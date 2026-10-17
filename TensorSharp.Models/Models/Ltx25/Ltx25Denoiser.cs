@@ -91,6 +91,11 @@ public sealed class Ltx25Denoiser : IDisposable
     public int ReferenceLoraProjections => _referenceLora?.ProjectionCount ?? 0;
     internal int CachedReferenceLoraProjections => _referenceLora?.CachedProjectionCount ?? 0;
 
+    // Internal diagnostic observer, installed before execution by validation
+    // tools. Arrays are borrowed and must not be mutated. Null on normal models;
+    // called after finite output readback and before the sampler advances state.
+    internal Action<Ltx25DenoiserInput, Ltx25DenoiserOutput> ForwardObserver { get; set; }
+
     // Synchronizing between phases changes execution overlap. This diagnostic
     // ranks phases only; its totals must never be reported as throughput.
     private sealed class StageTiming : IDisposable
@@ -567,7 +572,9 @@ public sealed class Ltx25Denoiser : IDisposable
             timing?.Mark("output_readback");
             if (videoValues.Any(value => !float.IsFinite(value)) || audioValues.Any(value => !float.IsFinite(value)))
                 throw new InvalidOperationException("LTX denoiser produced nonfinite velocity.");
-            return new(videoValues, audioValues, blocks);
+            var result = new Ltx25DenoiserOutput(videoValues, audioValues, blocks);
+            ForwardObserver?.Invoke(input, result);
+            return result;
         }
     }
 

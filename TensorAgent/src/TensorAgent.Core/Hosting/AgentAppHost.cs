@@ -310,6 +310,21 @@ public sealed class AgentAppHost : IDisposable
             WebUiChatService.DefaultArtifactUriPrefix,
             skillRouter: TensorAgentSkillRouter.Route);
         Chat.Knowledge = Knowledge;
+        Studio = new TensorSharp.Studio.StudioService(Path.Combine(Paths.DataRoot, "studio-projects"),
+            new TensorSharp.Chat.Studio.NativeStudioGenerationAdapter(ModelService, Chat, async ct =>
+            {
+                await WaitWhileAModelLoadsAsync(ct).ConfigureAwait(false);
+                await StopWarmingThePrefixCacheAndWaitAsync().ConfigureAwait(false);
+                await WaitForTheAppToBeInFrontAsync(ct).ConfigureAwait(false);
+            }, Compute,
+            // Studio follows the choice made under LoRAs, as a chat clip does. A capability or
+            // validation query plans without logging; the clip that runs prepares, and logs, once.
+            videoLoras: forClip =>
+            {
+                ImageTurns.Preparation p = forClip ? PrepareVideoTurn() : PlanClipLoras();
+                return p.Error is null ? p.Specs : throw new InvalidOperationException(p.Error);
+            }), TensorSharp.Chat.Studio.StudioHostOptions.Create(Options.UploadMaxFileBytes));
+        Chat.Studio = Studio;
         ImagePlanner = ImageTurns.Planner.For(Chat, Options.UploadDirectory);
 
         // The share contract stays platform-neutral. On iOS the path points into the
@@ -400,10 +415,11 @@ public sealed class AgentAppHost : IDisposable
         // app is away, and has to recognise and repair a poisoned engine. See
         // GatedChatFrames.
         Server.MapWebUi(Chat, Options.UploadDirectory, SkillsService, Recorder, chatFrames: GatedChatFrames, turns: Turns,
-            prepareImage: PrepareImageTurn);
+            prepareImage: PrepareImageTurn, prepareVideo: PrepareVideoTurn);
         // Without this the model's "here is your PDF" link 404s: the runner emits
         // /api/code/artifacts/... and nothing served it. See MapCodeArtifacts.
         Server.MapCodeArtifacts(Artifacts);
+        Server.MapStudio(Studio, Options.UploadDirectory);
         Server.MapAgent(
             Catalog, Models, Conversations, Settings, DescribeEngine, RaisePageEvent, Downloads,
             onSettingsChanged: ApplySettings, describeModel: DescribeModelState, shares: Shares,
@@ -438,6 +454,7 @@ public sealed class AgentAppHost : IDisposable
     public UploadStoragePolicy Uploads { get; }
     public ServerHostingOptions Options { get; }
     public WebUiChatService Chat { get; }
+    public TensorSharp.Studio.StudioService Studio { get; }
     /// <summary>Durable personal sources and their retrieval index, separate from temporary chat uploads.</summary>
     public KnowledgeStore Knowledge { get; }
     /// <summary>Verified app-private PDF tools and language data, prepared lazily on supported desktop hosts.</summary>
@@ -2341,14 +2358,17 @@ public sealed class AgentAppHost : IDisposable
 
     private int _speculationBenchStarted;
     private int _imageBenchStarted;
+    private int _videoBenchStarted;
 
     /// <summary>Start the on-device plain-vs-speculative benchmark once, when the
     /// launch environment asks for it (see <see cref="SpeculationBench"/>), or the picture
-    /// benchmark (see <see cref="ImageBench"/>).</summary>
+    /// benchmark (see <see cref="ImageBench"/>), or the clip benchmark (see <see cref="VideoBench"/>).</summary>
     private void StartSpeculationBenchIfRequested()
     {
         if (ImageBench.Requested && Interlocked.Exchange(ref _imageBenchStarted, 1) == 0)
             _ = Task.Run(() => new ImageBench(this).RunAsync(CancellationToken.None));
+        if (VideoBench.Requested && Interlocked.Exchange(ref _videoBenchStarted, 1) == 0)
+            _ = Task.Run(() => new VideoBench(this).RunAsync(CancellationToken.None));
         if (!SpeculationBench.Requested || Interlocked.Exchange(ref _speculationBenchStarted, 1) != 0)
             return;
         _ = Task.Run(() => new SpeculationBench(this).RunAsync(CancellationToken.None));
@@ -2630,7 +2650,12 @@ public sealed class AgentAppHost : IDisposable
         skillsAllowNetwork: settings.AllowNetwork,
         // The user's own switch, not the server's default. Only Enabled is chosen
         // here; the limits stay MultiAgentOptions' defaults, as they always were.
-        multiAgent: new MultiAgentOptions { Enabled = settings.MultiAgentEnabled });
+        multiAgent: new MultiAgentOptions { Enabled = settings.MultiAgentEnabled },
+        // A photo turn keeps the compact 640x384-area canvas it always had. The desktop
+        // hosts follow MiniMax-H3's 768p keyframe recipe, which has up to about 4.2x the video
+        // tokens per frame; its peak memory on the app's 32 GB tier is not measured yet, and a
+        // ggml device OOM ends the process instead of throwing. Switch when it is.
+        videoCanvasPolicy: TensorSharp.Models.Video.VideoCanvasPolicy.CompactPreview);
 
     /// <summary>
     /// Wait until the engine has nothing in flight.
@@ -3189,7 +3214,26 @@ public sealed class AgentAppHost : IDisposable
     /// </summary>
     /// <param name="editing">Whether the picture edits an attached photo: a plug-in made only
     /// for edits is not applied to a picture made from words.</param>
-    internal ImageTurns.Preparation PrepareImageTurn(bool editing)
+    internal ImageTurns.Preparation PrepareImageTurn(bool editing) => PrepareLoras(editing, log: true);
+
+    /// <summary>
+    /// The LoRA plug-ins the next clip would be made with, planned without a word in the log:
+    /// what Studio's capability and admission checks ask for (a MiniMax-H3 Turbo plug-in fixes
+    /// the step count they advertise), as often as the page polls. Writing a speed plug-in's
+    /// config beside its weights happens only when its text differs.
+    /// </summary>
+    internal ImageTurns.Preparation PlanClipLoras() => PrepareLoras(editing: false, log: false);
+
+    /// <summary>
+    /// The LoRA plug-ins the next clip is made with, as <see cref="PrepareImageTurn"/> is for a
+    /// picture: the video service applies them under the lock the clip runs in, and the log says
+    /// once per clip what it is made with.
+    /// </summary>
+    internal ImageTurns.Preparation PrepareVideoTurn() => PrepareLoras(editing: false, log: true);
+
+    /// <summary>The plan behind <see cref="PrepareImageTurn"/>, <see cref="PrepareVideoTurn"/> and
+    /// <see cref="PlanClipLoras"/>; <paramref name="log"/> is false only for the planning queries.</summary>
+    private ImageTurns.Preparation PrepareLoras(bool editing, bool log)
     {
         try
         {
@@ -3197,14 +3241,18 @@ public sealed class AgentAppHost : IDisposable
                 Settings.Load().ImageLoras, LoadedCatalogModel()?.Id, Loras, editing, out string? error);
             if (plan is null)
                 return ImageTurns.Preparation.Refused(error!);
-            HostLog.LogInformation("this picture is made with LoRA plug-ins: {Loras}{SatOut}",
-                plan.Names.Count == 0 ? "none" : string.Join(", ", plan.Names),
-                plan.SatOut is null ? "" : $" ({plan.SatOut})");
+            if (log)
+            {
+                HostLog.LogInformation("the next picture or clip is made with LoRA plug-ins: {Loras}{SatOut}",
+                    plan.Names.Count == 0 ? "none" : string.Join(", ", plan.Names),
+                    plan.SatOut is null ? "" : $" ({plan.SatOut})");
+            }
             return ImageTurns.Preparation.Ready(plan.Specs, plan.Names);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
         {
-            HostLog.LogWarning(ex, "preparing the LoRA plug-ins failed");
+            if (log)
+                HostLog.LogWarning(ex, "preparing the LoRA plug-ins failed");
             return ImageTurns.Preparation.Refused(Loc.T("host.loras.prepareFailed", ("reason", ex.Message)));
         }
     }
@@ -3370,6 +3418,7 @@ public sealed class AgentAppHost : IDisposable
         // the weights being unmapped underneath it.
         Turns.StopAll();
         Close(Server);
+        Studio.DisposeAsync().AsTask().GetAwaiter().GetResult();
         // Before the engine wait, because a download holds a socket and a file handle
         // and has nothing to do with the model: making a five-second transfer teardown
         // wait behind a generation would be for no reason.

@@ -34,6 +34,16 @@ public static class WebUiStaticFiles
             return Results.File(Path.Combine(baseDirectory, "wwwroot", "mask-editor.css"),
                 "text/css; charset=utf-8");
         });
+        app.MapGet("/studio.js", (HttpContext context) =>
+        {
+            RequireRevalidation(context.Response);
+            return Results.File(Path.Combine(baseDirectory, "wwwroot", "studio.js"), "text/javascript; charset=utf-8");
+        });
+        app.MapGet("/studio.css", (HttpContext context) =>
+        {
+            RequireRevalidation(context.Response);
+            return Results.File(Path.Combine(baseDirectory, "wwwroot", "studio.css"), "text/css; charset=utf-8");
+        });
         app.UseDefaultFiles();
         app.UseStaticFiles(new StaticFileOptions
         {

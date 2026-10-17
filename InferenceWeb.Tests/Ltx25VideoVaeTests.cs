@@ -90,6 +90,27 @@ public sealed class Ltx25VideoVaeTests
     }
 
     [Theory]
+    [InlineData("video-vae-two-frame.json")]
+    [InlineData("video-vae-single-frame.json")]
+    public void UntracedDecoderMatchesOriginalWithoutTraceInducedMaterialization(string fixture)
+    {
+        // Stage traces read back and materialize every activation. Exercise the
+        // normal generation path too, with only its deliberate residency bounds.
+        using var reference = Reference(fixture);
+        using var checkpoint = new Checkpoint();
+        IAllocator allocator = Allocator();
+        try
+        {
+            using var decoder = new Ltx25VideoVaeDecoder(checkpoint.Path, allocator);
+            var root = reference.RootElement;
+            int[] shape = Shape(root.GetProperty("input_shape"));
+            var actual = decoder.DecodeRaw(Values(root.GetProperty("input")), shape[1], shape[2], shape[3]);
+            Close(Values(root.GetProperty("stages").GetProperty("decoded").GetProperty("values")), actual, "untraced output");
+        }
+        finally { (allocator as IDisposable)?.Dispose(); }
+    }
+
+    [Theory]
     [InlineData(0, 1, 1)]
     [InlineData(1, 0, 1)]
     [InlineData(1, 1, -1)]

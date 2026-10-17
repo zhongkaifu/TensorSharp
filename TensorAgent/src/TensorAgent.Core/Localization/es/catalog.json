@@ -41,6 +41,8 @@
   "catalog.lora.objectRemover.purpose": "Elimina lo que hay dentro de los recuadros rojos dibujados en una foto adjunta y rellena el fondo. No funciona con todas las fotos; revisa el resultado.",
   "catalog.lora.objectMover.purpose": "Mueve el objeto situado en un recuadro rojo dibujado en una foto adjunta al lugar marcado por un segundo recuadro rojo.",
   "catalog.lora.animeConsistency.purpose": "Mantiene la identidad de un personaje de anime al editar una imagen adjunta con una nueva pose, vista o expresión. Experimental.",
+  "catalog.lora.minimaxH3Turbo8Step.purpose": "Vídeos en 8 pasos en vez de 20, con la programación para la que se destiló. Entrenado a 768p para el checkpoint de primer y último fotograma.",
+  "catalog.lora.minimaxH3Turbo4Step.purpose": "Vídeos en 4 pasos en vez de 20. Entrenado a 768p para el checkpoint de primer y último fotograma. Su programación es inferida: el autor no indica ninguna para esta versión.",
   "catalog.extended.gemmaLarge.notes": "La visión y la cabeza de borrador MTP correspondiente son descargas opcionales. Los borradores DSpark/DFlash de Gemma no son compatibles. Los metadatos del catálogo están verificados; la inferencia en TensorAgent aún no está validada.",
   "catalog.extended.qwen35Large.notes": "Mezcla híbrida de expertos con un proyector de visión opcional. Los metadatos del catálogo están verificados; la inferencia en TensorAgent aún no está validada.",
   "catalog.extended.qwen36Large.notes": "La visión es opcional. La cabeza NextN integrada no requiere otra descarga; la app usa por defecto decodificación especulativa con n-gramas. Los metadatos del catálogo están verificados; la inferencia en TensorAgent aún no está validada.",

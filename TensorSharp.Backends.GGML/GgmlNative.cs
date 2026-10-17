@@ -1078,6 +1078,45 @@ public struct H3DitForwardArgs
     /// The caller serializes use and retains it until the native call returns.</summary>
     public IntPtr GraphArena;
     public ulong GraphArenaBytes;
+    /// <summary>Optional LoRA plug-in applied unmerged (<see cref="H3DitAdapter"/>*);
+    /// Zero = none. MUST match TSGgmlMiniMaxH3DitForwardDesc.adapter (ggml_h3_lora.h).</summary>
+    public IntPtr Adapter;
+}
+
+/// <summary>One unmerged LoRA update y += Up (Down x). MUST match TSGH3Lora in ggml_h3_lora.h.
+/// Down is ggml [ne0 = In, ne1 = Rank] (PyTorch lora_A [rank, in]); Up is ggml
+/// [ne0 = Rank, ne1 = Out] (lora_B [out, rank]) with strength * alpha / rank folded in.
+/// Both factors share <see cref="Type"/>: GGML_TYPE_F32 (0) or GGML_TYPE_F16 (1).
+/// Rank 0 = no update; otherwise the (padded) rank.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3Lora
+{
+    public IntPtr Down;
+    public IntPtr Up;
+    public int Type;
+    public int Rank;
+    public long In, Out;
+}
+
+/// <summary>A DiT or token-refiner block's LoRA updates. MUST match TSGH3BlockLora in
+/// ggml_h3_lora.h. Q/K/V update the stacked [q; k; v] rows of attn.qkv_proj; Fc1.Up is
+/// already in TensorSharp's [gate | value] row order.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3BlockLora
+{
+    public H3Lora Q, K, V, Out, Fc1, Fc2;
+}
+
+/// <summary>A whole MiniMax-H3 DiT LoRA plug-in. MUST match TSGH3DitAdapter in ggml_h3_lora.h.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct H3DitAdapter
+{
+    public int StructBytes;       // sizeof(H3DitAdapter)
+    public int NumBlocks;
+    public int NumRefinerBlocks;
+    public int Reserved;
+    public IntPtr Blocks;         // H3BlockLora[NumBlocks]
+    public IntPtr Refiner;        // H3BlockLora[NumRefinerBlocks]
 }
 
 /// <summary>A 2-D convolution kernel in ggml order [KW, KH, IC, OC].

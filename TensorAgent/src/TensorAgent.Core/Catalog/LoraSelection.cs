@@ -15,10 +15,10 @@ using TensorSharp.Runtime;
 namespace TensorAgent.Core.Catalog;
 
 /// <summary>The engine's specs for the plug-ins in use, with their names for the page.</summary>
-/// <param name="Specs">What the image service is handed for the picture: the speed plug-in
-/// first, then the others in the order they were turned on.</param>
+/// <param name="Specs">What the image or video service is handed for the picture or clip: the
+/// speed plug-in first, then the others in the order they were turned on.</param>
 /// <param name="Names">Their display names, in the same order.</param>
-/// <param name="SatOut">Why chosen plug-ins are not applied to this picture, or null.</param>
+/// <param name="SatOut">Why chosen plug-ins are not applied to this picture or clip, or null.</param>
 public sealed record LoraPlan(IReadOnlyList<LoraSpec> Specs, IReadOnlyList<string> Names, string? SatOut = null)
 {
     public static LoraPlan None { get; } = new(Array.Empty<LoraSpec>(), Array.Empty<string>());
@@ -26,15 +26,18 @@ public sealed record LoraPlan(IReadOnlyList<LoraSpec> Specs, IReadOnlyList<strin
 
 /// <summary>
 /// The rules a choice of LoRA plug-ins obeys, in one place for the route that saves a choice
-/// and for the picture that applies it: known plug-ins of the model in use, installed, and at
-/// most one speed plug-in, because two sampling schedules cannot both apply.
+/// and for the picture or clip that applies it: known plug-ins of the model in use, installed,
+/// and at most one speed plug-in per model, because two sampling schedules cannot both apply.
+/// One choice holds every model's plug-ins, so a Qwen-Image speed plug-in and a MiniMax-H3 one
+/// can both be on: each applies only to its own model's work.
 /// </summary>
 public static class LoraSelection
 {
     /// <summary>
     /// Check a choice the user just made and return it as it will be saved: duplicates
     /// dropped, strengths inside <see cref="LoraCatalog.MinStrength"/>..<see cref="LoraCatalog.MaxStrength"/>,
-    /// a speed plug-in at its own strength. The page sends the whole choice with every change,
+    /// a speed plug-in at its own strength, and no two speed plug-ins that some model would both
+    /// take (<see cref="ShareAModel"/>). The page sends the whole choice with every change,
     /// so only what the change adds has to be downloaded: a plug-in that was already on stays
     /// on when its files have gone (the picture says so, and the sheet can turn it off).
     /// Ids this build does not know that were already saved are kept after the user's choice,
@@ -53,7 +56,7 @@ public static class LoraSelection
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var wasOn = new HashSet<string>(
             saved.Where(c => c is not null && !string.IsNullOrWhiteSpace(c.Id)).Select(c => c.Id), StringComparer.OrdinalIgnoreCase);
-        CatalogLora? speed = null;
+        var speeds = new List<CatalogLora>();
         foreach (ImageLoraChoice choice in requested)
         {
             if (choice is null || string.IsNullOrWhiteSpace(choice.Id) || !seen.Add(choice.Id))
@@ -76,12 +79,12 @@ public static class LoraSelection
             }
             if (lora.Kind == LoraKind.Speed)
             {
-                if (speed is not null)
+                if (speeds.FirstOrDefault(s => ShareAModel(s, lora)) is { } speed)
                 {
                     error = Loc.T("host.loras.twoSpeeds", ("first", speed.DisplayName), ("second", lora.DisplayName));
                     return null;
                 }
-                speed = lora;
+                speeds.Add(lora);
             }
             if (!float.IsFinite(choice.Strength) && lora.StrengthAdjustable)
             {
@@ -102,18 +105,20 @@ public static class LoraSelection
     }
 
     /// <summary>
-    /// What the saved choice asks the engine to apply to <paramref name="modelId"/>'s next picture.
-    /// A plug-in for another model, or one this build does not know, is skipped, and so is one
-    /// made only for edits when the picture is made from words (the sheet says so, and the
-    /// picture's progress names what it is drawn with). A plug-in chosen for another image model
-    /// sits out this one's pictures and the plan says so (<see cref="LoraPlan.SatOut"/>): a speed
-    /// plug-in on a Qwen-Image 2.1 Turbo entry, which is step-distilled already, and any plug-in
-    /// not validated on the entry, which <see cref="CatalogLora.AlsoFor"/> lists. A known plug-in
-    /// that is no longer installed, or a hand-edited choice with two speed plug-ins, is an error
-    /// rather than a silent omission: the user would otherwise get a picture without the plug-in
-    /// they turned on, with nothing to say so.
+    /// What the saved choice asks the engine to apply to <paramref name="modelId"/>'s next picture
+    /// or clip. A plug-in for another model, or one this build does not know, is skipped, and so
+    /// is one made only for edits when the picture is made from words (the sheet says so, and the
+    /// picture's progress names what it is drawn with). A plug-in chosen for another entry of the
+    /// same family sits out this one's work and the plan says so (<see cref="LoraPlan.SatOut"/>):
+    /// a speed plug-in on a Qwen-Image 2.1 Turbo entry, which is step-distilled already, any
+    /// plug-in not validated on a Qwen-Image entry, which <see cref="CatalogLora.AlsoFor"/> lists,
+    /// and a MiniMax-H3 plug-in on the references entry, which the keyframes checkpoint's Turbo
+    /// was not made for. Another family's plug-ins are not named: they were never meant for this
+    /// model. A known plug-in that is no longer installed, or a hand-edited choice with two speed
+    /// plug-ins for the model, is an error rather than a silent omission: the user would
+    /// otherwise get a picture or clip without the plug-in they turned on, with nothing to say so.
     /// </summary>
-    /// <param name="editing">Whether the picture edits an attached photo.</param>
+    /// <param name="editing">Whether the picture edits an attached photo; false for a clip.</param>
     /// <returns>The plan, or null with <paramref name="error"/> set.</returns>
     public static LoraPlan? Plan(
         IReadOnlyList<ImageLoraChoice> choices, string? modelId, LoraStore store, bool editing, out string? error)
@@ -133,9 +138,12 @@ public static class LoraSelection
                 continue;
             if (!lora.AppliesTo(modelId))
             {
-                // Another image model's plug-in: the picture is made without it, and says why.
-                if (model is { IsImageGenerator: true })
-                    satOut.Add(lora.Kind == LoraKind.Speed && model.ImageVariant == QwenImageVariant.Turbo
+                // Another entry of this model's family: the work is made without it, and says why.
+                if (model is { IsImageGenerator: true } or { IsVideoGenerator: true }
+                    && ModelCatalog.Find(lora.BaseModelId)?.Family == model.Family)
+                    satOut.Add(model.Family == CatalogFamily.MiniMaxH3
+                        ? $"{lora.DisplayName} sits out: made for MiniMax-H3's keyframes checkpoint"
+                        : lora.Kind == LoraKind.Speed && model.ImageVariant == QwenImageVariant.Turbo
                         ? $"{lora.DisplayName} sits out: {model.DisplayName} is step-distilled already"
                         : $"{lora.DisplayName} sits out: not validated on {model.DisplayName}");
                 continue;
@@ -176,4 +184,12 @@ public static class LoraSelection
             ordered.Select(c => c.Lora.DisplayName).ToArray(),
             why);
     }
+
+    /// <summary>
+    /// Whether some catalog entry takes both plug-ins, so that both would apply to its work:
+    /// two speed plug-ins conflict only then. Viggle Turbo (Qwen-Image 2.1) and a MiniMax-H3
+    /// Turbo never meet; the two MiniMax-H3 ones always do.
+    /// </summary>
+    internal static bool ShareAModel(CatalogLora a, CatalogLora b) =>
+        ModelCatalog.BuiltIn.Any(m => a.AppliesTo(m.Id) && b.AppliesTo(m.Id));
 }

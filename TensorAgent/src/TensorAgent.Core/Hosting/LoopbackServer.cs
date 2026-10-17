@@ -1026,7 +1026,7 @@ public sealed class LoopbackServer : IDisposable
         // tables the native screens read (PageStrings).
         if (relative == Localization.PageStrings.ScriptName)
             return LoopbackResponse.Text(Localization.PageStrings.Script(), contentType: "text/javascript; charset=utf-8");
-        if (relative is "mask-editor.js" or "mask-editor.css")
+        if (relative is "mask-editor.js" or "mask-editor.css" or "studio.js" or "studio.css")
         {
             using Stream stream = typeof(LoopbackServer).Assembly
                 .GetManifestResourceStream("TensorAgent.Core.WebUi." + relative)
@@ -1087,7 +1087,8 @@ public sealed class LoopbackServer : IDisposable
             + Localization.PageStrings.Tag() + "\n");
         html = InsertBefore(html, head, "</head>"u8, prependWhenMissing: true);
         byte[] tag = Encoding.UTF8.GetBytes("\n<link rel=\"stylesheet\" href=\"/mask-editor.css\">\n"
-            + "<script src=\"/mask-editor.js\"></script>\n<script src=\"/" + CompanionScriptName + "\"></script>\n");
+            + "<script src=\"/mask-editor.js\"></script>\n<script src=\"/" + CompanionScriptName + "\"></script>\n"
+            + "<link rel=\"stylesheet\" href=\"/studio.css\"><script src=\"/studio.js\"></script>\n");
         return InsertBefore(html, tag, "</body>"u8);
     }
 

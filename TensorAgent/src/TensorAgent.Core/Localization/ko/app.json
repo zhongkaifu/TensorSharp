@@ -33,5 +33,11 @@
   "app.shareNotifications.alert.title": "다음부터 공유 항목을 더 빠르게 여시겠어요?",
   "app.shareNotifications.alert.message": "iOS에서는 공유 확장 프로그램이 앱을 직접 전환할 수 없습니다. 알림을 허용하면 다음부터 공유 후 알림을 한 번 탭하여 TensorAgent를 열 수 있습니다.",
   "app.shareNotifications.alert.allow": "허용",
-  "app.shareNotifications.alert.notNow": "나중에"
+  "app.shareNotifications.alert.notNow": "나중에",
+  "app.webLink.title": "웹 페이지",
+  "app.webLink.back": "뒤로",
+  "app.webLink.forward": "앞으로",
+  "app.webLink.close": "닫기",
+  "app.webLink.loading": "페이지를 불러오는 중…",
+  "app.webLink.failed": "이 페이지를 불러올 수 없습니다."
 }

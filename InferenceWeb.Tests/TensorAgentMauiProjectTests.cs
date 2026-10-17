@@ -9,10 +9,13 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Xml.Linq;
 using Xunit;
 
@@ -675,6 +678,109 @@ public class TensorAgentMauiProjectTests
             .Distinct(StringComparer.Ordinal).OrderBy(n => n, StringComparer.Ordinal).ToArray();
         Assert.NotEmpty(imports);
         Assert.Equal(imports, items.Select(i => i.Attribute("Include")!.Value).OrderBy(n => n, StringComparer.Ordinal).ToArray());
+    }
+
+    [Fact]
+    public void AppleBundles_ImportTheXcodeRuleFromTheirProjectBody()
+    {
+        // The SDK checks Xcode for every bundle it makes: the app on both Apple heads and the
+        // phone's share extension. The rule runs ahead of that check only because it is
+        // defined first, so it is imported from the body of an SDK-style project, whose
+        // implicit Sdk.targets import comes after the body.
+        XElement app = Assert.Single(Csproj.Root!.Elements(Ns + "Import"),
+            e => e.Attribute("Project")?.Value == "XcodeVersion.targets");
+        Assert.True(IsFor(app, "ios"), ConditionOf(app));
+        Assert.True(IsFor(app, "maccatalyst"), ConditionOf(app));
+        XElement extension = Assert.Single(ShareExtensionCsproj.Root!.Elements(Ns + "Import"),
+            e => e.Attribute("Project")?.Value == "../TensorAgent.Maui/XcodeVersion.targets");
+        Assert.Null(extension.Attribute("Condition"));
+        Assert.Equal("Microsoft.NET.Sdk", Csproj.Root.Attribute("Sdk")?.Value);
+        Assert.Equal("Microsoft.NET.Sdk", ShareExtensionCsproj.Root.Attribute("Sdk")?.Value);
+    }
+
+    [Theory]
+    [InlineData("27.1", "27.0", "", true, true)]        // a newer minor: what the rule is for
+    [InlineData("27.10", "27.2", "", true, true)]       // minors compare as numbers
+    [InlineData("27.0", "27.0", "", true, false)]       // the SDK's own Xcode
+    [InlineData("27.0.1", "27.0", "", true, false)]     // the SDK ignores the revision too
+    [InlineData("26.6", "27.0", "", false, false)]      // an older Xcode: the SDK's error
+    [InlineData("28.0", "27.0", "", false, false)]      // another major: the SDK's error
+    [InlineData("27.1", "27.0", "true", false, false)]  // an explicit check keeps the error
+    [InlineData("27.1", "27.0", "false", true, false)]  // an explicit opt-out is the builder's own
+    public async Task XcodeRule_LetsOnlyANewerMinorPastTheSdkCheck(
+        string xcode, string sdkXcode, string validate, bool builds, bool warns)
+    {
+        // The real file, imported from the project body, against a copy of the SDK's
+        // _ValidateXcodeVersion (Xamarin.Shared.Sdk.targets, .NET for iOS 27.0.10722)
+        // defined after it, as Sdk.targets is. This runs the ordering the rule relies on:
+        // two targets after _DetectSdkLocations, and the check's condition read when the
+        // check runs.
+        string directory = Path.Combine(RepoRoot, "artifacts", "tests", "TensorAgentXcode", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        string project = Path.Combine(directory, "probe.proj");
+        File.WriteAllText(project, $"""
+            <Project>
+              <PropertyGroup>
+                <_CanOutputAppBundle>true</_CanOutputAppBundle>
+                <IsMacEnabled>true</IsMacEnabled>
+                <_PlatformName>MacCatalyst</_PlatformName>
+                <_ShortPackageVersion>27.0.10722</_ShortPackageVersion>
+              </PropertyGroup>
+              <Import Project="{Path.Combine(MauiDir, "XcodeVersion.targets")}" />
+              <Target Name="_DetectSdkLocations">
+                <PropertyGroup>
+                  <_XcodeVersion>{xcode}</_XcodeVersion>
+                  <RecommendedXcodeVersion>{sdkXcode}</RecommendedXcodeVersion>
+                </PropertyGroup>
+              </Target>
+              <Target Name="_ValidateXcodeVersion"
+                      AfterTargets="_DetectSdkLocations"
+                      Condition="'$(ValidateXcodeVersion)' != 'false' And '$(_CanOutputAppBundle)' == 'true' And '$(IsMacEnabled)' == 'true'">
+                <PropertyGroup>
+                  <_XcodeVersionMajorMinorOnly>$([System.Version]::Parse('$(_XcodeVersion)').Major).$([System.Version]::Parse('$(_XcodeVersion)').Minor)</_XcodeVersionMajorMinorOnly>
+                  <_RecommendedXcodeVersionMajorMinorOnly>$([System.Version]::Parse('$(RecommendedXcodeVersion)').Major).$([System.Version]::Parse('$(RecommendedXcodeVersion)').Minor)</_RecommendedXcodeVersionMajorMinorOnly>
+                  <_IsMatchingXcode Condition="'$(_RecommendedXcodeVersionMajorMinorOnly)' == '$(_XcodeVersionMajorMinorOnly)'">true</_IsMatchingXcode>
+                </PropertyGroup>
+                <Error Condition="'$(_IsMatchingXcode)' != 'true'" Text="SDK Xcode check: requires Xcode $(RecommendedXcodeVersion), found $(_XcodeVersion)" />
+              </Target>
+              <Target Name="Build" DependsOnTargets="_DetectSdkLocations" />
+            </Project>
+            """);
+
+        string? dotnet = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");
+        var start = new ProcessStartInfo(string.IsNullOrEmpty(dotnet) ? "dotnet" : dotnet)
+        {
+            WorkingDirectory = directory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        foreach (string argument in new[] { "msbuild", project, "-t:Build", "-nologo", "-v:minimal", "-tl:off" })
+            start.ArgumentList.Add(argument);
+        if (validate.Length > 0)
+            start.ArgumentList.Add($"-p:ValidateXcodeVersion={validate}");
+        using var process = new Process { StartInfo = start };
+        process.Start();
+        Task<string> stdout = process.StandardOutput.ReadToEndAsync();
+        Task<string> stderr = process.StandardError.ReadToEndAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            process.Kill(entireProcessTree: true);
+            Assert.Fail($"The Xcode rule probe did not finish within 30 seconds: {project}");
+        }
+        string output = await stdout + await stderr;
+
+        Assert.True((process.ExitCode == 0) == builds, output);
+        Assert.Equal(!builds, output.Contains("SDK Xcode check:", StringComparison.Ordinal));
+        Assert.Equal(warns, output.Contains($"warning : TensorAgent: Xcode {xcode} is newer than the Xcode {sdkXcode}", StringComparison.Ordinal));
+        if (!warns)
+            Assert.DoesNotContain("warning", output, StringComparison.Ordinal);
     }
 
     [Fact]

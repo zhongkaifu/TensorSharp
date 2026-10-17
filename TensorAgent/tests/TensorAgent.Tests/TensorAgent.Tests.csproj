@@ -18,6 +18,8 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\TensorAgent.Core\TensorAgent.Core.csproj" />
+    <!-- Exercise shared Studio commands through the actual standalone HTTP routes as well as loopback. -->
+    <ProjectReference Include="..\..\..\TensorSharp.Server\TensorSharp.Server.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Using Include="Xunit" />

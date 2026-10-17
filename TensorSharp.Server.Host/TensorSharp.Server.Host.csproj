@@ -23,7 +23,9 @@
 		         Exclude="..\TensorAgent\skills\verdicts.json;..\TensorAgent\skills\**\__pycache__\**\*;..\TensorAgent\skills\**\node_modules\**\*"
 		         Link="skills/%(RecursiveDir)%(Filename)%(Extension)"
 		         CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-		<Content Include="..\TensorSharp.Chat\WebUi\mask-editor.js" Link="wwwroot\mask-editor.js" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+		<Content Include="..\TensorSharp.Chat\WebUi\studio.js" Link="wwwroot\studio.js" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+        <Content Include="..\TensorSharp.Chat\WebUi\studio.css" Link="wwwroot\studio.css" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+        <Content Include="..\TensorSharp.Chat\WebUi\mask-editor.js" Link="wwwroot\mask-editor.js" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
 		<Content Include="..\TensorSharp.Chat\WebUi\mask-editor.css" Link="wwwroot\mask-editor.css" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
 	</ItemGroup>
 

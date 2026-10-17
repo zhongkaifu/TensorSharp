@@ -814,6 +814,7 @@ public sealed class LocalizationTests : IDisposable
             ? SourceFiles(Path.Combine(Repo, "TensorAgent", "src", "TensorAgent.Core"), "*.cs", "*.js")
                 .Concat(SourceFiles(Path.Combine(Repo, "TensorAgent", "src", "TensorAgent.Maui"), "*.cs", "*.js", "*.html"))
                 .Append(Path.Combine(Repo, "TensorSharp.Chat", "WebUi", "mask-editor.js"))
+                .Append(Path.Combine(Repo, "TensorSharp.Chat", "WebUi", "studio.js"))
             : SourceFiles(Path.Combine(Repo, "TensorAgent", "src", "TensorAgent.Sharing"), "*.cs")
                 .Concat(SourceFiles(Path.Combine(Repo, "TensorAgent", "src", "TensorAgent.ShareExtension"), "*.cs"));
 

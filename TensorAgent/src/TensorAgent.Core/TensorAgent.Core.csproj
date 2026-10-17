@@ -20,6 +20,8 @@
     <EmbeddedResource Include="WebUi\i18n.js" />
     <EmbeddedResource Include="Localization\**\*.json"
                       LogicalName="TensorAgent.Core.Localization.%(RecursiveDir)%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\..\TensorSharp.Chat\WebUi\studio.js" LogicalName="TensorAgent.Core.WebUi.studio.js" />
+    <EmbeddedResource Include="..\..\..\TensorSharp.Chat\WebUi\studio.css" LogicalName="TensorAgent.Core.WebUi.studio.css" />
     <EmbeddedResource Include="..\..\..\TensorSharp.Chat\WebUi\mask-editor.js" LogicalName="TensorAgent.Core.WebUi.mask-editor.js" />
     <EmbeddedResource Include="..\..\..\TensorSharp.Chat\WebUi\mask-editor.css" LogicalName="TensorAgent.Core.WebUi.mask-editor.css" />
     <!-- The engine's own LoRA plug-in configs. A speed plug-in whose weights do not carry

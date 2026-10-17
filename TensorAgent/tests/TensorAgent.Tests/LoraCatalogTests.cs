@@ -14,6 +14,7 @@ using System.Text.Json;
 using TensorAgent.Core.Catalog;
 using TensorAgent.Core.Downloads;
 using TensorAgent.Core.Settings;
+using TensorSharp.Models.MiniMaxH3;
 using TensorSharp.Runtime;
 
 namespace TensorAgent.Tests;
@@ -53,7 +54,8 @@ public sealed class LoraCatalogTests : IDisposable
             Assert.True(ids.Add(lora.Id), $"duplicate id {lora.Id}");
             Assert.Matches("^[a-z0-9.-]+$", lora.Id);
             CatalogModel? model = ModelCatalog.Find(lora.BaseModelId);
-            Assert.True(model is { Family: CatalogFamily.QwenImage }, $"{lora.Id}: the base model must be a Qwen-Image entry");
+            Assert.True(model is { Family: CatalogFamily.QwenImage or CatalogFamily.MiniMaxH3 },
+                $"{lora.Id}: the base model must be a Qwen-Image or MiniMax-H3 entry");
             Assert.NotEmpty(lora.DisplayName);
             Assert.NotEmpty(lora.Purpose);
             Assert.NotEmpty(lora.License);
@@ -99,7 +101,7 @@ public sealed class LoraCatalogTests : IDisposable
     [Fact]
     public void EachPlugInIsTheEnginesOwnConfigAndEveryConfigIsOffered()
     {
-        string[] configs = Directory.GetFiles(Path.Combine(RepoRoot(), "config", "lora"), "qwen-image-2.1-*.json")
+        string[] configs = Directory.GetFiles(Path.Combine(RepoRoot(), "config", "lora"), "*.json")
             .Select(Path.GetFileNameWithoutExtension).OrderBy(id => id, StringComparer.Ordinal).ToArray()!;
         Assert.Equal(configs, LoraCatalog.BuiltIn.Select(l => l.Id).OrderBy(id => id, StringComparer.Ordinal));
 
@@ -107,7 +109,10 @@ public sealed class LoraCatalogTests : IDisposable
         {
             using JsonDocument document = JsonDocument.Parse(File.ReadAllText(EngineConfigPath(lora.Id)), Jsonc);
             JsonElement root = document.RootElement;
-            Assert.Equal("qwen-image-2.1-lora", root.GetProperty("type").GetString());
+            Assert.Equal(ModelCatalog.Find(lora.BaseModelId)!.Family == CatalogFamily.MiniMaxH3
+                    ? LoraCliFlags.MiniMaxH3PluginType
+                    : LoraCliFlags.QwenImagePluginType,
+                root.GetProperty("type").GetString());
 
             JsonElement weights = root.GetProperty("weights");
             Assert.Equal(lora.Weights.Url, weights.GetProperty("urls")[0].GetString());
@@ -139,12 +144,15 @@ public sealed class LoraCatalogTests : IDisposable
     [Fact]
     public void ThePlugInsAreOfferedOnlyWhereTheirModelIs()
     {
-        Assert.All(LoraCatalog.BuiltIn, l => Assert.Equal(LoraCatalog.QwenImage, l.BaseModelId));
-        Assert.Equal(LoraCatalog.BuiltIn.Count, LoraCatalog.For(LoraCatalog.QwenImage).Count);
+        Assert.All(LoraCatalog.BuiltIn, l => Assert.Contains(l.BaseModelId, new[] { LoraCatalog.QwenImage, LoraCatalog.MiniMaxH3Keyframes }));
+        Assert.Equal(14, LoraCatalog.For(LoraCatalog.QwenImage).Count);
+        Assert.Equal(new[] { H3Turbo8, H3Turbo4 }, LoraCatalog.For(LoraCatalog.MiniMaxH3Keyframes).Select(l => l.Id));
+        Assert.Equal(LoraCatalog.BuiltIn.Count, LoraCatalog.For(LoraCatalog.QwenImage).Count + LoraCatalog.For(LoraCatalog.MiniMaxH3Keyframes).Count);
         Assert.Empty(LoraCatalog.For("gemma-4-e2b-q8"));
-        // No phone or tablet reaches the image model's tier, so none is offered a plug-in.
+        // No phone or tablet reaches the image or video models' tiers, so none is offered a plug-in.
         Assert.DoesNotContain(ModelCatalog.ForDevice(16), m => m.Id == LoraCatalog.QwenImage);
         Assert.All(LoraCatalog.QwenImageTurbo, id => Assert.DoesNotContain(ModelCatalog.ForDevice(16), m => m.Id == id));
+        Assert.DoesNotContain(ModelCatalog.ForDevice(16), m => m.Id == LoraCatalog.MiniMaxH3Keyframes);
     }
 
     /// <summary>
@@ -172,8 +180,9 @@ public sealed class LoraCatalogTests : IDisposable
             // What the LoRA sheet lists while that entry is loaded.
             Assert.Equal(new[] { Film, Grain, Casual, Voxel }, LoraCatalog.Offered(ModelCatalog.Find(id), ModelCatalog.BuiltIn).Select(l => l.Id));
         }
-        // The base model, a chat model or nothing loaded: every plug-in of an offered model.
-        Assert.Equal(LoraCatalog.BuiltIn, LoraCatalog.Offered(ModelCatalog.Find(LoraCatalog.QwenImage), ModelCatalog.BuiltIn));
+        // The base model: every plug-in of its own. A chat model or nothing loaded: every plug-in
+        // of an offered model.
+        Assert.Equal(LoraCatalog.For(LoraCatalog.QwenImage), LoraCatalog.Offered(ModelCatalog.Find(LoraCatalog.QwenImage), ModelCatalog.BuiltIn));
         Assert.Equal(LoraCatalog.BuiltIn, LoraCatalog.Offered(ModelCatalog.Find("gemma-4-e2b-q8"), ModelCatalog.BuiltIn));
         Assert.Equal(LoraCatalog.BuiltIn, LoraCatalog.Offered(null, ModelCatalog.BuiltIn));
         Assert.Empty(LoraCatalog.Offered(null, ModelCatalog.ForDevice(16)));
@@ -255,6 +264,141 @@ public sealed class LoraCatalogTests : IDisposable
 
         // A model that makes no pictures has no plug-ins to name.
         Assert.Same(LoraPlan.None, LoraSelection.Plan(choices, "gemma-4-e2b-q8", store, editing: true, out _));
+    }
+
+    // ---- MiniMax-H3 Turbo ----------------------------------------------------------------
+
+    private const string H3Turbo8 = "minimax-h3-fl2v-turbo-8step";
+    private const string H3Turbo4 = "minimax-h3-fl2v-turbo-4step";
+    private const string H3References = "minimax-h3-ref2va-q4k";
+
+    /// <summary>
+    /// The two MiniMax-H3 Turbo plug-ins, pinned to the bytes verified on 2026-10-16 (a
+    /// <c>shasum -a 256</c> of the downloaded files matched these), and the engine's own
+    /// config for each: the app hands that config over as the plug-in's, so its weights must be
+    /// the file it names (the engine ties them by file name) and its step count the one the
+    /// sheet shows. The schedule is the config's: the catalog only repeats its steps.
+    /// </summary>
+    [Theory]
+    [InlineData(H3Turbo8, "minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors",
+        "9b0efe3613b43a84e30febaa43af27432ea9d0711eac7bba904b2556b175f6d4", 8)]
+    [InlineData(H3Turbo4, "minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors",
+        "c3d4a2cf618efea71b9e21a4baaa12d412f1eb6c2b6f86efacaf0ebb6814b689", 4)]
+    public void TheMiniMaxH3TurboPlugInsArePinnedAndCarryTheEnginesRecipe(string id, string file, string sha256, int steps)
+    {
+        CatalogLora lora = LoraCatalog.Find(id)!;
+        Assert.Equal(LoraCatalog.MiniMaxH3Keyframes, lora.BaseModelId);
+        Assert.Empty(lora.AlsoFor);
+        Assert.Equal(LoraKind.Speed, lora.Kind);
+        Assert.Equal(steps, lora.Steps);
+        Assert.Equal(1f, lora.DefaultStrength);
+        Assert.False(lora.StrengthAdjustable);
+        Assert.Equal("Apache-2.0", lora.License);
+        Assert.Equal(id + ".json", lora.RecipeConfig);
+        Assert.Null(lora.ConfigFile);
+        LoraFile weights = Assert.Single(lora.Files);
+        Assert.Equal(file, weights.FileName);
+        Assert.Equal(1_383_677_808, weights.Bytes);
+        Assert.Equal(sha256, weights.Sha256);
+        Assert.Equal($"https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/a29e57d195f80ead07c89f89e55ecf2911e893c5/{file}", weights.Url);
+
+        MiniMaxH3LoraConfig config = MiniMaxH3LoraConfig.Load(EngineConfigPath(id));
+        Assert.Equal(file, config.WeightsFileName);
+        Assert.Equal(MiniMaxH3Partition.FirstLastFrame, config.Partition);
+        Assert.Equal(steps, config.Recipe.Steps);
+        Assert.Equal(lora.DefaultStrength, config.Scale ?? 1f);
+    }
+
+    /// <summary>
+    /// The Turbo plug-ins are offered where they apply and nowhere else: on the keyframes entry,
+    /// not on References (the same tensors, which the engine refuses them on by file name), LTX
+    /// 2.5 or a Qwen-Image entry, whose sheet keeps its own fourteen.
+    /// </summary>
+    [Fact]
+    public void TheTurboPlugInsAreOfferedOnlyOnTheKeyframesEntry()
+    {
+        Assert.Equal(new[] { H3Turbo8, H3Turbo4 },
+            LoraCatalog.Offered(ModelCatalog.Find(LoraCatalog.MiniMaxH3Keyframes), ModelCatalog.BuiltIn).Select(l => l.Id));
+        Assert.Empty(LoraCatalog.Offered(ModelCatalog.Find(H3References), ModelCatalog.BuiltIn));
+        Assert.Empty(LoraCatalog.Offered(ModelCatalog.Find("ltx-2.5-distilled-q4km"), ModelCatalog.BuiltIn));
+        Assert.DoesNotContain(LoraCatalog.Offered(ModelCatalog.Find(LoraCatalog.QwenImage), ModelCatalog.BuiltIn), l => l.Id.StartsWith("minimax-h3", StringComparison.Ordinal));
+        Assert.All(new[] { H3Turbo8, H3Turbo4 }, id =>
+        {
+            CatalogLora lora = LoraCatalog.Find(id)!;
+            Assert.False(lora.AppliesTo(H3References));
+            Assert.False(lora.AppliesTo(LoraCatalog.QwenImage));
+        });
+    }
+
+    /// <summary>
+    /// One speed plug-in per model: two schedules can only conflict on a model that takes
+    /// both. Viggle Turbo (Qwen-Image) and a MiniMax-H3 Turbo are both on at once, each for its
+    /// own model's work; the two MiniMax-H3 ones are not.
+    /// </summary>
+    [Fact]
+    public void OnlySpeedPlugInsForTheSameModelExcludeEachOther()
+    {
+        LoraStore store = StoreWith(Viggle, Pruna, H3Turbo8, H3Turbo4);
+        var none = Array.Empty<ImageLoraChoice>();
+
+        Assert.Equal(new[] { new ImageLoraChoice(Viggle, 1f), new ImageLoraChoice(H3Turbo8, 1f) },
+            LoraSelection.Validate(new ImageLoraChoice[] { new(Viggle, 0.4f), new(H3Turbo8, 0.3f) }, none, store, out string? error));
+        Assert.Null(error);
+
+        Assert.Null(LoraSelection.Validate(new ImageLoraChoice[] { new(H3Turbo8, 1f), new(H3Turbo4, 1f) }, none, store, out error));
+        Assert.Equal("LightX2V Turbo 8-Step and LightX2V Turbo 4-Step both set the number of steps; use one of them.", error);
+        Assert.Null(LoraSelection.Validate(new ImageLoraChoice[] { new(Viggle, 1f), new(H3Turbo4, 1f), new(Pruna, 1f) }, none, store, out error));
+        Assert.Equal("Viggle Turbo and Pruna 8-Step both set the number of steps; use one of them.", error);
+
+        Assert.True(LoraSelection.ShareAModel(LoraCatalog.Find(H3Turbo8)!, LoraCatalog.Find(H3Turbo4)!));
+        Assert.False(LoraSelection.ShareAModel(LoraCatalog.Find(Viggle)!, LoraCatalog.Find(H3Turbo8)!));
+    }
+
+    /// <summary>
+    /// What a clip is made with, from one choice that holds both families' plug-ins. The
+    /// keyframes entry takes its Turbo and names nothing it skips from Qwen-Image; References
+    /// says why the Turbo sits out; LTX and Qwen-Image never name a MiniMax-H3 plug-in. Two
+    /// MiniMax-H3 speed plug-ins saved by hand, or one whose files have gone, refuse the clip.
+    /// </summary>
+    [Fact]
+    public void AClipIsPlannedFromTheChoiceForItsOwnCheckpoint()
+    {
+        LoraStore store = StoreWith(Viggle, Film, H3Turbo8, H3Turbo4);
+        var choices = new[] { new ImageLoraChoice(Viggle, 1f), new ImageLoraChoice(Film, 0.7f), new ImageLoraChoice(H3Turbo8, 0.2f) };
+
+        LoraPlan clip = LoraSelection.Plan(choices, LoraCatalog.MiniMaxH3Keyframes, store, editing: false, out string? error)!;
+        Assert.Null(error);
+        Assert.Equal(new[] { "LightX2V Turbo 8-Step" }, clip.Names);
+        Assert.Null(clip.SatOut);
+        LoraSpec spec = Assert.Single(clip.Specs);
+        // Strength 1, whatever was saved; the weights and, as their config, the engine's own plug-in.
+        Assert.Equal(1f, spec.Scale);
+        Assert.Equal(store.PathFor(LoraCatalog.Find(H3Turbo8)!, LoraCatalog.Find(H3Turbo8)!.Weights), spec.Path);
+        Assert.Equal(LoraCatalog.RecipeText(LoraCatalog.Find(H3Turbo8)!), File.ReadAllText(spec.ConfigPath!));
+        // The form the engine is handed is one it accepts: the config ties these weights, by file name.
+        MiniMaxH3SamplingRecipe recipe = MiniMaxH3LoraConfig.RecipeFor(clip.Specs, MiniMaxH3Partition.FirstLastFrame);
+        Assert.Equal(8, recipe.Steps);
+        Assert.Equal(LoraCliFlags.MiniMaxH3PluginType, LoraCliFlags.DeclaredPluginType(spec));
+
+        LoraPlan references = LoraSelection.Plan(choices, H3References, store, editing: false, out error)!;
+        Assert.Null(error);
+        Assert.Empty(references.Specs);
+        Assert.Equal("LightX2V Turbo 8-Step sits out: made for MiniMax-H3's keyframes checkpoint", references.SatOut);
+
+        Assert.Same(LoraPlan.None, LoraSelection.Plan(choices, "ltx-2.5-distilled-q4km", store, editing: false, out _));
+        LoraPlan picture = LoraSelection.Plan(choices, LoraCatalog.QwenImage, store, editing: false, out _)!;
+        Assert.Equal(new[] { "Viggle Turbo", "Film Stills" }, picture.Names);
+        Assert.Null(picture.SatOut);
+        Assert.Equal("Viggle Turbo sits out: Qwen-Image 2.1 Turbo is step-distilled already",
+            LoraSelection.Plan(choices, LoraCatalog.QwenImageTurbo[0], store, editing: false, out _)!.SatOut);
+
+        Assert.Null(LoraSelection.Plan(new[] { new ImageLoraChoice(H3Turbo8, 1f), new ImageLoraChoice(H3Turbo4, 1f) },
+            LoraCatalog.MiniMaxH3Keyframes, store, editing: false, out error));
+        Assert.Contains("both set the number of steps", error);
+        store.Delete(LoraCatalog.Find(H3Turbo4)!);
+        Assert.Null(LoraSelection.Plan(new[] { new ImageLoraChoice(H3Turbo4, 1f) },
+            LoraCatalog.MiniMaxH3Keyframes, store, editing: false, out error));
+        Assert.Equal("LightX2V Turbo 4-Step is turned on but its files are missing. Download it again under LoRAs, or turn it off.", error);
     }
 
     // ---- the store ---------------------------------------------------------------------

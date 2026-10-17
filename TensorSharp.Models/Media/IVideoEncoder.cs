@@ -9,12 +9,28 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using TensorSharp.Models.QwenImage;
 using TensorSharp.Models.Video;
+using System.Threading;
 
 namespace TensorSharp.Models.Media
 {
     /// <summary>Writes generated frames as an MP4 file.</summary>
     public interface IVideoEncoder
     {
+        /// <summary>Whether this provider supplies the libx264 conditioning transform
+        /// used by LTX image guides. An OS H.264 export encoder alone is insufficient.</summary>
+        bool SupportsH264ImageConditioning => false;
+
+        /// <summary>Encode and decode one packed RGB8 frame using libx264 at 1 fps,
+        /// the veryfast preset, the requested CRF and yuv420p. RGB/YUV conversion uses
+        /// bilinear scaling and the encoder uses slice threading, matching PyAV's
+        /// defaults in the publisher's image-conditioning implementation. Dimensions
+        /// must be positive and even; the returned RGB8 buffer has the same geometry.
+        /// No alternate codec or bitrate fallback is permitted.</summary>
+        byte[] RecompressH264Image(byte[] rgb8, int width, int height, int crf,
+            CancellationToken cancellationToken = default) => throw new System.NotSupportedException(
+                $"{GetType().Name} does not provide the libx264 image-conditioning transform required by LTX. " +
+                "Use the desktop media provider with FFmpeg (including libx264) on PATH or set TS_FFMPEG.");
+
         /// <summary>
         /// Write <paramref name="frames"/> (all the same size, HWC RGB float [0,1]) at
         /// <paramref name="fps"/> to <paramref name="path"/>, whose directory already exists.

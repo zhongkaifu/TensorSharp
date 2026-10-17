@@ -187,7 +187,9 @@ public sealed class LoraCliFlagsTests : IDisposable
     {
         Assert.Equal(new[] { "--lora", "--lora-scale", "--lora-config" }, LoraCliFlags.Flags);
         Assert.Equal("TS_LORAS", LoraCliFlags.EnvironmentVariable);
-        Assert.Equal("qwen-image-2.1-lora", LoraCliFlags.PluginType);
+        Assert.Equal("qwen-image-2.1-lora", LoraCliFlags.QwenImagePluginType);
+        Assert.Equal("minimax-h3-lora", LoraCliFlags.MiniMaxH3PluginType);
+        Assert.Equal(new[] { "qwen-image-2.1-lora", "minimax-h3-lora" }, LoraCliFlags.PluginTypes);
     }
 
     // ---- the TS_LORAS environment channel ------------------------------------------------
@@ -476,6 +478,7 @@ public sealed class LoraCliFlagsTests : IDisposable
 
         var ex = Assert.Throws<ArgumentException>(() => LoraCliFlags.Resolve(new[] { new LoraSpec(manifest) }));
         Assert.Contains("qwen-image-2.1-lora", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("minimax-h3-lora", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -504,6 +507,101 @@ public sealed class LoraCliFlagsTests : IDisposable
 
         var ex = Assert.Throws<FileNotFoundException>(() => LoraCliFlags.Resolve(new[] { new LoraSpec(manifest) }));
         Assert.Equal(Path.Combine(_dir, "nowhere.safetensors"), ex.FileName);
+    }
+
+    // ---- MiniMax-H3 plug-ins and the declared plug-in type -----------------------------------
+
+    private string WriteH3Manifest(string relative, string weights = "w/turbo.safetensors", string extra = "")
+    {
+        return Write(relative, $$"""
+        {
+          // a minimax-h3-lora manifest; its weights may be missing, and are never fetched here
+          "type": "minimax-h3-lora",
+          "name": "Test Turbo",
+          "weights": { "path": {{J(weights)}}, "urls": ["https://example.invalid/never-fetched.safetensors"] },
+          "partition": "fl2va",
+          "key_format": "minimax-h3-diffusers",
+          "sampling": { "steps": 8, "schedule": "linspace", "video_shift": 6.0, "audio_shift": 3.0, "sampler": "euler", "cfg": 1.0 },
+          {{extra}}
+        }
+        """);
+    }
+
+    [Fact]
+    public void Resolve_H3PluginManifest_BecomesItsWeightsWithItselfAsTheConfig()
+    {
+        string weights = Touch("h3/w/turbo.safetensors");
+        string manifest = WriteH3Manifest("h3/turbo-8step.json");
+
+        var resolved = Assert.Single(LoraCliFlags.Resolve(new[] { new LoraSpec(manifest, 0.5f) }));
+
+        Assert.Equal(new LoraSpec(Path.GetFullPath(weights), 0.5f, Path.GetFullPath(manifest)), resolved);
+    }
+
+    [Fact]
+    public void Resolve_H3PluginManifestThatForwardsAConfig_IsRefusedInBothForms()
+    {
+        string weights = Touch("h3/w/turbo.safetensors");
+        Write("h3/pdd_config.json", "{}");
+        string manifest = WriteH3Manifest("h3/forwarding.json", extra: "\"config\": \"pdd_config.json\"");
+        string expected = $"{Path.GetFullPath(manifest)}: a minimax-h3-lora plug-in cannot forward a \"config\"; its own file is the config.";
+
+        var asLora = Assert.Throws<ArgumentException>(() => LoraCliFlags.Resolve(new[] { new LoraSpec(manifest) }));
+        var asConfig = Assert.Throws<ArgumentException>(() => LoraCliFlags.Resolve(new[] { new LoraSpec(weights, null, manifest) }));
+
+        Assert.Equal(expected, asLora.Message);
+        Assert.Equal(expected, asConfig.Message);
+    }
+
+    [Fact]
+    public void DeclaredPluginType_ReadsTheManifestNamedByLoraOrLoraConfig()
+    {
+        string weights = Touch("decl/w.safetensors");
+        string h3 = WriteH3Manifest("decl/h3.json", weights: "missing/turbo.safetensors");
+        string qwen = Write("decl/qwen.json", """{ "type": "qwen-image-2.1-lora", "weights": "w.safetensors" }""");
+        string peft = Write("decl/adapter_config.json", """{ "lora_alpha": 16, "r": 8 }""");
+
+        Assert.Equal(LoraCliFlags.MiniMaxH3PluginType, LoraCliFlags.DeclaredPluginType(new LoraSpec(h3)));
+        Assert.Equal(LoraCliFlags.QwenImagePluginType, LoraCliFlags.DeclaredPluginType(new LoraSpec(qwen)));
+        // A manifest used as --lora-config declares the type for the weights before it.
+        Assert.Equal(LoraCliFlags.MiniMaxH3PluginType, LoraCliFlags.DeclaredPluginType(new LoraSpec(weights, null, h3)));
+        // Bare weights and third-party configs declare nothing.
+        Assert.Null(LoraCliFlags.DeclaredPluginType(new LoraSpec(weights)));
+        Assert.Null(LoraCliFlags.DeclaredPluginType(new LoraSpec(weights, 0.5f, peft)));
+        // The H3 manifest's weights are missing and only reachable through example.invalid: reading
+        // the type must not have tried to fetch them.
+        Assert.False(File.Exists(Path.Combine(_dir, "decl", "missing", "turbo.safetensors")));
+    }
+
+    [Fact]
+    public void DeclaredPluginType_MissingFiles_UseTheResolveNotFoundTexts()
+    {
+        string weights = Touch("nf/w.safetensors");
+        string missingJson = Path.Combine(_dir, "nf", "typo-turbo-8step.json");
+        string missingConfig = Path.Combine(_dir, "nf", "typo-config.json");
+
+        var lora = Assert.Throws<FileNotFoundException>(() => LoraCliFlags.DeclaredPluginType(new LoraSpec(missingJson)));
+        var config = Assert.Throws<FileNotFoundException>(() => LoraCliFlags.DeclaredPluginType(new LoraSpec(weights, null, missingConfig)));
+
+        // A typo'd manifest is reported missing, never mistaken for bare weights.
+        Assert.Equal($"--lora file not found: {missingJson}", lora.Message);
+        Assert.Equal(missingJson, lora.FileName);
+        Assert.Equal($"--lora-config file not found: {missingConfig}", config.Message);
+        Assert.Equal(missingConfig, config.FileName);
+    }
+
+    [Fact]
+    public void ManifestPath_IsTheLoraJsonOrAPluginLoraConfig()
+    {
+        string weights = Touch("mp/w.safetensors");
+        string h3 = WriteH3Manifest("mp/h3.json");
+        string peft = Write("mp/adapter_config.json", """{ "lora_alpha": 16, "r": 8 }""");
+
+        Assert.Equal(Path.GetFullPath(h3), LoraCliFlags.ManifestPath(new LoraSpec(h3)));
+        Assert.Equal(Path.GetFullPath(h3), LoraCliFlags.ManifestPath(new LoraSpec(weights, 1f, h3)));
+        Assert.Null(LoraCliFlags.ManifestPath(new LoraSpec(weights, null, peft)));
+        Assert.Null(LoraCliFlags.ManifestPath(new LoraSpec(weights)));
+        Assert.Null(LoraCliFlags.ManifestPath(new LoraSpec(Path.Combine(_dir, "mp", "absent.json"))));
     }
 
     [Fact]

@@ -29,6 +29,10 @@ namespace TensorSharp.Models.MiniMaxH3
             MultiGpu = MultiGpuMode.SingleDevice,
             MultiGpuLimitation =
                 "minimax-h3 has no tensor-parallel or layer-split path; it runs on one GPU and extra GPUs stay idle.",
+
+            // Step-distillation adapters (the LightX2V Turbo plug-ins) as minimax-h3-lora
+            // configs, which declare the checkpoint partition and the sampling contract.
+            LoraPluginType = LoraCliFlags.MiniMaxH3PluginType,
         };
     }
 }

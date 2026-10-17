@@ -148,11 +148,30 @@ namespace TensorSharp.Runtime
             Expand(args, Console.Error, interactiveProgress: !Console.IsErrorRedirected);
 
         /// <summary>
+        /// <see cref="Expand(string[])"/> with a host check that runs before anything is
+        /// downloaded. When <paramref name="args"/> names a <c>--config</c> file and
+        /// <paramref name="preflight"/> is set, every file is first expanded in a preview
+        /// that resolves each file entry to its local path without fetching it (a missing
+        /// file with no URL is still refused), and <paramref name="preflight"/> sees the
+        /// merged tokens and the files the real expansion would download. An exception it
+        /// throws propagates before any transfer starts; otherwise the real expansion runs
+        /// unchanged. Without a <c>--config</c> file nothing is downloaded and
+        /// <paramref name="preflight"/> is not called.
+        /// </summary>
+        /// <exception cref="ArgumentException">A <c>--config</c> flag has no path, or a config file is malformed.</exception>
+        /// <exception cref="FileNotFoundException">A named config file, or a referenced file with no download URL, does not exist.</exception>
+        /// <exception cref="IOException">A referenced file could not be downloaded from any URL.</exception>
+        /// <exception cref="NotSupportedException">A named preset declares that it is unavailable.</exception>
+        public static string[] Expand(string[] args, Action<ConfigExpansionPreview>? preflight) =>
+            Expand(args, Console.Error, interactiveProgress: !Console.IsErrorRedirected, preflight);
+
+        /// <summary>
         /// Testable overload: routes download progress to an explicit writer and
         /// controls whether progress overwrites a single line (TTY) or emits
         /// discrete lines (log sink).
         /// </summary>
-        internal static string[] Expand(string[] args, TextWriter log, bool interactiveProgress)
+        internal static string[] Expand(string[] args, TextWriter log, bool interactiveProgress,
+            Action<ConfigExpansionPreview>? preflight = null)
         {
             if (args == null || args.Length == 0)
                 return args ?? Array.Empty<string>();
@@ -199,6 +218,25 @@ namespace TensorSharp.Runtime
             {
                 foreach (string configPath in configPaths)
                     files.Add(LoadConfig(configPath));
+
+                // The host's own checks (a LoRA plug-in's locked sampling flags, say) would
+                // otherwise run only after the real pass had fetched every model file. The
+                // preview resolves the same entries to their local paths without fetching
+                // anything and stays silent: its override notices are reported once, below.
+                if (preflight != null)
+                {
+                    var preview = new ExpandContext(TextWriter.Null, interactiveProgress: false, CommandLineOptions(passThrough))
+                    {
+                        Preview = true,
+                    };
+                    for (int f = 0; f < files.Count; f++)
+                        preview.AddFileOptions(files[f].FullPath, OptionsSetBy(files[f]));
+                    var previewTokens = new List<string>(args.Length);
+                    for (int f = 0; f < files.Count; f++)
+                        ExpandFile(files[f], f, previewTokens, preview);
+                    previewTokens.AddRange(passThrough);
+                    preflight(new ConfigExpansionPreview(previewTokens, preview.Pending));
+                }
 
                 var context = new ExpandContext(log ?? TextWriter.Null, interactiveProgress, CommandLineOptions(passThrough));
                 for (int f = 0; f < files.Count; f++)
@@ -304,6 +342,13 @@ namespace TensorSharp.Runtime
 
             public TextWriter Log { get; }
             public bool InteractiveProgress { get; }
+
+            /// <summary>The no-download preview pass: file entries resolve to their local
+            /// paths, and missing ones are recorded in <see cref="Pending"/> instead of fetched.</summary>
+            public bool Preview { get; init; }
+
+            /// <summary>The full paths the real pass would download, in the order met (preview only).</summary>
+            public List<string> Pending { get; } = new();
 
             public void AddFileOptions(string path, HashSet<string> options) => _files.Add((path, options));
 
@@ -573,7 +618,20 @@ namespace TensorSharp.Runtime
         /// <exception cref="ArgumentException">The document or the entry is malformed.</exception>
         /// <exception cref="FileNotFoundException">The file is missing and no URL names it.</exception>
         /// <exception cref="IOException">No URL could supply the file.</exception>
-        public static string? ResolveFileEntry(string documentPath, string key)
+        public static string? ResolveFileEntry(string documentPath, string key) =>
+            ResolveFileEntry(documentPath, key, download: true);
+
+        /// <summary>
+        /// The local path of the file entry <paramref name="key"/> of a document that follows
+        /// this class's conventions, as <see cref="ResolveFileEntry(string, string)"/> resolves it
+        /// (variables substituted, relative to the document), without checking that the file
+        /// exists and without ever downloading it. Returns null when the document has no such key.
+        /// </summary>
+        /// <exception cref="ArgumentException">The document or the entry is malformed.</exception>
+        public static string? ResolveFileEntryPath(string documentPath, string key) =>
+            ResolveFileEntry(documentPath, key, download: false);
+
+        private static string? ResolveFileEntry(string documentPath, string key, bool download)
         {
             string fullPath = Path.GetFullPath(documentPath);
             JsonDocument document;
@@ -592,6 +650,12 @@ namespace TensorSharp.Runtime
                     return null;
                 var variables = VariableResolver.FromConfig(fullPath, root);
                 string? directory = Path.GetDirectoryName(fullPath);
+                if (entry.ValueKind == JsonValueKind.Object && !download)
+                {
+                    var entryFiles = new List<DownloadFile>();
+                    CollectDownloadFiles(fullPath, directory, variables, key, entry, entryFiles);
+                    return entryFiles[0].Path;
+                }
                 if (entry.ValueKind == JsonValueKind.Object)
                     return ResolveDownloadSpec(fullPath, directory, variables, key, entry,
                         new ExpandContext(Console.Error, interactiveProgress: !Console.IsErrorRedirected));
@@ -625,7 +689,8 @@ namespace TensorSharp.Runtime
             {
                 if (File.Exists(file.Path))
                 {
-                    context.Log.WriteLine($"[model-download] {file.Key}: using cached file at {file.Path}");
+                    if (!context.Preview)
+                        context.Log.WriteLine($"[model-download] {file.Key}: using cached file at {file.Path}");
                     continue;
                 }
 
@@ -633,6 +698,14 @@ namespace TensorSharp.Runtime
                     throw new FileNotFoundException(
                         $"Configuration file '{configPath}' option '{file.Key}' path not found and no download URL was provided: {file.Path}",
                         file.Path);
+
+                if (context.Preview)
+                {
+                    // The preview never fetches: the real pass downloads it if the host's
+                    // check lets startup continue.
+                    context.Pending.Add(file.Path);
+                    continue;
+                }
 
                 context.Log.WriteLine($"[model-download] {file.Key}: '{file.Path}' not found locally; attempting download from {file.Urls.Count} source(s)");
                 ModelDownloader.Download(file.Path, file.Urls, file.Sha256, file.Key, context.Log, context.InteractiveProgress);
@@ -840,5 +913,40 @@ namespace TensorSharp.Runtime
                 return false;
             }
         }
+    }
+
+    /// <summary>
+    /// What <see cref="ConfigFileArgs.Expand(string[], Action{ConfigExpansionPreview})"/> will
+    /// produce, computed before anything is downloaded, so a host can refuse a contradictory
+    /// command line (a locked sampling flag beside a LoRA plug-in, say) without first fetching
+    /// tens of gigabytes of model files.
+    /// </summary>
+    public sealed class ConfigExpansionPreview
+    {
+        private readonly HashSet<string> _pending;
+
+        internal ConfigExpansionPreview(IReadOnlyList<string> tokens, IEnumerable<string> pendingDownloads)
+        {
+            Tokens = tokens.ToArray();
+            // macOS and Windows file systems are case-insensitive by default; Linux is not.
+            _pending = new HashSet<string>(
+                pendingDownloads.Select(p => Path.GetFullPath(p)),
+                OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() || OperatingSystem.IsMacCatalyst() || OperatingSystem.IsIOS()
+                    ? StringComparer.OrdinalIgnoreCase
+                    : StringComparer.Ordinal);
+            PendingDownloads = _pending.ToArray();
+        }
+
+        /// <summary>The merged tokens exactly as the expansion will return them, with every file
+        /// entry as its local path (downloaded or not).</summary>
+        public IReadOnlyList<string> Tokens { get; }
+
+        /// <summary>The full paths of the files the real expansion would download.</summary>
+        public IReadOnlyCollection<string> PendingDownloads { get; }
+
+        /// <summary>True when <paramref name="path"/> names a file the real expansion would
+        /// download, so a check that reads files must skip it rather than call it missing.</summary>
+        public bool IsPending(string path) =>
+            !string.IsNullOrWhiteSpace(path) && _pending.Contains(Path.GetFullPath(path));
     }
 }

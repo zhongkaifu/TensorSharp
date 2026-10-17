@@ -45,8 +45,10 @@ namespace TensorSharp.Models.MiniMaxH3
         public const float VisualConditionTimestep = 0.999f;
 
         /// <summary>Default denoising steps, matching stable-diffusion.cpp's CLI.
-        /// Guidance distillation does not guarantee quality at fewer steps; dedicated
-        /// FastH3 checkpoints use their own trained schedules.</summary>
+        /// Guidance distillation does not guarantee quality at fewer steps. Fewer steps
+        /// take a step-distillation adapter, the LightX2V Turbo plug-in
+        /// (config/lora/minimax-h3-fl2v-turbo-*.json), which brings its own step count and
+        /// grid (<see cref="BuildUniformSigmas"/>) and refuses any other.</summary>
         public const int DefaultSteps = 20;
 
         /// <summary>The flow-matching SNR shift: sigma' = a*t / (1 + (a-1)*t).</summary>
@@ -72,6 +74,25 @@ namespace TensorSharp.Models.MiniMaxH3
                 double t = steps == 1 ? 999.0 : 999.0 - i * (999.0 / (steps - 1));
                 sigmas[i] = (float)TimeSnrShift(shift, (t + 1.0) / 1000.0);
             }
+            sigmas[steps] = 0f;
+            return sigmas;
+        }
+
+        /// <summary>The endpoint-inclusive linspace grid the Turbo adapters were distilled on
+        /// (ModelTC/Minimax-H3-Turbo, q_i = (N - i) / N; diffusers scheduling_minimax_h3.py
+        /// set_timesteps): u_i = 1 - i/N for i = 0..N-1, sigma_i = TimeSnrShift(shift, u_i),
+        /// then a terminal 0. Unlike <see cref="BuildSigmas"/>, which walks sd.cpp's discrete
+        /// 999..0 axis, the steps are even in u and the last nonzero sigma sits at u = 1/N
+        /// rather than just above 0, so the two grids differ after the first step. The audio stream's grid is this one mapped
+        /// through <see cref="MapSigma"/>, which equals the same grid at the audio shift.
+        /// Returns <paramref name="steps"/>+1 values from 1.0 down to exactly 0.0.</summary>
+        public static float[] BuildUniformSigmas(int steps, float shift)
+        {
+            if (steps <= 0) throw new ArgumentOutOfRangeException(nameof(steps));
+            if (!float.IsFinite(shift) || shift <= 0) throw new ArgumentOutOfRangeException(nameof(shift));
+            var sigmas = new float[steps + 1];
+            for (int i = 0; i < steps; i++)
+                sigmas[i] = (float)TimeSnrShift(shift, 1.0 - (double)i / steps);
             sigmas[steps] = 0f;
             return sigmas;
         }

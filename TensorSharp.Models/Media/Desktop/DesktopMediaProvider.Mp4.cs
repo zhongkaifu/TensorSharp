@@ -134,33 +134,7 @@ namespace TensorSharp.Models.Media.Desktop
             }
         }
 
-        private static string FindFfmpeg()
-        {
-            string env = Environment.GetEnvironmentVariable("TS_FFMPEG");
-            if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return env;
-            string exe = OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg";
-            foreach (string dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
-            {
-                try
-                {
-                    if (!string.IsNullOrWhiteSpace(dir) && File.Exists(Path.Combine(dir, exe)))
-                        return Path.Combine(dir, exe);
-                }
-                catch { /* malformed PATH entry */ }
-            }
-            // A copy dropped next to the app (or in an ffmpeg/bin subfolder) also counts.
-            string baseDir = AppContext.BaseDirectory;
-            foreach (string cand in new[]
-            {
-                Path.Combine(baseDir, exe),
-                Path.Combine(baseDir, "ffmpeg", exe),
-                Path.Combine(baseDir, "ffmpeg", "bin", exe),
-            })
-            {
-                if (File.Exists(cand)) return cand;
-            }
-            return null;
-        }
+        private static string FindFfmpeg() => MediaExecutableLocator.Find("ffmpeg", "TS_FFMPEG");
 
         private static bool TrySaveWithOpenCv(string path, RgbImage[] frames, int fps, string fourcc)
         {

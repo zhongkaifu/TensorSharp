@@ -67,9 +67,10 @@ public static partial class ImageTurns
     /// first frame; every unit test passed, because none of them ran the app's wiring.
     /// </para>
     /// </summary>
-    /// <param name="prepare">Asked before a picture is started, with whether it is an edit: the
-    /// LoRA plug-ins it is made with (see <see cref="Preparation"/>). Null for a host that chooses
-    /// none, whose pictures keep whatever set the model was loaded with.</param>
+    /// <param name="prepare">Asked before a picture is started, with whether it is an edit, or
+    /// before a clip is (always false): the LoRA plug-ins it is made with (see
+    /// <see cref="Preparation"/>). Null for a host that chooses none, whose pictures and clips
+    /// keep whatever set the model was loaded with.</param>
     /// <param name="planner">How a picture turn reads the conversation (see <see cref="Planner"/>).
     /// Required rather than defaulted for the same reason this method exists: a caller that left
     /// it out would quietly plan every turn from the newest message alone again.</param>
@@ -79,16 +80,19 @@ public static partial class ImageTurns
     {
         ArgumentNullException.ThrowIfNull(chat);
         ArgumentNullException.ThrowIfNull(planner);
-        return chat.LoadedModelMakesImages ? StreamAsync(chat, body, planner, cancellationToken, prepare)
-            : chat.LoadedModelMakesVideo ? VideoTurns.StreamAsync(chat, body, cancellationToken)
+        // Studio messages are editing instructions, never prompts for implicit media generation.
+        // ChatStreamAsync validates the selected planner and rejects loaded diffusion models.
+        bool studio = body.ValueKind == JsonValueKind.Object && body.TryGetProperty("studio", out _);
+        return !studio && chat.LoadedModelMakesImages ? StreamAsync(chat, body, planner, cancellationToken, prepare)
+            : !studio && chat.LoadedModelMakesVideo ? VideoTurns.StreamAsync(chat, body, cancellationToken, prepare)
             : chat.ChatStreamAsync(body, cancellationToken);
     }
 
     /// <summary>
-    /// The LoRA plug-ins a picture is made with: the engine's specs, applied under the same lock
-    /// as the run, and their names (the page says what it is drawing with). Or why the picture
-    /// cannot be made as the user asked, which ends the turn with that message rather than with
-    /// a picture made without the plug-ins they turned on.
+    /// The LoRA plug-ins a picture or clip is made with: the engine's specs, applied under the
+    /// same lock as the run, and their names (the page says what it is drawing or filming with).
+    /// Or why it cannot be made as the user asked, which ends the turn with that message rather
+    /// than with a picture or clip made without the plug-ins they turned on.
     /// </summary>
     public sealed record Preparation(string? Error, IReadOnlyList<LoraSpec> Specs, IReadOnlyList<string> Loras)
     {

@@ -225,7 +225,7 @@ Start with these choices, in order:
 
 1. **Choose the right checkpoint.** For Wan video, use a Turbo/Lightning/4-step distilled GGUF. For Qwen-Image-2.1, add a step-distillation [LoRA plug-in](models/qwenimage21.md#lora-plug-ins) from `config/lora/` (4–8 steps instead of the 40-step default).
 2. **Use the matching backend.** NVIDIA: `ggml_cuda`; Apple Silicon and iOS: `ggml_metal`; CPU: `ggml_cpu` (use managed `cpu` for portability).
-3. **Reduce work before tuning flags.** For H3 use `--cfg 1.0` and 4–8 steps; for media, lower resolution, frame count, or steps.
+3. **Reduce work before tuning flags.** For H3 use `--cfg 1.0`, and for fewer steps add a [Turbo plug-in](models/minimax-h3.md#turbo-plug-ins) on FL2VA (8 or 4 steps) rather than lowering the base step count; for media, lower resolution, frame count, or steps.
 4. **Then scale or speculate.** Try `--draft-model` / `--spec`, `--n-cpu-moe`, or `--tp N` when the model or workload calls for it.
 
 See the [performance guide and detailed fast lanes](PROJECT_STATUS.md#make-it-fast), the [model cards](models/README.md), and the [environment-variable matrix](env_var_feature_matrix.md) for trade-offs and measurements.

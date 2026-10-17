@@ -10,6 +10,7 @@
 
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 
 namespace InferenceWeb.Tests;
 
@@ -296,6 +297,251 @@ public class HostLoadRefusalProcessTests : IDisposable
         }
     }
 
+    // ---- LoRA plug-ins: the shared startup preflight -----------------------------------------
+    // A plug-in the model does not take, or a MiniMax-H3 Turbo plug-in beside a sampling flag its
+    // recipe contradicts, stops the host with one configuration-error line before any plug-in or
+    // model file is fetched; only the family of a model a --config has yet to download waits for
+    // that download (its header is what names it). The MiniMax-H3 stand-ins are what the published GGUFs are to the
+    // registry: no metadata, two patch projections, the partition in the file name. A plug-in's
+    // weights (and a --config's model) would download from a loopback server that counts requests.
+
+    private string H3Model(string partition = "fl2va") =>
+        LoraHostFixtures.WriteH3Model(_dir, $"minimax_h3_{partition}_pruned-Q4_K.gguf");
+
+    private string TurboManifest(LoopbackCountingServer server) =>
+        LoraHostFixtures.WriteH3Manifest(Path.Combine(_dir, "loras"), url: server.UrlFor("/" + LoraHostFixtures.Weights8));
+
+    public static IEnumerable<object[]> TurboContradictions() => new[]
+    {
+        new object[] { "fl2va", new[] { "--diffusion-steps", "20" }, "--diffusion-steps 20 contradicts" },
+        new object[] { "fl2va", new[] { "--flow-shift", "12" }, "flow shift 12 contradicts it" },
+        new object[] { "fl2va", new[] { "--sampler", "unipc" }, "sampler 'unipc' contradicts it" },
+        new object[] { "fl2va", new[] { "--cfg", "2" }, "requires guidance 1.0" },
+        new object[] { "ref2va", Array.Empty<string>(), "is the Ref2VA checkpoint, and Ref2VA Turbo is not supported" },
+    };
+
+    [Theory]
+    [MemberData(nameof(TurboContradictions))]
+    public void Cli_H3TurboPlugin_ContradictedOrOnRef2va_IsRefusedBeforeAnyDownload(string partition, string[] flags, string reason)
+    {
+        using var server = new LoopbackCountingServer();
+        string[] line = new[] { "--lora", TurboManifest(server) }.Concat(flags).ToArray();
+
+        AssertRefusedBeforeDownload(RunCliWith(H3Model(partition), line), reason, server);
+    }
+
+    [Theory]
+    [InlineData("qwen35", "--lora applies to Qwen-Image-2.1 and MiniMax-H3 (FL2VA) models only")]
+    [InlineData("qwen_image", "--lora turbo-8step.json is a minimax-h3-lora plug-in;")]
+    public void Cli_H3TurboPlugin_OnAnotherFamily_IsRefusedBeforeAnyDownload(string architecture, string reason)
+    {
+        using var server = new LoopbackCountingServer();
+        string model = architecture == "qwen35"
+            ? LoraHostFixtures.WriteTextModel(_dir)
+            : LoraHostFixtures.WriteQwenImageModel(_dir);
+
+        AssertRefusedBeforeDownload(RunCliWith(model, new[] { "--lora", TurboManifest(server) }), reason, server);
+    }
+
+    [Fact]
+    public void Cli_H3_RefusesBareWeights()
+    {
+        string weights = LoraHostFixtures.Touch(_dir, Path.Combine("loras", LoraHostFixtures.Weights8));
+
+        AssertOneLoraRefusal(RunCliWith(H3Model(), new[] { "--lora", weights }),
+            $"--lora {LoraHostFixtures.Weights8}: MiniMax-H3 takes LoRA plug-ins only as a minimax-h3-lora config");
+    }
+
+    [Fact]
+    public void Cli_TypoInThePluginConfigPath_IsReportedMissing()
+    {
+        string typo = Path.Combine(_dir, "loras", "minimax-h3-fl2v-turbo-8stp.json");
+
+        AssertOneLoraRefusal(RunCliWith(H3Model(), new[] { "--lora", typo }), "--lora file not found: " + typo);
+    }
+
+    [Fact]
+    public void Cli_InheritedTsLoras_H3Plugin_IsHeldToTheFlags()
+    {
+        using var server = new LoopbackCountingServer();
+        var environment = new Dictionary<string, string>
+        {
+            ["TS_LORAS"] = LoraCliFlags.ToJson(new[] { new LoraSpec(TurboManifest(server)) }),
+        };
+
+        AssertRefusedBeforeDownload(RunCliWith(H3Model(), new[] { "--diffusion-steps", "20" }, environment),
+            "--diffusion-steps 20 contradicts", server);
+    }
+
+    [Fact]
+    public void BothHosts_ConfigNamedModel_IsNotDownloaded_WhenThePluginRefusesTheLine()
+    {
+        using var server = new LoopbackCountingServer();
+        const string ModelFile = "minimax_h3_fl2va_pruned-Q4_K.gguf";
+        server.AddFile("/" + ModelFile, File.ReadAllBytes(LoraHostFixtures.WriteH3Model(Path.Combine(_dir, "source"), ModelFile)));
+        string model = Path.Combine(_dir, "downloads", ModelFile);
+        string config = LoraHostFixtures.Write(_dir, "h3.json",
+            $$"""{ "model": { "path": {{JsonSerializer.Serialize(model)}}, "urls": [ {{JsonSerializer.Serialize(server.UrlFor("/" + ModelFile))}} ] } }""");
+        string manifest = TurboManifest(server);
+
+        AssertRefusedBeforeDownload(RunCliWith(null, new[] { "--config", config, "--lora", manifest, "--diffusion-steps", "20" }),
+            "--diffusion-steps 20 contradicts", server);
+        AssertRefusedBeforeDownload(RunServerWith(null, new[] { "--config", config, "--lora", manifest, "--video-steps", "20" }),
+            "--video-steps 20 contradicts", server);
+        Assert.False(File.Exists(model));
+    }
+
+    /// <summary>
+    /// The model's family is read from its GGUF header, so a model a <c>--config</c> still has to
+    /// download cannot be checked against the plug-in's type before that download. It is checked
+    /// right after it, on the final command line: the plug-in another family's is refused before
+    /// its own weights are fetched (the usage pages and docs say exactly this).
+    /// </summary>
+    [Theory]
+    [InlineData("qwen_image", "--lora turbo-8step.json is a minimax-h3-lora plug-in; Qwen-Image-2.1-Q4_K.gguf (qwen_image) takes qwen-image-2.1-lora plug-ins only.")]
+    [InlineData("minimax_h3", "--lora qwen-plugin.json is a qwen-image-2.1-lora plug-in; minimax_h3_fl2va_pruned-Q4_K.gguf (minimax-h3) takes minimax-h3-lora plug-ins only.")]
+    public void BothHosts_ConfigModelStillToDownload_IsCheckedAfterItsDownload_BeforeThePluginsWeights(string family, string reason)
+    {
+        using var server = new LoopbackCountingServer();
+        string modelFile = family == "qwen_image" ? "Qwen-Image-2.1-Q4_K.gguf" : "minimax_h3_fl2va_pruned-Q4_K.gguf";
+        string source = family == "qwen_image"
+            ? LoraHostFixtures.WriteQwenImageModel(Path.Combine(_dir, "source"), modelFile)
+            : LoraHostFixtures.WriteH3Model(Path.Combine(_dir, "source"), modelFile);
+        server.AddFile("/" + modelFile, File.ReadAllBytes(source));
+        const string QwenWeights = "qwen-lora.safetensors";
+        string plugin = family == "qwen_image"
+            ? TurboManifest(server)
+            : LoraHostFixtures.WriteQwenManifest(Path.Combine(_dir, "loras"), weights: QwenWeights, url: server.UrlFor("/" + QwenWeights));
+        string weightsPath = "/" + (family == "qwen_image" ? LoraHostFixtures.Weights8 : QwenWeights);
+
+        foreach (string host in new[] { "cli", "server" })
+        {
+            // Each host downloads into a folder of its own, so each run starts with the model pending.
+            string model = Path.Combine(_dir, "downloads", host, modelFile);
+            string config = LoraHostFixtures.Write(_dir, $"{host}-{family}.json",
+                $$"""{ "model": { "path": {{JsonSerializer.Serialize(model)}}, "urls": [ {{JsonSerializer.Serialize(server.UrlFor("/" + modelFile))}} ] } }""");
+            int before = server.RequestCount("/" + modelFile);
+            string[] line = { "--config", config, "--lora", plugin };
+            HostRun run = host == "cli" ? RunCliWith(null, line) : RunServerWith(null, line);
+
+            AssertOneConfigurationErrorAmongDownloadLines(run, reason);
+            Assert.Equal(before + 1, server.RequestCount("/" + modelFile));
+            Assert.True(File.Exists(model), $"{host}: the model was not downloaded before the check.");
+            Assert.Equal(0, server.RequestCount(weightsPath));
+        }
+    }
+
+    /// <summary>A <c>--config</c> file that cannot be downloaded from any of its URLs is a
+    /// configuration error on both hosts, not an unhandled exception.</summary>
+    [Fact]
+    public void BothHosts_ConfigFileThatCannotBeDownloaded_IsAConfigurationError()
+    {
+        using var server = new LoopbackCountingServer();   // serves nothing: every request is a 404
+        foreach (string host in new[] { "cli", "server" })
+        {
+            string model = Path.Combine(_dir, "downloads", host, "missing.gguf");
+            string config = LoraHostFixtures.Write(_dir, $"{host}-missing.json",
+                $$"""{ "model": { "path": {{JsonSerializer.Serialize(model)}}, "urls": [ {{JsonSerializer.Serialize(server.UrlFor("/missing.gguf"))}} ] } }""");
+            string[] line = { "--config", config };
+            HostRun run = host == "cli" ? RunCliWith(null, line) : RunServerWith(null, line);
+
+            string error = AssertOneConfigurationErrorAmongDownloadLines(run, "Configuration error: Failed to download model to '");
+            Assert.Contains("missing.gguf' from all 1 source(s):", error, StringComparison.Ordinal);
+            Assert.False(File.Exists(model));
+        }
+        Assert.Equal(2, server.RequestCount("/missing.gguf"));
+    }
+
+    /// <summary>Exit code 1 and exactly one "Configuration error: ..." line naming
+    /// <paramref name="reason"/>, after the <c>--config</c> download's own progress lines on
+    /// stderr; never a stack trace.</summary>
+    private static string AssertOneConfigurationErrorAmongDownloadLines(HostRun run, string reason)
+    {
+        string context = $"exit={run.ExitCode}\n--- stderr ---\n{run.Stderr}\n--- stdout (tail) ---\n{Tail(run.Stdout)}";
+        string[] errors = run.Stderr.Split('\n').Select(l => l.TrimEnd('\r'))
+            .Where(l => l.StartsWith("Configuration error: ", StringComparison.Ordinal)).ToArray();
+        Assert.True(run.ExitCode == ConfigurationErrorExitCode, context);
+        Assert.True(errors.Length == 1, context);
+        Assert.Contains(reason, errors[0], StringComparison.Ordinal);
+        Assert.Contains("[model-download]", run.Stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("Unhandled exception", run.Stdout + run.Stderr, StringComparison.Ordinal);
+        return errors[0];
+    }
+
+    [Fact]
+    public void Server_H3TurboPlugin_ContradictingVideoSteps_IsRefusedBeforeAnyDownload()
+    {
+        using var server = new LoopbackCountingServer();
+
+        AssertRefusedBeforeDownload(RunServerWith(H3Model(), new[] { "--lora", TurboManifest(server), "--video-steps", "20" }),
+            "--video-steps 20 contradicts", server);
+    }
+
+    [Theory]
+    [InlineData("qwen_image", "--lora turbo-8step.json is a minimax-h3-lora plug-in;")]
+    [InlineData("ref2va", "is the Ref2VA checkpoint, and Ref2VA Turbo is not supported")]
+    public void Server_H3TurboPlugin_ForTheWrongModel_IsRefusedBeforeAnyDownload(string model, string reason)
+    {
+        using var server = new LoopbackCountingServer();
+        string path = model == "qwen_image" ? LoraHostFixtures.WriteQwenImageModel(_dir) : H3Model(model);
+
+        AssertRefusedBeforeDownload(RunServerWith(path, new[] { "--lora", TurboManifest(server) }), reason, server);
+    }
+
+    [Fact]
+    public void BothHosts_ShippedTurboConfig_IsRefusedByItsOwnRecipe()
+    {
+        string manifest = Path.Combine(LoraHostFixtures.RepoRoot(), "config", "lora", "minimax-h3-fl2v-turbo-8step.json");
+        string model = H3Model();
+        const string Recipe = "contradicts minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors: " +
+            "LightX2V Turbo 8-step (FL2V v1.0, 768p) samples exactly 8 steps on its own schedule.";
+
+        Assert.StartsWith("Configuration error: --diffusion-steps 4 " + Recipe,
+            AssertOneLoraRefusal(RunCliWith(model, new[] { "--lora", manifest, "--diffusion-steps", "4" }), Recipe), StringComparison.Ordinal);
+        Assert.StartsWith("Configuration error: --video-steps 4 " + Recipe,
+            AssertOneLoraRefusal(RunServerWith(model, new[] { "--lora", manifest, "--video-steps", "4" }), Recipe), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Cli_InheritedQwenPlugin_OnH3_IsAWarning_AndTheModelLoads()
+    {
+        string qwen = LoraHostFixtures.WriteQwenManifest(Path.Combine(_dir, "loras"));
+        var environment = new Dictionary<string, string> { ["TS_LORAS"] = LoraCliFlags.ToJson(new[] { new LoraSpec(qwen) }) };
+        // A complete (tiny) FL2VA transformer, so the load gets as far as the companions it lacks.
+        // One folder down: the model looks for them beside it and in the parent folder, which
+        // must be this test's own and not the system's temporary folder.
+        using var fixtures = new MiniMaxH3LoraFixtures();
+        string model = Path.Combine(_dir, "h3", MiniMaxH3LoraFixtures.Fl2vaModel);
+        Directory.CreateDirectory(Path.GetDirectoryName(model)!);
+        File.Copy(fixtures.WriteTransformer(), model);
+
+        HostRun run = RunCliWith(model, Array.Empty<string>(), environment);
+
+        Assert.Contains("TS_LORAS names LoRA plug-ins qwen-plugin.json of type qwen-image-2.1-lora; " +
+            $"{MiniMaxH3LoraFixtures.Fl2vaModel} (minimax-h3) takes minimax-h3-lora plug-ins and runs without them.",
+            run.Stdout + run.Stderr, StringComparison.Ordinal);
+        Assert.DoesNotContain("Configuration error", run.Stderr, StringComparison.Ordinal);
+        // It went on to the load, which refuses the transformer for the companions it lacks.
+        Assert.Contains($"Loading model {MiniMaxH3LoraFixtures.Fl2vaModel}", run.Stdout, StringComparison.Ordinal);
+        AssertRefused(run, "MiniMax-H3 needs companion models beside the denoiser GGUF");
+    }
+
+    /// <summary>One configuration-error line naming <paramref name="reason"/>, and nothing
+    /// fetched: no request reached <paramref name="server"/> and no download was announced.</summary>
+    private static string AssertRefusedBeforeDownload(HostRun run, string reason, LoopbackCountingServer server)
+    {
+        string line = AssertOneLoraRefusal(run, reason);
+        Assert.Equal(0, server.Requests);
+        return line;
+    }
+
+    private static string AssertOneLoraRefusal(HostRun run, string reason)
+    {
+        string line = AssertOneConfigurationErrorLine(run, reason);
+        Assert.DoesNotContain("[model-download]", run.Stdout + run.Stderr, StringComparison.Ordinal);
+        return line;
+    }
+
     private static void AssertConfigurationError(HostRun run, string messageFragment)
     {
         string line = AssertOneConfigurationErrorLine(run, messageFragment);
@@ -399,26 +645,33 @@ public class HostLoadRefusalProcessTests : IDisposable
     private HostRun RunServer(string modelPath, string logLevel = "Information") =>
         RunServerWith(modelPath, Array.Empty<string>(), logLevel);
 
-    private HostRun RunServerWith(string modelPath, string[] extra, string logLevel = "Information",
+    /// <param name="modelPath">The <c>--model</c>, or null when a <c>--config</c> in
+    /// <paramref name="extra"/> names it.</param>
+    private HostRun RunServerWith(string? modelPath, string[] extra, string logLevel = "Information",
         IReadOnlyDictionary<string, string>? environment = null)
     {
         string dll = HostAssembly("TensorSharp.Server.Host", "TensorSharp.Server.Host.dll");
         return Run(dll, logLevel, environment,
-            new[] { "--model", modelPath, "--backend", "cpu", "--no-webui", "--no-skills", "--no-prefix-cache" }
+            ModelArgs(modelPath).Concat(new[] { "--backend", "cpu", "--no-webui", "--no-skills", "--no-prefix-cache" })
                 .Concat(extra).ToArray());
     }
 
     private HostRun RunCli(string modelPath) => RunCliWith(modelPath, Array.Empty<string>());
 
-    private HostRun RunCliWith(string modelPath, string[] extra, IReadOnlyDictionary<string, string>? environment = null)
+    /// <param name="modelPath">The <c>--model</c>, or null when a <c>--config</c> in
+    /// <paramref name="extra"/> names it.</param>
+    private HostRun RunCliWith(string? modelPath, string[] extra, IReadOnlyDictionary<string, string>? environment = null)
     {
         string dll = HostAssembly("TensorSharp.Cli", "TensorSharp.Cli.dll");
         string input = Path.Combine(_dir, "prompt.txt");
         File.WriteAllText(input, "hello");
         return Run(dll, "Information", environment,
-            new[] { "--model", modelPath, "--backend", "cpu", "--input", input, "--log-dir", Path.Combine(_dir, "cli-logs") }
+            ModelArgs(modelPath).Concat(new[] { "--backend", "cpu", "--input", input, "--log-dir", Path.Combine(_dir, "cli-logs") })
                 .Concat(extra).ToArray());
     }
+
+    private static string[] ModelArgs(string? modelPath) =>
+        modelPath == null ? Array.Empty<string>() : new[] { "--model", modelPath };
 
     private HostRun Run(string dll, string logLevel, IReadOnlyDictionary<string, string>? environment, params string[] args)
     {

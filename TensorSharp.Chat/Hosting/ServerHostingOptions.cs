@@ -69,8 +69,10 @@ namespace TensorSharp.Server.Hosting
             bool embeddingsEnabled = false,
             int embeddingThreads = 0,
             int embeddingContextSize = 0,
-            MultiAgentOptions? multiAgent = null)
+            MultiAgentOptions? multiAgent = null,
+            TensorSharp.Models.Video.VideoCanvasPolicy videoCanvasPolicy = TensorSharp.Models.Video.VideoCanvasPolicy.ModelRecipe)
         {
+            VideoCanvasPolicy = videoCanvasPolicy;
             MultiAgent = multiAgent ?? new MultiAgentOptions();
             MultiAgent.Validate();
             EmbeddingsEnabled = embeddingsEnabled;
@@ -331,6 +333,18 @@ namespace TensorSharp.Server.Hosting
 
         /// <summary>Default output height; see <see cref="DefaultVideoWidth"/>.</summary>
         public int DefaultVideoHeight { get; }
+
+        /// <summary>
+        /// How a keyframe sizes the canvas when neither a request nor the host gives a
+        /// size. <see cref="TensorSharp.Models.Video.VideoCanvasPolicy.ModelRecipe"/> (the
+        /// default) follows the model's released recipe, which keeps a keyframe's faces
+        /// intact at several times the cost; a host whose memory or time budget has not
+        /// been measured at that size chooses
+        /// <see cref="TensorSharp.Models.Video.VideoCanvasPolicy.CompactPreview"/>. This is
+        /// the host's call, not a command-line flag: an operator who wants a fixed size
+        /// sets <c>--video-width</c>/<c>--video-height</c> instead.
+        /// </summary>
+        public TensorSharp.Models.Video.VideoCanvasPolicy VideoCanvasPolicy { get; }
 
         /// <summary>
         /// Default denoising steps used when a video-generation request omits

@@ -33,5 +33,11 @@
   "app.shareNotifications.alert.title": "Open future shares faster?",
   "app.shareNotifications.alert.message": "iOS cannot let a Share extension switch apps directly. Allow notifications so future shares can offer a one-tap way to open TensorAgent.",
   "app.shareNotifications.alert.allow": "Allow",
-  "app.shareNotifications.alert.notNow": "Not now"
+  "app.shareNotifications.alert.notNow": "Not now",
+  "app.webLink.title": "Web page",
+  "app.webLink.back": "Back",
+  "app.webLink.forward": "Forward",
+  "app.webLink.close": "Close",
+  "app.webLink.loading": "Loading page…",
+  "app.webLink.failed": "This page could not be loaded."
 }

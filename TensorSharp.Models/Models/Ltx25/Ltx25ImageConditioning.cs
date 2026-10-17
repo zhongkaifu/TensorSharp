@@ -57,8 +57,13 @@ public static class Ltx25ImageConditioning
             throw new ArgumentException("Text-only mode cannot include images; use i2v, fl2v or keyframes.");
         if (images.Count == 0 && parameters.Mode is "i2v" or "fl2v" or "keyframes")
             throw new ArgumentException("The selected image generation mode requires images.");
-        if (parameters.Mode == "fl2v" && (images.Count != 2 || !positions.Contains(0) || !positions.Contains(frames - 1)))
-            throw new ArgumentException("fl2v requires a first-frame and a last-frame image.");
+        // i2v animates a first frame; an end image alone would otherwise become a last-frame guide unasked.
+        if (parameters.Mode == "i2v" && !positions.Contains(0))
+            throw new ArgumentException("i2v animates a first-frame image; to pin only the last frame use fl2v.");
+        // fl2v pins the last frame and optionally the first, as MiniMax-H3's fl2v does (sglang [-1] / [0,-1]).
+        if (parameters.Mode == "fl2v" && (images.Count is < 1 or > 2 || !positions.Contains(frames - 1)
+                                          || images.Count == 2 && !positions.Contains(0)))
+            throw new ArgumentException("fl2v pins a last-frame image, optionally with a first-frame image; use keyframes for other frames.");
         return images;
     }
 
@@ -66,8 +71,9 @@ public static class Ltx25ImageConditioning
     /// unchanged. Encoded image storage is [channel,height,width], not token-major.
     /// A refinement pass supplies its token-major <paramref name="rawNoise"/> and
     /// <paramref name="noiseScale"/>: like GaussianNoiser after the conditionings,
-    /// a guided token becomes clean + mask·scale·(noise − clean), while the other
-    /// tokens keep the caller's already noised latent.</summary>
+    /// the first-frame guide blends its clean latent with the caller's already
+    /// noised prior-stage latent. Appended guides have a zero prior latent, so
+    /// they blend with scale·noise instead. Unguided tokens are unchanged.</summary>
     public static Ltx25DenoiserInput Apply(Ltx25DenoiserInput initial, Ltx25GenerationSettings settings,
         IReadOnlyList<Ltx25EncodedImage> images, float[] rawNoise = null, float noiseScale = 1)
     {
@@ -111,8 +117,15 @@ public static class Ltx25ImageConditioning
                 for (int c = 0; c < 128; ++c)
                 {
                     int offset = token * 128 + c;
-                    float noise = rawNoise == null ? video[offset] : rawNoise[offset];
-                    video[offset] = clean[offset] + (noise - clean[offset]) * (denoise * noiseScale);
+                    // VideoConditionByLatentIndex preserves the prior-stage latent;
+                    // VideoConditionByKeyframeIndex appends zero placeholders. The
+                    // official GaussianNoiser first noises those latents, then applies
+                    // the clean/mask blend. Replacing the prior with clean here gives
+                    // fractional-strength guides the wrong refinement starting point.
+                    float noised = image.FrameIndex == 0 || rawNoise == null
+                        ? video[offset] : rawNoise[offset] * noiseScale;
+                    video[offset] = denoise == 0 ? clean[offset] : denoise == 1 ? noised
+                        : clean[offset] + (noised - clean[offset]) * denoise;
                 }
                 if (image.FrameIndex != 0)
                 {

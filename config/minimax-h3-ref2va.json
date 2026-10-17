@@ -28,8 +28,8 @@
   //   2. Qwen3-VL-32B     (video-text-encoder)  the text encoder, 50 layers  16.97 GiB
   //   3. the video VAE    (video-vae)           16x spatial / 4x temporal     5.21 GB
   //   4. the audio VAE    (audio-vae)           32 kHz stereo soundtrack      0.61 GB
-  // Only the denoiser differs from the FL2VA config; the other three are shared and
-  // will not download a second time if you already ran that one.
+  // Of these, only the denoiser differs from the FL2VA config; the other three are
+  // shared and will not download a second time if you already ran that one.
   //
   // THE TOKENIZER IS NOT AUTOMATED. The text-encoder GGUF carries none, and
   // auto-download can only fill in options that are flags — the tokenizer is not
@@ -46,9 +46,12 @@
   // both hosts, and the two spell steps differently — --video-steps N on the server,
   // --diffusion-steps N on the CLI, and the server takes no --cfg at all. So the
   // model's own defaults apply (20 steps, guidance off). H3 is CFG-distilled: cfg
-  // MUST stay 1.0, which the pipeline enforces by refusing anything higher. 4-8 steps
-  // is the fast operating point, at the cost of some chromatic fringing around moving
-  // subjects that is gone by ~20.
+  // MUST stay 1.0, which the pipeline enforces by refusing anything higher. Fewer
+  // steps cost some chromatic fringing around moving subjects that is gone by ~20.
+  //
+  // Ref2VA Turbo is not supported. The LightX2V Turbo plug-ins in config/lora/
+  // (minimax-h3-fl2v-turbo-*.json) were distilled on the FL2VA checkpoint, and this one
+  // refuses them at startup, so it runs the base schedule.
   //
   // The frame count snaps to the 17k+5 grid and fps is pinned to 24.
   "variables": {
@@ -70,7 +73,7 @@
   // it, so `--backend ggml_metal` still runs this file on Apple silicon.
   "backend": "ggml_cuda",
 
-  // The one entry that differs from minimax-h3-fl2va.json. The partition is read off
+  // The network that differs from minimax-h3-fl2va.json. The partition is read off
   // the FILE NAME, so keep "ref2va" in it if you rename or requantize.
   "model": {
     "path": "${modelRoot}/minimax_h3_ref2va_pruned-Q4_K.gguf",
@@ -112,6 +115,8 @@
     "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48"
   },
 
+  // References never set the canvas: they are not frames of the clip. So this file,
+  // unlike minimax-h3-fl2va.json, pins 640x384, which is also its text-to-video size.
   "width": 640,
   "height": 384,
   "video-frames": 22,

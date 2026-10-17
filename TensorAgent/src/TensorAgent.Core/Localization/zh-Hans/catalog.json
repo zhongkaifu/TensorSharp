@@ -41,6 +41,8 @@
   "catalog.lora.objectRemover.purpose": "移除附加照片上红框内的内容，并补全背景。它无法处理所有照片，请检查结果。",
   "catalog.lora.objectMover.purpose": "将附加照片上一个红框中的物体移动到第二个红框标记的位置。",
   "catalog.lora.animeConsistency.purpose": "将附加图片编辑为新的姿势、视角或表情时，保持动漫角色一致。实验性功能。",
+  "catalog.lora.minimaxH3Turbo8Step.purpose": "按蒸馏时的调度，用 8 步代替 20 步生成视频。在 768p 下为首尾帧检查点训练。",
+  "catalog.lora.minimaxH3Turbo4Step.purpose": "用 4 步代替 20 步生成视频。在 768p 下为首尾帧检查点训练。其调度为推断值：发布者未说明此版本的调度。",
   "catalog.extended.gemmaLarge.notes": "视觉组件及匹配的 MTP 草稿头可选下载。暂不支持 Gemma 的 DSpark/DFlash 草稿模型。 目录元数据已核实，尚未验证 TensorAgent 中的推理运行。",
   "catalog.extended.qwen35Large.notes": "混合架构的专家模型，视觉投影器可选下载。 目录元数据已核实，尚未验证 TensorAgent 中的推理运行。",
   "catalog.extended.qwen36Large.notes": "视觉组件可选下载。内置 NextN 头无需额外下载；应用默认采用 n-gram 推测解码。 目录元数据已核实，尚未验证 TensorAgent 中的推理运行。",

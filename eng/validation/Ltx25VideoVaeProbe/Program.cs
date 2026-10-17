@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using TensorSharp;
@@ -31,8 +32,12 @@ string Hash(string path)
 }
 void SaveFloats(string path, float[] data)
 {
-    byte[] bytes = new byte[checked(data.Length * 4)];
-    Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length); File.WriteAllBytes(path, bytes);
+    // A 1024x1024x145 output is 1.8 GB. Write its existing storage in bounded
+    // spans instead of allocating a second full-size byte array for evidence.
+    using var file = File.Create(path);
+    const int chunkFloats = 262144;
+    for (int start = 0; start < data.Length; start += chunkFloats)
+        file.Write(MemoryMarshal.AsBytes(data.AsSpan(start, Math.Min(chunkFloats, data.Length - start))));
 }
 var report = new Dictionary<string, object?>
 {

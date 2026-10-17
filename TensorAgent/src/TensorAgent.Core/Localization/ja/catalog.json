@@ -41,6 +41,8 @@
   "catalog.lora.objectRemover.purpose": "添付写真に描いた赤い枠の中を除去し、背景で埋めます。すべての写真でうまくいくとは限らないため、結果を確認してください。",
   "catalog.lora.objectMover.purpose": "添付写真に描いた赤い枠内の物を、もう 1 つの赤い枠で示した場所に移動します。",
   "catalog.lora.animeConsistency.purpose": "添付画像のポーズ、視点、表情を変更しても、アニメキャラクターの一貫性を保ちます。実験的な機能です。",
+  "catalog.lora.minimaxH3Turbo8Step.purpose": "蒸留時のスケジュールで、20 ステップの代わりに 8 ステップで動画を生成します。最初と最後のフレームを使うチェックポイント向けに 768p で学習されています。",
+  "catalog.lora.minimaxH3Turbo4Step.purpose": "20 ステップの代わりに 4 ステップで動画を生成します。最初と最後のフレームを使うチェックポイント向けに 768p で学習されています。スケジュールは推定です。公開元はこのバージョンのスケジュールを示していません。",
   "catalog.extended.gemmaLarge.notes": "視覚機能と対応する MTP ドラフトヘッドは任意でダウンロードできます。Gemma の DSpark/DFlash ドラフトには対応していません。 カタログのメタデータは確認済みです。TensorAgent での推論は未検証です。",
   "catalog.extended.qwen35Large.notes": "視覚プロジェクターを任意で追加できるハイブリッド混合エキスパートモデルです。 カタログのメタデータは確認済みです。TensorAgent での推論は未検証です。",
   "catalog.extended.qwen36Large.notes": "視覚機能は任意です。内蔵 NextN ヘッドの追加ダウンロードは不要です。アプリの推測デコードは既定で n-gram を使用します。 カタログのメタデータは確認済みです。TensorAgent での推論は未検証です。",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare a TensorSharp denoiser probe with unchanged official LTX CPU PyTorch.
 
-Uses the probe's exact deterministic latent/context generator. GGUF weights are
+Uses deterministic probe inputs or an integrity-checked real forward capture. GGUF weights are
 independently dequantized by gguf-py. Full or bounded diagnostic depth is a
 numerical component reference, not rendered-quality or GPU performance evidence.
 """
@@ -12,11 +12,123 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import json
+import math
 from pathlib import Path
+import resource
+import struct
 import subprocess
 import sys
 import threading
 import time
+
+
+def load_captured_inputs(probe, probe_path):
+    """Validate captured Float32 arrays before importing torch or loading weights.
+
+    Relative array paths are relative to the manifest. Null optional fields retain
+    their actual denoiser semantics; no positions/masks are inferred from geometry.
+    """
+    if probe.get("input_mode") != "captured":
+        raise ValueError("Expected input_mode=captured")
+    if probe.get("use_reference_lora", False) is not False:
+        raise ValueError("Captured Ingredients/LoRA forwards are not supported by this oracle")
+    config, tokens = probe["config"], probe["tokens"]
+    def positive(value):
+        if type(value) is not int or value < 1:
+            raise ValueError("Captured dimensions must be positive integers")
+        return value
+    v, a = positive(tokens["video"]), positive(tokens["audio"])
+    vc = positive(tokens.get("video_context", tokens.get("context")))
+    ac = positive(tokens.get("audio_context", tokens.get("context")))
+    dimensions = {name: positive(config[name]) for name in
+                  ("VideoChannels", "AudioChannels", "VideoContextDim", "AudioContextDim")}
+    shapes = dict(video=[v, dimensions["VideoChannels"]], audio=[a, dimensions["AudioChannels"]],
+                  video_context=[vc, dimensions["VideoContextDim"]], audio_context=[ac, dimensions["AudioContextDim"]],
+                  video_positions=[v, 3, 2], audio_positions=[a, 1, 2],
+                  video_timesteps=[v], audio_timesteps=[a], keyframe_mask=[v],
+                  video_denoise_mask=[v], clean_video=[v, dimensions["VideoChannels"]])
+    optional = {"video_timesteps", "audio_timesteps", "keyframe_mask", "video_denoise_mask", "clean_video"}
+    specs = probe["inputs"]
+    if set(specs) - set(shapes):
+        raise ValueError("Unsupported captured input fields: " + ", ".join(sorted(set(specs) - set(shapes))))
+    result = {}
+    for name, expected_shape in shapes.items():
+        spec = specs.get(name)
+        if spec is None:
+            if name not in optional:
+                raise ValueError("Missing captured input: " + name)
+            result[name] = None
+            continue
+        shape = spec.get("shape")
+        if (not isinstance(shape, list) or any(type(value) is not int or value < 1 for value in shape) or
+                shape != expected_shape and not (name.endswith("_timesteps") and shape == [1])):
+            raise ValueError("Captured input shape differs: " + name)
+        if spec.get("dtype") != "float32-le":
+            raise ValueError("Captured input must use float32-le: " + name)
+        path = Path(spec["path"])
+        if not path.is_absolute():
+            path = Path(probe_path).parent / path
+        if path.stat().st_size != math.prod(shape) * 4:
+            raise ValueError("Captured input byte length differs: " + name)
+        payload = path.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != spec.get("sha256"):
+            raise ValueError("Captured input SHA256 differs: " + name)
+        previous = None
+        for index, (value,) in enumerate(struct.iter_unpack("<f", payload)):
+            if not math.isfinite(value):
+                raise ValueError("Captured input is nonfinite: " + name)
+            if (name.endswith("_timesteps") or name == "video_denoise_mask") and not 0 <= value <= 1:
+                raise ValueError("Captured timestep/mask is outside [0,1]: " + name)
+            if name.endswith("_positions"):
+                if index % 2 and value < previous:
+                    raise ValueError("Captured position boundaries are reversed: " + name)
+                previous = value
+        result[name] = payload
+    for name in ("video_sigma", "audio_sigma"):
+        value = probe.get(name)
+        if type(value) not in (float, int) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError("Captured sigma must be finite [0,1]: " + name)
+    return result
+
+
+def captured_modalities(probe, payloads, np, torch, modality):
+    """Map exact capture storage to the unchanged official Modality contract."""
+    def tensor(name):
+        data = payloads[name]
+        return None if data is None else torch.from_numpy(np.frombuffer(data, dtype="<f4").copy())
+    result = []
+    for name, axes in (("video", 3), ("audio", 1)):
+        tokens = probe["tokens"][name]
+        context_tokens = probe["tokens"].get(name + "_context", probe["tokens"].get("context"))
+        sigma = probe[name + "_sigma"]
+        timesteps = tensor(name + "_timesteps")
+        if timesteps is None:
+            timesteps = torch.full((1, tokens), sigma, dtype=torch.float32)
+        else:
+            timesteps = timesteps.reshape(1, -1).expand(1, tokens)
+        keyframes = tensor("keyframe_mask") if name == "video" else None
+        result.append(modality(
+            latent=tensor(name).reshape(1, tokens, -1), sigma=torch.tensor([sigma], dtype=torch.float32),
+            timesteps=timesteps,
+            positions=tensor(name + "_positions").reshape(1, tokens, axes, 2).transpose(1, 2),
+            context=tensor(name + "_context").reshape(1, context_tokens, -1),
+            keyframes_mask=keyframes.reshape(1, tokens, 1) if keyframes is not None else None))
+    return tuple(result)
+
+
+def validate_captured_outputs(probe):
+    """Reject incomplete/tampered native velocity captures before the costly oracle."""
+    for name, channels in (("video", "VideoChannels"), ("audio", "AudioChannels")):
+        path = Path(probe["outputs"][name])
+        if not path.is_absolute():
+            raise ValueError("Captured output paths must be absolute")
+        if path.stat().st_size != probe["tokens"][name] * probe["config"][channels] * 4:
+            raise ValueError("Captured output byte length differs: " + name)
+        payload = path.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != probe["output_sha256"][name]:
+            raise ValueError("Captured output SHA256 differs: " + name)
+        if any(not math.isfinite(value) for (value,) in struct.iter_unpack("<f", payload)):
+            raise ValueError("Captured output is nonfinite: " + name)
 
 
 def memory_constraints():
@@ -129,6 +241,12 @@ def main():
         raise SystemExit("Refusing to replace existing oracle evidence")
     probe = json.loads(args.probe.read_text())
     blocks = validate_probe(probe, args.max_blocks)
+    input_mode = probe.get("input_mode", "synthetic")
+    if input_mode not in ("synthetic", "captured"):
+        raise SystemExit("Unknown input_mode: " + str(input_mode))
+    captured = load_captured_inputs(probe, args.probe) if input_mode == "captured" else None
+    if captured is not None:
+        validate_captured_outputs(probe)
     if args.threads < 1:
         raise SystemExit("--threads must be positive")
     probe_sha256 = hashlib.sha256(args.probe.read_bytes()).hexdigest()
@@ -197,32 +315,35 @@ def main():
             result[i] = (np.float32(seed >> 8) * np.float32(1 / 16777216) - np.float32(.5)) * np.float32(.2)
         return result
 
-    tokens = probe["tokens"]
-    v, a, c = tokens["video"], tokens["audio"], tokens["context"]
-    arrays = {"video": values(v * config["VideoChannels"], 1), "audio": values(a * config["AudioChannels"], 2),
-              "video_context": values(c * config["VideoContextDim"], 3), "audio_context": values(c * config["AudioContextDim"], 4)}
-    for name, array in arrays.items():
-        digest = hashlib.sha256(array.tobytes()).hexdigest()
-        if digest != probe["input_sha256"][name]:
-            raise SystemExit("Deterministic input SHA256 differs for " + name)
-    width, height, frames = probe["geometry"]
-    ft, ht, wt = (frames - 1) // 8 + 1, height // 32, width // 32
-    video_positions = []
-    for t in range(ft):
-        for h in range(ht):
-            for w in range(wt):
-                video_positions.append([np.float32(max(0, t * 8 - 7)) / np.float32(24),
-                                        np.float32(max(0, (t + 1) * 8 - 7)) / np.float32(24),
-                                        h * 32, (h + 1) * 32, w * 32, (w + 1) * 32])
-    audio_positions = [[np.float32(max(0, t * 4 - 3)) * np.float32(160) / np.float32(16000),
-                        np.float32(max(0, (t + 1) * 4 - 3)) * np.float32(160) / np.float32(16000)] for t in range(a)]
-    vp = torch.tensor(video_positions, dtype=torch.float32).reshape(1, v, 3, 2).transpose(1, 2)
-    ap = torch.tensor(audio_positions, dtype=torch.float32).reshape(1, a, 1, 2).transpose(1, 2)
-    sigma = probe["sigma"]
-    vm = Modality(torch.from_numpy(arrays["video"]).reshape(1, v, -1), torch.tensor([sigma]),
-                  torch.full((1, v), sigma), vp, torch.from_numpy(arrays["video_context"]).reshape(1, c, -1))
-    am = Modality(torch.from_numpy(arrays["audio"]).reshape(1, a, -1), torch.tensor([sigma]),
-                  torch.full((1, a), sigma), ap, torch.from_numpy(arrays["audio_context"]).reshape(1, c, -1))
+    if captured is not None:
+        vm, am = captured_modalities(probe, captured, np, torch, Modality)
+    else:
+        tokens = probe["tokens"]
+        v, a, c = tokens["video"], tokens["audio"], tokens["context"]
+        arrays = {"video": values(v * config["VideoChannels"], 1), "audio": values(a * config["AudioChannels"], 2),
+                  "video_context": values(c * config["VideoContextDim"], 3), "audio_context": values(c * config["AudioContextDim"], 4)}
+        for name, array in arrays.items():
+            digest = hashlib.sha256(array.tobytes()).hexdigest()
+            if digest != probe["input_sha256"][name]:
+                raise SystemExit("Deterministic input SHA256 differs for " + name)
+        width, height, frames = probe["geometry"]
+        ft, ht, wt = (frames - 1) // 8 + 1, height // 32, width // 32
+        video_positions = []
+        for t in range(ft):
+            for h in range(ht):
+                for w in range(wt):
+                    video_positions.append([np.float32(max(0, t * 8 - 7)) / np.float32(24),
+                                            np.float32(max(0, (t + 1) * 8 - 7)) / np.float32(24),
+                                            h * 32, (h + 1) * 32, w * 32, (w + 1) * 32])
+        audio_positions = [[np.float32(max(0, t * 4 - 3)) * np.float32(160) / np.float32(16000),
+                            np.float32(max(0, (t + 1) * 4 - 3)) * np.float32(160) / np.float32(16000)] for t in range(a)]
+        vp = torch.tensor(video_positions, dtype=torch.float32).reshape(1, v, 3, 2).transpose(1, 2)
+        ap = torch.tensor(audio_positions, dtype=torch.float32).reshape(1, a, 1, 2).transpose(1, 2)
+        sigma = probe["sigma"]
+        vm = Modality(torch.from_numpy(arrays["video"]).reshape(1, v, -1), torch.tensor([sigma]),
+                      torch.full((1, v), sigma), vp, torch.from_numpy(arrays["video_context"]).reshape(1, c, -1))
+        am = Modality(torch.from_numpy(arrays["audio"]).reshape(1, a, -1), torch.tensor([sigma]),
+                      torch.full((1, a), sigma), ap, torch.from_numpy(arrays["audio_context"]).reshape(1, c, -1))
     start = time.perf_counter()
     with torch.inference_mode():
         outputs = model(vm, am, None)
@@ -254,16 +375,25 @@ def main():
     result = dict(completed=True, reference_revision=revision, torch=torch.__version__, gguf=gguf_version,
                   checkpoint=probe["model"], checkpoint_sha256=checkpoint_sha256, probe=str(args.probe),
                   probe_sha256=probe_sha256, frequency_precision=probe["frequency_precision"],
-                  probe_backend=probe["backend"], probe_environment=probe.get("environment", {}),
+                  probe_backend=probe.get("backend", "unrecorded"), probe_environment=probe.get("environment", {}),
                   reference_device="cpu", reference_threads=args.threads,
+                  input_mode=input_mode, tokens=probe["tokens"],
+                  captured_input_sha256={name: spec["sha256"] if spec is not None else None
+                                         for name, spec in probe["inputs"].items()} if captured is not None else None,
+                  captured_input_bytes=sum(len(payload) for payload in captured.values() if payload is not None) if captured is not None else None,
+                  video_sigma=probe.get("video_sigma", probe.get("sigma")),
+                  audio_sigma=probe.get("audio_sigma", probe.get("sigma")),
                   tool_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   executed_blocks=blocks, max_blocks=args.max_blocks, full_depth=full_depth,
                   timestep_scale_multiplier=timestep_scale, av_ca_timestep_scale_multiplier=av_ca_timestep_scale,
                   dequantized_tensor_types=weight_stats["dequantized_tensor_types"], memory_constraints=constraints,
                   weight_residency_mode="one streamed block plus persistent non-block weights" if args.stream_block_weights else "all weights materialized",
                   weight_loading=weight_stats, reference_forward_includes_streamed_weight_loading=args.stream_block_weights,
+                  peak_process_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024),
+                  memory_scope="Process peak RSS includes mapped file pages, weights, activations and dequantization temporaries; estimated_dequantized_residency_bytes counts retained weights only.",
+                  one_video_attention_score_matrix_bytes=config["VideoHeads"] * probe["tokens"]["video"] ** 2 * 4,
                   load_dequantize_seconds=load_seconds, reference_forward_seconds=elapsed, comparisons=comparisons,
-                  scope="Official LTX component graph with synthetic projected contexts/latents and real checkpoint weights. " +
+                  scope="Official LTX component graph with " + ("captured actual projected contexts/latents, positions, keyframe markers and token timesteps" if captured is not None else "synthetic projected contexts/latents") + " and real checkpoint weights. " +
                         ("Full denoiser depth; " if full_depth else "Partial denoiser depth; ") +
                         "excludes text encoder/connectors/sampler/VAEs/full generation. CPU PyTorch timing is not a sdcpp performance comparison.")
     args.output.write_text(json.dumps(result, indent=2) + "\n")

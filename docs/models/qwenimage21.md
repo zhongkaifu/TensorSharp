@@ -390,7 +390,8 @@ such a merge needs Viggle's schedule, not Turbo's; declare `base` for it. Any ot
 is the base checkpoint. The server applies its declaration to every Qwen-Image model it
 loads, like the companion paths. The declaration means nothing to another model: the CLI
 refuses `--qwen-image-variant` with one (exit code 1), and the server loads it without the
-declaration and logs a warning, as it does for `--lora`.
+declaration and logs a warning, as it does for a `--lora` plug-in that a model loaded
+after startup does not take.
 
 ### Sampling
 
@@ -843,7 +844,7 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
 ```
 
 The flag reference, the plug-in config format and the table of the fourteen shipped
-plug-ins are in [USAGE.md](../../USAGE.md#qwen-image-21-lora-plug-ins).
+Qwen-Image-2.1 plug-ins are in [USAGE.md](../../USAGE.md#qwen-image-21-lora-plug-ins).
 
 ### Sampling recipes
 
@@ -1030,15 +1031,19 @@ A host that chooses plug-ins per picture passes them to `WebUiChatService`'s
 The set is swapped in under the same lock as the run, so a picture that waited behind
 another is made with the set it asked for. An unchanged set costs nothing; pass
 absolute paths, which is how the model records the set. The TensorAgent Mac app works this
-way: its pinned catalog contains the fourteen plug-ins of [USAGE.md's table](../../USAGE.md#qwen-image-21-lora-plug-ins),
+way: its pinned catalog contains the fourteen Qwen-Image-2.1 plug-ins of [USAGE.md's table](../../USAGE.md#qwen-image-21-lora-plug-ins)
+(and two MiniMax-H3 Turbo plug-ins for that model's keyframes checkpoint),
 offers those compatible with the loaded model, and applies the user's choice to each picture, its edit routes
 included (see [TensorAgent's README](../../TensorAgent/README.md)).
 
 ### Limitations
 
-- The plug-ins apply to Qwen-Image-2.1 only; the CLI refuses `--lora` with any
-  other model, and the server logs a warning and loads the other model without
-  them.
+- These plug-ins apply to Qwen-Image-2.1 only; MiniMax-H3 takes its own
+  [Turbo plug-ins](minimax-h3.md#turbo-plug-ins) and refuses these. Both hosts
+  refuse a `--lora` the startup model does not take before the plug-in downloads (a
+  model a `--config` still has to download is checked right after that download); a
+  model the server loads later runs without plug-ins it does not take, and the
+  server logs a warning naming them.
 - Only one plug-in per run can carry a sampling recipe, and a recipe with sigmas
   runs only the step counts it defines. Qwen-Image-2.1-Turbo takes none.
 - The Qwen-Image-2.1-Fix author's workflow also uses APG, FreSca and the `seeds_2`

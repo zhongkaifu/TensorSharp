@@ -637,6 +637,151 @@ public sealed class VideoTurnsTests
         }
     }
 
+    /// <summary>
+    /// A MiniMax-H3 request never carries steps, a flow shift, a sampler or a CFG: the base
+    /// model's own defaults apply, and a Turbo plug-in's contract fixes them itself (and would
+    /// refuse a value it does not fix). LTX's published recipe is the one family that sends them.
+    /// </summary>
+    [Theory]
+    [InlineData(false, 0)]
+    [InlineData(false, 1)]
+    [InlineData(false, 2)]
+    [InlineData(true, 0)]
+    [InlineData(true, 2)]
+    public void AMiniMaxH3RequestLeavesTheSamplingToTheModel(bool references, int photos)
+    {
+        string[] stills = Enumerable.Range(0, photos).Select(i => $"photo-{i}.png").ToArray();
+        Dictionary<string, object> payload = Payload(VideoTurns.Read(
+            Body(new { role = "user", content = "a fox in falling snow", stillImagePaths = stills, imagePaths = stills }),
+            references ? References : Keyframes));
+
+        foreach (string sampling in new[] { "steps", "flowShift", "sampler", "cfg" })
+            Assert.False(payload.ContainsKey(sampling), $"the H3 request carries {sampling}");
+    }
+
+    /// <summary>With LoRA plug-ins, every step frame names them; the clip and the end do not.</summary>
+    [Fact]
+    public async Task TheStepFramesNameThePlugInsTheClipIsMadeWith()
+    {
+        object[] service =
+        {
+            new { videoGen = true, step = 0, total = 8, phase = "text-encode", detail = (string?)null, elapsedSeconds = 0.5, etaSeconds = -1.0 },
+            new { videoGen = true, step = 1, total = 8, phase = "denoise", detail = (string?)null, elapsedSeconds = 9.0, etaSeconds = 63.0 },
+            new { videoGen = true, step = 8, total = 8, phase = "vae-decode", detail = (string?)null, elapsedSeconds = 72.0, etaSeconds = -1.0 },
+            new
+            {
+                done = true, url = "/uploads/v.mp4", audioUrl = "/uploads/v.wav", audioMuxed = true,
+                width = 640, height = 384, frames = 22, fps = 24, seed = 1L, codec = "h264", elapsedSeconds = 80.0,
+            },
+        };
+        List<JsonElement> named = await Collect(VideoTurns.Translate(ServiceFrames(service), "s", default, new[] { "LightX2V Turbo 8-Step" }));
+
+        JsonElement[] steps = named.Where(f => f.TryGetProperty("video_step", out _)).ToArray();
+        Assert.Equal(3, steps.Length);
+        Assert.All(steps, f => Assert.Equal(new[] { "LightX2V Turbo 8-Step" },
+            f.GetProperty("video_loras").EnumerateArray().Select(n => n.GetString())));
+        Assert.All(named.Where(f => !f.TryGetProperty("video_step", out _)), f => Assert.False(f.TryGetProperty("video_loras", out _)));
+        Assert.Equal(63.0, steps[1].GetProperty("eta").GetDouble());
+
+        // Without plug-ins the frames are what they always were.
+        List<JsonElement> plain = await Collect(VideoTurns.Translate(ServiceFrames(service), "s"));
+        Assert.All(plain, f => Assert.False(f.TryGetProperty("video_loras", out _)));
+        Assert.Equal(named.Count, plain.Count);
+    }
+
+    /// <summary>
+    /// A chat clip asks the host once, after the request is read and recorded, what plug-ins
+    /// it is made with, and the video service applies exactly those to the model before it
+    /// runs: through <see cref="ImageTurns.FramesFor"/>, the one route every turn takes. A choice
+    /// the host cannot honour ends the turn with the reason, and nothing is applied or made.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AClipIsMadeWithThePlugInsPreparedOnceForIt(bool refused)
+    {
+        string root = Path.Combine(Path.GetTempPath(), "video-loras-" + Guid.NewGuid().ToString("N"));
+        string uploads = Path.Combine(root, "uploads");
+        Directory.CreateDirectory(uploads);
+        try
+        {
+            string gguf = Path.Combine(root, "stand-in.gguf");
+            using (var writer = new BinaryWriter(File.Create(gguf)))
+            {
+                writer.Write(0x46554747u);
+                writer.Write(3u);
+                writer.Write(0UL);
+                writer.Write(0UL);
+                writer.Write(new byte[8]);
+            }
+            string weights = Path.Combine(root, "turbo.safetensors");
+            File.WriteAllBytes(weights, new byte[16]);
+            using var model = new PlugInVideoModel(gguf);
+            using var models = new ModelService();
+            FieldInfo modelField = models.LifecycleService.GetType().GetField("_model", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            modelField.SetValue(models.LifecycleService, model);
+            try
+            {
+                var options = new ServerHostingOptions(
+                    startupModelPath: gguf, startupMmProjPath: null, defaultBackend: "cpu",
+                    supportedBackends: new[] { new BackendOption("cpu", "CPU") },
+                    defaultMaxTokens: 256, maxTokensPinned: false,
+                    defaultVideoFrames: 0, defaultVideoFps: 0, defaultVideoWidth: 0,
+                    defaultVideoHeight: 0, defaultVideoSteps: 0, defaultVideoMode: null,
+                    uploadDirectory: uploads, logDirectory: Path.Combine(root, "logs"),
+                    fileLoggingEnabled: false, samplingDefaults: null);
+                var chat = new WebUiChatService(models, new SessionManager(), options,
+                    new UploadStoragePolicy(uploads), new SkillRegistry(new SkillRegistryOptions()),
+                    codeRunner: null, workspaces: null, codeArtifacts: null, NullLoggerFactory.Instance);
+                var recorded = new List<string>();
+                chat.OnChatRequest = (session, _) => recorded.Add(session);
+                var spec = new LoraSpec(weights, 1f, null);
+                var asked = new List<bool>();
+                ImageTurns.Preparation Prepare(bool editing)
+                {
+                    asked.Add(editing);
+                    // Asked after the request is recorded, as a picture asks after its plan.
+                    Assert.Equal(new[] { "s" }, recorded);
+                    return refused
+                        ? ImageTurns.Preparation.Refused("LightX2V Turbo 8-Step is turned on but its files are missing.")
+                        : ImageTurns.Preparation.Ready(new[] { spec }, new[] { "LightX2V Turbo 8-Step" });
+                }
+
+                List<JsonElement> frames = await Collect(ImageTurns.FramesFor(chat, Body(new { role = "user", content = "a fox in falling snow" }),
+                    CancellationToken.None, Prepare, ImageTurns.Planner.For(chat, uploads)));
+
+                Assert.Equal(new[] { false }, asked);
+                JsonElement last = frames[^1];
+                Assert.True(last.GetProperty("done").GetBoolean());
+                Assert.Equal("s", last.GetProperty("sessionId").GetString());
+                if (refused)
+                {
+                    Assert.Equal("LightX2V Turbo 8-Step is turned on but its files are missing.", Assert.Single(frames).GetProperty("error").GetString());
+                    Assert.Empty(model.Applied);
+                    Assert.Equal(0, model.GenerateCalls);
+                    return;
+                }
+                IReadOnlyList<LoraSpec> applied = Assert.Single(model.Applied);
+                Assert.Equal(spec, Assert.Single(applied));
+                Assert.Equal(1, model.GenerateCalls);
+                // The model's own sampling: nothing the request could contradict a plug-in with.
+                VideoGenerationParams parameters = model.Parameters!;
+                Assert.Equal(0, parameters.Steps);
+                Assert.Equal(0f, parameters.FlowShift);
+                Assert.Null(parameters.Sampler);
+                Assert.Contains(PlugInVideoModel.Captured, last.GetProperty("error").GetString());
+            }
+            finally
+            {
+                modelField.SetValue(models.LifecycleService, null);
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch (IOException) { }
+        }
+    }
+
     private static async IAsyncEnumerable<object> ServiceFrames(params object[] frames)
     {
         foreach (object frame in frames)
@@ -697,6 +842,50 @@ public sealed class VideoTurnsTests
         {
             GenerateCalls++;
             Prompt = prompt;
+            Parameters = parameters;
+            throw new NotSupportedException(Captured);
+        }
+
+        protected override float[] ForwardCore(int[] tokens) => throw new NotSupportedException();
+        protected override void ResetKVCacheCore() { }
+    }
+
+    /// <summary>A MiniMax-H3 keyframes stand-in that takes LoRA plug-ins and records each set
+    /// it is given; it stops at the clip, before any inference.</summary>
+    private sealed class PlugInVideoModel : ModelBase, IVideoGenerationModel, ILoraPluginHost
+    {
+        public const string Captured = "Clip request captured before inference.";
+        private IReadOnlyList<LoraSpec> _loras = Array.Empty<LoraSpec>();
+
+        public PlugInVideoModel(string path) : base(path, BackendType.Cpu) =>
+            Config = new ModelConfig { Architecture = VideoModelFamily };
+
+        public List<IReadOnlyList<LoraSpec>> Applied { get; } = new();
+        public VideoGenerationParams? Parameters { get; private set; }
+        public int GenerateCalls { get; private set; }
+
+        public string VideoModelFamily => "minimax-h3";
+        public int DefaultPreviewFrames => VideoTurns.DefaultFrames;
+        public bool SupportsAudio => true;
+        public bool SupportsImageConditioning => true;
+        public bool SupportsEndImageConditioning => true;
+        public bool SupportsReferenceConditioning => false;
+        public bool SupportsKeyframeConditioning => false;
+        public int MaxReferenceImages => 0;
+
+        public string LoraPluginType => LoraCliFlags.MiniMaxH3PluginType;
+        public IReadOnlyList<LoraSpec> LoraSpecs => _loras;
+        public bool AcceptsLora(LoraSpec spec) => true;
+
+        public void SetLoras(IReadOnlyList<LoraSpec> specs)
+        {
+            Applied.Add(specs.ToArray());
+            _loras = specs.ToArray();
+        }
+
+        public GeneratedVideo GenerateVideo(string prompt, VideoGenerationParams? parameters = null)
+        {
+            GenerateCalls++;
             Parameters = parameters;
             throw new NotSupportedException(Captured);
         }

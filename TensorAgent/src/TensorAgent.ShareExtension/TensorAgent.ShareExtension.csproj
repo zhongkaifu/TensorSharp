@@ -95,4 +95,8 @@
                     LogicalName="PrivacyInfo.xcprivacy" />
   </ItemGroup>
 
+  <!-- The extension is a bundle of its own, so the SDK checks Xcode for it too; it takes
+       the app's rule for an Xcode a minor release ahead of the SDK. -->
+  <Import Project="../TensorAgent.Maui/XcodeVersion.targets" />
+
 </Project>

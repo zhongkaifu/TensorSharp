@@ -160,11 +160,11 @@ public sealed class Ltx25VideoVaeDecoder : IDisposable
                     for (int layer = 0; layer < block.Layers; ++layer)
                     {
                         string p = path + ".res_blocks." + layer;
-                        using var activated1 = NormSilu(current);
-                        using var conv1 = Convolve(activated1, p + ".conv1.conv", cancellationToken);
-                        using var activated2 = NormSilu(conv1);
-                        using var conv2 = Convolve(activated2, p + ".conv2.conv", cancellationToken);
+                        using var conv2 = ResidualBranch(current, p, cancellationToken);
                         Ops.Add(current, current, conv2);
+                        // MLX's lazy sum otherwise keeps the completed branch and
+                        // previous current buffer alive into the next layer.
+                        if (_context.IsMlx) MlxLtx25VaeOps.Materialize(current);
                         Trace(p, current, trace);
                     }
                 }
@@ -188,6 +188,26 @@ public sealed class Ltx25VideoVaeDecoder : IDisposable
     }
 
     private Tensor NormSilu(Tensor input) => _ops.NormSilu(input);
+
+    private Tensor ResidualBranch(Tensor input, string name, CancellationToken cancellationToken)
+    {
+        // A full-resolution activation is several GiB for a six-second clip.
+        // Keep only the branch's current tensor, releasing each completed
+        // convolution/activation before constructing the next full-clip output.
+        Tensor current = null;
+        try
+        {
+            using (var activated = NormSilu(input))
+                current = Convolve(activated, name + ".conv1.conv", cancellationToken);
+            Replace(ref current, NormSilu(current));
+            // Evaluating now severs the lazy activation's dependency on conv1,
+            // so conv2 does not overlap both complete branch intermediates.
+            if (_context.IsMlx) MlxLtx25VaeOps.Materialize(current);
+            Replace(ref current, Convolve(current, name + ".conv2.conv", cancellationToken));
+            var result = current; current = null; return result;
+        }
+        finally { current?.Dispose(); }
+    }
 
     private Tensor Upsample(Tensor input, int temporalStride, int spatialStride)
     {

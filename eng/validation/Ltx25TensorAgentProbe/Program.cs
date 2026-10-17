@@ -110,7 +110,7 @@ var body=new Dictionary<string,object>{["prompt"]=prompt,["width"]=width,["heigh
 if(uploadedFirst!=null)body["imagePath"]=uploadedFirst;
 if(uploadedEnd!=null)body["endImage"]=uploadedEnd;
 if(uploadedReferences.Count>0){body["referenceImages"]=uploadedReferences;body["videoMode"]="keyframes";}
-else if(uploadedFirst!=null||uploadedEnd!=null)body["videoMode"]=uploadedFirst!=null&&uploadedEnd!=null?"fl2v":"i2v";
+else if(uploadedFirst!=null||uploadedEnd!=null)body["videoMode"]=uploadedEnd!=null?"fl2v":"i2v"; // fl2v: a last frame, optionally with a first
 if(!string.IsNullOrWhiteSpace(mode))body["videoMode"]=mode;
 for(int repeat=0;repeat<repeats;++repeat)
 {

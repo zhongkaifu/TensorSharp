@@ -81,7 +81,8 @@ namespace TensorSharp.AgentHost.Skills
         public static bool IsBuiltInTool(string? name) =>
             IsSkillTool(name) || SkillToolNames.IsCodeTool(name)
             || Knowledge.KnowledgeTools.IsTool(name)
-            || Agents.MultiAgentTools.IsTool(name);
+            || Agents.MultiAgentTools.IsTool(name)
+            || StudioTools.IsTool(name);
 
         /// <summary>
         /// Split one round's tool calls three ways: the ones this host answers, the ones
@@ -484,6 +485,8 @@ namespace TensorSharp.AgentHost.Skills
                 return call.Name switch
                 {
                     ListToolName => ExecuteList(context),
+                    _ when StudioTools.IsTool(call.Name) => context.Studio?.Execute(call, cancellationToken)
+                        ?? SkillToolResult.Failure("No Video Studio project was explicitly selected for this request."),
                     ReadToolName => ExecuteRead(call, context),
                     RunToolName => ExecuteRun(call, context, onToolOutput),
                     _ when SkillMarketplaceTools.IsTool(call.Name) =>
@@ -1007,6 +1010,7 @@ namespace TensorSharp.AgentHost.Skills
 
         /// <summary>Read-only knowledge access restricted to collections explicitly selected for this request.</summary>
         public Knowledge.KnowledgeToolScope? Knowledge { get; set; }
+        public StudioToolScope? Studio { get; set; }
         /// <summary>Children share source permissions and provenance, but not the evidence
         /// their own conversation has seen. Null uses the root scope's eager evidence.</summary>
         public Knowledge.KnowledgeRetrievalProgress? KnowledgeRetrieval { get; init; }

@@ -764,6 +764,11 @@
   }
 
   // ---- model state ---------------------------------------------------------
+  // Video Studio (studio.js) re-reads what the loaded model can make when this fires.
+  function modelChanged() {
+    try { window.dispatchEvent(new Event('tensorsharp:model-changed')); } catch (e) { /* An old WebView without Event(). */ }
+  }
+
   function paintModel(d) {
     var previousModel = state.model;
     var previousVideo = state.video;
@@ -792,6 +797,7 @@
     // What a video model can be given besides its description. The host reports it
     // for a video model and null for every other one.
     state.video = d && d.video ? Object.assign({}, d.video) : null;
+    if (previousModel !== state.model) modelChanged();
     // A foreground capability refresh must not discard an unsent clip's
     // length or image semantics. A different checkpoint starts a fresh choice.
     if (previousModel === state.model && state.video && state.video.supportsKeyframeConditioning
@@ -808,7 +814,7 @@
       if ($('lora-sheet').classList.contains('on')) closeSheets();
     }
     paintLoraAccess();
-    if (state.model && makesImages() && !state.loras) loadLoras(true).catch(function () { /* retry when the model details are opened */ });
+    if (state.model && takesLoras() && !state.loras) loadLoras(true).catch(function () { /* retry when the model details are opened */ });
   }
 
   function paintComposerHint() {
@@ -828,6 +834,10 @@
   // the capability the host reports, not by an architecture name: the two checkpoints
   // share one architecture and take different things.
   function makesVideo() { return !!state.video; }
+
+  // A model whose work LoRA plug-ins can apply to: pictures, or clips (MiniMax-H3's Turbo
+  // plug-ins). Which plug-ins, if any, the host says (WebUiRoutes.MapLoras).
+  function takesLoras() { return makesImages() || makesVideo(); }
 
   // The keyframes checkpoint starts the clip from a photo (and ends it on a second
   // one); the references checkpoint puts the people, things and sounds it is shown
@@ -1352,7 +1362,7 @@
       return;
     }
     if (state.maskEditing) { notice(t('page.send.finishSelection')); return; }
-    if (makesImages() && loraChoice !== null) {
+    if (takesLoras() && loraChoice !== null) {
       notice(t('page.send.waitForLoras')); return;
     }
     var source = imageSource(state.attachments);
@@ -2144,9 +2154,17 @@
    * tell, says about how long is left (its eta is -1 until then).
    */
   function filmingLabel(f) {
+    // With LoRA plug-ins the host names them on every step (VideoTurns.Translate).
+    var loras = f.video_loras && f.video_loras.length ? f.video_loras.join(' + ') : null;
     switch (f.video_phase) {
       case 'text-encode': return t('page.activity.readingDescription');
       case 'denoise':
+        if (loras !== null) {
+          return (f.video_steps
+            ? t('page.activity.filmingWithStep', { loras: loras, step: f.video_step, steps: f.video_steps })
+            : t('page.activity.filmingWith', { loras: loras }))
+            + timeLeft(Number(f.eta));
+        }
         return (f.video_steps
           ? t('page.activity.filmingStep', { step: f.video_step, steps: f.video_steps })
           : t('page.activity.filming'))
@@ -3134,30 +3152,33 @@
     info.appendChild(el('div', 'skillrow',
       state.model ? (pretty(state.model) + ' · ' + (state.arch || '?') + ' · ' + (state.backend || '')) : t('page.modelSheet.none')));
     paintLoraAccess();
-    if (state.model && makesImages()) loadLoras(true).catch(function () {});
+    if (state.model && takesLoras()) loadLoras(true).catch(function () {});
     openSheet('model-sheet');
   });
 
-  // ---- LoRA plug-ins (an image model) --------------------------------------
+  // ---- LoRA plug-ins (an image or video model) ------------------------------
   //
-  // The plug-ins the host offers for the image model (WebUiRoutes.MapLoras): what is
-  // downloaded, what is on, and how strongly. A change is saved, and the host applies
-  // it to the next picture, so a picture being drawn keeps the plug-ins it started with.
+  // The plug-ins the host offers for the image or video model (WebUiRoutes.MapLoras): what
+  // is downloaded, what is on, and how strongly. A change is saved, and the host applies it
+  // to the next picture or clip, so one being made keeps the plug-ins it started with. A
+  // video model is offered speed plug-ins only, and the sheet says so in a clip's words.
   var loraPoll = null;
   var loraModelVersion = 0;
   var loraReturnFocus = null;
   function supportsLoras(d) {
-    return !!(state.model && makesImages() && d && d.supportsLoras === true
+    return !!(state.model && takesLoras() && d && d.supportsLoras === true
       && (!d.loadedModelFile || d.loadedModelFile === state.model) && d.loras && d.loras.length);
   }
   function paintLoraAccess() {
-    var d = state.loras, supported = supportsLoras(d);
+    var d = state.loras, supported = supportsLoras(d), video = makesVideo();
     $('composer-loras').style.display = supported ? '' : 'none';
     $('open-loras').style.display = supported ? '' : 'none';
     var selected = ((d && d.loras) || []).filter(function (l) { return l.chosen; }).map(function (l) { return l.name; });
-    var summary = selected.length ? selected.join(' + ') : t('page.lora.choose');
+    var summary = selected.length ? selected.join(' + ') : video ? t('page.lora.chooseSpeed') : t('page.lora.choose');
     $('composer-loras-hint').textContent = summary;
-    $('loras-hint').textContent = selected.length ? summary : t('page.modelSheet.lorasHint');
+    $('loras-hint').textContent = selected.length ? summary
+      : video ? t('page.modelSheet.lorasHintVideo') : t('page.modelSheet.lorasHint');
+    $('lora-hint').textContent = video ? t('page.lora.hintVideo') : t('markup.loras.hint');
     if (!supported && $('lora-sheet').classList.contains('on')) closeSheets();
   }
   // The choice last sent, until the host answers it: a second change made before then
@@ -3250,14 +3271,14 @@
   function finishPreviousModelChoice(seq) {
     if (seq !== loraSeq) return;
     loraChoice = null;
-    if (state.model && makesImages()) return loadLoras();
+    if (state.model && takesLoras()) return loadLoras();
   }
   function saveLoras(list) {
     loraChoice = list;
     return queueLoras(function () {
       return fetch('/api/agent/loras/choice', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ loras: list }),
-      }).then(loraJson);
+      }).then(loraJson).then(function (value) { modelChanged(); return value; });
     }, null, true);
   }
   function toggleLora(l, on) {
@@ -3265,9 +3286,11 @@
     var d = state.loras || {};
     var list = currentLoras().filter(function (c) { return c.id !== l.id; });
     if (on) {
-      // One speed plug-in at a time: two step schedules cannot both apply.
+      // One speed plug-in per model at a time: two step schedules cannot both apply. Another
+      // model's speed plug-in (chosen while it was loaded) stays on for that model's work.
       if (l.kind === 'Speed') {
-        var speeds = ((d.loras) || []).filter(function (x) { return x.kind === 'Speed'; }).map(function (x) { return x.id; });
+        var speeds = ((d.loras) || []).filter(function (x) { return x.kind === 'Speed' && x.baseModel === l.baseModel; })
+          .map(function (x) { return x.id; });
         list = list.filter(function (c) { return speeds.indexOf(c.id) < 0; });
       }
       list.push({ id: l.id, strength: l.defaultStrength });
@@ -5289,6 +5312,27 @@
     if (!hit) return;
     ev.preventDefault();
     post('/api/agent/events', { type: 'open-file', url: hit.url, name: hit.name });
+  });
+
+  // A WebView's target="_blank" handling differs by platform: a web link can
+  // replace the conversation or open nothing at all. Ask the app to show its own
+  // browser popup, leaving this page and its composer alive underneath it.
+  document.addEventListener('click', function (ev) {
+    if (!state.native || ev.defaultPrevented || ev.button) return;
+    for (var n = ev.target; n && n !== document; n = n.parentNode) {
+      if (n.tagName !== 'A') continue;
+      if (n.getAttribute && n.getAttribute('download') !== null) return;
+      var href = String((n.getAttribute && n.getAttribute('href')) || n.href || '').trim();
+      if (!href || href.charAt(0) === '#' || artifactPath(href) || knowledgeSourceHref(n)) return;
+      // The browser resolves the property against the document's base URL, so
+      // relative and protocol-relative hyperlinks work too. Only web pages belong
+      // in this viewer; mail and other application links keep their usual handling.
+      var url = String(n.href || href);
+      if (!/^https?:\/\//i.test(url)) return;
+      ev.preventDefault();
+      post('/api/agent/events', { type: 'open-link', url: url, name: n.textContent || '' });
+      return;
+    }
   });
 
   // The page heals itself, without needing the app to tell it to. Opening any other

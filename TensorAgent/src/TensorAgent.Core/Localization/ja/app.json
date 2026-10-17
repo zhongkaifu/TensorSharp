@@ -33,5 +33,11 @@
   "app.shareNotifications.alert.title": "次回から共有内容をすばやく開きますか？",
   "app.shareNotifications.alert.message": "iOS では共有拡張機能から直接アプリを切り替えられません。通知を許可すると、次回から共有後に通知を 1 回タップして TensorAgent を開けます。",
   "app.shareNotifications.alert.allow": "許可",
-  "app.shareNotifications.alert.notNow": "今はしない"
+  "app.shareNotifications.alert.notNow": "今はしない",
+  "app.webLink.title": "ウェブページ",
+  "app.webLink.back": "戻る",
+  "app.webLink.forward": "進む",
+  "app.webLink.close": "閉じる",
+  "app.webLink.loading": "ページを読み込み中…",
+  "app.webLink.failed": "このページを読み込めませんでした。"
 }

@@ -424,5 +424,7 @@
   <Import Project="GgmlExportedSymbols.targets" Condition="'$(TensorAgentPlatform)' == 'ios'" />
   <!-- The embedded CPython entry points the Mac app does not link; see the file. -->
   <Import Project="EmbeddedPythonSymbols.targets" Condition="'$(TensorAgentPlatform)' == 'maccatalyst'" />
+  <!-- An Xcode a minor release ahead of the Apple SDK builds with a warning; see the file. -->
+  <Import Project="XcodeVersion.targets" Condition="'$(TensorAgentPlatform)' == 'ios' Or '$(TensorAgentPlatform)' == 'maccatalyst'" />
 
 </Project>

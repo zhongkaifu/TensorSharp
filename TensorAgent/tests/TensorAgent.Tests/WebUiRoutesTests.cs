@@ -593,7 +593,8 @@ public sealed class WebUiRoutesTests : IDisposable
         string head = "\n<style id=\"tensoragent-language-loading\">body{visibility:hidden}</style>\n"
             + TensorAgent.Core.Localization.PageStrings.Tag() + "\n";
         const string tag = "\n<link rel=\"stylesheet\" href=\"/mask-editor.css\">\n"
-            + "<script src=\"/mask-editor.js\"></script>\n<script src=\"/tensoragent.js\"></script>\n";
+            + "<script src=\"/mask-editor.js\"></script>\n<script src=\"/tensoragent.js\"></script>\n"
+            + "<link rel=\"stylesheet\" href=\"/studio.css\"><script src=\"/studio.js\"></script>\n";
         string text = Encoding.UTF8.GetString(served);
         Assert.Contains(tag, text, StringComparison.Ordinal);
         Assert.Contains(head, text, StringComparison.Ordinal);

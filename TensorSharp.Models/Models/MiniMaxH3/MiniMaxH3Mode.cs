@@ -118,6 +118,11 @@ namespace TensorSharp.Models.MiniMaxH3
             if (mode == MiniMaxH3Mode.ImageToVideo && !hasFirst)
                 throw new InvalidOperationException(
                     "--video-mode i2v needs a conditioning image. Upload an image or pass --image.");
+            // i2v pins only the first frame; an end image would otherwise be pinned too, unasked.
+            if (mode == MiniMaxH3Mode.ImageToVideo && hasLast)
+                throw new InvalidOperationException(
+                    "--video-mode i2v animates only a first frame; use --video-mode fl2v to also " +
+                    "(or only) pin the last frame with --end-image.");
             if (mode == MiniMaxH3Mode.FirstLastFrame && !(hasFirst || hasLast))
                 throw new InvalidOperationException(
                     "--video-mode fl2v needs a first and/or last conditioning image. " +

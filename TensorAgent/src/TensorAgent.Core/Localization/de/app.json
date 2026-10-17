@@ -33,5 +33,11 @@
   "app.shareNotifications.alert.title": "Künftige Freigaben schneller öffnen?",
   "app.shareNotifications.alert.message": "iOS erlaubt einer Teilen-Erweiterung keinen direkten App-Wechsel. Erlaube Mitteilungen, damit du TensorAgent bei künftigen Freigaben mit einem Tippen öffnen kannst.",
   "app.shareNotifications.alert.allow": "Erlauben",
-  "app.shareNotifications.alert.notNow": "Nicht jetzt"
+  "app.shareNotifications.alert.notNow": "Nicht jetzt",
+  "app.webLink.title": "Webseite",
+  "app.webLink.back": "Zurück",
+  "app.webLink.forward": "Vorwärts",
+  "app.webLink.close": "Schließen",
+  "app.webLink.loading": "Seite wird geladen…",
+  "app.webLink.failed": "Diese Seite konnte nicht geladen werden."
 }

@@ -33,5 +33,11 @@
   "app.shareNotifications.alert.title": "¿Abrir más rápido los próximos elementos compartidos?",
   "app.shareNotifications.alert.message": "iOS no permite que una extensión para compartir cambie de app directamente. Permite las notificaciones para que los próximos elementos compartidos ofrezcan abrir TensorAgent con un toque.",
   "app.shareNotifications.alert.allow": "Permitir",
-  "app.shareNotifications.alert.notNow": "Ahora no"
+  "app.shareNotifications.alert.notNow": "Ahora no",
+  "app.webLink.title": "Página web",
+  "app.webLink.back": "Atrás",
+  "app.webLink.forward": "Adelante",
+  "app.webLink.close": "Cerrar",
+  "app.webLink.loading": "Cargando la página…",
+  "app.webLink.failed": "No se pudo cargar esta página."
 }

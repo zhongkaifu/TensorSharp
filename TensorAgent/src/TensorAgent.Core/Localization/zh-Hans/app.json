@@ -33,5 +33,11 @@
   "app.shareNotifications.alert.title": "更快地打开以后的分享内容？",
   "app.shareNotifications.alert.message": "iOS 不允许分享扩展直接切换应用。允许通知后，以后的分享可以提供一键打开 TensorAgent 的方式。",
   "app.shareNotifications.alert.allow": "允许",
-  "app.shareNotifications.alert.notNow": "暂不"
+  "app.shareNotifications.alert.notNow": "暂不",
+  "app.webLink.title": "网页",
+  "app.webLink.back": "后退",
+  "app.webLink.forward": "前进",
+  "app.webLink.close": "关闭",
+  "app.webLink.loading": "正在加载网页…",
+  "app.webLink.failed": "无法加载此网页。"
 }

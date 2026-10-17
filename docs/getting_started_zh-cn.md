@@ -192,7 +192,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
 
 1. **先选对 checkpoint。** Wan 视频优先使用 Turbo/Lightning/4-step 蒸馏 GGUF。Qwen-Image-2.1 可加上 `config/lora/` 中的步数蒸馏 [LoRA 插件](models/qwenimage21_zh-cn.md#lora-插件)（4–8 步，取代默认的 40 步）。
 2. **使用匹配的后端。** NVIDIA：`ggml_cuda`；Apple Silicon 和 iOS：`ggml_metal`；CPU：`ggml_cpu`（需要可移植性时使用纯托管 `cpu`）。
-3. **先减少工作量，再调参数。** H3 使用 `--cfg 1.0` 和 4–8 步；媒体任务优先降低分辨率、帧数或步数。
+3. **先减少工作量，再调参数。** H3 使用 `--cfg 1.0`，想少跑几步时在 FL2VA 上加 [Turbo 插件](models/minimax-h3_zh-cn.md#turbo-插件)（8 或 4 步），而不是调低基础步数；媒体任务优先降低分辨率、帧数或步数。
 4. **最后再扩展或投机。** 根据模型和负载尝试 `--draft-model` / `--spec`、`--n-cpu-moe` 或 `--tp N`。
 
 详见[性能指南与快速路径](PROJECT_STATUS_zh-cn.md#让它跑得更快)、[模型卡片](models/README_zh-cn.md)和[环境变量功能矩阵](env_var_feature_matrix_zh-cn.md)。

@@ -1265,13 +1265,16 @@ namespace TensorSharp.Chat
         /// </summary>
         public bool LoadedModelMakesImages => _svc.Model is TensorSharp.Models.QwenImage.QwenImageModel;
 
+        /// <summary>The host's authoritative persistent Studio service, shared by chat tools and manual editing.</summary>
+        public TensorSharp.Studio.StudioService Studio { get; set; }
+
         /// <summary>Whether the loaded model makes video clips (see <see cref="LoadedModelMakesImages"/>).</summary>
         public bool LoadedModelMakesVideo => LoadedVideoModel != null;
 
         /// <summary>
         /// The loaded model when it makes video clips, otherwise null: what it can be given
         /// (keyframes or references, how many, with sound or not) decides how a host turns
-        /// a chat message into a <see cref="VideoGenerateStreamAsync"/> request.
+        /// a chat message into a <see cref="VideoGenerateStreamAsync(JsonElement, IReadOnlyList{LoraSpec}, CancellationToken)"/> request.
         /// </summary>
         public TensorSharp.Models.Video.IVideoGenerationModel LoadedVideoModel =>
             _svc.Model as TensorSharp.Models.Video.IVideoGenerationModel;
@@ -1568,15 +1571,17 @@ namespace TensorSharp.Chat
 
         /// <summary>
         /// Swap <paramref name="loras"/> into <paramref name="model"/> unless it already carries
-        /// that set; null means the caller does not choose plug-ins. Called inside
-        /// <see cref="_imageEditLock"/>, so the picture that follows is made with the set it was
-        /// asked with, whatever the request it waited behind used. The model records a set as
-        /// <see cref="LoraCliFlags.Resolve"/> expands it (a plug-in manifest becomes its weights
-        /// and config), so a set given in another form is compared in that one: compared as
-        /// given, it reloaded on every picture.
+        /// that set; null means the caller does not choose plug-ins. Called inside the lock its
+        /// requests take (<see cref="_imageEditLock"/> for pictures, the model's
+        /// <see cref="ModelBase.GpuComputeLock"/> for clips), so the picture or clip that follows
+        /// is made with the set it was asked with, whatever the request it waited behind used.
+        /// The model records a set as <see cref="LoraCliFlags.Resolve"/> expands it (a plug-in
+        /// manifest becomes its weights and config), so a set given in another form is compared
+        /// in that one: compared as given, it reloaded on every picture. <paramref name="what"/>
+        /// names the request in the log ("Image request", "Video request").
         /// </summary>
         private static void ApplyLoras(
-            TensorSharp.Models.QwenImage.QwenImageModel model, IReadOnlyList<LoraSpec> loras, ILogger logger)
+            ILoraPluginHost model, IReadOnlyList<LoraSpec> loras, ILogger logger, string what)
         {
             if (loras == null || model.LoraSpecs.SequenceEqual(loras))
                 return;
@@ -1591,12 +1596,48 @@ namespace TensorSharp.Chat
             {
                 throw new LoraApplyException("The LoRA plug-ins could not be applied: " + ex.Message, ex);
             }
-            logger.LogInformation(LogEventIds.UploadReceived, "Image request: LoRA plug-ins {Loras} applied in {Seconds:F2}s",
-                loras.Count == 0 ? "(none)" : string.Join(", ", loras.Select(l => Path.GetFileName(l.Path) + "@" + l.Scale)),
+            logger.LogInformation(LogEventIds.UploadReceived, "{Request}: LoRA plug-ins {Loras} applied in {Seconds:F2}s",
+                what, loras.Count == 0 ? "(none)" : string.Join(", ", loras.Select(l => Path.GetFileName(l.Path) + "@" + l.Scale)),
                 swap.Elapsed.TotalSeconds);
         }
 
-        /// <summary>A plug-in set the model refused; the model keeps the set it had.</summary>
+        /// <summary>
+        /// <see cref="ApplyLoras"/> for a clip: null leaves the model's plug-ins as they are; a
+        /// model that takes plug-ins (<see cref="ILoraPluginHost"/>) is given exactly
+        /// <paramref name="loras"/>, an empty list removing them; a model that takes none refuses
+        /// a non-empty set rather than making the clip without it.
+        /// </summary>
+        private static void ApplyVideoLoras(
+            TensorSharp.Models.Video.IVideoGenerationModel model, IReadOnlyList<LoraSpec> loras, ILogger logger)
+        {
+            if (loras == null)
+                return;
+            if (model is ILoraPluginHost host)
+                ApplyLoras(host, loras, logger, "Video request");
+            else if (loras.Count > 0)
+                throw new LoraApplyException($"{model.VideoModelFamily} takes no LoRA plug-ins.", null);
+        }
+
+        /// <summary>
+        /// Refuse to run a job admitted for another sampling recipe. A host that admits a job
+        /// against the recipe the model advertised (Studio binds its
+        /// <see cref="TensorSharp.Models.Video.VideoSamplingContract.Id"/>) passes that id; the
+        /// model's plug-ins may have changed since, and the steps the job was planned with belong
+        /// to the old recipe. Null means the caller bound none. Checked after the plug-ins are
+        /// applied, under the lock the generation runs in, so nothing can change it in between.
+        /// </summary>
+        private static void CheckSamplingRecipe(TensorSharp.Models.Video.IVideoGenerationModel model, string expected)
+        {
+            if (expected == null)
+                return;
+            string actual = model.SamplingContract?.Id ?? TensorSharp.Models.Video.VideoSamplingContract.NativeId;
+            if (!string.Equals(actual, expected, StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    $"The video model's sampling recipe is {actual}; this job was admitted for {expected}. Refresh and retry.");
+        }
+
+        /// <summary>A plug-in set the model refused, or a set for a model that takes none; the
+        /// model keeps the set it had.</summary>
         private sealed class LoraApplyException(string message, Exception inner) : InvalidOperationException(message, inner);
 
         private async Task<object> RunImageEditAsync(
@@ -1621,7 +1662,7 @@ namespace TensorSharp.Chat
                         cancellationToken.ThrowIfCancellationRequested();
                         var inputs = imageBytesList.ConvertAll(bytes => DecodeRequestImage(bytes, "image"));
                         ValidateImageMaskGeometry(p, inputs);
-                        ApplyLoras(model, loras, logger);
+                        ApplyLoras(model, loras, logger, "Image request");
                         p.OnStep = (_, _, _) => cancellationToken.ThrowIfCancellationRequested();
                         var output = generate ? model.GenerateImage(prompt, p) : model.EditImage(prompt, inputs, p);
                         TensorSharp.Models.QwenImage.ImageIO.SavePng(outPath, output);
@@ -1855,7 +1896,7 @@ namespace TensorSharp.Chat
                         var inputs = imageBytesList.ConvertAll(bytes => DecodeRequestImage(bytes, "image"));
                         ct.ThrowIfCancellationRequested();
                         ValidateImageMaskGeometry(p, inputs);
-                        ApplyLoras(editModel, loras, logger);
+                        ApplyLoras(editModel, loras, logger, "Image request");
                         p.PreviewCount = previewCount;
                         p.OnStep = (step, total, preview) =>
                             {
@@ -1977,6 +2018,9 @@ namespace TensorSharp.Chat
         /// </summary>
         public void EnsureVideoGenerationAvailable() => RequireVideoModel();
 
+        /// <summary>Fresh copies keep Studio's capability resolution from changing chat request defaults.</summary>
+        internal TensorSharp.Models.Video.VideoGenerationParams VideoDefaults => VideoGenerationParamsParser.CreateDefaults(_options);
+
         private TensorSharp.Models.Video.IVideoGenerationModel RequireVideoModel()
         {
             if (_svc.Model is not TensorSharp.Models.Video.IVideoGenerationModel videoModel)
@@ -1991,9 +2035,20 @@ namespace TensorSharp.Chat
         /// frames, fps, seed, codec, elapsedSeconds }</c>. A request the model can explain
         /// (wrong checkpoint for the mode, a mode without its inputs) is a 400 carrying
         /// that explanation, not a 500. The non-streaming generation runs to completion;
-        /// cancellation is honoured by <see cref="VideoGenerateStreamAsync"/>.
+        /// cancellation is honoured by <see cref="VideoGenerateStreamAsync(JsonElement, CancellationToken)"/>.
         /// </summary>
-        public async Task<object> VideoGenerateAsync(JsonElement body, CancellationToken cancellationToken)
+        public Task<object> VideoGenerateAsync(JsonElement body, CancellationToken cancellationToken) =>
+            VideoGenerateAsync(body, null, cancellationToken);
+
+        /// <summary>
+        /// <see cref="VideoGenerateAsync(JsonElement, CancellationToken)"/> made with exactly the
+        /// LoRA plug-ins <paramref name="loras"/> (an empty list removes the model's; null leaves
+        /// them as they are). The set is applied under the lock the clip runs in, so the clip is
+        /// made with it whatever the request it waited behind used. A set that cannot be applied
+        /// is a 500 with the reason, as for pictures, and the previous set stays; a request that
+        /// contradicts the plug-in's sampling recipe is a 400 with the model's explanation.
+        /// </summary>
+        public async Task<object> VideoGenerateAsync(JsonElement body, IReadOnlyList<LoraSpec> loras, CancellationToken cancellationToken)
         {
             var logger = _loggerFactory.CreateLogger("TensorSharp.Server.VideoGenerate");
             var videoModel = RequireVideoModel();
@@ -2019,7 +2074,12 @@ namespace TensorSharp.Chat
             VideoGenerationResult result;
             try
             {
-                result = await GenerateVideoCoreAsync(videoModel, prompt, p);
+                result = await GenerateVideoCoreAsync(videoModel, prompt, p, loras, expectedSamplingRecipe: null);
+            }
+            catch (LoraApplyException ex)
+            {
+                logger.LogError(LogEventIds.ChatFailed, ex, "Video generate failed");
+                throw new WebUiRequestRejectedException(500, new { error = ex.Message });
             }
             catch (Exception ex) when (IsVideoRequestRejection(ex))
             {
@@ -2049,21 +2109,85 @@ namespace TensorSharp.Chat
         /// video model (400 otherwise) and the upload directory must have headroom
         /// (507); the model's own rejections propagate unwrapped so the caller can shape them.
         /// </summary>
-        public Task<VideoGenerationResult> GenerateVideoAsync(string prompt, TensorSharp.Models.Video.VideoGenerationParams parameters)
+        public Task<VideoGenerationResult> GenerateVideoAsync(string prompt, TensorSharp.Models.Video.VideoGenerationParams parameters, TensorSharp.Models.Video.IVideoGenerationModel expectedModel = null) =>
+            GenerateVideoAsync(prompt, parameters, expectedModel, null, null);
+
+        /// <summary>
+        /// <see cref="GenerateVideoAsync(string, TensorSharp.Models.Video.VideoGenerationParams, TensorSharp.Models.Video.IVideoGenerationModel)"/>
+        /// made with exactly the LoRA plug-ins <paramref name="loras"/> (an empty list removes the
+        /// model's; null leaves them as they are), for a job admitted against the sampling recipe
+        /// <paramref name="expectedSamplingRecipe"/> (a
+        /// <see cref="TensorSharp.Models.Video.VideoSamplingContract.Id"/>; null binds none). The
+        /// set is applied and the recipe checked under the lock the clip runs in; a set the model
+        /// refuses, or a recipe that is no longer the model's, throws
+        /// <see cref="InvalidOperationException"/> before anything is generated.
+        /// </summary>
+        public Task<VideoGenerationResult> GenerateVideoAsync(
+            string prompt, TensorSharp.Models.Video.VideoGenerationParams parameters,
+            TensorSharp.Models.Video.IVideoGenerationModel expectedModel,
+            IReadOnlyList<LoraSpec> loras, string expectedSamplingRecipe)
         {
             if (parameters == null) throw new ArgumentNullException(nameof(parameters));
             var videoModel = RequireVideoModel();
+            if (expectedModel != null && !ReferenceEquals(expectedModel, videoModel))
+                throw new InvalidOperationException("The selected video model changed before generation began.");
             string conditioningError = VideoImageConditionsError(videoModel, parameters);
             if (conditioningError != null)
                 throw new WebUiRequestRejectedException(400, new { error = conditioningError });
             if (!_uploads.HasQuotaHeadroom(out string quotaError))
                 throw new WebUiRequestRejectedException(507, new { error = quotaError });
-            return GenerateVideoCoreAsync(videoModel, prompt ?? "", parameters);
+            return GenerateVideoCoreAsync(videoModel, prompt ?? "", parameters, loras, expectedSamplingRecipe);
+        }
+
+        /// <summary>
+        /// Run <paramref name="generate"/> on <paramref name="videoModel"/> under the guard every
+        /// clip takes, the plain and the streamed path alike. Generations are serialised
+        /// (<see cref="_videoGenLock"/>); a request that waited behind another must still find
+        /// its model loaded, so a model switched or unloaded meanwhile is refused rather than
+        /// used. The clip holds a use of the model (<see cref="ModelBase.TryEnterUse"/>), which
+        /// an unload waits for, and its <see cref="ModelBase.GpuComputeLock"/>, which the unload
+        /// takes to dispose: the plug-ins, the recipe check, the generation and the save all run
+        /// with the model alive. An unload that began while the plug-ins were being applied (a
+        /// MiniMax-H3 adapter takes seconds to pack) is checked for again before the clip, so it
+        /// is not kept waiting for a whole generation.
+        /// </summary>
+        private T RunVideoGeneration<T>(
+            TensorSharp.Models.Video.IVideoGenerationModel videoModel, IReadOnlyList<LoraSpec> loras,
+            string expectedSamplingRecipe, ILogger logger, CancellationToken cancellationToken, Func<T> generate)
+        {
+            lock (_videoGenLock)
+            {
+                // A request stopped while it waited behind another must not start.
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!ReferenceEquals(videoModel, _svc.Model))
+                    throw new InvalidOperationException("The selected video model changed while generation was queued.");
+                var owner = (ModelBase)videoModel;
+                if (!owner.TryEnterUse())
+                    throw new InvalidOperationException("The video model is being unloaded; retry after loading it.");
+                try
+                {
+                    // Disposal uses the same lock after retiring the model. Keep it
+                    // alive through the entire native call, even beyond the drain timeout.
+                    lock (owner.GpuComputeLock)
+                    {
+                        if (owner.IsRetiring)
+                            throw new InvalidOperationException("The selected video model is being unloaded.");
+                        ApplyVideoLoras(videoModel, loras, logger);
+                        if (owner.IsRetiring)
+                            throw new InvalidOperationException("The selected video model is being unloaded.");
+                        CheckSamplingRecipe(videoModel, expectedSamplingRecipe);
+                        return generate();
+                    }
+                }
+                finally { owner.ExitUse(); }
+            }
         }
 
         private async Task<VideoGenerationResult> GenerateVideoCoreAsync(
-            TensorSharp.Models.Video.IVideoGenerationModel videoModel, string prompt, TensorSharp.Models.Video.VideoGenerationParams p)
+            TensorSharp.Models.Video.IVideoGenerationModel videoModel, string prompt, TensorSharp.Models.Video.VideoGenerationParams p,
+            IReadOnlyList<LoraSpec> loras, string expectedSamplingRecipe)
         {
+            var logger = _loggerFactory.CreateLogger("TensorSharp.Server.VideoGenerate");
             string outName = $"video-{Guid.NewGuid():N}.mp4";
             string outPath = Path.Combine(_options.UploadDirectory, outName);
 
@@ -2072,17 +2196,15 @@ namespace TensorSharp.Chat
             (TensorSharp.Models.WanVideo.GeneratedVideo video, string codec, bool audioMuxed) result;
             try
             {
-                result = await Task.Run(() =>
-                {
-                    lock (_videoGenLock)
+                result = await Task.Run(() => RunVideoGeneration(
+                    videoModel, loras, expectedSamplingRecipe, logger, p.CancellationToken, () =>
                     {
                         var video = videoModel.GenerateVideo(prompt, p);
                         p.CancellationToken.ThrowIfCancellationRequested();
                         string codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(
                             outPath, video.Frames, video.Fps, video.Audio, out bool audioMuxed);
                         return (video, codec, audioMuxed);
-                    }
-                });
+                    }));
             }
             finally
             {
@@ -2135,13 +2257,23 @@ namespace TensorSharp.Chat
 
         /// <summary>
         /// <c>POST /api/video-generate/stream</c> — same JSON body as
-        /// <see cref="VideoGenerateAsync"/> but a stream of progress frames
+        /// <see cref="VideoGenerateAsync(JsonElement, CancellationToken)"/> but a stream of progress frames
         /// (<c>{ videoGen, step, total, phase, detail, elapsedSeconds, etaSeconds }</c> per
         /// denoising step and heartbeat, then <c>{ done, url, ... }</c>) so the Web UI
         /// can show live progress. Refusals are <c>{ done, error }</c> frames.
         /// </summary>
+        public IAsyncEnumerable<object> VideoGenerateStreamAsync(JsonElement body, CancellationToken cancellationToken) =>
+            VideoGenerateStreamAsync(body, null, cancellationToken);
+
+        /// <summary>
+        /// <see cref="VideoGenerateStreamAsync(JsonElement, CancellationToken)"/> made with exactly
+        /// the LoRA plug-ins <paramref name="loras"/> (an empty list removes the model's; null
+        /// leaves them as they are). The set is applied under the lock the clip runs in; a set
+        /// that cannot be applied, like every other refusal, ends the stream with a
+        /// <c>{ done, error }</c> frame, and the previous set stays.
+        /// </summary>
         public async IAsyncEnumerable<object> VideoGenerateStreamAsync(
-            JsonElement body,
+            JsonElement body, IReadOnlyList<LoraSpec> loras,
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             var logger = _loggerFactory.CreateLogger("TensorSharp.Server.VideoGenerate");
@@ -2200,10 +2332,10 @@ namespace TensorSharp.Chat
                 var sw = Stopwatch.StartNew();
                 try
                 {
-                    lock (_videoGenLock)
+                    // The same guard as the plain path: the model this request found, alive and
+                    // held for the whole clip, with the request's plug-ins applied.
+                    RunVideoGeneration(videoModel, loras, expectedSamplingRecipe: null, logger, ct, () =>
                     {
-                        // A request stopped while it waited behind another must not start.
-                        ct.ThrowIfCancellationRequested();
                         p.CancellationToken = ct;
                         int generatingThread = Environment.CurrentManagedThreadId;
                         p.OnStep = (step, total) =>
@@ -2240,7 +2372,8 @@ namespace TensorSharp.Chat
                             Frames = video.Frames.Length, Fps = video.Fps, Seed = video.Seed,
                             Codec = codec, Seconds = sw.Elapsed.TotalSeconds,
                         });
-                    }
+                        return true;
+                    });
                 }
                 catch (OperationCanceledException)
                 {
@@ -2430,6 +2563,9 @@ namespace TensorSharp.Chat
             if (!_svc.IsLoaded)
                 throw new WebUiRequestRejectedException(400, new { error = "No model loaded" });
 
+            if (body.TryGetProperty("studio", out _) && (LoadedModelMakesVideo || LoadedModelMakesImages || _svc.IsDiffusionModel))
+                throw new WebUiRequestRejectedException(400, new { error = "Studio conversation requires a text planning model. Select a chat model explicitly; the video model remains a generation model." });
+
             var messagesEl = body.GetProperty("messages");
             int maxTokens = _options.ResolveMaxTokens(
                 SamplingConfigParser.ReadRequestedMaxTokens(body, "maxTokens", "max_tokens"));
@@ -2557,7 +2693,8 @@ namespace TensorSharp.Chat
                 workspace: workspace,
                 captureProducedFiles: ScriptFileCapture(),
                 logger: webUiLogger,
-                multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge);
+                multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge,
+                studio: TensorSharp.Chat.Studio.StudioChatScope.Create(Studio, _svc, body, _options.UploadDirectory));
 
             if (unknownSkills.Count > 0)
             {

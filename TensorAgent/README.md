@@ -8,8 +8,8 @@ in the app process for text and reasoning, multimodal questions, agentic code an
 document work, **Qwen-Image 2.1 image generation and editing**, and **MiniMax-H3
 and LTX 2.5 video generation with audio**. Choose a model for the task and use the same composer, saved chats
 and artifact links. Image edits support painted selections, protected pixels,
-original/result comparison and fourteen optional LoRA plug-ins. The interface is
-available in [eight languages](#languages).
+original/result comparison and fourteen optional LoRA plug-ins; MiniMax-H3 clips take two
+optional Turbo plug-ins. The interface is available in [eight languages](#languages).
 
 **Personal knowledge:** open **Menu → Knowledge** to upload documents, datasets,
 media or nested folders, and import saved chats with available attachments and produced
@@ -115,8 +115,9 @@ Windows Installer's limits (`2026.10.03` becomes MSI version `26.10.3`); the com
 release version remains in asset names. The workflow pins .NET SDK 10.0.302,
 workload set 10.0.303.1 and Xcode 26.6 for its hosted Mac build, installs both Apple
 MAUI workloads for restore, and builds the native macOS engine with a 14.0
-deployment floor. Local builds still need a workload/Xcode combination that matches
-their installed Xcode.
+deployment floor. Local builds still need Apple workloads made for their installed
+Xcode, or for an earlier minor release of the same major, which builds with a warning
+(see Build and run).
 
 The [Mac packager](../eng/package-tensoragent-macos.sh) requires a Developer ID
 Application signature and Hardened Runtime by default. It notarizes and staples
@@ -434,12 +435,12 @@ HEIC/HEIF photos use a full-resolution PNG for editing and comparison while thei
 small preview remains in the attachment list. Reattach older HEIC/HEIF uploads if
 the editor asks for a full-resolution source.
 
-**LoRA plug-ins.** With a compatible Qwen-Image 2.1 model loaded, the **LoRA plug-ins**
+**LoRA plug-ins.** With a compatible Qwen-Image 2.1 model (or MiniMax-H3, see below) loaded, the **LoRA plug-ins**
 button above the message box opens its compatible adapters in one tap. The model details
 sheet keeps the same shortcut; both hide when the loaded model has no supported LoRAs.
 The existing side menu is unchanged. Search filters the list locally, and the composer
-shows the selected adapters. The catalog contains fourteen LoRAs in total. Each is pinned to a commit and a SHA-256 in `LoraCatalog` and downloaded on its
-own, 80-680 MB, into `Library/Caches/TensorAgent/loras/<id>/`. A switch turns one on, a
+shows the selected adapters. The catalog contains fourteen Qwen-Image LoRAs and two MiniMax-H3 Turbo plug-ins. Each is pinned to a commit and a SHA-256 in `LoraCatalog` and downloaded on its
+own, 80-680 MB (1.38 GB for MiniMax-H3's), into `Library/Caches/TensorAgent/loras/<id>/`. A switch turns one on, a
 slider sets the strength of a style or an edit (10-150%), and Remove deletes the files and
 turns it off. Speed plug-ins (Viggle Turbo, 6 steps; Pruna 8-Step; Pruna 5-Step; Fun-Acc
 4-Step) replace the model's 40 steps with their own schedule, so only one can be on and
@@ -499,6 +500,19 @@ differ from those by at most 2 levels in 3% of pixels without plug-ins and 5 lev
 pixels with Viggle Turbo and Film Stills: Mono's LLVM code generation rounds some arithmetic
 differently, plug-ins or not.
 
+**Video Studio.** Open the shared Studio from chat or beside a video artifact to
+keep imported/generated assets in an editable project. The timeline, reviewed
+agent proposals, undo/redo, packages and background jobs share the WebUX Studio
+implementation. Generate starts from a description; a first frame and a last
+frame are each optional and are picked from the library's thumbnails, and the
+filled slots set the mode (none is t2v, a first frame i2v, a last frame alone or
+with a first fl2v). Timed keyframes and identity references (ref) are the other
+uses of photos. What can be used follows the loaded checkpoint. Desktop
+composition uses operator-installed FFmpeg. Where Studio runs without media
+subprocesses (iOS, and Mac Catalyst, which .NET reports as iOS), it says that
+generation, import and export are unavailable and keeps project review and editing. See the [user guide](../docs/video-studio.md#generation-modes) and
+[actual validation and limitations](../docs/video-studio-validation.md).
+
 **Videos.** With MiniMax-H3 loaded, a message describes a short clip, and an attached
 photo is its first frame (two photos, its first and last); with MiniMax-H3 References,
 the photos, clips and recordings attached, up to nine together, are the people, things,
@@ -509,9 +523,13 @@ video…"), then plays the clip inline and looped, with its sound (an AAC track 
 MP4), and the clip stays in the saved chat. What a checkpoint cannot use is refused before
 the model starts, in the app's words: a clip or a recording on the keyframes entry names
 MiniMax-H3 References, and a document is refused rather than read as the script. For
-MiniMax-H3, the app asks for 640x384 (or that area at the photo's
-shape, 608x416 for a 3:2 photo), 22 frames (0.92 s at 24 fps) and the model's own 20
-steps, as the shipped `config/minimax-h3-*.json` do. On an M5 Pro the app made a clip
+MiniMax-H3, the app asks for 22 frames (0.92 s at 24 fps) and the model's own 20
+steps, as the shipped `config/minimax-h3-*.json` do, at 640x384 (or that area at the
+photo's shape, 608x416 for a 3:2 photo), in chat and in Studio. For a photo that is
+smaller than the server and CLI now use: they size a keyframe by MiniMax's 768p recipe
+(1152x768 for a 3:2 photo), which keeps small faces from smearing at several times the
+cost, and the app stays on the compact canvas until that size's peak memory is measured
+on its 32 GB tier. On an M5 Pro the app made a clip
 from words in 150.0-152.9 s, one from a photo in 216.5-223 s and one around a reference
 photo in 199-210 s. Longer clips cost more than in proportion, because every
 step attends over the whole clip: in the CLI 22 frames took 147.7 s, 39 frames 278.5 s
@@ -520,6 +538,17 @@ in the scene, so say who or what is in the shot: a description that said only "t
 subject of the picture" produced a garden with nobody in it. The denoisers' license, the
 MiniMax H3 Community License, excludes the EU, the UK, the Republic of Korea and the US
 from its territory, as both entries' notes say; the Qwen3-VL text encoder is Apache-2.0.
+
+**MiniMax-H3 Turbo.** The LoRA sheet offers MiniMax-H3 (the keyframes entry only; References
+takes none) two speed plug-ins from `lightx2v/Minimax-h3-Turbo`, Apache-2.0, 1.38 GB each:
+LightX2V Turbo 8-Step and 4-Step, a clip in 8 or 4 steps instead of 20 on the schedule in
+the engine's own `config/lora/minimax-h3-fl2v-turbo-*.json`, applied per clip in chat and in
+Studio, which follows the same choice. The app never asks for steps, a flow shift or a
+sampler, so the plug-in's contract holds, and the progress line names it ("Filming with
+LightX2V Turbo 8-Step… step 3 of 8"). One can be on at a time, beside any Qwen-Image speed
+plug-in. They were trained at 768p; a photo turn stays on the compact canvas above. The
+4-step plug-in's schedule is inferred (the publisher states none for that version) until it
+is validated. No app timings with them are recorded yet.
 
 **LTX 2.5.** The experimental **LTX 2.5 Distilled** entry uses the same composer,
 saved chat and inline video/audio result. Its default preview is 17 frames at 24 fps,
@@ -872,7 +901,7 @@ network switch (empty means any host); `contextLength`, an override of the catal
 entry's window (0 keeps it); `keepAwakeWhileGenerating`, which holds the display awake
 while the model works (on by default); and `defaultSkills`, the skills preselected for
 a new chat (none by default). The Skills master switch is in the page's Skills sheet,
-and `imageLoras`, the LoRA plug-ins every picture is made with, is set from the page's
+and `imageLoras`, the LoRA plug-ins every picture and clip is made with, is set from the page's
 LoRA sheet (see "LoRA plug-ins" above).
 
 **Model download and cache folder.** Settings > Storage shows the full folder path
@@ -995,7 +1024,12 @@ lets the app use Xcode-compatible workloads even when the system SDK has older o
 `-p:TensorAgentDotnet=/path/to/dotnet` selects another SDK explicitly; its architecture
 must match the SDK running the solution. The selected SDK needs the app workloads
 and must support the installed Xcode (for Xcode 27.0, workload set 10.0.401.1 supplies
-the matching Apple SDKs). The simulator app also needs the files above. A missing workload
+the matching Apple SDKs). Xcode updates itself before Microsoft ships the matching SDK, so
+an Xcode a minor release ahead of the SDK (27.1 under the 27.0 SDK) builds with a warning
+instead of the SDK's error ([XcodeVersion.targets](src/TensorAgent.Maui/XcodeVersion.targets));
+an older Xcode or another major still fails, and `-p:ValidateXcodeVersion=true` on a
+`dotnet build` of the app project restores the exact check. The simulator app also needs
+the files above. A missing workload
 skips the app and a missing file skips that head, each with a warning; any other failure
 fails the solution build. `-p:TensorSharpSkipTensorAgentApp=true` leaves the app out.
 Running, deploying and verifying still go through the scripts.
@@ -1129,7 +1163,8 @@ The Mac head needs the `maui-maccatalyst` workload in the same user-local SDK, a
 (`dotnet workload install maui-maccatalyst maui-ios`), plus CMake and the Xcode
 command-line tools.
 Measured here with workload set 10.0.401.1 (MAUI 10.0.110, Mac Catalyst SDK 27.0.10722)
-and Xcode 27.0. Then:
+and Xcode 27.0, and with the same SDK under Xcode 27.1, which builds with the warning
+described in Build and run. Then:
 
 ```
 TensorAgent/scripts/build-mac.sh     # CONFIGURATION=Release for an LLVM build (about three minutes)

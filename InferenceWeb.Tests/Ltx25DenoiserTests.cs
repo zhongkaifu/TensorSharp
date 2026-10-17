@@ -34,6 +34,46 @@ public sealed partial class Ltx25DenoiserTests
     }
 
     [Fact]
+    public void DiagnosticObserverReceivesExactForwardInputAndFiniteOracleOutput()
+    {
+        using var fixture = new Checkpoint();
+        var allocator = new CpuAllocator(BlasEnum.DotNet);
+        using var model = new Ltx25Denoiser(fixture.Path, allocator);
+        var reference = Oracle.GetProperty("cases")[0];
+        var input = Input(reference);
+        Ltx25DenoiserOutput? observed = null;
+        int calls = 0;
+        model.ForwardObserver = (actualInput, output) =>
+        {
+            ++calls;
+            Assert.Same(input, actualInput);
+            observed = output;
+            Equal(Floats(reference, "videoVelocity"), output.VideoVelocity, 2e-5, "observed video");
+            Equal(Floats(reference, "audioVelocity"), output.AudioVelocity, 2e-5, "observed audio");
+        };
+        var result = model.Forward(input);
+        Assert.Equal(1, calls);
+        Assert.Same(result, observed);
+    }
+
+    [Fact]
+    public void DiagnosticObserverCanStopBeforeSamplerUpdateAndReleaseForwardTemporaries()
+    {
+        using var fixture = new Checkpoint();
+        var allocator = new CpuAllocator(BlasEnum.DotNet);
+        using var model = new Ltx25Denoiser(fixture.Path, allocator);
+        var reference = Oracle.GetProperty("cases")[0];
+        var input = Input(reference);
+        var stopped = new InvalidOperationException("diagnostic capture complete");
+        model.ForwardObserver = (_, _) => throw stopped;
+        Assert.Same(stopped, Assert.Throws<InvalidOperationException>(() => model.Forward(input)));
+        model.ForwardObserver = null!;
+        var result = model.Forward(input);
+        Equal(Floats(reference, "videoVelocity"), result.VideoVelocity, 2e-5, "video after observer stop");
+        Equal(Floats(reference, "audioVelocity"), result.AudioVelocity, 2e-5, "audio after observer stop");
+    }
+
+    [Fact]
     public void CachedPositionTablesTrackCallerMutationsAndResidencyEviction()
     {
         using var fixture = new Checkpoint();
@@ -69,6 +109,22 @@ public sealed partial class Ltx25DenoiserTests
         Assert.Throws<ArgumentOutOfRangeException>(() => model.Forward(input, 3));
         model.Dispose();
         Assert.Throws<ObjectDisposedException>(() => model.Forward(input));
+    }
+
+    [MlxFact]
+    public void MlxDeviceResidencyCanBeReleasedBeforeDecodeAndRebuiltForTheNextRequest()
+    {
+        using var fixture = new Checkpoint();
+        using var allocator = new MlxAllocator();
+        using var model = new Ltx25Denoiser(fixture.Path, allocator);
+        var reference = Oracle.GetProperty("cases")[0];
+        var before = model.Forward(Input(reference));
+        model.ReleaseDeviceResidency();
+        MlxBackend.ClearCache();
+        var after = model.Forward(Input(reference));
+        Equal(before.VideoVelocity, after.VideoVelocity, 1e-6, "MLX video after residency reload");
+        Equal(before.AudioVelocity, after.AudioVelocity, 1e-6, "MLX audio after residency reload");
+        Assert.Equal(before.ExecutedBlocks, after.ExecutedBlocks);
     }
 
     [Fact]

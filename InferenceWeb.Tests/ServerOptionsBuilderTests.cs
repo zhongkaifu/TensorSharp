@@ -32,6 +32,9 @@ public class ServerOptionsBuilderTests : IDisposable
         _env.ClearSpeculationVars();
         foreach (string variable in new[] { "TENSORSHARP_TP_DEGREE", "TENSORSHARP_LAYER_SPLIT_DEGREE", "TENSORSHARP_TP_NODE_ID", "TENSORSHARP_TP_PEERS" })
             _env.Set(variable, null);
+        // The companion pass runs the LoRA preflight over an inherited TS_LORAS when the
+        // command line names no plug-in, so a developer shell's TS_LORAS must not reach it.
+        _env.Set(TensorSharp.Runtime.LoraCliFlags.EnvironmentVariable, null);
         // Build needs a writable base directory because it creates an
         // "uploads" folder under it. Use a temp dir per test instance to keep
         // the workspace clean.

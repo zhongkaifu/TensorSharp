@@ -19,10 +19,11 @@ namespace TensorAgent.Core.Hosting;
 public static partial class WebUiRoutes
 {
     /// <summary>
-    /// The page's LoRA sheet: the plug-ins of the image models this device is offered, what
-    /// is downloaded and turned on, and the actions on them. A choice is saved, not applied:
-    /// the next picture applies it (<see cref="AgentAppHost.PrepareImageTurn"/>), so
-    /// turning a plug-in on while a picture is being made never touches that picture.
+    /// The page's LoRA sheet: the plug-ins of the image and video models this device is offered,
+    /// what is downloaded and turned on, and the actions on them. A choice is saved, not applied:
+    /// the next picture or clip applies it (<see cref="AgentAppHost.PrepareImageTurn"/>,
+    /// <see cref="AgentAppHost.PrepareVideoTurn"/>), so turning a plug-in on while a picture or
+    /// clip is being made never touches it.
     /// </summary>
     public static void MapLoras(this LoopbackServer server, AgentAppHost host)
     {
@@ -100,9 +101,10 @@ public static partial class WebUiRoutes
         });
     }
 
-    /// <summary>The LoRA sheet's state: the plug-ins of the loaded image model (with none loaded,
-    /// every plug-in of an offered model), and the choice. A Qwen-Image 2.1 Turbo entry is offered
-    /// only the plug-ins validated on it, never a speed plug-in.</summary>
+    /// <summary>The LoRA sheet's state: the plug-ins of the loaded image or video model (with none
+    /// loaded, every plug-in of an offered model), and the choice. A Qwen-Image 2.1 Turbo entry is
+    /// offered only the plug-ins validated on it, never a speed plug-in; MiniMax-H3's keyframes
+    /// entry is offered its Turbo plug-ins, and a video model with none has no sheet.</summary>
     internal static object DescribeLoras(AgentAppHost host)
     {
         IReadOnlyList<ImageLoraChoice> chosen = host.Settings.Load().ImageLoras;
@@ -117,7 +119,7 @@ public static partial class WebUiRoutes
             loadedModelFile = Path.GetFileName(loaded),
             loadedModelName = loadedModel?.DisplayName,
             loadedModelIsImage = loadedModel?.IsImageGenerator == true,
-            supportsLoras = loadedModel?.IsImageGenerator == true && offered.Count > 0,
+            supportsLoras = (loadedModel?.IsImageGenerator == true || loadedModel?.IsVideoGenerator == true) && offered.Count > 0,
             minStrength = LoraCatalog.MinStrength,
             maxStrength = LoraCatalog.MaxStrength,
             loras = offered

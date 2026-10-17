@@ -80,6 +80,18 @@ public sealed class Ltx25ImageConditioningTests
         Assert.Equal(16, Assert.Single(last).FrameIndex);
     }
 
+    [Fact]
+    public void FirstLastFramePinsTheLastFrameWithAnOptionalFirstFrame()
+    {
+        // Last only: one appended guide at the final pixel frame, nothing at frame zero.
+        var lastOnly = Ltx25ImageConditioning.Resolve(new() { Mode = "fl2v", EndImagePath = "end" }, 17);
+        var guide = Assert.Single(lastOnly);
+        Assert.Equal(16, guide.FrameIndex); Assert.Equal("end", guide.ImagePath); Assert.Equal(1f, guide.Strength);
+        var both = Ltx25ImageConditioning.Resolve(new() { Mode = "fl2v", ImagePath = "start", EndImagePath = "end" }, 17);
+        Assert.Equal(new[] { 0, 16 }, both.Select(image => image.FrameIndex));
+        Assert.Equal(0, Assert.Single(Ltx25ImageConditioning.Resolve(new() { Mode = "i2v", ImagePath = "start" }, 17)).FrameIndex);
+    }
+
     [Theory]
     [InlineData(-2, 1)]
     [InlineData(17, 1)]
@@ -103,6 +115,11 @@ public sealed class Ltx25ImageConditioningTests
             { Mode = "t2v", ImagePath = "a" }, 17));
         Assert.Throws<ArgumentException>(() => Ltx25ImageConditioning.Resolve(new()
             { Mode = "fl2v", ImagePath = "a" }, 17));
+        // i2v animates a first frame: an end image alone is not quietly turned into a last-frame guide.
+        Assert.Throws<ArgumentException>(() => Ltx25ImageConditioning.Resolve(new()
+            { Mode = "i2v", EndImagePath = "z" }, 17));
+        Assert.Throws<ArgumentException>(() => Ltx25ImageConditioning.Resolve(new()
+            { Mode = "fl2v", EndImagePath = "z", ImageConditions = [new() { ImagePath = "m", FrameIndex = 8 }] }, 17));
         Assert.Throws<ArgumentException>(() => Ltx25ImageConditioning.Resolve(new()
             { ReferenceImagePaths = Enumerable.Repeat("a", 17).ToArray() }, 17));
         Assert.Throws<NotSupportedException>(() => Ltx25GenerationSettings.Resolve(new()
@@ -135,30 +152,60 @@ public sealed class Ltx25ImageConditioningTests
             Assert.Equal(3 + (original[3 * 128 + i] - 3) * .5f, result.Video[3 * 128 + i]);
     }
 
-    [Fact]
-    public void RefinementPassNoisesGuidesFromTheirCleanLatentLikeGaussianNoiser()
+    [Theory]
+    [InlineData(0)] // Fractional first frame and appended guide, plus a fully conditioned guide.
+    [InlineData(1)] // Zero strength must retain the noised prior, including at the first frame.
+    [InlineData(2)] // Full strength must preserve clean image latents exactly.
+    public void RefinementGuidesMatchUnchangedOfficialConditioningsAndGaussianNoiser(int caseIndex)
     {
-        // Stage two: GaussianNoiser lerps toward noise by the first refinement sigma
-        // after the conditionings, then lerps back toward the clean latent by the mask.
+        using Stream stream = typeof(Ltx25ImageConditioningTests).Assembly.GetManifestResourceStream(
+            "InferenceWeb.Tests.Fixtures.Ltx25.refinement-conditioning.json")!;
+        using var document = JsonDocument.Parse(stream);
+        var fixture = document.RootElement;
+        Assert.Equal("be6d6d0a69d11a0a399c462ed92606692e5f8697", fixture.GetProperty("source_revision").GetString());
+        Assert.Equal("cpu", fixture.GetProperty("device").GetString());
+        static float[] Values(JsonElement value) => value.EnumerateArray().Select(item => item.GetSingle()).ToArray();
+        var test = fixture.GetProperty("cases")[caseIndex];
         var settings = Settings();
-        var input = Input(settings, 1);
-        float[] raw = (float[])input.Video.Clone();
-        const float scale = Ltx25GenerationSettings.RefinementNoiseScale;
-        float[] prior = Enumerable.Range(0, 3 * 128).Select(i => (i % 7) * .25f).ToArray();
+        var input = Input(settings, 2);
+        float[] raw = Values(fixture.GetProperty("noise"));
+        raw.CopyTo(input.Video, 0);
+        float scale = fixture.GetProperty("noise_scale").GetSingle();
+        Assert.Equal(Ltx25GenerationSettings.RefinementNoiseScale, scale);
+        float[] prior = Values(fixture.GetProperty("prior"));
+        // Match the pipeline: base tokens already hold lerp(prior, rawNoise, sigma),
+        // while appended guide slots still contain raw noise before Apply runs.
         for (int i = 0; i < prior.Length; ++i) input.Video[i] = prior[i] + (raw[i] - prior[i]) * scale;
         float[] noised = (float[])input.Video.Clone();
-        var first = Enumerable.Repeat(2f, 128).ToArray();
-        var middle = Enumerable.Repeat(3f, 128).ToArray();
-        var result = Ltx25ImageConditioning.Apply(input, settings, [new(first, 0, .75f), new(middle, 8, .5f)], raw, scale);
-        Assert.Equal(new[] { .25f, 1f, 1f, .5f }, result.VideoDenoiseMask);
-        for (int i = 0; i < 128; ++i)
-        {
-            Assert.Equal(2 + (raw[i] - 2) * (.25f * scale), result.Video[i]);
-            Assert.Equal(3 + (raw[3 * 128 + i] - 3) * (.5f * scale), result.Video[3 * 128 + i]);
-        }
+        var images = fixture.GetProperty("images").EnumerateArray().Select((image, i) => new Ltx25EncodedImage(
+            Values(image.GetProperty("latent")), image.GetProperty("frame_index").GetInt32(), test.GetProperty("strengths")[i].GetSingle())).ToArray();
+        var result = Ltx25ImageConditioning.Apply(input, settings, images, raw, scale);
+        float[] expected = Values(test.GetProperty("output"));
+        Assert.Equal(expected.Length, result.Video.Length);
+        for (int i = 0; i < expected.Length; ++i)
+            Assert.InRange(Math.Abs(expected[i] - result.Video[i]), 0, 4e-7f);
+        Assert.Equal(Values(test.GetProperty("mask")), result.VideoDenoiseMask);
+        Assert.Equal(noised, input.Video);
         Assert.Equal(noised.Skip(128).Take(2 * 128), result.Video.Skip(128).Take(2 * 128));
+        Assert.Same(input.Audio, result.Audio);
+        if (caseIndex == 1) Assert.Equal(noised.Take(128), result.Video.Take(128));
+        for (int i = 0; i < images.Length; ++i)
+        {
+            if (images[i].Strength != 1) continue;
+            int offset = i == 0 ? 0 : (settings.VideoTokens + i - 1) * 128;
+            Assert.Equal(images[i].Latent, result.Video.Skip(offset).Take(128));
+        }
+    }
+
+    [Fact]
+    public void RefinementRequiresRawNoiseAndNonUnitScaleTogether()
+    {
+        var settings = Settings();
+        var input = Input(settings);
+        float[] raw = (float[])input.Video.Clone();
+        var first = new float[128];
         Assert.Throws<ArgumentException>(() => Ltx25ImageConditioning.Apply(input, settings, [new(first, 0)], raw, 1f));
-        Assert.Throws<ArgumentException>(() => Ltx25ImageConditioning.Apply(input, settings, [new(first, 0)], null, scale));
+        Assert.Throws<ArgumentException>(() => Ltx25ImageConditioning.Apply(input, settings, [new(first, 0)], null, Ltx25GenerationSettings.RefinementNoiseScale));
     }
 
     [Fact]

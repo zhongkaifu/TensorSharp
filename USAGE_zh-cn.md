@@ -125,7 +125,7 @@ entry is skipped, so nothing is fetched for it.`。`--config` 可重复出现以
 因此在全新机器上也能直接运行。该目录还提供聊天模型（`gemma-4-*`、`qwen3.5-9b-*`、`qwen3.6-*`、
 `gpt-oss-20b`）、智能体托管（`agent-*`）、嵌入服务（`embedding-*`）、DiffusionGemma 与 Jev
 （`diffusiongemma-*`、`jev-diffusiongemma-q4`）以及视频（`minimax-h3-*`、`wan-video-*`）的预设，
-[`config/lora/`](config/lora/) 中则有十四个 Qwen-Image-2.1 LoRA 插件。完整说明见
+[`config/lora/`](config/lora/) 中则有十四个 Qwen-Image-2.1 LoRA 插件和两个 MiniMax-H3 Turbo 插件。完整说明见
 [`config/README.md`](config/README.md)。
 
 ## 控制台应用
@@ -198,7 +198,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
 # 潜变量一起去噪，因此音轨是模型输出本身，而不是事后配上去的。Qwen3-VL-32B 文本
 # 编码器、视频 VAE 与音频 VAE 会在 DiT GGUF 旁解析（或用 --video-text-encoder /
 # --video-vae / --audio-vae 指定）。H3 是 CFG 蒸馏模型：必须 `--cfg 1.0`，默认 20
-# 步，4-8 步是快速档。详见下文“音视频生成（MiniMax-H3）”与
+# 步；像这里这样减少基础步数是更快的预览，会损失一些质量，专为 8 或 4 步蒸馏的调度
+# 是下面的 Turbo 插件。详见下文“音视频生成（MiniMax-H3）”与
 # docs/models/minimax-h3_zh-cn.md。
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <minimax_h3_fl2va_pruned-Q4_K.gguf> \
     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4 \
@@ -219,6 +220,13 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <minimax_h3_fl2va_pruned-
 # （config/minimax-h3-ref2va.json 对应参考检查点）。
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
+
+# MiniMax-H3 Turbo：LightX2V 为 fl2va 检查点做的步数蒸馏插件，首次使用时下载 1.38 GB
+# 权重，按自己锁定的调度只跑 8 步（4 步文件为 4 步），因此不要设置 --diffusion-steps、
+# --flow-shift 与 --sampler。见下文“MiniMax-H3 Turbo 插件”。
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
+    --lora config/lora/minimax-h3-fl2v-turbo-8step.json \
+    --prompt "a red fox trotting through falling snow, cinematic" --output fox-turbo.mp4
 
 # Wan 视频生成，仅视频（提示词 -> H.264 MP4）。UMT5-XXL 文本编码器 GGUF 与视频 VAE
 # 伴随文件会在 DiT GGUF 旁解析（或用 --video-text-encoder / --video-vae 指定）。
@@ -436,7 +444,7 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--test-chunked-prefill` | 运行分块 prefill 正确性检查（对比分块与非分块 logits） |
 | `--correct-prefill <N>` | `--test-chunked-prefill` 使用的 prompt 长度 |
 | `--correct-decode <N>` | `--test-chunked-prefill` 使用的 decode 长度 |
-| `--diffusion-steps <N>` | DiffusionGemma 每个 block 的去噪步数（默认：48）。对 Qwen-Image-2.1 则是 FlowMatch-Euler 步数——省略时自动选择（40，或 `--lora` 插件采样配方中的步数；Qwen-Image-2.1-Turbo 为 8，也只接受 8）。 LTX 2.5 只接受 8 步（另加 3 步精修），CFG 固定为 1。 |
+| `--diffusion-steps <N>` | DiffusionGemma 每个 block 的去噪步数（默认：48）。对 Qwen-Image-2.1 则是 FlowMatch-Euler 步数——省略时自动选择（40，或 `--lora` 插件采样配方中的步数；Qwen-Image-2.1-Turbo 为 8，也只接受 8）。MiniMax-H3 默认 20；加载 [Turbo 插件](#minimax-h3-turbo-插件)时只跑插件的 8 或 4 步，其他值在启动时被拒绝。 LTX 2.5 只接受 8 步（另加 3 步精修），CFG 固定为 1。 |
 | `--diffusion-seed <N>` | 扩散路径的噪声种子：DiffusionGemma 的确定性采样器与 Qwen-Image-2.1（默认：0），以及视频生成（Wan、MiniMax-H3）——视频不传时每次运行都会取一个新的随机种子。决定一段视频长什么样的是这个种子，`--seed` 是文本采样种子，对它没有影响。Qwen-Image-2.1 的图像由种子和尺寸决定；编辑的噪声还取决于 `--image` 传入的图片，因此用画出某张图的种子去编辑它，不会从它自己的噪声重新开始（[种子与编辑](docs/models/qwenimage21_zh-cn.md#种子与编辑)）。 |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas 数量。`0` 表示根据 `--max-tokens` 与模型 canvas 长度推导。 |
 | `--image <path>` | Qwen-Image-2.1 编辑用的输入图像（也是多模态聊天的图像输入）；重复该参数可传入多张参考图。每个 `--image` 都是一张参考图，按命令行顺序在提示词之前标记为 `<image1>`、`<image2>`……，提示词可以用这些标记指代图片。不带 `--image` 时，Qwen-Image-2.1 DiT 改为根据提示词生成图像。 |
@@ -452,17 +460,17 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--qwen-image-vl <path>` | 覆盖解析到的 Qwen3-VL-8B 文本编码器 GGUF（默认：DiT 旁的 `Qwen3VL-8B` / `Qwen3-VL-8B` GGUF）。环境变量：`TS_QWEN_IMAGE_TE`。 |
 | `--qwen-image-mmproj <path>` | 覆盖解析到的 Qwen3-VL-8B mmproj（编辑时的视觉接地）GGUF（默认：DiT 旁匹配的 `mmproj` GGUF）。环境变量：`TS_QWEN_IMAGE_MMPROJ`。 |
 | `--qwen-image-variant <base\|turbo>` | DiT GGUF 是哪一个 Qwen-Image-2.1 检查点。GGUF 不带元数据，Turbo 的张量又与基础检查点相同，所以由宿主声明：`turbo` 按 Qwen-Image-2.1-Turbo 公布的 8 步调度、CFG 1 采样，拒绝其他步数，也拒绝步数蒸馏 `--lora` 插件。默认：不声明——文件名含单词 `turbo` 时按 Turbo 处理，加载时会打印这一假定；其他文件为 `base`。用于其他模型时被拒绝。环境变量：`TS_QWEN_IMAGE_VARIANT`。见 [Qwen-Image-2.1-Turbo](docs/models/qwenimage21_zh-cn.md#qwen-image-21-turbo)。 |
-| `--lora <path>` | Qwen-Image-2.1 LoRA 插件：LoRA `.safetensors` 文件，或 TensorSharp 插件配置 `.json`（见 [`config/lora/`](config/lora/)）。重复该参数可叠加多个 LoRA。以不合并的方式叠加在量化 Transformer 之上。用于其他模型时会被拒绝。默认：无。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)。 |
-| `--lora-scale <f>` | 前一个 `--lora` 的强度（乘以 alpha / rank）。默认：插件配置中的 `"scale"`，否则为 `1.0`。 |
-| `--lora-config <path>` | 前一个 `--lora` 的伴随配置：TensorSharp LoRA 配置、PEFT `adapter_config.json` 或 VideoX-Fun `pdd_config.json`。默认：无（PDD 包的 `pdd_config.json`，以及与 `adapter_model.safetensors` 同目录的 PEFT `adapter_config.json`，会在权重旁自动找到）。 |
+| `--lora <path>` | Qwen-Image-2.1 或 MiniMax-H3（FL2VA）的 LoRA 插件。Qwen-Image-2.1：LoRA `.safetensors` 文件，或 TensorSharp 插件配置 `.json`（见 [`config/lora/`](config/lora/)）；重复该参数可叠加多个 LoRA。MiniMax-H3：只接受一个 `minimax-h3-lora` 配置，即 `config/lora/minimax-h3-fl2v-turbo-8step.json` 或 `-4step.json`，它把 `--diffusion-steps`、`--flow-shift`、`--sampler` 与 `--cfg` 锁定为其配方，并在 Ref2VA 检查点上被拒绝。以不合并的方式叠加在量化 Transformer 之上。模型不接受的插件会在启动时、插件下载之前被拒绝；若 `--config` 仍需下载模型，模型家族会在该下载完成后立即检查（冲突的采样参数在下载之前就被拒绝）。默认：无。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)与 [MiniMax-H3 Turbo 插件](#minimax-h3-turbo-插件)。 |
+| `--lora-scale <f>` | 前一个 `--lora` 的强度（乘以 alpha / rank）。默认：插件配置中的 `"scale"`，否则为 `1.0`。MiniMax-H3 拒绝负强度：其 Turbo 调度在强度 1 下蒸馏，0 则保留适配器各项而上投影因子为零。 |
+| `--lora-config <path>` | 前一个 `--lora` 的伴随配置：TensorSharp LoRA 配置、PEFT `adapter_config.json` 或 VideoX-Fun `pdd_config.json`。放在这里的 MiniMax-H3 插件配置必须在其 `"weights"` 中写明前一个 `--lora` 的权重文件，其配方仍然锁定。默认：无（PDD 包的 `pdd_config.json`，以及与 `adapter_model.safetensors` 同目录的 PEFT `adapter_config.json`，会在权重旁自动找到）。 |
 | `--qwen-image-lora` / `--offload-cpu` | **已移除，启动时（包括作为配置文件键时）直接拒绝。** 两者只服务于早期的 Qwen-Image-Edit 流水线。`--qwen-image-lora` 由上面的 `--lora` 取代；`--offload-cpu` 没有替代项，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。 |
 | `--penalty-last-n` | **已移除，启动时（包括作为配置文件键时）直接拒绝**（退出码 1，`Configuration error: --penalty-last-n was removed: …`）。它是 CLI 独有的重复惩罚窗口名：请改用 `--repeat-last-n <N>`，即两个宿主与请求字段 `repeat_last_n` 共用的拼写。 |
 | `--paged-kv` / `--no-paged-kv` / `--paged-kv-*` / `--paged-bench*` | **已移除，两个宿主在启动时（包括作为配置文件键时）都会直接拒绝。** 它们配置的是独立分页 KV 缓存（RAM / SSD / Redis 块层与块量化），只有 `--paged-bench` 构建过它。请求 KV 状态由引擎持有，跨请求的提示词复用由引擎的 radix 前缀缓存提供，默认开启（`--no-prefix-cache` 关闭）。该缓存读取的 `TS_KV_PAGED_CACHE`、`TS_KV_BLOCK_SIZE`、`TS_KV_CACHE_MAX_RAM_MB`、`TS_KV_CACHE_SSD_DIR`、`TS_KV_CACHE_MAX_SSD_MB`、`TS_KV_PAGED_QUANT_BITS`、`TS_KV_CACHE_REDIS_URL` 与 `TS_KV_CACHE_REDIS_TTL_MINUTES` 变量同样会在启动时被拒绝。 |
-| `--width <px>` / `--height <px>` | Qwen-Image-2.1 与视频生成的输出尺寸。默认 `0` —— 自动（Qwen-Image-2.1：生成为 2048×2048，编辑则取与第一张参考图宽高比一致、面积大致相同的尺寸——在纯 C# 的 `cpu` 后端上为 1024×1024（1 百万像素）——显式尺寸须为 32 的倍数；MiniMax-H3：640×384，有条件图时按该面积取图片宽高比，并向上取整到 32 的倍数；Wan：按输入图的宽高比取模型原生面积，TI2V-5B 为 1280×704，其余为 832×480）。 LTX 2.5 视频默认输出 1024×1024，宽高必须为 64 的正整数倍；见下文两阶段配方。 |
+| `--width <px>` / `--height <px>` | Qwen-Image-2.1 与视频生成的输出尺寸。默认 `0` —— 自动（Qwen-Image-2.1：生成为 2048×2048，编辑则取与第一张参考图宽高比一致、面积大致相同的尺寸——在纯 C# 的 `cpu` 后端上为 1024×1024（1 百万像素）——显式尺寸须为 32 的倍数；MiniMax-H3：文生视频和具名参考图为 640×384（Ref2VA 上的普通 `--image` 按其宽高比保持这一面积），i2v/fl2v 则按 MiniMax 的 768p 配方由第一个关键帧决定画布——保持其宽高比、短边 768 像素、面积不超过 768×1344、取最接近的 32 的倍数——因为这两种模式保留关键帧的构图，画布更小会让其中的人脸变糊（[尺寸](docs/models/minimax-h3_zh-cn.md#尺寸与设置)）；Wan：按输入图的宽高比取模型原生面积，TI2V-5B 为 1280×704，其余为 832×480）。 LTX 2.5 视频默认输出 1024×1024，宽高必须为 64 的正整数倍；见下文两阶段配方。 |
 | `--video-frames <N>` | 视频帧数，会对齐到模型自己的时间网格（Wan 为 `4k+1`；MiniMax-H3 为 `17k+5` —— 5、22、39、56、73、90…）。默认：33；Wan2.2-TI2V 为 49，MiniMax-H3 为 22。`1` 生成一张静态图（配合 `--output out.png`）。 LTX 2.5 默认 17 帧，必须为 `8k+1`；无效请求不会自动对齐。 |
 | `--fps <N>` | 保存的 MP4 的播放帧率（默认：16；Wan2.2-TI2V 为 24）。以固定帧率训练的模型（MiniMax-H3，24 fps）会覆盖任何其他取值。 LTX 2.5 默认为 24 fps。 |
-| `--flow-shift <F>` | FlowMatch 时间步 shift（默认：模型官方配方 —— Wan 2.2 为 5.0，A14B T2V 为 12.0，Wan 2.1 为 8.0/3.0/5.0，MiniMax-H3 为 12.0）。在带联合音频流的模型上，该 shift 只作用于视频流。 |
-| `--sampler <name>` | 采样器：`unipc`（Wan 官方采样器，Wan 默认）或 `euler`。LTX 2.5 默认使用发布方配方 `euler_ancestral`；在 LTX 上 `euler` 仅作为确定性 Euler 诊断选项。MiniMax-H3 走自己的 flow-match 调度，不读取它。 |
+| `--flow-shift <F>` | FlowMatch 时间步 shift（默认：模型官方配方 —— Wan 2.2 为 5.0，A14B T2V 为 12.0，Wan 2.1 为 8.0/3.0/5.0，MiniMax-H3 为 12.0，加载 MiniMax-H3 Turbo 插件时为 6.0，且拒绝其他值）。在带联合音频流的模型上，该 shift 只作用于视频流。 |
+| `--sampler <name>` | 采样器：`unipc`（Wan 官方采样器，Wan 默认）或 `euler`。LTX 2.5 默认使用发布方配方 `euler_ancestral`；在 LTX 上 `euler` 仅作为确定性 Euler 诊断选项。MiniMax-H3 在自己的 flow-match 调度上用 Euler 采样，不读取它；但加载 Turbo 插件时，`euler` 以外的采样器都会被拒绝。 |
 | `--negative-prompt <text>` | 负向提示词（默认：模型官方的负向提示词）。在 `--cfg 1.0` 下不生效，因为不跑无条件分支——所以对只接受 `--cfg 1.0` 的 MiniMax-H3 完全没有作用。 |
 | _（步数蒸馏检查点）_ | 按 DiT 文件名自动识别（`Turbo`、`distill`、`Lightning`、`lightx2v`、`FastWan`、`-dmd`，或显式的 `…-4steps-…` / `…8step…`，N 取 1–16）：管线切换到该步数并关闭引导，把官方 50 步 × CFG 配方的 100 次 DiT 前向变成 4 次。这是整个 TensorSharp 里最大的提速手段——详见下文 **[视频生成（Wan）](#视频生成wan)**。`--diffusion-steps` / `--cfg` 可覆盖它。 |
 | `--cfg-cache-stride <N>` | Wan 引导缓存：每 `N` 步只跑一次无条件 CFG 前向，其余步复用缓存的引导方向（默认关闭——每步都跑两次前向）。`2` 约快 1.30×，`3` 约快 1.43×；属于近似，需要严格对齐参考样本时请关闭。在 `--cfg 1.0` 下不起作用，因此对 MiniMax-H3 无效。 |
@@ -473,7 +481,7 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--video-upscaler <path>` | 两阶段视频模型所用的 2 倍潜变量放大器：LTX 2.5 先以输出尺寸的一半生成，再用 `ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` 放大潜变量，最后以完整尺寸精修。默认：模型同目录的 `latent_upscale_models/`。环境变量：`TS_VIDEO_UPSCALER`。 |
 | `--video-diffusion-vae <path>` | 可选的 LTX 2.5 扩散视频解码器（`ltx-2.5-video-vae-bf16.safetensors`）：颗粒和闪烁更少、画面更干净，但比默认的卷积 `--video-vae` 更柔和。仅支持 MLX 和 CPU；CUDA 会拒绝。默认：关闭。环境变量：`TS_VIDEO_DIFFUSION_VAE`。 |
 | `--video-mode <mode>` | 在有多种条件模式的模型上，指定所传图片的含义。默认：按所传内容自动推断。MiniMax-H3 支持 `t2v`（纯文本）、`i2v`（图片**就是**第一帧，并让它动起来）、`fl2v`（首帧与末帧）、`ref`（图片是用于**全新**场景的身份/外观参考）。`i2v`/`fl2v` 需要 FL2VA 检查点，`ref` 需要 Ref2VA——它们是两个独立文件而不是开关，要错了会直接报错并指出该加载的另一个文件。 |
-| `--end-image <file>` | 末帧条件图，适用于支持该能力的模型（MiniMax-H3 的首尾帧模式）。与 `--image` 一起使用时，片段会被引导为从首帧开始、到末帧结束。 LTX 2.5 也支持尾帧与带时间位置的图像引导。 |
+| `--end-image <file>` | 末帧条件图，适用于支持该能力的模型（MiniMax-H3 FL2VA、LTX 2.5）。单独使用时只钉住末帧（片段以它结束）；与 `--image` 一起使用时，片段从首帧开始、到末帧结束。Wan 会拒绝它。LTX 2.5 还支持带时间位置的图像引导。 |
 | `--ref-image <file>` | 参考图，用于参考条件模型（MiniMax-H3 Ref2VA）：主体特征保留下来，而机位、背景和构图由提示词决定。最多可重复传入 9 次；在提示词中按 `<Picture 1>`、`<Picture 2>`… 引用。参考图只会被**缩小**并保持自身宽高比，输出尺寸仍由 `--width`/`--height` 决定。 |
 | `--ref-video <path>` | 参考视频片段——可以是视频**文件**，也可以是帧目录；两种都会被重采样到模型自己的 24 fps 与画布。可重复传入；在提示词中按 `<Video 1>`、`<Video 2>`… 引用。 |
 | `--ref-video-audio <file>` | 与**相同位置**的 `--ref-video` 配对的音轨：第一个配第一个，依此类推。之所以与 `--ref-video` 分开，是因为容器里的音轨无法通过帧解码器读取；想要一段无声的参考片段就不传它。支持 WAV、MP3 或 Ogg。 |
@@ -583,16 +591,23 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/
 # 多模态模型：同时显式指定投影器
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda
 
-# MiniMax-H3：视频与它的 32 kHz 立体声音轨一起生成。尺寸、步数和帧数都是启动参数，
-# 因为 Web UI 自己不发送任何数值；640x384 是文档给出的起点。每次运行都会写出一个
-# .mp4 和一个旁挂的 .wav。详见下文“音视频生成（MiniMax-H3）”。
+# MiniMax-H3：视频与它的 32 kHz 立体声音轨一起生成。步数和帧数是启动参数，因为
+# Web UI 自己不发送任何数值。尺寸交给模型：文生视频为 640x384，上传的关键帧按
+# MiniMax 的 768p 配方决定画布，远景人物的脸需要这个尺寸。--video-width/--video-height
+# 会把所有模式固定为同一尺寸。每次运行都会写出一个 .mp4 和一个旁挂的 .wav。详见下文
+# “音视频生成（MiniMax-H3）”。
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
     --model ./models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
-    --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+    --video-steps 20 --video-frames 22
 
 # 同样的托管也可以直接用随仓库提供的配置文件（config/minimax-h3-ref2va.json 换成
 # 参考检查点；两者只有去噪器不同，其余三个网络不会重复下载）。
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json
+
+# MiniMax-H3 Turbo：每段片段都按插件的 8 步采样。不要设置 --video-steps（或设为 8）；
+# 其他值会在启动时、下载任何文件之前被拒绝。
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json \
+    --lora config/lora/minimax-h3-fl2v-turbo-8step.json
 
 # Wan 视频生成，仅视频：当 Web UI 或 API 请求未提供自己的 frames / fps 时，
 # 默认以 24 fps 生成 121 帧（约五秒）。
@@ -722,7 +737,7 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 |---|---|
 | `--video-width <px>` | Web UI 或 API 请求未提供 `width` 时，视频生成使用的默认输出宽度；别名 `--width`。这是**服务端最主要的质量杠杆**，因为 Web UI 自己不发送尺寸——不设置的话每段视频都会用模型默认值生成。MiniMax-H3 的推荐起点是 `640`（配合 `--video-height 384`）。会向上取整到模型的网格。 |
 | `--video-height <px>` | 请求未提供 `height` 时的默认输出高度；别名 `--height`。只给出宽高之一时，MiniMax-H3 会按条件图片的宽高比推出另一个，这样 4:3 的照片就不会被拉成 16:9。 |
-| `--video-steps <N>` | 请求未提供 `steps` 时的默认去噪步数——分辨率之后最重要的质量/时间取舍。MiniMax-H3 自身默认 `20`；`4`–`8` 是快速工作点，`16`–`24` 明显更干净，超过 30 提升有限。 LTX 2.5 只接受首阶段 8 步，随后另做 3 步精修。 |
+| `--video-steps <N>` | 请求未提供 `steps` 时的默认去噪步数——分辨率之后最重要的质量/时间取舍。MiniMax-H3 自身默认 `20`；`16`–`24` 明显更干净，超过 30 提升有限。想让 MiniMax-H3 少跑几步，请改用 `--lora` 加载 [Turbo 插件](#minimax-h3-turbo-插件)：它只跑蒸馏时的 8 或 4 步，所以本参数不要设置或设为该步数；其他值会在启动时被拒绝，请求自带的 `steps` 同样如此。 LTX 2.5 只接受首阶段 8 步，随后另做 3 步精修。 |
 | `--video-mode <mode>` | 请求未提供 `videoMode` 时的默认条件模式：`t2v`（纯文本）、`i2v`（图片是第一帧并让它动起来）、`fl2v`（同时钉住首帧**与**末帧）、`ref`（图片是用于全新场景的身份/外观参考）。不设置时每个请求按其自身携带的输入推断，通常这就是你想要的；只提供一种模式的部署才需要固定它。 |
 | `--video-frames <N>` | Web UI 或 API 请求未提供 `frames` 时，视频生成使用的默认输出帧数。会对齐到模型自己的时间网格——Wan 为 `4k+1`，其中以 24 fps 生成 `121` 帧约为五秒；MiniMax-H3 为 `17k+5`。未指定此参数时沿用模型回退值：通常为 `33`，Wan 2.2 TI2V-5B 为 `49`，MiniMax-H3 为 `22`。请求中显式提供的 `frames` 会覆盖此默认值。 LTX 2.5 默认 17 帧，必须为 `8k+1`；无效请求不会自动对齐。 |
 | `--fps <N>` | Web UI 或 API 请求未提供 `fps` 时，生成的 MP4 使用的默认播放帧率。未指定此参数时沿用模型回退值：通常为 `16` fps，Wan 2.2 TI2V-5B 为 `24` fps。请求中显式提供的 `fps` 会覆盖此默认值；仅改变 FPS 会改变播放速度，而不会改变生成的帧数。以固定帧率训练的模型（MiniMax-H3，24 fps）会覆盖任何其他取值。 LTX 2.5 默认为 24 fps。 |
@@ -733,9 +748,9 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `--video-upscaler <path>` | 两阶段视频模型所用的 2 倍潜变量放大器：LTX 2.5 先以输出尺寸的一半生成，再用 `ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` 放大潜变量，最后以完整尺寸精修。默认：模型同目录的 `latent_upscale_models/`。环境变量：`TS_VIDEO_UPSCALER`。 |
 | `--video-diffusion-vae <path>` | 可选的 LTX 2.5 扩散视频解码器（`ltx-2.5-video-vae-bf16.safetensors`）：颗粒和闪烁更少、画面更干净，但比默认的卷积 `--video-vae` 更柔和。仅支持 MLX 和 CPU；CUDA 会拒绝。默认：关闭。环境变量：`TS_VIDEO_DIFFUSION_VAE`。 |
 | `--qwen-image-vae <path>` / `--qwen-image-vl <path>` / `--qwen-image-mmproj <path>` | 覆盖服务端原本在 DiT GGUF 旁找到的 Qwen-Image-2.1 伴随文件：VAE、Qwen3-VL-8B 文本编码器及其视觉投影器（编辑时需要）。启动时检查。环境变量：`TS_QWEN_IMAGE_VAE`、`TS_QWEN_IMAGE_TE`、`TS_QWEN_IMAGE_MMPROJ`。 |
-| `--qwen-image-variant <base\|turbo>` | DiT GGUF 是哪一个 Qwen-Image-2.1 检查点，拼写与含义同 CLI：`turbo` 默认按 Turbo 的 8 步调度、CFG 1 采样（请求的 `steps` 只能是 8），并拒绝步数蒸馏 `--lora` 插件。作用于服务端加载的每个 Qwen-Image 模型；其他模型照常加载、不使用它，服务端会记录一条警告，与 `--lora` 相同。默认：不声明——文件名含单词 `turbo` 时按 Turbo 处理，加载时会打印这一假定。启动时检查。环境变量：`TS_QWEN_IMAGE_VARIANT`。 |
+| `--qwen-image-variant <base\|turbo>` | DiT GGUF 是哪一个 Qwen-Image-2.1 检查点，拼写与含义同 CLI：`turbo` 默认按 Turbo 的 8 步调度、CFG 1 采样（请求的 `steps` 只能是 8），并拒绝步数蒸馏 `--lora` 插件。作用于服务端加载的每个 Qwen-Image 模型；其他模型照常加载、不使用它，服务端会记录一条警告，与启动后加载的模型遇到它不接受的 `--lora` 插件时相同。默认：不声明——文件名含单词 `turbo` 时按 Turbo 处理，加载时会打印这一假定。启动时检查。环境变量：`TS_QWEN_IMAGE_VARIANT`。 |
 | `--width <px>` / `--height <px>` | 图像请求既未指定尺寸也未指定面积时（Web UI 从不指定）Qwen-Image-2.1 的默认输出尺寸；请求自己设置了宽高或目标面积时保留它自己的几何设置。默认尺寸需要两个值都给出。不是 32 倍数的边会向下取整到 32 的倍数（最小 32），并打印一次 `[qwen-image] WARNING`；只给出一边、或值无法解析或为负数时，默认尺寸会被忽略（同样只警告一次），继续使用自动尺寸（2048×2048 面积；`cpu` 后端上为 1024×1024）。Qwen-Image 服务端在这两种情况下都会在启动时警告，但不会拒绝启动。请求本身设置的宽高仍必须是 32 的正整数倍。环境变量：`TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`。它们同时也是 `--video-width` / `--video-height` 的别名。 LTX 2.5 视频默认输出 1024×1024，宽高必须为 64 的正整数倍；见下文两阶段配方。 |
-| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | Qwen-Image-2.1 LoRA 插件，拼写与绑定规则都与 CLI 相同（重复 `--lora` 可叠加；强度与配置绑定到前一个 `--lora`）。文件在启动时检查，这组插件作用于每个图像请求；请求中的 `steps` / `cfg` 仍会覆盖插件的采样配方。其他模型会忽略它们（启动日志会说明这些插件只作用于 Qwen-Image-2.1 模型）。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)。 |
+| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | 所承载的 Qwen-Image-2.1 或 MiniMax-H3（FL2VA）模型的 LoRA 插件，拼写与绑定规则都与 CLI 相同（重复 `--lora` 可叠加 Qwen-Image-2.1 插件；强度与配置绑定到前一个 `--lora`）。文件在启动时检查，启动模型不接受的插件会在启动时、插件下载之前被拒绝（`--config` 仍需下载的模型在该下载完成后立即检查）；之后加载的模型不使用它不接受的插件，并记录一条写明这些插件的警告。启动日志列出这组插件（`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`）。在 Qwen-Image-2.1 上这组插件作用于每个图像请求，请求中的 `steps` / `cfg` 仍会覆盖插件的采样配方。MiniMax-H3 Turbo 插件作用于每段片段，并把 `--video-steps` 以及请求的 `steps`、`flowShift`、`sampler` 锁定为其配方。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)与 [MiniMax-H3 Turbo 插件](#minimax-h3-turbo-插件)。 |
 | `--qwen-image-lora` / `--offload-cpu` | **已移除，启动时（包括作为配置文件键时）直接拒绝。** 两者只服务于早期的 Qwen-Image-Edit 流水线。`--qwen-image-lora` 由上面的 `--lora` 取代；`--offload-cpu` 没有替代项，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。 |
 | `--temperature <f>` | 采样温度（`0` = 贪心） |
 | `--top-k <N>` | Top-K 过滤（`0` = 关闭） |
@@ -972,9 +987,13 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
 环境变量 `TS_LORAS` 把解析后的列表交给模型，其值是由 `{"path", "scale", "config"}` 对象
 组成的 JSON 数组。
 
-这些插件只作用于 Qwen-Image-2.1。CLI 遇到其他模型时拒绝 `--lora`；服务端在启动时记录它们
-（`LoRA plug-ins (applied to Qwen-Image-2.1 models only): ...`），并把它们应用到每个
-图像请求上。TensorSharp.Server.Host 不提供按请求选择 LoRA；TensorAgent 有自己的已保存插件选择，从下一张图片起生效。已退役的 `--qwen-image-lora` 仍是已移除的参数，其报错
+本节的插件作用于 Qwen-Image-2.1；MiniMax-H3 使用自己的 [Turbo 插件](#minimax-h3-turbo-插件)，
+并拒绝这些插件。两个宿主都会在插件下载之前拒绝启动模型不接受的 `--lora`；`--config` 仍需下载的
+模型，其家族会在该下载完成后立即检查，因为家族由文件头给出。服务端在启动时
+记录这组插件（`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`），并把它应用到每个图像请求上；
+之后加载的模型若不接受这些插件，就不使用它们，并记录一条写明它们的警告。命令行未指定插件时，
+继承来的 `TS_LORAS` 接受同样的检查：模型不接受的条目会被跳过并给出警告，所列文件缺失时会
+中止启动（启动模型不接受任何插件时除外）。TensorSharp.Server.Host 不提供按请求选择 LoRA；TensorAgent 有自己的已保存插件选择，从下一张图片起生效。已退役的 `--qwen-image-lora` 仍是已移除的参数，其报错
 会指明 `--lora`；`TS_QWEN_IMAGE_LORA` 在加载时被拒绝，并给出同样的建议。
 
 Qwen-Image-2.1-Turbo（`--qwen-image-variant turbo`）本身已经过步数蒸馏：带采样配方的插件
@@ -1082,6 +1101,48 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/q
 `--tp N` 兼容。格式、打包方式、张量并行与限制的详细说明见
 [Qwen-Image-2.1 卡片](docs/models/qwenimage21_zh-cn.md#lora-插件)。
 
+### MiniMax-H3 Turbo 插件
+
+`config/lora/minimax-h3-fl2v-turbo-8step.json` 与 `minimax-h3-fl2v-turbo-4step.json` 是 LightX2V
+为 MiniMax-H3 FL2VA 检查点做的步数蒸馏 LoRA：一段片段只需 8 或 4 次 Transformer 前向，而不是 20 次。
+各自在首次使用时下载 1.38 GB 权重（固定修订版本、校验 SHA-256、Apache-2.0）到
+`${TENSORSHARP_MODELS:-<仓库>/models}/minimax-h3/loras`。
+
+```bash
+# CLI：插件的配方取代 --diffusion-steps / --flow-shift / --sampler
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
+    --lora config/lora/minimax-h3-fl2v-turbo-8step.json \
+    --image first.png --prompt "The person smiles and waves." --output wave.mp4
+
+# 服务端：每段片段都按插件的配方采样；请求不要带 "steps"
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json \
+    --lora config/lora/minimax-h3-fl2v-turbo-4step.json
+```
+
+| 插件 | 配方 |
+|---|---|
+| `minimax-h3-fl2v-turbo-8step.json` | LightX2V Turbo 8-step（FL2V v1.0，768p）：在端点包含的 linspace 网格上做 8 步 Euler，视频 shift 6、音频 shift 3、CFG 1，即发布方给出的配方 |
+| `minimax-h3-fl2v-turbo-4step.json` | LightX2V Turbo 4-step（FL2V v1.2，768p）：同一网格与 shift 上的 4 步。**推断所得**：发布方没有给出 v1.2 的配方，因此在验证之前沿用其 4 步 v1.0 一行 |
+
+与上面的 Qwen-Image-2.1 插件不同之处：
+
+- **配方是锁定的，不是默认值。** `--diffusion-steps`、`--flow-shift`、`--sampler` 与 `--cfg`（CLI）、
+  `--video-steps`（服务端）以及请求的 `steps`、`flowShift`、`sampler` 可以不设（0）或等于配方值；
+  其他任何值都会被拒绝，绝不会被覆盖。两个宿主都在启动时、下载任何文件之前（包括 `--config`
+  的文件）以一行 `Configuration error:` 和退出码 1 拒绝；请求则返回 400，流式路由返回
+  `{done, error}` 事件。
+- **只接受一个插件，且必须是插件配置。** MiniMax-H3 只接受一个 `minimax-h3-lora` 配置；裸
+  `.safetensors`、Qwen-Image-2.1 插件或第二个 H3 插件都会被拒绝。`--lora <权重> --lora-config <配置>`
+  只在权重文件正是该配置所指的文件时可用。
+- **仅限 FL2VA。** Ref2VA 检查点（按文件名中的 `ref2va` 识别）两个都拒绝。
+- **强度。** `--lora-scale` 必须 ≥ 0；不等于 1 时日志会说明该调度是在强度 1 下蒸馏的；0 则保留
+  适配器各项而上投影因子为零。
+- **尺寸不变。** 文生视频仍为 640×384，关键帧仍取 768p 配方画布。适配器在 768p 下训练，短边
+  不是 768 的片段会记录一行说明。
+
+sigma 网格、适配器的应用方式、后端与验证情况见
+[MiniMax-H3 卡片](docs/models/minimax-h3_zh-cn.md#turbo-插件)。
+
 ## 音视频生成（LTX 2.5 Distilled）
 
 LTX 2.5 从文本、首尾帧或带时间位置的图像关键帧联合生成视频与 48 kHz 立体声音频。
@@ -1164,7 +1225,8 @@ dotnet run --project TensorSharp.Cli -c Release -- \
 `--ref-audio` 与按索引配对的 `--ref-video-audio`；提示词使用 `<Picture 1>`、
 `<Video 1>`、`<Audio 1>` 占位。检查点、模式或输入不兼容时会报错，避免静默忽略条件。
 
-CFG 固定为 **1**；默认 **20 步**，4–8 步以质量换速度。宽高向上对齐到 32 的倍数；
+CFG 固定为 **1**；默认 **20 步**，减少基础步数以质量换速度；FL2VA 上的
+[Turbo 插件](#minimax-h3-turbo-插件)则改为按其蒸馏时的 8 或 4 步采样。宽高向上对齐到 32 的倍数；
 帧数对齐到 `17k+5` 网格（5、22、39……），播放固定 24 fps。
 这些是输入约束；长片段的感知质量尚未确立。`--no-audio` 跳过音频解码，
 仍运行训练时的联合 AV 去噪器。CLI 在 MP4 旁写 WAV；是否封装音轨取决于导出器。
@@ -1176,6 +1238,9 @@ CFG 固定为 **1**；默认 **20 步**，4–8 步以质量换速度。宽高�
 （640×384×22、20 步）中，完整进程时间在 Metal 降低 5.0%、MLX 降低 12.5%、
 直接 CUDA 降低 19.0%；原生 CUDA 无明显收益。小样本包含加载 / 导出，
 文件缓存状态未受控，不能建立普遍加速或跨引擎性能持平的结论；修正后的 CPU 完整生成配对仍待完成。
+在 `ggml_metal` 上，让长注意力走 ggml-metal 的 tensor-API 内核（补齐 key、分块 query）后，
+M5 Pro 上一次 1280×768×107、20 步的首尾帧运行从 11,553.8 秒降到 5,438.5 秒（2.12×；单次运行，
+[详情](docs/models/minimax-h3_zh-cn.md#metal-上的长序列注意力)）。
 实际组件、设备验证与性能边界见[当前覆盖与精度说明](docs/models/minimax-h3_zh-cn.md)。
 
 三个共用端点为 `/api/video-generate`、`/api/video-generate/stream` 与

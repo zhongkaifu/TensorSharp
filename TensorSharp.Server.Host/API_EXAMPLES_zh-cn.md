@@ -1386,8 +1386,9 @@ curl --fail-with-body http://localhost:5000/api/image-generate \
 请求中的 `steps` 与 `cfg` 仍会覆盖配方。带调度的插件只能以它定义的步数运行，因此其他
 `steps` 值会被拒绝，并列出支持的步数（Pruna 8 步插件只支持 8）。风格与编辑插件不带配方，
 省略时仍使用模型默认值（40 步、CFG 1）。重复 `--lora` 可叠加插件，`--lora-scale` 设置强度。
-服务端启动时会记录 `LoRA plug-ins (applied to Qwen-Image-2.1 models only): ...`。参数、
-随附插件与插件配置格式见 [USAGE_zh-cn.md](../USAGE_zh-cn.md#qwen-image-21-lora-插件)。
+服务端启动时会记录 `LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`，并在插件下载之前
+拒绝启动模型不接受的插件（`--config` 仍需下载的模型在该下载完成后立即检查）。参数、随附插件与插件配置格式见 [USAGE_zh-cn.md](../USAGE_zh-cn.md#qwen-image-21-lora-插件)。
+MiniMax-H3 的 Turbo 插件见[视频生成](#minimax-h3--视频与原生-32-khz-立体声音频)。
 
 ### 视频生成（`/api/video-generate`、`/v1/videos/generations`）
 
@@ -1421,7 +1422,7 @@ Distilled 检查点支持首帧 `imagePath`、尾帧 `endImage`，以及指定�
 
 `frameIndex` 从零开始，`-1` 表示最终帧，`strength` 范围为 `[0,1]`。
 同时接受 `image_conditions`、`image_path`、`frame_index` 和上游形式 `frame_idx`。
-仅指定尾帧时，可省略模式或使用 `keyframes`；`fl2v` 要求同时有首帧和尾帧。
+只有尾帧时也是 `fl2v`（只发送 `endImage`）：片段以它结束。`fl2v` 必须有尾帧，首帧可选；`i2v` 必须有首帧，并拒绝尾帧。
 `/api/models.video` 返回 `supportsKeyframeConditioning`、`defaultPreviewFrames`
 和 `maxReferenceImages`。Web UI 与 TensorAgent 默认将一张图作为首帧、两张图作为
 首尾帧，三张及以上等距排列在时间线上；每张图也提供帧位置与强度控件。
@@ -1446,14 +1447,25 @@ MiniMax-H3 把视频和 32 kHz 立体声音轨当作同一个打包潜变量一�
 
 ```bash
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
-  --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+  --video-steps 20 --video-frames 22
 ```
 
-`--video-width`/`--video-height` 在这里比在任何其他模型上都更要紧：Web UI 自己不
-发送尺寸，因此缺了它们每个片段都会以模型默认尺寸产出。帧数会对齐到 H3 的 `17k+5`
-网格（5、22、39、56、73、90……），宽高向上取整到 32 的倍数，fps 不管请求写什么都
-固定为 24。H3 是 CFG 蒸馏过的 —— 大于 `1.0` 的引导系数会被直接拒绝 —— 所以
-`steps` 才是质量杠杆：20 是模型默认值，4-8 步是快速工作点。
+这个模型不要设 `--video-width`/`--video-height`。请求不带尺寸时（聊天 Web UI 就不
+带），画布按模式确定：文生视频为 640×384；图生视频与首尾帧按 MiniMax 发布的 768p
+配方从第一张关键帧（只有尾帧时取尾帧）取画布 —— 保持关键帧宽高比、短边 768 像素、
+最多 768×1344 像素、每边取最接近的 32 的倍数。3:2 照片得到 1152×768，2:3 竖图
+768×1152，4:3 为 1024×768，16:9 为 1344×768，正方形 768×768；宽高比限制在
+1:4–4:1，超出部分居中裁掉。这与 vllm-omni 和 sglang 一致。这两种模式保留关键帧的
+构图，而视频 VAE 在每个方向上下采样 16×：塞进 640×384 后，全身照里的人脸只剩约
+60 像素高，单是一次 VAE 编码再解码就会把它抹糊；在配方画布上人脸能保住。配方画布
+每帧的视频 token 是 640×384 的约 2.4×（正方形）到 4.2×（16:9 及更宽），注意力开销
+增长得更快，所以一次运行要慢好几倍。同时设置 `--video-width` 与 `--video-height`
+会给所有模式（包括关键帧）钉死同一个尺寸，并关闭 Studio 的"按首帧"尺寸；只设其中
+一个时，另一边随图像宽高比。帧数会对齐到 H3 的 `17k+5` 网格（5、22、39、56、73、
+90……），请求指定的宽高向上取整到 32 的倍数，fps 不管请求写什么都固定为 24。
+H3 是 CFG 蒸馏过的 —— 大于 `1.0` 的引导系数会被直接拒绝 —— 所以
+`steps` 才是质量杠杆：20 是模型默认值。想少跑几步，请以 [Turbo 插件](#使用-turbo-插件)启动服务端，
+而不是调低 `steps`。
 
 再在另一个终端中：
 
@@ -1481,7 +1493,7 @@ curl -X POST http://localhost:5000/api/video-generate \
 （桌面端 FFmpeg，Mac 应用 AVFoundation）；`audioMuxed` 表示 MP4 是否包含该音轨。
 
 **一张图像意味着什么，取决于检查点。** `videoMode` 取 `t2v`、`i2v`（图像就是首
-帧，并被赋予动作）、`fl2v`（首帧和尾帧）或 `ref`（为新场景提供身份与外观参考）；
+帧，并被赋予动作）、`fl2v`（尾帧，首帧可选：只发送 `endImage` 即以该图结束）或 `ref`（为新场景提供身份与外观参考）；
 省略它则从请求提供的内容推断。`i2v`/`fl2v` 需要 FL2VA 检查点，`ref` 需要 Ref2VA
 —— 它们是两个不同的文件，而不是一个开关。让某个检查点去做它没有训练过的模式，会
 得到 400，并携带模型自己的解释，告诉你该改加载哪个文件。
@@ -1489,11 +1501,12 @@ curl -X POST http://localhost:5000/api/video-generate \
 ```bash
 # 首尾帧，FL2VA 检查点。两个名字都是先前 /api/upload 返回的 "file"；
 # 上传目录之外的任何路径都会被拒绝。
+# 不带 width/height：画布取自首帧（3:2 照片为 1152x768）。
 curl -X POST http://localhost:5000/api/video-generate \
   -H "Content-Type: application/json" \
   -d '{"prompt": "缓慢的电影感推镜", "videoMode": "fl2v",
        "imagePath": "<file from /api/upload>", "endImage": "<file from /api/upload>",
-       "width": 640, "height": 384, "frames": 22, "steps": 20, "cfg": 1.0}'
+       "frames": 22, "steps": 20, "cfg": 1.0}'
 ```
 
 参考条件生成 —— 主体的身份被延续下来，而镜头、背景和构图来自提示词 —— 需要
@@ -1510,6 +1523,53 @@ curl -X POST http://localhost:5000/api/video-generate \
 在 Ref2VA 上，一个不带 `videoMode`、不带 `endImage`、也没有具名参考的普通
 `imagePath` 会被当作单个参考，因此只会附带一张图片的客户端 —— 内置 Web UI 也在其
 中 —— 不需要任何额外字段。
+
+##### 使用 Turbo 插件
+
+用 LightX2V 的步数蒸馏插件启动 FL2VA 服务端后，每段片段都按其配方采样：只跑 8 步
+（`minimax-h3-fl2v-turbo-4step.json` 为 4 步）、视频 shift 6、Euler、CFG 1。不要设置
+`--video-steps`，或设为同一步数；其他值会在下载任何文件之前以一行 `Configuration error:`
+中止启动。
+
+```bash
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json \
+  --lora config/lora/minimax-h3-fl2v-turbo-8step.json
+```
+
+此后请求不要带 `steps`、`flowShift` 与 `sampler`，或与配方取值相同；Web UI 对该模型
+一个都不发送：
+
+```bash
+curl -X POST http://localhost:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "一只红狐狸在纷飞的雪中小跑，电影感", "frames": 22, "seed": 42}'
+```
+
+`steps` 与配方冲突的请求会被拒绝，并附上插件自己的说明，绝不会改用其他步数重新采样：
+
+```bash
+curl -X POST http://localhost:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "一只红狐狸在纷飞的雪中小跑，电影感", "steps": 20}'
+```
+
+```json
+{"error": "LightX2V Turbo 8-step (FL2V v1.0, 768p) (minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors) samples exactly 8 steps on its own schedule; 20 steps contradicts it. Leave the step count unset (--diffusion-steps on the CLI, --video-steps on the server, \"steps\" in a request) or set it to 8."}
+```
+
+这个回复是 HTTP 400。`/api/video-generate/stream` 以携带同一文本的
+`{"done": true, "error": "..."}` 事件结束，`POST /v1/videos/generations` 则以其 OpenAI
+信封返回 400：
+
+```json
+{"error": {"message": "LightX2V Turbo 8-step (FL2V v1.0, 768p) (minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors) samples exactly 8 steps on its own schedule; 20 steps contradicts it. Leave the step count unset (--diffusion-steps on the CLI, --video-steps on the server, \"steps\" in a request) or set it to 8.", "type": "invalid_request_error"}}
+```
+
+不等于 6 的 `flowShift`、不是 `euler` 的 `sampler` 同样会被拒绝。生成过程中服务端自身的失败
+（前向计算耗尽设备内存、请求等待期间模型被卸载）不属于拒绝：该路由返回 500，
+`"type": "server_error"` 并附上原因，OpenAI 客户端会重试。启动时的插件组作用于
+每段片段：请求不能选择或去掉插件。Ref2VA 检查点在启动时拒绝该插件。配方、其他拒绝情形与
+验证情况见 [MiniMax-H3 卡片](../docs/models/minimax-h3_zh-cn.md#turbo-插件)。
 
 #### Wan 2.1 / 2.2 —— 仅视频
 

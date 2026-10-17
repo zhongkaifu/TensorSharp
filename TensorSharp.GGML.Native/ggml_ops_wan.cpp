@@ -40,6 +40,7 @@
 #include "ggml_ops_internal.h"
 #include "ggml-impl.h"   // ggml_graph_view, for the segmented MPS conv runner
 #include "ggml-alloc.h"
+#include "ggml_ops_metal_flash_pad.h"
 
 #include <cmath>
 #include <cstdint>
@@ -1122,21 +1123,12 @@ static bool wan_backend_is_metal()
     return name != nullptr && std::strncmp(name, "MTL", 3) == 0;
 }
 
-// Mirrors ggml-metal's has_tensor gating closely enough to predict whether the
-// Metal 4 tensor API is active for this process: an M5/M6/A19/A20-class device
-// name (or GGML_METAL_TENSOR_ENABLE) and no GGML_METAL_TENSOR_DISABLE. Used to
-// decide the VAE conv strategy; a rare false positive only costs speed, never
-// correctness.
+// Whether the Metal 4 tensor API is active for this process
+// (ggml_ops_metal_flash_pad.h). Used to decide the VAE conv strategy; a rare
+// false positive only costs speed, never correctness.
 static bool wan_metal_tensor_api_likely()
 {
-    if (!wan_backend_is_metal()) return false;
-    if (std::getenv("GGML_METAL_TENSOR_DISABLE") != nullptr) return false;
-    ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
-    const char* desc = dev != nullptr ? ggml_backend_dev_description(dev) : nullptr;
-    const bool m5class = desc != nullptr &&
-        (std::strstr(desc, "M5") || std::strstr(desc, "M6") ||
-         std::strstr(desc, "A19") || std::strstr(desc, "A20"));
-    return m5class || std::getenv("GGML_METAL_TENSOR_ENABLE") != nullptr;
+    return tsg_metal_tensor_api_likely(g_backend);
 }
 
 static long long wan_vae_gemm_budget()

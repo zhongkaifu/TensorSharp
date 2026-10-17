@@ -39,6 +39,8 @@
 #include "ggml_h3_weight_upload.h"
 #include "ggml_h3_token_rows.h"
 #include "ggml_h3_graph_inputs.h"
+#include "ggml_ops_metal_flash_pad.h"
+#include "ggml_h3_lora.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -174,6 +176,53 @@ float h3_flash_v_scale(int keys)
     return s;
 }
 
+// The key-padding masks of one graph (ggml_ops_metal_flash_pad.h), one per
+// sequence length, so the 50 DiT blocks share one rather than building 50.
+struct H3FlashMasks
+{
+    struct Entry { int seq, keys, rows; ggml_tensor* mask; };
+    std::vector<Entry> entries;
+
+    ggml_tensor* get(ggml_context* ctx, int seq, int keys, int rows)
+    {
+        for (const Entry& e : entries)
+            if (e.seq == seq && e.keys == keys && e.rows == rows) return e.mask;
+        ggml_tensor* mask = tsg_metal_flash_kv_pad_mask(ctx, seq, keys, rows);
+        entries.push_back({ seq, keys, rows, mask });
+        return mask;
+    }
+};
+
+// h3_attend's flash call with the keys padded to `keys` (a multiple of 64) and
+// the queries in chunks sharing one small mask (ggml_ops_metal_flash_pad.h).
+// q/k/v as h3_attend takes them; returns [inner, seq] still divided by vScale,
+// or null when the backend cannot run the padded call.
+ggml_tensor* h3_attend_padded(ggml_context* ctx, ggml_backend_t backend,
+                              ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
+                              int heads, int seq, int keys, float scale, float vScale,
+                              H3FlashMasks& masks)
+{
+    const int chunk = tsg_metal_flash_query_chunk(seq, heads);
+    // ggml_pad zero-fills the K/V rows past seq, and its output stands in for the
+    // ggml_cont the permute needs.
+    ggml_tensor* vs = vScale == 1.0f ? v : ggml_scale(ctx, v, 1.0f / vScale);
+    ggml_tensor* kf = ggml_cast(ctx,
+        ggml_permute(ctx, ggml_pad(ctx, k, 0, 0, keys - seq, 0), 0, 2, 1, 3), GGML_TYPE_F16);
+    ggml_tensor* vf = ggml_cast(ctx,
+        ggml_permute(ctx, ggml_pad(ctx, vs, 0, 0, keys - seq, 0), 0, 2, 1, 3), GGML_TYPE_F16);
+    ggml_tensor* merged = tsg_metal_flash_attn_chunked(ctx, backend, ggml_permute(ctx, q, 0, 2, 1, 3),
+                                                       kf, vf, masks.get(ctx, seq, keys, chunk),
+                                                       chunk, scale);
+    static bool reported = false;
+    if (merged != nullptr && !reported)
+    {
+        reported = true;
+        std::fprintf(stderr, "  [h3] flash attention: %d keys padded to %d for ggml-metal's "
+                     "tensor-API kernel (TS_METAL_FLASH_KV_PAD=0 disables)\n", seq, keys);
+    }
+    return merged;
+}
+
 // Full bidirectional attention over a packed sequence.
 //
 // q/k/v arrive as [head_dim, heads, seq]. The explicit path materializes a
@@ -209,9 +258,15 @@ float h3_flash_v_scale(int keys)
 // Attention is LINEAR in V, so scaling V down before the kernel and scaling the
 // result back up afterwards is exact -- and by a power of two it is exact through
 // the FP16 cast as well, being nothing but an exponent shift.
+//
+// On ggml-metal with the Metal 4 tensor API the keys are padded to a multiple of
+// 64 and the pads masked, which is what puts a long sequence on the tensor-API
+// kernel: 2.49x per call at 1280x768x107 (ggml_ops_metal_flash_pad.h). `masks`
+// shares that mask between the graph's attentions; null leaves the keys unpadded.
 ggml_tensor* h3_attend(ggml_context* ctx, ggml_backend_t backend,
                        ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
-                       int hd, int heads, int seq, float scale, bool allowFlash)
+                       int hd, int heads, int seq, float scale, bool allowFlash,
+                       H3FlashMasks* masks = nullptr)
 {
     ggml_tensor* qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));   // [hd, seq, heads]
     ggml_tensor* kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
@@ -223,11 +278,19 @@ ggml_tensor* h3_attend(ggml_context* ctx, ggml_backend_t backend,
 
     if (allowFlash)
     {
-        ggml_tensor* vp = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
         // Keep the kernel's FP16 numerator in range no matter how long the clip
         // is: the accumulator now sums over at most kH3FlashKeyBudget effective
         // keys' worth of V, and the output is scaled back on the way out.
         const float vScale = h3_flash_v_scale(seq);
+        const int keys = masks != nullptr ? tsg_metal_flash_kv_length(backend, seq, seq) : seq;
+        if (keys != seq)
+        {
+            ggml_tensor* merged = h3_attend_padded(ctx, backend, q, k, v, heads, seq, keys,
+                                                   scale, vScale, *masks);
+            if (merged != nullptr)
+                return vScale == 1.0f ? merged : ggml_scale(ctx, merged, vScale);
+        }
+        ggml_tensor* vp = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
         ggml_tensor* kf = ggml_cast(ctx, kp, GGML_TYPE_F16);
         ggml_tensor* vf = ggml_cast(ctx,
             vScale == 1.0f ? vp : ggml_scale(ctx, vp, 1.0f / vScale), GGML_TYPE_F16);
@@ -379,6 +442,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeDecode(const TSGgmlMiniMaxH3VideoVaeDecod
 
         const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
         const std::size_t f = sizeof(float);
+        H3FlashMasks flashMasks;
 
         for (int l = 0; l < nl; l++)
         {
@@ -415,17 +479,15 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeDecode(const TSGgmlMiniMaxH3VideoVaeDecod
             k = h3_vit_rope(ctx, k, cosf, sinf, hd, heads, seq, rot);
 
             ggml_tensor* merged = h3_attend(ctx, g_backend, q, k, v, hd, heads, seq,
-                                            scale, /*allowFlash*/ true);
+                                            scale, /*allowFlash*/ true, &flashMasks);
             ggml_tensor* attn = lin(ow, merged, ob);
             h = ggml_add(ctx, h, s1 ? ggml_mul(ctx, attn, s1) : attn);
 
             // ---- gated FFN ----
             ggml_tensor* n2 = ggml_mul(ctx, ggml_rms_norm(ctx, h, eps), n2w);
             ggml_tensor* gv = lin(w1w, n2, w1b);                 // [2*inner, seq]
-            ggml_tensor* gate = ggml_cont(ctx, ggml_view_2d(ctx, gv, inner, seq, gv->nb[1], 0));
-            ggml_tensor* val = ggml_cont(ctx, ggml_view_2d(ctx, gv, inner, seq, gv->nb[1],
-                                                            static_cast<std::size_t>(inner) * f));
-            ggml_tensor* ff = lin(w2w, ggml_mul(ctx, ggml_silu(ctx, gate), val), w2b);
+            // silu(gate) * value in one pass, gate being the first half of each row.
+            ggml_tensor* ff = lin(w2w, ggml_swiglu(ctx, gv), w2b);
             h = ggml_add(ctx, h, s2 ? ggml_mul(ctx, ff, s2) : ff);
         }
 
@@ -858,18 +920,32 @@ struct TSGgmlMiniMaxH3DitForwardDesc
     float audio_scale;       // -d(sigma_audio)/d(sigma_video)
     void* graph_arena;       // optional, caller-owned stable CUDA graph metadata
     std::uint64_t graph_arena_bytes;
+    // Optional LoRA plug-in applied unmerged (ggml_h3_lora.h); null runs the
+    // checkpoint as stored, through exactly the graph it had before adapters.
+    const TSGH3DitAdapter* adapter;
 };
-static_assert(sizeof(void*) != 8 || (sizeof(TSGgmlMiniMaxH3DitForwardDesc) == 544 &&
+static_assert(sizeof(void*) != 8 || (sizeof(TSGgmlMiniMaxH3DitForwardDesc) == 552 &&
     offsetof(TSGgmlMiniMaxH3DitForwardDesc, graph_arena) == 528 &&
-    offsetof(TSGgmlMiniMaxH3DitForwardDesc, graph_arena_bytes) == 536),
+    offsetof(TSGgmlMiniMaxH3DitForwardDesc, graph_arena_bytes) == 536 &&
+    offsetof(TSGgmlMiniMaxH3DitForwardDesc, adapter) == 544),
     "MiniMax-H3 DiT descriptor must match the managed 64-bit ABI.");
 
 TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d)
 {
     try
     {
+        // Checked first and on its own: a descriptor of another size is a managed
+        // build paired with a different GgmlOps, and every field past the first
+        // may then be misread (the adapter pointer would lie past its end).
+        if (d != nullptr && d->struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlMiniMaxH3DitForwardDesc)))
+        {
+            set_last_error("MiniMaxH3DitForward: descriptor is " + std::to_string(d->struct_bytes) +
+                           " bytes; this GgmlOps build expects " +
+                           std::to_string(sizeof(TSGgmlMiniMaxH3DitForwardDesc)) +
+                           ". The managed TensorSharp build and the native library differ; rebuild GgmlOps.");
+            return 0;
+        }
         if (d == nullptr ||
-            d->struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlMiniMaxH3DitForwardDesc)) ||
             d->video_tokens == nullptr || d->audio_tokens == nullptr ||
             d->time_embed == nullptr || d->cosf == nullptr || d->sinf == nullptr ||
             d->video_out == nullptr || d->audio_out == nullptr ||
@@ -936,6 +1012,30 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
             { set_last_error("MiniMaxH3DitForward: text_count outside the sequence."); return 0; }
         }
 
+        // The LoRA plug-in, checked as a whole before any of it is bound.
+        const TSGH3DitAdapter* adapter = d->adapter;
+        {
+            const std::string bad = h3_lora_validate(adapter, nl, nref, hidden, inner, ffn);
+            if (!bad.empty())
+            { set_last_error("MiniMaxH3DitForward: LoRA " + bad); return 0; }
+        }
+        if (adapter != nullptr)
+        {
+            // h3_lora_fc1 splits a bias-free fc1; no released H3 fc1 carries one.
+            auto biasedFc1 = [&](const TSGH3BlockLora& l, const TSGH3Lin& fc1, const std::string& where) {
+                if (!h3_lora_has(l.fc1) || fc1.b == nullptr) return false;
+                set_last_error("MiniMaxH3DitForward: LoRA " + where + " ff.net.0.proj: this fc1 has a "
+                               "bias, and the split SwiGLU that applies an fc1 update takes none.");
+                return true;
+            };
+            for (int i = 0; i < nref && d->refiner != nullptr; i++)
+                if (biasedFc1(adapter->refiner[i], d->refiner[i].fc1, "refiner block " + std::to_string(i)))
+                    return 0;
+            for (int l = 0; l < nl; l++)
+                if (biasedFc1(adapter->blocks[l], d->blocks[l].fc1, "block " + std::to_string(l)))
+                    return 0;
+        }
+
         const char* backend_name = ggml_backend_name(g_backend);
         const bool stable_cuda_graph = backend_name != nullptr && std::strncmp(backend_name, "CUDA", 4) == 0;
         if ((d->graph_arena == nullptr) != (d->graph_arena_bytes == 0) ||
@@ -982,6 +1082,8 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
             ggml_set_input(t);
             uploads.push_back({ t, data, bytes });
         };
+        // The LoRA factors take the weights' path: device cache, else an upload.
+        const tsg::H3Bind bindFn = bind;
         auto declLin = [&](const TSGH3Lin& s, ggml_tensor*& wt, ggml_tensor*& bt) {
             wt = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(s.type), s.ne0, s.ne1);
             bind(wt, s.w, ggml_nbytes(wt));
@@ -1001,6 +1103,12 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         auto lin = [&](ggml_tensor* w, ggml_tensor* x, ggml_tensor* b, bool guard = true) {
             ggml_tensor* o = h3_mm(ctx, w, x, guard);
             return b ? ggml_add(ctx, o, b) : o;
+        };
+        // One projection's LoRA term on x, [out, seq]. The caller adds it as src0,
+        // so the graph visits it first: x's other consumer, h3_mm's guard
+        // pre-scale, is then its last and may scale x in place.
+        auto loraDelta = [&](const TSGH3Lora& l, ggml_tensor* x) {
+            return h3_lora_expand(ctx, bindFn, l, h3_lora_shrink(ctx, bindFn, { &l }, x)[0]);
         };
 
         // ---- inputs ----
@@ -1031,16 +1139,33 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
 
         // Shared bidirectional attention. Packed diffusion blocks apply RoPE;
         // the text token refiner has no positional rotation.
+        H3FlashMasks flashMasks;
+        // `L` is the block's LoRA (null = none); a part without an update builds
+        // exactly what it did before adapters.
         auto attention = [&](ggml_tensor* h, ggml_tensor* qkvw, ggml_tensor* qkvb,
                              ggml_tensor* qn, ggml_tensor* kn, ggml_tensor* ow, ggml_tensor* ob,
-                             int seq, ggml_tensor* cosT, ggml_tensor* sinT) {
+                             int seq, ggml_tensor* cosT, ggml_tensor* sinT, const TSGH3BlockLora* L) {
             ggml_tensor* qkv = lin(qkvw, h, qkvb);                 // [3*inner, seq]
-            ggml_tensor* q = ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
+            // q/k/v updates land on the stacked thirds of qkv, before the q/k norm and
+            // RoPE: one shrink of h for all three, then each part's slice plus its
+            // term, which replaces the slice's ggml_cont.
+            ggml_tensor* adapted[3] = { nullptr, nullptr, nullptr };
+            if (L != nullptr && (h3_lora_has(L->q) || h3_lora_has(L->k) || h3_lora_has(L->v)))
+            {
+                const TSGH3Lora* parts[3] = { &L->q, &L->k, &L->v };
+                std::vector<ggml_tensor*> shrunk = h3_lora_shrink(ctx, bindFn, { &L->q, &L->k, &L->v }, h);
+                for (int i = 0; i < 3; i++)
+                    if (shrunk[i] != nullptr)
+                        adapted[i] = ggml_reshape_3d(ctx, h3_lora_add_slice(ctx,
+                            h3_lora_expand(ctx, bindFn, *parts[i], shrunk[i]), qkv, inner,
+                            static_cast<std::size_t>(i) * inner * f), hd, heads, seq);
+            }
+            ggml_tensor* q = adapted[0] != nullptr ? adapted[0] : ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
                 static_cast<std::size_t>(hd) * f, qkv->nb[1], 0));
-            ggml_tensor* k = ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
+            ggml_tensor* k = adapted[1] != nullptr ? adapted[1] : ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
                 static_cast<std::size_t>(hd) * f, qkv->nb[1],
                 static_cast<std::size_t>(inner) * f));
-            ggml_tensor* v = ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
+            ggml_tensor* v = adapted[2] != nullptr ? adapted[2] : ggml_cont(ctx, ggml_view_3d(ctx, qkv, hd, heads, seq,
                 static_cast<std::size_t>(hd) * f, qkv->nb[1],
                 static_cast<std::size_t>(2) * inner * f));
             if (qn) q = ggml_mul(ctx, ggml_rms_norm(ctx, q, eps), qn);
@@ -1051,19 +1176,49 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
                 k = h3_vit_rope(ctx, k, cosT, sinT, hd, heads, seq, rot);
             }
             ggml_tensor* merged = h3_attend(ctx, g_backend, q, k, v, hd, heads, seq,
-                                            scale, /*allowFlash*/ true);
+                                            scale, /*allowFlash*/ true, &flashMasks);
+            if (L != nullptr && h3_lora_has(L->out))
+                return ggml_add(ctx, loraDelta(L->out, merged), lin(ow, merged, ob));
             return lin(ow, merged, ob);
         };
 
-        // SwiGLU with the gate first: fc1 emits [gate | value].
+        // SwiGLU with the gate first: fc1 emits [gate | value]. ggml_swiglu computes
+        // silu(first half) * second half of each row in one pass, where splitting
+        // the halves out cost two [ffn, seq] copies (2 GB each at 1280x768x107)
+        // plus separate silu and mul passes.
+        //
+        // With LoRA updates on fc1 or fc2 (`L`, null = none) mlpLora builds the
+        // block instead. An fc1 update computes the two SwiGLU halves separately
+        // (h3_lora_fc1), which keeps the peak where the fused path has it; adding
+        // the update to gv would hold a second [2*ffn, seq] tensor.
+        auto mlpLora = [&](ggml_tensor* h, ggml_tensor* w1, ggml_tensor* b1,
+                           ggml_tensor* w2, ggml_tensor* b2, const TSGH3BlockLora& L) {
+            ggml_tensor* act;
+            if (h3_lora_has(L.fc1))
+            {
+                auto [gate, value] = h3_lora_fc1(ctx, bindFn, w1, h, L.fc1, ffn, kH3MmScale);
+                act = ggml_swiglu_split(ctx, gate, value);
+                if (!ggml_backend_supports_op(g_backend, act))
+                    act = ggml_mul(ctx, ggml_silu(ctx, gate), value);
+            }
+            else
+            {
+                ggml_tensor* gv = lin(w1, h, b1);
+                if (gv->ne[0] != 2 * static_cast<std::int64_t>(ffn))
+                    throw std::runtime_error("MiniMaxH3DitForward: fc1 width is not 2 x ffn.");
+                act = ggml_swiglu(ctx, gv);
+            }
+            if (!h3_lora_has(L.fc2)) return lin(w2, act, b2);
+            return ggml_add(ctx, loraDelta(L.fc2, act), lin(w2, act, b2));
+        };
         auto mlp = [&](ggml_tensor* h, ggml_tensor* w1, ggml_tensor* b1,
-                       ggml_tensor* w2, ggml_tensor* b2) {
+                       ggml_tensor* w2, ggml_tensor* b2, const TSGH3BlockLora* L) {
+            if (L != nullptr && (h3_lora_has(L->fc1) || h3_lora_has(L->fc2)))
+                return mlpLora(h, w1, b1, w2, b2, *L);
             ggml_tensor* gv = lin(w1, h, b1);
-            int seq = static_cast<int>(gv->ne[1]);
-            ggml_tensor* gate = ggml_cont(ctx, ggml_view_2d(ctx, gv, ffn, seq, gv->nb[1], 0));
-            ggml_tensor* val = ggml_cont(ctx, ggml_view_2d(ctx, gv, ffn, seq, gv->nb[1],
-                static_cast<std::size_t>(ffn) * f));
-            return lin(w2, ggml_mul(ctx, ggml_silu(ctx, gate), val), b2);
+            if (gv->ne[0] != 2 * static_cast<std::int64_t>(ffn))
+                throw std::runtime_error("MiniMaxH3DitForward: fc1 width is not 2 x ffn.");
+            return lin(w2, ggml_swiglu(ctx, gv), b2);
         };
 
         // ---- text: project, then refine ----
@@ -1083,11 +1238,12 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
                 ggml_tensor *qkvw, *qkvb, *ow, *ob, *w1, *b1, *w2, *b2;
                 declLin(rw.qkv, qkvw, qkvb); declLin(rw.out, ow, ob);
                 declLin(rw.fc1, w1, b1); declLin(rw.fc2, w2, b2);
+                const TSGH3BlockLora* rl = adapter != nullptr ? &adapter->refiner[i] : nullptr;
                 ggml_tensor* n1 = ggml_mul(ctx, ggml_rms_norm(ctx, ctxTok, eps), n1w);
                 ctxTok = ggml_add(ctx, ctxTok,
-                    attention(n1, qkvw, qkvb, qn, kn, ow, ob, d->text_count, nullptr, nullptr));
+                    attention(n1, qkvw, qkvb, qn, kn, ow, ob, d->text_count, nullptr, nullptr, rl));
                 ggml_tensor* n2 = ggml_mul(ctx, ggml_rms_norm(ctx, ctxTok, eps), n2w);
-                ctxTok = ggml_add(ctx, ctxTok, mlp(n2, w1, b1, w2, b2));
+                ctxTok = ggml_add(ctx, ctxTok, mlp(n2, w1, b1, w2, b2, rl));
             }
             ggml_tensor* rfn = declVec(d->refiner_final_norm, hidden);
             if (rfn) ctxTok = ggml_mul(ctx, ggml_rms_norm(ctx, ctxTok, eps), rfn);
@@ -1202,14 +1358,15 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
             // No SiLU: the curve-table variant feeds the interpolated embedding straight in.
             ggml_tensor* mods = ggml_reshape_2d(ctx, lin(adw, temb, adb, false), hidden, 18 * nts);
 
+            const TSGH3BlockLora* bl = adapter != nullptr ? &adapter->blocks[l] : nullptr;
             ggml_tensor* h = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), n1w);
             h = modulate(h, mods, 0, 1);
-            ggml_tensor* a = attention(h, qkvw, qkvb, qn, kn, ow, ob, ntok, cosf, sinf);
+            ggml_tensor* a = attention(h, qkvw, qkvb, qn, kn, ow, ob, ntok, cosf, sinf, bl);
             x = gatedResidual(x, a, mods, 2);
 
             h = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), n2w);
             h = modulate(h, mods, 3, 4);
-            ggml_tensor* m = mlp(h, w1, b1, w2, b2);
+            ggml_tensor* m = mlp(h, w1, b1, w2, b2, bl);
             x = gatedResidual(x, m, mods, 5);
         }
 
@@ -1265,9 +1422,14 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         // prompt, and at fourteen segments a 50-layer graph runs past the end
         // and ggml_build_forward_expand trips GGML_ASSERT(n_nodes < size),
         // which aborts the process rather than returning an error.
+        //
+        // A LoRA adapter adds at most kH3LoraNodesPerBlock nodes, and as many
+        // factor leaves, to every trunk and refiner block (ggml_h3_lora.h, measured
+        // by eng/validation/minimax-h3-lora.cpp). Without one the budget is as before.
+        const std::size_t loraNodes = adapter != nullptr ? static_cast<std::size_t>(kH3LoraNodesPerBlock) : 0;
         const std::size_t nodes =
-            static_cast<std::size_t>(nl) * (104 + static_cast<std::size_t>(nseg) * 32) +
-            static_cast<std::size_t>(nref) * 104 + 4096;
+            static_cast<std::size_t>(nl) * (104 + static_cast<std::size_t>(nseg) * 32 + loraNodes) +
+            static_cast<std::size_t>(nref) * (104 + loraNodes) + 4096;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, nodes, false);
         if (graph == nullptr)
         { set_last_error("MiniMaxH3DitForward: graph alloc failed."); return 0; }
@@ -2087,6 +2249,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
         std::vector<ggml_tensor*> outputs;
         outputs.reserve(1 + nds);
         outputs.push_back(nullptr);   // filled with the final merger below
+        H3FlashMasks flashMasks;
 
         for (int l = 0; l < nl && visProbe == nullptr; l++)
         {
@@ -2114,7 +2277,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
             // Qwen3-VL runs FULL attention on every layer; the windowed variant in the
             // Qwen2.5-VL config is dead for this path.
             ggml_tensor* merged2 = h3_attend(ctx, g_backend, q, k, v, hd, heads, seq,
-                                             scale, /*allowFlash*/ true);
+                                             scale, /*allowFlash*/ true, &flashMasks);
             h = ggml_add(ctx, h, lin(pw, merged2, pb));
 
             ggml_tensor* n2 = layerNorm(h, n2w, n2b);

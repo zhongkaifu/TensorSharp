@@ -40,14 +40,15 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Qwen-Image-2.1 | Qwen3-VL-8B 文本编码器（必需） | [Qwen/Qwen3-VL-8B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF) 中的 `Qwen3VL-8B-Instruct-Q4_K_M.gguf`——放在 DiT 旁，或用 `--qwen-image-vl` / `TS_QWEN_IMAGE_TE` 指定 |
 | Qwen-Image-2.1 | 编辑用视觉编码器 | 同一 Qwen3-VL 仓库中的 `mmproj-Qwen3VL-8B-Instruct-F16.gguf`——放在 DiT 旁，或用 `--qwen-image-mmproj` / `TS_QWEN_IMAGE_MMPROJ` 指定 |
 | Qwen-Image-2.1-Turbo | 扩散 Transformer，8 步蒸馏版（即 `--model` GGUF） | [AtomicChat/Qwen-Image-2.1-Turbo-GGUF](https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-GGUF)，文件 `Qwen-Image-2.1-Turbo-AD-Q4_K.gguf`（4.20 GB）；`Qwen-Image-2.1-Turbo-Q8_0.gguf`（7.59 GB）是最接近全精度的 Transformer（文本编码器仍是同一个 Q4_K_M）。[`config/qwen-image-2.1-turbo.json`](config/qwen-image-2.1-turbo.json) 以固定修订版本与 SHA-256 把 AD-Q4_K 下载到模型根目录下的 `qwen-image-2.1/`，VAE、文本编码器与 mmproj 使用上面列出的发布文件名，因此已存有这些文件的目录只需下载 Transformer。GGUF 不含元数据，因此配置文件声明了检查点（`--qwen-image-variant turbo`）。详见 [qwenimage21_zh-cn.md](docs/models/qwenimage21_zh-cn.md#qwen-image-21-turbo) |
-| Qwen-Image-2.1 | LoRA 插件（可选） | [`config/lora/`](config/lora/) 中的十四个插件，用 `--lora` 加载；每个插件在首次使用时以固定修订版本与 SHA-256 从 Hugging Face 下载其 `.safetensors`，保存到模型根目录下的 `qwen-image-2.1/loras/`（Fun-Acc 还会下载它转交的 `pdd_config.json`）。包括步数蒸馏适配器（Viggle Turbo、Pruna 8/5 步、阿里巴巴 PAI Fun-Acc 4 步）以及风格 / 编辑 LoRA；其中数个仅限非商业用途。见 [USAGE_zh-cn.md](USAGE_zh-cn.md#qwen-image-21-lora-插件) |
+| Qwen-Image-2.1 | LoRA 插件（可选） | [`config/lora/`](config/lora/) 中的十四个 Qwen-Image-2.1 插件，用 `--lora` 加载；每个插件在首次使用时以固定修订版本与 SHA-256 从 Hugging Face 下载其 `.safetensors`，保存到模型根目录下的 `qwen-image-2.1/loras/`（Fun-Acc 还会下载它转交的 `pdd_config.json`）。包括步数蒸馏适配器（Viggle Turbo、Pruna 8/5 步、阿里巴巴 PAI Fun-Acc 4 步）以及风格 / 编辑 LoRA；其中数个仅限非商业用途。见 [USAGE_zh-cn.md](USAGE_zh-cn.md#qwen-image-21-lora-插件) |
 | LTX 2.5 Distilled | 视频 + 48 kHz 立体声音频 | [`config/ltx-2.5-distilled.json`](config/ltx-2.5-distilled.json) 固定五个文件（44.76 GB）：Q4_K_M 去噪器、专用 Gemma 4 BF16 编码器 / 投影、卷积视频 VAE、2 倍潜变量放大器与音频 VAE。官方伴随文件需要获批 Hugging Face 访问权限与 token。TensorAgent 的实验性档位为 48 GB；默认预览为 1024×1024×17、24 fps，使用 8+3 步两阶段 ancestral Euler。可选 Ingredients IC-LoRA 与扩散视频解码器需另行下载。见 [LTX 2.5](docs/models/ltx-2.5_zh-cn.md)。 |
 | EmbeddingGemma 2 | 文本 / 代码及可选媒体嵌入 | [`config/embeddinggemma2.json`](config/embeddinggemma2.json) 将 Q8_0 文本模型固定到 Unsloth 修订 `031f0d4b35536f69ab3509d4893c923264fcf253`；同一版本的可选 `mmproj-Q8_0.gguf` 提供图像 / 音频 / 视频输入。用 `--embeddings` 承载；输出 768 维（MRL：512/256/128），默认输入窗口 8192 token。已实现六个后端，不支持 Vulkan。命令与覆盖范围见[嵌入指南](docs/embeddings_zh-cn.md)。 |
-| MiniMax-H3 音视频生成 | 去噪器（`--model` GGUF） | **两个独立的 checkpoint，不是开关**——加载哪一个决定了它接受什么条件输入。[unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)：`minimax_h3_fl2va_pruned-Q4_K.gguf`（10.64 GiB）用于文生视频 / 图生视频 / 首尾帧，`minimax_h3_ref2va_pruned-Q4_K.gguf`（10.60 GiB）用于身份与外观参考。另有 Q8_0（19.97 GiB）到 Q2_K（6.26 GiB）。H3 是 CFG 蒸馏模型：**CFG 必须为 1.0**（默认值）；当前默认 20 步，4–8 步是以质量换速度的选择。这些 GGUF **完全没有元数据**，TensorSharp 靠张量表识别它们，并从文件名读出分区——重命名或重新量化时请保留 `fl2va` / `ref2va`。两个 checkpoint 共用下面三个网络，所以事后再加另一个只需下它自己的约 10.6 GiB。TensorAgent 的桌面目录（32 GB 档位）会自己下载整套带哈希校验的文件（含分词器），分为 `minimax-h3-fl2va-q4k` 与 `minimax-h3-ref2va-q4k` 两个条目；后安装的那个直接链接已有的 24.0 GB 共用文件而不重新下载，只下载自己的去噪器。见 [minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md#在-tensoragent-mac-应用里) |
+| MiniMax-H3 音视频生成 | 去噪器（`--model` GGUF） | **两个独立的 checkpoint，不是开关**——加载哪一个决定了它接受什么条件输入。[unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)：`minimax_h3_fl2va_pruned-Q4_K.gguf`（10.64 GiB）用于文生视频 / 图生视频 / 首尾帧，`minimax_h3_ref2va_pruned-Q4_K.gguf`（10.60 GiB）用于身份与外观参考。另有 Q8_0（19.97 GiB）到 Q2_K（6.26 GiB）。H3 是 CFG 蒸馏模型：**CFG 必须为 1.0**（默认值）；默认 20 步，下面可选的 Turbo 插件把 FL2VA 检查点蒸馏为 8 或 4 步。这些 GGUF **完全没有元数据**，TensorSharp 靠张量表识别它们，并从文件名读出分区——重命名或重新量化时请保留 `fl2va` / `ref2va`。两个 checkpoint 共用下面三个网络，所以事后再加另一个只需下它自己的约 10.6 GiB。TensorAgent 的桌面目录（32 GB 档位）会自己下载整套带哈希校验的文件（含分词器），分为 `minimax-h3-fl2va-q4k` 与 `minimax-h3-ref2va-q4k` 两个条目；后安装的那个直接链接已有的 24.0 GB 共用文件而不重新下载，只下载自己的去噪器。见 [minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md#在-tensoragent-mac-应用里) |
 | MiniMax-H3 音视频生成 | Qwen3-VL-32B 文本编码器（必需） | 同仓库：`qwen3vl_32b_minimax_h3-Q4_K_M.gguf`（16.97 GiB），或 `-Q2_K_M.gguf`（12.20 GiB）以搭配最小的那几个去噪器。截断到 50 层并去掉最后的 norm，去噪开始前即从显存释放。**它不含分词器**——还需要下一行那三个文件 |
 | MiniMax-H3 音视频生成 | `vocab.json` + `merges.txt` + `tokenizer_config.json`（必需） | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor) 的 `processor/`（三个合计 4.46 MB）——编码器 GGUF 缺的那对 Qwen2 字节级 BPE 文件，外加 `tokenizer_config.json`：只有它定义了 `<\|vision_start\|>`、`<\|image_pad\|>` 和 `<\|vision_end\|>`。文生视频与参考全是录音的请求不需要它；缺了它，带关键帧、或参考中含照片或视频片段的请求会在视觉塔运行前被拒绝（以前图片会被放到提示词的错误位置上、悄悄被忽略）。这也是配置文件唯一无法替你自动下载的东西（自动下载只能补齐“是参数”的条目，而分词器不是），不过 TensorAgent 的目录会自己下载这三个文件。放在编码器旁边，或用 `TS_VIDEO_TOKENIZER` 指向存放它们的目录 |
 | MiniMax-H3 音视频生成 | 视频 VAE（必需） | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/vae) 里的 `minimax_h3_video_vae_fp16.safetensors`（5.21 GB）。空间 16 倍 / 时间 4 倍，解码器是纯 Transformer。放在去噪器旁或用 `--video-vae` 指定 |
 | MiniMax-H3 音视频生成 | 音频 VAE（可选） | 同一目录下的 `minimax_h3_audio_vae_fp32.safetensors`（0.61 GB）。把联合生成的音频 latent 解码成 32 kHz 立体声，作为旁挂 `.wav` 写在视频边上。**不下载也照样出视频**，只是没有声音。用 `--audio-vae` 指定 |
+| MiniMax-H3 音视频生成 | Turbo LoRA 插件（可选，仅 FL2VA） | [`config/lora/`](config/lora/) 中的两个步数蒸馏插件，用 `--lora` 加载，来自 [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/a29e57d195f80ead07c89f89e55ecf2911e893c5)，固定修订版本 `a29e57d195f80ead07c89f89e55ecf2911e893c5`（Apache-2.0），各 1,383,677,808 字节（1.38 GB），首次使用时下载到模型根目录下的 `minimax-h3/loras/`。`minimax-h3-fl2v-turbo-8step.json`：`minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors`，SHA-256 `9b0efe3613b43a84e30febaa43af27432ea9d0711eac7bba904b2556b175f6d4`，8 步。`minimax-h3-fl2v-turbo-4step.json`：`minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors`，SHA-256 `c3d4a2cf618efea71b9e21a4baaa12d412f1eb6c2b6f86efacaf0ebb6814b689`，4 步，配方为推断所得。各自把步数、flow shift、采样器与 CFG 锁定为其配方；Ref2VA 两个都拒绝。见 [minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md#turbo-插件) |
 | Wan 视频生成 | **步数蒸馏 DiT（首选）** | **这是最大的提速手段——除非要复现参考样例，都应该用它。**蒸馏 checkpoint 生成同一段视频只跑 4 次去噪，而官方配方要跑 100 次：在 M5 Pro / `ggml_metal` 上以 1088×832×121 帧实测，端到端 **17 分 30 秒**，而基础 checkpoint 是 **3 小时 30 分**——同一个请求，其他参数一律不变。TI2V-5B：[hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF)，文件 `Wan2_2-TI2V-5B-Turbo-Q8_0.gguf`（5.40 GB），另有 Q6_K（4.22 GB）、Q5_K_M（3.82 GB）、Q4_K_M（3.44 GB），最小到 Q2_K（1.86 GB）。**注意文件名里是 `Wan2_2` 下划线**，照抄基础仓库的 `Wan2.2` 写法会 404。I2V-A14B：[jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF](https://huggingface.co/jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF)，Lightning 已合并进两个专家；需同时下载 `high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf` **和** `low_noise/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf`（各 9.66 GB；Q8_0 15.42 GB，Q2_K 5.31 GB），放在同一个 `--local-dir` 下，`--model` 指向任意一个即可，另一个专家会自动找到。备选：[Green-Sky/FastWan2.2-TI2V-5B-FullAttn-GGUF](https://huggingface.co/Green-Sky/FastWan2.2-TI2V-5B-FullAttn-GGUF)（`FastWan2.2-TI2V-5B-q8_0.gguf`，5.41 GB）。**无需任何参数**：TensorSharp 读取 DiT 文件名，命中 `turbo` / `distill` / `lightning` / `lightx2v` / `fastwan` / `-dmd` 或显式的 `<N>steps`（1-16）即切换到该步数并关闭 guidance，加载时打印 `step-distilled checkpoint detected -> N steps, guidance off`；`--diffusion-steps` / `--cfg` 可覆盖。Turbo 与 A14B 蒸馏仓库都不含 VAE 和文本编码器，请从下面两行获取 |
 | Wan 视频生成 | 基础 DiT（`--model` GGUF） | 完整官方配方（50 步 × 2 次 CFG = 100 次 DiT 前向）——需要对齐参考样例时才用，否则优先用上一行的蒸馏版本。Wan 2.2 文/图生视频：[QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF)（`Wan2.2-TI2V-5B-Q8_0.gguf` 5.40 GB 或 `Wan2.2-TI2V-5B-Q4_K_M.gguf` 3.43 GB，仓库自带 `VAE/Wan2.2_VAE.safetensors`）、[QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF) 或 [QuantStack/Wan2.2-T2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF)（`HighNoise/` 与 `LowNoise/` 两个专家缺一不可，两个仓库都自带 `VAE/Wan2.1_VAE.safetensors`）；Wan 2.1 文生视频：[samuelchristlie/Wan2.1-T2V-1.3B-GGUF](https://huggingface.co/samuelchristlie/Wan2.1-T2V-1.3B-GGUF)（`Wan2.1-T2V-1.3B-Q8_0.gguf` / `-F16.gguf`）或 [city96/Wan2.1-T2V-14B-gguf](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf)（文件名为小写，如 `wan2.1-t2v-14b-Q8_0.gguf`）——这两个 2.1 仓库都不含 VAE 和编码器。`general.architecture` 为 `wan` / `wan2.1` / `wan2.2`。参见 [docs/models/wan.md](docs/models/wan.md) |
 | Wan 视频生成 | UMT5-XXL 文本编码器（必需，所有 Wan checkpoint 都要） | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf)：`umt5-xxl-encoder-Q8_0.gguf`（6.04 GB），内存紧张可用 `umt5-xxl-encoder-Q5_K_M.gguf`（4.15 GB）/ `umt5-xxl-encoder-Q4_K_M.gguf`（3.66 GB）。负责把提示词编码成条件向量，去噪开始前即从显存释放。放在 DiT 旁或用 `--video-text-encoder` / `TS_VIDEO_TEXT_ENCODER` 指定 |
@@ -304,7 +305,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/qw
 
 （在 Web UI 里，不带附件的提示词会生成图像；附加一张或多张图像即可编辑。省略设置时为 2048×2048（纯 C# `cpu` 上为 1024×1024）、40 步 Euler、CFG 1；`--width 1024 --height 1024` 是更快的草图尺寸；服务端同时给出 `--width` / `--height` 时会改变这个默认值。详见 [qwenimage21_zh-cn.md](docs/models/qwenimage21_zh-cn.md)。）
 
-步数蒸馏 LoRA 插件（可选）能把 40 步降到 4–8 步。去掉上面 CLI 命令里的 `--diffusion-steps 40 --cfg 1`，再加上 `--lora config/lora/qwen-image-2.1-viggle-turbo.json`（默认 6 步，CFG 1）或 `--lora config/lora/qwen-image-2.1-pruna-8step.json`（8 步）：适配器在首次使用时下载，步数与 CFG 由它的配方提供。显式的 `--diffusion-steps` / `--cfg` 会覆盖配方，配方没有对应调度的步数会被拒绝。服务端在启动时接受同样的 `--lora`。全部十四个插件见 [config/README.md](config/README.md#qwen-image-21-lora-plug-ins-lora)。
+步数蒸馏 LoRA 插件（可选）能把 40 步降到 4–8 步。去掉上面 CLI 命令里的 `--diffusion-steps 40 --cfg 1`，再加上 `--lora config/lora/qwen-image-2.1-viggle-turbo.json`（默认 6 步，CFG 1）或 `--lora config/lora/qwen-image-2.1-pruna-8step.json`（8 步）：适配器在首次使用时下载，步数与 CFG 由它的配方提供。显式的 `--diffusion-steps` / `--cfg` 会覆盖配方，配方没有对应调度的步数会被拒绝。服务端在启动时接受同样的 `--lora`。全部十四个 Qwen-Image-2.1 插件见 [config/README.md](config/README.md#qwen-image-21-lora-plug-ins-lora)。
 
 **Qwen-Image-2.1-Turbo**（同一模型蒸馏为 8 步、CFG 1；[AtomicChat/Qwen-Image-2.1-Turbo-GGUF](https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-GGUF)）：`qwen-image-2.1/` 中已有 Qwen-Image-2.1 的文件时，它的配置只需下载 4.20 GB 的 AD-Q4_K Transformer。配置声明了检查点，因此 Turbo 按公布的 8 步调度采样；其他步数和步数蒸馏 LoRA 插件会被拒绝：
 
@@ -378,25 +379,50 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
     --video-text-encoder models/qwen3vl_32b_minimax_h3-Q4_K_M.gguf \
     --video-vae models/vae/minimax_h3_video_vae_fp16.safetensors \
     --audio-vae models/vae/minimax_h3_audio_vae_fp32.safetensors \
-    --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+    --video-steps 20 --video-frames 22
 ```
 
 上面这条 CLI 命令会写出 `fox.mp4` **和 `fox.wav`**：原始 PCM 保存在旁挂 WAV 中；MP4 音轨封装取决于导出器及可用的音频编码器——用 `ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4` 合并即可。
 所有文件都在同一个目录下时，三个伴随文件参数都可以省略：去噪器所在目录及其上一级会被递归扫描，子目录也算。
 不下载音频 VAE，或者加上 `--no-audio`，仍然会出视频——只是没有声音。
 
-H3 是 CFG 蒸馏模型，**必须传 `--cfg 1.0`**，更高的值会被直接拒绝；管线自身的默认是 20 步，4-8 步是快速
-工作点，代价是运动主体边缘会有一些彩色条纹，到 ~20 步就消失了。宽高向上取整到 32 的倍数，帧数对齐到
+H3 是 CFG 蒸馏模型，**必须传 `--cfg 1.0`**，更高的值会被直接拒绝；管线自身的默认是 20 步，基础模型减少步数的
+代价是运动主体边缘会有一些彩色条纹，到 ~20 步就消失了；想少跑几步，请加上专为此蒸馏的 Turbo 插件（见下文）。请求指定的宽高向上取整到 32 的倍数，帧数对齐到
 `17k+5` 网格（5、22、39、56、73、90……），fps 无论你传什么都被钉死在 24。服务端的步数参数叫
 `--video-steps`，而且根本没有 `--cfg`——这正是随附配置两个都不设的原因。
 
 条件输入方面：`--image first.png` 把这张图作为首帧动起来；再加上
 `--end-image last.png --video-mode fl2v` 就是在首尾两帧之间插值；而在 Ref2VA checkpoint 上，`--ref-image`（可重复，最多九个）、
 `--ref-video`、`--ref-video-audio` 与 `--ref-audio` 则是把身份与外观带进一个全新的镜头。
+不指定尺寸时，文生视频与参考以 640×384 运行，关键帧则自己决定画布：`--image`（i2v）与 `--end-image`（fl2v）
+按 MiniMax 发布的 768p 配方从第一张关键帧取画布——保持其宽高比、短边 768 像素、最多 768×1344 像素
+（3:2 照片为 1152×768，2:3 为 768×1152，16:9 为 1344×768）。这两种模式保留关键帧的构图，塞进 640×384 后
+全身照里的人脸只剩约 60 像素高，单靠视频 VAE 就会把它抹糊。配方画布每帧的视频 token 是 640×384 的
+约 2.4×（正方形）到 4.2×（16:9），所以要慢好几倍。同时给出 `--width` 与 `--height`（服务端为
+`--video-width` 与 `--video-height`）会为所有模式（包括关键帧）钉死同一个尺寸，所以上面的服务端命令两个都不设；
+狐狸那条 CLI 命令的 640×384 是文生视频，只影响那一次运行。
 文本精修与 AV 采样修正后，旧的 Metal 2.4× / 1.7× 对比已失效。最新同精度改动前后测试在
 Metal、MLX 与直接 CUDA 上有收益，原生 CUDA 无明显改善；加载、编码器、未受控文件缓存
 与有限样本限制了这些结论。参见
 [docs/models/minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md)。
+
+**MiniMax-H3 Turbo 插件**（LightX2V 为 FL2VA 检查点做的步数蒸馏 LoRA，
+[lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/a29e57d195f80ead07c89f89e55ecf2911e893c5)，
+Apache-2.0；8 或 4 次 Transformer 前向，取代 20 步）：在上面的命令里加上
+`--lora config/lora/minimax-h3-fl2v-turbo-8step.json`（或 `minimax-h3-fl2v-turbo-4step.json`），
+插件首次使用时下载 1.38 GB 权重并校验表中列出的 SHA-256。它的配方是锁定的：CLI 命令里的
+`--diffusion-steps 8` 与 8 步插件一致，但服务端命令必须去掉 `--video-steps 20`，否则会在启动时、
+下载任何文件之前被拒绝。使用 4 步插件时，还要去掉 CLI 命令里的 `--diffusion-steps 8`（或改为 4）。
+4 步插件的配方是推断所得（发布方没有给出该版本的配方）。要自己下载权重，
+请放到插件查找的位置，即仓库中的 `models/minimax-h3/loras`（设置了 `TENSORSHARP_MODELS` 时为
+`$TENSORSHARP_MODELS/minimax-h3/loras`）：
+
+```bash
+hf download lightx2v/Minimax-h3-Turbo minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors \
+    --revision a29e57d195f80ead07c89f89e55ecf2911e893c5 --local-dir models/minimax-h3/loras
+```
+
+契约、拒绝规则与验证情况见 [docs/models/minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md#turbo-插件)。
 
 **Wan 视频生成**（提示词 + 可选首帧图片 → H.264 MP4，仅视频；需要 DiT + 视频 VAE + UMT5-XXL 文本编码器）：
 

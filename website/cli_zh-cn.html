@@ -154,12 +154,12 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
   --width 1024 --height 1024 --diffusion-seed 42 --output turbo.png</code></pre>
   <p><strong>局部编辑：</strong>在 <code>--image photo.png</code> 上增加 <code>--mask selection.png</code>。同尺寸的灰度蒙版用白色表示编辑、黑色表示保护；<code>--mask-mode alpha</code>、<code>--mask-invert</code>、<code>--mask-feather</code>、<code>--mask-crop</code> 与 <code>--mask-crop-padding</code> 控制选区。结果保持源图尺寸。<a href="models-image_zh-cn.html#mask-editing">完整示例与蒙版语义 →</a></p>
 
-  <p><code>config/lora/</code> 中的步数蒸馏插件 —— <code>qwen-image-2.1-viggle-turbo.json</code>、<code>-pruna-8step.json</code>、<code>-pruna-5step.json</code> 与 <code>-fun-acc-4step.json</code> —— 会用它们训练时的 4–8 步配方取代默认的 40 步，因此是图像生成最主要的提速杠杆。显式的 <code>--diffusion-steps</code> / <code>--cfg</code> 仍然优先，但配方没有对应调度的步数会被拒绝。伴随文件、尺寸、草图设置与 <a href="models-image_zh-cn.html#lora">LoRA 插件</a>见<a href="models-image_zh-cn.html#imagegen">图像生成</a>。</p>
+  <p><code>config/lora/</code> 中的 Qwen-Image-2.1 步数蒸馏插件 —— <code>qwen-image-2.1-viggle-turbo.json</code>、<code>-pruna-8step.json</code>、<code>-pruna-5step.json</code> 与 <code>-fun-acc-4step.json</code> —— 会用它们训练时的 4–8 步配方取代默认的 40 步，因此是图像生成最主要的提速杠杆。显式的 <code>--diffusion-steps</code> / <code>--cfg</code> 仍然优先，但配方没有对应调度的步数会被拒绝。伴随文件、尺寸、草图设置与 <a href="models-image_zh-cn.html#lora">LoRA 插件</a>见<a href="models-image_zh-cn.html#imagegen">图像生成</a>。</p>
 
   <p><strong>LTX 2.5:</strong> 使用 <code>--config config/ltx-2.5-distilled.json</code>；NVIDIA 用 <code>cuda</code>/<code>ggml_cuda</code>，Apple 用 <code>mlx</code>/<code>ggml_metal</code>（实际为 MLX），CPU 别名选择直接 CPU。默认 1024×1024×17、24 fps，宽高为 64 倍数、帧数 <code>8k+1</code>；8 步半尺寸加 3 步精修，CFG 1。 <a href="models-video_zh-cn.html#ltx-25">五文件、音频、条件与限制 →</a></p>
 
   <h3 id="video">视频生成</h3>
-  <p><strong>MiniMax-H3</strong> 在<em>同一个</em>打包潜变量里同时去噪视频与原生 32&nbsp;kHz 立体声音轨，所以声音和画面来自同一次前向。它经过 CFG 蒸馏，因此必须传 <code>--cfg 1.0</code>（更高的取值会被直接拒绝），默认 20 步，而 4–8 步是它的快速工作点：</p>
+  <p><strong>MiniMax-H3</strong> 在<em>同一个</em>打包潜变量里同时去噪视频与原生 32&nbsp;kHz 立体声音轨，所以声音和画面来自同一次前向。它经过 CFG 蒸馏，因此必须传 <code>--cfg 1.0</code>（更高的取值会被直接拒绝），默认 20 步。像前两个示例那样减少基础步数可以更快得到预览，但会损失一些质量；专为少步数蒸馏的调度是下文的 <a href="#h3-turbo">Turbo 插件</a>：</p>
   <pre data-lang="bash"><code># 文本 -> H.264 MP4 外加一个旁挂 WAV。写出 fox.mp4 与 fox.wav。
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --model &lt;minimax_h3_fl2va_pruned-Q4_K.gguf&gt; --backend ggml_metal \
@@ -168,12 +168,14 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --output fox.mp4
 
 # 让一张照片动起来：在 FL2VA 权重上，这张图像就是首帧。
-# 再加 --end-image 可以把尾帧也钉住（--video-mode fl2v）。
+# 再加 --end-image 可以把尾帧也钉住（--video-mode fl2v）。不给 --width/--height
+# 时，画布按 MiniMax 的 768p 配方取自这张照片（3:2 照片为 1152x768），人脸得以保留；
+# 两者都给出则改为固定所给的尺寸，例如用更小的尺寸做更快的预览。
 dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --model &lt;minimax_h3_fl2va_pruned-Q4_K.gguf&gt; --backend ggml_metal \
     --image portrait.jpg --video-mode i2v \
     --prompt "the person turns toward the camera and smiles" \
-    --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
+    --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
     --output animated.mp4
 
 # 参考：保留主体，围绕它构建一个新场景。需要 Ref2VA 权重，
@@ -185,6 +187,11 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
     --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
     --output rooftop.mp4</code></pre>
   <div class="callout note"><div class="ic">💡</div><p><code>i2v</code> / <code>fl2v</code> 需要 <code>fl2va</code> 权重，<code>ref</code> 需要 <code>ref2va</code> —— 它们是两个不同的文件而不是开关，用错时报错信息会直接点名另一个文件。宽高向上取整到 32 的倍数，帧数向上对齐到 <code>17k+5</code> 网格（5、22、39、56、73、90……），帧率固定为 24。音轨保留为独立 <code>.wav</code>；FFmpeg 与 Apple AVFoundation 导出路径也可将其混入 MP4，其他提供器可能返回分离音轨：<code>ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4</code> 可以把两者合并。<code>--no-audio</code> 则完全跳过音频 VAE。→ <a href="models-video_zh-cn.html#minimax-h3">H3 需要的四个文件</a></p></div>
+  <p id="h3-turbo"><strong>MiniMax-H3 Turbo：</strong>LightX2V 为 FL2VA 检查点做的步数蒸馏 LoRA 以两份插件配置提供：<code>config/lora/minimax-h3-fl2v-turbo-8step.json</code> 与 <code>-4step.json</code>。每份在首次使用时下载 1.38 GB 权重，并按自己的调度只跑 8（或 4）步——Euler、视频 shift 6、音频 shift 3、CFG 1；4 步配方为<em>推断所得</em>，因为发布方没有给出该版本的配方。请不要设置 <code>--diffusion-steps</code>、<code>--flow-shift</code> 与 <code>--sampler</code>：与配方冲突的取值会在下载任何文件之前以一行 <code>Configuration error:</code> 终止运行。Ref2VA 检查点不接受它。→ <a href="models-video_zh-cn.html#h3-turbo">插件、锁定的配方与已验证的范围</a></p>
+  <pre data-lang="bash"><code>dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
+    --config config/minimax-h3-fl2va.json \
+    --lora config/lora/minimax-h3-fl2v-turbo-8step.json \
+    --prompt "a red fox trotting through falling snow, cinematic" --output fox-turbo.mp4</code></pre>
   <p><strong>Wan 2.1 / 2.2</strong> 只生成视频，而在那里，<code>--model</code> 指向哪个权重决定了整体耗时：</p>
   <pre data-lang="bash"><code># 提示词 -> H.264 MP4。UMT5-XXL 文本编码器与视频 VAE 会在 DiT GGUF
 # 旁边自动解析（也可用 --video-text-encoder / --video-vae 指定）。
@@ -363,9 +370,9 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--negative-prompt &lt;text&gt;</code></td><td>Qwen-Image-2.1 负向提示词（默认为空，即无条件分支）。只有 <code>--cfg</code> 大于 1 时才会用到，否则不跑负向分支。</td></tr>
       <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>覆盖解析到的 Qwen-Image-2.1 伴随文件（专用 2.1 VAE / Qwen3-VL-8B 文本编码器 / Qwen3-VL-8B mmproj）。</td></tr>
       <tr><td><code>--qwen-image-variant base|turbo</code></td><td>DiT GGUF 是哪一个 Qwen-Image-2.1 检查点（GGUF 不带元数据）。<code>turbo</code> 按 Qwen-Image-2.1-Turbo 公布的 8 步调度、CFG 1 采样，拒绝其他步数，也拒绝步数蒸馏 <code>--lora</code> 插件。不声明时，文件名含单词 <code>turbo</code> 即按 Turbo 处理，加载时会说明。用于其他模型时被拒绝。环境变量：<code>TS_QWEN_IMAGE_VARIANT</code>。</td></tr>
-      <tr><td><code>--lora &lt;path&gt;</code></td><td>Qwen-Image-2.1 LoRA 插件：LoRA <code>.safetensors</code>，或 TensorSharp 插件配置 <code>.json</code>（见 <code>config/lora/</code>）。可重复以叠加。以不合并的方式叠加在量化 Transformer 之上；用于其他模型时会被拒绝。→ <a href="models-image_zh-cn.html#lora">LoRA 插件</a></td></tr>
-      <tr><td><code>--lora-scale &lt;f&gt;</code></td><td>前一个 <code>--lora</code> 的强度（乘以 alpha / rank）。默认：插件配置中的 <code>"scale"</code>，否则为 1.0。</td></tr>
-      <tr><td><code>--lora-config &lt;path&gt;</code></td><td>前一个 <code>--lora</code> 的伴随配置：TensorSharp LoRA 配置、PEFT <code>adapter_config.json</code> 或 VideoX-Fun <code>pdd_config.json</code>。除非给出 <code>--diffusion-steps</code> / <code>--cfg</code>，否则由插件的配方提供步数、sigma 与 CFG。</td></tr>
+      <tr><td><code>--lora &lt;path&gt;</code></td><td>Qwen-Image-2.1 或 MiniMax-H3（FL2VA）的 LoRA 插件：<code>config/lora/</code> 中的 TensorSharp 插件配置 <code>.json</code>；Qwen-Image-2.1 还可直接用 LoRA <code>.safetensors</code>，可重复以叠加 Qwen-Image-2.1 插件。MiniMax-H3 只接受一份 <code>minimax-h3-lora</code> 配置——<code>config/lora/minimax-h3-fl2v-turbo-8step.json</code> 或 <code>-4step.json</code>——它把 <code>--diffusion-steps</code>、<code>--flow-shift</code>、<code>--sampler</code> 与 <code>--cfg</code> 锁定为自己的配方，Ref2VA 检查点会拒绝它。以不合并的方式叠加在量化 Transformer 之上。模型不接受的插件会在启动时、插件下载之前被拒绝；若 <code>--config</code> 仍需下载模型，其家族会在该下载完成后立即检查。→ <a href="models-image_zh-cn.html#lora">Qwen-Image-2.1 插件</a> · <a href="models-video_zh-cn.html#h3-turbo">MiniMax-H3 Turbo</a></td></tr>
+      <tr><td><code>--lora-scale &lt;f&gt;</code></td><td>前一个 <code>--lora</code> 的强度（乘以 alpha / rank）。默认：插件配置中的 <code>"scale"</code>，否则为 1.0。MiniMax-H3 拒绝负强度：其 Turbo 调度是在强度 1 下蒸馏的（0 保留适配器的各项，但上投影因子为零）。</td></tr>
+      <tr><td><code>--lora-config &lt;path&gt;</code></td><td>前一个 <code>--lora</code> 的伴随配置：TensorSharp LoRA 配置、PEFT <code>adapter_config.json</code> 或 VideoX-Fun <code>pdd_config.json</code>。除非给出 <code>--diffusion-steps</code> / <code>--cfg</code>，否则由 Qwen-Image-2.1 插件的配方提供步数、sigma 与 CFG；放在这里的 MiniMax-H3 插件配置必须指向前一个 <code>--lora</code> 的权重文件，其配方保持锁定。</td></tr>
       <tr><td><code>--qwen-image-lora</code> · <code>--offload-cpu</code></td><td><strong>已移除，启动时（包括作为 <code>--config</code> 键时）会直接拒绝。</strong>两者只服务于早期的 Qwen-Image-Edit 流水线。<code>--qwen-image-lora</code> 由 <code>--lora</code> 取代；<code>--offload-cpu</code> 没有替代参数，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。</td></tr>
       <tr><td><code>--penalty-last-n</code></td><td><strong>已移除，启动时（包括作为 <code>--config</code> 键时）会直接拒绝</strong>（退出码 1）。它是 CLI 独有的重复惩罚窗口名：请改用 <code>--repeat-last-n &lt;N&gt;</code>，即两个宿主与请求字段 <code>repeat_last_n</code> 共用的拼写。</td></tr>
       <tr><td><code>--paged-kv*</code> · <code>--paged-bench*</code> · <code>--paged-batching</code></td><td><strong>已移除，启动时（包括作为 <code>--config</code> 键时）会直接拒绝</strong>（退出码 1）。它们配置和基准测试的独立分页 KV 存储已删除：跨请求的提示词复用由引擎的 radix 前缀缓存提供（<code>--no-prefix-cache</code>），它的 <code>TS_KV_*</code> 变量同样会被拒绝。<code>--paged-batching</code> / <code>--no-paged-batching</code> 是 <code>--continuous-batching</code> / <code>--no-continuous-batching</code> 的第二种拼写。</td></tr>
@@ -382,13 +389,13 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
   </table>
   </div>
   <h4>视频生成（MiniMax-H3 · Wan 2.1 / 2.2）</h4>
-  <p>以下参数在 <code>--model</code> 为视频生成 DiT（LTX 2.5、MiniMax-H3 或 Wan）时生效。<code>--prompt</code> 提供文本，<code>--image</code> 提供条件帧，<code>--output</code> 指定 MP4 文件名（默认 <code>video.mp4</code>；若扩展名写成 <code>.png</code>，则改为把各帧写成 PNG）。除非用 <code>--diffusion-steps</code> / <code>--cfg</code> 覆盖，去噪步数与引导强度都来自模型自身的配方。</p>
+  <p>以下参数在 <code>--model</code> 为视频生成 DiT（LTX 2.5、MiniMax-H3 或 Wan）时生效。<code>--prompt</code> 提供文本，<code>--image</code> 提供条件帧，<code>--output</code> 指定 MP4 文件名（默认 <code>video.mp4</code>；若扩展名写成 <code>.png</code>，则改为把各帧写成 PNG）。除非用 <code>--diffusion-steps</code> / <code>--cfg</code> 覆盖，去噪步数与引导强度都来自模型自身的配方；MiniMax-H3 Turbo 插件的配方不能覆盖，只能重复其取值。</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>选项</th><th>说明</th></tr></thead>
     <tbody>
       <tr><td><code>--video-mode &lt;mode&gt;</code></td><td>在拥有多种条件模式的模型上，决定如何解释传入的图像。默认：根据你传了什么自动推断。MiniMax-H3 接受 <code>t2v</code>（纯文本）、<code>i2v</code>（图像<em>就是</em>首帧，会被驱动起来）、<code>fl2v</code>（首帧与尾帧）与 <code>ref</code>（图像是<em>新</em>场景里的身份/外观参考）。<code>i2v</code>/<code>fl2v</code> 需要 <code>fl2va</code> 权重，<code>ref</code> 需要 <code>ref2va</code> —— 它们是不同的文件而不是开关。在 <code>ref2va</code> 上，单独的 <code>--image</code> 会被当作一个参考，因此只会附带一张图的客户端无需改动即可工作。</td></tr>
-      <tr><td><code>--width &lt;px&gt;</code> / <code>--height &lt;px&gt;</code></td><td>输出画布。MiniMax-H3 会把每个维度<em>向上</em>取整到 32 的倍数（VAE 的 16× 空间比乘以 2×2 的 patch），默认 <strong>640×384</strong> —— 这是模型卡自身的工作点，也是人脸还能保持连贯的最小尺寸；只传其中一个时，另一个按条件图像的宽高比推出。Wan 则对齐到它自己的 VAE 网格，并默认取官方配方的面积：TI2V-5B 为 1280×704，其余为 832×480。参考图像永远不会决定画布尺寸。 LTX 2.5 默认 1024×1024，宽高必须为 64 倍数。</td></tr>
+      <tr><td><code>--width &lt;px&gt;</code> / <code>--height &lt;px&gt;</code></td><td>输出画布。MiniMax-H3 会把给出的每个维度<em>向上</em>取整到 32 的倍数（VAE 的 16× 空间比乘以 2×2 的 patch）。未指定尺寸时，文生视频与 Ref2VA 参考按 <strong>640×384</strong> 运行（在 Ref2VA 权重上，单独的 <code>--image</code> 保持该面积、取图像的宽高比）；<code>i2v</code>/<code>fl2v</code> 则按 MiniMax 发布的 768p 配方由第一个关键帧（只有末帧时用末帧）决定画布：保持其宽高比、短边 768 像素、不超过 768×1344 像素，每边取最接近的 32 的倍数 —— 3:2 照片为 1152×768，2:3 为 768×1152，4:3 为 1024×768，16:9 为 1344×768，方图为 768×768；宽高比限制在 1:4–4:1，超出部分居中裁掉。这两种模式保留关键帧的构图，放进 640×384 后全身照的人脸只有约 60 像素高，仅 VAE 编码再解码就已糊掉；配方画布能保住人脸，代价是每帧视频 token 为 640×384 的 2.4 倍（方图）到 4.2 倍（16:9 及更宽），注意力开销增长得更快，单次运行耗时会成倍增加。同时给出 <code>--width</code> 与 <code>--height</code> 会为所有模式（包括关键帧模式）固定同一尺寸；只传其中一个时，另一个按条件图像的宽高比推出。Wan 则对齐到它自己的 VAE 网格，并默认取官方配方的面积：TI2V-5B 为 1280×704，其余为 832×480。<code>--ref-image</code> 参考永远不会决定画布尺寸。 LTX 2.5 默认 1024×1024，宽高必须为 64 倍数。</td></tr>
       <tr><td><code>--video-frames &lt;N&gt;</code></td><td>输出帧数，会对齐到模型自身的时间网格 —— Wan 为 <code>4k+1</code>，MiniMax-H3 为 <code>17k+5</code>；在模型允许时 <code>1</code> 表示只出一张静态图。默认取模型自身的值（33，Wan2.2-TI2V 为 49；MiniMax-H3 为 22）。帧数同时决定注意力开销与 VAE 解码耗时，是仅次于权重选择的第二大杠杆。 LTX 2.5 默认 17 帧/24 fps，帧数必须遵循 <code>8k+1</code>。</td></tr>
       <tr><td><code>--fps &lt;N&gt;</code></td><td>保存的 MP4 的播放帧率（默认 16，Wan2.2-TI2V 为 24 —— 即模型的训练帧率）。它只改变播放速度，不改变计算量。以固定帧率训练的模型（MiniMax-H3，24 fps）会覆盖任何其他取值。</td></tr>
       <tr><td><code>--end-image &lt;file&gt;</code></td><td>尾帧条件图像，用于接受它的模型（MiniMax-H3 的首尾帧模式）。与 <code>--image</code> 一起使用时，片段会被引导为从这两帧开始并结束。 LTX 2.5 也支持尾帧时间引导。</td></tr>
@@ -397,11 +404,11 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--ref-video-audio &lt;file&gt;</code></td><td>与<strong>同一位置</strong>的参考视频配对的音轨 —— 第一个对应第一个 <code>--ref-video</code>，依此类推。之所以与 <code>--ref-video</code> 分开，是因为容器里的音轨无法通过帧解码器读取。想要一段无声的参考片段就省略它。支持 WAV、MP3 或 Ogg。</td></tr>
       <tr><td><code>--ref-audio &lt;file&gt;</code></td><td>独立的参考音轨，可重复；提示词中以 <code>&lt;Audio 1&gt;</code>、<code>&lt;Audio 2&gt;</code>…… 引用。会被重采样到音频 VAE 的 32 kHz 立体声，并截断到所生成片段的时长。</td></tr>
       <tr><td><code>--no-audio</code></td><td>在与视频联合生成音轨的模型（MiniMax-H3）上跳过音频解码，只要画面时可省下音频 VAE 的时间与显存。纯视频模型会忽略它。</td></tr>
-      <tr><td><code>--flow-shift &lt;F&gt;</code></td><td>FlowMatch timestep shift（默认 <code>0</code> = 模型官方配方：Wan 2.2 为 5.0，A14B T2V 为 12.0；Wan 2.1 中 1.3B 模型的视频运行为 8.0，其余 ≤ 480p 为 3.0、更高为 5.0；MiniMax-H3 为 12.0）。在带联合音频流的模型上，该 shift 只作用于视频流。</td></tr>
-      <tr><td><code>--sampler &lt;name&gt;</code></td><td><code>unipc</code>（Wan 官方采样器；多步预测-校正，在相同步数下质量更好）或 <code>euler</code>。默认取模型自身的值 —— Wan 为 <code>unipc</code>，LTX 2.5 为发布方配方 <code>euler_ancestral</code>（在 LTX 上 <code>euler</code> 仅作为确定性 Euler 诊断选项）。MiniMax-H3 走自己的 flow-match 调度，会忽略它。</td></tr>
+      <tr><td><code>--flow-shift &lt;F&gt;</code></td><td>FlowMatch timestep shift（默认 <code>0</code> = 模型官方配方：Wan 2.2 为 5.0，A14B T2V 为 12.0；Wan 2.1 中 1.3B 模型的视频运行为 8.0，其余 ≤ 480p 为 3.0、更高为 5.0；MiniMax-H3 为 12.0，在 MiniMax-H3 Turbo 插件下为 6.0，且拒绝其他取值）。在带联合音频流的模型上，该 shift 只作用于视频流。</td></tr>
+      <tr><td><code>--sampler &lt;name&gt;</code></td><td><code>unipc</code>（Wan 官方采样器；多步预测-校正，在相同步数下质量更好）或 <code>euler</code>。默认取模型自身的值 —— Wan 为 <code>unipc</code>，LTX 2.5 为发布方配方 <code>euler_ancestral</code>（在 LTX 上 <code>euler</code> 仅作为确定性 Euler 诊断选项）。MiniMax-H3 走自己的 flow-match Euler 调度，会忽略它；但在 Turbo 插件下，<code>euler</code> 以外的采样器都会被拒绝。</td></tr>
       <tr><td><code>--negative-prompt &lt;text&gt;</code></td><td>无分类器引导使用的负向提示词（默认为模型官方的负向提示词）。在 <code>--cfg 1.0</code> 下不会被用到，因为根本不跑负向分支 —— 所以它对步数蒸馏的 Wan 权重、以及 CFG 蒸馏的 MiniMax-H3 都没有作用。</td></tr>
       <tr><td><code>--cfg-cache-stride &lt;N&gt;</code></td><td>引导缓存：每 N 步才跑一次无条件 CFG 分支，其余步复用缓存的引导方向（前三步与最后一步始终重算）。50 步时，<code>2</code> 只跑 100 次前向中的 77 次（快 1.30×），<code>3</code> 跑 70 次（1.43×）。默认 <code>0</code> = 关闭。它是一种近似 —— 需要对齐参考样本时请保持关闭；另外在 <code>--cfg 1.0</code> 下它没有意义，因为根本没有无条件分支可缓存。</td></tr>
-      <tr><td><code>--diffusion-steps &lt;N&gt;</code> / <code>--cfg &lt;F&gt;</code></td><td>覆盖配方或自动识别到的蒸馏取值。在基础 Wan 权重上用 30 步替代 50 步，观感非常接近而开销少 1.7×。MiniMax-H3 经过 <strong>CFG 蒸馏</strong>：默认 20 步，任何高于 <code>1.0</code> 的 <code>--cfg</code> 都会被拒绝，而 4–8 步是它的快速工作点。</td></tr>
+      <tr><td><code>--diffusion-steps &lt;N&gt;</code> / <code>--cfg &lt;F&gt;</code></td><td>覆盖配方或自动识别到的蒸馏取值。在基础 Wan 权重上用 30 步替代 50 步，观感非常接近而开销少 1.7×。MiniMax-H3 经过 <strong>CFG 蒸馏</strong>：默认 20 步，任何高于 <code>1.0</code> 的 <code>--cfg</code> 都会被拒绝；在 <a href="#h3-turbo">Turbo 插件</a>下它只按插件的 8 或 4 步采样，其他任何 <code>--diffusion-steps</code> 都会在启动时被拒绝。</td></tr>
       <tr><td><code>--video-vae &lt;path&gt;</code></td><td>视频 VAE —— <code>wan_2.1_vae.safetensors</code>，TI2V-5B 用 <code>Wan2.2_VAE.safetensors</code>，MiniMax-H3 用 <code>minimax_h3_video_vae_fp16.safetensors</code>。默认在 DiT 同目录扫描，包含 <code>VAE/</code> 子目录。环境变量：<code>TS_VIDEO_VAE</code>。需要哪个 VAE 由 DiT 自己决定，而不是由你指定。</td></tr>
       <tr><td><code>--video-text-encoder &lt;path&gt;</code></td><td>文本编码器 GGUF —— Wan 用 UMT5-XXL，MiniMax-H3 用 Qwen3-VL-32B。默认在同目录扫描；环境变量 <code>TS_VIDEO_TEXT_ENCODER</code>。H3 的编码器<strong>不附带分词器</strong> —— 请把 <code>vocab.json</code> 与 <code>merges.txt</code> 放在它旁边，或用 <code>TS_VIDEO_TOKENIZER</code> 指向存放它们的目录。</td></tr>
       <tr><td><code>--video-dit2 &lt;path&gt;</code></td><td>双专家模型的第二个扩散专家（Wan 2.2 A14B 的 high/low noise 一对）。默认按文件名在第一个专家旁边自动解析。环境变量：<code>TS_VIDEO_DIT2</code>。</td></tr>

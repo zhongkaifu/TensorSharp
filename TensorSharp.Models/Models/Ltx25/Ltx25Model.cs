@@ -4,6 +4,7 @@ using System.IO;
 using System.Threading;
 using TensorSharp.Cuda;
 using TensorSharp.MLX;
+using TensorSharp.Models.Media;
 using TensorSharp.Models.Video;
 using TensorSharp.Models.WanVideo;
 using TensorSharp.Runtime;
@@ -184,8 +185,9 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
     {
         sigmas ??= Ltx25Scheduler.DistilledSigmas();
         ArgumentNullException.ThrowIfNull(settings);
-        // Preserve mapped weight/cache identities across requests. In particular,
-        // rebuilding MLX's Q4_K affine representation for each video is expensive.
+        // Reuse device weights across both sampling stages. Mapped checkpoint and
+        // descriptor identities survive across requests; DecodeVideo releases their
+        // device representation to leave room for full-resolution VAE activations.
         // The serialized generation lock also protects this single device model.
         _denoiser ??= new Ltx25Denoiser(CheckpointPath, _allocator, ReferenceLoraPath);
         try
@@ -206,6 +208,13 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
     internal float[] DecodeVideo(float[] latents, int frames, int height, int width, long seed,
         CancellationToken cancellationToken = default)
     {
+        // Denoising is finished. Its live quantized weights and position tables
+        // otherwise remain resident beside the VAE's full-resolution activations;
+        // ClearCache alone only frees inactive allocator buffers. Retain the mapped
+        // checkpoint and descriptors so the next request can rebind the same weights.
+        _denoiser?.ReleaseDeviceResidency();
+        if (_allocator is MlxAllocator) MlxBackend.ClearCache();
+        else if (_allocator is CudaAllocator cuda) { cuda.Synchronize(); cuda.TrimPool(); }
         if (UsesDiffusionDecoder)
         {
             var diffusion = _diffusionDecoder ??= new Ltx25DiffusionVideoDecoder(DiffusionVaePath, _allocator);
@@ -299,9 +308,9 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
     public string VideoModelFamily => ArchitectureId;
     public int DefaultPreviewFrames => 17;
     public bool SupportsAudio => true;
-    public bool SupportsImageConditioning => true;
-    public bool SupportsEndImageConditioning => true;
-    public bool SupportsKeyframeConditioning => true;
+    public bool SupportsImageConditioning => MediaCodecs.VideoEncoder.SupportsH264ImageConditioning;
+    public bool SupportsEndImageConditioning => SupportsImageConditioning;
+    public bool SupportsKeyframeConditioning => SupportsImageConditioning;
     public bool SupportsReferenceConditioning => ReferenceLoraPath != null;
     public int MaxReferenceImages => Ltx25ImageConditioning.MaxImages;
     protected override float[] ForwardCore(int[] tokens) => throw new NotSupportedException("LTX is a video-generation model; use GenerateVideo().");

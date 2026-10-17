@@ -27,6 +27,22 @@ namespace TensorSharp.Server.RequestParsers
     /// </summary>
     internal static class VideoGenerationParamsParser
     {
+        /// <summary>The host defaults shared by chat and Studio, before explicit request overrides.</summary>
+        internal static VideoGenerationParams CreateDefaults(ServerHostingOptions options)
+        {
+            ArgumentNullException.ThrowIfNull(options);
+            return new VideoGenerationParams
+            {
+                Frames = options.DefaultVideoFrames,
+                Fps = options.DefaultVideoFps,
+                Width = options.DefaultVideoWidth,
+                Height = options.DefaultVideoHeight,
+                CanvasPolicy = options.VideoCanvasPolicy,
+                Steps = options.DefaultVideoSteps,
+                Mode = options.DefaultVideoMode,
+            };
+        }
+
         public static VideoGenerationParams Parse(
             JsonElement root,
             ServerHostingOptions options,
@@ -35,14 +51,7 @@ namespace TensorSharp.Server.RequestParsers
             if (options == null) throw new ArgumentNullException(nameof(options));
 
             error = null;
-            var p = new VideoGenerationParams
-            {
-                Frames = options.DefaultVideoFrames,
-                Fps = options.DefaultVideoFps,
-                Width = options.DefaultVideoWidth,
-                Height = options.DefaultVideoHeight,
-                Steps = options.DefaultVideoSteps,
-            };
+            var p = CreateDefaults(options);
 
             if (root.TryGetProperty("width", out var w) && w.TryGetInt32(out int wi)) p.Width = wi;
             if (root.TryGetProperty("height", out var h) && h.TryGetInt32(out int hi)) p.Height = hi;
@@ -62,7 +71,6 @@ namespace TensorSharp.Server.RequestParsers
                 p.CfgCacheStride = ccv;
 
             // How to interpret supplied images (t2v / i2v / fl2v / ref); null = infer.
-            p.Mode = options?.DefaultVideoMode;
             if (TryGetEither(root, "videoMode", "video_mode", out var vm)
                 && vm.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(vm.GetString()))
                 p.Mode = vm.GetString();

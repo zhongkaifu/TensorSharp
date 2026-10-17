@@ -46,6 +46,7 @@ public sealed class MainPage : ContentPage
     private bool _languageReloadPending;
     private bool _languageReloadRetryScheduled;
     private bool _knowledgeDirectoryImporting;
+    private Pages.WebLinkPage? _webLinkPage;
     private readonly Queue<string> _knowledgePresentedPreviewFolders = new();
 #if IOS
     private int _shareNotificationPrompting;
@@ -109,7 +110,7 @@ public sealed class MainPage : ContentPage
         // with no download delegate simply does nothing when you tap it. Hand it to
         // the share sheet instead, which is what "save it to my phone" actually
         // means -- Save to Files, Mail, AirDrop.
-        _webView.Navigating += OnNavigatingShareArtifact;
+        _webView.Navigating += OnNavigating;
 #if DEBUG
         _webView.Navigated += OnNavigatedSendDemoPrompt;
 #endif
@@ -129,7 +130,7 @@ public sealed class MainPage : ContentPage
     private const string ArtifactPrefix = "/api/code/artifacts/";
 
     /// <summary>
-    /// Intercept a tap on a generated file and open it rather than navigating.
+    /// Keep linked content out of the chat WebView, including generated files.
     ///
     /// <para>
     /// The BACKSTOP, not the main path. The page claims these clicks itself and asks
@@ -140,22 +141,88 @@ public sealed class MainPage : ContentPage
     /// an artifact URL from anywhere else in the page.
     /// </para>
     /// </summary>
-    private async void OnNavigatingShareArtifact(object? sender, WebNavigatingEventArgs e)
+    private async void OnNavigating(object? sender, WebNavigatingEventArgs e)
     {
-        if (!Uri.TryCreate(e.Url, UriKind.Absolute, out Uri? uri) ||
-            !uri.AbsolutePath.StartsWith(ArtifactPrefix, StringComparison.Ordinal))
+        if (!Uri.TryCreate(e.Url, UriKind.Absolute, out Uri? uri))
+            return;
+
+        bool sameOrigin = Uri.TryCreate(_host.EntryUrl, UriKind.Absolute, out Uri? entry)
+            && string.Equals(uri.GetLeftPart(UriPartial.Authority), entry.GetLeftPart(UriPartial.Authority), StringComparison.OrdinalIgnoreCase);
+        if (sameOrigin && uri.AbsolutePath.StartsWith(ArtifactPrefix, StringComparison.Ordinal))
         {
+            // A run listing rather than a file: retain the route's existing behavior.
+            string rest = Uri.UnescapeDataString(uri.AbsolutePath[ArtifactPrefix.Length..]);
+            int slash = rest.IndexOf('/');
+            if (slash <= 0 || slash == rest.Length - 1)
+                return;
+
+            e.Cancel = true;
+            await OpenArtifactAsync(uri.AbsolutePath, null);
             return;
         }
 
-        // A run listing rather than a file: JSON the page can render, so let it navigate.
-        string rest = Uri.UnescapeDataString(uri.AbsolutePath[ArtifactPrefix.Length..]);
-        int slash = rest.IndexOf('/');
-        if (slash <= 0 || slash == rest.Length - 1)
+        if (uri.Scheme is not ("http" or "https"))
+            return;
+
+        // Initial load, language/session reloads, and page fragments belong to the
+        // chat's own URL. Other pages always get a separate browsing surface.
+        if (sameOrigin && string.Equals(uri.AbsolutePath, entry!.AbsolutePath, StringComparison.Ordinal))
             return;
 
         e.Cancel = true;
-        await OpenArtifactAsync(uri.AbsolutePath, null);
+        await OpenWebLinkAsync(uri.AbsoluteUri, null);
+    }
+
+    /// <summary>Show a linked page without replacing the chat's WebView or its draft.</summary>
+    private async Task OpenWebLinkAsync(string url, string? displayName)
+    {
+        // Events come from the page; only a web address is a browser request.
+        if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? uri)
+            || uri.Scheme is not ("http" or "https") || _webLinkPage is not null)
+            return;
+
+        var page = new Pages.WebLinkPage(uri, displayName, CloseWebLinkAsync);
+        _webLinkPage = page;
+        try
+        {
+#if WINDOWS
+            Application application = Application.Current ?? throw new InvalidOperationException("The application is not available.");
+            var popup = new Window(page) { Title = page.Title, Width = 1000, Height = 760 };
+            popup.Destroying += (_, _) =>
+            {
+                if (ReferenceEquals(_webLinkPage, page)) _webLinkPage = null;
+            };
+            application.OpenWindow(popup);
+#else
+            // A form sheet works on iPhone, iPad and the singleton Mac Catalyst
+            // scene. The original page stays installed beneath it.
+            Microsoft.Maui.Controls.PlatformConfiguration.iOSSpecific.Page.SetModalPresentationStyle(
+                page.On<Microsoft.Maui.Controls.PlatformConfiguration.iOS>(),
+                Microsoft.Maui.Controls.PlatformConfiguration.iOSSpecific.UIModalPresentationStyle.FormSheet);
+            page.Disappearing += (_, _) =>
+            {
+                if (ReferenceEquals(_webLinkPage, page)) _webLinkPage = null;
+            };
+            await Navigation.PushModalAsync(page);
+#endif
+        }
+        catch (Exception ex)
+        {
+            if (ReferenceEquals(_webLinkPage, page)) _webLinkPage = null;
+            Console.WriteLine("TensorAgent: open-link failed: " + ex.Message);
+            await DisplayAlert(Loc.T("app.openFile.alert.title"), Loc.T("app.webLink.failed"), Loc.T("common.ok"));
+        }
+    }
+
+    private async Task CloseWebLinkAsync(Pages.WebLinkPage page)
+    {
+#if WINDOWS
+        if (page.Window is { } popup) Application.Current?.CloseWindow(popup);
+        await Task.CompletedTask;
+#else
+        if (ReferenceEquals(Navigation.ModalStack.LastOrDefault(), page))
+            await Navigation.PopModalAsync();
+#endif
     }
 
     /// <summary>
@@ -2396,6 +2463,14 @@ public sealed class MainPage : ContentPage
 
             case "open-settings":
                 MainThread.BeginInvokeOnMainThread(OpenAppSettings);
+                return;
+
+            case "open-link":
+                string linkUrl = message.TryGetProperty("url", out JsonElement link)
+                    && link.ValueKind == JsonValueKind.String ? link.GetString() ?? string.Empty : string.Empty;
+                string linkName = message.TryGetProperty("name", out JsonElement linkText)
+                    && linkText.ValueKind == JsonValueKind.String ? linkText.GetString() ?? string.Empty : string.Empty;
+                MainThread.BeginInvokeOnMainThread(async () => await OpenWebLinkAsync(linkUrl, linkName));
                 return;
 
             // A tap on a file the model's code produced. The page cannot open one

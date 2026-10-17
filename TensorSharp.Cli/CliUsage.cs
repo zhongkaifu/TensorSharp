@@ -601,7 +601,9 @@ namespace TensorSharp.Cli
                     "--cfg 4"),
                 new OptionHelp("--diffusion-steps <N>",
                     "Denoising steps. Range: >= 1. Default: 48 for DiffusionGemma, 40 for Qwen-Image-2.1 (8, the only count it takes, for " +
-                    "Qwen-Image-2.1-Turbo; a LoRA plug-in's recipe sets its own).",
+                    "Qwen-Image-2.1-Turbo; a LoRA plug-in's recipe sets its own), and the video model's own for video: 20 for " +
+                    "MiniMax-H3, or exactly the 8 or 4 steps a MiniMax-H3 Turbo plug-in (--lora) was distilled for, which refuses " +
+                    "any other count at startup.",
                     "--diffusion-steps 20"),
                 new OptionHelp("--diffusion-seed <N>",
                     "Random seed for the diffusion sampler. Default: 0. A Qwen-Image-2.1 edit's noise also depends " +
@@ -659,19 +661,29 @@ namespace TensorSharp.Cli
                     "edits keep the source size without it. Default: off (the automatic size).",
                     "--image photo.png --keep-source-size"),
                 new OptionHelp("--lora <path>",
-                    "Qwen-Image-2.1 LoRA plug-in: a LoRA .safetensors (diffusers/PEFT, ComfyUI, kohya, DiffSynth, DoRA or " +
-                    "VideoX-Fun PDD format) or a TensorSharp plug-in config .json from config/lora/ (downloads its weights on " +
-                    "first use and brings its strength and sampling recipe). Repeat to stack LoRAs. Applied unmerged on top " +
-                    "of the quantized transformer, so small distillation deltas are kept exactly. Default: none.",
+                    "LoRA plug-in for Qwen-Image-2.1 or MiniMax-H3 (FL2VA): a TensorSharp plug-in config .json from " +
+                    "config/lora/ (downloads its weights on first use and brings its strength and sampling recipe), or for " +
+                    "Qwen-Image-2.1 also a LoRA .safetensors (diffusers/PEFT, ComfyUI, kohya, DiffSynth, DoRA or VideoX-Fun PDD " +
+                    "format); repeat to stack Qwen-Image-2.1 LoRAs. MiniMax-H3 takes one minimax-h3-lora config only: the " +
+                    "LightX2V Turbo step-distillation plug-ins config/lora/minimax-h3-fl2v-turbo-8step.json (8 steps) and " +
+                    "config/lora/minimax-h3-fl2v-turbo-4step.json (4 steps), which lock --diffusion-steps, --flow-shift, " +
+                    "--sampler and --cfg to their recipe (unset or equal is accepted; anything else is refused) and are refused " +
+                    "on the Ref2VA checkpoint. Applied unmerged on top of the quantized transformer, so small distillation " +
+                    "deltas are kept exactly. A plug-in the model does not take is refused at startup, before the plug-in " +
+                    "downloads; when a --config still has to download the model, the model's family is checked right after " +
+                    "that download (a contradicting sampling flag is refused before it). Default: none.",
                     "--lora config/lora/qwen-image-2.1-viggle-turbo.json"),
                 new OptionHelp("--lora-scale <f>",
-                    "Strength of the preceding --lora (multiplies alpha / rank). Default: the plug-in config's \"scale\", else 1.0.",
+                    "Strength of the preceding --lora (multiplies alpha / rank). Default: the plug-in config's \"scale\", else 1.0. " +
+                    "MiniMax-H3 refuses a negative strength: its Turbo schedule is distilled at 1 (0 keeps the adapter's terms " +
+                    "with zero up factors).",
                     "--lora-scale 0.7"),
                 new OptionHelp("--lora-config <path>",
                     "Companion config of the preceding --lora: a TensorSharp LoRA config (default strength and the sampling " +
                     "recipe of a step-distilled LoRA; see config/lora/), a PEFT adapter_config.json or a VideoX-Fun " +
-                    "pdd_config.json. The recipe supplies steps, sigmas and CFG unless you set them. Default: none " +
-                    "(a PDD bundle's pdd_config.json is found next to its weights).",
+                    "pdd_config.json. A Qwen-Image-2.1 recipe supplies steps, sigmas and CFG unless you set them; a MiniMax-H3 " +
+                    "plug-in config here must name the preceding --lora's weights file in its \"weights\" entry, and its recipe " +
+                    "is locked. Default: none (a PDD bundle's pdd_config.json is found next to its weights).",
                     "--lora-config config/lora/qwen-image-2.1-viggle-turbo.json"),
                 new OptionHelp("--video-frames <N>",
                     "Video generation: number of output frames, snapped to the model's temporal grid " +
@@ -686,14 +698,15 @@ namespace TensorSharp.Cli
                 new OptionHelp("--flow-shift <F>",
                     "FlowMatch timestep shift. Default: 0 — the model's official recipe (5.0 for Wan 2.2, " +
                     "12.0 for A14B T2V; Wan 2.1: 8.0 for the 1.3B model's video runs, else 3.0 at <= 480p, " +
-                    "5.0 above; 12.0 for MiniMax-H3). On models with a joint audio stream this shifts the " +
-                    "video stream only.",
+                    "5.0 above; 12.0 for MiniMax-H3, or 6.0 under a MiniMax-H3 Turbo plug-in, which refuses any other " +
+                    "value). On models with a joint audio stream this shifts the video stream only.",
                     "--flow-shift 5.0"),
                 new OptionHelp("--sampler <name>",
                     "Sampler: unipc (the official Wan sampler; multistep predictor-corrector, better quality " +
                     "at the same step count) or euler. LTX 2.5 samples with euler_ancestral (the publisher's " +
-                    "recipe); euler selects deterministic Euler there as a diagnostic. Default: the model's own " +
-                    "(unipc for Wan, euler_ancestral for LTX 2.5).",
+                    "recipe); euler selects deterministic Euler there as a diagnostic. MiniMax-H3 samples with " +
+                    "Euler, and under a Turbo plug-in any sampler but euler is refused. Default: the model's own " +
+                    "(unipc for Wan, euler_ancestral for LTX 2.5, euler for MiniMax-H3).",
                     "--sampler unipc"),
                 new OptionHelp("--negative-prompt <text>",
                     "Image/video negative prompt for classifier-free guidance. Default: empty for Qwen-Image, " +
@@ -709,15 +722,16 @@ namespace TensorSharp.Cli
                 new OptionHelp("--video-mode <mode>",
                     "How to interpret supplied images, on models with more than one conditioning " +
                     "mode. Default: inferred from what you pass. MiniMax-H3 accepts t2v (text " +
-                    "only), i2v (the image IS the first frame and gets animated), fl2v (first and " +
-                    "last frame), ref (the images are identity/appearance references for a NEW " +
+                    "only), i2v (the image IS the first frame and gets animated), fl2v (the last " +
+                    "frame, optionally with the first frame), ref (the images are identity/appearance references for a NEW " +
                     "scene, not the first frame). i2v/fl2v need the fl2va checkpoint and ref needs " +
                     "ref2va — they are separate files. On the ref2va checkpoint a plain --image is " +
                     "taken as a reference, so clients that only attach one image work unchanged.",
                     "--video-mode i2v"),
                 new OptionHelp("--end-image <file>",
-                    "Last-frame conditioning image, on models that accept one (MiniMax-H3 first/last-frame " +
-                    "mode). Combined with --image the clip is steered to start and end on the two frames.",
+                    "Last-frame conditioning image, on models that accept one (MiniMax-H3 FL2VA, LTX 2.5). " +
+                    "Alone it pins only the last frame (the clip ends on it); with --image the clip starts " +
+                    "and ends on the two frames. Wan refuses it: Wan pins at most a first frame.",
                     "--end-image last.png"),
                 new OptionHelp("--ref-image <file>",
                     "Reference image for reference-conditioned models (MiniMax-H3 Ref2VA): the subject " +
@@ -980,6 +994,7 @@ namespace TensorSharp.Cli
             writer.WriteLine("  TensorSharp.Cli --model DeepSeek-V4-Flash-00001-of-00005.gguf --backend ggml_cuda --draft-model DSpark-drafter.gguf --temperature 0 --chat    (block speculative decoding)");
             writer.WriteLine("  TensorSharp.Cli --config config/qwen-image-2.1.json --prompt \"A small orange cat beside a blue vase\" --width 1024 --height 1024 --output generated.png");
             writer.WriteLine("  TensorSharp.Cli --config config/qwen-image-2.1.json --image generated.png --prompt \"Change the blue vase to a red vase\" --output edited.png");
+            writer.WriteLine("  TensorSharp.Cli --config config/minimax-h3-fl2va.json --lora config/lora/minimax-h3-fl2v-turbo-8step.json --prompt \"A red fox trotting through falling snow\" --output fox.mp4    (MiniMax-H3 Turbo: 8 steps)");
             writer.WriteLine("  TensorSharp.Cli --model model.gguf --backend ggml_cuda --benchmark --bench-prefill 512 --bench-decode 128");
             writer.WriteLine("  TensorSharp.Cli --config run.json    (read options from a file)");
         }

@@ -57,6 +57,10 @@ namespace TensorSharp.Models.MiniMaxH3
         private readonly object _nativeGraphLock = new();
         private readonly bool _useNativeGraphArena;
         private IntPtr _nativeGraphArena;
+        // The LoRA plug-in the last native forward bound. Its packed factors are cached on
+        // the device by host pointer exactly like the weights, so releasing residency has
+        // to hand them back as well. The model owns the set; this is a reference only.
+        private MiniMaxH3LoraSet _boundLora;
         private bool _disposed;
 
         public MiniMaxH3Config Config { get; }
@@ -354,6 +358,26 @@ namespace TensorSharp.Models.MiniMaxH3
             IReadOnlyList<H3CondChunk> conditionChunks = null,
             float videoShift = MiniMaxH3Scheduler.VideoShift,
             float audioShift = MiniMaxH3Scheduler.AudioShift,
+            int blockLimit = 0) =>
+            Forward(null, videoTokens, videoCount, audioLatent, audioCount, textHidden, textCount, layout, sigma,
+                conditionTokens, conditionCount, conditionAudio, conditionAudioCount, conditionChunks,
+                videoShift, audioShift, blockLimit);
+
+        /// <summary>One diffusion step with a LoRA plug-in applied unmerged (null for none):
+        /// its packed factors on the native graph (<c>H3DitForwardArgs.Adapter</c>), its exact
+        /// F32 factors on a direct backend. The set must have been loaded for this DiT's path.</summary>
+        internal (float[] Video, float[] Audio) Forward(
+            MiniMaxH3LoraSet lora,
+            float[] videoTokens, int videoCount,
+            float[] audioLatent, int audioCount,
+            float[] textHidden, int textCount,
+            MiniMaxH3PackedLayout layout,
+            float sigma,
+            float[] conditionTokens = null, int conditionCount = 0,
+            float[] conditionAudio = null, int conditionAudioCount = 0,
+            IReadOnlyList<H3CondChunk> conditionChunks = null,
+            float videoShift = MiniMaxH3Scheduler.VideoShift,
+            float audioShift = MiniMaxH3Scheduler.AudioShift,
             int blockLimit = 0)
         {
             bool nativeLockTaken = false;
@@ -365,6 +389,11 @@ namespace TensorSharp.Models.MiniMaxH3
                 if (_direct == null) System.Threading.Monitor.Enter(_nativeGraphLock, ref nativeLockTaken);
                 ObjectDisposedException.ThrowIf(_disposed, this);
                 if (layout is null) throw new ArgumentNullException(nameof(layout));
+                if (lora != null && lora.IsDirect != (_direct != null))
+                    throw new ArgumentException(lora.IsDirect
+                        ? "This MiniMax-H3 LoRA set was loaded for a direct backend; the native graph needs its packed factors."
+                        : "This MiniMax-H3 LoRA set is packed for the native graph; a direct backend reads the exact factors.",
+                        nameof(lora));
 
                 // TS_H3_DIT_LAYERS truncates the trunk for BOTH the GGML and managed
                 // paths, which turns a velocity comparison into an error-vs-depth curve.
@@ -424,7 +453,24 @@ namespace TensorSharp.Models.MiniMaxH3
                         -1f,
                         -MiniMaxH3Scheduler.ShiftSlope(
                             MiniMaxH3Scheduler.ClampSigma(sigma), videoShift, audioShift),
-                        blockLimit > 0 ? Math.Min(blockLimit, _blocks.Length) : _blocks.Length);
+                        blockLimit > 0 ? Math.Min(blockLimit, _blocks.Length) : _blocks.Length,
+                        lora);
+                }
+
+                IntPtr adapter = IntPtr.Zero;
+                if (lora != null)
+                {
+                    adapter = lora.NativeAdapter;
+                    if (adapter == IntPtr.Zero)
+                        throw new ObjectDisposedException(nameof(MiniMaxH3LoraSet),
+                            "The MiniMax-H3 LoRA set was disposed before the forward that applies it.");
+                }
+                // A set that is no longer the one in use hands its device copies back now
+                // rather than holding them beside the next one's.
+                if (!ReferenceEquals(_boundLora, lora))
+                {
+                    _boundLora?.InvalidateDeviceCopies();
+                    _boundLora = lora;
                 }
 
                 var videoOut = new float[(long)videoCount * Config.VideoPatchDim];
@@ -501,9 +547,11 @@ namespace TensorSharp.Models.MiniMaxH3
                             MiniMaxH3Scheduler.ClampSigma(sigma), videoShift, audioShift),
                         GraphArena = _nativeGraphArena,
                         GraphArenaBytes = _nativeGraphArena != IntPtr.Zero ? NativeGraphArenaBytes : 0UL,
+                        Adapter = adapter,
                     };
                     if (!GgmlBasicOps.TryMiniMaxH3DitForward(in args))
-                        throw new InvalidOperationException("MiniMax-H3 DiT forward failed.");
+                        throw new InvalidOperationException(
+                            "MiniMax-H3 DiT forward failed: " + GgmlBasicOps.LastNativeError());
                 }
                 finally
                 {
@@ -540,6 +588,28 @@ namespace TensorSharp.Models.MiniMaxH3
                     if (ptr != IntPtr.Zero) GgmlBasicOps.InvalidateHostBuffer(ptr);
                 // _bound is deliberately NOT cleared: the pointers stay valid, Dispose still
                 // needs them, and a later Forward re-caches under the very same keys.
+                // The plug-in's packed factors are bound the same way, and stay bound to it.
+                _boundLora?.InvalidateDeviceCopies();
+            }
+            finally
+            {
+                if (nativeLockTaken) System.Threading.Monitor.Exit(_nativeGraphLock);
+            }
+        }
+
+        /// <summary>Drop what this DiT built or bound for a LoRA plug-in: the device copies of
+        /// a packed set's factors, or the direct path's built factors. Called when the model's
+        /// plug-in changes; the next forward binds or builds whatever it is given then.</summary>
+        internal void ReleaseLora()
+        {
+            bool nativeLockTaken = false;
+            try
+            {
+                if (_direct == null) System.Threading.Monitor.Enter(_nativeGraphLock, ref nativeLockTaken);
+                if (_disposed) return;
+                _direct?.ReleaseLora();
+                _boundLora?.InvalidateDeviceCopies();
+                _boundLora = null;
             }
             finally
             {
@@ -562,6 +632,8 @@ namespace TensorSharp.Models.MiniMaxH3
                 foreach (IntPtr ptr in _bound)
                     if (ptr != IntPtr.Zero) GgmlBasicOps.InvalidateHostBuffer(ptr);
                 _bound.Clear();
+                _boundLora?.InvalidateDeviceCopies();
+                _boundLora = null;
                 foreach (var h in _pins) if (h.IsAllocated) h.Free();
                 _pins.Clear();
                 _gguf?.Dispose();

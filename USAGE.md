@@ -166,7 +166,8 @@ directory also holds presets for chat models (`gemma-4-*`, `qwen3.5-9b-*`,
 `qwen3.6-*`, `gpt-oss-20b`), agent hosting (`agent-*`), embedding services
 (`embedding-*`), DiffusionGemma and Jev (`diffusiongemma-*`,
 `jev-diffusiongemma-q4`) and video (`minimax-h3-*`, `wan-video-*`), and
-[`config/lora/`](config/lora/) holds fourteen Qwen-Image-2.1 LoRA plug-ins. See
+[`config/lora/`](config/lora/) holds fourteen Qwen-Image-2.1 LoRA plug-ins and two
+MiniMax-H3 Turbo plug-ins. See
 [`config/README.md`](config/README.md) for the full reference.
 
 ## Console Application
@@ -243,9 +244,10 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
 # latent, so the soundtrack is model output rather than something dubbed on
 # afterwards. The Qwen3-VL-32B text encoder, the video VAE and the audio VAE are
 # resolved next to the DiT GGUF (or set --video-text-encoder / --video-vae /
-# --audio-vae). H3 is CFG-distilled: --cfg 1.0 is required, and 4-8 steps is the
-# fast lane against a 20-step default. See "Video generation with audio
-# (MiniMax-H3)" below and docs/models/minimax-h3.md.
+# --audio-vae). H3 is CFG-distilled: --cfg 1.0 is required. The default is 20
+# steps; fewer base steps, as here, are a quicker preview at some cost in quality,
+# and the Turbo plug-in below is the schedule distilled for 8 or 4. See "Video
+# generation with audio (MiniMax-H3)" below and docs/models/minimax-h3.md.
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <minimax_h3_fl2va_pruned-Q4_K.gguf> \
     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4 \
     --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
@@ -266,6 +268,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <minimax_h3_fl2va_pruned-
 # first use (config/minimax-h3-ref2va.json is the reference checkpoint).
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
+
+# MiniMax-H3 Turbo: LightX2V's step-distillation plug-in for the fl2va checkpoint
+# downloads its 1.38 GB of weights on first use and samples exactly 8 steps (the
+# 4-step file: 4) on its own locked schedule, so leave --diffusion-steps,
+# --flow-shift and --sampler unset. See "MiniMax-H3 Turbo plug-ins" below.
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
+    --lora config/lora/minimax-h3-fl2v-turbo-8step.json \
+    --prompt "a red fox trotting through falling snow, cinematic" --output fox-turbo.mp4
 
 # Wan video generation, video only (prompt -> H.264 MP4). The UMT5-XXL
 # text-encoder GGUF and video-VAE companions are resolved next to the DiT GGUF
@@ -501,7 +511,7 @@ script gets that error instead of watching a setting be ignored.
 | `--test-chunked-prefill` | Run the chunked-prefill correctness check (compares chunked vs non-chunked logits) |
 | `--correct-prefill <N>` | Prompt length used by `--test-chunked-prefill` |
 | `--correct-decode <N>` | Decode length used by `--test-chunked-prefill` |
-| `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48). For Qwen-Image-2.1, the FlowMatch-Euler step count — omit for auto (40, or the step count of a `--lora` plug-in's sampling recipe; Qwen-Image-2.1-Turbo runs 8, the only count it takes). LTX 2.5 accepts only 8 (plus 3 refinement steps); CFG is fixed at 1. |
+| `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48). For Qwen-Image-2.1, the FlowMatch-Euler step count — omit for auto (40, or the step count of a `--lora` plug-in's sampling recipe; Qwen-Image-2.1-Turbo runs 8, the only count it takes). MiniMax-H3 defaults to 20; under a [Turbo plug-in](#minimax-h3-turbo-plug-ins) it samples exactly the plug-in's 8 or 4 steps, and any other value is refused at startup. LTX 2.5 accepts only 8 (plus 3 refinement steps); CFG is fixed at 1. |
 | `--diffusion-seed <N>` | Noise seed for the diffusion paths: DiffusionGemma's deterministic sampler and Qwen-Image-2.1 (default: 0), and video generation (LTX 2.5, Wan, MiniMax-H3), where leaving it out draws a fresh random seed each run. This is the seed that decides what a clip looks like — `--seed` is the text sampling seed and does not affect it. A Qwen-Image-2.1 picture depends on the seed and its size; an edit's noise also depends on its `--image` pictures, so editing a picture at the seed it was drawn with does not restart from its own noise ([seeds and edits](docs/models/qwenimage21.md#seeds-and-edits)). |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas count. `0` derives the count from `--max-tokens` and the model canvas length. |
 | `--image <path>` | Input image for Qwen-Image-2.1 editing (also the image input for multimodal chat); repeat it for multiple references. Every `--image` is a reference, tagged `<image1>`, `<image2>`, … in command-line order ahead of the prompt, so the prompt can name a picture by its tag. Without `--image`, a Qwen-Image-2.1 DiT generates an image from the prompt instead. |
@@ -517,17 +527,17 @@ script gets that error instead of watching a setting be ignored.
 | `--qwen-image-vl <path>` | Override the resolved Qwen3-VL-8B text-encoder GGUF (default: a `Qwen3VL-8B` / `Qwen3-VL-8B` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_TE`. |
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen3-VL-8B mmproj (vision grounding for edits) GGUF (default: a matching `mmproj` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_MMPROJ`. |
 | `--qwen-image-variant <base\|turbo>` | Which Qwen-Image-2.1 checkpoint the DiT GGUF holds. The GGUFs carry no metadata and Turbo has the base checkpoint's tensors, so the host declares it: `turbo` samples Qwen-Image-2.1-Turbo's published 8-step schedule at CFG 1, refuses other step counts and refuses step-distillation `--lora` plug-ins. Default: none — a file name containing the word `turbo` is assumed to be Turbo and the load says so; any other is `base`. Refused with any other model. Env: `TS_QWEN_IMAGE_VARIANT`. See [Qwen-Image-2.1-Turbo](docs/models/qwenimage21.md#qwen-image-21-turbo). |
-| `--lora <path>` | Qwen-Image-2.1 LoRA plug-in: a LoRA `.safetensors` file or a TensorSharp plug-in config `.json` (see [`config/lora/`](config/lora/)). Repeat to stack LoRAs. Applied unmerged on top of the quantized transformer. Refused with any other model. Default: none. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins). |
-| `--lora-scale <f>` | Strength of the preceding `--lora` (multiplies alpha / rank). Default: the plug-in config's `"scale"`, else `1.0`. |
-| `--lora-config <path>` | Companion config of the preceding `--lora`: a TensorSharp LoRA config, a PEFT `adapter_config.json` or a VideoX-Fun `pdd_config.json`. Default: none (a PDD bundle's `pdd_config.json`, and a PEFT `adapter_config.json` beside `adapter_model.safetensors`, are found next to the weights). |
+| `--lora <path>` | LoRA plug-in for Qwen-Image-2.1 or MiniMax-H3 (FL2VA). Qwen-Image-2.1: a LoRA `.safetensors` file or a TensorSharp plug-in config `.json` (see [`config/lora/`](config/lora/)); repeat to stack LoRAs. MiniMax-H3: one `minimax-h3-lora` config only, `config/lora/minimax-h3-fl2v-turbo-8step.json` or `-4step.json`, which locks `--diffusion-steps`, `--flow-shift`, `--sampler` and `--cfg` to its recipe and is refused on the Ref2VA checkpoint. Applied unmerged on top of the quantized transformer. A plug-in the model does not take is refused at startup, before the plug-in downloads; when a `--config` still has to download the model, the model's family is checked right after that download (a contradicting sampling flag is refused before it). Default: none. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins) and [MiniMax-H3 Turbo plug-ins](#minimax-h3-turbo-plug-ins). |
+| `--lora-scale <f>` | Strength of the preceding `--lora` (multiplies alpha / rank). Default: the plug-in config's `"scale"`, else `1.0`. MiniMax-H3 refuses a negative strength: its Turbo schedule is distilled at 1, and 0 keeps the adapter's terms with zero up factors. |
+| `--lora-config <path>` | Companion config of the preceding `--lora`: a TensorSharp LoRA config, a PEFT `adapter_config.json` or a VideoX-Fun `pdd_config.json`. A MiniMax-H3 plug-in config here must name the preceding `--lora`'s weights file in its `"weights"` entry, and its recipe stays locked. Default: none (a PDD bundle's `pdd_config.json`, and a PEFT `adapter_config.json` beside `adapter_model.safetensors`, are found next to the weights). |
 | `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys.** Both served only the earlier Qwen-Image-Edit pipeline. `--qwen-image-lora` is replaced by `--lora` above; `--offload-cpu` has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident. |
 | `--penalty-last-n` | **Removed and rejected at startup, including as a config-file key** (exit code 1, `Configuration error: --penalty-last-n was removed: …`). It was the CLI-only name of the repeat-penalty window: use `--repeat-last-n <N>`, the spelling both hosts and the `repeat_last_n` request field use. |
 | `--paged-kv` / `--no-paged-kv` / `--paged-kv-*` / `--paged-bench*` | **Removed and rejected at startup on both hosts, including as config-file keys.** They configured the standalone paged KV cache (RAM / SSD / Redis block tiers and block quantization), which only `--paged-bench` ever built. Request KV state is engine-owned, and prompt reuse across requests is the engine's radix prefix cache, on by default (`--no-prefix-cache` turns it off). The `TS_KV_PAGED_CACHE`, `TS_KV_BLOCK_SIZE`, `TS_KV_CACHE_MAX_RAM_MB`, `TS_KV_CACHE_SSD_DIR`, `TS_KV_CACHE_MAX_SSD_MB`, `TS_KV_PAGED_QUANT_BITS`, `TS_KV_CACHE_REDIS_URL` and `TS_KV_CACHE_REDIS_TTL_MINUTES` variables that cache read are refused at startup too. |
-| `--width <px>` / `--height <px>` | Output size for Qwen-Image-2.1 and video generation. Default: `0` — auto (Qwen-Image-2.1: 2048×2048 for generation, or about that area at the first reference's aspect ratio for editing — 1024×1024 (1 MP) on the pure-C# `cpu` backend — and explicit sizes must be multiples of 32; MiniMax-H3: 640×384, or that area at the conditioning image's aspect ratio, rounded up to a multiple of 32; Wan: the model's native area at the input image's aspect ratio, 1280×704 for TI2V-5B and 832×480 otherwise). LTX 2.5 video defaults to 1024×1024 output with both sides positive multiples of 64; see its two-stage recipe below. |
+| `--width <px>` / `--height <px>` | Output size for Qwen-Image-2.1 and video generation. Default: `0` — auto (Qwen-Image-2.1: 2048×2048 for generation, or about that area at the first reference's aspect ratio for editing — 1024×1024 (1 MP) on the pure-C# `cpu` backend — and explicit sizes must be multiples of 32; MiniMax-H3: 640×384 for text-to-video and named references (a plain `--image` on Ref2VA keeps that area at its aspect), while i2v/fl2v take the canvas from the first keyframe by MiniMax's 768p recipe — its aspect at a 768-pixel short edge, under 768×1344's area, on the nearest multiple of 32 — because those modes keep the keyframe's framing and a smaller canvas blurs its faces ([sizes](docs/models/minimax-h3.md#sizes-and-settings)); Wan: the model's native area at the input image's aspect ratio, 1280×704 for TI2V-5B and 832×480 otherwise). LTX 2.5 video defaults to 1024×1024 output with both sides positive multiples of 64; see its two-stage recipe below. |
 | `--video-frames <N>` | Video frame count, snapped to the model's temporal grid (`4k+1` for Wan; `17k+5` for MiniMax-H3 — 5, 22, 39, 56, 73, 90 …). Default: 33; 49 for Wan2.2-TI2V, 22 for MiniMax-H3. `1` generates a still image where the model supports it (use `--output out.png`). LTX 2.5 defaults to 17 and requires `8k+1` frames; it does not snap an invalid request. |
 | `--fps <N>` | Playback frame rate of the saved MP4 (default: 16; 24 for Wan2.2-TI2V). Models trained at a fixed rate (MiniMax-H3, 24 fps) override any other value. LTX 2.5 defaults to 24 fps. |
-| `--flow-shift <F>` | FlowMatch timestep shift (default: the model's official recipe — 5.0 for Wan 2.2, 12.0 for A14B T2V, 8.0/3.0/5.0 for Wan 2.1, 12.0 for MiniMax-H3). On models with a joint audio stream this shifts the video stream only. |
-| `--sampler <name>` | Sampler: `unipc` (the official Wan sampler, default for Wan) or `euler`. LTX 2.5 defaults to `euler_ancestral`, the publisher's recipe; `euler` selects deterministic Euler there as a diagnostic. MiniMax-H3 runs its own flow-match schedule and does not read it. |
+| `--flow-shift <F>` | FlowMatch timestep shift (default: the model's official recipe — 5.0 for Wan 2.2, 12.0 for A14B T2V, 8.0/3.0/5.0 for Wan 2.1, 12.0 for MiniMax-H3, or 6.0 under a MiniMax-H3 Turbo plug-in, which refuses any other value). On models with a joint audio stream this shifts the video stream only. |
+| `--sampler <name>` | Sampler: `unipc` (the official Wan sampler, default for Wan) or `euler`. LTX 2.5 defaults to `euler_ancestral`, the publisher's recipe; `euler` selects deterministic Euler there as a diagnostic. MiniMax-H3 samples with Euler on its own flow-match schedule and does not read it, except under a Turbo plug-in, which refuses any sampler but `euler`. |
 | `--negative-prompt <text>` | Negative prompt for classifier-free guidance (default: the model's official negative prompt). Unused at `--cfg 1.0`, where no negative pass runs — so it does nothing at all on MiniMax-H3, which only accepts `--cfg 1.0`. |
 | _(step-distilled checkpoints)_ | Auto-detected from the DiT file name (`Turbo`, `distill`, `Lightning`, `lightx2v`, `FastWan`, `-dmd`, or an explicit `…-4steps-…` / `…8step…` for 1–16): the pipeline switches to that step count with guidance off, turning the official 50-step × CFG recipe's 100 DiT passes into 4. This is the single biggest speed lever anywhere in TensorSharp — see **[Video generation (Wan)](#video-generation-wan)** below. `--diffusion-steps` / `--cfg` override it. |
 | `--cfg-cache-stride <N>` | Wan guidance cache: run the unconditional CFG pass on one step in `N` and reuse the cached guidance direction in between (default off — every step runs both passes). `2` ≈ 1.30x faster, `3` ≈ 1.43x; approximate, so leave it off when matching a reference sample matters. No effect at `--cfg 1.0`, and therefore none on MiniMax-H3. |
@@ -538,7 +548,7 @@ script gets that error instead of watching a setting be ignored.
 | `--video-upscaler <path>` | x2 latent upscaler for two-stage video models: LTX 2.5 generates at half the output size, upscales the latent with `ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`, then refines at full size. Default: `latent_upscale_models/` beside the model. Env: `TS_VIDEO_UPSCALER`. |
 | `--video-diffusion-vae <path>` | Opt-in LTX 2.5 diffusion video decoder (`ltx-2.5-video-vae-bf16.safetensors`): cleaner, with less grain and flicker, but softer than the default convolutional `--video-vae`. MLX and CPU only; CUDA refuses it. Default: off. Env: `TS_VIDEO_DIFFUSION_VAE`. |
 | `--video-mode <mode>` | How to read the images you pass, on models with more than one conditioning mode. Default: inferred from what you supply. MiniMax-H3 accepts `t2v` (text only), `i2v` (the image **is** the first frame and gets animated), `fl2v` (first and last frame) and `ref` (the images are identity/appearance references for a **new** scene). `i2v`/`fl2v` need the FL2VA checkpoint and `ref` needs Ref2VA — separate files, not settings, and asking for the wrong one fails with the name of the other. |
-| `--end-image <file>` | Last-frame conditioning image, on models that accept one (MiniMax-H3 first/last-frame mode). Combined with `--image` the clip is steered to start and end on the two frames. LTX 2.5 also supports a last frame and timed image guides. |
+| `--end-image <file>` | Last-frame conditioning image, on models that accept one (MiniMax-H3 FL2VA, LTX 2.5). Alone it pins only the last frame (the clip ends on it); with `--image` the clip starts and ends on the two frames. Wan refuses it. LTX 2.5 also supports timed image guides. |
 | `--ref-image <file>` | Reference image for reference-conditioned models (MiniMax-H3 Ref2VA): the subject carries over while camera, background and composition come from the prompt. Repeatable up to 9; referred to in the prompt as `<Picture 1>`, `<Picture 2>`, … References are only ever scaled **down** and keep their own aspect ratio, so the output size still comes from `--width`/`--height`. |
 | `--ref-video <path>` | Reference video clip — a video **file** or a directory of frames, either way resampled onto the model's own 24 fps and canvas. Repeatable; referred to as `<Video 1>`, `<Video 2>`, … |
 | `--ref-video-audio <file>` | Soundtrack for the `--ref-video` at the **same position**: the first pairs with the first, and so on. Separate from `--ref-video` because a container's audio track is not readable through the frame decoder; omit it for a silent reference clip. WAV, MP3 or Ogg. |
@@ -652,17 +662,25 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/
 # Multimodal models: host an explicit projector too
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda
 
-# MiniMax-H3: video and its 32 kHz stereo soundtrack generated together. Size,
-# steps and frame count are startup flags because the Web UI sends no numbers of
-# its own; 640x384 is the documented starting point. Each run writes an .mp4 plus
-# a sidecar .wav. See "Video generation with audio (MiniMax-H3)" below.
+# MiniMax-H3: video and its 32 kHz stereo soundtrack generated together. Steps
+# and frame count are startup flags because the Web UI sends no numbers of its
+# own. The size is left to the model: text-to-video runs at 640x384, and an
+# uploaded keyframe sizes the canvas by MiniMax's 768p recipe, which a wide shot's
+# faces need. --video-width/--video-height would pin one size for every mode.
+# Each run writes an .mp4 plus a sidecar .wav. See "Video generation with audio
+# (MiniMax-H3)" below.
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
     --model ./models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
-    --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+    --video-steps 20 --video-frames 22
 
 # The same host from a shipped config (config/minimax-h3-ref2va.json swaps in the
 # reference checkpoint; only the denoiser differs, so nothing re-downloads).
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json
+
+# MiniMax-H3 Turbo: every clip samples the plug-in's 8 steps. Leave --video-steps
+# unset (or 8); any other value is refused at startup, before anything downloads.
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json \
+    --lora config/lora/minimax-h3-fl2v-turbo-8step.json
 
 # Wan video generation, video only: use 121 frames at 24 fps (about five seconds)
 # whenever the Web UI or an API request does not supply its own frames / fps value.
@@ -804,7 +822,7 @@ of quietly losing a setting.
 |---|---|
 | `--video-width <px>` | Default output width for video generation when a Web UI or API request omits `width`; alias `--width`. **The main quality lever on the server**, because the Web UI sends no size of its own — without it every clip comes out at the model default. `640` (with `--video-height 384`) is the documented starting point for MiniMax-H3. Rounded up to the model's grid. |
 | `--video-height <px>` | Default output height when a request omits `height`; alias `--height`. If only one of the two is given, MiniMax-H3 takes the other from the conditioning image's aspect ratio, which is what stops a 4:3 photo being stretched into a 16:9 frame. |
-| `--video-steps <N>` | Default denoising steps when a request omits `steps` — the quality/time trade-off after resolution. MiniMax-H3's own default is `20`; `4`–`8` is the fast operating point, `16`–`24` is visibly cleaner, past ~30 gains little. LTX 2.5 accepts only 8 as the first-pass schedule, followed by 3 refinement steps. |
+| `--video-steps <N>` | Default denoising steps when a request omits `steps` — the quality/time trade-off after resolution. MiniMax-H3's own default is `20`; `16`–`24` is visibly cleaner, past ~30 gains little. For fewer MiniMax-H3 steps, load a [Turbo plug-in](#minimax-h3-turbo-plug-ins) with `--lora` instead: it samples exactly the 8 or 4 steps it was distilled for, so leave this unset or set it to that count; any other value is refused at startup, and a request's own `steps` likewise. LTX 2.5 accepts only 8 as the first-pass schedule, followed by 3 refinement steps. |
 | `--video-mode <mode>` | Default conditioning mode when a request omits `videoMode`: `t2v` (text only), `i2v` (the image is the first frame and is animated), `fl2v` (first **and** last frame pinned) or `ref` (the images are identity/appearance references for a new scene). Omit it and each request's mode is inferred from what it supplies, which is usually what you want; pin it for a deployment that only offers one. |
 | `--video-frames <N>` | Default output frame count for video generation when a Web UI or API request omits `frames`. Snapped to the model's temporal grid — `4k+1` for Wan, where `121` frames at 24 fps is about five seconds; `17k+5` for MiniMax-H3. Without this flag, the model default is `33` (`49` for Wan 2.2 TI2V, `22` for MiniMax-H3). An explicit request `frames` value overrides this default. LTX 2.5 defaults to 17 and requires `8k+1` frames; it does not snap an invalid request. |
 | `--fps <N>` | Default playback frame rate for the generated MP4 when a Web UI or API request omits `fps`. Without this flag, the model default is `16` fps (`24` for Wan 2.2 TI2V). An explicit request `fps` value overrides this default; changing only FPS changes playback speed rather than the generated frame count. Models trained at a fixed rate (MiniMax-H3, 24 fps) override any other value. LTX 2.5 defaults to 24 fps. |
@@ -815,9 +833,9 @@ of quietly losing a setting.
 | `--video-upscaler <path>` | x2 latent upscaler for two-stage video models: LTX 2.5 generates at half the output size, upscales the latent with `ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`, then refines at full size. Default: `latent_upscale_models/` beside the model. Env: `TS_VIDEO_UPSCALER`. |
 | `--video-diffusion-vae <path>` | Opt-in LTX 2.5 diffusion video decoder (`ltx-2.5-video-vae-bf16.safetensors`): cleaner, with less grain and flicker, but softer than the default convolutional `--video-vae`. MLX and CPU only; CUDA refuses it. Default: off. Env: `TS_VIDEO_DIFFUSION_VAE`. |
 | `--qwen-image-vae <path>` / `--qwen-image-vl <path>` / `--qwen-image-mmproj <path>` | Override the Qwen-Image-2.1 companions the server otherwise finds next to the DiT GGUF: the VAE, the Qwen3-VL-8B text encoder and its vision projector (needed for editing). Checked at startup. Env: `TS_QWEN_IMAGE_VAE`, `TS_QWEN_IMAGE_TE`, `TS_QWEN_IMAGE_MMPROJ`. |
-| `--qwen-image-variant <base\|turbo>` | Which Qwen-Image-2.1 checkpoint the DiT GGUF holds, same spelling and meaning as on the CLI: `turbo` samples Turbo's 8-step schedule at CFG 1 by default (a request's `steps` may only be 8) and refuses step-distillation `--lora` plug-ins. Applies to every Qwen-Image model the server loads; another model loads without it and the server logs a warning, as for `--lora`. Default: none — a file name containing the word `turbo` is assumed to be Turbo and the load says so. Checked at startup. Env: `TS_QWEN_IMAGE_VARIANT`. |
+| `--qwen-image-variant <base\|turbo>` | Which Qwen-Image-2.1 checkpoint the DiT GGUF holds, same spelling and meaning as on the CLI: `turbo` samples Turbo's 8-step schedule at CFG 1 by default (a request's `steps` may only be 8) and refuses step-distillation `--lora` plug-ins. Applies to every Qwen-Image model the server loads; another model loads without it and the server logs a warning, as for a `--lora` plug-in that a model loaded after startup does not take. Default: none — a file name containing the word `turbo` is assumed to be Turbo and the load says so. Checked at startup. Env: `TS_QWEN_IMAGE_VARIANT`. |
 | `--width <px>` / `--height <px>` | Default Qwen-Image-2.1 output size for an image request that names neither a size nor an area (the Web UI sends none); a request that sets its own width/height or target area keeps its own geometry. The default needs both values. A side that is not a multiple of 32 is rounded down to one (never below 32) with a one-time `[qwen-image] WARNING`; with only one side given, or an unparsable or negative value, the default is ignored with a one-time warning and the automatic size (a 2048×2048 area; 1024×1024 on the `cpu` backend) stays. A Qwen-Image server also warns at startup in either case; nothing is refused. A width/height set in the request itself must still be a positive multiple of 32. Env: `TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`. They are also aliases of `--video-width` / `--video-height`. LTX 2.5 video defaults to 1024×1024 output with both sides positive multiples of 64; see its two-stage recipe below. |
-| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | Qwen-Image-2.1 LoRA plug-ins, same spelling and binding rules as on the CLI (repeat `--lora` to stack; scale and config bind to the preceding `--lora`). The files are checked at startup, and the set applies to every image request; a request's `steps` / `cfg` still override a plug-in's sampling recipe. Other models ignore them (the startup log says the plug-ins apply to Qwen-Image-2.1 models only). See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins). |
+| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | LoRA plug-ins for the hosted Qwen-Image-2.1 or MiniMax-H3 (FL2VA) model, same spelling and binding rules as on the CLI (repeat `--lora` to stack Qwen-Image-2.1 plug-ins; scale and config bind to the preceding `--lora`). The files are checked at startup, and a plug-in the startup model does not take is refused there, before the plug-in downloads (a model a `--config` still has to download is checked right after that download); a model loaded later runs without plug-ins it does not take and logs a warning naming them. The startup log lists the set (`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`). On Qwen-Image-2.1 the set applies to every image request, and a request's `steps` / `cfg` still override a plug-in's sampling recipe. A MiniMax-H3 Turbo plug-in applies to every clip and locks `--video-steps` and a request's `steps`, `flowShift` and `sampler` to its recipe. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins) and [MiniMax-H3 Turbo plug-ins](#minimax-h3-turbo-plug-ins). |
 | `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys.** Both served only the earlier Qwen-Image-Edit pipeline. `--qwen-image-lora` is replaced by `--lora` above; `--offload-cpu` has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident. |
 | `--temperature <f>` | Sampling temperature (`0` = greedy) |
 | `--top-k <N>` | Top-K filtering (`0` = disabled) |
@@ -1077,9 +1095,17 @@ before it binds to the config file's last plug-in. The hosts hand the parsed lis
 to the model as the environment variable `TS_LORAS`, a JSON array of
 `{"path", "scale", "config"}` objects.
 
-The plug-ins apply to Qwen-Image-2.1 only. The CLI refuses `--lora` with any other
-model; the server logs them at startup (`LoRA plug-ins (applied to Qwen-Image-2.1
-models only): ...`) and applies them to every image request. TensorSharp.Server.Host
+The plug-ins in this section apply to Qwen-Image-2.1; MiniMax-H3 takes its own
+[Turbo plug-ins](#minimax-h3-turbo-plug-ins) and refuses these. Both hosts refuse a
+`--lora` the startup model does not take before the plug-in downloads; a model a
+`--config` still has to download is checked for its family right after that download,
+since its file header is what names the family. The server logs
+the set at startup (`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`) and applies it
+to every image request; a model it loads later that does not take them runs without
+them and logs a warning naming them. When the command line names no plug-in, an
+inherited `TS_LORAS` gets the same checks: entries the model does not take are skipped
+with a warning, and a file it names that is missing stops startup unless the startup
+model takes no plug-ins. TensorSharp.Server.Host
 does not expose per-request LoRA selection; TensorAgent has its own saved LoRA choices,
 which apply from the next picture. The retired `--qwen-image-lora` is still a removed
 flag, and its error names `--lora`; `TS_QWEN_IMAGE_LORA` is refused at load with
@@ -1199,6 +1225,55 @@ Q8_0 or Q4 weights rounds most of it away. It works on `ggml_metal`, `ggml_cuda`
 [Qwen-Image-2.1 card](docs/models/qwenimage21.md#lora-plug-ins) covers the formats,
 the packing, tensor parallelism and the limitations in detail.
 
+### MiniMax-H3 Turbo plug-ins
+
+`config/lora/minimax-h3-fl2v-turbo-8step.json` and `minimax-h3-fl2v-turbo-4step.json`
+are LightX2V's step-distillation LoRAs for the MiniMax-H3 FL2VA checkpoint: a clip in
+8 or 4 transformer passes instead of 20. Each downloads its 1.38 GB of weights on first
+use (pinned, SHA-256-checked, Apache-2.0) to
+`${TENSORSHARP_MODELS:-<repo>/models}/minimax-h3/loras`.
+
+```bash
+# CLI: the plug-in's recipe takes the place of --diffusion-steps / --flow-shift / --sampler
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
+    --lora config/lora/minimax-h3-fl2v-turbo-8step.json \
+    --image first.png --prompt "The person smiles and waves." --output wave.mp4
+
+# Server: every clip samples the plug-in's recipe; requests leave "steps" out
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json \
+    --lora config/lora/minimax-h3-fl2v-turbo-4step.json
+```
+
+| Plug-in | Recipe |
+|---|---|
+| `minimax-h3-fl2v-turbo-8step.json` | LightX2V Turbo 8-step (FL2V v1.0, 768p): 8 Euler steps on the endpoint-inclusive linspace grid, video shift 6, audio shift 3, CFG 1, as the publisher states it |
+| `minimax-h3-fl2v-turbo-4step.json` | LightX2V Turbo 4-step (FL2V v1.2, 768p): 4 steps on the same grid and shifts. **Inferred**: the publisher states no recipe for v1.2, so this one is carried over from its 4-step v1.0 row until it is validated |
+
+Where these differ from the Qwen-Image-2.1 plug-ins above:
+
+- **The recipe is locked, not a default.** `--diffusion-steps`, `--flow-shift`,
+  `--sampler` and `--cfg` (CLI), `--video-steps` (server) and a request's `steps`,
+  `flowShift` and `sampler` may be unset (0) or equal the recipe's; any other value is
+  refused, never overridden. Both hosts refuse it at startup, with one
+  `Configuration error:` line and exit code 1, before anything downloads, the files of
+  a `--config` included. A request gets a 400, or a `{done, error}` event on the
+  stream route.
+- **One plug-in, as its config.** MiniMax-H3 takes one `minimax-h3-lora` config; a bare
+  `.safetensors`, a Qwen-Image-2.1 plug-in or a second H3 plug-in is refused.
+  `--lora <weights> --lora-config <config>` works when the weights file is the one the
+  config names.
+- **FL2VA only.** The Ref2VA checkpoint, recognized by `ref2va` in its file name,
+  refuses both.
+- **Strength.** `--lora-scale` must be ≥ 0. Any other strength than 1 logs that the
+  schedule was distilled at strength 1, and 0 keeps the adapter's terms with zero up
+  factors.
+- **Sizes do not change.** Text-to-video still runs at 640×384 and a keyframe takes the
+  768p recipe canvas. The adapters were trained at 768p, so a clip whose short edge is
+  not 768 logs a line saying so.
+
+The [MiniMax-H3 card](docs/models/minimax-h3.md#turbo-plug-ins) covers the sigma
+grids, how the adapter is applied, the backends and what has been validated.
+
 ## Video generation with audio (LTX 2.5 Distilled)
 
 LTX 2.5 jointly generates video and 48 kHz stereo audio from text, a first/last
@@ -1287,8 +1362,9 @@ frame for FL2VA. Ref2VA accepts up to nine `--ref-image` inputs, plus `--ref-vid
 `<Picture 1>`, `<Video 1>` and `<Audio 1>`. Incompatible checkpoint/mode/input
 combinations fail rather than silently dropping conditioning.
 
-CFG is fixed at **1**; the default is **20 steps**, while 4–8 trades quality for
-speed. Width/height round up to multiples of 32; frames round up to the `17k+5`
+CFG is fixed at **1**; the default is **20 steps**, and fewer base steps trade
+quality for speed. A [Turbo plug-in](#minimax-h3-turbo-plug-ins) on FL2VA samples
+the 8 or 4 steps it was distilled for instead. Width/height round up to multiples of 32; frames round up to the `17k+5`
 grid (5, 22, 39, …). Playback is fixed at 24 fps.
 These limits are input contracts; long-clip perceptual quality is not established.
 `--no-audio` skips audio decoding but retains the trained joint AV denoiser.
@@ -1303,7 +1379,10 @@ whole-process time by 5.0% on Metal, 12.5% on MLX and 19.0% on direct CUDA;
 native CUDA had no meaningful gain. Samples include loading/export and
 uncontrolled file-cache state, so they establish neither universal speedups
 nor general cross-engine parity; CPU
-whole-generation comparisons after the corrections remain pending. Consult the
+whole-generation comparisons after the corrections remain pending. On `ggml_metal`,
+putting long attention on ggml-metal's tensor-API kernel (padded keys, chunked queries) cut one 1280×768×107,
+20-step first/last-frame run on an M5 Pro from 11,553.8 s to 5,438.5 s (2.12×; a single
+run, [details](docs/models/minimax-h3.md#long-sequence-attention-on-metal)). Consult the
 [current coverage and precision notes](docs/models/minimax-h3.md) for the actual
 fixtures, device runs and performance limits.
 

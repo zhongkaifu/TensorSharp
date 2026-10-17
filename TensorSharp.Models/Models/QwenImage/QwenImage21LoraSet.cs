@@ -38,10 +38,9 @@ internal sealed class QwenImage21LoraSet : IDisposable
 {
     private const int GgmlF32 = 0, GgmlF16 = 1;
     private const int Channels = QwenImage21DiT.Channels, Dim = QwenImage21DiT.HiddenSize;
-    private const long PageAlignment = 16384;
     private const string PddFormatPrefix = "qwenimage21_extracted_prefused";
 
-    private readonly List<IntPtr> _buffers = new();
+    private readonly LoraFactorBuffers _buffers = new();
     private IntPtr[] _adapters = Array.Empty<IntPtr>();
     // The pure-C# cpu backend dequantizes checkpoint weights (DoRA row norms, diff bases) with
     // the managed kernels: it must not reach the native library whatever the process-global
@@ -385,7 +384,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
         if (u.DownName != null)
         {
             term = new Term { Down = st.ReadFloat32(u.DownName), Up = st.ReadFloat32(u.UpName), Rank = u.Rank, In = u.In, Out = u.Out };
-            if (u.Scale != 1f) Scale(term.Up, u.Scale);
+            if (u.Scale != 1f) LoraFactorMath.Scale(term.Up, u.Scale);
         }
 
         if (rowScale != null)
@@ -404,10 +403,10 @@ internal sealed class QwenImage21LoraSet : IDisposable
             }
             if (term != null)
                 for (long o = 0; o < u.Out; o++)
-                    Scale(term.Up.AsSpan((int)(o * term.Rank), term.Rank), rowScale[o]);
+                    LoraFactorMath.Scale(term.Up.AsSpan((int)(o * term.Rank), term.Rank), rowScale[o]);
             rowScale = baseScale;
         }
-        if (term != null) Balance(term);
+        if (term != null) LoraFactorMath.Balance(term.Down, term.Up, term.Rank, term.In, term.Out);
 
         if (u.Slots.Length == 1)
         {
@@ -438,64 +437,13 @@ internal sealed class QwenImage21LoraSet : IDisposable
             for (int o = 0; o < slot.Out; o++) slot.RowScale[o] *= rowScale[o];
             foreach (var earlier in slot.Terms)
                 for (int o = 0; o < slot.Out; o++)
-                    Scale(earlier.Up.AsSpan(o * earlier.Rank, earlier.Rank), rowScale[o]);
+                    LoraFactorMath.Scale(earlier.Up.AsSpan(o * earlier.Rank, earlier.Rank), rowScale[o]);
         }
         if (term != null) slot.Terms.Add(term);
     }
 
-    /// <summary>Give every rank component equal down-row and up-column norms; the product is unchanged.</summary>
-    private static void Balance(Term t)
-    {
-        var upNorm = new double[t.Rank];
-        for (long o = 0; o < t.Out; o++)
-            for (int r = 0; r < t.Rank; r++) { double v = t.Up[o * t.Rank + r]; upNorm[r] += v * v; }
-        var divisors = new float[t.Rank];
-        for (int r = 0; r < t.Rank; r++)
-        {
-            divisors[r] = 1f;
-            Span<float> row = t.Down.AsSpan((int)(r * t.In), (int)t.In);
-            double down = Norm(row);
-            double up = Math.Sqrt(upNorm[r]);
-            if (down <= 0 || up <= 0) continue;
-            float k = (float)Math.Sqrt(up / down);
-            Scale(row, k);
-            divisors[r] = k;
-        }
-        // Row by row: the up factor is [out, rank], so a column at a time would stride.
-        for (long o = 0; o < t.Out; o++)
-        {
-            Span<float> row = t.Up.AsSpan((int)(o * t.Rank), t.Rank);
-            for (int r = 0; r < row.Length; r++) row[r] /= divisors[r];
-        }
-    }
-
-    // ---- arithmetic ---------------------------------------------------------------------------
-    // Plain loops, not TensorPrimitives. On Mono, which runs the Mac and iOS apps, its generic
-    // vector operators ran hundreds of times slower than on CoreCLR. MEASURED in the Release
-    // Mac app: loading Viggle Turbo with Film Stills spent 497 thread-seconds in MaxMagnitude
-    // and 73 in Balance's norms, products and quotients, 31 s of wall time for what the CLI
-    // loads in 0.6 s. A loop like these is fast on both runtimes. The norms are summed in double
-    // in index order, so every runtime computes the same bits.
-
-    /// <summary>Whether every value is a number of magnitude below <paramref name="limit"/>; a NaN is not.</summary>
-    private static bool AllBelow(float[] values, float limit)
-    {
-        foreach (float v in values)
-            if (!(MathF.Abs(v) < limit)) return false;
-        return true;
-    }
-
-    private static void Scale(Span<float> values, float factor)
-    {
-        for (int i = 0; i < values.Length; i++) values[i] *= factor;
-    }
-
-    private static double Norm(ReadOnlySpan<float> values)
-    {
-        double sum = 0;
-        foreach (float v in values) sum += (double)v * v;
-        return Math.Sqrt(sum);
-    }
+    // Balance, the F16 range check, scaling, norms and the F16/F32 store are LoraFactorMath's
+    // (plain loops, shared with MiniMaxH3LoraSet); see its remarks for why not TensorPrimitives.
 
     /// <summary>Row norms of the checkpoint weight a DoRA magnitude normalizes: gate_layer and
     /// proj are the halves of a fused gate_up, and a fused gate_up LoRA spans both halves of
@@ -538,7 +486,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
                 for (long i = 0; i < n; i++)
                 {
                     Dequantize(managed, (int)info.Type, data + (nint)((first + start + i) * rowBytes), row, input);
-                    result[start + i] = (float)Norm(row);
+                    result[start + i] = (float)LoraFactorMath.Norm(row);
                 }
             });
             return result;
@@ -625,21 +573,9 @@ internal sealed class QwenImage21LoraSet : IDisposable
         else NativeDequant.DequantizeToFloat32(type, source, destination, 0, count);
     }
 
-    private unsafe IntPtr Copy(ReadOnlySpan<float> values)
-    {
-        IntPtr p = Allocate(values.Length * sizeof(float));
-        values.CopyTo(new Span<float>((void*)p, values.Length));
-        return p;
-    }
+    private IntPtr Copy(ReadOnlySpan<float> values) => _buffers.Copy(values);
 
-    private unsafe IntPtr Allocate(long bytes)
-    {
-        void* p = NativeMemory.AlignedAlloc((nuint)Math.Max(bytes, 1), (nuint)PageAlignment);
-        if (p == null) throw new OutOfMemoryException($"Unable to allocate {bytes} bytes for LoRA factors.");
-        var ptr = (IntPtr)p;
-        lock (_buffers) _buffers.Add(ptr);
-        return ptr;
-    }
+    private IntPtr Allocate(long bytes) => _buffers.Allocate(bytes);
 
     // ---- packing ------------------------------------------------------------------------
 
@@ -748,7 +684,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
             paddedRanks.Add(padded);
         }
         // F16 unless some value would overflow it (then the whole group stays F32).
-        bool f16 = downs.Concat(ups).All(a => AllBelow(a, 60000f));
+        bool f16 = downs.Concat(ups).All(a => LoraFactorMath.AllBelow(a, LoraFactorMath.F16Limit));
         int elem = f16 ? 2 : 4;
         long totalDown = shareDown ? downs[0].Length : downs.Sum(d => (long)d.Length);
         IntPtr downBase = totalDown > 0 ? Allocate(totalDown * elem) : IntPtr.Zero;
@@ -763,12 +699,12 @@ internal sealed class QwenImage21LoraSet : IDisposable
                 down = downBase + (nint)(cursor * elem);
                 if (!shareDown || i == 0)
                 {
-                    Store(downs[i], down, f16);
+                    LoraFactorMath.Store(downs[i], down, f16);
                     cursor += downs[i].Length;
                 }
                 else down = downBase;
                 up = Allocate(ups[i].LongLength * elem);
-                Store(ups[i], up, f16);
+                LoraFactorMath.Store(ups[i], up, f16);
                 Interlocked.Add(ref _factorBytes, (shareDown && i > 0 ? 0 : downs[i].LongLength * elem) + ups[i].LongLength * elem);
             }
             IntPtr rowScale = slot.RowScale != null ? Copy(slot.RowScale) : IntPtr.Zero;
@@ -784,12 +720,6 @@ internal sealed class QwenImage21LoraSet : IDisposable
             };
             lock (_packed) _packed[name] = packed;
         }
-    }
-
-    private static unsafe void Store(float[] values, IntPtr destination, bool f16)
-    {
-        if (f16) TensorPrimitives.ConvertToHalf(values, new Span<System.Half>((void*)destination, values.Length));
-        else values.CopyTo(new Span<float>((void*)destination, values.Length));
     }
 
     // ---- native descriptors ---------------------------------------------------------------
@@ -874,8 +804,7 @@ internal sealed class QwenImage21LoraSet : IDisposable
 
     public void Dispose()
     {
-        foreach (var p in _buffers) unsafe { NativeMemory.AlignedFree(p.ToPointer()); }
-        _buffers.Clear();
+        _buffers.Dispose();
         _adapters = Array.Empty<IntPtr>();
     }
 }

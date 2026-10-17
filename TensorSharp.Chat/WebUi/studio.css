@@ -1,0 +1,250 @@
+/* Shared, dependency-free editor. Tokens inherit either host's current theme. */
+.ts-studio { --studio-bg: var(--bg, #11121b); --studio-panel: var(--surface, #1b1c28); --studio-border: var(--border, #36394c); --studio-text: var(--text, #eeeef5); --studio-muted: var(--muted, #aaaabd); --studio-accent: var(--accent, #8c91ff); position: fixed; inset: 0; z-index: 10000; display: flex; flex-direction: column; background: var(--studio-bg); color: var(--studio-text); font: 14px/1.5 system-ui, sans-serif; isolation: isolate; }
+.ts-studio[hidden] { display: none !important; }
+.ts-studio *, .ts-studio *::before, .ts-studio *::after { box-sizing: border-box; }
+.ts-studio button, .ts-studio input, .ts-studio select, .ts-studio textarea { font: inherit; color: inherit; }
+.ts-studio button, .ts-studio select, .ts-studio input:not([type=checkbox]):not([type=range]), .ts-studio textarea { border: 1px solid var(--studio-border); border-radius: 7px; background: var(--studio-panel); min-height: 36px; padding: 6px 10px; }
+.ts-studio button { cursor: pointer; }
+.ts-studio button[aria-pressed=true] { border-color: var(--studio-accent); background: color-mix(in srgb, var(--studio-accent) 17%, var(--studio-panel)); box-shadow: inset 0 0 0 1px var(--studio-accent); }
+@media (hover: hover) { .ts-studio button:hover:not(:disabled) { border-color: var(--studio-accent); background: color-mix(in srgb, var(--studio-accent) 17%, var(--studio-panel)); } }
+.ts-studio button:active:not(:disabled) { background: color-mix(in srgb, var(--studio-accent) 28%, var(--studio-panel)); }
+.ts-studio button:disabled { cursor: not-allowed; opacity: .45; }
+.ts-studio :focus-visible, .ts-studio-open:focus-visible { outline: 2px solid var(--studio-accent, #8c91ff); outline-offset: 2px; }
+.ts-studio .ts-primary { background: var(--studio-accent); color: #10121c; border-color: transparent; font-weight: 650; }
+.ts-studio .ts-danger { color: #ffb5b5; }
+.ts-studio h2, .ts-studio h3, .ts-studio p { margin: 0; }
+.ts-studio h2 { font-size: 17px; }
+.ts-studio h3 { font-size: 14px; }
+.ts-studio-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: max(10px, env(safe-area-inset-top)) 14px 10px; border-bottom: 1px solid var(--studio-border); }
+.ts-studio-header h2 { margin-right: 8px; white-space: nowrap; }
+.ts-studio-header select { width: min(250px, 35vw); }
+.ts-studio-header .ts-save-state { margin-left: auto; }
+.ts-studio .ts-save-state, .ts-studio .ts-hint, .ts-studio small { color: var(--studio-muted); font-size: 12px; }
+.ts-studio .ts-status { padding: 5px 14px; border-bottom: 1px solid var(--studio-border); min-height: 30px; font-size: 12px; }
+.ts-studio .ts-status[data-error=true] { color: #ffc9bf; background: #582d2d; }
+.ts-studio-workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(190px, 245px) minmax(240px, 1fr) minmax(260px, 330px); grid-template-rows: minmax(250px, 1fr) minmax(180px, 31vh); }
+.ts-studio-section { min-width: 0; min-height: 0; padding: 12px; overflow: auto; }
+.ts-studio-library { border-right: 1px solid var(--studio-border); }
+.ts-studio-inspector { border-left: 1px solid var(--studio-border); }
+.ts-studio .ts-section-heading { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.ts-studio .ts-section-heading h3 { margin-right: auto; }
+.ts-studio .ts-row { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.ts-studio .ts-stack { display: grid; gap: 10px; }
+.ts-studio .ts-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.ts-studio label.ts-field { display: grid; gap: 4px; min-width: 0; font-size: 12px; color: var(--studio-muted); }
+.ts-studio label.ts-field input, .ts-studio label.ts-field select, .ts-studio label.ts-field textarea { width: 100%; color: var(--studio-text); }
+.ts-studio textarea { min-height: 82px; resize: vertical; width: 100%; }
+.ts-studio .ts-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.ts-studio input[type=checkbox] { accent-color: var(--studio-accent); width: 17px; height: 17px; }
+.ts-studio input[type=range] { accent-color: var(--studio-accent); }
+.ts-studio .ts-empty { padding: 20px 6px; color: var(--studio-muted); font-size: 13px; }
+.ts-studio .ts-asset { border: 1px solid var(--studio-border); border-radius: 8px; padding: 9px; margin: 8px 0; overflow-wrap: anywhere; }
+.ts-studio .ts-asset header { display: block; background: none; border: 0; padding: 0; position: static; height: auto; }
+.ts-studio .ts-asset .ts-row { margin-top: 8px; }
+.ts-studio .ts-asset[data-missing=true] { border-color: #bd7950; }
+.ts-studio-preview { display: flex; flex-direction: column; overflow: hidden; gap: 8px; }
+.ts-studio .ts-monitor { flex: 1; min-height: 120px; display: flex; align-items: center; justify-content: center; background: #07070b; border-radius: 9px; overflow: hidden; position: relative; }
+.ts-studio .ts-monitor video { width: 100%; height: 100%; max-height: 48vh; object-fit: contain; }
+.ts-studio .ts-monitor p { padding: 24px; text-align: center; max-width: 480px; }
+.ts-studio .ts-playback { display: flex; gap: 8px; align-items: center; }
+.ts-studio .ts-playback input { flex: 1; min-width: 50px; }
+.ts-studio .ts-time { font: 12px ui-monospace, monospace; min-width: 95px; }
+.ts-studio .ts-shots { display: flex; gap: 7px; overflow-x: auto; min-height: 43px; }
+.ts-studio .ts-shot { flex: 0 0 auto; max-width: 150px; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ts-studio .ts-tabbar { display: flex; gap: 5px; margin-bottom: 12px; position: sticky; top: -12px; background: var(--studio-bg); padding: 4px 0 8px; z-index: 1; }
+.ts-studio .ts-tabbar button { flex: 1; padding: 5px; }
+.ts-studio details { border-top: 1px solid var(--studio-border); padding-top: 9px; margin-top: 9px; }
+.ts-studio summary { cursor: pointer; margin-bottom: 9px; }
+.ts-studio .ts-provenance { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; max-height: 180px; overflow: auto; }
+.ts-studio .ts-proposal { border: 1px solid var(--studio-accent); border-radius: 8px; padding: 10px; }
+.ts-studio .ts-proposal pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; max-height: 210px; overflow: auto; }
+.ts-studio .ts-job { padding: 8px 0; border-top: 1px solid var(--studio-border); overflow-wrap: anywhere; }
+.ts-studio .ts-job progress { width: 100%; height: 5px; accent-color: var(--studio-accent); }
+.ts-studio .ts-job a { color: var(--studio-accent); }
+.ts-studio .ts-job { display: grid; gap: 4px; }
+.ts-studio .ts-job > button { justify-self: start; margin-top: 2px; }
+.ts-studio .ts-job-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.ts-studio .ts-job-state { flex: none; font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--studio-border); color: var(--studio-muted); }
+.ts-studio .ts-job[data-state=running] .ts-job-state, .ts-studio .ts-job[data-state=cancelling] .ts-job-state { border-color: var(--studio-accent); color: var(--studio-text); }
+.ts-studio .ts-job[data-state=failed] .ts-job-state, .ts-studio .ts-job[data-state=interrupted] .ts-job-state { border-color: #bd7950; color: #ffc9bf; }
+.ts-studio .ts-job-prompt { font-size: 12px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.ts-studio .ts-job-stage { font-size: 13px; font-weight: 600; }
+.ts-studio-timeline { grid-column: 1 / -1; border-top: 1px solid var(--studio-border); display: flex; flex-direction: column; padding: 9px 12px max(9px, env(safe-area-inset-bottom)); overflow: hidden; }
+.ts-studio .ts-timeline-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
+.ts-studio .ts-timeline-toolbar h3 { margin-right: 8px; }
+.ts-studio .ts-timeline-toolbar button { min-height: 31px; font-size: 12px; padding: 4px 8px; }
+.ts-studio .ts-timeline-toolbar input[type=range] { width: 88px; }
+.ts-studio .ts-timeline-scroll { min-height: 0; overflow: auto; position: relative; flex: 1; overscroll-behavior: contain; }
+.ts-studio .ts-ruler-row, .ts-studio .ts-track-row { display: flex; width: max-content; min-width: 100%; position: relative; }
+.ts-studio .ts-track-label { flex: 0 0 150px; width: 150px; padding: 6px; border-right: 1px solid var(--studio-border); border-bottom: 1px solid var(--studio-border); background: var(--studio-panel); position: sticky; left: 0; z-index: 3; font-size: 12px; display: flex; align-items: center; gap: 4px; }
+/* The name takes its own line above the track buttons, so it keeps the full header width. */
+.ts-studio .ts-track-row .ts-track-label { flex-wrap: wrap; align-content: center; padding: 3px 6px; row-gap: 2px; }
+.ts-studio .ts-track-label strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 100%; line-height: 14px; }
+.ts-studio .ts-track-label button { padding: 2px 4px; min-height: 28px; font-size: 10px; }
+.ts-studio .ts-track-label .ts-danger { min-width: 24px; }
+.ts-studio .ts-lane, .ts-studio .ts-ruler { position: relative; flex-shrink: 0; height: 53px; border-bottom: 1px solid var(--studio-border); background-image: linear-gradient(90deg, color-mix(in srgb, var(--studio-border) 45%, transparent) 1px, transparent 1px); }
+.ts-studio .ts-ruler { height: 25px; cursor: crosshair; }
+.ts-studio .ts-ruler-row .ts-track-label { font-size: 10px; height: 25px; }
+.ts-studio .ts-tick { position: absolute; top: 3px; font-size: 10px; color: var(--studio-muted); pointer-events: none; }
+.ts-studio .ts-clip { position: absolute; top: 5px; bottom: 5px; padding: 3px 8px !important; min-width: 14px; min-height: 0; text-align: left; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; background: #30436b; border-color: #547bb7; touch-action: none; user-select: none; }
+.ts-studio .ts-clip[data-kind=audio] { background: #244c42; border-color: #568c7b; }
+.ts-studio .ts-clip[data-kind=text] { background: #59416d; border-color: #9472b1; }
+.ts-studio .ts-clip[aria-pressed=true] { box-shadow: inset 0 0 0 2px var(--studio-accent); z-index: 1; }
+.ts-studio .ts-clip span { display: block; font-size: 10px; opacity: .8; }
+.ts-studio .ts-playhead { position: absolute; top: 0; bottom: 0; width: 1px; background: #ffd097; z-index: 2; pointer-events: none; }
+.ts-studio .ts-welcome { grid-column: 1 / -1; grid-row: 1 / -1; display: grid; place-content: center; gap: 14px; padding: 24px; text-align: center; }
+.ts-studio .ts-welcome p { max-width: 520px; color: var(--studio-muted); }
+.ts-studio-open, .ts-studio-chat-action { cursor: pointer; }
+.ts-studio-chat-action { display: block; margin: 6px 0 10px; border: 1px solid var(--border, #494b65); background: var(--surface, #252637); color: var(--text, #eee); border-radius: 6px; padding: 6px 10px; font: inherit; font-size: 12px; }
+.ts-studio .ts-mobile-tabs { display: none; }
+.ts-studio .ts-visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+@media (max-width: 1000px) {
+  .ts-studio-workspace { grid-template-columns: minmax(155px, 200px) minmax(220px, 1fr); grid-template-rows: minmax(240px, 1fr) minmax(200px, 33vh); }
+  .ts-studio-inspector { position: absolute; top: 100px; bottom: 0; right: 0; width: min(340px, 88vw); background: var(--studio-bg); z-index: 6; box-shadow: -8px 0 24px #0005; }
+  .ts-studio-inspector[data-panel-hidden=true] { display: none; }
+  /* Five tabs and the close button wrap instead of overflowing a 320 pt screen. */
+  .ts-studio .ts-mobile-tabs { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)) 44px; gap: 4px; padding: 0 max(8px, env(safe-area-inset-right)) 6px max(8px, env(safe-area-inset-left)); }
+  .ts-studio .ts-mobile-tabs button { font-size: 12px; min-height: 36px; padding: 4px 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* The mobile row already chooses the inspector tab, so the panel's own tab row would be a second copy. */
+  .ts-studio-inspector .ts-tabbar { display: none; }
+}
+@media (max-width: 620px) {
+  .ts-studio-header { padding: max(7px, env(safe-area-inset-top)) 8px 7px; gap: 5px; }
+  .ts-studio-header h2 { font-size: 15px; }
+  /* Title and project share the first row; the buttons and the save state wrap below. */
+  .ts-studio-header .ts-save-state { width: auto; order: 3; margin: 0 0 0 auto; }
+  .ts-studio-header select { order: 1; flex: 1 1 150px; width: auto; min-width: 0; }
+  .ts-studio-header button { order: 2; }
+  .ts-studio-header button { min-height: 37px; padding: 5px 7px; }
+  .ts-studio-workspace { display: flex; flex-direction: column; }
+  .ts-studio-preview { flex: 1; min-height: 180px; padding: 8px; }
+  .ts-studio-library { position: absolute; top: 145px; bottom: 0; left: 0; width: min(300px, 88vw); z-index: 6; background: var(--studio-bg); box-shadow: 8px 0 24px #0005; }
+  .ts-studio-library[data-panel-hidden=true] { display: none; }
+  .ts-studio-inspector { top: 145px; }
+  .ts-studio-timeline { flex: 0 0 37%; padding: 7px 5px max(7px, env(safe-area-inset-bottom)); }
+  .ts-studio .ts-track-label { flex-basis: 112px; width: 112px; }
+  .ts-studio .ts-timeline-toolbar { gap: 4px; }
+  .ts-studio .ts-timeline-toolbar h3 { display: none; }
+  .ts-studio .ts-monitor video { max-height: 34vh; }
+  .ts-studio button { min-height: 40px; }
+}
+@media (prefers-reduced-motion: reduce) { .ts-studio * { scroll-behavior: auto !important; transition: none !important; } }
+.ts-studio .ts-thumbnail { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; object-fit: contain; border-radius: 5px; margin-bottom: 7px; background: #08090d; }
+.ts-studio .ts-thumbnail[hidden] { display: none; }
+.ts-studio .ts-waveform { display: block; width: 100%; height: 48px; margin-top: 7px; background: #101e1a; border-radius: 5px; }
+.ts-studio .ts-name-dialog { position: absolute; inset: 0; z-index: 20; display: grid; place-items: center; padding: 20px; background: #0009; }
+.ts-studio .ts-name-dialog form { width: min(420px, 100%); background: var(--studio-bg); border: 1px solid var(--studio-border); border-radius: 12px; padding: 22px; box-shadow: 0 12px 50px #0006; }
+.ts-studio .ts-name-dialog .ts-row { justify-content: flex-end; }
+.ts-studio .ts-delete-content { width: min(460px, 100%); max-height: 100%; overflow: auto; overflow-wrap: anywhere; background: var(--studio-bg); border: 1px solid var(--studio-border); border-radius: 12px; padding: 22px; box-shadow: 0 12px 50px #0006; }
+.ts-studio .ts-delete-warning { border-left: 3px solid #d88d57; padding-left: 10px; }
+.ts-studio-workspace { position: relative; }
+@media (hover: hover) { .ts-studio .ts-primary:hover:not(:disabled) { background: color-mix(in srgb, var(--studio-accent) 85%, white); color: #10121c; } }
+@media (max-width: 1000px) { .ts-studio-inspector { top: 0; } }
+@media (max-width: 620px) { .ts-studio-library, .ts-studio-inspector { top: 0; } }
+
+/* ---- Studio as a whole: the visible viewport (keyboard included) and the side safe areas ---- */
+.ts-studio { bottom: auto; height: var(--vh, 100dvh); padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); }
+.ts-studio .ts-notice { border: 1px solid var(--studio-border); border-left: 3px solid var(--studio-accent); border-radius: 8px; padding: 10px 12px; display: grid; gap: 4px; }
+.ts-studio .ts-notice p { color: var(--studio-muted); font-size: 13px; }
+.ts-studio .ts-primary-soft { border-color: color-mix(in srgb, var(--studio-accent) 55%, var(--studio-border)); }
+.ts-studio h4 { margin: 0; font-size: 13px; }
+
+/* ---- Library ---- */
+.ts-studio .ts-asset[data-highlight=true] { border-color: var(--studio-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--studio-accent) 45%, transparent); }
+.ts-studio .ts-asset-prompt { font-size: 12px; color: var(--studio-muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin-top: 2px; }
+.ts-studio .ts-asset-frames { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+.ts-studio .ts-asset-frames .ts-hint { flex: 1 1 100%; }
+.ts-studio .ts-asset-frames button { flex: 1 1 0; min-width: 0; font-size: 12px; }
+.ts-studio .ts-more { border-top: 0; padding-top: 0; margin-top: 6px; }
+.ts-studio .ts-more summary { font-size: 12px; color: var(--studio-muted); margin-bottom: 6px; }
+
+/* ---- Monitor: a still photo and the getting-started steps ---- */
+.ts-studio .ts-monitor-still { width: 100%; height: 100%; max-height: 48vh; object-fit: contain; }
+.ts-studio .ts-monitor-still[hidden] { display: none; }
+.ts-studio .ts-monitor-empty { width: 100%; max-height: 100%; overflow: auto; padding: 14px; }
+.ts-studio .ts-monitor-empty[hidden] { display: none; }
+.ts-studio .ts-guide { display: grid; gap: 10px; max-width: 520px; margin: 0 auto; text-align: left; }
+.ts-studio .ts-guide h2 { font-size: 16px; }
+/* The monitor centers its own hint; the guide's steps read left to right. */
+.ts-studio .ts-monitor .ts-guide p { padding: 0; text-align: left; max-width: none; }
+.ts-studio .ts-guide-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.ts-studio .ts-guide-step { border: 1px solid var(--studio-border); border-radius: 9px; padding: 9px 11px; display: grid; gap: 5px; background: var(--studio-panel); }
+.ts-studio .ts-guide-step[data-done=true] { opacity: .72; }
+.ts-studio .ts-guide-head { display: flex; align-items: center; gap: 8px; }
+.ts-studio .ts-guide-mark { flex: none; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 700; border: 1px solid var(--studio-accent); color: var(--studio-accent); }
+.ts-studio .ts-guide-step[data-done=true] .ts-guide-mark { background: var(--studio-accent); color: #10121c; }
+.ts-studio .ts-welcome .ts-guide { width: min(520px, 100%); }
+
+/* ---- Generate ---- */
+.ts-studio .ts-gen-model { display: grid; gap: 2px; padding: 8px 10px; border: 1px solid var(--studio-border); border-radius: 8px; }
+.ts-studio .ts-gen-file { overflow-wrap: anywhere; opacity: .8; font-size: 11px; }
+/* The section is the container the slot row is sized against (an element cannot query its own width). */
+.ts-studio .ts-gen-use { display: grid; gap: 8px; container-type: inline-size; }
+.ts-studio .ts-gen-result { font-size: 13px; }
+/* Two slots side by side only where both fit; the 88vw phone overlay stacks them. */
+.ts-studio .ts-slots { display: grid; gap: 8px; grid-template-columns: 1fr; }
+@container (min-width: 300px) { .ts-studio .ts-slots { grid-template-columns: 1fr 1fr; } }
+.ts-studio .ts-slot { display: grid; gap: 6px; align-content: start; border: 1px solid var(--studio-border); border-radius: 9px; padding: 8px; min-width: 0; container-type: inline-size; }
+.ts-studio .ts-slot[data-state=disabled] { border-style: dotted; opacity: .85; }
+.ts-studio .ts-slot-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 6px; }
+.ts-studio .ts-slot-title { font-weight: 650; font-size: 13px; white-space: nowrap; }
+.ts-studio .ts-slot-tag { font-size: 11px; color: var(--studio-muted); border: 1px solid var(--studio-border); border-radius: 999px; padding: 0 7px; white-space: nowrap; }
+.ts-studio .ts-slot-pick { min-height: 96px; width: 100%; border: 1.5px dashed var(--studio-muted); background: transparent; color: var(--studio-muted); display: grid; place-items: center; gap: 4px; text-align: center; }
+.ts-studio .ts-slot-frame { width: 100%; max-height: 140px; aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden; background: #08090d; display: flex; justify-content: center; }
+.ts-studio .ts-slot-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ts-studio .ts-slot-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ts-studio .ts-slot-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+@container (max-width: 160px) { .ts-studio .ts-slot-actions { grid-template-columns: 1fr; } }
+.ts-studio .ts-swap { width: 100%; }
+.ts-studio [data-drop=true] { outline: 2px dashed var(--studio-accent); outline-offset: 2px; }
+.ts-studio .ts-picker { border: 1px solid var(--studio-accent); border-radius: 9px; padding: 9px; display: grid; gap: 8px; background: var(--studio-panel); }
+.ts-studio .ts-picker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ts-studio .ts-picker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 6px; padding: 2px; }
+.ts-studio .ts-picker-tile { position: relative; display: grid; gap: 4px; align-content: start; padding: 4px; min-height: 88px; text-align: left; overflow: hidden; }
+.ts-studio .ts-picker-tile:focus-visible { outline-offset: -2px; }
+.ts-studio .ts-picker-thumb { width: 100%; height: auto; aspect-ratio: 1; object-fit: cover; border-radius: 5px; display: block; background: #08090d; }
+.ts-studio .ts-picker-thumb[hidden], .ts-studio .ts-guide-thumb[hidden], .ts-studio .ts-slot-thumb[hidden] { display: none; }
+.ts-studio .ts-picker-name { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ts-studio .ts-picker-import { place-content: center; text-align: center; border-style: dashed; color: var(--studio-muted); }
+.ts-studio .ts-picker-tile[aria-current=true]::after, .ts-studio .ts-ref-badge { position: absolute; top: 6px; right: 6px; min-width: 22px; height: 22px; border-radius: 11px; display: grid; place-items: center; background: var(--studio-accent); color: #10121c; font-size: 12px; font-weight: 700; padding: 0 5px; }
+.ts-studio .ts-picker-tile[aria-current=true]::after { content: '✓'; }
+.ts-studio .ts-guide-row { display: grid; gap: 6px; border: 1px solid var(--studio-border); border-radius: 8px; padding: 8px; }
+.ts-studio .ts-guide-row .ts-slot-pick { min-height: 56px; grid-auto-flow: column; justify-content: start; }
+.ts-studio .ts-guide-thumb { width: 64px; height: 40px; object-fit: cover; border-radius: 4px; }
+.ts-studio .ts-gen-other summary { font-size: 13px; }
+.ts-studio .ts-use { border: 0; margin: 0; padding: 0; display: grid; gap: 6px; }
+.ts-studio .ts-use legend { font-size: 12px; color: var(--studio-muted); margin-bottom: 4px; }
+.ts-studio .ts-radio { display: flex; gap: 8px; align-items: flex-start; min-height: 44px; padding: 8px; border: 1px solid var(--studio-border); border-radius: 8px; cursor: pointer; }
+.ts-studio .ts-radio input { margin-top: 2px; accent-color: var(--studio-accent); width: 17px; height: 17px; flex: none; }
+.ts-studio .ts-radio:has(input:checked) { border-color: var(--studio-accent); }
+.ts-studio .ts-radio:has(input:disabled) { opacity: .6; cursor: not-allowed; }
+.ts-studio .ts-radio-text { display: grid; gap: 2px; font-size: 13px; }
+/* The sticky Generate footer must never cover the control that has focus. */
+.ts-studio .ts-studio-inspector { scroll-padding-top: 56px; scroll-padding-bottom: 132px; }
+.ts-studio .ts-gen-footer { position: sticky; bottom: -12px; display: grid; gap: 6px; padding: 10px 0 12px; background: var(--studio-bg); border-top: 1px solid var(--studio-border); z-index: 1; }
+.ts-studio .ts-gen-summary { font-size: 12px; color: var(--studio-muted); }
+.ts-studio .ts-form-error { color: #ffc9bf; font-size: 13px; }
+.ts-studio .ts-form-error:empty { display: none; }
+.ts-studio .ts-form-error summary { margin: 4px 0; font-size: 12px; }
+.ts-studio [aria-invalid=true] { border-color: #e0876b; }
+
+/* ---- Assistant ---- */
+.ts-studio .ts-chat { display: grid; gap: 6px; max-height: 260px; overflow: auto; }
+.ts-studio .ts-bubble { padding: 7px 10px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; max-width: 92%; }
+.ts-studio .ts-bubble[data-role=user] { justify-self: end; background: color-mix(in srgb, var(--studio-accent) 22%, var(--studio-panel)); }
+.ts-studio .ts-bubble[data-role=assistant] { justify-self: start; background: var(--studio-panel); border: 1px solid var(--studio-border); }
+.ts-studio .ts-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.ts-studio .ts-chip { border-radius: 999px; font-size: 12px; min-height: 32px; padding: 4px 10px; text-align: left; }
+.ts-studio .ts-proposal { display: grid; gap: 6px; }
+.ts-studio .ts-proposal-list { margin: 0; padding-left: 18px; display: grid; gap: 3px; font-size: 13px; }
+
+/* ---- Touch: targets follow the input type, not the screen width (an iPad in landscape is wide). Last on purpose. ---- */
+@media (pointer: coarse) {
+  .ts-studio button, .ts-studio .ts-mobile-tabs button, .ts-studio .ts-timeline-toolbar button, .ts-studio .ts-track-label button,
+  .ts-studio select, .ts-studio summary, .ts-studio .ts-check, .ts-studio .ts-chip { min-height: 44px; min-width: 44px; }
+  /* Four track buttons still fit one header line; the lane grows with the row so labels and lanes stay aligned. */
+  .ts-studio .ts-track-label button { min-width: 30px; }
+  .ts-studio .ts-track-row .ts-lane { height: auto; min-height: 53px; align-self: stretch; }
+  .ts-studio input, .ts-studio select, .ts-studio textarea { font-size: 16px; } /* below 16px iOS zooms into the field */
+}
+@media (max-height: 500px) { .ts-studio-workspace { grid-template-rows: minmax(160px, 1fr) minmax(120px, 28vh); } }

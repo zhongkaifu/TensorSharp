@@ -28,6 +28,7 @@
          backend probes that touch them live in the Server's BackendCatalogProbes).
          ChatLayeringTests fails the moment either shows up in this assembly's
          references. -->
+    <ProjectReference Include="..\TensorSharp.Studio\TensorSharp.Studio.csproj" />
     <ProjectReference Include="..\TensorSharp.Runtime.Logging\TensorSharp.Runtime.Logging.csproj" />
     <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
     <ProjectReference Include="..\TensorSharp.AgentHost\TensorSharp.AgentHost.csproj" />

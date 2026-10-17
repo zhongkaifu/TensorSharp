@@ -469,6 +469,143 @@ public sealed class AgentAppHostTests : IDisposable
         Assert.Equal(0, (await Get("/api/agent/loras")).GetProperty("loras").GetArrayLength());
     }
 
+    private const string H3Turbo8 = "minimax-h3-fl2v-turbo-8step";
+    private const string MadeWith = "is made with LoRA plug-ins";
+    private const string H3Turbo8Missing =
+        "LightX2V Turbo 8-Step is turned on but its files are missing. Download it again under LoRAs, or turn it off.";
+
+    /// <summary>Make the engine report <paramref name="modelId"/>'s weights as loaded (null: none), which is
+    /// all the plug-in plan reads of the loaded model; nothing is loaded.</summary>
+    private static void ReportLoaded(AgentAppHost host, string? modelId)
+    {
+        string? path = modelId is null ? null : host.Models.PathFor(ModelCatalog.Find(modelId)!, ModelCatalog.Find(modelId)!.Weights);
+        typeof(TensorSharp.Server.ModelLifecycleService)
+            .GetField("_loadedModelPath", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(host.ModelService.LifecycleService, path);
+    }
+
+    /// <summary>The plug-in provider the app handed Studio's generation adapter.</summary>
+    private static Func<bool, IReadOnlyList<LoraSpec>> StudioLoras(AgentAppHost host)
+    {
+        object adapter = typeof(TensorSharp.Studio.StudioService)
+            .GetField("generation", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(host.Studio)!;
+        return Assert.IsType<Func<bool, IReadOnlyList<LoraSpec>>>(adapter.GetType()
+            .GetField("_videoLoras", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(adapter));
+    }
+
+    /// <summary>
+    /// Studio follows the clip plug-ins chosen under LoRAs. Its capability and admission queries
+    /// plan them as often as the page polls, without a word in the log; the clip that runs
+    /// prepares them once and says so, as a chat clip does. One choice holds both families'
+    /// plug-ins, and a clip names only its own. A choice that cannot be honoured is thrown,
+    /// which Studio shows as the reason the model is unavailable, never a clip made without it.
+    /// </summary>
+    [Fact]
+    public void StudioPlansAClipsPlugInsQuietlyAndPreparesThemOncePerClip()
+    {
+        var log = new LineLog();
+        _host = new AgentAppHost(Paths with { DeviceMemoryGB = 48 }, loggerFactory: log);
+        const string viggle = "qwen-image-2.1-viggle-turbo";
+        FakeInstall(_host.Loras, H3Turbo8);
+        FakeInstall(_host.Loras, viggle);
+        Assert.NotNull(_host.ChooseLoras(new[] { new ImageLoraChoice(viggle, 1f), new ImageLoraChoice(H3Turbo8, 1f) }, out string? error));
+        Assert.Null(error);
+        ReportLoaded(_host, LoraCatalog.MiniMaxH3Keyframes);
+        try
+        {
+            Func<bool, IReadOnlyList<LoraSpec>> provider = StudioLoras(_host);
+            CatalogLora turbo = LoraCatalog.Find(H3Turbo8)!;
+            for (int i = 0; i < 3; i++)
+                Assert.Equal(_host.Loras.PathFor(turbo, turbo.Weights), Assert.Single(provider(false)).Path);
+            Assert.Equal(provider(false), _host.PlanClipLoras().Specs);
+            Assert.Empty(log.Lines(MadeWith));
+
+            // The engine takes the form the app hands it: the plug-in's own config ties these weights.
+            LoraSpec clip = Assert.Single(provider(true));
+            Assert.Equal(8, TensorSharp.Models.MiniMaxH3.MiniMaxH3LoraConfig.RecipeFor(
+                new[] { clip }, TensorSharp.Models.MiniMaxH3.MiniMaxH3Partition.FirstLastFrame).Steps);
+            string line = Assert.Single(log.Lines(MadeWith));
+            Assert.Contains("LightX2V Turbo 8-Step", line, StringComparison.Ordinal);
+            Assert.DoesNotContain("Viggle", line, StringComparison.Ordinal);
+
+            // A chat clip prepares, and logs, the same way.
+            Assert.Equal(new[] { "LightX2V Turbo 8-Step" }, _host.PrepareVideoTurn().Loras);
+            Assert.Equal(2, log.Lines(MadeWith).Count);
+
+            // Its files gone: refused, still quietly.
+            _host.Loras.Delete(turbo);
+            Assert.Equal(H3Turbo8Missing, Assert.Throws<InvalidOperationException>(() => provider(false)).Message);
+            Assert.Equal(H3Turbo8Missing, _host.PrepareVideoTurn().Error);
+            Assert.Equal(2, log.Lines(MadeWith).Count);
+        }
+        finally
+        {
+            ReportLoaded(_host, null);
+        }
+    }
+
+    /// <summary>
+    /// The app's video routes apply the choice as a chat clip does: one the host cannot honour
+    /// is a 409 with the reason on both, before anything runs, rather than a clip sampled with
+    /// whatever the last one left on the model. With nothing chosen they go on to the service.
+    /// </summary>
+    [Fact]
+    public async Task TheVideoRoutesRefuseAClipThePlugInChoiceCannotMake()
+    {
+        StartServing(Paths with { DeviceMemoryGB = 48 });
+        FakeInstall(_host!.Loras, H3Turbo8);
+        Assert.NotNull(_host.ChooseLoras(new[] { new ImageLoraChoice(H3Turbo8, 1f) }, out _));
+        ReportLoaded(_host, LoraCatalog.MiniMaxH3Keyframes);
+        try
+        {
+            _host.Loras.Delete(LoraCatalog.Find(H3Turbo8)!);
+            foreach (string route in new[] { "/api/video-generate", "/api/video-generate/stream" })
+            {
+                HttpResponseMessage response = await _client!.PostAsJsonAsync(route, new { prompt = "a fox in falling snow" });
+                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+                Assert.Equal(H3Turbo8Missing, (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("error").GetString());
+            }
+
+            Assert.NotNull(_host.ChooseLoras(Array.Empty<ImageLoraChoice>(), out _));
+            HttpResponseMessage served = await _client!.PostAsJsonAsync("/api/video-generate", new { prompt = "a fox in falling snow" });
+            Assert.NotEqual(HttpStatusCode.Conflict, served.StatusCode);
+        }
+        finally
+        {
+            ReportLoaded(_host, null);
+        }
+    }
+
+    /// <summary>
+    /// The LoRA sheet of MiniMax-H3's keyframes entry lists its two Turbo plug-ins, and the
+    /// references entry has no sheet: the plug-ins are not for it.
+    /// </summary>
+    [Fact]
+    public async Task TheKeyframesEntrysSheetOffersItsTurboPlugIns()
+    {
+        StartServing(Paths with { DeviceMemoryGB = 48 });
+        ReportLoaded(_host!, LoraCatalog.MiniMaxH3Keyframes);
+        try
+        {
+            JsonElement sheet = await Get("/api/agent/loras");
+            Assert.True(sheet.GetProperty("supportsLoras").GetBoolean());
+            Assert.Equal(new[] { H3Turbo8, "minimax-h3-fl2v-turbo-4step" },
+                sheet.GetProperty("loras").EnumerateArray().Select(l => l.GetProperty("id").GetString()));
+            Assert.All(sheet.GetProperty("loras").EnumerateArray(), l => Assert.Equal("Speed", l.GetProperty("kind").GetString()));
+
+            ReportLoaded(_host!, "minimax-h3-ref2va-q4k");
+            sheet = await Get("/api/agent/loras");
+            Assert.False(sheet.GetProperty("supportsLoras").GetBoolean());
+            Assert.Equal(0, sheet.GetProperty("loras").GetArrayLength());
+        }
+        finally
+        {
+            ReportLoaded(_host!, null);
+        }
+    }
+
     /// <summary>
     /// The app answers /api/chat through its GPU gate, not the route's default frame source,
     /// so the gate has to plan a picture turn from the conversation as the route does
@@ -606,6 +743,33 @@ public sealed class AgentAppHostTests : IDisposable
         Assert.True(host.CodeRunner!.CanRun);
         Assert.Equal("in-process", host.Backend.Name);
         Assert.Equal("sh", host.Backend.Shell!.Name);
+    }
+
+    [Fact]
+    public void PhotoTurnsKeepTheCompactVideoCanvasUntilTheRecipeSizeIsMeasuredOnTheAppsMemoryTier()
+    {
+        AgentAppHost host = Start();
+
+        // The desktop hosts size a MiniMax-H3 keyframe's canvas by MiniMax's 768p recipe, with up to
+        // about 4.2x the video tokens per frame. The app keeps the compact canvas, in chat and in Studio, until
+        // that size's peak memory is measured on its 32 GB tier: a ggml device OOM ends the process.
+        Assert.Equal(TensorSharp.Models.Video.VideoCanvasPolicy.CompactPreview, host.Options.VideoCanvasPolicy);
+        Assert.Equal(0, host.Options.DefaultVideoWidth);
+        Assert.Equal(0, host.Options.DefaultVideoHeight);
+
+        // ...and it reaches the paths the app takes: a photo turn's parameters, and the Studio capability that
+        // would otherwise offer "From the first frame" on an FL2VA checkpoint.
+        Assert.Equal(TensorSharp.Models.Video.VideoCanvasPolicy.CompactPreview, host.Chat.VideoDefaults.CanvasPolicy);
+        var turn = TensorSharp.Server.RequestParsers.VideoGenerationParamsParser.Parse(
+            JsonSerializer.SerializeToElement(new { prompt = "p" }), host.Options, out string error);
+        Assert.Null(error);
+        Assert.Equal(TensorSharp.Models.Video.VideoCanvasPolicy.CompactPreview, turn.CanvasPolicy);
+        var fl2va = (TensorSharp.Models.MiniMaxH3.MiniMaxH3Model)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(
+            typeof(TensorSharp.Models.MiniMaxH3.MiniMaxH3Model));
+        var capability = TensorSharp.Chat.Studio.NativeStudioGenerationAdapter.CreateCapability(fl2va, "h3", host.Chat.VideoDefaults);
+        Assert.Contains("i2v", capability.Modes);
+        Assert.Empty(capability.ImageCanvasModes);
+        Assert.Equal((640, 384), (capability.DefaultWidth, capability.DefaultHeight));
     }
 
     [Fact]
@@ -2147,5 +2311,24 @@ public sealed class AgentAppHostTests : IDisposable
         {
             squatter.Dispose();
         }
+    }
+
+    /// <summary>Every line the host logs, formatted, for the tests that count what it says.</summary>
+    private sealed class LineLog : Microsoft.Extensions.Logging.ILoggerFactory, Microsoft.Extensions.Logging.ILogger
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<string> _lines = new();
+
+        public IReadOnlyList<string> Lines(string containing) =>
+            _lines.Where(l => l.Contains(containing, StringComparison.Ordinal)).ToList();
+
+        public Microsoft.Extensions.Logging.ILogger CreateLogger(string categoryName) => this;
+        public void AddProvider(Microsoft.Extensions.Logging.ILoggerProvider provider) { }
+        public void Dispose() { }
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+            TState state, Exception? exception, Func<TState, Exception?, string> formatter) =>
+            _lines.Enqueue(formatter(state, exception));
     }
 }

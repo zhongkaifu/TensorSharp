@@ -289,6 +289,33 @@ uses locally compiled sm86 PTX. The latest addition retains all 160 preceding
 entry bodies unchanged and appends one H3 conversion entry. No ggml patches
 are applied.
 
+### Long-sequence attention on Metal
+
+A 1280×768×107 first/last-frame clip on FL2VA is 34,991 packed tokens, and at that
+length attention dominates each step. On an M5 Pro with `ggml_metal`, unchanged ggml
+`a05c9922613c6a2230dbb1d0de679519ecafb4f0`, 20 steps and seed 42, the whole run
+went from 11,553.8 s to 5,438.5 s (2.12×), about 570 s to 263 s per step. One
+flash-attention call went from 8.05 s to 3.24 s:
+
+- ggml-metal runs a long flash attention on its Metal 4 tensor-API kernel only when
+  the key count is a multiple of 64. TensorSharp pads the keys with zero rows up to
+  the next multiple and masks them, which leaves the attention unchanged (a masked
+  key adds nothing to the softmax or the output). The padding applies only where
+  the tensor API is live; `TS_METAL_FLASH_KV_PAD=0` turns it off for A/B runs.
+- The mask needs a row per query, 2.45 GB at this length. Every row is the same, so
+  the queries run in chunks that share one mask of about 4 MB.
+
+The video VAE then decoded in 146–148 s. On `ggml_metal` the pipeline now releases
+the denoiser's weights and its reused compute buffers before the decode
+(`TS_H3_KEEP_RESIDENT=1` keeps the weights). Without that, only 3.3 GB of the
+38.3 GB Metal budget stayed free, and the decode could fail with
+`kIOGPUCommandBufferCallbackErrorOutOfMemory`. For comparison, MLX's fused SDPA at
+the same shape took 4.08 s per call in F32 and 1.68 s in F16; it was not adopted.
+These are single runs on one machine, timed as the CLI reports a whole clip; the
+before run's log is in `artifacts/minimax-h3/fl2v-face-investigation/` and the
+after run's in `artifacts/minimax-h3/speed/hr/` (local validation evidence, not
+committed).
+
 ## Files
 
 Four networks cooperate, so a run needs four files. The two denoisers are
@@ -321,7 +348,9 @@ TensorSharp.Cli         --config config/minimax-h3-ref2va.json \
 ```
 
 Both name `"backend": "ggml_cuda"` (a `--backend` on the command line wins) and set
-width 640, height 384, 22 frames, 24 fps. Neither sets steps or guidance: a shipped
+22 frames at 24 fps. Only the Ref2VA config pins 640×384; the FL2VA config leaves
+the size to the model, so text-to-video runs at 640×384 and a keyframe gets its
+[recipe canvas](#sizes-and-settings). Neither sets steps or guidance: a shipped
 config has to parse on both hosts, and the two spell steps differently
 (`--video-steps N` on the server, `--diffusion-steps N` on the CLI), while the
 server takes no `--cfg` at all — so the model's own defaults apply.
@@ -358,7 +387,7 @@ server takes no `--cfg` at all — so the model's own defaults apply.
 |---|---|---|
 | Text | `t2v` | FL2VA or Ref2VA |
 | First photo | `i2v` | FL2VA |
-| First and/or last photo | `fl2v` | FL2VA |
+| Last photo, with or without a first | `fl2v` | FL2VA |
 | Reference images, clips or soundtracks | `ref` | Ref2VA |
 
 `--video-mode` makes the choice explicit; otherwise inputs select it. Keep
@@ -400,15 +429,224 @@ Temporary extracted frames are removed; supplied frame directories are preserved
 
 ## Sizes and settings
 
-- Spatial dimensions round up to multiples of 32. The default is 640×384, or
-  that area at a conditioning image's aspect.
+- Spatial dimensions round up to multiples of 32. Text-to-video and named
+  Ref2VA references default to 640×384; on Ref2VA a plain `--image` (how the
+  Web UI attaches a picture) keeps that area at the image's aspect.
+- i2v and fl2v keep the keyframe's framing, so with no size given the canvas
+  comes from the first keyframe (the last one when it is the only one) by
+  MiniMax's released recipe: its aspect at a 768-pixel short edge, under
+  768×1344's area, each side on the nearest multiple of 32. A 3:2 photo gets
+  1152×768, a 2:3 portrait 768×1152, 4:3 1024×768 and 16:9 1344×768, matching
+  vllm-omni and sglang. Beyond 1:4 or 4:1 the aspect is clamped and the rest is
+  centre-cropped. The video VAE downsamples 16× in each direction: fitted to
+  640×384, a full-body photo leaves a face about 60 px tall, and an encode then
+  decode alone already smears it, with no denoiser involved. Measured on such a
+  photo as whole-frame VAE round trips: 27.6 dB at 640×384 and 29.5 dB on the
+  1152×768 canvas a 3:2 first keyframe gives, where the face (compared by eye)
+  survives. The recipe has about 2.4× (square) to 4.2× (16:9) the video tokens
+  per frame of 640×384 (3.6× for 3:2), so it takes several times longer.
+- An explicit `--width` and `--height` still win, and pin that size for every
+  mode. A keyframe that is centre-cropped gets a warning saying how much of it
+  is kept; one scaled further down than its own recipe canvas gets a warning
+  naming that size. The TensorAgent app keeps the compact 640×384-area canvas
+  until the recipe's peak memory is measured on its 32 GB tier.
 - Frame counts round up to 5, 22, 39, 56, … (`17k+5`); the default is 22.
 - H3 uses 24 fps, CFG 1 and its own Euler flow schedule. The default is 20 steps.
+  A [Turbo plug-in](#turbo-plug-ins) replaces that schedule with the 8 or 4 steps
+  it was distilled for.
   Wan-specific negative-prompt, sampler and guidance-cache options do not change H3.
 - `--diffusion-seed` selects generation noise. `--seed` controls text sampling
   and is not the H3 noise seed.
 - Video decode is spatially tiled and temporally chunked. Long-clip finiteness
   and perceptual quality still require current full-generation gates.
+
+## Turbo plug-ins
+
+LightX2V's Turbo LoRAs distill the FL2VA checkpoint to 8 or 4 transformer passes
+instead of the base 20. TensorSharp ships them as two plug-in configs in
+[`config/lora/`](../../config/lora/), which download their weights on first use:
+
+```sh
+TensorSharp.Cli --config config/minimax-h3-fl2va.json \
+  --lora config/lora/minimax-h3-fl2v-turbo-8step.json \
+  --prompt "A red fox walks through a quiet forest. Forest birds chirp." --output fox.mp4
+
+TensorSharp.Server.Host --config config/minimax-h3-fl2va.json \
+  --lora config/lora/minimax-h3-fl2v-turbo-8step.json
+```
+
+| Config | Plug-in and weights | Steps | Where the recipe comes from |
+|---|---|---|---|
+| `minimax-h3-fl2v-turbo-8step.json` | LightX2V Turbo 8-step (FL2V v1.0, 768p), `minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` | 8 | The ModelTC/Minimax-H3-Turbo README: "8 NFE, video shift 6, audio shift 3" |
+| `minimax-h3-fl2v-turbo-4step.json` | LightX2V Turbo 4-step (FL2V v1.2, 768p), `minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` | 4 | **Inferred.** The README has no v1.2 row and the file records no shift, so the linspace grid and shift 6/3 of its 4-step v1.0 768p row are carried over. It stays labelled inferred until a shift A/B or the publisher settles it |
+
+Both weights files come from
+[lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/a29e57d195f80ead07c89f89e55ecf2911e893c5)
+at revision `a29e57d195f80ead07c89f89e55ecf2911e893c5`, 1,383,677,808 bytes each,
+SHA-256-checked (the values are in [MODEL_DOWNLOADS.md](../../MODEL_DOWNLOADS.md)),
+under Apache-2.0. They land in `minimax-h3/loras/` under the models root.
+
+### The sampling contract
+
+A plug-in samples N Euler steps on the endpoint-inclusive linspace grid
+q_i = (N − i)/N, shifted by 6 for video and 3 for audio and ending in 0, at CFG 1
+and strength 1. That is a different grid from the base checkpoint's
+stable-diffusion.cpp schedule at shift 12, so a base run with fewer steps is not
+the distilled schedule.
+
+| Steps | Video sigmas (shift 6) | Audio sigmas (shift 3) |
+|---|---|---|
+| 8 | 1, 0.97674, 0.94737, 0.90909, 0.85714, 0.78261, 0.66667, 0.46154, 0 | 1, 0.95455, 0.9, 0.83333, 0.75, 0.64286, 0.5, 0.3, 0 |
+| 4 | 1, 0.94737, 0.85714, 0.66667, 0 | 1, 0.9, 0.75, 0.5, 0 |
+
+Every clip logs the plug-in, its recipe and both sigma lists
+(`[lora] sampling recipe (...)`).
+
+### Locked settings and refusals
+
+The recipe is a contract, not a default. Steps, video flow shift, sampler and CFG
+may be left unset (0) or repeat the plug-in's own values; any other value is
+refused with a message that names the plug-in, never overridden.
+
+| Where | What is checked | A contradicting value gives |
+|---|---|---|
+| CLI | `--diffusion-steps`, `--flow-shift`, `--sampler`, `--cfg` | One `Configuration error:` line and exit code 1, before anything downloads |
+| Server startup | `--video-steps` | The same, before anything downloads |
+| `--config` on either host | The merged options, before the config's own files download | The same; a refused run downloads nothing, not even the ~35.5 GB model set |
+| A request | `"steps"`, `"flowShift"`, `"sampler"` (a `"cfg"` other than 1 is refused for every H3 model) | 400 on `/api/video-generate` and `/v1/videos/generations`; a `{done, error}` event on `/api/video-generate/stream` |
+| Video Studio | A shot planned for another recipe | 409 `sampling_recipe_conflict`, and no job ([Video Studio](../video-studio.md#sampling-recipes)) |
+
+Both hosts hold a plug-in inherited through `TS_LORAS` to the same checks when the
+command line names none. For example, the 8-step plug-in with `--diffusion-steps 20`
+stops with:
+
+```text
+Configuration error: --diffusion-steps 20 contradicts minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors: LightX2V Turbo 8-step (FL2V v1.0, 768p) samples exactly 8 steps on its own schedule. Drop --diffusion-steps or pass 8.
+```
+
+The plug-in itself is also refused, with the reason:
+
+- on the Ref2VA checkpoint, recognized by `ref2va` in its file name (Ref2VA Turbo is
+  not supported);
+- as a bare `.safetensors`: H3 takes only the plug-in config, which declares the
+  checkpoint partition and the contract;
+- on another model, or as a Qwen-Image-2.1 plug-in on H3; two H3 plug-ins at once;
+- with a negative `--lora-scale`;
+- as `--lora <weights> --lora-config <plug-in config>` when the weights file is not
+  the one that config names.
+
+### How it is applied
+
+- **Unmerged**, `y = W x + B (A x)`, on top of the quantized GGUF weights, with
+  strength × alpha / rank folded into B. This is how the publisher's inference script
+  applies it through PEFT (its `--fuse-lora` is off by default). Both files declare
+  alpha 8 at rank 128, a scale of 0.0625; a loader that assumed alpha = rank would
+  apply the update 16× too strong.
+- **312 terms** (624 tensors): q, k, v, out, fc1 and fc2 in the 50 DiT blocks and the
+  2 token-refiner blocks. The q/k/v updates land before the q/k RMSNorm and RoPE,
+  fc1's before SwiGLU, and out's and fc2's after their projections. The Diffusers
+  file stores fc1 as [value; gate]; the halves are swapped into the checkpoint's
+  [gate | value] order.
+- **Memory.** The factors take 1.38 GB as F16 on `ggml_metal` and `ggml_cuda` (a
+  group with a value too large for F16 stays F32) and 2.77 GB as F32 on `ggml_cpu`.
+  The direct `cpu`, `mlx` and `cuda` backends build exact F32 factors per block on
+  first use. With fc1 updated, the native graph splits the fc1 base into its gate and
+  value halves, so the update adds no full-size activation.
+- **Strength.** `--lora-scale` (default the config's 1.0) multiplies the update and
+  must be ≥ 0. Any other strength than 1 logs that the schedule was distilled at
+  strength 1. Strength 0 keeps every term with zero up factors, so each forward
+  equals the base checkpoint's on the same input while the clip still samples the
+  plug-in's schedule: an identity probe.
+- **Canvas.** No default changes. Text-to-video still runs at 640×384 and keyframes
+  take the [recipe canvas](#sizes-and-settings). The adapters were trained at 768p,
+  so a clip whose short edge is not 768 logs one line saying so, and still runs.
+- **Backends.** The native graph applies the adapter on `ggml_metal`, `ggml_cuda` and
+  `ggml_cpu`; the direct `cpu`, `mlx` and `cuda` backends apply it themselves. Which
+  of them have run is listed below.
+
+On the server the startup `--lora` applies to every clip, and a request cannot
+choose plug-ins; send requests without `steps`, as the Web UI does
+([API examples](../../TensorSharp.Server.Host/API_EXAMPLES.md#minimax-h3--video-and-native-32-khz-stereo-audio)).
+[Video Studio](../video-studio.md#sampling-recipes) shows the recipe, fixes the step
+count and binds each job to it. The [TensorAgent app](../../TensorAgent/README.md)
+offers both plug-ins on its keyframes entry as speed plug-ins, applied per clip in
+chat and in Studio, and never sends steps, a flow shift or a sampler.
+
+### Turbo validation status
+
+Recorded for this change on 2026-10-17, against unchanged ggml
+`a05c9922613c6a2230dbb1d0de679519ecafb4f0` on an Apple M5 Pro:
+
+- **Contracts and hosts.** Managed CPU tests cover the manifests, the recipe and
+  sigma grids, every refusal above on the CLI, the server, `--config`, the request
+  routes and Studio, and process tests in which each refusal prints one
+  `Configuration error:` line, exits 1 and starts no download.
+- **Native helpers** (`eng/validation/minimax-h3-lora.cpp`, ctest `minimax-h3-lora`)
+  on `cpu` and `metal`: the stacked q/k/v shrink, the folds, the split fc1 and the
+  zero-up identity are bit-equal, and a rank-0 adapter builds the unchanged graph.
+- **Synthetic two-block parity** with tiny random weights through the real code:
+  direct CPU with the plug-in matches a GGUF with the update merged in at relative
+  error ≤ 1.3e-7 in five cases, while a merge without the fc1 half swap differs by
+  0.17. Native `ggml_cpu` against direct CPU: ≤ 3.0e-7 with the explicit softmax and
+  ≤ 2.05e-4 with flash attention's F16 K/V. `ggml_metal`: ≤ 5.0e-4, update cosine
+  ≥ 0.9999993. Strength 0 is bit-identical to no plug-in on `ggml_cpu`, `ggml_metal`
+  and direct CPU. The fixture's head size of 8 keeps Metal off its flash kernel, so
+  that kernel has not run with an adapter.
+- **The real adapter files** on CPU: both load as 624 tensors and 312 terms at rank
+  128 and scale 0.0625, and Ref2VA refuses them. Block 10's rows match the
+  publisher's ComfyUI-format twins bit for bit
+  (`InferenceWeb.Tests/Fixtures/MiniMaxH3/turbo-comfy-reference-rows.json`), which
+  pins the fc1 half swap and the stacked q/k/v layout against data rather than
+  against TensorSharp. Packing took 0.7 s as F32 (2.77 GB) and 0.5 s as F16 (1.38 GB).
+
+Measured on `ggml_metal` with the real weights (one run each, so a sample rather
+than a benchmark):
+
+- **Step-0 identity** (384×256×22, seed 42). Turbo-8 at `--lora-scale 0` gives a
+  first-step video velocity bit-identical to base H3; both runs start at σ = 1. The
+  audio velocity differs by design: the plug-in moves the video shift from 12 to 6,
+  which rescales the audio carrier. At strength 1 the update moves the video velocity
+  to cosine 0.943 against base.
+- **Wall clock.** FL2VA with a first and a last keyframe, 1280×768×107 (34,991 packed
+  tokens), seed 42:
+
+  | Run | DiT steps | s/step | VAE decode | Total |
+  |---|---:|---:|---:|---:|
+  | Base, before the attention fix | 20 | ~570 | — | 11,553.8 s |
+  | Base | 20 | 262.8 | 148.0 s | 5,438.5 s |
+  | Turbo-8 | 8 | 264.7 | 146.6 s | 2,298.7 s |
+  | Turbo-4 | 4 | 264.7 | 146.2 s | 1,238.6 s |
+
+  The unmerged adapter costs under 1% per step. Peak memory with an adapter was not
+  measured. A base step leaves 3.3 GB of the 38.3 GB Metal budget free, and the
+  adapter adds 1.38 GB of F16 factors.
+- **Quality on the 768p keyframe canvas** (the same runs, judged by eye on full-size
+  frame crops, plus whole-frame statistics):
+  - Faces stay sharp and undistorted in both Turbo clips, mid-clip and next to the
+    pinned last frame, and the prompted gesture reads more clearly than in base.
+  - The clips drift from base 20 as a distilled model should. Mean whole-frame PSNR
+    against it is 17.5 dB for Turbo-8 and 19.8 dB for Turbo-4. For scale, base runs
+    before and after the attention fix agree at 41.6 dB.
+  - Most of the difference is the transition between two dissimilar keyframes: base
+    dissolves around frame 13, while both Turbo variants hold the first frame and cut.
+  - Turbo is somewhat more saturated (mean 0.20 against 0.17) and moves more (mean
+    frame-to-frame change 7.3 and 5.1 against 2.0). Its soundtrack is louder (RMS 0.21
+    and 0.25 against 0.15).
+- **4-step shift A/B** (video shift 6 against 12, same keyframes and seed). Both are
+  clean and close to each other: 19.8 against 19.3 dB against base 20, saturation
+  0.197 against 0.199, motion 5.1 against 5.3. One seed does not decide between them,
+  so the 4-step recipe stays inferred. It keeps shift 6, the value the published 768p
+  rows use.
+
+Not run, so not validated:
+
+- Text-to-video at 640×384 with either plug-in, and more than one seed.
+- Real-weight update parity of `ggml_metal` against direct `mlx`.
+- `ggml_cuda`, direct `cuda` and `mlx` with an adapter, the TensorAgent app, and a
+  Diffusers + PEFT reference velocity, which has no local reference to run.
+
+Logs and reports are in ignored `artifacts/minimax-h3/turbo-*` and
+`artifacts/minimax-h3/lora-native/` (local validation evidence, not committed).
 
 ## HTTP API
 
@@ -586,6 +824,7 @@ but a track that is spectrally plausible and merely wrong.
 | `TS_H3_PREFAULT_THREADS` | Prefault streams; default 1 |
 | `TS_H3_TE_GROUP` | Optional grouped native text-encoder trunk; off by default |
 | `TS_H3_KEEP_RESIDENT=1` | Optional Metal residency policy between clips |
+| `TS_METAL_FLASH_KV_PAD=0` | Turns off the key padding that puts long `ggml_metal` flash attention on the tensor-API kernel ([above](#long-sequence-attention-on-metal)); for A/B runs |
 | `TS_H3_UPLOAD_PREFAULT` | Native CUDA bulk page-prefault policy: automatic half-memory/cgroup guard; `0` disables, `1` forces; final default coverage is recorded above |
 | `TS_H3_UPLOAD_WORKERS` | Native bulk-prefault workers (1–8, default 8); distinct from the pipeline's denoiser file-read streams |
 | `TS_H3_UPLOAD_PROFILE=1` | Native weight-upload and graph-compute diagnostics; record separately from trace-free performance runs |

@@ -196,6 +196,7 @@ official companions; it does not download or start inference.
 | [`qwen-image-2.1.json`](qwen-image-2.1.json) | Qwen-Image-2.1 Q4_K_M + dedicated VAE + Qwen3-VL-8B + projector | Text-to-image and editing; pinned, checksum-verified downloads |
 | [`qwen-image-2.1-turbo.json`](qwen-image-2.1-turbo.json) | Qwen-Image-2.1-Turbo AD-Q4_K + the same VAE, Qwen3-VL-8B and projector | Text-to-image and editing in 8 steps; declares `"qwen-image-variant": "turbo"`; the companions keep their publishers' file names, so a base-model config pointed at the same folder and names downloads them once for both |
 | [`lora/qwen-image-2.1-*.json`](lora/) | Fourteen Qwen-Image-2.1 LoRA plug-ins (each downloads its weights; Fun-Acc also its `pdd_config.json`) | `--lora` plug-ins for Qwen-Image-2.1; Film Stills, Grainscape, Casual Phone Photo and Voxel Style also work with the official 8-step Turbo checkpoint; see [below](#qwen-image-21-lora-plug-ins-lora) |
+| [`lora/minimax-h3-fl2v-turbo-*.json`](lora/) | Two MiniMax-H3 FL2VA LoRA plug-ins (each downloads its 1.38 GB of weights) | `--lora` step-distillation plug-ins for the FL2VA checkpoint: LightX2V Turbo, 8 or 4 steps on a locked recipe; see [below](#minimax-h3-turbo-plug-ins) |
 | [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | MiniMax-H3 FL2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~35.5 GB) | **Video and 32 kHz stereo audio in one packed latent**; text-to-video, image-to-video, first/last frame |
 | [`minimax-h3-ref2va.json`](minimax-h3-ref2va.json) | MiniMax-H3 Ref2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~35.4 GB) | The same four networks, reference checkpoint: up to nine stills, clips and soundtracks |
 | [`wan-video-ti2v-5b-turbo.json`](wan-video-ti2v-5b-turbo.json) | Wan 2.2 TI2V-5B Turbo: DiT + video VAE + UMT5 (~12.9 GB) | Video only, 4-step distilled, text- **and** image-to-video |
@@ -373,10 +374,18 @@ credentials only to HTTPS `huggingface.co` requests; credentials are not sent to
 download mirrors or CDN redirects. The ordinary Gemma 4 model is not
 interchangeable with the dedicated LTX text encoder, which embeds its tokenizer.
 
-## Qwen-Image-2.1 LoRA plug-ins (`lora/`)
+<a id="qwen-image-21-lora-plug-ins-lora"></a>
+
+## LoRA plug-ins (`lora/`)
 
 The files in [`lora/`](lora/) are **not** host configs: they are LoRA plug-ins that
-you add to a Qwen-Image-2.1 run with `--lora`, on either host. Each one names its
+you add to a run with `--lora`, on either host. The fourteen `qwen-image-2.1-*` files
+are for Qwen-Image-2.1, and the two `minimax-h3-fl2v-turbo-*` files are for the
+MiniMax-H3 FL2VA checkpoint ([below](#minimax-h3-turbo-plug-ins)). A plug-in the
+startup model does not take is refused at startup, before the plug-in downloads; a model
+a `--config` still has to download is checked for its family right after that download.
+
+Each Qwen-Image-2.1 plug-in names its
 weights with a pinned URL and SHA-256 (the Fun-Acc bundle pins the `pdd_config.json`
 it forwards the same way), downloaded on first use to
 `$TENSORSHARP_MODELS/qwen-image-2.1/loras` (or `models/qwen-image-2.1/loras` in the
@@ -433,6 +442,53 @@ Notes:
 - The plug-in format (`"type": "qwen-image-2.1-lora"`, `weights`, `scale`,
   `sampling`, or a forwarded `config`) is described in
   [USAGE.md](../USAGE.md#qwen-image-21-lora-plug-ins).
+
+### MiniMax-H3 Turbo plug-ins
+
+The two `minimax-h3-fl2v-turbo-*` files are LightX2V's step-distillation LoRAs for the
+MiniMax-H3 **FL2VA** checkpoint (text-to-video, image-to-video and first/last frame),
+from [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/a29e57d195f80ead07c89f89e55ecf2911e893c5)
+under Apache-2.0. Each downloads its 1.38 GB `.safetensors` on first use, pinned to
+revision `a29e57d` and checked against its SHA-256, to
+`$TENSORSHARP_MODELS/minimax-h3/loras` (or `models/minimax-h3/loras` in the repository
+when the variable is unset):
+
+```bash
+TensorSharp.Cli --config config/minimax-h3-fl2va.json \
+  --lora config/lora/minimax-h3-fl2v-turbo-8step.json --prompt "…" --output clip.mp4
+
+TensorSharp.Server.Host --config config/minimax-h3-fl2va.json --lora config/lora/minimax-h3-fl2v-turbo-8step.json
+```
+
+| File | Plug-in |
+|------|---------|
+| [`minimax-h3-fl2v-turbo-8step.json`](lora/minimax-h3-fl2v-turbo-8step.json) | LightX2V Turbo 8-step (FL2V v1.0, 768p): 8 Euler steps on the publisher's recipe, video shift 6 / audio shift 3, CFG 1 |
+| [`minimax-h3-fl2v-turbo-4step.json`](lora/minimax-h3-fl2v-turbo-4step.json) | LightX2V Turbo 4-step (FL2V v1.2, 768p): 4 Euler steps at video shift 6 / audio shift 3, CFG 1. The publisher states no recipe for v1.2, so this one is **inferred** from its 4-step v1.0 row until it is validated |
+
+Notes:
+
+- **The recipe is locked, not a default.** Steps, flow shift, sampler and CFG come from
+  the plug-in. Leave `--diffusion-steps`, `--flow-shift`, `--sampler` and `--cfg` (CLI),
+  `--video-steps` (server) and a request's `steps`, `flowShift` and `sampler` unset, or
+  repeat the plug-in's values; anything else is refused, never overridden. Both hosts
+  check this before anything downloads, the files of a `--config` included.
+- **FL2VA only.** `minimax-h3-ref2va.json` refuses both files: Ref2VA Turbo is not
+  supported.
+- **One plug-in, as its config.** MiniMax-H3 takes one of these files, not the bare
+  `.safetensors`, because the config declares the checkpoint partition and the
+  sampling contract. `--lora-scale` must be ≥ 0: the schedule was distilled at
+  strength 1, and 0 keeps the adapter's terms with zero up factors.
+- **The format is strict** (`"type": "minimax-h3-lora"`, `weights`, `partition`,
+  `key_format`, `alpha`, `scale`, `sampling`): an unknown key, the Ref2VA partition,
+  or another schedule, sampler, audio shift or CFG is refused. See
+  [the MiniMax-H3 card](../docs/models/minimax-h3.md#turbo-plug-ins).
+- **Do not name a plug-in with a relative `"lora"` string in a preset.** A string
+  value is passed to `--lora` as written, so a relative path resolves against the
+  working directory, not against the preset's folder the way its file entries do:
+  `"lora": "lora/minimax-h3-fl2v-turbo-8step.json"` works only when the host starts
+  in `config/`. Pass `--lora` on the command line, as above, or write the entry as an
+  object, `"lora": { "path": "lora/minimax-h3-fl2v-turbo-8step.json" }`, which resolves
+  against the preset's folder. This holds for every plug-in in `lora/`.
 
 ## Agent configs
 
@@ -567,15 +623,24 @@ Notes:
   takes `--video-steps N` and has no `--cfg` at all; the CLI takes `--diffusion-steps N`
   and `--cfg`. A flag the server does not know is not ignored — it refuses to start —
   so a config carrying a CLI-only key would break `TensorSharp.Server.Host --config`. H3 is
-  CFG-distilled and enforces cfg 1.0 itself; its default is 20 steps, and 4-8 is the
-  fast operating point.
+  CFG-distilled and enforces cfg 1.0 itself; its default is 20 steps. For fewer steps,
+  add a [Turbo plug-in](#minimax-h3-turbo-plug-ins) to `minimax-h3-fl2va.json`
+  (`--lora config/lora/minimax-h3-fl2v-turbo-8step.json`, or the 4-step one), which
+  samples exactly the 8 or 4 steps it was distilled for.
 - **`video-frames` snaps to the `17k+5` grid** (5, 22, 39, 56, 73, 90 …), not Wan's
   `4k+1`, and fps is pinned to 24.
+- **`minimax-h3-fl2va.json` leaves the size to the model.** Text-to-video runs at
+  640×384; `--image` and `--end-image` take the canvas from the first keyframe by
+  MiniMax's released 768p recipe (1152×768 for a 3:2 photo, 1344×768 for 16:9), which
+  keeps a keyframe's faces from smearing at about 2.4-4.2× the video tokens per frame,
+  so those runs take several times longer. `minimax-h3-ref2va.json` pins 640×384, the
+  size references run at. `--width` and `--height` together (`--video-width` and
+  `--video-height` on the server) pin one size for every mode, keyframes included.
 - **References need the other checkpoint**, which now has its own file. FL2VA and Ref2VA
   are separate checkpoints rather than a setting: `minimax-h3-fl2va.json` refuses
   `--ref-image` and `minimax-h3-ref2va.json` refuses `--image` as a keyframe, and each
-  error names the other file. Only the `model` entry differs between the two configs, so
-  the text encoder and both VAEs are shared and will not download twice.
+  error names the other file. Only the `model` entry and the size pin differ between the
+  two configs, so the text encoder and both VAEs are shared and will not download twice.
 - **Ref2VA takes up to nine references in any mix** — `--ref-image` (a still),
   `--ref-video` (a clip, or a folder of frames), `--ref-audio` (a soundtrack), and
   `--ref-video-audio` to give the i-th `--ref-video` its own sound. Each takes its own

@@ -41,6 +41,8 @@
   "catalog.lora.objectRemover.purpose": "Removes what is inside red boxes drawn on an attached photo and fills in the background. It does not manage every photo, so check the result.",
   "catalog.lora.objectMover.purpose": "Moves the object in one red box drawn on an attached photo to the spot marked by a second red box.",
   "catalog.lora.animeConsistency.purpose": "Keeps an anime character the same when an attached picture is edited into a new pose, view or expression. Experimental.",
+  "catalog.lora.minimaxH3Turbo8Step.purpose": "Clips in 8 steps instead of 20, on the schedule it was distilled for. Trained at 768p for the first-and-last-frame checkpoint.",
+  "catalog.lora.minimaxH3Turbo4Step.purpose": "Clips in 4 steps instead of 20. Trained at 768p for the first-and-last-frame checkpoint. Its schedule is inferred: the publisher states none for this version.",
   "catalog.extended.gemmaLarge.notes": "Vision and the matching MTP draft head are optional downloads. Gemma DSpark/DFlash drafts are not supported. Catalog metadata is verified; TensorAgent inference is not yet validated.",
   "catalog.extended.qwen35Large.notes": "Hybrid mixture of experts with an optional vision projector. Catalog metadata is verified; TensorAgent inference is not yet validated.",
   "catalog.extended.qwen36Large.notes": "Vision is optional. The embedded NextN head needs no extra download; the app defaults to n-gram speculative decoding. Catalog metadata is verified; TensorAgent inference is not yet validated.",

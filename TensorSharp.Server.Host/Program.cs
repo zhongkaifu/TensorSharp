@@ -34,12 +34,17 @@ Console.OutputEncoding = System.Text.Encoding.UTF8;
 // single-valued option the command line (or a later file) sets is dropped from
 // the earlier file before it is resolved or downloaded, so the command line wins
 // whatever an option reader does with repeats (every option pass below is
-// last-one-wins as well). The --config flag itself is stripped here.
+// last-one-wins as well). The --config flag itself is stripped here. The LoRA
+// preflight sees the expansion first, so a plug-in the model refuses, or a
+// --video-steps a plug-in's recipe contradicts, stops startup before any of the
+// configuration's files is downloaded.
 try
 {
-    args = ConfigFileArgs.Expand(args);
+    args = ConfigFileArgs.Expand(args, preview => LoraHostPreflight.CheckPreview(preview, LoraHost.Server));
 }
-catch (Exception ex) when (ex is ArgumentException or FileNotFoundException or NotSupportedException)
+// IOException covers a referenced file that is missing (FileNotFoundException) and one
+// that could not be downloaded from any of its URLs.
+catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException)
 {
     Console.Error.WriteLine("Configuration error: " + ex.Message);
     Environment.ExitCode = HostExitCodes.ConfigurationError;
@@ -205,9 +210,12 @@ try
     // Translate --qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj into the
     // TS_QWEN_IMAGE_* env vars QwenImageModel reads to locate the Qwen-Image-2.1 VAE,
     // Qwen3-VL-8B text encoder and mmproj, --qwen-image-variant into TS_QWEN_IMAGE_VARIANT,
-    // and --lora / --lora-scale / --lora-config into TS_LORAS. Must run before the startup
-    // model is loaded.
-    qwenImageFlagsApplied = ServerOptionsBuilder.ApplyQwenImageCompanionCliFlags(args);
+    // and --lora / --lora-scale / --lora-config into TS_LORAS, after the LoRA preflight has
+    // checked them against the startup model and --video-steps. Must run before the startup
+    // model is loaded. The preflight's warnings about inherited plug-ins are dropped: the
+    // model lifecycle says them when it loads.
+    qwenImageFlagsApplied = ServerOptionsBuilder.ApplyQwenImageCompanionCliFlags(args,
+        hostingOptions.DefaultVideoSteps, hostingOptions.StartupModelPath, envWarnings: null);
     // Translate --kv-cache-dtype into the process-wide KvCacheDtypeConfig (or honor
     // the KV_CACHE_DTYPE env var) so block-quantized / half-precision KV caches are
     // selectable on the server, mirroring the CLI. The fused native decode path used
@@ -386,6 +394,8 @@ builder.Services.AddTensorSharpRequestLogging(options =>
 
 // One adapter per protocol; instances are stateless and free to share between requests.
 builder.Services.AddSingleton<WebUiAdapter>();
+builder.Services.AddVideoStudio(Environment.GetEnvironmentVariable("TS_STUDIO_DIRECTORY")
+    ?? Path.Combine(baseDirectory, "studio-projects"));
 builder.Services.AddSingleton<OllamaAdapter>();
 builder.Services.AddSingleton<OpenAIChatAdapter>();
 // Responses API store: use Redis when TS_RESPONSES_STORE_REDIS_URL is set,
@@ -499,7 +509,7 @@ if (qwenImageFlagsApplied)
     var loras = TensorSharp.Runtime.LoraCliFlags.FromJson(Environment.GetEnvironmentVariable(TensorSharp.Runtime.LoraCliFlags.EnvironmentVariable));
     if (loras.Count > 0)
         startupLogger.LogInformation(LogEventIds.HostConfiguration,
-            "LoRA plug-ins (applied to Qwen-Image-2.1 models only): {Loras}", TensorSharp.Runtime.LoraCliFlags.Describe(loras));
+            "LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): {Loras}", TensorSharp.Runtime.LoraCliFlags.Describe(loras));
 }
 
 if (hostingOptions.UploadMaxFileBytes != UploadStoragePolicy.DefaultMaxFileBytes
@@ -627,6 +637,9 @@ if (hostingOptions.SkillsEnabled)
 if (codeExecOptions.Enabled)
     app.MapCodeArtifactEndpoints();
 app.MapWebUiEndpoints();
+app.MapVideoStudio();
+// Instantiate the shared owner before chat requests can bind Studio tools.
+_ = app.Services.GetRequiredService<TensorSharp.Studio.StudioService>();
 app.MapOllamaEndpoints();
 app.MapOpenAIEndpoints();
 

@@ -32,13 +32,21 @@ namespace TensorSharp.Models.Video
         /// default, or the conditioning image's aspect for image-to-video.</summary>
         public int Height { get; set; }
 
+        /// <summary>How the canvas is sized from a keyframe when <see cref="Width"/> and
+        /// <see cref="Height"/> are both 0. A host chooses this, not a request: it trades
+        /// keyframe detail against time and memory. Models without keyframe sizing ignore it.</summary>
+        public VideoCanvasPolicy CanvasPolicy { get; set; }
+
         /// <summary>Number of output frames, snapped to the model's temporal grid (4k+1 for
         /// Wan, 17k+5 for MiniMax-H3). 0 = the model's default. 1 = a still image, where
         /// the model supports it.</summary>
         public int Frames { get; set; }
 
         /// <summary>Denoising steps. 0 = the model's default (30 for Wan 2.1, 40 for
-        /// Wan2.2-A14B, 50 for Wan2.2-TI2V; step-distilled checkpoints use far fewer).</summary>
+        /// Wan2.2-A14B, 50 for Wan2.2-TI2V, 20 for MiniMax-H3; step-distilled checkpoints use
+        /// far fewer). A step-distillation LoRA plug-in fixes the count (8 or 4 for MiniMax-H3's
+        /// Turbo plug-ins, <see cref="IVideoGenerationModel.SamplingContract"/>): leave it 0 or
+        /// pass that count; any other value is refused.</summary>
         public int Steps { get; set; }
 
         /// <summary>Classifier-free guidance scale. 0 = the model's default; 1.0 disables the
@@ -55,14 +63,18 @@ namespace TensorSharp.Models.Video
 
         /// <summary>FlowMatch timestep shift. 0 = the model's default (Wan 2.1's 3.0/5.0/8.0
         /// recipe, 5.0 or 12.0 for Wan 2.2, 12.0 for MiniMax-H3's video stream). On models
-        /// with a separate audio stream this shifts the video stream only.</summary>
+        /// with a separate audio stream this shifts the video stream only. A LoRA plug-in's
+        /// sampling recipe fixes it (6.0 under MiniMax-H3's Turbo plug-ins): leave it 0 or pass
+        /// that value; any other value is refused.</summary>
         public float FlowShift { get; set; }
 
         /// <summary>Negative prompt; null = the model's default negative prompt. Unused when
         /// the guidance scale is 1.0, since no negative pass runs.</summary>
         public string NegativePrompt { get; set; }
 
-        /// <summary>Sampler name, e.g. "unipc", "euler" or LTX 2.5's "euler_ancestral". null = the model's default.</summary>
+        /// <summary>Sampler name, e.g. "unipc", "euler" or LTX 2.5's "euler_ancestral". null = the model's default.
+        /// A LoRA plug-in's sampling recipe fixes it (Euler under MiniMax-H3's Turbo plug-ins): leave it null
+        /// or pass that sampler; any other is refused.</summary>
         public string Sampler { get; set; }
 
         /// <summary>Playback frame rate for the saved video. 0 = the model's default. Models
@@ -81,8 +93,10 @@ namespace TensorSharp.Models.Video
         public string ImagePath { get; set; }
 
         /// <summary>Last-frame conditioning image, on models that accept one (LTX or
-        /// MiniMax-H3). Combined with <see cref="Image"/> the generation is
-        /// steered to start and end on the two supplied frames.</summary>
+        /// MiniMax-H3 FL2VA). Alone it pins only the last frame; combined with
+        /// <see cref="Image"/> the generation is steered to start and end on the two
+        /// supplied frames. A missing frame is never replaced by a blank image. Wan
+        /// refuses it.</summary>
         public RgbImage EndImage { get; set; }
 
         /// <summary>Last-frame conditioning image as a file path.</summary>
@@ -114,7 +128,8 @@ namespace TensorSharp.Models.Video
         /// <summary>How to interpret the supplied images, for models that offer more
         /// than one conditioning mode. null = infer from what was supplied.
         /// <para>MiniMax-H3 accepts: <c>t2v</c> (text only), <c>i2v</c> (the image is
-        /// the FIRST FRAME and is animated), <c>fl2v</c> (first and last frame), and
+        /// the FIRST FRAME and is animated), <c>fl2v</c> (the last frame, optionally with
+        /// the first frame), and
         /// <c>ref</c> (the images are identity/appearance references for a new scene,
         /// not the first frame).</para>
         /// <para>The distinction matters: "animate this photo" is <c>i2v</c>, while
@@ -176,6 +191,28 @@ namespace TensorSharp.Models.Video
             if (!string.IsNullOrWhiteSpace(EndImagePath)) return QwenImage.ImageIO.Load(EndImagePath);
             return null;
         }
+    }
+
+    /// <summary>How an image-anchored video model sizes its canvas when the request gives
+    /// no width or height.
+    ///
+    /// <para>First- and last-frame modes keep the keyframe's framing, so the canvas decides
+    /// how many pixels a face or a hand in that frame gets. MiniMax-H3's video VAE downsamples
+    /// 16x in each direction: a full-body photo fitted to 640x384 leaves a face about 60 px
+    /// tall, and an encode then decode alone already smears it, so no number of denoising
+    /// steps can bring it back. The same photo survives at MiniMax's released 768-pixel
+    /// recipe.</para></summary>
+    public enum VideoCanvasPolicy
+    {
+        /// <summary>The model's released recipe. MiniMax-H3 i2v/fl2v: the first keyframe's
+        /// aspect at a 768-pixel short edge
+        /// (<see cref="MiniMaxH3.MiniMaxH3Geometry.KeyframeCanvas"/>).</summary>
+        ModelRecipe = 0,
+
+        /// <summary>A smaller canvas for hosts whose memory or time budget has not been
+        /// measured at the recipe size. MiniMax-H3 i2v/fl2v: a 640x384 area at the
+        /// keyframe's aspect. Faces that are small in the keyframe do not survive it.</summary>
+        CompactPreview = 1,
     }
 
     /// <summary>A temporal image guide, with strength in [0,1].</summary>

@@ -22,6 +22,7 @@ namespace TensorSharp.Models.QwenImage
             Factory = c => new QwenImageModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
             SupportsDistributedTensorParallel = false,
             DetectFromTensors = LooksLikeVersion21,
+            LoraPluginType = LoraCliFlags.QwenImagePluginType,
         };
 
         /// <summary>

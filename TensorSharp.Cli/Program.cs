@@ -45,17 +45,23 @@ namespace TensorSharp.Cli
             // argv. File-derived tokens are spliced in ahead of the real command
             // line, and a single-valued option the command line (or a later file)
             // sets is dropped from the earlier file before it is resolved, so the
-            // command line wins without the file's download ever running.
+            // command line wins without the file's download ever running. The LoRA
+            // preflight sees the expansion first, so a plug-in the model refuses, or a
+            // sampling flag a plug-in's recipe contradicts, stops startup before any of
+            // the configuration's files is downloaded.
             try
             {
-                args = ConfigFileArgs.Expand(args);
+                args = ConfigFileArgs.Expand(args,
+                    preview => TensorSharp.Models.LoraHostPreflight.CheckPreview(preview, TensorSharp.Models.LoraHost.Cli));
                 // The switch in MainCore matches the exact lower-case spaced spelling only,
                 // while the server, the shared parsers and the --config override all take
                 // --flag=value in any case. Normalising here makes every documented option
                 // mean the same thing on both hosts, instead of being silently dropped.
                 args = CliUsage.NormalizeOptionSpellings(args);
             }
-            catch (Exception ex) when (ex is ArgumentException or FileNotFoundException or NotSupportedException)
+            // IOException covers a referenced file that is missing (FileNotFoundException) and
+            // one that could not be downloaded from any of its URLs.
+            catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException)
             {
                 Console.Error.WriteLine("Configuration error: " + ex.Message);
                 Environment.ExitCode = HostExitCodes.ConfigurationError;
@@ -832,24 +838,38 @@ namespace TensorSharp.Cli
                     QwenImageVariantFlag.Name(variant));
             }
 
-            // LoRA plug-ins apply to Qwen-Image-2.1's transformer only. Probe the file's
-            // architecture first, so a text or video model is refused before a plug-in
-            // downloads its weights or the model loads, and nothing is applied silently.
-            // The variant declaration is checked the same way: it means nothing to another model.
+            // LoRA plug-ins apply to the models that take them (Qwen-Image-2.1, MiniMax-H3
+            // FL2VA), each only its own family's. The shared preflight probes the file's
+            // architecture first, so a text model, a foreign plug-in or a sampling flag a
+            // MiniMax-H3 plug-in's recipe contradicts is refused before a plug-in downloads
+            // its weights or the model loads, and nothing is applied silently. TS_LORAS counts
+            // only when the command line names no plug-in (it is replaced below); its entries
+            // the model will skip are named in a warning. The variant declaration is checked
+            // against the same probe: it means nothing to another model.
             string declaredVariant = Environment.GetEnvironmentVariable(QwenImageVariantFlag.EnvironmentVariable);
-            if (loraSpecs.Count > 0 || !string.IsNullOrWhiteSpace(declaredVariant) ||
-                !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(LoraCliFlags.EnvironmentVariable)))
+            string inheritedLoras = Environment.GetEnvironmentVariable(LoraCliFlags.EnvironmentVariable);
+            if (loraSpecs.Count > 0 || !string.IsNullOrWhiteSpace(declaredVariant) || !string.IsNullOrWhiteSpace(inheritedLoras))
             {
-                string loraArchitecture = null;
+                TensorSharp.Models.LoraHostVerdict loraVerdict;
                 try
                 {
-                    using var probe = new GgufFile(modelPath);
-                    loraArchitecture = ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe).Id;
+                    var envLoraSpecs = loraSpecs.Count == 0 ? LoraCliFlags.FromJson(inheritedLoras) : new List<LoraSpec>();
+                    loraVerdict = TensorSharp.Models.LoraHostPreflight.Check(new TensorSharp.Models.LoraHostRequest(
+                        TensorSharp.Models.LoraHost.Cli, loraSpecs, envLoraSpecs, modelPath,
+                        TensorSharp.Models.LoraHostPreflight.CliSampling(diffusionStepsSet ? diffusionSteps : 0, flowShift,
+                            cfgScaleSet ? cfgScale : 0f, videoSampler)));
                 }
-                catch (Exception)
+                catch (Exception ex) when (ex is ArgumentException or IOException)
                 {
-                    // An unreadable or unknown model file is reported by the load itself.
+                    // A plug-in the model does not take, a contradicted recipe, a missing file.
+                    Console.Error.WriteLine("Configuration error: " + ex.Message);
+                    Environment.ExitCode = HostExitCodes.ConfigurationError;
+                    return;
                 }
+                foreach (string warning in loraVerdict.EnvWarnings)
+                    _log.LogWarning(LogEventIds.HostConfiguration, "{Warning}", warning);
+
+                string loraArchitecture = loraVerdict.Architecture?.Id;
                 if (loraArchitecture != null && loraArchitecture != "qwen_image")
                 {
                     if (qwenImageVariant != null)
@@ -859,23 +879,12 @@ namespace TensorSharp.Cli
                         Environment.ExitCode = HostExitCodes.ConfigurationError;
                         return;
                     }
-                    if (loraSpecs.Count > 0)
-                    {
-                        Console.Error.WriteLine($"Configuration error: {LoraCliFlags.LoraFlag} applies to Qwen-Image-2.1 models only; " +
-                            $"'{Path.GetFileName(modelPath)}' ({loraArchitecture}) does not take LoRA plug-ins.");
-                        Environment.ExitCode = HostExitCodes.ConfigurationError;
-                        return;
-                    }
-                    if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(LoraCliFlags.EnvironmentVariable)))
-                        _log.LogWarning(LogEventIds.HostConfiguration,
-                            "{EnvVar} names LoRA plug-ins, but {Model} ({Architecture}) does not take them; it runs without them.",
-                            LoraCliFlags.EnvironmentVariable, Path.GetFileName(modelPath), loraArchitecture);
                     if (!string.IsNullOrWhiteSpace(declaredVariant))
                         _log.LogWarning(LogEventIds.HostConfiguration,
                             "{EnvVar} ({Variant}) declares a Qwen-Image-2.1 checkpoint, but {Model} ({Architecture}) is not one; it ignores it.",
                             QwenImageVariantFlag.EnvironmentVariable, declaredVariant.Trim(), Path.GetFileName(modelPath), loraArchitecture);
                 }
-                else if (loraSpecs.Count > 0)
+                if (loraSpecs.Count > 0)
                 {
                     try
                     {

@@ -729,7 +729,26 @@ public static class ServerOptionsBuilder
     /// Returns true when at least one flag was applied so the caller can emit a
     /// startup-log line.
     /// </summary>
-    public static bool ApplyQwenImageCompanionCliFlags(string[] args)
+    public static bool ApplyQwenImageCompanionCliFlags(string[] args) =>
+        ApplyQwenImageCompanionCliFlags(args, defaultVideoSteps: 0, startupModelPath: null, envWarnings: null);
+
+    /// <summary>
+    /// <see cref="ApplyQwenImageCompanionCliFlags(string[])"/> with the LoRA preflight the
+    /// CLI runs too (<see cref="TensorSharp.Models.LoraHostPreflight"/>), before any plug-in is
+    /// resolved or downloaded: the command line's <c>--lora</c> specs (or, when it names none,
+    /// the inherited <c>TS_LORAS</c>) against the family of the startup model, and a MiniMax-H3
+    /// plug-in's locked step count against <paramref name="defaultVideoSteps"/>
+    /// (<c>--video-steps</c>; 0 when not given). Requests name their own flow shift, guidance
+    /// and sampler, which the model checks per request.
+    /// </summary>
+    /// <param name="startupModelPath">The model the server hosts, or null when none is known
+    /// (only the MiniMax-H3 plug-ins' own checks then run).</param>
+    /// <param name="envWarnings">Receives the warnings for inherited plug-ins the model will
+    /// skip, or null to drop them: the server's model lifecycle says them when it loads.</param>
+    /// <exception cref="ArgumentException">A malformed value, or a plug-in the preflight refuses.</exception>
+    /// <exception cref="IOException">A missing file, or a plug-in download that failed.</exception>
+    public static bool ApplyQwenImageCompanionCliFlags(string[] args, int defaultVideoSteps, string? startupModelPath,
+        ICollection<string>? envWarnings)
     {
         if (args == null || args.Length == 0)
             return false;
@@ -831,10 +850,27 @@ public static class ServerOptionsBuilder
                 continue;
             }
         }
-        // LoRA plug-ins for the Qwen-Image-2.1 transformer, in one ordered pass of their
-        // own: --lora-scale and --lora-config bind to the --lora before them. The files
-        // are checked now, so a typo fails at startup rather than on the first request.
-        var loras = LoraCliFlags.Resolve(LoraCliFlags.Parse(args));
+        // LoRA plug-ins for the Qwen-Image-2.1 and MiniMax-H3 transformers, in one ordered
+        // pass of their own: --lora-scale and --lora-config bind to the --lora before them.
+        // The files are checked now, so a typo fails at startup rather than on the first
+        // request, and the preflight runs before Resolve, so a plug-in the hosted model
+        // refuses (or one whose recipe --video-steps contradicts) is never downloaded.
+        var flagLoras = LoraCliFlags.Parse(args);
+        var inheritedLoras = flagLoras.Count == 0
+            ? LoraCliFlags.FromJson(Environment.GetEnvironmentVariable(LoraCliFlags.EnvironmentVariable))
+            : new List<LoraSpec>();
+        if (flagLoras.Count > 0 || inheritedLoras.Count > 0)
+        {
+            var verdict = TensorSharp.Models.LoraHostPreflight.Check(new TensorSharp.Models.LoraHostRequest(
+                TensorSharp.Models.LoraHost.Server, flagLoras, inheritedLoras, startupModelPath,
+                TensorSharp.Models.LoraHostPreflight.ServerSampling(defaultVideoSteps)));
+            if (envWarnings != null)
+            {
+                foreach (string warning in verdict.EnvWarnings)
+                    envWarnings.Add(warning);
+            }
+        }
+        var loras = LoraCliFlags.Resolve(flagLoras);
         if (loras.Count > 0)
         {
             Environment.SetEnvironmentVariable(LoraCliFlags.EnvironmentVariable, LoraCliFlags.ToJson(loras));

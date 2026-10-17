@@ -51,7 +51,52 @@ namespace TensorSharp.Models.MiniMaxH3
         // Snapshot its bytes because callers may reuse and mutate their buffer.
         private float[] _cachedTextHidden;
         private Tensor _cachedTextTokens;
+        // The refiner blocks carry LoRA updates too, so the cached tokens belong to the
+        // plug-in they were refined with as much as to the prompt.
+        private MiniMaxH3LoraSet _cachedTextLora;
+        // The LoRA plug-in applied unmerged (a direct-mode MiniMaxH3LoraSet), null for none.
+        private LoraState _lora;
         private bool _disposed;
+
+        /// <summary>
+        /// One block's LoRA terms as exact F32 linears: down [rank, in], and up [out, rank]
+        /// with strength * alpha / rank folded in and fc1's halves already in [gate | value]
+        /// order (MiniMaxH3LoraSet.ReadFactors). q, k and v read one input, so their downs are
+        /// stacked into one projection whose output each part's up reads at its own offset.
+        /// </summary>
+        private sealed class BlockLora
+        {
+            public DirectLinear QkvDown;
+            public readonly DirectLinear[] QkvUp = new DirectLinear[3];
+            public readonly int[] QkvOffset = new int[3], QkvRank = new int[3];
+            public DirectLinear OutDown, OutUp, Fc1Down, Fc1Up, Fc2Down, Fc2Up;
+        }
+
+        /// <summary>A block the plug-in leaves alone, so it is not looked up again.</summary>
+        private static readonly BlockLora NoBlockLora = new();
+
+        /// <summary>
+        /// The factors of one plug-in, in a context of their own so a set change or a residency
+        /// release drops them without touching the checkpoint's weights. Blocks are built the
+        /// first time a forward reaches them - inside <see cref="Forward"/>, so on MLX the arrays
+        /// are created on its worker - and kept for the steps that follow.
+        /// </summary>
+        private sealed class LoraState : IDisposable
+        {
+            public readonly MiniMaxH3LoraSet Set;
+            public readonly DirectContext Context;
+            public readonly BlockLora[] Trunk, Refiner;
+
+            public LoraState(MiniMaxH3LoraSet set, IAllocator allocator, int blocks, int refinerBlocks)
+            {
+                Set = set;
+                Context = new DirectContext(allocator);
+                Trunk = new BlockLora[blocks];
+                Refiner = new BlockLora[refinerBlocks];
+            }
+
+            public void Dispose() => Context.Dispose();
+        }
 
         // Explicit diagnostic boundary snapshots. Device synchronization and
         // downloads occur only when this evidence directory is requested.
@@ -206,7 +251,8 @@ namespace TensorSharp.Models.MiniMaxH3
             }
         }
 
-        private Tensor Attention(Tensor h, BlockW w, int seq, float[] cos, float[] sin, bool applyRope = true)
+        private Tensor Attention(Tensor h, BlockW w, int seq, float[] cos, float[] sin, bool applyRope = true,
+                                 BlockLora lora = null)
         {
             int heads = _cfg.NumAttentionHeads, hd = _cfg.AttentionHeadDim;
             int inner = _cfg.AttentionInnerDim, rot = _cfg.RopeRotaryDim;
@@ -223,6 +269,10 @@ namespace TensorSharp.Models.MiniMaxH3
 
             try
             {
+                // LoRA updates land on q/k/v before the q/k norm and RoPE, where the
+                // reference's to_q/to_k/to_v adapters put them (transformer_minimax_h3.py).
+                if (lora?.QkvDown != null) AddQkvLora(lora, h, q, k, v);
+
                 // q/k RMS norm is per HEAD, over the head dim.
                 if (w.QNorm != null) q = NormHeads(q, w.QNorm, seq, heads, hd);
                 if (w.KNorm != null) k = NormHeads(k, w.KNorm, seq, heads, hd);
@@ -234,7 +284,14 @@ namespace TensorSharp.Models.MiniMaxH3
                 }
 
                 using Tensor merged = DirectOps.Attention(_ctx, q, k, v, heads, hd, scale);
-                return w.Out.Forward(merged);
+                Tensor o = w.Out.Forward(merged);
+                if (lora?.OutDown == null) return o;
+                try
+                {
+                    AddLora(lora.OutDown, lora.OutUp, merged, o);
+                    return o;
+                }
+                catch { o.Dispose(); throw; }
             }
             finally
             {
@@ -253,12 +310,120 @@ namespace TensorSharp.Models.MiniMaxH3
         }
 
         /// <summary>SwiGLU with the gate first: fc1 emits [gate | value].</summary>
-        private Tensor Mlp(Tensor h, BlockW w)
+        private Tensor Mlp(Tensor h, BlockW w, BlockLora lora = null)
         {
             int ffn = _cfg.FfnHiddenSize;
             using Tensor gv = w.Fc1.Forward(h);
+            // fc1's update is already in [gate | value] order, so it joins gv before the SwiGLU.
+            if (lora?.Fc1Down != null) AddLora(lora.Fc1Down, lora.Fc1Up, h, gv);
             using Tensor act = ActivateMlp(_ctx, gv, ffn);
-            return w.Fc2.Forward(act);
+            Tensor y = w.Fc2.Forward(act);
+            if (lora?.Fc2Down == null) return y;
+            try
+            {
+                AddLora(lora.Fc2Down, lora.Fc2Up, act, y);
+                return y;
+            }
+            catch { y.Dispose(); throw; }
+        }
+
+        // ---- LoRA plug-in ----------------------------------------------------
+
+        /// <summary>y += up(down(x)), in place: the unmerged update of one projection.</summary>
+        private static void AddLora(DirectLinear down, DirectLinear up, Tensor x, Tensor y)
+        {
+            using Tensor low = down.Forward(x);
+            using Tensor delta = up.Forward(low);
+            Ops.Add(y, y, delta);
+        }
+
+        /// <summary>q/k/v += their updates: one stacked shrink of <paramref name="h"/>, then
+        /// each part's up over its own columns of it.</summary>
+        private static void AddQkvLora(BlockLora lora, Tensor h, Tensor q, Tensor k, Tensor v)
+        {
+            using Tensor low = lora.QkvDown.Forward(h);   // [seq, sum of the q/k/v ranks]
+            Tensor[] parts = { q, k, v };
+            for (int i = 0; i < 3; i++)
+            {
+                if (lora.QkvUp[i] == null) continue;
+                using Tensor slice = Cols(low, lora.QkvOffset[i], lora.QkvRank[i]);
+                using Tensor delta = lora.QkvUp[i].Forward(slice);
+                Ops.Add(parts[i], parts[i], delta);
+            }
+        }
+
+        /// <summary>Apply <paramref name="lora"/> from the next block on. A different set, or
+        /// none, drops the previous one's factors and the text it refined.</summary>
+        private void UseLora(MiniMaxH3LoraSet lora)
+        {
+            if (ReferenceEquals(_lora?.Set, lora)) return;
+            ReleaseLora();
+            ClearTextCache();
+            if (lora != null) _lora = new LoraState(lora, _ctx.Allocator, _blocks.Length, _refiner.Length);
+        }
+
+        /// <summary>Drop the plug-in's built factors; a later forward rebuilds them from the set.</summary>
+        internal void ReleaseLora()
+        {
+            _lora?.Dispose();
+            _lora = null;
+        }
+
+        /// <summary>The block's terms, built on first use; null when the plug-in has none there.</summary>
+        private BlockLora LoraFor(bool refiner, int block)
+        {
+            if (_lora == null) return null;
+            BlockLora[] built = refiner ? _lora.Refiner : _lora.Trunk;
+            built[block] ??= BuildBlockLora(refiner, block);
+            return ReferenceEquals(built[block], NoBlockLora) ? null : built[block];
+        }
+
+        private BlockLora BuildBlockLora(bool refiner, int block)
+        {
+            MiniMaxH3LoraSet set = _lora.Set;
+            DirectContext ctx = _lora.Context;
+            // down [rank, in] is ggml [ne0 = in, ne1 = rank]; up [out, rank] is [ne0 = rank, ne1 = out].
+            // The factors never change once built, so on MLX they go straight into device arrays
+            // with no host copy kept beside them (that copy would be another 2.77 GB for the 8-step adapter).
+            DirectLinear Linear(float[] w, long input, long output) =>
+                DirectLinear.FromFloats(ctx, w, input, output, null, exactFloat32: true, mlxDeviceOnly: ctx.IsMlx);
+
+            var b = new BlockLora();
+            bool any = false;
+            var qkv = new (float[] Down, float[] Up, int Rank, long In, long Out)?[3];
+            int stacked = 0;
+            long width = 0;
+            for (int i = 0; i < 3; i++)
+            {
+                qkv[i] = set.ReadFactors(refiner, block, (MiniMaxH3LoraTarget)i);
+                if (qkv[i] is not { } f) continue;
+                b.QkvOffset[i] = stacked;
+                b.QkvRank[i] = f.Rank;
+                stacked += f.Rank;
+                width = f.In;
+            }
+            if (stacked > 0)
+            {
+                var down = new float[(long)stacked * width];
+                for (int i = 0; i < 3; i++)
+                {
+                    if (qkv[i] is not { } f) continue;
+                    Array.Copy(f.Down, 0, down, (long)b.QkvOffset[i] * width, (long)f.Rank * width);
+                    b.QkvUp[i] = Linear(f.Up, f.Rank, f.Out);
+                }
+                b.QkvDown = Linear(down, width, stacked);
+                any = true;
+            }
+            (DirectLinear Down, DirectLinear Up) Pair(MiniMaxH3LoraTarget t)
+            {
+                if (set.ReadFactors(refiner, block, t) is not { } f) return (null, null);
+                any = true;
+                return (Linear(f.Down, f.In, f.Rank), Linear(f.Up, f.Rank, f.Out));
+            }
+            (b.OutDown, b.OutUp) = Pair(MiniMaxH3LoraTarget.Out);
+            (b.Fc1Down, b.Fc1Up) = Pair(MiniMaxH3LoraTarget.Fc1);
+            (b.Fc2Down, b.Fc2Up) = Pair(MiniMaxH3LoraTarget.Fc2);
+            return any ? b : NoBlockLora;
         }
 
         internal static Tensor ActivateMlp(DirectContext context, Tensor gv, int ffn, bool fuseAccelerated = true)
@@ -314,6 +479,7 @@ namespace TensorSharp.Models.MiniMaxH3
             _cachedTextTokens?.Dispose();
             _cachedTextTokens = null;
             _cachedTextHidden = null;
+            _cachedTextLora = null;
         }
 
         // The returned reference is borrowed storage with its own lifetime. The
@@ -327,7 +493,7 @@ namespace TensorSharp.Models.MiniMaxH3
             // Trace mode deliberately executes every boundary, including the
             // intermediate refiner blocks that are absent from the final cache.
             bool cache = string.IsNullOrEmpty(TraceDirectory);
-            if (cache && _cachedTextTokens != null &&
+            if (cache && _cachedTextTokens != null && ReferenceEquals(_cachedTextLora, _lora?.Set) &&
                 MemoryMarshal.AsBytes(textHidden.AsSpan()).SequenceEqual(
                     MemoryMarshal.AsBytes(_cachedTextHidden.AsSpan())))
                 return _cachedTextTokens.CopyRef();
@@ -345,11 +511,12 @@ namespace TensorSharp.Models.MiniMaxH3
                 int refinerIndex = 0;
                 foreach (var rw in _refiner)
                 {
+                    BlockLora rl = LoraFor(refiner: true, refinerIndex);
                     using (Tensor n1 = DirectOps.RmsNorm(_ctx, ctxTok, rw.Norm1, _cfg.NormEps))
-                    using (Tensor a = Attention(n1, rw, textCount, null, null, applyRope: false))
+                    using (Tensor a = Attention(n1, rw, textCount, null, null, applyRope: false, rl))
                         Ops.Add(ctxTok, ctxTok, a);
                     using (Tensor n2 = DirectOps.RmsNorm(_ctx, ctxTok, rw.Norm2, _cfg.NormEps))
-                    using (Tensor m = Mlp(n2, rw))
+                    using (Tensor m = Mlp(n2, rw, rl))
                         Ops.Add(ctxTok, ctxTok, m);
                     Trace("refiner-" + refinerIndex++, ctxTok);
                 }
@@ -366,6 +533,7 @@ namespace TensorSharp.Models.MiniMaxH3
                     return result;
                 }
                 _cachedTextHidden = (float[])textHidden.Clone();
+                _cachedTextLora = _lora?.Set;
                 _cachedTextTokens = ctxTok;
                 ctxTok = null;
                 return _cachedTextTokens.CopyRef();
@@ -378,7 +546,9 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <summary>
         /// One diffusion step over the packed sequence. The inputs are exactly the
         /// buffers the native descriptor is handed, so the two paths can be
-        /// compared step for step.
+        /// compared step for step. <paramref name="lora"/> (a direct-mode set, or null)
+        /// adds its unmerged updates to the trunk and token-refiner blocks, as the
+        /// native graph does with the set's packed factors.
         /// </summary>
         public (float[] Video, float[] Audio) Forward(
             float[] videoInput, int conditionCount, int videoCount,
@@ -392,10 +562,11 @@ namespace TensorSharp.Models.MiniMaxH3
             int nTok, int audioStart, int videoStart,
             int audioCol, int videoCol,
             float videoScale, float audioScale,
-            int numBlocks)
+            int numBlocks, MiniMaxH3LoraSet lora = null)
         {
             int hidden = _cfg.HiddenSize;
             float eps = _cfg.NormEps;
+            UseLora(lora);
 
             using Tensor temb = _ctx.FromFloats(timeEmbed, nTimesteps, _cfg.TimeEmbedDim);
             Trace("time-embed", timeEmbed);
@@ -495,6 +666,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 for (int l = 0; l < nl; l++)
                 {
                     BlockW bw = _blocks[l];
+                    BlockLora bl = LoraFor(refiner: false, l);
                     // No SiLU: the curve-table variant feeds the interpolated
                     // embedding straight into the projection.
                     using Tensor modsRaw = bw.AdaLn.Forward(temb);          // [nts, 18*hidden]
@@ -504,13 +676,13 @@ namespace TensorSharp.Models.MiniMaxH3
                     using (Tensor h = DirectOps.RmsNorm(_ctx, x, bw.Norm1, eps))
                     {
                         Modulate(h, mods, segments, 0, 1);
-                        using Tensor a = Attention(h, bw, nTok, cos, sin);
+                        using Tensor a = Attention(h, bw, nTok, cos, sin, lora: bl);
                         GatedResidual(x, a, mods, segments, 2);
                     }
                     using (Tensor h = DirectOps.RmsNorm(_ctx, x, bw.Norm2, eps))
                     {
                         Modulate(h, mods, segments, 3, 4);
-                        using Tensor m = Mlp(h, bw);
+                        using Tensor m = Mlp(h, bw, bl);
                         GatedResidual(x, m, mods, segments, 5);
                     }
                     Trace("block-" + l, x);
@@ -563,6 +735,8 @@ namespace TensorSharp.Models.MiniMaxH3
         {
             if (_disposed) return;
             ClearTextCache();
+            // The plug-in's factors are the DiT's to rebuild, from the set, on the next forward.
+            ReleaseLora();
             _ctx.ReleaseDeviceResidency();
         }
 
@@ -571,6 +745,7 @@ namespace TensorSharp.Models.MiniMaxH3
             if (_disposed) return;
             _disposed = true;
             ClearTextCache();
+            ReleaseLora();
             foreach (var l in _owned) l.Dispose();
             _owned.Clear();
             _tensorOps.Dispose();

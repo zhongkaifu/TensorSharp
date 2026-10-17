@@ -15,9 +15,16 @@
 // Note the checkpoints carry NO GGUF metadata, so this model is identified by the
 // joint presence of video_patch_proj and audio_patch_proj rather than by an
 // architecture string, and the tokenizer has to come from separate vocab files.
+//
+// LoRA plug-ins (--lora / TS_LORAS) are minimax-h3-lora configs: the LightX2V Turbo
+// step-distillation adapters for the FL2VA checkpoint, applied unmerged, which also
+// lock the sampling recipe they were distilled on (MiniMaxH3LoraConfig).
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using TensorSharp.Models.Video;
 using TensorSharp.Models.WanVideo;
 using TensorSharp.MLX;
@@ -26,17 +33,33 @@ using TensorSharp.Runtime;
 namespace TensorSharp.Models.MiniMaxH3
 {
     /// <summary>The MiniMax-H3 audio-video generator.</summary>
-    public sealed class MiniMaxH3Model : ModelBase, IVideoGenerationModel
+    public sealed class MiniMaxH3Model : ModelBase, IVideoGenerationModel, ILoraPluginHost
     {
         /// <summary>Architecture id this model reports. The GGUFs have no metadata,
         /// so nothing reads this back out of a file — it exists for the API and UI.</summary>
         public const string ArchitectureId = "minimax-h3";
+
+        /// <summary>What <see cref="SetLoras"/> throws (an <see cref="ObjectDisposedException"/>)
+        /// when the model is unloaded before the plug-in it was loading is in place.</summary>
+        internal const string UnloadedText = "MiniMax-H3 was unloaded; its LoRA plug-ins were not applied.";
+
+        /// <summary>Test seam: runs after <see cref="SetLoras"/> has loaded a set and before it
+        /// checks for an unload, so a test can unload the model while a set is in hand.</summary>
+        internal static Action<MiniMaxH3LoraSet> LoraLoadedHookForTest;
 
         private readonly string _ditPath;
         private readonly string _tePath;
         private readonly string _vaePath;
         private readonly string _audioVaePath;
         private MiniMaxH3Pipeline _pipeline;
+
+        // One clip at a time, and never across a plug-in swap or an unload: GenerateVideo,
+        // SetLoras and Dispose all hold it. Lock order is GpuComputeLock (the hosts'), then
+        // this; nothing waits on GpuComputeLock while holding it.
+        private readonly object _generationLock = new();
+        // Set by Dispose BEFORE it waits for _generationLock, so a SetLoras still loading its
+        // plug-in sees the unload when it finishes and releases the set instead of keeping it.
+        private volatile bool _disposed;
 
         /// <summary>The backend this model was loaded for; the pipeline needs it to
         /// make the matching GGML backend the active one.</summary>
@@ -82,6 +105,114 @@ namespace TensorSharp.Models.MiniMaxH3
                     "(Comfy-Org/MiniMax-H3). The text encoder also needs vocab.json, merges.txt " +
                     "and tokenizer_config.json (MiniMaxAI/MiniMax-H3, processor/) beside it, since " +
                     "its GGUF carries no tokenizer; a photo or a reference needs the last of them.");
+
+            // LoRA plug-ins from the host (--lora / TS_LORAS). They are loaded and checked
+            // against the transformer now, so a bad adapter or a contradicted recipe fails
+            // before any request, and their configuration mistakes are refusals (one line,
+            // exit 2), not crashes. TS_LORAS can also carry another family's plug-ins (a
+            // Qwen-Image config inherited by this process); the host names what it skips,
+            // and this model applies only the ones it accepts.
+            try
+            {
+                var specs = LoraCliFlags.FromJson(Environment.GetEnvironmentVariable(LoraCliFlags.EnvironmentVariable))
+                    .Where(AcceptsLora).ToList();
+                if (specs.Count > 0) SetLoras(specs);
+            }
+            catch (Exception e) when (e is ArgumentException or InvalidDataException or JsonException or FormatException or
+                FileNotFoundException or KeyNotFoundException)
+            {
+                Dispose();
+                throw new ModelLoadRefusedException("LoRA plug-in refused: " + e.Message, e);
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
+        }
+
+        // ---- LoRA plug-ins (ILoraPluginHost) ----
+
+        /// <inheritdoc/>
+        public string LoraPluginType => LoraCliFlags.MiniMaxH3PluginType;
+
+        /// <summary>The plug-in in use, as <see cref="LoraCliFlags.Resolve"/> expands it (empty when none).</summary>
+        public IReadOnlyList<LoraSpec> LoraSpecs { get; private set; } = Array.Empty<LoraSpec>();
+
+        /// <summary>A <c>minimax-h3-lora</c> config, as <c>--lora</c> or as the <c>--lora-config</c>
+        /// of its weights. Bare weights and other families' plug-ins are not.</summary>
+        public bool AcceptsLora(LoraSpec spec) =>
+            LoraCliFlags.DeclaredPluginType(spec) == LoraCliFlags.MiniMaxH3PluginType;
+
+        /// <summary>The loaded plug-in, or null; the pipeline applies it to every step.</summary>
+        internal MiniMaxH3LoraSet Loras { get; private set; }
+
+        /// <summary>The recipe the loaded plug-in locks (steps, linspace grid, shifts, Euler,
+        /// CFG 1), or null when clips sample with the base checkpoint's own schedule.</summary>
+        public MiniMaxH3SamplingRecipe SamplingRecipe { get; private set; }
+
+        VideoSamplingContract IVideoGenerationModel.SamplingContract => SamplingRecipe?.ToContract();
+
+        /// <summary>The contract <paramref name="specs"/> would bind this model to, read from the
+        /// plug-in configs alone (no weights, no download); null for an empty list.</summary>
+        /// <exception cref="ArgumentException">The specs are refused, with the canonical text.</exception>
+        /// <exception cref="FileNotFoundException">A named config is missing.</exception>
+        public VideoSamplingContract ContractFor(IReadOnlyList<LoraSpec> specs) =>
+            MiniMaxH3LoraConfig.RecipeFor(specs, Partition, Path.GetFileName(_ditPath))?.ToContract();
+
+        /// <summary>
+        /// Replace the LoRA plug-in applied to every later clip; an empty list removes it. At
+        /// most one <c>minimax-h3-lora</c> config, written for this checkpoint's partition. It is
+        /// checked from its config before anything is downloaded, then loaded and validated
+        /// against the transformer. A failure leaves the previous set in place. Waits for a clip
+        /// in progress.
+        /// </summary>
+        /// <exception cref="ObjectDisposedException">The model was unloaded first, or while the
+        /// plug-in loaded (<see cref="UnloadedText"/>); nothing was applied.</exception>
+        public void SetLoras(IReadOnlyList<LoraSpec> specs)
+        {
+            ArgumentNullException.ThrowIfNull(specs);
+            lock (_generationLock)
+            {
+                if (_disposed) throw new ObjectDisposedException(null, UnloadedText);
+                // The refusals that need the configs alone (another family's plug-in, bare
+                // weights, two plug-ins, the Ref2VA checkpoint, a negative strength, weights the
+                // config was not written for) come before Resolve downloads anything.
+                MiniMaxH3LoraConfig.RecipeFor(specs, Partition, Path.GetFileName(_ditPath));
+                var resolved = LoraCliFlags.Resolve(specs);
+                MiniMaxH3LoraSet loaded = null;
+                if (resolved.Count > 0)
+                {
+                    var timer = Stopwatch.StartNew();
+                    loaded = MiniMaxH3LoraSet.Load(resolved, DitConfig, Partition, Backend, UsesDirectBackend);
+                    try
+                    {
+                        LoraLoadedHookForTest?.Invoke(loaded);
+                        if (_disposed) throw new ObjectDisposedException(null, UnloadedText);
+                    }
+                    catch
+                    {
+                        loaded.Dispose();
+                        throw;
+                    }
+                    Console.WriteLine($"MiniMax-H3 LoRA: {Path.GetFileName(loaded.WeightsPath)} applied unmerged " +
+                        $"({loaded.FactorBytes / (1024.0 * 1024.0):F0} MiB of factors, loaded in {timer.Elapsed.TotalSeconds:F1}s)");
+                    Console.WriteLine(loaded.Summary);
+                }
+                else if (Loras != null)
+                {
+                    Console.WriteLine("MiniMax-H3 LoRA: plug-in removed; clips sample with the base checkpoint's schedule.");
+                }
+                var previous = Loras;
+                Loras = loaded;
+                SamplingRecipe = loaded?.Recipe;
+                LoraSpecs = resolved;
+                if (!ReferenceEquals(previous, loaded))
+                {
+                    _pipeline?.ReleaseLora();
+                    previous?.Dispose();
+                }
+            }
         }
 
         /// <summary>True when the tensor table looks like a MiniMax-H3 denoiser. Used
@@ -220,13 +351,19 @@ namespace TensorSharp.Models.MiniMaxH3
         internal string AudioVaePath => _audioVaePath;
 
         /// <summary>Generate a clip with guidance 1.0. Base MiniMax-H3 defaults to
-        /// 20 steps; reduced-step runs need their own quality validation.</summary>
+        /// 20 steps; reduced-step runs need their own quality validation. With a LoRA
+        /// plug-in loaded (<see cref="SetLoras"/>), the plug-in's recipe fixes the steps,
+        /// shift and sampler, and a request that contradicts it is refused.</summary>
         public GeneratedVideo GenerateVideo(string prompt, VideoGenerationParams p = null)
         {
             if (_allocator is MlxAllocator && !MlxWorker.Shared.IsOnWorkerThread)
                 return MlxWorker.Shared.Invoke(() => GenerateVideo(prompt, p));
-            _pipeline ??= new MiniMaxH3Pipeline(this);
-            return _pipeline.Generate(prompt, p ?? new VideoGenerationParams());
+            lock (_generationLock)
+            {
+                if (_disposed) throw new ObjectDisposedException(nameof(MiniMaxH3Model));
+                _pipeline ??= new MiniMaxH3Pipeline(this);
+                return _pipeline.Generate(prompt, p ?? new VideoGenerationParams());
+            }
         }
 
         // ---- IVideoGenerationModel ----
@@ -254,12 +391,21 @@ namespace TensorSharp.Models.MiniMaxH3
         // The pipeline keeps the denoiser and both VAEs between requests, each holding
         // pinned arrays, its own file mapping and the device wraps of its weights.
         // Without this every unload leaked them, and the Metal wraps still registered
-        // with the device are what ggml-metal asserts on at process exit.
+        // with the device are what ggml-metal asserts on at process exit. The LoRA set
+        // goes after the pipeline, whose denoiser may still hold its device copies.
         public override void Dispose()
         {
-            _pipeline?.Dispose();
-            _pipeline = null;
-            base.Dispose();
+            _disposed = true;
+            lock (_generationLock)
+            {
+                _pipeline?.Dispose();
+                _pipeline = null;
+                Loras?.Dispose();
+                Loras = null;
+                SamplingRecipe = null;
+                LoraSpecs = Array.Empty<LoraSpec>();
+                base.Dispose();
+            }
         }
     }
 }

@@ -460,7 +460,9 @@ public sealed class QwenImage21LoraConfigTests : IDisposable
         Assert.True(root != null, "The tests run from a source checkout; config/lora/ must be reachable.");
         string dir = Path.Combine(root, "config", "lora");
         Assert.True(Directory.Exists(dir), $"{dir} is missing.");
-        var files = Directory.GetFiles(dir, "*.json").OrderBy(f => f, StringComparer.Ordinal).ToArray();
+        // This family's plug-ins only: config/lora/ also ships other families' (minimax-h3-*.json),
+        // which LoraPluginManifestFamilyTests pairs with their own parsers.
+        var files = Directory.GetFiles(dir, "qwen-image-2.1-*.json").OrderBy(f => f, StringComparer.Ordinal).ToArray();
         Assert.NotEmpty(files);
         return files;
     }
@@ -493,7 +495,7 @@ public sealed class QwenImage21LoraConfigTests : IDisposable
         {
             using var doc = JsonDocument.Parse(File.ReadAllText(file), CommentedJson);
             var root = doc.RootElement;
-            Assert.Equal(LoraCliFlags.PluginType, root.GetProperty("type").GetString());
+            Assert.Equal(LoraCliFlags.QwenImagePluginType, root.GetProperty("type").GetString());
             AssertDownloadEntry(file, root.GetProperty("weights"), "weights");
             Assert.EndsWith(".safetensors", root.GetProperty("weights").GetProperty("path").GetString(), StringComparison.Ordinal);
             if (root.TryGetProperty("config", out var forwarded))

@@ -75,12 +75,68 @@ namespace TensorSharp.Models.MiniMaxH3
         /// attachments at it.</para></summary>
         public const int MaxReferences = 9;
 
+        /// <summary>Short edge of MiniMax's released quality recipe canvas.</summary>
+        public const int RecipeShortEdge = 768;
+
+        /// <summary>Pixel budget of the recipe canvas (768 x 1344); a wider shape shrinks to fit.</summary>
+        public const long RecipeMaxPixels = 768L * 1344;
+
+        /// <summary>The recipe accepts aspect ratios from 1:4 to 4:1, inclusive.</summary>
+        public const double RecipeMinAspect = 1.0 / 4.0;
+        public const double RecipeMaxAspect = 4.0;
+
         /// <summary>Round a pixel dimension up to the 32-px grid the model requires.</summary>
         public static int AlignSpatial(int size)
         {
             if (size <= 0) return SpatialMultiple;
             int r = size % SpatialMultiple;
             return r == 0 ? size : size + (SpatialMultiple - r);
+        }
+
+        /// <summary>Round to the NEAREST multiple of 32, ties to even, at least 32. Rounding
+        /// up instead misses the image's aspect by 2-4% for common photo shapes (a 3:2 photo
+        /// at 640x384's area became 608x416), and that miss is then cropped off the frame.</summary>
+        public static int NearestSpatial(double size) =>
+            Math.Max(SpatialMultiple,
+                (int)Math.Round(size / SpatialMultiple, MidpointRounding.ToEven) * SpatialMultiple);
+
+        /// <summary>The canvas MiniMax's released recipe gives a keyframe of this size:
+        /// the keyframe's own aspect at a 768-pixel short edge, shrunk to 768x1344's area
+        /// when wider than that, each side on the nearest 32-px step.
+        ///
+        /// <para>Ported from both upstream runtimes, which agree: vllm-omni
+        /// <c>resolve_minimax_h3_output_canvas</c> (fl2va takes its aspect from the first
+        /// image) and sglang <c>minimax_h3_resolve_spatial_shape</c> (<c>adapt_shape_v1</c>,
+        /// <c>auto_geometry_source = first_keyframe</c>). Examples: 1253x836 gives 1152x768,
+        /// 3808x5712 gives 768x1152, 1920x1080 gives 1344x768.</para>
+        ///
+        /// <para>This is what keeps a keyframe's faces intact. The video VAE downsamples 16x in
+        /// each direction (one transformer token covers 32x32 pixels), and first/last-frame modes
+        /// cannot recompose the shot, so a small canvas leaves a full-body subject's face a few
+        /// latent cells across, which the VAE alone cannot reproduce.</para>
+        ///
+        /// <para>The recipe covers aspect ratios from 1:4 to 4:1. Both upstreams refuse a
+        /// keyframe outside that; here its ratio is clamped to the nearer end instead, so a
+        /// panorama gets the 4:1 canvas and the cover fit crops the rest, which the keyframe
+        /// warning reports. A request with no size then still generates, as it did before the
+        /// recipe, rather than failing with advice a chat client cannot follow.</para></summary>
+        public static (int Width, int Height) KeyframeCanvas(int sourceWidth, int sourceHeight)
+        {
+            if (sourceWidth <= 0 || sourceHeight <= 0)
+                throw new ArgumentOutOfRangeException(nameof(sourceWidth),
+                    $"a keyframe needs a positive size, got {sourceWidth}x{sourceHeight}.");
+            double ratio = Math.Clamp(sourceWidth / (double)sourceHeight, RecipeMinAspect, RecipeMaxAspect);
+            double w, h;
+            if (ratio >= 1.0) { w = RecipeShortEdge * ratio; h = RecipeShortEdge; }
+            else { w = RecipeShortEdge; h = RecipeShortEdge / ratio; }
+            double area = w * h;
+            if (area > RecipeMaxPixels)
+            {
+                double scale = Math.Sqrt(RecipeMaxPixels / area);
+                w *= scale;
+                h *= scale;
+            }
+            return (NearestSpatial(w), NearestSpatial(h));
         }
 
         /// <summary>Round a requested frame count up onto H3's 17k+5 grid (minimum 5).

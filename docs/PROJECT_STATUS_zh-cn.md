@@ -8,7 +8,7 @@ TensorSharp 是面向 GGUF 模型的原生 .NET 10 推理引擎。当前源码�
 
 ### TensorAgent：在同一应用中聊天、执行任务与生成媒体
 
-TensorAgent 在同一会话界面中提供文本与多模态聊天、代码和技能工作流、个人知识检索，以及对应模型的图像/视频生成。可搜索的模型目录按系列分组，并依据设备内存预算筛选。目录包含用于文生图和参考图编辑的 Qwen-Image-2.1 及显式声明的八步 Turbo 变体，可选择 LoRA 插件，并通过 **Select area** 区域编辑器保留选区外的像素；还包含联合生成音视频的 MiniMax-H3 与实验性 LTX 2.5 Distilled。LTX 使用保守的 48 GB 目录档位，五个固定文件共 44.76 GB，默认预览为 1024×1024×17、24 fps。目录可用性与验证范围是两回事：已有的 Mac 应用媒体实测不覆盖所有新增条目；iOS 与 Windows 上的媒体生成尚未验证。
+TensorAgent 在同一会话界面中提供文本与多模态聊天、代码和技能工作流、个人知识检索，以及对应模型的图像/视频生成。可搜索的模型目录按系列分组，并依据设备内存预算筛选。目录包含用于文生图和参考图编辑的 Qwen-Image-2.1 及显式声明的八步 Turbo 变体，可选择 LoRA 插件，并通过 **Select area** 区域编辑器保留选区外的像素；还包含联合生成音视频的 MiniMax-H3（其关键帧条目提供两个 Turbo 提速插件）与实验性 LTX 2.5 Distilled。LTX 使用保守的 48 GB 目录档位，五个固定文件共 44.76 GB，默认预览为 1024×1024×17、24 fps。目录可用性与验证范围是两回事：已有的 Mac 应用媒体实测不覆盖所有新增条目；iOS 与 Windows 上的媒体生成尚未验证。
 
 界面现支持英语、简体与繁体中文、日语、韩语、西班牙语、法语和德语。设置可跟随系统语言或手动选择，模型仍根据用户的提示词决定回答语言。文本轮次会保存并显示 token 数、耗时、token 速率，以及可用的 KV 复用统计。**Enter** 发送提示词，**Shift+Enter** 换行，输入法确认候选字时的 Enter 不会发送。文本回答生成期间可以发送新消息引导当前轮次：宿主取消当前生成，保留部分回答与已接受的引导，再从该会话继续生成。独立服务端浏览器聊天与交互式 CLI 也支持引导；它不会撤销已执行的工具操作。各界面的操作说明见[使用指南](../USAGE_zh-cn.md)。
 
@@ -364,7 +364,7 @@ TensorAgent 是使用 .NET MAUI 构建的 iOS/iPadOS、macOS 与 Windows 应用�
 
 1. Wan 选择 step-distilled checkpoint。八步 Qwen-Image 生成使用显式声明的 [Turbo 变体](models/qwenimage21_zh-cn.md)。基础 Qwen-Image-2.1 出草图时用 `--width 1024 --height 1024` 或 `--diffusion-steps 25`，或使用 `config/lora/` 中的步数蒸馏 LoRA 插件（4–8 步）。
 2. 后端匹配硬件：NVIDIA 用 `ggml_cuda`，Apple Silicon 和 iOS 用 `ggml_metal`，原生 CPU 用 `ggml_cpu`。
-3. 调高级开关前先降低分辨率或帧数。MiniMax-H3 必须 `--cfg 1.0`，默认 20 步；4–8 步是质量与速度权衡，不是独立训练的 FastH3 配方。LTX 保持固定两阶段步数；降低输出尺寸也会降低首阶段尺寸，可能损害人脸/手部细节。
+3. 调高级开关前先降低分辨率或帧数。MiniMax-H3 必须 `--cfg 1.0`，默认 20 步；减少基础步数是质量与速度权衡，并非蒸馏配方。想在 FL2VA 上只跑 8 或 4 步，请加上 LightX2V [Turbo 插件](models/minimax-h3_zh-cn.md#turbo-插件)（`--lora config/lora/minimax-h3-fl2v-turbo-8step.json`），它把步数固定为其配方。LTX 保持固定两阶段步数；降低输出尺寸也会降低首阶段尺寸，可能损害人脸/手部细节。
 4. 文本任务只有在模型和负载适合时，再尝试投机解码、CPU MoE offload 或 `--tp N`。
 
 测量数据与限制条件见[引擎对比报告](engine_comparison_report.md)、[Apple Silicon 上 ggml_metal 对比 llama.cpp](perf/metal-vs-llama-cpp.md)、[模型卡片](models/README_zh-cn.md)、[功能说明](../FEATURES_zh-cn.md)和[环境变量功能矩阵](env_var_feature_matrix_zh-cn.md)。

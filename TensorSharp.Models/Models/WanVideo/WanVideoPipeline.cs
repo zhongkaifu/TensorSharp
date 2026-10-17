@@ -111,6 +111,25 @@ namespace TensorSharp.Models.WanVideo
             }
         }
 
+        /// <summary>The frames a Wan checkpoint can pin: at most a first frame, which an I2V-A14B checkpoint
+        /// requires and a T2V-only checkpoint refuses. A last frame is refused rather than silently dropped.</summary>
+        public static void ValidateConditioning(VideoGenerationParams p, bool hasImage, bool supportsImage, bool requiresImage)
+        {
+            ArgumentNullException.ThrowIfNull(p);
+            if (p.EndImage != null || !string.IsNullOrWhiteSpace(p.EndImagePath))
+                throw new NotSupportedException(
+                    "Wan takes at most a first-frame image; it cannot pin the last frame. " +
+                    "MiniMax-H3 FL2VA or LTX 2.5 can end a clip on an image.");
+            if (hasImage && !supportsImage)
+                throw new NotSupportedException(
+                    "This Wan checkpoint is text-to-video only; image-to-video needs a Wan 2.2 model " +
+                    "(Wan2.2-TI2V-5B or Wan2.2-I2V-A14B).");
+            if (requiresImage && !hasImage)
+                throw new ArgumentException(
+                    "Wan2.2-I2V-A14B is an image-to-video model: supply a conditioning image " +
+                    "(CLI --image, API \"image\"/\"imagePath\").");
+        }
+
         private GeneratedVideo GenerateCore(string prompt, VideoGenerationParams p)
         {
             // On the GGML backends the networks run through the native whole-graph
@@ -147,14 +166,7 @@ namespace TensorSharp.Models.WanVideo
             // ---- conditioning image (image-to-video) ----
             RgbImage image = p.ResolveImage();
             bool i2v = image != null;
-            if (i2v && !_model.SupportsImage)
-                throw new NotSupportedException(
-                    "This Wan checkpoint is text-to-video only; image-to-video needs a Wan 2.2 model " +
-                    "(Wan2.2-TI2V-5B or Wan2.2-I2V-A14B).");
-            if (_model.RequiresImage && !i2v)
-                throw new ArgumentException(
-                    "Wan2.2-I2V-A14B is an image-to-video model: supply a conditioning image " +
-                    "(CLI --image, API \"image\"/\"imagePath\").");
+            ValidateConditioning(p, i2v, _model.SupportsImage, _model.RequiresImage);
 
             // ---- resolve parameters ----
             // Default resolution follows each model's official recipe: TI2V-5B is a
@@ -661,14 +673,18 @@ namespace TensorSharp.Models.WanVideo
             _timer = new System.Threading.Timer(_ => Tick(), null, period, period);
         }
 
-        /// <summary>Enter a phase; the next ticks describe it.</summary>
+        /// <summary>Enter a phase and report it at once; the next ticks describe it. A host's
+        /// status line then follows the run instead of trailing it by up to a tick.</summary>
         public void Set(string phase, int step, int totalSteps, string detail)
         {
+            double eta;
             lock (_lock)
             {
                 _phase = phase; _step = step; _totalSteps = totalSteps; _detail = detail;
                 _since = Stopwatch.StartNew();
+                eta = _eta;
             }
+            Report(phase, step, totalSteps, detail, eta, heartbeat: false);
         }
 
         public void Report(string phase, int step, int totalSteps, string detail, double eta, bool heartbeat)

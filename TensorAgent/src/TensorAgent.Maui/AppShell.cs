@@ -69,10 +69,12 @@ public sealed class AppShell : Shell
 
         // TENSORAGENT_USE_MODEL=<catalog id>: in a Debug build always (the simulator
         // harness cannot tap); in a Release build only when an on-device benchmark asked
-        // for it (TENSORAGENT_SPEC_BENCH=1, or TENSORAGENT_IMAGE_BENCH=1 for pictures),
-        // which is how scripts/bench-spec-device.sh chooses the model to measure - a
-        // Release build used to ignore the variable and measure whatever model was remembered.
-        bool honourUseModel = Core.Hosting.SpeculationBench.Requested || Core.Hosting.ImageBench.Requested;
+        // for it (TENSORAGENT_SPEC_BENCH=1, TENSORAGENT_IMAGE_BENCH=1 for pictures, or
+        // TENSORAGENT_VIDEO_BENCH=1 for clips), which is how scripts/bench-spec-device.sh
+        // chooses the model to measure - a Release build used to ignore the variable and
+        // measure whatever model was remembered.
+        bool honourUseModel = Core.Hosting.SpeculationBench.Requested || Core.Hosting.ImageBench.Requested
+            || Core.Hosting.VideoBench.Requested;
 #if DEBUG
         honourUseModel = true;
 #endif

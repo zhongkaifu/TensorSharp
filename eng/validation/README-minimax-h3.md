@@ -6,6 +6,83 @@ dirty or unavailable dependency checkouts. Put outputs in ignored `artifacts/`
 or `docs/validation/`. A structural media pass does not establish perceptual
 quality or benchmark parity.
 
+## 2026-10-17 1280×768 speed and Turbo plug-in validation
+
+Evidence is under ignored `artifacts/minimax-h3/speed/` (attention benchmarks and
+base runs) and `artifacts/minimax-h3/turbo-*` and `artifacts/minimax-h3/lora-native/`
+(Turbo plug-in). All runs use unchanged upstream ggml
+`a05c9922613c6a2230dbb1d0de679519ecafb4f0` on the Apple M5 Pro (48 GiB, Metal 4
+tensor API live, 38.3 GB recommended working set). Every timing is a single run under
+`caffeinate` with OS caches uncontrolled.
+
+**Why 1280×768 was slow.** A 1280×768×107 FL2VA clip packs 34,991 tokens, and about
+85% of a ~570 s step was flash attention. ggml-metal takes its tensor-API flash
+kernel only when the key count is a multiple of 64 (34,991 leaves 47), so H3 ran the
+8-queries-per-threadgroup simdgroup kernel. `ggml_ops_metal_flash_pad.h` pads K/V
+with zero rows to a multiple of 64 and masks the pads, and passes the queries in
+64-row chunks over ggml's grouped-query broadcast. One 4 MB mask then serves every
+row, where a per-query mask was 2.45 GB. ggml is not modified.
+
+| Measurement | Before | After |
+|---|---:|---:|
+| One flash call, 34,991 tokens, 56×128 heads (`GgmlOpsMetalFlashKvPadTest metal`) | 8.05 s | 3.24 s |
+| One flash call, 9,298 tokens (640×384×107) | 0.456 s | 0.233 s |
+| DiT step at 1280×768×107 | ~570 s | 262.8 s |
+| Full 20-step clip at 1280×768×107 (first/last keyframes, seed 42) | 11,553.8 s | 5,438.5 s |
+
+- **Correctness.** On CPU the chunked padded call is bit-identical to unpadded
+  attention. On Metal it differs only by FP16 rounding (rel-rms ≤ 6e-4), and its error
+  against an F32 explicit-softmax reference matches the simdgroup kernel's.
+- **First-step velocities.** At 384×256×22 the chunked and full-mask versions are
+  bit-identical. Against the F32 reference, video and audio rel-rms are 2.6e-3 and
+  3.6e-3, against 2.5e-3 and 4.1e-3 unpadded.
+- **Full-clip drift.** The 20-step clips before and after agree at a mean whole-frame
+  PSNR of 41.6 dB.
+- **H3 oracle tests on Metal.** The VAE, vision, long-clip and checkpoint tests pass
+  on Metal with the padding active. 31 run; several of them return early without
+  their external fixtures, and those are not counted.
+- **The gate.** The padding runs only where the tensor API is predicted live. With
+  the tensor API disabled, the padded call was 5% slower. `TS_METAL_FLASH_KV_PAD=0`
+  disables it.
+- **Memory fix.** At this size the DiT's reuse allocator grows to 23.9 GB. With the
+  DiT weights still wired, only 3.3 GB of the 38.3 GB budget stayed free, and the
+  VAE's first command buffer failed with `kIOGPUCommandBufferCallbackErrorOutOfMemory`.
+  The pipeline now releases both on Metal before the decode (33.1 GB free, decode
+  146–148 s).
+- **MLX's fused attention** at the same shape: F32 4.08 s and F16 1.68 s per call.
+  That is 1.93× the padded ggml kernel, below the 2× bar set for writing a
+  TensorSharp-owned Metal kernel, so none was written.
+
+**Turbo plug-ins** (LightX2V FL2V 8-step v1.0 and 4-step v1.2, 768p, applied
+unmerged). The same keyframes, prompt and seed were run at 1280×768×107:
+
+| Run | s/step | Total |
+|---|---:|---:|
+| Base 20 steps | 262.8 | 5,438.5 s |
+| Turbo-8 | 264.7 | 2,298.7 s |
+| Turbo-4 | 264.7 | 1,238.6 s |
+| Turbo-4 at video shift 12 (A/B, not shipped) | 264.9 | 1,240.1 s |
+
+- **Identity.** On `ggml_metal` with the real weights, strength 0 gives a first-step
+  video velocity bit-identical to base.
+- **Faces.** They stay sharp and undistorted in every Turbo clip, by eye on full-size
+  crops.
+- **Drift from base 20.** Mean whole-frame PSNR is 17.5 dB for Turbo-8 and 19.8 dB for
+  Turbo-4. Most of it is the transition between two dissimilar keyframes: base
+  dissolves, Turbo cuts.
+- **Character.** Turbo is a little more saturated (0.20 against 0.17), moves more, and
+  its audio is louder (RMS 0.21–0.25 against 0.15).
+- **Shift A/B.** Shift 6 and 12 came out alike, so the 4-step recipe stays inferred.
+
+Not covered:
+- peak memory with an adapter;
+- text-to-video, more seeds, or other canvases;
+- `ggml_cuda`, direct `cuda` or `mlx` with an adapter, apart from MLX on a tiny
+  fixture;
+- M1–M4 Macs, where the padding is gated off;
+- a Studio or TensorAgent Turbo take;
+- the 32 GB TensorAgent tier.
+
 ## 2026-10-15 performance and quality validation
 
 Evidence is under ignored `docs/validation/minimax-h3/performance-20261015/`.

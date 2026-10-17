@@ -8,8 +8,10 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 
@@ -323,16 +325,11 @@ namespace TensorSharp.Server
                         Path.GetFileName(attachedDraft));
                 }
 
-                // --lora plug-ins apply to Qwen-Image-2.1's transformer only. Other models
-                // load without them; say so instead of letting the adapter vanish silently.
-                if (_model is not TensorSharp.Models.QwenImage.QwenImageModel &&
-                    TensorSharp.Runtime.LoraCliFlags.FromJson(Environment.GetEnvironmentVariable(
-                        TensorSharp.Runtime.LoraCliFlags.EnvironmentVariable)) is { Count: > 0 } loras)
-                {
-                    _logger.LogWarning(
-                        "LoRA plug-ins ({Loras}) apply to Qwen-Image-2.1 models only; {Model} ({Architecture}) runs without them.",
-                        TensorSharp.Runtime.LoraCliFlags.Describe(loras), LoadedModelName, Architecture ?? "unknown architecture");
-                }
+                // --lora plug-ins (TS_LORAS) apply to the models that take them, each model only
+                // its own family's (Qwen-Image-2.1, MiniMax-H3), and it loads without the rest;
+                // say so instead of letting the adapter vanish silently.
+                WarnAboutSkippedLoras(TensorSharp.Runtime.LoraCliFlags.FromJson(Environment.GetEnvironmentVariable(
+                    TensorSharp.Runtime.LoraCliFlags.EnvironmentVariable)));
                 // So does the checkpoint declaration (--qwen-image-variant), which the CLI refuses
                 // for another model outright.
                 if (_model is not TensorSharp.Models.QwenImage.QwenImageModel &&
@@ -387,6 +384,60 @@ namespace TensorSharp.Server
                 throw;
             }
         }
+
+        /// <summary>
+        /// Name the plug-ins in <paramref name="loras"/> (inherited as TS_LORAS) that the loaded
+        /// model runs without: a model that takes LoRA plug-ins
+        /// (<see cref="TensorSharp.Models.ILoraPluginHost"/>) skips the ones it does not accept
+        /// (another family's), one warning per declared type, and a model that takes none skips
+        /// them all. The texts are the ones the CLI's preflight prints for the same variable
+        /// (<see cref="TensorSharp.Models.LoraHostPreflight.EnvForeignTypeWarning"/>,
+        /// <see cref="TensorSharp.Models.LoraHostPreflight.EnvNoPluginsWarning"/>); the server
+        /// says them here, at load, rather than at startup. A plug-in whose file cannot be read
+        /// is named with the reason rather than thrown: the model has loaded, having read the
+        /// same variable itself.
+        /// </summary>
+        private void WarnAboutSkippedLoras(IReadOnlyList<TensorSharp.Runtime.LoraSpec> loras)
+        {
+            if (loras.Count == 0)
+                return;
+            string architecture = Architecture ?? "unknown architecture";
+            if (_model is not TensorSharp.Models.ILoraPluginHost host)
+            {
+                _logger.LogWarning("{Warning}", TensorSharp.Models.LoraHostPreflight.EnvNoPluginsWarning(
+                    LoraFileNames(loras), LoadedModelName, architecture));
+                return;
+            }
+            var skipped = new List<(string Declared, TensorSharp.Runtime.LoraSpec Spec)>();
+            foreach (var spec in loras)
+            {
+                string declared;
+                try
+                {
+                    if (host.AcceptsLora(spec))
+                        continue;
+                    declared = TensorSharp.Runtime.LoraCliFlags.DeclaredPluginType(spec);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+                {
+                    // A missing file or a config that is not JSON: the reason names the path.
+                    _logger.LogWarning("{EnvVar} names LoRA plug-in {Lora}, which cannot be read: {Reason}",
+                        TensorSharp.Runtime.LoraCliFlags.EnvironmentVariable, Path.GetFileName(spec.Path), ex.Message);
+                    continue;
+                }
+                skipped.Add((declared, spec));
+            }
+            // Null (bare weights, a PEFT or PDD config) groups like any other declared type.
+            foreach (var group in skipped.GroupBy(s => s.Declared, StringComparer.Ordinal))
+            {
+                _logger.LogWarning("{Warning}", TensorSharp.Models.LoraHostPreflight.EnvForeignTypeWarning(
+                    LoraFileNames(group.Select(s => s.Spec)), group.Key, LoadedModelName, architecture, host.LoraPluginType));
+            }
+        }
+
+        /// <summary>The plug-ins' file names, comma-separated, as the warning texts name them.</summary>
+        private static string LoraFileNames(IEnumerable<TensorSharp.Runtime.LoraSpec> loras) =>
+            string.Join(", ", loras.Select(l => Path.GetFileName(l.Path)));
 
         public void Dispose()
         {

@@ -33,5 +33,11 @@
   "app.shareNotifications.alert.title": "Ouvrir les prochains partages plus vite ?",
   "app.shareNotifications.alert.message": "iOS ne permet pas à une extension de partage de changer d’app directement. Autorisez les notifications pour ouvrir TensorAgent en un geste lors des prochains partages.",
   "app.shareNotifications.alert.allow": "Autoriser",
-  "app.shareNotifications.alert.notNow": "Pas maintenant"
+  "app.shareNotifications.alert.notNow": "Pas maintenant",
+  "app.webLink.title": "Page web",
+  "app.webLink.back": "Précédent",
+  "app.webLink.forward": "Suivant",
+  "app.webLink.close": "Fermer",
+  "app.webLink.loading": "Chargement de la page…",
+  "app.webLink.failed": "Cette page n’a pas pu être chargée."
 }

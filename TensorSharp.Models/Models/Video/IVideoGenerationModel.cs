@@ -51,5 +51,11 @@ namespace TensorSharp.Models.Video
         /// default answers 0 for every model that does not do reference conditioning, so a
         /// model only implements this if it has a real cap to report.</para></summary>
         int MaxReferenceImages => 0;
+
+        /// <summary>The sampling recipe the model is bound to right now (a step-distillation
+        /// LoRA plug-in's, for one), or null when it samples with its own defaults. A request
+        /// that contradicts it is refused. Hosts advertise it and bind admitted jobs to its
+        /// <see cref="VideoSamplingContract.Id"/>.</summary>
+        VideoSamplingContract SamplingContract => null;
     }
 }

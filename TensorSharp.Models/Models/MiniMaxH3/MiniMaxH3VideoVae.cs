@@ -469,7 +469,10 @@ namespace TensorSharp.Models.MiniMaxH3
                 var chunk = new float[(long)take * voxel];
                 Array.Copy(padded, (long)start * voxel, chunk, 0, (long)take * voxel);
 
-                float[] pixels = DecodeWindow(chunk, take, latentH, latentW, onTile);
+                // Every window tiles the same plane, so the count runs over the whole clip.
+                int window = i;
+                float[] pixels = DecodeWindow(chunk, take, latentH, latentW,
+                    onTile == null ? null : (done, tiles) => onTile(window * tiles + done, chunks * tiles));
                 int decoded = take * PatchTemporal;
 
                 int firstEnd = Math.Min(DecodeFramesPerChunk, decoded);

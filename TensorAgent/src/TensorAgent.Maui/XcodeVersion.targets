@@ -1,0 +1,44 @@
+<Project>
+  <!--
+    Build the Apple bundles with an Xcode one or more MINOR releases ahead of the one the
+    installed .NET for iOS / Mac Catalyst SDK was released for, with a warning, instead of
+    stopping at the SDK's error.
+
+    The SDK's _ValidateXcodeVersion (Xamarin.Shared.Sdk.targets) fails every app-bundle
+    build whose Xcode major.minor is not exactly the SDK's RecommendedXcodeVersion:
+        error : This version of .NET for MacCatalyst (27.0.10722) requires Xcode 27.0.
+                The current version of Xcode is 27.1.
+    Xcode updates itself from the App Store and the SDK for a new minor release ships
+    later, so in between every Apple build stops. In October 2026 Xcode 27.1 was out and
+    the newest iOS / Mac Catalyst SDK on NuGet was still 27.0.10722 (workload set
+    10.0.402), so no `dotnet workload update` could fix it. A minor Xcode release keeps the
+    previous one's SDK source and binary compatible, which is all the bindings need.
+    MEASURED with Xcode 27.1 (27A9275) and SDK 27.0.10722: the Mac app built in Release
+    (LLVM), launched, loaded Qwen 3.6 35B-A3B on Metal and answered its warm-up turn.
+    The iOS heads were not built under that pairing.
+
+    Only that case passes: the same major and a later minor. An older Xcode or another
+    major still fails the SDK's check, and a build that sets ValidateXcodeVersion itself
+    keeps it (-p:ValidateXcodeVersion=true makes a newer minor an error again).
+
+    Ordering: the SDK sets _XcodeVersion in _DetectSdkLocations and runs its check after
+    that target. This target runs after it too and is defined first (the projects import
+    this file from their body, ahead of the SDK's targets), so it runs first. A target's
+    condition is read when the target is about to run, so the check then sees
+    ValidateXcodeVersion=false. TensorAgentMauiProjectTests runs that sequence in MSBuild.
+  -->
+  <Target Name="TensorAgentAcceptNewerXcodeMinor"
+          AfterTargets="_DetectSdkLocations"
+          Condition="'$(ValidateXcodeVersion)' == '' And '$(_CanOutputAppBundle)' == 'true' And '$(IsMacEnabled)' == 'true' And '$(_XcodeVersion)' != '' And '$(RecommendedXcodeVersion)' != ''">
+    <PropertyGroup>
+      <_TensorAgentXcodeMajor>$([System.Version]::Parse('$(_XcodeVersion)').Major)</_TensorAgentXcodeMajor>
+      <_TensorAgentXcodeMinor>$([System.Version]::Parse('$(_XcodeVersion)').Minor)</_TensorAgentXcodeMinor>
+      <_TensorAgentSdkXcodeMajor>$([System.Version]::Parse('$(RecommendedXcodeVersion)').Major)</_TensorAgentSdkXcodeMajor>
+      <_TensorAgentSdkXcodeMinor>$([System.Version]::Parse('$(RecommendedXcodeVersion)').Minor)</_TensorAgentSdkXcodeMinor>
+      <_TensorAgentXcodeIsNewerMinor Condition="'$(_TensorAgentXcodeMajor)' == '$(_TensorAgentSdkXcodeMajor)' And $(_TensorAgentXcodeMinor) &gt; $(_TensorAgentSdkXcodeMinor)">true</_TensorAgentXcodeIsNewerMinor>
+      <ValidateXcodeVersion Condition="'$(_TensorAgentXcodeIsNewerMinor)' == 'true'">false</ValidateXcodeVersion>
+    </PropertyGroup>
+    <Warning Condition="'$(_TensorAgentXcodeIsNewerMinor)' == 'true'"
+             Text="TensorAgent: Xcode $(_XcodeVersion) is newer than the Xcode $(RecommendedXcodeVersion) that .NET for $(_PlatformName) $(_ShortPackageVersion) was released for. Building with it anyway, without the SDK's Xcode version check. Microsoft does not support this combination, so a build or launch failure may come from it. 'dotnet workload update' brings the matching SDK once one ships; -p:ValidateXcodeVersion=true makes this an error (TensorAgent/src/TensorAgent.Maui/XcodeVersion.targets)." />
+  </Target>
+</Project>

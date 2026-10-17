@@ -9,7 +9,8 @@ the bundled Web UI chat).
 > **Wan is the video-only family.** The newer video model in TensorSharp is
 > [MiniMax-H3](minimax-h3.md), which generates video **and native 32 kHz stereo
 > audio together in one packed latent** — text-to-video, image-to-video,
-> first/last frame and reference-to-video, CFG-free at 4–8 steps. Wan stays the
+> first/last frame and reference-to-video, CFG-free, 20 steps by default (8 or 4
+> with the FL2VA [Turbo plug-in](minimax-h3.md#turbo-plug-ins)). Wan stays the
 > family to reach for when you want video alone, and it is the one with the
 > step-distilled checkpoints that cut the 100-DiT-pass recipe to 4.
 

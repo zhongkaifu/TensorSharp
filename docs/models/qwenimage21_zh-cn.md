@@ -323,7 +323,7 @@ Turbo 的张量名与形状与基础检查点相同，GGUF 又没有元数据，
 这样的合并需要 Viggle 的调度而不是 Turbo 的，请为它声明 `base`。其他文件名一律视为基础检查点。
 服务端的声明与伴随文件路径一样，作用于它加载的每个 Qwen-Image 模型。这一声明对其他模型
 没有意义：CLI 遇到其他模型时拒绝 `--qwen-image-variant`（退出码 1），服务端则照常加载该模型、
-不使用声明，并记录一条警告，与 `--lora` 相同。
+不使用声明，并记录一条警告，与启动后加载的模型遇到它不接受的 `--lora` 插件时相同。
 
 ### 采样
 
@@ -673,7 +673,7 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
   --width 1024 --height 1024 --diffusion-seed 42 --output turbo.png
 ```
 
-参数说明、插件配置格式以及十四个随附插件的列表见
+参数说明、插件配置格式以及十四个随附 Qwen-Image-2.1 插件的列表见
 [USAGE_zh-cn.md](../../USAGE_zh-cn.md#qwen-image-21-lora-插件)。
 
 ### 采样配方
@@ -821,13 +821,16 @@ sd.cpp 忽略 `lora_adapter_metadata` 中的 alpha，因此给它的 Pruna 倍�
 `ImageEditStreamAsync` 或 `ImageEditAsync(body, loras, ct)`：插件组在与生成相同的锁内替换，
 所以排队等候的图片使用它请求时的插件组；插件组未变时没有开销（请传绝对路径，模型按此记录
 插件组）。TensorAgent 的 Mac 应用即如此：它的固定目录包含
-[USAGE_zh-cn.md 表中](../../USAGE_zh-cn.md#qwen-image-21-lora-插件)的十四个插件，只提供与当前模型兼容的选项，并把用户的选择
+[USAGE_zh-cn.md 表中](../../USAGE_zh-cn.md#qwen-image-21-lora-插件)的十四个 Qwen-Image-2.1 插件（另有供 MiniMax-H3
+关键帧检查点使用的两个 Turbo 插件），只提供与当前模型兼容的选项，并把用户的选择
 应用到每张图片，包括它的编辑路由（见 [TensorAgent 的 README](../../TensorAgent/README.md)）。
 
 ### 限制
 
-- 插件只作用于 Qwen-Image-2.1；CLI 遇到其他模型时拒绝 `--lora`，服务端则记录一条警告，
-  并在不带插件的情况下加载该模型。
+- 这些插件只作用于 Qwen-Image-2.1；MiniMax-H3 使用自己的 [Turbo 插件](minimax-h3_zh-cn.md#turbo-插件)，
+  并拒绝这些插件。两个宿主都会在插件下载之前拒绝启动模型不接受的 `--lora`（`--config` 仍需下载的
+  模型在该下载完成后立即检查）；服务端之后加载
+  的模型不使用它不接受的插件，服务端会记录一条写明这些插件的警告。
 - 每次运行只能有一个插件带采样配方，而带 sigma 的配方只能以它定义的步数运行。
   Qwen-Image-2.1-Turbo 不接受任何带配方的插件。
 - Qwen-Image-2.1-Fix 作者的工作流还使用了 APG、FreSca 以及 CFG 3 下的 `seeds_2` 采样器，

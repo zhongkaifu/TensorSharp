@@ -41,6 +41,8 @@
   "catalog.lora.objectRemover.purpose": "Entfernt den Inhalt roter Kästen auf einem angehängten Foto und ergänzt den Hintergrund. Funktioniert nicht bei jedem Foto; prüfe das Ergebnis.",
   "catalog.lora.objectMover.purpose": "Verschiebt das Objekt in einem roten Kasten auf einem angehängten Foto an die Stelle eines zweiten roten Kastens.",
   "catalog.lora.animeConsistency.purpose": "Hält eine Anime-Figur unverändert, wenn Pose, Ansicht oder Ausdruck eines angehängten Bildes bearbeitet werden. Experimentell.",
+  "catalog.lora.minimaxH3Turbo8Step.purpose": "Clips in 8 statt 20 Schritten, nach dem Zeitplan, auf den es destilliert wurde. Bei 768p für den Checkpoint mit erstem und letztem Bild trainiert.",
+  "catalog.lora.minimaxH3Turbo4Step.purpose": "Clips in 4 statt 20 Schritten. Bei 768p für den Checkpoint mit erstem und letztem Bild trainiert. Sein Zeitplan ist erschlossen: Der Herausgeber nennt für diese Version keinen.",
   "catalog.extended.gemmaLarge.notes": "Vision und der passende MTP-Entwurfskopf können optional heruntergeladen werden. Gemma-DSpark/DFlash-Entwürfe werden nicht unterstützt. Die Katalogmetadaten sind geprüft; die Inferenz in TensorAgent ist noch nicht validiert.",
   "catalog.extended.qwen35Large.notes": "Hybrides Expertenmischmodell mit optionalem Bildprojektor. Die Katalogmetadaten sind geprüft; die Inferenz in TensorAgent ist noch nicht validiert.",
   "catalog.extended.qwen36Large.notes": "Vision ist optional. Der eingebettete NextN-Kopf benötigt keinen zusätzlichen Download; die App nutzt standardmäßig n-Gramm-Spekulation. Die Katalogmetadaten sind geprüft; die Inferenz in TensorAgent ist noch nicht validiert.",

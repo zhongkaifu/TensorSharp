@@ -303,7 +303,8 @@ namespace TensorSharp.Models.WanVideo
         string IVideoGenerationModel.VideoModelFamily => "wan";
         int IVideoGenerationModel.DefaultPreviewFrames => 21;
         bool IVideoGenerationModel.SupportsAudio => false;
-        bool IVideoGenerationModel.SupportsImageConditioning => true;
+        // A T2V-only checkpoint refuses an image, so it must not invite one (chat would offer a photo that fails).
+        bool IVideoGenerationModel.SupportsImageConditioning => SupportsImage;
         bool IVideoGenerationModel.SupportsEndImageConditioning => false;
         bool IVideoGenerationModel.SupportsReferenceConditioning => false;
 

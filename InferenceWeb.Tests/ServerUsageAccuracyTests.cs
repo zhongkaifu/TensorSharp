@@ -129,6 +129,84 @@ public class ServerUsageAccuracyTests
         Assert.DoesNotMatch(new Regex(@"TensorSharp\.Server --"), usage);
     }
 
+    private static string RawUsage()
+    {
+        var writer = new StringWriter();
+        ServerUsage.PrintUsage(writer);
+        return writer.ToString().Replace("\r\n", "\n", StringComparison.Ordinal);
+    }
+
+    /// <summary>The option flags listed under <paramref name="section"/>, in order.</summary>
+    private static List<string> SectionFlags(string usage, string section)
+    {
+        string header = "\n" + section + ":\n";
+        int start = usage.IndexOf(header, StringComparison.Ordinal);
+        Assert.True(start >= 0, $"No usage section '{section}'.");
+        int end = usage.IndexOf("\n\n", start + header.Length, StringComparison.Ordinal);
+        return usage.Substring(start + header.Length, end - start - header.Length)
+            .Split('\n')
+            .Where(line => line.StartsWith("  --", StringComparison.Ordinal))
+            .Select(line => line.Trim().Split(' ')[0])
+            .ToList();
+    }
+
+    [Fact]
+    public void LoraFlags_HaveTheirOwnSection_NamingBothFamilies()
+    {
+        string usage = RawUsage();
+
+        Assert.Equal(LoraCliFlags.Flags, SectionFlags(usage, "LoRA plug-ins (Qwen-Image-2.1, MiniMax-H3 FL2VA)"));
+        var companions = SectionFlags(usage, "Qwen-Image-2.1 companion models");
+        Assert.Contains("--qwen-image-variant", companions);
+        foreach (string flag in LoraCliFlags.Flags)
+            Assert.DoesNotContain(flag, companions);
+    }
+
+    [Fact]
+    public void Lora_NamesEveryShippedTurboConfig_AndWhatItLocksOnTheServer()
+    {
+        string lora = CliUsageTests.UsageEntry(RawUsage(), "--lora <path>");
+
+        Assert.Contains("Qwen-Image-2.1 or MiniMax-H3 (FL2VA)", lora, StringComparison.Ordinal);
+        foreach (var (path, plugin) in CliUsageTests.ShippedH3Plugins())
+            Assert.Contains($"{path} ({plugin.Recipe.Steps} steps)", lora, StringComparison.Ordinal);
+        foreach (string locked in new[] { "--video-steps", "\"steps\"", "\"flowShift\"", "\"sampler\"", "\"cfg\"" })
+            Assert.Contains(locked, lora, StringComparison.Ordinal);
+        // The CLI's spellings are not server flags.
+        Assert.DoesNotContain("--diffusion-steps", lora, StringComparison.Ordinal);
+        Assert.DoesNotContain("--flow-shift", lora, StringComparison.Ordinal);
+        // A --config's model still to download is checked for its family after that download.
+        Assert.Contains("refused at startup, before the plug-in downloads", lora, StringComparison.Ordinal);
+        Assert.DoesNotContain("before anything downloads", lora, StringComparison.Ordinal);
+        Assert.Contains("MiniMax-H3 refuses a negative strength", CliUsageTests.UsageEntry(RawUsage(), "--lora-scale <f>"),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void VideoSteps_PointsAtTheTurboPlugin_NotAFourToEightStepOperatingPoint()
+    {
+        string steps = CliUsageTests.UsageEntry(RawUsage(), "--video-steps <N>");
+
+        Assert.DoesNotContain("fast operating point", Usage(), StringComparison.Ordinal);
+        Assert.DoesNotContain("4-8", steps, StringComparison.Ordinal);
+        Assert.Contains($"{TensorSharp.Models.MiniMaxH3.MiniMaxH3Scheduler.DefaultSteps} for MiniMax-H3", steps, StringComparison.Ordinal);
+        Assert.Contains("--lora config/lora/minimax-h3-fl2v-turbo-8step.json", steps, StringComparison.Ordinal);
+        Assert.Contains("exactly the 8 or 4 steps it was distilled for", steps, StringComparison.Ordinal);
+        Assert.Contains("any other value is refused at startup, and a request's own \"steps\" likewise", steps, StringComparison.Ordinal);
+        Assert.Equal(new[] { 4, 8 }, CliUsageTests.ShippedH3Plugins().Values.Select(p => p.Recipe.Steps).OrderBy(s => s));
+    }
+
+    [Fact]
+    public void Examples_IncludeAMiniMaxH3TurboServer()
+    {
+        string examples = RawUsage();
+        examples = examples.Substring(examples.IndexOf("Examples:", StringComparison.Ordinal));
+
+        Assert.Contains("  TensorSharp.Server.Host --config config/minimax-h3-fl2va.json --lora config/lora/minimax-h3-fl2v-turbo-8step.json ",
+            examples, StringComparison.Ordinal);
+        Assert.Contains("config/lora/minimax-h3-fl2v-turbo-8step.json", CliUsageTests.ShippedH3Plugins().Keys);
+    }
+
     [Fact]
     public void HostedModelGuard_RefusalsNameTheExecutableThatExists()
     {

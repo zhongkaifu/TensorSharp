@@ -96,6 +96,13 @@ public static partial class WebUiRoutes
     /// (<see cref="ImageTurns.Planner.For"/>). A host that passes <paramref name="chatFrames"/>
     /// plans inside its own frames, as the app's GPU gate does.
     /// </param>
+    /// <param name="prepareVideo">
+    /// The LoRA plug-ins a clip is made with (<see cref="AgentAppHost.PrepareVideoTurn"/>), or
+    /// null when the host does not choose them per clip. The video routes apply it as a chat clip
+    /// does, and refuse with 409 and the reason when the choice cannot be honoured: without it
+    /// they would sample with whatever set the last chat clip left on the model, and a Turbo
+    /// plug-in fixes the step count a request may ask for.
+    /// </param>
     public static void MapWebUi(
         this LoopbackServer server,
         WebUiChatService chat,
@@ -105,7 +112,8 @@ public static partial class WebUiRoutes
         Func<JsonElement, CancellationToken, IAsyncEnumerable<object>>? chatFrames = null,
         ChatTurnManager? turns = null,
         Func<bool, ImageTurns.Preparation>? prepareImage = null,
-        ImageTurns.Planner? planImage = null)
+        ImageTurns.Planner? planImage = null,
+        Func<ImageTurns.Preparation>? prepareVideo = null)
     {
         ArgumentNullException.ThrowIfNull(server);
         ArgumentNullException.ThrowIfNull(chat);
@@ -127,6 +135,8 @@ public static partial class WebUiRoutes
         server.MapPost("/api/chat", async (request, ct) =>
         {
             JsonElement body = await request.ReadJsonAsync(ct);
+            if (body.TryGetProperty("studio", out _) && !StudioAllowed(request))
+                return LoopbackResponse.Json(new { error = "Studio chat requires a same-origin request and X-TensorSharp-Studio: 1." }, 403);
             if (turns is null)
             {
                 return LoopbackResponse.Sse(
@@ -294,10 +304,22 @@ public static partial class WebUiRoutes
         server.MapPost("/api/video-generate", async (request, ct) =>
         {
             JsonElement body = await request.ReadJsonAsync(ct);
-            return Json(await Guarded(() => chat.VideoGenerateAsync(body, ct)));
+            if (prepareVideo?.Invoke() is not { } plan)
+                return Json(await Guarded(() => chat.VideoGenerateAsync(body, ct)));
+            if (plan.Error is { } refused)
+                return LoopbackResponse.Json(new { error = refused }, 409);
+            return Json(await Guarded(() => chat.VideoGenerateAsync(body, plan.Specs, ct)));
         });
+        // Refused before the stream starts, so the refusal is a status code as on the route above.
         server.MapPost("/api/video-generate/stream", async (request, ct) =>
-            LoopbackResponse.Sse(Guarded(chat.VideoGenerateStreamAsync(await request.ReadJsonAsync(ct), ct)), request.Cancellation));
+        {
+            JsonElement body = await request.ReadJsonAsync(ct);
+            if (prepareVideo?.Invoke() is not { } plan)
+                return LoopbackResponse.Sse(Guarded(chat.VideoGenerateStreamAsync(body, ct)), request.Cancellation);
+            if (plan.Error is { } refused)
+                return LoopbackResponse.Json(new { error = refused }, 409);
+            return LoopbackResponse.Sse(Guarded(chat.VideoGenerateStreamAsync(body, plan.Specs, ct)), request.Cancellation);
+        });
 
         // ---- skills -------------------------------------------------------------
         if (skills is null)

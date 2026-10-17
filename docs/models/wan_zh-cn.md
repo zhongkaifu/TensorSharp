@@ -10,7 +10,8 @@ TensorSharp 原生运行 [Wan 2.1](https://github.com/Wan-Video/Wan2.1) 与
 > **Wan 是只生成视频的家族。** TensorSharp 中更新的视频模型是
 > [MiniMax-H3](minimax-h3_zh-cn.md)：它在**同一份打包潜变量**里把视频与
 > **原生 32 kHz 立体声音频一起生成**——支持文生视频、图生视频、首尾帧与参考生视频，
-> 并在 CFG-free 的 4–8 步下运行。只需要视频时仍然选 Wan，它也是拥有步数蒸馏检查点、
+> 并以 CFG-free 方式运行，默认 20 步（FL2VA 加上 [Turbo 插件](minimax-h3_zh-cn.md#turbo-插件)时为 8 或 4 步）。
+> 只需要视频时仍然选 Wan，它也是拥有步数蒸馏检查点、
 > 能把 100 次 DiT 前向的官方配方降到 4 次的那个家族。
 
 支持的模型家族（按 DiT GGUF 自动识别）：

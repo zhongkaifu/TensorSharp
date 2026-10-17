@@ -27,7 +27,7 @@ namespace TensorSharp.Runtime
     /// The <c>--lora</c>, <c>--lora-scale</c> and <c>--lora-config</c> options shared by
     /// <c>TensorSharp.Cli</c> and <c>TensorSharp.Server</c>, and the environment channel
     /// (<see cref="EnvironmentVariable"/>) through which both hosts hand the parsed list to
-    /// the image model.
+    /// the model that applies them (Qwen-Image-2.1 or MiniMax-H3).
     /// </summary>
     /// <remarks>
     /// <c>--lora</c> may repeat; each one starts a new plug-in. <c>--lora-scale</c> and
@@ -42,7 +42,7 @@ namespace TensorSharp.Runtime
         public const string ScaleFlag = "--lora-scale";
         public const string ConfigFlag = "--lora-config";
 
-        /// <summary>JSON array of <c>{ "path", "scale", "config" }</c> objects read by the image model.</summary>
+        /// <summary>JSON array of <c>{ "path", "scale", "config" }</c> objects read by the model that applies them.</summary>
         public const string EnvironmentVariable = "TS_LORAS";
 
         /// <summary>Every flag this class owns, for the usage pages and drift tests.</summary>
@@ -120,15 +120,72 @@ namespace TensorSharp.Runtime
             return result;
         }
 
-        /// <summary>The <c>"type"</c> of a TensorSharp LoRA plug-in config.</summary>
-        public const string PluginType = "qwen-image-2.1-lora";
+        /// <summary>The <c>"type"</c> of a Qwen-Image-2.1 LoRA plug-in config.</summary>
+        public const string QwenImagePluginType = "qwen-image-2.1-lora";
+
+        /// <summary>The <c>"type"</c> of a MiniMax-H3 LoRA plug-in config, which declares the
+        /// checkpoint partition and the sampling contract of a step-distillation adapter.</summary>
+        public const string MiniMaxH3PluginType = "minimax-h3-lora";
+
+        /// <summary>Every TensorSharp plug-in config type, one per model family that takes LoRA plug-ins.</summary>
+        public static readonly IReadOnlyList<string> PluginTypes = new[] { QwenImagePluginType, MiniMaxH3PluginType };
+
+        /// <summary>
+        /// The TensorSharp plug-in config that <paramref name="spec"/> is selected by:
+        /// <see cref="LoraSpec.Path"/> when it is an existing <c>.json</c>, else
+        /// <see cref="LoraSpec.ConfigPath"/> when it is an existing plug-in <c>.json</c>
+        /// (one whose <c>"type"</c> is in <see cref="PluginTypes"/>), else null. Reads the
+        /// manifest only; never downloads.
+        /// </summary>
+        /// <exception cref="ArgumentException">The manifest is not valid JSON.</exception>
+        public static string? ManifestPath(LoraSpec spec)
+        {
+            ArgumentNullException.ThrowIfNull(spec);
+            if (spec.Path.EndsWith(".json", StringComparison.OrdinalIgnoreCase) && File.Exists(spec.Path))
+                return System.IO.Path.GetFullPath(spec.Path);
+            if (spec.ConfigPath != null && spec.ConfigPath.EndsWith(".json", StringComparison.OrdinalIgnoreCase) &&
+                File.Exists(spec.ConfigPath))
+            {
+                string config = System.IO.Path.GetFullPath(spec.ConfigPath);
+                using var doc = ReadPlugin(config, out bool isPlugin);
+                return isPlugin ? config : null;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// The plug-in type <paramref name="spec"/> declares: the <c>"type"</c> of the
+        /// <c>.json</c> named by <c>--lora</c>, or else by <c>--lora-config</c>, when it is one of
+        /// <see cref="PluginTypes"/>; null for bare weights, a PEFT or PDD config, or any other
+        /// JSON. Hosts and models read it to route a plug-in to the family that can apply it
+        /// before anything is downloaded or loaded. Reads the manifest only; never downloads.
+        /// </summary>
+        /// <exception cref="FileNotFoundException">The <c>--lora</c> or <c>--lora-config</c> file is
+        /// missing, with the text <see cref="Resolve"/> uses, so a typo'd manifest is reported as
+        /// missing rather than as bare weights.</exception>
+        /// <exception cref="ArgumentException">The manifest is not valid JSON.</exception>
+        public static string? DeclaredPluginType(LoraSpec spec)
+        {
+            ArgumentNullException.ThrowIfNull(spec);
+            if (!File.Exists(spec.Path))
+                throw new FileNotFoundException($"{LoraFlag} file not found: {spec.Path}", spec.Path);
+            if (spec.ConfigPath != null && !File.Exists(spec.ConfigPath))
+                throw new FileNotFoundException($"{ConfigFlag} file not found: {spec.ConfigPath}", spec.ConfigPath);
+            string? manifest = spec.Path.EndsWith(".json", StringComparison.OrdinalIgnoreCase) ? spec.Path
+                : spec.ConfigPath != null && spec.ConfigPath.EndsWith(".json", StringComparison.OrdinalIgnoreCase) ? spec.ConfigPath
+                : null;
+            if (manifest == null) return null;
+            using var doc = ReadPlugin(System.IO.Path.GetFullPath(manifest), out _);
+            return PluginTypeOf(doc!.RootElement);
+        }
 
         /// <summary>
         /// Check that every named file exists and return absolute paths. A <c>--lora</c> that
-        /// names a TensorSharp plug-in config (a <c>.json</c> with <c>"type": "qwen-image-2.1-lora"</c>)
-        /// is expanded here: its <c>"weights"</c> entry (downloaded and hash-checked when missing)
-        /// becomes the weights, and the plug-in itself becomes the config, or its
-        /// <c>"config"</c> entry when it forwards a third-party one (a PDD <c>pdd_config.json</c>).
+        /// names a TensorSharp plug-in config (a <c>.json</c> whose <c>"type"</c> is one of
+        /// <see cref="PluginTypes"/>) is expanded here: its <c>"weights"</c> entry (downloaded and
+        /// hash-checked when missing) becomes the weights, and the plug-in itself becomes the
+        /// config, or its <c>"config"</c> entry when a Qwen-Image-2.1 plug-in forwards a
+        /// third-party one (a PDD <c>pdd_config.json</c>).
         /// </summary>
         /// <exception cref="FileNotFoundException">A weights or config file is missing.</exception>
         /// <exception cref="ArgumentException">A plug-in config is malformed.</exception>
@@ -172,10 +229,28 @@ namespace TensorSharp.Runtime
             {
                 throw new ArgumentException($"LoRA config {path} is not valid JSON: {ex.Message}", ex);
             }
-            var root = doc.RootElement;
-            isPlugin = root.ValueKind == JsonValueKind.Object && root.TryGetProperty("type", out var type) &&
-                type.ValueKind == JsonValueKind.String && type.GetString() == PluginType;
+            isPlugin = PluginTypeOf(doc.RootElement) != null;
             return doc;
+        }
+
+        /// <summary>The root's <c>"type"</c> when it is one of <see cref="PluginTypes"/>, else null.</summary>
+        private static string? PluginTypeOf(JsonElement root)
+        {
+            if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("type", out var type) ||
+                type.ValueKind != JsonValueKind.String)
+                return null;
+            string? value = type.GetString();
+            foreach (string known in PluginTypes)
+                if (value == known) return known;
+            return null;
+        }
+
+        /// <summary>A MiniMax-H3 plug-in is its own config; it never forwards a third-party one.</summary>
+        private static void RefuseForwardingH3(JsonElement root, string manifest)
+        {
+            if (PluginTypeOf(root) == MiniMaxH3PluginType && root.TryGetProperty("config", out _))
+                throw new ArgumentException(
+                    $"{manifest}: a {MiniMaxH3PluginType} plug-in cannot forward a \"config\"; its own file is the config.");
         }
 
         /// <summary>A plug-in's own strength, when it states one.</summary>
@@ -200,7 +275,8 @@ namespace TensorSharp.Runtime
             using (var doc = ReadPlugin(manifest, out bool isPlugin))
             {
                 if (!isPlugin) return spec;
-                forwards = doc!.RootElement.TryGetProperty("config", out _);
+                RefuseForwardingH3(doc!.RootElement, manifest);
+                forwards = doc.RootElement.TryGetProperty("config", out _);
                 if (forwards) scale = PluginScale(doc.RootElement, manifest);
             }
             if (!forwards) return spec;
@@ -216,10 +292,12 @@ namespace TensorSharp.Runtime
                 var root = doc!.RootElement;
                 if (!isPlugin)
                     throw new ArgumentException(
-                        $"{LoraFlag} {manifest}: a .json LoRA must be a TensorSharp plug-in config (\"type\": \"{PluginType}\"). " +
+                        $"{LoraFlag} {manifest}: a .json LoRA must be a TensorSharp plug-in config " +
+                        $"(\"type\": \"{QwenImagePluginType}\" or \"{MiniMaxH3PluginType}\"). " +
                         $"Pass the weights (.safetensors) with {LoraFlag} and a third-party config with {ConfigFlag}.");
                 if (spec.ConfigPath != null)
                     throw new ArgumentException($"{LoraFlag} {manifest} is a plug-in config already; drop the {ConfigFlag} after it.");
+                RefuseForwardingH3(root, manifest);
                 if (root.TryGetProperty("config", out _))
                 {
                     // The forwarded config (a pdd_config.json, say) becomes THE config, so

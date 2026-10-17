@@ -404,7 +404,37 @@ public sealed class WebUiAdapter
         bool wantB64 = root.TryGetProperty("response_format", out var rf) &&
                        rf.ValueKind == JsonValueKind.String && rf.GetString() == "b64_json";
 
-        VideoGenerationResult result = await _service.GenerateVideoAsync(prompt, p).ConfigureAwait(false);
+        VideoGenerationResult result;
+        try
+        {
+            result = await _service.GenerateVideoAsync(prompt, p).ConfigureAwait(false);
+        }
+        catch (WebUiRequestRejectedException ex)
+        {
+            // The service's own refusals (no video model, keyframes this checkpoint cannot
+            // take, no upload headroom) keep the status it chose.
+            return Rejected(ex);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+        {
+            // The model's explanation of what the request asked for and why this checkpoint
+            // cannot do it (a step count, flow shift or sampler a plug-in's recipe contradicts,
+            // guidance a distilled model refuses, a conditioning kind not implemented): the
+            // caller's to fix, so a 400 in this route's envelope rather than a 500 that throws
+            // the reason away. Cancellation is neither and propagates.
+            logger.LogWarning(LogEventIds.UploadReceived, ex, "OpenAI video generation rejected");
+            return Results.BadRequest(new { error = new { message = ex.Message, type = "invalid_request_error" } });
+        }
+        catch (InvalidOperationException ex)
+        {
+            // Mostly the server's own failure, not the request's: a native forward that failed
+            // (out of device memory, say), a denoise that diverged, a model swapped or being
+            // unloaded while the request waited. A 500 server_error keeps the reason and lets an
+            // OpenAI client retry, which it does not do for a 400. (MiniMax-H3's refusal of a
+            // mode its checkpoint lacks is this type too, and gets the same answer.)
+            logger.LogError(LogEventIds.ChatFailed, ex, "OpenAI video generation failed");
+            return Results.Json(new { error = new { message = ex.Message, type = "server_error" } }, statusCode: 500);
+        }
 
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInformation(LogEventIds.UploadReceived,
@@ -462,6 +492,14 @@ public sealed class WebUiAdapter
     {
         var webUiLogger = _loggerFactory.CreateLogger("TensorSharp.Server.WebUI.Chat");
         var body = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body).ConfigureAwait(false);
+        if (body.TryGetProperty("studio", out _) && (!TensorSharp.Server.Endpoints.StudioEndpoints.ConnectionAllowed(ctx)
+            || !TensorSharp.Chat.Studio.StudioHostBoundary.AllowsMutation(
+            ctx.Request.Headers["X-TensorSharp-Studio"].ToString(), ctx.Request.Headers.Origin.ToString(), ctx.Request.Scheme, ctx.Request.Host.Value ?? "")))
+        {
+            ctx.Response.StatusCode = 403;
+            await ctx.Response.WriteAsJsonAsync(new { error = "Studio chat requires an allowed loopback connection (or explicit protected remote deployment), same-origin request, and X-TensorSharp-Studio: 1." });
+            return;
+        }
         using var generationCancel = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
 
         await WriteChatFramesAsync(ctx, _service.ChatStreamAsync(body, generationCancel.Token),

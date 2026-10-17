@@ -100,6 +100,28 @@ CUDA 量化投影默认以最多 64 MiB 转换暂存区运行 pedantic F32 GEMM�
 缓存波动很大，暖对照仍更快，因此没有普遍 CUDA 整进程持平结论。
 当前 A/B 和这些历史跨引擎数据不能合并。完整旧数据与限制见[英文卡片](minimax-h3.md)。
 
+### Metal 上的长序列注意力
+
+FL2VA 上 1280×768×107 的首尾帧片段有 34,991 个打包 token，此时每步的耗时主要在注意力。
+在 M5 Pro、`ggml_metal`、未修改的 ggml `a05c9922613c6a2230dbb1d0de679519ecafb4f0`、
+20 步、seed 42 下，整次运行从 11,553.8 秒降到 5,438.5 秒（2.12×），每步约 570 秒降到
+263 秒；单次 flash attention 调用从 8.05 秒降到 3.24 秒：
+
+- ggml-metal 只在 key 数为 64 的倍数时才把长 flash attention 交给 Metal 4 tensor-API
+  内核。TensorSharp 用零行把 key 补到下一个 64 的倍数并加以遮罩，注意力结果不变（被遮罩
+  的 key 对 softmax 和输出没有贡献）。只在 tensor API 可用时补齐；`TS_METAL_FLASH_KV_PAD=0`
+  关闭补齐，供 A/B 对比。
+- 遮罩每个 query 需要一行，在这一长度下为 2.45 GB；各行相同，因此 query 分块运行，共用
+  一份约 4 MB 的遮罩。
+
+随后视频 VAE 解码耗时 146–148 秒。在 `ggml_metal` 上，管线现在会在解码前释放去噪器的
+权重和复用的计算缓冲区（`TS_H3_KEEP_RESIDENT=1` 保留权重）；此前 38.3 GB 的 Metal 预算
+只剩 3.3 GB 空闲，解码可能以 `kIOGPUCommandBufferCallbackErrorOutOfMemory` 失败。作为
+对照，MLX 融合 SDPA 在同一形状下每次调用 F32 为 4.08 秒、F16 为 1.68 秒，未被采用。
+以上是同一台机器上的单次运行，按 CLI 报告的整段耗时计；改动前后的日志分别位于
+`artifacts/minimax-h3/fl2v-face-investigation/` 与 `artifacts/minimax-h3/speed/hr/`
+（本地验证证据，未提交）。
+
 ## 需要的文件
 
 | 文件 | 大小 | 用途 / 来源 |
@@ -113,7 +135,8 @@ CUDA 量化投影默认以最多 64 MiB 转换暂存区运行 pedantic F32 GEMM�
 一套约 35.5 GB；第二种去噪器共用编码器、VAEs 和分词器。
 伴随文件可放在去噪器旁，或用 `--video-text-encoder`、`--video-vae`、`--audio-vae`
 指定。`config/minimax-h3-fl2va.json` 与 `config/minimax-h3-ref2va.json`
-下载网络文件，默认 `ggml_cuda`、640×384×22、24 fps；命令行后端优先。
+下载网络文件，默认 `ggml_cuda`、22 帧、24 fps，命令行后端优先；只有 ref2va 配置固定
+640×384，fl2va 配置把尺寸交给模型（文生视频 640×384，关键帧按[配方画布](#尺寸与设置)）。
 服务端步数使用 `--video-steps`，CLI 使用 `--diffusion-steps`；两份配置不写步数与 CFG，
 由模型采用默认 20 步和 CFG 1。
 
@@ -132,7 +155,7 @@ CUDA 量化投影默认以最多 64 MiB 转换暂存区运行 pedantic F32 GEMM�
 |---|---|---|
 | 文本 | `t2v` | FL2VA 或 Ref2VA |
 | 首帧图像 | `i2v` | FL2VA |
-| 首帧和/或尾帧 | `fl2v` | FL2VA |
+| 尾帧（可带首帧） | `fl2v` | FL2VA |
 | 参考图、片段、音轨 | `ref` | Ref2VA |
 
 `--video-mode` 可显式选择，否则按输入推断。关键帧不能与命名参考混用；
@@ -159,12 +182,174 @@ TensorSharp.Cli --config config/minimax-h3-ref2va.json --backend ggml_metal \
 
 ## 尺寸与设置
 
-- 宽高向上对齐 32；默认 640×384，或在关键帧比例下保持相同面积。
+- 宽高向上对齐 32；文生视频与具名的 Ref2VA 参考图默认 640×384；在 Ref2VA 上，普通
+  `--image`（Web UI 附加图片的方式）按该图宽高比保持这一面积。
+- i2v 与 fl2v 保留关键帧的构图，因此未指定尺寸时，画布按 MiniMax 发布的配方由第一个
+  关键帧（只有末帧时用末帧）决定：保持其宽高比、短边 768 像素、面积不超过 768×1344，
+  每边取最接近的 32 的倍数。3:2 照片为 1152×768，2:3 竖图为 768×1152，4:3 为
+  1024×768，16:9 为 1344×768，与 vllm-omni 和 sglang 一致；超出 1:4 至 4:1 时宽高比被
+  夹紧，多余部分居中裁掉。视频 VAE 在每个方向下采样 16 倍：全身照放进 640×384 后人脸只有
+  约 60 像素高，仅编码再解码就已经糊掉，与去噪器无关。在这类照片上测得的整帧 VAE 往返：
+  640×384 为 27.6 dB，3:2 首帧给出的 1152×768 画布上为 29.5 dB，人脸（目测比较）得以保留。
+  配方画布每帧的视频 token 约为 640×384 的 2.4 倍（方形）到 4.2 倍（16:9），3:2 为
+  3.6 倍，耗时也会成倍增加。
+- 显式给出 `--width` 与 `--height` 仍然优先，并对所有模式固定该尺寸。被居中裁剪的关键帧
+  会给出保留了多少的警告；缩得比其自身配方画布更小的关键帧会给出警告并写明该尺寸。
+  TensorAgent 应用在其 32 GB 档位测得配方尺寸的峰值内存之前，仍使用 640×384 面积的
+  紧凑画布。
 - 帧数向上对齐 5、22、39、56……（`17k+5`），默认 22。
 - 固定 24 fps、CFG 1、自有 Euler flow schedule，默认 20 步；其他 CFG 会拒绝。
+  [Turbo 插件](#turbo-插件)会以其蒸馏时的 8 或 4 步取代该调度。
 - Wan 的负面提示词、采样器与 guidance-cache 选项不改变 H3。
 - `--diffusion-seed` 决定视频噪声；`--seed` 只控制文本采样。
 - 视频 VAE 按 256 px 空间分块、按时间分段；长片的有限性与感知质量仍需单独验证。
+
+## Turbo 插件
+
+LightX2V 的 Turbo LoRA 把 FL2VA 检查点蒸馏为 8 或 4 次 Transformer 前向，取代基础的 20 步。
+TensorSharp 在 [`config/lora/`](../../config/lora/) 中提供两份插件配置，权重在首次使用时下载：
+
+```sh
+TensorSharp.Cli --config config/minimax-h3-fl2va.json \
+  --lora config/lora/minimax-h3-fl2v-turbo-8step.json \
+  --prompt "A red fox walks through a quiet forest. Forest birds chirp." --output fox.mp4
+
+TensorSharp.Server.Host --config config/minimax-h3-fl2va.json \
+  --lora config/lora/minimax-h3-fl2v-turbo-8step.json
+```
+
+| 配置 | 插件与权重 | 步数 | 配方来源 |
+|---|---|---|---|
+| `minimax-h3-fl2v-turbo-8step.json` | LightX2V Turbo 8-step（FL2V v1.0，768p），`minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` | 8 | ModelTC/Minimax-H3-Turbo README："8 NFE, video shift 6, audio shift 3" |
+| `minimax-h3-fl2v-turbo-4step.json` | LightX2V Turbo 4-step（FL2V v1.2，768p），`minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` | 4 | **推断所得。** README 没有 v1.2 一行，文件也未记录 shift，因此沿用其 4 步 v1.0 768p 一行的 linspace 网格与 shift 6/3；在 shift A/B 或发布方给出答案之前一直标注为推断 |
+
+两份权重来自 [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/a29e57d195f80ead07c89f89e55ecf2911e893c5)
+的修订版 `a29e57d195f80ead07c89f89e55ecf2911e893c5`，各 1,383,677,808 字节，校验 SHA-256
+（数值见 [MODEL_DOWNLOADS_zh-cn.md](../../MODEL_DOWNLOADS_zh-cn.md)），Apache-2.0 许可，
+保存到模型根目录下的 `minimax-h3/loras/`。
+
+### 采样契约
+
+插件在端点包含的 linspace 网格 q_i = (N − i)/N 上做 N 步 Euler，视频 shift 6、音频 shift 3，
+末尾为 0，CFG 1，强度 1。它与基础检查点 shift 12 的 stable-diffusion.cpp 调度不是同一个网格，
+因此基础模型减少步数并不等于蒸馏调度。
+
+| 步数 | 视频 sigma（shift 6） | 音频 sigma（shift 3） |
+|---|---|---|
+| 8 | 1, 0.97674, 0.94737, 0.90909, 0.85714, 0.78261, 0.66667, 0.46154, 0 | 1, 0.95455, 0.9, 0.83333, 0.75, 0.64286, 0.5, 0.3, 0 |
+| 4 | 1, 0.94737, 0.85714, 0.66667, 0 | 1, 0.9, 0.75, 0.5, 0 |
+
+每段片段都会记录插件、配方与两组 sigma（`[lora] sampling recipe (...)`）。
+
+### 锁定的设置与拒绝
+
+配方是契约而不是默认值。步数、视频 flow shift、采样器与 CFG 可以不设（0）或与插件取值相同；
+其他任何值都会被拒绝并给出插件名称，绝不会被静默覆盖。
+
+| 位置 | 检查内容 | 冲突时 |
+|---|---|---|
+| CLI | `--diffusion-steps`、`--flow-shift`、`--sampler`、`--cfg` | 输出一行 `Configuration error:`，退出码 1，不下载任何文件 |
+| 服务端启动 | `--video-steps` | 同上，不下载任何文件 |
+| 任一宿主的 `--config` | 合并后的选项，在配置文件自身的文件下载之前 | 同上；被拒绝的运行什么都不下载，包括约 35.5 GB 的整套模型 |
+| 请求 | `"steps"`、`"flowShift"`、`"sampler"`（任何 H3 模型都拒绝不等于 1 的 `"cfg"`） | `/api/video-generate` 与 `/v1/videos/generations` 返回 400；`/api/video-generate/stream` 返回 `{done, error}` 事件 |
+| Video Studio | 按另一配方规划的镜头 | 409 `sampling_recipe_conflict`，不创建任务（见 [Video Studio](../video-studio.md#sampling-recipes)，英文） |
+
+命令行未指定插件时，两个宿主对通过 `TS_LORAS` 继承的插件做同样的检查。例如 8 步插件配
+`--diffusion-steps 20` 会输出：
+
+```text
+Configuration error: --diffusion-steps 20 contradicts minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors: LightX2V Turbo 8-step (FL2V v1.0, 768p) samples exactly 8 steps on its own schedule. Drop --diffusion-steps or pass 8.
+```
+
+以下情况插件本身会被拒绝并说明原因：用于 Ref2VA 检查点（按文件名中的 `ref2va` 识别；不支持
+Ref2VA Turbo）；以裸 `.safetensors` 传入（H3 只接受声明分区与契约的插件配置）；用于其他模型，
+或把 Qwen-Image-2.1 插件用于 H3；同时使用两个 H3 插件；`--lora-scale` 为负；以
+`--lora <权重> --lora-config <插件配置>` 传入而权重文件并非该配置所指的文件。
+
+### 应用方式
+
+- **不合并**：`y = W x + B (A x)` 叠加在量化 GGUF 权重之上，强度 × alpha / rank 折入 B，
+  与发布方推理脚本经 PEFT 的用法一致（其 `--fuse-lora` 默认关闭）。两个文件都声明 rank 128
+  时 alpha 为 8，即缩放 0.0625；若加载器假定 alpha = rank，会把更新放大 16 倍。
+- **312 项**（624 个张量）：50 个 DiT 块与 2 个 token-refiner 块中的 q、k、v、out、fc1、fc2。
+  q/k/v 更新位于 q/k RMSNorm 与 RoPE 之前，fc1 位于 SwiGLU 之前，out 与 fc2 位于各自投影之后。
+  Diffusers 文件按 [value; gate] 存放 fc1，两半会交换为检查点的 [gate | value] 顺序。
+- **内存。** 因子在 `ggml_metal` 与 `ggml_cuda` 上为 F16，1.38 GB（数值超出 F16 范围的组保持
+  F32）；在 `ggml_cpu` 上为 F32，2.77 GB。直接 `cpu`、`mlx` 与 `cuda` 后端在首次使用时逐块构建
+  精确的 F32 因子。fc1 有更新时，原生图把 fc1 基础权重拆为 gate 与 value 两半，更新不会新增
+  完整尺寸的激活。
+- **强度。** `--lora-scale`（默认取配置中的 1.0）乘到更新上，必须 ≥ 0；不等于 1 时日志会说明
+  该调度是在强度 1 下蒸馏的。强度 0 保留所有项而上投影因子为零，因此每次前向都与基础检查点
+  在同一输入上的结果相同，而片段仍按插件的调度采样，可作恒等探针。
+- **画布。** 默认值不变：文生视频仍为 640×384，关键帧使用[配方画布](#尺寸与设置)。适配器在
+  768p 下训练，短边不是 768 的片段会记录一行说明，照常运行。
+- **后端。** 原生图在 `ggml_metal`、`ggml_cuda` 与 `ggml_cpu` 上应用适配器；直接 `cpu`、`mlx`
+  与 `cuda` 后端自行应用。哪些已经运行见下文。
+
+服务端启动时的 `--lora` 作用于每个片段，请求不能选择插件；请求不要带 `steps`，与 Web UI 一样
+（见 [API 示例](../../TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#minimax-h3--视频与原生-32-khz-立体声音频)）。
+[Video Studio](../video-studio.md#sampling-recipes)（英文）显示配方、固定步数并把每个任务绑定到它。
+[TensorAgent 应用](../../TensorAgent/README.md)在关键帧条目上把两个插件作为提速插件提供，在聊天与
+Studio 中按片段应用，且从不发送步数、flow shift 或采样器。
+
+### Turbo 验证状态
+
+本次改动于 2026-10-17 在 Apple M5 Pro 上、针对未修改的 ggml
+`a05c9922613c6a2230dbb1d0de679519ecafb4f0` 记录：
+
+- **契约与宿主。** 托管 CPU 测试覆盖插件配置、配方与 sigma 网格、上述在 CLI、服务端、
+  `--config`、请求路由和 Studio 中的全部拒绝，以及进程测试：每次拒绝都只输出一行
+  `Configuration error:`、退出码 1、不开始任何下载。
+- **原生辅助函数**（`eng/validation/minimax-h3-lora.cpp`，ctest `minimax-h3-lora`）在 `cpu` 与
+  `metal` 上：堆叠的 q/k/v shrink、折叠、拆分 fc1 与零上投影恒等均逐位相同，rank 0 的适配器
+  构建出与原来相同的图。
+- **两块合成对比**（真实代码、随机小权重）：带插件的直接 CPU 与合并了更新的 GGUF 在五种情况下
+  相对误差 ≤ 1.3e-7，而不交换 fc1 两半的合并相差 0.17。原生 `ggml_cpu` 对直接 CPU：显式 softmax
+  ≤ 3.0e-7，flash attention 的 F16 K/V 下 ≤ 2.05e-4。`ggml_metal`：≤ 5.0e-4，更新余弦
+  ≥ 0.9999993。强度 0 在 `ggml_cpu`、`ggml_metal` 与直接 CPU 上与不加插件逐位相同。夹具的
+  head 维度为 8，Metal 不会走其 flash 内核，因此该内核尚未带适配器运行。
+- **真实适配器文件**（CPU）：两个文件都加载为 624 个张量、312 项，rank 128，缩放 0.0625，
+  Ref2VA 会拒绝它们。第 10 块的行与发布方 ComfyUI 格式孪生文件逐位相同
+  （`InferenceWeb.Tests/Fixtures/MiniMaxH3/turbo-comfy-reference-rows.json`），以真实数据而非
+  TensorSharp 自身锁定了 fc1 两半交换与堆叠 q/k/v 布局。打包耗时：F32（2.77 GB）0.7 秒，
+  F16（1.38 GB）0.5 秒。
+
+在 `ggml_metal` 上用真实权重实测（每项各运行一次，属于样本而非基准）：
+
+- **第 0 步恒等**（384×256×22，种子 42）。Turbo-8 在 `--lora-scale 0` 下的首步视频速度与基础 H3
+  逐位相同；两次运行都从 σ = 1 开始。音频速度按设计不同：插件把视频 shift 从 12 改为 6，
+  这会重新缩放音频载体。强度为 1 时，更新使视频速度与基础的余弦相似度为 0.943。
+- **墙钟时间。** FL2VA，首尾两张关键帧，1280×768×107（34,991 个打包 token），种子 42：
+
+  | 运行 | DiT 步数 | 每步秒数 | VAE 解码 | 总计 |
+  |---|---:|---:|---:|---:|
+  | 基础，注意力修复之前 | 20 | ~570 | — | 11,553.8 秒 |
+  | 基础 | 20 | 262.8 | 148.0 秒 | 5,438.5 秒 |
+  | Turbo-8 | 8 | 264.7 | 146.6 秒 | 2,298.7 秒 |
+  | Turbo-4 | 4 | 264.7 | 146.2 秒 | 1,238.6 秒 |
+
+  非合并适配器每步开销不到 1%。带适配器的峰值内存未测。基础的一步在 38.3 GB 的 Metal 预算中
+  留出 3.3 GB 空闲，适配器另加 1.38 GB 的 F16 因子。
+- **768p 关键帧画布上的质量**（同一批运行，按全尺寸帧裁剪目测，并计算整帧统计）：
+  - 两个 Turbo 片段的人脸在片段中段和固定末帧附近都保持清晰、不变形，提示词要求的动作比基础更清楚。
+  - 与基础 20 步相比的偏离符合蒸馏模型的预期：对基础的整帧平均 PSNR，Turbo-8 为 17.5 dB，
+    Turbo-4 为 19.8 dB。作为参照，注意力修复前后的两次基础运行彼此相差 41.6 dB。
+  - 差异主要来自两张差异很大的关键帧之间的过渡：基础在第 13 帧左右溶接，两个 Turbo 变体都先保持首帧再硬切。
+  - Turbo 饱和度略高（平均 0.20 对 0.17），运动更多（平均帧间变化 7.3 与 5.1 对 2.0），音轨更响
+    （RMS 0.21 与 0.25 对 0.15）。
+- **4 步 shift A/B**（视频 shift 6 对 12，同样的关键帧与种子）。两者都干净且彼此接近：对基础 20 步
+  19.8 对 19.3 dB，饱和度 0.197 对 0.199，运动 5.1 对 5.3。一个种子无法分出优劣，因此 4 步配方
+  仍为推断，保持已发布 768p 配置所用的 shift 6。
+
+尚未运行，因此未经验证：
+
+- 两个插件在 640×384 下的文生视频，以及多个种子。
+- `ggml_metal` 对直接 `mlx` 的真实权重更新一致性。
+- 带适配器的 `ggml_cuda`、直接 `cuda` 与 `mlx`，TensorAgent 应用，以及 Diffusers + PEFT 参考
+  速度（本地没有可运行的参考）。
+
+日志与报告位于被忽略的 `artifacts/minimax-h3/turbo-*` 与 `artifacts/minimax-h3/lora-native/`
+（本地验证证据，未提交）。
 
 ## HTTP API
 
@@ -251,6 +436,7 @@ AdaLN 来自学习的 `[8,1025]` 曲线表，三模态分别取调制参数。
 | `TS_H3_PREFAULT_THREADS` | 托管预读流，默认 1 |
 | `TS_H3_TE_GROUP` | 可选原生文本主干分组，默认关闭 |
 | `TS_H3_KEEP_RESIDENT=1` | Metal 片段间保留网络 |
+| `TS_METAL_FLASH_KV_PAD=0` | 关闭让 `ggml_metal` 长 flash attention 走 tensor-API 内核的 key 补齐（见[上文](#metal-上的长序列注意力)），供 A/B 对比 |
 | `TS_H3_PHASE=1` / `TS_H3_TRACE=1` | 阶段耗时 / 潜变量与速度幅度 |
 | `TS_H3_DIT_TRACE_DIR` / `TS_H3_LINEAR_TRACE_FILE` | 会同步下载的边界诊断，排除在正式性能数据外 |
 

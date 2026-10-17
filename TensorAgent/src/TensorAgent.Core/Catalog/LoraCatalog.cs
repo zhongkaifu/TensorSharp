@@ -10,12 +10,13 @@
 
 namespace TensorAgent.Core.Catalog;
 
-/// <summary>What a LoRA plug-in does to a picture, which decides how it may be combined.</summary>
+/// <summary>What a LoRA plug-in does to a picture or a clip, which decides how it may be combined.</summary>
 public enum LoraKind
 {
-    /// <summary>A step-distillation plug-in: the same picture in a few steps instead of 40, with
-    /// its own sampling schedule. Used at the strength it was trained at, and only one at a time:
-    /// two schedules cannot both apply (the engine refuses the pair).</summary>
+    /// <summary>A step-distillation plug-in: the same picture or clip in a few steps instead of the
+    /// model's own (40 for Qwen-Image 2.1, 20 for MiniMax-H3), with its own sampling schedule. Used
+    /// at the strength it was trained at, and only one per model at a time: two schedules cannot
+    /// both apply (the engine refuses the pair).</summary>
     Speed,
     /// <summary>Changes how pictures look. Combines with a speed plug-in and with other styles.</summary>
     Style,
@@ -33,7 +34,7 @@ public sealed record LoraFile(string FileName, string Url, long Bytes, string Sh
 
 /// <summary>
 /// A LoRA plug-in for a diffusion model in <see cref="ModelCatalog"/>: a small adapter the
-/// engine applies on top of the model's own weights, unmerged, to every later picture.
+/// engine applies on top of the model's own weights, unmerged, to every later picture or clip.
 /// </summary>
 public sealed record CatalogLora
 {
@@ -65,7 +66,9 @@ public sealed record CatalogLora
     /// <summary>
     /// The engine's plug-in config (<c>config/lora/&lt;id&gt;.json</c>, embedded in this assembly)
     /// that carries the sampling schedule, for a speed plug-in whose weights do not: the engine
-    /// is handed it as the plug-in's config. Null when nothing beyond the weights is needed.
+    /// is handed it as the plug-in's config. A MiniMax-H3 plug-in's config also declares the
+    /// checkpoint it is for and its alpha, and the engine ties it to the weights by file name.
+    /// Null when nothing beyond the weights is needed.
     /// </summary>
     public string? RecipeConfig { get; init; }
     /// <summary>The engine's own config for a plug-in whose third-party config file ships with
@@ -102,16 +105,17 @@ public sealed record CatalogLora
 }
 
 /// <summary>
-/// The LoRA plug-ins the app offers, all for Qwen-Image 2.1: the fourteen the engine ships
-/// configs for in <c>config/lora/</c>, at the same pinned files (<c>LoraCatalogTests</c> keeps
-/// the two equal). Sizes and hashes were read from the Hugging Face tree API at the pinned
-/// commits on 2026-10-01 (the two added adapters on 2026-10-10) and checked against downloaded copies.
+/// The LoRA plug-ins the app offers: the fourteen for Qwen-Image 2.1 and the two MiniMax-H3
+/// Turbo plug-ins the engine ships configs for in <c>config/lora/</c>, at the same pinned files
+/// (<c>LoraCatalogTests</c> keeps the two equal). Sizes and hashes were read from the Hugging
+/// Face tree API at the pinned commits on 2026-10-01 (the two added Qwen adapters on 2026-10-10,
+/// the MiniMax-H3 ones on 2026-10-16) and checked against downloaded copies.
 ///
 /// <para>
 /// They are add-ons, not catalog entries: a plug-in is nothing without its base model, is a
-/// tenth of its size or less, and is chosen per picture rather than loaded. They live beside
-/// the models (<see cref="LoraStore"/>), are downloaded one at a time on request, and the
-/// ones the user turns on are applied to the loaded model before each picture.
+/// tenth of its size or less, and is chosen per picture or clip rather than loaded. They live
+/// beside the models (<see cref="LoraStore"/>), are downloaded one at a time on request, and
+/// the ones the user turns on are applied to the loaded model before each picture or clip.
 /// </para>
 /// </summary>
 public static class LoraCatalog
@@ -121,6 +125,14 @@ public static class LoraCatalog
     /// <summary>The same-architecture Qwen-Image 2.1 Turbo entries. Style/edit adapters apply
     /// to both, with image-validation scope recorded separately; speed adapters never do.</summary>
     public static readonly IReadOnlyList<string> QwenImageTurbo = new[] { "qwen-image-2.1-turbo-adq4k", "qwen-image-2.1-turbo-q8" };
+
+    /// <summary>MiniMax-H3's first-and-last-frame (FL2VA) entry, the one checkpoint its Turbo
+    /// plug-ins are for: the references (Ref2VA) entry has the same tensor shapes, and the engine
+    /// refuses them there by the checkpoint's file name.</summary>
+    public const string MiniMaxH3Keyframes = "minimax-h3-fl2va-q4k";
+
+    /// <summary>The commit of <c>lightx2v/Minimax-h3-Turbo</c> the MiniMax-H3 plug-ins are pinned to.</summary>
+    private const string MiniMaxH3TurboCommit = "a29e57d195f80ead07c89f89e55ecf2911e893c5";
 
     /// <summary>The Qwen Research License of the base model and most plug-ins.</summary>
     private const string QwenResearch = "catalog.license.qwenResearch";
@@ -393,6 +405,47 @@ public static class LoraCatalog
             Purpose = "catalog.lora.animeConsistency.purpose",
             License = "Apache-2.0",
         },
+        // MiniMax-H3 Turbo: step distillation for the keyframes checkpoint, applied unmerged per
+        // clip. The config fixes the step count, the linspace grid, video shift 6 / audio 3,
+        // Euler and CFG 1, and a clip that asks for anything else is refused, never overridden;
+        // the app never puts steps, a shift or a sampler in a clip's request (VideoTurns).
+        new CatalogLora
+        {
+            Id = "minimax-h3-fl2v-turbo-8step",
+            DisplayName = "LightX2V Turbo 8-Step",
+            BaseModelId = MiniMaxH3Keyframes,
+            Kind = LoraKind.Speed,
+            Steps = 8,
+            RecipeConfig = "minimax-h3-fl2v-turbo-8step.json",
+            Files = new[]
+            {
+                new LoraFile("minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors",
+                    Hf("lightx2v/Minimax-h3-Turbo", MiniMaxH3TurboCommit, "minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors"),
+                    1_383_677_808, "9b0efe3613b43a84e30febaa43af27432ea9d0711eac7bba904b2556b175f6d4"),
+            },
+            Purpose = "catalog.lora.minimaxH3Turbo8Step.purpose",
+            License = "Apache-2.0",
+        },
+        // Its schedule is INFERRED: upstream publishes no recipe for v1.2, so the config carries
+        // the 4-step v1.0 768p row's (linspace, shift 6/3) until it is validated
+        // (config/lora/minimax-h3-fl2v-turbo-4step.json).
+        new CatalogLora
+        {
+            Id = "minimax-h3-fl2v-turbo-4step",
+            DisplayName = "LightX2V Turbo 4-Step",
+            BaseModelId = MiniMaxH3Keyframes,
+            Kind = LoraKind.Speed,
+            Steps = 4,
+            RecipeConfig = "minimax-h3-fl2v-turbo-4step.json",
+            Files = new[]
+            {
+                new LoraFile("minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors",
+                    Hf("lightx2v/Minimax-h3-Turbo", MiniMaxH3TurboCommit, "minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors"),
+                    1_383_677_808, "c3d4a2cf618efea71b9e21a4baaa12d412f1eb6c2b6f86efacaf0ebb6814b689"),
+            },
+            Purpose = "catalog.lora.minimaxH3Turbo4Step.purpose",
+            License = "Apache-2.0",
+        },
     };
 
     /// <summary>The strengths a user may choose for a plug-in whose strength is adjustable.</summary>
@@ -407,15 +460,16 @@ public static class LoraCatalog
         BuiltIn.Where(l => l.AppliesTo(modelId)).ToList();
 
     /// <summary>
-    /// The plug-ins the LoRA sheet lists: those that apply to the loaded image model, so a Qwen-Image
-    /// 2.1 Turbo entry is never offered a speed plug-in; with no image model loaded, every plug-in
-    /// of a model in <paramref name="offered"/>.
+    /// The plug-ins the LoRA sheet lists: those that apply to the loaded image or video model, so
+    /// a Qwen-Image 2.1 Turbo entry is never offered a speed plug-in and MiniMax-H3 References,
+    /// LTX 2.5 or Wan none; with no image or video model loaded, every plug-in of a model in
+    /// <paramref name="offered"/>.
     /// </summary>
     public static IReadOnlyList<CatalogLora> Offered(CatalogModel? loaded, IEnumerable<CatalogModel> offered)
     {
         ArgumentNullException.ThrowIfNull(offered);
         CatalogModel[] models = offered.ToArray();
-        return BuiltIn.Where(l => loaded is { IsImageGenerator: true }
+        return BuiltIn.Where(l => loaded is { IsImageGenerator: true } or { IsVideoGenerator: true }
             ? l.AppliesTo(loaded.Id)
             : models.Any(m => l.AppliesTo(m.Id))).ToList();
     }

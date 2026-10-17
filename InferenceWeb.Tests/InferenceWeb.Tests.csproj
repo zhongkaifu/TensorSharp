@@ -34,6 +34,7 @@
     <EmbeddedResource Include="Fixtures/NemotronAudio/reference128.json" />
     <EmbeddedResource Include="Fixtures/NemotronAudio/frontend_reference.json" />
     <EmbeddedResource Include="Fixtures/MiniMaxH3/noise-reference.json" />
+    <EmbeddedResource Include="Fixtures/MiniMaxH3/turbo-comfy-reference-rows.json" />
     <EmbeddedResource Include="Fixtures/Ltx25/*" />
     <EmbeddedResource Include="Fixtures/Qwen35MRope/reference_positions.json" />
     <EmbeddedResource Include="Fixtures/Glm4Tokenizer/reference.json" />

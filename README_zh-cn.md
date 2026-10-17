@@ -86,7 +86,7 @@ dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNat
 
 各模型的后端、模态、功能支持与验证覆盖范围不同，详见[支持的模型](docs/supported_models_zh-cn.md)各表、[模型卡片](docs/models/README_zh-cn.md)及[嵌入指南](docs/embeddings_zh-cn.md)。
 
-TensorAgent 当前目录包含 39 个条目，按可搜索的模型家族分组，并支持内存档位与已下载过滤；其中包括实验性 48 GB 内存档位的 LTX 2.5 Distilled、4 位和 8 位 Qwen-Image-2.1 Turbo，以及十四款图像 LoRA 插件。扩展目录包含实验性条目，其内存档位与应用 / 设备行为尚未全部实测。Qwen3.8 Flash Next 使用 SSD 支持的权重路径；Q2 包已在 48 GB Mac 上测量，IQ1_M 另有 Windows 目录宿主验证。多 GPU 的 `--layer-split` 与 `--tp` 是独立选项，支持范围和性能取决于架构与量化格式。验证范围见 [TensorAgent 说明](TensorAgent/README.md#what-has-not-been-verified)（英文）与模型卡片。更新后的 Release Binaries 工作流会在新发布中提供桌面安装包，历史发布可能不包含这些资源。
+TensorAgent 当前目录包含 39 个条目，按可搜索的模型家族分组，并支持内存档位与已下载过滤；其中包括实验性 48 GB 内存档位的 LTX 2.5 Distilled、4 位和 8 位 Qwen-Image-2.1 Turbo、十四款图像 LoRA 插件，以及两个 MiniMax-H3 Turbo 提速插件。扩展目录包含实验性条目，其内存档位与应用 / 设备行为尚未全部实测。Qwen3.8 Flash Next 使用 SSD 支持的权重路径；Q2 包已在 48 GB Mac 上测量，IQ1_M 另有 Windows 目录宿主验证。多 GPU 的 `--layer-split` 与 `--tp` 是独立选项，支持范围和性能取决于架构与量化格式。验证范围见 [TensorAgent 说明](TensorAgent/README.md#what-has-not-been-verified)（英文）与模型卡片。更新后的 Release Binaries 工作流会在新发布中提供桌面安装包，历史发布可能不包含这些资源。
 
 ## 实际运行效果
 
@@ -164,7 +164,7 @@ TensorSharp 与 `llama.cpp` 在同一块 NVIDIA RTX 3080 Laptop GPU（16 GB）�
 | 服务能力 | 带共享前缀缓存的连续批处理、投机解码、张量并行、结构化输出与工具调用。 |
 | 智能体能力 | Agent Skills、沙箱化的文件与 shell 工具，以及有界的子智能体。见 [Agent Skills](docs/agent_skills.md)（英文）与[多智能体](docs/multi_agent.md)（英文）。 |
 | 知识库 | 本地文档、数据集与媒体集合；TensorAgent 支持目录和已保存聊天导入、每聊天作用域、词法 / 可选语义检索、来源预览与完整数据集智能体工具。媒体提取与 OCR 有明确的覆盖边界。见[个人知识库](docs/knowledge-system_zh-cn.md)。 |
-| TensorAgent | 38 项目录条目，支持家族搜索与过滤；保存聊天与产物、个人知识库、生成中追加指令、蒙版编辑、8 步 Turbo、十四款 LoRA、八种界面语言和持久保存的文本轮次统计。扩展目录条目仍属实验性；iOS 媒体生成及 Windows 图像 / 音频 / 视频生成仍未验证。 |
+| TensorAgent | 38 项目录条目，支持家族搜索与过滤；保存聊天与产物、个人知识库、生成中追加指令、蒙版编辑、8 步 Turbo、十四款图像 LoRA 与两个 MiniMax-H3 Turbo 插件、八种界面语言和持久保存的文本轮次统计。扩展目录条目仍属实验性；iOS 媒体生成及 Windows 图像 / 音频 / 视频生成仍未验证。 |
 
 逐项细节（哪个架构跑在哪个后端上、各家族分别支持哪些特性，以及已知限制）见[状态矩阵](docs/PROJECT_STATUS_zh-cn.md#状态矩阵)。
 

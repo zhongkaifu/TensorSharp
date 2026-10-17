@@ -34,7 +34,7 @@ dotnet run --project TensorSharp.Cli -- \
   <p><code>--video-upscaler</code> / <code>TS_VIDEO_UPSCALER</code> 指定放大器；可选 <code>--video-diffusion-vae</code> 选择颗粒/闪烁更少但较柔和的扩散解码器，仅支持 MLX/CPU，CUDA 会拒绝。实际 CUDA、MLX 与 Mac Catalyst 短片验证、数值参考与局限详见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/ltx-2.5_zh-cn.md">模型卡</a>与<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/eng/validation/README-ltx25.md">复现指南</a>。组件测试、旧版单阶段耗时与成功导出均不能证明当前两阶段管线的通用质量或性能对等。</p>
 
   <h2 id="minimax-h3">MiniMax-H3（提示词 → 视频<em>带音频</em>）</h2>
-  <p>H3 把视频与 <strong>32 kHz 立体声</strong>作为一条打包潜变量联合去噪。FL2VA 支持文本、图生视频与首尾帧，Ref2VA 支持身份参考。检查点经过 CFG 蒸馏，要求 <code>--cfg 1.0</code>；默认 20 步，4–8 步适合快速预览。当前性能与精度以 <a href="#h3-speed">2026-10-15 验证</a>为准；旧的 Metal 与 16 GB 笔记本速度倍数已被替代。需要以下四个网络，以及分词器文件：</p>
+  <p>H3 把视频与 <strong>32 kHz 立体声</strong>作为一条打包潜变量联合去噪。FL2VA 支持文本、图生视频与首尾帧，Ref2VA 支持身份参考。检查点经过 CFG 蒸馏，要求 <code>--cfg 1.0</code>；默认 20 步。减少基础步数可以更快得到较粗糙的预览，而 <a href="#h3-turbo">Turbo 插件</a>让 FL2VA 只按蒸馏时的 8 或 4 步采样。当前性能与精度以 <a href="#h3-speed">2026-10-15 验证</a>为准；旧的 Metal 与 16 GB 笔记本速度倍数已被替代。需要以下四个网络，以及分词器文件：</p>
   <pre data-lang="bash"><code># 去噪器 + 文本编码器
 hf download unsloth/MiniMax-H3-GGUF minimax_h3_fl2va_pruned-Q4_K.gguf --local-dir models
 hf download unsloth/MiniMax-H3-GGUF qwen3vl_32b_minimax_h3-Q4_K_M.gguf --local-dir models
@@ -52,7 +52,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_p
     --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 --output fox.mp4</code></pre>
   <p>分词器文件必须放在编码器旁边，或 <code>TS_VIDEO_TOKENIZER</code> 指向的位置：<code>hf download MiniMaxAI/MiniMax-H3 processor/vocab.json … --local-dir models</code> 会保留 <code>processor/</code> 这一层目录，而加载器从不去那里找。<code>tokenizer_config.json</code> 最容易漏掉，也是唯一定义 <code>&lt;|vision_start|&gt;</code>、<code>&lt;|image_pad|&gt;</code> 与 <code>&lt;|vision_end|&gt;</code> 的文件。文生视频不需要它，参考全是录音的请求也不需要；缺了它，带关键帧、或参考中含照片或视频片段的请求会在视觉塔运行之前被拒绝——以前图片会被放到提示词的错误位置上、悄悄被忽略。</p>
 
-  <p>也可以把四个网络都写进配置文件，让第一次运行自动下载——<code>config/minimax-h3-fl2va.json</code> 用于关键帧，<code>config/minimax-h3-ref2va.json</code> 用于参考。两者只有 <code>model</code> 一项不同，因此文本编码器与两个 VAE 只下载一次并共用（总计约 35.5 GB）。上面那三个分词器文件是自动下载唯一补不上的东西，因为它们不是命令行选项：</p>
+  <p>也可以把四个网络都写进配置文件，让第一次运行自动下载——<code>config/minimax-h3-fl2va.json</code> 用于关键帧，<code>config/minimax-h3-ref2va.json</code> 用于参考。两者只有 <code>model</code> 一项与尺寸不同（FL2VA 配置把尺寸交给模型，Ref2VA 配置固定 640×384），因此文本编码器与两个 VAE 只下载一次并共用（总计约 35.5 GB）。上面那三个分词器文件是自动下载唯一补不上的东西，因为它们不是命令行选项：</p>
   <pre data-lang="bash"><code>dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-ref2va.json</code></pre>
@@ -76,20 +76,20 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/m
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_pruned-Q4_K.gguf \
     --backend ggml_metal --image portrait.jpg \
     --prompt "the person turns toward the camera and smiles, subtle handheld motion" \
-    --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 --output animated.mp4
+    --video-frames 22 --diffusion-steps 8 --cfg 1.0 --output animated.mp4
 
 # 首尾帧：两端钉住，模型补出中间运动
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_pruned-Q4_K.gguf \
     --backend ggml_metal --image start.png --end-image end.png \
     --prompt "a slow cinematic push-in" \
-    --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 --output morph.mp4
+    --video-frames 22 --diffusion-steps 8 --cfg 1.0 --output morph.mp4
 
 # 参考：保留主体，机位、背景和构图全部重来
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_pruned-Q4_K.gguf \
     --backend ggml_metal --ref-image person.jpg --ref-image bottle.png \
     --prompt "she holds the bottle up to the light on a rooftop at golden hour, slow orbit" \
     --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 --output rooftop.mp4</code></pre>
-  <p>参考图只会被缩小并保持自身宽高比，输出画布仍由 <code>--width</code>/<code>--height</code> 决定。在 Ref2VA 检查点上，普通的 <code>--image</code> 会被当作单张参考，因此只会"上传一张图"的客户端（包括 Web UI）无需改动即可使用。</p>
+  <p>两个关键帧示例有意不给尺寸：i2v 与 fl2v 保留关键帧的构图，画布按 MiniMax 发布的 768p 配方由第一个关键帧决定——3:2 照片为 1152×768，2:3 竖图为 768×1152（见<a href="#h3-length">尺寸</a>）。参考图只会被缩小并保持自身宽高比，输出画布仍由 <code>--width</code>/<code>--height</code> 决定，两者都不给时为 640×384。在 Ref2VA 检查点上，普通的 <code>--image</code> 会被当作单张参考，并按该图宽高比保持 640×384 的面积，因此只会"上传一张图"的客户端（包括 Web UI）无需改动即可使用。</p>
 
   <h3 id="h3-references">参考：静图、片段与音轨</h3>
   <p>最多 <strong>九个</strong>参考，可以任意混搭。<code>--ref-image</code> 是静图，提示词里按位置称作 <code>&lt;Picture 1&gt;</code>、<code>&lt;Picture 2&gt;</code>……；<code>--ref-video</code> 是片段——视频文件或帧目录——会被重采样到 H3 自己的 24 fps 与自己的画布，称作 <code>&lt;Video 1&gt;</code>、<code>&lt;Video 2&gt;</code>……；<code>--ref-audio</code> 是音轨，重采样到音频 VAE 的 32 kHz 立体声并截断到所生成片段的时长。片段自带的声音要用 <code>--ref-video-audio</code> 单独给出，<em>按位置</em>与 <code>--ref-video</code> 配对，因为容器里的音轨无法通过帧解码器读取。</p>
@@ -108,9 +108,32 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_
   <p>参考<em>片段</em>是 H3 最昂贵的输入：22 帧 448×320 的参考会在输出本身所需的 1680 个 token 之外再加 980 个条件 token，而且 VAE 还得先把这 22 帧全部编码——在 M5 Pro 上实测，编码 14 s，之后每个去噪步约 9 s，而不带参考时只要 5 s。语言模型以 2 fps、每次两帧的方式看这段片段；去噪器则以潜变量的形式看到全部内容。</p>
 
   <h3 id="h3-length">长度、尺寸，以及长片段的上限</h3>
-  <p>宽高向<strong>上</strong>取整到 32 的倍数。帧数向上对齐到 <code>17k+5</code> 网格——5、22、39、56、73、90……——这来自视频 VAE 的时间分块，而不是随意选定的；fps 无论请求写什么都固定为 24。VAE 实现了跨该网格的分块解码：VAE 每次跑 5 个潜变量帧、带 2 帧前瞻，并对接缝做交叉淡化。反过来，一次性解码长片段会让细节被逐渐冲淡——对着条件照片测量，第 0 帧的相关度从 22 帧时的 0.97 掉到 90 帧时的 0.86——所以分块是正确性要求，而不是优化。只想要画面时用 <code>--no-audio</code> 跳过音频解码，省下音频 VAE 的时间与内存。</p>
+  <p>不指定尺寸时，文生视频与参考为 640×384；图生视频与首尾帧按 MiniMax 发布的 768p 配方由第一个关键帧（只有末帧时用末帧）决定画布：保持其宽高比、短边 768 像素、不超过 768×1344 像素，每边取最接近的 32 的倍数——3:2 照片为 1152×768，2:3 竖图为 768×1152，4:3 为 1024×768，16:9 为 1344×768，方图为 768×768，与 vllm-omni 和 sglang 一致；宽高比夹紧在 1:4 至 4:1 之间，多余部分居中裁掉。这两种模式保留关键帧的构图，而视频 VAE 在每个方向下采样 16 倍：全身照放进 640×384 后人脸只有约 60 像素高，仅 VAE 编码再解码就已经糊掉，与去噪器无关；在配方画布上人脸得以保留。代价是每帧视频 token 约为 640×384 的 2.4 倍（方图）到 4.2 倍（16:9 及更宽），4:3 为 3.2 倍、3:2 为 3.6 倍，而注意力开销增长得更快，因此一次运行要多花数倍时间。同时给出 <code>--width</code> 与 <code>--height</code> 会对所有模式（包括关键帧）固定同一尺寸；只给一个时，另一边按图像宽高比推出。TensorAgent 应用在其 32 GB 档位测得配方尺寸的峰值内存之前，仍按照片宽高比使用 640×384 面积的紧凑画布（3:2 为 608×416）。</p>
+  <p>显式给出的宽高向<strong>上</strong>取整到 32 的倍数。帧数向上对齐到 <code>17k+5</code> 网格——5、22、39、56、73、90……——这来自视频 VAE 的时间分块，而不是随意选定的；fps 无论请求写什么都固定为 24。VAE 实现了跨该网格的分块解码：VAE 每次跑 5 个潜变量帧、带 2 帧前瞻，并对接缝做交叉淡化。反过来，一次性解码长片段会让细节被逐渐冲淡——对着条件照片测量，第 0 帧的相关度从 22 帧时的 0.97 掉到 90 帧时的 0.86——所以分块是正确性要求，而不是优化。只想要画面时用 <code>--no-audio</code> 跳过音频解码，省下音频 VAE 的时间与内存。</p>
   <div class="callout warn"><div class="ic">⚠️</div><p><strong>长片段过去会整片全黑。</strong>H3 在一条不加掩码的打包序列上做双向注意力，因此它的 key 数量就是整段片段——22 帧是 2364 个 token，107 帧是 8646——而所有上游 ggml flash attention 内核都把 softmax 分子保持在 FP16，只留三个比特的余量。107 帧的片段在第一个去噪步就溢出成 NaN，回来时每个像素全黑、每个音频采样被削平，而同一条请求在 73 帧下却完全正常。现在 <code>h3_attend</code> 会按 key 数量取一个 2 的幂预先缩放 V，并在输出上还原——由于注意力对 V 是线性的，这一步是精确的；采样器也不再保存已经发散的片段，而是让请求失败并指出是哪一步，不再写出一个全黑文件。设 <code>TS_H3_TRACE=1</code> 可打印每一步的潜变量与速度幅值。</p></div>
   <div class="callout note"><div class="ic">💡</div><p>音频导出保留独立 <code>.wav</code>。MP4 是否含音轨取决于导出提供器：FFmpeg 或 Apple AVFoundation 路径可以混入音轨；其他路径可能返回视频与单独 WAV。可检查路由的 <code>audioMuxed</code>，或用 <code>ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4</code> 合并。分块解码与有限输出不能证明长片段感知质量。详见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/minimax-h3_zh-cn.md">模型卡</a>。</p></div>
+
+  <h3 id="h3-turbo">Turbo 插件：8 步或 4 步</h3>
+  <p>LightX2V 的 Turbo LoRA 把 FL2VA 检查点蒸馏为 8 或 4 次 Transformer 前向，取代基础的 20 步。两份插件配置 <code>config/lora/minimax-h3-fl2v-turbo-8step.json</code> 与 <code>-4step.json</code> 在 CLI 与服务端上应用它们。每份在首次使用时从 <a href="https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/a29e57d195f80ead07c89f89e55ecf2911e893c5" target="_blank" rel="noopener">lightx2v/Minimax-h3-Turbo</a> 下载权重，固定在修订版 <code>a29e57d</code> 并校验 SHA-256（各 1,383,677,808 字节，Apache-2.0），保存到模型根目录下的 <code>minimax-h3/loras/</code>。</p>
+  <pre data-lang="bash"><code># CLI：插件的配方取代 --diffusion-steps / --flow-shift / --sampler
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
+    --lora config/lora/minimax-h3-fl2v-turbo-8step.json \
+    --prompt "a red fox trotting through falling snow, cinematic" --output fox-turbo.mp4
+
+# 服务端：每段片段都按插件的配方采样；请求不要带 "steps"
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json \
+    --lora config/lora/minimax-h3-fl2v-turbo-4step.json</code></pre>
+  <div class="table-scroll"><table><thead><tr><th>插件</th><th>步数</th><th>配方</th></tr></thead><tbody>
+    <tr><td>LightX2V Turbo 8-step（FL2V v1.0，768p），<code>-8step.json</code></td><td>8</td><td>端点包含的 linspace 网格上的 Euler，视频 shift 6、音频 shift 3、CFG 1，与发布方给出的一致</td></tr>
+    <tr><td>LightX2V Turbo 4-step（FL2V v1.2，768p），<code>-4step.json</code></td><td>4</td><td>相同的网格与 shift。<strong>推断所得：</strong>发布方没有给出 v1.2 的配方，文件也未记录 shift，因此沿用其 4 步 v1.0 一行，直到经过验证</td></tr>
+  </tbody></table></div>
+  <ul>
+    <li><strong>配方是锁定的，不是默认值。</strong>步数、视频 flow shift、采样器与 CFG 可以不设或与插件取值相同；其他任何值都会被拒绝并给出插件名称，绝不会被静默覆盖。CLI 上的 <code>--diffusion-steps</code>、<code>--flow-shift</code>、<code>--sampler</code> 与 <code>--cfg</code>，以及服务端的 <code>--video-steps</code>，会在下载任何文件之前（包括 <code>--config</code> 的文件）以一行 <code>Configuration error:</code> 终止启动。请求中的 <code>steps</code>、<code>flowShift</code> 或 <code>sampler</code> 在 <code>/api/video-generate</code> 与 <code>/v1/videos/generations</code> 上返回 <code>400</code>，在流式路由上返回 <code>{done, error}</code> 事件。Video Studio 固定步数，并对按另一配方规划的镜头返回 <code>409 sampling_recipe_conflict</code>。通过 <code>TS_LORAS</code> 继承的插件接受同样的检查。</li>
+    <li><strong>只用于 FL2VA，且只能以插件配置传入。</strong>Ref2VA 检查点会拒绝它（不支持 Ref2VA Turbo）；裸 <code>.safetensors</code> 同样被拒绝，因为分区与配方由插件配置声明。同时使用两个 H3 插件、把 Qwen-Image-2.1 插件用于 H3、负的 <code>--lora-scale</code> 也都会被拒绝。强度 0 保留适配器的各项而上投影因子为零，因此每次前向都与基础检查点相同，可作恒等探针。</li>
+    <li><strong>不合并地应用</strong>在量化权重之上，与发布方推理脚本经 PEFT 的用法一致：50 个 DiT 块与 2 个 token-refiner 块中 q、k、v、out、fc1、fc2 上的 312 项，因子在 <code>ggml_metal</code> 与 <code>ggml_cuda</code> 上为 F16，占 1.38 GB，在 <code>ggml_cpu</code> 上为 F32，占 2.77 GB。画布默认值不变；适配器在 768p 下训练，短边不是 768 的片段会记录一行说明。</li>
+    <li><strong>适用范围。</strong>CLI 与服务端用 <code>--lora</code> 加载；Video Studio 显示配方并把每个任务绑定到它；<a href="agentic_zh-cn.html#tensoragent">TensorAgent 应用</a>在关键帧条目上把两个插件作为提速插件提供，在聊天与 Studio 中按片段应用。</li>
+    <li><strong>已验证：</strong>各宿主上的拒绝、<code>cpu</code> 与 <code>metal</code> 上的原生 LoRA 辅助函数、两块合成对比（直接 CPU 对合并了更新的检查点，<code>ggml_cpu</code> 与 <code>ggml_metal</code> 对直接 CPU），以及 CPU 上的真实适配器文件——抽查的各行与发布方 ComfyUI 格式孪生文件逐位相同。<strong>M5 Pro 实测</strong>（<code>ggml_metal</code>，FL2VA 关键帧，1280×768×107，种子 42，每项一次）：基础 20 步 5,438.5 秒，Turbo-8 2,298.7 秒，Turbo-4 1,238.6 秒，适配器每步开销不到 1%。强度 0 时首步视频速度与基础逐位相同。两个 Turbo 片段的人脸都保持清晰。与基础相比，Turbo 片段在差异很大的关键帧之间硬切而非溶接，饱和度略高，音轨更响。视频 shift 12 的 4 步运行与 shift 6 同样干净，因此 4 步配方仍为推断。<strong>尚未实测：</strong>带适配器的峰值内存、640×384 文生视频、更多种子，以及 <code>ggml_cuda</code>、直接 <code>cuda</code> 与 <code>mlx</code> 上带适配器的运行。<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/minimax-h3_zh-cn.md#turbo-插件" target="_blank" rel="noopener">契约、sigma 表与验证状态 →</a></li>
+  </ul>
 
   <h3 id="h3-speed">2026-10-15：当前性能与精度</h3>
   <p>以下是同一精度下的版本前后对照，并非对 stable-diffusion.cpp 的速度倍数。FL2VA Q4_K，640×384×22、24 fps、20 Euler 步、种子 42、CFG 1、flow shift 12；两轮交替运行，包含加载、生成与编码。M5 Pro 为 48 GiB 统一内存，A40 为 46,068 MiB 显存/CUDA 12.8；OS 缓存未受控，不是热模型服务基准。两边均使用未修改的上游 ggml <code>3612c0af93f2cfc8f048295300a61187723b12ae</code>。</p>
@@ -123,20 +146,22 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_
   <p>所有完整比较的解码 RGB 与音频完全一致。优化减少重复 RoPE/切片/调制工作，缓存原生 CUDA 图绑定，并让 MLX VAE 直接持有 F32 权重。固定潜变量检查中，采样的热进程 RSS 中位数 23.048 → 14.024 GiB；这不是峰值统一/GPU 内存的降低测量。</p>
   <p>直接 CUDA 的 BF16 权重投影现在默认采用 pedantic F32，<code>TS_H3_CUDA_BF16_PEDANTIC=0</code> 才会恢复旧近似。独立 PyTorch F32 全 50 层合成参考中，音频/视频相对 L2 误差为 0.000125891 / 0.000084754，均通过 0.001 门限；这不是自然媒体的多步感知质量验证。实验性批量注意力未通过完整生成质量门限，模型开关已移除。</p>
   <p>最终构建另有 CPU/MLX 与远端 CUDA 聚焦测试、四条 GPU 通道各九个组件参考检查及完整生成保真对照；这些保真对照不增加速度样本。<code>TS_H3_PHASE=1</code> 打印阶段耗时，<code>TS_H3_TRACE=1</code> 打印潜变量诊断。完整条件、结果和被拒绝的实验见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/eng/validation/README-minimax-h3.md">复现指南</a>。</p>
+  <p><strong>Metal 上的长序列注意力。</strong>FL2VA 上一段 1280×768×107 的首尾帧片段有 34,991 个打包 token，在这个长度下每一步都以注意力为主。ggml-metal 只有在 key 数为 64 的倍数时才会把长 flash attention 放到 Metal 4 tensor-API 内核上，因此 TensorSharp 用带掩码的零行把 key 补齐（结果不变），并把 query 分块运行、共用一个很小的掩码。在 M5 Pro 上用 <code>ggml_metal</code>、未修改的 ggml <code>a05c9922613c6a2230dbb1d0de679519ecafb4f0</code>、20 步、种子 42，整次运行从 11,553.8 秒降到 5,438.5 秒（2.12×），每步约从 570 秒降到 263 秒。这是单机上的单次运行，按 CLI 报告的整段片段计时；<code>TS_METAL_FLASH_KV_PAD=0</code> 可关闭补齐以做 A/B 对比。</p>
 
   <h3 id="h3-cpu">后端与验证范围</h3>
   <p>六个后端有独立执行路径：<code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_cpu</code> 使用 TensorSharp 原生 ggml 集成，<code>mlx</code>、<code>cuda</code>、<code>cpu</code> 使用直接实现。纯 C# CPU 支持文本、首尾帧与参考图像/视频/音频，无需 ggml；完整检查点吞吐仍受限于主机资源。合成组件、技术冒烟和成功写出文件不构成所有模式的感知质量验证；图像与音频参考的具体门限见模型卡。视频噪声种子使用 <code>--diffusion-seed</code>。</p>
 
   <h3 id="h3-server">部署到服务端</h3>
-  <p>在服务端，尺寸是<strong>启动参数</strong>，因为浏览器不会自己发尺寸：<code>--video-width 640 --video-height 384 --video-steps 20</code> 是文档给出的起点（<code>--width</code> / <code>--height</code> 是别名；只给其中一个时，H3 会从条件图像的宽高比推出另一个）。<code>--video-mode</code> 用于给只提供一种模式的部署固定条件模式；不写它，则每条请求各自推断，通常这才是你想要的。<code>--video-frames</code>、<code>--fps</code>、<code>--video-vae</code>、<code>--video-text-encoder</code> 与 <code>--audio-vae</code> 补齐其余部分。服务端完全没有 <code>--cfg</code>，这也是随仓库提供的配置既不设步数也不设引导的原因。</p>
+  <p>在服务端，尺寸是<strong>启动参数</strong>，因为浏览器不会自己发尺寸；而对 H3 推荐的做法是不设 <code>--video-width</code> / <code>--video-height</code>：这样文生视频与参考为 640×384，i2v/fl2v 采用第一个关键帧的<a href="#h3-length">配方尺寸</a>。两个都设会对所有模式（包括关键帧）固定同一尺寸，并关闭 Studio 的“按首帧（模型推荐配置）”尺寸（<code>--width</code> / <code>--height</code> 是别名；只给其中一个时，H3 会从条件图像的宽高比推出另一个）。<code>--video-steps 20</code> 与默认步数一致。<code>--video-mode</code> 用于给只提供一种模式的部署固定条件模式；不写它，则每条请求各自推断，通常这才是你想要的。<code>--video-frames</code>、<code>--fps</code>、<code>--video-vae</code>、<code>--video-text-encoder</code> 与 <code>--audio-vae</code> 补齐其余部分。服务端完全没有 <code>--cfg</code>，这也是随仓库提供的配置既不设步数也不设引导的原因。</p>
   <pre data-lang="bash"><code>dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/minimax_h3_fl2va_pruned-Q4_K.gguf \
-    --backend ggml_metal --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+    --backend ggml_metal --video-steps 20 --video-frames 22
 
 curl -s http://localhost:5000/api/video-generate -H 'content-type: application/json' -d '{
   "prompt": "a red fox trotting through falling snow, cinematic",
-  "width": 640, "height": 384, "frames": 22, "steps": 8, "cfg": 1.0,
+  "frames": 22, "steps": 8, "cfg": 1.0,
   "imagePath": "card.jpeg", "videoMode": "i2v"
 }'</code></pre>
+  <p>要按 <a href="#h3-turbo">Turbo 配方</a>提供服务，加上 <code>--lora config/lora/minimax-h3-fl2v-turbo-8step.json</code>（或 4 步那份），<code>--video-steps</code> 不设或设为插件的步数；此后请求不要带 <code>steps</code>，与 Web UI 一样。示例中的 <code>"steps": 8</code> 只有 8 步插件接受，冲突的取值会被拒绝而不是被覆盖。</p>
   <p>有三条路由接收这个请求体：<code>POST /api/video-generate</code>、<code>POST /api/video-generate/stream</code>（同样的东西，外加 SSE 进度事件）以及 OpenAI 形状的 <code>POST /v1/videos/generations</code>。三者共用同一个解析器，因此 <code>videoMode</code>、<code>generateAudio</code>、<code>endImage</code>、<code>referenceImages</code>、<code>referenceVideos</code>、<code>referenceAudios</code> 与 <code>referenceVideoAudios</code> 在三条路由上都可用，并且各自还接受下划线写法；<code>referenceVideoAudios</code> 按下标与 <code>referenceVideos</code> 配对。响应里带 <code>audioUrl</code>（OpenAI 路由上是 <code>audio_url</code>），模型没有产生音轨时为 null；除 OpenAI 路由外还带 <code>audioMuxed</code>，表示 MP4 里是否也带着这条音轨。所有文件字段都必须指向此前通过 <code>/api/upload</code> 上传的文件，并被限制在上传目录之内。模型层面的拒绝（加载了错误的检查点、关键帧与参考混用）会以 <strong>400 加上模型自己的报错信息</strong>返回，而不是笼统的 500。</p>
   <p><code>GET /api/models</code> 会返回一个 <code>video</code> 对象——非视频模型一律为 null——其中包含 <code>family</code>（<code>minimax-h3</code>）、<code>supportsAudio</code>、<code>supportsImageConditioning</code>、<code>supportsEndImageConditioning</code>、<code>supportsReferenceConditioning</code> 与 <code>maxReferenceImages</code>。Web UI 正是靠它判断该不该提供首帧、尾帧，或最多九个参考：它根据 <code>supportsReferenceConditioning</code> 启用参考附件控件，并在 <code>maxReferenceImages</code> 处停止添加，而不是去匹配架构字符串。</p>
 

@@ -53,7 +53,7 @@ public class MiniMaxH3UploadedImageTests
     public void UploadedBytesSetTheCanvasAspectWhenOnlyWidthIsSupplied()
     {
         var request = new VideoGenerationParams { Width = 640, ImageBytes = UploadedPng() };
-        Assert.Equal((640, 320), MiniMaxH3Pipeline.ResolveCanvas(request));
+        Assert.Equal((640, 320), MiniMaxH3Pipeline.ResolveCanvas(request, MiniMaxH3Mode.ImageToVideo));
     }
 
     [Fact]

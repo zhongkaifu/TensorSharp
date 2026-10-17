@@ -30,11 +30,32 @@
   // both hosts, and the two spell steps differently — --video-steps N on the server,
   // --diffusion-steps N on the CLI, and the server takes no --cfg at all. So the
   // model's own defaults apply (20 steps, guidance off). H3 is CFG-distilled: cfg
-  // MUST stay 1.0, which the pipeline enforces by refusing anything higher. 4-8 steps
-  // is the fast operating point, at the cost of some chromatic fringing around moving
-  // subjects that is gone by ~20.
+  // MUST stay 1.0, which the pipeline enforces by refusing anything higher. Fewer base
+  // steps cost some chromatic fringing around moving subjects that is gone by ~20.
+  //
+  // FOR FEWER STEPS, add the LightX2V Turbo plug-in, a step-distillation LoRA made for
+  // this checkpoint, instead of lowering the base step count:
+  //   TensorSharp.Cli --config config/minimax-h3-fl2va.json \
+  //     --lora config/lora/minimax-h3-fl2v-turbo-8step.json --prompt "..." --output clip.mp4
+  //   TensorSharp.Server.Host --config config/minimax-h3-fl2va.json \
+  //     --lora config/lora/minimax-h3-fl2v-turbo-8step.json
+  // It samples exactly 8 steps (minimax-h3-fl2v-turbo-4step.json: 4) on its own schedule,
+  // video shift 6 / audio 3, Euler, cfg 1, and its 1.38 GB of weights download on first
+  // use. Leave the step count, flow shift and sampler unset with it: any other value is
+  // refused at startup, before anything downloads. See docs/models/minimax-h3.md#turbo-plug-ins.
   //
   // The frame count snaps to the 17k+5 grid and fps is pinned to 24.
+  //
+  // THE SIZE IS LEFT TO THE MODEL, on purpose. Text-to-video runs at 640x384. A
+  // keyframe (--image for i2v, --image and --end-image for fl2v) sizes the canvas
+  // itself, by MiniMax's released 768p recipe: the first keyframe's aspect at a
+  // 768-pixel short edge, so 1152x768 for a 3:2 photo and 1344x768 for 16:9. Those
+  // modes keep the keyframe's framing, and the video VAE downsamples 16x each way:
+  // fitted to 640x384, a full-body photo leaves a face about 60 px tall, and it comes
+  // back smeared and distorted however many steps run. The recipe has about 2.4x
+  // (square) to 4.2x (16:9) the video tokens per frame of 640x384, so it takes several
+  // times longer. To pin one size for every mode, pass both --width and --height (CLI)
+  // or both --video-width and --video-height (server).
   "variables": {
     // Override the location with the TENSORSHARP_MODELS environment variable;
     // otherwise ../models, and relative paths in a config resolve against the
@@ -90,8 +111,6 @@
     "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48"
   },
 
-  "width": 640,
-  "height": 384,
   "video-frames": 22,
   "fps": 24
 }

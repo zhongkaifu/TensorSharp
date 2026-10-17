@@ -31,10 +31,11 @@ namespace TensorAgent.Core.Hosting;
 /// </para>
 /// <para>
 /// The video service's frames are translated into the chat stream's vocabulary:
-/// <c>video_step</c> with a <c>video_phase</c> while the clip is made, one <c>videoUrl</c>
-/// for the finished clip (with <c>audioUrl</c> only when its sound is a separate file the
-/// page must play itself), and the usual <c>done</c> with the session, which is what the
-/// recorder keys the transcript on.
+/// <c>video_step</c> with a <c>video_phase</c> while the clip is made (and <c>video_loras</c>,
+/// the LoRA plug-ins it is made with, when there are any), one <c>videoUrl</c> for the finished
+/// clip (with <c>audioUrl</c> only when its sound is a separate file the page must play
+/// itself), and the usual <c>done</c> with the session, which is what the recorder keys the
+/// transcript on.
 /// </para>
 /// </summary>
 public static class VideoTurns
@@ -46,9 +47,11 @@ public static class VideoTurns
     /// take 148 s, 39 frames 279 s, and 56 frames about 7 minutes, since every step attends
     /// over the whole clip.
     ///
-    /// <para>The step count is left to the model: 20, the reference's own default. H3 is
-    /// step-distilled and runs at 4 to 8, but those leave visible colour fringing on moving
-    /// subjects that is gone by 20.</para>
+    /// <para>The step count is left to the model: 20, the reference's own default, or the
+    /// count a MiniMax-H3 Turbo plug-in turned on under LoRAs fixes (8 or 4, with its own
+    /// schedule; see <c>config/lora/minimax-h3-fl2v-turbo-*.json</c>). A clip's request never
+    /// carries steps, a flow shift or a sampler for H3: a plug-in's contract fixes them and
+    /// refuses any other value, and without one the model's own defaults apply.</para>
     /// </summary>
     public const int DefaultFrames = 22;
 
@@ -61,8 +64,13 @@ public static class VideoTurns
     /// <param name="chat">The chat service, with a video model loaded.</param>
     /// <param name="body">The <c>/api/chat</c> request the page sent.</param>
     /// <param name="cancellationToken">Ends the turn; the clip is abandoned.</param>
+    /// <param name="prepare">Asked once, after the request is read and recorded, for the LoRA
+    /// plug-ins the clip is made with (always with false: a clip edits no photo). The video
+    /// service applies them under the lock the clip runs in; a refusal ends the turn with its
+    /// reason. Null for a host that chooses none, whose clips keep the model's own set.</param>
     public static async IAsyncEnumerable<object> StreamAsync(
-        WebUiChatService chat, JsonElement body, [EnumeratorCancellation] CancellationToken cancellationToken)
+        WebUiChatService chat, JsonElement body, [EnumeratorCancellation] CancellationToken cancellationToken,
+        Func<bool, ImageTurns.Preparation>? prepare = null)
     {
         ArgumentNullException.ThrowIfNull(chat);
 
@@ -89,17 +97,30 @@ public static class VideoTurns
         if (!string.IsNullOrEmpty(sessionId))
             chat.OnChatRequest?.Invoke(sessionId, body);
 
+        // As a picture asks after its plan: the clip is made with the plug-ins chosen now, or
+        // not at all, rather than without the ones the user turned on.
+        ImageTurns.Preparation? prepared = prepare?.Invoke(false);
+        if (prepared?.Error is { } refusal)
+        {
+            yield return new { done = true, error = refusal, sessionId };
+            yield break;
+        }
+
         using JsonDocument payload = JsonDocument.Parse(JsonSerializer.Serialize(request.Payload));
         JsonElement service = payload.RootElement.Clone();
-        await foreach (object frame in Translate(chat.VideoGenerateStreamAsync(service, cancellationToken), sessionId, cancellationToken)
-                           .ConfigureAwait(false))
+        IAsyncEnumerable<object> frames = prepared is null
+            ? chat.VideoGenerateStreamAsync(service, cancellationToken)
+            : chat.VideoGenerateStreamAsync(service, prepared.Specs, cancellationToken);
+        await foreach (object frame in Translate(frames, sessionId, cancellationToken, prepared?.Loras).ConfigureAwait(false))
             yield return frame;
     }
 
-    /// <summary>The video service's frames, as the chat stream's.</summary>
+    /// <summary>The video service's frames, as the chat stream's. A step frame names the LoRA
+    /// plug-ins in use (<c>video_loras</c>) when there are any.</summary>
     internal static async IAsyncEnumerable<object> Translate(
         IAsyncEnumerable<object> frames, string? sessionId,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation] CancellationToken cancellationToken = default,
+        IReadOnlyList<string>? loras = null)
     {
         string? lastPhase = null;
         int lastStep = -1;
@@ -161,13 +182,27 @@ public static class VideoTurns
             lastPhase = phase;
             lastStep = step;
             lastTimed = elapsed > 0;
+            double etaSeconds = f.TryGetProperty("etaSeconds", out JsonElement e) && e.TryGetDouble(out double eta) ? eta : -1;
+            if (loras is { Count: > 0 })
+            {
+                yield return new
+                {
+                    video_step = step,
+                    video_steps = Number(f, "total"),
+                    video_phase = phase,
+                    elapsed,
+                    eta = etaSeconds,
+                    video_loras = loras,
+                };
+                continue;
+            }
             yield return new
             {
                 video_step = step,
                 video_steps = Number(f, "total"),
                 video_phase = phase,
                 elapsed,
-                eta = f.TryGetProperty("etaSeconds", out JsonElement e) && e.TryGetDouble(out double eta) ? eta : -1,
+                eta = etaSeconds,
             };
         }
 

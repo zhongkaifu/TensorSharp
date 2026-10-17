@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using TensorSharp.Cuda;
 using TensorSharp.MLX;
@@ -13,8 +14,23 @@ namespace TensorSharp.Models.Ltx25;
 internal static class Ltx25Pipeline
 {
     internal static GeneratedVideo Generate(Ltx25Model model, string prompt, VideoGenerationParams parameters)
+        => Generate(model, prompt, parameters, null);
+
+    // Diagnostic callers can observe the final normalized [128,T,H,W] video
+    // latents and token-major audio before either decoder. Buffers are borrowed
+    // and must not be mutated. The ordinary generation path has no observer.
+    internal static GeneratedVideo Generate(Ltx25Model model, string prompt, VideoGenerationParams parameters,
+        Action<Ltx25GenerationSettings, float[], float[]> finalLatents)
+        => Generate(model, prompt, parameters, finalLatents, null);
+
+    // Diagnostic-only override for the first pass's frame-zero guide. The
+    // refinement pass continues to use the request's explicit strength.
+    internal static GeneratedVideo Generate(Ltx25Model model, string prompt, VideoGenerationParams parameters,
+        Action<Ltx25GenerationSettings, float[], float[]> finalLatents, float? firstStageImageStrength)
     {
         ArgumentNullException.ThrowIfNull(prompt);
+        if (firstStageImageStrength is float strength && (!float.IsFinite(strength) || strength < 0 || strength > 1))
+            throw new ArgumentOutOfRangeException(nameof(firstStageImageStrength), "Image strength must be finite and in [0,1].");
         var settings = Ltx25GenerationSettings.Resolve(parameters, model.SupportsReferenceConditioning);
         var timer = Stopwatch.StartNew();
         var phase = Stopwatch.StartNew();
@@ -45,7 +61,11 @@ internal static class Ltx25Pipeline
             bool twoStage = settings.TwoStage;
             var first = twoStage ? settings.HalfResolution() : settings;
             var images = identity ? Array.Empty<VideoImageCondition>() : Ltx25ImageConditioning.Resolve(parameters, settings.Frames);
-            var resolvedImages = images.Select(image => image.ResolveImage()).ToArray();
+            float? effectiveFirstStageStrength = ResolveFirstStageImageStrength(parameters, twoStage, images, firstStageImageStrength);
+            // Recompress each original once; both stages resize the same conditioned
+            // source independently, as the publisher's image loader does.
+            var resolvedImages = images.Select(image => Ltx25ImagePreprocessing.PrepareSource(
+                image.ResolveImage(), parameters.CancellationToken)).ToArray();
             float[] encodedReference = null;
             int identitySourceCount = 0;
             // Progress phases follow the hosts' video contract (text-encode, denoise,
@@ -59,7 +79,7 @@ internal static class Ltx25Pipeline
                 for (int i = 0; i < images.Count; ++i)
                 {
                     parameters.CancellationToken.ThrowIfCancellationRequested();
-                    RgbImage resized = TensorSharp.Models.QwenImage.ImageIO.ResizeCover(resolvedImages[i], stage.Width, stage.Height);
+                    RgbImage resized = Ltx25ImagePreprocessing.ResizeAndCenterCrop(resolvedImages[i], stage.Width, stage.Height);
                     encoded.Add(new(model.EncodeImage(resized.Pixels, stage.Height, stage.Width, parameters.CancellationToken),
                         images[i].FrameIndex, images[i].Strength));
                 }
@@ -77,7 +97,12 @@ internal static class Ltx25Pipeline
                 encodedReference = model.EncodeStaticReferenceVideo(sheet.Pixels, settings.Frames, settings.Height, settings.Width, parameters.CancellationToken);
                 Trim(); EndPhase("reference-encode");
             }
-            else encodedImages = EncodeImages(first, "image-encode", "image-encode");
+            else
+            {
+                encodedImages = EncodeImages(first, "image-encode", "image-encode");
+                if (effectiveFirstStageStrength.HasValue)
+                    encodedImages = WithFirstStageImageStrength(encodedImages, effectiveFirstStageStrength.Value);
+            }
             Report("text-encode", "Gemma 4 and learned AV conditioning");
             Ltx25PromptEncoding conditioning = model.Conditioning(identity
                 ? Ltx25ReferencePrompt.Format(prompt, identitySourceCount) : prompt, parameters.CancellationToken);
@@ -119,7 +144,9 @@ internal static class Ltx25Pipeline
                     : Ltx25ImageConditioning.Apply(input, stage, stageImages, rawNoise, noiseScale);
                 Report("denoise", $"{(priorVideo == null ? twoStage ? "first pass" : "single pass" : "refinement pass")} at {stage.Width}x{stage.Height}: {stage.VideoTokens} video + {guideTokens} guide, {stage.AudioTokens} audio, {conditioning.Tokens} prompt tokens, " +
                     (stage.Ancestral ? Ltx25GenerationSettings.AncestralSampler
-                        : $"{Ltx25GenerationSettings.EulerSampler} (requested; the publisher samples LTX 2.5 with {Ltx25GenerationSettings.AncestralSampler})"));
+                        : $"{Ltx25GenerationSettings.EulerSampler} (requested; the publisher samples LTX 2.5 with {Ltx25GenerationSettings.AncestralSampler})") +
+                    (identity || stageImages.Count == 0 ? "" : "; temporal guide strengths: " + string.Join(", ", stageImages.Select(image =>
+                        $"frame {image.FrameIndex}={image.Strength.ToString("R", CultureInfo.InvariantCulture)}"))));
                 Ltx25SamplingOutput result = model.Sample(input, stage, (step, total) =>
                     {
                         completed = stepOffset + step;
@@ -147,8 +174,10 @@ internal static class Ltx25Pipeline
                     Ltx25Geometry.PackVideo(upsampled, settings.VideoTokens, 128), latents.Audio);
             }
 
+            float[] videoLatents = Ltx25Geometry.UnpackVideo(latents.Video.AsSpan(0, checked(settings.VideoTokens * 128)), settings.VideoTokens, 128);
+            finalLatents?.Invoke(settings, videoLatents, latents.Audio);
             Report("vae-decode", model.UsesDiffusionDecoder ? "diffusion video decoder" : "convolutional video decoder");
-            float[] pixels = model.DecodeVideo(Ltx25Geometry.UnpackVideo(latents.Video.AsSpan(0, checked(settings.VideoTokens * 128)), settings.VideoTokens, 128),
+            float[] pixels = model.DecodeVideo(videoLatents,
                 settings.LatentFrames, settings.LatentHeight, settings.LatentWidth, settings.Seed, parameters.CancellationToken);
             Trim();
             int frameSize = checked(settings.Width * settings.Height * 3);
@@ -178,5 +207,39 @@ internal static class Ltx25Pipeline
             return new GeneratedVideo { Frames = frames, Fps = settings.Fps, Seed = settings.Seed, Audio = audio };
         }
         finally { Trim(); }
+    }
+
+    // The publisher's two-stage I2V workflow uses .7 at half resolution and 1
+    // during refinement. Only shorthand first-image requests select this default:
+    // explicit guides, ordered/end images and other modes retain their strengths.
+    // A null result means that the first pass uses the resolved request strengths.
+    internal static float? ResolveFirstStageImageStrength(VideoGenerationParams parameters, bool twoStage,
+        IReadOnlyList<VideoImageCondition> images, float? diagnosticOverride = null)
+    {
+        ArgumentNullException.ThrowIfNull(parameters);
+        ArgumentNullException.ThrowIfNull(images);
+        if (diagnosticOverride is float strength)
+        {
+            if (!float.IsFinite(strength) || strength < 0 || strength > 1)
+                throw new ArgumentOutOfRangeException(nameof(diagnosticOverride), "Image strength must be finite and in [0,1].");
+            if (!twoStage || !images.Any(image => image.FrameIndex == 0))
+                throw new ArgumentException("A first-stage image strength requires two-stage generation with a frame-zero image guide.", nameof(diagnosticOverride));
+            return strength;
+        }
+        bool shorthand = parameters.Image != null || parameters.ImageBytes is { Length: > 0 } || !string.IsNullOrWhiteSpace(parameters.ImagePath);
+        bool firstImageMode = string.IsNullOrWhiteSpace(parameters.Mode) || parameters.Mode == "i2v";
+        return twoStage && shorthand && firstImageMode && images.Count == 1 && images[0].FrameIndex == 0 &&
+            parameters.EndImage == null && string.IsNullOrWhiteSpace(parameters.EndImagePath) &&
+            parameters.ReferenceImagePaths is not { Count: > 0 } && parameters.ImageConditions is not { Count: > 0 }
+            ? .7f : null;
+    }
+
+    internal static List<Ltx25EncodedImage> WithFirstStageImageStrength(IReadOnlyList<Ltx25EncodedImage> images, float strength)
+    {
+        if (!float.IsFinite(strength) || strength < 0 || strength > 1)
+            throw new ArgumentOutOfRangeException(nameof(strength), "Image strength must be finite and in [0,1].");
+        if (!images.Any(image => image.FrameIndex == 0))
+            throw new ArgumentException("A first-stage strength requires a frame-zero image guide.", nameof(images));
+        return images.Select(image => image.FrameIndex == 0 ? image with { Strength = strength } : image).ToList();
     }
 }

@@ -1526,9 +1526,12 @@ refused with the supported counts named (the Pruna 8-step plug-in supports 8).
 Style and editing plug-ins carry no recipe, so omitted values keep the model
 defaults (40 steps, CFG 1). Repeat `--lora` to stack plug-ins and use
 `--lora-scale` for strength. At startup the server logs
-`LoRA plug-ins (applied to Qwen-Image-2.1 models only): ...`. The flags, the
+`LoRA plug-ins (Qwen-Image-2.1 / MiniMax-H3): ...`, and refuses a plug-in the startup
+model does not take before the plug-in downloads (a model a `--config` still has to
+download is checked right after that download). The flags, the
 shipped plug-ins and the plug-in config format are in
-[USAGE.md](../USAGE.md#qwen-image-21-lora-plug-ins).
+[USAGE.md](../USAGE.md#qwen-image-21-lora-plug-ins). MiniMax-H3's Turbo plug-ins are
+under [video generation](#minimax-h3--video-and-native-32-khz-stereo-audio).
 
 ### Video Generation (`/api/video-generate`, `/v1/videos/generations`)
 
@@ -1571,8 +1574,9 @@ a data URL in place of `imagePath`. `/api/models.video` advertises
 `maxReferenceImages`. In the web UI and TensorAgent, one photo starts the clip,
 two are first and last frames, and three or more are spaced along the timeline.
 Each attached photo also has a frame-position and strength control.
-For a last-frame-only request, omit `videoMode` or select `keyframes`;
-`fl2v` requires both first and last frames.
+A last frame alone is `fl2v` (send only `endImage`): the clip ends on it.
+`fl2v` needs the last frame and takes a first frame too; `i2v` needs a first frame
+and refuses an end image.
 
 These images guide moments in the video. The optional Ingredients IC-LoRA adds
 identity/appearance references when installed under `loras/` beside the model or
@@ -1597,16 +1601,31 @@ it, because its GGUF ships no tokenizer:
 
 ```bash
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
-  --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
+  --video-steps 20 --video-frames 22
 ```
 
-`--video-width`/`--video-height` matter more here than for any other model: the
-Web UI sends no size of its own, so without them every clip comes out at the
-model's default. Frame counts snap to H3's `17k+5` grid (5, 22, 39, 56, 73, 90 …),
-width and height round up to a multiple of 32, and fps is pinned to 24 whatever a
-request asks for. H3 is CFG-distilled — guidance above `1.0` is refused outright —
-so `steps` is the quality lever: 20 is the model's default and 4-8 is the fast
-operating point.
+Leave `--video-width`/`--video-height` unset for this model. A request that names
+no size (the chat Web UI sends none) then gets the canvas its mode calls for.
+Text-to-video runs at 640×384. Image-to-video and first/last-frame take the canvas
+from the first keyframe (the last one when it is the only one) by MiniMax's
+released 768p recipe: the keyframe's aspect at a 768-pixel short edge, capped at
+768×1344 pixels, each side on the nearest multiple of 32. A 3:2 photo gets
+1152×768, a 2:3 portrait 768×1152, 4:3 1024×768, 16:9 1344×768 and a square
+768×768; an aspect beyond 1:4–4:1 is clamped and the excess centre-cropped. This
+matches vllm-omni and sglang. Those modes keep the keyframe's framing, and the
+video VAE downsamples 16× in each direction, so fitted to 640×384 a full-body
+photo leaves a face about 60 px tall that a plain VAE encode and decode already
+smears; on the recipe canvas the face survives. The recipe costs about 2.4×
+(square) to 4.2× (16:9 and wider) the video tokens per frame of 640×384, and
+attention grows faster than that, so such a run takes several times longer.
+Setting both `--video-width` and `--video-height` pins one size for every mode,
+keyframes included, and turns off Studio's "From the first frame" size; with only
+one of them, the other side follows the image's aspect. Frame counts snap to H3's
+`17k+5` grid (5, 22, 39, 56, 73, 90 …), a requested width and height round up to
+a multiple of 32, and fps is pinned to 24 whatever a request asks for. H3 is
+CFG-distilled — guidance above `1.0` is refused outright —
+so `steps` is the quality lever: 20 is the model's default. For fewer steps, start
+the server with a [Turbo plug-in](#with-a-turbo-plug-in) rather than lowering `steps`.
 
 In another terminal:
 
@@ -1636,7 +1655,8 @@ provider and an available encoder (FFmpeg on desktop, or AVFoundation in the
 Mac app); `audioMuxed` reports whether the MP4 includes it.
 
 **What an image means depends on the checkpoint.** `videoMode` is `t2v`, `i2v`
-(the image IS the first frame and gets animated), `fl2v` (first and last frame) or
+(the image IS the first frame and gets animated), `fl2v` (the last frame, with an
+optional first frame: send `endImage` alone to end on a photo) or
 `ref` (identity and appearance references for a new scene); omit it and the mode
 is inferred from what the request supplies. `i2v`/`fl2v` need the FL2VA
 checkpoint and `ref` needs Ref2VA — separate files, not a setting. Asking a
@@ -1646,11 +1666,12 @@ model's own explanation of which file to load instead.
 ```bash
 # First-and-last-frame, FL2VA checkpoint. Both names are the "file" a previous
 # /api/upload returned; anything outside the upload directory is rejected.
+# No width/height: the canvas comes from the first frame (1152x768 for a 3:2 photo).
 curl -X POST http://localhost:5000/api/video-generate \
   -H "Content-Type: application/json" \
   -d '{"prompt": "a slow cinematic push-in", "videoMode": "fl2v",
        "imagePath": "<file from /api/upload>", "endImage": "<file from /api/upload>",
-       "width": 640, "height": 384, "frames": 22, "steps": 20, "cfg": 1.0}'
+       "frames": 22, "steps": 20, "cfg": 1.0}'
 ```
 
 Reference conditioning — the subject carries over while the camera, background and
@@ -1668,6 +1689,58 @@ curl -X POST http://localhost:5000/api/video-generate \
 On Ref2VA a plain `imagePath` with no `videoMode`, no `endImage` and no named
 references is taken as a single reference, so a client that only knows how to
 attach one image — the bundled Web UI among them — needs no extra field.
+
+##### With a Turbo plug-in
+
+Start the FL2VA server with LightX2V's step-distillation plug-in and every clip
+samples its recipe: exactly 8 steps (4 with `minimax-h3-fl2v-turbo-4step.json`),
+video shift 6, Euler and CFG 1. Leave `--video-steps` out, or set it to the same
+count; any other value stops startup with one `Configuration error:` line before
+anything downloads.
+
+```bash
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json \
+  --lora config/lora/minimax-h3-fl2v-turbo-8step.json
+```
+
+Requests then leave `steps`, `flowShift` and `sampler` out, or repeat the recipe's
+values; the Web UI sends none of them for this model:
+
+```bash
+curl -X POST http://localhost:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a red fox trotting through falling snow, cinematic", "frames": 22, "seed": 42}'
+```
+
+A request whose `steps` contradicts the recipe is refused with the plug-in's own
+explanation, never resampled at another count:
+
+```bash
+curl -X POST http://localhost:5000/api/video-generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a red fox trotting through falling snow, cinematic", "steps": 20}'
+```
+
+```json
+{"error": "LightX2V Turbo 8-step (FL2V v1.0, 768p) (minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors) samples exactly 8 steps on its own schedule; 20 steps contradicts it. Leave the step count unset (--diffusion-steps on the CLI, --video-steps on the server, \"steps\" in a request) or set it to 8."}
+```
+
+That reply is HTTP 400. `/api/video-generate/stream` ends with a
+`{"done": true, "error": "..."}` event carrying the same text, and
+`POST /v1/videos/generations` answers 400 in its OpenAI envelope:
+
+```json
+{"error": {"message": "LightX2V Turbo 8-step (FL2V v1.0, 768p) (minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors) samples exactly 8 steps on its own schedule; 20 steps contradicts it. Leave the step count unset (--diffusion-steps on the CLI, --video-steps on the server, \"steps\" in a request) or set it to 8.", "type": "invalid_request_error"}}
+```
+
+A `flowShift` other than 6 or a `sampler` other than `euler` is refused the same way.
+A failure on the server's side during the clip (a forward that runs out of device
+memory, the model unloaded while the request waited) is not a refusal: that route
+answers 500 with `"type": "server_error"` and the reason, which OpenAI clients retry.
+The startup set applies to every clip: a request cannot choose or drop plug-ins.
+The Ref2VA checkpoint refuses the plug-in at startup. See the
+[MiniMax-H3 card](../docs/models/minimax-h3.md#turbo-plug-ins) for the recipe, the
+other refusals and what has been validated.
 
 #### Wan 2.1 / 2.2 — video only
 

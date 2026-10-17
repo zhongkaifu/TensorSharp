@@ -340,20 +340,34 @@ namespace TensorSharp.Server.Host.Hosting
                     "name with the word turbo is assumed to be Turbo (the load says so), any other is base. Another model " +
                     "loads without it, with a warning.",
                     "--qwen-image-variant turbo"),
+            }),
+            ("LoRA plug-ins (Qwen-Image-2.1, MiniMax-H3 FL2VA)", new[]
+            {
                 new OptionHelp("--lora <path>",
-                    "Qwen-Image-2.1 LoRA plug-in: a LoRA .safetensors (diffusers/PEFT, ComfyUI, kohya, DiffSynth, DoRA or " +
-                    "VideoX-Fun PDD format) or a TensorSharp plug-in config .json from config/lora/ (downloads its weights on " +
-                    "first use and brings its strength and sampling recipe). Repeat to stack LoRAs. Applied unmerged on top " +
-                    "of the quantized transformer, so small distillation deltas are kept exactly. Default: none.",
+                    "LoRA plug-in for the hosted Qwen-Image-2.1 or MiniMax-H3 (FL2VA) model: a TensorSharp plug-in config " +
+                    ".json from config/lora/ (downloads its weights on first use and brings its strength and sampling recipe), " +
+                    "or for Qwen-Image-2.1 also a LoRA .safetensors (diffusers/PEFT, ComfyUI, kohya, DiffSynth, DoRA or " +
+                    "VideoX-Fun PDD format); repeat to stack Qwen-Image-2.1 LoRAs. MiniMax-H3 takes one minimax-h3-lora " +
+                    "config only: the LightX2V Turbo step-distillation plug-ins config/lora/minimax-h3-fl2v-turbo-8step.json " +
+                    "(8 steps) and config/lora/minimax-h3-fl2v-turbo-4step.json (4 steps), which lock --video-steps and a " +
+                    "request's \"steps\", \"flowShift\", \"sampler\" and \"cfg\" to their recipe (unset or equal is accepted; " +
+                    "anything else is refused) and are refused on the Ref2VA checkpoint. Applied unmerged on top of the " +
+                    "quantized transformer, so small distillation deltas are kept exactly. A plug-in the startup model does " +
+                    "not take is refused at startup, before the plug-in downloads; when a --config still has to download the " +
+                    "model, the model's family is checked right after that download (a contradicting --video-steps is refused " +
+                    "before it). Default: none.",
                     "--lora config/lora/qwen-image-2.1-viggle-turbo.json"),
                 new OptionHelp("--lora-scale <f>",
-                    "Strength of the preceding --lora (multiplies alpha / rank). Default: the plug-in config's \"scale\", else 1.0.",
+                    "Strength of the preceding --lora (multiplies alpha / rank). Default: the plug-in config's \"scale\", else 1.0. " +
+                    "MiniMax-H3 refuses a negative strength: its Turbo schedule is distilled at 1 (0 keeps the adapter's terms " +
+                    "with zero up factors).",
                     "--lora-scale 0.7"),
                 new OptionHelp("--lora-config <path>",
                     "Companion config of the preceding --lora: a TensorSharp LoRA config (default strength and the sampling " +
                     "recipe of a step-distilled LoRA; see config/lora/), a PEFT adapter_config.json or a VideoX-Fun " +
-                    "pdd_config.json. The recipe supplies steps, sigmas and CFG unless you set them. Default: none " +
-                    "(a PDD bundle's pdd_config.json is found next to its weights).",
+                    "pdd_config.json. A Qwen-Image-2.1 recipe supplies steps, sigmas and CFG unless a request sets them; a " +
+                    "MiniMax-H3 plug-in config here must name the preceding --lora's weights file in its \"weights\" entry, and " +
+                    "its recipe is locked. Default: none (a PDD bundle's pdd_config.json is found next to its weights).",
                     "--lora-config config/lora/qwen-image-2.1-viggle-turbo.json"),
             }),
             ("Video-generation defaults and companion models", new[]
@@ -361,7 +375,9 @@ namespace TensorSharp.Server.Host.Hosting
                 new OptionHelp("--video-width <px>",
                     "Default output width when a request omits 'width'. THE main quality lever: " +
                     "the Web UI sends no size of its own, so without this every clip is generated " +
-                    "at the model's default. 640x384 is a good starting point for MiniMax-H3. " +
+                    "at the model's default. Leave it unset for MiniMax-H3: text-to-video then runs at 640x384, and an " +
+                    "i2v/fl2v keyframe sizes the canvas by MiniMax's 768p recipe, which the faces of a wide shot need; " +
+                    "setting both sides pins that size for every mode, keyframes included. " +
                     "Rounded up to the model's grid. --width is accepted as an alias, and --width / --height " +
                     "ALSO set the Qwen-Image-2.1 default image size (TS_QWEN_IMAGE_WIDTH / " +
                     "TS_QWEN_IMAGE_HEIGHT) for image requests that name neither a size nor an area: that " +
@@ -382,10 +398,11 @@ namespace TensorSharp.Server.Host.Hosting
                     "trade-off after resolution. The server has NO default of its own - unset, " +
                     "each model uses its own: 20 for MiniMax-H3, and for Wan the checkpoint's " +
                     "trained step count when it is step-distilled, otherwise 50 (TI2V-5B), 40 " +
-                    "(A14B) or 30 (Wan 2.1). MiniMax-H3 is step-distilled and CFG-free, so 4-8 " +
-                    "is the fast operating point (some chromatic fringing around moving subjects " +
-                    "at the low end, gone by ~20), 16-24 is visibly cleaner, and past ~30 gains " +
-                    "little. Setting this pins EVERY request, so on a step-distilled Wan " +
+                    "(A14B) or 30 (Wan 2.1). For fewer MiniMax-H3 steps, load the LightX2V Turbo " +
+                    "plug-in instead (--lora config/lora/minimax-h3-fl2v-turbo-8step.json, or the " +
+                    "4-step one): it samples exactly the 8 or 4 steps it was distilled for, so leave " +
+                    "this unset or set it to that count - any other value is refused at startup, " +
+                    "and a request's own \"steps\" likewise. Setting this pins EVERY request, so on a step-distilled Wan " +
                     "checkpoint it overrides the 4 steps the file was trained for - leave it " +
                     "unset there rather than paying 4x the work for a worse result.",
                     "--video-steps 16"),
@@ -838,6 +855,7 @@ namespace TensorSharp.Server.Host.Hosting
             writer.WriteLine("  TensorSharp.Server.Host --model diffusiongemma-26B-A4B-it-Q4_K_M.gguf --mmproj diffusiongemma-vision/model-00011-of-00011.safetensors --backend ggml_metal    (vision tower straight from the HF shard)");
             writer.WriteLine("  TensorSharp.Server.Host --model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2    (tensor parallelism across 2 GPUs)");
             writer.WriteLine("  TensorSharp.Server.Host --config config/qwen-image-2.1.json    (Qwen-Image-2.1 generation and editing)");
+            writer.WriteLine("  TensorSharp.Server.Host --config config/minimax-h3-fl2va.json --lora config/lora/minimax-h3-fl2v-turbo-8step.json    (MiniMax-H3 Turbo: 8 steps)");
             writer.WriteLine("  TensorSharp.Server.Host --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda --video-frames 121 --fps 24");
             writer.WriteLine("  TensorSharp.Server.Host --backend ggml_cpu    (model-less status process; inference unavailable)");
             writer.WriteLine("  TensorSharp.Server.Host --config server.json    (read options from a file)");

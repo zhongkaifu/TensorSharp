@@ -67,7 +67,9 @@ The experimental catalog tier is 48 GB. This is a conservative supported startin
 point, not a proven minimum or a promise for arbitrary duration/resolution.
 
 Image conditioning accepts a first frame, a last frame, both endpoints, or multiple
-images at explicit output pixel-frame positions. Ordered reference-image lists
+images at explicit output pixel-frame positions. `fl2v` pins the last frame and
+optionally the first; a last frame alone becomes one appended guide at the final
+frame (strength 1.0). `i2v` needs a frame-zero image and refuses an end image alone. Ordered reference-image lists
 become evenly spaced keyframes; one image anchors frame zero. These references
 control the timeline. Character/prop/location identity references use `Mode = "ref"` and the optional
 Ingredients IC-LoRA described below. Reference video/audio, retake/refinement,
@@ -99,8 +101,9 @@ checks cover tile boundaries and incomplete head groups.
 
 ## Clear faces and hands
 
-Three TensorSharp deviations from the publisher's pipeline distorted faces and
-hands. All three are fixed.
+Three earlier TensorSharp deviations from the publisher's pipeline contributed
+to distorted faces and hands and have been corrected. These implementation fixes
+do not guarantee anatomically correct output for every prompt, seed or duration.
 
 1. **Sampler.** Generation used deterministic Euler where the publisher samples
    LTX 2.5 with ancestral Euler.
@@ -118,10 +121,11 @@ hands. All three are fixed.
    eyes and mouth showing through the fingers. More pixels in one pass did not cure
    this: a single 1152×768 pass still smeared the hand over the face. The
    refinement pass, which restarts from the upscaled latent mixed with 91% noise,
-   resolves it.
+   improved the earlier samples below.
 
 Measured on an M5 Pro (MLX) with `imgs/banner_1.png` as the first frame, the
-detailed Chinese prompt above, seed 42 and audio:
+detailed Chinese prompt below, seed 42 and audio. These are historical sampled
+visual observations, not an anatomy acceptance test:
 
 | Recipe | Output | First pass | Frames | Observation |
 | --- | --- | --- | --- | --- |
@@ -154,20 +158,40 @@ For clear faces and hands:
 1. **Keep the first pass at 512 or more on each side.** That means an output of
    1024×1024 (the default) or larger. Width and height are output sizes and must be
    multiples of 64. A square request center-crops a landscape upload; a 3:2 source
-   keeps its whole composition at, for example, 1024×640 or 1536×1024, if memory
-   allows. Larger outputs than 1024×1024×121 were not measured here.
+   preserves its composition at, for example, 1536×1024, if memory allows.
+   Larger outputs than 1024×1024×121 were not measured in the table above.
 2. **Frame the face large.** An upper-body or close-up upload gives the face more
    latent tokens at any size.
 3. **Describe the shot and the face.** Name the shot type, the face and the action.
 4. Keep `euler_ancestral`, eight steps and CFG 1. Distilled LTX has no
    negative-prompt or guidance lever.
 
-Remaining differences from the publisher's highest-quality path: TensorSharp
-decodes with the convolutional VAE by default (the diffusion decoder is opt-in), does
-not apply the publisher's CRF 18 image re-compression, and the preset denoiser is a third-party
-Q4_K_M quantization (the GGUF publisher's own ComfyUI workflow uses the same file).
+Temporal image preprocessing now includes the publisher's CRF 18 compression and
+Float32 bilinear resize-before-crop, and fractional-strength refinement preserves
+the noised prior-stage latent. Both Studio and chat use this shared pipeline.
+For ordinary single first-image uploads, the first stage now uses strength 0.7
+and refinement uses 1.0, following the publisher's ComfyUI recipe. Explicit
+`ImageConditions` strengths, ordered/end guides and other modes retain their
+requested strengths. Each stage logs its effective guide strengths.
+
+In the reported 145-frame banner sample (seed `3206401772581117598`), every reviewed
+first-second frame avoided the earlier blank-white-eye artifact after the
+preprocessing correction. Strength 0.7/1.0 then substantially improved the hand:
+frames 63–84 show five distinct, opaque digits. Finger/face blending remains near
+frames 56–61 and 88–94, so this is not an artifact-free result. Switching decoders
+alone did not correct the earlier full-strength guide's hand errors. Media
+equality between Studio and chat is a separate check from anatomy quality.
+
+Remaining differences from the publisher's default ComfyUI workflow: TensorSharp
+decodes with the convolutional VAE by default (the diffusion decoder is opt-in),
+passes the prompt through without the optional image-aware enhancer, and the
+preset denoiser is a third-party Q4_K_M quantization. The new shorthand image
+strengths match the [official ComfyUI image-to-video example](https://docs.ltx.io/open-source-model/usage-guides/image-to-video);
+the other differences remain comparison dimensions, not proven fixes for extra
+fingers. The GGUF publisher's own ComfyUI workflow uses the same model file.
 Evidence is in `artifacts/ltx25/diffvae-diag/` and `docs/validation/ltx25/face-fix/`
-(local validation evidence, not committed).
+(historical evidence), and `artifacts/studio-anatomy/` (the 145-frame follow-up).
+Generated validation evidence is local and not committed.
 
 ## Video decoders
 
@@ -247,11 +271,29 @@ var video = model.GenerateVideo("The woman smiles and blows a kiss.", request);
 
 Each frame position must be unique and within the requested clip. Strength is
 finite and between zero and one, with one preserving the encoded guide latent.
-Images are center-cropped to the requested aspect ratio and resized before VAE
-encoding. This is the raw-image crop/resize workflow used for the SD.cpp
-comparison. The publisher's pipeline defaults to CRF 18 image compression on
-LTX 2.4 and newer, followed by Torch bicubic resizing, so exact source-pixel
-preprocessing parity with that default is not claimed. At most 16 images are accepted. More guides increase the denoiser token
+Explicit `ImageConditions` keep their strengths in both stages. An ordinary
+single `Image`, `ImageBytes` or `ImagePath` upload in inferred/`i2v` mode instead
+uses the model's first-stage default of 0.7 and restores strength 1.0 in refinement.
+Temporal image guides follow the publisher's LTX 2.5 preprocessing: crop an odd
+bottom/right edge to even dimensions, recompress through libx264 at CRF 18 with
+the `veryfast` preset and `yuv420p`, then resize the full image with Float32
+bilinear interpolation (`align_corners=False`) and center-crop to each stage's
+size. The intermediate resize retains fractional pixels. RGB/YUV conversion and
+slice threading match PyAV's settings; exact lossy-codec pixels can vary with
+the installed x264 version and CPU thread count.
+
+Desktop temporal image conditioning requires FFmpeg with **libx264** on `PATH`
+or at `TS_FFMPEG`. Capability discovery checks for that encoder; a missing or
+unsupported codec fails before image encoding and denoising. There is no OS-codec
+fallback for conditioning. Managed and Apple-only media providers do not yet
+implement this transform, so they do not advertise temporal image conditioning;
+text-to-video and the separate Ingredients identity-reference path are unaffected.
+The CPU resize oracle and an optional local PyAV codec comparison are covered by
+`Ltx25ImagePreprocessingTests`; regenerate the local reference with
+`eng/validation/generate_ltx25_image_preprocessing_reference.py` and set
+`TS_LTX25_IMAGE_ORACLE` to its output path to run the codec comparison.
+
+At most 16 images are accepted. More guides increase the denoiser token
 count, memory use, and runtime. The decoded first frame is a VAE reconstruction,
 so exact pixel equality with the uploaded file is not expected.
 

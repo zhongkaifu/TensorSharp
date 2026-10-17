@@ -1,0 +1,48 @@
+{
+  // LightX2V Turbo 4-step v1.2: a step-distillation LoRA for the MiniMax-H3 FL2VA checkpoint
+  // (text-to-video, image-to-video and first-and-last-frame), 4 transformer passes instead of
+  // 20, CFG off, applied unmerged to the 50 DiT blocks and the 2 token-refiner blocks.
+  //
+  //   TensorSharp.Cli --config config/minimax-h3-fl2va.json \
+  //       --lora config/lora/minimax-h3-fl2v-turbo-4step.json --prompt "..." --output clip.mp4
+  //
+  //   TensorSharp.Server.Host --config config/minimax-h3-fl2va.json \
+  //       --lora config/lora/minimax-h3-fl2v-turbo-4step.json
+  //
+  // INFERRED: upstream publishes no recipe for v1.2 (ModelTC README lists 4-step v1.0 768p at 6/3; the v1.2 file has no shift metadata). Linspace grid and shift 6/3 are carried over; see docs/models/minimax-h3.md for the validation status.
+  //
+  // Contract: 4 Euler steps on the endpoint-inclusive linspace grid q_i = (4 - i) / 4, shifted
+  // by 6 for video and 3 for audio, then a terminal 0; cfg 1; strength 1.
+  //   video sigmas [1, 0.94737, 0.85714, 0.66667, 0]
+  //   audio sigmas [1, 0.9, 0.75, 0.5, 0]
+  // The file's metadata says alpha 8 at rank 128 → scale 0.0625; a loader assuming
+  // alpha = rank applies 16x.
+  // FL2VA only (a Ref2VA checkpoint refuses it); trained at 768p. License: Apache-2.0.
+  // Locked: --diffusion-steps, --flow-shift, --sampler and --cfg on the CLI, --video-steps on
+  // the server, and "steps", "flowShift" and "sampler" in a request may be left unset or repeat
+  // the values above; any other value is refused, never overridden.
+  "type": "minimax-h3-lora",
+  "name": "LightX2V Turbo 4-step (FL2V v1.2, 768p)",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/minimax-h3/loras"
+  },
+  "weights": {
+    "path": "${root}/minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors",
+    "urls": [
+      "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/a29e57d195f80ead07c89f89e55ecf2911e893c5/minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors"
+    ],
+    "sha256": "c3d4a2cf618efea71b9e21a4baaa12d412f1eb6c2b6f86efacaf0ebb6814b689"
+  },
+  "partition": "fl2va",
+  "key_format": "minimax-h3-diffusers",
+  "alpha": 8,
+  "scale": 1.0,
+  "sampling": {
+    "steps": 4,
+    "schedule": "linspace",
+    "video_shift": 6.0,
+    "audio_shift": 3.0,
+    "sampler": "euler",
+    "cfg": 1.0
+  }
+}

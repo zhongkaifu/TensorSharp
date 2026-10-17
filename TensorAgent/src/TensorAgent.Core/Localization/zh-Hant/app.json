@@ -33,5 +33,11 @@
   "app.shareNotifications.alert.title": "更快地開啟以後的分享內容？",
   "app.shareNotifications.alert.message": "iOS 不允許分享延伸功能直接切換應用程式。允許通知後，以後的分享可以提供一鍵開啟 TensorAgent 的方式。",
   "app.shareNotifications.alert.allow": "允許",
-  "app.shareNotifications.alert.notNow": "暫不"
+  "app.shareNotifications.alert.notNow": "暫不",
+  "app.webLink.title": "網頁",
+  "app.webLink.back": "上一頁",
+  "app.webLink.forward": "下一頁",
+  "app.webLink.close": "關閉",
+  "app.webLink.loading": "正在載入網頁…",
+  "app.webLink.failed": "無法載入此網頁。"
 }

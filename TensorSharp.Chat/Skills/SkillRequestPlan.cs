@@ -275,7 +275,8 @@ namespace TensorSharp.Server.Skills
             WorkspaceFileCapture? captureProducedFiles = null,
             ILogger? logger = null,
             bool? multiAgent = null,
-            KnowledgeToolScope? knowledge = null)
+            KnowledgeToolScope? knowledge = null,
+            StudioToolScope? studio = null)
         {
             SkillRequestPlan plan = CreateCore(registry, requestedSkills, discovery, clientTools,
                 architecture, contextTokens, options, out unknown, allowTools, codeRunner,
@@ -295,6 +296,16 @@ namespace TensorSharp.Server.Skills
                 plan.ToolContext.Knowledge = knowledge;
                 plan = new SkillRequestPlan(plan.Prompt, plan.Selected, plan.ToolContext,
                     KnowledgeTools.Merge(plan.Tools), plan.LoopOptions, toolsOffered: true, plan.ClientTools);
+            }
+            if (unknown.Count == 0 && studio != null && allowTools && SkillCapabilities.For(architecture).ToolsRendered)
+            {
+                plan ??= new SkillRequestPlan(SkillPlan.Empty, Array.Empty<Skill>(),
+                    new SkillToolContext(Array.Empty<Skill>()), new List<ToolFunction>(),
+                    new SkillAgentLoopOptions { MaxRounds = 8, ToolResultsAreRendered = SkillCapabilities.For(architecture).ToolResultsRendered },
+                    toolsOffered: true, clientTools);
+                plan.ToolContext.Studio = studio;
+                plan = new SkillRequestPlan(plan.Prompt with { Instructions = plan.Prompt.Instructions + StudioTools.WorkflowInstructions }, plan.Selected, plan.ToolContext,
+                    StudioTools.Merge(plan.Tools), plan.LoopOptions, toolsOffered: true, plan.ClientTools);
             }
             if (unknown.Count > 0 || !allowTools || multiAgent == false
                 || options?.MultiAgent is not { Enabled: true } agents

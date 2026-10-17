@@ -89,35 +89,16 @@ namespace TensorSharp.Models.MiniMaxH3
         public GeneratedVideo Generate(string prompt, VideoGenerationParams p)
         {
             p ??= new VideoGenerationParams();
-            ValidateSamplingParameters(p);
+            // The LoRA plug-in is read once: the model swaps it only between clips.
+            MiniMaxH3LoraSet lora = _model.Loras;
+            MiniMaxH3SamplingRecipe recipe = lora?.Recipe;
+            ValidateSamplingParameters(p, recipe);
             var total = Stopwatch.StartNew();
 
-            // Resolve the canvas. A 256x256 default is far too small for faces to hold
-            // together, so default to the model's own operating area and, when a
-            // conditioning image is supplied, take the aspect ratio FROM THE IMAGE —
-            // otherwise the frame it is meant to become gets stretched into it.
-            var (width, height) = ResolveCanvas(p);
-            var shape = MiniMaxH3Geometry.Resolve(
-                width, height,
-                p.Frames > 0 ? p.Frames : 22,
-                p.Fps > 0 ? p.Fps : MiniMaxH3Geometry.Fps);
-
-            // 20 matches stable-diffusion.cpp's CLI default. Fewer steps reduce
-            // latency, but low-step quality requires its own validation rather than
-            // inheriting the guarantees of separately distilled FastH3 checkpoints.
-            int steps = p.Steps > 0 ? p.Steps : MiniMaxH3Scheduler.DefaultSteps;
-            float videoShift = p.FlowShift > 0 ? p.FlowShift : MiniMaxH3Scheduler.VideoShift;
-            long seed = p.Seed >= 0 ? p.Seed : Random.Shared.NextInt64() & 0x7fffffff;
-
+            // The mode decides what an image MEANS, and so whether it may size the canvas:
+            // a keyframe is a frame of the clip, a reference is not.
             var mode = MiniMaxH3ModeResolver.Resolve(p, _model.Partition);
-            Report(p, "text-encode", 0, steps, total);
-
-            // Ref2VA reference images are loaded once and used twice: the vision tower
-            // reads them for the prompt, and the video VAE encodes them into
-            // conditioning latents. Both must see the same pixels.
-            List<MiniMaxH3Reference> references = mode == MiniMaxH3Mode.Reference
-                ? LoadReferences(p, width, height, shape.Frames)
-                : null;
+            RequirePluginMode(recipe, mode);
 
             // A KEYFRAME is conditioned twice, and both halves matter.
             //
@@ -130,15 +111,29 @@ namespace TensorSharp.Models.MiniMaxH3
             // for Ref2VA references; leaving it out is what made long clips drift.
             var keyframes = new List<RgbImage>();
             var keyframeAtEndFlags = new List<bool>();
-            if (mode is MiniMaxH3Mode.ImageToVideo or MiniMaxH3Mode.FirstLastFrame)
+            var (width, height, shape) = ResolveCanvasAndKeyframes(p, mode, keyframes, keyframeAtEndFlags);
+
+            // The base checkpoint samples 20 steps, stable-diffusion.cpp's CLI default; fewer
+            // base steps are not a validated operating point. A fast clip takes the LightX2V
+            // Turbo plug-in (config/lora/minimax-h3-fl2v-turbo-{8,4}step.json) instead, whose
+            // recipe fixes the steps, the shift and the grid the adapter was distilled on.
+            var (steps, videoShift, sigmas) = ResolveSampling(p, recipe);
+            long seed = p.Seed >= 0 ? p.Seed : Random.Shared.NextInt64() & 0x7fffffff;
+            if (recipe != null)
             {
-                // Fitted to the generation canvas ONCE, here: the same pixels go to the
-                // VAE and to the vision tower, which is what the reference presents. The
-                // original photo would give the tower a far finer patch grid — a 1024x768
-                // source is 768 merged tokens against 108 for a 384x288 canvas — and that
-                // is a different conditioning signal, not a better one.
-                ResolveKeyframes(p, shape, keyframes, keyframeAtEndFlags);
+                Console.WriteLine(recipe.LogLine());
+                string canvasNote = DescribePluginCanvas(recipe, shape);
+                if (canvasNote != null) Console.WriteLine(canvasNote);
             }
+
+            Report(p, "text-encode", 0, steps, total);
+
+            // Ref2VA reference images are loaded once and used twice: the vision tower
+            // reads them for the prompt, and the video VAE encodes them into
+            // conditioning latents. Both must see the same pixels.
+            List<MiniMaxH3Reference> references = mode == MiniMaxH3Mode.Reference
+                ? LoadReferences(p, width, height, shape.Frames)
+                : null;
 
             // Warming the denoiser file is pure disk work and the text encoder that runs
             // next is pure GPU work, so mode 2 starts it here and collects it just before
@@ -406,8 +401,9 @@ namespace TensorSharp.Models.MiniMaxH3
             int audioCount = shape.AudioTokenCount;
             var (videoPatches, audioLatent) = MiniMaxH3Noise.Initial(shape, seed);
 
-            float[] sigmas = MiniMaxH3Scheduler.BuildSigmas(steps, videoShift);
-
+            // The first step can run for minutes at a large canvas; without this a host would show
+            // the prompt encode until it finished.
+            Report(p, "denoise", 0, steps, total);
             for (int step = 0; step < steps; step++)
             {
                 float sigma = sigmas[step];
@@ -425,7 +421,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 // reference sampler. DiT consumes physical audio latents instead.
                 float[] audioInput = MiniMaxH3Scheduler.AudioInputFromCarrier(
                     audioLatent, sigma, videoShift);
-                var (vVel, aVel) = _dit.Forward(
+                var (vVel, aVel) = _dit.Forward(lora,
                     videoPatches, videoCount, audioInput, audioCount,
                     textHidden, textLength, layout, sigma,
                     conditionTokens, conditionCount,
@@ -493,7 +489,7 @@ namespace TensorSharp.Models.MiniMaxH3
             var vaeRunClock = Stopwatch.StartNew();
             float[] pixels = _vae.Decode(
                 latent, shape.LatentFrames, shape.LatentHeight, shape.LatentWidth,
-                (tile, tiles) => Report(p, "vae-decode", steps, steps, total));
+                (tile, tiles) => Report(p, "vae-decode", steps, steps, total, $"tile {tile}/{tiles}"));
             vaeRunClock.Stop();
             if (PhaseTiming)
                 Console.WriteLine($"  [h3] .. video VAE open {vaeOpenClock.Elapsed.TotalSeconds:F1}s, "
@@ -948,36 +944,138 @@ namespace TensorSharp.Models.MiniMaxH3
         /// merged tokens against 108 for a 384x288 canvas — and that is a different
         /// conditioning signal, not a better one.</para></summary>
         internal static void ResolveKeyframes(VideoGenerationParams p, MiniMaxH3Shape shape,
-                                              List<RgbImage> frames, List<bool> atEnd)
+                                              List<RgbImage> frames, List<bool> atEnd) =>
+            ResolveKeyframes(p.ResolveImage(), p.ResolveEndImage(), shape, frames, atEnd, unsetCanvas: null);
+
+        /// <summary>Resolve the canvas and, in a keyframe mode, fit the keyframes to it.
+        ///
+        /// <para>Each keyframe is decoded once, here: the canvas comes from the first of them,
+        /// and the canvas-sized copies then go to the VAE and the vision tower. The full-size
+        /// decodes live only in this frame (a 24 MP phone photo is ~290 MB of float RGB), so
+        /// they are unreachable before the 17 GB text encoder loads; held in Generate's frame
+        /// they would stay reachable through the whole run, under Tier-0 and Mono alike.</para></summary>
+        /// <returns>The canvas before grid alignment (references are sized from it, as before)
+        /// and the resolved shape.</returns>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        internal static (int Width, int Height, MiniMaxH3Shape Shape) ResolveCanvasAndKeyframes(
+            VideoGenerationParams p, MiniMaxH3Mode mode, List<RgbImage> frames, List<bool> atEnd)
         {
-            RgbImage first = p.ResolveImage();
-            RgbImage last = p.ResolveEndImage();
+            bool keyframeMode = mode is MiniMaxH3Mode.ImageToVideo or MiniMaxH3Mode.FirstLastFrame;
+            RgbImage first = keyframeMode ? p.ResolveImage() : null;
+            RgbImage last = keyframeMode ? p.ResolveEndImage() : null;
+            var (width, height) = ResolveCanvas(p, mode, first, last);
+            var shape = MiniMaxH3Geometry.Resolve(
+                width, height,
+                p.Frames > 0 ? p.Frames : 22,
+                p.Fps > 0 ? p.Fps : MiniMaxH3Geometry.Fps);
+            if (!keyframeMode) return (width, height, shape);
+
+            RgbImage anchor = first ?? last;
+            bool requested = p.Width > 0 || p.Height > 0;
+            Console.WriteLine($"  [h3] canvas {shape.Width}x{shape.Height} " +
+                              (requested ? "(requested size)"
+                               : $"from the {(first != null ? "first" : "last")} keyframe " +
+                                 (p.CanvasPolicy == VideoCanvasPolicy.ModelRecipe ? "(MiniMax 768p recipe)" : "(compact preview)")));
+            // What an unset size would have given, so a warning can say whether it would help.
+            (int Width, int Height)? unset = null;
+            if (requested && anchor != null)
+            {
+                var canvas = ResolveCanvas(new VideoGenerationParams { CanvasPolicy = p.CanvasPolicy }, mode, first, last);
+                unset = (MiniMaxH3Geometry.AlignSpatial(canvas.Width), MiniMaxH3Geometry.AlignSpatial(canvas.Height));
+            }
+            // Fitted to the generation canvas ONCE, here: the same pixels go to the VAE and
+            // to the vision tower, which is what the reference presents. The original photo
+            // would give the tower a far finer patch grid — a 1024x768 source is 768 merged
+            // tokens against 108 for a 384x288 canvas — and that is a different conditioning
+            // signal, not a better one.
+            ResolveKeyframes(first, last, shape, frames, atEnd, unset);
+            return (width, height, shape);
+        }
+
+        /// <summary>The same fit, over keyframes the caller has already decoded.
+        ///
+        /// <para>Both keyframes are centre-cropped to the canvas. On the recipe canvas the
+        /// first keyframe sets the aspect, so its crop is under 2%; sglang stretches that one
+        /// instead, which is the same picture to within the rounding. The last keyframe is
+        /// cropped exactly as sglang crops its follower keyframe.</para></summary>
+        /// <param name="unsetCanvas">The canvas an unset size would have given, when the size was
+        /// requested; null when the canvas already is that one.</param>
+        internal static void ResolveKeyframes(RgbImage first, RgbImage last, MiniMaxH3Shape shape,
+                                              List<RgbImage> frames, List<bool> atEnd,
+                                              (int Width, int Height)? unsetCanvas)
+        {
             if (first != null)
             {
-                WarnOnAspectCrop(first, shape);
+                ReportKeyframeFit("first", first, shape, anchor: true, unsetCanvas);
                 frames.Add(QwenImage.ImageIO.ResizeCover(first, shape.Width, shape.Height));
                 atEnd.Add(false);
             }
             if (last != null)
             {
+                ReportKeyframeFit("last", last, shape, anchor: first == null, unsetCanvas);
                 frames.Add(QwenImage.ImageIO.ResizeCover(last, shape.Width, shape.Height));
                 atEnd.Add(true);
             }
         }
 
-        /// <summary>Say so when the canvas forces a crop. Centre-cropping is the right
-        /// trade against stretching — a squeezed face is baked into every frame — but it
-        /// silently loses the edges of the shot, so it should never be a surprise.</summary>
-        private static void WarnOnAspectCrop(RgbImage img, MiniMaxH3Shape shape)
+        private static void ReportKeyframeFit(string which, RgbImage img, MiniMaxH3Shape shape,
+                                              bool anchor, (int Width, int Height)? unsetCanvas)
         {
-            if (img.Width == shape.Width && img.Height == shape.Height) return;
-            double want = shape.Width / (double)shape.Height;
-            double have = img.Width / (double)img.Height;
-            if (Math.Abs(want - have) / have <= 0.02) return;
-            Console.WriteLine(
-                $"  [h3] conditioning image is {img.Width}x{img.Height} ({have:F2}:1) but the " +
-                $"canvas is {shape.Width}x{shape.Height} ({want:F2}:1); centre-cropping to fit. " +
-                "Leave --width/--height unset to take the canvas from the image instead.");
+            foreach (string line in DescribeKeyframeFit(which, img.Width, img.Height,
+                                                        shape.Width, shape.Height, anchor, unsetCanvas))
+                Console.WriteLine("  [h3] " + line);
+        }
+
+        /// <summary>What fitting a keyframe to the canvas costs it, in words, or nothing
+        /// when it costs nothing worth saying.
+        ///
+        /// <para>Two losses, and neither should be a surprise. A crop drops the edges of the
+        /// shot: centre-cropping is the right trade against stretching, since a squeezed face
+        /// is baked into every frame, but a portrait photo on a landscape canvas keeps only
+        /// a band of it. A downscale drops detail: these modes keep the keyframe's framing,
+        /// and the video VAE downsamples 16x in each direction, so a canvas smaller than the
+        /// keyframe's own recipe leaves the faces of a wide shot a few latent cells across.
+        /// An encode then decode alone smears them, which no denoiser can undo.</para></summary>
+        /// <param name="anchor">This keyframe is the one an unset size takes the canvas from.</param>
+        /// <param name="unsetCanvas">The canvas an unset size would give, when a size was
+        /// requested; null otherwise.</param>
+        internal static List<string> DescribeKeyframeFit(string which, int sourceWidth, int sourceHeight,
+                                                         int canvasWidth, int canvasHeight, bool anchor,
+                                                         (int Width, int Height)? unsetCanvas)
+        {
+            var lines = new List<string>();
+            if (sourceWidth <= 0 || sourceHeight <= 0) return lines;
+            bool unsetDiffers = unsetCanvas is { } u && (u.Width != canvasWidth || u.Height != canvasHeight);
+            double want = canvasWidth / (double)canvasHeight;
+            double have = sourceWidth / (double)sourceHeight;
+            if (Math.Abs(want - have) / have > 0.02)
+            {
+                // The same arithmetic ImageIO.ResizeCover crops by.
+                bool cropsWidth = have > want;
+                double kept = cropsWidth ? want / have : have / want;
+                lines.Add(
+                    $"the {which} keyframe is {sourceWidth}x{sourceHeight} ({have:F2}:1) but the canvas is " +
+                    $"{canvasWidth}x{canvasHeight} ({want:F2}:1); centre-cropping it keeps the middle " +
+                    $"{kept * 100:F0}% of its {(cropsWidth ? "width" : "height")}." +
+                    (anchor && unsetDiffers
+                        ? $" Leave the size unset to take the canvas from this keyframe ({unsetCanvas.Value.Width}x{unsetCanvas.Value.Height})."
+                        : ""));
+            }
+
+            // A cover fit scales by the LARGER ratio and crops the other axis. The keyframe's own
+            // recipe canvas is the yardstick: scaling it further down than that loses detail the
+            // recipe keeps. Comparing linear scale, not area, keeps a last keyframe that is merely
+            // cropped onto the first keyframe's recipe canvas from being reported as starved.
+            var recipe = MiniMaxH3Geometry.KeyframeCanvas(sourceWidth, sourceHeight);
+            double fit = Math.Max(canvasWidth / (double)sourceWidth, canvasHeight / (double)sourceHeight);
+            double recipeFit = Math.Max(recipe.Width / (double)sourceWidth, recipe.Height / (double)sourceHeight);
+            if (fit < 1.0 && fit < 0.9 * recipeFit)
+                lines.Add(
+                    $"the {which} keyframe is scaled down {1.0 / fit:F1}x into {canvasWidth}x{canvasHeight}, " +
+                    $"{recipeFit / fit:F1}x further than MiniMax-H3's 768p recipe would ({recipe.Width}x{recipe.Height}); " +
+                    "faces and hands that are small in it come out blurred and distorted at this size" +
+                    (unsetDiffers ? $". Leave the size unset for {unsetCanvas.Value.Width}x{unsetCanvas.Value.Height}." : "."));
+            return lines;
         }
 
         /// <summary>Mark which prompt tokens are modulated on the visual stream.
@@ -1145,23 +1243,87 @@ namespace TensorSharp.Models.MiniMaxH3
                 throw new ArgumentException("MiniMax-H3 steps must be positive, or 0 for the default.", nameof(p));
         }
 
-        /// <summary>Default generation area when the request does not give a size.
-        /// 640x384 is the model card's own working point and the smallest size at
-        /// which faces stay coherent.</summary>
-        private const long DefaultArea = 640L * 384L;
+        /// <summary>The same check with a LoRA plug-in loaded: the request is held to the
+        /// plug-in's recipe (<see cref="MiniMaxH3SamplingRecipe.Validate"/>), so steps, flow shift
+        /// and sampler may be unset or the recipe's own, and anything else is refused, never
+        /// overridden. A null recipe is the base check.</summary>
+        internal static void ValidateSamplingParameters(VideoGenerationParams p, MiniMaxH3SamplingRecipe recipe)
+        {
+            if (recipe != null) recipe.Validate(p);
+            else ValidateSamplingParameters(p);
+        }
 
-        /// <summary>Resolve the output canvas. An explicit width/height always wins;
-        /// otherwise a conditioning image sets the aspect ratio and the default area
-        /// sets the size, so "animate this photo" does not silently letterbox or
-        /// stretch it.</summary>
-        internal static (int Width, int Height) ResolveCanvas(VideoGenerationParams p)
+        /// <summary>The steps, video shift and sigma grid a clip samples with. A plug-in's recipe
+        /// fixes all three: its N Euler steps on the endpoint-inclusive linspace grid at its own
+        /// shift (<see cref="MiniMaxH3Scheduler.BuildUniformSigmas"/>). Without one, the request's
+        /// steps and shift, else 20 at 12, on stable-diffusion.cpp's grid
+        /// (<see cref="MiniMaxH3Scheduler.BuildSigmas"/>).</summary>
+        internal static (int Steps, float VideoShift, float[] Sigmas) ResolveSampling(
+            VideoGenerationParams p, MiniMaxH3SamplingRecipe recipe)
+        {
+            if (recipe != null) return (recipe.Steps, recipe.VideoShift, recipe.VideoSigmas());
+            int steps = p.Steps > 0 ? p.Steps : MiniMaxH3Scheduler.DefaultSteps;
+            float videoShift = p.FlowShift > 0 ? p.FlowShift : MiniMaxH3Scheduler.VideoShift;
+            return (steps, videoShift, MiniMaxH3Scheduler.BuildSigmas(steps, videoShift));
+        }
+
+        /// <summary>Refuse a reference clip with a plug-in loaded. The Turbo adapters were
+        /// distilled on the FL2VA checkpoint's text, first-frame and first/last-frame clips;
+        /// reference conditioning belongs to Ref2VA, which takes no plug-in.</summary>
+        internal static void RequirePluginMode(MiniMaxH3SamplingRecipe recipe, MiniMaxH3Mode mode)
+        {
+            if (recipe != null && mode == MiniMaxH3Mode.Reference)
+                throw new InvalidOperationException(
+                    $"{recipe.Name} ({recipe.WeightsFileName}) is a MiniMax-H3 FL2VA plug-in for text, first-frame and " +
+                    "first/last-frame clips; reference conditioning does not take it. Drop the plug-in for a reference clip.");
+        }
+
+        /// <summary>The Turbo adapters were trained at 768p; a clip whose short edge is another
+        /// size says so once, and still runs. Null when there is nothing to say.</summary>
+        internal static string DescribePluginCanvas(MiniMaxH3SamplingRecipe recipe, MiniMaxH3Shape shape)
+        {
+            const int TrainedShortEdge = 768;
+            int shortEdge = Math.Min(shape.Width, shape.Height);
+            if (recipe == null || shortEdge == TrainedShortEdge) return null;
+            return $"  [lora] {recipe.Name} was trained at 768p; this clip is {shape.Width}x{shape.Height} " +
+                   $"(short edge {shortEdge}).";
+        }
+
+        /// <summary>Area of the compact canvas: 640x384, TensorSharp's own validation
+        /// workload and the size text-to-video and references get when no size is given.
+        /// It is not MiniMax's working point (the released recipe uses a 768-pixel short
+        /// edge), and for a keyframe it is too small: a full-body photo fitted to it leaves
+        /// a face about 60 px tall, which the video VAE cannot reproduce.</summary>
+        private const long PreviewArea = 640L * 384L;
+
+        /// <summary>Resolve the output canvas.
+        ///
+        /// <para>An explicit width and height always win. One given side takes the other
+        /// from the image's aspect. With neither, i2v and fl2v size the canvas from the
+        /// first keyframe (the last one when it is the only one), because those modes keep
+        /// its framing: under <see cref="VideoCanvasPolicy.ModelRecipe"/> by MiniMax's 768p
+        /// recipe (<see cref="MiniMaxH3Geometry.KeyframeCanvas"/>), under
+        /// <see cref="VideoCanvasPolicy.CompactPreview"/> at 640x384's area. Text-to-video
+        /// gets 640x384.</para></summary>
+        /// <param name="firstKeyframe">The decoded first keyframe, when the caller has one;
+        /// otherwise the request's images are decoded here.</param>
+        internal static (int Width, int Height) ResolveCanvas(
+            VideoGenerationParams p, MiniMaxH3Mode mode,
+            RgbImage firstKeyframe = null, RgbImage lastKeyframe = null)
         {
             if (p.Width > 0 && p.Height > 0) return (p.Width, p.Height);
 
+            bool keyframeMode = mode is MiniMaxH3Mode.ImageToVideo or MiniMaxH3Mode.FirstLastFrame;
+            RgbImage reference = keyframeMode && (firstKeyframe ?? lastKeyframe) != null
+                ? firstKeyframe ?? lastKeyframe
+                : p.ResolveImage() ?? p.ResolveEndImage();
             double aspect = 0;
-            RgbImage reference = p.ResolveImage() ?? p.ResolveEndImage();
             if (reference is { Width: > 0, Height: > 0 })
                 aspect = reference.Width / (double)reference.Height;
+
+            if (keyframeMode && aspect > 0 && p.Width <= 0 && p.Height <= 0
+                && p.CanvasPolicy == VideoCanvasPolicy.ModelRecipe)
+                return MiniMaxH3Geometry.KeyframeCanvas(reference.Width, reference.Height);
 
             if (p.Width > 0 && aspect > 0) return (p.Width, (int)Math.Round(p.Width / aspect));
             if (p.Height > 0 && aspect > 0) return ((int)Math.Round(p.Height * aspect), p.Height);
@@ -1169,8 +1331,8 @@ namespace TensorSharp.Models.MiniMaxH3
             if (p.Height > 0) return (p.Height, p.Height);
 
             if (aspect <= 0) return (640, 384);
-            int w = (int)Math.Round(Math.Sqrt(DefaultArea * aspect));
-            int h = (int)Math.Round(Math.Sqrt(DefaultArea / aspect));
+            int w = (int)Math.Round(Math.Sqrt(PreviewArea * aspect));
+            int h = (int)Math.Round(Math.Sqrt(PreviewArea / aspect));
             return (Math.Max(w, 32), Math.Max(h, 32));
         }
 
@@ -1200,7 +1362,7 @@ namespace TensorSharp.Models.MiniMaxH3
         }
 
         private static void Report(VideoGenerationParams p, string phase, int step, int steps,
-                                  Stopwatch sw)
+                                  Stopwatch sw, string detail = null)
         {
             if (p.OnProgress == null) return;
             double elapsed = sw.Elapsed.TotalSeconds;
@@ -1210,6 +1372,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 Phase = phase,
                 Step = step,
                 TotalSteps = steps,
+                Detail = detail,
                 ElapsedSeconds = elapsed,
                 EtaSeconds = eta,
             });
@@ -1229,12 +1392,27 @@ namespace TensorSharp.Models.MiniMaxH3
         /// denoiser stays resident and behaviour is exactly as before, so cards with room pay
         /// nothing. When it does not, the release costs a re-upload of the DiT on the NEXT
         /// request only - the weights are mmapped GGUF pages that are still in RAM - and buys
-        /// back a decode that is not crossing the bus. Other GGML backends are left alone here:
-        /// a unified-memory device has no separate VRAM to fit the VAE into, and its kept
-        /// networks are released before the next text encoder instead
-        /// (<see cref="ReleaseKeptNetworksForTheTextEncoder"/>).</para></summary>
+        /// back a decode that is not crossing the bus.</para>
+        ///
+        /// <para>On Metal (unified memory) the release is unconditional. The denoise loop
+        /// leaves two things in Metal's working set that the decode never touches: the DiT's
+        /// weights, wired zero-copy wraps of the mapped file, and the persistent reuse
+        /// gallocr its graph grew. At 1280x768x107 (34,991 tokens) that gallocr alone is
+        /// 23.9 GB, and with the weights only 3.3 GB of a 38.3 GB budget stayed free, so the
+        /// 5.2 GB VAE's first command buffer failed with kIOGPUCommandBufferCallbackErrorOutOfMemory.
+        /// The weights would be released before the next request's text encoder anyway
+        /// (<see cref="ReleaseKeptNetworksForTheTextEncoder"/>), and the next graph re-creates
+        /// the gallocr, so releasing both here costs nothing. TS_H3_KEEP_RESIDENT=1 keeps
+        /// the weights, as it does there; the gallocr goes regardless.</para></summary>
         private void ReleaseDenoiserIfVaeWouldNotFit()
         {
+            if (_model.Backend == BackendType.GgmlMetal)
+            {
+                if (Environment.GetEnvironmentVariable("TS_H3_KEEP_RESIDENT") != "1")
+                    _dit?.ReleaseDeviceResidency();
+                GgmlBasicOps.ReleaseReuseComputeBuffers();
+                return;
+            }
             if (_dit == null || _model.Backend != BackendType.GgmlCuda)
                 return;
             if (!GpuMemoryBudget.TryGetSpareBytes(_model.Backend, out long spare))
@@ -1270,6 +1448,9 @@ namespace TensorSharp.Models.MiniMaxH3
             _vae?.ReleaseDeviceResidency();
             _audioVae?.ReleaseDeviceResidency();
         }
+
+        /// <summary>The model's plug-in changed: drop what the denoiser built or bound for the old one.</summary>
+        internal void ReleaseLora() => _dit?.ReleaseLora();
 
         public void Dispose()
         {

@@ -163,6 +163,23 @@ public class ConfigFileArgsTests : IDisposable
         }
     }
 
+    // The FL2VA checkpoint's keyframe modes keep the keyframe's framing, so the canvas
+    // decides how many pixels its faces get. A size in this preset pins every mode,
+    // keyframes included, at that size: it shipped as 640x384, where a full-body photo's
+    // face is about 60 px and the video VAE alone smears it. Leaving the size out lets
+    // a keyframe size the canvas by MiniMax's 768p recipe.
+    [Fact]
+    public void TheFl2vaPresetLeavesTheCanvasToTheKeyframe()
+    {
+        string repoRoot = FindRepoRoot();
+        if (repoRoot is null) return;   // running outside a source checkout
+        string path = Path.Combine(repoRoot, "config", "minimax-h3-fl2va.json");
+        Assert.True(File.Exists(path), path);
+        var keys = TopLevelOptionKeys(path).ToList();
+        foreach (string pinned in new[] { "width", "height", "video-width", "video-height" })
+            Assert.DoesNotContain(pinned, keys);
+    }
+
     // A file entry that names no URL cannot self-provision: on a machine without the
     // file the run stops at "path not found and no download URL was provided". The
     // shape matters as much as the presence -- an entry is understood only when its

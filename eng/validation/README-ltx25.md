@@ -899,6 +899,41 @@ can slow GPU command submission. Retain process-control evidence if a reference
 is temporarily stopped for exclusive benchmarks; its interrupted elapsed time
 is not throughput evidence.
 
+`Ltx25LatentProbe --operation forward` captures the first actual sampler prediction
+and stops before its update. Pass its `forward.json` to the same CPU reference
+command above. With `input_mode: captured`, the reference verifies every array's
+Float32 dtype, shape, byte length, SHA256 and finite values before loading weights.
+It uses the captured latent/context arrays, exact position bounds, scalar sigmas,
+per-token timesteps and keyframe markers in the unchanged official `Modality`.
+Null timestep arrays mean the stream's scalar sigma; captured sampler clean-latent
+and denoise-mask metadata are validated but are not applied again inside the
+transformer. Ingredients LoRA captures are unsupported and explicitly rejected.
+The report records actual process peak RSS separately from retained weight bytes.
+A 512×512×145 first pass has 4,864 video tokens; its single Float32 32-head
+attention score matrix is about 2.82 GiB. At 1024×1024×145 it is about 45.1 GiB,
+before weights or temporary arrays, so full-resolution CPU math attention is not
+a suitable reference run on a 48 GB machine. This replay checks the captured
+denoiser call, not text encoding, image preprocessing, the sampler trajectory or
+rendered anatomy.
+
+To isolate rotary geometry on the captured positions without loading model
+weights or a GPU runtime, compile the production geometry file into the small
+standalone probe, then compare its tables and intermediate phases with the
+unchanged official patchifiers and Float64-frequency RoPE. Supply the capture's
+actual FPS explicitly (older forward manifests do not record it):
+
+```sh
+dotnet run --project eng/validation/Ltx25RopeProbe -- \
+  --capture /path/to/forward.json --output /path/to/rope-native.json
+"$ltx_python" eng/validation/ltx25-rope-capture-reference.py \
+  --reference "$ltx_reference" --probe /path/to/rope-native.json \
+  --fps 24 --output /path/to/rope-original.json
+```
+
+The comparison includes all position bounds, frequencies, normalized coordinates,
+phases and sine/cosine entries, with per-latent-frame results and Float32 ULP
+distances. It does not test the device kernel that applies those tables to Q/K.
+
 Choose `--backend CUDA` for TensorSharp on the requested VM. Connect using:
 
 ```sh

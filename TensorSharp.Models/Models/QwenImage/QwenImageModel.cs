@@ -26,7 +26,7 @@ namespace TensorSharp.Models.QwenImage
     /// environment variables). This class is not an <see cref="IModelArchitecture"/>
     /// text generator; use <see cref="GenerateImage"/> or <see cref="EditImage(string, RgbImage, QwenImageParams)"/>.
     /// </summary>
-    public sealed class QwenImageModel : ModelBase
+    public sealed class QwenImageModel : ModelBase, ILoraPluginHost
     {
         private readonly string _vaePath;
         private readonly string _tePath;
@@ -172,7 +172,11 @@ namespace TensorSharp.Models.QwenImage
                         $"with --lora (the hosts publish them as {LoraCliFlags.EnvironmentVariable}) and unset TS_QWEN_IMAGE_LORA.");
                 try
                 {
-                    var specs = LoraCliFlags.FromJson(Environment.GetEnvironmentVariable(LoraCliFlags.EnvironmentVariable));
+                    // TS_LORAS can also carry another family's plug-ins (a MiniMax-H3 config
+                    // inherited by this process); the host names what it skips, and this model
+                    // applies only the ones it accepts.
+                    var specs = LoraCliFlags.FromJson(Environment.GetEnvironmentVariable(LoraCliFlags.EnvironmentVariable))
+                        .Where(AcceptsLora).ToList();
                     if (specs.Count > 0) SetLoras(specs);
                 }
                 catch (Exception e) when (e is ArgumentException or System.Text.Json.JsonException or FormatException or
@@ -188,6 +192,17 @@ namespace TensorSharp.Models.QwenImage
 
         /// <summary>The LoRA plug-ins in use (empty when none).</summary>
         public IReadOnlyList<LoraSpec> LoraSpecs { get; private set; } = Array.Empty<LoraSpec>();
+
+        /// <inheritdoc/>
+        public string LoraPluginType => LoraCliFlags.QwenImagePluginType;
+
+        /// <summary>A Qwen-Image-2.1 plug-in config, or weights with no TensorSharp plug-in
+        /// config (bare, or with a PEFT or PDD config); another family's plug-in is not.</summary>
+        public bool AcceptsLora(LoraSpec spec)
+        {
+            string declared = LoraCliFlags.DeclaredPluginType(spec);
+            return declared == null || declared == LoraCliFlags.QwenImagePluginType;
+        }
 
         internal QwenImage21LoraSet Loras { get; private set; }
 

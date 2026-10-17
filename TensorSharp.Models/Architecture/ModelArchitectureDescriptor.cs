@@ -146,6 +146,14 @@ namespace TensorSharp.Models.Architecture
         /// </summary>
         public IReadOnlyList<string> ProjectorFileHints { get; init; } = Array.Empty<string>();
 
+        /// <summary>
+        /// The <c>"type"</c> of the LoRA plug-in configs this family's model applies (one of
+        /// <see cref="LoraCliFlags.PluginTypes"/>), or null when it takes none. The hosts read
+        /// it from the probe GGUF to refuse a <c>--lora</c> the model could not apply before any
+        /// plug-in file is resolved or downloaded.
+        /// </summary>
+        public string LoraPluginType { get; init; }
+
         /// <summary>Backends on which <see cref="MultiGpuMode.LayerSplit"/> can actually
         /// find several devices to split across.</summary>
         internal static bool BackendHasSeveralDevices(BackendType backend)
@@ -174,6 +182,12 @@ namespace TensorSharp.Models.Architecture
                 throw new InvalidOperationException(
                     $"Architecture '{Id}' declares MultiGpu={MultiGpu} but no MultiGpuLimitation. That message is " +
                     "what tells an operator why the extra GPUs are idle or holding layers; an empty one is a bug.");
+            }
+            if (LoraPluginType != null && !LoraCliFlags.PluginTypes.Contains(LoraPluginType, StringComparer.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Architecture '{Id}' takes LoRA plug-ins of type '{LoraPluginType}', which is not one of " +
+                    $"{string.Join(", ", LoraCliFlags.PluginTypes)}.");
             }
         }
     }
