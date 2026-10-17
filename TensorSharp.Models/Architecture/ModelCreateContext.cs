@@ -24,7 +24,7 @@ namespace TensorSharp.Models.Architecture
     {
         public ModelCreateContext(string ggufPath, BackendType backend, GgufFile probe,
             int tpDegree = 1, ITensorParallelGroup tpGroup = null,
-            string draftModelPath = null, int layerSplitDegree = 1)
+            string draftModelPath = null, int layerSplitDegree = 1, string projectorPath = null)
         {
             GgufPath = ggufPath ?? throw new ArgumentNullException(nameof(ggufPath));
             Backend = backend;
@@ -33,6 +33,7 @@ namespace TensorSharp.Models.Architecture
             TpGroup = tpGroup;
             DraftModelPath = draftModelPath;
             LayerSplitDegree = layerSplitDegree;
+            ProjectorPath = projectorPath;
         }
 
         /// <summary>Path of the main model GGUF.</summary>
@@ -60,8 +61,13 @@ namespace TensorSharp.Models.Architecture
         /// architectures that implement layer placement; 1 when not requested.</summary>
         public int LayerSplitDegree { get; }
 
+        /// <summary>Multimodal projector (mmproj) the host will load next to this model
+        /// once it is built, or null. Models that place their weights against device
+        /// memory reserve room for it; the projector itself is still loaded by the host.</summary>
+        public string ProjectorPath { get; }
+
         /// <summary>Rebuild with a different tensor-parallel / layer-split resolution.</summary>
         public ModelCreateContext With(int tpDegree, ITensorParallelGroup tpGroup, int layerSplitDegree)
-            => new(GgufPath, Backend, Probe, tpDegree, tpGroup, DraftModelPath, layerSplitDegree);
+            => new(GgufPath, Backend, Probe, tpDegree, tpGroup, DraftModelPath, layerSplitDegree, ProjectorPath);
     }
 }

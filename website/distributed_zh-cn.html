@@ -30,7 +30,7 @@
 
   <h2 id="vs-layer-split">选择张量并行或按层切分</h2>
   <p>张量并行（<code>--tp N</code>）在每层内部切分投影，让 N 张 GPU 并行计算并通过集合通信归约结果。按层切分（<code>--layer-split N</code>）把完整层放到 N 张本地 GPU，在设备边界传递隐状态；它增加容量，但不保证吞吐提升。</p>
-  <p>Qwen 3.8 Flash Next 在 <code>ggml_cuda</code> 上对满足条件的 FFN 量化支持本地 <code>--tp N</code>，在 GGML CUDA/Vulkan 上支持 <code>--layer-split N</code>。DeepSeek V4.1 在 GGML CUDA 上支持 routed-MoE TP（并行度 2–8），注意力与缓存仍按层放置。DeepSeek V4 与 GLM 5.x 也支持本地整层放置，GLM 还有本地原生 TP。两种参数互斥，不支持的模式会在模型/后端检查时被拒绝，这些整模型路径不支持多节点组。</p>
+  <p>Qwen 3.8 Flash Next 在 <code>ggml_cuda</code> 上对满足条件的 FFN 量化支持本地 <code>--tp N</code>，在 GGML CUDA/Vulkan 上支持 <code>--layer-split N</code>。在 <code>ggml_cuda</code> 上，它的按层切分会结合路由专家卸载、按每张 GPU 的空闲显存来规划：放不下本层专家的 GPU 会把靠前几层的专家路由到主机，切分仍能加载（<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwen38-flash-next_zh-cn.md#ggml_cuda-上的专家放置" target="_blank" rel="noopener">详情</a>）。DeepSeek V4.1 在 GGML CUDA 上支持 routed-MoE TP（并行度 2–8），注意力与缓存仍按层放置。DeepSeek V4 与 GLM 5.x 也支持本地整层放置，GLM 还有本地原生 TP。两种参数互斥，不支持的模式会在模型/后端检查时被拒绝，这些整模型路径不支持多节点组。</p>
   <pre data-lang="bash"><code># 完整层放到两张本地 GPU；服务端接受相同参数
 TensorSharp.Cli/bin/TensorSharp.Cli --model qwen38-flash-next.gguf \
     --backend ggml_cuda --layer-split 2</code></pre>
