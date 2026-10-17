@@ -87,7 +87,7 @@ void tsg_matmul_q8_cuda_compute(ggml_tensor * dst, ggml_backend_t cuda_backend) 
     // 65536-token microbatch is well below this limit for every tile size.
     GGML_ASSERT(dst->ne[1] <= int64_t(65535) * 8);
     auto * context = static_cast<ggml_backend_cuda_context *>(cuda_backend->context);
-    CUDA_CHECK(cudaSetDevice(context->device));
+    ggml_cuda_set_device(context->device);
     const cudaStream_t stream = context->stream(context->device, 0);
     if (dst->ne[1] <= 8) launch<8>(dst, stream);
     else if (dst->ne[1] <= 16) launch<16>(dst, stream);

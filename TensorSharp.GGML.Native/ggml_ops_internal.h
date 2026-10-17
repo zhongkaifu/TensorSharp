@@ -813,6 +813,19 @@ namespace tsg
     // process creates its first NCCL communicator for its verdict to be
     // actionable — NCCL caches NCCL_P2P_DISABLE at that point.
     int tp_probe_cuda_peer_access(const int* device_indices, int count);
+    // Behavioural check of the rendezvous ggml's internal two-GPU AllReduce
+    // relies on (each GPU spinning on the other's token in mapped pinned host
+    // memory), with TensorSharp kernels that give up on their own. 1 = the two
+    // GPUs meet, 0 = they do not (caller should fall back to the host
+    // reduction), -1 = not applicable (not two Volta+ devices, probe disabled).
+    int tp_probe_cuda_host_signal(const int* device_indices, int count);
+    // Submit every launch queued on these CUDA backends' streams without
+    // waiting. WDDM holds launches in a software queue until something flushes
+    // it, which deadlocks a cross-GPU rendezvous; a no-op off Windows.
+    void tp_cuda_flush_backends(ggml_backend_t const* backends, int count);
+    // Wait for these CUDA backends' streams with a deadline: 1 = all idle,
+    // 0 = timed out, -1 = not applicable or a CUDA error (synchronize instead).
+    int tp_cuda_wait_backends(ggml_backend_t const* backends, int count, int timeout_ms);
     // Release the collective context and every rank's AllReduce scratch buffer.
     void tp_comm_free();
     // In-place device AllReduce (sum) over one contiguous F32 tensor per rank.
@@ -822,6 +835,9 @@ namespace tsg
     // one-element AllReduce), false when every call would fall through to the
     // host reduction.
     bool tp_device_allreduce_usable();
+    // True once that check found the collective wedged: its kernels never
+    // completed, so the ranks' streams cannot run anything else.
+    bool tp_allreduce_wedged();
     // In-place host AllReduce (sum) over one contiguous F32 buffer per rank.
     void tp_host_allreduce(float** buffers, int n, std::int64_t count);
     void tp_host_allreduce_mt(float** buffers, int n, std::int64_t count);

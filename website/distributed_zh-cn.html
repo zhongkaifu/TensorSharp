@@ -30,7 +30,7 @@
 
   <h2 id="vs-layer-split">选择张量并行或按层切分</h2>
   <p>张量并行（<code>--tp N</code>）在每层内部切分投影，让 N 张 GPU 并行计算并通过集合通信归约结果。按层切分（<code>--layer-split N</code>）把完整层放到 N 张本地 GPU，在设备边界传递隐状态；它增加容量，但不保证吞吐提升。</p>
-  <p>Qwen 3.8 Flash Next 在 <code>ggml_cuda</code> 上对满足条件的 FFN 量化支持本地 <code>--tp N</code>，在 GGML CUDA/Vulkan 上支持 <code>--layer-split N</code>。DeepSeek V4.1 在 GGML CUDA 上支持 routed-MoE TP（并行度 2–8），注意力与缓存仍按层放置。DeepSeek V4 与 GLM 5.x 也支持本地整层放置，GLM 还有本地原生 TP。两种参数互斥，不支持的模式会在模型/后端检查时被拒绝，这些整模型路径不支持多节点组。</p>
+  <p>Qwen 3.8 Flash Next 在 <code>ggml_cuda</code> 上对满足条件的 FFN 量化支持本地 <code>--tp N</code>，在 GGML CUDA/Vulkan 上支持 <code>--layer-split N</code>。在 <code>ggml_cuda</code> 上，它的按层切分会结合路由专家卸载、按每张 GPU 的空闲显存来规划：放不下本层专家的 GPU 会把靠前几层的专家路由到主机，切分仍能加载（<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwen38-flash-next_zh-cn.md#ggml_cuda-上的专家放置" target="_blank" rel="noopener">详情</a>）。DeepSeek V4.1 在 GGML CUDA 上支持 routed-MoE TP（并行度 2–8），注意力与缓存仍按层放置。DeepSeek V4 与 GLM 5.x 也支持本地整层放置，GLM 还有本地原生 TP。两种参数互斥，不支持的模式会在模型/后端检查时被拒绝，这些整模型路径不支持多节点组。</p>
   <pre data-lang="bash"><code># 完整层放到两张本地 GPU；服务端接受相同参数
 TensorSharp.Cli/bin/TensorSharp.Cli --model qwen38-flash-next.gguf \
     --backend ggml_cuda --layer-split 2</code></pre>
@@ -207,8 +207,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
       <tr><td><code>TS_GGML_TP_CUDA_GRAPHS</code></td><td>开启</td><td><code>0</code> 关闭多 GPU 运行下的 CUDA 图捕获。默认开启，因为一个张量并行 token 是几十次按 rank 的小提交，重放远比重新下发便宜（见<a href="#perf-graphs">上文</a>）。该开关会在首次调用后端之前被翻译成原生的 <code>GGML_CUDA_DISABLE_GRAPHS</code>，因为 ggml 在首次使用时就会锁定该值。</td></tr>
       <tr><td><code>TS_GEMMA4_TP_FUSED_MOE</code></td><td>开启</td><td><code>0</code> 表示 Gemma 4 从融合的 MoE 主干回退到逐算子的整专家路径。</td></tr>
       <tr><td><code>GGML_CUDA_ALLREDUCE</code></td><td>自动</td><td><code>nccl</code> / <code>internal</code> / <code>none</code>，直接透传给 ggml 的集合通信选择。显式设置会同时跳过 NCCL 启动前探测。</td></tr>
-      <tr><td><code>TS_GGML_TP_AR_PROBE</code></td><td>开</td><td>模型加载前对 NCCL 集合通信做行为探测：一些云主机声称支持 GPU P2P 但数据永远送不到，NCCL 的第一次 AllReduce 会让两块 GPU 永远空转——典型症状是 TP 模型加载卡死在 kernel warmup。探测失败时 TensorSharp 自动改走 ggml 的钉页主机内存 <code>internal</code> 管线。<code>0</code> 跳过探测；<code>force</code> 忽略缓存的按主机判定（<code>~/.cache/tensorsharp/tp-collective-probe</code>）。</td></tr>
-      <tr><td><code>TS_GGML_TP_AR_PROBE_MS</code></td><td><code>10000</code></td><td>探测 AllReduce 的完成期限，超时即判定集合通信不可用；<code>0</code> 关闭探测。</td></tr>
+      <tr><td><code>TS_GGML_TP_AR_PROBE</code></td><td>开</td><td>模型加载前对 NCCL 集合通信做行为探测：一些云主机声称支持 GPU P2P 但数据永远送不到，NCCL 的第一次 AllReduce 会让两块 GPU 永远空转——典型症状是 TP 模型加载卡死在 kernel warmup。探测失败时 TensorSharp 自动改走 ggml 的钉页主机内存 <code>internal</code> 管线。两张 GPU 且没有可用 NCCL 时（所有 Windows 主机），还会再探测两块 GPU 能否像该管线的 kernel 那样经由钉页主机内存会合，无法会合时回退到主机归约。<code>0</code> 跳过这些探测；<code>force</code> 忽略缓存的按主机判定（<code>~/.cache/tensorsharp/tp-collective-probe</code>）。</td></tr>
+      <tr><td><code>TS_GGML_TP_AR_PROBE_MS</code></td><td><code>10000</code></td><td>探测 AllReduce 的完成期限，超时即判定集合通信不可用；<code>0</code> 关闭探测。它也约束一次运行的第一次集合通信：未完成时以拒绝加载并说明调整办法结束，而不是卡住。</td></tr>
+      <tr><td><code>TS_GGML_TP_WDDM_FLUSH</code></td><td>开启（Windows）</td><td>每次 AllReduce 之后提交各 GPU 已排队的 launch。WDDM 会把 launch 暂存在软件队列中，而双 GPU 的 <code>internal</code> AllReduce 在 kernel 内部会合，没有这一步时一块 GPU 的那一半可能永远不被提交：即 issue #256 中 <code>--tp 2</code> 的启动卡死。<code>0</code> 仅供诊断。</td></tr>
       <tr><td><code>GGML_CUDA_AR_BF16_THRESHOLD</code></td><td><code>1 MB</code></td><td>ggml 在多大载荷以上把 F32 集合通信转成 BF16。TensorSharp 提高了 ggml 自身的默认值（总是转换），使 decode 规模的归约保持精确；设为 <code>0</code> 则完全禁用转换。</td></tr>
     </tbody>
   </table>

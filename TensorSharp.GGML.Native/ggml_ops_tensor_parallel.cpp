@@ -81,6 +81,21 @@ namespace tsg
         TpComm g_tp_comm;
         std::mutex g_tp_comm_mutex;
 
+        // Set when the first collective of the process never completed: the
+        // ranks' streams are blocked behind it, so no later work can run.
+        std::atomic<bool> g_tp_allreduce_wedged{false};
+
+        // Completion deadline for that first collective; the same knob the NCCL
+        // pre-flight probe uses (TS_GGML_TP_AR_PROBE_MS, default 10 s).
+        int tp_collective_deadline_ms()
+        {
+            const char* value = std::getenv("TS_GGML_TP_AR_PROBE_MS");
+            if (value == nullptr || value[0] == '\0')
+                return 10000;
+            const long parsed = std::strtol(value, nullptr, 10);
+            return parsed > 0 ? static_cast<int>(parsed) : 10000;
+        }
+
         // Set a process environment variable so that native getenv() sees it —
         // the backend and NCCL both read their configuration that way.
         void tp_setenv(const char* name, const char* value)
@@ -250,7 +265,8 @@ namespace tsg
                     std::fflush(stderr);
                 }
 
-                if (tp_probe_cuda_collective(probe_devices, n) == 0)
+                const int nccl_verdict = tp_probe_cuda_collective(probe_devices, n);
+                if (nccl_verdict == 0)
                 {
                     // NCCL is unusable even without P2P. The internal pipeline
                     // is 2-device only; past that the host reduction is all that
@@ -265,6 +281,24 @@ namespace tsg
                           "pinned-host-memory AllReduce only supports 2 devices; falling back to "
                           "the host reduction, which will cost throughput. Set "
                           "GGML_CUDA_ALLREDUCE to override, TS_GGML_TP_AR_PROBE=force to re-test.\n");
+                    std::fflush(stderr);
+                }
+
+                // Two ranks without a working NCCL - always the case on Windows,
+                // where ggml's default IS the internal pipeline - take ggml's
+                // pinned-host AllReduce, whose kernels rendezvous through host
+                // memory. Check that rendezvous with kernels that time out
+                // before trusting one that would spin forever.
+                const char* selected = std::getenv("GGML_CUDA_ALLREDUCE");
+                const bool internal = n == 2
+                    && (selected != nullptr ? std::strcmp(selected, "internal") == 0 : nccl_verdict != 1);
+                if (internal && tp_probe_cuda_host_signal(probe_devices, n) == 0)
+                {
+                    tp_setenv("GGML_CUDA_ALLREDUCE", "none");
+                    std::fprintf(stderr,
+                        "[TP] the pinned-host-memory AllReduce cannot synchronize these two GPUs on this "
+                        "host; using the host reduction instead, which costs throughput. Set "
+                        "GGML_CUDA_ALLREDUCE to override.\n");
                     std::fflush(stderr);
                 }
             }
@@ -370,6 +404,27 @@ namespace tsg
         }
         if (ok)
         {
+#ifdef TSG_GGML_USE_CUDA
+            // This is the first collective of the process. Wait for it with a
+            // deadline: a transport that cannot complete must stop the load with
+            // a reason, not leave it blocked in a synchronize that never returns.
+            ggml_backend_t backends[TSG_MAX_DEVICES];
+            for (int r = 0; r < n; ++r) backends[r] = dev(r).backend;
+            tp_cuda_flush_backends(backends, n);
+            if (tp_cuda_wait_backends(backends, n, tp_collective_deadline_ms()) == 0)
+            {
+                g_tp_allreduce_wedged.store(true, std::memory_order_release);
+                std::fprintf(stderr,
+                    "[TP] the device AllReduce (%s) did not complete within %d ms. Restart with "
+                    "GGML_CUDA_ALLREDUCE=none to reduce through host memory instead, or use "
+                    "--layer-split N, which needs no collective.\n",
+                    std::getenv("GGML_CUDA_ALLREDUCE") != nullptr ? std::getenv("GGML_CUDA_ALLREDUCE") : "backend default",
+                    tp_collective_deadline_ms());
+                std::fflush(stderr);
+                cached = 0;
+                return false;
+            }
+#endif
             for (int r = 0; r < n; ++r)
             {
                 ScopedRank rank(r);
@@ -378,6 +433,11 @@ namespace tsg
         }
         cached = ok ? 1 : 0;
         return ok;
+    }
+
+    bool tp_allreduce_wedged()
+    {
+        return g_tp_allreduce_wedged.load(std::memory_order_acquire);
     }
 
     // In-place AllReduce over device tensors, one per rank. `tensors[r]` must be
@@ -390,7 +450,16 @@ namespace tsg
         std::lock_guard<std::mutex> lock(g_tp_comm_mutex);
         if (g_tp_comm.ctx == nullptr)
             return false;
-        return g_tp_comm.allreduce_fn(g_tp_comm.ctx, tensors);
+        const bool reduced = g_tp_comm.allreduce_fn(g_tp_comm.ctx, tensors);
+#ifdef TSG_GGML_USE_CUDA
+        // Both halves of a rendezvous-style collective must reach their GPUs
+        // before any rank's thread blocks on its stream (see tp_cuda_flush_backends).
+        const int n = g_device_count.load(std::memory_order_acquire);
+        ggml_backend_t backends[TSG_MAX_DEVICES];
+        for (int r = 0; r < n; ++r) backends[r] = dev(r).backend;
+        tp_cuda_flush_backends(backends, n);
+#endif
+        return reduced;
     }
 
     // Host-side AllReduce: sum n contiguous F32 buffers element-wise and write
@@ -1567,7 +1636,12 @@ static int tsg_multi_device_init(int backendType, const int* deviceIndices, int 
         // collective that is never issued.
         if (count > 1 && enableCollectives)
         {
-            const bool device_ar = tsg::tp_comm_ensure();
+            // "none" still creates a communicator - one whose AllReduce always
+            // declines - so the selection, not the context, says what runs. Read
+            // it afterwards: the transport probes inside may have chosen it.
+            bool device_ar = tsg::tp_comm_ensure();
+            const char* selected = std::getenv("GGML_CUDA_ALLREDUCE");
+            device_ar &= !(selected != nullptr && std::strcmp(selected, "none") == 0);
             std::fprintf(stderr,
                 "[TP] GGML tensor parallelism: %d device(s), AllReduce=%s\n",
                 count, device_ar ? "device (backend collective)" : "host");
@@ -1796,7 +1870,17 @@ TSG_EXPORT int TSGgml_GetTensorParallelDegree()
 // model never gets.
 TSG_EXPORT int TSGgml_TensorParallelHasDeviceAllReduce()
 {
-    return tsg::tp_device_allreduce_usable() ? 1 : 0;
+    const bool usable = tsg::tp_device_allreduce_usable();
+    if (tsg::tp_allreduce_wedged())
+    {
+        // -1: not merely "no device collective" - the ranks are unusable.
+        tsg::set_last_error(
+            "The GPUs' first tensor-parallel AllReduce did not complete (its kernels are still waiting on each "
+            "other), so this process cannot use them. Restart with GGML_CUDA_ALLREDUCE=none to reduce through "
+            "host memory instead, or use --layer-split N, which needs no collective.");
+        return -1;
+    }
+    return usable ? 1 : 0;
 }
 
 // Host AllReduce over `count` per-rank F32 buffers. Used by the managed TP

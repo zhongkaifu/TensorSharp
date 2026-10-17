@@ -368,6 +368,7 @@ struct glm_tp_comm
     void * ctx = nullptr;
     free_fn_t free_fn = nullptr;
     allreduce_fn_t allreduce_fn = nullptr;
+    std::vector<ggml_backend_t> members;
 
     ~glm_tp_comm()
     {
@@ -388,12 +389,20 @@ struct glm_tp_comm
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor"));
         if (!init_fn || !allreduce_fn) return false;
         ctx = init_fn(backends, (size_t) n);
+        members.assign(backends, backends + n);
         return ctx != nullptr;
     }
 
     bool allreduce(ggml_tensor ** tensors) const
     {
-        return ctx && allreduce_fn && allreduce_fn(ctx, tensors);
+        const bool reduced = ctx && allreduce_fn && allreduce_fn(ctx, tensors);
+#ifdef TSG_GGML_USE_CUDA
+        // Submit both halves of a rendezvous-style collective before any rank
+        // blocks on its stream (WDDM queues launches; see tp_cuda_flush_backends).
+        if (reduced)
+            tsg::tp_cuda_flush_backends(members.data(), (int) members.size());
+#endif
+        return reduced;
     }
 };
 
@@ -728,7 +737,8 @@ static bool init_glm_tp_comm(glm_model & m)
             glm_setenv_default("NCCL_P2P_DISABLE", "1");
             fprintf(stderr, "[glm] TP peer access is non-functional; NCCL will use shared-memory transport\n");
         }
-        if (tsg::tp_probe_cuda_collective(devices, m.tp) == 0)
+        const int nccl_verdict = tsg::tp_probe_cuda_collective(devices, m.tp);
+        if (nccl_verdict == 0)
         {
             // The backend's pinned-host device pipeline is a good two-rank
             // fallback and still avoids 90 explicit tensor downloads/uploads.
@@ -736,6 +746,23 @@ static bool init_glm_tp_comm(glm_model & m)
             fprintf(stderr, m.tp == 2
                 ? "[glm] NCCL probe failed; using the CUDA backend's internal two-rank AllReduce\n"
                 : "[glm] NCCL probe failed; segmented TP will use host-staged reductions\n");
+        }
+        // Two ranks without a working NCCL (always on Windows) take the internal
+        // pipeline, whose kernels rendezvous through pinned host memory: check
+        // that they can meet before trusting a kernel that would spin forever.
+        const char * selected = getenv("GGML_CUDA_ALLREDUCE");
+        if (m.tp == 2 && (selected ? strcmp(selected, "internal") == 0 : nccl_verdict != 1)
+            && tsg::tp_probe_cuda_host_signal(devices, m.tp) == 0)
+        {
+            // Overwrite: the NCCL branch above may have chosen "internal".
+#if defined(_WIN32)
+            _putenv_s("GGML_CUDA_ALLREDUCE", "none");
+#else
+            setenv("GGML_CUDA_ALLREDUCE", "none", 1);
+#endif
+            fprintf(stderr, "[glm] the pinned-host AllReduce cannot synchronize the two GPUs; "
+                "segmented TP will use host-staged reductions\n");
+            return false;   // as for an explicit GGML_CUDA_ALLREDUCE=none above
         }
     }
 #endif
