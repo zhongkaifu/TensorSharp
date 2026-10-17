@@ -6,6 +6,20 @@
 
 [English](README.md) | [中文](README_zh-cn.md)
 
+**Run local AI from C# — from GGUF inference to agent workflows.** TensorSharp brings local model serving, multimodal workloads and tool-using agents into a native .NET stack.
+
+**Get started:** [Download a release](https://github.com/zhongkaifu/TensorSharp/releases/latest) · [Install and run](docs/getting_started.md) · [See benchmarks](docs/benchmarks.md) · [Supported models and backends](docs/supported_models.md) · [Known limitations](docs/PROJECT_STATUS.md)
+
+| If you want to… | Start here |
+|---|---|
+| Build local AI features into a C# application | [Getting started](docs/getting_started.md) and [API/CLI usage](USAGE.md) |
+| Serve GGUF models through compatible APIs | [Server quick start](#tensorsharp-cli-and-server) |
+| Explore local agents, skills and personal knowledge | [Agent skills](docs/agent_skills.md) and [knowledge collections](docs/knowledge-system.md) |
+| Generate or edit images, or experiment with video | [Qwen-Image 2.1](docs/models/qwenimage21.md) and [LTX 2.5](docs/models/ltx-2.5.md) |
+| Compare measured speed and memory behavior | [Reproducible benchmark details](docs/benchmarks.md) |
+
+*Model support, acceleration, memory requirements and validation vary by architecture and platform; check the linked status and model documentation before choosing hardware.*
+
 **TensorSharp is a .NET 10 inference engine for local GGUF models.** Run it on Windows, macOS or Linux through the CLI, browser chat, or Ollama/OpenAI-compatible APIs, or embed it in your own .NET application. Use managed C# CPU kernels or native CUDA, Metal and Vulkan backends, with support that varies by model.
 
 Current source covers text and reasoning, multimodal input, embeddings, image generation/editing, video with audio, personal knowledge collections, and Agent Skills with code tools. TensorSharp also powers [TensorAgent](TensorAgent/README.md), the local app for iPhone, iPad, Mac and Windows. Start below, or check the [project status](docs/PROJECT_STATUS.md) for capabilities and validation limits; LTX 2.5, EmbeddingGemma 2 and native skill discovery require source newer than `v2026.10.11`.
