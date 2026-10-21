@@ -385,7 +385,9 @@ namespace TensorSharp.Models
         /// this mirrors). Unknown budgets leave the configured byte budget alone.</summary>
         protected virtual long? GetCacheMemorySpareBytes()
         {
-            long? spare = GpuMemoryBudget.TryGetReservationSpareBytes(_backend, out long deviceSpare)
+            // Under a layer split a holder's KV and recurrent state land on every GPU
+            // of the split: the tightest one bounds what may be retained.
+            long? spare = GpuMemoryBudget.TryGetReservationSpareBytes(_backend, Math.Max(1, LayerSplitDegree), out long deviceSpare)
                 ? deviceSpare : null;
             try
             {
