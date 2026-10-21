@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using TensorSharp.Core;
 using TensorSharp.GGML;
@@ -291,6 +292,15 @@ namespace TensorSharp.Models
                 // this holder runs again. Check its flush status before a
                 // fused-kernel fallback can consume any older solo state.
                 if (_kvCacheHostStale) FlushArenaCache(_kCache);
+                // The VRAM plan reserved span scratch for at most _spanTokenCap
+                // tokens, narrowing as the KV the span reads grows. The scheduler
+                // hands whole prompt chunks (up to 4096+ tokens) straight here, so
+                // the width has to be enforced here, for image and speculative
+                // forwards too. Consecutive spans are exact: causal attention plus
+                // recurrent state carried in the cache.
+                if (tokens != null && tokens.Length > 1 && _spanTokenCap != int.MaxValue
+                    && tokens.Length > SpanTokensAt(_cacheSeqLen, _spanTokenCap, _spanKvRowTokenBudget, _maxContextLength))
+                    return ForwardInSpans(tokens);
                 return ForwardCoreInner(tokens);
             }
             catch
@@ -303,6 +313,65 @@ namespace TensorSharp.Models
                 foreach (var (emb, _) in _visionEmbeddingsList) emb?.Dispose();
                 _visionEmbeddingsList.Clear();
                 throw;
+            }
+        }
+
+        /// <summary>
+        /// Run one forward as consecutive spans no wider than the plan reserved for.
+        /// Per-forward state is cut with the tokens: an image prompt's (T,H,W)
+        /// position table is sliced, each queued image embedding is narrowed to the
+        /// rows that fall in the span, and a speculative forward's hidden and logits
+        /// outputs are written through offset pointers, so the result is the same as
+        /// the uncut forward's (logits for the last token, or every row).
+        /// </summary>
+        private float[] ForwardInSpans(int[] tokens)
+        {
+            int[] positions = _pendingMRoPEPositions;
+            if (positions != null && positions.Length < 3 * tokens.Length)
+                positions = null;   // ForwardCoreInner would ignore a short table too
+            var images = _visionEmbeddingsList.Count == 0
+                ? null
+                : new List<(Tensor Embeddings, int StartPosition)>(_visionEmbeddingsList);
+            _visionEmbeddingsList.Clear();
+            IntPtr hidden = _specHiddenOutput, logits = _specLogitsOutput;
+            bool allRows = _specForwardActive && _specAllLogitsRows;
+            try
+            {
+                float[] result = null;
+                for (int start = 0; start < tokens.Length;)
+                {
+                    int width = Math.Min(tokens.Length - start,
+                        SpanTokensAt(_cacheSeqLen, _spanTokenCap, _spanKvRowTokenBudget, _maxContextLength));
+                    int end = start + width;
+                    _pendingMRoPEPositions = positions?[(3 * start)..(3 * end)];
+                    if (images != null)
+                    {
+                        foreach (var (embeddings, at) in images)
+                        {
+                            if (embeddings == null || at < 0) continue;
+                            int lo = Math.Max(at, start), hi = Math.Min(at + (int)embeddings.Sizes[0], end);
+                            if (lo < hi)
+                                _visionEmbeddingsList.Add((embeddings.Narrow(0, lo - at, hi - lo), lo - start));
+                        }
+                    }
+                    if (_specForwardActive)
+                    {
+                        if (hidden != IntPtr.Zero)
+                            _specHiddenOutput = hidden + checked((nint)((long)start * SpecFeatureSize * sizeof(float)));
+                        if (allRows)
+                            _specLogitsOutput = logits + checked((nint)((long)start * Config.VocabSize * sizeof(float)));
+                    }
+                    result = ForwardCoreInner(tokens[start..end]);
+                    start = end;
+                }
+                return result;
+            }
+            finally
+            {
+                _specHiddenOutput = hidden;
+                _specLogitsOutput = logits;
+                if (images != null)
+                    foreach (var (embeddings, _) in images) embeddings?.Dispose();
             }
         }
 
@@ -346,7 +415,8 @@ namespace TensorSharp.Models
             {
                 res.Dispose();
                 throw new InvalidOperationException(
-                    "qwen4exp: required token-span path declined; this configuration cannot use the per-layer fallback.");
+                    "qwen4exp: required token-span path declined; this configuration cannot use the per-layer fallback. "
+                    + _tokenGraphDeclineReason);
             }
             if (spanDone) Q4eSpanTicks += Stopwatch.GetTimestamp() - tSpan;
             if (!spanDone && LayerSplitDegree > 1)
@@ -357,17 +427,20 @@ namespace TensorSharp.Models
                 // running it would silently compute against the wrong device's state -
                 // the same class of failure as the mid-sequence QSA fallback that used
                 // to collapse generation. Refuse instead.
+                res.Dispose();
                 throw new NotSupportedException(
                     "qwen4exp: the token-span path declined while a layer split is active. "
                     + "The per-layer fallback is single-GPU only, so it cannot run here. "
-                    + "Re-run without --layer-split to use the fallback.");
+                    + _tokenGraphDeclineReason);
             }
             if (!spanDone && _pendingMRoPEPositions != null)
             {
                 // The fallback paths rotate with scalar positions only; running an
                 // image prompt through them would be silently wrong.
+                res.Dispose();
                 throw new NotSupportedException(
-                    "qwen4exp image prompts need the token-span path, which declined this forward.");
+                    "qwen4exp image prompts need the token-span path, which declined this forward. "
+                    + _tokenGraphDeclineReason);
             }
 
             for (int il = spanDone ? Config.NumLayers : 0; il < Config.NumLayers; il++)
@@ -1089,6 +1162,14 @@ namespace TensorSharp.Models
         }
 
         private bool _tokenGraphUnsupported;
+        private string _tokenGraphDeclineReason;
+
+        private bool DeclineTokenGraph(string reason)
+        {
+            _tokenGraphUnsupported = true;
+            _tokenGraphDeclineReason = reason;
+            return false;
+        }
         private byte[] _layerKinds;
         // The final mixer + LM head riding the last span. _spanLogits holds the
         // downloaded [vocab] row when the head was fused this forward.
@@ -1182,14 +1263,16 @@ namespace TensorSharp.Models
 
         private unsafe bool TryFusedTokenSpans(Tensor res, int[] tokens, int seqLen, int startPos)
         {
-            if (_tokenGraphUnsupported || !IsGgmlBackend
-                || _fusedGateUpExperts
-                || _fusedFfnUnsupported || _fusedGdnUnsupported || _fusedAttnUnsupported
-                || _gdnVerify)
-            {
-                return false;
-            }
-
+            if (_tokenGraphUnsupported) return false;
+            if (!IsGgmlBackend)
+                return DeclineTokenGraph("The token span requires a GGML backend.");
+            if (_fusedGateUpExperts)
+                return DeclineTokenGraph("The token span requires separate gate/up expert tensors.");
+            if (_fusedFfnUnsupported || _fusedGdnUnsupported || _fusedAttnUnsupported)
+                return DeclineTokenGraph(_tokenGraphDeclineReason
+                    ?? $"A fused block was disabled (FFN={_fusedFfnUnsupported}, GDN={_fusedGdnUnsupported}, attention={_fusedAttnUnsupported}).");
+            if (_gdnVerify)
+                return DeclineTokenGraph("TS_Q4E_GDN_VERIFY disables the token span; unset it for this configuration.");
 
             // QSA stays inside the same span as recurrent state, including the
             // first token crossing its sparse width. A fallback cannot reseed it.
@@ -1341,17 +1424,23 @@ namespace TensorSharp.Models
                             if (ok && last) _spanLogitsValid = true;
                             if (!ok)
                             {
-                                _tokenGraphUnsupported = true;
+                                // Read the native error before any cleanup or another native
+                                // call can replace it. Managed descriptor failures never read
+                                // this thread-local value: it may belong to an earlier call.
+                                string failure = $"Native token span layers [{begin}, {il}) on device {DeviceForLayer(begin)} "
+                                    + $"failed at position {startPos}, tokens {seqLen}: "
+                                    + GgmlBasicOps.LastNativeError("no native error was provided");
+                                DeclineTokenGraph(failure);
                                 if (ranAnything)
                                 {
                                     // Layers [0, begin) already advanced the KV cache
                                     // and the recurrent state; re-running them would
                                     // apply the token twice. Fail loudly instead of
-                                    // quietly double-stepping the model; the next
-                                    // forward takes the per-layer fallback.
+                                    // quietly double-stepping the model. A required
+                                    // span cannot promise a fallback on the next forward.
                                     throw new InvalidOperationException(
-                                        "qwen4exp token span failed mid-token; the per-layer " +
-                                        "fallback takes over on the next forward.");
+                                        "qwen4exp token span failed mid-token; earlier layers have already advanced their state. "
+                                        + failure);
                                 }
                                 return false;
                             }
@@ -1393,7 +1482,7 @@ namespace TensorSharp.Models
             }
             catch (Exception ex)
             {
-                _tokenGraphUnsupported = true;
+                DeclineTokenGraph(ex.Message);
                 if (IsTensorParallel || _specForwardActive || HasQsa
                     || LayerSplitDegree > 1 || _pendingMRoPEPositions != null)
                 {
@@ -1415,7 +1504,14 @@ namespace TensorSharp.Models
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (_isRecurrent[l]) continue;
-                if (!TryFillAttnArgs(l, ref args[l])) { _fusedAttnUnsupported = true; return false; }
+                if (!TryFillAttnArgs(l, ref args[l]))
+                {
+                    _fusedAttnUnsupported = true;
+                    _tokenGraphDeclineReason = $"Could not build attention descriptors for layer {l} "
+                        + $"(K={_kCache[l]?.ElementType}, V={_vCache[l]?.ElementType}). "
+                        + "The token span requires available projection weights and an f16 or f32 K/V cache.";
+                    return false;
+                }
             }
             _attnArgs = args;
             return true;
@@ -1442,7 +1538,13 @@ namespace TensorSharp.Models
                     _gdnConvStateT[l] = new Tensor(_allocator, DType.Float32, _convKernel - 1, _convDim);
                     Ops.Fill(_gdnConvStateT[l], 0f);
                 }
-                if (!TryFillGdnArgs(l, ref args[l])) { _fusedGdnUnsupported = true; return false; }
+                if (!TryFillGdnArgs(l, ref args[l]))
+                {
+                    _fusedGdnUnsupported = true;
+                    _tokenGraphDeclineReason = $"Could not build GDN descriptors for layer {l}; "
+                        + "check the projection weights and F32 ssm_conv1d.weight coefficients.";
+                    return false;
+                }
             }
             _gdnArgs = args;
             return true;
@@ -1456,7 +1558,13 @@ namespace TensorSharp.Models
             // the graph each time - exactly the cost the cache exists to remove.
             var args = GC.AllocateArray<Qwen4ExpFfnArgs>(Config.NumLayers, pinned: true);
             for (int l = 0; l < Config.NumLayers; l++)
-                if (!TryFillFfnArgs(l, ref args[l])) { _fusedFfnUnsupported = true; return false; }
+                if (!TryFillFfnArgs(l, ref args[l]))
+                {
+                    _fusedFfnUnsupported = true;
+                    _tokenGraphDeclineReason = $"Could not build FFN descriptors for layer {l}; "
+                        + "check the separate gate/up/down expert tensors and shared projections.";
+                    return false;
+                }
             _ffnArgs = args;
             return true;
         }

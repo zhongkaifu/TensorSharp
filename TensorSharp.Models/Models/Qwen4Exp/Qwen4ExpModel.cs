@@ -95,7 +95,8 @@ namespace TensorSharp.Models
         private float _attnScale;
 
         public Qwen4ExpModel(string ggufPath, BackendType backend, int tpDegree = 1,
-            ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1, string draftGgufPath = null)
+            ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1, string draftGgufPath = null,
+            string projectorPath = null)
             : base(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree)
         {
             Config = new ModelConfig { Architecture = ArchitectureId };
@@ -107,6 +108,9 @@ namespace TensorSharp.Models
                 ParseTokenizer();
                 if (!string.IsNullOrWhiteSpace(draftGgufPath))
                     LoadMtpDraftWeights(draftGgufPath);
+                // The vision tower is loaded after this constructor, on device 0. When
+                // the host already knows it will load one, price it into the plan.
+                _visionReserveBytes = EstimateProjectorDeviceBytes(projectorPath);
 
                 Console.WriteLine($"Model: {ArchitectureId}, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
                     $"Heads={Config.NumHeads}, KVHeads={Config.NumKVHeads}, HeadDim={Config.HeadDim}, Vocab={Config.VocabSize}");
@@ -121,16 +125,21 @@ namespace TensorSharp.Models
                 LoadWeights();
                 VerifyQwen4ExpTensors();
                 PreparePleTableAccess();
+                // The context decides how much KV each layer carries, which the
+                // VRAM-aware layer split below has to price before anything uploads.
+                int maxContextLength = ResolveConfiguredContextLength();
+                int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
+                // Tensor parallelism keeps every expert on the GPUs; refuse a model that
+                // cannot fit that way before slicing and uploading tens of gigabytes.
+                RefuseUnfitTensorParallel(initialCacheLength);
                 // The layer -> GPU map has to exist BEFORE the preload: that is what
                 // decides which device each weight is uploaded to, and the preload frees
                 // the host copy immediately afterwards so there is no second chance.
-                BuildLayerDeviceMap();
+                BuildLayerDeviceMap(maxContextLength, initialCacheLength);
                 PrepareQwen4ExpTensorParallel();
                 if (IsTensorParallel) PrepareCudaQuantizedWeightsForInferenceTP();
                 else PrepareCudaQuantizedWeightsForInference();
 
-                int maxContextLength = ResolveConfiguredContextLength();
-                int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
                 InitCaches(initialCacheLength, maxContextLength);
                 PlanExpertPlacement();
                 FinalizeMtpHead();
@@ -165,16 +174,28 @@ namespace TensorSharp.Models
         ///
         /// See <see cref="PackLayersOntoDevices"/> for why the runs are contiguous.
         /// </summary>
-        private void BuildLayerDeviceMap()
+        private void BuildLayerDeviceMap(int maxContextLength, int initialCacheLength)
         {
             int n = Config.NumLayers;
             _layerDevice = new int[n];
             if (LayerSplitDegree <= 1)
                 return;
 
+            int[] fixedMap = ParseLayerSplitOverride(Environment.GetEnvironmentVariable("TS_Q4E_LAYER_SPLIT"),
+                n, LayerSplitDegree);
+
+            // ggml_cuda: size the runs AND the expert offload against each GPU's free
+            // memory (issue #256 - two 20 GB cards asked to hold 62 GB of experts).
+            if (_backend == BackendType.GgmlCuda && !IsTensorParallel
+                && TryPlanCudaLayerSplit(maxContextLength, initialCacheLength, fixedMap))
+                return;
+
             long[] layerBytes = new long[n];
             long sharedBytes = 0;   // rides on device 0 (embedding, PLE gather source, vision)
             long headBytes = _mtpResidentBytes; // final mixer + LM head + optional shared MTP
+            // Layers whose experts an explicit --n-cpu-moe / --cpu-moe sends to the host
+            // cost their GPU nothing for those experts.
+            bool[] hostLayers = ExplicitHostLayers();
             foreach (var kv in _quantWeights)
             {
                 // Only weights that actually take VRAM count. per_layer_token_embd is
@@ -187,6 +208,10 @@ namespace TensorSharp.Models
                 if (!ShouldPreloadCudaQuantWeightToDevice(kv.Key)
                     && !_stackedExpertMemberNames.Contains(kv.Key))
                     continue;
+                if (hostLayers != null && _stackedExpertMemberNames.Contains(kv.Key)
+                    && MoeCpuOffloadConfig.TryParseLayerIndex(kv.Key, out int expertLayer)
+                    && expertLayer >= 0 && expertLayer < n && hostLayers[expertLayer])
+                    continue;
                 // Charge the head group to the device that will actually hold it
                 // (PreloadRankForWeight sends it to the last one), not to device 0.
                 if (IsHeadSpanWeight(kv.Key)) { headBytes += kv.Value.RawBytes; continue; }
@@ -198,9 +223,7 @@ namespace TensorSharp.Models
                 AccumulateWeightBytes(kv.Key, kv.Value.Storage.ByteLength, layerBytes, ref sharedBytes);
             }
 
-            _layerDevice = ParseLayerSplitOverride(Environment.GetEnvironmentVariable("TS_Q4E_LAYER_SPLIT"),
-                                  n, LayerSplitDegree)
-                ?? PackLayersOntoDevices(layerBytes, sharedBytes, headBytes, LayerSplitDegree);
+            _layerDevice = fixedMap ?? PackLayersOntoDevices(layerBytes, sharedBytes, headBytes, LayerSplitDegree);
 
             var counts = new int[LayerSplitDegree];
             var bytes = new long[LayerSplitDegree];

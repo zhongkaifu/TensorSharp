@@ -335,10 +335,11 @@ UD-Q2_K_XL 文件共 78.9 GB，分三个分片：28.8 GB 的 n-gram（PLE）表�
   `PLE n-gram table: 28.8 GB read on demand from the GGUF mapping, 16 rows a token (random-access advice).`
   直连 `cuda` 引擎同样从映射中读取这些行，并在加载后把整张表预热进页缓存。
 - **最前面若干层的路由专家在主机上运行，同样直接读这份映射。** 在 GGML 的 GPU 后端上由
-  `--n-cpu-moe N` / `--cpu-moe` 选择这些层（在 `ggml_metal` 与 `ggml_cuda` 上实测）。在 `ggml_metal`
-  上两者都未设置时，引擎自行规划切分：在既放得进 Metal 工作集、又给主机层留够页缓存所需内存的前提下，
-  尽量把整层专家留在 GPU 上，其余卸载到主机。在 48 GB 的 M5 Pro 上（51.5 GB 内存、40.2 GB 的 Metal
-  工作集）：
+  `--n-cpu-moe N` / `--cpu-moe` 选择这些层（在 `ggml_metal` 与 `ggml_cuda` 上实测）。两者都未设置时，
+  `ggml_metal` 与 `ggml_cuda` 会自行规划切分；`ggml_cuda` 按每张 GPU 规划，按层切分时也是如此（见
+  [`ggml_cuda` 上的专家放置](#ggml_cuda-上的专家放置)）。在 `ggml_metal` 上，引擎在既放得进 Metal
+  工作集、又给主机层留够页缓存所需内存的前提下，尽量把整层专家留在 GPU 上，其余卸载到主机。在 48 GB
+  的 M5 Pro 上（51.5 GB 内存、40.2 GB 的 Metal 工作集）：
 
   ```
   [moe-offload] qwen4exp (planned): routed experts of 33 of 48 layers run on the host from the GGUF mapping (31.7 GB read on demand); the accelerator holds 15 layers' (14.4 GB). Metal working set 40.2 GB, RAM 51.5 GB; --n-cpu-moe N overrides.
@@ -388,8 +389,9 @@ decode 落后 6%（21.1 对 22.55）。
 10.3-11.3 tok/s。TensorAgent 在 48 GB 的 Mac 上提供这个文件
 （[应用内实测](../../TensorAgent/README.md#the-macs-own-models)）。
 
-单设备 `ggml_cuda` 也会按当前空闲显存、尚待绑定的浮点权重和缓存、驱动余量及 3 GiB 图工作区
-自动规划专家放置。显式 `--n-cpu-moe` / `--cpu-moe` 优先；张量并行和层切分仍使用显式配置。
+`ggml_cuda` 也会按每张 GPU 的空闲显存规划专家放置，单卡与按层切分（`--layer-split N`）都适用。
+显式 `--n-cpu-moe` / `--cpu-moe` 会覆盖该规划；张量并行运行不卸载专家。规划方式、启动输出以及
+哪些情况会拒绝加载，见 [`ggml_cuda` 上的专家放置](#ggml_cuda-上的专家放置)。
 
 可选的 CUDA 专家缓存借鉴 Strata 的紧凑量化槽位：只把被路由的专家保留在设备缓冲区，
 使用 LRU 淘汰，保留全部选中专家和原有归约顺序。缓存保存原始 GGUF 字节，调用未修改的上游
@@ -470,9 +472,9 @@ Qwen/MoE 回归通过 CUDA 327 项（跳过 17）和 CPU 319 项（跳过 22）�
 `docs/validation/qwen38-strata-trained-audit/`、`qwen38-trained-transfer-ab-final/`
 及 `strata-qwen38/`；可复用工具和命令位于 `eng/validation/`。
 
-在 CUDA 上，GPU 放不下这个文件时，`--n-cpu-moe` 起同样的作用。在一张 A40（46 GB）上把 12 层的专家
-放在主机上，`ggml_cuda` 实测 600 / 30.2 tok/s（随机 token，pp512 / tg128），llama-bench 用
-`-ncmoe 12` 为 466.14 / 18.84。
+在 CUDA 上，GPU 放不下这个文件时，同样的卸载起同样的作用：`ggml_cuda` 会自行规划，`--n-cpu-moe N`
+可将其固定。在一张 A40（46 GB）上把 12 层的专家放在主机上，`ggml_cuda` 实测 600 / 30.2 tok/s（随机
+token，pp512 / tg128），llama-bench 用 `-ncmoe 12` 为 466.14 / 18.84。
 
 直接 `cuda` 引擎能运行 UD-Q2_K_XL 的 IQ2_XS 与 IQ3_XXS 专家：decode 用从 ggml 点积移植来的逐 token
 kernel，仍以捕获的 CUDA 图运行；prefill 则把这两种布局解码进它的 tensor-core 与寄存器暂存
@@ -498,6 +500,80 @@ llama-bench 的双 GPU 运行只有 210.74 / 41.99，远低于同一台机器上
 文本那张表为准。按那张表，TensorSharp 的 prefill 快 1.2-2.1 倍，decode 为 llama.cpp 的 88-90%
 （`ggml_cuda`）与 95-96%（`cuda`）。
 
+### `ggml_cuda` 上的专家放置
+
+未指定 `--n-cpu-moe` 与 `--cpu-moe` 时，`ggml_cuda` 会自行决定哪些层的路由专家在主机上运行，单卡与
+按层切分（`--layer-split N`）都适用；`--tp N` 下不卸载任何专家。按层切分过去把每个路由专家都按常驻
+GPU 计价，也没有任何机制按 GPU 卸载专家，因此两张 20 GB 的 RTX 3080 各被要求放下 27-38 GB，加载在
+kernel 预热时失败。
+
+- **单卡。** 规划以量化稠密权重上传后的空闲显存为起点，扣除尚待绑定的浮点权重与缓存、驱动余量
+  （`TS_VRAM_HEADROOM_MB`；默认取 512 MiB 与显卡容量 1/16 中的较大者），以及按 span 宽度和主机路由
+  层数计算的 prefill span 工作区。过去固定预留 3 GiB，而 4,096 token 的 span 加 40 个主机路由层就会
+  超出，把 16 GB 的显卡推入 WDDM 换页。
+- **按层切分。** 在上传任何权重之前，引擎测量每张 GPU 的空闲显存（同样扣除余量），并同时选定连续的
+  层段与主机路由层，让尽可能多的层把专家留在 GPU 上。在每张 GPU 的层段内，靠前的层把专家路由到主机
+  （从 GGUF 映射按需读取），靠后的层把专家留在 GPU 上，与 llama.cpp `--n-cpu-moe` 的顺序相同。稠密
+  权重上传之后，会再次测量每张 GPU 并重新拟合它的卸载。启动时会打印规划，例如：
+
+  ```
+  Layer split across 2 GPUs (sized to free VRAM): gpu0=layers 0-23 (10 with experts on the GPU, 14 on the host), ...
+  [moe-offload] qwen4exp (planned per GPU): routed experts of 28 of 48 layers run on the host from the GGUF mapping (...); gpu0 holds the experts of 10 of layers 0-23 (...), ...
+  ```
+
+  按层切分增加的是容量而不是速度：每个 token 都要依次经过各张 GPU；专家放在主机上时，decode 速度
+  取决于主机内存为这些主机路由层提供的带宽。
+
+覆盖方式，以及哪些情况会拒绝加载（退出码 2）：
+
+- `--n-cpu-moe N` / `--cpu-moe`（`TS_N_CPU_MOE` / `TS_CPU_MOE`）固定主机层集合，即前 N 层；
+  `--n-cpu-moe 0` 表示一层都不卸载。按层切分时，层段会围绕这一集合排布，主机路由层的专家不再计入
+  其所在 GPU，放不下的放置会被拒绝，消息例如 "Re-run with --n-cpu-moe N, or omit the flag to let
+  TensorSharp place the experts"。
+- `TS_Q4E_LAYER_SPLIT=a,b` 固定层段（每张 GPU 的层数），每张 GPU 仍会卸载自己靠前的层；若某张 GPU
+  即使把全部专家放到主机也放不下它的层段，则拒绝加载。
+- 若即使全部专家都在主机上，切分仍放不下，加载会被拒绝，并列出每张 GPU 所需与空闲的显存。可以降低
+  `MAX_CONTEXT` 或 `TS_Q4E_PREFILL_CHUNK`、释放显存，或增加 GPU。
+
+**Prefill span。** `TS_Q4E_PREFILL_CHUNK`（token 数，至少 128）是 qwen4exp 在不使用 `--tp` 的
+`ggml_cuda` 上运行的最宽 prefill span；更长的提示词分块按连续的多个 span 运行。所有路由专家都留在
+GPU 上时默认 4096，只要有一层路由到主机就默认 2048。每个主机路由层在每个 span 都要把自己的整套专家
+流式送到 GPU 一次：span 越窄，所需工作区越小，能常驻的层越多（decode 更快）；span 越宽，流式传输的
+开销分摊得越开（长提示词 prefill 更快）。span 所读取的 KV 超过 16,384 行后，span 还会自动变窄，使长
+上下文不超出预留的工作区。图像与投机解码的前向同样按 span 切分：每个 span 取用自己那几行的图像嵌入与
+位置表，并写入自己那几行的草稿模型隐藏状态与 logits。取值不是不小于 128 的整数时，加载会报错终止。有专家被卸载时，`[moe-offload]` 那一行会写明当前使用的宽度。span 边界就是 prefill 分块边界，
+因此[连续批处理](#连续批处理)末尾关于 prefill 分块形状的数值限制同样适用。
+
+**上下文。** 放置完成后，若各 GPU 已没有空间让 KV 缓存继续增长，加载时会限制上下文长度：
+`[moe-offload] qwen4exp: context capped at N tokens (was M): GPU d has no room to grow the KV cache further after this placement. ...`
+设置 `MAX_CONTEXT` 会预先分配整个窗口，规划也会为它预留空间。
+
+**视觉投影器。** 通过 `--mmproj` 指定的投影器（以及 CLI 在给出 `--image` 或 `--video`
+时在模型旁边找到的配套投影器）会计入 GPU 0 的规划：它的视觉塔以 F32 权重形式驻留，另需约 512 MiB
+工作区。因此多模态运行会相应多卸载一些专家，而不是之后让 GPU 0 显存耗尽。
+
+**预热。** 预热会构建规划所允许的最宽 span，因此预留不足会在第一个请求之前暴露，而不是在请求中途失败。
+在自动放置下，若预热时显存不足（其他进程占用了显存，或驱动所需超出规划），该 GPU 会把更多层的专家
+移到主机（它仍持有的层的四分之一，至少两层）并重新预热，最多四次：
+`[moe-offload] qwen4exp: GPU d ran out of memory during warmup; routing the experts of layers a-b to the host as well ...`。
+若这样也无济于事（显式指定了 `--n-cpu-moe` / `--cpu-moe`，或全部专家已在主机上），CLI 与服务端都会以
+一行信息拒绝加载（退出码 2），而不是带着堆栈失败，或启动一个无法应答的模型。这一行会写明当前放置以及
+相应的调整办法：调大 `TS_VRAM_HEADROOM_MB`（在每张 GPU 上多留空闲，从而把更多专家移到主机）、调大
+`--n-cpu-moe`，或调低 `TS_Q4E_PREFILL_CHUNK`、`MAX_CONTEXT`。
+
+**并发请求。** 在放得很紧的切分上，每多一个并发请求，就要在每张 GPU 上为它准备独立的 KV 与递归状态
+（16K 上下文时合计约 0.5 GiB，分布在各张 GPU 上）；单独一个请求会复用预热时放置的状态。若要支持多个
+并发会话，请降低 `MAX_CONTEXT` 或卸载更多层。
+
+**接缝缓冲区。** 对 64 token 及以上的 span，主机路由层的 MoE 交接缓冲区会在层与层之间复用，而不是
+在整个前向期间一直占用。在 16 GB 的 RTX 3080 Laptop、40 个主机路由层上实测：span 图缓冲区（UD-IQ1_M，
+`MAX_CONTEXT=8192`，用 `TS_GGML_LOG_VRAM=1` 读取）在 2,048 token 时从 2,164 MB 降到 572 MB，在
+4,096 token 时从 4,705 MB 降到 1,561 MB；生成文本逐字节一致；一次 6,544 token 的 prefill 因显卡不再
+换页而从 116 秒降到 55 秒。这只是单张显卡上的结果，不是吞吐对比。
+
+要在一张卡上验证按层切分及其按 GPU 的卸载，可以使用上游 ggml-cuda 的 `GGML_CUDA_DEVICES=2`：它模拟
+两张各报告一半显存的 GPU。这只是模拟，不是性能测量。
+
 ## 多 GPU
 
 `ggml_cuda` 的 `--tp N` 切分每个路由专家及共享专家：gate/up 按中间通道切分，汇集激活后，
@@ -522,8 +598,17 @@ FFN 类型限于 Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、IQ2_XXS、IQ2_XS、IQ2_S、I
 专家切片目前另占总路由专家字节数及重叠行的
 主机缓冲区，并保留至模型释放。加载时不再预读整个稀疏 PLE 表，所需行按需读取。
 
+**容量。** `--tp N` 下所有路由专家都留在 GPU 上并切成 N 份，同时每张 GPU 还各自持有注意力、循环与 PLE
+权重、输出头以及全部缓存的副本；这种模式下不能卸载专家。无法这样放下的检查点会在加载时、把专家切分到主机
+缓冲区之前被拒绝，并列出每张 GPU 的需求与空闲显存（退出码 2）。97 GB 的 IQ4_XS 检查点（三个分片）约含 61 GiB 路由
+专家，因此在 2 张 20 GB GPU 上每张需要 30 GiB 以上：这种情况下请使用 `--layer-split 2`，它会把放得下的
+部分留在 GPU 上，其余专家放在系统内存中运行。在这样的主机上，带专家卸载的张量并行本来也不会更快：在两张
+GPU 上复制注意力与缓存会比按层切分留给专家的空间更少，而 decode 速度无论哪种方式都取决于驻留主机的专家。
+
 `--layer-split N` 仍表示按完整层连续分配至多个 GPU，适用于 `ggml_cuda`、
-`ggml_vulkan` 和直接 `cuda` 引擎。不得同时使用 `--tp` 与 `--layer-split`。
+`ggml_vulkan` 和直接 `cuda` 引擎。在 `ggml_cuda` 上，层段与路由专家卸载会按每张 GPU 的空闲显存一并
+确定（见 [`ggml_cuda` 上的专家放置](#ggml_cuda-上的专家放置)）；在 `ggml_vulkan` 上，层段按权重字节数
+均衡。不得同时使用 `--tp` 与 `--layer-split`。
 `eng/tests/qwen4exp-tensor-parallel.py` 验证两层 prefill、重放、QSA、多轴 RoPE、
 全部 logits 和多 rank 状态回滚。量化模式
 （`--quantized-ffn --tokens 1,2,3,4,5,6,7,8 --rollback-width 8`）在 CUDA TP2 与 TP4 上均通过全部 102 项检查，
@@ -651,11 +736,13 @@ MTP 在两个场景中均实际达到验证宽度 8，并覆盖拒绝回滚。�
   2 张 GPU `-sm layer` 1200 / 61.5——也就是说 llama.cpp 从第二张卡上同样只拿到
   约 10% 的 prefill 提升、decode 基本为 0。
 
-启动时会打印实际走的是哪种模式，以及每张 GPU 分到的层数 / 字节数。
-`TS_Q4E_LAYER_SPLIT=20,28` 可以用显式的每卡层数覆盖自动均衡（精神上等同于
-llama.cpp 的 `--tensor-split`），并且在无法满足给定值时直接抛异常，而不是悄悄忽略
-——这很有用，因为自动均衡只按权重计价，看不见视觉塔，而视觉塔加载得更晚、会落在
-GPU 0 上。
+启动时会打印实际走的是哪种模式，以及每张 GPU 的划分：在 `ggml_cuda` 上是每张 GPU 的层段、其中多少层
+把专家留在 GPU 上，以及规划用量与空闲显存的对比；在 `ggml_vulkan` 上是每张 GPU 分到的层数 / 字节数。
+`TS_Q4E_LAYER_SPLIT=20,28` 可以用显式的每卡层数覆盖自动划分（精神上等同于
+llama.cpp 的 `--tensor-split`），并且在无法满足给定值时直接抛异常，而不是悄悄忽略。
+在 `ggml_cuda` 上，每张 GPU 仍会卸载自己靠前那些层的专家；某张 GPU 即使把全部专家放到主机也放不下
+它的层段时会拒绝加载；规划也已把 `--mmproj` 指定的投影器计入 GPU 0。在 `ggml_vulkan` 上，自动均衡
+只按权重计价，看不见视觉塔，而视觉塔加载得更晚、会落在 GPU 0 上，因此要靠这个覆盖值为它留出空间。
 
 ## 基准矩阵
 
