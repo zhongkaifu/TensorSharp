@@ -92,6 +92,15 @@ public sealed partial class OpenAIChatAdapter
                 ["id"] = Path.GetFileNameWithoutExtension(_options.StartupModelPath),
                 ["object"] = "model",
                 ["owned_by"] = "local",
+                ["loras"] = _svc.LoraRegistry.List()
+                    .Select(a => new Dictionary<string, object>
+                    {
+                        ["id"] = a.Name,
+                        ["rank"] = a.Rank,
+                        ["alpha"] = a.Alpha,
+                        ["modules"] = a.Modules,
+                    })
+                    .ToList(),
             }];
         return Results.Json(new { @object = "list", data });
     }
@@ -298,15 +307,59 @@ public sealed partial class OpenAIChatAdapter
             completeDocumentFits: candidate => _svc.KnowledgePromptFits(candidate, maxTokens, effectiveTools, openaiThink)).ConfigureAwait(false);
         if (inferenceMessages == null) return;
 
-        if (stream)
+        // LoRA selection: an explicit `lora` field names an adapter, or "none"/empty to
+        // clear. The selection is request-scoped and always reverted at the end.
+        bool loraApplied = false;
+        if (body.TryGetProperty("lora", out var loraProp))
         {
-            await StreamCompletionAsync(ctx, requestId, modelName!, inferenceMessages, maxTokens,
-                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge).ConfigureAwait(false);
+            if (loraProp.ValueKind != JsonValueKind.String)
+            {
+                openaiLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                    "/v1/chat/completions rejected: 'lora' must be a string (id={ChatcmplId})", requestId);
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsJsonAsync(new
+                {
+                    error = new
+                    {
+                        message = "lora must be a string naming a loaded adapter, or \"none\"",
+                        type = "invalid_request_error",
+                    },
+                }).ConfigureAwait(false);
+                return;
+            }
+
+            string? loraName = loraProp.GetString();
+            if (!_svc.TrySetActiveLora(loraName, out string? loraError))
+            {
+                openaiLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                    "/v1/chat/completions rejected: {LoraError} (id={ChatcmplId})", loraError, requestId);
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsJsonAsync(new
+                {
+                    error = new { message = loraError, type = "invalid_request_error" },
+                }).ConfigureAwait(false);
+                return;
+            }
+            loraApplied = true;
         }
-        else
+
+        try
         {
-            await CompleteSyncAsync(ctx, requestId, modelName!, inferenceMessages, maxTokens,
-                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge).ConfigureAwait(false);
+            if (stream)
+            {
+                await StreamCompletionAsync(ctx, requestId, modelName!, inferenceMessages, maxTokens,
+                    samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge).ConfigureAwait(false);
+            }
+            else
+            {
+                await CompleteSyncAsync(ctx, requestId, modelName!, inferenceMessages, maxTokens,
+                    samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            if (loraApplied)
+                _svc.ClearActiveLora();
         }
     }
 

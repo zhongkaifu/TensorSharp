@@ -20,6 +20,7 @@ using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.Models.Architecture;
+using TensorSharp.Models.Lora;
 using TensorSharp.Cuda;
 using TensorSharp.GGML;
 using TensorSharp.MLX;
@@ -102,6 +103,14 @@ namespace TensorSharp.Models
         /// every expert byte a second time in VRAM on top of the stacked copy.
         /// </summary>
         protected readonly HashSet<string> _stackedExpertMemberNames = new();
+
+        // ---- LoRA (text adapters) ----
+        // The adapter selected with SetActiveLora. Its deltas are immutable (owned by the
+        // registry); the materialized Device tensors in _loraTensors are owned here and are
+        // rebuilt on every swap. See SetActiveLora for the concurrency contract.
+        private TextLoraAdapter? _activeLora;
+        private readonly Dictionary<string, (Tensor AT, Tensor BT)> _loraTensors = new(StringComparer.Ordinal);
+
         private bool _quantBackendReady;
         private bool _cudaQuantWeightsPrepared;
         private bool _mlxQuantWeightsPrepared;
@@ -1454,6 +1463,105 @@ namespace TensorSharp.Models
             return Ops.IndexSelect(null, embWeight, indices);
         }
 
+        /// <summary>
+        /// Select the LoRA adapter every subsequent linear projection applies on top of the
+        /// base weights, or null to run the base model unchanged. Calling this replaces the
+        /// current selection; the previous adapter's device tensors are released.
+        ///
+        /// <para>
+        /// <b>Concurrency:</b> selection is a property of this shared model instance. It is
+        /// safe to swap between requests that are processed one at a time (the CLI, or a
+        /// server running serial inference). Per-sequence adapter scoping under continuous
+        /// batching needs engine-level adapter state and is not yet implemented — do not
+        /// rely on this staying constant while concurrent requests share the engine.
+        /// </para>
+        /// </summary>
+        public void SetActiveLora(TextLoraAdapter? adapter)
+        {
+            foreach (var (_, pair) in _loraTensors)
+            {
+                pair.AT.Dispose();
+                pair.BT.Dispose();
+            }
+            _loraTensors.Clear();
+            _activeLora = adapter;
+
+            if (adapter == null)
+                return;
+
+            foreach (var (weightName, delta) in adapter.Deltas)
+            {
+                if (TryGetWeightDims(weightName, out long inDim, out long outDim))
+                {
+                    if (delta.In != inDim || delta.Out != outDim)
+                    {
+                        Console.WriteLine(
+                            $"  LoRA '{adapter.Name}': target weight '{weightName}' has shape [{outDim}, {inDim}] but the " +
+                            $"delta expects [{delta.Out}, {delta.In}]; this delta is skipped.");
+                        continue;
+                    }
+                }
+                else
+                {
+                    Console.WriteLine(
+                        $"  LoRA '{adapter.Name}': target weight '{weightName}' is not present in the loaded model " +
+                        $"(it may have been fused on load, e.g. attn_q/attn_k/attn_v -> attn_qkv); this delta is skipped.");
+                    continue;
+                }
+
+                Tensor at = CreateFloatTensor(delta.AT, delta.In, delta.Rank);  // [in, rank]
+                Tensor bt = CreateFloatTensor(delta.BT, delta.Rank, delta.Out); // [rank, out]
+                _loraTensors[weightName] = (at, bt);
+            }
+        }
+
+        /// <summary>
+        /// The <c>[out, in]</c> shape of a base-model linear weight, or false (with dims 0)
+        /// when the name is not present in either weight dictionary.
+        /// </summary>
+        private bool TryGetWeightDims(string weightName, out long inDim, out long outDim)
+        {
+            if (_quantWeights.TryGetValue(weightName, out var qw))
+            {
+                inDim = qw.Ne0;
+                outDim = qw.Ne1;
+                return true;
+            }
+            if (_weights.TryGetValue(weightName, out var w))
+            {
+                inDim = w.Sizes[1];
+                outDim = w.Sizes[0];
+                return true;
+            }
+            inDim = outDim = 0;
+            return false;
+        }
+
+        /// <summary>The name of the active LoRA adapter, or null when none is selected.</summary>
+        public string? ActiveLoraName => _activeLora?.Name;
+
+        /// <summary>True when a LoRA adapter is selected, so fused fast paths that bypass the
+        /// generic <see cref="LinearForward"/> can fall back to the LoRA-aware path.</summary>
+        protected bool HasActiveLora => _activeLora != null;
+
+        /// <summary>
+        /// Add the active adapter's <c>x @ AT @ BT</c> correction to <paramref name="result"/>
+        /// (the base projection <c>x @ W^T</c> plus, when applicable, a sidecar scale).
+        /// </summary>
+        private void ApplyLoraDelta(Tensor result, Tensor input, (Tensor AT, Tensor BT) lora)
+        {
+            long seqLen = input.Sizes[0];
+            int rank = (int)lora.AT.Sizes[1];
+
+            // h = x @ AT  -> [seq, rank]
+            var h = new Tensor(_allocator, DType.Float32, seqLen, rank);
+            Ops.Addmm(h, 0f, h, 1f, input, lora.AT);
+            // result += 1.0 * (h @ BT)  -> [seq, out]
+            Ops.Addmm(result, 1f, result, 1f, h, lora.BT);
+            h.Dispose();
+            InvalidateTensorDeviceCache(result);
+        }
+
         protected Tensor LinearForward(Tensor input, string weightName)
         {
             long t0 = Stopwatch.GetTimestamp();
@@ -1489,6 +1597,14 @@ namespace TensorSharp.Models
             else
             {
                 return null;
+            }
+
+            // Apply the active LoRA delta on top of the base projection. The fused FFN
+            // paths skip LinearForward entirely, so they are gated off when a LoRA is
+            // active (TryFusedDenseSwiGLUFFNInto below and any future fused kernels).
+            if (HasActiveLora && _loraTensors.TryGetValue(weightName, out var lora))
+            {
+                ApplyLoraDelta(result, input, lora);
             }
 
             _linearTicks += Stopwatch.GetTimestamp() - t0;
@@ -1791,6 +1907,10 @@ namespace TensorSharp.Models
         protected bool TryFusedDenseSwiGLUFFNInto(
             Tensor residual, string normWeightName, string gateUpWeightName, string downWeightName)
         {
+            // The fused FFN bypasses LinearForward, so it cannot apply a LoRA delta on
+            // gate_up/down. Fall back to the generic (LoRA-aware) FFN path when active.
+            if (HasActiveLora)
+                return false;
             if (!IsGgmlBackend || residual == null || residual.DimensionCount != 2)
                 return false;
             if (!_quantWeights.TryGetValue(gateUpWeightName, out var gateUpQW) || gateUpQW == null)

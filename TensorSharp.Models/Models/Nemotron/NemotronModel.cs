@@ -102,6 +102,23 @@ namespace TensorSharp.Models
         private bool _expertWeightsNorm;
         private float _expertWeightsScale;
 
+        // Per-block (per-layer) MoE config: the Nemotron "Puzzle"/Bolt checkpoints
+        // assign each MoE layer its own expert count, FF width and top-k via
+        // per-layer arrays, unlike the uniform Nemotron-H/Omni/Super checkpoints.
+        // _numExperts / _numExpertsUsed stay as the maximum across layers so every
+        // pre-allocated buffer is large enough; the per-layer arrays drive routing.
+        private bool _hasPerLayerMoEConfig;
+        private int[] _numExpertsPerLayer;
+        private int[] _numExpertsUsedPerLayer;
+        private uint[]? _expertUsedCountArray;
+
+        // Per-layer, per-expert combined NVFP4 scale2 (downScale * upScale²) folded into
+        // the routing weight. The routed experts are up -> ReLU² -> down, and both up and
+        // down carry a per-expert "<base>.scale" sidecar (llama.cpp applies them inside
+        // the up/down matmuls, i.e. up before and down after the non-linearity).
+        // Null entry = no sidecar (e.g. IQ-quantized experts, which are self-scaling).
+        private float[][] _layerExpertScale;
+
         // Pre-allocated decode buffers for Mamba2
         private float[] _mamba2ConvOutBuf;
         private float[] _mamba2YBuf;
@@ -351,6 +368,7 @@ namespace TensorSharp.Models
             // MoE config
             _numExperts = (int)_gguf.GetUint32($"{arch}.expert_count", 0);
             _numExpertsUsed = (int)_gguf.GetUint32($"{arch}.expert_used_count", 0);
+            _expertUsedCountArray = _gguf.GetUint32Array($"{arch}.expert_used_count");
             Config.NumExperts = _numExperts;
             Config.NumExpertsUsed = _numExpertsUsed;
             _expertWeightsNorm = _gguf.GetBool($"{arch}.expert_weights_norm", false);
@@ -420,6 +438,15 @@ namespace TensorSharp.Models
                 Console.WriteLine($"Attention scale: {_attentionScale}");
 
             LoadWeights();
+
+            // Nemotron 3 Super / Bolt (and other new "nemotron 3" checkpoints) name the
+            // latent MoE projections ffn_latent_down / ffn_latent_up, whereas this model
+            // references them as ffn_latent_in / ffn_latent_out. Normalize the names up
+            // front so every downstream lookup (this includes the quantized + F32 weight
+            // dictionaries) works unchanged for both naming conventions.
+            NormalizeLatentWeightNames();
+            InitPerLayerMoEConfig();
+            InitExpertScales();
 
             if (_numExperts == 0)
                 FuseFFNWeights();
@@ -727,6 +754,149 @@ namespace TensorSharp.Models
             Console.WriteLine($"Expanded Nemotron attention cache to {newCapacity} tokens.");
         }
 
+        /// <summary>
+        /// The "nemotron 3 super" GGUF exports name the latent MoE projections
+        /// <c>ffn_latent_down</c> / <c>ffn_latent_up</c>, while this model references
+        /// <c>ffn_latent_in</c> / <c>ffn_latent_out</c> everywhere else. Rewrite the
+        /// dictionary keys once at load (never touching the weight objects, whose cache
+        /// keys and device buffers are independent of the dictionary key) so both the
+        /// legacy Nemotron-H and the newer Bolt/Super-VL conventions serve the same path.
+        /// </summary>
+        private void NormalizeLatentWeightNames()
+        {
+            AliasLatentTensors(_quantWeights, ".ffn_latent_down.weight", ".ffn_latent_in.weight");
+            AliasLatentTensors(_quantWeights, ".ffn_latent_up.weight", ".ffn_latent_out.weight");
+            AliasLatentTensors(_weights, ".ffn_latent_down.weight", ".ffn_latent_in.weight");
+            AliasLatentTensors(_weights, ".ffn_latent_up.weight", ".ffn_latent_out.weight");
+        }
+
+        private static void AliasLatentTensors<T>(Dictionary<string, T> map, string fromSuffix, string toSuffix)
+        {
+            var renames = new List<(string From, string To)>();
+            foreach (var key in map.Keys)
+            {
+                if (key.EndsWith(fromSuffix, StringComparison.Ordinal))
+                {
+                    string to = key[..^fromSuffix.Length] + toSuffix;
+                    if (!map.ContainsKey(to))
+                        renames.Add((key, to));
+                }
+            }
+
+            foreach (var (from, to) in renames)
+            {
+                map[to] = map[from];
+                map.Remove(from);
+            }
+        }
+
+        /// <summary>
+        /// Derive the per-layer MoE expert count and top-k after weights are loaded.
+        /// Uniform checkpoints (Nemotron-H/Omni/Super) leave every FFN layer at the
+        /// global <c>_numExperts</c>/<c>_numExpertsUsed</c>; the "Puzzle"/Bolt
+        /// checkpoints declare varied per-layer counts (the routed-expert tensor's last
+        /// dim, cross-checked with the per-layer <c>expert_used_count</c> array).
+        /// </summary>
+        private void InitPerLayerMoEConfig()
+        {
+            int numLayers = Config.NumLayers;
+            _numExpertsPerLayer = new int[numLayers];
+            _numExpertsUsedPerLayer = new int[numLayers];
+            if (_numExperts <= 0)
+                return;
+
+            bool varied = false;
+            int maxExperts = 0, maxUsed = 0;
+            for (int l = 0; l < numLayers; l++)
+            {
+                if (_layerTypes[l] != LayerType.FFN)
+                {
+                    _numExpertsPerLayer[l] = 0;
+                    _numExpertsUsedPerLayer[l] = 0;
+                    continue;
+                }
+
+                int numExperts = _numExperts;
+                if (_stackedExpertWeights.TryGetValue($"blk.{l}.ffn_up_exps.weight", out var stackedUp)
+                    && stackedUp.NumExperts > 0)
+                {
+                    numExperts = stackedUp.NumExperts;
+                }
+
+                int numUsed = _numExpertsUsed;
+                if (_expertUsedCountArray != null && l < _expertUsedCountArray.Length)
+                    numUsed = (int)_expertUsedCountArray[l];
+
+                _numExpertsPerLayer[l] = numExperts;
+                _numExpertsUsedPerLayer[l] = numUsed;
+                if (numExperts != _numExperts || numUsed != _numExpertsUsed)
+                    varied = true;
+                maxExperts = Math.Max(maxExperts, numExperts);
+                maxUsed = Math.Max(maxUsed, numUsed);
+            }
+
+            _hasPerLayerMoEConfig = varied;
+
+            if (varied && IsTensorParallel)
+                throw new NotSupportedException(
+                    "Nemotron per-block MoE configuration (Nemotron Puzzle/Bolt) is not yet supported under tensor parallelism.");
+
+            // Grow the global backing sizes to the observed maximum so the pre-allocated
+            // routing buffers (_moeProbs/_moeTopExperts/pointer tables) always fit every
+            // layer. No-op for uniform checkpoints.
+            if (maxExperts > _numExperts)
+                _numExperts = maxExperts;
+            if (maxUsed > _numExpertsUsed)
+                _numExpertsUsed = maxUsed;
+        }
+
+        /// <summary>
+        /// Read the per-expert NVFP4 scale2 sidecars (<c>ffn_up_exps.scale</c> /
+        /// <c>ffn_down_exps.scale</c>) and fold them into a single per-expert multiplier.
+        /// llama.cpp applies <c>up_exps_s</c> inside the up matmul (before ReLU²) and
+        /// <c>down_exps_s</c> inside the down matmul, so the combined factor on the expert
+        /// output is <c>downScale * upScale²</c>. No sidecars -> null (no scaling).
+        /// </summary>
+        private void InitExpertScales()
+        {
+            if (_numExperts <= 0)
+                return;
+
+            _layerExpertScale = new float[Config.NumLayers][];
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_layerTypes[l] != LayerType.FFN)
+                    continue;
+                int ne = _numExpertsPerLayer[l];
+                if (ne <= 0)
+                    continue;
+
+                float[]? upScale = ReadExpertScale($"blk.{l}.ffn_up_exps.scale", ne);
+                float[]? downScale = ReadExpertScale($"blk.{l}.ffn_down_exps.scale", ne);
+                if (upScale == null && downScale == null)
+                {
+                    _layerExpertScale[l] = null!;
+                    continue;
+                }
+
+                var combined = new float[ne];
+                for (int e = 0; e < ne; e++)
+                {
+                    float us = upScale != null ? upScale[e] : 1.0f;
+                    float ds = downScale != null ? downScale[e] : 1.0f;
+                    combined[e] = ds * us * us;
+                }
+                _layerExpertScale[l] = combined;
+            }
+        }
+
+        private float[]? ReadExpertScale(string key, int expectedLength)
+        {
+            if (!_weights.TryGetValue(key, out var tensor) || tensor.ElementCount() != expectedLength)
+                return null;
+            return tensor.GetElementsAsFloat(expectedLength);
+        }
+
         private unsafe void InitLayerInfo()
         {
             int numLayers = Config.NumLayers;
@@ -784,11 +954,12 @@ namespace TensorSharp.Models
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (_layerTypes[l] != LayerType.FFN) continue;
-                _expertUpKeys[l] = new string[_numExperts];
-                _expertDownKeys[l] = new string[_numExperts];
-                _expertUpQW[l] = new QuantizedWeight[_numExperts];
-                _expertDownQW[l] = new QuantizedWeight[_numExperts];
-                for (int e = 0; e < _numExperts; e++)
+                int layerExperts = _numExpertsPerLayer[l];
+                _expertUpKeys[l] = new string[layerExperts];
+                _expertDownKeys[l] = new string[layerExperts];
+                _expertUpQW[l] = new QuantizedWeight[layerExperts];
+                _expertDownQW[l] = new QuantizedWeight[layerExperts];
+                for (int e = 0; e < layerExperts; e++)
                 {
                     _expertUpKeys[l][e] = $"blk.{l}.ffn_up_exps.{e}.weight";
                     _expertDownKeys[l][e] = $"blk.{l}.ffn_down_exps.{e}.weight";
@@ -870,7 +1041,7 @@ namespace TensorSharp.Models
                 for (int l = 0; l < Config.NumLayers; l++)
                 {
                     if (_expertUpQW[l] == null) continue;
-                    for (int e = 0; e < _numExperts; e++)
+                    for (int e = 0; e < _expertUpQW[l].Length; e++)
                     {
                         var up = _expertUpQW[l][e];
                         var dn = _expertDownQW[l][e];
@@ -2106,6 +2277,10 @@ namespace TensorSharp.Models
         {
             int hiddenSize = Config.HiddenSize;
             ref var moeInfo = ref _moeLayerInfo[layer];
+            // Per-block checkpoints give each layer its own expert count and top-k.
+            // For uniform checkpoints these equal the globals, so this is a no-op.
+            int numExperts = _numExpertsPerLayer[layer];
+            int nUsed = _numExpertsUsedPerLayer[layer];
             bool directDecodeResidual = CanMoEDecodeResidualAdd(input, residual, prefix, ref moeInfo, isDecode);
 
             Tensor routerLogits = LinearForward(input, prefix + "ffn_gate_inp.weight");
@@ -2205,39 +2380,51 @@ namespace TensorSharp.Models
 
             for (int s = 0; s < seqLen; s++)
             {
-                float* logitsRow = routerPtr + s * _numExperts;
+                float* logitsRow = routerPtr + s * numExperts;
 
-                for (int e = 0; e < _numExperts; e++)
+                for (int e = 0; e < numExperts; e++)
                     probs[e] = SigmoidScalar(logitsRow[e]);
 
                 if (biasPtr != null)
                 {
-                    for (int e = 0; e < _numExperts; e++)
+                    for (int e = 0; e < numExperts; e++)
                         selectionProbs[e] = probs[e] + biasPtr[e];
                 }
                 else
                 {
-                    Array.Copy(probs, 0, selectionProbs, 0, _numExperts);
+                    Array.Copy(probs, 0, selectionProbs, 0, numExperts);
                 }
 
-                SelectTopKInPlace(selectionProbs, _numExperts, _numExpertsUsed, topExperts);
-                ThrowIfMoEUnroutable(topExperts, _numExpertsUsed, _numExperts, layer, s);
+                SelectTopKInPlace(selectionProbs, numExperts, nUsed, topExperts);
+                ThrowIfMoEUnroutable(topExperts, nUsed, numExperts, layer, s);
 
-                for (int k = 0; k < _numExpertsUsed; k++)
+                for (int k = 0; k < nUsed; k++)
                     routeW[k] = probs[topExperts[k]];
 
                 if (_expertWeightsNorm)
                 {
                     float wSum = 0;
-                    for (int k = 0; k < _numExpertsUsed; k++) wSum += routeW[k];
+                    for (int k = 0; k < nUsed; k++) wSum += routeW[k];
                     if (wSum < 6.103515625e-5f) wSum = 6.103515625e-5f;
-                    for (int k = 0; k < _numExpertsUsed; k++) routeW[k] /= wSum;
+                    for (int k = 0; k < nUsed; k++) routeW[k] /= wSum;
                 }
 
                 if (_expertWeightsScale != 1.0f)
                 {
-                    for (int k = 0; k < _numExpertsUsed; k++)
+                    for (int k = 0; k < nUsed; k++)
                         routeW[k] *= _expertWeightsScale;
+                }
+
+                // Fold the per-expert NVFP4 scale2 into the gating weight. This is applied
+                // after the gating normalization/scale (those act on the router probs, not
+                // the weight scale); it is a per-expert scalar, so it commutes with the
+                // routed-weights accumulation in every MoE path (per-expert, prefill-batched,
+                // GGML/MLX batched).
+                if (_layerExpertScale != null && _layerExpertScale[layer] != null)
+                {
+                    float[] expertScale = _layerExpertScale[layer];
+                    for (int k = 0; k < nUsed; k++)
+                        routeW[k] *= expertScale[topExperts[k]];
                 }
 
                 // Get the input for expert computation
@@ -2289,7 +2476,7 @@ namespace TensorSharp.Models
                         var dnQw0 = _expertDownQW[layer][topExperts[0]];
                         if (upQw0 != null && dnQw0 != null)
                         {
-                            for (int k = 0; k < _numExpertsUsed; k++)
+                            for (int k = 0; k < nUsed; k++)
                             {
                                 int ei = topExperts[k];
                                 _moeUpPtrs[k] = _expertUpQW[layer][ei].CacheKey;
@@ -2301,7 +2488,7 @@ namespace TensorSharp.Models
                             // Use _expertDownResult as the output accumulator
                             GgmlBasicOps.MoEExpertsForward(
                                 _expertDownResult, routedInput,
-                                _numExpertsUsed, _moeUpPtrs, _moeDownPtrs,
+                                nUsed, _moeUpPtrs, _moeDownPtrs,
                                 upQw0.GgmlType, upQw0.Ne0, upQw0.Ne1, upQw0.RawBytes,
                                 dnQw0.GgmlType, dnQw0.Ne0, dnQw0.Ne1, dnQw0.RawBytes,
                                 routeW);
@@ -2330,7 +2517,7 @@ namespace TensorSharp.Models
 
                     if (!usedBatchedMoE)
                     {
-                        for (int k = 0; k < _numExpertsUsed; k++)
+                        for (int k = 0; k < nUsed; k++)
                         {
                             int expertIdx = topExperts[k];
 
@@ -2538,7 +2725,8 @@ namespace TensorSharp.Models
                 return false;
             }
 
-            int nUsed = _numExpertsUsed;
+            int numExperts = _numExpertsPerLayer[layer];
+            int nUsed = _numExpertsUsedPerLayer[layer];
             int totalRoutes = checked(seqLen * nUsed);
             EnsureMoEPrefillRouteBuffers(totalRoutes);
             int[] selectedExperts = _moePrefillSelectedExperts;
@@ -2548,17 +2736,23 @@ namespace TensorSharp.Models
             int[] routedRows = _moePrefillRoutedRows;
             float[] routedWeights = _moePrefillRoutedWeights;
             RouteMoEPrefillTokens(
-                routerPtr, biasPtr, seqLen, _numExperts, nUsed, _expertWeightsNorm, _expertWeightsScale, layer,
+                routerPtr, biasPtr, seqLen, numExperts, nUsed, _expertWeightsNorm, _expertWeightsScale, layer,
                 _moeProbs, _moeSelectionProbs, _moeTopExperts, selectedExperts, routingWeights);
+            if (_layerExpertScale != null && _layerExpertScale[layer] != null)
+            {
+                float[] expertScale = _layerExpertScale[layer];
+                for (int i = 0; i < totalRoutes; i++)
+                    routingWeights[i] *= expertScale[selectedExperts[i]];
+            }
             GroupMoERoutesByExpert(
-                selectedExperts, routingWeights, seqLen, nUsed, _numExperts,
+                selectedExperts, routingWeights, seqLen, nUsed, numExperts,
                 expertCounts, expertOffsets, _moePrefillExpertCursors, routedRows, routedWeights);
 
             float* inputPtr = GetFloatPtr(routedInput);
             float* outputPtr = GetFloatPtr(moeOut);
             int rowBytes = checked(routedDim * sizeof(float));
 
-            for (int expert = 0; expert < _numExperts; expert++)
+            for (int expert = 0; expert < numExperts; expert++)
             {
                 int start = expertOffsets[expert];
                 int batchSize = expertOffsets[expert + 1] - start;

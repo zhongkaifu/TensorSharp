@@ -641,6 +641,7 @@ app.MapVideoStudio();
 _ = app.Services.GetRequiredService<TensorSharp.Studio.StudioService>();
 app.MapOllamaEndpoints();
 app.MapOpenAIEndpoints();
+app.MapLoraEndpoints();
 
 try
 {

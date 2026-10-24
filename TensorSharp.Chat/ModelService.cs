@@ -82,6 +82,51 @@ namespace TensorSharp.Server
         public ModelBase Model => _lifecycle.Model;
 
         /// <summary>
+        /// Loaded text-LoRA adapters, held independently of the base model so they can be
+        /// loaded and unloaded at runtime. Populated by the host's startup directory scan
+        /// and by the adapters that consume a <c>lora</c> request field.
+        /// </summary>
+        public TextLoraRegistry LoraRegistry { get; } = new();
+
+        /// <summary>
+        /// Select the named LoRA adapter on the loaded model for subsequent inference, or
+        /// clear the selection when <paramref name="name"/> is null/empty/<c>"none"</c>.
+        /// Returns false with a reason when no model is loaded or the adapter is unknown.
+        /// </summary>
+        public bool TrySetActiveLora(string? name, out string? error)
+        {
+            error = null;
+            var model = Model;
+            if (model == null)
+            {
+                error = "No model is loaded.";
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(name) || string.Equals(name, "none", StringComparison.OrdinalIgnoreCase))
+            {
+                model.SetActiveLora(null);
+                return true;
+            }
+
+            var adapter = LoraRegistry.Get(name);
+            if (adapter == null)
+            {
+                error = $"No LoRA adapter named '{name}' is loaded.";
+                return false;
+            }
+
+            model.SetActiveLora(adapter);
+            return true;
+        }
+
+        /// <summary>Detach any active LoRA from the loaded model.</summary>
+        public void ClearActiveLora() => Model?.SetActiveLora(null);
+
+        /// <summary>The name of the LoRA adapter currently active on the loaded model, or null.</summary>
+        public string? ActiveLoraName => Model?.ActiveLoraName;
+
+        /// <summary>
         /// Non-null when an explicitly requested <c>--draft-model</c> could not
         /// be activated on the loaded target (see
         /// <see cref="ModelLifecycleService.DraftHeadActivationError"/>). The startup
