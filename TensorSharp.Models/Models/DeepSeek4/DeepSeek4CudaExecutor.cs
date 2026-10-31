@@ -130,6 +130,7 @@ namespace TensorSharp.Models
                 bool stream = ParseEnvInt("TS_DSV4_MMAP", 0) == 0;
                 if (stream)
                 {
+                    _gguf.DropPagesAfterRead = DecideLoadDropCache(null, null);
                     _gguf.BeginStreaming();
                     PrefetchedTensorNames = _gguf.PrefetchedNames;
                     Mark("small tensors prefetched");
@@ -231,11 +232,20 @@ namespace TensorSharp.Models
                 int stage = LayerSplitPlan.StageOf(distributed.NodeId, distributed.Nodes, distributed.DriverRunsLastStage);
                 int[] boundaries = Dsv4StagePlacement.Boundaries(globalDevice, devices);
 
+                // Which node keeps each Engram table (host-mapped tables only; TS_DSV41_ENGRAM_OWNER): a pure function
+                // of the placement and the shard headers, so every node computes the same owners.
+                _stageIndex = stage;
+                _engramOwner = Dsv4StagePlacement.EngramOwners(topology, globalDevice, distributed.LocalDevices,
+                    distributed.Nodes, EngramTableBytes(), engramOnDevice ? "local" : EngramOwnerMode());
+
                 // Before any weight is read: every node must have computed the same placement from the same bytes.
                 ulong bytesHash = Fnv1a(layerBytes, embeddingBytes, headBytes);
                 distributed.Agree?.Invoke($"dsv4-cuda-placement|devices={string.Join(",", boundaries)}" +
                     $"|assignment={Dsv4StagePlacement.AssignmentHash(globalDevice):X16}|bytes={bytesHash:X16}" +
-                    $"|ctx={nCtx}|ubatch={ubatch}|engram_device={engramOnDevice}");
+                    $"|ctx={nCtx}|ubatch={ubatch}|engram_device={engramOnDevice}|engram_owners={string.Join(",", _engramOwner)}");
+                for (int t = 0; t < _engramOwner.Length; t++)
+                    Console.Error.WriteLine($"[dsv4-cuda] Engram table {t} (layer {_engram.Layers[t].Id}): kept by stage {_engramOwner[t]}" +
+                        (_engramOwner[t] == stage ? " (this node)" : string.Empty));
                 Console.Error.WriteLine($"[dsv4-cuda] cross-node layer split: global device boundaries {string.Join(",", boundaries)}; " +
                     $"node {distributed.NodeId} runs stage {stage} of {distributed.Nodes}");
                 // Every node computes the same verdict from the same topology, so all refuse here together, before
@@ -248,10 +258,17 @@ namespace TensorSharp.Models
                 {
                     // Only this stage's layers' small tensors (and the non-layer ones): another stage's norms,
                     // gates and routers are never read here.
+                    _gguf.DropPagesAfterRead = DecideLoadDropCache(Owns, engramOnDevice ? null : KeepsEngramTable);
                     _gguf.BeginStreaming(name => !LayerSplitPlan.TryGetLayer(name, out int il) || Owns(il));
                     PrefetchedTensorNames = _gguf.PrefetchedNames;
                 }
                 var desc = BuildModelDesc(nCtx, ubatch, Owns, engramOnDevice);
+                // A table this node keeps for another node's layer: mapped here, though its layer is not.
+                for (int t = 0; t < _engramOwner.Length; t++)
+                {
+                    if (_engramOwner[t] == stage && _engramTables[t].Base == null)
+                        _engramTables[t] = MapEngramTable($"blk.{_engram.Layers[t].Id}.engram_embd.weight");
+                }
                 _engine = new Dsv4CudaEngine(desc, new Dsv4StagePlan
                 {
                     GlobalDeviceOfLayer = globalDevice,
@@ -261,6 +278,7 @@ namespace TensorSharp.Models
                     Link = distributed.Link,
                     Agree = distributed.Agree,
                     Build = distributed.Build,
+                    EngramOwnerStage = _engramOwner,
                 });
                 _gguf.EndLoad();
                 Console.Error.WriteLine($"[dsv4-cuda] stage {stage} ready in {sw.Elapsed.TotalSeconds:F1}s");
@@ -520,6 +538,10 @@ namespace TensorSharp.Models
                 _v41KvSource[il] = ratio != 0 ? kv : -1;
                 _v41IndexSource[il] = ratio != 0 ? index : -1;
             }
+            _engramTables = new EngramTable[_engram.Layers.Length];
+            _engramRemote = new RemoteRows[_engram.Layers.Length];
+            _engramReader = Dsv41EngramReader.FromEnvironment();
+            Console.Error.WriteLine($"[dsv4-cuda] Engram host reads: {_engramReader.Describe()}");
         }
 
         // -------------------------------------------------------------------
@@ -536,23 +558,128 @@ namespace TensorSharp.Models
             public GgmlTensorType Type;
             public long RowBytes;
             public long Rows;
+
+            public Dsv41EngramReader.Table View => new Dsv41EngramReader.Table(Base, (int)Type, RowBytes, Rows);
         }
 
+        /// <summary>The rows another node sent for one table this forward (<see cref="ImportEngramRows"/>).</summary>
+        private sealed class RemoteRows
+        {
+            public int StartPos, Count;
+            public int[] Ids = Array.Empty<int>();
+            public byte[] Raw = Array.Empty<byte>();
+        }
+
+        // Per table: the mapping (Base null when another node keeps it), and the rows that node sent this forward.
         private EngramTable[] _engramTables;
-        // Each host-mapped table's bytes in its shard, for the warm pass.
-        private readonly List<(string Path, long Offset, long Bytes)> _engramRanges = new List<(string, long, long)>();
+        private RemoteRows[] _engramRemote;
+        private Dsv41EngramReader _engramReader;
+        // A distributed stage: its index and each table's keeper (null on a single-process load: all local).
+        private int _stageIndex = -1;
+        private int[] _engramOwner;
+        private int _engramUbatchStart;
+        // Each host-mapped table's bytes in its shard and its mapping, for the warm pass.
+        private readonly List<MappedTableWarm.Range> _engramRanges = new List<MappedTableWarm.Range>();
         private Task _engramWarm;
         private readonly CancellationTokenSource _engramWarmCancel = new CancellationTokenSource();
+
+        /// <summary>The Engram reader's settings (tests).</summary>
+        internal Dsv41EngramReader EngramReader => _engramReader;
+
+        /// <summary>Each Engram table's keeping stage on a distributed load (null on a single-process one).</summary>
+        internal int[] EngramOwners => _engramOwner;
+
+        /// <summary>Whether this node maps table <paramref name="engramIndex"/> (tests).</summary>
+        internal bool MapsEngramTable(int engramIndex) => _engramTables != null && _engramTables[engramIndex].Base != null;
+
+        /// <summary>Whether this node keeps (maps and gathers from) Engram table <paramref name="t"/>.</summary>
+        private bool KeepsEngramTable(int t) => _engramOwner == null || _engramOwner[t] == _stageIndex;
+
+        /// <summary>The bytes of received Engram rows a table keeps between forwards: a forward that needs at most half of
+        /// a larger buffer gets a buffer of its own size, so one long CLI prompt does not hold its rows for the life of
+        /// the process (tests lower it).</summary>
+        internal static long RemoteRowsKeepBytes = 32L << 20;
+
+        /// <summary>The bytes the received rows of every table hold now (tests).</summary>
+        internal long RemoteRowsBytes
+        {
+            get
+            {
+                long bytes = 0;
+                foreach (RemoteRows r in _engramRemote ?? Array.Empty<RemoteRows>())
+                    bytes += r == null ? 0 : r.Raw.LongLength + 4L * r.Ids.Length;
+                return bytes;
+            }
+        }
+
+        /// <summary>TS_DSV41_ENGRAM_OWNER: <c>local</c> (unset) or <c>balance</c>; see Dsv4StagePlacement.EngramOwners.</summary>
+        internal static string EngramOwnerMode() => Environment.GetEnvironmentVariable("TS_DSV41_ENGRAM_OWNER")?.Trim();
+
+        /// <summary>Each Engram table's bytes, from the shard headers (the same on every node).</summary>
+        private long[] EngramTableBytes()
+        {
+            var bytes = new long[_engram.Layers.Length];
+            for (int t = 0; t < bytes.Length; t++)
+            {
+                GgufTensorInfo info = _gguf.InfoOf($"blk.{_engram.Layers[t].Id}.engram_embd.weight")
+                    ?? throw new InvalidOperationException($"[dsv4-cuda] missing tensor: blk.{_engram.Layers[t].Id}.engram_embd.weight");
+                bytes[t] = ManagedQuantizedOps.RowSize((int)info.Type, (int)info.Shape[0]) * (long)(info.Shape.Length > 1 ? info.Shape[1] : 1);
+            }
+            return bytes;
+        }
+
+        /// <summary>
+        /// TS_DSV4_LOAD_DROP_CACHE (LoadPageCachePolicy, the native loader's rule): whether the loader drops each weight
+        /// chunk's page cache once it has read it (Linux; shards on tmpfs are left alone). Automatic: when the bytes this
+        /// node uploads plus the Engram tables it keeps host-mapped plus 8 GiB exceed its cgroup limit. On the 1017's
+        /// 100 GB VMs a node uploads ~76 GiB and keeps a 63 GiB slice, so it drops, and the next process's weight read no
+        /// longer pushes the warm slice out.
+        /// </summary>
+        /// <param name="owns">The layers this node loads (null: all).</param>
+        /// <param name="keepsTable">The Engram tables this distributed stage keeps host-mapped (null: none). A
+        /// single-process load keeps every table host-mapped unless TS_DSV41_ENGRAM_DEVICE=1.</param>
+        private bool DecideLoadDropCache(Func<int, bool> owns, Func<int, bool> keepsTable)
+        {
+            long upload = 0, mapped = 0;
+            var tables = new Dictionary<string, int>(StringComparer.Ordinal);
+            if (_isV41)
+                for (int t = 0; t < _engram.Layers.Length; t++)
+                    tables[$"blk.{_engram.Layers[t].Id}.engram_embd.weight"] = t;
+            bool singleHostTables = owns == null && _isV41 && EngramPlacement() != true;
+            foreach (var (name, _, bytes) in _gguf.TensorBytes())
+            {
+                bool layer = LayerSplitPlan.TryGetLayer(name, out int il);
+                if (tables.TryGetValue(name, out int t))
+                {
+                    if (owns == null ? singleHostTables : keepsTable != null && keepsTable(t))
+                        mapped += bytes;
+                    else if (owns == null || (layer && owns(il)))
+                        upload += bytes;
+                    continue;
+                }
+                if (owns != null && layer && !owns(il))
+                    continue;
+                upload += bytes;
+            }
+            long allowance = LoadPageCachePolicy.Allowance();
+            var decision = LoadPageCachePolicy.Decide(Environment.GetEnvironmentVariable(LoadPageCachePolicy.Variable),
+                upload, mapped, allowance);
+            if (OperatingSystem.IsLinux())
+                Console.Error.WriteLine("[dsv4-cuda] load page cache: " + LoadPageCachePolicy.Describe(decision, upload, mapped, allowance));
+            return decision.Drop;
+        }
 
         /// <summary>
         /// A host-mapped Engram table is read a few scattered rows per token, and a row whose page is not
         /// cached is a storage round trip: about a millisecond on a network filesystem, so a cold table
-        /// halves decode. Read the tables once on a background thread after the model is ready, as the
-        /// native loader does (dsv4_warm_engram), when the host has room to keep them cached.
+        /// halves decode. Read the tables once after the model is ready, as the native loader does
+        /// (dsv4_warm_engram), when this process's cgroup (and the host) has room to keep them cached; only the
+        /// tables this node keeps, and only the pages that are not already resident (MappedTableWarm).
         /// TS_DSV41_ENGRAM_WARM is read as the native loader reads it (atoi): unset warms in the background,
         /// <c>0</c> never warms, and a positive value warms before the model is handed out. Ignoring it read
         /// the whole 63 GiB table of the 1017 behind every request of a run that asked for no warm, and filled
-        /// a 100 GB cgroup that MemAvailable (host-wide) said had room.
+        /// a 100 GB cgroup that MemAvailable (host-wide) said had room. TS_DSV41_ENGRAM_WARM_THREADS (1-64,
+        /// default 16) sets how many threads read, each on its own file handles.
         /// </summary>
         private void StartEngramWarm()
         {
@@ -564,7 +691,8 @@ namespace TensorSharp.Models
                 Console.Error.WriteLine("[dsv4-cuda] Engram tables are not warmed (TS_DSV41_ENGRAM_WARM=0)");
                 return;
             }
-            _engramWarm = MappedTableWarm.Start(_engramRanges, "dsv4-cuda", "Engram tables", _engramWarmCancel.Token);
+            var options = new MappedTableWarm.Options { Threads = EngramWarmThreads() };
+            _engramWarm = MappedTableWarm.Start(_engramRanges, "dsv4-cuda", "Engram tables", _engramWarmCancel.Token, options);
             if (mode > 0)
                 _engramWarm?.Wait();
         }
@@ -579,6 +707,17 @@ namespace TensorSharp.Models
             return int.TryParse(option.Trim(), out int v) ? v : 0;
         }
 
+        /// <summary>TS_DSV41_ENGRAM_WARM_THREADS: 1-64, default 16.</summary>
+        internal static int EngramWarmThreads()
+        {
+            string option = Environment.GetEnvironmentVariable("TS_DSV41_ENGRAM_WARM_THREADS");
+            if (option == null)
+                return MappedTableWarm.DefaultThreads;
+            if (!int.TryParse(option.Trim(), out int v) || v < 1 || v > 64)
+                throw new NotSupportedException($"TS_DSV41_ENGRAM_WARM_THREADS must be in [1, 64], got '{option}'.");
+            return v;
+        }
+
         public int HashColumns => (int)_engram.HashColumns;
 
         public int HeadDim => (int)_engram.HeadDim;
@@ -587,6 +726,7 @@ namespace TensorSharp.Models
         {
             _engramHashes = _engram.HashTokens(tokens, startPos, ref history.Tokens, ref history.Length);
             _engramUbatchTokens = tokens.Length;
+            _engramUbatchStart = startPos;
         }
 
         public void BeginEngramRows(Dsv41EngramHistory[] histories, ReadOnlySpan<int> tokens, ReadOnlySpan<int> positions)
@@ -604,6 +744,7 @@ namespace TensorSharp.Models
             }
             _engramHashes = hashes;
             _engramUbatchTokens = n;
+            _engramUbatchStart = -1;   // rows of several sequences: never served from another node's rows
         }
 
         public void CopyEngramRowIndices(int engramIndex, int count, int* dst)
@@ -616,48 +757,219 @@ namespace TensorSharp.Models
                 Buffer.MemoryCopy(hashes + first, dst, (long)count * columns * 4, (long)count * columns * 4);
         }
 
+        private long _engramReadTicks;
+
+        public long EngramReadTicks => _engramReadTicks;
+
         public void GatherEngramRows(int engramIndex, int count, float* dst)
+        {
+            long start = Stopwatch.GetTimestamp();
+            try
+            {
+                GatherEngramRowsCore(engramIndex, count, dst);
+            }
+            finally
+            {
+                _engramReadTicks += Stopwatch.GetTimestamp() - start;
+            }
+        }
+
+        private void GatherEngramRowsCore(int engramIndex, int count, float* dst)
         {
             if (_engramHashes == null || count > _engramUbatchTokens)
                 throw new InvalidOperationException("[dsv4-cuda] Engram rows requested before the ubatch was hashed");
 
             EngramTable table = _engramTables[engramIndex];
             int columns = HashColumns, headDim = HeadDim;
-            int rowValues = columns * headDim;
             fixed (int* hashes = _engramHashes)
             {
                 int* mine = hashes + (long)engramIndex * _engramUbatchTokens * columns;
+                if (!KeepsEngramTable(engramIndex))
+                {
+                    GatherReceivedRows(engramIndex, table, mine, count, columns, headDim, dst);
+                    return;
+                }
+                if (table.Base == null)
+                    throw new InvalidOperationException($"[dsv4-cuda] Engram table {engramIndex} is not mapped on this node");
                 // Each (token, column) is an independent random row: the one place
                 // this executor touches the big table at all.
-                Parallel.For(0, count, t =>
-                {
-                    float* rows = dst + (long)t * rowValues;
-                    int* ids = mine + (long)t * columns;
-                    for (int c = 0; c < columns; c++)
-                    {
-                        int row = ids[c];
-                        if ((uint)row >= (uint)table.Rows)
-                            throw new InvalidOperationException("[dsv4-cuda] Engram lookup is out of bounds");
-                        ManagedQuantizedOps.DequantizeRowToFloat32(
-                            (int)table.Type, (IntPtr)(table.Base + row * table.RowBytes),
-                            rows + c * headDim, headDim);
-                    }
-                });
+                _engramReader.Gather(table.View, mine, count, columns, headDim, dst);
             }
         }
 
-        /// <summary>Maps one Engram table read-only. Falls back to a full staged
-        /// copy only when the platform cannot map, which for a table this size
-        /// would mean RAM the box does not have -- so say so rather than
-        /// silently allocating.</summary>
+        /// <summary>
+        /// A table another node keeps: this ubatch's rows are in what it sent at the start of the forward. Their ids must be
+        /// this node's own hashes of the same positions (both nodes hash the same tokens with the same history), which
+        /// catches nodes that fell out of step before a wrong row is used; then each row is dequantized by the same function
+        /// a local gather calls, so the floats are the same.
+        /// </summary>
+        private void GatherReceivedRows(int engramIndex, EngramTable table, int* mine, int count, int columns, int headDim, float* dst)
+        {
+            RemoteRows received = _engramRemote[engramIndex];
+            int offset = _engramUbatchStart - (received?.StartPos ?? 0);
+            if (received == null || _engramUbatchStart < 0 || offset < 0 || offset + count > received.Count)
+                throw new InvalidOperationException(
+                    $"[dsv4-cuda] Engram table {engramIndex} is kept by stage {_engramOwner[engramIndex]}, which sent no rows for " +
+                    $"positions {_engramUbatchStart}..{_engramUbatchStart + count - 1}");
+            int items = count * columns;
+            fixed (int* ids = received.Ids)
+            fixed (byte* raw = received.Raw)
+            {
+                int* theirs = ids + (long)offset * columns;
+                for (int i = 0; i < items; i++)
+                {
+                    if (theirs[i] != mine[i])
+                        throw new InvalidOperationException(
+                            $"[dsv4-cuda] Engram table {engramIndex}: stage {_engramOwner[engramIndex]} sent row {theirs[i]} for position " +
+                            $"{_engramUbatchStart + i / columns}, column {i % columns}, where this node hashes {mine[i]}. The nodes' token " +
+                            "histories differ; restart every node.");
+                }
+                // The received rows, as a table whose row k is the k-th row of this ubatch.
+                var view = new Dsv41EngramReader.Table(raw + (long)offset * columns * table.RowBytes, (int)table.Type, table.RowBytes, items);
+                var order = new int[items];
+                for (int i = 0; i < items; i++)
+                    order[i] = i;
+                fixed (int* rows = order)
+                    _engramReader.Gather(view, rows, count, columns, headDim, dst);
+            }
+        }
+
+        public void PrefetchEngramRows(Dsv41EngramHistory history, ReadOnlySpan<int> tokens, int startPos, int ubatch)
+        {
+            if (_engramReader == null || !_engramReader.Prefetch || tokens.Length == 0 || ubatch <= 0)
+                return;
+            int tables = _engram.Layers.Length, columns = HashColumns, n = tokens.Length;
+            bool any = false;
+            for (int t = 0; t < tables; t++)
+                any |= KeepsEngramTable(t) && _engramTables[t].Base != null;
+            if (!any)
+                return;
+            int[] hashes;
+            try
+            {
+                hashes = _engram.PreviewHashes(tokens, startPos, history.Tokens, history.Length);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentOutOfRangeException)
+            {
+                return;   // the forward's own hashing reports it
+            }
+            // The order the layers ask: every table of ubatch 0 (in layer order, which is table order), then ubatch 1, ...
+            var segments = new List<Dsv41EngramReader.Segment>();
+            for (int u = 0; u < n; u += ubatch)
+            {
+                int nt = Math.Min(ubatch, n - u);
+                for (int t = 0; t < tables; t++)
+                {
+                    if (KeepsEngramTable(t) && _engramTables[t].Base != null)
+                        segments.Add(new Dsv41EngramReader.Segment(_engramTables[t].View, hashes, (t * n + u) * columns, nt * columns));
+                }
+            }
+            _engramReader.PrefetchRows(segments);
+        }
+
+        public void CancelEngramPrefetch() => _engramReader?.CancelPrefetch();
+
+        /// <summary>
+        /// Before a page-cache eviction of the Engram tables (ModelBase.EvictHostTablePageCache): stop every read this
+        /// executor would make of them on its own, so nothing reads the dropped pages straight back. The read-ahead of
+        /// the last forward is abandoned and waited for (each thread finishes the row it is on), and a background warm
+        /// that is still running is cancelled and waited for (it stops after its current 64 MiB blocks): a cold row
+        /// asks for cold tables. The forward's own gathers run only inside a forward, never during an eviction.
+        /// </summary>
+        internal void QuiesceEngramReads()
+        {
+            _engramReader?.CancelPrefetch(wait: true);
+            if (_engramWarm is { IsCompleted: false } warm)
+            {
+                Console.Error.WriteLine("[dsv4-cuda] a page-cache eviction stops the background Engram warm");
+                _engramWarmCancel.Cancel();
+                try { warm.Wait(); }
+                catch (AggregateException) { }
+            }
+        }
+
+        public long EngramTransferBytes(int engramIndex, int count)
+        {
+            long items = (long)count * HashColumns;
+            long bytes = items * 4 + items * _engramTables[engramIndex].RowBytes;
+            return (bytes + 3) & ~3L;
+        }
+
+        public void ExportEngramRows(int engramIndex, int count, byte* dst)
+        {
+            if (_engramHashes == null || count != _engramUbatchTokens)
+                throw new InvalidOperationException("[dsv4-cuda] Engram rows exported before the forward was hashed");
+            EngramTable table = _engramTables[engramIndex];
+            if (!KeepsEngramTable(engramIndex) || table.Base == null)
+                throw new InvalidOperationException($"[dsv4-cuda] Engram table {engramIndex} is not kept by this node");
+            int items = count * HashColumns;
+            long start = Stopwatch.GetTimestamp();
+            fixed (int* hashes = _engramHashes)
+            {
+                int* mine = hashes + (long)engramIndex * count * HashColumns;
+                Buffer.MemoryCopy(mine, dst, (long)items * 4, (long)items * 4);
+                _engramReader.CopyRaw(table.View, mine, items, dst + (long)items * 4);
+            }
+            _engramReadTicks += Stopwatch.GetTimestamp() - start;
+            long used = (long)items * 4 + items * table.RowBytes;
+            long padded = EngramTransferBytes(engramIndex, count);
+            for (long b = used; b < padded; b++)
+                dst[b] = 0;
+        }
+
+        public void ImportEngramRows(int engramIndex, int startPos, int count, byte* src)
+        {
+            if (KeepsEngramTable(engramIndex))
+                throw new InvalidOperationException($"[dsv4-cuda] Engram table {engramIndex} is kept by this node; it takes no rows");
+            int items = count * HashColumns;
+            long rawBytes = items * _engramTables[engramIndex].RowBytes;
+            RemoteRows r = _engramRemote[engramIndex] ??= new RemoteRows();
+            // Grow to this forward; shrink back when a large buffer (one long prompt's rows) is mostly unused.
+            static bool Resize(long have, long need) => have < need || (have > RemoteRowsKeepBytes && need <= have / 2);
+            if (Resize(4L * r.Ids.Length, 4L * items))
+                r.Ids = new int[items];
+            if (Resize(r.Raw.LongLength, rawBytes))
+                r.Raw = new byte[rawBytes];
+            fixed (int* ids = r.Ids)
+                Buffer.MemoryCopy(src, ids, (long)r.Ids.Length * 4, (long)items * 4);
+            fixed (byte* raw = r.Raw)
+                Buffer.MemoryCopy(src + (long)items * 4, raw, r.Raw.LongLength, rawBytes);
+            r.StartPos = startPos;
+            r.Count = count;
+        }
+
+        /// <summary>Maps one Engram table read-only (with MADV_RANDOM unless the reader is told otherwise). Falls back to
+        /// a full staged copy only when the platform cannot map, which for a table this size would mean RAM the box does
+        /// not have -- so say so rather than silently allocating.</summary>
         private EngramTable MapEngramTable(string name)
         {
             GgufTensorInfo info = _gguf.InfoOf(name);
             var (path, offset, bytes, mapped) = _gguf.MapTensor(name);
-            _engramRanges.Add((path, offset, bytes));
+            if (_engramReader.RandomAdvice)
+            {
+                var status = PageCacheHints.AdviseRandom(mapped, bytes, out int error);
+                if (status == PageCacheHints.AdviceStatus.Failed)
+                    Console.Error.WriteLine($"[dsv4-cuda] note: MADV_RANDOM on {name} failed (error {error}); faults read ahead as before");
+                else if (status == PageCacheHints.AdviceStatus.Applied)
+                    Console.Error.WriteLine($"[dsv4-cuda] {name}: {bytes / (double)(1L << 30):F2} GiB mapped for random reads (MADV_RANDOM)");
+            }
+            _engramRanges.Add(new MappedTableWarm.Range(path, offset, bytes, mapped));
             return new EngramTable
             {
                 Base = (byte*)mapped,
+                Type = info.Type,
+                RowBytes = ManagedQuantizedOps.RowSize((int)info.Type, (int)info.Shape[0]),
+                Rows = info.Shape.Length > 1 ? (long)info.Shape[1] : 1,
+            };
+        }
+
+        /// <summary>A table another node keeps: its row layout only, for the rows that node sends.</summary>
+        private EngramTable DescribeRemoteEngramTable(string name)
+        {
+            GgufTensorInfo info = _gguf.InfoOf(name) ?? throw new InvalidOperationException($"[dsv4-cuda] missing tensor: {name}");
+            return new EngramTable
+            {
+                Base = null,
                 Type = info.Type,
                 RowBytes = ManagedQuantizedOps.RowSize((int)info.Type, (int)info.Shape[0]),
                 Rows = info.Shape.Length > 1 ? (long)info.Shape[1] : 1,
@@ -866,8 +1178,9 @@ namespace TensorSharp.Models
                             throw new InvalidOperationException(
                                 $"[dsv4-cuda] DeepSeek V4.1 Engram weights at layer {il} do not match {lookup} lookup " +
                                 $"values, {HcStreams} streams and n_embd {_nEmbd}");
-                        _engramTables ??= new EngramTable[_engram.Layers.Length];
-                        _engramTables[t] = MapEngramTable(p + "engram_embd.weight");
+                        _engramTables[t] = KeepsEngramTable(t)
+                            ? MapEngramTable(p + "engram_embd.weight")
+                            : DescribeRemoteEngramTable(p + "engram_embd.weight");
                         break;
                     }
                 }
@@ -1058,6 +1371,8 @@ namespace TensorSharp.Models
 
         public void Dispose()
         {
+            // The prefetch threads read the mappings: they leave before anything is unmapped.
+            _engramReader?.Dispose();
             _engramWarmCancel.Cancel();
             try { _engramWarm?.Wait(); }
             catch (AggregateException) { }

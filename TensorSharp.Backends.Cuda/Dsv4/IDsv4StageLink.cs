@@ -38,6 +38,15 @@ namespace TensorSharp.Cuda
 
         /// <summary>Receive from the previous pipeline stage.</summary>
         void ReceivePrevious(IntPtr data, int bytes);
+
+        /// <summary>Send to any other stage (the Engram rows an owning node sends the node whose layer reads them,
+        /// <see cref="Dsv4StagePlan.EngramOwnerStage"/>). A link that cannot reach it throws.</summary>
+        void SendToStage(int stage, IntPtr data, int bytes)
+            => throw new NotSupportedException($"[dsv4-cuda] this stage link cannot reach stage {stage}.");
+
+        /// <summary>Receive from any other stage.</summary>
+        void ReceiveFromStage(int stage, IntPtr data, int bytes)
+            => throw new NotSupportedException($"[dsv4-cuda] this stage link cannot reach stage {stage}.");
     }
 
     /// <summary>One node's part of a cross-node layer split.</summary>
@@ -65,6 +74,14 @@ namespace TensorSharp.Cuda
         /// <summary>The build this node runs (the model layer's release and source revision), part of the module
         /// identity the stages agree on: two builds may lay out the payload or compute the layers differently.</summary>
         public string Build { get; init; }
+
+        /// <summary>
+        /// Per Engram table, the stage whose node maps it and reads its rows (null: the stage that runs the table's
+        /// layer, as before). A table owned by another stage than its reader's crosses as raw rows at the start of
+        /// each forward (<see cref="Dsv4StagePlacement.EngramOwners"/>), so each node keeps only its own tables warm.
+        /// Every node computes it from the same placement and agrees on it before loading.
+        /// </summary>
+        public int[] EngramOwnerStage { get; init; }
 
         public int FirstLocalGlobalDevice => Stage * LocalDevices;
 
@@ -324,6 +341,69 @@ namespace TensorSharp.Cuda
                     device[il] = g;
             }
             return device;
+        }
+
+        /// <summary>
+        /// TS_DSV41_ENGRAM_OWNER as the stages agree on it: unset, empty or <c>local</c> is <c>local</c>, <c>balance</c> is
+        /// <c>balance</c> (both trimmed); any other value comes back as given (trimmed), for
+        /// <see cref="EngramOwners"/> to refuse. So a node that leaves it unset and one that says <c>local</c> agree.
+        /// </summary>
+        public static string EngramOwnerModeName(string mode)
+        {
+            string m = mode?.Trim();
+            return string.IsNullOrEmpty(m) ? "local" : m;
+        }
+
+        /// <summary>
+        /// Which stage keeps each host-mapped Engram table: <c>local</c> (the default, <c>TS_DSV41_ENGRAM_OWNER</c>
+        /// unset) leaves every table with the stage whose layer reads it (S9); <c>balance</c> hands the tables out in
+        /// index order, each to the stage holding the fewest table bytes so far, keeping it with its reader on a tie.
+        /// On the 1017 at (12, 22, 31) both tables (layers 1 and 14) are read on stage 0: with <c>balance</c> table 0
+        /// stays there and table 1 goes to stage 1, so each node holds one 63 GiB slice. <c>balance</c> is opt-in until
+        /// a two-node run has measured it: it moves every forward's rows of a moved table before the reader's first
+        /// layer, and the keeping node does not read them ahead. Device-resident tables never move.
+        /// </summary>
+        /// <param name="tableBytes">Each table's bytes (from the shard headers, the same on every node).</param>
+        /// <param name="mode">null or <c>local</c>, or <c>balance</c>; anything else is refused.</param>
+        public static int[] EngramOwners(Dsv4Topology t, int[] globalDevice, int localDevices, int stageCount,
+            long[] tableBytes, string mode)
+        {
+            int tables = 0;
+            for (int il = 0; il < t.NLayer; il++)
+                tables = Math.Max(tables, t.EngramIndex[il] + 1);
+            if (tableBytes == null || tableBytes.Length < tables)
+                throw new ArgumentException($"[dsv4-cuda] {tables} Engram tables need their sizes", nameof(tableBytes));
+            bool balance = EngramOwnerModeName(mode) switch
+            {
+                "balance" => true,
+                "local" => false,
+                _ => throw new NotSupportedException($"TS_DSV41_ENGRAM_OWNER must be 'local' or 'balance' (unset is local), got '{mode}'."),
+            };
+            var owner = new int[tables];
+            var held = new long[stageCount];
+            for (int e = 0; e < tables; e++)
+            {
+                int reader = -1;
+                for (int il = 0; il < t.NLayer; il++)
+                {
+                    if (t.EngramIndex[il] == e)
+                        reader = globalDevice[il] / localDevices;
+                }
+                if (reader < 0)
+                    throw new InvalidOperationException($"[dsv4-cuda] no layer reads Engram table {e}");
+                int best = reader;
+                if (balance)
+                {
+                    for (int s = 0; s < stageCount; s++)
+                    {
+                        if (held[s] < held[best])
+                            best = s;
+                    }
+                }
+                owner[e] = best;
+                held[best] += tableBytes[e];
+            }
+            return owner;
         }
 
         /// <summary>FNV-1a over the assignment: the identity every node agrees on before loading.</summary>
@@ -747,6 +827,14 @@ namespace TensorSharp.Cuda
         /// <summary>Wall time of the boundaries: DtoH + stream sync + network on the sender, network +
         /// validation + queueing the HtoD on the receiver.</summary>
         public long SendTicks, ReceiveTicks;
+        /// <summary>Engram rows that crossed between an owning and a reading node: messages, bytes (header and body)
+        /// and wall time (gather + send on the owner, receive on the reader).</summary>
+        public long EngramMessagesSent, EngramMessagesReceived, EngramBytesSent, EngramBytesReceived, EngramTicks;
+        /// <summary>Deferred sends (TS_DSV4_ASYNC_SEND): how many payloads left one step late, and the host time spent
+        /// waiting for their device-to-host copies when they did. The receiver's time waiting for its one staging to
+        /// be copied out before the next payload may land there (non-zero in steady state means the single receive
+        /// slot is what holds the sender back).</summary>
+        public long Deferred, SendReadyWaitTicks, ReceiveSlotWaitTicks;
         public readonly HashSet<int> SourcesSent = new HashSet<int>(), SourcesReceived = new HashSet<int>();
     }
 }

@@ -37,6 +37,21 @@ public partial class GgufFile
         catch (EntryPointNotFoundException) { return false; }
     }
 
+    /// <summary>Where a tensor's bytes live: the shard file that holds it, the byte offset of its data in that
+    /// file and its byte count. False for a tensor this model does not have.</summary>
+    public bool TryGetTensorFileRange(string name, out string path, out long offset, out long bytes)
+    {
+        path = string.Empty;
+        offset = bytes = 0;
+        if (name == null || !Tensors.TryGetValue(name, out var info))
+            return false;
+        GgufFile owner = OwnerOf(info);
+        path = owner._path;
+        offset = checked(owner.DataOffset + (long)info.Offset);
+        bytes = GetTensorByteCount(info);
+        return true;
+    }
+
     internal unsafe bool TryGetMappedTensorSourcePages(GgufTensorInfo info, IntPtr data, long bytes,
         out GgufFile owner, out long start, out long length)
     {

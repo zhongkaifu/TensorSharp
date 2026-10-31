@@ -444,6 +444,11 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--bench-chunked` | 运行分块 prefill 微基准（Gemma 4） |
 | `--bench-fixed-tokens` | 喂入预先确定的 decode token 流并计时，跳过主机侧贪心采样，便于与 llama-bench 对比。仍会报告一条不计时的贪心正确性链 |
 | `--bench-random-tokens` | 与 `--bench-fixed-tokens` 相同，但 prompt 与 decode 的 token id 从整个词表中均匀随机抽取，每次运行都换一批（固定种子），与 llama-bench 的取法一致。适用于按 token 从磁盘读取查找表或专家的模型：重复的 prompt 会让这些数据一直留在缓存里 |
+| `--bench-workload <spec>` | 基准测试套件中的一行；可重复给出多行。所有行在同一进程中运行，模型只加载一次，并走与 `--benchmark` 相同的计时循环（输出相同的 `benchmark run i/N` 行）。spec 为逗号分隔的 `key=value`：`label`、`prefill`（合成长度，或对真实提示的截断长度）、`text=FILE`（UTF-8，不加特殊 token 分词）或 `tokens=FILE`（JSON token id 数组）、`decode`、`runs`、`mode=greedy\|fixed\|random`、`evict=none\|row\|run`、`chunked`、`seed`（默认 20261001）、`check=0\|1`。单独的 `cold` 等于 `evict=row`：该行开始前，每个节点在不卸载模型的情况下把模型的主机映射表（DeepSeek V4.1 的 Engram 表）从页缓存中逐出（仅 Linux）。未给出的字段取 `--bench-*` 的值 |
+| `--bench-suite <file>` | 从文件读取套件行：每行一个 `--bench-workload` spec（`#` 为注释），或由相同键组成的 JSON 对象数组 |
+| `--bench-json <path>` | 写出套件的机器可读摘要：每次运行的计时与 UTC 时间戳，以及每次逐出在各节点上的页缓存驻留量；每行结束后重写 |
+| `--bench-evict-measure <none\|sampled\|full>` | cold 行在各节点上如何确认表已离开页缓存（逐出前后用 `mincore` 测量）。`sampled`（默认）每张表最多检查 64 个均匀分布的 64 MiB 窗口 |
+| `--bench-evict-strict` | 一旦某个 cold 行的表未能在所有节点上被确认逐出页缓存，就停止整个套件，而不是把其余各行误当作 cold 来测（默认：只警告并继续） |
 | `--warmup-runs <N>` | 在对真实文本 / 多模态 prompt 计时前丢弃的前向次数（默认：0） |
 | `--test-chunked-prefill` | 运行分块 prefill 正确性检查（对比分块与非分块 logits） |
 | `--correct-prefill <N>` | `--test-chunked-prefill` 使用的 prompt 长度 |
@@ -1930,6 +1935,11 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 | 纯 C# 执行器的数值把关 | `InferenceWeb.Tests.Dsv41CpuExecutorTests` 以独立的 PyTorch 参照实现 `eng/dsv41-reference.py` 为准，`atol=rtol=2e-5`，并要求贪心 argmax 完全一致；覆盖一次性 prefill、按 1/3/5/8 分块的 prefill（每个位置都检查）与 reset | **`TS_DSV41_FIXTURE_DIR`**——不设置它这些测试会静默返回。fixture 是一个 5 层、256 隐藏维、16 token 的 F32 合成模型，因此它确立的是与参照实现的架构一致性，而不是真实 246 GiB Q2_K 权重上的 CPU/CUDA 一致性 | — |
 | 逐张量 trace（与参照实现对拍） | 关闭 | `TS_DSV4_CPU_TRACE_DIR=<dir>` 写出与 `eng/dsv41-reference.py --output` 完全相同的逐张量文件，两个目录可以逐张量 diff | — |
 | 内嵌 Engram | 所有后端（含 `--backend cpu`）都直接从 GGUF 读取 | 在 `--backend cpu` 上 `TS_DSV41_ENGRAM_DEVICE` 必须为 `0`（其他取值会在读取任何权重之前被拒绝）；`TS_DSV41_ENGRAM_WARM` / `_THREADS` / `_RANDOM` 仅对原生加载器有效，在这里是空操作 | — |
+| 直连 CUDA 引擎（`--backend cuda`）上主机映射 Engram 表的读取 | 开启：一个 ubatch 的行按 (token, 列) 并行读取，一次 min(16, 核数) 行，在读取器自己的线程上（从不使用 .NET 线程池），Linux 上使用 `MADV_RANDOM`；与 S9 的读取方式逐位一致 | `TS_DSV41_ENGRAM_THREADS=1..32`（`1` 恢复 S9 的读取方式）、`TS_DSV41_ENGRAM_RANDOM=0\|1` | — |
+| `--backend cuda` 上的 Engram 预读 | 关闭：在完整模型上实测之前保持为可选 | `TS_DSV41_ENGRAM_PREFETCH=1` 在各层运行时预先读取一次前向的所有行；取行总是优先 | — |
+| `--backend cuda` 跨节点层切分时 Engram 表的持有节点 | `local`：每张主机映射的表留在运行其所在层的节点上 | `TS_DSV41_ENGRAM_OWNER=balance` 按大小分配各表（1017 在 2 x 2 A40 上：每个节点一个 63 GiB 切片，在每次前向开始时以原始行发送）；逐位一致，在双节点实测之前保持为可选，且所有节点必须使用同一模式 | — |
+| `--backend cuda` 跨节点层切分时的延迟边界发送 | 关闭：每个 prefill ubatch 的数据在下一个 ubatch 开始前发出 | `TS_DSV4_ASYNC_SEND=1` 在下一个 ubatch 期间发送（`2`：在下一个 ubatch 自己发送时），使节点内各 GPU 重叠；逐位一致，在每个 stage 各用自己的 GPU 运行过之前保持为可选 | — |
+| `--backend cuda` 上的 Engram 预热与权重页缓存 | 后台预热，只预热本节点持有的表，且只在其 cgroup 放得下时（只补读缺失的页）；当上传量加上持有的表再加 8 GiB 超过 cgroup 时，加载过程中释放每个权重分块的页缓存（Linux） | `TS_DSV41_ENGRAM_WARM=0\|1`、`TS_DSV41_ENGRAM_WARM_THREADS=1..64`、`TS_DSV4_LOAD_DROP_CACHE=0\|1` | — |
 | 路由 MoE 张量并行 | 关闭 | —（`--backend cpu` 会拒绝，分布式 TP 组同样被拒） | `--tp N` |
 | 仅原生加载器可用的注意力 / gather 开关 | — | `TS_DSV41_SPARSE_FA`、`TS_DSV41_COMPACT_RAW_GATHER`——在 `--backend cpu` 上是空操作 | — |
 | 投机起草 | 实验性：`deepseek41-dspark` 草稿器只能在 `ggml_cuda` / `ggml_cpu` 上加载，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证 | 其他架构的草稿器，或 `ggml_cuda` / `ggml_cpu` 以外任何后端上的草稿器，都会在读取任何权重之前被拒绝 | `--draft-model <deepseek41-dspark.gguf>` |

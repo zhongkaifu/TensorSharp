@@ -430,13 +430,48 @@ namespace TensorSharp.Models
             for (int i = 0; i < tokens.Length; i++)
                 history[startPos + i] = tokens[i] < 0 ? -1 : TokenMap[tokens[i]];
             historyLength = needed;
+            return HashWindow(history, 0, startPos, tokens.Length);
+        }
 
+        /// <summary>
+        /// The row ids <see cref="HashTokens"/> would return for <paramref name="tokens"/> at
+        /// <paramref name="startPos"/>, without touching the history: the Engram reader uses it to read a
+        /// forward's rows ahead of the layers. It reads only the lookback before
+        /// <paramref name="startPos"/> from the history and the rest from <paramref name="tokens"/>, exactly
+        /// as <see cref="HashTokens"/> would see them once it has stored them.
+        /// </summary>
+        public int[] PreviewHashes(ReadOnlySpan<int> tokens, int startPos, int[] history, int historyLength)
+        {
+            if (startPos > historyLength || (startPos > 0 && (history == null || history.Length < startPos)))
+                throw new InvalidOperationException("DeepSeek V4.1 Engram history is not contiguous");
+            foreach (int token in tokens)
+            {
+                if (token >= 0 && (uint)token >= VocabSize)
+                    throw new ArgumentOutOfRangeException(nameof(tokens), "DeepSeek V4.1 token is out of bounds");
+            }
+            int lookback = (int)Math.Min((uint)startPos, MaxNgramSize > 0 ? MaxNgramSize - 1 : 0);
+            int first = startPos - lookback;
+            var window = new int[lookback + tokens.Length];
+            for (int i = 0; i < lookback; i++)
+                window[i] = history[first + i];
+            for (int i = 0; i < tokens.Length; i++)
+                window[lookback + i] = tokens[i] < 0 ? -1 : TokenMap[tokens[i]];
+            return HashWindow(window, first, startPos, tokens.Length);
+        }
+
+        /// <summary>
+        /// The hashing loop of <see cref="HashTokens"/>: <paramref name="history"/>[k] holds the compressed token
+        /// at absolute position <paramref name="historyBase"/> + k, for every position from the first lookback
+        /// the ubatch reaches up to its end.
+        /// </summary>
+        private int[] HashWindow(int[] history, int historyBase, int startPos, int count)
+        {
             uint columns = HashColumns;
-            var hashes = new int[Layers.Length * tokens.Length * columns];
+            var hashes = new int[Layers.Length * count * columns];
             for (int li = 0; li < Layers.Length; li++)
             {
                 LayerLayout layer = Layers[li];
-                for (int i = 0; i < tokens.Length; i++)
+                for (int i = 0; i < count; i++)
                 {
                     int pos = startPos + i;
                     ulong rolling = 0;
@@ -445,8 +480,8 @@ namespace TensorSharp.Models
                     {
                         // Once a lookback runs off the start of the sequence or
                         // hits an image position, every longer one is blocked too.
-                        blocked = blocked || pos < shift || history[pos - shift] < 0;
-                        int token = blocked ? (int)PadId : history[pos - shift];
+                        blocked = blocked || pos < shift || history[pos - shift - historyBase] < 0;
+                        int token = blocked ? (int)PadId : history[pos - shift - historyBase];
                         rolling ^= (ulong)token * layer.Multipliers[shift];
                         if (shift == 0)
                             continue;
@@ -455,7 +490,7 @@ namespace TensorSharp.Models
                             uint column = (shift - 1) * HeadCount + head;
                             // Every head at this lookback sees the same rolling
                             // value; the prime and offset are what separate them.
-                            hashes[(li * tokens.Length + i) * columns + column] =
+                            hashes[(li * count + i) * columns + column] =
                                 (int)(rolling % layer.Primes[column] + (ulong)layer.Offsets[column]);
                         }
                     }

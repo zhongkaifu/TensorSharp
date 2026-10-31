@@ -285,6 +285,15 @@ namespace TensorSharp.Cuda
             _perf = EnvInt("TS_DSV4_PERF", 0);
             _stages = new CudaStageTimer("dsv4-cuda", _perf, StageNames);
             _syncDebug = EnvInt("TS_DSV4_CUDA_SYNCDBG", 0) != 0;
+            // TS_DSV4_ASYNC_SEND: a sending stage may defer each non-final ubatch's boundary send by one step
+            // (Dsv4CudaEngine.Distributed.cs): 1 sends it at the next ubatch's first local hand-over, 2 only at the next
+            // ubatch's own send, 0 (the default) sends synchronously, as S9 did. Opt-in until it has run on separate
+            // GPUs per stage: one shared laptop GPU can show neither its gain nor its event wait across two real CUDA
+            // contexts. Timing only: the payloads, their order and every kernel are the same, so the nodes need not
+            // agree on it.
+            int asyncSend = stage != null && stage.Stage < stage.StageCount - 1 ? EnvInt("TS_DSV4_ASYNC_SEND", 0) : 0;
+            _deferSends = asyncSend != 0;
+            _flushAtHandOver = asyncSend != 2;
 
             // The model layer coerces DSV4's backend to Cpu (it only needs a cheap
             // host allocator), so the CUDA op handlers are not registered for us:
@@ -1236,6 +1245,11 @@ namespace TensorSharp.Cuda
         /// <summary>Clears the active slot back to position 0. Weights and other slots are untouched.</summary>
         public void Reset()
         {
+            // Nothing is in flight between forwards (the last ubatch sends synchronously); drain anyway, so a reset
+            // can never clear caches a deferred payload still reads.
+            FlushBoundarySend();
+            // The last forward's read-ahead names rows this sequence will no longer gather.
+            _m.Engram?.CancelEngramPrefetch();
             ClearSlot(_active);
             _v41CandActive = false;
         }
@@ -1266,14 +1280,33 @@ namespace TensorSharp.Cuda
             var sw = Stopwatch.StartNew();
             long start = Stopwatch.GetTimestamp();
             slot.Failed = true;
+            long engramTicks = _m.Engram?.EngramReadTicks ?? 0;
             int done = 0;
-            while (done < tokens.Length)
+            try
             {
-                int nt = Math.Min(_m.NUbatch, tokens.Length - done);
-                bool last = done + nt == tokens.Length;
-                ForwardUbatch(tokens, done, nt, slot.NPast, last ? logitsOut : null, false, null, 0);
-                slot.NPast += nt;
-                done += nt;
+                BeginForwardEngram(tokens, slot.NPast);
+                while (done < tokens.Length)
+                {
+                    int nt = Math.Min(_m.NUbatch, tokens.Length - done);
+                    bool last = done + nt == tokens.Length;
+                    // A non-final ubatch's boundary may leave during the next one; the last always leaves before
+                    // this returns, so nothing is in flight between forwards.
+                    _deferThisSend = _deferSends && !last;
+                    ForwardUbatch(tokens, done, nt, slot.NPast, last ? logitsOut : null, false, null, 0);
+                    slot.NPast += nt;
+                    done += nt;
+                }
+                _deferThisSend = false;
+                FlushBoundarySend();
+            }
+            catch
+            {
+                // The slot stays failed and the mesh is aborted above this engine; the unsent payload goes nowhere, and
+                // nothing reads ahead for the rest of a forward that will not run.
+                _deferThisSend = false;
+                AbandonBoundarySend();
+                _m.Engram?.CancelEngramPrefetch();
+                throw;
             }
             slot.Failed = false;
             // Only a multi-token forward ends at a prompt boundary.
@@ -1282,9 +1315,28 @@ namespace TensorSharp.Cuda
             if (_perf > 0)
             {
                 double secs = sw.Elapsed.TotalSeconds;
+                double engramMs = ((_m.Engram?.EngramReadTicks ?? 0) - engramTicks) * 1000.0 / Stopwatch.Frequency;
                 Console.Error.WriteLine($"[dsv4-cuda] forward {tokens.Length} tokens in {secs:F3}s ({tokens.Length / secs:F1} tok/s), "
-                    + $"host issue {IssueMs(start):F1}ms" + (_stage != null ? "; " + DescribeBoundaries() : string.Empty));
+                    + $"host issue {IssueMs(start):F1}ms" + (_m.Engram != null ? $", Engram host reads {engramMs:F1}ms" : string.Empty)
+                    + (_stage != null ? "; " + DescribeBoundaries() : string.Empty));
             }
+        }
+
+        /// <summary>
+        /// V4.1's Engram work that spans a whole forward, before its first ubatch: start reading the rows this node's
+        /// host-mapped tables will give its layers (advisory, <see cref="IDsv41EngramSource.PrefetchEngramRows"/>), and on
+        /// a distributed stage exchange the rows of the tables one node keeps for another's layers
+        /// (<see cref="ExchangeEngramRows"/>). The prefetch goes first so its reads overlap the exchange.
+        /// </summary>
+        private void BeginForwardEngram(int[] tokens, int p0)
+        {
+            var m = _m;
+            if (!m.V41 || m.Engram == null)
+                return;
+            if (_ownsEngram && !EngramResident)
+                m.Engram.PrefetchEngramRows(_active.Engram, tokens, p0, m.NUbatch);
+            if (_stage != null)
+                ExchangeEngramRows(tokens, p0);
         }
 
         private void CheckSync(Dev dev, string stage)
@@ -1521,6 +1573,10 @@ namespace TensorSharp.Cuda
                     CudaDriverApi.cuStreamWaitEvent(src.Stream, dst.CopyDoneEv, 0).ThrowOnError();
                     curDev = L.Device;
                     StageEnd(dst, 11);
+                    // The previous ubatch's deferred boundary: the GPUs before this hand-over have this ubatch's
+                    // layers queued, so they compute while the host waits for the last GPU and sends.
+                    if (_flushAtHandOver)
+                        FlushBoundarySend();
                 }
 
                 var dev = _devs[curDev];

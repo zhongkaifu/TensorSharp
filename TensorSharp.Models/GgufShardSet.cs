@@ -159,6 +159,32 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// Drop each range the loader reads from the page cache as soon as it has been copied out (Linux, set before
+        /// <see cref="BeginStreaming"/>). A weight on its way to VRAM is never read from the file again, and on a host
+        /// whose memory cgroup also has to keep a host-mapped table warm, the weights' pages would otherwise push the
+        /// table out: on the 1017's 100 GB VMs a node held 36.8 GB of weight cache after every load. Shards on tmpfs
+        /// or ramfs are left alone (their pages are the file).
+        /// </summary>
+        public bool DropPagesAfterRead { get; set; }
+
+        /// <summary>Bytes the loader dropped from the page cache, and the drops the kernel refused (logs, tests).</summary>
+        public long DroppedBytes
+        {
+            get
+            {
+                if (_loadEnded)
+                    return _droppedAtEnd;
+                long total = 0;
+                foreach (var s in _sources ?? Array.Empty<ShardSource>())
+                    total += s.DroppedBytes;
+                return total;
+            }
+        }
+
+        private bool _loadEnded;
+        private long _droppedAtEnd;
+
+        /// <summary>
         /// Switch to streaming: large weights are read exactly once, on their way to VRAM, so the
         /// engine streams them from the shards through pinned chunks instead of staging the whole
         /// (hundreds of GB) model in host RAM. The host's own small tensors are read now, in
@@ -171,7 +197,10 @@ namespace TensorSharp.Models
         {
             _sources = new ShardSource[_paths.Count];
             for (int s = 0; s < _paths.Count; s++)
-                _sources[s] = new ShardSource(_paths[s], _tag);
+            {
+                bool drop = DropPagesAfterRead && OperatingSystem.IsLinux() && !PageCacheHints.IsMemoryBacked(_paths[s]);
+                _sources[s] = new ShardSource(_paths[s], _tag, drop);
+            }
 
             var names = new List<string>();
             foreach (var kv in _tensors)
@@ -334,11 +363,24 @@ namespace TensorSharp.Models
             if (_sources == null)
                 return;
             bool anyMapped = false;
+            long dropped = 0;
+            int failures = 0, dropping = 0;
             foreach (var s in _sources)
             {
                 s.DisposeReaders();
                 anyMapped |= s.HasMapping;
+                dropped += s.DroppedBytes;
+                failures += s.DropFailures;
+                dropping += s.Drops ? 1 : 0;
             }
+            if (dropping > 0)
+                Console.Error.WriteLine($"[{_tag}] dropped {dropped / (double)(1L << 30):F1} GiB of weight pages from the page cache " +
+                    $"after reading them ({dropping} of {_sources.Length} shards" +
+                    (failures > 0 ? $"; the kernel refused {failures} drops" : string.Empty) + "; TS_DSV4_LOAD_DROP_CACHE=0 keeps them)");
+            else if (DropPagesAfterRead && OperatingSystem.IsLinux())
+                Console.Error.WriteLine($"[{_tag}] weight pages kept in the page cache: every shard is on tmpfs or ramfs");
+            _droppedAtEnd = dropped;
+            _loadEnded = true;
             if (!anyMapped)
                 _sources = null;
         }
@@ -385,14 +427,25 @@ namespace TensorSharp.Models
             private byte* _mapBase;
             private long _mapLength;
 
-            public ShardSource(string path, string tag)
+            private readonly bool _drop;
+            private long _dropped;
+            private int _dropFailures;
+
+            public ShardSource(string path, string tag, bool dropPagesAfterRead = false)
             {
                 _path = path;
                 _tag = tag;
+                _drop = dropPagesAfterRead;
                 _handles = new ThreadLocal<Microsoft.Win32.SafeHandles.SafeFileHandle>(
                     () => File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.Read),
                     trackAllValues: true);
             }
+
+            public bool Drops => _drop;
+
+            public long DroppedBytes => Interlocked.Read(ref _dropped);
+
+            public int DropFailures => Volatile.Read(ref _dropFailures);
 
             public void Read(long offset, IntPtr dst, long bytes)
             {
@@ -406,6 +459,15 @@ namespace TensorSharp.Models
                     if (got <= 0)
                         throw new IOException($"[{_tag}] short read at offset {offset + done} in {_path}");
                     done += got;
+                }
+                // The bytes are in the caller's buffer now (a pinned chunk on its way to VRAM, or a small tensor the
+                // host keeps): this process never reads these pages from the file again.
+                if (_drop)
+                {
+                    if (PageCacheHints.DropFileRange(handle, offset, bytes, out long whole) == 0)
+                        Interlocked.Add(ref _dropped, whole);
+                    else
+                        Interlocked.Increment(ref _dropFailures);
                 }
             }
 
