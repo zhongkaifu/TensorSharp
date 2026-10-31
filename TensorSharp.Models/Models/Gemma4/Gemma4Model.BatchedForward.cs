@@ -15,7 +15,9 @@
 //   - Per-layer SWA dispatch via sliding_window param to native kernel
 //     (kernel accepts a per-call slidingWindow argument)
 //   - Per-layer head dim + num_kv_heads (per-layer paged buffers)
-//   - NeoX-style RoPE per layer with local vs global ropeBase + ropeDims
+//   - NeoX-style RoPE per layer with local vs global ropeBase + ropeDims;
+//     global layers divide the frequencies by rope_freqs.weight
+//     (proportional RoPE) on every backend
 //   - Q/K/V projection with Q-norm, K-norm, V-norm (V-norm unweighted)
 //   - Dense FFN with Gemma-style pre/post FFN norms
 //   - PLE injection (inp_gate -> GELUMul -> proj -> post_norm)
@@ -34,7 +36,9 @@
 using System;
 using System.Collections.Generic;
 using TensorSharp;
+using TensorSharp.Cuda;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 using TensorSharp.Runtime.Paged;
 using TensorSharp.Runtime.Scheduling;
 
@@ -200,6 +204,10 @@ namespace TensorSharp.Models
             if (_pleDim > 0)
                 perLayerInputs = ComputePLE(flatTokens, hiddenStates, numTokens);
 
+            // Global layers' proportional-RoPE cos/sin tables at this batch's positions,
+            // built on the first global layer that needs them and shared by the rest.
+            using var globalRope = new BatchedNeoXRopeTables();
+
             for (int layer = 0; layer < numLayers; layer++)
             {
                 string prefix = $"blk.{layer}";
@@ -277,13 +285,13 @@ namespace TensorSharp.Models
                     !isLocal && _weights.TryGetValue("rope_freqs.weight", out var rff) ? rff : null;
                 using (var posTensorQ = BuildRoPEPositionsTensor(positions, numHeads))
                 {
-                    q = ApplyBatchedRoPENeoX(q, posTensorQ, numTokens, numHeads, hd, ropeDims, ropeBase, ropeFreqFactors);
+                    q = ApplyBatchedRoPENeoX(q, posTensorQ, positions, numTokens, numHeads, hd, ropeDims, ropeBase, ropeFreqFactors, globalRope);
                 }
                 if (!isShared)
                 {
                     using (var posTensorK = BuildRoPEPositionsTensor(positions, kvHeads))
                     {
-                        k = ApplyBatchedRoPENeoX(k, posTensorK, numTokens, kvHeads, hd, ropeDims, ropeBase, ropeFreqFactors);
+                        k = ApplyBatchedRoPENeoX(k, posTensorK, positions, numTokens, kvHeads, hd, ropeDims, ropeBase, ropeFreqFactors, globalRope);
                     }
 
                     // Scatter K, V into the (donor or own) paged buffer.
@@ -465,28 +473,30 @@ namespace TensorSharp.Models
         }
 
         private Tensor ApplyBatchedRoPENeoX(
-            Tensor data, Tensor positionsTensor,
+            Tensor data, Tensor positionsTensor, int[] tokenPositions,
             int numTokens, int numHeads, int hd, int ropeDims, float ropeBase,
-            Tensor freqFactors)
+            Tensor freqFactors, BatchedNeoXRopeTables globalRope)
         {
             using var reshaped = data.View(1, numTokens, numHeads, hd);
             // NeoX mode = 2 in Gemma 4's ApplyRoPEPrefill. `ropeDims` is
             // the partial-rotary dim count (= hd for local layers, =
             // _partialRotaryDims for global layers). Global layers
-            // additionally scale frequencies by `rope_freqs.weight` -
-            // but that scaling path is currently only implemented in the
-            // GGML backend's RoPEExWithFreqFactors helper. On non-GGML
-            // backends (e.g. MLX) we fall through to Ops.RoPEEx (no
-            // scaling); the resulting K mismatches the single-sequence Forward
-            // path's K only on global layers, and the visible quality
-            // hit is small for short prompts. Plumbing freq_factors
-            // through Ops.RoPEEx for other backends is a follow-up.
-            bool useGgmlFreqFactors = freqFactors != null && reshaped.Storage is TensorSharp.GGML.GgmlStorage;
-            if (useGgmlFreqFactors)
+            // additionally divide each frequency by `rope_freqs.weight`
+            // (proportional RoPE: gemma-4-E4B's factors are 1 for the first
+            // 64 of its 256 pairs and 1e30 for the rest, which must not
+            // rotate). Ops.RoPEEx has no freq-factor input, so it cannot run
+            // a global layer: GGML storages take RoPEExWithFreqFactors, every
+            // other backend the same cos/sin tables the single-sequence path
+            // builds from _ropeFreqsGlobal (which folds the factors in).
+            if (freqFactors != null && reshaped.Storage is TensorSharp.GGML.GgmlStorage)
             {
                 GgmlBasicOps.RoPEExWithFreqFactors(
                     reshaped, reshaped, positionsTensor, freqFactors,
                     ropeDims, 2, 0, ropeBase, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            }
+            else if (freqFactors != null)
+            {
+                ApplyNeoXRoPEAtPositions(data, numHeads, hd, tokenPositions, _ropeFreqsGlobal, globalRope);
             }
             else
             {
@@ -494,6 +504,74 @@ namespace TensorSharp.Models
                            ropeBase, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
             }
             return data;
+        }
+
+        /// <summary>Cos/sin tables of one batched forward's token positions for one
+        /// frequency set, [numTokens, freqs.Length] row-major, plus their device copies on
+        /// CUDA/MLX (on the rotated data's device: under tensor parallelism one set per
+        /// rank). Built on first use; positions differ per sequence, so the
+        /// single-sequence path's (seqLen, startPos)-keyed tables cannot be reused.</summary>
+        private sealed class BatchedNeoXRopeTables : IDisposable
+        {
+            public float[] Cos, Sin;
+            public Tensor CosTensor, SinTensor;
+
+            public void Dispose()
+            {
+                CosTensor?.Dispose();
+                SinTensor?.Dispose();
+                CosTensor = SinTensor = null;
+            }
+        }
+
+        /// <summary>NeoX RoPE of a flat [numTokens, numHeads * headDim] tensor, token t at
+        /// <paramref name="positions"/>[t], with explicit per-pair frequencies (pair j is
+        /// (j, j + freqs.Length)). Same angles (position * freqs[j] in float) and kernels as
+        /// <see cref="ApplyNeoXRoPEPrefill"/>, so a batched or tensor-parallel global layer
+        /// rotates exactly like the single-sequence one.</summary>
+        private unsafe void ApplyNeoXRoPEAtPositions(Tensor data, int numHeads, int headDim,
+            int[] positions, float[] freqs, BatchedNeoXRopeTables tables)
+        {
+            int rows = positions.Length;
+            int ropeHalf = freqs.Length;
+            if (tables.Cos == null)
+            {
+                tables.Cos = new float[rows * ropeHalf];
+                tables.Sin = new float[rows * ropeHalf];
+                for (int t = 0; t < rows; t++)
+                {
+                    int off = t * ropeHalf;
+                    for (int j = 0; j < ropeHalf; j++)
+                    {
+                        float angle = positions[t] * freqs[j];
+                        tables.Cos[off + j] = MathF.Cos(angle);
+                        tables.Sin[off + j] = MathF.Sin(angle);
+                    }
+                }
+            }
+
+            if (_backend == BackendType.Cuda || _backend == BackendType.Mlx)
+            {
+                if (tables.CosTensor == null)
+                {
+                    // The kernel reads the tables on the data's device (a TP rank's GPU).
+                    IAllocator tableAllocator = data.Storage.Allocator;
+                    tables.CosTensor = new Tensor(tableAllocator, DType.Float32, tables.Cos.Length);
+                    tables.SinTensor = new Tensor(tableAllocator, DType.Float32, tables.Sin.Length);
+                    tables.CosTensor.SetElementsAsFloat(tables.Cos);
+                    tables.SinTensor.SetElementsAsFloat(tables.Sin);
+                }
+                if ((_backend == BackendType.Cuda &&
+                        CudaFusedOps.TryNeoXRoPEFlatInPlace(data, tables.CosTensor, tables.SinTensor,
+                            numHeads, rows, headDim, ropeHalf)) ||
+                    MlxFusedOps.TryNeoXRoPEFlatInPlace(data, tables.CosTensor, tables.SinTensor,
+                        numHeads, rows, headDim, ropeHalf))
+                {
+                    return;
+                }
+            }
+
+            NeoXRopeCpu.Apply(GetFloatPtr(data), rows, numHeads, headDim, tables.Cos, tables.Sin, ropeHalf);
         }
 
         private Tensor BuildRoPEPositionsTensor(int[] tokenPositions, int numHeads)

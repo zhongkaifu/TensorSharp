@@ -679,19 +679,33 @@ namespace TensorSharp.Models
             if (tpDebug)
                 DumpTpTensorStats(hidden[0], $"embed seqLen={seqLen} startPos={startPos}");
 
-            for (int layer = 0; layer < Config.NumLayers; layer++)
+            // Global layers' proportional-RoPE cos/sin tables at this forward's positions,
+            // one set per rank on that rank's device, built on the first global layer that
+            // needs them and shared by the rest.
+            var globalRope = new BatchedNeoXRopeTables[tp];
+            for (int r = 0; r < tp; r++)
+                globalRope[r] = new BatchedNeoXRopeTables();
+            try
             {
-                Tensor perLayerInput = perLayerInputs != null
-                    ? ExtractPerLayerSlice(perLayerInputs, layer, seqLen)
-                    : null;
-                hidden = Gemma4TransformerBlockTP(hidden, layer, seqLen, startPos, perLayerInput, exceptPositions);
-                perLayerInput?.Dispose();
-                if (tpDebug)
+                for (int layer = 0; layer < Config.NumLayers; layer++)
                 {
-                    DumpTpTensorStats(hidden[0], $"layer {layer} rank0");
-                    if (TpDegree > 1)
-                        DumpTpTensorStats(hidden[1], $"layer {layer} rank1");
+                    Tensor perLayerInput = perLayerInputs != null
+                        ? ExtractPerLayerSlice(perLayerInputs, layer, seqLen)
+                        : null;
+                    hidden = Gemma4TransformerBlockTP(hidden, layer, seqLen, startPos, perLayerInput, globalRope, exceptPositions);
+                    perLayerInput?.Dispose();
+                    if (tpDebug)
+                    {
+                        DumpTpTensorStats(hidden[0], $"layer {layer} rank0");
+                        if (TpDegree > 1)
+                            DumpTpTensorStats(hidden[1], $"layer {layer} rank1");
+                    }
                 }
+            }
+            finally
+            {
+                foreach (var tables in globalRope)
+                    tables.Dispose();
             }
 
             perLayerInputs?.Dispose();
@@ -736,7 +750,7 @@ namespace TensorSharp.Models
         }
 
         private Tensor[] Gemma4TransformerBlockTP(Tensor[] hidden, int layer, int seqLen, int startPos,
-            Tensor perLayerInput, HashSet<int> exceptPositions = null)
+            Tensor perLayerInput, BatchedNeoXRopeTables[] globalRope, HashSet<int> exceptPositions = null)
         {
             string prefix = $"blk.{layer}";
             int tp = TpDegree;
@@ -793,7 +807,7 @@ namespace TensorSharp.Models
 
             // 3. Per-GPU attention.
             Tensor[] attnOut = Gemma4AttentionTP(qkvFused, layer, seqLen, startPos,
-                isLocal, isShared, headDim, numHeadsPerGpu, numKVHeadsPerGpu, exceptPositions);
+                isLocal, isShared, headDim, numHeadsPerGpu, numKVHeadsPerGpu, globalRope, exceptPositions);
 
             if (TpDebugLevel >= 2)
                 DumpTpTensorStats(attnOut[0], $"layer {layer} attnout rank0 local={isLocal} shared={isShared}");
@@ -871,14 +885,13 @@ namespace TensorSharp.Models
 
         private Tensor[] Gemma4AttentionTP(Tensor[] qkvFused, int layer, int seqLen, int startPos,
             bool isLocal, bool isShared, int headDim, int numHeadsPerGpu, int numKVHeadsPerGpu,
-            HashSet<int> exceptPositions = null)
+            BatchedNeoXRopeTables[] globalRope, HashSet<int> exceptPositions = null)
         {
             int tp = TpDegree;
             int qDimPerGpu = numHeadsPerGpu * headDim;
             int kDimPerGpu = numKVHeadsPerGpu * headDim;
             int totalSeqLen = startPos + seqLen;
             string prefix = $"blk.{layer}";
-            float ropeBase = isLocal ? _ropeLocalBase : _ropeGlobalBase;
             // KV-sharing layers attend the donor layer's cache instead of their own.
             int kvCacheLayer = isShared ? _kvDonorMap[layer] : layer;
 
@@ -935,9 +948,9 @@ namespace TensorSharp.Models
                 }
 
                 // RoPE.
-                qTensor = ApplyGemma4RoPETP(qTensor, numHeadsPerGpu, headDim, seqLen, startPos, ropeBase);
+                qTensor = ApplyGemma4RoPETP(qTensor, numHeadsPerGpu, headDim, seqLen, startPos, isLocal, globalRope[r]);
                 if (!isShared)
-                    kTensor = ApplyGemma4RoPETP(kTensor, numKVHeadsPerGpu, headDim, seqLen, startPos, ropeBase);
+                    kTensor = ApplyGemma4RoPETP(kTensor, numKVHeadsPerGpu, headDim, seqLen, startPos, isLocal, globalRope[r]);
 
                 if (TpDebugLevel >= 2 && r == 0)
                 {
@@ -1283,10 +1296,26 @@ namespace TensorSharp.Models
             return data;
         }
 
+        /// <summary>
+        /// RoPE of one rank's Q or K heads, [seqLen, numHeads * headDim], at positions
+        /// startPos to startPos + seqLen - 1. Local layers rotate every pair at the SWA base,
+        /// as the single-sequence path does. Global layers use proportional RoPE:
+        /// rope_freqs.weight divides each frequency (gemma-4-E4B: 1 for the first 64 of 256
+        /// pairs, 1e30 for the rest, which must not rotate), and Ops.RoPEEx has no
+        /// freq-factor input, so they rotate with the same _ropeFreqsGlobal cos/sin tables as
+        /// the single-sequence path, built on this rank's device.
+        /// </summary>
         private Tensor ApplyGemma4RoPETP(Tensor data, int numHeads, int headDim, int seqLen, int startPos,
-            float ropeBase)
+            bool isLocal, BatchedNeoXRopeTables globalRope)
         {
-            return ApplyRoPEPrefill(data, numHeads, headDim, seqLen, startPos, ropeBase);
+            if (isLocal)
+                return ApplyRoPEPrefill(data, numHeads, headDim, seqLen, startPos, _ropeLocalBase);
+
+            var positions = new int[seqLen];
+            for (int s = 0; s < seqLen; s++)
+                positions[s] = startPos + s;
+            ApplyNeoXRoPEAtPositions(data, numHeads, headDim, positions, _ropeFreqsGlobal, globalRope);
+            return data;
         }
 
         // ====================================================================
