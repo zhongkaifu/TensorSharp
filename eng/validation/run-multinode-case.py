@@ -48,6 +48,18 @@ Nagle batching then delays every small collective or activation frame.
       --weights-id REPO@REVISION --label dsv41-tp-2x2-probe \\
       --output artifacts/multinode/dsv41-tp-2x2-probe
 
+--kind suite runs many benchmark rows in ONE process per node (TensorSharp.Cli --bench-workload), so a block
+pays one model load instead of one per row. Give the rows with --suite-workload SPEC (repeatable) and/or
+--suite-file FILE (one spec per line, or a JSON array; read on this machine). A cold row ('cold' or
+evict=row|run) drops the model's host-mapped tables (DeepSeek V4.1's Engram) from the page cache on EVERY node
+first, inside the processes (the driver tells the workers; no restart, no evict.py). The driver writes
+bench-suite.json next to its log; summarize-bench-suite.py turns both into OUTPUT/suite-summary.json:
+
+  python eng/validation/run-multinode-case.py ... --kind suite --label dsv41-v1-cuda --output OUT \\
+      --suite-workload label=pp2048-cold,prefill=2048,decode=128,runs=4,mode=random,cold \\
+      --suite-workload label=pp2048-warm,prefill=2048,decode=128,runs=4,mode=random \\
+      --suite-workload label=r8k-cold,text=/root/s7/r8k.txt,decode=32,runs=2,cold
+
 Arguments after '--' go to every node's command, so model flags stay identical.
 Use --driver-arg=--flag (with '=') for driver-only flags, such as server options.
 A worker accepts its lower ranks only until TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS
@@ -88,10 +100,12 @@ SOURCE_DIRS = ("TensorSharp.GGML.Native", "TensorSharp.Core", "TensorSharp.Runti
                "TensorSharp.Cli", "TensorSharp.Chat", "TensorSharp.Server", "TensorSharp.Server.Host")
 SOURCE_PATTERNS = ("*.cs", "*.csproj", "*.props", "*.targets", "*.cpp", "*.c", "*.h", "*.hpp",
                    "*.cu", "*.cuh", "*.ptx", "*.cmake", "CMakeLists.txt")
-PROGRESS = ("inference benchmark starting|benchmark run|benchmark summary|Loaded model|Kernel warmup|"
+PROGRESS = ("bench suite workload|bench evict|inference benchmark starting|benchmark run|benchmark summary|"
+            "Loaded model|Kernel warmup|"
             "TcpCommunicator|Distributed (tensor|layer)|Now listening on|Model load refused|Unhandled exception")
 NOTABLE = re.compile(r"Distributed (tensor parallelism|layer splitting):|\[TcpCommunicator\] Rank \d+/\d+ connected|"
-                     r"MoE CPU offload active|Context length: using|inference benchmark starting|benchmark summary:")
+                     r"MoE CPU offload active|Context length: using|inference benchmark starting|benchmark summary:|"
+                     r"bench suite (starting|complete)")
 CRASH_MARKERS = ("GGML_ASSERT(", "GGML_ABORT", "Unhandled exception.", "Model load refused", "CUDA error:")
 # Shell function: is anything listening on TCP port $1 on this host? (2 = cannot tell)
 LISTEN_FN = ("listening() { if command -v ss >/dev/null 2>&1; then t=$(ss -ltn 2>/dev/null); "
@@ -148,6 +162,26 @@ def windows_identity(path):
     return path if os.path.isabs(path) else os.path.abspath(path)
 
 
+def suite_file_rows(path):
+    """Rows of a suite file, as TensorSharp.Cli --bench-suite reads them: a JSON array of objects (key: value),
+    or one spec per line with blank lines and '#' comments skipped."""
+    text = Path(path).read_text(encoding="utf-8")
+    if text.lstrip().startswith("["):
+        rows = []
+        for entry in json.loads(text):
+            if not isinstance(entry, dict):
+                raise ValueError("every JSON suite entry must be an object")
+            parts = []
+            for key, val in entry.items():
+                val = ("1" if val else "0") if isinstance(val, bool) else str(val)
+                if "," in val:
+                    raise ValueError(f"{key!r} may not contain a comma")
+                parts.append(f"{key}={val}")
+            rows.append(",".join(parts))
+        return rows
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+
 def parse_args(argv):
     extra = []
     if "--" in argv:
@@ -176,12 +210,21 @@ def parse_args(argv):
     p.add_argument("--kv-cache-dtype", default="f16", help="'none' omits it")
     p.add_argument("--n-cpu-moe", default="0", help="'none' omits it")
     p.add_argument("--driver-arg", action="append", default=[], help="Driver-only argument; write --driver-arg=--flag")
-    p.add_argument("--kind", choices=("bench", "probe", "server"), required=True)
+    p.add_argument("--kind", choices=("bench", "probe", "server", "suite"), required=True)
     p.add_argument("--bench-prefill", type=int, default=512)
     p.add_argument("--bench-decode", type=int, default=128)
     p.add_argument("--bench-runs", type=int, default=4)
     p.add_argument("--bench-random-tokens", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--discard-runs", type=int, default=1, help="Initial benchmark runs excluded from medians")
+    p.add_argument("--suite-workload", action="append", default=[], metavar="SPEC",
+                   help="--kind suite: one TensorSharp.Cli --bench-workload row (repeatable; rows run in this order)")
+    p.add_argument("--suite-file", type=Path, help="--kind suite: rows from a local file (one spec per line, '#' comments, "
+                                                   "or a JSON array of objects), after the --suite-workload rows")
+    p.add_argument("--suite-evict-measure", choices=("none", "sampled", "full"), default="sampled",
+                   help="--kind suite: how each node checks that a cold row's tables left its page cache")
+    p.add_argument("--suite-allow-unverified", action="store_true",
+                   help="--kind suite: keep running after a cold row's eviction is not verified on every node "
+                        "(default: the CLI's --bench-evict-strict stops the suite there)")
     source = p.add_mutually_exclusive_group()
     source.add_argument("--probe-text", help="UTF-8 text file on the nodes")
     source.add_argument("--probe-tokens", help="JSON token-id file on the nodes")
@@ -241,6 +284,21 @@ def parse_args(argv):
         p.error("--server-command and --server-hold require --kind server")
     if a.kind == "bench" and a.discard_runs >= a.bench_runs:
         p.error("--discard-runs must leave at least one measured run")
+    a.suite_rows = list(a.suite_workload)
+    if a.suite_file:
+        try:
+            a.suite_rows += suite_file_rows(a.suite_file)
+        except (OSError, ValueError) as error:
+            p.error(f"--suite-file: {error}")
+    if a.kind == "suite" and not a.suite_rows:
+        p.error("--kind suite needs at least one --suite-workload or a --suite-file")
+    if a.kind != "suite" and a.suite_rows:
+        p.error("--suite-workload/--suite-file require --kind suite")
+    for row in a.suite_rows:
+        if not row.strip() or "\n" in row:
+            p.error(f"Invalid suite row {row!r}")
+        if WINDOWS_PATH.search(row):
+            p.error(f"Suite row {row!r} names a Windows path; text=/tokens= files are read on the driver node.")
     remote_paths = {"--remote-root": a.remote_root, "--dotnet": a.dotnet, "--remote-out": a.remote_out, "--model": a.model}
     for name in ("cli_dll", "server_dll", "probe_dll", "native_dir", "probe_text", "probe_tokens"):
         if getattr(a, name):
@@ -369,6 +427,15 @@ def node_command(a, k, run):
             # Workers receive the same flags; they enter the mirror loop before benchmarking.
             argv += ["--benchmark", "--bench-prefill", str(a.bench_prefill), "--bench-decode", str(a.bench_decode),
                      "--bench-runs", str(a.bench_runs)] + (["--bench-random-tokens"] if a.bench_random_tokens else [])
+        elif a.kind == "suite":
+            # Every node parses the rows. A worker never runs them and never reads their prompt files: it enters
+            # the mirror loop, where the driver's cold rows reach it as an eviction op.
+            argv += ["--bench-prefill", str(a.bench_prefill), "--bench-decode", str(a.bench_decode), "--bench-runs", str(a.bench_runs)]
+            argv += ["--bench-random-tokens"] if a.bench_random_tokens else []
+            for row in a.suite_rows:
+                argv += ["--bench-workload", row]
+            argv += ["--bench-evict-measure", a.suite_evict_measure, "--bench-json", run + "/bench-suite.json"]
+            argv += [] if a.suite_allow_unverified else ["--bench-evict-strict"]
     return argv + a.extra + (a.driver_arg if k == 0 else []), dll
 
 
@@ -968,7 +1035,8 @@ class Case:
         self.summary["exit_codes"], self.summary["node_evidence"] = exit_codes, nodes
         if self.state[0]["started"] and exit_codes.get("node0") is not None:
             try:
-                {"bench": self.bench_metrics, "probe": self.probe_metrics, "server": self.server_metrics}[self.a.kind]()
+                {"bench": self.bench_metrics, "probe": self.probe_metrics, "server": self.server_metrics,
+                 "suite": self.suite_metrics}[self.a.kind]()
             except (OSError, ValueError, KeyError, TypeError) as error:
                 self.fail(f"Could not parse {self.a.kind} metrics: {error!r}")
         elif self.state[0]["started"]:
@@ -1025,6 +1093,35 @@ class Case:
         if report["status"] != "measured":
             self.fail("benchmark: " + "; ".join(report["failures"]))
         self.metrics["benchmark"] = metrics
+
+    def suite_metrics(self):
+        """Parse the driver's suite log and bench-suite.json, and every worker's eviction lines (summarize-bench-suite.py)."""
+        path = Path(__file__).with_name("summarize-bench-suite.py")
+        spec = importlib.util.spec_from_file_location("summarize_bench_suite", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        driver = self.output / "node0"
+        log = (driver / "process.log").read_text(encoding="utf-8", errors="replace")
+        suite_json = None
+        if (driver / "bench-suite.json").is_file():
+            suite_json = json.loads((driver / "bench-suite.json").read_text(encoding="utf-8"))
+        else:
+            self.fail("suite: node0/bench-suite.json missing")
+        workers = {}
+        for p in self.plan[1:]:
+            k = p["node"].index
+            worker_log = self.output / f"node{k}" / "process.log"
+            if worker_log.is_file():
+                workers[str(k)] = worker_log.read_text(encoding="utf-8", errors="replace")
+        report = module.summarize(log, suite_json, workers, self.a.discard_runs)
+        report["summarizer"] = path.name
+        (self.output / "suite-summary.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        for failure in report["failures"]:
+            self.fail("suite: " + failure)
+        keys = ("label", "evict", "cold_verified", "median_prefill_tps", "median_decode_tps", "run1_prefill_tps",
+                "run1_decode_tps", "measured_runs", "status")
+        self.metrics["suite"] = {"status": report["status"], "report": "suite-summary.json",
+                                 "workloads": [{key: w[key] for key in keys} for w in report["workloads"]]}
 
     def probe_metrics(self):
         result = {}
@@ -1120,6 +1217,9 @@ class Case:
         headline = {key: self.summary[key] for key in ("status", "failures", "warnings", "exit_codes") if key in self.summary}
         if "benchmark" in self.metrics:
             headline["benchmark_median"] = self.metrics["benchmark"]["median_excluding_discarded"]
+        if "suite" in self.metrics:
+            headline["suite"] = {w["label"]: [w["median_prefill_tps"], w["median_decode_tps"], w["cold_verified"]]
+                                 for w in self.metrics["suite"]["workloads"]}
         print(json.dumps(headline, indent=2))
         return 0 if self.summary["status"] == "passed" else 1
 

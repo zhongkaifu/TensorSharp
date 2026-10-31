@@ -563,6 +563,32 @@ namespace TensorSharp.Cli
                     "vocabulary, new ones every run (seeded), as llama-bench draws them. Use it for models whose " +
                     "per-token tables or experts are read from disk, which a repeating prompt keeps cached. Default: off.",
                     "--benchmark --bench-random-tokens"),
+                new OptionHelp("--bench-workload <spec>",
+                    "One row of a benchmark suite: many rows run in one process with the model loaded once, each " +
+                    "through the --benchmark loop (same timings, same 'benchmark run' lines). Repeatable. The spec is " +
+                    "comma-separated key=value: label, prefill (synthetic length, or a cap on a real prompt), " +
+                    "text=FILE (UTF-8, tokenized without special tokens) or tokens=FILE (JSON id array), decode, runs, " +
+                    "mode=greedy|fixed|random, evict=none|row|run (the bare word 'cold' = evict=row: drop the model's " +
+                    "host-mapped tables, DeepSeek V4.1's Engram, from the page cache on every node before the row, " +
+                    "Linux only), chunked, seed, check=0|1 (untimed correctness chain). Unset fields take the " +
+                    "--bench-* values. Default: none.",
+                    "--bench-workload label=pp2048-cold,prefill=2048,decode=128,runs=4,mode=random,cold"),
+                new OptionHelp("--bench-suite <file>",
+                    "Benchmark suite rows from a file: one --bench-workload spec per line ('#' comments), or a JSON " +
+                    "array of objects with the same keys. Default: none.",
+                    "--bench-suite rows.txt"),
+                new OptionHelp("--bench-json <path>",
+                    "Write the suite's machine-readable summary (every run's timings and timestamps, every eviction's " +
+                    "per-node page-cache residency) here, rewritten after each row. Default: none.",
+                    "--bench-json runs/suite.json"),
+                new OptionHelp("--bench-evict-measure <none|sampled|full>",
+                    "How a cold row checks that its tables left the page cache on each node (mincore before and " +
+                    "after): sampled = up to 64 evenly spaced 64 MiB windows per table. Default: sampled.",
+                    "--bench-evict-measure full"),
+                new OptionHelp("--bench-evict-strict",
+                    "Stop the suite at the first cold row whose tables are not verified out of the page cache on " +
+                    "every node, instead of measuring the remaining rows warm by mistake. Default: off (warn).",
+                    "--bench-evict-strict"),
                 new OptionHelp("--test",
                     "Run the built-in generation smoke-test prompts against the loaded model. Default: off.",
                     "--test"),

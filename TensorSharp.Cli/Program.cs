@@ -383,6 +383,11 @@ namespace TensorSharp.Cli
             bool benchmarkChunked = false;
             bool benchmarkFixedTokens = false;
             bool benchmarkRandomTokens = false;
+            // --bench-workload / --bench-suite: many benchmark rows in one process (BenchmarkSuite.cs).
+            var benchWorkloadSpecs = new List<string>();
+            string benchJsonPath = null;
+            string benchEvictMeasure = "sampled";
+            bool benchEvictStrict = false;
             bool runChunkedPrefillCorrectness = false;
             int correctnessPrefill = 1500;
             int correctnessDecode = 8;
@@ -541,6 +546,11 @@ namespace TensorSharp.Cli
                     case "--bench-chunked": benchmarkChunked = true; break;
                     case "--bench-fixed-tokens": benchmarkFixedTokens = true; break;
                     case "--bench-random-tokens": benchmarkRandomTokens = true; break;
+                    case "--bench-workload": benchWorkloadSpecs.Add(args[++i]); break;
+                    case "--bench-suite": benchWorkloadSpecs.AddRange(BenchWorkloadSpec.ReadSuiteFile(args[++i])); break;
+                    case "--bench-json": benchJsonPath = args[++i]; break;
+                    case "--bench-evict-measure": benchEvictMeasure = args[++i]; break;
+                    case "--bench-evict-strict": benchEvictStrict = true; break;
                     case "--test-chunked-prefill": runChunkedPrefillCorrectness = true; break;
                     case "--correct-prefill": correctnessPrefill = int.Parse(args[++i]); break;
                     case "--correct-decode": correctnessDecode = int.Parse(args[++i]); break;
@@ -621,6 +631,27 @@ namespace TensorSharp.Cli
             var parallelism = TensorSharp.Distributed.ModelParallelismOptions.Parse(parallelismArgs.ToArray());
             parallelism.ApplyEnvironment();
             int tpDegree = parallelism.TpDegree;
+
+            // A benchmark suite is parsed and checked before the model loads, so a row that could never run
+            // (a missing prompt file, a cold row on an OS that cannot evict) costs no load. Only the driver runs
+            // the suite: a worker node mirrors its forwards and never reads the prompt files.
+            List<BenchWorkloadSpec> benchSuite = null;
+            HostPageCacheMeasure benchSuiteMeasure = BenchSuiteOptions.ParseMeasure(benchEvictMeasure);
+            if (benchWorkloadSpecs.Count > 0)
+            {
+                var benchDefaults = new BenchWorkloadSpec.Defaults
+                {
+                    Prefill = benchmarkPrefill,
+                    Decode = benchmarkDecode,
+                    Runs = benchmarkRuns,
+                    Chunked = benchmarkChunked,
+                    Mode = benchmarkRandomTokens ? "random" : benchmarkFixedTokens ? "fixed" : "greedy",
+                };
+                benchSuite = benchWorkloadSpecs.Select(spec => BenchWorkloadSpec.Parse(spec, benchDefaults)).ToList();
+                BenchWorkloadSpec.AssignLabels(benchSuite);
+                if ((parallelism.Distributed?.NodeId ?? 0) == 0)
+                    PreflightBenchmarkSuite(benchSuite);
+            }
             imageMask.Validate(imagePathList.Count);
             ValidateKeepSourceSize(keepSourceSize, imagePathList.Count, imageWidth, imageHeight);
 
@@ -1142,6 +1173,19 @@ namespace TensorSharp.Cli
             if (runTest)
             {
                 RunTests(model, maxTokens, outputFile);
+                return;
+            }
+
+            if (benchSuite != null)
+            {
+                RunBenchmarkSuite(model, PrepareBenchmarkSuite(model, benchSuite), new BenchSuiteOptions
+                {
+                    JsonPath = benchJsonPath,
+                    EvictMeasure = benchSuiteMeasure,
+                    EvictStrict = benchEvictStrict,
+                    Backend = backendStr,
+                    ModelPath = modelPath,
+                });
                 return;
             }
 
@@ -2939,7 +2983,7 @@ namespace TensorSharp.Cli
         /// benchmark can be run twice (e.g. before and after a change) and the outputs
         /// compared.
         /// </summary>
-        internal static void RunBenchmark(
+        internal static BenchmarkOutcome RunBenchmark(
             ModelBase model,
             int prefillTokens,
             int decodeTokens,
@@ -2947,21 +2991,50 @@ namespace TensorSharp.Cli
             bool chunked = false,
             bool fixedTokens = false,
             bool randomTokens = false)
+            => RunBenchmarkCore(model, new BenchmarkPlan
+            {
+                PrefillTokens = prefillTokens,
+                DecodeTokens = decodeTokens,
+                Runs = runs,
+                Chunked = chunked,
+                FixedTokens = fixedTokens,
+                RandomTokens = randomTokens,
+            });
+
+        /// <summary>
+        /// The benchmark loop behind <c>--benchmark</c> and every <c>--bench-workload</c> row: the same
+        /// stopwatches and the same log lines either way, so a suite row is comparable with a one-row process.
+        /// <see cref="BenchmarkPlan.PromptIds"/> replaces the synthetic prompt (random mode then draws only the
+        /// decode ids), <see cref="BenchmarkPlan.BeforeRun"/> runs before each run's cache reset, outside every
+        /// stopwatch, and <see cref="BenchmarkPlan.Check"/> = false skips the untimed correctness chain.
+        /// </summary>
+        internal static BenchmarkOutcome RunBenchmarkCore(ModelBase model, BenchmarkPlan plan)
         {
+            int decodeTokens = plan.DecodeTokens, runs = plan.Runs;
+            bool chunked = plan.Chunked, randomTokens = plan.RandomTokens;
             // Random ids are a fixed-token stream too: decode never samples.
-            fixedTokens |= randomTokens;
+            bool fixedTokens = plan.FixedTokens | randomTokens;
+            int prefillTokens = plan.PromptIds?.Length ?? plan.PrefillTokens;
             if (prefillTokens < 1)
-                throw new ArgumentOutOfRangeException(nameof(prefillTokens), "Benchmark prefill tokens must be at least 1.");
+                throw new ArgumentOutOfRangeException(nameof(plan), "Benchmark prefill tokens must be at least 1.");
             // 0 is legal and means "prefill only" — the llama-bench `pp<N>` shape.
             // TensorSharp.TestMatrix's pp512 / pp2048 cells pass exactly that, and
             // rejecting it made every prefill-only cell in the shipped default
             // feature set abort before the first forward.
             if (decodeTokens < 0)
-                throw new ArgumentOutOfRangeException(nameof(decodeTokens), "Benchmark decode tokens cannot be negative.");
+                throw new ArgumentOutOfRangeException(nameof(plan), "Benchmark decode tokens cannot be negative.");
             if (runs < 1)
-                throw new ArgumentOutOfRangeException(nameof(runs), "Benchmark runs must be at least 1.");
+                throw new ArgumentOutOfRangeException(nameof(plan), "Benchmark runs must be at least 1.");
 
             string decodeMode = randomTokens ? "random-inference" : fixedTokens ? "fixed-inference" : "greedy-e2e";
+            var outcome = new BenchmarkOutcome
+            {
+                PrefillTokens = prefillTokens,
+                DecodeTokens = decodeTokens,
+                Runs = runs,
+                Chunked = chunked,
+                DecodeMode = decodeMode,
+            };
             _log.LogInformation(LogEventIds.CliBenchmark,
                 "inference benchmark starting: prefillTokens={PrefillTokens} decodeTokens={DecodeTokens} runs={Runs} chunked={Chunked} decodeMode={DecodeMode}",
                 prefillTokens, decodeTokens, runs, chunked, decodeMode);
@@ -2972,8 +3045,11 @@ namespace TensorSharp.Cli
             int syntheticSpan = Math.Max(1, Math.Min(17, vocab));
             int basisToken = Math.Max(0, Math.Min(100, vocab - syntheticSpan));
             int[] prefillIds = new int[prefillTokens];
-            for (int i = 0; i < prefillTokens; i++)
-                prefillIds[i] = basisToken + (i % syntheticSpan);
+            if (plan.PromptIds != null)
+                Array.Copy(plan.PromptIds, prefillIds, prefillTokens);
+            else
+                for (int i = 0; i < prefillTokens; i++)
+                    prefillIds[i] = basisToken + (i % syntheticSpan);
 
             // llama-bench advances decode with generated random token IDs rather
             // than scanning the vocabulary after every step. This deterministic
@@ -2991,8 +3067,9 @@ namespace TensorSharp.Cli
             // whole vocabulary, new ones every run. A model that reads per-token
             // tables (n-gram embeddings, routed experts paged in from the SSD) is
             // then measured on rows it has not already cached, which the 17-id
-            // cycle above never exercises. Seeded, so a rerun replays the same ids.
-            Random randomIds = randomTokens ? new Random(20261001) : null;
+            // cycle above never exercises. Seeded, so a rerun replays the same ids
+            // (and a suite row with the same seed replays an earlier row's ids).
+            Random randomIds = randomTokens ? new Random(plan.Seed) : null;
 
             double bestPrefillMs = double.PositiveInfinity;
             double bestDecodeMs = double.PositiveInfinity;
@@ -3019,11 +3096,14 @@ namespace TensorSharp.Cli
 
             for (int run = 0; run < runs; run++)
             {
+                plan.BeforeRun?.Invoke(run);
                 model.ResetKVCache();
                 if (randomIds != null)
                 {
-                    for (int i = 0; i < prefillIds.Length; i++)
-                        prefillIds[i] = randomIds.Next(vocab);
+                    // A real prompt stays as it is; only the decode stream is drawn.
+                    if (plan.PromptIds == null)
+                        for (int i = 0; i < prefillIds.Length; i++)
+                            prefillIds[i] = randomIds.Next(vocab);
                     for (int i = 0; i < fixedDecodeIds.Length; i++)
                         fixedDecodeIds[i] = randomIds.Next(vocab);
                 }
@@ -3032,6 +3112,7 @@ namespace TensorSharp.Cli
                 // Forward(): single non-chunked pass, used by --benchmark default.
                 // ForwardRefill(): the path the server uses for long prompts; engages
                 // the model's internal chunked prefill (with rolling SWA cache, etc.).
+                DateTime prefillStartUtc = DateTime.UtcNow;
                 var prefillSw = Stopwatch.StartNew();
                 float[] logits = chunked
                     ? model.ForwardRefill(prefillIds)
@@ -3064,6 +3145,7 @@ namespace TensorSharp.Cli
                 long decodeSamplingTicks = 0;
                 bool decodeBreakdownAvailable = fixedTokens || !usePipelinedGreedy;
                 int[] decodeInput = new int[1];
+                DateTime decodeStartUtc = DateTime.UtcNow;
                 var decodeSw = Stopwatch.StartNew();
                 if (decodeTokens == 0)
                 {
@@ -3123,6 +3205,7 @@ namespace TensorSharp.Cli
                     }
                 }
                 decodeSw.Stop();
+                DateTime decodeEndUtc = DateTime.UtcNow;
                 double decodeMs = decodeSw.Elapsed.TotalMilliseconds;
                 // Prefill-only runs report NaN rather than 0 for the decode metrics:
                 // 0 tok/s would read as "measured, and catastrophically slow" in the
@@ -3150,6 +3233,21 @@ namespace TensorSharp.Cli
                         run + 1, runs, prefillMs, prefillTps, decodeMs, decodeTps,
                         decodeMsPerTok, decodeMode);
                 }
+                outcome.Samples.Add(new BenchmarkRunSample
+                {
+                    Run = run + 1,
+                    PrefillMs = prefillMs,
+                    PrefillTps = prefillTps,
+                    DecodeMs = decodeMs,
+                    DecodeTps = decodeTps,
+                    MsPerToken = decodeMsPerTok,
+                    DecodeModelMs = decodeBreakdownAvailable ? decodeModelMs : double.NaN,
+                    DecodeModelTps = decodeModelTps,
+                    GreedySampleMs = decodeBreakdownAvailable ? decodeSamplingMs : double.NaN,
+                    PrefillStartUtc = prefillStartUtc,
+                    DecodeStartUtc = decodeStartUtc,
+                    DecodeEndUtc = decodeEndUtc,
+                });
 
                 if (prefillMs < bestPrefillMs)
                 {
@@ -3194,16 +3292,21 @@ namespace TensorSharp.Cli
                     bestPrefillMs, bestPrefillTps, bestDecodeMs, bestDecodeTps,
                     decodeTokens > 0 ? bestDecodeMs / decodeTokens : double.NaN, avgPrefillTps, avgDecodeTps, decodeMode);
             }
+            outcome.AvgPrefillTps = avgPrefillTps;
+            outcome.AvgDecodeTps = avgDecodeTps;
 
             if (!fixedTokens && firstRunDecodeTokens != null)
             {
                 _log.LogInformation(LogEventIds.CliBenchmark,
                     "benchmark sampled tokens (run1): prefillTopToken={Prefill} decode={Decode}",
                     firstRunPrefillTopToken, string.Join(",", firstRunDecodeTokens));
+                outcome.SampledTokensSource = "run1";
+                outcome.PrefillTopToken = firstRunPrefillTopToken;
+                outcome.SampledDecodeTokens = firstRunDecodeTokens;
             }
             model.PrintTimingStats();
 
-            if (fixedTokens)
+            if (fixedTokens && plan.Check)
             {
                 // Fixed-token timing intentionally does not inspect logits. Run
                 // the historic greedy chain once, outside all benchmark
@@ -3219,7 +3322,11 @@ namespace TensorSharp.Cli
                 _log.LogInformation(LogEventIds.CliBenchmark,
                     "benchmark sampled tokens (untimed correctness): prefillTopToken={Prefill} decode={Decode}",
                     firstRunPrefillTopToken, string.Join(",", firstRunDecodeTokens));
+                outcome.SampledTokensSource = "untimed correctness";
+                outcome.PrefillTopToken = firstRunPrefillTopToken;
+                outcome.SampledDecodeTokens = firstRunDecodeTokens;
             }
+            return outcome;
         }
 
         static int[] RunUntimedGreedyDecode(

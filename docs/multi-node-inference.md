@@ -258,7 +258,14 @@ Tools for running such a campaign live in `eng/validation/`:
 - `run-multinode-case.py` drives one case (CLI benchmark, numeric probe or HTTP
   server) over SSH: workers first, then the driver, with runtime hashes, exit
   codes and parsed metrics in `summary.json`. `--collect-exclude '*.f32'` leaves
-  large probe vectors on the nodes and records their hashes.
+  large probe vectors on the nodes and records their hashes. `--kind suite`
+  runs many benchmark rows (`--suite-workload`, `--suite-file`) in one process
+  per node, so the model loads once. A cold row drops the model's host-mapped
+  tables (DeepSeek V4.1's Engram) from every node's page cache inside the
+  processes, and checks with `mincore` that they left (Linux only).
+  `summarize-bench-suite.py` turns the driver's log and `bench-suite.json` into
+  `suite-summary.json`; a cold row that is not verified on every node fails.
+  `suites/dsv41-1017-perf.txt` is the DeepSeek V4.1 perf matrix as rows.
 - `compare-distributed-quality.py` scores two probe runs by next-token
   perplexity, KL divergence and top-1 agreement, and flags a run that disagrees
   with itself across its prefill/chunk/refill phases. Use it where two placements
