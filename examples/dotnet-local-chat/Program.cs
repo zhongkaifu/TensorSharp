@@ -37,7 +37,7 @@ static async Task<int> RunAsync(string[] args)
         if (!models.Contains(model, StringComparer.Ordinal)) throw new InvalidOperationException(
             "The requested model is not advertised by /v1/models. Use --list-models and pass an exact ID with --model.");
 
-        Console.Error.WriteLine($"Streaming with {settings.Client}; model={model}; endpoint={settings.Endpoint}");
+        Console.Error.WriteLine($"TensorSharp HTTP chat via {settings.Client}; model={model}; endpoint={settings.Endpoint}");
         var sdk = new OpenAI.Chat.ChatClient(model, new ApiKeyCredential(key), new OpenAIClientOptions
         {
             Endpoint = settings.Endpoint,
@@ -147,7 +147,7 @@ sealed record Settings(Uri Endpoint, string? Model, string Prompt, string Client
     int TimeoutSeconds, bool ListModels, bool Help)
 {
     public const string Usage = """
-        TensorSharp one-turn streaming chat (.NET 10)
+        TensorSharp HTTP streaming chat (.NET 10)
         dotnet run -- [options]
           --list-models             Discover IDs using GET /v1/models
           --prompt TEXT             User message (default: a short introduction)
