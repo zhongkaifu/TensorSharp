@@ -67,6 +67,16 @@ namespace TensorSharp
         public virtual IntPtr PtrAtElementForOverwrite(long index) => PtrAtElement(index);
 
         /// <summary>
+        /// Host pointer for a caller that only READS through it (host decode attention over a
+        /// K/V cache, a snapshot extract). A device-backed storage brings its host mirror up to
+        /// date but does not treat the checkout as a host write, so the next device use does not
+        /// upload the unchanged bytes again (and a device write that keeps the other elements,
+        /// such as a K/V append, does not have to). Writing through the pointer is a bug: the
+        /// write may never reach the device. Default: <see cref="PtrAtElement"/>.
+        /// </summary>
+        public virtual IntPtr PtrAtElementForRead(long index) => PtrAtElement(index);
+
+        /// <summary>
         /// True, once, when this storage's memory was all zero at allocation and nothing has
         /// claimed that since: an allocation-time zero fill can then be skipped (a fresh
         /// anonymous mapping is zero already, and touching it page-faults every page). Call it

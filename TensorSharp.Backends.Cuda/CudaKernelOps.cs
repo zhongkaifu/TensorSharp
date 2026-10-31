@@ -2123,6 +2123,17 @@ namespace TensorSharp.Cuda
                 return false;
 
             srcStorage.EnsureDeviceCurrent();
+            // The append writes rows [startPos, startPos + seqLen) and must keep every other row,
+            // so the cache is read-modify-write, not an output: rows a host path wrote (a snapshot
+            // inject, a holder clone) and has not uploaded yet would otherwise be discarded by the
+            // MarkDeviceModified below. Never record that upload in a capture (see
+            // Qwen35Model.RunCudaPrefillLayerLoop): abort it and let the plain loop upload.
+            if (cacheStorage.IsHostDirty)
+            {
+                if (CudaGraphCapture.IsCapturing(allocator))
+                    throw new CudaGraphCaptureAbortedException("KV cache append with host rows not yet on the device.");
+                cacheStorage.EnsureDeviceCurrent();
+            }
             allocator.Context.MakeCurrent();
             // Decode-graph capture: the single-token append re-reads its write
             // position from the dyn block on every replay.

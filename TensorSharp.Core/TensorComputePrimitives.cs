@@ -64,6 +64,33 @@ namespace TensorSharp
             return (ushort*)GetStoragePointer(tensor);
         }
 
+        /// <summary><see cref="GetFloatPointer"/> for a caller that only reads through the
+        /// pointer (<see cref="Storage.PtrAtElementForRead"/>): a device-backed storage is not
+        /// marked for re-upload. Never write through it.</summary>
+        public static float* GetFloatPointerForRead(Tensor tensor)
+        {
+            if (tensor == null)
+                throw new ArgumentNullException(nameof(tensor));
+            if (tensor.ElementType != DType.Float32)
+                throw new NotSupportedException($"Requires a Float32 tensor, but found {tensor.ElementType}");
+
+            tensor.Storage.EnsureHostReadable();
+            return (float*)tensor.Storage.PtrAtElementForRead(tensor.StorageOffset);
+        }
+
+        /// <summary><see cref="GetHalfPointer"/> for a caller that only reads through the
+        /// pointer (see <see cref="GetFloatPointerForRead"/>).</summary>
+        public static ushort* GetHalfPointerForRead(Tensor tensor)
+        {
+            if (tensor == null)
+                throw new ArgumentNullException(nameof(tensor));
+            if (tensor.ElementType != DType.Float16)
+                throw new NotSupportedException($"Requires a Float16 tensor, but found {tensor.ElementType}");
+
+            tensor.Storage.EnsureHostReadable();
+            return (ushort*)tensor.Storage.PtrAtElementForRead(tensor.StorageOffset);
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector<float> LoadVector(float* p) =>
             Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)p);

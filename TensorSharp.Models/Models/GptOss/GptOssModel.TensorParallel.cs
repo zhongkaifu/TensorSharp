@@ -799,8 +799,8 @@ namespace TensorSharp.Models
             int attendStart, int attendEnd, float scale, float[] sinks)
         {
             float* qPtr = GetFloatPtr(q);
-            float* kPtr = GetFloatPtr(kCache);
-            float* vPtr = GetFloatPtr(vCache);
+            float* kPtr = GetFloatPtrForRead(kCache);
+            float* vPtr = GetFloatPtrForRead(vCache);
             float* rPtr = GetFloatPtr(result);
 
             int groupSize = numHeads / numKVHeads;

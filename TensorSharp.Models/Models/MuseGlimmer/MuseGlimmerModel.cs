@@ -1515,10 +1515,10 @@ namespace TensorSharp.Models
 
             float* qPtr = GetFloatPtr(q);
             float* rPtr = GetFloatPtr(result);
-            float* kPtrF = half ? null : GetFloatPtr(kCache);
-            float* vPtrF = half ? null : GetFloatPtr(vCache);
-            ushort* kPtrH = half ? TensorComputePrimitives.GetHalfPointer(kCache) : null;
-            ushort* vPtrH = half ? TensorComputePrimitives.GetHalfPointer(vCache) : null;
+            float* kPtrF = half ? null : GetFloatPtrForRead(kCache);
+            float* vPtrF = half ? null : GetFloatPtrForRead(vCache);
+            ushort* kPtrH = half ? GetHalfPtrForRead(kCache) : null;
+            ushort* vPtrH = half ? GetHalfPtrForRead(vCache) : null;
 
             int maxSeqLen = (int)kCache.Sizes[1];
             int groupSize = numHeads / numKVHeads;

@@ -1758,7 +1758,7 @@ namespace TensorSharp.Models
             long rowBytes = t.Storage.ByteLength / (numKVHeads * capacity);
             long blockBytes = numKVHeads * tokenCount * rowBytes;
             if (dest.Length < blockBytes) { written = 0; return false; }
-            IntPtr basePtr = t.Storage.PtrAtElement(0);
+            IntPtr basePtr = t.Storage.PtrAtElementForRead(0);   // read only: no full-cache re-upload on the next append
             unsafe
             {
                 byte* src = (byte*)basePtr;

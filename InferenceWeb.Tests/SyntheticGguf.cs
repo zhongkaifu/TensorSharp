@@ -16,7 +16,7 @@ namespace InferenceWeb.Tests;
 /// </summary>
 internal static class SyntheticGguf
 {
-    public enum GgmlType { F32 = 0, F16 = 1, Q4_0 = 2, Q5_1 = 7, Q8_0 = 8, Q4_K = 12, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, BF16 = 30 }
+    public enum GgmlType { F32 = 0, F16 = 1, Q4_0 = 2, Q5_1 = 7, Q8_0 = 8, Q4_K = 12, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, BF16 = 30, MXFP4 = 39 }
 
     private const int Q8Block = 32;
     private const int Q8BlockBytes = 2 + Q8Block;   // f16 scale + 32 int8
@@ -38,6 +38,7 @@ internal static class SyntheticGguf
         GgmlType.IQ2_XXS => (256, 66),   // f16 d, qs[32] u16 (grid bytes, then signs + scale)
         GgmlType.IQ2_S => (256, 82),     // f16 d, qs[64] (32 grid bytes + 32 sign bytes), qh[8], scales[8]
         GgmlType.IQ1_S => (256, 50),     // f16 d, qs[32] grid bytes, u16 qh[8] (grid high bits, scale, delta sign)
+        GgmlType.MXFP4 => (32, 17),      // u8 E8M0 exponent e, 16 bytes of 4-bit E2M1 codes
         _ => (1, 0),
     };
 
@@ -159,6 +160,14 @@ internal static class SyntheticGguf
         };
         for (long b = 0; b < blocks; b++)
         {
+            if (type == GgmlType.MXFP4)
+            {
+                // value = kvalues_mxfp4[code] (|code| averages 4.5, at most 12) * 2^(e - 128),
+                // ggml's GGML_E8M0_TO_FP32_HALF; e jitters by one either side of the target.
+                int e = 128 + (int)MathF.Round(MathF.Log2(scale / 4.5f)) + (int)(rng.Next() % 3) - 1;
+                raw[b * bytesPerBlock] = (byte)Math.Clamp(e, 1, 254);
+                continue;
+            }
             long at = b * bytesPerBlock + (type == GgmlType.Q6_K ? bytesPerBlock - 2 : 0);
             float d = scale / typical * (0.5f + (rng.Next() >> 8) / 16777216f);
             ushort bits = BitConverter.HalfToUInt16Bits((System.Half)d);
@@ -272,6 +281,16 @@ internal static class SyntheticGguf
         {
             w.Write(9u); w.Write(5u); w.Write((ulong)V.Count);
             foreach (int v in V) w.Write(v);
+        }
+    }
+
+    public sealed class BoolArr : Kv
+    {
+        public IReadOnlyList<bool> V;
+        public override void Write(BinaryWriter w)
+        {
+            w.Write(9u); w.Write(7u); w.Write((ulong)V.Count);
+            foreach (bool v in V) w.Write(v);
         }
     }
 

@@ -588,6 +588,14 @@ namespace TensorSharp.Models
                     foreach (var t in layerSlots) t?.Dispose();
                 }
             }
+            if (_q35GdnSlotCudaConv != null)
+            {
+                foreach (var layerSlots in _q35GdnSlotCudaConv)
+                {
+                    if (layerSlots == null) continue;
+                    foreach (var t in layerSlots) t?.Dispose();
+                }
+            }
 
             if (_mtpGdnConvDevSnap != null)
                 foreach (var t in _mtpGdnConvDevSnap) t?.Dispose();

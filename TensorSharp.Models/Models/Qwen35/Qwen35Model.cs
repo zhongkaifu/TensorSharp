@@ -2094,9 +2094,17 @@ namespace TensorSharp.Models
 
             if (graphs.TryGetReplayInput(key, out Tensor pinned))
             {
+                // The graph reads the KV/state buffers in place; re-upload anything a host-side
+                // path (a snapshot inject, a holder swap) wrote since the last device pass, as
+                // the decode replay below does.
+                EnsureDecodeGraphInputsResident();
                 Ops.Copy(pinned, hidden);
                 hidden.Dispose();
                 graphs.Replay(key);
+                // Mirror the C# bookkeeping the plain loop would have done: the captured
+                // GDN kernels advanced every recurrent layer's device conv ring by seqLen
+                // (a capture only succeeds when every layer took the device kernel).
+                AdvanceGdnConvPhases(_convKernel - 1, seqLen);
                 MarkCudaGraphStateModified();
                 return pinned;
             }
@@ -2117,6 +2125,11 @@ namespace TensorSharp.Models
             Ops.Copy(pinnedIn, hidden);
             hidden.Dispose();
 
+            // A host-dirty input would be uploaded INSIDE the capture: the graph would then copy that
+            // host image over the device buffer on every replay, and an aborted capture would
+            // clear the dirty flag without the upload ever running. Upload first.
+            EnsureDecodeGraphInputsResident();
+            int[] convPhasesBeforeCapture = SnapshotGdnConvPhases();
             if (!graphs.BeginCapture(key))
                 return RunPerOpLayerLoop(pinnedIn, seqLen, startPos);
 
@@ -2145,7 +2158,10 @@ namespace TensorSharp.Models
 
             if (!captured)
             {
-                // Nothing executed during the failed capture; run the loop for real.
+                // Nothing executed during the failed capture, but the C# loop advanced the
+                // conv ring index of every recurrent layer it reached; undo that, then run
+                // the loop for real.
+                RestoreGdnConvPhases(convPhasesBeforeCapture);
                 return RunPerOpLayerLoop(pinnedIn, seqLen, startPos);
             }
             return pinnedIn;
@@ -2227,6 +2243,11 @@ namespace TensorSharp.Models
             hidden.Dispose();
 
             dyn.Write(attendLen, startPos, convPhase, RopePosition(startPos));
+            // A host-dirty input would be uploaded INSIDE the capture: the graph would then copy that
+            // host image over the device buffer on every replay, and an aborted capture would
+            // clear the dirty flag without the upload ever running. Upload first.
+            EnsureDecodeGraphInputsResident();
+            int[] convPhasesBeforeCapture = SnapshotGdnConvPhases();
             if (!graphs.BeginCapture(key))
                 return RunPerOpLayerLoop(pinnedIn, 1, startPos);
 
@@ -2265,7 +2286,9 @@ namespace TensorSharp.Models
 
             if (!captured)
             {
-                // Nothing executed during the failed capture; run the loop for real.
+                // Nothing executed during the failed capture; undo the loop's conv ring
+                // advances (see the prefill path) and run the loop for real.
+                RestoreGdnConvPhases(convPhasesBeforeCapture);
                 return RunPerOpLayerLoop(pinnedIn, 1, startPos);
             }
             _cachedRoPEPosStartPos = -1;
@@ -2273,17 +2296,32 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Mirrors the per-layer conv ring advance the plain loop's
-        /// TryRunCudaNativeGdnPacked does, for decode-graph replays (the C#
-        /// loop does not run, but the captured kernel advanced the device ring).</summary>
-        private void AdvanceGdnConvPhases(int convDim)
+        /// TryRunCudaNativeGdnPacked does (by <paramref name="steps"/> tokens), for
+        /// decode- and prefill-graph replays (the C# loop does not run, but the
+        /// captured kernel advanced the device ring).</summary>
+        private void AdvanceGdnConvPhases(int convDim, int steps = 1)
         {
             if (convDim <= 0 || _convStateWriteIdx == null || _isRecurrent == null)
                 return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (_isRecurrent[l])
-                    _convStateWriteIdx[l] = (_convStateWriteIdx[l] + 1) % convDim;
+                    _convStateWriteIdx[l] = (_convStateWriteIdx[l] + steps) % convDim;
             }
+        }
+
+        /// <summary>The host conv ring indices before a CUDA-graph capture attempt.</summary>
+        private int[] SnapshotGdnConvPhases() => (int[])_convStateWriteIdx?.Clone();
+
+        /// <summary>Undoes the conv ring advances the C# layer loop made during a capture
+        /// that failed (illegal sync, instantiate failure): the captured kernels never
+        /// ran, so the device rings did not move. Without this, the layers the loop
+        /// reached before the abort advance twice and disagree with the rest, and the
+        /// decode graph (one ring phase for every layer) reads them at the wrong slot.</summary>
+        private void RestoreGdnConvPhases(int[] saved)
+        {
+            if (saved != null && _convStateWriteIdx != null && saved.Length == _convStateWriteIdx.Length)
+                Array.Copy(saved, _convStateWriteIdx, saved.Length);
         }
 
         /// <summary>Re-uploads any decode-graph input buffer (KV caches, GDN

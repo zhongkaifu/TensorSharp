@@ -63,12 +63,42 @@ internal sealed class NemotronSyntheticModelBuilder
     /// FFN layer as MoE once the file has experts).</summary>
     public string Layout { get; init; } = "MAM";
 
+    /// <summary>Attention geometry of the 'A' layers (defaults: the constants above). The
+    /// direct-CUDA prefill tests use the real models' head dim 128 at GQA group 16
+    /// (Nemotron-3.5 Lightning), which picks a different attention route than head dim 16.</summary>
+    public int AttentionHeads { get; init; } = NumHeads;
+    public int AttentionKvHeads { get; init; } = NumKvHeads;
+    public int AttentionHeadDim { get; init; } = HeadDim;
+
     /// <summary>nemotron_h_moe with MoE layers, the dense nemotron_h otherwise.</summary>
     public string Architecture => Layout.Contains('M') ? "nemotron_h_moe" : "nemotron_h";
 
     /// <summary>Storage type of the projections (attention, shared and latent experts,
-    /// Mamba2 in/out, dense FFN, LM head); routed experts stay Q8_0.</summary>
+    /// Mamba2 in/out, dense FFN, LM head). Q8_0 (default), F16 and BF16 are quantized from the
+    /// name-seeded values; a K/IQ/MXFP4 block type is written as seeded block bytes
+    /// (SyntheticGguf.Blocks), which needs every input width to be a multiple of its block (256
+    /// for Q4_K: use <see cref="Width"/> 256) and works neither with <see cref="Scaled"/> nor
+    /// with <see cref="Transform"/>.</summary>
     public SyntheticGguf.GgmlType LinearType { get; init; } = SyntheticGguf.GgmlType.Q8_0;
+
+    /// <summary>Storage type of the routed experts' up (and, unless <see cref="DownExpertType"/>
+    /// says otherwise, down) projections: Q8_0 by default; MXFP4 / Q5_1 / K types as seeded
+    /// blocks, as Nemotron-3.5 Lightning stores MXFP4 up and Q5_1 down experts.</summary>
+    public SyntheticGguf.GgmlType ExpertType { get; init; } = SyntheticGguf.GgmlType.Q8_0;
+    public SyntheticGguf.GgmlType? DownExpertType { get; init; }
+
+    /// <summary>Model and FFN widths (defaults: the constants above). The real models' K is a
+    /// multiple of 256, so their K-quant routes need <see cref="Width"/> 256 here.</summary>
+    public int Width { get; init; } = Hidden;
+    public int SsmInnerWidth { get; init; } = SsmInner;
+    public int DenseFfWidth { get; init; } = DenseFf;
+    public int SharedFfWidth { get; init; } = SharedFf;
+
+    /// <summary>ssm_in's output width for <see cref="SsmInnerWidth"/>: z, x, B, C and dt.</summary>
+    private int SsmInProjWidth => 2 * SsmInnerWidth + 2 * SsmGroups * SsmState + SsmHeads;
+
+    private static bool IsBlockType(SyntheticGguf.GgmlType t)
+        => t is not (SyntheticGguf.GgmlType.F32 or SyntheticGguf.GgmlType.F16 or SyntheticGguf.GgmlType.BF16 or SyntheticGguf.GgmlType.Q8_0);
 
     /// <summary>
     /// Rewrite tensors before they are written (a LoRA test's merged-weights twin): called
@@ -135,11 +165,11 @@ internal sealed class NemotronSyntheticModelBuilder
             // The model reads the layer kind from these two arrays: attention has KV heads,
             // an FFN layer a width, a Mamba2 layer neither.
             char kind = Layout[l];
-            headCountKv[l] = kind == 'A' ? NumKvHeads : 0u;
+            headCountKv[l] = kind == 'A' ? (uint)AttentionKvHeads : 0u;
             ffnLength[l] = kind switch
             {
                 'M' => (uint)ExpertFf,
-                'F' => DenseFf,
+                'F' => (uint)DenseFfWidth,
                 'A' or 'S' => 0u,
                 _ => throw new ArgumentException($"Unknown layer kind '{kind}' in layout {Layout}."),
             };
@@ -149,12 +179,12 @@ internal sealed class NemotronSyntheticModelBuilder
         kv.Add(new SyntheticGguf.Str { Key = "general.architecture", V = a });
         kv.Add(new SyntheticGguf.U32 { Key = $"{a}.block_count", V = (uint)layers });
         kv.Add(new SyntheticGguf.U32 { Key = $"{a}.context_length", V = 256 });
-        kv.Add(new SyntheticGguf.U32 { Key = $"{a}.embedding_length", V = Hidden });
-        kv.Add(new SyntheticGguf.U32 { Key = $"{a}.attention.head_count", V = NumHeads });
+        kv.Add(new SyntheticGguf.U32 { Key = $"{a}.embedding_length", V = (uint)Width });
+        kv.Add(new SyntheticGguf.U32 { Key = $"{a}.attention.head_count", V = (uint)AttentionHeads });
         kv.Add(new SyntheticGguf.U32Arr { Key = $"{a}.attention.head_count_kv", V = headCountKv });
         kv.Add(new SyntheticGguf.U32Arr { Key = $"{a}.feed_forward_length", V = ffnLength });
-        kv.Add(new SyntheticGguf.U32 { Key = $"{a}.attention.key_length", V = HeadDim });
-        kv.Add(new SyntheticGguf.U32 { Key = $"{a}.attention.value_length", V = HeadDim });
+        kv.Add(new SyntheticGguf.U32 { Key = $"{a}.attention.key_length", V = (uint)AttentionHeadDim });
+        kv.Add(new SyntheticGguf.U32 { Key = $"{a}.attention.value_length", V = (uint)AttentionHeadDim });
         kv.Add(new SyntheticGguf.F32 { Key = $"{a}.attention.layer_norm_rms_epsilon", V = 1e-5f });
         if (moeLayers)
         {
@@ -170,32 +200,34 @@ internal sealed class NemotronSyntheticModelBuilder
         if (Layout.Contains('S'))
         {
             kv.Add(new SyntheticGguf.U32 { Key = $"{a}.ssm.conv_kernel", V = SsmConv });
-            kv.Add(new SyntheticGguf.U32 { Key = $"{a}.ssm.inner_size", V = SsmInner });
+            kv.Add(new SyntheticGguf.U32 { Key = $"{a}.ssm.inner_size", V = (uint)SsmInnerWidth });
             kv.Add(new SyntheticGguf.U32 { Key = $"{a}.ssm.state_size", V = SsmState });
             kv.Add(new SyntheticGguf.U32 { Key = $"{a}.ssm.time_step_rank", V = SsmHeads });
             kv.Add(new SyntheticGguf.U32 { Key = $"{a}.ssm.group_count", V = SsmGroups });
         }
         SyntheticGguf.AddByteTokenizer(kv, Vocab, bos: 1, eos: 2);
 
-        tensors.Add(SyntheticGguf.Gen("token_embd.weight", 0.5f, Hidden, Vocab));
-        tensors.Add(SyntheticGguf.GenAround("output_norm.weight", 1f, 0.1f, Hidden));
-        tensors.Add(Linear(SyntheticGguf.Gen("output.weight", 0.1f, Hidden, Vocab)));
+        tensors.Add(SyntheticGguf.Gen("token_embd.weight", 0.5f, Width, Vocab));
+        tensors.Add(SyntheticGguf.GenAround("output_norm.weight", 1f, 0.1f, Width));
+        tensors.Add(IsBlockType(LinearType)
+            ? SyntheticGguf.Blocks("output.weight", LinearType, 0.1f, Width, Vocab)
+            : Linear(SyntheticGguf.Gen("output.weight", 0.1f, Width, Vocab)));
 
         int moeOrdinal = 0;
         for (int l = 0; l < layers; l++)
         {
             string p = $"blk.{l}.";
-            tensors.Add(SyntheticGguf.GenAround(p + "attn_norm.weight", 1f, 0.1f, Hidden));
+            tensors.Add(SyntheticGguf.GenAround(p + "attn_norm.weight", 1f, 0.1f, Width));
             if (Layout[l] == 'A')
             {
-                int qDim = NumHeads * HeadDim, kvDim = NumKvHeads * HeadDim;
-                AddLinear(tensors, p + "attn_q", 0.15f, QkvScales[0], Hidden, qDim);
-                AddLinear(tensors, p + "attn_k", 0.15f, QkvScales[1], Hidden, kvDim);
+                int qDim = AttentionHeads * AttentionHeadDim, kvDim = AttentionKvHeads * AttentionHeadDim;
+                AddLinear(tensors, p + "attn_q", 0.15f, QkvScales[0], Width, qDim);
+                AddLinear(tensors, p + "attn_k", 0.15f, QkvScales[1], Width, kvDim);
                 if (F32AttnV)
-                    tensors.Add(SyntheticGguf.Gen(p + "attn_v.weight", 0.15f, Hidden, kvDim));
+                    tensors.Add(SyntheticGguf.Gen(p + "attn_v.weight", 0.15f, Width, kvDim));
                 else
-                    AddLinear(tensors, p + "attn_v", 0.15f, QkvScales[2], Hidden, kvDim);
-                AddLinear(tensors, p + "attn_output", 0.15f, AttnOutputScale, qDim, Hidden);
+                    AddLinear(tensors, p + "attn_v", 0.15f, QkvScales[2], Width, kvDim);
+                AddLinear(tensors, p + "attn_output", 0.15f, AttnOutputScale, qDim, Width);
                 continue;
             }
             if (Layout[l] == 'S')
@@ -205,14 +237,14 @@ internal sealed class NemotronSyntheticModelBuilder
             }
             if (Layout[l] == 'F')
             {
-                AddLinear(tensors, p + "ffn_up", 0.2f, 1f, Hidden, DenseFf);
-                AddLinear(tensors, p + "ffn_down", 0.2f, 1f, DenseFf, Hidden);
+                AddLinear(tensors, p + "ffn_up", 0.2f, 1f, Width, DenseFfWidth);
+                AddLinear(tensors, p + "ffn_down", 0.2f, 1f, DenseFfWidth, Width);
                 continue;
             }
 
             int experts = ExpertsOfLayer(moeOrdinal++);
-            int expertIn = Latent ? LatentWidth : Hidden;
-            tensors.Add(SyntheticGguf.Gen(p + "ffn_gate_inp.weight", 0.3f, Hidden, experts));
+            int expertIn = Latent ? LatentWidth : Width;
+            tensors.Add(SyntheticGguf.Gen(p + "ffn_gate_inp.weight", 0.3f, Width, experts));
             var bias = new float[experts];
             if (experts > PinnedExpert)
                 bias[PinnedExpert] = 8f;
@@ -220,13 +252,13 @@ internal sealed class NemotronSyntheticModelBuilder
 
             if (Latent)
             {
-                AddLinear(tensors, p + "ffn_latent_down", 0.2f, LatentInScale, Hidden, LatentWidth);
-                AddLinear(tensors, p + "ffn_latent_up", 0.2f, LatentOutScale, LatentWidth, Hidden);
+                AddLinear(tensors, p + "ffn_latent_down", 0.2f, LatentInScale, Width, LatentWidth);
+                AddLinear(tensors, p + "ffn_latent_up", 0.2f, LatentOutScale, LatentWidth, Width);
             }
             if (SharedExperts)
             {
-                AddLinear(tensors, p + "ffn_up_shexp", 0.2f, SharedUpScale, Hidden, SharedFf);
-                AddLinear(tensors, p + "ffn_down_shexp", 0.2f, SharedDownScale, SharedFf, Hidden);
+                AddLinear(tensors, p + "ffn_up_shexp", 0.2f, SharedUpScale, Width, SharedFfWidth);
+                AddLinear(tensors, p + "ffn_down_shexp", 0.2f, SharedDownScale, SharedFfWidth, Width);
             }
 
             AddExperts(tensors, p + "ffn_up_exps", 0.25f, ExpertUpScales ? UpScaleCycle : null, expertIn, ExpertFf, experts);
@@ -265,15 +297,15 @@ internal sealed class NemotronSyntheticModelBuilder
     /// (negative, so the state decays), D and the grouped RMSNorm weight.</summary>
     private void AddMamba2(List<SyntheticGguf.Tensor> tensors, string p)
     {
-        int convChannels = SsmInner + 2 * SsmGroups * SsmState;
-        AddLinear(tensors, p + "ssm_in", 0.15f, 1f, Hidden, SsmInProj);
+        int convChannels = SsmInnerWidth + 2 * SsmGroups * SsmState;
+        AddLinear(tensors, p + "ssm_in", 0.15f, 1f, Width, SsmInProjWidth);
         tensors.Add(SyntheticGguf.Gen(p + "ssm_conv1d.weight", 0.3f, SsmConv, convChannels));
         tensors.Add(SyntheticGguf.Gen(p + "ssm_conv1d.bias", 0.1f, convChannels));
         tensors.Add(SyntheticGguf.Gen(p + "ssm_dt.bias", 0.5f, SsmHeads));
         tensors.Add(SyntheticGguf.GenAround(p + "ssm_a", -1f, 0.25f, 1, SsmHeads));
         tensors.Add(SyntheticGguf.GenAround(p + "ssm_d", 1f, 0.1f, 1, SsmHeads));
-        tensors.Add(SyntheticGguf.GenAround(p + "ssm_norm.weight", 1f, 0.1f, SsmInner / SsmGroups, SsmGroups));
-        AddLinear(tensors, p + "ssm_out", 0.15f, 1f, SsmInner, Hidden);
+        tensors.Add(SyntheticGguf.GenAround(p + "ssm_norm.weight", 1f, 0.1f, SsmInnerWidth / SsmGroups, SsmGroups));
+        AddLinear(tensors, p + "ssm_out", 0.15f, 1f, SsmInnerWidth, Width);
     }
 
     /// <summary>The values a model reads back from <paramref name="t"/> as stored.</summary>
@@ -307,6 +339,13 @@ internal sealed class NemotronSyntheticModelBuilder
     /// weight is the name-seeded W; with sidecars the file stores W / s and "<paramref name="baseName"/>.scale" = s.</summary>
     private void AddLinear(List<SyntheticGguf.Tensor> tensors, string baseName, float magnitude, float scale, int inDim, int outDim)
     {
+        if (IsBlockType(LinearType))
+        {
+            if (Scaled || Transform != null)
+                throw new NotSupportedException($"{LinearType} projections are seeded blocks: no sidecar scales, no Transform.");
+            tensors.Add(SyntheticGguf.Blocks(baseName + ".weight", LinearType, magnitude, inDim, outDim));
+            return;
+        }
         var t = Linear(SyntheticGguf.Gen(baseName + ".weight", magnitude, inDim, outDim));
         if (Scaled && scale != 1f)
         {
@@ -325,6 +364,14 @@ internal sealed class NemotronSyntheticModelBuilder
     private void AddExperts(List<SyntheticGguf.Tensor> tensors, string baseName, float magnitude, float[] cycle,
         int inDim, int outDim, int experts)
     {
+        var type = baseName.EndsWith("ffn_down_exps", StringComparison.Ordinal) ? DownExpertType ?? ExpertType : ExpertType;
+        if (type != SyntheticGguf.GgmlType.Q8_0)
+        {
+            if (Scaled || Transform != null)
+                throw new NotSupportedException($"{type} experts are seeded blocks: no sidecar scales, no Transform.");
+            tensors.Add(SyntheticGguf.Blocks(baseName + ".weight", type, magnitude, inDim, outDim, experts));
+            return;
+        }
         var t = Q8(SyntheticGguf.Gen(baseName + ".weight", magnitude, inDim, outDim, experts));
         if (Scaled && cycle != null)
         {

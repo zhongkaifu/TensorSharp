@@ -2496,6 +2496,16 @@ namespace TensorSharp.Models
         protected static unsafe float* GetFloatPtr(Tensor t) =>
             TensorComputePrimitives.GetFloatPointer(t);
 
+        /// <summary>Host pointer for READING a tensor (a K/V cache in host decode attention): a
+        /// direct-CUDA storage is not marked for re-upload, so the next K/V append does not copy
+        /// the whole cache back to the device. Never write through it.</summary>
+        protected static unsafe float* GetFloatPtrForRead(Tensor t) =>
+            TensorComputePrimitives.GetFloatPointerForRead(t);
+
+        /// <summary>F16 variant of <see cref="GetFloatPtrForRead"/>.</summary>
+        protected static unsafe ushort* GetHalfPtrForRead(Tensor t) =>
+            TensorComputePrimitives.GetHalfPointerForRead(t);
+
         private static IntPtr GetStoragePtr(Tensor t) =>
             TensorComputePrimitives.GetStoragePointer(t);
 
@@ -2564,7 +2574,7 @@ namespace TensorSharp.Models
                 throw new InvalidOperationException("cache tensors differ in bytes per row");
             source.Storage.EnsureHostReadable();
             destination.Storage.EnsureHostReadable();
-            byte* src = (byte*)source.Storage.PtrAtElement(0);
+            byte* src = (byte*)source.Storage.PtrAtElementForRead(0);   // read only: the source is not re-uploaded
             byte* dst = (byte*)destination.Storage.PtrAtElement(0);
             long perHead = rows * rowBytes;
             for (long h = 0; h < heads; h++)
@@ -2592,7 +2602,7 @@ namespace TensorSharp.Models
             source.Storage.EnsureHostReadable();
             destination.Storage.EnsureHostReadable();
             Buffer.MemoryCopy(
-                (void*)source.Storage.PtrAtElement(0),
+                (void*)source.Storage.PtrAtElementForRead(0),   // read only: the source is not re-uploaded
                 (void*)destination.Storage.PtrAtElement(0),
                 bytes, bytes);
         }

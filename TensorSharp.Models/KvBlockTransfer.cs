@@ -265,7 +265,9 @@ namespace TensorSharp.Models
             if (rowStart < 0 || rowStart >= rows || tokenCount > rows)
                 return false;
 
-            IntPtr storageBase = cacheTensor.Storage.PtrAtElement(0);
+            // Read only: PtrAtElement would mark a direct-CUDA cache host-dirty, and the next K/V
+            // append would then upload the whole unchanged cache before writing its rows.
+            IntPtr storageBase = cacheTensor.Storage.PtrAtElementForRead(0);
             if (storageBase == IntPtr.Zero)
                 return false;
 

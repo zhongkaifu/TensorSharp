@@ -92,6 +92,10 @@ namespace TensorSharp.Models
         private Tensor[][]  _q35GdnSlotSsmTensor;
         private bool[][]    _q35GdnSlotInit;
         private MlxFusedOps.GatedDeltaNetCache[][] _q35GdnSlotMlxCache;
+        // Direct CUDA: the packed GDN kernel reads and writes the conv ring on the device
+        // (_cudaGdnConvStateTensor[layer]), never the host ring above, so each slot needs its
+        // own device ring; RunBatchedGdnLayer swaps it in like the SSM tensor (D2).
+        private Tensor[][] _q35GdnSlotCudaConv;
 
         // ForwardBatch handles multimodal sequences directly (vision
         // embedding inject + per-batch MRoPE position table).
@@ -736,6 +740,7 @@ namespace TensorSharp.Models
             Tensor[][] oldSsm = _q35GdnSlotSsmTensor;
             bool[][] oldInit = _q35GdnSlotInit;
             MlxFusedOps.GatedDeltaNetCache[][] oldMlxCache = _q35GdnSlotMlxCache;
+            Tensor[][] oldCudaConv = _q35GdnSlotCudaConv;
             int oldNumBlocks = _q35PagedNumBlocks;
             int oldBlockSize = _q35PagedBlockSize;
 
@@ -755,6 +760,9 @@ namespace TensorSharp.Models
             _q35GdnSlotMlxCache = needMlxSlotCache
                 ? new MlxFusedOps.GatedDeltaNetCache[numLayers][]
                 : null;
+            _q35GdnSlotCudaConv = _cudaGdnConvStateTensor != null
+                ? new Tensor[numLayers][]
+                : null;
 
             for (int l = 0; l < numLayers; l++)
             {
@@ -770,6 +778,8 @@ namespace TensorSharp.Models
                     _q35GdnSlotInit[l] = new bool[targetBlocks];
                     if (needMlxSlotCache)
                         _q35GdnSlotMlxCache[l] = new MlxFusedOps.GatedDeltaNetCache[targetBlocks];
+                    if (_q35GdnSlotCudaConv != null)
+                        _q35GdnSlotCudaConv[l] = new Tensor[targetBlocks];
                     if (oldConvBuf != null && oldConvBuf[l] != null && oldNumBlocks > 0)
                     {
                         // Preserve previously-allocated slots — sequences in
@@ -783,6 +793,8 @@ namespace TensorSharp.Models
                         Array.Copy(oldInit[l], 0, _q35GdnSlotInit[l], 0, oldNumBlocks);
                         if (needMlxSlotCache && oldMlxCache != null && oldMlxCache[l] != null)
                             Array.Copy(oldMlxCache[l], 0, _q35GdnSlotMlxCache[l], 0, oldNumBlocks);
+                        if (_q35GdnSlotCudaConv != null && oldCudaConv?[l] != null)
+                            Array.Copy(oldCudaConv[l], 0, _q35GdnSlotCudaConv[l], 0, oldNumBlocks);
                     }
                 }
                 else
@@ -849,6 +861,18 @@ namespace TensorSharp.Models
                 else if (needsFreshState)
                     _q35GdnSlotMlxCache[layer][slot].Reset();
             }
+            if (_q35GdnSlotCudaConv?[layer] != null && _convKernel > 1)
+            {
+                if (_q35GdnSlotCudaConv[layer][slot] == null)
+                {
+                    _q35GdnSlotCudaConv[layer][slot] = new Tensor(_allocator, DType.Float32, _convKernel - 1, qkvDim);
+                    Ops.Fill(_q35GdnSlotCudaConv[layer][slot], 0);
+                }
+                else if (needsFreshState)
+                {
+                    Ops.Fill(_q35GdnSlotCudaConv[layer][slot], 0);
+                }
+            }
             _q35GdnSlotInit[layer][slot] = true;
         }
 
@@ -896,6 +920,7 @@ namespace TensorSharp.Models
             int     origConvWriteIdx = _convStateWriteIdx[layer];
             int     savedCacheSeqLen = _cacheSeqLen;
             MlxFusedOps.GatedDeltaNetCache origMlxCache = _mlxGdnCache?[layer];
+            Tensor origCudaConv = _cudaGdnConvStateTensor?[layer];
 
             float[] batchedGatedFlat = new float[numTokens * ssmDInner];
             try
@@ -918,6 +943,8 @@ namespace TensorSharp.Models
                     _cacheSeqLen = seq.NumComputedTokens;
                     if (_mlxGdnCache != null && _q35GdnSlotMlxCache?[layer] != null)
                         _mlxGdnCache[layer] = _q35GdnSlotMlxCache[layer][slot];
+                    if (_q35GdnSlotCudaConv?[layer]?[slot] != null)
+                        _cudaGdnConvStateTensor[layer] = _q35GdnSlotCudaConv[layer][slot];
 
                     using Tensor seqHidden = Ops.NewContiguous(hiddenStates.Narrow(0, seqStart, seqLen));
                     using Tensor gated = GatedDeltaNet(
@@ -944,6 +971,8 @@ namespace TensorSharp.Models
                 _cacheSeqLen              = savedCacheSeqLen;
                 if (_mlxGdnCache != null)
                     _mlxGdnCache[layer] = origMlxCache;
+                if (_cudaGdnConvStateTensor != null)
+                    _cudaGdnConvStateTensor[layer] = origCudaConv;
             }
 
             using Tensor batchedGated = CreateFloatTensor(batchedGatedFlat, numTokens, ssmDInner);

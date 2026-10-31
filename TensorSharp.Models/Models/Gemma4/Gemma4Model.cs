@@ -80,7 +80,11 @@ namespace TensorSharp.Models
         private float[] _layerScalars;
         private bool _hasTiedOutput;
 
-        private Tensor _onesForVNorm;
+        // One persistent all-ones RMSNorm weight per width (local head dim, global head dim,
+        // hidden size for the router norm). Never freed while the model lives: a direct-CUDA
+        // decode graph captures kernels that read these vectors, and freeing one during a
+        // capture let later captured kernels reuse its block, so replays read garbage weights.
+        private readonly Dictionary<int, Tensor> _onesForUnweightedNorm = new();
 
         // Per-forward-pass SWA mask cache: all SWA layers share the same
         // mask parameters (queryLen, startPos, windowSize), so we precompute
@@ -1237,7 +1241,8 @@ namespace TensorSharp.Models
             long blockBytes = numHeads * tokenCount * rowBytes;
             int bufLen = copyOut ? destination.Length : source.Length;
             if (bufferOffset + blockBytes > bufLen) { bytesMoved = 0; return false; }
-            IntPtr storageBase = t.Storage.PtrAtElement(0);
+            // An extract only reads: PtrAtElement would queue the whole cache for re-upload.
+            IntPtr storageBase = copyOut ? t.Storage.PtrAtElementForRead(0) : t.Storage.PtrAtElement(0);
             if (storageBase == IntPtr.Zero) { bytesMoved = 0; return false; }
             byte* storagePtr = (byte*)storageBase;
             long perHead = tokenCount * rowBytes;
@@ -6982,14 +6987,14 @@ namespace TensorSharp.Models
         private void ApplyUnweightedRMSNorm(Tensor data, int numVectors, int dim, int seqLen)
         {
             int total = seqLen * numVectors;
-            if (_onesForVNorm == null || (int)_onesForVNorm.Sizes[0] != dim)
+            if (!_onesForUnweightedNorm.TryGetValue(dim, out Tensor ones))
             {
-                _onesForVNorm?.Dispose();
-                _onesForVNorm = new Tensor(_allocator, DType.Float32, dim);
-                Ops.Fill(_onesForVNorm, 1f);
+                ones = new Tensor(_allocator, DType.Float32, dim);
+                Ops.Fill(ones, 1f);
+                _onesForUnweightedNorm[dim] = ones;
             }
             using var reshaped = data.View(total, dim);
-            Ops.RMSNorm(reshaped, reshaped, _onesForVNorm, null, Config.Eps);
+            Ops.RMSNorm(reshaped, reshaped, ones, null, Config.Eps);
         }
 
         private Tensor ApplyRoPEPrefill(Tensor data, int numHeads, int headDim,
@@ -7257,8 +7262,8 @@ namespace TensorSharp.Models
             }
 
             float* qPtr = GetFloatPtr(q);
-            float* kPtr = GetFloatPtr(kCache);
-            float* vPtr = GetFloatPtr(vCache);
+            float* kPtr = GetFloatPtrForRead(kCache);
+            float* vPtr = GetFloatPtrForRead(vCache);
             float* rPtr = GetFloatPtr(result);
             int maxSeqLen = (int)kCache.Sizes[1];
             int groupSize = numHeads / numKVHeads;
@@ -7338,8 +7343,8 @@ namespace TensorSharp.Models
             int attendStart, int totalSeqLen, float scale)
         {
             float* qPtr = GetFloatPtr(q);
-            ushort* kPtr = TensorComputePrimitives.GetHalfPointer(kCache);
-            ushort* vPtr = TensorComputePrimitives.GetHalfPointer(vCache);
+            ushort* kPtr = GetHalfPtrForRead(kCache);
+            ushort* vPtr = GetHalfPtrForRead(vCache);
             float* rPtr = GetFloatPtr(result);
             int maxSeqLen = (int)kCache.Sizes[1];
             int groupSize = numHeads / numKVHeads;
@@ -7414,8 +7419,8 @@ namespace TensorSharp.Models
             }
 
             float* qPtr = GetFloatPtr(q);
-            float* kPtr = GetFloatPtr(kCache);
-            float* vPtr = GetFloatPtr(vCache);
+            float* kPtr = GetFloatPtrForRead(kCache);
+            float* vPtr = GetFloatPtrForRead(vCache);
             float* rPtr = GetFloatPtr(result);
             int groupSize = numHeads / numKVHeads;
 
@@ -7474,8 +7479,8 @@ namespace TensorSharp.Models
             int currentPos, int attendLen, int cacheSize, float scale)
         {
             float* qPtr = GetFloatPtr(q);
-            ushort* kPtr = TensorComputePrimitives.GetHalfPointer(kCache);
-            ushort* vPtr = TensorComputePrimitives.GetHalfPointer(vCache);
+            ushort* kPtr = GetHalfPtrForRead(kCache);
+            ushort* vPtr = GetHalfPtrForRead(vCache);
             float* rPtr = GetFloatPtr(result);
             int groupSize = numHeads / numKVHeads;
 
@@ -7713,6 +7718,18 @@ namespace TensorSharp.Models
 
         private unsafe void CopyToCacheCircular(Tensor cache, Tensor src, int startPos, int seqLen, int cacheSize)
         {
+            // Only the last cacheSize rows survive a wrap. Writing every row lets rows s and
+            // s + cacheSize race for one slot (the CUDA kernel's threads, the Parallel.For
+            // below), so the ring could keep an older row or a mix of two. Write just the tail,
+            // as the MLX helper (TryCopyHeadFirstToCacheCircularMlx) already does.
+            if (seqLen > cacheSize)
+            {
+                int skip = seqLen - cacheSize;
+                using Tensor tailView = src.Narrow(1, skip, cacheSize);
+                using Tensor tail = Ops.NewContiguous(tailView);
+                CopyToCacheCircular(cache, tail, startPos + skip, cacheSize, cacheSize);
+                return;
+            }
             if (CudaFusedOps.TryCopyHeadFirstToCache(cache, src, startPos, seqLen, cacheSize, true))
                 return;
             if (TryCopyHeadFirstToCacheMlx(cache, src, startPos, seqLen, circular: true))
@@ -7929,7 +7946,9 @@ namespace TensorSharp.Models
             _cudaDecodeRopeSinGlobal?.Dispose();
             _cudaDecodeRopeSinGlobal = null;
 
-            _onesForVNorm?.Dispose();
+            foreach (Tensor ones in _onesForUnweightedNorm.Values)
+                ones.Dispose();
+            _onesForUnweightedNorm.Clear();
             _neoXRopeCosTensor?.Dispose();
             _neoXRopeSinTensor?.Dispose();
             foreach (NeoXRopeSlot slot in _neoXRopeSlotByFreqs.Values)
