@@ -10,7 +10,7 @@ Prerequisites: .NET 10 SDK, the native build prerequisites for your platform, an
 
 ```bash
 dotnet build examples/tensorsharp-native-chat -c Release -p:TensorSharpSkipMlxNative=true
-dotnet run --project examples/tensorsharp-native-chat -c Release --no-build -- --model /path/to/existing-model.gguf --backend ggml_cpu --prompt "Answer briefly: what is 2 + 2?" --follow-up "Multiply that answer by 3."
+dotnet run --project examples/tensorsharp-native-chat -c Release --no-build -- --model /path/to/existing-model.gguf --backend ggml_cpu --prompt "What is 2 + 2? Reply with just the single digit." --follow-up "Multiply that answer by 3. Reply with just the number." --max-tokens 64 --context-tokens 2048 --timeout-seconds 120
 ```
 
 The build uses the repository's normal native GGML build for your platform. Skipping MLX in this command avoids building the separate MLX backend; this sample selects GGML. For GGML Metal, CUDA or Vulkan, first build the matching native backend with the platform instructions, then select `ggml_metal`, `ggml_cuda` or `ggml_vulkan`. Choosing a backend does not install its toolchain or make an unsupported model work.
@@ -30,14 +30,22 @@ These are verified TensorSharp API capabilities, not claims that competing engin
 
 The answer streams to the terminal and `[TensorSharp native]` diagnostics report loaded model/backend and terminal metrics. Native runtime diagnostics can also appear. Exit `0` requires nonempty answer text and terminal metrics, `1` reports a configuration/load/generation error, and `130` is Ctrl+C cancellation. Check output content as well as the exit status. This is a runnable example, not a performance benchmark or production hosting service.
 
+After building the example, model-free completion-boundary regression checks can be run from the repository root:
+
+```bash
+dotnet run --project eng/tests/NativeChatCompletion -c Release -- examples/tensorsharp-native-chat/bin/Release/net10.0/TensorSharp.NativeChat.dll
+```
+
+These seven checks load the compiled completion validator without loading a native backend or weights. They cover an already-cancelled token when terminal metrics are reported or absent, cancellation taking precedence over empty/missing output, ordinary completion, and unrequested runtime cancellation. Ctrl+C retains exit `130`; a generation deadline retains the timeout diagnostic and exit `1`.
+
 ## Verified local run
 
 On 2026-10-31, this example was built with .NET SDK 10.0.302 and run on macOS arm64 with an already-installed `gemma-4-E2B-it-Q8_0.gguf` (4,967,497,152 bytes), `ggml_cpu`, a 2048-token context, greedy sampling and a 64-token reply limit. The simple two-turn command above returned `4`, then `12`, with `finish=eos` on both turns.
 
-For a longer synthetic shared prompt, the first turn reported 624 prompt tokens, 1 generated token and 0 reused tokens; the follow-up reported 648 prompt tokens, 2 generated tokens and **626 KV-cache-reused tokens**, again answering `4`, then `12`. The short conversation reported 0 reused tokens: reuse depends on the actual conversation and runtime state. SIGINT after the first generated integer produced the cancellation diagnostic and exit `130`; a missing model produced a clear error and exit `1`.
+For a longer synthetic shared prompt, the first turn reported 624 prompt tokens, 1 generated token and 0 reused tokens; the follow-up reported 648 prompt tokens, 2 generated tokens and **626 KV-cache-reused tokens**, again answering `4`, then `12`. The short conversation reported 0 reused tokens: reuse depends on the actual conversation and runtime state. SIGINT after the first generated integer produced the cancellation diagnostic and exit `130`; a one-second generation deadline after partial output produced the timeout diagnostic and exit `1`. A fresh CLI invocation then answered `4`, followed by `12`; this checks cleanup and relaunch. A missing model produced a clear error and exit `1`.
 
 To reproduce that longer input, pass `--prompt` the exact sentence `Background note: TensorSharp runs a local model inside this .NET process. ` repeated 40 times, immediately followed by `What is 2 + 2? Reply with just the single digit.`. Use `--follow-up "Multiply that answer by 3. Reply with just the number." --max-tokens 64`. The trailing space in each repeated sentence is significant for reproducing token counts.
 
-The engine source was `9462445734ed7390accefd6c49a91d0c4a809a6f` (with this example added). Its CPU-only native bridge was rebuilt against unchanged GGML `facdc44a67da17df4433adcc468b424f48e9ded2`; the tested bridge SHA256 was `861ace737e0ccb1a0a8b990d91e43864957886fa6c2479c908b1036724e1524e`. Model SHA256: `996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a`.
+The engine files match `72e0fc816da32405ebefdbeae864597cd951c708`; the final example and regression checks were validated in a worktree based on `6241652e6ecc3f7b2a6fcb15a4eb42409fadd9ca`. The CPU-only native bridge was rebuilt against unchanged GGML `facdc44a67da17df4433adcc468b424f48e9ded2`; the tested bridge SHA256 was `861ace737e0ccb1a0a8b990d91e43864957886fa6c2479c908b1036724e1524e`. Model SHA256: `996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a`.
 
 This validates the listed model, backend and text-only scenarios. It does not establish performance, equivalence on other hardware/backends, or support for every architecture. Full machine-local logs remain in ignored validation artifacts; no model files, personal model paths or generated logs are committed.

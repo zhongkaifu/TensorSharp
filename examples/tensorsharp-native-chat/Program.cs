@@ -57,13 +57,10 @@ try
             answer.Append(text);
             if (update.Done) terminal = update;
         }
+        var done = NativeCompletion.Require(terminal, !string.IsNullOrWhiteSpace(answer.ToString()), cancellation.Token);
         cancellation.CancelAfter(Timeout.InfiniteTimeSpan);
         Console.WriteLine();
-        if (terminal is not { } done) throw new InvalidOperationException("TensorSharp ended the stream without terminal metrics. Output may be partial.");
         Console.Error.WriteLine($"[TensorSharp native] finish={done.FinishReason}; prompt_tokens={done.PromptTokens}; generated_tokens={done.EvalTokens}; kv_cache_reused_tokens={done.KvCacheReusedTokens}");
-        if (done.FinishReason is "error" or "aborted" or "cancelled")
-            throw new InvalidOperationException($"TensorSharp generation stopped with {done.FinishReason}. Output may be partial.");
-        if (string.IsNullOrWhiteSpace(answer.ToString())) throw new InvalidOperationException("TensorSharp returned no answer text. Check model support and the token budget.");
         history.Add(new ChatMessage
         {
             Role = "assistant", Content = answer.ToString(),
@@ -89,6 +86,21 @@ catch (Exception e) when (e is ArgumentException or InvalidOperationException or
 {
     Console.Error.WriteLine("TensorSharp native chat failed: " + e.Message);
     return 1;
+}
+
+internal static class NativeCompletion
+{
+    public static ChatStreamUpdate Require(ChatStreamUpdate? terminal, bool hasText, CancellationToken cancellationToken)
+    {
+        // Cancellation may arrive as a terminal update instead of an exception from the iterator.
+        // Preserve the caller's cancellation/deadline path before interpreting finish reasons.
+        cancellationToken.ThrowIfCancellationRequested();
+        if (terminal is not { } done) throw new InvalidOperationException("TensorSharp ended the stream without terminal metrics. Output may be partial.");
+        if (done.FinishReason is "error" or "aborted" or "cancelled")
+            throw new InvalidOperationException($"TensorSharp generation stopped with {done.FinishReason}. Output may be partial.");
+        if (!hasText) throw new InvalidOperationException("TensorSharp returned no answer text. Check model support and the token budget.");
+        return done;
+    }
 }
 
 sealed record Options(string Model, string Backend, string Prompt, string? FollowUp,

@@ -101,11 +101,12 @@ Keep TensorSharp bound to `127.0.0.1`. The inspected server has no built-in auth
 dotnet restore --locked-mode --configfile NuGet.Config
 dotnet build -c Release --no-restore
 python3 ../../eng/tests/dotnet-local-chat.py
+python3 ../../eng/tests/dotnet-local-chat-e2e.py --self-test
 ```
 
 The Python harness binds an ephemeral loopback port, invokes the real compiled clients, checks the HTTP requests and serves deterministic SSE responses. It downloads no model and makes no hosted model call.
 
-The mock harness lives under `eng/tests` following repository conventions. It tests both SDK paths, model selection, request payloads, SSE framing, malformed/truncated/empty responses, HTTP errors, and discovery/generation timeouts. It also reproduces the server's HTTP-200 error-as-text limitation. Keep generated logs under the repository's ignored `artifacts/` or `docs/validation/` directories.
+The mock harness lives under `eng/tests` following repository conventions. It tests both SDK paths, model selection, request payloads, SSE framing, malformed/truncated/empty responses, HTTP errors, and discovery/generation timeouts. It also reproduces the server's HTTP-200 error-as-text limitation. The real-E2E harness's `--self-test` separately checks 3 accepted and 14 rejected answer fixtures without inference; it rejects contradictory text such as `The answer is 5, not 4.`. The live arithmetic oracle requires the complete answer `4`, allowing only surrounding whitespace and a single trailing period. Keep generated logs under the repository's ignored `artifacts/` or `docs/validation/` directories.
 
 ## Real-model checks
 
@@ -121,6 +122,6 @@ This opt-in harness makes actual generation requests; it starts no server, downl
 
 On 2026-10-31, all **10 real-endpoint checks** passed on macOS arm64 with .NET SDK 10.0.302, existing `gemma-4-E2B-it-Q8_0.gguf` (4,967,497,152 bytes), and `ggml_cpu`. Both client paths answered `4`. Raw SSE identified the configured model, finished with `stop` and `[DONE]`, and reported 1263 prompt tokens / 1 generated token. Each client was interrupted after producing `1`, returned exit `130`, and subsequently received `4` from a fresh request. Unknown-model preflight and a wrong API base also produced the expected actionable errors. The separate 22-case mock suite passed on the same final HTTP source.
 
-The tested engine source was `9462445734ed7390accefd6c49a91d0c4a809a6f`, with these example changes applied. Its native bridge was rebuilt CPU-only from that checkout against unchanged GGML `facdc44a67da17df4433adcc468b424f48e9ded2`. Native library SHA256: `861ace737e0ccb1a0a8b990d91e43864957886fa6c2479c908b1036724e1524e`; model SHA256: `996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a`.
+The engine files match `72e0fc816da32405ebefdbeae864597cd951c708`; the final reviewed example and tests were validated in a worktree based on `6241652e6ecc3f7b2a6fcb15a4eb42409fadd9ca`. The native bridge was rebuilt CPU-only against unchanged GGML `facdc44a67da17df4433adcc468b424f48e9ded2`. Native library SHA256: `861ace737e0ccb1a0a8b990d91e43864957886fa6c2479c908b1036724e1524e`; model SHA256: `996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a`.
 
 For this run, the server command above additionally used `--no-prefix-cache` to exercise inference without restored prefix state, with `MAX_CONTEXT=4096`, `TS_SCHED_NUM_BLOCKS=16` and `TS_SCHED_MAX_RUNNING_SEQS=1`. It listened only on loopback port 18763. The server and both sample applications were built in an isolated checkout; no existing service was stopped. Full machine-local logs stay in ignored artifacts. This covers the stated model, CPU backend and text-only cases; it does not validate every backend/model, Agent Skills, multimodal inference or comparative performance.

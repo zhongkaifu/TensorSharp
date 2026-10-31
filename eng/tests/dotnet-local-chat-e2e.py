@@ -77,8 +77,25 @@ def run_client(args, model, client, **kwargs):
 def answer_text(text):
     require(bool(text.strip()), "The model produced no answer text.")
     require("error:" not in text.lower(), "The server returned error text inside a successful HTTP stream: " + public_text(text))
-    require(re.search(r"\b(?:4|four)\b", text, re.IGNORECASE) is not None,
-            "The model did not answer the arithmetic prompt meaningfully: " + public_text(text))
+    # The prompt asks for one digit. Tolerate surrounding whitespace and one
+    # trailing period, but never accept a correct digit embedded in a wrong answer.
+    require(re.fullmatch(r"4\.?", text.strip()) is not None,
+            "Expected only the digit 4 (optionally a trailing period): " + public_text(text))
+
+
+def check_answer_oracle():
+    accepted = ("4", " 4\n", "\t4. \n")
+    rejected = ("", "5", "four", "The answer is 5, not 4.", "2 + 2 = 4",
+                "4 or 5", "4\n5", "14", "40", "4.0", "-4", "4,", "Error: 4", "4 because it is correct")
+    for text in accepted:
+        answer_text(text)
+    for text in rejected:
+        try:
+            answer_text(text)
+        except AssertionError:
+            continue
+        raise AssertionError("Answer oracle accepted an incorrect or contradictory response: " + repr(text))
+    print(f"PASS answer oracle: {len(accepted)} accepted / {len(rejected)} rejected cases (no model)", flush=True)
 
 
 def checked_answer(result):
@@ -211,12 +228,18 @@ class NoRedirect(request.HTTPRedirectHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", required=True, type=loopback_url)
+    parser.add_argument("--base-url", type=loopback_url)
+    parser.add_argument("--self-test", action="store_true", help="Check the strict answer oracle without a server or model.")
     parser.add_argument("--model", help="Exact /v1/models ID; automatically selected only when there is one.")
     parser.add_argument("--dll", type=Path,
                         default=Path(__file__).resolve().parents[2] / "examples/dotnet-local-chat/bin/Release/net10.0/TensorSharp.LocalChat.dll")
     parser.add_argument("--timeout-seconds", type=int, default=180)
     args = parser.parse_args()
+    check_answer_oracle()
+    if args.self_test:
+        return
+    if args.base_url is None:
+        parser.error("Pass --base-url for real inference checks, or --self-test for the model-free oracle checks.")
     require(os.name == "posix", "SIGINT verification in this harness requires macOS or Linux.")
     require(0 < args.timeout_seconds <= 1800, "--timeout-seconds must be between 1 and 1800.")
     args.dll = args.dll.resolve()
