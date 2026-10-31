@@ -29,6 +29,10 @@ namespace TensorSharp.Cuda
 
         internal IntPtr DeviceBuffer => deviceBuffer;
 
+        /// <summary>True while host writes (through <see cref="PtrAtElement"/> and friends) are not
+        /// on the device yet; <see cref="EnsureDeviceCurrent"/> uploads them.</summary>
+        internal bool IsHostDirty => hostDirty;
+
         public int DeviceId => AllocatorImpl.DeviceId;
 
         protected override void Destroy()
@@ -94,6 +98,19 @@ namespace TensorSharp.Cuda
             // dispatch refreshes device memory before using this storage as input.
             SyncHostFromDevice();
             hostDirty = true;
+            return HostPtrAtElementUnchecked(index);
+        }
+
+        public override IntPtr PtrAtElementForRead(long index)
+        {
+            ThrowIfDisposed();
+            ValidateElementRange(index, 0);
+
+            // Read-only checkout: refresh the host mirror without marking it newer than the
+            // device copy. Host writes still waiting for an upload stay pending, and a clean
+            // host copy stays clean, so the next K/V append (which uploads a host-dirty cache
+            // before writing its rows) does not re-upload the whole unchanged cache.
+            SyncHostFromDevice();
             return HostPtrAtElementUnchecked(index);
         }
 

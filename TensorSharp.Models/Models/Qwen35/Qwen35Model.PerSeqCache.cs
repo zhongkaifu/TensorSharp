@@ -1235,7 +1235,7 @@ namespace TensorSharp.Models
             if (rows == 0 || heads == 0 || rowBytes == 0)
                 return;
             t.Storage.EnsureHostReadable();
-            byte* src = (byte*)t.Storage.PtrAtElement(0);
+            byte* src = (byte*)t.Storage.PtrAtElementForRead(0);   // read only
             w.Flush();
             for (long head = 0; head < heads; head++)
                 w.BaseStream.Write(new ReadOnlySpan<byte>(src + head * cap * rowBytes, checked((int)(rows * rowBytes))));

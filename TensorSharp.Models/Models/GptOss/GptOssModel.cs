@@ -1705,8 +1705,8 @@ namespace TensorSharp.Models
             }
 
             float* qPtr = GetFloatPtr(q);
-            float* kPtr = GetFloatPtr(kCache);
-            float* vPtr = GetFloatPtr(vCache);
+            float* kPtr = GetFloatPtrForRead(kCache);
+            float* vPtr = GetFloatPtrForRead(vCache);
             float* rPtr = GetFloatPtr(result);
             int maxSeqLen = (int)kCache.Sizes[1];
             int groupSize = numHeads / numKVHeads;
@@ -1775,8 +1775,8 @@ namespace TensorSharp.Models
             int slidingWindow)
         {
             long qPtrL = (long)GetFloatPtr(q);
-            long kPtrL = (long)TensorComputePrimitives.GetHalfPointer(kCache);
-            long vPtrL = (long)TensorComputePrimitives.GetHalfPointer(vCache);
+            long kPtrL = (long)GetHalfPtrForRead(kCache);
+            long vPtrL = (long)GetHalfPtrForRead(vCache);
             long rPtrL = (long)GetFloatPtr(result);
             int maxSeqLen = (int)kCache.Sizes[1];
             int groupSize = numHeads / numKVHeads;

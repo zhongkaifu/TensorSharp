@@ -424,7 +424,7 @@ namespace InferenceWeb.Tests
         }
         private string _tensorCoreModule;
 
-        /// <summary>See <see cref="CudaFactAttribute.GgmlBackend"/>.</summary>
+        /// <summary>The GGML backend the test constructs (a reference model); skips unless the process pins it (<see cref="TestGates.GgmlPinSkip"/>). See <see cref="CudaFactAttribute.GgmlBackend"/>.</summary>
         public BackendType GgmlBackend
         {
             get => _ggmlBackend;

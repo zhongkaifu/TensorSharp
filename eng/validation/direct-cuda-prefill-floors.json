@@ -1,0 +1,14 @@
+{
+ "_about": "Stage 0 ggml-vs-ggml parity floors for the direct-CUDA prefill G3 gates (direct-cuda-prefill-ab.py parity --parity-floors THIS --floors-model NAME). A floor is the distance between two ggml_cuda configurations that should agree (prefill chunk L vs L/4 or 256, and on VM2 also NVIDIA_TF32_OVERRIDE=0), the larger per metric; the gate is B <= max(1.10 x A, floor) per case and metric, top-1 mismatches B <= A + top1_flips. Sources (git-ignored evidence): docs/validation/direct-cuda-prefill/stage0/VM1/README.md section 3.3 (qwen08, lightning, bolt: model-level maxima over 6 cases {code,prose,chat}x{512,2048}, 24 teacher-forced steps) and stage0/VM2/README.md section 3.3 (gptoss, qwen35, gemma26, nemotron8b). step0_* = the prompt's first-token row; median_* = the median over a case's teacher-forced rows (VM1: case-median maximum; VM2: median of case medians, so slightly lenient per case). null = not measured: the gate then uses 1.10 x A alone for that metric. Pinned prompts: VM1 stage0/VM1/raw/parity/<model>/gR/cases.json (use --cases); VM2 /root/stage0-vm2/ref/<model>/G1 on VM2.",
+ "models": {
+  "qwen08": {"step0_max_relative_l2": 7.0e-3, "step0_max_kl": 2.6e-4, "median_relative_l2": 2.8e-3, "median_kl": null, "top1_flips": 1,
+             "_note": "run with TS_CUDA_PREFILL_GRAPH_MAX_SEQLEN=1 until D5 is fixed (Stage 0 VM1 3.3)"},
+  "lightning": {"step0_max_relative_l2": 5.7e-2, "step0_max_kl": null, "median_relative_l2": 4.5e-2, "median_kl": null, "top1_flips": 3,
+                "_note": "Stage 0: base direct CUDA already sits above the KL floor (3.3e-2 vs 4.9e-3, prose512): gate Lightning KL against 1.10 x A, i.e. no KL floor"},
+  "bolt": {"step0_max_relative_l2": 4.1e-3, "step0_max_kl": 1.2e-2, "median_relative_l2": 8.4e-3, "median_kl": null, "top1_flips": 1},
+  "gptoss": {"step0_max_relative_l2": 8.8e-2, "step0_max_kl": 5.6e-2, "median_relative_l2": 2.3e-2, "median_kl": 6.2e-4, "top1_flips": 1},
+  "qwen35": {"step0_max_relative_l2": 1.03e-1, "step0_max_kl": 4.7e-3, "median_relative_l2": 5.6e-2, "median_kl": 9.9e-5, "top1_flips": 5},
+  "gemma26": {"step0_max_relative_l2": 1.56e-1, "step0_max_kl": 8.0e-2, "median_relative_l2": 1.70e-1, "median_kl": 3.7e-3, "top1_flips": 4},
+  "nemotron8b": {"step0_max_relative_l2": 1.89e-1, "step0_max_kl": 1.0e-1, "median_relative_l2": 4.0e-2, "median_kl": 1.3e-3, "top1_flips": 7}
+ }
+}

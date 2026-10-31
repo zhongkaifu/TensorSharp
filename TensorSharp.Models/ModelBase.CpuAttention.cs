@@ -257,7 +257,7 @@ namespace TensorSharp.Models
                 return;
             }
 
-            AttentionDecodeGrouped(GetFloatPtr(q), GetFloatPtr(kCache), GetFloatPtr(vCache), GetFloatPtr(result),
+            AttentionDecodeGrouped(GetFloatPtr(q), GetFloatPtrForRead(kCache), GetFloatPtrForRead(vCache), GetFloatPtr(result),
                 numHeads, numKVHeads, headDim, (int)kCache.Sizes[1], totalSeqLen, scale,
                 Environment.ProcessorCount);
         }
@@ -770,7 +770,7 @@ namespace TensorSharp.Models
             Tensor result, int numHeads, int numKVHeads, int headDim, int totalSeqLen, float scale)
         {
             AttentionDecodeGroupedF16(GetFloatPtr(q),
-                TensorComputePrimitives.GetHalfPointer(kCache), TensorComputePrimitives.GetHalfPointer(vCache),
+                GetHalfPtrForRead(kCache), GetHalfPtrForRead(vCache),
                 GetFloatPtr(result), numHeads, numKVHeads, headDim, (int)kCache.Sizes[1], totalSeqLen, scale);
         }
 

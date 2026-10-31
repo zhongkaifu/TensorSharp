@@ -43,6 +43,39 @@ public class CudaBackendTests
         }, tensor.GetElementsAsFloat(16));
     }
 
+    [CudaFact]
+    public unsafe void CudaStorage_ReadOnlyHostCheckout_DoesNotQueueAnUpload()
+    {
+        // Host decode attention and snapshot extracts READ a K/V cache through a host pointer.
+        // PtrAtElement treats every checkout as a possible write (host-dirty: uploaded before the
+        // next device use), so once the K/V append uploads a host-dirty cache before writing its
+        // rows (direct-CUDA defect D1), a read-only checkout through it made every decode step on
+        // a host-attention family upload the whole cache. The read-only checkout must refresh the
+        // host copy and leave the dirty flag alone in both directions.
+        using var allocator = new CudaAllocator();
+        using var tensor = new Tensor(allocator, DType.Float32, 4, 8);
+        var storage = (CudaStorage)tensor.Storage;
+        FillSequential(tensor, scale: 1f, offset: 0f);
+        storage.EnsureDeviceCurrent();
+        Assert.False(storage.IsHostDirty);
+
+        Ops.Mul(tensor, tensor, 2f);                       // a device write
+        float* read = TensorComputePrimitives.GetFloatPointerForRead(tensor);
+        Assert.Equal(62f, read[31]);                       // the host copy was refreshed
+        Assert.False(storage.IsHostDirty);                 // and is not queued for upload
+
+        tensor.SetElementsAsFloat(new[] { 7f }, 0, 0);     // a host write stays pending
+        Assert.True(storage.IsHostDirty);
+        read = TensorComputePrimitives.GetFloatPointerForRead(tensor);
+        Assert.Equal(7f, read[0]);
+        Assert.True(storage.IsHostDirty);
+        Ops.Mul(tensor, tensor, 1f);                       // the device op uploads it first
+        Assert.Equal(7f, tensor.GetElementsAsFloat(1)[0]);
+
+        _ = TensorComputePrimitives.GetFloatPointer(tensor); // a read-write checkout still marks it
+        Assert.True(storage.IsHostDirty);
+    }
+
     [CudaTheory]
     // (rows, wide, narrow) — narrow < wide forces a strided source row pitch, so
     // NewContiguous hits the 2D strided-copy kernel (ts_copy2d_bytes) rather than
