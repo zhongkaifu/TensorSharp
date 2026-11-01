@@ -22,7 +22,7 @@ using TensorSharp.Runtime.Speculative;
 
 namespace InferenceWeb.Tests;
 
-public class SpeculativeExecutionTests
+public partial class SpeculativeExecutionTests
 {
     private const int VocabSize = 64;
     private const int HiddenSize = 4;
@@ -831,7 +831,7 @@ public class SpeculativeExecutionTests
 
     private static SequenceState RunEngineRequest(FakeSpeculativeModel model, int promptLen, int maxNewTokens,
         bool specEnabled, bool enablePrefixCaching = false, int soloPrefillChunk = 0, string speculator = null,
-        Action beforeDispose = null, IRequestAdapter adapter = null)
+        Action beforeDispose = null, IRequestAdapter adapter = null, SamplingConfig sampling = null)
     {
         var cfg = new SchedulerConfig
         {
@@ -863,7 +863,7 @@ public class SpeculativeExecutionTests
             FrequencyPenalty = 0f,
         };
         var seq = new SequenceState("mtp-req", Enumerable.Range(1, promptLen).ToList(),
-            maxNewTokens, BlockSize, greedy, adapter: adapter);
+            maxNewTokens, BlockSize, sampling ?? greedy, adapter: adapter);
         var handle = engine.SubmitRequest(seq);
         var completion = handle.Completion.GetAwaiter().GetResult();
         Assert.True(completion.PrefillElapsedTicks > 0, "The engine must time all prompt chunks even when speculation is armed.");
@@ -1271,6 +1271,10 @@ public class SpeculativeExecutionTests
         public int EosTokenId { get; set; } = -1;
 
         public int LinearSpecForwardCalls { get; private set; }
+        public bool EnableGreedyVerify { get; set; }
+        public bool ThrowGreedyVerify { get; set; }
+        public int GreedyVerifyCalls { get; private set; }
+        public int FullVerifyCalls { get; private set; }
 
         public FakeSpeculativeModel()
         {
@@ -1290,7 +1294,8 @@ public class SpeculativeExecutionTests
             BlockDraftCalls = 0;
         }
 
-        public int ExpectedNext(int position) => ((position * 13) + 7) % VocabSize;
+        public int ConstantNextToken { get; set; } = -1;
+        public int ExpectedNext(int position) => ConstantNextToken >= 0 ? ConstantNextToken : ((position * 13) + 7) % VocabSize;
 
         /// <summary>Tokens the trunk has actually committed to its KV cache.</summary>
         public IReadOnlyList<int> Trunk => _trunk;
@@ -1364,13 +1369,27 @@ public class SpeculativeExecutionTests
         // pure-C# CUDA backend for Gemma 4): the engine must NOT engage spec.
         public bool SpeculationProfitable { get; set; } = true;
         public int CacheSeqLen => _trunk.Count;
-        public int MaxContextLength => 4096;
+        public int ContextLimit { get; set; } = 4096;
+        public int MaxContextLength => ContextLimit;
 
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
             LinearSpecForwardCalls++;
+            if (allLogitsRows && tokens.Length > 1) FullVerifyCalls++;
             (Injector as FakeInjector)?.ConsumeSlice(_trunk.Count, tokens.Length);
             ForwardCore(tokens, hAllOut, logitsOut, allLogitsRows);
+        }
+
+        public bool TrySpecForwardGreedyVerify(int[] tokens, float[] hAllOut, int[] drawnOut)
+        {
+            if (!EnableGreedyVerify) return false;
+            GreedyVerifyCalls++;
+            if (ThrowGreedyVerify) throw new InvalidOperationException("injected verify failure");
+            var logits = new float[tokens.Length * VocabSize];
+            ForwardCore(tokens, hAllOut, logits, true);
+            for (int row = 0; row < tokens.Length; row++)
+                drawnOut[row] = Argmax(logits.AsSpan(row * VocabSize, VocabSize).ToArray());
+            return true;
         }
 
         private void ForwardCore(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)

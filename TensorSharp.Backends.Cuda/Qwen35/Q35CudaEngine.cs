@@ -138,11 +138,14 @@ namespace TensorSharp.Cuda
         private IntPtr _vRaw, _vQkv, _vG, _vBeta, _features, _keptDev;
         private int[] _featureSlot;
         private int _featureCount;
+        private int _featureBufferWidth;
 
         // ---- scratch, sized for NUbatch rows ----
         private IntPtr _x, _xn, _proj, _q, _gate, _attn, _block, _gdnQkv, _gdnG, _gdnBeta, _gdnO, _gdnY, _act;
         private IntPtr _q8, _q8d, _fp4c, _fp4s, _fp4r, _partial, _counters, _attnPartial, _logits, _argmax;
         private IntPtr _rowsDev, _tokensDev, _ropePosDev, _cacheRowDev, _keyEndDev, _countDev, _lastX, _lastBlock;
+        private IntPtr _gdnPreparedScratch;
+        private long _gdnPreparedScratchBytes;
         private IntPtr _pinned;
         private const int PinnedBytes = 1 << 20;
 
@@ -150,6 +153,9 @@ namespace TensorSharp.Cuda
         public int ContextSize => _m.NCtx;
         public int UBatch => _m.NUbatch;
         public int HiddenSize => _m.NEmbd;
+        /// <summary>Actually submitted prepared GDN prefill passes (diagnostic coverage).</summary>
+        public long PreparedGdnPrefillLaunchCount => _k.PreparedGdnLaunches;
+        public bool PreparedGdnScratchReusesProjection { get; private set; }
         /// <summary>The sequence <see cref="Forward"/> runs.</summary>
         public Slot Active
         {
@@ -163,6 +169,26 @@ namespace TensorSharp.Cuda
 
         /// <summary>The last verify's feature taps, [rows][FeatureWidth] F32 on the device.</summary>
         public IntPtr FeatureRows => _features;
+
+        /// <summary>Copies the last Verify's feature rows for numerical diagnostics. The
+        /// caller supplies at least rows * FeatureWidth floats; normal inference leaves
+        /// these rows on the device and does not incur this synchronization/readback.</summary>
+        public void ReadFeatureRows(float[] destination, int rows)
+        {
+            if (destination == null)
+                throw new ArgumentNullException(nameof(destination));
+            long count = (long)rows * FeatureWidth;
+            if (rows < 0 || rows > MaxVerifyRows || destination.LongLength < count)
+                throw new ArgumentException("[q35-cuda] feature output shape is invalid");
+            if (count == 0)
+                return;
+            if (_features == IntPtr.Zero)
+                throw new InvalidOperationException("[q35-cuda] no Verify feature rows are available");
+            MakeCurrent();
+            Sync();
+            fixed (float* dst = destination)
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)dst, _features, new UIntPtr((ulong)count * 4)).ThrowOnError();
+        }
 
         private int ConvDim => (2 * _m.GdnKHeads + _m.GdnVHeads) * Q35Kernels.GdnHeadDim;
         private int ValueDim => _m.GdnVHeads * Q35Kernels.GdnHeadDim;
@@ -421,6 +447,26 @@ namespace TensorSharp.Cuda
             _gdnBeta = Alloc((long)nt * _m.GdnVHeads * 4);
             _gdnO = Alloc((long)nt * ValueDim * 4);
             _gdnY = Alloc((long)nt * ValueDim * 4);
+            if (Q35Kernels.GdnPreparedPrefillEnabled && _nGdn > 0)
+            {
+                _gdnPreparedScratchBytes = Q35Kernels.GdnPreparedScratchCapacityBytes(nt, MaxSeqs, _m.GdnKHeads, _m.GdnVHeads);
+                // Every GDN group's packed projection lives below this bound, including a
+                // mixed prefill/Verify step. Its unused tail can hold the packets until
+                // GdnOut finishes. The following FFN may overwrite that tail on the same
+                // stream; no packet is used by Commit or by the next layer. Only _proj's
+                // allocation is owned, so this alias must never be separately freed.
+                long packedBytes = checked((long)nt * GdnPackedWidth * sizeof(float));
+                long tailOffset = checked(packedBytes + 255) & ~255L;
+                long tailBytes = checked((long)nt * widest * sizeof(float)) - tailOffset;
+                if (tailBytes >= _gdnPreparedScratchBytes)
+                {
+                    _gdnPreparedScratch = _proj + (nint)tailOffset;
+                    PreparedGdnScratchReusesProjection = true;
+                }
+                else
+                    _gdnPreparedScratch = Alloc(_gdnPreparedScratchBytes);
+                Console.Error.WriteLine($"[q35-cuda] prepared GDN prefill enabled, scratch={_gdnPreparedScratchBytes} bytes, projectionTail={PreparedGdnScratchReusesProjection}");
+            }
             _act = Alloc((long)nt * _m.NFf * 4);
             if (nt < MaxVerifyRows)
                 throw new NotSupportedException($"[q35-cuda] ubatch {nt} below the {MaxVerifyRows}-row verify window");
@@ -457,15 +503,31 @@ namespace TensorSharp.Cuda
 
         private void EnsureVerifyBuffers()
         {
-            if (_vQkv != IntPtr.Zero)
-                return;
-            long rows = (long)Math.Max(1, _nGdn) * MaxVerifyRows;
-            _vRaw = Alloc(rows * ConvDim * 4);
-            _vQkv = Alloc(rows * ConvDim * 4);
-            _vG = Alloc(rows * _m.GdnVHeads * 4);
-            _vBeta = Alloc(rows * _m.GdnVHeads * 4);
-            if (_featureCount > 0)
-                _features = Alloc((long)MaxVerifyRows * FeatureWidth * 4);
+            if (_vQkv == IntPtr.Zero)
+            {
+                long rows = (long)Math.Max(1, _nGdn) * MaxVerifyRows;
+                _vRaw = Alloc(rows * ConvDim * 4);
+                _vQkv = Alloc(rows * ConvDim * 4);
+                _vG = Alloc(rows * _m.GdnVHeads * 4);
+                _vBeta = Alloc(rows * _m.GdnVHeads * 4);
+            }
+            // A feature layout may be selected after the first Verify. Grow before capture;
+            // never leave an executable graph pointing at replaced or undersized storage.
+            if (FeatureWidth > _featureBufferWidth)
+            {
+                InvalidateVerifyGraphs();
+                // Preserve the old buffer/capacity if allocation fails, so a later request
+                // selecting the old layout can still use it safely.
+                IntPtr grown = Alloc((long)MaxVerifyRows * FeatureWidth * 4);
+                if (_features != IntPtr.Zero)
+                {
+                    Sync();
+                    CudaDriverApi.cuMemFree(_features).ThrowOnError();
+                    _owned.Remove(_features);
+                }
+                _features = grown;
+                _featureBufferWidth = FeatureWidth;
+            }
         }
 
         // ---------------------------------------------------------------------------------------
@@ -761,6 +823,28 @@ namespace TensorSharp.Cuda
                     maxKeys[gi] = Math.Max(maxKeys[gi], s.NPast);
                 maxKeys[gi] += groups[gi].RowsPerSeq;
             }
+            RunVerifyLayerPass(n, tapFirst, groups, maxKeys);
+            for (int gi = 0, r0 = 0, q0 = 0; gi < groups.Length; r0 += groups[gi].Rows, q0 += groups[gi].Slots.Length, gi++)
+            {
+                var g = groups[gi];
+                if (g.Verify)
+                    continue;
+                var before = new int[g.Slots.Length];
+                for (int q = 0; q < g.Slots.Length; q++)
+                {
+                    before[q] = g.Slots[q].NPast;
+                    g.Slots[q].NPast += g.Counts != null ? g.Counts[q] : g.RowsPerSeq;
+                }
+                if (_d != null)
+                    DraftInjectRun(g.Slots, g.RowsPerSeq, Math.Clamp(tapFirst - r0, 0, g.Rows), before, g.Counts, r0, q0);
+            }
+        }
+
+        // Device submissions only. BindSlots, metadata uploads, embedding overrides, position
+        // updates, drafter injection and all host reads stay in RunGroups or its caller.
+        private void RunLayerKernels(int n, int tapFirst, RowGroup[] groups, int[] maxKeys)
+        {
+            int e = _m.NEmbd;
             IntPtr pending = IntPtr.Zero;   // the previous block's output, added before the next norm
             for (int il = 0; il < _m.NLayer; il++)
             {
@@ -819,20 +903,6 @@ namespace TensorSharp.Cuda
                     GemmQuantized(L.Down, _block, n);
                 }
                 pending = _block;
-            }
-            for (int gi = 0, r0 = 0, q0 = 0; gi < groups.Length; r0 += groups[gi].Rows, q0 += groups[gi].Slots.Length, gi++)
-            {
-                var g = groups[gi];
-                if (g.Verify)
-                    continue;
-                var before = new int[g.Slots.Length];
-                for (int q = 0; q < g.Slots.Length; q++)
-                {
-                    before[q] = g.Slots[q].NPast;
-                    g.Slots[q].NPast += g.Counts != null ? g.Counts[q] : g.RowsPerSeq;
-                }
-                if (_d != null)
-                    DraftInjectRun(g.Slots, g.RowsPerSeq, Math.Clamp(tapFirst - r0, 0, g.Rows), before, g.Counts, r0, q0);
             }
         }
 
@@ -977,12 +1047,15 @@ namespace TensorSharp.Cuda
             _k.GdnPrep(qkv, proj, GdnPackedWidth, n, _m.GdnKHeads, hv, ConvDim, ValueDim, L.DtBias, L.SsmA, _m.Eps, gd, beta, Stream,
                 count, g.RowsPerSeq);
             _k.GdnScan(qkv, ConvDim, _m.GdnKHeads, hv, g.RowsPerSeq, g.Slots.Length, gd, beta, TabState(L) + (nint)(8L * q0),
-                _gdnO + (nint)((long)r0 * ValueDim * 4), verify, Stream);
+                _gdnO + (nint)((long)r0 * ValueDim * 4), verify, Stream, _gdnPreparedScratch, _gdnPreparedScratchBytes);
         }
 
         public void Dispose()
         {
             MakeCurrent();
+            Sync();
+            FreeDraftGraphs();
+            FreeVerifyGraphs();
             FreeSlot(_active);
             ReleaseFreeBlocks();
             ReleaseFreeArenas();

@@ -36,6 +36,10 @@ namespace TensorSharp.Cuda
         private readonly CudaModule module;
         private readonly IntPtr repack, quantQ81, quantNvfp4, quantSwiGluNvfp4, normNvfp4, embed, addNorm, attnPrep, gateMul, swiglu;
         private readonly IntPtr gdnConv, gdnConvState, gdnPrep, gdnScan, gdnScanVerify, gdnReplay, gdnChunk, gdnOut, copyRows, attn, attnSplit, attnCombine, argmax;
+        private readonly IntPtr gdnPrepareQk, gdnPrepareControl, gdnChunkPrepared;
+        private static readonly bool PreparedGdnPrefill = Environment.GetEnvironmentVariable("TS_Q35_GDN_PREPARED_PREFILL") == "1";
+        internal static bool GdnPreparedPrefillEnabled => PreparedGdnPrefill;
+        internal long PreparedGdnLaunches { get; private set; }
         private readonly IntPtr attnPrefill;
         private readonly int smemAttnPrefill;
         /// <summary>Prompt rows take ts_q35_attn_prefill_f32 (pipelined, short F16 accumulation runs; about 1.7x as fast)
@@ -43,11 +47,17 @@ namespace TensorSharp.Cuda
         private static readonly bool PrefillAttention = Environment.GetEnvironmentVariable("TS_Q35_ATTN_PREFILL") != "0";
         // TS_Q35_GEMM_SPLITK=0 keeps every GEMM to one K pass (a summation order independent of the row count).
         private static readonly bool SplitK = Environment.GetEnvironmentVariable("TS_Q35_GEMM_SPLITK") != "0";
+        // Diagnostic control for strict repeated-logit comparisons. Keep the production
+        // reduction policy unless explicitly disabled; atomic draft split-K is not bit stable.
+        private static readonly bool DraftSplitK = Environment.GetEnvironmentVariable("TS_Q35_DRAFT_SPLITK") != "0";
         private readonly IntPtr[] gemv = new IntPtr[GemvMaxRows + 1];
         private readonly IntPtr[] gemvQ6k = new IntPtr[2];
         private readonly IntPtr gemmQ6k16, gemmQ6k32, gemmQ6k64;
         private readonly IntPtr[] mmaQ4k = new IntPtr[4], mmaQ6k = new IntPtr[4];   // 8, 16, 32, 64 rows
         private readonly IntPtr rowsByIndex, dfPrep, dfAttn, dfCombine, dfConv, dfGather, topk, dfSelect;
+        private readonly IntPtr topkPartial, topkMerge;
+        internal const int TopKPartitions = 32;
+        private static readonly bool PartitionedTopK = Environment.GetEnvironmentVariable("TS_Q35_TOPK_PARTITIONED") == "1";
         /// <summary>Activation rows one int8 tensor-core launch (Q4_K / Q6_K) takes.</summary>
         public const int QuantMmaRows = 64;
         /// <summary>Draft head width (TS_Q35_DF_HD).</summary>
@@ -81,6 +91,12 @@ namespace TensorSharp.Cuda
             gdnPrep = module.GetFunction("ts_q35_gdn_prep_f32");
             gdnScan = module.GetFunction("ts_q35_gdn_scan_f32");
             gdnChunk = module.GetFunction("ts_q35_gdn_chunk_f32");
+            if (PreparedGdnPrefill)
+            {
+                gdnPrepareQk = module.GetFunction("ts_q35_gdn_prepare_qk_f32");
+                gdnPrepareControl = module.GetFunction("ts_q35_gdn_prepare_control_f32");
+                gdnChunkPrepared = module.GetFunction("ts_q35_gdn_chunk_prepared_f32");
+            }
             gdnScanVerify = module.GetFunction("ts_q35_gdn_scan_verify_f32");
             gdnReplay = module.GetFunction("ts_q35_gdn_replay_f32");
             copyRows = module.GetFunction("ts_q35_copy_rows_f32");
@@ -105,6 +121,8 @@ namespace TensorSharp.Cuda
             dfConv = module.GetFunction("ts_q35_df_conv_f32");
             dfGather = module.GetFunction("ts_q35_df_gather_f32");
             topk = module.GetFunction("ts_q35_topk_f32");
+            topkPartial = module.GetFunction("ts_q35_topk_partial_f32");
+            topkMerge = module.GetFunction("ts_q35_topk_merge_f32");
             dfSelect = module.GetFunction("ts_q35_df_select");
             gemmQ6k16 = module.GetFunction("ts_q35_gemm_q6k_2");
             gemmQ6k32 = module.GetFunction("ts_q35_gemm_q6k_4");
@@ -395,10 +413,8 @@ namespace TensorSharp.Cuda
                 // Key ranges on fixed boundaries (a chunk that only doubles past 64 of them), so a
                 // row's partial sums never depend on how far the other rows in the step reach:
                 // a verify then draws exactly what plain steps of the same width draw.
-                int chunk = AttnSplitChunk;
-                while ((maxKeys + chunk - 1) / chunk > AttnMaxSplits)
-                    chunk *= 2;
-                int splits = (maxKeys + chunk - 1) / chunk;
+                var plan = GetSplitAttentionPlan(maxKeys);
+                int chunk = plan.Chunk, splits = plan.Splits;
                 IntPtr a0 = q, a1 = keyEnd, a2 = blockTable, a10 = partial;
                 int a3 = maxBlocks, a5 = rowsPerSeq, a6 = nHead, a7 = nKv, a9 = chunk; float a8 = scale; long a4 = kOff, a4v = vOff;
                 void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a4v, &a5, &a6, &a7, &a8, &a9, &a10 };
@@ -455,6 +471,20 @@ namespace TensorSharp.Cuda
         /// <summary>Key splits of a decode/verify attention launch: enough blocks to cover the
         /// device twice, at most 64, never shorter than 128 keys.</summary>
         private const int AttnSplitChunk = 128, AttnMaxSplits = 64;
+
+        internal readonly record struct SplitAttentionPlan(int Chunk, int Splits);
+
+        // The launch and the Verify CUDA graph key must use the same plan. Token positions
+        // remain device inputs; only this grid/reduction geometry is captured as constants.
+        internal static SplitAttentionPlan GetSplitAttentionPlan(int maxKeys)
+        {
+            if (maxKeys < 1)
+                throw new ArgumentOutOfRangeException(nameof(maxKeys));
+            int chunk = AttnSplitChunk;
+            while (((long)maxKeys + chunk - 1) / chunk > AttnMaxSplits)
+                chunk *= 2;
+            return new SplitAttentionPlan(chunk, (int)(((long)maxKeys + chunk - 1) / chunk));
+        }
 
         /// <summary>Partial floats a split attention launch writes.</summary>
         public static long AttnSplitFloats(int rows, int nHead) => (long)rows * nHead * AttnMaxSplits * (AttnHeadDim + 2);
@@ -517,18 +547,54 @@ namespace TensorSharp.Cuda
         /// <summary>Rows per sequence from which the delta rule runs chunked (16 tokens per step on
         /// the tensor cores) instead of token by token.</summary>
         public const int GdnChunkMinRows = 32;
+        internal const int GdnChunkRows = 16, GdnQkPacketBytes = 16384, GdnControlPacketBytes = 2176;
+
+        internal static long GdnPreparedScratchBytes(int rowsPerSeq, int sequences, int hk, int hv)
+        {
+            if (rowsPerSeq < 1 || sequences < 1 || hk < 1 || hv < 1)
+                throw new ArgumentOutOfRangeException(nameof(rowsPerSeq));
+            long chunks = ((long)rowsPerSeq + GdnChunkRows - 1) / GdnChunkRows;
+            return checked(chunks * sequences * ((long)hk * GdnQkPacketBytes + (long)hv * GdnControlPacketBytes));
+        }
+
+        // A step has at most totalRows rows, divided among at most sequences groups. Independent
+        // rounding of each sequence's last chunk needs at most sequences-1 additional packets.
+        internal static long GdnPreparedScratchCapacityBytes(int totalRows, int sequences, int hk, int hv)
+        {
+            if (totalRows < 1 || sequences < 1 || hk < 1 || hv < 1)
+                throw new ArgumentOutOfRangeException(nameof(totalRows));
+            long chunks = ((long)totalRows + GdnChunkRows - 1) / GdnChunkRows + sequences - 1;
+            return checked(chunks * ((long)hk * GdnQkPacketBytes + (long)hv * GdnControlPacketBytes));
+        }
 
         /// <summary>The gated delta rule over nSeq windows. <paramref name="verify"/> leaves the
         /// states as they were (outputs only).</summary>
         public void GdnScan(IntPtr qkv, int convDim, int hk, int hv, int rowsPerSeq, int nSeq, IntPtr g, IntPtr beta,
-            IntPtr states, IntPtr outRows, bool verify, IntPtr stream)
+            IntPtr states, IntPtr outRows, bool verify, IntPtr stream, IntPtr preparedScratch = default, long preparedBytes = 0)
         {
             IntPtr a0 = qkv, a6 = g, a7 = beta, a8 = states, a9 = outRows; int a1 = convDim, a2 = hk, a3 = hv, a4 = rowsPerSeq;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a6, &a7, &a8, &a9 };
             if (verify)
                 Launch(gdnScanVerify, (uint)hv, (uint)nSeq, GdnHeadDim / 16, 128, 0, stream, args);
             else if (rowsPerSeq >= GdnChunkMinRows)
-                Launch(gdnChunk, (uint)hv * (GdnHeadDim / 32), (uint)nSeq, 1, 256, 0, stream, args);
+            {
+                if (PreparedGdnPrefill && preparedScratch != IntPtr.Zero &&
+                    preparedBytes >= GdnPreparedScratchBytes(rowsPerSeq, nSeq, hk, hv))
+                {
+                    int chunks = (int)(((long)rowsPerSeq + GdnChunkRows - 1) / GdnChunkRows);
+                    IntPtr packets = preparedScratch;
+                    IntPtr control = packets + (nint)((long)nSeq * hk * chunks * GdnQkPacketBytes);
+                    void** qkArgs = stackalloc void*[] { &a0, &a1, &a2, &a4, &packets };
+                    Launch(gdnPrepareQk, (uint)chunks, (uint)hk, (uint)nSeq, 256, 0, stream, qkArgs);
+                    void** controlArgs = stackalloc void*[] { &packets, &a6, &a7, &a2, &a3, &a4, &control };
+                    Launch(gdnPrepareControl, (uint)chunks, (uint)hv, (uint)nSeq, 256, 0, stream, controlArgs);
+                    void** preparedArgs = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a6, &a7, &a8, &a9, &packets, &control };
+                    Launch(gdnChunkPrepared, (uint)hv * (GdnHeadDim / 32), (uint)nSeq, 1, 256, 0, stream, preparedArgs);
+                    PreparedGdnLaunches++;
+                }
+                else
+                    Launch(gdnChunk, (uint)hv * (GdnHeadDim / 32), (uint)nSeq, 1, 256, 0, stream, args);
+            }
             else
                 Launch(gdnScan, (uint)hv, (uint)nSeq, GdnHeadDim / 16, 128, 0, stream, args);
         }
@@ -557,7 +623,7 @@ namespace TensorSharp.Cuda
             // split blocks add atomically, so a non-accumulating product starts from zero.
             uint tiles = CeilDiv(outDim, 64);
             int superblocks = k / 256, splits = 1;
-            while (tiles * splits < 2 * sms && splits * 4 <= superblocks)
+            while (DraftSplitK && tiles * splits < 2 * sms && splits * 4 <= superblocks)
                 splits *= 2;
             if (splits > 1 && !accumulate)
                 CudaDriverApi.cuMemsetD32Async(y, 0, new UIntPtr((ulong)n * (ulong)outDim), stream).ThrowOnError();
@@ -635,10 +701,23 @@ namespace TensorSharp.Cuda
             Launch(dfGather, (uint)(lanes * count), 1, 1, Block, 0, stream, args);
         }
 
-        public void TopK(IntPtr x, int rows, int n, int k, IntPtr idxOut, IntPtr valOut, IntPtr stream)
+        public void TopK(IntPtr x, int rows, int n, int k, IntPtr idxOut, IntPtr valOut, IntPtr stream,
+            IntPtr partialIdx = default, IntPtr partialVal = default)
         {
-            if (k > 16)
+            if (k < 1 || k > 16)
                 throw new NotSupportedException($"[q35-cuda] top-{k} (at most 16)");
+            if (PartitionedTopK && n >= 16384 && partialIdx != IntPtr.Zero && partialVal != IntPtr.Zero)
+            {
+                IntPtr p0 = x, p4 = partialIdx, p5 = partialVal;
+                int p1 = n, p2 = k, p3 = TopKPartitions;
+                void** pargs = stackalloc void*[] { &p0, &p1, &p2, &p3, &p4, &p5 };
+                Launch(topkPartial, (uint)TopKPartitions, (uint)rows, 1, 256, 0, stream, pargs);
+                IntPtr m0 = partialIdx, m1 = partialVal, m4 = idxOut, m5 = valOut;
+                int m2 = k, m3 = TopKPartitions;
+                void** margs = stackalloc void*[] { &m0, &m1, &m2, &m3, &m4, &m5 };
+                Launch(topkMerge, (uint)rows, 1, 1, 256, 0, stream, margs);
+                return;
+            }
             IntPtr a0 = x, a3 = idxOut, a4 = valOut; int a1 = n, a2 = k;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
             Launch(topk, (uint)rows, 1, 1, 256, 0, stream, args);

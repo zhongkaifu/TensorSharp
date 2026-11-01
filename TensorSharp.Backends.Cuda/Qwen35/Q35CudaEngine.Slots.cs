@@ -291,6 +291,7 @@ namespace TensorSharp.Cuda
         /// layers, in order) for every verified row: <see cref="FeatureRows"/>.</summary>
         public void SetFeatureTaps(int[] layers)
         {
+            InvalidateVerifyGraphs();
             _featureSlot = new int[_m.NLayer];
             Array.Fill(_featureSlot, -1);
             _featureCount = 0;

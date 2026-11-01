@@ -822,6 +822,25 @@ namespace TensorSharp.Models
                 hAllOut[0] = 0f;
         }
 
+        /// <summary>Token-only version of the solo verify; explicit opt-in until
+        /// full sampler/state and model quality gates have passed on the device.</summary>
+        public bool TrySpecForwardGreedyVerify(int[] tokens, float[] hAllOut, int[] drawnOut)
+        {
+            if (Environment.GetEnvironmentVariable("TS_Q35_GREEDY_VERIFY") != "1"
+                || tokens.Length < 2 || tokens.Length > TensorSharp.Cuda.Q35CudaEngine.MaxVerifyRows)
+                return false;
+            if (drawnOut == null || drawnOut.Length < tokens.Length)
+                throw new ArgumentException("A greedy verify needs one output token per row.", nameof(drawnOut));
+            lock (_sync)
+            {
+                _exec.Engine.Verify(new[] { _exec.Engine.Active }, tokens.Length, tokens, drawnOut);
+                _soloVerifyRows = tokens.Length;
+            }
+            if (hAllOut != null && hAllOut.Length > 0)
+                hAllOut[0] = 0f;
+            return true;
+        }
+
         public void SpecOnVerifyAccepted(int acceptedRows, int verifyRows)
         {
             lock (_sync)

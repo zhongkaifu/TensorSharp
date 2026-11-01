@@ -424,7 +424,8 @@ namespace TensorSharp.Models
                     if (!outcome.UsedSpeculation)
                     {
                         // Plain decode step.
-                        int next = Draw(outcome.NextLogits);
+                        int next = Draw(outcome.NextLogits
+                            ?? throw new InvalidOperationException("A plain speculative step did not return logits."));
                         history?.Add(next);
                         n += 1;
                         tLast = next;

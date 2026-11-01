@@ -1511,6 +1511,8 @@ extern "C" __global__ void __launch_bounds__(256) ts_q35_gdn_chunk_f32(
             M[(long long)(v0 + 8 * j + 2 * tq + (e & 1)) * S + d0 + gq + 8 * (e >> 1)] = st[j][e];
 }
 
+#include "tensorsharp_q35_gdn_prepared.cuh"
+
 // ---------------------------------------------------------------------------
 // Gated RMS norm of the delta-rule output: y = rmsnorm(o_head) * ssmNorm * silu(z), one warp per
 // (row, v-head); z is the packed projection's z slice.
@@ -2415,6 +2417,15 @@ extern "C" __global__ void ts_q35_argmax_f32(const float* __restrict__ x, int n,
     __shared__ float bv[32];
     __shared__ int bi[32];
     const float* row = x + (long long)blockIdx.x * n;
+    // TokenSampler.Argmax seeds its running maximum with row[0]. When that
+    // value is NaN every later comparison is false, so CPU sampling returns 0.
+    // This branch is uniform across the CTA and precedes every synchronization.
+    if (isnan(row[0]))
+    {
+        if (threadIdx.x == 0)
+            out[blockIdx.x] = 0;
+        return;
+    }
     float best = -INFINITY;
     int idx = 0x7fffffff;
     for (int i = threadIdx.x; i < n; i += blockDim.x)

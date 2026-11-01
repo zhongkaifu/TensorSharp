@@ -224,6 +224,14 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         void SpecForward(int[] tokens, float[]? hAllOut, float[] logitsOut, bool allLogitsRows);
 
+        /// <summary>Optional verify with the same state/hidden-row semantics as
+        /// <see cref="SpecForward"/>, returning each raw row's first-max token instead
+        /// of host logits. Only a caller whose sampler is plain greedy may use it;
+        /// forced thinking tokens and stop checks remain the caller's responsibility.
+        /// False MUST leave all model state and output buffers untouched. A failed
+        /// forward throws and must never be retried as a full-logit forward.</summary>
+        bool TrySpecForwardGreedyVerify(int[] tokens, float[]? hAllOut, int[] drawnOut) => false;
+
         /// <summary>Pre-grow the KV caches to cover a full speculative window
         /// (growing mid-draft would drop drafter rows written past the trunk
         /// position).</summary>

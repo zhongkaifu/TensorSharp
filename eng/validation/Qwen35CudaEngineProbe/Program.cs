@@ -33,6 +33,171 @@ if (Environment.GetEnvironmentVariable("TS_PROBE_PROMPT_FILE") is { Length: > 0 
 string modelPath = Environment.GetEnvironmentVariable("TS_TEST_QWEN35_MODEL")
     ?? throw new ArgumentException("Set TS_TEST_QWEN35_MODEL.");
 
+if (args.Length >= 2 && args[0] == "--verify-graph-trace")
+{
+    string? lengths = args.Skip(2).FirstOrDefault(a => a != "--snapshots");
+    return VerifyGraphTrace.Run(modelPath, args[1], lengths, args.Contains("--snapshots"));
+}
+
+if (args.Length >= 2 && args[0] == "--greedy-verify-trace")
+    return GreedyVerifyTrace.Run(modelPath, args[1], args.Length > 2 ? int.Parse(args[2]) : 12);
+
+if (args.Length >= 2 && args[0] == "--prefill-trace")
+    return PrefillTrace.Run(modelPath, args[1], args.Length > 2 ? args[2] : null, args.Length > 3 ? int.Parse(args[3]) : 512);
+
+if (args.Length >= 2 && args[0] == "--graph-trace")
+{
+    // Run twice, in separate processes, with TS_Q35_CUDA_GRAPHS=0 and =1. trace.json
+    // must be byte-identical. The trace hashes every full-vocabulary draft/verify logit
+    // and records confidence bits, including the first capture and repeated replays.
+    // Lane order/width changes and slot replacement exercise stable pointer indirection.
+    string draftPath = Environment.GetEnvironmentVariable("TS_TEST_QWEN35_DRAFT")
+        ?? throw new ArgumentException("Set TS_TEST_QWEN35_DRAFT.");
+    int rounds = args.Length > 2 ? int.Parse(args[2]) : 12;
+    if (rounds < 6)
+        throw new ArgumentException("Use at least 6 rounds to cover slot replacement.");
+    Directory.CreateDirectory(args[1]);
+    File.WriteAllText(Path.Combine(args[1], "run.json"), JsonSerializer.Serialize(new { complete = false }));
+    using var metadata = new GgufFile(modelPath);
+    var tokenizer = ModelBase.CreateTokenizerFromGguf(metadata);
+    using var exec = new Qwen35CudaExecutor(modelPath, 8192, 512, draftPath);
+    var eng = exec.Engine;
+    var primary = eng.Active;
+    string[] prompts = {
+        "Write a Python function that returns the first n Fibonacci numbers. Return code only.\n",
+        "Explain why the sky appears blue during a clear day.\n",
+        "Translate to Chinese: The library is open every morning except Sunday.\n",
+        "Return a JSON object with Paris as the capital of France and Tokyo as the capital of Japan.\n"
+    };
+    var slots = new TensorSharp.Cuda.Q35CudaEngine.Slot[4];
+    var anchors = new int[4];
+    var trace = new List<object>();
+    var finalLogits = new float[exec.VocabSize];
+    string Hash(float[] values)
+    {
+        if (values.Any(v => !float.IsFinite(v)))
+            throw new InvalidOperationException("Graph trace encountered non-finite logits.");
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Runtime.InteropServices.MemoryMarshal.AsBytes(values.AsSpan()))).ToLowerInvariant();
+    }
+    void SaveFloats(string name, float[] values) => File.WriteAllBytes(Path.Combine(args[1], name),
+        System.Runtime.InteropServices.MemoryMarshal.AsBytes(values.AsSpan()));
+    void Fill(int i, string text)
+    {
+        slots[i] = eng.CreateSlot(0);
+        eng.Active = slots[i];
+        eng.Forward(tokenizer.Encode(text, addSpecial: false).ToArray(), finalLogits);
+        anchors[i] = ArgMax(finalLogits);
+    }
+    try
+    {
+        for (int i = 0; i < slots.Length; i++)
+            Fill(i, prompts[i]);
+        int[][] schedule = { new[] { 0 }, new[] { 0, 1 }, new[] { 0, 1, 2, 3 }, new[] { 3, 1 }, new[] { 2 }, new[] { 2, 0, 3, 1 } };
+        int b = eng.DraftBlockSize, g = b - 1;
+        for (int round = 0; round < rounds; round++)
+        {
+            if (round == rounds / 2)
+            {
+                eng.Active = primary;
+                eng.FreeSlot(slots[1]);
+                Fill(1, "Compute the sum of integers from 1 to 20 and explain the formula.\n");
+            }
+            int[] ids = schedule[round % schedule.Length];
+            var current = ids.Select(i => slots[i]).ToArray();
+            var currentAnchors = ids.Select(i => anchors[i]).ToArray();
+            var proposed = ids.Select(_ => new int[g]).ToArray();
+            var confidence = ids.Select(_ => new float[g]).ToArray();
+            var draftLogits = new float[ids.Length * g * exec.VocabSize];
+            eng.Draft(current, currentAnchors, proposed, confidence, draftLogits);
+            SaveFloats($"round-{round:D3}.draft-a.f32", draftLogits);
+            string draftHash = Hash(draftLogits);
+            var firstLogits = (float[])draftLogits.Clone();
+            var confidenceBits = confidence.Select(v => v.Select(BitConverter.SingleToInt32Bits).ToArray()).ToArray();
+            var proposedCopy = proposed.Select(v => (int[])v.Clone()).ToArray();
+            // Drafting must not mutate slots, so the first captured invocation and the replay
+            // immediately after it must return identical logits, candidates and confidences.
+            eng.Draft(current, currentAnchors, proposed, confidence, draftLogits);
+            SaveFloats($"round-{round:D3}.draft-b.f32", draftLogits);
+            if (Hash(draftLogits) != draftHash || !proposedCopy.Zip(proposed).All(p => p.First.SequenceEqual(p.Second))
+                || !confidenceBits.Zip(confidence).All(p => p.First.SequenceEqual(p.Second.Select(BitConverter.SingleToInt32Bits))))
+            {
+                double maxAbs = 0, squaredError = 0, squaredReference = 0;
+                int differing = 0;
+                for (int i = 0; i < firstLogits.Length; i++)
+                {
+                    double delta = (double)draftLogits[i] - firstLogits[i];
+                    maxAbs = Math.Max(maxAbs, Math.Abs(delta));
+                    squaredError += delta * delta;
+                    squaredReference += (double)firstLogits[i] * firstLogits[i];
+                    differing += BitConverter.SingleToInt32Bits(draftLogits[i]) == BitConverter.SingleToInt32Bits(firstLogits[i]) ? 0 : 1;
+                }
+                File.WriteAllText(Path.Combine(args[1], "repeat-failure.json"), JsonSerializer.Serialize(new {
+                    round, lanes = ids, max_abs = maxAbs, relative_l2 = Math.Sqrt(squaredError / Math.Max(squaredReference, 1e-300)),
+                    differing_elements = differing, elements = firstLogits.Length,
+                    first_proposed = proposedCopy, repeated_proposed = proposed,
+                    first_confidence_bits = confidenceBits, repeated_confidence_bits = confidence.Select(v => v.Select(BitConverter.SingleToInt32Bits).ToArray()).ToArray(),
+                    complete = false
+                }, new JsonSerializerOptions { WriteIndented = true }));
+                throw new InvalidOperationException($"DFlash repeat changed numerical results at round {round}");
+            }
+            var tokens = new int[ids.Length * b];
+            for (int i = 0; i < ids.Length; i++)
+            {
+                tokens[i * b] = currentAnchors[i];
+                Array.Copy(proposed[i], 0, tokens, i * b + 1, g);
+            }
+            var drawn = new int[tokens.Length];
+            var verifyLogits = new float[tokens.Length * exec.VocabSize];
+            eng.Verify(current, b, tokens, drawn, verifyLogits);
+            SaveFloats($"round-{round:D3}.verify.f32", verifyLogits);
+            int[] kept = new int[ids.Length];
+            for (int i = 0; i < ids.Length; i++)
+            {
+                int accepted = 0;
+                while (accepted < g && proposed[i][accepted] == drawn[i * b + accepted])
+                    accepted++;
+                kept[i] = accepted + 1;
+            }
+            trace.Add(new { round, lanes = ids, positions = current.Select(s => s.NPast).ToArray(),
+                anchors = currentAnchors, proposed = proposedCopy, confidence_bits = confidenceBits,
+                draft_logits_sha256 = draftHash, verify_logits_sha256 = Hash(verifyLogits), drawn, kept });
+            eng.Commit(current, b, kept);
+            for (int i = 0; i < ids.Length; i++)
+                anchors[ids[i]] = drawn[i * b + kept[i] - 1];
+        }
+        // A cache reset and fresh prefill must still work after every captured lane shape.
+        eng.Active = primary;
+        eng.Reset();
+        eng.Forward(tokenizer.Encode(prompts[0], addSpecial: false).ToArray(), finalLogits);
+        trace.Add(new { reset_logits_sha256 = Hash(finalLogits), complete = true });
+        if (Environment.GetEnvironmentVariable("TS_Q35_CUDA_GRAPHS") == "1" && eng.CapturedDraftGraphCount != 3)
+            throw new InvalidOperationException($"Expected 3 captured lane shapes, got {eng.CapturedDraftGraphCount}");
+        if (Environment.GetEnvironmentVariable("TS_Q35_VERIFY_GRAPHS") == "1" &&
+            (eng.VerifyGraphCaptureCount < 1 || eng.VerifyGraphReplayCount <= eng.VerifyGraphCaptureCount))
+            throw new InvalidOperationException("The requested Verify CUDA graphs did not exercise both capture and reuse.");
+        File.WriteAllText(Path.Combine(args[1], "trace.json"), JsonSerializer.Serialize(trace, new JsonSerializerOptions { WriteIndented = true }));
+        File.WriteAllText(Path.Combine(args[1], "run.json"), JsonSerializer.Serialize(new {
+            graph_setting = Environment.GetEnvironmentVariable("TS_Q35_CUDA_GRAPHS"), rounds,
+            captured_lane_shapes = eng.CapturedDraftGraphCount,
+            verify_graph_setting = Environment.GetEnvironmentVariable("TS_Q35_VERIFY_GRAPHS"),
+            verify_graph_captures = eng.VerifyGraphCaptureCount, verify_graph_replays = eng.VerifyGraphReplayCount,
+            draft_splitk_setting = Environment.GetEnvironmentVariable("TS_Q35_DRAFT_SPLITK"),
+            target_splitk_setting = Environment.GetEnvironmentVariable("TS_Q35_GEMM_SPLITK"),
+            partitioned_topk_setting = Environment.GetEnvironmentVariable("TS_Q35_TOPK_PARTITIONED"),
+            complete = true
+        }));
+        Console.WriteLine($"[q35-probe] graph trace: {rounds} rounds, lanes 1/2/4, reordered/replaced slots, full draft/verify logits and confidence bits; complete");
+    }
+    finally
+    {
+        eng.Active = primary;
+        foreach (var slot in slots)
+            eng.FreeSlot(slot);
+    }
+    return 0;
+}
+
 if (args.Length == 2 && args[0] == "--ggml")
 {
     Directory.CreateDirectory(args[1]);

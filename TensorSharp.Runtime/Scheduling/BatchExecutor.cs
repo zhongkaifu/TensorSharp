@@ -2498,12 +2498,29 @@ namespace TensorSharp.Runtime.Scheduling
                         || (stopRepetition
                             && RepetitionGuard.IsLooping(seq.OutputTokens, seq.OutputTokens.Count, out _, out _)))
                         stopped = true;
-                });
+                },
+                drawGreedy: CanUseGreedySpecVerify(seq, FirstTokenLogitsDump.IsArmed || _cbDebug) ? drawn =>
+                {
+                    if (stopped) return -1;
+                    // Keep this check per row, AFTER onDraftAccepted updated the
+                    // committed history, exactly as TokenSampler.Sample does.
+                    if (!penaltySampler.TryGetForcedThinkingToken(seq.OutputTokens, out int forced))
+                        return drawn;
+                    if ((uint)forced >= (uint)_model.Config.VocabSize)
+                        throw new InvalidOperationException("Thinking end token is outside the model vocabulary.");
+                    return forced;
+                } : null);
             swDecode.Stop();
             accepted = acceptedTokens;
             elapsedTicks = swDecode.ElapsedTicks;
             return outcome;
         }
+
+        // Full-logit consumers retain the original path. A future logprob/logit
+        // observer must join this gate rather than consume a token-only outcome.
+        internal static bool CanUseGreedySpecVerify(SequenceState seq, bool requiresLogits) =>
+            seq.OutputTokens.Count > 0 && seq.GetOrCreateSampler().IsPlainGreedyArgmax
+            && !requiresLogits;
 
         // ---- Speculation on a per-request fused holder ----
         //
