@@ -285,6 +285,22 @@ namespace TensorSharp.Server
             }
         }
 
+        /// <summary>Check header-only distributed support before startup rejects an
+        /// unavailable backend or a load creates its GPU group and connects to peers.</summary>
+        internal void ValidateDistributedModelSupport(string modelPath, string backendStr)
+        {
+            if (TensorParallelGroupFactory == null ||
+                string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID")) ||
+                string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS")))
+                return;
+
+            bool layerSelected = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE")) &&
+                (!int.TryParse(Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"), out int tpDegree) || tpDegree <= 1);
+            BackendType backend = ResolveBackend(backendStr);
+            if (layerSelected) ModelBase.ValidateDistributedLayerSplit(modelPath, backend);
+            else ModelBase.ValidateDistributedTensorParallelism(modelPath, backend);
+        }
+
         private void LoadModelCore(string modelPath, string mmProjPath, string backendStr)
         {
             _backend = ResolveBackend(backendStr);
@@ -299,16 +315,7 @@ namespace TensorSharp.Server
                 // (an iOS app has no peers and no CUDA). The Server and CLI hand in a
                 // factory that reads TENSORSHARP_TP_* and builds the on-node group to
                 // match the backend; with no factory the load is single-node.
-                if (TensorParallelGroupFactory != null &&
-                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID")) &&
-                    !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS")))
-                {
-                    // Keep this portable library independent of TensorSharp.Distributed.
-                    bool layerSelected = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE")) &&
-                        (!int.TryParse(Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"), out int tpDegree) || tpDegree <= 1);
-                    if (layerSelected) ModelBase.ValidateDistributedLayerSplit(modelPath, _backend);
-                    else ModelBase.ValidateDistributedTensorParallelism(modelPath, _backend);
-                }
+                ValidateDistributedModelSupport(modelPath, backendStr);
                 tpGroup = TensorParallelGroupFactory?.Invoke(_backend);
 
                 // Block drafters go to the factory rather than being attached

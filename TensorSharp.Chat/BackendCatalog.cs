@@ -101,6 +101,12 @@ namespace TensorSharp.Server
             };
         }
 
+        internal static bool IsKnownBackend(string? backend)
+        {
+            string? canonical = Canonicalize(backend);
+            return BackendDescriptors.Any(descriptor => descriptor.Value == canonical);
+        }
+
         internal static string ToBackendValue(BackendType backendType)
         {
             return backendType switch

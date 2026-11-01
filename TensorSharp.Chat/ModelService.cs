@@ -354,6 +354,9 @@ namespace TensorSharp.Server
         internal void LoadStartupModel(string modelPath, string mmProjPath, string backendStr)
             => LoadModelCore(modelPath, mmProjPath, backendStr, startupLoad: true);
 
+        internal void ValidateDistributedModelSupport(string modelPath, string backendStr)
+            => _lifecycle.ValidateDistributedModelSupport(modelPath, backendStr);
+
         private void LoadModelCore(string modelPath, string mmProjPath, string backendStr, bool startupLoad)
         {
             using var jevLease = _jevExecution.BeginChange();

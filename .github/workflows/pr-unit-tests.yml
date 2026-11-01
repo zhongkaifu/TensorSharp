@@ -46,6 +46,16 @@ jobs:
       - name: Pack and verify the complete public package graph
         shell: pwsh
         run: ./eng/verify-packages.ps1 -PackageVersion 0.0.0-ci -SkipNativeBuild
+      - name: Verify Microsoft.Extensions.AI HTTP example (mock only, no model)
+        run: |
+          dotnet restore examples/dotnet-local-chat --locked-mode --configfile examples/dotnet-local-chat/NuGet.Config
+          dotnet build examples/dotnet-local-chat -c Release --no-restore
+          python3 eng/tests/dotnet-local-chat.py
+          python3 eng/tests/dotnet-local-chat-e2e.py --self-test
+      - name: Verify TensorSharp native IChatClient contracts (managed only, no GPU/model)
+        run: |
+          dotnet build eng/tests/NativeChatCompletion -c Release -p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true
+          dotnet run --project eng/tests/NativeChatCompletion -c Release --no-build -- examples/tensorsharp-native-chat/bin/Release/net10.0/TensorSharp.NativeChat.dll
 
   unit-tests:
     name: CPU correctness (${{ matrix.os }})
