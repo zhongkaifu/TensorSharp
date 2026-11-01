@@ -1,0 +1,18 @@
+{
+  // Portable text-only Qwen3.8-27B preset, without the agent preset's
+  // code execution, network, package installs, or machine-specific skills.
+  // Source and checksum are shared with agent-qwen3.8-27b.json.
+  // The pinned file is IQ3_XXS, not the Q4_K_XL named by that preset's old comments.
+  "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
+  "model": {
+    "path": "${modelRoot}/Qwen/Qwen3.8-27B-UD-IQ3_XXS.gguf",
+    "urls": ["https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-IQ3_XXS.gguf"],
+    "sha256": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0.3,
+  "top-k": 20,
+  "top-p": 0.8,
+  "repeat-penalty": 1.0
+}

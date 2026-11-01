@@ -1,0 +1,3854 @@
+{
+  "schema_version": 1,
+  "source_revision": "2de8a63fa048d3a9bf25b04923aa124f745a7a10",
+  "note": "Code/config inventory only, not execution evidence. Backends describe admitted or explicitly documented routes; per-checkpoint/device validation must be reported separately. Unknown resource estimates require a measured override. Recipes are not automated passes.",
+  "inventory": {
+    "config_glob": "config/**/*.json",
+    "excluded": [
+      "config/regression/**"
+    ],
+    "architectures_source": "TensorSharp.Models/Architecture/BuiltInArchitectures.cs",
+    "embedding_architectures_source": "TensorSharp.Models/Embeddings/EmbeddingModel.cs",
+    "existing_download_catalog": "eng/validation/release-model-catalog.json"
+  },
+  "backends": [
+    {
+      "id": "cpu",
+      "os": [
+        "windows",
+        "linux",
+        "macos"
+      ],
+      "requires": "Managed .NET runtime"
+    },
+    {
+      "id": "ggml_cpu",
+      "os": [
+        "windows",
+        "linux",
+        "macos"
+      ],
+      "requires": "Native CPU GGML library"
+    },
+    {
+      "id": "ggml_cuda",
+      "os": [
+        "windows",
+        "linux"
+      ],
+      "requires": "NVIDIA driver/device and native GGML CUDA"
+    },
+    {
+      "id": "ggml_metal",
+      "os": [
+        "macos"
+      ],
+      "requires": "macOS Metal device and native GGML Metal"
+    },
+    {
+      "id": "ggml_vulkan",
+      "os": [
+        "windows",
+        "linux"
+      ],
+      "requires": "Vulkan device/loader and native GGML Vulkan"
+    },
+    {
+      "id": "cuda",
+      "os": [
+        "windows",
+        "linux"
+      ],
+      "requires": "NVIDIA driver/device and direct CUDA runtime"
+    },
+    {
+      "id": "mlx",
+      "os": [
+        "macos"
+      ],
+      "requires": "Apple Silicon and MLX runtime"
+    }
+  ],
+  "families": [
+    {
+      "id": "gemma4",
+      "aliases": [
+        "gemma4"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "layout": "dense_or_moe",
+      "notes": "Quantized KV is declined; MTP needs the matching assistant head.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Gemma4/Gemma4Architecture.cs",
+        "docs/models/gemma4.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "agent-gemma-4-12b",
+        "agent-gemma-4-26b-a4b",
+        "gemma-4-12b",
+        "gemma-4-26b-a4b",
+        "gemma-4-e4b",
+        "server-basic",
+        "variables"
+      ]
+    },
+    {
+      "id": "qwen35",
+      "aliases": [
+        "qwen35",
+        "qwen35moe",
+        "qwen3next"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "layout": "dense_or_moe",
+      "notes": "Vision requires the matching projector. Direct CUDA whole-model fast path depends on checkpoint types; per-op CUDA is a distinct route.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "agent-qwen3.6-35b-a3b",
+        "agent-qwen3.8-27b",
+        "auto-download",
+        "cli-basic",
+        "qwen3.5-9b-iq4_xs",
+        "qwen3.5-9b-q8",
+        "qwen3.5-9b-uncensored-q8",
+        "qwen3.6-27b",
+        "qwen3.6-35b-a3b",
+        "qwen3.8-27b"
+      ]
+    },
+    {
+      "id": "qwen4exp",
+      "aliases": [
+        "qwen4exp"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "modalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "layout": "moe",
+      "notes": "MLX refused. MTP shared head requires GGML; f16/f32 KV only; cpu is a correctness path. No automatic disk-offload capacity claim.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpArchitecture.cs",
+        "docs/models/qwen38-flash-next.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "qwen3.8-flash-next-mtp",
+        "qwen3.8-flash-next"
+      ]
+    },
+    {
+      "id": "gptoss",
+      "aliases": [
+        "gptoss",
+        "gpt-oss"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "text"
+      ],
+      "layout": "moe",
+      "notes": "Always reasons; generation budget must include analysis tokens.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/GptOss/GptOssArchitecture.cs",
+        "docs/models/gptoss.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "gpt-oss-20b"
+      ]
+    },
+    {
+      "id": "diffusion-gemma",
+      "aliases": [
+        "diffusion-gemma",
+        "diffusion_gemma"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "text_diffusion",
+        "image"
+      ],
+      "layout": "moe",
+      "notes": "Single device. Ordinary chat refuses tools/audio/video_url. Jev video is sampled image frames; Jev speech requires external ASR. Batch path requires GGML.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaArchitecture.cs",
+        "docs/models/diffusiongemma.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "diffusiongemma-26b-a4b-q3",
+        "diffusiongemma-26b-a4b-q4",
+        "jev-diffusiongemma-q4"
+      ]
+    },
+    {
+      "id": "qwen_image",
+      "aliases": [
+        "qwen_image",
+        "qwen-image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "modalities": [
+        "image_generation",
+        "image_editing"
+      ],
+      "layout": "dense",
+      "notes": "Only Qwen-Image 2.1; earlier models refused. Direct CUDA/MLX refused. Requires dedicated VAE and Qwen3-VL encoder.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md",
+        "TensorSharp.Models/Models/QwenImage/QwenImageArchitecture.cs"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "lora-qwen-image-2.1-anime-consistency",
+        "lora-qwen-image-2.1-casual-phone",
+        "lora-qwen-image-2.1-detail-enhancer",
+        "lora-qwen-image-2.1-film-stills",
+        "lora-qwen-image-2.1-fix",
+        "lora-qwen-image-2.1-fun-acc-4step",
+        "lora-qwen-image-2.1-grainscape",
+        "lora-qwen-image-2.1-natural-exposure",
+        "lora-qwen-image-2.1-object-mover",
+        "lora-qwen-image-2.1-object-remover",
+        "lora-qwen-image-2.1-pruna-5step",
+        "lora-qwen-image-2.1-pruna-8step",
+        "lora-qwen-image-2.1-viggle-turbo",
+        "lora-qwen-image-2.1-voxel-style",
+        "qwen-image-2.1-turbo",
+        "qwen-image-2.1"
+      ]
+    },
+    {
+      "id": "minimax-h3",
+      "aliases": [
+        "minimax-h3",
+        "minimax_h3"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "video_generation",
+        "audio_generation"
+      ],
+      "layout": "dense",
+      "notes": "Single device. Vulkan route is unqualified and excluded from automatic selection. FL2VA and Ref2VA are separate denoisers; audio VAE required for sound.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3Architecture.cs",
+        "docs/models/minimax-h3.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "lora-minimax-h3-fl2v-turbo-4step",
+        "lora-minimax-h3-fl2v-turbo-8step",
+        "minimax-h3-fl2va"
+      ]
+    },
+    {
+      "id": "wan",
+      "aliases": [
+        "wan",
+        "wan2.1",
+        "wan2.2"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "modalities": [
+        "video_generation"
+      ],
+      "layout": "dense_or_two_expert",
+      "notes": "Single device. A14B needs both expert files; VAE differs between TI2V and A14B; no audio output.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/WanVideo/WanVideoModel.cs",
+        "docs/models/wan.md",
+        "TensorSharp.Models/Models/WanVideo/WanVideoArchitecture.cs"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "wan-video-i2v-a14b",
+        "wan-video-ti2v-5b-turbo",
+        "wan-video-ti2v-5b"
+      ]
+    },
+    {
+      "id": "ltx-2.5",
+      "aliases": [
+        "ltx-2.5",
+        "ltx",
+        "ltxv",
+        "ltx2",
+        "ltx-2",
+        "ltx_2_5"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "video_generation",
+        "audio_generation"
+      ],
+      "layout": "dense",
+      "notes": "Experimental. ggml_cuda aliases owned CUDA; ggml_metal aliases owned MLX; ggml_cpu aliases CPU. Record effective route, not GGML kernel coverage. Required assets ungated; Ingredients optional and gated.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Ltx25/Ltx25Model.cs",
+        "docs/models/ltx-2.5.md",
+        "TensorSharp.Models/Models/Ltx25/Ltx25Architecture.cs"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "ltx-2.5-distilled"
+      ]
+    },
+    {
+      "id": "bert",
+      "aliases": [
+        "bert"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "modalities": [
+        "embedding"
+      ],
+      "layout": "dense",
+      "notes": "Text embeddings only; CUDA direct/MLX and Vulkan not supported.",
+      "source_evidence": [
+        "TensorSharp.Models/Embeddings/EmbeddingModel.cs",
+        "docs/embeddings.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "embedding-minilm",
+        "embedding-snowflake"
+      ]
+    },
+    {
+      "id": "nomic-bert",
+      "aliases": [
+        "nomic-bert"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "modalities": [
+        "embedding"
+      ],
+      "layout": "dense",
+      "notes": "Task prefixes must be applied consistently; no Vulkan/direct CUDA/MLX.",
+      "source_evidence": [
+        "TensorSharp.Models/Embeddings/EmbeddingModel.cs",
+        "docs/embeddings.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "embedding-nomic"
+      ]
+    },
+    {
+      "id": "gemma-embedding2",
+      "aliases": [
+        "gemma-embedding2"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "embedding",
+        "image",
+        "audio",
+        "video"
+      ],
+      "layout": "dense",
+      "notes": "768 dimensions with 512/256/128 MRL; media needs optional projector; Vulkan unavailable.",
+      "source_evidence": [
+        "TensorSharp.Models/Embeddings/EmbeddingModel.cs",
+        "docs/embeddings.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "embeddinggemma2"
+      ]
+    },
+    {
+      "id": "nemotron_h",
+      "aliases": [
+        "nemotron_h",
+        "nemotron_h_moe",
+        "nemotron_h_omni"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "text",
+        "image",
+        "audio"
+      ],
+      "layout": "dense_or_moe",
+      "notes": "Omni image and converted Parakeet audio companions required; speculation refused (verify/decode discrepancy).",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Nemotron/NemotronArchitecture.cs",
+        "docs/models/nemotron.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "nemotron-3-nano-omni-30b-a3b",
+        "nemotron-3.5-lightning-30b-a3b",
+        "nemotron-h-47b",
+        "nemotron-h-8b"
+      ]
+    },
+    {
+      "id": "mistral3",
+      "aliases": [
+        "mistral3",
+        "llama (Mistral tokenizer only)"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "layout": "dense",
+      "notes": "No supported tool protocol or reasoning; some llama aliases only when the Mistral tokenizer is detected.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Mistral3/Mistral3Architecture.cs",
+        "docs/models/mistral3.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "mistral-small-3.1-24b"
+      ]
+    },
+    {
+      "id": "hunyuan-dense",
+      "aliases": [
+        "hunyuan-dense"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "text"
+      ],
+      "layout": "dense",
+      "notes": "Translation checkpoints require translation-specific quality fixtures; no tools/reasoning.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/HunyuanDense/HunyuanDenseArchitecture.cs",
+        "docs/models/hunyuan-dense.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "hunyuan-hy-mt2-1.8b"
+      ]
+    },
+    {
+      "id": "muse-glimmer",
+      "aliases": [
+        "muse-glimmer",
+        "muse_glimmer"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "layout": "dense",
+      "notes": "ATEM tool protocol; DFlash needs separate matching drafter.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerArchitecture.cs",
+        "docs/models/muse-glimmer.md"
+      ],
+      "configuration_status": "missing_preset",
+      "presets": [],
+      "gap_reason": "No standalone pinned config in config/ for this family. Project download/card references exist, but complete immutable assets/hashes and companions must be verified before unattended download. Not counted as covered."
+    },
+    {
+      "id": "muse-spark",
+      "aliases": [
+        "muse-spark",
+        "muse_spark"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "layout": "moe",
+      "notes": "Native path qualified on ggml_cuda/ggml_vulkan; other per-op paths are not claimed as qualified. Local TP uses CUDA; n-gram only, no learned drafter.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/MuseSpark/MuseSparkArchitecture.cs",
+        "docs/models/muse-spark.md"
+      ],
+      "configuration_status": "missing_preset",
+      "presets": [],
+      "gap_reason": "No standalone pinned config in config/ for this family. Project download/card references exist, but complete immutable assets/hashes and companions must be verified before unattended download. Not counted as covered."
+    },
+    {
+      "id": "deepseek4",
+      "aliases": [
+        "deepseek4"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "modalities": [
+        "text"
+      ],
+      "layout": "moe",
+      "notes": "Backends listed are source-documented explicit executor/placement routes. DSpark separate drafter; no vision.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/DeepSeek4/DeepSeek4Architecture.cs",
+        "docs/models/deepseek4.md",
+        "TensorSharp.Models/Models/DeepSeek4/DeepSeek41Architecture.cs"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "deepseek-v4-flash-0731"
+      ]
+    },
+    {
+      "id": "deepseek41",
+      "aliases": [
+        "deepseek41"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "cuda"
+      ],
+      "modalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "layout": "moe",
+      "notes": "Default non-CUDA GPU gate refuses Metal/Vulkan; cpu and direct cuda text only. Vision requires GGML and prepared companion. Engram and complete ten-shard checkpoint needed.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/DeepSeek4/DeepSeek41Architecture.cs",
+        "docs/models/deepseek41.md",
+        "TensorSharp.Models/Models/DeepSeek4/DeepSeek4Architecture.cs"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "deepseek-v4.1-flash"
+      ]
+    },
+    {
+      "id": "glm-dsa",
+      "aliases": [
+        "glm-dsa",
+        "glm_dsa"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "modalities": [
+        "text"
+      ],
+      "layout": "moe",
+      "notes": "5.2/5.3 text only; managed reference not bit-parity. Backends here are documented explicit executor/placement routes. NextN on 5.3 requires no active TP.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/GlmDsa/GlmDsaArchitecture.cs",
+        "docs/models/glm.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "glm-5.2",
+        "glm-5.3"
+      ]
+    },
+    {
+      "id": "glm5next",
+      "aliases": [
+        "glm5next"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "layout": "moe",
+      "notes": "5.3 Flash only; image companion required; distributed paths require separate profiles.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/GlmDsa/GlmDsaArchitecture.cs",
+        "docs/models/glm.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "glm-5.3-flash"
+      ]
+    },
+    {
+      "id": "minimax-m3",
+      "aliases": [
+        "minimax-m3",
+        "minimax_m3"
+      ],
+      "backends": [
+        "ggml_cuda",
+        "ggml_cpu"
+      ],
+      "modalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "layout": "moe",
+      "notes": "ggml_cpu correctness path. Direct CUDA/MLX/Metal/Vulkan refused. No distributed TP; local CUDA TP/layer split; converted mmproj/drafter needed.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/MiniMaxM3/MiniMaxM3Architecture.cs",
+        "docs/models/minimax-m3.md"
+      ],
+      "configuration_status": "missing_preset",
+      "presets": [],
+      "gap_reason": "No standalone pinned config in config/ for this family. Project download/card references exist, but complete immutable assets/hashes and companions must be verified before unattended download. Not counted as covered."
+    },
+    {
+      "id": "bonsai2",
+      "aliases": [
+        "bonsai2"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "layout": "dense",
+      "notes": "PRISM-transformed Qwen variant; single-device only; local hash-pinned files, no verified public download pin in current presets.",
+      "source_evidence": [
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/bonsai2.md"
+      ],
+      "configuration_status": "configured",
+      "presets": [
+        "bonsai-2-27b-ptq1"
+      ]
+    }
+  ],
+  "presets": [
+    {
+      "id": "agent-gemma-4-12b",
+      "config": "config/agent-gemma-4-12b.json",
+      "kind": "agent",
+      "family": "gemma4",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "speculation",
+        "server_agents"
+      ],
+      "source_evidence": [
+        "config/agent-gemma-4-12b.json",
+        "TensorSharp.Models/Models/Gemma4/Gemma4Architecture.cs",
+        "docs/models/gemma4.md"
+      ],
+      "layout": "dense",
+      "notes": [
+        "Privileged host settings are never replayed automatically; use isolated fixture tools. Existing absolute skills/model defaults need explicit overrides."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "agent-gemma-4-26b-a4b",
+      "config": "config/agent-gemma-4-26b-a4b.json",
+      "kind": "agent",
+      "family": "gemma4",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "server_agents"
+      ],
+      "source_evidence": [
+        "config/agent-gemma-4-26b-a4b.json",
+        "TensorSharp.Models/Models/Gemma4/Gemma4Architecture.cs",
+        "docs/models/gemma4.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf": 14249047104
+      },
+      "notes": [
+        "Privileged host settings are never replayed automatically; use isolated fixture tools. Existing absolute skills/model defaults need explicit overrides."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "agent-qwen3.6-35b-a3b",
+      "config": "config/agent-qwen3.6-35b-a3b.json",
+      "kind": "agent",
+      "family": "qwen35",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "server_agents"
+      ],
+      "source_evidence": [
+        "config/agent-qwen3.6-35b-a3b.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md"
+      ],
+      "layout": "moe",
+      "notes": [
+        "Privileged host settings are never replayed automatically; use isolated fixture tools. Existing absolute skills/model defaults need explicit overrides."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "agent-qwen3.8-27b",
+      "config": "config/agent-qwen3.8-27b.json",
+      "kind": "agent",
+      "family": "qwen35",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "server_agents"
+      ],
+      "source_evidence": [
+        "config/agent-qwen3.8-27b.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "Qwen3.8-27B-UD-IQ3_XXS.gguf": 17559178144
+      },
+      "notes": [
+        "Privileged host settings are never replayed automatically; use isolated fixture tools. Existing absolute skills/model defaults need explicit overrides."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "auto-download",
+      "config": "config/auto-download.json",
+      "kind": "text",
+      "family": "qwen35",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/auto-download.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md"
+      ],
+      "layout": "dense",
+      "status": "configured"
+    },
+    {
+      "id": "bonsai-2-27b-ptq1",
+      "config": "config/bonsai-2-27b-ptq1.json",
+      "kind": "text",
+      "family": "bonsai2",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image"
+      ],
+      "source_evidence": [
+        "config/bonsai-2-27b-ptq1.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/bonsai2.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "Ternary-Bonsai-2-27B-PTQ1_0.gguf": 5946648928,
+        "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf": 629246976
+      },
+      "resource_requirements": {
+        "ram_gib": 12,
+        "vram_gib": 12,
+        "scratch_gib": 2,
+        "basis": "Conservative short-context budget: PTQ1 weights repack about 29 percent larger (docs/models/bonsai2.md), plus projector and graph/KV headroom. Not a measured fit guarantee."
+      },
+      "status": "configured"
+    },
+    {
+      "id": "cli-basic",
+      "config": "config/cli-basic.json",
+      "kind": "text",
+      "family": "qwen35",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/cli-basic.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md"
+      ],
+      "layout": "dense",
+      "status": "configured"
+    },
+    {
+      "id": "deepseek-v4-flash-0731",
+      "config": "config/deepseek-v4-flash-0731.json",
+      "kind": "text",
+      "family": "deepseek4",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/deepseek-v4-flash-0731.json",
+        "TensorSharp.Models/Models/DeepSeek4/DeepSeek4Architecture.cs",
+        "docs/models/deepseek4.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf": 5257664,
+        "DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00002-of-00003.gguf": 49437013568,
+        "DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00003-of-00003.gguf": 47390237120
+      },
+      "status": "configured"
+    },
+    {
+      "id": "deepseek-v4.1-flash",
+      "config": "config/deepseek-v4.1-flash.json",
+      "kind": "text",
+      "family": "deepseek41",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "cuda"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/deepseek-v4.1-flash.json",
+        "TensorSharp.Models/Models/DeepSeek4/DeepSeek41Architecture.cs",
+        "docs/models/deepseek41.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf": 31006920384,
+        "DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00002-of-00010.gguf": 31461213696,
+        "DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00003-of-00010.gguf": 31001150976,
+        "DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00004-of-00010.gguf": 31001150976,
+        "DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00005-of-00010.gguf": 31461213696,
+        "DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00006-of-00010.gguf": 31001150976,
+        "DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00007-of-00010.gguf": 9838264896,
+        "DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00008-of-00010.gguf": 67585085760,
+        "DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00009-of-00010.gguf": 67586936224,
+        "DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00010-of-00010.gguf": 3438927040
+      },
+      "status": "configured"
+    },
+    {
+      "id": "diffusiongemma-26b-a4b-q3",
+      "config": "config/diffusiongemma-26b-a4b-q3.json",
+      "kind": "text_diffusion",
+      "family": "diffusion-gemma",
+      "modalities": [
+        "text_diffusion",
+        "image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "server_chat",
+        "server_stream",
+        "jev_decision"
+      ],
+      "source_evidence": [
+        "config/diffusiongemma-26b-a4b-q3.json",
+        "TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaArchitecture.cs",
+        "docs/models/diffusiongemma.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "diffusiongemma-26B-A4B-it-vision.safetensors": 2838371118
+      },
+      "notes": [
+        "Autoregressive prefill/decode, tool and forced-history paths do not apply to diffusion generation."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "diffusiongemma-26b-a4b-q4",
+      "config": "config/diffusiongemma-26b-a4b-q4.json",
+      "kind": "text_diffusion",
+      "family": "diffusion-gemma",
+      "modalities": [
+        "text_diffusion",
+        "image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "server_chat",
+        "server_stream",
+        "jev_decision"
+      ],
+      "source_evidence": [
+        "config/diffusiongemma-26b-a4b-q4.json",
+        "TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaArchitecture.cs",
+        "docs/models/diffusiongemma.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "diffusiongemma-26B-A4B-it-Q4_K_M.gguf": 16806810208,
+        "diffusiongemma-26B-A4B-it-vision.safetensors": 2838371118
+      },
+      "notes": [
+        "Autoregressive prefill/decode, tool and forced-history paths do not apply to diffusion generation."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "embedding-minilm",
+      "config": "config/embedding-minilm.json",
+      "kind": "embedding",
+      "family": "bert",
+      "modalities": [
+        "embedding"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "server_embeddings",
+        "retrieval"
+      ],
+      "source_evidence": [
+        "config/embedding-minilm.json",
+        "TensorSharp.Models/Embeddings/EmbeddingModel.cs",
+        "docs/embeddings.md"
+      ],
+      "layout": "dense",
+      "status": "configured"
+    },
+    {
+      "id": "embedding-nomic",
+      "config": "config/embedding-nomic.json",
+      "kind": "embedding",
+      "family": "nomic-bert",
+      "modalities": [
+        "embedding"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "server_embeddings",
+        "retrieval"
+      ],
+      "source_evidence": [
+        "config/embedding-nomic.json",
+        "TensorSharp.Models/Embeddings/EmbeddingModel.cs",
+        "docs/embeddings.md"
+      ],
+      "layout": "dense",
+      "status": "configured"
+    },
+    {
+      "id": "embedding-snowflake",
+      "config": "config/embedding-snowflake.json",
+      "kind": "embedding",
+      "family": "bert",
+      "modalities": [
+        "embedding"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal"
+      ],
+      "scenarios": [
+        "server_embeddings",
+        "retrieval"
+      ],
+      "source_evidence": [
+        "config/embedding-snowflake.json",
+        "TensorSharp.Models/Embeddings/EmbeddingModel.cs",
+        "docs/embeddings.md"
+      ],
+      "layout": "dense",
+      "status": "configured"
+    },
+    {
+      "id": "embeddinggemma2",
+      "config": "config/embeddinggemma2.json",
+      "kind": "embedding",
+      "family": "gemma-embedding2",
+      "modalities": [
+        "embedding"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "server_embeddings",
+        "retrieval"
+      ],
+      "source_evidence": [
+        "config/embeddinggemma2.json",
+        "TensorSharp.Models/Embeddings/EmbeddingModel.cs",
+        "docs/embeddings.md"
+      ],
+      "layout": "dense",
+      "notes": [
+        "Preset contains text model only; media remains a coverage gap until matching projector is supplied."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "gemma-4-12b",
+      "config": "config/gemma-4-12b.json",
+      "kind": "text",
+      "family": "gemma4",
+      "modalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image",
+        "cli_audio",
+        "cli_video",
+        "speculation"
+      ],
+      "source_evidence": [
+        "config/gemma-4-12b.json",
+        "TensorSharp.Models/Models/Gemma4/Gemma4Architecture.cs",
+        "docs/models/gemma4.md"
+      ],
+      "layout": "dense",
+      "status": "configured"
+    },
+    {
+      "id": "gemma-4-26b-a4b",
+      "config": "config/gemma-4-26b-a4b.json",
+      "kind": "text",
+      "family": "gemma4",
+      "modalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image",
+        "cli_audio",
+        "cli_video",
+        "speculation"
+      ],
+      "source_evidence": [
+        "config/gemma-4-26b-a4b.json",
+        "TensorSharp.Models/Models/Gemma4/Gemma4Architecture.cs",
+        "docs/models/gemma4.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf": 14249047104,
+        "gemma-4-26B-A4B-mmproj-BF16.gguf": 1194828256,
+        "gemma-4-26B-A4B-it-Q4_0-MTP.gguf": 251939328
+      },
+      "status": "configured"
+    },
+    {
+      "id": "gemma-4-e4b",
+      "config": "config/gemma-4-e4b.json",
+      "kind": "text",
+      "family": "gemma4",
+      "modalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image",
+        "cli_audio",
+        "cli_video",
+        "speculation"
+      ],
+      "source_evidence": [
+        "config/gemma-4-e4b.json",
+        "TensorSharp.Models/Models/Gemma4/Gemma4Architecture.cs",
+        "docs/models/gemma4.md"
+      ],
+      "layout": "dense",
+      "status": "configured"
+    },
+    {
+      "id": "glm-5.2",
+      "config": "config/glm-5.2.json",
+      "kind": "text",
+      "family": "glm-dsa",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/glm-5.2.json",
+        "TensorSharp.Models/Models/GlmDsa/GlmDsaArchitecture.cs",
+        "docs/models/glm.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf": 9423744,
+        "GLM-5.2-UD-IQ2_XXS-00002-of-00006.gguf": 49105028960,
+        "GLM-5.2-UD-IQ2_XXS-00003-of-00006.gguf": 49143176640,
+        "GLM-5.2-UD-IQ2_XXS-00004-of-00006.gguf": 49143176640,
+        "GLM-5.2-UD-IQ2_XXS-00005-of-00006.gguf": 49143176640,
+        "GLM-5.2-UD-IQ2_XXS-00006-of-00006.gguf": 41914650304
+      },
+      "status": "configured"
+    },
+    {
+      "id": "glm-5.3-flash",
+      "config": "config/glm-5.3-flash.json",
+      "kind": "text",
+      "family": "glm5next",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image"
+      ],
+      "source_evidence": [
+        "config/glm-5.3-flash.json",
+        "TensorSharp.Models/Models/GlmDsa/GlmDsaArchitecture.cs",
+        "docs/models/glm.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf": 9429984,
+        "GLM-5.3-Flash-UD-Q2_K_XL-00002-of-00004.gguf": 49294975936,
+        "GLM-5.3-Flash-UD-Q2_K_XL-00003-of-00004.gguf": 49949266048,
+        "GLM-5.3-Flash-UD-Q2_K_XL-00004-of-00004.gguf": 9466399584,
+        "mmproj-BF16.gguf": 1164010176
+      },
+      "status": "configured"
+    },
+    {
+      "id": "glm-5.3",
+      "config": "config/glm-5.3.json",
+      "kind": "text",
+      "family": "glm-dsa",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/glm-5.3.json",
+        "TensorSharp.Models/Models/GlmDsa/GlmDsaArchitecture.cs",
+        "docs/models/glm.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "GLM-5.3-UD-Q2_K_XL-00001-of-00007.gguf": 9428677,
+        "GLM-5.3-UD-Q2_K_XL-00002-of-00007.gguf": 49172427136,
+        "GLM-5.3-UD-Q2_K_XL-00003-of-00007.gguf": 49091626976,
+        "GLM-5.3-UD-Q2_K_XL-00004-of-00007.gguf": 49091626976,
+        "GLM-5.3-UD-Q2_K_XL-00005-of-00007.gguf": 49091626976,
+        "GLM-5.3-UD-Q2_K_XL-00006-of-00007.gguf": 49994703552,
+        "GLM-5.3-UD-Q2_K_XL-00007-of-00007.gguf": 7426966496
+      },
+      "status": "configured"
+    },
+    {
+      "id": "gpt-oss-20b",
+      "config": "config/gpt-oss-20b.json",
+      "kind": "text",
+      "family": "gptoss",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/gpt-oss-20b.json",
+        "TensorSharp.Models/Models/GptOss/GptOssArchitecture.cs",
+        "docs/models/gptoss.md"
+      ],
+      "layout": "moe",
+      "status": "configured"
+    },
+    {
+      "id": "hunyuan-hy-mt2-1.8b",
+      "config": "config/hunyuan-hy-mt2-1.8b.json",
+      "kind": "text",
+      "family": "hunyuan-dense",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "forced_logits",
+        "forced_logits_sequence"
+      ],
+      "source_evidence": [
+        "config/hunyuan-hy-mt2-1.8b.json",
+        "TensorSharp.Models/Models/HunyuanDense/HunyuanDenseArchitecture.cs",
+        "docs/models/hunyuan-dense.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "Hy-MT2-1.8B-Q4_K_M.gguf": 1133080448
+      },
+      "notes": [
+        "Translation-only checkpoint: arithmetic/chat fixtures are not quality coverage. Supply translation fixtures with reference-based assertions."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "jev-diffusiongemma-q4",
+      "config": "config/jev-diffusiongemma-q4.json",
+      "kind": "text_diffusion",
+      "family": "diffusion-gemma",
+      "modalities": [
+        "text_diffusion",
+        "image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "server_chat",
+        "server_stream",
+        "jev_decision"
+      ],
+      "source_evidence": [
+        "config/jev-diffusiongemma-q4.json",
+        "TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaArchitecture.cs",
+        "docs/models/diffusiongemma.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "diffusiongemma-26B-A4B-it-Q4_K_M.gguf": 16806810208,
+        "diffusiongemma-26B-A4B-it-vision.safetensors": 2838371118
+      },
+      "notes": [
+        "Autoregressive prefill/decode, tool and forced-history paths do not apply to diffusion generation."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-minimax-h3-fl2v-turbo-4step",
+      "config": "config/lora/minimax-h3-fl2v-turbo-4step.json",
+      "kind": "plugin",
+      "family": "minimax-h3",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/minimax-h3-fl2v-turbo-4step.json",
+        "TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3Architecture.cs",
+        "docs/models/minimax-h3.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/minimax-h3-fl2va.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-minimax-h3-fl2v-turbo-8step",
+      "config": "config/lora/minimax-h3-fl2v-turbo-8step.json",
+      "kind": "plugin",
+      "family": "minimax-h3",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/minimax-h3-fl2v-turbo-8step.json",
+        "TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3Architecture.cs",
+        "docs/models/minimax-h3.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/minimax-h3-fl2va.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-anime-consistency",
+      "config": "config/lora/qwen-image-2.1-anime-consistency.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-anime-consistency.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-casual-phone",
+      "config": "config/lora/qwen-image-2.1-casual-phone.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-casual-phone.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-detail-enhancer",
+      "config": "config/lora/qwen-image-2.1-detail-enhancer.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-detail-enhancer.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-film-stills",
+      "config": "config/lora/qwen-image-2.1-film-stills.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-film-stills.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-fix",
+      "config": "config/lora/qwen-image-2.1-fix.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-fix.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-fun-acc-4step",
+      "config": "config/lora/qwen-image-2.1-fun-acc-4step.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-fun-acc-4step.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-grainscape",
+      "config": "config/lora/qwen-image-2.1-grainscape.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-grainscape.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-natural-exposure",
+      "config": "config/lora/qwen-image-2.1-natural-exposure.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-natural-exposure.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-object-mover",
+      "config": "config/lora/qwen-image-2.1-object-mover.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-object-mover.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-object-remover",
+      "config": "config/lora/qwen-image-2.1-object-remover.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-object-remover.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-pruna-5step",
+      "config": "config/lora/qwen-image-2.1-pruna-5step.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-pruna-5step.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-pruna-8step",
+      "config": "config/lora/qwen-image-2.1-pruna-8step.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-pruna-8step.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-viggle-turbo",
+      "config": "config/lora/qwen-image-2.1-viggle-turbo.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-viggle-turbo.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "lora-qwen-image-2.1-voxel-style",
+      "config": "config/lora/qwen-image-2.1-voxel-style.json",
+      "kind": "plugin",
+      "family": "qwen_image",
+      "modalities": [
+        "adapter"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "lora"
+      ],
+      "source_evidence": [
+        "config/lora/qwen-image-2.1-voxel-style.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md"
+      ],
+      "layout": "dense",
+      "requires_configs": [
+        "config/qwen-image-2.1.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "ltx-2.5-distilled",
+      "config": "config/ltx-2.5-distilled.json",
+      "kind": "video_generation",
+      "family": "ltx-2.5",
+      "modalities": [
+        "video_generation",
+        "audio_generation"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "video_generation",
+        "video_audio_generation",
+        "video_reference"
+      ],
+      "source_evidence": [
+        "config/ltx-2.5-distilled.json",
+        "TensorSharp.Models/Models/Ltx25/Ltx25Model.cs",
+        "docs/models/ltx-2.5.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Ltx25.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf": 14000234880,
+        "ltx-2.5-22b-ic-lora-ingredients-0.9.safetensors": 1308787472,
+        "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors": 26263858182,
+        "ltx-2.5-video-vae-conv-bf16.safetensors": 1452269922,
+        "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors": 995778752,
+        "ltx-2.5-audio-vae-bf16.safetensors": 364866540
+      },
+      "resource_requirements": {
+        "ram_gib": 48,
+        "vram_gib": 48,
+        "scratch_gib": 4,
+        "download_gib": 40.118590254336596,
+        "basis": "Conservative experimental 48 GB device tier from docs/models/ltx-2.5.md; excludes optional Ingredients and any larger shape. Unified-memory budget is shared, not added."
+      },
+      "status": "configured"
+    },
+    {
+      "id": "minimax-h3-fl2va",
+      "config": "config/minimax-h3-fl2va.json",
+      "kind": "video_generation",
+      "family": "minimax-h3",
+      "modalities": [
+        "video_generation",
+        "audio_generation"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "video_generation",
+        "video_audio_generation",
+        "video_reference",
+        "lora"
+      ],
+      "source_evidence": [
+        "config/minimax-h3-fl2va.json",
+        "TensorSharp.Models/Models/MiniMaxH3/MiniMaxH3Architecture.cs",
+        "docs/models/minimax-h3.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "minimax_h3_fl2va_pruned-Q4_K.gguf": 11420663904,
+        "minimax_h3_ref2va_pruned-Q4_K.gguf": 11381096544,
+        "qwen3vl_32b_minimax_h3-Q4_K_M.gguf": 18218065024,
+        "vocab.json": 2776833,
+        "merges.txt": 1671839,
+        "tokenizer_config.json": 11003,
+        "minimax_h3_video_vae_fp16.safetensors": 5207808496,
+        "minimax_h3_audio_vae_fp32.safetensors": 605254808
+      },
+      "status": "configured"
+    },
+    {
+      "id": "mistral-small-3.1-24b",
+      "config": "config/mistral-small-3.1-24b.json",
+      "kind": "text",
+      "family": "mistral3",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "cli_image"
+      ],
+      "source_evidence": [
+        "config/mistral-small-3.1-24b.json",
+        "TensorSharp.Models/Models/Mistral3/Mistral3Architecture.cs",
+        "docs/models/mistral3.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf": 14333910496,
+        "mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf": 878054144
+      },
+      "status": "configured"
+    },
+    {
+      "id": "nemotron-3-nano-omni-30b-a3b",
+      "config": "config/nemotron-3-nano-omni-30b-a3b.json",
+      "kind": "text",
+      "family": "nemotron_h",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image"
+      ],
+      "source_evidence": [
+        "config/nemotron-3-nano-omni-30b-a3b.json",
+        "TensorSharp.Models/Models/Nemotron/NemotronArchitecture.cs",
+        "docs/models/nemotron.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "dense_or_moe",
+      "file_sizes": {
+        "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf": 23926934976,
+        "mmproj-BF16.gguf": 1589506304
+      },
+      "status": "configured"
+    },
+    {
+      "id": "nemotron-3.5-lightning-30b-a3b",
+      "config": "config/nemotron-3.5-lightning-30b-a3b.json",
+      "kind": "text",
+      "family": "nemotron_h",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/nemotron-3.5-lightning-30b-a3b.json",
+        "TensorSharp.Models/Models/Nemotron/NemotronArchitecture.cs",
+        "docs/models/nemotron.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "dense_or_moe",
+      "file_sizes": {
+        "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MXFP4_MOE.gguf": 23210817600
+      },
+      "status": "configured"
+    },
+    {
+      "id": "nemotron-h-47b",
+      "config": "config/nemotron-h-47b.json",
+      "kind": "text",
+      "family": "nemotron_h",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/nemotron-h-47b.json",
+        "TensorSharp.Models/Models/Nemotron/NemotronArchitecture.cs",
+        "docs/models/nemotron.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "dense_or_moe",
+      "file_sizes": {
+        "nvidia_Nemotron-H-47B-Reasoning-128K-Q4_K_M.gguf": 28187710688
+      },
+      "status": "configured"
+    },
+    {
+      "id": "nemotron-h-8b",
+      "config": "config/nemotron-h-8b.json",
+      "kind": "text",
+      "family": "nemotron_h",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/nemotron-h-8b.json",
+        "TensorSharp.Models/Models/Nemotron/NemotronArchitecture.cs",
+        "docs/models/nemotron.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "dense_or_moe",
+      "file_sizes": {
+        "nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf": 4983360480
+      },
+      "status": "configured"
+    },
+    {
+      "id": "qwen-image-2.1-turbo",
+      "config": "config/qwen-image-2.1-turbo.json",
+      "kind": "image_generation",
+      "family": "qwen_image",
+      "modalities": [
+        "image_generation",
+        "image_editing"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "image_generation",
+        "image_editing",
+        "lora",
+        "multi_gpu"
+      ],
+      "source_evidence": [
+        "config/qwen-image-2.1-turbo.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "qwen-image-2.1-turbo-Q5_K_S.gguf": 4501948224,
+        "qwen_image_2.1_vae_bf16.safetensors": 675509688,
+        "Qwen3VL-8B-Instruct-Q4_K_M.gguf": 5027784800,
+        "mmproj-Qwen3VL-8B-Instruct-F16.gguf": 1159029824
+      },
+      "status": "configured"
+    },
+    {
+      "id": "qwen-image-2.1",
+      "config": "config/qwen-image-2.1.json",
+      "kind": "image_generation",
+      "family": "qwen_image",
+      "modalities": [
+        "image_generation",
+        "image_editing"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "image_generation",
+        "image_editing",
+        "lora",
+        "multi_gpu"
+      ],
+      "source_evidence": [
+        "config/qwen-image-2.1.json",
+        "TensorSharp.Models/Models/QwenImage/QwenImageModel.cs",
+        "docs/models/qwenimage21.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "qwen_image_2.1_Q4_K_M.gguf": 4189343904,
+        "qwen_image_2.1_vae_bf16.safetensors": 675509688,
+        "Qwen3VL-8B-Instruct-Q4_K_M.gguf": 5027784800,
+        "mmproj-Qwen3VL-8B-Instruct-F16.gguf": 1159029824
+      },
+      "status": "configured"
+    },
+    {
+      "id": "qwen3.5-9b-iq4_xs",
+      "config": "config/qwen3.5-9b-iq4_xs.json",
+      "kind": "text",
+      "family": "qwen35",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/qwen3.5-9b-iq4_xs.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "Qwen3.5-9B-IQ4_XS.gguf": 5168653536
+      },
+      "status": "configured"
+    },
+    {
+      "id": "qwen3.5-9b-q8",
+      "config": "config/qwen3.5-9b-q8.json",
+      "kind": "text",
+      "family": "qwen35",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/qwen3.5-9b-q8.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md"
+      ],
+      "layout": "dense",
+      "status": "configured"
+    },
+    {
+      "id": "qwen3.5-9b-uncensored-q8",
+      "config": "config/qwen3.5-9b-uncensored-q8.json",
+      "kind": "text",
+      "family": "qwen35",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/qwen3.5-9b-uncensored-q8.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md"
+      ],
+      "layout": "dense",
+      "status": "configured"
+    },
+    {
+      "id": "qwen3.6-27b",
+      "config": "config/qwen3.6-27b.json",
+      "kind": "text",
+      "family": "qwen35",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image"
+      ],
+      "source_evidence": [
+        "config/qwen3.6-27b.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "Qwen3.6-27B-mmproj-BF16.gguf": 931146304
+      },
+      "status": "configured"
+    },
+    {
+      "id": "qwen3.6-35b-a3b",
+      "config": "config/qwen3.6-35b-a3b.json",
+      "kind": "text",
+      "family": "qwen35",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image"
+      ],
+      "source_evidence": [
+        "config/qwen3.6-35b-a3b.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md"
+      ],
+      "layout": "moe",
+      "status": "configured"
+    },
+    {
+      "id": "qwen3.8-27b",
+      "config": "config/qwen3.8-27b.json",
+      "kind": "text",
+      "family": "qwen35",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/qwen3.8-27b.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "Qwen3.8-27B-UD-IQ3_XXS.gguf": 17559178144
+      },
+      "status": "configured"
+    },
+    {
+      "id": "qwen3.8-flash-next-mtp",
+      "config": "config/qwen3.8-flash-next-mtp.json",
+      "kind": "overlay",
+      "family": "qwen4exp",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "speculation"
+      ],
+      "source_evidence": [
+        "config/qwen3.8-flash-next-mtp.json",
+        "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpArchitecture.cs",
+        "docs/models/qwen38-flash-next.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf": 2786568256
+      },
+      "notes": [
+        "Apply after config/qwen3.8-flash-next.json; no standalone model."
+      ],
+      "requires_configs": [
+        "config/qwen3.8-flash-next.json"
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "qwen3.8-flash-next",
+      "config": "config/qwen3.8-flash-next.json",
+      "kind": "text",
+      "family": "qwen4exp",
+      "modalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image",
+        "cli_video"
+      ],
+      "source_evidence": [
+        "config/qwen3.8-flash-next.json",
+        "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpArchitecture.cs",
+        "docs/models/qwen38-flash-next.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf": 10946624,
+        "Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf": 49979779296,
+        "Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf": 28878402944,
+        "mmproj-BF16.gguf": 907542944
+      },
+      "status": "configured"
+    },
+    {
+      "id": "server-basic",
+      "config": "config/server-basic.json",
+      "kind": "text",
+      "family": "gemma4",
+      "modalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image",
+        "cli_audio",
+        "cli_video"
+      ],
+      "source_evidence": [
+        "config/server-basic.json",
+        "TensorSharp.Models/Models/Gemma4/Gemma4Architecture.cs",
+        "docs/models/gemma4.md"
+      ],
+      "layout": "dense",
+      "status": "configured"
+    },
+    {
+      "id": "variables",
+      "config": "config/variables.json",
+      "kind": "text",
+      "family": "gemma4",
+      "modalities": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image",
+        "cli_audio",
+        "cli_video",
+        "speculation"
+      ],
+      "source_evidence": [
+        "config/variables.json",
+        "TensorSharp.Models/Models/Gemma4/Gemma4Architecture.cs",
+        "docs/models/gemma4.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "${gemmaBase}-it-qat-UD-Q4_K_XL.gguf": 14249047104,
+        "${gemmaBase}-mmproj-BF16.gguf": 1194828256,
+        "${gemmaBase}-it-Q4_0-MTP.gguf": 251939328
+      },
+      "status": "configured"
+    },
+    {
+      "id": "wan-video-i2v-a14b",
+      "config": "config/wan-video-i2v-a14b.json",
+      "kind": "video_generation",
+      "family": "wan",
+      "modalities": [
+        "video_generation"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "scenarios": [
+        "video_generation"
+      ],
+      "source_evidence": [
+        "config/wan-video-i2v-a14b.json",
+        "TensorSharp.Models/Models/WanVideo/WanVideoModel.cs",
+        "docs/models/wan.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "dense_or_two_expert",
+      "file_sizes": {
+        "wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf": 9661569664,
+        "wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf": 9661569664,
+        "Wan2.1_VAE.safetensors": 253815318,
+        "umt5-xxl-encoder-Q8_0.gguf": 6043068256
+      },
+      "notes": [
+        "I2V-only A14B requires source image; text-only generation is unsupported."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "wan-video-ti2v-5b-turbo",
+      "config": "config/wan-video-ti2v-5b-turbo.json",
+      "kind": "video_generation",
+      "family": "wan",
+      "modalities": [
+        "video_generation"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "scenarios": [
+        "video_generation"
+      ],
+      "source_evidence": [
+        "config/wan-video-ti2v-5b-turbo.json",
+        "TensorSharp.Models/Models/WanVideo/WanVideoModel.cs",
+        "docs/models/wan.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "dense_or_two_expert",
+      "file_sizes": {
+        "Wan2_2-TI2V-5B-Turbo-Q8_0.gguf": 5404990176,
+        "Wan2.2_VAE.safetensors": 1409400960,
+        "umt5-xxl-encoder-Q8_0.gguf": 6043068256
+      },
+      "notes": [
+        "I2V-only A14B requires source image; text-only generation is unsupported."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "wan-video-ti2v-5b",
+      "config": "config/wan-video-ti2v-5b.json",
+      "kind": "video_generation",
+      "family": "wan",
+      "modalities": [
+        "video_generation"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "scenarios": [
+        "video_generation"
+      ],
+      "source_evidence": [
+        "config/wan-video-ti2v-5b.json",
+        "TensorSharp.Models/Models/WanVideo/WanVideoModel.cs",
+        "docs/models/wan.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs"
+      ],
+      "layout": "dense_or_two_expert",
+      "file_sizes": {
+        "Wan2.2-TI2V-5B-Q8_0.gguf": 5400179040,
+        "Wan2.2_VAE.safetensors": 1409400960,
+        "umt5-xxl-encoder-Q8_0.gguf": 6043068256
+      },
+      "notes": [
+        "I2V-only A14B requires source image; text-only generation is unsupported."
+      ],
+      "status": "configured"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "cli_text",
+      "entry_point": "TensorSharp.Cli/bin/TensorSharp.Cli.dll",
+      "status": "automated",
+      "recipe": "--model {model} --backend {backend} --input {fixture} --max-tokens 128 --temperature 0 --seed 42",
+      "assertions": [
+        "Assistant output contains the expected answer from the selected fixture, excluding prompts and logs.",
+        "Observed backend equals requested backend."
+      ],
+      "evidence": [
+        "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
+        "TensorSharp.Cli/Program.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "cli_prefill",
+      "entry_point": "TensorSharp.Cli/bin/TensorSharp.Cli.dll",
+      "status": "automated",
+      "recipe": "--benchmark --bench-prefill 128 --bench-decode 0 --bench-runs 1 --bench-fixed-tokens",
+      "assertions": [
+        "Finite positive prefill throughput and exactly the requested prompt-token count.",
+        "No backend fallback."
+      ],
+      "evidence": [
+        "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
+        "TensorSharp.TestMatrix/Runners/OutputParser.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "cli_decode",
+      "entry_point": "TensorSharp.Cli/bin/TensorSharp.Cli.dll",
+      "status": "automated",
+      "recipe": "--benchmark --bench-prefill 32 --bench-decode 16 --bench-runs 1 --bench-fixed-tokens",
+      "assertions": [
+        "Finite positive decode throughput and exactly the requested decode-token count.",
+        "No backend fallback."
+      ],
+      "evidence": [
+        "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
+        "TensorSharp.TestMatrix/Runners/OutputParser.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "cli_multi_turn",
+      "entry_point": "TensorSharp.Cli/bin/TensorSharp.Cli.dll",
+      "status": "automated",
+      "recipe": "--multi-turn-jsonl TensorSharp.TestMatrix/Inputs/multi_turn/three_turn.jsonl",
+      "assertions": [
+        "Later assistant turns recover Alex and teal; fixture text cannot satisfy assertions."
+      ],
+      "evidence": [
+        "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
+        "TensorSharp.TestMatrix/Inputs/multi_turn/three_turn.jsonl",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "cli_tools",
+      "entry_point": "TensorSharp.Cli/bin/TensorSharp.Cli.dll",
+      "status": "automated",
+      "recipe": "Use runner synthetic get_regression_value tool and key=fixture prompt.",
+      "assertions": [
+        "Parsed tool call is get_regression_value; JSON arguments have key=fixture; ordinary prose is not a tool call."
+      ],
+      "evidence": [
+        "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
+        "TensorSharp.TestMatrix/Inputs/tools/weather_tools.json",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "cli_thinking",
+      "entry_point": "TensorSharp.Cli/bin/TensorSharp.Cli.dll",
+      "status": "automated",
+      "recipe": "--think --input TensorSharp.TestMatrix/Inputs/prompts/thinking_question.txt",
+      "assertions": [
+        "Visible final answer gives 10:38; analysis tokens alone do not pass."
+      ],
+      "evidence": [
+        "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "cli_image",
+      "entry_point": "TensorSharp.Cli/bin/TensorSharp.Cli.dll",
+      "status": "automated",
+      "recipe": "--image {fixture} --input TensorSharp.TestMatrix/Inputs/prompts/image_question.txt",
+      "assertions": [
+        "Assistant answer contains fixture-specific expected content (tensorsharp for repository default).",
+        "Media encoder actually loads; text-only fallback is failure."
+      ],
+      "evidence": [
+        "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
+        "eng/make-test-media.sh",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": [
+        "Matching projector",
+        "Explicit generated media fixture and expected answer",
+        "ffmpeg for video/audio preparation"
+      ]
+    },
+    {
+      "id": "cli_audio",
+      "entry_point": "TensorSharp.Cli/bin/TensorSharp.Cli.dll",
+      "status": "automated",
+      "recipe": "--audio {fixture} --input TensorSharp.TestMatrix/Inputs/prompts/audio_question.txt",
+      "assertions": [
+        "Assistant answer contains fixture-specific expected content (fox for repository default).",
+        "Media encoder actually loads; text-only fallback is failure."
+      ],
+      "evidence": [
+        "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
+        "eng/make-test-media.sh",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": [
+        "Matching projector",
+        "Explicit generated media fixture and expected answer",
+        "ffmpeg for video/audio preparation"
+      ]
+    },
+    {
+      "id": "cli_video",
+      "entry_point": "TensorSharp.Cli/bin/TensorSharp.Cli.dll",
+      "status": "automated",
+      "recipe": "--video {fixture} --input TensorSharp.TestMatrix/Inputs/prompts/video_question.txt",
+      "assertions": [
+        "Assistant answer contains fixture-specific expected content (tensorsharp for repository default).",
+        "Media encoder actually loads; text-only fallback is failure."
+      ],
+      "evidence": [
+        "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
+        "eng/make-test-media.sh",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": [
+        "Matching projector",
+        "Explicit generated media fixture and expected answer",
+        "ffmpeg for video/audio preparation"
+      ]
+    },
+    {
+      "id": "forced_logits",
+      "entry_point": "eng/ForcedLogitProbe",
+      "status": "automated",
+      "recipe": "Run two fresh processes with --steps 16 on the same backend; the second uses --reference {first-output} to replay exact teacher-forced histories.",
+      "assertions": [
+        "metrics.complete is true and case histories/token counts match.",
+        "Every logit is finite; compare identical forced token history, max absolute error, cosine and top-token margins.",
+        "Record first divergent case/step/token and full rows; autoregressive text equality is not enough.",
+        "This is within-backend consistency. An independent oracle or cross-backend accuracy claim requires a separate controlled reference."
+      ],
+      "evidence": [
+        "eng/ForcedLogitProbe/Program.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": [
+        "Built ForcedLogitProbe",
+        "Reference generated with same model hash and case inputs"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "cuda"
+      ]
+    },
+    {
+      "id": "forced_logits_sequence",
+      "entry_point": "eng/ForcedLogitProbe",
+      "status": "automated",
+      "recipe": "Run short-short, long-long, short-long-short and long-short orders with 32/512 prompt-token lengths and 32 teacher-forced decode steps. Compare each reused-model ResetKVCache case with a fresh-process reference.",
+      "assertions": [
+        "All complete markers true; exact prompt lengths and teacher-forced histories match their reference.",
+        "Finite logits at every step; declared max-absolute/relative or cosine tolerance gates apply independently of argmax.",
+        "Report first changed row/token and preceding case/length; include per-step top-k/selected token, model/backend hashes and reset boundary.",
+        "Sequence agreement is consistency evidence only; it does not identify a root cause or establish independent numerical accuracy."
+      ],
+      "evidence": [
+        "eng/ForcedLogitProbe/Program.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": [
+        "Built sequence-capable ForcedLogitProbe",
+        "Fresh process references from identical model/backend and generated fixed histories"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "cuda"
+      ]
+    },
+    {
+      "id": "server_chat",
+      "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
+      "status": "automated",
+      "recipe": "POST /v1/chat/completions with fixed seed, greedy sampler and arithmetic fixture",
+      "assertions": [
+        "Expected answer, assistant role, nonempty choices, model identity and bounded token usage."
+      ],
+      "evidence": [
+        "TensorSharp.Server/Endpoints/OpenAIEndpoints.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "server_stream",
+      "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
+      "status": "automated",
+      "recipe": "POST /v1/chat/completions stream=true with same fixed input as nonstream",
+      "assertions": [
+        "Valid SSE JSON chunks, exactly one terminal [DONE], nonempty assistant delta and expected reconstructed answer."
+      ],
+      "evidence": [
+        "TensorSharp.Server/Endpoints/OpenAIEndpoints.cs",
+        "InferenceWeb.Tests/ReasoningContentStreamingTests.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "server_cancel",
+      "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
+      "status": "automated",
+      "recipe": "Close an in-flight streaming request, then perform a bounded follow-up request",
+      "assertions": [
+        "Stream starts before cancellation; owned server stays healthy and follow-up completes; no stale text crosses requests."
+      ],
+      "evidence": [
+        "TensorSharp.Server/Endpoints/OpenAIEndpoints.cs",
+        "TensorSharp.Server/Endpoints/SessionEndpoints.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "server_reset_cache",
+      "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
+      "status": "automated",
+      "recipe": "Repeat fixed conversations, reset owned session, repeat prompt",
+      "assertions": [
+        "No cross-session secret leakage; after reset same seeded answer; retained-cache behavior requires backend-specific trace evidence."
+      ],
+      "evidence": [
+        "TensorSharp.Server/Endpoints/SessionEndpoints.cs",
+        "InferenceWeb.Tests/ChatSessionCacheIsolationTests.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "server_structured",
+      "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
+      "status": "automated",
+      "recipe": "POST /v1/chat/completions response_format=json_schema",
+      "assertions": [
+        "Parse final JSON; validate exact required fields, types and values; no additional properties."
+      ],
+      "evidence": [
+        "TensorSharp.Server/Endpoints/OpenAIEndpoints.cs",
+        "InferenceWeb.Tests/StructuredOutputTests.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "server_tools",
+      "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
+      "status": "automated",
+      "recipe": "POST /v1/chat/completions with one read-only fixture tool and forced tool_choice",
+      "assertions": [
+        "Exact function name, valid JSON args and expected argument values; never execute model-supplied commands."
+      ],
+      "evidence": [
+        "TensorSharp.Server/Endpoints/OpenAIEndpoints.cs",
+        "InferenceWeb.Tests/MultiAgentToolSchemaTests.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "server_embeddings",
+      "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
+      "status": "automated",
+      "recipe": "POST /v1/embeddings for identical, semantically related and unrelated fixture strings",
+      "assertions": [
+        "Finite vectors with correct dimension/order; repeat consistency and cosine self-similarity; related text ranks over unrelated text.",
+        "Embedding host rejects generation routes; malformed input gets correct 4xx."
+      ],
+      "evidence": [
+        "TensorSharp.Server/Endpoints/EmbeddingEndpoints.cs",
+        "InferenceWeb.Tests/EmbeddingEndpointTests.cs",
+        "eng/regression/scenarios.py"
+      ],
+      "requirements": []
+    },
+    {
+      "id": "embedding_media",
+      "entry_point": "eng/validation/embeddinggemma2-media-http.py",
+      "status": "recipe",
+      "recipe": "Run the existing media HTTP probe with matching projector and synthetic labeled fixtures.",
+      "assertions": [
+        "Finite normalized vectors, correct MRL dimension, repeat consistency and multimodal relevance against paired fixtures."
+      ],
+      "evidence": [
+        "eng/validation/embeddinggemma2-media-http.py",
+        "InferenceWeb.Tests/EmbeddingGemma2MediaRequestTests.cs"
+      ],
+      "requirements": [
+        "Matching media projector and local labeled media"
+      ]
+    },
+    {
+      "id": "server_agents",
+      "entry_point": "eng/validation/probe_multi_agent_host.py",
+      "status": "recipe",
+      "recipe": "Run isolated loopback multi-agent host probe with fixture tools only.",
+      "assertions": [
+        "Expected delegation/dependency events, result delivery, cancellation propagation and isolated helper workspace."
+      ],
+      "evidence": [
+        "eng/validation/probe_multi_agent_host.py",
+        "InferenceWeb.Tests/MultiAgentHostTests.cs"
+      ],
+      "requirements": [
+        "Explicit controlled agent fixture; never run shipped network/code-exec agent settings automatically"
+      ]
+    },
+    {
+      "id": "retrieval",
+      "entry_point": "TensorSharp.Knowledge.Tests",
+      "status": "recipe",
+      "recipe": "dotnet test TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj --logger trx",
+      "assertions": [
+        "Fixture document ingestion/chunk IDs, expected retrieved passage and citation; ACL/session isolation and malformed document behavior."
+      ],
+      "evidence": [
+        "TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj",
+        "InferenceWeb.Tests/KnowledgeRetrievalLoopTests.cs"
+      ],
+      "requirements": [
+        "Built test suite; model-backed end-to-end retrieval needs local embedding model"
+      ]
+    },
+    {
+      "id": "image_generation",
+      "entry_point": "eng/validation/qwen-image21-http.py",
+      "status": "recipe",
+      "recipe": "Run existing Qwen Image HTTP validation against an owned loopback server.",
+      "assertions": [
+        "Decode image; exact dimensions/format, finite nonconstant pixels, expected alpha; compare deterministic seeded fixture or approved reference."
+      ],
+      "evidence": [
+        "eng/validation/qwen-image21-http.py",
+        "eng/validation/validate-release-generation.py"
+      ],
+      "requirements": [
+        "Complete VAE/text/vision companions",
+        "Explicit image dimensions and memory budget"
+      ]
+    },
+    {
+      "id": "image_editing",
+      "entry_point": "eng/validation/qwen-image21-edit-fidelity.py",
+      "status": "recipe",
+      "recipe": "Run fixed source image, prompt and mask with approved output metric bounds.",
+      "assertions": [
+        "Preserve unmasked pixels/geometry within tolerance; masked region changes; invalid masks rejected; output matches requested dimensions."
+      ],
+      "evidence": [
+        "eng/validation/qwen-image21-edit-fidelity.py",
+        "eng/validation/validate-image-mask-live.py"
+      ],
+      "requirements": [
+        "Synthetic owned source/mask and thresholds"
+      ]
+    },
+    {
+      "id": "video_generation",
+      "entry_point": "eng/validation/validate-release-generation.py",
+      "status": "recipe",
+      "recipe": "Run generation profile with bounded frame count and ffprobe artifact validation.",
+      "assertions": [
+        "Playable video; exact frame/time grid, dimensions, finite varied pixels; deterministic reference metrics with declared tolerance."
+      ],
+      "evidence": [
+        "eng/validation/validate-release-generation.py",
+        "eng/validation/ltx25-generation-suite.py"
+      ],
+      "requirements": [
+        "All model companions",
+        "ffmpeg/ffprobe",
+        "Family-specific memory and duration budget"
+      ]
+    },
+    {
+      "id": "video_audio_generation",
+      "entry_point": "eng/validation/validate-release-generation.py",
+      "status": "recipe",
+      "recipe": "Run H3 or LTX bounded generation and decode video/audio outputs.",
+      "assertions": [
+        "Video checks plus nonempty finite stereo waveform, expected 32kHz H3 or 48kHz LTX rate, duration alignment; silent video cannot pass sound coverage."
+      ],
+      "evidence": [
+        "eng/validation/validate-release-generation.py",
+        "eng/validation/minimax-h3-generation.py",
+        "eng/validation/ltx25-generation-suite.py"
+      ],
+      "requirements": [
+        "Family audio VAE and complete companions",
+        "ffmpeg/ffprobe"
+      ]
+    },
+    {
+      "id": "video_reference",
+      "entry_point": "eng/validation/ltx25-generation-suite.py",
+      "status": "recipe",
+      "recipe": "Use family-specific first/last/timed-image/reference profile.",
+      "assertions": [
+        "Reference identity and keyframe alignment metrics; requested conditioning mode active; unsupported combinations rejected."
+      ],
+      "evidence": [
+        "eng/validation/ltx25-generation-suite.py",
+        "eng/validation/minimax-h3-generation.py"
+      ],
+      "requirements": [
+        "Approved reference fixture; LTX Ingredients access for identity mode"
+      ]
+    },
+    {
+      "id": "jev_decision",
+      "entry_point": "eng/jev-extended-smoke.py",
+      "status": "recipe",
+      "recipe": "Run fixed Jev /v1/systemone decisions and attachment probes.",
+      "assertions": [
+        "Expected structured decision probabilities finite/normalized, label order and seeded reproducibility; unsupported media/ASR missing errors explicit."
+      ],
+      "evidence": [
+        "eng/jev-extended-smoke.py",
+        "TensorSharp.TestMatrix/Inputs/jev/decisions.json"
+      ],
+      "requirements": [
+        "Jev fixture; ASR only when testing transcript path"
+      ]
+    },
+    {
+      "id": "speculation",
+      "entry_point": "eng/validation/validate-speculative-rows.py",
+      "status": "recipe",
+      "recipe": "Compare fixed greedy token rows for plain vs matching draft, same model/hash/seed.",
+      "assertions": [
+        "Speculation actually active with acceptance statistics; exact greedy token rows or explicit justified numerical tolerances; drafter mismatch rejected."
+      ],
+      "evidence": [
+        "eng/validation/validate-speculative-rows.py",
+        "eng/qwen4exp-mtp-fixture.py"
+      ],
+      "requirements": [
+        "Matching draft/embedded NextN and supported backend"
+      ]
+    },
+    {
+      "id": "lora",
+      "entry_point": "eng/validation/lora-endpoint-check.py",
+      "status": "recipe",
+      "recipe": "Load approved family LoRA plug-in, compare same seed base/adapted/unloaded output.",
+      "assertions": [
+        "Adapter changes expected target; unload restores baseline; invalid partition/schedule/scale rejected."
+      ],
+      "evidence": [
+        "eng/validation/lora-endpoint-check.py",
+        "InferenceWeb.Tests/QwenImage21LoraConfigTests.cs",
+        "InferenceWeb.Tests/MiniMaxH3LoraConfigTests.cs"
+      ],
+      "requirements": [
+        "Base model plus compatible adapter; explicit license/access"
+      ]
+    },
+    {
+      "id": "multi_gpu",
+      "entry_point": "eng/validation/run-parallel-case.py",
+      "status": "recipe",
+      "recipe": "Use validated per-family TP/layer-split profile and compare fixed histories to one-device reference.",
+      "assertions": [
+        "Requested devices/placement active; identical histories and finite logits within declared tolerances; no silent single-device fallback."
+      ],
+      "evidence": [
+        "eng/validation/run-parallel-case.py",
+        "eng/validation/compare-parallel-logits.py",
+        "InferenceWeb.Tests/TensorParallelSupportGateTests.cs"
+      ],
+      "requirements": [
+        "At least two matching local devices",
+        "Explicit family, transport and memory profile"
+      ]
+    },
+    {
+      "id": "distributed",
+      "entry_point": "eng/validation/run-multinode-case.py",
+      "status": "recipe",
+      "recipe": "Prepare authorized worker/rank profile; run existing distributed quality comparison.",
+      "assertions": [
+        "All ranks join, matching source/model hashes, expected world size, finite fixed-history logits, clean teardown and failure propagation."
+      ],
+      "evidence": [
+        "eng/validation/run-multinode-case.py",
+        "eng/validation/compare-distributed-quality.py",
+        "TensorSharp.Distributed/TensorSharp.Distributed.csproj"
+      ],
+      "requirements": [
+        "Explicit authorized nodes and rank profile; never auto-connect remotely"
+      ]
+    },
+    {
+      "id": "native_ctest",
+      "entry_point": "TensorSharp.GGML.Native/CMakeLists.txt",
+      "status": "recipe",
+      "recipe": "Configure isolated native build with -DTENSORSHARP_GGML_NATIVE_BUILD_TESTS=ON, build, then ctest --test-dir {build} --output-on-failure.",
+      "assertions": [
+        "Native MoE, quantization, attention, cache, scheduler and model-specific numerical assertions pass.",
+        "Preserve unsupported device skips and failed native assertions; record unchanged upstream ggml revision."
+      ],
+      "evidence": [
+        "TensorSharp.GGML.Native/CMakeLists.txt"
+      ],
+      "requirements": [
+        "CMake/toolchain and isolated native build; device-specific tests require hardware"
+      ]
+    },
+    {
+      "id": "client_live",
+      "entry_point": "eng/tests/dotnet-local-chat-e2e.py",
+      "status": "recipe",
+      "recipe": "Run existing HTTP IChatClient end-to-end checks against an owned local server, then native checks on their supported live backend.",
+      "assertions": [
+        "Arithmetic 4 then 12 from maintained chat history, streaming equality and successful cancellation.",
+        "NativeChatCompletion live mode currently hardcodes ggml_metal; other live native client backends remain untested."
+      ],
+      "evidence": [
+        "eng/tests/dotnet-local-chat-e2e.py",
+        "eng/tests/NativeChatCompletion/LiveChecks.cs"
+      ],
+      "requirements": [
+        "Built examples and owned loopback server; native live check requires Apple Silicon; SIGINT subcase POSIX only"
+      ]
+    },
+    {
+      "id": "native_unit",
+      "entry_point": "InferenceWeb.Tests/InferenceWeb.Tests.csproj",
+      "status": "recipe",
+      "recipe": "dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release --logger trx",
+      "assertions": [
+        "Preserve xUnit native/GPU/model skips; numerics and backend gates must not silently return pass.",
+        "Parse passed/failed/skipped counts from TRX; zero executed tests is untested."
+      ],
+      "evidence": [
+        "InferenceWeb.Tests/InferenceWeb.Tests.csproj"
+      ],
+      "requirements": [
+        ".NET 10 SDK and restored packages; built native libraries only for relevant tests"
+      ]
+    },
+    {
+      "id": "server_unit",
+      "entry_point": "InferenceWeb.Tests/InferenceWeb.Tests.csproj",
+      "status": "recipe",
+      "recipe": "dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release --logger trx",
+      "assertions": [
+        "Validate server protocol, request validation, config semantics, cancellation, cache and tool behavior with fixture services.",
+        "Parse passed/failed/skipped counts from TRX; zero executed tests is untested."
+      ],
+      "evidence": [
+        "InferenceWeb.Tests/InferenceWeb.Tests.csproj"
+      ],
+      "requirements": [
+        ".NET 10 SDK and restored packages; built native libraries only for relevant tests"
+      ]
+    },
+    {
+      "id": "client_unit",
+      "entry_point": "InferenceWeb.Tests/InferenceWeb.Tests.csproj",
+      "status": "recipe",
+      "recipe": "dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release --logger trx",
+      "assertions": [
+        "Validate IChatClient examples and native client transport, streaming, cancellation and tool contract fixtures.",
+        "Parse passed/failed/skipped counts from TRX; zero executed tests is untested."
+      ],
+      "evidence": [
+        "InferenceWeb.Tests/InferenceWeb.Tests.csproj"
+      ],
+      "requirements": [
+        ".NET 10 SDK and restored packages; built native libraries only for relevant tests"
+      ]
+    },
+    {
+      "id": "knowledge_unit",
+      "entry_point": "TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj",
+      "status": "recipe",
+      "recipe": "dotnet test TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj -c Release --logger trx",
+      "assertions": [
+        "Validate ingestion, chunking, retrieval and isolation fixture assertions.",
+        "Parse passed/failed/skipped counts from TRX; zero executed tests is untested."
+      ],
+      "evidence": [
+        "TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj"
+      ],
+      "requirements": [
+        ".NET 10 SDK and restored packages; built native libraries only for relevant tests"
+      ]
+    },
+    {
+      "id": "studio_unit",
+      "entry_point": "TensorSharp.Studio.Tests/TensorSharp.Studio.Tests.csproj",
+      "status": "recipe",
+      "recipe": "dotnet test TensorSharp.Studio.Tests/TensorSharp.Studio.Tests.csproj -c Release --logger trx",
+      "assertions": [
+        "Validate studio controller and workflow contracts; these are not desktop visual E2E coverage.",
+        "Parse passed/failed/skipped counts from TRX; zero executed tests is untested."
+      ],
+      "evidence": [
+        "TensorSharp.Studio.Tests/TensorSharp.Studio.Tests.csproj"
+      ],
+      "requirements": [
+        ".NET 10 SDK and restored packages; built native libraries only for relevant tests"
+      ]
+    }
+  ]
+}

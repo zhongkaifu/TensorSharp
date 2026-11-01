@@ -1,0 +1,16 @@
+{
+  // Overlay, used with --config config/qwen3.8-flash-next.json first.
+  // This is a companion preset, not a standalone model. The source/hash
+  // already appear in the base config's optional MTP example.
+  // Supported on GGML backends; direct CUDA and MLX do not support this head.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/qwen3.8-flash-next"
+  },
+  "draft-model": {
+    "path": "${root}/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+    "urls": ["https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"],
+    "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+  },
+  "spec": true
+}

@@ -1,5 +1,12 @@
 # Configuration files
 
+For local regression planning and config coverage, see
+[`docs/local-regression-coverage.md`](../docs/local-regression-coverage.md) and
+the machine-readable [`regression/catalog.json`](regression/catalog.json).
+The catalog records each preset, companion overlay and LoRA plugin separately,
+with backend restrictions and explicit scenario/config gaps. Metadata files in
+`regression/` are for the test runner, not `--config` input to an inference host.
+
 Both `TensorSharp.Cli` and the server, `TensorSharp.Server.Host`, can read their
 startup options from a JSON file passed with `--config`, in addition to the
 command line:
@@ -184,8 +191,9 @@ auto-download to their local `path` on the first run and are reused afterward.
 The MiniMax-H3 config also downloads the tokenizer files (`vocab.json`, `merges.txt`
 and `tokenizer_config.json`) beside the text encoder.
 If you already have a file at that `path`, it is used as-is (no download).
-The experimental LTX 2.5 preset described below includes gated
-official companions; it does not download or start inference.
+The experimental LTX 2.5 preset has ungated required assets and can run inference.
+Its optional Ingredients adapter requires publisher access; missing access must
+be reported separately from the ordinary text/image-to-video path.
 
 | File | Model(s) | Shows |
 |------|----------|-------|

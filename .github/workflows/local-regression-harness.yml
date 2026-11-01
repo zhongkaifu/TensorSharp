@@ -1,0 +1,46 @@
+name: Local regression harness
+
+on:
+  pull_request:
+    paths:
+      - 'eng/regression/**'
+      - 'eng/run-local-regression.py'
+      - 'eng/ForcedLogitProbe/**'
+      - 'config/**'
+      - '.github/workflows/local-regression-harness.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-harness:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Synthetic harness regressions (no models, GPU or external downloads)
+        run: python -m unittest discover -s eng/regression/tests -p "test_*.py" -v
+      - name: Audit every config and coverage declaration
+        run: python eng/run-local-regression.py --mode audit
+      - name: Compile managed probe and verify model-free schedule contracts
+        run: |
+          dotnet build eng/ForcedLogitProbe/ForcedLogitProbe.csproj -c Release -p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true
+          dotnet run --project eng/ForcedLogitProbe/ContractTests/ContractTests.csproj -c Release
+      - name: Plan all source-supported backends without model loading
+        run: python eng/run-local-regression.py --mode plan --backend all
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: local-regression-${{ matrix.os }}
+          path: artifacts/local-regression/**/report.*

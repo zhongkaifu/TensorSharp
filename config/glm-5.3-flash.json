@@ -1,0 +1,61 @@
+{
+  // GLM 5.3 Flash; immutable artifact identities copied from
+  // TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs, entry glm-5.3-flash-q2kxl.
+  // Metadata provenance is not a model/backend quality qualification.
+  // Choose a backend/context only after the local regression resource plan.
+  // Projector is optional for text; image tests must require and verify it.
+  // GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf: 9429984 bytes.
+  // GLM-5.3-Flash-UD-Q2_K_XL-00002-of-00004.gguf: 49294975936 bytes.
+  // GLM-5.3-Flash-UD-Q2_K_XL-00003-of-00004.gguf: 49949266048 bytes.
+  // GLM-5.3-Flash-UD-Q2_K_XL-00004-of-00004.gguf: 9466399584 bytes.
+  // mmproj-BF16.gguf: 1164010176 bytes.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/glm-5.3-flash"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/resolve/a38483c8cd5df544f53d70fb281afe97369d5ab6/UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf"
+    ],
+    "sha256": "2f32eba33ebc75a715e9c85a010faac4c67542e38e8970bd961d544bfe815f9e",
+    "files": [
+      {
+        "path": "${root}/GLM-5.3-Flash-UD-Q2_K_XL-00002-of-00004.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/resolve/a38483c8cd5df544f53d70fb281afe97369d5ab6/UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00002-of-00004.gguf"
+        ],
+        "sha256": "f4a9e1ab13d5d9620f5590c9a4aba4c169e6707a1554f3be3fe3112f80a66825"
+      },
+      {
+        "path": "${root}/GLM-5.3-Flash-UD-Q2_K_XL-00003-of-00004.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/resolve/a38483c8cd5df544f53d70fb281afe97369d5ab6/UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00003-of-00004.gguf"
+        ],
+        "sha256": "330a8ad76c787b3ab6df062dd30abea7aafe6a0e3d5860e8720dfa4abb2434a5"
+      },
+      {
+        "path": "${root}/GLM-5.3-Flash-UD-Q2_K_XL-00004-of-00004.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/resolve/a38483c8cd5df544f53d70fb281afe97369d5ab6/UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00004-of-00004.gguf"
+        ],
+        "sha256": "5c294f42edc5d69cf00a79ab444e61f0742e9933105fc5c85f97da54dab8946f"
+      }
+    ]
+  },
+  "mmproj": {
+    "path": "${root}/mmproj-BF16.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/resolve/a38483c8cd5df544f53d70fb281afe97369d5ab6/mmproj-BF16.gguf"
+    ],
+    "sha256": "82b7adb44411dbb298b1c689567804e5ed0790d80f308ed8b5b6b8ac0527d2ac",
+    "optional": true
+  }
+}

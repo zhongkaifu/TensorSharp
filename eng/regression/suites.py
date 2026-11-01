@@ -1,0 +1,126 @@
+"""Reuse existing correctness suites; building is a separate explicit opt-in."""
+from pathlib import Path
+import re
+import shutil
+import sys
+import xml.etree.ElementTree as ET
+
+from .processes import run_process
+
+
+def list_suites(repo):
+    repo = Path(repo)
+    suites = []
+    for identifier, project in (("server_unit", "InferenceWeb.Tests"),
+                                ("knowledge_unit", "TensorSharp.Knowledge.Tests"),
+                                ("studio_unit", "TensorSharp.Studio.Tests")):
+        suites.append({"id": identifier, "kind": "dotnet", "project": project + "/" + project + ".csproj",
+                       "built": repo / project / "bin/Release/net10.0" / (project + ".dll"),
+                       "filter": "Category!=Bench&Requires!=Models&Requires!=Cuda&Requires!=Mlx",
+                       "assertions": ["TRX contains executed passed tests", "zero failed tests", "skipped tests disclosed separately"],
+                       "scope": "Environment-independent correctness only; not native GPU/model/performance coverage"})
+    suites.append({"id": "client_native_contract", "kind": "client_native",
+                   "built": repo / "eng/tests/NativeChatCompletion/bin/Release/net10.0/NativeChatCompletion.dll",
+                   "example": repo / "examples/tensorsharp-native-chat/bin/Release/net10.0/TensorSharp.NativeChat.dll",
+                   "assertions": ["all seven completion-boundary checks", "adapter contracts execute"]})
+    suites.append({"id": "client_http_contract", "kind": "client_http",
+                   "built": repo / "examples/dotnet-local-chat/bin/Release/net10.0/TensorSharp.LocalChat.dll",
+                   "assertions": ["mock HTTP integration assertions execute", "zero FAIL records"]})
+    return suites
+
+
+def trx_counts(path):
+    root = ET.parse(path).getroot()
+    counters = root.find(".//{*}Counters")
+    if counters is None:
+        raise ValueError("TRX contains no test counters")
+    counts = {key: int(counters.attrib.get(key, "0")) for key in ("total", "executed", "passed", "failed", "error", "timeout", "notExecuted", "aborted", "inconclusive", "notRunnable")}
+    if any(v < 0 for v in counts.values()) or counts["executed"] <= 0 or counts["passed"] <= 0 or not counts["total"] >= counts["executed"] >= counts["passed"]:
+        raise ValueError("suite did not execute any passing tests or counters are inconsistent")
+    if counts["failed"] + counts["error"] + counts["timeout"] + counts["aborted"]:
+        raise ValueError("TRX reports failure/error/timeout/aborted tests")
+    if counts["executed"] != counts["passed"] + counts["inconclusive"]:
+        raise ValueError("TRX executed count includes unexplained nonpassing tests")
+    counts["unqualified"] = counts["total"] - counts["passed"]
+    return counts
+
+
+def run_suites(repo, output, mode, allow_builds, timeout_seconds):
+    repo, output = Path(repo), Path(output)
+    results, dotnet = [], shutil.which("dotnet")
+    for spec in list_suites(repo):
+        result = {"id": spec["id"], "scope": spec.get("scope", "client contracts without model execution"),
+                  "assertions": spec["assertions"], "status": "untested", "reason": "planned; suite not executed"}
+        if mode != "run":
+            results.append(result)
+            continue
+        if not dotnet:
+            result.update(status="skip", reason=".NET SDK/runtime unavailable")
+            results.append(result)
+            continue
+        target = output / spec["id"]
+        target.mkdir(parents=True, exist_ok=True)
+        commands = []
+        if spec["kind"] == "dotnet":
+            if not allow_builds and not spec["built"].is_file():
+                result.update(status="skip", reason="test assembly not built; build explicitly or use --allow-builds")
+                results.append(result)
+                continue
+            command = [dotnet, "test", str(repo / spec["project"]), "-c", "Release", "--filter", spec["filter"],
+                       "--logger", "trx;LogFileName=tests.trx", "--results-directory", str(target)]
+            if not allow_builds:
+                command += ["--no-build", "--no-restore"]
+            commands.append(command)
+        else:
+            if spec["kind"] == "client_native":
+                if allow_builds:
+                    commands.append([dotnet, "build", "eng/tests/NativeChatCompletion", "-c", "Release", "-p:TensorSharpSkipGgmlNative=true", "-p:TensorSharpSkipMlxNative=true"])
+                elif not spec["built"].is_file() or not spec["example"].is_file():
+                    result.update(status="skip", reason="native client contract assemblies not built; see documented recipe")
+                    results.append(result)
+                    continue
+                commands.append([dotnet, str(spec["built"]), str(spec["example"])])
+            else:
+                if allow_builds:
+                    commands += [[dotnet, "restore", "examples/dotnet-local-chat", "--locked-mode", "--configfile", "examples/dotnet-local-chat/NuGet.Config"],
+                                 [dotnet, "build", "examples/dotnet-local-chat", "-c", "Release", "--no-restore"]]
+                elif not spec["built"].is_file():
+                    result.update(status="skip", reason="HTTP example assembly not built; see documented recipe")
+                    results.append(result)
+                    continue
+                commands += [[sys.executable, str(repo / "eng/tests/dotnet-local-chat.py")],
+                             [sys.executable, str(repo / "eng/tests/dotnet-local-chat-e2e.py"), "--self-test"]]
+        result["processes"] = []
+        try:
+            for index, command in enumerate(commands):
+                process = run_process(command, cwd=repo, artifact_dir=target, stage=f"step-{index}",
+                                      timeout_seconds=timeout_seconds,
+                                      env={"TENSORSHARP_GGML_NATIVE_ENABLE_CUDA": "OFF", "TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN": "OFF",
+                                           "TENSORSHARP_CUDNN": "OFF", "TS_TEST_GGML_BACKEND": "cpu"})
+                result["processes"].append(process)
+                if process["exit_code"] != 0 or process.get("timed_out"):
+                    raise ValueError(f"suite process failed or timed out at step {index}; see sanitized logs")
+                is_assertion_command = spec["kind"] != "dotnet" and not (len(command) > 1 and command[0] == dotnet and command[1] in {"build", "restore"})
+                if is_assertion_command:
+                    content = process.get("stdout", "") + process.get("stderr", "")
+                    if "FAIL " in content or not re.search(r"\bPASS\b|\bchecks passed\b", content):
+                        raise ValueError(f"client test step {index} emitted failure or no assertion evidence")
+            if spec["kind"] == "dotnet":
+                counts = trx_counts(target / "tests.trx")
+                result["counts"] = counts
+                if counts["failed"] + counts["error"] + counts["timeout"]:
+                    raise ValueError("TRX reports failed/error/timeout tests")
+                if counts["unqualified"]:
+                    results.append({"id": spec["id"] + "::not-executed", "status": "skip",
+                                    "reason": f"{counts['unqualified']} test(s) unexecuted or inconclusive; see TRX"})
+            else:
+                content = "\n".join(p.get("stdout", "") + p.get("stderr", "") for p in result["processes"])
+                if "FAIL " in content or not re.search(r"\bPASS\b|\bchecks passed\b", content):
+                    raise ValueError("client suite emitted failure or no assertion evidence")
+                if spec["kind"] == "client_native" and "7 completion boundary checks passed" not in content:
+                    raise ValueError("completion boundary checks did not complete")
+            result.update(status="pass", reason="existing suite assertions passed; detailed counts/scope retained")
+        except (OSError, ValueError, ET.ParseError) as error:
+            result.update(status="fail", reason=str(error))
+        results.append(result)
+    return results

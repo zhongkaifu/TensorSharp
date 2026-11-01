@@ -1,0 +1,101 @@
+{
+  // DeepSeek V4.1 Flash; immutable artifact identities copied from
+  // TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs, entry deepseek-v4.1-flash-engramq5-q2k.
+  // Metadata provenance is not a model/backend quality qualification.
+  // Choose a backend/context only after the local regression resource plan.
+  // Text-only: no converted vision companion is included in this catalog entry.
+  // ggml_cuda is the serving backend; cpu/ggml_cpu/cuda are correctness paths.
+  // DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf: 31006920384 bytes.
+  // DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00002-of-00010.gguf: 31461213696 bytes.
+  // DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00003-of-00010.gguf: 31001150976 bytes.
+  // DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00004-of-00010.gguf: 31001150976 bytes.
+  // DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00005-of-00010.gguf: 31461213696 bytes.
+  // DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00006-of-00010.gguf: 31001150976 bytes.
+  // DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00007-of-00010.gguf: 9838264896 bytes.
+  // DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00008-of-00010.gguf: 67585085760 bytes.
+  // DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00009-of-00010.gguf: 67586936224 bytes.
+  // DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00010-of-00010.gguf: 3438927040 bytes.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/deepseek-v4.1-flash"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf",
+    "urls": [
+      "https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/resolve/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00001-of-00010.gguf"
+    ],
+    "sha256": "8126b49dfcfde02cb3db24b6f98d56b031f0a34eaca2509fc7b2b9d362cf0ac8",
+    "files": [
+      {
+        "path": "${root}/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00002-of-00010.gguf",
+        "urls": [
+          "https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/resolve/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00002-of-00010.gguf"
+        ],
+        "sha256": "22bb293aee509a348ce32a739e006fa41f2348c6bcfafa3be76a3ee079eadf96"
+      },
+      {
+        "path": "${root}/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00003-of-00010.gguf",
+        "urls": [
+          "https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/resolve/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00003-of-00010.gguf"
+        ],
+        "sha256": "db894848b4f14d42c39e18faa907c737cd4850f2fcb9deff9d5ebd86f580aaf7"
+      },
+      {
+        "path": "${root}/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00004-of-00010.gguf",
+        "urls": [
+          "https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/resolve/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00004-of-00010.gguf"
+        ],
+        "sha256": "655a3400f2c092d6e3c11b8b18bf319b29563e59b960337115266574321953e3"
+      },
+      {
+        "path": "${root}/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00005-of-00010.gguf",
+        "urls": [
+          "https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/resolve/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00005-of-00010.gguf"
+        ],
+        "sha256": "4b9378c6819d1130517e8719026b34e5257f1f73bd1d50cf6f30243982100bac"
+      },
+      {
+        "path": "${root}/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00006-of-00010.gguf",
+        "urls": [
+          "https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/resolve/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00006-of-00010.gguf"
+        ],
+        "sha256": "04f161084d82032c65247c02e6169784a757be7db9e068b0baba6833125b6bb8"
+      },
+      {
+        "path": "${root}/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00007-of-00010.gguf",
+        "urls": [
+          "https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/resolve/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00007-of-00010.gguf"
+        ],
+        "sha256": "b1b1bf3cfbbc7388ce49b5ced69c42a13c7c5c5d3d609ac86902897a08d3c88a"
+      },
+      {
+        "path": "${root}/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00008-of-00010.gguf",
+        "urls": [
+          "https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/resolve/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00008-of-00010.gguf"
+        ],
+        "sha256": "fae7f35123ae3557034a541507bb9fc24fb62c2e16ff8441c32e8e0477743d5d"
+      },
+      {
+        "path": "${root}/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00009-of-00010.gguf",
+        "urls": [
+          "https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/resolve/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00009-of-00010.gguf"
+        ],
+        "sha256": "781fd69e9dd17c09676865830523a2d077a97544d6a004429aab95d2570f8534"
+      },
+      {
+        "path": "${root}/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00010-of-00010.gguf",
+        "urls": [
+          "https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/resolve/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5/DeepSeek-V4.1-Flash-EngramQ5-Q2_K-00010-of-00010.gguf"
+        ],
+        "sha256": "fa5affb1f971cd6e7effad5684b73780472b486a46330cd7c5776f87c38fea97"
+      }
+    ]
+  }
+}

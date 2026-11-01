@@ -8,6 +8,7 @@
     <TensorSharpSkipMlxNative>true</TensorSharpSkipMlxNative>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="ContractTests/**/*.cs" />
     <ProjectReference Include="../../TensorSharp.Models/TensorSharp.Models.csproj" />
   </ItemGroup>
 </Project>

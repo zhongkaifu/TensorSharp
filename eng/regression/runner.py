@@ -1,0 +1,519 @@
+"""Sequential orchestration; planning never loads models or downloads payloads."""
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, is_dataclass, replace
+from datetime import datetime, timezone
+import fnmatch
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import time
+import uuid
+
+from .audit import audit_catalog
+from .configs import read_config
+from .downloads import DownloadPolicy, PrepareError, prepare_files
+from .hardware import detect_hardware, plan_resources
+from .reports import aggregate_exit, atomic_json, file_hash, runtime_identity, sanitize, source_identity, write_reports
+from .scenarios import availability, run_scenario
+
+GIB = 1024 ** 3
+SAFE_OPTIONS = {"model", "mmproj", "draft-model", "tokenizer", "kv-cache-dtype", "embedding-threads",
+                "embeddings", "model-type", "qwen-image-variant", "qwen-image-vae", "qwen-image-vl",
+                "qwen-image-mmproj", "video-dit2", "video-vae", "video-text-encoder", "audio-vae",
+                "video-frames", "video-fps", "spec"}
+MEDIA_SCENARIOS = {"cli_image", "cli_audio", "cli_video"}
+
+
+def plain(value):
+    if is_dataclass(value):
+        return plain(asdict(value))
+    if isinstance(value, dict):
+        return {k: plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [plain(v) for v in value]
+    return str(value) if isinstance(value, Path) else value
+
+
+def command_for(path):
+    if not path:
+        return None
+    path = Path(path).resolve()
+    if not path.is_file():
+        return None
+    if path.suffix.lower() == ".dll":
+        dotnet = shutil.which("dotnet")
+        return [dotnet, str(path)] if dotnet else None
+    return [str(path)]
+
+
+def find_binary(repo, explicit, project, name):
+    if explicit:
+        return command_for(explicit)
+    for folder in (repo / project / "bin", repo / project / "bin" / "Release" / "net10.0"):
+        for extension in ((".exe", ".dll") if os.name == "nt" else ("", ".dll")):
+            found = command_for(folder / (name + extension))
+            if found:
+                return found
+    return None
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("audit", "plan", "run"), default="plan")
+    parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--catalog", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--models", default="*", help="Comma-separated preset ID glob patterns")
+    parser.add_argument("--scenarios", default="*", help="Comma-separated scenario ID glob patterns")
+    parser.add_argument("--backend", default="auto", help="auto, all, or comma-separated exact backend IDs")
+    parser.add_argument("--model-root", type=Path, default=None)
+    parser.add_argument("--existing-root", action="append", type=Path, default=[], help="Search existing weights by unique filename; never write/delete here")
+    parser.add_argument("--cli", type=Path)
+    parser.add_argument("--server", type=Path)
+    parser.add_argument("--logit-probe", type=Path)
+    parser.add_argument("--runtime-dir", action="append", type=Path, default=[], help="Additional native runtime/build metadata directories")
+    parser.add_argument("--media-dir", type=Path)
+    parser.add_argument("--allow-download", action="store_true")
+    parser.add_argument("--probe-network", action="store_true", help="Resolve missing file sizes by HEAD; plan still downloads no payloads")
+    parser.add_argument("--max-download-gib", type=float, default=20)
+    parser.add_argument("--disk-headroom-gib", type=float, default=5)
+    parser.add_argument("--ram-budget-gib", type=float)
+    parser.add_argument("--vram-budget-gib", type=float)
+    parser.add_argument("--ram-required-gib", type=float)
+    parser.add_argument("--vram-required-gib", type=float)
+    parser.add_argument("--gpu-index", type=int, default=0)
+    parser.add_argument("--assume-backend-available", action="store_true", help="Override detection only; actual runtime backend still must match")
+    parser.add_argument("--max-models", type=int, default=0, help="0 means no count limit; download budget always applies")
+    parser.add_argument("--timeout-seconds", type=float, default=600)
+    parser.add_argument("--strict", action="store_true", help="Exit 3 for any selected skip/untested coverage")
+    parser.add_argument("--include-suites", action="store_true", help="Include existing local .NET and client correctness suites")
+    parser.add_argument("--allow-builds", action="store_true", help="Allow local managed/native builds required by existing suites; opt-in")
+    args = parser.parse_args(argv)
+    from .hardware import BACKENDS
+    if args.backend not in {"auto", "all"} and any(b not in BACKENDS for b in args.backend.split(",")):
+        parser.error("--backend contains an unknown backend ID")
+    for key in ("max_download_gib", "disk_headroom_gib", "ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib", "timeout_seconds"):
+        value = getattr(args, key)
+        if value is not None and (not 0 <= value < float("inf") or (key == "timeout_seconds" and value == 0)):
+            parser.error(f"--{key.replace('_', '-')} must be finite and nonnegative")
+    if args.max_models < 0 or args.gpu_index < 0:
+        parser.error("--max-models and --gpu-index must be nonnegative")
+    for key in ("ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib"):
+        if getattr(args, key) == 0:
+            parser.error(f"--{key.replace('_', '-')} must be positive")
+    return args
+
+
+def selected(identifier, patterns):
+    return any(fnmatch.fnmatchcase(identifier, pattern.strip()) for pattern in patterns.split(",") if pattern.strip())
+
+
+def select_backends(requested, supported, hardware):
+    if requested == "all":
+        return list(supported)
+    if requested != "auto":
+        return requested.split(",")
+    candidates = [backend for backend in ("ggml_cuda", "cuda", "ggml_metal", "mlx", "ggml_vulkan", "ggml_cpu", "cpu")
+                  if backend in supported and hardware.get("backends", {}).get(backend, {}).get("available")]
+    # Auto chooses one available backend, and records the choice. Explicit requests never fall back.
+    return candidates[:1] or list(supported[:1])
+
+
+def existing_index(roots):
+    index = {}
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in {".gguf", ".safetensors", ".json", ".txt"}:
+                index.setdefault(path.name, []).append(path.resolve())
+    return index
+
+
+def use_existing(resolved, index):
+    replacements, files = {}, []
+    for spec in resolved.files:
+        candidates = index.get(spec.path.name, [])
+        if not spec.path.exists() and len(candidates) == 1:
+            replacements[str(spec.path)] = str(candidates[0])
+            spec = replace(spec, path=candidates[0])
+        files.append(spec)
+    options = {key: replacements.get(value, value) if isinstance(value, str) else value
+               for key, value in resolved.options.items()}
+    # Split models must remain co-located, including the primary shard.
+    groups = {}
+    for spec in files:
+        if "-of-" in spec.path.name and spec.path.suffix == ".gguf":
+            groups.setdefault(spec.option, set()).add(spec.path.parent)
+    if any(len(parents) != 1 for parents in groups.values()):
+        raise ValueError("split model shards resolved to different directories")
+    return options, files
+
+
+def effective_options(options, scenario_ids, backend):
+    result = {key: value for key, value in options.items() if key in SAFE_OPTIONS}
+    if not any(s in MEDIA_SCENARIOS for s in scenario_ids):
+        result.pop("mmproj", None)
+    # Drafting is an independent coverage recipe, never silently enabled by a text test.
+    if not any("spec" in s or "mtp" in s for s in scenario_ids):
+        result.pop("draft-model", None)
+        result.pop("spec", None)
+    return result
+
+
+def model_files(files, options):
+    return [spec for spec in files if spec.option in options]
+
+
+def required_scenario_files(files, scenarios):
+    # A projector optional for text becomes mandatory when a selected fixture
+    # actually exercises media. Its full memory/download cost must be planned.
+    needs_media = any(s["id"] in MEDIA_SCENARIOS for s in scenarios)
+    return [replace(spec, optional=False) if needs_media and spec.option == "mmproj" else spec for spec in files]
+
+
+def catalog_file_sizes(files, preset):
+    sizes = preset.get("file_sizes", {})
+    return [replace(spec, size_bytes=sizes[spec.path.name])
+            if spec.size_bytes is None and spec.path.name in sizes else spec for spec in files]
+
+
+def preset_budgets(preset, overrides):
+    declared = preset.get("resource_requirements", {})
+    values = {}
+    for source, target in (("ram_gib", "ram_required_gib"), ("vram_gib", "vram_required_gib")):
+        if source in declared:
+            values[target] = declared[source]
+    if "scratch_gib" in declared:
+        values["scratch_bytes"] = int(declared["scratch_gib"] * GIB)
+    return {**values, **overrides}
+
+
+def sizes_for(files, policy, network=False):
+    sizes, missing = [], 0
+    for spec in files:
+        size = spec.path.stat().st_size if spec.path.is_file() else getattr(spec, "size_bytes", None)
+        if size is None and network:
+            from .downloads import probe_files
+            probes = probe_files([spec], policy, network=True)
+            first = probes[0]
+            if isinstance(first, dict) and first.get("status") == "blocked":
+                failure = first.get("reason") or {}
+                raise PrepareError(failure.get("stage", "probe"), failure.get("code", "probe_failed"), spec.path,
+                                   failure.get("message", "Model metadata probe failed"))
+            size = first.get("size_bytes") if isinstance(first, dict) else getattr(first, "size_bytes", None)
+        if size is None or size <= 0:
+            return None, None
+        sizes.append(size)
+        if not spec.path.is_file():
+            missing += size
+    return sum(sizes), missing
+
+
+def result_stub(preset, backend, scenario, status, reason, **details):
+    return {"id": f"{preset['id']}::{backend}::{scenario['id']}", "preset": preset["id"],
+            "family": preset.get("family"), "backend": backend, "scenario": scenario["id"],
+            "status": status, "reason": reason, **details}
+
+
+def reproduce_args(args, repo, root, preset, backend, scenario):
+    command = [sys.executable, str(repo / "eng/run-local-regression.py"), "--mode", "run",
+               "--models", preset["id"], "--backend", backend, "--scenarios", scenario["id"], "--model-root", str(root)]
+    for key in ("cli", "server", "logit_probe", "media_dir", "ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib", "gpu_index", "disk_headroom_gib", "max_download_gib", "timeout_seconds", "catalog"):
+        value = getattr(args, key)
+        if value is not None:
+            command += ["--" + key.replace("_", "-"), str(value)]
+    for key in ("existing_root", "runtime_dir"):
+        for value in getattr(args, key):
+            command += ["--" + key.replace("_", "-"), str(value)]
+    for key in ("assume_backend_available", "allow_download", "probe_network"):
+        if getattr(args, key):
+            command.append("--" + key.replace("_", "-"))
+    return command
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    repo = args.repo.resolve()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    output = (args.output or repo / "artifacts" / "local-regression" / run_id).resolve()
+    if output.exists() and any(output.iterdir()):
+        print("Output must be empty: each run has independent evidence and cannot reuse stale passes.", file=sys.stderr)
+        return 2
+    output.mkdir(parents=True, exist_ok=True)
+    report = {"schema_version": 1, "run_id": run_id, "mode": args.mode,
+              "started_utc": datetime.now(timezone.utc).isoformat(), "source": source_identity(repo),
+              "invocation": sanitize([sys.executable, str(repo / "eng/run-local-regression.py"), *(argv if argv is not None else sys.argv[1:])]),
+              "results": [], "limitations": [
+                  "Only this local OS and selected backend can be tested; other platforms are unrun.",
+                  "Availability detection is not backend coverage. Runtime cases require positive backend identity.",
+                  "Memory estimates reserve workspace/KV headroom and assume full-resident weights; no automatic partial offload.",
+                  "Generation correctness checks use deterministic task fixtures, not a comprehensive language quality benchmark.",
+                  "Recipe-only features need the documented fixtures/hardware and remain untested in this entry point.",
+                  "Model payloads are never downloaded in audit/plan modes. No model files are deleted or published."]}
+    cancelled = False
+    try:
+        catalog_path = args.catalog or repo / "config/regression/catalog.json"
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        report["catalog"] = {"path": str(catalog_path), "sha256": file_hash(catalog_path)}
+        audit = audit_catalog(repo, catalog)
+        report["audit"] = audit
+        report["results"].append({"id": "config-coverage-audit", "status": audit["status"],
+                                  "reason": "; ".join(audit["errors"]) or f"Inventoried {audit['config_count']} configs and {audit['scenario_count']} scenarios"})
+        if audit["status"] == "fail":
+            report["exit_code"] = 2
+            write_reports(output, report)
+            print(f"Config audit failed. See {output / 'report.md'}")
+            return 2
+        cli = find_binary(repo, args.cli, "TensorSharp.Cli", "TensorSharp.Cli")
+        server = find_binary(repo, args.server, "TensorSharp.Server.Host", "TensorSharp.Server.Host")
+        logit = find_binary(repo, args.logit_probe, "eng/ForcedLogitProbe", "ForcedLogitProbe")
+        commands = {"cli_command": cli, "server_command": server, "logit_command": logit}
+        runtime_dirs = sorted({str(Path(command[-1]).parent) for command in commands.values() if command} | {str(p.resolve()) for p in args.runtime_dir})
+        root = (args.model_root or Path(os.environ.get("TENSORSHARP_MODELS", str(repo / "models")))).resolve()
+        hardware = detect_hardware(root, runtime_dirs=runtime_dirs)
+        report["hardware"] = hardware
+        if args.mode == "run":
+            report["runtime_assets"] = runtime_identity(hardware)
+        report["binaries"] = {key: {"command": command, "sha256": file_hash(command[-1])}
+                              if command else None for key, command in commands.items()}
+        if args.mode == "audit":
+            report["exit_code"] = aggregate_exit(report["results"], strict=args.strict)
+            write_reports(output, report)
+            print(f"Audit complete: {output / 'report.md'}")
+            return report["exit_code"]
+        policy = DownloadPolicy(cache_root=root, max_download_bytes=int(args.max_download_gib * GIB),
+                                disk_headroom_bytes=int(args.disk_headroom_gib * GIB),
+                                allow_download=args.allow_download and args.mode == "run", token=os.environ.get("HF_TOKEN"))
+        index = existing_index(args.existing_root)
+        scenarios = {s["id"]: s for s in catalog["scenarios"]}
+        overrides = {key: getattr(args, key) for key in ("ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib", "gpu_index", "disk_headroom_gib", "assume_backend_available")
+                     if getattr(args, key) is not None}
+        report["policy"] = {"model_root": str(root), "max_download_bytes": int(args.max_download_gib * GIB),
+                            "requested_backend": args.backend, "overrides": overrides, "allow_download": args.allow_download,
+                            "offload": "full-resident conservative estimate; no automatic paging/offload", "sampling": {"seed": 42, "temperature": 0}}
+        presets = [p for p in catalog["presets"] if selected(p["id"], args.models)]
+        if not presets:
+            raise ValueError("model selector matched no catalog presets")
+        download_reserved, executed_models = 0, set()
+        for preset in presets:
+            model_overrides = preset_budgets(preset, overrides)
+            case_defs = [scenarios[s] for s in preset.get("scenarios", []) if selected(s, args.scenarios)]
+            if not case_defs:
+                continue
+            backends = select_backends(args.backend, preset.get("backends", []), hardware) or ["none"]
+            if args.backend == "auto" and preset.get("status") != "unsupported" and any(s.get("status") == "automated" for s in case_defs):
+                # Evaluate resource fit before choosing an automatic backend. This is
+                # a recorded planning decision, never a runtime fallback.
+                preliminary_files = []
+                prerequisite_failures = {}
+                try:
+                    preliminary = read_config(repo / preset["config"], root)
+                    if not preliminary.unavailable:
+                        preliminary_options, preliminary_files = use_existing(preliminary, index)
+                        preliminary_context = {"repo": repo, "backend": backends[0], "preparing_model": True,
+                            "model_options": preliminary_options, "model_path": preliminary_options.get("model"),
+                            "media_dir": args.media_dir, **commands}
+                        preliminary_cases = []
+                        for scenario in case_defs:
+                            if scenario.get("status") != "automated":
+                                continue
+                            ready, why = availability(scenario, preliminary_context)
+                            if ready:
+                                preliminary_cases.append(scenario)
+                            else:
+                                prerequisite_failures[scenario["id"]] = why
+                        preliminary_options = effective_options(preliminary_options, [s["id"] for s in preliminary_cases], backends[0])
+                        preliminary_files = catalog_file_sizes(model_files(preliminary_files, preliminary_options), preset)
+                        preliminary_files = required_scenario_files(preliminary_files, preliminary_cases)
+                        total, missing = sizes_for(preliminary_files, policy, network=args.probe_network or (args.mode == "run" and args.allow_download)) if preliminary_cases else (None, None)
+                        candidates = [b for b in ("ggml_cuda", "cuda", "ggml_metal", "mlx", "ggml_vulkan", "ggml_cpu", "cpu") if b in preset.get("backends", [])]
+                        attempts = [{"backend": b, **plan_resources(total, b, hardware, overrides={**model_overrides, "download_bytes": missing or 0})} for b in candidates]
+                        eligible = [attempt["backend"] for attempt in attempts if attempt["eligible"]]
+                        if eligible:
+                            backends = eligible[:1]
+                        report.setdefault("backend_selections", []).append({"preset": preset["id"], "requested": "auto", "selected": backends[0], "attempts": attempts})
+                except (ValueError, OSError, RuntimeError) as error:
+                    # A single bad source or preset must not prevent all other
+                    # selected models from being planned/tested. Do not retry it
+                    # for each backend or turn untouched recipes into failures.
+                    details = error.as_dict() if isinstance(error, PrepareError) else {
+                        "stage": "planning", "code": "planning_error", "path": str(repo / preset["config"]), "message": str(error)}
+                    report.setdefault("backend_selections", []).append({"preset": preset["id"], "requested": "auto",
+                        "selected": None, "error": details})
+                    for scenario in case_defs:
+                        capability = scenario.get("status")
+                        if capability == "unsupported":
+                            status, reason = "unsupported", scenario.get("reason", "Implementation unavailable")
+                        elif capability != "automated":
+                            status, reason = "untested", "Supported recipe needs a dedicated fixture/adapter: " + str(scenario.get("recipe", "see coverage catalog"))
+                        elif scenario["id"] in prerequisite_failures:
+                            status, reason = "skip", prerequisite_failures[scenario["id"]]
+                        else:
+                            status, reason = "fail", str(error)
+                        report["results"].append(result_stub(preset, "auto", scenario, status, reason,
+                            stage=details["stage"], error_code=details["code"], error=details,
+                            required_files=[plain(spec) for spec in preliminary_files],
+                            reproduce=reproduce_args(args, repo, root, preset, "auto", scenario)))
+                    write_reports(output, report, bundle=False)
+                    continue
+            for backend in backends:
+                base_context = {"repo": repo, "backend": backend, "artifact_dir": output,
+                                "timeout_seconds": args.timeout_seconds, "media_dir": args.media_dir,
+                                "disk_headroom_gib": args.disk_headroom_gib,
+                                "seed": 42, "env": {"CUDA_VISIBLE_DEVICES": str(args.gpu_index)} if backend in {"cuda", "ggml_cuda"} else {}, **commands}
+                candidates = []
+                for scenario in case_defs:
+                    if scenario.get("status") == "unsupported" or preset.get("kind") == "unsupported" or preset.get("status") == "unsupported":
+                        status, reason = "unsupported", preset.get("reason") or scenario.get("reason", "Implementation unavailable")
+                    elif backend not in preset.get("backends", []):
+                        status, reason = "unsupported", f"{backend} is outside this preset's source-supported backend matrix"
+                    elif scenario.get("status") != "automated":
+                        status, reason = "untested", "Supported recipe needs a dedicated fixture/adapter: " + str(scenario.get("recipe", "see coverage catalog"))
+                    else:
+                        candidates.append(scenario)
+                        continue
+                    report["results"].append(result_stub(preset, backend, scenario, status, reason))
+                if not candidates:
+                    continue
+                files, config_path, resources = [], None, None
+                try:
+                    resolved = read_config(repo / preset["config"], root)
+                    if resolved.unavailable:
+                        for scenario in candidates:
+                            report["results"].append(result_stub(preset, backend, scenario, "unsupported", resolved.unavailable))
+                        continue
+                    options, files = use_existing(resolved, index)
+                    # Resolve fixture/binary prerequisites before choosing files.
+                    # Missing image/audio/video fixtures must not fetch a projector
+                    # or prevent otherwise eligible text tests from running.
+                    prerequisite_context = {**base_context, "preparing_model": True,
+                        "model_path": options.get("model"), "model_options": options}
+                    available_candidates = []
+                    for scenario in candidates:
+                        ready, why = availability(scenario, prerequisite_context)
+                        if ready:
+                            available_candidates.append(scenario)
+                        else:
+                            report["results"].append(result_stub(preset, backend, scenario, "skip", why,
+                                reproduce=reproduce_args(args, repo, root, preset, backend, scenario)))
+                    candidates = available_candidates
+                    if not candidates:
+                        continue
+                    options = effective_options(options, [s["id"] for s in candidates], backend)
+                    files = catalog_file_sizes(model_files(files, options), preset)
+                    files = required_scenario_files(files, candidates)
+                    if not files:
+                        raise ValueError("preset has no verifiable model files")
+                    model_dir = output / "cases" / f"{preset['id']}--{backend}"
+                    model_dir.mkdir(parents=True, exist_ok=True)
+                    config_path = model_dir / "effective-config.json"
+                    atomic_json(config_path, options)
+                    context = {**base_context, "config_path": config_path, "effective_config_path": config_path,
+                               "model_path": options.get("model"), "model_options": options}
+                    weight_bytes, missing_bytes = sizes_for(files, policy, network=args.probe_network or (args.mode == "run" and args.allow_download))
+                    if args.mode == "run":
+                        hardware = detect_hardware(root, runtime_dirs=runtime_dirs)
+                    resources = plan_resources(weight_bytes, backend, hardware,
+                                               overrides={**model_overrides, "download_bytes": missing_bytes or 0})
+                    reason = None
+                    if args.max_models and preset["id"] not in executed_models and len(executed_models) >= args.max_models:
+                        reason = "selected model count limit reached"
+                    elif not resources.get("eligible"):
+                        reason = resources.get("reason", "resource budget unknown or exceeded")
+                    elif missing_bytes and not args.allow_download:
+                        reason = "weights missing; --allow-download is disabled"
+                    elif missing_bytes and download_reserved + missing_bytes > args.max_download_gib * GIB:
+                        reason = "remaining whole-run download budget insufficient"
+                    runnable = []
+                    for scenario in candidates:
+                        ok, available_reason = availability(scenario, {**context, "preparing_model": True})
+                        why = reason or (None if ok else available_reason)
+                        if why or args.mode != "run":
+                            report["results"].append(result_stub(preset, backend, scenario, "skip" if why else "untested",
+                                why or "planned; model payloads and tests were not executed", resource_plan=resources,
+                                inputs=scenario.get("fixture"), required_files=[plain(spec) for spec in files]))
+                        else:
+                            runnable.append(scenario)
+                    if not runnable:
+                        continue
+                    # Reserve across models before starting; no concurrent downloads or GPU tests.
+                    download_reserved += missing_bytes or 0
+                    executed_models.add(preset["id"])
+                    print(f"Preparing {preset['id']} / {backend}", flush=True)
+                    identities = prepare_files(files, policy)
+                    atomic_json(model_dir / "model-identity.json", plain(identities))
+                    skipped_files = {item["path"]: item for item in plain(identities) if item.get("status") == "optional-skipped"}
+                    dropped_options = {key for key, value in options.items() if isinstance(value, str) and value in skipped_files}
+                    if dropped_options:
+                        options = {key: value for key, value in options.items() if key not in dropped_options}
+                        atomic_json(config_path, options)
+                        context = {**context, "model_path": options.get("model"), "model_options": options}
+                    for scenario in runnable:
+                        dependencies = {"model"}
+                        if scenario["id"] in MEDIA_SCENARIOS:
+                            dependencies.add("mmproj")
+                        if "spec" in scenario["id"] or "mtp" in scenario["id"]:
+                            dependencies.add("draft-model")
+                        missing_dependencies = dependencies & dropped_options
+                        if missing_dependencies:
+                            report["results"].append(result_stub(preset, backend, scenario, "skip",
+                                "Selected scenario companion unavailable after preparation: " + ", ".join(sorted(missing_dependencies)),
+                                optional_companions=list(skipped_files.values()), model_identity=plain(identities),
+                                resource_plan=resources, reproduce=reproduce_args(args, repo, root, preset, backend, scenario)))
+                            continue
+                        case_context = {**context, "artifact_dir": model_dir / scenario["id"]}
+                        print(f"Running {preset['id']} / {backend} / {scenario['id']}", flush=True)
+                        start = time.monotonic()
+                        outcome = run_scenario(scenario, case_context)
+                        outcome.pop("id", None)
+                        result = result_stub(preset, backend, scenario, outcome.pop("status"), outcome.pop("reason", ""),
+                                             **outcome)
+                        result["resource_plan"] = resources
+                        result["model_identity"] = plain(identities)
+                        result["duration_seconds"] = time.monotonic() - start
+                        result["reproduce"] = reproduce_args(args, repo, root, preset, backend, scenario)
+                        report["results"].append(result)
+                        write_reports(output, report, bundle=False)
+                except PrepareError as error:
+                    for scenario in candidates:
+                        if not any(r["id"] == f"{preset['id']}::{backend}::{scenario['id']}" for r in report["results"]):
+                            report["results"].append(result_stub(preset, backend, scenario, "fail", str(error), stage=error.stage, error_code=error.code,
+                                error=error.as_dict(), required_files=[plain(spec) for spec in files], effective_config=config_path,
+                                resource_plan=resources, reproduce=reproduce_args(args, repo, root, preset, backend, scenario)))
+                except (ValueError, OSError, RuntimeError) as error:
+                    for scenario in candidates:
+                        if not any(r["id"] == f"{preset['id']}::{backend}::{scenario['id']}" for r in report["results"]):
+                            report["results"].append(result_stub(preset, backend, scenario, "fail", str(error), stage="orchestration",
+                                required_files=[plain(spec) for spec in files], effective_config=config_path,
+                                resource_plan=resources, reproduce=reproduce_args(args, repo, root, preset, backend, scenario)))
+                write_reports(output, report, bundle=False)
+        if args.include_suites:
+            from .suites import run_suites
+            report["results"].extend(run_suites(repo, output / "suites", args.mode, args.allow_builds, args.timeout_seconds))
+        if len(report["results"]) == 1:
+            raise ValueError("scenario selector matched no cases")
+        # An inventory pass alone must not turn a zero-execution run into an inference pass.
+        runtime_results = [r for r in report["results"] if r["id"] != "config-coverage-audit"]
+        report["exit_code"] = aggregate_exit(runtime_results, strict=args.strict)
+        model_results = [r for r in runtime_results if r.get("preset")]
+        if model_results and not any(r["status"] in {"pass", "fail"} for r in model_results) and report["exit_code"] == 0:
+            report["exit_code"] = 3
+        if args.mode == "plan":
+            report["exit_code"] = 1 if any(r["status"] == "fail" for r in runtime_results) else 0
+    except KeyboardInterrupt:
+        cancelled = True
+        report["results"].append({"id": "run-cancelled", "status": "untested", "reason": "Interrupted by user; remaining cases were not executed"})
+        report["exit_code"] = 130
+    except (ValueError, OSError, KeyError, TypeError, RuntimeError) as error:
+        report["results"].append({"id": "harness-error", "status": "fail", "reason": str(error), "stage": "configuration"})
+        report["exit_code"] = 2
+    report["finished_utc"] = datetime.now(timezone.utc).isoformat()
+    report["cancelled"] = cancelled
+    write_reports(output, report)
+    print(f"Report: {output / 'report.md'} (exit {report['exit_code']})", flush=True)
+    return report["exit_code"]

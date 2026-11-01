@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TensorSharp local regression coverage catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source_revision", "note", "inventory", "backends", "families", "presets", "scenarios"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "source_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "note": {"type": "string", "minLength": 1},
+    "inventory": {
+      "type": "object", "additionalProperties": false,
+      "required": ["config_glob", "excluded", "architectures_source", "embedding_architectures_source", "existing_download_catalog"],
+      "properties": {
+        "config_glob": {"type": "string"},
+        "excluded": {"$ref": "#/$defs/strings"},
+        "architectures_source": {"type": "string"},
+        "embedding_architectures_source": {"type": "string"},
+        "existing_download_catalog": {"type": "string"}
+      }
+    },
+    "backends": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "os", "requires"],
+        "properties": {
+          "id": {"$ref": "#/$defs/backend"},
+          "os": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["windows", "linux", "macos"]}},
+          "requires": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "families": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/family"}},
+    "presets": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/preset"}},
+    "scenarios": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/scenario"}}
+  },
+  "$defs": {
+    "strings": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "backend": {"enum": ["cpu", "ggml_cpu", "ggml_cuda", "ggml_metal", "ggml_vulkan", "cuda", "mlx"]},
+    "backends": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/backend"}},
+    "layout": {"enum": ["dense", "moe", "dense_or_moe", "dense_or_two_expert"]},
+    "family": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "aliases", "backends", "modalities", "layout", "notes", "source_evidence", "configuration_status", "presets"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "aliases": {"$ref": "#/$defs/strings"},
+        "backends": {"$ref": "#/$defs/backends"},
+        "modalities": {"$ref": "#/$defs/strings"},
+        "layout": {"$ref": "#/$defs/layout"},
+        "notes": {"type": "string"},
+        "source_evidence": {"$ref": "#/$defs/strings"},
+        "configuration_status": {"enum": ["configured", "missing_preset"]},
+        "presets": {"$ref": "#/$defs/strings"},
+        "gap_reason": {"type": "string", "minLength": 1}
+      },
+      "allOf": [{"if": {"properties": {"configuration_status": {"const": "missing_preset"}}}, "then": {"required": ["gap_reason"], "properties": {"presets": {"maxItems": 0}}}}]
+    },
+    "resource_requirements": {
+      "description": "Conservative planning estimates, not measured fit guarantees. Unknown fields must not be treated as zero.",
+      "type": "object", "additionalProperties": false,
+      "required": ["basis"],
+      "properties": {
+        "ram_gib": {"type": "number", "minimum": 0},
+        "vram_gib": {"type": "number", "minimum": 0},
+        "scratch_gib": {"type": "number", "minimum": 0},
+        "download_gib": {"type": "number", "minimum": 0},
+        "basis": {"type": "string", "minLength": 1}
+      }
+    },
+    "preset": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "config", "kind", "family", "modalities", "backends", "scenarios", "source_evidence", "layout", "status"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "config": {"type": "string", "pattern": "^config/[^\\\\]+\\.json$"},
+        "kind": {"enum": ["text", "text_diffusion", "embedding", "image_generation", "video_generation", "agent", "plugin", "overlay"]},
+        "family": {"type": "string", "minLength": 1},
+        "modalities": {"$ref": "#/$defs/strings"},
+        "backends": {"$ref": "#/$defs/backends"},
+        "scenarios": {"$ref": "#/$defs/strings"},
+        "source_evidence": {"$ref": "#/$defs/strings"},
+        "layout": {"$ref": "#/$defs/layout"},
+        "status": {"enum": ["configured", "unsupported"]},
+        "notes": {"$ref": "#/$defs/strings"},
+        "reason": {"type": "string", "minLength": 1},
+        "requires_configs": {"$ref": "#/$defs/strings"},
+        "resource_requirements": {"$ref": "#/$defs/resource_requirements"},
+        "file_sizes": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}}
+      },
+      "allOf": [
+        {"if": {"properties": {"status": {"const": "unsupported"}}}, "then": {"required": ["reason"]}},
+        {"if": {"properties": {"kind": {"enum": ["overlay", "plugin"]}}}, "then": {"required": ["requires_configs"]}}
+      ]
+    },
+    "scenario": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "entry_point", "status", "recipe", "assertions", "evidence", "requirements"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "entry_point": {"type": "string", "minLength": 1},
+        "status": {"enum": ["automated", "recipe", "unsupported"]},
+        "recipe": {"type": "string", "minLength": 1},
+        "assertions": {"$ref": "#/$defs/strings"},
+        "evidence": {"$ref": "#/$defs/strings"},
+        "requirements": {"$ref": "#/$defs/strings"},
+        "backends": {"$ref": "#/$defs/backends"}
+      }
+    }
+  }
+}
