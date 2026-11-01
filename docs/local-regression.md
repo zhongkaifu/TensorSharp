@@ -25,7 +25,12 @@ broader quality or concurrency claims remain visible gaps. A
 For acceptance, read the [checkpoint qualification and open failures](local-regression-coverage.md#current-checkpoint-qualification).
 At the `1783d3b` integration snapshot, native CUDA and CPU numerical failures and
 component-suite reruns remained open. The passing bounded client/device profiles
-do not make the full matrix green or certify a clean final revision.
+have since passed with clean harness `d93f4aa`; they do not make the full matrix
+green or imply every retained engine assembly was rebuilt from that revision.
+The later grounded retrieval profile failed normal completion at its fixed
+384-token budget. MiniLM CPU embedding and a real partial-download resume passed
+with a valid 4 GiB RAM budget; those reports disclose documentation-only edits.
+Full Python/component runs and final CI acceptance remain pending in this snapshot.
 
 ## Start with an audit and a plan
 

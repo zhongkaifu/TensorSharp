@@ -312,7 +312,7 @@ python eng/run-local-regression.py --mode run --models qwen3.5-0.8b --scenarios 
 | 场景 ID | 必须明确的组合和证据 |
 |---|---|
 | `embedding_media` | encoder、matching projector、图像/音频/视频夹具；有限向量、维度、重复性与批准的参考向量数值对照，不宣称通用语义质量 |
-| `retrieval` | 检索/生成所需模型、文档和查询；排名、集合隔离、引用或原文身份 |
+| `retrieval` | 检索/生成所需模型、文档和查询；排名、集合隔离、引用或原文身份。实际 Qwen3.5-0.8B `ggml_cuda` + MiniLM CPU 运行完成文档/来源检查后，在固定 384-token 输出预算下未正常结束，整体失败 |
 | `image_generation` | 完整生成依赖、固定输入；解码后的尺寸、像素有效性及批准的质量指标 |
 | `image_editing` | 原图、蒙版、编辑提示；输出解码、预期变化与保留区域约束 |
 | `video_generation` | 全部专家/VAE/encoder、短视频参数；帧、尺寸、时长及有效画面 |
@@ -357,7 +357,9 @@ python eng/run-local-regression.py --mode run --models qwen3.5-0.8b --scenarios 
 
 执行器顺序运行原生 stream/response 两个进程，每个做两轮；再启动所拥有的 loopback server，验证两个 HTTP SDK 的 stream/response 共四种模式。原生示例必须包含 `--regression-json`：回执由程序读取完整 `response.Text` 和实际加载身份生成，启动日志不能冒充回答。新参数只在显式请求时输出 JSON，不改变普通示例调用。这里校验语义答案和正常完成；原生 seed1、HTTP seed42，不能将结果称为精确 token/logit 一致性，也不证明取消恢复或缓存命中。
 
-本地 Windows `ggml_cuda` + Qwen3.5-0.8B 已实际通过这两个原生模式和四个 HTTP SDK 模式，共校验 12 个完整回答。证据位于本机 `D:/TensorSharp-regression-validation/artifacts/client-live-profile-f6e6e50-dirty/report.json`；原生示例源码为 `f6e6e506206d62755efa08755c6d83ed19e249f8`，HTTP 示例为 `b764dec`，运行器记录了当时未提交的集成状态。此结果只覆盖该模型、后端和固定两轮夹具，不代表所有客户端、取消行为、平台或最终提交已通过。
+本地 Windows `ggml_cuda` + Qwen3.5-0.8B 已在干净运行器提交 `d93f4aaa5fede1a5cb084b14c01e7e49703fd921` 下重跑通过：两个原生模式和四个 HTTP SDK 模式，共 12 个完整回答、22 项 profile 断言，整次退出码为 0。证据位于本机 `D:/TensorSharp-regression-validation/artifacts/client-live-profile-d93f4aa/report.json`。六个客户端均正常退出，客户端与所拥有的 server 均验证无残留进程；server 在断言完成后被主动停止，其终止退出码不宣称为自然退出。
+
+原生示例构建源码仍为 `f6e6e506206d62755efa08755c6d83ed19e249f8`，HTTP 示例仍为 `b764dec`；对应 SHA-256 为 `220757da421387082df93fdd732369975165c253ff094ecd4bee1a06e5959d98` 与 `5b2b8e673b91a78dd7b655c07e536720d907329a1ea4c2c74d245e78b9e45c6c`。报告声明的当前引擎 checkout 为 `1783d3b`，不能据此把所有保留的程序集都归为该提交的新构建。此结果只覆盖该模型、后端和固定两轮夹具，不代表所有客户端、取消行为或平台已通过。
 
 `native_unit` 不准备、下载或加载主预设权重；`preset` 仅限定目录/后端范围。`fixtures.test_assembly` 固定为 `InferenceWeb.Tests.dll`，参数同样只有 `source_commit`。`expected.required_tests` 必须精确包含这两个 FQN：
 
@@ -368,7 +370,9 @@ InferenceWeb.Tests.CudaBackendTests.CudaQuantizedWeight_CanRunAfterHostCopyRelea
 
 同时声明整数 `max_cpu_fallback_calls:0`。此 profile 仅接入 direct `cuda`；固定 `dotnet vstest` 入口不构建、不 restore，过滤掉 Bench/Models。两个测试都必须在 TRX 中 Passed，CUDA 图捕获/回放日志和完整的零 fallback 计数也必须存在。跳过或诊断缺失是未测试，失败计数和实际 CPU 回落是失败。测试 DLL 的 `.deps.json`、`.runtimeconfig.json` 与依赖库必须相邻。报告区分“调用者声明的构建源码 revision”和“已计算哈希的部署文件”；不能宣称编译输入或实际映射模块已经独立证明。
 
-本地 Windows direct CUDA 已实际通过上述两个设备合成测试，并记录积极的图捕获/回放证据与零 CPU fallback。该次测试程序集声明源码为 `b764dec2d149aabd725c067a47c6f4c5dfedd010`，运行器为 `f6e6e50` 加未提交的 profile 集成，部署候选包含新构建的 A0 原生库；完整身份与结果见本机 `D:/TensorSharp-regression-validation/artifacts/native-cuda-profile-f6e6e50-dirty/report.json`。这只是两个指定 CUDA 测试的通过，不能代表全部原生算子、模型或最终提交。
+本地 Windows direct CUDA 已在同一干净运行器提交 `d93f4aaa5fede1a5cb084b14c01e7e49703fd921` 下通过上述两个设备合成测试和全部 7 项 profile 断言，退出码为 0；记录了实际图捕获/回放、两个完整的零 CPU fallback 计数块以及无残留进程的清理结果。测试程序集声明源码仍为 `b764dec2d149aabd725c067a47c6f4c5dfedd010`，SHA-256 为 `0b7a9e3bbdd4f8e39e0a1d39c7ce544335991f043f4ac501866ab73907816053`。部署候选包含 A0 原生库（`a0f0674576b5193222846db339456d86d089fffdcb9f105f64b6a85426d98128`），但候选哈希不证明它被实际映射或执行 GGML。完整身份与结果见本机 `D:/TensorSharp-regression-validation/artifacts/native-cuda-profile-d93f4aa/report.json`。
+
+这两份干净运行器报告取代此前 `*-profile-f6e6e50-dirty` 报告作为相应执行器的最新验证；旧报告仍保留，既有程序集的真实构建来源不改变。两项 CUDA 测试通过不能代表全部原生算子、模型或所有引擎程序集已按运行器提交重建。
 
 profile 结果使用 `profile::<id>` 单独编号。已经绑定模型预设的场景，按每个被选择的“预设/后端/场景”组合检查是否有精确匹配的 profile；缺失者逐项记录 `untested`。提供一个模型或设备的 profile 不会隐藏其他被选择组合的缺口。只有未绑定任何模型预设的场景类，在缺少 profile 时使用 `catalog::<scenario>` 范围的 `untested` 记录。普通聊天通过不能补足这些缺口。
 
@@ -426,19 +430,26 @@ python eng/run-local-regression.py --mode run --scenarios native_ctest `
 
 ### 当前验证快照与未完成项
 
-`1783d3b` 已集成 14 个 typed profile 执行器，但没有证明完整矩阵全绿或已经满足合并条件。下面的已完成运行保留其原始源码和二进制身份；后续定点通过不会改写原始全轮计数。报告名均指本机 `D:/TensorSharp-regression-validation/artifacts/` 下的忽略产物，不是已发布附件。
+`1783d3b` 已集成 14 个 typed profile 执行器，其中两项限定 profile 已用干净运行器 `d93f4aa` 重跑通过，但没有证明完整矩阵全绿或已经满足合并条件。下面的已完成运行保留其原始源码和二进制身份；后续定点通过不会改写原始全轮计数。报告名均指本机 `D:/TensorSharp-regression-validation/artifacts/` 下的忽略产物，不是已发布附件。
 
 | 运行 | 已记录结果 | 尚未解决或明确的范围 |
 |---|---|---|
 | `native-cuda-f6e6e50` | 选中 61 项 CTest：47 通过、1 失败、13 跳过 | `minimax-h3-lora-cuda` 的 f32 base/f32 factors、guard off 参考断言失败，最大差值 `0.000628856`；跳过项仍未验证 |
 | `native-cpu-5fa7ab0` | 原始 41 项 CTest：37 通过、2 失败、2 跳过 | `cpu-quantized-ffn-strip` 的 Q2_K 严格相等断言仍失败，最大绝对差值 `2.38418579e-07`；数值小不能抹掉断言失败 |
 | `minimax-cpu-5b78c99` | 定点 MiniMax executor 重跑 1 项通过 | 仅修正测试对不同平台 allocation-error 文案的判断，不能据此把原始 CPU 全轮或另一个数值失败改成通过 |
-| `native-cuda-profile-f6e6e50-dirty` | 两项固定 direct CUDA 设备测试通过 | 实际图捕获/回放和零 CPU fallback；只覆盖前述两项合成测试 |
-| `client-live-profile-f6e6e50-dirty` | 两个原生模式、四个 HTTP SDK 模式，12 个回答通过 | 仅 Windows `ggml_cuda` + Qwen3.5-0.8B Q8_0 的固定语义、身份和正常完成断言 |
+| `native-cuda-profile-d93f4aa` | 干净运行器重跑：两项固定 CUDA 测试、7 项 profile 断言通过，退出 0 | 图捕获/回放、零 CPU fallback、清理确认；测试程序集仍为 `b764dec` 构建 |
+| `client-live-profile-d93f4aa` | 干净运行器重跑：六个模式、12 个回答、22 项 profile 断言通过，退出 0 | Windows `ggml_cuda` + Qwen3.5-0.8B Q8_0；原生 `f6e6e50` / HTTP `b764dec` 构建身份保留 |
+| `grounded-retrieval-profile-d93f4aa` | 干净运行器；profile 失败，退出 1 | Qwen3.5-0.8B `ggml_cuda` + MiniLM CPU 完成文档/来源检查，随后未满足固定 384-token 输出预算下的正常完成契约；Windows Job 清理确认无残留 |
+| `minilm-resumed-run-d93f4aa` | CPU 嵌入场景跳过，退出 3，没有额外传输 | 2 GiB RAM 预算低于 `2178743728` 字节的需求估计；这是资源门禁，不是推理失败 |
+| `minilm-resumed-run-d93f4aa-ram4` | CPU 嵌入场景及 19 项断言通过，退出 0 | 4 GiB RAM 预算允许运行；从真实断点恢复下载并校验完整文件。代码为 `d93f4aa`，报告明确披露仅文档工作区修改，不能称为干净 checkout |
+
+检索失败按原始预算与 oracle 保留，不通过增大输出预算掩盖。回执证明生成没有正常完成，尚不足以进一步归因为引擎缺陷或模型/夹具行为。导入、索引和原文身份检查通过不代表完整 profile 通过，也不宣称后续作用域对照已经执行。
+
+`minilm-resume-d93f4aa/controlled-cancellation.json` 记录真实下载在 `2097152` 字节处取消、保留 partial，且最终文件尚未安装。后续被允许的运行恢复剩余 `22910912` 字节；`0.022 GiB` 网络上限低于完整文件的 `25008064` 字节。最终 SHA-256 为 `263215c3cadd6e16740741a7624ab4cbb6c8e777688bd5331ecfbf5681c2f8ed`。下载管理器没有修改；两个 MiniLM 报告均记录运行器 `d93f4aa` 加文档修改。最终 CPU 模型身份、嵌入断言、类型化拒绝响应和所拥有 server 的清理均通过。这只验证该 checkpoint 的恢复与 CPU 路径，不代表所有模型下载都已经实测。
 
 原始 `components-b764dec/report.json` 中 Knowledge 110 项及两个无模型客户端契约通道通过。Server 通道失败并超时：其中 36 项失败可归因于把模型宿主环境设置施加到了无模型套件。`1783d3b` 已修正环境策略，但此快照中的重建/重跑结果仍待完成；独立的 FileLogger `Flush` 失败和整轮超时尚未证明修复。Studio 两项缺少 ffmpeg 的测试已调整为先检查跳过前提再操作目录，其重建后实测也待完成。源码修正不能直接登记为测试通过。
 
-剩余数值失败和组件重跑必须解决，或在明确范围下得到接受后再判断合并就绪。本轮仍没有 Linux/WSL GPU、macOS/Metal/MLX、Vulkan、多 GPU 或授权远端集群的实测通过证明；其他 typed profile 场景还需要批准的夹具、预算和实际模型报告。
+剩余数值失败、检索生成失败、组件重跑以及仍在进行的完整 Python 测试和最终 CI 结果必须完成评估，才能判断合并就绪；不得把未完成项算成通过。本轮仍没有 Linux/WSL GPU、macOS/Metal/MLX、Vulkan、多 GPU 或授权远端集群的实测通过证明；其他 typed profile 场景还需要批准的夹具、预算和实际模型报告。
 
 ### 运行器自身与配置维护
 

@@ -233,15 +233,16 @@ Earlier model reports retain their original narrower scope.
 | `lora` | Pinned text LoRA, prompt and distinct approved base/adapted answers; load, use, unload and restored-baseline assertions | Harness only; actual model/device run required |
 | `multi_gpu` | Explicit physical devices, tensor/layer placement receipts and per-device budgets; teacher-forced token history and numerical parity | Harness only; multiple actual GPUs required |
 | `distributed` | Explicit authorized Linux SSH nodes, unique mandatory raw `/etc/machine-id` SHA-256 pins checked before run-directory creation or model launch, pinned preinstalled model/runtime/source manifests, per-node budgets, rank/logit evidence and verified owned-process teardown | Harness only; authorized multi-node run required |
-| `retrieval` | Primary chat model plus CPU embedding role; pinned document, Ready/index provenance, exact source bytes, grounded answer and matching source URL, empty/unrelated-scope controls and cleanup | Harness only; actual paired-model run required |
+| `retrieval` | Primary chat model plus CPU embedding role; pinned document, Ready/index provenance, exact source bytes, grounded answer and matching source URL, empty/unrelated-scope controls and cleanup | Actual Windows Qwen3.5-0.8B `ggml_cuda` + MiniLM CPU run failed the normal-completion contract with fixed 384 output tokens; document/source checks ran, full profile not qualified |
 | `jev_media` | Bounded PNG/MP4/WebM plus typed gold decisions with/without media; positive visual preparation, deterministic replay/cache evidence and typed negative responses; no positive audio/ASR path | Harness only; actual vision-model run required |
-| `client_live` | Pinned prebuilt native and HTTP clients; two native modes plus four HTTP SDK modes, exact two-turn answers, requested backend receipts and normal completion | Local Windows `ggml_cuda`, Qwen3.5-0.8B Q8_0: six modes and all 12 semantic answers passed; dirty-source provenance and limits below |
+| `client_live` | Pinned prebuilt native and HTTP clients; two native modes plus four HTTP SDK modes, exact two-turn answers, requested backend receipts and normal completion | Local Windows `ggml_cuda`, Qwen3.5-0.8B Q8_0: six modes and all 12 semantic answers passed with clean harness `d93f4aa`; retained binary build sources and limits below |
 | `native_unit` | Pinned prebuilt `InferenceWeb.Tests.dll`; two fixed direct-CUDA synthetic graph/cache/quantized-weight tests, positive execution/counter evidence and zero fallback; no model load/download | Local Windows direct CUDA: both tests passed, graph capture/replay observed, zero CPU fallback; device-only scope and deployment provenance below |
 
-The local `native-cuda-profile-f6e6e50-dirty` report on 2026-11-01 records two
+The local `native-cuda-profile-d93f4aa` report on 2026-11-01 records two
 executed/passing tests, no skipped tests, positive graph capture/replay and two
-empty CPU-fallback counter blocks. It used harness commit
-`f6e6e506206d62755efa08755c6d83ed19e249f8` **with uncommitted changes**, a prebuilt
+empty CPU-fallback counter blocks. All seven profile assertions passed, the run
+exited zero, and Windows Job teardown verified no owned processes remained. It
+used clean harness commit `d93f4aaa5fede1a5cb084b14c01e7e49703fd921`, a prebuilt
 test assembly with declared build source
 `b764dec2d149aabd725c067a47c6f4c5dfedd010`, and assembly SHA-256
 `0b7a9e3bbdd4f8e39e0a1d39c7ce544335991f043f4ac501866ab73907816053`.
@@ -249,19 +250,23 @@ Its deployment inventory also records the `GgmlOps.dll` candidate SHA-256
 `a0f0674576b5193222846db339456d86d089fffdcb9f105f64b6a85426d98128`; that inventory
 is not mapped-module attestation or evidence of GGML execution. This result
 qualifies only the two direct-CUDA synthetic tests, not model inference,
-backend-wide correctness or a clean final source revision. A clean-head rerun
-must retain its own report and binary identities.
+backend-wide correctness or a rebuild of every assembly from the harness commit.
 
-The local `client-live-profile-f6e6e50-dirty` report on 2026-11-01 records
+The local `client-live-profile-d93f4aa` report on 2026-11-01 records
 `profile::qwen08-native-http-cuda` passing on the RTX 3080 Laptop GPU. Native
 stream/response and OpenAI/Extensions.AI HTTP stream/response each returned the
 two required answers, `4` and `12`: six client invocations and 12 answers.
 The host and native receipts identify `ggml_cuda`; raw HTTP/SSE controls and
 verified owned-server teardown also passed. The Qwen3.5-0.8B Q8_0 weight SHA-256
 was `0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c`.
-Harness commit `f6e6e506206d62755efa08755c6d83ed19e249f8` had uncommitted
-changes. The profile's shared source declaration names that revision; the native
-example was built from it, while the HTTP example reused the `b764dec` deployment.
+Harness commit `d93f4aaa5fede1a5cb084b14c01e7e49703fd921` was clean. All 22
+profile assertions passed and the overall run exited zero. Both native and all
+four HTTP client processes exited zero; every client and the owned server had
+verified Windows Job teardown. The server was deliberately stopped after the
+assertions, so its recorded termination exit is not claimed as a natural exit.
+The profile's shared source declaration remains
+`f6e6e506206d62755efa08755c6d83ed19e249f8`; the native example was built from it,
+while the HTTP example reused the `b764dec` deployment.
 That shared declaration does not independently establish both binaries' compiler
 inputs. Their recorded SHA-256 values are
 `220757da421387082df93fdd732369975165c253ff094ecd4bee1a06e5959d98` (native) and
@@ -269,11 +274,16 @@ inputs. Their recorded SHA-256 values are
 This is bounded semantic parity with normal completion. Native and HTTP sampling
 seeds differ, so it does not establish exact token/logit parity, complete SDK
 wire history, cancellation/deadline recovery, cache-hit behavior or all client
-features. It is not qualification of a clean final source revision.
+features. Both clean-harness reports record a caller-declared engine checkout at
+`1783d3bc5ea133995f98e4dd02ad9c35a15ee506`; its current revision does not establish
+that every retained assembly was rebuilt from it. These reports supersede the
+earlier `*-profile-f6e6e50-dirty` runs for harness qualification, while those
+historical reports and their actual binary build identities remain intact.
 
 ## Current checkpoint qualification
 
-The `1783d3b` integration registers all 14 typed profile executors. It is not a
+The `1783d3b` integration registers all 14 typed profile executors; the two bounded
+profiles below were rerun using clean harness `d93f4aa`. This is not a
 claim that all model/device combinations pass. The completed runs below retain
 their original source/binary identities; targeted reruns do not rewrite earlier
 full-run counts. Evidence names refer to local ignored report directories under
@@ -284,8 +294,30 @@ full-run counts. Evidence names refer to local ignored report directories under
 | `native-cuda-f6e6e50/report.json` | 61 selected CTest tests: 47 pass, 1 fail, 13 skip | `minimax-h3-lora-cuda` fails the f32-base/f32-factors, guard-off reference assertion; maximum difference `0.000628856`. Skips remain unqualified. |
 | `native-cpu-5fa7ab0/report.json` | Original 41 selected CTest tests: 37 pass, 2 fail, 2 skip | `cpu-quantized-ffn-strip` still fails strict equality for Q2_K; reported maximum absolute difference `2.38418579e-07`. This assertion failure remains open. |
 | `minimax-cpu-5b78c99/report.json` | Targeted MiniMax executor rerun: 1 pass | The allocation-error message assertion was made portable in a test-only change. This resolves that targeted test, not the other CPU failure or the original full report. |
-| `native-cuda-profile-f6e6e50-dirty/report.json` | Both fixed direct-CUDA sentinels pass | Positive graph capture/replay and zero CPU fallback; only the two synthetic tests described above. |
-| `client-live-profile-f6e6e50-dirty/report.json` | Two native and four HTTP SDK modes pass; 12 required answers | Qwen3.5-0.8B Q8_0 with Windows `ggml_cuda`; bounded semantic/identity/normal-completion assertions only. |
+| `native-cuda-profile-d93f4aa/report.json` | Clean-harness rerun: both fixed direct-CUDA sentinels and all 7 profile assertions pass; exit 0 | Positive graph capture/replay, zero CPU fallback and verified teardown; retained `b764dec` test assembly, not a rebuild from the harness commit. |
+| `client-live-profile-d93f4aa/report.json` | Clean-harness rerun: two native and four HTTP SDK modes, 12 answers and all 22 profile assertions pass; exit 0 | Qwen3.5-0.8B Q8_0 with Windows `ggml_cuda`; native `f6e6e50` / HTTP `b764dec` deployment identities retained. |
+| `grounded-retrieval-profile-d93f4aa/report.json` | Clean harness; profile fail, exit 1 | Qwen3.5-0.8B `ggml_cuda` + MiniLM CPU completed document/source checks, then failed normal completion under the fixed 384-token output budget. Owned Windows Job teardown verified zero remaining processes. |
+| `minilm-resumed-run-d93f4aa/report.json` | CPU embedding case skipped, exit 3; no additional transfer | The 2 GiB RAM budget was below the declared estimate of `2178743728` bytes. This is a resource gate, not an inference failure. |
+| `minilm-resumed-run-d93f4aa-ram4/report.json` | CPU embedding case and all 19 assertions pass, exit 0 | A valid 4 GiB RAM budget admitted the same workload; a real retained partial download resumed and its final identity verified. Harness code is `d93f4aa`, with documentation-only working-tree edits disclosed. |
+
+The grounded retrieval failure is retained without increasing its output budget
+or changing its oracle. The receipt establishes failure to finish normally; it
+does not, by itself, classify an engine defect versus model/fixture behavior.
+Passing import, indexing and source-byte checks do not make the whole retrieval
+profile pass, and later scope-control assertions are not claimed as executed.
+
+The MiniLM cancellation receipt is
+`minilm-resume-d93f4aa/controlled-cancellation.json`: it records a real
+`2097152`-byte partial, no installed final file, and cancellation in model
+preparation. The subsequent accepted run resumed the remaining `22910912` bytes
+under a `0.022` GiB network cap, which is below the full file size of `25008064`
+bytes. The final SHA-256 was
+`263215c3cadd6e16740741a7624ab4cbb6c8e777688bd5331ecfbf5681c2f8ed`.
+The download manager was unchanged; both MiniLM reports disclose documentation
+edits in the working tree and are not labeled clean-checkout runs. The final
+case verified CPU model identity, embedding assertions, typed negative responses
+and owned-server teardown. This is one checkpoint's successful resume and CPU
+qualification, not evidence that every download or model combination passes.
 
 The original `components-b764dec/report.json` records 110 Knowledge tests passing
 and both model-free client contract lanes passing. Its server lane failed/timed
@@ -297,8 +329,9 @@ tests now check the skip prerequisite before directory operations; their rebuilt
 execution was also pending. Source corrections alone are not passing evidence.
 
 This checkpoint therefore does not establish an all-green full-regression or
-merge-ready result. Remaining numeric failures and component reruns must be
-resolved or explicitly accepted with their exact scope. Linux/WSL GPU,
+merge-ready result. Remaining numeric and grounded-completion failures require
+resolution or explicit acceptance of their exact scope; component reruns, the
+full Python suite and final CI results were still pending at this snapshot. Linux/WSL GPU,
 macOS/Metal/MLX, Vulkan, multi-GPU and authorized remote-node runs remain unrun in
 this qualification. The other typed profile classes still require their approved
 fixtures, budgets and actual model/device reports.
