@@ -176,6 +176,14 @@ Vision/video/ASR and uploaded-reference transport remain separate `jev_media`
 recipes; office formatting, embedded figures and formula recalculation are not
 qualified by text extraction.
 
+`client_http_live` adds four prebuilt HTTP SDK invocations (OpenAI/Extensions.AI,
+stream/response) with strict two-turn answers `4` and `12`, exact client identity
+headers, clean process completion and raw HTTP/SSE controls. No SDK wire-history
+capture, SDK cancellation/deadline or native-client qualification is claimed.
+The native CLI source admits GGML CPU/CUDA/Metal/Vulkan, while its existing
+recorded `LiveChecks` fixture is specifically Qwen3.8 Flash Next on Metal; these
+are distinct support and execution scopes.
+
 `server_agents` exercises two named read-only arithmetic reviewers using only
 host coordination tools, with skills/code execution disabled. Successful spawn
 and wait events, completed child snapshots, exact child/final JSON arithmetic,

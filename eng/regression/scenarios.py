@@ -27,7 +27,7 @@ ADAPTER_IDS = frozenset({
     "cli_text", "cli_prefill", "cli_decode", "cli_multi_turn", "cli_tools", "cli_thinking",
     "cli_image", "cli_audio", "cli_video", "forced_logits", "forced_logits_sequence", "server_chat", "server_stream",
     "server_cancel", "server_reset_cache", "server_structured", "server_tools", "server_embeddings", "server_agents",
-    "jev_decision", "jev_text_attachments", "image_generation_smoke", "speculation_ngram",
+    "jev_decision", "jev_text_attachments", "image_generation_smoke", "speculation_ngram", "client_http_live",
 })
 _LOGIT_BACKENDS = {"cpu", "cuda", "ggml_cpu", "ggml_cuda", "ggml_metal"}
 _CONFIG_KEYS = {"model", "mmproj", "draft-model", "tokenizer", "kv-cache-dtype", "embedding-threads",
@@ -77,10 +77,15 @@ def availability(case, context):
     if kind == "speculation_ngram":
         from .speculation import availability as ngram_available
         return ngram_available(context)
-    command_key = "logit_command" if kind.startswith("forced_logits") else "server_command" if kind.startswith("server_") or kind in {"jev_decision", "jev_text_attachments", "image_generation_smoke"} else "cli_command"
+    command_key = "logit_command" if kind.startswith("forced_logits") else "server_command" if kind.startswith("server_") or kind in {"jev_decision", "jev_text_attachments", "image_generation_smoke", "client_http_live"} else "cli_command"
     command = context.get(command_key)
     if not command or isinstance(command, str):
         return False, "provide a built local binary argv list in " + command_key
+    if kind == "client_http_live":
+        from .client_live import availability as client_available
+        ready, reason = client_available(context)
+        if not ready:
+            return ready, reason
     if kind.startswith("forced_logits") and context.get("backend") not in _LOGIT_BACKENDS:
         return False, "ForcedLogitProbe does not implement this backend; no fallback will run"
     if kind == "jev_decision" and not all((Path(context["repo"]) / path).is_file() for path in
@@ -870,7 +875,10 @@ def _server(case, context, result):
         model = _hosted_response_model(identity["loaded"], listing, result)
         payload = {"model": model, "messages": [{"role": "user", "content": _PROMPT}], "temperature": 0,
                    "seed": 42, "max_tokens": 128, "think": False, "stream": False}
-        if kind == "jev_decision":
+        if kind == "client_http_live":
+            from .client_live import run_http_client
+            run_http_client(http, model, context, result)
+        elif kind == "jev_decision":
             from .jev import run_decisions
             run_decisions(http, model, context, result)
         elif kind == "jev_text_attachments":

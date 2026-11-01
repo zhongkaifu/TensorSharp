@@ -445,6 +445,7 @@ namespace InferenceWeb.Tests
         private const string TePath = @"C:\Works\models\wan\umt5-xxl-encoder-Q8_0.gguf";
 
         [Fact]
+        [Trait("Requires", "Models")]
         public void TokenizerMatchesHuggingFaceReference()
         {
             if (!File.Exists(TePath)) return;   // model not present on this machine

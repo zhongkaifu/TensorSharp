@@ -78,6 +78,7 @@ def parse_args(argv=None):
     parser.add_argument("--existing-root", action="append", type=Path, default=[], help="Search existing weights by unique filename; never write/delete here")
     parser.add_argument("--cli", type=Path)
     parser.add_argument("--server", type=Path)
+    parser.add_argument("--http-client", type=Path, help="Prebuilt TensorSharp.LocalChat example for live HTTP SDK scenarios; never built implicitly")
     parser.add_argument("--logit-probe", type=Path)
     parser.add_argument("--benchmark", type=Path, help="Prebuilt AgentTurnBench for explicitly supported n-gram parity cells")
     parser.add_argument("--runtime-dir", action="append", type=Path, default=[], help="Additional native runtime/build metadata directories")
@@ -279,7 +280,7 @@ def reproduce_args(args, repo, root, preset, backend, scenario):
         # nonempty evidence directory. The generated argv is saved per result.
         fresh = args.output.resolve().parent / ("repro-" + preset["id"] + "-" + scenario["id"] + "-" + uuid.uuid4().hex[:8])
         command += ["--output", str(fresh)]
-    for key in ("cli", "server", "logit_probe", "benchmark", "engine_repo", "media_dir", "ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib", "gpu_index", "disk_headroom_gib", "max_download_gib", "timeout_seconds", "catalog"):
+    for key in ("cli", "server", "http_client", "logit_probe", "benchmark", "engine_repo", "media_dir", "ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib", "gpu_index", "disk_headroom_gib", "max_download_gib", "timeout_seconds", "catalog"):
         value = getattr(args, key)
         if value is not None:
             command += ["--" + key.replace("_", "-"), str(value)]
@@ -330,9 +331,10 @@ def main(argv=None):
             return 2
         cli = find_binary(repo, args.cli, "TensorSharp.Cli", "TensorSharp.Cli")
         server = find_binary(repo, args.server, "TensorSharp.Server.Host", "TensorSharp.Server.Host")
+        http_client = find_binary(repo, args.http_client, "examples/dotnet-local-chat", "TensorSharp.LocalChat")
         logit = find_binary(repo, args.logit_probe, "eng/ForcedLogitProbe", "ForcedLogitProbe")
         benchmark = find_binary(repo, args.benchmark, "benchmarks/AgentTurnBench", "AgentTurnBench")
-        commands = {"cli_command": cli, "server_command": server, "logit_command": logit, "benchmark_command": benchmark}
+        commands = {"cli_command": cli, "server_command": server, "http_client_command": http_client, "logit_command": logit, "benchmark_command": benchmark}
         runtime_dirs = sorted({str(Path(command[-1]).parent) for command in commands.values() if command} | {str(p.resolve()) for p in args.runtime_dir})
         root = (args.model_root or Path(os.environ.get("TENSORSHARP_MODELS", str(repo / "models")))).resolve()
         hardware = detect_hardware(root, runtime_dirs=runtime_dirs)

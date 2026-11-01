@@ -283,6 +283,21 @@ depends on a previous input length even when equal-length repeats are stable.
 Repeatability does not establish agreement with an
 independent Transformers/reference implementation.
 
+`client_http_live` uses the prebuilt `TensorSharp.LocalChat` example with an owned
+server. It runs both OpenAI SDK and `IChatClient` paths in streaming and response
+modes, each requiring exactly `4` then `12` from two conversation turns. Raw
+HTTP/SSE controls check identity, normal completion and token accounting. SDK
+sampling uses the server's fixed defaults; the example does not send seed or
+temperature. This does not capture SDK wire history or qualify per-SDK metrics,
+cancellation, deadlines or native-client lifecycle behavior. Provide a separately
+built example with `--http-client`, or let the runner discover its Release output:
+
+```powershell
+python eng/run-local-regression.py --mode run --models qwen3.5-0.8b `
+  --scenarios client_http_live --backend auto --existing-root C:\work\model `
+  --http-client examples/dotnet-local-chat/bin/Release/net10.0/TensorSharp.LocalChat.dll
+```
+
 `jev_decision` runs the repository's 12 labeled text decision fixtures, 36 gold
 decisions, fixed-seed replay and malformed requests. `jev_text_attachments` runs
 14 pinned text/document fixtures as inline attachments, including office/PDF text

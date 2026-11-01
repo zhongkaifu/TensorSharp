@@ -13,6 +13,16 @@ from .reports import file_hash, runtime_identity, source_identity
 MANAGED_BUILD_PROPERTIES = ["-p:TensorSharpSkipGgmlNative=true", "-p:TensorSharpSkipMlxNative=true",
                             "-p:TensorSharpSkipCudaPtx=true"]
 
+# Keep explicit exclusions even after the source traits are corrected: deployments
+# may contain older, prebuilt assemblies whose ordinary Facts load local weights.
+# Environment cleanup cannot prevent a test's hardcoded filesystem fallback.
+SERVER_MODEL_EXCLUSIONS = (
+    {"fully_qualified_name": "InferenceWeb.Tests.WanVideoOracleTests", "match": "class",
+     "reason": "External Wan VAE/DiT weights and oracle fixtures; legacy tests use a fixed local fallback and may silently return or select another backend."},
+    {"fully_qualified_name": "InferenceWeb.Tests.WanVideoTests.TokenizerMatchesHuggingFaceReference", "match": "method",
+     "reason": "External UMT5 GGUF tokenizer fixture; legacy test uses a fixed local fallback and silently returns when absent."},
+)
+
 
 def list_suites(repo):
     repo = Path(repo)
@@ -20,9 +30,14 @@ def list_suites(repo):
     for identifier, project in (("server_unit", "InferenceWeb.Tests"),
                                 ("knowledge_unit", "TensorSharp.Knowledge.Tests"),
                                 ("studio_unit", "TensorSharp.Studio.Tests")):
+        excluded = [dict(item) for item in SERVER_MODEL_EXCLUSIONS] if identifier == "server_unit" else []
+        test_filter = "Category!=Bench&Requires!=Models&Requires!=Cuda&Requires!=Mlx"
+        for item in excluded:
+            operator = "!~" if item["match"] == "class" else "!="
+            test_filter += "&FullyQualifiedName" + operator + item["fully_qualified_name"]
         suites.append({"id": identifier, "kind": "dotnet", "project": project + "/" + project + ".csproj",
                        "built": repo / project / "bin/Release/net10.0" / (project + ".dll"),
-                       "filter": "Category!=Bench&Requires!=Models&Requires!=Cuda&Requires!=Mlx",
+                       "filter": test_filter, "excluded_fixtures": excluded,
                        "assertions": ["TRX contains executed passed tests", "zero failed tests", "skipped tests disclosed separately"],
                        "scope": "Environment-independent correctness only; not native GPU/model/performance coverage"})
     suites.append({"id": "client_native_contract", "kind": "client_native",
@@ -76,6 +91,8 @@ def run_suites(repo, output, mode, allow_builds, timeout_seconds):
         result = {"id": spec["id"], "scope": spec.get("scope", "client contracts without model execution"),
                   "assertions": spec["assertions"], "status": "untested", "reason": "planned; suite not executed",
                   "build_policy": {"managed_builds_allowed": bool(allow_builds), "native_builds_allowed": False}}
+        if spec.get("excluded_fixtures"):
+            result["excluded_fixtures"] = [{**item, "status": "untested"} for item in spec["excluded_fixtures"]]
         if halt is not None:
             result.update(reason=UNSAFE_RESOURCES_REASON, stage="execution_halted")
             results.append(result)

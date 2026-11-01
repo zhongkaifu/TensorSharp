@@ -47,6 +47,55 @@ class TrxTests(unittest.TestCase):
                     suites.trx_counts(self.path)
 
 
+class SuiteSelectionTests(unittest.TestCase):
+    def test_legacy_model_fallbacks_are_excluded_without_relying_on_traits(self):
+        specs = {spec["id"]: spec for spec in suites.list_suites(Path("unused"))}
+        server = specs["server_unit"]
+        predicates = server["filter"].split("&")
+        self.assertNotIn("|", server["filter"], "an OR must not bypass model exclusions")
+        self.assertIn("FullyQualifiedName!~InferenceWeb.Tests.WanVideoOracleTests", predicates)
+        self.assertIn("FullyQualifiedName!=InferenceWeb.Tests.WanVideoTests.TokenizerMatchesHuggingFaceReference", predicates)
+        self.assertNotIn("FullyQualifiedName!~InferenceWeb.Tests.WanVideoTests", predicates,
+                         "synthetic Wan tests should still execute")
+        self.assertEqual(2, len(server["excluded_fixtures"]))
+        self.assertTrue(all(item["reason"] for item in server["excluded_fixtures"]))
+        self.assertFalse(specs["knowledge_unit"]["excluded_fixtures"])
+
+    def test_prebuilt_assembly_command_and_report_keep_model_exclusions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            spec = suites.list_suites(repo)[0]
+            spec["built"].parent.mkdir(parents=True)
+            # An opaque old assembly has no corrected source traits to rely on.
+            spec["built"].write_bytes(b"legacy untagged model fixture assembly")
+
+            def process(command, **kwargs):
+                test_filter = command[command.index("--filter") + 1]
+                self.assertIn("&FullyQualifiedName!~InferenceWeb.Tests.WanVideoOracleTests", test_filter)
+                self.assertIn("&FullyQualifiedName!=InferenceWeb.Tests.WanVideoTests.TokenizerMatchesHuggingFaceReference", test_filter)
+                self.assertIn("--no-build", command)
+                self.assertIn("--no-restore", command)
+                (kwargs["artifact_dir"] / "tests.trx").write_text(trx())
+                return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+            with patch.object(suites, "list_suites", return_value=[spec]), \
+                    patch.object(suites.shutil, "which", return_value="dotnet"), \
+                    patch.object(suites, "source_identity", return_value={}), \
+                    patch.object(suites, "run_process", side_effect=process) as launch:
+                result = suites.run_suites(repo, repo / "output", "run", False, 10)[-1]
+            self.assertEqual("pass", result["status"])
+            self.assertEqual(1, launch.call_count)
+            self.assertEqual(2, len(result["excluded_fixtures"]))
+            self.assertTrue(all(item["status"] == "untested" for item in result["excluded_fixtures"]))
+
+    def test_new_assembly_sources_classify_external_wan_fixtures_as_models(self):
+        repo = Path(__file__).resolve().parents[3]
+        oracle = (repo / "InferenceWeb.Tests/WanVideoOracleTests.cs").read_text(encoding="utf-8-sig")
+        tokenizer = (repo / "InferenceWeb.Tests/WanVideoTests.cs").read_text(encoding="utf-8-sig")
+        self.assertRegex(oracle, r'\[Trait\("Requires", "Models"\)\]\s+public class WanVideoOracleTests')
+        self.assertRegex(tokenizer, r'\[Trait\("Requires", "Models"\)\]\s+public void TokenizerMatchesHuggingFaceReference')
+
+
 class SuiteTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
