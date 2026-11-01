@@ -24,6 +24,38 @@ def result():
     return {"assertions": [], "inputs": {}, "evidence": {}, "processes": []}
 
 
+class LoraHttpFixture:
+    """Protocol-shaped responses; the production chat validator stays active."""
+    def __init__(self, evidence, texts=("blue", "orange", "blue", "blue"), *, removed=True, retain=False):
+        self.evidence, self.texts = evidence, iter(texts)
+        self.removed, self.retain, self.loaded = removed, retain, False
+        self.calls = []
+        self.response_mutator = lambda response: response
+
+    def json(self, route, body=None, method=None):
+        self.calls.append((route, body, method))
+        if (body or {}).get("scale") == 1e60 or ((body or {}).get("lora") and not self.loaded):
+            param = "scale" if "scale" in body else "lora"
+            self.evidence["evidence"].setdefault("http_errors", []).append({
+                "body": json.dumps({"error": {"type": "invalid_request_error", "param": param}})})
+            raise urllib.error.HTTPError("http://fixture", 400, "invalid", {}, None)
+        if method == "DELETE":
+            self.loaded = self.retain
+            return {"removed": self.removed}
+        if route == "/v1/loras" and body:
+            self.loaded = True
+            return {"id": "fixture-lora", "modules": 1}
+        if route == "/v1/loras":
+            return {"data": [{"id": "fixture-lora", "applicable": True}] if self.loaded else []}
+        if route != "/v1/chat/completions":
+            raise AssertionError("unexpected fixture route: " + route)
+        return self.response_mutator({
+            "object": "chat.completion", "model": "model.gguf",
+            "choices": [{"message": {"role": "assistant", "content": next(self.texts)}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 9},
+        })
+
+
 class ScalingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -294,54 +326,69 @@ class ScalingTests(unittest.TestCase):
             self.assertEqual(evidence["evidence"]["numerical_comparison"]["status"], "failed")
 
     def test_lora_ignored_adapter_cannot_pass_just_because_loading_succeeded(self):
-        from eng.regression import scenarios
         profile = self.profile("lora")
         folder = self.root / "ignored-lora"
         folder.mkdir()
-        class FakeHttp:
-            loaded = False
-            def json(inner, route, body=None, method=None):
-                if route == "/v1/loras" and body:
-                    inner.loaded = True
-                    return {"id": "fixture-lora", "modules": 1}
-                if route == "/v1/loras":
-                    return {"data": [{"id": "fixture-lora", "applicable": True}] if inner.loaded else []}
-                return {"text": "blue"}
         evidence = result()
-        with patch.object(scenarios, "validate_chat", side_effect=lambda response, **kw: response["text"]), self.assertRaises(ScenarioFailure):
-            scaling._lora_requests(FakeHttp(), "model.gguf", profile, evidence, self.adapter, folder)
+        http = LoraHttpFixture(evidence, texts=("blue", "blue"))
+        with self.assertRaises(ScenarioFailure):
+            scaling._lora_requests(http, "model.gguf", profile, evidence, self.adapter, folder)
         self.assertEqual(evidence["assertions"][-1]["name"], "exact adapted oracle differs from baseline")
 
     def test_lora_changes_expected_answer_and_unload_restores_base(self):
-        from eng.regression import scenarios
         profile = self.profile("lora")
         evidence = result()
         folder = self.root / "loras"
         folder.mkdir()
-        calls = []
-        class FakeHttp:
-            loaded = False
-            def json(inner, route, body=None, method=None):
-                calls.append((route, body, method))
-                if (body or {}).get("scale") == 1e60 or ((body or {}).get("lora") and not inner.loaded):
-                    param = "scale" if "scale" in body else "lora"
-                    evidence["evidence"].setdefault("http_errors", []).append({"body": json.dumps({"error": {"type": "invalid_request_error", "param": param}})})
-                    raise urllib.error.HTTPError("http://fixture", 400, "invalid", {}, None)
-                if method == "DELETE":
-                    inner.loaded = False
-                    return {"removed": True}
-                if route == "/v1/loras" and body:
-                    inner.loaded = True
-                    return {"id": "fixture-lora", "modules": 1}
-                if route == "/v1/loras":
-                    return {"data": [{"id": "fixture-lora", "applicable": True}] if inner.loaded else []}
-                return {"text": "orange" if body.get("lora") else "blue"}
-        with patch.object(scenarios, "validate_chat", side_effect=lambda response, **kw: response["text"]):
-            scaling._lora_requests(FakeHttp(), "model.gguf", profile, evidence, self.adapter, folder)
+        http = LoraHttpFixture(evidence)
+        scaling._lora_requests(http, "model.gguf", profile, evidence, self.adapter, folder)
         oracle = evidence["evidence"]["lora_oracle"]
         self.assertEqual((oracle["before"], oracle["adapted"], oracle["after"]), ("blue", "orange", "blue"))
-        self.assertTrue(any(method == "DELETE" for _, _, method in calls))
+        self.assertTrue(any(method == "DELETE" for _, _, method in http.calls))
         self.assertEqual(self.adapter.read_bytes(), (folder / "verified-adapter.safetensors").read_bytes())
+
+    def test_lora_wrong_baseline_adaptation_or_unload_cannot_satisfy_profile_oracles(self):
+        cases = (
+            ({"texts": ("56",)}, "exact baseline oracle"),
+            ({"texts": ("blue", "56")}, "exact adapted oracle differs from baseline"),
+            ({"texts": ("blue", "orange", "orange")}, "per-request baseline remains unmodified"),
+            ({"texts": ("blue", "orange", "blue", "orange")}, "unload restores exact baseline"),
+            ({"removed": False}, "adapter unload acknowledged"),
+            ({"retain": True}, "no adapter remains after unload"),
+        )
+        for index, (changes, assertion) in enumerate(cases):
+            with self.subTest(assertion=assertion):
+                evidence = result()
+                folder = self.root / f"lora-negative-{index}"
+                folder.mkdir()
+                with self.assertRaisesRegex(ScenarioFailure, assertion):
+                    scaling._lora_requests(LoraHttpFixture(evidence, **changes), "model.gguf",
+                                           self.profile("lora"), evidence, self.adapter, folder)
+                self.assertEqual(assertion, evidence["assertions"][-1]["name"])
+                self.assertFalse(evidence["assertions"][-1]["passed"])
+                self.assertNotIn("lora_oracle", evidence["evidence"])
+
+    def test_lora_profile_oracle_does_not_disable_chat_envelope_identity_or_usage_checks(self):
+        def bad_finish(response):
+            response["choices"][0]["finish_reason"] = "length"
+            return response
+        for index, (mutator, reason) in enumerate((
+            (lambda response: dict(response, object="invalid"), "envelope"),
+            (lambda response: dict(response, model="another-model.gguf"), "identity"),
+            (lambda response: dict(response, usage={"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 8}), "usage"),
+            (lambda response: dict(response, usage={"prompt_tokens": 8, "completion_tokens": 17, "total_tokens": 25}), "budget"),
+            (bad_finish, "finish normally"),
+        )):
+            with self.subTest(reason=reason):
+                evidence = result()
+                folder = self.root / f"lora-protocol-{index}"
+                folder.mkdir()
+                http = LoraHttpFixture(evidence)
+                http.response_mutator = mutator
+                with self.assertRaisesRegex(ScenarioFailure, reason):
+                    scaling._lora_requests(http, "model.gguf", self.profile("lora"), evidence, self.adapter, folder)
+                self.assertFalse(any(body for route, body, _ in http.calls if route == "/v1/loras"),
+                                 "invalid baseline envelope must block adapter loading")
 
     def test_lora_requires_effect_oracle_and_safe_parameters(self):
         for key, bad in (("adapter_name", "../escape"), ("scale", 0), ("scale", float("inf")), ("max_tokens", 1000)):

@@ -406,7 +406,10 @@ def _lora_requests(http, model, profile, result, adapter_source, adapter_dir):
                "seed": 42, "max_tokens": params["max_tokens"], "think": False, "stream": False}
     _require(result, "owned server starts with no LoRA", http.json("/v1/loras").get("data") == [])
     def chat(body):
-        return validate_chat(http.json("/v1/chat/completions", body), expected_model=model, max_tokens=params["max_tokens"])
+        # This profile supplies exact baseline/adapted text oracles below;
+        # the shared chat validator's default arithmetic answer does not apply.
+        return validate_chat(http.json("/v1/chat/completions", body), expected_regex=None,
+                             expected_model=model, max_tokens=params["max_tokens"])
     before = chat(payload)
     _require(result, "exact baseline oracle", before == expected["base_text"], expected["base_text"], before)
     destination = adapter_dir / "verified-adapter.safetensors"
