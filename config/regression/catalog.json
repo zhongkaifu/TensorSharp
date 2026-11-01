@@ -4194,7 +4194,7 @@
       "id": "server_unit",
       "entry_point": "InferenceWeb.Tests/InferenceWeb.Tests.csproj",
       "status": "suite",
-      "recipe": "Use --include-suites; prebuilt default, --allow-builds explicitly enables building. Environment-independent filter excludes Bench/Models/Cuda/Mlx.",
+      "recipe": "Use --include-suites; prebuilt default, --allow-builds explicitly enables managed building. Correctness filter excludes Bench/Models/Cuda/Mlx/GgmlCuda/GgmlMetal/GgmlVulkan and pins GGML CPU; discovery may enumerate GPU devices.",
       "assertions": [
         "Positive passing TRX execution count; zero failed/error/timeout/aborted tests; inconsistent or absent counters fail.",
         "Unexecuted/inconclusive tests remain explicit skipped coverage; this lane does not establish native/model or desktop visual qualification."
@@ -4230,7 +4230,7 @@
       "id": "knowledge_unit",
       "entry_point": "TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj",
       "status": "suite",
-      "recipe": "Use --include-suites; prebuilt default, --allow-builds explicitly enables building. Environment-independent filter excludes Bench/Models/Cuda/Mlx.",
+      "recipe": "Use --include-suites; prebuilt default, --allow-builds explicitly enables managed building. Correctness filter excludes Bench/Models/Cuda/Mlx/GgmlCuda/GgmlMetal/GgmlVulkan and pins GGML CPU; discovery may enumerate GPU devices.",
       "assertions": [
         "Positive passing TRX execution count; zero failed/error/timeout/aborted tests; inconsistent or absent counters fail.",
         "Unexecuted/inconclusive tests remain explicit skipped coverage; this lane does not establish native/model or desktop visual qualification."
@@ -4247,7 +4247,7 @@
       "id": "studio_unit",
       "entry_point": "TensorSharp.Studio.Tests/TensorSharp.Studio.Tests.csproj",
       "status": "suite",
-      "recipe": "Use --include-suites; prebuilt default, --allow-builds explicitly enables building. Environment-independent filter excludes Bench/Models/Cuda/Mlx.",
+      "recipe": "Use --include-suites; prebuilt default, --allow-builds explicitly enables managed building. Correctness filter excludes Bench/Models/Cuda/Mlx/GgmlCuda/GgmlMetal/GgmlVulkan and pins GGML CPU; discovery may enumerate GPU devices.",
       "assertions": [
         "Positive passing TRX execution count; zero failed/error/timeout/aborted tests; inconsistent or absent counters fail.",
         "Unexecuted/inconclusive tests remain explicit skipped coverage; this lane does not establish native/model or desktop visual qualification."

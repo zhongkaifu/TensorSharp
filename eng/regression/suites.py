@@ -31,7 +31,10 @@ def list_suites(repo):
                                 ("knowledge_unit", "TensorSharp.Knowledge.Tests"),
                                 ("studio_unit", "TensorSharp.Studio.Tests")):
         excluded = [dict(item) for item in SERVER_MODEL_EXCLUSIONS] if identifier == "server_unit" else []
-        test_filter = "Category!=Bench&Requires!=Models&Requires!=Cuda&Requires!=Mlx"
+        # Prebuilt assemblies may have different skip gates: exclude GPU traits
+        # in the runner as well as pinning GGML CPU in the child environment.
+        test_filter = ("Category!=Bench&Requires!=Models&Requires!=Cuda&Requires!=Mlx"
+                       "&Requires!=GgmlCuda&Requires!=GgmlMetal&Requires!=GgmlVulkan")
         for item in excluded:
             operator = "!~" if item["match"] == "class" else "!="
             test_filter += "&FullyQualifiedName" + operator + item["fully_qualified_name"]

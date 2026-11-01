@@ -101,8 +101,10 @@ outputs must also be deployed beforehand: this mode does not stage native assets
 Existing PTX/fatbin/identity sidecars are retained across SDK incremental cleanup;
 `Clean` and `Rebuild` are rejected while the CUDA skip flag is enabled.
 The suite scopes runtime execution with `TS_TEST_GGML_BACKEND=cpu` instead of
-changing CUDA/Vulkan build flags. Existing native libraries must be prepared
-separately in an isolated build directory following `DEVELOPMENT.md`. Native
+changing CUDA/Vulkan build flags. Its test filter also excludes `Cuda`, `Mlx`,
+`GgmlCuda`, `GgmlMetal` and `GgmlVulkan` requirements while retaining `GgmlCpu`;
+test discovery may still query GPU driver availability. Existing native libraries
+must be prepared separately in an isolated build directory following `DEVELOPMENT.md`. Native
 CTest likewise requires an explicit `--native-test-build-dir`; `--allow-builds`
 does not build it. A managed build exit code alone is never a passing test:
 required client assemblies and actual contract/TRX assertion evidence must exist.

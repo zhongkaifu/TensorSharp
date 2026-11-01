@@ -48,6 +48,21 @@ class TrxTests(unittest.TestCase):
 
 
 class SuiteSelectionTests(unittest.TestCase):
+    def test_cpu_lanes_exclude_all_gpu_traits_and_retain_ggml_cpu(self):
+        gpu_traits = {"Cuda", "Mlx", "GgmlCuda", "GgmlMetal", "GgmlVulkan"}
+        for spec in suites.list_suites(Path("unused")):
+            if spec["kind"] != "dotnet":
+                continue
+            with self.subTest(suite=spec["id"]):
+                self.assertNotIn("|", spec["filter"], "an OR must not bypass GPU exclusions")
+                predicates = spec["filter"].split("&")
+                excluded = {item.removeprefix("Requires!=") for item in predicates
+                            if item.startswith("Requires!=")}
+                self.assertTrue(gpu_traits <= excluded, "GPU selection must not depend on assembly skip gates")
+                self.assertNotIn("GgmlCpu", excluded, "native CPU correctness tests should remain eligible")
+                self.assertIn("Models", excluded)
+                self.assertIn("Category!=Bench", predicates)
+
     def test_legacy_model_fallbacks_are_excluded_without_relying_on_traits(self):
         specs = {spec["id"]: spec for spec in suites.list_suites(Path("unused"))}
         server = specs["server_unit"]
@@ -73,6 +88,10 @@ class SuiteSelectionTests(unittest.TestCase):
                 test_filter = command[command.index("--filter") + 1]
                 self.assertIn("&FullyQualifiedName!~InferenceWeb.Tests.WanVideoOracleTests", test_filter)
                 self.assertIn("&FullyQualifiedName!=InferenceWeb.Tests.WanVideoTests.TokenizerMatchesHuggingFaceReference", test_filter)
+                for trait in ("Cuda", "Mlx", "GgmlCuda", "GgmlMetal", "GgmlVulkan"):
+                    self.assertIn("Requires!=" + trait, test_filter.split("&"))
+                self.assertNotIn("Requires!=GgmlCpu", test_filter.split("&"))
+                self.assertEqual("cpu", kwargs["env"]["TS_TEST_GGML_BACKEND"])
                 self.assertIn("--no-build", command)
                 self.assertIn("--no-restore", command)
                 (kwargs["artifact_dir"] / "tests.trx").write_text(trx())
