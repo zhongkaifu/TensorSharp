@@ -144,7 +144,8 @@ as diagnostics; they are not additional passing thresholds.
 
 The sequence consistency scenario also covers short-short, long-long,
 short-long-short and long-short orderings with 32/512 prompt tokens and 32
-teacher-forced decode steps. It compares model reuse after `ResetKVCache` with
+compared logit rows (one prefill row plus 31 teacher-forced decode forwards).
+It compares model reuse after `ResetKVCache` with
 fresh-process controls and records the preceding case/length at the first
 divergence. This evidence can isolate order-sensitive behavior; it does not
 itself establish the cause of an MoE failure.

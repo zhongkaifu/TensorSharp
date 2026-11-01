@@ -79,10 +79,17 @@ def run_http_client(http, model, context, result):
     # Imported only after scenarios has initialized the shared validation helpers.
     from .scenarios import validate_chat
     endpoint = local_endpoint(http.base)
+    alias = result["evidence"].get("model_alias")
+    if (not isinstance(alias, dict) or alias.get("loaded_filename") != model or
+            alias.get("request_model") != model or alias.get("expected_response_model") != model or
+            not isinstance(alias.get("advertised_id"), str) or
+            not alias["advertised_id"] or alias["advertised_id"] not in {model, Path(model).stem}):
+        raise ValueError("HTTP client requires a verified advertised alias for the loaded model")
+    sdk_model = alias["advertised_id"]
     command = context["http_client_command"]
     oracle = load_oracle(context["repo"])
     evidence = result["evidence"]["http_client"] = {
-        "endpoint": endpoint, "model": model, "oracle": _ORACLE,
+        "endpoint": endpoint, "model": model, "sdk_model": sdk_model, "oracle": _ORACLE,
         "oracle_sha256": file_hash(Path(context["repo"]) / _ORACLE),
         "client_command": command, "client_sha256": file_hash(command[-1]), "invocations": [],
         "sampling": "SDK example omits seed/temperature; owned-server defaults are seed42 and greedy. Raw controls explicitly request them.",
@@ -109,7 +116,9 @@ def run_http_client(http, model, context, result):
         for mode in ("stream", "response"):
             remaining = http.remaining()
             seconds = max(1, min(86400, math.ceil(remaining)))
-            argv = list(command) + ["--base-url", endpoint, "--model", model, "--client", client, "--mode", mode,
+            # The SDK example requires the exact /v1/models ID, while response
+            # identity and raw controls use the verified loaded filename.
+            argv = list(command) + ["--base-url", endpoint, "--model", sdk_model, "--client", client, "--mode", mode,
                 "--prompt", PROMPT, "--follow-up", FOLLOW_UP, "--max-tokens", "64", "--timeout-seconds", str(seconds)]
             client_env = dict(context.get("env") or {})
             # The SDK client must reach only this owned loopback server even on a
@@ -125,7 +134,7 @@ def run_http_client(http, model, context, result):
             row = {"client": client, "mode": mode, "passed": False}
             evidence["invocations"].append(row)
             try:
-                answers = validate_client_output(item, client=client, mode=mode, model=model, endpoint=endpoint, oracle=oracle)
+                answers = validate_client_output(item, client=client, mode=mode, model=sdk_model, endpoint=endpoint, oracle=oracle)
             except ValueError as error:
                 row["error"] = str(error)
                 _require(result, f"HTTP {client} {mode} semantic two-turn conversation", False, ["4", "12"], str(error))

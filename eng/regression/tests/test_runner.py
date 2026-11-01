@@ -85,6 +85,72 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(2, exit_code)
         self.assertIn("scenario selector", report["results"][-1]["reason"])
 
+    def add_unbound_recipes(self):
+        ids = ("embedding_media", "distributed", "client_live", "native_unit")
+        self.catalog_data["scenarios"].extend({"id": identifier, "status": "recipe",
+            "entry_point": "eng/fixture.py", "recipe": "Run with separately prepared fixture",
+            "requirements": ["Explicit fixture and supported hardware"],
+            "assertions": ["A meaningful result must be checked"], "evidence": ["eng/fixture.py"]}
+            for identifier in ids)
+        self.catalog.write_text(json.dumps(self.catalog_data))
+        return ids
+
+    def test_explicit_unbound_recipe_is_catalog_untested_not_selection_error(self):
+        for identifier in self.add_unbound_recipes():
+            with self.subTest(identifier=identifier):
+                self.output = self.repo / "artifacts" / identifier
+                exit_code, report = self.invoke("--mode", "run", "--scenarios", identifier)
+                self.assertEqual(3, exit_code)
+                rows = [row for row in report["results"] if row["id"] != "config-coverage-audit"]
+                self.assertEqual(1, len(rows))
+                self.assertEqual(("catalog::" + identifier, "catalog", "untested"),
+                                 (rows[0]["id"], rows[0]["scope"], rows[0]["status"]))
+                self.assertNotIn("preset", rows[0])
+                self.assertNotIn("family", rows[0])
+                self.assertNotIn("backend", rows[0])
+                self.assertEqual(["A meaningful result must be checked"], rows[0]["unexecuted_assertions"])
+                self.assertIn(identifier, (self.output / "report.md").read_text(encoding="utf-8"))
+        self.config.assert_not_called()
+        self.prepare.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_broad_run_discloses_unbound_recipes_without_false_pass(self):
+        ids = self.add_unbound_recipes()
+        exit_code, report = self.invoke("--mode", "run")
+        self.assertEqual(0, exit_code)
+        rows = [row for row in report["results"] if row.get("scope") == "catalog"]
+        self.assertEqual(set(ids), {row["scenario"] for row in rows})
+        self.assertTrue(all(row["status"] == "untested" and "backend" not in row for row in rows))
+        self.assertEqual(1, self.run.call_count)
+        self.assertEqual(["tiny::ggml_cpu::cli_text"], [row["id"] for row in report["results"]
+                         if row["status"] == "pass" and row["id"] != "config-coverage-audit"])
+
+    def test_strict_broad_run_keeps_unbound_recipe_coverage_incomplete(self):
+        self.add_unbound_recipes()
+        exit_code, report = self.invoke("--mode", "run", "--strict")
+        self.assertEqual(3, exit_code)
+        self.assertEqual(4, len([row for row in report["results"] if row.get("scope") == "catalog"]))
+
+    def test_broad_plan_preserves_bound_recipe_and_separate_catalog_gaps(self):
+        ids = self.add_unbound_recipes()
+        self.catalog_data["presets"][0]["scenarios"].append("bound_recipe")
+        self.catalog_data["scenarios"].append({"id": "bound_recipe", "status": "recipe", "recipe": "Existing model recipe"})
+        self.catalog.write_text(json.dumps(self.catalog_data))
+        exit_code, report = self.invoke("--mode", "plan")
+        self.assertEqual(0, exit_code)
+        self.assertEqual(set(ids), {row["scenario"] for row in report["results"] if row.get("scope") == "catalog"})
+        bound = [row for row in report["results"] if row.get("scenario") == "bound_recipe"]
+        self.assertEqual(1, len(bound))
+        self.assertEqual(("tiny", "ggml_cpu", "untested"), (bound[0]["preset"], bound[0]["backend"], bound[0]["status"]))
+        self.prepare.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_unselected_catalog_recipes_do_not_change_explicit_model_case(self):
+        self.add_unbound_recipes()
+        exit_code, report = self.invoke("--mode", "run", "--scenarios", "cli_text", "--strict")
+        self.assertEqual(0, exit_code)
+        self.assertFalse(any(row.get("scope") == "catalog" for row in report["results"]))
+
     def test_inventory_pass_does_not_hide_zero_executions(self):
         self.availability.return_value = (False, "CLI unavailable")
         exit_code, report = self.invoke("--mode", "run")

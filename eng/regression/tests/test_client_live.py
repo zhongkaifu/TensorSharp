@@ -10,15 +10,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from regression import client_live, runner, scenarios
 
 REPO = Path(__file__).resolve().parents[3]
-MODEL = "fixture-model"
+MODEL = "fixture-model.gguf"
+ADVERTISED = "fixture-model"
 ENDPOINT = "http://127.0.0.1:12345/v1/"
 
 
-def captured(client="extensions", mode="stream"):
+def captured(client="extensions", mode="stream", model=ADVERTISED):
     return {"exit_code": 0, "timed_out": False, "cancelled": False, "output_truncated": False,
             "teardown": {"attempted": True, "verified": True}, "stage": "synthetic",
             "stdout": "4\n12\n",
-            "stderr": f"TensorSharp HTTP chat via {client}; mode={mode}; model={MODEL}; endpoint={ENDPOINT}\n"}
+            "stderr": f"TensorSharp HTTP chat via {client}; mode={mode}; model={model}; endpoint={ENDPOINT}\n"}
 
 
 class FakeHttp:
@@ -53,10 +54,12 @@ class ClientLiveTests(unittest.TestCase):
         self.binary.write_bytes(b"never executed")
         self.context = {"repo": REPO, "artifact_dir": self.root, "http_client_command": ["dotnet", str(self.binary)],
                         "env": {"CUDA_VISIBLE_DEVICES": "0"}, "timeout_seconds": 600}
-        self.result = {"assertions": [], "inputs": {}, "evidence": {}, "processes": []}
+        self.result = {"assertions": [], "inputs": {}, "evidence": {"model_alias": {
+            "loaded_filename": MODEL, "advertised_id": ADVERTISED,
+            "request_model": MODEL, "expected_response_model": MODEL}}, "processes": []}
 
     def validate(self, item):
-        return client_live.validate_client_output(item, client="extensions", mode="stream", model=MODEL, endpoint=ENDPOINT, oracle=self.oracle)
+        return client_live.validate_client_output(item, client="extensions", mode="stream", model=ADVERTISED, endpoint=ENDPOINT, oracle=self.oracle)
 
     def test_strict_two_answer_lines_accept_only_semantic_answers(self):
         for text in ("4\n12\n", " 4.\n 12. \n"):
@@ -104,12 +107,16 @@ class ClientLiveTests(unittest.TestCase):
         self.assertEqual(process.call_count, 4)
         self.assertEqual(len(self.result["processes"]), 4)
         self.assertEqual(len(http.calls), 2)
+        self.assertTrue(all(payload["model"] == MODEL for _, payload in http.calls))
+        self.assertEqual(self.result["evidence"]["http_client"]["sdk_model"], ADVERTISED)
+        self.assertEqual(self.result["evidence"]["http_client"]["model"], MODEL)
         self.assertTrue(all(row["passed"] for row in self.result["evidence"]["http_client"]["invocations"]))
         seen = set()
         for call in process.call_args_list:
             argv = call.args[0]
             seen.add((argv[argv.index("--client") + 1], argv[argv.index("--mode") + 1]))
             self.assertEqual(argv[argv.index("--base-url") + 1], ENDPOINT)
+            self.assertEqual(argv[argv.index("--model") + 1], ADVERTISED)
             self.assertEqual(argv[argv.index("--follow-up") + 1], client_live.FOLLOW_UP)
             self.assertNotIn("--seed", argv)
             self.assertNotIn("--temperature", argv)
@@ -117,6 +124,34 @@ class ClientLiveTests(unittest.TestCase):
             self.assertEqual(call.kwargs["env"]["HTTP_PROXY"], "")
             self.assertEqual(call.kwargs["env"]["NO_PROXY"], "127.0.0.1,localhost,::1")
         self.assertEqual(seen, {(client, mode) for client in ("extensions", "openai") for mode in ("stream", "response")})
+
+    def test_exact_advertised_filename_is_also_valid(self):
+        self.result["evidence"]["model_alias"]["advertised_id"] = MODEL
+        def execute(argv, **kwargs):
+            self.assertEqual(argv[argv.index("--model") + 1], MODEL)
+            return captured(argv[argv.index("--client") + 1], argv[argv.index("--mode") + 1], model=MODEL)
+        with patch.object(client_live, "run_process", side_effect=execute) as process:
+            client_live.run_http_client(FakeHttp(), MODEL, self.context, self.result)
+        self.assertEqual(process.call_count, 4)
+
+    def test_missing_unknown_or_mismatched_alias_blocks_all_requests(self):
+        valid = self.result["evidence"]["model_alias"]
+        aliases = [None, {}, dict(valid, advertised_id="unknown-model"),
+                   dict(valid, advertised_id=""), dict(valid, advertised_id=None),
+                   dict(valid, loaded_filename="other-model.gguf"),
+                   dict(valid, request_model="other-model.gguf"),
+                   dict(valid, expected_response_model="other-model.gguf")]
+        for alias in aliases:
+            result = copy.deepcopy(self.result)
+            if alias is None:
+                result["evidence"].pop("model_alias")
+            else:
+                result["evidence"]["model_alias"] = alias
+            http = FakeHttp()
+            with self.subTest(alias=alias), patch.object(client_live, "run_process") as process, self.assertRaisesRegex(ValueError, "verified advertised alias"):
+                client_live.run_http_client(http, MODEL, self.context, result)
+            process.assert_not_called()
+            self.assertEqual(http.calls, [])
 
     def test_failed_first_client_stops_later_invocations_and_keeps_evidence(self):
         item = captured()

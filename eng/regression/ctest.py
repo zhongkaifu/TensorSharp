@@ -161,6 +161,9 @@ def run_native_tests(repo, build_dir, output, mode, backend="cpu", pattern=None,
         result["test_binaries"] = {test["command"][0]: file_hash(test["command"][0])
                                    for test in selected if test.get("command")}
         junit = output / "ctest.xml"
+        # A successful process exit is insufficient without a report from this
+        # invocation. Invalidate only our known result file before execution.
+        junit.unlink(missing_ok=True)
         expression = "^(" + "|".join(re.escape(test["name"]) for test in selected) + ")$"
         command = common + ["--parallel", "1", "--timeout", str(timeout_seconds), "--no-tests=error",
                             "--fixture-exclude-any", ".*", "-R", expression, "--output-on-failure", "--output-junit", str(junit.resolve())]

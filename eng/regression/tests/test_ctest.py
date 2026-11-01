@@ -107,14 +107,48 @@ class CTestTests(unittest.TestCase):
         self.assertEqual(calls[1][1]["env"]["CUDA_VISIBLE_DEVICES"], "")
 
     def test_zero_exit_without_junit_or_only_skips_is_not_pass(self):
+        write_skipped_report = False
         def execute(command, **kwargs):
             if "--show-only=json-v1" in command:
                 return {"exit_code": 0, "stdout": json.dumps(payload(case("fixture-cpu"))), "stderr": ""}
+            if write_skipped_report:
+                self.output.joinpath("ctest.xml").write_text('<testsuite><testcase name="fixture-cpu"><skipped/></testcase></testsuite>')
             return {"exit_code": 0, "stdout": "100% tests passed", "stderr": ""}
         with patch.object(ctest.shutil, "which", return_value="ctest"), patch.object(ctest, "run_process", side_effect=execute):
             self.assertEqual(self.invoke()[0]["status"], "fail")
-            self.output.joinpath("ctest.xml").write_text('<testsuite><testcase name="fixture-cpu"><skipped/></testcase></testsuite>')
+            write_skipped_report = True
             self.assertEqual(self.invoke()[0]["status"], "untested")
+
+    def test_zero_exit_without_fresh_junit_rejects_old_passing_report(self):
+        self.output.mkdir()
+        junit = self.output / "ctest.xml"
+        junit.write_text('<testsuite><testcase name="fixture-cpu"/></testsuite>')
+        unrelated = self.output / "keep.txt"
+        unrelated.write_text("preserve other diagnostic evidence")
+        def execute(command, **kwargs):
+            if "--show-only=json-v1" in command:
+                return {"exit_code": 0, "stdout": json.dumps(payload(case("fixture-cpu"))), "stderr": ""}
+            self.assertFalse(junit.exists(), "stale report must be removed before execution")
+            return {"exit_code": 0, "stdout": "100% tests passed", "stderr": "no new report written"}
+        with patch.object(ctest.shutil, "which", return_value="ctest"), patch.object(ctest, "run_process", side_effect=execute) as process:
+            results = self.invoke()
+        self.assertEqual(process.call_count, 2)
+        self.assertEqual([row["status"] for row in results], ["fail"])
+        self.assertIn("ctest.xml", results[0]["reason"])
+        self.assertEqual(results[0]["processes"][-1]["stderr"], "no new report written")
+        self.assertFalse(junit.exists())
+        self.assertEqual(unrelated.read_text(), "preserve other diagnostic evidence")
+
+    def test_junit_invalidation_failure_prevents_native_execution(self):
+        discovery = {"exit_code": 0, "stdout": json.dumps(payload(case("fixture-cpu"))), "stderr": ""}
+        with patch.object(ctest.shutil, "which", return_value="ctest"), \
+             patch.object(ctest, "run_process", return_value=discovery) as process, \
+             patch.object(Path, "unlink", side_effect=PermissionError("cannot invalidate stale ctest.xml")) as unlink:
+            results = self.invoke()
+        unlink.assert_called_once_with(missing_ok=True)
+        process.assert_called_once()
+        self.assertEqual(results[0]["status"], "fail")
+        self.assertIn("cannot invalidate stale ctest.xml", results[0]["reason"])
 
     def test_unverified_discovery_blocks_native_test_launch(self):
         discovery = {"exit_code": 0, "stdout": json.dumps(payload(case("fixture-cpu"))), "stderr": "",

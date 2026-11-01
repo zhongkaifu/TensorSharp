@@ -1,8 +1,9 @@
 # Local hardware-aware regression
 
 `python eng/run-local-regression.py` is the local orchestration entry point. It
-requires Python 3.10+ and the standard library, runs one model/process at a time,
-and never uploads evidence. Planning is the default. Existing `TensorSharp.TestMatrix`,
+requires Python 3.10+ and the standard library, prepares models and runs scenario
+cells sequentially, and never uploads evidence. A scenario may own both server
+and client processes. Planning is the default. Existing `TensorSharp.TestMatrix`,
 the release validation tools, `ForcedLogitProbe`, and test projects remain useful;
 their scope and recipes are inventoried in
 [`config/regression/catalog.json`](../config/regression/catalog.json) and the
@@ -11,9 +12,13 @@ their scope and recipes are inventoried in
 This is a bounded regression suite, not a claim that every architecture, hardware,
 quantization, context length, or feature combination has passed. An executable
 adapter, a supported recipe, and an actual passing result are different things.
-The catalog explicitly records all three. Image/video generation, speculative
-variants, broader agent workflows, distributed/multi-GPU paths, and missing model-family
-presets retain explicit gaps where the unified runner has no validated adapter.
+The catalog records source support, adapters and recipes; execution reports record
+actual outcomes. It inventories 67 config documents: 50 standalone presets,
+16 LoRA plugins and one MTP overlay. Its 43 scenario definitions comprise
+24 executable adapters, five global suite categories and 14 recipes. These are
+coverage declarations, not counts of qualified models or passing tests. Broader
+image quality/editing, video generation, learned speculative variants, agent
+workflows and distributed/multi-GPU paths retain explicit gaps.
 
 ## 本地快速开始
 
@@ -108,7 +113,12 @@ the conventional `cuda_kernels` directory. These are distinct from host identiti
 captured before the run, and do not claim independent observation of mapped modules.
 The InferenceWeb lane excludes benchmark, real-model, CUDA and MLX requirements;
 their separate coverage remains in the matrix, not inferred from this lane.
-TRX counters must show executed passing tests, and skipped tests are disclosed.
+Explicit exclusions also block the historical Wan oracle class and UMT5 tokenizer
+fixture in older prebuilt assemblies, whose hardcoded local paths bypassed model
+traits. Reports list these excluded fixtures as untested. TRX counters must show
+executed passing tests, and skipped tests are disclosed. The `--include-suites`
+and `--native-test-build-dir` switches select global lanes independently of the
+per-model `--models` and `--scenarios` selectors.
 
 ## Budget and download policy
 
@@ -188,8 +198,10 @@ invocation, a new report is created under the selected repository.
   VRAM or assume that disk-paged experts fit. These estimates are conservative
   planning gates, not measured peak usage or a guarantee against OOM.
 - Unknown model sizes, RAM, VRAM, native runtime capability, missing fixtures and
-  unavailable executables are recorded, not treated as successes. A plan only
-  reads local file metadata; model hashes are computed during actual preparation.
+  unavailable executables are recorded, not treated as successes. Planning reads
+  model file metadata without reading or hashing model payloads; model hashes are
+  computed during actual preparation. Deployment binaries and runtime metadata
+  are inventoried separately and may be hashed during planning.
 - `--ram-budget-gib`, `--vram-budget-gib`, `--ram-required-gib`, and
   `--vram-required-gib` are explicit machine/measurement overrides. They do not
   enable partial offload by themselves. The explicit CPU MoE profile below
@@ -276,7 +288,8 @@ request boundary, not implicit recall of history omitted by the client.
 `ForcedLogitProbe` replays fixed token histories, checks all finite rows,
 completion metadata, identical top-1 and the existing numerical gates; it retains
 first-divergence diagnostics. `forced_logits_sequence` uses 32/512-token prompts
-and 32 teacher-forced decode steps for short-short, long-long, short-long-short,
+and 32 compared logit rows (one initial prefill row plus 31 teacher-forced decode
+forwards) for short-short, long-long, short-long-short,
 and long-short orders, comparing every reset case against a separate fresh-process
 baseline with matching prompt/forced-history hashes. This detects state that
 depends on a previous input length even when equal-length repeats are stable.
@@ -314,12 +327,21 @@ responses, and records repeated-seed hashes without declaring semantic quality
 or bitwise determinism. The corresponding broader quality, attachment and
 learned-speculation recipes remain untested.
 
+`server_agents` runs two bounded arithmetic reviewers through host coordination
+tools, requiring completed child results, exact child/final JSON and a separate
+request-level opt-out. Skills, code execution and worker tools remain disabled.
+It checks distinct workspace identities, not filesystem confinement; the host
+uses its normal per-user `TensorSharp/agent-workspaces` directory. Dependency
+scheduling, mutable tools and cancellation propagation remain untested.
+
 Media understanding needs the documented public/synthetic inputs from
 `eng/make-test-media.sh` supplied through `--media-dir`. Missing media never
 causes a pass. These inputs have known content and assertions; arbitrary private
-files are not scanned or copied into reports. Model-generated tool calls are
-validated as data and never executed. Agent configs are projected to an allowlist
-of model options; host shell/network/install permissions are not inherited.
+files are not scanned or copied into reports. The `cli_tools` and `server_tools`
+fixtures validate model-generated calls as data without executing them;
+`server_agents` executes only its bounded coordination workflow. Agent configs
+are projected to an allowlist of model options; host shell/network/install
+permissions are not inherited.
 
 Host processes receive a scrubbed environment, fixed sampling and short context,
 artifact-local caches, loopback-only HTTP binding and bounded log capture. A
@@ -382,7 +404,15 @@ The tool does not publish them.
 
 For CI/local acceptance use `--strict` and select a deliberately bounded scenario
 matrix. A broad run containing known recipes cannot honestly satisfy strict full
-coverage. Re-run a failed case using its `reproduce` argv in `report.json`; reruns
+coverage. Explicit `unsupported` results remain visible but do not by themselves
+trigger strict exit code 3. Four catalog-only recipes (`embedding_media`,
+`distributed`, `client_live` and `native_unit`) have neither per-preset
+associations nor a global execution lane. When selected, they appear once as
+`catalog::<scenario-id>` with `scope=catalog` and `status=untested`, without
+inventing a model or backend association. A recipe-only run exits 3; its plan
+exits 0 with untested coverage. Consult the catalog as well as the run report
+when assessing remaining coverage.
+Re-run a failed case using its `reproduce` argv in `report.json`; reruns
 always create fresh evidence and do not import old passes.
 
 ## Harness verification without models

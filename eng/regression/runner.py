@@ -250,6 +250,21 @@ def result_stub(preset, backend, scenario, status, reason, **details):
             "status": status, "reason": reason, **details}
 
 
+def unbound_catalog_recipes(catalog, patterns):
+    """Disclose selected recipes with no model binding, without inventing one."""
+    bound = {scenario for preset in catalog["presets"] for scenario in preset.get("scenarios", [])}
+    return [{"id": "catalog::" + scenario["id"], "scope": "catalog", "scenario": scenario["id"],
+             "status": "untested", "stage": "coverage_inventory",
+             "reason": "Catalog recipe has no preset or global execution binding; its documented requirements need separate qualification.",
+             "catalog_status": "recipe", "entry_point": scenario.get("entry_point"),
+             "recipe": scenario.get("recipe"), "requirements": scenario.get("requirements", []),
+             "source_evidence": scenario.get("evidence", []),
+             "unexecuted_assertions": scenario.get("assertions", [])}
+            for scenario in catalog["scenarios"]
+            if scenario.get("status") == "recipe" and scenario["id"] not in bound
+            and selected(scenario["id"], patterns)]
+
+
 def record_execution_halt(report, result):
     evidence = containment_failure_evidence(result)
     if evidence is None:
@@ -361,6 +376,7 @@ def main(argv=None):
         presets = [p for p in catalog["presets"] if selected(p["id"], args.models)]
         if not presets:
             raise ValueError("model selector matched no catalog presets")
+        report["results"].extend(unbound_catalog_recipes(catalog, args.scenarios))
         download_reserved, executed_models = 0, set()
         halt = None
         if args.mode == "run" and unsafe_process_state() is not None:
