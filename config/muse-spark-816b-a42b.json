@@ -1,0 +1,83 @@
+// Metadata-only source verification: config/regression/source-pins.json.
+// Public project-linked publisher, immutable revision plus SHA256 for every file.
+// No quality/device qualification is implied. The local runner budgets the complete shard group.
+// Projector optional for text, required and hash-verified for image tests; no learned draft enabled.
+{
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/muse-spark-816b-a42b"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00001-of-00008.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/resolve/c00670568b6ce5e56a247f67091247984df2a01e/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00001-of-00008.gguf"
+    ],
+    "sha256": "35e2dccb1263a8d5ea60bc60701819757fd3833896e9980fdff8f878a7a8947e",
+    "files": [
+      {
+        "path": "${root}/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00002-of-00008.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/resolve/c00670568b6ce5e56a247f67091247984df2a01e/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00002-of-00008.gguf"
+        ],
+        "sha256": "13ef68334c913ddf2f33998e7668d6766791c0937c375cbc0b7f3970474815a7"
+      },
+      {
+        "path": "${root}/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00003-of-00008.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/resolve/c00670568b6ce5e56a247f67091247984df2a01e/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00003-of-00008.gguf"
+        ],
+        "sha256": "587f4cb4a928e8e0a25dda4a399d539e5f33a99a27e0add4758981f70fabaeee"
+      },
+      {
+        "path": "${root}/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00004-of-00008.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/resolve/c00670568b6ce5e56a247f67091247984df2a01e/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00004-of-00008.gguf"
+        ],
+        "sha256": "02942f790c113aa94cc6ac6eb0606f9dd3e849750b90c5d38e026588529a57ad"
+      },
+      {
+        "path": "${root}/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00005-of-00008.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/resolve/c00670568b6ce5e56a247f67091247984df2a01e/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00005-of-00008.gguf"
+        ],
+        "sha256": "49b6efafde7972047331127a6caa1ee6053fbb3b26d80155a18ba98d212cc39e"
+      },
+      {
+        "path": "${root}/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00006-of-00008.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/resolve/c00670568b6ce5e56a247f67091247984df2a01e/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00006-of-00008.gguf"
+        ],
+        "sha256": "c907c40f8e282a220f6097e41f8824564f5acc3d697066b910309bade05f28ea"
+      },
+      {
+        "path": "${root}/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00007-of-00008.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/resolve/c00670568b6ce5e56a247f67091247984df2a01e/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00007-of-00008.gguf"
+        ],
+        "sha256": "1973d7063cf1a07a3609904e2ac5b4b2c161e58af6c2a2850c56ae47790daeb6"
+      },
+      {
+        "path": "${root}/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00008-of-00008.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/resolve/c00670568b6ce5e56a247f67091247984df2a01e/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00008-of-00008.gguf"
+        ],
+        "sha256": "9db635ddec9ca114af99c57ade557b34b27ea266c564fc9f755d446613c42f37"
+      }
+    ]
+  },
+  "mmproj": {
+    "path": "${root}/mmproj-Q8_0.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/resolve/c00670568b6ce5e56a247f67091247984df2a01e/mmproj-Q8_0.gguf"
+    ],
+    "sha256": "c3a0613bb2be1dde38faec3d1d1bf2c118013626ab9623936de500a656232ed3",
+    "optional": true
+  }
+}

@@ -15,17 +15,18 @@ import urllib.error
 from unittest.mock import patch
 from types import SimpleNamespace
 
-from eng.regression.processes import clean_environment, redact, run_process
+from eng.regression.processes import ManagedProcess, clean_environment, redact, run_process
 from eng.regression.scenarios import (
     ScenarioFailure, ScenarioUntested, _Http, availability, backend_evidence, extract_assistant,
     run_scenario, validate_chat, validate_embeddings, validate_logit_metrics,
     validate_sequence_metrics,
     _history_hashes,
+    _json_loads, cancellation_evidence,
 )
 
 
 def completion(text="56"):
-    return {"object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+    return {"object": "chat.completion", "model": "synthetic.gguf", "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 12, "completion_tokens": 1, "total_tokens": 13}}
 
 
@@ -67,6 +68,33 @@ class ScenarioContracts(unittest.TestCase):
         value["choices"][0]["finish_reason"] = "length"
         with self.assertRaises(ScenarioFailure):
             validate_chat(value)
+
+    def test_completion_model_and_budget_are_validated(self):
+        with self.assertRaisesRegex(ScenarioFailure, "identity"):
+            validate_chat(completion(), expected_model="another-model")
+        with self.assertRaisesRegex(ScenarioFailure, "budget"):
+            validate_chat(completion(), max_tokens=0)
+
+    def test_duplicate_json_properties_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            _json_loads('{"answer": 1, "answer": 56}')
+
+    def test_cancel_telemetry_requires_matching_scope_link_and_early_stop(self):
+        start = {"scope": {"RequestId": "owned"}, "props": {"ChatcmplId": "chatcmpl-owned"}}
+        aborted = {"scope": {"RequestId": "owned"}, "event": {"id": 1503, "name": "ChatAborted"},
+                   "message": "chat.cancelled tokens=2", "props": {"Tokens": 2}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tensorsharp-server-test.jsonl"
+            def proof(first, second):
+                path.write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+                return cancellation_evidence(directory, "owned", "chatcmpl-owned", 512)
+            self.assertTrue(proof(start, aborted)["verified"])
+            other = copy.deepcopy(aborted); other["scope"]["RequestId"] = "unrelated"
+            self.assertFalse(proof(start, other)["verified"])
+            other = copy.deepcopy(aborted); other["props"]["Tokens"] = 512
+            self.assertFalse(proof(start, other)["verified"])
+            other_start = copy.deepcopy(start); other_start["props"]["ChatcmplId"] = "wrong-stream"
+            self.assertFalse(proof(other_start, aborted)["verified"])
 
     def test_embedding_shapes_nonfinite_and_insensitivity(self):
         value = {"object": "list", "data": [{"index": 0, "embedding": [1.0, 0.0]},
@@ -189,6 +217,12 @@ class RealSubprocessRegressions(unittest.TestCase):
         self.assertEqual(value["status"], "fail")
         self.assertIn("semantic", value["reason"])
 
+    def test_cli_tool_prose_without_formatted_section_fails(self):
+        self.context["cli_command"] = self.fake_cli('Function: get_regression_value Arguments: {"key":"fixture"}')
+        value = run_scenario({"id": "cli_tools"}, self.context)
+        self.assertEqual(value["status"], "fail")
+        self.assertIn("formatted", value["reason"])
+
     def test_backend_mismatch_is_failure(self):
         self.context["cli_command"] = self.fake_cli(backend="GgmlCuda")
         self.assertEqual(run_scenario({"id": "cli_text"}, self.context)["status"], "fail")
@@ -201,8 +235,14 @@ class RealSubprocessRegressions(unittest.TestCase):
         self.assertIn("out of memory", Path(value["processes"][0]["stderr_path"]).read_text())
 
     def test_timeout_kills_owned_process_and_records_stage(self):
-        value = run_process([sys.executable, "-c", "import time; print('started',flush=True); time.sleep(30)"],
-                            cwd=self.root, artifact_dir=self.root, stage="timeout", timeout_seconds=0.2)
+        process = ManagedProcess([sys.executable, "-c", "import time; print('started',flush=True); time.sleep(30)"],
+                                 cwd=self.root, artifact_dir=self.root, stage="timeout")
+        self.addCleanup(process.stop)
+        deadline = time.monotonic() + 5
+        while "started" not in process.stdout.read()[0] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn("started", process.stdout.read()[0], "synthetic child did not start")
+        value = process.wait(0.2)
         self.assertTrue(value["timed_out"])
         self.assertIsNotNone(value["exit_code"])
         self.assertIn("started", value["stdout"])
@@ -247,36 +287,132 @@ class RealSubprocessRegressions(unittest.TestCase):
         self.assertEqual(value["status"], "fail")
         json.loads((self.root / "result/scenario.json").read_text())
 
-    def test_owned_server_bootstrap_and_real_loopback_replay(self):
+    def run_fake_server(self, scenario, mode="normal"):
         script = self.root / "synthetic_server.py"
-        script.write_text('''import json, sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+        script.write_text(r'''import json, sys, os, time, re
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+mode = sys.argv[1]
 port = int(sys.argv[sys.argv.index('--port') + 1])
 model = Path(sys.argv[sys.argv.index('--model') + 1]).name
+active = False
+sessions = set()
+session_counter = 0
+def telemetry(request_id, event, message, props):
+    folder = Path(os.environ['TENSORSHARP_LOG_DIR']); folder.mkdir(parents=True, exist_ok=True)
+    record = {'scope':{'RequestId':request_id},'event':event,'message':message,'props':props}
+    with (folder/'tensorsharp-server-fixture.jsonl').open('a',encoding='utf-8') as f:
+        f.write(json.dumps(record)+'\n')
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_GET(self):
         if self.path == '/api/models': value = {'loaded':model,'loadedBackend':'cpu'}
-        else: value = {'data':[{'id':model}]}
+        elif self.path == '/api/queue/status': value = {'processing':int(active),'pending_requests':0}
+        else: value = {'data':[{'id':model,'embedding_dimensions':2}]}
         self.reply(value)
     def do_POST(self):
-        self.rfile.read(int(self.headers.get('Content-Length','0')))
-        self.reply({'object':'chat.completion','choices':[{'message':{'role':'assistant','content':'56'},'finish_reason':'stop'}],
-                    'usage':{'prompt_tokens':12,'completion_tokens':1,'total_tokens':13}})
-    def reply(self, value):
+        global active, session_counter
+        payload = json.loads(self.rfile.read(int(self.headers.get('Content-Length','0'))) or b'{}')
+        if self.path == '/api/sessions':
+            session_counter += 1; sid = 'fixture-session-'+str(session_counter); sessions.add(sid)
+            self.reply({'sessionId':sid}); return
+        if self.path == '/api/chat':
+            sid = payload['sessionId']; prompt = payload['messages'][0]['content']
+            if 'My session marker is' in prompt: answer = re.search(r'REGRESSION_[A-Z]+_\d+',prompt)[0]
+            elif 'earlier messages' in prompt: answer = 'REGRESSION_COBALT_7319' if mode=='reset_leaks' else 'NONE'
+            else: answer = '56'
+            self.sse_headers()
+            self.emit({'token':answer})
+            self.emit({'done':True,'aborted':False,'truncated':False,'promptTokens':12,'tokenCount':1,'sessionId':sid})
+            return
+        if self.path == '/v1/embeddings':
+            if payload.get('model') != model: self.error(404,'model','model_not_found'); return
+            if payload.get('input') == [] and mode != 'embedding_accepts_empty': self.error(400,'input'); return
+            if payload.get('dimensions') == 0: self.error(400,'dimensions'); return
+            self.reply({'object':'list','data':[{'index':i,'embedding':v} for i,v in enumerate([[1,0],[1,0],[.8,.6],[0,1]])]}); return
+        if mode.startswith('embedding') and mode != 'embedding_allows_generation':
+            self.error(400,None,message='This server hosts an embedding model. Use /v1/embeddings or /api/embed.'); return
+        if payload.get('stream'):
+            active = True
+            rid = self.headers.get('X-TensorSharp-Request-Id'); stream_id = 'chatcmpl-fixture-cancel'
+            telemetry(rid, {'id':1501,'name':'ChatStarted'}, 'request starts', {'ChatcmplId':stream_id})
+            self.sse_headers()
+            self.emit({'id':stream_id,'model':model,'object':'chat.completion.chunk','choices':[{'delta':{'content':'1'},'finish_reason':None}]})
+            time.sleep(.3)
+            if mode == 'cancel_aborts':
+                telemetry(rid, {'id':1503,'name':'ChatAborted'}, 'chat.cancelled tokens=2', {'Tokens':2,'PromptTokens':12})
+            else:
+                # Deliberately ignore disconnect and report normal completion of
+                # the entire budget: queue recovery must not pass this scenario.
+                telemetry(rid, {'id':1502,'name':'ChatCompleted'}, 'chat.complete tokens=512', {'Tokens':512,'FinishReason':'max_tokens'})
+            active = False
+            return
+        self.reply({'object':'chat.completion','model':model,'choices':[{'message':{'role':'assistant','content':'56'},'finish_reason':'stop'}],
+                    'usage':{'prompt_tokens':12,'completion_tokens':1,'total_tokens':13,'prompt_tokens_details':{'cached_tokens':8}}})
+    def do_DELETE(self):
+        sid = self.path.rsplit('/',1)[-1]
+        if sid not in sessions: self.error(404,'session'); return
+        sessions.remove(sid); self.reply({'ok':True,'sessionId':sid})
+    def error(self, status, param, code=None, message='Invalid fixture input'):
+        self.reply({'error':{'type':'invalid_request_error','param':param,'code':code,'message':message}},status)
+    def sse_headers(self):
+        self.send_response(200); self.send_header('Content-Type','text/event-stream')
+        if self.headers.get('X-TensorSharp-Request-Id'): self.send_header('X-TensorSharp-Request-Id',self.headers['X-TensorSharp-Request-Id'])
+        self.end_headers()
+    def emit(self, value):
+        try: self.wfile.write(('data: '+json.dumps(value)+'\n\n').encode()); self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError): pass
+    def reply(self, value, status=200):
         data = json.dumps(value).encode()
-        self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data)))
+        self.send_response(status); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data)))
         self.end_headers(); self.wfile.write(data)
-server = HTTPServer(('127.0.0.1', port), Handler)
+server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
 print('Now listening on: http://127.0.0.1:' + str(port), flush=True)
 server.serve_forever()
 ''', encoding="utf-8")
-        self.context["server_command"] = [sys.executable, str(script)]
+        self.context["server_command"] = [sys.executable, str(script), mode]
         self.context["timeout_seconds"] = 10
-        value = run_scenario({"id": "server_chat"}, self.context)
+        return run_scenario({"id": scenario}, self.context)
+
+    def test_owned_server_bootstrap_and_real_loopback_replay(self):
+        value = self.run_fake_server("server_chat")
         self.assertEqual(value["status"], "pass", value)
-        self.assertEqual(value["evidence"]["server_shutdown"], "owned process tree terminated after scenario")
+        self.assertTrue(value["evidence"]["server_shutdown"]["verified"])
+
+    def test_embedding_negatives_are_executed(self):
+        value = self.run_fake_server("server_embeddings", "embedding")
+        self.assertEqual(value["status"], "pass", value)
+        self.assertEqual(len(value["evidence"]["http_errors"]), 4)
+
+    def test_embedding_accepting_malformed_input_fails(self):
+        value = self.run_fake_server("server_embeddings", "embedding_accepts_empty")
+        self.assertEqual(value["status"], "fail", value)
+        self.assertIn("rejects invalid request", value["reason"])
+
+    def test_embedding_serving_generation_fails(self):
+        value = self.run_fake_server("server_embeddings", "embedding_allows_generation")
+        self.assertEqual(value["status"], "fail", value)
+
+    def test_two_sessions_reset_and_cache_evidence(self):
+        value = self.run_fake_server("server_reset_cache", "reset")
+        self.assertEqual(value["status"], "pass", value)
+        self.assertIn("session B cannot recover A marker", [a["name"] for a in value["assertions"]])
+
+    def test_cross_session_marker_leak_fails(self):
+        value = self.run_fake_server("server_reset_cache", "reset_leaks")
+        self.assertEqual(value["status"], "fail", value)
+        self.assertIn("session B", value["reason"])
+
+    def test_ignored_disconnect_normal_completion_is_untested(self):
+        value = self.run_fake_server("server_cancel", "cancel_ignores")
+        self.assertEqual(value["status"], "untested", value)
+        self.assertIn("normal completion", value["reason"])
+        self.assertFalse(value["evidence"]["cancellation"]["verified"])
+
+    def test_request_scoped_early_abort_and_recovery_pass(self):
+        value = self.run_fake_server("server_cancel", "cancel_aborts")
+        self.assertEqual(value["status"], "pass", value)
+        self.assertTrue(value["evidence"]["cancellation"]["verified"])
 
 
 class HttpStreamRegressions(unittest.TestCase):
@@ -309,8 +445,8 @@ class HttpStreamRegressions(unittest.TestCase):
         self.thread.join()
 
     def stream_body(self, content="56", done=True, finish="stop"):
-        value = {"object": "chat.completion.chunk", "choices": [{"delta": {"content": content}, "finish_reason": None}]}
-        final = {"object": "chat.completion.chunk", "choices": [{"delta": {}, "finish_reason": finish}],
+        value = {"id": "chatcmpl-fixture", "model": "synthetic.gguf", "object": "chat.completion.chunk", "choices": [{"delta": {"content": content}, "finish_reason": None}]}
+        final = {"id": "chatcmpl-fixture", "model": "synthetic.gguf", "object": "chat.completion.chunk", "choices": [{"delta": {}, "finish_reason": finish}],
                  "usage": {"prompt_tokens": 12, "completion_tokens": 1, "total_tokens": 13}}
         return "data: " + json.dumps(value) + "\n\ndata: " + json.dumps(final) + "\n\n" + ("data: [DONE]\n\n" if done else "")
 
@@ -334,6 +470,16 @@ class HttpStreamRegressions(unittest.TestCase):
         self.body = self.stream_body() + "data: [DONE]\n\n"
         with self.assertRaises(ScenarioFailure):
             self.http.stream("/v1/chat/completions", {})
+
+    def test_stream_cannot_switch_completion_identity(self):
+        self.body = self.stream_body().replace('"id": "chatcmpl-fixture"', '"id": "another-id"', 1)
+        with self.assertRaisesRegex(ScenarioFailure, "ID"):
+            self.http.stream("/v1/chat/completions", {})
+
+    def test_stream_model_must_match_request(self):
+        self.body = self.stream_body()
+        with self.assertRaisesRegex(ScenarioFailure, "model"):
+            self.http.stream("/v1/chat/completions", {"model": "another-model"})
 
     def test_completed_stream_cannot_count_as_cancellation_coverage(self):
         self.body = self.stream_body()

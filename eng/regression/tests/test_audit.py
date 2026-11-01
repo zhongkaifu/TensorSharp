@@ -78,6 +78,17 @@ class AuditTests(unittest.TestCase):
         self.catalog["presets"][0]["backends"] = ["invented_gpu"]
         self.assertEqual(audit_catalog(self.repo, self.catalog)["status"], "fail")
 
+    def test_suite_requires_adapter_and_is_not_model_qualification(self):
+        suite = copy.deepcopy(self.catalog["scenarios"][0])
+        suite.update(id="native_ctest", status="suite")
+        self.catalog["scenarios"].append(suite)
+        self.assertEqual(audit_catalog(self.repo, self.catalog)["status"], "pass")
+        self.catalog["presets"][0]["scenarios"].append("native_ctest")
+        self.assertEqual(audit_catalog(self.repo, self.catalog)["status"], "fail")
+        self.catalog["presets"][0]["scenarios"].pop()
+        suite["id"] = "imaginary_suite"
+        self.assertEqual(audit_catalog(self.repo, self.catalog)["status"], "fail")
+
     def test_sizes_and_budget_metadata_are_validated(self):
         for value in (-1, 0, True, "100"):
             with self.subTest(value=value):

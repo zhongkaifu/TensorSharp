@@ -27,6 +27,7 @@ ADAPTER_IDS = frozenset({
     "cli_text", "cli_prefill", "cli_decode", "cli_multi_turn", "cli_tools", "cli_thinking",
     "cli_image", "cli_audio", "cli_video", "forced_logits", "forced_logits_sequence", "server_chat", "server_stream",
     "server_cancel", "server_reset_cache", "server_structured", "server_tools", "server_embeddings",
+    "jev_decision", "image_generation_smoke", "speculation_ngram",
 })
 _LOGIT_BACKENDS = {"cpu", "cuda", "ggml_cpu", "ggml_cuda", "ggml_metal"}
 _CONFIG_KEYS = {"model", "mmproj", "draft-model", "tokenizer", "kv-cache-dtype", "embedding-threads",
@@ -36,6 +37,7 @@ _CONFIG_KEYS = {"model", "mmproj", "draft-model", "tokenizer", "kv-cache-dtype",
 _NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 _PROMPT = "What is 7 multiplied by 8? Reply with only the integer answer."
 _ANSWER = r"^\s*56[.!]?\s*$"
+_SESSION_MARKER = "REGRESSION_COBALT_7319"
 _TOOL = {"name": "get_regression_value", "description": "Return a synthetic regression fixture value.",
          "parameters": {"type": "object", "properties": {"key": {"type": "string", "enum": ["fixture"]}},
                         "required": ["key"], "additionalProperties": False}}
@@ -71,14 +73,23 @@ def availability(case, context):
     kind = _kind(case)
     if kind not in ADAPTER_IDS:
         return False, "scenario has a documented recipe but no executable adapter"
-    command_key = "logit_command" if kind.startswith("forced_logits") else "server_command" if kind.startswith("server_") else "cli_command"
+    if kind == "speculation_ngram":
+        from .speculation import availability as ngram_available
+        return ngram_available(context)
+    command_key = "logit_command" if kind.startswith("forced_logits") else "server_command" if kind.startswith("server_") or kind in {"jev_decision", "image_generation_smoke"} else "cli_command"
     command = context.get(command_key)
     if not command or isinstance(command, str):
         return False, "provide a built local binary argv list in " + command_key
     if kind.startswith("forced_logits") and context.get("backend") not in _LOGIT_BACKENDS:
         return False, "ForcedLogitProbe does not implement this backend; no fallback will run"
+    if kind == "jev_decision" and not all((Path(context["repo"]) / path).is_file() for path in
+            ("TensorSharp.TestMatrix/Inputs/jev/decisions.json", "eng/jev-benchmark.py")):
+        return False, "repository Jev decision fixtures/validator are missing"
     if not context.get("preparing_model") and (not context.get("model_path") or not Path(context["model_path"]).is_file()):
         return False, "verified local model is not available"
+    if kind == "image_generation_smoke":
+        from .image_generation import availability as image_available
+        return image_available(context)
     if kind in {"cli_image", "cli_audio", "cli_video"}:
         fixture = _fixture(case, context)
         if not fixture.get("media_path") or not Path(fixture["media_path"]).is_file():
@@ -99,7 +110,14 @@ def _require(result, name, condition, expected=None, actual=None):
 def _json_loads(value):
     def reject(value):
         raise ValueError("nonfinite JSON number: " + value)
-    return json.loads(value, parse_constant=reject)
+    def object_pairs(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key: " + key)
+            result[key] = item
+        return result
+    return json.loads(value, parse_constant=reject, object_pairs_hook=object_pairs)
 
 
 def _finite_json(value):
@@ -176,6 +194,8 @@ def _check_process(result, item, backend):
     _require(result, item["stage"] + ": no timeout", not item["timed_out"], False, item["timed_out"])
     _require(result, item["stage"] + ": process exit", item["exit_code"] == 0, 0, item["exit_code"])
     _require(result, item["stage"] + ": full output captured", not item["output_truncated"], False, item["output_truncated"])
+    _require(result, item["stage"] + ": owned processes stopped", item.get("teardown", {}).get("verified") is True,
+             "verified empty owned process container", item.get("teardown"))
     evidence = backend_evidence(item["stdout"] + "\n" + item["stderr"], backend)
     result["evidence"].setdefault("backend", []).append(evidence)
     _require(result, item["stage"] + ": actual backend", evidence["verified"], backend, evidence)
@@ -275,11 +295,11 @@ def _cli(case, context, result):
             _require(result, "assistant output is present", bool(answer), "nonempty generated output", answer)
             _require(result, "no inference error text", not re.search(r"(?:^|\n)\s*(?:Error:|Exception:|<unused)", answer, re.I), "answer", answer)
             if kind == "cli_tools":
-                function = re.search(r"Function:\s*(\w+)", answer)
-                arguments = re.search(r"Arguments:\s*(\{.*?\})", answer, re.S)
-                _require(result, "tool function identity", bool(function) and function[1] == _TOOL["name"], _TOOL["name"], function[1] if function else None)
-                _require(result, "tool arguments JSON", arguments is not None)
-                actual = _json_loads(arguments[1])
+                block = re.search(r"--- Tool Calls ---\s*(.*?)\s*--- End Tool Calls ---", answer, re.S)
+                _require(result, "CLI formatted tool-call section", block is not None)
+                function = re.fullmatch(r"\s*Function:\s*(\w+)\s+Arguments:\s*(\{.*\})\s*", block[1], re.S)
+                _require(result, "single formatted tool function identity", bool(function) and function[1] == _TOOL["name"], _TOOL["name"], block[1])
+                actual = _json_loads(function[2])
                 _require(result, "tool fixture argument", actual == {"key": "fixture"}, {"key": "fixture"}, actual)
             else:
                 _require(result, "semantic fixture answer", re.search(expected, answer, re.I) is not None, expected, answer)
@@ -335,11 +355,12 @@ def _logits(case, context, result):
     result["inputs"] = {"cases": fixtures, "steps": 16, "comparison": "same-backend fresh-process fixed-history repeatability",
                         "limitations": "Not an independent quality oracle or cross-backend numerical certification."}
     reference = root / "logits-reference"
+    canonical = None
     for index, folder in enumerate((reference, root / "logits-candidate")):
         _ensure_logit_disk(context, result)
         run_id = uuid.uuid4().hex
         args = list(context["logit_command"]) + [str(context["model_path"]), str(folder), context["backend"],
-                "--steps", "16", "--run-id", run_id]
+                "--steps", "16", "--run-id", run_id, "--disk-headroom-gib", str(context.get("disk_headroom_gib", 5))]
         args += ["--cases", str(fixture_file)] if not index else ["--reference", str(reference)]
         item = _process(context, result, args, "logits-" + str(index + 1))
         metrics_path = folder / "metrics.json"
@@ -347,6 +368,17 @@ def _logits(case, context, result):
             metrics = _json_loads(metrics_path.read_text(encoding="utf-8"))
             result["evidence"]["logits_" + str(index + 1)] = metrics
             first = validate_logit_metrics(metrics, run_id, comparison=bool(index))
+            actual_cases = _json_loads((folder / "cases.json").read_text(encoding="utf-8"))
+            _require(result, "logit fixture case identities", [item.get("name") for item in actual_cases] == [item["name"] for item in fixtures])
+            _require(result, "logit metrics cover every fixture", len(metrics["cases"]) == len(actual_cases))
+            if canonical is None:
+                canonical = actual_cases
+            for expected, actual, measured in zip(canonical, actual_cases, metrics["cases"]):
+                _require(result, "logit metric case identity", measured.get("name") == actual["name"], actual["name"], measured.get("name"))
+                _require(result, "logit exact teacher-forced IDs", actual.get("prompt_tokens") == expected["prompt_tokens"] and
+                         actual.get("generated_tokens") == expected["generated_tokens"] and len(actual["generated_tokens"]) == 16)
+                for key, expected_hash in _history_hashes(expected).items():
+                    _require(result, "logit " + key, measured.get(key) == expected_hash, expected_hash, measured.get(key))
             if first:
                 result["evidence"]["first_divergence"] = first
             _require(result, "finite fixed-history rows within numerical gates", first is None, "relative L2 <= 0.001, cosine >= 0.999999, identical top1", first)
@@ -355,10 +387,12 @@ def _logits(case, context, result):
         _check_process(result, item, context["backend"])
 
 
-def validate_chat(response, expected_regex=_ANSWER):
+def validate_chat(response, expected_regex=_ANSWER, *, expected_model=None, max_tokens=None):
     if response.get("object") != "chat.completion" or len(response.get("choices", [])) != 1:
         raise ScenarioFailure("invalid chat completion envelope")
     choice, usage = response["choices"][0], response.get("usage", {})
+    if expected_model is not None and response.get("model") != expected_model:
+        raise ScenarioFailure("completion response model identity mismatch")
     message = choice.get("message", {})
     content = message.get("content")
     if message.get("role") != "assistant" or not isinstance(content, str) or not content.strip():
@@ -368,8 +402,10 @@ def validate_chat(response, expected_regex=_ANSWER):
     if re.search(r"^\s*(?:Error:|Exception:)", content, re.I) or (expected_regex and re.search(expected_regex, content, re.I) is None):
         raise ScenarioFailure("assistant failed semantic fixture: " + content[:300])
     prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
-    if not isinstance(prompt, int) or not isinstance(completion, int) or prompt <= 0 or completion <= 0 or usage.get("total_tokens") != prompt + completion:
+    if type(prompt) is not int or type(completion) is not int or prompt <= 0 or completion <= 0 or usage.get("total_tokens") != prompt + completion:
         raise ScenarioFailure("invalid token usage accounting")
+    if max_tokens is not None and completion > max_tokens:
+        raise ScenarioFailure("completion exceeded requested token budget")
     return content
 
 
@@ -413,7 +449,8 @@ def _logits_sequence(case, context, result):
         output = root / ("fresh-" + name)
         run_id = uuid.uuid4().hex
         args = list(context["logit_command"]) + [str(context["model_path"]), str(output), context["backend"],
-                "--steps", "32", "--cases", str(fixture_path), "--run-id", run_id]
+                "--steps", "32", "--cases", str(fixture_path), "--run-id", run_id,
+                "--disk-headroom-gib", str(context.get("disk_headroom_gib", 5))]
         item = _process(context, result, args, "fresh-" + name)
         metrics = _json_loads((output / "metrics.json").read_text(encoding="utf-8"))
         result["evidence"]["fresh_" + name] = metrics
@@ -439,7 +476,8 @@ def _logits_sequence(case, context, result):
         fixture_path.write_text(json.dumps(sequence), encoding="utf-8")
         output, run_id = root / ("sequence-" + order), uuid.uuid4().hex
         args = list(context["logit_command"]) + [str(context["model_path"]), str(output), context["backend"],
-                "--reference", str(library), "--cases", str(fixture_path), "--steps", "32", "--run-id", run_id]
+                "--reference", str(library), "--cases", str(fixture_path), "--steps", "32", "--run-id", run_id,
+                "--disk-headroom-gib", str(context.get("disk_headroom_gib", 5))]
         item = _process(context, result, args, "sequence-" + order)
         try:
             metrics = _json_loads((output / "metrics.json").read_text(encoding="utf-8"))
@@ -452,6 +490,10 @@ def _logits_sequence(case, context, result):
                 reference = references[reference_name]
                 divergence["reference_case"] = reference_name
                 divergence["input_history_sha256"] = _token_hash(reference["prompt_tokens"] + reference["generated_tokens"][:first["step"]])
+                position = next(i for i, entry in enumerate(sequence) if entry["name"] == first["case"])
+                preceding = sequence[position - 1] if position else None
+                divergence["preceding_case"] = preceding
+                divergence["preceding_prompt_tokens"] = len(references[preceding["reference_case"]]["prompt_tokens"]) if preceding else None
                 result["evidence"].setdefault("divergences", []).append(divergence)
                 result["evidence"].setdefault("first_divergence", divergence)
             _require(result, order + " reset history numerical parity", first is None,
@@ -504,13 +546,13 @@ class _Http:
             raise ScenarioFailure("server scenario deadline exceeded")
         return seconds
 
-    def open(self, route, payload=None, method=None):
+    def open(self, route, payload=None, method=None, headers=None):
         if not route.startswith("/") or route.startswith("//"):
             raise ScenarioFailure("nonlocal HTTP route refused")
-        self.result["inputs"].setdefault("requests", []).append({"route": route, "method": method or ("POST" if payload is not None else "GET"), "body": payload})
+        self.result["inputs"].setdefault("requests", []).append({"route": route, "method": method or ("POST" if payload is not None else "GET"), "body": payload, "headers": headers or {}})
         data = None if payload is None else json.dumps(payload, allow_nan=False).encode("utf-8")
         request = urllib.request.Request(self.base + route, data=data, method=method,
-                                         headers={"Content-Type": "application/json"})
+                                         headers={"Content-Type": "application/json", **(headers or {})})
         try:
             return self.opener.open(request, timeout=self.remaining())
         except urllib.error.HTTPError as error:
@@ -531,10 +573,16 @@ class _Http:
             "duration_seconds": round(time.monotonic() - started, 4), "body": value})
         return value
 
-    def stream(self, route, payload, *, cancel=False, web_ui=False):
+    def stream(self, route, payload, *, cancel=False, web_ui=False, request_id=None):
         started = time.monotonic()
-        chunks, content, finish, usage, done = [], "", None, None, False
-        with self.open(route, payload) as response:
+        chunks, content, finish, usage, done, stream_id = [], "", None, None, False, None
+        headers = {"X-TensorSharp-Request-Id": request_id} if request_id else None
+        with self.open(route, payload, headers=headers) as response:
+            if request_id:
+                self.result["evidence"]["request_correlation"] = {"requested": request_id,
+                    "echoed": response.headers.get("X-TensorSharp-Request-Id")}
+            if request_id and response.headers.get("X-TensorSharp-Request-Id") != request_id:
+                raise ScenarioUntested("server did not echo request correlation ID; cancellation cannot be attributed")
             if "text/event-stream" not in response.headers.get("Content-Type", ""):
                 raise ScenarioFailure("stream is not text/event-stream")
             size = 0
@@ -568,10 +616,17 @@ class _Http:
                         if event.get("aborted") or event.get("truncated"):
                             raise ScenarioFailure("web UI request aborted or exhausted the token budget")
                         done, usage = True, event
+                        if payload.get("sessionId") and event.get("sessionId") != payload["sessionId"]:
+                            raise ScenarioFailure("Web UI response belongs to another session")
                         continue
                 else:
                     if event.get("object") != "chat.completion.chunk":
                         raise ScenarioFailure("invalid streaming completion envelope")
+                    if not isinstance(event.get("id"), str) or not event["id"] or (stream_id is not None and event["id"] != stream_id):
+                        raise ScenarioFailure("stream completion ID is missing or changed")
+                    stream_id = event["id"]
+                    if payload.get("model") and event.get("model") != payload["model"]:
+                        raise ScenarioFailure("stream completion model identity mismatch")
                     for choice in event.get("choices", []):
                         delta = choice.get("delta", {})
                         content += delta.get("content") or ""
@@ -583,7 +638,7 @@ class _Http:
                                 raise ScenarioUntested("stream produced a token but completed before disconnect; no in-flight cancellation was observed")
                             self.result["evidence"]["cancelled_after_chunk"] = event
                             self.result["evidence"]["queue_before_disconnect"] = queue
-                            return {"cancelled": True, "chunks": chunks}
+                            return {"disconnected": True, "stream_id": stream_id, "request_id": request_id, "chunks": chunks}
                     usage = event.get("usage") or usage
         answer = {"content": content, "finish_reason": finish, "usage": usage, "done": done, "chunks": chunks,
                   "route": route, "duration_seconds": round(time.monotonic() - started, 4)}
@@ -599,6 +654,95 @@ class _Http:
         return answer
 
 
+def _expect_http_error(http, result, route, payload, *, status, param=None, message=None, code=None):
+    try:
+        http.json(route, payload)
+    except urllib.error.HTTPError as error:
+        _require(result, route + " rejection status", error.code == status, status, error.code)
+        body = _json_loads(result["evidence"]["http_errors"][-1]["body"])
+        details = body.get("error", {})
+        _require(result, route + " typed error", isinstance(details, dict) and details.get("type") == "invalid_request_error",
+                 "invalid_request_error", details)
+        if param is not None:
+            _require(result, route + " error parameter", details.get("param") == param, param, details.get("param"))
+        if code is not None:
+            _require(result, route + " error code", details.get("code") == code, code, details.get("code"))
+        if message is not None:
+            _require(result, route + " error explains rejected operation", re.search(message, details.get("message", ""), re.I) is not None,
+                     message, details.get("message"))
+    else:
+        _require(result, route + " rejects invalid request", False, status, "request succeeded")
+
+
+def _embedding_negatives(http, model, result):
+    _expect_http_error(http, result, "/v1/chat/completions", {}, status=400,
+                       message=r"hosts an embedding model.*(?:/v1/embeddings|/api/embed)")
+    for payload, param in (({"model": model, "input": []}, "input"),
+                           ({"model": model, "input": ["fixture"], "dimensions": 0}, "dimensions")):
+        _expect_http_error(http, result, "/v1/embeddings", payload, status=400, param=param)
+    _expect_http_error(http, result, "/v1/embeddings", {"model": "unhosted-regression-model", "input": ["fixture"]},
+                       status=404, param="model", code="model_not_found")
+
+
+def cancellation_evidence(log_root, request_id, stream_id, max_tokens):
+    """Read only this run's logs; aggregate queue-idle is never cancellation proof."""
+    records, files = [], []
+    for path in sorted(Path(log_root).glob("tensorsharp-server-*.jsonl"))[:16]:
+        with path.open("rb") as stream:
+            raw = stream.read(8 * 1024 * 1024 + 1)
+        if len(raw) > 8 * 1024 * 1024:
+            return {"verified": False, "reason": "request telemetry exceeds bounded capture", "files": files}
+        files.append(str(path))
+        for line in raw.decode("utf-8", "replace").splitlines():
+            try:
+                record = _json_loads(line)
+            except ValueError:
+                continue  # The logger may currently be flushing its last line.
+            if isinstance(record, dict) and isinstance(record.get("scope"), dict) and record["scope"].get("RequestId") == request_id:
+                records.append(record)
+    linked = any(isinstance(record.get("props"), dict) and record["props"].get("ChatcmplId") == stream_id for record in records)
+    aborted = [record for record in records if isinstance(record.get("event"), dict) and record["event"].get("id") == 1503 and record["event"].get("name") == "ChatAborted"
+               and str(record.get("message", "")).startswith("chat.cancelled tokens=")]
+    completed = [record for record in records if str(record.get("message", "")).startswith("chat.complete tokens=")]
+    valid_abort = [record for record in aborted if isinstance(record.get("props"), dict) and type(record["props"].get("Tokens")) is int
+                   and 0 < record["props"]["Tokens"] < max_tokens]
+    verified = linked and len(valid_abort) == 1 and not completed
+    reason = ("request-scoped engine cancellation before token budget" if verified else
+              "normal completion observed after disconnect; cancellation was not demonstrated" if completed else
+              "missing request-scoped early-abort telemetry or SSE/request linkage")
+    return {"verified": verified, "reason": reason, "request_id": request_id, "stream_id": stream_id,
+            "requested_max_tokens": max_tokens, "linked": linked, "records": records, "files": files}
+
+
+def _cancel(http, payload, context, result):
+    request_id = "regression-cancel-" + uuid.uuid4().hex
+    long_payload = dict(payload, stream=True, max_tokens=512,
+                        messages=[{"role": "user", "content": "Count from 1 to 200, one number per line. Do not stop before 200."}])
+    disconnected = http.stream("/v1/chat/completions", long_payload, cancel=True, request_id=request_id)
+    while True:
+        queue = http.json("/api/queue/status")
+        if queue.get("processing") == 0 and queue.get("pending_requests") == 0:
+            break
+        time.sleep(min(0.1, http.remaining()))
+    # Recoverability is useful independent evidence, but cannot establish that the
+    # preceding request stopped early rather than ignored the disconnect.
+    validate_chat(http.json("/v1/chat/completions", payload), expected_model=payload["model"], max_tokens=payload["max_tokens"])
+    _require(result, "disconnect recovery answer", True)
+    flush_deadline = min(http.deadline, time.monotonic() + 3)
+    while True:
+        proof = cancellation_evidence(Path(context["artifact_dir"]) / "host-logs", request_id,
+                                      disconnected["stream_id"], long_payload["max_tokens"])
+        result["evidence"]["cancellation"] = proof
+        if proof["verified"] or any(str(record.get("message", "")).startswith("chat.complete tokens=") for record in proof.get("records", [])):
+            break
+        if time.monotonic() >= flush_deadline:
+            break
+        time.sleep(0.1)
+    if not proof["verified"]:
+        raise ScenarioUntested(proof["reason"] + "; queue recovery alone does not qualify cancellation")
+    _require(result, "request-specific early engine abort", True, "matching RequestId + SSE id + ChatAborted with 0<Tokens<512", proof)
+
+
 def _server(case, context, result):
     kind = _kind(case)
     with socket.socket() as sock:
@@ -608,7 +752,10 @@ def _server(case, context, result):
     command += ["--host", "127.0.0.1", "--port", str(port), "--no-webui", "--no-multi-agent"]
     if kind == "server_embeddings":
         command += ["--embeddings"]
-    process = ManagedProcess(command, cwd=context["repo"], artifact_dir=context["artifact_dir"], stage="server", env=context.get("env"))
+    server_env = dict(context.get("env") or {})
+    if kind == "server_cancel":
+        server_env.update(TENSORSHARP_LOG_FILE="1", TENSORSHARP_LOG_LEVEL="Information")
+    process = ManagedProcess(command, cwd=context["repo"], artifact_dir=context["artifact_dir"], stage="server", env=server_env)
     deadline = time.monotonic() + context.get("timeout_seconds", 600)
     http = _Http(port, deadline, result)
     result["evidence"]["base_url"] = http.base
@@ -627,24 +774,33 @@ def _server(case, context, result):
         identity = http.json("/api/models")
         _require(result, "loaded backend identity", identity.get("loadedBackend") == context["backend"], context["backend"], identity.get("loadedBackend"))
         _require(result, "loaded model identity", identity.get("loaded") == Path(context["model_path"]).name, Path(context["model_path"]).name, identity.get("loaded"))
+        if kind == "image_generation_smoke":
+            _require(result, "Qwen image architecture loaded", identity.get("architecture") == "qwen_image", "qwen_image", identity.get("architecture"))
+            from .image_generation import run_image_smoke
+            run_image_smoke(http, identity["loaded"], context, result)
+            return
         listing = http.json("/v1/models").get("data", [])
         _require(result, "one hosted model advertised", len(listing) == 1 and bool(listing[0].get("id")))
         model = listing[0]["id"]
         payload = {"model": model, "messages": [{"role": "user", "content": _PROMPT}], "temperature": 0,
                    "seed": 42, "max_tokens": 128, "think": False, "stream": False}
-        if kind == "server_embeddings":
+        if kind == "jev_decision":
+            from .jev import run_decisions
+            run_decisions(http, model, context, result)
+        elif kind == "server_embeddings":
             response = http.json("/v1/embeddings", {"model": model, "input": ["A cat is sitting on a warm windowsill.",
                 "A cat is sitting on a warm windowsill.", "A kitten rests beside the sunny window.",
                 "Database transactions must satisfy atomicity and isolation."], "encoding_format": "float"})
             checks = validate_embeddings(response, listing[0].get("embedding_dimensions", 0))
             result["evidence"]["embedding_checks"] = checks
             _require(result, "finite normalized input-sensitive embeddings", True, "unit vectors and duplicate consistency", checks)
+            _embedding_negatives(http, model, result)
         elif kind == "server_structured":
             payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "answer", "strict": True,
                 "schema": {"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"], "additionalProperties": False}}}
             payload["messages"][0]["content"] = "What is 7 multiplied by 8? Return a JSON object with the integer field answer."
             response = http.json("/v1/chat/completions", payload)
-            answer = _json_loads(validate_chat(response, None))
+            answer = _json_loads(validate_chat(response, None, expected_model=model, max_tokens=payload["max_tokens"]))
             _require(result, "strict structured semantic result", answer == {"answer": 56} and type(answer.get("answer")) is int, {"answer": 56}, answer)
         elif kind == "server_tools":
             payload["messages"][0]["content"] = "Call get_regression_value with key fixture. Do not answer until you receive its value."
@@ -663,31 +819,23 @@ def _server(case, context, result):
             payload["messages"] += [choice["message"], {"role": "tool", "tool_call_id": call["id"], "content": '{"value":56}'},
                                      {"role": "user", "content": "Reply with only the integer value returned by the tool."}]
             payload["tool_choice"] = "none"
-            validate_chat(http.json("/v1/chat/completions", payload))
+            validate_chat(http.json("/v1/chat/completions", payload), expected_model=model, max_tokens=payload["max_tokens"])
             _require(result, "fixed synthetic tool-result round trip", True)
             result["evidence"]["limitation"] = "No model-generated function, shell command, skill, or host agent was executed."
         elif kind == "server_cancel":
-            long_payload = dict(payload, stream=True, max_tokens=512,
-                                messages=[{"role": "user", "content": "Count from 1 to 200, one number per line. Do not stop before 200."}])
-            http.stream("/v1/chat/completions", long_payload, cancel=True)
-            while True:
-                queue = http.json("/api/queue/status")
-                if queue.get("processing") == 0 and queue.get("pending_requests") == 0:
-                    break
-                time.sleep(min(0.1, http.remaining()))
-            validate_chat(http.json("/v1/chat/completions", payload))
-            _require(result, "disconnect cancellation drains queue and recovers", True)
+            _cancel(http, payload, context, result)
         elif kind == "server_reset_cache":
             _reset_and_cache(http, payload, result)
         else:
-            first = validate_chat(http.json("/v1/chat/completions", payload))
+            first = validate_chat(http.json("/v1/chat/completions", payload), expected_model=model, max_tokens=payload["max_tokens"])
             if kind == "server_stream":
                 streamed = http.stream("/v1/chat/completions", dict(payload, stream=True))
                 _require(result, "stream and nonstream content parity", streamed["content"] == first, first, streamed["content"])
                 usage = streamed["usage"]
                 _require(result, "stream token accounting", usage.get("total_tokens") == usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0))
+                _require(result, "stream bounded completion count", type(usage.get("completion_tokens")) is int and 0 < usage["completion_tokens"] <= payload["max_tokens"])
             else:
-                second = validate_chat(http.json("/v1/chat/completions", payload))
+                second = validate_chat(http.json("/v1/chat/completions", payload), expected_model=model, max_tokens=payload["max_tokens"])
                 _require(result, "server greedy replay", second == first, first, second)
     finally:
         process.stop()
@@ -695,33 +843,49 @@ def _server(case, context, result):
         result["processes"].append({k: v for k, v in item.items() if k not in {"stdout", "stderr"}})
         # An intentional server shutdown is not a model test failure; readiness,
         # model identity and each request above carry their own assertions.
-        result["evidence"]["server_shutdown"] = "owned process tree terminated after scenario"
+        result["evidence"]["server_shutdown"] = item.get("teardown")
+        _require(result, "owned server processes stopped", item.get("teardown", {}).get("verified") is True,
+                 "verified empty owned process container", item.get("teardown"))
 
 
 def _reset_and_cache(http, payload, result):
-    session = http.json("/api/sessions", {})["sessionId"]
-    route = "/api/sessions/" + urllib.parse.quote(session, safe="")
+    sessions = []
     try:
-        chat = {"sessionId": session, "messages": [{"role": "user", "content": _PROMPT}],
-                "maxTokens": 128, "temperature": 0, "seed": 42, "think": False, "newChat": True}
-        first = http.stream("/api/chat", chat, web_ui=True)["content"]
-        second = http.stream("/api/chat", chat, web_ui=True)["content"]
-        _require(result, "newChat reset answer equivalence", first == second and re.search(_ANSWER, second) is not None, first, second)
+        for _ in range(2):
+            sessions.append(http.json("/api/sessions", {})["sessionId"])
+        _require(result, "independent sessions created", len(set(sessions)) == 2)
+        def chat(session, prompt):
+            body = {"sessionId": session, "messages": [{"role": "user", "content": prompt}],
+                    "maxTokens": 128, "temperature": 0, "seed": 42, "think": False, "newChat": True}
+            return http.stream("/api/chat", body, web_ui=True)["content"]
+        marker_answer = chat(sessions[0], "My session marker is " + _SESSION_MARKER + ". Reply with only my session marker.")
+        _require(result, "session A sees its synthetic marker", _SESSION_MARKER in marker_answer, _SESSION_MARKER, marker_answer)
+        isolated = chat(sessions[1], "What session marker was stated in earlier messages of this conversation? If no marker was stated, reply with only NONE.")
+        _require(result, "session B cannot recover A marker", _SESSION_MARKER not in isolated and re.fullmatch(r"\s*NONE[.!]?\s*", isolated, re.I) is not None,
+                 "NONE, without the marker supplied only to A", isolated)
+        reset = chat(sessions[0], _PROMPT)
+        fresh = chat(sessions[1], _PROMPT)
+        _require(result, "newChat reset matches independent-session answer", reset == fresh and re.search(_ANSWER, reset) is not None
+                 and _SESSION_MARKER not in reset, fresh, reset)
+        result["evidence"]["session_isolation_scope"] = "One synthetic marker across two distinct session IDs; not a general privacy guarantee."
     finally:
-        deleted = http.json(route, method="DELETE")
-        _require(result, "session disposed", deleted.get("ok") is True)
-    try:
-        http.json(route, method="DELETE")
-    except urllib.error.HTTPError as error:
-        _require(result, "disposed session no longer exists", error.code == 404, 404, error.code)
-    else:
-        _require(result, "disposed session no longer exists", False, 404, 200)
+        for session in sessions:
+            route = "/api/sessions/" + urllib.parse.quote(session, safe="")
+            deleted = http.json(route, method="DELETE")
+            _require(result, "session disposed", deleted.get("ok") is True and deleted.get("sessionId") == session)
+    for session in sessions:
+        try:
+            http.json("/api/sessions/" + urllib.parse.quote(session, safe=""), method="DELETE")
+        except urllib.error.HTTPError as error:
+            _require(result, "disposed session no longer exists", error.code == 404, 404, error.code)
+        else:
+            _require(result, "disposed session no longer exists", False, 404, 200)
     prefix = "The following is a synthetic cache fixture, with no private information. " * 40
     repeated = dict(payload, messages=[{"role": "user", "content": prefix + "\n" + _PROMPT}])
     first_response = http.json("/v1/chat/completions", repeated)
-    first = validate_chat(first_response)
+    first = validate_chat(first_response, expected_model=payload["model"], max_tokens=payload["max_tokens"])
     second_response = http.json("/v1/chat/completions", repeated)
-    second = validate_chat(second_response)
+    second = validate_chat(second_response, expected_model=payload["model"], max_tokens=payload["max_tokens"])
     _require(result, "cached prefix preserves answer", first == second, first, second)
     reused = second_response.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
     result["evidence"]["cached_tokens"] = reused
@@ -732,6 +896,9 @@ def _reset_and_cache(http, payload, result):
 
 def run_scenario(case, context):
     """Execute one adapter; status is pass/fail/untested, never infer coverage from exit 0."""
+    if _kind(case) == "speculation_ngram":
+        from .speculation import run_ngram
+        return run_ngram(case, context)
     start = time.monotonic()
     root = Path(context["artifact_dir"])
     root.mkdir(parents=True, exist_ok=True)
@@ -758,7 +925,7 @@ def run_scenario(case, context):
         result["reason"] = str(error)
     except KeyboardInterrupt:
         interrupted = True
-        result["reason"] = "cancelled by user; owned process tree terminated; scenario remains untested"
+        result["reason"] = "cancelled by user; cleanup outcome is recorded in stage.process.json; scenario remains untested"
     except (ScenarioFailure, OSError, ValueError, KeyError, TypeError, IndexError) as error:
         result["status"], result["reason"] = "fail", type(error).__name__ + ": " + str(error)
     finally:

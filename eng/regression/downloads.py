@@ -236,7 +236,14 @@ def probe_files(files: Iterable[FileSpec], policy: DownloadPolicy, network: bool
                 record.update(status="blocked", reason=exc.as_dict())
         else:
             if spec.size_bytes:
-                record["remaining_bytes"] = spec.size_bytes
+                try:
+                    # Planning may inspect sidecar metadata/stat, never model
+                    # payloads. Credit only partials owned by this suite whose
+                    # declared SHA/length match the selected immutable identity.
+                    _target(spec, policy)
+                    record["remaining_bytes"] = spec.size_bytes - _part_size(spec, spec.size_bytes)
+                except PrepareError as exc:
+                    record.update(status="blocked", reason=exc.as_dict())
         result.append(record)
     return result
 

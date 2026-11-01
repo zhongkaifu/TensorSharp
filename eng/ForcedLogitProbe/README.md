@@ -45,6 +45,14 @@ and the first row outside the numerical gate. Check `complete`, `cases_done`,
 and output directories must differ; stale completion records are invalidated
 before schedule parsing and model loading.
 
+Before creating each `.f32` file, the probe checks the exact byte count
+`rows * vocabulary_size * sizeof(float)` against free space on the output volume,
+plus `--disk-headroom-gib` (default **5 GiB**). The case's `artifact_disk_budget`
+records the logit, headroom, available and total required bytes. Insufficient
+space leaves incomplete metrics and exits with an error before that file is
+created. This is a pre-write check, not an OS disk reservation; another process
+can still consume space afterward. Zero headroom is an explicit override.
+
 The schedule contract has a separate model-free executable, linking the same
 `ProbeSchedule.cs` implementation without TensorSharp or native dependencies:
 

@@ -62,4 +62,18 @@ ProbeSchedule.ValidateReferences(roundtrip, external);
 Check(roundtrip[0].PromptTokens!.SequenceEqual(shortCase.PromptTokens!), "recorded JSON round trip");
 Check(ProbeSchedule.TokenHash([0, 1, 2]) == "ad5dc1478de06a4c2728ea528bd9361a4b945e92a414bf4d180cedaaeaa5f4cc", "portable int32-le SHA256");
 Check(ProbeSchedule.TokenHash([1, 2]) != ProbeSchedule.TokenHash([2, 1]), "hash preserves order");
+var budget = ProbeSchedule.PlanLogitArtifacts(32, 152064, 6L * 1024 * 1024 * 1024, 5);
+Check(budget.LogitBytes == 32L * 152064 * sizeof(float), "exact float32 rows times vocabulary disk bytes");
+Check(budget.HeadroomBytes == 5L * 1024 * 1024 * 1024, "explicit five GiB headroom");
+Check(budget.RequiredBytes == budget.LogitBytes + budget.HeadroomBytes && budget.Fits, "total artifact budget fits");
+Check(ProbeSchedule.PlanLogitArtifacts(1, 8, 32, 0).Fits, "exact capacity boundary permitted");
+Check(!ProbeSchedule.PlanLogitArtifacts(1, 8, 31, 0).Fits, "one byte short refused");
+Check(!ProbeSchedule.PlanLogitArtifacts(1, 8, 1024, 5).Fits, "headroom never silently discarded");
+Check(ProbeSchedule.PlanLogitArtifacts(1, 8, 1024, 1d / (1024d * 1024d * 1024d)).HeadroomBytes == 1, "fractional GiB rounded to bytes");
+foreach (double headroom in new[] { -1d, double.NaN, double.PositiveInfinity, double.MaxValue })
+    Reject(() => ProbeSchedule.PlanLogitArtifacts(1, 8, 100, headroom), "invalid or overflowed headroom");
+Reject(() => ProbeSchedule.PlanLogitArtifacts(int.MaxValue, int.MaxValue, long.MaxValue, 0), "row byte multiplication overflow");
+Reject(() => ProbeSchedule.PlanLogitArtifacts(0, 8, 100, 0), "empty capture row count");
+Reject(() => ProbeSchedule.PlanLogitArtifacts(1, 0, 100, 0), "empty vocabulary");
+Check(ProbeSchedule.AvailableDiskBytes(Path.GetTempPath()) > 0, "read-only current artifact volume free-space query");
 Console.WriteLine($"PASS: {checks} model-free forced-logit schedule assertions");

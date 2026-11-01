@@ -2,6 +2,8 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 using System.Buffers.Binary;
 using System.Security.Cryptography;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 
 // Model-free schedule contract, also linked into ContractTests. Output names are
@@ -78,6 +80,46 @@ internal static class ProbeSchedule
         return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
     }
 
+    public static LogitArtifactBudget PlanLogitArtifacts(int rows, int vocabularySize, long availableBytes, double headroomGiB)
+    {
+        if (rows <= 0 || vocabularySize <= 0 || availableBytes < 0)
+            throw new ArgumentOutOfRangeException(nameof(rows), "Rows/vocabulary must be positive and available bytes nonnegative");
+        if (!double.IsFinite(headroomGiB) || headroomGiB < 0)
+            throw new ArgumentOutOfRangeException(nameof(headroomGiB), "Disk headroom must be finite and nonnegative");
+        try
+        {
+            long logitBytes = checked((long)rows * vocabularySize * sizeof(float));
+            long headroomBytes = checked((long)Math.Ceiling(headroomGiB * 1024d * 1024d * 1024d));
+            long requiredBytes = checked(logitBytes + headroomBytes);
+            return new(logitBytes, headroomBytes, availableBytes, requiredBytes);
+        }
+        catch (OverflowException)
+        {
+            throw new ArgumentOutOfRangeException(nameof(headroomGiB), "Logit artifact byte budget exceeds Int64 capacity");
+        }
+    }
+
+    public static long AvailableDiskBytes(string outputDirectory)
+    {
+        string path = Path.GetFullPath(outputDirectory);
+        if (!Directory.Exists(path)) throw new DirectoryNotFoundException(path);
+        if (OperatingSystem.IsWindows())
+        {
+            // Query the actual path, not its drive letter: a junction can lead to
+            // a different volume. Available bytes also respect per-user quotas.
+            if (!GetDiskFreeSpaceExW(path, out ulong available, out _, out _))
+                throw new IOException("Cannot inspect logit output disk: " + path, new Win32Exception(Marshal.GetLastWin32Error()));
+            return checked((long)available);
+        }
+        // On Unix DriveInfo queries statfs at the existing path. Passing '/' would
+        // incorrectly budget the root volume when artifacts live on another mount.
+        return new DriveInfo(path).AvailableFreeSpace;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetDiskFreeSpaceExW(string directory, out ulong available, out ulong total, out ulong free);
+
     private static void RequireRecordedHistory(ProbeCase reference)
     {
         if (reference.PromptTokens is not { Length: > 0 } || reference.GeneratedTokens is not { Length: > 0 })
@@ -91,6 +133,11 @@ internal static class ProbeSchedule
             Regex.IsMatch(name.Split('.')[0], @"\A(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\z", RegexOptions.IgnoreCase))
             throw new ArgumentException("Invalid case name: " + name);
     }
+}
+
+internal sealed record LogitArtifactBudget(long LogitBytes, long HeadroomBytes, long AvailableBytes, long RequiredBytes)
+{
+    public bool Fits => AvailableBytes >= RequiredBytes;
 }
 
 internal sealed class ProbeCase

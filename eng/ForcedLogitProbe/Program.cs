@@ -3,6 +3,7 @@
 // Compare identical token histories, avoiding autoregressive divergence masking
 // small or large numerical errors. Artifacts belong in ignored validation paths.
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using TensorSharp;
@@ -11,7 +12,7 @@ using TensorSharp.Runtime;
 
 if (args.Length < 3)
 {
-    Console.Error.WriteLine("Usage: ForcedLogitProbe MODEL OUTPUT_DIR (BACKEND | --backend BACKEND) [--reference REFERENCE_DIR] [--steps N] [--cases cases.json] [--run-id ID]");
+    Console.Error.WriteLine("Usage: ForcedLogitProbe MODEL OUTPUT_DIR (BACKEND | --backend BACKEND) [--reference REFERENCE_DIR] [--steps N] [--cases cases.json] [--run-id ID] [--disk-headroom-gib N]");
     Console.Error.WriteLine("  BACKEND: ggml_cuda | ggml_cpu | ggml_metal | cuda (direct CUDA) | cpu (managed)");
     Console.Error.WriteLine("  Without --reference the run is greedy (its tokens become the reference's forced tokens) and");
     Console.Error.WriteLine("  metrics.json records each case's generated ids and text. metrics.json carries complete=false");
@@ -38,6 +39,9 @@ string? Option(string name)
 }
 int steps = int.Parse(Option("--steps") ?? "24");
 if (steps < 1 || steps > 1024) throw new ArgumentOutOfRangeException("--steps", "Use 1..1024 steps; at least16 for qualification.");
+double diskHeadroomGiB = double.Parse(Option("--disk-headroom-gib") ?? "5", CultureInfo.InvariantCulture);
+if (!double.IsFinite(diskHeadroomGiB) || diskHeadroomGiB < 0)
+    throw new ArgumentOutOfRangeException("--disk-headroom-gib", "Use finite nonnegative GiB");
 string? referenceDir = Option("--reference");
 if (referenceDir != null)
 {
@@ -93,6 +97,7 @@ void WriteMetrics(bool complete) =>
         model = Path.GetFileName(modelPath), backend = backendName, tp = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"),
         layer_split = Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE"), load_seconds = loadTimer.Elapsed.TotalSeconds,
         reference = referenceDir,
+        disk_headroom_gib = diskHeadroomGiB,
         session_semantics = "one model instance; ResetKVCache before every case",
         summary = hasComparisons ? all.Summarize() : null,
         cases = results }, json));
@@ -116,6 +121,17 @@ foreach (var item in cases)
     int count = referenceCase != null ? item.GeneratedTokens!.Length : steps;
     int[] generated = new int[count];
     string binaryPath = Path.Combine(directory, item.Name + ".f32");
+    LogitArtifactBudget diskBudget = ProbeSchedule.PlanLogitArtifacts(count, model.Config.VocabSize,
+        ProbeSchedule.AvailableDiskBytes(directory), diskHeadroomGiB);
+    if (!diskBudget.Fits)
+    {
+        string message = $"Insufficient logit artifact disk: case={item.Name}, logit_bytes={diskBudget.LogitBytes}, " +
+            $"headroom_bytes={diskBudget.HeadroomBytes}, required_bytes={diskBudget.RequiredBytes}, available_bytes={diskBudget.AvailableBytes}";
+        results.Add(new { name = item.Name, stage = "artifact_budget", status = "blocked",
+            session_case_index = casesDone, artifact_disk_budget = diskBudget, error = message });
+        WriteMetrics(complete: false);
+        throw new IOException(message);
+    }
     using var actualFile = File.Create(binaryPath);
     using FileStream? referenceFile = referenceName == null ? null : File.OpenRead(Path.Combine(referenceDir ?? directory, referenceCase!.Name + ".f32"));
     if (referenceFile != null && referenceFile.Length != (long)count * model.Config.VocabSize * sizeof(float))
@@ -187,6 +203,7 @@ foreach (var item in cases)
         catch (Exception ex) { text = "<decode failed: " + ex.GetType().Name + ">"; }
     }
     results.Add(new { name = item.Name, prompt_tokens = item.PromptTokens.Length, steps = count,
+        artifact_disk_budget = diskBudget,
         reference_case = referenceCase?.Name,
         reference_scope = referenceCase == null ? null : referenceDir != null ? "external" : "process",
         reset_kv_cache = true, session_case_index = casesDone, first_divergence = firstDivergence,

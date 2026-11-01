@@ -1,0 +1,71 @@
+// Metadata-only source verification: config/regression/source-pins.json.
+// Public project-linked publisher, immutable revision plus SHA256 for every file.
+// No quality/device qualification is implied. The local runner budgets the complete shard group.
+// Text-only baseline: ggml_cuda serves; ggml_cpu is a correctness path.
+// Other backends are refused. The ~232 GiB checkpoint needs an explicit high-memory/multi-GPU plan.
+// Upstream now publishes a projector/drafter; these newer companions are not automatically
+// enabled until their format/behavior is separately validated against the implementation.
+{
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/minimax-m3.1-flash"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/MiniMax-M3.1-Flash-UD-Q4_K_XL-00001-of-00007.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00001-of-00007.gguf"
+    ],
+    "sha256": "33859402ee4d2e195ca0a2556310db7b8da0a14f6104917cd5203288f73f3030",
+    "files": [
+      {
+        "path": "${root}/MiniMax-M3.1-Flash-UD-Q4_K_XL-00002-of-00007.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00002-of-00007.gguf"
+        ],
+        "sha256": "bbd9f034daeeb857c2435da1153c6f3b9e11e28e0325a3048c428f26f53d0c00"
+      },
+      {
+        "path": "${root}/MiniMax-M3.1-Flash-UD-Q4_K_XL-00003-of-00007.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00003-of-00007.gguf"
+        ],
+        "sha256": "18cfd1957e6593af07e0c8045d1e37825bb6c1413ff50d99aea5a060ace537f4"
+      },
+      {
+        "path": "${root}/MiniMax-M3.1-Flash-UD-Q4_K_XL-00004-of-00007.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00004-of-00007.gguf"
+        ],
+        "sha256": "520e886b521cb0f77cfdcdc88e8934be0cd55de01209cad92667bf85cfdf595e"
+      },
+      {
+        "path": "${root}/MiniMax-M3.1-Flash-UD-Q4_K_XL-00005-of-00007.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00005-of-00007.gguf"
+        ],
+        "sha256": "c761ad19c980a67946a963faebd0175d5751cd64ccdec1bb6274810d3156013f"
+      },
+      {
+        "path": "${root}/MiniMax-M3.1-Flash-UD-Q4_K_XL-00006-of-00007.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00006-of-00007.gguf"
+        ],
+        "sha256": "367e01f928ed33c9d994b7fe22cb5e623b2bda9b67984b418f4367873c082436"
+      },
+      {
+        "path": "${root}/MiniMax-M3.1-Flash-UD-Q4_K_XL-00007-of-00007.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00007-of-00007.gguf"
+        ],
+        "sha256": "4d67d5144fb734820da7ba78aa58bfb0408dacfcf8601507b71e3e60310f74ef"
+      }
+    ]
+  }
+}

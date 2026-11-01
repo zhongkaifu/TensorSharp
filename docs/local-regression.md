@@ -131,6 +131,16 @@ depends on a previous input length even when equal-length repeats are stable.
 Repeatability does not establish agreement with an
 independent Transformers/reference implementation.
 
+`jev_decision` runs the repository's 12 labeled text decision fixtures, 36 gold
+decisions, fixed-seed replay and malformed requests. `speculation_ngram` requires
+a prebuilt `--benchmark` AgentTurnBench and a source-admitted family/backend;
+it requires actual n-gram verification/acceptance and exact greedy token parity.
+It never enables a learned drafter. `image_generation_smoke` runs Qwen base/Turbo
+at 128px with its required VAE/text encoder, validates PNG contents and error
+responses, and records repeated-seed hashes without declaring semantic quality
+or bitwise determinism. The corresponding broader quality, attachment and
+learned-speculation recipes remain untested.
+
 Media understanding needs the documented public/synthetic inputs from
 `eng/make-test-media.sh` supplied through `--media-dir`. Missing media never
 causes a pass. These inputs have known content and assertions; arbitrary private
@@ -145,12 +155,35 @@ truncated required evidence, timeout, OOM or crash fails the relevant case.
 
 ## Reports, exit codes and reproduction
 
+Prebuilt native CTest assertions can also run through this entry point:
+
+```sh
+python eng/run-local-regression.py --mode run --scenarios native_ctest --native-test-build-dir artifacts/native-regression-build --native-test-backend cpu
+```
+
+Configure and build that isolated directory separately using
+`-DTENSORSHARP_GGML_NATIVE_BUILD_TESTS=ON`. The runner checks that its CMake cache
+points to this checkout and never configures or builds it implicitly. Tests run
+sequentially, with exact selected names and per-test JUnit outcomes. Backend
+arguments/names must identify the requested device; ambiguous tests stay
+`untested`, other-device tests are `skip`. An optional `--native-test-filter`
+regex narrows names further. Fixture dependencies outside the selection are
+reported instead of allowing CTest to start another device automatically.
+Device builds require the corresponding explicit `--native-test-backend` and
+recorded compiler options. Binary/cache hashes identify the deployment; they do
+not establish that an old binary was rebuilt from the current commit. Native
+assertions do not count as real-model qualification.
+
 Each invocation uses a new directory under `artifacts/local-regression/` (or an
 empty `--output`). It writes `report.json`, `report.md`, `junit.xml`, sanitized
 per-case logs/configs/inputs and `diagnostics.zip`. Report identity includes source
 commit/dirty state, config/catalog hashes, binary hashes, model source/revision
 and SHA-256, hardware/toolchain, requested/actual backend, budgets, sampling,
 commands, stage, timings, assertions and reproduction arguments.
+When using hosts built in another checkout, provide `--engine-repo` to record
+that checkout's commit and dirty state separately. This is declared build
+provenance; the report also hashes the supplied binaries and does not infer their
+source commit from the harness checkout.
 
 Only allowlisted text diagnostics enter the ZIP, with credential redaction and
 size limits. No weights, process memory, or entire environment dumps are bundled.
@@ -172,7 +205,7 @@ The tool does not publish them.
 | 1 | Preparation/assertion failure |
 | 2 | Invalid invocation/configuration or harness error |
 | 3 | No executable test passed, or `--strict` found selected skip/untested cases |
-| 130 | Cancelled; owned processes stopped and evidence retained |
+| 130 | Cancelled; process cleanup outcome and evidence retained |
 
 For CI/local acceptance use `--strict` and select a deliberately bounded scenario
 matrix. A broad run containing known recipes cannot honestly satisfy strict full

@@ -578,9 +578,10 @@
         "TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerArchitecture.cs",
         "docs/models/muse-glimmer.md"
       ],
-      "configuration_status": "missing_preset",
-      "presets": [],
-      "gap_reason": "No standalone pinned config in config/ for this family. Project download/card references exist, but complete immutable assets/hashes and companions must be verified before unattended download. Not counted as covered."
+      "configuration_status": "configured",
+      "presets": [
+        "muse-glimmer-30b"
+      ]
     },
     {
       "id": "muse-spark",
@@ -607,9 +608,10 @@
         "TensorSharp.Models/Models/MuseSpark/MuseSparkArchitecture.cs",
         "docs/models/muse-spark.md"
       ],
-      "configuration_status": "missing_preset",
-      "presets": [],
-      "gap_reason": "No standalone pinned config in config/ for this family. Project download/card references exist, but complete immutable assets/hashes and companions must be verified before unattended download. Not counted as covered."
+      "configuration_status": "configured",
+      "presets": [
+        "muse-spark-816b-a42b"
+      ]
     },
     {
       "id": "deepseek4",
@@ -742,9 +744,10 @@
         "TensorSharp.Models/Models/MiniMaxM3/MiniMaxM3Architecture.cs",
         "docs/models/minimax-m3.md"
       ],
-      "configuration_status": "missing_preset",
-      "presets": [],
-      "gap_reason": "No standalone pinned config in config/ for this family. Project download/card references exist, but complete immutable assets/hashes and companions must be verified before unattended download. Not counted as covered."
+      "configuration_status": "configured",
+      "presets": [
+        "minimax-m3.1-flash"
+      ]
     },
     {
       "id": "bonsai2",
@@ -807,7 +810,8 @@
         "server_structured",
         "server_tools",
         "speculation",
-        "server_agents"
+        "server_agents",
+        "speculation_ngram"
       ],
       "source_evidence": [
         "config/agent-gemma-4-12b.json",
@@ -852,7 +856,8 @@
         "server_reset_cache",
         "server_structured",
         "server_tools",
-        "server_agents"
+        "server_agents",
+        "speculation_ngram"
       ],
       "source_evidence": [
         "config/agent-gemma-4-26b-a4b.json",
@@ -1214,7 +1219,8 @@
         "cli_text",
         "server_chat",
         "server_stream",
-        "jev_decision"
+        "jev_decision",
+        "jev_media"
       ],
       "source_evidence": [
         "config/diffusiongemma-26b-a4b-q3.json",
@@ -1253,7 +1259,8 @@
         "cli_text",
         "server_chat",
         "server_stream",
-        "jev_decision"
+        "jev_decision",
+        "jev_media"
       ],
       "source_evidence": [
         "config/diffusiongemma-26b-a4b-q4.json",
@@ -1418,7 +1425,8 @@
         "cli_image",
         "cli_audio",
         "cli_video",
-        "speculation"
+        "speculation",
+        "speculation_ngram"
       ],
       "source_evidence": [
         "config/gemma-4-12b.json",
@@ -1466,7 +1474,8 @@
         "cli_image",
         "cli_audio",
         "cli_video",
-        "speculation"
+        "speculation",
+        "speculation_ngram"
       ],
       "source_evidence": [
         "config/gemma-4-26b-a4b.json",
@@ -1520,7 +1529,8 @@
         "cli_image",
         "cli_audio",
         "cli_video",
-        "speculation"
+        "speculation",
+        "speculation_ngram"
       ],
       "source_evidence": [
         "config/gemma-4-e4b.json",
@@ -1775,7 +1785,8 @@
         "cli_text",
         "server_chat",
         "server_stream",
-        "jev_decision"
+        "jev_decision",
+        "jev_media"
       ],
       "source_evidence": [
         "config/jev-diffusiongemma-q4.json",
@@ -2348,6 +2359,58 @@
       "status": "configured"
     },
     {
+      "id": "minimax-m3.1-flash",
+      "config": "config/minimax-m3.1-flash.json",
+      "kind": "text",
+      "family": "minimax-m3",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "ggml_cuda",
+        "ggml_cpu"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "multi_gpu",
+        "speculation_ngram"
+      ],
+      "source_evidence": [
+        "config/minimax-m3.1-flash.json",
+        "config/regression/source-pins.json",
+        "TensorSharp.Models/Models/MiniMaxM3/MiniMaxM3Architecture.cs",
+        "docs/models/minimax-m3.md"
+      ],
+      "layout": "moe",
+      "status": "configured",
+      "file_sizes": {
+        "MiniMax-M3.1-Flash-UD-Q4_K_XL-00001-of-00007.gguf": 8243070,
+        "MiniMax-M3.1-Flash-UD-Q4_K_XL-00002-of-00007.gguf": 48922385120,
+        "MiniMax-M3.1-Flash-UD-Q4_K_XL-00003-of-00007.gguf": 48922385152,
+        "MiniMax-M3.1-Flash-UD-Q4_K_XL-00004-of-00007.gguf": 48922385152,
+        "MiniMax-M3.1-Flash-UD-Q4_K_XL-00005-of-00007.gguf": 48922385152,
+        "MiniMax-M3.1-Flash-UD-Q4_K_XL-00006-of-00007.gguf": 49985658336,
+        "MiniMax-M3.1-Flash-UD-Q4_K_XL-00007-of-00007.gguf": 3718663328
+      },
+      "notes": [
+        "Pinned model file identities verified from publisher metadata only; actual inference remains untested.",
+        "New upstream projector/drafter not enabled by this text baseline; converted/qualified companion still required for vision/learned speculation."
+      ]
+    },
+    {
       "id": "mistral-small-3.1-24b",
       "config": "config/mistral-small-3.1-24b.json",
       "kind": "text",
@@ -2391,6 +2454,118 @@
         "mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf": 878054144
       },
       "status": "configured"
+    },
+    {
+      "id": "muse-glimmer-30b",
+      "config": "config/muse-glimmer-30b.json",
+      "kind": "text",
+      "family": "muse-glimmer",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image"
+      ],
+      "source_evidence": [
+        "config/muse-glimmer-30b.json",
+        "config/regression/source-pins.json",
+        "TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerArchitecture.cs",
+        "docs/models/muse-glimmer.md"
+      ],
+      "layout": "dense",
+      "status": "configured",
+      "file_sizes": {
+        "Muse-Glimmer-30B-UD-Q4_K_XL.gguf": 15878222368,
+        "mmproj-Muse-Glimmer-30B-Q8_0.gguf": 2051685088
+      },
+      "notes": [
+        "Pinned model file identities verified from publisher metadata only; actual inference remains untested.",
+        "Matching DFlash exists separately; n-gram and learned draft coverage must stay distinct."
+      ]
+    },
+    {
+      "id": "muse-spark-816b-a42b",
+      "config": "config/muse-spark-816b-a42b.json",
+      "kind": "text",
+      "family": "muse-spark",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image",
+        "multi_gpu",
+        "speculation_ngram"
+      ],
+      "source_evidence": [
+        "config/muse-spark-816b-a42b.json",
+        "config/regression/source-pins.json",
+        "TensorSharp.Models/Models/MuseSpark/MuseSparkArchitecture.cs",
+        "docs/models/muse-spark.md"
+      ],
+      "layout": "moe",
+      "status": "configured",
+      "file_sizes": {
+        "Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00001-of-00008.gguf": 13079896,
+        "Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00002-of-00008.gguf": 49199576672,
+        "Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00003-of-00008.gguf": 48777572992,
+        "Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00004-of-00008.gguf": 48998157856,
+        "Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00005-of-00008.gguf": 49672648608,
+        "Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00006-of-00008.gguf": 48956218432,
+        "Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00007-of-00008.gguf": 49010673088,
+        "Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00008-of-00008.gguf": 45722968832,
+        "mmproj-Q8_0.gguf": 2183868768
+      },
+      "notes": [
+        "Pinned model file identities verified from publisher metadata only; actual inference remains untested."
+      ]
     },
     {
       "id": "nemotron-3-nano-omni-30b-a3b",
@@ -2595,7 +2770,8 @@
         "image_generation",
         "image_editing",
         "lora",
-        "multi_gpu"
+        "multi_gpu",
+        "image_generation_smoke"
       ],
       "source_evidence": [
         "config/qwen-image-2.1-turbo.json",
@@ -2632,7 +2808,8 @@
         "image_generation",
         "image_editing",
         "lora",
-        "multi_gpu"
+        "multi_gpu",
+        "image_generation_smoke"
       ],
       "source_evidence": [
         "config/qwen-image-2.1.json",
@@ -3034,7 +3211,8 @@
         "server_tools",
         "cli_image",
         "cli_audio",
-        "cli_video"
+        "cli_video",
+        "speculation_ngram"
       ],
       "source_evidence": [
         "config/server-basic.json",
@@ -3082,7 +3260,8 @@
         "cli_image",
         "cli_audio",
         "cli_video",
-        "speculation"
+        "speculation",
+        "speculation_ngram"
       ],
       "source_evidence": [
         "config/variables.json",
@@ -3215,8 +3394,8 @@
       "status": "automated",
       "recipe": "--model {model} --backend {backend} --input {fixture} --max-tokens 128 --temperature 0 --seed 42",
       "assertions": [
-        "Assistant output contains the expected answer from the selected fixture, excluding prompts and logs.",
-        "Observed backend equals requested backend."
+        "Generated final answer satisfies the selected semantic fixture; prompts, logs and formatted thinking cannot satisfy it.",
+        "Positive runtime backend banner matches the requested backend, normal completion has generated tokens, and fresh-process replay matches."
       ],
       "evidence": [
         "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
@@ -3231,8 +3410,8 @@
       "status": "automated",
       "recipe": "--benchmark --bench-prefill 128 --bench-decode 0 --bench-runs 1 --bench-fixed-tokens",
       "assertions": [
-        "Finite positive prefill throughput and exactly the requested prompt-token count.",
-        "No backend fallback."
+        "Startup evidence has the requested prefill/decode shape; prefill throughput is finite and positive.",
+        "Correctness prefill top-token ID matches across two fresh processes; actual backend and owned-process teardown are verified."
       ],
       "evidence": [
         "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
@@ -3247,8 +3426,8 @@
       "status": "automated",
       "recipe": "--benchmark --bench-prefill 32 --bench-decode 16 --bench-runs 1 --bench-fixed-tokens",
       "assertions": [
-        "Finite positive decode throughput and exactly the requested decode-token count.",
-        "No backend fallback."
+        "Decode throughput is finite and positive and the sampled decode-ID count equals the requested count.",
+        "Prefill top ID and every decode ID match across two fresh processes; actual backend and owned-process teardown are verified."
       ],
       "evidence": [
         "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
@@ -3263,7 +3442,8 @@
       "status": "automated",
       "recipe": "--multi-turn-jsonl TensorSharp.TestMatrix/Inputs/multi_turn/three_turn.jsonl",
       "assertions": [
-        "Later assistant turns recover Alex and teal; fixture text cannot satisfy assertions."
+        "Three answer previews are present; the second recovers Alex and the third recovers teal after an explicit KV-reset event.",
+        "This checks the CLI multi-turn fixture and reset path; fixed-history numerical cache equivalence is a separate logits scenario."
       ],
       "evidence": [
         "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
@@ -3278,7 +3458,8 @@
       "status": "automated",
       "recipe": "Use runner synthetic get_regression_value tool and key=fixture prompt.",
       "assertions": [
-        "Parsed tool call is get_regression_value; JSON arguments have key=fixture; ordinary prose is not a tool call."
+        "One formatted CLI Tool Calls section identifies get_regression_value with exact JSON arguments {key: fixture}.",
+        "This is the CLI presentation contract; typed HTTP tool-call envelopes and round-trip results are checked by server_tools. No model-generated command executes."
       ],
       "evidence": [
         "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
@@ -3293,7 +3474,7 @@
       "status": "automated",
       "recipe": "--think --input TensorSharp.TestMatrix/Inputs/prompts/thinking_question.txt",
       "assertions": [
-        "Visible final answer gives 10:38; analysis tokens alone do not pass."
+        "Visible final answer gives 10:38 after the formatted thinking section is removed; normal completion and generated-token evidence are required."
       ],
       "evidence": [
         "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
@@ -3307,8 +3488,8 @@
       "status": "automated",
       "recipe": "--image {fixture} --input TensorSharp.TestMatrix/Inputs/prompts/image_question.txt",
       "assertions": [
-        "Assistant answer contains fixture-specific expected content (tensorsharp for repository default).",
-        "Media encoder actually loads; text-only fallback is failure."
+        "Final answer matches the explicit media fixture expectation (tensorsharp for the generated repository banner).",
+        "A recognized positive vision encoder/injection event is required; absent execution evidence is untested rather than a pass."
       ],
       "evidence": [
         "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
@@ -3327,8 +3508,8 @@
       "status": "automated",
       "recipe": "--audio {fixture} --input TensorSharp.TestMatrix/Inputs/prompts/audio_question.txt",
       "assertions": [
-        "Assistant answer contains fixture-specific expected content (fox for repository default).",
-        "Media encoder actually loads; text-only fallback is failure."
+        "Final answer matches the explicit media fixture expectation (fox for the generated repository audio).",
+        "A recognized positive audio encoder event is required; absent execution evidence is untested rather than a pass."
       ],
       "evidence": [
         "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
@@ -3347,8 +3528,8 @@
       "status": "automated",
       "recipe": "--video {fixture} --input TensorSharp.TestMatrix/Inputs/prompts/video_question.txt",
       "assertions": [
-        "Assistant answer contains fixture-specific expected content (tensorsharp for repository default).",
-        "Media encoder actually loads; text-only fallback is failure."
+        "Final answer matches the explicit media fixture expectation (tensorsharp for the generated repository banner-zoom video).",
+        "A recognized positive vision encoder/injection event is required; absent execution evidence is untested rather than a pass."
       ],
       "evidence": [
         "TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs",
@@ -3367,10 +3548,9 @@
       "status": "automated",
       "recipe": "Run two fresh processes with --steps 16 on the same backend; the second uses --reference {first-output} to replay exact teacher-forced histories.",
       "assertions": [
-        "metrics.complete is true and case histories/token counts match.",
-        "Every logit is finite; compare identical forced token history, max absolute error, cosine and top-token margins.",
-        "Record first divergent case/step/token and full rows; autoregressive text equality is not enough.",
-        "This is within-backend consistency. An independent oracle or cross-backend accuracy claim requires a separate controlled reference."
+        "Complete markers, unique run IDs, case identities, exact prompt/generated ID histories and their int32-little-endian SHA256 hashes agree.",
+        "Every compared row is finite; relative L2 <= 0.001, cosine >= 0.999999 and identical top1 must all hold. Max absolute error, KL, top5 overlap and margins are diagnostic measurements, not additional threshold gates.",
+        "Persist full float32 rows and first divergent case/step/reference/candidate token. This is within-backend consistency, not independent numerical accuracy."
       ],
       "evidence": [
         "eng/ForcedLogitProbe/Program.cs",
@@ -3394,10 +3574,10 @@
       "status": "automated",
       "recipe": "Run short-short, long-long, short-long-short and long-short orders with 32/512 prompt-token lengths and 32 teacher-forced decode steps. Compare each reused-model ResetKVCache case with a fresh-process reference.",
       "assertions": [
-        "All complete markers true; exact prompt lengths and teacher-forced histories match their reference.",
-        "Finite logits at every step; declared max-absolute/relative or cosine tolerance gates apply independently of argmax.",
-        "Report first changed row/token and preceding case/length; include per-step top-k/selected token, model/backend hashes and reset boundary.",
-        "Sequence agreement is consistency evidence only; it does not identify a root cause or establish independent numerical accuracy."
+        "Independent fresh-process short32 and long512 controls each generate 32 forced IDs; all four reused-session schedules retain exact histories and hashes.",
+        "Every case reports an explicit KV reset, external canonical reference and session index. Every row must be finite with relative L2 <= 0.001, cosine >= 0.999999 and identical top1.",
+        "First divergence records schedule, case, preceding case/length, step and reference/candidate top1; full rows and diagnostic error/margin/overlap measurements remain available.",
+        "Sequence agreement is consistency evidence only; it neither identifies the root cause nor establishes independent numerical accuracy."
       ],
       "evidence": [
         "eng/ForcedLogitProbe/Program.cs",
@@ -3421,7 +3601,8 @@
       "status": "automated",
       "recipe": "POST /v1/chat/completions with fixed seed, greedy sampler and arithmetic fixture",
       "assertions": [
-        "Expected answer, assistant role, nonempty choices, model identity and bounded token usage."
+        "Loaded model/backend identity and response model match; assistant final answer satisfies the fixed arithmetic fixture.",
+        "Completion ends normally, positive integer usage sums correctly and stays within the requested token budget; seeded replay matches."
       ],
       "evidence": [
         "TensorSharp.Server/Endpoints/OpenAIEndpoints.cs",
@@ -3435,7 +3616,8 @@
       "status": "automated",
       "recipe": "POST /v1/chat/completions stream=true with same fixed input as nonstream",
       "assertions": [
-        "Valid SSE JSON chunks, exactly one terminal [DONE], nonempty assistant delta and expected reconstructed answer."
+        "SSE chunks have a stable completion ID and requested model; reconstructed content equals the nonstream fixture answer.",
+        "Exactly one terminal [DONE], a normal finish reason and positive bounded token accounting are required; trailing data or error text fails."
       ],
       "evidence": [
         "TensorSharp.Server/Endpoints/OpenAIEndpoints.cs",
@@ -3450,7 +3632,9 @@
       "status": "automated",
       "recipe": "Close an in-flight streaming request, then perform a bounded follow-up request",
       "assertions": [
-        "Stream starts before cancellation; owned server stays healthy and follow-up completes; no stale text crosses requests."
+        "Observe a generated chunk and an in-flight queue before disconnect, using an echoed unique X-TensorSharp-Request-Id.",
+        "Require matching request-scope/SSE-ID startup linkage and ChatAborted JSONL telemetry with 0 < generated tokens < the requested budget; absent evidence or normal completion is untested.",
+        "The queue drains and a subsequent arithmetic request succeeds; recovery alone never establishes cancellation."
       ],
       "evidence": [
         "TensorSharp.Server/Endpoints/OpenAIEndpoints.cs",
@@ -3465,7 +3649,9 @@
       "status": "automated",
       "recipe": "Repeat fixed conversations, reset owned session, repeat prompt",
       "assertions": [
-        "No cross-session secret leakage; after reset same seeded answer; retained-cache behavior requires backend-specific trace evidence."
+        "Two distinct sessions execute a synthetic marker fixture: session A can repeat its marker, session B answers NONE without it.",
+        "After newChat reset, the arithmetic answer equals the independent-session answer; both sessions are deleted and repeated deletion returns 404.",
+        "Identical long-prefix replay preserves the answer and reports positive cached_tokens; without observed cache reuse the combined scenario remains untested. These fixtures do not establish general privacy or raw KV equivalence."
       ],
       "evidence": [
         "TensorSharp.Server/Endpoints/SessionEndpoints.cs",
@@ -3480,7 +3666,7 @@
       "status": "automated",
       "recipe": "POST /v1/chat/completions response_format=json_schema",
       "assertions": [
-        "Parse final JSON; validate exact required fields, types and values; no additional properties."
+        "Parse final JSON without duplicate keys; require exactly the integer field answer=56 with no extra fields, normal finish and bounded usage."
       ],
       "evidence": [
         "TensorSharp.Server/Endpoints/OpenAIEndpoints.cs",
@@ -3495,7 +3681,8 @@
       "status": "automated",
       "recipe": "POST /v1/chat/completions with one read-only fixture tool and forced tool_choice",
       "assertions": [
-        "Exact function name, valid JSON args and expected argument values; never execute model-supplied commands."
+        "Typed assistant completion contains exactly one tool call, its expected function name/ID and exact JSON arguments; do not execute it.",
+        "Feed a fixed synthetic tool result and require the final arithmetic value. Host agents, skills and shell execution remain outside this scenario."
       ],
       "evidence": [
         "TensorSharp.Server/Endpoints/OpenAIEndpoints.cs",
@@ -3510,8 +3697,9 @@
       "status": "automated",
       "recipe": "POST /v1/embeddings for identical, semantically related and unrelated fixture strings",
       "assertions": [
-        "Finite vectors with correct dimension/order; repeat consistency and cosine self-similarity; related text ranks over unrelated text.",
-        "Embedding host rejects generation routes; malformed input gets correct 4xx."
+        "Four finite unit-norm vectors have the advertised dimension and ordered indices; duplicate cosine >= 0.99999 and related-text cosine exceeds unrelated-text cosine by > 0.0001.",
+        "POST /v1/chat/completions is rejected with HTTP 400 and the embedding-host explanation.",
+        "Empty OpenAI input and zero dimensions return typed HTTP 400 errors naming the correct parameter; an unhosted model returns typed HTTP 404 model_not_found."
       ],
       "evidence": [
         "TensorSharp.Server/Endpoints/EmbeddingEndpoints.cs",
@@ -3655,18 +3843,21 @@
     },
     {
       "id": "jev_decision",
-      "entry_point": "eng/jev-extended-smoke.py",
-      "status": "recipe",
-      "recipe": "Run fixed Jev /v1/systemone decisions and attachment probes.",
+      "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
+      "status": "automated",
+      "recipe": "Execute all 12 fixed text decision fixtures through /v1/systemone, replay one fixed seed, and reject four malformed requests.",
       "assertions": [
-        "Expected structured decision probabilities finite/normalized, label order and seeded reproducibility; unsupported media/ASR missing errors explicit."
+        "All 36 gold decisions match; probability vectors are finite, normalized and correctly ordered, with consistent argmax and weighted scores.",
+        "Model identity, question ownership, typed nonnegative usage and one-step seed/sample diagnostics match.",
+        "Fixed-seed probability replay stays within 1e-5; malformed decision inputs return 400/422."
       ],
       "evidence": [
-        "eng/jev-extended-smoke.py",
+        "eng/regression/jev.py",
+        "eng/jev-benchmark.py",
         "TensorSharp.TestMatrix/Inputs/jev/decisions.json"
       ],
       "requirements": [
-        "Jev fixture; ASR only when testing transcript path"
+        "Built local server and Jev model; text decisions only"
       ]
     },
     {
@@ -3739,18 +3930,20 @@
     },
     {
       "id": "native_ctest",
-      "entry_point": "TensorSharp.GGML.Native/CMakeLists.txt",
-      "status": "recipe",
-      "recipe": "Configure isolated native build with -DTENSORSHARP_GGML_NATIVE_BUILD_TESTS=ON, build, then ctest --test-dir {build} --output-on-failure.",
+      "entry_point": "eng/regression/ctest.py",
+      "status": "suite",
+      "recipe": "Use --native-test-build-dir PATH --native-test-backend cpu|cuda|metal|vulkan with an independently prebuilt directory from this checkout.",
       "assertions": [
-        "Native MoE, quantization, attention, cache, scheduler and model-specific numerical assertions pass.",
-        "Preserve unsupported device skips and failed native assertions; record unchanged upstream ggml revision."
+        "Discovery, selected test names and JUnit outcomes match; each pass/fail/skip is retained.",
+        "Only tests with requested backend attribution and selected fixture dependencies execute; ambiguous tests remain untested.",
+        "No implicit native build or other-device fixture execution; CMake cache and executable hashes recorded without claiming rebuild provenance."
       ],
       "evidence": [
-        "TensorSharp.GGML.Native/CMakeLists.txt"
+        "TensorSharp.GGML.Native/CMakeLists.txt",
+        "eng/regression/ctest.py"
       ],
       "requirements": [
-        "CMake/toolchain and isolated native build; device-specific tests require hardware"
+        "Explicit prebuilt directory with TENSORSHARP_GGML_NATIVE_BUILD_TESTS=ON, CTest, and relevant backend hardware"
       ]
     },
     {
@@ -3789,14 +3982,15 @@
     {
       "id": "server_unit",
       "entry_point": "InferenceWeb.Tests/InferenceWeb.Tests.csproj",
-      "status": "recipe",
-      "recipe": "dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release --logger trx",
+      "status": "suite",
+      "recipe": "Use --include-suites; prebuilt default, --allow-builds explicitly enables building. Environment-independent filter excludes Bench/Models/Cuda/Mlx.",
       "assertions": [
-        "Validate server protocol, request validation, config semantics, cancellation, cache and tool behavior with fixture services.",
-        "Parse passed/failed/skipped counts from TRX; zero executed tests is untested."
+        "Positive passing TRX execution count; zero failed/error/timeout/aborted tests; inconsistent or absent counters fail.",
+        "Unexecuted/inconclusive tests remain explicit skipped coverage; this lane does not establish native/model or desktop visual qualification."
       ],
       "evidence": [
-        "InferenceWeb.Tests/InferenceWeb.Tests.csproj"
+        "InferenceWeb.Tests/InferenceWeb.Tests.csproj",
+        "eng/regression/suites.py"
       ],
       "requirements": [
         ".NET 10 SDK and restored packages; built native libraries only for relevant tests"
@@ -3804,15 +3998,18 @@
     },
     {
       "id": "client_unit",
-      "entry_point": "InferenceWeb.Tests/InferenceWeb.Tests.csproj",
-      "status": "recipe",
-      "recipe": "dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release --logger trx",
+      "entry_point": "eng/tests/NativeChatCompletion and eng/tests/dotnet-local-chat.py",
+      "status": "suite",
+      "recipe": "Use --include-suites for separate native and HTTP model-free client contracts.",
       "assertions": [
-        "Validate IChatClient examples and native client transport, streaming, cancellation and tool contract fixtures.",
-        "Parse passed/failed/skipped counts from TRX; zero executed tests is untested."
+        "Native contract output confirms all seven completion-boundary checks and no FAIL records.",
+        "Each HTTP integration/self-test command emits assertion evidence, exits successfully and has no FAIL records; absent assemblies remain skipped."
       ],
       "evidence": [
-        "InferenceWeb.Tests/InferenceWeb.Tests.csproj"
+        "eng/tests/NativeChatCompletion/Program.cs",
+        "eng/tests/dotnet-local-chat.py",
+        "eng/tests/dotnet-local-chat-e2e.py",
+        "eng/regression/suites.py"
       ],
       "requirements": [
         ".NET 10 SDK and restored packages; built native libraries only for relevant tests"
@@ -3821,14 +4018,15 @@
     {
       "id": "knowledge_unit",
       "entry_point": "TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj",
-      "status": "recipe",
-      "recipe": "dotnet test TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj -c Release --logger trx",
+      "status": "suite",
+      "recipe": "Use --include-suites; prebuilt default, --allow-builds explicitly enables building. Environment-independent filter excludes Bench/Models/Cuda/Mlx.",
       "assertions": [
-        "Validate ingestion, chunking, retrieval and isolation fixture assertions.",
-        "Parse passed/failed/skipped counts from TRX; zero executed tests is untested."
+        "Positive passing TRX execution count; zero failed/error/timeout/aborted tests; inconsistent or absent counters fail.",
+        "Unexecuted/inconclusive tests remain explicit skipped coverage; this lane does not establish native/model or desktop visual qualification."
       ],
       "evidence": [
-        "TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj"
+        "TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj",
+        "eng/regression/suites.py"
       ],
       "requirements": [
         ".NET 10 SDK and restored packages; built native libraries only for relevant tests"
@@ -3837,17 +4035,73 @@
     {
       "id": "studio_unit",
       "entry_point": "TensorSharp.Studio.Tests/TensorSharp.Studio.Tests.csproj",
-      "status": "recipe",
-      "recipe": "dotnet test TensorSharp.Studio.Tests/TensorSharp.Studio.Tests.csproj -c Release --logger trx",
+      "status": "suite",
+      "recipe": "Use --include-suites; prebuilt default, --allow-builds explicitly enables building. Environment-independent filter excludes Bench/Models/Cuda/Mlx.",
       "assertions": [
-        "Validate studio controller and workflow contracts; these are not desktop visual E2E coverage.",
-        "Parse passed/failed/skipped counts from TRX; zero executed tests is untested."
+        "Positive passing TRX execution count; zero failed/error/timeout/aborted tests; inconsistent or absent counters fail.",
+        "Unexecuted/inconclusive tests remain explicit skipped coverage; this lane does not establish native/model or desktop visual qualification."
       ],
       "evidence": [
-        "TensorSharp.Studio.Tests/TensorSharp.Studio.Tests.csproj"
+        "TensorSharp.Studio.Tests/TensorSharp.Studio.Tests.csproj",
+        "eng/regression/suites.py"
       ],
       "requirements": [
         ".NET 10 SDK and restored packages; built native libraries only for relevant tests"
+      ]
+    },
+    {
+      "id": "jev_media",
+      "status": "recipe",
+      "entry_point": "eng/jev-extended-smoke.py",
+      "recipe": "Run separately controlled Jev image/attachment and optional ASR probes with approved local fixtures.",
+      "assertions": [
+        "Attachment-dependent decisions match labeled fixtures; unsupported media and absent ASR return explicit errors."
+      ],
+      "evidence": [
+        "eng/jev-extended-smoke.py"
+      ],
+      "requirements": [
+        "Synthetic attachments; explicitly configured ASR only for speech path"
+      ]
+    },
+    {
+      "id": "image_generation_smoke",
+      "status": "automated",
+      "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
+      "recipe": "Generate two 128x128 Qwen images with seed42, base2 or Turbo8 steps; validate four malformed requests and strict same-origin PNG downloads.",
+      "assertions": [
+        "Requested backend/model and qwen_image architecture are positively identified.",
+        "Complete bounded PNG CRC/IHDR/IEND/zlib/filter decoding, exact dimensions/RGBA8 and visible nonconstant pixels.",
+        "Malformed prompt/dimensions/parameter types return typed 400 diagnostics; repeat SHA values recorded as observation only. Semantic quality, internal float traces and bitwise repeatability are not qualified."
+      ],
+      "evidence": [
+        "eng/regression/image_generation.py",
+        "eng/validation/qwen-image21-http.py"
+      ],
+      "requirements": [
+        "Complete model/VAE/text encoder, source-defined base/turbo schedule and memory budget"
+      ]
+    },
+    {
+      "id": "speculation_ngram",
+      "status": "automated",
+      "entry_point": "benchmarks/AgentTurnBench/bin/Release/net10.0/AgentTurnBench.dll",
+      "recipe": "Use --benchmark with a prebuilt AgentTurnBench; run only bounded plain-greedy versus ngram rows, 64 generated tokens and 128-token code fixture.",
+      "assertions": [
+        "Identical nonempty token IDs, Finish and prompt/cache shapes; plain counters contain no drafting.",
+        "Positive ngram Drafted/Accepted/VerifySteps and internally consistent counters; zero activation is untested.",
+        "Observed backend matches requested; nonfinite/malformed/stale rows, timeout/OOM and unverified process teardown fail. First token divergence retained."
+      ],
+      "evidence": [
+        "eng/regression/speculation.py",
+        "benchmarks/AgentTurnBench/Program.cs",
+        "eng/validation/validate-speculative-rows.py",
+        "TensorSharp.Models/Models/Gemma4/Gemma4Model.Speculative.cs",
+        "TensorSharp.Models/Models/MuseSpark/MuseSparkModel.Speculative.cs",
+        "TensorSharp.Models/Models/MiniMaxM3/MiniMaxM3Model.Speculative.cs"
+      ],
+      "requirements": [
+        "Prebuilt benchmark; source-admitted Gemma4/MuseSpark/MiniMaxM3 family/backend; single-device ngram only"
       ]
     }
   ]

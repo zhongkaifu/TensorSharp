@@ -96,6 +96,38 @@ class CatalogInventoryTests(unittest.TestCase):
                 self.assertEqual(list(range(1, total + 1)), sorted(number for number, count in shards))
                 self.assertTrue(all(count == total for number, count in shards))
 
+    def test_publisher_metadata_pins_match_new_family_presets(self):
+        receipt = json.loads((REPO / "config/regression/source-pins.json").read_text(encoding="utf-8"))
+        seen = set()
+        for source in receipt["repositories"]:
+            self.assertRegex(source["revision"], r"^[0-9a-f]{40}$")
+            self.assertRegex(source["metadata_sha256"], r"^[0-9a-f]{64}$")
+            self.assertFalse(source["gated"])
+            self.assertGreater(source["metadata_bytes"], 0)
+            self.assertLessEqual(source["metadata_bytes"], 2 * 1024 * 1024)
+            self.assertEqual("https://huggingface.co/api/models/" + source["repository"] + "/revision/" +
+                             source["revision"] + "?blobs=true", source["metadata_url"])
+            preset = next(row for row in self.presets.values() if row["config"] == source["config"])
+            self.assertEqual(source["architecture"], preset["family"])
+            resolved = read_config(REPO / source["config"], REPO / "models", environ={})
+            pinned = {Path(row["path"]).name: row for row in source["files"]}
+            self.assertEqual(set(pinned), {file.path.name for file in resolved.files})
+            shards = []
+            for file in resolved.files:
+                expected = pinned[file.path.name]
+                self.assertEqual(expected["sha256"], file.sha256)
+                self.assertEqual(expected["size_bytes"], preset["file_sizes"][file.path.name])
+                self.assertEqual(("https://huggingface.co/" + source["repository"] + "/resolve/" +
+                                  source["revision"] + "/" + expected["path"],), file.urls)
+                match = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", file.path.name)
+                if match:
+                    shards.append(tuple(map(int, match.groups())))
+            if shards:
+                self.assertTrue(all(total == shards[0][1] for number, total in shards))
+                self.assertEqual(list(range(1, shards[0][1] + 1)), sorted(number for number, total in shards))
+            seen.add(preset["family"])
+        self.assertEqual({"muse-glimmer", "muse-spark", "minimax-m3"}, seen)
+
 
 if __name__ == "__main__":
     unittest.main()

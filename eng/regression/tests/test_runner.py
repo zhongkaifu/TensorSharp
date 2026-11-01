@@ -166,6 +166,13 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--assume-backend-available", command)
         self.assertIn(str(existing_root), command)
 
+    def test_external_engine_source_is_separate_and_preserved_for_reproduction(self):
+        engine = self.repo / "engine-checkout"
+        _, report = self.invoke("--mode", "run", "--engine-repo", str(engine))
+        self.assertIn("caller-declared", report["engine_source"]["provenance"])
+        self.assertIn("--engine-repo", report["results"][-1]["reproduce"])
+        self.assertIn(str(engine), report["results"][-1]["reproduce"])
+
     def test_cancellation_returns_130_and_preserves_report(self):
         self.run.side_effect = KeyboardInterrupt()
         exit_code, report = self.invoke("--mode", "run")
@@ -224,6 +231,18 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("a.gguf", options["model"])
         for name in ("code-exec", "code-exec-allow-network", "skills-dir", "host", "draft-model", "mmproj", "spec"):
             self.assertNotIn(name, options)
+
+    def test_ngram_and_image_smoke_only_prepare_used_companions(self):
+        options = runner.effective_options({"model": "base.gguf", "draft-model": "draft.gguf", "spec": "dflash"},
+                                           ["speculation_ngram"], "cpu")
+        self.assertEqual(options, {"model": "base.gguf"})
+        options = runner.effective_options({"model": "base.gguf", "qwen-image-mmproj": "editing.gguf",
+                                           "qwen-image-vae": "vae.gguf", "qwen-image-vl": "encoder.gguf"},
+                                           ["image_generation_smoke"], "cpu")
+        self.assertNotIn("qwen-image-mmproj", options)
+        files = [FileSpec(option, self.repo / path, optional=True) for option, path in options.items()]
+        files = runner.required_scenario_files(files, [{"id": "image_generation_smoke"}])
+        self.assertTrue(all(not spec.optional for spec in files if spec.option != "model"))
 
 
 class ReportPolicyTests(unittest.TestCase):

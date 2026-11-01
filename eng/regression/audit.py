@@ -8,6 +8,8 @@ from .configs import read_config, loads_jsonc
 from .reports import file_hash
 from .hardware import BACKENDS
 
+SUITE_IDS = frozenset({"server_unit", "knowledge_unit", "studio_unit", "client_unit", "native_ctest"})
+
 
 def audit_catalog(repo, catalog):
     repo = Path(repo)
@@ -86,7 +88,7 @@ def audit_catalog(repo, catalog):
         name = scenario.get("id")
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", name):
             errors.append(f"unsafe scenario ID: {name!r}")
-        if scenario.get("status") not in {"automated", "recipe", "unsupported"}:
+        if scenario.get("status") not in {"automated", "suite", "recipe", "unsupported"}:
             errors.append(f"{scenario.get('id')}: invalid capability status")
         if not scenario.get("assertions"):
             errors.append(f"{scenario.get('id')}: no meaningful assertions declared")
@@ -94,6 +96,11 @@ def audit_catalog(repo, catalog):
             from .scenarios import ADAPTER_IDS
             if scenario.get("adapter", name) not in ADAPTER_IDS:
                 errors.append(f"{name}: declared automated but no adapter exists")
+        if scenario.get("status") == "suite":
+            if name not in SUITE_IDS:
+                errors.append(f"{name}: declared suite but no suite adapter exists")
+            if any(name in preset.get("scenarios", []) for preset in presets):
+                errors.append(f"{name}: suite coverage is global and must not be repeated as model qualification")
         for evidence in scenario.get("evidence", []):
             # Evidence accepts repo paths with a line number or an external authoritative URL.
             if isinstance(evidence, str) and not evidence.startswith("https://"):

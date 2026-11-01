@@ -100,7 +100,7 @@
       "properties": {
         "id": {"type": "string", "minLength": 1},
         "entry_point": {"type": "string", "minLength": 1},
-        "status": {"enum": ["automated", "recipe", "unsupported"]},
+        "status": {"enum": ["automated", "suite", "recipe", "unsupported"]},
         "recipe": {"type": "string", "minLength": 1},
         "assertions": {"$ref": "#/$defs/strings"},
         "evidence": {"$ref": "#/$defs/strings"},

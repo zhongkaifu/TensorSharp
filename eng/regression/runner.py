@@ -65,6 +65,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("audit", "plan", "run"), default="plan")
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--engine-repo", type=Path, help="Source checkout used to build explicitly supplied hosts; recorded separately from harness source")
     parser.add_argument("--catalog", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--models", default="*", help="Comma-separated preset ID glob patterns")
@@ -75,6 +76,7 @@ def parse_args(argv=None):
     parser.add_argument("--cli", type=Path)
     parser.add_argument("--server", type=Path)
     parser.add_argument("--logit-probe", type=Path)
+    parser.add_argument("--benchmark", type=Path, help="Prebuilt AgentTurnBench for explicitly supported n-gram parity cells")
     parser.add_argument("--runtime-dir", action="append", type=Path, default=[], help="Additional native runtime/build metadata directories")
     parser.add_argument("--media-dir", type=Path)
     parser.add_argument("--allow-download", action="store_true")
@@ -91,6 +93,9 @@ def parse_args(argv=None):
     parser.add_argument("--timeout-seconds", type=float, default=600)
     parser.add_argument("--strict", action="store_true", help="Exit 3 for any selected skip/untested coverage")
     parser.add_argument("--include-suites", action="store_true", help="Include existing local .NET and client correctness suites")
+    parser.add_argument("--native-test-build-dir", type=Path, help="Explicit prebuilt CTest directory from this checkout; no implicit native build")
+    parser.add_argument("--native-test-backend", choices=("cpu", "cuda", "metal", "vulkan"), default="cpu")
+    parser.add_argument("--native-test-filter", help="Optional regex narrowing native test names; unverified device tests remain untested")
     parser.add_argument("--allow-builds", action="store_true", help="Allow local managed/native builds required by existing suites; opt-in")
     args = parser.parse_args(argv)
     from .hardware import BACKENDS
@@ -159,9 +164,11 @@ def effective_options(options, scenario_ids, backend):
     if not any(s in MEDIA_SCENARIOS for s in scenario_ids):
         result.pop("mmproj", None)
     # Drafting is an independent coverage recipe, never silently enabled by a text test.
-    if not any("spec" in s or "mtp" in s for s in scenario_ids):
+    if not any(s != "speculation_ngram" and ("spec" in s or "mtp" in s) for s in scenario_ids):
         result.pop("draft-model", None)
         result.pop("spec", None)
+    if "image_generation_smoke" in scenario_ids and "image_editing" not in scenario_ids:
+        result.pop("qwen-image-mmproj", None)
     return result
 
 
@@ -173,7 +180,9 @@ def required_scenario_files(files, scenarios):
     # A projector optional for text becomes mandatory when a selected fixture
     # actually exercises media. Its full memory/download cost must be planned.
     needs_media = any(s["id"] in MEDIA_SCENARIOS for s in scenarios)
-    return [replace(spec, optional=False) if needs_media and spec.option == "mmproj" else spec for spec in files]
+    needs_image = any(s["id"] == "image_generation_smoke" for s in scenarios)
+    return [replace(spec, optional=False) if (needs_media and spec.option == "mmproj") or
+            (needs_image and spec.option in {"qwen-image-vae", "qwen-image-vl"}) else spec for spec in files]
 
 
 def catalog_file_sizes(files, preset):
@@ -194,24 +203,26 @@ def preset_budgets(preset, overrides):
 
 
 def sizes_for(files, policy, network=False):
-    sizes, missing = [], 0
-    for spec in files:
-        size = spec.path.stat().st_size if spec.path.is_file() else getattr(spec, "size_bytes", None)
-        if size is None and network:
-            from .downloads import probe_files
-            probes = probe_files([spec], policy, network=True)
-            first = probes[0]
-            if isinstance(first, dict) and first.get("status") == "blocked":
-                failure = first.get("reason") or {}
-                raise PrepareError(failure.get("stage", "probe"), failure.get("code", "probe_failed"), spec.path,
-                                   failure.get("message", "Model metadata probe failed"))
-            size = first.get("size_bytes") if isinstance(first, dict) else getattr(first, "size_bytes", None)
-        if size is None or size <= 0:
+    """Return (final weight footprint, remaining transfer/additional disk bytes).
+
+    Existing partial bytes already occupy disk and do not need transferring again.
+    Only validated suite sidecars may reduce the remaining-byte budget. The full
+    final footprint still sizes RAM/VRAM; all final contents require SHA checking.
+    """
+    from .downloads import probe_files
+    files = list(files)
+    sizes, remaining = [], 0
+    for spec, probe in zip(files, probe_files(files, policy, network=network)):
+        if probe.get("status") == "blocked":
+            failure = probe.get("reason") or {}
+            raise PrepareError(failure.get("stage", "probe"), failure.get("code", "probe_failed"), spec.path,
+                               failure.get("message", "Model metadata probe failed"))
+        size, needed = probe.get("size_bytes"), probe.get("remaining_bytes")
+        if size is None or size <= 0 or needed is None:
             return None, None
         sizes.append(size)
-        if not spec.path.is_file():
-            missing += size
-    return sum(sizes), missing
+        remaining += needed
+    return sum(sizes), remaining
 
 
 def result_stub(preset, backend, scenario, status, reason, **details):
@@ -223,7 +234,7 @@ def result_stub(preset, backend, scenario, status, reason, **details):
 def reproduce_args(args, repo, root, preset, backend, scenario):
     command = [sys.executable, str(repo / "eng/run-local-regression.py"), "--mode", "run",
                "--models", preset["id"], "--backend", backend, "--scenarios", scenario["id"], "--model-root", str(root)]
-    for key in ("cli", "server", "logit_probe", "media_dir", "ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib", "gpu_index", "disk_headroom_gib", "max_download_gib", "timeout_seconds", "catalog"):
+    for key in ("cli", "server", "logit_probe", "benchmark", "engine_repo", "media_dir", "ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib", "gpu_index", "disk_headroom_gib", "max_download_gib", "timeout_seconds", "catalog"):
         value = getattr(args, key)
         if value is not None:
             command += ["--" + key.replace("_", "-"), str(value)]
@@ -247,6 +258,8 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=True)
     report = {"schema_version": 1, "run_id": run_id, "mode": args.mode,
               "started_utc": datetime.now(timezone.utc).isoformat(), "source": source_identity(repo),
+              "engine_source": {"identity": source_identity(args.engine_repo.resolve()) if args.engine_repo else None,
+                                "provenance": "caller-declared build checkout; binary hashes are recorded independently" if args.engine_repo else "unspecified; harness checkout is not proof of deployed host build source"},
               "invocation": sanitize([sys.executable, str(repo / "eng/run-local-regression.py"), *(argv if argv is not None else sys.argv[1:])]),
               "results": [], "limitations": [
                   "Only this local OS and selected backend can be tested; other platforms are unrun.",
@@ -272,7 +285,8 @@ def main(argv=None):
         cli = find_binary(repo, args.cli, "TensorSharp.Cli", "TensorSharp.Cli")
         server = find_binary(repo, args.server, "TensorSharp.Server.Host", "TensorSharp.Server.Host")
         logit = find_binary(repo, args.logit_probe, "eng/ForcedLogitProbe", "ForcedLogitProbe")
-        commands = {"cli_command": cli, "server_command": server, "logit_command": logit}
+        benchmark = find_binary(repo, args.benchmark, "benchmarks/AgentTurnBench", "AgentTurnBench")
+        commands = {"cli_command": cli, "server_command": server, "logit_command": logit, "benchmark_command": benchmark}
         runtime_dirs = sorted({str(Path(command[-1]).parent) for command in commands.values() if command} | {str(p.resolve()) for p in args.runtime_dir})
         root = (args.model_root or Path(os.environ.get("TENSORSHARP_MODELS", str(repo / "models")))).resolve()
         hardware = detect_hardware(root, runtime_dirs=runtime_dirs)
@@ -315,7 +329,7 @@ def main(argv=None):
                     preliminary = read_config(repo / preset["config"], root)
                     if not preliminary.unavailable:
                         preliminary_options, preliminary_files = use_existing(preliminary, index)
-                        preliminary_context = {"repo": repo, "backend": backends[0], "preparing_model": True,
+                        preliminary_context = {"repo": repo, "backend": backends[0], "preparing_model": True, "model_family": preset["family"],
                             "model_options": preliminary_options, "model_path": preliminary_options.get("model"),
                             "media_dir": args.media_dir, **commands}
                         preliminary_cases = []
@@ -362,7 +376,7 @@ def main(argv=None):
                     write_reports(output, report, bundle=False)
                     continue
             for backend in backends:
-                base_context = {"repo": repo, "backend": backend, "artifact_dir": output,
+                base_context = {"repo": repo, "backend": backend, "artifact_dir": output, "model_family": preset["family"],
                                 "timeout_seconds": args.timeout_seconds, "media_dir": args.media_dir,
                                 "disk_headroom_gib": args.disk_headroom_gib,
                                 "seed": 42, "env": {"CUDA_VISIBLE_DEVICES": str(args.gpu_index)} if backend in {"cuda", "ggml_cuda"} else {}, **commands}
@@ -425,9 +439,9 @@ def main(argv=None):
                         reason = "selected model count limit reached"
                     elif not resources.get("eligible"):
                         reason = resources.get("reason", "resource budget unknown or exceeded")
-                    elif missing_bytes and not args.allow_download:
+                    elif any(not spec.path.is_file() for spec in files) and not args.allow_download:
                         reason = "weights missing; --allow-download is disabled"
-                    elif missing_bytes and download_reserved + missing_bytes > args.max_download_gib * GIB:
+                    elif missing_bytes and max(download_reserved, policy.downloaded_bytes) + missing_bytes > args.max_download_gib * GIB:
                         reason = "remaining whole-run download budget insufficient"
                     runnable = []
                     for scenario in candidates:
@@ -495,6 +509,10 @@ def main(argv=None):
         if args.include_suites:
             from .suites import run_suites
             report["results"].extend(run_suites(repo, output / "suites", args.mode, args.allow_builds, args.timeout_seconds))
+        if args.native_test_build_dir:
+            from .ctest import run_native_tests
+            report["results"].extend(run_native_tests(repo, args.native_test_build_dir, output / "native-ctest", args.mode,
+                args.native_test_backend, args.native_test_filter, args.timeout_seconds, args.gpu_index))
         if len(report["results"]) == 1:
             raise ValueError("scenario selector matched no cases")
         # An inventory pass alone must not turn a zero-execution run into an inference pass.
