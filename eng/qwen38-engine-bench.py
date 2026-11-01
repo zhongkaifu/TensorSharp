@@ -15,10 +15,14 @@ drafter), then point --url at it.
 
 Scenarios (--scenarios, comma list; --list-scenarios prints them):
   short_chat           eight factual/arithmetic questions with checkable answers
-  long_prompt_{4k,16k,32k}
+  quality_tasks        generated arithmetic, sorting and aggregation with exact JSON answers
+  quality_gsm8k        optional pinned MIT-licensed public 8/12-example final-answer regression subset
+  long_prompt_{4k,16k,32k,128k,250k}
                        needle in a haystack of real prose (repository docs by
                        default, --haystack FILE|DIR): a unique code word must
-                       be in the answer; reports prefill rate
+                       be in the answer at 5/50/95% depth; reports actual prompt tokens
+                       (128K/250K require --tokenizer, not character estimates);
+                       --long-order-quality adds five randomized records and order/neighbor checks
   json_object          response_format json_object; must parse with typed keys
   json_schema          response_format json_schema; must validate and match
   tool_call_single     one get_weather call with the right typed arguments
@@ -35,17 +39,27 @@ Scenarios (--scenarios, comma list; --list-scenarios prints them):
   parallel_{2,4}       N different concurrent requests: aggregate throughput
                        and per-request correctness (server needs >= N lanes)
 
-Method. Every request is greedy (temperature 0, top_p 1, fixed seed), streamed,
+Method. Requests default to greedy (temperature 0, top_p 1, fixed seed), streamed,
+with --temperature/--top-p available for separately labelled sampled quality runs,
 and asks for no thinking: chat_template_kwargs.enable_thinking=false (TensorSharp
 reads think=false; velox takes --enable-thinking false at launch). Each
 conversation opens with a system line carrying a fixed-width nonce drawn per
 invocation, so no engine can reuse a previous run's or repeat's prompt beyond the
 template preamble; prefix reuse is measured by multi_turn and agentic_loop. TTFT
-is the first streamed content, reasoning or tool-call delta. Decode rate is
-(completion_tokens - 1) / (last delta - first delta). completion_tokens comes from
+is the first nonempty semantic output delta (content, reasoning, or tool name /
+arguments), not a GPU first-token timestamp. Role/id-only announcements do not
+start it. For pure-content, multi-delta responses with a tokenizer, client decode
+is (visible content tokens - tokens already in the first payload) / (last semantic
+delta - first semantic delta). The first payload must be a stable tokenized prefix
+of the full visible output. Tool calls, reasoning, single-payload responses,
+missing tokenizers and unstable token boundaries have no client decode rate.
+This visible-text estimate excludes EOS/hidden tokens; server-native timings
+remain separate. completion_tokens comes from
 the stream's usage; a server that sends none is counted with --tokenizer (an HF
-tokenizer.json) and the source is recorded. Prefill rate is uncached prompt
-tokens / TTFT. Speculative counters: llama.cpp timings (draft_n), the Prometheus
+tokenizer.json) and the source is recorded. Missing token counts stay unknown;
+SSE event counts are not tokens. Prefill rate is a TTFT-derived prompt rate,
+subtracting cached tokens only when reported; it is not a pure GPU prefill rate.
+Speculative counters: llama.cpp timings (draft_n), the Prometheus
 /metrics counters of vLLM and SGLang (diffed per request), or --server-log lines
 for TensorSharp. Warm-up requests run first and are not recorded.
 
@@ -58,6 +72,7 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+from decimal import Decimal, InvalidOperation
 import hashlib
 import importlib.util
 import json
@@ -76,8 +91,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MEDIA_DIR = ROOT / "eng" / "minimax-m3-bench-media"
-HARNESS_VERSION = "qwen38-engine-bench/1"
-ENGINES = ["tensorsharp", "llamacpp", "vllm", "sglang", "velox", "ninfer"]
+HARNESS_VERSION = "qwen38-engine-bench/3"
+ENGINES = ["tensorsharp", "llamacpp", "vllm", "sglang", "velox", "ninfer",
+           "infernix", "ignis", "eole", "strata", "basalt", "focus-llama"]
 
 # Qwen3.8's tokenizer gives about 4.3 characters per token on the repo-docs
 # haystack; --chars-per-token overrides it for another corpus. Prompts are built
@@ -85,9 +101,12 @@ ENGINES = ["tensorsharp", "llamacpp", "vllm", "sglang", "velox", "ninfer"]
 # prompt_tokens from each server are recorded.
 DEFAULT_CHARS_PER_TOKEN = 4.3
 
-SCENARIOS = ["short_chat", "long_prompt_4k", "long_prompt_16k", "long_prompt_32k",
+SCENARIOS = ["short_chat", "quality_tasks", "long_prompt_4k", "long_prompt_16k", "long_prompt_32k",
+             "long_prompt_128k", "long_prompt_250k",
              "json_object", "json_schema", "tool_call_single", "tool_call_parallel", "agentic_loop",
              "multi_turn", "image", "long_generation", "parallel_2", "parallel_4"]
+OPTIONAL_SCENARIOS = ["quality_gsm8k"]
+GSM8K_FIXTURE = ROOT / "InferenceWeb.Tests" / "Fixtures" / "Qwen38" / "gsm8k-mini.json"
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -118,7 +137,8 @@ def stream_chat(url, body, timeout):
                                  headers={"Content-Type": "application/json", "Accept": "text/event-stream"})
     obs = {"content": [], "reasoning": [], "tool_calls": {}, "usage": None, "timings": None,
            "finish_reason": None, "first": None, "last": None, "n_content": 0, "n_reasoning": 0,
-           "n_tool_deltas": 0, "error": None, "http_status": None}
+           "n_tool_deltas": 0, "n_tool_metadata_deltas": 0, "n_model_deltas": 0,
+           "first_payload": None, "multiple_choices": False, "error": None, "http_status": None}
     t0 = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -141,10 +161,13 @@ def stream_chat(url, body, timeout):
                     obs["usage"] = obj["usage"]
                 if obj.get("timings"):
                     obs["timings"] = obj["timings"]
-                for ch in obj.get("choices") or []:
+                choices = obj.get("choices") or []
+                if len(choices) > 1 or any(ch.get("index", 0) != 0 for ch in choices):
+                    obs["multiple_choices"] = True
+                for ch in choices:
                     delta = ch.get("delta") or {}
-                    now = time.perf_counter()
                     got = False
+                    payload_tools = []
                     # vLLM and SGLang name the field "reasoning" in some versions.
                     reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                     if reasoning:
@@ -167,10 +190,21 @@ def stream_chat(url, body, timeout):
                             slot["name"] += fn["name"]
                         if fn.get("arguments"):
                             slot["arguments"] += fn["arguments"] if isinstance(fn["arguments"], str) else json.dumps(fn["arguments"])
-                        obs["n_tool_deltas"] += 1
-                        got = True
+                        # An id/type/index announcement is transport metadata,
+                        # not generated semantic output and not a first token.
+                        if fn.get("name") or fn.get("arguments"):
+                            payload_tools.append({"name": fn.get("name") or "", "arguments": fn.get("arguments") or ""})
+                            obs["n_tool_deltas"] += 1
+                            got = True
+                        else:
+                            obs["n_tool_metadata_deltas"] += 1
                     if got:
-                        obs["first"] = obs["first"] or now
+                        now = time.perf_counter()
+                        obs["n_model_deltas"] += 1
+                        if obs["first"] is None:
+                            obs["first"] = now
+                            obs["first_payload"] = {"content": delta.get("content") or "",
+                                "reasoning": reasoning or "", "tool_calls": payload_tools}
                         obs["last"] = now
                     if ch.get("finish_reason"):
                         obs["finish_reason"] = ch["finish_reason"]
@@ -284,13 +318,13 @@ class Client:
             "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0,
-            "top_p": 1,
+            "temperature": float(getattr(self.args, "temperature", 0)),
+            "top_p": float(getattr(self.args, "top_p", 1)),
             # Explicit zeros: a server otherwise fills in the model's recommended non-thinking defaults
             # (presence_penalty 1.5 for Qwen3.8), which change even greedy output.
             "presence_penalty": 0,
             "frequency_penalty": 0,
-            "seed": 1234,
+            "seed": getattr(self.args, "sampling_seed", 1234),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -314,6 +348,12 @@ class Client:
         mark = server_log_mark(self.args.server_log)
         obs = stream_chat(self.url, self.body(messages, max_tokens, extra), self.args.timeout)
         res = self.finish(obs)
+        # The identity excludes the model id so equivalent deployed checkpoints
+        # can be compared, but includes all generation settings and full messages.
+        request = self.body(messages, max_tokens, extra)
+        request = request_identity(request)
+        res["request_sha256"] = hashlib.sha256(json.dumps(request, sort_keys=True,
+            ensure_ascii=False).encode("utf-8")).hexdigest()
         spec = spec_from_metrics(before, scrape_metrics(self.metrics_url)) if before else None
         if spec is None:
             log = server_log_spec_stats(self.args.server_log, mark)
@@ -327,9 +367,67 @@ class Client:
         return res
 
     def count_tokens(self, text):
-        if not text or self.tokenizer is None:
+        if self.tokenizer is None:
             return None
         return len(self.tokenizer.encode(text, add_special_tokens=False).ids)
+
+    def client_decode_metrics(self, obs, content, reasoning, tool_calls, completion):
+        """Visible-text rate after the first burst; never infer GPU tokens from SSE chunks."""
+        first, last, payload = obs.get("first"), obs.get("last"), obs.get("first_payload")
+        duration = last - first if first is not None and last is not None and last > first else None
+        out = {"decode_tok_s": None, "decode_tok_s_source": None, "decode_numerator_tokens": None,
+               "decode_numerator_source": None, "decode_duration_s": duration,
+               "first_payload_content_tokens": None, "visible_content_tokens": None,
+               "decode_token_prefix_stable": None, "decode_usage_minus_visible_tokens": None,
+               "decode_unavailable_reason": None,
+               # Diagnostic only: v1/v2 assumed the first delta held one token.
+               # Never used by performance tables or as a replacement rate.
+               "legacy_completion_minus_one_decode_tok_s":
+                   (completion - 1) / duration if isinstance(completion, int) and not isinstance(completion, bool)
+                   and completion > 1 and duration else None}
+        if obs.get("error"):
+            reason = "request_error"
+        elif tool_calls or obs.get("n_tool_deltas", 0):
+            reason = "tool_call_parser_output_is_not_a_raw_token_stream"
+        elif reasoning or obs.get("n_reasoning", 0):
+            reason = "reasoning_and_content_token_boundaries_are_not_reliably_separable"
+        elif obs.get("multiple_choices"):
+            reason = "multiple_choices_are_not_one_decode_stream"
+        elif self.tokenizer is None:
+            reason = "tokenizer_required_to_count_first_payload_tokens"
+        elif not payload or not isinstance(payload.get("content"), str) or not payload["content"]:
+            reason = "first_semantic_content_payload_unavailable"
+        else:
+            try:
+                full_ids = self.tokenizer.encode(content, add_special_tokens=False).ids
+                first_ids = self.tokenizer.encode(payload["content"], add_special_tokens=False).ids
+            except Exception as error:
+                out["decode_unavailable_reason"] = f"tokenizer_error: {type(error).__name__}: {error}"
+                return out
+            stable = content.startswith(payload["content"]) and full_ids[:len(first_ids)] == first_ids
+            out.update({"first_payload_content_tokens": len(first_ids), "visible_content_tokens": len(full_ids),
+                        "decode_token_prefix_stable": stable,
+                        "decode_usage_minus_visible_tokens": completion - len(full_ids)
+                            if isinstance(completion, int) and not isinstance(completion, bool) else None})
+            if not stable:
+                reason = "first_payload_retokenization_is_not_a_stable_prefix"
+            elif not first_ids:
+                reason = "first_payload_has_no_countable_tokens"
+            else:
+                numerator = len(full_ids) - len(first_ids)
+                source = "tokenizer_visible_content_minus_first_semantic_payload"
+                out.update({"decode_numerator_tokens": numerator, "decode_numerator_source": source})
+                if completion == 0:
+                    reason = "zero_completion_token_usage"
+                elif obs.get("n_model_deltas", 0) < 2 or obs.get("n_content", 0) < 2:
+                    reason = "single_semantic_payload_has_no_post_first_payload_rate"
+                elif duration is None or numerator <= 0:
+                    reason = "no_positive_post_first_payload_token_interval"
+                else:
+                    out.update({"decode_tok_s": numerator / duration, "decode_tok_s_source": source})
+                    return out
+        out["decode_unavailable_reason"] = reason
+        return out
 
     def finish(self, obs):
         usage = obs["usage"] or {}
@@ -344,39 +442,54 @@ class Client:
             except ValueError:
                 parsed = None
             tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": tc["arguments"], "parsed": parsed})
-        completion = usage.get("completion_tokens") or timings.get("predicted_n")
-        completion_source = "usage" if completion else None
-        if not completion:
-            text = reasoning + content + "".join(t["name"] + t["arguments"] for t in tool_calls)
-            completion = self.count_tokens(text)
-            completion_source = "tokenizer" if completion else None
-        if not completion:
-            n_events = obs["n_content"] + obs["n_reasoning"] + obs["n_tool_deltas"]
-            completion, completion_source = (n_events or None), "deltas"
+        completion = usage.get("completion_tokens")
+        completion_source = "usage" if completion is not None else None
+        if completion is None:
+            completion = timings.get("predicted_n")
+            completion_source = "server_timings" if completion is not None else None
+        if completion is None and not reasoning and not tool_calls:
+            # Tool wrappers and hidden reasoning separators are not recoverable
+            # from semantic OpenAI deltas. Count visible plain content only.
+            completion = self.count_tokens(content)
+            completion_source = "tokenizer" if completion is not None else None
+        # An SSE event can carry many speculative tokens. Counting events as
+        # tokens gives particularly misleading cross-engine decode comparisons.
         prompt = usage.get("prompt_tokens") or (timings.get("prompt_n", 0) + timings.get("cache_n", 0) if timings else None)
         cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
         if cached is None and timings:
             cached = timings.get("cache_n")
         first, last = obs["first"], obs["last"]
-        ttft = (first - obs["t0"]) if first else None
-        decode = ((completion - 1) / (last - first)) if (first and last and last > first and completion and completion > 1) else None
+        ttft = (first - obs["t0"]) if first is not None else None
         res = {
             "error": obs["error"], "http_status": obs["http_status"],
             "prompt_tokens": prompt, "completion_tokens": completion, "completion_tokens_source": completion_source,
             "cached_tokens": cached, "reasoning_chars": len(reasoning),
-            "ttft_s": ttft, "total_s": obs["t_end"] - obs["t0"], "decode_tok_s": decode,
-            "first_offset_s": (first - obs["t0"]) if first else None, "last_offset_s": (last - obs["t0"]) if last else None,
+            "ttft_s": ttft, "ttft_definition": "first_nonempty_semantic_output_delta_not_gpu_first_token",
+            "total_s": obs["t_end"] - obs["t0"],
+            "first_offset_s": (first - obs["t0"]) if first is not None else None,
+            "last_offset_s": (last - obs["t0"]) if last is not None else None,
             "finish_reason": obs["finish_reason"],
             "n_content_deltas": obs["n_content"], "n_reasoning_deltas": obs["n_reasoning"],
             "n_tool_deltas": obs["n_tool_deltas"],
+            "n_model_deltas": obs.get("n_model_deltas"),
+            "n_tool_metadata_deltas": obs.get("n_tool_metadata_deltas", 0),
+            "first_payload": obs.get("first_payload"),
             "content": content, "reasoning": reasoning, "tool_calls": tool_calls,
             "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "response_sha256": hashlib.sha256(json.dumps({"content": content, "reasoning": reasoning,
+                "tool_calls": [{"name": t["name"], "arguments": t["parsed"] if t["parsed"] is not None
+                                else t["arguments"]} for t in tool_calls]}, sort_keys=True,
+                ensure_ascii=False).encode("utf-8")).hexdigest(),
         }
+        res.update(self.client_decode_metrics(obs, content, reasoning, tool_calls, completion))
         if prompt and ttft:
             uncached = prompt - (cached or 0)
             res["prefill_tok_s"] = uncached / ttft if uncached > 0 else None
+            res["prefill_tok_s_source"] = ("uncached_prompt_tokens_over_semantic_ttft_not_pure_gpu_prefill"
+                if cached is not None else "prompt_tokens_over_semantic_ttft_cache_usage_unreported_not_pure_gpu_prefill")
         if timings:
             res["server_timings"] = timings
+            res["server_timing_source"] = "server_native_timings_separate_from_client_visible_stream_rates"
             res["server_prefill_tok_s"] = timings.get("prompt_per_second")
             res["server_decode_tok_s"] = timings.get("predicted_per_second")
             if "draft_n" in timings:
@@ -385,14 +498,31 @@ class Client:
         return res
 
 
+def request_identity(body):
+    """Canonical request for parity: generated tool-call ids are transport details."""
+    body = json.loads(json.dumps(body))
+    body.pop("model", None)
+    ids = {}
+    for message in body.get("messages", []):
+        for call in message.get("tool_calls") or []:
+            if call.get("id") is not None:
+                original = call["id"]
+                ids.setdefault(original, f"tool_{len(ids)}")
+                call["id"] = ids[original]
+        if message.get("tool_call_id") is not None:
+            original = message["tool_call_id"]
+            ids.setdefault(original, f"tool_{len(ids)}")
+            message["tool_call_id"] = ids[original]
+    return body
+
+
 def load_tokenizer(path):
     if not path:
         return None
     try:
         from tokenizers import Tokenizer
     except ImportError:
-        print("warning: --tokenizer needs the 'tokenizers' package; completion counts fall back to deltas", file=sys.stderr)
-        return None
+        raise RuntimeError("--tokenizer requires the 'tokenizers' package; refusing unverified token counts")
     return Tokenizer.from_file(str(path))
 
 
@@ -565,8 +695,6 @@ def take_prose(haystack, chars, start=0):
         out.append(p)
         total += len(p) + 2
         i += 1
-        if i - start > 4 * len(paras):
-            break
     return out
 
 
@@ -597,12 +725,18 @@ class Ctx:
 
 def case(scenario, repeat, checks, metrics, requests, keep, notes=None):
     errors = [r.get("error") for r in requests if r.get("error")]
-    passed = bool(checks) and all(c["ok"] for c in checks)
+    check(checks, "stream_completed", bool(requests) and all(
+        r.get("finish_reason") in ("stop", "length", "tool_calls", "function_call") for r in requests),
+        "each response must include a terminal finish_reason; partial successful text is insufficient")
+    passed = bool(checks) and all(c["ok"] for c in checks) and not errors
     verdict = "PASS" if passed else ("ERROR" if errors and not any(c["ok"] for c in checks) else "FAIL")
     rec = {"kind": "case", "scenario": scenario, "repeat": repeat, "verdict": verdict, "pass": passed,
            "checks": checks, "metrics": metrics, "requests": [trim(r, keep) for r in requests]}
     if errors:
         rec["errors"] = errors[:5]
+        if any(re.search(r"context.{0,30}(length|window|exceed)|maximum.{0,30}(length|token)|"
+                         r"out of memory|n_ctx|too (long|many tokens)", error, re.I) for error in errors):
+            rec["availability"] = "capacity_rejected"
     if notes:
         rec["notes"] = notes
     return rec
@@ -694,32 +828,176 @@ def run_short_chat(ctx, r):
     return case("short_chat", r, checks, m, results, ctx.args.keep_text)
 
 
+def run_quality_tasks(ctx, r):
+    """Generated, held-out answers; a matching word alone cannot pass these tasks.
+
+    This is a functional regression gate, not a replacement for comprehensive
+    knowledge/reasoning evaluations. Fixed nonce seeds give identical tasks.
+    """
+    rng = ctx.rng("quality_tasks", r)
+    checks, results, expected = [], [], []
+    for i in range(ctx.args.quality_tasks):
+        numbers = [rng.randint(-999, 999) for _ in range(9)]
+        a, b, c = [rng.randint(10, 99) for _ in range(3)]
+        answer = {"result": a * b - c, "sorted": sorted(numbers),
+                  "sum": sum(numbers), "unique_count": len(set(numbers))}
+        prompt = (f"Calculate {a} * {b} - {c}. Also sort the list {numbers} in ascending order, "
+                  "sum its numbers and count its distinct values. Return exactly one JSON object with "
+                  "keys result (integer), sorted (array of integers), sum (integer), unique_count (integer). "
+                  "Do not use markdown or include other text.")
+        res = ctx.chat(ctx.messages("quality_tasks", r, prompt, i), ctx.args.answer_tokens)
+        results.append(res)
+        expected.append(answer)
+        try:
+            actual = json.loads(res.get("content") or "")
+            # JSON true equals 1 in Python; require the expected types too.
+            correct = (actual == answer and isinstance(actual, dict)
+                       and all(type(actual.get(k)) is int for k in ("result", "sum", "unique_count"))
+                       and all(type(x) is int for x in actual.get("sorted", [])))
+        except (ValueError, TypeError):
+            correct = False
+        check(checks, f"task{i}", correct and not res.get("error"), budget_note(res))
+    m = pooled_metrics(results)
+    m.update({"n_correct": sum(c["ok"] for c in checks), "n_questions": len(checks)})
+    return case("quality_tasks", r, checks, m, results, ctx.args.keep_text,
+                notes={"expected": expected, "scope": "generated arithmetic, sorting, aggregation; functional regression only"})
+
+
+def numeric_answer(text):
+    """Strict final numeric answer: never accept a reference number buried in prose."""
+    text = (text or "").strip()
+    if not re.fullmatch(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", text):
+        return None
+    try:
+        return Decimal(text.replace(",", ""))
+    except InvalidOperation:
+        return None
+
+
+def run_quality_gsm8k(ctx, r):
+    fixture = json.loads(GSM8K_FIXTURE.read_text(encoding="utf-8"))
+    examples = fixture["examples"][:ctx.args.gsm8k_limit]
+    results, checks = [], []
+    for i, example in enumerate(examples):
+        prompt = (example["question"] + "\n\nSolve the problem. Output only the final numeric answer, "
+                  "without units, markdown or explanation.")
+        res = ctx.chat(ctx.messages("quality_gsm8k", r, prompt, i), ctx.args.answer_tokens)
+        results.append(res)
+        expected, actual = numeric_answer(example["answer"]), numeric_answer(res.get("content"))
+        check(checks, example["id"], expected is not None and actual == expected and not res.get("error"),
+              f"expected={example['answer']}; {budget_note(res)}")
+    m = pooled_metrics(results)
+    m.update({"n_correct": sum(c["ok"] for c in checks), "n_questions": len(checks)})
+    return case("quality_gsm8k", r, checks, m, results, ctx.args.keep_text,
+        notes={"dataset": fixture["dataset"], "source_revision": fixture["upstream_revision"],
+               "ids": [e["id"] for e in examples], "limitations": fixture["limitations"]})
+
+
 CODE_WORDS_A = ["AMBER", "COBALT", "VERMILION", "SAFFRON", "INDIGO", "CERULEAN", "OCHRE", "VIRIDIAN", "MAGENTA", "UMBER"]
 CODE_WORDS_B = ["OTTER", "HERON", "LYNX", "MARTEN", "PETREL", "IBEX", "GECKO", "BITTERN", "TAPIR", "WOMBAT"]
 
 
+def fit_prompt_tokens(render, prose, target, count_tokens):
+    """Fit the complete user message, including questions and needles, to a token budget.
+
+    Counts come from the actual tokenizer, never a characters/token estimate.
+    Chat template tokens are measured separately from the server's usage.
+    """
+    if count_tokens(render("")) > target:
+        raise ValueError("token budget is smaller than the instructions and needles")
+    if count_tokens(render(prose)) < target:
+        raise ValueError("insufficient haystack for the requested token budget")
+    lo, hi, best = 0, len(prose), render("")
+    best_count = count_tokens(best)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        prompt = render(prose[:mid])
+        n = count_tokens(prompt)
+        if n <= target:
+            if n >= best_count:
+                best, best_count = prompt, n
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if target - best_count > max(8, int(target * 0.001)):
+        raise RuntimeError(f"could not fit prompt: requested {target}, got {best_count}")
+    return best, best_count
+
+
 def run_long_prompt(ctx, r, k, name):
     rng = ctx.rng(name, r)
-    code = f"{rng.choice(CODE_WORDS_A)}-{rng.choice(CODE_WORDS_B)}-{rng.randint(1000, 9999)}"
-    depth = (0.5, 0.25, 0.75)[r % 3]
-    target_tokens = int(k * 1024 * 0.96)  # leaves room for the template preamble and the question
-    paragraphs = take_prose(ctx.haystack, int(target_tokens * ctx.args.chars_per_token), start=97 * k)
-    if any(code in p for p in paragraphs):
+    order_quality = getattr(ctx.args, "long_order_quality", False)
+    keys = ("alpha", "beta", "gamma", "delta", "epsilon") if order_quality else ("alpha", "beta", "gamma")
+    codes = {key: f"{rng.choice(CODE_WORDS_A)}-{rng.choice(CODE_WORDS_B)}-{rng.randint(1000, 9999)}"
+             for key in keys}
+    physical_order = list(keys)
+    if order_quality:
+        rng.shuffle(physical_order)
+    depths = (0.05, 0.25, 0.5, 0.75, 0.95) if order_quality else (0.05, 0.5, 0.95)
+    target_tokens = k * 1024
+    # Reserve 128 tokens for the chat template. The server usage, not this
+    # reservation, determines whether the advertised context size was achieved.
+    user_budget = target_tokens - 128
+    tokenizer_available = ctx.client.tokenizer is not None
+    if k >= 128 and not tokenizer_available:
+        raise RuntimeError("128K/250K scenarios require --tokenizer; character estimates cannot validate long context")
+    prose = "\n\n".join(take_prose(ctx.haystack,
+        int(target_tokens * (8 if tokenizer_available else ctx.args.chars_per_token)), start=97 * k))
+    if any(code in prose for code in codes.values()):
         raise RuntimeError("needle collides with the haystack")
-    needle = f"Note for the archive: the secret code word for the vault is {code}."
-    at = max(1, int(len(paragraphs) * depth))
-    paragraphs = paragraphs[:at] + [needle] + paragraphs[at:]
-    prompt = ("Read the following document carefully.\n\n<document>\n"
-              + "\n\n".join(paragraphs)
-              + "\n</document>\n\nWhat is the secret code word for the vault mentioned in the document above? "
-                "Reply with the code word only.")
+
+    def render(text):
+        pieces, start = [], 0
+        for key, depth in zip(physical_order, depths):
+            at = int(len(text) * depth)
+            pieces.extend([text[start:at], f"\n\nArchive record: the {key} vault code is {codes[key]}.\n\n"])
+            start = at
+        pieces.append(text[start:])
+        if order_quality:
+            question = ('Return a JSON object with the complete vault codes in keys "alpha", "beta", "gamma", '
+                        '"delta", "epsilon"; "order" must be an array of the five vault names in the order their '
+                        'records appear from the beginning to the end of the document; "before_gamma" and '
+                        '"after_gamma" must be the vault names whose records appear immediately before and after '
+                        'the gamma record, or null when there is no such record. Base the order on document '
+                        'positions, not alphabetical order. Output JSON only.')
+        else:
+            question = ('Return the three vault codes in a JSON object with exactly keys '
+                        '"alpha", "beta", "gamma". Copy each complete code exactly. Output JSON only.')
+        return ("Read the following document carefully.\n\n<document>\n" + "".join(pieces)
+                + "\n</document>\n\n" + question)
+
+    if tokenizer_available:
+        prompt, user_tokens = fit_prompt_tokens(render, prose, user_budget, ctx.client.count_tokens)
+    else:
+        prompt, user_tokens = render(prose), None
     res = ctx.chat(ctx.messages(name, r, prompt), ctx.args.answer_tokens)
-    flat = re.sub(r"[^A-Z0-9]", "", (res.get("content") or "").upper())
     checks = []
-    check(checks, "needle", re.sub(r"[^A-Z0-9]", "", code) in flat, budget_note(res))
+    try:
+        actual = json.loads(res.get("content") or "")
+    except ValueError:
+        actual = None
+    for key, code in codes.items():
+        check(checks, f"needle_{key}", isinstance(actual, dict) and actual.get(key) == code, budget_note(res))
+    if order_quality:
+        gamma_at = physical_order.index("gamma")
+        relations = {"order": physical_order,
+                     "before_gamma": physical_order[gamma_at - 1] if gamma_at > 0 else None,
+                     "after_gamma": physical_order[gamma_at + 1] if gamma_at + 1 < len(physical_order) else None}
+        for key, expected in relations.items():
+            check(checks, f"position_{key}", isinstance(actual, dict) and key in actual and actual[key] == expected,
+                  f"expected={expected!r}; {budget_note(res)}")
+    actual_tokens = res.get("prompt_tokens")
+    check(checks, "context_length", isinstance(actual_tokens, int)
+          and abs(actual_tokens - target_tokens) <= max(256, target_tokens * ctx.args.long_prompt_tolerance),
+          f"target={target_tokens}; server_usage={actual_tokens}; user_tokenizer={user_tokens}")
     m = single_metrics(res)
-    m.update({"target_tokens": target_tokens, "prompt_chars": len(prompt), "needle_depth": depth})
-    return case(name, r, checks, m, [res], ctx.args.keep_text, notes={"code_word": code})
+    m.update({"target_tokens": target_tokens, "user_prompt_tokens": user_tokens,
+              "prompt_chars": len(prompt), "needle_depths": depths, "order_quality": order_quality})
+    return case(name, r, checks, m, [res], ctx.args.keep_text,
+                notes={"code_words": codes, "physical_order": physical_order,
+                       "needle_depth_unit": "fraction of haystack characters",
+                       "token_count_source": "local_tokenizer+server_usage" if tokenizer_available else "server_usage",
+                       "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest()})
 
 
 JSON_OBJECT_PROMPT = ("Describe the city of Tokyo as a JSON object with exactly these keys: \"city\" (string), "
@@ -948,8 +1226,11 @@ def run_parallel(ctx, r, n, name):
     def worker(i):
         barrier.wait()
         # Concurrent requests share the metrics counters: per-request diffs would overlap.
-        obs = stream_chat(ctx.client.url, ctx.client.body(prompts[i], ctx.args.decode_tokens), ctx.args.timeout)
+        body = ctx.client.body(prompts[i], ctx.args.decode_tokens)
+        obs = stream_chat(ctx.client.url, body, ctx.args.timeout)
         results[i] = ctx.client.finish(obs)
+        results[i]["request_sha256"] = hashlib.sha256(json.dumps(request_identity(body), sort_keys=True,
+            ensure_ascii=False).encode("utf-8")).hexdigest()
 
     before = scrape_metrics(ctx.client.metrics_url)
     t0 = time.perf_counter()
@@ -963,12 +1244,19 @@ def run_parallel(ctx, r, n, name):
     checks = []
     for i, res in enumerate(results):
         check(checks, f"req{i}", re.search(rf"\b{expected[i]}\b", norm(res.get("content"))) is not None, budget_note(res))
-    total = sum(x.get("completion_tokens") or 0 for x in results)
+    total = (sum(x["completion_tokens"] for x in results)
+             if all(x.get("completion_tokens") is not None for x in results) else None)
     firsts = [x["first_offset_s"] for x in results if x.get("first_offset_s") is not None]
     lasts = [x["last_offset_s"] for x in results if x.get("last_offset_s") is not None]
-    m = {"n": n, "wall_s": wall, "total_completion_tokens": total, "aggregate_tok_s": total / wall if wall > 0 else None,
-         "aggregate_decode_tok_s": (total - len(firsts)) / (max(lasts) - min(firsts))
-         if firsts and lasts and max(lasts) > min(firsts) else None,
+    m = {"n": n, "wall_s": wall, "total_completion_tokens": total,
+         "aggregate_tok_s": total / wall if total is not None and wall > 0 else None,
+         "aggregate_tok_s_source": "completion_token_counts_over_complete_wave_wall_time_not_kernel_decode",
+         # A global decode interval cannot subtract each request's first burst
+         # reliably from per-request relative clocks. E2E wave throughput above
+         # remains meaningful; individual client decode rates remain separate.
+         "aggregate_decode_tok_s": None,
+         "legacy_completion_minus_one_aggregate_decode_tok_s": (total - len(firsts)) / (max(lasts) - min(firsts))
+         if total is not None and firsts and lasts and max(lasts) > min(firsts) else None,
          "per_request_decode_tok_s": [x.get("decode_tok_s") for x in results],
          "decode_tok_s": med([x.get("decode_tok_s") for x in results]),
          "ttft_s": med([x.get("ttft_s") for x in results]),
@@ -1107,10 +1395,14 @@ def run_long_generation(ctx, r):
 def dispatch(name):
     if name == "short_chat":
         return run_short_chat
-    if name.startswith("long_prompt_"):
+    if name == "quality_tasks":
+        return run_quality_tasks
+    if name == "quality_gsm8k":
+        return run_quality_gsm8k
+    if re.fullmatch(r"long_prompt_[1-9]\d*k", name):
         k = int(name[len("long_prompt_"):].rstrip("k"))
         return lambda ctx, r: run_long_prompt(ctx, r, k, name)
-    if name.startswith("parallel_"):
+    if re.fullmatch(r"parallel_[1-9]\d*", name):
         n = int(name.split("_")[1])
         return lambda ctx, r: run_parallel(ctx, r, n, name)
     return {"json_object": run_json_object, "json_schema": run_json_schema,
@@ -1120,6 +1412,62 @@ def dispatch(name):
 
 
 # --------------------------------------------------------------------------- run
+
+def file_metadata(path):
+    """Streaming SHA256 of an actual artifact, not its path or a mutable HF alias."""
+    path = Path(path)
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return {"path": str(path), "bytes": path.stat().st_size, "sha256": digest.hexdigest()}
+
+
+def read_quality_baseline(path):
+    """Read the last complete invocation; no implicit merge of different runs."""
+    header, cases = None, {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        if rec.get("kind") == "run":
+            header, cases = rec, {}
+        elif rec.get("kind") == "case" and header:
+            cases[(rec["scenario"], rec["repeat"])] = rec
+    if header is None:
+        raise ValueError("quality baseline has no run header")
+    return header, cases
+
+
+def compare_quality_baseline(rec, baseline):
+    """Exact same-engine greedy equivalence, beyond functional answer checks.
+
+    A changed response is a failed gate requiring investigation, even if a small
+    floating-point difference might be benign. It is never silently waived.
+    """
+    checks = rec["checks"]
+    if baseline is None:
+        check(checks, "baseline_case", False, "baseline scenario/repeat is missing")
+    else:
+        check(checks, "baseline_quality", baseline.get("pass") is True and not baseline.get("errors")
+              and all(c.get("ok") is True for c in baseline.get("checks", []))
+              and not any(r.get("error") for r in baseline.get("requests", [])),
+              "the reference must pass its own functional checks")
+        expected, actual = baseline.get("requests", []), rec.get("requests", [])
+        check(checks, "baseline_request_count", len(expected) == len(actual),
+              f"reference={len(expected)} current={len(actual)}")
+        for i, (old, new) in enumerate(zip(expected, actual)):
+            same_input = bool(old.get("request_sha256")) and old.get("request_sha256") == new.get("request_sha256")
+            check(checks, f"baseline_input_{i}", same_input, "full request SHA256 must match")
+            same_output = bool(old.get("response_sha256")) and old.get("response_sha256") == new.get("response_sha256")
+            check(checks, f"baseline_output_{i}", same_input and same_output,
+                  "content, reasoning and normalized tool calls must match exactly")
+    rec["pass"] = bool(checks) and all(c["ok"] for c in checks) and not rec.get("errors")
+    rec["verdict"] = "PASS" if rec["pass"] else ("ERROR" if rec.get("errors") else "FAIL")
+    rec["quality_baseline"] = {"scenario": rec["scenario"], "repeat": rec["repeat"],
+                                "policy": "exact_greedy_response_sha256"}
+    return rec
+
 
 def server_info(client):
     info = {}
@@ -1172,42 +1520,113 @@ def main():
     ap.add_argument("--answer-tokens", type=int, default=512, help="max_tokens for answer-checked scenarios")
     ap.add_argument("--decode-tokens", type=int, default=1024, help="max_tokens for long_generation and parallel_N")
     ap.add_argument("--agent-max-turns", type=int, default=8)
+    ap.add_argument("--quality-tasks", type=int, default=16, help="generated arithmetic/sorting questions per repeat")
+    ap.add_argument("--gsm8k-limit", type=int, default=8,
+                    help="1-12 fixed public GSM8K test examples per optional quality_gsm8k repeat")
+    ap.add_argument("--temperature", type=float, default=0, help="0 for greedy; label sampled quality runs separately")
+    ap.add_argument("--top-p", type=float, default=1)
+    ap.add_argument("--sampling-seed", type=int, default=1234)
     ap.add_argument("--warmup", type=int, default=3, help="unrecorded warm-up requests before the scenarios")
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--haystack", help="prose source for long prompts: a .txt/.md file or a directory (default: repo docs)")
     ap.add_argument("--chars-per-token", type=float, default=DEFAULT_CHARS_PER_TOKEN)
+    ap.add_argument("--long-prompt-tolerance", type=float, default=0.01,
+                    help="allowed fractional difference from nominal prompt tokens (server usage required)")
+    ap.add_argument("--long-order-quality", action="store_true",
+                    help="five randomized long-context needles plus document order and immediate-neighbor checks; no extra requests")
     ap.add_argument("--nonce-seed", type=int, default=None, help="default: random per invocation (recorded)")
     ap.add_argument("--extra-body", help="JSON object merged into every request body (engine-specific fields)")
     ap.add_argument("--metrics-url", help="Prometheus page with speculative counters "
                                           "(default: <url>/metrics for vllm and sglang, none otherwise)")
     ap.add_argument("--tokenizer", help="HF tokenizer.json to count completion tokens when a stream has no usage")
+    ap.add_argument("--quality-baseline", type=Path,
+                    help="reference v3 JSONL from the same engine/settings; require identical full greedy outputs")
+    ap.add_argument("--manifest", type=Path,
+                    help="JSON with engine/dependency revision, launch command, checkpoint, quantization and KV provenance")
+    ap.add_argument("--model-artifact", type=Path, action="append", default=[],
+                    help="hash an actual model/drafter weight file into run metadata; repeatable, optional full-file I/O")
+    ap.add_argument("--model-config", type=Path, action="append", default=[],
+                    help="hash actual model/runtime/rope configuration files into metadata; repeatable")
     ap.add_argument("--server-log", help="server stdout log; TensorSharp's speculative stats are read from it")
     ap.add_argument("--keep-text", type=int, default=1500, help="characters of content/reasoning kept per request")
     ap.add_argument("--list-scenarios", action="store_true")
+    ap.add_argument("--allow-failures", action="store_true",
+                    help="return zero after recording failed cases (default: nonzero when any quality check fails)")
     args = ap.parse_args()
     if args.list_scenarios:
-        print("\n".join(SCENARIOS))
+        print("\n".join(SCENARIOS + OPTIONAL_SCENARIOS))
         return 0
     if not (args.engine and args.url and args.out):
         ap.error("--engine, --url and --out are required")
+    if args.repeats < 1 or args.quality_tasks < 1 or not 0 < args.long_prompt_tolerance <= 0.1:
+        ap.error("--repeats/--quality-tasks must be positive and --long-prompt-tolerance in (0, 0.1]")
+    if args.temperature < 0 or not 0 < args.top_p <= 1:
+        ap.error("--temperature must be nonnegative and --top-p in (0, 1]")
+    if not 1 <= args.gsm8k_limit <= 12:
+        ap.error("--gsm8k-limit must be in [1,12]")
     names = [s.strip() for s in args.scenarios.split(",") if s.strip()]
     unknown = [n for n in names if dispatch(n) is None]
     if unknown:
         ap.error(f"unknown scenario(s): {', '.join(unknown)} (see --list-scenarios)")
+    baseline_header, baseline_cases = read_quality_baseline(args.quality_baseline) if args.quality_baseline else (None, {})
+    if baseline_header and baseline_header.get("harness") != HARNESS_VERSION:
+        ap.error("quality baseline must be generated by the same harness version (v3 semantic-stream metrics)")
+    if args.nonce_seed is None and baseline_header:
+        args.nonce_seed = baseline_header["nonce_seed"]
     if args.nonce_seed is None:
         args.nonce_seed = random.SystemRandom().randrange(1 << 31)
 
     client = Client(args)
     haystack = load_haystack(args.haystack)
+    if baseline_header:
+        for key, actual in {"engine": args.engine, "model": client.model, "nonce_seed": args.nonce_seed,
+                            "answer_tokens": args.answer_tokens, "decode_tokens": args.decode_tokens}.items():
+            if baseline_header.get(key) != actual:
+                ap.error(f"quality baseline {key} differs: reference={baseline_header.get(key)!r}, current={actual!r}")
+        if baseline_header.get("haystack", {}).get("sha256") != haystack["sha256"]:
+            ap.error("quality baseline haystack differs; use the same frozen --haystack")
+        sampling = {"temperature": args.temperature, "top_p": args.top_p, "seed": args.sampling_seed}
+        if baseline_header.get("sampling") != sampling:
+            ap.error("quality baseline sampling settings differ")
+        if baseline_header.get("long_order_quality", False) != args.long_order_quality:
+            ap.error("quality baseline --long-order-quality setting differs")
     ctx = Ctx(args, client, haystack)
     header = {"kind": "run", "harness": HARNESS_VERSION, "engine": args.engine, "mode": args.mode, "url": client.url,
+              "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "python": sys.version,
               "label": args.label, "model": client.model, "host": socket.gethostname(),
               "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "loadavg": list(os.getloadavg()),
               "scenarios": names, "repeats": args.repeats, "answer_tokens": args.answer_tokens,
               "decode_tokens": args.decode_tokens, "nonce_seed": args.nonce_seed,
               "chars_per_token": args.chars_per_token, "extra_body": client.extra,
               "metrics_url": client.metrics_url, "tokenizer": args.tokenizer,
+              "tokenizer_sha256": hashlib.sha256(Path(args.tokenizer).read_bytes()).hexdigest() if args.tokenizer else None,
+              "quality_tasks": args.quality_tasks, "long_prompt_tolerance": args.long_prompt_tolerance,
+              "long_order_quality": args.long_order_quality, "gsm8k_limit": args.gsm8k_limit,
+              "model_artifacts": [file_metadata(path) for path in args.model_artifact],
+              "model_configs": [file_metadata(path) for path in args.model_config],
+              "manifest_file": file_metadata(args.manifest) if args.manifest else None,
+              "quality_fixture": ({**file_metadata(GSM8K_FIXTURE), **{k: v for k, v in
+                  json.loads(GSM8K_FIXTURE.read_text(encoding="utf-8")).items()
+                  if k in ("dataset", "split", "upstream_repository", "upstream_revision", "upstream_path",
+                           "upstream_sha256", "license", "limitations")}} if "quality_gsm8k" in names else None),
+              "sampling": {"temperature": args.temperature, "top_p": args.top_p, "seed": args.sampling_seed},
+              "quality_baseline_run_id": baseline_header.get("run_id") if baseline_header else None,
+              "manifest": json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest else None,
               "haystack": {k: v for k, v in haystack.items() if k != "paragraphs"},
+              "metric_definitions": {
+                  "ttft_s": "client time to first nonempty semantic output delta, not GPU first token; tool-name deltas can be parser-buffered",
+                  "decode_tok_s": "pure content only: (visible tokenizer tokens - first semantic payload tokenizer tokens)/(last-first semantic delta); stable tokenized prefix required",
+                  "decode_exclusions": "tool calls, reasoning, single semantic payload, missing tokenizer, unstable token boundary, request error, zero completion usage",
+                  "prefill_tok_s": "TTFT-derived prompt rate, subtract cached tokens when reported; no pure GPU prefill claim when cache usage is unreported",
+                  "aggregate_tok_s": "reported completion counts / complete wave wall time, not kernel decode throughput",
+                  "server_timings": "server-native timing fields are recorded independently, never substituted for client decode rates"},
+              "limitations": ["Functional regression checks and a small optional public GSM8K subset are not comprehensive quality evaluation.",
+                              "Greedy exact-response parity is a conservative regression gate, not a proof of sampling-distribution equivalence.",
+                              "Long-context retrieval/order tasks can detect specific failures; they do not establish full long-context reasoning quality.",
+                              "TTFT means first semantic output delta, not GPU first token; tool parsers may buffer model output.",
+                              "Prefill rates are TTFT-derived, subtract cached tokens when reported, and include non-kernel overhead.",
+                              "Client decode counts visible text after the entire first payload; tokenizer, stable prefix and multiple pure-content deltas are required. It is not a GPU kernel timing.",
+                              "Different checkpoints, quantization, KV formats, drafters, context capacity and active lanes are distinct deployment stacks."],
               "server": server_info(client)}
     run_id = hashlib.sha256(json.dumps(header, sort_keys=True, default=str).encode()).hexdigest()[:12]
     header["run_id"] = run_id
@@ -1238,13 +1657,15 @@ def main():
                 rec = {"kind": "case", "scenario": name, "repeat": r, "verdict": "ERROR", "pass": False,
                        "checks": [{"name": "harness", "ok": False, "detail": f"{type(err).__name__}: {err}"}],
                        "metrics": {}, "requests": [], "errors": [f"{type(err).__name__}: {err}"]}
+            if baseline_header:
+                compare_quality_baseline(rec, baseline_cases.get((name, r)))
             rec["loadavg"] = list(os.getloadavg())
             emit(rec)
             tally.setdefault(name, []).append(rec["verdict"])
             print(summary_line(rec), flush=True)
     out.close()
     print("\nverdicts: " + ", ".join(f"{n} {v.count('PASS')}/{len(v)}" for n, v in tally.items()))
-    return 0
+    return 0 if args.allow_failures or all(v == "PASS" for verdicts in tally.values() for v in verdicts) else 1
 
 
 if __name__ == "__main__":
