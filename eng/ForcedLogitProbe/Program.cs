@@ -80,7 +80,7 @@ void WriteMetrics(bool complete) =>
         gate = new { max_relative_l2 = 0.001, min_cosine = 0.999999, require_identical_top1 = true },
         model = Path.GetFileName(modelPath), backend = backendName, tp = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"),
         layer_split = Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE"), load_seconds = loadTimer.Elapsed.TotalSeconds,
-        max_context = model.MaxContextLength, cpu_moe = MoeCpuOffloadConfig.Describe(),
+        max_context = model.MaxContextLength, vocab_size = model.Config.VocabSize, cpu_moe = MoeCpuOffloadConfig.Describe(),
         cpu_moe_threads = MoeCpuOffloadConfig.CpuThreads,
         reference = referenceDir,
         summary = referenceDir == null ? null : all.Summarize(),

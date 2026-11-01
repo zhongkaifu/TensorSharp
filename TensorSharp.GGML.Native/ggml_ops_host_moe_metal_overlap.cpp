@@ -1,6 +1,6 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
-#include "ggml_ops_qwen4exp_host_overlap.h"
+#include "ggml_ops_host_moe_metal_overlap.h"
 #include "ggml-impl.h"
 #include <algorithm>
 #include <array>
@@ -11,7 +11,7 @@
 #include <cstring>
 #include <limits>
 
-namespace tsg::q4e_host_overlap {
+namespace tsg::host_moe_metal_overlap {
 namespace {
 bool pending_view(const ggml_tensor* tensor, const ggml_tensor* pending) {
     for (int depth = 0; tensor; ++depth, tensor = tensor->view_src) {
@@ -48,6 +48,10 @@ bool pinned(const ggml_tensor* tensor) {
         if (depth == 64 || !(tensor->flags & GGML_TENSOR_FLAG_OUTPUT)) return false;
     return true;
 }
+bool pending_leaf(const ggml_tensor* tensor) {
+    return tensor && tensor->op == GGML_OP_NONE && !tensor->view_src &&
+        tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor);
+}
 struct Stats {
     std::array<std::atomic<unsigned long long>, static_cast<unsigned>(Count::count)> counts{};
     std::array<std::atomic<unsigned long long>, static_cast<unsigned>(Reject::count)> rejects{};
@@ -61,8 +65,8 @@ Stats& stats() { static Stats value; return value; }
 
 int prefix_end(ggml_cgraph* graph, int begin, int limit, const ggml_tensor* pending, Reject& why) {
     why = Reject::geometry;
-    if (!graph || !pending || begin < 0 || limit <= begin || limit > ggml_graph_n_nodes(graph)) return -1;
-    // Qwen's independent shared branch begins with its complete gate matmul,
+    if (!graph || !pending_leaf(pending) || begin < 0 || limit <= begin || limit > ggml_graph_n_nodes(graph)) return -1;
+    // An independent shared branch begins with its complete gate matmul,
     // never with an activation whose producer could be fused before the cut.
     if (ggml_graph_node(graph, begin)->op != GGML_OP_MUL_MAT) { why = Reject::fusion_boundary; return -1; }
     for (int i = begin; i < limit && i - begin <= 64; ++i) {
@@ -98,7 +102,7 @@ int prefix_end(ggml_cgraph* graph, int begin, int limit, const ggml_tensor* pend
 bool safe_allocations(ggml_cgraph* graph, int begin, int end, const ggml_tensor* pending,
     const ggml_tensor* const* inputs, int input_count, Reject& why) {
     why = Reject::geometry;
-    if (!graph || !pending || !inputs || input_count <= 0 || begin < 0 || end <= begin || end > ggml_graph_n_nodes(graph)) return false;
+    if (!graph || !pending_leaf(pending) || !inputs || input_count <= 0 || begin < 0 || end <= begin || end > ggml_graph_n_nodes(graph)) return false;
     why = Reject::unpinned;
     if ((pending->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) != (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) return false;
     for (int j = 0; j < input_count; ++j) if (!inputs[j] || !pinned(inputs[j])) return false;
@@ -128,7 +132,7 @@ bool safe_allocations(ggml_cgraph* graph, int begin, int end, const ggml_tensor*
 
 int mode() {
     static const int selected = [] {
-        const char* value = std::getenv("TS_Q4E_METAL_HOST_OVERLAP");
+        const char* value = std::getenv("TS_HOST_MOE_METAL_OVERLAP");
         return value && std::strcmp(value, "1") == 0 ? 1 : value && std::strcmp(value, "2") == 0 ? 2 : 0;
     }();
     return selected;
@@ -152,13 +156,13 @@ void report() {
     for (unsigned i = 0; i < totals.size(); ++i) { totals[i] = value.counts[i].exchange(0); nonzero |= totals[i] != 0; }
     if (!nonzero && value.reported.exchange(true)) return;
     value.reported.store(true);
-    std::fprintf(stderr, "[Q4E-HOST-OVERLAP] mode=%d considered=%llu ineligible=%llu rejected=%llu eligible=%llu async=%llu serial=%llu prefix_nodes=%llu "
+    std::fprintf(stderr, "[HOSTMOE-METAL-OVERLAP] mode=%d considered=%llu ineligible=%llu rejected=%llu eligible=%llu async=%llu serial=%llu prefix_nodes=%llu "
         "submit_failures=%llu drain_failures=%llu fast_fallbacks=%llu cached_cuts=%llu submit_wall_ms=%.3f drain_wall_ms=%.3f serial_prefix_wall_ms=%.3f "
         "(wall timings include host encoding/waits; not GPU-device duration)\n",
         mode(), totals[0], totals[1], totals[2], totals[3], totals[4], totals[5], totals[6], totals[7], totals[8], totals[9], totals[10],
         value.submit_us.exchange(0) / 1000.0, value.drain_us.exchange(0) / 1000.0, value.serial_us.exchange(0) / 1000.0);
     for (unsigned i = 0; i < static_cast<unsigned>(Reject::count); ++i)
-        if (const auto amount = value.rejects[i].exchange(0)) std::fprintf(stderr, "[Q4E-HOST-OVERLAP] rejected_%s=%llu\n", reject_name(static_cast<Reject>(i)), amount);
+        if (const auto amount = value.rejects[i].exchange(0)) std::fprintf(stderr, "[HOSTMOE-METAL-OVERLAP] rejected_%s=%llu\n", reject_name(static_cast<Reject>(i)), amount);
     std::fflush(stderr);
 }
-} // namespace tsg::q4e_host_overlap
+} // namespace tsg::host_moe_metal_overlap

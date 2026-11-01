@@ -934,9 +934,8 @@ namespace tsg
         int n_used = 0;
         int seq_len = 1;             // 1 for autoregressive decode, C for DiffusionGemma blocks
         bool independent_decode_rows = false; // preserve scalar expert arithmetic in a decode batch
-        bool q4e_metal_host_overlap = false; // internal policy, never a C ABI field
-        mutable int q4e_overlap_end = -1;    // cached original-order prefix cut
-        mutable int q4e_overlap_reject = 0;
+        mutable int host_moe_metal_overlap_end = -1;    // cached original-order prefix cut
+        mutable int host_moe_metal_overlap_reject = 0;
         int hidden = 0;
         int n_ff = 0;
 

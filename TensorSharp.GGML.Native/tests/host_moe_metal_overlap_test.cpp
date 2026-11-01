@@ -1,7 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 // Graph metadata and synthetic allocation ranges only; no backend or model.
-#include "ggml_ops_qwen4exp_host_overlap.h"
+#include "ggml_ops_host_moe_metal_overlap.h"
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -13,7 +13,7 @@
 #include <vector>
 
 namespace {
-namespace ov = tsg::q4e_host_overlap;
+namespace ov = tsg::host_moe_metal_overlap;
 int checks = 0;
 void require(bool value, const char* message)
 {
@@ -25,33 +25,38 @@ void* address(std::uintptr_t value) { return reinterpret_cast<void*>(value); }
 struct Fixture {
     ggml_context* ctx = nullptr;
     ggml_cgraph* graph = nullptr;
-    ggml_tensor *x, *ids, *weights, *pending, *gate, *up, *activation, *down, *shared, *join;
+    ggml_tensor *x, *ids, *weights, *router, *pending, *gate, *up, *activation, *down, *shared, *join;
     std::array<const ggml_tensor*, 3> inputs;
-    Fixture()
+    Fixture(int hidden = 4, int shared_ff = 4, int rows = 1, int used = 4, int experts = 8)
     {
+        if (hidden <= 0 || shared_ff <= 0 || rows <= 0 || used <= 0 || used > experts)
+            throw std::invalid_argument("invalid synthetic MoE geometry");
         ctx = ggml_init({2u << 20, nullptr, true});
         if (!ctx) throw std::runtime_error("metadata context allocation");
-        auto matrix = [&] { return ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 4); };
-        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);
-        ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
-        weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
-        pending = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);
+        auto matrix = [&](int input, int output) { return ggml_new_tensor_2d(ctx, GGML_TYPE_F32, input, output); };
+        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, rows);
+        ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, rows);
+        weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, used, rows);
+        router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, experts, rows);
+        pending = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, rows);
         for (auto* input : {x, ids, weights}) ggml_set_output(input);
         ggml_set_input(pending); ggml_set_output(pending);
         inputs = {x, ids, weights};
-        gate = ggml_mul_mat(ctx, matrix(), x);
-        up = ggml_mul_mat(ctx, matrix(), x);
+        gate = ggml_mul_mat(ctx, matrix(hidden, shared_ff), x);
+        up = ggml_mul_mat(ctx, matrix(hidden, shared_ff), x);
         activation = ggml_mul(ctx, ggml_silu(ctx, gate), up);
-        down = ggml_mul_mat(ctx, matrix(), activation);
-        auto* scalar = ggml_sigmoid(ctx, ggml_mul_mat(ctx,
-            ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1), x));
+        down = ggml_mul_mat(ctx, matrix(shared_ff, hidden), activation);
+        auto* scalar = ggml_sigmoid(ctx, ggml_mul_mat(ctx, matrix(hidden, 1), x));
         shared = ggml_mul(ctx, down, scalar);
         join = ggml_add(ctx, pending, shared);
         graph = ggml_new_graph_custom(ctx, 128, false);
         ggml_build_forward_expand(graph, join);
         std::uintptr_t next = 0x10000000;
         for (auto* t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
-            if (!t->view_src) { t->data = address(next); next += 4096; }
+            if (!t->view_src) {
+                t->data = address(next);
+                next += ((ggml_nbytes(t) + 4095) / 4096 + 1) * 4096;
+            }
         }
         for (auto* t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t))
             if (t->view_src) t->data = address(reinterpret_cast<std::uintptr_t>(t->view_src->data) + t->view_offs);
@@ -112,6 +117,58 @@ void eligible_prefix()
     require(f.safe(why) && why == ov::Reject::none, "pinned disjoint synthetic allocations are safe");
     before.unchanged(f);
     require(f.cut(why) == end && f.safe(why), "cached cut can be revalidated on the same graph");
+}
+
+void variable_shapes_and_routing()
+{
+    struct Shape { int hidden, shared_ff, rows, used, experts; };
+    // These are synthetic dimensions and independent routing capacities, not
+    // model identities. Row batching here exercises metadata only; execution
+    // policy can separately restrict which ordinary CPU path may overlap.
+    for (const Shape shape : {Shape{4, 6, 1, 1, 1}, Shape{8, 12, 1, 2, 7},
+                             Shape{32, 24, 2, 3, 13}, Shape{64, 96, 3, 5, 29},
+                             Shape{16, 20, 1, 9, 61}, Shape{24, 40, 1, 17, 127}}) {
+        Fixture f(shape.hidden, shape.shared_ff, shape.rows, shape.used, shape.experts);
+        Snapshot before(f); ov::Reject why = ov::Reject::none;
+        require(f.router->ne[0] == shape.experts && f.ids->ne[0] == shape.used &&
+            f.ids->ne[1] == shape.rows && f.weights->ne[0] == shape.used,
+            "routing metadata retains the requested expert capacity and actual selection shape");
+        require(f.cut(why) == f.index(f.join) && f.safe(why),
+            "independent shared-branch eligibility follows graph shape rather than model or expert-count constants");
+        before.unchanged(f);
+    }
+}
+
+template<class Change>
+void reject_pending(Change change, const char* message)
+{
+    Fixture f(8, 12, 2, 3, 11); change(f); f.join->src[0] = f.pending;
+    Snapshot before(f); ov::Reject why = ov::Reject::none;
+    require(f.cut(why) < 0 && why == ov::Reject::geometry, message);
+    require(!f.safe(why) && why == ov::Reject::geometry,
+        "allocation validation independently rejects an invalid pending-result representation");
+    before.unchanged(f);
+}
+
+void fresh_pending_contract()
+{
+    reject_pending([](Fixture& f) {
+        auto* view = ggml_view_2d(f.ctx, f.pending, f.pending->ne[0], f.pending->ne[1], f.pending->nb[1], 0);
+        // Deliberately malformed: ggml_set_input itself rejects non-leaves.
+        view->flags |= GGML_TENSOR_FLAG_INPUT; ggml_set_output(view); f.pending = view;
+    }, "even a zero-offset contiguous pending view is not a fresh result allocation");
+    reject_pending([](Fixture& f) {
+        auto* produced = ggml_cont(f.ctx, f.pending);
+        produced->data = address(0x50000000);
+        produced->flags |= GGML_TENSOR_FLAG_INPUT; ggml_set_output(produced); f.pending = produced;
+    }, "a produced pending tensor cannot stand in for the host-written leaf");
+    reject_pending([](Fixture& f) {
+        auto* half = ggml_new_tensor_2d(f.ctx, GGML_TYPE_F16, f.pending->ne[0], f.pending->ne[1]);
+        half->data = address(0x50000000);
+        ggml_set_input(half); ggml_set_output(half); f.pending = half;
+    }, "pending-result storage must be F32");
+    reject_pending([](Fixture& f) { f.pending->nb[1] += sizeof(float); },
+        "a noncontiguous non-view pending root is rejected");
 }
 
 void allowed_metadata_prefix()
@@ -295,8 +352,9 @@ void drain_lifetime()
 int main()
 {
     try {
-        eligible_prefix(); allowed_metadata_prefix(); structural_rejections(); allocation_rejections(); drain_lifetime();
-        std::printf("PASS %d model-free Qwen4Exp host-overlap metadata checks\n", checks);
+        eligible_prefix(); variable_shapes_and_routing(); fresh_pending_contract();
+        allowed_metadata_prefix(); structural_rejections(); allocation_rejections(); drain_lifetime();
+        std::printf("PASS %d model-free host MoE Metal-overlap metadata checks\n", checks);
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL after %d checks: %s\n", checks, error.what());

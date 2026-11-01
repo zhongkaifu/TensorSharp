@@ -33,7 +33,7 @@
 
 #include "ggml_ops_internal.h"
 #include "dsv41_engram_io.h"
-#include "ggml_ops_qwen4exp_host_overlap.h"
+#include "ggml_ops_host_moe_metal_overlap.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -2009,7 +2009,7 @@ namespace tsg
 
     void moe_ffn_host_release()
     {
-        q4e_host_overlap::report();
+        host_moe_metal_overlap::report();
         // Cached CUDA graphs must retire before the backend and mapped weights.
         host_moe_expert_cache_release();
         // Give the locked expert pages back first: a model reload maps a new
@@ -2103,15 +2103,15 @@ namespace tsg
             seg_end.push_back(cut);
         }
         seg_end.push_back(n_nodes);
-        if (q4e_host_overlap::mode())
+        if (host_moe_metal_overlap::mode())
             for (std::size_t i = 0; i < segments.size(); ++i)
             {
                 const HostMoeSegment& hm = segments[i];
-                if (!hm.q4e_metal_host_overlap) continue;
-                q4e_host_overlap::Reject reason;
-                hm.q4e_overlap_end = q4e_host_overlap::prefix_end(graph, seg_end[i], seg_end[i + 1], hm.moe_out, reason);
-                if (hm.q4e_overlap_end >= 0) q4e_host_overlap::count(q4e_host_overlap::Count::cuts);
-                hm.q4e_overlap_reject = static_cast<int>(reason);
+                if (hm.seq_len != 1 || hm.verify_gpu != nullptr) continue;
+                host_moe_metal_overlap::Reject reason;
+                hm.host_moe_metal_overlap_end = host_moe_metal_overlap::prefix_end(graph, seg_end[i], seg_end[i + 1], hm.moe_out, reason);
+                if (hm.host_moe_metal_overlap_end >= 0) host_moe_metal_overlap::count(host_moe_metal_overlap::Count::cuts);
+                hm.host_moe_metal_overlap_reject = static_cast<int>(reason);
             }
         return true;
     }
@@ -2195,7 +2195,7 @@ namespace tsg
         // same accelerator. Retire/check its prefix before entering that path.
         if (overlap)
         {
-            q4e_host_overlap::count(q4e_host_overlap::Count::fast_fallbacks);
+            host_moe_metal_overlap::count(host_moe_metal_overlap::Count::fast_fallbacks);
             if (!overlap->finish(overlap->state)) return false;
         }
         if (hm.independent_decode_rows && hm.seq_len > 1)
@@ -2254,11 +2254,11 @@ namespace tsg
 
     namespace
     {
-        struct Q4eOverlapRun
+        struct HostMoeMetalOverlapRun
         {
             ggml_backend_t backend = nullptr;
             ggml_cgraph prefix{};
-            q4e_host_overlap::Drain* guard = nullptr;
+            host_moe_metal_overlap::Drain* guard = nullptr;
             std::uint64_t error_floor = 0;
             int mode = 0;
             bool executed = false;
@@ -2268,9 +2268,9 @@ namespace tsg
         {
             return std::chrono::duration<double, std::milli>(overlap_clock::now() - start).count();
         }
-        bool q4e_overlap_drain(void* opaque) noexcept
+        bool host_moe_metal_overlap_drain(void* opaque) noexcept
         {
-            auto& run = *static_cast<Q4eOverlapRun*>(opaque);
+            auto& run = *static_cast<HostMoeMetalOverlapRun*>(opaque);
             const auto start = overlap_clock::now();
             // This must happen BEFORE another graph submission replaces the
             // Metal backend's tracked command-buffer slots, including fallback.
@@ -2278,43 +2278,43 @@ namespace tsg
             if (g_ggml_error_count.load(std::memory_order_acquire) != run.error_floor)
                 g_backend_compute_failed.store(true, std::memory_order_release);
             const bool ok = !g_backend_compute_failed.load(std::memory_order_acquire);
-            q4e_host_overlap::time(0, overlap_ms(start), 0);
-            if (!ok) q4e_host_overlap::count(q4e_host_overlap::Count::drain_failures);
+            host_moe_metal_overlap::time(0, overlap_ms(start), 0);
+            if (!ok) host_moe_metal_overlap::count(host_moe_metal_overlap::Count::drain_failures);
             return ok;
         }
-        bool q4e_overlap_start(void* opaque)
+        bool host_moe_metal_overlap_start(void* opaque)
         {
-            auto& run = *static_cast<Q4eOverlapRun*>(opaque);
+            auto& run = *static_cast<HostMoeMetalOverlapRun*>(opaque);
             if (g_backend_compute_failed.load(std::memory_order_acquire)) return false;
             const auto start = overlap_clock::now();
             ggml_status status;
             if (run.mode == 2)
             {
-                q4e_host_overlap::count(q4e_host_overlap::Count::serial_submits);
+                host_moe_metal_overlap::count(host_moe_metal_overlap::Count::serial_submits);
                 status = tsg::compute_graph(run.backend, &run.prefix);
-                q4e_host_overlap::time(0, 0, overlap_ms(start));
+                host_moe_metal_overlap::time(0, 0, overlap_ms(start));
             }
             else
             {
                 run.error_floor = g_ggml_error_count.load(std::memory_order_acquire);
                 run.guard->arm(); // failed submission may still have queued work
-                q4e_host_overlap::count(q4e_host_overlap::Count::async_submits);
+                host_moe_metal_overlap::count(host_moe_metal_overlap::Count::async_submits);
                 status = tsg::compute_graph_async(run.backend, &run.prefix);
-                q4e_host_overlap::time(overlap_ms(start), 0, 0);
+                host_moe_metal_overlap::time(overlap_ms(start), 0, 0);
             }
-            q4e_host_overlap::count(q4e_host_overlap::Count::prefix_nodes, ggml_graph_n_nodes(&run.prefix));
+            host_moe_metal_overlap::count(host_moe_metal_overlap::Count::prefix_nodes, ggml_graph_n_nodes(&run.prefix));
             if (status != GGML_STATUS_SUCCESS || g_backend_compute_failed.load(std::memory_order_acquire))
             {
-                q4e_host_overlap::count(q4e_host_overlap::Count::submit_failures);
+                host_moe_metal_overlap::count(host_moe_metal_overlap::Count::submit_failures);
                 run.guard->finish();
                 return false;
             }
             run.executed = true;
             return true;
         }
-        bool q4e_overlap_finish(void* opaque)
+        bool host_moe_metal_overlap_finish(void* opaque)
         {
-            return static_cast<Q4eOverlapRun*>(opaque)->guard->finish();
+            return static_cast<HostMoeMetalOverlapRun*>(opaque)->guard->finish();
         }
     }
 
@@ -2367,7 +2367,7 @@ namespace tsg
         static thread_local double s_acc_gpu = 0, s_acc_host = 0, s_acc_up = 0, s_acc_total = 0;
         static thread_local int s_acc_passes = 0, s_acc_seq = -1;
         const auto t_pass = s_pass_timing ? pass_clock::now() : pass_clock::time_point{};
-        const int overlap_mode = q4e_host_overlap::mode();
+        const int overlap_mode = host_moe_metal_overlap::mode();
         auto ms_since = [](pass_clock::time_point t) {
             return std::chrono::duration<double, std::milli>(pass_clock::now() - t).count();
         };
@@ -2405,40 +2405,40 @@ namespace tsg
             bool output_on_device = false;
             // The context and graph view outlive the guard. Any exception in
             // the ordinary CPU kernel therefore drains before graph teardown.
-            Q4eOverlapRun overlap;
+            HostMoeMetalOverlapRun overlap;
             overlap.backend = backend;
             overlap.mode = overlap_mode;
-            q4e_host_overlap::Drain overlap_guard(q4e_overlap_drain, &overlap);
+            host_moe_metal_overlap::Drain overlap_guard(host_moe_metal_overlap_drain, &overlap);
             overlap.guard = &overlap_guard;
-            const HostMoeOverlapHooks hooks{ q4e_overlap_start, q4e_overlap_finish, &overlap };
+            const HostMoeOverlapHooks hooks{ host_moe_metal_overlap_start, host_moe_metal_overlap_finish, &overlap };
             bool use_overlap = false;
             if (overlap_mode)
             {
-                q4e_host_overlap::count(q4e_host_overlap::Count::considered);
+                host_moe_metal_overlap::count(host_moe_metal_overlap::Count::considered);
                 bool metal = false;
 #if defined(TSG_GGML_USE_METAL)
                 metal = ggml_backend_is_metal(backend);
 #endif
-                if (!metal || !hm.q4e_metal_host_overlap || hm.seq_len != 1 || hm.verify_gpu ||
+                if (!metal || hm.seq_len != 1 || hm.verify_gpu ||
                     debug_this_call || g_device_count.load(std::memory_order_acquire) != 1)
-                    q4e_host_overlap::count(q4e_host_overlap::Count::ineligible);
+                    host_moe_metal_overlap::count(host_moe_metal_overlap::Count::ineligible);
                 else
                 {
-                    q4e_host_overlap::Reject reason = static_cast<q4e_host_overlap::Reject>(hm.q4e_overlap_reject);
+                    host_moe_metal_overlap::Reject reason = static_cast<host_moe_metal_overlap::Reject>(hm.host_moe_metal_overlap_reject);
                     const ggml_tensor* inputs[] = { hm.moe_in, hm.sel_ids, hm.weights };
                     // Recheck allocation aliases after binding refresh, while
                     // reusing the original-order structural cut from graph build.
-                    use_overlap = hm.q4e_overlap_end > begin && hm.q4e_overlap_end < seg_end[seg + 1] &&
-                        q4e_host_overlap::safe_allocations(graph, begin, hm.q4e_overlap_end, hm.moe_out, inputs, 3, reason);
-                    q4e_host_overlap::count(use_overlap ? q4e_host_overlap::Count::eligible : q4e_host_overlap::Count::rejected);
-                    if (use_overlap) overlap.prefix = ggml_graph_view(graph, begin, hm.q4e_overlap_end);
+                    use_overlap = hm.host_moe_metal_overlap_end > begin && hm.host_moe_metal_overlap_end < seg_end[seg + 1] &&
+                        host_moe_metal_overlap::safe_allocations(graph, begin, hm.host_moe_metal_overlap_end, hm.moe_out, inputs, 3, reason);
+                    host_moe_metal_overlap::count(use_overlap ? host_moe_metal_overlap::Count::eligible : host_moe_metal_overlap::Count::rejected);
+                    if (use_overlap) overlap.prefix = ggml_graph_view(graph, begin, hm.host_moe_metal_overlap_end);
                     else
                     {
-                        if (reason == q4e_host_overlap::Reject::none) reason = q4e_host_overlap::Reject::geometry;
-                        q4e_host_overlap::reject(reason);
+                        if (reason == host_moe_metal_overlap::Reject::none) reason = host_moe_metal_overlap::Reject::geometry;
+                        host_moe_metal_overlap::reject(reason);
                         static thread_local int rejected_logs = 0;
-                        if (rejected_logs++ < 8) std::fprintf(stderr, "[Q4E-HOST-OVERLAP] rejected layer=%d begin=%d cut=%d reason=%s\n",
-                            hm.layer, begin, hm.q4e_overlap_end, q4e_host_overlap::reject_name(reason));
+                        if (rejected_logs++ < 8) std::fprintf(stderr, "[HOSTMOE-METAL-OVERLAP] rejected layer=%d begin=%d cut=%d reason=%s\n",
+                            hm.layer, begin, hm.host_moe_metal_overlap_end, host_moe_metal_overlap::reject_name(reason));
                     }
                 }
             }
@@ -2457,7 +2457,7 @@ namespace tsg
                 set_last_error(std::string(kernel_name) + ": independent Metal prefix failed while draining.");
                 return false;
             }
-            if (overlap.executed) begin = hm.q4e_overlap_end;
+            if (overlap.executed) begin = hm.host_moe_metal_overlap_end;
             if (s_pass_timing) s_acc_host += ms_since(t_host);
 
             const std::size_t act_count = static_cast<std::size_t>(hm.hidden) * static_cast<std::size_t>(hm.seq_len);

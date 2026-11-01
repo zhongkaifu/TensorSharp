@@ -3,9 +3,10 @@
 #pragma once
 #include "ggml.h"
 
-namespace tsg::q4e_host_overlap {
+namespace tsg::host_moe_metal_overlap {
 enum class Reject { none, geometry, no_prefix, dependency, operation, fusion_boundary, unpinned, allocation, alias, count };
-// Returns the first consumer index (exclusive prefix end), or -1. Does not
+// A pending host result must be a fresh contiguous non-view F32 leaf. Returns
+// the first consumer index (exclusive prefix end), or -1. Does not
 // reorder nodes, add outputs, change allocation, or expand another graph.
 int prefix_end(ggml_cgraph* graph, int begin, int limit, const ggml_tensor* pending, Reject&);
 bool safe_allocations(ggml_cgraph* graph, int begin, int end, const ggml_tensor* pending,
@@ -39,4 +40,4 @@ void reject(Reject);
 const char* reject_name(Reject);
 void time(double submit_ms, double drain_ms, double serial_ms);
 void report();
-} // namespace tsg::q4e_host_overlap
+} // namespace tsg::host_moe_metal_overlap
