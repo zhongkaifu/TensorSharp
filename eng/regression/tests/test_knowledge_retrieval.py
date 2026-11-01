@@ -189,7 +189,8 @@ class RetrievalContracts(unittest.TestCase):
         self.assertEqual("CPU", env["TS_KNOWLEDGE_EMBEDDING_BACKEND"])
         self.assertEqual("none", env["TS_KNOWLEDGE_PDF_OCR"])
         self.assertEqual("0", env["TS_KNOWLEDGE_RERANK"])
-        self.assertTrue(Path(env["TS_KNOWLEDGE_DIRECTORY"]).is_relative_to(self.context["artifact_dir"]))
+        self.assertTrue(Path(env["TS_KNOWLEDGE_DIRECTORY"]).resolve().is_relative_to(
+            Path(self.context["artifact_dir"]).resolve()))
         with self.assertRaisesRegex(ValueError, "fresh"):
             retrieval.host_environment(self.context)
 
