@@ -358,6 +358,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_mamba2.cpp
     ggml_ops_moe.cpp
     ggml_ops_host_moe_decode.cpp
+    ggml_ops_qwen4exp_host_overlap.cpp
     ggml_ops_host_moe_cache.cpp
     ggml_ops_deepseek4.cpp
     ggml_ops_deepseek41_tp.cpp
@@ -823,6 +824,13 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_link_libraries(GgmlOpsHostMoeDecodeRowsTest PRIVATE ggml-cpu ggml-base)
     add_test(NAME host-moe-decode-independent-rows COMMAND GgmlOpsHostMoeDecodeRowsTest)
     set_tests_properties(host-moe-decode-independent-rows PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
+    add_executable(GgmlOpsQwen4ExpHostOverlapTest
+        tests/qwen4exp_host_overlap_test.cpp ggml_ops_qwen4exp_host_overlap.cpp)
+    target_include_directories(GgmlOpsQwen4ExpHostOverlapTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    target_link_libraries(GgmlOpsQwen4ExpHostOverlapTest PRIVATE ggml-base)
+    add_test(NAME qwen4exp-host-overlap-plan-drain COMMAND GgmlOpsQwen4ExpHostOverlapTest)
+    set_tests_properties(qwen4exp-host-overlap-plan-drain PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
     add_test(NAME host-moe-expert-cache-cpu-fallback COMMAND GgmlOpsHostMoeExpertCacheTest --cpu)
     add_test(NAME host-moe-expert-cache-invalid-budget-sign
         COMMAND GgmlOpsHostMoeExpertCacheTest --invalid-budget "+8192")

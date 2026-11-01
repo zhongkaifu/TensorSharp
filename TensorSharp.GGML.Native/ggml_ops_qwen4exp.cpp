@@ -1029,6 +1029,8 @@ ggml_tensor* q4e_nodes_ffn(
         hm.n_used = n_expert_used;
         hm.n_ff = n_ff;
         hm.seq_len = T;
+        hm.q4e_metal_host_overlap = T == 1 && g_backend_type == BACKEND_TYPE_METAL &&
+            g_device_count.load(std::memory_order_acquire) == 1 && !tsg::host_moe_verify_enabled();
         hm.hidden = n_embd;
 
         if (tsg::host_moe_verify_enabled())

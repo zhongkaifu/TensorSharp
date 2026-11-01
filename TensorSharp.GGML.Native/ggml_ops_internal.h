@@ -489,6 +489,15 @@ namespace tsg
         return status;
     }
 
+    inline ggml_status compute_graph_async(ggml_backend_t backend, ggml_cgraph* graph)
+    {
+        const std::uint64_t before = g_ggml_error_count.load(std::memory_order_acquire);
+        const ggml_status status = ggml_backend_graph_compute_async(backend, graph);
+        if (g_ggml_error_count.load(std::memory_order_acquire) != before)
+            g_backend_compute_failed.store(true, std::memory_order_release);
+        return status;
+    }
+
     // Same, for the paths that submit asynchronously and drain separately.
     inline void sync_backend(ggml_backend_t backend)
     {
@@ -925,6 +934,9 @@ namespace tsg
         int n_used = 0;
         int seq_len = 1;             // 1 for autoregressive decode, C for DiffusionGemma blocks
         bool independent_decode_rows = false; // preserve scalar expert arithmetic in a decode batch
+        bool q4e_metal_host_overlap = false; // internal policy, never a C ABI field
+        mutable int q4e_overlap_end = -1;    // cached original-order prefix cut
+        mutable int q4e_overlap_reject = 0;
         int hidden = 0;
         int n_ff = 0;
 
@@ -1290,10 +1302,17 @@ namespace tsg
         const std::int32_t* sel_ids = nullptr;
         const float* weights = nullptr;
     };
+    struct HostMoeOverlapHooks
+    {
+        bool (*start)(void*) = nullptr;  // called only after all input downloads
+        bool (*finish)(void*) = nullptr; // called before backend-using fallback
+        void* state = nullptr;
+    };
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
                                   HostMoeStagedInputs* staged = nullptr,
                                   bool allow_device_stream = true,
-                                  bool* output_on_device = nullptr);
+                                  bool* output_on_device = nullptr,
+                                  const HostMoeOverlapHooks* overlap = nullptr);
 
     // One-token routed experts on the host (ggml_ops_host_moe_decode.cpp): ggml's
     // CPU dot kernels on a team woken once per layer instead of a ggml graph per
