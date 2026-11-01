@@ -174,8 +174,9 @@
       ],
       "configuration_status": "configured",
       "presets": [
-        "qwen3.8-flash-next-mtp",
-        "qwen3.8-flash-next"
+        "qwen3.8-flash-next",
+        "qwen3.8-flash-next-iq1_m",
+        "qwen3.8-flash-next-mtp"
       ]
     },
     {
@@ -1221,6 +1222,7 @@
         "server_chat",
         "server_stream",
         "jev_decision",
+        "jev_text_attachments",
         "jev_media"
       ],
       "source_evidence": [
@@ -1261,6 +1263,7 @@
         "server_chat",
         "server_stream",
         "jev_decision",
+        "jev_text_attachments",
         "jev_media"
       ],
       "source_evidence": [
@@ -1787,6 +1790,7 @@
         "server_chat",
         "server_stream",
         "jev_decision",
+        "jev_text_attachments",
         "jev_media"
       ],
       "source_evidence": [
@@ -3232,6 +3236,64 @@
       "status": "configured"
     },
     {
+      "id": "qwen3.8-flash-next-iq1_m",
+      "config": "config/qwen3.8-flash-next-iq1_m.json",
+      "kind": "text",
+      "family": "qwen4exp",
+      "modalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image",
+        "cli_video"
+      ],
+      "source_evidence": [
+        "config/qwen3.8-flash-next-iq1_m.json",
+        "config/regression/source-pins.json",
+        "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpArchitecture.cs",
+        "TensorSharp.Models/ManagedQuantizedOps.cs",
+        "TensorSharp.Backends.Cuda/Engine/CudaMoe.cs",
+        "docs/models/qwen38-flash-next.md"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf": 10946624,
+        "Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf": 49988981792,
+        "Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf": 24538827360,
+        "mmproj-BF16.gguf": 907542944
+      },
+      "status": "configured",
+      "notes": [
+        "Distinct UD-IQ1_M quantization: all three shard SHA256 values and exact sizes match the supplied local inventory identities at the pinned publisher revision. It is not an alias for UD-Q2_K_XL.",
+        "Trunk size is 74538755776 bytes; on-disk size does not establish residency or throughput. Full-resident planning remains conservative; explicit CPU MoE needs independent RAM/VRAM peak requirements.",
+        "MLX is refused by this architecture. Direct cuda is not automatically qualified for this quant: CudaMoe does not decode IQ1_M expert tensors and metadata-only verification does not reveal this mixed checkpoint's tensor layouts. Qualify those layouts before expanding this preset's backend matrix.",
+        "Optional matching BF16 projector is required for image/video fixtures. No learned draft or offload policy is enabled by this config."
+      ]
+    },
+    {
       "id": "server-basic",
       "config": "config/server-basic.json",
       "kind": "text",
@@ -3928,6 +3990,29 @@
       ]
     },
     {
+      "id": "jev_text_attachments",
+      "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
+      "status": "automated",
+      "recipe": "Execute all 14 manifest cases without vision/ASR requirements as inline text/document requests, replay one exact attachment request, and reject eight malformed attachment inputs.",
+      "assertions": [
+        "Manifest and selected fixture identities are recorded; every submitted file matches its pinned byte count and SHA256. Legacy text CRLF conversion is accepted only when exact canonical pinned bytes are recovered and both identities recorded.",
+        "Current-request HTTP 200 evidence, served model/seed/sample identity, question ownership and every gold decision must match.",
+        "Attachment count/name/kind/order and positive extracted-text counts match; zero image spans, no sampling, typed cache diagnostics and finite stage timings are required.",
+        "Exact replay requires positive extraction cacheHit for every attachment and probability delta at most 1e-5; eight malformed attachment fixtures return exact 422 validation_error envelopes.",
+        "This covers inline text and office/PDF text extraction, including source ordering and cross-file fixtures. Vision, video, ASR, uploaded references, concurrent isolation and representative quality remain untested."
+      ],
+      "evidence": [
+        "eng/regression/jev_text_attachments.py",
+        "eng/jev-attachments-benchmark.py",
+        "InferenceWeb.Tests/Fixtures/JevAttachments/manifest.json",
+        "InferenceWeb.Tests/JevAttachmentTests.cs",
+        "TensorSharp.Chat/Jev/JevAttachmentPreparer.cs"
+      ],
+      "requirements": [
+        "Built local server and Jev model; pinned repository fixtures; scenario-local upload storage. No projector or ASR service is used."
+      ]
+    },
+    {
       "id": "speculation",
       "entry_point": "eng/validation/validate-speculative-rows.py",
       "status": "recipe",
@@ -4120,7 +4205,7 @@
       "id": "jev_media",
       "status": "recipe",
       "entry_point": "eng/jev-extended-smoke.py",
-      "recipe": "Run separately controlled Jev image/attachment and optional ASR probes with approved local fixtures.",
+      "recipe": "Run separately controlled Jev vision/video and optional ASR probes with approved local fixtures; inline text/document coverage is jev_text_attachments.",
       "assertions": [
         "Attachment-dependent decisions match labeled fixtures; unsupported media and absent ASR return explicit errors."
       ],

@@ -21,7 +21,7 @@ from eng.regression.scenarios import (
     run_scenario, validate_chat, validate_embeddings, validate_logit_metrics,
     validate_sequence_metrics,
     _history_hashes,
-    _json_loads, cancellation_evidence, offload_evidence, _attest_offload,
+    _json_loads, cancellation_evidence, offload_evidence, _attest_offload, _attest_offload_architecture, _hosted_response_model,
 )
 
 
@@ -40,6 +40,23 @@ def logit_metrics(comparison=False):
 
 
 class ScenarioContracts(unittest.TestCase):
+    def test_hosted_stem_alias_uses_exact_filename_response_identity(self):
+        loaded = "Qwen3.5-0.8B-Q4_K_M.gguf"
+        for alias in (loaded, "Qwen3.5-0.8B-Q4_K_M"):
+            result = {"assertions": [], "evidence": {}}
+            expected = _hosted_response_model(loaded, [{"id": alias}], result)
+            self.assertEqual(expected, loaded)
+            response = dict(completion(), model=loaded)
+            self.assertEqual(validate_chat(response, expected_model=expected), "56")
+            for wrong in ("another-model.gguf", "Qwen3.5-0.8B-Q4_K_M-other.gguf"):
+                with self.subTest(wrong=wrong), self.assertRaisesRegex(ScenarioFailure, "identity"):
+                    validate_chat(dict(response, model=wrong), expected_model=expected)
+
+    def test_unrelated_advertised_model_cannot_alias_verified_loaded_file(self):
+        for listing in ([{"id": "other-model"}], [{"id": "synthetic.gguf.backup"}], [{"id": "dir/synthetic.gguf"}], [], [{"id": "synthetic"}, {"id": "other"}]):
+            with self.subTest(listing=listing), self.assertRaises(ScenarioFailure):
+                _hosted_response_model("synthetic.gguf", listing, {"assertions": [], "evidence": {}})
+
     def test_cpu_moe_host_requires_active_all_layer_banner(self):
         active = "MoE CPU offload active: routed experts of all layers stay in system RAM and run on the host (auto threads)"
         self.assertTrue(offload_evidence(active)["verified"])
@@ -75,6 +92,24 @@ class ScenarioContracts(unittest.TestCase):
                 _attest_offload(context, {"assertions": [], "evidence": {}}, "probe", "",
                                 dict(metrics, model_architecture=architecture), probe=True)
 
+    def test_cpu_moe_cli_config_banner_cannot_qualify_dense_or_missing_architecture(self):
+        context = {"model_family": "qwen35", "offload_policy": {"name": "cpu_moe", "requested": True, "supported": True}}
+        active = "MoE CPU offload active: routed experts of all layers stay in system RAM and run on the host (auto threads)\n"
+        for architecture in ("qwen35moe", "qwen3next"):
+            _attest_offload(context, {"assertions": [], "evidence": {}}, "cli", active + "Model: " + architecture + ", Layers=32",
+                            cli=True)
+        for banner in ("", "Model: qwen35, Layers=32", "Model: qwen4exp, Layers=32", "model_path=qwen35moe.gguf",
+                       "Model: qwen35, Layers=32\nModel: qwen35moe, Layers=32"):
+            with self.subTest(banner=banner), self.assertRaisesRegex(ScenarioFailure, "actual model architecture"):
+                _attest_offload(context, {"assertions": [], "evidence": {}}, "cli", active + banner, cli=True)
+
+    def test_cpu_moe_server_identity_is_bound_to_requested_family(self):
+        context = {"model_family": "qwen4exp", "offload_policy": {"name": "cpu_moe", "requested": True, "supported": True}}
+        _attest_offload_architecture(context, {"assertions": [], "evidence": {}}, "server-model", ["qwen4exp"], "/api/models architecture")
+        for architecture in (None, "qwen35", "qwen35moe", "llama"):
+            with self.subTest(architecture=architecture), self.assertRaisesRegex(ScenarioFailure, "actual model architecture"):
+                _attest_offload_architecture(context, {"assertions": [], "evidence": {}}, "server-model", [architecture], "/api/models architecture")
+
     def test_backend_requires_positive_runtime_banner(self):
         self.assertFalse(backend_evidence("requested backend=ggml_cuda", "ggml_cuda")["verified"])
         self.assertTrue(backend_evidence("Backend: GgmlCuda\n", "ggml_cuda")["verified"])
@@ -91,7 +126,7 @@ class ScenarioContracts(unittest.TestCase):
                 self.assertFalse(backend_evidence("Backend: Cuda\n" + switch, "cuda")["verified"])
 
     def test_prompt_or_thinking_cannot_satisfy_answer(self):
-        text = "info: prompt mentions 56\n=== Generated Output ===\n--- Thinking ---\n56\n--- End Thinking ---\nwrong\ninfo: done"
+        text = "info: prompt mentions 56\n=== Generated Output ===\n--- Thinking ---\n56\n--- End Thinking ---\nwrong\n08:41:33 info: TensorSharp.Cli[1701] done"
         self.assertEqual(extract_assistant(text), "wrong")
         self.assertEqual(extract_assistant("prompt 56\nno output marker"), "")
 
@@ -101,6 +136,11 @@ class ScenarioContracts(unittest.TestCase):
         self.assertEqual(extract_assistant(prefix + '56' + suffix), '56')
         self.assertEqual(extract_assistant(prefix + '55' + suffix), '55')
         self.assertEqual(extract_assistant(prefix + suffix), '')
+
+    def test_visible_error_and_info_lines_are_not_discarded_as_logs(self):
+        for visible in ("Error: inference failed\n56", "Exception: invalid state\n56", "info: misleading answer\n56"):
+            with self.subTest(visible=visible):
+                self.assertEqual(extract_assistant("=== Generated Output ===\n" + visible), visible)
 
     def test_semantic_and_usage_assertions(self):
         self.assertEqual(validate_chat(completion()), "56")
@@ -262,7 +302,7 @@ class RealSubprocessRegressions(unittest.TestCase):
 
     def test_cpu_moe_active_cli_preserves_backend_and_output_assertions(self):
         self.cpu_moe_profile()
-        output = "Backend: GgmlCuda\nMoE CPU offload active: routed experts of all layers stay in system RAM and run on the host (auto threads)\ncli.inference decode complete: tokens=2 ms=1 tokensPerSec=2\ncli.inference finishReason=eos tokens=2\n=== Generated Output ===\n56"
+        output = "Backend: GgmlCuda\nModel: qwen35moe, Layers=32\nMoE CPU offload active: routed experts of all layers stay in system RAM and run on the host (auto threads)\ncli.inference decode complete: tokens=2 ms=1 tokensPerSec=2\ncli.inference finishReason=eos tokens=2\n=== Generated Output ===\n56"
         self.context["cli_command"] = [sys.executable, "-c", "print(" + repr(output) + ")"]
         value = run_scenario({"id": "cli_text"}, self.context)
         self.assertEqual(value["status"], "pass", value)
@@ -271,6 +311,14 @@ class RealSubprocessRegressions(unittest.TestCase):
         value = run_scenario({"id": "cli_text"}, self.context)
         self.assertEqual(value["status"], "fail", value)
         self.assertIn("actual backend", value["reason"])
+
+    def test_cpu_moe_valid_model_file_and_banner_do_not_make_dense_cli_pass(self):
+        self.cpu_moe_profile()
+        output = "Backend: GgmlCuda\nModel: qwen35, Layers=32\nMoE CPU offload active: routed experts of all layers stay in system RAM and run on the host (auto threads)\ncli.inference decode complete: tokens=2\ncli.inference finishReason=eos tokens=2\n=== Generated Output ===\n56"
+        self.context["cli_command"] = [sys.executable, "-c", "print(" + repr(output) + ")"]
+        value = run_scenario({"id": "cli_text"}, self.context)
+        self.assertEqual(value["status"], "fail", value)
+        self.assertIn("actual model architecture", value["reason"])
 
     def test_cpu_moe_ignored_by_old_probe_cannot_pass_either_logit_adapter(self):
         self.cpu_moe_profile()
@@ -299,6 +347,12 @@ class RealSubprocessRegressions(unittest.TestCase):
         value = run_scenario({"id": "cli_text"}, self.context)
         self.assertEqual(value["status"], "fail")
         self.assertIn("semantic", value["reason"])
+
+    def test_visible_error_followed_by_correct_integer_cannot_pass(self):
+        self.context["cli_command"] = self.fake_cli("Error: inference failed\n56")
+        value = run_scenario({"id": "cli_text"}, self.context)
+        self.assertEqual(value["status"], "fail", value)
+        self.assertIn("no inference error text", value["reason"])
 
     def test_cli_tool_prose_without_formatted_section_fails(self):
         self.context["cli_command"] = self.fake_cli('Function: get_regression_value Arguments: {"key":"fixture"}')
@@ -390,9 +444,10 @@ def telemetry(request_id, event, message, props):
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_GET(self):
-        if self.path == '/api/models': value = {'loaded':model,'loadedBackend':sys.argv[sys.argv.index('--backend')+1]}
+        if self.path == '/api/models': value = {'loaded':model,'loadedBackend':sys.argv[sys.argv.index('--backend')+1],
+                                               'architecture':'qwen35' if mode=='cpu_moe_dense' else 'qwen35moe'}
         elif self.path == '/api/queue/status': value = {'processing':int(active),'pending_requests':0}
-        else: value = {'data':[{'id':model,'embedding_dimensions':2}]}
+        else: value = {'data':[{'id':'unrelated-model' if mode=='advertised_other_model' else Path(model).stem,'embedding_dimensions':2}]}
         self.reply(value)
     def do_POST(self):
         global active, session_counter
@@ -427,6 +482,12 @@ class Handler(BaseHTTPRequestHandler):
         if mode.startswith('embedding') and mode != 'embedding_allows_generation':
             self.error(400,None,message='This server hosts an embedding model. Use /v1/embeddings or /api/embed.'); return
         if payload.get('stream'):
+            if mode == 'normal_stream':
+                self.sse_headers()
+                self.emit({'id':'chatcmpl-fixture','model':model,'object':'chat.completion.chunk','choices':[{'delta':{'content':'56'},'finish_reason':None}]})
+                self.emit({'id':'chatcmpl-fixture','model':model,'object':'chat.completion.chunk','choices':[{'delta':{},'finish_reason':'stop'}],
+                           'usage':{'prompt_tokens':12,'completion_tokens':1,'total_tokens':13}})
+                self.wfile.write(b'data: [DONE]\n\n'); self.wfile.flush(); return
             active = True
             rid = self.headers.get('X-TensorSharp-Request-Id'); stream_id = 'chatcmpl-fixture-cancel'
             telemetry(rid, {'id':1501,'name':'ChatStarted'}, 'request starts', {'ChatcmplId':stream_id})
@@ -441,7 +502,7 @@ class Handler(BaseHTTPRequestHandler):
                 telemetry(rid, {'id':1502,'name':'ChatCompleted'}, 'chat.complete tokens=512', {'Tokens':512,'FinishReason':'max_tokens'})
             active = False
             return
-        self.reply({'object':'chat.completion','model':model,'choices':[{'message':{'role':'assistant','content':'56'},'finish_reason':'stop'}],
+        self.reply({'object':'chat.completion','model':'another-model.gguf' if mode=='response_other_model' else model,'choices':[{'message':{'role':'assistant','content':'56'},'finish_reason':'stop'}],
                     'usage':{'prompt_tokens':12,'completion_tokens':1,'total_tokens':13,'prompt_tokens_details':{'cached_tokens':8}}})
     def do_DELETE(self):
         sid = self.path.rsplit('/',1)[-1]
@@ -461,7 +522,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data)))
         self.end_headers(); self.wfile.write(data)
 server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
-if mode == 'cpu_moe_active': print('MoE CPU offload active: routed experts of all layers stay in system RAM and run on the host (auto threads)', flush=True)
+if mode in {'cpu_moe_active','cpu_moe_dense'}: print('MoE CPU offload active: routed experts of all layers stay in system RAM and run on the host (auto threads)', flush=True)
 print('Now listening on: http://127.0.0.1:' + str(port), flush=True)
 server.serve_forever()
 ''', encoding="utf-8")
@@ -473,6 +534,20 @@ server.serve_forever()
         value = self.run_fake_server("server_chat")
         self.assertEqual(value["status"], "pass", value)
         self.assertTrue(value["evidence"]["server_shutdown"]["verified"])
+        self.assertEqual(value["evidence"]["model_alias"], {"loaded_filename": "synthetic.gguf", "advertised_id": "synthetic",
+                         "request_model": "synthetic.gguf", "expected_response_model": "synthetic.gguf"})
+        self.assertTrue(all(r["body"]["model"] == "synthetic.gguf" for r in value["inputs"]["requests"] if r["route"] == "/v1/chat/completions"))
+
+    def test_extensionless_listing_and_filename_sse_are_exactly_bound(self):
+        value = self.run_fake_server("server_stream", "normal_stream")
+        self.assertEqual(value["status"], "pass", value)
+
+    def test_advertised_or_response_other_model_cannot_pass(self):
+        for mode, reason in (("advertised_other_model", "advertised model alias"), ("response_other_model", "identity")):
+            with self.subTest(mode=mode):
+                value = self.run_fake_server("server_chat", mode)
+                self.assertEqual(value["status"], "fail", value)
+                self.assertIn(reason, value["reason"])
 
     def test_agent_dispatch_uses_bounded_host_options_and_owned_loopback(self):
         with patch("eng.regression.agent_regression.run_agents") as run_agents:
@@ -500,6 +575,12 @@ server.serve_forever()
         value = self.run_fake_server("server_chat", "cpu_moe_active")
         self.assertEqual(value["status"], "pass", value)
         self.assertEqual([proof["stage"] for proof in value["evidence"]["offload"]], ["server-startup", "server-final"])
+
+    def test_cpu_moe_valid_model_file_and_banner_do_not_make_dense_server_pass(self):
+        self.cpu_moe_profile()
+        value = self.run_fake_server("server_chat", "cpu_moe_dense")
+        self.assertEqual(value["status"], "fail", value)
+        self.assertIn("actual model architecture", value["reason"])
 
     def test_embedding_negatives_are_executed(self):
         value = self.run_fake_server("server_embeddings", "embedding")

@@ -1,0 +1,3 @@
+# Manifest SHA256 values and PDF byte offsets require exact checkout bytes.
+# Treat the entire fixture set as byte-preserving, including ASCII PDFs/text.
+* -text

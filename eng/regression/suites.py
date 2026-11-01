@@ -7,8 +7,11 @@ import xml.etree.ElementTree as ET
 
 from .processes import (run_process, containment_failure_evidence, unsafe_process_state,
                         UNSAFE_RESOURCES_REASON, ProcessContainmentError)
+from .hardware import _runtime_evidence
+from .reports import file_hash, runtime_identity, source_identity
 
-MANAGED_BUILD_PROPERTIES = ["-p:TensorSharpSkipGgmlNative=true", "-p:TensorSharpSkipMlxNative=true"]
+MANAGED_BUILD_PROPERTIES = ["-p:TensorSharpSkipGgmlNative=true", "-p:TensorSharpSkipMlxNative=true",
+                            "-p:TensorSharpSkipCudaPtx=true"]
 
 
 def list_suites(repo):
@@ -23,13 +26,30 @@ def list_suites(repo):
                        "assertions": ["TRX contains executed passed tests", "zero failed tests", "skipped tests disclosed separately"],
                        "scope": "Environment-independent correctness only; not native GPU/model/performance coverage"})
     suites.append({"id": "client_native_contract", "kind": "client_native",
+                   "project": "eng/tests/NativeChatCompletion/NativeChatCompletion.csproj",
                    "built": repo / "eng/tests/NativeChatCompletion/bin/Release/net10.0/NativeChatCompletion.dll",
                    "example": repo / "examples/tensorsharp-native-chat/bin/Release/net10.0/TensorSharp.NativeChat.dll",
                    "assertions": ["all seven completion-boundary checks", "adapter contracts execute"]})
     suites.append({"id": "client_http_contract", "kind": "client_http",
+                   "project": "examples/dotnet-local-chat/TensorSharp.LocalChat.csproj",
                    "built": repo / "examples/dotnet-local-chat/bin/Release/net10.0/TensorSharp.LocalChat.dll",
                    "assertions": ["mock HTTP integration assertions execute", "zero FAIL records"]})
     return suites
+
+
+def suite_identity(repo, spec):
+    """Capture the resulting deployment before tests, independently of initial host hashes."""
+    assemblies = [spec["built"]] + ([spec["example"]] if spec["kind"] == "client_native" else [])
+    missing = [str(path) for path in assemblies if not path.is_file()]
+    if missing:
+        raise ValueError("required contract assemblies unavailable before execution: " + ", ".join(missing))
+    project = Path(repo) / spec["project"] if spec.get("project") else None
+    directories = sorted({str(path.parent.resolve()) for path in assemblies})
+    return {"stage": "after permitted managed builds; before assertion execution", "source": source_identity(repo),
+            "project": {"path": str(project), "sha256": file_hash(project)} if project and project.is_file() else None,
+            "assemblies": [{"path": str(path), "size_bytes": path.stat().st_size, "sha256": file_hash(path)} for path in assemblies],
+            "runtime_candidates": runtime_identity({"runtime": _runtime_evidence(directories)}),
+            "limitation": "Deployment hashes describe files before execution; mapped modules are not independently observed"}
 
 
 def trx_counts(path):
@@ -76,9 +96,9 @@ def run_suites(repo, output, mode, allow_builds, timeout_seconds):
                 results.append(result)
                 continue
             command = [dotnet, "test", str(repo / spec["project"]), "-c", "Release", "--filter", spec["filter"],
-                       "--logger", "trx;LogFileName=tests.trx", "--results-directory", str(target)]
-            if not allow_builds:
-                command += ["--no-build", "--no-restore"]
+                       "--logger", "trx;LogFileName=tests.trx", "--results-directory", str(target), "--no-build", "--no-restore"]
+            if allow_builds:
+                commands.append([dotnet, "build", str(repo / spec["project"]), "-c", "Release"])
             commands.append(command)
         else:
             if spec["kind"] == "client_native":
@@ -108,6 +128,13 @@ def run_suites(repo, output, mode, allow_builds, timeout_seconds):
         result["processes"] = []
         try:
             for index, command in enumerate(commands):
+                managed_build = len(command) > 1 and command[0] == dotnet and command[1] in {"build", "restore"}
+                if not managed_build:
+                    if "execution_identity" not in result:
+                        result["execution_identity"] = suite_identity(repo, spec)
+                    if spec["kind"] == "dotnet":
+                        # A build or an earlier attempt must not supply this test's evidence.
+                        (target / "tests.trx").unlink(missing_ok=True)
                 process = run_process(command, cwd=repo, artifact_dir=target, stage=f"step-{index}",
                                       timeout_seconds=timeout_seconds,
                                       env={"TS_TEST_GGML_BACKEND": "cpu"})

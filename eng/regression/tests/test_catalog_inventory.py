@@ -126,7 +126,36 @@ class CatalogInventoryTests(unittest.TestCase):
                 self.assertTrue(all(total == shards[0][1] for number, total in shards))
                 self.assertEqual(list(range(1, shards[0][1] + 1)), sorted(number for number, total in shards))
             seen.add(preset["family"])
-        self.assertEqual({"muse-glimmer", "muse-spark", "minimax-m3", "qwen35"}, seen)
+        self.assertEqual({"muse-glimmer", "muse-spark", "minimax-m3", "qwen35", "qwen4exp"}, seen)
+
+    def test_flash_next_iq1m_is_a_distinct_complete_quantization(self):
+        preset = self.presets["qwen3.8-flash-next-iq1_m"]
+        self.assertEqual("qwen4exp", preset["family"])
+        self.assertEqual("moe", preset["layout"])
+        self.assertNotIn("mlx", preset["backends"])
+        self.assertNotIn("cuda", preset["backends"])
+        root = REPO / "artifacts" / "source-only-model-root"
+        resolved = read_config(REPO / preset["config"], root, environ={})
+        models = [file for file in resolved.files if file.option == "model"]
+        self.assertEqual(3, len(models))
+        expected = [(10946624, "6584f289c808a486ac33aef20906774bcf6616785535c03b842072951e5112d2"),
+                    (49988981792, "a7cbafba2cbc1ccde484ed05e1bbeaef4d67e0924ef51cc8b8de18e62edb5586"),
+                    (24538827360, "ae757ff9347651adacc7746f137d8c29b51f25cf6bb27cd49086ef45bd8cc203")]
+        for number, (file, (size, digest)) in enumerate(zip(models, expected), 1):
+            self.assertEqual(f"Qwen3.8-Flash-Next-UD-IQ1_M-{number:05}-of-00003.gguf", file.path.name)
+            self.assertEqual(root / "Qwen3.8-Flash-Next-GGUF", file.path.parent)
+            self.assertEqual(size, preset["file_sizes"][file.path.name])
+            self.assertEqual(digest, file.sha256)
+            self.assertFalse(file.optional)
+        self.assertEqual(74538755776, sum(preset["file_sizes"][file.path.name] for file in models))
+        projector, = [file for file in resolved.files if file.option == "mmproj"]
+        self.assertTrue(projector.optional)
+        self.assertEqual(907542944, preset["file_sizes"][projector.path.name])
+        self.assertEqual("f16", resolved.options["kv-cache-dtype"])
+        self.assertNotIn("spec", resolved.options)
+        self.assertNotIn("draft-model", resolved.options)
+        q2 = read_config(REPO / self.presets["qwen3.8-flash-next"]["config"], root, environ={})
+        self.assertFalse({file.sha256 for file in models} & {file.sha256 for file in q2.files if file.option == "model"})
 
     def test_small_qwen35_has_complete_pinned_local_layout(self):
         preset = self.presets["qwen3.5-0.8b"]

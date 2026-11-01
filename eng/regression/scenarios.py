@@ -27,7 +27,7 @@ ADAPTER_IDS = frozenset({
     "cli_text", "cli_prefill", "cli_decode", "cli_multi_turn", "cli_tools", "cli_thinking",
     "cli_image", "cli_audio", "cli_video", "forced_logits", "forced_logits_sequence", "server_chat", "server_stream",
     "server_cancel", "server_reset_cache", "server_structured", "server_tools", "server_embeddings", "server_agents",
-    "jev_decision", "image_generation_smoke", "speculation_ngram",
+    "jev_decision", "jev_text_attachments", "image_generation_smoke", "speculation_ngram",
 })
 _LOGIT_BACKENDS = {"cpu", "cuda", "ggml_cpu", "ggml_cuda", "ggml_metal"}
 _CONFIG_KEYS = {"model", "mmproj", "draft-model", "tokenizer", "kv-cache-dtype", "embedding-threads",
@@ -77,7 +77,7 @@ def availability(case, context):
     if kind == "speculation_ngram":
         from .speculation import availability as ngram_available
         return ngram_available(context)
-    command_key = "logit_command" if kind.startswith("forced_logits") else "server_command" if kind.startswith("server_") or kind in {"jev_decision", "image_generation_smoke"} else "cli_command"
+    command_key = "logit_command" if kind.startswith("forced_logits") else "server_command" if kind.startswith("server_") or kind in {"jev_decision", "jev_text_attachments", "image_generation_smoke"} else "cli_command"
     command = context.get(command_key)
     if not command or isinstance(command, str):
         return False, "provide a built local binary argv list in " + command_key
@@ -86,6 +86,9 @@ def availability(case, context):
     if kind == "jev_decision" and not all((Path(context["repo"]) / path).is_file() for path in
             ("TensorSharp.TestMatrix/Inputs/jev/decisions.json", "eng/jev-benchmark.py")):
         return False, "repository Jev decision fixtures/validator are missing"
+    if kind == "jev_text_attachments" and not all((Path(context["repo"]) / path).is_file() for path in
+            ("InferenceWeb.Tests/Fixtures/JevAttachments/manifest.json", "eng/jev-benchmark.py")):
+        return False, "repository Jev attachment manifest/validator are missing"
     if not context.get("preparing_model") and (not context.get("model_path") or not Path(context["model_path"]).is_file()):
         return False, "verified local model is not available"
     if kind == "image_generation_smoke":
@@ -189,7 +192,19 @@ def offload_evidence(text, metrics=None, *, probe=False):
             "scope": "Runtime all-layer configuration attestation; not a measurement of resident expert bytes or host work."}
 
 
-def _attest_offload(context, result, stage, text, metrics=None, *, probe=False):
+def _attest_offload_architecture(context, result, stage, observed, source):
+    requested = context.get("offload_policy") or {}
+    if requested.get("requested") is not True:
+        return
+    family = context.get("model_family") or requested.get("family")
+    allowed = {"qwen35": {"qwen35moe", "qwen3next"}, "qwen4exp": {"qwen4exp"}}.get(family, set())
+    verified = bool(observed) and all(isinstance(value, str) and value in allowed for value in observed)
+    evidence = {"stage": stage, "source": source, "observed": observed, "allowed": sorted(allowed), "verified": verified}
+    result["evidence"].setdefault("offload_architecture", []).append(evidence)
+    _require(result, stage + ": CPU MoE actual model architecture", verified, sorted(allowed), observed)
+
+
+def _attest_offload(context, result, stage, text, metrics=None, *, probe=False, cli=False):
     requested = context.get("offload_policy") or {}
     if requested.get("requested") is not True:
         return
@@ -200,11 +215,11 @@ def _attest_offload(context, result, stage, text, metrics=None, *, probe=False):
     _require(result, stage + ": runtime CPU MoE all-layer policy", evidence["verified"],
              "explicit all-layer CPU MoE policy, without unsupported/ignored warning", evidence)
     if probe:
-        family = context.get("model_family") or requested.get("family")
-        allowed = {"qwen35": {"qwen35moe", "qwen3next"}, "qwen4exp": {"qwen4exp"}}.get(family, set())
         actual = metrics.get("model_architecture") if isinstance(metrics, dict) else None
-        _require(result, stage + ": CPU MoE actual model architecture", actual in allowed,
-                 sorted(allowed), actual)
+        _attest_offload_architecture(context, result, stage, [actual], "probe model.Config.Architecture")
+    elif cli:
+        actual = re.findall(r"(?m)^\s*Model:\s*([A-Za-z0-9_-]+)(?=,|\s*$)", text)
+        _attest_offload_architecture(context, result, stage, actual, "loaded model architecture banner")
 
 
 def extract_assistant(stdout):
@@ -214,10 +229,13 @@ def extract_assistant(stdout):
     text = stdout.split(marker, 1)[1].lstrip("\r\n")
     lines = []
     for line in text.splitlines():
-        if re.match(r"^(?:\d\d:\d\d:\d\d\s+)?(?:info|warn|warning|error|critical|trace|debug|fail|crit):\s", line, re.I):
+        if re.match(r"^\d\d:\d\d:\d\d(?:\.\d+)?\s+(?:info|warn|warning|error|critical|trace|debug|dbug|trce|fail|crit):\s+"
+                    r"[A-Za-z_][A-Za-z0-9_.+`]*\[\d+\]\s", line, re.I):
             # The CLI logs its completion preview AFTER the output marker but
             # BEFORE printing the actual answer. Never interpret that preview as
             # answer text, and do not stop before reaching the actual output.
+            # Require its timestamp/category/event grammar: bare assistant Error:
+            # or info: text is answer content and must remain visible to assertions.
             continue
         lines.append(line)
     answer = "\n".join(lines).strip()
@@ -313,7 +331,7 @@ def _cli(case, context, result):
         item = _process(context, result, args, "cli-" + str(index + 1))
         _check_process(result, item, context["backend"])
         combined = item["stdout"] + "\n" + item["stderr"]
-        _attest_offload(context, result, item["stage"], combined)
+        _attest_offload(context, result, item["stage"], combined, cli=True)
         if kind in {"cli_prefill", "cli_decode"}:
             _require(result, "benchmark executed requested shape", f"prefillTokens={prefill} decodeTokens={decode} runs=1" in combined)
             metrics = re.search(r"benchmark summary:\s*bestPrefillMs=(\S+) bestPrefillTps=(\S+) bestDecodeMs=(\S+) bestDecodeTps=(\S+)", combined)
@@ -790,6 +808,21 @@ def _cancel(http, payload, context, result):
     _require(result, "request-specific early engine abort", True, "matching RequestId + SSE id + ChatAborted with 0<Tokens<512", proof)
 
 
+def _hosted_response_model(loaded, listing, result):
+    # /v1/models advertises the stem, while completion/SSE serializers emit the
+    # loaded filename. HostedModelGuard accepts both exact aliases. Bind the
+    # advertised alias to the already verified loaded file, then request the
+    # filename so every response assertion stays exact and unambiguous.
+    _require(result, "one hosted model advertised", isinstance(listing, list) and len(listing) == 1
+             and isinstance(listing[0], dict) and bool(listing[0].get("id")))
+    advertised = listing[0]["id"]
+    _require(result, "advertised model alias matches loaded file", isinstance(advertised, str) and advertised in {loaded, Path(loaded).stem},
+             [loaded, Path(loaded).stem], advertised)
+    result["evidence"]["model_alias"] = {"loaded_filename": loaded, "advertised_id": advertised,
+                                         "request_model": loaded, "expected_response_model": loaded}
+    return loaded
+
+
 def _server(case, context, result):
     kind = _kind(case)
     with socket.socket() as sock:
@@ -827,19 +860,22 @@ def _server(case, context, result):
         identity = http.json("/api/models")
         _require(result, "loaded backend identity", identity.get("loadedBackend") == context["backend"], context["backend"], identity.get("loadedBackend"))
         _require(result, "loaded model identity", identity.get("loaded") == Path(context["model_path"]).name, Path(context["model_path"]).name, identity.get("loaded"))
+        _attest_offload_architecture(context, result, "server-model", [identity.get("architecture")], "/api/models architecture")
         if kind == "image_generation_smoke":
             _require(result, "Qwen image architecture loaded", identity.get("architecture") == "qwen_image", "qwen_image", identity.get("architecture"))
             from .image_generation import run_image_smoke
             run_image_smoke(http, identity["loaded"], context, result)
             return
         listing = http.json("/v1/models").get("data", [])
-        _require(result, "one hosted model advertised", len(listing) == 1 and bool(listing[0].get("id")))
-        model = listing[0]["id"]
+        model = _hosted_response_model(identity["loaded"], listing, result)
         payload = {"model": model, "messages": [{"role": "user", "content": _PROMPT}], "temperature": 0,
                    "seed": 42, "max_tokens": 128, "think": False, "stream": False}
         if kind == "jev_decision":
             from .jev import run_decisions
             run_decisions(http, model, context, result)
+        elif kind == "jev_text_attachments":
+            from .jev_text_attachments import run_text_attachments
+            run_text_attachments(http, model, context, result)
         elif kind == "server_agents":
             from .agent_regression import run_agents
             run_agents(http, model, context, result)

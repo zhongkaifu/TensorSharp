@@ -84,6 +84,47 @@ class HardwareTests(unittest.TestCase):
             self.assertIn("ggmlops.dll", result["files"])
             self.assertTrue(result["build_flags"]["TENSORSHARP_GGML_NATIVE_ENABLE_CUDA"])
 
+    def test_runtime_inventory_includes_conventional_cuda_kernel_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernels = root / "cuda_kernels"
+            kernels.mkdir()
+            expected = {"tensorsharp.ptx": b"synthetic ptx",
+                        "tensorsharp.fatbin": b"synthetic fatbin",
+                        "tensorsharp.fatbin.sha256": b"synthetic identity sidecar"}
+            for name, contents in expected.items():
+                (kernels / name).write_bytes(contents)
+            # Neither model files, arbitrary sidecars nor deeper trees are assets.
+            for name in ("private.gguf", "notes.json", "unrelated.sha256", "unexpected.dll"):
+                (kernels / name).write_bytes(b"not a kernel")
+            for folder in (kernels / "nested", root / "models"):
+                folder.mkdir()
+                (folder / "excluded.ptx").write_bytes(b"not a conventional asset")
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("inventory must not read payloads")):
+                result = hardware._runtime_evidence([root, kernels])
+            # An explicitly supplied kernels dir may contain its own DLL; the
+            # parent-dir inventory must restrict conventional children to kernels.
+            parent_only = hardware._runtime_evidence([root])["files"]
+            self.assertEqual(set(expected), set(parent_only))
+            for name in expected:
+                self.assertEqual([str(kernels / name)], result["files"][name])
+            self.assertNotIn("excluded.ptx", result["files"])
+
+    def test_conventional_cuda_kernel_inventory_reaches_report_hashes(self):
+        report_spec = importlib.util.spec_from_file_location("regression_reports", MODULE.with_name("reports.py"))
+        reports = importlib.util.module_from_spec(report_spec)
+        report_spec.loader.exec_module(reports)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernels = root / "cuda_kernels"
+            kernels.mkdir()
+            for name in ("test.ptx", "test.fatbin", "test.fatbin.sha256"):
+                (kernels / name).write_bytes(name.encode())
+            assets = reports.runtime_identity({"runtime": hardware._runtime_evidence([root])})
+            self.assertEqual({"test.ptx", "test.fatbin", "test.fatbin.sha256"},
+                             {Path(row["path"]).name for row in assets})
+            self.assertTrue(all(len(row["sha256"]) == 64 and row["size_bytes"] > 0 for row in assets))
+
     def test_unknown_size_or_memory_not_eligible(self):
         self.assertFalse(hardware.plan_resources(None, "cpu", host())["eligible"])
         self.assertFalse(hardware.plan_resources(0, "cpu", host())["eligible"])

@@ -177,6 +177,46 @@
           "role": "projector"
         }
       ]
+    },
+    {
+      "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+      "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+      "architecture": "qwen4exp",
+      "metadata_url": "https://huggingface.co/api/models/unsloth/Qwen3.8-Flash-Next-GGUF/revision/766911a6b7369840a91dbcd95f9f997acaab6cd6?blobs=true",
+      "repository_url": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/766911a6b7369840a91dbcd95f9f997acaab6cd6",
+      "metadata_sha256": "8c80beef666a527023c57be69f0426b3a8985165e3725d6ca73fb21ba8114d67",
+      "metadata_bytes": 27260,
+      "gated": false,
+      "config": "config/qwen3.8-flash-next-iq1_m.json",
+      "base_model": "Qwen/Qwen3.8-Flash-Next",
+      "license": "other",
+      "publisher_reference": "config/qwen3.8-flash-next.json",
+      "files": [
+        {
+          "path": "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf",
+          "size_bytes": 10946624,
+          "sha256": "6584f289c808a486ac33aef20906774bcf6616785535c03b842072951e5112d2",
+          "role": "weights"
+        },
+        {
+          "path": "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf",
+          "size_bytes": 49988981792,
+          "sha256": "a7cbafba2cbc1ccde484ed05e1bbeaef4d67e0924ef51cc8b8de18e62edb5586",
+          "role": "weights"
+        },
+        {
+          "path": "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf",
+          "size_bytes": 24538827360,
+          "sha256": "ae757ff9347651adacc7746f137d8c29b51f25cf6bb27cd49086ef45bd8cc203",
+          "role": "weights"
+        },
+        {
+          "path": "mmproj-BF16.gguf",
+          "size_bytes": 907542944,
+          "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355",
+          "role": "projector"
+        }
+      ]
     }
   ]
 }

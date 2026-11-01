@@ -79,14 +79,29 @@ is distinguishable from a CPU-only wrapper.
 client contract tests. By default these require prebuilt Release assemblies and
 use `--no-build --no-restore`. `--allow-builds` explicitly permits **managed-only**
 build and restore steps, which can fetch NuGet packages. Every managed suite
-`test`, `build` and `restore` command sets `TensorSharpSkipGgmlNative=true` and
-`TensorSharpSkipMlxNative=true`; it never configures or compiles native backends.
+`test`, `build` and `restore` command sets `TensorSharpSkipGgmlNative=true`,
+`TensorSharpSkipMlxNative=true` and `TensorSharpSkipCudaPtx=true`; it never
+configures or compiles native backends. The CUDA flag also suppresses nvcc
+detection, PTX/fatbin selection and copying, and committed-baseline refreshes.
+It requires prebuilt portable-kernel PTX with valid version/target headers under
+the CUDA project's active output `cuda_kernels` directory. Missing assets fail
+clearly even if a committed baseline or intermediate build exists elsewhere.
+Architecture-specific optional kernels remain subject to runtime capability
+checks; these header checks do not qualify CUDA execution. Referencing application
+outputs must also be deployed beforehand: this mode does not stage native assets.
+Existing PTX/fatbin/identity sidecars are retained across SDK incremental cleanup;
+`Clean` and `Rebuild` are rejected while the CUDA skip flag is enabled.
 The suite scopes runtime execution with `TS_TEST_GGML_BACKEND=cpu` instead of
 changing CUDA/Vulkan build flags. Existing native libraries must be prepared
 separately in an isolated build directory following `DEVELOPMENT.md`. Native
 CTest likewise requires an explicit `--native-test-build-dir`; `--allow-builds`
 does not build it. A managed build exit code alone is never a passing test:
 required client assemblies and actual contract/TRX assertion evidence must exist.
+Permitted suite builds run as separate steps, followed by `dotnet test --no-build
+--no-restore`. Before assertions execute, each suite records its own source state,
+project and resulting assembly hashes, plus native deployment candidates including
+the conventional `cuda_kernels` directory. These are distinct from host identities
+captured before the run, and do not claim independent observation of mapped modules.
 The InferenceWeb lane excludes benchmark, real-model, CUDA and MLX requirements;
 their separate coverage remains in the matrix, not inferred from this lane.
 TRX counters must show executed passing tests, and skipped tests are disclosed.
@@ -265,7 +280,12 @@ Repeatability does not establish agreement with an
 independent Transformers/reference implementation.
 
 `jev_decision` runs the repository's 12 labeled text decision fixtures, 36 gold
-decisions, fixed-seed replay and malformed requests. `speculation_ngram` requires
+decisions, fixed-seed replay and malformed requests. `jev_text_attachments` runs
+14 pinned text/document fixtures as inline attachments, including office/PDF text
+extraction, ordered sources and cross-file questions; it requires positive cache
+replay evidence and rejects eight malformed inputs with exact typed errors. Its
+five vision/audio-dependent manifest cases remain explicitly untested, as do
+uploaded-reference and concurrent-isolation paths. `speculation_ngram` requires
 a prebuilt `--benchmark` AgentTurnBench and a source-admitted family/backend;
 it requires actual n-gram verification/acceptance and exact greedy token parity.
 It never enables a learned drafter. `image_generation_smoke` runs Qwen base/Turbo

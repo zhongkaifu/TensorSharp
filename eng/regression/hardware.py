@@ -135,9 +135,21 @@ def _runtime_evidence(runtime_dirs: list[str | Path]) -> dict[str, Any]:
         candidates = list(directory.glob("*"))
         # Only inspect conventional native asset subdirectories, never model trees.
         candidates += list(directory.glob("runtimes/*/native/*"))
+        kernel_directory = directory / "cuda_kernels"
+        if kernel_directory.is_dir() and kernel_directory.resolve().is_relative_to(directory):
+            # CUDA deployments put the loaded PTX/fatbin pair and its identity
+            # sidecar here. Stay one level deep and do not follow file links to
+            # unrelated trees; callers can name another runtime dir explicitly.
+            candidates += [path for path in kernel_directory.glob("*")
+                           if (path.suffix.lower() in (".ptx", ".fatbin")
+                               or path.name.lower().endswith(".fatbin.sha256"))
+                           and not path.is_symlink() and path.resolve().is_relative_to(directory)]
         for candidate in candidates:
-            if candidate.is_file() and (candidate.suffix.lower() in (".dll", ".so", ".dylib", ".ptx", ".fatbin") or ".so." in candidate.name):
-                files.setdefault(candidate.name.lower(), []).append(str(candidate))
+            if candidate.is_file() and (candidate.suffix.lower() in (".dll", ".so", ".dylib", ".ptx", ".fatbin")
+                                        or ".so." in candidate.name or candidate.name.lower().endswith(".fatbin.sha256")):
+                paths = files.setdefault(candidate.name.lower(), [])
+                if str(candidate) not in paths:
+                    paths.append(str(candidate))
         for cache in (directory / "CMakeCache.txt", directory.parent / "CMakeCache.txt"):
             if not cache.is_file():
                 continue

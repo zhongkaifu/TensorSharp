@@ -11,7 +11,7 @@ cells separately from passes.
 The machine-readable inventory is
 [`config/regression/catalog.json`](../config/regression/catalog.json), checked
 against [`catalog.schema.json`](../config/regression/catalog.schema.json).
-It inventories all 66 host presets, overlays and LoRA documents under `config/`
+It inventories all 67 host presets, overlays and LoRA documents under `config/`
 (excluding its own `config/regression/` metadata), 23 architecture/embedding/
 special-quantization family records and seven backend names. The audit report
 records the current scenario count and execution classification.
@@ -48,7 +48,7 @@ companions and requested scenario may narrow these sets further.
 |---|---|---|
 | Gemma 4 | E4B, 12B, 26B-A4B; dense and MoE | Seven routes; matching media/MTP companions needed. Quantized KV is declined. Other sizes/quants require separate qualification. |
 | Qwen 3.5/3.6/3.8 27B | Dense 0.8B/9B/27B, MoE 35B-A3B; portable small 0.8B and non-agent 3.8 presets added | Seven routes; direct CUDA whole-model fast path depends on quantization. Image coverage requires matching projector. |
-| Qwen3.8 Flash Next | Complete three-shard preset, vision; MTP overlay added | Six routes, MLX refused. Shared MTP head only on GGML. Sparse attention requires f16/f32 KV. No automatic assumption that SSD offload makes the model fit. |
+| Qwen3.8 Flash Next | Separate complete three-shard UD-Q2_K_XL and UD-IQ1_M presets, vision; MTP overlay added | Six family routes, MLX refused; IQ1_M preset conservatively omits direct CUDA until its mixed tensor layouts are qualified. Shared MTP head only on GGML. Sparse attention requires f16/f32 KV. No automatic assumption that SSD offload makes the model fit. |
 | Bonsai2 | PTQ1_0 + optional projector added | Single-device four GGML routes only. PTQ1_0 repacks about 29% larger; download size is not resident weight size. PQ2_0 and other variants remain separate coverage. |
 | GPT-OSS | 20B Q8_0 | Seven routes; MoE, always reasons, text only. |
 | Nemotron | H8B/H47B, 3 Nano Omni, 3.5 Lightning added | Seven generic routes; Omni image needs projector, audio needs a separately converted Parakeet companion. Speculation is refused. |
@@ -72,14 +72,15 @@ The first 12 new family presets copy immutable URLs, SHA-256 and file identities
 `ModelCatalog.cs` and the Bonsai2 card. These are repository-source provenance
 checks; they do not claim fresh network validation or model execution.
 
-Four additional presets use fresh metadata-only verification on
+Five additional presets use fresh metadata-only verification on
 2026-11-01. Each publisher manifest was reread at its immutable revision, with
 an exact repository architecture, ungated status and complete LFS file
 SHA-256/size entries: [Muse-Glimmer](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/tree/faa5b025c584459c13febfa5c59883516710ae39),
 [Muse-Spark](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/tree/c00670568b6ce5e56a247f67091247984df2a01e),
 [MiniMax-M3.1](https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/tree/b17b7f5459c0b8f127ea12ee774409b282521d6a),
-and [Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/tree/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0).
-The 20 selected file identities and metadata response hashes are preserved in
+[Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/tree/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0),
+and [Qwen3.8 Flash Next IQ1_M](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/766911a6b7369840a91dbcd95f9f997acaab6cd6/UD-IQ1_M).
+The 24 selected file identities and metadata response hashes are preserved in
 [`source-pins.json`](../config/regression/source-pins.json). No model weights
 were downloaded for this verification. Every registered family now has at
 least a representative config, which does not cover every size, quantization,
@@ -93,6 +94,18 @@ SHA-256 values still require verification before execution. The publisher's
 metadata identifies the official `Qwen/Qwen3.5-0.8B` base and the implemented
 `qwen35` architecture. `DirectCudaRealModelTests` already contains a 0.8B
 regression target; that source evidence does not mean it ran in this session.
+
+The IQ1_M preset uses the separate `Qwen3.8-Flash-Next-GGUF` directory layout.
+Its three trunk files total 74,538,755,776 bytes, and the optional matching
+BF16 projector is 907,542,944 bytes. Their immutable publisher hashes match the
+supplied inventory identities; this source audit did not reread the local
+weights. The existing Q2_K_XL preset and its file identities remain distinct.
+Direct CUDA's expert decoder does not admit GGUF IQ1_M tensors; the quantization
+filename alone does not establish the individual tensor types of a mixed
+checkpoint. The new preset therefore retains the managed CPU and four GGML
+routes, with direct CUDA pending separate tensor-layout qualification. This
+is a conservative preset restriction, not a claim that every IQ1_M-named
+checkpoint is incompatible with direct CUDA.
 
 No speculative model URL, revision or checksum was invented. Known byte sizes
 are copied into catalog `file_sizes` by matching SHA-256; absent sizes remain
@@ -150,7 +163,18 @@ outputs normalize to RGBA8; legal 16-bit/Adam7 encodings are explicitly untested
 with their local artifact and header retained. Seeded output hashes are observations;
 this adapter does not qualify semantic image quality or universal bitwise
 determinism. Invalid bounded payloads remain local diagnostic artifacts.
-Jev attachment/ASR checks remain a separate `jev_media` recipe.
+`jev_text_attachments` executes the 14 manifest cases requiring no extra media
+service: text/CSV/JSON/HTML, PDF text layers, DOCX/XLSX/PPTX, a plain-text control,
+ordered/reversed source pairs, cross-file decisions and eight attachments. It
+checks pinned fixture bytes, all gold decisions, attachment order and extraction
+diagnostics, a positive extraction-cache replay and eight exact typed validation
+errors. Fixture `.gitattributes` preserves the pinned bytes, including PDF offsets,
+on Windows; legacy text CRLF normalization is accepted only when it recovers the
+exact pinned bytes, with original and submitted identities recorded. No binary
+normalization is accepted. Inline fixtures stay in scenario-local upload storage.
+Vision/video/ASR and uploaded-reference transport remain separate `jev_media`
+recipes; office formatting, embedded figures and formula recalculation are not
+qualified by text extraction.
 
 `server_agents` exercises two named read-only arithmetic reviewers using only
 host coordination tools, with skills/code execution disabled. Successful spawn
@@ -185,6 +209,10 @@ protocol correctness.
   the Q8_0 checkpoint does not use the NVFP4-only whole-model CUDA executor.
 - `qwen3.8-flash-next-mtp.json` is an overlay, requiring the base Flash Next
   config. It must not be treated as a standalone model.
+- `qwen3.8-flash-next-iq1_m.json` separately pins the supplied three IQ1_M
+  shards. The projector remains optional for text, and no offload or speculative
+  decoding policy is silently enabled. Explicit CPU-MoE runs require their
+  own resident RAM/VRAM peak requirements; download size is not a fit guarantee.
 - LTX README text now reflects its runnable ungated required assets; optional
   gated Ingredients remains a separately reportable blocker.
 - [`host-config.schema.json`](../config/regression/host-config.schema.json)
@@ -198,8 +226,8 @@ turn a missing file/device/fixture into a successful result. Keep generated
 reports in ignored `artifacts/` or `docs/validation/`; reusable tools and
 fixtures belong outside generated evidence directories.
 
-This implementation session performed source/config and lightweight harness
-validation only. GPU loads, large downloads and native builds were held for
-the separate MoE repair task. Windows model execution, Linux/WSL model
-execution, macOS, multi-GPU and distributed qualification therefore remain
-unrun in this session; no remote Mac was accessed.
+The config/source additions above were checked with source metadata, schemas
+and lightweight harness tests. Those checks did not read model payloads or
+execute models. Actual model, backend and platform qualification belongs to
+the separately recorded execution reports; it cannot be inferred from this
+inventory. No remote Mac was accessed during this config audit.

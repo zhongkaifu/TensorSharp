@@ -1,5 +1,6 @@
 """Test existing-suite orchestration with synthetic logs/TRX and mocked processes."""
 from contextlib import ExitStack
+import hashlib
 from pathlib import Path
 import sys
 import tempfile
@@ -59,6 +60,7 @@ class SuiteTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(suites, "list_suites", return_value=[self.spec]))
+        self.stack.enter_context(patch.object(suites, "source_identity", return_value={"commit": "synthetic-suite-source"}))
         self.dotnet = self.stack.enter_context(patch.object(suites.shutil, "which", return_value="dotnet"))
         self.process = self.stack.enter_context(patch.object(suites, "run_process"))
         self.xml = trx()
@@ -113,7 +115,12 @@ class SuiteTests(unittest.TestCase):
                         managed.append(command)
                         self.assertEqual(1, command.count("-p:TensorSharpSkipGgmlNative=true"))
                         self.assertEqual(1, command.count("-p:TensorSharpSkipMlxNative=true"))
-                        self.assertNotIn("--no-build", command)
+                        self.assertEqual(1, command.count("-p:TensorSharpSkipCudaPtx=true"))
+                        if command[1] == "test":
+                            self.assertIn("--no-build", command)
+                            self.assertIn("--no-restore", command)
+                        else:
+                            self.assertNotIn("--no-build", command)
                         self.assertFalse(any("ENABLE_CUDA" in arg or "ENABLE_VULKAN" in arg for arg in command))
                 self.assertTrue(managed)
 
@@ -123,6 +130,44 @@ class SuiteTests(unittest.TestCase):
         self.assertIn("--no-build", command)
         self.assertIn("-p:TensorSharpSkipGgmlNative=true", command)
         self.assertIn("-p:TensorSharpSkipMlxNative=true", command)
+        self.assertIn("-p:TensorSharpSkipCudaPtx=true", command)
+
+    def test_identity_is_recorded_after_build_before_test_with_native_candidates(self):
+        native = self.repo / "GgmlOps.dll"
+        native.write_bytes(b"original native")
+        kernel = self.repo / "cuda_kernels" / "tensorsharp_kernels.ptx"
+        kernel.parent.mkdir()
+        kernel.write_bytes(b"prebuilt PTX")
+        built_contents = b"new managed assembly"
+
+        def process(command, **kwargs):
+            if command[1] == "build":
+                self.binary.write_bytes(built_contents)
+            else:
+                # This mutation after launch must not replace pre-execution identity.
+                self.binary.write_bytes(b"modified during test")
+                (kwargs["artifact_dir"] / "tests.trx").write_text(self.xml)
+            return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+        self.process.side_effect = process
+        result = self.invoke(allow_builds=True)[-1]
+        self.assertEqual("pass", result["status"])
+        self.assertEqual(["build", "test"], [call.args[0][1] for call in self.process.call_args_list])
+        identity = result["execution_identity"]
+        self.assertEqual("synthetic-suite-source", identity["source"]["commit"])
+        self.assertEqual(hashlib.sha256(built_contents).hexdigest(), identity["assemblies"][0]["sha256"])
+        candidates = {Path(item["path"]).name: item["sha256"] for item in identity["runtime_candidates"]}
+        self.assertEqual(hashlib.sha256(b"original native").hexdigest(), candidates["GgmlOps.dll"])
+        self.assertEqual(hashlib.sha256(b"prebuilt PTX").hexdigest(), candidates["tensorsharp_kernels.ptx"])
+
+    def test_build_cannot_leave_trx_that_substitutes_for_test_execution(self):
+        def process(command, **kwargs):
+            if command[1] == "build":
+                (kwargs["artifact_dir"] / "tests.trx").write_text(self.xml)
+            return {"exit_code": 0, "stdout": "PASS build", "stderr": ""}
+
+        self.process.side_effect = process
+        self.assertEqual("fail", self.invoke(allow_builds=True)[-1]["status"])
 
     def test_successful_managed_build_without_contract_assembly_is_failure(self):
         for kind, expected_calls in (("client_native", 1), ("client_http", 2)):
