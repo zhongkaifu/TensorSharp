@@ -814,7 +814,8 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     # The production MoE selector must return compact, score-ordered IDs before
     # weight normalization and expert accumulation. No model checkpoint needed.
     add_executable(GgmlOpsOrderedMoeRoutingTest tests/ordered_moe_routing_test.cpp)
-    target_include_directories(GgmlOpsOrderedMoeRoutingTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_include_directories(GgmlOpsOrderedMoeRoutingTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
     target_link_libraries(GgmlOpsOrderedMoeRoutingTest PRIVATE ggml-cpu ggml-base)
     add_test(NAME ordered-moe-routing-cpu COMMAND GgmlOpsOrderedMoeRoutingTest cpu)
     set_tests_properties(ordered-moe-routing-cpu PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
