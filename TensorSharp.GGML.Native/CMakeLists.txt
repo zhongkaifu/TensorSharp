@@ -1210,7 +1210,14 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_include_directories(GgmlOpsMiniMaxM3ExecTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
     )
-    target_link_libraries(GgmlOpsMiniMaxM3ExecTest PRIVATE GgmlOps)
+    if (WIN32)
+        # The synthetic GGUF writer calls APIs not exported by GgmlOps.dll.
+        # Keep the static archive first to avoid duplicate imported ggml symbols;
+        # only the written fixture filename crosses the DLL boundary.
+        target_link_libraries(GgmlOpsMiniMaxM3ExecTest PRIVATE ggml-base GgmlOps)
+    else()
+        target_link_libraries(GgmlOpsMiniMaxM3ExecTest PRIVATE GgmlOps)
+    endif()
     add_test(NAME minimax-m3-exec-cpu COMMAND GgmlOpsMiniMaxM3ExecTest cpu)
     set_tests_properties(minimax-m3-exec-cpu PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
