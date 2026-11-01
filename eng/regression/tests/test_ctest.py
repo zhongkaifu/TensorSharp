@@ -69,6 +69,33 @@ class CTestTests(unittest.TestCase):
         self.assertEqual([row["status"] for row in rows], ["pass", "skip", "fail"])
         self.assertEqual(rows[2]["reason"], "wrong row")
 
+    def test_ctest_message_only_failure_retains_reason_and_assertion_output(self):
+        # Actual CTest format from the native CPU regression; assertion details
+        # are in system-out rather than inside the failure element.
+        self.xml.write_text('<testsuite><testcase name="one" status="fail"><failure message="Failed"/>'
+                            '<system-out>QUANT_STRIP_MISMATCH actual=0.643071175 expected=0.643071234</system-out>'
+                            '</testcase></testsuite>')
+        row = ctest.parse_results(self.xml, [case("one")])[0]
+        self.assertEqual(row["status"], "fail")
+        self.assertEqual(row["reason"], "Failed")
+        self.assertIn("QUANT_STRIP_MISMATCH", row["stdout"])
+        self.assertNotIn("skipped", row["reason"])
+
+    def test_error_message_and_body_both_retained(self):
+        self.xml.write_text('<testsuite><testcase name="one"><error message="Process crashed">'
+                            'exception details</error></testcase></testsuite>')
+        row = ctest.parse_results(self.xml, [case("one")])[0]
+        self.assertEqual(row["status"], "fail")
+        self.assertEqual(row["reason"], "Process crashed\nexception details")
+
+    def test_empty_failure_never_uses_skip_reason_or_overrides_failure_with_skip(self):
+        for extra in ('', '<skipped message="fixture unavailable"/>'):
+            with self.subTest(extra=extra):
+                self.xml.write_text('<testsuite><testcase name="one"><failure/>' + extra + '</testcase></testsuite>')
+                row = ctest.parse_results(self.xml, [case("one")])[0]
+                self.assertEqual(row["status"], "fail")
+                self.assertEqual(row["reason"], "native test failed; see retained stdout/stderr")
+
     def test_missing_extra_duplicate_test_or_nonfinite_timing_fails(self):
         for content in ('<testsuite/>', '<testsuite><testcase name="other"/></testsuite>',
                         '<testsuite><testcase name="one"/><testcase name="one"/></testsuite>',

@@ -96,11 +96,17 @@ def parse_results(path, selected):
         if not 0 <= duration < float("inf"):
             raise ValueError("invalid native test duration")
         status = "fail" if failures else "skip" if skipped is not None else "pass"
-        text = "\n".join("".join(item.itertext()) for item in failures)
-        if skipped is not None:
+        # CTest commonly emits <failure message="Failed"/> and keeps the
+        # actual assertion diagnostics in system-out. An empty element body
+        # must not discard its message or describe the failure as a skip.
+        text = "\n".join("\n".join(part for part in (item.get("message", "").strip(),
+                                                    "".join(item.itertext()).strip()) if part)
+                         for item in failures)
+        if not failures and skipped is not None:
             text = skipped.get("message", "") + " " + "".join(skipped.itertext())
         results.append({"id": "native_ctest::" + name, "status": status,
-                        "reason": text.strip() or ("native assertions passed" if status == "pass" else "native test skipped"),
+                        "reason": text.strip() or {"pass": "native assertions passed", "fail": "native test failed; see retained stdout/stderr",
+                                                    "skip": "native test skipped"}[status],
                         "duration_seconds": duration, "command": expected[name].get("command", []),
                         "stdout": row.findtext("system-out", ""), "stderr": row.findtext("system-err", "")})
     return results
