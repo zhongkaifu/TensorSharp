@@ -22,18 +22,19 @@ import urllib.request
 import uuid
 
 from .processes import ManagedProcess, redact, run_process, secret_values
+from .scenario_profiles import PROFILE_MODULES
 
 ADAPTER_IDS = frozenset({
     "cli_text", "cli_prefill", "cli_decode", "cli_multi_turn", "cli_tools", "cli_thinking",
     "cli_image", "cli_audio", "cli_video", "forced_logits", "forced_logits_sequence", "server_chat", "server_stream",
     "server_cancel", "server_reset_cache", "server_structured", "server_tools", "server_embeddings", "server_agents",
     "jev_decision", "jev_text_attachments", "image_generation_smoke", "speculation_ngram", "client_http_live", "retrieval_vector_cpu",
-})
+}) | frozenset(PROFILE_MODULES)
 _LOGIT_BACKENDS = {"cpu", "cuda", "ggml_cpu", "ggml_cuda", "ggml_metal"}
 _CONFIG_KEYS = {"model", "mmproj", "draft-model", "tokenizer", "kv-cache-dtype", "embedding-threads",
                 "embeddings", "model-type", "qwen-image-variant", "qwen-image-vae", "qwen-image-vl",
                 "qwen-image-mmproj", "video-dit2", "video-vae", "video-text-encoder", "audio-vae",
-                "video-frames", "video-fps", "spec"}
+                "video-frames", "video-fps", "video-upscaler", "spec"}
 _NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 _PROMPT = "What is 7 multiplied by 8? Reply with only the integer answer."
 # Bounds describe existing fixture shapes; they never change prompts or decode
@@ -86,6 +87,11 @@ def availability(case, context):
         minimum = 2048  # An arbitrary caller prompt has no fixed token bound.
     if tokens < minimum:
         return False, f"{kind} requires context_tokens >= {minimum}; selected {tokens}; fixed fixture inputs and steps are unchanged"
+    if kind in PROFILE_MODULES:
+        if not context.get("scenario_profile"):
+            return False, "provide --scenario-profiles with typed parameters, approved fixtures and total peak resource requirements"
+        from .scenario_profiles import adapter
+        return adapter(kind).availability(case, context)
     if kind == "speculation_ngram":
         from .speculation import availability as ngram_available
         return ngram_available(context)
@@ -1154,7 +1160,12 @@ def run_scenario(case, context):
     interrupted = False
     try:
         kind = _kind(case)
-        if kind == "forced_logits_sequence":
+        if kind in PROFILE_MODULES:
+            from .scenario_profiles import adapter
+            adapter(kind).run(case, context, result)
+            _require(result, "profile executed meaningful assertions", bool(result["assertions"]) and
+                     all(assertion.get("passed") is True for assertion in result["assertions"]))
+        elif kind == "forced_logits_sequence":
             _logits_sequence(case, context, result)
         elif kind == "forced_logits":
             _logits(case, context, result)

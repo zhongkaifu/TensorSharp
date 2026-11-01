@@ -101,6 +101,7 @@
         "id": {"type": "string", "minLength": 1},
         "entry_point": {"type": "string", "minLength": 1},
         "status": {"enum": ["automated", "suite", "recipe", "unsupported"]},
+        "execution": {"enum": ["profile"]},
         "recipe": {"type": "string", "minLength": 1},
         "assertions": {"$ref": "#/$defs/strings"},
         "evidence": {"$ref": "#/$defs/strings"},

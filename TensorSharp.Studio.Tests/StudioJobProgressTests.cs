@@ -169,8 +169,10 @@ public sealed class StudioJobProgressTests : IDisposable
     public async Task AGenerationReportsItsStageStepsAndTimesAndKeepsAStageBreakdown()
     {
         Directory.CreateDirectory(root);
-        var adapter = new SteppedDouble(await FixtureAsync());
+        var adapter = new SteppedDouble(Path.Combine(root, "fixture.mp4"));
         await using var service = new StudioService(root, adapter); await RequireMediaAsync(service);
+        // Check dependencies before FixtureAsync launches FFmpeg, so absence is an explicit skip.
+        await FixtureAsync();
         var p = await service.CreateProjectAsync("Progress", 64, 64);
         var request = new StudioGenerationRequest { ProjectId = p.Id, ModelId = "stepped-double", Prompt = "A slow pan across a quiet harbour at dawn.", Width = 64, Height = 64, Seed = 7, GenerateAudio = true };
 
@@ -210,10 +212,12 @@ public sealed class StudioJobProgressTests : IDisposable
     {
         Directory.CreateDirectory(root);
         string projectId, jobId;
-        var adapter = new SteppedDouble(await FixtureAsync());
+        var adapter = new SteppedDouble(Path.Combine(root, "fixture.mp4"));
         await using (var service = new StudioService(root, adapter))
         {
-            await RequireMediaAsync(service); projectId = (await service.CreateProjectAsync()).Id;
+            await RequireMediaAsync(service);
+            await FixtureAsync();
+            projectId = (await service.CreateProjectAsync()).Id;
             jobId = (await service.StartGenerationAsync(new() { ProjectId = projectId, ModelId = "stepped-double", Prompt = "Rain on a window.", Width = 64, Height = 64 })).Id;
             await adapter.Parked.Task.WaitAsync(TimeSpan.FromSeconds(10));
             await Until(service, projectId, jobId, j => j.Step == 2);

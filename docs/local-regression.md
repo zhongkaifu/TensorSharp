@@ -11,54 +11,63 @@ their scope and recipes are inventoried in
 
 This is a bounded regression suite, not a claim that every architecture, hardware,
 quantization, context length, or feature combination has passed. An executable
-adapter, a supported recipe, and an actual passing result are different things.
-The catalog records source support, adapters and recipes; execution reports record
+adapter, a typed execution profile, and an actual passing result are different things.
+The catalog records source support and execution requirements; execution reports record
 actual outcomes. It inventories 67 config documents: 50 standalone presets,
 16 LoRA plugins and one MTP overlay. Its 44 scenario definitions comprise
-25 executable adapters, five global suite categories and 14 recipes. These are
-coverage declarations, not counts of qualified models or passing tests. Broader
-image quality/editing, video generation, learned speculative variants, agent
-workflows and distributed/multi-GPU paths retain explicit gaps.
+25 default adapters, 14 profile-driven executors and five global suite categories.
+These are coverage declarations, not counts of qualified models or passing tests.
+Profile executors require explicit model roles, local fixtures, independent
+oracles and resource declarations. Unrun hardware, unsupported submodes and
+broader quality or concurrency claims remain visible gaps. A
+[Chinese deployment guide](local-regression.zh-CN.md) is also available.
 
-## 本地快速开始
+## Start with an audit and a plan
 
-先检查配置覆盖和本机计划，不下载权重、不初始化 GPU：
+Audit config coverage and inspect local eligibility without loading a model:
 
 ```powershell
 python eng/run-local-regression.py --mode audit
 python eng/run-local-regression.py --mode plan --model-root C:\work\model
 ```
 
-已有模型放在不同目录时，明确提供查找根目录。仅按唯一文件名匹配，分片必须同目录；
-真正执行前会校验文件大小、完整性及配置中的 SHA-256。不会覆盖或删除已有模型。
+Keep existing weights in place and select a separate cache for new files.
+Discovery uses unique filenames, with shards in the same directory; actual
+execution verifies complete file sizes and SHA-256 identities before loading them:
 
 ```powershell
 python eng/run-local-regression.py --mode plan --model-root .\models --existing-root C:\work\model
 ```
 
-默认离线计划无法知道缺失权重大小时会标记跳过。允许只查询已固定来源的 HTTP
-响应头以完善计划：
+Optional metadata probes resolve unknown file sizes from the configured sources.
+Enable those probes explicitly when needed:
 
 ```powershell
 python eng/run-local-regression.py --mode plan --probe-network --allow-download --max-download-gib 20
 ```
 
-上面的 `plan` 不下载载荷；`--allow-download` 仅用于展示下载允许时的计划。
-完整执行需显式指定 `--mode run`。模型按顺序准备，下载总量受上限控制：
+`plan` never downloads weight payloads. `--allow-download` authorizes downloads
+only in `--mode run`, within the transfer budget. Start execution with a small
+selected model and a deployed host:
 
 ```powershell
 python eng/run-local-regression.py --mode run --models embedding-minilm --backend ggml_cpu --server .\TensorSharp.Server.Host\bin\TensorSharp.Server.Host.dll --model-root C:\work\model --allow-download --max-download-gib 1
 ```
 
-在已经部署对应 CLI/server/probe 的机器上，可遍历所有配置和已适配场景：
+After deploying the CLI, server, probe and selected test assemblies, a broader
+invocation can use the same cache:
 
 ```powershell
 python eng/run-local-regression.py --mode run --backend auto --allow-download --max-download-gib 40 --model-root C:\work\model --include-suites
 ```
 
-`auto` 在有本机能力证据且资源预算满足的 backend 中选择一个，报告记录选择理由。
-`--backend ggml_cuda` 等明确请求不会回落；`--backend all` 才会逐一测试配置声明的
-所有 backend。`--models` 和 `--scenarios` 接受逗号分隔的 ID 通配符。
+For default adapters, `auto` considers source support, available runtimes and
+selected scenario compatibility. An explicit `--backend ggml_cuda` retains that
+requested identity; fallback cannot count as CUDA coverage. `--backend all`
+plans the declared backends separately. `--models` and `--scenarios` accept
+comma-separated catalog ID patterns. Profile-backed scenarios additionally need
+the [typed profile file](#typed-scenario-profiles) described below; a broad run
+does not invent its fixtures or turn missing profiles into passes.
 
 ## Deploy binaries and test projects
 
@@ -306,6 +315,167 @@ For example, `--context-tokens 256 --scenarios cli_text,forced_logits` selects
 bounded checks without shrinking their fixtures. A sequence-order test selected
 with that context is reported as skipped, not replaced with a shorter sequence.
 
+## Typed scenario profiles
+
+`--scenario-profiles PATH` supplies explicit inputs for the 14 profile-driven
+scenarios in the [execution matrix](local-regression-coverage.md#profile-driven-execution-matrix).
+These scenarios run automatically once their typed profile, verified files,
+executables and budgets are available. The runner never manufactures a passing
+oracle from the candidate's own output. The common
+[JSON Schema](../config/regression/scenario-profiles.schema.json) describes the
+envelope; [the loader](../eng/regression/scenario_profiles.py) and each executor's
+`validate_profile` function also enforce scenario-specific fields and limits.
+Passing the common schema alone is insufficient.
+
+Use a UTF-8 JSON document with `schema_version: 1` and a `profiles` array. The
+loader also accepts the repository's JSONC comments and trailing commas. Unknown
+common fields and unknown executor parameters are rejected. Documents are limited
+to 1 MiB and 128 profiles. Each profile has the following contract:
+
+| Field | Meaning |
+|---|---|
+| `id` | Unique safe identifier; the result ID is `profile::<id>` |
+| `scenario` | Exact profile-backed scenario ID |
+| `preset` | Exact catalog preset ID for the implicit primary model |
+| `backend` | One exact backend ID; profiles do not substitute another backend |
+| `models` | Executor-defined companion role to catalog preset ID, such as `embedding`; not model URLs or shell commands |
+| `fixtures` | Named local files, each with `path` and a 64-hex `sha256`; relative paths resolve against the profile document directory |
+| `parameters`, `expected` | Strict executor-specific inputs and independent semantic/numerical oracles |
+| `resources` | Explicit positive, finite total `ram_required_gib`; `vram_required_gib` is additionally required for GPU backends; optional `per_gpu_required_gib` and `scratch_gib` |
+
+Omit unused CPU VRAM and scratch fields instead of setting them to zero. Model
+roles reference existing verified catalog sources. The runner retains required
+weights and downloads optional companions only when the executor needs that
+option, such as a media projector; optional draft/media weights are not fetched
+for unrelated scenarios. Identical resolved files are prepared once even when
+multiple roles use them. Every concurrently resident instance still counts in
+the memory declaration. `native_unit` is model-free: its `preset` is only a
+selection/classification key, and it neither resolves nor downloads model weights.
+
+Fixture paths must be local, with no URL or UNC path. Files must be nonempty and
+at most 512 MiB; executor-specific limits are smaller. For example, the Jev media
+executor admits bounded PNG, MP4 and WebM fixtures up to 2 MiB, with image/video
+dimensions at most 512 per side and video at most 10 seconds/32 frames. Valid
+unhandled image encodings remain untested. Audio/ASR is outside that executor.
+Fixture hashes are verified before preparation and rechecked after downloads.
+Missing fixtures or tools remain explicit prerequisites; they never count as
+passes. Use public or synthetic fixtures approved for this task. Hashing pins
+identity but does not establish provenance, licensing or oracle correctness.
+
+Memory declarations cover the combined peak of the primary model, all resident
+companions/roles, staging buffers and workspace. They are caller estimates, not
+measured guarantees or an implicit offload policy. Profile runs currently use
+full residency and do not combine with `--cpu-moe`. Machine RAM/VRAM budgets and
+headroom still apply. `per_gpu_required_gib` uses physical device indices and
+checks each device's **free** VRAM independently; two GPUs' memory is never pooled
+to admit one oversized allocation. Multi-GPU profiles must declare each selected
+device. Remote distributed profiles additionally require explicit authorized
+Linux nodes, preinstalled matching assets, pinned manifests, SSH authentication
+and known hosts; they do not discover, deploy to or download models on machines.
+
+Every distributed node must also provide a unique, lowercase
+`expected_machine_id_sha256`. On each already authorized Linux node, the operator
+can obtain this pin with the following read-only command; the runner does not
+discover nodes or collect pins on the operator's behalf:
+
+```sh
+sha256sum /etc/machine-id
+```
+
+Copy the digest of the **exact raw file bytes, including any trailing newline**;
+do not hash trimmed text. The remote worker checks this pin before creating its
+run directory, inspecting resource budgets, hashing model files or launching a
+probe/anchor process. A mismatch is a hard failure before model launch. Duplicate expected
+pins are rejected during profile validation, and the returned identity is checked
+again against the pin. A machine ID identifies an OS instance, not independent
+physical hardware: containers or VMs can share host resources. The operator must
+provide separate valid allocations and budgets for every selected node; unique
+pins alone do not prove resource isolation.
+
+`scratch_gib` reserves additional artifact/workspace capacity on `--output`'s
+volume. Download remainder is charged to the model/cache volume. When both paths
+share a volume, the planner checks their combined demand; otherwise each volume
+must satisfy its own demand and disk headroom. Scenario-specific logit/media
+guards still apply. RAM, free VRAM, per-device budgets, artifact space and fixture
+identity are checked again after model preparation, before execution. A changed
+resource situation can stop launch while retaining verified cached weights.
+
+`--models` matches the profile's primary `preset`, `--scenarios` matches its
+scenario, and an explicit `--backend` list filters its declared backend. `auto`
+and `all` retain a profile's exact declared backend; they do not rewrite it.
+There is no profile-ID selector: put only the desired matching profiles in the
+supplied file when narrowing further. For scenarios bound to catalog presets,
+each selected preset/backend combination without a matching selected profile
+retains an `untested` row. A profile for one model or device cannot hide another
+selected combination's gap; an unresolved `auto` request stays labeled `auto`.
+Only profile classes without preset bindings use a single
+`catalog::<scenario-id>`, `scope=catalog`, `status=untested` row when no profile
+is supplied, without inventing a model/backend association.
+Global `--include-suites` and native CTest selection remain independent.
+
+### Example: a synthetic grounded retrieval profile
+
+Run the following PowerShell in the checkout to create an original document and
+its real SHA-256. The primary Qwen chat model and the MiniLM CPU embedding sidecar
+are separate resident models. The declared 8 GiB is an illustrative combined
+planning estimate; establish a suitable peak requirement on the target machine.
+This example exercises grounded answers, source URLs and collection isolation;
+it does not claim OCR, reranking or tenant authorization coverage.
+
+```powershell
+$profileDir = Join-Path (Get-Location) 'artifacts\profiles\retrieval-demo'
+$ErrorActionPreference = 'Stop'
+New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+$fixturePath = Join-Path $profileDir 'document.txt'
+$profileFile = Join-Path $profileDir 'retrieval.json'
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+$document = 'The designated maintenance code for LANTERN-STATION is COBALT-7319.'
+[System.IO.File]::WriteAllText($fixturePath, $document, $utf8)
+$sha256 = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $documentSha = ([BitConverter]::ToString($sha256.ComputeHash(
+        [System.IO.File]::ReadAllBytes($fixturePath)))).Replace('-', '').ToLowerInvariant()
+} finally {
+    $sha256.Dispose()
+}
+$profile = @{
+    schema_version = 1
+    profiles = @(@{
+        id = 'qwen08-document-retrieval'
+        scenario = 'retrieval'
+        preset = 'qwen3.5-0.8b'
+        backend = 'cpu'
+        models = @{ embedding = 'embedding-minilm' }
+        fixtures = @{ document = @{ path = 'document.txt'; sha256 = $documentSha } }
+        parameters = @{
+            embedding_backend = 'cpu'
+            question = 'What is the maintenance code for LANTERN-STATION? Cite the source URL.'
+            search_query = 'LANTERN-STATION maintenance code'
+            max_tokens = 384
+        }
+        expected = @{ answer_contains = 'COBALT-7319'; source_excerpt = $document }
+        resources = @{ ram_required_gib = 8 }
+    })
+}
+[System.IO.File]::WriteAllText($profileFile, ($profile | ConvertTo-Json -Depth 12), $utf8)
+```
+
+Plan using an already deployed host; `plan` does not start it:
+
+```powershell
+python eng/run-local-regression.py --mode plan --models qwen3.5-0.8b `
+  --scenarios retrieval --scenario-profiles $profileFile `
+  --model-root D:\TensorSharp-models --existing-root C:\work\model `
+  --server .\TensorSharp.Server.Host\bin\TensorSharp.Server.Host.dll
+```
+
+For execution, change to `--mode run`, use a fresh `--output` directory and, if
+the verified weights are absent, add `--allow-download --max-download-gib 2`.
+Add `--strict` to require the selected case to execute and satisfy its assertions.
+Reports retain the profile document hash, resolved role/file identities, fixture
+hashes, expected/actual evidence and reproduction arguments. Generated media and
+large oracle artifacts remain local; no upload or publication occurs.
+
 ## Executed assertions and safe fixtures
 
 CLI adapters assert task-specific text, positive prefill/decode metrics, multi-turn
@@ -371,7 +541,8 @@ The primary CPU backend is API-attested. The independent sidecar's CPU backend
 is explicitly configured and source-admitted; its public API exposes the
 weight/prefix identity but no backend telemetry. Grounded answers and citations,
 reranking, OCR/media, persistence across restart, concurrency and tenant ACLs
-remain outside this adapter; the broader `retrieval` recipe stays untested.
+remain outside this adapter. The explicit `retrieval` profile adds paired
+chat/embedding execution with grounded-answer and source-URL assertions.
 Collection IDs constrain retrieval scope and are not authorization credentials.
 
 `jev_decision` runs the repository's 12 labeled text decision fixtures, 36 gold
@@ -379,16 +550,18 @@ decisions, fixed-seed replay and malformed requests. `jev_text_attachments` runs
 14 pinned text/document fixtures as inline attachments, including office/PDF text
 extraction, ordered sources and cross-file questions; it requires positive cache
 replay evidence and rejects eight malformed inputs with exact typed errors. Its
-five vision/audio-dependent manifest cases remain explicitly untested, as do
-uploaded-reference and concurrent-isolation paths. `speculation_ngram` requires
+five vision/audio-dependent manifest cases are not executed by this text adapter;
+bounded image/video fixtures use `jev_media` profiles, while audio/ASR,
+uploaded-reference and concurrent-isolation paths remain untested. `speculation_ngram` requires
 a prebuilt `--benchmark` AgentTurnBench and a source-admitted family/backend;
 it requires actual n-gram verification/acceptance and exact greedy token parity.
 It never enables a learned drafter. `image_generation_smoke` runs Qwen base/Turbo
 at 128px with its required VAE/text encoder, validates RGB/RGBA and noninterlaced
 gray/palette PNG contents and error
 responses, and records repeated-seed hashes without declaring semantic quality
-or bitwise determinism. The corresponding broader quality, attachment and
-learned-speculation recipes remain untested.
+or bitwise determinism. Explicit profiles add independent image/media oracles
+and learned-head speculation assertions; their availability does not establish
+real-model qualification or open-ended quality.
 
 `server_agents` runs two bounded arithmetic reviewers through host coordination
 tools, requiring completed child results, exact child/final JSON and a separate
@@ -461,8 +634,8 @@ The tool does not publish them.
 | `pass` | Actual execution satisfied its assertions |
 | `fail` | Preparation or executed assertion failed |
 | `skip` | Selected case could not run because a prerequisite or budget was absent |
-| `unsupported` | Explicit source/config support limitation |
-| `untested` | Planned, recipe-only, incomplete, or unobserved behavior |
+| `unsupported` | Explicit source/config or adapter qualification limitation, with its scope stated |
+| `untested` | Planned, missing profile, incomplete, or unobserved behavior |
 
 | Exit | Meaning |
 |---|---|
@@ -473,15 +646,14 @@ The tool does not publish them.
 | 130 | Cancelled; process cleanup outcome and evidence retained |
 
 For CI/local acceptance use `--strict` and select a deliberately bounded scenario
-matrix. A broad run containing known recipes cannot honestly satisfy strict full
-coverage. Explicit `unsupported` results remain visible but do not by themselves
-trigger strict exit code 3. Four catalog-only recipes (`embedding_media`,
-`distributed`, `client_live` and `native_unit`) have neither per-preset
-associations nor a global execution lane. When selected, they appear once as
-`catalog::<scenario-id>` with `scope=catalog` and `status=untested`, without
-inventing a model or backend association. A recipe-only run exits 3; its plan
-exits 0 with untested coverage. Consult the catalog as well as the run report
-when assessing remaining coverage.
+matrix. A broad run with missing profiles, fixtures or hardware cannot honestly
+satisfy strict full coverage. Explicit `unsupported` results remain visible but
+do not by themselves trigger strict exit code 3. The 14 profile-backed scenario
+IDs have automatic typed execution paths, but need selected profiles to run.
+Missing profiles produce per-preset/backend or unbound catalog-scope untested
+records as described above.
+A run containing only these records exits 3; its plan exits 0 with untested
+coverage. Consult the catalog and execution report together when assessing gaps.
 Re-run a failed case using its `reproduce` argv in `report.json`; reruns
 always create fresh evidence and do not import old passes.
 

@@ -14,12 +14,13 @@ against [`catalog.schema.json`](../config/regression/catalog.schema.json).
 It inventories all 67 host presets, overlays and LoRA documents under `config/`
 (excluding its own `config/regression/` metadata), 23 architecture/embedding/
 special-quantization family records and seven backend names. The audit report
-records the current scenario count and execution classification.
-`automated` means a runner adapter exists; `recipe` means a supported existing
-entry point and assertions are recorded but are not automatically executed by
-the runner. `suite` identifies a globally integrated component/native lane,
-which must not be repeated or counted as per-model coverage. None of these
-statuses is execution evidence. Each result requires its own
+records the current scenario count and execution classification: **44 scenario
+definitions = 25 default adapters + 14 typed profile executors + five suite
+categories**. `automated` means an execution adapter exists; those with
+`execution: "profile"` require an explicit `--scenario-profiles` document and
+their approved fixtures. `suite` identifies a globally integrated component/native
+lane, which must not be repeated or counted as per-model coverage. None of these
+classifications is execution evidence. Each result requires its own
 model hash, source identity, backend, input and actual outcome.
 
 ## Existing infrastructure reused or indexed
@@ -143,9 +144,10 @@ document/collection deletion. Default RAM accounts for both encoder instances;
 download/disk bytes count the unique file once. This CPU-only adapter is limited
 qualification, not an engine backend restriction. The sidecar has no public
 backend telemetry, so its CPU configuration/source admission is disclosed
-separately from the primary host's API backend evidence. The broader retrieval
-recipe still records grounded-chat/citation, reranking, OCR/media, persistence,
-concurrency and tenant authorization gaps. Collection scope is not a tenant ACL.
+separately from the primary host's API backend evidence. The paired `retrieval`
+profile below adds grounded-chat and source-URL assertions. Reranking, OCR/media,
+persistence, concurrency and tenant authorization remain outside these bounded
+adapters. Collection scope is not a tenant ACL.
 
 Fixed-history consistency captures every compared logit row and the first
 divergent case/step/token. Nonfinite values, incomplete output, a mismatched
@@ -186,17 +188,18 @@ errors. Fixture `.gitattributes` preserves the pinned bytes, including PDF offse
 on Windows; legacy text CRLF normalization is accepted only when it recovers the
 exact pinned bytes, with original and submitted identities recorded. No binary
 normalization is accepted. Inline fixtures stay in scenario-local upload storage.
-Vision/video/ASR and uploaded-reference transport remain separate `jev_media`
-recipes; office formatting, embedded figures and formula recalculation are not
-qualified by text extraction.
+Bounded vision/video fixtures use the separate `jev_media` profile executor.
+Audio/ASR and uploaded-reference transport remain untested; office formatting,
+embedded figures and formula recalculation are not qualified by text extraction.
 
 `client_http_live` adds four prebuilt HTTP SDK invocations (OpenAI/Extensions.AI,
 stream/response) with strict two-turn answers `4` and `12`, exact client identity
 headers, clean process completion and raw HTTP/SSE controls. No SDK wire-history
 capture, SDK cancellation/deadline or native-client qualification is claimed.
-The native CLI source admits GGML CPU/CUDA/Metal/Vulkan, while its existing
-recorded `LiveChecks` fixture is specifically Qwen3.8 Flash Next on Metal; these
-are distinct support and execution scopes.
+The `client_live` profile adds explicit native-client and HTTP SDK execution.
+The native CLI source admits GGML CPU/CUDA/Metal/Vulkan, while its historical
+recorded `LiveChecks` fixture is specifically Qwen3.8 Flash Next on Metal; that
+existing evidence does not qualify the new profile on another device.
 
 `server_agents` exercises two named read-only arithmetic reviewers using only
 host coordination tools, with skills/code execution disabled. Successful spawn
@@ -207,14 +210,102 @@ scheduling, mutable worker tools and cancellation propagation remain untested.
 The host uses its normal per-user `TensorSharp/agent-workspaces` storage; the
 runner does not redirect or inspect unrelated user workspaces.
 
-Generation/editing, multimodal embeddings, broader agent workflows, learned
-speculation, LoRA, multi-GPU and distributed paths retain explicit
-recipes and fixture requirements where no adapter is implemented. The catalog
-does not turn these into automatic passes. Family-specific generated-media validation must decode the
-artifact, check dimensions/frame/sample rate/duration, reject nonfinite or
-constant output, and compare an approved fixture metric; file existence alone
-is insufficient. Open-ended quality is not equivalent to deterministic
-protocol correctness.
+## Profile-driven execution matrix
+
+The following 14 scenario IDs have typed executors rather than manual-only
+recipes. They require [explicit profiles](local-regression.md#typed-scenario-profiles)
+and independent approved inputs/oracles. Their integration evidence is source
+review and synthetic harness tests, with the separately recorded local
+`native_unit` direct-CUDA and `client_live` GGML-CUDA results below. Every other
+row still requires a real model/device run report. No result qualifies Linux,
+macOS, remote nodes or other unrun platforms.
+Earlier model reports retain their original narrower scope.
+
+| Scenario | Executed assertion scope and requirements | Qualification |
+|---|---|---|
+| `embedding_media` | Verified EmbeddingGemma2 projector; bounded image/audio/video; finite vector, exact dimension and independent SHA-pinned vector oracle with numerical gates | Harness only; actual model/device run required |
+| `image_generation` | Bounded Qwen-Image generation; decode dimensions and nonconstant pixels; compare independent decoded RGBA8 pixel hash | Harness only; actual model/device run required |
+| `image_editing` | Approved input/mask and output oracle; decoded pixel identity, changed-region evidence and masked preservation metric; metric dependencies required | Harness only; actual model/device run required |
+| `video_generation` | Source-admitted family pipeline; decode complete bounded clip, shape/rate/frame count, finite/nonconstant content and approved RGB reference error | Harness only; actual model/device run required |
+| `video_audio_generation` | Supported audio-producing family plus the video gates; complete decoded PCM sample-rate/channel/length checks and independent audio error oracle | Harness only; actual model/device run required |
+| `video_reference` | Family-admitted start/end/reference conditioning with explicit fixtures, pipeline evidence and complete output oracle; LTX Ingredients execution remains untested | Harness only; actual model/device run required |
+| `speculation` | Explicit supported learned head/drafter and benchmark; exact greedy token parity against plain baseline and positive draft/verify/accept evidence | Harness only; actual model/device run required |
+| `lora` | Pinned text LoRA, prompt and distinct approved base/adapted answers; load, use, unload and restored-baseline assertions | Harness only; actual model/device run required |
+| `multi_gpu` | Explicit physical devices, tensor/layer placement receipts and per-device budgets; teacher-forced token history and numerical parity | Harness only; multiple actual GPUs required |
+| `distributed` | Explicit authorized Linux SSH nodes, unique mandatory raw `/etc/machine-id` SHA-256 pins checked before run-directory creation or model launch, pinned preinstalled model/runtime/source manifests, per-node budgets, rank/logit evidence and verified owned-process teardown | Harness only; authorized multi-node run required |
+| `retrieval` | Primary chat model plus CPU embedding role; pinned document, Ready/index provenance, exact source bytes, grounded answer and matching source URL, empty/unrelated-scope controls and cleanup | Harness only; actual paired-model run required |
+| `jev_media` | Bounded PNG/MP4/WebM plus typed gold decisions with/without media; positive visual preparation, deterministic replay/cache evidence and typed negative responses; no positive audio/ASR path | Harness only; actual vision-model run required |
+| `client_live` | Pinned prebuilt native and HTTP clients; two native modes plus four HTTP SDK modes, exact two-turn answers, requested backend receipts and normal completion | Local Windows `ggml_cuda`, Qwen3.5-0.8B Q8_0: six modes and all 12 semantic answers passed; dirty-source provenance and limits below |
+| `native_unit` | Pinned prebuilt `InferenceWeb.Tests.dll`; two fixed direct-CUDA synthetic graph/cache/quantized-weight tests, positive execution/counter evidence and zero fallback; no model load/download | Local Windows direct CUDA: both tests passed, graph capture/replay observed, zero CPU fallback; device-only scope and deployment provenance below |
+
+The local `native-cuda-profile-f6e6e50-dirty` report on 2026-11-01 records two
+executed/passing tests, no skipped tests, positive graph capture/replay and two
+empty CPU-fallback counter blocks. It used harness commit
+`f6e6e506206d62755efa08755c6d83ed19e249f8` **with uncommitted changes**, a prebuilt
+test assembly with declared build source
+`b764dec2d149aabd725c067a47c6f4c5dfedd010`, and assembly SHA-256
+`0b7a9e3bbdd4f8e39e0a1d39c7ce544335991f043f4ac501866ab73907816053`.
+Its deployment inventory also records the `GgmlOps.dll` candidate SHA-256
+`a0f0674576b5193222846db339456d86d089fffdcb9f105f64b6a85426d98128`; that inventory
+is not mapped-module attestation or evidence of GGML execution. This result
+qualifies only the two direct-CUDA synthetic tests, not model inference,
+backend-wide correctness or a clean final source revision. A clean-head rerun
+must retain its own report and binary identities.
+
+The local `client-live-profile-f6e6e50-dirty` report on 2026-11-01 records
+`profile::qwen08-native-http-cuda` passing on the RTX 3080 Laptop GPU. Native
+stream/response and OpenAI/Extensions.AI HTTP stream/response each returned the
+two required answers, `4` and `12`: six client invocations and 12 answers.
+The host and native receipts identify `ggml_cuda`; raw HTTP/SSE controls and
+verified owned-server teardown also passed. The Qwen3.5-0.8B Q8_0 weight SHA-256
+was `0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c`.
+Harness commit `f6e6e506206d62755efa08755c6d83ed19e249f8` had uncommitted
+changes; the client binaries declare the same build-source revision. Their
+recorded SHA-256 values are
+`220757da421387082df93fdd732369975165c253ff094ecd4bee1a06e5959d98` (native) and
+`5b2b8e673b91a78dd7b655c07e536720d907329a1ea4c2c74d245e78b9e45c6c` (HTTP).
+This is bounded semantic parity with normal completion. Native and HTTP sampling
+seeds differ, so it does not establish exact token/logit parity, complete SDK
+wire history, cancellation/deadline recovery, cache-hit behavior or all client
+features. It is not qualification of a clean final source revision.
+
+Exact allowed keys, family/backend admission, fixtures and thresholds are enforced
+by the executors' `validate_profile`/`availability` functions:
+
+- [Image and embedding profiles](../eng/regression/image_profiles.py)
+- [Video profiles](../eng/regression/video_profiles.py)
+- [Scaling, speculation and LoRA profiles](../eng/regression/scaling_profiles.py),
+  with the [fixed remote supervisor](../eng/regression/scaling_remote.py)
+- [Retrieval and Jev media profiles](../eng/regression/knowledge_profiles.py)
+- [Native unit and client profiles](../eng/regression/extended_profiles.py)
+
+The [common schema](../config/regression/scenario-profiles.schema.json) validates
+only the envelope; it cannot prove file hashes, catalog membership, source
+provenance, resource fit or executor-specific oracle correctness. The primary
+model is implicit in `preset`; companion roles use exact catalog IDs. Optional
+weights are selected only for the executor's required options. RAM/VRAM budgets
+must cover all resident roles/instances, while downloads count unique files once.
+Artifact scratch and model-cache demand are charged to their respective volumes;
+eligibility and fixture hashes are rechecked after preparation. Per-GPU free VRAM
+is checked separately and never pooled. See the deployment guide for the actual
+selectors and a runnable synthetic retrieval-profile generator.
+Distributed machine pins identify OS instances, not physical separation between
+containers or VMs; independent resource allocations and budgets remain explicit
+operator requirements. A pin mismatch fails before run-directory creation,
+resource inspection, model hashing or probe/anchor launch, rather than relying only
+on post-run identity checks.
+
+A selected profile-backed scenario bound to a preset retains a per-preset/backend
+`untested` row when that combination lacks a matching selected profile. One model
+or device's profile does not cover another combination; unresolved automatic
+backend requests remain labeled `auto`. Unbound profile classes use
+`catalog::<scenario-id>`, `scope=catalog`, `status=untested` only when no profile
+is supplied. Missing binaries, fixtures or budgets cannot turn into passes. General image/video quality,
+unimplemented submodes such as LTX Ingredients or owned local ASR, broader agent
+workflows, OCR/reranking/tenant ACLs, SDK cancellation and arbitrary size/context/
+quantization combinations remain outside the implemented bounded assertions.
+Source support, successful preparation and a process exit code alone do not
+establish those claims.
 
 ## Config repairs and maintenance
 

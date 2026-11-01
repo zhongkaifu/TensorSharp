@@ -96,6 +96,17 @@ def audit_catalog(repo, catalog):
             from .scenarios import ADAPTER_IDS
             if scenario.get("adapter", name) not in ADAPTER_IDS:
                 errors.append(f"{name}: declared automated but no adapter exists")
+        if "execution" in scenario:
+            from .scenario_profiles import PROFILE_MODULES, adapter
+            if scenario["execution"] != "profile" or scenario.get("status") != "automated" or name not in PROFILE_MODULES:
+                errors.append(f"{name}: invalid typed profile execution declaration")
+            else:
+                try:
+                    module = adapter(name)
+                    if not all(callable(getattr(module, entry, None)) for entry in ("validate_profile", "availability", "run")):
+                        errors.append(f"{name}: typed executor has missing callable contracts")
+                except ImportError as error:
+                    errors.append(f"{name}: typed executor import failed: {error}")
         if scenario.get("status") == "suite":
             if name not in SUITE_IDS:
                 errors.append(f"{name}: declared suite but no suite adapter exists")

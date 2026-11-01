@@ -77,8 +77,14 @@ def secret_values(env=None):
     return [v for k, v in (os.environ if env is None else env).items() if _SECRET_KEY.search(k)]
 
 
-def clean_environment(overrides=None, artifact_dir=None):
-    """Do not inherit tuning, host execution permissions or remote credentials."""
+def clean_environment(overrides=None, artifact_dir=None, *, environment_mode="model_host"):
+    """Scrub ambient settings in every mode; bound actual inference hosts by default.
+
+    Only the fixed, model-free component suites opt out of host-policy defaults:
+    those tests construct their own permission, context and storage fixtures.
+    """
+    if environment_mode not in {"model_host", "model_free_suite"}:
+        raise ValueError("unknown process environment mode")
     result = {k: v for k, v in os.environ.items()
               if not k.upper().startswith(_PREFIXES) and k.upper() not in _SETTING_KEYS
               and not _SECRET_KEY.search(k)}
@@ -86,14 +92,16 @@ def clean_environment(overrides=None, artifact_dir=None):
         if _SECRET_KEY.search(k):
             continue
         result[str(k)] = str(v)
-    # Local fixtures never require model-generated host commands or discovered skills.
-    result.update(TS_CODE_EXEC="0", TS_SKILLS_ALLOW_EXEC="0", TS_SKILLS_ALLOW_NETWORK="0", TS_NO_SKILLS="1")
-    if artifact_dir:
-        for key, folder in (("TENSORSHARP_PREFIX_CACHE_DIR", "prefix-cache"),
-                            ("TENSORSHARP_UPLOAD_DIR", "uploads"), ("TENSORSHARP_LOG_DIR", "host-logs"),
-                            ("TS_STUDIO_DIRECTORY", "studio")):
-            result[key] = str(Path(artifact_dir).resolve() / folder)
-    result.setdefault("MAX_CONTEXT", "2048")
+    if environment_mode == "model_host":
+        # Actual inference fixtures never require model-generated host commands
+        # or discovered skills, even when an override attempts to enable them.
+        result.update(TS_CODE_EXEC="0", TS_SKILLS_ALLOW_EXEC="0", TS_SKILLS_ALLOW_NETWORK="0", TS_NO_SKILLS="1")
+        if artifact_dir:
+            for key, folder in (("TENSORSHARP_PREFIX_CACHE_DIR", "prefix-cache"),
+                                ("TENSORSHARP_UPLOAD_DIR", "uploads"), ("TENSORSHARP_LOG_DIR", "host-logs"),
+                                ("TS_STUDIO_DIRECTORY", "studio")):
+                result[key] = str(Path(artifact_dir).resolve() / folder)
+        result.setdefault("MAX_CONTEXT", "2048")
     return result
 
 
@@ -284,7 +292,8 @@ def _posix_group_state(pgid):
 class ManagedProcess:
     """Only terminates this process and its descendants; never searches process names."""
 
-    def __init__(self, command, *, cwd, artifact_dir, stage, env=None, capture_limit=4 * 1024 * 1024):
+    def __init__(self, command, *, cwd, artifact_dir, stage, env=None, capture_limit=4 * 1024 * 1024,
+                 environment_mode="model_host"):
         if not command or isinstance(command, str):
             raise ValueError("command must be a nonempty argv list, never a shell command")
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", stage):
@@ -301,7 +310,8 @@ class ManagedProcess:
         self.teardown = {"attempted": False, "verified": False,
                          "mechanism": "windows-job" if os.name == "nt" else "posix-process-group",
                          "reason": "process lifecycle has not completed"}
-        self.env = clean_environment(env, artifact_dir)
+        self.env = clean_environment(env, artifact_dir, environment_mode=environment_mode)
+        self.environment_mode = environment_mode
         kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
         launch_command = self.command
         if os.name == "nt":
@@ -434,6 +444,7 @@ class ManagedProcess:
         parent_exit = self.process.poll()
         containment_failure = self.teardown["attempted"] and not self.teardown["verified"]
         result = {"command": [redact(v, self.secrets) for v in self.command], "stage": self.stage,
+                "environment_mode": self.environment_mode,
                 "exit_code": 125 if containment_failure else parent_exit, "parent_exit_code": parent_exit,
                 "containment_failure": containment_failure,
                 "timed_out": self.timed_out, "cancelled": self.cancelled,
@@ -450,5 +461,6 @@ class ManagedProcess:
         return result
 
 
-def run_process(command, *, cwd, artifact_dir, stage, timeout_seconds=600, env=None):
-    return ManagedProcess(command, cwd=cwd, artifact_dir=artifact_dir, stage=stage, env=env).wait(timeout_seconds)
+def run_process(command, *, cwd, artifact_dir, stage, timeout_seconds=600, env=None, environment_mode="model_host"):
+    return ManagedProcess(command, cwd=cwd, artifact_dir=artifact_dir, stage=stage, env=env,
+                          environment_mode=environment_mode).wait(timeout_seconds)

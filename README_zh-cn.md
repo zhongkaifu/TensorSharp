@@ -174,6 +174,7 @@ TensorAgent 当前目录包含 39 个条目，按可搜索的模型家族分组�
 | [环境变量功能矩阵](docs/env_var_feature_matrix_zh-cn.md) | 哪些高影响运行时开关影响哪些模型、后端与提示类型 |
 | [Muse Spark 对比 llama.cpp](docs/perf/muse-spark-vs-llama-cpp.md) | 816B MoE 在十块 A40 GPU 上的按层切分与张量并行测试：测试环境、逐场景结果、teacher-forced 质量与对比的局限 |
 | [测试 / 基准矩阵运行器](TensorSharp.TestMatrix/README_zh-cn.md) | 扫描 model × backend × feature × env-var 组合并生成回归报告 |
+| [本地自动化回归部署指南](docs/local-regression.zh-CN.md) | 按机器配置规划模型和后端、校验下载、执行场景并生成诊断与复现报告 |
 | [服务端 API 示例](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md) | 完整的 curl 与 Python 示例 |
 
 ## 当前状态

@@ -3871,19 +3871,24 @@
     },
     {
       "id": "embedding_media",
-      "entry_point": "eng/validation/embeddinggemma2-media-http.py",
-      "status": "recipe",
-      "recipe": "Run the existing media HTTP probe with matching projector and synthetic labeled fixtures.",
+      "entry_point": "eng/regression/image_profiles.py",
+      "status": "automated",
+      "recipe": "Run eng/run-local-regression.py --scenario-profiles PATH with an exact catalog preset/backend, typed parameters, SHA-pinned approved fixtures and explicit peak resource requirements. See docs/local-regression.zh-CN.md and executor validate_profile().",
       "assertions": [
-        "Finite normalized vectors, correct MRL dimension, repeat consistency and multimodal relevance against paired fixtures."
+        "Bounded SHA-pinned PNG/WAV/video and exact model/projector/backend identity.",
+        "Finite normalized vectors match declared dimensions and approved numerical oracle (relative L2 <= .001, cosine >= .999999); duplicate replay and typed invalid-media responses.",
+        "Owned temporary files and processes are cleaned."
       ],
       "evidence": [
         "eng/validation/embeddinggemma2-media-http.py",
-        "InferenceWeb.Tests/EmbeddingGemma2MediaRequestTests.cs"
+        "InferenceWeb.Tests/EmbeddingGemma2MediaRequestTests.cs",
+        "eng/regression/image_profiles.py"
       ],
       "requirements": [
-        "Matching media projector and local labeled media"
-      ]
+        "Built local host/CLI and scenario-specific runtime dependencies.",
+        "Approved reference fixtures and explicit total RAM/VRAM/scratch budgets; absent prerequisites produce skip/untested, not pass."
+      ],
+      "execution": "profile"
     },
     {
       "id": "server_agents",
@@ -3910,25 +3915,32 @@
     },
     {
       "id": "retrieval",
-      "entry_point": "TensorSharp.Knowledge.Tests",
-      "status": "recipe",
-      "recipe": "Broad grounded-chat/citation, reranking, OCR/media, persistence and authorization qualification remains a separate recipe. Use knowledge_unit for component tests; retrieval_vector_cpu covers only bounded MiniLM CPU indexing/search/read/source/scope/deletion over owned synthetic TXT.",
+      "entry_point": "eng/regression/knowledge_profiles.py",
+      "status": "automated",
+      "recipe": "Run eng/run-local-regression.py --scenario-profiles PATH with an exact catalog preset/backend, typed parameters, SHA-pinned approved fixtures and explicit peak resource requirements. See docs/local-regression.zh-CN.md and executor validate_profile().",
       "assertions": [
-        "Fixture document ingestion/chunk IDs, expected retrieved passage and citation; ACL/session isolation and malformed document behavior."
+        "Verified chat and CPU embedding model identities; exact original document SHA/download and retrieval source excerpt.",
+        "Approved answer literal and valid authoritative source citation; unrelated collection scope does not disclose the fixture secret.",
+        "Typed errors, collection cleanup and verified owned-process teardown; no OCR/reranker/authorization guarantee."
       ],
       "evidence": [
         "TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj",
-        "InferenceWeb.Tests/KnowledgeRetrievalLoopTests.cs"
+        "InferenceWeb.Tests/KnowledgeRetrievalLoopTests.cs",
+        "eng/regression/knowledge_profiles.py"
       ],
       "requirements": [
-        "Built test suite; model-backed end-to-end retrieval needs local embedding model"
-      ]
+        "Built local host/CLI and scenario-specific runtime dependencies.",
+        "Approved reference fixtures and explicit total RAM/VRAM/scratch budgets; absent prerequisites produce skip/untested, not pass."
+      ],
+      "execution": "profile"
     },
     {
       "id": "retrieval_vector_cpu",
       "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
       "status": "automated",
-      "backends": ["cpu"],
+      "backends": [
+        "cpu"
+      ],
       "recipe": "Run --models embedding-minilm --scenarios retrieval_vector_cpu --backend cpu (or auto) --server <built host>; an owned embedding-only loopback server independently loads the same pinned MiniLM file for its CPU knowledge sidecar. No chat or external provider is used.",
       "assertions": [
         "Primary CPU/bert/384-dimension embedding-only identity and pinned MiniLM SHA; each Ready single-chunk import records exact source hash/bytes, extractor and matching sidecar weight/prefix identity.",
@@ -3954,88 +3966,109 @@
     },
     {
       "id": "image_generation",
-      "entry_point": "eng/validation/qwen-image21-http.py",
-      "status": "recipe",
-      "recipe": "Run existing Qwen Image HTTP validation against an owned loopback server.",
+      "entry_point": "eng/regression/image_profiles.py",
+      "status": "automated",
+      "recipe": "Run eng/run-local-regression.py --scenario-profiles PATH with an exact catalog preset/backend, typed parameters, SHA-pinned approved fixtures and explicit peak resource requirements. See docs/local-regression.zh-CN.md and executor validate_profile().",
       "assertions": [
-        "Decode image; exact dimensions/format, finite nonconstant pixels, expected alpha; compare deterministic seeded fixture or approved reference."
+        "Bounded source-defined generation schedule; typed invalid-request responses.",
+        "Complete visible nonconstant PNG with exact approved RGBA8 hash.",
+        "Actual requested backend without fallback; verified owned-process teardown."
       ],
       "evidence": [
         "eng/validation/qwen-image21-http.py",
-        "eng/validation/validate-release-generation.py"
+        "eng/validation/validate-release-generation.py",
+        "eng/regression/image_profiles.py"
       ],
       "requirements": [
-        "Complete VAE/text/vision companions",
-        "Explicit image dimensions and memory budget"
-      ]
+        "Built local host/CLI and scenario-specific runtime dependencies.",
+        "Approved reference fixtures and explicit total RAM/VRAM/scratch budgets; absent prerequisites produce skip/untested, not pass."
+      ],
+      "execution": "profile"
     },
     {
       "id": "image_editing",
-      "entry_point": "eng/validation/qwen-image21-edit-fidelity.py",
-      "status": "recipe",
-      "recipe": "Run fixed source image, prompt and mask with approved output metric bounds.",
+      "entry_point": "eng/regression/image_profiles.py",
+      "status": "automated",
+      "recipe": "Run eng/run-local-regression.py --scenario-profiles PATH with an exact catalog preset/backend, typed parameters, SHA-pinned approved fixtures and explicit peak resource requirements. See docs/local-regression.zh-CN.md and executor validate_profile().",
       "assertions": [
-        "Preserve unmasked pixels/geometry within tolerance; masked region changes; invalid masks rejected; output matches requested dimensions."
+        "Approved RGBA8 output oracle and binary grayscale mask geometry.",
+        "Protected RGB pixels remain unchanged and selected-region change meets approved bound; black mask preserves exact RGBA input.",
+        "Invalid mask mode/dimensions are rejected; owned processes cleaned. No semantic quality or browser UI claim."
       ],
       "evidence": [
         "eng/validation/qwen-image21-edit-fidelity.py",
-        "eng/validation/validate-image-mask-live.py"
+        "eng/validation/validate-image-mask-live.py",
+        "eng/regression/image_profiles.py"
       ],
       "requirements": [
-        "Synthetic owned source/mask and thresholds"
-      ]
+        "Built local host/CLI and scenario-specific runtime dependencies.",
+        "Approved reference fixtures and explicit total RAM/VRAM/scratch budgets; absent prerequisites produce skip/untested, not pass."
+      ],
+      "execution": "profile"
     },
     {
       "id": "video_generation",
-      "entry_point": "eng/validation/validate-release-generation.py",
-      "status": "recipe",
-      "recipe": "Run generation profile with bounded frame count and ffprobe artifact validation.",
+      "entry_point": "eng/regression/video_profiles.py",
+      "status": "automated",
+      "recipe": "Run eng/run-local-regression.py --scenario-profiles PATH with an exact catalog preset/backend, typed parameters, SHA-pinned approved fixtures and explicit peak resource requirements. See docs/local-regression.zh-CN.md and executor validate_profile().",
       "assertions": [
-        "Playable video; exact frame/time grid, dimensions, finite varied pixels; deterministic reference metrics with declared tolerance."
+        "Actual requested backend without fallback; verified owned-process teardown.",
+        "Exact frame count/size/fps and bounded full RGB24 decode, nonblank variance and approved full-clip RMSE.",
+        "Video-only generation emits no audio."
       ],
       "evidence": [
         "eng/validation/validate-release-generation.py",
-        "eng/validation/ltx25-generation-suite.py"
+        "eng/validation/ltx25-generation-suite.py",
+        "eng/regression/video_profiles.py"
       ],
       "requirements": [
-        "All model companions",
-        "ffmpeg/ffprobe",
-        "Family-specific memory and duration budget"
-      ]
+        "Built local host/CLI and scenario-specific runtime dependencies.",
+        "Approved reference fixtures and explicit total RAM/VRAM/scratch budgets; absent prerequisites produce skip/untested, not pass."
+      ],
+      "execution": "profile"
     },
     {
       "id": "video_audio_generation",
-      "entry_point": "eng/validation/validate-release-generation.py",
-      "status": "recipe",
-      "recipe": "Run H3 or LTX bounded generation and decode video/audio outputs.",
+      "entry_point": "eng/regression/video_profiles.py",
+      "status": "automated",
+      "recipe": "Run eng/run-local-regression.py --scenario-profiles PATH with an exact catalog preset/backend, typed parameters, SHA-pinned approved fixtures and explicit peak resource requirements. See docs/local-regression.zh-CN.md and executor validate_profile().",
       "assertions": [
-        "Video checks plus nonempty finite stereo waveform, expected 32kHz H3 or 48kHz LTX rate, duration alignment; silent video cannot pass sound coverage."
+        "Actual backend, bounded full video decode and approved RGB24 numerical oracle.",
+        "Original WAV sidecar has exact source-defined sample rate/stereo layout, finite nonsilent unclipped PCM, approved sample count and duration within one video frame.",
+        "Approved PCM RMSE and owned-process cleanup; no MP4 audio-mux quality claim."
       ],
       "evidence": [
         "eng/validation/validate-release-generation.py",
         "eng/validation/minimax-h3-generation.py",
-        "eng/validation/ltx25-generation-suite.py"
+        "eng/validation/ltx25-generation-suite.py",
+        "eng/regression/video_profiles.py"
       ],
       "requirements": [
-        "Family audio VAE and complete companions",
-        "ffmpeg/ffprobe"
-      ]
+        "Built local host/CLI and scenario-specific runtime dependencies.",
+        "Approved reference fixtures and explicit total RAM/VRAM/scratch budgets; absent prerequisites produce skip/untested, not pass."
+      ],
+      "execution": "profile"
     },
     {
       "id": "video_reference",
-      "entry_point": "eng/validation/ltx25-generation-suite.py",
-      "status": "recipe",
-      "recipe": "Use family-specific first/last/timed-image/reference profile.",
+      "entry_point": "eng/regression/video_profiles.py",
+      "status": "automated",
+      "recipe": "Run eng/run-local-regression.py --scenario-profiles PATH with an exact catalog preset/backend, typed parameters, SHA-pinned approved fixtures and explicit peak resource requirements. See docs/local-regression.zh-CN.md and executor validate_profile().",
       "assertions": [
-        "Reference identity and keyframe alignment metrics; requested conditioning mode active; unsupported combinations rejected."
+        "SHA-pinned first/end/reference image and matching source-admitted conditioning mode.",
+        "CLI conditioning receipt and full conditioned RGB24 oracle with exact geometry/frame count.",
+        "Requested backend and cleanup verified; no semantic identity or timed-keyframe quality claim."
       ],
       "evidence": [
         "eng/validation/ltx25-generation-suite.py",
-        "eng/validation/minimax-h3-generation.py"
+        "eng/validation/minimax-h3-generation.py",
+        "eng/regression/video_profiles.py"
       ],
       "requirements": [
-        "Approved reference fixture; LTX Ingredients access for identity mode"
-      ]
+        "Built local host/CLI and scenario-specific runtime dependencies.",
+        "Approved reference fixtures and explicit total RAM/VRAM/scratch budgets; absent prerequisites produce skip/untested, not pass."
+      ],
+      "execution": "profile"
     },
     {
       "id": "jev_decision",
@@ -4081,71 +4114,87 @@
     },
     {
       "id": "speculation",
-      "entry_point": "eng/validation/validate-speculative-rows.py",
-      "status": "recipe",
-      "recipe": "Compare fixed greedy token rows for plain vs matching draft, same model/hash/seed.",
+      "entry_point": "eng/regression/scaling_profiles.py",
+      "status": "automated",
+      "recipe": "Run --scenario-profiles with exact preset/backend, typed parameters, SHA-pinned fixtures and explicit total resource budgets; see the executor validate_profile contract.",
       "assertions": [
-        "Speculation actually active with acceptance statistics; exact greedy token rows or explicit justified numerical tolerances; drafter mismatch rejected."
+        "Plain and observed learned-head runs preserve the exact greedy token sequence.",
+        "Positive proposal/acceptance counters and expected drafter head kind, finite metrics and exact model/backend identity; no unobserved MTP/NextN subtype claim."
       ],
       "evidence": [
         "eng/validation/validate-speculative-rows.py",
-        "eng/qwen4exp-mtp-fixture.py"
+        "eng/qwen4exp-mtp-fixture.py",
+        "eng/regression/scaling_profiles.py"
       ],
       "requirements": [
-        "Matching draft/embedded NextN and supported backend"
-      ]
+        "Prebuilt binaries, approved fixtures, source-supported family/backend and sufficient resources."
+      ],
+      "execution": "profile"
     },
     {
       "id": "lora",
-      "entry_point": "eng/validation/lora-endpoint-check.py",
-      "status": "recipe",
-      "recipe": "Load approved family LoRA plug-in, compare same seed base/adapted/unloaded output.",
+      "entry_point": "eng/regression/scaling_profiles.py",
+      "status": "automated",
+      "recipe": "Run --scenario-profiles with exact preset/backend, typed parameters, SHA-pinned fixtures and explicit total resource budgets; see the executor validate_profile contract.",
       "assertions": [
-        "Adapter changes expected target; unload restores baseline; invalid partition/schedule/scale rejected."
+        "Approved base and different adapted text oracle, exact adapter scale/name admission, unloading restores base output.",
+        "Typed bad-scale/missing-adapter refusal, source-admitted family/backend, model identity and verified owned host cleanup."
       ],
       "evidence": [
         "eng/validation/lora-endpoint-check.py",
         "InferenceWeb.Tests/QwenImage21LoraConfigTests.cs",
-        "InferenceWeb.Tests/MiniMaxH3LoraConfigTests.cs"
+        "InferenceWeb.Tests/MiniMaxH3LoraConfigTests.cs",
+        "eng/regression/scaling_profiles.py"
       ],
       "requirements": [
-        "Base model plus compatible adapter; explicit license/access"
-      ]
+        "Prebuilt binaries, approved fixtures, source-supported family/backend and sufficient resources."
+      ],
+      "execution": "profile"
     },
     {
       "id": "multi_gpu",
-      "entry_point": "eng/validation/run-parallel-case.py",
-      "status": "recipe",
-      "recipe": "Use validated per-family TP/layer-split profile and compare fixed histories to one-device reference.",
+      "entry_point": "eng/regression/scaling_profiles.py",
+      "status": "automated",
+      "recipe": "Run --scenario-profiles with exact preset/backend, typed parameters, SHA-pinned fixtures and explicit total resource budgets; see the executor validate_profile contract.",
       "assertions": [
-        "Requested devices/placement active; identical histories and finite logits within declared tolerances; no silent single-device fallback."
+        "Fresh single-device and requested multi-device full teacher-forced operation histories are identical and finite within strict declared gates.",
+        "Positive requested device placement evidence, exact model/runtime/probe identities and verified owned teardown; no pooled VRAM or single-device fallback pass."
       ],
       "evidence": [
         "eng/validation/run-parallel-case.py",
         "eng/validation/compare-parallel-logits.py",
-        "InferenceWeb.Tests/TensorParallelSupportGateTests.cs"
+        "InferenceWeb.Tests/TensorParallelSupportGateTests.cs",
+        "eng/regression/scaling_profiles.py"
       ],
       "requirements": [
-        "At least two matching local devices",
-        "Explicit family, transport and memory profile"
-      ]
+        "Prebuilt binaries, approved fixtures, source-supported family/backend and sufficient resources."
+      ],
+      "execution": "profile"
     },
     {
       "id": "distributed",
-      "entry_point": "eng/validation/run-multinode-case.py",
-      "status": "recipe",
-      "recipe": "Prepare authorized worker/rank profile; run existing distributed quality comparison.",
+      "entry_point": "eng/regression/scaling_profiles.py",
+      "status": "automated",
+      "recipe": "Use --scenario-profiles with explicitly authorized Linux nodes, unique expected_machine_id_sha256 pins, exact model/probe/runtime/source hashes, pinned known_hosts and separate resource budgets. No discovery/provisioning; existing nodes only.",
       "assertions": [
-        "All ranks join, matching source/model hashes, expected world size, finite fixed-history logits, clean teardown and failure propagation."
+        "Fixed SSH/probe arguments, strict host keys and unique expected OS-instance hash checked before model launch; no node discovery or raw commands.",
+        "Every node rechecks RAM/per-GPU VRAM after full immutable model/runtime/source hashing; no pooled VRAM or unproved hardware isolation.",
+        "Actual all-peer join, backend identity, full topology and completed sharding/nonempty layer ownership; driver/worker disposal required.",
+        "Complete finite teacher-forced operation histories match fresh single-device control within strict gates, including exact token IDs and argmax.",
+        "Independent EOF/HUP/deadline supervision, identity-pinned process-group teardown and bounded hash-verified artifact transfer; uncertain cleanup halts later work."
       ],
       "evidence": [
         "eng/validation/run-multinode-case.py",
         "eng/validation/compare-distributed-quality.py",
-        "TensorSharp.Distributed/TensorSharp.Distributed.csproj"
+        "TensorSharp.Distributed/TensorSharp.Distributed.csproj",
+        "eng/regression/scaling_profiles.py",
+        "eng/regression/scaling_remote.py"
       ],
       "requirements": [
-        "Explicit authorized nodes and rank profile; never auto-connect remotely"
-      ]
+        "Authorized Linux SSH nodes with direct peer routes, prebuilt identical probe/runtime and prepared immutable model shards.",
+        "Unique SHA256 of exact raw /etc/machine-id; known_hosts pin; supplied budgets cover local single-device reference and each remote GPU."
+      ],
+      "execution": "profile"
     },
     {
       "id": "native_ctest",
@@ -4167,21 +4216,23 @@
     },
     {
       "id": "client_live",
-      "entry_point": "eng/tests/dotnet-local-chat-e2e.py",
-      "status": "recipe",
-      "recipe": "Remaining deeper client lifecycle/native checks: separately exercise verified cancellation and native IChatClient with appropriate prebuilt examples. Basic HTTP SDK semantic conversations are automated as client_http_live.",
+      "entry_point": "eng/regression/extended_profiles.py",
+      "status": "automated",
+      "recipe": "Run --scenario-profiles with exact preset/backend, typed parameters, SHA-pinned fixtures and explicit total resource budgets; see the executor validate_profile contract.",
       "assertions": [
-        "Verify native same-adapter arithmetic/history, streaming metadata and lifecycle behavior. Client cancellation output or recovery alone does not establish request-specific server cancellation.",
-        "The recorded NativeChatCompletion LiveChecks mode is fixed to Qwen3.8 Flash Next/ggml_metal. The native CLI accepts ggml_cpu, ggml_cuda, ggml_metal and ggml_vulkan; these routes require their own qualification and a reliable assistant-output boundary."
+        "Two native stream/response modes and four HTTP SDK modes return exact full answers 4 then12 with normal finish and bounded token accounting.",
+        "Exact observed model/backend identity and structured native receipts; fresh native processes and owned HTTP host teardown. No real client cancellation or numerical-logit equivalence claim."
       ],
       "evidence": [
         "eng/tests/dotnet-local-chat-e2e.py",
         "eng/tests/NativeChatCompletion/LiveChecks.cs",
-        "examples/tensorsharp-native-chat/Program.cs"
+        "examples/tensorsharp-native-chat/Program.cs",
+        "eng/regression/extended_profiles.py"
       ],
       "requirements": [
-        "Prebuilt examples and matching supported model/backend; recorded Metal LiveChecks needs Apple Silicon, existing HTTP SIGINT harness needs POSIX. No cancellation coverage is inferred on other platforms."
-      ]
+        "Prebuilt binaries, approved fixtures, source-supported family/backend and sufficient resources."
+      ],
+      "execution": "profile"
     },
     {
       "id": "client_http_live",
@@ -4205,19 +4256,22 @@
     },
     {
       "id": "native_unit",
-      "entry_point": "InferenceWeb.Tests/InferenceWeb.Tests.csproj",
-      "status": "recipe",
-      "recipe": "dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release --logger trx",
+      "entry_point": "eng/regression/extended_profiles.py",
+      "status": "automated",
+      "recipe": "Run --scenario-profiles with exact preset/backend, typed parameters, SHA-pinned fixtures and explicit total resource budgets; see the executor validate_profile contract.",
       "assertions": [
-        "Preserve xUnit native/GPU/model skips; numerics and backend gates must not silently return pass.",
-        "Parse passed/failed/skipped counts from TRX; zero executed tests is untested."
+        "Two exact source-reviewed CUDA device-only sentinel tests execute and pass, with captured/replayed graph evidence and a complete empty CPU fallback block.",
+        "Pinned prebuilt test assembly, dependency/native identities and verified process cleanup; no model loaded; other backend/native coverage remains in native_ctest."
       ],
       "evidence": [
-        "InferenceWeb.Tests/InferenceWeb.Tests.csproj"
+        "InferenceWeb.Tests/InferenceWeb.Tests.csproj",
+        "eng/regression/extended_profiles.py"
       ],
       "requirements": [
-        ".NET 10 SDK and restored packages; built native libraries only for relevant tests"
-      ]
+        "Prebuilt binaries, approved fixture oracles and source-supported backend/hardware.",
+        "Missing prerequisites remain skip/untested; native_unit does not prepare or load primary model weights."
+      ],
+      "execution": "profile"
     },
     {
       "id": "server_unit",
@@ -4291,18 +4345,23 @@
     },
     {
       "id": "jev_media",
-      "status": "recipe",
-      "entry_point": "eng/jev-extended-smoke.py",
-      "recipe": "Run separately controlled Jev vision/video and optional ASR probes with approved local fixtures; inline text/document coverage is jev_text_attachments.",
+      "status": "automated",
+      "entry_point": "eng/regression/knowledge_profiles.py",
+      "recipe": "Run eng/run-local-regression.py --scenario-profiles PATH with an exact catalog preset/backend, typed parameters, SHA-pinned approved fixtures and explicit peak resource requirements. See docs/local-regression.zh-CN.md and executor validate_profile().",
       "assertions": [
-        "Attachment-dependent decisions match labeled fixtures; unsupported media and absent ASR return explicit errors."
+        "SHA-pinned bounded PNG/MP4/WebM and positive source preprocessing image count.",
+        "Approved media decisions differ from the no-media control, replay and probability distributions validate; typed invalid requests rejected.",
+        "Exact model/projector/backend and owned cleanup; external ASR and unsupported image encodings remain untested."
       ],
       "evidence": [
-        "eng/jev-extended-smoke.py"
+        "eng/jev-extended-smoke.py",
+        "eng/regression/knowledge_profiles.py"
       ],
       "requirements": [
-        "Synthetic attachments; explicitly configured ASR only for speech path"
-      ]
+        "Built local host/CLI and scenario-specific runtime dependencies.",
+        "Approved reference fixtures and explicit total RAM/VRAM/scratch budgets; absent prerequisites produce skip/untested, not pass."
+      ],
+      "execution": "profile"
     },
     {
       "id": "image_generation_smoke",

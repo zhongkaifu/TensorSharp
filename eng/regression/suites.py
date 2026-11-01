@@ -93,6 +93,7 @@ def run_suites(repo, output, mode, allow_builds, timeout_seconds):
     for spec in list_suites(repo):
         result = {"id": spec["id"], "scope": spec.get("scope", "client contracts without model execution"),
                   "assertions": spec["assertions"], "status": "untested", "reason": "planned; suite not executed",
+                  "environment_mode": "model_free_suite",
                   "build_policy": {"managed_builds_allowed": bool(allow_builds), "native_builds_allowed": False}}
         if spec.get("excluded_fixtures"):
             result["excluded_fixtures"] = [{**item, "status": "untested"} for item in spec["excluded_fixtures"]]
@@ -157,6 +158,9 @@ def run_suites(repo, output, mode, allow_builds, timeout_seconds):
                         (target / "tests.trx").unlink(missing_ok=True)
                 process = run_process(command, cwd=repo, artifact_dir=target, stage=f"step-{index}",
                                       timeout_seconds=timeout_seconds,
+                                      # Filtered suites own their synthetic permission/storage
+                                      # fixtures; inference-host defaults would change assertions.
+                                      environment_mode="model_free_suite",
                                       env={"TS_TEST_GGML_BACKEND": "cpu"})
                 result["processes"].append(process)
                 containment = containment_failure_evidence(process)

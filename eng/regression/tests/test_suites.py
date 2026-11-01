@@ -92,6 +92,7 @@ class SuiteSelectionTests(unittest.TestCase):
                     self.assertIn("Requires!=" + trait, test_filter.split("&"))
                 self.assertNotIn("Requires!=GgmlCpu", test_filter.split("&"))
                 self.assertEqual("cpu", kwargs["env"]["TS_TEST_GGML_BACKEND"])
+                self.assertEqual("model_free_suite", kwargs["environment_mode"])
                 self.assertIn("--no-build", command)
                 self.assertIn("--no-restore", command)
                 (kwargs["artifact_dir"] / "tests.trx").write_text(trx())
@@ -174,11 +175,13 @@ class SuiteTests(unittest.TestCase):
                 self.process.side_effect = successful_process
                 results = self.invoke(allow_builds=True)
                 self.assertEqual("pass", results[-1]["status"])
+                self.assertEqual("model_free_suite", results[-1]["environment_mode"])
                 self.assertEqual({"managed_builds_allowed": True, "native_builds_allowed": False}, results[-1]["build_policy"])
                 managed = []
                 for call in self.process.call_args_list:
                     command = call.args[0]
                     self.assertEqual({"TS_TEST_GGML_BACKEND": "cpu"}, call.kwargs["env"])
+                    self.assertEqual("model_free_suite", call.kwargs["environment_mode"])
                     if command[0] == "dotnet" and command[1] in {"build", "restore", "test"}:
                         managed.append(command)
                         self.assertEqual(1, command.count("-p:TensorSharpSkipGgmlNative=true"))

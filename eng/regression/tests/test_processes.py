@@ -40,6 +40,59 @@ def alive(pid):
         return False
 
 
+class EnvironmentPolicyTests(unittest.TestCase):
+    host_defaults = {"TS_CODE_EXEC", "TS_SKILLS_ALLOW_EXEC", "TS_SKILLS_ALLOW_NETWORK", "TS_NO_SKILLS",
+                     "TENSORSHARP_PREFIX_CACHE_DIR", "TENSORSHARP_UPLOAD_DIR", "TENSORSHARP_LOG_DIR",
+                     "TS_STUDIO_DIRECTORY", "MAX_CONTEXT"}
+
+    def test_model_free_suite_scrubs_ambient_settings_without_injecting_host_policy(self):
+        ambient = {key: "ambient" for key in self.host_defaults}
+        ambient.update(TS_MODEL="private-model", GDN_TUNING="1", QWEN35_TUNING="1", FUSED_TUNING="1",
+                       DIFFUSION_TUNING="1", MAX_TOKENS="999999", KV_CACHE_DTYPE="bad",
+                       VIDEO_MAX_FRAMES="999999", VIDEO_SAMPLE_FPS="999999", HF_TOKEN="private-token",
+                       SERVER_API_KEY="private-key", PATH="normal-path")
+        with patch.dict(processes.os.environ, ambient, clear=True):
+            env = processes.clean_environment({"TS_TEST_GGML_BACKEND": "cpu", "API_KEY": "override-secret"},
+                                               "artifacts", environment_mode="model_free_suite")
+        self.assertEqual({"PATH": "normal-path", "TS_TEST_GGML_BACKEND": "cpu"}, env)
+
+    def test_default_model_host_keeps_strict_policy_even_if_overrides_try_to_enable_it(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(processes.os.environ, {}, clear=True):
+            env = processes.clean_environment({"TS_CODE_EXEC": "1", "TS_SKILLS_ALLOW_EXEC": "1",
+                                                "TS_SKILLS_ALLOW_NETWORK": "1", "TS_NO_SKILLS": "0",
+                                                "TENSORSHARP_UPLOAD_DIR": "private-uploads"}, directory)
+            for key in ("TS_CODE_EXEC", "TS_SKILLS_ALLOW_EXEC", "TS_SKILLS_ALLOW_NETWORK"):
+                self.assertEqual("0", env[key])
+            self.assertEqual("1", env["TS_NO_SKILLS"])
+            self.assertEqual("2048", env["MAX_CONTEXT"])
+            self.assertEqual(str(Path(directory).resolve() / "uploads"), env["TENSORSHARP_UPLOAD_DIR"])
+            self.assertTrue(self.host_defaults <= env.keys())
+
+    def test_unknown_mode_rejected_before_process_launch(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(processes.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(ValueError, "environment mode"):
+                run_process([sys.executable, "-c", "pass"], cwd=directory, artifact_dir=directory,
+                            stage="invalid-mode", environment_mode="unrestricted")
+            launch.assert_not_called()
+
+    def test_owned_child_observes_explicit_suite_mode_and_default_host_mode(self):
+        script = "import json,os; print(json.dumps({k:os.environ[k] for k in " + repr(sorted(self.host_defaults)) + " if k in os.environ}))"
+        with tempfile.TemporaryDirectory() as directory, patch.dict(processes.os.environ, {
+                "TS_NO_SKILLS": "ambient", "TENSORSHARP_UPLOAD_DIR": "ambient", "MAX_CONTEXT": "99999"}):
+            suite = run_process([sys.executable, "-c", script], cwd=directory, artifact_dir=directory,
+                                stage="suite-env", environment_mode="model_free_suite", timeout_seconds=5)
+            host = run_process([sys.executable, "-c", script], cwd=directory, artifact_dir=directory,
+                               stage="host-env", timeout_seconds=5)
+        self.assertEqual(0, suite["exit_code"], suite)
+        self.assertEqual({}, json.loads(suite["stdout"]))
+        self.assertEqual("model_free_suite", suite["environment_mode"])
+        self.assertEqual(0, host["exit_code"], host)
+        self.assertEqual("1", json.loads(host["stdout"])["TS_NO_SKILLS"])
+        self.assertEqual("2048", json.loads(host["stdout"])["MAX_CONTEXT"])
+        self.assertEqual("model_host", host["environment_mode"])
+        self.assertTrue(suite["teardown"]["verified"] and host["teardown"]["verified"])
+
+
 class ProcessContainmentTests(unittest.TestCase):
     def setUp(self):
         state = patch.object(processes, "_unsafe_resources", None)

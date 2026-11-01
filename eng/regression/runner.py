@@ -27,7 +27,7 @@ GIB = 1024 ** 3
 SAFE_OPTIONS = {"model", "mmproj", "draft-model", "tokenizer", "kv-cache-dtype", "embedding-threads",
                 "embeddings", "model-type", "qwen-image-variant", "qwen-image-vae", "qwen-image-vl",
                 "qwen-image-mmproj", "video-dit2", "video-vae", "video-text-encoder", "audio-vae",
-                "video-frames", "video-fps", "spec"}
+                "video-frames", "video-fps", "video-upscaler", "spec"}
 MEDIA_SCENARIOS = {"cli_image", "cli_audio", "cli_video"}
 BACKEND_PREFERENCE = ("ggml_cuda", "cuda", "ggml_metal", "mlx", "ggml_vulkan", "ggml_cpu", "cpu")
 
@@ -71,6 +71,7 @@ def parse_args(argv=None):
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--engine-repo", type=Path, help="Source checkout used to build explicitly supplied hosts; recorded separately from harness source")
     parser.add_argument("--catalog", type=Path)
+    parser.add_argument("--scenario-profiles", type=Path, help="Typed SHA-pinned fixture/companion profiles for extended scenarios; never arbitrary commands")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--models", default="*", help="Comma-separated preset ID glob patterns")
     parser.add_argument("--scenarios", default="*", help="Comma-separated scenario ID glob patterns")
@@ -284,19 +285,42 @@ def result_stub(preset, backend, scenario, status, reason, **details):
             "status": status, "reason": reason, **details}
 
 
-def unbound_catalog_recipes(catalog, patterns):
+def unbound_catalog_recipes(catalog, patterns, profiles=()):
     """Disclose selected recipes with no model binding, without inventing one."""
     bound = {scenario for preset in catalog["presets"] for scenario in preset.get("scenarios", [])}
+    profiled = {profile["scenario"] for profile in profiles}
     return [{"id": "catalog::" + scenario["id"], "scope": "catalog", "scenario": scenario["id"],
              "status": "untested", "stage": "coverage_inventory",
-             "reason": "Catalog recipe has no preset or global execution binding; its documented requirements need separate qualification.",
-             "catalog_status": "recipe", "entry_point": scenario.get("entry_point"),
+             "reason": ("Typed executor needs a selected --scenario-profiles entry with approved fixtures and resource requirements."
+                        if scenario.get("execution") == "profile" else
+                        "Catalog recipe has no preset or global execution binding; its documented requirements need separate qualification."),
+             "catalog_status": scenario.get("status"), "entry_point": scenario.get("entry_point"),
              "recipe": scenario.get("recipe"), "requirements": scenario.get("requirements", []),
              "source_evidence": scenario.get("evidence", []),
              "unexecuted_assertions": scenario.get("assertions", [])}
             for scenario in catalog["scenarios"]
-            if scenario.get("status") == "recipe" and scenario["id"] not in bound
+            if ((scenario.get("status") == "recipe" and scenario["id"] not in bound)
+                or (scenario.get("execution") == "profile" and scenario["id"] not in profiled and scenario["id"] not in bound))
             and selected(scenario["id"], patterns)]
+
+
+def missing_profile_cases(preset, scenarios, args, profiles):
+    """A profile for one model/device never hides another selected matrix gap."""
+    results = []
+    backends = ["auto"] if args.backend == "auto" else select_backends(args.backend, preset.get("backends", []), {})
+    for identifier in preset.get("scenarios", []):
+        scenario = scenarios[identifier]
+        if scenario.get("execution") != "profile" or not selected(identifier, args.scenarios):
+            continue
+        for backend in backends:
+            matching = [p for p in profiles if p["preset"] == preset["id"] and p["scenario"] == identifier
+                        and (backend == "auto" or p["backend"] == backend)]
+            if not matching:
+                results.append(result_stub(preset, backend, scenario, "untested",
+                    "No selected typed profile for this model/backend/scenario; provide --scenario-profiles with approved fixtures and total peak budgets",
+                    stage="profile_requirements", entry_point=scenario.get("entry_point"),
+                    unexecuted_assertions=scenario.get("assertions", [])))
+    return results
 
 
 def record_execution_halt(report, result):
@@ -329,7 +353,7 @@ def reproduce_args(args, repo, root, preset, backend, scenario):
         # nonempty evidence directory. The generated argv is saved per result.
         fresh = args.output.resolve().parent / ("repro-" + preset["id"] + "-" + scenario["id"] + "-" + uuid.uuid4().hex[:8])
         command += ["--output", str(fresh)]
-    for key in ("cli", "server", "http_client", "logit_probe", "benchmark", "engine_repo", "media_dir", "ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib", "gpu_index", "disk_headroom_gib", "max_download_gib", "timeout_seconds", "context_tokens", "catalog"):
+    for key in ("cli", "server", "http_client", "logit_probe", "benchmark", "engine_repo", "media_dir", "ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib", "gpu_index", "disk_headroom_gib", "max_download_gib", "timeout_seconds", "context_tokens", "catalog", "scenario_profiles"):
         value = getattr(args, key)
         if value is not None:
             command += ["--" + key.replace("_", "-"), str(value)]
@@ -362,12 +386,15 @@ def main(argv=None):
                   "CPU MoE planning uses explicit caller-supplied peak requirements; runtime residency and memory use remain workload-dependent." if args.cpu_moe else
                   "Memory planning reserves workspace/KV headroom and charges all weight bytes; the harness requests no automatic partial offload.",
                   "Generation correctness checks use deterministic task fixtures, not a comprehensive language quality benchmark.",
-                  "Recipe-only features need the documented fixtures/hardware and remain untested in this entry point.",
+                  "Typed profile executors require their explicit approved fixtures, dependencies and hardware; missing conditions remain skip/untested.",
                   "Model payloads are never downloaded in audit/plan modes. No model files are deleted or published."]}
     cancelled = False
     try:
         catalog_path = args.catalog or repo / "config/regression/catalog.json"
         catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        from .scenario_profiles import load_profiles
+        scenario_profiles = load_profiles(args.scenario_profiles, catalog)
+        report["scenario_profiles"] = scenario_profiles
         report["catalog"] = {"path": str(catalog_path), "sha256": file_hash(catalog_path)}
         audit = audit_catalog(repo, catalog)
         report["audit"] = audit
@@ -384,7 +411,11 @@ def main(argv=None):
         logit = find_binary(repo, args.logit_probe, "eng/ForcedLogitProbe", "ForcedLogitProbe")
         benchmark = find_binary(repo, args.benchmark, "benchmarks/AgentTurnBench", "AgentTurnBench")
         commands = {"cli_command": cli, "server_command": server, "http_client_command": http_client, "logit_command": logit, "benchmark_command": benchmark}
-        runtime_dirs = sorted({str(Path(command[-1]).parent) for command in commands.values() if command} | {str(p.resolve()) for p in args.runtime_dir})
+        fixture_runtime_dirs = {str(Path(fixture["path"]).parent) for profile in scenario_profiles
+            if selected(profile["preset"], args.models) and selected(profile["scenario"], args.scenarios)
+            for fixture in profile["fixtures"].values() if Path(fixture["path"]).suffix.lower() in {".dll", ".exe"}}
+        runtime_dirs = sorted({str(Path(command[-1]).parent) for command in commands.values() if command}
+            | {str(p.resolve()) for p in args.runtime_dir} | fixture_runtime_dirs)
         root = (args.model_root or Path(os.environ.get("TENSORSHARP_MODELS", str(repo / "models")))).resolve()
         hardware = detect_hardware(root, runtime_dirs=runtime_dirs)
         report["hardware"] = hardware
@@ -412,7 +443,10 @@ def main(argv=None):
         presets = [p for p in catalog["presets"] if selected(p["id"], args.models)]
         if not presets:
             raise ValueError("model selector matched no catalog presets")
-        report["results"].extend(unbound_catalog_recipes(catalog, args.scenarios))
+        selected_profiles = [p for p in scenario_profiles if selected(p["preset"], args.models)
+            and selected(p["scenario"], args.scenarios)
+            and (args.backend in {"auto", "all"} or p["backend"] in args.backend.split(","))]
+        report["results"].extend(unbound_catalog_recipes(catalog, args.scenarios, selected_profiles))
         download_reserved, executed_models = 0, set()
         halt = None
         if args.mode == "run" and unsafe_process_state() is not None:
@@ -421,8 +455,10 @@ def main(argv=None):
             report["results"].append(previous)
             halt = record_execution_halt(report, previous)
         for preset in presets:
+            report["results"].extend(missing_profile_cases(preset, scenarios, args, selected_profiles))
             model_overrides = preset_budgets(preset, overrides)
-            case_defs = [scenarios[s] for s in preset.get("scenarios", []) if selected(s, args.scenarios)]
+            case_defs = [scenarios[s] for s in preset.get("scenarios", []) if selected(s, args.scenarios)
+                         and scenarios[s].get("execution") != "profile"]
             if not case_defs:
                 continue
             if halt:
@@ -701,6 +737,12 @@ def main(argv=None):
                 if halt:
                     append_halted_cases(report, preset, [backend], case_defs, halt)
                 write_reports(output, report, bundle=False)
+        if selected_profiles:
+            from .profile_execution import run_profiles
+            halt = run_profiles(selected_profiles, args=args, repo=repo, root=root, output=output,
+                catalog=catalog, report=report, policy=policy, index=index, commands=commands,
+                runtime_dirs=runtime_dirs, executed_models=executed_models,
+                download_reserved=download_reserved, halt=halt)
         if args.include_suites:
             from .suites import list_suites, run_suites
             if halt:

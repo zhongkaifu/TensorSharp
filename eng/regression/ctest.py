@@ -165,8 +165,10 @@ def run_native_tests(repo, build_dir, output, mode, backend="cpu", pattern=None,
         if not selected:
             result.update(status="untested", reason="no native tests with verified requested backend and complete fixtures")
             return [result] + omitted
-        result["test_binaries"] = {test["command"][0]: file_hash(test["command"][0])
-                                   for test in selected if test.get("command")}
+        # Many CUDA cases invoke the same large executable with different flags.
+        # Hash each distinct binary once, without redundant multi-GiB disk reads.
+        binary_paths = sorted({test["command"][0] for test in selected if test.get("command")})
+        result["test_binaries"] = {path: file_hash(path) for path in binary_paths}
         junit = output / "ctest.xml"
         # A successful process exit is insufficient without a report from this
         # invocation. Invalidate only our known result file before execution.
