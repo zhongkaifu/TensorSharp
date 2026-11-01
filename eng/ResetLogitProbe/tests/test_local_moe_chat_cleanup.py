@@ -60,9 +60,20 @@ class FakeProcess:
 
 @unittest.skipUnless(os.name == "nt", "The target entry point is explicitly Windows-only")
 class OwnedServerCleanupTests(unittest.TestCase):
-    def exercise_summary_failure(self, terminate_times_out):
+    def exercise_summary_failure(self, terminate_times_out, noncanonical_temp_path=False):
         with tempfile.TemporaryDirectory(prefix="tensorsharp-chat-cleanup-") as temporary:
             root = Path(temporary)
+            if noncanonical_temp_path:
+                # Reproduce a different spelling of the same directory without
+                # depending on whether this Windows volume enables 8.3 aliases.
+                anchor = root / "path-normalization-anchor"
+                anchor.mkdir()
+                root = anchor / ".."
+                self.assertNotEqual(root, root.resolve())
+                self.assertTrue(root.samefile(temporary))
+            # main() resolves CLI paths. Normalize the expected paths as well,
+            # including a TemporaryDirectory returned under an 8.3 short name.
+            root = root.resolve()
             native_app = root / "native" / "TensorSharp.NativeChat.dll"
             server_app = root / "server" / "TensorSharp.Server.Host.dll"
             model = root / "tiny.gguf"
@@ -143,10 +154,14 @@ class OwnedServerCleanupTests(unittest.TestCase):
             self.assertIn("stoppedUtc", server_case)
 
     def test_summary_failure_terminates_and_reaps_only_owned_server(self):
-        self.exercise_summary_failure(terminate_times_out=False)
+        for noncanonical in (False, True):
+            with self.subTest(noncanonical_temp_path=noncanonical):
+                self.exercise_summary_failure(terminate_times_out=False, noncanonical_temp_path=noncanonical)
 
     def test_summary_failure_kills_and_reaps_owned_server_when_terminate_times_out(self):
-        self.exercise_summary_failure(terminate_times_out=True)
+        for noncanonical in (False, True):
+            with self.subTest(noncanonical_temp_path=noncanonical):
+                self.exercise_summary_failure(terminate_times_out=True, noncanonical_temp_path=noncanonical)
 
 
 if __name__ == "__main__":
