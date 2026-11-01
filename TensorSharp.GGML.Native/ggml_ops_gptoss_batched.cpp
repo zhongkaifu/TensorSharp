@@ -606,7 +606,7 @@ static int gob_decode_batched_window(
         ggml_tensor* router_logits = ggml_mul_mat(ctx, t.gate_inp_w, moe_in);
         if (t.gate_inp_b != nullptr)
             router_logits = ggml_add(ctx, router_logits, t.gate_inp_b);
-        ggml_tensor* sel = ggml_top_k(ctx, router_logits, nUsed);
+        ggml_tensor* sel = tsg::ordered_moe_top_k(ctx, router_logits, nUsed);
         ggml_tensor* logits_r = ggml_reshape_3d(ctx, router_logits, 1, nExp, n_seqs);
         ggml_tensor* w = ggml_get_rows(ctx, logits_r, sel);
         ggml_tensor* w_soft = ggml_soft_max(ctx, ggml_reshape_2d(ctx, w, nUsed, n_seqs));
@@ -1103,7 +1103,7 @@ static int gob_decode_batched_arena(
             ggml_tensor* router_logits = ggml_mul_mat(ctx, t.gate_inp_w, moe_in);
             if (t.gate_inp_b != nullptr)
                 router_logits = ggml_add(ctx, router_logits, t.gate_inp_b);
-            ggml_tensor* sel = ggml_top_k(ctx, router_logits, nUsed);
+            ggml_tensor* sel = tsg::ordered_moe_top_k(ctx, router_logits, nUsed);
             ggml_tensor* logits_r = ggml_reshape_3d(ctx, router_logits, 1, nExp, n_slots);
             ggml_tensor* w = ggml_get_rows(ctx, logits_r, sel);
             ggml_tensor* w_soft = ggml_soft_max(ctx, ggml_reshape_2d(ctx, w, nUsed, n_slots));

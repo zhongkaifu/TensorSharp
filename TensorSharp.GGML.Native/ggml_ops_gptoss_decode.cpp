@@ -698,7 +698,7 @@ static int gptoss_model_decode_impl(
                 router_logits = ggml_add(ctx, router_logits, t.gate_inp_b);
             // GPT-OSS gates with SOFTMAX_WEIGHT: top-k over the RAW logits, then a
             // softmax over just the selected ones (no renormalisation afterwards).
-            ggml_tensor* sel = ggml_top_k(ctx, router_logits, nUsed);
+            ggml_tensor* sel = tsg::ordered_moe_top_k(ctx, router_logits, nUsed);
             ggml_tensor* logits_r = ggml_reshape_3d(ctx, router_logits, 1, nExp, 1);
             ggml_tensor* w = ggml_get_rows(ctx, logits_r, sel);                        // [1, nUsed, 1]
             ggml_tensor* w_soft = ggml_soft_max(ctx, ggml_reshape_2d(ctx, w, nUsed, 1));

@@ -138,6 +138,20 @@ namespace tsg
             ggml_backend_tensor_set(tensor, data, offset, bytes);
     }
 
+    // Descending-score, compact indices for routed FFNs that gather and normalize their
+    // weights before accumulating experts in routing-slot order. ggml_top_k
+    // permits unordered indices; CUDA's single-row CUB implementation can return
+    // the same expert set in different orders for identical scores. That changes
+    // both floating-point normalization and the subsequent weighted reduction.
+    // Sort before either operation. Materialize the argsort view so existing
+    // [n_used, tokens] reshapes retain the compact layout of ggml_top_k.
+    // Equal-score tie order follows the backend's argsort implementation.
+    inline ggml_tensor* ordered_moe_top_k(
+        ggml_context* ctx, ggml_tensor* scores, int n_used)
+    {
+        return ggml_cont(ctx, ggml_argsort_top_k(ctx, scores, n_used));
+    }
+
     // ------------------------------------------------------------------
     // Softmax-gated top-k MoE routing, in the shape ggml-cuda can fuse
     // ------------------------------------------------------------------
@@ -152,10 +166,9 @@ namespace tsg
     // TensorSharp off it:
     //
     //  * `ggml_top_k` is its own op (GGML_OP_TOP_K), not `argsort + view`, so
-    //    the pattern never matched. It is also strictly more work — a full sort
-    //    of all n_expert scores per token where the fused kernel does a partial
-    //    selection — and it hands back a COMPACT [k, tokens] tensor, whereas the
-    //    fused kernel recovers n_expert from the ids' row stride
+    //    the pattern never matched. It also permits unordered indices and hands
+    //    back a COMPACT [k, tokens] tensor, whereas the fused kernel recovers
+    //    n_expert from the ids' row stride
     //    (`ids->nb[1] / ids->nb[0]`), which only holds for the argsort view.
     //  * the reshape of `probs` has to be emitted between the softmax and the
     //    argsort, which is a consequence of build order, not of the maths.

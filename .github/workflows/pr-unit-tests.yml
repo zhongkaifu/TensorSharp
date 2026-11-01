@@ -57,6 +57,35 @@ jobs:
           dotnet build eng/tests/NativeChatCompletion -c Release -p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true
           dotnet run --project eng/tests/NativeChatCompletion -c Release --no-build -- examples/tensorsharp-native-chat/bin/Release/net10.0/TensorSharp.NativeChat.dll
 
+  moe-probe-contracts:
+    name: MoE probe contracts (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile the fixed-history probe without native builds or models
+        # Force the supported committed-PTX fallback even if a hosted image
+        # happens to include nvcc. This job only checks managed contracts.
+        run: >
+          dotnet build eng/ResetLogitProbe/ResetLogitProbe.csproj -c Release
+          -p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true
+          -p:TensorSharpSkipCpuNative=true -p:CudaNvcc=nvcc-disabled-for-moe-probe-contracts
+      - name: Verify strict full-logit evidence guards with synthetic files
+        run: dotnet run --project eng/ResetLogitProbe/tests/ResetLogitProbe.Validation.Tests.csproj -c Release
+      - name: Verify owned Windows process cleanup with fault injection
+        if: runner.os == 'Windows'
+        run: python -m unittest discover -s eng/ResetLogitProbe/tests -p test_local_moe_chat_cleanup.py -v
+
   unit-tests:
     name: CPU correctness (${{ matrix.os }})
     strategy:
@@ -97,3 +126,20 @@ jobs:
         run: >
           dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
           --filter "Category!=Bench&Requires!=Cuda&Requires!=Mlx&Requires!=Models"
+
+      # Reuse the CPU-only build made by the managed test project above. Build
+      # only these standalone regressions; no GPU backend or model is loaded.
+      - name: Build focused MoE routing and graph-plan regressions
+        run: |
+          cmake -S TensorSharp.GGML.Native -B TensorSharp.GGML.Native/build \
+            -DCMAKE_BUILD_TYPE=Release -DTENSORSHARP_GGML_NATIVE_BUILD_TESTS=ON \
+            -DTENSORSHARP_GGML_NATIVE_ENABLE_CUDA=OFF \
+            -DTENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF \
+            -DTENSORSHARP_GGML_NATIVE_ENABLE_METAL=OFF
+          cmake --build TensorSharp.GGML.Native/build --config Release --parallel 2 \
+            --target GgmlOpsOrderedMoeRoutingTest GgmlOpsGraphAllocCurrentPlanTest
+      - name: Run focused native CPU regressions
+        run: >
+          ctest --test-dir TensorSharp.GGML.Native/build -C Release
+          -R '^(ordered-moe-routing-cpu|current-graph-plan-cpu)$'
+          --output-on-failure --no-tests=error

@@ -1292,7 +1292,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecodeBatched(
             if (t.gate_inp_scale_t != nullptr) route_n = ggml_mul(ctx, route_n, t.gate_inp_scale_t);
             ggml_tensor* router_logits = ggml_mul_mat(ctx, t.gate_inp_w, route_n);
             ggml_tensor* probs = ggml_soft_max(ctx, router_logits);
-            ggml_tensor* sel = ggml_top_k(ctx, probs, nUsed);
+            ggml_tensor* sel = tsg::ordered_moe_top_k(ctx, probs, nUsed);
             ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, nExp, n_seqs);
             ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);
             ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, nUsed, n_seqs);

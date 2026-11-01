@@ -811,6 +811,32 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
             PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
     endif()
 
+    # The production MoE selector must return compact, score-ordered IDs before
+    # weight normalization and expert accumulation. No model checkpoint needed.
+    add_executable(GgmlOpsOrderedMoeRoutingTest tests/ordered_moe_routing_test.cpp)
+    target_include_directories(GgmlOpsOrderedMoeRoutingTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsOrderedMoeRoutingTest PRIVATE ggml-cpu ggml-base)
+    add_test(NAME ordered-moe-routing-cpu COMMAND GgmlOpsOrderedMoeRoutingTest cpu)
+    set_tests_properties(ordered-moe-routing-cpu PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        target_compile_definitions(GgmlOpsOrderedMoeRoutingTest PRIVATE TSG_GGML_USE_CUDA=1)
+        target_link_libraries(GgmlOpsOrderedMoeRoutingTest PRIVATE ggml-cuda)
+        add_test(NAME ordered-moe-routing-cuda COMMAND GgmlOpsOrderedMoeRoutingTest cuda)
+        set_tests_properties(ordered-moe-routing-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+    endif()
+
+    add_executable(GgmlOpsGraphAllocCurrentPlanTest tests/graph_alloc_current_plan_test.cpp)
+    target_include_directories(GgmlOpsGraphAllocCurrentPlanTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsGraphAllocCurrentPlanTest PRIVATE ggml-cpu ggml-base)
+    add_test(NAME current-graph-plan-cpu COMMAND GgmlOpsGraphAllocCurrentPlanTest cpu)
+    set_tests_properties(current-graph-plan-cpu PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        target_compile_definitions(GgmlOpsGraphAllocCurrentPlanTest PRIVATE TSG_GGML_USE_CUDA=1)
+        target_link_libraries(GgmlOpsGraphAllocCurrentPlanTest PRIVATE ggml-cuda)
+        add_test(NAME current-graph-plan-cuda COMMAND GgmlOpsGraphAllocCurrentPlanTest cuda)
+        set_tests_properties(current-graph-plan-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+    endif()
+
     add_executable(GgmlOpsHostMoeExpertCacheTest
         tests/host_moe_expert_cache_test.cpp ggml_ops_host_moe_cache.cpp)
     target_include_directories(GgmlOpsHostMoeExpertCacheTest PRIVATE
