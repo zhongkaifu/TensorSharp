@@ -66,10 +66,15 @@ public sealed class PortablePdfProcessRunnerTests : IDisposable
         finally
         {
             cancellation.Cancel();
-            foreach (int id in ids)
-                try { using var process = Process.GetProcessById(id); process.Kill(entireProcessTree: true); }
-                catch (ArgumentException) { }
-                catch (InvalidOperationException) { }
+            try { await run; }
+            catch (OperationCanceledException) { } // Reap even if readiness or an assertion failed.
+            finally
+            {
+                foreach (int id in ids)
+                    try { using var process = Process.GetProcessById(id); process.Kill(entireProcessTree: true); }
+                    catch (ArgumentException) { }
+                    catch (InvalidOperationException) { }
+            }
         }
     }
 

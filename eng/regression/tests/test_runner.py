@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from regression import reports, runner
 from regression.configs import FileSpec, ResolvedConfig
 from regression.downloads import PrepareError
+from regression.scenarios import availability as actual_availability
+from regression.processes import clean_environment
 
 GIB = 1024 ** 3
 
@@ -326,7 +328,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(16 * GIB, result["resource_plan"]["estimates"]["ram_required_bytes"])
         self.assertEqual(6 * GIB, result["resource_plan"]["estimates"]["vram_required_bytes"])
         context = self.run.call_args.args[1]
-        self.assertEqual({"CUDA_VISIBLE_DEVICES": "0", "TS_CPU_MOE": "1"}, context["env"])
+        self.assertEqual({"CUDA_VISIBLE_DEVICES": "0", "TS_CPU_MOE": "1", "MAX_CONTEXT": "2048"}, context["env"])
         self.assertEqual("cpu_moe", context["offload_policy"]["name"])
         self.assertEqual("explicit_user_requirements", report["policy"]["offload"]["estimate_source"])
         self.assertIn("--cpu-moe", result["reproduce"])
@@ -404,12 +406,68 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("ggml_cpu", report["results"][-1]["backend"])
         direct_cuda = next(row for row in report["backend_selections"][0]["attempts"] if row["backend"] == "cuda")
         self.assertFalse(direct_cuda["eligible"])
-        self.assertEqual({"TS_CPU_MOE": "1"}, self.run.call_args.args[1]["env"])
+        self.assertEqual({"TS_CPU_MOE": "1", "MAX_CONTEXT": "2048"}, self.run.call_args.args[1]["env"])
 
     def test_default_run_passes_no_cpu_moe_environment(self):
         self.invoke("--mode", "run")
         self.assertNotIn("TS_CPU_MOE", self.run.call_args.args[1]["env"])
         self.assertFalse(self.run.call_args.args[1]["offload_policy"]["requested"])
+
+    def test_context_is_explicit_recorded_and_reproduced_without_ambient_inheritance(self):
+        self.run.side_effect = lambda *_: {"status": "pass", "reason": "fixture passed"}
+        for tokens in (256, 2048):
+            with self.subTest(tokens=tokens):
+                self.output = self.repo / "artifacts" / ("context-" + str(tokens))
+                with patch.dict("os.environ", {"MAX_CONTEXT": "99999"}):
+                    code, report = self.invoke("--mode", "run", "--context-tokens", str(tokens))
+                    context = self.run.call_args.args[1]
+                    environment = clean_environment(context["env"])
+                self.assertEqual(0, code)
+                self.assertEqual(tokens, context["context_tokens"])
+                self.assertEqual(str(tokens), environment["MAX_CONTEXT"])
+                self.assertEqual(tokens, report["policy"]["context_tokens"])
+                self.assertEqual({"MAX_CONTEXT": str(tokens)}, report["policy"]["model_environment"])
+                result = report["results"][-1]
+                self.assertEqual(tokens, result["context_tokens"])
+                self.assertEqual(str(tokens), result["reproduce"][result["reproduce"].index("--context-tokens") + 1])
+                if tokens == 256:
+                    small_context_estimates = result["resource_plan"]["estimates"]
+                else:
+                    self.assertEqual(small_context_estimates, result["resource_plan"]["estimates"],
+                                     "smaller context must not silently lower resource estimates")
+
+    def test_default_context_remains_2048(self):
+        self.assertEqual(2048, runner.parse_args([]).context_tokens)
+        self.invoke("--mode", "run")
+        self.assertEqual("2048", self.run.call_args.args[1]["env"]["MAX_CONTEXT"])
+
+    def test_invalid_contexts_rejected(self):
+        for value in ("0", "-1", "2049", "65536", "nan", "inf", "256.5", "true"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                runner.parse_args(["--context-tokens", value])
+            self.assertEqual(2, error.exception.code)
+
+    def test_context_too_small_skips_before_prepare_or_metadata_probe_without_reshaping(self):
+        self.availability.side_effect = actual_availability
+        self.catalog_data["presets"][0]["scenarios"] = ["forced_logits_sequence"]
+        fixture = {"id": "forced_logits_sequence", "status": "automated", "fixture": {"sentinel": "unchanged"}}
+        self.catalog_data["scenarios"] = [fixture]
+        self.catalog.write_text(json.dumps(self.catalog_data))
+        for backend in ("ggml_cpu", "auto"):
+            with self.subTest(backend=backend):
+                self.output = self.repo / "artifacts" / ("insufficient-" + backend)
+                with patch.object(runner, "sizes_for") as sizes:
+                    code, report = self.invoke("--mode", "run", "--backend", backend, "--context-tokens", "256", "--allow-download")
+                self.assertEqual(3, code)
+                result = report["results"][-1]
+                self.assertEqual("skip", result["status"])
+                self.assertIn("requires context_tokens >= 576", result["reason"])
+                self.assertIn("fixed fixture inputs and steps are unchanged", result["reason"])
+                self.assertEqual("256", result["reproduce"][result["reproduce"].index("--context-tokens") + 1])
+                sizes.assert_not_called()
+        self.assertEqual(fixture, json.loads(self.catalog.read_text())["scenarios"][0])
+        self.prepare.assert_not_called()
+        self.run.assert_not_called()
 
     def test_cumulative_download_cap_stops_later_model_before_prepare(self):
         first = self.catalog_data["presets"][0]

@@ -40,6 +40,47 @@ def logit_metrics(comparison=False):
 
 
 class ScenarioContracts(unittest.TestCase):
+    def test_fixed_context_minima_preserve_inputs_and_requirements(self):
+        context = {"backend": "ggml_cpu", "preparing_model": True,
+                   "cli_command": ["fixture-cli"], "logit_command": ["fixture-probe"], "server_command": ["fixture-server"]}
+        for kind, minimum in (("cli_text", 256), ("cli_prefill", 128), ("cli_decode", 48),
+                              ("forced_logits", 144), ("forced_logits_sequence", 576), ("server_chat", 2048)):
+            with self.subTest(kind=kind):
+                case = {"id": kind}
+                original = copy.deepcopy(case)
+                ready, reason = availability(case, {**context, "context_tokens": minimum - 1})
+                self.assertFalse(ready)
+                self.assertIn(f"requires context_tokens >= {minimum}", reason)
+                self.assertTrue(availability(case, {**context, "context_tokens": minimum})[0])
+                self.assertEqual(original, case)
+
+    def test_small_context_is_not_applied_to_unbounded_or_other_adapters(self):
+        from eng.regression.scenarios import ADAPTER_IDS
+        context = {"context_tokens": 256, "preparing_model": True}
+        bounded = {"cli_text", "cli_prefill", "cli_decode", "forced_logits", "forced_logits_sequence"}
+        for kind in ADAPTER_IDS - bounded:
+            with self.subTest(kind=kind):
+                ready, reason = availability({"id": kind}, context)
+                self.assertFalse(ready)
+                self.assertIn("requires context_tokens >= 2048", reason)
+        ready, reason = availability({"id": "cli_text", "fixture": {"prompt": "arbitrary " * 1000}}, context)
+        self.assertFalse(ready)
+        self.assertIn("requires context_tokens >= 2048", reason)
+
+    def test_invalid_context_cannot_bypass_adapter_gate(self):
+        for value in (0, -1, 2049, True, 256.0, "256", None):
+            with self.subTest(value=value):
+                ready, reason = availability({"id": "cli_text"}, {"context_tokens": value})
+                self.assertFalse(ready)
+                self.assertIn("integer in 1..2048", reason)
+
+    def test_ngram_delegate_cannot_bypass_context_gate(self):
+        with tempfile.TemporaryDirectory() as directory, patch("eng.regression.speculation.run_ngram") as execute:
+            result = run_scenario({"id": "speculation_ngram"}, {"artifact_dir": Path(directory), "context_tokens": 256})
+        self.assertEqual("untested", result["status"])
+        self.assertIn("requires context_tokens >= 2048", result["reason"])
+        execute.assert_not_called()
+
     def test_hosted_stem_alias_uses_exact_filename_response_identity(self):
         loaded = "Qwen3.5-0.8B-Q4_K_M.gguf"
         for alias in (loaded, "Qwen3.5-0.8B-Q4_K_M"):
@@ -288,6 +329,21 @@ class RealSubprocessRegressions(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_explicit_context_reaches_cli_without_changing_fixed_fixture(self):
+        output = "Backend: Cpu\ncli.inference decode complete: tokens=2 ms=1 tokensPerSec=2\ncli.inference finishReason=eos tokens=2\n=== Generated Output ===\n56"
+        script = "import os; assert os.environ['MAX_CONTEXT'] == '256'; print(" + repr(output) + ")"
+        self.context.update(context_tokens=256, env={"MAX_CONTEXT": "256"},
+                            cli_command=[sys.executable, "-c", script])
+        with patch.dict(os.environ, {"MAX_CONTEXT": "99999"}):
+            result = run_scenario({"id": "cli_text"}, self.context)
+        self.assertEqual("pass", result["status"], result)
+        self.assertEqual("What is 7 multiplied by 8? Reply with only the integer answer.", result["inputs"]["prompt"])
+        self.assertEqual(2, len(result["processes"]))
+        for process in result["processes"]:
+            command = process["command"]
+            self.assertEqual("128", command[command.index("--max-tokens") + 1])
+            self.assertTrue(process["teardown"]["verified"])
 
     def cpu_moe_profile(self):
         self.context.update(backend="ggml_cuda", model_family="qwen35", model_layout="moe", env={"TS_CPU_MOE": "1"},

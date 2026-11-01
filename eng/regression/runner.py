@@ -96,6 +96,7 @@ def parse_args(argv=None):
     parser.add_argument("--assume-backend-available", action="store_true", help="Override detection only; actual runtime backend still must match")
     parser.add_argument("--max-models", type=int, default=0, help="0 means no count limit; download budget always applies")
     parser.add_argument("--timeout-seconds", type=float, default=600)
+    parser.add_argument("--context-tokens", type=int, default=2048, help="Explicit model context, 1..2048 (default 2048); insufficient fixed fixtures are skipped without resizing")
     parser.add_argument("--strict", action="store_true", help="Exit 3 for any selected skip/untested coverage")
     parser.add_argument("--include-suites", action="store_true", help="Include existing local .NET and client correctness suites")
     parser.add_argument("--native-test-build-dir", type=Path, help="Explicit prebuilt CTest directory from this checkout; no implicit native build")
@@ -112,6 +113,8 @@ def parse_args(argv=None):
             parser.error(f"--{key.replace('_', '-')} must be finite and nonnegative")
     if args.max_models < 0 or args.gpu_index < 0:
         parser.error("--max-models and --gpu-index must be nonnegative")
+    if not 1 <= args.context_tokens <= 2048:
+        parser.error("--context-tokens must be an integer in 1..2048")
     for key in ("ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib"):
         if getattr(args, key) == 0:
             parser.error(f"--{key.replace('_', '-')} must be positive")
@@ -295,7 +298,7 @@ def reproduce_args(args, repo, root, preset, backend, scenario):
         # nonempty evidence directory. The generated argv is saved per result.
         fresh = args.output.resolve().parent / ("repro-" + preset["id"] + "-" + scenario["id"] + "-" + uuid.uuid4().hex[:8])
         command += ["--output", str(fresh)]
-    for key in ("cli", "server", "http_client", "logit_probe", "benchmark", "engine_repo", "media_dir", "ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib", "gpu_index", "disk_headroom_gib", "max_download_gib", "timeout_seconds", "catalog"):
+    for key in ("cli", "server", "http_client", "logit_probe", "benchmark", "engine_repo", "media_dir", "ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib", "gpu_index", "disk_headroom_gib", "max_download_gib", "timeout_seconds", "context_tokens", "catalog"):
         value = getattr(args, key)
         if value is not None:
             command += ["--" + key.replace("_", "-"), str(value)]
@@ -372,6 +375,8 @@ def main(argv=None):
                      if getattr(args, key) is not None}
         report["policy"] = {"model_root": str(root), "max_download_bytes": int(args.max_download_gib * GIB),
                             "requested_backend": args.backend, "overrides": overrides, "allow_download": args.allow_download,
+                            "context_tokens": args.context_tokens, "model_environment": {"MAX_CONTEXT": str(args.context_tokens)},
+                            "context_policy": "fixed explicit context; fixtures unchanged; no automatic memory estimate reduction",
                             "offload": offload_profile(args), "sampling": {"seed": 42, "temperature": 0}}
         presets = [p for p in catalog["presets"] if selected(p["id"], args.models)]
         if not presets:
@@ -421,6 +426,7 @@ def main(argv=None):
                     if not preliminary.unavailable:
                         preliminary_options, preliminary_files = use_existing(preliminary, index)
                         preliminary_context = {"repo": repo, "backend": backends[0], "preparing_model": True, "model_family": preset["family"],
+                            "context_tokens": args.context_tokens,
                             "model_options": preliminary_options, "model_path": preliminary_options.get("model"),
                             "media_dir": args.media_dir, "offload_policy": offload_profile(args, preset, backends[0]), **commands}
                         preliminary_cases = []
@@ -474,9 +480,11 @@ def main(argv=None):
                 profile = offload_profile(args, preset, backend)
                 model_env = {"CUDA_VISIBLE_DEVICES": str(args.gpu_index)} if backend in {"cuda", "ggml_cuda"} else {}
                 model_env.update(profile["environment"])
+                model_env["MAX_CONTEXT"] = str(args.context_tokens)
                 base_context = {"repo": repo, "backend": backend, "artifact_dir": output, "model_family": preset["family"],
                                 "timeout_seconds": args.timeout_seconds, "media_dir": args.media_dir,
                                 "disk_headroom_gib": args.disk_headroom_gib,
+                                "context_tokens": args.context_tokens,
                                 "model_layout": preset.get("layout"), "offload_policy": profile,
                                 "seed": 42, "env": model_env, **commands}
                 candidates = []
@@ -593,6 +601,7 @@ def main(argv=None):
                         result = result_stub(preset, backend, scenario, outcome.pop("status"), outcome.pop("reason", ""),
                                              **outcome)
                         result["resource_plan"] = resources
+                        result["context_tokens"] = args.context_tokens
                         result["offload_policy"] = profile
                         result["model_identity"] = plain(identities)
                         result["duration_seconds"] = time.monotonic() - start

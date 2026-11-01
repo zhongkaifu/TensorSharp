@@ -36,6 +36,10 @@ _CONFIG_KEYS = {"model", "mmproj", "draft-model", "tokenizer", "kv-cache-dtype",
                 "video-frames", "video-fps", "spec"}
 _NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 _PROMPT = "What is 7 multiplied by 8? Reply with only the integer answer."
+# Bounds describe existing fixture shapes; they never change prompts or decode
+# lengths. Other adapters keep the established 2048-token deployment contract.
+_MIN_CONTEXT_TOKENS = {"cli_text": 256, "cli_prefill": 128, "cli_decode": 48,
+                       "forced_logits": 144, "forced_logits_sequence": 576}
 _ANSWER = r"^\s*56[.!]?\s*$"
 _SESSION_MARKER = "REGRESSION_COBALT_7319"
 _SESSION_MARKER_B = "REGRESSION_AMBER_4826"
@@ -74,6 +78,14 @@ def availability(case, context):
     kind = _kind(case)
     if kind not in ADAPTER_IDS:
         return False, "scenario has a documented recipe but no executable adapter"
+    tokens = context.get("context_tokens", 2048)
+    if type(tokens) is not int or not 1 <= tokens <= 2048:
+        return False, "context_tokens must be an explicit integer in 1..2048"
+    minimum = _MIN_CONTEXT_TOKENS.get(kind, 2048)
+    if kind == "cli_text" and (case.get("fixture") or {}).get("prompt", _PROMPT) != _PROMPT:
+        minimum = 2048  # An arbitrary caller prompt has no fixed token bound.
+    if tokens < minimum:
+        return False, f"{kind} requires context_tokens >= {minimum}; selected {tokens}; fixed fixture inputs and steps are unchanged"
     if kind == "speculation_ngram":
         from .speculation import availability as ngram_available
         return ngram_available(context)
@@ -1095,9 +1107,6 @@ def _reset_and_cache(http, payload, result, context):
 
 def run_scenario(case, context):
     """Execute one adapter; status is pass/fail/untested, never infer coverage from exit 0."""
-    if _kind(case) == "speculation_ngram":
-        from .speculation import run_ngram
-        return run_ngram(case, context)
     start = time.monotonic()
     root = Path(context["artifact_dir"])
     root.mkdir(parents=True, exist_ok=True)
@@ -1107,6 +1116,9 @@ def run_scenario(case, context):
     if not available:
         result["reason"] = reason
         return result
+    if _kind(case) == "speculation_ngram":
+        from .speculation import run_ngram
+        return run_ngram(case, context)
     interrupted = False
     try:
         kind = _kind(case)

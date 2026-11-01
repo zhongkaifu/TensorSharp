@@ -270,6 +270,32 @@ Reproduction commands retain the flag and both requirements. Without `--cpu-moe`
 the conservative full-weight planning gate remains unchanged; native model-specific
 placement behavior is not inferred from a successful preflight.
 
+### Explicit context limit
+
+`--context-tokens` accepts integers from **1 to 2048**, with **2048** as the
+unchanged default. It sets `MAX_CONTEXT` explicitly in owned model processes;
+an ambient `MAX_CONTEXT` is not inherited. The report records the value and
+environment policy, and reproduction commands retain the option. There is no
+automatic context reduction and no corresponding reduction in RAM/VRAM estimates.
+CPU MoE still requires both explicit peak-memory requirements, established for
+the selected context and workload.
+
+Insufficient context produces a `skip` before model preparation or downloads.
+Prompts, fixed token histories, decode steps and numerical gates remain unchanged:
+
+| Scenario | Minimum context tokens |
+|---|---:|
+| `cli_text`, using the built-in bounded arithmetic prompt | 256 |
+| `cli_prefill` (128 prefill, no decode) | 128 |
+| `cli_decode` (32 prefill, 16 decode) | 48 |
+| `forced_logits` (128-token prefill, 16 logit rows: initial prefill plus 15 decode forwards) | 144 |
+| `forced_logits_sequence` (512-token long control, 32 logit rows: initial prefill plus 31 decode forwards, conservative margin) | 576 |
+| Other model adapters or a custom `cli_text` prompt | 2048 |
+
+For example, `--context-tokens 256 --scenarios cli_text,forced_logits` selects
+bounded checks without shrinking their fixtures. A sequence-order test selected
+with that context is reported as skipped, not replaced with a shorter sequence.
+
 ## Executed assertions and safe fixtures
 
 CLI adapters assert task-specific text, positive prefill/decode metrics, multi-turn
