@@ -97,3 +97,10 @@ jobs:
         run: >
           dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
           --filter "Category!=Bench&Requires!=Cuda&Requires!=Mlx&Requires!=Models"
+
+      - name: Check HostMoE overlap planning and quality oracles (no GPU/model)
+        run: |
+          python3 eng/validation/tests/test_moe_metal_overlap_quality.py
+          cmake -S TensorSharp.GGML.Native -B TensorSharp.GGML.Native/build -DTENSORSHARP_GGML_NATIVE_BUILD_TESTS=ON
+          cmake --build TensorSharp.GGML.Native/build --target GgmlOpsHostMoeMetalOverlapTest -j2
+          ctest --test-dir TensorSharp.GGML.Native/build -R '^host-moe-metal-overlap-plan-drain$' --output-on-failure
