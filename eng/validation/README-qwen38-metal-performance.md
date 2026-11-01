@@ -78,7 +78,9 @@ The HTTP ABBA comparison ran auto/tuned/tuned/auto sequentially, with two
 repetitions of three prompts per server: **24 requests, zero errors**. All
 paired complete answers and token-usage records matched exactly; cached-token
 usage was zero and every request ended with `stop`. Arithmetic, Chinese and
-JSON responses used 4, 87 and 11 completion tokens respectively. All four
+JSON responses used 4, 87 and 11 completion tokens respectively. The eight
+JSON responses also pass a type-strict recheck: `answer` is integer `42` and
+`ok` is boolean `true` throughout. All four
 arithmetic first-token F32 vectors were validated, with all three comparisons
 against the first vector bit-identical across all 248,320 elements. This
 checks these deterministic requests; it does not establish broader language

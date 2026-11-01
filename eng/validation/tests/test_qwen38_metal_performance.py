@@ -309,8 +309,30 @@ class IdentityTests(unittest.TestCase):
                 PERF.identity(root, dll)
 
 
+class JsonValueTests(unittest.TestCase):
+    def test_numeric_equality_does_not_hide_different_json_types(self):
+        for actual, expected in ((1, True), (True, 1), (42.0, 42), (42, 42.0),
+                                 (0, False), (False, 0), (1.0, True)):
+            with self.subTest(actual=actual, expected=expected):
+                self.assertFalse(PERF.json_values_equal(actual, expected))
+
+    def test_nested_types_keys_and_array_order_are_checked(self):
+        expected = {"items": [{"answer": 42, "ok": True}], "empty": None}
+        same = json.loads('{"empty":null,"items":[{"ok":true,"answer":42}]}')
+        self.assertTrue(PERF.json_values_equal(same, expected))
+        for text in ('{"empty":null,"items":[{"ok":1,"answer":42}]}',
+                     '{"empty":null,"items":[{"ok":true,"answer":42.0}]}',
+                     '{"items":[{"ok":true,"answer":42}]}',
+                     '{"empty":null,"items":[{"ok":true,"answer":42}],"extra":0}',
+                     '{"empty":null,"items":[]}'):
+            with self.subTest(text=text):
+                self.assertFalse(PERF.json_values_equal(json.loads(text), expected))
+        self.assertFalse(PERF.json_values_equal([1, 2], [2, 1]))
+
+
 class HttpVectorTests(unittest.TestCase):
-    def run_mocked_servers(self, changed=False, missing=False, pid_text=None):
+    def run_mocked_servers(self, changed=False, missing=False, pid_text=None,
+                           json_answer='{"answer":42,"ok":true}', expect_json_error=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             model = root / "synthetic.gguf"
@@ -348,7 +370,7 @@ class HttpVectorTests(unittest.TestCase):
 
             def request(port, model, messages, max_tokens, timeout):
                 prompt = messages[0]["content"]
-                answer = "579" if prompt.startswith("Only output") else '{"answer":42,"ok":true}' if prompt.startswith("Output only") else "中文回答"
+                answer = "579" if prompt.startswith("Only output") else json_answer if prompt.startswith("Output only") else "中文回答"
                 return {"answer": answer, "usage": USAGE, "errors": [], "finish_reason": "stop", "ttft_ms": 1, "e2e_ms": 2}
 
             connection = Mock()
@@ -368,7 +390,7 @@ class HttpVectorTests(unittest.TestCase):
                 try:
                     PERF.main()
                 except SystemExit as error:
-                    self.assertTrue(missing)
+                    self.assertTrue(missing or expect_json_error)
                     self.assertEqual(1, error.code)
             return json.loads((output / "report.json").read_text()), launched
 
@@ -397,6 +419,17 @@ class HttpVectorTests(unittest.TestCase):
                 self.assertTrue(report["complete"])
                 self.assertTrue(report["passed"])
                 self.assertEqual([0, 0], [p["exit_code_after_owned_shutdown"] for p in report["processes"]])
+
+    def test_json_numeric_coercions_fail_the_actual_http_validation_path(self):
+        for text in ('{"answer":42,"ok":1}', '{"answer":42.0,"ok":true}',
+                     '{"answer":42,"ok":1.0}'):
+            with self.subTest(answer=text):
+                report, _ = self.run_mocked_servers(json_answer=text, expect_json_error=True)
+                self.assertFalse(report["passed"])
+                self.assertEqual(2, report["quality_summary"]["failed_requests"])
+                requests = [r for p in report["processes"] for r in p["requests"] if r["scenario"] == "json"]
+                self.assertEqual(2, len(requests))
+                self.assertTrue(all("incorrect JSON answer" in r["errors"] for r in requests))
 
 
 class MainPersistenceTests(unittest.TestCase):

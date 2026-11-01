@@ -338,6 +338,19 @@ def request_sse(port, model, messages, max_tokens, timeout):
     return result
 
 
+def json_values_equal(actual, expected):
+    """Compare parsed JSON trees without Python's bool/int/float coercion."""
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            json_values_equal(actual[key], value) for key, value in expected.items())
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            json_values_equal(left, right) for left, right in zip(actual, expected))
+    return actual == expected
+
+
 def http(args, report):
     references = {}
     first_dump = None
@@ -398,7 +411,7 @@ def http(args, report):
                             result["errors"].append("incorrect arithmetic answer")
                         if isinstance(expected, dict):
                             try:
-                                if json.loads(result["answer"]) != expected:
+                                if not json_values_equal(json.loads(result["answer"]), expected):
                                     raise ValueError("JSON value differs")
                             except ValueError:
                                 result["errors"].append("incorrect JSON answer")
