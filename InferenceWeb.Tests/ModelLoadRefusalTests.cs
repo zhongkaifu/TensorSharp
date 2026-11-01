@@ -318,6 +318,41 @@ public class ModelLoadRefusalTests : IDisposable
         Assert.IsType<ModelLoadRefusedException>(ex);
     }
 
+    [Theory]
+    [InlineData("nemotron_h", "cuda", "does not implement distributed --layer-split on --backend cuda")]
+    [InlineData("deepseek41", "cuda", "Backend 'cuda' is not supported on this machine.")]
+    [InlineData("nemotron_h", "not-a-backend", "Backend 'not-a-backend' is not supported on this machine.")]
+    public void StartupLoad_DistributedArchitectureIsCheckedBeforeBackendAvailability(string architecture, string backend, string reasonFragment)
+    {
+        string model = Path.Combine(_dir, "distributed-" + architecture + ".gguf");
+        SyntheticGguf.Write(model, [new SyntheticGguf.Str { Key = "general.architecture", V = architecture }], []);
+        _env.Set("TENSORSHARP_TP_NODE_ID", "0");
+        _env.Set("TENSORSHARP_TP_PEERS", "127.0.0.1:9,127.0.0.1:10");
+        _env.Set("TENSORSHARP_LAYER_SPLIT_DEGREE", "1");
+        _env.Set("TENSORSHARP_TP_DEGREE", null);
+        bool modelFactoryCalled = false, groupFactoryCalled = false;
+        using var svc = new ModelService(NullLogger<ModelService>.Instance, (_, _, _, _) =>
+        {
+            modelFactoryCalled = true;
+            throw new InvalidOperationException("must not load weights");
+        });
+        svc.TensorParallelGroupFactory = _ =>
+        {
+            groupFactoryCalled = true;
+            throw new InvalidOperationException("must not initialize a GPU or connect peers");
+        };
+
+        // Options deliberately advertise CPU only, independently of the test machine's GPUs.
+        Exception ex = Record.Exception(() =>
+            StartupModelLoader.LoadIfConfigured(Options(model), svc, backend, NullLogger.Instance));
+
+        Assert.True(ModelLoadRefusal.TryDescribe(ex, out string reason), ex?.ToString());
+        Assert.Contains(reasonFragment, reason, StringComparison.Ordinal);
+        Assert.False(modelFactoryCalled);
+        Assert.False(groupFactoryCalled);
+        Assert.False(svc.IsLoaded);
+    }
+
     [Fact]
     public void ReportRefusal_ReleasesFirst_ThenWritesOneLine_AndReturnsTheRefusalCode()
     {

@@ -51,6 +51,13 @@ namespace TensorSharp.Server.Hosting
                 return;
             }
 
+            // Match the CLI: reject an unsupported distributed architecture from its
+            // header before device availability can hide that portable refusal. Unknown
+            // backend names still receive the selector's existing refusal below.
+            string backendInput = string.IsNullOrWhiteSpace(configuredBackendInput) ? options.DefaultBackend : configuredBackendInput;
+            if (BackendCatalog.IsKnownBackend(backendInput))
+                modelService.ValidateDistributedModelSupport(options.StartupModelPath, backendInput);
+
             if (!BackendSelector.TryResolveSupportedBackend(options, configuredBackendInput, out string startupBackend, out string startupBackendError))
                 throw new ModelLoadRefusedException(startupBackendError);
 
