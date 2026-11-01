@@ -26,7 +26,8 @@ class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.repo = Path(self.temp.name)
+        # Compare canonical identities, including Windows short TEMP aliases.
+        self.repo = Path(self.temp.name).resolve()
         self.output = self.repo / "artifacts" / "result"
         self.model = self.repo / "models" / "tiny.gguf"
         self.model.parent.mkdir()

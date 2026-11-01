@@ -24,7 +24,8 @@ SHA = hashlib.sha256(PAYLOAD).hexdigest()
 class ConfigTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        # Windows CI can expose an 8.3 TEMP alias; the resolver canonicalizes it.
+        self.root = Path(self.temp.name).resolve()
         self.config = self.root / "config" / "fixture.json"
         self.config.parent.mkdir()
 
