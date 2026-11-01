@@ -240,7 +240,7 @@ TSG_EXPORT int TSGgml_Gemma4MoELayerDecode(const TSGgmlGemma4MoELayerDesc* d)
             route_n = ggml_mul(ctx, route_n, gate_inp_scale_t);
         ggml_tensor* logits = ggml_mul_mat(ctx, gate_inp_w, route_n);          // [nExp, 1]
         ggml_tensor* probs = ggml_soft_max(ctx, logits);                       // softmax over nExp
-        ggml_tensor* sel = ggml_top_k(ctx, probs, nUsed);                      // [nUsed, 1] i32
+        ggml_tensor* sel = tsg::ordered_moe_top_k(ctx, probs, nUsed);           // [nUsed, 1] i32
         ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, nExp, 1);
         ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);                     // [1, nUsed, 1]
         ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, nUsed, 1);
@@ -1077,7 +1077,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
                 route_n = ggml_mul(ctx, route_n, t.gate_inp_scale_t);
             ggml_tensor* router_logits = ggml_mul_mat(ctx, t.gate_inp_w, route_n);
             ggml_tensor* probs = ggml_soft_max(ctx, router_logits);
-            ggml_tensor* sel = ggml_top_k(ctx, probs, nUsed);
+            ggml_tensor* sel = tsg::ordered_moe_top_k(ctx, probs, nUsed);
             ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, nExp, 1);
             ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);
             ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, nUsed, 1);
