@@ -1,0 +1,9 @@
+{
+  // Optional thread-only overlay for an Apple M5 Pro with 18 logical CPUs
+  // and 48 GiB RAM, using Qwen3.8-Flash-Next UD-Q2_K_XL on ggml_metal.
+  // Qualification uses text-only requests with 33 host expert layers and
+  // 15 Metal expert layers. Other Macs, placements and workloads need retesting.
+  // Merge after your local-model configuration, or pass --model explicitly.
+  // This file contains no model paths or downloads; the setting is process-wide.
+  "cpu-moe-threads": 12
+}

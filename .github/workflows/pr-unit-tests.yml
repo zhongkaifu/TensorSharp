@@ -84,6 +84,9 @@ jobs:
       - name: Check build-linux.sh CUDA build-tree reuse (fake toolchain, no download)
         run: python3 -m unittest eng/tests/test_build_linux_cuda_tree.py
 
+      - name: Check Qwen Metal performance evidence tools (no GPU or model)
+        run: python3 -m unittest eng/validation/tests/test_qwen38_metal_performance.py
+
       # The DeepSeek V4.1 GGUF metadata, truncation, per-stage oracle and trace-sink tools on synthetic
       # inputs (no model, no GPU). They need numpy and gguf-py; the one test that needs torch skips.
       - name: Check the DeepSeek V4.1 GGUF, truncation and per-stage oracle tools (synthetic inputs, no GPU)

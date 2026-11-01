@@ -605,6 +605,9 @@ it and reads those parts from the SSD as tokens need them.
 
   Past a point, wiring more layers does not make it faster: a wired layer holds all 512
   experts, used or not, and takes page cache from the layers that read theirs from the SSD.
+  For the 18-CPU, 48 GiB M5 Pro with this exact quantization, an optional
+  [thread-tuning overlay and reproduction guide](../../eng/validation/README-qwen38-metal-performance.md)
+  describe a twelve-thread host expert configuration and its validation scope.
 - **Decode** runs each host layer's ten experts on TensorSharp's own kernel: ggml's CPU
   dot products on a thread team that is woken once per layer and parked when the layer is
   done. A spinning team slowed the GPU's work between layers 1.5-2x on Apple silicon, so
