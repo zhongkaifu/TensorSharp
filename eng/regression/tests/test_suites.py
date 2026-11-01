@@ -91,6 +91,61 @@ class SuiteTests(unittest.TestCase):
         self.assertIn("--no-build", command)
         self.assertIn("--no-restore", command)
 
+    def test_all_managed_build_restore_test_commands_skip_native_targets(self):
+        for kind in ("dotnet", "client_native", "client_http"):
+            with self.subTest(kind=kind):
+                self.spec.update(kind=kind, example=self.binary)
+                self.process.reset_mock()
+
+                def successful_process(command, **kwargs):
+                    (kwargs["artifact_dir"] / "tests.trx").write_text(self.xml)
+                    return {"exit_code": 0, "stdout": "PASS contracts; 7 completion boundary checks passed", "stderr": ""}
+
+                self.process.side_effect = successful_process
+                results = self.invoke(allow_builds=True)
+                self.assertEqual("pass", results[-1]["status"])
+                self.assertEqual({"managed_builds_allowed": True, "native_builds_allowed": False}, results[-1]["build_policy"])
+                managed = []
+                for call in self.process.call_args_list:
+                    command = call.args[0]
+                    self.assertEqual({"TS_TEST_GGML_BACKEND": "cpu"}, call.kwargs["env"])
+                    if command[0] == "dotnet" and command[1] in {"build", "restore", "test"}:
+                        managed.append(command)
+                        self.assertEqual(1, command.count("-p:TensorSharpSkipGgmlNative=true"))
+                        self.assertEqual(1, command.count("-p:TensorSharpSkipMlxNative=true"))
+                        self.assertNotIn("--no-build", command)
+                        self.assertFalse(any("ENABLE_CUDA" in arg or "ENABLE_VULKAN" in arg for arg in command))
+                self.assertTrue(managed)
+
+    def test_no_build_dotnet_test_also_disables_native_msbuild_targets(self):
+        self.invoke()
+        command = self.process.call_args.args[0]
+        self.assertIn("--no-build", command)
+        self.assertIn("-p:TensorSharpSkipGgmlNative=true", command)
+        self.assertIn("-p:TensorSharpSkipMlxNative=true", command)
+
+    def test_successful_managed_build_without_contract_assembly_is_failure(self):
+        for kind, expected_calls in (("client_native", 1), ("client_http", 2)):
+            with self.subTest(kind=kind):
+                self.spec.update(kind=kind, built=self.repo / "missing.dll", example=self.binary)
+                self.process.reset_mock()
+                self.process.side_effect = None
+                self.process.return_value = {"exit_code": 0, "stdout": "PASS build; 7 completion boundary checks passed", "stderr": ""}
+                results = self.invoke(allow_builds=True)
+                self.assertEqual("fail", results[-1]["status"])
+                self.assertIn("required contract assemblies", results[-1]["reason"])
+                self.assertEqual(expected_calls, self.process.call_count, "missing assembly must block assertion process")
+
+    def test_managed_build_success_cannot_substitute_for_test_assertions(self):
+        self.spec.update(kind="client_http")
+        self.process.side_effect = [
+            {"exit_code": 0, "stdout": "PASS restore", "stderr": ""},
+            {"exit_code": 0, "stdout": "PASS build", "stderr": ""},
+            {"exit_code": 0, "stdout": "", "stderr": ""}]
+        results = self.invoke(allow_builds=True)
+        self.assertEqual("fail", results[-1]["status"])
+        self.assertIn("no assertion evidence", results[-1]["reason"])
+
     def test_failed_test_or_process_never_passes(self):
         self.xml = trx(passed=1, failed=1)
         self.assertEqual(self.invoke()[-1]["status"], "fail")

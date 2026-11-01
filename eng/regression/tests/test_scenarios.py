@@ -21,7 +21,7 @@ from eng.regression.scenarios import (
     run_scenario, validate_chat, validate_embeddings, validate_logit_metrics,
     validate_sequence_metrics,
     _history_hashes,
-    _json_loads, cancellation_evidence,
+    _json_loads, cancellation_evidence, offload_evidence, _attest_offload,
 )
 
 
@@ -40,6 +40,41 @@ def logit_metrics(comparison=False):
 
 
 class ScenarioContracts(unittest.TestCase):
+    def test_cpu_moe_host_requires_active_all_layer_banner(self):
+        active = "MoE CPU offload active: routed experts of all layers stay in system RAM and run on the host (auto threads)"
+        self.assertTrue(offload_evidence(active)["verified"])
+        for text in ("TS_CPU_MOE=1 requested", "MoE CPU offload: all layers", active.replace("all layers", "first 2 layer(s)"),
+                     active + "\n[moe-offload] WARNING: --cpu-moe is not implemented for this backend"):
+            with self.subTest(text=text):
+                self.assertFalse(offload_evidence(text)["verified"])
+
+    def test_cpu_moe_probe_requires_typed_runtime_policy_not_host_banner(self):
+        policy = {"cpu_moe_enabled": True, "all_layers": True, "cpu_moe_layers": 0,
+                  "explicitly_set": True, "cpu_threads": 0, "configuration_source": "environment"}
+        self.assertTrue(offload_evidence("", {"offload_policy": policy}, probe=True)["verified"])
+        self.assertFalse(offload_evidence("MoE CPU offload active: routed experts of all layers stay in system RAM and run on the host",
+                                          {}, probe=True)["verified"])
+        for key, value in (("cpu_moe_enabled", False), ("all_layers", False), ("cpu_moe_layers", 2),
+                           ("explicitly_set", False), ("cpu_threads", 4), ("configuration_source", "default"),
+                           ("cpu_moe_enabled", 1), ("cpu_moe_layers", False)):
+            with self.subTest(key=key, value=value):
+                bad = dict(policy, **{key: value})
+                self.assertFalse(offload_evidence("", {"offload_policy": bad}, probe=True)["verified"])
+        self.assertFalse(offload_evidence("[moe-offload] WARNING: --cpu-moe is not implemented for this model",
+                                          {"offload_policy": policy}, probe=True)["verified"])
+
+    def test_cpu_moe_probe_binds_profile_to_actual_moe_architecture(self):
+        context = {"model_family": "qwen35", "offload_policy": {"name": "cpu_moe", "requested": True, "supported": True}}
+        metrics = {"offload_policy": {"cpu_moe_enabled": True, "all_layers": True, "cpu_moe_layers": 0,
+                  "explicitly_set": True, "cpu_threads": 0, "configuration_source": "environment"}}
+        for architecture in ("qwen35moe", "qwen3next"):
+            _attest_offload(context, {"assertions": [], "evidence": {}}, "probe", "",
+                            dict(metrics, model_architecture=architecture), probe=True)
+        for architecture in (None, "qwen35", "llama", "qwen4exp"):
+            with self.subTest(architecture=architecture), self.assertRaisesRegex(ScenarioFailure, "actual model architecture"):
+                _attest_offload(context, {"assertions": [], "evidence": {}}, "probe", "",
+                                dict(metrics, model_architecture=architecture), probe=True)
+
     def test_backend_requires_positive_runtime_banner(self):
         self.assertFalse(backend_evidence("requested backend=ggml_cuda", "ggml_cuda")["verified"])
         self.assertTrue(backend_evidence("Backend: GgmlCuda\n", "ggml_cuda")["verified"])
@@ -48,10 +83,24 @@ class ScenarioContracts(unittest.TestCase):
         self.assertFalse(backend_evidence("Backend: Cpu\n", "ggml_cuda")["verified"])
         self.assertFalse(backend_evidence("Backend: GgmlCuda\nbackend unavailable, falling back to CPU", "ggml_cuda")["verified"])
 
+    def test_per_op_kernel_fallback_preserves_actual_backend_coverage(self):
+        message = "[qwen35] fused whole-model prefill NOT engaged (backend Cuda has no whole-model prefill graph); falling back to the per-op prefill loop."
+        self.assertTrue(backend_evidence("Backend: Cuda\n" + message, "cuda")["verified"])
+        for switch in ("falling back to CPU", "falling back to the ggml_cpu backend", "fallback backend: cpu"):
+            with self.subTest(switch=switch):
+                self.assertFalse(backend_evidence("Backend: Cuda\n" + switch, "cuda")["verified"])
+
     def test_prompt_or_thinking_cannot_satisfy_answer(self):
         text = "info: prompt mentions 56\n=== Generated Output ===\n--- Thinking ---\n56\n--- End Thinking ---\nwrong\ninfo: done"
         self.assertEqual(extract_assistant(text), "wrong")
         self.assertEqual(extract_assistant("prompt 56\nno output marker"), "")
+
+    def test_cli_interleaved_completion_log_cannot_replace_or_hide_answer(self):
+        prefix = '=== Generated Output ===\n08:41:33 info: TensorSharp.Cli[1501] cli.inference.complete chars=2 preview="56"\n'
+        suffix = '\n08:41:33 info: TensorSharp.Cli[1701] tensorsharp-cli completed exitCode=0\n'
+        self.assertEqual(extract_assistant(prefix + '56' + suffix), '56')
+        self.assertEqual(extract_assistant(prefix + '55' + suffix), '55')
+        self.assertEqual(extract_assistant(prefix + suffix), '')
 
     def test_semantic_and_usage_assertions(self):
         self.assertEqual(validate_chat(completion()), "56")
@@ -200,6 +249,40 @@ class RealSubprocessRegressions(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def cpu_moe_profile(self):
+        self.context.update(backend="ggml_cuda", model_family="qwen35", model_layout="moe", env={"TS_CPU_MOE": "1"},
+                            offload_policy={"name": "cpu_moe", "requested": True, "supported": True})
+
+    def test_cpu_moe_ignored_by_old_cli_cannot_pass(self):
+        self.cpu_moe_profile()
+        self.context["cli_command"] = [sys.executable, "-c", "print('Backend: GgmlCuda\\n=== Generated Output ===\\n56')"]
+        value = run_scenario({"id": "cli_text"}, self.context)
+        self.assertEqual(value["status"], "fail", value)
+        self.assertIn("runtime CPU MoE", value["reason"])
+
+    def test_cpu_moe_active_cli_preserves_backend_and_output_assertions(self):
+        self.cpu_moe_profile()
+        output = "Backend: GgmlCuda\nMoE CPU offload active: routed experts of all layers stay in system RAM and run on the host (auto threads)\ncli.inference decode complete: tokens=2 ms=1 tokensPerSec=2\ncli.inference finishReason=eos tokens=2\n=== Generated Output ===\n56"
+        self.context["cli_command"] = [sys.executable, "-c", "print(" + repr(output) + ")"]
+        value = run_scenario({"id": "cli_text"}, self.context)
+        self.assertEqual(value["status"], "pass", value)
+        self.assertEqual(len(value["evidence"]["offload"]), 2)
+        self.context["cli_command"] = [sys.executable, "-c", "print(" + repr(output.replace("Backend: GgmlCuda", "Backend: Cpu")) + ")"]
+        value = run_scenario({"id": "cli_text"}, self.context)
+        self.assertEqual(value["status"], "fail", value)
+        self.assertIn("actual backend", value["reason"])
+
+    def test_cpu_moe_ignored_by_old_probe_cannot_pass_either_logit_adapter(self):
+        self.cpu_moe_profile()
+        script = self.root / "old_probe.py"
+        script.write_text("import json,sys\nfrom pathlib import Path\np=Path(sys.argv[2]);p.mkdir(parents=True,exist_ok=True)\n(p/'metrics.json').write_text(json.dumps({}))\nprint('Backend: GgmlCuda')\n")
+        self.context["logit_command"] = [sys.executable, str(script)]
+        for kind in ("forced_logits", "forced_logits_sequence"):
+            with self.subTest(kind=kind), patch("eng.regression.scenarios.shutil.disk_usage", return_value=SimpleNamespace(free=100 * 1024**3)):
+                value = run_scenario({"id": kind}, self.context)
+            self.assertEqual(value["status"], "fail", value)
+            self.assertIn("runtime CPU MoE", value["reason"])
+
     def fake_cli(self, answer="56", backend="Cpu", finish="eos", exit_code=0):
         output = f"Backend: {backend}\ninfo: cli.inference decode complete: tokens=1 ms=1 tokensPerSec=1000\ninfo: cli.inference finishReason={finish} tokens=1\n=== Generated Output ===\n{answer}\n"
         return [sys.executable, "-c", "import sys; print(" + repr(output) + "); sys.exit(" + str(exit_code) + ")"]
@@ -307,7 +390,7 @@ def telemetry(request_id, event, message, props):
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_GET(self):
-        if self.path == '/api/models': value = {'loaded':model,'loadedBackend':'cpu'}
+        if self.path == '/api/models': value = {'loaded':model,'loadedBackend':sys.argv[sys.argv.index('--backend')+1]}
         elif self.path == '/api/queue/status': value = {'processing':int(active),'pending_requests':0}
         else: value = {'data':[{'id':model,'embedding_dimensions':2}]}
         self.reply(value)
@@ -378,6 +461,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(data)))
         self.end_headers(); self.wfile.write(data)
 server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+if mode == 'cpu_moe_active': print('MoE CPU offload active: routed experts of all layers stay in system RAM and run on the host (auto threads)', flush=True)
 print('Now listening on: http://127.0.0.1:' + str(port), flush=True)
 server.serve_forever()
 ''', encoding="utf-8")
@@ -389,6 +473,33 @@ server.serve_forever()
         value = self.run_fake_server("server_chat")
         self.assertEqual(value["status"], "pass", value)
         self.assertTrue(value["evidence"]["server_shutdown"]["verified"])
+
+    def test_agent_dispatch_uses_bounded_host_options_and_owned_loopback(self):
+        with patch("eng.regression.agent_regression.run_agents") as run_agents:
+            value = self.run_fake_server("server_agents")
+        self.assertEqual(value["status"], "pass", value)
+        run_agents.assert_called_once()
+        self.assertTrue(run_agents.call_args.args[0].base.startswith("http://127.0.0.1:"))
+        command = value["processes"][0]["command"]
+        self.assertNotIn("--no-multi-agent", command)
+        self.assertIn("--no-skills", command)
+        self.assertNotIn("--code-exec", command)
+        for flag, expected in (("--max-tokens", "256"), ("--agents-max-count", "2"), ("--agents-max-concurrent", "2"),
+                               ("--agents-max-depth", "1"), ("--agents-max-rounds", "3"), ("--agents-max-generations", "6"),
+                               ("--agents-timeout", "10"), ("--agents-max-result-chars", "2000")):
+            self.assertEqual(command[command.index(flag) + 1], expected)
+
+    def test_cpu_moe_ignored_by_old_server_cannot_pass(self):
+        self.cpu_moe_profile()
+        value = self.run_fake_server("server_chat")
+        self.assertEqual(value["status"], "fail", value)
+        self.assertIn("runtime CPU MoE", value["reason"])
+
+    def test_cpu_moe_active_server_is_attested_before_and_after_requests(self):
+        self.cpu_moe_profile()
+        value = self.run_fake_server("server_chat", "cpu_moe_active")
+        self.assertEqual(value["status"], "pass", value)
+        self.assertEqual([proof["stage"] for proof in value["evidence"]["offload"]], ["server-startup", "server-final"])
 
     def test_embedding_negatives_are_executed(self):
         value = self.run_fake_server("server_embeddings", "embedding")

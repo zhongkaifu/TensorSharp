@@ -26,7 +26,7 @@ from .processes import ManagedProcess, redact, run_process, secret_values
 ADAPTER_IDS = frozenset({
     "cli_text", "cli_prefill", "cli_decode", "cli_multi_turn", "cli_tools", "cli_thinking",
     "cli_image", "cli_audio", "cli_video", "forced_logits", "forced_logits_sequence", "server_chat", "server_stream",
-    "server_cancel", "server_reset_cache", "server_structured", "server_tools", "server_embeddings",
+    "server_cancel", "server_reset_cache", "server_structured", "server_tools", "server_embeddings", "server_agents",
     "jev_decision", "image_generation_smoke", "speculation_ngram",
 })
 _LOGIT_BACKENDS = {"cpu", "cuda", "ggml_cpu", "ggml_cuda", "ggml_metal"}
@@ -162,10 +162,49 @@ def backend_evidence(text, expected):
     """The ModelBase banner is emitted after successful backend allocation, not argv parsing."""
     canonical = lambda s: re.sub(r"[_\-]", "", s).lower()
     values = re.findall(r"(?m)^\s*Backend:\s*([A-Za-z_]+)\s*$", text)
-    fallback = re.search(r"(?i)(?:backend[^\n]{0,60}(?:falling back|fallback)|(?:falling back|fallback)[^\n]{0,60}(?:backend|to cpu))", text)
+    # A fused graph declining to per-op kernels stays on the selected device.
+    # Only an explicit switch to a named device/backend invalidates this evidence.
+    device = r"(?:(?:ggml[_-]?)?(?:cpu|cuda|metal|vulkan)|mlx)\b"
+    fallback = re.search(r"(?i)(?:(?:falling\s+back|fallback|switch(?:ing|ed))\s*(?:[:=]\s*)?(?:to\s+)?(?:the\s+)?(?:backend\s+)?" + device
+                         + r"|(?:fallback\s+backend|backend\s+fallback)\s*[:=]\s*" + device + r")", text)
     matching = bool(values) and all(canonical(v) == canonical(expected) for v in values)
     return {"requested": expected, "observed": values, "fallback": fallback.group(0) if fallback else None,
             "verified": matching and fallback is None}
+
+
+def offload_evidence(text, metrics=None, *, probe=False):
+    """Attest all-layer CPU MoE configuration, separately from backend identity."""
+    warnings = [line for line in text.splitlines()
+                if re.search(r"(?:moe.{0,12}offload|cpu.moe|moe.offload)", line, re.I)
+                and re.search(r"not implemented|not supported|unsupported|ignor(?:ed|ing)|disabled", line, re.I)]
+    banners = re.findall(r"MoE CPU offload active:\s*routed experts of all layers stay in system RAM and run on the host", text, re.I)
+    policy = metrics.get("offload_policy") if isinstance(metrics, dict) else None
+    expected = {"cpu_moe_enabled": True, "all_layers": True, "cpu_moe_layers": 0,
+                "explicitly_set": True, "cpu_threads": 0, "configuration_source": "environment"}
+    matches = isinstance(policy, dict) and all(type(policy.get(key)) is type(value) and policy[key] == value
+                                              for key, value in expected.items())
+    return {"profile": "cpu_moe", "source": "probe metrics" if probe else "host configuration banner",
+            "observed_policy": policy, "all_layers_banners": banners, "unsupported_warnings": warnings,
+            "verified": bool(matches if probe else banners) and not warnings,
+            "scope": "Runtime all-layer configuration attestation; not a measurement of resident expert bytes or host work."}
+
+
+def _attest_offload(context, result, stage, text, metrics=None, *, probe=False):
+    requested = context.get("offload_policy") or {}
+    if requested.get("requested") is not True:
+        return
+    _require(result, stage + ": supported CPU MoE profile requested", requested.get("name") == "cpu_moe"
+             and requested.get("supported") is True, "supported cpu_moe", requested)
+    evidence = {"stage": stage, **offload_evidence(text, metrics, probe=probe)}
+    result["evidence"].setdefault("offload", []).append(evidence)
+    _require(result, stage + ": runtime CPU MoE all-layer policy", evidence["verified"],
+             "explicit all-layer CPU MoE policy, without unsupported/ignored warning", evidence)
+    if probe:
+        family = context.get("model_family") or requested.get("family")
+        allowed = {"qwen35": {"qwen35moe", "qwen3next"}, "qwen4exp": {"qwen4exp"}}.get(family, set())
+        actual = metrics.get("model_architecture") if isinstance(metrics, dict) else None
+        _require(result, stage + ": CPU MoE actual model architecture", actual in allowed,
+                 sorted(allowed), actual)
 
 
 def extract_assistant(stdout):
@@ -176,7 +215,10 @@ def extract_assistant(stdout):
     lines = []
     for line in text.splitlines():
         if re.match(r"^(?:\d\d:\d\d:\d\d\s+)?(?:info|warn|warning|error|critical|trace|debug|fail|crit):\s", line, re.I):
-            break
+            # The CLI logs its completion preview AFTER the output marker but
+            # BEFORE printing the actual answer. Never interpret that preview as
+            # answer text, and do not stop before reaching the actual output.
+            continue
         lines.append(line)
     answer = "\n".join(lines).strip()
     # Thinking is explicitly formatted by FormatParsedResult; an answer mentioned
@@ -221,7 +263,7 @@ def _base_args(context, kind):
     options = context.get("model_options", {})
     media = kind in {"cli_image", "cli_audio", "cli_video"}
     args += ["--mmproj", str(options.get("mmproj", "none")) if media else "none"]
-    args += ["--max-tokens", "128", "--temperature", "0", "--top-k", "1", "--top-p", "1",
+    args += ["--max-tokens", "256" if kind == "server_agents" else "128", "--temperature", "0", "--top-k", "1", "--top-p", "1",
              "--min-p", "0", "--repeat-penalty", "1", "--seed", "42"]
     return args
 
@@ -271,6 +313,7 @@ def _cli(case, context, result):
         item = _process(context, result, args, "cli-" + str(index + 1))
         _check_process(result, item, context["backend"])
         combined = item["stdout"] + "\n" + item["stderr"]
+        _attest_offload(context, result, item["stage"], combined)
         if kind in {"cli_prefill", "cli_decode"}:
             _require(result, "benchmark executed requested shape", f"prefillTokens={prefill} decodeTokens={decode} runs=1" in combined)
             metrics = re.search(r"benchmark summary:\s*bestPrefillMs=(\S+) bestPrefillTps=(\S+) bestDecodeMs=(\S+) bestDecodeTps=(\S+)", combined)
@@ -368,6 +411,7 @@ def _logits(case, context, result):
         if metrics_path.is_file():
             metrics = _json_loads(metrics_path.read_text(encoding="utf-8"))
             result["evidence"]["logits_" + str(index + 1)] = metrics
+            _attest_offload(context, result, item["stage"], item["stdout"] + "\n" + item["stderr"], metrics, probe=True)
             first = validate_logit_metrics(metrics, run_id, comparison=bool(index))
             actual_cases = _json_loads((folder / "cases.json").read_text(encoding="utf-8"))
             _require(result, "logit fixture case identities", [item.get("name") for item in actual_cases] == [item["name"] for item in fixtures])
@@ -455,6 +499,7 @@ def _logits_sequence(case, context, result):
         item = _process(context, result, args, "fresh-" + name)
         metrics = _json_loads((output / "metrics.json").read_text(encoding="utf-8"))
         result["evidence"]["fresh_" + name] = metrics
+        _attest_offload(context, result, item["stage"], item["stdout"] + "\n" + item["stderr"], metrics, probe=True)
         first = validate_logit_metrics(metrics, run_id, comparison=False)
         _require(result, name + " fresh baseline finite", first is None, None, first)
         _check_process(result, item, context["backend"])
@@ -483,6 +528,7 @@ def _logits_sequence(case, context, result):
         try:
             metrics = _json_loads((output / "metrics.json").read_text(encoding="utf-8"))
             result["evidence"].setdefault("sequence_metrics", {})[order] = metrics
+            _attest_offload(context, result, item["stage"], item["stdout"] + "\n" + item["stderr"], metrics, probe=True)
             references = {entry["name"]: entry for entry in canonical}
             first = validate_sequence_metrics(metrics, sequence, run_id, references)
             if first:
@@ -750,11 +796,16 @@ def _server(case, context, result):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     command = list(context["server_command"]) + _base_args(context, kind)
-    command += ["--host", "127.0.0.1", "--port", str(port), "--no-webui", "--no-multi-agent"]
+    command += ["--host", "127.0.0.1", "--port", str(port), "--no-webui"]
+    if kind == "server_agents":
+        from .agent_regression import host_arguments
+        command += host_arguments(context.get("timeout_seconds", 600))
+    else:
+        command += ["--no-multi-agent"]
     if kind == "server_embeddings":
         command += ["--embeddings"]
     server_env = dict(context.get("env") or {})
-    if kind == "server_cancel":
+    if kind in {"server_cancel", "server_reset_cache"}:
         server_env.update(TENSORSHARP_LOG_FILE="1", TENSORSHARP_LOG_LEVEL="Information")
     process = ManagedProcess(command, cwd=context["repo"], artifact_dir=context["artifact_dir"], stage="server", env=server_env)
     deadline = time.monotonic() + context.get("timeout_seconds", 600)
@@ -772,6 +823,7 @@ def _server(case, context, result):
             if f"Now listening on: {http.base}" in startup_out + startup_err:
                 break
             time.sleep(0.1)
+        _attest_offload(context, result, "server-startup", startup_out + "\n" + startup_err)
         identity = http.json("/api/models")
         _require(result, "loaded backend identity", identity.get("loadedBackend") == context["backend"], context["backend"], identity.get("loadedBackend"))
         _require(result, "loaded model identity", identity.get("loaded") == Path(context["model_path"]).name, Path(context["model_path"]).name, identity.get("loaded"))
@@ -788,6 +840,9 @@ def _server(case, context, result):
         if kind == "jev_decision":
             from .jev import run_decisions
             run_decisions(http, model, context, result)
+        elif kind == "server_agents":
+            from .agent_regression import run_agents
+            run_agents(http, model, context, result)
         elif kind == "server_embeddings":
             response = http.json("/v1/embeddings", {"model": model, "input": ["A cat is sitting on a warm windowsill.",
                 "A cat is sitting on a warm windowsill.", "A kitten rests beside the sunny window.",
@@ -847,6 +902,7 @@ def _server(case, context, result):
         result["evidence"]["server_shutdown"] = item.get("teardown")
         _require(result, "owned server processes stopped", item.get("teardown", {}).get("verified") is True,
                  "verified empty owned process container", item.get("teardown"))
+        _attest_offload(context, result, "server-final", item["stdout"] + "\n" + item["stderr"])
 
 
 def _session_public_prefix(log_root, request_id):

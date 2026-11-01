@@ -3786,18 +3786,25 @@
     },
     {
       "id": "server_agents",
-      "entry_point": "eng/validation/probe_multi_agent_host.py",
-      "status": "recipe",
-      "recipe": "Run isolated loopback multi-agent host probe with fixture tools only.",
+      "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
+      "status": "automated",
+      "recipe": "Run two named read-only arithmetic reviewers with only host coordination tools, inspect completed wait snapshots and exact JSON results, then verify multi_agent:false on a separate request.",
       "assertions": [
-        "Expected delegation/dependency events, result delivery, cancellation propagation and isolated helper workspace."
+        "Exactly two successful root spawns precede a successful wait; completed snapshots identify both named children, read-only reviewer permissions, no dependencies and distinct logical workspace identities.",
+        "Both child reports and final synthesis contain the exact integer revenue/cost/profit/overstatement values; correct final prose alone cannot establish delegation.",
+        "Only permitted coordination events occur, children perform no host tool work, no files are exported, and the separate opt-out request returns 42 with no agent/tool events.",
+        "One normal terminal event is required. Dependency scheduling, mutable workers, filesystem confinement and cancellation propagation remain untested by this bounded adapter."
       ],
       "evidence": [
         "eng/validation/probe_multi_agent_host.py",
-        "InferenceWeb.Tests/MultiAgentHostTests.cs"
+        "InferenceWeb.Tests/MultiAgentHostTests.cs",
+        "eng/regression/agent_regression.py",
+        "TensorSharp.Chat/ResponseSerializers/WebUiSseEvents.cs",
+        "TensorSharp.AgentHost/Agents/MultiAgentOptions.cs"
       ],
       "requirements": [
-        "Explicit controlled agent fixture; never run shipped network/code-exec agent settings automatically"
+        "Tool-capable model and owned loopback server; skills and code execution disabled, no worker-tool opt-in.",
+        "At most two children, depth one, six total child generations, three rounds per child and 120-second child lifetime (or shorter scenario limit)."
       ]
     },
     {

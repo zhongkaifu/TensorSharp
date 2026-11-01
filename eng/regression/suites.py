@@ -1,4 +1,4 @@
-"""Reuse existing correctness suites; building is a separate explicit opt-in."""
+"""Reuse correctness suites; optional managed builds never reconfigure native assets."""
 from pathlib import Path
 import re
 import shutil
@@ -7,6 +7,8 @@ import xml.etree.ElementTree as ET
 
 from .processes import (run_process, containment_failure_evidence, unsafe_process_state,
                         UNSAFE_RESOURCES_REASON, ProcessContainmentError)
+
+MANAGED_BUILD_PROPERTIES = ["-p:TensorSharpSkipGgmlNative=true", "-p:TensorSharpSkipMlxNative=true"]
 
 
 def list_suites(repo):
@@ -52,7 +54,8 @@ def run_suites(repo, output, mode, allow_builds, timeout_seconds):
     halt = unsafe_process_state() if mode == "run" else None
     for spec in list_suites(repo):
         result = {"id": spec["id"], "scope": spec.get("scope", "client contracts without model execution"),
-                  "assertions": spec["assertions"], "status": "untested", "reason": "planned; suite not executed"}
+                  "assertions": spec["assertions"], "status": "untested", "reason": "planned; suite not executed",
+                  "build_policy": {"managed_builds_allowed": bool(allow_builds), "native_builds_allowed": False}}
         if halt is not None:
             result.update(reason=UNSAFE_RESOURCES_REASON, stage="execution_halted")
             results.append(result)
@@ -80,7 +83,7 @@ def run_suites(repo, output, mode, allow_builds, timeout_seconds):
         else:
             if spec["kind"] == "client_native":
                 if allow_builds:
-                    commands.append([dotnet, "build", "eng/tests/NativeChatCompletion", "-c", "Release", "-p:TensorSharpSkipGgmlNative=true", "-p:TensorSharpSkipMlxNative=true"])
+                    commands.append([dotnet, "build", "eng/tests/NativeChatCompletion", "-c", "Release"])
                 elif not spec["built"].is_file() or not spec["example"].is_file():
                     result.update(status="skip", reason="native client contract assemblies not built; see documented recipe")
                     results.append(result)
@@ -96,13 +99,18 @@ def run_suites(repo, output, mode, allow_builds, timeout_seconds):
                     continue
                 commands += [[sys.executable, str(repo / "eng/tests/dotnet-local-chat.py")],
                              [sys.executable, str(repo / "eng/tests/dotnet-local-chat-e2e.py"), "--self-test"]]
+        # Even dotnet test --no-build evaluates MSBuild targets. Always prevent
+        # transitive native build/restore targets from reconfiguring a shared
+        # CUDA/Metal build directory or replacing an existing runtime library.
+        commands = [command + MANAGED_BUILD_PROPERTIES
+                    if len(command) > 1 and command[0] == dotnet and command[1] in {"test", "build", "restore"}
+                    else command for command in commands]
         result["processes"] = []
         try:
             for index, command in enumerate(commands):
                 process = run_process(command, cwd=repo, artifact_dir=target, stage=f"step-{index}",
                                       timeout_seconds=timeout_seconds,
-                                      env={"TENSORSHARP_GGML_NATIVE_ENABLE_CUDA": "OFF", "TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN": "OFF",
-                                           "TENSORSHARP_CUDNN": "OFF", "TS_TEST_GGML_BACKEND": "cpu"})
+                                      env={"TS_TEST_GGML_BACKEND": "cpu"})
                 result["processes"].append(process)
                 containment = containment_failure_evidence(process)
                 if containment is not None:
@@ -113,6 +121,11 @@ def run_suites(repo, output, mode, allow_builds, timeout_seconds):
                     raise ValueError(UNSAFE_RESOURCES_REASON)
                 if process["exit_code"] != 0 or process.get("timed_out"):
                     raise ValueError(f"suite process failed or timed out at step {index}; see sanitized logs")
+                if len(command) > 1 and command[0] == dotnet and command[1] == "build":
+                    expected = [spec["built"]] + ([spec["example"]] if spec["kind"] == "client_native" else [])
+                    missing = [str(path) for path in expected if not path.is_file()]
+                    if missing:
+                        raise ValueError("managed build did not produce required contract assemblies: " + ", ".join(missing))
                 is_assertion_command = spec["kind"] != "dotnet" and not (len(command) > 1 and command[0] == dotnet and command[1] in {"build", "restore"})
                 if is_assertion_command:
                     content = process.get("stdout", "") + process.get("stderr", "")

@@ -152,7 +152,16 @@ this adapter does not qualify semantic image quality or universal bitwise
 determinism. Invalid bounded payloads remain local diagnostic artifacts.
 Jev attachment/ASR checks remain a separate `jev_media` recipe.
 
-Generation/editing, multimodal embeddings, agent workflows, learned
+`server_agents` exercises two named read-only arithmetic reviewers using only
+host coordination tools, with skills/code execution disabled. Successful spawn
+and wait events, completed child snapshots, exact child/final JSON arithmetic,
+distinct workspace identities and a separate request-level opt-out must all
+pass. Identity separation is not a filesystem-confinement test. Dependency
+scheduling, mutable worker tools and cancellation propagation remain untested.
+The host uses its normal per-user `TensorSharp/agent-workspaces` storage; the
+runner does not redirect or inspect unrelated user workspaces.
+
+Generation/editing, multimodal embeddings, broader agent workflows, learned
 speculation, LoRA, multi-GPU and distributed paths retain explicit
 recipes and fixture requirements where no adapter is implemented. The catalog
 does not turn these into automatic passes. Family-specific generated-media validation must decode the

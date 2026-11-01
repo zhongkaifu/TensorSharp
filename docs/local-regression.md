@@ -12,7 +12,7 @@ This is a bounded regression suite, not a claim that every architecture, hardwar
 quantization, context length, or feature combination has passed. An executable
 adapter, a supported recipe, and an actual passing result are different things.
 The catalog explicitly records all three. Image/video generation, speculative
-variants, agent execution, distributed/multi-GPU paths, and missing model-family
+variants, broader agent workflows, distributed/multi-GPU paths, and missing model-family
 presets retain explicit gaps where the unified runner has no validated adapter.
 
 ## 本地快速开始
@@ -77,8 +77,16 @@ is distinguishable from a CPU-only wrapper.
 
 `--include-suites` adds existing InferenceWeb, Knowledge, Studio and native/HTTP
 client contract tests. By default these require prebuilt Release assemblies and
-use `--no-build --no-restore`. `--allow-builds` explicitly permits their build and
-restore steps; this can fetch NuGet/native dependencies and is a heavy operation.
+use `--no-build --no-restore`. `--allow-builds` explicitly permits **managed-only**
+build and restore steps, which can fetch NuGet packages. Every managed suite
+`test`, `build` and `restore` command sets `TensorSharpSkipGgmlNative=true` and
+`TensorSharpSkipMlxNative=true`; it never configures or compiles native backends.
+The suite scopes runtime execution with `TS_TEST_GGML_BACKEND=cpu` instead of
+changing CUDA/Vulkan build flags. Existing native libraries must be prepared
+separately in an isolated build directory following `DEVELOPMENT.md`. Native
+CTest likewise requires an explicit `--native-test-build-dir`; `--allow-builds`
+does not build it. A managed build exit code alone is never a passing test:
+required client assemblies and actual contract/TRX assertion evidence must exist.
 The InferenceWeb lane excludes benchmark, real-model, CUDA and MLX requirements;
 their separate coverage remains in the matrix, not inferred from this lane.
 TRX counters must show executed passing tests, and skipped tests are disclosed.
@@ -142,7 +150,8 @@ Disk failures identify the relevant location: model preparation reports
 `artifact_disk_checks` with the artifact path, available bytes, estimate and
 headroom. Existing partial bytes already occupy their volume; only the validated
 remaining bytes count toward further transfer and additional disk allocation.
-The complete model size still counts toward RAM/VRAM estimates. A roomy model
+The complete model size still counts toward default RAM/VRAM estimates; the
+explicit CPU MoE profile below records caller-supplied resident requirements. A roomy model
 drive cannot compensate for a full report drive. Small report writes and other
 tools can still encounter ordinary filesystem errors, so leave space on every
 selected write volume rather than lowering the headroom to conceal exhaustion.
@@ -164,8 +173,8 @@ invocation, a new report is created under the selected repository.
   reads local file metadata; model hashes are computed during actual preparation.
 - `--ram-budget-gib`, `--vram-budget-gib`, `--ram-required-gib`, and
   `--vram-required-gib` are explicit machine/measurement overrides. They do not
-  enable partial offload. Use the separate documented architecture-specific
-  recipe for paging/offload; do not lower estimates to make an OOM disappear.
+  enable partial offload by themselves. The explicit CPU MoE profile below
+  connects declared resident requirements to the supported host-expert policy.
   `--gpu-index` selects a single CUDA device, recorded with the run.
 - `--assume-backend-available` permits launch when a deployment lacks build
   metadata. It never bypasses runtime backend assertions or source support.
@@ -182,6 +191,53 @@ invocation, a new report is created under the selected repository.
   resumed ranges and final sizes/hashes, and atomically install complete files.
   Incomplete or incorrect existing files fail clearly and are not overwritten.
   Ctrl+C retains resumable partial data and terminates only owned child processes.
+
+### Explicit CPU MoE profile
+
+`--cpu-moe` opts into all-layer routed-expert execution on the host. It requires
+both `--ram-required-gib` and `--vram-required-gib` as positive finite values
+supplied by the operator, including for `ggml_cpu`. Use peak requirements for
+the selected model, quantization, context, scenarios and runtime, with workload
+headroom. The runner does not derive a smaller resident size from the number of
+active experts or from a measurement of another model.
+
+The initial source-verified matrix is deliberately limited:
+
+| Catalog family/layout | Backends | Placement |
+|---|---|---|
+| `qwen35` / `moe` (including Qwen3.6) | `ggml_cuda`, `ggml_cpu` | All routed experts run on host |
+| `qwen4exp` / `moe` (Qwen3.8 Flash Next) | `ggml_cuda`, `ggml_cpu` | Explicit host-expert placement; single device |
+
+Dense variants, other families, direct `cuda`, Metal, Vulkan, MLX and distributed
+placements are outside this profile. They receive `unsupported` results without
+model preparation. On `ggml_cpu`, experts already execute on the host, so the
+flag does not claim VRAM savings and its required VRAM value is recorded but
+not charged to a GPU. `auto` chooses only a supported GGML backend for this profile;
+the report records each rejected candidate and never relabels a CPU execution as
+CUDA coverage.
+
+For example, append these options to the selected model's plan/run invocation,
+replacing the two placeholders with explicitly established requirements:
+
+```text
+--models qwen3.8-flash-next --backend ggml_cuda --cpu-moe --ram-required-gib <peak-RAM-GiB> --vram-required-gib <peak-VRAM-GiB>
+```
+
+The profile sets `TS_CPU_MOE=1` only in owned model processes. It leaves attention,
+router and shared-expert execution on the requested GGML CUDA backend. Downloads,
+hash verification and disk checks still use the complete model size, even when
+host experts are memory mapped. Current RAM/VRAM budgets and reserves still apply;
+the flag cannot make an over-budget plan eligible. Page residency and workspace
+can change during execution, so declared requirements are not a memory guarantee.
+
+Reports record the requested placement, explicit requirement source, sanitized
+environment, source support evidence and separate runtime assertions. Hosts must
+confirm the all-layer configuration; the probe records its effective configuration
+before comparisons can pass. The requested backend remains independently checked.
+Old executables that ignore the profile cannot establish a passing profile result.
+Reproduction commands retain the flag and both requirements. Without `--cpu-moe`,
+the conservative full-weight planning gate remains unchanged; native model-specific
+placement behavior is not inferred from a successful preflight.
 
 ## Executed assertions and safe fixtures
 

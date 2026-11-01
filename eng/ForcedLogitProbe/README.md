@@ -45,6 +45,16 @@ and the first row outside the numerical gate. Check `complete`, `cases_done`,
 and output directories must differ; stale completion records are invalidated
 before schedule parsing and model loading.
 
+The probe applies `MoeCpuOffloadConfig.ConfigureFromEnvironment()` before model
+creation, matching the CLI and server startup order. `TS_CPU_MOE=1` requests
+all-layer host routed-expert execution on supported GGML MoE paths. Metrics
+record `model_architecture` and the effective `offload_policy` (enabled, all layers,
+layer count, explicit configuration, thread count and configuration source).
+This is configuration evidence; backend identity and numerical comparisons must
+also pass. The local runner's `--cpu-moe` profile requires explicit peak RAM/VRAM
+requirements and limits this initial path to `qwen35`/MoE or `qwen4exp`/MoE on
+`ggml_cpu` and `ggml_cuda`; other backend/family combinations are not covered.
+
 Before creating each `.f32` file, the probe checks the exact byte count
 `rows * vocabulary_size * sizeof(float)` against free space on the output volume,
 plus `--disk-headroom-gib` (default **5 GiB**). The case's `artifact_disk_budget`

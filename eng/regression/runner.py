@@ -17,6 +17,7 @@ from .audit import audit_catalog
 from .configs import read_config
 from .downloads import DownloadPolicy, PrepareError, prepare_files
 from .hardware import detect_hardware, plan_resources
+from .profiles import CPU_MOE_BACKENDS, annotate_resource_plan, residency_profile
 from .reports import aggregate_exit, atomic_json, file_hash, runtime_identity, sanitize, source_identity, write_reports
 from .scenarios import availability, run_scenario
 from .processes import (UNSAFE_RESOURCES_REASON, ProcessContainmentError,
@@ -89,6 +90,7 @@ def parse_args(argv=None):
     parser.add_argument("--vram-budget-gib", type=float)
     parser.add_argument("--ram-required-gib", type=float)
     parser.add_argument("--vram-required-gib", type=float)
+    parser.add_argument("--cpu-moe", action="store_true", help="Explicit GGML host-expert profile for qwen35/moe or qwen4exp/moe; requires both --ram-required-gib and --vram-required-gib")
     parser.add_argument("--gpu-index", type=int, default=0)
     parser.add_argument("--assume-backend-available", action="store_true", help="Override detection only; actual runtime backend still must match")
     parser.add_argument("--max-models", type=int, default=0, help="0 means no count limit; download budget always applies")
@@ -98,7 +100,7 @@ def parse_args(argv=None):
     parser.add_argument("--native-test-build-dir", type=Path, help="Explicit prebuilt CTest directory from this checkout; no implicit native build")
     parser.add_argument("--native-test-backend", choices=("cpu", "cuda", "metal", "vulkan"), default="cpu")
     parser.add_argument("--native-test-filter", help="Optional regex narrowing native test names; unverified device tests remain untested")
-    parser.add_argument("--allow-builds", action="store_true", help="Allow local managed/native builds required by existing suites; opt-in")
+    parser.add_argument("--allow-builds", action="store_true", help="Allow managed suite builds/restores only; native backends must be prebuilt")
     args = parser.parse_args(argv)
     from .hardware import BACKENDS
     if args.backend not in {"auto", "all"} and any(b not in BACKENDS for b in args.backend.split(",")):
@@ -112,6 +114,8 @@ def parse_args(argv=None):
     for key in ("ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib"):
         if getattr(args, key) == 0:
             parser.error(f"--{key.replace('_', '-')} must be positive")
+    if args.cpu_moe and (args.ram_required_gib is None or args.vram_required_gib is None):
+        parser.error("--cpu-moe requires explicit --ram-required-gib and --vram-required-gib (including on ggml_cpu)")
     return args
 
 
@@ -204,6 +208,18 @@ def preset_budgets(preset, overrides):
     return {**values, **overrides}
 
 
+def offload_profile(args, preset=None, backend=None):
+    return residency_profile(args.cpu_moe, args.ram_required_gib, args.vram_required_gib, preset, backend)
+
+
+def plan_model_resources(args, preset, weight_bytes, backend, hardware, overrides):
+    profile = offload_profile(args, preset, backend)
+    if not profile["supported"]:
+        return {"eligible": False, "reason": profile["reason"], "backend": backend,
+                "offload_policy": profile, "estimates": {}, "warnings": []}
+    return annotate_resource_plan(plan_resources(weight_bytes, backend, hardware, overrides=overrides), profile)
+
+
 def sizes_for(files, policy, network=False):
     """Return (final weight footprint, remaining transfer/additional disk bytes).
 
@@ -270,7 +286,7 @@ def reproduce_args(args, repo, root, preset, backend, scenario):
     for key in ("existing_root", "runtime_dir"):
         for value in getattr(args, key):
             command += ["--" + key.replace("_", "-"), str(value)]
-    for key in ("assume_backend_available", "allow_download", "probe_network"):
+    for key in ("assume_backend_available", "allow_download", "probe_network", "cpu_moe"):
         if getattr(args, key):
             command.append("--" + key.replace("_", "-"))
     return command
@@ -293,7 +309,8 @@ def main(argv=None):
               "results": [], "limitations": [
                   "Only this local OS and selected backend can be tested; other platforms are unrun.",
                   "Availability detection is not backend coverage. Runtime cases require positive backend identity.",
-                  "Memory estimates reserve workspace/KV headroom and assume full-resident weights; no automatic partial offload.",
+                  "CPU MoE planning uses explicit caller-supplied peak requirements; runtime residency and memory use remain workload-dependent." if args.cpu_moe else
+                  "Memory planning reserves workspace/KV headroom and charges all weight bytes; the harness requests no automatic partial offload.",
                   "Generation correctness checks use deterministic task fixtures, not a comprehensive language quality benchmark.",
                   "Recipe-only features need the documented fixtures/hardware and remain untested in this entry point.",
                   "Model payloads are never downloaded in audit/plan modes. No model files are deleted or published."]}
@@ -338,7 +355,7 @@ def main(argv=None):
                      if getattr(args, key) is not None}
         report["policy"] = {"model_root": str(root), "max_download_bytes": int(args.max_download_gib * GIB),
                             "requested_backend": args.backend, "overrides": overrides, "allow_download": args.allow_download,
-                            "offload": "full-resident conservative estimate; no automatic paging/offload", "sampling": {"seed": 42, "temperature": 0}}
+                            "offload": offload_profile(args), "sampling": {"seed": 42, "temperature": 0}}
         presets = [p for p in catalog["presets"] if selected(p["id"], args.models)]
         if not presets:
             raise ValueError("model selector matched no catalog presets")
@@ -360,7 +377,22 @@ def main(argv=None):
                 remaining_backends = ["auto"] if args.backend == "auto" else select_backends(args.backend, preset.get("backends", []), hardware) or ["none"]
                 append_halted_cases(report, preset, remaining_backends, case_defs, halt)
                 continue
-            backends = select_backends(args.backend, preset.get("backends", []), hardware) or ["none"]
+            profile = offload_profile(args, preset)
+            if not profile["supported"]:
+                rejected_backends = ["auto"] if args.backend == "auto" else select_backends(args.backend, preset.get("backends", []), hardware) or ["none"]
+                for backend in rejected_backends:
+                    for scenario in case_defs:
+                        report["results"].append(result_stub(preset, backend, scenario, "unsupported", profile["reason"], offload_policy=profile))
+                continue
+            supported_backends = preset.get("backends", [])
+            if args.cpu_moe and args.backend == "auto":
+                supported_backends = [b for b in supported_backends if b in CPU_MOE_BACKENDS]
+                if not supported_backends:
+                    for scenario in case_defs:
+                        report["results"].append(result_stub(preset, "auto", scenario, "unsupported",
+                            "--cpu-moe has no source-supported GGML backend in this preset", offload_policy=profile))
+                    continue
+            backends = select_backends(args.backend, supported_backends, hardware) or ["none"]
             if args.backend == "auto" and preset.get("status") != "unsupported" and any(s.get("status") == "automated" for s in case_defs):
                 # Evaluate resource fit before choosing an automatic backend. This is
                 # a recorded planning decision, never a runtime fallback.
@@ -372,7 +404,7 @@ def main(argv=None):
                         preliminary_options, preliminary_files = use_existing(preliminary, index)
                         preliminary_context = {"repo": repo, "backend": backends[0], "preparing_model": True, "model_family": preset["family"],
                             "model_options": preliminary_options, "model_path": preliminary_options.get("model"),
-                            "media_dir": args.media_dir, **commands}
+                            "media_dir": args.media_dir, "offload_policy": offload_profile(args, preset, backends[0]), **commands}
                         preliminary_cases = []
                         for scenario in case_defs:
                             if scenario.get("status") != "automated":
@@ -387,7 +419,8 @@ def main(argv=None):
                         preliminary_files = required_scenario_files(preliminary_files, preliminary_cases)
                         total, missing = sizes_for(preliminary_files, policy, network=args.probe_network or (args.mode == "run" and args.allow_download)) if preliminary_cases else (None, None)
                         candidates = [b for b in ("ggml_cuda", "cuda", "ggml_metal", "mlx", "ggml_vulkan", "ggml_cpu", "cpu") if b in preset.get("backends", [])]
-                        attempts = [{"backend": b, **plan_resources(total, b, hardware, overrides={**model_overrides, "download_bytes": missing or 0})} for b in candidates]
+                        attempts = [{"backend": b, **plan_model_resources(args, preset, total, b, hardware,
+                            overrides={**model_overrides, "download_bytes": missing or 0})} for b in candidates]
                         eligible = [attempt["backend"] for attempt in attempts if attempt["eligible"]]
                         if eligible:
                             backends = eligible[:1]
@@ -420,22 +453,28 @@ def main(argv=None):
                 if halt:
                     append_halted_cases(report, preset, [backend], case_defs, halt)
                     continue
+                profile = offload_profile(args, preset, backend)
+                model_env = {"CUDA_VISIBLE_DEVICES": str(args.gpu_index)} if backend in {"cuda", "ggml_cuda"} else {}
+                model_env.update(profile["environment"])
                 base_context = {"repo": repo, "backend": backend, "artifact_dir": output, "model_family": preset["family"],
                                 "timeout_seconds": args.timeout_seconds, "media_dir": args.media_dir,
                                 "disk_headroom_gib": args.disk_headroom_gib,
-                                "seed": 42, "env": {"CUDA_VISIBLE_DEVICES": str(args.gpu_index)} if backend in {"cuda", "ggml_cuda"} else {}, **commands}
+                                "model_layout": preset.get("layout"), "offload_policy": profile,
+                                "seed": 42, "env": model_env, **commands}
                 candidates = []
                 for scenario in case_defs:
                     if scenario.get("status") == "unsupported" or preset.get("kind") == "unsupported" or preset.get("status") == "unsupported":
                         status, reason = "unsupported", preset.get("reason") or scenario.get("reason", "Implementation unavailable")
                     elif backend not in preset.get("backends", []):
                         status, reason = "unsupported", f"{backend} is outside this preset's source-supported backend matrix"
+                    elif not profile["supported"]:
+                        status, reason = "unsupported", profile["reason"]
                     elif scenario.get("status") != "automated":
                         status, reason = "untested", "Supported recipe needs a dedicated fixture/adapter: " + str(scenario.get("recipe", "see coverage catalog"))
                     else:
                         candidates.append(scenario)
                         continue
-                    report["results"].append(result_stub(preset, backend, scenario, status, reason))
+                    report["results"].append(result_stub(preset, backend, scenario, status, reason, offload_policy=profile))
                 if not candidates:
                     continue
                 files, config_path, resources, active_scenario = [], None, None, None
@@ -476,8 +515,8 @@ def main(argv=None):
                     weight_bytes, missing_bytes = sizes_for(files, policy, network=args.probe_network or (args.mode == "run" and args.allow_download))
                     if args.mode == "run":
                         hardware = detect_hardware(root, runtime_dirs=runtime_dirs)
-                    resources = plan_resources(weight_bytes, backend, hardware,
-                                               overrides={**model_overrides, "download_bytes": missing_bytes or 0})
+                    resources = plan_model_resources(args, preset, weight_bytes, backend, hardware,
+                                                    overrides={**model_overrides, "download_bytes": missing_bytes or 0})
                     reason = None
                     if args.max_models and preset["id"] not in executed_models and len(executed_models) >= args.max_models:
                         reason = "selected model count limit reached"
@@ -536,6 +575,7 @@ def main(argv=None):
                         result = result_stub(preset, backend, scenario, outcome.pop("status"), outcome.pop("reason", ""),
                                              **outcome)
                         result["resource_plan"] = resources
+                        result["offload_policy"] = profile
                         result["model_identity"] = plain(identities)
                         result["duration_seconds"] = time.monotonic() - start
                         result["reproduce"] = reproduce_args(args, repo, root, preset, backend, scenario)

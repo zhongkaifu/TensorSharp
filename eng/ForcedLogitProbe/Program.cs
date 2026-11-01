@@ -77,6 +77,8 @@ Dictionary<string, ProbeCase>? externalCases = referenceDir == null ? null : Pro
     JsonSerializer.Deserialize<ProbeCase[]>(File.ReadAllText(Path.Combine(referenceDir, "cases.json")), json)!);
 ProbeSchedule.ValidateReferences(cases, externalCases);
 KvCacheDtypeConfig.ConfigureFromEnvironment();
+// Residency must be configured before Create prepares quantized expert weights.
+MoeCpuOffloadConfig.ConfigureFromEnvironment();
 var loadTimer = Stopwatch.StartNew();
 using var model = ModelBase.Create(modelPath, backend);
 loadTimer.Stop();
@@ -94,7 +96,12 @@ void WriteMetrics(bool complete) =>
         // run that dies part-way leaves the cases it finished, marked incomplete.
         complete, cases_done = casesDone, cases_total = cases.Length, run_id = runId,
         gate = new { max_relative_l2 = 0.001, min_cosine = 0.999999, require_identical_top1 = true },
-        model = Path.GetFileName(modelPath), backend = backendName, tp = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"),
+        model = Path.GetFileName(modelPath), model_architecture = model.Config.Architecture,
+        backend = backendName, tp = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"),
+        offload_policy = new { cpu_moe_enabled = MoeCpuOffloadConfig.IsEnabled,
+            all_layers = MoeCpuOffloadConfig.AllLayers, cpu_moe_layers = MoeCpuOffloadConfig.CpuMoeLayers,
+            explicitly_set = MoeCpuOffloadConfig.IsExplicitlySet, cpu_threads = MoeCpuOffloadConfig.CpuThreads,
+            configuration_source = MoeCpuOffloadConfig.IsExplicitlySet ? "environment" : "default" },
         layer_split = Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE"), load_seconds = loadTimer.Elapsed.TotalSeconds,
         reference = referenceDir,
         disk_headroom_gib = diskHeadroomGiB,

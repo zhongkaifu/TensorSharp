@@ -240,6 +240,111 @@ class RunnerTests(unittest.TestCase):
         cuda_plan = next(p for p in selection["attempts"] if p["backend"] == "ggml_cuda")
         self.assertFalse(cuda_plan["eligible"])
 
+    def cpu_moe_fixture(self, family="qwen4exp", layout="moe"):
+        self.catalog_data["presets"][0].update(family=family, layout=layout,
+            backends=["cuda", "ggml_cuda", "ggml_cpu", "cpu"])
+        self.catalog.write_text(json.dumps(self.catalog_data))
+        self.hardware.return_value["backends"].update(ggml_cuda={"available": True}, cuda={"available": True})
+        self.hardware.return_value["gpus"] = [{"index": 0, "memory_free_bytes": 16 * GIB,
+            "compute_capability": 8.6, "driver_version": "580.100"}]
+
+    def test_explicit_cpu_moe_profile_fits_large_file_only_with_declared_requirements(self):
+        self.cpu_moe_fixture()
+        with patch.object(runner, "sizes_for", return_value=(75 * GIB, 0)):
+            exit_code, report = self.invoke("--mode", "run", "--backend", "ggml_cuda", "--cpu-moe",
+                "--ram-required-gib", "16", "--vram-required-gib", "6")
+        self.assertEqual(0, exit_code)
+        result = report["results"][-1]
+        self.assertEqual("ggml_cuda", result["backend"])
+        self.assertEqual(75 * GIB, result["resource_plan"]["estimates"]["weight_bytes"])
+        self.assertEqual(16 * GIB, result["resource_plan"]["estimates"]["ram_required_bytes"])
+        self.assertEqual(6 * GIB, result["resource_plan"]["estimates"]["vram_required_bytes"])
+        context = self.run.call_args.args[1]
+        self.assertEqual({"CUDA_VISIBLE_DEVICES": "0", "TS_CPU_MOE": "1"}, context["env"])
+        self.assertEqual("cpu_moe", context["offload_policy"]["name"])
+        self.assertEqual("explicit_user_requirements", report["policy"]["offload"]["estimate_source"])
+        self.assertIn("--cpu-moe", result["reproduce"])
+        self.assertIn("--ram-required-gib", result["reproduce"])
+        self.assertIn("--vram-required-gib", result["reproduce"])
+
+    def test_default_large_model_is_still_conservatively_skipped(self):
+        self.cpu_moe_fixture()
+        with patch.object(runner, "sizes_for", return_value=(75 * GIB, 0)):
+            exit_code, report = self.invoke("--mode", "run", "--backend", "ggml_cuda")
+        self.assertEqual(3, exit_code)
+        self.assertFalse(report["policy"]["offload"]["requested"])
+        self.prepare.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_cpu_moe_cannot_override_current_ram_or_gpu_budget(self):
+        self.cpu_moe_fixture()
+        for ram, vram, expected in (("16", "17", "VRAM budget"), ("31", "6", "RAM exceeds budget")):
+            with self.subTest(ram=ram, vram=vram):
+                self.output = self.repo / "artifacts" / ("budget-" + ram + "-" + vram)
+                exit_code, report = self.invoke("--mode", "run", "--backend", "ggml_cuda", "--cpu-moe",
+                    "--ram-required-gib", ram, "--vram-required-gib", vram)
+                self.assertEqual(3, exit_code)
+                self.assertIn(expected, report["results"][-1]["reason"])
+        self.prepare.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_cpu_moe_still_requires_known_size_and_full_download_budget(self):
+        self.cpu_moe_fixture()
+        for total, missing, expected in ((None, None, "size unknown"), (75 * GIB, 75 * GIB, "download budget")):
+            with self.subTest(total=total, missing=missing):
+                self.output = self.repo / "artifacts" / ("download-" + str(total))
+                with patch.object(runner, "sizes_for", return_value=(total, missing)):
+                    exit_code, report = self.invoke("--mode", "run", "--backend", "ggml_cuda", "--cpu-moe",
+                        "--ram-required-gib", "16", "--vram-required-gib", "6", "--allow-download")
+                self.assertEqual(3, exit_code)
+                self.assertIn(expected, report["results"][-1]["reason"])
+        self.prepare.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_cpu_moe_auto_no_supported_backend_rejects_before_metadata_probe(self):
+        self.cpu_moe_fixture()
+        self.catalog_data["presets"][0]["backends"] = ["cuda"]
+        self.catalog.write_text(json.dumps(self.catalog_data))
+        with patch.object(runner, "sizes_for") as probe:
+            exit_code, report = self.invoke("--mode", "run", "--backend", "auto", "--cpu-moe",
+                "--ram-required-gib", "16", "--vram-required-gib", "6", "--allow-download")
+        self.assertEqual(3, exit_code)
+        self.assertEqual("unsupported", report["results"][-1]["status"])
+        self.config.assert_not_called()
+        probe.assert_not_called()
+        self.prepare.assert_not_called()
+
+    def test_cpu_moe_invalid_family_layout_or_backend_never_prepares_files(self):
+        for family, layout, backend in (("qwen35", "dense", "auto"), ("test", "moe", "ggml_cuda"),
+                                        ("qwen4exp", "moe", "cuda")):
+            with self.subTest(family=family, layout=layout, backend=backend):
+                self.output = self.repo / "artifacts" / (family + "-" + layout + "-" + backend)
+                self.cpu_moe_fixture(family, layout)
+                exit_code, report = self.invoke("--mode", "run", "--backend", backend, "--cpu-moe",
+                    "--ram-required-gib", "16", "--vram-required-gib", "6")
+                self.assertEqual(3, exit_code)
+                self.assertEqual("unsupported", report["results"][-1]["status"])
+        self.config.assert_not_called()
+        self.prepare.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_cpu_moe_auto_does_not_choose_unsupported_direct_cuda(self):
+        self.cpu_moe_fixture("qwen35")
+        self.hardware.return_value["backends"]["ggml_cuda"]["available"] = False
+        with patch.object(runner, "sizes_for", return_value=(75 * GIB, 0)):
+            exit_code, report = self.invoke("--mode", "run", "--backend", "auto", "--cpu-moe",
+                "--ram-required-gib", "16", "--vram-required-gib", "6")
+        self.assertEqual(0, exit_code)
+        self.assertEqual("ggml_cpu", report["results"][-1]["backend"])
+        direct_cuda = next(row for row in report["backend_selections"][0]["attempts"] if row["backend"] == "cuda")
+        self.assertFalse(direct_cuda["eligible"])
+        self.assertEqual({"TS_CPU_MOE": "1"}, self.run.call_args.args[1]["env"])
+
+    def test_default_run_passes_no_cpu_moe_environment(self):
+        self.invoke("--mode", "run")
+        self.assertNotIn("TS_CPU_MOE", self.run.call_args.args[1]["env"])
+        self.assertFalse(self.run.call_args.args[1]["offload_policy"]["requested"])
+
     def test_cumulative_download_cap_stops_later_model_before_prepare(self):
         first = self.catalog_data["presets"][0]
         self.catalog_data["presets"] = [{**first, "id": f"tiny-{i}"} for i in range(3)]
