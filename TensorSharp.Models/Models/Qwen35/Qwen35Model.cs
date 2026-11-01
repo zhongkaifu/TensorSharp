@@ -1640,7 +1640,7 @@ namespace TensorSharp.Models
             long rowBytes = cacheTensor.Storage.ByteLength / (numKVHeads * capacity);
             long blockBytes = numKVHeads * tokenCount * rowBytes;
             if (destination.Length < blockBytes) { written = 0; return false; }
-            IntPtr basePtr = cacheTensor.Storage.PtrAtElement(0);
+            IntPtr basePtr = cacheTensor.Storage.PtrAtElementForRead(0);
             unsafe
             {
                 byte* src = (byte*)basePtr;
