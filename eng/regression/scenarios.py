@@ -27,7 +27,7 @@ ADAPTER_IDS = frozenset({
     "cli_text", "cli_prefill", "cli_decode", "cli_multi_turn", "cli_tools", "cli_thinking",
     "cli_image", "cli_audio", "cli_video", "forced_logits", "forced_logits_sequence", "server_chat", "server_stream",
     "server_cancel", "server_reset_cache", "server_structured", "server_tools", "server_embeddings", "server_agents",
-    "jev_decision", "jev_text_attachments", "image_generation_smoke", "speculation_ngram", "client_http_live",
+    "jev_decision", "jev_text_attachments", "image_generation_smoke", "speculation_ngram", "client_http_live", "retrieval_vector_cpu",
 })
 _LOGIT_BACKENDS = {"cpu", "cuda", "ggml_cpu", "ggml_cuda", "ggml_metal"}
 _CONFIG_KEYS = {"model", "mmproj", "draft-model", "tokenizer", "kv-cache-dtype", "embedding-threads",
@@ -89,7 +89,7 @@ def availability(case, context):
     if kind == "speculation_ngram":
         from .speculation import availability as ngram_available
         return ngram_available(context)
-    command_key = "logit_command" if kind.startswith("forced_logits") else "server_command" if kind.startswith("server_") or kind in {"jev_decision", "jev_text_attachments", "image_generation_smoke", "client_http_live"} else "cli_command"
+    command_key = "logit_command" if kind.startswith("forced_logits") else "server_command" if kind.startswith("server_") or kind in {"jev_decision", "jev_text_attachments", "image_generation_smoke", "client_http_live", "retrieval_vector_cpu"} else "cli_command"
     command = context.get(command_key)
     if not command or isinstance(command, str):
         return False, "provide a built local binary argv list in " + command_key
@@ -111,6 +111,9 @@ def availability(case, context):
     if kind == "image_generation_smoke":
         from .image_generation import availability as image_available
         return image_available(context)
+    if kind == "retrieval_vector_cpu":
+        from .knowledge_retrieval import availability as retrieval_available
+        return retrieval_available(context)
     if kind in {"cli_image", "cli_audio", "cli_video"}:
         fixture = _fixture(case, context)
         if not fixture.get("media_path") or not Path(fixture["media_path"]).is_file():
@@ -641,11 +644,14 @@ class _Http:
             raise ScenarioFailure("server scenario deadline exceeded")
         return seconds
 
-    def open(self, route, payload=None, method=None, headers=None):
+    def open(self, route, payload=None, method=None, headers=None, *, raw_body=None):
         if not route.startswith("/") or route.startswith("//"):
             raise ScenarioFailure("nonlocal HTTP route refused")
-        self.result["inputs"].setdefault("requests", []).append({"route": route, "method": method or ("POST" if payload is not None else "GET"), "body": payload, "headers": headers or {}})
-        data = None if payload is None else json.dumps(payload, allow_nan=False).encode("utf-8")
+        if raw_body is not None and (payload is not None or not isinstance(raw_body, bytes) or len(raw_body) > 64 * 1024):
+            raise ScenarioFailure("raw HTTP request must be bytes <=64 KiB without a JSON payload")
+        data = raw_body if raw_body is not None else None if payload is None else json.dumps(payload, allow_nan=False).encode("utf-8")
+        captured = {"bytes": len(raw_body), "sha256": hashlib.sha256(raw_body).hexdigest(), "encoding": "raw"} if raw_body is not None else payload
+        self.result["inputs"].setdefault("requests", []).append({"route": route, "method": method or ("POST" if data is not None else "GET"), "body": captured, "headers": headers or {}})
         request = urllib.request.Request(self.base + route, data=data, method=method,
                                          headers={"Content-Type": "application/json", **(headers or {})})
         try:
@@ -865,9 +871,12 @@ def _server(case, context, result):
         command += host_arguments(context.get("timeout_seconds", 600))
     else:
         command += ["--no-multi-agent"]
-    if kind == "server_embeddings":
+    if kind in {"server_embeddings", "retrieval_vector_cpu"}:
         command += ["--embeddings"]
     server_env = dict(context.get("env") or {})
+    if kind == "retrieval_vector_cpu":
+        from .knowledge_retrieval import host_environment
+        server_env.update(host_environment(context))
     if kind in {"server_cancel", "server_reset_cache"}:
         server_env.update(TENSORSHARP_LOG_FILE="1", TENSORSHARP_LOG_LEVEL="Information")
     process = ManagedProcess(command, cwd=context["repo"], artifact_dir=context["artifact_dir"], stage="server", env=server_env)
@@ -891,6 +900,10 @@ def _server(case, context, result):
         _require(result, "loaded backend identity", identity.get("loadedBackend") == context["backend"], context["backend"], identity.get("loadedBackend"))
         _require(result, "loaded model identity", identity.get("loaded") == Path(context["model_path"]).name, Path(context["model_path"]).name, identity.get("loaded"))
         _attest_offload_architecture(context, result, "server-model", [identity.get("architecture")], "/api/models architecture")
+        if kind == "retrieval_vector_cpu":
+            _require(result, "MiniLM embedding-only architecture and dimensions", identity.get("architecture") == "bert"
+                     and identity.get("embeddingDimensions") == 384 and identity.get("capabilities") == ["embedding"],
+                     {"architecture": "bert", "embeddingDimensions": 384, "capabilities": ["embedding"]}, identity)
         if kind == "image_generation_smoke":
             _require(result, "Qwen image architecture loaded", identity.get("architecture") == "qwen_image", "qwen_image", identity.get("architecture"))
             from .image_generation import run_image_smoke
@@ -900,7 +913,10 @@ def _server(case, context, result):
         model = _hosted_response_model(identity["loaded"], listing, result)
         payload = {"model": model, "messages": [{"role": "user", "content": _PROMPT}], "temperature": 0,
                    "seed": 42, "max_tokens": 128, "think": False, "stream": False}
-        if kind == "client_http_live":
+        if kind == "retrieval_vector_cpu":
+            from .knowledge_retrieval import run_retrieval
+            run_retrieval(http, model, context, result)
+        elif kind == "client_http_live":
             from .client_live import run_http_client
             run_http_client(http, model, context, result)
         elif kind == "jev_decision":
@@ -1102,7 +1118,10 @@ def _reset_and_cache(http, payload, result, context):
         else:
             _require(result, "disposed session no longer exists", False, 404, 200)
     prefix = "The following is a synthetic cache fixture, with no private information. " * 40
-    repeated = dict(payload, messages=[{"role": "user", "content": prefix + "\n" + _PROMPT}])
+    # Shared prefix extraction admits leading system/developer messages. A user-
+    # only request without assistant history gets a new private lineage and is
+    # deliberately ineligible for cross-request public-prefix reuse.
+    repeated = dict(payload, messages=[{"role": "system", "content": prefix}, {"role": "user", "content": _PROMPT}])
     first_response = http.json("/v1/chat/completions", repeated)
     first = validate_chat(first_response, expected_model=payload["model"], max_tokens=payload["max_tokens"])
     second_response = http.json("/v1/chat/completions", repeated)

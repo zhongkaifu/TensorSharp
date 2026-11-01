@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 
 from .processes import (run_process, containment_failure_evidence, unsafe_process_state,
@@ -164,12 +165,25 @@ def run_native_tests(repo, build_dir, output, mode, backend="cpu", pattern=None,
         # A successful process exit is insufficient without a report from this
         # invocation. Invalidate only our known result file before execution.
         junit.unlink(missing_ok=True)
+        # Native fixtures use fixed basenames and some default to external model
+        # directories. Allocate fresh owned directories, including on reruns;
+        # never inspect, overwrite or reuse ambient/user fixture locations.
+        isolation = Path(tempfile.mkdtemp(prefix="native-fixtures-", dir=output.resolve()))
+        native_tmp, external_fixtures = isolation / "native-tmp", isolation / "external-fixtures"
+        native_tmp.mkdir()
+        external_fixtures.mkdir()
+        fixture_env = {"TMPDIR": str(native_tmp), "TMP": str(native_tmp), "TEMP": str(native_tmp),
+                       "TS_MM3_FIXTURE_DIR": str(external_fixtures)}
+        result["fixture_isolation"] = {
+            "root": str(isolation), "environment": fixture_env,
+            "external_fixture_policy": "fresh empty directory; missing MiniMax DSpark fixtures remain skipped (77)",
+        }
         expression = "^(" + "|".join(re.escape(test["name"]) for test in selected) + ")$"
         command = common + ["--parallel", "1", "--timeout", str(timeout_seconds), "--no-tests=error",
                             "--fixture-exclude-any", ".*", "-R", expression, "--output-on-failure", "--output-junit", str(junit.resolve())]
         execution = run_process(command, cwd=repo, artifact_dir=output, stage="native-tests",
                                 timeout_seconds=timeout_seconds * len(selected) + 30,
-                                env={"CUDA_VISIBLE_DEVICES": str(gpu_index) if backend == "cuda" else ""})
+                                env={"CUDA_VISIBLE_DEVICES": str(gpu_index) if backend == "cuda" else "", **fixture_env})
         result["processes"].append(execution)
         containment = containment_failure_evidence(execution)
         if containment is not None:

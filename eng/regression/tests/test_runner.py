@@ -308,6 +308,149 @@ class RunnerTests(unittest.TestCase):
         cuda_plan = next(p for p in selection["attempts"] if p["backend"] == "ggml_cuda")
         self.assertFalse(cuda_plan["eligible"])
 
+    def retrieval_fixture(self, mixed=False):
+        retrieval = {"id": "retrieval_vector_cpu", "kind": "retrieval_vector_cpu",
+                     "status": "automated", "backends": ["cpu"]}
+        cases = [retrieval]
+        if mixed:
+            cases.append({"id": "server_embeddings", "kind": "server_embeddings", "status": "automated"})
+        self.catalog_data["presets"][0].update(id="embedding-minilm", kind="embedding", family="bert",
+            backends=["ggml_cuda", "ggml_cpu", "cpu"], scenarios=[case["id"] for case in cases])
+        self.catalog_data["scenarios"] = cases
+        self.catalog.write_text(json.dumps(self.catalog_data))
+        self.resolved.options["embeddings"] = True
+        self.hardware.return_value["backends"]["ggml_cuda"] = {"available": True}
+        self.hardware.return_value["gpus"] = [{"index": 0, "memory_free_bytes": 16 * GIB}]
+        self.run.side_effect = lambda *_: {"status": "pass", "reason": "offline fixture assertions"}
+
+    def test_retrieval_auto_prefers_its_supported_cpu_even_when_gpu_available(self):
+        self.retrieval_fixture()
+        code, report = self.invoke("--mode", "run", "--backend", "auto")
+        self.assertEqual(0, code)
+        self.assertEqual("cpu", report["results"][-1]["backend"])
+        selection = report["backend_selections"][0]
+        self.assertEqual("cpu", selection["selected"])
+        gpu = next(attempt for attempt in selection["attempts"] if attempt["backend"] == "ggml_cuda")
+        self.assertEqual([], gpu["runnable_scenarios"])
+        self.assertIn("retrieval_vector_cpu", gpu["scenario_rejections"])
+        self.assertTrue(all(call.args[1]["preset_id"] == "embedding-minilm" for call in self.availability.call_args_list))
+        self.assertEqual("embedding-minilm", self.run.call_args.args[1]["preset_id"])
+
+    def test_retrieval_mixed_auto_maximizes_coverage_with_one_cpu_preparation(self):
+        self.retrieval_fixture(mixed=True)
+        with patch.object(runner, "sizes_for", wraps=runner.sizes_for) as sizes:
+            code, report = self.invoke("--mode", "run", "--backend", "auto", "--strict")
+        self.assertEqual(0, code)
+        rows = [row for row in report["results"] if row.get("preset")]
+        self.assertEqual({"retrieval_vector_cpu", "server_embeddings"}, {row["scenario"] for row in rows})
+        self.assertTrue(all(row["backend"] == "cpu" and row["status"] == "pass" for row in rows))
+        self.assertEqual(1, self.prepare.call_count)
+        self.assertEqual(2, self.run.call_count)
+        self.assertEqual(2, sizes.call_count, "same files are probed once for auto selection, then rechecked for execution")
+        self.assertEqual(2, report["backend_selections"][0]["attempts"][-1]["coverage_count"])
+
+    def test_retrieval_explicit_gpu_is_unsupported_without_file_preparation(self):
+        self.retrieval_fixture()
+        code, report = self.invoke("--mode", "run", "--backend", "ggml_cuda")
+        self.assertEqual(3, code)
+        row = report["results"][-1]
+        self.assertEqual(("ggml_cuda", "unsupported"), (row["backend"], row["status"]))
+        self.assertIn("scenario's adapter qualification backend scope", row["reason"])
+        self.config.assert_not_called()
+        self.prepare.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_retrieval_mixed_explicit_gpu_preserves_unsupported_row(self):
+        self.retrieval_fixture(mixed=True)
+        code, report = self.invoke("--mode", "run", "--backend", "ggml_cuda", "--strict")
+        # Existing aggregation permits pass + unsupported; retain the explicit
+        # unsupported cell instead of pretending a CPU fallback covered the GPU.
+        self.assertEqual(0, code)
+        rows = {row["scenario"]: row for row in report["results"] if row.get("preset")}
+        self.assertEqual("unsupported", rows["retrieval_vector_cpu"]["status"])
+        self.assertEqual("pass", rows["server_embeddings"]["status"])
+        self.assertTrue(all(row["backend"] == "ggml_cuda" for row in rows.values()))
+        self.assertNotIn("resident_models", rows["server_embeddings"]["resource_plan"])
+
+    def test_retrieval_plan_charges_two_resident_models_but_one_disk_transfer(self):
+        self.retrieval_fixture()
+        size = 25 * 1024 ** 2
+        with patch.object(runner, "sizes_for", return_value=(size, size)):
+            code, report = self.invoke("--mode", "plan", "--backend", "auto")
+        self.assertEqual(0, code)
+        plan = report["results"][-1]["resource_plan"]
+        estimates, resident = plan["estimates"], plan["resident_models"]
+        self.assertEqual(size, estimates["weight_bytes"])
+        self.assertEqual(size, estimates["disk_required_bytes"])
+        self.assertEqual(int(2 * (size * 1.25 + 2 * GIB)), estimates["ram_required_bytes"])
+        self.assertEqual((2, size, 2 * size, 1), (resident["instances"], resident["unique_weight_bytes"],
+            resident["resident_weight_bytes"], resident["file_copies_for_download_and_disk"]))
+        self.assertEqual("per_instance_conservative_default", resident["ram_estimate_source"])
+        self.assertTrue(all(call.args[1]["preset_id"] == "embedding-minilm" for call in self.availability.call_args_list))
+        self.prepare.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_retrieval_memory_budget_between_one_and_two_models_blocks_execution(self):
+        self.retrieval_fixture()
+        code, report = self.invoke("--mode", "run", "--backend", "auto", "--ram-budget-gib", "3")
+        self.assertEqual(3, code)
+        row = report["results"][-1]
+        self.assertEqual(("cpu", "skip"), (row["backend"], row["status"]))
+        self.assertIn("RAM exceeds budget", row["reason"])
+        self.prepare.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_retrieval_explicit_ram_requirement_is_total_for_both_instances(self):
+        self.retrieval_fixture()
+        code, report = self.invoke("--mode", "run", "--backend", "cpu",
+                                   "--ram-budget-gib", "3", "--ram-required-gib", "2.5")
+        self.assertEqual(0, code)
+        plan = report["results"][-1]["resource_plan"]
+        self.assertEqual(int(2.5 * GIB), plan["estimates"]["ram_required_bytes"])
+        self.assertEqual(2.5, plan["overrides"]["ram_required_gib"])
+        self.assertEqual("explicit_total_override", plan["resident_models"]["ram_estimate_source"])
+        self.assertIn("both", plan["resident_models"]["ram_override_scope"])
+
+    def test_retrieval_unselected_does_not_add_sidecar_memory(self):
+        self.retrieval_fixture(mixed=True)
+        code, report = self.invoke("--mode", "plan", "--backend", "cpu", "--scenarios", "server_embeddings")
+        self.assertEqual(0, code)
+        self.assertNotIn("resident_models", report["results"][-1]["resource_plan"])
+
+    def test_auto_prerequisite_exception_does_not_reuse_previous_backend_rejections(self):
+        self.catalog_data["presets"][0].update(backends=["ggml_cuda", "cpu"], scenarios=["cli_text", "cli_decode"])
+        self.catalog_data["scenarios"].append({"id": "cli_decode", "status": "automated"})
+        self.catalog.write_text(json.dumps(self.catalog_data))
+
+        def available(case, context):
+            if context["backend"] == "cpu":
+                raise OSError("CPU fixture read failed")
+            return (False, "GPU-only prerequisite rejection") if case["id"] == "cli_text" else (True, "ready")
+
+        self.availability.side_effect = available
+        code, report = self.invoke("--mode", "plan", "--backend", "auto")
+        self.assertEqual(1, code)
+        rows = [row for row in report["results"] if row.get("preset")]
+        self.assertTrue(all(row["status"] == "fail" for row in rows))
+        self.assertTrue(all(row["planning_context"] == {"backend": "cpu", "stage": "scenario_prerequisites"} for row in rows))
+        self.assertTrue(all(row["required_files"] == [] for row in rows))
+        self.assertEqual({}, report["backend_selections"][0]["scenario_rejections"])
+        self.prepare.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_auto_source_probe_error_records_current_backend_and_stage(self):
+        self.retrieval_fixture()
+        failure = PrepareError("probe", "source_unavailable", self.model, "metadata source unavailable")
+        with patch.object(runner, "sizes_for", side_effect=failure):
+            code, report = self.invoke("--mode", "plan", "--backend", "auto")
+        self.assertEqual(1, code)
+        row = report["results"][-1]
+        self.assertEqual(("fail", "source_unavailable"), (row["status"], row["error_code"]))
+        self.assertEqual({"backend": "cpu", "stage": "file_planning"}, row["planning_context"])
+        self.assertEqual(row["planning_context"], report["backend_selections"][0]["planning_context"])
+        self.prepare.assert_not_called()
+        self.run.assert_not_called()
+
     def cpu_moe_fixture(self, family="qwen4exp", layout="moe"):
         self.catalog_data["presets"][0].update(family=family, layout=layout,
             backends=["cuda", "ggml_cuda", "ggml_cpu", "cpu"])

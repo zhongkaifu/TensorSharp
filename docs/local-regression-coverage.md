@@ -134,6 +134,19 @@ empty-input/zero-dimension errors (400), plus an unknown model (404). Media CLI
 cells require explicit fixtures, expected answers and positive
 encoder/injection evidence.
 
+`retrieval_vector_cpu` adds an owned embedding-only MiniLM host with a separate
+CPU knowledge encoder loading the same pinned file. Three synthetic TXT files
+exercise Ready indexed metadata and exact weight/prefix/source hashes, a
+zero-lexical-overlap dense paraphrase top result, finite RRF scores, scoped
+search/read, exact original downloads, malformed/atomic-upload rejection and
+document/collection deletion. Default RAM accounts for both encoder instances;
+download/disk bytes count the unique file once. This CPU-only adapter is limited
+qualification, not an engine backend restriction. The sidecar has no public
+backend telemetry, so its CPU configuration/source admission is disclosed
+separately from the primary host's API backend evidence. The broader retrieval
+recipe still records grounded-chat/citation, reranking, OCR/media, persistence,
+concurrency and tenant authorization gaps. Collection scope is not a tenant ACL.
+
 Fixed-history consistency captures every compared logit row and the first
 divergent case/step/token. Nonfinite values, incomplete output, a mismatched
 model/history or backend fallback cannot pass. A fresh same-backend repeat is

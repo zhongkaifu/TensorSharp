@@ -29,6 +29,7 @@ SAFE_OPTIONS = {"model", "mmproj", "draft-model", "tokenizer", "kv-cache-dtype",
                 "qwen-image-mmproj", "video-dit2", "video-vae", "video-text-encoder", "audio-vae",
                 "video-frames", "video-fps", "spec"}
 MEDIA_SCENARIOS = {"cli_image", "cli_audio", "cli_video"}
+BACKEND_PREFERENCE = ("ggml_cuda", "cuda", "ggml_metal", "mlx", "ggml_vulkan", "ggml_cpu", "cpu")
 
 
 def plain(value):
@@ -132,10 +133,14 @@ def select_backends(requested, supported, hardware):
         return list(supported)
     if requested != "auto":
         return requested.split(",")
-    candidates = [backend for backend in ("ggml_cuda", "cuda", "ggml_metal", "mlx", "ggml_vulkan", "ggml_cpu", "cpu")
+    candidates = [backend for backend in BACKEND_PREFERENCE
                   if backend in supported and hardware.get("backends", {}).get(backend, {}).get("available")]
     # Auto chooses one available backend, and records the choice. Explicit requests never fall back.
     return candidates[:1] or list(supported[:1])
+
+
+def scenario_supports_backend(scenario, backend):
+    return "backends" not in scenario or backend in scenario["backends"]
 
 
 def existing_index(roots):
@@ -216,12 +221,38 @@ def offload_profile(args, preset=None, backend=None):
     return residency_profile(args.cpu_moe, args.ram_required_gib, args.vram_required_gib, preset, backend)
 
 
-def plan_model_resources(args, preset, weight_bytes, backend, hardware, overrides):
+def plan_model_resources(args, preset, weight_bytes, backend, hardware, overrides, scenarios=()):
     profile = offload_profile(args, preset, backend)
     if not profile["supported"]:
         return {"eligible": False, "reason": profile["reason"], "backend": backend,
                 "offload_policy": profile, "estimates": {}, "warnings": []}
-    return annotate_resource_plan(plan_resources(weight_bytes, backend, hardware, overrides=overrides), profile)
+    resource_overrides = dict(overrides)
+    resident_models = None
+    if (preset.get("id") == "embedding-minilm" and backend == "cpu"
+            and any(s["id"] == "retrieval_vector_cpu" for s in scenarios)):
+        known_size = type(weight_bytes) is int and weight_bytes > 0
+        explicit_ram = "ram_required_gib" in resource_overrides
+        if known_size and not explicit_ram:
+            # The primary embedding endpoint and knowledge provider own separate
+            # models, even though both load the same verified file. Keep unique
+            # on-disk/transfer bytes unchanged and reserve workspace per instance.
+            resource_overrides["ram_required_gib"] = 2 * (weight_bytes * 1.25 + 2 * GIB) / GIB
+        resident_models = {
+            "scenario": "retrieval_vector_cpu", "instances": 2, "backend": "cpu",
+            "unique_weight_bytes": weight_bytes,
+            "resident_weight_bytes": 2 * weight_bytes if known_size else None,
+            "file_copies_for_download_and_disk": 1,
+            "ram_estimate_source": "explicit_total_override" if explicit_ram else "per_instance_conservative_default",
+            "ram_formula": "2 * (1.25 * unique_weight_bytes + 2 GiB)",
+            "ram_override_scope": "total for both independently resident CPU encoders and their workspace",
+            "source_evidence": ["TensorSharp.Server.Host/Program.cs",
+                                "TensorSharp.Chat/Knowledge/KnowledgeRuntime.cs",
+                                "TensorSharp.Chat/Knowledge/GgufKnowledgeEmbeddingProvider.cs"],
+        }
+    result = annotate_resource_plan(plan_resources(weight_bytes, backend, hardware, overrides=resource_overrides), profile)
+    if resident_models is not None:
+        result["resident_models"] = resident_models
+    return result
 
 
 def sizes_for(files, policy, network=False):
@@ -421,34 +452,60 @@ def main(argv=None):
                 # a recorded planning decision, never a runtime fallback.
                 preliminary_files = []
                 prerequisite_failures = {}
+                planning_context = {"backend": None, "stage": "config_resolution"}
                 try:
                     preliminary = read_config(repo / preset["config"], root)
                     if not preliminary.unavailable:
-                        preliminary_options, preliminary_files = use_existing(preliminary, index)
-                        preliminary_context = {"repo": repo, "backend": backends[0], "preparing_model": True, "model_family": preset["family"],
-                            "context_tokens": args.context_tokens,
-                            "model_options": preliminary_options, "model_path": preliminary_options.get("model"),
-                            "media_dir": args.media_dir, "offload_policy": offload_profile(args, preset, backends[0]), **commands}
-                        preliminary_cases = []
-                        for scenario in case_defs:
-                            if scenario.get("status") != "automated":
-                                continue
-                            ready, why = availability(scenario, preliminary_context)
-                            if ready:
-                                preliminary_cases.append(scenario)
+                        all_options, all_files = use_existing(preliminary, index)
+                        attempts, size_cache = [], {}
+                        for candidate_backend in (b for b in BACKEND_PREFERENCE if b in preset.get("backends", [])):
+                            planning_context = {"backend": candidate_backend, "stage": "scenario_prerequisites"}
+                            preliminary_files = []
+                            preliminary_context = {"repo": repo, "backend": candidate_backend, "preparing_model": True,
+                                "preset_id": preset["id"], "model_family": preset["family"],
+                                "context_tokens": args.context_tokens,
+                                "model_options": all_options, "model_path": all_options.get("model"),
+                                "media_dir": args.media_dir, "offload_policy": offload_profile(args, preset, candidate_backend), **commands}
+                            preliminary_cases, case_rejections = [], {}
+                            prerequisite_failures = case_rejections
+                            for scenario in case_defs:
+                                if scenario.get("status") != "automated":
+                                    continue
+                                if not scenario_supports_backend(scenario, candidate_backend):
+                                    case_rejections[scenario["id"]] = "outside this scenario's adapter qualification backend scope"
+                                    continue
+                                ready, why = availability(scenario, preliminary_context)
+                                if ready:
+                                    preliminary_cases.append(scenario)
+                                else:
+                                    case_rejections[scenario["id"]] = why
+                            planning_context["stage"] = "file_planning"
+                            preliminary_options = effective_options(all_options, [s["id"] for s in preliminary_cases], candidate_backend)
+                            preliminary_files = catalog_file_sizes(model_files(all_files, preliminary_options), preset)
+                            preliminary_files = required_scenario_files(preliminary_files, preliminary_cases)
+                            if preliminary_cases:
+                                file_key = tuple(preliminary_files)
+                                if file_key not in size_cache:
+                                    size_cache[file_key] = sizes_for(preliminary_files, policy,
+                                        network=args.probe_network or (args.mode == "run" and args.allow_download))
+                                total, missing = size_cache[file_key]
                             else:
-                                prerequisite_failures[scenario["id"]] = why
-                        preliminary_options = effective_options(preliminary_options, [s["id"] for s in preliminary_cases], backends[0])
-                        preliminary_files = catalog_file_sizes(model_files(preliminary_files, preliminary_options), preset)
-                        preliminary_files = required_scenario_files(preliminary_files, preliminary_cases)
-                        total, missing = sizes_for(preliminary_files, policy, network=args.probe_network or (args.mode == "run" and args.allow_download)) if preliminary_cases else (None, None)
-                        candidates = [b for b in ("ggml_cuda", "cuda", "ggml_metal", "mlx", "ggml_vulkan", "ggml_cpu", "cpu") if b in preset.get("backends", [])]
-                        attempts = [{"backend": b, **plan_model_resources(args, preset, total, b, hardware,
-                            overrides={**model_overrides, "download_bytes": missing or 0})} for b in candidates]
-                        eligible = [attempt["backend"] for attempt in attempts if attempt["eligible"]]
-                        if eligible:
-                            backends = eligible[:1]
-                        report.setdefault("backend_selections", []).append({"preset": preset["id"], "requested": "auto", "selected": backends[0], "attempts": attempts})
+                                total, missing = None, None
+                            planning_context["stage"] = "resource_planning"
+                            attempt = plan_model_resources(args, preset, total, candidate_backend, hardware,
+                                overrides={**model_overrides, "download_bytes": missing or 0}, scenarios=preliminary_cases)
+                            attempts.append({**attempt, "runnable_scenarios": [s["id"] for s in preliminary_cases],
+                                "scenario_rejections": case_rejections, "coverage_count": len(preliminary_cases)})
+                        eligible = [attempt for attempt in attempts if attempt["eligible"]]
+                        # Maximize selected scenario coverage, then retain backend
+                        # preference on ties. A CPU-only recipe cannot disappear
+                        # merely because the preset also supports a GPU backend.
+                        choices = eligible or [attempt for attempt in attempts if attempt.get("offload_policy", {}).get("supported")] or attempts
+                        if choices:
+                            backends = [max(choices, key=lambda attempt: attempt["coverage_count"])["backend"]]
+                        report.setdefault("backend_selections", []).append({"preset": preset["id"], "requested": "auto",
+                            "selected": backends[0], "selection_policy": "most runnable selected scenarios within resource budgets; backend preference breaks ties",
+                            "attempts": attempts})
                 except (ValueError, OSError, RuntimeError) as error:
                     # A single bad source or preset must not prevent all other
                     # selected models from being planned/tested. Do not retry it
@@ -456,7 +513,8 @@ def main(argv=None):
                     details = error.as_dict() if isinstance(error, PrepareError) else {
                         "stage": "planning", "code": "planning_error", "path": str(repo / preset["config"]), "message": str(error)}
                     report.setdefault("backend_selections", []).append({"preset": preset["id"], "requested": "auto",
-                        "selected": None, "error": details})
+                        "selected": None, "error": details, "planning_context": planning_context,
+                        "scenario_rejections": prerequisite_failures})
                     for scenario in case_defs:
                         capability = scenario.get("status")
                         if capability == "unsupported":
@@ -469,6 +527,7 @@ def main(argv=None):
                             status, reason = "fail", str(error)
                         report["results"].append(result_stub(preset, "auto", scenario, status, reason,
                             stage=details["stage"], error_code=details["code"], error=details,
+                            planning_context=planning_context,
                             required_files=[plain(spec) for spec in preliminary_files],
                             reproduce=reproduce_args(args, repo, root, preset, "auto", scenario)))
                     write_reports(output, report, bundle=False)
@@ -481,7 +540,7 @@ def main(argv=None):
                 model_env = {"CUDA_VISIBLE_DEVICES": str(args.gpu_index)} if backend in {"cuda", "ggml_cuda"} else {}
                 model_env.update(profile["environment"])
                 model_env["MAX_CONTEXT"] = str(args.context_tokens)
-                base_context = {"repo": repo, "backend": backend, "artifact_dir": output, "model_family": preset["family"],
+                base_context = {"repo": repo, "backend": backend, "artifact_dir": output, "preset_id": preset["id"], "model_family": preset["family"],
                                 "timeout_seconds": args.timeout_seconds, "media_dir": args.media_dir,
                                 "disk_headroom_gib": args.disk_headroom_gib,
                                 "context_tokens": args.context_tokens,
@@ -493,6 +552,8 @@ def main(argv=None):
                         status, reason = "unsupported", preset.get("reason") or scenario.get("reason", "Implementation unavailable")
                     elif backend not in preset.get("backends", []):
                         status, reason = "unsupported", f"{backend} is outside this preset's source-supported backend matrix"
+                    elif not scenario_supports_backend(scenario, backend):
+                        status, reason = "unsupported", f"{backend} is outside this scenario's adapter qualification backend scope"
                     elif not profile["supported"]:
                         status, reason = "unsupported", profile["reason"]
                     elif scenario.get("status") != "automated":
@@ -542,7 +603,7 @@ def main(argv=None):
                     if args.mode == "run":
                         hardware = detect_hardware(root, runtime_dirs=runtime_dirs)
                     resources = plan_model_resources(args, preset, weight_bytes, backend, hardware,
-                                                    overrides={**model_overrides, "download_bytes": missing_bytes or 0})
+                                                    overrides={**model_overrides, "download_bytes": missing_bytes or 0}, scenarios=candidates)
                     reason = None
                     if args.max_models and preset["id"] not in executed_models and len(executed_models) >= args.max_models:
                         reason = "selected model count limit reached"

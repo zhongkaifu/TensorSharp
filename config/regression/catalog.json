@@ -1309,7 +1309,8 @@
       ],
       "scenarios": [
         "server_embeddings",
-        "retrieval"
+        "retrieval",
+        "retrieval_vector_cpu"
       ],
       "source_evidence": [
         "config/embedding-minilm.json",
@@ -3911,7 +3912,7 @@
       "id": "retrieval",
       "entry_point": "TensorSharp.Knowledge.Tests",
       "status": "recipe",
-      "recipe": "dotnet test TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj --logger trx",
+      "recipe": "Broad grounded-chat/citation, reranking, OCR/media, persistence and authorization qualification remains a separate recipe. Use knowledge_unit for component tests; retrieval_vector_cpu covers only bounded MiniLM CPU indexing/search/read/source/scope/deletion over owned synthetic TXT.",
       "assertions": [
         "Fixture document ingestion/chunk IDs, expected retrieved passage and citation; ACL/session isolation and malformed document behavior."
       ],
@@ -3921,6 +3922,34 @@
       ],
       "requirements": [
         "Built test suite; model-backed end-to-end retrieval needs local embedding model"
+      ]
+    },
+    {
+      "id": "retrieval_vector_cpu",
+      "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
+      "status": "automated",
+      "backends": ["cpu"],
+      "recipe": "Run --models embedding-minilm --scenarios retrieval_vector_cpu --backend cpu (or auto) --server <built host>; an owned embedding-only loopback server independently loads the same pinned MiniLM file for its CPU knowledge sidecar. No chat or external provider is used.",
+      "assertions": [
+        "Primary CPU/bert/384-dimension embedding-only identity and pinned MiniLM SHA; each Ready single-chunk import records exact source hash/bytes, extractor and matching sidecar weight/prefix identity.",
+        "Three original synthetic TXT documents in two fresh collections; zero-lexical-overlap paraphrase ranks the maintenance passage first with finite positive RRF score and exact reference, scope, text and source URL.",
+        "Scoped read preserves exact passage; all three source downloads match original bytes/SHA and defensive download headers. Empty scope returns no hits; foreign-only positive control and local-scope query exclude foreign documents.",
+        "Wrong-scope read404, missing/malformed scope400, overlong query413 and multi-file multipart400; rejected multipart leaves the document inventory unchanged.",
+        "Document deletion removes listing/search/read/source access; repeated deletion returns false. Both owned collections are deleted, repeated deletion returns false and deleted collection search404.",
+        "Requests/responses are bounded and original fixture text/identities retained. CPU sidecar is explicitly configured and source-admitted; no public sidecar-backend telemetry, grounded answers/citations, reranking, OCR, concurrency, persistence or tenant ACL qualification is claimed."
+      ],
+      "evidence": [
+        "eng/regression/knowledge_retrieval.py",
+        "TensorSharp.Server.Host/Program.cs",
+        "TensorSharp.Server/Hosting/EmbeddingHosting.cs",
+        "TensorSharp.Server/Endpoints/KnowledgeEndpoints.cs",
+        "TensorSharp.Chat/Knowledge/KnowledgeRuntime.cs",
+        "TensorSharp.Chat/Knowledge/GgufKnowledgeEmbeddingProvider.cs",
+        "TensorSharp.Knowledge/KnowledgeStore.cs"
+      ],
+      "requirements": [
+        "Pinned embedding-minilm preset only; CPU is an adapter qualification limit, not an engine backend restriction.",
+        "Fresh artifact-local knowledge directory; same verified GGUF download/disk once, two independent resident encoders charged in default RAM planning; explicit RAM override describes their combined peak."
       ]
     },
     {

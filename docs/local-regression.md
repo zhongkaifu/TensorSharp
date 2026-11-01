@@ -14,8 +14,8 @@ quantization, context length, or feature combination has passed. An executable
 adapter, a supported recipe, and an actual passing result are different things.
 The catalog records source support, adapters and recipes; execution reports record
 actual outcomes. It inventories 67 config documents: 50 standalone presets,
-16 LoRA plugins and one MTP overlay. Its 43 scenario definitions comprise
-24 executable adapters, five global suite categories and 14 recipes. These are
+16 LoRA plugins and one MTP overlay. Its 44 scenario definitions comprise
+25 executable adapters, five global suite categories and 14 recipes. These are
 coverage declarations, not counts of qualified models or passing tests. Broader
 image quality/editing, video generation, learned speculative variants, agent
 workflows and distributed/multi-GPU paths retain explicit gaps.
@@ -97,7 +97,10 @@ the CUDA project's active output `cuda_kernels` directory. Missing assets fail
 clearly even if a committed baseline or intermediate build exists elsewhere.
 Architecture-specific optional kernels remain subject to runtime capability
 checks; these header checks do not qualify CUDA execution. Referencing application
-outputs must also be deployed beforehand: this mode does not stage native assets.
+CUDA kernel outputs must also be deployed beforehand. Ordinary project targets
+may copy existing GGML/MLX libraries, but do not compile them in this mode. Finish
+the native library build before a managed build copies it; on Windows an active
+linker can hold the source DLL open and make the copy fail.
 Existing PTX/fatbin/identity sidecars are retained across SDK incremental cleanup;
 `Clean` and `Rebuild` are rejected while the CUDA skip flag is enabled.
 The suite scopes runtime execution with `TS_TEST_GGML_BACKEND=cpu` instead of
@@ -199,6 +202,11 @@ invocation, a new report is created under the selected repository.
   separately with another 2 GiB free-VRAM reserve. It does not sum several GPUs'
   VRAM or assume that disk-paged experts fit. These estimates are conservative
   planning gates, not measured peak usage or a guarantee against OOM.
+- `retrieval_vector_cpu` loads two independent MiniLM CPU encoders from the same
+  verified file. Its default RAM estimate is `2 * (1.25 * weight bytes + 2 GiB)`;
+  disk and downloads count the file once. An explicit `--ram-required-gib` is
+  the caller's combined peak estimate for both encoders and their workspace.
+  The report records this residency policy; it does not claim measured RAM.
 - Unknown model sizes, RAM, VRAM, native runtime capability, missing fixtures and
   unavailable executables are recorded, not treated as successes. Planning reads
   model file metadata without reading or hashing model payloads; model hashes are
@@ -339,6 +347,33 @@ python eng/run-local-regression.py --mode run --models qwen3.5-0.8b `
   --http-client examples/dotnet-local-chat/bin/Release/net10.0/TensorSharp.LocalChat.dll
 ```
 
+`retrieval_vector_cpu` is restricted to `embedding-minilm` and the managed `cpu`
+backend. It starts an embedding-only host and CPU knowledge sidecar using the
+same verified GGUF, with a fresh artifact-local library and three original
+synthetic TXT files. It checks exact weight/prefix and source hashes, Ready
+single-chunk metadata, a zero-lexical-overlap paraphrase's top result, finite RRF
+scores, selected-collection scope, exact read/source content, rejected malformed
+requests and atomic rejected uploads, and document/collection deletion. HTTP
+bodies are bounded at 64 KiB. Failed fixture stores remain local diagnostics;
+successful runs delete only their API-created fixtures. `--backend auto` prefers
+the eligible backend covering the most selected adapters, so MiniLM retrieval
+alone or alongside embeddings selects CPU; explicit GPU requests retain an
+unsupported adapter cell, without switching backends. This restriction describes
+the adapter's qualification scope, not the engine's complete backend support.
+
+```powershell
+python eng/run-local-regression.py --mode run --models embedding-minilm `
+  --scenarios retrieval_vector_cpu --backend auto --model-root C:\work\model `
+  --server .\TensorSharp.Server.Host\bin\TensorSharp.Server.Host.dll
+```
+
+The primary CPU backend is API-attested. The independent sidecar's CPU backend
+is explicitly configured and source-admitted; its public API exposes the
+weight/prefix identity but no backend telemetry. Grounded answers and citations,
+reranking, OCR/media, persistence across restart, concurrency and tenant ACLs
+remain outside this adapter; the broader `retrieval` recipe stays untested.
+Collection IDs constrain retrieval scope and are not authorization credentials.
+
 `jev_decision` runs the repository's 12 labeled text decision fixtures, 36 gold
 decisions, fixed-seed replay and malformed requests. `jev_text_attachments` runs
 14 pinned text/document fixtures as inline attachments, including office/PDF text
@@ -392,6 +427,13 @@ arguments/names must identify the requested device; ambiguous tests stay
 `untested`, other-device tests are `skip`. An optional `--native-test-filter`
 regex narrows names further. Fixture dependencies outside the selection are
 reported instead of allowing CTest to start another device automatically.
+Each execution records fresh artifact-local temporary and external-fixture
+directories. `TMPDIR`, `TMP`, and `TEMP` point to the owned temporary directory;
+`TS_MM3_FIXTURE_DIR` points to the separate empty directory. MiniMax executor
+tests can generate their small synthetic GGUF without touching user files.
+MiniMax DSpark tests that require separately generated `model.gguf` and
+`dspark.gguf` remain skipped with code 77; the runner does not load an ambient
+fixture or automatically generate one from a real checkpoint.
 Device builds require the corresponding explicit `--native-test-backend` and
 recorded compiler options. Binary/cache hashes identify the deployment; they do
 not establish that an old binary was rebuilt from the current commit. Native

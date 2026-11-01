@@ -1,5 +1,6 @@
 """No native builds/devices: discovery and result contract negative fixtures."""
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from regression import ctest
+from regression.processes import clean_environment
 
 
 def payload(*tests):
@@ -118,6 +120,63 @@ class CTestTests(unittest.TestCase):
             self.assertEqual(self.invoke()[0]["status"], "fail")
             write_skipped_report = True
             self.assertEqual(self.invoke()[0]["status"], "untested")
+
+    def test_native_fixture_directories_are_fresh_owned_and_override_ambient_paths(self):
+        ambient_tmp, ambient_fixtures = self.repo / "user-temp", self.repo / "user-models"
+        ambient_tmp.mkdir()
+        ambient_fixtures.mkdir()
+        user_temp = ambient_tmp / "minimax-m3-exec-test.gguf"
+        user_model = ambient_fixtures / "model.gguf"
+        user_temp.write_text("existing user temp")
+        user_model.write_text("existing user fixture")
+        observed = []
+
+        def execute(command, **kwargs):
+            if "--show-only=json-v1" in command:
+                return {"exit_code": 0, "stdout": json.dumps(payload(case("minimax-m3-dspark-cpu"))), "stderr": ""}
+            effective = clean_environment(kwargs["env"])
+            native_tmp = Path(effective["TMPDIR"])
+            external = Path(effective["TS_MM3_FIXTURE_DIR"])
+            self.assertEqual(native_tmp.name, "native-tmp")
+            self.assertEqual(external.name, "external-fixtures")
+            self.assertEqual(native_tmp.parent, external.parent)
+            self.assertEqual(native_tmp.parent.parent, self.output.resolve())
+            self.assertNotEqual(native_tmp, ambient_tmp)
+            self.assertNotEqual(external, ambient_fixtures)
+            self.assertEqual(effective["TMP"], str(native_tmp))
+            self.assertEqual(effective["TEMP"], str(native_tmp))
+            self.assertEqual(list(native_tmp.iterdir()), [])
+            self.assertEqual(list(external.iterdir()), [])
+            observed.append((native_tmp, external, kwargs["env"]))
+            # Leave an old synthetic fixture behind: a rerun must not reuse it.
+            (external / "model.gguf").write_text("previous run synthetic marker")
+            self.output.joinpath("ctest.xml").write_text('<testsuite><testcase name="minimax-m3-dspark-cpu"><skipped message="fixture absent (77)"/></testcase></testsuite>')
+            return {"exit_code": 0, "stdout": "test skipped", "stderr": ""}
+
+        with patch.dict(os.environ, {"TMPDIR": str(ambient_tmp), "TMP": str(ambient_tmp),
+                                     "TEMP": str(ambient_tmp), "TS_MM3_FIXTURE_DIR": str(ambient_fixtures)}), \
+             patch.object(ctest.shutil, "which", return_value="ctest"), \
+             patch.object(ctest, "run_process", side_effect=execute):
+            first, second = self.invoke(), self.invoke()
+        for result, (_, _, env) in zip((first, second), observed):
+            self.assertEqual([row["status"] for row in result], ["untested", "skip"])
+            recorded = result[0]["fixture_isolation"]
+            self.assertEqual(recorded["environment"]["TMPDIR"], env["TMPDIR"])
+            self.assertEqual(recorded["environment"]["TS_MM3_FIXTURE_DIR"], env["TS_MM3_FIXTURE_DIR"])
+        self.assertNotEqual(observed[0][0], observed[1][0])
+        self.assertNotEqual(observed[0][1], observed[1][1])
+        self.assertEqual(user_temp.read_text(), "existing user temp")
+        self.assertEqual(user_model.read_text(), "existing user fixture")
+
+    def test_fixture_directory_creation_failure_prevents_native_execution(self):
+        discovery = {"exit_code": 0, "stdout": json.dumps(payload(case("fixture-cpu"))), "stderr": ""}
+        with patch.object(ctest.shutil, "which", return_value="ctest"), \
+             patch.object(ctest, "run_process", return_value=discovery) as process, \
+             patch.object(ctest.tempfile, "mkdtemp", side_effect=PermissionError("cannot isolate native fixtures")):
+            results = self.invoke()
+        process.assert_called_once()
+        self.assertEqual(results[0]["status"], "fail")
+        self.assertIn("cannot isolate native fixtures", results[0]["reason"])
 
     def test_zero_exit_without_fresh_junit_rejects_old_passing_report(self):
         self.output.mkdir()

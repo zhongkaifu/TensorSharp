@@ -593,7 +593,7 @@ class Handler(BaseHTTPRequestHandler):
             active = False
             return
         self.reply({'object':'chat.completion','model':'another-model.gguf' if mode=='response_other_model' else model,'choices':[{'message':{'role':'assistant','content':'56'},'finish_reason':'stop'}],
-                    'usage':{'prompt_tokens':12,'completion_tokens':1,'total_tokens':13,'prompt_tokens_details':{'cached_tokens':8}}})
+                    'usage':{'prompt_tokens':12,'completion_tokens':1,'total_tokens':13,'prompt_tokens_details':{'cached_tokens':0 if mode=='reset_zero_public_hit' else 8}}})
     def do_DELETE(self):
         sid = self.path.rsplit('/',1)[-1]
         if sid not in sessions: self.error(404,'session'); return
@@ -694,6 +694,25 @@ server.serve_forever()
         requests = [r["body"] for r in value["inputs"]["requests"] if r["route"] == "/api/chat"]
         self.assertEqual([r["newChat"] for r in requests], [True, False, True, False, False, False, True, False, True])
         self.assertEqual([len(r["messages"]) for r in requests], [1, 3, 1, 5, 3, 5, 1, 7, 1])
+        replay = [r["body"] for r in value["inputs"]["requests"] if r["route"] == "/v1/chat/completions"]
+        self.assertEqual(2, len(replay))
+        self.assertEqual(replay[0], replay[1])
+        self.assertEqual(["system", "user"], [m["role"] for m in replay[0]["messages"]])
+        self.assertEqual("The following is a synthetic cache fixture, with no private information. " * 40,
+                         replay[0]["messages"][0]["content"])
+        self.assertEqual("What is 7 multiplied by 8? Reply with only the integer answer.", replay[0]["messages"][1]["content"])
+        self.assertEqual(8, value["evidence"]["cached_tokens"])
+
+    def test_correct_system_prefix_without_measured_cache_hit_remains_untested(self):
+        value = self.run_fake_server("server_reset_cache", "reset_zero_public_hit")
+        self.assertEqual("untested", value["status"], value)
+        self.assertIn("no positive prefix-cache hit", value["reason"])
+        self.assertEqual(0, value["evidence"]["cached_tokens"])
+        self.assertEqual(2, len(value["evidence"]["session_cache_controls"]))
+        replay = [r["body"] for r in value["inputs"]["requests"] if r["route"] == "/v1/chat/completions"]
+        self.assertEqual(["system", "user"], [m["role"] for m in replay[0]["messages"]])
+        self.assertTrue(next(a["passed"] for a in value["assertions"] if a["name"] == "cached prefix preserves answer"))
+        self.assertNotIn("prefix-cache hit observed", [a["name"] for a in value["assertions"]])
 
     def test_new_chat_globally_clearing_other_session_cache_cannot_pass(self):
         value = self.run_fake_server("server_reset_cache", "reset_global_clear")
