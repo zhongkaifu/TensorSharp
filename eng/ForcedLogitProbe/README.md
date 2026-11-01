@@ -5,6 +5,37 @@ step while consuming exactly the reference token history. A process loads one
 model instance and calls `ResetKVCache()` before each case. It does not reload
 the model between cases.
 
+For GGML execution, deploy the prebuilt native library beside `ForcedLogitProbe.dll`.
+The probe's `AfterBuild` deployment target looks under
+`TensorSharp.GGML.Native/build-windows` on Windows or `TensorSharp.GGML.Native/build`
+on Linux/macOS, choosing `Release/<library>` first and then `<library>` in that
+directory. Names are `GgmlOps.dll`, `libGgmlOps.so`, and `libGgmlOps.dylib` respectively.
+Override `GgmlNativeBuildDir` to use a separate native build with the intended
+CPU/CUDA/Metal backend. The target only copies an existing file; it does not invoke
+CMake, nvcc, or a native compiler, and a successful copy does not qualify backend
+execution or prove dependent native libraries are installed.
+
+After preparing native assets separately, a managed-only deployment build can use:
+
+```powershell
+dotnet build eng/ForcedLogitProbe/ForcedLogitProbe.csproj -c Release `
+  -p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true -p:TensorSharpSkipCudaPtx=true `
+  -p:GgmlNativeBuildDir="D:\TensorSharp-build\ggml" -p:ForcedLogitProbeRequireGgmlNative=true
+```
+
+Pass all three skip properties on the command line so they apply to referenced
+projects as well. The CUDA skip policy requires its existing prebuilt PTX assets;
+see [local regression build guidance](../../docs/local-regression.md). Keep the
+complete output and matching dependencies together when relocating the probe.
+Without `ForcedLogitProbeRequireGgmlNative=true`, a missing source produces an
+explicit warning and leaves any existing output library untouched, allowing
+managed-only compilation without claiming GGML availability. With that property,
+the missing deployment fails the build.
+
+The runner's `--runtime-dir` inventories native files and build metadata only.
+It does **not** copy a DLL or alter the OS/.NET native-library search path. A GGML
+library found in another host's output does not make the probe's output runnable.
+
 ```sh
 dotnet run --project eng/ForcedLogitProbe -- model.gguf artifacts/fresh cpu --cases short.json --steps 32
 dotnet run --project eng/ForcedLogitProbe -- model.gguf artifacts/sequence cpu --reference artifacts/fresh --cases repeated.json

@@ -73,7 +73,11 @@ Pass `--cli`, `--server`, and `--logit-probe` when using release or isolated bui
 outputs. DLLs are launched through local `dotnet`. Host build/native dependencies
 are not proven by the existence of a DLL. `--runtime-dir` can point at a native
 build directory containing `GgmlOps` and `CMakeCache.txt` so CUDA/Metal capability
-is distinguishable from a CPU-only wrapper.
+is distinguishable from a CPU-only wrapper. This option inventories files only;
+it does not copy native libraries or change the OS/.NET library search path.
+The logit probe must have its matching prebuilt GGML library deployed beside its
+DLL; its [build target and override options](../eng/ForcedLogitProbe/README.md)
+copy from an explicitly selected native build without compiling GGML.
 
 `--include-suites` adds existing InferenceWeb, Knowledge, Studio and native/HTTP
 client contract tests. By default these require prebuilt Release assemblies and

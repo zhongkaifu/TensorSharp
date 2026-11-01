@@ -107,7 +107,10 @@ class HardwareTests(unittest.TestCase):
             parent_only = hardware._runtime_evidence([root])["files"]
             self.assertEqual(set(expected), set(parent_only))
             for name in expected:
-                self.assertEqual([str(kernels / name)], result["files"][name])
+                # Windows CI may canonicalize TEMP through its 8.3 alias. Assert
+                # the exact file identity and single entry, not path spelling.
+                self.assertEqual(1, len(result["files"][name]))
+                self.assertTrue((kernels / name).samefile(result["files"][name][0]))
             self.assertNotIn("excluded.ptx", result["files"])
 
     def test_conventional_cuda_kernel_inventory_reaches_report_hashes(self):
