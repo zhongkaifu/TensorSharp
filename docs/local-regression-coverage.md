@@ -299,6 +299,9 @@ full-run counts. Evidence names refer to local ignored report directories under
 | `grounded-retrieval-profile-d93f4aa/report.json` | Clean harness; profile fail, exit 1 | Qwen3.5-0.8B `ggml_cuda` + MiniLM CPU completed document/source checks, then failed normal completion under the fixed 384-token output budget. Owned Windows Job teardown verified zero remaining processes. |
 | `minilm-resumed-run-d93f4aa/report.json` | CPU embedding case skipped, exit 3; no additional transfer | The 2 GiB RAM budget was below the declared estimate of `2178743728` bytes. This is a resource gate, not an inference failure. |
 | `minilm-resumed-run-d93f4aa-ram4/report.json` | CPU embedding case and all 19 assertions pass, exit 0 | A valid 4 GiB RAM budget admitted the same workload; a real retained partial download resumed and its final identity verified. Harness code is `d93f4aa`, with documentation-only working-tree edits disclosed. |
+| `harness-d93f4aa-full.log` | 606 local Python tests: 605 pass, 1 skip | Harness verification, not model/backend qualification. |
+| `components-1783d3b/report.json` | Knowledge 110 pass; Studio 107 pass and 68 skip; native and HTTP client contract lanes pass | Server lane failed after its 1200-second deadline; owned-process cleanup verified zero remaining processes. |
+| `focused-model-free-3aeb10a/qualification.json` and `tests.trx` | 71 executed: 70 pass, 1 fail; no timeout; verified teardown | Environment-sensitive and PDF fixture paths pass. Only `FileLoggerProviderTests.Logger_RollsFileWhenSizeExceedsCap` still fails its 2-second Flush assertion. |
 
 The grounded retrieval failure is retained without increasing its output budget
 or changing its oracle. The receipt establishes failure to finish normally; it
@@ -319,19 +322,38 @@ case verified CPU model identity, embedding assertions, typed negative responses
 and owned-server teardown. This is one checkpoint's successful resume and CPU
 qualification, not evidence that every download or model combination passes.
 
-The original `components-b764dec/report.json` records 110 Knowledge tests passing
-and both model-free client contract lanes passing. Its server lane failed/timed
-out: 36 failures were traced to model-host environment settings incorrectly
-applied to model-free suites. `1783d3b` changes that environment policy, but the
-rebuilt suite rerun was pending at this snapshot. A separate FileLogger `Flush`
-failure and the overall timeout are not proven fixed. Studio's two missing-ffmpeg
-tests now check the skip prerequisite before directory operations; their rebuilt
-execution was also pending. Source corrections alone are not passing evidence.
+The earlier `components-b764dec` server run had 36 failures traced to model-host
+environment settings incorrectly applied to model-free suites. The completed
+`components-1783d3b` rerun uses the corrected environment policy. Knowledge and both
+model-free client contract lanes pass; Studio records 107 passes and 68 explicit
+skips, including the two missing-ffmpeg cases after their prerequisite checks were
+reordered. These skips are not device/media coverage.
 
-This checkpoint therefore does not establish an all-green full-regression or
-merge-ready result. Remaining numeric and grounded-completion failures require
-resolution or explicit acceptance of their exact scope; component reruns, the
-full Python suite and final CI results were still pending at this snapshot. Linux/WSL GPU,
+The server rerun still exceeded 1200 seconds and logged two failures: FileLogger
+`Flush` and the `KnowledgePdfFixtureTests` embedded-PDF hash assertion. Cleanup
+was verified, but neither the overall timeout nor the logger failure is resolved
+by that receipt. The PDF hash root cause was `core.autocrlf=true` rewriting
+canonical LF bytes to CRLF in the two manifest-pinned PDFs, not stale assemblies.
+Commit `3aeb10a` adds a scoped `-text` attribute; canonical fixture bytes were
+restored. The rebuilt assembly with declared source `3aeb10a` and SHA-256
+`6342e4a078ebe1a743263bbb438e98b85cc3b4113ed929fa0aae159fab499c9e` completed the
+71-test focused run: all 8 FindSkills, 53 protocol-workspace and 2 SkillRead tests
+passed, confirming the environment fix; the PDF hash/content test also passed.
+Six logger tests passed, while `Logger_RollsFileWhenSizeExceedsCap` still failed
+its 2-second Flush assertion. The focused run did not time out and verified all
+owned processes stopped, but it does not resolve the earlier full-suite timeout.
+A fresh checkout with `core.autocrlf=true` also matched both canonical PDF hashes.
+See the
+[safe existing-checkout procedure](local-regression.md#preserve-hash-pinned-pdf-fixture-bytes).
+
+The automation/config/documentation increment is ready for scoped merge review,
+subject to required checks passing on the exact PR head and explicit retention
+of the open failures. Full-engine qualification remains incomplete: the numerical,
+grounded-completion and logger failures, full-suite timeout and unrun combinations
+are not converted to passes. The local Python suite and focused verification are
+complete. Consult the
+[PR checks](https://github.com/zhongkaifu/TensorSharp/pull/323/checks) for the latest
+head's CI rather than inferring it from an earlier green revision. Linux/WSL GPU,
 macOS/Metal/MLX, Vulkan, multi-GPU and authorized remote-node runs remain unrun in
 this qualification. The other typed profile classes still require their approved
 fixtures, budgets and actual model/device reports.

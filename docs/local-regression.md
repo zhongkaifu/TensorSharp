@@ -30,7 +30,14 @@ green or imply every retained engine assembly was rebuilt from that revision.
 The later grounded retrieval profile failed normal completion at its fixed
 384-token budget. MiniLM CPU embedding and a real partial-download resume passed
 with a valid 4 GiB RAM budget; those reports disclose documentation-only edits.
-Full Python/component runs and final CI acceptance remain pending in this snapshot.
+The `d93f4aa` Python run completed with 605 passes and one skip out of 606 tests.
+The completed component rerun passed Knowledge, Studio and both client contract
+lanes, but the server lane timed out and recorded two failures. Its focused
+`3aeb10a` rerun completed 71 tests: 70 passed, including the environment and PDF
+paths, while the logger rolling/Flush assertion still failed; the earlier global
+timeout remains unresolved. Consult the
+[PR checks](https://github.com/zhongkaifu/TensorSharp/pull/323/checks) for CI on the
+latest head; earlier green checks do not certify later documentation or fixture changes.
 
 ## Start with an audit and a plan
 
@@ -143,6 +150,38 @@ traits. Reports list these excluded fixtures as untested. TRX counters must show
 executed passing tests, and skipped tests are disclosed. The `--include-suites`
 and `--native-test-build-dir` switches select global lanes independently of the
 per-model `--models` and `--scenarios` selectors.
+
+### Preserve hash-pinned PDF fixture bytes
+
+Commit `3aeb10a` marks `InferenceWeb.Tests/Fixtures/Knowledge/*.pdf` as `-text`
+in `.gitattributes`. Fresh checkouts containing that rule preserve the committed
+bytes even with `core.autocrlf=true`. Previously Git converted LF bytes in two
+text-like PDFs to CRLF, changing their embedded-resource SHA-256 and PDF offsets;
+this was a checkout transformation, not a stale-assembly diagnosis or an engine fix.
+The rebuilt `3aeb10a` fixture hash/content test passed, and a fresh checkout with
+`core.autocrlf=true` reproduced both canonical manifest hashes.
+
+For an existing checkout, verify the two canonical files against the repository
+manifest without loading a model:
+
+```sh
+python -c "import hashlib,json,pathlib; p=pathlib.Path('InferenceWeb.Tests/Fixtures/Knowledge'); m=json.loads((p/'manifest.json').read_text(encoding='utf-8')); rows=[(x['fileName'],hashlib.sha256((p/x['fileName']).read_bytes()).hexdigest()==x['sha256']) for x in m['files']]; print(rows); raise SystemExit(0 if all(ok for _,ok in rows) else 1)"
+git status --short -- InferenceWeb.Tests/Fixtures/Knowledge/scanned-four-pages.pdf InferenceWeb.Tests/Fixtures/Knowledge/mixed-two-pages.pdf
+```
+
+Only if these are the unchanged repository-owned fixtures and there are **no
+intentional uncommitted fixture edits**, restore these exact paths after updating
+the attributes rule, then repeat the manifest check and rebuild the managed test
+assembly that embeds them:
+
+```sh
+git restore --source=HEAD -- InferenceWeb.Tests/Fixtures/Knowledge/scanned-four-pages.pdf InferenceWeb.Tests/Fixtures/Knowledge/mixed-two-pages.pdf
+```
+
+Do not restore over user edits or broaden the command to a directory/tree. If a
+fixture was edited or its history is uncertain, preserve those changes and use a
+fresh isolated checkout for canonical validation. This procedure does not change
+the PDF oracle, numerical tolerances or inference behavior.
 
 ## Budget and download policy
 

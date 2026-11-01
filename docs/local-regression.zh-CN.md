@@ -390,6 +390,27 @@ python eng/run-local-regression.py --mode run --scenarios native_ctest `
 
 原生数值/生命周期测试、托管组件测试、真实模型场景是不同层面的证据。CTest 的 CPU 通过不能证明 CUDA，多卡 skip 也不能算通过。
 
+### 保持 PDF 夹具的原始字节
+
+`3aeb10a` 在 `.gitattributes` 中为 `InferenceWeb.Tests/Fixtures/Knowledge/*.pdf` 增加 `-text`。包含该规则的新 checkout 会保留仓库字节，不受 `core.autocrlf=true` 转换影响。此前两个看起来像文本的 PDF 被 Git 从 LF 转成 CRLF，破坏了固定 SHA-256 和 PDF 偏移；这是 checkout 字节转换问题，不是旧程序集诊断，也不是推理引擎修复。
+
+重建后的 `3aeb10a` PDF 哈希/内容测试已通过；使用 `core.autocrlf=true` 的新 checkout 也已验证两个文件均与 canonical manifest 哈希相同。
+
+已有 checkout 可先只读检查 canonical manifest 和两个精确路径的状态，不加载模型：
+
+```powershell
+python -c "import hashlib,json,pathlib; p=pathlib.Path('InferenceWeb.Tests/Fixtures/Knowledge'); m=json.loads((p/'manifest.json').read_text(encoding='utf-8')); rows=[(x['fileName'],hashlib.sha256((p/x['fileName']).read_bytes()).hexdigest()==x['sha256']) for x in m['files']]; print(rows); raise SystemExit(0 if all(ok for _,ok in rows) else 1)"
+git status --short -- InferenceWeb.Tests/Fixtures/Knowledge/scanned-four-pages.pdf InferenceWeb.Tests/Fixtures/Knowledge/mixed-two-pages.pdf
+```
+
+只有确认它们仍是仓库自带夹具、**没有用户有意保留的未提交编辑**时，才可在更新属性规则后恢复这两个精确路径，再次检查 manifest，并重新构建嵌入这些资源的托管测试程序集：
+
+```powershell
+git restore --source=HEAD -- InferenceWeb.Tests/Fixtures/Knowledge/scanned-four-pages.pdf InferenceWeb.Tests/Fixtures/Knowledge/mixed-two-pages.pdf
+```
+
+不要覆盖用户编辑，也不要把命令扩大到整个目录或工作树。如果文件曾被修改或历史不确定，保留修改，使用新的独立 checkout 做 canonical 验证。此步骤不修改 PDF 期望、数值容差或推理行为。
+
 ## 9. 报告、失败诊断和复现
 
 每次运行在新目录中写入：
@@ -442,14 +463,19 @@ python eng/run-local-regression.py --mode run --scenarios native_ctest `
 | `grounded-retrieval-profile-d93f4aa` | 干净运行器；profile 失败，退出 1 | Qwen3.5-0.8B `ggml_cuda` + MiniLM CPU 完成文档/来源检查，随后未满足固定 384-token 输出预算下的正常完成契约；Windows Job 清理确认无残留 |
 | `minilm-resumed-run-d93f4aa` | CPU 嵌入场景跳过，退出 3，没有额外传输 | 2 GiB RAM 预算低于 `2178743728` 字节的需求估计；这是资源门禁，不是推理失败 |
 | `minilm-resumed-run-d93f4aa-ram4` | CPU 嵌入场景及 19 项断言通过，退出 0 | 4 GiB RAM 预算允许运行；从真实断点恢复下载并校验完整文件。代码为 `d93f4aa`，报告明确披露仅文档工作区修改，不能称为干净 checkout |
+| `harness-d93f4aa-full.log` | 本地 Python 共 606 项：605 通过、1 跳过 | 这是运行器验证，不等于模型/后端通过 |
+| `components-1783d3b` | Knowledge 110 通过；Studio 107 通过、68 跳过；原生与 HTTP 客户端契约通道通过 | Server 通道达到 1200 秒期限后失败，清理确认没有残留进程 |
+| `focused-model-free-3aeb10a` | 71 项执行，70 通过、1 失败；没有超时，清理已确认 | 环境相关测试和 PDF 夹具通过；仅 `FileLoggerProviderTests.Logger_RollsFileWhenSizeExceedsCap` 的 2 秒 Flush 断言仍失败 |
 
 检索失败按原始预算与 oracle 保留，不通过增大输出预算掩盖。回执证明生成没有正常完成，尚不足以进一步归因为引擎缺陷或模型/夹具行为。导入、索引和原文身份检查通过不代表完整 profile 通过，也不宣称后续作用域对照已经执行。
 
 `minilm-resume-d93f4aa/controlled-cancellation.json` 记录真实下载在 `2097152` 字节处取消、保留 partial，且最终文件尚未安装。后续被允许的运行恢复剩余 `22910912` 字节；`0.022 GiB` 网络上限低于完整文件的 `25008064` 字节。最终 SHA-256 为 `263215c3cadd6e16740741a7624ab4cbb6c8e777688bd5331ecfbf5681c2f8ed`。下载管理器没有修改；两个 MiniLM 报告均记录运行器 `d93f4aa` 加文档修改。最终 CPU 模型身份、嵌入断言、类型化拒绝响应和所拥有 server 的清理均通过。这只验证该 checkpoint 的恢复与 CPU 路径，不代表所有模型下载都已经实测。
 
-原始 `components-b764dec/report.json` 中 Knowledge 110 项及两个无模型客户端契约通道通过。Server 通道失败并超时：其中 36 项失败可归因于把模型宿主环境设置施加到了无模型套件。`1783d3b` 已修正环境策略，但此快照中的重建/重跑结果仍待完成；独立的 FileLogger `Flush` 失败和整轮超时尚未证明修复。Studio 两项缺少 ffmpeg 的测试已调整为先检查跳过前提再操作目录，其重建后实测也待完成。源码修正不能直接登记为测试通过。
+原始 `components-b764dec` Server 通道的 36 项环境相关失败，促使 `1783d3b` 修正了无模型套件的环境策略。该修订后的完整组件运行现已结束：Knowledge 110 项及两个无模型客户端契约通道通过；Studio 107 项通过、68 项明确跳过，其中两项缺少 ffmpeg 的测试在调整前提检查顺序后明确跳过，不算媒体或设备覆盖。
 
-剩余数值失败、检索生成失败、组件重跑以及仍在进行的完整 Python 测试和最终 CI 结果必须完成评估，才能判断合并就绪；不得把未完成项算成通过。本轮仍没有 Linux/WSL GPU、macOS/Metal/MLX、Vulkan、多 GPU 或授权远端集群的实测通过证明；其他 typed profile 场景还需要批准的夹具、预算和实际模型报告。
+Server 通道在 1200 秒后超时，日志记录 FileLogger `Flush` 与 `KnowledgePdfFixtureTests` PDF 哈希两项失败；所拥有进程全部清理。PDF 根因已定位为 `core.autocrlf=true` 把 manifest 固定的两个 PDF 从 LF 转为 CRLF，不是旧程序集。`3aeb10a` 已加入限定范围的 `-text` 属性并恢复 canonical 字节。随后按 `3aeb10a` 重建的程序集（SHA-256 `6342e4a078ebe1a743263bbb438e98b85cc3b4113ed929fa0aae159fab499c9e`）实际完成 71 项定点测试：8 项 FindSkills、53 项 Protocol workspace、2 项 SkillRead 全部通过，验证了环境修复；PDF 哈希/内容测试和其他 6 项 logger 测试也通过。唯一失败仍是 `Logger_RollsFileWhenSizeExceedsCap` 的 2 秒 Flush 断言。本轮定点测试无超时且确认无残留进程，不能据此宣布先前完整 Server 套件超时已修复。已有 checkout 的安全核对与恢复方法见上面的 PDF 夹具说明。
+
+自动化框架、配置和文档增量可以进入限定范围的合并审查，前提是精确 PR head 的必需检查通过，并明确保留尚未解决的失败。完整引擎验证仍未完成：数值、检索生成和 logger 失败、完整 Server 套件超时及未运行组合都不能改记为通过。本地 Python 与定点测试均已完成；最新提交的 CI 状态应查看 [PR checks](https://github.com/zhongkaifu/TensorSharp/pull/323/checks)，不能用较早提交的绿色状态代替后续提交。本轮仍没有 Linux/WSL GPU、macOS/Metal/MLX、Vulkan、多 GPU 或授权远端集群的实测通过证明；其他 typed profile 场景还需要批准的夹具、预算和实际模型报告。
 
 ### 运行器自身与配置维护
 
