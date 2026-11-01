@@ -40,6 +40,40 @@ def logit_metrics(comparison=False):
 
 
 class ScenarioContracts(unittest.TestCase):
+    def test_correct_eos_answer_cannot_hide_context_reply_budget_clamp(self):
+        diagnostic = "cli.inference reply limited to 16 of 128 tokens: the prompt is 240 tokens of a 256-token context window (MAX_CONTEXT)"
+        valid_output = "Backend: Cpu\ncli.inference decode complete: tokens=2 ms=1 tokensPerSec=2\ncli.inference finishReason=eos tokens=2\n=== Generated Output ===\n56"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "synthetic.gguf"
+            model.write_bytes(b"GGUFfixture")
+            context = {"repo": root, "artifact_dir": root / "result", "backend": "cpu",
+                       "model_path": model, "context_tokens": 256, "env": {"MAX_CONTEXT": "256"},
+                       "cli_command": ["not-executed"]}
+            for stream in ("stdout", "stderr"):
+                def captured(command, **kwargs):
+                    return {"command": command, "stage": kwargs["stage"], "exit_code": 0,
+                            "timed_out": False, "output_truncated": False,
+                            "teardown": {"attempted": True, "verified": True},
+                            "stdout": (diagnostic + "\n" if stream == "stdout" else "") + valid_output,
+                            "stderr": diagnostic if stream == "stderr" else ""}
+                with self.subTest(stream=stream), patch("eng.regression.scenarios.run_process", side_effect=captured) as execute:
+                    result = run_scenario({"id": "cli_text"}, context)
+                self.assertEqual("fail", result["status"], result)
+                self.assertIn("reply budget was not reduced", result["reason"])
+                self.assertEqual(1, execute.call_count, "do not continue after an altered fixture budget")
+                command = execute.call_args.args[0]
+                self.assertEqual("128", command[command.index("--max-tokens") + 1])
+                self.assertEqual(128, result["inputs"]["max_tokens"])
+                self.assertEqual("What is 7 multiplied by 8? Reply with only the integer answer.", result["inputs"]["prompt"])
+                self.assertEqual([{"stage": "cli-1", "diagnostic": diagnostic, "actual_max_tokens": 16,
+                                  "requested_max_tokens": 128, "prompt_tokens": 240, "context_tokens": 256}],
+                                 result["evidence"]["reply_budget_clamps"])
+                assertion = result["assertions"][-1]
+                self.assertFalse(assertion["passed"])
+                self.assertEqual({"requested_max_tokens": 128, "context_tokens": 256}, assertion["expected"])
+                self.assertEqual(result["evidence"]["reply_budget_clamps"], assertion["actual"])
+
     def test_fixed_context_minima_preserve_inputs_and_requirements(self):
         context = {"backend": "ggml_cpu", "preparing_model": True,
                    "cli_command": ["fixture-cli"], "logit_command": ["fixture-probe"], "server_command": ["fixture-server"]}

@@ -343,12 +343,25 @@ def _cli(case, context, result):
         prompt_file.write_text(prompt, encoding="utf-8")
         args += ["--input", str(prompt_file), "--warmup-runs", "0"]
         result["inputs"] = {"prompt": prompt, "expected_regex": expected, "seed": 42, "temperature": 0}
+    requested_max_tokens = 512 if kind == "cli_thinking" else 128
+    if kind not in {"cli_prefill", "cli_decode"}:
+        result["inputs"]["max_tokens"] = requested_max_tokens
     outputs = []
     for index in range(2 if repeat else 1):
         item = _process(context, result, args, "cli-" + str(index + 1))
         _check_process(result, item, context["backend"])
         combined = item["stdout"] + "\n" + item["stderr"]
         _attest_offload(context, result, item["stage"], combined, cli=True)
+        clamps = [{"stage": item["stage"], "diagnostic": match[0],
+                   **{name: int(value) for name, value in match.groupdict().items()}}
+                  for match in re.finditer(
+                      r"cli\.inference reply limited to (?P<actual_max_tokens>\d+) of (?P<requested_max_tokens>\d+) tokens: "
+                      r"the prompt is (?P<prompt_tokens>\d+) tokens of a (?P<context_tokens>\d+)-token context window \(MAX_CONTEXT\)",
+                      combined)]
+        if clamps:
+            result["evidence"].setdefault("reply_budget_clamps", []).extend(clamps)
+            _require(result, "CLI requested reply budget was not reduced by the context window", False,
+                     {"requested_max_tokens": requested_max_tokens, "context_tokens": context.get("context_tokens", 2048)}, clamps)
         if kind in {"cli_prefill", "cli_decode"}:
             _require(result, "benchmark executed requested shape", f"prefillTokens={prefill} decodeTokens={decode} runs=1" in combined)
             metrics = re.search(r"benchmark summary:\s*bestPrefillMs=(\S+) bestPrefillTps=(\S+) bestDecodeMs=(\S+) bestDecodeTps=(\S+)", combined)
