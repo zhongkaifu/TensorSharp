@@ -1586,7 +1586,7 @@ namespace
                     ggml_tensor* mask_col = ggml_reshape_2d(ctx, ep_mask, num_experts, 1);
                     ggml_tensor* probs_m = ggml_add(ctx, ggml_mul(ctx, probs, mask_col),
                         ggml_scale(ctx, mask_col, 1e-30f));
-                    ggml_tensor* sel_r = ggml_top_k(ctx, probs_m, num_experts_used);       // owned, distinct, [num_used, N]
+                    ggml_tensor* sel_r = tsg::ordered_moe_top_k(ctx, probs_m, num_experts_used); // owned, distinct, [num_used, N]
                     ggml_tensor* p_r = ggml_reshape_2d(ctx,
                         ggml_get_rows(ctx, probs_r, sel_r), num_experts_used, N);          // unmasked probs of the picks
 

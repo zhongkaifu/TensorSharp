@@ -1544,7 +1544,7 @@ namespace
                 // ----- MoE: router -> top-k -> renorm -> stacked experts + gated shared expert -----
                 ggml_tensor* router_logits = ggml_mul_mat(ctx, t.gate_inp_w, ffn_normed_2d); // [num_experts, 1]
                 ggml_tensor* probs = ggml_soft_max(ctx, router_logits);
-                ggml_tensor* sel = ggml_top_k(ctx, probs, num_experts_used);                 // [num_used, 1]
+                ggml_tensor* sel = tsg::ordered_moe_top_k(ctx, probs, num_experts_used);      // [num_used, 1]
                 ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, num_experts, 1);
                 ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);                            // [1, num_used, 1]
                 ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, num_experts_used, 1);
@@ -2732,7 +2732,7 @@ namespace
                 // MoE: router -> top-k -> renorm -> stacked experts (mul_mat_id over T tokens) + gated shared expert.
                 ggml_tensor* router_logits = ggml_mul_mat(ctx, t.gate_inp_w, ffn_normed); // [num_experts, T]
                 ggml_tensor* probs = ggml_soft_max(ctx, router_logits);                   // [num_experts, T]
-                ggml_tensor* sel = ggml_top_k(ctx, probs, num_experts_used);              // [num_used, T] I32
+                ggml_tensor* sel = tsg::ordered_moe_top_k(ctx, probs, num_experts_used);   // [num_used, T] I32
                 ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, num_experts, T);
                 ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);                         // [1, num_used, T]
                 ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, num_experts_used, T);

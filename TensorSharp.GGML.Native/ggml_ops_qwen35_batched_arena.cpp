@@ -1411,7 +1411,7 @@ static int qab_decode_batched(
                 {
                     ggml_tensor* router_logits = ggml_mul_mat(ctx, t.gate_inp_w, ffn_normed);  // [nExp, N]
                     ggml_tensor* probs = ggml_soft_max(ctx, router_logits);
-                    ggml_tensor* sel = ggml_top_k(ctx, probs, num_experts_used);               // [nUsed, N]
+                    ggml_tensor* sel = tsg::ordered_moe_top_k(ctx, probs, num_experts_used);    // [nUsed, N]
                     ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, num_experts, n_slots);
                     ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);                          // [1, nUsed, N]
                     ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, num_experts_used, n_slots);

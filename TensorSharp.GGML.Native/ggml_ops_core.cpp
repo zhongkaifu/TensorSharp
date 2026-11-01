@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
 #include "ggml_ops_attention_alloc.h"
+#include "ggml_ops_graph_alloc.h"
 #include "ggml_ops_moe_stream_memory.h"
 #include "bonsai_quant.h"
 #include "ggml_ops_graph_optimize.h"
@@ -1848,7 +1849,12 @@ namespace tsg
         if (ggml_gallocr_get_buffer_size(slot.gallocr, 0) != 0)
             test_note_cache_release();
 #endif
-        bool ok = ggml_gallocr_alloc_graph(slot.gallocr, graph);
+        // Replan lifetimes/aliases for this graph while retaining the backing
+        // buffer. alloc_graph alone can keep a larger previous graph's plan;
+        // after a long->short request that changed CUDA routing-fusion alias
+        // eligibility, changing normalization rounding and amplified MoE logits.
+        // It also cannot infer every dependency change from node counts/sizes.
+        bool ok = alloc_graph_with_current_plan(slot.gallocr, graph);
         if (!ok)
         {
             // A FAILED alloc leaves the allocator POISONED, and because this one

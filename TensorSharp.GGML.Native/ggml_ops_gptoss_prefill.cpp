@@ -36,7 +36,7 @@ using namespace tsg;
 // over because the caller chunked anything past 256 tokens. Measured on an RTX
 // PRO 6000 that was 512 tokens in 519 ms (987 tok/s) against llama.cpp's 30 ms.
 // Everything in the list above is a graph node here instead: the routing top-k
-// runs on the accelerator (ggml_top_k over the router logits, exactly the
+// runs on the accelerator (ordered top-k over the router logits, the
 // SOFTMAX_WEIGHT gate llama.cpp's build_moe_ffn uses for this architecture) and
 // nothing crosses the bus between the hidden states going in and the logits
 // coming out.
@@ -555,7 +555,7 @@ static int gptoss_model_prefill_impl(
                 router_logits = ggml_add(ctx, router_logits, t.gate_inp_b);
             // GPT-OSS gates with SOFTMAX_WEIGHT: top-k over the RAW logits, then a
             // softmax over just the selected ones (no renormalisation afterwards).
-            ggml_tensor* sel = ggml_top_k(ctx, router_logits, nUsed);               // [nUsed, M] I32
+            ggml_tensor* sel = tsg::ordered_moe_top_k(ctx, router_logits, nUsed);   // [nUsed, M] I32
             ggml_tensor* logits_r = ggml_reshape_3d(ctx, router_logits, 1, nExp, M);
             ggml_tensor* w = ggml_get_rows(ctx, logits_r, sel);                     // [1, nUsed, M]
             ggml_tensor* w_soft = ggml_soft_max(ctx, ggml_reshape_2d(ctx, w, nUsed, M));

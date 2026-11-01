@@ -39,7 +39,7 @@
 //   out         = residual1 + rms_norm(mlp) * post_ffw_norm_w
 //   out        *= dec_scale
 // ============================================================================
-#include "ggml_ops_internal.h"
+#include "ggml_ops_transformer_common.h"
 #include "ggml-alloc.h"
 
 #include <algorithm>
@@ -354,7 +354,7 @@ TSG_EXPORT int TSGgml_DiffusionDecodeLayer(const TSGgmlDiffusionDecodeLayerDesc*
             route_n = ggml_mul(ctx, route_n, gate_inp_scale_t);
         ggml_tensor* logits = ggml_mul_mat(ctx, gate_inp_w, route_n);   // [nExp, C]
         ggml_tensor* probs = ggml_soft_max(ctx, logits);               // [nExp, C]
-        ggml_tensor* sel = ggml_top_k(ctx, probs, nUsed);              // [nUsed, C] i32
+        ggml_tensor* sel = tsg::ordered_moe_top_k(ctx, probs, nUsed);   // [nUsed, C] i32
         ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, nExp, C);
         ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);             // [1, nUsed, C]
         ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, nUsed, C);
@@ -760,7 +760,7 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
             ggml_tensor* route_n = ggml_scale(ctx, ggml_rms_norm(ctx, residual1, eps), d.inv_sqrt_hidden);
             if (t.gate_inp_scale_t != nullptr) route_n = ggml_mul(ctx, route_n, t.gate_inp_scale_t);
             ggml_tensor* probs = ggml_soft_max(ctx, ggml_mul_mat(ctx, t.gate_inp_w, route_n));   // [nExp, C]
-            ggml_tensor* sel = ggml_top_k(ctx, probs, nUsed);                                     // [nUsed, C]
+            ggml_tensor* sel = tsg::ordered_moe_top_k(ctx, probs, nUsed);                          // [nUsed, C]
             ggml_tensor* w_2d = ggml_reshape_2d(ctx, ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, nExp, C), sel), nUsed, C);
             w_2d = ggml_div(ctx, w_2d, ggml_sum_rows(ctx, w_2d));
             if (t.down_exps_scale_t != nullptr)
