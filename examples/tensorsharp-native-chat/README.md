@@ -1,51 +1,82 @@
-# Call TensorSharp directly from .NET
+# Microsoft.Extensions.AI + TensorSharp: native Qwen3.8 Flash Next on Metal
 
-This example loads an existing GGUF into TensorSharp's native inference runtime and streams a local conversation from C#. It opens no HTTP listener and uses no OpenAI client. Use the [HTTP example](../dotnet-local-chat) when the engine should run in a separate process.
+Use Microsoft's `IChatClient` application contract while TensorSharp loads and runs the local model directly in the same .NET process. This example uses the exact **Qwen3.8 Flash Next** checkpoint through **`ggml_metal`** on Apple silicon. No HTTP listener or hosted OpenAI service is involved.
 
-The code uses public TensorSharp APIs: `ModelService` and `ChatSession` from `TensorSharp.Chat`, the service's `ChatStreamWithMetricsAsync`, and `SamplingConfig` plus model-family output parsers from `TensorSharp.Runtime`. The public chat types retain the `TensorSharp.Server` namespace; the chat assembly is host-neutral. The project references the checked-out source, so it stays aligned with that checkout's APIs.
+```mermaid
+flowchart LR
+    A[Application: Microsoft IChatClient] --> B[Sample TensorSharpChatClient adapter]
+    B --> C[TensorSharp template, parser, ChatSession and scheduler]
+    C --> D[GGML Metal GPU plus host-expert execution]
+```
 
-## Run from the repository root
+`Microsoft.Extensions.AI.Abstractions` supplies the common messages, options, streaming responses and `IChatClient` interface. The broader `Microsoft.Extensions.AI` package offers application middleware/DI integrations; this small example references the abstraction package. **TensorSharp performs inference.** The sample-local adapter translates the contract into TensorSharp's public `ModelService.ChatStreamWithMetricsAsync` API. It is example code, not an official Microsoft provider or a newly published TensorSharp package.
 
-Prerequisites: .NET 10 SDK, the native build prerequisites for your platform, and an existing supported autoregressive GGUF. See [getting started](../../docs/getting_started.md). No model is downloaded by this example.
+| Integration | Microsoft layer | TensorSharp layer |
+| --- | --- | --- |
+| This native example | `IChatClient` + this sample's adapter | Public .NET model/session APIs and native backend in the application process |
+| [HTTP example](../dotnet-local-chat) | Microsoft's existing `Microsoft.Extensions.AI.OpenAI` adapter + official OpenAI HTTP transport | Separate TensorSharp server owns model loading, native inference and hosting |
+
+Both approaches keep application code on `IChatClient`. The native types retain the `TensorSharp.Server` namespace but live in the host-neutral `TensorSharp.Chat` assembly; the project references the checked-out source. See [the adapter](TensorSharpChatClient.cs) and [TensorSharp's public service](../../TensorSharp.Chat/ModelService.cs).
+
+## Prerequisites and run
+
+Use .NET 10, the repository's [native build prerequisites](../../docs/getting_started.md), and an already-present supported checkpoint. For this demonstration the model path is the **first** file, `Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf`; its two sibling shards must be beside it. The installed checkpoint totals **78,869,128,864 bytes**. The first shard is metadata-only; its small size is not the size of the model. `UD-Q2_K_XL` names a mixed-quantization profile. No model is downloaded by this example.
+
+From the repository root:
 
 ```bash
 dotnet build examples/tensorsharp-native-chat -c Release -p:TensorSharpSkipMlxNative=true
-dotnet run --project examples/tensorsharp-native-chat -c Release --no-build -- --model /path/to/existing-model.gguf --backend ggml_cpu --prompt "What is 2 + 2? Reply with just the single digit." --follow-up "Multiply that answer by 3. Reply with just the number." --max-tokens 64 --context-tokens 2048 --timeout-seconds 120
+dotnet run --project examples/tensorsharp-native-chat -c Release --no-build -- --model /path/to/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf --backend ggml_metal --prompt "What is 2 + 2? Reply with just the single digit." --follow-up "Multiply that answer by 3. Reply with just the number." --mode mixed --max-tokens 64 --context-tokens 4096 --timeout-seconds 600
 ```
 
-The build uses the repository's normal native GGML build for your platform. Skipping MLX in this command avoids building the separate MLX backend; this sample selects GGML. For GGML Metal, CUDA or Vulkan, first build the matching native backend with the platform instructions, then select `ggml_metal`, `ggml_cuda` or `ggml_vulkan`. Choosing a backend does not install its toolchain or make an unsupported model work.
+The build uses the repository's normal native GGML build. Skip MLX because this architecture's Mac backend is GGML Metal; TensorSharp explicitly refuses `mlx` for `qwen4exp`. If a matching native bridge is already built, add `-p:TensorSharpSkipGgmlNative=true`; the library must still be discoverable beside the application or in its native build tree. A managed-only build does not verify inference.
 
-If you already have a matching native build for **this checkout**, the repository supports `-p:TensorSharpSkipGgmlNative=true` to avoid rebuilding it. The native library must still be discoverable in the repository's native build tree or beside the app; a managed-only build is not inference validation. Do not mix unrelated managed and native revisions.
+`--mode mixed` streams the first turn through `GetStreamingResponseAsync` and obtains the follow-up with `GetResponseAsync`. `stream` and `response` use that mode for both turns. `--model` can come from `TENSORSHARP_MODEL_PATH`. The CLI reports the loaded model/backend and refuses a backend substitution. `--help` lists the bounded token/context and generation-deadline settings.
 
-`--model` can also come from `TENSORSHARP_MODEL_PATH`. `--max-tokens` defaults to 128; `--context-tokens` defaults to 2048 and sets this console process's `MAX_CONTEXT`. The scheduler pool is sized in 256-token blocks to cover that context and allows one running sequence. Long prompts still need enough context for the rendered template, reply and safety margin. `--timeout-seconds` is a per-generation deadline after synchronous model loading. Ctrl+C cancels generation; the public load API is synchronous and does not accept cancellation.
+## GPU placement and memory
 
-## What this demonstrates
+On the tested **Apple M5 Pro, 20 GPU cores, 48 GiB unified memory**, all 78.87 GB cannot be GPU-resident. TensorSharp's automatic plan kept the routed experts of **15 layers on Metal** and ran **33 layers' routed experts on the host**, reading them from the SSD mapping as needed. The 28.8 GB PLE n-gram table is read on demand. This is **hybrid Metal/CPU execution**. Attention, routing and the accelerator graph still use Metal; it is not a CPU substitution.
 
-- Native local inference composed in a .NET application, with an explicit backend rather than an external model server.
-- The embedded GGUF chat template plus TensorSharp's family-aware output parser, so model protocol/reasoning markers are not blindly printed as answer text.
-- A reusable `ChatSession`, complete conversation history and per-turn terminal metrics: finish reason, prompt/generated tokens and actual KV-cache-reused tokens. The assistant history retains TensorSharp's raw token IDs and prompt-boundary metadata instead of reconstructing them from displayed text. Reuse is reported as observed; a second turn is not a guarantee of a particular cache hit count or speedup.
-- Explicit resource lifetime (`IDisposable`), generation cancellation and a bounded token/context budget.
+Leave `--n-cpu-moe` unset for automatic placement; do not force zero to fit this checkpoint on a 48 GiB Mac. Capture your actual `[moe-offload]` plan and Metal device log. The observed counts depend on the checkpoint, context and hardware. See [the model's TensorSharp guide](../../docs/models/qwen38-flash-next.md#larger-than-memory), [the official model card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), and [the GGUF profile](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF).
 
-These are verified TensorSharp API capabilities, not claims that competing engines lack them. This small sample does not validate tool execution, Agent Skills, multimodal models, distributed execution or every backend/model combination. Its native finish reasons use TensorSharp's vocabulary (`eos`, `max_tokens`, etc.), rather than HTTP protocol mappings.
+Run the HTTP and native examples **sequentially** on this machine. One loaded `ModelService` can be shared by several conversation adapters; creating a conversation must not load another copy of the large model.
 
-The answer streams to the terminal and `[TensorSharp native]` diagnostics report loaded model/backend and terminal metrics. Native runtime diagnostics can also appear. Exit `0` requires nonempty answer text and terminal metrics, `1` reports a configuration/load/generation error, and `130` is Ctrl+C cancellation. Check output content as well as the exit status. This is a runnable example, not a performance benchmark or production hosting service.
+## Adapter contract and lifetime
 
-After building the example, model-free completion-boundary regression checks can be run from the repository root:
+The caller owns the loaded `ModelService`. Each `TensorSharpChatClient` owns a dedicated `ChatSession` for **one conversation**; wrappers sharing a model serialize generation. Pass full, unchanged successful history plus the new user message on every call. A different conversation gets a new wrapper over the same loaded model. `ConversationId` is left null; this sample does not advertise delta-only or resumable conversations.
+
+TensorSharp's public session pipeline records raw output token IDs and prompt-boundary metadata internally, so a later matching history can reuse the correct native state. Cancellation, a failed turn or an abandoned stream retires the affected session without reloading the model or adding the partial answer to successful history. Subsequent full-history requests use the same adapter/model. Consume or dispose the async enumerator; await active requests before disposing the caller-owned model. Adapter disposal cancels active work and does not wait on a model gate held by another conversation.
+
+Supported input is unnamed text with system/user/assistant roles. Supported options include token limit, temperature, top-p/top-k, 32-bit seed, frequency/presence penalties, stop sequences and instructions. Model selection is bound to the already-loaded checkpoint. Tools, media, reasoning/structured-response controls, background/resumable requests and unsupported provider properties are explicitly rejected rather than silently ignored.
+
+The family-aware output parser is primed with TensorSharp's generation suffix, flushed at completion and bypassed when output is already parsed. Native `eos`/stop reasons map to Microsoft `Stop`; native token/repetition budgets map to `Length`. Cancellation/error handling precedes that mapping. Standard `UsageDetails` reports input/output/cached tokens; `tensorsharp.*` additional properties preserve native finish reason, backend, KV-reused tokens and timing units. Usage and native metadata are also retained by non-streaming aggregation.
+
+Model loading is synchronous and not cancellable through this public API. The CLI deadline applies to generation after loading; Ctrl+C returns `130`, a generation deadline returns `1`, and completed calls require actual nonempty answer text and terminal metrics. These capabilities do not imply competitor exclusivity or a throughput advantage.
+
+## Validation
+
+Model-free contract checks, after building the sample:
 
 ```bash
 dotnet run --project eng/tests/NativeChatCompletion -c Release -- examples/tensorsharp-native-chat/bin/Release/net10.0/TensorSharp.NativeChat.dll
 ```
 
-These seven checks load the compiled completion validator without loading a native backend or weights. They cover an already-cancelled token when terminal metrics are reported or absent, cancellation taking precedence over empty/missing output, ordinary completion, and unrequested runtime cancellation. Ctrl+C retains exit `130`; a generation deadline retains the timeout diagnostic and exit `1`.
+The **41 adapter checks and 7 completion-boundary checks passed**. They cover streaming/non-streaming aggregation, full-history isolation, shared-model serialization, options/media rejection, parser boundaries, usage/native metrics, cancellation precedence, abandonment/recovery and nonblocking disposal. They load no weights; keep this evidence separate from inference results.
 
-## Verified local run
+The opt-in real-model suite uses one loaded model and one adapter throughout. After the model-free build, run it sequentially with any HTTP server stopped:
 
-On 2026-10-31, this example was built with .NET SDK 10.0.302 and run on macOS arm64 with an already-installed `gemma-4-E2B-it-Q8_0.gguf` (4,967,497,152 bytes), `ggml_cpu`, a 2048-token context, greedy sampling and a 64-token reply limit. The simple two-turn command above returned `4`, then `12`, with `finish=eos` on both turns.
+```bash
+dotnet run --project eng/tests/NativeChatCompletion -c Release -- examples/tensorsharp-native-chat/bin/Release/net10.0/TensorSharp.NativeChat.dll --real-model /path/to/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf
+```
 
-For a longer synthetic shared prompt, the first turn reported 624 prompt tokens, 1 generated token and 0 reused tokens; the follow-up reported 648 prompt tokens, 2 generated tokens and **626 KV-cache-reused tokens**, again answering `4`, then `12`. The short conversation reported 0 reused tokens: reuse depends on the actual conversation and runtime state. SIGINT after the first generated integer produced the cancellation diagnostic and exit `130`; a one-second generation deadline after partial output produced the timeout diagnostic and exit `1`. A fresh CLI invocation then answered `4`, followed by `12`; this checks cleanup and relaunch. A missing model produced a clear error and exit `1`.
+### Verified Qwen/Metal run
 
-To reproduce that longer input, pass `--prompt` the exact sentence `Background note: TensorSharp runs a local model inside this .NET process. ` repeated 40 times, immediately followed by `What is 2 + 2? Reply with just the single digit.`. Use `--follow-up "Multiply that answer by 3. Reply with just the number." --max-tokens 64`. The trailing space in each repeated sentence is significant for reproducing token counts.
+On 2026-11-01, all **11 real adapter checks passed** on the Mac described above. Streaming returned `4`; `GetResponseAsync` with the complete history returned `12`. Standard usage and native properties were present. An invalid-model option was rejected before generation. Cancellation after actual output `1`, a one-second generation deadline, and early disposal of a stream each allowed a subsequent request to return `4` through the **same adapter and same loaded `ModelService`**. The failed session was retired; the model was not reloaded to claim recovery.
 
-The engine files match `72e0fc816da32405ebefdbeae864597cd951c708`; the final example and regression checks were validated in a worktree based on `6241652e6ecc3f7b2a6fcb15a4eb42409fadd9ca`. The CPU-only native bridge was rebuilt against unchanged GGML `facdc44a67da17df4433adcc468b424f48e9ded2`; the tested bridge SHA256 was `861ace737e0ccb1a0a8b990d91e43864957886fa6c2479c908b1036724e1524e`. Model SHA256: `996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a`.
+The literal README CLI command also returned `4` and `12`, with Microsoft finish `Stop` and native finish `eos`. The second turn reported 54 input / 3 generated / **0 reused KV tokens**. Zero is the observed value for this short Qwen case; no cache hit or speedup is claimed. A separate final CLI request counted `1…20` exactly, finished `eos` with 51 generated tokens, and emitted a native `[HOSTMOE-PASS]` trace with nonzero accelerator work and host-expert segments. Together with the Apple M5 Pro device log and 33/15 placement log, this verifies actual hybrid GPU execution rather than relying only on the backend name.
 
-This validates the listed model, backend and text-only scenarios. It does not establish performance, equivalence on other hardware/backends, or support for every architecture. Full machine-local logs remain in ignored validation artifacts; no model files, personal model paths or generated logs are committed.
+Validation used .NET SDK 10.0.302, the worktree based on `9a8d4e69e33810ebc039f14e77f1f7ce3ce28a29` plus the targeted startup-preflight CI repair and these example changes. The Metal bridge was rebuilt from unchanged native source with unchanged GGML `facdc44a67da17df4433adcc468b424f48e9ded2` (0.28.0). Bridge SHA256: `d9c6453b231451dfcf22b3ec7ea2c87f3167bae37df055246d4018bc31e5ee13`. Full weight-file checksums were not computed; model identity is recorded from local filenames, shard sizes and GGUF headers.
+
+The real suite set `TS_HOST_MOE_TIMING=3` and bounded retained cache storage with `TS_Q4E_RETAINED_CACHE_MB=256`; CPU-expert overrides were unset so automatic placement applied. Context was 4096, concurrency one, F16 KV, greedy sampling and no projector/speculative draft. All test/model processes exited afterward. This is text-only functional coverage for the stated checkpoint, quantization, hardware and backend, not an all-model/all-backend claim or a performance comparison.
+
+Generated evidence belongs in ignored `artifacts/` or `docs/validation/`; do not commit model files, private paths, binaries or machine logs.

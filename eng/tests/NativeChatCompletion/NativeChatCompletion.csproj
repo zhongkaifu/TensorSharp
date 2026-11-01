@@ -7,4 +7,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../examples/tensorsharp-native-chat/TensorSharp.NativeChat.csproj" />
+  </ItemGroup>
 </Project>

@@ -1,127 +1,126 @@
-# Call a local TensorSharp server from .NET
+# Microsoft.Extensions.AI with a TensorSharp GPU server
 
-A small, one-turn console starter for TensorSharp's HTTP server. TensorSharp loads and runs your local GGUF; the official `OpenAI` .NET client and Microsoft's `IChatClient` adapter provide interoperable client APIs. No OpenAI account is required for the local commands.
+Use **Microsoft.Extensions.AI.IChatClient** in your .NET application while **TensorSharp** loads and runs the local model. This example defaults to Microsoft's existing adapter and demonstrates streaming, complete responses and a two-turn conversation. The primary model recipe is **Qwen3.8 Flash Next** on the native **GGML Metal** backend.
 
-This path separates the application from the TensorSharp engine process. For C# applications that should own model loading, session lifetime, native backend selection and per-turn KV reuse metrics directly, use the complementary [native TensorSharp .NET example](../tensorsharp-native-chat). That path opens no HTTP listener. These are useful TensorSharp integration choices, not claims of exclusivity over other engines.
-
-## Prerequisites
-
-- .NET 10 SDK and access to the official NuGet registry for the initial restore.
-- For real chat: an existing TensorSharp server, a supported model already on disk, and its backend/native build prerequisites. Follow TensorSharp's [getting started guide](https://github.com/zhongkaifu/TensorSharp/blob/72e0fc816da32405ebefdbeae864597cd951c708/docs/getting_started.md). This example contains no model or TensorSharp engine.
-- Python 3.9+ only if you want to run the model-free integration checks.
-
-## Run
-
-1. Start TensorSharp if it is not already running. From an existing TensorSharp checkout, use an already-present supported GGUF file:
-
-   ```bash
-   dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNative=true -- --model /absolute/path/to/model.gguf --backend ggml_cpu --host 127.0.0.1 --port 8080 --max-tokens 512 --temperature 0 --no-skills --no-webui
-   ```
-
-   This minimal chat configuration disables the bundled skills catalog and UI; enable them deliberately when you need the server's agent features. Model support, memory needs and native prerequisites depend on your TensorSharp build. Choose a backend supported by your machine. There is no automatic model download in this starter. Keep at least a 4096-token context window for this server recipe; when setting an explicit limit on macOS/Linux, prefix the command with `MAX_CONTEXT=4096` (or set that environment variable in your shell).
-
-2. In `examples/dotnet-local-chat`, restore, build, and discover the server's model ID:
-
-   ```bash
-   dotnet restore --locked-mode --configfile NuGet.Config
-   dotnet build -c Release --no-restore
-   dotnet run -c Release --no-build -- --list-models
-   ```
-
-3. Stream a message through `Microsoft.Extensions.AI.IChatClient`:
-
-   ```bash
-   dotnet run -c Release --no-build -- --prompt "Explain local inference in one sentence."
-   ```
-
-   The app automatically selects the model when exactly one ID is advertised. To choose explicitly, copy an exact ID from discovery:
-
-   ```bash
-   dotnet run -c Release --no-build -- --model "ID_FROM_DISCOVERY" --prompt "Hello!"
-   ```
-
-   Use the official OpenAI client directly with the same endpoint and request:
-
-   ```bash
-   dotnet run -c Release --no-build -- --client openai --prompt "Hello!"
-   ```
-
-Model text streams to stdout; endpoint/model information and errors go to stderr. Each invocation sends one user message; it does not retain conversation history. Exit code `0` means the SDK stream completed with nonempty text and a finish reason, `1` means a request/configuration failure, and `130` means Ctrl+C cancellation. Inspect any partial stdout after an error. Transport success alone does not prove inference success; see the server's error-as-text limitation below.
-
-## Configuration
-
-| Option | Default / behavior |
+| Component | Responsibility |
 | --- | --- |
-| `--base-url URL` | `http://127.0.0.1:8080/v1`; include `/v1` once, not `/chat/completions` |
-| `--model ID` | Auto-select only when one model is advertised |
-| `--client extensions\|openai` | `extensions` uses `IChatClient`; `openai` uses `ChatClient` directly |
-| `--max-tokens N` | `128`; the server's own cap also applies |
-| `--timeout-seconds N` | `120` total for discovery plus generation |
-| `--list-models` | Calls `GET /v1/models`; sends no generation request |
-| `--allow-remote` | Explicit opt-in for an HTTPS endpoint outside loopback |
-| `--help` | All options |
+| `Microsoft.Extensions.AI` | The application's `IChatClient`, messages, options, streaming and response APIs |
+| `Microsoft.Extensions.AI.OpenAI` | Microsoft's `.AsIChatClient()` adapter for the existing HTTP client |
+| Official `OpenAI` .NET client | Serializes chat requests and reads HTTP/SSE responses from the configured local endpoint |
+| TensorSharp server and native runtime | Load GGUF weights, render the model's chat template, schedule inference and execute on the selected backend |
 
-`TENSORSHARP_BASE_URL` and `TENSORSHARP_MODEL` provide environment defaults; CLI options take priority. `TENSORSHARP_API_KEY` optionally supplies a token for an authenticated proxy. For direct local TensorSharp, the app sends a non-secret placeholder. It does not read `OPENAI_API_KEY`. By default, requests go only to the local endpoint; explicit remote configuration sends requests to the endpoint you choose.
+The client libraries do not run inference. No hosted OpenAI account is needed for this local path. The optional `--client openai` path exercises the underlying transport directly. For a .NET application that should own the engine and `ChatSession` in its own process, use the complementary [direct TensorSharp example](../tensorsharp-native-chat).
 
-For a different local port:
+## Prerequisites and Qwen GPU recipe
+
+You need the .NET 10 SDK, the repository's native GGML Metal build prerequisites, and an already-installed supported model. See [getting started](../../docs/getting_started.md). This example downloads no weights and provisions no hardware.
+
+The demonstrated model set is `Qwen3.8-Flash-Next-UD-Q2_K_XL`, **three shards totaling 78,869,128,864 bytes**. Keep all three files together and pass the first shard to TensorSharp. The first shard is metadata-only (10,946,624 bytes); the two weight-bearing siblings are required. `UD-Q2_K_XL` is the distribution's mixed-quantization profile, not a statement that every tensor has the same type.
+
+From the repository root on macOS, with an existing GGML Metal build/toolchain:
 
 ```bash
-dotnet run -c Release --no-build -- --base-url http://127.0.0.1:5000/v1 --list-models
+MAX_CONTEXT=4096 TS_SCHED_NUM_BLOCKS=16 TS_SCHED_MAX_RUNNING_SEQS=1 \
+TS_Q4E_RETAINED_CACHE_MB=0 TS_HOST_MOE_TIMING=3 \
+dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNative=true -- \
+  --model /path/to/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf \
+  --backend ggml_metal --host 127.0.0.1 --port 8080 --max-tokens 512 --temperature 0 \
+  --no-skills --no-multi-agent --no-prefix-cache --no-webui
 ```
 
-## How the integration works
+`TensorSharpSkipMlxNative` skips the separate MLX native build; it does not disable GGML Metal. Selecting `ggml_metal` requires a matching native build. This minimal text-chat configuration disables unrelated agent/UI features and restored prefix state so the E2E check exercises actual generation.
 
-`GET /v1/models` discovers the exact configured ID; `POST /v1/chat/completions` requests streaming text. `Program.cs` constructs an OpenAI `ChatClient` with a custom endpoint, then calls either `CompleteChatStreamingAsync` or `.AsIChatClient().GetStreamingResponseAsync`. Both paths use the same official HTTP client. SDK retries and redirects are disabled to keep failures explicit.
+A 78.87 GB model set is larger than the 48 GiB unified memory on the local demonstration Mac. TensorSharp's model-specific host-expert placement can combine CPU MoE experts with Metal computation and memory-mapped weights. This is **hybrid GPU-assisted inference**, not a claim that all weights or layers reside on the GPU. Check the actual server placement and device logs; a requested backend name alone is not GPU execution evidence. Other machines may need a different model or resource configuration.
 
-Pinned dependencies are `OpenAI 2.14.0` and `Microsoft.Extensions.AI.OpenAI 10.11.0`, verified in the official registry and compiled together. `packages.lock.json` also records transitive versions and hashes. The existing TensorSharp examples use curl and Python; this starter adds the .NET client path. The server contract was inspected at TensorSharp commit `72e0fc816da32405ebefdbeae864597cd951c708`: [routes](../../TensorSharp.Server/Endpoints/OpenAIEndpoints.cs), [model discovery and chat handling](../../TensorSharp.Server/ProtocolAdapters/OpenAIChatAdapter.cs), and [SSE chunks](../../TensorSharp.Server/ResponseSerializers/OpenAIResponseFactory.cs). Client APIs and versions are documented by [OpenAI](https://www.nuget.org/packages/OpenAI/2.14.0) and [Microsoft](https://www.nuget.org/packages/Microsoft.Extensions.AI.OpenAI/10.11.0).
+## Run the Microsoft.Extensions.AI example
 
-## Troubleshooting and limits
-
-- Connection refused: start the server and check host/port. TensorSharp's inspected default is `0.0.0.0:5000`; the explicit recipe above binds `127.0.0.1:8080`.
-- HTTP 404: use a base URL ending in `/v1`, with no duplicated `/v1`.
-- No model or wrong model: start the server with `--model`; use the exact discovery ID, which normally omits `.gguf`. One server process hosts its startup model; this app does not switch or load models.
-- `context_length_exceeded`: the rendered system/tool/skill prompt also consumes context. An actual run with bundled skills and `MAX_CONTEXT=2048` required 2959 protected prompt tokens and correctly returned HTTP 400. Shortening only the user message cannot fix that case; increase the context window or disable unused features. The model-free mock does not detect this deployment constraint.
-- A discovered model is **configuration, not a readiness check**. TensorSharp may defer loading until chat. Some load failures are delivered as ordinary SSE text `Error: ...` with HTTP 200 and a normal finish marker. The SDK and this app then return that text with exit `0`; check the server log. The starter deliberately does not guess error status from generated words.
-- A malformed stream, an empty reply or a stream ending without a finish reason fails with a diagnostic. A server's normal token-limit finish can leave an incomplete answer; raise both client and server limits as needed. Ctrl+C cancels the request; model loading may need a longer deadline.
-- Scope is one-turn text chat. Tool calling, reasoning fields, multimodal inputs, embeddings, Responses API behavior and full OpenAI parity are not validated here.
-
-## When to use / when not to use
-
-Use this deployment when a .NET application should call an independently running local TensorSharp engine over HTTP, you have a supported model that fits your machine, and you want standard client APIs. Choose `IChatClient` when your application uses Microsoft's common chat abstraction; choose `openai` to work directly with the official SDK.
-
-Choose a different deployment when you need a managed service with operational guarantees, authenticated multi-user hosting without building a secure proxy, in-process engine access without HTTP, or API/model capabilities outside this tested text-chat subset. This package supplies no performance comparison or throughput claim; evaluate your own model and hardware.
-
-## Security
-
-Keep TensorSharp bound to `127.0.0.1`. The inspected server has no built-in authentication or TLS; do not expose its default all-interface binding to an untrusted network. A local endpoint is still reachable by other local processes. Use an authenticated TLS proxy and deliberate network controls for remote access; the starter requires HTTPS plus `--allow-remote` for non-loopback URLs. Redirects are refused, and credentials, query strings and fragments in the base URL are rejected. Keep tokens in environment variables, and check server/proxy logging policies before sending sensitive prompts.
-
-## Reproduce the model-free checks
+In `examples/dotnet-local-chat`:
 
 ```bash
 dotnet restore --locked-mode --configfile NuGet.Config
 dotnet build -c Release --no-restore
-python3 ../../eng/tests/dotnet-local-chat.py
-python3 ../../eng/tests/dotnet-local-chat-e2e.py --self-test
+dotnet run -c Release --no-build -- --list-models
 ```
 
-The Python harness binds an ephemeral loopback port, invokes the real compiled clients, checks the HTTP requests and serves deterministic SSE responses. It downloads no model and makes no hosted model call.
+The app discovers the exact ID through `/v1/models` and automatically selects it only when exactly one model is advertised. To choose explicitly, pass `--model ID_FROM_DISCOVERY`.
 
-The mock harness lives under `eng/tests` following repository conventions. It tests both SDK paths, model selection, request payloads, SSE framing, malformed/truncated/empty responses, HTTP errors, and discovery/generation timeouts. It also reproduces the server's HTTP-200 error-as-text limitation. The real-E2E harness's `--self-test` separately checks 3 accepted and 14 rejected answer fixtures without inference; it rejects contradictory text such as `The answer is 5, not 4.`. The live arithmetic oracle requires the complete answer `4`, allowing only surrounding whitespace and a single trailing period. Keep generated logs under the repository's ignored `artifacts/` or `docs/validation/` directories.
-
-## Real-model checks
-
-After starting your own loopback server with an already-present supported text model and a server token cap of at least 512, run from the repository root:
+Stream two turns through `IChatClient.GetStreamingResponseAsync`:
 
 ```bash
+dotnet run -c Release --no-build -- \
+  --prompt "What is 2 + 2? Reply with only the single digit answer." \
+  --follow-up "Multiply your previous answer by 3. Reply with only the number." --max-tokens 64
+```
+
+Use `IChatClient.GetResponseAsync` to wait for each complete answer:
+
+```bash
+dotnet run -c Release --no-build -- --mode response \
+  --prompt "What is 2 + 2? Reply with only the single digit answer." \
+  --follow-up "Multiply your previous answer by 3. Reply with only the number." --max-tokens 64
+```
+
+The intended answers are `4`, then `12`, one answer per turn on stdout. The optional follow-up resends the complete text history: user, assistant, user. History is retained only within this invocation. The HTTP API does not infer previous messages from earlier requests.
+
+`Program.cs` creates the official HTTP client with TensorSharp's endpoint and calls `.AsIChatClient()`. The application then uses Microsoft's `ChatMessage`, `ChatOptions`, `GetStreamingResponseAsync` and `GetResponseAsync`. The same choices can be checked with `--client openai`, which uses `CompleteChatStreamingAsync` and `CompleteChatAsync` directly. No custom TensorSharp HTTP adapter is required.
+
+## Options and behavior
+
+| Option | Default / behavior |
+| --- | --- |
+| `--client extensions\|openai` | `extensions`, using Microsoft's `IChatClient` adapter |
+| `--mode stream\|response` | `stream`; `response` waits for a complete answer |
+| `--prompt TEXT` | First user message |
+| `--follow-up TEXT` | Optional second user message with full conversation history |
+| `--base-url URL` | `http://127.0.0.1:8080/v1`; include `/v1` once |
+| `--model ID` | Auto-select only when one model is advertised |
+| `--max-tokens N` | `128` per turn; the server's cap also applies |
+| `--timeout-seconds N` | `120` for the entire invocation: discovery and both turns |
+| `--list-models` | Discovery only; sends no generation request |
+| `--allow-remote` | Explicit opt-in to a remote HTTPS endpoint |
+| `--help` | Show all options |
+
+`TENSORSHARP_BASE_URL` and `TENSORSHARP_MODEL` provide defaults; CLI options take priority. `TENSORSHARP_API_KEY` can supply an authenticated proxy token. Direct local TensorSharp receives a non-secret placeholder; the app does not read `OPENAI_API_KEY`. Requests go to the configured endpoint, and redirects/retries are disabled.
+
+Diagnostics go to stderr. Exit `0` requires nonempty answer text and completion, `1` reports configuration/request/deadline failure, and `130` is Ctrl+C cancellation. In streaming mode, output before an error can be partial. In response mode, an answer is printed after the complete response arrives.
+
+## Tests and evidence boundaries
+
+From the repository root, after building the client:
+
+```bash
+python3 eng/tests/dotnet-local-chat.py
+python3 eng/tests/dotnet-local-chat-e2e.py --self-test
 python3 eng/tests/dotnet-local-chat-e2e.py --base-url http://127.0.0.1:8080/v1
 ```
 
-This opt-in harness makes actual generation requests; it starts no server, downloads no model and provisions no hardware. It checks arithmetic output through both clients, raw SSE model identity/finish/usage, discovery and HTTP errors, and SIGINT cancellation followed by another successful generation. It requires macOS/Linux for SIGINT checks. Model answers are checked, so an unsuitable model or unsupported backend correctly fails the run; this is not a hermetic correctness test or benchmark.
+The first command runs **36 deterministic stdlib mock checks** with no model. It retains the original streaming checks and adds complete responses, full two-turn request payloads, empty/malformed/error responses, deadlines and recovery for both SDKs. The oracle self-test covers **6 accepted and 28 rejected fixtures**. It accepts only the complete numeric answers `4` and `12` with optional surrounding whitespace and one trailing period, and rejects contradictory text such as `The answer is 5, not 4.`.
 
-### Verified local run
+The opt-in live harness starts no server or download. It requires macOS/Linux for SIGINT verification and checks both clients in both modes, two-turn `4` → `12` answers, raw SSE model identity/finish/token metrics, useful errors, cancellation, invocation deadlines and subsequent recovery. Real model output can fail these assertions; that is a failed E2E check, not something the mock can override. These checks are not a performance benchmark or proof of support for every architecture/backend.
 
-On 2026-10-31, all **10 real-endpoint checks** passed on macOS arm64 with .NET SDK 10.0.302, existing `gemma-4-E2B-it-Q8_0.gguf` (4,967,497,152 bytes), and `ggml_cpu`. Both client paths answered `4`. Raw SSE identified the configured model, finished with `stop` and `[DONE]`, and reported 1263 prompt tokens / 1 generated token. Each client was interrupted after producing `1`, returned exit `130`, and subsequently received `4` from a fresh request. Unknown-model preflight and a wrong API base also produced the expected actionable errors. The separate 22-case mock suite passed on the same final HTTP source.
+### Verified local Qwen Metal run
 
-The engine files match `72e0fc816da32405ebefdbeae864597cd951c708`; the final reviewed example and tests were validated in a worktree based on `6241652e6ecc3f7b2a6fcb15a4eb42409fadd9ca`. The native bridge was rebuilt CPU-only against unchanged GGML `facdc44a67da17df4433adcc468b424f48e9ded2`. Native library SHA256: `861ace737e0ccb1a0a8b990d91e43864957886fa6c2479c908b1036724e1524e`; model SHA256: `996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a`.
+On **2026-11-01**, all **20 real-endpoint checks** passed against an isolated loopback TensorSharp server on a **Mac M5 Pro, 20 GPU cores, 48 GiB unified memory**, using the three-shard Qwen model above and `ggml_metal`. The server's recorded device/placement diagnostics identified Apple M5 Pro and **33 host-expert layers / 15 Metal-expert layers**. The host-expert path used SSD-backed on-demand weights. This was the hybrid placement described above, not full GPU residency or a measurement of the complete model's resident memory.
 
-For this run, the server command above additionally used `--no-prefix-cache` to exercise inference without restored prefix state, with `MAX_CONTEXT=4096`, `TS_SCHED_NUM_BLOCKS=16` and `TS_SCHED_MAX_RUNNING_SEQS=1`. It listened only on loopback port 18763. The server and both sample applications were built in an isolated checkout; no existing service was stopped. Full machine-local logs stay in ignored artifacts. This covers the stated model, CPU backend and text-only cases; it does not validate every backend/model, Agent Skills, multimodal inference or comparative performance.
+- Microsoft.Extensions.AI `GetStreamingResponseAsync` and `GetResponseAsync` each returned exactly `4`, then `12`; the direct SDK paths did the same.
+- Raw SSE returned `4`, identified the configured first-shard model, finished with `stop` and `[DONE]`, and reported **27 prompt tokens / 2 completion tokens**.
+- Each SDK was interrupted after producing `1`, returned cancellation exit `130`, and then answered `4` on a fresh request.
+- Both SDKs in both modes hit a one-second invocation deadline with exit `1`, then recovered with a fresh `4` response. Unknown-model preflight and an incorrect API base also produced the expected errors.
+- The final HTTP client built with .NET SDK **10.0.302**, with **0 warnings and 0 errors**. The 36 mock checks and strict oracle self-test also passed.
+
+The managed projects were built in an isolated working tree based on `9a8d4e69e33810ebc039f14e77f1f7ce3ce28a29`, with this PR's focused CI preflight repair applied. The native GGML Metal bridge was freshly built for this source against unchanged GGML `facdc44a67da17df4433adcc468b424f48e9ded2`; tested bridge SHA256: `d9c6453b231451dfcf22b3ec7ea2c87f3167bae37df055246d4018bc31e5ee13`. The server used the recipe's 4096-token context, one running sequence, 16 scheduler blocks, no retained expert cache, and timing diagnostics; expert-offload count overrides were unset so the model's automatic placement policy applied. It listened on loopback port 18763 for the test.
+
+No weights were downloaded, and no existing service or paid runner was used for this run. These results cover the stated model, quantization, hybrid Metal backend and text-only scenarios on this machine. They do not establish general model quality, comparative performance, or correctness for every backend/model. Full machine-local logs remain in ignored `artifacts/` or `docs/validation/`; no private model paths or credentials belong in public evidence.
+
+## Limits and deployment choice
+
+- Discovery advertises configuration, not model readiness. A failed load can appear as ordinary SSE `Error: ...` text with HTTP 200 and a normal finish marker; inspect the server log and answer content as well as the exit status.
+- Model IDs normally omit `.gguf`, while response chunks can include it. Use the advertised ID; changing a hosted model requires a server restart.
+- The rendered system/tool/skill template consumes context too. Increase the context budget or disable unused features when the server returns `context_length_exceeded`.
+- This sample covers two-turn text chat. It does not establish tool calling, Agent Skills, multimodal inputs, distributed operation or full OpenAI API parity.
+
+Use the HTTP path when a .NET application should use Microsoft's common client abstraction while TensorSharp owns inference in a separate process. Use the [direct example](../tensorsharp-native-chat) when the application should own native model loading, session lifetime and runtime metrics. The combination of a native .NET engine, GGUF model support, backend selection and common .NET client APIs is the integration demonstrated here; no exclusivity or comparative speed claim is made.
+
+Keep TensorSharp bound to loopback. The inspected server has no built-in authentication or TLS; use an authenticated TLS proxy and deliberate network controls for remote access. The client requires HTTPS plus `--allow-remote` outside loopback and rejects credentials, query strings and fragments in the base URL. Review server/proxy logging before sending sensitive prompts.
+
+Pinned clients: [OpenAI 2.14.0](https://www.nuget.org/packages/OpenAI/2.14.0) and [Microsoft.Extensions.AI.OpenAI 10.11.0](https://www.nuget.org/packages/Microsoft.Extensions.AI.OpenAI/10.11.0); `packages.lock.json` records the transitive graph. TensorSharp's [routes](../../TensorSharp.Server/Endpoints/OpenAIEndpoints.cs), [chat adapter](../../TensorSharp.Server/ProtocolAdapters/OpenAIChatAdapter.cs) and [SSE response construction](../../TensorSharp.Server/ResponseSerializers/OpenAIResponseFactory.cs) implement the server contract.

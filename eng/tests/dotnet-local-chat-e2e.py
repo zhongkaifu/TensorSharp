@@ -28,6 +28,7 @@ from urllib import error, parse, request
 
 
 PROMPT = "What is 2 + 2? Reply with only the single digit answer."
+FOLLOW_UP = "Multiply your previous answer by 3. Reply with only the number."
 LONG_PROMPT = "Count the integers from 1 through 1000, one integer per line. Start immediately with 1 and do not stop early."
 
 
@@ -63,39 +64,50 @@ def child_environment():
     return env
 
 
-def command(args, model, client, prompt=PROMPT, max_tokens=64, base_url=None):
-    return ["dotnet", str(args.dll), "--base-url", base_url or args.base_url,
+def command(args, model, client, prompt=PROMPT, max_tokens=64, base_url=None,
+            mode="stream", follow_up=None, deadline_seconds=None):
+    argv = ["dotnet", str(args.dll), "--base-url", base_url or args.base_url,
             "--model", model, "--client", client, "--prompt", prompt,
-            "--max-tokens", str(max_tokens), "--timeout-seconds", str(args.timeout_seconds)]
+            "--mode", mode, "--max-tokens", str(max_tokens),
+            "--timeout-seconds", str(deadline_seconds or args.timeout_seconds)]
+    if follow_up is not None:
+        argv.extend(("--follow-up", follow_up))
+    return argv
 
 
 def run_client(args, model, client, **kwargs):
     return subprocess.run(command(args, model, client, **kwargs), env=child_environment(),
-                          capture_output=True, text=True, timeout=args.timeout_seconds + 15)
+                          capture_output=True, text=True,
+                          timeout=(kwargs.get("deadline_seconds") or args.timeout_seconds) + 15)
 
 
-def answer_text(text):
+def answer_text(text, expected="4"):
     require(bool(text.strip()), "The model produced no answer text.")
     require("error:" not in text.lower(), "The server returned error text inside a successful HTTP stream: " + public_text(text))
-    # The prompt asks for one digit. Tolerate surrounding whitespace and one
+    # The prompt asks for one number. Tolerate surrounding whitespace and one
     # trailing period, but never accept a correct digit embedded in a wrong answer.
-    require(re.fullmatch(r"4\.?", text.strip()) is not None,
-            "Expected only the digit 4 (optionally a trailing period): " + public_text(text))
+    require(re.fullmatch(re.escape(expected) + r"\.?", text.strip()) is not None,
+            f"Expected only {expected} (optionally a trailing period): " + public_text(text))
 
 
 def check_answer_oracle():
-    accepted = ("4", " 4\n", "\t4. \n")
-    rejected = ("", "5", "four", "The answer is 5, not 4.", "2 + 2 = 4",
-                "4 or 5", "4\n5", "14", "40", "4.0", "-4", "4,", "Error: 4", "4 because it is correct")
-    for text in accepted:
-        answer_text(text)
-    for text in rejected:
-        try:
-            answer_text(text)
-        except AssertionError:
-            continue
-        raise AssertionError("Answer oracle accepted an incorrect or contradictory response: " + repr(text))
-    print(f"PASS answer oracle: {len(accepted)} accepted / {len(rejected)} rejected cases (no model)", flush=True)
+    accepted_count = rejected_count = 0
+    for expected, wrong, word in (("4", "5", "four"), ("12", "13", "twelve")):
+        accepted = (expected, f" {expected}\n", f"\t{expected}. \n")
+        rejected = ("", wrong, word, f"The answer is {wrong}, not {expected}.", f"The answer is {expected}",
+                    f"{expected} or {wrong}", f"{expected}\n{wrong}", "1" + expected, expected + "0",
+                    expected + ".0", "-" + expected, expected + ",", "Error: " + expected, expected + " because it is correct")
+        for text in accepted:
+            answer_text(text, expected)
+        for text in rejected:
+            try:
+                answer_text(text, expected)
+            except AssertionError:
+                continue
+            raise AssertionError("Answer oracle accepted an incorrect or contradictory response: " + repr(text))
+        accepted_count += len(accepted)
+        rejected_count += len(rejected)
+    print(f"PASS answer oracle: {accepted_count} accepted / {rejected_count} rejected cases (no model)", flush=True)
 
 
 def checked_answer(result):
@@ -103,6 +115,16 @@ def checked_answer(result):
             f"Client exit {result.returncode}: {public_text(result.stderr)} {public_text(result.stdout)}")
     answer_text(result.stdout)
     return result.stdout.strip()
+
+
+def checked_conversation(result):
+    require(result.returncode == 0,
+            f"Client exit {result.returncode}: {public_text(result.stderr)} {public_text(result.stdout)}")
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    require(len(lines) == 2, "Expected exactly two number answers: " + public_text(result.stdout))
+    answer_text(lines[0], "4")
+    answer_text(lines[1], "12")
+    return [line.strip() for line in lines]
 
 
 def read_models(args, opener):
@@ -248,10 +270,11 @@ def main():
     model = read_models(args, opener)
     print("PASS TensorSharp model discovery: " + public_text(Path(model).name), flush=True)
     passed = 1
-    for client in ("openai", "extensions"):
-        answer = checked_answer(run_client(args, model, client))
-        print(f"PASS {client}: model-backed answer {public_text(answer)!r}", flush=True)
-        passed += 1
+    for client in ("extensions", "openai"):
+        for mode in ("stream", "response"):
+            answers = checked_conversation(run_client(args, model, client, mode=mode, follow_up=FOLLOW_UP))
+            print(f"PASS {client} {mode}: complete conversation answers {answers!r}", flush=True)
+            passed += 1
     answer, usage = raw_stream(args, model, opener)
     print(f"PASS raw SSE: answer={public_text(answer)!r}; model identity; stop; [DONE]; "
           f"prompt_tokens={usage['prompt_tokens']}; completion_tokens={usage['completion_tokens']}", flush=True)
@@ -275,6 +298,17 @@ def main():
         answer = checked_answer(run_client(args, model, client))
         print(f"PASS {client}: server recovery after cancellation; answer={public_text(answer)!r}", flush=True)
         passed += 1
+        for mode in ("stream", "response"):
+            result = run_client(args, model, client, prompt=LONG_PROMPT, max_tokens=512,
+                                mode=mode, deadline_seconds=1)
+            require(result.returncode == 1 and "timed out" in result.stderr.lower(),
+                    f"Expected a generation deadline in {client} {mode}; exit={result.returncode}; "
+                    + public_text(result.stderr))
+            print(f"PASS {client} {mode}: one-second invocation deadline; exit 1", flush=True)
+            passed += 1
+            answer = checked_answer(run_client(args, model, client, mode=mode))
+            print(f"PASS {client} {mode}: server recovery after deadline; answer={public_text(answer)!r}", flush=True)
+            passed += 1
     print(f"{passed} endpoint checks passed against the already-running TensorSharp server. "
           "Record its actual model/backend/build provenance; these checks are not a benchmark.", flush=True)
 

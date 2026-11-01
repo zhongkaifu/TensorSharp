@@ -21,6 +21,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 MODEL = "mock-model-Q4_K_M"
 PROMPT = "Say hello from this mock test."
 TEXT = "Hello from mock."
+ARITHMETIC_PROMPT = "What is 2 + 2? Reply with only the single digit answer."
+FOLLOW_UP = "Multiply your previous answer by 3. Reply with only the number."
+
+
+def message_text(message):
+    content = message.get("content")
+    if isinstance(content, list):
+        return "".join(part.get("text", "") for part in content if part.get("type") == "text")
+    return content
+
+
+def reply_text(payload):
+    messages = payload.get("messages", [])
+    if messages and message_text(messages[-1]) == ARITHMETIC_PROMPT:
+        return "4"
+    if messages and message_text(messages[-1]) == FOLLOW_UP:
+        expected = [("user", ARITHMETIC_PROMPT), ("assistant", "4"), ("user", FOLLOW_UP)]
+        actual = [(message.get("role"), message_text(message)) for message in messages]
+        return "12" if actual == expected else "History was not preserved."
+    return TEXT
 
 
 class MockServer(ThreadingHTTPServer):
@@ -99,6 +119,28 @@ class Handler(BaseHTTPRequestHandler):
         if self.server.behavior == "http-error":
             self.json_response(400, {"error": {"message": "Mock rejected generation options", "type": "invalid_request_error"}})
             return
+        text = reply_text(payload)
+        if not payload.get("stream", False):
+            if self.server.behavior == "generation-timeout":
+                time.sleep(3)
+            if self.server.behavior == "malformed":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "9")
+                self.end_headers()
+                self.wfile.write(b"{invalid}")
+                return
+            if self.server.behavior == "empty":
+                text = ""
+            if self.server.behavior == "model-error-text":
+                text = "Error: Mock model load failed"
+            self.json_response(200, {
+                "id": "chatcmpl-deterministicmock", "object": "chat.completion", "created": 1700000000,
+                "model": payload["model"] + ".gguf",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 4, "total_tokens": 11},
+            })
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -122,7 +164,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 return
-            pieces = () if self.server.behavior == "empty" else ("Hello", " from", " mock.")
+            pieces = () if self.server.behavior == "empty" else (("Hello", " from", " mock.") if text == TEXT else (text,))
             for piece in pieces:
                 self.write_chunk(payload["model"], {"role": None, "content": piece})
                 if self.server.behavior == "generation-timeout":
@@ -182,23 +224,21 @@ def check_failure(result, *needles):
         require(needle.lower() in combined, f"Expected {needle!r} in diagnostic: {combined!r}")
 
 
-def verify_request(server, expected_model=MODEL, max_tokens=17):
+def verify_request(server, expected_model=MODEL, max_tokens=17, stream=True):
     require(server.requests[0][:2] == ("GET", "/v1/models"), f"Discovery was not first: {server.requests!r}")
     posts = [item for item in server.requests if item[0] == "POST"]
     require(len(posts) == 1, f"Expected one chat POST: {server.requests!r}")
     _, path, body = posts[0]
     require(path == "/v1/chat/completions", f"Wrong chat path: {path}")
     require(body.get("model") == expected_model, f"Wrong model: {body!r}")
-    require(body.get("stream") is True, f"Streaming was not requested: {body!r}")
+    require(body.get("stream", False) is stream, f"Wrong streaming mode: {body!r}")
     # Both token-limit spellings are accepted by TensorSharp. The official SDK
     # version determines which of these fields its ChatCompletionOptions emits.
     limits = [body[key] for key in ("max_tokens", "max_completion_tokens") if key in body]
     require(limits == [max_tokens], f"Wrong/missing token limit: {body!r}")
     user_messages = [message for message in body.get("messages", []) if message.get("role") == "user"]
     require(len(user_messages) == 1, f"Expected one user message: {body!r}")
-    content = user_messages[0].get("content")
-    if isinstance(content, list):
-        content = "".join(part.get("text", "") for part in content if part.get("type") == "text")
+    content = message_text(user_messages[0])
     require(content == PROMPT, f"Wrong user content: {body!r}")
 
 
@@ -300,12 +340,51 @@ def main():
             check_failure(result, "time")
             require(result.stdout.startswith("Hello"), "Expected first chunk before generation timeout")
             passed_case(f"{client}: generation timeout reports partial output")
+            server.behavior = "normal"
+            result = run_app(dll, server, "--client", client, "--prompt", PROMPT)
+            check_success(result)
+            require(result.stdout == TEXT + "\n", "Client did not recover after the streaming deadline")
 
     with MockServer(behavior="timeout") as server:
         result = run_app(dll, server, "--prompt", PROMPT, "--timeout-seconds", "1")
         check_failure(result, "time")
         no_chat(server)
         passed_case("request timeout fails with diagnostic")
+
+    for client in ("openai", "extensions"):
+        with MockServer() as server:
+            result = run_app(dll, server, "--client", client, "--mode", "response", "--prompt", PROMPT, "--max-tokens", "17")
+            check_success(result)
+            require(result.stdout == TEXT + "\n", f"Wrong complete response: {result.stdout!r}")
+            verify_request(server, stream=False)
+            passed_case(f"{client}: response mode payload and complete answer")
+        for behavior in ("empty", "malformed", "http-error"):
+            with MockServer(behavior=behavior) as server:
+                result = run_app(dll, server, "--client", client, "--mode", "response", "--prompt", PROMPT)
+                check_failure(result)
+                passed_case(f"{client}: response mode {behavior} fails with diagnostic")
+        with MockServer(behavior="generation-timeout") as server:
+            result = run_app(dll, server, "--client", client, "--mode", "response", "--prompt", PROMPT, "--timeout-seconds", "1")
+            check_failure(result, "time")
+            require(not result.stdout, "Response mode should not print a partial answer before completion")
+            server.behavior = "normal"
+            result = run_app(dll, server, "--client", client, "--mode", "response", "--prompt", PROMPT)
+            check_success(result)
+            require(result.stdout == TEXT + "\n", "Client did not recover after the response deadline")
+            passed_case(f"{client}: response deadline and recovery")
+        for mode in ("stream", "response"):
+            with MockServer() as server:
+                result = run_app(dll, server, "--client", client, "--mode", mode,
+                                 "--prompt", ARITHMETIC_PROMPT, "--follow-up", FOLLOW_UP, "--max-tokens", "17")
+                check_success(result)
+                require(result.stdout == "4\n12\n", f"Wrong two-turn output: {result.stdout!r}")
+                posts = [body for method, path, body in server.requests if method == "POST"]
+                require(len(posts) == 2, f"Expected two chat requests: {server.requests!r}")
+                expected = [("user", ARITHMETIC_PROMPT), ("assistant", "4"), ("user", FOLLOW_UP)]
+                require([(message.get("role"), message_text(message)) for message in posts[1]["messages"]] == expected,
+                        f"Second request lost the full conversation: {posts[1]!r}")
+                require(all(body.get("stream", False) is (mode == "stream") for body in posts), "A turn used the wrong mode")
+                passed_case(f"{client}: {mode} preserves user/assistant/user history (4 then 12)")
 
     print(f"{passed} checks passed. Mock HTTP integration only; no real model was run.")
 

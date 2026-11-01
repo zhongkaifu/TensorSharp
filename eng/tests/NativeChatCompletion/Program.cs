@@ -2,7 +2,8 @@
 using System.Reflection;
 using System.Runtime.Loader;
 
-if (args.Length != 1) throw new ArgumentException("Pass the built TensorSharp.NativeChat.dll path.");
+if (args.Length != 1 && !(args.Length == 3 && args[1] == "--real-model"))
+    throw new ArgumentException("Pass the built TensorSharp.NativeChat.dll path; optionally add --real-model PATH for an opt-in Metal inference run.");
 string app = Path.GetFullPath(args[0]);
 string directory = Path.GetDirectoryName(app)!;
 AssemblyLoadContext.Default.Resolving += (_, name) =>
@@ -42,3 +43,5 @@ Check(Invoke(Terminal("eos"), false, CancellationToken.None) is InvalidOperation
 Check(Invoke(null, true, CancellationToken.None) is InvalidOperationException,
     "missing terminal metrics fails");
 Console.WriteLine("7 completion boundary checks passed; no model or native backend loaded.");
+await AdapterChecks.RunAsync();
+if (args.Length == 3) await LiveChecks.RunAsync(args[2]);

@@ -1,6 +1,7 @@
 using System.ClientModel;
 using System.ClientModel.Primitives;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.AI;
 using OpenAI;
@@ -37,7 +38,7 @@ static async Task<int> RunAsync(string[] args)
         if (!models.Contains(model, StringComparer.Ordinal)) throw new InvalidOperationException(
             "The requested model is not advertised by /v1/models. Use --list-models and pass an exact ID with --model.");
 
-        Console.Error.WriteLine($"TensorSharp HTTP chat via {settings.Client}; model={model}; endpoint={settings.Endpoint}");
+        Console.Error.WriteLine($"TensorSharp HTTP chat via {settings.Client}; mode={settings.Mode}; model={model}; endpoint={settings.Endpoint}");
         var sdk = new OpenAI.Chat.ChatClient(model, new ApiKeyCredential(key), new OpenAIClientOptions
         {
             Endpoint = settings.Endpoint,
@@ -45,44 +46,68 @@ static async Task<int> RunAsync(string[] args)
             RetryPolicy = new ClientRetryPolicy(0),
             NetworkTimeout = TimeSpan.FromSeconds(settings.TimeoutSeconds)
         });
-        bool finished = false;
-        bool limited = false;
-        bool hasText = false;
-        if (settings.Client == "extensions")
+        // IChatClient is Microsoft's application abstraction; TensorSharp performs inference.
+        using IChatClient? chat = settings.Client == "extensions" ? sdk.AsIChatClient() : null;
+        List<Microsoft.Extensions.AI.ChatMessage> aiHistory = [];
+        List<OpenAI.Chat.ChatMessage> sdkHistory = [];
+        string[] prompts = settings.FollowUp is null ? [settings.Prompt] : [settings.Prompt, settings.FollowUp];
+        foreach (string prompt in prompts)
         {
-            // Microsoft's official adapter wraps the official OpenAI client. No TensorSharp adapter required.
-            using IChatClient chat = sdk.AsIChatClient();
-            await foreach (var update in chat.GetStreamingResponseAsync(
-                [new Microsoft.Extensions.AI.ChatMessage(ChatRole.User, settings.Prompt)],
-                new ChatOptions { MaxOutputTokens = settings.MaxTokens }, ct))
+            var answer = new StringBuilder();
+            bool finished = false, limited = false;
+            void Write(string? text) { Console.Write(text); answer.Append(text); }
+            if (chat is not null)
             {
-                Console.Write(update.Text);
-                hasText |= !string.IsNullOrWhiteSpace(update.Text);
-                finished |= update.FinishReason is not null;
-                limited |= update.FinishReason == Microsoft.Extensions.AI.ChatFinishReason.Length;
-            }
-        }
-        else
-        {
-            await foreach (var update in sdk.CompleteChatStreamingAsync(
-                [new UserChatMessage(settings.Prompt)],
-                new ChatCompletionOptions { MaxOutputTokenCount = settings.MaxTokens }, ct))
-            {
-                foreach (var part in update.ContentUpdate)
+                aiHistory.Add(new(ChatRole.User, prompt));
+                var options = new ChatOptions { MaxOutputTokens = settings.MaxTokens };
+                if (settings.Mode == "response")
                 {
-                    Console.Write(part.Text);
-                    hasText |= !string.IsNullOrWhiteSpace(part.Text);
+                    var response = await chat.GetResponseAsync(aiHistory, options, ct);
+                    Write(response.Text);
+                    finished = response.FinishReason is not null;
+                    limited = response.FinishReason == Microsoft.Extensions.AI.ChatFinishReason.Length;
                 }
-                finished |= update.FinishReason is not null;
-                limited |= update.FinishReason == OpenAI.Chat.ChatFinishReason.Length;
+                else
+                {
+                    await foreach (var update in chat.GetStreamingResponseAsync(aiHistory, options, ct))
+                    {
+                        Write(update.Text);
+                        finished |= update.FinishReason is not null;
+                        limited |= update.FinishReason == Microsoft.Extensions.AI.ChatFinishReason.Length;
+                    }
+                }
             }
+            else
+            {
+                sdkHistory.Add(new UserChatMessage(prompt));
+                var options = new ChatCompletionOptions { MaxOutputTokenCount = settings.MaxTokens };
+                if (settings.Mode == "response")
+                {
+                    ChatCompletion response = await sdk.CompleteChatAsync(sdkHistory, options, ct);
+                    foreach (var part in response.Content) Write(part.Text);
+                    finished = true;
+                    limited = response.FinishReason == OpenAI.Chat.ChatFinishReason.Length;
+                }
+                else
+                {
+                    await foreach (var update in sdk.CompleteChatStreamingAsync(sdkHistory, options, ct))
+                    {
+                        foreach (var part in update.ContentUpdate) Write(part.Text);
+                        finished |= update.FinishReason is not null;
+                        limited |= update.FinishReason == OpenAI.Chat.ChatFinishReason.Length;
+                    }
+                }
+            }
+            Console.WriteLine();
+            if (!finished) throw new InvalidOperationException(
+                "The response ended without a finish_reason. Output may be partial; inspect the TensorSharp server log.");
+            if (string.IsNullOrWhiteSpace(answer.ToString())) throw new InvalidOperationException(
+                "The response completed without assistant text. Check model compatibility, token limits, and the TensorSharp server log.");
+            // Send the full text conversation on the optional second request. The HTTP API is stateless.
+            if (chat is not null) aiHistory.Add(new(ChatRole.Assistant, answer.ToString()));
+            else sdkHistory.Add(new AssistantChatMessage(answer.ToString()));
+            if (limited) Console.Error.WriteLine("Generation reached the token limit. Increase --max-tokens and the server's cap if needed.");
         }
-        Console.WriteLine();
-        if (!finished) throw new InvalidOperationException(
-            "The stream ended without a finish_reason. Output may be partial; inspect the TensorSharp server log.");
-        if (!hasText) throw new InvalidOperationException(
-            "The stream completed without assistant text. Check model compatibility, token limits, and the TensorSharp server log.");
-        if (limited) Console.Error.WriteLine("Generation reached the token limit. Increase --max-tokens and the server's cap if needed.");
         return 0;
     }
     catch (OperationCanceledException)
@@ -143,19 +168,21 @@ static string HttpHint(int status) => status switch
     _ => "Check the TensorSharp server log."
 };
 
-sealed record Settings(Uri Endpoint, string? Model, string Prompt, string Client, int MaxTokens,
+sealed record Settings(Uri Endpoint, string? Model, string Prompt, string? FollowUp, string Client, string Mode, int MaxTokens,
     int TimeoutSeconds, bool ListModels, bool Help)
 {
     public const string Usage = """
-        TensorSharp HTTP streaming chat (.NET 10)
+        Microsoft.Extensions.AI chat with a local TensorSharp server (.NET 10)
         dotnet run -- [options]
           --list-models             Discover IDs using GET /v1/models
           --prompt TEXT             User message (default: a short introduction)
+          --follow-up TEXT          Optional second turn with full conversation history
           --model ID                Exact advertised ID (auto-select if exactly one)
           --client extensions|openai Default: extensions (IChatClient)
+          --mode stream|response    Default: stream; response waits for the complete answer
           --base-url URL            Default: http://127.0.0.1:8080/v1
           --max-tokens N            Default: 128
-          --timeout-seconds N       Total discovery + generation deadline; default: 120
+          --timeout-seconds N       Entire invocation, including both turns; default: 120
           --allow-remote            Allow an explicitly chosen HTTPS remote endpoint
           --help                    Show this help
         Environment: TENSORSHARP_BASE_URL, TENSORSHARP_MODEL, TENSORSHARP_API_KEY
@@ -167,10 +194,11 @@ sealed record Settings(Uri Endpoint, string? Model, string Prompt, string Client
         string baseUrl = Environment.GetEnvironmentVariable("TENSORSHARP_BASE_URL") ?? "http://127.0.0.1:8080/v1";
         string? model = Environment.GetEnvironmentVariable("TENSORSHARP_MODEL");
         string prompt = "Explain what a local LLM inference server does in one sentence.";
-        string client = "extensions";
+        string? followUp = null;
+        string client = "extensions", mode = "stream";
         int maxTokens = 128, timeoutSeconds = 120;
         bool list = false, remote = false;
-        if (args.Contains("--help")) return new(new Uri("http://127.0.0.1:8080/v1/"), null, prompt, client, maxTokens, timeoutSeconds, false, true);
+        if (args.Contains("--help")) return new(new Uri("http://127.0.0.1:8080/v1/"), null, prompt, null, client, mode, maxTokens, timeoutSeconds, false, true);
         for (int i = 0; i < args.Length; i++)
         {
             string option = args[i];
@@ -180,7 +208,9 @@ sealed record Settings(Uri Endpoint, string? Model, string Prompt, string Client
                 case "--base-url": baseUrl = Value(); break;
                 case "--model": model = Value(); break;
                 case "--prompt": prompt = Value(); break;
+                case "--follow-up": followUp = Value(); break;
                 case "--client": client = Value(); break;
+                case "--mode": mode = Value(); break;
                 case "--max-tokens": maxTokens = PositiveInt(Value(), option); break;
                 case "--timeout-seconds": timeoutSeconds = PositiveInt(Value(), option); break;
                 case "--list-models": list = true; break;
@@ -189,7 +219,9 @@ sealed record Settings(Uri Endpoint, string? Model, string Prompt, string Client
             }
         }
         if (client is not ("extensions" or "openai")) throw new ArgumentException("--client must be extensions or openai.");
-        if (string.IsNullOrWhiteSpace(prompt)) throw new ArgumentException("--prompt must not be empty.");
+        if (mode is not ("stream" or "response")) throw new ArgumentException("--mode must be stream or response.");
+        if (string.IsNullOrWhiteSpace(prompt) || followUp is not null && string.IsNullOrWhiteSpace(followUp))
+            throw new ArgumentException("--prompt and --follow-up must not be empty.");
         if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https")
             || uri.UserInfo.Length != 0 || uri.Query.Length != 0 || uri.Fragment.Length != 0
             || !uri.AbsolutePath.TrimEnd('/').EndsWith("/v1", StringComparison.Ordinal))
@@ -197,7 +229,7 @@ sealed record Settings(Uri Endpoint, string? Model, string Prompt, string Client
         if (!uri.IsLoopback && (!remote || uri.Scheme != "https")) throw new ArgumentException(
             "Use a loopback endpoint by default. Remote endpoints require HTTPS and explicit --allow-remote; add authentication at a trusted proxy.");
         return new(new Uri(uri.AbsoluteUri.TrimEnd('/') + "/"), string.IsNullOrWhiteSpace(model) ? null : model,
-            prompt, client, maxTokens, timeoutSeconds, list, false);
+            prompt, followUp, client, mode, maxTokens, timeoutSeconds, list, false);
     }
 
     static int PositiveInt(string value, string option) => int.TryParse(value, out int n) && n is > 0 and <= 86400
