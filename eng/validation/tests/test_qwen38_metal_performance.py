@@ -143,6 +143,26 @@ class CliParserTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "decodeModelMs"):
             PERF.parse_runs(benchmark_line().replace("decodeModelMs=2999 ", ""), 1)
 
+    def test_nonfinite_nonpositive_and_nonnumeric_measurements_fail(self):
+        for old, new in (("prefillMs=101", "prefillMs=NaN"), ("prefillMs=101", "prefillMs=0"),
+                         ("decodeMs=3000", "decodeMs=Infinity"), ("decodeMs=3000", "decodeMs=-1"),
+                         ("decodeMs=3000", "decodeMs=0"), ("decodeTps=21.3", "decodeTps=NaN"),
+                         ("decodeModelMs=2999", "decodeModelMs=-Infinity"),
+                         ("decodeModelMs=2999", "decodeModelMs=invalid"),
+                         ("greedySampleMs=0.0", "greedySampleMs=-1")):
+            with self.subTest(value=new), self.assertRaises(ValueError):
+                PERF.parse_runs(benchmark_line().replace(old, new), 1)
+
+    def test_prefill_only_has_no_decode_rates_but_elapsed_times_must_be_finite(self):
+        log = (benchmark_line().replace("decodeMs=3000", "decodeMs=0")
+               .replace("decodeModelMs=2999", "decodeModelMs=0").replace("decodeTps=21.3", "decodeTps=NaN")
+               .replace("decodeModelTps=21.3", "decodeModelTps=NaN").replace("msPerTok=46.9", "msPerTok=NaN"))
+        rows = PERF.parse_runs(log, 1, decode_tokens=0)
+        self.assertIsNone(rows[0]["decodeTps"])
+        self.assertEqual(0, rows[0]["decodeMs"])
+        with self.assertRaises(ValueError):
+            PERF.parse_runs(log.replace("decodeMs=0", "decodeMs=NaN"), 1, decode_tokens=0)
+
 
 class LogitTests(unittest.TestCase):
     def setUp(self):
@@ -233,7 +253,7 @@ class ConfigurationTests(unittest.TestCase):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp).resolve()
                 config = root / "tuned.json"
-                config.write_text('{"CpuMoeThreads":12}\n')
+                config.write_text('{"cpu-moe-threads":12}\n')
                 output = io.StringIO()
                 argv = ["qwen38-metal-performance.py", mode, "--variant", "baseline=" + str(root),
                         "--variant", "tuned=" + str(root), "--variant-config", "tuned=" + str(config),
@@ -262,7 +282,9 @@ class IdentityTests(unittest.TestCase):
                      "TensorSharp.Chat.dll": b"chat"}
             for name, raw in files.items():
                 (app / name).write_bytes(raw)
-            with patch.object(PERF, "capture", return_value={"exit_code": 0, "output": "synthetic"}):
+            def git_result(argv, cwd):
+                return {"exit_code": 0, "output": "0" * 40 if "rev-parse" in argv else ""}
+            with patch.object(PERF, "capture", side_effect=git_result):
                 provenance = PERF.identity(root, app / "TensorSharp.Cli.dll")
                 self.assertEqual({"app/" + name: hashlib.sha256(raw).hexdigest() for name, raw in files.items()},
                                  provenance["binaries_sha256"])
@@ -272,6 +294,20 @@ class IdentityTests(unittest.TestCase):
                         PERF.identity(root, app / "TensorSharp.Cli.dll")
                     (app / name).write_bytes(files[name])
 
+    def test_unavailable_git_or_invalid_revision_prevents_provenance_acceptance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dll = root / "TensorSharp.Cli.dll"
+            dll.write_bytes(b"entry")
+            (root / "libGgmlOps.dylib").write_bytes(b"native")
+            for failed_call in range(4):
+                results = [{"exit_code": 0, "output": "0" * 40 if index in (0, 2) else ""} for index in range(4)]
+                results[failed_call] = {"exit_code": 128, "output": ""}
+                with self.subTest(failed_call=failed_call), patch.object(PERF, "capture", side_effect=results), self.assertRaises(ValueError):
+                    PERF.identity(root, dll)
+            with patch.object(PERF, "capture", return_value={"exit_code": 0, "output": ""}), self.assertRaises(ValueError):
+                PERF.identity(root, dll)
+
 
 class HttpVectorTests(unittest.TestCase):
     def run_mocked_servers(self, changed=False, missing=False, pid_text=None):
@@ -280,7 +316,7 @@ class HttpVectorTests(unittest.TestCase):
             model = root / "synthetic.gguf"
             model.write_bytes(b"not a model")
             config = root / "tuned.json"
-            config.write_text('{"CpuMoeThreads":12}')
+            config.write_text('{"cpu-moe-threads":12}')
             output = root / "artifacts/run"
             stopped, launched = [], []
             compare = PERF.compare_logits

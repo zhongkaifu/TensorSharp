@@ -53,33 +53,82 @@ separate generic CPU backend; it does not set the host expert team size.
 removing an environment variable does not reset an override installed earlier
 in the same process. The existing sleeping worker policy remains in use.
 
-## Evidence status
+## Measured configuration results
 
-**Final-head revalidation on base `2de8a63f` is pending.** The measurements
-below are earlier configuration experiments on `72e0fc81`; they are not
-validation of the current branch head. Record the actual source revision,
-unchanged ggml revision and binary hashes from each new harness report before
-publishing a current-head result.
+The 2026-11-01 revalidation used source `ca9940f2`, based on main
+`2de8a63fa048d3a9bf25b04923aa124f745a7a10`, on macOS 27.2 and .NET 10.0.10.
+Both configurations used the same binaries. The managed CLI and server were
+rebuilt against this main base. The native library was reused from clean
+`72e0fc81`: source comparison found no changes in `TensorSharp.GGML.Native`,
+`TensorSharp.Models`, `TensorSharp.Runtime`, `TensorSharp.Core` or
+`TensorSharp.Cli` between those revisions. It used unchanged upstream ggml
+`facdc44a67da17df4433adcc468b424f48e9ded2`. The reused native SHA-256 was
+`0a5eba984397531eee8176a52b61e17a00062feca60de8404aa247557ca5847a`.
+This is configuration validation, not validation of a newly compiled native
+engine. Later documentation and harness-validation edits do not change the
+measured runtime or overlay; the source identifier above names the measured
+revision.
 
-The earlier HTTP ABBA comparison ran baseline/candidate/candidate/baseline
-sequentially, with two repetitions of three prompts per server: 24 requests.
-All paired answers and token-usage records matched exactly. The arithmetic
-request's complete 248,320-element first-token F32 logit vector was also
-bit-identical. This checks these requests, not broader language/model quality.
+The ignored evidence directory is `artifacts/qwen38-metal-performance/`:
+`summary.json`, `native-reuse.json`, `cli-abba/report.json` and
+`http-abba/report.json` retain the source/config/binary identities, individual
+measurements and correctness checks.
 
-Earlier request medians, milliseconds:
+The HTTP ABBA comparison ran auto/tuned/tuned/auto sequentially, with two
+repetitions of three prompts per server: **24 requests, zero errors**. All
+paired complete answers and token-usage records matched exactly; cached-token
+usage was zero and every request ended with `stop`. Arithmetic, Chinese and
+JSON responses used 4, 87 and 11 completion tokens respectively. All four
+arithmetic first-token F32 vectors were validated, with all three comparisons
+against the first vector bit-identical across all 248,320 elements. This
+checks these deterministic requests; it does not establish broader language
+or model-quality equivalence.
 
-| Workload | Auto nine: TTFT | Twelve: TTFT | Auto nine: end to end | Twelve: end to end |
-| --- | ---: | ---: | ---: | ---: |
-| Three-sentence Chinese explanation | 4,693 | 3,706 | 14,555 | 12,829 |
-| Exact JSON object | 7,183 | 5,593 | 9,285 | 7,512 |
+HTTP latency in milliseconds, **median [minimum, maximum]**, four samples per
+configuration and workload:
 
-End-to-end latency was 11.9% lower for the Chinese request and 19.1% lower for
-the JSON request in that experiment. Those are configuration results for the
-specified cases. A separate warmed fixed-work pp128/tg64 comparison measured
-auto-nine decode median 20.76 tok/s (range 19.60–20.87) and twelve-thread median
-21.16 tok/s (21.00–21.45), about 1.9% higher. It does not establish a general
-decode improvement or a kernel speedup.
+| Workload and metric | Auto nine threads | Twelve threads |
+| --- | ---: | ---: |
+| Arithmetic TTFT | 2,886 [2,561, 4,165] | 2,356 [2,133, 2,669] |
+| Arithmetic end to end | 3,367 [3,102, 4,768] | 2,828 [2,586, 3,105] |
+| Chinese explanation TTFT | 4,840 [4,323, 5,783] | 3,711 [3,482, 4,115] |
+| Chinese explanation end to end | 14,683 [13,760, 15,774] | 12,754 [12,268, 13,313] |
+| Exact JSON TTFT | 7,112 [6,662, 7,862] | 5,576 [5,403, 5,782] |
+| Exact JSON end to end | 9,265 [8,724, 10,130] | 7,593 [7,152, 7,995] |
+
+Median end-to-end latency was **13.1% lower for the Chinese request** and
+**18.0% lower for JSON** in this configuration comparison. Peak server process
+RSS was 11.27–11.31 GiB for auto and 11.17–11.30 GiB for twelve threads. RSS
+does not measure total unified memory, total GPU memory or other processes;
+these overlapping ranges do not establish a memory reduction.
+
+For the 87-token Chinese response, post-first-content SSE throughput was
+8.78 [8.53, 9.11] versus 9.54 [9.31, 9.79] tok/s (auto versus twelve). This
+transport estimate is a different workload from the fixed-token CLI benchmark
+and does not measure native kernel throughput.
+
+The CLI fixed-work pp128/tg64 ABBA comparison completed 16 timed iterations
+without errors. Each process ran four iterations after standard startup
+warmup; the warm summary excludes the first iteration of each process,
+leaving six warm samples per configuration:
+
+| Warm throughput, tok/s | Auto nine threads | Twelve threads |
+| --- | ---: | ---: |
+| Prefill | 121.12 [112.97, 125.61] | 120.53 [98.08, 123.31] |
+| Decode | 20.61 [19.13, 20.77] | 20.82 [20.54, 20.99] |
+
+The approximately 1% decode-median difference and overlapping ranges do not
+establish a general decode improvement. Prefill was not faster in this
+fixed-work comparison. Process-first iterations, retained separately in the
+reports, measured prefill 33.8–48.9 versus 47.4–51.2 tok/s and decode 14.6–16.1
+versus 15.3–15.7 tok/s (auto versus twelve, two samples each). These are fresh
+processes after startup warmup, not physically cold caches. All compared
+64-token untimed greedy correctness chains matched, and all compared CLI
+first-token vectors were bit-identical.
+
+Earlier experiments on `72e0fc81` also found matching output and lower Chinese
+and JSON request latency at twelve threads. The tables above use the later
+main-based revalidation; they do not pool samples from the earlier builds.
 
 ## Reproduce a comparison
 

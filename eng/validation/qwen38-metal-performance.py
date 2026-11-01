@@ -58,7 +58,7 @@ def capture(argv, cwd):
     return {"exit_code": run.returncode, "output": run.stdout.strip()}
 
 
-def parse_runs(log, expected):
+def parse_runs(log, expected, decode_tokens=None):
     rows = []
     for match in RUN.finditer(log):
         row = {"run": int(match[1]), "runs": int(match[2]),
@@ -66,12 +66,29 @@ def parse_runs(log, expected):
         for key, value in PAIR.findall(match[3]):
             if re.fullmatch(NUMBER, value):
                 number = float(value)
-                row[key] = number if math.isfinite(number) else None
+                if not math.isfinite(number):
+                    # CLI intentionally prints NaN rates for prefill-only runs.
+                    # Their elapsed times must still be finite; no decode rate
+                    # is accepted when zero decode tokens were requested.
+                    if decode_tokens == 0 and math.isnan(number) and key in ("decodeTps", "decodeModelTps", "msPerTok"):
+                        row[key] = None
+                        continue
+                    raise ValueError(f"benchmark {key} is not finite")
+                row[key] = number
             else:
                 row[key] = value
         for required in ("prefillMs", "prefillTps", "decodeMs", "decodeTps", "decodeModelMs", "decodeMode"):
             if required not in row:
                 raise ValueError(f"benchmark row lacks {required}")
+        for key in ("prefillMs", "prefillTps", "decodeMs", "decodeTps", "decodeModelMs", "decodeModelTps", "msPerTok", "greedySampleMs"):
+            if key not in row or (row[key] is None and decode_tokens == 0 and key in ("decodeTps", "decodeModelTps", "msPerTok")):
+                continue
+            value = row[key]
+            if not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(f"benchmark {key} is not a nonnegative number")
+            if value == 0 and (key in ("prefillMs", "prefillTps")
+                    or (decode_tokens != 0 and key in ("decodeMs", "decodeTps", "decodeModelMs", "decodeModelTps", "msPerTok"))):
+                raise ValueError(f"benchmark {key} must be positive")
         rows.append(row)
     if [r["run"] for r in rows] != list(range(1, expected + 1)) or any(r["runs"] != expected for r in rows):
         raise ValueError(f"expected exactly {expected} sequential benchmark rows, found {len(rows)}")
@@ -162,10 +179,14 @@ def identity(root, dll):
     files = set(required).union(dll.parent.glob("TensorSharp*.dll"))
     binaries = {str(path.relative_to(root)): sha(path) for path in sorted(files) if path.is_file()}
     ggml = root / "ExternalProjects/ggml"
-    return {"source": capture(["git", "rev-parse", "HEAD"], root),
-            "source_changes": capture(["git", "status", "--porcelain"], root),
-            "ggml": capture(["git", "rev-parse", "HEAD"], ggml),
-            "ggml_changes": capture(["git", "status", "--porcelain"], ggml), "binaries_sha256": binaries}
+    metadata = {"source": capture(["git", "rev-parse", "HEAD"], root),
+                "source_changes": capture(["git", "status", "--porcelain"], root),
+                "ggml": capture(["git", "rev-parse", "HEAD"], ggml),
+                "ggml_changes": capture(["git", "status", "--porcelain"], ggml)}
+    for name, result in metadata.items():
+        if result["exit_code"] != 0 or (name in ("source", "ggml") and not re.fullmatch(r"[0-9a-fA-F]{40}", result["output"])):
+            raise ValueError(f"Git provenance unavailable: {name}")
+    return dict(metadata, binaries_sha256=binaries)
 
 
 def stop_owned(process, child_pid=None):
@@ -229,7 +250,7 @@ def cli(args, report):
             if row["exit_code"] != 0:
                 row["errors"].append("process failed")
             try:
-                row["runs"] = parse_runs(log, args.runs)
+                row["runs"] = parse_runs(log, args.runs, decode)
                 if args.token_stream == "fixed":
                     for run in row["runs"]:
                         run["cache_label"] = ("process-first after standard warmup; OS caches uncontrolled"
