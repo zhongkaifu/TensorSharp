@@ -34,7 +34,7 @@ def category(name):
     name = name.lower()
     if re.search(r"gated.?delta|gdn|delta.?net", name):
         return "gdn"
-    if re.search(r"flash.?attn|flash.?attention|fattn|attention", name):
+    if re.search(r"flash.?attn|flash.?attention|fattn|attention|(?:^|_)attn(?:_|$)", name):
         return "attention"
     if re.search(r"dequantize|quantize|convert", name):
         return "quantization"

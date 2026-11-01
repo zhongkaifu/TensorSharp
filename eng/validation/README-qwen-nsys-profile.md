@@ -50,6 +50,25 @@ cold work use `--step 0 --prime-steps ''`. Each invocation starts a new server.
 Record observed prompt/image/cached token counts; fixture labels are targets,
 not evidence that a tokenizer produced exactly that length.
 
+The Linux wrapper records the actual server PID, its `/proc/PID/stat` start time,
+the kernel boot ID, and a fresh invocation ID in the `.pid` JSON file before
+`exec` replaces the wrapper with the server. It validates that identity before
+reading process counters. The Nsight launcher exiting does **not** establish
+that the server exited or released its CUDA context.
+
+After collection, `nsys shutdown --kill=none` releases the profiling session;
+the wrapper sends SIGTERM only to the independently identified server through a
+Linux pidfd and waits for its real exit. After `--server-exit-timeout` (15 seconds
+by default), it may send SIGKILL through a newly verified pidfd, then waits up to
+`--server-kill-timeout` (5 seconds). It never signals a process group or falls
+back to killing a bare numeric PID. Changed identities, unavailable pidfd support,
+or unconfirmed exit fail the invocation and leave `complete: false`, even when
+the capture/export succeeded. Inspect `server_identity`, `server_cleanup`,
+`launcher_exit_code`, and any cleanup errors before running another GPU profile.
+Startup and request failures also attempt this scoped cleanup. Use a foreground
+server command; this ownership record covers that server PID, not independently
+daemonized workers.
+
 `--max-tokens 1` changes both prime and measured requests, records the changed
 request hashes, and limits decode contamination. This is a prefill diagnostic,
 not an answer-quality or throughput run. Tool parsers may emit no content until
@@ -95,5 +114,12 @@ or throughput qualification.
 CPU-only tool tests (no model or GPU):
 
 ```bash
-python3 -m unittest discover -s eng/validation/tests -p test_qwen_nsys_summary.py -v
+python3 -m unittest discover -s eng/validation/tests -p 'test_qwen_nsys*.py' -v
 ```
+
+The lifecycle tests include real Linux `/proc` CPU processes: delayed exit after
+SIGTERM, SIGKILL escalation, an unrelated sibling in the same process group,
+stale identities, startup/exec failures, and a fake Nsight launcher that reports
+exited while its server remains alive. They need neither Nsight nor a GPU. On
+non-Linux hosts these cases are explicitly skipped; portable identity/race tests
+still run. Run the complete gate on Linux before relying on lifecycle coverage.
