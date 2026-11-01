@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Extensions.AI;
 using TensorSharp.MicrosoftExtensionsAISample;
 using TensorSharp.Runtime;
@@ -38,6 +39,7 @@ try
         throw new InvalidOperationException($"Requested backend {options.Backend}, but TensorSharp loaded {service.LoadedBackend}. Refusing a silent backend substitution.");
     using IChatClient chat = new TensorSharpChatClient(service);
     var history = new List<AiMessage>();
+    int completedTurns = 0;
     await SendAsync(options.Prompt, stream: options.Mode != "response");
     if (options.FollowUp is not null) await SendAsync(options.FollowUp, stream: options.Mode == "stream");
     return 0;
@@ -72,6 +74,16 @@ try
         cancellation.CancelAfter(Timeout.InfiniteTimeSpan);
         Console.WriteLine();
         Console.Error.WriteLine($"[TensorSharp IChatClient] mode={(stream ? "stream" : "response")}; finish={response.FinishReason}; native_finish={response.AdditionalProperties?["tensorsharp.finish_reason"]}; prompt_tokens={response.Usage?.InputTokenCount}; generated_tokens={response.Usage?.OutputTokenCount}; kv_cache_reused_tokens={response.Usage?.CachedInputTokenCount}");
+        if (options.RegressionJson)
+            Console.Error.WriteLine("[TensorSharp regression] " + JsonSerializer.Serialize(new
+            {
+                schema_version = 1, turn = ++completedTurns, text = response.Text,
+                model = service.LoadedModelName, architecture = service.Architecture, backend = service.LoadedBackend,
+                mode = stream ? "stream" : "response", finish = response.FinishReason?.ToString(),
+                native_finish = response.AdditionalProperties?["tensorsharp.finish_reason"],
+                prompt_tokens = response.Usage?.InputTokenCount, generated_tokens = response.Usage?.OutputTokenCount,
+                kv_cache_reused_tokens = response.Usage?.CachedInputTokenCount
+            }));
         history.AddRange(response.Messages);
     }
 }
@@ -108,7 +120,7 @@ internal static class NativeCompletion
 }
 
 sealed record Options(string Model, string Backend, string Prompt, string? FollowUp,
-    int MaxTokens, int ContextTokens, int TimeoutSeconds, string Mode, bool Help)
+    int MaxTokens, int ContextTokens, int TimeoutSeconds, string Mode, bool Help, bool RegressionJson)
 {
     public const string Usage = """
         Microsoft.Extensions.AI over TensorSharp's direct .NET runtime (.NET 10)
@@ -121,6 +133,7 @@ sealed record Options(string Model, string Backend, string Prompt, string? Follo
           --max-tokens N          Default: 128
           --context-tokens N      Default: 4096; sets this process's MAX_CONTEXT
           --timeout-seconds N     Per generation, after model loading; default: 120
+          --regression-json       Emit complete per-turn diagnostic JSON to stderr (may contain prompt-derived text)
           --help                  Show this help
         Ctrl+C cancels generation. Model loading is synchronous and not cancellable through this API.
         """;
@@ -131,7 +144,8 @@ sealed record Options(string Model, string Backend, string Prompt, string? Follo
         string backend = "ggml_metal", prompt = "What is 2 + 2? Reply with just the single digit.", mode = "mixed";
         string? followUp = null;
         int maxTokens = 128, contextTokens = 4096, timeout = 120;
-        if (args.Contains("--help")) return new("", backend, prompt, null, maxTokens, contextTokens, timeout, mode, true);
+        bool regressionJson = false;
+        if (args.Contains("--help")) return new("", backend, prompt, null, maxTokens, contextTokens, timeout, mode, true, false);
         for (int i = 0; i < args.Length; i++)
         {
             string option = args[i];
@@ -146,6 +160,7 @@ sealed record Options(string Model, string Backend, string Prompt, string? Follo
                 case "--max-tokens": maxTokens = Number(Value(), option); break;
                 case "--context-tokens": contextTokens = Number(Value(), option); break;
                 case "--timeout-seconds": timeout = Number(Value(), option); break;
+                case "--regression-json": regressionJson = true; break;
                 default: throw new ArgumentException($"Unknown option {option}. Use --help.");
             }
         }
@@ -157,7 +172,7 @@ sealed record Options(string Model, string Backend, string Prompt, string? Follo
             throw new ArgumentException("Prompts must not be empty.");
         if (contextTokens < 1024 || maxTokens >= contextTokens - 1024)
             throw new ArgumentException("Choose --context-tokens above 1024 and reserve more than --max-tokens + 1024 tokens for the chat prompt.");
-        return new(Path.GetFullPath(model), backend, prompt, followUp, maxTokens, contextTokens, timeout, mode, false);
+        return new(Path.GetFullPath(model), backend, prompt, followUp, maxTokens, contextTokens, timeout, mode, false, regressionJson);
     }
 
     static int Number(string value, string name) => int.TryParse(value, out int n) && n is > 0 and <= 65536
