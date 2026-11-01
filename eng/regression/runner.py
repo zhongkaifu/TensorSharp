@@ -19,6 +19,8 @@ from .downloads import DownloadPolicy, PrepareError, prepare_files
 from .hardware import detect_hardware, plan_resources
 from .reports import aggregate_exit, atomic_json, file_hash, runtime_identity, sanitize, source_identity, write_reports
 from .scenarios import availability, run_scenario
+from .processes import (UNSAFE_RESOURCES_REASON, ProcessContainmentError,
+                        containment_failure_evidence, unsafe_process_state)
 
 GIB = 1024 ** 3
 SAFE_OPTIONS = {"model", "mmproj", "draft-model", "tokenizer", "kv-cache-dtype", "embedding-threads",
@@ -231,9 +233,36 @@ def result_stub(preset, backend, scenario, status, reason, **details):
             "status": status, "reason": reason, **details}
 
 
+def record_execution_halt(report, result):
+    evidence = containment_failure_evidence(result)
+    if evidence is None:
+        return None
+    result.update(status="fail", containment_failure=True)
+    result["reason"] = str(result.get("reason", "")) + "; " + UNSAFE_RESOURCES_REASON
+    report.setdefault("execution_halt", {"reason": UNSAFE_RESOURCES_REASON,
+        "trigger_case": result["id"], "process_evidence": evidence})
+    return report["execution_halt"]
+
+
+def append_halted_cases(report, preset, backends, cases, halt):
+    existing = {result["id"] for result in report["results"]}
+    for backend in backends:
+        for scenario in cases:
+            result = result_stub(preset, backend, scenario, "untested", UNSAFE_RESOURCES_REASON,
+                                 stage="execution_halted", halt_trigger=halt["trigger_case"])
+            if result["id"] not in existing:
+                report["results"].append(result)
+                existing.add(result["id"])
+
+
 def reproduce_args(args, repo, root, preset, backend, scenario):
     command = [sys.executable, str(repo / "eng/run-local-regression.py"), "--mode", "run",
                "--models", preset["id"], "--backend", backend, "--scenarios", scenario["id"], "--model-root", str(root)]
+    if args.output is not None:
+        # Keep diagnostics on the caller's chosen volume without reusing a
+        # nonempty evidence directory. The generated argv is saved per result.
+        fresh = args.output.resolve().parent / ("repro-" + preset["id"] + "-" + scenario["id"] + "-" + uuid.uuid4().hex[:8])
+        command += ["--output", str(fresh)]
     for key in ("cli", "server", "logit_probe", "benchmark", "engine_repo", "media_dir", "ram_budget_gib", "vram_budget_gib", "ram_required_gib", "vram_required_gib", "gpu_index", "disk_headroom_gib", "max_download_gib", "timeout_seconds", "catalog"):
         value = getattr(args, key)
         if value is not None:
@@ -314,10 +343,22 @@ def main(argv=None):
         if not presets:
             raise ValueError("model selector matched no catalog presets")
         download_reserved, executed_models = 0, set()
+        halt = None
+        if args.mode == "run" and unsafe_process_state() is not None:
+            previous = {"id": "prior-containment-failure", "status": "fail", "reason": "Earlier process cleanup remains unverified",
+                        "containment_failure": True, "teardown": unsafe_process_state().get("teardown")}
+            report["results"].append(previous)
+            halt = record_execution_halt(report, previous)
         for preset in presets:
             model_overrides = preset_budgets(preset, overrides)
             case_defs = [scenarios[s] for s in preset.get("scenarios", []) if selected(s, args.scenarios)]
             if not case_defs:
+                continue
+            if halt:
+                # Do not resolve configs, probe metadata, hash/download weights or
+                # select another model based on resources which may still be owned.
+                remaining_backends = ["auto"] if args.backend == "auto" else select_backends(args.backend, preset.get("backends", []), hardware) or ["none"]
+                append_halted_cases(report, preset, remaining_backends, case_defs, halt)
                 continue
             backends = select_backends(args.backend, preset.get("backends", []), hardware) or ["none"]
             if args.backend == "auto" and preset.get("status") != "unsupported" and any(s.get("status") == "automated" for s in case_defs):
@@ -376,6 +417,9 @@ def main(argv=None):
                     write_reports(output, report, bundle=False)
                     continue
             for backend in backends:
+                if halt:
+                    append_halted_cases(report, preset, [backend], case_defs, halt)
+                    continue
                 base_context = {"repo": repo, "backend": backend, "artifact_dir": output, "model_family": preset["family"],
                                 "timeout_seconds": args.timeout_seconds, "media_dir": args.media_dir,
                                 "disk_headroom_gib": args.disk_headroom_gib,
@@ -394,7 +438,7 @@ def main(argv=None):
                     report["results"].append(result_stub(preset, backend, scenario, status, reason))
                 if not candidates:
                     continue
-                files, config_path, resources = [], None, None
+                files, config_path, resources, active_scenario = [], None, None, None
                 try:
                     resolved = read_config(repo / preset["config"], root)
                     if resolved.unavailable:
@@ -468,6 +512,10 @@ def main(argv=None):
                         atomic_json(config_path, options)
                         context = {**context, "model_path": options.get("model"), "model_options": options}
                     for scenario in runnable:
+                        if halt:
+                            append_halted_cases(report, preset, [backend], [scenario], halt)
+                            continue
+                        active_scenario = scenario
                         dependencies = {"model"}
                         if scenario["id"] in MEDIA_SCENARIOS:
                             dependencies.add("mmproj")
@@ -491,7 +539,14 @@ def main(argv=None):
                         result["model_identity"] = plain(identities)
                         result["duration_seconds"] = time.monotonic() - start
                         result["reproduce"] = reproduce_args(args, repo, root, preset, backend, scenario)
+                        unreported_cleanup = unsafe_process_state()
+                        if unreported_cleanup is not None and containment_failure_evidence(result) is None:
+                            # Even an adapter accidentally omitting its process
+                            # records cannot clear the central sticky launch guard.
+                            result.update(containment_failure=True, teardown=unreported_cleanup.get("teardown"),
+                                          containment_evidence=unreported_cleanup)
                         report["results"].append(result)
+                        halt = record_execution_halt(report, result) or halt
                         write_reports(output, report, bundle=False)
                 except PrepareError as error:
                     for scenario in candidates:
@@ -500,19 +555,45 @@ def main(argv=None):
                                 error=error.as_dict(), required_files=[plain(spec) for spec in files], effective_config=config_path,
                                 resource_plan=resources, reproduce=reproduce_args(args, repo, root, preset, backend, scenario)))
                 except (ValueError, OSError, RuntimeError) as error:
-                    for scenario in candidates:
-                        if not any(r["id"] == f"{preset['id']}::{backend}::{scenario['id']}" for r in report["results"]):
-                            report["results"].append(result_stub(preset, backend, scenario, "fail", str(error), stage="orchestration",
-                                required_files=[plain(spec) for spec in files], effective_config=config_path,
-                                resource_plan=resources, reproduce=reproduce_args(args, repo, root, preset, backend, scenario)))
+                    containment = error.evidence if isinstance(error, ProcessContainmentError) else unsafe_process_state()
+                    if containment is not None:
+                        scenario = active_scenario or candidates[0]
+                        failure = result_stub(preset, backend, scenario, "fail", str(error), stage="containment",
+                            containment_failure=True, teardown=containment.get("teardown"), process_evidence=containment,
+                            required_files=[plain(spec) for spec in files], effective_config=config_path,
+                            resource_plan=resources, reproduce=reproduce_args(args, repo, root, preset, backend, scenario))
+                        report["results"].append(failure)
+                        halt = record_execution_halt(report, failure)
+                    else:
+                        for scenario in candidates:
+                            if not any(r["id"] == f"{preset['id']}::{backend}::{scenario['id']}" for r in report["results"]):
+                                report["results"].append(result_stub(preset, backend, scenario, "fail", str(error), stage="orchestration",
+                                    required_files=[plain(spec) for spec in files], effective_config=config_path,
+                                    resource_plan=resources, reproduce=reproduce_args(args, repo, root, preset, backend, scenario)))
+                if halt:
+                    append_halted_cases(report, preset, [backend], case_defs, halt)
                 write_reports(output, report, bundle=False)
         if args.include_suites:
-            from .suites import run_suites
-            report["results"].extend(run_suites(repo, output / "suites", args.mode, args.allow_builds, args.timeout_seconds))
+            from .suites import list_suites, run_suites
+            if halt:
+                report["results"].extend({"id": spec["id"], "status": "untested", "reason": UNSAFE_RESOURCES_REASON,
+                    "stage": "execution_halted", "halt_trigger": halt["trigger_case"]} for spec in list_suites(repo))
+            else:
+                suite_results = run_suites(repo, output / "suites", args.mode, args.allow_builds, args.timeout_seconds)
+                for result in suite_results:
+                    halt = record_execution_halt(report, result) or halt
+                report["results"].extend(suite_results)
         if args.native_test_build_dir:
             from .ctest import run_native_tests
-            report["results"].extend(run_native_tests(repo, args.native_test_build_dir, output / "native-ctest", args.mode,
-                args.native_test_backend, args.native_test_filter, args.timeout_seconds, args.gpu_index))
+            if halt:
+                report["results"].append({"id": "native_ctest", "status": "untested", "reason": UNSAFE_RESOURCES_REASON,
+                    "stage": "execution_halted", "halt_trigger": halt["trigger_case"], "build_dir": str(args.native_test_build_dir)})
+            else:
+                native_results = run_native_tests(repo, args.native_test_build_dir, output / "native-ctest", args.mode,
+                    args.native_test_backend, args.native_test_filter, args.timeout_seconds, args.gpu_index)
+                for result in native_results:
+                    halt = record_execution_halt(report, result) or halt
+                report["results"].extend(native_results)
         if len(report["results"]) == 1:
             raise ValueError("scenario selector matched no cases")
         # An inventory pass alone must not turn a zero-execution run into an inference pass.
@@ -525,8 +606,31 @@ def main(argv=None):
             report["exit_code"] = 1 if any(r["status"] == "fail" for r in runtime_results) else 0
     except KeyboardInterrupt:
         cancelled = True
-        report["results"].append({"id": "run-cancelled", "status": "untested", "reason": "Interrupted by user; remaining cases were not executed"})
-        report["exit_code"] = 130
+        cleanup = unsafe_process_state()
+        if cleanup is None:
+            report["results"].append({"id": "run-cancelled", "status": "untested", "reason": "Interrupted by user; remaining cases were not executed"})
+            report["exit_code"] = 130
+        else:
+            failure = {"id": "run-cancelled", "status": "fail", "reason": "Interrupted with unverified owned-process cleanup",
+                       "containment_failure": True, "teardown": cleanup.get("teardown"), "process_evidence": cleanup}
+            report["results"].append(failure)
+            halt = record_execution_halt(report, failure)
+            # Cancellation must still disclose untouched selected coverage when
+            # resources may remain owned. All operations below are inventory-only.
+            for pending in locals().get("presets", []):
+                pending_cases = [scenarios[s] for s in pending.get("scenarios", []) if selected(s, args.scenarios)]
+                decisions = [d.get("selected") for d in report.get("backend_selections", []) if d["preset"] == pending["id"] and d.get("selected")]
+                pending_backends = (decisions[-1:] or ["auto"]) if args.backend == "auto" else select_backends(args.backend, pending.get("backends", []), hardware) or ["none"]
+                append_halted_cases(report, pending, pending_backends, pending_cases, halt)
+            existing_ids = {row["id"] for row in report["results"]}
+            if args.include_suites:
+                from .suites import list_suites
+                report["results"].extend({"id": spec["id"], "status": "untested", "reason": UNSAFE_RESOURCES_REASON,
+                    "stage": "execution_halted", "halt_trigger": halt["trigger_case"]} for spec in list_suites(repo) if spec["id"] not in existing_ids)
+            if args.native_test_build_dir and "native_ctest" not in existing_ids:
+                report["results"].append({"id": "native_ctest", "status": "untested", "reason": UNSAFE_RESOURCES_REASON,
+                    "stage": "execution_halted", "halt_trigger": halt["trigger_case"]})
+            report["exit_code"] = 1
     except (ValueError, OSError, KeyError, TypeError, RuntimeError) as error:
         report["results"].append({"id": "harness-error", "status": "fail", "reason": str(error), "stage": "configuration"})
         report["exit_code"] = 2

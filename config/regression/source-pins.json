@@ -149,6 +149,34 @@
           "role": "weights"
         }
       ]
+    },
+    {
+      "repository": "unsloth/Qwen3.5-0.8B-GGUF",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "architecture": "qwen35",
+      "metadata_url": "https://huggingface.co/api/models/unsloth/Qwen3.5-0.8B-GGUF/revision/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0?blobs=true",
+      "repository_url": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/tree/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "metadata_sha256": "3e56dfff75a36a62b24227c09ca1c8509672a0b4a1b9b69a608c3a5623269f72",
+      "metadata_bytes": 16501,
+      "gated": false,
+      "config": "config/qwen3.5-0.8b.json",
+      "base_model": "Qwen/Qwen3.5-0.8B",
+      "license": "apache-2.0",
+      "publisher_reference": "config/qwen3.5-9b-q8.json",
+      "files": [
+        {
+          "path": "Qwen3.5-0.8B-Q8_0.gguf",
+          "size_bytes": 811843840,
+          "sha256": "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c",
+          "role": "weights"
+        },
+        {
+          "path": "mmproj-F16.gguf",
+          "size_bytes": 204987232,
+          "sha256": "56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453",
+          "role": "projector"
+        }
+      ]
     }
   ]
 }

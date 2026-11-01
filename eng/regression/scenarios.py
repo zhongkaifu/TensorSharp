@@ -38,6 +38,7 @@ _NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 _PROMPT = "What is 7 multiplied by 8? Reply with only the integer answer."
 _ANSWER = r"^\s*56[.!]?\s*$"
 _SESSION_MARKER = "REGRESSION_COBALT_7319"
+_SESSION_MARKER_B = "REGRESSION_AMBER_4826"
 _TOOL = {"name": "get_regression_value", "description": "Return a synthetic regression fixture value.",
          "parameters": {"type": "object", "properties": {"key": {"type": "string", "enum": ["fixture"]}},
                         "required": ["key"], "additionalProperties": False}}
@@ -582,7 +583,7 @@ class _Http:
                 self.result["evidence"]["request_correlation"] = {"requested": request_id,
                     "echoed": response.headers.get("X-TensorSharp-Request-Id")}
             if request_id and response.headers.get("X-TensorSharp-Request-Id") != request_id:
-                raise ScenarioUntested("server did not echo request correlation ID; cancellation cannot be attributed")
+                raise ScenarioUntested("server did not echo request correlation ID; request evidence cannot be attributed")
             if "text/event-stream" not in response.headers.get("Content-Type", ""):
                 raise ScenarioFailure("stream is not text/event-stream")
             size = 0
@@ -825,7 +826,7 @@ def _server(case, context, result):
         elif kind == "server_cancel":
             _cancel(http, payload, context, result)
         elif kind == "server_reset_cache":
-            _reset_and_cache(http, payload, result)
+            _reset_and_cache(http, payload, result, context)
         else:
             first = validate_chat(http.json("/v1/chat/completions", payload), expected_model=model, max_tokens=payload["max_tokens"])
             if kind == "server_stream":
@@ -848,26 +849,121 @@ def _server(case, context, result):
                  "verified empty owned process container", item.get("teardown"))
 
 
-def _reset_and_cache(http, payload, result):
+def _session_public_prefix(log_root, request_id):
+    """Return the measured public prefix for this exact owned HTTP request."""
+    records = []
+    for path in sorted(Path(log_root).glob("tensorsharp-server-*.jsonl"))[:16]:
+        with path.open("rb") as stream:
+            raw = stream.read(8 * 1024 * 1024 + 1)
+        if len(raw) > 8 * 1024 * 1024:
+            return None
+        for line in raw.decode("utf-8", "replace").splitlines():
+            try:
+                record = _json_loads(line)
+            except ValueError:
+                continue
+            if (isinstance(record, dict) and isinstance(record.get("scope"), dict)
+                    and record["scope"].get("RequestId") == request_id
+                    and str(record.get("message", "")).startswith("prompt.shared_prefix ")
+                    and isinstance(record.get("props"), dict)):
+                value = record["props"].get("SharedPrefixTokens")
+                if type(value) is int and value >= 0:
+                    records.append(record)
+    return {"tokens": max(r["props"]["SharedPrefixTokens"] for r in records), "records": records} if records else None
+
+
+def _reset_and_cache(http, payload, result, context):
     sessions = []
+    missing_controls = []
     try:
         for _ in range(2):
             sessions.append(http.json("/api/sessions", {})["sessionId"])
         _require(result, "independent sessions created", len(set(sessions)) == 2)
-        def chat(session, prompt):
-            body = {"sessionId": session, "messages": [{"role": "user", "content": prompt}],
-                    "maxTokens": 128, "temperature": 0, "seed": 42, "think": False, "newChat": True}
-            return http.stream("/api/chat", body, web_ui=True)["content"]
-        marker_answer = chat(sessions[0], "My session marker is " + _SESSION_MARKER + ". Reply with only my session marker.")
-        _require(result, "session A sees its synthetic marker", _SESSION_MARKER in marker_answer, _SESSION_MARKER, marker_answer)
-        isolated = chat(sessions[1], "What session marker was stated in earlier messages of this conversation? If no marker was stated, reply with only NONE.")
+        histories = {session: [] for session in sessions}
+        # /api/chat is a full-history protocol. The session owns raw assistant-token
+        # replay and a cache scope; it does not append omitted user messages for us.
+        def chat(session, prompt, *, new_chat=False):
+            if new_chat:
+                histories[session] = []
+            messages = histories[session] + [{"role": "user", "content": prompt}]
+            body = {"sessionId": session, "messages": messages,
+                    "maxTokens": 128, "temperature": 0, "seed": 42, "think": False, "newChat": new_chat}
+            request_id = "regression-session-" + uuid.uuid4().hex
+            response = http.stream("/api/chat", body, web_ui=True, request_id=request_id)
+            response["request_id"] = request_id
+            histories[session] = messages + [{"role": "assistant", "content": response["content"]}]
+            return response
+
+        def marker(response, own, other, name):
+            answer = response["content"]
+            _require(result, name, re.fullmatch(r"\s*" + re.escape(own) + r"[.!]?\s*", answer) is not None
+                     and other not in answer, own, answer)
+
+        def reused(response):
+            usage = response["usage"]
+            count, prompt_count = usage.get("kvReusedTokens"), usage.get("promptTokens")
+            _require(result, "valid session cache accounting", type(count) is int and type(prompt_count) is int
+                     and 0 <= count <= prompt_count, "integer 0 <= kvReusedTokens <= promptTokens", usage)
+            return count
+
+        def retained(name, cold, control, after):
+            cold_count, control_count, after_count = reused(cold), reused(control), reused(after)
+            flush_deadline = min(http.deadline, time.monotonic() + 2)
+            while True:
+                control_prefix = _session_public_prefix(Path(context["artifact_dir"]) / "host-logs", control["request_id"])
+                after_prefix = _session_public_prefix(Path(context["artifact_dir"]) / "host-logs", after["request_id"])
+                if (control_prefix is not None and after_prefix is not None) or time.monotonic() >= flush_deadline:
+                    break
+                time.sleep(0.05)
+            evidence = {
+                "cold_reused_tokens": cold_count, "self_followup_reused_tokens": control_count,
+                "after_other_session_reused_tokens": after_count, "self_followup_public_prefix": control_prefix,
+                "after_other_session_public_prefix": after_prefix}
+            result["evidence"].setdefault("session_cache_controls", {})[name] = evidence
+            # Primary-only backends can legitimately lose the live state on a
+            # session switch; retained holders may also be evicted under pressure.
+            # Qualify retention only with observed reuse beyond both exact public
+            # boundaries. Missing retention is untested, never a false pass or an
+            # unsupported promise that every backend retains every conversation.
+            if (control_prefix is None or after_prefix is None
+                    or control_count <= control_prefix["tokens"] or after_count <= after_prefix["tokens"]):
+                missing_controls.append(name)
+                return
+            _require(result, name + " private-cache retention survives other session", True,
+                     "self-followup and cross-session reuse exceed their measured public prefixes", evidence)
+
+        recall = "What session marker was stated in earlier messages of this conversation? If no marker was stated, reply with only NONE. Otherwise reply with only that marker."
+        # Enough synthetic user text to cross a cache block on supported models,
+        # while both histories remain comfortably inside the 2048-token fixture.
+        padding = "Synthetic retention fixture. " * 24
+        def store_marker(value):
+            return padding + "My session marker is " + value + ". Reply with only my session marker."
+        first_a = chat(sessions[0], store_marker(_SESSION_MARKER), new_chat=True)
+        marker(first_a, _SESSION_MARKER, _SESSION_MARKER_B, "session A sees its synthetic marker")
+        control_a = chat(sessions[0], recall)
+        marker(control_a, _SESSION_MARKER, _SESSION_MARKER_B, "session A recalls its marker before B starts")
+        first_b = chat(sessions[1], recall, new_chat=True)
+        isolated = first_b["content"]
         _require(result, "session B cannot recover A marker", _SESSION_MARKER not in isolated and re.fullmatch(r"\s*NONE[.!]?\s*", isolated, re.I) is not None,
                  "NONE, without the marker supplied only to A", isolated)
-        reset = chat(sessions[0], _PROMPT)
-        fresh = chat(sessions[1], _PROMPT)
+        after_b = chat(sessions[0], recall)
+        marker(after_b, _SESSION_MARKER, _SESSION_MARKER_B, "session A recalls its marker after B starts")
+        retained("A after B starts", first_a, control_a, after_b)
+        marker(chat(sessions[1], store_marker(_SESSION_MARKER_B)), _SESSION_MARKER_B, _SESSION_MARKER,
+               "session B sees only its own synthetic marker")
+        control_b = chat(sessions[1], recall)
+        marker(control_b, _SESSION_MARKER_B, _SESSION_MARKER, "session B recalls its marker before A resets")
+        reset = chat(sessions[0], _PROMPT, new_chat=True)["content"]
+        after_reset_a = chat(sessions[1], recall)
+        marker(after_reset_a, _SESSION_MARKER_B, _SESSION_MARKER, "session B recalls its marker after A resets")
+        retained("B after A resets", first_b, control_b, after_reset_a)
+        fresh = chat(sessions[1], _PROMPT, new_chat=True)["content"]
         _require(result, "newChat reset matches independent-session answer", reset == fresh and re.search(_ANSWER, reset) is not None
                  and _SESSION_MARKER not in reset, fresh, reset)
-        result["evidence"]["session_isolation_scope"] = "One synthetic marker across two distinct session IDs; not a general privacy guarantee."
+        result["evidence"]["session_isolation_scope"] = (
+            "Two full-history conversations: A self-followup -> B starts -> A followup; "
+            "B self-followup -> A resets -> B followup. Own-marker answers and retained KV controls are separate assertions. "
+            "newChat arithmetic checks a fresh request boundary, not implicit server-side history recall or a general privacy guarantee.")
     finally:
         for session in sessions:
             route = "/api/sessions/" + urllib.parse.quote(session, safe="")
@@ -892,6 +988,9 @@ def _reset_and_cache(http, payload, result):
     if reused <= 0:
         raise ScenarioUntested("reset and replay assertions passed, but no positive prefix-cache hit was observed; cache coverage remains untested")
     _require(result, "prefix-cache hit observed", True, ">0 cached_tokens", reused)
+    if missing_controls:
+        raise ScenarioUntested("semantic session checks passed, but private-cache retention was not demonstrated for: "
+                               + ", ".join(missing_controls) + "; retained-session coverage remains untested")
 
 
 def run_scenario(case, context):

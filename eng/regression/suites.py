@@ -5,7 +5,8 @@ import shutil
 import sys
 import xml.etree.ElementTree as ET
 
-from .processes import run_process
+from .processes import (run_process, containment_failure_evidence, unsafe_process_state,
+                        UNSAFE_RESOURCES_REASON, ProcessContainmentError)
 
 
 def list_suites(repo):
@@ -48,9 +49,14 @@ def trx_counts(path):
 def run_suites(repo, output, mode, allow_builds, timeout_seconds):
     repo, output = Path(repo), Path(output)
     results, dotnet = [], shutil.which("dotnet")
+    halt = unsafe_process_state() if mode == "run" else None
     for spec in list_suites(repo):
         result = {"id": spec["id"], "scope": spec.get("scope", "client contracts without model execution"),
                   "assertions": spec["assertions"], "status": "untested", "reason": "planned; suite not executed"}
+        if halt is not None:
+            result.update(reason=UNSAFE_RESOURCES_REASON, stage="execution_halted")
+            results.append(result)
+            continue
         if mode != "run":
             results.append(result)
             continue
@@ -98,6 +104,13 @@ def run_suites(repo, output, mode, allow_builds, timeout_seconds):
                                       env={"TENSORSHARP_GGML_NATIVE_ENABLE_CUDA": "OFF", "TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN": "OFF",
                                            "TENSORSHARP_CUDNN": "OFF", "TS_TEST_GGML_BACKEND": "cpu"})
                 result["processes"].append(process)
+                containment = containment_failure_evidence(process)
+                if containment is not None:
+                    halt = containment
+                    result.update(containment_failure=True, containment_evidence=containment)
+                    result["remaining_commands"] = [{"command": pending, "status": "untested", "reason": UNSAFE_RESOURCES_REASON}
+                                                    for pending in commands[index + 1:]]
+                    raise ValueError(UNSAFE_RESOURCES_REASON)
                 if process["exit_code"] != 0 or process.get("timed_out"):
                     raise ValueError(f"suite process failed or timed out at step {index}; see sanitized logs")
                 is_assertion_command = spec["kind"] != "dotnet" and not (len(command) > 1 and command[0] == dotnet and command[1] in {"build", "restore"})
@@ -120,6 +133,10 @@ def run_suites(repo, output, mode, allow_builds, timeout_seconds):
                 if spec["kind"] == "client_native" and "7 completion boundary checks passed" not in content:
                     raise ValueError("completion boundary checks did not complete")
             result.update(status="pass", reason="existing suite assertions passed; detailed counts/scope retained")
+        except ProcessContainmentError as error:
+            halt = error.evidence
+            result.update(status="fail", reason=UNSAFE_RESOURCES_REASON,
+                          containment_failure=True, containment_evidence=halt)
         except (OSError, ValueError, ET.ParseError) as error:
             result.update(status="fail", reason=str(error))
         results.append(result)

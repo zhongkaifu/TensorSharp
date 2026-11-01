@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from regression.processes import ManagedProcess, _WindowsJob, run_process
+from regression.processes import ManagedProcess, _WindowsJob, run_process, ProcessContainmentError
 import regression.processes as processes
 
 
@@ -42,6 +42,9 @@ def alive(pid):
 
 class ProcessContainmentTests(unittest.TestCase):
     def setUp(self):
+        state = patch.object(processes, "_unsafe_resources", None)
+        state.start()
+        self.addCleanup(state.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -174,6 +177,11 @@ class ProcessContainmentTests(unittest.TestCase):
         self.assertEqual(125, uncertain["exit_code"])
         self.assertEqual(0, uncertain["parent_exit_code"])
         self.assertTrue(uncertain["containment_failure"])
+        with patch.object(processes.subprocess, "Popen") as launch:
+            with self.assertRaises(ProcessContainmentError):
+                ManagedProcess([sys.executable, "-c", "raise Exception('must not launch')"],
+                               cwd=self.root, artifact_dir=self.root, stage="blocked")
+            launch.assert_not_called()
         # The real job/group was already verified empty; avoid re-querying its
         # closed handle during test cleanup after this synthetic report check.
         process.teardown.update(verified=True)

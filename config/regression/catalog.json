@@ -139,6 +139,7 @@
         "agent-qwen3.8-27b",
         "auto-download",
         "cli-basic",
+        "qwen3.5-0.8b",
         "qwen3.5-9b-iq4_xs",
         "qwen3.5-9b-q8",
         "qwen3.5-9b-uncensored-q8",
@@ -2827,6 +2828,62 @@
       "status": "configured"
     },
     {
+      "id": "qwen3.5-0.8b",
+      "config": "config/qwen3.5-0.8b.json",
+      "kind": "text",
+      "family": "qwen35",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda",
+        "mlx"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image"
+      ],
+      "source_evidence": [
+        "config/qwen3.5-0.8b.json",
+        "config/regression/source-pins.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Model.cs",
+        "TensorSharp.Models/Models/Qwen35/Qwen35VisionEncoder.cs",
+        "InferenceWeb.Tests/DirectCudaRealModelTests.cs",
+        "docs/models/qwen35.md"
+      ],
+      "layout": "dense",
+      "status": "configured",
+      "file_sizes": {
+        "Qwen3.5-0.8B-Q8_0.gguf": 811843840,
+        "mmproj-F16.gguf": 204987232
+      },
+      "notes": [
+        "Small dense Q8_0 representative with optional matching image projector. Publisher metadata confirms qwen35 and exact pinned file identities; local file integrity and runtime qualification require execution.",
+        "The direct cuda route uses the generic Qwen35Model for Q8_0, not the NVFP4-only whole-model executor. No learned draft or speculative scenario is implied.",
+        "The F16 vision projector is converted to F32 on load; its 204987232-byte download is not a resident-memory estimate. Include model, expanded vision weights and scratch in a full image plan."
+      ]
+    },
+    {
       "id": "qwen3.5-9b-iq4_xs",
       "config": "config/qwen3.5-9b-iq4_xs.json",
       "kind": "text",
@@ -3647,14 +3704,17 @@
       "id": "server_reset_cache",
       "entry_point": "TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll",
       "status": "automated",
-      "recipe": "Repeat fixed conversations, reset owned session, repeat prompt",
+      "recipe": "Run full-history A -> B -> A and B -> A-reset -> B conversations, then repeat a fixed public-prefix request",
       "assertions": [
-        "Two distinct sessions execute a synthetic marker fixture: session A can repeat its marker, session B answers NONE without it.",
-        "After newChat reset, the arithmetic answer equals the independent-session answer; both sessions are deleted and repeated deletion returns 404.",
-        "Identical long-prefix replay preserves the answer and reports positive cached_tokens; without observed cache reuse the combined scenario remains untested. These fixtures do not establish general privacy or raw KV equivalence."
+        "Two distinct full-history conversations recall their own markers after interleaving; initially empty session B answers NONE and never receives A's marker. newChat is true only at each initial request and explicit reset.",
+        "Adjacent self-followup and interleaved followup must both report KV reuse beyond their request-correlated measured public-prefix boundaries. Missing telemetry, primary-only reuse, or lost/evicted retained state leaves retention untested; semantic correctness alone cannot pass.",
+        "After explicit newChat reset, the arithmetic answer equals the independent-session fresh-boundary answer; both sessions are deleted and repeated deletion returns 404.",
+        "Identical long-prefix replay preserves the answer and reports positive cached_tokens; without observed cache reuse the combined scenario remains untested. Full-history fixtures do not imply omitted server-side history recall, general privacy, or raw KV equivalence."
       ],
       "evidence": [
         "TensorSharp.Server/Endpoints/SessionEndpoints.cs",
+        "TensorSharp.Chat/ChatSession.cs",
+        "TensorSharp.Chat/ChatGenerationPipeline.cs",
         "InferenceWeb.Tests/ChatSessionCacheIsolationTests.cs",
         "eng/regression/scenarios.py"
       ],
@@ -3849,7 +3909,7 @@
       "assertions": [
         "All 36 gold decisions match; probability vectors are finite, normalized and correctly ordered, with consistent argmax and weighted scores.",
         "Model identity, question ownership, typed nonnegative usage and one-step seed/sample diagnostics match.",
-        "Fixed-seed probability replay stays within 1e-5; malformed decision inputs return 400/422."
+        "Fixed-seed probability replay stays within 1e-5; malformed decision inputs return exact 422 validation_error envelopes with current-request evidence."
       ],
       "evidence": [
         "eng/regression/jev.py",
@@ -4071,7 +4131,7 @@
       "recipe": "Generate two 128x128 Qwen images with seed42, base2 or Turbo8 steps; validate four malformed requests and strict same-origin PNG downloads.",
       "assertions": [
         "Requested backend/model and qwen_image architecture are positively identified.",
-        "Complete bounded PNG CRC/IHDR/IEND/zlib/filter decoding, exact dimensions/RGBA8 and visible nonconstant pixels.",
+        "Complete bounded PNG CRC/IHDR/IEND/zlib/filter decoding, exact dimensions and visible nonconstant pixels; RGB/RGBA8 and noninterlaced gray/palette variants normalize to RGBA8. Legal 16-bit/Adam7 encodings remain untested by this decoder.",
         "Malformed prompt/dimensions/parameter types return typed 400 diagnostics; repeat SHA values recorded as observation only. Semantic quality, internal float traces and bitwise repeatability are not qualified."
       ],
       "evidence": [

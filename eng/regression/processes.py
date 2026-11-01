@@ -15,6 +15,50 @@ import sys
 _SECRET_KEY = re.compile(r"(?:TOKEN|PASSWORD|SECRET|API[_-]?KEY|CREDENTIAL|AUTHORIZATION)", re.I)
 _PREFIXES = ("TS_", "TENSORSHARP_", "GDN_", "QWEN35_", "FUSED_", "DIFFUSION_")
 _SETTING_KEYS = {"KV_CACHE_DTYPE", "MAX_CONTEXT", "MAX_TOKENS", "VIDEO_MAX_FRAMES", "VIDEO_SAMPLE_FPS"}
+UNSAFE_RESOURCES_REASON = "Unsafe owned resources: process cleanup was not verified; remaining execution halted"
+_unsafe_resources = None
+
+
+def containment_failure_evidence(value):
+    """Find explicit failure or attempted-but-unverified teardown, even in a pass."""
+    if isinstance(value, dict):
+        teardown = value.get("teardown")
+        if value.get("containment_failure") or (isinstance(teardown, dict) and teardown.get("attempted") and teardown.get("verified") is not True):
+            return {key: value[key] for key in ("stage", "command", "owned_pid", "exit_code", "parent_exit_code", "containment_failure", "teardown", "stdout_path", "stderr_path") if key in value}
+        for child in value.values():
+            found = containment_failure_evidence(child)
+            if found is not None:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            found = containment_failure_evidence(child)
+            if found is not None:
+                return found
+    return None
+
+
+class ProcessContainmentError(RuntimeError):
+    def __init__(self, evidence):
+        super().__init__(UNSAFE_RESOURCES_REASON)
+        self.evidence = evidence
+
+
+def unsafe_process_state():
+    return _unsafe_resources
+
+
+def _record_unsafe_resources(result):
+    global _unsafe_resources
+    evidence = containment_failure_evidence(result)
+    if evidence is not None and _unsafe_resources is None:
+        _unsafe_resources = evidence
+
+
+def require_safe_process_launch():
+    # Sticky for this interpreter: a later parent exit or a new model must never
+    # silently clear uncertainty about previously owned descendants.
+    if _unsafe_resources is not None:
+        raise ProcessContainmentError(_unsafe_resources)
 
 
 def redact(value: str, secrets=()) -> str:
@@ -245,6 +289,7 @@ class ManagedProcess:
             raise ValueError("command must be a nonempty argv list, never a shell command")
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", stage):
             raise ValueError("invalid artifact stage")
+        require_safe_process_launch()
         self.command = [str(x) for x in command]
         self.artifact_dir, self.stage = Path(artifact_dir), stage
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -396,6 +441,7 @@ class ManagedProcess:
                 "duration_seconds": round(time.monotonic() - self.started, 4),
                 "stdout": out, "stderr": err, "output_truncated": out_cut or err_cut,
                 "stdout_path": str(out_file), "stderr_path": str(err_file)}
+        _record_unsafe_resources(result)
         # In particular, cancellation must leave teardown evidence even though
         # run_process re-raises KeyboardInterrupt instead of returning a result.
         metadata = {k: v for k, v in result.items() if k not in {"stdout", "stderr"}}

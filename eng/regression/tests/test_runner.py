@@ -92,6 +92,109 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual("skip", report["results"][-1]["status"])
         self.run.assert_not_called()
 
+    def containment_fixture(self, process):
+        first = self.catalog_data["presets"][0]
+        first["scenarios"] = ["cli_text", "cli_decode"]
+        self.catalog_data["presets"] = [first, {**first, "id": "next-model"}]
+        self.catalog_data["scenarios"].append({"id": "cli_decode", "kind": "cli_decode", "status": "automated"})
+        self.catalog.write_text(json.dumps(self.catalog_data))
+        # A buggy adapter claiming success must not hide uncertain cleanup.
+        self.run.side_effect = [{"status": "pass", "reason": "semantic fixture passed", "processes": [process]},
+                                AssertionError("later scenario must never start")]
+
+    def test_containment_failure_halts_remaining_scenarios_models_backends_and_suites(self):
+        self.containment_fixture({"stage": "decode", "exit_code": 125, "parent_exit_code": 0,
+            "containment_failure": True, "teardown": {"attempted": True, "verified": False, "reason": "child remains"}})
+        with patch("regression.suites.run_suites") as suite_run, patch("regression.ctest.run_native_tests") as native_run, \
+             patch.object(runner, "sizes_for", wraps=runner.sizes_for) as size_probe:
+            exit_code, report = self.invoke("--mode", "run", "--backend", "all", "--include-suites",
+                "--native-test-build-dir", str(self.repo / "native-build"), "--allow-download")
+        self.assertEqual(1, exit_code)
+        self.assertEqual(1, self.run.call_count)
+        self.assertEqual(1, self.prepare.call_count, "next model must not prepare/download")
+        self.assertEqual(1, self.config.call_count, "next model must not resolve files")
+        self.assertEqual(1, size_probe.call_count, "next model must not probe network metadata")
+        suite_run.assert_not_called()
+        native_run.assert_not_called()
+        model_results = [row for row in report["results"] if row.get("preset")]
+        self.assertEqual(8, len(model_results))
+        self.assertEqual("fail", model_results[0]["status"])
+        self.assertTrue(all(row["status"] == "untested" for row in model_results[1:]))
+        self.assertIn("Unsafe owned resources", report["execution_halt"]["reason"])
+        remaining_suites = [row for row in report["results"] if row["id"] not in {"config-coverage-audit"} and not row.get("preset")]
+        self.assertEqual(6, len(remaining_suites))
+        self.assertTrue(all(row["status"] == "untested" for row in remaining_suites))
+        self.assertEqual("child remains", model_results[0]["processes"][0]["teardown"]["reason"])
+
+    def test_attempted_teardown_unknown_halts_even_without_failure_flag(self):
+        self.containment_fixture({"stage": "server", "exit_code": 0,
+                                  "teardown": {"attempted": True, "verified": None}})
+        exit_code, report = self.invoke("--mode", "run")
+        self.assertEqual(1, exit_code)
+        self.assertEqual(1, self.run.call_count)
+        self.assertEqual(1, self.prepare.call_count)
+        model_results = [row for row in report["results"] if row.get("preset")]
+        self.assertEqual(["fail", "untested", "untested", "untested"], [row["status"] for row in model_results])
+
+    def test_suite_containment_failure_blocks_later_native_suite(self):
+        suite_result = {"id": "server_unit", "status": "fail", "reason": "cleanup uncertain",
+                        "processes": [{"exit_code": 0, "teardown": {"attempted": True, "verified": None}}]}
+        with patch("regression.suites.run_suites", return_value=[suite_result]), \
+             patch("regression.ctest.run_native_tests") as native_run:
+            exit_code, report = self.invoke("--mode", "run", "--include-suites",
+                "--native-test-build-dir", str(self.repo / "native-build"))
+        self.assertEqual(1, exit_code)
+        native_run.assert_not_called()
+        self.assertEqual("native_ctest", report["results"][-1]["id"])
+        self.assertEqual("untested", report["results"][-1]["status"])
+
+    def test_adapter_omitting_failed_process_cannot_bypass_central_guard(self):
+        self.containment_fixture({})
+        self.run.side_effect = [{"status": "pass", "reason": "adapter forgot process metadata"},
+                                AssertionError("must not run")]
+        state = {"containment_failure": True, "teardown": {"attempted": True, "verified": False}}
+        with patch.object(runner, "unsafe_process_state", side_effect=[None, state]):
+            exit_code, report = self.invoke("--mode", "run")
+        self.assertEqual(1, exit_code)
+        self.assertEqual(1, self.run.call_count)
+        self.assertEqual(1, self.prepare.call_count)
+        self.assertIn("execution_halt", report)
+
+    def test_cancellation_with_unverified_cleanup_fails_and_marks_remaining_untested(self):
+        self.containment_fixture({})
+        self.run.side_effect = KeyboardInterrupt()
+        state = {"containment_failure": True, "teardown": {"attempted": True, "verified": False}}
+        with patch.object(runner, "unsafe_process_state", side_effect=[None, state]):
+            exit_code, report = self.invoke("--mode", "run")
+        self.assertEqual(1, exit_code)
+        self.assertTrue(report["cancelled"])
+        self.assertEqual(1, self.prepare.call_count)
+        models = [row for row in report["results"] if row.get("preset")]
+        self.assertEqual(4, len(models))
+        self.assertTrue(all(row["status"] == "untested" for row in models))
+
+    def test_reproduce_output_is_unique_sibling_and_preserves_model_locations(self):
+        original = self.repo / "selected-volume" / "original-results"
+        original.mkdir(parents=True)
+        marker = original / "existing-evidence.txt"
+        marker.write_text("unchanged")
+        model_root = self.repo / "model-volume"
+        existing_root = self.repo / "read-only-model-volume"
+        args = runner.parse_args(["--output", str(original), "--model-root", str(model_root),
+                                  "--existing-root", str(existing_root)])
+        preset, scenario = self.catalog_data["presets"][0], self.catalog_data["scenarios"][0]
+        first = runner.reproduce_args(args, self.repo, model_root, preset, "cpu", scenario)
+        second = runner.reproduce_args(args, self.repo, model_root, preset, "cpu", scenario)
+        one, two = (Path(command[command.index("--output") + 1]) for command in (first, second))
+        self.assertEqual(original.parent, one.parent)
+        self.assertEqual(one.parent, two.parent)
+        self.assertNotEqual(one, two)
+        self.assertNotEqual(original, one)
+        self.assertFalse(one.exists())
+        self.assertEqual("unchanged", marker.read_text())
+        self.assertEqual(str(model_root), first[first.index("--model-root") + 1])
+        self.assertEqual(str(existing_root), first[first.index("--existing-root") + 1])
+
     def test_backend_unavailable_never_falls_back(self):
         self.hardware.return_value = machine()
         self.hardware.return_value["backends"]["ggml_cpu"]["available"] = False
@@ -165,6 +268,10 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--ram-budget-gib", command)
         self.assertIn("--assume-backend-available", command)
         self.assertIn(str(existing_root), command)
+        reproduction_output = Path(command[command.index("--output") + 1])
+        self.assertEqual(self.output.parent, reproduction_output.parent)
+        self.assertNotEqual(self.output, reproduction_output)
+        self.assertFalse(reproduction_output.exists())
 
     def test_external_engine_source_is_separate_and_preserved_for_reproduction(self):
         engine = self.repo / "engine-checkout"

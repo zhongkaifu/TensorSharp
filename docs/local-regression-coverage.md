@@ -11,7 +11,7 @@ cells separately from passes.
 The machine-readable inventory is
 [`config/regression/catalog.json`](../config/regression/catalog.json), checked
 against [`catalog.schema.json`](../config/regression/catalog.schema.json).
-It inventories all 65 host presets, overlays and LoRA documents under `config/`
+It inventories all 66 host presets, overlays and LoRA documents under `config/`
 (excluding its own `config/regression/` metadata), 23 architecture/embedding/
 special-quantization family records and seven backend names. The audit report
 records the current scenario count and execution classification.
@@ -47,7 +47,7 @@ companions and requested scenario may narrow these sets further.
 | Family | Config coverage | Backend restrictions and remaining scope |
 |---|---|---|
 | Gemma 4 | E4B, 12B, 26B-A4B; dense and MoE | Seven routes; matching media/MTP companions needed. Quantized KV is declined. Other sizes/quants require separate qualification. |
-| Qwen 3.5/3.6/3.8 27B | Dense 9B/27B, MoE 35B-A3B; portable non-agent 3.8 preset added | Seven routes; direct CUDA whole-model fast path depends on quantization. Image coverage requires matching projector. |
+| Qwen 3.5/3.6/3.8 27B | Dense 0.8B/9B/27B, MoE 35B-A3B; portable small 0.8B and non-agent 3.8 presets added | Seven routes; direct CUDA whole-model fast path depends on quantization. Image coverage requires matching projector. |
 | Qwen3.8 Flash Next | Complete three-shard preset, vision; MTP overlay added | Six routes, MLX refused. Shared MTP head only on GGML. Sparse attention requires f16/f32 KV. No automatic assumption that SSD offload makes the model fit. |
 | Bonsai2 | PTQ1_0 + optional projector added | Single-device four GGML routes only. PTQ1_0 repacks about 29% larger; download size is not resident weight size. PQ2_0 and other variants remain separate coverage. |
 | GPT-OSS | 20B Q8_0 | Seven routes; MoE, always reasons, text only. |
@@ -72,17 +72,27 @@ The first 12 new family presets copy immutable URLs, SHA-256 and file identities
 `ModelCatalog.cs` and the Bonsai2 card. These are repository-source provenance
 checks; they do not claim fresh network validation or model execution.
 
-Three additional family presets use fresh metadata-only verification on
+Four additional presets use fresh metadata-only verification on
 2026-11-01. Each publisher manifest was reread at its immutable revision, with
 an exact repository architecture, ungated status and complete LFS file
 SHA-256/size entries: [Muse-Glimmer](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/tree/faa5b025c584459c13febfa5c59883516710ae39),
 [Muse-Spark](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/tree/c00670568b6ce5e56a247f67091247984df2a01e),
-and [MiniMax-M3.1](https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/tree/b17b7f5459c0b8f127ea12ee774409b282521d6a).
-The 18 selected file identities and metadata response hashes are preserved in
+[MiniMax-M3.1](https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/tree/b17b7f5459c0b8f127ea12ee774409b282521d6a),
+and [Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/tree/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0).
+The 20 selected file identities and metadata response hashes are preserved in
 [`source-pins.json`](../config/regression/source-pins.json). No model weights
 were downloaded for this verification. Every registered family now has at
 least a representative config, which does not cover every size, quantization,
 optional companion, backend or scenario.
+
+The small Qwen preset uses `Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf`
+(811,843,840 bytes) and optional `mmproj-F16.gguf` (204,987,232 bytes).
+Set the runner's `--model-root` to their parent folder to reuse this layout.
+These names and sizes match the supplied local inventory; the actual local
+SHA-256 values still require verification before execution. The publisher's
+metadata identifies the official `Qwen/Qwen3.5-0.8B` base and the implemented
+`qwen35` architecture. `DirectCudaRealModelTests` already contains a 0.8B
+regression target; that source evidence does not mean it ran in this session.
 
 No speculative model URL, revision or checksum was invented. Known byte sizes
 are copied into catalog `file_sizes` by matching SHA-256; absent sizes remain
@@ -134,8 +144,10 @@ requiring identical token IDs and finish reason plus positive draft/accept/
 verify counters. It does not establish learned MTP/DFlash/DSpark coverage.
 
 `image_generation_smoke` validates four malformed requests and two bounded
-128px Qwen-Image outputs, including strict same-origin retrieval, full PNG
-decoding and visible nonconstant pixels. Seeded output hashes are observations;
+128px Qwen-Image outputs, including strict same-origin retrieval, bounded PNG
+decoding and visible nonconstant pixels. RGB/RGBA8 and noninterlaced gray/palette
+outputs normalize to RGBA8; legal 16-bit/Adam7 encodings are explicitly untested
+with their local artifact and header retained. Seeded output hashes are observations;
 this adapter does not qualify semantic image quality or universal bitwise
 determinism. Invalid bounded payloads remain local diagnostic artifacts.
 Jev attachment/ASR checks remain a separate `jev_media` recipe.
@@ -158,6 +170,10 @@ protocol correctness.
   explicitly when retaining an older layout.
 - `qwen3.8-27b.json` reuses the agent preset's actual IQ3_XXS identity without
   enabling shell execution, network or package installs.
+- `qwen3.5-0.8b.json` adds a small dense representative with a matching optional
+  image projector, immutable hashes and exact file sizes for local planning.
+  Its CPU default is overridden by the runner's explicit backend selection;
+  the Q8_0 checkpoint does not use the NVFP4-only whole-model CUDA executor.
 - `qwen3.8-flash-next-mtp.json` is an overlay, requiring the base Flash Next
   config. It must not be treated as a standalone model.
 - LTX README text now reflects its runnable ungated required assets; optional

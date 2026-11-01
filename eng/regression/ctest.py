@@ -9,7 +9,8 @@ import re
 import shutil
 import xml.etree.ElementTree as ET
 
-from .processes import run_process
+from .processes import (run_process, containment_failure_evidence, unsafe_process_state,
+                        UNSAFE_RESOURCES_REASON, ProcessContainmentError)
 from .reports import file_hash
 
 
@@ -111,6 +112,9 @@ def run_native_tests(repo, build_dir, output, mode, backend="cpu", pattern=None,
               "reason": "planned; native tests were not executed", "processes": []}
     if mode != "run":
         return [result]
+    if unsafe_process_state() is not None:
+        result.update(reason=UNSAFE_RESOURCES_REASON, stage="execution_halted")
+        return [result]
     ctest = shutil.which("ctest")
     if not ctest:
         result.update(status="skip", reason="CTest unavailable")
@@ -136,6 +140,18 @@ def run_native_tests(repo, build_dir, output, mode, backend="cpu", pattern=None,
         discovery = run_process(common + ["--show-only=json-v1"], cwd=repo, artifact_dir=output,
                                 stage="discovery", timeout_seconds=min(timeout_seconds, 60))
         result["processes"].append(discovery)
+        containment = containment_failure_evidence(discovery)
+        if containment is not None:
+            result.update(status="fail", reason=UNSAFE_RESOURCES_REASON,
+                          containment_failure=True, containment_evidence=containment)
+            # Reading an already captured discovery payload is safe; use it to
+            # disclose selected native cases without starting another command.
+            try:
+                pending, omitted = inventory(json.loads(discovery.get("stdout", "")), backend, pattern)
+            except (ValueError, KeyError, TypeError):
+                return [result]
+            return [result] + [{"id": "native_ctest::" + test["name"], "status": "untested",
+                              "reason": UNSAFE_RESOURCES_REASON} for test in pending] + omitted
         if discovery["exit_code"] != 0 or discovery.get("timed_out"):
             raise ValueError("CTest discovery failed; see process evidence")
         selected, omitted = inventory(json.loads(discovery["stdout"]), backend, pattern)
@@ -152,6 +168,12 @@ def run_native_tests(repo, build_dir, output, mode, backend="cpu", pattern=None,
                                 timeout_seconds=timeout_seconds * len(selected) + 30,
                                 env={"CUDA_VISIBLE_DEVICES": str(gpu_index) if backend == "cuda" else ""})
         result["processes"].append(execution)
+        containment = containment_failure_evidence(execution)
+        if containment is not None:
+            result.update(status="fail", reason=UNSAFE_RESOURCES_REASON,
+                          containment_failure=True, containment_evidence=containment)
+            return [result] + [{"id": "native_ctest::" + test["name"], "status": "untested",
+                              "reason": UNSAFE_RESOURCES_REASON} for test in selected] + omitted
         rows = parse_results(junit, selected)
         if execution.get("timed_out") or (execution["exit_code"] != 0 and not any(row["status"] == "fail" for row in rows)):
             raise ValueError("native test process failed or timed out without matching failed test evidence")
@@ -159,6 +181,10 @@ def run_native_tests(repo, build_dir, output, mode, backend="cpu", pattern=None,
                       reason="individual native assertion outcomes retained; omitted tests remain explicit",
                       counts={status: sum(row["status"] == status for row in rows) for status in ("pass", "fail", "skip")})
         return [result] + rows + omitted
+    except ProcessContainmentError as error:
+        result.update(status="fail", reason=UNSAFE_RESOURCES_REASON,
+                      containment_failure=True, containment_evidence=error.evidence)
+        return [result]
     except (OSError, ValueError, KeyError, TypeError, ET.ParseError) as error:
         result.update(status="fail", reason=str(error))
         return [result]

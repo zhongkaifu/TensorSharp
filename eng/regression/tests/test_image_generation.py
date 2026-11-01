@@ -1,5 +1,6 @@
 """Synthetic PNG/HTTP fixtures; no model, GPU, network or image libraries."""
 import io
+import hashlib
 import json
 from pathlib import Path
 import struct
@@ -11,31 +12,44 @@ import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from regression import image_generation as image
-from regression.scenarios import ScenarioFailure
+from regression.scenarios import ScenarioFailure, ScenarioUntested
 
 
 def chunk(kind, content):
     return struct.pack(">I", len(content)) + kind + content + struct.pack(">I", zlib.crc32(kind + content) & 0xffffffff)
 
 
-def png(size=128, *, constant=False, transparent=False, changed=False, filters=(0,), raw=None, compressed=None, header=None):
+def png(size=128, *, constant=False, transparent=False, changed=False, filters=(0,), raw=None, compressed=None, header=None,
+        color=6, depth=8, palette=None, transparency=None, interlace=0):
+    channels = 3 if color == 2 else 4
+    if raw is None and interlace == 1:
+        raw = bytearray()
+        for start_x, start_y, step_x, step_y in ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8),
+                                                 (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)):
+            if start_x >= size:
+                continue
+            for y in range(start_y, size, step_y):
+                raw.append(0)
+                for x in range(start_x, size, step_x):
+                    raw.extend(((x * 3 + y) % 256, (y * 7 + x) % 256, 20, 255)[:channels])
     if raw is None:
-        raw, previous = bytearray(), bytes(size * 4)
+        raw, previous = bytearray(), bytes(size * channels)
         for y in range(size):
             row = bytes(value for x in range(size) for value in (
                 70 if constant else (x * 3 + y + int(changed)) % 256,
                 50 if constant else (y * 7 + x) % 256,
-                20, 0 if transparent else 255))
+                20, 0 if transparent else 255)[:channels])
             kind = filters[y % len(filters)]
             raw.append(kind)
             for i, value in enumerate(row):
-                a, b, c = (row[i - 4] if i >= 4 else 0), previous[i], (previous[i - 4] if i >= 4 else 0)
+                a, b, c = (row[i - channels] if i >= channels else 0), previous[i], (previous[i - channels] if i >= channels else 0)
                 predictor = 0 if kind == 0 else a if kind == 1 else b if kind == 2 else (a + b) // 2 if kind == 3 else image._paeth(a, b, c) if kind == 4 else 0
                 raw.append((value - predictor) & 255)
             previous = row
-    head = header or struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+    head = header or struct.pack(">IIBBBBB", size, size, depth, color, 0, 0, interlace)
     payload = zlib.compress(bytes(raw)) if compressed is None else compressed
-    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", head) + chunk(b"IDAT", payload) + chunk(b"IEND", b"")
+    extra = (chunk(b"PLTE", palette) if palette is not None else b"") + (chunk(b"tRNS", transparency) if transparency is not None else b"")
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", head) + extra + chunk(b"IDAT", payload) + chunk(b"IEND", b"")
 
 
 class Response(io.BytesIO):
@@ -77,7 +91,7 @@ class FakeHttp:
 
 class PngTests(unittest.TestCase):
     def test_all_filters_decode_identically(self):
-        values = [image.png_metadata(png(8, filters=(kind,)), 8, 8) for kind in range(5)]
+        values = [image.png_metadata(png(8, filters=(kind,), color=color), 8, 8) for kind in range(5) for color in (2, 6)]
         self.assertEqual(len({value["pixel_sha256"] for value in values}), 1)
         self.assertTrue(all(value["spatially_varied"] and value["has_visible_pixels"] for value in values))
 
@@ -91,10 +105,53 @@ class PngTests(unittest.TestCase):
 
     def test_constant_transparent_and_wrong_size_or_format_rejected(self):
         cases = [png(8, constant=True), png(8, transparent=True), png(7),
-                 png(8, header=struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0)),
+                 png(8, header=struct.pack(">IIBBBBB", 8, 8, 8, 1, 0, 0, 0)),
                  png(8, filters=(5,))]
         for data in cases:
             with self.subTest(length=len(data)), self.assertRaises(ValueError):
+                image.png_metadata(data, 8, 8)
+
+    def test_managed_rgb_wrapper_and_rgba_encoding_share_canonical_pixels(self):
+        # ImageIO strips absent alpha; PngCodec.Encode writes noninterlaced RGB8
+        # for a three-channel buffer. Its opaque RGBA representation is equal.
+        rgb = image.png_metadata(png(8, color=2), 8, 8)
+        rgba = image.png_metadata(png(8, color=6), 8, 8)
+        self.assertEqual(rgb["color_type"], 2)
+        self.assertEqual(rgb["alpha_min"], 255)
+        self.assertEqual(rgb["pixel_sha256"], rgba["pixel_sha256"])
+
+    def test_gray_and_palette_optimizations_preserve_rgba_pixels(self):
+        expected = bytes((0, 0, 0, 255, 255, 255, 255, 255) * 4) * 8
+        digest = hashlib.sha256(expected).hexdigest()
+        for depth, packed in ((1, b"\x55"), (2, b"\x33\x33"), (4, b"\x0f" * 4), (8, b"\x00\xff" * 4)):
+            value = image.png_metadata(png(8, color=0, depth=depth, raw=(b"\x00" + packed) * 8), 8, 8)
+            self.assertEqual(value["pixel_sha256"], digest)
+        for depth, packed in ((1, b"\x55"), (2, b"\x11\x11"), (4, b"\x01" * 4), (8, b"\x00\x01" * 4)):
+            value = image.png_metadata(png(8, color=3, depth=depth, raw=(b"\x00" + packed) * 8,
+                                           palette=b"\x00\x00\x00\xff\xff\xff"), 8, 8)
+            self.assertEqual(value["pixel_sha256"], digest)
+        gray_alpha = image.png_metadata(png(8, color=4, raw=(b"\x00" + b"\x00\xff\xff\xff" * 4) * 8), 8, 8)
+        self.assertEqual(gray_alpha["pixel_sha256"], digest)
+
+    def test_palette_transparency_and_invalid_indices(self):
+        value = image.png_metadata(png(8, color=3, depth=1, raw=b"\x00\x55" * 8,
+            palette=b"\x00\x00\x00\xff\xff\xff", transparency=b"\x00\xff"), 8, 8)
+        self.assertEqual((value["alpha_min"], value["alpha_max"]), (0, 255))
+        for args in ({}, {"palette": b"\x00\x00\x00"},
+                     {"palette": b"\x00\x00\x00\xff\xff\xff", "transparency": b"\x00\xff\x00"}):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                image.png_metadata(png(8, color=3, depth=1, raw=b"\x00\x55" * 8, **args), 8, 8)
+
+    def test_rgb_and_gray_transparent_sample_preserved(self):
+        rgb = image.png_metadata(png(8, color=2, transparency=struct.pack(">HHH", 0, 0, 20)), 8, 8)
+        gray = image.png_metadata(png(8, color=0, raw=(b"\x00" + b"\x00\xff" * 4) * 8,
+                                      transparency=b"\x00\x00"), 8, 8)
+        self.assertEqual((rgb["alpha_min"], rgb["alpha_max"]), (0, 255))
+        self.assertEqual((gray["alpha_min"], gray["alpha_max"]), (0, 255))
+
+    def test_legitimate_unimplemented_encodings_are_explicitly_untested(self):
+        for data in (png(8, depth=16, raw=(b"\x00" + b"\x00" * 8 * 8) * 8), png(8, interlace=1)):
+            with self.subTest(length=len(data)), self.assertRaises(image.UnsupportedPngFormat):
                 image.png_metadata(data, 8, 8)
 
     def test_inflate_size_bomb_invalid_stream_and_trailing_zlib_rejected(self):
@@ -139,6 +196,20 @@ class AdapterTests(unittest.TestCase):
         self.context["model_options"]["qwen-image-variant"] = "turbo"
         self.run_smoke()
         self.assertTrue(all(payload["steps"] == 8 for payload in self.http.requests))
+
+    def test_actual_rgb_result_is_accepted_and_format_evidence_retained(self):
+        self.http.content = png(color=2)
+        self.run_smoke()
+        self.assertTrue(all(value["color_type"] == 2 for value in self.result["evidence"]["generated_images"]))
+
+    def test_unsupported_valid_encoding_does_not_claim_engine_failure(self):
+        self.http.content = png(interlace=1)
+        with self.assertRaises(ScenarioUntested):
+            self.run_smoke()
+        receipt = self.result["evidence"]["generated_images"][0]
+        self.assertEqual(receipt["validation"], "untested")
+        self.assertEqual(receipt["encoding"]["interlace"], 1)
+        self.assertTrue(Path(receipt["artifact"]).is_file())
 
     def test_repeat_difference_is_observed_not_claimed_as_qualified_determinism(self):
         self.http.repeat_changes = True

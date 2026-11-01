@@ -297,6 +297,7 @@ port = int(sys.argv[sys.argv.index('--port') + 1])
 model = Path(sys.argv[sys.argv.index('--model') + 1]).name
 active = False
 sessions = set()
+session_cache = set()
 session_counter = 0
 def telemetry(request_id, event, message, props):
     folder = Path(os.environ['TENSORSHARP_LOG_DIR']); folder.mkdir(parents=True, exist_ok=True)
@@ -317,13 +318,23 @@ class Handler(BaseHTTPRequestHandler):
             session_counter += 1; sid = 'fixture-session-'+str(session_counter); sessions.add(sid)
             self.reply({'sessionId':sid}); return
         if self.path == '/api/chat':
-            sid = payload['sessionId']; prompt = payload['messages'][0]['content']
+            sid = payload['sessionId']; prompt = payload['messages'][-1]['content']
+            if payload.get('newChat'):
+                if mode == 'reset_global_clear': session_cache.clear()
+                else: session_cache.discard(sid)
+            reused = 256 if sid in session_cache and mode != 'reset_no_private' else 8
+            session_cache.add(sid)
+            markers = re.findall(r'REGRESSION_[A-Z]+_\d+', '\n'.join(m['content'] for m in payload['messages']))
             if 'My session marker is' in prompt: answer = re.search(r'REGRESSION_[A-Z]+_\d+',prompt)[0]
-            elif 'earlier messages' in prompt: answer = 'REGRESSION_COBALT_7319' if mode=='reset_leaks' else 'NONE'
+            elif 'earlier messages' in prompt: answer = markers[-1] if markers else ('REGRESSION_COBALT_7319' if mode=='reset_leaks' else 'NONE')
             else: answer = '56'
+            if mode != 'reset_no_prefix_telemetry':
+                public = 256 if mode == 'reset_public_only' else 8
+                telemetry(self.headers.get('X-TensorSharp-Request-Id'), {'id':1,'name':'KvCacheReusePlan'},
+                          'prompt.shared_prefix tokens='+str(public), {'SharedPrefixTokens':public})
             self.sse_headers()
             self.emit({'token':answer})
-            self.emit({'done':True,'aborted':False,'truncated':False,'promptTokens':12,'tokenCount':1,'sessionId':sid})
+            self.emit({'done':True,'aborted':False,'truncated':False,'promptTokens':400,'tokenCount':1,'kvReusedTokens':reused,'sessionId':sid})
             return
         if self.path == '/v1/embeddings':
             if payload.get('model') != model: self.error(404,'model','model_not_found'); return
@@ -397,6 +408,29 @@ server.serve_forever()
         value = self.run_fake_server("server_reset_cache", "reset")
         self.assertEqual(value["status"], "pass", value)
         self.assertIn("session B cannot recover A marker", [a["name"] for a in value["assertions"]])
+        self.assertEqual(len(value["evidence"]["session_cache_controls"]), 2)
+        requests = [r["body"] for r in value["inputs"]["requests"] if r["route"] == "/api/chat"]
+        self.assertEqual([r["newChat"] for r in requests], [True, False, True, False, False, False, True, False, True])
+        self.assertEqual([len(r["messages"]) for r in requests], [1, 3, 1, 5, 3, 5, 1, 7, 1])
+
+    def test_new_chat_globally_clearing_other_session_cache_cannot_pass(self):
+        value = self.run_fake_server("server_reset_cache", "reset_global_clear")
+        self.assertEqual(value["status"], "untested", value)
+        self.assertIn("A after B starts", value["reason"])
+        self.assertTrue(next(a["passed"] for a in value["assertions"] if a["name"] == "session A recalls its marker after B starts"))
+
+    def test_absent_private_cache_positive_control_is_untested(self):
+        value = self.run_fake_server("server_reset_cache", "reset_no_private")
+        self.assertEqual(value["status"], "untested", value)
+        self.assertIn("private-cache retention was not demonstrated", value["reason"])
+
+    def test_warmed_public_prefix_alone_does_not_prove_private_retention(self):
+        value = self.run_fake_server("server_reset_cache", "reset_public_only")
+        self.assertEqual(value["status"], "untested", value)
+
+    def test_missing_request_scoped_public_boundary_is_untested(self):
+        value = self.run_fake_server("server_reset_cache", "reset_no_prefix_telemetry")
+        self.assertEqual(value["status"], "untested", value)
 
     def test_cross_session_marker_leak_fails(self):
         value = self.run_fake_server("server_reset_cache", "reset_leaks")

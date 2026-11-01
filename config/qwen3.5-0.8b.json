@@ -1,0 +1,33 @@
+// Small dense Qwen3.5 regression candidate; source metadata verified 2026-11-01.
+// Immutable publisher identities are recorded in config/regression/source-pins.json.
+// Source verification does not establish local file integrity or device qualification.
+// Set TENSORSHARP_MODELS to the parent of Qwen3.5-0.8B-GGUF to reuse that layout.
+// The optional matching projector is required for image scenarios; no draft head is enabled.
+{
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/Qwen3.5-0.8B-GGUF"
+  },
+  "backend": "ggml_cpu",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/Qwen3.5-0.8B-Q8_0.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0/Qwen3.5-0.8B-Q8_0.gguf"
+    ],
+    "sha256": "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c"
+  },
+  "mmproj": {
+    "path": "${root}/mmproj-F16.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0/mmproj-F16.gguf"
+    ],
+    "sha256": "56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453",
+    "optional": true
+  }
+}

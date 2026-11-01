@@ -36,8 +36,10 @@ def response(schema, expected):
 
 
 class FakeHttp:
-    def __init__(self, suite, mutate=None, invalid_status=422):
+    def __init__(self, suite, result, mutate=None, invalid_status=422, invalid_body=None, capture_errors=True):
         self.suite, self.mutate, self.invalid_status = suite, mutate, invalid_status
+        self.result, self.capture_errors = result, capture_errors
+        self.invalid_body = invalid_body if invalid_body is not None else '{"error":{"type":"validation_error","message":"synthetic invalid fields"}}'
         self.calls = []
 
     def json(self, route, payload):
@@ -50,6 +52,8 @@ class FakeHttp:
                 return body
         if self.invalid_status == 200:
             return {"accepted": True}
+        if self.capture_errors:
+            self.result["evidence"].setdefault("http_errors", []).append({"route": route, "status": self.invalid_status, "body": self.invalid_body})
         raise urllib.error.HTTPError("http://127.0.0.1/v1/systemone", self.invalid_status, "synthetic", {}, None)
 
 
@@ -70,7 +74,7 @@ class JevTests(unittest.TestCase):
         return jev.validate_decisions(self.contract, self.payload, body, self.case["expected"], MODEL)
 
     def test_all_fixed_cases_replay_and_validation_errors_are_executed(self):
-        http = FakeHttp(self.suite)
+        http = FakeHttp(self.suite, self.result)
         jev.run_decisions(http, MODEL, self.context, self.result)
         evidence = self.result["evidence"]["jev"]
         self.assertEqual(evidence["counts"], {"fixtures": 12, "passed_fixtures": 12, "decisions": 36, "failures": 0})
@@ -127,7 +131,7 @@ class JevTests(unittest.TestCase):
         def mutate(body, call):
             if call == 1:
                 body["answers"]["urgent"]["noul"] = 1.0
-        http = FakeHttp(self.suite, mutate)
+        http = FakeHttp(self.suite, self.result, mutate)
         with self.assertRaisesRegex(ValueError, "billing-calm"):
             jev.run_decisions(http, MODEL, self.context, self.result)
         rows = self.result["evidence"]["jev"]["cases"]
@@ -140,21 +144,35 @@ class JevTests(unittest.TestCase):
             if call == 13:
                 body["answers"]["urgent"]["noul"] = 0.1
         with self.assertRaisesRegex(ValueError, "replay probability delta"):
-            jev.run_decisions(FakeHttp(self.suite, mutate), MODEL, self.context, self.result)
+            jev.run_decisions(FakeHttp(self.suite, self.result, mutate), MODEL, self.context, self.result)
         self.assertFalse(self.result["evidence"]["jev"]["seeded_replay"]["passed"])
 
     def test_malformed_accepted_or_server_error_cannot_pass(self):
-        for status in (200, 404, 500):
+        for status in (200, 400, 404, 500):
             result = {"assertions": [], "inputs": {}, "evidence": {}}
-            with self.subTest(status=status), self.assertRaisesRegex(ValueError, "expected validation 4xx"):
-                jev.run_decisions(FakeHttp(self.suite, invalid_status=status), MODEL, self.context, result)
+            with self.subTest(status=status), self.assertRaisesRegex(ValueError, "expected HTTP 422 validation_error"):
+                jev.run_decisions(FakeHttp(self.suite, result, invalid_status=status), MODEL, self.context, result)
             self.assertEqual(len(result["evidence"]["jev"]["malformed_requests"]), 4)
+
+    def test_validation_status_with_wrong_type_or_unparseable_body_fails(self):
+        for body in ('{"error":{"type":"invalid_request_error","message":"wrong type"}}',
+                     '{"error":{"type":"validation_error"}}', '<html>error</html>', '[]'):
+            result = {"assertions": [], "inputs": {}, "evidence": {}}
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, "expected HTTP 422 validation_error"):
+                jev.run_decisions(FakeHttp(self.suite, result, invalid_body=body), MODEL, self.context, result)
+            self.assertTrue(all(not row["passed"] for row in result["evidence"]["jev"]["malformed_requests"]))
+
+    def test_stale_validation_body_cannot_satisfy_new_request(self):
+        self.result["evidence"]["http_errors"] = [{"route": "/v1/systemone", "status": 422,
+            "body": '{"error":{"type":"validation_error","message":"old request"}}'}]
+        with self.assertRaisesRegex(ValueError, "missing current-request HTTP error evidence"):
+            jev.run_decisions(FakeHttp(self.suite, self.result, capture_errors=False), MODEL, self.context, self.result)
 
     def test_missing_responses_cannot_be_reported_as_zero_execution_pass(self):
         def mutate(body, call):
             body["answers"] = {}
         with self.assertRaises(ValueError):
-            jev.run_decisions(FakeHttp(self.suite, mutate), MODEL, self.context, self.result)
+            jev.run_decisions(FakeHttp(self.suite, self.result, mutate), MODEL, self.context, self.result)
         self.assertEqual(self.result["evidence"]["jev"]["counts"]["passed_fixtures"], 0)
         self.assertTrue(any(item["name"] == "Jev seeded probability replay" and not item["passed"] for item in self.result["assertions"]))
 

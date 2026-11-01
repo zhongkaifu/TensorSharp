@@ -137,18 +137,34 @@ def run_decisions(http, model, context, result):
         _assert(result, "Jev seeded probability replay", False, "one valid fixture required", "no valid fixture")
 
     for name, payload in _malformed_requests(model):
-        status, detail = 200, None
+        status, detail, error_type = 200, None, None
+        error_offset = len(result["evidence"].get("http_errors", []))
         try:
             http.json("/v1/systemone", payload)
         except urllib.error.HTTPError as error:
             status = error.code
+            captured = result["evidence"].get("http_errors", [])[error_offset:]
+            try:
+                if len(captured) != 1 or captured[0].get("route") != "/v1/systemone" or captured[0].get("status") != status:
+                    raise ValueError("missing current-request HTTP error evidence")
+                body = json.loads(captured[0]["body"])
+                fields = body.get("error") if isinstance(body, dict) else None
+                if not isinstance(fields, dict) or not isinstance(fields.get("message"), str) or not fields["message"].strip():
+                    raise ValueError("Jev validation error envelope/message missing")
+                error_type = fields.get("type")
+            except (ValueError, KeyError, TypeError) as validation_error:
+                detail = str(validation_error)
         except (ValueError, TypeError, KeyError, OSError) as error:
             status, detail = None, str(error)
-        passed = status in {400, 422}
-        evidence["malformed_requests"].append({"id": name, "status": status, "passed": passed, "error": detail})
-        _assert(result, "Jev rejects " + name, passed, "HTTP 400 or 422", status)
+        # These are valid JSON with invalid Jev fields. JevRequest.Parse throws
+        # JevValidationException; JevAdapter maps exactly to this 422 error type.
+        # HTTP 400 is reserved for malformed JSON, which these fixtures are not.
+        passed = status == 422 and error_type == "validation_error" and detail is None
+        evidence["malformed_requests"].append({"id": name, "status": status, "type": error_type, "passed": passed, "error": detail})
+        _assert(result, "Jev rejects " + name, passed, {"status": 422, "type": "validation_error"},
+                {"status": status, "type": error_type, "error": detail})
         if not passed:
-            failures.append(name + ": expected validation 4xx, got " + str(status))
+            failures.append(name + ": expected HTTP 422 validation_error, got " + str(status) + " " + str(error_type) + (": " + detail if detail else ""))
     evidence["counts"] = {"fixtures": len(suite["cases"]), "passed_fixtures": sum(row["passed"] for row in evidence["cases"]),
                           "decisions": sum(len(case["expected"]) for case in suite["cases"]), "failures": len(failures)}
     if failures:

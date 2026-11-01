@@ -85,6 +85,75 @@ TRX counters must show executed passing tests, and skipped tests are disclosed.
 
 ## Budget and download policy
 
+### Use another drive for models, builds and diagnostics
+
+Model and report locations are independent. A nearly full system drive does not
+require moving or deleting existing weights: keep them where they are and select
+another drive for new files. The same options work with Linux mount paths.
+
+| Location | Select with | Behavior |
+|---|---|---|
+| New models and resumable `.part` files | `--model-root D:\TensorSharp-regression-validation\models` | Download and free-space checks use this model/cache volume |
+| Existing weights | One or more `--existing-root C:\work\model` options | Read-only discovery by unique filename; execution verifies the selected identity, without copying or deleting weights |
+| Reports, logs, caches and logit traces | `--output E:\TensorSharp-regression-results\run-001` | Must be empty; logit artifact headroom is checked on this volume separately |
+| Source and build outputs | A separate checkout, then explicit `--cli`, `--server`, `--logit-probe`, `--runtime-dir` paths | `--model-root` does not relocate source, `bin`, `obj` or native builds |
+| Process temporary files and package caches | Process-local `TEMP`/`TMP` on Windows; `TMPDIR` on Unix; optionally `NUGET_PACKAGES` | Configure these before starting Python, .NET or build tools; the runner does not move existing caches |
+
+For example, put an independent checkout in
+`D:\TensorSharp-regression-validation\source`, then plan using D: for new model
+files and artifacts while reusing existing C: weights:
+
+```powershell
+$validationRoot = 'D:\TensorSharp-regression-validation'
+$checkout = Join-Path $validationRoot 'source'
+$modelCache = Join-Path $validationRoot 'models'
+$artifactRoot = Join-Path $validationRoot 'artifacts'
+$temporaryRoot = Join-Path $validationRoot 'temp'
+New-Item -ItemType Directory -Force -Path $modelCache,$artifactRoot,$temporaryRoot | Out-Null
+$env:TEMP = $temporaryRoot
+$env:TMP = $temporaryRoot
+$planOutput = Join-Path $artifactRoot ('plan-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+python "$checkout\eng\run-local-regression.py" --repo $checkout --mode plan `
+  --model-root $modelCache --existing-root 'C:\work\model' `
+  --output $planOutput --disk-headroom-gib 10
+```
+
+To put only diagnostics on E:, change `$artifactRoot` to an existing writable
+directory such as `E:\TensorSharp-regression-results` before creating the new
+output path. Add another `--existing-root` only for an actual weights directory.
+Ambiguous duplicate filenames are not selected automatically; verified model
+identity still decides whether a local file is usable.
+
+After the plan is reviewed and the chosen local backend has been built, use a new
+output directory for execution. For example, with a server deployed under the
+independent D: validation directory:
+
+```powershell
+$runOutput = Join-Path $artifactRoot ('embedding-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+python "$checkout\eng\run-local-regression.py" --repo $checkout --mode run `
+  --models embedding-minilm --backend ggml_cpu `
+  --server "$validationRoot\build\server\TensorSharp.Server.Host.dll" `
+  --model-root $modelCache --existing-root 'C:\work\model' `
+  --output $runOutput --allow-download --max-download-gib 1 --disk-headroom-gib 10
+```
+
+Disk failures identify the relevant location: model preparation reports
+`disk_budget` with its model/cache path; logit scenarios record
+`artifact_disk_checks` with the artifact path, available bytes, estimate and
+headroom. Existing partial bytes already occupy their volume; only the validated
+remaining bytes count toward further transfer and additional disk allocation.
+The complete model size still counts toward RAM/VRAM estimates. A roomy model
+drive cannot compensate for a full report drive. Small report writes and other
+tools can still encounter ordinary filesystem errors, so leave space on every
+selected write volume rather than lowering the headroom to conceal exhaustion.
+
+The failure's `reproduce` command preserves the chosen model and existing roots.
+When the original run supplied `--output`, it also specifies a fresh sibling
+directory on that report volume; it does not reuse the old nonempty report
+directory. To execute the same recorded command again after its first replay,
+choose another empty output path. Without an explicit output in the original
+invocation, a new report is created under the selected repository.
+
 - The short text/embedding default estimates host RAM as `1.25 * weight bytes +
   2 GiB`, reserves at least 4 GiB or 20% of physical RAM, and charges GPU residency
   separately with another 2 GiB free-VRAM reserve. It does not sum several GPUs'
@@ -120,8 +189,16 @@ CLI adapters assert task-specific text, positive prefill/decode metrics, multi-t
 history, tool name/arguments, or media-specific expected content. Server adapters
 exercise chat, SSE completion, cancellation recovery, reset/cache, JSON schema,
 tool contracts, and embeddings (finite dimensions, repeatability and semantic
-similarity). Cache tests require an observed cache hit before claiming cache
-coverage. `ForcedLogitProbe` replays fixed token histories, checks all finite rows,
+similarity). The session fixture sends the full conversation history required by
+`/api/chat`, with `newChat` only at the first request and explicit resets. It checks
+A's marker after B starts, then B's marker after A resets. Both adjacent controls
+and interleaved followups must show KV reuse beyond their request-correlated
+public-prefix boundaries. Primary-only backends, eviction, absent telemetry, or
+other missing retention evidence leave this combined scenario untested; correct
+answers alone cannot establish retained state. A separate repeated-prefix request
+must also report a positive cache hit. The arithmetic reset check covers the fresh
+request boundary, not implicit recall of history omitted by the client.
+`ForcedLogitProbe` replays fixed token histories, checks all finite rows,
 completion metadata, identical top-1 and the existing numerical gates; it retains
 first-divergence diagnostics. `forced_logits_sequence` uses 32/512-token prompts
 and 32 teacher-forced decode steps for short-short, long-long, short-long-short,
@@ -136,7 +213,8 @@ decisions, fixed-seed replay and malformed requests. `speculation_ngram` require
 a prebuilt `--benchmark` AgentTurnBench and a source-admitted family/backend;
 it requires actual n-gram verification/acceptance and exact greedy token parity.
 It never enables a learned drafter. `image_generation_smoke` runs Qwen base/Turbo
-at 128px with its required VAE/text encoder, validates PNG contents and error
+at 128px with its required VAE/text encoder, validates RGB/RGBA and noninterlaced
+gray/palette PNG contents and error
 responses, and records repeated-seed hashes without declaring semantic quality
 or bitwise determinism. The corresponding broader quality, attachment and
 learned-speculation recipes remain untested.

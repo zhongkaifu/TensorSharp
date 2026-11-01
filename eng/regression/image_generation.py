@@ -16,6 +16,14 @@ PNG_LIMIT = 2 * 1024 * 1024
 SIZE = 128
 
 
+class UnsupportedPngFormat(ValueError):
+    """A valid encoding shape that this bounded decoder cannot qualify."""
+
+    def __init__(self, metadata):
+        self.metadata = metadata
+        super().__init__("PNG encoding is not qualified by this decoder: " + json.dumps(metadata, sort_keys=True))
+
+
 def availability(context):
     options = context.get("model_options", {})
     for option in ("qwen-image-vae", "qwen-image-vl"):
@@ -51,14 +59,17 @@ def _paeth(a, b, c):
 
 
 def png_metadata(data, width=SIZE, height=SIZE):
-    """Strict bounded noninterlaced RGBA8 decoder, including all five PNG filters.
+    """Strict bounded noninterlaced PNG decoder, including all five PNG filters.
 
-    Byte pixels are finite by construction. This cannot establish finiteness of
-    intermediate floating tensors or semantic agreement with the text prompt.
+    Accept RGB/RGBA8, gray/gray-alpha8 and packed gray/palette encodings that
+    desktop encoders can choose. Normalize to RGBA8 for comparisons. Legal
+    16-bit/Adam7 encodings remain explicitly untested instead of engine failures.
+    Finite byte pixels do not qualify intermediate tensors or semantic quality.
     """
     if not isinstance(data, bytes) or len(data) > PNG_LIMIT or data[:8] != b"\x89PNG\r\n\x1a\n":
         raise ValueError("invalid or oversized PNG signature")
-    offset, compressed, header, ended, idat_ended = 8, bytearray(), None, False, False
+    offset, compressed, header, ended, idat_ended, seen_idat = 8, bytearray(), None, False, False, False
+    palette, transparency = None, None
     while offset < len(data):
         if len(data) - offset < 12:
             raise ValueError("truncated PNG chunk")
@@ -66,6 +77,8 @@ def png_metadata(data, width=SIZE, height=SIZE):
         if length > len(data) - offset - 12:
             raise ValueError("truncated PNG chunk payload")
         kind = data[offset + 4:offset + 8]
+        if any(not (65 <= value <= 90 or 97 <= value <= 122) for value in kind) or not 65 <= kind[2] <= 90:
+            raise ValueError("invalid PNG chunk type")
         content = data[offset + 8:offset + 8 + length]
         crc = struct.unpack_from(">I", data, offset + 8 + length)[0]
         if zlib.crc32(kind + content) & 0xffffffff != crc:
@@ -76,11 +89,28 @@ def png_metadata(data, width=SIZE, height=SIZE):
             if header is not None or length != 13:
                 raise ValueError("invalid or repeated PNG IHDR")
             header = struct.unpack(">IIBBBBB", content)
-            if header != (width, height, 8, 6, 0, 0, 0):
-                raise ValueError("PNG must match requested dimensions and noninterlaced RGBA8 format")
+            actual_width, actual_height, depth, color, compression, filtering, interlace = header
+            legal_depths = {0: {1, 2, 4, 8, 16}, 2: {8, 16}, 3: {1, 2, 4, 8}, 4: {8, 16}, 6: {8, 16}}
+            if (actual_width, actual_height) != (width, height):
+                raise ValueError("PNG dimensions differ from requested dimensions")
+            if color not in legal_depths or depth not in legal_depths[color] or compression != 0 or filtering != 0 or interlace not in {0, 1}:
+                raise ValueError("invalid PNG encoding parameters")
+        elif kind == b"PLTE":
+            if palette is not None or seen_idat or color in {0, 4} or not 0 < length <= 768 or length % 3:
+                raise ValueError("invalid PNG palette")
+            if color == 3 and length // 3 > (1 << depth):
+                raise ValueError("PNG palette exceeds indexed bit depth")
+            palette = content
+        elif kind == b"tRNS":
+            if transparency is not None or seen_idat or color in {4, 6}:
+                raise ValueError("invalid PNG transparency chunk")
+            if (color == 0 and length != 2) or (color == 2 and length != 6) or (color == 3 and (palette is None or not 0 < length <= len(palette) // 3)):
+                raise ValueError("invalid PNG transparency entries")
+            transparency = content
         elif kind == b"IDAT":
             if idat_ended:
                 raise ValueError("noncontiguous PNG IDAT chunks")
+            seen_idat = True
             compressed.extend(content)
         elif kind == b"IEND":
             if length or not compressed:
@@ -89,14 +119,22 @@ def png_metadata(data, width=SIZE, height=SIZE):
             offset += 12
             break
         else:
-            if compressed:
+            if seen_idat:
                 idat_ended = True
             if kind[:1].isupper() and kind != b"PLTE":
                 raise ValueError("unsupported critical PNG chunk")
         offset += 12 + length
     if not ended or offset != len(data):
         raise ValueError("PNG IEND absent or trailing data present")
-    expected = height * (width * 4 + 1)
+    if color == 3 and palette is None:
+        raise ValueError("indexed PNG has no palette")
+    encoding = {"width": width, "height": height, "bit_depth": depth, "color_type": color, "interlace": interlace}
+    if depth == 16 or interlace:
+        raise UnsupportedPngFormat(encoding)
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
+    stride = (width * channels * depth + 7) // 8
+    bpp = max(1, (channels * depth + 7) // 8)
+    expected = height * (stride + 1)
     inflater = zlib.decompressobj()
     try:
         inflated = inflater.decompress(bytes(compressed), expected + 1)
@@ -104,7 +142,12 @@ def png_metadata(data, width=SIZE, height=SIZE):
         raise ValueError("invalid PNG zlib stream") from error
     if len(inflated) != expected or not inflater.eof or inflater.unused_data or inflater.unconsumed_tail:
         raise ValueError("PNG pixel stream is truncated, oversized or has trailing data")
-    stride, previous, pixels = width * 4, bytearray(width * 4), bytearray()
+    previous, pixels = bytearray(stride), bytearray()
+    transparent_samples = None
+    if transparency is not None and color in {0, 2}:
+        transparent_samples = struct.unpack(">" + "H" * channels, transparency)
+        if any(sample >= (1 << depth) for sample in transparent_samples):
+            raise ValueError("PNG transparent sample exceeds bit depth")
     for y in range(height):
         start = y * (stride + 1)
         kind = inflated[start]
@@ -112,17 +155,36 @@ def png_metadata(data, width=SIZE, height=SIZE):
             raise ValueError("invalid PNG row filter")
         row = bytearray(inflated[start + 1:start + stride + 1])
         for i in range(stride):
-            left, up, diagonal = (row[i - 4] if i >= 4 else 0), previous[i], (previous[i - 4] if i >= 4 else 0)
+            left, up, diagonal = (row[i - bpp] if i >= bpp else 0), previous[i], (previous[i - bpp] if i >= bpp else 0)
             predict = 0 if kind == 0 else left if kind == 1 else up if kind == 2 else (left + up) // 2 if kind == 3 else _paeth(left, up, diagonal)
             row[i] = (row[i] + predict) & 255
-        pixels.extend(row)
+        for x in range(width):
+            if depth < 8:
+                sample = (row[(x * depth) // 8] >> (8 - depth - (x * depth) % 8)) & ((1 << depth) - 1)
+                samples = (sample,)
+            else:
+                samples = tuple(row[x * channels:(x + 1) * channels])
+            if color == 3:
+                index = samples[0]
+                if index >= len(palette) // 3:
+                    raise ValueError("PNG pixel index is outside palette")
+                rgb = palette[index * 3:index * 3 + 3]
+                alpha = transparency[index] if transparency is not None and index < len(transparency) else 255
+            elif color in {0, 4}:
+                gray = samples[0] * 255 // ((1 << depth) - 1)
+                rgb = (gray, gray, gray)
+                alpha = samples[1] if color == 4 else 0 if samples == transparent_samples else 255
+            else:
+                rgb = samples[:3]
+                alpha = samples[3] if color == 6 else 0 if samples == transparent_samples else 255
+            pixels.extend((*rgb, alpha))
         previous = row
     first = pixels[:4]
     varied = any(pixels[i:i + 4] != first for i in range(4, len(pixels), 4))
     visible = any(pixels[i] > 0 for i in range(3, len(pixels), 4))
     if not varied or not visible:
         raise ValueError("PNG output is spatially constant or fully transparent")
-    return {"width": width, "height": height, "bit_depth": 8, "color_type": 6,
+    return {**encoding, "decoded_format": "RGBA8",
             "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
             "pixel_sha256": hashlib.sha256(pixels).hexdigest(), "spatially_varied": varied,
             "has_visible_pixels": visible, "alpha_min": min(pixels[3::4]), "alpha_max": max(pixels[3::4])}
@@ -130,7 +192,7 @@ def png_metadata(data, width=SIZE, height=SIZE):
 
 def run_image_smoke(http, model, context, result):
     """Run bounded transport/output checks through the caller's owned HTTP client."""
-    from .scenarios import ScenarioFailure, _require
+    from .scenarios import ScenarioFailure, ScenarioUntested, _require
     options = context.get("model_options", {})
     steps = 8 if options.get("qwen-image-variant") == "turbo" else 2
     payload = {"prompt": "A red ceramic cube on a white table.", "width": SIZE, "height": SIZE,
@@ -182,10 +244,13 @@ def run_image_smoke(http, model, context, result):
                        "capture_truncated": len(data) > PNG_LIMIT, "validation": "incomplete"}
             images.append(receipt)
             info = png_metadata(data)
+        except UnsupportedPngFormat as error:
+            receipt.update(validation="untested", encoding=error.metadata, reason=str(error))
+            raise ScenarioUntested(str(error)) from error
         except (ValueError, TypeError, KeyError, struct.error) as error:
             raise ScenarioFailure(str(error)) from error
         receipt.update(info, validation="passed")
-        _require(result, "complete nonconstant visible RGBA PNG", True, "128x128 valid fully decoded PNG", info)
+        _require(result, "complete nonconstant visible PNG", True, "128x128 valid PNG decoded to RGBA8", info)
     result["evidence"]["generated_images"] = images
     result["evidence"]["image_seeded_repeat"] = {
         "file_sha_equal": images[0]["sha256"] == images[1]["sha256"],

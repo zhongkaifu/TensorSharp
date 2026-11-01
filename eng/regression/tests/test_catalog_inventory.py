@@ -126,7 +126,25 @@ class CatalogInventoryTests(unittest.TestCase):
                 self.assertTrue(all(total == shards[0][1] for number, total in shards))
                 self.assertEqual(list(range(1, shards[0][1] + 1)), sorted(number for number, total in shards))
             seen.add(preset["family"])
-        self.assertEqual({"muse-glimmer", "muse-spark", "minimax-m3"}, seen)
+        self.assertEqual({"muse-glimmer", "muse-spark", "minimax-m3", "qwen35"}, seen)
+
+    def test_small_qwen35_has_complete_pinned_local_layout(self):
+        preset = self.presets["qwen3.5-0.8b"]
+        self.assertEqual("qwen35", preset["family"])
+        self.assertEqual("dense", preset["layout"])
+        self.assertEqual({"Qwen3.5-0.8B-Q8_0.gguf": 811843840,
+                          "mmproj-F16.gguf": 204987232}, preset["file_sizes"])
+        root = REPO / "artifacts" / "source-only-model-root"
+        resolved = read_config(REPO / preset["config"], root, environ={})
+        self.assertEqual({"model", "mmproj"}, {file.option for file in resolved.files})
+        for file in resolved.files:
+            self.assertEqual(root / "Qwen3.5-0.8B-GGUF" / file.path.name, file.path)
+            self.assertEqual(file.option == "mmproj", file.optional)
+        self.assertNotIn("spec", resolved.options)
+        self.assertNotIn("draft-model", resolved.options)
+        self.assertIn("forced_logits_sequence", preset["scenarios"])
+        self.assertIn("cli_image", preset["scenarios"])
+        self.assertIn("InferenceWeb.Tests/DirectCudaRealModelTests.cs", preset["source_evidence"])
 
 
 if __name__ == "__main__":

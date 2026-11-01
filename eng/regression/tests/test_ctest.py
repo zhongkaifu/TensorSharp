@@ -116,6 +116,29 @@ class CTestTests(unittest.TestCase):
             self.output.joinpath("ctest.xml").write_text('<testsuite><testcase name="fixture-cpu"><skipped/></testcase></testsuite>')
             self.assertEqual(self.invoke()[0]["status"], "untested")
 
+    def test_unverified_discovery_blocks_native_test_launch(self):
+        discovery = {"exit_code": 0, "stdout": json.dumps(payload(case("fixture-cpu"))), "stderr": "",
+                     "teardown": {"attempted": True, "verified": None}}
+        with patch.object(ctest.shutil, "which", return_value="ctest"), \
+             patch.object(ctest, "run_process", return_value=discovery) as execute:
+            results = self.invoke()
+        self.assertEqual(1, execute.call_count)
+        self.assertEqual("fail", results[0]["status"])
+        self.assertTrue(results[0]["containment_failure"])
+        self.assertEqual("native_ctest::fixture-cpu", results[1]["id"])
+        self.assertEqual("untested", results[1]["status"])
+
+    def test_unverified_execution_never_accepts_stale_passing_junit(self):
+        discovery = {"exit_code": 0, "stdout": json.dumps(payload(case("fixture-cpu"))), "stderr": ""}
+        failed_cleanup = {"exit_code": 0, "containment_failure": True, "stdout": "all pass", "stderr": ""}
+        with patch.object(ctest.shutil, "which", return_value="ctest"), \
+             patch.object(ctest, "run_process", side_effect=[discovery, failed_cleanup]), \
+             patch.object(ctest, "parse_results") as parse:
+            results = self.invoke()
+        parse.assert_not_called()
+        self.assertEqual(["fail", "untested"], [row["status"] for row in results])
+        self.assertEqual("native_ctest::fixture-cpu", results[1]["id"])
+
     @unittest.skipUnless(shutil.which("ctest"), "CTest not installed")
     def test_real_ctest_synthetic_pass_skip_fail_without_build_or_device(self):
         # This CTest file runs only tiny Python expressions, not native/model code.

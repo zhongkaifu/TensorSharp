@@ -125,6 +125,23 @@ class SuiteTests(unittest.TestCase):
         self.process.return_value = {"exit_code": 0, "stdout": "PASS unrelated", "stderr": ""}
         self.assertEqual(self.invoke()[-1]["status"], "fail")
 
+    def test_unsafe_teardown_halts_next_internal_command_and_later_suites(self):
+        self.spec.update(kind="client_http")
+        later = {**self.spec, "id": "must-not-start"}
+        for process in ({"exit_code": 125, "containment_failure": True},
+                        {"exit_code": 0, "teardown": {"attempted": True, "verified": None}}):
+            with self.subTest(process=process), patch.object(suites, "list_suites", return_value=[self.spec, later]):
+                self.process.reset_mock()
+                self.process.side_effect = None
+                self.process.return_value = {**process, "stdout": "PASS", "stderr": ""}
+                results = self.invoke(allow_builds=True)
+                self.assertEqual(1, self.process.call_count, "restore failure must block build, assertions, and next suite")
+                self.assertEqual(["fail", "untested"], [row["status"] for row in results])
+                self.assertTrue(results[0]["containment_failure"])
+                self.assertIn("Unsafe owned resources", results[1]["reason"])
+                self.assertEqual(3, len(results[0]["remaining_commands"]))
+                self.assertTrue(all(command["status"] == "untested" for command in results[0]["remaining_commands"]))
+
 
 if __name__ == "__main__":
     unittest.main()
