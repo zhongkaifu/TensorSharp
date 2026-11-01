@@ -7,9 +7,21 @@ import struct
 import tempfile
 import unittest
 from unittest.mock import patch
+import zlib
 
 from eng.regression import video_profiles as video
 from eng.regression.scenarios import ScenarioFailure, ScenarioUntested
+
+
+def png_header(width, height):
+    data = b"IHDR" + struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + data + struct.pack(">I", zlib.crc32(data) & 0xffffffff)
+
+
+def conditioning_png():
+    def chunk(name, data):
+        return struct.pack(">I", len(data)) + name + data + struct.pack(">I", zlib.crc32(name + data) & 0xffffffff)
+    return png_header(64, 64) + chunk(b"IDAT", zlib.compress((b"\x00" + b"\x10\x20\x30" * 64) * 64)) + chunk(b"IEND", b"")
 
 
 class VideoProfileTests(unittest.TestCase):
@@ -37,6 +49,7 @@ class VideoProfileTests(unittest.TestCase):
         self.failure_stage = self.failure = None
         self.bad_pixels = self.bad_audio = False
         self.wrong_frame_count = False
+        self.generated_seed, self.include_seed_receipt = None, True
         self.refresh()
 
     def fixture(self, name, data, suffix=".raw"):
@@ -69,6 +82,9 @@ class VideoProfileTests(unittest.TestCase):
             for name, marker in (("first_image", "image"), ("end_image", "end"), ("reference_image", "ref-img")):
                 if name in self.profile["fixtures"]:
                     stdout += "  " + marker + " : " + self.profile["fixtures"][name]["path"] + "\n"
+            if self.include_seed_receipt:
+                seed = p["seed"] if self.generated_seed is None else self.generated_seed
+                stdout += f"Saved {p['width']}x{p['height']} x {p['frames']} frames (h264, {p['fps']} fps, seed {seed}) to {self.output / 'generated.mp4'} in 0.1s\n"
         elif stage == "video-probe":
             stdout = json.dumps({"streams": [{"codec_type": "video", "width": p["width"], "height": p["height"],
                 "nb_read_frames": str(p["frames"] + int(self.wrong_frame_count)), "avg_frame_rate": str(p["fps"]) + "/1"}]})
@@ -103,6 +119,9 @@ class VideoProfileTests(unittest.TestCase):
         self.assertIn("--no-audio", command)
         self.assertEqual(command[command.index("--video-frames") + 1], "5")
         self.assertNotIn("--config", command)
+        self.assertEqual(command[command.index("--diffusion-seed") + 1], "42")
+        self.assertNotIn("--seed", command, "autoregressive sampling seed does not reach VideoGenerationParams")
+        self.assertEqual(42, result["evidence"]["video_seed_receipts"][0]["seed"])
         self.assertTrue(all(kwargs["timeout_seconds"] == 7 for _, kwargs in self.calls))
         self.assertIn("-xerror", self.calls[2][0])
         self.assertIn("-fs", self.calls[2][0])
@@ -116,6 +135,7 @@ class VideoProfileTests(unittest.TestCase):
         self.assertEqual(result["evidence"]["audio"]["decoded"]["rms"], .25)
         self.assertEqual(len(self.calls), 5)
         self.assertNotIn("--no-audio", self.calls[0][0])
+        self.assertEqual("42", self.calls[0][0][self.calls[0][0].index("--diffusion-seed") + 1])
 
     def test_ltx_exact_backend_schedule_and_audio(self):
         self.context["model_family"] = "ltx-2.5"
@@ -129,11 +149,14 @@ class VideoProfileTests(unittest.TestCase):
     def test_reference_fixture_receipt_and_golden_output(self):
         self.profile["scenario"] = "video_reference"
         self.profile["parameters"]["mode"] = "i2v"
-        self.fixture("first_image", b"synthetic approved fixture, no image decoder invoked", ".png")
+        self.fixture("first_image", conditioning_png(), ".png")
         self.refresh()
         result = self.run_profile()
         self.assertEqual(result["evidence"]["conditioning"]["mode"], "i2v")
         self.assertIn("--image", self.calls[0][0])
+        self.assertEqual("42", self.calls[0][0][self.calls[0][0].index("--diffusion-seed") + 1])
+        self.assertNotIn("--seed", self.calls[0][0])
+        self.assertEqual(64, result["evidence"]["conditioning_geometry"]["first_image"]["width"])
         self.assertIn("no face/subject identity", result["evidence"]["conditioning"]["scope"])
 
     def test_missing_profile_and_codecs_are_unavailable(self):
@@ -173,6 +196,47 @@ class VideoProfileTests(unittest.TestCase):
         with self.assertRaises(ScenarioFailure):
             self.run_profile()
         self.assertEqual(self.calls, [])
+
+    def test_small_compressed_conditioning_with_huge_geometry_never_launches_model(self):
+        self.profile["scenario"] = "video_reference"
+        self.profile["parameters"]["mode"] = "i2v"
+        self.fixture("first_image", png_header(100000, 100000), ".png")
+        with self.assertRaisesRegex(ScenarioUntested, "1024px geometry"):
+            self.run_profile()
+        self.assertEqual([], self.calls)
+
+    def test_conditioning_must_contain_valid_png_or_jpeg_header(self):
+        self.profile["scenario"] = "video_reference"
+        self.profile["parameters"]["mode"] = "i2v"
+        for data in (b"not an image", png_header(64, 64)[:-1], b"\xff\xd8\xff\xe0\xff\xffabc"):
+            with self.subTest(data=data):
+                self.fixture("first_image", data, ".png")
+                self.assertFalse(self.ready()[0])
+        self.assertEqual([], self.calls)
+
+    def test_jpeg_frame_dimensions_bounded_without_full_decode(self):
+        # Synthetic JPEG headers only: these test preflight, not JPEG decoding.
+        def header(width, height):
+            data = b"\x08" + struct.pack(">HH", height, width) + b"\x03\x01\x11\x00\x02\x11\x00\x03\x11\x00"
+            return b"\xff\xd8\xff\xc0" + struct.pack(">H", len(data) + 2) + data + b"\xff\xda"
+        self.fixture("first_image", header(1024, 512), ".jpg")
+        path = self.profile["fixtures"]["first_image"]["path"]
+        self.assertEqual(512, video._conditioning_geometry(path)["height"])
+        self.fixture("first_image", header(65535, 65535), ".jpg")
+        with self.assertRaisesRegex(ValueError, "geometry"):
+            video._conditioning_geometry(path)
+
+    def test_wrong_runtime_video_seed_fails_even_with_matching_pixels(self):
+        self.generated_seed = 71
+        with self.assertRaisesRegex(ScenarioFailure, "actual generated video seed"):
+            self.run_profile()
+        self.assertEqual(1, len(self.calls), "wrong seed must fail before numerical gold can pass")
+
+    def test_missing_runtime_video_seed_never_counts_as_seeded_qualification(self):
+        self.include_seed_receipt = False
+        with self.assertRaisesRegex(ScenarioFailure, "actual generated video seed"):
+            self.run_profile()
+        self.assertEqual(1, len(self.calls))
 
     def test_wrong_fixture_size_and_missing_companion_are_unavailable(self):
         path = Path(self.profile["fixtures"]["reference_rgb"]["path"])
@@ -279,6 +343,12 @@ class VideoProfileTests(unittest.TestCase):
     def test_blank_or_incorrect_pixels_fail(self):
         self.bad_pixels = True
         with self.assertRaises(ScenarioFailure):
+            self.run_profile()
+
+    def test_uniform_colored_clip_is_blank_even_when_reference_matches(self):
+        self.rgb = b"\xff\x00\x00" * (len(self.rgb) // 3)
+        self.fixture("reference_rgb", self.rgb)
+        with self.assertRaisesRegex(ScenarioFailure, "nonblank decoded video"):
             self.run_profile()
 
     def test_finite_but_different_pixels_fail_exact_oracle(self):

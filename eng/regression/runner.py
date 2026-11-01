@@ -256,6 +256,35 @@ def plan_model_resources(args, preset, weight_bytes, backend, hardware, override
     return result
 
 
+def execution_resource_plans(args, preset, weight_bytes, backend, hardware, overrides, scenario, artifact_dir):
+    """Recheck one prepared case without charging completed transfers again."""
+    resources = plan_model_resources(args, preset, weight_bytes, backend, hardware,
+        overrides={**overrides, "download_bytes": 0, "scratch_bytes": 0}, scenarios=[scenario])
+    artifact_path = Path(artifact_dir).resolve()
+    inventory_path = artifact_path
+    # After preparation, scratch belongs to the artifact volume, which can
+    # differ from the model/cache volume inventoried in hardware. Match the
+    # adapters' logit estimates, keeping their per-process guards as well.
+    logit_reserve = {"forced_logits": 256 * 1024 ** 2, "forced_logits_sequence": GIB}.get(scenario["id"], 0)
+    scratch = max(int(overrides.get("scratch_bytes", 0)), logit_reserve)
+    headroom = int(args.disk_headroom_gib * GIB)
+    disk = {"path": str(artifact_path), "inventory_path": str(inventory_path),
+            "scratch_bytes": scratch, "headroom_bytes": headroom,
+            "required_bytes": scratch + headroom}
+    try:
+        while not inventory_path.exists():
+            parent = inventory_path.parent
+            if parent == inventory_path:
+                raise OSError("artifact volume unavailable; no existing ancestor for " + str(artifact_path))
+            inventory_path = parent
+        disk["inventory_path"] = str(inventory_path)
+        disk["free_bytes"] = shutil.disk_usage(inventory_path).free
+        disk["eligible"] = disk["free_bytes"] >= disk["required_bytes"]
+    except OSError as error:
+        disk.update(inventory_path=str(inventory_path), free_bytes=None, eligible=False, error=str(error))
+    return resources, disk
+
+
 def sizes_for(files, policy, network=False):
     """Return (final weight footprint, remaining transfer/additional disk bytes).
 
@@ -691,6 +720,30 @@ def main(argv=None):
                                 resource_plan=resources, reproduce=reproduce_args(args, repo, root, preset, backend, scenario)))
                             continue
                         case_context = {**context, "artifact_dir": model_dir / scenario["id"]}
+                        # Downloads/full hashing and the preceding case may be
+                        # long. Fresh physical headroom is required for every
+                        # ordinary case; an earlier fit is not a reservation.
+                        hardware = detect_hardware(root, runtime_dirs=runtime_dirs)
+                        execution_resources, artifact_disk = execution_resource_plans(args, preset, weight_bytes,
+                            backend, hardware, model_overrides, scenario, case_context["artifact_dir"])
+                        resource_snapshot = {"checked_utc": datetime.now(timezone.utc).isoformat(),
+                            "memory": plain(hardware.get("memory", {})), "model_disk": plain(hardware.get("disk", {})),
+                            "gpus": plain(hardware.get("gpus", [])),
+                            "backend": plain(hardware.get("backends", {}).get(backend, {}))}
+                        if not execution_resources["eligible"] or not artifact_disk["eligible"]:
+                            why = (execution_resources["reason"] if not execution_resources["eligible"] else
+                                   "artifact volume lacks scratch/headroom" if artifact_disk["free_bytes"] is not None else
+                                   "artifact volume free space unavailable: " + artifact_disk["error"])
+                            report["results"].append(result_stub(preset, backend, scenario, "skip",
+                                "Resources changed after preparation or a preceding case: " + why,
+                                stage="execution_resources", resource_plan=resources,
+                                execution_resource_plan=execution_resources, artifact_disk_plan=artifact_disk,
+                                execution_resource_snapshot=resource_snapshot, model_identity=plain(identities),
+                                context_tokens=args.context_tokens, offload_policy=profile,
+                                reproduce=reproduce_args(args, repo, root, preset, backend, scenario)))
+                            write_reports(output, report, bundle=False)
+                            continue
+                        case_context["hardware"] = hardware
                         print(f"Running {preset['id']} / {backend} / {scenario['id']}", flush=True)
                         start = time.monotonic()
                         outcome = run_scenario(scenario, case_context)
@@ -698,6 +751,9 @@ def main(argv=None):
                         result = result_stub(preset, backend, scenario, outcome.pop("status"), outcome.pop("reason", ""),
                                              **outcome)
                         result["resource_plan"] = resources
+                        result["execution_resource_plan"] = execution_resources
+                        result["artifact_disk_plan"] = artifact_disk
+                        result["execution_resource_snapshot"] = resource_snapshot
                         result["context_tokens"] = args.context_tokens
                         result["offload_policy"] = profile
                         result["model_identity"] = plain(identities)

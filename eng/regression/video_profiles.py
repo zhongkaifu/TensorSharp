@@ -11,8 +11,11 @@ from fractions import Fraction
 import hashlib
 import math
 from pathlib import Path
+import re
 import shutil
+import struct
 import sys
+import zlib
 
 from .processes import run_process
 
@@ -24,6 +27,7 @@ _FIXTURES = {"reference_rgb", "reference_pcm", "first_image", "end_image", "refe
 _COMPANIONS = {"video-vae", "video-text-encoder", "video-dit2", "audio-vae", "video-upscaler"}
 _MAX_BYTES = 512 * 1024 ** 2
 _IMAGE_BYTES = 32 * 1024 ** 2
+_IMAGE_EDGE = 1024
 
 
 def _kind(case):
@@ -119,6 +123,60 @@ def _family(context):
     return context.get("model_family") or context.get("preset", {}).get("family")
 
 
+def _conditioning_geometry(path):
+    """Read PNG/JPEG geometry before any full decode/model allocation.
+
+    The encoded-byte limit does not bound a compressed image's decoded memory.
+    This is a header/resource check; the production image decoder still verifies
+    the image itself during the bounded conditioning run.
+    """
+    path = Path(path)
+    with path.open("rb") as stream:
+        header = stream.read(33)
+        if header[:8] == b"\x89PNG\r\n\x1a\n":
+            if (len(header) != 33 or header[8:16] != b"\x00\x00\x00\rIHDR"
+                    or zlib.crc32(header[12:29]) & 0xffffffff != struct.unpack(">I", header[29:33])[0]):
+                raise ValueError("conditioning PNG has invalid IHDR")
+            width, height = struct.unpack(">II", header[16:24])
+            encoding = "PNG"
+        elif header[:2] == b"\xff\xd8":
+            stream.seek(2)
+            width = height = None
+            encoding = "JPEG"
+            while stream.tell() < min(path.stat().st_size, _IMAGE_BYTES):
+                if stream.read(1) != b"\xff":
+                    raise ValueError("conditioning JPEG has invalid marker")
+                marker = stream.read(1)
+                while marker == b"\xff":
+                    marker = stream.read(1)
+                if marker in {b"", b"\x00", b"\xd8", b"\xd9"}:
+                    raise ValueError("conditioning JPEG is incomplete or malformed")
+                if marker == b"\xda":  # Start of scan; dimensions must already be known.
+                    break
+                if marker == b"\x01" or b"\xd0" <= marker <= b"\xd7":
+                    continue
+                raw_length = stream.read(2)
+                if len(raw_length) != 2:
+                    raise ValueError("conditioning JPEG segment is truncated")
+                length = struct.unpack(">H", raw_length)[0]
+                if length < 2 or stream.tell() + length - 2 > path.stat().st_size:
+                    raise ValueError("conditioning JPEG segment exceeds file bounds")
+                if marker in {bytes([value]) for value in (0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf)}:
+                    data = stream.read(length - 2)
+                    if width is not None or len(data) < 6:
+                        raise ValueError("conditioning JPEG has invalid/repeated frame header")
+                    height, width = struct.unpack(">HH", data[1:5])
+                else:
+                    stream.seek(length - 2, 1)
+            if width is None:
+                raise ValueError("conditioning JPEG dimensions are absent")
+        else:
+            raise ValueError("conditioning fixture must contain PNG/JPEG bytes")
+    if not 1 <= width <= _IMAGE_EDGE or not 1 <= height <= _IMAGE_EDGE:
+        raise ValueError("conditioning image exceeds 1024px geometry budget")
+    return {"format": encoding, "width": width, "height": height, "decoded_rgb_bytes": width * height * 3}
+
+
 def required_options(profile):
     """Required companion options; optional Ingredients is never activated here."""
     config = validate_profile(profile)
@@ -187,6 +245,8 @@ def availability(case, context):
                 raise ValueError("fixture exceeds bounded byte budget: " + name)
             if name.endswith("image") and path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
                 raise ValueError("conditioning fixtures must be PNG/JPEG")
+            if name.endswith("image"):
+                _conditioning_geometry(path)
         p, f = config["parameters"], config["fixtures"]
         if Path(f["reference_rgb"]["path"]).stat().st_size != p["width"] * p["height"] * p["frames"] * 3:
             raise ValueError("reference_rgb must be complete frame-major RGB24 data matching dimensions")
@@ -234,11 +294,12 @@ def _probe(path, context, result, stage):
 
 
 def _compare_rgb(actual, reference):
-    count, total, square, error, maximum, first = 0, 0, 0, 0, 0, None
+    count, error, maximum, first = 0, 0, 0, None
+    totals, squares = [0, 0, 0], [0, 0, 0]
     with actual.open("rb") as a, reference.open("rb") as b:
         while True:
-            av, bv = a.read(1024 * 1024), b.read(1024 * 1024)
-            if len(av) != len(bv):
+            av, bv = a.read(3 * 1024 * 1024), b.read(3 * 1024 * 1024)
+            if len(av) != len(bv) or len(av) % 3:
                 raise ValueError("RGB reference and actual lengths differ")
             if not av:
                 break
@@ -247,10 +308,18 @@ def _compare_rgb(actual, reference):
                               for i, (x, y) in enumerate(zip(av, bv)) if x != y), None)
             maximum = max(maximum, max(abs(x - y) for x, y in zip(av, bv)))
             count += len(av)
-            total += sum(av)
-            square += sum(x * x for x in av)
+            for channel in range(3):
+                values = av[channel::3]
+                totals[channel] += sum(values)
+                squares[channel] += sum(x * x for x in values)
             error += sum((x - y) ** 2 for x, y in zip(av, bv))
-    return {"samples": count, "rmse": math.sqrt(error / count), "std": math.sqrt(max(0, square / count - (total / count) ** 2)),
+    if not count:
+        raise ValueError("empty RGB")
+    pixels = count // 3
+    # Pooling R/G/B samples would incorrectly call a uniform red clip nonblank.
+    variances = [max(0, square / pixels - (total / pixels) ** 2) for total, square in zip(totals, squares)]
+    return {"samples": count, "rmse": math.sqrt(error / count), "std": math.sqrt(sum(variances) / 3),
+            "std_scope": "root mean channel variance across all decoded pixels and frames",
             "maximum_absolute_difference": maximum, "first_difference": first}
 
 
@@ -298,6 +367,8 @@ def run(case, context, result):
     for name, fixture in fixtures.items():
         hashes[name] = _sha(fixture["path"])
         _require(result, "approved fixture hash: " + name, hashes[name] == fixture["sha256"].lower(), fixture["sha256"], hashes[name])
+        if name.endswith("image"):
+            result["evidence"].setdefault("conditioning_geometry", {})[name] = _conditioning_geometry(fixture["path"])
     required_disk = 2 * p["width"] * p["height"] * p["frames"] * 3 + p.get("max_output_bytes", 128 * 1024 ** 2)
     required_disk += int(context.get("disk_headroom_gib", 5) * 1024 ** 3)
     if shutil.disk_usage(root).free < required_disk:
@@ -309,7 +380,7 @@ def run(case, context, result):
     command = list(context["cli_command"]) + ["--model", str(context["model_path"]), "--backend", context["backend"],
         "--no-skills", "--log-level", "info", "--log-file", "off", "--prompt", p["prompt"], "--output", str(media),
         "--width", str(p["width"]), "--height", str(p["height"]), "--video-frames", str(p["frames"]), "--fps", str(p["fps"]),
-        "--diffusion-steps", str(p["steps"]), "--cfg", str(p["cfg"]), "--seed", str(p["seed"]), "--sampler", p["sampler"],
+        "--diffusion-steps", str(p["steps"]), "--cfg", str(p["cfg"]), "--diffusion-seed", str(p["seed"]), "--sampler", p["sampler"],
         "--video-mode", config["mode"]]
     for name in sorted(_COMPANIONS):
         if context.get("model_options", {}).get(name):
@@ -320,6 +391,14 @@ def run(case, context, result):
         if name in fixtures:
             command += [flag, fixtures[name]["path"]]
     process = _execute(command, context, result, "video-generate", context["backend"])
+    # CLI --seed only controls autoregressive sampling. RunVideoGeneration uses
+    # --diffusion-seed and prints the seed returned by the actual video model.
+    receipts = re.findall(r"(?m)^Saved \d+x\d+ x \d+ frames \([^\r\n]*, \d+ fps, seed (-?\d+)\) to (.+) in [^\r\n]+s\s*$",
+                          process["stdout"])
+    result["evidence"]["video_seed_receipts"] = [{"seed": int(seed), "path": path} for seed, path in receipts]
+    _require(result, "actual generated video seed", len(receipts) == 1 and int(receipts[0][0]) == p["seed"]
+             and Path(receipts[0][1]).resolve() == media,
+             {"seed": p["seed"], "path": str(media)}, result["evidence"]["video_seed_receipts"])
     _require(result, "generated video exists within byte budget", media.is_file() and 0 < media.stat().st_size <= p.get("max_output_bytes", 128 * 1024 ** 2))
     metadata = _probe(media, context, result, "video-probe")
     streams = metadata.get("streams", [])

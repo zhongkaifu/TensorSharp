@@ -9,6 +9,8 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -91,6 +93,114 @@ class EnvironmentPolicyTests(unittest.TestCase):
         self.assertEqual("2048", json.loads(host["stdout"])["MAX_CONTEXT"])
         self.assertEqual("model_host", host["environment_mode"])
         self.assertTrue(suite["teardown"]["verified"] and host["teardown"]["verified"])
+
+
+class ConstructorFailureTests(unittest.TestCase):
+    """No children are launched: inject failures after a mocked target may start."""
+
+    def setUp(self):
+        state = patch.object(processes, "_unsafe_resources", None)
+        state.start()
+        self.addCleanup(state.stop)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def failed_initialization(self, error, *, platform="nt", failure="flush",
+                              verified=True, cleanup_error=None, metadata_error=False):
+        child, job = Mock(), Mock()
+        child.pid = 43210
+        child.returncode = 0
+        child.poll.return_value = child.wait.return_value = 0
+        captures = [Mock(), Mock()]
+        for capture in captures:
+            capture.read.return_value = ("", False)
+            capture.thread.is_alive.return_value = False
+        if failure in {"flush", "close"}:
+            getattr(child.stdin, failure).side_effect = error
+        capture = Mock(side_effect=error if failure == "capture-first" else
+                       [captures[0], error] if failure == "capture-second" else captures)
+        stopped = []
+
+        def stop(managed):
+            stopped.append(managed)
+            if cleanup_error is not None:
+                raise cleanup_error
+            managed.teardown.update(attempted=True, verified=verified,
+                                    reason="synthetic verified cleanup" if verified else "synthetic unknown descendants")
+            return managed.teardown
+
+        # Replace only this module's os reference; changing real os.name would
+        # make pathlib select an unsupported path class on the CI host.
+        fake_os = SimpleNamespace(name=platform, environ=os.environ)
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(processes, "os", fake_os))
+            stack.enter_context(patch.object(processes, "_WindowsJob", return_value=job))
+            launched = stack.enter_context(patch.object(processes.subprocess, "Popen", return_value=child))
+            stack.enter_context(patch.object(processes.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True))
+            stack.enter_context(patch.object(processes.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, create=True))
+            stack.enter_context(patch.object(processes, "_Capture", capture))
+            stack.enter_context(patch.object(ManagedProcess, "stop", stop))
+            if metadata_error:
+                stack.enter_context(patch.object(Path, "write_text", side_effect=OSError("synthetic full artifact disk")))
+            with self.assertRaises(type(error)) as caught:
+                ManagedProcess(["mock-never-executed-target"], cwd=self.root,
+                               artifact_dir=self.root, stage="constructor-failure")
+            self.assertIs(caught.exception, error, "cleanup must preserve the original exception object")
+            self.assertEqual(1, launched.call_count)
+            self.assertEqual(1, len(stopped), "spawned target requires owned-tree cleanup even without capture threads")
+            managed = stopped[0]
+            if platform == "nt":
+                job.assign.assert_called_once_with(child)
+                child.stdin.write.assert_called_once_with(b"GO\n")
+            else:
+                job.assign.assert_not_called()
+                self.assertEqual(child.pid, managed.pgid)
+            unsafe = processes.unsafe_process_state()
+            if verified and cleanup_error is None:
+                self.assertIsNone(unsafe)
+                processes.require_safe_process_launch()
+            else:
+                self.assertIsNotNone(unsafe)
+                with self.assertRaises(ProcessContainmentError):
+                    ManagedProcess(["must-never-launch"], cwd=self.root,
+                                   artifact_dir=self.root, stage="later-blocked")
+                self.assertEqual(1, launched.call_count, "uncertain descendants must block the next process")
+            return managed
+
+    def test_windows_after_go_flush_failure_verifies_owned_cleanup(self):
+        self.failed_initialization(BrokenPipeError("synthetic flush failed after GO"))
+
+    def test_windows_after_go_stdin_close_failure_preserves_original(self):
+        self.failed_initialization(OSError("synthetic stdin close failure"), failure="close")
+
+    def test_windows_after_go_keyboard_interrupt_cleans_before_reraise(self):
+        managed = self.failed_initialization(KeyboardInterrupt(), verified=False)
+        self.assertTrue(managed.cancelled)
+
+    def test_capture_failure_after_spawn_cleans_without_requiring_capture_objects(self):
+        for platform in ("nt", "posix"):
+            for failure in ("capture-first", "capture-second"):
+                with self.subTest(platform=platform, failure=failure):
+                    self.failed_initialization(RuntimeError("synthetic cannot start capture thread"),
+                                               platform=platform, failure=failure)
+
+    def test_unknown_cleanup_stays_sticky_when_emergency_metadata_cannot_be_written(self):
+        self.failed_initialization(RuntimeError("synthetic cannot start capture thread"),
+                                   platform="posix", failure="capture-first", verified=False, metadata_error=True)
+
+    def test_cleanup_exception_keeps_original_failure_and_blocks_later_launch(self):
+        self.failed_initialization(RuntimeError("synthetic cannot start capture thread"),
+                                   failure="capture-second", cleanup_error=OSError("synthetic cleanup inaccessible"))
+
+    def test_emergency_metadata_keeps_teardown_and_redacts_failure_credentials(self):
+        self.failed_initialization(RuntimeError("Bearer synthetic-private-token"), failure="capture-first")
+        text = (self.root / "constructor-failure.process.json").read_text(encoding="utf-8")
+        evidence = json.loads(text)
+        self.assertTrue(evidence["teardown"]["attempted"])
+        self.assertTrue(evidence["teardown"]["verified"])
+        self.assertNotIn("synthetic-private-token", text)
+        self.assertIn("[REDACTED]", text)
 
 
 class ProcessContainmentTests(unittest.TestCase):

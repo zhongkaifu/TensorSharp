@@ -307,6 +307,9 @@ class ManagedProcess:
         self.timed_out = False
         self.cancelled = False
         self._job = None
+        self._job_assigned = False
+        self._launch_permitted = False
+        self.process = self.pgid = self.stdout = self.stderr = None
         self.teardown = {"attempted": False, "verified": False,
                          "mechanism": "windows-job" if os.name == "nt" else "posix-process-group",
                          "reason": "process lifecycle has not completed"}
@@ -321,26 +324,96 @@ class ManagedProcess:
             self.process = subprocess.Popen(launch_command, cwd=str(cwd), env=self.env,
                                             stdin=subprocess.PIPE if self._job else subprocess.DEVNULL,
                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, **kwargs)
+            self.pgid = self.process.pid if os.name != "nt" else None
+            if self._job:
+                self._job.assign(self.process)
+                self._job_assigned = True
+                # A write/flush can partially succeed before raising. Once this
+                # begins, only the owned job can prove all targets terminated.
+                self._launch_permitted = True
+                self.process.stdin.write(b"GO\n")
+                self.process.stdin.flush()
+                self.process.stdin.close()
+            # Thread creation can fail after the target starts. Keep both
+            # capture constructors inside the same owned-lifecycle guard.
+            self.stdout = _Capture(self.process.stdout, capture_limit)
+            self.stderr = _Capture(self.process.stderr, capture_limit)
+        except BaseException as error:
+            if self.process is not None:
+                self._cleanup_initialization_failure("process_initialization", error)
+            elif self._job:
+                try:
+                    self._job.close()
+                except BaseException:
+                    pass  # No process started; preserve the original exception.
+            raise
+
+    def _cleanup_initialization_failure(self, phase, error):
+        """Contain a partially initialized child without needing capture threads.
+
+        This path must preserve the original exception, including cancellation,
+        and record uncertain ownership before any fallible diagnostic writes.
+        """
+        self.cancelled = isinstance(error, KeyboardInterrupt)
+        try:
+            if self._job and not self._job_assigned:
+                # The isolated launcher cannot start the target before GO. It
+                # may not belong to the job, so terminate only its own handle.
+                self.teardown.update(attempted=True, verified=False, actions=[])
+                if self._launch_permitted:
+                    raise RuntimeError("target launch permitted without verified job assignment")
+                if self.process.poll() is None:
+                    self.process.kill()
+                    self.teardown["actions"].append("terminate owned unassigned launcher")
+                self.process.wait(timeout=5)
+                self.teardown.update(verified=self.process.poll() is not None,
+                                     reason="owned launcher exited before target launch was permitted")
+                self._job.close()
+            else:
+                # Cancellation may arrive between Popen returning and storing
+                # its new-session identifier; recover it from the owned handle.
+                if self._job is None and self.pgid is None:
+                    self.pgid = self.process.pid
+                self.stop()
+        except BaseException as cleanup_error:
+            self.teardown.update(attempted=True, verified=False,
+                                 reason="initialization cleanup failed: " + type(cleanup_error).__name__ + ": " + str(cleanup_error))
             if self._job:
                 try:
-                    self._job.assign(self.process)
-                    self.process.stdin.write(b"GO\n")
-                    self.process.stdin.flush()
+                    self._job.close()
+                    self.teardown.setdefault("actions", []).append("job handle closed; termination outcome unverified")
                 except BaseException:
-                    self.process.stdin.close()
-                    self.process.kill()
-                    self.process.wait(timeout=5)
-                    self.process.stdout.close()
-                    self.process.stderr.close()
-                    raise
+                    pass
+        uncertain = self.teardown.get("verified") is not True
+        if uncertain:
+            self.teardown["attempted"] = True
+        result = {"command": [redact(v, self.secrets) for v in self.command], "stage": self.stage,
+                  "phase": phase, "environment_mode": self.environment_mode,
+                  "owned_pid": self.process.pid, "containment_failure": uncertain,
+                  "teardown": self.teardown, "cancelled": self.cancelled,
+                  "initialization_error": {"type": type(error).__name__, "message": redact(str(error), self.secrets)}}
+        _record_unsafe_resources(result)
+        # Do not wait on or close a stream still owned by a capture thread: a
+        # failed cleanup may leave its pipe open and blocking, including when a
+        # capture constructor raised after starting its reader. Daemon readers
+        # can finish after termination; close uncaptured pipes only when verified.
+        for name in ("stdout", "stderr"):
+            capture = getattr(self, name)
+            if capture is None and not uncertain:
+                try:
+                    getattr(self.process, name).close()
+                except BaseException:
+                    pass
+        try:
+            if self.process.stdin:
                 self.process.stdin.close()
         except BaseException:
-            if self._job:
-                self._job.close()
-            raise
-        self.pgid = self.process.pid if os.name != "nt" else None
-        self.stdout = _Capture(self.process.stdout, capture_limit)
-        self.stderr = _Capture(self.process.stderr, capture_limit)
+            pass
+        try:
+            text = redact(json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2), self.secrets)
+            (self.artifact_dir / (self.stage + ".process.json")).write_text(text + "\n", encoding="utf-8")
+        except BaseException:
+            pass  # Sticky unsafe state already prevents any later launch.
 
     def stop(self):
         if self.teardown["verified"]:

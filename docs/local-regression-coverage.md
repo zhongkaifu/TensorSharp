@@ -226,9 +226,9 @@ Earlier model reports retain their original narrower scope.
 | `embedding_media` | Verified EmbeddingGemma2 projector; bounded image/audio/video; finite vector, exact dimension and independent SHA-pinned vector oracle with numerical gates | Harness only; actual model/device run required |
 | `image_generation` | Bounded Qwen-Image generation; decode dimensions and nonconstant pixels; compare independent decoded RGBA8 pixel hash | Harness only; actual model/device run required |
 | `image_editing` | Approved input/mask and output oracle; decoded pixel identity, changed-region evidence and masked preservation metric; metric dependencies required | Harness only; actual model/device run required |
-| `video_generation` | Source-admitted family pipeline; decode complete bounded clip, shape/rate/frame count, finite/nonconstant content and approved RGB reference error | Harness only; actual model/device run required |
+| `video_generation` | Source-admitted family pipeline; actual returned diffusion seed, complete bounded decode, shape/rate/frame count, per-channel content variance and approved RGB reference error | Harness only; actual model/device run required |
 | `video_audio_generation` | Supported audio-producing family plus the video gates; complete decoded PCM sample-rate/channel/length checks and independent audio error oracle | Harness only; actual model/device run required |
-| `video_reference` | Family-admitted start/end/reference conditioning with explicit fixtures, pipeline evidence and complete output oracle; LTX Ingredients execution remains untested | Harness only; actual model/device run required |
+| `video_reference` | Family-admitted start/end/reference conditioning with SHA-pinned PNG/JPEG fixtures (<=32 MiB and each dimension <=1024 before loading), pipeline evidence, actual returned seed and complete output oracle; LTX Ingredients execution remains untested | Harness only; actual model/device run required |
 | `speculation` | Explicit supported learned head/drafter and benchmark; exact greedy token parity against plain baseline and positive draft/verify/accept evidence | Harness only; actual model/device run required |
 | `lora` | Pinned text LoRA, prompt and distinct approved base/adapted answers; load, use, unload and restored-baseline assertions | Harness only; actual model/device run required |
 | `multi_gpu` | Explicit physical devices, tensor/layer placement receipts and per-device budgets; teacher-forced token history and numerical parity | Harness only; multiple actual GPUs required |
@@ -260,14 +260,48 @@ The host and native receipts identify `ggml_cuda`; raw HTTP/SSE controls and
 verified owned-server teardown also passed. The Qwen3.5-0.8B Q8_0 weight SHA-256
 was `0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c`.
 Harness commit `f6e6e506206d62755efa08755c6d83ed19e249f8` had uncommitted
-changes; the client binaries declare the same build-source revision. Their
-recorded SHA-256 values are
+changes. The profile's shared source declaration names that revision; the native
+example was built from it, while the HTTP example reused the `b764dec` deployment.
+That shared declaration does not independently establish both binaries' compiler
+inputs. Their recorded SHA-256 values are
 `220757da421387082df93fdd732369975165c253ff094ecd4bee1a06e5959d98` (native) and
 `5b2b8e673b91a78dd7b655c07e536720d907329a1ea4c2c74d245e78b9e45c6c` (HTTP).
 This is bounded semantic parity with normal completion. Native and HTTP sampling
 seeds differ, so it does not establish exact token/logit parity, complete SDK
 wire history, cancellation/deadline recovery, cache-hit behavior or all client
 features. It is not qualification of a clean final source revision.
+
+## Current checkpoint qualification
+
+The `1783d3b` integration registers all 14 typed profile executors. It is not a
+claim that all model/device combinations pass. The completed runs below retain
+their original source/binary identities; targeted reruns do not rewrite earlier
+full-run counts. Evidence names refer to local ignored report directories under
+`D:/TensorSharp-regression-validation/artifacts/`, not published artifacts.
+
+| Completed run | Recorded outcome | Remaining qualification boundary |
+|---|---|---|
+| `native-cuda-f6e6e50/report.json` | 61 selected CTest tests: 47 pass, 1 fail, 13 skip | `minimax-h3-lora-cuda` fails the f32-base/f32-factors, guard-off reference assertion; maximum difference `0.000628856`. Skips remain unqualified. |
+| `native-cpu-5fa7ab0/report.json` | Original 41 selected CTest tests: 37 pass, 2 fail, 2 skip | `cpu-quantized-ffn-strip` still fails strict equality for Q2_K; reported maximum absolute difference `2.38418579e-07`. This assertion failure remains open. |
+| `minimax-cpu-5b78c99/report.json` | Targeted MiniMax executor rerun: 1 pass | The allocation-error message assertion was made portable in a test-only change. This resolves that targeted test, not the other CPU failure or the original full report. |
+| `native-cuda-profile-f6e6e50-dirty/report.json` | Both fixed direct-CUDA sentinels pass | Positive graph capture/replay and zero CPU fallback; only the two synthetic tests described above. |
+| `client-live-profile-f6e6e50-dirty/report.json` | Two native and four HTTP SDK modes pass; 12 required answers | Qwen3.5-0.8B Q8_0 with Windows `ggml_cuda`; bounded semantic/identity/normal-completion assertions only. |
+
+The original `components-b764dec/report.json` records 110 Knowledge tests passing
+and both model-free client contract lanes passing. Its server lane failed/timed
+out: 36 failures were traced to model-host environment settings incorrectly
+applied to model-free suites. `1783d3b` changes that environment policy, but the
+rebuilt suite rerun was pending at this snapshot. A separate FileLogger `Flush`
+failure and the overall timeout are not proven fixed. Studio's two missing-ffmpeg
+tests now check the skip prerequisite before directory operations; their rebuilt
+execution was also pending. Source corrections alone are not passing evidence.
+
+This checkpoint therefore does not establish an all-green full-regression or
+merge-ready result. Remaining numeric failures and component reruns must be
+resolved or explicitly accepted with their exact scope. Linux/WSL GPU,
+macOS/Metal/MLX, Vulkan, multi-GPU and authorized remote-node runs remain unrun in
+this qualification. The other typed profile classes still require their approved
+fixtures, budgets and actual model/device reports.
 
 Exact allowed keys, family/backend admission, fixtures and thresholds are enforced
 by the executors' `validate_profile`/`availability` functions:

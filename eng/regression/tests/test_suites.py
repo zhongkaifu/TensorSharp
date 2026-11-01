@@ -72,9 +72,39 @@ class SuiteSelectionTests(unittest.TestCase):
         self.assertIn("FullyQualifiedName!=InferenceWeb.Tests.WanVideoTests.TokenizerMatchesHuggingFaceReference", predicates)
         self.assertNotIn("FullyQualifiedName!~InferenceWeb.Tests.WanVideoTests", predicates,
                          "synthetic Wan tests should still execute")
-        self.assertEqual(2, len(server["excluded_fixtures"]))
+        self.assertEqual(2, len([item for item in server["excluded_fixtures"] if item["fixture_kind"] == "model_weights"]))
         self.assertTrue(all(item["reason"] for item in server["excluded_fixtures"]))
         self.assertFalse(specs["knowledge_unit"]["excluded_fixtures"])
+
+    def test_external_optional_inputs_are_exact_exclusions_not_model_weight_coverage(self):
+        expected = {
+            "InferenceWeb.Tests.Dsv41QuantizationTests.QuantizesTheHarnessVectorsForEveryMode":
+                ("quantization_vectors", "TS_DSV41_QUANT_VECTORS"),
+            "InferenceWeb.Tests.ImageProcessorTests.UserSuppliedJpegSmokeTestWhenConfigured":
+                ("user_media", "TENSORSHARP_JPEG_SMOKE_PATH"),
+            "InferenceWeb.Tests.ImageProcessorTests.UserSuppliedHeicSmokeTestWhenConfigured":
+                ("user_media", "TENSORSHARP_HEIC_SMOKE_PATH"),
+        }
+        spec = suites.list_suites(Path("unused"))[0]
+        predicates = spec["filter"].split("&")
+        records = {item["fully_qualified_name"]: item for item in spec["excluded_fixtures"]
+                   if item["fixture_kind"] != "model_weights"}
+        self.assertEqual(set(expected), set(records))
+        for name, (kind, variable) in expected.items():
+            with self.subTest(name=name):
+                self.assertIn("FullyQualifiedName!=" + name, predicates)
+                self.assertEqual("method", records[name]["match"])
+                self.assertEqual(kind, records[name]["fixture_kind"])
+                self.assertEqual(variable, records[name]["environment_variable"])
+                self.assertIn("absent", records[name]["reason"])
+        for name in ("InferenceWeb.Tests.Dsv41QuantizationTests", "InferenceWeb.Tests.ImageProcessorTests"):
+            self.assertNotIn("FullyQualifiedName!~" + name, predicates, "other synthetic tests remain eligible")
+
+        with patch.object(suites, "run_process") as launch:
+            planned = suites.run_suites(Path("unused"), Path("unused-output"), "plan", False, 10)[0]
+        launch.assert_not_called()
+        self.assertEqual(5, len(planned["excluded_fixtures"]))
+        self.assertTrue(all(item["status"] == "untested" for item in planned["excluded_fixtures"]))
 
     def test_prebuilt_assembly_command_and_report_keep_model_exclusions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -88,6 +118,8 @@ class SuiteSelectionTests(unittest.TestCase):
                 test_filter = command[command.index("--filter") + 1]
                 self.assertIn("&FullyQualifiedName!~InferenceWeb.Tests.WanVideoOracleTests", test_filter)
                 self.assertIn("&FullyQualifiedName!=InferenceWeb.Tests.WanVideoTests.TokenizerMatchesHuggingFaceReference", test_filter)
+                for item in suites.SERVER_EXTERNAL_FIXTURE_EXCLUSIONS:
+                    self.assertIn("FullyQualifiedName!=" + item["fully_qualified_name"], test_filter.split("&"))
                 for trait in ("Cuda", "Mlx", "GgmlCuda", "GgmlMetal", "GgmlVulkan"):
                     self.assertIn("Requires!=" + trait, test_filter.split("&"))
                 self.assertNotIn("Requires!=GgmlCpu", test_filter.split("&"))
@@ -105,8 +137,10 @@ class SuiteSelectionTests(unittest.TestCase):
                 result = suites.run_suites(repo, repo / "output", "run", False, 10)[-1]
             self.assertEqual("pass", result["status"])
             self.assertEqual(1, launch.call_count)
-            self.assertEqual(2, len(result["excluded_fixtures"]))
+            self.assertEqual(5, len(result["excluded_fixtures"]))
             self.assertTrue(all(item["status"] == "untested" for item in result["excluded_fixtures"]))
+            self.assertEqual({"model_weights", "quantization_vectors", "user_media"},
+                             {item["fixture_kind"] for item in result["excluded_fixtures"]})
 
     def test_new_assembly_sources_classify_external_wan_fixtures_as_models(self):
         repo = Path(__file__).resolve().parents[3]

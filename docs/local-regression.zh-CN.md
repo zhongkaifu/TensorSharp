@@ -331,8 +331,8 @@ python eng/run-local-regression.py --mode run --models qwen3.5-0.8b --scenarios 
 - `image_generation`：`parameters` 包括 `prompt,width,height,steps,cfg,seed`，可选 `negative_prompt`；尺寸为 32–512 且是 32 的倍数。`expected.pixel_sha256` 是经批准参考输出的**解码后 RGBA8 像素**哈希，不是 PNG 文件哈希。没有独立参考就不能据本次输出反填期望并宣布通过。
 - `image_editing`：使用同类生成参数，并提供 `fixtures.input`、`fixtures.mask`；`expected` 要有 `pixel_sha256` 和正的 `min_changed_mean_abs_diff`。执行器使用固定 fidelity 工具，需要 NumPy/Pillow，检查未蒙版区域保留、选区变化、黑蒙版无操作和错误蒙版拒绝。
 - `embedding_media`：`parameters` 为 `modality`（image/audio/video）、`text`、`dimensions`；`fixtures.media` 与 `fixtures.oracle` 都要固定哈希。oracle JSON 必须记录 `schema_version,model,projector,modality,media_sha256,text,dimensions,vector,provenance`。数值阈值不得宽于相对 L2 0.001 / cosine 0.999999；媒体限 2 MiB，PNG 不超过 512px，WAV 不超过 10 秒/48kHz/双声道，视频不超过 10 秒/32 帧/512px，视频路径需要 ffprobe/ffmpeg。
-- 三个 video 场景使用固定 CLI、ffprobe、ffmpeg。`parameters` 必须含 `prompt,width,height,frames,fps,steps,cfg,seed,sampler`；可选 `mode`（t2v/i2v/fl2v/ref）、`audio` 和 `max_output_bytes`。帧数至多 121、时长至多 10 秒、尺寸至多 1024，同时必须满足模型自己的时间/空间网格。输出总量也有上限。
-- 视频 oracle 是 `fixtures.reference_rgb`，表示完整 clip 的 RGB24 原始字节；`expected.max_rgb_rmse` 明确数值容差。参考输入可使用 `first_image`、`end_image`、`reference_image`。带音频时还必须有 interleaved little-endian float32 stereo 的 `reference_pcm`、`audio_samples_per_channel` 和 `max_audio_rmse`。这验证指定参考下的生成路径，不等于开放式语义质量。LTX profile 采用真实 `cpu/cuda/mlx` 执行器，不能用 GGML 别名冒充 GGML 内核覆盖。
+- 三个 video 场景使用固定 CLI、ffprobe、ffmpeg。`parameters` 必须含 `prompt,width,height,frames,fps,steps,cfg,seed,sampler`；可选 `mode`（t2v/i2v/fl2v/ref）、`audio` 和 `max_output_bytes`。帧数至多 121、时长至多 10 秒、尺寸至多 1024，同时必须满足模型自己的时间/空间网格。输出总量也有上限。`seed` 通过视频专用 `--diffusion-seed` 传入，并核对 CLI 完成记录中实际返回的 seed。
+- 视频 oracle 是 `fixtures.reference_rgb`，表示完整 clip 的 RGB24 原始字节；`expected.max_rgb_rmse` 明确数值容差。参考输入可使用 `first_image`、`end_image`、`reference_image`，每张必须是 PNG/JPEG、至多 32 MiB，且头部声明的宽高分别不超过 1024；模型启动前检查尺寸，实际解码仍由生成路径验证。带音频时还必须有 interleaved little-endian float32 stereo 的 `reference_pcm`、`audio_samples_per_channel` 和 `max_audio_rmse`。这验证指定参考下的生成路径，不等于开放式语义质量。LTX profile 采用真实 `cpu/cuda/mlx` 执行器，不能用 GGML 别名冒充 GGML 内核覆盖。
 - `jev_media` 使用 `fixtures.media` 和 `parameters.media_kind/state/questions`，`expected` 记录带媒体的 `decisions`、至少一个答案不同的 `control_decisions` 以及 `image_count`。媒体限 2 MiB；图片为可完整解码的 PNG 且各边不超过 512px；视频为 MP4/WebM、至多 10 秒/32 帧/512px，需要本地 ffprobe。image/video 需要匹配 projector 与积极的视觉就绪证据；未拥有本地 ASR 端点时，audio 分支明确未测试，不会转发到任意外部服务。
 
 推荐先对同一文件做 `plan`，再为有明确资源和夹具的子集做 `run`，最后加入全目录运行。缺少设备/输入和没有有效 oracle 的组合必须显示为未测试或阻塞，不能把“脚本退出 0”“文件存在”当作场景通过。
@@ -423,6 +423,24 @@ python eng/run-local-regression.py --mode run --scenarios native_ctest `
 `--strict` 不会仅因为显式 `unsupported` 就返回 3，所以必须同时审阅状态矩阵。全目录运行遇到配方、未验证硬件或缺少 profile，严格模式失败是诚实披露，而不是应该把这些状态改成通过。
 
 ## 11. 维护和合并前检查
+
+### 当前验证快照与未完成项
+
+`1783d3b` 已集成 14 个 typed profile 执行器，但没有证明完整矩阵全绿或已经满足合并条件。下面的已完成运行保留其原始源码和二进制身份；后续定点通过不会改写原始全轮计数。报告名均指本机 `D:/TensorSharp-regression-validation/artifacts/` 下的忽略产物，不是已发布附件。
+
+| 运行 | 已记录结果 | 尚未解决或明确的范围 |
+|---|---|---|
+| `native-cuda-f6e6e50` | 选中 61 项 CTest：47 通过、1 失败、13 跳过 | `minimax-h3-lora-cuda` 的 f32 base/f32 factors、guard off 参考断言失败，最大差值 `0.000628856`；跳过项仍未验证 |
+| `native-cpu-5fa7ab0` | 原始 41 项 CTest：37 通过、2 失败、2 跳过 | `cpu-quantized-ffn-strip` 的 Q2_K 严格相等断言仍失败，最大绝对差值 `2.38418579e-07`；数值小不能抹掉断言失败 |
+| `minimax-cpu-5b78c99` | 定点 MiniMax executor 重跑 1 项通过 | 仅修正测试对不同平台 allocation-error 文案的判断，不能据此把原始 CPU 全轮或另一个数值失败改成通过 |
+| `native-cuda-profile-f6e6e50-dirty` | 两项固定 direct CUDA 设备测试通过 | 实际图捕获/回放和零 CPU fallback；只覆盖前述两项合成测试 |
+| `client-live-profile-f6e6e50-dirty` | 两个原生模式、四个 HTTP SDK 模式，12 个回答通过 | 仅 Windows `ggml_cuda` + Qwen3.5-0.8B Q8_0 的固定语义、身份和正常完成断言 |
+
+原始 `components-b764dec/report.json` 中 Knowledge 110 项及两个无模型客户端契约通道通过。Server 通道失败并超时：其中 36 项失败可归因于把模型宿主环境设置施加到了无模型套件。`1783d3b` 已修正环境策略，但此快照中的重建/重跑结果仍待完成；独立的 FileLogger `Flush` 失败和整轮超时尚未证明修复。Studio 两项缺少 ffmpeg 的测试已调整为先检查跳过前提再操作目录，其重建后实测也待完成。源码修正不能直接登记为测试通过。
+
+剩余数值失败和组件重跑必须解决，或在明确范围下得到接受后再判断合并就绪。本轮仍没有 Linux/WSL GPU、macOS/Metal/MLX、Vulkan、多 GPU 或授权远端集群的实测通过证明；其他 typed profile 场景还需要批准的夹具、预算和实际模型报告。
+
+### 运行器自身与配置维护
 
 不运行模型即可检查运行器自身：
 

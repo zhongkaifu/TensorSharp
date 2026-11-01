@@ -22,6 +22,11 @@ oracles and resource declarations. Unrun hardware, unsupported submodes and
 broader quality or concurrency claims remain visible gaps. A
 [Chinese deployment guide](local-regression.zh-CN.md) is also available.
 
+For acceptance, read the [checkpoint qualification and open failures](local-regression-coverage.md#current-checkpoint-qualification).
+At the `1783d3b` integration snapshot, native CUDA and CPU numerical failures and
+component-suite reruns remained open. The passing bounded client/device profiles
+do not make the full matrix green or certify a clean final revision.
+
 ## Start with an audit and a plan
 
 Audit config coverage and inspect local eligibility without loading a model:

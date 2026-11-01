@@ -18,9 +18,27 @@ MANAGED_BUILD_PROPERTIES = ["-p:TensorSharpSkipGgmlNative=true", "-p:TensorSharp
 # Environment cleanup cannot prevent a test's hardcoded filesystem fallback.
 SERVER_MODEL_EXCLUSIONS = (
     {"fully_qualified_name": "InferenceWeb.Tests.WanVideoOracleTests", "match": "class",
+     "fixture_kind": "model_weights",
      "reason": "External Wan VAE/DiT weights and oracle fixtures; legacy tests use a fixed local fallback and may silently return or select another backend."},
     {"fully_qualified_name": "InferenceWeb.Tests.WanVideoTests.TokenizerMatchesHuggingFaceReference", "match": "method",
+     "fixture_kind": "model_weights",
      "reason": "External UMT5 GGUF tokenizer fixture; legacy test uses a fixed local fallback and silently returns when absent."},
+)
+
+# These ordinary Facts silently return when their optional external input is
+# absent. The model-free environment intentionally removes that input setting;
+# excluding the exact methods keeps a no-op from being reported as a passed test
+# even when deploying an older assembly without corrected prerequisite traits.
+SERVER_EXTERNAL_FIXTURE_EXCLUSIONS = (
+    {"fully_qualified_name": "InferenceWeb.Tests.Dsv41QuantizationTests.QuantizesTheHarnessVectorsForEveryMode",
+     "match": "method", "fixture_kind": "quantization_vectors", "environment_variable": "TS_DSV41_QUANT_VECTORS",
+     "reason": "External F32 quantization vectors and a separate oracle comparator are required; the legacy export fixture silently returns when its input is absent."},
+    {"fully_qualified_name": "InferenceWeb.Tests.ImageProcessorTests.UserSuppliedJpegSmokeTestWhenConfigured",
+     "match": "method", "fixture_kind": "user_media", "environment_variable": "TENSORSHARP_JPEG_SMOKE_PATH",
+     "reason": "An explicitly supplied JPEG fixture is required; the legacy smoke test silently returns when its input is absent."},
+    {"fully_qualified_name": "InferenceWeb.Tests.ImageProcessorTests.UserSuppliedHeicSmokeTestWhenConfigured",
+     "match": "method", "fixture_kind": "user_media", "environment_variable": "TENSORSHARP_HEIC_SMOKE_PATH",
+     "reason": "An explicitly supplied HEIC fixture is required; the legacy smoke test silently returns when its input is absent."},
 )
 
 
@@ -30,7 +48,7 @@ def list_suites(repo):
     for identifier, project in (("server_unit", "InferenceWeb.Tests"),
                                 ("knowledge_unit", "TensorSharp.Knowledge.Tests"),
                                 ("studio_unit", "TensorSharp.Studio.Tests")):
-        excluded = [dict(item) for item in SERVER_MODEL_EXCLUSIONS] if identifier == "server_unit" else []
+        excluded = [dict(item) for item in (*SERVER_MODEL_EXCLUSIONS, *SERVER_EXTERNAL_FIXTURE_EXCLUSIONS)] if identifier == "server_unit" else []
         # Prebuilt assemblies may have different skip gates: exclude GPU traits
         # in the runner as well as pinning GGML CPU in the child environment.
         test_filter = ("Category!=Bench&Requires!=Models&Requires!=Cuda&Requires!=Mlx"

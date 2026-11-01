@@ -1,10 +1,12 @@
 """Offline end-to-end harness policy tests; no real executables or models run."""
 from contextlib import ExitStack, redirect_stdout, redirect_stderr
+from copy import deepcopy
 import io
 import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -51,6 +53,8 @@ class RunnerTests(unittest.TestCase):
         self.stack.enter_context(patch.object(runner, "source_identity", return_value={"commit": "test", "branch": "test"}))
         self.stack.enter_context(patch.object(runner, "find_binary", return_value=[str(self.binary)]))
         self.hardware = self.stack.enter_context(patch.object(runner, "detect_hardware", return_value=machine()))
+        self.disk = self.stack.enter_context(patch.object(runner.shutil, "disk_usage",
+            return_value=SimpleNamespace(total=200 * GIB, used=100 * GIB, free=100 * GIB)))
         self.config = self.stack.enter_context(patch.object(runner, "read_config", return_value=self.resolved))
         self.availability = self.stack.enter_context(patch.object(runner, "availability", return_value=(True, "available")))
         self.prepare = self.stack.enter_context(patch.object(runner, "prepare_files", return_value=[{"sha256": "fixture-only"}]))
@@ -295,6 +299,176 @@ class RunnerTests(unittest.TestCase):
         self.prepare.assert_not_called()
         self.run.assert_not_called()
 
+    def changing_resource_fixture(self, *, scenarios=("cli_text",)):
+        self.catalog_data["presets"][0].update(backends=["ggml_cuda", "ggml_cpu"], scenarios=list(scenarios))
+        self.catalog_data["scenarios"] = [{"id": name, "status": "automated"} for name in scenarios]
+        self.catalog.write_text(json.dumps(self.catalog_data))
+        hardware = machine()
+        hardware["backends"]["ggml_cuda"] = {"available": True}
+        hardware["gpus"] = [{"index": 0, "memory_free_bytes": 16 * GIB}]
+        return hardware
+
+    def test_ram_or_vram_drop_during_prepare_skips_before_first_adapter(self):
+        original = self.model.read_bytes()
+        for resource in ("RAM", "VRAM"):
+            with self.subTest(resource=resource):
+                self.output = self.repo / "artifacts" / ("prepare-drop-" + resource)
+                current = [self.changing_resource_fixture()]
+                self.hardware.side_effect = lambda *_args, **_kwargs: deepcopy(current[0])
+
+                def prepare(*_):
+                    if resource == "RAM":
+                        current[0]["memory"]["available_bytes"] = GIB
+                    else:
+                        current[0]["gpus"][0]["memory_free_bytes"] = GIB
+                    return [{"sha256": "verified-before-resource-drop"}]
+
+                self.prepare.side_effect = prepare
+                code, report = self.invoke("--mode", "run", "--backend", "ggml_cuda")
+                self.assertEqual(3, code)
+                row = report["results"][-1]
+                self.assertEqual(("skip", "execution_resources", "ggml_cuda"),
+                                 (row["status"], row["stage"], row["backend"]))
+                self.assertIn("Resources changed after preparation", row["reason"])
+                self.assertIn(resource, row["reason"])
+                self.assertTrue(row["resource_plan"]["eligible"], "preparation was initially eligible")
+                self.assertFalse(row["execution_resource_plan"]["eligible"])
+                self.assertEqual("verified-before-resource-drop", row["model_identity"][0]["sha256"])
+                self.assertTrue(row["execution_resource_snapshot"]["checked_utc"])
+                self.assertEqual("ggml_cuda", row["reproduce"][row["reproduce"].index("--backend") + 1])
+                self.assertEqual(original, self.model.read_bytes(), "verified weights must be retained")
+        self.assertEqual(2, self.prepare.call_count)
+        self.run.assert_not_called()
+
+    def test_ram_or_vram_is_refreshed_between_cases_and_can_recover(self):
+        for resource in ("RAM", "VRAM"):
+            with self.subTest(resource=resource):
+                self.output = self.repo / "artifacts" / ("between-cases-" + resource)
+                high = self.changing_resource_fixture(scenarios=("cli_text", "cli_decode", "cli_prefill"))
+                low = deepcopy(high)
+                if resource == "RAM":
+                    low["memory"]["available_bytes"] = GIB
+                else:
+                    low["gpus"][0]["memory_free_bytes"] = GIB
+                self.hardware.reset_mock()
+                self.hardware.side_effect = [deepcopy(high), deepcopy(high), deepcopy(high), low, deepcopy(high)]
+                self.prepare.reset_mock()
+                self.run.reset_mock()
+                self.run.side_effect = lambda *_: {"status": "pass", "reason": "fixture passed"}
+                code, report = self.invoke("--mode", "run", "--backend", "ggml_cuda", "--strict")
+                rows = [row for row in report["results"] if row.get("preset")]
+                self.assertEqual(3, code)
+                self.assertEqual(["pass", "skip", "pass"], [row["status"] for row in rows])
+                self.assertIn(resource, rows[1]["reason"])
+                self.assertIn("preceding case", rows[1]["reason"])
+                self.assertEqual(["cli_text", "cli_prefill"], [call.args[0]["id"] for call in self.run.call_args_list])
+                self.assertEqual(5, self.hardware.call_count, "inventory, prepare, and every case need distinct snapshots")
+                self.prepare.assert_called_once()
+                self.assertTrue(all(row["resource_plan"]["eligible"] for row in rows))
+                self.assertTrue(rows[0]["execution_resource_plan"]["eligible"])
+                self.assertTrue(rows[2]["execution_resource_plan"]["eligible"])
+
+    def test_output_headroom_is_checked_after_prepare_even_without_scratch(self):
+        def prepare(*_):
+            self.disk.return_value = SimpleNamespace(free=5 * GIB - 1)
+            return [{"sha256": "verified"}]
+        self.prepare.side_effect = prepare
+        code, report = self.invoke("--mode", "run")
+        self.assertEqual(3, code)
+        row = report["results"][-1]
+        self.assertEqual("skip", row["status"])
+        self.assertIn("artifact volume lacks scratch/headroom", row["reason"])
+        self.assertTrue(row["execution_resource_plan"]["eligible"], "ample model volume cannot cover output volume")
+        disk = row["artifact_disk_plan"]
+        self.assertEqual((0, 5 * GIB, 5 * GIB - 1), (disk["scratch_bytes"], disk["required_bytes"], disk["free_bytes"]))
+        self.assertEqual(self.output / "cases" / "tiny--ggml_cpu" / "cli_text", Path(disk["path"]))
+        self.assertEqual(self.model.read_bytes(), b"GGUF-test-fixture")
+        self.run.assert_not_called()
+
+    def test_output_scratch_is_refreshed_between_cases_at_exact_boundary(self):
+        self.changing_resource_fixture(scenarios=("cli_text", "cli_decode"))
+        self.catalog_data["presets"][0]["resource_requirements"] = {"scratch_gib": 2}
+        self.catalog.write_text(json.dumps(self.catalog_data))
+        self.disk.return_value = SimpleNamespace(free=7 * GIB)
+
+        def first_case(*_):
+            self.disk.return_value = SimpleNamespace(free=7 * GIB - 1)
+            return {"status": "pass", "reason": "fixture passed"}
+        self.run.side_effect = first_case
+        code, report = self.invoke("--mode", "run", "--strict")
+        rows = [row for row in report["results"] if row.get("preset")]
+        self.assertEqual(3, code)
+        self.assertEqual(["pass", "skip"], [row["status"] for row in rows])
+        self.assertTrue(rows[0]["artifact_disk_plan"]["eligible"], "headroom plus scratch equality fits")
+        self.assertFalse(rows[1]["artifact_disk_plan"]["eligible"])
+        self.assertEqual(2 * GIB, rows[1]["artifact_disk_plan"]["scratch_bytes"])
+        self.assertEqual(7 * GIB - 1, rows[1]["artifact_disk_plan"]["free_bytes"])
+        self.run.assert_called_once()
+        self.prepare.assert_called_once()
+
+    def test_completed_download_and_output_scratch_are_not_recharged_to_cache(self):
+        self.catalog_data["presets"][0]["resource_requirements"] = {"scratch_gib": 2}
+        self.catalog.write_text(json.dumps(self.catalog_data))
+        current = [machine()]
+        self.hardware.side_effect = lambda *_args, **_kwargs: deepcopy(current[0])
+
+        def prepare(*_):
+            current[0]["disk"]["free_bytes"] = 5 * GIB
+            return [{"sha256": "verified"}]
+        self.prepare.side_effect = prepare
+        self.disk.return_value = SimpleNamespace(free=7 * GIB)
+        with patch.object(runner, "sizes_for", return_value=(10 * GIB, 10 * GIB)):
+            code, report = self.invoke("--mode", "run", "--allow-download")
+        self.assertEqual(0, code)
+        row = report["results"][-1]
+        self.assertEqual(12 * GIB, row["resource_plan"]["estimates"]["disk_required_bytes"])
+        self.assertEqual(0, row["execution_resource_plan"]["estimates"]["disk_required_bytes"])
+        self.assertEqual(10 * GIB, row["execution_resource_plan"]["estimates"]["weight_bytes"])
+        self.assertEqual(7 * GIB, row["artifact_disk_plan"]["required_bytes"])
+        self.prepare.assert_called_once()
+        self.run.assert_called_once()
+
+    def test_output_space_inventory_failure_cannot_launch(self):
+        self.disk.side_effect = OSError("output volume unavailable")
+        code, report = self.invoke("--mode", "run")
+        self.assertEqual(3, code)
+        row = report["results"][-1]
+        self.assertEqual("skip", row["status"])
+        self.assertIn("artifact volume free space unavailable", row["reason"])
+        self.assertIsNone(row["artifact_disk_plan"]["free_bytes"])
+        self.run.assert_not_called()
+
+    def test_unavailable_output_volume_stops_at_root_without_unbounded_walk(self):
+        # Simulate an unmounted drive without touching or disconnecting one.
+        # The finite side-effect sequence makes a missing root guard fail this
+        # test promptly instead of hanging the test process itself.
+        checks = [False] * (len(self.output.parents) + 1)
+        with patch.object(Path, "exists", side_effect=checks + [AssertionError("walk repeated the missing volume root")]) as exists:
+            resources, disk = runner.execution_resource_plans(runner.parse_args([]),
+                self.catalog_data["presets"][0], self.model.stat().st_size, "ggml_cpu", machine(), {},
+                self.catalog_data["scenarios"][0], self.output)
+        self.assertTrue(resources["eligible"])
+        self.assertFalse(disk["eligible"])
+        self.assertIsNone(disk["free_bytes"])
+        self.assertIn("artifact volume unavailable", disk["error"])
+        self.assertIn(str(self.output), disk["error"])
+        root = Path(disk["inventory_path"])
+        self.assertEqual(root, root.parent)
+        self.assertEqual(len(checks), exists.call_count)
+        self.disk.assert_not_called()
+        self.run.assert_not_called()
+
+    def test_logit_scratch_reserves_apply_before_adapter_entry(self):
+        for scenario, reserve in (("forced_logits", 256 * 1024 ** 2), ("forced_logits_sequence", GIB)):
+            with self.subTest(scenario=scenario):
+                self.output = self.repo / "artifacts" / scenario
+                self.changing_resource_fixture(scenarios=(scenario,))
+                self.disk.return_value = SimpleNamespace(free=5 * GIB + reserve - 1)
+                code, report = self.invoke("--mode", "run")
+                self.assertEqual(3, code)
+                self.assertEqual(reserve, report["results"][-1]["artifact_disk_plan"]["scratch_bytes"])
+        self.run.assert_not_called()
+
     def test_auto_backend_records_resource_rejection_and_cpu_selection(self):
         self.catalog_data["presets"][0]["backends"] = ["ggml_cuda", "ggml_cpu"]
         self.catalog.write_text(json.dumps(self.catalog_data))
@@ -400,6 +574,29 @@ class RunnerTests(unittest.TestCase):
         self.prepare.assert_not_called()
         self.run.assert_not_called()
 
+    def test_fresh_case_budget_distinguishes_two_encoder_retrieval_from_embeddings(self):
+        self.retrieval_fixture(mixed=True)
+        current = [deepcopy(self.hardware.return_value)]
+        self.hardware.side_effect = lambda *_args, **_kwargs: deepcopy(current[0])
+
+        def prepare(*_):
+            # After the 6.4 GiB physical reserve, one encoder fits but two do not.
+            current[0]["memory"]["available_bytes"] = 10 * GIB
+            return [{"sha256": "verified"}]
+        self.prepare.side_effect = prepare
+        code, report = self.invoke("--mode", "run", "--backend", "cpu", "--strict")
+        self.assertEqual(3, code)
+        rows = {row["scenario"]: row for row in report["results"] if row.get("preset")}
+        retrieval, embeddings = rows["retrieval_vector_cpu"], rows["server_embeddings"]
+        self.assertEqual(("skip", "pass"), (retrieval["status"], embeddings["status"]))
+        self.assertEqual(2, retrieval["execution_resource_plan"]["resident_models"]["instances"])
+        self.assertNotIn("resident_models", embeddings["execution_resource_plan"])
+        self.assertGreater(retrieval["execution_resource_plan"]["estimates"]["ram_required_bytes"],
+                           embeddings["execution_resource_plan"]["estimates"]["ram_required_bytes"])
+        self.assertEqual("server_embeddings", self.run.call_args.args[0]["id"])
+        self.run.assert_called_once()
+        self.prepare.assert_called_once()
+
     def test_retrieval_explicit_ram_requirement_is_total_for_both_instances(self):
         self.retrieval_fixture()
         code, report = self.invoke("--mode", "run", "--backend", "cpu",
@@ -410,6 +607,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(2.5, plan["overrides"]["ram_required_gib"])
         self.assertEqual("explicit_total_override", plan["resident_models"]["ram_estimate_source"])
         self.assertIn("both", plan["resident_models"]["ram_override_scope"])
+        self.assertEqual(int(2.5 * GIB), report["results"][-1]["execution_resource_plan"]["estimates"]["ram_required_bytes"])
 
     def test_retrieval_unselected_does_not_add_sidecar_memory(self):
         self.retrieval_fixture(mixed=True)
@@ -470,6 +668,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(75 * GIB, result["resource_plan"]["estimates"]["weight_bytes"])
         self.assertEqual(16 * GIB, result["resource_plan"]["estimates"]["ram_required_bytes"])
         self.assertEqual(6 * GIB, result["resource_plan"]["estimates"]["vram_required_bytes"])
+        self.assertEqual(16 * GIB, result["execution_resource_plan"]["estimates"]["ram_required_bytes"])
+        self.assertEqual(6 * GIB, result["execution_resource_plan"]["estimates"]["vram_required_bytes"])
         context = self.run.call_args.args[1]
         self.assertEqual({"CUDA_VISIBLE_DEVICES": "0", "TS_CPU_MOE": "1", "MAX_CONTEXT": "2048"}, context["env"])
         self.assertEqual("cpu_moe", context["offload_policy"]["name"])
