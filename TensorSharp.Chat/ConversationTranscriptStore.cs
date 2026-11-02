@@ -57,7 +57,7 @@ namespace TensorSharp.Server
     /// content), so concurrent conversations never overwrite each other. A record is
     /// spliced only when the client's assistant message equals what the server EMITTED
     /// for those tokens (the parsed content and tool calls, or the raw text), compared
-    /// ignoring whitespace: an assistant message a client wrote or edited renders from
+    /// preserving whitespace: an assistant message a client wrote or edited renders from
     /// its own text. Matching a record is also the possession proof that the request
     /// continues that record's conversation, which is how a stateless API request
     /// inherits its conversation's cache scope.
@@ -74,6 +74,7 @@ namespace TensorSharp.Server
         {
             public List<ChatMessage> Replacement;   // the generated message(s), raw tokens attached
             public EmittedAssistantTurn Emitted;
+            public string FinalThinking;   // the final round, before tool-loop reasoning is combined
             public string Scope;
             public long Tokens;
             // Which load of the model produced these tokens (ModelLifecycleService.LoadEpoch).
@@ -239,6 +240,7 @@ namespace TensorSharp.Server
         {
             if (generated?.RawOutputTokens is not { Count: > 0 } || emitted == null)
                 return;
+            string finalThinking = emitted.Thinking;
             history ??= Array.Empty<ChatMessage>();
             int visibleEnd = VisibleEnd(history);
 
@@ -284,7 +286,11 @@ namespace TensorSharp.Server
                 };
             }
 
-            var record = new TurnRecord { Replacement = replacement, Emitted = emitted, Scope = scope, Tokens = tokens, Epoch = epoch };
+            var record = new TurnRecord
+            {
+                Replacement = replacement, Emitted = emitted, FinalThinking = finalThinking,
+                Scope = scope, Tokens = tokens, Epoch = epoch,
+            };
             lock (_lock)
             {
                 if (!_chains.TryGetValue(key, out ChainEntry entry))
@@ -408,21 +414,23 @@ namespace TensorSharp.Server
             EmittedAssistantTurn emitted = record.Emitted;
             if (!ToolCallsEqual(client.ToolCalls, emitted.ToolCalls))
                 return false;
-            string clientThinking = Squash(client.Thinking);
-            string emittedThinking = Squash(emitted.Thinking);
+            // Whitespace can change code, quoted strings and ordinary words. A
+            // formatting change may forfeit reuse; it must not restore different text.
+            string clientThinking = client.Thinking ?? string.Empty;
+            string emittedThinking = emitted.Thinking ?? string.Empty;
             // A tool-loop transcript records every round's reasoning; a client may send back
-            // all of it or only the final round's, which is a suffix of it.
-            if (clientThinking.Length > 0 && emittedThinking.Length > 0
+            // all of it or only the complete final round, not an arbitrary suffix.
+            if (clientThinking.Length > 0
                 && !string.Equals(clientThinking, emittedThinking, StringComparison.Ordinal)
-                && !(record.Replacement.Count > 1 && emittedThinking.EndsWith(clientThinking, StringComparison.Ordinal)))
+                && !(record.Replacement.Count > 1 && string.Equals(clientThinking, record.FinalThinking, StringComparison.Ordinal)))
                 return false;
 
-            string clientContent = Squash(client.Content);
-            string emittedContent = Squash(emitted.Content);
+            string clientContent = client.Content ?? string.Empty;
+            string emittedContent = emitted.Content ?? string.Empty;
             if (string.Equals(clientContent, emittedContent, StringComparison.Ordinal))
                 return true;
             if (emitted.RawText != null
-                && string.Equals(clientContent, Squash(emitted.RawText), StringComparison.Ordinal))
+                && string.Equals(clientContent, emitted.RawText, StringComparison.Ordinal))
                 return true;
 
             // A stopped turn: the client kept what streamed before the stop, which can be
@@ -438,37 +446,20 @@ namespace TensorSharp.Server
             // generated part must be all there; the host's note is not model output.
             if (record.Replacement.Count > 1 && emittedContent.Length > 0
                 && clientContent.StartsWith(emittedContent, StringComparison.Ordinal))
-                return HostNoteFollows(client.Content ?? string.Empty, emittedContent.Length);
+                return HostNoteFollows(clientContent, emittedContent.Length);
 
             return false;
         }
 
-        /// <summary>After the first <paramref name="nonWhitespace"/> non-whitespace
-        /// characters of <paramref name="content"/>, the rest begins with a blank line.</summary>
-        private static bool HostNoteFollows(string content, int nonWhitespace)
+        /// <summary>After the exact emitted prefix of <paramref name="prefixLength"/>
+        /// characters, the rest begins with a blank line.</summary>
+        private static bool HostNoteFollows(string content, int prefixLength)
         {
-            int seen = 0, i = 0;
-            for (; i < content.Length && seen < nonWhitespace; i++)
-                if (!char.IsWhiteSpace(content[i]))
-                    seen++;
             int newlines = 0;
-            for (; i < content.Length && char.IsWhiteSpace(content[i]); i++)
+            for (int i = prefixLength; i < content.Length && char.IsWhiteSpace(content[i]); i++)
                 if (content[i] == '\n')
                     newlines++;
             return newlines >= 2;
-        }
-
-        /// <summary>Whitespace is not content: an adapter or client that trims, or
-        /// re-flows line endings, still sent back what it was given.</summary>
-        private static string Squash(string value)
-        {
-            if (string.IsNullOrEmpty(value))
-                return string.Empty;
-            var sb = new StringBuilder(value.Length);
-            foreach (char c in value)
-                if (!char.IsWhiteSpace(c))
-                    sb.Append(c);
-            return sb.ToString();
         }
 
         private static bool ToolCallsEqual(IReadOnlyList<ToolCall> a, IReadOnlyList<ToolCall> b)
@@ -485,8 +476,8 @@ namespace TensorSharp.Server
             return true;
         }
 
-        /// <summary>Tool arguments as JSON with object keys sorted, so the same call
-        /// compares equal whichever side serialized it.</summary>
+        /// <summary>Tool arguments as JSON with object keys sorted, preserving exact
+        /// numeric spellings rather than conflating values through floating point.</summary>
         internal static string CanonicalArguments(Dictionary<string, object> arguments)
         {
             if (arguments == null || arguments.Count == 0)
@@ -533,9 +524,10 @@ namespace TensorSharp.Server
                     sb.Append(']');
                     break;
                 case JsonValueKind.Number:
-                    sb.Append(element.TryGetDouble(out double d)
-                        ? d.ToString("R", System.Globalization.CultureInfo.InvariantCulture)
-                        : element.GetRawText());
+                    // Keep the exact JSON number: a Double round-trip aliases distinct
+                    // large integers/decimals and can replay the wrong tool argument.
+                    // Different spellings may safely miss rather than lose precision.
+                    sb.Append(element.GetRawText());
                     break;
                 default:
                     sb.Append(element.GetRawText());
