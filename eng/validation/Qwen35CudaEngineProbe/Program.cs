@@ -18,6 +18,18 @@ using TensorSharp;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
 
+// This diagnostic has a CPU-only plan mode and must be dispatched before the
+// ordinary probe requires a model path. Existing modes keep their defaults.
+if (args.Length >= 2 && args[0] == "--mixed-capacity-trace")
+{
+    if (args.Length > 3 || (args.Length == 3 && args[2] != "--plan-only"))
+        throw new ArgumentException("Use --mixed-capacity-trace <fresh-output> [--plan-only].");
+    return args.Length == 3
+        ? MixedCapacityTrace.Plan(args[1])
+        : MixedCapacityTrace.Run(Environment.GetEnvironmentVariable("TS_TEST_QWEN35_MODEL")
+            ?? throw new ArgumentException("Set TS_TEST_QWEN35_MODEL."), args[1]);
+}
+
 const int Steps = 24;
 string prompt = string.Concat(Enumerable.Repeat(
     "The river flows through a green valley. Trees grow beside the water and birds fly overhead. " +

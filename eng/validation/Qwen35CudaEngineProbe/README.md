@@ -199,3 +199,91 @@ batched prefill. It loads no drafter. The opt-in arm must record actual prepared
 launches. Both processes must complete and produce identical traces. These
 checks establish numerical equivalence for their inputs, independently of the
 separate answer-quality and long-context retrieval evaluations.
+
+## Mixed prefill/Verify at full row capacity
+
+`--mixed-capacity-trace <fresh-output>` loads one Qwen3.8-27B model with no
+drafter and ubatch 4096. It uses the primary slot plus eight additional slots:
+each first receives a fixed seven-token prefix, then one mixed call submits
+4096 prefill rows and eight Verify lanes of eight rows. Thus all 4160 rows of
+`MixedRowCapacity` and nine of sixteen slot-table entries are exercised.
+The Verify lanes commit respectively 1..8 rows, then all nine slots receive
+eight fixed teacher-forced batched decode steps. Reset repeats that exact
+schedule for a full-bit A/A check. This does not compare separate and mixed
+forwards, whose projection shapes and split-K numerics can differ.
+
+Build managed code and check the plan without a model, CUDA calls or GPU:
+
+```sh
+dotnet build eng/validation/Qwen35CudaEngineProbe -c Release --no-restore \
+  -p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true \
+  -p:UseSharedCompilation=false -nodeReuse:false --disable-build-servers
+probe=eng/validation/Qwen35CudaEngineProbe/bin/Release/net10.0/Qwen35CudaEngineProbe.dll
+dotnet "$probe" --mixed-capacity-trace artifacts/q35-mixed/plan --plan-only
+```
+
+The plan must say `PLAN_ONLY_GPU_NOT_RUN`; its geometry and reflection checks
+are CPU evidence only. Run the two actual arms sequentially, on an exclusively
+leased GPU, with the same source, binary, model and other flags. Output paths
+must not already exist. If running outside the checkout, set
+`TS_PROBE_SOURCE_ROOT` to that checkout. These commands keep production split-K:
+
+```sh
+export TS_TEST_QWEN35_MODEL=/models/Qwen3.8-27B-NVFP4-MTP-N4_0.gguf
+export TS_Q35_GEMM_SPLITK=1 TS_Q35_ATTN_PREFILL=1 TS_Q35_DRAFT_SPLITK=1
+export TS_Q35_CUDA_GRAPHS=0 TS_Q35_VERIFY_GRAPHS=0
+export TS_Q35_GREEDY_VERIFY=0 TS_Q35_TOPK_PARTITIONED=0
+TS_Q35_GDN_PREPARED_PREFILL=0 dotnet "$probe" --mixed-capacity-trace artifacts/q35-mixed/off
+TS_Q35_GDN_PREPARED_PREFILL=1 dotnet "$probe" --mixed-capacity-trace artifacts/q35-mixed/on
+```
+
+The last Head inside `MixedVerify` computes all 64 Verify logits but normally
+returns only their IDs. This probe immediately synchronizes the engine stream
+and reads that existing private `_logits` allocation before Commit or another
+forward. It does not recompute Head or modify production APIs. Exact private
+field/type and internal D2H-method signature checks fail closed if that layout
+changes. Source and loaded assembly SHA values are recorded; external build
+provenance must establish that the recorded source produced those assemblies.
+This reflection diagnostic is deliberately limited to the reviewed implementation.
+
+Each arm saves 38 complete F32 records (146 full vocabulary rows per repeat),
+18 I32 drawn-token files, input arrays/hashes and exact positions. For a 248320
+vocabulary this is about 277 MiB of F32 snapshots per arm. Non-finite logits,
+missing dispatches, mismatching CPU first-max IDs or any reset A/A byte
+difference fail without relaxing a tolerance. Raw mixed outputs are persisted
+before those checks. Enabled runs must actually use the projection-tail alias
+and launch one prepared pass per recurrent layer per mixed call. The public
+prepared-launch counter is observed; other dispatch routes are explicitly
+source-derived rather than presented as kernel-profiler measurements.
+
+Check both completed manifests and compare every saved output byte:
+
+```sh
+python3 - artifacts/q35-mixed/off artifacts/q35-mixed/on <<'PY'
+import hashlib, json, pathlib, sys
+a, b = map(pathlib.Path, sys.argv[1:])
+r = [json.loads((p / 'run.json').read_text()) for p in (a, b)]
+assert all(x['complete'] is True and x['status'] == 'COMPLETE_STRICT_RESET_AA' for x in r)
+assert [x['flags']['TS_Q35_GDN_PREPARED_PREFILL'] for x in r] == ['0', '1']
+assert {k:v for k,v in r[0]['flags'].items() if k != 'TS_Q35_GDN_PREPARED_PREFILL'} == {k:v for k,v in r[1]['flags'].items() if k != 'TS_Q35_GDN_PREPARED_PREFILL'}
+assert r[0]['definition'] == r[1]['definition'] and r[0]['model'] == r[1]['model']
+for key in ('source_files', 'engine_assembly', 'probe_assembly'):
+    assert r[0]['provenance'][key] == r[1]['provenance'][key]
+inputs = [(p / 'inputs.json').read_bytes() for p in (a, b)]
+assert inputs[0] == inputs[1] and all(hashlib.sha256(x).hexdigest() == y['inputs_sha256'] for x,y in zip(inputs,r))
+assert (a / 'trace.json').read_bytes() == (b / 'trace.json').read_bytes()
+trace = json.loads((a / 'trace.json').read_text())
+keys = {f'prefix-{i}' for i in range(9)} | {'mixed-prefill', 'mixed-verify'} | {f'teacher-{i}' for i in range(8)}
+assert len(trace) == 38 and {(x['repeat'], x['key']) for x in trace} == {(i,k) for i in range(2) for k in keys}
+for x in trace:
+    for name, digest, size in ((x['file'], x['sha256'], x['bytes']), (x['drawn_file'], x['drawn_sha256'], x['rows'] * 4)):
+        if name is None: continue
+        lhs, rhs = (a / name).read_bytes(), (b / name).read_bytes()
+        assert len(lhs) == size and hashlib.sha256(lhs).hexdigest() == digest and lhs == rhs
+print('PASS: completed mixed-capacity reset A/A and fresh-process off/on full-output bits')
+PY
+```
+
+Do not label an incomplete arm, a failed A/A, or a CPU-only plan as a GPU pass.
+This mode is a capacity/continuation correctness diagnostic and makes no
+performance, arbitrary-partition equivalence or answer-quality claim.
