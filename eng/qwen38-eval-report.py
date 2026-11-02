@@ -16,6 +16,10 @@ screenshot object may include image_path to embed an existing local image.
 missingEngines accepts strings or objects with engine/status/reason/mode/label.
 Unknown context fields are retained in a collapsed metadata section. Generated
 reports belong in ignored docs/validation/ or artifacts/.
+
+measurement_groups maps whole raw-input SHA256 strings to explicit group IDs.
+Unmapped inputs are UNSPECIFIED, isolated internally by source SHA; host identity
+is never inferred from a label, GPU model, or context narrative.
 """
 from __future__ import annotations
 
@@ -44,6 +48,7 @@ spec.loader.exec_module(metrics)
 STATUS_NAMES = {"PASS": "通过", "FAIL": "未通过", "INCOMPLETE": "不完整", "UNSUPPORTED": "不支持 / 容量拒绝",
                 "NOT_RUN": "未执行", "BUILD_FAILED": "构建失败", "ERROR": "执行错误"}
 DEFAULT_LIMITATIONS = [
+    "测量组仅由原始输入文件 SHA256 的显式映射确定。不同组的延迟和区间不可合并；UNSPECIFIED 未确认主机，不能据此作跨机排名。",
     "只有全部预期重复完成且所有功能检查、配置的基线检查均通过，才展示该场景的性能。失败、缺失、容量拒绝不算验证通过。",
     "表中性能为中位数。95% 区间按整个重复轮次进行 cluster bootstrap；重复很少时，区间仍不足以证明稳定优势。",
     "本报告不自动宣布赢家。差异小于 5% 不能宣称领先；不同检查点、量化、KV 精度、drafter、上下文容量或活动并发数不能隔离比较引擎本身。",
@@ -91,16 +96,44 @@ def collect_inputs(inputs):
     return list(dict.fromkeys(paths)), warnings
 
 
-def load_runs(paths):
-    """Keep the last invocation per engine/mode/label, preserving input provenance."""
+def measurement_groups(context):
+    raw = context.get("measurement_groups", {})
+    if not isinstance(raw, dict):
+        raise ValueError("measurement_groups must map raw input SHA256 strings to nonempty group IDs")
+    result = {}
+    for source_sha, group in raw.items():
+        if not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", source_sha):
+            raise ValueError("measurement_groups keys must be 64-character raw input SHA256 strings")
+        if (not isinstance(group, str) or not group.strip() or group != group.strip()
+                or group == "UNSPECIFIED" or group.startswith("UNSPECIFIED:")):
+            raise ValueError("measurement_groups values must be nonempty, trimmed group IDs; UNSPECIFIED is reserved")
+        source_sha = source_sha.lower()
+        if source_sha in result and result[source_sha] != group:
+            raise ValueError(f"conflicting measurement_groups assignments for SHA256 {source_sha}")
+        result[source_sha] = group
+    return result
+
+
+def measurement_identity(run):
+    return {"measurement_group": run.get("measurement_group", "UNSPECIFIED"),
+            "source_sha256": run.get("source_sha256")}
+
+
+def load_runs(paths, groups=None):
+    """Last invocation per group/profile; unknown profiles are isolated by source SHA."""
+    groups = measurement_groups({"measurement_groups": groups if groups is not None else {}})
     runs, diagnostics, sources, superseded = {}, [], [], 0
     for path in paths:
         current, recognised = None, 0
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            source_bytes = path.read_bytes()
+            lines = source_bytes.decode("utf-8").splitlines()
         except (OSError, UnicodeError) as error:
             diagnostics.append(f"无法读取 {path}: {error}")
             continue
+        source_sha = hashlib.sha256(source_bytes).hexdigest()
+        group = groups.get(source_sha, "UNSPECIFIED")
+        isolation = group if group != "UNSPECIFIED" else "UNSPECIFIED:" + source_sha
         for line_no, line in enumerate(lines, 1):
             if not line.strip():
                 continue
@@ -112,9 +145,10 @@ def load_runs(paths):
             if not isinstance(rec, dict):
                 continue
             if rec.get("kind") == "run" and rec.get("engine"):
-                current = (str(rec["engine"]), str(rec.get("mode", "plain")), str(rec.get("label", "")))
+                current = (str(rec["engine"]), str(rec.get("mode", "plain")), str(rec.get("label", "")), isolation)
                 superseded += current in runs
-                runs[current] = {"header": rec, "cases": [], "source": str(path), "header_line": line_no}
+                runs[current] = {"header": rec, "cases": [], "source": str(path), "header_line": line_no,
+                                 "measurement_group": group, "source_sha256": source_sha}
                 recognised += 1
             elif rec.get("kind") == "case" and current and rec.get("scenario") is not None:
                 header_id = runs[current]["header"].get("run_id")
@@ -122,12 +156,14 @@ def load_runs(paths):
                     diagnostics.append(f"run_id 不匹配：{path}:{line_no}；此 case 未用于评估")
                     continue
                 runs[current]["cases"].append(rec)
-        sources.append({"path": str(path), "bytes": path.stat().st_size,
-                        "sha256": digest_file(path), "recognised_run_headers": recognised})
+        sources.append({"path": str(path), "bytes": len(source_bytes), "sha256": source_sha,
+                        "measurement_group": group, "recognised_run_headers": recognised})
+        if recognised and group == "UNSPECIFIED":
+            diagnostics.append(f"测量组未映射：{path}；UNSPECIFIED 按原始输入 SHA256 隔离，不推断主机。")
         if not recognised:
             diagnostics.append(f"未发现 engine-bench run header：{path}；未将其他日志格式解释成引擎成绩")
     if superseded:
-        diagnostics.append(f"相同 engine/mode/label 有 {superseded} 个较早 invocation 被后读取的 header 替换；未合并不同运行。")
+        diagnostics.append(f"相同测量组内 engine/mode/label 有 {superseded} 个较早 invocation 被后读取的 header 替换；未合并不同运行，UNSPECIFIED 按输入 SHA256 隔离。")
     return runs, diagnostics, sources
 
 
@@ -230,6 +266,7 @@ def functional_answer_counts(header, cases, scenario):
 
 def empty_row(engine, mode, label, scenario, status="NOT_RUN", reason="未执行此场景", expected=None):
     return {"engine": engine, "mode": mode, "label": label, "scenario": scenario,
+            "measurement_group": "UNSPECIFIED", "source_sha256": None,
             "status": status, "reason": reason, "repeats": 0, "expected_repeats": expected,
             "pass": 0, "checks_passed": 0, "checks_total": 0, "quality_rate": None,
             "metrics": {}, "errors": []}
@@ -255,7 +292,7 @@ def summarise_run(key, run, min_decode_tokens):
     out = []
     for scenario in scenarios:
         if scenario not in summaries:
-            out.append(empty_row(*key, scenario, "INCOMPLETE", "run header 计划了此场景，但没有 case", expected))
+            out.append(empty_row(*key[:3], scenario, "INCOMPLETE", "run header 计划了此场景，但没有 case", expected))
             continue
         summary, group = summaries[scenario], grouped[scenario]
         status = summary["quality_gate"] if valid_expected else "INCOMPLETE"
@@ -301,6 +338,8 @@ def summarise_run(key, run, min_decode_tokens):
             row["functional_answers"] = {"correct": sum(item["n_correct"] for item in answers),
                                          "total": sum(item["n_questions"] for item in answers)}
         out.append(row)
+    for row in out:
+        row.update(**measurement_identity(run), source=run["source"], run_id=header.get("run_id"))
     return out
 
 
@@ -323,7 +362,8 @@ def missing_engines(context):
 
 
 def build_summary(paths, context, min_decode_tokens=32, initial_warnings=()):
-    runs, diagnostics, sources = load_runs(paths)
+    groups = measurement_groups(context)
+    runs, diagnostics, sources = load_runs(paths, groups)
     rows = [row for key, run in runs.items() for row in summarise_run(key, run, min_decode_tokens)]
     missing = []
     for entry in missing_engines(context):
@@ -335,8 +375,13 @@ def build_summary(paths, context, min_decode_tokens=32, initial_warnings=()):
             missing.append(entry)
     scenarios = list(dict.fromkeys([row["scenario"] for row in rows] + list(context.get("plannedScenarios", []))))
     for key, run in runs.items():
-        present = {row["scenario"] for row in rows if (row["engine"], row["mode"], row["label"]) == key}
-        rows += [empty_row(*key, scenario) for scenario in scenarios if scenario not in present]
+        present = {row["scenario"] for row in rows if (row["engine"], row["mode"], row["label"]) == key[:3]
+                   and row["measurement_group"] == run["measurement_group"] and row["source_sha256"] == run["source_sha256"]}
+        for scenario in scenarios:
+            if scenario not in present:
+                row = empty_row(*key[:3], scenario)
+                row.update(**measurement_identity(run), source=run["source"], run_id=run["header"].get("run_id"))
+                rows.append(row)
     for entry in missing:
         key = (entry["engine"], str(entry.get("mode", "—")), str(entry.get("label", "")))
         for scenario in scenarios:
@@ -344,12 +389,14 @@ def build_summary(paths, context, min_decode_tokens=32, initial_warnings=()):
                 rows.append(empty_row(*key, scenario, entry["status"], str(entry.get("reason", "无实际运行数据"))))
     return safe_json({"schema": REPORT_VERSION, "generated_at": datetime.now(timezone.utc).isoformat(),
         "context": context, "sources": sources, "diagnostics": list(initial_warnings) + diagnostics,
-        "selection_policy": "按输入文件和行顺序读取；相同 engine/mode/label 仅保留最后的 run header 及其 cases，不合并 invocation。",
+        "measurement_groups": groups,
+        "selection_policy": "按输入文件和行顺序读取；相同测量组内 engine/mode/label 仅保留最后的 run header 及其 cases。UNSPECIFIED 按原始输入 SHA256 隔离，不合并 invocation 或跨组重复。",
         "method": {"min_decode_tokens": min_decode_tokens, "performance_gate": "all_expected_repeats_and_all_quality_checks",
                    "confidence_intervals": "95% cluster bootstrap by whole repeats, 2000 resamples; no winner inference",
+                   "measurement_groups": "explicit raw input SHA256 mapping; unknown inputs isolated by SHA; latency/CI never pooled across runs or groups",
                    "winner_policy": "none; <5% differences do not establish a lead"},
         "runs": [{"engine": key[0], "mode": key[1], "label": key[2], "source": run["source"],
-                  "header_line": run["header_line"], "header": run["header"]} for key, run in runs.items()],
+                  **measurement_identity(run), "header_line": run["header_line"], "header": run["header"]} for key, run in runs.items()],
         "rows": rows, "missing_engines": missing, "status_counts": dict(Counter(row["status"] for row in rows)),
         "limitations": DEFAULT_LIMITATIONS})
 
@@ -390,12 +437,13 @@ def metric_cell(row, name, decimals=3):
 def data_table(rows, table_id):
     if not rows:
         return '<p class="empty">未执行：没有此类场景的可核验原始测量。</p>'
-    parts = [f'<div class="table-wrap"><table id="{esc(table_id)}"><thead><tr>',
-             '<th>引擎 / 模式</th><th>场景</th><th>状态</th><th>质量检查</th><th>重复通过 / 计划</th>',
+    parts = ['<p class="method">仅同测量组内比较延迟和区间；UNSPECIFIED 表示主机未标注，按输入 SHA 隔离。</p>',
+             f'<div class="table-wrap"><table id="{esc(table_id)}"><thead><tr>',
+             '<th>引擎 / 模式</th><th>测量组</th><th>场景</th><th>状态</th><th>质量检查</th><th>重复通过 / 计划</th>',
              '<th>TTFT · s</th><th>总耗时 · s</th><th>Decode · tok/s</th><th>Prefill · tok/s</th><th>输入 token</th></tr></thead><tbody>']
     for row in rows:
         status, m = row["status"], row["metrics"]
-        search = " ".join(str(row.get(key, "")) for key in ("engine", "mode", "label", "scenario", "status"))
+        search = " ".join(str(row.get(key, "")) for key in ("engine", "mode", "label", "scenario", "status", "measurement_group"))
         quality = (f"{row['quality_rate'] * 100:.1f}% <small>{row['checks_passed']}/{row['checks_total']} 检查</small>"
                    if finite(row.get("quality_rate")) else "—")
         if row.get("functional_answers"):
@@ -419,6 +467,8 @@ def data_table(rows, table_id):
         parts += [f'<tr data-search="{esc(search.lower())}" data-status="{esc(status)}">',
                   f'<td><strong>{esc(row["engine"])}</strong><small>{esc(row["mode"])}</small>'
                   + (f'<small class="label">{esc(row["label"])}</small>' if row.get("label") else "") + '</td>',
+                  f'<td><code>{esc(row.get("measurement_group", "UNSPECIFIED"))}</code>'
+                  + (f'<small>input {esc(row["source_sha256"][:12])}</small>' if row.get("source_sha256") else "") + '</td>',
                   f'<td><code>{esc(row["scenario"])}</code></td>',
                   f'<td><span class="badge {esc(status.lower())}" title="{esc(reason)}">{esc(STATUS_NAMES.get(status, status))}</span></td>',
                   f'<td class="number">{quality}</td><td class="number">{repeats}</td>',
@@ -501,7 +551,10 @@ def main(argv=None):
     if not isinstance(context, dict):
         ap.error("--context-json must contain a JSON object")
     paths, warnings = collect_inputs(args.inputs)
-    summary = build_summary(paths, context, args.min_decode_tokens, warnings)
+    try:
+        summary = build_summary(paths, context, args.min_decode_tokens, warnings)
+    except ValueError as error:
+        ap.error(str(error))
     html = render_html(summary)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(html, encoding="utf-8")

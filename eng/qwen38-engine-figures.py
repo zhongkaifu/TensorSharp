@@ -4,9 +4,17 @@
 No engine is run and no response is rescored. The existing report parser and
 original quality gate are reused. Matplotlib is imported only when rendering;
 --data-only and data-extraction tests need only the Python standard library.
+Use --context-json for measurement_groups (raw input SHA256 -> group ID).
+Rendering rejects multiple groups or multiple UNSPECIFIED input hashes;
+select one --measurement-group and output directory per group. One unmapped
+input remains compatible with the old CLI; no host is inferred for it.
 
   python eng/qwen38-engine-figures.py 'docs/validation/run/raw/*.jsonl' \
-      --output-dir docs/validation/run/figures --exclude-label '*warmup*'
+      --context-json docs/validation/run/context.json --measurement-group vm1 \\
+      --output-dir docs/validation/run/figures-vm1 --exclude-label '*warmup*'
+
+Example context: {"measurement_groups": {"<raw-input-SHA256>": "vm1"}}.
+The SHA is the entire original JSONL file, not a label or a generated summary.
 """
 from __future__ import annotations
 
@@ -35,6 +43,7 @@ LONG = ("long_prompt_128k", "long_prompt_250k")
 RATE_SOURCE = "tokenizer_visible_content_minus_first_semantic_payload"
 TOKEN_SOURCES = ("usage", "tokenizer", "server_timings")
 LIMITATIONS = [
+    "Measurement groups come only from explicit raw input SHA256 mappings. Latency/CI are not pooled across runs or groups. UNSPECIFIED inputs have no verified host; multi-group/multi-unknown-source rendering is rejected.",
     "Original benchmark checks are reused without rescoring. In particular, the code check is not a proof of program correctness.",
     "Speed is withheld unless all expected repeats pass every original check. Decode additionally requires >=128 completion and visible tokens, reliable token counts, and the recorded v3 first-payload tokenizer evidence.",
     "Decode is a client stream estimate after the first semantic payload, not GPU kernel throughput; speculative output bursts affect it. TTFT includes client/server overhead.",
@@ -65,6 +74,7 @@ def selected(label, include, exclude):
 def identity(key, run, scenario, summaries):
     row = summaries.get(scenario, {})
     return {"engine": key[0], "mode": key[1], "label": key[2], "scenario": scenario,
+            **report.measurement_identity(run),
             "run_id": run["header"].get("run_id"), "source": run["source"],
             "original_gate": row.get("status", "NOT_RUN"),
             "expected_repeats": run["header"].get("repeats"),
@@ -195,17 +205,27 @@ def long_row(key, run, scenario, summaries):
     return row
 
 
-def build_data(paths, include=(), exclude=(), min_decode_tokens=128, initial_warnings=()):
+def build_data(paths, include=(), exclude=(), min_decode_tokens=128, initial_warnings=(), context=None, measurement_group=None):
     if not integer(min_decode_tokens, 128):
         raise ValueError("min_decode_tokens must be an integer >=128")
-    runs, warnings, sources = report.load_runs(paths)
+    groups = report.measurement_groups(context if context is not None else {})
+    runs, warnings, sources = report.load_runs(paths, groups)
     kept = {key: run for key, run in sorted(runs.items()) if selected(key[2], include, exclude)}
+    if measurement_group is not None:
+        if not isinstance(measurement_group, str) or not measurement_group.strip() or measurement_group != measurement_group.strip():
+            raise ValueError("--measurement-group must be a nonempty, trimmed group ID")
+        if measurement_group not in {run["measurement_group"] for run in kept.values()}:
+            raise ValueError(f"unknown --measurement-group or no selected input in group: {measurement_group}")
+        kept = {key: run for key, run in kept.items() if run["measurement_group"] == measurement_group}
     data = {"schema": VERSION, "generated_at": datetime.now(timezone.utc).isoformat(),
             "python_version": sys.version,
             "sources": sources, "diagnostics": list(initial_warnings) + warnings,
+            "measurement_groups": groups,
             "selection": {"include_label_globs": list(include), "exclude_label_globs": list(exclude),
                           "order": "engine, mode, label alphabetically; never by measured performance",
-                          "invocations": "existing report policy: last run per engine/mode/label; never merged",
+                          "invocations": "last run per measurement group/engine/mode/label; never merged; UNSPECIFIED isolated by raw input SHA256",
+                          "measurement_group_filter": measurement_group,
+                          "measurement_groups": sorted({run["measurement_group"] for run in kept.values()}),
                           "selected_runs": len(kept), "excluded_runs": len(runs) - len(kept)},
             "method": {"min_decode_tokens": min_decode_tokens, "bootstrap": "repeat clusters, 2000 resamples, seed1234, percentile95%",
                        "quality_counts": "original strict n_correct/n_questions, validated against question checks and complete identities; any request.error withholds the quality point; no CI",
@@ -217,6 +237,7 @@ def build_data(paths, include=(), exclude=(), min_decode_tokens=128, initial_war
     for key, run in kept.items():
         summaries = {row["scenario"]: row for row in report.summarise_run(key, run, min_decode_tokens)}
         data["runs"].append({"engine": key[0], "mode": key[1], "label": key[2], "source": run["source"],
+                             **report.measurement_identity(run),
                              "header_line": run["header_line"], "header": run["header"]})
         if key[1] in MODES:
             data["decode"][key[1]].extend(decode_rows(key, run, summaries, min_decode_tokens))
@@ -245,7 +266,22 @@ def wrapped_label(row, mode=True):
     return title + "\n" + label
 
 
+def render_measurement_group(data):
+    """Reject mixed axes before importing plotting libraries or writing images."""
+    runs = data["runs"]
+    groups = {run.get("measurement_group", "UNSPECIFIED") for run in runs}
+    if len(groups) > 1:
+        raise ValueError("multiple measurement groups cannot share chart axes; select one --measurement-group and output directory per group")
+    unknown = {run.get("source_sha256") for run in runs if run.get("measurement_group", "UNSPECIFIED") == "UNSPECIFIED"}
+    if None in unknown:
+        raise ValueError("UNSPECIFIED input SHA256 is unavailable; measurement isolation cannot be verified")
+    if len(unknown) > 1:
+        raise ValueError("multiple UNSPECIFIED inputs cannot share chart axes; supply explicit measurement_groups by raw input SHA256")
+    return next(iter(groups), "UNSPECIFIED")
+
+
 def render(data, output_dir):
+    measurement_group = render_measurement_group(data)
     # Deliberately lazy: extraction/tests do not require a plotting dependency.
     import matplotlib
     matplotlib.use("Agg")
@@ -304,7 +340,7 @@ def render(data, output_dir):
         rows = data["decode"][mode]
         count = len(rows) // 3
         fig, axes = plt.subplots(1, 3, figsize=(17, max(4.9, 2.5 + count * .68)))
-        fig.suptitle(f"Client decode rate · {mode}", fontsize=16, fontweight="bold")
+        fig.suptitle(f"Client decode rate · {mode} · {measurement_group}", fontsize=16, fontweight="bold")
         for kind, ax in zip(KINDS, axes):
             speeds(ax, [row for row in rows if row["kind"] == kind], kind.title(), "visible tokens / second", False)
         save(fig, f"figure1-decode-{mode}",
@@ -313,7 +349,7 @@ def render(data, output_dir):
 
     n = len(data["runs"])
     fig, axes = plt.subplots(1, 2, figsize=(15, max(5.5, 2.7 + n * .68)))
-    fig.suptitle("Original strict functional quality · no confidence intervals", fontsize=15, fontweight="bold")
+    fig.suptitle(f"Original strict functional quality · no confidence intervals · {measurement_group}", fontsize=15, fontweight="bold")
     for scenario, ax in zip(("quality_tasks", "quality_gsm8k"), axes):
         rows = [row for row in data["quality"] if row["scenario"] == scenario]
         ax.set_title("Generated tasks" if scenario == "quality_tasks" else "GSM8K fixed public subset", fontweight="bold", pad=12)
@@ -340,7 +376,7 @@ def render(data, output_dir):
          "GSM8K labels show actual unique IDs × repeats; repeated presentations are not independent questions. No confidence intervals or comprehensive quality claim.")
 
     fig, axes = plt.subplots(1, 2, figsize=(15, max(5.5, 2.7 + n * .68)))
-    fig.suptitle("Long-context client TTFT · original quality gate required", fontsize=15, fontweight="bold")
+    fig.suptitle(f"Long-context client TTFT · original quality gate required · {measurement_group}", fontsize=15, fontweight="bold")
     for scenario, ax in zip(LONG, axes):
         speeds(ax, data["long_context"][scenario], "128K (131,072 tokens)" if scenario.endswith("128k") else "250K (256,000 tokens)", "seconds")
     save(fig, "figure3-long-context-ttft",
@@ -357,11 +393,24 @@ def main(argv=None):
     ap.add_argument("--exclude-label", action="append", default=[], help="case-sensitive label glob; repeatable, takes precedence")
     ap.add_argument("--min-decode-tokens", type=int, default=128)
     ap.add_argument("--data-only", action="store_true", help="extract data.json without importing matplotlib")
+    ap.add_argument("--context-json", type=Path, help="report context containing measurement_groups (raw input SHA256 -> group ID)")
+    ap.add_argument("--measurement-group", help="select one explicitly assigned group; UNSPECIFIED selects unmapped inputs without assigning a host")
     args = ap.parse_args(argv)
     if args.min_decode_tokens < 128:
         ap.error("--min-decode-tokens cannot be lower than128")
     paths, warnings = report.collect_inputs(args.inputs)
-    data = build_data(paths, args.include_label, args.exclude_label, args.min_decode_tokens, warnings)
+    try:
+        context = json.loads(args.context_json.read_text(encoding="utf-8")) if args.context_json else {}
+        if not isinstance(context, dict):
+            raise ValueError("--context-json must contain a JSON object")
+        data = build_data(paths, args.include_label, args.exclude_label, args.min_decode_tokens, warnings,
+                          context=context, measurement_group=args.measurement_group)
+        if not args.data_only:
+            render_measurement_group(data)
+    except (OSError, ValueError) as error:
+        ap.error(str(error))
+    data["measurement_group_context"] = ({"path": str(args.context_json.resolve()), "sha256": report.digest_file(args.context_json)}
+                                         if args.context_json else None)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     data["figures"] = [] if args.data_only else render(data, args.output_dir)
     data["rendered"] = not args.data_only

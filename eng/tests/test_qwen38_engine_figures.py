@@ -140,10 +140,12 @@ class FigureDataTests(unittest.TestCase):
     def test_actual_sglang_request_failures_are_withheld_not_model_zero(self):
         records = sglang_error_records()
         original = json.dumps(records, sort_keys=True)
-        data = self.build(records)
+        source = self.write(records)
+        data = figures.build_data([source], context={"measurement_groups": {figures.report.digest_file(source): "vm1"}})
         self.assertEqual(json.dumps(records, sort_keys=True), original)
         for row in data["quality"]:
             with self.subTest(scenario=row["scenario"]):
+                self.assertEqual(row["measurement_group"], "vm1")
                 self.assertEqual(row["original_gate"], "FAIL")
                 self.assertFalse(row["qualified"])
                 self.assertTrue(row["counts_complete"])
@@ -250,6 +252,66 @@ class FigureDataTests(unittest.TestCase):
         records = [header()] + [case(i) for i in range(3)] + [header(), case(0)]
         rows = self.build(records)["decode"]["plain"]
         self.assertTrue(all(not row["qualified"] for row in rows))
+
+    def test_explicit_groups_keep_same_profile_and_compute_ci_within_each_run(self):
+        sources = []
+        samples = {"vm1": [100., 200., 300.], "vm2": [500., 600., 700.]}
+        for group, rates in samples.items():
+            records = [header()] + [case(i) for i in range(3)]
+            records[0]["run_id"] = group
+            for c, rate in zip(records[1:], rates):
+                c["run_id"] = group
+                c["requests"][0] = request(rate)
+                c["metrics"]["per_prompt"][0]["decode_tok_s"] = rate
+            sources.append(self.write(records, group + ".jsonl"))
+        context = {"measurement_groups": {figures.report.digest_file(p): group for p, group in zip(sources, samples)}}
+        data = figures.build_data(sources, context=context)
+        self.assertEqual(len(data["runs"]), 2)
+        rows = {r["measurement_group"]: r for r in data["decode"]["plain"] if r["kind"] == "code"}
+        for group, rates in samples.items():
+            self.assertTrue(rows[group]["qualified"])
+            self.assertEqual(rows[group]["median"], rates[1])
+            self.assertEqual(rows[group]["ci95"], list(figures.metrics.repeat_median_ci([[x] for x in rates])))
+            self.assertEqual(len(rows[group]["repeat_samples"]), 3)
+        with self.assertRaisesRegex(ValueError, "multiple measurement groups"):
+            figures.render(data, self.root / "must-not-render")
+        selected = figures.build_data(sources, context=context, measurement_group="vm1")
+        self.assertEqual(len(selected["runs"]), 1)
+        self.assertEqual(figures.render_measurement_group(selected), "vm1")
+
+    def test_same_group_last_wins_and_unknown_sources_are_isolated(self):
+        old = self.write([header()] + [case(i) for i in range(3)], "old.jsonl")
+        new = self.write([header(), case()], "new.jsonl")
+        mapping = {"measurement_groups": {figures.report.digest_file(p): "vm1" for p in (old, new)}}
+        grouped = figures.build_data([old, new], context=mapping)
+        self.assertEqual(len(grouped["runs"]), 1)
+        self.assertTrue(all(not row["qualified"] for row in grouped["decode"]["plain"]))
+        unknown = figures.build_data([old, new])
+        self.assertEqual(len(unknown["runs"]), 2)
+        self.assertEqual({r["measurement_group"] for r in unknown["runs"]}, {"UNSPECIFIED"})
+        with self.assertRaisesRegex(ValueError, "multiple UNSPECIFIED inputs"):
+            figures.render(unknown, self.root / "must-not-render")
+        self.assertEqual(figures.render_measurement_group(figures.build_data([old])), "UNSPECIFIED")
+
+    def test_bad_group_filter_and_mixed_cli_render_fail_before_creating_output(self):
+        import contextlib
+        import io
+        sources = [self.write([header(label=name), case()], name + ".jsonl") for name in ("one", "two")]
+        context = {"measurement_groups": {figures.report.digest_file(p): group for p, group in zip(sources, ("vm1", "vm2"))}}
+        for group in ("", " vm1", "not-recorded"):
+            with self.subTest(group=group), self.assertRaisesRegex(ValueError, "measurement-group"):
+                figures.build_data(sources, context=context, measurement_group=group)
+        context_path = self.root / "context.json"
+        context_path.write_text(json.dumps(context))
+        out = self.root / "mixed-render"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
+            figures.main([*(str(p) for p in sources), "--output-dir", str(out), "--context-json", str(context_path)])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("multiple measurement groups", stderr.getvalue())
+        self.assertFalse(out.exists())
+        self.assertEqual(figures.main([*(str(p) for p in sources), "--output-dir", str(out), "--context-json", str(context_path), "--data-only"]), 0)
+        self.assertEqual(json.loads((out / "data.json").read_text())["selection"]["measurement_groups"], ["vm1", "vm2"])
 
     def test_malformed_later_header_cannot_promote_an_earlier_complete_run(self):
         source = self.write([header()] + [case(i) for i in range(3)])

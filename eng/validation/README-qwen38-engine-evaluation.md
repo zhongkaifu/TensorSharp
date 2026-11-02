@@ -133,8 +133,23 @@ python3 eng/qwen38-eval-report.py 'docs/validation/RUN/raw/*.jsonl' \
   --context-json docs/validation/RUN/context.json \
   --output docs/validation/RUN/report.html --min-decode-tokens 128
 python3 eng/qwen38-engine-figures.py docs/validation/RUN/raw \
-  --output-dir docs/validation/RUN/figures
+  --context-json docs/validation/RUN/context.json --measurement-group vm1 \
+  --output-dir docs/validation/RUN/figures-vm1
 ```
+
+The sidecar context's `measurement_groups` maps each whole original JSONL
+file's SHA256 to an explicit group ID, for example
+`{"measurement_groups": {"<raw-input-SHA256>": "vm1"}}`. Use the raw source
+hash (`summary.json`'s `sources[].sha256`), not a model or deployment-manifest
+hash. Assign groups from recorded host/GPU UUID, CPU quota and memory provenance;
+the tools do not infer a host from a profile label or a GPU model name.
+
+Generate each group's figures separately with `--measurement-group vm1` or
+`vm2` and distinct output directories. Mixed groups and multiple unmapped input
+hashes are rejected before image rendering; `--data-only` and HTML may list
+them without pooling latency or confidence intervals. Unmapped inputs remain
+`UNSPECIFIED` and are isolated by source SHA, so they cannot overwrite another
+unknown source's profile. One unmapped input retains the original CLI behavior.
 
 Matplotlib is required only for rendering figures. The standalone HTML embeds
 optional PNG figures from the context JSON, records its input hashes, and retains

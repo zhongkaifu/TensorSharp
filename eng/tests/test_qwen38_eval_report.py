@@ -81,9 +81,11 @@ class OfflineReportTests(unittest.TestCase):
         fixture = Path(__file__).with_name("fixtures") / "qwen38-sglang-quality-request-errors.json"
         records = json.loads(fixture.read_text())["records"]
         original = copy.deepcopy(records)
-        summary = self.build(records)
+        source = self.write(records)
+        summary = report.build_summary([source], {"measurement_groups": {report.digest_file(source): "vm1"}})
         self.assertEqual(records, original)
         for row in summary["rows"]:
+            self.assertEqual(row["measurement_group"], "vm1")
             answer = row["functional_answers"]
             self.assertFalse(answer["qualified"])
             self.assertIsNone(answer["correct"])
@@ -210,6 +212,56 @@ class OfflineReportTests(unittest.TestCase):
         self.assertEqual(len(summary["runs"]), 1)
         self.assertEqual(summary["rows"][0]["status"], "FAIL")
         self.assertTrue(any("替换" in message for message in summary["diagnostics"]))
+
+    def test_same_profile_on_two_explicit_groups_is_not_overwritten_or_pooled(self):
+        sources = []
+        for name, ttft in (("vm1", .1), ("vm2", 1.0)):
+            records = [header(3)] + [case(i) for i in range(3)]
+            records[0]["run_id"] = name
+            for c in records[1:]:
+                c["run_id"] = name
+                c["requests"][0]["ttft_s"] = ttft
+            sources.append(self.write(records, name + ".jsonl"))
+        context = {"measurement_groups": {report.digest_file(p): group for p, group in zip(sources, ("vm1", "vm2"))}}
+        summary = report.build_summary(sources, context)
+        self.assertEqual(len(summary["runs"]), 2)
+        self.assertEqual(len(summary["rows"]), 2)
+        by_group = {row["measurement_group"]: row for row in summary["rows"]}
+        self.assertEqual(by_group["vm1"]["metrics"]["ttft_s"], .1)
+        self.assertEqual(by_group["vm2"]["metrics"]["ttft_s"], 1.0)
+        self.assertTrue(all(row["status"] == "PASS" and row["repeats"] == 3 for row in summary["rows"]))
+        html = report.render_html(summary)
+        self.assertIn("<th>测量组</th>", html)
+        self.assertIn("<code>vm1</code>", html)
+        self.assertIn("<code>vm2</code>", html)
+
+    def test_last_wins_within_same_group_still_does_not_merge_runs(self):
+        old = self.write([header(3)] + [case(i) for i in range(3)], "old.jsonl")
+        new = self.write([header(3), case()], "new.jsonl")
+        context = {"measurement_groups": {report.digest_file(p): "vm1" for p in (old, new)}}
+        summary = report.build_summary([old, new], context)
+        self.assertEqual(len(summary["runs"]), 1)
+        self.assertEqual(summary["runs"][0]["source"], str(new))
+        self.assertEqual(summary["rows"][0]["status"], "INCOMPLETE")
+
+    def test_unknown_sources_keep_unspecified_without_overwriting_same_profile(self):
+        old = self.write([header(), case()], "old.jsonl")
+        bad = case(); bad.update(verdict="FAIL", **{"pass": False})
+        new = self.write([header(), bad], "new.jsonl")
+        summary = report.build_summary([old, new], {})
+        self.assertEqual(len(summary["runs"]), 2)
+        self.assertEqual({r["measurement_group"] for r in summary["rows"]}, {"UNSPECIFIED"})
+        self.assertEqual(len({r["source_sha256"] for r in summary["rows"]}), 2)
+        self.assertEqual({r["status"] for r in summary["rows"]}, {"PASS", "FAIL"})
+
+    def test_invalid_measurement_group_maps_raise_clear_errors(self):
+        source = self.write([header(), case()])
+        sha = report.digest_file(source)
+        invalid = ([], {"label-not-a-sha": "vm1"}, {sha: ""}, {sha: " vm1"}, {sha: None},
+                   {sha: "UNSPECIFIED"}, {sha: "vm1", sha.upper(): "vm2"})
+        for mapping in invalid:
+            with self.subTest(mapping=mapping), self.assertRaisesRegex(ValueError, "measurement_groups"):
+                report.build_summary([source], {"measurement_groups": mapping})
 
     def test_wrong_run_id_is_rejected_not_merged_into_quality(self):
         wrong = case()
