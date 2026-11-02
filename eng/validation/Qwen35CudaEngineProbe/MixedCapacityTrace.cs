@@ -170,7 +170,7 @@ internal static class MixedCapacityTrace
         return values;
     }
 
-    internal static int Run(string modelPath, string output)
+    internal static int Run(string modelPath, string output, bool diagnoseSharedScratch = false)
     {
         output = FreshOutput(output);
         object? provenance = null;
@@ -239,6 +239,7 @@ internal static class MixedCapacityTrace
                 float_bytes_per_repeat = checked(146L * vocab * sizeof(float)), input_token_count = PrefixRows * Slots + UBatch + VerifyLanes * Window + TeacherSteps * Slots,
                 input_token_bytes = checked((PrefixRows * Slots + UBatch + VerifyLanes * Window + TeacherSteps * Slots) * sizeof(int)),
                 input_token_binary_sha256 = Hash(MemoryMarshal.AsBytes(prefixes.SelectMany(x => x).Concat(prefill).Concat(verify).Concat(teacher.SelectMany(x => x)).ToArray().AsSpan())) };
+            if (diagnoseSharedScratch) SharedScratchTrace.Capture(engine, output, "post-load");
             var slots = new Q35CudaEngine.Slot[Slots];
             slots[0] = engine.Active;
             try
@@ -340,6 +341,7 @@ internal static class MixedCapacityTrace
                 engine.Active = slots[0];
                 foreach (var slot in slots.Skip(1)) if (slot != null) engine.FreeSlot(slot);
             }
+            if (diagnoseSharedScratch) SharedScratchTrace.Capture(engine, output, "post-workflow");
             phase = "finished";
             Manifest(true);
             Console.WriteLine($"[q35-mixed-capacity] complete: 38 full-logit records, exact reset A/A, prepared launches={preparedCount}; no timing claim.");

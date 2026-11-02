@@ -18,6 +18,17 @@ using TensorSharp;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
 
+// Separate allocation diagnostic; the existing mixed-capacity mode remains unchanged.
+if (args.Length > 0 && args[0] == "--shared-scratch-trace")
+{
+    if (args.Length < 2 || args.Length > 3 || (args.Length == 3 && args[2] != "--plan-only"))
+        throw new ArgumentException("Use --shared-scratch-trace <fresh-output> [--plan-only].");
+    return args.Length == 3
+        ? SharedScratchTrace.Plan(args[1])
+        : SharedScratchTrace.Run(Environment.GetEnvironmentVariable("TS_TEST_QWEN35_MODEL")
+            ?? throw new ArgumentException("Set TS_TEST_QWEN35_MODEL."), args[1]);
+}
+
 // This diagnostic has a CPU-only plan mode and must be dispatched before the
 // ordinary probe requires a model path. Existing modes keep their defaults.
 if (args.Length >= 2 && args[0] == "--mixed-capacity-trace")

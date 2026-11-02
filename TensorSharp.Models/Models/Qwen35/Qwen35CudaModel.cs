@@ -15,6 +15,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using TensorSharp.Models.Architecture;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
@@ -29,6 +30,8 @@ namespace TensorSharp.Models
         private const string Tag = "q35-cuda";
         private Qwen35CudaExecutor _exec;
         private readonly object _sync = new object();
+        private readonly bool _reclaimVisionPool = Environment.GetEnvironmentVariable("TS_Q35_RECLAIM_VISION_POOL") == "1";
+        private long _visionPoolPressureTrimCount;
 
         // requestId -> engine slot. Guarded by _sync.
         private Dictionary<string, int> _slotByRequest;
@@ -96,7 +99,7 @@ namespace TensorSharp.Models
                     maxContext = Math.Min(maxContext, 65536);
                 int nUbatch = ParseEnvInt("TS_Q35_UBATCH", 2048);
                 _exec = new Qwen35CudaExecutor(ggufPath, maxContext, nUbatch, Qwen35Model.ResolveQwen35DFlashPath(draftGgufPath));
-                _exec.Engine.ReclaimMemory = ReclaimOneRetained;
+                _exec.Engine.ReclaimMemory = ReclaimDeviceMemory;
                 _hostBudgetBytes = ResolveHostBudgetBytes();
                 // The pinner fills the whole budget from load on: pinning beside the copies slowed them
                 // several times over.
@@ -492,6 +495,53 @@ namespace TensorSharp.Models
                     Console.Error.WriteLine($"[q35-retire] {key} tokens={_retainedSlots[key].Tokens} checkpoint={_checkpointKeys.Contains(key)} " +
                         $"free={free >> 20}MiB host={_hostRetained.Count} ({engine.HostBytesInUse >> 20}MiB)");
                 pending += engine.SlotStateBytes + engine.SlotKvBytes(slot);
+            }
+        }
+
+        /// <summary>Called under _sync when the engine needs device memory. Media preparation can
+        /// hold _mediaLock while waiting for _sync, so never wait for that lock here. Dispose also
+        /// holds _sync: an allocator selected below cannot be disposed by the model during a trim.</summary>
+        private bool ReclaimDeviceMemory()
+        {
+            if (_reclaimVisionPool && _vision != null && _visionAllocator is TensorSharp.Cuda.CudaAllocator allocator)
+            {
+                bool freed = TryTrimIdleVisionPool(_mediaLock, () => allocator.GetStats().CachedBytes,
+                    allocator.TrimPool, out long before, out long after);
+                if (before > 0)
+                {
+                    ++_visionPoolPressureTrimCount;
+                    Console.Error.WriteLine($"[q35-vision-pool-reclaim] trim={_visionPoolPressureTrimCount} " +
+                        $"cached_before={before} cached_after={after} cached_reduction={before - after}");
+                }
+                if (freed)
+                    return true;
+            }
+            return ReclaimOneRetained();
+        }
+
+        /// <summary>Only trim returned, idle pool blocks. The allocator synchronizes its own
+        /// stream before draining; live weights, embeddings and graph-owned blocks stay owned.
+        /// A late finalizer may return another block, so only an observed cache reduction counts
+        /// as progress. Stats/trim errors propagate, with the media lock released in every case.</summary>
+        internal static bool TryTrimIdleVisionPool(object mediaLock, Func<long> cachedBytes, Action trim,
+            out long before, out long after)
+        {
+            before = after = 0;
+            if (!Monitor.TryEnter(mediaLock, 0))
+                return false;
+            try
+            {
+                before = cachedBytes();
+                after = before;
+                if (before <= 0)
+                    return false;
+                trim();
+                after = cachedBytes();
+                return after < before;
+            }
+            finally
+            {
+                Monitor.Exit(mediaLock);
             }
         }
 

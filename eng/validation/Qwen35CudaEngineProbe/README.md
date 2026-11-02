@@ -287,3 +287,67 @@ PY
 Do not label an incomplete arm, a failed A/A, or a CPU-only plan as a GPU pass.
 This mode is a capacity/continuation correctness diagnostic and makes no
 performance, arbitrary-partition equivalence or answer-quality claim.
+
+
+### Shared-scratch allocation and full mixed-capacity equivalence
+
+`--shared-scratch-trace <fresh-output> [--plan-only]` reuses the complete
+`--mixed-capacity-trace` schedule: no drafter, 4160 rows, nine slots, 38 full F32
+records / 292 vocabulary rows, 18 drawn-I32 records, partial commits, teacher
+continuations and two exact reset repetitions. The existing CLI and its raw
+record definition retain their meaning. Use four separate processes with
+`TS_Q35_SHARED_SCRATCH=0/1` crossed with `TS_Q35_GDN_PREPARED_PREFILL=0/1`.
+Keep the other feature opts off and production draft split-K unset.
+
+The new mode additionally writes `shared-scratch-post-load.json` and
+`shared-scratch-post-workflow.json`. They record the actual shared backing pointer,
+requested bytes / avoided allocation bytes, all ten published and independently
+read private pointers, logical / padded extents, phase ranges, ownership and
+excluded persistent / quantized buffer pointers. The four `_v*` verification
+buffers are allocated lazily by `EnsureVerifyBuffers`: zero before the first
+verify and separate allocations afterwards is expected. The other nine excluded
+pointers remain fixed. Ownership observations and driver queries in this probe
+cover the ten scratch views; excluded-buffer allocation ownership is established
+from the allocation source, not an additional recorded driver query.
+The phase names describe reviewed
+source liveness, not GPU-profiler timestamps. The probe rejects overlap within
+one phase, misalignment, out-of-owner views, separately owned interior views and
+unexpected pointer changes. If `cuMemGetAddressRange_v2` is available it also
+checks actual driver allocation bounds; an unavailable symbol is explicitly
+recorded and supplies no passing driver-bound coverage.
+
+CPU `--plan-only` checks reflection and layout, including unsafe overlap,
+alignment and owner-bound fixtures. It never loads a model or initializes CUDA.
+Passing that plan is not passing the four GPU arms. The coordinator must retain
+and compare every raw F32/I32/input/trace byte across all four arms, require
+the shared allocation to be genuinely enabled, and observe 96 actual prepared
+launches in each prepared arm. This is a fixed-schedule numerical and allocation
+gate, not a performance or general model-quality result. Recurrent state is
+exercised through commit, positions and teacher continuation; this workflow does
+not separately dump all recurrent-state device memory.
+
+Build the probe into a fresh executable directory, then overlay the exact latest
+reviewed Host managed DLLs and validated native runtime. Record every copied SHA,
+the actually loaded engine/probe assembly SHAs, full Host and runtime inventories,
+model / source / unchanged upstream ggml identities before and after. Keep raw
+snapshots on persistent ignored storage (about 1.16 GB for all four 27B arms);
+do not confuse a current source checkout with proof of how a Host was built.
+
+### Native model memory-pressure integration
+
+Both memory switches default off and are selected before model construction:
+
+- `TS_Q35_SHARED_SCRATCH=1` enables the shared phase allocation. For the tested
+  27B geometry with 4160 scratch rows, requested allocation drops by 461660160
+  bytes (440.273 MiB). This is requested storage saved, rather than a measurement
+  of whole-device free memory.
+- `TS_Q35_RECLAIM_VISION_POOL=1` lets `Qwen35CudaModel` drain returned, idle vision
+  allocator blocks when the native engine needs memory. The callback attempts
+  the media lock without waiting, synchronizes the allocator's stream, and
+  preserves live allocations. Successful trims log cached bytes before and after;
+  an observed positive reduction is required to count the path as exercised.
+
+The switches preserve weights, KV/state formats, arithmetic and the device
+reserve. Evaluate real image requests and DFlash long contexts separately from
+this no-drafter layout probe. Greedy verification has its own answer-quality
+gate; concurrent multimodal quality for that opt-in remains unaccepted.

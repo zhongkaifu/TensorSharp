@@ -435,18 +435,25 @@ namespace TensorSharp.Cuda
             int nt = RowCap, e = _m.NEmbd;
             int widest = Math.Max(Math.Max(AttnProjWidth, GdnPackedWidth), 2 * _m.NFf);
             int widestK = Math.Max(Math.Max(e, _m.NFf), Math.Max(QDim, ValueDim));
+            SharedScratchEnabled = SharedScratchRequested(Environment.GetEnvironmentVariable("TS_Q35_SHARED_SCRATCH"));
             _x = Alloc((long)nt * e * 4);
-            _xn = Alloc((long)nt * e * 4);
+            if (SharedScratchEnabled)
+                AllocateSharedScratch(nt);
+            else
+                _xn = Alloc((long)nt * e * 4);
             _block = Alloc((long)nt * e * 4);
             _proj = Alloc((long)nt * widest * 4);
-            _q = Alloc((long)nt * QDim * 4);
-            _gate = Alloc((long)nt * QDim * 4);
-            _attn = Alloc((long)nt * QDim * 4);
-            _gdnQkv = Alloc((long)nt * ConvDim * 4);
-            _gdnG = Alloc((long)nt * _m.GdnVHeads * 4);
-            _gdnBeta = Alloc((long)nt * _m.GdnVHeads * 4);
-            _gdnO = Alloc((long)nt * ValueDim * 4);
-            _gdnY = Alloc((long)nt * ValueDim * 4);
+            if (!SharedScratchEnabled)
+            {
+                _q = Alloc((long)nt * QDim * 4);
+                _gate = Alloc((long)nt * QDim * 4);
+                _attn = Alloc((long)nt * QDim * 4);
+                _gdnQkv = Alloc((long)nt * ConvDim * 4);
+                _gdnG = Alloc((long)nt * _m.GdnVHeads * 4);
+                _gdnBeta = Alloc((long)nt * _m.GdnVHeads * 4);
+                _gdnO = Alloc((long)nt * ValueDim * 4);
+                _gdnY = Alloc((long)nt * ValueDim * 4);
+            }
             if (Q35Kernels.GdnPreparedPrefillEnabled && _nGdn > 0)
             {
                 _gdnPreparedScratchBytes = Q35Kernels.GdnPreparedScratchCapacityBytes(nt, MaxSeqs, _m.GdnKHeads, _m.GdnVHeads);
@@ -467,7 +474,9 @@ namespace TensorSharp.Cuda
                     _gdnPreparedScratch = Alloc(_gdnPreparedScratchBytes);
                 Console.Error.WriteLine($"[q35-cuda] prepared GDN prefill enabled, scratch={_gdnPreparedScratchBytes} bytes, projectionTail={PreparedGdnScratchReusesProjection}");
             }
-            _act = Alloc((long)nt * _m.NFf * 4);
+            if (!SharedScratchEnabled)
+                _act = Alloc((long)nt * _m.NFf * 4);
+            PublishScratchSpans(nt);
             if (nt < MaxVerifyRows)
                 throw new NotSupportedException($"[q35-cuda] ubatch {nt} below the {MaxVerifyRows}-row verify window");
             // q8_1 rows: a GEMV's activations, or the LM head's over a whole verify.
