@@ -29,6 +29,21 @@ def case(repeat=0, scenario="short_chat"):
                           "decode_tok_s": 189.9, "prefill_tok_s": 8123.4, "prompt_tokens": 1000}]}
 
 
+def quality_records(scenario="quality_tasks", correct=3):
+    h = header(3, [scenario])
+    h.update(quality_tasks=8, gsm8k_limit=8)
+    names = [f"task{i}" if scenario == "quality_tasks" else f"gsm8k-test-{i}" for i in range(8)]
+    cases = []
+    for repeat in range(3):
+        c = case(repeat, scenario)
+        c.update(metrics={"n_questions": 8, "n_correct": correct},
+                 checks=[{"name": name, "ok": i < correct} for i, name in enumerate(names)],
+                 requests=[copy.deepcopy(c["requests"][0]) for _ in names],
+                 notes={"ids": names}, verdict="PASS" if correct == 8 else "FAIL", **{"pass": correct == 8})
+        cases.append(c)
+    return [h] + cases
+
+
 class OfflineReportTests(unittest.TestCase):
     def setUp(self):
         # Validation evidence and scratch stay in the ignored evidence directory.
@@ -61,6 +76,80 @@ class OfflineReportTests(unittest.TestCase):
         self.assertEqual(summary["rows"][0]["status"], "FAIL")
         self.assertEqual(summary["rows"][0]["metrics"], {})
         self.assertNotIn("189.9", report.render_html(summary))
+
+    def test_actual_sglang_request_errors_are_not_rendered_as_model_zero(self):
+        fixture = Path(__file__).with_name("fixtures") / "qwen38-sglang-quality-request-errors.json"
+        records = json.loads(fixture.read_text())["records"]
+        original = copy.deepcopy(records)
+        summary = self.build(records)
+        self.assertEqual(records, original)
+        for row in summary["rows"]:
+            answer = row["functional_answers"]
+            self.assertFalse(answer["qualified"])
+            self.assertIsNone(answer["correct"])
+            self.assertIsNone(answer["total"])
+            self.assertEqual(answer["original_answer_counts"], {"correct": 0, "total": 24})
+            self.assertEqual(row["request_availability"]["requests_with_errors"], 24)
+        html = report.render_html(summary)
+        self.assertIn("24/24 请求失败", html)
+        self.assertIn("答案质量未验证", html)
+        self.assertNotIn("功能题 0/24", html)
+
+    def test_one_request_error_withholds_answer_quality_without_rescoring(self):
+        for scenario in ("quality_tasks", "quality_gsm8k"):
+            with self.subTest(scenario=scenario):
+                records = quality_records(scenario)
+                records[1]["requests"][7]["error"] = "Connection refused"
+                records[1]["verdict"] = "ERROR"
+                summary = self.build(records)
+                answer = summary["rows"][0]["functional_answers"]
+                self.assertFalse(answer["qualified"])
+                self.assertEqual(answer["original_answer_counts"], {"correct": 9, "total": 24})
+                html = report.render_html(summary)
+                self.assertIn("1/24 请求失败", html)
+                self.assertIn("答案质量未验证", html)
+                self.assertNotIn("功能题 9/24", html)
+
+    def test_actual_zero_and_nonzero_answer_failures_remain_countable_without_request_error(self):
+        for scenario in ("quality_tasks", "quality_gsm8k"):
+            for correct in (0, 3):
+                with self.subTest(scenario=scenario, correct=correct):
+                    summary = self.build(quality_records(scenario, correct))
+                    answer = summary["rows"][0]["functional_answers"]
+                    self.assertTrue(answer["qualified"])
+                    self.assertEqual((answer["correct"], answer["total"]), (3 * correct, 24))
+                    self.assertEqual(summary["rows"][0]["status"], "FAIL")
+                    self.assertIn(f"功能题 {3 * correct}/24", report.render_html(summary))
+
+    def test_unavailable_quality_retains_withheld_answers_without_request_error(self):
+        for status in ("UNSUPPORTED", "ERROR", "INCOMPLETE"):
+            with self.subTest(status=status):
+                records = quality_records(correct=0)
+                if status == "UNSUPPORTED":
+                    for c in records[1:]: c["availability"] = "unsupported"
+                else:
+                    records[1]["verdict"] = status
+                summary = self.build(records)
+                row = summary["rows"][0]
+                self.assertEqual(row["status"], "UNSUPPORTED" if status == "UNSUPPORTED" else "FAIL")
+                self.assertFalse(row["functional_answers"]["qualified"])
+                self.assertIsNone(row["functional_answers"]["correct"])
+                self.assertEqual(row["functional_answers"]["withheld_reason_code"], "unavailable_case")
+                self.assertIn(status, row["functional_answers"]["withheld_reason"])
+                html = report.render_html(summary)
+                self.assertNotIn("功能题 0/24", html)
+                self.assertIn("答案质量未验证", html)
+
+    def test_missing_duplicate_or_incomplete_question_counts_are_not_qualified(self):
+        for failure in ("missing_repeat", "duplicate_repeat", "missing_question"):
+            with self.subTest(failure=failure):
+                records = quality_records()
+                if failure == "missing_repeat": records.pop()
+                elif failure == "duplicate_repeat": records[-1]["repeat"] = 1
+                else: records[-1]["requests"].pop()
+                summary = self.build(records)
+                self.assertFalse(summary["rows"][0]["functional_answers"]["qualified"])
+                self.assertNotIn("功能题", report.render_html(summary))
 
     def test_missing_repeats_are_incomplete(self):
         summary = self.build([header(3), case()])

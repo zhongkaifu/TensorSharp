@@ -40,7 +40,7 @@ LIMITATIONS = [
     "Decode is a client stream estimate after the first semantic payload, not GPU kernel throughput; speculative output bursts affect it. TTFT includes client/server overhead.",
     "95% intervals bootstrap whole repeats (2000 deterministic resamples), not individual tokens. Three repeats provide weak uncertainty evidence; no ranking or winner is inferred.",
     "GSM8K repeats reuse the same public question IDs. Eight questions repeated three times are eight unique questions, not 24 independent questions. Quality figures show no confidence intervals.",
-    "Strict generated-task and GSM8K counts retain their original scorer, including format failures; these small tests do not establish comprehensive model quality.",
+    "Strict generated-task and GSM8K counts retain their original scorer, including format failures; any request.error withholds the whole quality point as availability evidence, not a model zero. These small tests do not establish comprehensive model quality.",
     "Long-context TTFT is shown only after the original retrieval/order/token-budget checks pass. Missing, failed, incomplete and unsupported records produce no speed point or zero substitute.",
     "Checkpoints, weight/KV precision, drafters, contexts and active lanes can differ between labelled configurations. These are stack comparisons, not isolated universal engine rankings.",
 ]
@@ -158,51 +158,18 @@ def decode_rows(key, run, summaries, minimum):
 
 def quality_row(key, run, scenario, summaries):
     row = identity(key, run, scenario, summaries)
-    row.update(correct=None, total=None, unique_questions=None, repeats_observed=0,
-               question_counts_by_repeat=[], confidence_interval=None,
-               independent_question_samples=None, counts_complete=False)
     cases = [case for case in run["cases"] if case["scenario"] == scenario]
-    if not complete_repeats(run["header"], cases):
-        row["withheld_reason"] = "question counts require every expected repeat exactly once"
-        return row
-    expected = run["header"].get("quality_tasks" if scenario == "quality_tasks" else "gsm8k_limit")
-    if not integer(expected, 1):
-        row["withheld_reason"] = "expected questions per repeat were not recorded"
-        return row
-    identities = []
-    for case in sorted(cases, key=lambda case: case["repeat"]):
-        m, notes = case.get("metrics", {}), case.get("notes", {})
-        n, correct = m.get("n_questions"), m.get("n_correct")
-        names = ([f"task{i}" for i in range(expected)] if scenario == "quality_tasks" else notes.get("ids"))
-        if (not integer(n, 1) or n != expected or not integer(correct) or correct > n
-                or not isinstance(names, list) or len(names) != expected
-                or any(not isinstance(name, str) for name in names) or len(set(names)) != expected
-                or len(case.get("requests", [])) != expected):
-            row["withheld_reason"] = "incomplete or invalid original question counts/identities"
-            return row
-        checks = [check for check in case.get("checks", []) if check.get("name") in names]
-        if (len(checks) != expected or len({check["name"] for check in checks}) != expected
-                or any(type(check.get("ok")) is not bool for check in checks)
-                or sum(check["ok"] for check in checks) != correct):
-            row["withheld_reason"] = "original question checks and n_correct/n_questions disagree"
-            return row
-        identities.append(names)
-        row["question_counts_by_repeat"].append({"repeat": case["repeat"], "correct": correct, "total": n,
-                                                  "original_verdict": case.get("verdict")})
-    if scenario == "quality_gsm8k" and any(names != identities[0] for names in identities):
-        row["withheld_reason"] = "GSM8K question IDs differ across repeats"
-        return row
-    row.update(qualified=True, counts_complete=True, withheld_reason=None,
-               correct=sum(item["correct"] for item in row["question_counts_by_repeat"]),
-               total=sum(item["total"] for item in row["question_counts_by_repeat"]),
-               repeats_observed=len(cases), questions_per_repeat=expected)
-    if scenario == "quality_gsm8k":
-        row.update(unique_questions=len(identities[0]), question_ids=identities[0],
-                   independent_question_samples=False,
-                   sample_note=f"{len(identities[0])} unique questions × {len(cases)} repeats; not {row['total']} independent questions")
-    else:
-        row["sample_note"] = f"{expected} generated tasks per repeat × {len(cases)} repeats; no CI"
+    row.update(report.functional_answer_counts(run["header"], cases, scenario))
     return row
+
+
+def quality_withheld_label(row):
+    availability = row.get("request_availability", {})
+    if row.get("withheld_reason_code") == "request_error":
+        return f"withheld (request errors {availability['requests_with_errors']}/{availability['requests_observed']})"
+    if row.get("withheld_reason_code") == "unavailable_case":
+        return "withheld (unavailable case)"
+    return "withheld (incomplete counts)"
 
 
 def long_row(key, run, scenario, summaries):
@@ -241,7 +208,7 @@ def build_data(paths, include=(), exclude=(), min_decode_tokens=128, initial_war
                           "invocations": "existing report policy: last run per engine/mode/label; never merged",
                           "selected_runs": len(kept), "excluded_runs": len(runs) - len(kept)},
             "method": {"min_decode_tokens": min_decode_tokens, "bootstrap": "repeat clusters, 2000 resamples, seed1234, percentile95%",
-                       "quality_counts": "original strict n_correct/n_questions, validated against question checks; no CI",
+                       "quality_counts": "original strict n_correct/n_questions, validated against question checks and complete identities; any request.error withholds the quality point; no CI",
                        "long_context": "original all-repeat quality gate; no failed/missing speed substitutes"},
             "tools": [{"path": str(p.resolve()), "sha256": report.digest_file(p)} for p in
                       (Path(__file__), REPORT_PATH, Path(__file__).with_name("qwen38-engine-report.py"))],
@@ -359,7 +326,7 @@ def render(data, output_dir):
         ax.set_axisbelow(True)
         for y, row in enumerate(rows):
             if not row["qualified"]:
-                ax.text(.02, y, "withheld (incomplete counts)", va="center", color="#777777", fontsize=9)
+                ax.text(.02, y, quality_withheld_label(row), va="center", color="#777777", fontsize=9)
                 continue
             rate = row["correct"] / row["total"]
             ax.barh(y, rate, height=.38, color="#3a8064", alpha=.80)

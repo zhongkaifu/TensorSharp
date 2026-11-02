@@ -50,6 +50,7 @@ DEFAULT_LIMITATIONS = [
     "TTFT 是客户端观察到首个非空模型 delta 的时间，含调度、网络、视觉编码和解析等开销；工具调用解析可推迟首个可见 delta。",
     "Prefill 吞吐量是未缓存输入 token / 客户端 TTFT，不是纯 GPU kernel 吞吐量。Decode 是流式时间估计，可能受推测解码成批输出影响；SSE 事件数不会当成 token。",
     "功能测试、随机算术任务和可选 GSM8K 小样本只能检查特定回归，不能证明全面模型质量、无训练数据污染或采样分布等价。",
+    "质量题组存在请求错误时只报告请求失败数，答案质量未验证；连接失败留下的原始 0/N 不当成模型答错。",
     "长上下文的多位置检索、顺序和相邻关系检查覆盖特定位置失真；通过这些检查不代表全面长上下文推理质量或 RoPE 数值等价。",
     "原始权重 SHA256、来源 revision、启动参数或设备信息未记录时，配置等价性仍未验证。历史截图或帖子数字仅作线索，不混入新测量。",
 ]
@@ -135,6 +136,98 @@ def is_unsupported(case):
             or str(case.get("verdict", "")).upper() in ("UNSUPPORTED", "UNAVAILABLE", "SKIP", "SKIPPED"))
 
 
+def request_availability(cases, expected=None):
+    """Transport evidence only; an error-free request is not an answer-quality pass."""
+    observed, errors = 0, []
+    for case in cases:
+        requests = case.get("requests", [])
+        if not isinstance(requests, list):
+            continue
+        observed += len(requests)
+        for index, request in enumerate(requests):
+            if isinstance(request, dict) and request.get("error"):
+                errors.append({"repeat": case.get("repeat"), "request_index": index,
+                               "error": str(request["error"])})
+    return {"status": "request_error" if errors else "no_recorded_request_error" if observed else "not_run",
+            "requests_observed": observed, "requests_with_errors": len(errors),
+            "expected_requests": expected, "errors": errors}
+
+
+def functional_answer_counts(header, cases, scenario):
+    """Reuse original question checks/counts; never score a transport failure as an answer.
+
+    This is shared by HTML and figures so both require the same complete repeat,
+    question identity and original-count evidence. A real strict 0/N remains 0/N.
+    """
+    integer = lambda value, minimum=0: type(value) is int and value >= minimum
+    repeats = header.get("repeats")
+    expected = header.get("quality_tasks" if scenario == "quality_tasks" else "gsm8k_limit")
+    planned = repeats * expected if integer(repeats, 1) and integer(expected, 1) else None
+    availability = request_availability(cases, planned)
+    unavailable = sorted({"UNSUPPORTED" if is_unsupported(case) else str(case.get("verdict", "")).upper()
+                          for case in cases if is_unsupported(case)
+                          or str(case.get("verdict", "")).upper() in ("ERROR", "INCOMPLETE")})
+    result = {"correct": None, "total": None, "qualified": False, "counts_complete": False,
+              "unique_questions": None, "repeats_observed": 0, "question_counts_by_repeat": [],
+              "confidence_interval": None, "independent_question_samples": None,
+              "request_availability": availability, "withheld_reason_code": "incomplete_counts",
+              "withheld_reason": None}
+
+    def withhold(reason):
+        if availability["requests_with_errors"]:
+            result.update(withheld_reason_code="request_error", counts_issue=reason,
+                          withheld_reason=f"request_error: {availability['requests_with_errors']}/{availability['requests_observed']} recorded requests failed; answer quality unverified")
+        elif unavailable:
+            result.update(withheld_reason_code="unavailable_case", counts_issue=reason,
+                          withheld_reason=f"unavailable_case: {', '.join(unavailable)}; answer quality unverified")
+        else:
+            result["withheld_reason"] = reason
+        return result
+
+    ids = [case.get("repeat") for case in cases]
+    if not (integer(repeats, 1) and len(ids) == repeats and all(integer(i) for i in ids)
+            and set(ids) == set(range(repeats))):
+        return withhold("question counts require every expected repeat exactly once")
+    if not integer(expected, 1):
+        return withhold("expected questions per repeat were not recorded")
+    identities = []
+    for case in sorted(cases, key=lambda case: case["repeat"]):
+        m, notes = case.get("metrics", {}), case.get("notes", {})
+        n, correct = m.get("n_questions"), m.get("n_correct")
+        names = ([f"task{i}" for i in range(expected)] if scenario == "quality_tasks" else notes.get("ids"))
+        requests = case.get("requests", [])
+        if (not integer(n, 1) or n != expected or not integer(correct) or correct > n
+                or not isinstance(names, list) or len(names) != expected
+                or any(not isinstance(name, str) for name in names) or len(set(names)) != expected
+                or not isinstance(requests, list) or len(requests) != expected
+                or any(not isinstance(request, dict) for request in requests)):
+            return withhold("incomplete or invalid original question counts/identities")
+        checks = [check for check in case.get("checks", []) if check.get("name") in names]
+        if (len(checks) != expected or len({check["name"] for check in checks}) != expected
+                or any(type(check.get("ok")) is not bool for check in checks)
+                or sum(check["ok"] for check in checks) != correct):
+            return withhold("original question checks and n_correct/n_questions disagree")
+        identities.append(names)
+        result["question_counts_by_repeat"].append({"repeat": case["repeat"], "correct": correct,
+                                                   "total": n, "original_verdict": case.get("verdict")})
+    if scenario == "quality_gsm8k" and any(names != identities[0] for names in identities):
+        return withhold("GSM8K question IDs differ across repeats")
+    result.update(counts_complete=True, repeats_observed=len(cases), questions_per_repeat=expected,
+                  original_answer_counts={"correct": sum(item["correct"] for item in result["question_counts_by_repeat"]),
+                                          "total": sum(item["total"] for item in result["question_counts_by_repeat"])})
+    if availability["requests_with_errors"] or unavailable:
+        return withhold(None)
+    result.update(qualified=True, withheld_reason=None, withheld_reason_code=None,
+                  **result["original_answer_counts"])
+    if scenario == "quality_gsm8k":
+        result.update(unique_questions=len(identities[0]), question_ids=identities[0],
+                      independent_question_samples=False,
+                      sample_note=f"{len(identities[0])} unique questions × {len(cases)} repeats; not {result['total']} independent questions")
+    else:
+        result["sample_note"] = f"{expected} generated tasks per repeat × {len(cases)} repeats; no CI"
+    return result
+
+
 def empty_row(engine, mode, label, scenario, status="NOT_RUN", reason="未执行此场景", expected=None):
     return {"engine": engine, "mode": mode, "label": label, "scenario": scenario,
             "status": status, "reason": reason, "repeats": 0, "expected_repeats": expected,
@@ -201,7 +294,10 @@ def summarise_run(key, run, min_decode_tokens):
                "metrics": measured, "errors": errors[:20], "run_id": header.get("run_id"),
                "source": run["source"]}
         answers = [case.get("metrics", {}) for case in group]
-        if status != "UNSUPPORTED" and answers and all(isinstance(item.get("n_questions"), int) and isinstance(item.get("n_correct"), int) for item in answers):
+        if scenario in ("quality_tasks", "quality_gsm8k"):
+            row["functional_answers"] = functional_answer_counts(header, group, scenario)
+            row["request_availability"] = row["functional_answers"]["request_availability"]
+        elif status != "UNSUPPORTED" and answers and all(isinstance(item.get("n_questions"), int) and isinstance(item.get("n_correct"), int) for item in answers):
             row["functional_answers"] = {"correct": sum(item["n_correct"] for item in answers),
                                          "total": sum(item["n_questions"] for item in answers)}
         out.append(row)
@@ -304,7 +400,16 @@ def data_table(rows, table_id):
                    if finite(row.get("quality_rate")) else "—")
         if row.get("functional_answers"):
             answer = row["functional_answers"]
-            quality += f"<small>功能题 {answer['correct']}/{answer['total']}</small>"
+            availability = answer.get("request_availability", {})
+            if availability.get("requests_with_errors"):
+                quality = (f"{availability['requests_with_errors']}/{availability['requests_observed']} 请求失败"
+                           "<small>答案质量未验证</small>")
+            elif answer.get("qualified", True):
+                quality += f"<small>功能题 {answer['correct']}/{answer['total']}</small>"
+            elif answer.get("withheld_reason_code") == "unavailable_case":
+                quality = "—<small>答案质量未验证</small>"
+            else:
+                quality = "—<small>题目计数或重复不完整，答案质量未验证</small>"
         planned = row.get("expected_repeats")
         repeats = f"{row['pass']}/{planned}" if isinstance(planned, int) and planned > 0 else "未执行" if not row["repeats"] else f"{row['pass']}/{row['repeats']}（计划缺失）"
         if row["repeats"] and planned and row["repeats"] != planned:

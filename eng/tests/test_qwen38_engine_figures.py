@@ -56,6 +56,11 @@ def quality_case(repeat=0, scenario="quality_gsm8k", correct=3):
     return c
 
 
+def sglang_error_records():
+    fixture = Path(__file__).with_name("fixtures") / "qwen38-sglang-quality-request-errors.json"
+    return json.loads(fixture.read_text())["records"]
+
+
 class FigureDataTests(unittest.TestCase):
     def setUp(self):
         parent = figures.ROOT / "docs" / "validation" / "qwen38-figure-tests"
@@ -130,6 +135,66 @@ class FigureDataTests(unittest.TestCase):
         self.assertFalse(row["independent_question_samples"])
         self.assertIsNone(row["confidence_interval"])
         self.assertIn("not 24 independent", row["sample_note"])
+        self.assertEqual(row["request_availability"]["requests_with_errors"], 0)
+
+    def test_actual_sglang_request_failures_are_withheld_not_model_zero(self):
+        records = sglang_error_records()
+        original = json.dumps(records, sort_keys=True)
+        data = self.build(records)
+        self.assertEqual(json.dumps(records, sort_keys=True), original)
+        for row in data["quality"]:
+            with self.subTest(scenario=row["scenario"]):
+                self.assertEqual(row["original_gate"], "FAIL")
+                self.assertFalse(row["qualified"])
+                self.assertTrue(row["counts_complete"])
+                self.assertEqual(row["original_answer_counts"], {"correct": 0, "total": 24})
+                self.assertIsNone(row["correct"])
+                self.assertIsNone(row["total"])
+                self.assertEqual(row["request_availability"]["requests_observed"], 24)
+                self.assertEqual(row["request_availability"]["requests_with_errors"], 24)
+                self.assertEqual(row["withheld_reason_code"], "request_error")
+                self.assertEqual(figures.quality_withheld_label(row), "withheld (request errors 24/24)")
+
+    def test_one_request_error_withholds_whole_quality_group(self):
+        for scenario in ("quality_tasks", "quality_gsm8k"):
+            with self.subTest(scenario=scenario):
+                cases = [quality_case(i, scenario) for i in range(3)]
+                cases[0]["requests"][7]["error"] = "ConnectionRefusedError: connection refused"
+                cases[0]["verdict"] = "ERROR"
+                row = next(row for row in self.build([header()] + cases)["quality"] if row["scenario"] == scenario)
+                self.assertFalse(row["qualified"])
+                self.assertIsNone(row["correct"])
+                self.assertEqual(row["original_answer_counts"], {"correct": 9, "total": 24})
+                self.assertEqual(row["request_availability"]["requests_with_errors"], 1)
+                self.assertEqual(row["withheld_reason_code"], "request_error")
+
+    def test_unavailable_quality_is_not_a_model_zero_even_without_request_error(self):
+        for status in ("UNSUPPORTED", "ERROR", "INCOMPLETE"):
+            with self.subTest(status=status):
+                cases = [quality_case(i, "quality_tasks", 0) for i in range(3)]
+                if status == "UNSUPPORTED":
+                    for c in cases: c["availability"] = "unsupported"
+                else:
+                    cases[0]["verdict"] = status
+                row = next(row for row in self.build([header()] + cases)["quality"] if row["scenario"] == "quality_tasks")
+                self.assertFalse(row["qualified"])
+                self.assertIsNone(row["correct"])
+                self.assertEqual(row["original_gate"], "UNSUPPORTED" if status == "UNSUPPORTED" else "FAIL")
+                self.assertEqual(row["withheld_reason_code"], "unavailable_case")
+                self.assertIn(status, row["withheld_reason"])
+                self.assertEqual(figures.quality_withheld_label(row), "withheld (unavailable case)")
+
+    def test_quality_missing_or_duplicate_repeat_never_qualifies_with_or_without_error(self):
+        for ids in ([0, 1], [0, 1, 1]):
+            for error in (None, "Connection refused"):
+                with self.subTest(ids=ids, error=error):
+                    cases = [quality_case(i) for i in ids]
+                    cases[0]["requests"][7]["error"] = error
+                    row = next(row for row in self.build([header()] + cases)["quality"] if row["scenario"] == "quality_gsm8k")
+                    self.assertFalse(row["qualified"])
+                    self.assertFalse(row["counts_complete"])
+                    self.assertIsNone(row["correct"])
+                    self.assertEqual(row["withheld_reason_code"], "request_error" if error else "incomplete_counts")
 
     def test_incomplete_questions_and_inconsistent_original_scores_are_withheld(self):
         for change in ("missing_request", "wrong_correct", "wrong_total", "duplicate_check", "duplicate_id"):
@@ -151,6 +216,7 @@ class FigureDataTests(unittest.TestCase):
                    if row["scenario"] == "quality_tasks")
         self.assertTrue(row["qualified"])
         self.assertEqual((row["correct"], row["total"]), (0, 24))
+        self.assertEqual(row["request_availability"]["requests_with_errors"], 0)
 
     def test_long_failure_or_missing_repeat_never_gets_a_zero_or_point(self):
         for failure in ("quality", "missing", "unfinished_stream"):
