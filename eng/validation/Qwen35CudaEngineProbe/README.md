@@ -349,5 +349,7 @@ Both memory switches default off and are selected before model construction:
 
 The switches preserve weights, KV/state formats, arithmetic and the device
 reserve. Evaluate real image requests and DFlash long contexts separately from
-this no-drafter layout probe. Greedy verification has its own answer-quality
-gate; concurrent multimodal quality for that opt-in remains unaccepted.
+this no-drafter layout probe. Concurrent multimodal comparisons have observed
+per-request answer regressions; the answer-quality gate for these opt-ins remains
+unaccepted in that workload. The separate greedy-verification opt-in also remains
+off by default.
