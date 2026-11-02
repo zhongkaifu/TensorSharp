@@ -252,8 +252,8 @@ stop() {
   return "$status"
 }
 
-bench() {
-  local engine=$1 mode=$2 label=$3 scenarios=$SCENARIOS repeats=${REPEATS:-3} status log
+prepare_bench_command() {
+  local engine=$1 mode=$2 label=$3 scenarios=$SCENARIOS repeats=${REPEATS:-3} log
   shift 3
   if [ $# -gt 0 ] && [ "$1" != -- ]; then scenarios=$1; shift; fi
   if [ $# -gt 0 ] && [ "$1" != -- ]; then repeats=$1; shift; fi
@@ -277,16 +277,31 @@ bench() {
   # configuration must not disturb an existing server.
   [[ $scenarios =~ [^,[:space:]] ]] || { die "scenarios must contain at least one nonempty scenario"; return 2; }
   [[ $repeats =~ ^[1-9][0-9]*$ ]] || { die "repeats must be a positive integer"; return 2; }
-  stop || return $?
-  start "$engine" "$mode" "$label" || return $?
   log=$OUT/logs/$engine-$mode-$label.log
-  mkdir -p "$OUT/results" || { stop; return 1; }
-  # Any benchmark failure is retained as a failure even when cleanup succeeds.
-  local -a bench_args=(--engine "$engine" --mode "$mode" --label "$label"
+  # This command is shared by ordinary bench and callers with an explicit
+  # readiness/headroom gate. Keep all fixture and sampling arguments together.
+  BENCH_COMMAND=("$PY" "$ROOT/eng/qwen38-engine-bench.py" --engine "$engine" --mode "$mode" --label "$label"
     --url "http://127.0.0.1:$(port_of "$engine")" --out "$OUT/results/$engine-$mode-$label.jsonl" --overwrite
     --scenarios "$scenarios" --repeats "$repeats" --warmup "$WARMUP" --nonce-seed "$NONCE_SEED" --tokenizer "$TOKENIZER"
     --server-log "$log" --manifest "$(manifest_of "$engine" "$mode" "$label")" "${extra[@]}")
-  "$PY" "$ROOT/eng/qwen38-engine-bench.py" "${bench_args[@]}"
+}
+
+bench_command() {
+  prepare_bench_command "$@" || return $?
+  "$CONTROL_PY" - "${BENCH_COMMAND[@]}" <<'COMMAND'
+import json, sys
+print(json.dumps(sys.argv[1:]))
+COMMAND
+}
+
+bench() {
+  local engine=$1 mode=$2 label=$3 status
+  prepare_bench_command "$@" || return $?
+  stop || return $?
+  start "$engine" "$mode" "$label" || return $?
+  mkdir -p "$OUT/results" || { stop; return 1; }
+  # Any benchmark failure is retained as a failure even when cleanup succeeds.
+  "${BENCH_COMMAND[@]}"
   status=$?
   stop || status=1
   return "$status"
@@ -296,6 +311,7 @@ case ${1:-} in
 start) shift; [ $# -ge 2 ] || { die "start <engine> <plain|dflash2> [label]"; exit 2; }; start "$@" ;;
 stop) stop ;;
 bench) shift; [ $# -ge 3 ] || { die "bench <engine> <plain|dflash2> <label> [scenarios] [repeats] [-- arguments...]"; exit 2; }; bench "$@" ;;
+bench-command) shift; [ $# -ge 3 ] || { die "bench-command <engine> <plain|dflash2> <label> [scenarios] [repeats] [-- arguments...]"; exit 2; }; bench_command "$@" ;;
 matrix)
   shift; [ "${1:-}" != -- ] || shift
   failures=0

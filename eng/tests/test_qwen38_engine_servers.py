@@ -199,6 +199,34 @@ class ServerLifecycleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
         self.assertFalse(self.record_path.exists())
 
+    def test_printed_benchmark_command_matches_executed_protocol_without_lifecycle_actions(self) -> None:
+        manifest = self.start()
+        capture = self.directory / "captured-benchmark-argv.json"
+        fake_python = self.directory / "capture-python"
+        fake_python.write_text(f"#!{sys.executable}\nimport json,sys\nfrom pathlib import Path\nPath({str(capture)!r}).write_text(json.dumps(sys.argv[1:]))\n")
+        fake_python.chmod(0o755)
+        environment = {**self.environment, "PY": str(fake_python),
+                       "HAYSTACK": str(self.directory / "exact haystack.txt"),
+                       "QUALITY_BASELINE": str(self.directory / "quality baseline.jsonl"),
+                       "TOKENIZER": str(self.directory / "pinned tokenizer.json"),
+                       "WARMUP": "3", "NONCE_SEED": "20261101"}
+        job = ("vllm", "plain", "fixture", "short_chat", "3", "--",
+               "--quality-tasks", "8", "--gsm8k-limit", "8", "--long-order-quality",
+               "--answer-tokens", "512", "--decode-tokens", "1024")
+        printed = self.run_server("bench-command", *job, environment=environment)
+        self.assertEqual(printed.returncode, 0, printed.stdout + printed.stderr)
+        command = json.loads(printed.stdout)
+        # Printing the resolved job cannot disturb the already running server.
+        os.kill(manifest["process"]["pid"], 0)
+        self.assertTrue(self.record_path.exists())
+        executed = self.run_server("bench", *job, environment=environment)
+        self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
+        self.assertEqual(json.loads(capture.read_text()), command[1:])
+        self.assertEqual(command[command.index("--haystack") + 1], environment["HAYSTACK"])
+        self.assertEqual(command[command.index("--quality-baseline") + 1], environment["QUALITY_BASELINE"])
+        self.assertEqual(command[command.index("--tokenizer") + 1], environment["TOKENIZER"])
+        self.assertFalse(self.record_path.exists())
+
     def test_invalid_readiness_poll_interval_cannot_launch_a_process(self) -> None:
         for interval in ("0", "-1", "nan", "inf"):
             with self.subTest(interval=interval):
