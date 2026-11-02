@@ -148,6 +148,22 @@ class AvailabilityEvidenceTests(unittest.TestCase):
         self.assertIn("sidecar", reason)
         self.assertEqual(excerpt, line)
 
+    def test_sglang_explicit_kv_budget_refusal_is_configuration_unsupported(self):
+        line = "ValueError: Loaded weights leave no GPU memory for the KV cache under --mem-fraction-static=0.9. Raise --mem-fraction-static above 0.741 (minimum viable = 1 - available/pre = 0.7400). If using speculative decoding, draft weights are now counted."
+        status, reason, excerpt = MODULE.classify(line)
+        self.assertEqual(status, "UNSUPPORTED")
+        self.assertIn("该配置", reason)
+        self.assertEqual(excerpt, line)
+        # Generic capture failures are not evidence of a whole-model limitation.
+        self.assertEqual(MODULE.classify("RuntimeError: markCaptureEnd called with no captures in progress")[0], "ERROR")
+
+    def test_sglang_no_accelerator_is_environment_error_not_capacity(self):
+        line = "RuntimeError: No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
+        status, reason, excerpt = MODULE.classify(line)
+        self.assertEqual(status, "ERROR")
+        self.assertIn("运行环境", reason)
+        self.assertEqual(excerpt, line)
+
 
 if __name__ == "__main__":
     unittest.main()

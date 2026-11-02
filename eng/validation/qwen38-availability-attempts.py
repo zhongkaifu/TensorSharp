@@ -50,6 +50,12 @@ def classify(log):
     line = next((s for s in log.splitlines() if "ValueError: Free memory on device" in s), "")
     if line:
         return "UNSUPPORTED", "该配置要求的GPU内存比例超过启动时可用内存；没有执行正式请求。", line.strip()
+    line = next((s for s in log.splitlines() if "ValueError: Loaded weights leave no GPU memory for the KV cache under --mem-fraction-static=" in s), "")
+    if line:
+        return "UNSUPPORTED", "该配置加载权重并预留运行时及SSM状态后，没有可分配的KV缓存预算；没有执行正式请求。", line.strip()
+    line = next((s for s in log.splitlines() if "RuntimeError: No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available." in s), "")
+    if line:
+        return "ERROR", "启动时未能初始化计算设备；属于运行环境错误，不能推断模型、精度或上下文不受支持。", line.strip()
     if "No space left on device" in log:
         return "ERROR", "启动/JIT临时磁盘空间不足；属于环境错误，不代表模型或GPU上下文不支持。", "No space left on device"
     if "Operation not supported" in log and ("ZMQ" in log or "ZeroMQ" in log or "zmq" in log):
