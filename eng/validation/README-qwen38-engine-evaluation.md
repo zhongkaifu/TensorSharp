@@ -7,6 +7,22 @@ an unavailable private workload. Generated evidence belongs in ignored
 `artifacts/` or `docs/validation/`; required fixtures live under
 `InferenceWeb.Tests/Fixtures/Qwen38/`.
 
+## TensorSharp backend and model route
+
+The native evaluation uses `TS_BACKEND=cuda` (the launcher's default), producing
+`--backend cuda`. With this dense NVFP4 GGUF, one device and `TS_Q35_NATIVE`
+unset, the actual model is `Qwen35CudaModel`. Its startup log must contain
+`Model: qwen35 on the direct-CUDA engine`. Check the recorded argv, environment
+and startup log together: the backend argument alone does not establish which
+Qwen model implementation was selected.
+
+`TS_Q35_NATIVE=0` selects the separate managed `Qwen35Model` implementation on
+the CUDA tensor backend. Label its state-residency diagnostics separately.
+`--backend ggml_cuda` selects another backend and is not part of this native
+performance matrix. The earlier configurations in
+`README-qwen38-perf-configurations.md` document a separate ggml CUDA campaign.
+Do not mix those runs or reuse their dependency revisions as current evidence.
+
 ## Run isolation and provenance
 
 Build engines and prepare models before measured runs. Keep ggml upstream
