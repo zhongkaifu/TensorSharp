@@ -18,18 +18,22 @@ import base64
 from collections import defaultdict
 from datetime import datetime, timezone
 import fnmatch
+from functools import lru_cache
 import glob
 import hashlib
+import importlib.util
 import json
 import math
 from pathlib import Path
 import re
 import statistics
 import textwrap
+import types
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve()
 CONTROL = HERE.with_name("qwen38-cua-control.py")
+BENCH = ROOT / "eng/qwen38-engine-bench.py"
 VERSION = "qwen38-cua-report/1"
 CONTROL_VERSION = "qwen38-cua-control/1"
 DEFAULT = ("append", "truncate", "edit")
@@ -89,6 +93,42 @@ def all_checks(value, required):
 
 def mapping(value):
     return value if isinstance(value, dict) else {}
+
+
+@lru_cache(maxsize=4)
+def frozen_client_module(expected_sha):
+    if not sha_value(expected_sha) or file_sha(BENCH) != expected_sha:
+        raise ValueError("frozen body builder source SHA differs")
+    spec = importlib.util.spec_from_file_location("cua_report_frozen_body_builder", BENCH)
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+    if bench.HARNESS_VERSION != "qwen38-engine-bench/3":
+        raise ValueError("unsupported frozen body builder")
+    return bench
+
+
+def original_wire_body(record, header):
+    """Rebuild frozen Client.body order lost by canonical JSONL serialization.
+
+    The prepared fixture itself was canonical JSON: its common/nested objects
+    therefore entered Client.body in sorted order. Adapters and base fields
+    were then inserted by the frozen builder, not by JSONL's final key sort.
+    Never contact a server or accept a pair of reported hashes as byte proof.
+    """
+    body = record["request_body"]
+    if (not isinstance(body, dict) or not isinstance(header.get("model"), str) or not header["model"]
+            or header.get("engine") not in ("tensorsharp", "velox", "ninfer")):
+        raise ValueError("engine/model/body missing for frozen wire reconstruction")
+    bench = frozen_client_module(mapping(header.get("sources")).get("frozen_bench"))
+    common = json.loads(canonical({k: body[k] for k in COMMON_FIELDS}))
+    args = types.SimpleNamespace(engine=header["engine"], model=header["model"], url="http://offline.invalid",
+        extra_body=None, metrics_url="", tokenizer=None, temperature=0, top_p=1, sampling_seed=1234)
+    client = bench.Client(args) # Nonempty model and tokenizer=None: no discovery or file/network I/O.
+    rebuilt = client.body(common["messages"], common["max_tokens"],
+        {k: v for k, v in common.items() if k not in ("messages", "max_tokens")})
+    if rebuilt != body or canonical(rebuilt) != canonical(body):
+        raise ValueError("complete body differs from the frozen engine adapter")
+    return rebuilt
 
 
 def cache_group(profile):
@@ -167,6 +207,7 @@ def header_errors(header):
         errors.append("invalid selected scenarios")
     for key in ("engine", "mode", "label"):
         if not isinstance(header.get(key), str) or not header[key]: errors.append(f"missing {key}")
+    if not isinstance(header.get("model"), str) or not header["model"]: errors.append("model routing ID required for exact wire reconstruction")
     if header.get("engine") not in ("tensorsharp", "velox", "ninfer"): errors.append("unknown engine for frozen CUA version")
     profile = header.get("cache_profile_operator_declaration")
     if cache_group(profile) == "UNVERIFIED" or header.get("cache_comparison_group") != cache_group(profile):
@@ -192,14 +233,15 @@ def header_errors(header):
     if header.get("settings") != settings: errors.append("fixed sampler/budget/history contract differs")
     sources, prepared = header.get("sources"), mapping(header.get("fixture_manifest"))
     if (not isinstance(sources, dict) or not all(sha_value(sources.get(k)) for k in ("tool", "frozen_bench", "media_generator"))
-            or sources != prepared.get("sources") or sources.get("tool") != file_sha(CONTROL)):
+            or sources != prepared.get("sources") or sources.get("tool") != file_sha(CONTROL)
+            or sources.get("frozen_bench") != file_sha(BENCH)):
         errors.append("frozen source/fixture source identities inconsistent or unsupported")
     if not sha_value(prepared.get("fixture_sha256")) or not sha_value(header.get("launch_manifest_sha256")):
         errors.append("fixture/launch SHA missing")
     return errors
 
 
-def request_observation(record, line):
+def request_observation(record, line, header):
     """Retain raw counts/hashes and original verdict; never regrade semantics."""
     q, response = mapping(record.get("quality")), mapping(record.get("response"))
     raw, wire, body = mapping(record.get("raw_observation")), mapping(record.get("raw_transport")), record.get("request_body")
@@ -235,8 +277,14 @@ def request_observation(record, line):
         identity_checks = {"full_body": record.get("full_body_sha256") == digest(body),
             "canonical_input": record.get("canonical_input_sha256") == digest({k: v for k, v in body.items() if k != "model"}),
             "portable_common": set(COMMON_FIELDS) <= set(body) and record.get("common_sha256") == digest({k: body[k] for k in COMMON_FIELDS if k in body}),
-            "wire_request": record.get("wire_request_body_sha256") == hashlib.sha256(json.dumps(body).encode()).hexdigest()
-                == wire.get("request_body_sha256")}
+            "frozen_body_reconstruction": False, "wire_request": False}
+        try:
+            rebuilt = original_wire_body(record, header)
+            identity_checks["frozen_body_reconstruction"] = True
+            identity_checks["wire_request"] = (record.get("wire_request_body_sha256") ==
+                hashlib.sha256(json.dumps(rebuilt).encode("utf-8")).hexdigest() == wire.get("request_body_sha256"))
+        except (KeyError, TypeError, ValueError, OSError, ImportError) as error:
+            errors.append("exact frozen wire reconstruction unavailable: " + str(error))
     if not identity_checks or not all(identity_checks.values()): errors.append("request body/input hash inconsistency")
     try:
         payload = base64.b64decode(wire["body_base64"], validate=True)
@@ -267,7 +315,7 @@ def case_data(segment, scenario, source):
     valid_shape = not protocol(h)[2] and type(lanes) is int and lanes in (1, 2)
     requests = [(line, r) for line, r in records if r.get("kind") == "request" and r.get("scenario") == scenario]
     waves = [(line, r) for line, r in records if r.get("kind") == "wave" and r.get("scenario") == scenario]
-    observed = [request_observation(r, line) for line, r in requests]
+    observed = [request_observation(r, line, h) for line, r in requests]
     ids = [(r.get("lane"), r.get("step")) for _, r in requests]
     valid_ids = all(type(a) is int and type(b) is int for a, b in ids)
     expected = {(lane, step) for lane in range(lanes) for step in range(steps)} if valid_shape else set()

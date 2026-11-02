@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ def module(name, path):
     spec=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
 report=module("cua_report_tested",HERE/"qwen38-cua-report.py")
 control=module("cua_frozen_for_report_mocks",HERE/"qwen38-cua-control.py")
+bench=control.load_bench()
 
 
 def header(lanes=1, scenario="append", profile="default-lineage", label="MOCK_ONLY", engine="tensorsharp", tag="one", steps=None):
@@ -24,7 +26,7 @@ def header(lanes=1, scenario="append", profile="default-lineage", label="MOCK_ON
         "environment":{"TS_PREFIX_CACHE_ISOLATION":"shared" if profile=="trusted-single-tenant-shared" else None},
         "binaries":[{"path":"MOCK_ONLY.dll","sha256":"a"*64}],"models":{"target_sha256":"b"*64}}
     sources=control.sources()
-    return {"kind":"run","schema":control.VERSION,"created_utc":"MOCK_"+tag,"engine":engine,"mode":"plain","label":label,
+    return {"kind":"run","schema":control.VERSION,"created_utc":"MOCK_"+tag,"engine":engine,"mode":"plain","label":label,"model":"MOCK_ROUTE",
         "lanes":lanes,"steps":steps,"selected_scenarios":[scenario],"context_capacity_operator_declaration":65536,
         "cache_profile_operator_declaration":profile,"cache_comparison_group":report.cache_group(profile),
         "standard_30step_protocol":not media,"protocol":"opt_in_6_to_10_step_old_media_probe" if media else "default_three_scenarios",
@@ -37,12 +39,15 @@ def request(h, step, lane):
     scenario=h["selected_scenarios"][0]
     expected={"code":"1234","color":"red","revision":"BASE","step":step,"lane":lane}
     if scenario=="edit_media":expected["anchor_code"]="5678"
-    common={"messages":[{"role":"user","content":f"MOCK ONLY step{step} lane{lane}"}],"tools":control.tools(scenario=="edit_media"),
+    common={"messages":[{"role":"user","content":f"MOCK ONLY step{step} lane{lane} 中文"}],"tools":control.tools(scenario=="edit_media"),
         "tool_choice":"auto","max_tokens":192,"temperature":0,"top_p":1,"presence_penalty":0,"frequency_penalty":0,
         "seed":1234,"stream":True,"stream_options":{"include_usage":True}}
-    body=dict(common,model="MOCK_ROUTE")
-    if h["engine"]=="tensorsharp":body.update(think=False,skills=[],skills_discovery=False,multi_agent=False,repeat_penalty=1)
-    else:body["chat_template_kwargs"]={"enable_thinking":False}
+    # Real prepare() writes canonical fixture.json; run() reads that ordering
+    # before the actual frozen Client.body inserts base fields and adapters.
+    common=json.loads(control.canonical(common))
+    client=bench.Client(types.SimpleNamespace(engine=h["engine"],model=h["model"],url="http://offline.invalid",
+        extra_body=None,metrics_url="",tokenizer=None,temperature=0,top_p=1,sampling_seed=1234))
+    body=client.body(common["messages"],common["max_tokens"],{k:v for k,v in common.items()if k not in("messages","max_tokens")})
     usage={"prompt_tokens":19000+step,"completion_tokens":60+lane,"prompt_tokens_details":{"cached_tokens":16602+step}}
     payload=b"data: MOCK_ONLY_TOOL_RESPONSE\n\ndata: [DONE]\n"
     wire_sha=hashlib.sha256(json.dumps(body).encode()).hexdigest()
@@ -86,7 +91,7 @@ class CuaReportTests(unittest.TestCase):
         parent=report.ROOT/"artifacts/qwen38-regression/cua-report-tests";parent.mkdir(parents=True,exist_ok=True)
         self.tmp=tempfile.TemporaryDirectory(dir=parent);self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name)
     def write(self,rows,name="mock.jsonl"):
-        p=self.root/name;p.write_text("\n".join(json.dumps(r) for r in rows)+"\n");return p
+        p=self.root/name;p.write_text("\n".join(control.canonical(r) for r in rows)+"\n");return p
     def data(self,rows,**kwargs):return report.build_data([self.write(rows)],**kwargs)
 
     def test_full30_by_two_lanes_and_raw_token_cache_hashes_preserved(self):
@@ -98,6 +103,43 @@ class CuaReportTests(unittest.TestCase):
         self.assertEqual(c["observations"][0]["server_cached_tokens"],16602)
         self.assertTrue(all(c["observations"][0]["request_identity_checks"].values()))
         self.assertIn("correlated",c["sample_note"]);self.assertIsNone(g["decode_tok_s"])
+
+    def test_canonical_jsonl_order_is_rebuilt_by_the_real_frozen_client_offline(self):
+        for engine in("tensorsharp","velox","ninfer"):
+            h=header(engine=engine,profile="default-lineage"if engine=="tensorsharp"else"engine-native-global")
+            rows=records(h);path=self.write(rows)
+            parsed=[json.loads(line)for line in path.read_text().splitlines()]
+            r=next(r for r in parsed if r["kind"]=="request")
+            self.assertNotEqual(hashlib.sha256(json.dumps(r["request_body"]).encode()).hexdigest(),r["wire_request_body_sha256"])
+            with patch("urllib.request.urlopen",side_effect=AssertionError("offline report cannot contact any server")):
+                data=report.build_data([path])
+            self.assertTrue(data["groups"][0]["qualified"],engine)
+            checks=data["groups"][0]["run_cases"][0]["observations"][0]["request_identity_checks"]
+            self.assertTrue(checks["frozen_body_reconstruction"]);self.assertTrue(checks["wire_request"])
+
+    def test_matching_reported_wire_hashes_do_not_replace_exact_byte_verification(self):
+        rows=records();r=next(r for r in rows if r["kind"]=="request")
+        reordered=json.loads(control.canonical(r["request_body"]))
+        wrong=hashlib.sha256(json.dumps(reordered).encode()).hexdigest()
+        self.assertNotEqual(wrong,r["wire_request_body_sha256"])
+        r["wire_request_body_sha256"]=r["raw_transport"]["request_body_sha256"]=wrong
+        data=self.data(rows);self.assertFalse(data["groups"][0]["qualified"])
+        checks=data["groups"][0]["run_cases"][0]["observations"][0]["request_identity_checks"]
+        self.assertTrue(checks["full_body"]);self.assertTrue(checks["canonical_input"]);self.assertTrue(checks["portable_common"])
+        self.assertTrue(checks["frozen_body_reconstruction"]);self.assertFalse(checks["wire_request"])
+
+    def test_complete_body_adapter_or_model_context_changes_fail_closed(self):
+        for change in("adapter","model_header","builder_sha"):
+            rows=records();r=next(r for r in rows if r["kind"]=="request")
+            if change=="adapter":
+                r["request_body"]["skills"]=["unrequested"]
+                r["full_body_sha256"]=control.digest(r["request_body"])
+                r["canonical_input_sha256"]=control.digest({k:v for k,v in r["request_body"].items()if k!="model"})
+                wire=hashlib.sha256(json.dumps(r["request_body"]).encode()).hexdigest()
+                r["wire_request_body_sha256"]=r["raw_transport"]["request_body_sha256"]=wire
+            elif change=="model_header":rows[0]["model"]="wrong-route"
+            else:rows[0]["sources"]["frozen_bench"]="0"*64
+            self.assertFalse(self.data(rows)["groups"][0]["qualified"],change)
 
     def test_original_fail_or_unverified_never_shows_any_performance(self):
         for change in ("quality","measurement","check","flag"):
