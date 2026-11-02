@@ -32,6 +32,12 @@ def identity(path: Path, remote_path=None):
 
 
 def classify(log):
+    line = next((s for s in log.splitlines() if 'ignis.artifact.sidecar_missing' in s), "")
+    if line:
+        return "ERROR", "启动所需的官方模型来源sidecar缺失；属于安装/文件准备错误，没有执行正式请求。", line.strip()
+    line = next((s for s in log.splitlines() if 'the VRAM plan needs ' in s and 'VRAM budget' in s), "")
+    if line:
+        return "UNSUPPORTED", "该配置的VRAM规划无法容纳权重、工作区、状态及一个完整声明上下文；没有执行正式请求。", line.strip()
     line = next((s for s in log.splitlines() if "automatic KV capacity requires " in s and " bytes are available after weights" in s), "")
     if line:
         return "UNSUPPORTED", "该配置所需的KV运行时预算和自动预留空间超过权重加载后可用设备内存；没有执行正式请求。", line.strip()

@@ -133,6 +133,21 @@ class AvailabilityEvidenceTests(unittest.TestCase):
         self.assertEqual(excerpt, line)
         self.assertEqual(MODULE.classify("automatic KV capacity requires an unsupported allocator")[0], "ERROR")
 
+    def test_ignis_actual_vram_plan_refusal_is_scoped_capacity_unsupported(self):
+        line = json.dumps({"event_name": "ignis.model.load_failed", "attributes": {
+            "error": "the VRAM plan needs 35951962248 bytes for the weights, workspaces, lanes, retained state and one --model-max-context sequence of KV, 3895879816 bytes more than the 32056082432-byte VRAM budget"}})
+        status, reason, excerpt = MODULE.classify(line)
+        self.assertEqual(status, "UNSUPPORTED")
+        self.assertIn("该配置", reason)
+        self.assertEqual(excerpt, line)
+
+    def test_missing_official_sidecar_is_setup_error_not_model_unsupported(self):
+        line = json.dumps({"event_name": "ignis.artifact.sidecar_missing", "attributes": {"error": "no sidecar next to model.ninfer"}})
+        status, reason, excerpt = MODULE.classify(line)
+        self.assertEqual(status, "ERROR")
+        self.assertIn("sidecar", reason)
+        self.assertEqual(excerpt, line)
+
 
 if __name__ == "__main__":
     unittest.main()
