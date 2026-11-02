@@ -1,0 +1,93 @@
+Standalone W4/A8 DP4a, N8 rows-per-warp experiment
+
+This tool does not change production kernels, dispatch, ggml, or the sealed
+Qwen35Int8MmaBench tool and its resource policy. It imports the production
+prefix verbatim and adds four private wrappers calling precisely the same
+ts_q35_gemv_nvfp4<8,R> template. There is no A4 activation conversion, new math,
+pre-unpacking, forced register count, launch-bounds hint, or approximation.
+The compiler can still schedule/contract instantiations differently: source
+identity is not an output-bit proof. The later full GPU gate cannot be skipped.
+
+The primary oracle is ts_q35_gemv_nvfp4_8, original R4, block128 and grid
+ceil(M/16), matching current Q35Kernels.GemvNvfp4 production geometry.
+R1/R2/R3 private wrappers also use block128; their grid is ceil(M/(4*R)).
+They change only R relative to this oracle. The R4 private wrapper uses
+block32 and grid ceil(M/4), and is separately labelled launch_only_control.
+Its timing must not be described as a rows-per-warp improvement. R1/R2/R3
+results must not be compared with R4/block32 as if block sizes matched.
+
+The hypothesis is that smaller R might reduce register pressure at a cost of
+less activation reuse/more warps and launches. Actual ptxas register counts,
+driver occupancy for each actual block size, GPU timing and end-to-end results
+are separate evidence. Register count alone does not identify a bottleneck.
+This tool does not claim that lower registers improve speed.
+
+CPU-only validation and preparation (neither command invokes nvcc or CUDA):
+
+  python3 -m unittest discover -s eng/validation/Qwen35Dp4aRowsBench -p test_build.py -v
+  python3 eng/validation/Qwen35Dp4aRowsBench/build.py --out artifacts/qwen38-regression/dp4a-rows-generated-01 --generate-only
+
+--out must be NEW storage under this checkout's ignored artifacts/ or
+docs/validation/. Reusing a generated or failed directory is refused, retaining
+earlier evidence. Generated source never creates a resource permission.
+N1..7 are NOT_SUPPORTED before any GPU build admission or CUDA initialization.
+
+Future offline native build, only in a separately authorized compiler window:
+
+  python3 eng/validation/Qwen35Dp4aRowsBench/build.py --out artifacts/qwen38-regression/dp4a-rows-native-01 --nvcc /usr/local/cuda/bin/nvcc --cuobjdump /usr/local/cuda/bin/cuobjdump --arch sm_120a
+
+For a separate harness checkout, pass --source with the unchanged production
+tensorsharp_q35_kernels.cu path. Retain this entire tool directory and the
+sealed Qwen35Int8MmaBench sibling: its generator supplies the exact prefix
+validation and 96-case/12-timed-shape plan. The new runner's input generation,
+sentinel/guards and readback are copied unchanged, with a CPU test checking
+byte identity to the sealed runner. Both source sets are SHA-identified.
+No production fatbin is loaded or asserted equivalent to the recompiled oracle.
+
+Build records nvcc --version, commands, flags/env, production and tool SHAs,
+actual ptxas resources for all five symbols, PTX and optional actual SASS.
+NVCC_PREPEND_FLAGS/NVCC_APPEND_FLAGS must be unset. Missing records or any
+stack/spill/shared bytes reject the entire experiment, without silently
+dropping a candidate. Natural registers must be 1..255/thread; this is a
+no-spill/launchability gate and does NOT reuse Int8MMA's <=64-register budget.
+No register limit is forced. Driver launchability still must be established.
+The distinct dp4a-rows-resources-permitted.json marker is written only after
+successful actual cubin/PTX/runner build, resource checks and artifact hashes.
+complete=true in a build manifest means offline compilation/resources only.
+
+Future explicit GPU strict gate and timing, never called by build/tests:
+
+  python3 eng/validation/Qwen35Dp4aRowsBench/run.py --build artifacts/qwen38-regression/dp4a-rows-native-01 --name strict-1
+  python3 eng/validation/Qwen35Dp4aRowsBench/run.py --build artifacts/qwen38-regression/dp4a-rows-native-01 --name abba-1 --bench --rounds 5 --iterations 3
+
+The run wrapper verifies the distinct schema/marker, tool/plan/artifact and
+production-source hashes before launch. Actual driver register/local/shared
+attributes and potential active CTAs are checked for EVERY actual block size;
+zero local/shared, max threads >= launch and >=1 potential active CTA are
+required. Potential occupancy is not measured achieved occupancy. A one-row
+pilot proves launchability but does not count as passing the 96-case plan.
+Before the pilot, the existing production rows-per-warp query runs into a
+guarded nine-int buffer and must confirm actual N8=R4; a macro-width mismatch
+fails before the oracle projection is launched.
+
+Each of four candidates must pass all 96 original cases, complete output
+float bits and input/output guards, oracle A/A, candidate A/A and actual-output
+argmax for all eight rows, including negative zero/NaN bit identity. This is
+384 candidate-case comparisons, not 384 independently designed fixtures.
+Failure retains full expected/actual arrays and the first mismatch. Argmax is
+diagnostic for synthetic projection rows, not model logits or model quality.
+It uses strict first-max comparisons, including leading NaN/tie behavior.
+
+Only after that complete strict plan can --bench time each of the original
+12 shapes for every candidate. Every exact timed fixture is gated again.
+ABBA records A=production-style R4/block128 and B=explicit candidate metadata,
+five paired rounds by default and three kernel invocations per half. Each
+half is freshly poisoned, runs GPU events, then checks every output bit and
+guard against the oracle. Resets/readback are outside the timing interval,
+but can change cache state; these are controlled synthetic kernel times,
+not uninterrupted hot-cache throughput, independent samples per launch,
+model quality, service latency or a production speedup claim.
+
+Until separately executed, native compilation, actual resources/launchability,
+GPU full bits, GPU timing, hardware counters and model quality remain NOT_RUN.
+Source generation and mock compiler tests are never CUDA validation evidence.
