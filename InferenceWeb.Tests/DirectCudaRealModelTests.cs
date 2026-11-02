@@ -223,6 +223,15 @@ public sealed class DirectCudaRealModelTests : IDisposable
     {
         string path = Find(pattern);
         using var model = ModelBase.Create(path, BackendType.Cuda);
+        _output.WriteLine($"snapshot runtime: type={model.GetType().FullName}, backend={model.ExecutionPlan.BackendType}, " +
+            $"KV={model.KvCacheDtype}, checkpoint={Path.GetFullPath(path)}, bytes={new FileInfo(path).Length}");
+        if (Environment.GetEnvironmentVariable("TS_Q35_NATIVE") == "0"
+            && model.Config.Architecture is "qwen35" or "qwen35moe" or "qwen3next")
+        {
+            Assert.IsType<Qwen35Model>(model);
+            Assert.Equal(BackendType.Cuda, model.ExecutionPlan.BackendType);
+            Assert.Equal(KvCacheDtype.F16, model.KvCacheDtype);
+        }
         int[] ids = Tokens(model, 68);
         int[] prefix = ids[..48], suffix = ids[48..64], forced = ids[64..68];
         Trajectory(model, ids[..64], forced);
