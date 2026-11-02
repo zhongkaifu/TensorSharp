@@ -39,6 +39,9 @@ class ServerLifecycleTests(unittest.TestCase):
         self.mock = binary / "vllm"
         self.mock.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
             import http.server, json, os, subprocess, sys
+            if os.environ.get('FIXTURE_SERVER_ENV_FILE'):
+                with open(os.environ['FIXTURE_SERVER_ENV_FILE'], 'w') as output:
+                    json.dump({key:os.environ.get(key) for key in ('MAX_CONTEXT','TS_Q35_UBATCH','TS_SCHED_MAX_RUNNING_SEQS')}, output)
             port = (int(sys.argv[sys.argv.index('--port') + 1]) if '--port' in sys.argv
                     else int(sys.argv[sys.argv.index('--server-bind') + 1].rsplit(':', 1)[1]))
             if '--fixture-child' in sys.argv:
@@ -91,6 +94,7 @@ class ServerLifecycleTests(unittest.TestCase):
         self.assertEqual(manifest["context_tokens"], 262144)
         self.assertEqual(manifest["lanes"], 1)
         self.assertEqual(manifest["status"], "ready")
+        self.assertEqual(manifest["readiness_budget"], {"timeout_seconds": 3600, "attempt_limit": 40, "poll_seconds": 0.05})
         self.assertEqual(manifest["environment"]["CUDA_VISIBLE_DEVICES"], "0")
         self.assertNotIn("DO_NOT_RECORD_TEST_SECRET", manifest["environment"])
         self.assertIn("TEST_UNSET_ENGINE_FIELD", manifest["environment"])
@@ -154,6 +158,27 @@ class ServerLifecycleTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--spec") + 1], "none")
         self.assertEqual(argv[argv.index("--proposal-head") + 1], "full")
 
+    def test_tensorsharp_explicit_scheduler_limit_reaches_server_environment(self) -> None:
+        dotnet = self.mock.with_name("dotnet")
+        dotnet.write_text(self.mock.read_text())
+        dotnet.chmod(0o755)
+        (self.directory / "TensorSharp.Server.Host.dll").write_bytes(b"fixture assembly")
+        child_environment = self.directory / "server-environment.json"
+        environment = {**self.environment, "TS_BIN": str(self.directory), "TS_PORT": str(self.port),
+                       "TENSORSHARP_REPO": str(self.directory), "LANES": "2", "TS_SCHED_MAX_RUNNING_SEQS": "99",
+                       "FIXTURE_SERVER_ENV_FILE": str(child_environment),
+                       "PATH": str(dotnet.parent) + os.pathsep + os.environ.get("PATH", "")}
+        result = self.run_server("start", "tensorsharp", "plain", "fixture", environment=environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        manifest = json.loads((self.directory / "run/manifests/tensorsharp-plain-fixture.json").read_text())
+        self.assertEqual(json.loads(child_environment.read_text())["TS_SCHED_MAX_RUNNING_SEQS"], "2")
+        self.assertEqual(manifest["environment"]["TS_SCHED_MAX_RUNNING_SEQS"], "2")
+        admission = manifest["sequence_admission_configuration"]
+        self.assertEqual(admission["configured_running_sequence_limit"], "2")
+        self.assertIn("explicit launcher", admission["source"])
+        self.assertFalse(admission["runtime_admission_cap_verified"])
+        self.assertIsNone(admission["observed_peak_active_sequences"])
+
     def test_ignis_records_kv_and_prefill_attention_precision_separately(self) -> None:
         environment = {**self.environment, "IGNIS_SERVE": str(self.mock), "IGNIS_PORT": str(self.port),
                        "IGNIS_REPO": str(self.directory), "IGNIS_KV": "bf16", "IGNIS_PREFILL_ATTENTION": "fp16"}
@@ -173,6 +198,16 @@ class ServerLifecycleTests(unittest.TestCase):
                                  "--", "--temperature", "0.7", environment=environment)
         self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
         self.assertFalse(self.record_path.exists())
+
+    def test_invalid_readiness_poll_interval_cannot_launch_a_process(self) -> None:
+        for interval in ("0", "-1", "nan", "inf"):
+            with self.subTest(interval=interval):
+                result = self.run_server("start", "vllm", "plain", "invalid-poll",
+                                         environment={**self.environment, "POLL_INTERVAL": interval})
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("--readiness-poll-seconds", result.stderr)
+                self.assertFalse(self.record_path.exists())
+                self.assertFalse((self.directory / "run/manifests/vllm-plain-invalid-poll.json").exists())
 
     def test_invalid_benchmark_job_cannot_stop_or_start_a_server(self) -> None:
         manifest = self.start()
@@ -249,6 +284,63 @@ class ServerLifecycleTests(unittest.TestCase):
 
 
 class SourceProvenanceTests(unittest.TestCase):
+    @staticmethod
+    def helper():
+        spec = importlib.util.spec_from_file_location("qwen38_process_binary_fixture", ROOT / "eng/qwen38-engine-process.py")
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        return helper
+
+    def test_binary_inventory_includes_capitalized_bridge_and_versioned_runtime_libraries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            bridge = directory / "libGgmlOps.so"
+            bridge.write_bytes(b"exact active bridge fixture")
+            runtime = directory / "runtimes/linux-x64/native/libTensorSharpCuda.so.1"
+            runtime.parent.mkdir(parents=True)
+            runtime.write_bytes(b"versioned runtime fixture")
+            inventory = self.helper().binary_identities("tensorsharp", ["nonexistent-fixture-executable"], str(directory), {})
+            found = {entry["path"]: entry for entry in inventory}
+            self.assertEqual(set(found), {str(bridge), str(runtime)})
+            self.assertEqual(found[str(bridge)]["sha256"], hashlib.sha256(bridge.read_bytes()).hexdigest())
+
+    def test_native_binary_inventory_includes_its_build_shared_libraries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary).resolve() / "build-current"
+            build.mkdir()
+            (build / "CMakeCache.txt").write_text("# configured build fixture\n")
+            executable = build / "bin/llama-server"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"native executable fixture")
+            executable.chmod(0o755)
+            library = build / "src/libllama.so.0.1"
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b"native shared library fixture")
+            inventory = self.helper().binary_identities("llamacpp", [str(executable)], str(build), {})
+            found = {entry["path"]: entry for entry in inventory}
+            self.assertEqual(set(found), {str(executable), str(library)})
+            self.assertEqual(found[str(library)]["sha256"], hashlib.sha256(library.read_bytes()).hexdigest())
+
+    def test_native_inventory_does_not_scan_system_prefix_as_an_engine_build(self) -> None:
+        executable = Path("/usr/bin/false")
+        if not executable.is_file():
+            self.skipTest("requires the standard Unix false executable")
+        inventory = self.helper().binary_identities("ninfer", [str(executable)], "/tmp", {})
+        self.assertEqual({entry["path"] for entry in inventory}, {str(executable.resolve())})
+
+    def test_unconfigured_bin_parent_is_not_recursively_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve() / "cuda"
+            executable = directory / "bin/fixture-engine"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"native executable fixture")
+            executable.chmod(0o755)
+            unrelated = directory / "lib/large-unrelated-runtime.so"
+            unrelated.parent.mkdir()
+            unrelated.write_bytes(b"outside the executable bundle and no configured build marker")
+            inventory = self.helper().binary_identities("ninfer", [str(executable)], str(directory), {})
+            self.assertEqual({entry["path"] for entry in inventory}, {str(executable)})
+
     def test_records_untracked_cuda_sources_and_ignores_ide_files(self) -> None:
         scratch = ROOT / "artifacts/qwen38-lifecycle-tests"
         scratch.mkdir(parents=True, exist_ok=True)

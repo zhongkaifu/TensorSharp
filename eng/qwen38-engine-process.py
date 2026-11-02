@@ -9,6 +9,7 @@ import datetime as dt
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -25,6 +26,13 @@ def write_json(path: Path, value: dict) -> None:
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
     os.replace(temporary, path)
+
+
+def positive_finite_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return number
 
 
 def process_stat(pid: int) -> dict | None:
@@ -162,8 +170,30 @@ def binary_identities(engine: str, argv: list[str], cwd: str, environment: dict)
     if engine == "tensorsharp":
         directory = Path(cwd)
         for pattern in ["TensorSharp*.dll", "cuda_kernels/*.fatbin", "cuda_kernels/*.ptx",
-                        "cuda_kernels/*.sha256", "*tensorsharp*.so", "*ggml*.so"]:
+                        "cuda_kernels/*.sha256", "*.so", "*.so.*"]:
             paths.extend(directory.glob(pattern))
+        runtime_directory = directory / "runtimes"
+        if runtime_directory.is_dir():
+            for pattern in ("*.so", "*.so.*"):
+                paths.extend(runtime_directory.rglob(pattern))
+    elif executable and engine in {"llamacpp", "focus-llama", "ninfer", "infernix", "velox", "ignis"}:
+        directory = Path(executable).resolve().parent
+        # Native CMake products commonly put the executable in bin/ or apps/
+        # and their own shared libraries in sibling lib/, src/, or ggml/ dirs.
+        # Inventory this build configuration only; do not scan Python wheels,
+        # system CUDA installations, or unrelated build configurations.
+        build_directory = directory.parent if directory.name in {"bin", "apps"} else directory
+        generic_prefix = build_directory in {Path("/"), Path("/usr"), Path("/usr/local"), Path("/opt"), Path("/root"), Path("/home")}
+        for pattern in ("*.so", "*.so.*"):
+            if generic_prefix:
+                continue
+            if directory.name in {"bin", "apps"} and (build_directory / "CMakeCache.txt").is_file():
+                paths.extend(build_directory.rglob(pattern))
+            else:
+                paths.extend(directory.glob(pattern))
+                if not generic_prefix:
+                    for child in ("lib", "lib64", "runtimes"):
+                        paths.extend((directory / child).rglob(pattern))
     unique = sorted({path.resolve() for path in paths if path.is_file()})
     return [file_identity(path) for path in unique]
 
@@ -235,6 +265,9 @@ def start(args: argparse.Namespace) -> int:
     manifest = {"schema_version": 1, "engine": args.engine, "mode": args.mode,
                 "label": args.label, "started_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "context_tokens": args.context, "lanes": args.lanes,
+                "readiness_budget": {"timeout_seconds": args.startup_timeout_seconds,
+                                     "attempt_limit": args.startup_attempt_limit,
+                                     "poll_seconds": args.readiness_poll_seconds},
                 "argv": argv, "working_directory": str(Path(args.cwd).resolve()),
                 "environment": {key: environment.get(key) for key in sorted(allowed) if key},
                 "process": record, "engine_source": revision(args.engine_repo),
@@ -244,6 +277,17 @@ def start(args: argparse.Namespace) -> int:
                 "harness_files": harness_identities(args.harness_root),
                 "host": {"platform": platform.platform(), "machine": platform.machine()},
                 "status": "starting", "log": str(Path(args.log).resolve())}
+    if args.engine == "tensorsharp":
+        manifest["sequence_admission_configuration"] = {
+            "declared_lane_setting": args.lanes,
+            "configured_running_sequence_limit": environment.get("TS_SCHED_MAX_RUNNING_SEQS"),
+            "source": "explicit launcher TS_SCHED_MAX_RUNNING_SEQS override" if "TS_SCHED_MAX_RUNNING_SEQS" in overrides
+                      else "inherited environment (not independently verified at the live scheduler)",
+            "runtime_admission_cap_verified": False,
+            "observed_peak_active_sequences": None,
+            "dynamic_device_slot_cap": None,
+            "effective_rule": "min(configured running-sequence limit, dynamic device slot capacity)",
+        }
     # Persist ownership before enriching; a failed hardware probe must never
     # orphan a server or erase the launch evidence.
     write_json(Path(args.manifest), manifest)
@@ -317,6 +361,9 @@ def main() -> int:
     launch.add_argument("--env", action="append", default=[])
     launch.add_argument("--context", type=int, required=True)
     launch.add_argument("--lanes", type=int, required=True)
+    launch.add_argument("--startup-timeout-seconds", type=int)
+    launch.add_argument("--startup-attempt-limit", type=int)
+    launch.add_argument("--readiness-poll-seconds", type=positive_finite_float)
     launch.add_argument("argv", nargs=argparse.REMAINDER)
     check = commands.add_parser("check")
     check.add_argument("--record", required=True)

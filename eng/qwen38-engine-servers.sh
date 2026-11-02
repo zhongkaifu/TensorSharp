@@ -10,6 +10,8 @@
 # Optional: eole (single active lane, text-only DFlash2), focus-llama (GGUF fork).
 # CTX and LANES are per-sequence context and active lanes. For the long suite use
 # CTX=262144 LANES=1 SCENARIOS=long_prompt_128k,long_prompt_250k (250K=256000).
+# STARTUP_TIMEOUT_SECONDS defaults to 3600 for first-use vendor JIT. Optional
+# START_ATTEMPTS additionally limits readiness probes (0 means no count limit).
 # All logs, manifests, PID records and results go below ignored artifacts/ by default.
 # Model formats differ across engines: retain each manifest and quality results.
 set -uo pipefail
@@ -51,6 +53,7 @@ CAPTURE_ENV=$CAPTURE_ENV,${MANIFEST_ENV_ALLOWLIST:-}
 CAPTURE_ENV=$CAPTURE_ENV,TS_Q35_CUDA_GRAPHS,TS_Q35_VERIFY_GRAPHS,TS_Q35_TOPK_PARTITIONED,TS_Q35_GDN_PREPARED_PREFILL,TS_Q35_GREEDY_VERIFY,TS_Q35_DRAFT_SPLITK,TS_Q35_GEMM_SPLITK,TS_Q35_ATTN_PREFILL,TS_Q35_NATIVE,TS_PREFIX_CACHE_ISOLATION,GGML_CUDA_PDL
 CAPTURE_ENV=$CAPTURE_ENV,EOLE_TORCH_COMPILE,EOLE_COMPILE_MODE,TORCH_CUDA_ARCH_LIST
 CAPTURE_ENV=$CAPTURE_ENV,TMPDIR,MAX_JOBS,FLASHINFER_CUDA_ARCH_LIST,FLASHINFER_WORKSPACE_BASE,VLLM_CPU_OFFLOAD_GB
+CAPTURE_ENV=$CAPTURE_ENV,TS_SCHED_MAX_RUNNING_SEQS
 
 die() { echo "qwen38-engine-servers: $*" >&2; return 2; }
 port_of() {
@@ -66,10 +69,12 @@ manifest_of() { echo "$OUT/manifests/$1-$2-$3.json"; }
 
 start() {
   local engine=$1 mode=$2 label=${3:-main} port log record manifest cwd=$ROOT repo='' pid i actual_lanes=$LANES python_executable=''
+  local startup_budget=${STARTUP_TIMEOUT_SECONDS:-3600} startup_attempt_limit=${START_ATTEMPTS:-0} startup_clock
   local -a argv=() spec=() env_args=() launch=() input_args=()
   [[ $label =~ ^[a-zA-Z0-9._-]+$ ]] || { die "label must contain only letters, numbers, dots, underscores or hyphens"; return 2; }
   [ "$mode" = plain ] || [ "$mode" = dflash2 ] || { die "mode must be plain or dflash2"; return 2; }
   [[ $CTX =~ ^[1-9][0-9]*$ && $LANES =~ ^[1-9][0-9]*$ ]] || { die "CTX and LANES must be positive integers"; return 2; }
+  [[ $startup_budget =~ ^[1-9][0-9]*$ && $startup_attempt_limit =~ ^[0-9]+$ ]] || { die "STARTUP_TIMEOUT_SECONDS must be positive and START_ATTEMPTS nonnegative integers"; return 2; }
   port=$(port_of "$engine") || return $?
   mkdir -p "$OUT/logs" "$OUT/pids" "$OUT/manifests" || return $?
   log=$OUT/logs/$engine-$mode-$label.log; record=$OUT/pids/$engine-$port.json
@@ -85,7 +90,8 @@ PORTCHECK
   tensorsharp)
     cwd=$TS_BIN; repo=$TS_SOURCE
     [ "$mode" = dflash2 ] && spec=(--draft-model "$TS_DRAFT" --spec-draft "$SPEC_DRAFT" --spec-pmin "$SPEC_PMIN")
-    env_args=(--env "MAX_CONTEXT=$CTX" --env "TS_Q35_UBATCH=${TS_Q35_UBATCH:-4096}")
+    env_args=(--env "MAX_CONTEXT=$CTX" --env "TS_Q35_UBATCH=${TS_Q35_UBATCH:-4096}"
+      --env "TS_SCHED_MAX_RUNNING_SEQS=$LANES")
     argv=(dotnet TensorSharp.Server.Host.dll --model "$TS_MODEL" --mmproj "$MMPROJ" --backend "$TS_BACKEND"
       --host 127.0.0.1 --port "$port" --no-webui --no-multi-agent --no-skills --temperature 0 --repeat-penalty 1 "${spec[@]}") ;;
   llamacpp|focus-llama)
@@ -213,9 +219,12 @@ EXTRA
     --label "$label" --context "$CTX" --lanes "$actual_lanes" --cwd "$cwd" --log "$log"
     --root "$TS_SOURCE" --harness-root "$ROOT" --engine-repo "$repo" --capture-env "$CAPTURE_ENV"
     --model-manifest-json "${MODEL_MANIFEST_JSON:-}" --python-executable "$python_executable"
+    --startup-timeout-seconds "$startup_budget" --startup-attempt-limit "$startup_attempt_limit" --readiness-poll-seconds "${POLL_INTERVAL:-3}"
     "${input_args[@]}" "${env_args[@]}" -- "${argv[@]}")
   pid=$("${launch[@]}") || return $?
-  for ((i=0; i<${START_ATTEMPTS:-400}; i++)); do
+  startup_clock=$SECONDS
+  for ((i=0; startup_attempt_limit == 0 || i < startup_attempt_limit; i++)); do
+    if ((SECONDS - startup_clock >= startup_budget)); then break; fi
     if ! "$CONTROL_PY" "$PROCESS" check --record "$record"; then
       "$CONTROL_PY" "$PROCESS" mark --manifest "$manifest" --status launch_failed
       echo "DIED $engine $mode (log $log)" >&2; tail -10 "$log" >&2
