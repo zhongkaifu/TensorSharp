@@ -459,9 +459,9 @@ def render_html(summary):
     long_rows = [row for row in rows if re.search(r"(?:128|250)k", row["scenario"], re.I)]
     short_rows = [row for row in rows if row not in long_rows]
     count = summary["status_counts"]
-    cards = [("实际运行配置", len(summary["runs"])), ("全通过场景", count.get("PASS", 0)),
-             ("失败 / 不完整", sum(count.get(key, 0) for key in ("FAIL", "INCOMPLETE", "ERROR"))),
-             ("128K / 250K 通过", sum(row["status"] == "PASS" for row in long_rows))]
+    cards = [("记录的运行配置", len(summary["runs"])), ("全通过场景组", count.get("PASS", 0)),
+             ("未通过 / 不完整场景组", sum(count.get(key, 0) for key in ("FAIL", "INCOMPLETE", "ERROR"))),
+             ("128K / 250K 全通过场景组", sum(row["status"] == "PASS" for row in long_rows))]
     card_html = "".join(f'<div class="card"><span>{esc(name)}</span><strong>{value if summary["runs"] else "—"}</strong></div>' for name, value in cards)
     notes = ["128K 指 131,072 token；250K 指 256,000 token。实际输入量以服务端 usage 为准。",
              "长上下文任务是否包含随机顺序和相邻关系检查，以折叠配置中的 long_order_quality 和原始 checks 为准。",
