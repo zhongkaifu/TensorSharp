@@ -182,7 +182,7 @@ import json, pathlib, sys
 path, model, drafter, context, mode, chunk = sys.argv[1:]
 config = dict(compute_dtype='bf16', self_attn_backend='flash', beam_size=1, n_best=1,
               top_k=1, top_p=0.0, temperature=1.0, min_length=0, max_length=2048,
-              max_length_ratio=0, context_length=int(context), batch_size=1, gpu_ranks=[0],
+              max_length_ratio=0, context_length=int(context), batch_size=1,
               self_speculative_decoding=False, report_time=True, fuse_kvq=True, fuse_gate=True,
               prefill_cache_size=0, prefill_chunk_size=int(chunk), vocabulary_quantization='none')
 if mode == 'dflash2':

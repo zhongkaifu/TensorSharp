@@ -15,7 +15,7 @@ SPEC.loader.exec_module(MODULE)
 
 
 class AvailabilityEvidenceTests(unittest.TestCase):
-    def run_audit(self, rows, observed=8, expected=8, exit_code=0):
+    def run_audit(self, rows, observed=8, expected=8, exit_code=0, log=None):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "external-engine-status").mkdir()
@@ -26,6 +26,9 @@ class AvailabilityEvidenceTests(unittest.TestCase):
                 "process_exit_code": exit_code, "quality_passed": True}))
             if rows is not None:
                 (root / "raw" / (stem + ".jsonl")).write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            if log is not None:
+                (root / "external-engine-logs").mkdir()
+                (root / "external-engine-logs" / (stem + ".log")).write_text(log)
             output = root / "availability.json"
             with patch("sys.argv", [str(TOOL), "--root", str(root), "--output", str(output), "--engines", "vllm"]), contextlib.redirect_stdout(io.StringIO()):
                 MODULE.main()
@@ -163,6 +166,27 @@ class AvailabilityEvidenceTests(unittest.TestCase):
         self.assertEqual(status, "ERROR")
         self.assertIn("运行环境", reason)
         self.assertEqual(excerpt, line)
+
+    def test_torch_startup_cuda_oom_is_scoped_capacity_not_cpu_or_kernel_error(self):
+        line = "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 512.00 MiB. GPU 0 has 13.69 MiB free."
+        audit = self.run_audit(None, observed=0, expected=8, exit_code=1, log=line)
+        attempt = next(row for row in audit["missingEngines"] if row.get("label") == "fixture")
+        self.assertEqual(attempt["status"], "UNSUPPORTED")
+        self.assertFalse(attempt["quality_passed"])
+        self.assertIn("该配置", attempt["reason"])
+        self.assertIn("不能据此推断引擎整体", attempt["reason"])
+        self.assertEqual(attempt["primary_log_evidence"], line)
+        for error in ("RuntimeError: DefaultCPUAllocator: not enough memory",
+                      "RuntimeError: CUDA error: an illegal memory access was encountered"):
+            with self.subTest(error=error):
+                self.assertEqual(MODULE.classify(error)[0], "ERROR")
+
+    def test_request_oom_in_complete_failed_raw_is_executed_without_quality_pass(self):
+        line = "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 512.00 MiB."
+        audit = self.run_audit([self.header(), *self.cases(passed=False)], log=line)
+        self.assertEqual(audit["executedProfiles"][0]["status"], "EXECUTED")
+        self.assertFalse(audit["executedProfiles"][0]["quality_passed"])
+        self.assertFalse(any(row.get("label") == "fixture" for row in audit["missingEngines"]))
 
 
 if __name__ == "__main__":

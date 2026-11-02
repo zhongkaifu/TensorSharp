@@ -189,6 +189,40 @@ class ServerLifecycleTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--model-kv-format") + 1], "bf16")
         self.assertEqual(argv[argv.index("--model-prefill-attention") + 1], "fp16")
 
+    def test_eole_config_respects_pinned_server_reserved_predict_arguments(self) -> None:
+        # Eole 572c7871 server/model.py constructs PredictConfig with these four
+        # explicit arguments before expanding **pre_config. Passing gpu_ranks
+        # in the generated config caused a real startup TypeError, before any
+        # model was loaded. Exercise that call contract before HTTP readiness.
+        eole = self.mock.with_name("eole")
+        fixture = self.mock.read_text().split("\n", 1)[1]
+        eole.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+            import json, sys
+            config = json.load(open(sys.argv[sys.argv.index('-c') + 1]))['models'][0]['config']
+            def PredictConfig(*, src, model_path, gpu_ranks, world_size, **settings):
+                return settings
+            PredictConfig(src='dummy', model_path='fixture', gpu_ranks=[0], world_size=1, **config)
+            """) + fixture)
+        eole.chmod(0o755)
+        environment = {**self.environment, "EOLE_SERVE": str(eole),
+                       "EOLE_VENV": str(eole.parent.parent), "EOLE_REPO": str(self.directory),
+                       "EOLE_PORT": str(self.port), "HF_DRAFT": str(self.directory / "bf16-drafter")}
+        for mode in ("plain", "dflash2"):
+            with self.subTest(mode=mode):
+                result = self.run_server("start", "eole", mode, "fixture", environment=environment)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                config = json.loads((self.directory / f"run/configs/eole-{mode}-fixture.json").read_text())['models'][0]['config']
+                self.assertFalse({'src', 'model_path', 'gpu_ranks', 'world_size'} & config.keys())
+                self.assertEqual(config['context_length'], 262144)
+                self.assertEqual(config['compute_dtype'], 'bf16')
+                self.assertEqual(config['vocabulary_quantization'], 'none')
+                self.assertEqual(config['batch_size'], 1)
+                self.assertFalse(config['self_speculative_decoding'])
+                if mode == 'dflash2':
+                    self.assertEqual(config['dflash2_model'], environment['HF_DRAFT'])
+                    self.assertEqual(config['dflash2_quantization'], 'none')
+                self.assertEqual(self.run_server("stop").returncode, 0)
+
     def test_benchmark_failure_survives_successful_cleanup(self) -> None:
         failing_python = self.directory / "failing-python"
         failing_python.write_text(f"#!{sys.executable}\nraise SystemExit(23)\n")
