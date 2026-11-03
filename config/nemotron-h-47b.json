@@ -1,0 +1,25 @@
+{
+  // Nemotron-H 47B; immutable artifact identities copied from
+  // TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs, entry nemotron-h-47b-q4km.
+  // Metadata provenance is not a model/backend quality qualification.
+  // Choose a backend/context only after the local regression resource plan.
+  // nvidia_Nemotron-H-47B-Reasoning-128K-Q4_K_M.gguf: 28187710688 bytes.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/nemotron-h-47b"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/nvidia_Nemotron-H-47B-Reasoning-128K-Q4_K_M.gguf",
+    "urls": [
+      "https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF/resolve/ce89f02cd0eafe3931acec38f4d91a654ae1ca4d/nvidia_Nemotron-H-47B-Reasoning-128K-Q4_K_M.gguf"
+    ],
+    "sha256": "3e9217e00201528d8d0c5bea3405b095a120f7e5cd920b34e3c7a961f6e01d71"
+  }
+}

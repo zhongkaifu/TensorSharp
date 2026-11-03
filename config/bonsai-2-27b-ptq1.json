@@ -1,0 +1,33 @@
+{
+  // Bonsai 2 27B PTQ1_0: qwen35 with PRISM Hadamard ternary weights.
+  // Immutable revision: docs/models/bonsai2.md; hashes/sizes also appear in
+  // TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs, bonsai-2-27b-ptq1-0.
+  // Weights: 5946648928 bytes; optional image projector: 629246976 bytes.
+  // Single-device GGML backends only; cpu, cuda, mlx and tensor parallelism
+  // are refused. Repacking grows the weight payload by about 29%; budget RAM
+  // from the repacked weights, not the smaller download. Metadata provenance
+  // does not qualify quality on an untested backend.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/bonsai-2-27b-ptq1",
+    "repo": "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/b072e1d3b35a0a630cece372c2127528e0994386"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    "urls": ["${repo}/Ternary-Bonsai-2-27B-PTQ1_0.gguf"],
+    "sha256": "53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"
+  },
+  "mmproj": {
+    "path": "${root}/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
+    "urls": ["${repo}/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"],
+    "sha256": "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903",
+    "optional": true
+  }
+}

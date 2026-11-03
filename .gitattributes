@@ -9,3 +9,6 @@ TensorAgent/src/TensorAgent.Core/Localization/**/*.json text eol=lf
 TensorAgent/src/TensorAgent.Sharing/Localization/**/*.json text eol=lf
 # Docker RUN heredocs are shell scripts too.
 Dockerfile* text eol=lf
+# PDF fixtures are hash-pinned embedded resources, even when their bytes look
+# like text. core.autocrlf must not rewrite their streams or xref offsets.
+InferenceWeb.Tests/Fixtures/Knowledge/*.pdf -text

@@ -6,8 +6,40 @@
     <Nullable>enable</Nullable>
     <TensorSharpSkipGgmlNative>true</TensorSharpSkipGgmlNative>
     <TensorSharpSkipMlxNative>true</TensorSharpSkipMlxNative>
+    <!-- The deployment target copies an existing library only; it never
+         configures or compiles GGML. Callers can select an isolated build. -->
+    <GgmlNativeBuildDir Condition="'$(GgmlNativeBuildDir)' == '' And $([MSBuild]::IsOSPlatform('Windows'))">$(MSBuildProjectDirectory)/../../TensorSharp.GGML.Native/build-windows</GgmlNativeBuildDir>
+    <GgmlNativeBuildDir Condition="'$(GgmlNativeBuildDir)' == ''">$(MSBuildProjectDirectory)/../../TensorSharp.GGML.Native/build</GgmlNativeBuildDir>
+    <GgmlNativeBinaryName Condition="'$(GgmlNativeBinaryName)' == '' And $([MSBuild]::IsOSPlatform('Windows'))">GgmlOps.dll</GgmlNativeBinaryName>
+    <GgmlNativeBinaryName Condition="'$(GgmlNativeBinaryName)' == '' And $([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryName>
+    <GgmlNativeBinaryName Condition="'$(GgmlNativeBinaryName)' == '' And $([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeBinaryName>
+    <ForcedLogitProbeRequireGgmlNative Condition="'$(ForcedLogitProbeRequireGgmlNative)' == ''">false</ForcedLogitProbeRequireGgmlNative>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="ContractTests/**/*.cs" />
     <ProjectReference Include="../../TensorSharp.Models/TensorSharp.Models.csproj" />
   </ItemGroup>
+  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup>
+      <_ForcedLogitProbeGgmlSource></_ForcedLogitProbeGgmlSource>
+      <!-- Match the hosts' Release output when both layouts are present, but
+           select exactly one source instead of overwriting the destination twice. -->
+      <_ForcedLogitProbeGgmlSource Condition="'$(GgmlNativeBinaryName)' != '' And Exists('$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)')">$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)</_ForcedLogitProbeGgmlSource>
+      <_ForcedLogitProbeGgmlSource Condition="'$(_ForcedLogitProbeGgmlSource)' == '' And '$(GgmlNativeBinaryName)' != '' And Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)')">$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)</_ForcedLogitProbeGgmlSource>
+      <_ForcedLogitProbeNativeOutput>$(TargetDir)</_ForcedLogitProbeNativeOutput>
+      <_ForcedLogitProbeNativeOutput Condition="'$(_ForcedLogitProbeNativeOutput)' == ''">$(OutDir)</_ForcedLogitProbeNativeOutput>
+      <_ForcedLogitProbeNativeOutput Condition="'$(_ForcedLogitProbeNativeOutput)' == ''">$(OutputPath)</_ForcedLogitProbeNativeOutput>
+    </PropertyGroup>
+    <Error Condition="'$(_ForcedLogitProbeGgmlSource)' == '' And '$(ForcedLogitProbeRequireGgmlNative)' == 'true'"
+           Text="ForcedLogitProbe GGML deployment unavailable: no prebuilt $(GgmlNativeBinaryName) under $(GgmlNativeBuildDir) or its Release directory. Build GGML separately or set -p:GgmlNativeBuildDir to the matching prebuilt directory. No native build was attempted." />
+    <Warning Condition="'$(_ForcedLogitProbeGgmlSource)' == '' And '$(ForcedLogitProbeRequireGgmlNative)' != 'true'"
+             Text="ForcedLogitProbe GGML deployment unavailable: no prebuilt $(GgmlNativeBinaryName) under $(GgmlNativeBuildDir) or its Release directory. Managed build completion does not establish GGML runtime availability; any existing output library is unchanged. No native build was attempted." />
+    <Error Condition="'$(_ForcedLogitProbeGgmlSource)' != '' And '$(_ForcedLogitProbeNativeOutput)' == ''"
+           Text="ForcedLogitProbe cannot deploy its prebuilt GGML library without a resolved output directory." />
+    <MakeDir Directories="$(_ForcedLogitProbeNativeOutput)" Condition="'$(_ForcedLogitProbeGgmlSource)' != ''" />
+    <Copy SourceFiles="$(_ForcedLogitProbeGgmlSource)" DestinationFolder="$(_ForcedLogitProbeNativeOutput)"
+          SkipUnchangedFiles="true" Condition="'$(_ForcedLogitProbeGgmlSource)' != ''" />
+    <Message Importance="high" Condition="'$(_ForcedLogitProbeGgmlSource)' != ''"
+             Text="ForcedLogitProbe prebuilt GGML runtime: $(_ForcedLogitProbeGgmlSource) -> $(_ForcedLogitProbeNativeOutput). Copying a library does not qualify its runtime backend." />
+  </Target>
 </Project>

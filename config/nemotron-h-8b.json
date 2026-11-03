@@ -1,0 +1,25 @@
+{
+  // Nemotron-H 8B; immutable artifact identities copied from
+  // TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs, entry nemotron-h-8b-q4km.
+  // Metadata provenance is not a model/backend quality qualification.
+  // Choose a backend/context only after the local regression resource plan.
+  // nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf: 4983360480 bytes.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/nemotron-h-8b"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf",
+    "urls": [
+      "https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF/resolve/cf45b6ff44dcd5c2105a23abeb9e77797f1a4014/nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf"
+    ],
+    "sha256": "312ebd50999058707868f49011d87225fcc92af0f5a526cd3553f821dc161956"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  // DeepSeek V4 Flash 0731; immutable artifact identities copied from
+  // TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs, entry deepseek-v4-flash-0731-q2kxl.
+  // Metadata provenance is not a model/backend quality qualification.
+  // Choose a backend/context only after the local regression resource plan.
+  // DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf: 5257664 bytes.
+  // DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00002-of-00003.gguf: 49437013568 bytes.
+  // DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00003-of-00003.gguf: 47390237120 bytes.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/deepseek-v4-flash-0731"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF/resolve/fbbb5b93fb787c21338159b0af3318bb3f4d9768/UD-Q2_K_XL/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf"
+    ],
+    "sha256": "de65c5bb660817b95cc281bf54935f9d1bcc3b22535f2eae63b35a14c7c5724b",
+    "files": [
+      {
+        "path": "${root}/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00002-of-00003.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF/resolve/fbbb5b93fb787c21338159b0af3318bb3f4d9768/UD-Q2_K_XL/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00002-of-00003.gguf"
+        ],
+        "sha256": "c8728a298862cd8736782e2e4056e5e3e03c415ba552a38173264494e41ef327"
+      },
+      {
+        "path": "${root}/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00003-of-00003.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF/resolve/fbbb5b93fb787c21338159b0af3318bb3f4d9768/UD-Q2_K_XL/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00003-of-00003.gguf"
+        ],
+        "sha256": "a4bae0788c025c1b2388754592c98fefa1372981748ac9875039bf6a30e6eeb4"
+      }
+    ]
+  }
+}

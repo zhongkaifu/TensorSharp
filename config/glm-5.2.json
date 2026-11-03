@@ -1,0 +1,67 @@
+{
+  // GLM 5.2; immutable artifact identities copied from
+  // TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs, entry glm-5.2-iq2xxs.
+  // Metadata provenance is not a model/backend quality qualification.
+  // Choose a backend/context only after the local regression resource plan.
+  // GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf: 9423744 bytes.
+  // GLM-5.2-UD-IQ2_XXS-00002-of-00006.gguf: 49105028960 bytes.
+  // GLM-5.2-UD-IQ2_XXS-00003-of-00006.gguf: 49143176640 bytes.
+  // GLM-5.2-UD-IQ2_XXS-00004-of-00006.gguf: 49143176640 bytes.
+  // GLM-5.2-UD-IQ2_XXS-00005-of-00006.gguf: 49143176640 bytes.
+  // GLM-5.2-UD-IQ2_XXS-00006-of-00006.gguf: 41914650304 bytes.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/glm-5.2"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/GLM-5.2-GGUF/resolve/abc55e72527792c6e77069c99b4cb7de16fa9f23/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf"
+    ],
+    "sha256": "7bf96eeabbe887e58b6c44364962731ddc9dc5bf46fec8d097c1dff64bea4a18",
+    "files": [
+      {
+        "path": "${root}/GLM-5.2-UD-IQ2_XXS-00002-of-00006.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/GLM-5.2-GGUF/resolve/abc55e72527792c6e77069c99b4cb7de16fa9f23/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00002-of-00006.gguf"
+        ],
+        "sha256": "d94adaa58ddd5abbcf2514192958084416b1aa36bd4d21409028a164341bac36"
+      },
+      {
+        "path": "${root}/GLM-5.2-UD-IQ2_XXS-00003-of-00006.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/GLM-5.2-GGUF/resolve/abc55e72527792c6e77069c99b4cb7de16fa9f23/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00003-of-00006.gguf"
+        ],
+        "sha256": "1cd0b1a3d9d939ce5a184c548f1b1c42edafaf1856cb0d7e586a2884a366256b"
+      },
+      {
+        "path": "${root}/GLM-5.2-UD-IQ2_XXS-00004-of-00006.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/GLM-5.2-GGUF/resolve/abc55e72527792c6e77069c99b4cb7de16fa9f23/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00004-of-00006.gguf"
+        ],
+        "sha256": "10f3965db697a46ba66494475045af183c1bcaf639984160930c91a377816d3e"
+      },
+      {
+        "path": "${root}/GLM-5.2-UD-IQ2_XXS-00005-of-00006.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/GLM-5.2-GGUF/resolve/abc55e72527792c6e77069c99b4cb7de16fa9f23/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00005-of-00006.gguf"
+        ],
+        "sha256": "40d7d4524ff07e0f9af494fb13130dc7090184800cc5af0a1563188b076af50d"
+      },
+      {
+        "path": "${root}/GLM-5.2-UD-IQ2_XXS-00006-of-00006.gguf",
+        "urls": [
+          "https://huggingface.co/unsloth/GLM-5.2-GGUF/resolve/abc55e72527792c6e77069c99b4cb7de16fa9f23/UD-IQ2_XXS/GLM-5.2-UD-IQ2_XXS-00006-of-00006.gguf"
+        ],
+        "sha256": "eeceb9084350e64be8eebcd1f19ab14bbbb6b40132c86d77ffc65e72f425044d"
+      }
+    ]
+  }
+}

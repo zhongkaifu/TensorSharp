@@ -54,6 +54,10 @@
     <CudaNvccOptimizationFlags Condition="'$(CudaNvccOptimizationFlags)' == ''">-O3 --extra-device-vectorization</CudaNvccOptimizationFlags>
     <CudaEnableFastMath Condition="'$(CudaEnableFastMath)' == ''">false</CudaEnableFastMath>
     <CudaFastMathFlag Condition="'$(CudaEnableFastMath)' == 'true' Or '$(CudaEnableFastMath)' == 'True'">--use_fast_math</CudaFastMathFlag>
+    <!-- Managed-only validation must not probe nvcc, compile kernels, replace
+         locally built kernels with the committed baseline, or copy over native
+         assets. It requires an already populated output instead. -->
+    <TensorSharpSkipCudaPtx Condition="'$(TensorSharpSkipCudaPtx)' == ''">false</TensorSharpSkipCudaPtx>
   </PropertyGroup>
 
   <ItemGroup>
@@ -72,12 +76,34 @@
          projects and to publish layouts as cuda_kernels/*.ptx. On machines with
          nvcc, SelectCudaPtxContent below swaps these for the locally compiled
          PTX before target paths are assigned. -->
-    <Content Include="$(CudaCommittedPtxDir)/*.ptx" Link="cuda_kernels\%(Filename)%(Extension)" Condition="Exists('$(CudaCommittedPtxDir)')">
+    <Content Include="$(CudaCommittedPtxDir)/*.ptx" Link="cuda_kernels\%(Filename)%(Extension)" Condition="'$(TensorSharpSkipCudaPtx)' != 'true' And Exists('$(CudaCommittedPtxDir)')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
 
-  <Target Name="DetectCudaPtxBuildSettings">
+  <Target Name="ValidatePrebuiltCudaPtx"
+          BeforeTargets="BeforeBuild;AssignTargetPaths"
+          Condition="'$(TensorSharpSkipCudaPtx)' == 'true' And '$(DesignTimeBuild)' != 'true'">
+    <Error Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true'"
+           Text="TensorSharpSkipCudaPtx cannot refresh committed kernels. Prepare native assets separately before a managed-only build." />
+    <PropertyGroup>
+      <_CudaPrebuiltPtxDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '$(OutDir)', 'cuda_kernels'))</_CudaPrebuiltPtxDir>
+    </PropertyGroup>
+    <ItemGroup>
+      <!-- Architecture-specific q35 kernels have no portable baseline and are
+           optional here; their runtime remains responsible for capability checks. -->
+      <_CudaRequiredPrebuiltKernel Include="@(CudaKernel)" Condition="'%(CudaKernel.CommittedBaseline)' != 'false'" />
+    </ItemGroup>
+    <Error Condition="!Exists('$(_CudaPrebuiltPtxDir)/%(_CudaRequiredPrebuiltKernel.Filename).ptx')"
+           Text="TensorSharpSkipCudaPtx requires prebuilt CUDA PTX: $(_CudaPrebuiltPtxDir)/%(_CudaRequiredPrebuiltKernel.Filename).ptx. Build/deploy native assets separately; no committed-baseline fallback or native copying is performed." />
+    <Error Condition="Exists('$(_CudaPrebuiltPtxDir)/%(_CudaRequiredPrebuiltKernel.Filename).ptx') And !$([System.Text.RegularExpressions.Regex]::IsMatch($([System.IO.File]::ReadAllText('$(_CudaPrebuiltPtxDir)/%(_CudaRequiredPrebuiltKernel.Filename).ptx')), '(?m)^\.version\s+\d+\.\d+\s*$'))"
+           Text="Prebuilt CUDA PTX has no valid .version directive: $(_CudaPrebuiltPtxDir)/%(_CudaRequiredPrebuiltKernel.Filename).ptx." />
+    <Error Condition="Exists('$(_CudaPrebuiltPtxDir)/%(_CudaRequiredPrebuiltKernel.Filename).ptx') And !$([System.Text.RegularExpressions.Regex]::IsMatch($([System.IO.File]::ReadAllText('$(_CudaPrebuiltPtxDir)/%(_CudaRequiredPrebuiltKernel.Filename).ptx')), '(?m)^\.target\s+sm_\d+[a-z]?(?:\s*,[^\r\n]*)?\s*$'))"
+           Text="Prebuilt CUDA PTX has no valid .target directive: $(_CudaPrebuiltPtxDir)/%(_CudaRequiredPrebuiltKernel.Filename).ptx." />
+    <Message Importance="high" Text="TensorSharp CUDA managed-only build: preserving existing native assets in $(_CudaPrebuiltPtxDir); no PTX compilation, fallback selection or copying." />
+  </Target>
+
+  <Target Name="DetectCudaPtxBuildSettings" Condition="'$(TensorSharpSkipCudaPtx)' != 'true'">
     <Exec Command="&quot;$(CudaNvcc)&quot; --version" IgnoreExitCode="true" ConsoleToMSBuild="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ExitCode" PropertyName="_NvccExitCode" />
       <Output TaskParameter="ConsoleOutput" PropertyName="_NvccVersionText" />
@@ -104,7 +130,7 @@
 
   <!-- Keep architecture resolution independent of the installed toolchain so
        the portable-baseline policy can also be checked without nvcc or a GPU. -->
-  <Target Name="ResolveCudaPtxArchitecture">
+  <Target Name="ResolveCudaPtxArchitecture" Condition="'$(TensorSharpSkipCudaPtx)' != 'true'">
     <Error Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true' And '$(CudaArch)' != 'auto' And '$(CudaArch)' != 'native' And '$(CudaArch)' != '$(CudaCommittedPtxArch)' And '$(CudaArch)' != '$(_CudaCommittedPtxSmArch)'"
            Text="The committed CUDA PTX baseline must target $(CudaCommittedPtxArch) (the oldest architecture CUDA 13 compiles). Omit -p:CudaArch, or omit TensorSharpUpdateCommittedPtx for a GPU-specific local build. Requested target: $(CudaArch)." />
     <PropertyGroup>
@@ -141,7 +167,7 @@
     </PropertyGroup>
   </Target>
 
-  <Target Name="ResolveCudaPtxBuildSettings" DependsOnTargets="DetectCudaPtxBuildSettings;ResolveCudaPtxArchitecture">
+  <Target Name="ResolveCudaPtxBuildSettings" DependsOnTargets="DetectCudaPtxBuildSettings;ResolveCudaPtxArchitecture" Condition="'$(TensorSharpSkipCudaPtx)' != 'true'">
     <Error Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true' And '$(_NvccExitCode)' != '0'"
            Text="Refreshing the committed CUDA PTX baseline requires nvcc $(CudaCommittedPtxToolkit) (set -p:CudaNvcc=&lt;path&gt;). Omit TensorSharpUpdateCommittedPtx to build with the existing committed kernels." />
     <Error Condition="'$(_NvccExitCode)' == '0' And '$(_NvccMajor)' == ''"
@@ -173,7 +199,7 @@
   <Target Name="SelectCudaPtxContent"
           BeforeTargets="AssignTargetPaths"
           DependsOnTargets="ResolveCudaPtxBuildSettings"
-          Condition="'$(DesignTimeBuild)' != 'true'">
+          Condition="'$(DesignTimeBuild)' != 'true' And '$(TensorSharpSkipCudaPtx)' != 'true'">
     <ItemGroup Condition="'$(_NvccExitCode)' == '0'">
       <Content Remove="$(CudaCommittedPtxDir)/*.ptx" />
       <Content Include="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx')">
@@ -205,6 +231,7 @@
        the upstream ggml checkout (ExternalProjects/ggml) or any ggml fetch step. -->
   <Target Name="CompileCudaPtx"
           BeforeTargets="BeforeBuild"
+          Condition="'$(TensorSharpSkipCudaPtx)' != 'true'"
           DependsOnTargets="ResolveCudaPtxBuildSettings"
           Inputs="@(CudaKernel);@(CudaKernelHeader);$(MSBuildProjectFullPath);$(CudaArchResolverPs1);$(CudaArchResolverSh)"
           Outputs="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx');$(_CudaFatbinOutputs);$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp">
@@ -267,7 +294,7 @@
                       Overwrite="true" />
   </Target>
 
-  <Target Name="CopyCudaPtxToOutput" AfterTargets="CompileCudaPtx" Condition="'$(_NvccExitCode)' == '0'">
+  <Target Name="CopyCudaPtxToOutput" AfterTargets="CompileCudaPtx" Condition="'$(TensorSharpSkipCudaPtx)' != 'true' And '$(_NvccExitCode)' == '0'">
     <ItemGroup>
       <_CompiledPtx Include="$(PtxOutputDir)/*.ptx" />
       <_CompiledPtx Include="$(PtxOutputDir)/*.fatbin;$(PtxOutputDir)/*.fatbin.sha256" Condition="'$(_CudaFatbinGencode)' != ''" />
@@ -293,7 +320,7 @@
        CommittedBaseline=false (q35, sm_80+ only) are compiled but never copied. -->
   <Target Name="UpdateCommittedCudaPtx"
           AfterTargets="CompileCudaPtx"
-          Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true' And '$(_NvccExitCode)' == '0'">
+          Condition="'$(TensorSharpSkipCudaPtx)' != 'true' And '$(TensorSharpUpdateCommittedPtx)' == 'true' And '$(_NvccExitCode)' == '0'">
     <Error Condition="'$(_ResolvedCudaArch)' != '$(CudaCommittedPtxArch)'"
            Text="Refusing to overwrite the portable committed CUDA PTX baseline with target $(_ResolvedCudaArch). Rebuild with -p:CudaArch=$(CudaCommittedPtxArch)." />
     <ItemGroup>

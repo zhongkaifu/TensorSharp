@@ -1,0 +1,35 @@
+{
+  // Mistral Small 3.1 24B; immutable artifact identities copied from
+  // TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs, entry mistral-small-3.1-24b-q4km.
+  // Metadata provenance is not a model/backend quality qualification.
+  // Choose a backend/context only after the local regression resource plan.
+  // Projector is optional for text; image tests must require and verify it.
+  // mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf: 14333910496 bytes.
+  // mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf: 878054144 bytes.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/mistral-small-3.1-24b"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf",
+    "urls": [
+      "https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF/resolve/f73dfd9e812922fb503a993e3fa5671424f486d3/mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf"
+    ],
+    "sha256": "c5743c1bf39db0ae8a5ade5df0374b8e9e492754a199cfdad7ef393c1590f7c0"
+  },
+  "mmproj": {
+    "path": "${root}/mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf",
+    "urls": [
+      "https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF/resolve/f73dfd9e812922fb503a993e3fa5671424f486d3/mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf"
+    ],
+    "sha256": "f5add93ad360ef6ccba571bba15e8b4bd4471f3577440a8b18785f8707d987ed",
+    "optional": true
+  }
+}

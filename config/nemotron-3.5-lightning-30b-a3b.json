@@ -1,0 +1,25 @@
+{
+  // Nemotron 3.5 Lightning 30B-A3B; immutable artifact identities copied from
+  // TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs, entry nemotron-3.5-lightning-30b-a3b-mxfp4.
+  // Metadata provenance is not a model/backend quality qualification.
+  // Choose a backend/context only after the local regression resource plan.
+  // NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MXFP4_MOE.gguf: 23210817600 bytes.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/nemotron-3.5-lightning-30b-a3b"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MXFP4_MOE.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/f2d3fe3694501008786e81e5f20360cbf715496a/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MXFP4_MOE.gguf"
+    ],
+    "sha256": "c5a1433ecfb206d63be963faaa81d7c1170cb13abb14c73390968fe7c79a99f6"
+  }
+}

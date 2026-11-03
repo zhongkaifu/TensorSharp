@@ -1,0 +1,32 @@
+// Metadata-only source verification: config/regression/source-pins.json.
+// Public project-linked publisher, immutable revision plus SHA256 for every file.
+// No quality/device qualification is implied. The local runner budgets the complete shard group.
+// Projector optional for text, required and hash-verified for image tests; no learned draft enabled.
+{
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/muse-glimmer-30b"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/resolve/faa5b025c584459c13febfa5c59883516710ae39/Muse-Glimmer-30B-UD-Q4_K_XL.gguf"
+    ],
+    "sha256": "82bece304887a313ece08400bc030f6066c7bff5b906b0cd40308ec8a409fd38"
+  },
+  "mmproj": {
+    "path": "${root}/mmproj-Muse-Glimmer-30B-Q8_0.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/resolve/faa5b025c584459c13febfa5c59883516710ae39/mmproj-Muse-Glimmer-30B-Q8_0.gguf"
+    ],
+    "sha256": "01ff73c95108e1754a4c145176c6d3ba44338942285cb87dcac7f4f193192ea2",
+    "optional": true
+  }
+}

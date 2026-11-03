@@ -54,9 +54,7 @@ public sealed class PortablePdfProcessRunnerTests : IDisposable
         int[] ids = Array.Empty<int>();
         try
         {
-            for (int attempt = 0; attempt < 200 && !File.Exists(pidPath); attempt++)
-                await Task.Delay(25);
-            Assert.True(File.Exists(pidPath), "Fixture process did not initialize.");
+            await WaitForFixtureFileAsync(pidPath);
             ids = (await File.ReadAllTextAsync(pidPath)).Split(',').Select(int.Parse).ToArray();
             Assert.Equal(2, ids.Length);
             cancellation.Cancel();
@@ -68,10 +66,46 @@ public sealed class PortablePdfProcessRunnerTests : IDisposable
         finally
         {
             cancellation.Cancel();
-            foreach (int id in ids)
-                try { using var process = Process.GetProcessById(id); process.Kill(entireProcessTree: true); }
-                catch (ArgumentException) { }
-                catch (InvalidOperationException) { }
+            try { await run; }
+            catch (OperationCanceledException) { } // Reap even if readiness or an assertion failed.
+            finally
+            {
+                foreach (int id in ids)
+                    try { using var process = Process.GetProcessById(id); process.Kill(entireProcessTree: true); }
+                    catch (ArgumentException) { }
+                    catch (InvalidOperationException) { }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task PidFileAppearsOnlyAfterCompletePublication()
+    {
+        string pidPath = Path.Combine(_directory, "published-pids");
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        Task<PortablePdfProcessResult> run = RunAsync(new[] { "publish-pids", pidPath }, ct: cancellation.Token);
+        try
+        {
+            await WaitForFixtureFileAsync(pidPath + ".empty");
+            Assert.True(File.Exists(pidPath + ".pending"));
+            Assert.Equal(0L, new FileInfo(pidPath + ".pending").Length);
+            Assert.False(File.Exists(pidPath), "An empty PID file must not signal readiness.");
+            await File.WriteAllTextAsync(pidPath + ".empty.release", "continue");
+
+            await WaitForFixtureFileAsync(pidPath + ".partial");
+            Assert.Equal(4L, new FileInfo(pidPath + ".pending").Length);
+            Assert.False(File.Exists(pidPath), "A partial PID list must not signal readiness.");
+            await File.WriteAllTextAsync(pidPath + ".partial.release", "continue");
+
+            Assert.Equal(0, (await run).ExitCode);
+            Assert.Equal("123,456", await File.ReadAllTextAsync(pidPath));
+            Assert.False(File.Exists(pidPath + ".pending"));
+        }
+        finally
+        {
+            cancellation.Cancel();
+            try { await run; }
+            catch (OperationCanceledException) { } // Reap fixture after an assertion failure.
         }
     }
 
@@ -129,6 +163,13 @@ public sealed class PortablePdfProcessRunnerTests : IDisposable
     {
         try { using var process = Process.GetProcessById(id); return !process.HasExited; }
         catch (ArgumentException) { return false; }
+    }
+
+    private static async Task WaitForFixtureFileAsync(string path)
+    {
+        for (int attempt = 0; attempt < 200 && !File.Exists(path); attempt++)
+            await Task.Delay(25);
+        Assert.True(File.Exists(path), $"Fixture process did not initialize: {Path.GetFileName(path)}.");
     }
 
     public void Dispose() => Directory.Delete(_directory, recursive: true);

@@ -21,6 +21,7 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests
 {
+    [Trait("Requires", "Models")]
     public class WanVideoOracleTests
     {
         private readonly ITestOutputHelper _output;
