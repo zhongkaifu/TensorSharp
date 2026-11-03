@@ -18,6 +18,17 @@ using TensorSharp;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
 
+// Isolated prototype schema; no deployment or model work in plan-only mode.
+if (args.Length >= 2 && args[0] == "--q81-projection-trace")
+{
+    if (args.Length > 3 || (args.Length == 3 && args[2] != "--plan-only"))
+        throw new ArgumentException("Use --q81-projection-trace <fresh-output> [--plan-only].");
+    return args.Length == 3
+        ? MixedCapacityTrace.Plan(args[1], projectionDiagnostic: true)
+        : MixedCapacityTrace.Run(Environment.GetEnvironmentVariable("TS_TEST_QWEN35_MODEL")
+            ?? throw new ArgumentException("Set TS_TEST_QWEN35_MODEL."), args[1], projectionDiagnostic: true);
+}
+
 // Separate allocation diagnostic; the existing mixed-capacity mode remains unchanged.
 if (args.Length > 0 && args[0] == "--shared-scratch-trace")
 {

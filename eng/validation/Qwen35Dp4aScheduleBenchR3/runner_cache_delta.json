@@ -1,0 +1,38 @@
+[
+  [
+    "\nstruct Fixture {",
+    "\n#include \"cache-sweep.h\"\n\nstruct Fixture {"
+  ],
+  [
+    "static float VerifiedTime(Fixture& f,const Variant& variant,const std::vector<uint32_t>& oracle,int iterations) {",
+    "static float VerifiedTime(Fixture& f,const Variant& variant,const std::vector<uint32_t>& oracle,int iterations,CacheSweep* sweep=nullptr,const char* candidate=nullptr,int round=-1,const char* half=nullptr) {"
+  ],
+  [
+    "    Rt(cudaEventRecord(begin));for(int i=0;i<iterations;i++)f.Issue(variant);",
+    "    if(sweep)sweep->Before(f.shape,variant,candidate,round,half);\n    Rt(cudaEventRecord(begin));for(int i=0;i<iterations;i++)f.Issue(variant);"
+  ],
+  [
+    "    int acts=8,rounds=5,iterations=3;",
+    "    int acts=8,rounds=5,iterations=3;bool cacheSweep=false,iterationsSet=false;"
+  ],
+  [
+    "    for(int i=4;i<argc;i+=2) {\n        if(i+1>=argc)throw std::runtime_error(\"missing option value\");\n        std::string option=argv[i];int value=std::stoi(argv[i+1]);\n        if(option==\"--acts\")acts=value;else if(option==\"--rounds\")rounds=value;else if(option==\"--iterations\")iterations=value;else throw std::runtime_error(\"unknown option\");\n    }",
+    "    for(int i=4;i<argc;) {\n        std::string option=argv[i];\n        if(option==\"--cache-sweep\"){cacheSweep=true;++i;continue;}\n        if(i+1>=argc)throw std::runtime_error(\"missing option value\");\n        int value=std::stoi(argv[i+1]);\n        if(option==\"--acts\")acts=value;else if(option==\"--rounds\")rounds=value;else if(option==\"--iterations\"){iterations=value;iterationsSet=true;}else throw std::runtime_error(\"unknown option\");\n        i+=2;\n    }\n    if(cacheSweep&&!iterationsSet)iterations=1;\n    if(cacheSweep&&(mode!=\"--bench\"||iterations!=1))throw std::runtime_error(\"cache-sweep timing requires bench and iterations1\");"
+  ],
+  [
+    "    if(mode==\"--bench\")for(const Shape& s:StrictPlan)if(s.timed) {",
+    "    std::unique_ptr<CacheSweep> sweep;\n    if(cacheSweep)sweep=std::make_unique<CacheSweep>(module,device.multiProcessorCount);\n    if(mode==\"--bench\")for(const Shape& s:StrictPlan)if(s.timed) {"
+  ],
+  [
+    "float a=VerifiedTime(f,module.oracle,oracle,iterations),b=VerifiedTime(f,v,oracle,iterations);",
+    "float a=VerifiedTime(f,module.oracle,oracle,iterations,sweep.get(),v.symbol,round,\"A1\"),b=VerifiedTime(f,v,oracle,iterations,sweep.get(),v.symbol,round,\"B1\");"
+  ],
+  [
+    "float c=VerifiedTime(f,v,oracle,iterations),d=VerifiedTime(f,module.oracle,oracle,iterations);",
+    "float c=VerifiedTime(f,v,oracle,iterations,sweep.get(),v.symbol,round,\"B2\"),d=VerifiedTime(f,module.oracle,oracle,iterations,sweep.get(),v.symbol,round,\"A2\");"
+  ],
+  [
+    "<<\",\\\"rounds\\\":\"<<rounds<<\",\\\"iterations_per_sample\\\":\"<<iterations",
+    "<<\",\\\"cache_sweep\\\":\"<<(cacheSweep?\"true\":\"false\")<<\",\\\"cache_mode\\\":\"<<Quote(cacheSweep?\"all_data_l2_eviction_control\":\"warm_repeated_matrix\")<<\",\\\"cache_sweeps\\\":\"<<(sweep?sweep->calls:0)<<\",\\\"rounds\\\":\"<<rounds<<\",\\\"iterations_per_sample\\\":\"<<iterations"
+  ]
+]

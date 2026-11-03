@@ -1,0 +1,57 @@
+Independent N8 DP4a launch geometry, source-only preparation; production unchanged
+
+Previously measured: R1/R2/R3 at block128, R4 at block32, all against R4/block128.
+Those384 strict comparisons passed, R1/R2 were slower on every12 timed shapes.
+This campaign only adds six unmeasured cells: R1/R2/R4 × block64/block256.
+No launch_bounds, register limit, weight-cache hint, new arithmetic or precision.
+The original28ede source/prefix/UE/E2/F32 accumulation/warp_sum and original Q81
+quantizer are hash-pinned. The oracle is newly compiled R4/block128, not asserted
+the exact machine image of production BBD. Native/compiler/driver gates remain.
+
+From this isolated checkout, CPU generation (never compiler/CUDA initialization):
+ python3 eng/validation/Qwen35Dp4aLaunchGeometryBench/build.py \
+   --out artifacts/geometry-generated --generate-only
+ python3 eng/validation/Qwen35Dp4aLaunchGeometryBench/run.py \
+   --build artifacts/geometry-generated --name noGPUplan --bench --cache-sweep
+
+Actual native build and GPU run are separate operator-owned exclusive actions:
+ python3 eng/validation/Qwen35Dp4aLaunchGeometryBench/build.py \
+   --out artifacts/geometry-built --nvcc /usr/local/cuda/bin/nvcc
+ python3 eng/validation/Qwen35Dp4aLaunchGeometryBench/run.py \
+   --build artifacts/geometry-built --name strict --execute
+ python3 eng/validation/Qwen35Dp4aLaunchGeometryBench/run.py \
+   --build artifacts/geometry-built --name warm --execute --bench
+ python3 eng/validation/Qwen35Dp4aLaunchGeometryBench/run.py \
+   --build artifacts/geometry-built --name sweep --execute --bench --cache-sweep
+--arms r4-b64 (or another exact candidate ID) selects a NEW independent build.
+Never automatically prune a resource/strict-failing arm or upgrade old failures.
+Natural actual stack/spill/local bytes must be zero; driver activeCTA>=1 for the
+requested block, not a requested occupancy count. All other arms stay separate.
+
+All96 frozen prequantized fixtures remain verbatim and pass before any timing.
+Full output F32 bits, original first-max argmax, input/output guards and oracle/
+candidate A/A are exact. N1..7 are NOT_SUPPORTED. A bit failure forbids timing.
+Six additional timing roles use the real27B matrix geometries, synthetic weights
+and finite F32 inputs: GDN-in5120→16480, attention-in5120→14336, GDN-out6144→5120,
+attention-out6144→5120, GateUp5120→34816, Down17408→5120. These are6 role records
+but only5 unique geometries; the two output roles repeat the same synthetic data
+and are not independent measurements or real checkpoint planes.
+
+Before each role's ABBA the original Q81 kernel is checked with two distinct
+payload poisons; every Q81 byte/F32 scale, guard and output is checked again after
+each half. The primary event interval includes ORIGINAL Q81 quantization followed
+by GEMV every iteration. No RMSNorm/embedding/model/serving latency is included.
+The old prequantized GEMV-only experiment is not directly comparable in absolute
+latency. The original96 strict fields, ordering and FP32 criterion are unchanged.
+
+Warm repeats the same matrix, default3 iterations per half. Sweep forces1 and
+executes >=2× actual driver L2 bytes using asm volatile ld.global.cg.u32, checksum
+and synchronize outside the event. It evicts all data including F32 input; the
+event's quantizer rewrites packed activations. This is eviction-control, not a
+physical-cold guarantee or weights-only experiment. Each half still gates bits.
+Five ABBA rounds/role are correlated micro observations; no model quality or
+end-to-end gain follows from synthetic PASS or a resource/occupancy observation.
+
+Original sealed Int8MMA/Rows/ScheduleR3 files are read-only dependencies. Local
+source generation/CPU mock/host syntax tests are not native compilation or GPU
+validation. Generated manifests/markers must never turn an unrun case into PASS.

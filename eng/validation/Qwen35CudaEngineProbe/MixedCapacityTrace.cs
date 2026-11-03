@@ -75,6 +75,8 @@ internal static class MixedCapacityTrace
         string[] sourcePaths = {
             "TensorSharp.Backends.Cuda/Qwen35/Q35CudaEngine.cs",
             "TensorSharp.Backends.Cuda/Qwen35/Q35Kernels.cs",
+            "TensorSharp.Backends.Cuda/Qwen35/Q35CudaEngine.VerifyDecodeQ81.cs",
+            "TensorSharp.Backends.Cuda/Qwen35/Q35CudaEngine.Scratch.cs",
             "eng/validation/Qwen35CudaEngineProbe/MixedCapacityTrace.cs",
             "eng/validation/Qwen35CudaEngineProbe/Program.cs"
         };
@@ -107,8 +109,8 @@ internal static class MixedCapacityTrace
         _ = (DeviceToHost)CopyMethod().CreateDelegate(typeof(DeviceToHost));
     }
 
-    private static object Definition() => new {
-        schema = "q35-mixed-capacity-trace-v1", ubatch = UBatch, context = Context,
+    private static object Definition(bool projectionDiagnostic = false) => new {
+        schema = projectionDiagnostic ? "q35-q81-projection-mixed-trace-v1" : "q35-mixed-capacity-trace-v1", ubatch = UBatch, context = Context,
         actual_models_to_load = 1, drafter = false, slots = Slots,
         prefix_rows_per_slot = PrefixRows, mixed_prefill_rows = UBatch,
         verify_lanes = VerifyLanes, verify_window = Window, verify_rows = VerifyLanes * Window,
@@ -118,11 +120,11 @@ internal static class MixedCapacityTrace
         reset_repeats = Repeats, float_records_per_repeat = Slots + 2 + TeacherSteps,
         full_vocab_rows_per_repeat = Slots + 1 + VerifyLanes * Window + TeacherSteps * Slots,
         integer_records_per_repeat = 1 + TeacherSteps,
-        oracle = "Fresh-process prepared0/1 with identical mixed schedule; in-process reset A/A is exact. No separate-vs-mixed oracle.",
+        oracle = projectionDiagnostic ? "In-process reset A/A only. Projection dispatch is actual host submission, not a profiler. Q81-off/on changes verify math; separate model partition oracle NOT implemented here." : "Fresh-process prepared0/1 with identical mixed schedule; in-process reset A/A is exact. No separate-vs-mixed oracle.",
         timing_is_benchmark = false
     };
 
-    internal static int Plan(string output)
+    internal static int Plan(string output, bool projectionDiagnostic = false)
     {
         output = FreshOutput(output);
         CheckReflection();
@@ -130,7 +132,7 @@ internal static class MixedCapacityTrace
         Require(UBatch + VerifyLanes * Window == 4160 && VerifyLanes * Window == Q35CudaEngine.MaxVerifyRows, "Exact row capacity.");
         Require(PrefixRows < 8 && PrefixRows + UBatch + TeacherSteps < Context, "Prefix or context geometry.");
         Require(Slots + 2 + TeacherSteps == 19 && Slots + 1 + VerifyLanes * Window + TeacherSteps * Slots == 146, "Output inventory.");
-        Write(Path.Combine(output, "plan.json"), new { complete = false, status = "PLAN_ONLY_GPU_NOT_RUN", definition = Definition(), provenance = Provenance(), reflection_and_geometry_checks = "PASS_CPU_ONLY" });
+        Write(Path.Combine(output, "plan.json"), new { complete = false, status = "PLAN_ONLY_GPU_NOT_RUN", definition = Definition(projectionDiagnostic), provenance = Provenance(), reflection_and_geometry_checks = "PASS_CPU_ONLY" });
         Console.WriteLine("[q35-mixed-capacity] CPU plan/geometry/reflection checks passed; model, CUDA and GPU NOT_RUN.");
         return 0;
     }
@@ -170,7 +172,7 @@ internal static class MixedCapacityTrace
         return values;
     }
 
-    internal static int Run(string modelPath, string output, bool diagnoseSharedScratch = false)
+    internal static int Run(string modelPath, string output, bool diagnoseSharedScratch = false, bool projectionDiagnostic = false)
     {
         output = FreshOutput(output);
         object? provenance = null;
@@ -185,7 +187,7 @@ internal static class MixedCapacityTrace
         string? inputHash = null;
         void Manifest(bool complete, string? error = null) => Write(Path.Combine(output, "run.json"), new {
             complete, status = complete ? "COMPLETE_STRICT_RESET_AA" : "INCOMPLETE_NOT_PASS", error, phase,
-            definition = Definition(), provenance, flags, model = modelIdentity, geometry,
+            definition = Definition(projectionDiagnostic), provenance, flags, model = modelIdentity, geometry,
             inputs_sha256 = inputHash, records = trace.Count, prepared_gdn_launches = preparedCount,
             actual_dispatch_observations = dispatch,
             transfer_boundary = "Private last-Head _logits read immediately after MixedVerify and before Commit. This is a diagnostic host copy only, not a production API.",
@@ -197,6 +199,12 @@ internal static class MixedCapacityTrace
             Require(BitConverter.IsLittleEndian, "Snapshots require little-endian F32/I32.");
             CheckReflection();
             flags = Configuration();
+            if (projectionDiagnostic)
+            {
+                Require(Environment.GetEnvironmentVariable("TS_Q35_VERIFY_DECODE_Q81") is "0" or "1", "Set the Q81 prototype flag explicitly to 0 or 1.");
+                Require(Environment.GetEnvironmentVariable("TS_Q35_PROJECTION_TRACE") == "1", "Enable actual host projection submission counters.");
+                Require(flags["TS_Q35_GDN_PREPARED_PREFILL"] == "0", "Keep prepared GDN off in the first Q81 diagnostic.");
+            }
             provenance = Provenance();
             var modelFile = new FileInfo(modelPath);
             modelIdentity = new { path = modelFile.FullName, bytes = modelFile.Length, sha256 = FileHash(modelFile.FullName) };
@@ -263,7 +271,9 @@ internal static class MixedCapacityTrace
                         }
                         var observation = new { repeat, key, rows, vocab, file, bytes = checked(values.LongLength * sizeof(float)),
                             sha256 = Hash(MemoryMarshal.AsBytes(values.AsSpan())), drawn_file = drawnFile, drawn,
-                            drawn_sha256 = drawn == null ? null : Hash(MemoryMarshal.AsBytes(drawn.AsSpan())), positions_before = before, positions_after = after };
+                            drawn_sha256 = drawn == null ? null : Hash(MemoryMarshal.AsBytes(drawn.AsSpan())), positions_before = before, positions_after = after,
+                            projection_dispatch_observation = projectionDiagnostic ? engine.ProjectionDispatchStats : null,
+                            projection_observation_semantics = projectionDiagnostic ? "Actual host-submitted projection API calls/role/dtype/row range since last RunGroups; NOT GPU kernel profiler/completion proof." : null };
                         trace.Add(observation);
                         Write(Path.Combine(output, "trace.json"), trace);
                         // Preserve every raw byte before any semantic/finiteness/A-A gate.
@@ -307,10 +317,30 @@ internal static class MixedCapacityTrace
                     File.WriteAllBytes(Path.Combine(output, $"repeat-{repeat}.mixed-verify.f32"), MemoryMarshal.AsBytes(verifyLogits.AsSpan()));
                     preparedCount = engine.PreparedGdnPrefillLaunchCount;
                     long delta = preparedCount - countBefore;
+                    if (projectionDiagnostic)
+                    {
+                        var observed = engine.ProjectionDispatchStats;
+                        string[] roles = { "InProj", "OutProj", "GateUp", "Down" };
+                        Require(observed.Length > 0 && observed.All(d => roles.Contains(d.Role) && d.Calls > 0 && d.Rows > 0
+                            && d.DType is "NVFP4_W4A4" or "NVFP4_W4A8_Q8_1"), "Missing or malformed actual projection submissions.");
+                        foreach (string role in roles)
+                        {
+                            Require(observed.Where(d => d.Role == role && d.DType == "NVFP4_W4A4").Sum(d => d.Calls * d.Rows)
+                                == (long)model.NLayer * (UBatch + VerifyLanes * Window), "Original whole-n prefill geometry not observed: " + role);
+                            var overrides = observed.Where(d => d.Role == role && d.DType == "NVFP4_W4A8_Q8_1").ToArray();
+                            int[] expectedStarts = engine.VerifyDecodeQ81Enabled
+                                ? Enumerable.Range(0, VerifyLanes * Window / 8).Select(i => UBatch + 8 * i).ToArray() : Array.Empty<int>();
+                            Require(overrides.All(d => d.Rows == 8 && d.Calls == model.NLayer)
+                                && overrides.Select(d => d.FirstRow).Order().SequenceEqual(expectedStarts),
+                                "Q81 override did not cover only the actual verify rows: " + role);
+                        }
+                    }
                     dispatch.Add(new { repeat, operation = "MixedVerify", actual_rows = UBatch + drawnVerify.Length, actual_slots = slots.Length,
                         prepared_gdn_launch_delta = delta, expected_prepared_gdn_launch_delta = enabled ? recurrentLayers : 0,
-                        source_selected_projection_route = "total n=4160 >8 => NVFP4 GEMM; source-derived, no kernel launch profiler",
-                        note = "Only the public prepared-launch counter is an actual dispatch count; other counts are submitted API schedule/shape." });
+                        source_selected_projection_route = projectionDiagnostic ? "Original all-n A4 plus Q8_1 verify override when enabled; see actual host-submitted dispatch rows." : "total n=4160 >8 => NVFP4 GEMM; source-derived, no kernel launch profiler",
+                        q81_prototype_enabled = projectionDiagnostic ? engine.VerifyDecodeQ81Enabled : (bool?)null,
+                        projection_dispatch_observation = projectionDiagnostic ? engine.ProjectionDispatchStats : null,
+                        note = projectionDiagnostic ? "Projection counters observe actual host submissions, not device execution. Full logits/drawn/AA gates remain separate." : "Only the public prepared-launch counter is an actual dispatch count; other counts are submitted API schedule/shape." });
                     Require(delta == (enabled ? recurrentLayers : 0), "Prepared mixed-prefill dispatch coverage is incomplete.");
                     Require(slots[0].NPast == PrefixRows + UBatch && verifySlots.All(slot => slot.NPast == PrefixRows), "Mixed prefill/verify position effects differ.");
                     int[] afterMixed = slots.Select(slot => slot.NPast).ToArray();

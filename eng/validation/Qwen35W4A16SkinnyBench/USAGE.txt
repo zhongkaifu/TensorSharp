@@ -1,0 +1,98 @@
+Owned W4A16 skinny Tensor Core experiment, isolated from production
+
+Default build.py only generates files. run.py is PLAN unless --execute.
+All paths below are relative to this isolated checkout (not the main worktree).
+
+CPU gate (no CUDA initialization):
+ python3 eng/validation/Qwen35W4A16SkinnyBench/test_build.py
+Generate only, fresh output:
+ python3 eng/validation/Qwen35W4A16SkinnyBench/build.py --out artifacts/w4a16-generated
+Offline native build, only in an agreed CPU setup window:
+ python3 eng/validation/Qwen35W4A16SkinnyBench/build.py --out artifacts/w4a16-built --compile --nvcc /usr/local/cuda/bin/nvcc
+GPU strict, only after ROOT acquires an exclusive lease:
+ python3 eng/validation/Qwen35W4A16SkinnyBench/run.py --build artifacts/w4a16-built --name strict-r1 --execute
+GPU strict followed by ABBA (never skips strict):
+ python3 eng/validation/Qwen35W4A16SkinnyBench/run.py --build artifacts/w4a16-built --name bench-r1 --bench --execute
+
+Numerical contract:
+ The candidate uses BF16 RNE activations, unchanged GGUF NVFP4 codes/scales,
+ exact-in-BF16 decoded weights, F32 MMA accumulation, and fixed-order F32 split
+ combination. UE4M3 has TS's sign-ignore and 0x7f/0xff->zero behavior. TS's old
+ half scale and doubled integer code cancel; no tensor sidecar scale is dropped.
+ F32 output/state and the original weight bytes are retained. There is no KV,
+ recurrent state, lm_head, graph, serving, or ggml change in this experiment.
+
+ This intentionally differs from old block-Q81 activations/reduction. BF16 is a
+ wider activation representation, not a proof of pointwise smaller error than
+ block-Q81 for every value. No old-A8 bit-equivalence or model-quality claim.
+
+Independent oracle and fixed admission:
+ A separate GPU reference reads logical K directly, decodes weight codes using
+ its own E2 table/full scale formula, rounds original F32 input to BF16 with an
+ independent integer RNE calculation, and accumulates in FP64. It shares neither
+ candidate permutation nor weight/pack helper. Full candidate F32, legacy-A8 F32,
+ reference F64, sum-absolute-product F64 and candidate-AA F32 are saved per shape.
+ Per-output |error| <= gamma*sumAbsProducts + 2^-140, where
+ t=(2*K+2*splits+8)*2^-24 and gamma=t/(1-t), AND relative L2 <= 2e-5.
+ These are fixed experimental criteria, not a claim of documented Tensor Core
+ internal rounding order. They are never relaxed after a device failure.
+ Reference and candidate A/A, different output/partial poisons, all allocation
+ guards, complete BF16 pack/padding bits, nonunit scales, ragged output rows and
+ an explicit wrong-permutation/1.01-scale mutation are required. CPU tests check
+ actual guard-checker corruption too. N2/4/8/16 only; N1 is unsupported.
+
+Timing:
+ All 67 strict shapes precede any timing. Twelve N8 synthetic shapes are then
+ strictly rechecked before timing. Each has five ABBA rounds in two scopes:
+ matrix_kernel_only excludes quantization/pack/combine; full_pack_kernel_combine
+ includes Q81 quant+old GEMV or BF16 pack+new MMA+split combine. Every sample's
+ final output is compared bitwise with its own prior output, not across the two
+ numerical contracts. No norm, model sampling, KV, or network time is included.
+ The old A8 source prefix is verbatim and compiled with identical recorded flags;
+ this is a recompiled source control, not a claim to load the production BBD image.
+ For N16 strict-only, the A8 control is two original <=8 calls, not production A4.
+
+Resource/identity gates:
+ Natural ptxas registers/stack/spills and driver launch resources are recorded.
+ Only actual activeCTA>=1/block128 launchability is mandatory; no 128-register,
+ two-CTA, maxregcount, or quality-skip override. Compilation alone cannot grant a
+ numerical PASS. All generated/runtime/tool identities are pinned and rechecked.
+ Each build and run directory must be new. No remote action is performed by this
+ tool. The operator must own a GPU-exclusive window; an active benchmark lease
+ remains a prohibition. The run process cleans only its own child process group.
+
+Source of ideas:
+ https://github.com/Oceania2018/velox-inferer/blob/b67f7d4565f5335988c91869cf0590b1e05998cd/crates/velox-variant/kernels/rtx5090_skinny16.cu
+ https://github.com/gpillon/ignis/blob/cb1a9851ec4b506200240e268b193f8693a96954/kernel/src/nvfp4_a16_mma.cu
+ Velox's pinned tree had no LICENSE/COPYING entry. No upstream implementation is
+ copied/included and no license grant is asserted. This owned implementation uses
+ the scheduling idea and an independently derived TS-specific mapping/reference.
+
+Current status: CPU/source generation only. NVCC, driver launchability, GPU
+ numerical gates, timing, whole-model quality and production integration NOT_RUN.
+ Any later adoption needs actual model/E2E original quality checks with no item
+ regression; synthetic numeric criteria alone cannot authorize production use.
+
+R2 cache timing control (v1 files/readiness are retained in their original tree):
+  python3 eng/validation/Qwen35W4A16SkinnyBench/run.py --build artifacts/w4a16-built-r2 --name eviction-r1 --bench --cache-sweep --execute
+--cache-sweep requires --bench. Its default iterations is1 and an explicit value
+other than1 is rejected by both Python and native CLIs. Warm mode remains the
+original default (iterations3, no sweep). A complete67-shape strict pass is still
+required before any timing, with all original AA/full-output/guard gates.
+
+Before EACH A1/B1/B2/A2 event interval, a separate kernel volatile-reads every
+uint32 of a buffer at least2x driver-reported L2 capacity, outputs a checksum per
+worker, synchronizes, downloads/verifies all checksums, then the event starts.
+Driver L2 bytes, sweep bytes/launch geometry/method and per-half checksum identity
+are recorded. This is named eviction-control, not guaranteed physical cold.
+It evicts inputs too: full_pack_kernel_combine is the primary control because its
+pack/quant kernel recreates and warms inputs inside each timed projection. The
+matrix_kernel_only scope also has cold prepared inputs and is diagnostic; it is
+not a weights-only cold control. Sweep/CPU checksum/reset/readback are outside
+the timed interval; every timed output is still bit-checked afterward. No new
+math, weights, activation policy, numerical tolerance or baseline marker changes.
+
+R3 cache opcode refinement: separate sweep uses asm volatile ld.global.cg.u32
+with a compiler memory clobber. .cg explicitly selects L2/bypassesL1 (a cache
+hint, not a physical-cold guarantee). Method metadata: volatile_asm_ld_global_cg_u32.
+R2 sevenfiles/c1ca readiness are preserved in their original independent tree.
