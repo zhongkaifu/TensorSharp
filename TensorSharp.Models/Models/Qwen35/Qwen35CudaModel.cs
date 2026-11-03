@@ -140,7 +140,8 @@ namespace TensorSharp.Models
         public override bool SupportsKVCacheTruncation => false;
 
         public override string KVStateFingerprint =>
-            $"qwen35|exec=cuda|L={Config.NumLayers}|H={Config.HiddenSize}|V={Config.VocabSize}|ctx={_maxContextLength}";
+            $"qwen35|exec=cuda|L={Config.NumLayers}|H={Config.HiddenSize}|V={Config.VocabSize}|ctx={_maxContextLength}" +
+            (_exec?.Engine?.KVStateNamespaceSuffix ?? string.Empty);
 
         protected override float[] ForwardCore(int[] tokens)
         {

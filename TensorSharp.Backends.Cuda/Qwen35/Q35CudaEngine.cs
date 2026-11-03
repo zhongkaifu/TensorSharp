@@ -242,6 +242,7 @@ namespace TensorSharp.Cuda
             if (m.SectT + m.SectH + m.SectW > Q35Kernels.RopeDims / 2)
                 throw new NotSupportedException("[q35-cuda] M-RoPE sections exceed the rotated width");
 
+            ValidateVerifyDecodeQ81Graphs(_verifyDecodeQ81 || _projectionTrace, _verifyGraphsEnabled, _draftGraphsEnabled);
             CudaBackend.Register();
             CudaDriverApi.cuInit(0);
             _alloc = new CudaAllocator(0);
@@ -602,7 +603,7 @@ namespace TensorSharp.Cuda
         {
             MakeCurrent();
             EnsureRoom(slots, 1);
-            RunRows(slots, 1, tokens, 0, null, tokens.Length, verify: false, tapFirst: 0);
+            RunRows(slots, 1, tokens, 0, null, tokens.Length, verify: false, tapFirst: 0, decode: true);
             HeadLastRows(slots.Length, 1, logitsOut, argmaxOut);
         }
 
@@ -734,8 +735,8 @@ namespace TensorSharp.Cuda
         /// each position moves past its rows. Leaves the last layer's FFN output pending in _block.
         /// </summary>
         private void RunRows(Slot[] slots, int rowsPerSeq, int[] tokens, int start, int[] ropePos, int ropeTotal, bool verify, int tapFirst,
-            int[] counts = null)
-            => RunGroups(tapFirst, new RowGroup(slots, rowsPerSeq, verify, counts, tokens, start, ropePos, ropeTotal));
+            int[] counts = null, bool decode = false)
+            => RunGroups(tapFirst, new RowGroup(slots, rowsPerSeq, verify, counts, tokens, start, ropePos, ropeTotal, decode));
 
         /// <summary>rowsPerSeq rows of each of Slots (Tokens[Start ..], sequence-major); verify as in
         /// <see cref="RunRows"/>. Counts: the real rows of each sequence (padding beyond).</summary>
@@ -743,15 +744,16 @@ namespace TensorSharp.Cuda
         {
             public readonly Slot[] Slots;
             public readonly int RowsPerSeq, Start, RopeTotal;
-            public readonly bool Verify;
+            public readonly bool Verify, Decode;
             public readonly int[] Counts, Tokens, RopePos;
 
             public RowGroup(Slot[] slots, int rowsPerSeq, bool verify, int[] counts, int[] tokens, int start = 0, int[] ropePos = null,
-                int ropeTotal = 0)
+                int ropeTotal = 0, bool decode = false)
             {
                 Slots = slots;
                 RowsPerSeq = rowsPerSeq;
                 Verify = verify;
+                Decode = decode;
                 Counts = counts;
                 Tokens = tokens;
                 Start = start;
@@ -775,6 +777,7 @@ namespace TensorSharp.Cuda
             }
             if (n > nt)
                 throw new ArgumentException($"[q35-cuda] {n} rows in one step (at most {nt})");
+            ResetProjectionDispatchStats();
             var all = new Slot[nSeq];
             for (int gi = 0, q0 = 0; gi < groups.Length; q0 += groups[gi].Slots.Length, gi++)
                 Array.Copy(groups[gi].Slots, 0, all, q0, groups[gi].Slots.Length);
@@ -853,6 +856,8 @@ namespace TensorSharp.Cuda
         // updates, drafter injection and all host reads stay in RunGroups or its caller.
         private void RunLayerKernels(int n, int tapFirst, RowGroup[] groups, int[] maxKeys)
         {
+            if (TryRunVerifyDecodeQ81(n, tapFirst, groups, maxKeys))
+                return;
             int e = _m.NEmbd;
             IntPtr pending = IntPtr.Zero;   // the previous block's output, added before the next norm
             for (int il = 0; il < _m.NLayer; il++)
@@ -872,9 +877,9 @@ namespace TensorSharp.Cuda
                 if (_d != null)
                     DraftTap(il, tapFirst, n);
                 if (fused)
-                    GemmQuantized(L.InProj, _proj, n);
+                    GemmObserved("InProj", L.InProj, _proj, n);
                 else
-                    Project(L.InProj, _xn, _proj, n);
+                    ProjectObserved("InProj", L.InProj, _xn, _proj, n);
                 for (int gi = 0, r0 = 0, q0 = 0; gi < groups.Length; r0 += groups[gi].Rows, q0 += groups[gi].Slots.Length, gi++)
                 {
                     if (L.Recurrent)
@@ -885,31 +890,32 @@ namespace TensorSharp.Cuda
                 if (L.Recurrent)
                 {
                     _k.GdnOut(_gdnO, _proj, GdnPackedWidth, ConvDim, n, _m.GdnVHeads, L.SsmNorm, _m.Eps, _gdnY, Stream);
-                    Project(L.OutProj, _gdnY, _block, n);
+                    ProjectObserved("OutProj", L.OutProj, _gdnY, _block, n);
                 }
                 else
-                    Project(L.OutProj, _attn, _block, n);
+                    ProjectObserved("OutProj", L.OutProj, _attn, _block, n);
                 if (fused)
                 {
                     _k.AddRmsNormNvfp4(_x, _block, L.PostNorm, _m.Eps, _fp4c, _fp4s, _fp4r, e, n, Stream);
                     _k.GemmW4A4(L.GateUp.Codes, L.GateUp.Scales, L.GateUp.Rows, L.GateUp.K, _fp4c, _fp4s, _fp4r, n, 1.0f, _act,
                         _partial, _counters, _sms, 1, Stream, swiglu: true);
+                    RecordProjectionDispatch("GateUp", "NVFP4_W4A4", 0, n);
                 }
                 else
                 {
                     _k.AddRmsNorm(_x, _block, L.PostNorm, _xn, n, e, _m.Eps, Stream);
-                    Project(L.GateUp, _xn, _proj, n);
+                    ProjectObserved("GateUp", L.GateUp, _xn, _proj, n);
                 }
                 if (!fused)
                 {
                     _k.SwiGlu(_proj, _act, _m.NFf, n, Stream, interleaved: true);
-                    Project(L.Down, _act, _block, n);
+                    ProjectObserved("Down", L.Down, _act, _block, n);
                 }
                 else
                 {
                     // SwiGLU happened in the gate|up GEMM's epilogue (half the bytes written and read back).
                     _k.QuantizeNvfp4(_act, _fp4c, _fp4s, _fp4r, _m.NFf, n, Stream);
-                    GemmQuantized(L.Down, _block, n);
+                    GemmObserved("Down", L.Down, _block, n);
                 }
                 pending = _block;
             }
