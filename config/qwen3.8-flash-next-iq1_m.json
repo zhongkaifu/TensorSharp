@@ -1,0 +1,45 @@
+// Qwen3.8 Flash Next UD-IQ1_M: a distinct three-shard quantization, not a Q2 alias.
+// Publisher revision, all shard sizes/hashes and optional projector verified from
+// metadata only; receipt: config/regression/source-pins.json. Trunk: 74,538,755,776 bytes.
+// Set TENSORSHARP_MODELS to the parent of Qwen3.8-Flash-Next-GGUF to reuse that layout.
+// Full-resident planning will reject small machines. Explicit --cpu-moe requires
+// independently supplied RAM/VRAM peak budgets; paging throughput is not guaranteed.
+// No learned draft or offload policy is silently enabled by this preset.
+{
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/Qwen3.8-Flash-Next-GGUF",
+    "repo": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "kv-cache-dtype": "f16",
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf",
+    "urls": ["${repo}/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"],
+    "sha256": "6584f289c808a486ac33aef20906774bcf6616785535c03b842072951e5112d2",
+    "files": [
+      {
+        "path": "${root}/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf",
+        "urls": ["${repo}/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf"],
+        "sha256": "a7cbafba2cbc1ccde484ed05e1bbeaef4d67e0924ef51cc8b8de18e62edb5586"
+      },
+      {
+        "path": "${root}/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf",
+        "urls": ["${repo}/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf"],
+        "sha256": "ae757ff9347651adacc7746f137d8c29b51f25cf6bb27cd49086ef45bd8cc203"
+      }
+    ]
+  },
+  "mmproj": {
+    "path": "${root}/mmproj-BF16.gguf",
+    "urls": ["${repo}/mmproj-BF16.gguf"],
+    "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355",
+    "optional": true
+  }
+}

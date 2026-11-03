@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TensorSharp host config value shape (JSONC parsed before validation)",
+  "description": "Structural schema only. Actual CLI/server option names and family compatibility are checked separately against source. LoRA plugin documents use their own model-specific format and are not host configs. Overlays may omit model.",
+  "type": "object",
+  "properties": {
+    "$schema": {"type": "string"},
+    "$unavailable": {"type": "string", "minLength": 1},
+    "variables": {"$ref": "#/$defs/variables"},
+    "vars": {"$ref": "#/$defs/variables"}
+  },
+  "additionalProperties": {"$ref": "#/$defs/option"},
+  "$defs": {
+    "variables": {"type": "object", "additionalProperties": {"type": ["string", "number"]}},
+    "scalar": {"type": ["string", "number", "boolean", "null"]},
+    "option": {
+      "anyOf": [
+        {"$ref": "#/$defs/scalar"},
+        {"$ref": "#/$defs/download"},
+        {"type": "array", "items": {"anyOf": [{"type": ["string", "number"]}, {"$ref": "#/$defs/download"}]}}
+      ]
+    },
+    "download": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "url": {"type": "string", "minLength": 1},
+        "urls": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "optional": {"type": "boolean"},
+        "files": {"type": "array", "items": {"$ref": "#/$defs/download"}}
+      }
+    }
+  }
+}

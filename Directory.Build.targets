@@ -1,0 +1,22 @@
+<Project>
+  <!-- PTX Content is intentionally absent in a managed-only build. Without
+       retaining these existing outputs, SDK IncrementalClean can treat PTX
+       copied by a prior native build as orphaned files and delete it in this
+       project or any referencing application's output directory. -->
+  <Target Name="TensorSharpPreservePrebuiltCudaAssets"
+          BeforeTargets="_CleanGetCurrentAndPriorFileWrites"
+          Condition="'$(TensorSharpSkipCudaPtx)' == 'true' And '$(OutDir)' != ''">
+    <PropertyGroup>
+      <_TensorSharpExistingCudaDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '$(OutDir)', 'cuda_kernels'))</_TensorSharpExistingCudaDir>
+    </PropertyGroup>
+    <ItemGroup>
+      <FileWrites Include="$(_TensorSharpExistingCudaDir)/*.ptx;$(_TensorSharpExistingCudaDir)/*.fatbin;$(_TensorSharpExistingCudaDir)/*.fatbin.sha256" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="TensorSharpRejectNativeAssetCleanInManagedOnlyMode"
+          BeforeTargets="Clean;CoreClean;Rebuild"
+          Condition="'$(TensorSharpSkipCudaPtx)' == 'true'">
+    <Error Text="TensorSharpSkipCudaPtx preserves prebuilt native assets and cannot be combined with Clean or Rebuild. Use Build for managed-only validation; prepare native assets separately." />
+  </Target>
+</Project>

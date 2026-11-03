@@ -1,0 +1,35 @@
+{
+  // Nemotron 3 Nano Omni 30B-A3B; immutable artifact identities copied from
+  // TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs, entry nemotron-3-nano-omni-30b-a3b-q4kxl.
+  // Metadata provenance is not a model/backend quality qualification.
+  // Choose a backend/context only after the local regression resource plan.
+  // Projector is optional for text; image tests must require and verify it.
+  // NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf: 23926934976 bytes.
+  // mmproj-BF16.gguf: 1589506304 bytes.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/nemotron-3-nano-omni-30b-a3b"
+  },
+  "backend": "ggml_cuda",
+  "max-tokens": 512,
+  "temperature": 0,
+  "top-k": 1,
+  "top-p": 1,
+  "min-p": 0,
+  "repeat-penalty": 1,
+  "model": {
+    "path": "${root}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF/resolve/571758804835f56154718683f5c0e388b7d0fef9/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf"
+    ],
+    "sha256": "82eb2c0a47383fc0d59d06faf0b60ad0ff0d566b8d403047525e751824e077ea"
+  },
+  "mmproj": {
+    "path": "${root}/mmproj-BF16.gguf",
+    "urls": [
+      "https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF/resolve/571758804835f56154718683f5c0e388b7d0fef9/mmproj-BF16.gguf"
+    ],
+    "sha256": "649fd5abd406c34b90942ca8616f4930953d8061083ff9e48172839e1f75313c",
+    "optional": true
+  }
+}

@@ -898,7 +898,15 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_executable(GgmlOpsDsv41VisionClipTest tests/dsv41_vision_clip_test.cpp)
     target_include_directories(GgmlOpsDsv41VisionClipTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include")
-    target_link_libraries(GgmlOpsDsv41VisionClipTest PRIVATE GgmlOps ggml-base)
+    set(TSG_DSV41_VISION_CLIP_LIBRARIES GgmlOps ggml-base)
+    if (WIN32)
+        # The test's GGUF writer needs ggml-base APIs not exported by GgmlOps.
+        # Resolve its ggml functions from that static archive before the DLL's
+        # import library, or ggml.c collides with already imported ggml exports
+        # (LNK2005). Only fixture filenames, never ggml contexts, cross the DLL.
+        set(TSG_DSV41_VISION_CLIP_LIBRARIES ggml-base GgmlOps)
+    endif()
+    target_link_libraries(GgmlOpsDsv41VisionClipTest PRIVATE ${TSG_DSV41_VISION_CLIP_LIBRARIES})
     add_test(NAME deepseek41-vision-clip-mmproj COMMAND GgmlOpsDsv41VisionClipTest)
     add_executable(GgmlOpsDsv41RetentionTest tests/dsv41_retention_test.cpp)
     target_include_directories(GgmlOpsDsv41RetentionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -1202,7 +1210,14 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_include_directories(GgmlOpsMiniMaxM3ExecTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
     )
-    target_link_libraries(GgmlOpsMiniMaxM3ExecTest PRIVATE GgmlOps)
+    if (WIN32)
+        # The synthetic GGUF writer calls APIs not exported by GgmlOps.dll.
+        # Keep the static archive first to avoid duplicate imported ggml symbols;
+        # only the written fixture filename crosses the DLL boundary.
+        target_link_libraries(GgmlOpsMiniMaxM3ExecTest PRIVATE ggml-base GgmlOps)
+    else()
+        target_link_libraries(GgmlOpsMiniMaxM3ExecTest PRIVATE GgmlOps)
+    endif()
     add_test(NAME minimax-m3-exec-cpu COMMAND GgmlOpsMiniMaxM3ExecTest cpu)
     set_tests_properties(minimax-m3-exec-cpu PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)

@@ -3,6 +3,7 @@
 // Compare identical token histories, avoiding autoregressive divergence masking
 // small or large numerical errors. Artifacts belong in ignored validation paths.
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using TensorSharp;
@@ -11,12 +12,14 @@ using TensorSharp.Runtime;
 
 if (args.Length < 3)
 {
-    Console.Error.WriteLine("Usage: ForcedLogitProbe MODEL OUTPUT_DIR (BACKEND | --backend BACKEND) [--reference REFERENCE_DIR] [--steps N] [--cases cases.json] [--run-id ID]");
+    Console.Error.WriteLine("Usage: ForcedLogitProbe MODEL OUTPUT_DIR (BACKEND | --backend BACKEND) [--reference REFERENCE_DIR] [--steps N] [--cases cases.json] [--run-id ID] [--disk-headroom-gib N]");
     Console.Error.WriteLine("  BACKEND: ggml_cuda | ggml_cpu | ggml_metal | cuda (direct CUDA) | cpu (managed)");
     Console.Error.WriteLine("  Without --reference the run is greedy (its tokens become the reference's forced tokens) and");
     Console.Error.WriteLine("  metrics.json records each case's generated ids and text. metrics.json carries complete=false");
     Console.Error.WriteLine("  until every case has finished; exit 0 = finished within the tight gate, 1 = finished outside it,");
     Console.Error.WriteLine("  anything else = did not finish.");
+    Console.Error.WriteLine("  --cases may reorder/repeat histories with unique names and reference_case aliases. With");
+    Console.Error.WriteLine("  --reference aliases name external cases; otherwise they name earlier cases in this process.");
     return 2;
 }
 string modelPath = args[0], directory = Path.GetFullPath(args[1]);
@@ -36,24 +39,28 @@ string? Option(string name)
 }
 int steps = int.Parse(Option("--steps") ?? "24");
 if (steps < 1 || steps > 1024) throw new ArgumentOutOfRangeException("--steps", "Use 1..1024 steps; at least16 for qualification.");
+double diskHeadroomGiB = double.Parse(Option("--disk-headroom-gib") ?? "5", CultureInfo.InvariantCulture);
+if (!double.IsFinite(diskHeadroomGiB) || diskHeadroomGiB < 0)
+    throw new ArgumentOutOfRangeException("--disk-headroom-gib", "Use finite nonnegative GiB");
 string? referenceDir = Option("--reference");
+if (referenceDir != null)
+{
+    referenceDir = Path.GetFullPath(referenceDir);
+    if (string.Equals(referenceDir, directory, StringComparison.OrdinalIgnoreCase))
+        throw new ArgumentException("Reference and output directories must differ");
+}
 // Lets a driver tell this run's output from a previous run's (it also deletes the directory first).
 string? runId = Option("--run-id");
 var json = new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, PropertyNameCaseInsensitive = true };
 Directory.CreateDirectory(directory);
-// A metrics.json left by an earlier run must never be read as this run's (a crash before the
-// first case would otherwise leave it in place).
+// Invalidate stale success before schedule parsing or native model loading can fail.
 File.Delete(Path.Combine(directory, "metrics.json"));
 File.Delete(Path.Combine(directory, "cases.json"));
-KvCacheDtypeConfig.ConfigureFromEnvironment();
-var loadTimer = Stopwatch.StartNew();
-using var model = ModelBase.Create(modelPath, backend);
-loadTimer.Stop();
 ProbeCase[] cases;
-if (referenceDir != null)
-    cases = JsonSerializer.Deserialize<ProbeCase[]>(File.ReadAllText(Path.Combine(referenceDir, "cases.json")), json)!;
-else if (Option("--cases") is string file)
+if (Option("--cases") is string file)
     cases = JsonSerializer.Deserialize<ProbeCase[]>(File.ReadAllText(file), json)!;
+else if (referenceDir != null)
+    cases = JsonSerializer.Deserialize<ProbeCase[]>(File.ReadAllText(Path.Combine(referenceDir, "cases.json")), json)!;
 else
 {
     string Chat(string text) => "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
@@ -65,6 +72,18 @@ else
         new() { Name = "synthetic_prefill128", PromptTokens = Enumerable.Range(0, 128).Select(i => 100 + i % 17).ToArray() },
     ];
 }
+ProbeSchedule.Validate(cases);
+Dictionary<string, ProbeCase>? externalCases = referenceDir == null ? null : ProbeSchedule.Validate(
+    JsonSerializer.Deserialize<ProbeCase[]>(File.ReadAllText(Path.Combine(referenceDir, "cases.json")), json)!);
+ProbeSchedule.ValidateReferences(cases, externalCases);
+KvCacheDtypeConfig.ConfigureFromEnvironment();
+// Residency must be configured before Create prepares quantized expert weights.
+MoeCpuOffloadConfig.ConfigureFromEnvironment();
+var loadTimer = Stopwatch.StartNew();
+using var model = ModelBase.Create(modelPath, backend);
+loadTimer.Stop();
+var completedCases = new Dictionary<string, ProbeCase>(StringComparer.OrdinalIgnoreCase);
+bool hasComparisons = referenceDir != null || cases.Any(item => item.ReferenceCase != null);
 var results = new List<object>();
 var all = new RowStats();
 bool allFinite = true;
@@ -72,19 +91,30 @@ bool qualified = true;
 int casesDone = 0;
 void WriteMetrics(bool complete) =>
     File.WriteAllText(Path.Combine(directory, "metrics.json"), JsonSerializer.Serialize(new { all_finite = allFinite,
-        qualified = referenceDir == null ? (bool?)null : qualified,
+        qualified = hasComparisons ? qualified : (bool?)null,
         // A driver gates only on complete == true: the file is rewritten after every case, so a
         // run that dies part-way leaves the cases it finished, marked incomplete.
         complete, cases_done = casesDone, cases_total = cases.Length, run_id = runId,
         gate = new { max_relative_l2 = 0.001, min_cosine = 0.999999, require_identical_top1 = true },
-        model = Path.GetFileName(modelPath), backend = backendName, tp = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"),
+        model = Path.GetFileName(modelPath), model_architecture = model.Config.Architecture,
+        backend = backendName, tp = Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"),
+        offload_policy = new { cpu_moe_enabled = MoeCpuOffloadConfig.IsEnabled,
+            all_layers = MoeCpuOffloadConfig.AllLayers, cpu_moe_layers = MoeCpuOffloadConfig.CpuMoeLayers,
+            explicitly_set = MoeCpuOffloadConfig.IsExplicitlySet, cpu_threads = MoeCpuOffloadConfig.CpuThreads,
+            configuration_source = MoeCpuOffloadConfig.IsExplicitlySet ? "environment" : "default" },
         layer_split = Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE"), load_seconds = loadTimer.Elapsed.TotalSeconds,
         reference = referenceDir,
-        summary = referenceDir == null ? null : all.Summarize(),
+        disk_headroom_gib = diskHeadroomGiB,
+        session_semantics = "one model instance; ResetKVCache before every case",
+        summary = hasComparisons ? all.Summarize() : null,
         cases = results }, json));
+WriteMetrics(complete: false);
 foreach (var item in cases)
 {
-    if (Path.GetFileName(item.Name) != item.Name || string.IsNullOrWhiteSpace(item.Name)) throw new ArgumentException("Invalid case name");
+    string? referenceName = referenceDir != null ? item.ReferenceCase ?? item.Name : item.ReferenceCase;
+    ProbeCase? referenceCase = referenceName == null ? null :
+        externalCases != null ? externalCases[referenceName] : completedCases[referenceName];
+    if (referenceCase != null) ProbeSchedule.UseReferenceHistory(item, referenceCase);
     item.PromptTokens ??= model.Tokenizer.Encode(item.Prompt ?? throw new ArgumentException("Missing prompt"), addSpecial: false).ToArray();
     if (item.PromptTokens.Length == 0) throw new ArgumentException("Empty prompt");
     // A case may ask for an exact prompt length (512, 2048, 8192 for the prefill gates): the
@@ -92,15 +122,32 @@ foreach (var item in cases)
     // --reference run replays exactly them.
     if (item.TargetTokens is int target && target > 0 && item.PromptTokens.Length != target)
         item.PromptTokens = Enumerable.Range(0, target).Select(i => item.PromptTokens[i % item.PromptTokens.Length]).ToArray();
-    int count = referenceDir != null ? item.GeneratedTokens!.Length : steps;
+    if (item.PromptTokens.Any(token => token < 0 || token >= model.Config.VocabSize) ||
+        item.GeneratedTokens?.Any(token => token < 0 || token >= model.Config.VocabSize) == true)
+        throw new ArgumentException("Token ID is outside model vocabulary for case " + item.Name);
+    int count = referenceCase != null ? item.GeneratedTokens!.Length : steps;
     int[] generated = new int[count];
     string binaryPath = Path.Combine(directory, item.Name + ".f32");
+    LogitArtifactBudget diskBudget = ProbeSchedule.PlanLogitArtifacts(count, model.Config.VocabSize,
+        ProbeSchedule.AvailableDiskBytes(directory), diskHeadroomGiB);
+    if (!diskBudget.Fits)
+    {
+        string message = $"Insufficient logit artifact disk: case={item.Name}, logit_bytes={diskBudget.LogitBytes}, " +
+            $"headroom_bytes={diskBudget.HeadroomBytes}, required_bytes={diskBudget.RequiredBytes}, available_bytes={diskBudget.AvailableBytes}";
+        results.Add(new { name = item.Name, stage = "artifact_budget", status = "blocked",
+            session_case_index = casesDone, artifact_disk_budget = diskBudget, error = message });
+        WriteMetrics(complete: false);
+        throw new IOException(message);
+    }
     using var actualFile = File.Create(binaryPath);
-    using FileStream? referenceFile = referenceDir == null ? null : File.OpenRead(Path.Combine(referenceDir, item.Name + ".f32"));
+    using FileStream? referenceFile = referenceName == null ? null : File.OpenRead(Path.Combine(referenceDir ?? directory, referenceCase!.Name + ".f32"));
+    if (referenceFile != null && referenceFile.Length != (long)count * model.Config.VocabSize * sizeof(float))
+        throw new InvalidOperationException("Reference logit width/step mismatch");
     model.ResetKVCache();
     float[] logits = model.Forward(item.PromptTokens);
     var metrics = new List<object>();
     var caseStats = new RowStats();
+    object? firstDivergence = null;
     for (int step = 0; step < count; ++step)
     {
         if (logits.Length != model.Config.VocabSize) throw new InvalidOperationException("Wrong vocabulary width");
@@ -108,7 +155,7 @@ foreach (var item in cases)
         bool finite = logits.All(float.IsFinite);
         allFinite &= finite;
         int top = Top(logits);
-        int forced = referenceDir == null ? top : item.GeneratedTokens![step];
+        int forced = referenceCase == null ? top : item.GeneratedTokens![step];
         generated[step] = forced;
         if (referenceFile != null)
         {
@@ -129,8 +176,14 @@ foreach (var item in cases)
             double cosine = dot / Math.Sqrt(Math.Max(normReference * normActual, 1e-300));
             double kl = finite ? KlDivergence(expected, logits) : double.NaN;
             double top5 = Top5Overlap(expected, logits);
-            bool rowFinite = finite && double.IsFinite(relativeL2) && double.IsFinite(kl);
-            qualified &= rowFinite && relativeL2 <= 0.001 && cosine >= 0.999999 && referenceTop == top;
+            bool rowFinite = finite && expected.All(float.IsFinite) && double.IsFinite(relativeL2) && double.IsFinite(cosine) && double.IsFinite(kl);
+            bool rowQualified = rowFinite && relativeL2 <= 0.001 && cosine >= 0.999999 && referenceTop == top;
+            qualified &= rowQualified;
+            allFinite &= rowFinite;
+            if (!rowQualified && firstDivergence == null)
+                firstDivergence = new { step, reference_top = referenceTop, candidate_top = top,
+                    max_abs = Finite(maxAbs), relative_l2 = Finite(relativeL2), cosine = Finite(cosine),
+                    input_history_sha256 = ProbeSchedule.TokenHash(item.PromptTokens.Concat(generated.Take(step))) };
             caseStats.Add(step, rowFinite, relativeL2, kl, top5, referenceTop == top);
             all.Add(step, rowFinite, relativeL2, kl, top5, referenceTop == top);
             metrics.Add(new { step, finite, reference_top = referenceTop, candidate_top = top,
@@ -151,14 +204,23 @@ foreach (var item in cases)
     if (referenceFile != null && referenceFile.Position != referenceFile.Length) throw new InvalidOperationException("Reference logit width/step mismatch");
     item.GeneratedTokens = generated;
     string? text = null;
-    if (referenceDir == null)
+    if (referenceCase == null)
     {
         try { text = model.Tokenizer.Decode(generated.ToList()); }
         catch (Exception ex) { text = "<decode failed: " + ex.GetType().Name + ">"; }
     }
     results.Add(new { name = item.Name, prompt_tokens = item.PromptTokens.Length, steps = count,
+        artifact_disk_budget = diskBudget,
+        reference_case = referenceCase?.Name,
+        reference_scope = referenceCase == null ? null : referenceDir != null ? "external" : "process",
+        reset_kv_cache = true, session_case_index = casesDone, first_divergence = firstDivergence,
+        token_hash_encoding = "int32-little-endian",
+        prompt_tokens_sha256 = ProbeSchedule.TokenHash(item.PromptTokens),
+        forced_tokens_sha256 = ProbeSchedule.TokenHash(generated),
+        input_history_sha256 = ProbeSchedule.TokenHash(item.PromptTokens.Concat(generated.Take(Math.Max(0, count - 1)))),
         summary = referenceFile == null ? null : caseStats.Summarize(),
-        generated_tokens = referenceDir == null ? generated : null, generated_text = text, metrics });
+        generated_tokens = generated, generated_text = text, metrics });
+    completedCases.Add(item.Name, item);
     casesDone++;
     WriteMetrics(complete: false);
     Console.WriteLine($"[forced-logits] {item.Name}: {count} rows x {model.Config.VocabSize} logits, finite={allFinite}");
@@ -187,7 +249,6 @@ static double KlDivergence(float[] reference, float[] candidate)
     }
     return Math.Max(0, kl);
 }
-
 // |top-5(reference) n top-5(candidate)| / 5.
 static double Top5Overlap(float[] reference, float[] candidate)
 {
@@ -248,13 +309,4 @@ internal sealed class RowStats
         double[] s = values.OrderBy(v => v).ToArray();
         return s.Length % 2 == 1 ? s[s.Length / 2] : 0.5 * (s[s.Length / 2 - 1] + s[s.Length / 2]);
     }
-}
-
-internal sealed class ProbeCase
-{
-    public string Name { get; set; } = "";
-    public string? Prompt { get; set; }
-    public int[]? PromptTokens { get; set; }
-    public int? TargetTokens { get; set; }
-    public int[]? GeneratedTokens { get; set; }
 }

@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TensorSharp typed local regression scenario profiles",
+  "description": "Common input envelope only. The Python loader also resolves catalog identities, checks unique profile IDs and local paths, validates finite budgets, and invokes the scenario executor's strict validate_profile function. Schema validation alone does not establish an executable, safe, supported or passing profile.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profiles"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "profiles": {
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/profile"}
+    }
+  },
+  "$defs": {
+    "identifier": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}(?![\\s\\S])"},
+    "catalog_reference": {"type": "string", "minLength": 1, "description": "Exact existing catalog preset ID; membership is checked by the loader."},
+    "backend": {"enum": ["cpu", "ggml_cpu", "ggml_cuda", "ggml_metal", "ggml_vulkan", "cuda", "mlx"]},
+    "positive_gib": {"type": "number", "exclusiveMinimum": 0},
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "not": {"pattern": "://|^[\\\\/]{2}|\u0000"},
+          "description": "Local regular file. Relative paths resolve against the profile document directory; URL and UNC paths are refused. The loader caps each fixture at 512 MiB and executors apply smaller format/geometry limits."
+        },
+        "sha256": {"type": "string", "pattern": "^[a-fA-F0-9]{64}(?![\\s\\S])"}
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ram_required_gib"],
+      "properties": {
+        "ram_required_gib": {
+          "$ref": "#/$defs/positive_gib",
+          "description": "Explicit combined peak host RAM for the primary model, every resident role, staging and workspace; not a measured fit guarantee."
+        },
+        "vram_required_gib": {
+          "$ref": "#/$defs/positive_gib",
+          "description": "Required for a GPU backend. Omit for CPU rather than supplying zero."
+        },
+        "per_gpu_required_gib": {
+          "type": "object",
+          "propertyNames": {"pattern": "^(0|[1-9][0-9]*)(?![\\s\\S])"},
+          "additionalProperties": {"$ref": "#/$defs/positive_gib"},
+          "description": "Separate physical-device requirements. Multi-GPU executors require an entry for each selected GPU; free VRAM is checked independently with headroom, never pooled."
+        },
+        "scratch_gib": {
+          "$ref": "#/$defs/positive_gib",
+          "description": "Output-volume workspace/artifact allowance, checked separately from model-cache transfer bytes. Omit when no additional allowance is requested."
+        }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "scenario", "preset", "backend", "resources"],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier", "description": "Must be unique across the document; result ID is profile::<id>."},
+        "scenario": {
+          "enum": ["embedding_media", "image_generation", "image_editing", "video_generation", "video_audio_generation", "video_reference", "speculation", "lora", "multi_gpu", "distributed", "retrieval", "jev_media", "client_live", "native_unit"]
+        },
+        "preset": {"$ref": "#/$defs/catalog_reference", "description": "An exact catalog preset ID; identifies the implicit primary role. native_unit uses it only for selection/classification and does not load its model."},
+        "backend": {"$ref": "#/$defs/backend"},
+        "models": {
+          "type": "object",
+          "default": {},
+          "propertyNames": {"$ref": "#/$defs/identifier"},
+          "additionalProperties": {"$ref": "#/$defs/catalog_reference"},
+          "description": "Executor-defined role -> exact catalog preset ID. The executor restricts admitted roles; an explicit primary, where admitted, must equal preset. Never a URL or command."
+        },
+        "fixtures": {
+          "type": "object",
+          "default": {},
+          "propertyNames": {"$ref": "#/$defs/identifier"},
+          "additionalProperties": {"$ref": "#/$defs/fixture"}
+        },
+        "parameters": {"type": "object", "default": {}, "description": "Strict scenario-specific fields are validated by the selected executor; arbitrary commands/endpoints are not a generic capability of this schema."},
+        "expected": {"type": "object", "default": {}, "description": "Independent approved oracle and scenario-specific numerical/semantic gates; validated by the selected executor."},
+        "resources": {"$ref": "#/$defs/resources"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"backend": {"not": {"enum": ["cpu", "ggml_cpu"]}}}, "required": ["backend"]},
+          "then": {"properties": {"resources": {"required": ["vram_required_gib"]}}}
+        }
+      ]
+    }
+  }
+}

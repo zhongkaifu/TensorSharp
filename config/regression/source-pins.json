@@ -1,0 +1,222 @@
+{
+  "schema_version": 1,
+  "verified_utc_date": "2026-11-01",
+  "scope": "Public project-linked Hugging Face metadata only; immutable revision and LFS object SHA256/size verified. No model payloads downloaded or model/device execution claimed.",
+  "repositories": [
+    {
+      "repository": "unsloth/Muse-Glimmer-30B-GGUF",
+      "revision": "faa5b025c584459c13febfa5c59883516710ae39",
+      "architecture": "muse-glimmer",
+      "metadata_url": "https://huggingface.co/api/models/unsloth/Muse-Glimmer-30B-GGUF/revision/faa5b025c584459c13febfa5c59883516710ae39?blobs=true",
+      "repository_url": "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/tree/faa5b025c584459c13febfa5c59883516710ae39",
+      "metadata_sha256": "5f351da9fe22cc74b98d31d0fbcaf1fa78eda1113c211bd51d326916fcaeb4bc",
+      "metadata_bytes": 13872,
+      "gated": false,
+      "config": "config/muse-glimmer-30b.json",
+      "files": [
+        {
+          "path": "Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
+          "size_bytes": 15878222368,
+          "sha256": "82bece304887a313ece08400bc030f6066c7bff5b906b0cd40308ec8a409fd38",
+          "role": "weights"
+        },
+        {
+          "path": "mmproj-Muse-Glimmer-30B-Q8_0.gguf",
+          "size_bytes": 2051685088,
+          "sha256": "01ff73c95108e1754a4c145176c6d3ba44338942285cb87dcac7f4f193192ea2",
+          "role": "projector"
+        }
+      ]
+    },
+    {
+      "repository": "unsloth/Muse-Spark-Open-816B-A42B-GGUF",
+      "revision": "c00670568b6ce5e56a247f67091247984df2a01e",
+      "architecture": "muse-spark",
+      "metadata_url": "https://huggingface.co/api/models/unsloth/Muse-Spark-Open-816B-A42B-GGUF/revision/c00670568b6ce5e56a247f67091247984df2a01e?blobs=true",
+      "repository_url": "https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/tree/c00670568b6ce5e56a247f67091247984df2a01e",
+      "metadata_sha256": "4ce7ce3cef1cec163fbc9423a5bf2ec737ab52cccc5a1bb091abdecf94c6815a",
+      "metadata_bytes": 36645,
+      "gated": false,
+      "config": "config/muse-spark-816b-a42b.json",
+      "files": [
+        {
+          "path": "UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00001-of-00008.gguf",
+          "size_bytes": 13079896,
+          "sha256": "35e2dccb1263a8d5ea60bc60701819757fd3833896e9980fdff8f878a7a8947e",
+          "role": "weights"
+        },
+        {
+          "path": "UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00002-of-00008.gguf",
+          "size_bytes": 49199576672,
+          "sha256": "13ef68334c913ddf2f33998e7668d6766791c0937c375cbc0b7f3970474815a7",
+          "role": "weights"
+        },
+        {
+          "path": "UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00003-of-00008.gguf",
+          "size_bytes": 48777572992,
+          "sha256": "587f4cb4a928e8e0a25dda4a399d539e5f33a99a27e0add4758981f70fabaeee",
+          "role": "weights"
+        },
+        {
+          "path": "UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00004-of-00008.gguf",
+          "size_bytes": 48998157856,
+          "sha256": "02942f790c113aa94cc6ac6eb0606f9dd3e849750b90c5d38e026588529a57ad",
+          "role": "weights"
+        },
+        {
+          "path": "UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00005-of-00008.gguf",
+          "size_bytes": 49672648608,
+          "sha256": "49b6efafde7972047331127a6caa1ee6053fbb3b26d80155a18ba98d212cc39e",
+          "role": "weights"
+        },
+        {
+          "path": "UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00006-of-00008.gguf",
+          "size_bytes": 48956218432,
+          "sha256": "c907c40f8e282a220f6097e41f8824564f5acc3d697066b910309bade05f28ea",
+          "role": "weights"
+        },
+        {
+          "path": "UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00007-of-00008.gguf",
+          "size_bytes": 49010673088,
+          "sha256": "1973d7063cf1a07a3609904e2ac5b4b2c161e58af6c2a2850c56ae47790daeb6",
+          "role": "weights"
+        },
+        {
+          "path": "UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00008-of-00008.gguf",
+          "size_bytes": 45722968832,
+          "sha256": "9db635ddec9ca114af99c57ade557b34b27ea266c564fc9f755d446613c42f37",
+          "role": "weights"
+        },
+        {
+          "path": "mmproj-Q8_0.gguf",
+          "size_bytes": 2183868768,
+          "sha256": "c3a0613bb2be1dde38faec3d1d1bf2c118013626ab9623936de500a656232ed3",
+          "role": "projector"
+        }
+      ]
+    },
+    {
+      "repository": "unsloth/MiniMax-M3.1-Flash-GGUF",
+      "revision": "b17b7f5459c0b8f127ea12ee774409b282521d6a",
+      "architecture": "minimax-m3",
+      "metadata_url": "https://huggingface.co/api/models/unsloth/MiniMax-M3.1-Flash-GGUF/revision/b17b7f5459c0b8f127ea12ee774409b282521d6a?blobs=true",
+      "repository_url": "https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/tree/b17b7f5459c0b8f127ea12ee774409b282521d6a",
+      "metadata_sha256": "e801a048427f610695742cc5acf62207e3417aa306eeffffc5cd4e973daedc7d",
+      "metadata_bytes": 25724,
+      "gated": false,
+      "config": "config/minimax-m3.1-flash.json",
+      "files": [
+        {
+          "path": "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00001-of-00007.gguf",
+          "size_bytes": 8243070,
+          "sha256": "33859402ee4d2e195ca0a2556310db7b8da0a14f6104917cd5203288f73f3030",
+          "role": "weights"
+        },
+        {
+          "path": "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00002-of-00007.gguf",
+          "size_bytes": 48922385120,
+          "sha256": "bbd9f034daeeb857c2435da1153c6f3b9e11e28e0325a3048c428f26f53d0c00",
+          "role": "weights"
+        },
+        {
+          "path": "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00003-of-00007.gguf",
+          "size_bytes": 48922385152,
+          "sha256": "18cfd1957e6593af07e0c8045d1e37825bb6c1413ff50d99aea5a060ace537f4",
+          "role": "weights"
+        },
+        {
+          "path": "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00004-of-00007.gguf",
+          "size_bytes": 48922385152,
+          "sha256": "520e886b521cb0f77cfdcdc88e8934be0cd55de01209cad92667bf85cfdf595e",
+          "role": "weights"
+        },
+        {
+          "path": "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00005-of-00007.gguf",
+          "size_bytes": 48922385152,
+          "sha256": "c761ad19c980a67946a963faebd0175d5751cd64ccdec1bb6274810d3156013f",
+          "role": "weights"
+        },
+        {
+          "path": "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00006-of-00007.gguf",
+          "size_bytes": 49985658336,
+          "sha256": "367e01f928ed33c9d994b7fe22cb5e623b2bda9b67984b418f4367873c082436",
+          "role": "weights"
+        },
+        {
+          "path": "UD-Q4_K_XL/MiniMax-M3.1-Flash-UD-Q4_K_XL-00007-of-00007.gguf",
+          "size_bytes": 3718663328,
+          "sha256": "4d67d5144fb734820da7ba78aa58bfb0408dacfcf8601507b71e3e60310f74ef",
+          "role": "weights"
+        }
+      ]
+    },
+    {
+      "repository": "unsloth/Qwen3.5-0.8B-GGUF",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "architecture": "qwen35",
+      "metadata_url": "https://huggingface.co/api/models/unsloth/Qwen3.5-0.8B-GGUF/revision/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0?blobs=true",
+      "repository_url": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/tree/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "metadata_sha256": "3e56dfff75a36a62b24227c09ca1c8509672a0b4a1b9b69a608c3a5623269f72",
+      "metadata_bytes": 16501,
+      "gated": false,
+      "config": "config/qwen3.5-0.8b.json",
+      "base_model": "Qwen/Qwen3.5-0.8B",
+      "license": "apache-2.0",
+      "publisher_reference": "config/qwen3.5-9b-q8.json",
+      "files": [
+        {
+          "path": "Qwen3.5-0.8B-Q8_0.gguf",
+          "size_bytes": 811843840,
+          "sha256": "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c",
+          "role": "weights"
+        },
+        {
+          "path": "mmproj-F16.gguf",
+          "size_bytes": 204987232,
+          "sha256": "56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453",
+          "role": "projector"
+        }
+      ]
+    },
+    {
+      "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+      "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+      "architecture": "qwen4exp",
+      "metadata_url": "https://huggingface.co/api/models/unsloth/Qwen3.8-Flash-Next-GGUF/revision/766911a6b7369840a91dbcd95f9f997acaab6cd6?blobs=true",
+      "repository_url": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/766911a6b7369840a91dbcd95f9f997acaab6cd6",
+      "metadata_sha256": "8c80beef666a527023c57be69f0426b3a8985165e3725d6ca73fb21ba8114d67",
+      "metadata_bytes": 27260,
+      "gated": false,
+      "config": "config/qwen3.8-flash-next-iq1_m.json",
+      "base_model": "Qwen/Qwen3.8-Flash-Next",
+      "license": "other",
+      "publisher_reference": "config/qwen3.8-flash-next.json",
+      "files": [
+        {
+          "path": "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf",
+          "size_bytes": 10946624,
+          "sha256": "6584f289c808a486ac33aef20906774bcf6616785535c03b842072951e5112d2",
+          "role": "weights"
+        },
+        {
+          "path": "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf",
+          "size_bytes": 49988981792,
+          "sha256": "a7cbafba2cbc1ccde484ed05e1bbeaef4d67e0924ef51cc8b8de18e62edb5586",
+          "role": "weights"
+        },
+        {
+          "path": "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf",
+          "size_bytes": 24538827360,
+          "sha256": "ae757ff9347651adacc7746f137d8c29b51f25cf6bb27cd49086ef45bd8cc203",
+          "role": "weights"
+        },
+        {
+          "path": "mmproj-BF16.gguf",
+          "size_bytes": 907542944,
+          "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355",
+          "role": "projector"
+        }
+      ]
+    }
+  ]
+}

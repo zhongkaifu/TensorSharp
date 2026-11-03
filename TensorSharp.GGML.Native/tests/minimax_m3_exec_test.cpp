@@ -568,11 +568,12 @@ static void check_slot_copy_keeps_source(const std::string & gguf, const config 
 /// costs only the progress lines.
 static void check_load_faults(const std::string & gguf, const config & c, int tp)
 {
-    struct fault { const char * what; int thread_start, upload_job; const char * says; };
+    struct fault { const char * what; int thread_start, upload_job; const char * says; const char * alternate; };
     const fault cases[] = {
-        { "a loader thread that cannot start is a load refusal", 1, -1, "cannot start loader thread" },
-        { "an upload worker that throws is a load refusal", -1, 0, "bad_alloc" },
-        { "a progress thread that cannot start costs only its lines", 0, -1, nullptr },
+        { "a loader thread that cannot start is a load refusal", 1, -1, "cannot start loader thread", nullptr },
+        // std::bad_alloc::what() is implementation-defined; MSVC says "bad allocation".
+        { "an upload worker that throws is a load refusal", -1, 0, "bad_alloc", "bad allocation" },
+        { "a progress thread that cannot start costs only its lines", 0, -1, nullptr, nullptr },
     };
     for (const fault & f : cases)
     {
@@ -580,7 +581,8 @@ static void check_load_faults(const std::string & gguf, const config & c, int tp
         void * h = load(gguf, c, 2048, tp);
         TSGgml_MiniMaxM3TestInjectFault(-1, -1);
         const char * err = TSGgml_GetLastError();
-        const bool ok = f.says ? !h && err && strstr(err, f.says) : h != nullptr;
+        const bool ok = f.says ? !h && err && (strstr(err, f.says) ||
+                                             (f.alternate && strstr(err, f.alternate))) : h != nullptr;
         if (h) TSGgml_MiniMaxM3Free(h);
         printf("%-58s %s\n", f.what, ok ? "ok" : "FAIL");
         if (!ok) { printf("  last error: %s\n", err ? err : "(none)"); g_failures++; }

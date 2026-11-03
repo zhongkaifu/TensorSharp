@@ -1,0 +1,225 @@
+"""Reuse correctness suites; optional managed builds never reconfigure native assets."""
+from pathlib import Path
+import re
+import shutil
+import sys
+import xml.etree.ElementTree as ET
+
+from .processes import (run_process, containment_failure_evidence, unsafe_process_state,
+                        UNSAFE_RESOURCES_REASON, ProcessContainmentError)
+from .hardware import _runtime_evidence
+from .reports import file_hash, runtime_identity, source_identity
+
+MANAGED_BUILD_PROPERTIES = ["-p:TensorSharpSkipGgmlNative=true", "-p:TensorSharpSkipMlxNative=true",
+                            "-p:TensorSharpSkipCudaPtx=true"]
+
+# Keep explicit exclusions even after the source traits are corrected: deployments
+# may contain older, prebuilt assemblies whose ordinary Facts load local weights.
+# Environment cleanup cannot prevent a test's hardcoded filesystem fallback.
+SERVER_MODEL_EXCLUSIONS = (
+    {"fully_qualified_name": "InferenceWeb.Tests.WanVideoOracleTests", "match": "class",
+     "fixture_kind": "model_weights",
+     "reason": "External Wan VAE/DiT weights and oracle fixtures; legacy tests use a fixed local fallback and may silently return or select another backend."},
+    {"fully_qualified_name": "InferenceWeb.Tests.WanVideoTests.TokenizerMatchesHuggingFaceReference", "match": "method",
+     "fixture_kind": "model_weights",
+     "reason": "External UMT5 GGUF tokenizer fixture; legacy test uses a fixed local fallback and silently returns when absent."},
+)
+
+# These ordinary Facts silently return when their optional external input is
+# absent. The model-free environment intentionally removes that input setting;
+# excluding the exact methods keeps a no-op from being reported as a passed test
+# even when deploying an older assembly without corrected prerequisite traits.
+SERVER_EXTERNAL_FIXTURE_EXCLUSIONS = (
+    {"fully_qualified_name": "InferenceWeb.Tests.Dsv41QuantizationTests.QuantizesTheHarnessVectorsForEveryMode",
+     "match": "method", "fixture_kind": "quantization_vectors", "environment_variable": "TS_DSV41_QUANT_VECTORS",
+     "reason": "External F32 quantization vectors and a separate oracle comparator are required; the legacy export fixture silently returns when its input is absent."},
+    {"fully_qualified_name": "InferenceWeb.Tests.ImageProcessorTests.UserSuppliedJpegSmokeTestWhenConfigured",
+     "match": "method", "fixture_kind": "user_media", "environment_variable": "TENSORSHARP_JPEG_SMOKE_PATH",
+     "reason": "An explicitly supplied JPEG fixture is required; the legacy smoke test silently returns when its input is absent."},
+    {"fully_qualified_name": "InferenceWeb.Tests.ImageProcessorTests.UserSuppliedHeicSmokeTestWhenConfigured",
+     "match": "method", "fixture_kind": "user_media", "environment_variable": "TENSORSHARP_HEIC_SMOKE_PATH",
+     "reason": "An explicitly supplied HEIC fixture is required; the legacy smoke test silently returns when its input is absent."},
+)
+
+
+def list_suites(repo):
+    repo = Path(repo)
+    suites = []
+    for identifier, project in (("server_unit", "InferenceWeb.Tests"),
+                                ("knowledge_unit", "TensorSharp.Knowledge.Tests"),
+                                ("studio_unit", "TensorSharp.Studio.Tests")):
+        excluded = [dict(item) for item in (*SERVER_MODEL_EXCLUSIONS, *SERVER_EXTERNAL_FIXTURE_EXCLUSIONS)] if identifier == "server_unit" else []
+        # Prebuilt assemblies may have different skip gates: exclude GPU traits
+        # in the runner as well as pinning GGML CPU in the child environment.
+        test_filter = ("Category!=Bench&Requires!=Models&Requires!=Cuda&Requires!=Mlx"
+                       "&Requires!=GgmlCuda&Requires!=GgmlMetal&Requires!=GgmlVulkan")
+        for item in excluded:
+            operator = "!~" if item["match"] == "class" else "!="
+            test_filter += "&FullyQualifiedName" + operator + item["fully_qualified_name"]
+        suites.append({"id": identifier, "kind": "dotnet", "project": project + "/" + project + ".csproj",
+                       "built": repo / project / "bin/Release/net10.0" / (project + ".dll"),
+                       "filter": test_filter, "excluded_fixtures": excluded,
+                       "assertions": ["TRX contains executed passed tests", "zero failed tests", "skipped tests disclosed separately"],
+                       "scope": "Environment-independent correctness only; not native GPU/model/performance coverage"})
+    suites.append({"id": "client_native_contract", "kind": "client_native",
+                   "project": "eng/tests/NativeChatCompletion/NativeChatCompletion.csproj",
+                   "built": repo / "eng/tests/NativeChatCompletion/bin/Release/net10.0/NativeChatCompletion.dll",
+                   "example": repo / "examples/tensorsharp-native-chat/bin/Release/net10.0/TensorSharp.NativeChat.dll",
+                   "assertions": ["all seven completion-boundary checks", "adapter contracts execute"]})
+    suites.append({"id": "client_http_contract", "kind": "client_http",
+                   "project": "examples/dotnet-local-chat/TensorSharp.LocalChat.csproj",
+                   "built": repo / "examples/dotnet-local-chat/bin/Release/net10.0/TensorSharp.LocalChat.dll",
+                   "assertions": ["mock HTTP integration assertions execute", "zero FAIL records"]})
+    return suites
+
+
+def suite_identity(repo, spec):
+    """Capture the resulting deployment before tests, independently of initial host hashes."""
+    assemblies = [spec["built"]] + ([spec["example"]] if spec["kind"] == "client_native" else [])
+    missing = [str(path) for path in assemblies if not path.is_file()]
+    if missing:
+        raise ValueError("required contract assemblies unavailable before execution: " + ", ".join(missing))
+    project = Path(repo) / spec["project"] if spec.get("project") else None
+    directories = sorted({str(path.parent.resolve()) for path in assemblies})
+    return {"stage": "after permitted managed builds; before assertion execution", "source": source_identity(repo),
+            "project": {"path": str(project), "sha256": file_hash(project)} if project and project.is_file() else None,
+            "assemblies": [{"path": str(path), "size_bytes": path.stat().st_size, "sha256": file_hash(path)} for path in assemblies],
+            "runtime_candidates": runtime_identity({"runtime": _runtime_evidence(directories)}),
+            "limitation": "Deployment hashes describe files before execution; mapped modules are not independently observed"}
+
+
+def trx_counts(path):
+    root = ET.parse(path).getroot()
+    counters = root.find(".//{*}Counters")
+    if counters is None:
+        raise ValueError("TRX contains no test counters")
+    counts = {key: int(counters.attrib.get(key, "0")) for key in ("total", "executed", "passed", "failed", "error", "timeout", "notExecuted", "aborted", "inconclusive", "notRunnable")}
+    if any(v < 0 for v in counts.values()) or counts["executed"] <= 0 or counts["passed"] <= 0 or not counts["total"] >= counts["executed"] >= counts["passed"]:
+        raise ValueError("suite did not execute any passing tests or counters are inconsistent")
+    if counts["failed"] + counts["error"] + counts["timeout"] + counts["aborted"]:
+        raise ValueError("TRX reports failure/error/timeout/aborted tests")
+    if counts["executed"] != counts["passed"] + counts["inconclusive"]:
+        raise ValueError("TRX executed count includes unexplained nonpassing tests")
+    counts["unqualified"] = counts["total"] - counts["passed"]
+    return counts
+
+
+def run_suites(repo, output, mode, allow_builds, timeout_seconds):
+    repo, output = Path(repo), Path(output)
+    results, dotnet = [], shutil.which("dotnet")
+    halt = unsafe_process_state() if mode == "run" else None
+    for spec in list_suites(repo):
+        result = {"id": spec["id"], "scope": spec.get("scope", "client contracts without model execution"),
+                  "assertions": spec["assertions"], "status": "untested", "reason": "planned; suite not executed",
+                  "environment_mode": "model_free_suite",
+                  "build_policy": {"managed_builds_allowed": bool(allow_builds), "native_builds_allowed": False}}
+        if spec.get("excluded_fixtures"):
+            result["excluded_fixtures"] = [{**item, "status": "untested"} for item in spec["excluded_fixtures"]]
+        if halt is not None:
+            result.update(reason=UNSAFE_RESOURCES_REASON, stage="execution_halted")
+            results.append(result)
+            continue
+        if mode != "run":
+            results.append(result)
+            continue
+        if not dotnet:
+            result.update(status="skip", reason=".NET SDK/runtime unavailable")
+            results.append(result)
+            continue
+        target = output / spec["id"]
+        target.mkdir(parents=True, exist_ok=True)
+        commands = []
+        if spec["kind"] == "dotnet":
+            if not allow_builds and not spec["built"].is_file():
+                result.update(status="skip", reason="test assembly not built; build explicitly or use --allow-builds")
+                results.append(result)
+                continue
+            command = [dotnet, "test", str(repo / spec["project"]), "-c", "Release", "--filter", spec["filter"],
+                       "--logger", "trx;LogFileName=tests.trx", "--results-directory", str(target), "--no-build", "--no-restore"]
+            if allow_builds:
+                commands.append([dotnet, "build", str(repo / spec["project"]), "-c", "Release"])
+            commands.append(command)
+        else:
+            if spec["kind"] == "client_native":
+                if allow_builds:
+                    commands.append([dotnet, "build", "eng/tests/NativeChatCompletion", "-c", "Release"])
+                elif not spec["built"].is_file() or not spec["example"].is_file():
+                    result.update(status="skip", reason="native client contract assemblies not built; see documented recipe")
+                    results.append(result)
+                    continue
+                commands.append([dotnet, str(spec["built"]), str(spec["example"])])
+            else:
+                if allow_builds:
+                    commands += [[dotnet, "restore", "examples/dotnet-local-chat", "--locked-mode", "--configfile", "examples/dotnet-local-chat/NuGet.Config"],
+                                 [dotnet, "build", "examples/dotnet-local-chat", "-c", "Release", "--no-restore"]]
+                elif not spec["built"].is_file():
+                    result.update(status="skip", reason="HTTP example assembly not built; see documented recipe")
+                    results.append(result)
+                    continue
+                commands += [[sys.executable, str(repo / "eng/tests/dotnet-local-chat.py")],
+                             [sys.executable, str(repo / "eng/tests/dotnet-local-chat-e2e.py"), "--self-test"]]
+        # Even dotnet test --no-build evaluates MSBuild targets. Always prevent
+        # transitive native build/restore targets from reconfiguring a shared
+        # CUDA/Metal build directory or replacing an existing runtime library.
+        commands = [command + MANAGED_BUILD_PROPERTIES
+                    if len(command) > 1 and command[0] == dotnet and command[1] in {"test", "build", "restore"}
+                    else command for command in commands]
+        result["processes"] = []
+        try:
+            for index, command in enumerate(commands):
+                managed_build = len(command) > 1 and command[0] == dotnet and command[1] in {"build", "restore"}
+                if not managed_build:
+                    if "execution_identity" not in result:
+                        result["execution_identity"] = suite_identity(repo, spec)
+                    if spec["kind"] == "dotnet":
+                        # A build or an earlier attempt must not supply this test's evidence.
+                        (target / "tests.trx").unlink(missing_ok=True)
+                process = run_process(command, cwd=repo, artifact_dir=target, stage=f"step-{index}",
+                                      timeout_seconds=timeout_seconds,
+                                      # Filtered suites own their synthetic permission/storage
+                                      # fixtures; inference-host defaults would change assertions.
+                                      environment_mode="model_free_suite",
+                                      env={"TS_TEST_GGML_BACKEND": "cpu"})
+                result["processes"].append(process)
+                containment = containment_failure_evidence(process)
+                if containment is not None:
+                    halt = containment
+                    result.update(containment_failure=True, containment_evidence=containment)
+                    result["remaining_commands"] = [{"command": pending, "status": "untested", "reason": UNSAFE_RESOURCES_REASON}
+                                                    for pending in commands[index + 1:]]
+                    raise ValueError(UNSAFE_RESOURCES_REASON)
+                if process["exit_code"] != 0 or process.get("timed_out"):
+                    raise ValueError(f"suite process failed or timed out at step {index}; see sanitized logs")
+                if len(command) > 1 and command[0] == dotnet and command[1] == "build":
+                    expected = [spec["built"]] + ([spec["example"]] if spec["kind"] == "client_native" else [])
+                    missing = [str(path) for path in expected if not path.is_file()]
+                    if missing:
+                        raise ValueError("managed build did not produce required contract assemblies: " + ", ".join(missing))
+                is_assertion_command = spec["kind"] != "dotnet" and not (len(command) > 1 and command[0] == dotnet and command[1] in {"build", "restore"})
+                if is_assertion_command:
+                    content = process.get("stdout", "") + process.get("stderr", "")
+                    if "FAIL " in content or not re.search(r"\bPASS\b|\bchecks passed\b", content):
+                        raise ValueError(f"client test step {index} emitted failure or no assertion evidence")
+            if spec["kind"] == "dotnet":
+                counts = trx_counts(target / "tests.trx")
+                result["counts"] = counts
+                if counts["failed"] + counts["error"] + counts["timeout"]:
+                    raise ValueError("TRX reports failed/error/timeout tests")
+                if counts["unqualified"]:
+                    results.append({"id": spec["id"] + "::not-executed", "status": "skip",
+                                    "reason": f"{counts['unqualified']} test(s) unexecuted or inconclusive; see TRX"})
+            else:
+                content = "\n".join(p.get("stdout", "") + p.get("stderr", "") for p in result["processes"])
+                if "FAIL " in content or not re.search(r"\bPASS\b|\bchecks passed\b", content):
+                    raise ValueError("client suite emitted failure or no assertion evidence")
+                if spec["kind"] == "client_native" and "7 completion boundary checks passed" not in content:
+                    raise ValueError("completion boundary checks did not complete")
+            result.update(status="pass", reason="existing suite assertions passed; detailed counts/scope retained")
+        except ProcessContainmentError as error:
+            halt = error.evidence
+            result.update(status="fail", reason=UNSAFE_RESOURCES_REASON,
+                          containment_failure=True, containment_evidence=halt)
+        except (OSError, ValueError, ET.ParseError) as error:
+            result.update(status="fail", reason=str(error))
+        results.append(result)
+    return results
