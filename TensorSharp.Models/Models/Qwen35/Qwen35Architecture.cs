@@ -18,9 +18,18 @@ namespace TensorSharp.Models
             Aliases = new[] { "qwen35", "qwen35moe", "qwen3next" },
             // --backend cuda on a dense NVFP4 checkpoint runs the direct-CUDA engine
             // (TS_Q35_NATIVE=0 keeps the managed path).
-            Factory = c => c.Backend == BackendType.Cuda && c.TpDegree <= 1 && c.TpGroup == null && Qwen35CudaModel.CanServe(c.Probe)
-                ? new Qwen35CudaModel(c.GgufPath, c.DraftModelPath)
-                : new Qwen35Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.DraftModelPath),
+            Factory = c =>
+            {
+                bool native = c.Backend == BackendType.Cuda && c.TpDegree <= 1 && c.TpGroup == null && Qwen35CudaModel.CanServe(c.Probe);
+                if (!native)
+                    Qwen35CudaExecutor.ValidateNinferHeadNativeRoute(false,
+                        System.Environment.GetEnvironmentVariable(Qwen35CudaExecutor.NinferHeadEnvironment),
+                        System.Environment.GetEnvironmentVariable(Qwen35CudaExecutor.W8HeadModuleEnvironment),
+                        System.Environment.GetEnvironmentVariable(Qwen35CudaExecutor.NinferHeadScopeEnvironment));
+                return native
+                    ? new Qwen35CudaModel(c.GgufPath, c.DraftModelPath)
+                    : new Qwen35Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.DraftModelPath);
+            },
             ProjectorFileHints = new[]
             {
                 "Qwen3.5-mmproj-F16.gguf",

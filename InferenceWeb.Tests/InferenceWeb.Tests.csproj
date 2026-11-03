@@ -27,6 +27,7 @@
   </ItemGroup>
   <ItemGroup>
     <Using Include="Xunit" />
+    <EmbeddedResource Include="TestData/Ninfer/qwen38-nvfp4full-target-directory.json" />
     <EmbeddedResource Include="Fixtures/Knowledge/*.pdf" />
     <EmbeddedResource Include="Fixtures/Knowledge/manifest.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/chat_template.jinja" />
@@ -43,6 +44,7 @@
     <EmbeddedResource Include="Fixtures/MiniMaxM3/tokenizer_reference.json" />
     <EmbeddedResource Include="Fixtures/Ltx25/*" />
     <EmbeddedResource Include="Fixtures/Qwen35MRope/reference_positions.json" />
+    <EmbeddedResource Include="Fixtures/Qwen35W8Head/official-nvcc-symbols.json" />
     <EmbeddedResource Include="Fixtures/Glm4Tokenizer/reference.json" />
     <EmbeddedResource Include="Fixtures/DeepSeek41/layout-1017.json" />
     <EmbeddedResource Include="Fixtures/DesktopSurface/create_surface.c" />

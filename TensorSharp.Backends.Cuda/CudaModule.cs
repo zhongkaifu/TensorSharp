@@ -5,7 +5,7 @@ using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
 {
-    internal sealed class CudaModule : IDisposable
+    internal sealed partial class CudaModule : IDisposable
     {
         private readonly Dictionary<string, IntPtr> functions = new Dictionary<string, IntPtr>(StringComparer.Ordinal);
         private IntPtr module;

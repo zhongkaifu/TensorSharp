@@ -1,0 +1,197 @@
+{
+  "schema": "qwen38-exact-official-W8-smallT-header-closure/1",
+  "created_utc": "2026-11-03T08:46:42.637209+00:00",
+  "revision": "e600a7d9e0d5921d767a6cb464373583b3cdcaf4",
+  "repository": "gpillon/ignis",
+  "status": "SOURCE_CLOSURE_COMPLETE_COMPILE_AND_GPU_NOT_RUN",
+  "files": [
+    {
+      "path": "upstream/kernel/vendor/src/ops/linear/w8/w8_small_t_mma.cuh",
+      "bytes": 14902,
+      "sha256": "745358b3c7588f1f01fe8be5ca180e739f576f8af87d0051d8dd0e5aac614e2c",
+      "canonical_git_blob": "a0b3ca94e5eb1ba4b39f0c5bc4aa7aad6cd8acd3",
+      "mode": "0o644",
+      "source_url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/src/ops/linear/w8/w8_small_t_mma.cuh",
+      "role": "kernel_header"
+    },
+    {
+      "path": "upstream/kernel/vendor/src/ops/linear/w8/w8_config.h",
+      "bytes": 11066,
+      "sha256": "86d80d4c11bb6128e150c5dadaf3abf46d0dfcb814f8bdc97e41c6126a226789",
+      "canonical_git_blob": "5532d6d037c7cdc949b6a37ed734a5b0e6ba0970",
+      "mode": "0o644",
+      "source_url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/src/ops/linear/w8/w8_config.h",
+      "role": "kernel_header"
+    },
+    {
+      "path": "upstream/kernel/vendor/src/ops/linear/w8/w8_rowsplit_output.cuh",
+      "bytes": 3606,
+      "sha256": "544f886ff3f975728a523dedb179b298ed14094bf6c809b7aed96dc8e7fa29a4",
+      "canonical_git_blob": "cb7bb807f17b5e63c13e4b04c9fe4d36d5389af6",
+      "mode": "0o644",
+      "source_url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/src/ops/linear/w8/w8_rowsplit_output.cuh",
+      "role": "kernel_header"
+    },
+    {
+      "path": "upstream/kernel/vendor/src/ops/common/mma.cuh",
+      "bytes": 5603,
+      "sha256": "4af04a39c2d1607819d1270ca9b890623e33a372179b00b80a9c8fb1a7f4484c",
+      "canonical_git_blob": "be39ac1478840e01e614271bca16832a921d352c",
+      "mode": "0o644",
+      "source_url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/src/ops/common/mma.cuh",
+      "role": "kernel_header"
+    },
+    {
+      "path": "upstream/kernel/vendor/src/ops/common/memory.cuh",
+      "bytes": 3424,
+      "sha256": "68d4ce555d86761aa4c21d49726be2e48d82fcbdc4f6dbe4fc8b7356f945e205",
+      "canonical_git_blob": "11f6253b060b515e48b504b964f32f065a9ab641",
+      "mode": "0o644",
+      "source_url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/src/ops/common/memory.cuh",
+      "role": "kernel_header"
+    },
+    {
+      "path": "upstream/kernel/vendor/src/core/pdl.cuh",
+      "bytes": 2387,
+      "sha256": "787b6d0fdfc5b25fe29dcb32548de56637e4d5b9b3561b9caaa2544cba4eb57f",
+      "canonical_git_blob": "f442d054f51900047485f858f53cea265c5b8f48",
+      "mode": "0o644",
+      "source_url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/src/core/pdl.cuh",
+      "role": "kernel_header"
+    },
+    {
+      "path": "upstream/LICENSE",
+      "bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "canonical_git_blob": "d645695673349e3947e8e5ae42332d0ac3164cd7",
+      "mode": "0o644",
+      "source_url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/LICENSE",
+      "role": "license_provenance"
+    },
+    {
+      "path": "upstream/NOTICE",
+      "bytes": 8190,
+      "sha256": "e767777fc7bed59df90d3e93645eff6644e735b171a07cca1d70949b2432f43d",
+      "canonical_git_blob": "0baaba19ac8938771289249b1442ca28e4eb96e9",
+      "mode": "0o644",
+      "source_url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/NOTICE",
+      "role": "license_provenance"
+    },
+    {
+      "path": "upstream/kernel/NOTICE",
+      "bytes": 27295,
+      "sha256": "5083ae40d481868f07f805c29831a4f33aa4d191863aadfe644dda273bbb9e92",
+      "canonical_git_blob": "df5b64caabbc09f33ba59274de6f753e43bb8c22",
+      "mode": "0o644",
+      "source_url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/NOTICE",
+      "role": "license_provenance"
+    },
+    {
+      "path": "upstream/kernel/vendor/LICENSE",
+      "bytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "canonical_git_blob": "261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64",
+      "mode": "0o644",
+      "source_url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/LICENSE",
+      "role": "license_provenance"
+    },
+    {
+      "path": "upstream/kernel/vendor/VENDOR.md",
+      "bytes": 35889,
+      "sha256": "4c2e0401c64b06d116236e71f5bc29d7df2b7a6c33f4b61c1946e58d56ddebfe",
+      "canonical_git_blob": "04bb1225e0268475294a0eb860c12fdde836de7c",
+      "mode": "0o644",
+      "source_url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/VENDOR.md",
+      "role": "license_provenance"
+    },
+    {
+      "path": "upstream/kernel/vendor/manifest.json",
+      "bytes": 78083,
+      "sha256": "76ece45e1463204c7344f265a44f22c59c3641ba45a963e8a6934b9ebfca21aa",
+      "canonical_git_blob": "3d76dce5df0140f295b91fb0cc2c813bd8da5819",
+      "mode": "0o644",
+      "source_url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/manifest.json",
+      "role": "license_provenance"
+    }
+  ],
+  "quoted_include_edges": [
+    {
+      "from_path": "kernel/vendor/src/ops/linear/w8/w8_small_t_mma.cuh",
+      "include": "core/pdl.cuh",
+      "resolves_to": "kernel/vendor/src/core/pdl.cuh"
+    },
+    {
+      "from_path": "kernel/vendor/src/ops/linear/w8/w8_small_t_mma.cuh",
+      "include": "ops/common/mma.cuh",
+      "resolves_to": "kernel/vendor/src/ops/common/mma.cuh"
+    },
+    {
+      "from_path": "kernel/vendor/src/ops/linear/w8/w8_small_t_mma.cuh",
+      "include": "ops/common/memory.cuh",
+      "resolves_to": "kernel/vendor/src/ops/common/memory.cuh"
+    },
+    {
+      "from_path": "kernel/vendor/src/ops/linear/w8/w8_small_t_mma.cuh",
+      "include": "ops/linear/w8/w8_config.h",
+      "resolves_to": "kernel/vendor/src/ops/linear/w8/w8_config.h"
+    },
+    {
+      "from_path": "kernel/vendor/src/ops/linear/w8/w8_small_t_mma.cuh",
+      "include": "ops/linear/w8/w8_rowsplit_output.cuh",
+      "resolves_to": "kernel/vendor/src/ops/linear/w8/w8_rowsplit_output.cuh"
+    },
+    {
+      "from_path": "kernel/vendor/src/ops/linear/w8/w8_config.h",
+      "include": "ops/common/memory.cuh",
+      "resolves_to": "kernel/vendor/src/ops/common/memory.cuh"
+    },
+    {
+      "from_path": "kernel/vendor/src/ops/common/mma.cuh",
+      "include": "ops/common/memory.cuh",
+      "resolves_to": "kernel/vendor/src/ops/common/memory.cuh"
+    }
+  ],
+  "all_selected_upstream_files_unchanged": true,
+  "required_system_headers": [
+    "cuda_runtime.h",
+    "cuda_pipeline.h",
+    "cuda_bf16.h",
+    "cuda_fp16.h",
+    "cstdint",
+    "cstddef",
+    "utility",
+    "type_traits"
+  ],
+  "no_Weight_Tensor_or_device_h_required_for_direct_kernel_instantiation": true,
+  "host_wrapper_plan": {
+    "kind": "New TensorSharp-owned CUDA host TU outside untouched upstream headers; instantiate original __global__ template directly and call its function pointer. Do not wrap it in a new __global__ calling a __global__.",
+    "include_root": "upstream/kernel/vendor/src",
+    "include": "ops/linear/w8/w8_small_t_mma.cuh",
+    "geometry": "using G=ninfer::ops::detail::W8VocabularyProjectionGeometry; //248320x5120",
+    "schedule": "using S=typename ninfer::ops::detail::W8LinearSmallTProductionSchedule<G,T>::Type;",
+    "output": "ninfer::ops::detail::W8ContiguousOutput output{out_bf16,248320};",
+    "kernel": "ninfer::ops::detail::w8_small_t_mma_kernel<G,T,S,ninfer::ops::detail::W8ContiguousOutput,ninfer::ops::detail::W8SmallTMmaStoreEpilogue,ninfer::ops::detail::W8SmallTMmaIdentityRows>",
+    "launch": "ninfer::pdl::launch_dependent({dim3(248320/16),dim3(S::kThreads),0,stream}, kernel, x_bf16,codes,scales,output,StoreEpilogue{},IdentityRows{});",
+    "expected_raw_signature": "const __nv_bfloat16*x,const uint8_t*codes,const uint8_t*scales,Output,Epilogue={},RowPolicy={}",
+    "T": "Original header supports head T1..33 via fixed perT production schedule; wrapper compile explicit bounded cases T1/2/4/7/8/14/16/28/32/33.",
+    "source_config": "T<=32 KWarps8/block256, T33 KWarps4/block128; groupK=64*KWarps; tileTokens8/16/24/32/40; minBlocks2; scaleShared iff T>4; do not modify these or force maxregs.",
+    "input_layout": "token-major BF16[T][5120]; original exact s8 weightcodes rowmajor; original half per32group scale plane.",
+    "API_scope": "Direct header instantiation bypasses library Tensor/Weight/dispatch containers only; arithmetic, output epilogue, static resource bounds and PDL consumer calls remain original.",
+    "fullcost": "Use same prepared BF16 cast + official/or owned matmul/combine + BF16 store when comparing within W8. Argmax separated. Matrix-only diagnostic secondary.",
+    "kernel_variable": "auto kernel = &ninfer::ops::detail::w8_small_t_mma_kernel<G,T,S,ninfer::ops::detail::W8ContiguousOutput,ninfer::ops::detail::W8SmallTMmaStoreEpilogue,ninfer::ops::detail::W8SmallTMmaIdentityRows>;"
+  },
+  "acceptance": [
+    "Fresh Linux NVCC compilation required; source/static include closure alone is not a build PASS. CUDA toolkit13.2 expected but actual flags/version/artifacts must be recorded.",
+    "Official-source baseline freshly compiled with identical compiler/math/cache control settings as owned candidate; not a byte-identical or full-runtime reproduction of historical Ignis463.9tok/s.",
+    "Exact code/scale decoder and BF16-input/output contract must be shared by both W8 paths; independent FP64 reference numeric gate, full outputs/guards/AA/mutation and actual resource launchability first.",
+    "Keep previous TSQ6 performance context separate because checkpoint/head encoding and F32 versus BF16 output differ; a W8-basicSIMT win alone does not establish proximity to Ignis.",
+    "Original e600 headers unchanged, ApacheLICENSE+relevant NOTICE/vendor provenance retained; new wrapper is TensorSharp-owned, no ggml mutation."
+  ],
+  "not_run": [
+    "NVCC compilation",
+    "linking with actual installed CUDA runtime",
+    "driver kernel resource inspection",
+    "numeric GPU comparison",
+    "timing or serving/model quality"
+  ]
+}

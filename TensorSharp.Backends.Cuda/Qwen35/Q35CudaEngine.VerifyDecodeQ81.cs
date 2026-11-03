@@ -15,7 +15,7 @@ namespace TensorSharp.Cuda
         public bool VerifyDecodeQ81Enabled => _verifyDecodeQ81;
         // Projection policy changes recurrent/KV state. Derive this from the engine's
         // immutable option, rather than rereading an environment variable at reuse.
-        public string KVStateNamespaceSuffix => _verifyDecodeQ81 ? "|verify-decode=q8_1-v1" : string.Empty;
+        public string KVStateNamespaceSuffix => (_verifyDecodeQ81 ? "|verify-decode=q8_1-v1" : string.Empty) + OutputW8NamespaceSuffix;
         public long ForcedQ81ProjectionCalls { get; private set; }
         public long ForcedQ81ProjectionRows { get; private set; }
         private readonly bool _projectionTrace = Environment.GetEnvironmentVariable("TS_Q35_PROJECTION_TRACE") == "1";
@@ -171,6 +171,7 @@ namespace TensorSharp.Cuda
         {
             int e = _m.NEmbd;
             bool keepOriginalA4 = !plan.AllForced;
+            _servingTrace?.LayerBranch(keepOriginalA4 ? "native_mixed_W4A4_plus_Q81_overwrite" : "native_forced_Q81_chunks_le8");
             IntPtr pending = IntPtr.Zero;
             for (int il = 0; il < _m.NLayer; il++)
             {

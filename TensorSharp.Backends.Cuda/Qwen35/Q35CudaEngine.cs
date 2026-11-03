@@ -62,6 +62,8 @@ namespace TensorSharp.Cuda
             public float RopeBase, Eps;
             public int NCtx, NUbatch;
             public CudaWeightDesc TokEmbd, Output;
+            /// <summary>Explicit experimental companion output head; null retains the original Q6 path.</summary>
+            public CudaW8HeadWeightDesc OutputW8;
             public float[] OutputNorm;
             public LayerDesc[] Layers;
         }
@@ -233,6 +235,7 @@ namespace TensorSharp.Cuda
         public Q35CudaEngine(ModelDesc m)
         {
             _m = m ?? throw new ArgumentNullException(nameof(m));
+            _outputW8 = m.OutputW8;
             if (m.HeadDim != Q35Kernels.AttnHeadDim)
                 throw new NotSupportedException($"[q35-cuda] attention head_dim {m.HeadDim} (the kernels take {Q35Kernels.AttnHeadDim})");
             if (m.NKvHead <= 0 || m.NHead % m.NKvHead != 0 || m.NHead / m.NKvHead > Q35Kernels.AttnBlockRows)
@@ -242,31 +245,51 @@ namespace TensorSharp.Cuda
             if (m.SectT + m.SectH + m.SectW > Q35Kernels.RopeDims / 2)
                 throw new NotSupportedException("[q35-cuda] M-RoPE sections exceed the rotated width");
 
-            ValidateVerifyDecodeQ81Graphs(_verifyDecodeQ81 || _projectionTrace, _verifyGraphsEnabled, _draftGraphsEnabled);
-            CudaBackend.Register();
-            CudaDriverApi.cuInit(0);
-            _alloc = new CudaAllocator(0);
-            MakeCurrent();
-            _k = Q35Kernels.Create();
-            CudaDriverApi.cuDeviceGetAttribute(out _sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, 0).ThrowOnError();
-
-            var sw = Stopwatch.StartNew();
-            _layers = new Layer[m.NLayer];
-            using (var loader = new Loader(this))
+            _servingTrace = ServingTraceLog.FromEnvironment();
+            try
             {
-                for (int il = 0; il < m.NLayer; il++)
+                ValidateVerifyDecodeQ81Graphs(_verifyDecodeQ81 || _projectionTrace, _verifyGraphsEnabled, _draftGraphsEnabled);
+                ValidateOutputW8Model(m, _outputW8, _verifyGraphsEnabled, _draftGraphsEnabled);
+                CudaBackend.Register();
+                CudaDriverApi.cuInit(0);
+                _alloc = new CudaAllocator(0);
+                MakeCurrent();
+                _k = Q35Kernels.Create();
+                CudaDriverApi.cuDeviceGetAttribute(out _sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, 0).ThrowOnError();
+
+                InitializeOutputW8Module();
+                var sw = Stopwatch.StartNew();
+                _layers = new Layer[m.NLayer];
+                using (var loader = new Loader(this))
                 {
-                    _layers[il] = LoadLayer(loader, m.Layers[il]);
-                    _layers[il].Ordinal = _layers[il].Recurrent ? _nGdn++ : _nAttn++;
+                    for (int il = 0; il < m.NLayer; il++)
+                    {
+                        _layers[il] = LoadLayer(loader, m.Layers[il]);
+                        _layers[il].Ordinal = _layers[il].Recurrent ? _nGdn++ : _nAttn++;
+                    }
+                    _tokEmbd = loader.Raw(m.TokEmbd, TQ4_0, out _tokEmbdRowBytes);
+                    if (!OutputW8TargetEnabled)
+                        _output = loader.Raw(m.Output, TQ6_K, out _outputRowBytes);
+                    if (_outputW8 != null)
+                        _outputW8Weights = loader.W8(_outputW8, out _outputW8PayloadSha);
                 }
-                _tokEmbd = loader.Raw(m.TokEmbd, TQ4_0, out _tokEmbdRowBytes);
-                _output = loader.Raw(m.Output, TQ6_K, out _outputRowBytes);
+                _outputNorm = UploadF32(m.OutputNorm);
+                AllocateScratch();
+                AllocateOutputW8Scratch();
+                SetFeatureTaps(null);
+                _active = CreateSlot(InitialSlotTokens);
+                Console.Error.WriteLine($"[q35-cuda] weights loaded in {sw.Elapsed.TotalSeconds:F1}s, {_sms} SMs, n_ctx={m.NCtx}, ubatch={m.NUbatch}");
             }
-            _outputNorm = UploadF32(m.OutputNorm);
-            AllocateScratch();
-            SetFeatureTaps(null);
-            _active = CreateSlot(InitialSlotTokens);
-            Console.Error.WriteLine($"[q35-cuda] weights loaded in {sw.Elapsed.TotalSeconds:F1}s, {_sms} SMs, n_ctx={m.NCtx}, ubatch={m.NUbatch}");
+            catch
+            {
+                if (_outputW8 != null && _alloc != null)
+                {
+                    try { Dispose(); }
+                    catch (Exception cleanup) { Console.Error.WriteLine("[q35-cuda] companion construction cleanup failed: " + cleanup.Message); }
+                }
+                _servingTrace?.Close("constructor_failed");
+                throw;
+            }
         }
 
         private IntPtr Stream => _alloc.Stream.Handle;
@@ -368,6 +391,25 @@ namespace TensorSharp.Cuda
                     row += w.Ne1;
                 }
                 return p;
+            }
+
+            public IntPtr W8(CudaW8HeadWeightDesc head, out string payloadSha)
+            {
+                IntPtr dst = _e.Alloc(head.Bytes);
+                using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+                for (long off = 0; off < head.Bytes; off += StagingBytes)
+                {
+                    int bytes = checked((int)Math.Min(StagingBytes, head.Bytes - off));
+                    head.Source.Read(checked(head.SourceOffset + off), _host, bytes);
+                    var data = new ReadOnlySpan<byte>((void*)_host, bytes);
+                    ValidateOutputW8Scales(data, off);
+                    hash.AppendData(data);
+                    CudaDriverApi.cuMemcpyHtoD(dst + (nint)off, _host, new UIntPtr((uint)bytes)).ThrowOnError();
+                }
+                payloadSha = Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+                if (head.ExpectedPayloadSha256 != null && head.ExpectedPayloadSha256 != payloadSha)
+                    throw new InvalidOperationException("The loaded W8 output-head payload SHA differs from its explicit expected identity.");
+                return dst;
             }
 
             public IntPtr Raw(in CudaWeightDesc w, int type, out long rowBytes)
@@ -715,6 +757,7 @@ namespace TensorSharp.Cuda
             if (_d != null)
                 DraftInjectKept(slots, window, kept, before);
             Sync();
+            _servingTrace?.CommitCompleted(slots, window, kept, before);
         }
 
         private void Upload(IntPtr dst, int* src, int count)
@@ -740,7 +783,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>rowsPerSeq rows of each of Slots (Tokens[Start ..], sequence-major); verify as in
         /// <see cref="RunRows"/>. Counts: the real rows of each sequence (padding beyond).</summary>
-        private readonly struct RowGroup
+        internal readonly struct RowGroup
         {
             public readonly Slot[] Slots;
             public readonly int RowsPerSeq, Start, RopeTotal;
@@ -767,7 +810,7 @@ namespace TensorSharp.Cuda
         /// <summary>Groups of rows through the layers in one forward, each group's rows after the
         /// previous group's: the projections and the FFN run over every row, attention and the
         /// recurrence per group over its own sequences. Rows from tapFirst on feed the drafter.</summary>
-        private void RunGroups(int tapFirst, params RowGroup[] groups)
+        private void RunGroupsCore(int tapFirst, RowGroup[] groups)
         {
             int e = _m.NEmbd, nt = RowCap, n = 0, nSeq = 0;
             foreach (var g in groups)
@@ -858,6 +901,7 @@ namespace TensorSharp.Cuda
         {
             if (TryRunVerifyDecodeQ81(n, tapFirst, groups, maxKeys))
                 return;
+            _servingTrace?.LayerBranch(n <= Q35Kernels.GemvMaxRows ? "native_default_W4A8_Q81" : "native_default_W4A4");
             int e = _m.NEmbd;
             IntPtr pending = IntPtr.Zero;   // the previous block's output, added before the next norm
             for (int il = 0; il < _m.NLayer; il++)
@@ -992,8 +1036,13 @@ namespace TensorSharp.Cuda
         private void Head(IntPtr normed, int rows, float[] logitsOut, int[] argmaxOut)
         {
             int e = _m.NEmbd;
-            _k.QuantizeQ81(normed, _q8, _q8d, e, rows, Stream);
-            _k.GemvQ6k(_output, _outputRowBytes, _m.NVocab, e, _q8, _q8d, _logits, rows, Stream);
+            if (!OutputW8TargetEnabled)
+            {
+                _k.QuantizeQ81(normed, _q8, _q8d, e, rows, Stream);
+                _k.GemvQ6k(_output, _outputRowBytes, _m.NVocab, e, _q8, _q8d, _logits, rows, Stream);
+            }
+            else
+                OutputW8Head(normed, rows, _logits, checked((long)MaxVerifyRows * _m.NVocab * 4));
             if (argmaxOut != null)
                 _k.Argmax(_logits, rows, _m.NVocab, _argmax, Stream);
             Sync();
@@ -1003,6 +1052,7 @@ namespace TensorSharp.Cuda
             if (argmaxOut != null)
                 fixed (int* dst = argmaxOut)
                     CudaDriverApi.cuMemcpyDtoH((IntPtr)dst, _argmax, new UIntPtr((ulong)rows * 4)).ThrowOnError();
+            _servingTrace?.HeadCompleted(rows, _m.NVocab, logitsOut != null, argmaxOut != null);
         }
 
         /// <summary>output[n, w.Rows] = input[n, w.K] W^T: the q8_1 GEMV for up to 8 rows, the FP4
@@ -1067,22 +1117,31 @@ namespace TensorSharp.Cuda
 
         public void Dispose()
         {
-            MakeCurrent();
-            Sync();
-            FreeDraftGraphs();
-            FreeVerifyGraphs();
-            FreeSlot(_active);
-            ReleaseFreeBlocks();
-            ReleaseFreeArenas();
-            FreeHostPool();
-            foreach (IntPtr p in _owned)
-                CudaDriverApi.cuMemFree(p);
-            _owned.Clear();
-            if (_pinned != IntPtr.Zero)
-                CudaDriverApi.cuMemFreeHost(_pinned);
-            _pinned = IntPtr.Zero;
-            _k?.Dispose();
-            _alloc?.Dispose();
+            try
+            {
+                MakeCurrent();
+                Sync();
+                FreeDraftGraphs();
+                FreeVerifyGraphs();
+                FreeSlot(_active);
+                ReleaseFreeBlocks();
+                ReleaseFreeArenas();
+                FreeHostPool();
+                foreach (IntPtr p in _owned)
+                    CudaDriverApi.cuMemFree(p);
+                _owned.Clear();
+                if (_pinned != IntPtr.Zero)
+                    CudaDriverApi.cuMemFreeHost(_pinned);
+                _pinned = IntPtr.Zero;
+                _outputW8Module?.Dispose();
+                _outputW8Module = null;
+                _k?.Dispose();
+                _alloc?.Dispose();
+            }
+            finally
+            {
+                _servingTrace?.Close("engine_dispose_finally");
+            }
         }
     }
 }

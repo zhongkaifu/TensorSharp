@@ -483,8 +483,15 @@ namespace TensorSharp.Cuda
             _k.AddRmsNorm(_dX, pending, _dOutNorm, _dH, rows, e, _d.Eps, Stream);
             // The proposal rows (each block's rows 1 .. b-1) through the target's LM head and the selector.
             _k.DfGather(_dH, e, b, 1, g, lanes, _dH2, Stream);
+            // Both head policies leave these Q81 inputs live for the selector's
+            // immediately following DMatMul(_dSelHidden), which consumes _dQ8/_dQ8d.
             DQuant(_dH2, e, lanes * g);
-            _k.GemmQuant(TQ6_K, _output, _outputRowBytes, _m.NVocab, e, _dQ8, _dQ8d, lanes * g, _dLogits, false, Stream);
+            if (_outputW8 == null)
+            {
+                _k.GemmQuant(TQ6_K, _output, _outputRowBytes, _m.NVocab, e, _dQ8, _dQ8d, lanes * g, _dLogits, false, Stream);
+            }
+            else
+                OutputW8Head(_dH2, lanes * g, _dLogits, checked((long)MaxSeqs * Gamma * _m.NVocab * 4));
             _k.TopK(_dLogits, lanes * g, _m.NVocab, _d.SelTopK, _dCand, _dUnary, Stream, _dTopPartialIdx, _dTopPartialVal);
             DMatMul(_dSelHidden, _dSel, lanes * g);
             _k.DfSelect(_dCand, _dUnary, _dSel, _dSelPred.W, _dSelSucc.W, _dSelPred.RowBytes, anchorDev, lanes, g, _d.SelTopK,

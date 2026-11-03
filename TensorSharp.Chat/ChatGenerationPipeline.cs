@@ -309,6 +309,18 @@ namespace TensorSharp.Server
             _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
         }
 
+        // Optional trace I/O must not turn a successful model request into a failed request.
+        // Missing mapping records are unavailable evidence, never an inferred HTTP/slot join.
+        internal static void LogServingTraceRequestMapping(ILogger logger, string engineSequenceId)
+        {
+            try
+            {
+                logger.LogInformation("q35.serving.request engine_sequence_id={EngineSequenceId}",
+                    engineSequenceId.Length <= 128 ? engineSequenceId : engineSequenceId[..128]);
+            }
+            catch (Exception) { }
+        }
+
         public async IAsyncEnumerable<string> ChatStreamAsync(
             ChatSession session,
             List<ChatMessage> history,
@@ -434,6 +446,10 @@ namespace TensorSharp.Server
             // the engine's per-sequence Forward path never queues from a
             // shared bucket).
             string requestId = $"chat-{Guid.NewGuid():N}";
+            // Keep the HTTP RequestId scope key intact: this separately named field joins it
+            // to native slot/forward metadata without adding anything to the HTTP response.
+            if (model is TensorSharp.Models.Qwen35CudaModel { ServingTraceEnabled: true })
+                LogServingTraceRequestMapping(_logger, requestId);
             bool injectorBucketCreated = false;
             try
             {

@@ -143,6 +143,9 @@ namespace TensorSharp.Models
             $"qwen35|exec=cuda|L={Config.NumLayers}|H={Config.HiddenSize}|V={Config.VocabSize}|ctx={_maxContextLength}" +
             (_exec?.Engine?.KVStateNamespaceSuffix ?? string.Empty);
 
+        /// <summary>Host metadata diagnostics only, immutable at native engine construction.</summary>
+        public bool ServingTraceEnabled => _exec?.Engine?.ServingTraceEnabled == true;
+
         protected override float[] ForwardCore(int[] tokens)
         {
             lock (_sync)
@@ -164,6 +167,7 @@ namespace TensorSharp.Models
             _pendingVision.Clear();
             try
             {
+                _exec.Engine.TraceBindSequence(_activeSlotKey, _exec.Engine.Active);
                 _exec.Engine.Forward(tokens, logitsOut, ropePos, spans);
             }
             finally
@@ -388,6 +392,7 @@ namespace TensorSharp.Models
                 if (!_exec.SetActiveSlot(slot))
                     throw new InvalidOperationException($"qwen35 slot {slot} missing for request {requestId}.");
                 _activeSlotKey = requestId;
+                _exec.Engine.TraceBindSequence(requestId, _exec.Engine.Active);
                 _cacheSeqLen = _exec.NPast;
                 return fresh;
             }
@@ -401,6 +406,7 @@ namespace TensorSharp.Models
                 _slotByRequest ??= new Dictionary<string, int>(StringComparer.Ordinal);
                 if (_activeSlotKey != null || _slotByRequest.ContainsKey(requestId)) return;
                 _slotByRequest[requestId] = _primarySlot;
+                _exec.Engine.TraceBindSequence(requestId, _exec.Slot(_primarySlot));
                 _activeSlotKey = requestId;
                 _primarySlot = -1;
             }
@@ -712,6 +718,7 @@ namespace TensorSharp.Models
                 if (!_exec.SetActiveSlot(_primarySlot))
                     throw new InvalidOperationException($"qwen35 primary slot {_primarySlot} missing.");
                 _activeSlotKey = null;
+                _exec.Engine.TraceBindSequence(null, _exec.Engine.Active);
                 _cacheSeqLen = _exec.NPast;
             }
         }
@@ -729,6 +736,9 @@ namespace TensorSharp.Models
                         return false;
                 int vocab = Config.VocabSize;
                 var flat = new float[n * vocab];
+                if (_exec.Engine.ServingTraceEnabled)
+                    for (int i = 0; i < n; i++)
+                        _exec.Engine.TraceBindSequence(requestIds[i], _exec.Slot(slots[i]));
                 if (!_exec.ForwardBatchedDecode(slots, tokens, positions, flat)) return false;
                 for (int i = 0; i < n; i++)
                 {
@@ -777,6 +787,9 @@ namespace TensorSharp.Models
                     if (slots[i] == null || slots[i].NPast != positions[i])
                         return Undo(fresh);
                 }
+                if (_exec.Engine.ServingTraceEnabled)
+                    for (int i = 0; i < n; i++)
+                        _exec.Engine.TraceBindSequence(requestIds[i], slots[i]);
                 _exec.Engine.PrefillBatch(slots, tokens.ToArray(), outLogits);
                 _cacheSeqLen = _exec.NPast;
                 return true;
@@ -827,6 +840,7 @@ namespace TensorSharp.Models
                 slots[i] = _exec.Slot(id);
                 if (slots[i] == null || (positions != null && slots[i].NPast != positions[i]))
                     return null;
+                _exec.Engine.TraceBindSequence(requestIds[i], slots[i]);
             }
             return slots;
         }

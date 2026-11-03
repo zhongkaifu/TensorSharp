@@ -14,7 +14,7 @@ namespace TensorSharp.Models
     /// GGUF's hyper-parameters and hands the engine its weights as shard offsets its loader streams
     /// into VRAM (NVFP4 projections repacked on the way).
     /// </summary>
-    public sealed class Qwen35CudaExecutor : IDisposable
+    public sealed partial class Qwen35CudaExecutor : IDisposable
     {
         private const string Tag = "q35-cuda";
         private const string A = "qwen35";
@@ -47,7 +47,7 @@ namespace TensorSharp.Models
                 if (arch != A)
                     throw new NotSupportedException($"[{Tag}] the direct-CUDA qwen35 engine runs {A}, not '{arch}'.");
                 _gguf.BeginStreaming();
-                _engine = new Q35CudaEngine(BuildModelDesc(maxContext, nUbatch));
+                _engine = CreateEngineWithCompanionHead(maxContext, nUbatch);
                 _gguf.EndLoad();
                 if (!string.IsNullOrWhiteSpace(draftGgufPath))
                     AttachDrafter(draftGgufPath);
