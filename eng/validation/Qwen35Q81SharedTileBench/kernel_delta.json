@@ -1,0 +1,26 @@
+{
+  "original_template_sha256": "e1cdd124f506ec0d8d4d94677ffaaf3908029e473fe44cfd757fc336a3712c89",
+  "candidate_template_sha256": "3666083af3c503bb9c3bd90e479d1431c28c54ae78832cf4b43281bb23085553",
+  "deltas": [
+    {
+      "before": "void ts_q35_gemv_nvfp4(",
+      "after": "void ts_bench_q81_shared_tile("
+    },
+    {
+      "before": "    if (r0 >= outDim)\n        return;",
+      "after": "    static_assert(N == 8 && R == 4, \"one bounded N8/R4 shared-tile candidate\");\n    const bool warpLive = r0 < outDim;\n    const int warp = threadIdx.x >> 5;\n    // int4 storage guarantees 16-byte alignment. Fifth int4 pads each block.\n    __shared__ int4 tileQ[N][32 * 5];\n    __shared__ float tileD[N][2][32];"
+    },
+    {
+      "before": "    for (int b = lane; b < nblocks; b += 32)\n    {",
+      "after": "    for (int base = 0; base < nblocks; base += 32)\n    {\n        const int b = base + lane;\n        // Four warps cooperatively load each 64-byte Q81 block exactly once.\n#pragma unroll\n        for (int n = 0; n < N; ++n)\n        {\n            tileQ[n][lane * 5 + warp] = b < nblocks\n                ? *(const int4*)(xq + (long long)n * k + b * 64 + warp * 16)\n                : make_int4(0, 0, 0, 0);\n            if (warp < 2)\n                tileD[n][warp][lane] = b < nblocks\n                    ? xd[(long long)n * scalesPerRow + b * 2 + warp] : 0.0f;\n        }\n        __syncthreads();\n        // Inactive row warps still stage and cross both CTA barriers.\n        if (warpLive && b < nblocks)\n        {"
+    },
+    {
+      "before": "                const int4 a = *(const int4*)(xq + (long long)n * k + kk);\n                const float xs = xd[(long long)n * scalesPerRow + sb];",
+      "after": "                const int4 a = tileQ[n][lane * 5 + s];\n                const float xs = tileD[n][s >> 1][lane];"
+    },
+    {
+      "before": "    }\n#pragma unroll\n    for (int n = 0; n < N; ++n)\n#pragma unroll\n        for (int j = 0; j < R; ++j)\n        {\n            const float v = ts_q35_warp_sum(acc[n][j]);",
+      "after": "        }\n        __syncthreads(); // Complete all consumers before reusing this shared tile.\n    }\n#pragma unroll\n    for (int n = 0; n < N; ++n)\n#pragma unroll\n        for (int j = 0; j < R; ++j)\n        {\n            const float v = ts_q35_warp_sum(acc[n][j]);"
+    }
+  ]
+}

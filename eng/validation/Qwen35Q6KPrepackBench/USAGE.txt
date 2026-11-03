@@ -1,0 +1,91 @@
+Q6_K exact integer predecode (private validation, production unchanged)
+
+Explicit r3 alternative: --aligned-blocks on BOTH build.py and run.py.
+Mutually exclusive with --byte-planes. Each original ql128/qh64/sc16/d2 block
+stays in place; only two trailing zero bytes are added: 210 -> 212 bytes/block.
+The candidate retains the full original decoder and changes only block stride
+and paired uint16 loads to aligned uint32 loads. The candidate rowBytes argument
+is blocksPerRow*212; oracle always receives blocksPerRow*210.
+GPU pack writes all 210 original bytes and BOTH zero-padding bytes. CPU checks
+invert the format, verify every original byte/padding, and reject corrupt padding.
+This mode uses the same 166 strict/10 timed matrix as byte planes, with all original
+91 cases retained. At248320x5120, packed=1,052,876,800 B, net=9,932,800 B
+=9.47265625 MiB; conversion/micro raw+packed=2,095,820,800 B before other buffers.
+
+python3 eng/validation/Qwen35Q6KPrepackBench/build.py --out artifacts/q6-aligned --aligned-blocks --generate-only
+python3 eng/validation/Qwen35Q6KPrepackBench/build.py --out artifacts/q6-aligned-gpu --aligned-blocks --nvcc /usr/local/cuda-13.2/bin/nvcc
+python3 eng/validation/Qwen35Q6KPrepackBench/run.py --build artifacts/q6-aligned-gpu --name strict --aligned-blocks --execute
+python3 eng/validation/Qwen35Q6KPrepackBench/run.py --build artifacts/q6-aligned-gpu --name warm --aligned-blocks --bench --rounds 10 --execute
+python3 eng/validation/Qwen35Q6KPrepackBench/run.py --build artifacts/q6-aligned-gpu --name sweep --aligned-blocks --bench --rounds 10 --cache-sweep --execute
+
+Explicit r2 alternative: pass --byte-planes to BOTH build.py and run.py.
+This keeps ql[128], qh[64], signed scales[16], and raw half d[2] in four planes
+per logical Q6 block, exactly 210 B/256 weights. The pack kernel only copies bytes.
+Original Q6 decode is retained; ql/qh loads become aligned uint32 loads instead of
+two uint16 loads. Neither signed codes nor scales are recomputed or rounded.
+Default WITHOUT this option remains the int8-expanded path and all original
+91 strict cases/7 timed shapes. The byte-plane path includes that entire matrix
+plus small N=7/14/28/9/17/33, and real-vocabulary N=7/14/28: 166 strict cases,
+10 timed shapes, 100 ABBA rows/400 eviction-controlled halves at ten rounds.
+Its full-size packed allocation is 1,042,944,000 B (zero replacement NET increase);
+the micro/conversion still keeps raw+packed = 2,085,888,000 B before other buffers.
+
+python3 eng/validation/Qwen35Q6KPrepackBench/build.py --out artifacts/q6-bytes --byte-planes --generate-only
+python3 eng/validation/Qwen35Q6KPrepackBench/build.py --out artifacts/q6-bytes-gpu --byte-planes --nvcc /usr/local/cuda-13.2/bin/nvcc
+python3 eng/validation/Qwen35Q6KPrepackBench/run.py --build artifacts/q6-bytes-gpu --name strict --byte-planes --execute
+python3 eng/validation/Qwen35Q6KPrepackBench/run.py --build artifacts/q6-bytes-gpu --name warm --byte-planes --bench --rounds 10 --execute
+python3 eng/validation/Qwen35Q6KPrepackBench/run.py --build artifacts/q6-bytes-gpu --name sweep --byte-planes --bench --rounds 10 --cache-sweep --execute
+
+Everything below about the 274-byte format and 303.125 MiB net increase describes
+the original default int8-expanded path, not the zero-growth byte-plane path.
+
+Baseline: unchanged Q6_K and Q8_1 quantizer source extracted from production
+28ede746...fc40b0, freshly recompiled together with the private candidate.
+This is NOT the actual BBD module, a full-model quality gate, or a production change.
+No weight values are re-quantized. Q6 codes become signed int8 [-32,31]; the original
+16 signed scales and raw half d per 256 weights remain byte-identical. K traversal,
+GEMV dp4a/warp reduction and GEMM integer MMA/F32 scaling order are unchanged.
+
+The real model log records Hidden=5120, Vocab=248320:
+docs/validation/qwen38-regression/vm2-ts-formal-r2/
+vm2-ts-formal-r2-main-dfl-short-ub4096/measurements/logs/
+tensorsharp-dflash2-vm2-ts-formal-r2-main-dfl-short-ub4096.log:29
+Original head: 1,042,944,000 B; packed: 1,360,793,600 B.
+Replacement NET increment: 317,849,600 B = 303.125 MiB. This micro keeps BOTH
+allocations (2,403,737,600 B before guards, activations and outputs). A conversion
+needs the full new 1,360,793,600 B allocation while the old head remains alive;
+production peak/250K fit has NOT been validated. Load events report the two poison
+passes separately; load_once_gpu_ms is the SECOND prepack kernel event only,
+excluding file IO, copies, allocation, CPU checks and full model initialization.
+
+python3 -m unittest discover -s eng/validation/Qwen35Q6KPrepackBench -p test_build.py -v
+python3 eng/validation/Qwen35Q6KPrepackBench/build.py --out artifacts/q6-local --generate-only
+
+ROOT/GPU owner only, CUDA 13, fresh outputs (no automatic SSH or GPU invocation):
+python3 eng/validation/Qwen35Q6KPrepackBench/build.py --out artifacts/q6-gpu --nvcc /usr/local/cuda-13.2/bin/nvcc
+python3 eng/validation/Qwen35Q6KPrepackBench/run.py --build artifacts/q6-gpu --name strict --execute
+python3 eng/validation/Qwen35Q6KPrepackBench/run.py --build artifacts/q6-gpu --name warm --bench --rounds 10 --execute
+python3 eng/validation/Qwen35Q6KPrepackBench/run.py --build artifacts/q6-gpu --name sweep --bench --rounds 10 --cache-sweep --execute
+
+Both timing runs first execute all 91 strict fixtures (84 small/tail/scale-boundary,
+7 complete real-vocabulary N=1/2/4/8/16/32/64), then independently re-gate each
+timed fixture. Full output F32 bits, dual-poison A/A, all guards, packed bytes against
+an independent CPU decoder and original Q8_1 payloads must agree exactly.
+Includes Inf/NaN/negative-zero scale bit patterns; no NaN/ULP tolerance relaxation.
+Successful full output arrays are compared in producer memory, not saved; on a
+failure complete oracle/candidate outputs and first differing bits are persisted.
+
+10 ABBA rounds per N, every half fully checked, event interval includes original
+Q8_1 activation quantization and matmul (and zero if optional split>1). Prepacking
+is once per fixture and separately reported; no per-inference prepacking hidden.
+Current production LM head has one K split (3880 row tiles on the measured 170SM
+device); strict and timings use one. Optional --atomic-aa records split2 A/A only,
+is a nonproduction diagnostic and NEVER establishes cross-path equivalence.
+
+Warm default repeats three complete projections. --cache-sweep forces one per half;
+before each event a >=2x actual driver-L2 buffer is read with volatile ld.global.cg,
+checksummed, and synchronized. It evicts all data including packed inputs, is NOT
+weights-only, and does NOT guarantee physical cold cache. Actual driver resources
+and natural no-stack/no-spill launchability are mandatory, not speedup evidence.
+GPU/full-model/actual-BBD/serving quality/performance remain NOT_RUN until executed.
+No ggml changes; no automatic adoption on microbenchmark success.
