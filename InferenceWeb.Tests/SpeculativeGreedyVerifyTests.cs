@@ -3,6 +3,13 @@
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Grammar;
 using TensorSharp.Runtime.Scheduling;
+using System.Collections;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using Microsoft.Extensions.Logging.Abstractions;
+using TensorSharp;
+using TensorSharp.Cpu;
+using TensorSharp.Models.Architecture;
 
 namespace InferenceWeb.Tests;
 
@@ -189,6 +196,140 @@ public partial class SpeculativeExecutionTests
         Assert.False(BatchExecutor.CanUseGreedySpecVerify(seq, false));
         seq.AppendOutputToken(2);
         Assert.True(BatchExecutor.CanUseGreedySpecVerify(seq, false));
+    }
+
+    [Fact]
+    public void GreedyVerify_TextRequestStillUsesExplicitTokenOnlyHook()
+    {
+        var model = new FakeSpeculativeModel { EnableGreedyVerify = true };
+        var seq = RunEngineRequest(model, 10, 32, true);
+        Assert.Empty(seq.MediaSpans);
+        Assert.True(BatchExecutor.CanUseGreedySpecVerify(seq, false));
+        Assert.True(model.GreedyVerifyCalls > 0);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Theory]
+    [InlineData("image", false)]
+    [InlineData("image", true)]
+    [InlineData("video", false)]
+    [InlineData("video", true)]
+    [InlineData("audio", false)]
+    [InlineData("audio", true)]
+    public void GreedyVerify_PreparedCurrentOrHistoricalMediaRetainsFullLogits(string kind, bool historical)
+    {
+        // Use the real injector/request bucket/ToMediaSpan/SequenceState handoff.
+        // Tiny CPU embeddings stand in at the encoder-result seam already used by
+        // MultimodalPreparationIsolationTests; this is not a pixel/audio encoder test.
+        using var rows = new Tensor(new CpuAllocator(BlasEnum.DotNet), DType.Float32, 2, 1);
+        rows.SetElementsAsFloat(new[] { 11f, 12f });
+        var preparedModel = (GreedyMediaProbeModel)RuntimeHelpers.GetUninitializedObject(typeof(GreedyMediaProbeModel));
+        preparedModel.Rows = rows;
+        using var injector = new ModelMultimodalInjector(preparedModel);
+        var attachment = new ChatMessage { Role = "user", Content = "describe the attachment" };
+        if (kind == "audio") attachment.AudioPaths = new List<string> { "fixture.wav" };
+        else attachment.ImagePaths = kind == "video"
+            ? new List<string> { "fixture-frame-0.png", "fixture-frame-1.png" }
+            : new List<string> { "fixture.png" };
+        var history = new List<ChatMessage> { attachment };
+        if (historical)
+        {
+            history.Add(new ChatMessage { Role = "assistant", Content = "I have read the attachment." });
+            history.Add(new ChatMessage { Role = "user", Content = "Now answer about the earlier attachment." });
+            Assert.Null(history[^1].ImagePaths);
+            Assert.Null(history[^1].AudioPaths);
+        }
+        string requestId = "media-greedy-" + kind;
+        var prompt = injector.ProcessPromptTokens(history, Enumerable.Range(1, 10).ToList(), requestId);
+        var spans = injector.GetPreparedMediaSpans(requestId);
+        Assert.Equal(kind == "video" ? 2 : 1, spans.Count);
+        Assert.All(spans, span => Assert.StartsWith("greedy-media-fixture:", span.ContentId));
+        var seq = new SequenceState(requestId, prompt, 32, BlockSize, SamplingConfig.Greedy, mediaSpans: spans);
+
+        // Deliver the prompt embeddings. A decode slice beyond the prompt queues
+        // nothing, but the complete request still carries its historical media.
+        Assert.True(injector.QueuePromptEmbeddingsForSlice(0, prompt.Count, requestId));
+        Assert.Equal(spans.Count, preparedModel.Delivered);
+        Assert.False(injector.QueuePromptEmbeddingsForSlice(prompt.Count, 1, requestId));
+        Assert.Equal(spans, seq.MediaSpans);
+        var expectedSpans = spans.ToArray();
+        Assert.IsType<List<PromptMediaSpan>>(spans).Clear();
+        injector.ClearPreparedPromptState(requestId);
+        Assert.Empty(injector.GetPreparedMediaSpans(requestId));
+        Assert.Equal(expectedSpans, seq.MediaSpans); // Constructor takes a snapshot.
+
+        var baseline = new FakeSpeculativeModel();
+        var expected = RunEngineRequest(baseline, prompt.Count, 32, true);
+        // Throw if the new hook is entered at ANY decode step, including after
+        // prefill and with no pending embedding queue. This drives BatchExecutor,
+        // not a mirrored eligibility predicate.
+        var candidate = new FakeSpeculativeModel { EnableGreedyVerify = true, ThrowGreedyVerify = true };
+        RunGreedyMediaRequest(candidate, seq);
+        Assert.True(seq.NumComputedTokens >= prompt.Count);
+        Assert.False(BatchExecutor.CanUseGreedySpecVerify(seq, false));
+        Assert.Equal(0, candidate.GreedyVerifyCalls);
+        Assert.True(candidate.FullVerifyCalls > 0);
+        Assert.Equal(expected.OutputTokens, seq.OutputTokens);
+        Assert.Equal(expected.Status, seq.Status);
+        Assert.Equal(expected.FinishReason, seq.FinishReason);
+        Assert.Equal(expectedSpans, seq.MediaSpans);
+        Assert.Empty(candidate.ProtocolViolations);
+    }
+
+    private static void RunGreedyMediaRequest(FakeSpeculativeModel model, SequenceState seq)
+    {
+        var config = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 256, MaxNumRunningSequences = 4, MaxPrefillChunkSize = 64,
+            SoloPrefillChunkSize = 8192, NumBlocks = 32, BlockSize = BlockSize,
+            EnablePrefixCaching = false, DecodeQuantumTokens = 1,
+            Speculation = new SpeculationOptions { Enabled = true, MaxDraftTokens = 8, MinDraftProb = .5f },
+        };
+        using var engine = new InferenceEngine(model, config, NullLogger.Instance);
+        var completion = engine.SubmitRequest(seq).Completion.GetAwaiter().GetResult();
+        Assert.True(completion.PrefillElapsedTicks > 0);
+        Assert.True(completion.DecodeElapsedTicks > 0);
+    }
+
+    private sealed class GreedyMediaProbeModel : ModelBase, IMultimodalPromptExpander, IVisionCapableModel, IAudioCapableModel
+    {
+        private GreedyMediaProbeModel() : base("unused", BackendType.Cpu) { }
+        public Tensor Rows;
+        public int Delivered;
+        public bool IsVisionEncoderLoaded => true;
+        public void LoadVisionEncoder(string path) => throw new NotSupportedException();
+        public void SetVisionEmbeddings(Tensor embeddings, int position) => Receive(embeddings);
+        public void SetAudioEmbeddings(Tensor embeddings, int position) => Receive(embeddings);
+        private void Receive(Tensor embeddings)
+        {
+            using (embeddings) Assert.Equal(new[] { 11f, 12f }, embeddings.GetElementsAsFloat(2));
+            Delivered++;
+        }
+        List<int> IMultimodalPromptExpander.ExpandMultimodalPrompt(ModelMultimodalInjector injector, List<ChatMessage> history, List<int> tokens)
+        {
+            int index = 0;
+            foreach (var message in history)
+            {
+                foreach (var path in message.ImagePaths ?? Enumerable.Empty<string>()) Append(injector, path, true, index++);
+                foreach (var path in message.AudioPaths ?? Enumerable.Empty<string>()) Append(injector, path, false, index++);
+            }
+            return tokens;
+        }
+        private void Append(ModelMultimodalInjector injector, string path, bool vision, int index)
+        {
+            const BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Instance;
+            var type = typeof(ModelMultimodalInjector);
+            var cacheType = type.GetNestedType("CachedEmbedding", BindingFlags.NonPublic)!;
+            var spanType = type.GetNestedType("PreparedEmbeddingSpan", BindingFlags.NonPublic)!;
+            object cached = Activator.CreateInstance(cacheType, path, 0L, 0L, Rows, 2, 0, 0)!;
+            cacheType.GetProperty("ContentId")!.SetValue(cached, "greedy-media-fixture:" + path);
+            int start = 2 + 2 * index;
+            object span = Activator.CreateInstance(spanType, cached, start, start, start + 2)!;
+            var bucket = (IList)type.GetProperty(vision ? "_preparedVisionEmbeddings" : "_preparedAudioEmbeddings", flags)!.GetValue(injector)!;
+            bucket.Add(span);
+        }
+        protected override float[] ForwardCore(int[] tokens) => throw new NotSupportedException();
+        protected override void ResetKVCacheCore() { }
     }
 
     [Fact]

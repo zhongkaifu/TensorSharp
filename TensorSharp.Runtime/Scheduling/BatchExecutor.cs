@@ -2516,10 +2516,13 @@ namespace TensorSharp.Runtime.Scheduling
             return outcome;
         }
 
-        // Full-logit consumers retain the original path. A future logprob/logit
-        // observer must join this gate rather than consume a token-only outcome.
+        // Full-logit consumers and prompts containing media (including images,
+        // video or audio in earlier turns) retain the original solo verify path.
+        // MediaSpans survives prefill/prefix reuse; pending embedding queues do not.
+        // A future logprob/logit observer must join this gate rather than consume
+        // a token-only outcome. The existing batched verify path is unchanged.
         internal static bool CanUseGreedySpecVerify(SequenceState seq, bool requiresLogits) =>
-            seq.OutputTokens.Count > 0 && seq.GetOrCreateSampler().IsPlainGreedyArgmax
+            seq.MediaSpans.Count == 0 && seq.OutputTokens.Count > 0 && seq.GetOrCreateSampler().IsPlainGreedyArgmax
             && !requiresLogits;
 
         // ---- Speculation on a per-request fused holder ----
