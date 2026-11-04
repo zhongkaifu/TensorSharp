@@ -142,6 +142,7 @@ public sealed class Qwen35VerifyDecodeQ81Tests
     public void ActualEnginePolicy_IsolatesModelAndPrefixNamespacesWithoutChangingLegacyBytes(bool q81, bool trace)
     {
         var engine = MetadataOnlyEngine(q81, trace);
+        Assert.False(engine.IsNinferModel);
         var executor = (Qwen35CudaExecutor)RuntimeHelpers.GetUninitializedObject(typeof(Qwen35CudaExecutor));
         SetField(executor, "_engine", engine);
         var model = (Qwen35CudaModel)RuntimeHelpers.GetUninitializedObject(typeof(Qwen35CudaModel));
@@ -236,6 +237,8 @@ public sealed class Qwen35VerifyDecodeQ81Tests
     private static Q35CudaEngine MetadataOnlyEngine(bool q81, bool trace)
     {
         var engine = (Q35CudaEngine)RuntimeHelpers.GetUninitializedObject(typeof(Q35CudaEngine));
+        // The production constructor always supplies a nonnull model recipe.
+        SetField(engine, "_m", new Q35CudaEngine.ModelDesc { NLayer = 64, NEmbd = 5120, NVocab = 248320, NCtx = 262144 });
         SetField(engine, "_verifyDecodeQ81", q81);
         SetField(engine, "_projectionTrace", trace);
         return engine;

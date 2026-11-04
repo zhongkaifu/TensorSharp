@@ -28,6 +28,15 @@ public sealed class Qwen35W8OutputHeadCompanionTests
     private static long XBytes(int rows) => (long)rows * 5120 * 4;
     private static long YBytes(int rows) => (long)rows * 248320 * 4;
     private static CudaWeightDesc OriginalQ6Head => new() { GgmlType=14, Ne0=5120, Ne1=248320, Ne2=1, RowBytes=4200 };
+    private static Q35CudaEngine MetadataOnlyEngine(CudaW8HeadWeightDesc? head = null)
+    {
+        var engine = (Q35CudaEngine)RuntimeHelpers.GetUninitializedObject(typeof(Q35CudaEngine));
+        // Preserve the constructor's nonnull GGUF recipe without CUDA/weight loading.
+        typeof(Q35CudaEngine).GetField("_m", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(engine,
+            new Q35CudaEngine.ModelDesc { NEmbd = 5120, NVocab = 248320, Output = OriginalQ6Head, OutputW8 = head });
+        typeof(Q35CudaEngine).GetField("_outputW8", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(engine, head);
+        return engine;
+    }
 
     [Fact]
     public void DescriptorSnapshotsExplicitMetadataWithoutReadingOrOpeningAnything()
@@ -69,8 +78,8 @@ public sealed class Qwen35W8OutputHeadCompanionTests
     public void ActualEnginePolicyRetainsQ6TargetOnlyForDraftScope(CudaW8HeadScope scope,bool targetW8)
     {
         var source=new UnreadSource();var head=Desc(source,scope:scope);
-        var engine=(Q35CudaEngine)RuntimeHelpers.GetUninitializedObject(typeof(Q35CudaEngine));
-        typeof(Q35CudaEngine).GetField("_outputW8",BindingFlags.Instance|BindingFlags.NonPublic)!.SetValue(engine,head);
+        var engine=MetadataOnlyEngine(head);
+        Assert.False(engine.IsNinferModel);
         Assert.True(engine.OutputW8Enabled);Assert.True(engine.OutputW8DraftEnabled);
         Assert.Equal(targetW8,engine.OutputW8TargetEnabled);Assert.Equal(targetW8,Q35CudaEngine.UsesW8TargetHead(head));
         Q35CudaEngine.ValidateOutputW8Model(new(){NEmbd=5120,NVocab=248320,Output=OriginalQ6Head},head,false,false);
@@ -166,7 +175,8 @@ public sealed class Qwen35W8OutputHeadCompanionTests
     public void OffKeepsTheOriginalNamespaceAndDoesNotInspectACompanionOrGraphs()
     {
         Q35CudaEngine.ValidateOutputW8Model(null!,null!,true,true);
-        var engine=(Q35CudaEngine)RuntimeHelpers.GetUninitializedObject(typeof(Q35CudaEngine));
+        var engine=MetadataOnlyEngine();
+        Assert.False(engine.IsNinferModel);
         Assert.False(engine.OutputW8Enabled);Assert.Equal(string.Empty,engine.KVStateNamespaceSuffix);
         typeof(Q35CudaEngine).GetField("_verifyDecodeQ81",BindingFlags.Instance|BindingFlags.NonPublic)!.SetValue(engine,true);
         Assert.Equal("|verify-decode=q8_1-v1",engine.KVStateNamespaceSuffix);
