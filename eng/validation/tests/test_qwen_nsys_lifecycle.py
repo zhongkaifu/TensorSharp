@@ -19,6 +19,118 @@ profile = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(profile)
 
 
+START_HELP = """Usage: nsys start [options]
+  --session ID
+  --output PATH
+  --sample {none,process-tree}
+  --cpuctxsw {none,process-tree}
+  --force-overwrite true|false
+"""
+
+
+class EnvironmentTests(unittest.TestCase):
+    def test_ambient_credentials_and_undeclared_model_settings_are_not_inherited(self):
+        ambient = {"PATH": "/usr/bin", "HOME": "/home/profiler", "CUDA_VISIBLE_DEVICES": "2",
+                   "LD_LIBRARY_PATH": "/cuda/lib", "HF_TOKEN": "synthetic-secret", "AWS_SECRET_ACCESS_KEY": "synthetic-secret",
+                   "HTTP_PROXY": "synthetic-secret", "TS_Q35_UNDECLARED": "1", "DOTNET_UNDECLARED": "1",
+                   "PYTHONPATH": "synthetic-startup-hook", "LD_PRELOAD": "/ambient/inject.so"}
+        with patch.dict(profile.os.environ, ambient, clear=True):
+            env = profile.process_environment({"TS_Q35_DECLARED": "1", "CUDA_VISIBLE_DEVICES": "3"})
+        self.assertEqual({"PATH": "/usr/bin", "HOME": "/home/profiler", "CUDA_VISIBLE_DEVICES": "3",
+                          "LD_LIBRARY_PATH": "/cuda/lib", "TS_Q35_DECLARED": "1"}, env)
+
+    def test_exec_keeps_only_named_nsight_interposition_and_explicit_server_overrides(self):
+        with patch.dict(profile.os.environ, {"LD_PRELOAD": "/nsys/trace.so", "CUDA_INJECTION64_PATH": "/nsys/cuda.so",
+                "NVTX_INJECTION64_PATH": "/nsys/nvtx.so", "NSYS_TARGET_SESSION_ID": "session", "HF_TOKEN": "synthetic-secret",
+                "TS_Q35_UNDECLARED": "1", "NSYS_UNKNOWN_SECRET": "synthetic-secret"}, clear=True):
+            env = profile.process_environment({"TS_Q35_DECLARED": "1"}, target_exec=True)
+        for name in ("LD_PRELOAD", "CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH", "NSYS_TARGET_SESSION_ID", "TS_Q35_DECLARED"):
+            self.assertIn(name, env)
+        for name in ("HF_TOKEN", "TS_Q35_UNDECLARED", "NSYS_UNKNOWN_SECRET"):
+            self.assertNotIn(name, env)
+        self.assertEqual(os.defpath, env["PATH"])
+
+    def test_spec_env_and_command_are_validated_before_launch(self):
+        good = {"argv": ["server", ""], "env": {"EXPLICIT": "", "TS_Q35_X": "1"}}
+        self.assertEqual(good, profile.validate_server_spec(good))
+        bad = [None, [], {}, {"argv": "server"}, {"argv": []}, {"argv": [""]}, {"argv": ["server", 1]},
+               {"argv": ["server\x00"]}, {"argv": ["server"], "env": []}, {"argv": ["server"], "env": {"": "v"}},
+               {"argv": ["server"], "env": {"bad=name": "v"}}, {"argv": ["server"], "env": {"bad\x00": "v"}},
+               {"argv": ["server"], "env": {"key": 1}}, {"argv": ["server"], "env": {"key": "v\x00"}},
+               {"argv": ["server"], "cwd": "/nonexistent/nsys-profile-cwd"}, {"argv": ["server"], "cwd": 1}]
+        for spec in bad:
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                profile.validate_server_spec(spec)
+
+    def test_exec_server_uses_scrubbed_environment_and_preserves_identity_before_exec(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spec = Path(temporary) / "server.json"; pid = Path(temporary) / "pid.json"
+            spec.write_text(json.dumps({"argv": ["server", "arg"], "env": {"TS_Q35_DECLARED": "1"}}))
+            with patch.dict(profile.os.environ, {"PATH": "/bin", "HF_TOKEN": "synthetic-secret", "LD_PRELOAD": "/nsys/trace.so"}, clear=True), \
+                    patch.object(profile, "write_server_identity") as identity, patch.object(profile.os, "execvpe") as execute:
+                profile.exec_server(["--server-spec", str(spec), "--pid-file", str(pid), "--run-id", "run"])
+            identity.assert_called_once_with(pid, "run")
+            command, argv, env = execute.call_args.args
+            self.assertEqual(("server", ["server", "arg"]), (command, argv))
+            self.assertEqual({"PATH": "/bin", "LD_PRELOAD": "/nsys/trace.so", "TS_Q35_DECLARED": "1"}, env)
+
+
+class CapabilityTests(unittest.TestCase):
+    def test_missing_optional_discard_flag_works_without_adding_it(self):
+        with patch.object(profile.subprocess, "check_output", return_value=START_HELP) as help_call:
+            caps = profile.nsys_start_capabilities("nsys", {"PATH": "/bin"})
+        self.assertFalse(caps["discard_environment_supported"])
+        self.assertNotIn("--discard-environment=true", profile.start_command("run", Path("out"), "none", caps))
+        self.assertEqual({"PATH": "/bin"}, help_call.call_args.kwargs["env"])
+        self.assertEqual(["nsys", "start", "--help"], help_call.call_args.args[0])
+        self.assertEqual(64, len(caps["help_sha256"]))
+
+    def test_advertised_discard_flag_is_added_exactly_once(self):
+        with patch.object(profile.subprocess, "check_output", return_value=START_HELP + "  --discard-environment=true|false\n"):
+            caps = profile.nsys_start_capabilities("nsys", {})
+        self.assertEqual(1, profile.start_command("run", Path("out"), "process-tree", caps).count("--discard-environment=true"))
+
+    def test_prose_or_longer_option_name_is_not_treated_as_support(self):
+        for text in ("Use --discard-environment=true if supported.\n", "  --discard-environment-extra=true\n"):
+            with self.subTest(text=text), patch.object(profile.subprocess, "check_output", return_value=START_HELP + text):
+                self.assertFalse(profile.nsys_start_capabilities("nsys", {})["discard_environment_supported"])
+
+    def test_missing_required_start_option_refuses(self):
+        with patch.object(profile.subprocess, "check_output", return_value=START_HELP.replace("  --sample {none,process-tree}\n", "")):
+            with self.assertRaisesRegex(RuntimeError, "--sample"):
+                profile.nsys_start_capabilities("nsys", {})
+
+    def test_help_failure_and_timeout_are_not_optional_flag_absence(self):
+        for error in (subprocess.CalledProcessError(1, ["nsys", "start", "--help"]), subprocess.TimeoutExpired("nsys", 30)):
+            with self.subTest(error=error), patch.object(profile.subprocess, "check_output", side_effect=error):
+                with self.assertRaises(type(error)):
+                    profile.nsys_start_capabilities("nsys", {})
+
+    def test_preflight_failure_never_launches_or_profiles_a_server(self):
+        directory = ROOT / "artifacts"; directory.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="nsys-preflight-", dir=directory) as temporary:
+            p = Path(temporary); prefix = p / "capture"; server = p / "server.json"; fixture = p / "fixture.jsonl"
+            server.write_text(json.dumps({"argv": ["/nonexistent/expensive-server"], "env": {"TS_Q35_DECLARED": "1"}}))
+            body = {"messages": [], "max_tokens": 1}
+            fixture.write_text(json.dumps({"scenario": "cpu", "lane": 0, "step": 0, "body": body,
+                                           "request_sha256": profile.replay.digest(body)}) + "\n")
+            with patch.object(profile, "linux_proc_available", return_value=True), patch.object(profile, "models", return_value=None), \
+                    patch.dict(profile.os.environ, {"PATH": "/bin", "HF_TOKEN": "synthetic-secret", "TS_Q35_AMBIENT": "1"}, clear=True), \
+                    patch.object(profile.subprocess, "check_output", side_effect=["fake Nsight", START_HELP.replace("  --sample {none,process-tree}\n", "")]) as query, \
+                    patch.object(profile.subprocess, "Popen") as launch, patch.object(profile.subprocess, "run") as run, \
+                    patch.object(profile.replay, "request") as request:
+                with self.assertRaisesRegex(RuntimeError, "--sample"):
+                    profile.main(["--nsys", "fake-nsys", "--server-spec", str(server), "--fixture", str(fixture),
+                                  "--scenario", "cpu", "--step", "0", "--prime-steps", "", "--output", str(prefix)])
+            launch.assert_not_called(); run.assert_not_called(); request.assert_not_called()
+            for call in query.call_args_list:
+                self.assertEqual({"PATH": "/bin", "TS_Q35_DECLARED": "1"}, call.kwargs["env"])
+            metadata = json.loads(Path(str(prefix) + ".json").read_text())
+            self.assertFalse(metadata["complete"]); self.assertEqual("NOT_RUN", metadata["capture_status"])
+            self.assertNotIn("server_cleanup", metadata)
+            self.assertNotIn("synthetic-secret", json.dumps(metadata))
+
+
 class IdentityTests(unittest.TestCase):
     def test_self_written_record_is_exclusive_and_bound_to_invocation(self):
         with tempfile.TemporaryDirectory() as temporary, \
@@ -187,18 +299,29 @@ while True: time.sleep(10)
         real_popen = subprocess.Popen
         calls = []
 
+        def safe_environment(kwargs):
+            self.assertIn("env", kwargs)
+            self.assertNotIn("HF_TOKEN", kwargs["env"])
+            self.assertNotIn("TS_Q35_AMBIENT", kwargs["env"])
+
         class FinishedLauncher:
             def poll(self): return 0
             def wait(self, timeout): return 0
 
         def launch(command, **kwargs):
+            safe_environment(kwargs)
             child = real_popen(command[command.index(sys.executable):], **kwargs)
             self.children.append(child)
             return FinishedLauncher()
 
         def run(command, **kwargs):
+            safe_environment(kwargs)
             calls.append(command)
             return subprocess.CompletedProcess(command, 0)
+
+        def query(command, **kwargs):
+            safe_environment(kwargs)
+            return "fake Nsight 2026" if "--version" in command else START_HELP
 
         result = {"errors": [], "done": True, "finish_reason": "length"}
         request = RuntimeError("injected capture failure") if request_fails else None
@@ -213,9 +336,10 @@ while True: time.sleep(10)
                 return {"confirmed_exited": False, "error": "injected timeout"}
             return stop(*args)
 
-        with patch.object(profile.subprocess, "Popen", side_effect=launch), \
+        with patch.dict(profile.os.environ, {"HF_TOKEN": "synthetic-secret", "TS_Q35_AMBIENT": "1"}), \
+                patch.object(profile.subprocess, "Popen", side_effect=launch), \
                 patch.object(profile.subprocess, "run", side_effect=run), \
-                patch.object(profile.subprocess, "check_output", return_value="fake Nsight 2026"), \
+                patch.object(profile.subprocess, "check_output", side_effect=query), \
                 patch.object(profile, "models", side_effect=lambda url: "cpu-model" if not never_ready and self.ready.exists() else None), \
                 patch.object(profile.replay, "request", return_value=result, side_effect=request), \
                 patch.object(profile, "stop_owned_server", side_effect=cleanup):
@@ -226,6 +350,7 @@ while True: time.sleep(10)
                 profile.main(argv)
         metadata = json.loads(Path(str(prefix) + ".json").read_text())
         self.assertTrue(any("--kill=none" in command for command in calls))
+        self.assertTrue(all("--discard-environment=true" not in command for command in calls))
         self.assertEqual(0, metadata["launcher_exit_code"])
         return metadata
 

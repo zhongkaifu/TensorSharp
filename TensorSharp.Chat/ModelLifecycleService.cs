@@ -192,8 +192,19 @@ namespace TensorSharp.Server
         /// </summary>
         private static void ValidateModelFiles(string modelPath, string mmProjPath)
         {
-            using (var gguf = new GgufFile(modelPath))
+            if (TensorSharp.Runtime.NinferArtifactReader.IsNinferArtifact(modelPath))
+            {
+                if (!string.IsNullOrWhiteSpace(mmProjPath))
+                    throw new NotSupportedException("NInfer Qwen3.8 currently serves its target text body; --mmproj is not implemented for this route.");
+                using var artifact = new TensorSharp.Runtime.NinferArtifactReader(modelPath);
+                _ = NinferQwen38TargetPlan.Create(artifact);
+                _ = TensorSharp.Runtime.NinferQwen38Frontend.FromReader(artifact);
+            }
+            else
+            {
+                using var gguf = new GgufFile(modelPath);
                 gguf.ThrowIfTruncated();
+            }
 
             // A missing projector file is skipped by the load itself, but one
             // that exists must parse.

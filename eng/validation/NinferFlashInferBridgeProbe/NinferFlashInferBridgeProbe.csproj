@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><AllowUnsafeBlocks>true</AllowUnsafeBlocks><UseAppHost>false</UseAppHost><IsPackable>false</IsPackable></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../../../TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj"/><Compile Include="../NinferFlashInferBridgeReference.cs" Link="NinferFlashInferBridgeReference.cs"/></ItemGroup>
+</Project>

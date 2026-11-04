@@ -100,6 +100,43 @@ public class ModelReloadRollbackTests : IDisposable
     }
 
     [Fact]
+    public void UnsupportedNinferVersion_IsRejectedByItsParserBeforeCurrentModelIsUnloaded()
+    {
+        var factory = new ScriptedFactory();
+        using var svc = NewService(factory);
+        string pathA = WriteMinimalGguf("model-a.gguf");
+        factory.Enqueue(p => new FakeModel(p));
+        svc.LoadModel(pathA, null, "cpu");
+        var modelA = (FakeModel)svc.Model;
+        string pathB = Path.Combine(_dir, "body.ninfer");
+        File.WriteAllBytes(pathB, "NINFER\0\x03"u8.ToArray());
+
+        var error = Assert.Throws<NotSupportedException>(() => svc.LoadModel(pathB, null, "cuda"));
+        Assert.Contains("NInfer v3", error.Message);
+        Assert.Same(modelA, svc.Model);
+        Assert.False(modelA.Disposed);
+        Assert.Single(factory.Calls);
+    }
+
+    [Fact]
+    public void NinferVisionOption_IsRejectedBeforeCurrentModelIsUnloaded()
+    {
+        var factory = new ScriptedFactory();
+        using var svc = NewService(factory);
+        string pathA = WriteMinimalGguf("model-a.gguf");
+        factory.Enqueue(p => new FakeModel(p));
+        svc.LoadModel(pathA, null, "cpu");
+        var modelA = (FakeModel)svc.Model;
+
+        var error = Assert.Throws<NotSupportedException>(() =>
+            svc.LoadModel(Path.Combine(_dir, "body.ninfer"), "vision.gguf", "cuda"));
+        Assert.Contains("--mmproj", error.Message);
+        Assert.Same(modelA, svc.Model);
+        Assert.False(modelA.Disposed);
+        Assert.Single(factory.Calls);
+    }
+
+    [Fact]
     public void TruncatedMmProj_IsRejectedWithCurrentModelStillLoaded()
     {
         var factory = new ScriptedFactory();

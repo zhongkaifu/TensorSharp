@@ -1,0 +1,234 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// Licensed under the BSD-3-Clause license in the repository root.
+using System;
+using TensorSharp.Cuda.Interop;
+
+namespace TensorSharp.Cuda
+{
+    public sealed unsafe partial class Q35CudaEngine
+    {
+        private CudaNinferKernels _ninfer;
+        private CudaNinferAttention _ninferAttention;
+        private NinferLayer[] _ninferLayers;
+        private IntPtr _ninferAlphaBeta;
+        private sealed class NinferMatrix
+        {
+            public CudaNinferProjectionDesc Descriptor;
+            public IntPtr Data, Scales;
+        }
+        private sealed class NinferLayer
+        {
+            public NinferMatrix Input, AlphaBeta, Output, GateUp, Down;
+        }
+        public bool IsNinferModel => _m.Ninfer != null;
+        public bool NinferPrefillAttentionEnabled => _ninferAttention?.PrefillEnabled == true;
+        public string NinferPrefillAttentionImageSha256 => _ninferAttention?.PrefillImageSha256;
+        public long NinferPrefillAttentionCoreSubmissions => _ninferAttention?.PrefillCoreSubmissions ?? 0;
+        public long NinferPrefillAttentionWorkspaceBytes => _ninferAttention?.PrefillWorkspaceBytes ?? 0;
+        public long NinferPrefill128CoreSubmissions => _ninferAttention?.Prefill128CoreSubmissions ?? 0;
+        public bool NinferVerify8AttentionEnabled => _ninferAttention?.Verify8Enabled == true;
+        public string NinferVerify8AttentionSelection => _ninferAttention?.Verify8Selection ?? "not-ninfer";
+        public string NinferVerify8AttentionImageSha256 => _ninferAttention?.Verify8ImageSha256;
+        public string NinferVerify8AttentionPolicy => NinferVerify8AttentionEnabled ? CudaNinferPrefillAttentionModule.Verify8Policy : null;
+        /// <summary>Host core submissions, including capture; GPU graph replays do not increment this count.</summary>
+        public long NinferVerify8AttentionCoreSubmissions => _ninferAttention?.Verify8CoreSubmissions ?? 0;
+        public long NinferVerify8AttentionWorkspaceBytes => _ninferAttention?.Verify8WorkspaceBytes ?? 0;
+
+        internal static void ValidateNinferModel(ModelDesc model)
+        {
+            var recipe = model.Ninfer;
+            if (recipe == null) return;
+            if (model.NLayer != 64 || model.NEmbd != 5120 || model.NFf != 17408 || model.NVocab != 248320
+                || model.NHead != 24 || model.NKvHead != 4 || model.HeadDim != 256
+                || model.GdnKHeads != 16 || model.GdnVHeads != 48 || model.DConv != 4
+                || recipe.Layers?.Length != model.NLayer || model.Layers?.Length != model.NLayer
+                || recipe.Embedding?.Format != CudaNinferProjectionFormat.W8G32
+                || recipe.Embedding.Rows != model.NVocab || recipe.Embedding.Columns != model.NEmbd
+                || recipe.Output == null || recipe.Output.Scope != CudaW8HeadScope.TargetAndDraft
+                || model.OutputW8 != null || string.IsNullOrWhiteSpace(recipe.Provenance))
+                throw new NotSupportedException("The complete NInfer route requires the validated Qwen3.8-27B target recipe.");
+            if (model.NCtx < 1 || model.NUbatch < 1 || model.NUbatch > model.NCtx
+                || !float.IsFinite(model.Eps) || model.Eps <= 0 || !float.IsFinite(model.RopeBase) || model.RopeBase <= 0)
+                throw new ArgumentException("Invalid NInfer context or normalization/rotary parameters.");
+            Vector(model.OutputNorm, model.NEmbd);
+            foreach (string option in new[] { "TS_Q35_VERIFY_DECODE_Q81", "TS_Q35_VERIFY_GRAPHS", "TS_Q35_CUDA_GRAPHS", "TS_Q35_GDN_PREPARED_PREFILL", "TS_Q35_SHARED_SCRATCH" })
+                if (Environment.GetEnvironmentVariable(option) == "1")
+                    throw new NotSupportedException("The NInfer numerical recipe does not accept the GGUF experimental option " + option);
+            for (int i = 0; i < model.NLayer; i++)
+            {
+                var layer = recipe.Layers[i] ?? throw new ArgumentException("Missing NInfer layer.");
+                bool recurrent = (i + 1) % 4 != 0;
+                if (model.Layers[i].Recurrent != recurrent)
+                    throw new ArgumentException("NInfer layer schedule differs.");
+                Vector(model.Layers[i].AttnNorm, model.NEmbd);
+                Vector(model.Layers[i].PostNorm, model.NEmbd);
+                Shape(layer.Input, recurrent ? 16384 : 14336, model.NEmbd);
+                Shape(layer.Output, model.NEmbd, 6144);
+                Shape(layer.GateUp, 34816, model.NEmbd);
+                Shape(layer.Down, model.NEmbd, model.NFf);
+                if (recurrent)
+                {
+                    Shape(layer.AlphaBeta, 96, model.NEmbd);
+                    if (layer.AlphaBeta.Format != CudaNinferProjectionFormat.BFloat16)
+                        throw new ArgumentException("NInfer GDN alpha/beta must retain BF16 weights.");
+                    Vector(model.Layers[i].ConvW, 40960);
+                    Vector(model.Layers[i].DtBias, 48);
+                    Vector(model.Layers[i].SsmA, 48);
+                    Vector(model.Layers[i].SsmNorm, 128);
+                }
+                else
+                {
+                    if (layer.AlphaBeta != null) throw new ArgumentException("An attention layer cannot have GDN gates.");
+                    Vector(model.Layers[i].QNorm, 256);
+                    Vector(model.Layers[i].KNorm, 256);
+                }
+            }
+            static void Shape(CudaNinferProjectionDesc d, int rows, int columns)
+            {
+                if (d == null || d.Rows != rows || d.Columns != columns || d.Format == CudaNinferProjectionFormat.W8G32)
+                    throw new ArgumentException("NInfer projection geometry differs from the target plan.");
+            }
+            static void Vector(float[] values, int count)
+            {
+                if (values?.Length != count) throw new ArgumentException("NInfer parameter vector geometry differs.");
+                foreach (float value in values)
+                    if (!float.IsFinite(value)) throw new ArgumentException("NInfer parameters must be finite.");
+            }
+        }
+        private void InitializeNinferModules()
+        {
+            InitializeNinferQualifiedDefaults();
+            InitializeNinferA16Candidate();
+            InitializeNinferLoadRepack();
+            InitializeNinferExactVerify();
+            InitializeNinferFlashInfer();
+            if (_ninferDecodeGraphsEnabled && _m.Ninfer == null)
+                throw new NotSupportedException(NinferDecodeGraphsEnvironment + " requires an original NInfer target.");
+            if (_ninferVerificationEnabled && _m.Ninfer == null)
+                throw new NotSupportedException(NinferVerificationEnvironment + " requires an original NInfer target.");
+            if (_m.Ninfer == null) return;
+            _ninfer = CudaNinferKernels.Create(_m.Ninfer.ModulePath);
+            _ninferAttention = new CudaNinferAttention(_m.RopeBase, _m.NUbatch, _m.NCtx, _sms,
+                _ninferVerificationEnabled, _m.NHead, _m.NKvHead, _m.HeadDim, _ninferAutomaticVerify8);
+            _ninferLayers = new NinferLayer[_m.NLayer];
+        }
+        private NinferMatrix LoadNinferMatrix(Loader loader, CudaNinferProjectionDesc d)
+        {
+            if (d == null) return null;
+            if (TryLoadNinferFlashInferMatrix(loader, d, out var rawMatrix)) return rawMatrix;
+            IntPtr data = Alloc(d.Bytes);
+            if (!loader.TryRepackNinfer(d, data))
+                loader.RawInto(new CudaWeightDesc { Source = d.Source, SourceOffset = d.SourceOffset,
+                    Ne0 = d.Columns, Ne1 = 1, Ne2 = 1, RowBytes = d.Bytes }, data);
+            return new NinferMatrix { Descriptor = d, Data = data,
+                Scales = d.Format == CudaNinferProjectionFormat.NvFp4Planes ? data + (nint)((long)d.Rows*d.Columns/2) : IntPtr.Zero };
+        }
+        private Layer LoadNinferLayer(Loader loader, int index)
+        {
+            var d = _m.Layers[index];
+            var source = _m.Ninfer.Layers[index];
+            _ninferLayers[index] = new NinferLayer { Input = LoadNinferMatrix(loader, source.Input),
+                AlphaBeta = LoadNinferMatrix(loader, source.AlphaBeta), Output = LoadNinferMatrix(loader, source.Output),
+                GateUp = LoadNinferMatrix(loader, source.GateUp), Down = LoadNinferMatrix(loader, source.Down) };
+            return new Layer { Recurrent = d.Recurrent, AttnNorm = UploadF32(d.AttnNorm), PostNorm = UploadF32(d.PostNorm),
+                QNorm = UploadF32(d.QNorm), KNorm = UploadF32(d.KNorm), ConvW = UploadF32(d.ConvW),
+                DtBias = UploadF32(d.DtBias), SsmA = UploadF32(d.SsmA), SsmNorm = UploadF32(d.SsmNorm) };
+        }
+        private void FinalNorm(IntPtr x, IntPtr delta, IntPtr weight, IntPtr output, int rows, int width, float eps, IntPtr stream)
+        {
+            if (_m.Ninfer == null) _k.AddRmsNorm(x, delta, weight, output, rows, width, eps, stream);
+            else _ninfer.AddRmsNorm(x, delta, weight, output, rows, width, eps, stream);
+        }
+        private void NinferProject(NinferMatrix matrix, IntPtr input, IntPtr output, int rows,
+            int a4Threshold = 4, bool round = true, bool isVerify = false)
+        {
+            if (TryProjectNinferFlashInfer(matrix, input, output, rows))
+            {
+                if (round) _ninfer.Round(output, (long)rows * matrix.Descriptor.Rows, Stream);
+                return;
+            }
+            matrix = PrepareNinferFlashInferFallback(matrix);
+            var d = matrix.Descriptor;
+            if (TryNinferExactVerify(matrix, input, output, rows, a4Threshold, isVerify)) { }
+            else if (d.Format == CudaNinferProjectionFormat.BFloat16)
+                _ninfer.ProjectBf16(matrix.Data, input, output, d.Rows, d.Columns, rows, Stream);
+            else if (d.AllowA4 && rows >= a4Threshold)
+            {
+                _ninfer.QuantizeNvfp4(input, _fp4c, _fp4s, _fp4r, d.Columns, rows, d.InputScaleDivisor, Stream);
+                float alpha = 1.0f / (d.InputScaleDivisor * d.WeightScaleDivisor);
+                _k.GemmW4A4(matrix.Data, matrix.Scales, d.Rows, d.Columns, _fp4c, _fp4s, _fp4r,
+                    rows, alpha, output, _partial, _counters, _sms, rows <= 64 ? 8 : 1, Stream);
+            }
+            else if (!TryNinferA16(matrix, input, output, rows))
+                _ninfer.ProjectA16(matrix.Data, matrix.Scales, input, output, d.Rows, d.Columns, rows,
+                    1.0f / d.WeightScaleDivisor, Stream);
+            if (round) _ninfer.Round(output, (long)rows*d.Rows, Stream);
+        }
+        private void RunNinferLayers(int rows, int tapFirst, RowGroup[] groups, int[] maxKeys)
+        {
+            if (_d != null || _embedSpans != null)
+                throw new NotSupportedException("NInfer target text inference cannot use a GGUF drafter or image embedding overrides.");
+            foreach (var group in groups)
+                if (group.Verify && (!_ninferVerificationEnabled || groups.Length != 1 || group.Counts != null
+                    || group.Rows > MaxVerifyRows || _vQkv == IntPtr.Zero))
+                    throw new NotSupportedException("NInfer target verification requires one complete prepared verification group.");
+            int e = _m.NEmbd;
+            bool isVerify = groups.Length == 1 && groups[0].Verify;
+            IntPtr pending = IntPtr.Zero;
+            for (int il = 0; il < _m.NLayer; il++)
+            {
+                var l = _layers[il]; var weights = _ninferLayers[il];
+                _ninfer.AddRmsNorm(_x, pending, l.AttnNorm, _xn, rows, e, _m.Eps, Stream);
+                CaptureNinferDraftTargetTap(il, tapFirst, rows);
+                NinferProject(weights.Input, _xn, _proj, rows, l.Recurrent ? 1 : 4, isVerify: isVerify);
+                if (l.Recurrent)
+                {
+                    if (_ninferAlphaBeta == IntPtr.Zero) _ninferAlphaBeta = Alloc((long)RowCap*96*4);
+                    NinferProject(weights.AlphaBeta, _xn, _ninferAlphaBeta, rows, round: false, isVerify: isVerify);
+                    for (int gi = 0, r0 = 0, q0 = 0; gi < groups.Length; r0 += groups[gi].Rows, q0 += groups[gi].Slots.Length, gi++)
+                    {
+                        var g = groups[gi];
+                        long verifyOffset = (long)l.Ordinal * MaxVerifyRows;
+                        IntPtr proj = _proj + (nint)((long)r0*16384*4);
+                        IntPtr qkv = g.Verify ? _vQkv + (nint)(verifyOffset * ConvDim * 4) : _gdnQkv + (nint)((long)r0*ConvDim*4);
+                        IntPtr gd = g.Verify ? _vG + (nint)(verifyOffset * _m.GdnVHeads * 4) : _gdnG + (nint)((long)r0*_m.GdnVHeads*4);
+                        IntPtr beta = g.Verify ? _vBeta + (nint)(verifyOffset * _m.GdnVHeads * 4) : _gdnBeta + (nint)((long)r0*_m.GdnVHeads*4);
+                        IntPtr raw = g.Verify ? _vRaw + (nint)(verifyOffset * ConvDim * 4) : IntPtr.Zero;
+                        IntPtr count = g.Counts != null ? _countDev + (nint)(4L*q0) : IntPtr.Zero;
+                        _ninfer.GdnConv(proj, 16384, g.RowsPerSeq, g.Slots.Length, ConvDim, _m.DConv,
+                            l.ConvW, TabConv(l) + (nint)(8L*q0), qkv, raw, !g.Verify, Stream, count);
+                        _ninfer.GdnPrep(qkv, _ninferAlphaBeta + (nint)((long)r0*96*4), 96, g.Rows, _m.GdnKHeads,
+                            _m.GdnVHeads, ConvDim, l.DtBias, l.SsmA, gd, beta, Stream, count, g.RowsPerSeq);
+                        _ninfer.GdnScan(qkv, ConvDim, _m.GdnKHeads, _m.GdnVHeads, g.RowsPerSeq, g.Slots.Length,
+                            gd, beta, TabState(l) + (nint)(8L*q0), _gdnO + (nint)((long)r0*ValueDim*4), g.Verify, Stream, count);
+                    }
+                    _ninfer.GdnOut(_gdnO, _proj, 16384, ConvDim, rows, _m.GdnVHeads, l.SsmNorm, _m.Eps, _gdnY, Stream);
+                    NinferProject(weights.Output, _gdnY, _block, rows, round: false, isVerify: isVerify);
+                }
+                else
+                {
+                    for (int gi = 0, r0 = 0, q0 = 0; gi < groups.Length; r0 += groups[gi].Rows, q0 += groups[gi].Slots.Length, gi++)
+                    {
+                        var g = groups[gi]; long kOff = KvLayerOffset(l), vOff = kOff + KvLayerBytes;
+                        IntPtr tab = _tabBlocks + (nint)((long)q0*_maxBlocks*8);
+                        nint qOff = (nint)((long)r0*QDim*4);
+                        _ninferAttention.Prepare(_proj + (nint)((long)r0*AttnProjWidth*4), g.Rows, g.RowsPerSeq,
+                            _m.NHead, _m.NKvHead, l.QNorm, l.KNorm, _m.Eps, _ropePosDev + (nint)(4L*r0), RowCap,
+                            _m.SectT, _m.SectH, _m.SectW, _m.RopeBase, _cacheRowDev + (nint)(4L*r0), tab,
+                            _maxBlocks, kOff, vOff, _q + qOff, _gate + qOff, Stream);
+                        _ninferAttention.Attention(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L*r0), tab,
+                            _maxBlocks, kOff, vOff, g.RowsPerSeq, g.Slots.Length, _m.NHead, _m.NKvHead,
+                            1.0f/MathF.Sqrt(_m.HeadDim), maxKeys[gi], g.Rows <= MaxVerifyRows ? _attnPartial : IntPtr.Zero, _attn + qOff, Stream,
+                            isVerify: g.Verify, allRowsValid: g.Counts == null, positionsBaseDev: _cacheRowDev + (nint)(4L*r0));
+                    }
+                    NinferProject(weights.Output, _attn, _block, rows, round: false, isVerify: isVerify);
+                }
+                _ninfer.AddRmsNorm(_x, _block, l.PostNorm, _xn, rows, e, _m.Eps, Stream);
+                NinferProject(weights.GateUp, _xn, _proj, rows, 2, round: rows > 128 && rows != 1024, isVerify: isVerify);
+                _ninfer.SwiGlu(_proj, _act, _m.NFf, rows, Stream);
+                NinferProject(weights.Down, _act, _block, rows, round: false, isVerify: isVerify);
+                pending = _block;
+            }
+        }
+    }
+}

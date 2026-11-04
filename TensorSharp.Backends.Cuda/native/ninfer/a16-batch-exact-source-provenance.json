@@ -1,0 +1,83 @@
+{
+  "schema": "tensorsharp-ninfer-a16-batch-exact-candidate-provenance/1",
+  "license": "Apache-2.0 for derived kernel portions; BSD-3-Clause for managed loading glue",
+  "source_repository": "gpillon/ignis",
+  "source_revision": "e600a7d9e0d5921d767a6cb464373583b3cdcaf4",
+  "reference_repository": "gpillon/ninfer",
+  "reference_revision": "a00648cb828457986cf5b4b4f712b4cbcd7af0d1",
+  "sources": [
+    {
+      "ignis_path": "kernel/vendor/src/ops/linear/nvfp4/nvfp4_config.h",
+      "ninfer_path": "src/ops/linear/nvfp4/nvfp4_config.h",
+      "sha256": "78cbbffc7885290547acee338a55e40fe03fc11b715ba9e6c450fe4f2a788aee",
+      "bytes": 13563
+    },
+    {
+      "ignis_path": "kernel/vendor/src/ops/linear/nvfp4/nvfp4_gemv.cuh",
+      "ninfer_path": "src/ops/linear/nvfp4/nvfp4_gemv.cuh",
+      "sha256": "2829185e7658c77b1ae8728313aef8002287320a494ef802e66fd2f7f86cd8e5",
+      "bytes": 12140
+    },
+    {
+      "ignis_path": "kernel/vendor/src/ops/linear/nvfp4/nvfp4_small_t.cuh",
+      "ninfer_path": "src/ops/linear/nvfp4/nvfp4_small_t.cuh",
+      "sha256": "ff606738b9f0de12ad0757649d7238d49acaf5aa5b002e4bea40bd0e10cfa6ae",
+      "bytes": 19342
+    },
+    {
+      "ignis_path": "kernel/vendor/src/ops/linear/nvfp4/nvfp4_codec.cuh",
+      "ninfer_path": "src/ops/linear/nvfp4/nvfp4_codec.cuh",
+      "sha256": "b1eb2a90ee717c85b1c6415015fffb588dbb7ed52ae675207bfcb0a3a22b8c63",
+      "bytes": 4771
+    },
+    {
+      "ignis_path": "kernel/vendor/src/ops/common/warp.cuh",
+      "ninfer_path": "src/ops/common/warp.cuh",
+      "sha256": "7555cb64c0bfd8738209fc25ebe5972f4cb032fee03ea4fc769770da4ec2d839",
+      "bytes": 1890
+    },
+    {
+      "ignis_path": "kernel/vendor/src/ops/common/math.cuh",
+      "ninfer_path": "src/ops/common/math.cuh",
+      "sha256": "5aedc4dccaa3cf3cf75a6b03cbe24c8ef830ef183488f002864103f0c35b760e",
+      "bytes": 1297
+    },
+    {
+      "ignis_path": "kernel/vendor/src/ops/common/memory.cuh",
+      "ninfer_path": "src/ops/common/memory.cuh",
+      "sha256": "68d4ce555d86761aa4c21d49726be2e48d82fcbdc4f6dbe4fc8b7356f945e205",
+      "bytes": 3424
+    }
+  ],
+  "attribution_files": [
+    {
+      "path": "../w8/upstream/LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "path": "../w8/upstream/NOTICE",
+      "sha256": "e767777fc7bed59df90d3e93645eff6644e735b171a07cca1d70949b2432f43d"
+    },
+    {
+      "path": "../w8/upstream/kernel/NOTICE",
+      "sha256": "5083ae40d481868f07f805c29831a4f33aa4d191863aadfe644dda273bbb9e92"
+    },
+    {
+      "path": "../w8/upstream/kernel/vendor/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    }
+  ],
+  "derived_file": "tensorsharp_q35_ninfer_a16_batch_exact.cu",
+  "changes": [
+    "Standalone CUDA-driver entries for K5120/6144/17408 and T1..8, separate from all already-qualified T1..3 candidate images.",
+    "Unchanged existing TensorSharp low8/high8 E2M1 code bytes and row-major E4M3 scales; no weight requantization, plane conversion or duplicated model storage.",
+    "F32 input storage contains already BF16-representable values; no input dtype change or extra activation rounding.",
+    "Exactly one positive-zero-initialized F32 accumulator per output row and token; groups advance lane+32*phase; code order low[j],high[j+8] for j0..7; coefficient scale*inverseD precedes code multiplication and ordered fmaf.",
+    "Exact legacy XOR16,8,4,2,1 warp sum with no extra zero-add or BF16 projection-output rounding.",
+    "CUDA FP4x2-to-float2 conversion decodes each unmodified TS byte, including signed zeros, before unchanged coefficient products.",
+    "Packed uint2 code loads and two output rows per warp reuse weights across tokens. T2..8 stage F32 inputs using the bijection col XOR ((col>>4)&31); T1 reads F32 input directly.",
+    "Separate24 symbols, explicit opt-in module/environment/numerical-policy identity; no engine, serving default, target A4 or dependency-source changes.",
+    "No PDL contract; ordinary caller stream sequencing supplies ordering."
+  ],
+  "acceptance": "Unvalidated optional batch candidate; OFF. Requires strict full-output CPU==batched frozen legacyGPU==independent one-token legacyGPU checks at T1..8, fixed FP64 bounds/guards/immutability/repeat, then full-model verification/quality/performance before any serving adoption."
+}

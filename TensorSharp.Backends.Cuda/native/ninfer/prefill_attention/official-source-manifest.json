@@ -1,0 +1,121 @@
+{
+  "repository": "gpillon/ignis",
+  "revision": "e600a7d9e0d5921d767a6cb464373583b3cdcaf4",
+  "files": [
+    {
+      "path": "kernel/vendor/src/ops/kernel/gqa_attention_prefill_bf16.cuh",
+      "bytes": 38962,
+      "sha256": "bd9d455e55ce1ccf56ad66ba44b8395db4eacbeb4e0fd76370d04a34508603f8",
+      "gitBlobSha1": "7e3c88cdeb6b884e31208b75c8d4a027dfe4e7bd"
+    },
+    {
+      "path": "kernel/vendor/src/ops/kernel/gqa_attention_prefill_common.cuh",
+      "bytes": 7481,
+      "sha256": "c1c25e1734853a8a5a7c9020c223fa8a3f3edbe41d4d0bb10905a06bcb81bc3f",
+      "gitBlobSha1": "fd529c0342bdb06d5ec85aa100f45ec8e5ccff17"
+    },
+    {
+      "path": "kernel/vendor/src/ops/kernel/gqa_attention_geometry.cuh",
+      "bytes": 957,
+      "sha256": "5fbf8456f640f2ebc308c5212e73fa037064af8c8fc10722daab80f0bece92d0",
+      "gitBlobSha1": "9f67e275d0ff60cffcb52f901eba871016b2d92d"
+    },
+    {
+      "path": "kernel/vendor/src/ops/kernel/paged_kv_address.cuh",
+      "bytes": 1743,
+      "sha256": "c62ea55649c65d65117ef4539b64ed4618c2c636124828e651f6837c0e2c4d46",
+      "gitBlobSha1": "ecd756ddf88f9560cb90649ad90b4783ca9e214a"
+    },
+    {
+      "path": "kernel/vendor/src/ops/kernel/hq_codec.cuh",
+      "bytes": 53124,
+      "sha256": "92dbfa9d7abc8d2b6b38320a64db2eedbe15a3a374fe7850e99ded09f451c062",
+      "gitBlobSha1": "2e772a4ed4fd9013006eca8e31f8d8edb08f5c46"
+    },
+    {
+      "path": "kernel/vendor/src/ops/common/math.cuh",
+      "bytes": 1297,
+      "sha256": "5aedc4dccaa3cf3cf75a6b03cbe24c8ef830ef183488f002864103f0c35b760e",
+      "gitBlobSha1": "403922f00ccac9d0a0cca9df4fd1b5c57f56b22d"
+    },
+    {
+      "path": "kernel/vendor/src/ops/common/math.h",
+      "bytes": 1244,
+      "sha256": "2f61fe7900d5584e700c824add008fe5c1d21e7d32a31e93ac9089b9f861f330",
+      "gitBlobSha1": "dbbb88f558cfc52f02933a1ad4f355f0b75de1d8"
+    },
+    {
+      "path": "kernel/vendor/src/ops/common/memory.cuh",
+      "bytes": 3424,
+      "sha256": "68d4ce555d86761aa4c21d49726be2e48d82fcbdc4f6dbe4fc8b7356f945e205",
+      "gitBlobSha1": "11f6253b060b515e48b504b964f32f065a9ab641"
+    },
+    {
+      "path": "kernel/vendor/src/ops/common/mma.cuh",
+      "bytes": 5603,
+      "sha256": "4af04a39c2d1607819d1270ca9b890623e33a372179b00b80a9c8fb1a7f4484c",
+      "gitBlobSha1": "be39ac1478840e01e614271bca16832a921d352c"
+    },
+    {
+      "path": "kernel/vendor/src/ops/common/warp.cuh",
+      "bytes": 1890,
+      "sha256": "7555cb64c0bfd8738209fc25ebe5972f4cb032fee03ea4fc769770da4ec2d839",
+      "gitBlobSha1": "00597abc97cebf7a29a91652426901dc45de367e"
+    },
+    {
+      "path": "kernel/vendor/src/core/paged_kv_cache.h",
+      "bytes": 8990,
+      "sha256": "9b02339d37a22ced1979d1f0bdbc44c75f92cf565bc8834577356f282c8664a8",
+      "gitBlobSha1": "aa5bb35d02ae23a2276822a077415eb2af0cf3ff"
+    },
+    {
+      "path": "kernel/vendor/src/core/layout.h",
+      "bytes": 2996,
+      "sha256": "1e5ef267fd354444795c830f16f9e5b7a6fe59845a59c5b0a6e008fbd2c9ee47",
+      "gitBlobSha1": "20e0a4f5d9ff6a81dca97207be8eb8a7a9ca1252"
+    },
+    {
+      "path": "kernel/vendor/src/core/tensor.h",
+      "bytes": 2158,
+      "sha256": "938c95eb81a85c417d709930dc763936de325a261cb71083a09014768481f27a",
+      "gitBlobSha1": "9b180a9bcb35fd52e96fb890bb0aacc63f4c7a64"
+    },
+    {
+      "path": "kernel/vendor/src/core/arena.h",
+      "bytes": 4613,
+      "sha256": "8369c1f321edc900fab00c83b5d04883959763afad7fe4b73fad45e5d6b3035d",
+      "gitBlobSha1": "5c229c4fc3c9bcb77d58456e8df10627c3b755b1"
+    },
+    {
+      "path": "kernel/vendor/src/core/dtype.h",
+      "bytes": 331,
+      "sha256": "13ab4e833debe24baf9294a9d8eefc3f61a182b914e8a128d1725be3d93574ed",
+      "gitBlobSha1": "9d68741181b3671a1d52de6e7f2e0376f5ef8c21"
+    },
+    {
+      "path": "kernel/vendor/include/ninfer/ops/gqa_attention.h",
+      "bytes": 8704,
+      "sha256": "f375af5a39f81c9593febd88b3c05306582a49e1c7692f57cee1fc09d2027396",
+      "gitBlobSha1": "89da2e5b569fae9cb6e631d5447f8ab22d9c7a80"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "gitBlobSha1": "d645695673349e3947e8e5ae42332d0ac3164cd7"
+    },
+    {
+      "path": "NOTICE",
+      "bytes": 8190,
+      "sha256": "e767777fc7bed59df90d3e93645eff6644e735b171a07cca1d70949b2432f43d",
+      "gitBlobSha1": "0baaba19ac8938771289249b1442ca28e4eb96e9"
+    },
+    {
+      "path": "kernel/vendor/LICENSE",
+      "bytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "gitBlobSha1": "261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64"
+    }
+  ],
+  "modifiedUpstreamFiles": []
+}

@@ -77,11 +77,11 @@ namespace TensorSharp.Cuda
         private IntPtr _tabRingK, _tabRingV, _tabRingPos;
 
         /// <summary>True when a drafter is attached.</summary>
-        public bool HasDrafter => _d != null;
+        public bool HasDrafter => _d != null || HasNinferDrafter;
         /// <summary>The attached drafter's block (anchor included), 0 without one.</summary>
-        public int DraftBlockSize => _d?.BlockSize ?? 0;
+        public int DraftBlockSize => HasNinferDrafter ? _ninferDraftDesc.BlockSize : _d?.BlockSize ?? 0;
         /// <summary>Committed positions a slot's drafter ring keeps.</summary>
-        public int DraftRingRows => _ringRows;
+        public int DraftRingRows => RingRows;
 
         private int DraftRows => MaxSeqs * _d.BlockSize;
         private int Gamma => _d.BlockSize - 1;
@@ -89,6 +89,7 @@ namespace TensorSharp.Cuda
         /// <summary>Loads a drafter. Slots created before this have no ring: create them after.</summary>
         public void AttachDrafter(DraftDesc d)
         {
+            if (_m.Ninfer != null) throw new NotSupportedException("A GGUF drafter cannot be attached to the NInfer target numerical recipe.");
             if (d == null)
                 throw new ArgumentNullException(nameof(d));
             if (_d != null)
@@ -248,7 +249,7 @@ namespace TensorSharp.Cuda
         /// K and V per draft layer, then the position each row holds.</summary>
         private void PlaceRing(Slot s, IntPtr ringBase)
         {
-            int layers = _dl.Length;
+            int layers = RingLayers;
             long step = Align256(RingLayerBytes), off = 0;
             s.RingBase = ringBase;
             s.RingK = new IntPtr[layers];
@@ -266,7 +267,7 @@ namespace TensorSharp.Cuda
         private void ResetRing(Slot s)
         {
             if (s.RingPos != IntPtr.Zero)
-                CudaDriverApi.cuMemsetD8Async(s.RingPos, 0xFF, new UIntPtr(4UL * (ulong)_ringRows), Stream).ThrowOnError();
+                CudaDriverApi.cuMemsetD8Async(s.RingPos, 0xFF, new UIntPtr(4UL * (ulong)RingRows), Stream).ThrowOnError();
         }
 
         private void CopyRing(Slot src, Slot dst)
@@ -399,6 +400,11 @@ namespace TensorSharp.Cuda
         /// </summary>
         public void Draft(Slot[] slots, int[] anchors, int[][] draftsOut, float[][] confOut, float[] logitsOut = null)
         {
+            if (HasNinferDrafter)
+            {
+                ProposeNinfer(slots, anchors, draftsOut, confOut, logitsOut);
+                return;
+            }
             if (_d == null)
                 throw new InvalidOperationException("[q35-cuda] no drafter attached");
             MakeCurrent();

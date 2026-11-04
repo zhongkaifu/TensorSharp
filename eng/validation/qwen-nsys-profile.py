@@ -9,10 +9,12 @@ or throughput benchmark. Requires nsys 2026 CLI and the standard Python library.
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -27,6 +29,71 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("qwen_replay", HERE / "qwen38-agent-replay.py")
 replay = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(replay)
+
+
+# Exact names only: no ambient TS_*, DOTNET_*, cloud credentials, proxies or
+# Python startup hooks are inherited implicitly. Model options belong in spec.env.
+PROCESS_ENV_NAMES = frozenset((
+    "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LD_LIBRARY_PATH",
+    "CUDA_VISIBLE_DEVICES", "CUDA_CACHE_DISABLE", "CUDA_CACHE_PATH",
+    "DOTNET_ROOT", "DOTNET_ROOT_X64", "DOTNET_ROOT_ARM64"))
+# Nsight adds these between launch and _exec. Preserve its interposition across
+# exec; the outer boundary never inherits ambient injection settings implicitly.
+NSIGHT_EXEC_ENV_NAMES = frozenset((
+    "LD_PRELOAD", "CUDA_INJECTION32_PATH", "CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH",
+    "NSYS_SESSION_NAME", "NSYS_CALLBACK_NAME", "NSYS_REPORT_PATH", "NSYS_TARGET_SESSION_ID",
+    "NSYS_PROFILING_SESSION_ID", "NSYS_AGENT_ID", "NSYS_INJECTION_ID", "NSYS_PARENT_PID"))
+START_OPTIONS = frozenset(("--session", "--output", "--sample", "--cpuctxsw", "--force-overwrite"))
+
+
+def validate_server_spec(cfg):
+    if not isinstance(cfg, dict):
+        raise ValueError("server-spec must be a JSON object")
+    command = cfg.get("argv")
+    if (not isinstance(command, list) or not command
+            or not all(isinstance(x, str) and "\0" not in x for x in command) or not command[0]):
+        raise ValueError("server-spec.argv must be a nonempty executable/string array without NUL")
+    env = cfg.get("env", {})
+    if (not isinstance(env, dict) or any(not isinstance(k, str) or not k or "=" in k or "\0" in k
+            or not isinstance(v, str) or "\0" in v for k, v in env.items())):
+        raise ValueError("server-spec.env must map valid nonempty environment names to string values")
+    if "cwd" in cfg and (not isinstance(cfg["cwd"], str) or not cfg["cwd"] or "\0" in cfg["cwd"]
+                         or not Path(cfg["cwd"]).is_dir()):
+        raise ValueError("server-spec.cwd must name an existing directory")
+    return cfg
+
+
+def process_environment(declared=None, *, target_exec=False):
+    names = PROCESS_ENV_NAMES | (NSIGHT_EXEC_ENV_NAMES if target_exec else frozenset())
+    result = {name: os.environ[name] for name in names if name in os.environ}
+    result.setdefault("PATH", os.defpath)
+    result.update(declared or {})
+    return result
+
+
+def linux_proc_available():
+    return Path("/proc/self/stat").exists()
+
+
+def nsys_start_capabilities(executable, env):
+    text = subprocess.check_output([executable, "start", "--help"], text=True,
+                                   stderr=subprocess.STDOUT, timeout=30, env=env)
+    # Only option declarations at a line start count, not prose/example mentions
+    # or a longer option whose prefix happens to match discard-environment.
+    offered = set(re.findall(r"(?m)^[ \t]*(?:-[A-Za-z],?[ \t]+)?(--[a-z][a-z0-9-]*)(?=[\s=,]|$)", text))
+    missing = START_OPTIONS - offered
+    if missing:
+        raise RuntimeError("nsys start does not advertise required options: " + ", ".join(sorted(missing)))
+    return {"help_sha256": hashlib.sha256(text.encode()).hexdigest(), "supported_options": sorted(offered),
+            "discard_environment_supported": "--discard-environment" in offered}
+
+
+def start_command(session, prefix, sampling, capabilities):
+    command = ["start", "--session=" + session, "--output=" + str(prefix),
+               "--sample=" + sampling, "--cpuctxsw=" + sampling, "--force-overwrite=false"]
+    if capabilities["discard_environment_supported"]:
+        command.append("--discard-environment=true")
+    return command
 
 
 def select_row(fixture, scenario, lane, step, max_tokens=None):
@@ -190,11 +257,9 @@ def exec_server(argv):
     parser.add_argument("--pid-file", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
     args = parser.parse_args(argv)
-    cfg = json.loads(args.server_spec.read_text())
+    cfg = validate_server_spec(json.loads(args.server_spec.read_text()))
     command = cfg["argv"]
-    if not command or not all(isinstance(x, str) for x in command):
-        raise ValueError("server-spec.argv must be a nonempty string array")
-    env = dict(os.environ, **cfg.get("env", {}))
+    env = process_environment(cfg.get("env"), target_exec=True)
     if cfg.get("cwd"):
         os.chdir(cfg["cwd"])
     write_server_identity(args.pid_file, args.run_id)
@@ -227,7 +292,7 @@ def main(argv=None):
     if any(not math.isfinite(value) or value <= 0 for value in
            (args.timeout, args.startup_timeout, args.server_exit_timeout, args.server_kill_timeout)):
         parser.error("timeouts must be finite and positive")
-    if not Path("/proc/self/stat").exists():
+    if not linux_proc_available():
         parser.error("Server lifecycle verification requires Linux /proc")
     if urlsplit(args.url).hostname not in ("127.0.0.1", "localhost", "::1"):
         parser.error("Use an isolated loopback server")
@@ -240,7 +305,8 @@ def main(argv=None):
     measured = select_row(fixture, args.scenario, args.lane, args.step, args.max_tokens)
     primes = [select_row(fixture, args.scenario, args.lane, int(s), args.max_tokens)
               for s in args.prime_steps.split(",") if s.strip()]
-    cfg = json.loads(args.server_spec.read_text())
+    cfg = validate_server_spec(json.loads(args.server_spec.read_text()))
+    child_env = process_environment(cfg.get("env"))
     session = "qwen-profile-" + uuid.uuid4().hex[:12]
     run_id = uuid.uuid4().hex
     pid_file = Path(str(prefix) + ".pid")
@@ -249,7 +315,10 @@ def main(argv=None):
               "cpu_sampling": args.cpu_sampling, "trace": args.trace, "prime_results": [],
               "scope": "One isolated request, including decode. Profiling perturbs timings; compare unprofiled runs separately.",
               "gpu_gap_limit": "Wall time minus GPU activity is host/queue/idle time, not measured CPU execution time. Process CPU counters are separate, summed over threads.",
-              "complete": False}
+              "complete": False, "capture_status": "NOT_RUN",
+              "environment_policy": {"inherited_process_names": sorted(PROCESS_ENV_NAMES & os.environ.keys()),
+                  "declared_spec_names": sorted(cfg.get("env", {})), "target_injection_names": sorted(NSIGHT_EXEC_ENV_NAMES),
+                  "ambient_environment_copied": False}}
     profiler_log = open(str(prefix) + ".nsys.log", "w")
     server_log = open(str(prefix) + ".server.log", "w")
     Path(str(prefix) + ".json").write_text(json.dumps(report, indent=2) + "\n")
@@ -260,15 +329,16 @@ def main(argv=None):
 
     def nsys(*command, timeout=180):
         subprocess.run([args.nsys, *command], check=True, stdout=profiler_log,
-                       stderr=subprocess.STDOUT, timeout=timeout)
+                       stderr=subprocess.STDOUT, timeout=timeout, env=child_env)
 
     try:
-        report["nsys_version"] = subprocess.check_output([args.nsys, "--version"], text=True).strip()
+        report["nsys_version"] = subprocess.check_output([args.nsys, "--version"], text=True, stderr=subprocess.STDOUT, timeout=30, env=child_env).strip()
+        report["nsys_start_capabilities"] = nsys_start_capabilities(args.nsys, child_env)
         launch = [args.nsys, "launch", "--session-new=" + session, "--trace=" + args.trace,
                   "--cuda-graph-trace=node", sys.executable, str(Path(__file__).resolve()), "_exec",
                   "--server-spec", str(args.server_spec.resolve()), "--pid-file", str(pid_file),
                   "--run-id", run_id]
-        launcher = subprocess.Popen(launch, stdout=server_log, stderr=subprocess.STDOUT)
+        launcher = subprocess.Popen(launch, stdout=server_log, stderr=subprocess.STDOUT, env=child_env)
         launched = True
         deadline = time.monotonic() + args.startup_timeout
         while True:
@@ -296,9 +366,8 @@ def main(argv=None):
             report["prime_results"].append(result)
             if result["errors"] or not result["done"]:
                 raise RuntimeError("Cache priming failed; inspect metadata")
-        nsys("start", "--session=" + session, "--output=" + str(prefix),
-             "--sample=" + args.cpu_sampling, "--cpuctxsw=" + args.cpu_sampling,
-             "--discard-environment=true", "--force-overwrite=false")
+        nsys(*start_command(session, prefix, args.cpu_sampling, report["nsys_start_capabilities"]))
+        report["capture_status"] = "COLLECTING"
         collecting = True
         cpu_before = process_counters(pid, identity)
         report["request_started_unix_ns"] = time.time_ns()
@@ -318,7 +387,10 @@ def main(argv=None):
             raise RuntimeError("Measured request did not finish correctly")
         nsys("export", "--type=sqlite", "--output=" + str(prefix) + ".sqlite", str(prefix) + ".nsys-rep")
         report["capture_complete"] = True
+        report["capture_status"] = "EXECUTED_COMPLETE"
     except BaseException as error:
+        if report["capture_status"] == "COLLECTING":
+            report["capture_status"] = "INCOMPLETE_NOT_PASS"
         report["error"] = repr(error)
         failure = error
     finally:
@@ -367,7 +439,7 @@ def main(argv=None):
     try:
         subprocess.run([sys.executable, str(HERE / "qwen-nsys-summary.py"),
                         "--sqlite", str(prefix) + ".sqlite", "--request", str(prefix) + ".json",
-                        "--output", str(prefix) + ".summary.json"], check=True)
+                        "--output", str(prefix) + ".summary.json"], check=True, env=child_env)
         report["summary_complete"] = True
         report["complete"] = True
     except BaseException as error:

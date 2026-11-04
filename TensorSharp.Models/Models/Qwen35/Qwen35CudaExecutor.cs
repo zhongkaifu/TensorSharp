@@ -11,8 +11,8 @@ namespace TensorSharp.Models
 {
     /// <summary>
     /// Qwen3.5 / Qwen3.8 dense on the direct-CUDA engine (<see cref="Q35CudaEngine"/>): reads the
-    /// GGUF's hyper-parameters and hands the engine its weights as shard offsets its loader streams
-    /// into VRAM (NVFP4 projections repacked on the way).
+    /// GGUF's hyper-parameters or the validated NInfer recipe and hands the engine bounded weight
+    /// sources its loader streams into VRAM (NVFP4 byte planes repacked without requantization).
     /// </summary>
     public sealed partial class Qwen35CudaExecutor : IDisposable
     {
@@ -40,6 +40,14 @@ namespace TensorSharp.Models
         public Qwen35CudaExecutor(string ggufPath, int maxContext, int nUbatch, string draftGgufPath = null)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
+            if (NinferQwen38ModelSource.IsNinferArtifact(ggufPath))
+            {
+                NinferQwen38ModelSource.ValidateExecutionRoute(TensorSharp.Runtime.BackendType.Cuda, 1, null, 1, draftGgufPath);
+                using var source = NinferQwen38ModelSource.Open(ggufPath);
+                InitializeNinfer(source, maxContext, nUbatch);
+                Console.Error.WriteLine($"[{Tag}] NInfer target ready in {sw.Elapsed.TotalSeconds:F1}s");
+                return;
+            }
             _gguf = new GgufShardSet(ggufPath, Tag);
             try
             {

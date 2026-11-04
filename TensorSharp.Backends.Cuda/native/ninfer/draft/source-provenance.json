@@ -1,0 +1,92 @@
+{
+  "repository": "gpillon/ignis",
+  "revision": "e600a7d9e0d5921d767a6cb464373583b3cdcaf4",
+  "reference_ninfer_revision": "a00648cb828457986cf5b4b4f712b4cbcd7af0d1",
+  "license": "Apache-2.0",
+  "unchanged_headers": "upstream/manifest.json",
+  "adaptation": "../tensorsharp_q35_ninfer_draft.cu",
+  "adaptations": [
+    "Standalone CUDA-driver exports; original NVFP4 bytes and BF16 storage, no A4 activation quantization",
+    "Original GEMV/small-T device helpers and production schedules with entry prologue and BF16 epilogue adapters",
+    "Original fused SwiGLU schedule with its gate/up pair row ownership, no intermediate BF16 projection round",
+    "Plain BF16 RMS reductions D128 and D5120, original dynamic-convolution and selector arithmetic",
+    "DflashText1D double range-reduced RoPE, device frequency pointer instead of by-value table",
+    "Original unchanged SWA partial MMA body and copied T-specific warp reduce",
+    "Ignis two-pass top16 selection; unary is widened directly from selected original BF16 logit",
+    "Owned bounded feature concat/block packing/ring copies; source ring capacity remains2048"
+  ],
+  "sources": [
+    {
+      "path": "kernel/vendor/src/ops/kernel/rmsnorm.cuh",
+      "blob": "1c873713d418b62ef84bcb9a025f98fa1317ccbe",
+      "sha256": "d2efc2716136fb89d1e6192a9bfaa424126a7f8fa759fadc629c8eca4f739832",
+      "bytes": 13355
+    },
+    {
+      "path": "kernel/vendor/src/ops/launcher/rmsnorm.cu",
+      "blob": "192b46be7939ce658a28c35efe7b34d9b0221639",
+      "sha256": "4d764b8e746d2e9a0e168f339d473a59b1bb022bab2ea4704c7c99f980e44055",
+      "bytes": 8273
+    },
+    {
+      "path": "kernel/vendor/src/ops/kernel/rope.cuh",
+      "blob": "62588e09b22765ea6dc5ec4f4bcb3f24ee966c4e",
+      "sha256": "ea5a011e8caeb6faed8c35d3101ab4578f78a0cd2499230bde57bdfe5a7c0c4c",
+      "bytes": 16152
+    },
+    {
+      "path": "kernel/vendor/src/ops/wrapper/rope.cpp",
+      "blob": "0aa1a2d7b1ce5e87afe44a2756578f339b971bee",
+      "sha256": "c2639a7112eb030ed1f048aec694a51734c176f294c4b073bb97ed2de58fd51c",
+      "bytes": 7448
+    },
+    {
+      "path": "kernel/vendor/src/ops/kernel/dflash2_draft.cuh",
+      "blob": "e58a7d1bbc08d73f102b59db541bf1bbead71005",
+      "sha256": "80f0978bcbe7767274068df32585a13e7336290d616b1a47357f6d77726a6435",
+      "bytes": 12394
+    },
+    {
+      "path": "kernel/vendor/src/ops/launcher/swa.cu",
+      "blob": "b9c667f464c074bd01ad6a6ba2be2f577dc7d30e",
+      "sha256": "5460058daac6f9fc78a70a0ff175c5b0510369d23719cd1e9021602829c71204",
+      "bytes": 7196
+    },
+    {
+      "path": "kernel/vendor/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu",
+      "blob": "a574274dfaa50c6e90f02d53f740e33042f3295a",
+      "sha256": "b810b70ae841239fb2bda874faa492a745ecbdd12ed83a973affd5ec85de5c3f",
+      "bytes": 3891
+    },
+    {
+      "path": "kernel/vendor/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu",
+      "blob": "83942b5b5569068cefffe435d280efa4c0201a5d",
+      "sha256": "6e8e046babdcf80ba7db5e9e35369bf5ca1de0797890d641d83602ac90ebf12e",
+      "bytes": 5578
+    },
+    {
+      "path": "kernel/src/dflash2_topk.cu",
+      "blob": "ecdae581f8e22da59a1b33c1dd6527d68c5588e6",
+      "sha256": "c33d96738ed848bd334a521d5eee5dcb4920bfcb6f95495c0e6ee2436e0ac83e",
+      "bytes": 10036
+    },
+    {
+      "path": "kernel/vendor/src/ops/kernel/prepare_masked_block.cuh",
+      "blob": "825f8c6c16bad304b777f07079c35b53e23ed81d",
+      "sha256": "6fd00ca25ded45ad1dadb4f08a3822246732d699fba7e9f982c8b4aea7037f36",
+      "bytes": 822
+    },
+    {
+      "path": "kernel/vendor/src/ops/kernel/kv_cache_append_prefix.cuh",
+      "blob": "dc2c9904aca1cd5206355af85c6e699ee3e580c6",
+      "sha256": "a622f00d492fd26cb3c0c896d3d7a9d3d75c6eab16e4a15074d177e5225beb91",
+      "bytes": 7469
+    },
+    {
+      "path": "kernel/vendor/src/ops/kernel/residual_add.cuh",
+      "blob": "c8aacbb51fe3a4cb73ba08ab1d624559a950b6cb",
+      "sha256": "fc8b3571bafdb797fa298896db79f9155fd2126e307aa2307fc0161966c5dac1",
+      "bytes": 3584
+    }
+  ]
+}

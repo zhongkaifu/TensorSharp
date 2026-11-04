@@ -78,6 +78,24 @@ public sealed class NinferResourceDescriptor : NinferObjectDescriptor
 /// </summary>
 public sealed class NinferArtifactReader : IDisposable
 {
+    /// <summary>Recognizes the NInfer family before selecting a format parser; the reader still validates its version and directory.</summary>
+    public static bool IsNinferArtifact(string path)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        bool hint = string.Equals(Path.GetExtension(path), ".ninfer", StringComparison.OrdinalIgnoreCase);
+        try
+        {
+            using var stream = File.OpenRead(path);
+            Span<byte> magic = stackalloc byte[8];
+            int count = stream.ReadAtLeast(magic, magic.Length, throwOnEndOfStream: false);
+            if (count >= 4 && magic[..4].SequenceEqual("GGUF"u8)) return false;
+            if (count >= 7 && magic[..7].SequenceEqual("NINFER\0"u8)) return true;
+            return hint; // A damaged explicitly named artifact gets this parser's refusal.
+        }
+        catch (FileNotFoundException) when (hint) { return true; }
+        catch (DirectoryNotFoundException) when (hint) { return true; }
+    }
+
     public const string GeometrySpecificationRevision = "e600a7d9e0d5921d767a6cb464373583b3cdcaf4";
     public const string GeometrySpecificationSourceSha256 = "e264fe3522e4fa07b21f66bf31e9877987396b59c55ae71e7a639b79ad434a73";
     private readonly SafeFileHandle _handle;
@@ -86,6 +104,8 @@ public sealed class NinferArtifactReader : IDisposable
     private long _bytesRead, _readOperations;
     public string FullPath { get; }
     public long FileBytes { get; }
+    /// <summary>Original open-handle timestamp for cache identity; not a payload checksum.</summary>
+    public long FileLastWriteUtcTicks { get; }
     public int MetadataBytes { get; }
     public long PayloadStart { get; }
     public NinferArtifactIdentity Identity { get; }
@@ -110,6 +130,7 @@ public sealed class NinferArtifactReader : IDisposable
         try
         {
             FileBytes = RandomAccess.GetLength(_handle);
+            FileLastWriteUtcTicks = File.GetLastWriteTimeUtc(_handle).Ticks;
             Require(FileBytes >= 8, "Artifact shorter than magic.");
             Span<byte> prefix = stackalloc byte[16];
             ReadRange(0, prefix[..8]);

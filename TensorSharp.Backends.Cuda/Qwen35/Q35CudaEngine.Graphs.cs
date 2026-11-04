@@ -189,6 +189,8 @@ namespace TensorSharp.Cuda
 
         private void InvalidateVerifyGraphs()
         {
+            ForgetNinferVerification();
+            InvalidateNinferDecodeGraphs();
             if (_verifyGraphCount > 0)
             {
                 MakeCurrent();

@@ -19,7 +19,7 @@ namespace TensorSharp.Cuda
         internal const long OutputW8LogitsBytes = (long)OutputW8ScratchRows * CudaW8G32HeadModule.Vocabulary * 2;
         public bool OutputW8Enabled => _outputW8 != null;
         public bool OutputW8TargetEnabled => UsesW8TargetHead(_outputW8);
-        public bool OutputW8DraftEnabled => _outputW8 != null;
+        public bool OutputW8DraftEnabled => _outputW8 != null && _m.Ninfer == null;
         internal static bool UsesW8TargetHead(CudaW8HeadWeightDesc head)
             => head != null && head.Scope == CudaW8HeadScope.TargetAndDraft;
         public readonly record struct OutputW8Diagnostic(string Profile, string PayloadSha256,
@@ -32,10 +32,10 @@ namespace TensorSharp.Cuda
             bool verifyGraphs, bool draftGraphs)
         {
             if (head == null) return;
-            if (model.NEmbd != CudaW8G32HeadModule.Width || model.NVocab != CudaW8G32HeadModule.Vocabulary
+            if (model.Ninfer == null && (model.NEmbd != CudaW8G32HeadModule.Width || model.NVocab != CudaW8G32HeadModule.Vocabulary
                 || model.Output.GgmlType != TQ6_K || model.Output.Ne0 != CudaW8G32HeadModule.Width
                 || model.Output.Ne1 != CudaW8G32HeadModule.Vocabulary || model.Output.Ne2 != 1
-                || model.Output.RowBytes != CudaW8G32HeadModule.Width / 256 * 210)
+                || model.Output.RowBytes != CudaW8G32HeadModule.Width / 256 * 210))
                 throw new NotSupportedException("The W8 companion only replaces the existing 248320x5120 Q6_K output head.");
             if (verifyGraphs || draftGraphs)
                 throw new NotSupportedException("The W8 companion has not validated either CUDA graph path; both graph opt-ins must be OFF.");
@@ -115,9 +115,9 @@ namespace TensorSharp.Cuda
             ScratchBufferSpans = spans.AsReadOnly();
             OutputW8Info = new(_outputW8.Profile, _outputW8PayloadSha, _outputW8Module.ImageSha256.ToLowerInvariant(),
                 _outputW8.ModulePath, _outputW8.Provenance, _outputW8.Bytes, OutputW8InputBytes, OutputW8LogitsBytes,
-                OutputW8TargetEnabled ? "target-logits-and-draft-proposals" : "draft-proposals-only", _outputW8.Scope);
+                _m.Ninfer != null ? "target-logits" : OutputW8TargetEnabled ? "target-logits-and-draft-proposals" : "draft-proposals-only", _outputW8.Scope);
             _outputW8Namespace = OutputW8StateSuffix(_outputW8.Profile, _outputW8PayloadSha, _outputW8Module.ImageSha256, _outputW8.Scope);
-            Console.Error.WriteLine("[q35-cuda] experimental output-head companion " + JsonSerializer.Serialize(OutputW8Info));
+            Console.Error.WriteLine((_m.Ninfer != null ? "[q35-cuda] NInfer target W8 output " : "[q35-cuda] experimental output-head companion ") + JsonSerializer.Serialize(OutputW8Info));
         }
         private string _outputW8PayloadSha;
         private void OutputW8Head(IntPtr input, int rows, IntPtr output, long outputBytes)

@@ -62,6 +62,7 @@ namespace TensorSharp.Cuda
             public float RopeBase, Eps;
             public int NCtx, NUbatch;
             public CudaWeightDesc TokEmbd, Output;
+            public CudaNinferModelDesc Ninfer;
             /// <summary>Explicit experimental companion output head; null retains the original Q6 path.</summary>
             public CudaW8HeadWeightDesc OutputW8;
             public float[] OutputNorm;
@@ -235,7 +236,9 @@ namespace TensorSharp.Cuda
         public Q35CudaEngine(ModelDesc m)
         {
             _m = m ?? throw new ArgumentNullException(nameof(m));
-            _outputW8 = m.OutputW8;
+            _outputW8 = m.Ninfer?.Output ?? m.OutputW8;
+            ValidateNinferModel(m);
+            PreflightNinferFlashInfer();
             if (m.HeadDim != Q35Kernels.AttnHeadDim)
                 throw new NotSupportedException($"[q35-cuda] attention head_dim {m.HeadDim} (the kernels take {Q35Kernels.AttnHeadDim})");
             if (m.NKvHead <= 0 || m.NHead % m.NKvHead != 0 || m.NHead / m.NKvHead > Q35Kernels.AttnBlockRows)
@@ -258,21 +261,27 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuDeviceGetAttribute(out _sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, 0).ThrowOnError();
 
                 InitializeOutputW8Module();
+                InitializeNinferModules();
                 var sw = Stopwatch.StartNew();
                 _layers = new Layer[m.NLayer];
                 using (var loader = new Loader(this))
                 {
                     for (int il = 0; il < m.NLayer; il++)
                     {
-                        _layers[il] = LoadLayer(loader, m.Layers[il]);
+                        _layers[il] = m.Ninfer == null ? LoadLayer(loader, m.Layers[il]) : LoadNinferLayer(loader, il);
                         _layers[il].Ordinal = _layers[il].Recurrent ? _nGdn++ : _nAttn++;
                     }
-                    _tokEmbd = loader.Raw(m.TokEmbd, TQ4_0, out _tokEmbdRowBytes);
+                    if (m.Ninfer == null)
+                        _tokEmbd = loader.Raw(m.TokEmbd, TQ4_0, out _tokEmbdRowBytes);
+                    else if (!TryLoadNinferHostEmbedding())
+                        _tokEmbd = LoadNinferMatrix(loader, m.Ninfer.Embedding).Data;
                     if (!OutputW8TargetEnabled)
                         _output = loader.Raw(m.Output, TQ6_K, out _outputRowBytes);
                     if (_outputW8 != null)
                         _outputW8Weights = loader.W8(_outputW8, out _outputW8PayloadSha);
                 }
+                CompleteNinferLoadRepack();
+                CompleteNinferFlashInferLoad();
                 _outputNorm = UploadF32(m.OutputNorm);
                 AllocateScratch();
                 AllocateOutputW8Scratch();
@@ -282,7 +291,7 @@ namespace TensorSharp.Cuda
             }
             catch
             {
-                if (_outputW8 != null && _alloc != null)
+                if (_alloc != null)
                 {
                     try { Dispose(); }
                     catch (Exception cleanup) { Console.Error.WriteLine("[q35-cuda] companion construction cleanup failed: " + cleanup.Message); }
@@ -327,7 +336,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>Streams weight bytes from their source through pinned host and device staging:
         /// NVFP4 matrices are repacked into planes on the device, other weights copied as stored.</summary>
-        private sealed class Loader : IDisposable
+        private sealed partial class Loader : IDisposable
         {
             private const long StagingBytes = 128L << 20;
             private readonly Q35CudaEngine _e;
@@ -610,14 +619,14 @@ namespace TensorSharp.Cuda
             var slots = new[] { _active };
             EnsureRoom(slots, tokens.Length);
             // The drafter keeps the last ringRows positions: tap only the rows that reach them.
-            int tapFrom = _d == null ? int.MaxValue : _active.NPast + tokens.Length - _ringRows;
+            int tapFrom = !HasDrafter ? int.MaxValue : _active.NPast + tokens.Length - RingRows;
             _embedSpans = embeds;
             try
             {
                 for (int start = 0; start < tokens.Length; start += _m.NUbatch)
                 {
                     int n = Math.Min(_m.NUbatch, tokens.Length - start);
-                    int first = _d == null ? n : Math.Clamp(tapFrom - (_active.NPast), 0, n);
+                    int first = !HasDrafter ? n : Math.Clamp(tapFrom - (_active.NPast), 0, n);
                     RunRows(slots, n, tokens, start, ropePos, tokens.Length, verify: false, tapFirst: first);
                 }
             }
@@ -658,6 +667,9 @@ namespace TensorSharp.Cuda
         /// </summary>
         public void Verify(Slot[] slots, int window, int[] tokens, int[] drawnOut, float[] logitsOut = null)
         {
+            RequireNinferVerification();
+            ValidateNinferVerifyRequest(slots, window, tokens, drawnOut, logitsOut);
+            if (_m.Ninfer != null) ForgetNinferVerification();
             int n = slots.Length * window;
             if (window < 1 || n > MaxVerifyRows || tokens.Length < n || drawnOut.Length < n)
                 throw new ArgumentException($"[q35-cuda] verify of {slots.Length} x {window} rows (at most {MaxVerifyRows})");
@@ -666,8 +678,9 @@ namespace TensorSharp.Cuda
             EnsureVerifyBuffers();
             RunRows(slots, window, tokens, 0, null, n, verify: true, tapFirst: 0);
             _verifyRow0 = 0;
-            _k.AddRmsNorm(_x, _block, _outputNorm, _xn, n, _m.NEmbd, _m.Eps, Stream);
+            FinalNorm(_x, _block, _outputNorm, _xn, n, _m.NEmbd, _m.Eps, Stream);
             Head(_xn, n, logitsOut, drawnOut);
+            RecordNinferVerification(slots, window);
         }
 
         // The row of the last verify's first window row in the step's activations (its drafter taps).
@@ -685,6 +698,7 @@ namespace TensorSharp.Cuda
         public void MixedVerify(Slot prefill, int[] prefillTokens, float[] prefillLogits, Slot[] slots, int window, int[] tokens, int[] drawnOut,
             int[] ropePos = null, IReadOnlyList<EmbeddingSpan> embeds = null)
         {
+            if (_m.Ninfer != null) throw new NotSupportedException("NInfer target mixed draft verification is not yet supported.");
             int p = prefillTokens.Length, nv = slots.Length * window, e = _m.NEmbd;
             if (p < 1 || window < 1 || nv > MaxVerifyRows || p + nv > RowCap || tokens.Length < nv || drawnOut.Length < nv
                 || Array.IndexOf(slots, prefill) >= 0 || (ropePos != null && ropePos.Length < 4 * p))
@@ -714,9 +728,9 @@ namespace TensorSharp.Cuda
             _verifyRow0 = p;
             _k.CopyRows(_x + (nint)((long)(p - 1) * e * 4), e, _lastX, e, e, 1, Stream);
             _k.CopyRows(_block + (nint)((long)(p - 1) * e * 4), e, _lastBlock, e, e, 1, Stream);
-            _k.AddRmsNorm(_lastX, _lastBlock, _outputNorm, _xn, 1, e, _m.Eps, Stream);
+            FinalNorm(_lastX, _lastBlock, _outputNorm, _xn, 1, e, _m.Eps, Stream);
             Head(_xn, 1, prefillLogits, null);
-            _k.AddRmsNorm(_x + (nint)((long)p * e * 4), _block + (nint)((long)p * e * 4), _outputNorm, _xn, nv, e, _m.Eps, Stream);
+            FinalNorm(_x + (nint)((long)p * e * 4), _block + (nint)((long)p * e * 4), _outputNorm, _xn, nv, e, _m.Eps, Stream);
             Head(_xn, nv, null, drawnOut);
         }
 
@@ -734,6 +748,7 @@ namespace TensorSharp.Cuda
         /// recurrent states advance over them and the position moves past them.</summary>
         public void Commit(Slot[] slots, int window, int[] kept)
         {
+            if (_m.Ninfer != null) { CommitNinfer(slots, window, kept); return; }
             MakeCurrent();
             BindSlots(slots);
             for (int i = 0; i < slots.Length; i++)
@@ -812,6 +827,7 @@ namespace TensorSharp.Cuda
         /// recurrence per group over its own sequences. Rows from tapFirst on feed the drafter.</summary>
         private void RunGroupsCore(int tapFirst, RowGroup[] groups)
         {
+            RequireNoPendingNinferVerification();
             int e = _m.NEmbd, nt = RowCap, n = 0, nSeq = 0;
             foreach (var g in groups)
             {
@@ -849,7 +865,10 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuMemcpyHtoDAsync(_rowsDev, _pinned, new UIntPtr((7UL * (ulong)nt + MaxSeqs) * 4), Stream).ThrowOnError();
             Sync();
 
-            _k.EmbedQ4_0(_tokEmbd, _tokEmbdRowBytes, _tokensDev, _x, n, e, Stream);
+            if (_m.Ninfer == null)
+                _k.EmbedQ4_0(_tokEmbd, _tokEmbdRowBytes, _tokensDev, _x, n, e, Stream);
+            else if (!TryHostNinferEmbedding(n))
+                _ninfer.EmbedW8(_tokEmbd, _tokensDev, _x, n, e, _m.NVocab, Stream);
             if (_embedSpans != null)
             {
                 // Embedding overrides belong to the first group (a forward's prompt chunk).
@@ -878,7 +897,8 @@ namespace TensorSharp.Cuda
                     maxKeys[gi] = Math.Max(maxKeys[gi], s.NPast);
                 maxKeys[gi] += groups[gi].RowsPerSeq;
             }
-            RunVerifyLayerPass(n, tapFirst, groups, maxKeys);
+            if (!TryRunNinferDecodeGraph(n, tapFirst, groups, maxKeys))
+                RunVerifyLayerPass(n, tapFirst, groups, maxKeys);
             for (int gi = 0, r0 = 0, q0 = 0; gi < groups.Length; r0 += groups[gi].Rows, q0 += groups[gi].Slots.Length, gi++)
             {
                 var g = groups[gi];
@@ -892,6 +912,8 @@ namespace TensorSharp.Cuda
                 }
                 if (_d != null)
                     DraftInjectRun(g.Slots, g.RowsPerSeq, Math.Clamp(tapFirst - r0, 0, g.Rows), before, g.Counts, r0, q0);
+                if (HasNinferDrafter)
+                    InjectNinferDraftRun(g, r0, q0, tapFirst, before);
             }
         }
 
@@ -899,6 +921,11 @@ namespace TensorSharp.Cuda
         // updates, drafter injection and all host reads stay in RunGroups or its caller.
         private void RunLayerKernels(int n, int tapFirst, RowGroup[] groups, int[] maxKeys)
         {
+            if (_m.Ninfer != null)
+            {
+                RunNinferLayers(n, tapFirst, groups, maxKeys);
+                return;
+            }
             if (TryRunVerifyDecodeQ81(n, tapFirst, groups, maxKeys))
                 return;
             _servingTrace?.LayerBranch(n <= Q35Kernels.GemvMaxRows ? "native_default_W4A8_Q81" : "native_default_W4A4");
@@ -1007,7 +1034,7 @@ namespace TensorSharp.Cuda
                     _k.CopyRows(_x + (nint)(row * e * 4), e, _lastX + (nint)((long)q * e * 4), e, e, 1, Stream);
                     _k.CopyRows(_block + (nint)(row * e * 4), e, _lastBlock + (nint)((long)q * e * 4), e, e, 1, Stream);
                 }
-                _k.AddRmsNorm(_lastX, _lastBlock, _outputNorm, _xn, group.Length, e, _m.Eps, Stream);
+                FinalNorm(_lastX, _lastBlock, _outputNorm, _xn, group.Length, e, _m.Eps, Stream);
                 var flatLogits = new float[(long)group.Length * _m.NVocab];
                 Head(_xn, group.Length, flatLogits, null);
                 for (int q = 0; q < group.Length; q++)
@@ -1027,7 +1054,7 @@ namespace TensorSharp.Cuda
             long last = (long)(rowsPerSeq - 1) * e * 4;
             _k.CopyRows(_x + (nint)last, (long)rowsPerSeq * e, _lastX, e, e, nSeq, Stream);
             _k.CopyRows(_block + (nint)last, (long)rowsPerSeq * e, _lastBlock, e, e, nSeq, Stream);
-            _k.AddRmsNorm(_lastX, _lastBlock, _outputNorm, _xn, nSeq, e, _m.Eps, Stream);
+            FinalNorm(_lastX, _lastBlock, _outputNorm, _xn, nSeq, e, _m.Eps, Stream);
             Head(_xn, nSeq, logitsOut, argmaxOut);
         }
 
@@ -1123,16 +1150,25 @@ namespace TensorSharp.Cuda
                 Sync();
                 FreeDraftGraphs();
                 FreeVerifyGraphs();
+                InvalidateNinferDecodeGraphs();
                 FreeSlot(_active);
                 ReleaseFreeBlocks();
                 ReleaseFreeArenas();
                 FreeHostPool();
+                DisposeNinferHostEmbedding();
                 foreach (IntPtr p in _owned)
                     CudaDriverApi.cuMemFree(p);
                 _owned.Clear();
                 if (_pinned != IntPtr.Zero)
                     CudaDriverApi.cuMemFreeHost(_pinned);
                 _pinned = IntPtr.Zero;
+                DisposeNinferLoadRepack();
+                DisposeNinferA16Candidate();
+                DisposeNinferExactVerify();
+                DisposeNinferFlashInfer();
+                DisposeNinferDraft();
+                _ninfer?.Dispose();
+                _ninferAttention?.Dispose();
                 _outputW8Module?.Dispose();
                 _outputW8Module = null;
                 _k?.Dispose();

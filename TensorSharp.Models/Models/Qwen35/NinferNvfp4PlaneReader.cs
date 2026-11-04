@@ -119,6 +119,17 @@ public sealed class NinferNvfp4PlaneReader : IDisposable
         };
     }
 
+    /// <summary>Original object bytes only, for an independently validated GPU layout
+    /// repacker. Ownership, bounds and liveness remain enforced by this reader.</summary>
+    internal void ReadOriginalRange(ulong offset, Span<byte> destination)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _reader.ReadObjectRange(OriginalWeights, offset, destination);
+        }
+    }
+
     /// <summary>Reads full source128-row blocks, then returns a complete converted destination tile.
     /// Gate/up can use two nonadjacent source blocks; GQA never assumes source equals destination.
     /// Every original E2M1 nibble, including negative codes/negativezero, is preserved.

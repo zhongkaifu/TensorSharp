@@ -24,7 +24,7 @@ using TensorSharp.Runtime.Speculative;
 
 namespace TensorSharp.Models
 {
-    public sealed class Qwen35CudaModel : ModelBase, IBatchedPagedModel, IPrefixCacheModel, IPrefixCacheModelDiagnostics,
+    public sealed partial class Qwen35CudaModel : ModelBase, IBatchedPagedModel, IPrefixCacheModel, IPrefixCacheModelDiagnostics,
         ISpeculativeModel, IBatchedSpeculativeTarget, IMixedStepPrefillTarget, IVisionCapableModel, IMRoPEPositionSink, IMultimodalPromptExpander
     {
         private const string Tag = "q35-cuda";
@@ -99,15 +99,7 @@ namespace TensorSharp.Models
                     maxContext = Math.Min(maxContext, 65536);
                 int nUbatch = ParseEnvInt("TS_Q35_UBATCH", 2048);
                 _exec = new Qwen35CudaExecutor(ggufPath, maxContext, nUbatch, Qwen35Model.ResolveQwen35DFlashPath(draftGgufPath));
-                _exec.Engine.ReclaimMemory = ReclaimDeviceMemory;
-                _hostBudgetBytes = ResolveHostBudgetBytes();
-                // The pinner fills the whole budget from load on: pinning beside the copies slowed them
-                // several times over.
-                _exec.Engine.ConfigureHostPool(_hostBudgetBytes, _hostBudgetBytes);
-                _primarySlot = _exec.ActiveSlot;
-                _maxContextLength = _exec.ContextSize;
-                Config.VocabSize = _exec.VocabSize;
-                _logitsBuffer = new float[Config.VocabSize];
+                InitializeEngineRuntime();
                 Console.WriteLine($"Model: qwen35 on the direct-CUDA engine, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
                     $"Vocab={Config.VocabSize}, n_ctx={_maxContextLength}, drafter={(_exec.Draft != null ? "DFlash2" : "none")}");
             }
@@ -141,6 +133,7 @@ namespace TensorSharp.Models
 
         public override string KVStateFingerprint =>
             $"qwen35|exec=cuda|L={Config.NumLayers}|H={Config.HiddenSize}|V={Config.VocabSize}|ctx={_maxContextLength}" +
+            (_ninferCacheIdentity == null ? string.Empty : "|ninfer=" + _ninferCacheIdentity) +
             (_exec?.Engine?.KVStateNamespaceSuffix ?? string.Empty);
 
         /// <summary>Host metadata diagnostics only, immutable at native engine construction.</summary>
@@ -220,6 +213,8 @@ namespace TensorSharp.Models
         /// its rows enter the engine's forward as embedding overrides copied device to device.</summary>
         public void LoadVisionEncoder(string mmProjPath)
         {
+            if (_ninferCacheIdentity != null)
+                throw new NotSupportedException("The complete NInfer route currently implements the target text body; NInfer vision preprocessing/tower inference is not implemented.");
             _visionAllocator ??= new TensorSharp.Cuda.CudaAllocator(0);
             _vision = new Qwen35VisionEncoder(mmProjPath, _visionAllocator);
             _vision.SetHostModel(this);
@@ -302,7 +297,8 @@ namespace TensorSharp.Models
         {
             try
             {
-                ForwardCore(new[] { Tokenizer?.BosTokenId ?? 0 });
+                int bos = Tokenizer?.BosTokenId ?? -1;
+                ForwardCore(new[] { bos >= 0 ? bos : 0 });
             }
             catch (Exception ex)
             {
@@ -847,8 +843,8 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- speculation
 
-        private bool HasDrafter => _exec?.Draft != null;
-        private int DraftWidth => HasDrafter ? _exec.Draft.BlockSize - 1 : 0;
+        private bool HasDrafter => _exec?.Engine?.HasDrafter == true;
+        private int DraftWidth => HasDrafter ? _exec.Engine.DraftBlockSize - 1 : 0;
 
         public bool SpeculationProfitable => HasDrafter;
         public bool SpecTrunkFollowsBoundCache => true;
@@ -968,7 +964,9 @@ namespace TensorSharp.Models
         {
             if (!HasDrafter || sequences < 1 || sequences > TensorSharp.Cuda.Q35CudaEngine.MaxSeqs)
                 return 0;
-            return Math.Min(DraftWidth + 1, TensorSharp.Cuda.Q35CudaEngine.MaxVerifyRows / sequences);
+            if (_exec.Engine.HasNinferDrafter && sequences > _exec.Engine.NinferDraftMaximumLanes)
+                return 0;
+            return Math.Min(DraftWidth + 1, _exec.Engine.NinferExactVerifyMaximumRows / sequences);
         }
 
         public int FusedCacheSeqLen(string requestId)
@@ -1010,6 +1008,8 @@ namespace TensorSharp.Models
                 var slots = SlotsOf(requestIds, positions);
                 if (slots == null || !HasDrafter)
                     return false;
+                if (_exec.Engine.HasNinferDrafter && slots.Length > _exec.Engine.NinferDraftMaximumLanes)
+                    return false;
                 _exec.Engine.Draft(slots, anchors, tokensOut, confOut);
                 return true;
             }
@@ -1021,7 +1021,7 @@ namespace TensorSharp.Models
             lock (_sync)
             {
                 var slots = SlotsOf(requestIds, positions);
-                if (slots == null || window < 1 || slots.Length * window > TensorSharp.Cuda.Q35CudaEngine.MaxVerifyRows)
+                if (slots == null || window < 1 || (long)slots.Length * window > _exec.Engine.NinferExactVerifyMaximumRows)
                     return false;
                 foreach (var s in slots)
                     if (s.NPast + window > _maxContextLength)
@@ -1083,7 +1083,7 @@ namespace TensorSharp.Models
         /// that only decodes beside a cold prompt waits that long per round; 1024 halves it at a
         /// small cost to the prompt (Qwen3.8-27B replay: image_replace c=2 1.02 -> 0.97 of Velox,
         /// c=4 0.99 -> 0.94, the rest unchanged within noise).</summary>
-        public int PreferredMixedStepPrefillTokens => MixedStep ? 1024 : 0;
+        public int PreferredMixedStepPrefillTokens => MixedStep && _ninferCacheIdentity == null ? 1024 : 0;
 
         public bool StageMixedPrefill(string requestId, int[] tokens, int position, bool whole)
         {
@@ -1106,7 +1106,7 @@ namespace TensorSharp.Models
                 _pendingVisionTensors.Clear();
                 // A chunk of a few tokens (a prompt's tail) takes the GEMV's 8-bit activations on its own:
                 // see MixedFp4Verify.
-                if (!MixedStep || requestId == null || tokens == null
+                if (_ninferCacheIdentity != null || !MixedStep || requestId == null || tokens == null
                     || !MixedNumericsAllowed(tokens.Length, int.MaxValue) || tokens.Length > _exec.Engine.UBatch
                     || position + tokens.Length > _maxContextLength || SlotsOf(new[] { requestId }, new[] { position }) == null)
                 {

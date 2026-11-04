@@ -37,7 +37,7 @@ namespace TensorSharp.Cuda
         public Func<bool> ReclaimMemory { get; set; }
 
         /// <summary>Bytes of one token's K (or V) rows in one attention layer.</summary>
-        private long KvRowBytes => (long)_m.NKvHead * Q35Kernels.Q8Row;
+        private long KvRowBytes => (long)_m.NKvHead * (_m.Ninfer == null ? Q35Kernels.Q8Row : Q35Kernels.AttnHeadDim * 2);
         /// <summary>Bytes of one layer's K (or V) rows in a block.</summary>
         private long KvLayerBytes => (long)Q35Kernels.KvBlockTokens * KvRowBytes;
         private long KvBlockBytes => 2L * Math.Max(1, _nAttn) * KvLayerBytes;
@@ -66,7 +66,7 @@ namespace TensorSharp.Cuda
         public long SlotBytes(int capacity) =>
             _nGdn * (ConvBytes + StateBytes)
             + (long)((capacity + Q35Kernels.KvBlockTokens - 1) / Q35Kernels.KvBlockTokens) * KvBlockBytes
-            + (_d == null ? 0 : 2L * _dl.Length * _d.NKvHead * _ringRows * _d.HeadDim * 2 + 4L * _ringRows);
+            + RingBytes;
 
         /// <summary>Makes room for <paramref name="bytes"/> of device memory: the free blocks first,
         /// then retained slots through <see cref="ReclaimMemory"/>.</summary>
@@ -100,8 +100,12 @@ namespace TensorSharp.Cuda
 
         private static long Align256(long bytes) => (bytes + 255) & ~255L;
         private long RecurrentBytes => _nGdn * (Align256(ConvBytes) + Align256(StateBytes));
-        private long RingLayerBytes => (long)_d.NKvHead * _ringRows * _d.HeadDim * 2;
-        private long RingBytes => _d == null ? 0 : 2L * _dl.Length * Align256(RingLayerBytes) + Align256(4L * _ringRows);
+        private int RingLayers => HasNinferDrafter ? 5 : _dl?.Length ?? 0;
+        private int RingHeads => HasNinferDrafter ? 8 : _d?.NKvHead ?? 0;
+        private int RingHeadDim => HasNinferDrafter ? 128 : _d?.HeadDim ?? 0;
+        private int RingRows => HasNinferDrafter ? 2048 : _ringRows;
+        private long RingLayerBytes => (long)RingHeads * RingRows * RingHeadDim * 2;
+        private long RingBytes => !HasDrafter ? 0 : 2L * RingLayers * Align256(RingLayerBytes) + Align256(4L * RingRows);
         private long ArenaBytes => RecurrentBytes + RingBytes;
 
         private void ReleaseFreeArenas()
@@ -168,7 +172,7 @@ namespace TensorSharp.Cuda
                     s.Conv[i] = s.Arena + (nint)off;
                 for (int i = 0; i < _nGdn; i++, off += Align256(StateBytes))
                     s.State[i] = s.Arena + (nint)off;
-                if (_d != null)
+                if (HasDrafter)
                     PlaceRing(s, s.Arena + (nint)off);
                 Grow(s, Math.Min(capacity, _m.NCtx));
             }
@@ -199,6 +203,9 @@ namespace TensorSharp.Cuda
         /// stay valid only for the host slots that hold them).</summary>
         private void EnsureRoom(Slot[] slots, int rows)
         {
+            RequireNoPendingNinferVerification();
+            if (HasNinferDrafter)
+                foreach (var s in slots) RequireNinferDraftRing(s);
             foreach (var s in slots)
             {
                 if (s.NPast + rows > _m.NCtx)
@@ -226,11 +233,13 @@ namespace TensorSharp.Cuda
         /// (copied before any reuse when shared).</summary>
         public void ResetSlot(Slot s)
         {
+            ForgetNinferVerification(s);
             MakeCurrent();
             CudaDriverApi.cuMemsetD8Async(s.Arena, 0, new UIntPtr((ulong)RecurrentBytes), Stream).ThrowOnError();
             ResetRing(s);
             s.NPast = 0;
             s.RopeDelta = 0;
+            ResetNinferDraftSlot(s);
             Sync();
         }
 
@@ -241,6 +250,18 @@ namespace TensorSharp.Cuda
         /// </summary>
         public void CopySlot(Slot src, Slot dst, int tokens = int.MaxValue)
         {
+            if (ReferenceEquals(src, dst))
+                throw new ArgumentException("A slot cannot be copied onto itself.", nameof(dst));
+            NinferDraftSlotSnapshot draftState = null;
+            if (HasNinferDrafter)
+            {
+                RequireNinferDraftRing(src);
+                RequireNinferDraftRing(dst);
+                if (Math.Min(tokens, src.NPast) != src.NPast)
+                    throw new NotSupportedException("NInfer draft/GDN checkpoints cannot rewind a longer slot to a shorter prefix.");
+                draftState = CaptureNinferDraftSlotState(src);
+            }
+            ForgetNinferVerification(dst);
             MakeCurrent();
             int rows = Math.Min(tokens, src.NPast);
             ReleaseBlocks(dst);
@@ -257,6 +278,7 @@ namespace TensorSharp.Cuda
             CopyRing(src, dst);
             dst.NPast = rows;
             dst.RopeDelta = src.RopeDelta;
+            if (HasNinferDrafter) RestoreNinferDraftSlotState(dst, draftState);
             Sync();
         }
 
@@ -264,6 +286,8 @@ namespace TensorSharp.Cuda
         {
             if (s == null)
                 return;
+            ForgetNinferVerification(s);
+            ForgetNinferDraftSlot(s);
             MakeCurrent();
             Sync();
             ReleaseBlocks(s);
@@ -273,7 +297,7 @@ namespace TensorSharp.Cuda
             // An arena of another layout (a slot made before the drafter, its ring apart) is not reused.
             if (s.Arena != IntPtr.Zero)
             {
-                bool current = _d == null ? s.RingBase == IntPtr.Zero : s.RingBase == s.Arena + (nint)RecurrentBytes;
+                bool current = !HasDrafter ? s.RingBase == IntPtr.Zero : s.RingBase == s.Arena + (nint)RecurrentBytes;
                 if (_freeArenas.Count < MaxFreeArenas && current)
                     _freeArenas.Push(s.Arena);
                 else
