@@ -1,16 +1,28 @@
 # Fixed T8 W4A4 components
 
-This standalone experiment changes only the TS-owned GEMM template schedule:
-BN32/3 stages becomes BN8/2 stages. Only five actual T8 projection roles are
-accepted, selected with `--shape`; default is `gdn-input`. Block256 and dynamic
-shared memory76800/43520 bytes remain fixed. Production
-files and existing probes are unchanged. The original Ignis implementation
-informs the smaller activation tile; no foreign format or arithmetic is used.
+This standalone experiment compares TS-owned GEMM schedules. Only five actual
+T8 projection roles are accepted, selected with `--shape`; default is
+`gdn-input`. The optional `--legacy-schedule bn32|bn8` selects the actual legacy
+module's entry. Omitting it preserves the original BN32/3-stage baseline and
+CLI. `bn8` instead compares the already accepted R34 BN8 entry with a new BN8
+candidate, so its timing cannot reuse the earlier BN32→BN8 improvement.
+
+| Legacy selection | Entry in pinned legacy module | Dynamic shared bytes | Recorded arm |
+|---|---|---:|---|
+| `bn32` (default) | `ts_q35_gemm_w4a4_32` |76800|`actual-old32`|
+| `bn8` | `ts_q35_gemm_w4a4_8` |43520|`actual-old8`|
+
+Block256, all projection geometries, quantization, consumers and mathematical
+gates stay fixed. The candidate image's `same-source32` entry remains a
+76800-byte numerical control; its `candidate8` entry remains43520 bytes.
+Production and native source files are not changed by this tool option.
 
 ```sh
 dotnet run --project eng/validation/NinferA4GdnCoreProbe -- --self-test --shape gate-up
+dotnet run --project eng/validation/NinferA4GdnCoreProbe -- --self-test --shape gate-up --legacy-schedule bn8
 dotnet /absolute/NinferA4GdnCoreProbe.dll \
   --shape gate-up \
+  --legacy-schedule bn8 \
   --helper-module /absolute/old-ninfer-helper.fatbin --expect-helper-sha256 SHA \
   --legacy-module /absolute/actual-q35-kernels.fatbin --expect-legacy-sha256 SHA \
   --candidate-module /absolute/t8-candidate.fatbin --expect-candidate-sha256 SHA \
@@ -18,8 +30,10 @@ dotnet /absolute/NinferA4GdnCoreProbe.dll \
 ```
 
 Actual driver parameter offsets/sizes and all loaded image SHA256 values are
-verified. Three fixtures compare actual old32, same-source32 in the candidate
-image, and new8 over two module lifetimes and A/B/A poisons. Every F32 GEMM
+verified. Three fixtures compare the selected actual old32/old8, same-source32
+in the candidate image, and new8 over two module lifetimes and A/B/A poisons.
+The selection, actual legacy symbol/shared size and honest arm label are recorded.
+Every F32 GEMM
 output and all used split partials must match bit for bit, then the entire
 unchanged consumer output must match. Independent CPU quantization must match
 every activation code/scale and row scale. The recorded active rows are adapted
@@ -46,10 +60,14 @@ Round/SwiGLU. No new independent SwiGLU numerical envelope is invented.
 
 Optional timing is admitted only after all components pass. It uses a separate
 dense pseudorandom weight payload at the selected role's full size. All full F32 outputs first
-match actual old32 exactly; all rounded outputs and split partials then match
+match the selected actual legacy exactly; all rounded outputs and split partials then match
 at every interval (split1 partials remain guards-only). Independent FP64 checks
 cover only the explicitly recorded active-row witnesses before the consumer
 in this dense timing fixture; uncomputed dots are never counted as FP64 checks.
+Only the selected legacy and `candidate8` are timing arms; `same-source32` is
+never timed. For `--legacy-schedule bn8`, both the actual old and candidate
+captured GEMMs must resolve their own module's `_8` function and43520-byte
+shared-memory descriptor. This is an old8/new8 comparison, not old32/new8.
 Both arms capture the role's complete quant→GEMM→consumer two/three-kernel
 chain, sharing immutable input/weight addresses. Five ABBA blocks use64 replays
 per interval and one symmetric outside warmup. Used split-K counters return to

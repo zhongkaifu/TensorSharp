@@ -256,3 +256,35 @@ finite quality parity is to that explicit configuration, not all model behavior.
 The affected managed suite passed 155 tests with zero failures; one existing
 9B GGUF model test was unavailable and skipped. Native kernels and upstream
 ggml were unchanged throughout this governor evaluation.
+
+
+## Fused residual and readonly norm for T8 verification
+
+`TS_Q35_NINFER_RESIDUAL_NORM` is automatic when unset on the qualified
+Qwen3.8 NInfer recipe with CC12.0/170-SM, context40960, enabled verification,
+layer graphs, Verify8 GEMM, split-K and the target W8 head. All Down projections
+must retain their original NVFP4/A4 format; FI and ExactVerify overrides are
+excluded. This selector enables none of those prerequisites itself. Only
+full-valid T8/B1 verification uses the fused path. Exact `0` opts out; `1`
+requires eligibility and both native entries. Missing automatically discovered
+entries retain the existing path before work begins. ABI, allocation and
+execution errors remain errors.
+
+The existing BN8 GEMM folds the F32 residual addition and BF16 rounding into
+its final split epilogue. Both F32 projection multiply boundaries and the
+split order are preserved; the original F32 projection buffer remains available.
+The following readonly norm retains the old 256-thread reduction and effective
+F32 norm weights, while prefetching weights and avoiding another residual write.
+The first embedding norm still performs the original null-delta addition,
+including its signed-zero behavior. BF16 exception projections still use their
+existing residual path. Local pass state selects normalization only after an
+actually fused projection; the final norm requires a completed fused Down.
+Graph/cache identities bind the actual native module and arithmetic policy.
+
+`NinferResidualNormProbe` validates both output/down shapes against the actual
+old image, CPU quantization and bounded FP64 references, including contraction,
+rounding, signed zero, guards and graph dependencies. `NinferResidualNormBodyProbe`
+compares independent old/new-off/new-on model processes through Verify, Commit,
+Decode, clone, reset and DFlash proposal operations. Component speedups are
+separate from model throughput and quality; generated evidence stays in ignored
+validation directories.

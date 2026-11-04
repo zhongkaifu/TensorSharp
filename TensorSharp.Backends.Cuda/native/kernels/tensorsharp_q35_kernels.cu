@@ -574,13 +574,16 @@ __device__ __forceinline__ void ts_q35_cp8(void* dst, const void* src, bool vali
 #endif
 }
 
-template <int BN, int WM, int WN, int STAGES, int BK = TS_Q35_BK, bool COLS_FAST = false, bool SWIGLU = false>
+template <int BN, int WM, int WN, int STAGES, int BK = TS_Q35_BK, bool COLS_FAST = false, bool SWIGLU = false,
+          bool ADD_RESIDUAL = false>
 __device__ __forceinline__ void ts_q35_gemm_w4a4(
     const uint8_t* __restrict__ wCodes, const uint8_t* __restrict__ wScales, int outDim, int k,
     const uint8_t* __restrict__ xCodes, const uint8_t* __restrict__ xScales, const float* __restrict__ rowScale,
-    int m, float alpha, float* __restrict__ y, float* __restrict__ partial, int* __restrict__ counters)
+    int m, float alpha, float* __restrict__ y, float* __restrict__ partial, int* __restrict__ counters,
+    float* __restrict__ residualX = nullptr)
 {
     static_assert(WM * WN == 8, "eight warps");
+    static_assert(!ADD_RESIDUAL || (BN == 8 && WN == 1 && !SWIGLU), "residual epilogue is plain BN8 only");
     constexpr int WROWS = TS_Q35_BM / WM, WCOLS = BN / WN;
     constexpr int MT = WROWS / 16, NT = WCOLS / 8;
     extern __shared__ __align__(16) uint8_t smemRaw[];
@@ -732,7 +735,19 @@ __device__ __forceinline__ void ts_q35_gemm_w4a4(
                     int r, c;
                     element(i, j, e, r, c);
                     if (r < outDim && c < m)
-                        y[(long long)c * outDim + r] = acc[i][j][e] * rowScale[c] * alpha;
+                    {
+                        if constexpr (ADD_RESIDUAL)
+                        {
+                            const long long index = (long long)c * outDim + r;
+                            // Preserve both old projection FMUL boundaries and the
+                            // following add_norm's F32 residual addition before BF16.
+                            const float value = __fmul_rn(__fmul_rn(acc[i][j][e], rowScale[c]), alpha);
+                            y[index] = value;
+                            residualX[index] = __bfloat162float(__float2bfloat16_rn(__fadd_rn(residualX[index], value)));
+                        }
+                        else
+                            y[(long long)c * outDim + r] = acc[i][j][e] * rowScale[c] * alpha;
+                    }
                 }
         return;
     }
@@ -773,7 +788,16 @@ __device__ __forceinline__ void ts_q35_gemm_w4a4(
                 float sum = 0.0f;
                 for (int z = 0; z < splits; ++z)
                     sum += __ldcg(partial + ((long long)z * m + c) * outDim + r);
-                y[(long long)c * outDim + r] = sum * rowScale[c] * alpha;
+                if constexpr (ADD_RESIDUAL)
+                {
+                    // Only the existing last-split winner reaches this store.
+                    const long long index = (long long)c * outDim + r;
+                    const float value = __fmul_rn(__fmul_rn(sum, rowScale[c]), alpha);
+                    y[index] = value;
+                    residualX[index] = __bfloat162float(__float2bfloat16_rn(__fadd_rn(residualX[index], value)));
+                }
+                else
+                    y[(long long)c * outDim + r] = sum * rowScale[c] * alpha;
             }
     if (tid == 0)
         counters[tile] = 0;
@@ -800,12 +824,81 @@ TS_Q35_GEMM(ts_q35_gemm_w4a4_32_swiglu, 32, 8, 1, 3, false, true)
 TS_Q35_GEMM(ts_q35_gemm_w4a4_64_swiglu, 64, 4, 2, 3, false, true)
 TS_Q35_GEMM(ts_q35_gemm_w4a4_128_swiglu, 128, 4, 2, 2, true, true)
 
+// Qualified residual entry; caller supplies disjoint residual/projection buffers,
+// grid(40,1,8), block256 and 43520 dynamic shared bytes. Managed dispatch admits
+// full-valid T8/B1 verification only. The original twelve-argument entries remain unchanged.
+extern "C" __global__ __launch_bounds__(256) void ts_q35_gemm_w4a4_8_residual_bf16(
+    const uint8_t* __restrict__ wCodes, const uint8_t* __restrict__ wScales, int outDim, int k,
+    const uint8_t* __restrict__ xCodes, const uint8_t* __restrict__ xScales, const float* __restrict__ rowScale,
+    int m, float alpha, float* __restrict__ y, float* __restrict__ partial, int* __restrict__ counters,
+    float* __restrict__ residualX)
+{
+    if (m != 8 || outDim != 5120 || (k != 6144 && k != 17408) || residualX == nullptr)
+    {
+        asm("trap;");
+        return;
+    }
+    ts_q35_gemm_w4a4<8, 8, 1, 2, TS_Q35_BK, false, false, true>(wCodes, wScales, outDim, k,
+        xCodes, xScales, rowScale, m, alpha, y, partial, counters, residualX);
+}
+
 /// Dynamic shared memory of ts_q35_gemm_w4a4_<bn>, by bn (32, 64, 128).
 extern "C" __global__ void ts_q35_gemm_smem_bytes(int* out)
 {
     out[0] = (int)sizeof(TsQ35GemmSmem<32, 8, 1, 3>);
     out[1] = (int)sizeof(TsQ35GemmSmem<64, 4, 2, 3>);
     out[2] = (int)sizeof(TsQ35GemmSmem<128, 4, 2, 2>);
+}
+
+// Readonly norm over already BF16-rounded F32 residuals. Its
+// reduction is the original NInfer add_norm's 256-thread order, without adding
+// +0, rounding or storing x. In particular, input negative zero stays negative.
+// The qualified caller uses width5120 and grid8; the bounded width stays a
+// runtime argument so the mean retains the original runtime-width division.
+// Keep the initial embedding norm and every unfused residual on the old helper.
+extern "C" __global__ __launch_bounds__(256) void ts_q35_ninfer_plain_norm_f32(
+    const float* __restrict__ x, const float* __restrict__ weight, float* __restrict__ y, int width, float eps)
+{
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.x != 8 || gridDim.y != 1
+        || gridDim.z != 1 || width < 1 || width > 5120)
+    {
+        asm("trap;");
+        return;
+    }
+    const int row = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    float values[20], weights[20], ss = 0;
+#pragma unroll
+    for (int j = 0; j < 20; ++j)
+    {
+        const int i = threadIdx.x + j * blockDim.x;
+        if (i < width)
+        {
+            const float v = x[(long long)row * width + i];
+            values[j] = v;
+            // The original F32 effective weight (including its exact unit offset)
+            // is independent of the reduction and can be fetched in the first pass.
+            weights[j] = weight[i];
+            ss += v * v;
+        }
+    }
+    ss = ts_q35_warp_sum(ss);
+    __shared__ float partial[32], inv;
+    if (!lane) partial[warp] = ss;
+    __syncthreads();
+    if (!warp)
+    {
+        ss = lane < (blockDim.x >> 5) ? partial[lane] : 0;
+        ss = ts_q35_warp_sum(ss);
+        if (!lane) inv = rsqrtf(ss / (float)width + eps);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 20; ++j)
+    {
+        const int i = threadIdx.x + j * blockDim.x;
+        if (i < width)
+            y[(long long)row * width + i] = __bfloat162float(__float2bfloat16_rn(values[j] * inv * weights[j]));
+    }
 }
 
 // ===========================================================================

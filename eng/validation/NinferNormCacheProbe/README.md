@@ -45,3 +45,11 @@ sidecar, written after graphs, modules and context are disposed and raw files
 are rehashed. `result.json` is progress only. A CPU self-test is not GPU/model
 qualification. Native compilation, GPU execution, model quality and end-to-end
 performance require separate actual evidence and are not inferred from skips.
+
+
+`prefetch-norm.cu` is a separate weight-prefetch control with the same entry and
+CLI protocol. Compile it explicitly with CUDA `-std=c++17 -O3 --ftz=false
+--fmad=true -arch=sm_120a -fatbin`; bind the resulting actual file/hash as the
+candidate above. Only the weight allocation is restricted and must be disjoint
+from x/delta/output. The original four delta alias cases remain legal. This
+control has no inference dispatch or automatic policy.

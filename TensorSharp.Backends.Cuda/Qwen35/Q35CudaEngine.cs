@@ -676,11 +676,17 @@ namespace TensorSharp.Cuda
             MakeCurrent();
             EnsureRoom(slots, window);
             EnsureVerifyBuffers();
-            RunRows(slots, window, tokens, 0, null, n, verify: true, tapFirst: 0);
+            var pass = SelectNinferResidualPass(NinferResidualNormEnabled, 1, window, slots.Length,
+                true, false, _embedSpans != null, _featureCount != 0, _d != null);
+            RunRows(slots, window, tokens, 0, null, n, verify: true, tapFirst: 0, passMode: pass);
             _verifyRow0 = 0;
-            FinalNorm(_x, _block, _outputNorm, _xn, n, _m.NEmbd, _m.Eps, Stream);
+            if (pass == NinferLayerPass.FusedResidualNorm)
+                _k.PlainNinferNorm(_x, _outputNorm, _xn, n, _m.NEmbd, _m.Eps, Stream);
+            else
+                FinalNorm(_x, _block, _outputNorm, _xn, n, _m.NEmbd, _m.Eps, Stream);
             Head(_xn, n, logitsOut, drawnOut);
             RecordNinferVerification(slots, window);
+            if (pass == NinferLayerPass.FusedResidualNorm) NinferResidualNormCompletedVerifies++;
         }
 
         // The row of the last verify's first window row in the step's activations (its drafter taps).
@@ -793,8 +799,8 @@ namespace TensorSharp.Cuda
         /// each position moves past its rows. Leaves the last layer's FFN output pending in _block.
         /// </summary>
         private void RunRows(Slot[] slots, int rowsPerSeq, int[] tokens, int start, int[] ropePos, int ropeTotal, bool verify, int tapFirst,
-            int[] counts = null, bool decode = false)
-            => RunGroups(tapFirst, new RowGroup(slots, rowsPerSeq, verify, counts, tokens, start, ropePos, ropeTotal, decode));
+            int[] counts = null, bool decode = false, NinferLayerPass passMode = NinferLayerPass.Legacy)
+            => RunGroups(tapFirst, new RowGroup(slots, rowsPerSeq, verify, counts, tokens, start, ropePos, ropeTotal, decode, passMode));
 
         /// <summary>rowsPerSeq rows of each of Slots (Tokens[Start ..], sequence-major); verify as in
         /// <see cref="RunRows"/>. Counts: the real rows of each sequence (padding beyond).</summary>
@@ -804,10 +810,14 @@ namespace TensorSharp.Cuda
             public readonly int RowsPerSeq, Start, RopeTotal;
             public readonly bool Verify, Decode;
             public readonly int[] Counts, Tokens, RopePos;
+            internal readonly NinferLayerPass PassMode;
 
             public RowGroup(Slot[] slots, int rowsPerSeq, bool verify, int[] counts, int[] tokens, int start = 0, int[] ropePos = null,
-                int ropeTotal = 0, bool decode = false)
+                int ropeTotal = 0, bool decode = false, NinferLayerPass passMode = NinferLayerPass.Legacy)
             {
+                if (passMode != NinferLayerPass.Legacy && (passMode != NinferLayerPass.FusedResidualNorm
+                    || !verify || decode || counts != null || rowsPerSeq != 8 || slots?.Length != 1))
+                    throw new ArgumentException("The fused residual/norm pass requires one complete T8 verification lane.");
                 Slots = slots;
                 RowsPerSeq = rowsPerSeq;
                 Verify = verify;
@@ -817,6 +827,7 @@ namespace TensorSharp.Cuda
                 Start = start;
                 RopePos = ropePos;
                 RopeTotal = ropeTotal;
+                PassMode = passMode;
             }
 
             public int Rows => Slots.Length * RowsPerSeq;
@@ -831,6 +842,10 @@ namespace TensorSharp.Cuda
             int e = _m.NEmbd, nt = RowCap, n = 0, nSeq = 0;
             foreach (var g in groups)
             {
+                if (g.PassMode != NinferLayerPass.Legacy && SelectNinferResidualPass(NinferResidualNormEnabled,
+                    groups.Length, g.RowsPerSeq, g.Slots.Length, g.Verify, g.Counts != null,
+                    _embedSpans != null, _featureCount != 0, _d != null, tapFirst) != g.PassMode)
+                    throw new InvalidOperationException("The requested residual/norm pass is outside its admitted profile.");
                 n += g.Rows;
                 nSeq += g.Slots.Length;
             }
@@ -1150,6 +1165,7 @@ namespace TensorSharp.Cuda
                 Sync();
                 FreeDraftGraphs();
                 FreeVerifyGraphs();
+                LogNinferResidualNormSummary();
                 InvalidateNinferDecodeGraphs();
                 FreeSlot(_active);
                 ReleaseFreeBlocks();

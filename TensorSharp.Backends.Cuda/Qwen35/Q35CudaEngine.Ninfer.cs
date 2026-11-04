@@ -103,6 +103,7 @@ namespace TensorSharp.Cuda
             InitializeNinferLoadRepack();
             InitializeNinferExactVerify();
             InitializeNinferFlashInfer();
+            InitializeNinferResidualNorm();
             if (_ninferDecodeGraphsEnabled && _m.Ninfer == null)
                 throw new NotSupportedException(NinferDecodeGraphsEnvironment + " requires an original NInfer target.");
             if (_ninferVerificationEnabled && _m.Ninfer == null)
@@ -176,11 +177,12 @@ namespace TensorSharp.Cuda
                     throw new NotSupportedException("NInfer target verification requires one complete prepared verification group.");
             int e = _m.NEmbd;
             bool isVerify = groups.Length == 1 && groups[0].Verify;
-            IntPtr pending = IntPtr.Zero;
+            bool candidatePass = groups.Length == 1 && groups[0].PassMode == NinferLayerPass.FusedResidualNorm;
+            var residualState = NinferResidualState.InitialNoDelta;
             for (int il = 0; il < _m.NLayer; il++)
             {
                 var l = _layers[il]; var weights = _ninferLayers[il];
-                _ninfer.AddRmsNorm(_x, pending, l.AttnNorm, _xn, rows, e, _m.Eps, Stream);
+                NormalizeNinferResidual(residualState, l.AttnNorm, rows, candidatePass, postProjection: false);
                 CaptureNinferDraftTargetTap(il, tapFirst, rows);
                 NinferProject(weights.Input, _xn, _proj, rows, l.Recurrent ? 1 : 4, isVerify: isVerify);
                 if (l.Recurrent)
@@ -205,7 +207,7 @@ namespace TensorSharp.Cuda
                             gd, beta, TabState(l) + (nint)(8L*q0), _gdnO + (nint)((long)r0*ValueDim*4), g.Verify, Stream, count);
                     }
                     _ninfer.GdnOut(_gdnO, _proj, 16384, ConvDim, rows, _m.GdnVHeads, l.SsmNorm, _m.Eps, _gdnY, Stream);
-                    NinferProject(weights.Output, _gdnY, _block, rows, round: false, isVerify: isVerify);
+                    residualState = ProjectNinferResidual(weights.Output, _gdnY, rows, isVerify, candidatePass);
                 }
                 else
                 {
@@ -223,14 +225,15 @@ namespace TensorSharp.Cuda
                             1.0f/MathF.Sqrt(_m.HeadDim), maxKeys[gi], g.Rows <= MaxVerifyRows ? _attnPartial : IntPtr.Zero, _attn + qOff, Stream,
                             isVerify: g.Verify, allRowsValid: g.Counts == null, positionsBaseDev: _cacheRowDev + (nint)(4L*r0));
                     }
-                    NinferProject(weights.Output, _attn, _block, rows, round: false, isVerify: isVerify);
+                    residualState = ProjectNinferResidual(weights.Output, _attn, rows, isVerify, candidatePass);
                 }
-                _ninfer.AddRmsNorm(_x, _block, l.PostNorm, _xn, rows, e, _m.Eps, Stream);
+                NormalizeNinferResidual(residualState, l.PostNorm, rows, candidatePass, postProjection: true);
                 NinferProject(weights.GateUp, _xn, _proj, rows, 2, round: rows > 128 && rows != 1024, isVerify: isVerify);
                 _ninfer.SwiGlu(_proj, _act, _m.NFf, rows, Stream);
-                NinferProject(weights.Down, _act, _block, rows, round: false, isVerify: isVerify);
-                pending = _block;
+                residualState = ProjectNinferResidual(weights.Down, _act, rows, isVerify, candidatePass);
             }
+            if (candidatePass && residualState != NinferResidualState.FusedCanonical)
+                throw new InvalidOperationException("The completed NInfer residual/norm pass must end with an actually fused Down projection.");
         }
     }
 }

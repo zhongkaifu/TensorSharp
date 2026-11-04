@@ -8,6 +8,52 @@ using S=TensorSharp.Validation.ValidationSha256;
 
 internal static partial class Program
 {
+    private enum LegacyScheduleKind{Bn32,Bn8}
+    private static LegacyScheduleKind LegacySchedule=LegacyScheduleKind.Bn32;
+    private static string LegacyScheduleName=>LegacySchedule==LegacyScheduleKind.Bn8?"bn8":"bn32";
+    private static (string Symbol,uint Shared,string Arm) ProjectionPlan(int kind,LegacyScheduleKind legacy)=>kind switch
+    {
+        0 when legacy==LegacyScheduleKind.Bn32=>("ts_q35_gemm_w4a4_32",76800,"actual-old32"),
+        0 when legacy==LegacyScheduleKind.Bn8=>("ts_q35_gemm_w4a4_8",43520,"actual-old8"),
+        1=>("ts_q35_gemm_w4a4_32",76800,"same-source32"),
+        2=>("ts_q35_gemm_w4a4_8",43520,"candidate8"),
+        _=>throw new ArgumentOutOfRangeException(nameof(kind),"Only the three declared projection arms are admitted.")
+    };
+    private static (string Symbol,uint Shared,string Arm) LegacyPlan=>ProjectionPlan(0,LegacySchedule);
+    private static LegacyScheduleKind ParseLegacySchedule(ref string[] args)
+    {
+        int at=Array.IndexOf(args,"--legacy-schedule");if(at<0)return LegacyScheduleKind.Bn32;
+        Need(at+1<args.Length&&args.Count(x=>x=="--legacy-schedule")==1,"Exactly one --legacy-schedule bn32|bn8 value required.");
+        var selected=args[at+1] switch{"bn32"=>LegacyScheduleKind.Bn32,"bn8"=>LegacyScheduleKind.Bn8,_=>throw new ArgumentException("Unknown legacy schedule; use bn32 or bn8.")};
+        args=args.Take(at).Concat(args.Skip(at+2)).ToArray();return selected;
+    }
+    private static void SelfTestLegacyScheduleCli()
+    {
+        var unchanged=new[]{"--self-test"};Need(ParseLegacySchedule(ref unchanged)==LegacyScheduleKind.Bn32&&unchanged.SequenceEqual(new[]{"--self-test"}),"Default legacy CLI changed.");
+        foreach(string name in new[]{"bn32","bn8"})foreach(bool first in new[]{false,true})
+        {
+            var args=first?new[]{"--legacy-schedule",name,"--self-test"}:new[]{"--self-test","--legacy-schedule",name};
+            var selected=ParseLegacySchedule(ref args);Need(args.SequenceEqual(new[]{"--self-test"})&&selected==(name=="bn8"?LegacyScheduleKind.Bn8:LegacyScheduleKind.Bn32),"Legacy option position/value differs.");
+        }
+        var old32=ProjectionPlan(0,LegacyScheduleKind.Bn32);var old8=ProjectionPlan(0,LegacyScheduleKind.Bn8);
+        Need(old32==("ts_q35_gemm_w4a4_32",76800u,"actual-old32")&&old8==("ts_q35_gemm_w4a4_8",43520u,"actual-old8"),"Actual legacy binding differs.");
+        foreach(int arm in new[]{1,2})Need(ProjectionPlan(arm,LegacyScheduleKind.Bn32)==ProjectionPlan(arm,LegacyScheduleKind.Bn8),"Changing legacy schedule changed the same-source/candidate arm.");
+        foreach(var invalid in new[]{new[]{"--legacy-schedule"},new[]{"--legacy-schedule","unknown"},new[]{"--legacy-schedule","BN8"},new[]{"--legacy-schedule","--self-test"},new[]{"--legacy-schedule","bn8","--legacy-schedule","bn32"}})
+        {var args=invalid.ToArray();bool refused=false;try{ParseLegacySchedule(ref args);}catch(Exception ex)when(ex is InvalidDataException or ArgumentException){refused=true;}Need(refused,"Invalid legacy schedule admitted.");}
+    }
+    private static void RunCpuSelfTest()
+    {
+        SelfTestLegacyScheduleCli();
+        if(LegacySchedule==LegacyScheduleKind.Bn32){SelfTest();return;}
+        // Keep Reference.cs (including its mathematics) unchanged. Its original
+        // CPU summary describes BN32; replace only that summary's launch metadata.
+        var original=Console.Out;using var captured=new StringWriter();
+        try{Console.SetOut(captured);SelfTest();}finally{Console.SetOut(original);}
+        var summary=JsonSerializer.Deserialize<Dictionary<string,JsonElement>>(captured.ToString())??throw new InvalidDataException("CPU summary missing.");
+        summary["oldDynamicShared"]=JsonSerializer.SerializeToElement(LegacyPlan.Shared);summary["legacySchedule"]=JsonSerializer.SerializeToElement(LegacyScheduleName);
+        summary["legacySymbol"]=JsonSerializer.SerializeToElement(LegacyPlan.Symbol);summary["legacyArm"]=JsonSerializer.SerializeToElement(LegacyPlan.Arm);
+        Console.WriteLine(JsonSerializer.Serialize(summary));
+    }
     private static void Need(bool value,string message){if(!value)throw new InvalidDataException(message);}
     private static string Sha(ReadOnlySpan<byte> data)=>Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
     private static string FileSha(string path){using var f=File.OpenRead(path);return Convert.ToHexString(SHA256.HashData(f)).ToLowerInvariant();}
@@ -36,7 +82,7 @@ internal static partial class Program
                 var outputs=new List<(string,byte[])>{("f32",before[i]),("consumer",after[i])};if(Geometry.Splits>1)outputs.Add(("partial",partial[i]));
                 foreach(var pair in outputs)
                 {string key=name+"/"+i+"/"+pair.Item1,h=Sha(pair.Item2);if(aa.TryGetValue(key,out var previous)&&h!=previous)repeated=false;else aa.TryAdd(key,h);}
-                captured.Add(new{arm=i==0?"actual-old32":i==1?"same-source32":"candidate8",f32=Cas(before[i],output,files),consumer=Cas(after[i],output,files),partial=Geometry.Splits>1?Cas(partial[i],output,files):null});
+                captured.Add(new{arm=ProjectionPlan(i,LegacySchedule).Arm,f32=Cas(before[i],output,files),consumer=Cas(after[i],output,files),partial=Geometry.Splits>1?Cas(partial[i],output,files):null});
             }
             bool ok=exact&&part&&quant&&counters&&boundary&&finalExact&&inputs&&guards&&repeated&&numeric.All(a=>a.Passed)&&finalFormat.All(a=>a.Passed);
             passes.Add(new{pass,poison=Poisons[pass],fullF32BitsEqual=exact,fullPartialF32BitsEqual=Geometry.Splits>1?(bool?)part:null,unusedScratchGuardsOnly=Geometry.Splits==1,sameQuantAndCpuBits=quant,countersReturnedZero=Geometry.Splits>1?(bool?)counters:null,cpuRoundBoundaryChecked=Geometry.Consumer=="round",roundBoundaryCpuBits=boundary,fullConsumerBitsEqual=finalExact,immutableInputs=inputs,allocationGuards=guards,aaAndCrossLifetime=repeated,fp64Before=numeric,consumerFormat=finalFormat,captured,passed=ok});checkpoint();Need(ok,"A4 component failed; full three-arm outputs retained.");
@@ -45,16 +91,17 @@ internal static partial class Program
     }
     private static int Main(string[] args)
     {
+        LegacySchedule=ParseLegacySchedule(ref args);
         int shapeIndex=Array.IndexOf(args,"--shape");if(shapeIndex>=0){Need(shapeIndex+1<args.Length&&args.Count(x=>x=="--shape")==1,"Exactly one named --shape required.");string name=args[shapeIndex+1];Geometry=Shapes.SingleOrDefault(x=>x.Name==name)??throw new ArgumentException("Unknown shape; use gdn-input,gate-up,down,output,gqa-input.");args=args.Take(shapeIndex).Concat(args.Skip(shapeIndex+2)).ToArray();}
-        if(args.SequenceEqual(new[]{"--self-test"})){SelfTest();return 0;}string? output=null;bool owned=false;var records=new List<Dictionary<string,object?>>();var files=new Dictionary<string,string>();var aa=new Dictionary<string,string>();
-        var state=new Dictionary<string,object?>{["schema"]="ninfer-a4-t8-component/2",["complete"]=false,["passed"]=false,["GPU"]="NOT_RUN",["modelQuality"]="NOT_RUN",["endToEndPerformance"]="NOT_RUN",["records"]=records,["files"]=files};
+        if(args.SequenceEqual(new[]{"--self-test"})){RunCpuSelfTest();return 0;}string? output=null;bool owned=false;var records=new List<Dictionary<string,object?>>();var files=new Dictionary<string,string>();var aa=new Dictionary<string,string>();
+        var state=new Dictionary<string,object?>{["schema"]="ninfer-a4-t8-component/2",["complete"]=false,["passed"]=false,["GPU"]="NOT_RUN",["modelQuality"]="NOT_RUN",["endToEndPerformance"]="NOT_RUN",["records"]=records,["files"]=files,["legacySchedule"]=LegacyScheduleName,["legacyArm"]=LegacyPlan.Arm,["legacySymbol"]=LegacyPlan.Symbol,["legacyDynamicSharedBytes"]=LegacyPlan.Shared};
         try
         {
-            bool timing=args.Length==15&&args[^1]=="--timing";Need((args.Length==14||timing)&&args[0]=="--helper-module"&&args[2]=="--expect-helper-sha256"&&args[4]=="--legacy-module"&&args[6]=="--expect-legacy-sha256"&&args[8]=="--candidate-module"&&args[10]=="--expect-candidate-sha256"&&args[12]=="--out","Usage: --shape ENUM --helper-module FILE --expect-helper-sha256 SHA --legacy-module FILE --expect-legacy-sha256 SHA --candidate-module FILE --expect-candidate-sha256 SHA --out FRESH_ABSOLUTE_ARTIFACT_DIR [--timing]");
+            bool timing=args.Length==15&&args[^1]=="--timing";Need((args.Length==14||timing)&&args[0]=="--helper-module"&&args[2]=="--expect-helper-sha256"&&args[4]=="--legacy-module"&&args[6]=="--expect-legacy-sha256"&&args[8]=="--candidate-module"&&args[10]=="--expect-candidate-sha256"&&args[12]=="--out","Usage: --shape ENUM [--legacy-schedule bn32|bn8] --helper-module FILE --expect-helper-sha256 SHA --legacy-module FILE --expect-legacy-sha256 SHA --candidate-module FILE --expect-candidate-sha256 SHA --out FRESH_ABSOLUTE_ARTIFACT_DIR [--timing]");
             foreach(int i in new[]{1,5,9})Pinned(args[i],S.Normalize(args[i+2]));output=args[13];Need(Path.IsPathFullyQualified(output)&&Path.GetFullPath(output)==output&&!Directory.Exists(output)&&!File.Exists(output)&&(output.Split(Path.DirectorySeparatorChar).Contains("artifacts")||output.Contains("/docs/validation/",StringComparison.Ordinal)),"Fresh ignored output path required.");
             Directory.CreateDirectory(output);Directory.CreateDirectory(Path.Combine(output,"cas"));owned=true;
             state["modules"]=new{helper=new{path=args[1],sha256=S.Normalize(args[3])},legacy=new{path=args[5],sha256=S.Normalize(args[7])},candidate=new{path=args[9],sha256=S.Normalize(args[11])}};state["toolAssemblySha256"]=FileSha(typeof(Program).Assembly.Location);state["backendAssemblySha256"]=FileSha(typeof(CudaBackend).Assembly.Location);
-            state["geometry"]=Geometry;state["scope"]="Fixed five actual T8 projection shapes only; actual old32 versus same-source32 versus new8. Same TS quantization/planes/alpha/rowScale. Strict beforeconsumer F32 bits and decoded FP64 mandatory. Actual unchanged consumer: round forGDN/GQA, SwiGLU forGateUp, none forOutput/Down. No model/quality/E2E proof.";
+            state["geometry"]=Geometry;state["scope"]=$"Fixed five actual T8 projection shapes only; {LegacyPlan.Arm} ({LegacyPlan.Symbol}, {LegacyPlan.Shared} shared bytes) versus same-source32 versus candidate8. Timing compares {LegacyPlan.Arm} only with candidate8; same-source32 is a numerical control, not a timing arm. Same TS quantization/planes/alpha/rowScale. Strict beforeconsumer F32 bits and decoded FP64 mandatory. Actual unchanged consumer: round forGDN/GQA, SwiGLU forGateUp, none forOutput/Down. No model/quality/E2E proof.";
             state["boundPolicy"]="Beforeconsumer only: gamma_(3K+32,u=2^-24)*abs(alpha)*sumAbsDecodedProducts+2u*abs(FP64ideal). Exact binary fixture independently proves accumulation on fixed lattice<2^24. After unchanged consumers require full GPUbits+finite and BF16format where applicable; no independent SwiGLU FP64 claim.";
             void Checkpoint()=>Save(Path.Combine(output,"result.json"),state);Checkpoint();CudaBackend.Register();CudaDriverApi.cuInit(0).ThrowOnError();
             using(var context=CudaContext.Create(0))
