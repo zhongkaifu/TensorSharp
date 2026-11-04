@@ -162,3 +162,40 @@ Code throughput was 375.90 versus 375.92 tokens/s, so discovery adds no extra
 speedup over explicit selection. The retained 7 text / 5 program failures remain
 failures. Final NInfer/SHA CPU tests passed 782 cases with zero skips; native
 Windows and other unavailable devices are not covered by this run.
+
+## Native DFlash cost governor
+
+When `TS_SPEC_ADAPTIVE` is unset, the HTTP scheduler skips repeated cost-governor
+calibration only for the measured native Qwen3.8 DFlash profile: the embedded
+full-vocabulary drafter, effective K7/pMin0, CC12.0/170-SM hardware, exactly
+40,960 configured context tokens, enabled decode graphs, the qualified legacy
+vector A16 asset, Verify8 attention and native greedy verification already
+enabled. FI, exact-Verify and shortlist experiments retain the adaptive default.
+The request must use plain greedy sampling without media, grammar, repetition
+penalties or a logits observer. This policy enables neither speculation nor
+verification and changes no kernels, draft window or confidence threshold.
+
+Explicit `TS_SPEC_ADAPTIVE=0` still disables calibration; every other explicitly
+set value enables it, as before. A caller-supplied governor is authoritative.
+Other profiles and standalone executions without sampler context retain the
+existing default. Each arming log reports `adaptive` and `adaptiveSource`, and
+switching request profiles replaces the shared governor without mutating a live
+execution's selected policy.
+
+One same-runtime ON/OFF/OFF/ON block measured code decode medians of
+389.22 / 399.97 / 399.63 / 388.32 tokens/s, about 2.84% higher without calibration.
+Prose varied little and copy did not improve. Code outputs differed in length,
+and total completion time did not improve, so this is a finite decode-throughput
+result, not a universal speed or latency claim.
+
+Actual automatic-policy validation completed all 45 text / 30 program cases.
+It selected fixed drafting for 168 qualified requests; six JSON requests retained
+adaptive calibration. Relative to explicit `TS_SPEC_ADAPTIVE=0`, all 141 request
+identities, 309 checks, 96 arithmetic values and 189 program-input statuses were
+unchanged. The text/program scores remained 38/45 and 26/30; one wrong interval
+answer and 21 unexecuted inputs remain failures. Code throughput was 400.09
+versus 400.06 tokens/s. The automatic policy removes manual configuration; its
+finite quality parity is to that explicit configuration, not all model behavior.
+The affected managed suite passed 155 tests with zero failures; one existing
+9B GGUF model test was unavailable and skipped. Native kernels and upstream
+ggml were unchanged throughout this governor evaluation.

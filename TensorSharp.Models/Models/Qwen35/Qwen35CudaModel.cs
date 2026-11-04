@@ -847,6 +847,9 @@ namespace TensorSharp.Models
         private int DraftWidth => HasDrafter ? _exec.Engine.DraftBlockSize - 1 : 0;
 
         public bool SpeculationProfitable => HasDrafter;
+        private static bool NativeGreedyVerifyEnabled => Environment.GetEnvironmentVariable("TS_Q35_GREEDY_VERIFY") == "1";
+        public bool SpecPrefersFixedCostGovernor => _exec?.HasEmbeddedNinferDrafter == true
+            && _exec.Engine.NinferFixedDraftGovernorQualified && NativeGreedyVerifyEnabled;
         public bool SpecTrunkFollowsBoundCache => true;
         /// <summary>The drafter's taps never leave the device: the executor's feature rows are a
         /// one-float placeholder.</summary>
@@ -887,7 +890,7 @@ namespace TensorSharp.Models
         /// full sampler/state and model quality gates have passed on the device.</summary>
         public bool TrySpecForwardGreedyVerify(int[] tokens, float[] hAllOut, int[] drawnOut)
         {
-            if (Environment.GetEnvironmentVariable("TS_Q35_GREEDY_VERIFY") != "1"
+            if (!NativeGreedyVerifyEnabled
                 || tokens.Length < 2 || tokens.Length > TensorSharp.Cuda.Q35CudaEngine.MaxVerifyRows)
                 return false;
             if (drawnOut == null || drawnOut.Length < tokens.Length)

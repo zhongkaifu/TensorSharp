@@ -41,6 +41,7 @@ namespace TensorSharp.Runtime.Speculative
         public const float DefaultGate = 0.35f;
 
         private readonly IDraftHead _head;
+        internal IDraftHead HeadIdentity => _head;
         private readonly int[] _blockTokens;
         private readonly float[] _blockConf;
 

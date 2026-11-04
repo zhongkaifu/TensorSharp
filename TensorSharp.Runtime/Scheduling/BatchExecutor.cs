@@ -1197,6 +1197,7 @@ namespace TensorSharp.Runtime.Scheduling
             _speculationDeclineWarned = false;
             _specPrefixReuseDeclineWarned = false;
             _sharedGovernor = null;   // a new policy is measured afresh
+            _sharedGovernorProfile = null;
         }
 
         private static readonly bool _cbDebug =
@@ -2293,12 +2294,18 @@ namespace TensorSharp.Runtime.Scheduling
         /// can serve this model, and the plan's next candidate then serves the
         /// step with plain decoding.
         /// </summary>
-        // One governor for every speculative execution this executor arms: its
-        // verdict is about the (model, drafter, backend) triple, which is the same
-        // for every request, and a chat's turns are short - re-measuring from
-        // scratch on each of them cost more than it decided. Replaced with the policy.
+        // Share measurements while the resolved model/head/configuration policy
+        // agrees. A different request profile receives a new governor, so a live
+        // execution never has its selected policy changed by the next request.
         private SpeculationCostGovernor? _sharedGovernor;
-        private SpeculationCostGovernor SharedGovernor => _sharedGovernor ??= new SpeculationCostGovernor();
+        private SpeculationGovernorFactory.Profile? _sharedGovernorProfile;
+        private SpeculationCostGovernor SharedGovernorFor(ISpeculativeTarget target, ISpeculator speculator, SequenceState sequence)
+        {
+            var profile = SpeculationGovernorFactory.Describe(target, speculator,
+                CanUseFixedGovernorGreedyProfile(sequence, FirstTokenLogitsDump.IsArmed || _cbDebug),
+                SpeculationCostGovernor.AdaptiveEnvironmentSnapshot);
+            return SpeculationGovernorFactory.Share(ref _sharedGovernor, ref _sharedGovernorProfile, profile);
+        }
 
         /// <summary>Whether a request can profit from drafting at all: it needs at
         /// least two tokens to decode, or every proposal would be wasted.</summary>
@@ -2323,11 +2330,12 @@ namespace TensorSharp.Runtime.Scheduling
             // state - release it here rather than leaving it to the GC.
             _specCtx?.Exec?.Dispose();
 
-            var exec = new SpeculativeExecution(spec, speculator, trunk, SharedGovernor);
+            var exec = new SpeculativeExecution(spec, speculator, trunk, SharedGovernorFor(spec, speculator, seq));
             _logger.LogInformation(
                 "Speculative decoding armed for {RequestId} (algorithm={Algorithm}, maxDraft={MaxDraft}, "
-                + "pMin={PMin}, trunk={Trunk})",
-                seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, trunkLabel);
+                + "pMin={PMin}, trunk={Trunk}, adaptive={Adaptive}, adaptiveSource={AdaptiveSource})",
+                seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, trunkLabel,
+                exec.AdaptiveSpeculation, exec.Governor.SelectionSource);
             return exec;
         }
 
@@ -2522,8 +2530,11 @@ namespace TensorSharp.Runtime.Scheduling
         // A future logprob/logit observer must join this gate rather than consume
         // a token-only outcome. The existing batched verify path is unchanged.
         internal static bool CanUseGreedySpecVerify(SequenceState seq, bool requiresLogits) =>
-            seq.MediaSpans.Count == 0 && seq.OutputTokens.Count > 0 && seq.GetOrCreateSampler().IsPlainGreedyArgmax
-            && !requiresLogits;
+            seq.OutputTokens.Count > 0 && CanUseFixedGovernorGreedyProfile(seq, requiresLogits);
+        // Arming precedes the first draw. History is a decode-time requirement,
+        // while sampler/media/logit-consumer eligibility is already knowable.
+        internal static bool CanUseFixedGovernorGreedyProfile(SequenceState seq, bool requiresLogits) =>
+            seq.MediaSpans.Count == 0 && seq.GetOrCreateSampler().IsPlainGreedyArgmax && !requiresLogits;
 
         // ---- Speculation on a per-request fused holder ----
         //
@@ -3016,7 +3027,7 @@ namespace TensorSharp.Runtime.Scheduling
                 _fusedSpecDeclined.Add(seq.RequestId);
                 return false;
             }
-            var exec = new SpeculativeExecution(spec, speculator, trunk: null, SharedGovernor);
+            var exec = new SpeculativeExecution(spec, speculator, trunk: null, SharedGovernorFor(spec, speculator, seq));
             if (!exec.CanSeedCommitted)
             {
                 exec.Dispose();
@@ -3032,8 +3043,9 @@ namespace TensorSharp.Runtime.Scheduling
             seq.SpecStats = exec.Stats;
             _logger.LogInformation(
                 "Speculative decoding armed for {RequestId} (algorithm={Algorithm}, maxDraft={MaxDraft}, "
-                + "pMin={PMin}, trunk=fused holder over {Committed} committed tokens)",
-                seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, prevComputed);
+                + "pMin={PMin}, trunk=fused holder over {Committed} committed tokens, adaptive={Adaptive}, adaptiveSource={AdaptiveSource})",
+                seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, prevComputed,
+                exec.AdaptiveSpeculation, exec.Governor.SelectionSource);
             return true;
         }
 

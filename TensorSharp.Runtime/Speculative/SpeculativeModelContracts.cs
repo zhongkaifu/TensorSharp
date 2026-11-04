@@ -71,6 +71,11 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         bool SpeculationProfitable => true;
 
+        /// <summary>Model/backend capability for the measured native fixed K7
+        /// profile. False by default; the factory also requires the target's own
+        /// block head, K7/pMin0 and a caller-qualified greedy request.</summary>
+        bool SpecPrefersFixedCostGovernor => false;
+
         /// <summary>
         /// Non-null when this trunk must not speculate at all, with the reason in
         /// operator words. Unlike <see cref="SpeculationProfitable"/> (a speed

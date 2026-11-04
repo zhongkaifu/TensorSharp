@@ -1368,6 +1368,14 @@ public partial class SpeculativeExecutionTests
         // Mirrors a backend that lacks the accelerated MTP kernels (e.g. the
         // pure-C# CUDA backend for Gemma 4): the engine must NOT engage spec.
         public bool SpeculationProfitable { get; set; } = true;
+        private bool _prefersFixedCostGovernor;
+        public int FixedGovernorHintReads { get; private set; }
+        public bool SpecPrefersFixedCostGovernor
+        {
+            get { FixedGovernorHintReads++; return _prefersFixedCostGovernor; }
+            set => _prefersFixedCostGovernor = value;
+        }
+        public int SpecMaxDraftTokens { get; set; } = int.MaxValue;
         public int CacheSeqLen => _trunk.Count;
         public int ContextLimit { get; set; } = 4096;
         public int MaxContextLength => ContextLimit;

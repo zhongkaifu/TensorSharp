@@ -165,9 +165,10 @@ namespace TensorSharp.Runtime.Speculative
         /// free).
         /// </summary>
         public bool Enabled { get; set; } = DefaultEnabled;
+        public string SelectionSource { get; internal set; } = "legacy-default";
 
-        private static readonly bool DefaultEnabled =
-            !string.Equals(Environment.GetEnvironmentVariable("TS_SPEC_ADAPTIVE"), "0", StringComparison.Ordinal);
+        internal static readonly string? AdaptiveEnvironmentSnapshot = Environment.GetEnvironmentVariable("TS_SPEC_ADAPTIVE");
+        private static readonly bool DefaultEnabled = AdaptiveEnvironmentSnapshot != "0";
 
         /// <summary>True while a losing verdict is actively suppressing drafting
         /// (as opposed to a round merely taking its plain baseline). Only these

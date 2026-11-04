@@ -138,7 +138,9 @@ namespace TensorSharp.Runtime.Speculative
             // backend) carries from one request to the next, so a chat's short turns
             // do not each pay a fresh probe round to rediscover that drafting loses
             // on prose (it re-probes with backoff either way).
-            Governor = governor ?? new SpeculationCostGovernor();
+            // This constructor has no sampler context; its fallback cannot opt
+            // into the measured greedy-only default. HTTP supplies that profile.
+            Governor = governor ?? SpeculationGovernorFactory.CreateFor(model, speculator);
             Governor.NewSequence();   // a shared governor: this request starts fresh enough to re-probe
             _governorWinsAtStart = Governor.Wins;
             _governorLossesAtStart = Governor.Losses;

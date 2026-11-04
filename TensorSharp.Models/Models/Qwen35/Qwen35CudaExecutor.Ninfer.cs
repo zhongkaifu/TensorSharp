@@ -15,6 +15,7 @@ public sealed partial class Qwen35CudaExecutor
     internal const string NinferBodyModuleEnvironment = "TS_Q35_NINFER_PTX";
     internal const string NinferDraftModuleEnvironment = "TS_Q35_NINFER_DRAFT_PTX";
     internal const string NinferDraftShortlistModuleEnvironment = "TS_Q35_NINFER_DRAFT_SHORTLIST_PTX";
+    internal bool HasEmbeddedNinferDrafter { get; private set; }
 
     internal Qwen35CudaExecutor(NinferQwen38ModelSource source, int maxContext, int nUbatch)
         => InitializeNinfer(source, maxContext, nUbatch);
@@ -38,6 +39,9 @@ public sealed partial class Qwen35CudaExecutor
                 _engine.AttachNinferDrafter(draft.Descriptor,
                     ResolveNinferModulePath(NinferDraftModuleEnvironment, "tensorsharp_q35_ninfer_draft.ptx", draftModule, AppContext.BaseDirectory),
                     shortlistModule == null ? null : ResolveNinferModulePath(NinferDraftShortlistModuleEnvironment, "tensorsharp_ninfer_shortlist.fatbin", shortlistModule, AppContext.BaseDirectory));
+                // This attachment was read from the target's own source.Reader,
+                // rather than an external drafter attached to a target wrapper.
+                HasEmbeddedNinferDrafter = true;
             }
             else if (Environment.GetEnvironmentVariable(NinferDraftShortlistModuleEnvironment) != null)
                 throw new ArgumentException("An original shortlist requires its original NInfer draft module.");
