@@ -104,6 +104,7 @@ namespace TensorSharp.Cuda
             InitializeNinferExactVerify();
             InitializeNinferFlashInfer();
             InitializeNinferResidualNorm();
+            InitializeNinferBf16Mma();
             if (_ninferDecodeGraphsEnabled && _m.Ninfer == null)
                 throw new NotSupportedException(NinferDecodeGraphsEnvironment + " requires an original NInfer target.");
             if (_ninferVerificationEnabled && _m.Ninfer == null)
@@ -142,7 +143,7 @@ namespace TensorSharp.Cuda
             else _ninfer.AddRmsNorm(x, delta, weight, output, rows, width, eps, stream);
         }
         private void NinferProject(NinferMatrix matrix, IntPtr input, IntPtr output, int rows,
-            int a4Threshold = 4, bool round = true, bool isVerify = false)
+            int a4Threshold = 4, bool round = true, bool isVerify = false, bool bf16Mma = false)
         {
             if (TryProjectNinferFlashInfer(matrix, input, output, rows))
             {
@@ -153,7 +154,10 @@ namespace TensorSharp.Cuda
             var d = matrix.Descriptor;
             if (TryNinferExactVerify(matrix, input, output, rows, a4Threshold, isVerify)) { }
             else if (d.Format == CudaNinferProjectionFormat.BFloat16)
-                _ninfer.ProjectBf16(matrix.Data, input, output, d.Rows, d.Columns, rows, Stream);
+            {
+                if (!TryNinferBf16Mma(matrix, input, output, rows, bf16Mma))
+                    _ninfer.ProjectBf16(matrix.Data, input, output, d.Rows, d.Columns, rows, Stream);
+            }
             else if (d.AllowA4 && rows >= a4Threshold)
             {
                 _ninfer.QuantizeNvfp4(input, _fp4c, _fp4s, _fp4r, d.Columns, rows, d.InputScaleDivisor, Stream);
@@ -178,13 +182,14 @@ namespace TensorSharp.Cuda
             int e = _m.NEmbd;
             bool isVerify = groups.Length == 1 && groups[0].Verify;
             bool candidatePass = groups.Length == 1 && groups[0].PassMode == NinferLayerPass.FusedResidualNorm;
+            bool bf16Mma = UsesNinferBf16Mma(groups, tapFirst);
             var residualState = NinferResidualState.InitialNoDelta;
             for (int il = 0; il < _m.NLayer; il++)
             {
                 var l = _layers[il]; var weights = _ninferLayers[il];
                 NormalizeNinferResidual(residualState, l.AttnNorm, rows, candidatePass, postProjection: false);
                 CaptureNinferDraftTargetTap(il, tapFirst, rows);
-                NinferProject(weights.Input, _xn, _proj, rows, l.Recurrent ? 1 : 4, isVerify: isVerify);
+                NinferProject(weights.Input, _xn, _proj, rows, l.Recurrent ? 1 : 4, isVerify: isVerify, bf16Mma: bf16Mma);
                 if (l.Recurrent)
                 {
                     if (_ninferAlphaBeta == IntPtr.Zero) _ninferAlphaBeta = Alloc((long)RowCap*96*4);
@@ -207,7 +212,7 @@ namespace TensorSharp.Cuda
                             gd, beta, TabState(l) + (nint)(8L*q0), _gdnO + (nint)((long)r0*ValueDim*4), g.Verify, Stream, count);
                     }
                     _ninfer.GdnOut(_gdnO, _proj, 16384, ConvDim, rows, _m.GdnVHeads, l.SsmNorm, _m.Eps, _gdnY, Stream);
-                    residualState = ProjectNinferResidual(weights.Output, _gdnY, rows, isVerify, candidatePass);
+                    residualState = ProjectNinferResidual(weights.Output, _gdnY, rows, isVerify, candidatePass, bf16Mma);
                 }
                 else
                 {
@@ -225,7 +230,7 @@ namespace TensorSharp.Cuda
                             1.0f/MathF.Sqrt(_m.HeadDim), maxKeys[gi], g.Rows <= MaxVerifyRows ? _attnPartial : IntPtr.Zero, _attn + qOff, Stream,
                             isVerify: g.Verify, allRowsValid: g.Counts == null, positionsBaseDev: _cacheRowDev + (nint)(4L*r0));
                     }
-                    residualState = ProjectNinferResidual(weights.Output, _attn, rows, isVerify, candidatePass);
+                    residualState = ProjectNinferResidual(weights.Output, _attn, rows, isVerify, candidatePass, bf16Mma);
                 }
                 NormalizeNinferResidual(residualState, l.PostNorm, rows, candidatePass, postProjection: true);
                 NinferProject(weights.GateUp, _xn, _proj, rows, 2, round: rows > 128 && rows != 1024, isVerify: isVerify);

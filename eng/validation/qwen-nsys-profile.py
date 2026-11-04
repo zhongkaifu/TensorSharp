@@ -17,6 +17,7 @@ import os
 import re
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -258,6 +259,16 @@ def models(url):
         return None
 
 
+def tcp_ready(url):
+    address = urlsplit(url)
+    try:
+        with socket.create_connection((address.hostname, address.port or
+                                       (443 if address.scheme == "https" else 80)), timeout=.25):
+            return True
+    except OSError:
+        return False
+
+
 def exec_server(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("--server-spec", required=True, type=Path)
@@ -279,6 +290,7 @@ def main(argv=None):
     parser.add_argument("--server-spec", type=Path, required=True, help="JSON: argv array, optional env object and cwd")
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--url", default="http://127.0.0.1:5089")
+    parser.add_argument("--known-model", help="Skip model discovery; requires a successful unprofiled prime")
     parser.add_argument("--scenario", required=True, help="Scenario identifier in the immutable fixture")
     parser.add_argument("--lane", type=int, default=0)
     parser.add_argument("--step", type=int, default=1)
@@ -294,6 +306,11 @@ def main(argv=None):
     parser.add_argument("--trace", default="cuda,nvtx,osrt", help="Use osrt for a CPU-only harness smoke test")
     parser.add_argument("--output", type=replay.evidence_path, required=True, help="Fresh evidence filename prefix")
     args = parser.parse_args(argv)
+    if args.known_model is not None:
+        if not args.known_model or args.known_model != args.known_model.strip() or "\0" in args.known_model:
+            parser.error("known-model must be a nonempty model identifier without surrounding whitespace or NUL")
+        if not any(step.strip() for step in args.prime_steps.split(",")):
+            parser.error("known-model requires at least one unprofiled prime step")
     if args.max_tokens is not None and args.max_tokens < 1:
         parser.error("max-tokens must be positive")
     if any(not math.isfinite(value) or value <= 0 for value in
@@ -303,7 +320,9 @@ def main(argv=None):
         parser.error("Server lifecycle verification requires Linux /proc")
     if urlsplit(args.url).hostname not in ("127.0.0.1", "localhost", "::1"):
         parser.error("Use an isolated loopback server")
-    if models(args.url) is not None:
+    if args.known_model is not None and tcp_ready(args.url):
+        parser.error("The selected port already accepts TCP connections; select a free port")
+    if args.known_model is None and models(args.url) is not None:
         parser.error("The selected port already serves a model; select a free port")
     prefix = args.output
     if any(prefix.parent.glob(prefix.name + ".*")):
@@ -319,6 +338,12 @@ def main(argv=None):
     pid_file = Path(str(prefix) + ".pid")
     report = {"session": session, "run_id": run_id, "server_spec": cfg, "scenario": args.scenario,
               "fixture": str(args.fixture.resolve()), "max_tokens_override": args.max_tokens,
+              "model_source": "known-model" if args.known_model is not None else "models-discovery",
+              "models_discovery_skipped": args.known_model is not None,
+              "known_model_prime_verified": False,
+              "known_model_prime_attempts": [],
+              "source_provenance": {str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in (Path(__file__), HERE / "qwen38-agent-replay.py", HERE / "qwen-nsys-summary.py")},
               "cpu_sampling": args.cpu_sampling, "trace": args.trace, "prime_results": [],
               "scope": "One isolated request, including decode. Profiling perturbs timings; compare unprofiled runs separately.",
               "gpu_gap_limit": "Wall time minus GPU activity is host/queue/idle time, not measured CPU execution time. Process CPU counters are separate, summed over threads.",
@@ -355,7 +380,7 @@ def main(argv=None):
                     report["server_identity"] = identity
                 except json.JSONDecodeError:
                     pass  # _exec is still writing its exclusive identity record.
-            model = models(args.url)
+            model = (args.known_model if tcp_ready(args.url) else None) if args.known_model is not None else models(args.url)
             if model is not None and identity is not None:
                 if server_state(identity) != "running":
                     raise RuntimeError("HTTP readiness does not belong to a live profiling server identity")
@@ -369,10 +394,35 @@ def main(argv=None):
         pid = identity["pid"]
         report["server_pid"] = pid
         for row in primes:
-            result = replay.request(args.url, model, row, args.timeout)
+            while True:
+                if args.known_model is not None:
+                    if not report["prime_results"] and report["known_model_prime_attempts"] and time.monotonic() >= deadline:
+                        raise TimeoutError("Known-model startup remained HTTP 503 until the readiness deadline")
+                    if server_state(identity) != "running":
+                        raise RuntimeError("Known-model prime does not belong to a live profiling server identity")
+                result = replay.request(args.url, model, row, args.timeout)
+                if args.known_model is not None:
+                    report["known_model_prime_attempts"].append(result)
+                    # A server can bind before loading its model. Retry only the
+                    # first prime's explicit startup 503, within the original
+                    # readiness deadline; never retry failed inference/streams.
+                    if not report["prime_results"] and result.get("http_status") == 503:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("Known-model startup remained HTTP 503 until the readiness deadline")
+                        time.sleep(min(.25, remaining))
+                        continue
+                break
             report["prime_results"].append(result)
             if result["errors"] or not result["done"]:
                 raise RuntimeError("Cache priming failed; inspect metadata")
+            if args.known_model is not None and (result.get("http_status") != 200
+                    or result.get("finish_reason") not in ("stop", "length", "tool_calls")):
+                raise RuntimeError("Known-model prime did not finish successfully; capture was not started")
+        if args.known_model is not None:
+            if server_state(identity) != "running":
+                raise RuntimeError("Known-model profiling server identity changed after priming")
+            report["known_model_prime_verified"] = True
         nsys(*start_command(session, prefix, args.cpu_sampling, report["nsys_start_capabilities"]))
         report["capture_status"] = "COLLECTING"
         collecting = True

@@ -112,10 +112,10 @@ public sealed unsafe partial class Q35CudaEngine
     }
 
     private NinferResidualState ProjectNinferResidual(NinferMatrix matrix, IntPtr input, int rows,
-        bool isVerify, bool candidatePass)
+        bool isVerify, bool candidatePass, bool bf16Mma = false)
     {
         bool fused = TryNinferFusedResidualProjection(matrix, input, _block, rows, candidatePass);
-        if (!fused) NinferProject(matrix, input, _block, rows, round: false, isVerify: isVerify);
+        if (!fused) NinferProject(matrix, input, _block, rows, round: false, isVerify: isVerify, bf16Mma: bf16Mma);
         return NinferProjectedResidualState(fused);
     }
 

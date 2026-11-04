@@ -1,15 +1,20 @@
 """Profiler ownership/cleanup gates. Linux cases use real CPU processes, no GPU/Nsight."""
 import importlib.util
+import http.server
+import io
 import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
+from contextlib import redirect_stderr
 import uuid
 
 SCRIPT = Path(__file__).resolve().parents[1] / "qwen-nsys-profile.py"
@@ -153,6 +158,140 @@ class CapabilityTests(unittest.TestCase):
             self.assertFalse(metadata["complete"]); self.assertEqual("NOT_RUN", metadata["capture_status"])
             self.assertNotIn("server_cleanup", metadata)
             self.assertNotIn("synthetic-secret", json.dumps(metadata))
+
+
+class KnownModelTests(unittest.TestCase):
+    def run_client(self, *, known=True, prime_failure=False, startup_status=None, persistent=False):
+        """Real loopback HTTP/SSE, mocked Nsight and Linux process identity; no GPU."""
+        directory = ROOT / "artifacts"; directory.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="nsys-known-model-", dir=directory) as temporary:
+            folder = Path(temporary); prefix = folder / "capture"
+            server_spec = folder / "server.json"; fixture = folder / "fixture.jsonl"
+            server_spec.write_text(json.dumps({"argv": ["unused-cpu-test-server"]}))
+            body = {"messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 1}
+            fixture.write_text("".join(json.dumps({"scenario": "cpu", "lane": 0, "step": step,
+                "body": body, "request_sha256": profile.replay.digest(body), "expected": None}) + "\n" for step in (0, 1)))
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0)); port = listener.getsockname()[1]
+            observed = {"get": 0, "posts": [], "commands": []}; server = None; thread = None
+
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, *args): pass
+                def do_GET(self):
+                    observed["get"] += 1
+                    payload = json.dumps({"data": [{"id": "discovered-model"}]}).encode() if not known else b""
+                    self.send_response(200 if not known else 503)
+                    self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+                def do_POST(self):
+                    observed["posts"].append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                    if startup_status is not None and (persistent or len(observed["posts"]) == 1):
+                        self.send_response(startup_status); self.send_header("Content-Length", "0"); self.end_headers(); return
+                    # [DONE] alone cannot establish that the known alias works.
+                    finish = None if prime_failure else "length"
+                    event = {"choices": [{"index": 0, "delta": {"content": "OK"}, "finish_reason": finish}],
+                             "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+                    payload = ("data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n").encode()
+                    self.send_response(200); self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+
+            class Launcher:
+                def poll(self): return 0
+                def wait(self, timeout): return 0
+
+            def launch(command, **kwargs):
+                nonlocal server, thread
+                Path(command[command.index("--pid-file") + 1]).write_text("owned wrapper marker")
+                server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+                return Launcher()
+
+            def run(command, **kwargs):
+                observed["commands"].append(command)
+                if len(command) > 1 and command[1] == "start":
+                    self.assertEqual((2 if startup_status == 503 else 1) if known else 0, len(observed["posts"]))
+                    self.assertFalse(prime_failure)
+                return subprocess.CompletedProcess(command, 0)
+
+            argv = ["--nsys", "fake-nsys", "--server-spec", str(server_spec), "--fixture", str(fixture),
+                    "--url", f"http://127.0.0.1:{port}", "--scenario", "cpu", "--step", "1",
+                    "--prime-steps", "0" if known else "", "--output", str(prefix)]
+            if persistent: argv += ["--startup-timeout", ".1"]
+            if known: argv += ["--known-model", "known-alias"]
+            identity = {"pid": 123, "starttime": 456, "boot_id": "synthetic-test"}
+            counters = dict(user_ms=0, system_ms=0, minor_faults=0, major_faults=0)
+            try:
+                with patch.object(profile, "linux_proc_available", return_value=True), \
+                        patch.object(profile.subprocess, "Popen", side_effect=launch), \
+                        patch.object(profile.subprocess, "run", side_effect=run), \
+                        patch.object(profile.subprocess, "check_output", side_effect=lambda cmd, **kw: "fake Nsight" if "--version" in cmd else START_HELP), \
+                        patch.object(profile, "read_server_identity", return_value=identity), \
+                        patch.object(profile, "server_state", return_value="running"), \
+                        patch.object(profile, "process_counters", return_value=counters), \
+                        patch.object(profile, "stop_owned_server", return_value={"confirmed_exited": True}) as cleanup:
+                    if persistent:
+                        with self.assertRaisesRegex(TimeoutError, "startup remained HTTP 503"): profile.main(argv)
+                    elif startup_status is not None and startup_status != 503:
+                        with self.assertRaisesRegex(RuntimeError, "Cache priming failed"): profile.main(argv)
+                    elif prime_failure:
+                        with self.assertRaisesRegex(RuntimeError, "prime did not finish successfully"): profile.main(argv)
+                    else: profile.main(argv)
+                cleanup.assert_called_once_with(identity, 15, 5)
+                return json.loads(Path(str(prefix) + ".json").read_text()), observed
+            finally:
+                if server is not None: server.shutdown(); server.server_close()
+                if thread is not None: thread.join(timeout=2)
+
+    def test_known_alias_profiles_chat_without_any_models_request(self):
+        metadata, observed = self.run_client()
+        self.assertTrue(metadata["complete"]); self.assertTrue(metadata["known_model_prime_verified"])
+        self.assertTrue(metadata["models_discovery_skipped"]); self.assertEqual("known-model", metadata["model_source"])
+        self.assertEqual(0, observed["get"]); self.assertEqual(2, len(observed["posts"]))
+        self.assertTrue(all(body["model"] == "known-alias" for body in observed["posts"]))
+        self.assertEqual(1, len(metadata["prime_results"])); self.assertEqual(200, metadata["prime_results"][0]["http_status"])
+        self.assertEqual(3, len(metadata["source_provenance"]))
+        self.assertEqual(profile.hashlib.sha256(SCRIPT.read_bytes()).hexdigest(), metadata["source_provenance"][str(SCRIPT.resolve())])
+
+    def test_default_keeps_models_discovery_and_allows_no_prime(self):
+        metadata, observed = self.run_client(known=False)
+        self.assertTrue(metadata["complete"]); self.assertFalse(metadata["models_discovery_skipped"])
+        self.assertEqual("models-discovery", metadata["model_source"]); self.assertFalse(metadata["known_model_prime_verified"])
+        self.assertGreater(observed["get"], 0); self.assertEqual([], metadata["prime_results"])
+        self.assertEqual("discovered-model", observed["posts"][0]["model"])
+
+    def test_startup_503_waits_for_successful_first_prime_before_start(self):
+        metadata, observed = self.run_client(startup_status=503)
+        self.assertTrue(metadata["complete"]); self.assertTrue(metadata["known_model_prime_verified"])
+        self.assertEqual([503, 200], [r["http_status"] for r in metadata["known_model_prime_attempts"]])
+        self.assertEqual(1, len(metadata["prime_results"])); self.assertEqual(200, metadata["prime_results"][0]["http_status"])
+        self.assertEqual(0, observed["get"]); self.assertEqual(3, len(observed["posts"]))
+
+    def test_startup_503_cannot_extend_the_original_deadline(self):
+        metadata, observed = self.run_client(startup_status=503, persistent=True)
+        self.assertFalse(metadata["complete"]); self.assertFalse(metadata["known_model_prime_verified"])
+        self.assertEqual([503], [r["http_status"] for r in metadata["known_model_prime_attempts"]])
+        self.assertEqual([], metadata["prime_results"]); self.assertEqual("NOT_RUN", metadata["capture_status"])
+        self.assertFalse(any(len(cmd) > 1 and cmd[1] == "start" for cmd in observed["commands"]))
+
+    def test_other_http_failures_are_not_startup_retries(self):
+        metadata, observed = self.run_client(startup_status=404)
+        self.assertFalse(metadata["complete"]); self.assertEqual(1, len(observed["posts"]))
+        self.assertEqual([404], [r["http_status"] for r in metadata["known_model_prime_attempts"]])
+        self.assertEqual("NOT_RUN", metadata["capture_status"])
+
+    def test_known_alias_refuses_missing_prime_before_any_discovery_or_launch(self):
+        with patch.object(profile, "models") as models, patch.object(profile, "tcp_ready") as tcp, \
+                patch.object(profile.subprocess, "Popen") as launch, redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                profile.main(["--server-spec", "unused", "--fixture", "unused", "--scenario", "cpu",
+                              "--output", str(ROOT / "artifacts/unused"), "--known-model", "known-alias", "--prime-steps", " , "])
+        models.assert_not_called(); tcp.assert_not_called(); launch.assert_not_called()
+
+    def test_done_without_successful_prime_never_starts_collection(self):
+        metadata, observed = self.run_client(prime_failure=True)
+        self.assertFalse(metadata["complete"]); self.assertFalse(metadata["known_model_prime_verified"])
+        self.assertEqual("NOT_RUN", metadata["capture_status"]); self.assertEqual(1, len(observed["posts"]))
+        self.assertFalse(any(len(cmd) > 1 and cmd[1] == "start" for cmd in observed["commands"]))
+        self.assertTrue(metadata["server_cleanup"]["confirmed_exited"])
 
 
 class IdentityTests(unittest.TestCase):
