@@ -13,7 +13,7 @@ using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
 {
-    internal sealed unsafe class Q35Kernels : IDisposable
+    internal sealed unsafe partial class Q35Kernels : IDisposable
     {
         /// <summary>Tokens per attention cache block (TS_Q35_KV_BLOCK).</summary>
         public const int KvBlockTokens = 256;
@@ -172,6 +172,9 @@ namespace TensorSharp.Cuda
         }
 
         public static Q35Kernels Create()
+            => Create(identifyImage: false);
+
+        internal static Q35Kernels Create(bool identifyImage)
         {
             string path = CudaKernels.LocatePtxPath("tensorsharp_q35_kernels.ptx");
             if (path == null)
@@ -180,7 +183,7 @@ namespace TensorSharp.Cuda
                     "tensorsharp_q35_kernels.ptx could not be located next to the application or under " +
                     "a 'cuda_kernels' folder. Build TensorSharp.Backends.Cuda with a CUDA 13 nvcc on the PATH.");
             }
-            return FromModule(CudaModule.LoadFromFile(path));
+            return FromModule(CudaModule.LoadFromFile(path, identify: identifyImage));
         }
 
         /// <summary>Kernels over an already loaded module, which they own (and unload when they
@@ -350,8 +353,10 @@ namespace TensorSharp.Cuda
         /// <param name="swiglu">wCodes are the interleaved gate|up planes: y [m][outDim / 2] is the FFN
         /// activation silu(gate) * up (never split over K).</param>
         public void GemmW4A4(IntPtr wCodes, IntPtr wScales, int outDim, int k, IntPtr xCodes, IntPtr xScales, IntPtr rowScale,
-            int m, float alpha, IntPtr y, IntPtr partial, IntPtr counters, int sms, int maxSplits, IntPtr stream, bool swiglu = false)
+            int m, float alpha, IntPtr y, IntPtr partial, IntPtr counters, int sms, int maxSplits, IntPtr stream,
+            bool swiglu = false, bool ninferVerify8 = false)
         {
+            _gemmWorkSubmitted = true;
             if (swiglu || !SplitK)
                 maxSplits = 1;
             int bn = m <= 32 ? 32 : m <= 64 ? 64 : 128;
@@ -364,11 +369,14 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11 };
             var (fn, smem) = bn == 32 ? (swiglu ? gemm32SwiGlu : gemm32, smem32) : bn == 64 ? (swiglu ? gemm64SwiGlu : gemm64, smem64)
                 : (swiglu ? gemm128SwiGlu : gemm128, smem128);
+            bool useVerify8 = UseNinferVerify8Gemm(_ninferVerify8Gemm != IntPtr.Zero, ninferVerify8, swiglu, m, outDim, k);
+            if (useVerify8) { fn = _ninferVerify8Gemm; smem = NinferVerify8GemmSharedBytes; }
             // The 128-row kernel walks activation tiles fastest (weight tiles shared in L2).
             if (bn == 128)
                 Launch(fn, (uint)tilesY, (uint)tilesX, (uint)splits, 256, smem, stream, args);
             else
                 Launch(fn, (uint)tilesX, (uint)tilesY, (uint)splits, 256, smem, stream, args);
+            if (useVerify8) NinferVerify8GemmHostSubmissions++;
         }
 
         public void EmbedQ4_0(IntPtr table, long rowBytes, IntPtr tokens, IntPtr outRows, int rows, int width, IntPtr stream)
@@ -754,6 +762,14 @@ namespace TensorSharp.Cuda
             Launch(argmax, (uint)rows, 1, 1, 1024, 0, stream, args);
         }
 
-        public void Dispose() => module.Dispose();
+        public void Dispose()
+        {
+            if (_ninferVerify8Gemm != IntPtr.Zero)
+            {
+                Console.Error.WriteLine($"[q35-cuda] NInfer Verify8 GEMM host submissions={NinferVerify8GemmHostSubmissions} (capture included; not GPU graph replays), module={module.ImageSha256}");
+                _ninferVerify8Gemm = IntPtr.Zero;
+            }
+            module.Dispose();
+        }
     }
 }

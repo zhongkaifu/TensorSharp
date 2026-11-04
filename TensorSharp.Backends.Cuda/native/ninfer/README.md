@@ -35,7 +35,7 @@ selects the packaged legacy-exact A16 vector module, lossless GPU weight-layout
 conversion, and eligible decode CUDA graphs. These choices preserve the existing
 projection arithmetic or encoded weight bytes. They do not turn on speculative
 decoding, host embeddings, FlashInfer, or a new GDN algorithm. The separate
-Verify8 policy below has narrower hardware and runtime requirements. Other
+Verify8 policies below have narrower hardware and runtime requirements. Other
 devices retain the existing implementations unless explicitly
 configured. Automatic device qualification currently comes from RTX 5090 testing;
 it is not a claim of model or performance coverage on every CC 12.0 board.
@@ -53,6 +53,7 @@ Execution failures are never retried on the fallback path.
 | `TS_Q35_NINFER_A16_AUTO=0` | Disable automatic vector selection. |
 | `TS_Q35_NINFER_REPACK=0` | Disable automatic GPU layout conversion. |
 | `TS_Q35_NINFER_DECODE_GRAPHS=0` | Disable automatic graph capture/replay. |
+| `TS_Q35_NINFER_VERIFY8_GEMM=0` | Keep the existing T8 verification matrix schedule. |
 | `TS_Q35_NINFER_A16_PTX` | Explicit original-schedule A16 image; suppresses automatic vector selection. |
 | `TS_Q35_NINFER_A16_LEGACY_EXACT_PTX` | Explicit legacy-exact image; suppresses automatic discovery. |
 | `TS_Q35_NINFER_REPACK_PTX` | Explicit lossless layout converter; takes precedence over its automatic control. |
@@ -162,6 +163,62 @@ Code throughput was 375.90 versus 375.92 tokens/s, so discovery adds no extra
 speedup over explicit selection. The retained 7 text / 5 program failures remain
 failures. Final NInfer/SHA CPU tests passed 782 cases with zero skips; native
 Windows and other unavailable devices are not covered by this run.
+
+## Full T8 verification GEMM
+
+`TS_Q35_NINFER_VERIFY8_GEMM` is automatic when unset on the complete
+Qwen3.8 NInfer recipe, CC12.0/170-SM hardware, with verification already enabled
+and room for eight rows. The main CUDA image must contain
+`ts_q35_gemm_w4a4_8`. It changes only complete T8 verification of the five plain
+NVFP4 projection shapes: N/K 16384/5120, 34816/5120, 5120/17408, 5120/6144 and
+14336/5120. Ordinary prefill, other shapes, BF16 matrices and GGUF retain their
+existing dispatch. It enables neither speculation nor verification.
+
+The kernel reuses the existing TensorSharp implementation with an eight-token
+tile and two shared-memory stages. It removes three unused token fragments,
+reducing dynamic shared memory from 76,800 to 43,520 bytes and measured registers
+from 76 to 40. Encoded weights, activation quantization, alpha, split-K summation
+order and consumer precision boundaries are unchanged. Gate/up still reaches
+SwiGLU in F32; output/down projections remain F32 until their existing consumer.
+
+Exact `0` disables selection; `1` requires a supported profile and the new entry.
+Other values are rejected on NInfer. An older automatic main image without the
+entry falls back before inference; other loading, ABI and execution failures
+remain errors. Selection is fixed before any GEMM or graph capture. The actual
+main image SHA and policy enter the KV namespace. Diagnostics expose selection,
+image and host submissions; host submissions include capture and do not count
+GPU graph replays.
+
+CUDA 13.2 validation on RTX 5090 exercised the actual production image across
+all five shapes: 702 component kernel executions, two module lifetimes,
+three output poisons, complete F32/consumer comparisons against both the actual
+old image and a same-source control, CPU quantization and scoped FP64 bounds.
+The dense GDN warm full chain improved 1.1237x in five paired timing rounds;
+the other shapes' component runs establish numerical coverage, not speed wins.
+The affected managed suite passed 146 tests with zero failures or skips.
+
+One same-runtime OFF/ON/ON/OFF block completed 36 frozen API requests. Code arm
+medians were 400.04 / 406.46 / 406.98 / 399.83 tokens/s: means of arm medians
+399.94 to 406.72, about 1.70%. Prose and copy increased about 1.76% and 1.61%.
+All nine corresponding response contents and token usages matched across arms;
+both arms retained the same automatic governor and speculative work. These are
+descriptive client decode rates for K7/pMin0, BF16 KV, context40960, ubatch2048
+and cap4, not a universal speed or engine-ranking claim.
+
+For those same outputs, complete HTTP request times were code 2.5823 to 2.5405s,
+prose 4.2749 to 4.2007s and copy 1.3505 to 1.3349s, using means of the two arm
+medians. TTFT was mixed: code 66.34 to 67.19ms, prose 65.00 to 63.28ms and copy
+414.59 to 415.30ms. The observed gain is primarily in decoding.
+
+The actual automatic build also completed all 45 text and 30 program cases.
+Against the preceding accepted default, all 141 inputs, 309 checks, 96 arithmetic
+values and 189 program-input statuses matched. All 123 serial text responses and
+30 generated programs were identical; parallel response variations changed no
+checks. Scores remain 38/45 and 26/30, including the existing wrong interval
+answer and 21 unexecuted program inputs. Finite parity does not establish
+universal model quality. This change does not establish NInfer 128K/250K or
+native Windows coverage. Reusable probes are in
+`eng/validation/NinferA4GdnCoreProbe`; generated evidence remains ignored.
 
 ## Native DFlash cost governor
 

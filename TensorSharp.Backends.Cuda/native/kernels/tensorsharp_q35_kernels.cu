@@ -790,6 +790,10 @@ __device__ __forceinline__ void ts_q35_gemm_w4a4(
 // grid (weight tiles, activation tiles, splits); the 128-row kernels take (activation tiles, weight tiles, splits).
 // _swiglu: the fused gate|up projection with SwiGLU in the epilogue (y is the FFN activation).
 TS_Q35_GEMM(ts_q35_gemm_w4a4_32, 32, 8, 1, 3, false, false)
+// Exact T8 specialization: same live-token MMA/split-K arithmetic as _32.
+// Separate entry retains the existing kernels and their shared-memory requirements.
+TS_Q35_GEMM(ts_q35_gemm_w4a4_8, 8, 8, 1, 2, false, false)
+#define TS_Q35_HAS_GEMM_W4A4_8 1
 TS_Q35_GEMM(ts_q35_gemm_w4a4_64, 64, 4, 2, 3, false, false)
 TS_Q35_GEMM(ts_q35_gemm_w4a4_128, 128, 4, 2, 2, true, false)
 TS_Q35_GEMM(ts_q35_gemm_w4a4_32_swiglu, 32, 8, 1, 3, false, true)

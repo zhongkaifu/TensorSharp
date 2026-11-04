@@ -98,6 +98,7 @@ namespace TensorSharp.Cuda
         private void InitializeNinferModules()
         {
             InitializeNinferQualifiedDefaults();
+            InitializeNinferVerify8Gemm();
             InitializeNinferA16Candidate();
             InitializeNinferLoadRepack();
             InitializeNinferExactVerify();
@@ -157,7 +158,8 @@ namespace TensorSharp.Cuda
                 _ninfer.QuantizeNvfp4(input, _fp4c, _fp4s, _fp4r, d.Columns, rows, d.InputScaleDivisor, Stream);
                 float alpha = 1.0f / (d.InputScaleDivisor * d.WeightScaleDivisor);
                 _k.GemmW4A4(matrix.Data, matrix.Scales, d.Rows, d.Columns, _fp4c, _fp4s, _fp4r,
-                    rows, alpha, output, _partial, _counters, _sms, rows <= 64 ? 8 : 1, Stream);
+                    rows, alpha, output, _partial, _counters, _sms, rows <= 64 ? 8 : 1, Stream,
+                    ninferVerify8: isVerify && rows == 8);
             }
             else if (!TryNinferA16(matrix, input, output, rows))
                 _ninfer.ProjectA16(matrix.Data, matrix.Scales, input, output, d.Rows, d.Columns, rows,

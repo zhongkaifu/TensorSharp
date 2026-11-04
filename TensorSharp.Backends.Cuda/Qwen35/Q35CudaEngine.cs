@@ -257,7 +257,7 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuInit(0);
                 _alloc = new CudaAllocator(0);
                 MakeCurrent();
-                _k = Q35Kernels.Create();
+                _k = Q35Kernels.Create(identifyImage: m.Ninfer != null);
                 CudaDriverApi.cuDeviceGetAttribute(out _sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, 0).ThrowOnError();
 
                 InitializeOutputW8Module();
