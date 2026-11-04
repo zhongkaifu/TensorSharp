@@ -1,0 +1,29 @@
+{
+  // Shared CLI/Server.Host profile. Add --chat only for the interactive CLI.
+  // Existing VM model: override --model /workspace/hf/ignis/qwen3_8_27b_nvfp4full-v2.ninfer.
+  // The artifact embeds its tokenizer and original full-head DFlash2 weights.
+  "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
+  "model": {
+    "path": "${modelRoot}/qwen3_8_27b_nvfp4full-v2.ninfer",
+    "urls": ["https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer/resolve/86d9a4bf76997639dcd64f78fde2d73740ad9a3e/qwen3_8_27b_nvfp4full-v2.ninfer"],
+    "sha256": "abb1e120d5f1f32d61689604d238227ff579ab76cbd9319628f3b3904fffd9af"
+  },
+  "backend": "cuda",
+  "max-tokens": 1024,
+  "temperature": 0,
+  "repeat-penalty": 1,
+  "no-skills": true,
+  "spec": true,
+  "spec-type": "block",
+  "spec-draft": 7,
+  "spec-pmin": 0,
+  "environment": {
+    "MAX_CONTEXT": "40960",
+    "TS_Q35_UBATCH": "2048",
+    "TS_SCHED_MAX_RUNNING_SEQS": "4",
+    "TS_Q35_NINFER_VERIFY": "1",
+    "TS_Q35_GREEDY_VERIFY": "1",
+    "TS_SPEC_ADAPTIVE": "0",
+    "TS_Q35_NINFER_DRAFT_PTX": "${appBaseDirectory}/cuda_kernels/tensorsharp_q35_ninfer_draft.fatbin"
+  }
+}

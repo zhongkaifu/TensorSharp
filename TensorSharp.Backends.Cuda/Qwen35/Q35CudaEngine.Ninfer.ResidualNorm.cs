@@ -31,11 +31,13 @@ public sealed unsafe partial class Q35CudaEngine
     {
         if (!ninfer) return false;
         bool requested = NinferAutomaticOptimizationRequested(option, NinferResidualNormEnvironment);
-        bool supported = qualified && sms == 170 && context == 40960 && maximumRows >= 8
+        // Configured context does not enter this fixed T8 projection/norm math.
+        // Attention independently keeps its actual-visible 40960-key cap and fallback.
+        bool supported = qualified && sms == 170 && (context is 40960 or 65536) && maximumRows >= 8
             && verification && graphs && gemm8 && splitK && targetW8 && !flashInfer && !exactVerify && allDowns;
         if (option == "1" && !supported)
             throw new NotSupportedException(NinferResidualNormEnvironment
-                + "=1 requires the qualified context40960/170-SM target, W8, Verify8 GEMM/split-K and decode graphs, original NVFP4 Down projections, without projection overrides.");
+                + "=1 requires the qualified context40960 or context65536/170-SM target, W8, Verify8 GEMM/split-K and decode graphs, original NVFP4 Down projections, without projection overrides.");
         return requested && supported;
     }
 
@@ -93,7 +95,7 @@ public sealed unsafe partial class Q35CudaEngine
             _ninferResidualNormSuffix = BuildNinferResidualNormStateSuffix(_k.ImageSha256);
             NinferResidualNormEnabled = true;
         }
-        Console.Error.WriteLine($"[q35-cuda] NInfer residual norm selection={NinferResidualNormSelection}, enabled={NinferResidualNormEnabled}, policy={Q35Kernels.NinferResidualNormPolicy}, module={NinferResidualNormImageSha256}, rows=8,lanes=1,context=40960");
+        Console.Error.WriteLine($"[q35-cuda] NInfer residual norm selection={NinferResidualNormSelection}, enabled={NinferResidualNormEnabled}, policy={Q35Kernels.NinferResidualNormPolicy}, module={NinferResidualNormImageSha256}, rows=8,lanes=1,context={_m.NCtx}");
     }
 
     private bool TryNinferFusedResidualProjection(NinferMatrix matrix, IntPtr input, IntPtr output,

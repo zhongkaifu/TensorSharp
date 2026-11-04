@@ -27,10 +27,11 @@ public sealed unsafe partial class Q35CudaEngine
     {
         if (!ninfer) return false;
         bool requested = NinferAutomaticOptimizationRequested(option, NinferBf16MmaEnvironment);
-        bool supported = qualified && sms == 170 && context == 40960 && maximumRows >= 8
+        // Only the configured profile widens; the two T8 shapes and scratch stay fixed.
+        bool supported = qualified && sms == 170 && (context is 40960 or 65536) && maximumRows >= 8
             && verify && graphs && !flashInfer && !exact;
         if (option == "1" && !supported)
-            throw new NotSupportedException(NinferBf16MmaEnvironment + "=1 requires the qualified 170-SM/context40960 NInfer recipe, enabled verification/graphs, without FI or ExactVerify.");
+            throw new NotSupportedException(NinferBf16MmaEnvironment + "=1 requires the qualified 170-SM/context40960 or context65536 NInfer recipe, enabled verification/graphs, without FI or ExactVerify.");
         return requested && supported;
     }
     internal static bool UseNinferBf16MmaPass(bool enabled, int groups, int window, int lanes,
@@ -104,7 +105,7 @@ public sealed unsafe partial class Q35CudaEngine
         LogNinferBf16MmaSelection();
     }
     private void LogNinferBf16MmaSelection()
-        => Console.Error.WriteLine($"[q35-cuda] NInfer BF16 MMA selection={NinferBf16MmaSelection}, enabled={NinferBf16MmaEnabled}, policy={CudaNinferBf16MmaModule.ArithmeticPolicy}, module={NinferBf16MmaImageSha256}, rows=8,lanes=1,context=40960,scratch={(NinferBf16MmaEnabled ? CudaNinferBf16MmaModule.ScratchBytes : 0)}");
+        => Console.Error.WriteLine($"[q35-cuda] NInfer BF16 MMA selection={NinferBf16MmaSelection}, enabled={NinferBf16MmaEnabled}, policy={CudaNinferBf16MmaModule.ArithmeticPolicy}, module={NinferBf16MmaImageSha256}, rows=8,lanes=1,context={_m.NCtx},scratch={(NinferBf16MmaEnabled ? CudaNinferBf16MmaModule.ScratchBytes : 0)}");
     private bool TryNinferBf16Mma(NinferMatrix matrix, IntPtr input, IntPtr output, int rows, bool pass)
     {
         var d = matrix.Descriptor;

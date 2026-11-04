@@ -11,6 +11,22 @@ public sealed class NinferGateUpSwiGluPolicyTests
         => Q35CudaEngine.PlanNinferGateUpSwiGlu(true, qualified, sms, context, rows, verify, graphs,
             gemm, overrides, matrices, option!);
 
+    [Theory]
+    [InlineData(40960)] [InlineData(65536)]
+    public void OnlyTheTwoConfiguredContextProfilesCanUseTheSameT8Math(int context)
+    {
+        Assert.True(Plan(null, context: context)); Assert.True(Plan("1", context: context));
+        Assert.False(Plan("0", context: context));
+    }
+
+    [Theory]
+    [InlineData(32768)] [InlineData(65535)] [InlineData(65537)]
+    public void OtherConfiguredContextsRemainUnsupported(int context)
+    {
+        Assert.False(Plan(null, context: context)); Assert.False(Plan("0", context: context));
+        Assert.Throws<NotSupportedException>(() => Plan("1", context: context));
+    }
+
     [Fact]
     public void QualifiedRouteHasStrictOptOut()
     {

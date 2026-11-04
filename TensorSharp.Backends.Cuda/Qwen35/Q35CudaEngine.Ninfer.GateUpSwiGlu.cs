@@ -20,10 +20,11 @@ public sealed unsafe partial class Q35CudaEngine
     {
         if (!ninfer) return false;
         bool requested = NinferAutomaticOptimizationRequested(option, NinferGateUpSwiGluEnvironment);
-        bool supported = qualified && sms == 170 && context == 40960 && maximumRows >= 8
+        // Context is not an operand of the fixed GateUp/SwiGLU specialization.
+        bool supported = qualified && sms == 170 && (context is 40960 or 65536) && maximumRows >= 8
             && verify && graphs && verify8Gemm && !overrides && allGateUps;
         if (option == "1" && !supported)
-            throw new NotSupportedException(NinferGateUpSwiGluEnvironment + "=1 requires qualified context40960/170-SM T8 verification, graphs and Verify8 GEMM with original NVFP4 GateUp projections.");
+            throw new NotSupportedException(NinferGateUpSwiGluEnvironment + "=1 requires qualified context40960 or context65536/170-SM T8 verification, graphs and Verify8 GEMM with original NVFP4 GateUp projections.");
         return requested && supported;
     }
     internal static bool NinferGateUpSwiGluMatrixEligible(CudaNinferProjectionFormat format, bool allowA4, int rows, int n, int k)
@@ -63,7 +64,7 @@ public sealed unsafe partial class Q35CudaEngine
             _ninferGateUpSwiGluSuffix = "|ninfer-gateup-swiglu=" + Q35Kernels.NinferGateUpSwiGluPolicy
                 + ":" + _k.ImageSha256.ToLowerInvariant();
         }
-        Console.Error.WriteLine($"[q35-cuda] NInfer GateUp SwiGLU selection={NinferGateUpSwiGluSelection}, enabled={NinferGateUpSwiGluEnabled}, policy={Q35Kernels.NinferGateUpSwiGluPolicy}, module={NinferGateUpSwiGluImageSha256}, rows=8,lanes=1,context=40960");
+        Console.Error.WriteLine($"[q35-cuda] NInfer GateUp SwiGLU selection={NinferGateUpSwiGluSelection}, enabled={NinferGateUpSwiGluEnabled}, policy={Q35Kernels.NinferGateUpSwiGluPolicy}, module={NinferGateUpSwiGluImageSha256}, rows=8,lanes=1,context={_m.NCtx}");
     }
 
     private bool TryNinferGateUpSwiGlu(NinferMatrix matrix, int rows, bool pass)

@@ -18,6 +18,22 @@ public sealed class NinferBf16MmaPolicyTests
     public void QualifiedProfileSelectsAutomaticallyWithExplicitOptOut(string? value, bool expected) => Assert.Equal(expected, Plan(value));
 
     [Theory]
+    [InlineData(40960)] [InlineData(65536)]
+    public void OnlyTheTwoConfiguredContextProfilesCanUseTheSameT8Math(int context)
+    {
+        Assert.True(Plan(null, context: context)); Assert.True(Plan("1", context: context));
+        Assert.False(Plan("0", context: context));
+    }
+
+    [Theory]
+    [InlineData(32768)] [InlineData(65535)] [InlineData(65537)]
+    public void OtherConfiguredContextsRemainUnsupported(int context)
+    {
+        Assert.False(Plan(null, context: context)); Assert.False(Plan("0", context: context));
+        Assert.Throws<NotSupportedException>(() => Plan("1", context: context));
+    }
+
+    [Theory]
     [InlineData("")] [InlineData(" ")] [InlineData("true")] [InlineData("01")] [InlineData("2")] [InlineData(" 1")]
     public void MalformedNinferOptionCannotHideBehindAnUnsupportedProfile(string value)
         => Assert.Throws<ArgumentException>(() => Plan(value, qualified: false));
@@ -26,7 +42,7 @@ public sealed class NinferBf16MmaPolicyTests
     public void RequiredCandidateRejectsUnmeasuredProfilesAndProjectionOverrides()
     {
         Action[] requests = { () => Plan("1", qualified: false), () => Plan("1", sms: 169), () => Plan("1", sms: 171),
-            () => Plan("1", context: 40959), () => Plan("1", context: 65536), () => Plan("1", rows: 7),
+            () => Plan("1", context: 40959), () => Plan("1", context: 65535), () => Plan("1", rows: 7),
             () => Plan("1", verify: false), () => Plan("1", graphs: false), () => Plan("1", fi: true), () => Plan("1", exact: true) };
         foreach (var request in requests) Assert.Throws<NotSupportedException>(request);
         Assert.False(Plan(null, qualified: false, graphs: false, fi: true));
@@ -37,7 +53,7 @@ public sealed class NinferBf16MmaPolicyTests
     public void AutomaticSelectionDeclinesEveryUnmeasuredProfileAndOverride()
     {
         bool[] rejected = { Plan(null, qualified: false), Plan(null, sms: 169), Plan(null, sms: 171),
-            Plan(null, context: 40959), Plan(null, context: 65536), Plan(null, rows: 7),
+            Plan(null, context: 40959), Plan(null, context: 65535), Plan(null, rows: 7),
             Plan(null, verify: false), Plan(null, graphs: false), Plan(null, fi: true), Plan(null, exact: true) };
         Assert.All(rejected, x => Assert.False(x));
     }

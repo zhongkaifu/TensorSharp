@@ -7,7 +7,8 @@
     "$schema": {"type": "string"},
     "$unavailable": {"type": "string", "minLength": 1},
     "variables": {"$ref": "#/$defs/variables"},
-    "vars": {"$ref": "#/$defs/variables"}
+    "vars": {"$ref": "#/$defs/variables"},
+    "environment": {"type": "object", "additionalProperties": {"type": "string"}}
   },
   "additionalProperties": {"$ref": "#/$defs/option"},
   "$defs": {

@@ -130,6 +130,65 @@ public sealed class ConfigFileArgsPreflightTests : IDisposable
     }
 
     [Fact]
+    public void EnvironmentDefaults_AreAppliedAfterSuccessfulPreflightAndDownload()
+    {
+        using var server = new CountingServer();
+        server.AddFile("/model.gguf", [1, 2, 3, 4]);
+        string key = "TS_CONFIG_DOWNLOAD_" + Guid.NewGuid().ToString("N");
+        string cfg = WriteConfig($$"""
+        {
+          "environment": { {{Q(key)}}: "download-complete" },
+          "model": { "path": {{Q(Path.Combine(_dir, "model.gguf"))}}, "urls": [ {{Q(server.UrlFor("/model.gguf"))}} ] }
+        }
+        """);
+        try
+        {
+            var result = ConfigFileArgs.Expand(["--config", cfg], TextWriter.Null, false, preview =>
+            {
+                Assert.Null(Environment.GetEnvironmentVariable(key));
+                Assert.Equal(0, server.Requests);
+                Assert.DoesNotContain("--environment", preview.Tokens);
+            });
+            Assert.Equal(1, server.Requests);
+            Assert.Equal("download-complete", Environment.GetEnvironmentVariable(key));
+            Assert.Equal(["--model", Path.Combine(_dir, "model.gguf")], result);
+        }
+        finally { Environment.SetEnvironmentVariable(key, null); }
+    }
+
+    [Fact]
+    public void MalformedEnvironment_IsRefusedBeforePreflightOrAnyDownload()
+    {
+        using var server = new CountingServer();
+        string cfg = WriteConfig($$"""
+        {
+          "model": { "path": {{Q(Path.Combine(_dir, "model.gguf"))}}, "urls": [ {{Q(server.UrlFor("/model.gguf"))}} ] },
+          "environment": { "INVALID=NAME": "value" }
+        }
+        """);
+        bool preflight = false;
+        Assert.Throws<ArgumentException>(() => ConfigFileArgs.Expand(["--config", cfg], TextWriter.Null, false, _ => preflight = true));
+        Assert.False(preflight);
+        Assert.Equal(0, server.Requests);
+    }
+
+    [Fact]
+    public void FailedDownload_DoesNotPublishEnvironmentDefaults()
+    {
+        using var server = new CountingServer();
+        string key = "TS_CONFIG_DOWNLOAD_" + Guid.NewGuid().ToString("N");
+        string cfg = WriteConfig($$"""
+        {
+          "environment": { {{Q(key)}}: "must-not-leak" },
+          "model": { "path": {{Q(Path.Combine(_dir, "missing.gguf"))}}, "urls": [ {{Q(server.UrlFor("/missing.gguf"))}} ] }
+        }
+        """);
+        Assert.ThrowsAny<IOException>(() => ConfigFileArgs.Expand(["--config", cfg], TextWriter.Null, false));
+        Assert.True(server.Requests > 0);
+        Assert.Null(Environment.GetEnvironmentVariable(key));
+    }
+
+    [Fact]
     public void Preview_ListsEveryShardOfADownloadGroupButEmitsOnlyTheMainPath()
     {
         using var server = new CountingServer();

@@ -14,8 +14,9 @@ planes and retain the weight divisor; activation-quantized projections use the
 original input calibration divisor. The activation pack implements E2M1
 round-to-nearest-even using exact binary midpoint comparisons because the
 consumer Blackwell target does not support `cvt.e2m1x2.f32`. It does not first
-round to F16. Original BF16 exception matrices use cuBLAS BF16 products and F32
-accumulation. The original W8 output module is separate.
+round to F16. Original BF16 exception matrices retain BF16 products and F32 accumulation;
+qualified T8 verification can use the separate original MMA module instead of
+cuBLAS. The original W8 output module is separate.
 
 Reference contracts were inspected in the public gpillon/ignis revision
 `e600a7d9e0d5921d767a6cb464373583b3cdcaf4`: `kernel/src/gdn_layer.cu`,
@@ -261,7 +262,8 @@ ggml were unchanged throughout this governor evaluation.
 ## Fused residual and readonly norm for T8 verification
 
 `TS_Q35_NINFER_RESIDUAL_NORM` is automatic when unset on the qualified
-Qwen3.8 NInfer recipe with CC12.0/170-SM, context40960, enabled verification,
+Qwen3.8 NInfer recipe with CC12.0/170-SM, configured context exactly 40,960 or
+65,536, enabled verification,
 layer graphs, Verify8 GEMM, split-K and the target W8 head. All Down projections
 must retain their original NVFP4/A4 format; FI and ExactVerify overrides are
 excluded. This selector enables none of those prerequisites itself. Only
@@ -293,8 +295,8 @@ validation directories.
 
 `TS_Q35_NINFER_GATEUP_SWIGLU` selects the qualified exact GateUp/SwiGLU fusion.
 Unset selects automatically only for the known CC12.0/170-SM recipe,
-context40960, enabled verification/layer graphs/Verify8 GEMM and original NVFP4
-GateUp matrices, without FI or ExactVerify. Dispatch is full-valid T8/B1 only.
+configured context exactly 40,960 or 65,536, enabled verification/layer graphs/
+Verify8 GEMM and original NVFP4 GateUp matrices, without FI or ExactVerify. Dispatch is full-valid T8/B1 only.
 `0` disables it; `1` requires the qualified profile and native entry. It enables
 none of its prerequisites. Other shapes keep their previous path.
 
@@ -310,58 +312,70 @@ text tasks and 26/30 programs. Against R55, all 309 checks, 96 arithmetic values
 and 189 program statuses were unchanged, with no lost successful check or
 executed case. All 123 serial responses and 30 program contents matched; ten
 parallel response contents changed without score loss. Existing model mistakes
-remain. Other devices, model recipes and long contexts are not covered by this
-finite qualification. Upstream ggml remained unchanged at
+remain. Those R59/R60 results used configured context 40,960; they do not alone
+cover the later 64K profile described below. Upstream ggml remained unchanged at
 `facdc44a67da17df4433adcc468b424f48e9ded2`; generated evidence stays ignored.
+
+## Qualified 64K shared configuration
+
+Residual/norm, BF16 MMA and GateUp fusion admit exactly configured context 40,960
+or 65,536 with their existing CC12.0/170-SM, full-valid T8/B1 qualifications.
+Capacity is not an operand of these three kernels. Verify8 attention separately
+retains its cap of 40,960 actual visible keys and existing fallback above it.
+Other configured contexts do not inherit these three automatic qualifications.
+The automatic governor's measured scope remains 40K; both shared presets
+explicitly set `TS_SPEC_ADAPTIVE=0` for stable K7 drafting.
+
+R61 tested the three optimizations together at configured 65,536 in one fixed
+OFF/ON/ON/OFF block: code 406.49→442.42 token/s (+8.84%), HTTP total time −8.10%,
+with identical response contents, typed usage and draft work. This is a combined
+finite result, not a separate gain attributed to each kernel. Four repeats of
+one long diagnostic used 64,416 input +144 output tokens, cache0 and passed all ten
+needle/order checks each; this does not establish general long reasoning quality.
+
+R62 ran the 64K JSON through the actual CLI with inherited TS_*/MAX_CONTEXT
+cleared, full-head DFlash and positive T8 captures/replays. R63 used the same
+JSON through Server.Host for all 45 text +30 program cases: 38/45 and 26/30 passed.
+Against R60, all 309 checks, 96 arithmetic values and 189 program statuses matched;
+123 serial responses and 30 program contents were identical. Sixteen parallel
+contents changed without score loss. Existing model mistakes remain.
+The literal 40K JSON was parser tested; earlier 40K engine qualification is not a
+claim that this new 40K file itself received that GPU campaign. Complete 128K/250K
+campaigns for the optimized profile are **NOT_RUN**; arbitrary contexts and
+other hardware remain outside this finite qualification.
 
 ## CLI and Server.Host startup
 
 Use the complete `qwen3_8_27b_nvfp4full-v2.ninfer` artifact with `--backend cuda`,
-not `ggml_cuda`. The known artifact embeds its tokenizer/config, chat template,
-generation and processor resources; no external `--tokenizer` or special-token
-file is needed. This route currently serves text, not the embedded vision data.
-Build/deploy matching native assets into each application's `cuda_kernels/`:
+not `ggml_cuda`. Its tokenizer, special-token metadata and chat template are
+embedded; no external `--tokenizer` is needed. This route currently serves text.
+Build matching assets, including the separate attention/MMA modules:
 
 ```sh
 dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release -p:CudaArch=sm_120a
 dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release -p:CudaArch=sm_120a
 ```
 
-The CUDA toolkit must support this architecture. A portable compute75 package
-alone is insufficient. Body/W8 assets are discovered normally; use the actual
-`TS_Q35_NINFER_PTX` override only for a nonstandard body-module location.
-For ordinary target-only CLI generation, use `--chat` or `--input prompt.txt`;
-`--prompt` is not the CLI's text-generation input option:
+The toolkit must support sm120a; portable compute75 assets alone are insufficient.
+For DFlash, **use the same JSON in both hosts** (only the entry arguments differ):
 
 ```sh
-dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
-  --model /models/qwen3_8_27b_nvfp4full-v2.ninfer --backend cuda --chat
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen3.8-27b-ninfer-64k.json --chat
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/qwen3.8-27b-ninfer-64k.json --host 127.0.0.1 --port 5088
 ```
 
-DFlash is **not** enabled merely by loading NInfer. The following Linux examples
-explicitly enable its embedded full head and the measured K7/greedy profile.
-The draft module is explicit; do not supply an external `--draft-model`.
-Leave automatic optimization controls unset to allow qualified asset selection:
+Choose `config/qwen3.8-27b-ninfer.json` in either command for 40,960 capacity.
+The profiles explicitly request full-head K7/pMin0, greedy verification and
+Gov0; loading an NInfer file by itself does not enable speculation. Their
+`${appBaseDirectory}` draft path locates each application's own
+`cuda_kernels/tensorsharp_q35_ninfer_draft.fatbin`; `_PTX` accepts direct fatbins.
+Use `--input prompt.txt` instead of `--chat` for CLI file input; `--prompt` is not
+its text-generation option. An existing model can override the download entry:
+`--model /workspace/hf/ignis/qwen3_8_27b_nvfp4full-v2.ninfer`.
 
-```sh
-export MAX_CONTEXT=40960 TS_Q35_UBATCH=2048 TS_SCHED_MAX_RUNNING_SEQS=4
-export TS_Q35_NINFER_VERIFY=1 TS_Q35_GREEDY_VERIFY=1
-
-TS_Q35_NINFER_DRAFT_PTX="$PWD/TensorSharp.Cli/bin/cuda_kernels/tensorsharp_q35_ninfer_draft.ptx" \
-dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
-  --model /models/qwen3_8_27b_nvfp4full-v2.ninfer --backend cuda --chat \
-  --spec --spec-type block --spec-draft 7 --spec-pmin 0 \
-  --temperature 0 --repeat-penalty 1
-
-TS_Q35_NINFER_DRAFT_PTX="$PWD/TensorSharp.Server.Host/bin/cuda_kernels/tensorsharp_q35_ninfer_draft.ptx" \
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-  --model /models/qwen3_8_27b_nvfp4full-v2.ninfer --backend cuda \
-  --host 127.0.0.1 --port 5088 --no-webui --no-multi-agent --no-skills \
-  --spec --spec-type block --spec-draft 7 --spec-pmin 0 \
-  --temperature 0 --repeat-penalty 1
-```
-
-The model's default context is 65536; setting 40960 matters for the narrower
-automatic residual/norm, BF16 MMA and governor policies. Startup logs report
-actual selections and module SHAs; an eligible setting is not proof of dispatch.
-Host submission counters include graph capture, not individual GPU replays.
+See the [shared configuration guide](../../../config/README-ninfer.md) for model
+location, environment precedence, profile validation and the comment-only
+finalization of the tested 64K settings. A standalone target-only run still uses
+`--model FILE.ninfer --backend cuda` without the DFlash preset. Startup logs
+identify actual selected module SHAs; host submissions include capture and are
+not individual GPU kernel replay counts.

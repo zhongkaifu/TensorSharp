@@ -2,7 +2,8 @@
 
 The serving implementation automatically selects this optional module only for
 the known NInfer Qwen3.8 recipe on compute capability 12.0/170 SMs, declared
-context 40960, and verification plus decode graphs already enabled. Runtime
+configured context exactly 40960 or 65536, and verification plus decode graphs
+already enabled. Runtime
 dispatch requires a full single-lane T8 Verify pass and a BF16 descriptor for
 Input `14336x5120` or Output `5120x6144`. AB, ordinary prefill, decode,
 mixed/padded passes and other shapes retain their original paths. FlashInfer
@@ -95,3 +96,14 @@ score regression. Existing model mistakes remain. This establishes no loss
 within the fixed evaluated suite, not perfect quality or a general engine rank.
 CPU, GPU component, end-to-end performance and model quality results remain
 separate; missing or unfinished cases never count as passes.
+
+The subsequent 64K qualification reused this same native image and arithmetic.
+R61 toggled BF16 MMA, residual/norm and GateUp fusion together: one matched block
+measured code 406.49→442.42 token/s (+8.84%), with identical responses, typed
+usage and draft work. That is a combined result, not the gain from BF16 MMA
+alone. Four repeated 64,416-input/144-output/cache0 diagnostics passed all ten
+needle/order checks; attention above 40,960 visible keys retained its fallback.
+R63 used the same shared 64K JSON through Server.Host and completed 38/45 text
+and 26/30 programs with all 309 checks, 96 arithmetic values and 189 program
+statuses unchanged against R60. These finite tests do not extend qualification
+to arbitrary configured contexts or complete 128K/250K campaigns.

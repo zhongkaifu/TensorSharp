@@ -408,6 +408,7 @@ public class ConfigFileArgsTests : IDisposable
     private static bool IsReserved(string key) =>
         key.Equals("variables", StringComparison.OrdinalIgnoreCase)
         || key.Equals("vars", StringComparison.OrdinalIgnoreCase)
+        || key.Equals("environment", StringComparison.OrdinalIgnoreCase)
         || key.Equals("$schema", StringComparison.OrdinalIgnoreCase)
         || key.Equals("$unavailable", StringComparison.OrdinalIgnoreCase);
 

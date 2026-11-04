@@ -22,6 +22,22 @@ public sealed class NinferResidualNormPolicyTests
         => Assert.Equal(expected, Plan(option));
 
     [Theory]
+    [InlineData(40960)] [InlineData(65536)]
+    public void OnlyTheTwoConfiguredContextProfilesCanUseTheSameT8Math(int context)
+    {
+        Assert.True(Plan(null, context: context)); Assert.True(Plan("1", context: context));
+        Assert.False(Plan("0", context: context));
+    }
+
+    [Theory]
+    [InlineData(32768)] [InlineData(65535)] [InlineData(65537)]
+    public void OtherConfiguredContextsRemainUnsupported(int context)
+    {
+        Assert.False(Plan(null, context: context)); Assert.False(Plan("0", context: context));
+        Assert.Throws<NotSupportedException>(() => Plan("1", context: context));
+    }
+
+    [Theory]
     [InlineData("")] [InlineData("true")] [InlineData(" 1")] [InlineData("01")] [InlineData("2")]
     public void InvalidNinferOptionCannotSilentlyFallBack(string option)
         => Assert.Throws<ArgumentException>(() => Plan(option, qualified: false));
@@ -31,7 +47,7 @@ public sealed class NinferResidualNormPolicyTests
     {
         Action[] requests = {
             () => Plan("1", qualified: false), () => Plan("1", sms: 169), () => Plan("1", sms: 171),
-            () => Plan("1", context: 40959), () => Plan("1", context: 65536), () => Plan("1", rows: 7),
+            () => Plan("1", context: 40959), () => Plan("1", context: 65535), () => Plan("1", rows: 7),
             () => Plan("1", verification: false), () => Plan("1", graphs: false), () => Plan("1", gemm8: false),
             () => Plan("1", splitK: false), () => Plan("1", w8: false), () => Plan("1", fi: true), () => Plan("1", exact: true),
             () => Plan("1", allDowns: false)
@@ -45,7 +61,7 @@ public sealed class NinferResidualNormPolicyTests
     public void AutomaticSelectionDeclinesEveryUnmeasuredProfileWithoutChangingOtherFlags()
     {
         bool[] choices = { Plan(null, qualified: false), Plan(null, sms: 169), Plan(null, sms: 171),
-            Plan(null, context: 40959), Plan(null, context: 65536), Plan(null, rows: 7),
+            Plan(null, context: 40959), Plan(null, context: 65535), Plan(null, rows: 7),
             Plan(null, verification: false), Plan(null, graphs: false), Plan(null, gemm8: false),
             Plan(null, splitK: false), Plan(null, w8: false), Plan(null, fi: true), Plan(null, exact: true),
             Plan(null, allDowns: false) };

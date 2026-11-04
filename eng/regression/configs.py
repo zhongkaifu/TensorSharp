@@ -5,7 +5,7 @@ is the authority for host options; the coverage catalog records the host contrac
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -34,6 +34,9 @@ class ResolvedConfig:
     options: dict[str, Any]
     files: list[FileSpec]
     unavailable: str | None = None
+    # Raw host metadata: only the running host knows appBaseDirectory. The
+    # offline planner never expands these values or changes os.environ.
+    environment_defaults: dict[str, str] = field(default_factory=dict)
 
 
 def loads_jsonc(text: str) -> Any:
@@ -180,6 +183,8 @@ def read_config(path: str | Path, model_root: str | Path | None = None,
     if not isinstance(variables, dict):
         raise ConfigError("variables must be an object")
     variables = dict(variables)
+    if "appBaseDirectory" in variables:
+        raise ConfigError("appBaseDirectory is reserved for the running host")
     environment = dict(os.environ if environ is None else environ)
     if model_root is not None:
         environment["TENSORSHARP_MODELS"] = str(Path(model_root).resolve())
@@ -188,6 +193,15 @@ def read_config(path: str | Path, model_root: str | Path | None = None,
     normalized.pop("$schema", None)
     normalized.pop("vars", None)
     normalized.update({k.removeprefix("--").lower(): v for k, v in (overrides or {}).items()})
+    defaults = normalized.pop("environment", {})
+    if not isinstance(defaults, dict):
+        raise ConfigError("environment must be an object of string values")
+    for name, value in defaults.items():
+        if (not name.strip() or len(name) >= 32767 or "=" in name
+                or any(ord(c) < 32 or 0x7f <= ord(c) <= 0x9f for c in name)):
+            raise ConfigError("Invalid environment variable name")
+        if not isinstance(value, str) or "\x00" in value:
+            raise ConfigError(f"Environment default {name} must be a string without NUL")
     files: list[FileSpec] = []
 
     def expand(value):
@@ -262,7 +276,7 @@ def read_config(path: str | Path, model_root: str | Path | None = None,
                 if sibling not in known:
                     files.append(FileSpec(item.option, sibling, group=item.group))
                     known.add(sibling)
-    return ResolvedConfig(source, options, files)
+    return ResolvedConfig(source, options, files, environment_defaults=dict(defaults))
 
 
 def flatten(config: ResolvedConfig) -> list[FileSpec]:
