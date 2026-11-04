@@ -27,6 +27,14 @@ START_HELP = """Usage: nsys start [options]
   --force-overwrite true|false
 """
 
+# Names-only observation from the actual Nsight launch; values here are synthetic.
+OBSERVED_NSIGHT_TRANSPORT = (
+    "QUADD_CUDA_CONFIG", "QUADD_INJECTION_CONFIG", "QUADD_INJECTION_PROXY",
+    "QUADD_IS_PROCESS_LAUNCHED_BY_NSYS", "QUADD_AGENT_PID", "CUPTI_PROFILE_MODE",
+    "NSYS_AGENT_TMP_DIR", "NSYS_CONTROL_CUPTI_FEATURES", "NSYS_CUDA_GPU_TIME_CONVERSION",
+    "NSYS_SESSION_TEMP_DIR", "NSYS_TARGET_STD_REDIRECT_ACTION", "NSYS_TSC_SUPPORT",
+    "TRACE_START_IMMEDIATELY")
+
 
 class EnvironmentTests(unittest.TestCase):
     def test_ambient_credentials_and_undeclared_model_settings_are_not_inherited(self):
@@ -50,6 +58,19 @@ class EnvironmentTests(unittest.TestCase):
             self.assertNotIn(name, env)
         self.assertEqual(os.defpath, env["PATH"])
 
+    def test_observed_nsight_transport_is_inner_exec_only_without_prefix_passthrough(self):
+        transport = {name: "synthetic-transport-" + str(i) for i, name in enumerate(OBSERVED_NSIGHT_TRANSPORT)}
+        rejected = {name: "synthetic-rejected" for name in (
+            "QUADD_UNKNOWN_CONFIG", "NSYS_UNKNOWN_SECRET", "CUPTI_UNKNOWN_MODE",
+            "TRACE_START_IMMEDIATELY_EXTRA", "__GL_CONSTANT_FRAME_RATE_HINT",
+            "AWS_SECRET_ACCESS_KEY", "HF_TOKEN", "PYTHONPATH", "PYTHONSTARTUP", "LD_AUDIT")}
+        injection = {"LD_PRELOAD": "/nsys/trace.so", "CUDA_INJECTION64_PATH": "/nsys/cuda.so"}
+        with patch.dict(profile.os.environ, transport | rejected | injection, clear=True):
+            outer = profile.process_environment({"TS_Q35_DECLARED": "1"})
+            inner = profile.process_environment({"TS_Q35_DECLARED": "1"}, target_exec=True)
+        self.assertEqual({"PATH": os.defpath, "TS_Q35_DECLARED": "1"}, outer)
+        self.assertEqual({"PATH": os.defpath, "TS_Q35_DECLARED": "1"} | transport | injection, inner)
+
     def test_spec_env_and_command_are_validated_before_launch(self):
         good = {"argv": ["server", ""], "env": {"EXPLICIT": "", "TS_Q35_X": "1"}}
         self.assertEqual(good, profile.validate_server_spec(good))
@@ -66,13 +87,16 @@ class EnvironmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             spec = Path(temporary) / "server.json"; pid = Path(temporary) / "pid.json"
             spec.write_text(json.dumps({"argv": ["server", "arg"], "env": {"TS_Q35_DECLARED": "1"}}))
-            with patch.dict(profile.os.environ, {"PATH": "/bin", "HF_TOKEN": "synthetic-secret", "LD_PRELOAD": "/nsys/trace.so"}, clear=True), \
+            transport = {name: "synthetic-transport-" + str(i) for i, name in enumerate(OBSERVED_NSIGHT_TRANSPORT)}
+            ambient = {"PATH": "/bin", "HF_TOKEN": "synthetic-secret", "LD_PRELOAD": "/nsys/trace.so",
+                       "QUADD_UNKNOWN_CONFIG": "synthetic-rejected", "PYTHONSTARTUP": "synthetic-hook"} | transport
+            with patch.dict(profile.os.environ, ambient, clear=True), \
                     patch.object(profile, "write_server_identity") as identity, patch.object(profile.os, "execvpe") as execute:
                 profile.exec_server(["--server-spec", str(spec), "--pid-file", str(pid), "--run-id", "run"])
             identity.assert_called_once_with(pid, "run")
             command, argv, env = execute.call_args.args
             self.assertEqual(("server", ["server", "arg"]), (command, argv))
-            self.assertEqual({"PATH": "/bin", "LD_PRELOAD": "/nsys/trace.so", "TS_Q35_DECLARED": "1"}, env)
+            self.assertEqual({"PATH": "/bin", "LD_PRELOAD": "/nsys/trace.so", "TS_Q35_DECLARED": "1"} | transport, env)
 
 
 class CapabilityTests(unittest.TestCase):
