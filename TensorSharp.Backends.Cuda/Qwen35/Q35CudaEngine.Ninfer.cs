@@ -105,6 +105,7 @@ namespace TensorSharp.Cuda
             InitializeNinferFlashInfer();
             InitializeNinferResidualNorm();
             InitializeNinferBf16Mma();
+            InitializeNinferGateUpSwiGlu();
             if (_ninferDecodeGraphsEnabled && _m.Ninfer == null)
                 throw new NotSupportedException(NinferDecodeGraphsEnvironment + " requires an original NInfer target.");
             if (_ninferVerificationEnabled && _m.Ninfer == null)
@@ -183,6 +184,7 @@ namespace TensorSharp.Cuda
             bool isVerify = groups.Length == 1 && groups[0].Verify;
             bool candidatePass = groups.Length == 1 && groups[0].PassMode == NinferLayerPass.FusedResidualNorm;
             bool bf16Mma = UsesNinferBf16Mma(groups, tapFirst);
+            bool fusedGateUp = UsesNinferGateUpSwiGlu(groups, tapFirst);
             var residualState = NinferResidualState.InitialNoDelta;
             for (int il = 0; il < _m.NLayer; il++)
             {
@@ -233,8 +235,11 @@ namespace TensorSharp.Cuda
                     residualState = ProjectNinferResidual(weights.Output, _attn, rows, isVerify, candidatePass, bf16Mma);
                 }
                 NormalizeNinferResidual(residualState, l.PostNorm, rows, candidatePass, postProjection: true);
-                NinferProject(weights.GateUp, _xn, _proj, rows, 2, round: rows > 128 && rows != 1024, isVerify: isVerify);
-                _ninfer.SwiGlu(_proj, _act, _m.NFf, rows, Stream);
+                if (!TryNinferGateUpSwiGlu(weights.GateUp, rows, fusedGateUp))
+                {
+                    NinferProject(weights.GateUp, _xn, _proj, rows, 2, round: rows > 128 && rows != 1024, isVerify: isVerify);
+                    _ninfer.SwiGlu(_proj, _act, _m.NFf, rows, Stream);
+                }
                 residualState = ProjectNinferResidual(weights.Down, _act, rows, isVerify, candidatePass);
             }
             if (candidatePass && residualState != NinferResidualState.FusedCanonical)

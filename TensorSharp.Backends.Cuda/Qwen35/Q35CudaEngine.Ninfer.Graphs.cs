@@ -13,7 +13,7 @@ public sealed unsafe partial class Q35CudaEngine
     private bool _ninferDecodeCapturePrepared;
     internal readonly record struct NinferDecodeGraphKey(int Lanes, int Window, bool Verify, int TapFirst,
         int AttentionChunk, int AttentionSplits, bool Verify8Attention, string ResidualNormIdentity = null,
-        string Bf16MmaIdentity = null);
+        string Bf16MmaIdentity = null, string GateUpSwiGluIdentity = null);
     private struct NinferDecodeGraphEntry
     {
         public NinferDecodeGraphKey Key;
@@ -48,9 +48,11 @@ public sealed unsafe partial class Q35CudaEngine
             && (long)window * lanes <= MaxVerifyRows && !counts && !embeddings && !featureTaps && !ggufDrafter;
 
     internal static NinferDecodeGraphKey PlanNinferDecodeGraphKey(int lanes, int window, bool verify,
-        int tapFirst, int maxKeys, bool useVerify8, string residualNormIdentity = null, string bf16MmaIdentity = null)
+        int tapFirst, int maxKeys, bool useVerify8, string residualNormIdentity = null, string bf16MmaIdentity = null,
+        string gateUpSwiGluIdentity = null)
     {
         ValidateNinferBf16MmaGraphIdentity(lanes, window, verify, tapFirst, bf16MmaIdentity);
+        ValidateNinferGateUpSwiGluGraphIdentity(lanes, window, verify, tapFirst, gateUpSwiGluIdentity);
         if (residualNormIdentity != null)
         {
             const string prefix = "|ninfer-residual-norm=" + Q35Kernels.NinferResidualNormPolicy + ":";
@@ -67,10 +69,10 @@ public sealed unsafe partial class Q35CudaEngine
                 throw new ArgumentException("The captured Verify8 route requires its exact admitted shape/history.");
             // All candidate launch arguments are fixed or dynamic device inputs;
             // legacy split boundaries must neither alias this route nor recapture it.
-            return new(lanes, window, verify, tapFirst, 0, 4, true, residualNormIdentity, bf16MmaIdentity);
+            return new(lanes, window, verify, tapFirst, 0, 4, true, residualNormIdentity, bf16MmaIdentity, gateUpSwiGluIdentity);
         }
         var plan = Q35Kernels.GetSplitAttentionPlan(maxKeys);
-        return new(lanes, window, verify, tapFirst, plan.Chunk, plan.Splits, false, residualNormIdentity, bf16MmaIdentity);
+        return new(lanes, window, verify, tapFirst, plan.Chunk, plan.Splits, false, residualNormIdentity, bf16MmaIdentity, gateUpSwiGluIdentity);
     }
 
     private void PrepareNinferDecodeCapture()
@@ -102,7 +104,8 @@ public sealed unsafe partial class Q35CudaEngine
             group.Counts == null, _m.NHead, _m.NKvHead, maxKeys[0]);
         var key = PlanNinferDecodeGraphKey(group.Slots.Length, group.RowsPerSeq, group.Verify, tapFirst, maxKeys[0], useVerify8,
             group.PassMode == NinferLayerPass.FusedResidualNorm ? _ninferResidualNormSuffix : null,
-            UsesNinferBf16Mma(groups, tapFirst) ? _ninferBf16MmaSuffix : null);
+            UsesNinferBf16Mma(groups, tapFirst) ? _ninferBf16MmaSuffix : null,
+            UsesNinferGateUpSwiGlu(groups, tapFirst) ? _ninferGateUpSwiGluSuffix : null);
         for (int i = 0; i < _ninferDecodeGraphRefusalCount; i++)
             if (_ninferDecodeGraphRefusals[i] == key) return false;
         PrepareNinferDecodeCapture();
@@ -147,9 +150,10 @@ public sealed unsafe partial class Q35CudaEngine
                 NinferDecodeGraphCaptureCount++;
                 if (key.ResidualNormIdentity != null) NinferResidualNormCaptureCount++;
                 if (key.Bf16MmaIdentity != null) NinferBf16MmaCaptureCount++;
+                if (key.GateUpSwiGluIdentity != null) NinferGateUpSwiGluCaptureCount++;
             }
             finally { if (executable != IntPtr.Zero) CudaDriverApi.cuGraphExecDestroy(executable); }
-            Console.Error.WriteLine($"[q35-cuda] NInfer layer graph captured: lanes={key.Lanes}, window={key.Window}, verify={key.Verify}, attention={key.AttentionChunk}x{key.AttentionSplits}, verify8Attention={key.Verify8Attention}, residualNorm={key.ResidualNormIdentity != null}, bf16Mma={key.Bf16MmaIdentity != null}");
+            Console.Error.WriteLine($"[q35-cuda] NInfer layer graph captured: lanes={key.Lanes}, window={key.Window}, verify={key.Verify}, attention={key.AttentionChunk}x{key.AttentionSplits}, verify8Attention={key.Verify8Attention}, residualNorm={key.ResidualNormIdentity != null}, bf16Mma={key.Bf16MmaIdentity != null}, gateUpSwiGlu={key.GateUpSwiGluIdentity != null}");
         }
         _ninferDecodeGraphs[found].LastUse = ++_ninferDecodeGraphClock;
         // Failed launches are never retried: recurrent/KV writes may have begun.
@@ -157,6 +161,7 @@ public sealed unsafe partial class Q35CudaEngine
         NinferDecodeGraphReplayCount++;
         if (key.ResidualNormIdentity != null) NinferResidualNormReplayCount++;
         if (key.Bf16MmaIdentity != null) NinferBf16MmaReplayCount++;
+        if (key.GateUpSwiGluIdentity != null) NinferGateUpSwiGluReplayCount++;
         return true;
     }
 

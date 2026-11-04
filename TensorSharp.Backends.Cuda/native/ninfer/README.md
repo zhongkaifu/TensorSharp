@@ -5,7 +5,7 @@ representation and numerical boundaries to the existing Q35 CUDA engine. It
 neither includes nor patches ggml. Build with the same CUDA 13+ toolkit and
 `sm_120a` architecture as the native FP4 engine; fast math must remain disabled.
 The build project includes this separate module. An explicit
-`TS_Q35_NINFER_KERNELS` path overrides module discovery in `cuda_kernels/`.
+`TS_Q35_NINFER_PTX` path overrides module discovery in `cuda_kernels/`.
 
 The adapter uses F32 storage for activations and rounds at the declared BF16
 boundaries. Persistent recurrent state and the independent BF16 AB projection's
@@ -288,3 +288,80 @@ compares independent old/new-off/new-on model processes through Verify, Commit,
 Decode, clone, reset and DFlash proposal operations. Component speedups are
 separate from model throughput and quality; generated evidence stays in ignored
 validation directories.
+
+## Qualified automatic GateUp/SwiGLU fusion
+
+`TS_Q35_NINFER_GATEUP_SWIGLU` selects the qualified exact GateUp/SwiGLU fusion.
+Unset selects automatically only for the known CC12.0/170-SM recipe,
+context40960, enabled verification/layer graphs/Verify8 GEMM and original NVFP4
+GateUp matrices, without FI or ExactVerify. Dispatch is full-valid T8/B1 only.
+`0` disables it; `1` requires the qualified profile and native entry. It enables
+none of its prerequisites. Other shapes keep their previous path.
+
+The BN8/stages2/split1 epilogue preserves the old F32 projection boundaries,
+helper `expf` SiLU and final BF16-RNE/F32 output. R58 passed full final-output
+bits and numerical checks, but its 0.961us saving **failed** the original 1us
+absolute micro gate. That result was retained. A separately declared R59 model
+study then measured one OFF/ON/ON/OFF block: code +0.622%, prose +0.681%, copy
++0.712%, with matching responses, typed usage and draft work. This is not a
+general speed guarantee. Code HTTP total time fell 0.693%; its TTFT was 0.763ms
+slower in this block. R60 exercised the unset automatic path and retained 38/45
+text tasks and 26/30 programs. Against R55, all 309 checks, 96 arithmetic values
+and 189 program statuses were unchanged, with no lost successful check or
+executed case. All 123 serial responses and 30 program contents matched; ten
+parallel response contents changed without score loss. Existing model mistakes
+remain. Other devices, model recipes and long contexts are not covered by this
+finite qualification. Upstream ggml remained unchanged at
+`facdc44a67da17df4433adcc468b424f48e9ded2`; generated evidence stays ignored.
+
+## CLI and Server.Host startup
+
+Use the complete `qwen3_8_27b_nvfp4full-v2.ninfer` artifact with `--backend cuda`,
+not `ggml_cuda`. The known artifact embeds its tokenizer/config, chat template,
+generation and processor resources; no external `--tokenizer` or special-token
+file is needed. This route currently serves text, not the embedded vision data.
+Build/deploy matching native assets into each application's `cuda_kernels/`:
+
+```sh
+dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release -p:CudaArch=sm_120a
+dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release -p:CudaArch=sm_120a
+```
+
+The CUDA toolkit must support this architecture. A portable compute75 package
+alone is insufficient. Body/W8 assets are discovered normally; use the actual
+`TS_Q35_NINFER_PTX` override only for a nonstandard body-module location.
+For ordinary target-only CLI generation, use `--chat` or `--input prompt.txt`;
+`--prompt` is not the CLI's text-generation input option:
+
+```sh
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+  --model /models/qwen3_8_27b_nvfp4full-v2.ninfer --backend cuda --chat
+```
+
+DFlash is **not** enabled merely by loading NInfer. The following Linux examples
+explicitly enable its embedded full head and the measured K7/greedy profile.
+The draft module is explicit; do not supply an external `--draft-model`.
+Leave automatic optimization controls unset to allow qualified asset selection:
+
+```sh
+export MAX_CONTEXT=40960 TS_Q35_UBATCH=2048 TS_SCHED_MAX_RUNNING_SEQS=4
+export TS_Q35_NINFER_VERIFY=1 TS_Q35_GREEDY_VERIFY=1
+
+TS_Q35_NINFER_DRAFT_PTX="$PWD/TensorSharp.Cli/bin/cuda_kernels/tensorsharp_q35_ninfer_draft.ptx" \
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+  --model /models/qwen3_8_27b_nvfp4full-v2.ninfer --backend cuda --chat \
+  --spec --spec-type block --spec-draft 7 --spec-pmin 0 \
+  --temperature 0 --repeat-penalty 1
+
+TS_Q35_NINFER_DRAFT_PTX="$PWD/TensorSharp.Server.Host/bin/cuda_kernels/tensorsharp_q35_ninfer_draft.ptx" \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+  --model /models/qwen3_8_27b_nvfp4full-v2.ninfer --backend cuda \
+  --host 127.0.0.1 --port 5088 --no-webui --no-multi-agent --no-skills \
+  --spec --spec-type block --spec-draft 7 --spec-pmin 0 \
+  --temperature 0 --repeat-penalty 1
+```
+
+The model's default context is 65536; setting 40960 matters for the narrower
+automatic residual/norm, BF16 MMA and governor policies. Startup logs report
+actual selections and module SHAs; an eligible setting is not proof of dispatch.
+Host submission counters include graph capture, not individual GPU replays.

@@ -575,7 +575,7 @@ __device__ __forceinline__ void ts_q35_cp8(void* dst, const void* src, bool vali
 }
 
 template <int BN, int WM, int WN, int STAGES, int BK = TS_Q35_BK, bool COLS_FAST = false, bool SWIGLU = false,
-          bool ADD_RESIDUAL = false>
+          bool ADD_RESIDUAL = false, bool SWIGLU_BF16 = false>
 __device__ __forceinline__ void ts_q35_gemm_w4a4(
     const uint8_t* __restrict__ wCodes, const uint8_t* __restrict__ wScales, int outDim, int k,
     const uint8_t* __restrict__ xCodes, const uint8_t* __restrict__ xScales, const float* __restrict__ rowScale,
@@ -584,6 +584,8 @@ __device__ __forceinline__ void ts_q35_gemm_w4a4(
 {
     static_assert(WM * WN == 8, "eight warps");
     static_assert(!ADD_RESIDUAL || (BN == 8 && WN == 1 && !SWIGLU), "residual epilogue is plain BN8 only");
+    static_assert(!SWIGLU_BF16 || (SWIGLU && BN == 8 && WM == 8 && WN == 1 && STAGES == 2 && !ADD_RESIDUAL),
+                  "BF16 SwiGLU epilogue is the single-split BN8 NInfer component only");
     constexpr int WROWS = TS_Q35_BM / WM, WCOLS = BN / WN;
     constexpr int MT = WROWS / 16, NT = WCOLS / 8;
     extern __shared__ __align__(16) uint8_t smemRaw[];
@@ -718,8 +720,22 @@ __device__ __forceinline__ void ts_q35_gemm_w4a4(
                     element(i, j, e, r, c);
                     if (r >= outDim || c >= m)
                         continue;
-                    const float gate = acc[i][j][e] * rowScale[c] * alpha, up = acc[i][j][e + 2] * rowScale[c] * alpha;
-                    y[(long long)c * ff + r / 16 * 8 + r % 16] = ts_q35_silu(gate) * up;
+                    if constexpr (SWIGLU_BF16)
+                    {
+                        // Preserve the old F32 projection stores' two RN multiplies
+                        // before the exact ts_ni_swiglu expf/divide/product sequence.
+                        // Only the final activation is BF16-rounded and widened to F32.
+                        const float gate = __fmul_rn(__fmul_rn(acc[i][j][e], rowScale[c]), alpha);
+                        const float up = __fmul_rn(__fmul_rn(acc[i][j][e + 2], rowScale[c]), alpha);
+                        const float activation = __fmul_rn(ts_q35_silu(gate), up);
+                        y[(long long)c * ff + r / 16 * 8 + r % 16] =
+                            __bfloat162float(__float2bfloat16_rn(activation));
+                    }
+                    else
+                    {
+                        const float gate = acc[i][j][e] * rowScale[c] * alpha, up = acc[i][j][e + 2] * rowScale[c] * alpha;
+                        y[(long long)c * ff + r / 16 * 8 + r % 16] = ts_q35_silu(gate) * up;
+                    }
                 }
         return;
     }
@@ -818,6 +834,22 @@ TS_Q35_GEMM(ts_q35_gemm_w4a4_32, 32, 8, 1, 3, false, false)
 // Separate entry retains the existing kernels and their shared-memory requirements.
 TS_Q35_GEMM(ts_q35_gemm_w4a4_8, 8, 8, 1, 2, false, false)
 #define TS_Q35_HAS_GEMM_W4A4_8 1
+// Isolated NInfer component: final activation, not a raw projection buffer.
+// Existing entries and the ordinary SwiGLU epilogue retain their original behavior.
+extern "C" __global__ __launch_bounds__(256) void ts_q35_gemm_w4a4_8_swiglu_bf16(
+    const uint8_t* __restrict__ wCodes, const uint8_t* __restrict__ wScales, int outDim, int k,
+    const uint8_t* __restrict__ xCodes, const uint8_t* __restrict__ xScales, const float* __restrict__ rowScale,
+    int m, float alpha, float* __restrict__ y, float* __restrict__ partial, int* __restrict__ counters)
+{
+    if (m != 8 || outDim != 34816 || k != 5120 || gridDim.x != 272 || gridDim.y != 1 || gridDim.z != 1
+        || blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1)
+    {
+        asm("trap;");
+        return;
+    }
+    ts_q35_gemm_w4a4<8, 8, 1, 2, TS_Q35_BK, false, true, false, true>(
+        wCodes, wScales, outDim, k, xCodes, xScales, rowScale, m, alpha, y, partial, counters);
+}
 TS_Q35_GEMM(ts_q35_gemm_w4a4_64, 64, 4, 2, 3, false, false)
 TS_Q35_GEMM(ts_q35_gemm_w4a4_128, 128, 4, 2, 2, true, false)
 TS_Q35_GEMM(ts_q35_gemm_w4a4_32_swiglu, 32, 8, 1, 3, false, true)

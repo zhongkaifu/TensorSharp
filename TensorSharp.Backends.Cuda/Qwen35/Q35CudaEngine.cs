@@ -1166,6 +1166,8 @@ namespace TensorSharp.Cuda
                 FreeDraftGraphs();
                 FreeVerifyGraphs();
                 LogNinferResidualNormSummary();
+                if (NinferGateUpSwiGluEnabled)
+                    Console.Error.WriteLine($"[q35-cuda] NInfer GateUp SwiGLU host submissions={NinferGateUpSwiGluHostSubmissions}, graph captures={NinferGateUpSwiGluCaptureCount}, graph launches={NinferGateUpSwiGluReplayCount} (capture included; not individual GPU kernel replay counts), module={NinferGateUpSwiGluImageSha256}");
                 InvalidateNinferDecodeGraphs();
                 FreeSlot(_active);
                 ReleaseFreeBlocks();
