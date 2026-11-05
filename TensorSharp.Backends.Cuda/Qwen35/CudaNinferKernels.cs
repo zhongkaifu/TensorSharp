@@ -14,7 +14,9 @@ public sealed unsafe class CudaNinferKernels : IDisposable
 {
     public const string EnvironmentVariable = "TS_Q35_NINFER_KERNELS";
     private readonly CudaModule _module;
-    private readonly IntPtr _round, _cast, _embed, _norm, _normQuant, _quant, _swiglu, _a16;
+    private readonly IntPtr _round, _cast, _norm, _norm5120, _normQuant, _quant, _swiglu, _a16;
+    // T = 1 NVFP4 GEMV: K 5120, K 5120 with SwiGLU, K 6144, K 17408 (ts_ni_gemv_nvfp4_*).
+    private readonly IntPtr _gemv5120, _gemv5120SwiGlu, _gemv6144, _gemv17408;
     private readonly IntPtr _conv, _convState, _prep, _scan, _replay, _out;
     private IntPtr _blas, _inputBf16;
     private long _inputCapacity;
@@ -28,7 +30,9 @@ public sealed unsafe class CudaNinferKernels : IDisposable
         try
         {
             _round=Function("ts_ni_round"); _cast=Function("ts_ni_f32_bf16");
-            _embed=Function("ts_ni_embed_w8"); _norm=Function("ts_ni_add_norm");
+            _norm=Function("ts_ni_add_norm"); _norm5120=Function("ts_ni_add_norm_5120");
+            _gemv5120=Function("ts_ni_gemv_nvfp4_k5120"); _gemv5120SwiGlu=Function("ts_ni_gemv_nvfp4_k5120_swiglu");
+            _gemv6144=Function("ts_ni_gemv_nvfp4_k6144"); _gemv17408=Function("ts_ni_gemv_nvfp4_k17408");
             _normQuant=Function("ts_ni_add_norm_quant");
             _quant=Function("ts_ni_quant_nvfp4"); _swiglu=Function("ts_ni_swiglu");
             _a16=Function("ts_ni_project_a16"); _conv=Function("ts_ni_gdn_conv");
@@ -90,14 +94,6 @@ public sealed unsafe class CudaNinferKernels : IDisposable
         _=checked(count*sizeof(float));
         void** args=stackalloc void*[]{&input,&output,&count}; Launch(_cast,Grid(count),1,1,256,stream,args);
     }
-    public void EmbedW8(IntPtr weights,IntPtr tokenIds,IntPtr output,int rows,int width,int vocabulary,IntPtr stream)
-    {
-        Shape(rows,width);
-        if(width%128!=0||vocabulary<1)throw new ArgumentOutOfRangeException(nameof(width));
-        IntPtr scales=weights+(nint)checked((long)vocabulary*width);
-        void** args=stackalloc void*[]{&weights,&scales,&tokenIds,&output,&width,&vocabulary};
-        Launch(_embed,(uint)rows,1,1,256,stream,args);
-    }
     /// <summary>Mutates x to BF16(x+delta), then writes BF16(RMSNorm(x,effectiveWeight)).
     /// The norm weight already contains the F32 unit offset where the format requires it.</summary>
     public void AddRmsNorm(IntPtr x,IntPtr delta,IntPtr effectiveWeight,IntPtr output,int rows,int width,float eps,IntPtr stream)
@@ -106,7 +102,21 @@ public sealed unsafe class CudaNinferKernels : IDisposable
         if(x==output)throw new ArgumentException("Residual and norm output must not alias.");
         if(!(eps>0)||!float.IsFinite(eps))throw new ArgumentOutOfRangeException(nameof(eps));
         void** args=stackalloc void*[]{&x,&delta,&effectiveWeight,&output,&width,&eps};
-        Launch(_norm,(uint)rows,1,1,256,stream,args);
+        // Width 5120 keeps the row in registers: the same arithmetic, bit-identical output.
+        Launch(width==5120?_norm5120:_norm,(uint)rows,1,1,256,stream,args);
+    }
+    /// <summary>One activation row of an NVFP4 (TS planes) projection on the CUDA cores:
+    /// y[n] = x W^T with weights code * scale * inverseDivisor, as the A16 route, F32 output; with
+    /// <paramref name="swiGlu"/> the rows are gate|up interleaved by 8 and y[n / 2] = BF16(silu(gate) * up),
+    /// as <see cref="SwiGlu"/>. False when the shape has no instance (K 5120, 6144 or 17408; 16-row tiles).</summary>
+    public bool TryGemvNvfp4(IntPtr codes,IntPtr scales,IntPtr input,IntPtr output,int n,int k,float inverseDivisor,bool swiGlu,IntPtr stream)
+    {
+        if(n<16||n%16!=0||((long)input&15)!=0||((long)codes&15)!=0)return false;
+        IntPtr f=k switch{5120=>swiGlu?_gemv5120SwiGlu:_gemv5120,6144 when !swiGlu=>_gemv6144,17408 when !swiGlu=>_gemv17408,_=>IntPtr.Zero};
+        if(f==IntPtr.Zero)return false;
+        void** args=stackalloc void*[]{&codes,&scales,&input,&output,&inverseDivisor};
+        Launch(f,(uint)(n/16),1,1,256,stream,args);
+        return true;
     }
     /// <summary>AddRmsNorm with a delta, then QuantizeNvfp4 of its output in the same pass (same arithmetic).</summary>
     public void AddRmsNormQuantize(IntPtr x,IntPtr delta,IntPtr effectiveWeight,IntPtr output,int rows,int width,float eps,

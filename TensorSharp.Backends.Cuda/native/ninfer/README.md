@@ -1,5 +1,68 @@
 # NInfer Qwen3.8 native adapter
 
+The route serves the NInfer v3 artifact `qwen3_8_27b_nvfp4.ninfer`
+([neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer)):
+FP8 E4M3 row-scaled embedding, head, attention/GDN input and output projections and MLP
+layers 56-63; NVFP4 MLP layers 0-55; a q8_g32/BF16 DFlash2 drafter. The v2 container (and
+the Ignis `nvfp4full-v2` artifact) is no longer read.
+
+## FP8 projections (TensorSharp-owned, `native/kernels`)
+
+* `tensorsharp_small_t_mma.cuh`: small-T projections on BF16 tensor cores for decode,
+  verification and the drafter. Weights widen exactly to BF16 operands (E4M3 and INT8
+  are BF16 values); FP8 row scales apply once after the dot product, q8_g32 group scales
+  per 32 values in F32. Activations are never quantized. A CTA owns 16-64 weight rows and
+  KW warps split K; each warp streams its own K slice through a cp.async ring. Above 8
+  rows the activations are cast to BF16 once per projection and shared by up to four
+  16-row weight tiles. Gate|up rows are interleaved by 8 at load so SwiGLU fuses.
+  Structure follows NInfer's sliced-K A16 kernels (Neroued/ninfer 1882c6ad, Apache-2.0);
+  the code is independent.
+* `ts_q35_gemm_w8a8_tma*` (`tensorsharp_q35_kernels.cu`): prefill W8A8 GEMM with the same
+  warp-specialized TMA structure as the W4A4 GEMM, on per-row E4M3 activation codes
+  (`ts_q35_fp8_quant_act`, amax / 448, NInfer's A8 numerics). The MMA is issued as
+  `kind::mxf8f6f4.block_scale` with unit UE8M0 scales: on the RTX 5090 the plain FP8 form
+  accumulates F32 at half rate (NInfer's finding), the block-scaled form at full rate with
+  the same dot product. Scales apply at the store.
+* `ts_q35_embed_fp8`: token rows as BF16(code x row scale).
+* `ts_q35_fp8_gemv_{b,c}_*`: one activation row (non-speculative decode) on the CUDA cores.
+  A warp owns 4 (b) or 2 (c) weight rows and each lane streams 16 codes per row per phase
+  with `ld.global.nc.L1::no_allocate`, so the BF16-rounded F32 activations stay
+  L1-resident; four F32 accumulator chains, one warp reduction, then the row scale.
+  Schedule b serves the 16384-row GDN input projection, c everything else (NInfer's RTX 5090
+  shape choices).
+
+Prefill 8K / 32K TTFT on the RTX 5090: 0.90 / 4.48 s with half-rate FP8 MMA, 0.78 / 3.99 s
+with the block-scaled form.
+
+## One-row NVFP4 and norm kernels (`tensorsharp_q35_ninfer.cu`)
+
+* `ts_ni_gemv_nvfp4_k*`: one activation row of an NVFP4 projection (TS planes), 8 warps x 2
+  rows, 32 values per lane per phase (16 code bytes and 2 scale bytes). The generic
+  `compute_120` build has no hardware E2M1 conversion (CUDA emulates it), so each code pair
+  is placed straight into F16 bits, which is the value times 2^-14 exactly. The 2^14 is
+  folded into the A16 coefficient (scale x inverse divisor), so every weight equals
+  code x coefficient. The `_swiglu` form writes BF16(silu(gate) x up) for the
+  8-row-interleaved gate|up matrix.
+* `ts_ni_add_norm_5120`: `ts_ni_add_norm` with the row in registers; the same per-thread
+  values, sum order and expressions, so the output is bit-identical.
+
+RTX 5090, one row: gate|up [34816, 5120] 103 -> 56 us (0.97 -> 1.79 TB/s), down
+[5120, 17408] 56 -> 29 us, FP8 projections 1.45-1.60 -> 1.60-1.70 TB/s, add+norm 6.8 ->
+2.2 us. Non-speculative decode: 53 -> 73 tok/s. `TS_Q35_T1_GEMV=off` selects the previous
+kernels (8-row FP8 tile and the legacy A16 NVFP4 kernel) for A/B runs.
+
+## Optional FP8 KV cache
+
+`TS_Q35_NINFER_KV=fp8` stores KV rows as 256 E4M3 codes plus two F32 group-128 scales (272
+bytes, 53% of BF16). The prep kernel quantizes K after norm and RoPE and V as projected;
+decode/verify attention stages FP8 tiles and widens them in shared memory; prefill
+attention reads a per-layer BF16 copy of the visible history (`ts_ninfer_kv_fp8_to_bf16`).
+Prefix-cache namespaces and host checkpoints carry the KV format. Measured: no speed change
+at 32K-64K (the decode split kernel is not KV-bandwidth bound), answers unchanged on the
+long-context checks; the default stays BF16.
+
+## Adapter
+
 `tensorsharp_q35_ninfer.cu` is TensorSharp-owned code. It adapts the NInfer target
 representation and numerical boundaries to the existing Q35 CUDA engine. It
 neither includes nor patches ggml. Build with the same CUDA 13+ toolkit and
@@ -14,9 +77,7 @@ planes and retain the weight divisor; activation-quantized projections use the
 original input calibration divisor. The activation pack implements E2M1
 round-to-nearest-even using exact binary midpoint comparisons because the
 consumer Blackwell target does not support `cvt.e2m1x2.f32`. It does not first
-round to F16. Original BF16 exception matrices retain BF16 products and F32 accumulation;
-qualified T8 verification can use the separate original MMA module instead of
-cuBLAS. The original W8 output module is separate.
+round to F16. The BF16 GDN a/b projection retains BF16 products and F32 accumulation.
 
 Reference contracts were inspected in the public gpillon/ignis revision
 `e600a7d9e0d5921d767a6cb464373583b3cdcaf4`: `kernel/src/gdn_layer.cu`,
@@ -82,16 +143,9 @@ universal model-quality equivalence. Upstream ggml was unchanged at
 `facdc44a67da17df4433adcc468b424f48e9ded2`. Generated evidence remains ignored
 under `docs/validation/`; unavailable model/device scenarios are not passes.
 
-The synthetic GPU component probe is
-`eng/validation/NinferCudaKernelProbe`. It covers representation, exact BF16
-boundaries, activation-pack bytes, BF16/A16 projections, GDN grouped-head
-mapping, causal convolution, count-limited state movement, verification
-nonmutation, and recurrent-state commit. It does not load a model or measure
-end-to-end inference. Run it with an actual compiled module:
-
-```
-dotnet NinferCudaKernelProbe.dll MODULE_PATH OUTPUT_JSON
-```
+The v2-era synthetic component probe (`NinferCudaKernelProbe`) was removed with the v2
+reader; the unit tests in `InferenceWeb.Tests` (`Ninfer*`) cover the v3 descriptors, and
+`eng/validation/Qwen35T1GemvBench` times the one-row projections.
 
 Generated logs, module images, and probe outputs belong in ignored
 `docs/validation/` or `artifacts/`. A skipped or unavailable GPU run does not
@@ -239,9 +293,8 @@ Graph/cache identities bind the actual native module and arithmetic policy.
 
 `NinferResidualNormProbe` validates both output/down shapes against the actual
 old image, CPU quantization and bounded FP64 references, including contraction,
-rounding, signed zero, guards and graph dependencies. `NinferResidualNormBodyProbe`
-compares independent old/new-off/new-on model processes through Verify, Commit,
-Decode, clone, reset and DFlash proposal operations. Component speedups are
+rounding, signed zero, guards and graph dependencies. (The whole-model v2 comparison,
+`NinferResidualNormBodyProbe`, was removed with the v2 reader.) Component speedups are
 separate from model throughput and quality; generated evidence stays in ignored
 validation directories.
 
@@ -272,7 +325,7 @@ cover the later 64K profile described below. Upstream ggml remained unchanged at
 
 ## Qualified 64K shared configuration
 
-Residual/norm, BF16 MMA and GateUp fusion admit exactly configured context 40,960
+Residual/norm and GateUp fusion admit exactly configured context 40,960
 or 65,536 with their existing CC12.0/170-SM, full-valid T8/B1 qualifications.
 Capacity is not an operand of these three kernels.
 Other configured contexts do not inherit these three automatic qualifications.
@@ -313,7 +366,7 @@ These now apply automatically on the qualified recipe (CC 12.0, Q24/KV4/HD256):
 | Prefill norm + quantize | The residual add + RMSNorm before an A4 projection also writes that projection's NVFP4 input (`ts_ni_add_norm_quant`: add_norm's reduction order, then the quantizer's arithmetic on the values it just produced); the projection skips its own quantize pass. Full GDN chunks are no longer rounded in place before the chunk pack (the pack's BF16 conversion is the same rounding); only the scanned tail is. Byte-identical answers; 32K TTFT 3.70 -> 3.63 s. A residual-add GEMM epilogue was measured 2.4x slower per GEMM and is not shipped. | `TS_Q35_NINFER_PREFILL_EPILOGUE=0` |
 | Tensor-core context append | The DFlash2 drafter's context projections over 64+ rows run Ignis' A16 BF16-MMA kernel (`ts_nidf_mma_*`); only drafts change, never the verified output. | none (draft image) |
 | Decode/verify attention | One GQA-packed split kernel with cp.async double-buffered tiles: a fixed one-wave split count (SMs / KV heads / lanes), each split's key range derived on the device, so one captured graph serves every history. Replaced both the unpipelined split kernel and the Ignis T8 core. | none |
-| Context qualification | Residual/norm, BF16 MMA and GateUp/SwiGLU also admit configured contexts 131,072 and 262,144 (context is not an operand of those kernels). | their existing `=0` options |
+| Context qualification | Residual/norm and GateUp/SwiGLU also admit configured contexts 131,072 and 262,144 (context is not an operand of those kernels). | their existing `=0` options |
 
 Measured on RTX 5090 with `config/qwen3.8-27b-ninfer-64k.json` (DFlash2 K7, BF16 KV):
 TTFT 32K 14.29 -> 3.63 s, 60K 44.45 -> 8.74 s (8K 0.92 -> 0.74 s from the TMA GEMM
@@ -330,7 +383,7 @@ are not shipped.
 
 ## CLI and Server.Host startup
 
-Use the complete `qwen3_8_27b_nvfp4full-v2.ninfer` artifact with `--backend cuda`,
+Use the complete `qwen3_8_27b_nvfp4.ninfer` artifact with `--backend cuda`,
 not `ggml_cuda`. Its tokenizer, special-token metadata and chat template are
 embedded; no external `--tokenizer` is needed. This route currently serves text.
 Build matching assets, including the separate attention/MMA modules:
@@ -355,7 +408,7 @@ Gov0; loading an NInfer file by itself does not enable speculation. Their
 `cuda_kernels/tensorsharp_q35_ninfer_draft.fatbin`; `_PTX` accepts direct fatbins.
 Use `--input prompt.txt` instead of `--chat` for CLI file input; `--prompt` is not
 its text-generation option. An existing model can override the download entry:
-`--model /workspace/hf/ignis/qwen3_8_27b_nvfp4full-v2.ninfer`.
+`--model /workspace/hf/ninfer/qwen3_8_27b_nvfp4.ninfer`.
 
 See the [shared configuration guide](../../../config/README-ninfer.md) for model
 location, environment precedence, profile validation and the comment-only

@@ -3206,7 +3206,7 @@
       ],
       "layout": "dense",
       "file_sizes": {
-        "qwen3_8_27b_nvfp4full-v2.ninfer": 19406942468
+        "qwen3_8_27b_nvfp4.ninfer": 23719715844
       },
       "status": "configured",
       "notes": [
@@ -3235,7 +3235,7 @@
       ],
       "layout": "dense",
       "file_sizes": {
-        "qwen3_8_27b_nvfp4full-v2.ninfer": 19406942468
+        "qwen3_8_27b_nvfp4.ninfer": 23719715844
       },
       "status": "configured",
       "notes": [

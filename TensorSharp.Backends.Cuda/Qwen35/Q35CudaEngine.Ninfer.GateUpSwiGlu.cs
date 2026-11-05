@@ -31,7 +31,7 @@ public sealed unsafe partial class Q35CudaEngine
         => format == CudaNinferProjectionFormat.NvFp4Planes && allowA4 && rows == 8 && n == 34816 && k == 5120;
 
     private bool UsesNinferGateUpSwiGlu(RowGroup[] groups, int tapFirst)
-        => groups.Length == 1 && UseNinferBf16MmaPass(NinferGateUpSwiGluEnabled, 1,
+        => groups.Length == 1 && UseNinferT8VerifyPass(NinferGateUpSwiGluEnabled, 1,
             groups[0].RowsPerSeq, groups[0].Slots.Length, groups[0].Verify, groups[0].Counts != null,
             _embedSpans != null, _featureCount != 0, _d != null, tapFirst);
 
@@ -48,10 +48,11 @@ public sealed unsafe partial class Q35CudaEngine
     private void InitializeNinferGateUpSwiGlu()
     {
         if (_m.Ninfer == null) return;
-        bool all = true;
+        // Per-matrix: FP8 GateUp layers take their own fused SwiGLU projection.
+        bool all = false;
         foreach (var layer in _m.Ninfer.Layers)
-            if (!NinferGateUpSwiGluMatrixEligible(layer.GateUp.Format, layer.GateUp.AllowA4, 8,
-                layer.GateUp.Rows, layer.GateUp.Columns)) all = false;
+            if (NinferGateUpSwiGluMatrixEligible(layer.GateUp.Format, layer.GateUp.AllowA4, 8,
+                layer.GateUp.Rows, layer.GateUp.Columns)) all = true;
         string option = Environment.GetEnvironmentVariable(NinferGateUpSwiGluEnvironment);
         bool requested = PlanNinferGateUpSwiGlu(true, _ninferQualifiedDefaults?.Qualified == true, _sms,
             _m.NCtx, _m.NUbatch, _ninferVerificationEnabled, _ninferDecodeGraphsEnabled,

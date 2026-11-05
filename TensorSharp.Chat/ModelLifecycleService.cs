@@ -194,8 +194,7 @@ namespace TensorSharp.Server
         {
             if (TensorSharp.Runtime.NinferArtifactReader.IsNinferArtifact(modelPath))
             {
-                if (!string.IsNullOrWhiteSpace(mmProjPath))
-                    throw new NotSupportedException("NInfer Qwen3.8 currently serves its target text body; --mmproj is not implemented for this route.");
+                // Images use the Qwen3.8 vision tower from an mmproj GGUF (validated below).
                 using var artifact = new TensorSharp.Runtime.NinferArtifactReader(modelPath);
                 _ = NinferQwen38TargetPlan.Create(artifact);
                 _ = TensorSharp.Runtime.NinferQwen38Frontend.FromReader(artifact);

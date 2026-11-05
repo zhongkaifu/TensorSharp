@@ -55,9 +55,6 @@ internal sealed class NinferQwen38ModelSource : IDisposable
             throw new NotSupportedException("NInfer body inference requires the native CUDA engine; remove TS_Q35_NATIVE=0.");
         if (!string.IsNullOrWhiteSpace(draftModelPath))
             throw new NotSupportedException("An external draft model is not implemented for complete NInfer body inference. The artifact's target text model can run without a drafter.");
-        if (Environment.GetEnvironmentVariable(Qwen35CudaExecutor.NinferHeadEnvironment) != null
-            || Environment.GetEnvironmentVariable(Qwen35CudaExecutor.NinferHeadScopeEnvironment) != null)
-            throw new NotSupportedException("The GGUF companion-head options cannot be combined with a complete NInfer body; unset TS_Q35_NINFER_HEAD and TS_Q35_NINFER_HEAD_SCOPE.");
     }
 
     internal float[] ReadFloats(NinferQwen38TensorBinding tensor)

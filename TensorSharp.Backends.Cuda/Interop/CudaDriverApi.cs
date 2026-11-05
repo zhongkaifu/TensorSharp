@@ -64,6 +64,12 @@ namespace TensorSharp.Cuda.Interop
         [LibraryImport(LibName, EntryPoint = "cuMemFreeHost")]
         public static partial int cuMemFreeHost(IntPtr hostPtr);
 
+        /// <summary>cuMemHostAlloc flags: PORTABLE (all contexts) and DEVICEMAP (kernels address it).</summary>
+        public const uint CU_MEMHOSTALLOC_PORTABLE = 0x01, CU_MEMHOSTALLOC_DEVICEMAP = 0x02;
+
+        [LibraryImport(LibName, EntryPoint = "cuMemHostGetDevicePointer_v2")]
+        public static partial int cuMemHostGetDevicePointer(out IntPtr devicePtr, IntPtr hostPtr, uint flags);
+
         [LibraryImport(LibName, EntryPoint = "cuMemcpyHtoD_v2")]
         public static partial int cuMemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, UIntPtr byteCount);
 

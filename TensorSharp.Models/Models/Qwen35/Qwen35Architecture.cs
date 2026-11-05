@@ -21,11 +21,6 @@ namespace TensorSharp.Models
             Factory = c =>
             {
                 bool native = c.Backend == BackendType.Cuda && c.TpDegree <= 1 && c.TpGroup == null && Qwen35CudaModel.CanServe(c.Probe);
-                if (!native)
-                    Qwen35CudaExecutor.ValidateNinferHeadNativeRoute(false,
-                        System.Environment.GetEnvironmentVariable(Qwen35CudaExecutor.NinferHeadEnvironment),
-                        System.Environment.GetEnvironmentVariable(Qwen35CudaExecutor.W8HeadModuleEnvironment),
-                        System.Environment.GetEnvironmentVariable(Qwen35CudaExecutor.NinferHeadScopeEnvironment));
                 return native
                     ? new Qwen35CudaModel(c.GgufPath, c.DraftModelPath)
                     : new Qwen35Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.DraftModelPath);

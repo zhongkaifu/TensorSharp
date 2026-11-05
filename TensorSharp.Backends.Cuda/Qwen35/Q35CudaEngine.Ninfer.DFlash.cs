@@ -32,18 +32,20 @@ public sealed unsafe partial class Q35CudaEngine
     private readonly ConditionalWeakTable<Slot, NinferDraftState> _ndStates = new();
     private string _ninferDraftNamespace = string.Empty;
     public bool HasNinferDrafter => _ninferDraftDesc != null && _ninferDraftModule != null;
-    public int NinferDraftMaximumLanes => HasNinferDrafter ? Math.Min(Math.Min(NdMaxLanes, RowCap / _ninferDraftDesc.BlockSize), CudaW8G32HeadModule.MaximumRows / _ninferDraftDesc.DraftTokens) : 0;
+    public int NinferDraftMaximumLanes => HasNinferDrafter ? Math.Min(Math.Min(NdMaxLanes, RowCap / _ninferDraftDesc.BlockSize), NinferDraftHeadMaximumRows / _ninferDraftDesc.DraftTokens) : 0;
     private string NinferDraftNamespaceSuffix => _ninferDraftNamespace;
     public string NinferDraftPayloadSha256 { get; private set; }
     public string NinferDraftModuleSha256 => _ninferDraftModule?.ImageSha256;
     public bool NinferDraftUsesShortlist => _ninferDraftShortlistKernels != null;
     public int NinferDraftHeadRows => NinferDraftProposalHeadRows;
+    /// <summary>Proposal rows (draft tokens x lanes) one drafting step projects through the head.</summary>
+    internal const int NinferDraftHeadMaximumRows = 33;
 
     private sealed class NinferDraftMatrix
     {
         internal IntPtr Codes, Scales;
         internal int Rows, Columns;
-        internal float InverseDivisor;
+        internal CudaNinferProjectionFormat Format;
     }
     private sealed class NinferDraftLayer
     {
@@ -138,7 +140,7 @@ public sealed unsafe partial class Q35CudaEngine
         bool shortlist = descriptor.HeadPolicy == CudaNinferDraftHeadPolicy.OriginalQ4G64Shortlist;
         if (shortlist != (descriptor.Shortlist != null) || shortlist != (shortlistModulePath != null))
             throw new ArgumentException("Original shortlist descriptors require their explicit original Q4 module; full heads do not accept one.");
-        if (_outputW8Module == null || _outputW8Weights == IntPtr.Zero || _ninferVerifiedSlots != null
+        if (_ninferHead == null || _ninferVerifiedSlots != null
             || HostBytesInUse != 0 || _active != null && _active.NPast != 0)
             throw new InvalidOperationException("Attach the original drafter to a fresh NInfer engine with its loaded target head and no pending verification.");
         MakeCurrent(); Sync(); InvalidateVerifyGraphs(); InvalidateNinferDecodeGraphs();
@@ -205,14 +207,19 @@ public sealed unsafe partial class Q35CudaEngine
     {
         public NinferDraftMatrix NinferDraftRaw(CudaNinferProjectionDesc descriptor, IncrementalHash hash)
         {
-            if (descriptor.AllowA4 || descriptor.InputScaleDivisor != 1) throw new NotSupportedException("Original DFlash projections are A16-only without activation-divisor sites.");
-            var source = new CudaNinferValidatedOriginalSource(descriptor);
-            if (source.Bytes > StagingBytes) throw new NotSupportedException("Original draft object exceeds the existing bounded staging buffer.");
-            source.Read(0, _host, source.Bytes); source.RequireCompleteValidation();
-            hash.AppendData(new ReadOnlySpan<byte>((void*)_host, checked((int)source.Bytes)));
-            IntPtr device = _e.Alloc(source.Bytes); CudaDriverApi.cuMemcpyHtoD(device, _host, (UIntPtr)source.Bytes).ThrowOnError();
-            return new() { Codes = device, Scales = device + (nint)((long)descriptor.Rows * descriptor.Columns / 2),
-                Rows = descriptor.Rows, Columns = descriptor.Columns, InverseDivisor = 1f / descriptor.WeightScaleDivisor };
+            if (descriptor.AllowA4 || descriptor.InputScaleDivisor != 1) throw new NotSupportedException("DFlash projections are A16-only without activation-divisor sites.");
+            if (descriptor.Format is not (CudaNinferProjectionFormat.W8G32 or CudaNinferProjectionFormat.BFloat16))
+                throw new NotSupportedException("DFlash projections are q8_g32 or BF16.");
+            IntPtr device = _e.Alloc(descriptor.Bytes);
+            for (long offset = 0; offset < descriptor.Bytes; offset += StagingBytes)
+            {
+                long count = Math.Min(StagingBytes, descriptor.Bytes - offset);
+                descriptor.Source.Read(descriptor.SourceOffset + offset, _host, count);
+                hash.AppendData(new ReadOnlySpan<byte>((void*)_host, checked((int)count)));
+                CudaDriverApi.cuMemcpyHtoD(device + (nint)offset, _host, (UIntPtr)count).ThrowOnError();
+            }
+            return new() { Codes = device, Rows = descriptor.Rows, Columns = descriptor.Columns, Format = descriptor.Format,
+                Scales = descriptor.Format == CudaNinferProjectionFormat.W8G32 ? device + (nint)((long)descriptor.Rows * descriptor.Columns) : IntPtr.Zero };
         }
     }
 
@@ -243,21 +250,21 @@ public sealed unsafe partial class Q35CudaEngine
         CudaDriverApi.cuMemcpy2DAsync(in copy, stream).ThrowOnError();
     }
     private void NinferDraftProject(NinferDraftMatrix matrix, IntPtr input, IntPtr output, int rows)
+        => NinferDraftProjectRows(matrix, 0, matrix.Rows, input, output, rows);
+
+    /// <summary>Weight rows [firstRow, firstRow + count) of a row-planar draft matrix, BF16 in/out ([rows][count]).</summary>
+    private void NinferDraftProjectRows(NinferDraftMatrix matrix, int firstRow, int count, IntPtr input, IntPtr output, int rows)
     {
-        // Wide context appends run on the tensor cores (ignis' A16 MMA route); the
-        // per-32-row CUDA-core loop remains for proposals and short appends.
-        if (_ninferDraftModule.TryProjectMma(matrix.Codes, matrix.Scales, input, output, matrix.Rows, matrix.Columns,
-                rows, matrix.InverseDivisor, Stream))
-            return;
-        for (int first = 0; first < rows; first += 32)
-            _ninferDraftModule.ProjectRaw(matrix.Codes, matrix.Scales, input + (nint)((long)first * matrix.Columns * 2),
-                output + (nint)((long)first * matrix.Rows * 2), matrix.Rows, matrix.Columns, Math.Min(32, rows - first), matrix.InverseDivisor, Stream);
+        bool w8 = matrix.Format == CudaNinferProjectionFormat.W8G32;
+        IntPtr codes = matrix.Codes + (nint)((long)firstRow * matrix.Columns * (w8 ? 1 : 2));
+        IntPtr scales = w8 ? matrix.Scales + (nint)((long)firstRow * (matrix.Columns / 32) * 2) : IntPtr.Zero;
+        _ninferDraftModule.ProjectSmall(w8, codes, scales, input, output, count, matrix.Columns, rows, Stream);
     }
     internal static int ValidateNinferDraftHeadShape(int draftTokens, int lanes)
     {
         if (draftTokens < 1 || draftTokens > 7 || lanes < 1 || lanes > 8) throw new ArgumentOutOfRangeException(nameof(draftTokens));
         int columns = draftTokens * lanes;
-        if (columns > CudaW8G32HeadModule.MaximumRows) throw new NotSupportedException("The exact original small-T full head supports at most33 proposal rows.");
+        if (columns > NinferDraftHeadMaximumRows) throw new NotSupportedException("The drafter projects at most 33 proposal rows per step.");
         return columns;
     }
     internal static bool NinferDraftCarriesAnchor(int physicalWindow, int kept)
@@ -284,8 +291,10 @@ public sealed unsafe partial class Q35CudaEngine
     }
     private void RequireNinferDraftRing(Slot slot)
     {
-        if (slot.RopeDelta != 0 || slot.RingK == null || slot.RingV == null || slot.RingK.Length != 5 || slot.RingV.Length != 5)
-            throw new InvalidOperationException("Original text DFlash requires this slot's five BF16 2048-position K/V rings.");
+        // The drafter positions its rings by token index (slot.NPast), independent of the target's
+        // M-RoPE delta after image spans.
+        if (slot.RingK == null || slot.RingV == null || slot.RingK.Length != 5 || slot.RingV.Length != 5)
+            throw new InvalidOperationException("DFlash2 drafting requires this slot's five BF16 2048-position K/V rings.");
         for (int i = 0; i < 5; i++) if (slot.RingK[i] == IntPtr.Zero || slot.RingV[i] == IntPtr.Zero)
             throw new InvalidOperationException("Missing original draft slot ring.");
     }
@@ -303,9 +312,10 @@ public sealed unsafe partial class Q35CudaEngine
         for (int layer = 0; layer < 5; layer++)
         {
             var weights = _ninferDraftLayers[layer];
-            NinferDraftProject(weights.Qkv, _ndContext, _ndQkv, rows);
-            NinferDraftCopyRows(_ndQkv, 6144, 4096, _ndKey, 1024, rows, Stream);
-            NinferDraftCopyRows(_ndQkv, 6144, 5120, _ndValue, 1024, rows, Stream);
+            // Context rows only need K|V (the context_key/context_value bindings are the K/V rows).
+            NinferDraftProjectRows(weights.Qkv, 4096, 2048, _ndContext, _ndQkv, rows);
+            NinferDraftCopyRows(_ndQkv, 2048, 0, _ndKey, 1024, rows, Stream);
+            NinferDraftCopyRows(_ndQkv, 2048, 1024, _ndValue, 1024, rows, Stream);
             _ninferDraftModule.PlainRms(_ndKey, weights.KeyNorm, _ndKeyNormed, 128, rows * 8, 1e-6f, Stream);
             _ninferDraftModule.QkRope(IntPtr.Zero, _ndKeyNormed, _ndMeta + (nint)(NdAppendPositions * 4L), _ndFrequencies, rows, Stream);
             for (int q = 0; q < lanes; q++)
@@ -459,8 +469,7 @@ public sealed unsafe partial class Q35CudaEngine
             IntPtr anchorsDevice = _ndMeta + (nint)(NdAnchors * 4L), baseDevice = _ndMeta + (nint)(NdBases * 4L), validDevice = _ndMeta + (nint)(NdValid * 4L);
             IntPtr ids = _ndMeta + (nint)(NdIds * 4L), positions = _ndMeta + (nint)(NdPositions * 4L);
             _ninferDraftModule.PrepareBlock(anchorsDevice, baseDevice, validDevice, ids, positions, block, lanes, Stream);
-            if (!TryHostNinferDraftEmbedding(_ndHostMeta.AsSpan(NdAnchors, lanes), block))
-                _ninfer.EmbedW8(_tokEmbd, ids, _ndEmbeddingF32, rows, NdHidden, _m.NVocab, Stream);
+            _k.EmbedFp8(_tokEmbd, _tokEmbd + (nint)((long)_m.NVocab * NdHidden), ids, _ndEmbeddingF32, rows, NdHidden, _m.NVocab, Stream);
             _ninfer.CastToBf16(_ndEmbeddingF32, _ndResidual, (long)rows * NdHidden, Stream);
             for (int l = 0; l < 5; l++)
             {
@@ -486,9 +495,8 @@ public sealed unsafe partial class Q35CudaEngine
                 _ninferDraftModule.PlainRms(_ndResidual, layer.PostNorm, _ndNorm, NdHidden, rows, 1e-6f, Stream);
                 NinferDraftProject(layer.MlpConv, _ndNorm, _ndDynamic, rows);
                 _ninferDraftModule.DynamicConv(_ndNorm, _ndDynamic, layer.MlpBase, _ndConvInput, NdHidden, block, lanes, 0, Stream);
-                for (int first = 0; first < rows; first += 16)
-                    _ninferDraftModule.SwiGluRaw(layer.GateUp.Codes, layer.GateUp.Scales, _ndConvInput + (nint)((long)first * NdHidden * 2),
-                        _ndIntermediate + (nint)((long)first * 17408 * 2), Math.Min(16, rows - first), layer.GateUp.InverseDivisor, Stream);
+                _ninferDraftModule.SwiGluW8(layer.GateUp.Codes, layer.GateUp.Scales, _ndConvInput, _ndIntermediate,
+                    layer.GateUp.Rows, layer.GateUp.Columns, rows, Stream);
                 NinferDraftProject(layer.Down, _ndIntermediate, _ndProjected, rows);
                 _ninferDraftModule.DynamicConv(_ndProjected, _ndDynamic, layer.MlpBase, _ndConvOutput, NdHidden, block, lanes, 1, Stream);
                 _ninferDraftModule.ResidualAdd(_ndConvOutput, _ndResidual, (long)rows * NdHidden, Stream);
@@ -497,16 +505,14 @@ public sealed unsafe partial class Q35CudaEngine
             _ninferDraftModule.PlainRms(_ndPacked, _ndFinalNorm, _ndFinal, NdHidden, columns, 1e-6f, Stream);
             if (!TryNinferDraftShortlistHead(_ndFinal, columns))
             {
-                _outputW8Module.LaunchBf16(_outputW8Weights, _outputW8.Bytes, _ndFinal, (long)columns * NdHidden * 2,
-                    _ndLogits, (long)columns * _m.NVocab * 2, columns, Stream);
+                _k.ProjectFp8Bf16(_ninferHead.Data, _ninferHead.Scales, _m.NVocab, NdHidden, _ndFinal, columns, _ndLogits, Stream);
                 _ninferDraftModule.Top16(_ndLogits, _ndCandidate, _ndUnary, _m.NVocab, columns, _ndTopScratch, Stream);
             }
             _ninferDraftModule.SelectorPredecessors(_ndCandidate, anchorsDevice, _ndPredecessors, draft, lanes, Stream);
             NinferDraftProject(_ndSelectorHidden, _ndFinal, _ndSelectorBf16, columns);
             _ninferDraftModule.CastBf16ToF32(_ndSelectorBf16, _ndSelectorF32, (long)columns * 256, Stream);
-            _ninferDraftModule.SelectorScoresRaw(_ndCandidate, _ndPredecessors, _ndUnary, _ndSelectorF32, _ndSelectorSuccessor.Codes,
-                _ndSelectorSuccessor.Scales, _ndSelectorSuccessor.InverseDivisor, _ndSelectorPredecessor.Codes, _ndSelectorPredecessor.Scales,
-                _ndSelectorPredecessor.InverseDivisor, _ndScores, _m.NVocab, draft, lanes, Stream);
+            _ninferDraftModule.SelectorScoresBf16(_ndCandidate, _ndPredecessors, _ndUnary, _ndSelectorF32, _ndSelectorSuccessor.Codes,
+                _ndSelectorPredecessor.Codes, _ndScores, draft, lanes, Stream);
             _ninferDraftModule.SelectorWalk(_ndScores, _ndCandidate, _ndDrafts, draft, lanes, Stream);
             if (fullHeadOut != null)
             {

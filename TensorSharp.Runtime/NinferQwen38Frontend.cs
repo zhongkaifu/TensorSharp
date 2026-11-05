@@ -66,21 +66,34 @@ public sealed class NinferQwen38Frontend
     public string? ArtifactPath { get; }
     public string? ArtifactDirectorySha256 { get; }
 
+    /// <summary>NInfer v3 component resource (component, file name) behind each frontend resource key.</summary>
+    private static readonly IReadOnlyDictionary<string, (string Component, string File)> ResourceSources = new ReadOnlyDictionary<string, (string, string)>(new Dictionary<string, (string, string)>(StringComparer.Ordinal)
+    {
+        ["frontend/tokenizer.json"] = ("text", "tokenizer.json"),
+        ["frontend/tokenizer_config.json"] = ("text", "tokenizer_config.json"),
+        ["frontend/chat_template.jinja"] = ("text", "chat_template.jinja"),
+        ["frontend/generation_config.json"] = ("text", "generation_config.json"),
+        ["frontend/preprocessor_config.json"] = ("vision", "preprocessor_config.json"),
+        ["frontend/video_preprocessor_config.json"] = ("vision", "video_preprocessor_config.json")
+    });
+
     public static NinferQwen38Frontend FromReader(NinferArtifactReader reader)
     {
         ArgumentNullException.ThrowIfNull(reader);
         reader.ReadRange(0, Span<byte>.Empty); // Disposed-reader check, no tensor content read.
-        NinferFrontendJson.Require(reader.Identity.ModelId == "qwen3.8-27b" && reader.Identity.WeightsId == "nvfp4full", "Unsupported NInfer frontend family.");
-        NinferFrontendJson.Require(reader.Objects.Count == 1325 && reader.Tensors.Count == 1319 && reader.Resources.Count == 6, "Known artifact inventory count differs.");
-        NinferFrontendJson.Require(reader.Resources.Select(x => x.Name).ToHashSet(StringComparer.Ordinal).SetEquals(ResourceLimits.Keys), "Known frontend resource names differ.");
+        NinferFrontendJson.Require(reader.Identity.ModelId == "qwen3.8-27b", "Unsupported NInfer frontend family.");
+        var bytes = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         ulong total = 0;
-        foreach (var resource in reader.Resources)
+        foreach (var (key, (component, file)) in ResourceSources)
         {
-            NinferFrontendJson.Require(ReferenceEquals(reader.GetObject(resource.Name), resource) && resource.Encoding == "raw-bytes-v1" && resource.ByteLength <= (ulong)ResourceLimits[resource.Name], "Frontend resource ownership/encoding/bounds differ.");
+            NinferResourceDescriptor? resource = null;
+            NinferFrontendJson.Require(reader.ComponentResources.TryGetValue(component, out var map) && map.TryGetValue(file, out resource),
+                $"Missing NInfer {component} resource {file}.");
+            NinferFrontendJson.Require(resource!.ByteLength <= (ulong)ResourceLimits[key], "Frontend resource exceeds its bound: " + file);
             total = checked(total + resource.ByteLength);
+            bytes.Add(key, reader.ReadResource(resource, ResourceLimits[key]));
         }
         NinferFrontendJson.Require(total <= 16UL << 20, "Frontend resources exceed total read budget.");
-        var bytes = reader.Resources.ToDictionary(x => x.Name, x => reader.ReadResource(x, ResourceLimits[x.Name]), StringComparer.Ordinal);
         return ParseResources(bytes, NinferFrontendProfile.Actual, reader.FullPath, reader.DirectorySha256);
     }
 
@@ -116,7 +129,10 @@ public sealed class NinferQwen38Frontend
         using var video = NinferFrontendJson.Parse(resources["frontend/video_preprocessor_config.json"].Utf8Text);
         var g = ParseGeneration(generation.RootElement);
         var t = NinferQwen38Tokenizer.Parse(tokenizer.RootElement, config.RootElement, g, profile);
-        NinferFrontendJson.Require(NinferFrontendJson.Text(config.RootElement.GetProperty("chat_template")) == resources["frontend/chat_template.jinja"].Utf8Text, "Chat template resource and tokenizer config differ.");
+        // The artifact's chat_template.jinja is NInfer's superset of the official template (positional
+        // system/developer turns, final-assistant continuation, tool histories without a user turn); it
+        // renders standard histories exactly as tokenizer_config's copy, which it is allowed to differ from.
+        NinferFrontendJson.Require(NinferFrontendJson.Text(config.RootElement.GetProperty("chat_template")).Length > 0, "tokenizer_config.json lacks a chat template.");
         return new(t, g, ParseProcessor(image.RootElement, false), ParseProcessor(video.RootElement, true),
             new ReadOnlyDictionary<string, NinferFrontendResource>(resources), path, directorySha);
     }

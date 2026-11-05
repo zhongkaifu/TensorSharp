@@ -28,10 +28,14 @@ public sealed partial class Qwen35CudaExecutor
         try
         {
             var model = BuildNinferModelDesc(source, maxContext, nUbatch,
-                ResolveNinferModulePath(NinferBodyModuleEnvironment, "tensorsharp_q35_ninfer.ptx"),
-                ResolveNinferModulePath(W8HeadModuleEnvironment, "tensorsharp_w8g32_head.ptx"));
+                ResolveNinferModulePath(NinferBodyModuleEnvironment, "tensorsharp_q35_ninfer.ptx"));
             _engine = new Q35CudaEngine(model);
-            if (Environment.GetEnvironmentVariable(NinferDraftModuleEnvironment) is string draftModule)
+            string? draftModule = Environment.GetEnvironmentVariable(NinferDraftModuleEnvironment);
+            if (draftModule == null && Environment.GetEnvironmentVariable(NinferDraftShortlistModuleEnvironment) != null)
+                throw new ArgumentException("An original shortlist requires its original NInfer draft module.");
+            // --no-spec (TS_SPEC=0) vetoes the embedded drafter for the whole process: not attaching it
+            // keeps its weights out of VRAM and its per-token context append off the decode path.
+            if (draftModule != null && !TensorSharp.Runtime.Speculative.SpeculationOptions.FromEnvironment().ExplicitlyDisabled)
             {
                 string? shortlistModule = Environment.GetEnvironmentVariable(NinferDraftShortlistModuleEnvironment);
                 using var draft = new NinferQwen38DraftSource(NinferQwen38DraftPlan.Create(source.Reader),
@@ -43,8 +47,6 @@ public sealed partial class Qwen35CudaExecutor
                 // rather than an external drafter attached to a target wrapper.
                 HasEmbeddedNinferDrafter = true;
             }
-            else if (Environment.GetEnvironmentVariable(NinferDraftShortlistModuleEnvironment) != null)
-                throw new ArgumentException("An original shortlist requires its original NInfer draft module.");
             _slots.Add(_engine.Active);
             ActiveSlot = 0;
         }
@@ -71,7 +73,7 @@ public sealed partial class Qwen35CudaExecutor
     }
 
     internal static Q35CudaEngine.ModelDesc BuildNinferModelDesc(NinferQwen38ModelSource source,
-        int nCtx, int nUbatch, string bodyModule, string headModule)
+        int nCtx, int nUbatch, string bodyModule)
     {
         var p = source.Plan;
         float[] Norm(NinferQwen38TensorBinding tensor) => NinferQwen38ModelSource.EffectiveNorm(source.ReadFloats(tensor), tensor.NormConvention);
@@ -79,41 +81,51 @@ public sealed partial class Qwen35CudaExecutor
         {
             var descriptor = tensor.Descriptor;
             int rows = checked((int)descriptor.Shape[0]), columns = checked((int)descriptor.Shape[1]);
-            if (descriptor.Format == NinferTensorFormat.NvFp4)
+            switch (descriptor.Format)
             {
-                if (tensor.InputScaleDivisor is null) throw new InvalidDataException("NVFP4 projection lacks activation calibration: " + descriptor.Name);
-                Span<byte> raw = stackalloc byte[4]; source.Reader.ReadObjectRange(tensor.InputScaleDivisor, 0, raw);
-                float inputDivisor = PositiveDivisor(BinaryPrimitives.ReadUInt32LittleEndian(raw));
-                var planes = source.ConvertedProjection(tensor);
-                return new(planes, 0, planes.Bytes, rows, columns, CudaNinferProjectionFormat.NvFp4Planes,
-                    inputDivisor, descriptor.WeightDivisor!.Value);
+                case NinferTensorFormat.NvFp4:
+                {
+                    float inputDivisor = source.Reader.ReadScalar(tensor.InputScaleDivisor
+                        ?? throw new InvalidDataException("NVFP4 projection lacks activation calibration: " + tensor.Name));
+                    if (!float.IsFinite(inputDivisor) || inputDivisor <= 0) throw new InvalidDataException("NInfer activation divisor must be positive and finite.");
+                    var planes = source.ConvertedProjection(tensor);
+                    return new(planes, 0, planes.Bytes, rows, columns, CudaNinferProjectionFormat.NvFp4Planes,
+                        inputDivisor, descriptor.WeightDivisor!.Value);
+                }
+                case NinferTensorFormat.Fp8E4M3FnRowBFloat16Scale:
+                {
+                    Func<int, int>? order = tensor.RowOrder switch
+                    {
+                        NinferQwen38RowOrder.AttentionQueryKeyGateValue => NinferRowPlanarWeightSource.AttentionQueryGateKeyValue,
+                        NinferQwen38RowOrder.MlpGateThenUp => NinferRowPlanarWeightSource.GateUpRows8(rows),
+                        _ => null
+                    };
+                    var planar = new NinferRowPlanarWeightSource(source.Reader, descriptor, order);
+                    return new(planar, 0, planar.Bytes, rows, columns, CudaNinferProjectionFormat.Fp8Row, allowA4: false);
+                }
+                case NinferTensorFormat.BFloat16:
+                    if (tensor.RowOrder is not (NinferQwen38RowOrder.Unchanged or NinferQwen38RowOrder.GdnAlphaThenBeta))
+                        throw new NotSupportedException("BF16 target projections keep their stored row order: " + tensor.Name);
+                    return new(new NinferTensorWeightSource(source.Reader, descriptor), 0, checked((long)descriptor.ByteLength),
+                        rows, columns, CudaNinferProjectionFormat.BFloat16, allowA4: false);
+                default:
+                    throw new NotSupportedException($"Unexpected target projection format {descriptor.Format}: {tensor.Name}");
             }
-            if (descriptor.Format != NinferTensorFormat.BFloat16) throw new NotSupportedException("Unexpected target projection format.");
-            bool attention = tensor.RowOrder == NinferQwen38RowOrder.AttentionQueryKeyGateValue;
-            return new(new NinferTensorWeightSource(source.Reader, descriptor, attention), 0, checked((long)descriptor.ByteLength),
-                rows, columns, CudaNinferProjectionFormat.BFloat16, allowA4: false);
         }
         string provenance = JsonSerializer.Serialize(new
         {
-            recipe = "ninfer-qwen38-target-nvfp4full-v2",
-            source.Reader.FullPath, source.Reader.FileBytes, source.Reader.Identity,
+            recipe = source.Reader.Identity.WeightsId, binding = NinferQwen38TargetPlan.BindingVersion,
+            source.Reader.FullPath, source.Reader.FileBytes, source.Reader.Identity, source.Reader.ArtifactId,
             source.Reader.DirectorySha256, source.Reader.PrefixSha256, source.Reader.FileLastWriteUtcTicks,
             cacheIdentity = source.CacheIdentity,
-            fullArtifactSha256Recomputed = false,
             frontendResources = source.Frontend.Resources.Values.Select(x => new { x.Name, x.Sha256, x.ByteLength }),
-            embedding = "original-W8G32-F16S", output = "original-W8G32-F16S",
-            projectionCalibration = "original-FP32-input-divisor-and-weight-divisor",
-            draft = "not-bound", vision = "not-bound"
+            embedding = "FP8-E4M3-row-BF16", head = "FP8-E4M3-row-BF16",
+            projections = "FP8-row (A16 small-T, A8 prefill) / NVFP4 (A4, FP32 activation divisor) / BF16"
         });
-        var embedding = p.TokenEmbedding.Descriptor;
-        var output = p.OutputHead.Descriptor;
         var native = new CudaNinferModelDesc
         {
-            Embedding = new(new NinferTensorWeightSource(source.Reader, embedding), 0, checked((long)embedding.ByteLength),
-                NinferQwen38TargetPlan.VocabularySize, NinferQwen38TargetPlan.HiddenSize, CudaNinferProjectionFormat.W8G32, allowA4: false),
-            Output = new(new NinferTensorWeightSource(source.Reader, output), 0, checked((long)output.ByteLength),
-                NinferQwen38TargetPlan.VocabularySize, NinferQwen38TargetPlan.HiddenSize, headModule, provenance,
-                profile: "ninfer-qwen38-target-w8g32-f16s-bf16-v1"),
+            Embedding = Projection(p.TokenEmbedding),
+            Head = Projection(p.OutputHead),
             Layers = new CudaNinferLayerDesc[NinferQwen38TargetPlan.LayerCount],
             ModulePath = bodyModule,
             Provenance = provenance

@@ -1372,6 +1372,49 @@ extern "C" __global__ void ts_q35_add_rmsnorm_f32(
         y[row * width + i] = xr[i] * scale * w[i];
 }
 
+// ts_q35_add_rmsnorm_f32 for width 5120 at 512 threads with the row in registers: the same values
+// per thread, sum order, reductions and expressions (bit-identical output), but every load issued
+// up front rather than one dependent round trip per iteration (a verify step runs ~140 of these).
+extern "C" __global__ void __launch_bounds__(512) ts_q35_add_rmsnorm_5120_f32(
+    float* __restrict__ x, const float* __restrict__ delta, const float* __restrict__ w,
+    float* __restrict__ y, int width, float eps)
+{
+    constexpr int PER = 10;
+    __shared__ float partial[32];
+    const long long row = blockIdx.x;
+    float* xr = x + row * width;
+    float v[PER];
+#pragma unroll
+    for (int p = 0; p < PER; ++p)
+    {
+        v[p] = xr[threadIdx.x + p * 512];
+        if (delta != nullptr) v[p] += delta[row * width + threadIdx.x + p * 512];
+    }
+    float ss = 0.0f;
+#pragma unroll
+    for (int p = 0; p < PER; ++p)
+    {
+        if (delta != nullptr) xr[threadIdx.x + p * 512] = v[p];
+        ss += v[p] * v[p];
+    }
+    ss = ts_q35_warp_sum(ss);
+    if ((threadIdx.x & 31) == 0)
+        partial[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32)
+    {
+        float t = threadIdx.x < (blockDim.x >> 5) ? partial[threadIdx.x] : 0.0f;
+        t = ts_q35_warp_sum(t);
+        if (threadIdx.x == 0)
+            partial[0] = t;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(partial[0] / (float)width + eps);
+#pragma unroll
+    for (int p = 0; p < PER; ++p)
+        y[row * width + threadIdx.x + p * 512] = v[p] * scale * w[threadIdx.x + p * 512];
+}
+
 // ---------------------------------------------------------------------------
 // Attention front end. qkv rows are [Q|gate per head (nHead x 2 x 256) | K (nKv x 256) |
 // V (nKv x 256)]. One warp per (row, unit): units 0..nHead-1 are query heads, then nKv key heads,
@@ -2966,3 +3009,319 @@ extern "C" __global__ void ts_q35_argmax_f32(const float* __restrict__ x, int n,
 }
 
 #include "tensorsharp_q35_dflash.cuh"
+
+// ---------------------------------------------------------------------------
+// FP8 E4M3 row-scaled weights (NInfer v3 fp8_e4m3fn_row_bf16: codes [rows][k], one BF16 scale per
+// row), the representation of the NInfer Qwen3.8-27B artifact's embedding, head, attention/GDN
+// projections and last MLP layers.
+//   * ts_q35_fp8_<x>_t<TT>_<epilogue>: small-T (decode / verify / drafter head) BF16 tensor-core
+//     projection, see tensorsharp_small_t_mma.cuh. A16: activations are never quantized.
+//   * ts_q35_fp8_quant_act: per-row E4M3 activation codes with an F32 scale amax / 448 (NInfer
+//     fp8_a8.cu fp8_a8_quantize_kernel numerics), for prefill's A8 projection.
+//   * ts_q35_gemm_w8a8_tma<bm>_<epilogue>: prefill W8A8 GEMM, the warp-specialized TMA structure of
+//     ts_q35_gemm_w4a4_tma with the m16n8k32 E4M3 MMA (64 K values per 64-byte tile) and the
+//     scales applied once at the store: y = acc * xScale[token] * wScale[row].
+//   * ts_q35_embed_fp8: token rows, BF16(code * row scale) as F32.
+// ---------------------------------------------------------------------------
+#include "tensorsharp_small_t_mma.cuh"
+
+// T <= 8 reads the F32 activations directly; wider tiles take BF16 activations (cast once per
+// projection) and share each staged activation slab across RT 16-row weight tiles.
+#define TS_Q35_FP8_SMALL(NAME, XBF, YBF, OUT, TT, KW, ST, RT) \
+    extern "C" __global__ __launch_bounds__(KW * 32) void NAME(const uint8_t* __restrict__ w, const uint16_t* __restrict__ s, \
+        const void* __restrict__ x, void* __restrict__ y, int n, int k, int m, int ldy) \
+    { ts_smt::project<ts_smt::kFp8Row, XBF, YBF, OUT, TT, KW, ST, RT>(w, s, x, y, n, k, m, ldy); }
+TS_Q35_FP8_SMALL(ts_q35_fp8_f32_t8_plain, false, false, 0, 8, 4, 3, 1)
+TS_Q35_FP8_SMALL(ts_q35_fp8_f32_t8_round, false, false, 1, 8, 4, 3, 1)
+TS_Q35_FP8_SMALL(ts_q35_fp8_f32_t8_swiglu, false, false, 2, 8, 4, 3, 1)
+TS_Q35_FP8_SMALL(ts_q35_fp8_bx_t16_plain, true, false, 0, 16, 4, 2, 2)
+TS_Q35_FP8_SMALL(ts_q35_fp8_bx_t16_round, true, false, 1, 16, 4, 2, 2)
+TS_Q35_FP8_SMALL(ts_q35_fp8_bx_t16_swiglu, true, false, 2, 16, 4, 2, 2)
+TS_Q35_FP8_SMALL(ts_q35_fp8_bx_t32_plain, true, false, 0, 32, 2, 2, 4)
+TS_Q35_FP8_SMALL(ts_q35_fp8_bx_t32_round, true, false, 1, 32, 2, 2, 4)
+TS_Q35_FP8_SMALL(ts_q35_fp8_bx_t32_swiglu, true, false, 2, 32, 2, 2, 4)
+TS_Q35_FP8_SMALL(ts_q35_fp8_bf16_t8_plain, true, true, 0, 8, 4, 3, 1)
+TS_Q35_FP8_SMALL(ts_q35_fp8_bf16_t16_plain, true, true, 0, 16, 4, 2, 2)
+TS_Q35_FP8_SMALL(ts_q35_fp8_bf16_t32_plain, true, true, 0, 32, 2, 2, 4)
+
+// T = 1 (non-speculative decode): CUDA-core GEMV, NInfer's RTX 5090 shape choices: b = 4 warps x
+// 4 rows x 16 codes (the 16384-row GDN input projection), c = 8 warps x 2 rows x 16 codes.
+#define TS_Q35_FP8_GEMV(NAME, WARPS, RPW, VPL, OUT, MINB) \
+    extern "C" __global__ __launch_bounds__(WARPS * 32, MINB) void NAME(const uint8_t* __restrict__ w, \
+        const uint16_t* __restrict__ s, const float* __restrict__ x, float* __restrict__ y, int k) \
+    { ts_smt::gemv<WARPS, RPW, VPL, OUT>(w, s, x, y, k); }
+TS_Q35_FP8_GEMV(ts_q35_fp8_gemv_b_plain, 4, 4, 16, 0, 1)
+TS_Q35_FP8_GEMV(ts_q35_fp8_gemv_b_round, 4, 4, 16, 1, 1)
+TS_Q35_FP8_GEMV(ts_q35_fp8_gemv_b_swiglu, 4, 4, 16, 2, 1)
+TS_Q35_FP8_GEMV(ts_q35_fp8_gemv_c_plain, 8, 2, 16, 0, 2)
+TS_Q35_FP8_GEMV(ts_q35_fp8_gemv_c_round, 8, 2, 16, 1, 2)
+TS_Q35_FP8_GEMV(ts_q35_fp8_gemv_c_swiglu, 8, 2, 16, 2, 2)
+
+/// One CTA (256 threads) per row: scale = amax / 448, codes = E4M3(x / scale) (satfinite).
+extern "C" __global__ __launch_bounds__(256) void ts_q35_fp8_quant_act(const float* __restrict__ x,
+    uint8_t* __restrict__ codes, float* __restrict__ scales, int k)
+{
+    __shared__ float warpMax[8];
+    __shared__ float rowScale;
+    const long long base = (long long)blockIdx.x * k;
+    const float4* x4 = reinterpret_cast<const float4*>(x + base);
+    float amax = 0.0f;
+    for (int i = threadIdx.x; i < k / 4; i += 256)
+    {
+        const float4 v = x4[i];
+        amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    if ((threadIdx.x & 31) == 0) warpMax[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    if (threadIdx.x < 32)
+    {
+        float v = threadIdx.x < 8 ? warpMax[threadIdx.x] : 0.0f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+        if (threadIdx.x == 0)
+        {
+            rowScale = v > 0.0f ? v / 448.0f : 0.0f;
+            scales[blockIdx.x] = rowScale;
+        }
+    }
+    __syncthreads();
+    const float inverse = rowScale > 0.0f ? 1.0f / rowScale : 0.0f;
+    uint32_t* out = reinterpret_cast<uint32_t*>(codes + base);
+    for (int i = threadIdx.x; i < k / 4; i += 256)
+    {
+        const float4 v = x4[i];
+        const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(v.x * inverse, v.y * inverse), __NV_SATFINITE, __NV_E4M3);
+        const uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(v.z * inverse, v.w * inverse), __NV_SATFINITE, __NV_E4M3);
+        out[i] = lo | (hi << 16);
+    }
+}
+
+/// out[row][c] = BF16(E4M3(codes[id][c]) * scale[id]) as F32; one CTA per token row.
+extern "C" __global__ void ts_q35_embed_fp8(const uint8_t* __restrict__ codes, const uint16_t* __restrict__ scales,
+    const int* __restrict__ ids, float* __restrict__ out, int width, int vocab)
+{
+    const int row = blockIdx.x, id = ids[row];
+    if (id < 0 || id >= vocab) { asm("trap;"); return; }
+    const float s = ts_smt::bf16_bits(scales[id]);
+    const uint8_t* src = codes + (long long)id * width;
+    for (int i = threadIdx.x * 2; i < width; i += blockDim.x * 2)
+    {
+        const uint32_t bf = ts_smt::e4m3x2_bf16x2(*reinterpret_cast<const uint16_t*>(src + i));
+        out[(long long)row * width + i] = ts_smt::round_bf16(__uint_as_float(bf << 16) * s);
+        out[(long long)row * width + i + 1] = ts_smt::round_bf16(__uint_as_float(bf & 0xffff0000u) * s);
+    }
+}
+
+template <int BM, int STAGES>
+struct TsQ35Fp8TmaSmem
+{
+    alignas(1024) uint8_t xc[STAGES][BM * 64];
+    alignas(1024) uint8_t wc[STAGES][128 * 64];
+    alignas(8) unsigned long long full[STAGES];
+    alignas(8) unsigned long long empty[STAGES];
+};
+
+// E4M3 x E4M3 with F32 accumulation. On RTX 5090 (sm_120a) the plain m16n8k32 form accumulates in
+// F32 at half rate; the block-scaled kind::mxf8f6f4 form with unit UE8M0 scales (0x7f = 2^0) runs at
+// full rate and computes the same raw dot product (NInfer 1882c6ad src/ops/common/cuda/mma.cuh).
+__device__ __forceinline__ void ts_q35_mma_fp8(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
+{
+#if defined(TS_Q35_FP4_MMA)
+    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%10}, {%11,%12};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0x7fu), "h"((unsigned short)0), "h"((unsigned short)0));
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    __trap();
+#endif
+}
+
+// EPI: 0 y = v, 1 y = BF16(v), 2 y = BF16(silu(BF16(gate)) * BF16(up)), 3 y = BF16(silu(gate) * up),
+// v = acc * xScale[token] * wScale[row]; SwiGLU weights are gate|up interleaved by 8 rows.
+template <int BM, int STAGES, int EPI>
+__device__ __forceinline__ void ts_q35_gemm_w8a8_tma(const TsQ35TmaMaps& maps, int outDim, int k,
+    const float* __restrict__ xScale, const uint16_t* __restrict__ wScale, int m, float* __restrict__ y)
+{
+    static_assert(BM == 128 || BM == 256, "token tile");
+    static_assert(EPI >= 0 && EPI <= 3, "epilogues 0-3");
+#if defined(TS_Q35_FP4_MMA)
+    constexpr int PRODUCERS = BM == 256 ? 128 : 32, WARP_M = BM / 4, MT = WARP_M / 16, NT = 8;
+    extern __shared__ __align__(1024) uint8_t tmaSmem[];
+    auto& sm = *reinterpret_cast<TsQ35Fp8TmaSmem<BM, STAGES>*>(tmaSmem);
+    const int token0 = blockIdx.x * BM, row0 = blockIdx.y * 128, kTiles = k / 64;
+
+    if (threadIdx.x == 0)
+    {
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s)
+        {
+            ts_q35_mbar_init(&sm.full[s], 1);
+            ts_q35_mbar_init(&sm.empty[s], 8);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+
+    if (threadIdx.x < PRODUCERS)
+    {
+        if constexpr (PRODUCERS == 128)
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" ::: "memory");
+        if (threadIdx.x == 0)
+        {
+            constexpr uint32_t CODES = BM * 64 + 128 * 64;
+#pragma unroll 1
+            for (int kt = 0; kt < kTiles; ++kt)
+            {
+                const int s = kt % STAGES;
+                ts_q35_mbar_wait(&sm.empty[s], 1u ^ ((kt / STAGES) & 1u));
+                ts_q35_mbar_expect(&sm.full[s], CODES);
+                ts_q35_tma_2d(sm.xc[s], &maps.xCodes, kt * 64, token0, &sm.full[s]);
+                ts_q35_tma_2d(sm.wc[s], &maps.wCodes, kt * 64, row0, &sm.full[s]);
+            }
+        }
+        return;
+    }
+    if constexpr (PRODUCERS == 128)
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 232;" ::: "memory");
+
+    const int ct = threadIdx.x - PRODUCERS, lane = ct & 31, warp = ct >> 5;
+    const int wm = warp >> 1, wn = warp & 1;
+    const int g = lane >> 2, q = lane & 3;
+    const int aRow = wm * WARP_M + (lane & 15), aByte = (lane >> 4) * 16;
+    const int bRow = wn * 64 + (lane & 7), bByte = ((lane >> 3) & 1) * 16;
+
+    float acc[MT][NT][4];
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+            acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.0f;
+
+#pragma unroll 1
+    for (int kt = 0; kt < kTiles; ++kt)
+    {
+        const int s = kt % STAGES;
+        ts_q35_mbar_wait(&sm.full[s], (kt / STAGES) & 1u);
+        const uint32_t xc = ts_q35_smem_u32(sm.xc[s]), wc = ts_q35_smem_u32(sm.wc[s]);
+#pragma unroll
+        for (int k32 = 0; k32 < 2; ++k32)
+        {
+            uint32_t a[MT][4];
+#pragma unroll
+            for (int i = 0; i < MT; ++i)
+                ts_q35_ldsm_x4a(a[i], ts_q35_sw64(xc + (aRow + i * 16) * 64 + k32 * 32 + aByte));
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+            {
+                uint32_t b0, b1;
+                ts_q35_ldsm_x2(b0, b1, ts_q35_sw64(wc + (bRow + j * 8) * 64 + k32 * 32 + bByte));
+#pragma unroll
+                for (int i = 0; i < MT; ++i)
+                    ts_q35_mma_fp8(acc[i][j], a[i], b0, b1);
+            }
+        }
+        if (lane == 0)
+            ts_q35_mbar_arrive(&sm.empty[s]);
+    }
+
+    // D rows are tokens (g, g + 8), columns weight rows (2q, 2q + 1).
+    const int tokBase = token0 + wm * WARP_M + g, rowBase = row0 + wn * 64 + 2 * q;
+    float ws[NT][2];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+    {
+        const int r = rowBase + j * 8;
+        ws[j][0] = r < outDim ? ts_smt::bf16_bits(wScale[r]) : 0.0f;
+        ws[j][1] = r + 1 < outDim ? ts_smt::bf16_bits(wScale[r + 1]) : 0.0f;
+    }
+    if constexpr (EPI == 2 || EPI == 3)
+    {
+        const int ff = outDim / 2;
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+            {
+                const int c = tokBase + i * 16 + h * 8;
+                if (c >= m)
+                    continue;
+                const float xs = xScale[c];
+#pragma unroll
+                for (int jp = 0; jp < NT / 2; ++jp)
+                {
+                    const int r = rowBase + jp * 16;
+                    if (r >= outDim)
+                        continue;
+                    float out[2];
+#pragma unroll
+                    for (int e = 0; e < 2; ++e)
+                    {
+                        float gate = acc[i][2 * jp][h * 2 + e] * xs * ws[2 * jp][e];
+                        float up = acc[i][2 * jp + 1][h * 2 + e] * xs * ws[2 * jp + 1][e];
+                        if constexpr (EPI == 2)
+                        {
+                            gate = __bfloat162float(__float2bfloat16_rn(gate));
+                            up = __bfloat162float(__float2bfloat16_rn(up));
+                        }
+                        out[e] = __bfloat162float(__float2bfloat16_rn(__fmul_rn(ts_q35_silu(gate), up)));
+                    }
+                    *(float2*)(y + (long long)c * ff + r / 16 * 8 + r % 16) = make_float2(out[0], out[1]);
+                }
+            }
+        return;
+    }
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            const int c = tokBase + i * 16 + h * 8;
+            if (c >= m)
+                continue;
+            const float xs = xScale[c];
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+            {
+                const int r = rowBase + j * 8;
+                if (r >= outDim)
+                    continue;
+                float v0 = acc[i][j][h * 2] * xs * ws[j][0], v1 = acc[i][j][h * 2 + 1] * xs * ws[j][1];
+                if constexpr (EPI == 1)
+                {
+                    v0 = __bfloat162float(__float2bfloat16_rn(v0));
+                    v1 = __bfloat162float(__float2bfloat16_rn(v1));
+                }
+                *(float2*)(y + (long long)c * outDim + r) = make_float2(v0, v1);
+            }
+        }
+#else
+    __trap();
+#endif
+}
+
+#define TS_Q35_GEMM_W8A8_TMA(NAME, BM, STAGES, EPI) \
+    extern "C" __global__ __launch_bounds__(256 + (BM == 256 ? 128 : 32), 1) void NAME( \
+        const __grid_constant__ TsQ35TmaMaps maps, int outDim, int k, const float* __restrict__ xScale, \
+        const uint16_t* __restrict__ wScale, int m, float* __restrict__ y) \
+    { ts_q35_gemm_w8a8_tma<BM, STAGES, EPI>(maps, outDim, k, xScale, wScale, m, y); }
+TS_Q35_GEMM_W8A8_TMA(ts_q35_gemm_w8a8_tma256_plain, 256, 4, 0)
+TS_Q35_GEMM_W8A8_TMA(ts_q35_gemm_w8a8_tma256_round, 256, 4, 1)
+TS_Q35_GEMM_W8A8_TMA(ts_q35_gemm_w8a8_tma256_swiglu_rin, 256, 4, 2)
+TS_Q35_GEMM_W8A8_TMA(ts_q35_gemm_w8a8_tma256_swiglu, 256, 4, 3)
+TS_Q35_GEMM_W8A8_TMA(ts_q35_gemm_w8a8_tma128_plain, 128, 4, 0)
+TS_Q35_GEMM_W8A8_TMA(ts_q35_gemm_w8a8_tma128_round, 128, 4, 1)
+TS_Q35_GEMM_W8A8_TMA(ts_q35_gemm_w8a8_tma128_swiglu_rin, 128, 4, 2)
+TS_Q35_GEMM_W8A8_TMA(ts_q35_gemm_w8a8_tma128_swiglu, 128, 4, 3)
+
+/// Dynamic shared memory of the W8A8 TMA GEMMs: [BM256 4-stage, BM128 4-stage].
+extern "C" __global__ void ts_q35_gemm_w8a8_tma_smem_bytes(int* out)
+{
+    out[0] = (int)sizeof(TsQ35Fp8TmaSmem<256, 4>);
+    out[1] = (int)sizeof(TsQ35Fp8TmaSmem<128, 4>);
+}

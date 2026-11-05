@@ -31,34 +31,38 @@ internal sealed class NinferQwen38DraftSource : IDisposable
             {
                 string p = $"dflash2/layers/{i}/";
                 layers[i] = new(Read(p + "input_norm"), Read(p + "attention/query_norm"), Read(p + "attention/key_norm"),
-                    Read(p + "post_attention_norm"), Read(p + "attention/conv_base"), Read(p + "mlp/conv_base"),
-                    Projection(p + "attention/query_key_value"), Projection(p + "attention/output"), Projection(p + "attention/conv_proj"),
-                    Projection(p + "mlp/gate_up"), Projection(p + "mlp/down"), Projection(p + "mlp/conv_proj"));
+                    Read(p + "post_attention_norm"), Read(p + "attention_conv/base_kernel"), Read(p + "mlp_conv/base_kernel"),
+                    Projection(p + "attention/query_key_value"), Projection(p + "attention/output"), Projection(p + "attention_conv/kernel_projection"),
+                    Projection(p + "mlp/gate_up", gateUp: true), Projection(p + "mlp/down"), Projection(p + "mlp_conv/kernel_projection"));
             }
             CudaNinferDraftShortlistDesc? shortlist = null;
             if (headPolicy == CudaNinferDraftHeadPolicy.OriginalQ4G64Shortlist)
             {
-                var head = plan.GetTensor("text/draft_head");
+                var head = plan.GetTensor("proposal/head");
                 ValidateShortlistScales(plan, head);
                 shortlist = new(new NinferTensorWeightSource(plan.Reader, head.Descriptor), checked((long)head.Descriptor.ByteLength),
-                    ReadShortlistTokenIds(plan, plan.GetTensor("text/draft_head_token_ids")));
+                    ReadShortlistTokenIds(plan, plan.GetTensor("proposal/token_ids")));
             }
             Descriptor = new(draftTokens, headPolicy, shortlist, Projection("dflash2/feature_projection"),
                 Read("dflash2/context_norm"), Read("dflash2/final_norm"), layers,
-                Projection("dflash2/selector/hidden"), Projection("dflash2/selector/predecessor"), Projection("dflash2/selector/successor"),
+                Projection("dflash2/candidate_selector/hidden_projection"), Projection("dflash2/candidate_selector/predecessor_codebook"),
+                Projection("dflash2/candidate_selector/successor_codebook"),
                 $"{NinferQwen38DraftPlan.BindingVersion}:{plan.DirectorySha256}:{CudaNinferDraftDesc.NumericalPolicy}:draft{draftTokens}:head{headPolicy}");
         }
         catch { Dispose(); throw; }
     }
 
     private float[] Read(string name) => ReadPlainParameter(_plan, _plan.GetTensor(name));
-    private CudaNinferProjectionDesc Projection(string name)
+    private CudaNinferProjectionDesc Projection(string name, bool gateUp = false)
     {
-        var binding = _plan.GetTensor(name);
-        var planes = new NinferNvfp4PlaneReader(_plan.Reader, binding.Descriptor, mapping: binding.ProjectionRowMapping);
-        var source = new NinferNvfp4WeightSource(planes); _sources.Add(source);
-        return new(source, 0, source.Bytes, source.Rows, source.Columns, CudaNinferProjectionFormat.NvFp4Planes,
-            inputScaleDivisor: 1, weightScaleDivisor: binding.Descriptor.WeightDivisor!.Value, allowA4: false);
+        var d = _plan.GetTensor(name).Descriptor;
+        int rows = checked((int)d.Shape[0]), columns = checked((int)d.Shape[1]);
+        if (d.Format == NinferTensorFormat.BFloat16)
+            return new(new NinferTensorWeightSource(_plan.Reader, d), 0, checked((long)d.ByteLength), rows, columns,
+                CudaNinferProjectionFormat.BFloat16, allowA4: false);
+        // q8_g32: gate|up interleaved by 8 rows so the SwiGLU projection holds a gate and its up value.
+        var planar = new NinferRowPlanarWeightSource(_plan.Reader, d, gateUp ? NinferRowPlanarWeightSource.GateUpRows8(rows) : null);
+        return new(planar, 0, planar.Bytes, rows, columns, CudaNinferProjectionFormat.W8G32, allowA4: false);
     }
 
     internal static float[] ReadPlainParameter(NinferQwen38DraftPlan plan, NinferQwen38DraftBinding binding)

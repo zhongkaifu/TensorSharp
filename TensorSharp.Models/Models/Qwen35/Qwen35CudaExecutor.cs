@@ -55,7 +55,7 @@ namespace TensorSharp.Models
                 if (arch != A)
                     throw new NotSupportedException($"[{Tag}] the direct-CUDA qwen35 engine runs {A}, not '{arch}'.");
                 _gguf.BeginStreaming();
-                _engine = CreateEngineWithCompanionHead(maxContext, nUbatch);
+                _engine = new Q35CudaEngine(BuildModelDesc(maxContext, nUbatch));
                 _gguf.EndLoad();
                 if (!string.IsNullOrWhiteSpace(draftGgufPath))
                     AttachDrafter(draftGgufPath);

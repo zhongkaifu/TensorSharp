@@ -4,9 +4,11 @@ using System;
 
 namespace TensorSharp.Cuda
 {
-    /// <summary>Storage and arithmetic of an original NInfer target projection.
-    /// This is independent of ggml types; no GGUF conversion or requantization occurs.</summary>
-    public enum CudaNinferProjectionFormat { NvFp4Planes, BFloat16, W8G32 }
+    /// <summary>Storage and arithmetic of an original NInfer projection.
+    /// This is independent of ggml types; no GGUF conversion or requantization occurs.
+    /// Fp8Row: E4M3 codes [rows][columns] then one BF16 scale per row (fp8_e4m3fn_row_bf16).
+    /// W8G32: INT8 codes [rows][columns] then one F16 scale per 32 values (q8_g32_fp16).</summary>
+    public enum CudaNinferProjectionFormat { NvFp4Planes, BFloat16, W8G32, Fp8Row }
 
     public sealed class CudaNinferProjectionDesc
     {
@@ -40,6 +42,7 @@ namespace TensorSharp.Cuda
                 CudaNinferProjectionFormat.NvFp4Planes when columns % 64 == 0 && rows % 128 == 0 => count / 2 + count / 16,
                 CudaNinferProjectionFormat.BFloat16 => checked(count * 2),
                 CudaNinferProjectionFormat.W8G32 when columns % 128 == 0 => count + count / 32 * 2,
+                CudaNinferProjectionFormat.Fp8Row when columns % 128 == 0 => count + (long)rows * 2,
                 _ => throw new NotSupportedException("Unsupported NInfer matrix storage geometry.")
             };
             if (bytes != expected) throw new ArgumentException("NInfer matrix byte count differs from its storage geometry.");
@@ -58,7 +61,8 @@ namespace TensorSharp.Cuda
     public sealed class CudaNinferModelDesc
     {
         public CudaNinferProjectionDesc Embedding;
-        public CudaW8HeadWeightDesc Output;
+        /// <summary>The FP8 row-scaled LM head [vocabulary][hidden], shared by the target and the drafter.</summary>
+        public CudaNinferProjectionDesc Head;
         public CudaNinferLayerDesc[] Layers;
         public string ModulePath;
         public string Provenance;

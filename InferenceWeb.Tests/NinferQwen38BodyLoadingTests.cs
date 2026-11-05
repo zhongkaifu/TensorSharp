@@ -159,53 +159,18 @@ public sealed class NinferQwen38BodyLoadingTests
 
     private sealed class TensorFixture : IDisposable
     {
-        internal string PathName { get; } = Path.GetTempFileName();
+        private readonly NinferV3File _file;
         internal NinferArtifactReader Reader { get; }
-        internal NinferTensorDescriptor Tensor => (NinferTensorDescriptor)Reader.GetObject("weights");
-        internal TensorFixture(string format, string layout, int rows, int columns, byte[] payload)
+        internal NinferTensorDescriptor Tensor => Reader.GetBinding("weights").Object;
+        internal TensorFixture(string format, int rows, int columns, byte[] payload)
         {
-            byte[] directory = JsonSerializer.SerializeToUtf8Bytes(new
-            {
-                identity = new { model_id = "test", weights_id = "test" },
-                objects = new[] { new { name = "weights", kind = "tensor", shape = new[] { rows, columns }, format, layout, offset = 0, bytes = payload.Length } }
-            });
-            using (var file = File.Create(PathName))
-            {
-                file.Write("NINFER\0\x02"u8); Span<byte> n = stackalloc byte[8]; BinaryPrimitives.WriteUInt64LittleEndian(n, (ulong)directory.Length);
-                file.Write(n); file.Write(directory); file.Position = (16L + directory.Length + 4095) / 4096 * 4096;
-                file.Write(payload); file.Write(new byte[] { 0x55, 0x66 }); // Not part of the tensor.
-            }
-            Reader = new NinferArtifactReader(PathName);
+            var b = new NinferV3Builder();
+            b.Bind("weights", b.TensorBytes(format, new[] { (ulong)rows, (ulong)columns }, payload));
+            b.Resource("text", "unrelated", new byte[] { 0x55, 0x66 }); // Not part of the tensor.
+            _file = b.Write();
+            Reader = new NinferArtifactReader(_file.Path);
         }
-        public void Dispose() { Reader.Dispose(); File.Delete(PathName); }
-    }
-
-    [Fact]
-    public void BfloatAttentionStreamPermutesAllRowsAndSupportsUnalignedCrossRowReads()
-    {
-        const int rows = 14336, columns = 2;
-        var original = new byte[rows * columns * 2];
-        for (int r = 0; r < rows; r++)
-            for (int k = 0; k < columns; k++) BinaryPrimitives.WriteUInt16LittleEndian(original.AsSpan(r * 4 + k * 2, 2), (ushort)(r * 2 + k));
-        using var fixture = new TensorFixture("BF16", "contiguous-le-v1", rows, columns, original);
-        var source = new NinferTensorWeightSource(fixture.Reader, fixture.Tensor, attentionPermutation: true);
-        var expected = new byte[original.Length];
-        // Independent source-to-destination traversal, including every Q, K, gate and V row.
-        for (int s = 0; s < rows; s++)
-        {
-            int destination = s < 6144 ? s / 256 * 512 + s % 256 : s < 7168 ? 12288 + s - 6144
-                : s < 13312 ? (s - 7168) / 256 * 512 + 256 + (s - 7168) % 256 : s;
-            original.AsSpan(s * 4, 4).CopyTo(expected.AsSpan(destination * 4, 4));
-        }
-        long before = fixture.Reader.ReadOperations;
-        Assert.Equal(expected, Read(source, 0, original.Length));
-        Assert.InRange(fixture.Reader.ReadOperations - before, 1, 64); // A bounded set of runs, not one file call per row.
-        Assert.Equal(expected.AsSpan(1023, 4099).ToArray(), Read(source, 1023, 4099));
-        Assert.Equal(expected.AsSpan(256 * 4 - 7, 31).ToArray(), Read(source, 256 * 4 - 7, 31));
-        Assert.Equal(expected.AsSpan(12288 * 4 - 11, 39).ToArray(), Read(source, 12288 * 4 - 11, 39));
-        Assert.Equal(expected.AsSpan(13312 * 4 - 9, 43).ToArray(), Read(source, 13312 * 4 - 9, 43));
-        Assert.Throws<ArgumentOutOfRangeException>(() => Read(source, original.Length - 1, 2));
-        Assert.Throws<ArgumentException>(() => source.Read(0, IntPtr.Zero, 1));
+        public void Dispose() { Reader.Dispose(); _file.Dispose(); }
     }
 
     [Fact]
@@ -216,7 +181,7 @@ public sealed class NinferQwen38BodyLoadingTests
         for (int i = 0; i < codeBytes; i++) encoded[i] = (byte)i;
         for (int i = 0; i < scaleBytes; i++) encoded[codeBytes + i] = (byte)(i % 127);
         BinaryPrimitives.WriteUInt32LittleEndian(encoded.AsSpan(codeBytes + scaleBytes), 0x40200000);
-        using var fixture = new TensorFixture("NVFP4", "blockscale-k16-m128x4-v1", rows, columns, encoded);
+        using var fixture = new TensorFixture("nvfp4", rows, columns, encoded);
         using var source = new NinferNvfp4WeightSource(new NinferNvfp4PlaneReader(fixture.Reader, fixture.Tensor));
         using var independentTileReader = new NinferNvfp4PlaneReader(fixture.Reader, fixture.Tensor);
         var tile = independentTileReader.ReadTile(0);

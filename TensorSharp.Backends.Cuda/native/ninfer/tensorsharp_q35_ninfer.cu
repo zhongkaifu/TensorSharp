@@ -33,18 +33,10 @@ extern "C" __global__ void ts_ni_f32_bf16(const float* x,__nv_bfloat16* y,long l
     long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
     if(i<count) y[i]=__float2bfloat16_rn(x[i]);
 }
-extern "C" __global__ void ts_ni_embed_w8(const int8_t* codes,const __half* scales,
-    const int* ids,float* out,int width,int vocab) {
-    int row=blockIdx.x,id=ids[row];
-    if(id<0||id>=vocab) { asm("trap;"); return; }
-    for(int i=threadIdx.x;i<width;i+=blockDim.x)
-        out[(long long)row*width+i]=ts_ni_bf((float)codes[(long long)id*width+i]*
-            __half2float(scales[(long long)id*(width/32)+i/32]));
-}
 // effectiveWeight contains F32(stored BF16 + 1), or plain GDN weights.
 // x and y may not alias: x receives the rounded residual and y its rounded norm.
-extern "C" __global__ void ts_ni_add_norm(float* x,const float* delta,const float* weight,
-    float* y,int width,float eps) {
+extern "C" __global__ void ts_ni_add_norm(float* __restrict__ x,const float* __restrict__ delta,const float* __restrict__ weight,
+    float* __restrict__ y,int width,float eps) {
     int row=blockIdx.x,lane=threadIdx.x&31,warp=threadIdx.x>>5;
     float ss=0;
     for(int i=threadIdx.x;i<width;i+=blockDim.x) {
@@ -64,12 +56,44 @@ extern "C" __global__ void ts_ni_add_norm(float* x,const float* delta,const floa
         long long j=(long long)row*width+i; y[j]=ts_ni_bf(x[j]*inv*weight[i]);
     }
 }
+// ts_ni_add_norm for width 256 * PER with the row held in registers: the same strided values per
+// thread, the same sequential sum, reductions and expressions, so the output is bit-identical,
+// but every load is issued up front instead of one dependent round trip per iteration (decode
+// runs this 129 times a token). blockDim 256.
+template<int PER>
+__device__ __forceinline__ void ts_ni_add_norm_regs(float* __restrict__ x,const float* __restrict__ delta,
+    const float* __restrict__ weight,float* __restrict__ y,int width,float eps) {
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    const long long base=(long long)blockIdx.x*width;
+    float v[PER];
+#pragma unroll
+    for(int p=0;p<PER;++p) { const long long j=base+threadIdx.x+p*256; v[p]=x[j]+(delta?delta[j]:0.0f); }
+    float ss=0;
+#pragma unroll
+    for(int p=0;p<PER;++p) { v[p]=ts_ni_bf(v[p]); x[base+threadIdx.x+p*256]=v[p]; ss+=v[p]*v[p]; }
+    ss=ts_ni_sum(ss);
+    __shared__ float partial[32], inv;
+    if(!lane) partial[warp]=ss;
+    __syncthreads();
+    if(!warp) {
+        ss=lane<(blockDim.x>>5)?partial[lane]:0; ss=ts_ni_sum(ss);
+        if(!lane) inv=rsqrtf(ss/(float)width+eps);
+    }
+    __syncthreads();
+#pragma unroll
+    for(int p=0;p<PER;++p) { const int i=threadIdx.x+p*256; y[base+i]=ts_ni_bf(v[p]*inv*weight[i]); }
+}
+extern "C" __global__ void __launch_bounds__(256) ts_ni_add_norm_5120(float* __restrict__ x,const float* __restrict__ delta,
+    const float* __restrict__ weight,float* __restrict__ y,int width,float eps) {
+    ts_ni_add_norm_regs<20>(x,delta,weight,y,width,eps);
+}
 // ts_ni_add_norm and ts_ni_quant_nvfp4 of its output in one pass, same arithmetic:
 // the identical per-thread sum, reductions and BF16 norm, then each half-warp quantizes
 // the 16 consecutive values its lanes just produced (blockDim 256 and width % 256 == 0,
 // so a group never straddles an iteration and every lane of a warp takes part).
-extern "C" __global__ void __launch_bounds__(256) ts_ni_add_norm_quant(float* x,const float* delta,
-    const float* weight,float* y,int width,float eps,uint8_t* codes,uint8_t* scales,float* rowScale,float inputD) {
+extern "C" __global__ void __launch_bounds__(256) ts_ni_add_norm_quant(float* __restrict__ x,const float* __restrict__ delta,
+    const float* __restrict__ weight,float* __restrict__ y,int width,float eps,uint8_t* __restrict__ codes,uint8_t* __restrict__ scales,
+    float* __restrict__ rowScale,float inputD) {
     int row=blockIdx.x,lane=threadIdx.x&31,warp=threadIdx.x>>5;
     float ss=0;
     for(int i=threadIdx.x;i<width;i+=blockDim.x) {
@@ -108,8 +132,8 @@ extern "C" __global__ void __launch_bounds__(256) ts_ni_add_norm_quant(float* x,
 }
 // One warp owns two independent K16 groups. Each half-warp handles a group;
 // paired lanes write TS's low8/high8 nibble convention, without requantizing weights.
-extern "C" __global__ void ts_ni_quant_nvfp4(const float* x,uint8_t* codes,uint8_t* scales,
-    float* rowScale,int k,int rows,float inputD) {
+extern "C" __global__ void ts_ni_quant_nvfp4(const float* __restrict__ x,uint8_t* __restrict__ codes,uint8_t* __restrict__ scales,
+    float* __restrict__ rowScale,int k,int rows,float inputD) {
     long long group=((long long)blockIdx.x*blockDim.x+threadIdx.x)/16;
     int lane=threadIdx.x&15,groups=k/16;
     if(group>=(long long)rows*groups) return;
@@ -131,13 +155,97 @@ extern "C" __global__ void ts_ni_quant_nvfp4(const float* x,uint8_t* codes,uint8
     }
     if(lane==0) { scales[group]=s; if(g==0) rowScale[row]=1.0f; }
 }
-extern "C" __global__ void ts_ni_swiglu(const float* packed,float* out,int ff) {
+extern "C" __global__ void ts_ni_swiglu(const float* __restrict__ packed,float* __restrict__ out,int ff) {
     int i=blockIdx.x*blockDim.x+threadIdx.x,row=blockIdx.y;
     if(i>=ff) return;
     int gate=(i/8)*16+i%8;
     out[(long long)row*ff+i]=ts_ni_bf(ts_ni_silu(packed[(long long)row*2*ff+gate])*
         packed[(long long)row*2*ff+gate+8]);
 }
+// T = 1 NVFP4 A16 on the CUDA cores, NInfer's nvfp4_a16_gemv structure (Neroued/ninfer 1882c6ad,
+// src/ops/linear/kernels/nvfp4/nvfp4_a16_gemv.cuh, Apache-2.0; independent implementation) over
+// TS planes (codes [n][k/2], byte j of a 16-value group = K j low nibble, K j+8 high nibble;
+// E4M3 scales [n][k/16]). 8 warps x RPW rows; a lane streams 32 values of each row a phase
+// (16 code bytes, 2 scale bytes) with loads that bypass L1, so the F32 activations stay
+// L1-resident. Weight = code * (scale * inverseD), as the A16 route, F32 FMA into 4 chains.
+// The E2M1 pair is placed straight into F16 bits (e1 e0 m at bits 11..9, sign at 15), which is
+// the code times 2^-14 exactly (e = 0 is the F16 subnormal m * 2^-15); the 2^14 is folded into
+// the coefficient, so each weight equals code * coefficient. SWIGLU: rows are gate|up
+// interleaved by 8 (ts_ni_swiglu), y = BF16(silu(gate) * up); otherwise y = the F32 sum.
+__device__ __forceinline__ float2 ts_ni_e2m1x2_scaled(uint32_t b) {
+    const uint32_t bits=((b&0x7u)<<9)|((b&0x8u)<<12)|((b&0x70u)<<21)|((b&0x80u)<<24);
+    return __half22float2(*reinterpret_cast<const __half2*>(&bits));
+}
+template<int K,int RPW,bool SWIGLU>
+__device__ __forceinline__ void ts_ni_gemv_nvfp4(const uint8_t* __restrict__ codes,const uint8_t* __restrict__ scales,
+    const float* __restrict__ x,float* __restrict__ y,float inverseD) {
+    static_assert(K%1024==0,"32 values per lane per phase");
+    static_assert(!SWIGLU||RPW%2==0,"gate/up pairs");
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    int rows[RPW];
+    if constexpr(SWIGLU) {
+#pragma unroll
+        for(int p=0;p<RPW/2;++p) {
+            const int o=(blockIdx.x*8+warp)*(RPW/2)+p;
+            rows[p]=(o>>3)*16+(o&7); rows[p+RPW/2]=rows[p]+8;
+        }
+    } else {
+#pragma unroll
+        for(int r=0;r<RPW;++r) rows[r]=(blockIdx.x*8+warp)*RPW+r;
+    }
+    const float inv=inverseD*16384.0f;
+    float acc[RPW][4];
+#pragma unroll
+    for(int r=0;r<RPW;++r) acc[r][0]=acc[r][1]=acc[r][2]=acc[r][3]=0.0f;
+#pragma unroll 2
+    for(int ph=0;ph<K/1024;++ph) {
+        const int v0=ph*1024+lane*32;
+        uint32_t c[RPW][4]; uint32_t sw[RPW];
+#pragma unroll
+        for(int r=0;r<RPW;++r) {
+            asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                : "=r"(c[r][0]),"=r"(c[r][1]),"=r"(c[r][2]),"=r"(c[r][3]) : "l"(codes+(long long)rows[r]*(K/2)+v0/2));
+            sw[r]=__ldg(reinterpret_cast<const unsigned short*>(scales+(long long)rows[r]*(K/16)+v0/16));
+        }
+        float xv[32];
+#pragma unroll
+        for(int i=0;i<8;++i) {
+            const float4 f=__ldg(reinterpret_cast<const float4*>(x+v0)+i);
+            xv[4*i]=f.x; xv[4*i+1]=f.y; xv[4*i+2]=f.z; xv[4*i+3]=f.w;
+        }
+#pragma unroll
+        for(int r=0;r<RPW;++r) {
+#pragma unroll
+            for(int g=0;g<2;++g) {
+                const float coef=ts_ni_fp8((uint8_t)(sw[r]>>(8*g)))*inv;
+#pragma unroll
+                for(int j=0;j<8;++j) {
+                    const float2 d=ts_ni_e2m1x2_scaled((c[r][2*g+(j>>2)]>>((j&3)*8))&0xffu);
+                    acc[r][(j&1)*2]=fmaf(d.x*coef,xv[g*16+j],acc[r][(j&1)*2]);
+                    acc[r][(j&1)*2+1]=fmaf(d.y*coef,xv[g*16+j+8],acc[r][(j&1)*2+1]);
+                }
+            }
+        }
+    }
+    float total[RPW];
+#pragma unroll
+    for(int r=0;r<RPW;++r) total[r]=ts_ni_sum((acc[r][0]+acc[r][1])+(acc[r][2]+acc[r][3]));
+    if(lane) return;
+    if constexpr(SWIGLU) {
+#pragma unroll
+        for(int p=0;p<RPW/2;++p) y[(blockIdx.x*8+warp)*(RPW/2)+p]=ts_ni_bf(ts_ni_silu(total[p])*total[p+RPW/2]);
+    } else {
+#pragma unroll
+        for(int r=0;r<RPW;++r) y[rows[r]]=total[r];
+    }
+}
+#define TS_NI_GEMV_NVFP4(NAME,K,RPW,SWIGLU) \
+    extern "C" __global__ void __launch_bounds__(256,2) NAME(const uint8_t* __restrict__ codes,const uint8_t* __restrict__ scales, \
+        const float* __restrict__ x,float* __restrict__ y,float inverseD) { ts_ni_gemv_nvfp4<K,RPW,SWIGLU>(codes,scales,x,y,inverseD); }
+TS_NI_GEMV_NVFP4(ts_ni_gemv_nvfp4_k5120,5120,2,false)
+TS_NI_GEMV_NVFP4(ts_ni_gemv_nvfp4_k5120_swiglu,5120,2,true)
+TS_NI_GEMV_NVFP4(ts_ni_gemv_nvfp4_k6144,6144,2,false)
+TS_NI_GEMV_NVFP4(ts_ni_gemv_nvfp4_k17408,17408,2,false)
 // A16 route: weights are decoded to F32 with the source's scale*inverseD
 // coefficient before the dot; no activation quantization or BF16 weight rounding.
 // Four output rows per CTA; one warp computes each dot in 16-value groups.
@@ -160,8 +268,8 @@ extern "C" __global__ void ts_ni_project_a16(const uint8_t* codes,const uint8_t*
     sum=ts_ni_sum(sum);
     if(!lane) output[(long long)t*outputStride+r]=sum;
 }
-extern "C" __global__ void ts_ni_gdn_conv(const float* packed,int packedWidth,int rowsPerSeq,
-    int convDim,int dConv,const float* weights,float* const* states,float* qkv,float* raw,const int* count) {
+extern "C" __global__ void ts_ni_gdn_conv(const float* __restrict__ packed,int packedWidth,int rowsPerSeq,
+    int convDim,int dConv,const float* __restrict__ weights,float* const* states,float* __restrict__ qkv,float* __restrict__ raw,const int* count) {
     int ch=blockIdx.x*blockDim.x+threadIdx.x,t=blockIdx.y,seq=blockIdx.z;
     if(ch>=convDim) return;
     long long row=(long long)seq*rowsPerSeq+t;
@@ -276,8 +384,8 @@ extern "C" __global__ __launch_bounds__(128) void ts_ni_gdn_replay(const float* 
     ts_ni_scan<false,true>(qkv+layer*qkvStride,convDim,hk,hv,rowsPerSeq,kept[blockIdx.y],
         g+layer*gStride,beta+layer*gStride,state,nullptr,blockIdx.z%8);
 }
-extern "C" __global__ void ts_ni_gdn_out(const float* o,const float* packed,int packedWidth,
-    int convDim,int rows,int hv,const float* norm,float eps,float* y) {
+extern "C" __global__ void ts_ni_gdn_out(const float* __restrict__ o,const float* __restrict__ packed,int packedWidth,
+    int convDim,int rows,int hv,const float* __restrict__ norm,float eps,float* __restrict__ y) {
     long long warp=((long long)blockIdx.x*blockDim.x+threadIdx.x)>>5;
     int lane=threadIdx.x&31;
     if(warp>=(long long)rows*hv)return;

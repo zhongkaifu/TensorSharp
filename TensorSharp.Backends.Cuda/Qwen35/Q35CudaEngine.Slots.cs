@@ -37,7 +37,12 @@ namespace TensorSharp.Cuda
         public Func<bool> ReclaimMemory { get; set; }
 
         /// <summary>Bytes of one token's K (or V) rows in one attention layer.</summary>
-        private long KvRowBytes => (long)_m.NKvHead * (_m.Ninfer == null ? Q35Kernels.Q8Row : Q35Kernels.AttnHeadDim * 2);
+        private long KvRowBytes => (long)_m.NKvHead * (_m.Ninfer == null ? Q35Kernels.Q8Row
+            : _ninferKvFp8 ? NinferFp8KvRowBytes : Q35Kernels.AttnHeadDim * 2);
+        /// <summary>NInfer FP8 KV row: 256 E4M3 codes and two F32 group-128 scales, padded to 16 bytes.</summary>
+        internal const int NinferFp8KvRowBytes = 272;
+        // TS_Q35_NINFER_KV=fp8 selects the FP8 KV rows for an NInfer target (the default stays BF16).
+        private readonly bool _ninferKvFp8 = CudaNinferAttention.ResolveKvFp8(Environment.GetEnvironmentVariable(CudaNinferAttention.KvEnvironment));
         /// <summary>Bytes of one layer's K (or V) rows in a block.</summary>
         private long KvLayerBytes => (long)Q35Kernels.KvBlockTokens * KvRowBytes;
         private long KvBlockBytes => 2L * Math.Max(1, _nAttn) * KvLayerBytes;

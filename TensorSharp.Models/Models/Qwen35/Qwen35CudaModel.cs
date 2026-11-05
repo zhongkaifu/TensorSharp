@@ -213,8 +213,8 @@ namespace TensorSharp.Models
         /// its rows enter the engine's forward as embedding overrides copied device to device.</summary>
         public void LoadVisionEncoder(string mmProjPath)
         {
-            if (_ninferCacheIdentity != null)
-                throw new NotSupportedException("The complete NInfer route currently implements the target text body; NInfer vision preprocessing/tower inference is not implemented.");
+            // The NInfer route takes the same Qwen3.8 vision tower from the mmproj GGUF; its rows
+            // replace the image placeholders' FP8 embeddings like on the GGUF route.
             _visionAllocator ??= new TensorSharp.Cuda.CudaAllocator(0);
             _vision = new Qwen35VisionEncoder(mmProjPath, _visionAllocator);
             _vision.SetHostModel(this);

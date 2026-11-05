@@ -64,7 +64,6 @@ namespace TensorSharp.Cuda
             public CudaWeightDesc TokEmbd, Output;
             public CudaNinferModelDesc Ninfer;
             /// <summary>Explicit experimental companion output head; null retains the original Q6 path.</summary>
-            public CudaW8HeadWeightDesc OutputW8;
             public float[] OutputNorm;
             public LayerDesc[] Layers;
         }
@@ -236,7 +235,6 @@ namespace TensorSharp.Cuda
         public Q35CudaEngine(ModelDesc m)
         {
             _m = m ?? throw new ArgumentNullException(nameof(m));
-            _outputW8 = m.Ninfer?.Output ?? m.OutputW8;
             ValidateNinferModel(m);
             PreflightNinferFlashInfer();
             if (m.HeadDim != Q35Kernels.AttnHeadDim)
@@ -252,7 +250,6 @@ namespace TensorSharp.Cuda
             try
             {
                 ValidateVerifyDecodeQ81Graphs(_verifyDecodeQ81 || _projectionTrace, _verifyGraphsEnabled, _draftGraphsEnabled);
-                ValidateOutputW8Model(m, _outputW8, _verifyGraphsEnabled, _draftGraphsEnabled);
                 CudaBackend.Register();
                 CudaDriverApi.cuInit(0);
                 _alloc = new CudaAllocator(0);
@@ -260,7 +257,6 @@ namespace TensorSharp.Cuda
                 _k = Q35Kernels.Create(identifyImage: m.Ninfer != null);
                 CudaDriverApi.cuDeviceGetAttribute(out _sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, 0).ThrowOnError();
 
-                InitializeOutputW8Module();
                 InitializeNinferModules();
                 var sw = Stopwatch.StartNew();
                 _layers = new Layer[m.NLayer];
@@ -273,18 +269,17 @@ namespace TensorSharp.Cuda
                     }
                     if (m.Ninfer == null)
                         _tokEmbd = loader.Raw(m.TokEmbd, TQ4_0, out _tokEmbdRowBytes);
-                    else if (!TryLoadNinferHostEmbedding())
-                        _tokEmbd = LoadNinferMatrix(loader, m.Ninfer.Embedding).Data;
-                    if (!OutputW8TargetEnabled)
+                    else
+                        _tokEmbd = LoadNinferEmbedding(loader, m.Ninfer.Embedding);
+                    if (m.Ninfer != null)
+                        _ninferHead = LoadNinferMatrix(loader, m.Ninfer.Head);
+                    else
                         _output = loader.Raw(m.Output, TQ6_K, out _outputRowBytes);
-                    if (_outputW8 != null)
-                        _outputW8Weights = loader.W8(_outputW8, out _outputW8PayloadSha);
                 }
                 CompleteNinferLoadRepack();
                 CompleteNinferFlashInferLoad();
                 _outputNorm = UploadF32(m.OutputNorm);
                 AllocateScratch();
-                AllocateOutputW8Scratch();
                 SetFeatureTaps(null);
                 _active = CreateSlot(InitialSlotTokens);
                 Console.Error.WriteLine($"[q35-cuda] weights loaded in {sw.Elapsed.TotalSeconds:F1}s, {_sms} SMs, n_ctx={m.NCtx}, ubatch={m.NUbatch}");
@@ -400,25 +395,6 @@ namespace TensorSharp.Cuda
                     row += w.Ne1;
                 }
                 return p;
-            }
-
-            public IntPtr W8(CudaW8HeadWeightDesc head, out string payloadSha)
-            {
-                IntPtr dst = _e.Alloc(head.Bytes);
-                using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
-                for (long off = 0; off < head.Bytes; off += StagingBytes)
-                {
-                    int bytes = checked((int)Math.Min(StagingBytes, head.Bytes - off));
-                    head.Source.Read(checked(head.SourceOffset + off), _host, bytes);
-                    var data = new ReadOnlySpan<byte>((void*)_host, bytes);
-                    ValidateOutputW8Scales(data, off);
-                    hash.AppendData(data);
-                    CudaDriverApi.cuMemcpyHtoD(dst + (nint)off, _host, new UIntPtr((uint)bytes)).ThrowOnError();
-                }
-                payloadSha = Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
-                if (head.ExpectedPayloadSha256 != null && head.ExpectedPayloadSha256 != payloadSha)
-                    throw new InvalidOperationException("The loaded W8 output-head payload SHA differs from its explicit expected identity.");
-                return dst;
             }
 
             public IntPtr Raw(in CudaWeightDesc w, int type, out long rowBytes)
@@ -542,7 +518,9 @@ namespace TensorSharp.Cuda
             _partial = Alloc(8L * 64 * widest * 4);
             _counters = Alloc(1L << 20);
             CudaDriverApi.cuMemsetD8(_counters, 0, new UIntPtr(1u << 20)).ThrowOnError();
-            _attnPartial = Alloc(Q35Kernels.AttnSplitFloats(MaxVerifyRows, _m.NHead) * 4);
+            // The q8_0 split kernel (GGUF route) takes up to 160 splits, the NInfer pipelined kernel 64.
+            _attnPartial = Alloc(Q35Kernels.AttnSplitFloats(MaxVerifyRows, _m.NHead,
+                _m.Ninfer == null ? Q35Kernels.AttnMaxSplits : Q35Kernels.AttnMaxSplitCount) * 4);
             _logits = Alloc((long)MaxVerifyRows * _m.NVocab * 4);
             _argmax = Alloc(MaxVerifyRows * 4);
             _lastX = Alloc((long)MaxSeqs * e * 4);
@@ -680,7 +658,7 @@ namespace TensorSharp.Cuda
                 true, false, _embedSpans != null, _featureCount != 0, _d != null);
             RunRows(slots, window, tokens, 0, null, n, verify: true, tapFirst: 0, passMode: pass);
             _verifyRow0 = 0;
-            if (pass == NinferLayerPass.FusedResidualNorm)
+            if (pass == NinferLayerPass.FusedResidualNorm && _ninferFinalResidualState == NinferResidualState.FusedCanonical)
                 _k.PlainNinferNorm(_x, _outputNorm, _xn, n, _m.NEmbd, _m.Eps, Stream);
             else
                 FinalNorm(_x, _block, _outputNorm, _xn, n, _m.NEmbd, _m.Eps, Stream);
@@ -882,8 +860,8 @@ namespace TensorSharp.Cuda
 
             if (_m.Ninfer == null)
                 _k.EmbedQ4_0(_tokEmbd, _tokEmbdRowBytes, _tokensDev, _x, n, e, Stream);
-            else if (!TryHostNinferEmbedding(n))
-                _ninfer.EmbedW8(_tokEmbd, _tokensDev, _x, n, e, _m.NVocab, Stream);
+            else
+                _k.EmbedFp8(_tokEmbd, _tokEmbd + (nint)((long)_m.NVocab * e), _tokensDev, _x, n, e, _m.NVocab, Stream);
             if (_embedSpans != null)
             {
                 // Embedding overrides belong to the first group (a forward's prompt chunk).
@@ -1078,13 +1056,13 @@ namespace TensorSharp.Cuda
         private void Head(IntPtr normed, int rows, float[] logitsOut, int[] argmaxOut)
         {
             int e = _m.NEmbd;
-            if (!OutputW8TargetEnabled)
+            if (_ninferHead != null)
+                ProjectNinferFp8(_ninferHead, normed, _logits, rows, Q35Kernels.Fp8Epilogue.Round, isVerify: true);
+            else
             {
                 _k.QuantizeQ81(normed, _q8, _q8d, e, rows, Stream);
                 _k.GemvQ6k(_output, _outputRowBytes, _m.NVocab, e, _q8, _q8d, _logits, rows, Stream);
             }
-            else
-                OutputW8Head(normed, rows, _logits, checked((long)MaxVerifyRows * _m.NVocab * 4));
             if (argmaxOut != null)
                 _k.Argmax(_logits, rows, _m.NVocab, _argmax, Stream);
             Sync();
@@ -1173,7 +1151,6 @@ namespace TensorSharp.Cuda
                 ReleaseFreeBlocks();
                 ReleaseFreeArenas();
                 FreeHostPool();
-                DisposeNinferHostEmbedding();
                 foreach (IntPtr p in _owned)
                     CudaDriverApi.cuMemFree(p);
                 _owned.Clear();
@@ -1184,13 +1161,11 @@ namespace TensorSharp.Cuda
                 DisposeNinferA16Candidate();
                 DisposeNinferExactVerify();
                 DisposeNinferFlashInfer();
-                DisposeNinferBf16Mma();
                 DisposeNinferGdnChunk();
                 DisposeNinferDraft();
                 _ninfer?.Dispose();
                 _ninferAttention?.Dispose();
-                _outputW8Module?.Dispose();
-                _outputW8Module = null;
+                FreeNinferHostEmbedding();
                 _k?.Dispose();
                 _alloc?.Dispose();
             }

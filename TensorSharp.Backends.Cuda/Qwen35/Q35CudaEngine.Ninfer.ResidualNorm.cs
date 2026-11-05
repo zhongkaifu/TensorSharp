@@ -26,7 +26,7 @@ public sealed unsafe partial class Q35CudaEngine
     private string NinferResidualNormNamespaceSuffix => _ninferResidualNormSuffix;
 
     internal static bool PlanNinferResidualNorm(bool ninfer, bool qualified, int sms, int context,
-        int maximumRows, bool verification, bool graphs, bool gemm8, bool splitK, bool targetW8,
+        int maximumRows, bool verification, bool graphs, bool gemm8, bool splitK,
         bool flashInfer, bool exactVerify, string option, bool allDowns = true)
     {
         if (!ninfer) return false;
@@ -34,10 +34,10 @@ public sealed unsafe partial class Q35CudaEngine
         // Configured context does not enter this fixed T8 projection/norm math.
         // Attention independently keeps its actual-visible 40960-key cap and fallback.
         bool supported = qualified && sms == 170 && (context is 40960 or 65536 or 131072 or 262144) && maximumRows >= 8
-            && verification && graphs && gemm8 && splitK && targetW8 && !flashInfer && !exactVerify && allDowns;
+            && verification && graphs && gemm8 && splitK && !flashInfer && !exactVerify && allDowns;
         if (option == "1" && !supported)
             throw new NotSupportedException(NinferResidualNormEnvironment
-                + "=1 requires the qualified context40960 or context65536/170-SM target, W8, Verify8 GEMM/split-K and decode graphs, original NVFP4 Down projections, without projection overrides.");
+                + "=1 requires the qualified context40960 or context65536/170-SM target, Verify8 GEMM/split-K and decode graphs, and at least one NVFP4 Down projection, without projection overrides.");
         return requested && supported;
     }
 
@@ -79,13 +79,14 @@ public sealed unsafe partial class Q35CudaEngine
         // This immutable constructor-time check guarantees the final Down can
         // complete the fused pass. An automatic selector never changes policy
         // after work/graph capture, including when an older image lacks entries.
-        bool allDowns = true;
+        // Per-matrix: an FP8 Down keeps the legacy delta and the next norm adds it.
+        bool allDowns = false;
         foreach (var layer in _m.Ninfer.Layers)
-            if (!NinferResidualMatrixEligible(layer.Down.Format, layer.Down.AllowA4, 8, layer.Down.Rows, layer.Down.Columns))
-                allDowns = false;
+            if (NinferResidualMatrixEligible(layer.Down.Format, layer.Down.AllowA4, 8, layer.Down.Rows, layer.Down.Columns))
+                allDowns = true;
         bool requested = PlanNinferResidualNorm(true, _ninferQualifiedDefaults?.Qualified == true,
             _sms, _m.NCtx, _m.NUbatch, _ninferVerificationEnabled, _ninferDecodeGraphsEnabled,
-            NinferVerify8GemmEnabled, Q35Kernels.NinferResidualNormSplitKEnabled, OutputW8TargetEnabled,
+            NinferVerify8GemmEnabled, Q35Kernels.NinferResidualNormSplitKEnabled,
             NinferFlashInferEnabled, NinferExactVerifyEnabled, option, allDowns);
         NinferResidualNormSelection = option == "0" ? "disabled" : requested ? "asset-missing" : "unsupported-profile";
         if (requested && _k.ConfigureNinferResidualNorm(option == "1"))
@@ -114,10 +115,10 @@ public sealed unsafe partial class Q35CudaEngine
     }
 
     private NinferResidualState ProjectNinferResidual(NinferMatrix matrix, IntPtr input, int rows,
-        bool isVerify, bool candidatePass, bool bf16Mma = false)
+        bool isVerify, bool candidatePass)
     {
         bool fused = TryNinferFusedResidualProjection(matrix, input, _block, rows, candidatePass);
-        if (!fused) NinferProject(matrix, input, _block, rows, round: false, isVerify: isVerify, bf16Mma: bf16Mma);
+        if (!fused) NinferProject(matrix, input, _block, rows, round: false, isVerify: isVerify);
         return NinferProjectedResidualState(fused);
     }
 

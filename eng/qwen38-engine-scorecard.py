@@ -7,8 +7,9 @@
 CAMPAIGN_DIR holds one directory per engine and context tier, as written by the campaign
 driver: <engine>-64k/{main,long}.jsonl, <engine>-128k/long128.jsonl, longdecode.jsonl
 (one JSON line per long-context decode probe), ready.txt (load_s=...), vram.txt.
-<engine>-64k for a vision-only companion deployment (tensorsharp-gguf) contributes its
-image cases to the base engine. <engine>-nospec holds the same engine with speculative
+TensorSharp is scored as two deployments: tensorsharp (the NInfer .ninfer artifact on the
+native CUDA engine, text only) and tensorsharp-gguf (the GGUF + mmproj model on the same
+engine). <engine>-nospec holds the same engine with speculative
 decoding off (long_generation only): it feeds the speculative-decoding section and is
 never scored. Outputs: summary.json, report_en.html, report_zh.html, poster_en.html,
 poster_zh.html. Nothing is started; only recorded evidence is read.
@@ -32,9 +33,9 @@ import math
 import statistics
 from pathlib import Path
 
-ENGINE_NAMES = {"tensorsharp": "TensorSharp", "ignis": "Ignis", "ninfer": "NInfer", "velox": "velox-inferer",
-                "llamacpp": "llama.cpp", "vllm": "vLLM", "sglang": "SGLang"}
-COMPANIONS = {"tensorsharp-gguf": "tensorsharp"}
+ENGINE_NAMES = {"tensorsharp": "TensorSharp-NInfer", "tensorsharp-gguf": "TensorSharp-GGUF", "ignis": "Ignis",
+                "ninfer": "NInfer", "velox": "velox-inferer", "llamacpp": "llama.cpp", "vllm": "vLLM", "sglang": "SGLang"}
+TS_ENGINES = ("tensorsharp", "tensorsharp-gguf")
 
 # (id, en, zh, weight, quality scenarios, perf metrics [(metric id, higher_is_better)])
 CATEGORIES = [
@@ -104,7 +105,7 @@ def collect(campaign: Path):
         name, _, tier = d.name.rpartition("-")
         if not name:
             continue
-        base = COMPANIONS.get(name, name)
+        base = name
         if base not in ENGINE_NAMES:
             continue
         e = engines.setdefault(base, {"cases": [], "probes": [], "meta": {}, "companion": [], "nospec": []})
@@ -112,14 +113,6 @@ def collect(campaign: Path):
         if tier == "nospec":
             e["nospec"].extend(cases)
             continue
-        if name in COMPANIONS:
-            # A companion deployment contributes only what the base deployment could not serve.
-            e["companion"].append({"name": name, "tier": tier, "meta": meta})
-            e["cases"].extend(c for c in cases if c["scenario"] == "image")
-            continue
-        if name == "tensorsharp" and any(c["scenario"] == "image" for c in cases):
-            # The NInfer text deployment declines images; the vision companion answers them.
-            cases = [c for c in cases if c["scenario"] != "image"] if (campaign / "tensorsharp-gguf-64k").exists() else cases
         e["cases"].extend(cases)
         e["probes"].extend(probes)
         e["meta"][tier] = meta
@@ -477,14 +470,15 @@ def matrix_block(result, order, stats, best, lang, mids=None):
         p, pmax = st.get("prompt"), st.get("prompt_max")
         ptxt = fmt_tokens(p) + (f"–{fmt_tokens(pmax)}" if pmax and p and pmax > 1.2 * p else "")
         ts = result.get("tensorsharp", {}).get("metrics", {}).get(mid)
+        tsg = result.get("tensorsharp-gguf", {}).get("metrics", {}).get(mid)
         b = best.get(mid)
         who = next((ENGINE_NAMES[k] for k in order if result[k]["metrics"].get(mid) == b), "") if b else ""
         rows.append(f"<tr><td>{html.escape(label)}</td><td>{html.escape(task)}</td><td class='num'>{ptxt}</td>"
                     f"<td class='num'>{fmt_tokens(st.get('output'))}</td><td class='num'>{st.get('requests') or 1:g}</td>"
-                    f"<td class='num'>{fmt(ts)}</td><td class='num'>{fmt(b)} {html.escape(who)}</td></tr>")
+                    f"<td class='num'>{fmt(ts)}</td><td class='num'>{fmt(tsg)}</td><td class='num'>{fmt(b)} {html.escape(who)}</td></tr>")
     return (f"<h2>{html.escape(sec['matrix'])}</h2><div style='overflow-x:auto'><table class='matrix'><tr>"
             f"<th>{sec['metric']}</th><th>{sec['task']}</th><th>{sec['prompt']}</th><th>{sec['gen']}</th>"
-            f"<th>{sec['reqs']}</th><th>TensorSharp</th><th>{sec['best']}</th></tr>{''.join(rows)}</table></div>")
+            f"<th>{sec['reqs']}</th><th>TensorSharp-NInfer</th><th>TensorSharp-GGUF</th><th>{sec['best']}</th></tr>{''.join(rows)}</table></div>")
 
 
 def spec_block(result, order, context, lang, charts=True):
@@ -494,7 +488,7 @@ def spec_block(result, order, context, lang, charts=True):
     for k in order:
         m = result[k]["metrics"]
         acc = m.get("spec_accept")
-        rows.append(f'<tr class="{"ts" if k == "tensorsharp" else ""}"><td>{ENGINE_NAMES[k]}</td>'
+        rows.append(f'<tr class="{"ts" if k in TS_ENGINES else ""}"><td>{ENGINE_NAMES[k]}</td>'
                     f'<td style="text-align:left">{html.escape(methods.get(k, ""))}</td>'
                     f'<td>{fmt(100 * acc, 1) + "%" if acc else "–"}</td><td>{fmt(m.get("spec_tokens_per_step"))}</td>'
                     f'<td>{fmt(m.get("decode_gen"))}</td><td>{fmt(m.get("decode_nospec"))}</td>'
@@ -515,7 +509,7 @@ def reuse_block(result, order, stats, lang, charts=True):
     rows = []
     for k in order:
         m = result[k]["metrics"]
-        rows.append(f'<tr class="{"ts" if k == "tensorsharp" else ""}"><td>{ENGINE_NAMES[k]}</td>'
+        rows.append(f'<tr class="{"ts" if k in TS_ENGINES else ""}"><td>{ENGINE_NAMES[k]}</td>'
                     f'<td>{fmt(m.get("mt_turn1_ttft"), 3)}</td><td>{fmt(m.get("multiturn_ttft"), 3)}</td><td>{fmt_tokens(m.get("mt_cached"))}</td>'
                     f'<td>{fmt(m.get("reuse_cold_ttft"), 3)}</td><td>{fmt(m.get("reuse_warm_ttft"), 3)}</td>'
                     f'<td>{fmt(m.get("reuse_speedup")) + "×" if m.get("reuse_speedup") else "–"}</td><td>{fmt_tokens(m.get("reuse_cached"))}</td></tr>')
@@ -539,7 +533,7 @@ def ranking_block(result, order, lang):
     for k in order:
         r = result[k]
         name = ENGINE_NAMES[k]
-        rows.append(f'<div class="rankrow{" ts" if k == "tensorsharp" else ""}"><span class="n">{r["rank"]}</span>'
+        rows.append(f'<div class="rankrow{" ts" if k in TS_ENGINES else ""}"><span class="n">{r["rank"]}</span>'
                     f'<span class="nm">{html.escape(name)}</span><span class="track"><span class="fill" style="width:{r["overall"]:.1f}%;display:block"></span></span>'
                     f'<span class="sc">{t["overall"]} {r["overall"]:.1f} · {t["quality"]} {fmt(r["quality"],1)} · {t["perf"]} {fmt(r["performance"],1)}</span></div>')
     return "\n".join(rows)
@@ -562,7 +556,7 @@ def render_report(result, order, context, lang, stats=None, best=None):
     for k in order:
         cells = "".join(f'<td>{fmt(result[k]["categories"][c[0]]["score"], 1)}</td>' for c in CATEGORIES)
         ok, n = result[k]["checks"]
-        body.append(f'<tr class="{"ts" if k == "tensorsharp" else ""}"><td>{ENGINE_NAMES[k]}</td><td>{result[k]["overall"]:.1f}</td>{cells}<td>{ok}/{n}</td></tr>')
+        body.append(f'<tr class="{"ts" if k in TS_ENGINES else ""}"><td>{ENGINE_NAMES[k]}</td><td>{result[k]["overall"]:.1f}</td>{cells}<td>{ok}/{n}</td></tr>')
     parts.append(f'<h2>{t["cats"]}</h2><div style="overflow-x:auto"><table><tr><th>{t["engine"]}</th><th>{t["overall"]}</th>{head}'
                  f'<th>{t["checks"]}</th></tr>{"".join(body)}</table></div>')
     # charts
@@ -577,7 +571,7 @@ def render_report(result, order, context, lang, stats=None, best=None):
     # full metric table
     mids = list(METRIC_LABELS)
     th = "".join(f"<th>{html.escape(METRIC_LABELS[m][li])}</th>" for m in mids)
-    trs = "".join(f'<tr class="{"ts" if k == "tensorsharp" else ""}"><td>{ENGINE_NAMES[k]}</td>' +
+    trs = "".join(f'<tr class="{"ts" if k in TS_ENGINES else ""}"><td>{ENGINE_NAMES[k]}</td>' +
                   "".join(f"<td>{fmt(result[k]['metrics'].get(m))}</td>" for m in mids) + "</tr>" for k in order)
     parts.append(f'<details><summary>{t["table"]}</summary><div style="overflow-x:auto"><table><tr><th>{t["engine"]}</th>{th}</tr>{trs}</table></div></details>')
     for key, title in (("ts_improvements", t["ts"]), ("analysis", t["analysis"]), ("method", t["method"]), ("caveats", t["caveats"])):

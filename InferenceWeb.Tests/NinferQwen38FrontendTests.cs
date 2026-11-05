@@ -145,7 +145,7 @@ public sealed class NinferQwen38FrontendTests
     [Theory]
     [InlineData("normalizer")][InlineData("regex")][InlineData("bytelevel")][InlineData("dropout")][InlineData("unknown")]
     [InlineData("added_normalized")][InlineData("added_special")][InlineData("added_id")][InlineData("decoder_config")][InlineData("bos")]
-    [InlineData("eos")][InlineData("template")][InlineData("processor")]
+    [InlineData("eos")][InlineData("processor")]
     public void UnsupportedBehaviorAndDisagreeingConfigsAreRefused(string mutation)
     {
         var b = Fixture();
@@ -162,7 +162,6 @@ public sealed class NinferQwen38FrontendTests
             case "decoder_config": Mutate(b, Config, x => x["added_tokens_decoder"]![BaseCount.ToString()]!["special"] = false); break;
             case "bos": Mutate(b, Config, x => x["add_bos_token"] = true); break;
             case "eos": Mutate(b, Generation, x => x["eos_token_id"] = new JsonArray(BaseCount, BaseCount + 2)); break;
-            case "template": b[Template] = Encoding.UTF8.GetBytes("changed\n"); break;
             case "processor": Mutate(b, Image, x => x["patch_size"] = 14); break;
         }
         Assert.Throws<InvalidDataException>(() => NinferQwen38Frontend.ParseTinyForTests(b));
@@ -212,22 +211,18 @@ public sealed class NinferQwen38FrontendTests
     }
 
     [Fact]
-    public void PublicReaderPathRefusesTinyOrUnknownInventoryBeforeReadingResources()
+    public void PublicReaderPathRefusesOtherModelsOrMissingResourcesBeforeReadingThem()
     {
-        Span<byte> len = stackalloc byte[8];
         foreach (string family in new[] { "tiny", "qwen3.8-27b" })
         {
-            string dir = Path.Combine(Path.GetTempPath(), "ninfer-front-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
-            try
-            {
-                string path = Path.Combine(dir, "tiny.ninfer");
-                byte[] metadata = JsonSerializer.SerializeToUtf8Bytes(new { identity = new { model_id = family, weights_id = "nvfp4full" }, objects = new[] { new { name = Tokenizer, kind = "resource", encoding = "raw-bytes-v1", offset = 0, bytes = 1 } } });
-                using (var file = File.Create(path)) { file.Write("NINFER\0\x02"u8); BinaryPrimitives.WriteUInt64LittleEndian(len, (ulong)metadata.Length); file.Write(len); file.Write(metadata); file.SetLength((16L + metadata.Length + 4095) / 4096 * 4096 + 1); }
-                using var reader = new NinferArtifactReader(path); long before = reader.TotalBytesRead;
-                Assert.Throws<InvalidDataException>(() => NinferQwen38Frontend.FromReader(reader)); Assert.Equal(before, reader.TotalBytesRead);
-                reader.Dispose(); Assert.Throws<ObjectDisposedException>(() => NinferQwen38Frontend.FromReader(reader));
-            }
-            finally { Directory.Delete(dir, true); }
+            var b = new NinferV3Builder { Model = family };
+            b.Resource("text", "tokenizer.json", new byte[] { 0x7b });
+            b.Bind("w", b.Tensor("bf16", new ulong[] { 2 }));
+            using var file = b.Write();
+            var reader = new NinferArtifactReader(file.Path); long before = reader.TotalBytesRead;
+            Assert.Throws<InvalidDataException>(() => NinferQwen38Frontend.FromReader(reader));
+            if (family == "tiny") Assert.Equal(before, reader.TotalBytesRead);
+            reader.Dispose(); Assert.Throws<ObjectDisposedException>(() => NinferQwen38Frontend.FromReader(reader));
         }
     }
 }

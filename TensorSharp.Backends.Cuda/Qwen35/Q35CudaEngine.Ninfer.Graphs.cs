@@ -13,7 +13,7 @@ public sealed unsafe partial class Q35CudaEngine
     private bool _ninferDecodeCapturePrepared;
     internal readonly record struct NinferDecodeGraphKey(int Lanes, int Window, bool Verify, int TapFirst,
         int AttentionChunk, int AttentionSplits, string ResidualNormIdentity = null,
-        string Bf16MmaIdentity = null, string GateUpSwiGluIdentity = null);
+        string GateUpSwiGluIdentity = null);
     private struct NinferDecodeGraphEntry
     {
         public NinferDecodeGraphKey Key;
@@ -51,10 +51,9 @@ public sealed unsafe partial class Q35CudaEngine
     /// (CudaNinferAttention.SplitPlan: a fixed split count, key ranges derived on the device),
     /// so one graph serves every history of a shape.</summary>
     internal static NinferDecodeGraphKey PlanNinferDecodeGraphKey(int lanes, int window, bool verify,
-        int tapFirst, Q35Kernels.SplitAttentionPlan splitPlan, string residualNormIdentity = null, string bf16MmaIdentity = null,
+        int tapFirst, Q35Kernels.SplitAttentionPlan splitPlan, string residualNormIdentity = null,
         string gateUpSwiGluIdentity = null)
     {
-        ValidateNinferBf16MmaGraphIdentity(lanes, window, verify, tapFirst, bf16MmaIdentity);
         ValidateNinferGateUpSwiGluGraphIdentity(lanes, window, verify, tapFirst, gateUpSwiGluIdentity);
         if (residualNormIdentity != null)
         {
@@ -66,7 +65,7 @@ public sealed unsafe partial class Q35CudaEngine
                 if (!(residualNormIdentity[i] is >= '0' and <= '9' or >= 'a' and <= 'f'))
                     throw new ArgumentException("The residual/norm graph image identity must be normalized SHA256.");
         }
-        return new(lanes, window, verify, tapFirst, splitPlan.Chunk, splitPlan.Splits, residualNormIdentity, bf16MmaIdentity, gateUpSwiGluIdentity);
+        return new(lanes, window, verify, tapFirst, splitPlan.Chunk, splitPlan.Splits, residualNormIdentity, gateUpSwiGluIdentity);
     }
 
     private void PrepareNinferDecodeCapture()
@@ -97,7 +96,6 @@ public sealed unsafe partial class Q35CudaEngine
         var key = PlanNinferDecodeGraphKey(group.Slots.Length, group.RowsPerSeq, group.Verify, tapFirst,
             _ninferAttention.SplitPlan(group.Slots.Length, _m.NKvHead),
             group.PassMode == NinferLayerPass.FusedResidualNorm ? _ninferResidualNormSuffix : null,
-            UsesNinferBf16Mma(groups, tapFirst) ? _ninferBf16MmaSuffix : null,
             UsesNinferGateUpSwiGlu(groups, tapFirst) ? _ninferGateUpSwiGluSuffix : null);
         for (int i = 0; i < _ninferDecodeGraphRefusalCount; i++)
             if (_ninferDecodeGraphRefusals[i] == key) return false;
@@ -142,18 +140,16 @@ public sealed unsafe partial class Q35CudaEngine
                 _ninferDecodeGraphCount++;
                 NinferDecodeGraphCaptureCount++;
                 if (key.ResidualNormIdentity != null) NinferResidualNormCaptureCount++;
-                if (key.Bf16MmaIdentity != null) NinferBf16MmaCaptureCount++;
                 if (key.GateUpSwiGluIdentity != null) NinferGateUpSwiGluCaptureCount++;
             }
             finally { if (executable != IntPtr.Zero) CudaDriverApi.cuGraphExecDestroy(executable); }
-            Console.Error.WriteLine($"[q35-cuda] NInfer layer graph captured: lanes={key.Lanes}, window={key.Window}, verify={key.Verify}, attention={key.AttentionChunk}x{key.AttentionSplits}, residualNorm={key.ResidualNormIdentity != null}, bf16Mma={key.Bf16MmaIdentity != null}, gateUpSwiGlu={key.GateUpSwiGluIdentity != null}");
+            Console.Error.WriteLine($"[q35-cuda] NInfer layer graph captured: lanes={key.Lanes}, window={key.Window}, verify={key.Verify}, attention={key.AttentionChunk}x{key.AttentionSplits}, residualNorm={key.ResidualNormIdentity != null}, gateUpSwiGlu={key.GateUpSwiGluIdentity != null}");
         }
         _ninferDecodeGraphs[found].LastUse = ++_ninferDecodeGraphClock;
         // Failed launches are never retried: recurrent/KV writes may have begun.
         CudaDriverApi.cuGraphLaunch(_ninferDecodeGraphs[found].Executable, Stream).ThrowOnError();
         NinferDecodeGraphReplayCount++;
         if (key.ResidualNormIdentity != null) NinferResidualNormReplayCount++;
-        if (key.Bf16MmaIdentity != null) NinferBf16MmaReplayCount++;
         if (key.GateUpSwiGluIdentity != null) NinferGateUpSwiGluReplayCount++;
         return true;
     }

@@ -34,7 +34,7 @@ namespace TensorSharp.Cuda
 
         private const int Block = 256;
         private readonly CudaModule module;
-        private readonly IntPtr repack, quantQ81, quantNvfp4, quantSwiGluNvfp4, normNvfp4, embed, addNorm, attnPrep, gateMul, swiglu;
+        private readonly IntPtr repack, quantQ81, quantNvfp4, quantSwiGluNvfp4, normNvfp4, embed, addNorm, addNorm5120, attnPrep, gateMul, swiglu;
         private readonly IntPtr gdnConv, gdnConvState, gdnPrep, gdnScan, gdnScanVerify, gdnReplay, gdnChunk, gdnOut, copyRows, attn, attnSplit, attnCombine, argmax;
         private readonly IntPtr gdnPrepareQk, gdnPrepareControl, gdnChunkPrepared;
         private static readonly bool PreparedGdnPrefill = Environment.GetEnvironmentVariable("TS_Q35_GDN_PREPARED_PREFILL") == "1";
@@ -83,6 +83,7 @@ namespace TensorSharp.Cuda
             normNvfp4 = module.GetFunction("ts_q35_add_rmsnorm_nvfp4_f32");
             embed = module.GetFunction("ts_q35_embed_q4_0");
             addNorm = module.GetFunction("ts_q35_add_rmsnorm_f32");
+            addNorm5120 = module.GetFunction("ts_q35_add_rmsnorm_5120_f32");
             attnPrep = module.GetFunction("ts_q35_attn_prep_f32");
             gateMul = module.GetFunction("ts_q35_gate_mul_f32");
             swiglu = module.GetFunction("ts_q35_swiglu_f32");
@@ -391,7 +392,8 @@ namespace TensorSharp.Cuda
         {
             IntPtr a0 = x, a1 = delta, a2 = w, a3 = y; int a4 = width; float a5 = eps;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
-            Launch(addNorm, (uint)rows, 1, 1, 512, 0, stream, args);
+            // Width 5120 keeps the row in registers: the same arithmetic, bit-identical output.
+            Launch(width == 5120 ? addNorm5120 : addNorm, (uint)rows, 1, 1, 512, 0, stream, args);
         }
 
         /// <param name="ropePos">The M-RoPE components [4][ropeStride] (component c of row i at c * ropeStride + i).</param>
@@ -476,10 +478,15 @@ namespace TensorSharp.Cuda
             return best;
         }
 
-        /// <summary>Key splits of a decode/verify attention launch: enough blocks to cover the
-        /// device twice, at most 64, never shorter than 128 keys.</summary>
-        private const int AttnSplitChunk = 128, AttnMaxSplits = 64;
-        internal const int AttnMaxSplitCount = AttnMaxSplits;
+        /// <summary>Key splits of a q8_0 decode/verify attention launch: chunks of at least 128 keys,
+        /// at most 160 splits (x 4 KV heads, about three 4-warp CTAs per SM). On the RTX 5090 the
+        /// former cap of 64 left 61 splits (1.4 CTAs per SM) at 60K keys: long decode 135 tok/s there,
+        /// 149 with 121 splits; 241 splits fell back to 134 (the partials cost more than they hide).</summary>
+        private const int AttnSplitChunk = 128;
+        internal const int AttnMaxSplits = 160;
+        /// <summary>Split cap of the pipelined NInfer attention kernel (one CTA per SM) and of the
+        /// partial buffer the NInfer route allocates.</summary>
+        internal const int AttnMaxSplitCount = 64;
 
         internal readonly record struct SplitAttentionPlan(int Chunk, int Splits);
 
@@ -495,8 +502,8 @@ namespace TensorSharp.Cuda
             return new SplitAttentionPlan(chunk, (int)(((long)maxKeys + chunk - 1) / chunk));
         }
 
-        /// <summary>Partial floats a split attention launch writes.</summary>
-        public static long AttnSplitFloats(int rows, int nHead) => (long)rows * nHead * AttnMaxSplits * (AttnHeadDim + 2);
+        /// <summary>Partial floats a split attention launch of at most <paramref name="maxSplits"/> splits writes.</summary>
+        public static long AttnSplitFloats(int rows, int nHead, int maxSplits) => (long)rows * nHead * maxSplits * (AttnHeadDim + 2);
 
         public void GateMul(IntPtr attnRows, IntPtr gate, long n, IntPtr stream)
         {

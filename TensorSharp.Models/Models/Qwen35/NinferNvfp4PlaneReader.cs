@@ -23,7 +23,6 @@ public sealed class NinferNvfp4PlaneTile
     public uint WeightDivisorBits { get; }
     public float WeightDivisor => BitConverter.Int32BitsToSingle(unchecked((int)WeightDivisorBits));
     public NinferTensorDescriptor? InputScaleDivisor { get; }
-    public NinferQwen38ContentValidation InputScaleDivisorContentValidation => NinferQwen38ContentValidation.NotRead;
     public string Layout => "q35-native-nvfp4-code16-low8-high8-scale-rowmajor/1";
     /// <summary>Existing Q35 Planes/alpha=1 dispatch cannot silently drop the retained divisor.</summary>
     public bool RequiresWeightDivisorAwareDispatch => true;

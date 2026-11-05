@@ -10,6 +10,11 @@ namespace TensorSharp.Cuda
         private CudaNinferKernels _ninfer;
         private CudaNinferAttention _ninferAttention;
         private NinferLayer[] _ninferLayers;
+        private NinferMatrix _ninferHead;
+        // The last layer's residual state: a fused pass whose final Down was not fused (an FP8
+        // layer) leaves its projection in _block for the final norm to add.
+        private NinferResidualState _ninferFinalResidualState;
+        private IntPtr _fp8ActCodes, _fp8ActScales, _fp8ActBf16;
         private IntPtr _ninferAlphaBeta;
         private sealed class NinferMatrix
         {
@@ -35,10 +40,11 @@ namespace TensorSharp.Cuda
                 || model.NHead != 24 || model.NKvHead != 4 || model.HeadDim != 256
                 || model.GdnKHeads != 16 || model.GdnVHeads != 48 || model.DConv != 4
                 || recipe.Layers?.Length != model.NLayer || model.Layers?.Length != model.NLayer
-                || recipe.Embedding?.Format != CudaNinferProjectionFormat.W8G32
+                || recipe.Embedding?.Format != CudaNinferProjectionFormat.Fp8Row
                 || recipe.Embedding.Rows != model.NVocab || recipe.Embedding.Columns != model.NEmbd
-                || recipe.Output == null || recipe.Output.Scope != CudaW8HeadScope.TargetAndDraft
-                || model.OutputW8 != null || string.IsNullOrWhiteSpace(recipe.Provenance))
+                || recipe.Head?.Format != CudaNinferProjectionFormat.Fp8Row
+                || recipe.Head.Rows != model.NVocab || recipe.Head.Columns != model.NEmbd
+                || string.IsNullOrWhiteSpace(recipe.Provenance))
                 throw new NotSupportedException("The complete NInfer route requires the validated Qwen3.8-27B target recipe.");
             if (model.NCtx < 1 || model.NUbatch < 1 || model.NUbatch > model.NCtx
                 || !float.IsFinite(model.Eps) || model.Eps <= 0 || !float.IsFinite(model.RopeBase) || model.RopeBase <= 0)
@@ -97,7 +103,6 @@ namespace TensorSharp.Cuda
             InitializeNinferExactVerify();
             InitializeNinferFlashInfer();
             InitializeNinferResidualNorm();
-            InitializeNinferBf16Mma();
             InitializeNinferGateUpSwiGlu();
             if (_ninferDecodeGraphsEnabled && _m.Ninfer == null)
                 throw new NotSupportedException(NinferDecodeGraphsEnvironment + " requires an original NInfer target.");
@@ -106,10 +111,34 @@ namespace TensorSharp.Cuda
             if (_m.Ninfer == null) return;
             _ninfer = CudaNinferKernels.Create(_m.Ninfer.ModulePath);
             _ninferAttention = new CudaNinferAttention(_m.RopeBase, _m.NUbatch, _m.NCtx, _sms,
-                _m.NHead, _m.NKvHead, _m.HeadDim, _ninferAutomaticPrefillAttention);
+                _m.NHead, _m.NKvHead, _m.HeadDim, _ninferAutomaticPrefillAttention, _ninferKvFp8);
+            Console.Error.WriteLine($"[q35-cuda] NInfer KV cache: {(_ninferKvFp8 ? "FP8 E4M3, group-128 F32 scales (272-byte rows)" : "BF16")}");
             _ninferLayers = new NinferLayer[_m.NLayer];
             InitializeNinferGdnChunk();
         }
+        /// <summary>TS_Q35_NINFER_EMBEDDING=host (default) keeps the FP8 embedding table in pinned,
+        /// device-mapped host memory: a token gather reads one 5 KB row over PCIe, and the 1.27 GB
+        /// of VRAM goes to KV capacity. =device uploads it like the other matrices.</summary>
+        internal const string NinferEmbeddingEnvironment = "TS_Q35_NINFER_EMBEDDING";
+        private IntPtr _hostEmbedding;
+        private IntPtr LoadNinferEmbedding(Loader loader, CudaNinferProjectionDesc d)
+        {
+            string mode = Environment.GetEnvironmentVariable(NinferEmbeddingEnvironment) ?? "host";
+            if (mode == "device") return LoadNinferMatrix(loader, d).Data;
+            if (mode != "host") throw new ArgumentException(NinferEmbeddingEnvironment + " accepts only host or device.");
+            CudaDriverApi.cuMemHostAlloc(out _hostEmbedding, new UIntPtr((ulong)d.Bytes),
+                CudaDriverApi.CU_MEMHOSTALLOC_PORTABLE | CudaDriverApi.CU_MEMHOSTALLOC_DEVICEMAP).ThrowOnError();
+            for (long offset = 0; offset < d.Bytes; offset += 64L << 20)
+                d.Source.Read(d.SourceOffset + offset, _hostEmbedding + (nint)offset, Math.Min(64L << 20, d.Bytes - offset));
+            CudaDriverApi.cuMemHostGetDevicePointer(out IntPtr device, _hostEmbedding, 0).ThrowOnError();
+            Console.Error.WriteLine($"[q35-cuda] NInfer FP8 embedding in mapped host memory ({d.Bytes / (1 << 20)} MiB of VRAM kept for KV)");
+            return device;
+        }
+        private void FreeNinferHostEmbedding()
+        {
+            if (_hostEmbedding != IntPtr.Zero) { CudaDriverApi.cuMemFreeHost(_hostEmbedding); _hostEmbedding = IntPtr.Zero; }
+        }
+
         private NinferMatrix LoadNinferMatrix(Loader loader, CudaNinferProjectionDesc d)
         {
             if (d == null) return null;
@@ -119,7 +148,12 @@ namespace TensorSharp.Cuda
                 loader.RawInto(new CudaWeightDesc { Source = d.Source, SourceOffset = d.SourceOffset,
                     Ne0 = d.Columns, Ne1 = 1, Ne2 = 1, RowBytes = d.Bytes }, data);
             return new NinferMatrix { Descriptor = d, Data = data,
-                Scales = d.Format == CudaNinferProjectionFormat.NvFp4Planes ? data + (nint)((long)d.Rows*d.Columns/2) : IntPtr.Zero };
+                Scales = d.Format switch
+                {
+                    CudaNinferProjectionFormat.NvFp4Planes => data + (nint)((long)d.Rows*d.Columns/2),
+                    CudaNinferProjectionFormat.Fp8Row => data + (nint)((long)d.Rows*d.Columns),
+                    _ => IntPtr.Zero
+                } };
         }
         private Layer LoadNinferLayer(Loader loader, int index)
         {
@@ -138,8 +172,13 @@ namespace TensorSharp.Cuda
             else _ninfer.AddRmsNorm(x, delta, weight, output, rows, width, eps, stream);
         }
         private void NinferProject(NinferMatrix matrix, IntPtr input, IntPtr output, int rows,
-            int a4Threshold = 4, bool round = true, bool isVerify = false, bool bf16Mma = false)
+            int a4Threshold = 4, bool round = true, bool isVerify = false)
         {
+            if (matrix.Descriptor.Format == CudaNinferProjectionFormat.Fp8Row)
+            {
+                ProjectNinferFp8(matrix, input, output, rows, round ? Q35Kernels.Fp8Epilogue.Round : Q35Kernels.Fp8Epilogue.Plain, isVerify);
+                return;
+            }
             if (TryProjectNinferFlashInfer(matrix, input, output, rows))
             {
                 if (round) _ninfer.Round(output, (long)rows * matrix.Descriptor.Rows, Stream);
@@ -147,11 +186,11 @@ namespace TensorSharp.Cuda
             }
             matrix = PrepareNinferFlashInferFallback(matrix);
             var d = matrix.Descriptor;
-            if (TryNinferExactVerify(matrix, input, output, rows, a4Threshold, isVerify)) { }
+            if (rows == 1 && TryGemvNinferNvfp4(matrix, input, output, swiGlu: false)) { }
+            else if (TryNinferExactVerify(matrix, input, output, rows, a4Threshold, isVerify)) { }
             else if (d.Format == CudaNinferProjectionFormat.BFloat16)
             {
-                if (!TryNinferBf16Mma(matrix, input, output, rows, bf16Mma))
-                    _ninfer.ProjectBf16(matrix.Data, input, output, d.Rows, d.Columns, rows, Stream);
+                _ninfer.ProjectBf16(matrix.Data, input, output, d.Rows, d.Columns, rows, Stream);
             }
             else if (d.AllowA4 && rows >= a4Threshold)
             {
@@ -173,10 +212,51 @@ namespace TensorSharp.Cuda
                     1.0f / d.WeightScaleDivisor, Stream);
             if (round) _ninfer.Round(output, (long)rows*d.Rows, Stream);
         }
+        /// <summary>One-row NVFP4 projection on the CUDA cores (non-speculative decode), unless
+        /// TS_Q35_T1_GEMV=off. Same A16 weights; the summation order differs from the legacy kernel.</summary>
+        private bool TryGemvNinferNvfp4(NinferMatrix matrix, IntPtr input, IntPtr output, bool swiGlu)
+        {
+            var d = matrix.Descriptor;
+            return Q35Kernels.T1GemvEnabled && d.Format == CudaNinferProjectionFormat.NvFp4Planes
+                && _ninfer.TryGemvNvfp4(matrix.Data, matrix.Scales, input, output, d.Rows, d.Columns, 1.0f / d.WeightScaleDivisor, swiGlu, Stream);
+        }
+        /// <summary>FP8 row-scaled projection: the small-T A16 route for decode/verify rows, the
+        /// W8A8 TMA GEMM over per-row E4M3 activations for prefill (NInfer's AllowA8 uses).
+        /// SwiGlu takes gate|up interleaved by 8 rows and writes [rows][n / 2].</summary>
+        private void ProjectNinferFp8(NinferMatrix matrix, IntPtr input, IntPtr output, int rows, Q35Kernels.Fp8Epilogue epilogue, bool isVerify)
+        {
+            var d = matrix.Descriptor;
+            if (!isVerify && rows >= Q35Kernels.Fp8TmaMinRows && Q35Kernels.Fp8TmaFits(matrix.Data, IntPtr.Zero, d.Rows, d.Columns))
+            {
+                if (_fp8ActCodes == IntPtr.Zero)
+                {
+                    _fp8ActCodes = Alloc(checked((long)RowCap * Math.Max(_m.NFf, Math.Max(_m.NEmbd, 6144))));
+                    _fp8ActScales = Alloc((long)RowCap * 4);
+                }
+                _k.QuantizeFp8Activations(input, _fp8ActCodes, _fp8ActScales, d.Columns, rows, Stream);
+                var tma = epilogue switch
+                {
+                    Q35Kernels.Fp8Epilogue.Round => Q35Kernels.Fp8TmaEpilogue.Round,
+                    Q35Kernels.Fp8Epilogue.SwiGlu => Q35Kernels.Fp8TmaEpilogue.SwiGlu,
+                    _ => Q35Kernels.Fp8TmaEpilogue.Plain
+                };
+                _k.GemmW8A8(matrix.Data, matrix.Scales, d.Rows, d.Columns, _fp8ActCodes, _fp8ActScales, rows, output, tma, Stream);
+                return;
+            }
+            if (Q35Kernels.Fp8SmallTakesBf16(rows))
+            {
+                // Wide verify/decode tiles read BF16 activations, cast once for every CTA.
+                if (_fp8ActBf16 == IntPtr.Zero) _fp8ActBf16 = Alloc((long)Math.Max(MaxVerifyRows, 64) * Math.Max(_m.NFf, Math.Max(_m.NEmbd, 6144)) * 2);
+                _ninfer.CastToBf16(input, _fp8ActBf16, (long)rows * d.Columns, Stream);
+                input = _fp8ActBf16;
+            }
+            _k.ProjectFp8(matrix.Data, matrix.Scales, d.Rows, d.Columns, input, rows, output, epilogue, Stream);
+        }
+
         private void RunNinferLayers(int rows, int tapFirst, RowGroup[] groups, int[] maxKeys)
         {
-            if (_d != null || _embedSpans != null)
-                throw new NotSupportedException("NInfer target text inference cannot use a GGUF drafter or image embedding overrides.");
+            if (_d != null)
+                throw new NotSupportedException("NInfer target inference cannot use a GGUF drafter.");
             foreach (var group in groups)
                 if (group.Verify && (!_ninferVerificationEnabled || groups.Length != 1 || group.Counts != null
                     || group.Rows > MaxVerifyRows || _vQkv == IntPtr.Zero))
@@ -184,7 +264,6 @@ namespace TensorSharp.Cuda
             int e = _m.NEmbd;
             bool isVerify = groups.Length == 1 && groups[0].Verify;
             bool candidatePass = groups.Length == 1 && groups[0].PassMode == NinferLayerPass.FusedResidualNorm;
-            bool bf16Mma = UsesNinferBf16Mma(groups, tapFirst);
             bool fusedGateUp = UsesNinferGateUpSwiGlu(groups, tapFirst);
             var residualState = NinferResidualState.InitialNoDelta;
             for (int il = 0; il < _m.NLayer; il++)
@@ -192,7 +271,7 @@ namespace TensorSharp.Cuda
                 var l = _layers[il]; var weights = _ninferLayers[il];
                 NormalizeNinferResidual(residualState, l.AttnNorm, rows, candidatePass, postProjection: false, weights.Input);
                 CaptureNinferDraftTargetTap(il, tapFirst, rows);
-                NinferProject(weights.Input, _xn, _proj, rows, l.Recurrent ? 1 : 4, isVerify: isVerify, bf16Mma: bf16Mma);
+                NinferProject(weights.Input, _xn, _proj, rows, l.Recurrent ? 1 : 4, isVerify: isVerify);
                 if (l.Recurrent)
                 {
                     if (_ninferAlphaBeta == IntPtr.Zero) _ninferAlphaBeta = Alloc((long)RowCap*96*4);
@@ -218,7 +297,7 @@ namespace TensorSharp.Cuda
                                 gd, beta, TabState(l) + (nint)(8L*q0), _gdnO + (nint)((long)r0*ValueDim*4), g.Verify, Stream, count);
                     }
                     _ninfer.GdnOut(_gdnO, _proj, 16384, ConvDim, rows, _m.GdnVHeads, l.SsmNorm, _m.Eps, _gdnY, Stream);
-                    residualState = ProjectNinferResidual(weights.Output, _gdnY, rows, isVerify, candidatePass, bf16Mma);
+                    residualState = ProjectNinferResidual(weights.Output, _gdnY, rows, isVerify, candidatePass);
                 }
                 else
                 {
@@ -236,15 +315,22 @@ namespace TensorSharp.Cuda
                             1.0f/MathF.Sqrt(_m.HeadDim), maxKeys[gi], g.Rows <= MaxVerifyRows ? _attnPartial : IntPtr.Zero, _attn + qOff, Stream,
                             isVerify: g.Verify, allRowsValid: g.Counts == null);
                     }
-                    residualState = ProjectNinferResidual(weights.Output, _attn, rows, isVerify, candidatePass, bf16Mma);
+                    residualState = ProjectNinferResidual(weights.Output, _attn, rows, isVerify, candidatePass);
                 }
                 NormalizeNinferResidual(residualState, l.PostNorm, rows, candidatePass, postProjection: true, weights.GateUp);
+                if (weights.GateUp.Descriptor.Format == CudaNinferProjectionFormat.Fp8Row)
+                {
+                    ProjectNinferFp8(weights.GateUp, _xn, _act, rows, Q35Kernels.Fp8Epilogue.SwiGlu, isVerify);
+                    residualState = ProjectNinferResidual(weights.Down, _act, rows, isVerify, candidatePass);
+                    continue;
+                }
                 if (TryNinferPrefillGateUpSwiGluQuant(weights.GateUp, weights.Down, rows, isVerify))
                 {
                     residualState = ProjectNinferPrequantizedDown(weights.Down, rows);
                     continue;
                 }
-                if (!TryNinferGateUpSwiGlu(weights.GateUp, rows, fusedGateUp)
+                if (rows == 1 && !_ninferFiResident.ContainsKey(weights.GateUp) && TryGemvNinferNvfp4(weights.GateUp, _xn, _act, swiGlu: true)) { }
+                else if (!TryNinferGateUpSwiGlu(weights.GateUp, rows, fusedGateUp)
                     && !TryNinferPrefillGateUpSwiGlu(weights.GateUp, rows, isVerify))
                 {
                     NinferProject(weights.GateUp, _xn, _proj, rows, 2, round: rows > 128 && rows != 1024, isVerify: isVerify);
@@ -252,8 +338,7 @@ namespace TensorSharp.Cuda
                 }
                 residualState = ProjectNinferResidual(weights.Down, _act, rows, isVerify, candidatePass);
             }
-            if (candidatePass && residualState != NinferResidualState.FusedCanonical)
-                throw new InvalidOperationException("The completed NInfer residual/norm pass must end with an actually fused Down projection.");
+            _ninferFinalResidualState = residualState;
         }
     }
 }

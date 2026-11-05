@@ -18,6 +18,21 @@ namespace TensorSharp.Cuda
         // 192.8 / 159.5 / 132.3 -> 217.2 / 189.8 / 183.2 tok/s.
         private readonly IntPtr _splitPipe;
         private readonly uint _splitPipeSmem;
+        // FP8 KV (TS_Q35_NINFER_KV=fp8): 272-byte rows of E4M3 codes and two F32 group-128 scales.
+        // Decode/verify stage FP8 tiles and widen them in shared memory; the BF16 prefill core reads
+        // a per-layer BF16 copy of the visible history (_kvScratch, one 1 MiB K|V block per 256 keys).
+        private readonly bool _kvFp8;
+        private readonly IntPtr _fp8ToBf16;
+        private IntPtr _kvScratch, _kvScratchTable;
+        private int _kvScratchBlocks;
+        internal const string KvEnvironment = "TS_Q35_NINFER_KV";
+        internal bool KvFp8 => _kvFp8;
+        internal static bool ResolveKvFp8(string raw) => raw switch
+        {
+            null or "bf16" => false,
+            "fp8" => true,
+            _ => throw new ArgumentException(KvEnvironment + " accepts only bf16 or fp8.")
+        };
         /// <summary>A fixed split count that fills the SMs in one wave (each CTA holds 67.6 KB of
         /// tiles, so one per SM), its key range derived on the device (chunk 0): one launch
         /// shape, so one captured graph, for every history.</summary>
@@ -42,8 +57,9 @@ namespace TensorSharp.Cuda
         public string ImageSha256 => _module.ImageSha256;
         public CudaNinferAttention(float ropeBase = 10000000f, int maximumPrefillRows = 0,
             int maximumKeys = 0, int sms = 0,
-            int heads = 24, int kvHeads = 4, int headDim = 256, bool automaticPrefill = false)
+            int heads = 24, int kvHeads = 4, int headDim = 256, bool automaticPrefill = false, bool kvFp8 = false)
         {
+            _kvFp8 = kvFp8;
             string prefillRaw = Environment.GetEnvironmentVariable(CudaNinferPrefillAttentionModule.EnvironmentVariable);
             bool autoPrefill = automaticPrefill && prefillRaw == null && heads == CudaNinferPrefillAttentionModule.QueryHeads
                 && kvHeads == CudaNinferPrefillAttentionModule.KvHeads && headDim == CudaNinferPrefillAttentionModule.HeadDim;
@@ -68,17 +84,18 @@ namespace TensorSharp.Cuda
             try
             {
                 _prep = _module.GetFunction("ts_ninfer_attn_prep_f32");
-                _attention = _module.GetFunction("ts_ninfer_attn_bf16_f32");
+                _attention = _module.GetFunction(kvFp8 ? "ts_ninfer_attn_fp8_f32" : "ts_ninfer_attn_bf16_f32");
                 _combine = _module.GetFunction("ts_ninfer_attn_combine_f32");
-                _splitPipe = _module.GetFunction("ts_ninfer_attn_bf16_split_pipe_f32");
-                CudaDriverApi.cuMemAlloc(out IntPtr probe, new UIntPtr(4u)).ThrowOnError();
+                _splitPipe = _module.GetFunction(kvFp8 ? "ts_ninfer_attn_fp8_split_pipe_f32" : "ts_ninfer_attn_bf16_split_pipe_f32");
+                if (kvFp8) _fp8ToBf16 = _module.GetFunction("ts_ninfer_kv_fp8_to_bf16");
+                CudaDriverApi.cuMemAlloc(out IntPtr probe, new UIntPtr(8u)).ThrowOnError();
                 try
                 {
                     void** pargs = stackalloc void*[] { &probe };
                     Launch(_module.GetFunction("ts_ninfer_attn_pipe_smem_bytes"), 1, 1, 1, 1, IntPtr.Zero, pargs);
-                    int bytes;
-                    CudaDriverApi.cuMemcpyDtoH((IntPtr)(&bytes), probe, new UIntPtr(4u)).ThrowOnError();
-                    _splitPipeSmem = (uint)bytes;
+                    int* bytes = stackalloc int[2];
+                    CudaDriverApi.cuMemcpyDtoH((IntPtr)bytes, probe, new UIntPtr(8u)).ThrowOnError();
+                    _splitPipeSmem = (uint)bytes[kvFp8 ? 1 : 0];
                 }
                 finally { CudaDriverApi.cuMemFree(probe); }
                 CudaDriverApi.cuFuncSetAttribute(_splitPipe, CudaDriverApi.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)_splitPipeSmem).ThrowOnError();
@@ -157,8 +174,9 @@ namespace TensorSharp.Cuda
             long kOff, long vOff, IntPtr q, IntPtr gate, IntPtr stream)
         {
             IntPtr frequencies = _frequencies;
+            int fp8 = _kvFp8 ? 1 : 0;
             void** args = stackalloc void*[] { &qkv, &rows, &rowsPerSeq, &nHead, &nKv, &qNorm, &kNorm, &eps,
-                &ropePos, &ropeStride, &sectT, &sectH, &sectW, &ropeBase, &cacheRow, &table, &maxBlocks, &kOff, &vOff, &q, &gate, &frequencies };
+                &ropePos, &ropeStride, &sectT, &sectH, &sectW, &ropeBase, &cacheRow, &table, &maxBlocks, &kOff, &vOff, &q, &gate, &frequencies, &fp8 };
             Launch(_prep, checked((uint)(((long)rows * (nHead + 2*nKv)*32+255)/256)), 1, 1, 256, stream, args);
         }
         public void Attention(IntPtr q, IntPtr gate, IntPtr keyEnd, IntPtr table, int maxBlocks, long kOff, long vOff,
@@ -169,6 +187,13 @@ namespace TensorSharp.Cuda
                 && nHead == CudaNinferPrefillAttentionModule.QueryHeads && nKv == CudaNinferPrefillAttentionModule.KvHeads
                 && CudaNinferPrefillAttentionModule.Supports(rowsPerSeq, sequences, isVerify, allRowsValid))
             {
+                if (_kvFp8)
+                {
+                    WidenFp8History(table, kOff, vOff, maxKeys, nKv, stream);
+                    _prefill.RunF32(q, gate, _kvScratchTable, _kvScratchBlocks, 0, CudaNinferPrefillAttentionModule.KvPlaneBlockBytes,
+                        rowsPerSeq, checked(maxKeys - rowsPerSeq), scale, output, _prefillWorkspace, _prefillWorkspaceBytes, _sms, stream);
+                    return;
+                }
                 _prefill.RunF32(q, gate, table, maxBlocks, kOff, vOff, rowsPerSeq, checked(maxKeys - rowsPerSeq),
                     scale, output, _prefillWorkspace, _prefillWorkspaceBytes, _sms, stream);
                 return;
@@ -195,8 +220,33 @@ namespace TensorSharp.Cuda
                 if (threads == 128) _prefill128Submissions++;
             }
         }
+        /// <summary>BF16 copy of keys [0, keys) of one sequence's layer for the prefill core.</summary>
+        private void WidenFp8History(IntPtr table, long kOff, long vOff, int keys, int nKv, IntPtr stream)
+        {
+            int blocks = checked((keys + 255) / 256);
+            if (blocks > _kvScratchBlocks)
+            {
+                if (_kvScratch != IntPtr.Zero) { CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError(); CudaDriverApi.cuMemFree(_kvScratch).ThrowOnError(); CudaDriverApi.cuMemFree(_kvScratchTable).ThrowOnError(); }
+                // Grow by the visible history (plus 8 blocks), not by doubling: at 128K the scratch is
+                // most of a GB that KV blocks need.
+                int capacity = Math.Max(blocks + 8, 16);
+                long blockBytes = 2 * CudaNinferPrefillAttentionModule.KvPlaneBlockBytes;
+                CudaDriverApi.cuMemAlloc(out _kvScratch, new UIntPtr(checked((ulong)(capacity * blockBytes)))).ThrowOnError();
+                CudaDriverApi.cuMemAlloc(out _kvScratchTable, new UIntPtr((ulong)capacity * 8)).ThrowOnError();
+                var pointers = new long[capacity];
+                for (int i = 0; i < capacity; i++) pointers[i] = _kvScratch.ToInt64() + i * blockBytes;
+                fixed (long* p = pointers) CudaDriverApi.cuMemcpyHtoD(_kvScratchTable, (IntPtr)p, new UIntPtr((ulong)capacity * 8)).ThrowOnError();
+                _kvScratchBlocks = capacity;
+            }
+            IntPtr scratchTable = _kvScratchTable;
+            long plane = CudaNinferPrefillAttentionModule.KvPlaneBlockBytes;
+            void** args = stackalloc void*[] { &table, &kOff, &vOff, &keys, &scratchTable, &plane };
+            Launch(_fp8ToBf16, checked((uint)((keys + 7) / 8)), (uint)nKv, 2, 256, stream, args);
+        }
+
         public void Dispose()
         {
+            if (_kvScratch != IntPtr.Zero) { CudaDriverApi.cuMemFree(_kvScratch); CudaDriverApi.cuMemFree(_kvScratchTable); _kvScratch = _kvScratchTable = IntPtr.Zero; }
             // The engine synchronizes and destroys its layer graphs before
             // disposing this module or any captured workspace pointer.
             if (_prefillThreads == 128)

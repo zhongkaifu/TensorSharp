@@ -8,7 +8,7 @@ namespace TensorSharp.Cuda;
 
 public enum CudaNinferDraftHeadPolicy { FullTargetVocabulary, OriginalQ4G64Shortlist }
 
-/// <summary>Original Q4G64_F16S proposal head, independent of GGML Q4_K; no quantization conversion.</summary>
+/// <summary>Indexed q4_g64 proposal head, independent of GGML Q4_K; no quantization conversion.</summary>
 public sealed class CudaNinferDraftShortlistDesc
 {
     public const int Rows = 131072, Columns = 5120, GroupSize = 64;
@@ -67,7 +67,7 @@ public sealed class CudaNinferDraftLayerDesc
 /// </summary>
 public sealed class CudaNinferDraftDesc
 {
-    public const string NumericalPolicy = "original-dflash2-a16-bf16-plain-norm-concatenated-output-taps-v1";
+    public const string NumericalPolicy = "ninfer-v3-dflash2-a16-q8g32-bf16-plain-norm-concatenated-output-taps-v1";
     public const int RingPositions = 2048, QueryHeads = 32, KeyValueHeads = 8, HeadDimension = 128;
     public const int TopK = 16, SelectorRank = 256, ConvTaps = 2, ConvGroupSize = 16, MaskToken = 248070;
     public static IReadOnlyList<int> TargetOutputLayers { get; } = Array.AsReadOnly(new[] { 5, 19, 33, 47, 61 });
@@ -105,9 +105,10 @@ public sealed class CudaNinferDraftDesc
     internal static CudaNinferProjectionDesc Projection(CudaNinferProjectionDesc projection, int rows, int columns)
     {
         ArgumentNullException.ThrowIfNull(projection);
-        if (projection.Rows != rows || projection.Columns != columns || projection.Format != CudaNinferProjectionFormat.NvFp4Planes
+        if (projection.Rows != rows || projection.Columns != columns
+            || projection.Format is not (CudaNinferProjectionFormat.W8G32 or CudaNinferProjectionFormat.BFloat16)
             || projection.AllowA4 || BitConverter.SingleToInt32Bits(projection.InputScaleDivisor) != 0x3f800000)
-            throw new ArgumentException("Original draft projections require their exact NVFP4 shape and A16-only policy without an activation divisor.");
+            throw new ArgumentException("Draft projections require their exact q8_g32/BF16 shape and an A16-only policy without an activation divisor.");
         return projection;
     }
     internal static float[] Plain(float[] values, int length)

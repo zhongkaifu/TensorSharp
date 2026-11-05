@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 BENCH_SHA = "4e1fa314732250648f43a06d62c02d82b9c17e8842edfeda812f969aac8c363c"
 RUNTIME = "/dev/shm/ts-ninfer-r12/runtime"
-MODEL = "/workspace/hf/ignis/qwen3_8_27b_nvfp4full-v2.ninfer"
+MODEL = "/workspace/hf/ninfer/qwen3_8_27b_nvfp4.ninfer"
 SCENARIO = "r12-long_generation-code-r0"
 
 

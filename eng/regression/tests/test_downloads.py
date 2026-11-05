@@ -135,7 +135,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(parsed.options["backend"], "cuda")
             self.assertNotIn("environment", parsed.options)
             self.assertEqual(len(parsed.files), 1)
-            self.assertEqual(parsed.files[0].sha256, "abb1e120d5f1f32d61689604d238227ff579ab76cbd9319628f3b3904fffd9af")
+            self.assertEqual(parsed.files[0].sha256, "74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82")
 
 
 class DownloadTests(unittest.TestCase):

@@ -55,8 +55,8 @@ separately. No independent approximation replaces full old/new bit equality.
 The new norm must leave its complete input unchanged. Separate semantic cases
 check old `(-0)+(-0)` versus new readonly `-0` and old initial-null `(-0)+(+0)`.
 The initial-null case must remain the old path in engine integration; this tool
-does not implement or certify that routing. Use `NinferResidualNormBodyProbe`
-for the separate fixed whole-model state/output comparison. Guarded allocations, immutable
+does not implement or certify that routing; the whole-model comparison probe of the v2 era
+was removed with the v2 reader. Guarded allocations, immutable
 weights/inputs, zero returned counters and AA across both module lifetimes are
 mandatory. There are 270 projection/norm kernel calls plus18 signed-zero norm
 calls per shape: **288 actual direct submissions** on a complete run.

@@ -12,9 +12,9 @@ public sealed class NinferResidualNormPolicyTests
 {
     private static bool Plan(string? option, bool qualified = true, int sms = 170, int context = 40960,
         int rows = 2048, bool verification = true, bool graphs = true, bool gemm8 = true,
-        bool splitK = true, bool w8 = true, bool fi = false, bool exact = false, bool allDowns = true)
+        bool splitK = true, bool fi = false, bool exact = false, bool allDowns = true)
         => Q35CudaEngine.PlanNinferResidualNorm(true, qualified, sms, context, rows, verification,
-            graphs, gemm8, splitK, w8, fi, exact, option!, allDowns);
+            graphs, gemm8, splitK, fi, exact, option!, allDowns);
 
     [Theory]
     [InlineData(null, true)] [InlineData("0", false)] [InlineData("1", true)]
@@ -49,7 +49,7 @@ public sealed class NinferResidualNormPolicyTests
             () => Plan("1", qualified: false), () => Plan("1", sms: 169), () => Plan("1", sms: 171),
             () => Plan("1", context: 40959), () => Plan("1", context: 65535), () => Plan("1", rows: 7),
             () => Plan("1", verification: false), () => Plan("1", graphs: false), () => Plan("1", gemm8: false),
-            () => Plan("1", splitK: false), () => Plan("1", w8: false), () => Plan("1", fi: true), () => Plan("1", exact: true),
+            () => Plan("1", splitK: false), () => Plan("1", fi: true), () => Plan("1", exact: true),
             () => Plan("1", allDowns: false)
         };
         foreach (var request in requests) Assert.Throws<NotSupportedException>(request);
@@ -63,7 +63,7 @@ public sealed class NinferResidualNormPolicyTests
         bool[] choices = { Plan(null, qualified: false), Plan(null, sms: 169), Plan(null, sms: 171),
             Plan(null, context: 40959), Plan(null, context: 65535), Plan(null, rows: 7),
             Plan(null, verification: false), Plan(null, graphs: false), Plan(null, gemm8: false),
-            Plan(null, splitK: false), Plan(null, w8: false), Plan(null, fi: true), Plan(null, exact: true),
+            Plan(null, splitK: false), Plan(null, fi: true), Plan(null, exact: true),
             Plan(null, allDowns: false) };
         Assert.All(choices, choice => Assert.False(choice));
     }
@@ -109,7 +109,7 @@ public sealed class NinferResidualNormPolicyTests
     [InlineData(null)] [InlineData("0")] [InlineData("1")] [InlineData("invalid")]
     public void GgufIgnoresTheNewOptionEntirely(string? option)
         => Assert.False(Q35CudaEngine.PlanNinferResidualNorm(false, false, 0, 0, 0,
-            false, false, false, false, false, false, false, option!));
+            false, false, false, false, false, false, option!));
 
     private static Pass Select(bool enabled = true, int groups = 1, int window = 8, int lanes = 1,
         bool verify = true, bool counts = false, bool embeds = false, bool taps = false, bool gguf = false, int first = 0)

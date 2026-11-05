@@ -1,6 +1,5 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
-using System.Security.Cryptography;
 using System.Text.Json;
 using TensorSharp.Cuda;
 
@@ -27,34 +26,38 @@ public sealed class NinferFlashInferBodyIntegrationPolicyTests
             n, k, format);
 
     [Fact]
-    public void ActualDirectoryAdmitsExactly199OriginalMatricesWithoutReadingPayloads()
+    public void ActualV3DirectoryAdmitsExactlyItsNvfp4MlpMatricesWithoutReadingPayloads()
     {
         using var fixture = typeof(NinferFlashInferBodyIntegrationPolicyTests).Assembly.GetManifestResourceStream(
-            "InferenceWeb.Tests.TestData.Ninfer.qwen38-nvfp4full-target-directory.json")!;
+            "InferenceWeb.Tests.TestData.Ninfer.qwen38-nvfp4-v3-directory.json")!;
         using var memory = new MemoryStream(); fixture.CopyTo(memory); byte[] raw = memory.ToArray();
-        Assert.Equal("97dbfacf273f8db61e905f9dbb600db9199e3565d6385c5f3888234feb234238", Convert.ToHexString(SHA256.HashData(raw)).ToLowerInvariant());
         using var document = JsonDocument.Parse(raw);
-        var counts = new Dictionary<(int, int), int>(); long bytes = 0; int excluded = 0;
+        // Object id -> its first text binding (fused objects bind several row ranges).
+        var names = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var binding in document.RootElement.GetProperty("bindings").EnumerateObject())
+        {
+            if (!binding.Name.StartsWith("text/", StringComparison.Ordinal)) continue;
+            string id = binding.Value.TryGetProperty("object", out var whole) ? whole.GetString()!
+                : binding.Value.GetProperty("parts")[0].GetProperty("object").GetString()!;
+            names.TryAdd(id, binding.Name);
+        }
+        var counts = new Dictionary<(int, int), int>(); long bytes = 0;
         foreach (var tensor in document.RootElement.GetProperty("objects").EnumerateArray())
         {
-            if (tensor.GetProperty("format").GetString() != "NVFP4") continue;
-            string name = tensor.GetProperty("name").GetString()!;
+            if (tensor.GetProperty("kind").GetString() != "tensor" || tensor.GetProperty("format").GetString() != "nvfp4") continue;
+            string name = names[tensor.GetProperty("id").GetString()!];
             int n = tensor.GetProperty("shape")[0].GetInt32(), k = tensor.GetProperty("shape")[1].GetInt32();
-            var mapping = name.EndsWith("/mlp/gate_up", StringComparison.Ordinal) ? CudaNinferOriginalRowMapping.GateUpRows8
-                : name.EndsWith("/attention/query_key_gate_value", StringComparison.Ordinal) ? CudaNinferOriginalRowMapping.AttentionQueryGateKeyValue
+            var mapping = name.EndsWith("/mlp/gate", StringComparison.Ordinal) ? CudaNinferOriginalRowMapping.GateUpRows8
                 : CudaNinferOriginalRowMapping.Identity;
             var source = new Source(n, k, mapping);
-            bool admitted = Q35CudaEngine.TryPlanNinferFlashInferProjection(Descriptor(source, n, k), out var plan);
-            if (name.EndsWith("/gdn/query_key_value_z", StringComparison.Ordinal))
-            { Assert.False(admitted); excluded++; continue; }
-            Assert.True(admitted);
+            Assert.True(Q35CudaEngine.TryPlanNinferFlashInferProjection(Descriptor(source, n, k), out var plan));
             Assert.Equal(tensor.GetProperty("bytes").GetInt64(), plan.OriginalBytes);
             Assert.Equal(mapping, plan.Mapping); Assert.Equal(source.OriginalBytes, plan.CodeBytes + plan.ScaleBytes + 4);
             counts[(n, k)] = counts.GetValueOrDefault((n, k)) + 1; bytes += plan.OriginalBytes;
         }
-        Assert.Equal(48, excluded); Assert.Equal(199, counts.Values.Sum()); Assert.Equal(11118183196, bytes);
-        Assert.Equal(64, counts[(34816, 5120)]); Assert.Equal(64, counts[(5120, 17408)]);
-        Assert.Equal(61, counts[(5120, 6144)]); Assert.Equal(10, counts[(14336, 5120)]);
+        Assert.Equal(112, counts.Values.Sum());
+        Assert.Equal(56, counts[(34816, 5120)]); Assert.Equal(56, counts[(5120, 17408)]);
+        Assert.Equal(56L * (100270084 + 50135044), bytes);
     }
 
     [Theory]

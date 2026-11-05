@@ -69,9 +69,6 @@
     <!-- The exact flags of eng/validation/build-ninfer-gdn-chunk-module.py (C++20 for the
          unchanged original prepare header's template lambdas; no fast math). -->
     <_NinferGdnChunkFlags>-std=c++20 -O3 --fmad=true --ftz=false --prec-div=true --prec-sqrt=true -arch=sm_120a -I&quot;$(MSBuildProjectDirectory)/native/ninfer/chunk/upstream/kernel/vendor/src&quot;</_NinferGdnChunkFlags>
-    <NinferBf16MmaOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'obj', 'cuda_ninfer_bf16_mma'))</NinferBf16MmaOutputDir>
-    <_NinferBf16MmaSource>$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/tensorsharp_ninfer_bf16_mma.cu</_NinferBf16MmaSource>
-    <_NinferBf16MmaFlags>-std=c++17 -O3 --ftz=false --fmad=true -lineinfo -arch=sm_120a -I&quot;$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/upstream&quot;</_NinferBf16MmaFlags>
   </PropertyGroup>
 
   <ItemGroup>
@@ -103,15 +100,8 @@
     </CudaKernel>
     <CudaKernelHeader Include="$(MSBuildProjectDirectory)/native/ninfer/draft/upstream/**/*.cuh" />
     <CudaKernelHeader Include="$(MSBuildProjectDirectory)/native/ninfer/draft/upstream/**/*.h" />
-    <CudaKernel Include="$(MSBuildProjectDirectory)/native/w8/tensorsharp_w8g32_head.cu">
-      <CommittedBaseline>false</CommittedBaseline>
-      <AdditionalOptions>-std=c++17 --ftz=false --fmad=true -I&quot;$(MSBuildProjectDirectory)/native/w8/upstream/kernel/vendor/src&quot;</AdditionalOptions>
-    </CudaKernel>
-    <CudaKernelHeader Include="$(MSBuildProjectDirectory)/native/w8/upstream/kernel/vendor/src/**/*.cuh" />
-    <CudaKernelHeader Include="$(MSBuildProjectDirectory)/native/w8/upstream/kernel/vendor/src/**/*.h" />
     <NinferVerify8Input Include="$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/**/*.cu;$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/**/*.cuh;$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/**/*.h" />
     <NinferGdnChunkInput Include="$(MSBuildProjectDirectory)/native/ninfer/chunk/**/*.cu;$(MSBuildProjectDirectory)/native/ninfer/chunk/**/*.cuh;$(MSBuildProjectDirectory)/native/ninfer/chunk/**/*.h" />
-    <NinferBf16MmaInput Include="$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/**/*.cu;$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/**/*.cuh;$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/**/*.h;$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/upstream/LICENSE;$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/upstream/manifest.json" />
     <!-- Headers the kernels #include (e.g. the vendored IQ2_XXS tables). Tracked as
          build inputs so editing them re-triggers the PTX compile below. -->
     <CudaKernelHeader Include="$(CudaKernelDir)/*.cuh" />
@@ -152,13 +142,6 @@
     <PropertyGroup>
       <_NinferVerify8BuildEnabled>false</_NinferVerify8BuildEnabled>
       <_NinferVerify8BuildEnabled Condition="'$(_NvccExitCode)' == '0' And '$(TensorSharpSkipCudaPtx)' != 'true' And '$(DesignTimeBuild)' != 'true' And '$(TensorSharpUpdateCommittedPtx)' != 'true' And ($([System.Text.RegularExpressions.Regex]::IsMatch('$(_ResolvedCudaArch)', '^(?:compute|sm)_120a?$')) Or $([System.Text.RegularExpressions.Regex]::IsMatch('$(CudaFatbinArchitectures)', '(^|[,; ])120a?($|[,; ])')))">true</_NinferVerify8BuildEnabled>
-    </PropertyGroup>
-  </Target>
-
-  <Target Name="ResolveNinferBf16MmaBuildPolicy">
-    <PropertyGroup>
-      <_NinferBf16MmaBuildEnabled>false</_NinferBf16MmaBuildEnabled>
-      <_NinferBf16MmaBuildEnabled Condition="'$(_NvccExitCode)' == '0' And '$(TensorSharpSkipCudaPtx)' != 'true' And '$(DesignTimeBuild)' != 'true' And '$(TensorSharpUpdateCommittedPtx)' != 'true' And ($([System.Text.RegularExpressions.Regex]::IsMatch('$(_ResolvedCudaArch)', '^(?:compute|sm)_120a?$')) Or $([System.Text.RegularExpressions.Regex]::IsMatch('$(CudaFatbinArchitectures)', '(^|[,; ])120a?($|[,; ])')))">true</_NinferBf16MmaBuildEnabled>
     </PropertyGroup>
   </Target>
 
@@ -259,38 +242,6 @@
       <Content Include="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin.sha256" Link="cuda_kernels/tensorsharp_ninfer_gdn_chunk.fatbin.sha256" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
       <Content Include="$(MSBuildProjectDirectory)/native/ninfer/chunk/upstream/LICENSE" Link="cuda_kernels/ninfer_gdn_chunk_licenses/ignis-LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
       <Content Include="$(MSBuildProjectDirectory)/native/ninfer/chunk/upstream/NOTICE" Link="cuda_kernels/ninfer_gdn_chunk_licenses/NOTICE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-    </ItemGroup>
-  </Target>
-
-  <Target Name="CompileNinferBf16Mma"
-          BeforeTargets="BeforeBuild"
-          DependsOnTargets="ResolveCudaPtxBuildSettings;ResolveCudaHostCompiler;ResolveNinferBf16MmaBuildPolicy"
-          Condition="'$(TensorSharpSkipCudaPtx)' != 'true' And '$(DesignTimeBuild)' != 'true'"
-          Inputs="@(NinferBf16MmaInput);$(MSBuildProjectFullPath)"
-          Outputs="$(NinferBf16MmaOutputDir)/tensorsharp_ninfer_bf16_mma.ptx;$(NinferBf16MmaOutputDir)/tensorsharp_ninfer_bf16_mma.fatbin;$(NinferBf16MmaOutputDir)/tensorsharp_ninfer_bf16_mma.fatbin.sha256;$(NinferBf16MmaOutputDir)/nvcc$(_NvccMajor).$(_NvccMinor).stamp">
-    <MakeDir Condition="'$(_NinferBf16MmaBuildEnabled)' == 'true'" Directories="$(NinferBf16MmaOutputDir)" />
-    <!-- Exact qualified build-script flags; global fast-math/vectorization
-         switches do not alter this core's numerical contract. -->
-    <Exec Condition="'$(_NinferBf16MmaBuildEnabled)' == 'true'"
-          Command="&quot;$(CudaNvcc)&quot; $(_NinferBf16MmaFlags) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -ptx &quot;$(_NinferBf16MmaSource)&quot; -o &quot;$(NinferBf16MmaOutputDir)/tensorsharp_ninfer_bf16_mma.ptx&quot;" StandardOutputImportance="low" />
-    <Exec Condition="'$(_NinferBf16MmaBuildEnabled)' == 'true'"
-          Command="&quot;$(CudaNvcc)&quot; $(_NinferBf16MmaFlags) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) --ptxas-options=-v -fatbin &quot;$(_NinferBf16MmaSource)&quot; -o &quot;$(NinferBf16MmaOutputDir)/tensorsharp_ninfer_bf16_mma.fatbin&quot;" StandardOutputImportance="low" />
-    <GetFileHash Condition="'$(_NinferBf16MmaBuildEnabled)' == 'true'" Files="$(NinferBf16MmaOutputDir)/tensorsharp_ninfer_bf16_mma.ptx" Algorithm="SHA256" HashEncoding="hex">
-      <Output TaskParameter="Items" ItemName="_NinferBf16MmaPtxHash" />
-    </GetFileHash>
-    <WriteLinesToFile Condition="'$(_NinferBf16MmaBuildEnabled)' == 'true'" File="$(NinferBf16MmaOutputDir)/tensorsharp_ninfer_bf16_mma.fatbin.sha256" Lines="%(_NinferBf16MmaPtxHash.FileHash)" Overwrite="true" />
-    <WriteLinesToFile Condition="'$(_NinferBf16MmaBuildEnabled)' == 'true'" File="$(NinferBf16MmaOutputDir)/nvcc$(_NvccMajor).$(_NvccMinor).stamp" Lines="$(_NinferBf16MmaFlags)" Overwrite="true" />
-  </Target>
-
-  <Target Name="SelectNinferBf16MmaContent" BeforeTargets="AssignTargetPaths"
-          DependsOnTargets="CompileNinferBf16Mma"
-          Condition="'$(TensorSharpSkipCudaPtx)' != 'true' And '$(DesignTimeBuild)' != 'true'">
-    <ItemGroup Condition="'$(_NinferBf16MmaBuildEnabled)' == 'true'">
-      <Content Include="$(NinferBf16MmaOutputDir)/tensorsharp_ninfer_bf16_mma.ptx" Link="cuda_kernels/tensorsharp_ninfer_bf16_mma.ptx" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-      <Content Include="$(NinferBf16MmaOutputDir)/tensorsharp_ninfer_bf16_mma.fatbin" Link="cuda_kernels/tensorsharp_ninfer_bf16_mma.fatbin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-      <Content Include="$(NinferBf16MmaOutputDir)/tensorsharp_ninfer_bf16_mma.fatbin.sha256" Link="cuda_kernels/tensorsharp_ninfer_bf16_mma.fatbin.sha256" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-      <Content Include="$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/upstream/LICENSE" Link="cuda_kernels/ninfer_bf16_mma_licenses/ignis-LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-      <Content Include="$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/upstream/manifest.json" Link="cuda_kernels/ninfer_bf16_mma_licenses/upstream-manifest.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     </ItemGroup>
   </Target>
 

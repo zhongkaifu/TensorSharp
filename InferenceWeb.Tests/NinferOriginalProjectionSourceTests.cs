@@ -14,9 +14,9 @@ public sealed class NinferOriginalProjectionSourceTests
 {
     private sealed class Fixture : IDisposable
     {
-        private readonly string _path = Path.GetTempFileName();
+        private readonly NinferV3File _file;
         internal NinferArtifactReader Reader { get; }
-        internal NinferTensorDescriptor Tensor => (NinferTensorDescriptor)Reader.GetObject("projection");
+        internal NinferTensorDescriptor Tensor => Reader.GetBinding("projection").Object;
         internal byte[] Original { get; }
         internal Fixture(int rows = 128, int columns = 64)
         {
@@ -25,29 +25,15 @@ public sealed class NinferOriginalProjectionSourceTests
             for (int i = 0; i < codes; i++) Original[i] = unchecked((byte)(i * 29 + (i >> 3) * 11));
             for (int i = 0; i < scales; i++) Original[codes + i] = (byte)((i * 13 + 7) % 127);
             BinaryPrimitives.WriteUInt32LittleEndian(Original.AsSpan(codes + scales), 0x40200000);
-            int unrelatedOffset = (Original.Length + 255) / 256 * 256;
-            byte[] metadata = JsonSerializer.SerializeToUtf8Bytes(new
-            {
-                identity = new { model_id = "original-reader-fixture", weights_id = "raw-only" },
-                objects = new object[]
-                {
-                    new { name = "projection", kind = "tensor", shape = new[] { rows, columns }, format = "NVFP4", layout = "blockscale-k16-m128x4-v1", offset = 0, bytes = Original.Length },
-                    new { name = "unrelated", kind = "resource", encoding = "raw-bytes-v1", offset = unrelatedOffset, bytes = 32 }
-                }
-            });
-            using (var file = File.Create(_path))
-            {
-                file.Write("NINFER\0\x02"u8); Span<byte> n = stackalloc byte[8];
-                BinaryPrimitives.WriteUInt64LittleEndian(n, (ulong)metadata.Length); file.Write(n); file.Write(metadata);
-                long payload = (16L + metadata.Length + 4095) / 4096 * 4096;
-                file.Position = payload; file.Write(Original); file.Position = payload + unrelatedOffset;
-                file.Write(Enumerable.Repeat((byte)0xee, 32).ToArray());
-            }
-            Reader = new NinferArtifactReader(_path);
+            var b = new NinferV3Builder();
+            b.Bind("projection", b.TensorBytes("nvfp4", new[] { (ulong)rows, (ulong)columns }, Original));
+            b.Resource("text", "unrelated", Enumerable.Repeat((byte)0xee, 32).ToArray());
+            _file = b.Write();
+            Reader = new NinferArtifactReader(_file.Path);
         }
         internal NinferNvfp4WeightSource Source(NinferNvfp4RowMapping mapping = NinferNvfp4RowMapping.Identity)
             => new(new NinferNvfp4PlaneReader(Reader, Tensor, mapping: mapping));
-        public void Dispose() { Reader.Dispose(); File.Delete(_path); }
+        public void Dispose() { Reader.Dispose(); _file.Dispose(); }
     }
 
     private static byte[] Read(ICudaNinferOriginalProjectionSource source, long offset, int bytes)

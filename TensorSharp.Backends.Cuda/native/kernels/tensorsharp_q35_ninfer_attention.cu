@@ -8,6 +8,27 @@
 #define TS_NINFER_KV_BLOCK 256
 #define TS_NINFER_ROPE_DIMS 64
 #define TS_NINFER_Q8_ROW 512 // BF16 cache bytes, not q8 storage
+// FP8 KV row (TS_Q35_NINFER_KV=fp8): 256 E4M3 codes, then one F32 scale per 128 values
+// (amax / 448), padded to 272 bytes so every row stays 16-byte aligned for cp.async.
+#define TS_NINFER_FP8_ROW 272
+#include <cuda_fp8.h>
+#include <cuda_fp16.h>
+// Eight E4M3 codes times their group scale, rounded to eight BF16 values (exact widening, one rounding).
+__device__ __forceinline__ uint4 ts_ninfer_fp8x8_bf16(uint2 codes, float scale)
+{
+    uint32_t w[2] = {codes.x, codes.y}, out[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        const uint32_t pair = (w[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint32_t h;
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"((unsigned short)pair));
+        const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+        const __nv_bfloat162 b = __floats2bfloat162_rn(f.x * scale, f.y * scale);
+        out[i] = *reinterpret_cast<const uint32_t*>(&b);
+    }
+    return make_uint4(out[0], out[1], out[2], out[3]);
+}
 __device__ __forceinline__ float ts_ninfer_bf(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 __device__ __forceinline__ float ts_ninfer_warp_sum(float v) {
 #pragma unroll
@@ -20,7 +41,7 @@ extern "C" __global__ void ts_ninfer_attn_prep_f32(
     const float* __restrict__ qNorm, const float* __restrict__ kNorm, float eps,
     const int* __restrict__ ropePos, int ropeStride, int sectT, int sectH, int sectW, float ropeBase,
     const int* __restrict__ cacheRow, uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
-    float* __restrict__ q, float* __restrict__ gate, const float* __restrict__ invFrequency)
+    float* __restrict__ q, float* __restrict__ gate, const float* __restrict__ invFrequency, int kvFp8)
 {
     const int units = nHead + 2 * nKv;
     const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -85,8 +106,29 @@ extern "C" __global__ void ts_ninfer_attn_prep_f32(
     const bool isK = unit < nHead + nKv;
     const int head = isK ? unit - nHead : unit - nHead - nKv;
     const int cr = cacheRow[row];
+    const long long rowBytes = kvFp8 ? TS_NINFER_FP8_ROW : TS_NINFER_Q8_ROW;
     uint8_t* cache = blockTable[(long long)seq * maxBlocks + cr / TS_NINFER_KV_BLOCK] + (isK ? kOff : vOff)
-                   + ((long long)head * TS_NINFER_KV_BLOCK + cr % TS_NINFER_KV_BLOCK) * TS_NINFER_Q8_ROW;
+                   + ((long long)head * TS_NINFER_KV_BLOCK + cr % TS_NINFER_KV_BLOCK) * rowBytes;
+    if (kvFp8)
+    {
+        // Values 0-127 are j = 0..3, 128-255 are j = 4..7 (dim = lane + 32 j): one scale per half.
+        float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { a0 = fmaxf(a0, fabsf(v[j])); a1 = fmaxf(a1, fabsf(v[j + 4])); }
+#pragma unroll
+        for (int off = 16; off; off >>= 1)
+        {
+            a0 = fmaxf(a0, __shfl_xor_sync(0xffffffff, a0, off));
+            a1 = fmaxf(a1, __shfl_xor_sync(0xffffffff, a1, off));
+        }
+        const float s0 = a0 / 448.0f, s1 = a1 / 448.0f;
+        const float i0 = s0 > 0.0f ? 1.0f / s0 : 0.0f, i1 = s1 > 0.0f ? 1.0f / s1 : 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            cache[32 * j + lane] = __nv_cvt_float_to_fp8(v[j] * (j < 4 ? i0 : i1), __NV_SATFINITE, __NV_E4M3);
+        if (lane < 2) reinterpret_cast<float*>(cache + 256)[lane] = lane ? s1 : s0;
+        return;
+    }
 #pragma unroll
     for (int j = 0; j < 8; ++j)
         ((__nv_bfloat16*)cache)[32*j+lane] = __float2bfloat16_rn(v[j]);
@@ -133,6 +175,20 @@ __device__ __forceinline__ void ts_ninfer_dequant_tile(const uint8_t* head, long
  }
 }
 
+// FP8 rows: the same 32 x 256 BF16 tile, eight values per thread step.
+__device__ __forceinline__ void ts_ninfer_dequant_tile_fp8(const uint8_t* head, int limit, __nv_bfloat16* tile)
+{
+ for(int i=threadIdx.x;i<TS_NINFER_ATTN_KT*(TS_NINFER_HD/8);i+=blockDim.x) {
+  const int key=i/(TS_NINFER_HD/8),c8=(i%(TS_NINFER_HD/8))*8;
+  uint4 value=make_uint4(0u,0u,0u,0u);
+  if(key<limit) {
+   const uint8_t* row=head+(long long)key*TS_NINFER_FP8_ROW;
+   value=ts_ninfer_fp8x8_bf16(*reinterpret_cast<const uint2*>(row+c8),reinterpret_cast<const float*>(row+256)[c8>>7]);
+  }
+  *reinterpret_cast<uint4*>(tile+key*TS_NINFER_ATTN_ROW+c8)=value;
+ }
+}
+
 __device__ __forceinline__ void ts_ninfer_cp16(void* dst, const void* src, bool valid)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -167,12 +223,40 @@ __device__ __forceinline__ void ts_ninfer_async_tile(const uint8_t* head, long l
     }
 }
 #define TS_NINFER_PIPE_SMEM (4 * TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW * 2)
+// FP8: 32 rows of 272 bytes (17 cp.async chunks each) into a contiguous staging tile.
+__device__ __forceinline__ void ts_ninfer_async_tile_fp8(const uint8_t* head, int limit, uint8_t* stage)
+{
+    for (int i = threadIdx.x; i < TS_NINFER_ATTN_KT * (TS_NINFER_FP8_ROW / 16); i += blockDim.x)
+    {
+        const int key = i / (TS_NINFER_FP8_ROW / 16), chunk = i % (TS_NINFER_FP8_ROW / 16);
+        const bool ok = key < limit;
+        ts_ninfer_cp16(stage + key * TS_NINFER_FP8_ROW + chunk * 16, head + (long long)(ok ? key : 0) * TS_NINFER_FP8_ROW + chunk * 16, ok);
+    }
+}
+// Staged FP8 rows to the padded BF16 tile; rows past `limit` become exact zeros.
+__device__ __forceinline__ void ts_ninfer_stage_to_bf16(const uint8_t* stage, int limit, __nv_bfloat16* tile)
+{
+    for (int i = threadIdx.x; i < TS_NINFER_ATTN_KT * (TS_NINFER_HD / 8); i += blockDim.x)
+    {
+        const int key = i / (TS_NINFER_HD / 8), c8 = (i % (TS_NINFER_HD / 8)) * 8;
+        uint4 value = make_uint4(0u, 0u, 0u, 0u);
+        if (key < limit)
+        {
+            const uint8_t* row = stage + key * TS_NINFER_FP8_ROW;
+            value = ts_ninfer_fp8x8_bf16(*reinterpret_cast<const uint2*>(row + c8), reinterpret_cast<const float*>(row + 256)[c8 >> 7]);
+        }
+        *reinterpret_cast<uint4*>(tile + key * TS_NINFER_ATTN_ROW + c8) = value;
+    }
+}
+// [2 stages][K|V][32][272] FP8 staging, then one BF16 K tile and one BF16 V tile.
+#define TS_NINFER_FP8_STAGE_BYTES (2 * TS_NINFER_ATTN_KT * TS_NINFER_FP8_ROW)
+#define TS_NINFER_PIPE_SMEM_FP8 (2 * TS_NINFER_FP8_STAGE_BYTES + 2 * TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW * 2)
 
 // PIPE (the split kernel): the K/V tiles are staged with 16-byte cp.async into two dynamic
 // shared-memory buffers so the next tile's load overlaps this tile's MMAs (the plain
 // version, kept for the unsplit prefill kernel, loads 2 bytes per thread per element in
 // lock-step with compute; as a split kernel it was load-bound on long verify histories).
-template <bool SPLIT, bool PIPE = false>
+template <bool SPLIT, bool PIPE = false, bool FP8 = false>
 __device__ __forceinline__ void ts_ninfer_attention(
     const float* __restrict__ q, const float* __restrict__ gate, const int* __restrict__ keyEnd,
     uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
@@ -210,7 +294,7 @@ __device__ __forceinline__ void ts_ninfer_attention(
     }
     // Cache blocks hold this head's TS_NINFER_KV_BLOCK keys contiguously, and a 32-key tile never
     // leaves its block.
-    const long long keyStride = TS_NINFER_Q8_ROW;
+    const long long keyStride = FP8 ? TS_NINFER_FP8_ROW : TS_NINFER_Q8_ROW;
     uint8_t* const* blocks = blockTable + (long long)seq * maxBlocks;
 
     // This warp's rows: r0 = rowBase + warp * 16 + g, r1 = r0 + 8.
@@ -247,9 +331,18 @@ __device__ __forceinline__ void ts_ninfer_attention(
     extern __shared__ __align__(16) unsigned char ts_ninfer_pipe_smem[];
     auto tileOf = [&](int first) {
         return blocks[first / TS_NINFER_KV_BLOCK]
-             + ((long long)kvh * TS_NINFER_KV_BLOCK + first % TS_NINFER_KV_BLOCK) * TS_NINFER_Q8_ROW;
+             + ((long long)kvh * TS_NINFER_KV_BLOCK + first % TS_NINFER_KV_BLOCK) * keyStride;
     };
-    if constexpr (PIPE)
+    if constexpr (PIPE && FP8)
+    {
+        if (kLo < kHi)
+        {
+            ts_ninfer_async_tile_fp8(tileOf(kLo) + kOff, kHi - kLo, ts_ninfer_pipe_smem);
+            ts_ninfer_async_tile_fp8(tileOf(kLo) + vOff, kHi - kLo, ts_ninfer_pipe_smem + TS_NINFER_ATTN_KT * TS_NINFER_FP8_ROW);
+        }
+        ts_ninfer_cp_commit();
+    }
+    else if constexpr (PIPE)
     {
         if (kLo < kHi)
         {
@@ -263,7 +356,28 @@ __device__ __forceinline__ void ts_ninfer_attention(
     {
         const __nv_bfloat16* ks;
         const __nv_bfloat16* vs;
-        if constexpr (PIPE)
+        if constexpr (PIPE && FP8)
+        {
+            const int slot = it & 1;
+            const int next = first + TS_NINFER_ATTN_KT;
+            if (next < kHi)
+            {
+                uint8_t* dst = ts_ninfer_pipe_smem + (slot ^ 1) * TS_NINFER_FP8_STAGE_BYTES;
+                ts_ninfer_async_tile_fp8(tileOf(next) + kOff, kHi - next, dst);
+                ts_ninfer_async_tile_fp8(tileOf(next) + vOff, kHi - next, dst + TS_NINFER_ATTN_KT * TS_NINFER_FP8_ROW);
+            }
+            ts_ninfer_cp_commit();
+            ts_ninfer_cp_wait<1>();
+            __syncthreads();
+            const uint8_t* stage = ts_ninfer_pipe_smem + slot * TS_NINFER_FP8_STAGE_BYTES;
+            __nv_bfloat16* tiles = reinterpret_cast<__nv_bfloat16*>(ts_ninfer_pipe_smem + 2 * TS_NINFER_FP8_STAGE_BYTES);
+            ts_ninfer_stage_to_bf16(stage, kHi - first, tiles);
+            ts_ninfer_stage_to_bf16(stage + TS_NINFER_ATTN_KT * TS_NINFER_FP8_ROW, kHi - first, tiles + TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW);
+            __syncthreads();
+            ks = tiles;
+            vs = tiles + TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW;
+        }
+        else if constexpr (PIPE)
         {
             __nv_bfloat16* base = reinterpret_cast<__nv_bfloat16*>(ts_ninfer_pipe_smem);
             const int slot = it & 1;
@@ -283,8 +397,16 @@ __device__ __forceinline__ void ts_ninfer_attention(
         else
         {
             __syncthreads();
-            ts_ninfer_dequant_tile(tileOf(first) + kOff, keyStride, 0, kHi - first, ksStatic);
-            ts_ninfer_dequant_tile(tileOf(first) + vOff, keyStride, 0, kHi - first, vsStatic);
+            if constexpr (FP8)
+            {
+                ts_ninfer_dequant_tile_fp8(tileOf(first) + kOff, kHi - first, ksStatic);
+                ts_ninfer_dequant_tile_fp8(tileOf(first) + vOff, kHi - first, vsStatic);
+            }
+            else
+            {
+                ts_ninfer_dequant_tile(tileOf(first) + kOff, keyStride, 0, kHi - first, ksStatic);
+                ts_ninfer_dequant_tile(tileOf(first) + vOff, keyStride, 0, kHi - first, vsStatic);
+            }
             __syncthreads();
             ks = ksStatic;
             vs = vsStatic;
@@ -433,7 +555,39 @@ extern "C" __global__ void __launch_bounds__(128) ts_ninfer_attn_bf16_split_pipe
     ts_ninfer_attention<true, true>(q, nullptr, keyEnd, blockTable, maxBlocks, kOff, vOff, rowsPerSeq, nHead, nKv, scale, chunk,
                                  gridDim.x, partial, nullptr);
 }
-extern "C" __global__ void ts_ninfer_attn_pipe_smem_bytes(int* out) { out[0] = TS_NINFER_PIPE_SMEM; }
+extern "C" __global__ void ts_ninfer_attn_pipe_smem_bytes(int* out) { out[0] = TS_NINFER_PIPE_SMEM; out[1] = TS_NINFER_PIPE_SMEM_FP8; }
+
+// FP8 KV variants of the two entries above (TS_NINFER_FP8_ROW rows).
+extern "C" __global__ void __launch_bounds__(256) ts_ninfer_attn_fp8_f32(
+    const float* __restrict__ q, const float* __restrict__ gate, const int* __restrict__ keyEnd,
+    uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
+    int rowsPerSeq, int nHead, int nKv, float scale, float* __restrict__ out)
+{
+    ts_ninfer_attention<false, false, true>(q, gate, keyEnd, blockTable, maxBlocks, kOff, vOff, rowsPerSeq, nHead, nKv, scale, 0, 1, nullptr, out);
+}
+extern "C" __global__ void __launch_bounds__(128) ts_ninfer_attn_fp8_split_pipe_f32(
+    const float* __restrict__ q, const int* __restrict__ keyEnd,
+    uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
+    int rowsPerSeq, int nHead, int nKv, float scale, int chunk, float* __restrict__ partial)
+{
+    ts_ninfer_attention<true, true, true>(q, nullptr, keyEnd, blockTable, maxBlocks, kOff, vOff, rowsPerSeq, nHead, nKv, scale, chunk,
+                                       gridDim.x, partial, nullptr);
+}
+// FP8 rows [0, keys) of one sequence's layer (K and V, all KV heads) into BF16 scratch blocks of
+// the original layout (K plane, then V plane: [head][256 keys][256 values]) for the BF16 prefill
+// core. One warp per (key, head, K|V); grid (ceil(keys / 8), nKv, 2), 256 threads.
+extern "C" __global__ void __launch_bounds__(256) ts_ninfer_kv_fp8_to_bf16(
+    uint8_t* const* __restrict__ blockTable, long long kOff, long long vOff, int keys,
+    uint8_t* const* __restrict__ scratchTable, long long scratchPlaneBytes)
+{
+    const int key = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31, head = blockIdx.y, isV = blockIdx.z;
+    if (key >= keys) return;
+    const long long inBlock = (long long)head * TS_NINFER_KV_BLOCK + key % TS_NINFER_KV_BLOCK;
+    const uint8_t* row = blockTable[key / TS_NINFER_KV_BLOCK] + (isV ? vOff : kOff) + inBlock * TS_NINFER_FP8_ROW;
+    __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(scratchTable[key / TS_NINFER_KV_BLOCK] + isV * scratchPlaneBytes) + inBlock * TS_NINFER_HD;
+    const int c8 = lane * 8;
+    *reinterpret_cast<uint4*>(dst + c8) = ts_ninfer_fp8x8_bf16(*reinterpret_cast<const uint2*>(row + c8), reinterpret_cast<const float*>(row + 256)[c8 >> 7]);
+}
 
 // Merge the split partials of every (row, head) in split order and apply the gate:
 // out = (sum_s acc_s e^(m_s - M)) / (sum_s l_s e^(m_s - M)) * sigmoid(gate). One block per

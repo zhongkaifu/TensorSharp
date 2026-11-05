@@ -7,17 +7,18 @@ using TensorSharp.Cuda.Interop;
 namespace TensorSharp.Cuda;
 
 /// <summary>
-/// Standalone original DFlash2 components, deliberately disconnected from serving.
-/// Activations, plain weights and cyclic KV are actual BF16. Projection codes/scales use
-/// original adjacent-K/m128x4 storage, never the target adapter's permuted planes.
+/// DFlash2 components of the NInfer v3 artifact. Activations, plain weights and cyclic KV are
+/// BF16; projections are q8_g32 (INT8 codes, F16 group-32 scales) or BF16 on the small-T BF16
+/// tensor-core kernels; the candidate codebooks are BF16.
 /// Device metadata values must be validated by the owning scheduler before submission.
 /// </summary>
 internal sealed unsafe class CudaNinferDraftModule : IDisposable
 {
     internal const string EnvironmentVariable = "TS_Q35_NINFER_DRAFT_PTX";
     private readonly CudaModule _module;
-    private readonly IntPtr[,] _linear = new IntPtr[6, 32];
-    private readonly IntPtr[] _swiglu = new IntPtr[16], _swaPartial = new IntPtr[8], _swaDirect = new IntPtr[8], _swaReduce = new IntPtr[8];
+    // [tile 8/16/32]: q8_g32 projection, q8_g32 gate|up SwiGLU, BF16-weight projection.
+    private readonly IntPtr[] _w8 = new IntPtr[3], _w8SwiGlu = new IntPtr[3], _bf16w = new IntPtr[3];
+    private readonly IntPtr[] _swaPartial = new IntPtr[8], _swaDirect = new IntPtr[8], _swaReduce = new IntPtr[8];
     private readonly IntPtr _rms128, _rms5120, _conv, _residual, _tap, _pack, _cast, _prepare, _rope, _append;
     private readonly IntPtr _topPartial, _topMerge, _pred, _scores, _walk;
     private bool _disposed;
@@ -28,10 +29,11 @@ internal sealed unsafe class CudaNinferDraftModule : IDisposable
         _module = CudaModule.LoadFromFile(Path.GetFullPath(path), identify: true);
         try
         {
-            var shapes = new[] { (5120, 25600), (6144, 5120), (5120, 4096), (1280, 5120), (256, 5120), (5120, 17408) };
-            for (int i = 0; i < shapes.Length; i++) for (int t = 1; t <= 32; t++)
-                _linear[i, t - 1] = Function($"ts_nidf_linear_n{shapes[i].Item1}_k{shapes[i].Item2}_t{t}");
-            for (int t = 1; t <= 16; t++) _swiglu[t - 1] = Function($"ts_nidf_swiglu_t{t}");
+            for (int i = 0; i < 3; i++)
+            {
+                int tile = 8 << i;
+                _w8[i] = Function($"ts_nidf_w8_t{tile}"); _w8SwiGlu[i] = Function($"ts_nidf_w8_swiglu_t{tile}"); _bf16w[i] = Function($"ts_nidf_bf16w_t{tile}");
+            }
             for (int t = 1; t <= 8; t++)
             {
                 _swaPartial[t - 1] = Function($"ts_nidf_swa_partial_t{t}");
@@ -43,99 +45,42 @@ internal sealed unsafe class CudaNinferDraftModule : IDisposable
             _cast = Function("ts_nidf_cast_bf16_f32"); _prepare = Function("ts_nidf_prepare_block");
             _rope = Function("ts_nidf_rope"); _append = Function("ts_nidf_ring_append");
             _topPartial = Function("ts_nidf_top16_partial"); _topMerge = Function("ts_nidf_top16_merge");
-            _pred = Function("ts_nidf_selector_predecessors"); _scores = Function("ts_nidf_selector_scores"); _walk = Function("ts_nidf_selector_walk");
+            _pred = Function("ts_nidf_selector_predecessors"); _scores = Function("ts_nidf_selector_scores_bf16"); _walk = Function("ts_nidf_selector_walk");
         }
         catch { _module.Dispose(); throw; }
     }
     private IntPtr Function(string name) => _module.GetFunction(name);
 
-    // Tensor-core A16 route for the context append's wide token counts (see the
-    // ts_nidf_mma kernels): [shape][full, partial], absent in older images.
-    private readonly IntPtr[,] _mma = new IntPtr[2, 2];
-    private int _mmaSharedBytes, _mmaThreads;
-    private bool _mmaResolved;
-    internal long MmaLaunches { get; private set; }
-    internal const int MmaMinTokens = 64;
-    private bool MmaAvailable()
+    // Warps per CTA of each small-T instance (tensorsharp_q35_ninfer_draft.cu TS_NIDF_SMALL).
+    private static int Tile(int tokens) => tokens <= 8 ? 0 : tokens <= 16 ? 1 : 2;
+    private static int Threads(int tile, bool bf16Weights) => (tile == 0 || (tile == 1 && !bf16Weights) ? 4 : 2) * 32;
+    /// <summary>Weight rows per CTA (16 x RT) of each instance.</summary>
+    private static int WeightRows(int tile, bool bf16Weights) => tile == 0 ? 16 : 32;
+
+    /// <summary>y[tokens][n] = x W^T for a q8_g32 (scales: F16 [n][k/32]) or BF16-weight matrix,
+    /// BF16 activations and outputs; any token count (32-row grid tiles).</summary>
+    internal void ProjectSmall(bool w8, IntPtr weights, IntPtr scales, IntPtr input, IntPtr output, int n, int k, int tokens, IntPtr stream)
     {
-        if (_mmaResolved) return _mmaThreads > 0;
-        _mmaResolved = true;
-        try
-        {
-            var shapes = new[] { (5120, 25600), (6144, 5120) };
-            for (int i = 0; i < shapes.Length; i++)
-            {
-                _mma[i, 0] = Function($"ts_nidf_mma_n{shapes[i].Item1}_k{shapes[i].Item2}_full");
-                _mma[i, 1] = Function($"ts_nidf_mma_n{shapes[i].Item1}_k{shapes[i].Item2}_part");
-            }
-            CudaDriverApi.cuMemAlloc(out IntPtr probe, new UIntPtr(8)).ThrowOnError();
-            try
-            {
-                void** args = stackalloc void*[] { &probe };
-                Launch(Function("ts_nidf_mma_shared_bytes"), 1, 1, 1, 1, 0, IntPtr.Zero, args);
-                int* host = stackalloc int[2];
-                CudaDriverApi.cuMemcpyDtoH((IntPtr)host, probe, new UIntPtr(8)).ThrowOnError();
-                (_mmaSharedBytes, _mmaThreads) = (host[0], host[1]);
-            }
-            finally { CudaDriverApi.cuMemFree(probe); }
-        }
-        catch (CudaException error) when (error.ErrorCode == 500)
-        {
-            _mmaThreads = 0;
-            Console.Error.WriteLine("[q35-cuda] NInfer draft image has no tensor-core A16 projection; using the small-T route");
-        }
-        return _mmaThreads > 0;
+        int tile = Tile(tokens), tt = 8 << tile, rowsPerCta = WeightRows(tile, !w8);
+        if (n % rowsPerCta != 0 || k % 256 != 0 || tokens < 1) throw new ArgumentOutOfRangeException(nameof(n), "Draft projections need whole weight-row tiles and k % 256 == 0.");
+        long wb = (long)n * k * (w8 ? 1 : 2), ib = (long)tokens * k * 2, ob = (long)tokens * n * 2;
+        Pointer(weights, wb, 16); Pointer(input, ib, 16); Pointer(output, ob, 2);
+        Separate(output, ob, weights, wb); Separate(output, ob, input, ib);
+        void** args = stackalloc void*[] { &weights, &scales, &input, &output, &n, &k, &tokens, &n };
+        Launch(w8 ? _w8[tile] : _bf16w[tile], n / rowsPerCta, (tokens + tt - 1) / tt, 1, Threads(tile, !w8), 0, stream, args);
     }
 
-    /// <summary>One launch over all <paramref name="tokens"/> rows on the BF16 tensor cores,
-    /// for the context append's wide projections. False leaves the caller's small-T route.</summary>
-    internal bool TryProjectMma(IntPtr codes, IntPtr scales, IntPtr input, IntPtr output, int n, int k, int tokens, float inverseDivisor, IntPtr stream)
+    /// <summary>BF16(silu(gate) * up) [tokens][n / 2] from a q8_g32 gate|up matrix interleaved by 8 rows.</summary>
+    internal void SwiGluW8(IntPtr weights, IntPtr scales, IntPtr input, IntPtr output, int n, int k, int tokens, IntPtr stream)
     {
-        int shape = (n, k) switch { (5120, 25600) => 0, (6144, 5120) => 1, _ => -1 };
-        if (shape < 0 || tokens < MmaMinTokens || !MmaAvailable()) return false;
-        Factor(inverseDivisor);
-        long codeBytes = (long)n * k / 2, scaleBytes = (long)n * k / 16, inputBytes = (long)tokens * k * 2, outputBytes = (long)tokens * n * 2;
-        Pointer(codes, codeBytes, 16); Pointer(scales, scaleBytes, 16); Pointer(input, inputBytes, 16); Pointer(output, outputBytes, 2);
-        Separate(output, outputBytes, codes, codeBytes); Separate(output, outputBytes, scales, scaleBytes); Separate(output, outputBytes, input, inputBytes);
-        int tilesN = (tokens + 127) / 128;
-        void** args = stackalloc void*[] { &codes, &scales, &input, &output, &inverseDivisor, &tokens };
-        Launch(_mma[shape, tokens % 128 == 0 ? 0 : 1], checked(n / 64 * tilesN), 1, 1, _mmaThreads, (uint)_mmaSharedBytes, stream, args);
-        MmaLaunches++;
-        return true;
-    }
-
-    internal readonly record struct ProjectionLayout(int ShapeIndex, int Threads, int Blocks, long CodeBytes, long ScaleBytes, long InputBytes, long OutputBytes);
-    internal static ProjectionLayout ValidateProjection(int n, int k, int tokens, float inverseDivisor)
-    {
-        int shape = (n, k) switch { (5120, 25600) => 0, (6144, 5120) => 1, (5120, 4096) => 2, (1280, 5120) => 3, (256, 5120) => 4, (5120, 17408) => 5, _ => -1 };
-        if (shape < 0 || tokens < 1 || tokens > 32) throw new ArgumentOutOfRangeException(nameof(tokens), "Expected an original draft projection and T=1..32.");
-        Factor(inverseDivisor);
-        int warps = tokens == 1 ? 8 : tokens >= 17 ? 4 : shape == 5 ? (tokens >= 8 ? 16 : 4) : (tokens >= 13 ? 16 : 8);
-        return new(shape, warps * 32, n / (warps * 2), checked((long)n * k / 2), checked((long)n * k / 16), checked((long)tokens * k * 2), checked((long)tokens * n * 2));
-    }
-    internal void ProjectRaw(IntPtr codes, IntPtr scales, IntPtr input, IntPtr output, int n, int k, int tokens, float inverseDivisor, IntPtr stream)
-    {
-        var p = ValidateProjection(n, k, tokens, inverseDivisor);
-        Pointer(codes, p.CodeBytes, 16); Pointer(scales, p.ScaleBytes, 16); Pointer(input, p.InputBytes, 16); Pointer(output, p.OutputBytes, 2);
-        Separate(output, p.OutputBytes, codes, p.CodeBytes); Separate(output, p.OutputBytes, scales, p.ScaleBytes); Separate(output, p.OutputBytes, input, p.InputBytes);
-        void** args = stackalloc void*[] { &codes, &scales, &input, &output, &inverseDivisor };
-        Launch(_linear[p.ShapeIndex, tokens - 1], p.Blocks, 1, 1, p.Threads, 0, stream, args);
-    }
-
-    internal static int SwiGluThreads(int tokens)
-    {
-        if (tokens < 1 || tokens > 16) throw new ArgumentOutOfRangeException(nameof(tokens));
-        return (tokens >= 13 ? 16 : tokens >= 5 ? 4 : 8) * 32;
-    }
-    internal void SwiGluRaw(IntPtr codes, IntPtr scales, IntPtr input, IntPtr output, int tokens, float inverseDivisor, IntPtr stream)
-    {
-        int threads = SwiGluThreads(tokens); Factor(inverseDivisor);
-        const long codeBytes = 34816L * 5120 / 2, scaleBytes = 34816L * 5120 / 16;
-        long ib = tokens * 5120L * 2, ob = tokens * 17408L * 2;
-        Pointer(codes, codeBytes, 16); Pointer(scales, scaleBytes, 16); Pointer(input, ib, 16); Pointer(output, ob, 2);
-        Separate(output, ob, codes, codeBytes); Separate(output, ob, scales, scaleBytes); Separate(output, ob, input, ib);
-        void** args = stackalloc void*[] { &codes, &scales, &input, &output, &inverseDivisor };
-        Launch(_swiglu[tokens - 1], 17408 / (threads / 32), 1, 1, threads, 0, stream, args);
+        if (n % 16 != 0 || k % 256 != 0 || tokens < 1) throw new ArgumentOutOfRangeException(nameof(n));
+        long wb = (long)n * k, ib = (long)tokens * k * 2, ob = (long)tokens * (n / 2) * 2;
+        Pointer(weights, wb, 16); Pointer(input, ib, 16); Pointer(output, ob, 2);
+        Separate(output, ob, weights, wb); Separate(output, ob, input, ib);
+        int tile = Tile(tokens), tt = 8 << tile, ldy = n / 2, rowsPerCta = WeightRows(tile, false);
+        if (n % rowsPerCta != 0) throw new ArgumentOutOfRangeException(nameof(n));
+        void** args = stackalloc void*[] { &weights, &scales, &input, &output, &n, &k, &tokens, &ldy };
+        Launch(_w8SwiGlu[tile], n / rowsPerCta, (tokens + tt - 1) / tt, 1, Threads(tile, false), 0, stream, args);
     }
 
     internal void PlainRms(IntPtr input, IntPtr weight, IntPtr output, int width, int rows, float eps, IntPtr stream)
@@ -287,19 +232,15 @@ internal sealed unsafe class CudaNinferDraftModule : IDisposable
         Pointer(candidates, bytes, 4); Pointer(anchors, lanes * 4L, 4); Pointer(output, bytes, 4); Separate(output, bytes, candidates, bytes); Separate(output, bytes, anchors, lanes * 4L);
         void** args = stackalloc void*[] { &candidates, &anchors, &top, &positions, &lanes, &output }; Launch(_pred, Grid(bytes / 4), 1, 1, 256, 0, stream, args);
     }
-    internal void SelectorScoresRaw(IntPtr candidates, IntPtr predecessors, IntPtr unary, IntPtr hidden,
-        IntPtr successorCodes, IntPtr successorScales, float successorInverseDivisor, IntPtr predecessorCodes, IntPtr predecessorScales,
-        float predecessorInverseDivisor, IntPtr output, int vocabulary, int positions, int lanes, IntPtr stream)
+    internal void SelectorScoresBf16(IntPtr candidates, IntPtr predecessors, IntPtr unary, IntPtr hidden,
+        IntPtr successor, IntPtr predecessor, IntPtr output, int positions, int lanes, IntPtr stream)
     {
-        SelectorShape(positions, lanes); Factor(successorInverseDivisor); Factor(predecessorInverseDivisor);
-        if (vocabulary < 128 || vocabulary > 248320 || vocabulary % 128 != 0) throw new ArgumentOutOfRangeException(nameof(vocabulary));
-        int rank = 256, top = 16; long cb = vocabulary * 128L, sb = vocabulary * 16L, ib = (long)positions * lanes * 16 * 4, hb = (long)positions * lanes * 256 * 4, ob = ib * 16;
+        SelectorShape(positions, lanes);
+        int rank = 256, top = 16; long cb = 248320L * rank * 2, ib = (long)positions * lanes * 16 * 4, hb = (long)positions * lanes * 256 * 4, ob = ib * 16;
         Pointer(candidates, ib, 4); Pointer(predecessors, ib, 4); Pointer(unary, ib, 4); Pointer(hidden, hb, 4);
-        Pointer(successorCodes, cb, 1); Pointer(successorScales, sb, 1); Pointer(predecessorCodes, cb, 1); Pointer(predecessorScales, sb, 1); Pointer(output, ob, 4);
+        Pointer(successor, cb, 2); Pointer(predecessor, cb, 2); Pointer(output, ob, 4);
         Separate(output, ob, candidates, ib); Separate(output, ob, predecessors, ib); Separate(output, ob, unary, ib); Separate(output, ob, hidden, hb);
-        Separate(output, ob, successorCodes, cb); Separate(output, ob, successorScales, sb); Separate(output, ob, predecessorCodes, cb); Separate(output, ob, predecessorScales, sb);
-        void** args = stackalloc void*[] { &candidates, &predecessors, &unary, &hidden, &successorCodes, &successorScales, &successorInverseDivisor,
-            &predecessorCodes, &predecessorScales, &predecessorInverseDivisor, &rank, &top, &positions, &lanes, &output };
+        void** args = stackalloc void*[] { &candidates, &predecessors, &unary, &hidden, &successor, &predecessor, &rank, &top, &positions, &lanes, &output };
         Launch(_scores, checked(16 * 16 * positions * lanes), 1, 1, 256, 0, stream, args);
     }
     internal void SelectorWalk(IntPtr scores, IntPtr candidates, IntPtr output, int positions, int lanes, IntPtr stream)

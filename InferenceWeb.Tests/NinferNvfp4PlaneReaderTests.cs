@@ -13,14 +13,14 @@ public sealed class NinferNvfp4PlaneReaderTests
     private static byte Scale(int row, int group) => (byte)((row * 13 + group * 7) % 127);
     private sealed class Fixture : IDisposable
     {
-        private readonly string _directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ts-ninfer-planes-" + Guid.NewGuid().ToString("N"));
         internal string Path { get; }
         internal int Rows { get; }
         internal int Columns { get; }
         internal byte[] Encoded { get; }
         internal NinferArtifactReader Reader { get; }
-        internal NinferTensorDescriptor Weights => (NinferTensorDescriptor)Reader.GetObject("weights");
-        internal NinferTensorDescriptor Input => (NinferTensorDescriptor)Reader.GetObject("input_divisor");
+        internal NinferTensorDescriptor Weights => Reader.GetBinding("weights").Object;
+        internal NinferTensorDescriptor Input => Reader.GetBinding("input_divisor").Object;
+        private readonly NinferV3File _file;
         internal Fixture(int rows = 128, int columns = 64, uint divisorBits = 0x40200000,
             int invalidScaleIndex = -1, byte invalidScale = 0, uint inputBits = 0x7fc00001)
         {
@@ -39,27 +39,14 @@ public sealed class NinferNvfp4PlaneReaderTests
             Assert.Equal(codeBytes + scaleBytes, at);
             if (invalidScaleIndex >= 0) Encoded[codeBytes + invalidScaleIndex] = invalidScale;
             BinaryPrimitives.WriteUInt32LittleEndian(Encoded.AsSpan(at), divisorBits);
-            int inputOffset = (Encoded.Length + 255) / 256 * 256;
-            byte[] directory = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
-            {
-                identity = new { model_id = "tiny-real-reader", weights_id = "fixture" },
-                objects = new object[]
-                {
-                    new { name = "weights", kind = "tensor", shape = new[] { rows, columns }, format = "NVFP4", layout = "blockscale-k16-m128x4-v1", offset = 0, bytes = Encoded.Length },
-                    new { name = "input_divisor", kind = "tensor", shape = Array.Empty<int>(), format = "FP32", layout = "contiguous-le-v1", offset = inputOffset, bytes = 4 }
-                }
-            }));
-            System.IO.Directory.CreateDirectory(_directory); Path = System.IO.Path.Combine(_directory, "fixture.ninfer");
-            using (var stream = File.Create(Path))
-            {
-                stream.Write("NINFER\0\x02"u8); Span<byte> n = stackalloc byte[8]; BinaryPrimitives.WriteUInt64LittleEndian(n, (ulong)directory.Length); stream.Write(n); stream.Write(directory);
-                long payload = (16L + directory.Length + 4095) / 4096 * 4096;
-                stream.SetLength(payload + inputOffset + 4); stream.Position = payload; stream.Write(Encoded);
-                stream.Position = payload + inputOffset; BinaryPrimitives.WriteUInt32LittleEndian(n[..4], inputBits); stream.Write(n[..4]);
-            }
+            var b = new NinferV3Builder();
+            b.Bind("weights", b.TensorBytes("nvfp4", new[] { (ulong)rows, (ulong)columns }, Encoded));
+            b.Bind("input_divisor", b.ScalarBits(inputBits));
+            _file = b.Write();
+            Path = _file.Path;
             Reader = new NinferArtifactReader(Path);
         }
-        public void Dispose() { Reader.Dispose(); System.IO.Directory.Delete(_directory, true); }
+        public void Dispose() { Reader.Dispose(); _file.Dispose(); }
     }
 
     // Source-to-destination mapping is deliberately the inverse direction of the converter.
@@ -203,7 +190,6 @@ public sealed class NinferNvfp4PlaneReaderTests
         using var convert = new NinferNvfp4PlaneReader(f.Reader, f.Weights, f.Input);
         Assert.Equal(bytes, f.Reader.TotalBytesRead); Assert.Equal(calls, f.Reader.ReadOperations);
         var tile = convert.ReadTile(0); Assert.Same(f.Input, tile.InputScaleDivisor);
-        Assert.Equal(NinferQwen38ContentValidation.NotRead, tile.InputScaleDivisorContentValidation);
         Assert.Equal(0x40500000u, tile.WeightDivisorBits); Assert.Equal(3.25f, tile.WeightDivisor); Assert.True(tile.RequiresWeightDivisorAwareDispatch);
         Assert.Equal(bytes + convert.CodeBytesPerTile + convert.ScaleBytesPerTile, f.Reader.TotalBytesRead); Assert.Equal(calls + 2, f.Reader.ReadOperations);
     }

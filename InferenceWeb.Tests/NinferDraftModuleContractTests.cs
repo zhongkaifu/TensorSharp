@@ -8,54 +8,6 @@ namespace InferenceWeb.Tests;
 public sealed class NinferDraftModuleContractTests
 {
     [Theory]
-    [InlineData(5120, 25600, 73728000L)]
-    [InlineData(6144, 5120, 17694720L)]
-    [InlineData(5120, 4096, 11796480L)]
-    [InlineData(1280, 5120, 3686400L)]
-    [InlineData(256, 5120, 737280L)]
-    [InlineData(5120, 17408, 50135040L)]
-    public void OriginalProjectionLayoutAdmitsAllProductionTokenExtents(int n, int k, long encodedWithoutDivisor)
-    {
-        foreach (int tokens in new[] { 1, 2, 4, 8, 13, 16, 17, 20, 21, 32 })
-        {
-            var layout = CudaNinferDraftModule.ValidateProjection(n, k, tokens, 1f / 2.5f);
-            Assert.Equal(encodedWithoutDivisor, layout.CodeBytes + layout.ScaleBytes);
-            Assert.Equal((long)tokens * k * 2, layout.InputBytes); Assert.Equal((long)tokens * n * 2, layout.OutputBytes);
-            Assert.Equal(n, layout.Blocks * (layout.Threads / 32 * 2));
-        }
-    }
-
-    [Fact]
-    public void OriginalDownScheduleAndToken17CrossoverRetainTheirProductionThreadGeometry()
-    {
-        Assert.Equal(128, CudaNinferDraftModule.ValidateProjection(5120, 17408, 7, 1).Threads);
-        Assert.Equal(512, CudaNinferDraftModule.ValidateProjection(5120, 17408, 8, 1).Threads);
-        Assert.Equal(256, CudaNinferDraftModule.ValidateProjection(6144, 5120, 8, 1).Threads);
-        Assert.Equal(512, CudaNinferDraftModule.ValidateProjection(6144, 5120, 13, 1).Threads);
-        Assert.Equal(128, CudaNinferDraftModule.ValidateProjection(6144, 5120, 17, 1).Threads);
-        Assert.Equal(256, CudaNinferDraftModule.SwiGluThreads(1)); Assert.Equal(128, CudaNinferDraftModule.SwiGluThreads(5));
-        Assert.Equal(512, CudaNinferDraftModule.SwiGluThreads(13));
-    }
-
-    [Theory]
-    [InlineData(6144, 5120, 0)]
-    [InlineData(6144, 5120, 33)]
-    [InlineData(14336, 5120, 8)]
-    [InlineData(34816, 5120, 8)] // Fused SwiGLU is its own original arithmetic, not two rounded linear outputs.
-    [InlineData(248320, 256, 8)] // These are selector lookup codebooks, not projected matrices.
-    [InlineData(5120, 5120, 8)]
-    public void UnsupportedProjectionCannotFallBackToAnotherSchedule(int n, int k, int tokens)
-        => Assert.Throws<ArgumentOutOfRangeException>(() => CudaNinferDraftModule.ValidateProjection(n, k, tokens, 1));
-
-    [Theory]
-    [InlineData(0f)]
-    [InlineData(-1f)]
-    [InlineData(float.PositiveInfinity)]
-    [InlineData(float.NaN)]
-    public void InvalidWeightInverseIsRejectedBeforeAnyDeviceUse(float inverse)
-        => Assert.Throws<ArgumentOutOfRangeException>(() => CudaNinferDraftModule.ValidateProjection(6144, 5120, 1, inverse));
-
-    [Theory]
     [InlineData(0, true, 1)]
     [InlineData(96, true, 1)]
     [InlineData(97, false, 4)]

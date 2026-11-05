@@ -78,7 +78,7 @@ public sealed unsafe partial class Q35CudaEngine
     {
         if (_ninferDraftShortlistKernels == null) return false;
         if (!HasNinferDrafter || _ninferDraftDesc.HeadPolicy != CudaNinferDraftHeadPolicy.OriginalQ4G64Shortlist
-            || columns < 1 || columns > CudaW8G32HeadModule.MaximumRows)
+            || columns < 1 || columns > NinferDraftHeadMaximumRows)
             throw new InvalidOperationException("The original shortlist requires its attached draft policy and complete supported proposal shape.");
         _ninferDraftShortlistKernels.Project(_ninferDraftShortlistWeights,
             _ninferDraftShortlistWeights + (nint)NinferShortlistCodeBytes, proposalHidden, _ndLogits, columns, Stream);

@@ -36,6 +36,7 @@ public sealed class NinferCudaDescriptorTests
             CudaNinferProjectionFormat.NvFp4Planes => n / 2 + n / 16,
             CudaNinferProjectionFormat.BFloat16 => n * 2,
             CudaNinferProjectionFormat.W8G32 => n + n / 16,
+            CudaNinferProjectionFormat.Fp8Row => n + (long)rows * 2,
             _ => throw new ArgumentOutOfRangeException(nameof(format))
         };
         return new(source, 0, bytes, rows, columns, format);
@@ -45,9 +46,8 @@ public sealed class NinferCudaDescriptorTests
         float[] norm = Enumerable.Repeat(1f, 5120).ToArray(), qkNorm = Enumerable.Repeat(1f, 256).ToArray();
         var recipe = new CudaNinferModelDesc
         {
-            Embedding = Matrix(source, 248320, 5120, CudaNinferProjectionFormat.W8G32),
-            Output = new(source, 0, 1_350_860_800, 248320, 5120,
-                Path.GetFullPath("cpu-only-not-created.ptx"), "cpu-only-metadata-contract"),
+            Embedding = Matrix(source, 248320, 5120, CudaNinferProjectionFormat.Fp8Row),
+            Head = Matrix(source, 248320, 5120, CudaNinferProjectionFormat.Fp8Row),
             Layers = new CudaNinferLayerDesc[64], ModulePath = Path.GetFullPath("cpu-only-not-created-body.ptx"),
             Provenance = "cpu-only-metadata-contract"
         };
@@ -61,8 +61,7 @@ public sealed class NinferCudaDescriptorTests
         for (int i = 0; i < 64; i++)
         {
             bool recurrent = (i + 1) % 4 != 0;
-            bool inputBf16 = new[] { 3, 7, 11, 15, 19, 23 }.Contains(i);
-            bool outputBf16 = i is 3 or 4 or 7;
+            bool fp8Mlp = i >= 56;
             model.Layers[i] = new Q35CudaEngine.LayerDesc
             {
                 Recurrent = recurrent, AttnNorm = norm, PostNorm = norm,
@@ -73,11 +72,10 @@ public sealed class NinferCudaDescriptorTests
             };
             recipe.Layers[i] = new CudaNinferLayerDesc
             {
-                Input = Matrix(source, recurrent ? 16384 : 14336, 5120,
-                    inputBf16 ? CudaNinferProjectionFormat.BFloat16 : CudaNinferProjectionFormat.NvFp4Planes),
-                Output = Matrix(source, 5120, 6144,
-                    outputBf16 ? CudaNinferProjectionFormat.BFloat16 : CudaNinferProjectionFormat.NvFp4Planes),
-                GateUp = Matrix(source, 34816, 5120), Down = Matrix(source, 5120, 17408),
+                Input = Matrix(source, recurrent ? 16384 : 14336, 5120, CudaNinferProjectionFormat.Fp8Row),
+                Output = Matrix(source, 5120, 6144, CudaNinferProjectionFormat.Fp8Row),
+                GateUp = Matrix(source, 34816, 5120, fp8Mlp ? CudaNinferProjectionFormat.Fp8Row : CudaNinferProjectionFormat.NvFp4Planes),
+                Down = Matrix(source, 5120, 17408, fp8Mlp ? CudaNinferProjectionFormat.Fp8Row : CudaNinferProjectionFormat.NvFp4Planes),
                 AlphaBeta = recurrent ? Matrix(source, 96, 5120, CudaNinferProjectionFormat.BFloat16) : null
             };
         }
@@ -129,9 +127,8 @@ public sealed class NinferCudaDescriptorTests
     {
         using var options = new Options(); var source = new UnreadSource(); var model = Target(source);
         Q35CudaEngine.ValidateNinferModel(model); Assert.Equal(0, source.Calls);
-        Assert.False(File.Exists(model.Ninfer.ModulePath)); Assert.False(File.Exists(model.Ninfer.Output.ModulePath));
-        Assert.Equal(9, model.Ninfer.Layers.Sum(l => (l.Input.Format == CudaNinferProjectionFormat.BFloat16 ? 1 : 0)
-            + (l.Output.Format == CudaNinferProjectionFormat.BFloat16 ? 1 : 0)));
+        Assert.False(File.Exists(model.Ninfer.ModulePath));
+        Assert.Equal(8, model.Ninfer.Layers.Count(l => l.GateUp.Format == CudaNinferProjectionFormat.Fp8Row));
     }
 
     [Fact]
@@ -144,6 +141,7 @@ public sealed class NinferCudaDescriptorTests
         m = Target(source); m.Layers[3].Recurrent = true; Assert.Throws<ArgumentException>(() => Q35CudaEngine.ValidateNinferModel(m));
         m = Target(source); m.Ninfer.Layers[0].Input = Matrix(source, 14336, 5120); Assert.Throws<ArgumentException>(() => Q35CudaEngine.ValidateNinferModel(m));
         m = Target(source); m.Ninfer.Layers[0].AlphaBeta = null; Assert.Throws<ArgumentException>(() => Q35CudaEngine.ValidateNinferModel(m));
+        m = Target(source); m.Ninfer.Head = Matrix(source, 248320, 5120, CudaNinferProjectionFormat.W8G32); Assert.Throws<NotSupportedException>(() => Q35CudaEngine.ValidateNinferModel(m));
         m = Target(source); m.Ninfer.Layers[3].AlphaBeta = Matrix(source, 96, 5120, CudaNinferProjectionFormat.BFloat16); Assert.Throws<ArgumentException>(() => Q35CudaEngine.ValidateNinferModel(m));
         Assert.Equal(0, source.Calls);
     }

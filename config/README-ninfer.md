@@ -4,17 +4,17 @@ The **same JSON file** works with `TensorSharp.Cli` and `TensorSharp.Server.Host
 
 | Profile | Configured context |
 |---|---:|
-| [qwen3.8-27b-ninfer.json](qwen3.8-27b-ninfer.json) | 40,960; previously qualified engine profile, config parser tested |
-| [qwen3.8-27b-ninfer-64k.json](qwen3.8-27b-ninfer-64k.json) | 65,536; actual CLI smoke and Host full45+30 tested |
+| [qwen3.8-27b-ninfer.json](qwen3.8-27b-ninfer.json) | 40,960 |
+| [qwen3.8-27b-ninfer-64k.json](qwen3.8-27b-ninfer-64k.json) | 65,536 |
 
-Both select native `cuda`, original embedded full-head DFlash2, K7/pMin0 and
-greedy sampling. They do not use `ggml_cuda` or an external draft model.
-Both explicitly default `TS_SPEC_ADAPTIVE=0` to keep K7 drafting stable; this
-does not assert an automatically qualified 64K governor policy.
-The tokenizer, special-token metadata and chat template are in the `.ninfer`
-artifact; no separate tokenizer option or file is needed.
+Both run the [NInfer](https://github.com/Neroued/ninfer) Qwen3.8-27B artifact
+`qwen3_8_27b_nvfp4.ninfer` (NInfer v3 container) on TensorSharp's native `cuda` backend,
+with the artifact's embedded DFlash2 drafter (K7, pMin 0) and greedy sampling. They do not
+use `ggml_cuda` or an external draft model, and set `TS_SPEC_ADAPTIVE=0` to keep K7
+drafting stable. The tokenizer, special tokens, generation defaults and chat template come
+from the artifact; no separate tokenizer file is needed.
 
-Build with a toolkit supporting the target GPU, including the optional assets:
+Build with a toolkit that supports the target GPU:
 
 ```sh
 dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release -p:CudaArch=compute_120
@@ -28,58 +28,55 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen3.8-27b-ninfe
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/qwen3.8-27b-ninfer-64k.json --host 127.0.0.1 --port 5088
 ```
 
-Choose `qwen3.8-27b-ninfer.json` in either command for 40,960 capacity. For CLI
-file input, replace `--chat` with `--input prompt.txt`; `--prompt` is not its
-text-generation input option. Host-only options belong on the Host command,
-not in a second application-specific configuration.
+The model defaults to `<repo>/models/qwen3_8_27b_nvfp4.ninfer` and is downloaded if absent
+from [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer)
+at a pinned revision: **23,719,715,844 bytes**, SHA256
+`74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82`. Set `TENSORSHARP_MODELS`
+to use another model directory, or pass `--model PATH` to skip the configured download.
+Older NInfer v2 files (including Ignis `nvfp4full-v2` artifacts) are refused: upgrade them
+with NInfer's `tools/upgrade_ninfer_v2_to_v3.py` or download the v3 release.
 
-The model defaults to `<repo>/models/qwen3_8_27b_nvfp4full-v2.ninfer` and is
-downloaded if absent: **19,406,942,468 bytes**, with a pinned revision and SHA256.
-Set `TENSORSHARP_MODELS` to use another model directory, or use a CLI override
-which skips the configured download entirely. For the existing validation VM:
+The reserved `environment` map sets process defaults after config expansion, host preflight
+and downloads; existing process variables win. `${appBaseDirectory}` names the running
+application's output directory, so one draft-module path finds each application's own
+`cuda_kernels` folder (`TS_Q35_NINFER_DRAFT_PTX` accepts a fatbin).
 
-```sh
-dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
-  --config config/qwen3.8-27b-ninfer.json --chat \
-  --model /workspace/hf/ignis/qwen3_8_27b_nvfp4full-v2.ninfer
-```
+## What the artifact contains and how TensorSharp runs it
 
-The reserved `environment` map sets process defaults after successful config
-expansion, host preflight and downloads. Existing process variables win; later
-config files win among defaults. Values must be strings. `${appBaseDirectory}`
-is a reserved built-in naming the running application's output directory, so
-one draft-module path finds each application's own `cuda_kernels` folder.
-The profiles select `tensorsharp_q35_ninfer_draft.fatbin` directly; the variable
-name still ends in `_PTX` but accepts fatbins. A PTX-only deployment can override
-`TS_Q35_NINFER_DRAFT_PTX` with its real PTX path.
-`appBaseDirectory` cannot be overridden through `variables`; `TS_Q35_NINFER_DRAFT_PTX` in the
-process environment can explicitly select a nonstandard deployed asset.
+| Weights | Representation | TensorSharp execution |
+|---|---|---|
+| Token embedding, LM head | FP8 E4M3, one BF16 scale per row | FP8 gather; small-T BF16 tensor-core head (the drafter shares it) |
+| Attention Q\|K\|gate\|V, GDN Q\|K\|V\|Z, attention/GDN output | FP8 E4M3 row-scaled | decode/verify: FP8 widened exactly to BF16 MMA operands (activations never quantized); prefill: W8A8 TMA GEMM with per-row E4M3 activations on the full-rate block-scaled FP8 MMA |
+| MLP layers 0-55 | NVFP4 (E2M1 + E4M3 block scales + FP32 divisor) | W4A4 with the artifact's FP32 activation divisors |
+| MLP layers 56-63 | FP8 E4M3 row-scaled | as the other FP8 projections, SwiGLU fused in the epilogue |
+| GDN a/b, norms, conv, A_log, dt_bias | BF16 / FP32 | unchanged |
+| DFlash2 drafter | q8_g32 (INT8, F16 group-32 scales), BF16 conv/selector weights and codebooks | small-T BF16 tensor-core kernels, gate\|up SwiGLU fused |
 
-40,960 is **not a file-format context limit**; the artifact declares 262,144.
-The residual/norm, BF16 MMA and
-GateUp fusion selectors admit exactly configured context **40,960 or 65,536**
-on the qualified CC12.0/170-SM recipe. Their fixed T8/B1 mathematics do not use
-context capacity; other prerequisites and shape checks still apply.
+Without speculation (`--no-spec`, one activation row per step) the FP8 and NVFP4 projections
+run as CUDA-core GEMVs (16-byte weight loads that bypass L1, activations L1-resident) instead of
+the 8-row tensor-core tile, and the drafter is not attached. On the RTX 5090 this decodes at
+73 tok/s, up from 53. `TS_Q35_T1_GEMV=off` restores the previous kernels for comparisons.
 
-On RTX 5090, the 64K shared settings passed an actual CLI generation and Host
-full45+30 evaluation: **38/45 text, 26/30 programs**, unchanged against R60 in
-all 309 checks, 96 arithmetic values and 189 program statuses. All 123 serial
-responses and 30 generated programs matched; 16 parallel contents changed
-without score loss. Existing model mistakes remain. The 40K JSON was parser
-tested; earlier engine validation does not imply that literal JSON was GPU run.
+Row orders are applied once at load (attention Q/gate heads interleaved, gate\|up
+interleaved by 8 rows); every code and scale word is copied, never requantized.
 
-One 64K OFF/ON/ON/OFF study toggling the three matrix/norm optimizations together
-measured code **406.49→442.42 token/s (+8.84%)**, HTTP total time **−8.10%**.
-Responses, typed usage and draft work matched. A single seeded long diagnostic
-repeated in all four arms used **64,416 input +144 output tokens, cache0** and
-passed all ten needle/order checks each time. It is not general long reasoning
-coverage. Complete 128K/250K campaigns for this optimized profile are **NOT_RUN**.
+KV cache: BF16 by default. `TS_Q35_NINFER_KV=fp8` stores 272-byte rows (256 E4M3 codes and
+two F32 group-128 scales), half the BF16 size; decode and verify widen FP8 tiles in shared
+memory and prefill reads a BF16 copy of the visible history per layer. On the RTX 5090 it
+measured no speed change at 32K-64K and the same answers on the long-context checks; use it
+for capacity (more lanes or longer contexts in the same memory).
 
-The final 64K preset differs from the GPU-tested `b652…` snapshot only in its
-qualification comment; parsed settings are identical. Larger capacities need
-more KV memory. Other hardware and arbitrary contexts are not qualified by
-these results. Inspect startup selections/module SHAs and actual dispatch;
-host submissions include capture, not individual GPU replays.
+Configured contexts are not file-format limits (the artifact declares 262,144); larger
+capacities need more KV memory (a 128K context on a 32 GB card needs `TS_Q35_NINFER_KV=fp8`).
 
-See the [native adapter guide](../TensorSharp.Backends.Cuda/native/ninfer/README.md)
-for numerical contracts, automatic controls and finite validation results.
+Memory: the FP8 embedding table (1.2 GiB) stays in pinned, device-mapped host memory by
+default (a token gather reads one 5 KB row over PCIe); `TS_Q35_NINFER_EMBEDDING=device`
+uploads it instead. With `--mmproj`, `TS_Q35_RECLAIM_VISION_POOL=1` returns the vision
+tower's cached buffers when KV blocks run short (needed for 128K on a 32 GB card).
+
+Images: pass `--mmproj mmproj-BF16.gguf` (the Qwen3.8 vision tower, the same official BF16
+weights the artifact carries); its rows replace the image placeholders' embeddings. The
+artifact's own vision and MTP weights are not read by this route.
+
+See the [native adapter guide](../TensorSharp.Backends.Cuda/native/ninfer/README.md) for
+the kernels and their numerical contracts.

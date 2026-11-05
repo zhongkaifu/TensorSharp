@@ -1,329 +1,15 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Derived portions licensed under Apache-2.0; see draft/upstream/{LICENSE,NOTICE,manifest.json}.
-// TensorSharp-owned standalone entrypoints adapted from gpillon/ignis
-// e600a7d9e0d5921d767a6cb464373583b3cdcaf4. Original headers are unchanged.
-// Uses ORIGINAL adjacent-K NVFP4 codes, m128x4-swizzled scales and actual BF16 buffers.
-// No GGML source, A4 activation quantization, weight conversion or serving hook.
+// DFlash2 drafter kernels for the NInfer v3 artifact: dynamic convolution, candidate selector,
+// RMSNorm, ring append, sliding-window attention and top-16 adapters (vendored headers are
+// unchanged), plus q8_g32/BF16 small-T projections (tensorsharp_small_t_mma.cuh). BF16 buffers;
+// no GGML source, activation quantization or weight conversion.
 #include "draft/upstream/kernel/vendor/src/ops/linear/nvfp4/nvfp4_small_t.cuh"
 #include "draft/upstream/kernel/vendor/src/ops/kernel/bidirectional_gqa_attention.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 
-namespace ts_nidf {
-using namespace ninfer::ops;
-using namespace ninfer::ops::detail;
-template<int N,int K,int T> struct LinearConfig {
- using Geometry=Nvfp4GemvGeometry<N,K>;
- using Schedule=typename Nvfp4LinearSmallTProductionSchedule<Geometry,T>::Type;
- static constexpr int Threads=Schedule::kThreads, MinBlocks=Schedule::kMinBlocksPerSm;
-};
-template<int N,int K> struct LinearConfig<N,K,1> {
- using Geometry=Nvfp4GemvGeometry<N,K>;
- using Schedule=typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
- static constexpr int Threads=Schedule::kThreads, MinBlocks=Schedule::kMinBlocksPerSm;
-};
-template<int N,int K,int T>
-__device__ __forceinline__ void linear(const uint8_t* codes,const uint8_t* scales,
- const __nv_bfloat16* input,__nv_bfloat16* output,float inverseD) {
- using C=LinearConfig<N,K,T>; using G=typename C::Geometry; using S=typename C::Schedule;
- constexpr int CtasPerTile=128/S::kRowsPerCta;
- int m_tile=(int)blockIdx.x/CtasPerTile, cta=(int)blockIdx.x-m_tile*CtasPerTile;
- int rmod_base=cta*(S::kRowsPerCta/4),lane=(int)threadIdx.x&31,warp=(int)threadIdx.x>>5;
- int parent[S::kRowsPerWarp];
-#pragma unroll
- for(int r=0;r<S::kRowsPerWarp;r++) {
-  int flat=warp*S::kRowsPerWarp+r;
-  parent[r]=m_tile*128+rmod_base+flat/4+(flat&3)*32;
- }
- if constexpr(T==1) {
-  __shared__ Nvfp4GemvSharedStorage<G,S> shared;
-  stage_nvfp4_scales<G,S>(scales,shared,m_tile,rmod_base);
-  float a[S::kRowsPerWarp][S::kAccumulatorChains]={};
-  compute_nvfp4_rows<G,S>(input,codes,scales,shared,inverseD,parent,warp*S::kRowsPerWarp,lane,a);
-#pragma unroll
-  for(int r=0;r<S::kRowsPerWarp;r++) {
-   float total=0;
-#pragma unroll
-   for(int c=0;c<S::kAccumulatorChains;c++)total+=a[r][c];
-   total=warp_reduce_sum(total);
-   if(!lane)output[parent[r]]=__float2bfloat16_rn(total);
-  }
- } else {
-  static_assert(S::kWarpsPerRow==1 && S::kTokenTile==T);
-  __shared__ Nvfp4SmallTSharedStorage<G,T,S> shared;
-  stage_nvfp4_scales<G,S>(scales,shared.gemv,m_tile,rmod_base);
-  float a[S::kRowsPerWarp][T][S::kAccumulatorChains]={};
-  compute_nvfp4_small_t_rows<G,T,S>(input,codes,scales,shared,inverseD,parent,warp*S::kRowsPerWarp,0,0,lane,a);
-#pragma unroll
-  for(int r=0;r<S::kRowsPerWarp;r++) {
-#pragma unroll
-   for(int t=0;t<T;t++) {
-    float total=0;
-#pragma unroll
-    for(int c=0;c<S::kAccumulatorChains;c++)total+=a[r][t][c];
-    total=warp_reduce_sum(total);
-    if(!lane)output[(long long)t*N+parent[r]]=__float2bfloat16_rn(total);
-   }
-  }
- }
-}
-template<int T> struct SwiConfig {
- static constexpr int Warps=T>=13?16:(T>=5?4:8);
- static constexpr auto Access=T<=4?Nvfp4SmallTActivationAccess::SharedPhase:Nvfp4SmallTActivationAccess::TokenPacked;
- using Schedule=Nvfp4SmallTSchedule<Warps,1,2,16,T,1,Access,Nvfp4ScaleAccess::Direct,Nvfp4CodeCache::Default,1,Nvfp4SmallTBlockOrder::RowsContiguous,1>;
- static constexpr int Threads=Schedule::kThreads,MinBlocks=1;
-};
-template<> struct SwiConfig<1> {
- using Schedule=Nvfp4GemvSchedule<8,2,16,4,Nvfp4ScaleAccess::Direct,Nvfp4CodeCache::Default,2>;
- static constexpr int Threads=256,MinBlocks=2;
-};
-template<int T>
-__device__ __forceinline__ void swiglu(const uint8_t* codes,const uint8_t* scales,
- const __nv_bfloat16* input,__nv_bfloat16* output,float inverseD) {
- using G=Nvfp4MlpGateUpGeometry;using S=typename SwiConfig<T>::Schedule;
- constexpr int FF=17408,CtasPerTile=128/S::kWarpsPerCta;
- int m=(int)blockIdx.x/CtasPerTile,cta=(int)blockIdx.x-m*CtasPerTile;
- int lane=(int)threadIdx.x&31,warp=(int)threadIdx.x>>5,flat=cta*S::kWarpsPerCta+warp;
- int gate=m*128+(flat>>2)+(flat&3)*32,parent[2]={gate,gate+FF};
- if constexpr(T==1) {
-  __shared__ Nvfp4GemvSharedStorage<G,S> shared;
-  float a[2][S::kAccumulatorChains]={};
-  compute_nvfp4_rows<G,S>(input,codes,scales,shared,inverseD,parent,warp*2,lane,a);
-  float g=0,u=0;
-#pragma unroll
-  for(int c=0;c<S::kAccumulatorChains;c++){g+=a[0][c];u+=a[1][c];}
-  g=warp_reduce_sum(g);u=warp_reduce_sum(u);
-  if(!lane)output[gate]=__float2bfloat16_rn(silu(g)*u);
- } else {
-  __shared__ Nvfp4SmallTSharedStorage<G,T,S> shared;
-  float a[2][T][S::kAccumulatorChains]={};
-  compute_nvfp4_small_t_rows<G,T,S>(input,codes,scales,shared,inverseD,parent,warp*2,0,0,lane,a);
-#pragma unroll
-  for(int t=0;t<T;t++) {
-   float g=0,u=0;
-#pragma unroll
-   for(int c=0;c<S::kAccumulatorChains;c++){g+=a[0][t][c];u+=a[1][t][c];}
-   g=warp_reduce_sum(g);u=warp_reduce_sum(u);
-   if(!lane)output[(long long)t*FF+gate]=__float2bfloat16_rn(silu(g)*u);
-  }
- }
-}
-} // namespace ts_nidf
-#define TS_NIDF_LINEAR(N,K,T) \
-extern "C" __global__ __launch_bounds__(ts_nidf::LinearConfig<N,K,T>::Threads,ts_nidf::LinearConfig<N,K,T>::MinBlocks) \
-void ts_nidf_linear_n##N##_k##K##_t##T(const uint8_t* c,const uint8_t* s,const __nv_bfloat16* x,__nv_bfloat16* y,float inv) { ts_nidf::linear<N,K,T>(c,s,x,y,inv); }
-#define TS_NIDF_SWIGLU(T) \
-extern "C" __global__ __launch_bounds__(ts_nidf::SwiConfig<T>::Threads,ts_nidf::SwiConfig<T>::MinBlocks) \
-void ts_nidf_swiglu_t##T(const uint8_t* c,const uint8_t* s,const __nv_bfloat16* x,__nv_bfloat16* y,float inv) { ts_nidf::swiglu<T>(c,s,x,y,inv); }
-TS_NIDF_LINEAR(5120,25600,1)
-TS_NIDF_LINEAR(5120,25600,2)
-TS_NIDF_LINEAR(5120,25600,3)
-TS_NIDF_LINEAR(5120,25600,4)
-TS_NIDF_LINEAR(5120,25600,5)
-TS_NIDF_LINEAR(5120,25600,6)
-TS_NIDF_LINEAR(5120,25600,7)
-TS_NIDF_LINEAR(5120,25600,8)
-TS_NIDF_LINEAR(5120,25600,9)
-TS_NIDF_LINEAR(5120,25600,10)
-TS_NIDF_LINEAR(5120,25600,11)
-TS_NIDF_LINEAR(5120,25600,12)
-TS_NIDF_LINEAR(5120,25600,13)
-TS_NIDF_LINEAR(5120,25600,14)
-TS_NIDF_LINEAR(5120,25600,15)
-TS_NIDF_LINEAR(5120,25600,16)
-TS_NIDF_LINEAR(5120,25600,17)
-TS_NIDF_LINEAR(5120,25600,18)
-TS_NIDF_LINEAR(5120,25600,19)
-TS_NIDF_LINEAR(5120,25600,20)
-TS_NIDF_LINEAR(5120,25600,21)
-TS_NIDF_LINEAR(5120,25600,22)
-TS_NIDF_LINEAR(5120,25600,23)
-TS_NIDF_LINEAR(5120,25600,24)
-TS_NIDF_LINEAR(5120,25600,25)
-TS_NIDF_LINEAR(5120,25600,26)
-TS_NIDF_LINEAR(5120,25600,27)
-TS_NIDF_LINEAR(5120,25600,28)
-TS_NIDF_LINEAR(5120,25600,29)
-TS_NIDF_LINEAR(5120,25600,30)
-TS_NIDF_LINEAR(5120,25600,31)
-TS_NIDF_LINEAR(5120,25600,32)
-TS_NIDF_LINEAR(6144,5120,1)
-TS_NIDF_LINEAR(6144,5120,2)
-TS_NIDF_LINEAR(6144,5120,3)
-TS_NIDF_LINEAR(6144,5120,4)
-TS_NIDF_LINEAR(6144,5120,5)
-TS_NIDF_LINEAR(6144,5120,6)
-TS_NIDF_LINEAR(6144,5120,7)
-TS_NIDF_LINEAR(6144,5120,8)
-TS_NIDF_LINEAR(6144,5120,9)
-TS_NIDF_LINEAR(6144,5120,10)
-TS_NIDF_LINEAR(6144,5120,11)
-TS_NIDF_LINEAR(6144,5120,12)
-TS_NIDF_LINEAR(6144,5120,13)
-TS_NIDF_LINEAR(6144,5120,14)
-TS_NIDF_LINEAR(6144,5120,15)
-TS_NIDF_LINEAR(6144,5120,16)
-TS_NIDF_LINEAR(6144,5120,17)
-TS_NIDF_LINEAR(6144,5120,18)
-TS_NIDF_LINEAR(6144,5120,19)
-TS_NIDF_LINEAR(6144,5120,20)
-TS_NIDF_LINEAR(6144,5120,21)
-TS_NIDF_LINEAR(6144,5120,22)
-TS_NIDF_LINEAR(6144,5120,23)
-TS_NIDF_LINEAR(6144,5120,24)
-TS_NIDF_LINEAR(6144,5120,25)
-TS_NIDF_LINEAR(6144,5120,26)
-TS_NIDF_LINEAR(6144,5120,27)
-TS_NIDF_LINEAR(6144,5120,28)
-TS_NIDF_LINEAR(6144,5120,29)
-TS_NIDF_LINEAR(6144,5120,30)
-TS_NIDF_LINEAR(6144,5120,31)
-TS_NIDF_LINEAR(6144,5120,32)
-TS_NIDF_LINEAR(5120,4096,1)
-TS_NIDF_LINEAR(5120,4096,2)
-TS_NIDF_LINEAR(5120,4096,3)
-TS_NIDF_LINEAR(5120,4096,4)
-TS_NIDF_LINEAR(5120,4096,5)
-TS_NIDF_LINEAR(5120,4096,6)
-TS_NIDF_LINEAR(5120,4096,7)
-TS_NIDF_LINEAR(5120,4096,8)
-TS_NIDF_LINEAR(5120,4096,9)
-TS_NIDF_LINEAR(5120,4096,10)
-TS_NIDF_LINEAR(5120,4096,11)
-TS_NIDF_LINEAR(5120,4096,12)
-TS_NIDF_LINEAR(5120,4096,13)
-TS_NIDF_LINEAR(5120,4096,14)
-TS_NIDF_LINEAR(5120,4096,15)
-TS_NIDF_LINEAR(5120,4096,16)
-TS_NIDF_LINEAR(5120,4096,17)
-TS_NIDF_LINEAR(5120,4096,18)
-TS_NIDF_LINEAR(5120,4096,19)
-TS_NIDF_LINEAR(5120,4096,20)
-TS_NIDF_LINEAR(5120,4096,21)
-TS_NIDF_LINEAR(5120,4096,22)
-TS_NIDF_LINEAR(5120,4096,23)
-TS_NIDF_LINEAR(5120,4096,24)
-TS_NIDF_LINEAR(5120,4096,25)
-TS_NIDF_LINEAR(5120,4096,26)
-TS_NIDF_LINEAR(5120,4096,27)
-TS_NIDF_LINEAR(5120,4096,28)
-TS_NIDF_LINEAR(5120,4096,29)
-TS_NIDF_LINEAR(5120,4096,30)
-TS_NIDF_LINEAR(5120,4096,31)
-TS_NIDF_LINEAR(5120,4096,32)
-TS_NIDF_LINEAR(1280,5120,1)
-TS_NIDF_LINEAR(1280,5120,2)
-TS_NIDF_LINEAR(1280,5120,3)
-TS_NIDF_LINEAR(1280,5120,4)
-TS_NIDF_LINEAR(1280,5120,5)
-TS_NIDF_LINEAR(1280,5120,6)
-TS_NIDF_LINEAR(1280,5120,7)
-TS_NIDF_LINEAR(1280,5120,8)
-TS_NIDF_LINEAR(1280,5120,9)
-TS_NIDF_LINEAR(1280,5120,10)
-TS_NIDF_LINEAR(1280,5120,11)
-TS_NIDF_LINEAR(1280,5120,12)
-TS_NIDF_LINEAR(1280,5120,13)
-TS_NIDF_LINEAR(1280,5120,14)
-TS_NIDF_LINEAR(1280,5120,15)
-TS_NIDF_LINEAR(1280,5120,16)
-TS_NIDF_LINEAR(1280,5120,17)
-TS_NIDF_LINEAR(1280,5120,18)
-TS_NIDF_LINEAR(1280,5120,19)
-TS_NIDF_LINEAR(1280,5120,20)
-TS_NIDF_LINEAR(1280,5120,21)
-TS_NIDF_LINEAR(1280,5120,22)
-TS_NIDF_LINEAR(1280,5120,23)
-TS_NIDF_LINEAR(1280,5120,24)
-TS_NIDF_LINEAR(1280,5120,25)
-TS_NIDF_LINEAR(1280,5120,26)
-TS_NIDF_LINEAR(1280,5120,27)
-TS_NIDF_LINEAR(1280,5120,28)
-TS_NIDF_LINEAR(1280,5120,29)
-TS_NIDF_LINEAR(1280,5120,30)
-TS_NIDF_LINEAR(1280,5120,31)
-TS_NIDF_LINEAR(1280,5120,32)
-TS_NIDF_LINEAR(256,5120,1)
-TS_NIDF_LINEAR(256,5120,2)
-TS_NIDF_LINEAR(256,5120,3)
-TS_NIDF_LINEAR(256,5120,4)
-TS_NIDF_LINEAR(256,5120,5)
-TS_NIDF_LINEAR(256,5120,6)
-TS_NIDF_LINEAR(256,5120,7)
-TS_NIDF_LINEAR(256,5120,8)
-TS_NIDF_LINEAR(256,5120,9)
-TS_NIDF_LINEAR(256,5120,10)
-TS_NIDF_LINEAR(256,5120,11)
-TS_NIDF_LINEAR(256,5120,12)
-TS_NIDF_LINEAR(256,5120,13)
-TS_NIDF_LINEAR(256,5120,14)
-TS_NIDF_LINEAR(256,5120,15)
-TS_NIDF_LINEAR(256,5120,16)
-TS_NIDF_LINEAR(256,5120,17)
-TS_NIDF_LINEAR(256,5120,18)
-TS_NIDF_LINEAR(256,5120,19)
-TS_NIDF_LINEAR(256,5120,20)
-TS_NIDF_LINEAR(256,5120,21)
-TS_NIDF_LINEAR(256,5120,22)
-TS_NIDF_LINEAR(256,5120,23)
-TS_NIDF_LINEAR(256,5120,24)
-TS_NIDF_LINEAR(256,5120,25)
-TS_NIDF_LINEAR(256,5120,26)
-TS_NIDF_LINEAR(256,5120,27)
-TS_NIDF_LINEAR(256,5120,28)
-TS_NIDF_LINEAR(256,5120,29)
-TS_NIDF_LINEAR(256,5120,30)
-TS_NIDF_LINEAR(256,5120,31)
-TS_NIDF_LINEAR(256,5120,32)
-TS_NIDF_LINEAR(5120,17408,1)
-TS_NIDF_LINEAR(5120,17408,2)
-TS_NIDF_LINEAR(5120,17408,3)
-TS_NIDF_LINEAR(5120,17408,4)
-TS_NIDF_LINEAR(5120,17408,5)
-TS_NIDF_LINEAR(5120,17408,6)
-TS_NIDF_LINEAR(5120,17408,7)
-TS_NIDF_LINEAR(5120,17408,8)
-TS_NIDF_LINEAR(5120,17408,9)
-TS_NIDF_LINEAR(5120,17408,10)
-TS_NIDF_LINEAR(5120,17408,11)
-TS_NIDF_LINEAR(5120,17408,12)
-TS_NIDF_LINEAR(5120,17408,13)
-TS_NIDF_LINEAR(5120,17408,14)
-TS_NIDF_LINEAR(5120,17408,15)
-TS_NIDF_LINEAR(5120,17408,16)
-TS_NIDF_LINEAR(5120,17408,17)
-TS_NIDF_LINEAR(5120,17408,18)
-TS_NIDF_LINEAR(5120,17408,19)
-TS_NIDF_LINEAR(5120,17408,20)
-TS_NIDF_LINEAR(5120,17408,21)
-TS_NIDF_LINEAR(5120,17408,22)
-TS_NIDF_LINEAR(5120,17408,23)
-TS_NIDF_LINEAR(5120,17408,24)
-TS_NIDF_LINEAR(5120,17408,25)
-TS_NIDF_LINEAR(5120,17408,26)
-TS_NIDF_LINEAR(5120,17408,27)
-TS_NIDF_LINEAR(5120,17408,28)
-TS_NIDF_LINEAR(5120,17408,29)
-TS_NIDF_LINEAR(5120,17408,30)
-TS_NIDF_LINEAR(5120,17408,31)
-TS_NIDF_LINEAR(5120,17408,32)
-TS_NIDF_SWIGLU(1)
-TS_NIDF_SWIGLU(2)
-TS_NIDF_SWIGLU(3)
-TS_NIDF_SWIGLU(4)
-TS_NIDF_SWIGLU(5)
-TS_NIDF_SWIGLU(6)
-TS_NIDF_SWIGLU(7)
-TS_NIDF_SWIGLU(8)
-TS_NIDF_SWIGLU(9)
-TS_NIDF_SWIGLU(10)
-TS_NIDF_SWIGLU(11)
-TS_NIDF_SWIGLU(12)
-TS_NIDF_SWIGLU(13)
-TS_NIDF_SWIGLU(14)
-TS_NIDF_SWIGLU(15)
-TS_NIDF_SWIGLU(16)
 
 // The following scalar/selection adapters preserve the pinned original operation order.
 // Their source functions and adaptations are enumerated in draft/source-provenance.json.
@@ -360,76 +46,6 @@ extern "C" __global__ void ts_nidf_dynamic_conv(
             acc += w * x;
         }
         out[idx] = __float2bfloat16(acc);
-    }
-}
-extern "C" __global__ void ts_nidf_selector_scores(
-    const std::int32_t* __restrict__ candidates, const std::int32_t* __restrict__ pred_ids,
-    const float* __restrict__ unary, const float* __restrict__ hidden_proj,
-    const std::uint8_t* __restrict__ successor_codes,
-    const std::uint8_t* __restrict__ successor_scales, float successor_inverse_divisor,
-    const std::uint8_t* __restrict__ predecessor_codes,
-    const std::uint8_t* __restrict__ predecessor_scales, float predecessor_inverse_divisor,
-    std::int32_t rank, std::int32_t top_k, std::int32_t positions, std::int32_t lanes,
-    float* __restrict__ out) {
-    // One block per (i, j, s, l), enumerated so the block index is the output element index.
-    const int idx = blockIdx.x;
-    const int i   = idx % top_k;
-    const int j   = (idx / top_k) % top_k;
-    const int s   = (idx / (top_k * top_k)) % positions;
-    const int l   = idx / (top_k * top_k * positions);
-
-    // [K, P, L] is contiguous with the draft position ahead of the lane, so the per-position
-    // vector (x, s, l) sits at x + K * (s + P * l). Putting the lane first here is the whole
-    // batch>1 defect: it is the identity at L = 1 and a transpose at every wider batch.
-    const std::int64_t slot = static_cast<std::int64_t>(l) * positions + s;
-    const std::int32_t succ_id = candidates[static_cast<std::int64_t>(i) + top_k * slot];
-    const std::int32_t pred_id = pred_ids[static_cast<std::int64_t>(j) + top_k * slot];
-    const std::int64_t succ_row  = static_cast<std::int64_t>(succ_id) * rank;
-    const std::int64_t pred_row  = static_cast<std::int64_t>(pred_id) * rank;
-    const float* h               = hidden_proj + slot * rank;
-
-    // The codebooks are NVFP4 weights in QuantLayout::BlockScaleK16M128x4. Only the
-    // E4M3FN scale plane is swizzled by the artifact writer (swizzle_nvfp4_scales in
-    // tools/artifact/layouts.py); the E2M1 code plane stays row-major, so the code
-    // gathers below keep their plain `row / 2` offsets. Scales must go through the
-    // shared nvfp4_scale_offset (ops/linear/nvfp4/nvfp4_codec.cuh) - the same
-    // definition nvfp4_gemv.cuh's nvfp4_scale_offset<Geometry> wraps - addressed by
-    // the token id as the parent row, not by the flattened `id * rank` row base.
-    // This kernel is not templated on a Geometry, so kScaleTilesPerRow = K / 64 is
-    // supplied from the runtime rank.
-    const int scale_tiles_per_row = rank / 64;
-
-    float local = 0.0F;
-    for (int r = threadIdx.x; r < rank; r += blockDim.x) {
-        const float2 succ_pair = decode_nvfp4_e2m1x2(
-            successor_codes[succ_row / 2 + r / 2]);
-        const float2 pred_pair = decode_nvfp4_e2m1x2(
-            predecessor_codes[pred_row / 2 + r / 2]);
-        const float succ = (r & 1) == 0 ? succ_pair.x : succ_pair.y;
-        const float pred = (r & 1) == 0 ? pred_pair.x : pred_pair.y;
-        const float succ_scale = decode_nvfp4_e4m3(
-            successor_scales[nvfp4_scale_offset(succ_id, r / 16, scale_tiles_per_row)]);
-        const float pred_scale = decode_nvfp4_e4m3(
-            predecessor_scales[nvfp4_scale_offset(pred_id, r / 16, scale_tiles_per_row)]);
-        local += succ * succ_scale * successor_inverse_divisor * pred * pred_scale *
-                 predecessor_inverse_divisor * h[r];
-    }
-    __shared__ float warp_sums[kDflash2SelectorThreads / 32];
-    const int warp = threadIdx.x / 32;
-    const int lane = threadIdx.x % 32;
-    for (int offset = 16; offset > 0; offset /= 2) {
-        local += __shfl_down_sync(0xffffffffu, local, offset);
-    }
-    if (lane == 0) { warp_sums[warp] = local; }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float total = 0.0F;
-        for (int w = 0; w < blockDim.x / 32; ++w) {
-            total += warp_sums[w];
-        }
-        out[static_cast<std::int64_t>(i) +
-            top_k * (static_cast<std::int64_t>(j) + top_k * slot)] =
-            total + unary[static_cast<std::int64_t>(i) + top_k * slot];
     }
 }
 extern "C" __global__ void ts_nidf_selector_walk(const float* __restrict__ scores,
@@ -799,175 +415,57 @@ TS_NIDF_SWA(8)
 
 
 
+
 // ---------------------------------------------------------------------------
-// A16 NVFP4 projection on BF16 tensor-core MMA for wide token counts (the
-// drafter's context append over prompt chunks). Adapted from gpillon/ignis
-// kernel/src/nvfp4_a16_mma.cu (Apache-2.0, revision ad81d52e; ignis finding
-// 2026-09-29 "A16 NVFP4 on the tensor cores": 6.3-7.4x per call at T=1,024).
-// Each 64-row x 128-token CTA decodes the K step's weight tile exactly into a
-// BF16 shared tile (E2M1 x E4M3 is exact in BF16), runs m16n8k16 BF16 MMAs
-// with F32 accumulation, and scales by the weight divisor at the store, like
-// the small-T route. Only the F32 summation order differs from that route, and
-// these projections only feed DFlash proposals, which greedy verification
-// accepts or rejects against the unchanged target.
-#include "ops/common/mma.cuh"
-namespace ts_nidf_mma {
-using ninfer::ops::Cache;
-using ninfer::ops::cp_async;
-using ninfer::ops::cp_async_zfill;
-using ninfer::ops::cp_commit;
-using ninfer::ops::cp_wait;
-using ninfer::ops::ldmatrix_x2;
-using ninfer::ops::ldmatrix_x4;
-using ninfer::ops::mma_bf16;
-using ninfer::ops::smem_addr;
-using ninfer::ops::detail::decode_nvfp4_e2m1x2;
-using ninfer::ops::detail::decode_nvfp4_e4m3;
-constexpr int kBlockRows = 64, kBlockCols = 128, kBlockK = 64, kWarpRows = 32, kWarpCols = 32, kStages = 2;
-constexpr int kWarpsM = kBlockRows / kWarpRows, kWarpsN = kBlockCols / kWarpCols, kThreads = kWarpsM * kWarpsN * 32;
-constexpr int kMmaRows = kWarpRows / 16, kMmaCols = kWarpCols / 8, kMmaK = kBlockK / 16;
-constexpr int kScaleTileRows = 128, kScaleTileBytes = 512, kCodeBytesPerRow = kBlockK / 2;
-constexpr int kCodeStageBytes = kBlockRows * kCodeBytesPerRow, kTokenStageBytes = kBlockCols * kBlockK * 2;
-constexpr int kStageBytes = kCodeStageBytes + kScaleTileBytes + kTokenStageBytes;
-constexpr int kWeightTileBytes = kBlockRows * kBlockK * 2;
-constexpr int kSharedBytes = kStages * kStageBytes + kWeightTileBytes;
-static_assert(kBlockRows * (kBlockK / 16) == kThreads, "one decode job per thread");
-static_assert(kSharedBytes <= 48 * 1024, "fits the default dynamic shared memory");
-__device__ __forceinline__ int swizzled_col(int row, int col) {
-  return (col & ~63) + ((((col & 63) >> 3) ^ (row & 7)) << 3) + (col & 7);
-}
-__device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
-  const __nv_bfloat162 packed = __floats2bfloat162_rn(lo, hi);
-  return *reinterpret_cast<const uint32_t*>(&packed);
-}
-template <int M, int K, bool FullTokens>
-__device__ __forceinline__ void a16_mma(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ codes,
-    const uint8_t* __restrict__ scales, float inverse_weight_divisor, __nv_bfloat16* __restrict__ out, int tokens) {
-  static_assert(M % kBlockRows == 0 && K % kBlockK == 0);
-  constexpr int kTiles = K / kBlockK;
-  static_assert(kTiles >= kStages);
-  constexpr int kScaleTilesPerRow = K / 64;
-  extern __shared__ __align__(16) unsigned char shared_raw[];
-  unsigned char* ring = shared_raw;
-  auto* weight_tile = reinterpret_cast<__nv_bfloat16*>(shared_raw + kStages * kStageBytes);
-  const int tid = (int)threadIdx.x, warp = tid >> 5, lane = tid & 31;
-  const int wm = warp / kWarpsN, wn = warp - wm * kWarpsN, gid = lane >> 2, lid = lane & 3;
-  const int tiles_n = tokens / kBlockCols + (int)(tokens % kBlockCols != 0);
-  const int tile_m = (int)blockIdx.x / tiles_n, tile_n = (int)blockIdx.x - tile_m * tiles_n;
-  const int m0 = tile_m * kBlockRows, n0 = tile_n * kBlockCols;
-  const int scale_tile_m = m0 / kScaleTileRows, row_in_scale_tile0 = m0 - scale_tile_m * kScaleTileRows;
-  auto stage_codes = [&](int stage) { return ring + stage * kStageBytes; };
-  auto stage_scales = [&](int stage) { return ring + stage * kStageBytes + kCodeStageBytes; };
-  auto stage_tokens = [&](int stage) {
-    return reinterpret_cast<__nv_bfloat16*>(ring + stage * kStageBytes + kCodeStageBytes + kScaleTileBytes);
-  };
-  auto load_stage = [&](int stage, int k_tile) {
-    const int k0 = k_tile * kBlockK;
-    unsigned char* code_dst = stage_codes(stage);
-    for (int item = tid; item < kBlockRows * 2; item += kThreads) {
-      const int row = item >> 1, half = item & 1;
-      cp_async<16, Cache::cg>(code_dst + row * kCodeBytesPerRow + half * 16,
-                              codes + (long long)(m0 + row) * (K / 2) + k0 / 2 + half * 16);
-    }
-    unsigned char* scale_dst = stage_scales(stage);
-    const uint8_t* scale_src = scales + ((long long)scale_tile_m * kScaleTilesPerRow + k_tile) * kScaleTileBytes;
-    for (int item = tid; item < kScaleTileBytes / 16; item += kThreads)
-      cp_async<16, Cache::cg>(scale_dst + item * 16, scale_src + item * 16);
-    __nv_bfloat16* token_dst = stage_tokens(stage);
-    for (int item = tid; item < kBlockCols * (kBlockK / 8); item += kThreads) {
-      const int col = item / (kBlockK / 8), kk = (item - col * (kBlockK / 8)) * 8;
-      __nv_bfloat16* dst = &token_dst[col * kBlockK + swizzled_col(col, kk)];
-      const int token = n0 + col;
-      if constexpr (FullTokens) {
-        cp_async<16, Cache::cg>(dst, &x[(long long)token * K + k0 + kk]);
-      } else {
-        const bool valid = token < tokens;
-        cp_async_zfill<16, Cache::cg>(dst, &x[(long long)(valid ? token : 0) * K + k0 + kk], valid ? 16 : 0);
-      }
-    }
-  };
-  const int decode_row = tid >> 2, decode_group = tid & 3;
-  const int decode_scale_row = row_in_scale_tile0 + decode_row;
-  const int decode_scale_index = (decode_scale_row & 31) * 16 + (decode_scale_row >> 5) * 4 + decode_group;
-  auto decode_stage = [&](int stage) {
-    const uint2 packed = *reinterpret_cast<const uint2*>(stage_codes(stage) + decode_row * kCodeBytesPerRow + decode_group * 8);
-    const float scale = decode_nvfp4_e4m3(stage_scales(stage)[decode_scale_index]);
-    const uint32_t words[2] = {packed.x, packed.y};
-    uint32_t decoded[8];
-#pragma unroll
-    for (int w = 0; w < 2; ++w)
-#pragma unroll
-      for (int b = 0; b < 4; ++b) {
-        const float2 pair = decode_nvfp4_e2m1x2((uint8_t)(words[w] >> (8 * b)));
-        decoded[w * 4 + b] = pack_bf16x2(pair.x * scale, pair.y * scale);
-      }
-    const int col = decode_group * 16;
-    *reinterpret_cast<uint4*>(&weight_tile[decode_row * kBlockK + swizzled_col(decode_row, col)]) =
-        make_uint4(decoded[0], decoded[1], decoded[2], decoded[3]);
-    *reinterpret_cast<uint4*>(&weight_tile[decode_row * kBlockK + swizzled_col(decode_row, col + 8)]) =
-        make_uint4(decoded[4], decoded[5], decoded[6], decoded[7]);
-  };
-  float accum[kMmaRows][kMmaCols][4] = {};
-  const int a_matrix = lane >> 3, a_row_offset = (lane & 7) + ((a_matrix & 1) << 3), a_col_offset = (a_matrix >> 1) << 3;
-  const int b_inner_row = lane & 7, b_k_offset = ((lane >> 3) & 1) << 3;
-#pragma unroll
-  for (int stage = 0; stage < kStages; ++stage) { load_stage(stage, stage); cp_commit(); }
-#pragma unroll 1
-  for (int k_tile = 0; k_tile < kTiles; ++k_tile) {
-    const int stage = k_tile % kStages;
-    if (k_tile + kStages <= kTiles) cp_wait<kStages - 1>(); else cp_wait<0>();
+// NInfer v3 DFlash2 representation: q8_g32_fp16 projections (INT8 codes [rows][k], one F16 scale
+// per 32 values), BF16 conv-kernel/selector projections and BF16 candidate codebooks. Small-T
+// BF16 tensor-core projections from tensorsharp_small_t_mma.cuh, BF16 activations in and out;
+// gate|up is interleaved by 8 rows at load so SwiGLU fuses in the projection.
+// ---------------------------------------------------------------------------
+#include "../kernels/tensorsharp_small_t_mma.cuh"
+#define TS_NIDF_SMALL(NAME, FMT, OUT, TT, KW, ST, RT) \
+extern "C" __global__ __launch_bounds__(KW * 32) void NAME(const uint8_t* __restrict__ w, const void* __restrict__ s, \
+    const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ y, int n, int k, int m, int ldy) \
+{ ts_smt::project<FMT, true, true, OUT, TT, KW, ST, RT>(w, s, x, y, n, k, m, ldy); }
+TS_NIDF_SMALL(ts_nidf_w8_t8, ts_smt::kW8G32, ts_smt::kOutPlain, 8, 4, 3, 1)
+TS_NIDF_SMALL(ts_nidf_w8_t16, ts_smt::kW8G32, ts_smt::kOutPlain, 16, 4, 2, 2)
+TS_NIDF_SMALL(ts_nidf_w8_t32, ts_smt::kW8G32, ts_smt::kOutPlain, 32, 2, 2, 2)
+TS_NIDF_SMALL(ts_nidf_w8_swiglu_t8, ts_smt::kW8G32, ts_smt::kOutSwiGlu, 8, 4, 3, 1)
+TS_NIDF_SMALL(ts_nidf_w8_swiglu_t16, ts_smt::kW8G32, ts_smt::kOutSwiGlu, 16, 4, 2, 2)
+TS_NIDF_SMALL(ts_nidf_w8_swiglu_t32, ts_smt::kW8G32, ts_smt::kOutSwiGlu, 32, 2, 2, 2)
+TS_NIDF_SMALL(ts_nidf_bf16w_t8, ts_smt::kBf16, ts_smt::kOutPlain, 8, 4, 3, 1)
+TS_NIDF_SMALL(ts_nidf_bf16w_t16, ts_smt::kBf16, ts_smt::kOutPlain, 16, 2, 2, 2)
+TS_NIDF_SMALL(ts_nidf_bf16w_t32, ts_smt::kBf16, ts_smt::kOutPlain, 32, 2, 2, 2)
+
+/// ts_nidf_selector_scores with BF16 [vocab][rank] successor/predecessor codebooks.
+extern "C" __global__ void ts_nidf_selector_scores_bf16(
+    const std::int32_t* __restrict__ candidates, const std::int32_t* __restrict__ pred_ids,
+    const float* __restrict__ unary, const float* __restrict__ hidden_proj,
+    const __nv_bfloat16* __restrict__ successor, const __nv_bfloat16* __restrict__ predecessor,
+    std::int32_t rank, std::int32_t top_k, std::int32_t positions, std::int32_t lanes, float* __restrict__ out) {
+    const int idx = blockIdx.x;
+    const int i   = idx % top_k;
+    const int j   = (idx / top_k) % top_k;
+    const int s   = (idx / (top_k * top_k)) % positions;
+    const int l   = idx / (top_k * top_k * positions);
+    const std::int64_t slot = static_cast<std::int64_t>(l) * positions + s;
+    const std::int32_t succ_id = candidates[static_cast<std::int64_t>(i) + top_k * slot];
+    const std::int32_t pred_id = pred_ids[static_cast<std::int64_t>(j) + top_k * slot];
+    const __nv_bfloat16* succ = successor + static_cast<std::int64_t>(succ_id) * rank;
+    const __nv_bfloat16* pred = predecessor + static_cast<std::int64_t>(pred_id) * rank;
+    const float* h = hidden_proj + slot * rank;
+    float local = 0.0F;
+    for (int r = threadIdx.x; r < rank; r += blockDim.x)
+        local += __bfloat162float(succ[r]) * __bfloat162float(pred[r]) * h[r];
+    __shared__ float warp_sums[kDflash2SelectorThreads / 32];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    for (int offset = 16; offset > 0; offset /= 2) local += __shfl_down_sync(0xffffffffu, local, offset);
+    if (lane == 0) warp_sums[warp] = local;
     __syncthreads();
-    decode_stage(stage);
-    __syncthreads();
-    const __nv_bfloat16* token_tile = stage_tokens(stage);
-#pragma unroll
-    for (int k_step = 0; k_step < kMmaK; ++k_step) {
-      unsigned a_frag[kMmaRows][4], b_frag[kMmaCols][2];
-#pragma unroll
-      for (int mi = 0; mi < kMmaRows; ++mi) {
-        const int row = wm * kWarpRows + mi * 16 + a_row_offset, col = k_step * 16 + a_col_offset;
-        ldmatrix_x4(a_frag[mi][0], a_frag[mi][1], a_frag[mi][2], a_frag[mi][3],
-                    smem_addr(&weight_tile[row * kBlockK + swizzled_col(row, col)]));
-      }
-#pragma unroll
-      for (int ni = 0; ni < kMmaCols; ++ni) {
-        const int row = wn * kWarpCols + ni * 8 + b_inner_row, col = k_step * 16 + b_k_offset;
-        ldmatrix_x2(b_frag[ni][0], b_frag[ni][1], smem_addr(&token_tile[row * kBlockK + swizzled_col(row, col)]));
-      }
-#pragma unroll
-      for (int mi = 0; mi < kMmaRows; ++mi)
-#pragma unroll
-        for (int ni = 0; ni < kMmaCols; ++ni)
-          mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2], accum[mi][ni][3],
-                   a_frag[mi][0], a_frag[mi][1], a_frag[mi][2], a_frag[mi][3], b_frag[ni][0], b_frag[ni][1]);
+    if (threadIdx.x == 0) {
+        float total = 0.0F;
+        for (int w = 0; w < blockDim.x / 32; ++w) total += warp_sums[w];
+        out[static_cast<std::int64_t>(i) + top_k * (static_cast<std::int64_t>(j) + top_k * slot)] =
+            total + unary[static_cast<std::int64_t>(i) + top_k * slot];
     }
-    __syncthreads();
-    const int next = k_tile + kStages;
-    if (next < kTiles) { load_stage(stage, next); cp_commit(); }
-  }
-  auto store = [&](int row, int token, float value) {
-    out[(long long)token * M + row] = __float2bfloat16_rn(value * inverse_weight_divisor);
-  };
-#pragma unroll
-  for (int mi = 0; mi < kMmaRows; ++mi) {
-    const int row0 = m0 + wm * kWarpRows + mi * 16 + gid, row1 = row0 + 8;
-#pragma unroll
-    for (int ni = 0; ni < kMmaCols; ++ni) {
-      const int token0 = n0 + wn * kWarpCols + ni * 8 + 2 * lid, token1 = token0 + 1;
-      const float* value = accum[mi][ni];
-      if (FullTokens || token0 < tokens) { store(row0, token0, value[0]); store(row1, token0, value[2]); }
-      if (FullTokens || token1 < tokens) { store(row0, token1, value[1]); store(row1, token1, value[3]); }
-    }
-  }
 }
-} // namespace ts_nidf_mma
-extern "C" __global__ void ts_nidf_mma_shared_bytes(int* out) { out[0] = ts_nidf_mma::kSharedBytes; out[1] = ts_nidf_mma::kThreads; }
-#define TS_NIDF_MMA(N, K) \
-extern "C" __global__ __launch_bounds__(ts_nidf_mma::kThreads) void ts_nidf_mma_n##N##_k##K##_full( \
-  const uint8_t* c, const uint8_t* s, const __nv_bfloat16* x, __nv_bfloat16* y, float inv, int tokens) \
-  { ts_nidf_mma::a16_mma<N, K, true>(x, c, s, inv, y, tokens); } \
-extern "C" __global__ __launch_bounds__(ts_nidf_mma::kThreads) void ts_nidf_mma_n##N##_k##K##_part( \
-  const uint8_t* c, const uint8_t* s, const __nv_bfloat16* x, __nv_bfloat16* y, float inv, int tokens) \
-  { ts_nidf_mma::a16_mma<N, K, false>(x, c, s, inv, y, tokens); }
-TS_NIDF_MMA(5120, 25600)
-TS_NIDF_MMA(6144, 5120)
