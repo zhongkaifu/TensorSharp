@@ -81,7 +81,7 @@ namespace TensorSharp.Cuda
             Environment.GetEnvironmentVariable("TS_Q35_VERIFY_GRAPHS") == "1";
         internal const int MaxVerifyGraphs = 32;
         private int _verifyGraphGeneration;
-        private readonly record struct VerifyGraphKey(int Lanes, int Window, int AttentionChunk, int AttentionSplits, int Generation);
+        private readonly record struct VerifyGraphKey(int Lanes, int Window, int AttentionChunk, int AttentionSplits, int SharedSplits, int Generation);
         private struct VerifyGraphEntry
         {
             public VerifyGraphKey Key;
@@ -116,8 +116,10 @@ namespace TensorSharp.Cuda
                 return;
             }
             var attention = Q35Kernels.GetSplitAttentionPlan(maxKeys[0]);
+            // The shared-prefix attention launches (see SharedPrefixKeys) are part of the captured graph.
+            int sharedSplits = Q35Kernels.SharedSplitCount(SharedPrefixKeys(groups[0].Slots), maxKeys[0], groups[0].Slots.Length);
             var key = new VerifyGraphKey(groups[0].Slots.Length, groups[0].RowsPerSeq,
-                attention.Chunk, attention.Splits, _verifyGraphGeneration);
+                attention.Chunk, attention.Splits, sharedSplits, _verifyGraphGeneration);
             for (int i = 0; i < _uncapturableVerifyCount; i++)
                 if (_uncapturableVerifyKeys[i] == key)
                 {
@@ -179,7 +181,7 @@ namespace TensorSharp.Cuda
                     if (owned != IntPtr.Zero)
                         CudaDriverApi.cuGraphExecDestroy(owned);
                 }
-                Console.Error.WriteLine($"[q35-cuda] Verify CUDA graph captured: lanes={key.Lanes}, window={key.Window}, attention={key.AttentionChunk}x{key.AttentionSplits}, generation={key.Generation}");
+                Console.Error.WriteLine($"[q35-cuda] Verify CUDA graph captured: lanes={key.Lanes}, window={key.Window}, attention={key.AttentionChunk}x{key.AttentionSplits}, shared={key.SharedSplits}, generation={key.Generation}");
             }
             _verifyGraphs[slot].LastUse = ++_verifyGraphClock;
             // No fallback after a failed launch: some device writes may already have occurred.

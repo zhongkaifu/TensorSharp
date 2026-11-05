@@ -1218,9 +1218,71 @@ namespace TensorSharp.Cuda
                 return;
             }
             // The FFN activations are idle during attention: key-split partials of prompt chunks go there.
+            int sharedKeys = SharedPrefixKeys(g.Slots);
             _k.Attention(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L * r0), tab, _maxBlocks, kOff, vOff, g.RowsPerSeq, g.Slots.Length,
                 _m.NHead, _m.NKvHead, 1.0f / MathF.Sqrt(_m.HeadDim), maxKeys, n <= MaxVerifyRows ? _attnPartial : IntPtr.Zero, _attn + qOff,
-                _sms, Stream, _act, (long)RowCap * _m.NFf * 4);
+                _sms, Stream, _act, (long)RowCap * _m.NFf * 4, sharedKeys);
+            if (SharedPrefixCheck && n <= MaxVerifyRows && Q35Kernels.SharedSplitCount(sharedKeys, maxKeys, g.Slots.Length) > 0)
+                CheckSharedPrefixAttention(g, r0, n, maxKeys, kOff, vOff, tab, qOff);
+        }
+
+        private static readonly bool SharedPrefixCheck = Environment.GetEnvironmentVariable("TS_Q35_SHARED_PREFIX_CHECK") == "1";
+
+        /// <summary>Diagnostic (TS_Q35_SHARED_PREFIX_CHECK=1): the same rows without the shared-prefix
+        /// launch, and the largest difference to the shared result (the key ranges and each row's
+        /// arithmetic are the same, so it must be 0).</summary>
+        private void CheckSharedPrefixAttention(in RowGroup g, int r0, int n, int maxKeys, long kOff, long vOff, IntPtr tab, nint qOff)
+        {
+            long count = (long)n * QDim;
+            IntPtr reference = Alloc(count * 4);
+            try
+            {
+                _k.Attention(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L * r0), tab, _maxBlocks, kOff, vOff, g.RowsPerSeq, g.Slots.Length,
+                    _m.NHead, _m.NKvHead, 1.0f / MathF.Sqrt(_m.HeadDim), maxKeys, _attnPartial, reference, _sms, Stream, _act,
+                    (long)RowCap * _m.NFf * 4, sharedKeys: 0);
+                Sync();
+                var a = new float[count]; var b = new float[count];
+                fixed (float* pa = a) CudaDriverApi.cuMemcpyDtoH((IntPtr)pa, _attn + qOff, new UIntPtr((ulong)count * 4)).ThrowOnError();
+                fixed (float* pb = b) CudaDriverApi.cuMemcpyDtoH((IntPtr)pb, reference, new UIntPtr((ulong)count * 4)).ThrowOnError();
+                double worst = 0;
+                for (long i = 0; i < count; i++)
+                    worst = Math.Max(worst, Math.Abs((double)a[i] - b[i]));
+                Console.Error.WriteLine($"[q35-shared-check] seqs={g.Slots.Length} rows/seq={g.RowsPerSeq} keys={maxKeys} " +
+                    $"shared={SharedPrefixKeys(g.Slots)} max|diff|={worst:G3}");
+            }
+            finally
+            {
+                CudaDriverApi.cuMemFree(reference);
+                _owned.Remove(reference);
+            }
+        }
+
+        /// <summary>Keys at the start of every slot's cache that all of them read from the same cache
+        /// blocks (clones of one cached prefix share its blocks until a slot writes into one), 0 for a
+        /// single slot. Every such block lies before each slot's position: a slot copies a shared block
+        /// before its first write into it.</summary>
+        private static int SharedPrefixKeys(Slot[] slots)
+        {
+            if (slots == null || slots.Length < 2 || !Q35Kernels.SharedPrefixAttention)
+                return 0;
+            var first = slots[0].Blocks;
+            int n = first.Count;
+            foreach (var s in slots)
+                n = Math.Min(n, s.Blocks.Count);
+            int k = 0;
+            for (; k < n; k++)
+            {
+                IntPtr b = first[k];
+                bool same = true;
+                for (int i = 1; i < slots.Length && same; i++)
+                    same = slots[i].Blocks[k] == b;
+                if (!same)
+                    break;
+            }
+            int keys = k * Q35Kernels.KvBlockTokens;
+            foreach (var s in slots)
+                keys = Math.Min(keys, s.NPast);
+            return keys;
         }
 
         /// <summary>The Gated DeltaNet recurrence of one group's rows (rows r0.., sequences q0..) into

@@ -2479,16 +2479,18 @@ __device__ __forceinline__ void ts_q35_tile_to_h(const uint8_t* raw, half* dst, 
 __device__ __forceinline__ void ts_q35_attn_pipe(
     const float* __restrict__ q, const float* __restrict__ gate, const int* __restrict__ keyEnd,
     uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
-    int rowsPerSeq, int nHead, int nKv, float scale, int splits, int chunk, float* __restrict__ partial,
-    float* __restrict__ out)
+    int rowsPerSeq, int nHead, int nKv, float scale, int splits, int chunk, int splitBase, int splitCount,
+    float* __restrict__ partial, float* __restrict__ out)
 {
     extern __shared__ __align__(16) uint8_t ts_q35_attn_smem[];
     TsQ35AttnPrefill& sm = *reinterpret_cast<TsQ35AttnPrefill*>(ts_q35_attn_smem);
     const int kvh = blockIdx.y, seq = blockIdx.z;
     const int G = nHead / nKv;
     const int R = rowsPerSeq * G;
-    const int split = blockIdx.x % splits;
-    const int rowBase = (blockIdx.x / splits) * TS_Q35_AI_ROWS;
+    // Block x = (row tile, split splitBase + x % splitCount): a launch can take a subset of the splits
+    // (the key range several sequences share, or each sequence's own); partials use all splits' stride.
+    const int split = splitBase + (int)(blockIdx.x % splitCount);
+    const int rowBase = (blockIdx.x / splitCount) * TS_Q35_AI_ROWS;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, qd = lane & 3;
     const int* ends = keyEnd + (long long)seq * rowsPerSeq;
     const int kAll = ends[(min(rowBase + TS_Q35_AI_ROWS, R) - 1) / G];
@@ -2715,22 +2717,25 @@ extern "C" __global__ void __launch_bounds__(256) ts_q35_attn_prefill_f32(
     int rowsPerSeq, int nHead, int nKv, float scale, int splits, float* __restrict__ partial, float* __restrict__ out)
 {
     ts_q35_attn_pipe(q, gate, keyEnd, blockTable, maxBlocks, kOff, vOff, rowsPerSeq, nHead, nKv, scale, splits, 0,
-                     partial, out);
+                     0, splits, partial, out);
 }
 
 // Decode and verify attention (at most 128 query rows per KV head): ts_q35_attn_q8_split_f32's key
 // ranges (fixed boundaries every chunk keys, so a row's sums never depend on the other rows of the
 // step) on the prefill kernel's two-stage cp.async pipeline. The synchronous split kernel reads a
 // long q8_0 history at about half the device bandwidth (one 32-key tile in flight per 4-warp block).
-// splits == 1 writes the gated output; otherwise partials for ts_q35_attn_combine_f32.
+// splits == 1 writes the gated output; otherwise partials for ts_q35_attn_combine_f32. Splits
+// [splitBase, splitBase + splitCount) only: sequences that share their first keys (clones of one cached
+// prefix share its cache blocks) run those splits once with every sequence's rows as one sequence
+// (rows are [sequence][token] in every buffer), then their own splits separately.
 extern "C" __global__ void __launch_bounds__(256) ts_q35_attn_q8_split_pipe_f32(
     const float* __restrict__ q, const float* __restrict__ gate, const int* __restrict__ keyEnd,
     uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
-    int rowsPerSeq, int nHead, int nKv, float scale, int splits, int chunk, float* __restrict__ partial,
-    float* __restrict__ out)
+    int rowsPerSeq, int nHead, int nKv, float scale, int splits, int chunk, int splitBase, int splitCount,
+    float* __restrict__ partial, float* __restrict__ out)
 {
     ts_q35_attn_pipe(q, gate, keyEnd, blockTable, maxBlocks, kOff, vOff, rowsPerSeq, nHead, nKv, scale, splits, chunk,
-                     partial, out);
+                     splitBase, splitCount, partial, out);
 }
 
 // Dynamic shared memory of ts_q35_attn_prefill_f32, for the host.

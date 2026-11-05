@@ -415,9 +415,11 @@ namespace TensorSharp.Cuda
         /// ([tokens][nKv][272 B]), gate applied. Sequences of at most <see cref="AttnBlockRows"/> query rows per KV head take the
         /// split-key path (<paramref name="partial"/> sized by <see cref="AttnSplitFloats"/>). Longer prompt chunks split
         /// their keys too when that fills the device better, into <paramref name="scratch"/> (<paramref name="scratchBytes"/>).</summary>
+        /// <remarks><paramref name="sharedKeys"/>: the first keys every sequence's cache shares (the same
+        /// cache blocks): on the pipelined decode path those splits run once for all sequences' rows.</remarks>
         public void Attention(IntPtr q, IntPtr gate, IntPtr keyEnd, IntPtr blockTable, int maxBlocks, long kOff, long vOff,
             int rowsPerSeq, int nSeq, int nHead, int nKv, float scale, int maxKeys, IntPtr partial, IntPtr outRows, int sms, IntPtr stream,
-            IntPtr scratch = default, long scratchBytes = 0)
+            IntPtr scratch = default, long scratchBytes = 0, int sharedKeys = 0)
         {
             int rowsPerHead = rowsPerSeq * (nHead / nKv);
             if (rowsPerHead <= AttnBlockRows && partial != IntPtr.Zero)
@@ -430,12 +432,26 @@ namespace TensorSharp.Cuda
                 if (DecodeAttentionPipelined)
                 {
                     // The same key ranges on the prefill kernel's cp.async pipeline (one launch writes
-                    // the gated output when a single split covers every key).
-                    IntPtr p0 = q, p1 = gate, p2 = keyEnd, p3 = blockTable, p12 = partial, p13 = outRows;
-                    int p4 = maxBlocks, p7 = rowsPerSeq, p8 = nHead, p9 = nKv, p10 = splits, p11 = chunk;
+                    // the gated output when a single split covers every key). Splits every sequence
+                    // shares run once over all their rows (the shared blocks are read once per 128 rows
+                    // instead of once per sequence); each sequence's own splits follow.
+                    int shared = SharedSplitCount(sharedKeys, maxKeys, nSeq);
+                    int G = nHead / nKv;
+                    IntPtr p0 = q, p1 = gate, p2 = keyEnd, p3 = blockTable, p14 = partial, p15 = outRows;
+                    int p4 = maxBlocks, p7 = rowsPerSeq, p8 = nHead, p9 = nKv, p10 = splits, p11 = chunk, p12 = 0, p13 = splits;
                     long p5 = kOff, p6 = vOff; float pscale = scale;
-                    void** sargs = stackalloc void*[] { &p0, &p1, &p2, &p3, &p4, &p5, &p6, &p7, &p8, &p9, &pscale, &p10, &p11, &p12, &p13 };
-                    Launch(attnSplitPipe, (uint)splits, (uint)nKv, (uint)nSeq, 256, smemAttnPrefill, stream, sargs);
+                    void** sargs = stackalloc void*[] { &p0, &p1, &p2, &p3, &p4, &p5, &p6, &p7, &p8, &p9, &pscale, &p10, &p11, &p12, &p13, &p14, &p15 };
+                    if (shared > 0)
+                    {
+                        p7 = rowsPerSeq * nSeq;
+                        p13 = shared;
+                        uint rowTiles = CeilDiv((long)p7 * G, 2 * AttnBlockRows);
+                        Launch(attnSplitPipe, rowTiles * (uint)shared, (uint)nKv, 1, 256, smemAttnPrefill, stream, sargs);
+                        p7 = rowsPerSeq;
+                        p12 = shared;
+                        p13 = splits - shared;
+                    }
+                    Launch(attnSplitPipe, (uint)p13, (uint)nKv, (uint)nSeq, 256, smemAttnPrefill, stream, sargs);
                     if (splits > 1)
                     {
                         IntPtr e0 = partial, e1 = gate, e3 = outRows; int e2 = splits;
@@ -511,6 +527,21 @@ namespace TensorSharp.Cuda
         internal const int AttnMaxSplitCount = 64;
 
         internal readonly record struct SplitAttentionPlan(int Chunk, int Splits);
+
+        /// <summary>Shared-prefix attention for clones of one cached prefix (TS_Q35_SHARED_PREFIX_ATTN=0: off).</summary>
+        internal static readonly bool SharedPrefixAttention = Environment.GetEnvironmentVariable("TS_Q35_SHARED_PREFIX_ATTN") != "0";
+
+        /// <summary>Leading splits of the decode/verify plan for <paramref name="maxKeys"/> that lie wholly
+        /// within <paramref name="sharedKeys"/> keys every one of <paramref name="nSeq"/> sequences shares,
+        /// leaving at least one split per sequence for its own keys; 0 when not worth a launch.</summary>
+        internal static int SharedSplitCount(int sharedKeys, int maxKeys, int nSeq)
+        {
+            if (!SharedPrefixAttention || !DecodeAttentionPipelined || nSeq < 2 || sharedKeys <= 0 || maxKeys < 1)
+                return 0;
+            var plan = GetSplitAttentionPlan(maxKeys);
+            int shared = Math.Min(sharedKeys / plan.Chunk, plan.Splits - 1);
+            return shared >= 2 ? shared : 0;
+        }
 
         // The launch and the Verify CUDA graph key must use the same plan. Token positions
         // remain device inputs; only this grid/reduction geometry is captured as constants.
