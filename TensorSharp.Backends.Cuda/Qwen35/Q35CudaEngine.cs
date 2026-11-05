@@ -817,7 +817,6 @@ namespace TensorSharp.Cuda
         private void RunGroupsCore(int tapFirst, RowGroup[] groups)
         {
             RequireNoPendingNinferVerification();
-            KeepGrowthReserve();
             int e = _m.NEmbd, nt = RowCap, n = 0, nSeq = 0;
             foreach (var g in groups)
             {
@@ -830,6 +829,7 @@ namespace TensorSharp.Cuda
             }
             if (n > nt)
                 throw new ArgumentException($"[q35-cuda] {n} rows in one step (at most {nt})");
+            KeepGrowthReserve();
             ResetProjectionDispatchStats();
             var all = new Slot[nSeq];
             for (int gi = 0, q0 = 0; gi < groups.Length; q0 += groups[gi].Slots.Length, gi++)
