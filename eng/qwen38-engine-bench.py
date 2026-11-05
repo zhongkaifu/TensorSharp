@@ -38,6 +38,15 @@ Scenarios (--scenarios, comma list; --list-scenarios prints them):
                        servers launched with and without the DFlash2 drafter
   parallel_{2,4}       N different concurrent requests: aggregate throughput
                        and per-request correctness (server needs >= N lanes)
+  subagent_fanout      an orchestrator delegates three regional audits in one turn
+                       (parallel delegate_task calls); the three sub-agents run
+                       concurrently as tool loops; the orchestrator combines them
+  skill_call           Agent Skills: pick from a catalog, load_skill, run its
+                       script with the right arguments, return the output
+  code_edit            fix four buggy functions to a spec; each answer is executed
+                       against hidden checks in a policy-checked, rlimited sandbox
+  code_run             write a program, run it via a run_python tool, answer
+                       from its output (generate-execute-observe)
 
 Method. Requests default to greedy (temperature 0, top_p 1, fixed seed), streamed,
 with --temperature/--top-p available for separately labelled sampled quality runs,
@@ -104,7 +113,8 @@ DEFAULT_CHARS_PER_TOKEN = 4.3
 SCENARIOS = ["short_chat", "quality_tasks", "long_prompt_4k", "long_prompt_16k", "long_prompt_32k",
              "long_prompt_128k", "long_prompt_250k",
              "json_object", "json_schema", "tool_call_single", "tool_call_parallel", "agentic_loop",
-             "multi_turn", "image", "long_generation", "parallel_2", "parallel_4"]
+             "multi_turn", "image", "long_generation", "parallel_2", "parallel_4",
+             "subagent_fanout", "skill_call", "code_edit", "code_run", "prefix_reuse_16k"]
 OPTIONAL_SCENARIOS = ["quality_gsm8k"]
 GSM8K_FIXTURE = ROOT / "InferenceWeb.Tests" / "Fixtures" / "Qwen38" / "gsm8k-mini.json"
 
@@ -972,8 +982,11 @@ def run_long_prompt(ctx, r, k, name):
         prompt, user_tokens = render(prose), None
     res = ctx.chat(ctx.messages(name, r, prompt), ctx.args.answer_tokens)
     checks = []
+    # A ```json fence is a formatting choice, not a retrieval error; every other JSON
+    # scenario already accepts it (parse_json_answer), so the needle check does too.
+    answer_text, _ = strip_fence(res.get("content") or "")
     try:
-        actual = json.loads(res.get("content") or "")
+        actual = json.loads(answer_text)
     except ValueError:
         actual = None
     for key, code in codes.items():
@@ -1304,6 +1317,43 @@ def run_multi_turn(ctx, r):
     return case("multi_turn", r, checks, m, results, ctx.args.keep_text)
 
 
+REUSE_FACTS = [
+    ("The harbor archive's tide ledger for 1903 was rebound in green calfskin.",
+     "What colour was the 1903 tide ledger rebound in? Reply with the colour only.", r"\bgreen\b"),
+    ("The archive's night watchman, Oskar Pellow, kept the brass key ring.",
+     "Who kept the brass key ring? Reply with the full name only.", r"\bpellow\b"),
+    ("The flood of 1911 destroyed the archive's second reading room.",
+     "Which room did the flood of 1911 destroy? Reply with the room only.", r"\bsecond\b"),
+]
+
+
+def run_prefix_reuse(ctx, r, k, name):
+    """KV-cache reuse across conversations: three fresh chats that share a k-K-token system
+    document and ask different questions. Request 1 prefills the document cold; requests 2
+    and 3 can reuse its KV (cached_tokens, warm TTFT). The document carries the repeat's
+    nonce, so request 1 never hits a cache left by another run."""
+    paragraphs = take_prose(ctx.haystack, int(k * 1024 * ctx.args.chars_per_token), start=401 + 13 * r)
+    for j, (fact, _, _) in enumerate(REUSE_FACTS):
+        paragraphs.insert(int(len(paragraphs) * (j + 1) / (len(REUSE_FACTS) + 1)), fact)
+    system = (f"Session {ctx.nonce(name, r)}. You are the archivist of the harbor archive. Answer questions "
+              "about the archive's records below concisely.\n\n<records>\n" + "\n\n".join(paragraphs) + "\n</records>")
+    results, checks = [], []
+    for i, (_, question, pattern) in enumerate(REUSE_FACTS):
+        res = ctx.chat([{"role": "system", "content": system}, {"role": "user", "content": question}],
+                       ctx.args.answer_tokens)
+        results.append(res)
+        check(checks, f"request{i + 1}", re.search(pattern, norm(res.get("content"))) is not None, budget_note(res))
+    t = [x.get("ttft_s") for x in results]
+    warm = med(t[1:])
+    m = {"turn_ttft_s": t, "turn_prompt_tokens": [x.get("prompt_tokens") for x in results],
+         "turn_cached_tokens": [x.get("cached_tokens") for x in results],
+         "cold_ttft_s": t[0], "warm_ttft_s": warm, "ttft_s": med(t),
+         "ttft_drop": (t[0] / warm) if (t[0] and warm) else None,
+         "prompt_tokens": results[0].get("prompt_tokens") if results else None,
+         "decode_tok_s": med([x.get("decode_tok_s") for x in results])}
+    return case(name, r, checks, m, results, ctx.args.keep_text)
+
+
 def load_generator():
     spec = importlib.util.spec_from_file_location("bench_media_generate", MEDIA_DIR / "generate.py")
     mod = importlib.util.module_from_spec(spec)
@@ -1392,6 +1442,335 @@ def run_long_generation(ctx, r):
     return case("long_generation", r, checks, m, results, ctx.args.keep_text)
 
 
+
+# --------------------------------------------------------------------------- agent fan-out, skills, code
+
+def tool_turn_messages(res, turn, handler, trace, label=""):
+    """The assistant tool-call message and the tool results for one model turn."""
+    assistant = {"role": "assistant", "content": res.get("content") or "", "tool_calls": []}
+    outs = []
+    for i, c in enumerate(res["tool_calls"]):
+        call_id = c["id"] or f"call_{label}{turn}_{i}"
+        args = c["parsed"] if isinstance(c["parsed"], dict) else {}
+        out = handler(c["name"], args) if c["parsed"] is not None else "error: arguments are not valid JSON"
+        assistant["tool_calls"].append({"id": call_id, "type": "function",
+                                        "function": {"name": c["name"], "arguments": c["arguments"] or "{}"}})
+        outs.append({"role": "tool", "tool_call_id": call_id, "content": out})
+        trace.append({"agent": label, "turn": turn, "tool": c["name"], "args": args, "result": out[:200]})
+    return [assistant] + outs
+
+
+def run_tool_loop(ctx, msgs, tools, handler, trace, label="", max_turns=None):
+    """Model <-> local tools until a turn without tool calls (or the cap). Returns (results, final)."""
+    results, final = [], None
+    for turn in range(max_turns or ctx.args.agent_max_turns):
+        res = ctx.chat(msgs, ctx.args.answer_tokens, {"tools": tools, "tool_choice": "auto"})
+        results.append(res)
+        if res.get("error"):
+            break
+        if not res["tool_calls"]:
+            final = res
+            break
+        msgs = msgs + tool_turn_messages(res, turn, handler, trace, label)
+    return results, final
+
+
+SUBAGENT_REGIONS = {
+    "north": ("north,widget,12\nnorth,gadget,3\nnorth,widget,8\n", None),
+    "south": ("south,gadget,7\nsouth,sprocket,25\nsouth,widget,4\n", None),
+    "west": ("west,widget,30\nwest,sprocket,10\nwest,gadget,1\n", None),
+}
+SUBAGENT_PRICES = {"widget": 3.75, "gadget": 12.0, "sprocket": 0.8}
+DELEGATE_TOOL = tool("delegate_task", "Hand one self-contained task to a sub-agent and get its final report back. "
+                     "Sub-agents run in parallel; delegate every independent task in the same turn.",
+                     {"agent": {"type": "string", "description": "a short sub-agent name"},
+                      "task": {"type": "string", "description": "the complete instructions for the sub-agent"}},
+                     ["agent", "task"])
+
+
+def subagent_revenue(region):
+    total = 0.0
+    for line in SUBAGENT_REGIONS[region][0].strip().splitlines():
+        _, product, qty = line.split(",")
+        total += int(qty) * SUBAGENT_PRICES[product]
+    return round(total, 2)
+
+
+def run_subagent_fanout(ctx, r):
+    """An orchestrator delegates three independent regional revenue audits to sub-agents (one turn,
+    parallel tool calls); the harness runs the three sub-agents concurrently, each a tool-using loop over
+    its own files, returns their reports, and the orchestrator must combine them correctly."""
+    trace, results = [], []
+    orchestrator_sys = ("You are an orchestrating agent. You cannot read files yourself: delegate work to sub-agents "
+                        "with the delegate_task tool, then combine their reports.")
+    task = ("Compute the total sales revenue in US dollars for the north, south and west regions. Each region's "
+            "orders are in /sales/<region>.csv (columns region,product,quantity) and unit prices are in "
+            "/sales/prices.json. Delegate one sub-agent per region (all three in this turn); each must report "
+            "'REVENUE: <amount>'. When the reports come back, reply with one line per region and a final line "
+            "'TOTAL: <amount>'.")
+    msgs = ctx.messages("subagent_fanout", r, task, system=orchestrator_sys)
+    t0 = time.perf_counter()
+    first = ctx.chat(msgs, ctx.args.answer_tokens, {"tools": [DELEGATE_TOOL], "tool_choice": "auto",
+                                                    "parallel_tool_calls": True})
+    results.append(first)
+    calls = first["tool_calls"] if not first.get("error") else []
+    regions = []
+    for c in calls:
+        a = c["parsed"] if isinstance(c["parsed"], dict) else {}
+        text = (str(a.get("agent", "")) + " " + str(a.get("task", ""))).lower()
+        regions.append(next((g for g in SUBAGENT_REGIONS if g in text), None))
+    files = {f"/sales/{g}.csv": "region,product,quantity\n" + SUBAGENT_REGIONS[g][0] for g in SUBAGENT_REGIONS}
+    files["/sales/prices.json"] = json.dumps(SUBAGENT_PRICES)
+
+    def handler(name, args):
+        if name == "read_file":
+            path = str(args.get("path", ""))
+            return files.get(path if path.startswith("/") else "/sales/" + path, f"error: no such file {path}")
+        if name == "list_files":
+            return "\n".join(sorted(p.rsplit("/", 1)[1] for p in files))
+        if name == "calculator":
+            try:
+                return str(calculate(args.get("expression", "")))
+            except Exception as err:
+                return f"error: {err}"
+        return f"error: unknown tool {name}"
+
+    sub_out = [None] * len(calls)
+    sub_sys = "You are a sub-agent. Use the tools to read the files you need and the calculator for arithmetic."
+
+    def sub(i):
+        a = calls[i]["parsed"] if isinstance(calls[i]["parsed"], dict) else {}
+        m = ctx.messages("subagent_fanout", r, str(a.get("task", "")) + "\nEnd with the line 'REVENUE: <amount>'.",
+                         i + 1, system=sub_sys)
+        sub_out[i] = run_tool_loop(ctx, m, AGENT_TOOLS, handler, trace, label=f"sub{i}")
+
+    ts = time.perf_counter()
+    threads = [threading.Thread(target=sub, args=(i,)) for i in range(len(calls))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    sub_wall = time.perf_counter() - ts
+    checks = []
+    check(checks, "delegated_three", len(calls) == 3 and sorted(x or "" for x in regions) == sorted(SUBAGENT_REGIONS),
+          f"{len(calls)} delegation(s) {regions}; {budget_note(first) if not calls else ''}")
+    reports, final = [], None
+    for i, out in enumerate(sub_out):
+        sub_results, sub_final = out
+        results.extend(sub_results)
+        text = norm(sub_final.get("content")) if sub_final else ""
+        g = regions[i]
+        want = subagent_revenue(g) if g else None
+        got = re.search(r"revenue:\s*\$?\s*([0-9][0-9,]*\.?[0-9]*)", text)
+        ok = want is not None and got is not None and abs(float(got.group(1).replace(",", "")) - want) < 0.01
+        check(checks, f"subagent_{g or i}", ok, f"want={want} got={got.group(1) if got else None}")
+        reports.append(sub_final.get("content") if sub_final else "error: sub-agent did not finish")
+    if calls:
+        msgs2 = msgs + tool_turn_messages(first, 0, lambda n, a: reports.pop(0) if reports else "error", trace, "orch")
+        results2, final = run_tool_loop(ctx, msgs2, [DELEGATE_TOOL], lambda n, a: "error: delegation closed", trace,
+                                        label="orch", max_turns=2)
+        results.extend(results2)
+    want_total = round(sum(subagent_revenue(g) for g in SUBAGENT_REGIONS), 2)
+    got_total = re.search(r"total:\s*\$?\s*([0-9][0-9,]*\.?[0-9]*)", norm(final.get("content")) if final else "")
+    check(checks, "total", got_total is not None and abs(float(got_total.group(1).replace(",", "")) - want_total) < 0.01,
+          f"want={want_total} got={got_total.group(1) if got_total else None}")
+    m = pooled_metrics(results)
+    m.update({"end_to_end_s": time.perf_counter() - t0, "subagent_wall_s": sub_wall, "subagents": len(calls),
+              "model_calls": len(results), "tool_calls": len(trace)})
+    return case("subagent_fanout", r, checks, m, results, ctx.args.keep_text, notes={"trace": trace})
+
+
+SKILLS = {
+    "csv-table": ("Convert a Markdown table to CSV.",
+                  "To convert a Markdown table: call run_skill_script with script='md2csv.py' and args={'table': "
+                  "<the exact Markdown table text>}. Then return the script's CSV output verbatim inside a "
+                  "```csv code block."),
+    "unit-convert": ("Convert physical units (length, mass, temperature).",
+                     "Call run_skill_script with script='convert.py' and args={'value': number, 'from': unit, 'to': unit}."),
+    "pdf-extract": ("Extract text from a PDF file.", "Call run_skill_script with script='extract.py' and args={'path': path}."),
+}
+SKILL_TOOLS = [
+    tool("load_skill", "Load a skill's full instructions by name.", {"name": {"type": "string"}}, ["name"]),
+    tool("run_skill_script", "Run one of a loaded skill's bundled scripts.",
+         {"script": {"type": "string"}, "args": {"type": "object"}}, ["script", "args"]),
+]
+SKILL_TABLE = "| city | population |\n|---|---|\n| Lyon | 522250 |\n| Nice | 348085 |\n| Lille | 236710 |"
+SKILL_CSV = "city,population\nLyon,522250\nNice,348085\nLille,236710"
+
+
+def run_skill_call(ctx, r):
+    """Agent Skills flow: pick a skill from the catalog, load its instructions, run its script with the
+    right arguments, and return the script's output."""
+    loaded = set()
+
+    def handler(name, args):
+        if name == "load_skill":
+            n = str(args.get("name", ""))
+            if n not in SKILLS:
+                return f"error: no skill named {n!r}"
+            loaded.add(n)
+            return SKILLS[n][1]
+        if name == "run_skill_script":
+            if "csv-table" not in loaded:
+                return "error: load the skill first"
+            a = args.get("args") if isinstance(args.get("args"), dict) else {}
+            table = str(a.get("table", ""))
+            rows = [[x.strip() for x in line.strip().strip("|").split("|")]
+                    for line in table.strip().splitlines() if not re.fullmatch(r"\|?[\s:|-]+\|?", line.strip())]
+            return "\n".join(",".join(row) for row in rows) if args.get("script") == "md2csv.py" and rows else "error: bad script or args"
+        return f"error: unknown tool {name}"
+
+    catalog = "\n".join(f"- {k}: {v[0]}" for k, v in SKILLS.items())
+    system = ("You are an assistant with Agent Skills. Available skills (load one before using it):\n" + catalog)
+    trace = []
+    msgs = ctx.messages("skill_call", r, "Convert this table to CSV:\n\n" + SKILL_TABLE, system=system)
+    results, final = run_tool_loop(ctx, msgs, SKILL_TOOLS, handler, trace, max_turns=5)
+    checks = []
+    check(checks, "loaded_right_skill", "csv-table" in loaded and not (loaded - {"csv-table"}), repr(sorted(loaded)))
+    ran = [t for t in trace if t["tool"] == "run_skill_script"]
+    check(checks, "ran_script", any(t["args"].get("script") == "md2csv.py" and not t["result"].startswith("error")
+                                    for t in ran), repr([t["args"] for t in ran])[:200])
+    body = strip_fence((final.get("content") or "").replace("```csv", "```"))[0] if final else ""
+    check(checks, "csv_output", SKILL_CSV in re.sub(r"[ \t]+", "", body), body[:200])
+    m = pooled_metrics(results)
+    m.update({"turns": len(results), "tool_calls": len(trace), "end_to_end_s": sum(x.get("total_s") or 0 for x in results)})
+    return case("skill_call", r, checks, m, results, ctx.args.keep_text, notes={"trace": trace})
+
+
+CODE_ALLOWED_IMPORTS = {"math", "itertools", "functools", "collections", "heapq", "bisect", "re", "string"}
+CODE_BANNED_NAMES = {"open", "exec", "eval", "compile", "__import__", "input", "globals", "locals", "vars",
+                     "getattr", "setattr", "delattr", "breakpoint", "exit", "quit"}
+
+
+def code_policy_error(source):
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as err:
+        return f"syntax error: {err}"
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [a.name.split(".")[0] for a in node.names] if isinstance(node, ast.Import) else [(node.module or "").split(".")[0]]
+            if any(n not in CODE_ALLOWED_IMPORTS for n in names):
+                return f"import not allowed: {names}"
+        if isinstance(node, ast.Name) and node.id in CODE_BANNED_NAMES:
+            return f"name not allowed: {node.id}"
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+            return f"dunder attribute not allowed: {node.attr}"
+    return None
+
+
+def run_python_sandboxed(source, stdin_text="", timeout=4.0, harness=""):
+    """Policy-checked, resource-limited fresh interpreter (defense in depth; benign benchmark tasks).
+    Only the model's `source` is policy-checked; the harness's own appended checks are trusted."""
+    import subprocess
+    err = code_policy_error(source)
+    if err:
+        return {"ok": False, "stdout": "", "stderr": err}
+
+    def limits():
+        import resource
+        resource.setrlimit(resource.RLIMIT_CPU, (2, 2))
+        resource.setrlimit(resource.RLIMIT_AS, (512 << 20, 512 << 20))
+    try:
+        p = subprocess.run([sys.executable, "-I", "-S", "-c", source + harness], input=stdin_text, capture_output=True,
+                           text=True, timeout=timeout, preexec_fn=limits, env={"PATH": "/usr/bin:/bin"})
+        return {"ok": p.returncode == 0, "stdout": p.stdout[-4000:], "stderr": p.stderr[-2000:]}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "stdout": "", "stderr": "timeout"}
+
+
+CODE_EDIT_TASKS = [
+    ("median", "def median(values):\n    values = sorted(values)\n    return values[len(values) // 2]\n",
+     "median([]) must raise ValueError; for an even count it must return the mean of the two middle values.",
+     [("median([3, 1, 2])", 2), ("median([4, 1, 3, 2])", 2.5), ("median([5])", 5), ("median([1, 1, 2, 9])", 1.5)],
+     "median([])"),
+    ("merge_intervals", "def merge_intervals(intervals):\n    out = []\n    for a, b in intervals:\n"
+     "        if out and a < out[-1][1]:\n            out[-1][1] = max(out[-1][1], b)\n        else:\n"
+     "            out.append([a, b])\n    return out\n",
+     "Intervals may arrive unsorted, and touching intervals such as [1, 3] and [3, 5] must merge. Return a list of "
+     "[start, end] lists sorted by start.",
+     [("merge_intervals([[1, 3], [3, 5]])", [[1, 5]]), ("merge_intervals([[5, 6], [1, 2], [2, 4]])", [[1, 4], [5, 6]]),
+      ("merge_intervals([])", []), ("merge_intervals([[1, 10], [2, 3]])", [[1, 10]])], None),
+    ("is_palindrome", "def is_palindrome(text):\n    return text == text[::-1]\n",
+     "Ignore case and every non-alphanumeric character.",
+     [("is_palindrome('A man, a plan, a canal: Panama')", True), ("is_palindrome('race a car')", False),
+      ("is_palindrome('')", True), ("is_palindrome('No lemon, no melon')", True)], None),
+    ("word_count", "def word_count(text):\n    counts = {}\n    for w in text.split(' '):\n        counts[w] = counts.get(w, 0) + 1\n    return counts\n",
+     "Split on any whitespace, lowercase words, strip the punctuation .,!? from both ends, and skip empty words.",
+     [("word_count('Hi hi  there!')", {"hi": 2, "there": 1}), ("word_count('')", {}),
+      ("word_count('A. a, A!')", {"a": 3})], None),
+]
+
+
+def extract_python(text):
+    blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", text or "", re.S)
+    return max(blocks, key=len) if blocks else (text or "")
+
+
+def run_code_edit(ctx, r):
+    """Fix a buggy function to a spec; every returned module is executed against hidden checks."""
+    checks, results = [], []
+    for name, buggy, spec, cases, raises in CODE_EDIT_TASKS:
+        prompt = (f"This Python function has bugs:\n\n```python\n{buggy}```\n\nRequirements: {spec}\n"
+                  f"Return the complete corrected function `{name}` in one ```python code block, with no tests.")
+        res = ctx.chat(ctx.messages("code_edit", r, prompt, len(results)), ctx.args.answer_tokens * 2)
+        results.append(res)
+        src = extract_python(res.get("content"))
+        harness = "\nimport json\nres = []\n"
+        for expr, _ in cases:
+            harness += f"res.append({expr})\n"
+        if raises:
+            harness += f"try:\n    {raises}\n    res.append('no-raise')\nexcept ValueError:\n    res.append('raised')\n"
+        harness += "print(json.dumps(res))\n"
+        out = run_python_sandboxed(src, harness=harness)
+        want = [v for _, v in cases] + (["raised"] if raises else [])
+        try:
+            got = json.loads(out["stdout"].strip().splitlines()[-1]) if out["ok"] else None
+        except (ValueError, IndexError):
+            got = None
+        check(checks, name, got == json.loads(json.dumps(want)), f"got={str(got)[:120]} err={out['stderr'][:120]}")
+    m = pooled_metrics(results)
+    m["n_correct"] = sum(c["ok"] for c in checks)
+    return case("code_edit", r, checks, m, results, ctx.args.keep_text)
+
+
+RUN_PYTHON_TOOL = tool("run_python", "Execute a Python 3 program in a sandbox and return its stdout and stderr. "
+                       "Only the standard modules math, itertools, functools, collections, heapq, bisect, re and "
+                       "string are available; no files or network.", {"code": {"type": "string"}}, ["code"])
+
+
+def run_code_run(ctx, r):
+    """Write a program, run it through a tool, read the output and answer: the generate-execute-observe loop."""
+    n = 30 + r
+    task = (f"Define a(0)=2, a(1)=1 and a(k)=a(k-1)+2*a(k-2) for k>=2. Write a Python program that prints how many "
+            f"of a(0)..a({n}) are divisible by 3, and also prints a({n}). Run it with the run_python tool, then "
+            "reply with the two numbers as 'COUNT: <n>' and 'VALUE: <n>'.")
+    seq = [2, 1]
+    while len(seq) <= n:
+        seq.append(seq[-1] + 2 * seq[-2])
+    want_count, want_value = sum(1 for x in seq[:n + 1] if x % 3 == 0), seq[n]
+    trace = []
+
+    def handler(name, args):
+        if name != "run_python":
+            return f"error: unknown tool {name}"
+        out = run_python_sandboxed(str(args.get("code", "")))
+        return json.dumps({"stdout": out["stdout"], "stderr": out["stderr"], "ok": out["ok"]})
+
+    msgs = ctx.messages("code_run", r, task, system="You are a coding assistant that verifies answers by running code.")
+    results, final = run_tool_loop(ctx, msgs, [RUN_PYTHON_TOOL], handler, trace, max_turns=6)
+    checks = []
+    runs = [t for t in trace if t["tool"] == "run_python"]
+    check(checks, "ran_code", any('"ok": true' in t["result"] for t in runs), f"{len(runs)} run(s)")
+    text = norm(final.get("content")) if final else ""
+    c = re.search(r"count:\s*(\d+)", text)
+    v = re.search(r"value:\s*(\d+)", text)
+    check(checks, "count", c is not None and int(c.group(1)) == want_count, f"want={want_count} got={c.group(1) if c else None}")
+    check(checks, "value", v is not None and int(v.group(1)) == want_value, f"want={want_value} got={v.group(1) if v else None}")
+    m = pooled_metrics(results)
+    m.update({"turns": len(results), "tool_calls": len(trace), "end_to_end_s": sum(x.get("total_s") or 0 for x in results)})
+    return case("code_run", r, checks, m, results, ctx.args.keep_text, notes={"trace": trace})
+
 def dispatch(name):
     if name == "short_chat":
         return run_short_chat
@@ -1402,13 +1781,17 @@ def dispatch(name):
     if re.fullmatch(r"long_prompt_[1-9]\d*k", name):
         k = int(name[len("long_prompt_"):].rstrip("k"))
         return lambda ctx, r: run_long_prompt(ctx, r, k, name)
+    if re.fullmatch(r"prefix_reuse_[1-9]\d*k", name):
+        k = int(name[len("prefix_reuse_"):].rstrip("k"))
+        return lambda ctx, r: run_prefix_reuse(ctx, r, k, name)
     if re.fullmatch(r"parallel_[1-9]\d*", name):
         n = int(name.split("_")[1])
         return lambda ctx, r: run_parallel(ctx, r, n, name)
     return {"json_object": run_json_object, "json_schema": run_json_schema,
             "tool_call_single": run_tool_call_single, "tool_call_parallel": run_tool_call_parallel,
             "agentic_loop": run_agentic_loop, "multi_turn": run_multi_turn, "image": run_image,
-            "long_generation": run_long_generation}.get(name)
+            "long_generation": run_long_generation, "subagent_fanout": run_subagent_fanout,
+            "skill_call": run_skill_call, "code_edit": run_code_edit, "code_run": run_code_run}.get(name)
 
 
 # --------------------------------------------------------------------------- run
@@ -1493,7 +1876,7 @@ def summary_line(rec):
     acc += f" tok/step {f(m.get('tokens_per_step'))}" if m.get("tokens_per_step") is not None else ""
     if name.startswith("parallel_"):
         core = f"wall {f(m.get('wall_s'), 1)}s aggregate {f(m.get('aggregate_tok_s'))} tok/s correct {m.get('n_correct')}/{m.get('n')}"
-    elif name in ("multi_turn",):
+    elif name == "multi_turn" or name.startswith("prefix_reuse_"):
         core = (f"ttft {[round(x, 3) if x else None for x in m.get('turn_ttft_s', [])]} "
                 f"cached {m.get('turn_cached_tokens')} drop {f(m.get('ttft_drop'))}x")
     elif name == "agentic_loop":
