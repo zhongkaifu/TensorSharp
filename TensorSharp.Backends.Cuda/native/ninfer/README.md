@@ -51,6 +51,36 @@ RTX 5090, one row: gate|up [34816, 5120] 103 -> 56 us (0.97 -> 1.79 TB/s), down
 2.2 us. Non-speculative decode: 53 -> 73 tok/s. `TS_Q35_T1_GEMV=off` selects the previous
 kernels (8-row FP8 tile and the legacy A16 NVFP4 kernel) for A/B runs.
 
+## 8-bit prompt attention (`tensorsharp_q35_attn8.cuh`, both routes)
+
+Prompt chunks with at least 1,024 visible keys (one sequence) run their attention in 8 bits, as
+Ignis and NInfer do. The design follows the FP8 path of mkyt/qwen3-27b-5090 (MIT) as Ignis adapts
+it (`kernel/src/hq_prompt_attention.cu`, gpillon/ignis ad81d52e, Apache-2.0); the code is
+TensorSharp's own and reads TensorSharp's cache formats (q8_0 on the GGUF route, BF16 or FP8 on
+the NInfer route).
+
+- **Band, once per chunk and layer:** the visible keys become INT8 K with one F32 scale per key,
+  plus E4M3 V^T with one power-of-two scale per 32-key tile. Converting per CTA tile instead
+  would cost more than the attention itself.
+- **Attention:** 128 GQA-packed rows per CTA, 8 warps. Q is quantized per row in registers.
+  - Q K^T runs on the INT8 m16n8k32 MMA (exact int32).
+  - The online softmax runs in base 2 with P = 2^(s - m + 8) in E4M3; the row sum uses the
+    rounded P.
+  - P V runs on the block-scaled E4M3 MMA with V's tile scale as the B scale, full rate on
+    sm_120.
+  - P never leaves registers: each V^T tile stores its keys in the order of the S accumulators.
+
+RTX 5090, Qwen3.8-27B TTFT (2 repeats each):
+
+| Route | 32K | 63K | 127K |
+|---|---:|---:|---:|
+| GGUF | 3.99 -> 3.65 s | 9.58 -> 8.21 s | |
+| NInfer | 3.94 -> 3.43 s | 10.0 -> 7.87 s | 29.6 -> 20.2 s (FP8 KV) |
+
+Every 8K-127K retrieval and record-order check passed. Against the 16-bit kernel the output
+differs by about 2% relative RMS per layer (`TS_Q35_ATTN8_CHECK=1` prints it on the GGUF
+route). `TS_Q35_ATTN8=0` restores the 16-bit kernels.
+
 ## Optional FP8 KV cache
 
 `TS_Q35_NINFER_KV=fp8` stores KV rows as 256 E4M3 codes plus two F32 group-128 scales (272

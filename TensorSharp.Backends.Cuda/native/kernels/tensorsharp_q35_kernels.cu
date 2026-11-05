@@ -2711,6 +2711,8 @@ extern "C" __global__ void ts_q35_attn_smem_bytes(int* out)
     out[0] = (int)sizeof(TsQ35AttnPrefill);
 }
 
+#include "tensorsharp_q35_attn8.cuh"
+
 // ---------------------------------------------------------------------------
 // LM head: Q6_K weights x q8_1 activations for one row (more: ts_q35_gemm_q6k below). Q6_K superblock (256 values, 210
 // bytes): ql[128] | qh[64] | scales int8[16] | half d; value 128h + 32m + l (h < 2, m < 4,

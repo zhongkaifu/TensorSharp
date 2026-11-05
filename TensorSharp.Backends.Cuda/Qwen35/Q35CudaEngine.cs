@@ -1096,6 +1096,54 @@ namespace TensorSharp.Cuda
             _k.GemmW4A4(w.Codes, w.Scales, w.Rows, w.K, _fp4c, _fp4s, _fp4r, n, 1.0f, output, _partial, _counters, _sms, maxSplits, Stream);
         }
 
+        private IntPtr _a8K, _a8Ks, _a8Vt, _a8Vs;
+        private int _a8Cap;
+        private int Attn8Capacity => (_m.NCtx + Q35Kernels.Attn8TileKeys - 1) / Q35Kernels.Attn8TileKeys * Q35Kernels.Attn8TileKeys;
+
+        /// <summary>One sequence's prompt chunk (not a verify window, not the split decode path) with at
+        /// least <see cref="Q35Kernels.Attn8MinKeys"/> visible keys, on Qwen3.5's 24/4 x 256 geometry.</summary>
+        private bool UsesAttn8(in RowGroup g, int maxKeys)
+            => Q35Kernels.Attn8Enabled && !g.Verify && g.Slots.Length == 1 && g.Counts == null
+               && g.RowsPerSeq * (_m.NHead / _m.NKvHead) > Q35Kernels.AttnBlockRows
+               && maxKeys >= Q35Kernels.Attn8MinKeys && maxKeys <= Attn8Capacity
+               && _m.NHead == 24 && _m.NKvHead == 4 && _m.HeadDim == Q35Kernels.AttnHeadDim;
+
+        private static readonly bool Attn8Check = Environment.GetEnvironmentVariable("TS_Q35_ATTN8_CHECK") == "1";
+
+        /// <summary>Diagnostic (TS_Q35_ATTN8_CHECK=1): the q8_0 F16 prompt attention over the same rows,
+        /// and the 8-bit result's error against it (relative RMS and largest absolute difference).</summary>
+        private void CheckAttn8(Layer L, in RowGroup g, int r0, int q0, int maxKeys, long kOff, long vOff, IntPtr tab, nint qOff)
+        {
+            long count = (long)g.Rows * QDim;
+            IntPtr reference = Alloc(count * 4);
+            try
+            {
+                _k.Attention(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L * r0), tab, _maxBlocks, kOff, vOff, g.RowsPerSeq, g.Slots.Length,
+                    _m.NHead, _m.NKvHead, 1.0f / MathF.Sqrt(_m.HeadDim), maxKeys, IntPtr.Zero, reference, _sms, Stream, _act, (long)RowCap * _m.NFf * 4);
+                Sync();
+                var a = new float[count]; var b = new float[count];
+                fixed (float* pa = a) CudaDriverApi.cuMemcpyDtoH((IntPtr)pa, _attn + qOff, new UIntPtr((ulong)count * 4)).ThrowOnError();
+                fixed (float* pb = b) CudaDriverApi.cuMemcpyDtoH((IntPtr)pb, reference, new UIntPtr((ulong)count * 4)).ThrowOnError();
+                double err = 0, norm = 0, worst = 0;
+                for (long i = 0; i < count; i++)
+                {
+                    double d = a[i] - b[i];
+                    err += d * d; norm += (double)b[i] * b[i]; worst = Math.Max(worst, Math.Abs(d));
+                }
+                Console.Error.WriteLine($"[q35-cuda] attn8 check layer {L.Ordinal} rows {g.Rows} keys {maxKeys}: rel-rms {Math.Sqrt(err / Math.Max(norm, 1e-30)):E2} max-abs {worst:E2}");
+            }
+            finally { CudaDriverApi.cuMemFree(reference); _owned.Remove(reference); }
+        }
+
+        private void EnsureAttn8Band(int cap)
+        {
+            if (_a8Cap == cap) return;
+            var (k, ks, vt, vs) = Q35Kernels.Attn8BandBytes(cap, _m.NKvHead);
+            _a8K = Alloc(k); _a8Ks = Alloc(ks); _a8Vt = Alloc(vt); _a8Vs = Alloc(Math.Max(vs, 16));
+            _a8Cap = cap;
+            Console.Error.WriteLine($"[q35-cuda] 8-bit prompt attention band: {cap} keys x {_m.NKvHead} KV heads ({(k + ks + vt + vs) >> 20} MiB)");
+        }
+
         /// <summary>Attention of one group's rows (rows r0.., sequences q0.. of the bound tables) over
         /// their sequences' caches, into _attn rows r0..; the out-projection follows for all rows.</summary>
         private void AttnCore(Layer L, in RowGroup g, int r0, int q0, int maxKeys)
@@ -1107,6 +1155,18 @@ namespace TensorSharp.Cuda
             _k.AttnPrep(_proj + (nint)((long)r0 * AttnProjWidth * 4), n, g.RowsPerSeq, _m.NHead, _m.NKvHead, L.QNorm, L.KNorm, _m.Eps,
                 _ropePosDev + (nint)(4L * r0), RowCap, _m.SectT, _m.SectH, _m.SectW, _m.RopeBase, _cacheRowDev + (nint)(4L * r0), tab,
                 _maxBlocks, kOff, vOff, _q + qOff, _gate + qOff, Stream);
+            if (UsesAttn8(g, maxKeys))
+            {
+                // 8-bit prompt attention: the visible keys once into the band, then INT8 QK / E4M3 PV.
+                int cap = Attn8Capacity;
+                EnsureAttn8Band(cap);
+                _k.Attn8Band(Q35Kernels.Attn8Cache.Q8, tab, kOff, vOff, maxKeys, cap, _m.NKvHead, _a8K, _a8Ks, _a8Vt, _a8Vs, Stream);
+                _k.Attn8Prefill(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L * r0), _a8K, _a8Ks, _a8Vt, _a8Vs, cap,
+                    g.RowsPerSeq, _m.NHead, _m.NKvHead, 1.0f / MathF.Sqrt(_m.HeadDim), _attn + qOff, Stream);
+                if (Attn8Check)
+                    CheckAttn8(L, g, r0, q0, maxKeys, kOff, vOff, tab, qOff);
+                return;
+            }
             // The FFN activations are idle during attention: key-split partials of prompt chunks go there.
             _k.Attention(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L * r0), tab, _maxBlocks, kOff, vOff, g.RowsPerSeq, g.Slots.Length,
                 _m.NHead, _m.NKvHead, 1.0f / MathF.Sqrt(_m.HeadDim), maxKeys, n <= MaxVerifyRows ? _attnPartial : IntPtr.Zero, _attn + qOff,
