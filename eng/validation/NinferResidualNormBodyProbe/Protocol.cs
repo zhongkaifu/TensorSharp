@@ -45,7 +45,7 @@ internal static class Protocol
         Need(doc.RootElement.GetProperty("schema").GetString() == "ninfer-residual-body-native-pins/1", "Native pin schema differs.");
         var pins = doc.RootElement.GetProperty("files").EnumerateArray().Select(x => new NativePin(x.GetProperty("role").GetString()!,
             x.GetProperty("path").GetString()!, x.GetProperty("bytes").GetInt64(), ValidationSha256.Normalize(x.GetProperty("sha256").GetString()!))).ToArray();
-        string[] roles = { "main", "helper", "attention", "verify8Attention", "a16", "draft", "repack", "w8" };
+        string[] roles = { "main", "helper", "attention", "a16", "draft", "repack", "w8" };
         Need(pins.Length == roles.Length && pins.Select(p => p.Role).ToHashSet().SetEquals(roles), "Exactly eight distinct actual loaded native roles required.");
         foreach (var p in pins) Need(Path.IsPathFullyQualified(p.Path) && p.Path == Path.GetFullPath(p.Path) && p.Bytes > 0 && FilePin(p.Path) == new Pin(p.Path,p.Bytes,p.Sha256), "Actual native bytes differ: " + p.Role);
         Need(pins.Single(p => p.Role == "main").Sha256 == (mode == "old" ? OldMain : NewMain), "Wrong actual baseline/candidate main image."); return pins;
@@ -69,13 +69,13 @@ internal static class Protocol
     {
         Need(e.IsNinferModel && e.VocabSize == Vocab && e.HasNinferDrafter && e.HasDrafter && executor.Draft == null && e.DraftBlockSize == 8
             && e.DraftRingRows == 2048 && e.NinferDraftHeadRows == Vocab && !e.NinferDraftUsesShortlist && e.NinferDecodeGraphsEnabled
-            && e.NinferVerify8AttentionEnabled && e.NinferVerify8GemmEnabled && e.OutputW8TargetEnabled
+            && e.NinferVerify8GemmEnabled && e.OutputW8TargetEnabled
             && !e.NinferFlashInferEnabled && !e.NinferExactVerifyEnabled && !e.NinferGdnChunkEnabled && !e.NinferPrefillAttentionEnabled, "Qualified existing native full-head policies required.");
         string Image(string role, object? actual) { string s = ValidationSha256.Normalize(actual as string ?? ""); Need(s == pins.Single(x => x.Role == role).Sha256, "Loaded image differs: " + role); return s; }
         var k = Member<object>(e,"_k"); var attention = Member<object>(e,"_ninferAttention");
         var loaded = new Dictionary<string,string> {
             ["main"] = Image("main",Member<string>(k,"ImageSha256")), ["helper"] = Image("helper",Member<string>(Member<object>(e,"_ninfer"),"ImageSha256")),
-            ["attention"] = Image("attention",Member<string>(attention,"ImageSha256")), ["verify8Attention"] = Image("verify8Attention",e.NinferVerify8AttentionImageSha256),
+            ["attention"] = Image("attention",Member<string>(attention,"ImageSha256")),
             ["a16"] = Image("a16",e.NinferA16ImageSha256), ["draft"] = Image("draft",e.NinferDraftModuleSha256), ["repack"] = Image("repack",e.NinferLoadRepackImageSha256),
             ["w8"] = Image("w8",Member<string>(e.OutputW8Info,"ModuleImageSha256")) };
         var counters = State.Counters(e); Need(mode == "old" ? counters.Enabled == null : counters.Enabled == (mode == "on"), "New residual mode/old compatibility differs.");

@@ -798,3 +798,176 @@ TS_NIDF_SWA(8)
 
 
 
+
+// ---------------------------------------------------------------------------
+// A16 NVFP4 projection on BF16 tensor-core MMA for wide token counts (the
+// drafter's context append over prompt chunks). Adapted from gpillon/ignis
+// kernel/src/nvfp4_a16_mma.cu (Apache-2.0, revision ad81d52e; ignis finding
+// 2026-09-29 "A16 NVFP4 on the tensor cores": 6.3-7.4x per call at T=1,024).
+// Each 64-row x 128-token CTA decodes the K step's weight tile exactly into a
+// BF16 shared tile (E2M1 x E4M3 is exact in BF16), runs m16n8k16 BF16 MMAs
+// with F32 accumulation, and scales by the weight divisor at the store, like
+// the small-T route. Only the F32 summation order differs from that route, and
+// these projections only feed DFlash proposals, which greedy verification
+// accepts or rejects against the unchanged target.
+#include "ops/common/mma.cuh"
+namespace ts_nidf_mma {
+using ninfer::ops::Cache;
+using ninfer::ops::cp_async;
+using ninfer::ops::cp_async_zfill;
+using ninfer::ops::cp_commit;
+using ninfer::ops::cp_wait;
+using ninfer::ops::ldmatrix_x2;
+using ninfer::ops::ldmatrix_x4;
+using ninfer::ops::mma_bf16;
+using ninfer::ops::smem_addr;
+using ninfer::ops::detail::decode_nvfp4_e2m1x2;
+using ninfer::ops::detail::decode_nvfp4_e4m3;
+constexpr int kBlockRows = 64, kBlockCols = 128, kBlockK = 64, kWarpRows = 32, kWarpCols = 32, kStages = 2;
+constexpr int kWarpsM = kBlockRows / kWarpRows, kWarpsN = kBlockCols / kWarpCols, kThreads = kWarpsM * kWarpsN * 32;
+constexpr int kMmaRows = kWarpRows / 16, kMmaCols = kWarpCols / 8, kMmaK = kBlockK / 16;
+constexpr int kScaleTileRows = 128, kScaleTileBytes = 512, kCodeBytesPerRow = kBlockK / 2;
+constexpr int kCodeStageBytes = kBlockRows * kCodeBytesPerRow, kTokenStageBytes = kBlockCols * kBlockK * 2;
+constexpr int kStageBytes = kCodeStageBytes + kScaleTileBytes + kTokenStageBytes;
+constexpr int kWeightTileBytes = kBlockRows * kBlockK * 2;
+constexpr int kSharedBytes = kStages * kStageBytes + kWeightTileBytes;
+static_assert(kBlockRows * (kBlockK / 16) == kThreads, "one decode job per thread");
+static_assert(kSharedBytes <= 48 * 1024, "fits the default dynamic shared memory");
+__device__ __forceinline__ int swizzled_col(int row, int col) {
+  return (col & ~63) + ((((col & 63) >> 3) ^ (row & 7)) << 3) + (col & 7);
+}
+__device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
+  const __nv_bfloat162 packed = __floats2bfloat162_rn(lo, hi);
+  return *reinterpret_cast<const uint32_t*>(&packed);
+}
+template <int M, int K, bool FullTokens>
+__device__ __forceinline__ void a16_mma(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ codes,
+    const uint8_t* __restrict__ scales, float inverse_weight_divisor, __nv_bfloat16* __restrict__ out, int tokens) {
+  static_assert(M % kBlockRows == 0 && K % kBlockK == 0);
+  constexpr int kTiles = K / kBlockK;
+  static_assert(kTiles >= kStages);
+  constexpr int kScaleTilesPerRow = K / 64;
+  extern __shared__ __align__(16) unsigned char shared_raw[];
+  unsigned char* ring = shared_raw;
+  auto* weight_tile = reinterpret_cast<__nv_bfloat16*>(shared_raw + kStages * kStageBytes);
+  const int tid = (int)threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int wm = warp / kWarpsN, wn = warp - wm * kWarpsN, gid = lane >> 2, lid = lane & 3;
+  const int tiles_n = tokens / kBlockCols + (int)(tokens % kBlockCols != 0);
+  const int tile_m = (int)blockIdx.x / tiles_n, tile_n = (int)blockIdx.x - tile_m * tiles_n;
+  const int m0 = tile_m * kBlockRows, n0 = tile_n * kBlockCols;
+  const int scale_tile_m = m0 / kScaleTileRows, row_in_scale_tile0 = m0 - scale_tile_m * kScaleTileRows;
+  auto stage_codes = [&](int stage) { return ring + stage * kStageBytes; };
+  auto stage_scales = [&](int stage) { return ring + stage * kStageBytes + kCodeStageBytes; };
+  auto stage_tokens = [&](int stage) {
+    return reinterpret_cast<__nv_bfloat16*>(ring + stage * kStageBytes + kCodeStageBytes + kScaleTileBytes);
+  };
+  auto load_stage = [&](int stage, int k_tile) {
+    const int k0 = k_tile * kBlockK;
+    unsigned char* code_dst = stage_codes(stage);
+    for (int item = tid; item < kBlockRows * 2; item += kThreads) {
+      const int row = item >> 1, half = item & 1;
+      cp_async<16, Cache::cg>(code_dst + row * kCodeBytesPerRow + half * 16,
+                              codes + (long long)(m0 + row) * (K / 2) + k0 / 2 + half * 16);
+    }
+    unsigned char* scale_dst = stage_scales(stage);
+    const uint8_t* scale_src = scales + ((long long)scale_tile_m * kScaleTilesPerRow + k_tile) * kScaleTileBytes;
+    for (int item = tid; item < kScaleTileBytes / 16; item += kThreads)
+      cp_async<16, Cache::cg>(scale_dst + item * 16, scale_src + item * 16);
+    __nv_bfloat16* token_dst = stage_tokens(stage);
+    for (int item = tid; item < kBlockCols * (kBlockK / 8); item += kThreads) {
+      const int col = item / (kBlockK / 8), kk = (item - col * (kBlockK / 8)) * 8;
+      __nv_bfloat16* dst = &token_dst[col * kBlockK + swizzled_col(col, kk)];
+      const int token = n0 + col;
+      if constexpr (FullTokens) {
+        cp_async<16, Cache::cg>(dst, &x[(long long)token * K + k0 + kk]);
+      } else {
+        const bool valid = token < tokens;
+        cp_async_zfill<16, Cache::cg>(dst, &x[(long long)(valid ? token : 0) * K + k0 + kk], valid ? 16 : 0);
+      }
+    }
+  };
+  const int decode_row = tid >> 2, decode_group = tid & 3;
+  const int decode_scale_row = row_in_scale_tile0 + decode_row;
+  const int decode_scale_index = (decode_scale_row & 31) * 16 + (decode_scale_row >> 5) * 4 + decode_group;
+  auto decode_stage = [&](int stage) {
+    const uint2 packed = *reinterpret_cast<const uint2*>(stage_codes(stage) + decode_row * kCodeBytesPerRow + decode_group * 8);
+    const float scale = decode_nvfp4_e4m3(stage_scales(stage)[decode_scale_index]);
+    const uint32_t words[2] = {packed.x, packed.y};
+    uint32_t decoded[8];
+#pragma unroll
+    for (int w = 0; w < 2; ++w)
+#pragma unroll
+      for (int b = 0; b < 4; ++b) {
+        const float2 pair = decode_nvfp4_e2m1x2((uint8_t)(words[w] >> (8 * b)));
+        decoded[w * 4 + b] = pack_bf16x2(pair.x * scale, pair.y * scale);
+      }
+    const int col = decode_group * 16;
+    *reinterpret_cast<uint4*>(&weight_tile[decode_row * kBlockK + swizzled_col(decode_row, col)]) =
+        make_uint4(decoded[0], decoded[1], decoded[2], decoded[3]);
+    *reinterpret_cast<uint4*>(&weight_tile[decode_row * kBlockK + swizzled_col(decode_row, col + 8)]) =
+        make_uint4(decoded[4], decoded[5], decoded[6], decoded[7]);
+  };
+  float accum[kMmaRows][kMmaCols][4] = {};
+  const int a_matrix = lane >> 3, a_row_offset = (lane & 7) + ((a_matrix & 1) << 3), a_col_offset = (a_matrix >> 1) << 3;
+  const int b_inner_row = lane & 7, b_k_offset = ((lane >> 3) & 1) << 3;
+#pragma unroll
+  for (int stage = 0; stage < kStages; ++stage) { load_stage(stage, stage); cp_commit(); }
+#pragma unroll 1
+  for (int k_tile = 0; k_tile < kTiles; ++k_tile) {
+    const int stage = k_tile % kStages;
+    if (k_tile + kStages <= kTiles) cp_wait<kStages - 1>(); else cp_wait<0>();
+    __syncthreads();
+    decode_stage(stage);
+    __syncthreads();
+    const __nv_bfloat16* token_tile = stage_tokens(stage);
+#pragma unroll
+    for (int k_step = 0; k_step < kMmaK; ++k_step) {
+      unsigned a_frag[kMmaRows][4], b_frag[kMmaCols][2];
+#pragma unroll
+      for (int mi = 0; mi < kMmaRows; ++mi) {
+        const int row = wm * kWarpRows + mi * 16 + a_row_offset, col = k_step * 16 + a_col_offset;
+        ldmatrix_x4(a_frag[mi][0], a_frag[mi][1], a_frag[mi][2], a_frag[mi][3],
+                    smem_addr(&weight_tile[row * kBlockK + swizzled_col(row, col)]));
+      }
+#pragma unroll
+      for (int ni = 0; ni < kMmaCols; ++ni) {
+        const int row = wn * kWarpCols + ni * 8 + b_inner_row, col = k_step * 16 + b_k_offset;
+        ldmatrix_x2(b_frag[ni][0], b_frag[ni][1], smem_addr(&token_tile[row * kBlockK + swizzled_col(row, col)]));
+      }
+#pragma unroll
+      for (int mi = 0; mi < kMmaRows; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < kMmaCols; ++ni)
+          mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2], accum[mi][ni][3],
+                   a_frag[mi][0], a_frag[mi][1], a_frag[mi][2], a_frag[mi][3], b_frag[ni][0], b_frag[ni][1]);
+    }
+    __syncthreads();
+    const int next = k_tile + kStages;
+    if (next < kTiles) { load_stage(stage, next); cp_commit(); }
+  }
+  auto store = [&](int row, int token, float value) {
+    out[(long long)token * M + row] = __float2bfloat16_rn(value * inverse_weight_divisor);
+  };
+#pragma unroll
+  for (int mi = 0; mi < kMmaRows; ++mi) {
+    const int row0 = m0 + wm * kWarpRows + mi * 16 + gid, row1 = row0 + 8;
+#pragma unroll
+    for (int ni = 0; ni < kMmaCols; ++ni) {
+      const int token0 = n0 + wn * kWarpCols + ni * 8 + 2 * lid, token1 = token0 + 1;
+      const float* value = accum[mi][ni];
+      if (FullTokens || token0 < tokens) { store(row0, token0, value[0]); store(row1, token0, value[2]); }
+      if (FullTokens || token1 < tokens) { store(row0, token1, value[1]); store(row1, token1, value[3]); }
+    }
+  }
+}
+} // namespace ts_nidf_mma
+extern "C" __global__ void ts_nidf_mma_shared_bytes(int* out) { out[0] = ts_nidf_mma::kSharedBytes; out[1] = ts_nidf_mma::kThreads; }
+#define TS_NIDF_MMA(N, K) \
+extern "C" __global__ __launch_bounds__(ts_nidf_mma::kThreads) void ts_nidf_mma_n##N##_k##K##_full( \
+  const uint8_t* c, const uint8_t* s, const __nv_bfloat16* x, __nv_bfloat16* y, float inv, int tokens) \
+  { ts_nidf_mma::a16_mma<N, K, true>(x, c, s, inv, y, tokens); } \
+extern "C" __global__ __launch_bounds__(ts_nidf_mma::kThreads) void ts_nidf_mma_n##N##_k##K##_part( \
+  const uint8_t* c, const uint8_t* s, const __nv_bfloat16* x, __nv_bfloat16* y, float inv, int tokens) \
+  { ts_nidf_mma::a16_mma<N, K, false>(x, c, s, inv, y, tokens); }
+TS_NIDF_MMA(5120, 25600)
+TS_NIDF_MMA(6144, 5120)

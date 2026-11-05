@@ -479,6 +479,7 @@ namespace TensorSharp.Cuda
         /// <summary>Key splits of a decode/verify attention launch: enough blocks to cover the
         /// device twice, at most 64, never shorter than 128 keys.</summary>
         private const int AttnSplitChunk = 128, AttnMaxSplits = 64;
+        internal const int AttnMaxSplitCount = AttnMaxSplits;
 
         internal readonly record struct SplitAttentionPlan(int Chunk, int Splits);
 

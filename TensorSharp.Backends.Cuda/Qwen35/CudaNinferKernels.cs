@@ -14,7 +14,7 @@ public sealed unsafe class CudaNinferKernels : IDisposable
 {
     public const string EnvironmentVariable = "TS_Q35_NINFER_KERNELS";
     private readonly CudaModule _module;
-    private readonly IntPtr _round, _cast, _embed, _norm, _quant, _swiglu, _a16;
+    private readonly IntPtr _round, _cast, _embed, _norm, _normQuant, _quant, _swiglu, _a16;
     private readonly IntPtr _conv, _convState, _prep, _scan, _replay, _out;
     private IntPtr _blas, _inputBf16;
     private long _inputCapacity;
@@ -29,6 +29,7 @@ public sealed unsafe class CudaNinferKernels : IDisposable
         {
             _round=Function("ts_ni_round"); _cast=Function("ts_ni_f32_bf16");
             _embed=Function("ts_ni_embed_w8"); _norm=Function("ts_ni_add_norm");
+            _normQuant=Function("ts_ni_add_norm_quant");
             _quant=Function("ts_ni_quant_nvfp4"); _swiglu=Function("ts_ni_swiglu");
             _a16=Function("ts_ni_project_a16"); _conv=Function("ts_ni_gdn_conv");
             _convState=Function("ts_ni_gdn_conv_state"); _prep=Function("ts_ni_gdn_prep");
@@ -106,6 +107,19 @@ public sealed unsafe class CudaNinferKernels : IDisposable
         if(!(eps>0)||!float.IsFinite(eps))throw new ArgumentOutOfRangeException(nameof(eps));
         void** args=stackalloc void*[]{&x,&delta,&effectiveWeight,&output,&width,&eps};
         Launch(_norm,(uint)rows,1,1,256,stream,args);
+    }
+    /// <summary>AddRmsNorm with a delta, then QuantizeNvfp4 of its output in the same pass (same arithmetic).</summary>
+    public void AddRmsNormQuantize(IntPtr x,IntPtr delta,IntPtr effectiveWeight,IntPtr output,int rows,int width,float eps,
+        IntPtr codes,IntPtr scales,IntPtr rowScale,float inputDivisor,IntPtr stream)
+    {
+        Shape(rows,width);
+        if(x==output)throw new ArgumentException("Residual and norm output must not alias.");
+        if(delta==IntPtr.Zero)throw new ArgumentNullException(nameof(delta));
+        if(width%256!=0)throw new ArgumentOutOfRangeException(nameof(width));
+        if(!(eps>0)||!float.IsFinite(eps))throw new ArgumentOutOfRangeException(nameof(eps));
+        if(!(inputDivisor>0)||!float.IsFinite(inputDivisor))throw new ArgumentOutOfRangeException(nameof(inputDivisor));
+        void** args=stackalloc void*[]{&x,&delta,&effectiveWeight,&output,&width,&eps,&codes,&scales,&rowScale,&inputDivisor};
+        Launch(_normQuant,(uint)rows,1,1,256,stream,args);
     }
     public void QuantizeNvfp4(IntPtr input,IntPtr codes,IntPtr scales,IntPtr rowScale,int columns,int rows,float inputDivisor,IntPtr stream)
     {

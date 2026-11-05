@@ -1,7 +1,6 @@
 {
   // Same shared profile as qwen3.8-27b-ninfer.json, with 65,536 context capacity.
   // Qualified 64K CLI/Host settings; finite validation details: README-ninfer.md.
-  // Verify8 attention retains its existing fallback above 40,960 visible keys.
   "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
   "model": {
     "path": "${modelRoot}/qwen3_8_27b_nvfp4full-v2.ninfer",

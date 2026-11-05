@@ -10,14 +10,17 @@ public sealed unsafe partial class Q35CudaEngine
 {
     internal const string NinferAutoA16Environment = "TS_Q35_NINFER_A16_AUTO";
     internal const string NinferAutoRepackEnvironment = "TS_Q35_NINFER_REPACK";
-    internal const string NinferAutoVerify8Environment = "TS_Q35_NINFER_VERIFY8_ATTN";
-    internal const string NinferQualifiedVerify8Asset = "tensorsharp_ninfer_prefill_attention.ptx";
+    internal const string NinferQualifiedPrefillAttentionAsset = "tensorsharp_ninfer_prefill_attention.ptx";
     internal const string NinferQualifiedA16Asset = "tensorsharp_q35_ninfer_a16_legacy_exact_vector.ptx";
     internal const string NinferQualifiedRepackAsset = "tensorsharp_ninfer_repack.ptx";
+    // Ignis-original prefill kernels, selected automatically for the qualified recipe:
+    // the Br64/Bc64 BF16 prompt attention and the chunked GDN recurrence.
+    internal const string NinferAutoPrefillAttentionEnvironment = "TS_Q35_NINFER_PREFILL_ATTN";
+    internal const string NinferAutoGdnChunkEnvironment = "TS_Q35_NINFER_GDN_CHUNK";
+    internal const string NinferQualifiedGdnChunkAsset = "tensorsharp_ninfer_gdn_chunk.ptx";
+    private bool _ninferAutomaticPrefillAttention, _ninferAutomaticGdnChunk;
     private readonly string _ninferAutoA16Option = Environment.GetEnvironmentVariable(NinferAutoA16Environment);
     private readonly string _ninferAutoRepackOption = Environment.GetEnvironmentVariable(NinferAutoRepackEnvironment);
-    private readonly string _ninferAutoVerify8Option = Environment.GetEnvironmentVariable(NinferAutoVerify8Environment);
-    private bool _ninferAutomaticVerify8;
     private NinferQualifiedDefaults _ninferQualifiedDefaults;
 
     /// <summary>How the current engine selected its A16 implementation. The actual
@@ -61,12 +64,6 @@ public sealed unsafe partial class Q35CudaEngine
             graphsOption != null ? (graphs ? "explicit" : "disabled") : qualified ? "auto-sm120" : "unsupported-hardware");
     }
 
-    internal static bool PlanNinferAutomaticVerify8(bool qualified, int sms, bool verificationEnabled,
-        int maximumRows, int maximumKeys, string option)
-        => NinferAutomaticOptimizationRequested(option, NinferAutoVerify8Environment)
-            && qualified && sms == 170 && verificationEnabled && maximumRows >= 8
-            && maximumKeys >= 8 && maximumKeys <= CudaNinferPrefillAttentionModule.MaximumContext;
-
     private void InitializeNinferQualifiedDefaults()
     {
         _ninferDecodeGraphsEnabled = _ninferDecodeGraphsSetting.ExplicitEnabled;
@@ -78,8 +75,17 @@ public sealed unsafe partial class Q35CudaEngine
             _m.NVocab, _m.NHead, _m.NKvHead, _m.HeadDim, major, minor);
         _ninferQualifiedDefaults = PlanNinferQualifiedDefaults(qualified, _ninferAutoA16Option,
             _ninferAutoRepackOption, _ninferDecodeGraphsSetting.Value);
-        _ninferAutomaticVerify8 = PlanNinferAutomaticVerify8(qualified, _sms, _ninferVerificationEnabled,
-            _m.NUbatch, _m.NCtx, _ninferAutoVerify8Option);
+        // Prefill kernels are independent of verification/speculation and of the device's
+        // SM count; they only need the Q24/KV4/HD256 recipe on CC 12.0 and their images.
+        _ninferAutomaticPrefillAttention = qualified && _m.NUbatch >= 64
+            && _m.NUbatch <= CudaNinferPrefillAttentionModule.MaximumRows
+            && _m.NCtx >= _m.NUbatch && _m.NCtx <= CudaNinferPrefillAttentionModule.MaximumContext
+            && Environment.GetEnvironmentVariable(CudaNinferPrefillAttentionModule.EnvironmentVariable) == null
+            && Environment.GetEnvironmentVariable(CudaNinferAttention.PrefillThreadsEnvironment) == null
+            && NinferAutomaticOptimizationRequested(Environment.GetEnvironmentVariable(NinferAutoPrefillAttentionEnvironment), NinferAutoPrefillAttentionEnvironment);
+        _ninferAutomaticGdnChunk = qualified && _m.NUbatch >= 64
+            && Environment.GetEnvironmentVariable(NinferGdnChunkEnvironment) == null
+            && NinferAutomaticOptimizationRequested(Environment.GetEnvironmentVariable(NinferAutoGdnChunkEnvironment), NinferAutoGdnChunkEnvironment);
         _ninferDecodeGraphsEnabled = _ninferQualifiedDefaults.DecodeGraphs;
         NinferDecodeGraphsSelection = _ninferQualifiedDefaults.GraphSelection;
         NinferA16Selection = _ninferAutoA16Option == "0" ? "disabled" : qualified ? "auto-pending" : "unsupported-hardware";

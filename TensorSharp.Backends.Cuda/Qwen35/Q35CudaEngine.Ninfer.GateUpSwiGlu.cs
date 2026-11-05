@@ -21,7 +21,7 @@ public sealed unsafe partial class Q35CudaEngine
         if (!ninfer) return false;
         bool requested = NinferAutomaticOptimizationRequested(option, NinferGateUpSwiGluEnvironment);
         // Context is not an operand of the fixed GateUp/SwiGLU specialization.
-        bool supported = qualified && sms == 170 && (context is 40960 or 65536) && maximumRows >= 8
+        bool supported = qualified && sms == 170 && (context is 40960 or 65536 or 131072 or 262144) && maximumRows >= 8
             && verify && graphs && verify8Gemm && !overrides && allGateUps;
         if (option == "1" && !supported)
             throw new NotSupportedException(NinferGateUpSwiGluEnvironment + "=1 requires qualified context40960 or context65536/170-SM T8 verification, graphs and Verify8 GEMM with original NVFP4 GateUp projections.");
@@ -72,7 +72,7 @@ public sealed unsafe partial class Q35CudaEngine
         var d = matrix.Descriptor;
         if (!pass || !NinferGateUpSwiGluEnabled
             || !NinferGateUpSwiGluMatrixEligible(d.Format, d.AllowA4, rows, d.Rows, d.Columns)) return false;
-        _ninfer.QuantizeNvfp4(_xn, _fp4c, _fp4s, _fp4r, d.Columns, rows, d.InputScaleDivisor, Stream);
+        QuantizeNinferInput(_xn, matrix, rows);
         float alpha = 1.0f / (d.InputScaleDivisor * d.WeightScaleDivisor);
         _k.GemmNinferGateUpSwiGlu(matrix.Data, matrix.Scales, _fp4c, _fp4s, _fp4r,
             alpha, _act, _partial, _counters, Stream);

@@ -17,8 +17,9 @@ public sealed class NinferPrefillAttentionPolicyTests
 
     [Theory]
     [InlineData(1, 1, false, true, false)]
-    [InlineData(8, 1, false, true, false)]
-    [InlineData(63, 1, false, true, false)]
+    [InlineData(2, 1, false, true, true)]
+    [InlineData(8, 1, false, true, true)]
+    [InlineData(63, 1, false, true, true)]
     [InlineData(64, 1, false, true, true)]
     [InlineData(512, 1, false, true, true)]
     [InlineData(8192, 1, false, true, true)]
@@ -100,5 +101,40 @@ public sealed class NinferPrefillAttentionPolicyTests
         Assert.Throws<ArgumentOutOfRangeException>(() => CudaNinferPrefillAttentionModule.WorkspaceCapacity(63, 262144));
         Assert.Throws<ArgumentOutOfRangeException>(() => CudaNinferPrefillAttentionModule.WorkspaceCapacity(512, 511));
         Assert.Throws<ArgumentOutOfRangeException>(() => CudaNinferPrefillAttentionModule.WorkspaceCapacity(512, 262145));
+    }
+
+    [Theory]
+    [InlineData(170, 1, 4, 42)]
+    [InlineData(170, 2, 4, 21)]
+    [InlineData(170, 4, 4, 10)]
+    [InlineData(170, 64, 4, 1)]
+    [InlineData(10000, 1, 4, Q35Kernels.AttnMaxSplitCount)]
+    public void SplitAttentionFillsOneWaveWithAFixedSplitCount(int sms, int sequences, int kvHeads, int expected)
+        => Assert.Equal(expected, CudaNinferAttention.PipeSplits(sms, sequences, kvHeads));
+
+    [Theory]
+    [InlineData(65, 128)] [InlineData(574, 128)] [InlineData(767, 128)] [InlineData(768, 256)] [InlineData(2048, 256)]
+    public void TmaPrefillTokenTileFollowsTheMeasuredCrossover(int rows, int expected)
+        => Assert.Equal(expected, Q35Kernels.NinferTmaTokenTile(rows));
+
+    [Theory]
+    [InlineData(5120, 17408, 0, true)]
+    [InlineData(34816, 5120, 0, true)]
+    [InlineData(96, 5120, 0, true)]
+    [InlineData(100, 5120, 0, false)]
+    [InlineData(5120, 5100, 0, false)]
+    [InlineData(5120, 5120, 8, false)]
+    public void TmaPrefillTilesNeedWholeKTilesRowPairsAndAlignedPlanes(int outDim, int k, int misalign, bool expected)
+        => Assert.Equal(expected, Q35Kernels.NinferPrefillEpilogueFits(new IntPtr(0x10000 + misalign), new IntPtr(0x20000), outDim, k));
+
+    [Fact]
+    public void PackagedPrefillAttentionUsesThePairedPtxResolverAndFatbinOnlyFallback()
+    {
+        string name = Q35CudaEngine.NinferQualifiedPrefillAttentionAsset;
+        var requests = new List<string>();
+        string? Resolve(string file) { requests.Add(file); return file.EndsWith(".fatbin") ? "/assets/cuda_kernels/" + file : null; }
+        Assert.EndsWith("/tensorsharp_ninfer_prefill_attention.fatbin", Q35CudaEngine.LocateNinferAutomaticAsset(name, Resolve!));
+        Assert.Equal(new[] { name, "tensorsharp_ninfer_prefill_attention.fatbin" }, requests);
+        Assert.Null(Q35CudaEngine.LocateNinferAutomaticAsset(name, _ => null!));
     }
 }

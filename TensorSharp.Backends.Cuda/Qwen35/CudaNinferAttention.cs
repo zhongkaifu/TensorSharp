@@ -9,7 +9,22 @@ namespace TensorSharp.Cuda
     internal sealed unsafe class CudaNinferAttention : IDisposable
     {
         private readonly CudaModule _module;
-        private readonly IntPtr _prep, _attention, _split, _combine;
+        private readonly IntPtr _prep, _attention, _combine;
+        // Decode and verification attention: GQA-packed split kernel with cp.async
+        // double-buffered tiles. One CTA per (KV head, key split) reads each key once for all
+        // six query heads and every row (eight verify rows fill 48 of its 64 MMA rows), where a
+        // per-query-head core reads every key six times. It replaced both the unpipelined split
+        // kernel and the Ignis Verify8 core: RTX 5090, 512-token answers after 7K / 33K / 62K,
+        // 192.8 / 159.5 / 132.3 -> 217.2 / 189.8 / 183.2 tok/s.
+        private readonly IntPtr _splitPipe;
+        private readonly uint _splitPipeSmem;
+        /// <summary>A fixed split count that fills the SMs in one wave (each CTA holds 67.6 KB of
+        /// tiles, so one per SM), its key range derived on the device (chunk 0): one launch
+        /// shape, so one captured graph, for every history.</summary>
+        internal Q35Kernels.SplitAttentionPlan SplitPlan(int sequences, int nKv)
+            => new(0, PipeSplits(_sms, sequences, nKv));
+        internal static int PipeSplits(int sms, int sequences, int nKv)
+            => Math.Clamp(Math.Max(1, sms) / Math.Max(1, sequences * nKv), 1, Q35Kernels.AttnMaxSplitCount);
         private IntPtr _frequencies;
         private CudaNinferPrefillAttentionModule _prefill;
         private IntPtr _prefillWorkspace;
@@ -18,15 +33,6 @@ namespace TensorSharp.Cuda
         internal const string PrefillThreadsEnvironment = "TS_Q35_NINFER_PREFILL_ATTN_THREADS";
         private readonly int _prefillThreads;
         private long _prefill128Submissions;
-        internal const string Verify8Environment = "TS_Q35_NINFER_VERIFY8_ATTN_PTX";
-        private CudaNinferPrefillAttentionModule _verify8;
-        private IntPtr _verify8Workspace;
-        private long _verify8WorkspaceBytes;
-        internal bool Verify8Enabled => _verify8 != null;
-        internal string Verify8Selection { get; private set; } = "disabled-or-ineligible";
-        internal string Verify8ImageSha256 { get; private set; }
-        internal long Verify8CoreSubmissions => _verify8?.PagedCoreLaunches ?? 0;
-        internal long Verify8WorkspaceBytes => _verify8WorkspaceBytes;
         internal bool PrefillEnabled => _prefill != null;
         internal string PrefillImageSha256 => _prefill?.ImageSha256;
         internal long PrefillCoreSubmissions => _prefill?.PagedCoreLaunches ?? 0;
@@ -35,31 +41,25 @@ namespace TensorSharp.Cuda
         internal string PrefillNamespaceSuffix { get; private set; } = string.Empty;
         public string ImageSha256 => _module.ImageSha256;
         public CudaNinferAttention(float ropeBase = 10000000f, int maximumPrefillRows = 0,
-            int maximumKeys = 0, int sms = 0, bool verificationEnabled = false,
-            int heads = 24, int kvHeads = 4, int headDim = 256, bool automaticVerify8 = false)
+            int maximumKeys = 0, int sms = 0,
+            int heads = 24, int kvHeads = 4, int headDim = 256, bool automaticPrefill = false)
         {
             string prefillRaw = Environment.GetEnvironmentVariable(CudaNinferPrefillAttentionModule.EnvironmentVariable);
-            // Snapshot the explicit path once; captured graphs never consult a
-            // changed environment, host cache position or changing page count.
-            string explicitVerify8 = Environment.GetEnvironmentVariable(Verify8Environment);
-            string verify8Path = ResolveVerify8Path(explicitVerify8,
-                verificationEnabled, maximumPrefillRows, maximumKeys, sms, heads, kvHeads, headDim);
-            bool autoVerify8 = UseAutomaticVerify8(automaticVerify8, explicitVerify8);
-            if (autoVerify8)
-            {
-                verify8Path = Q35CudaEngine.LocateNinferAutomaticAsset(Q35CudaEngine.NinferQualifiedVerify8Asset, CudaKernels.LocatePtxPath);
-                if (verify8Path == null)
-                {
-                    Verify8Selection = "asset-missing";
-                    Console.Error.WriteLine("[q35-cuda] automatic NInfer Verify8 attention asset missing; using existing attention");
-                }
-            }
+            bool autoPrefill = automaticPrefill && prefillRaw == null && heads == CudaNinferPrefillAttentionModule.QueryHeads
+                && kvHeads == CudaNinferPrefillAttentionModule.KvHeads && headDim == CudaNinferPrefillAttentionModule.HeadDim;
             _prefillThreads = ResolvePrefillThreads(Environment.GetEnvironmentVariable(PrefillThreadsEnvironment), prefillRaw != null);
             if (_prefillThreads == 128 && (maximumPrefillRows < 64 || maximumKeys < maximumPrefillRows
                 || maximumKeys > CudaNinferPrefillAttentionModule.MaximumContext || sms < 1))
                 throw new NotSupportedException("The explicit prefill schedule requires its bounded native target geometry.");
             string prefillPath = ResolvePrefillPath(prefillRaw,
                 maximumPrefillRows, maximumKeys, sms);
+            if (autoPrefill)
+            {
+                // The packaged Ignis-original image; absent -> legacy kernel.
+                prefillPath = Q35CudaEngine.LocateNinferAutomaticAsset(Q35CudaEngine.NinferQualifiedPrefillAttentionAsset, CudaKernels.LocatePtxPath);
+                if (prefillPath == null)
+                    Console.Error.WriteLine("[q35-cuda] automatic NInfer prefill attention asset missing; using the legacy prefill kernel");
+            }
             _maximumPrefillRows = maximumPrefillRows;
             _sms = sms;
             string path = CudaKernels.LocatePtxPath("tensorsharp_q35_ninfer_attention.ptx")
@@ -69,8 +69,19 @@ namespace TensorSharp.Cuda
             {
                 _prep = _module.GetFunction("ts_ninfer_attn_prep_f32");
                 _attention = _module.GetFunction("ts_ninfer_attn_bf16_f32");
-                _split = _module.GetFunction("ts_ninfer_attn_bf16_split_f32");
                 _combine = _module.GetFunction("ts_ninfer_attn_combine_f32");
+                _splitPipe = _module.GetFunction("ts_ninfer_attn_bf16_split_pipe_f32");
+                CudaDriverApi.cuMemAlloc(out IntPtr probe, new UIntPtr(4u)).ThrowOnError();
+                try
+                {
+                    void** pargs = stackalloc void*[] { &probe };
+                    Launch(_module.GetFunction("ts_ninfer_attn_pipe_smem_bytes"), 1, 1, 1, 1, IntPtr.Zero, pargs);
+                    int bytes;
+                    CudaDriverApi.cuMemcpyDtoH((IntPtr)(&bytes), probe, new UIntPtr(4u)).ThrowOnError();
+                    _splitPipeSmem = (uint)bytes;
+                }
+                finally { CudaDriverApi.cuMemFree(probe); }
+                CudaDriverApi.cuFuncSetAttribute(_splitPipe, CudaDriverApi.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)_splitPipeSmem).ThrowOnError();
                 var frequencies = new float[32];
                 for (int i = 0; i < frequencies.Length; i++) frequencies[i] = (float)(1.0 / Math.Pow((double)ropeBase, 2.0*i/64.0));
                 CudaDriverApi.cuMemAlloc(out _frequencies, new UIntPtr(128u)).ThrowOnError();
@@ -78,12 +89,19 @@ namespace TensorSharp.Cuda
                     CudaDriverApi.cuMemcpyHtoD(_frequencies, (IntPtr)values, new UIntPtr(128u)).ThrowOnError();
                 if (prefillPath != null)
                 {
-                    _prefill = new CudaNinferPrefillAttentionModule(prefillPath);
+                    try { _prefill = new CudaNinferPrefillAttentionModule(prefillPath); }
+                    catch (Exception error) when (autoPrefill && Q35CudaEngine.NinferAutomaticModuleUnavailable(error))
+                    {
+                        Console.Error.WriteLine($"[q35-cuda] automatic NInfer prefill attention unavailable before use: {error.Message}; using the legacy prefill kernel");
+                    }
+                }
+                if (_prefill != null)
+                {
                     _prefillWorkspaceBytes = CudaNinferPrefillAttentionModule.WorkspaceCapacity(maximumPrefillRows, maximumKeys);
                     CudaDriverApi.cuMemAlloc(out _prefillWorkspace, new UIntPtr(checked((ulong)_prefillWorkspaceBytes))).ThrowOnError();
                     PrefillNamespaceSuffix = "|ninfer-prefill-attn=" + CudaNinferPrefillAttentionModule.Policy + ":"
                         + _prefill.ImageSha256.ToLowerInvariant() + ":ub=" + maximumPrefillRows + ":sms=" + sms;
-                    Console.Error.WriteLine($"[q35-cuda] explicit original BF16 prefill attention: policy={CudaNinferPrefillAttentionModule.Policy}, module={_prefill.ImageSha256}, workspaceBytes={_prefillWorkspaceBytes}, maxRows={maximumPrefillRows}; ordinary single-sequence prefill only");
+                    Console.Error.WriteLine($"[q35-cuda] {(autoPrefill ? "automatic" : "explicit")} original BF16 prefill attention: policy={CudaNinferPrefillAttentionModule.Policy}, module={_prefill.ImageSha256}, workspaceBytes={_prefillWorkspaceBytes}, maxRows={maximumPrefillRows}; ordinary single-sequence prefill only");
                 }
                 else if (_prefillThreads == 128)
                 {
@@ -91,37 +109,11 @@ namespace TensorSharp.Cuda
                         + ImageSha256.ToLowerInvariant() + ":ub=" + maximumPrefillRows;
                     Console.Error.WriteLine($"[q35-cuda] explicit legacy BF16 prefill schedule: threads=128, module={ImageSha256}; original arithmetic, ordinary single-sequence prefill only");
                 }
-                if (verify8Path != null)
-                {
-                    // Only module admission can fall back. Allocation and every
-                    // later launch remain outside the catch; partial execution
-                    // must never be retried on another arithmetic policy.
-                    try { _verify8 = new CudaNinferPrefillAttentionModule(verify8Path); }
-                    catch (Exception error) when (autoVerify8 && Q35CudaEngine.NinferAutomaticModuleUnavailable(error))
-                    {
-                        Verify8Selection = "asset-unavailable";
-                        Console.Error.WriteLine($"[q35-cuda] automatic NInfer Verify8 attention unavailable before use: {error.Message}; using existing attention");
-                    }
-                    if (_verify8 != null)
-                    {
-                        _verify8WorkspaceBytes = CudaNinferPrefillAttentionModule.WorkspaceVerify8();
-                        CudaDriverApi.cuMemAlloc(out _verify8Workspace, new UIntPtr(checked((ulong)_verify8WorkspaceBytes))).ThrowOnError();
-                        Verify8ImageSha256 = _verify8.ImageSha256;
-                        Verify8Selection = autoVerify8 ? "auto-sm120-170sm" : "explicit";
-                        PrefillNamespaceSuffix += "|ninfer-verify8-attn=" + CudaNinferPrefillAttentionModule.Verify8Policy + ":"
-                            + Verify8ImageSha256.ToLowerInvariant() + ":context-cap=40960:rows=8:splits=4:sms=170";
-                        Console.Error.WriteLine($"[q35-cuda] {(autoVerify8 ? "automatic" : "explicit")} NInfer Verify8 BF16 attention: selection={Verify8Selection}, option={(autoVerify8 ? Q35CudaEngine.NinferAutoVerify8Environment : Verify8Environment)}, policy={CudaNinferPrefillAttentionModule.Verify8Policy}, module={Verify8ImageSha256}, workspaceBytes={_verify8WorkspaceBytes}, path={verify8Path}; full-valid Verify T8/B1 only, visibleKeys<=40960, device-base graph input");
-                    }
-                }
             }
             catch
             {
                 // Cleanup failures cannot replace the original module/allocation
                 // admission error. No kernels or graphs have been published yet.
-                if (_verify8Workspace != IntPtr.Zero) CudaDriverApi.cuMemFree(_verify8Workspace);
-                _verify8Workspace = IntPtr.Zero;
-                try { _verify8?.Dispose(); } catch { }
-                _verify8 = null;
                 if (_prefillWorkspace != IntPtr.Zero) CudaDriverApi.cuMemFree(_prefillWorkspace);
                 _prefillWorkspace = IntPtr.Zero;
                 try { _prefill?.Dispose(); } catch { }
@@ -132,28 +124,6 @@ namespace TensorSharp.Cuda
                 throw;
             }
         }
-        internal static string ResolveVerify8Path(string raw, bool verificationEnabled, int maximumRows,
-            int maximumKeys, int sms, int heads, int kvHeads, int headDim)
-        {
-            if (raw == null) return null;
-            if (string.IsNullOrWhiteSpace(raw) || !Path.IsPathFullyQualified(raw) || raw != Path.GetFullPath(raw))
-                throw new ArgumentException(Verify8Environment + " requires an explicit normalized absolute module path.");
-            if (!verificationEnabled || maximumRows < 8 || maximumKeys < 8
-                || maximumKeys > CudaNinferPrefillAttentionModule.MaximumContext
-                || sms != 170 || heads != 24 || kvHeads != 4 || headDim != 256)
-                throw new NotSupportedException("The explicit NInfer Verify8 attention policy requires verification enabled and validated170SM Q24/KV4/HD256 target geometry.");
-            if (!File.Exists(raw)) throw new FileNotFoundException("Original BF16 Verify8 attention module is unavailable.", raw);
-            return raw;
-        }
-        internal static bool UseAutomaticVerify8(bool qualifiedAutomatic, string explicitPath)
-            => qualifiedAutomatic && explicitPath == null;
-        internal static bool UseVerify8(bool enabled, int rows, int sequences, bool isVerify,
-            bool allRowsValid, int heads, int kvHeads, int maxVisibleKeys)
-            => enabled && heads == 24 && kvHeads == 4
-                && CudaNinferPrefillAttentionModule.SupportsVerify8(rows, sequences, isVerify, allRowsValid, maxVisibleKeys);
-        internal bool UsesVerify8(int rows, int sequences, bool isVerify, bool allRowsValid,
-            int heads, int kvHeads, int maxVisibleKeys)
-            => UseVerify8(Verify8Enabled, rows, sequences, isVerify, allRowsValid, heads, kvHeads, maxVisibleKeys);
         internal static int ResolvePrefillThreads(string raw, bool hasOriginalModule)
         {
             if (raw == null) return 256;
@@ -193,16 +163,8 @@ namespace TensorSharp.Cuda
         }
         public void Attention(IntPtr q, IntPtr gate, IntPtr keyEnd, IntPtr table, int maxBlocks, long kOff, long vOff,
             int rowsPerSeq, int sequences, int nHead, int nKv, float scale, int maxKeys, IntPtr partial, IntPtr output, IntPtr stream,
-            bool isVerify = false, bool allRowsValid = true, IntPtr positionsBaseDev = default)
+            bool isVerify = false, bool allRowsValid = true)
         {
-            if (UsesVerify8(rowsPerSeq, sequences, isVerify, allRowsValid, nHead, nKv, maxKeys))
-            {
-                // This is the physical cache-row base, not keyEnd's base+1 or
-                // an mRoPE coordinate. The core dereferences it at graph replay.
-                _verify8.RunF32Verify8(q, gate, table, maxBlocks, kOff, vOff, positionsBaseDev, maxKeys,
-                    scale, output, _verify8Workspace, _verify8WorkspaceBytes, stream);
-                return;
-            }
             if (_prefill != null && rowsPerSeq <= _maximumPrefillRows
                 && nHead == CudaNinferPrefillAttentionModule.QueryHeads && nKv == CudaNinferPrefillAttentionModule.KvHeads
                 && CudaNinferPrefillAttentionModule.Supports(rowsPerSeq, sequences, isVerify, allRowsValid))
@@ -213,11 +175,12 @@ namespace TensorSharp.Cuda
             }
             if (rowsPerSeq * (nHead/nKv) <= Q35Kernels.AttnBlockRows && partial != IntPtr.Zero)
             {
-                var plan = Q35Kernels.GetSplitAttentionPlan(maxKeys);
+                var plan = SplitPlan(sequences, nKv);
                 int chunk = plan.Chunk, splits = plan.Splits;
                 void** args = stackalloc void*[] { &q, &keyEnd, &table, &maxBlocks, &kOff, &vOff, &rowsPerSeq,
                     &nHead, &nKv, &scale, &chunk, &partial };
-                Launch(_split, (uint)splits, (uint)nKv, (uint)sequences, 128, stream, args);
+                CudaDriverApi.cuLaunchKernel(_splitPipe, (uint)splits, (uint)nKv, (uint)sequences, 128, 1, 1, _splitPipeSmem,
+                    stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
                 void** merge = stackalloc void*[] { &partial, &gate, &splits, &output };
                 Launch(_combine, checked((uint)(sequences*rowsPerSeq*nHead)), 1, 1, 256, stream, merge);
             }
@@ -236,13 +199,6 @@ namespace TensorSharp.Cuda
         {
             // The engine synchronizes and destroys its layer graphs before
             // disposing this module or any captured workspace pointer.
-            if (_verify8 != null)
-            {
-                Console.Error.WriteLine($"[q35-cuda] NInfer Verify8 BF16 attention core host submissions={_verify8.PagedCoreLaunches}; includes graph capture, excludes GPU graph replays; module={Verify8ImageSha256}");
-                _verify8.Dispose(); _verify8 = null;
-            }
-            if (_verify8Workspace != IntPtr.Zero) CudaDriverApi.cuMemFree(_verify8Workspace).ThrowOnError();
-            _verify8Workspace = IntPtr.Zero;
             if (_prefillThreads == 128)
                 Console.Error.WriteLine($"[q35-cuda] legacy BF16 prefill schedule128 core submissions={_prefill128Submissions}; host submissions, not a timing measurement");
             if (_prefill != null)

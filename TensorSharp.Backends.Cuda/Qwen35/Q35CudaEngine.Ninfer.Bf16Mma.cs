@@ -28,7 +28,7 @@ public sealed unsafe partial class Q35CudaEngine
         if (!ninfer) return false;
         bool requested = NinferAutomaticOptimizationRequested(option, NinferBf16MmaEnvironment);
         // Only the configured profile widens; the two T8 shapes and scratch stay fixed.
-        bool supported = qualified && sms == 170 && (context is 40960 or 65536) && maximumRows >= 8
+        bool supported = qualified && sms == 170 && (context is 40960 or 65536 or 131072 or 262144) && maximumRows >= 8
             && verify && graphs && !flashInfer && !exact;
         if (option == "1" && !supported)
             throw new NotSupportedException(NinferBf16MmaEnvironment + "=1 requires the qualified 170-SM/context40960 or context65536 NInfer recipe, enabled verification/graphs, without FI or ExactVerify.");

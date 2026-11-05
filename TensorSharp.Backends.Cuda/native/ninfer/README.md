@@ -98,25 +98,16 @@ Generated logs, module images, and probe outputs belong in ignored
 constitute passing device validation.
 
 
-## Original BF16 Verify8 attention
+## Original BF16 prompt attention image
 
-`TS_Q35_NINFER_VERIFY8_ATTN_PTX` explicitly selects the original Ignis
-Br64/Bc64 BF16 attention core through a TensorSharp-owned paged-cache adapter.
-It serves only full-valid, single-sequence T8 verification on the tested
-170-SM device, with Q24/KV4/HD256 and at most 40,960 visible keys. Other shapes
-retain the existing attention implementation. The device cache-row base is a
-graph input, so replay does not reuse a captured CPU position. Numerical
-cache namespaces include the actual native image and arithmetic policy.
-
-For the complete Qwen3.8 recipe on CC12.0/170-SM hardware, automatic selection
-tries the packaged image when verification is already enabled and the batch
-capacity permits eight tokens. It does not enable verification or speculation.
-`TS_Q35_NINFER_VERIFY8_ATTN=0` disables automatic selection; its accepted values
-are exactly `0` and `1`. An explicit `_PTX` path takes precedence even with `0`
-and must pass its existing path/geometry checks. Missing or incompatible
-automatic assets retain existing attention before use; allocation, context and
-execution failures are errors. Startup diagnostics identify the selection and
-actual loaded image. Other models, devices and runtime shapes retain their path.
+The packaged `tensorsharp_ninfer_prefill_attention` image holds the original Ignis
+Br64/Bc64 BF16 attention core behind a TensorSharp-owned paged-cache adapter. It
+serves ordinary single-sequence prefill chunks (see the defaults table below).
+It was first qualified as a T8 verification core, where it beat the legacy split
+kernel 3.95-7.04x at 74-1,024 keys; the GQA-packed, cp.async-pipelined split
+kernel has since replaced it for verification at every history (it reads each key
+once for all six query heads instead of six times), so the T8 entry and its
+probes were removed.
 
 The normal build adds this optional image only for target120 or an explicit
 fatbin list containing120, with a dedicated C++20/sm120a compilation and exact
@@ -127,43 +118,7 @@ the compute75 portable baseline; managed-only builds preserve prebuilt assets.
 Build the separate image with `eng/validation/build-ninfer-prefill-attention.py`.
 The source manifest preserves the unchanged original core, notices and licenses
 at Ignis `e600a7d9e0d5921d767a6cb464373583b3cdcaf4`. No ggml modifications
-are needed. `NinferSmallAttentionProbe` checks the adapter against that original
-core and FP64 references, exercises poisoned workspaces and changing positions
-inside captured graphs, and times the complete old/new attention call chains.
-`NinferSmallAttentionAudit` independently replays retained evidence on CPU.
-Actual RTX 5090 validation covered 624 component kernel executions, 24 dynamic
-graph replays, and 1,680 timing kernel executions; four tested key lengths
-(74, 202, 512, 1,024) won all five paired timing rounds, with median complete-call
-speedups of 3.95–7.04×. These are attention-component results, not engine-wide
-speedups.
-
-This implementation uses the original valid BF16 arithmetic; summation order
-and intermediate rounding differ from the legacy implementation. A changed
-answer alone is not an engine-bug verdict. The full 45-text/30-program trial
-completed with 38/45 and 25/30 passing, compared with 38/45 and 27/30 for the
-previous DFlash path. One newly generated program merged adjacent integer
-intervals incorrectly; another previously passing program was not executed
-because of the unchanged execution policy. Preserve those failures separately
-from verified kernel contracts. Finite quality results do not prove equivalent
-whole-model output or sampling distributions.
-
-One same-runtime OFF/ON/ON/OFF block completed 36 frozen measured requests:
-code decode medians were 326.98 / 388.30 / 388.33 / 326.96 tokens/s, about 18.8%
-higher with this path. Prose/copy decode rates improved 12.9% / 23.7%. Per-request
-completion times were code 3.208 → 2.555 s, prose 4.863 → 4.920 s, copy 1.720 → 1.370 s;
-outputs and lengths differed, so throughput gains are not identical to latency
-gains. This single descriptive block does not establish universal speedup.
-
-The normal CUDA 13.2 MSBuild target then reproduced the exact qualified native
-image. An actual automatic-selection run completed all 45 text / 30 program cases
-with neither Verify8 path nor auto option specified. All 141 request identities,
-309 original checks, 96 arithmetic values and 189 program-case statuses matched
-the explicit configuration; 125 normalized serial responses were identical. The
-other 16 responses were parallel 2/4 cases, with unchanged checks and verdicts.
-Code throughput was 375.90 versus 375.92 tokens/s, so discovery adds no extra
-speedup over explicit selection. The retained 7 text / 5 program failures remain
-failures. Final NInfer/SHA CPU tests passed 782 cases with zero skips; native
-Windows and other unavailable devices are not covered by this run.
+are needed.
 
 ## Full T8 verification GEMM
 
@@ -227,8 +182,7 @@ When `TS_SPEC_ADAPTIVE` is unset, the HTTP scheduler skips repeated cost-governo
 calibration only for the measured native Qwen3.8 DFlash profile: the embedded
 full-vocabulary drafter, effective K7/pMin0, CC12.0/170-SM hardware, exactly
 40,960 configured context tokens, enabled decode graphs, the qualified legacy
-vector A16 asset, Verify8 attention and native greedy verification already
-enabled. FI, exact-Verify and shortlist experiments retain the adaptive default.
+vector A16 asset and native greedy verification already enabled. FI, exact-Verify and shortlist experiments retain the adaptive default.
 The request must use plain greedy sampling without media, grammar, repetition
 penalties or a logits observer. This policy enables neither speculation nor
 verification and changes no kernels, draft window or confidence threshold.
@@ -320,8 +274,7 @@ cover the later 64K profile described below. Upstream ggml remained unchanged at
 
 Residual/norm, BF16 MMA and GateUp fusion admit exactly configured context 40,960
 or 65,536 with their existing CC12.0/170-SM, full-valid T8/B1 qualifications.
-Capacity is not an operand of these three kernels. Verify8 attention separately
-retains its cap of 40,960 actual visible keys and existing fallback above it.
+Capacity is not an operand of these three kernels.
 Other configured contexts do not inherit these three automatic qualifications.
 The automatic governor's measured scope remains 40K; both shared presets
 explicitly set `TS_SPEC_ADAPTIVE=0` for stable K7 drafting.
@@ -344,6 +297,37 @@ claim that this new 40K file itself received that GPU campaign. Complete 128K/25
 campaigns for the optimized profile are **NOT_RUN**; arbitrary contexts and
 other hardware remain outside this finite qualification.
 
+## Ignis-derived prefill and long-context defaults (2026-11-04)
+
+A per-kernel nsys comparison of the same 32K prompt against Ignis (same
+artifact, BF16 KV) showed the legacy prefill attention kernel at 74% of GPU
+time, a sequential GDN scan at 23%, and F32 storage-boundary passes
+(`ts_ni_round`, `ts_ni_swiglu`, `ts_ni_quant_nvfp4`) that Ignis does not run.
+These now apply automatically on the qualified recipe (CC 12.0, Q24/KV4/HD256):
+
+| Feature | What changed | Opt-out |
+|---|---|---|
+| Original BF16 prompt attention | The packaged Ignis Br64/Bc64 core serves ordinary prefill chunks of 2+ rows. | `TS_Q35_NINFER_PREFILL_ATTN=0` |
+| Chunked GDN prefill | Ignis' WY/state-passing/output kernels (`native/ninfer/chunk`, built as `tensorsharp_ninfer_gdn_chunk`) replace the sequential scan for spans of whole 64-token chunks; tails, decode and verification keep the scan. | `TS_Q35_NINFER_GDN_CHUNK=0` |
+| TMA prefill GEMM | Prefill projections of 65+ rows run a TMA-fed, warp-specialized W4A4 kernel (the structure of NInfer's `nvfp4_w4a4_tma`, on TensorSharp's planes, 128- or 256-token tiles) whose epilogue applies the BF16 round, SwiGLU, and the down projection's NVFP4 input quantization. Same accumulation order and arithmetic: answers were byte-identical with and without it. | `TS_Q35_NINFER_PREFILL_EPILOGUE=0` |
+| Prefill norm + quantize | The residual add + RMSNorm before an A4 projection also writes that projection's NVFP4 input (`ts_ni_add_norm_quant`: add_norm's reduction order, then the quantizer's arithmetic on the values it just produced); the projection skips its own quantize pass. Full GDN chunks are no longer rounded in place before the chunk pack (the pack's BF16 conversion is the same rounding); only the scanned tail is. Byte-identical answers; 32K TTFT 3.70 -> 3.63 s. A residual-add GEMM epilogue was measured 2.4x slower per GEMM and is not shipped. | `TS_Q35_NINFER_PREFILL_EPILOGUE=0` |
+| Tensor-core context append | The DFlash2 drafter's context projections over 64+ rows run Ignis' A16 BF16-MMA kernel (`ts_nidf_mma_*`); only drafts change, never the verified output. | none (draft image) |
+| Decode/verify attention | One GQA-packed split kernel with cp.async double-buffered tiles: a fixed one-wave split count (SMs / KV heads / lanes), each split's key range derived on the device, so one captured graph serves every history. Replaced both the unpipelined split kernel and the Ignis T8 core. | none |
+| Context qualification | Residual/norm, BF16 MMA and GateUp/SwiGLU also admit configured contexts 131,072 and 262,144 (context is not an operand of those kernels). | their existing `=0` options |
+
+Measured on RTX 5090 with `config/qwen3.8-27b-ninfer-64k.json` (DFlash2 K7, BF16 KV):
+TTFT 32K 14.29 -> 3.63 s, 60K 44.45 -> 8.74 s (8K 0.92 -> 0.74 s from the TMA GEMM
+alone); a 512-token answer after 7K / 33K / 62K context decodes at
+192.8 / 127.5 / 82.4 -> 217.2 / 189.8 / 183.2 tok/s.
+The unchanged text suite (309 checks, 3 repeats) and the 30-program suite scored
+297/339 both before and after; the differing answers are greedy flips of legal
+summation-order changes, in both directions.
+
+Not adopted: Ignis' 8-bit prompt-attention band exists only for its hq-e8-2b KV
+codec, whose own measurements cost KLD +0.018-0.022 at 32K-64K. Deeper cp.async
+pipelines with K128 tiles and 256-column cp.async tiles were measured slower and
+are not shipped.
+
 ## CLI and Server.Host startup
 
 Use the complete `qwen3_8_27b_nvfp4full-v2.ninfer` artifact with `--backend cuda`,
@@ -352,8 +336,8 @@ embedded; no external `--tokenizer` is needed. This route currently serves text.
 Build matching assets, including the separate attention/MMA modules:
 
 ```sh
-dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release -p:CudaArch=sm_120a
-dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release -p:CudaArch=sm_120a
+dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release -p:CudaArch=compute_120
+dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release -p:CudaArch=compute_120
 ```
 
 The toolkit must support sm120a; portable compute75 assets alone are insufficient.

@@ -12,7 +12,7 @@ public sealed class NinferGateUpSwiGluPolicyTests
             gemm, overrides, matrices, option!);
 
     [Theory]
-    [InlineData(40960)] [InlineData(65536)]
+    [InlineData(40960)] [InlineData(65536)] [InlineData(131072)] [InlineData(262144)]
     public void OnlyTheTwoConfiguredContextProfilesCanUseTheSameT8Math(int context)
     {
         Assert.True(Plan(null, context: context)); Assert.True(Plan("1", context: context));
@@ -66,10 +66,10 @@ public sealed class NinferGateUpSwiGluPolicyTests
     public void GraphsCannotReuseTheUnfusedOrDifferentImageRoute()
     {
         string identity = "|ninfer-gateup-swiglu=" + Q35Kernels.NinferGateUpSwiGluPolicy + ":" + new string('a', 64);
-        var old = Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 1024, true);
-        var fused = Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 1024, true, gateUpSwiGluIdentity: identity);
+        var old = Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42));
+        var fused = Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42), gateUpSwiGluIdentity: identity);
         Assert.NotEqual(old, fused);
-        Assert.NotEqual(fused, Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 1024, true,
+        Assert.NotEqual(fused, Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42),
             gateUpSwiGluIdentity: identity.Replace(new string('a', 64), new string('b', 64))));
         foreach (var shape in new[] { (2, 4, true, 0), (1, 7, true, 0), (1, 8, false, 0), (1, 8, true, 1) })
             Assert.Throws<ArgumentException>(() => Q35CudaEngine.ValidateNinferGateUpSwiGluGraphIdentity(shape.Item1, shape.Item2, shape.Item3, shape.Item4, identity));

@@ -160,6 +160,13 @@ namespace TensorSharp.Cuda.Interop
             IntPtr kernelParams,
             IntPtr extra);
 
+        /// <summary>Encodes a TMA tensor map (CUtensorMap, 128 bytes, 64-byte aligned) for a tiled
+        /// bulk copy. Data type 0 is UINT8; swizzle 0 none, 2 64-byte; the rest are passed as 0.</summary>
+        [LibraryImport(LibName)]
+        public static unsafe partial int cuTensorMapEncodeTiled(void* tensorMap, int dataType, uint rank,
+            IntPtr globalAddress, ulong* globalDim, ulong* globalStrides, uint* boxDim, uint* elementStrides,
+            int interleave, int swizzle, int l2Promotion, int oobFill);
+
         [LibraryImport(LibName)]
         public static partial int cuStreamCreate(out IntPtr stream, uint flags);
 

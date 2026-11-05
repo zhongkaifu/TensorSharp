@@ -49,6 +49,61 @@ internal sealed unsafe class CudaNinferDraftModule : IDisposable
     }
     private IntPtr Function(string name) => _module.GetFunction(name);
 
+    // Tensor-core A16 route for the context append's wide token counts (see the
+    // ts_nidf_mma kernels): [shape][full, partial], absent in older images.
+    private readonly IntPtr[,] _mma = new IntPtr[2, 2];
+    private int _mmaSharedBytes, _mmaThreads;
+    private bool _mmaResolved;
+    internal long MmaLaunches { get; private set; }
+    internal const int MmaMinTokens = 64;
+    private bool MmaAvailable()
+    {
+        if (_mmaResolved) return _mmaThreads > 0;
+        _mmaResolved = true;
+        try
+        {
+            var shapes = new[] { (5120, 25600), (6144, 5120) };
+            for (int i = 0; i < shapes.Length; i++)
+            {
+                _mma[i, 0] = Function($"ts_nidf_mma_n{shapes[i].Item1}_k{shapes[i].Item2}_full");
+                _mma[i, 1] = Function($"ts_nidf_mma_n{shapes[i].Item1}_k{shapes[i].Item2}_part");
+            }
+            CudaDriverApi.cuMemAlloc(out IntPtr probe, new UIntPtr(8)).ThrowOnError();
+            try
+            {
+                void** args = stackalloc void*[] { &probe };
+                Launch(Function("ts_nidf_mma_shared_bytes"), 1, 1, 1, 1, 0, IntPtr.Zero, args);
+                int* host = stackalloc int[2];
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)host, probe, new UIntPtr(8)).ThrowOnError();
+                (_mmaSharedBytes, _mmaThreads) = (host[0], host[1]);
+            }
+            finally { CudaDriverApi.cuMemFree(probe); }
+        }
+        catch (CudaException error) when (error.ErrorCode == 500)
+        {
+            _mmaThreads = 0;
+            Console.Error.WriteLine("[q35-cuda] NInfer draft image has no tensor-core A16 projection; using the small-T route");
+        }
+        return _mmaThreads > 0;
+    }
+
+    /// <summary>One launch over all <paramref name="tokens"/> rows on the BF16 tensor cores,
+    /// for the context append's wide projections. False leaves the caller's small-T route.</summary>
+    internal bool TryProjectMma(IntPtr codes, IntPtr scales, IntPtr input, IntPtr output, int n, int k, int tokens, float inverseDivisor, IntPtr stream)
+    {
+        int shape = (n, k) switch { (5120, 25600) => 0, (6144, 5120) => 1, _ => -1 };
+        if (shape < 0 || tokens < MmaMinTokens || !MmaAvailable()) return false;
+        Factor(inverseDivisor);
+        long codeBytes = (long)n * k / 2, scaleBytes = (long)n * k / 16, inputBytes = (long)tokens * k * 2, outputBytes = (long)tokens * n * 2;
+        Pointer(codes, codeBytes, 16); Pointer(scales, scaleBytes, 16); Pointer(input, inputBytes, 16); Pointer(output, outputBytes, 2);
+        Separate(output, outputBytes, codes, codeBytes); Separate(output, outputBytes, scales, scaleBytes); Separate(output, outputBytes, input, inputBytes);
+        int tilesN = (tokens + 127) / 128;
+        void** args = stackalloc void*[] { &codes, &scales, &input, &output, &inverseDivisor, &tokens };
+        Launch(_mma[shape, tokens % 128 == 0 ? 0 : 1], checked(n / 64 * tilesN), 1, 1, _mmaThreads, (uint)_mmaSharedBytes, stream, args);
+        MmaLaunches++;
+        return true;
+    }
+
     internal readonly record struct ProjectionLayout(int ShapeIndex, int Threads, int Blocks, long CodeBytes, long ScaleBytes, long InputBytes, long OutputBytes);
     internal static ProjectionLayout ValidateProjection(int n, int k, int tokens, float inverseDivisor)
     {

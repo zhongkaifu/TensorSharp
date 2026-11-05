@@ -64,6 +64,48 @@ extern "C" __global__ void ts_ni_add_norm(float* x,const float* delta,const floa
         long long j=(long long)row*width+i; y[j]=ts_ni_bf(x[j]*inv*weight[i]);
     }
 }
+// ts_ni_add_norm and ts_ni_quant_nvfp4 of its output in one pass, same arithmetic:
+// the identical per-thread sum, reductions and BF16 norm, then each half-warp quantizes
+// the 16 consecutive values its lanes just produced (blockDim 256 and width % 256 == 0,
+// so a group never straddles an iteration and every lane of a warp takes part).
+extern "C" __global__ void __launch_bounds__(256) ts_ni_add_norm_quant(float* x,const float* delta,
+    const float* weight,float* y,int width,float eps,uint8_t* codes,uint8_t* scales,float* rowScale,float inputD) {
+    int row=blockIdx.x,lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    float ss=0;
+    for(int i=threadIdx.x;i<width;i+=blockDim.x) {
+        long long j=(long long)row*width+i;
+        float v=ts_ni_bf(x[j]+delta[j]); x[j]=v; ss+=v*v;
+    }
+    ss=ts_ni_sum(ss);
+    __shared__ float partial[32], inv;
+    if(!lane) partial[warp]=ss;
+    __syncthreads();
+    if(!warp) {
+        ss=lane<(blockDim.x>>5)?partial[lane]:0; ss=ts_ni_sum(ss);
+        if(!lane) inv=rsqrtf(ss/(float)width+eps);
+    }
+    __syncthreads();
+    const int l16=threadIdx.x&15,groups=width/16;
+    for(int i=threadIdx.x;i<width;i+=blockDim.x) {
+        long long j=(long long)row*width+i;
+        float v=ts_ni_bf(x[j]*inv*weight[i]); y[j]=v;
+        float a=fabsf(v);
+#pragma unroll
+        for(int off=8;off;off>>=1) a=fmaxf(a,__shfl_xor_sync(0xffffffffu,a,off,16));
+        uint8_t s=__nv_cvt_float_to_fp8(__fdiv_rn(inputD*a,6.0f),__NV_SATFINITE,__NV_E4M3);
+        float q=s?__fdiv_rn(v*inputD,ts_ni_fp8(s)):0;
+        float high=__shfl_xor_sync(0xffffffffu,q,8,16);
+        int g=i/16;
+        if(l16<8) {
+            float a0=fabsf(q),a1=fabsf(high);
+            unsigned lo=a0<=0.25f?0:a0<0.75f?1:a0<=1.25f?2:a0<1.75f?3:a0<=2.5f?4:a0<3.5f?5:a0<=5.0f?6:7;
+            unsigned hi=a1<=0.25f?0:a1<0.75f?1:a1<=1.25f?2:a1<1.75f?3:a1<=2.5f?4:a1<3.5f?5:a1<=5.0f?6:7;
+            lo|=(__float_as_uint(q)>>28)&8u; hi|=(__float_as_uint(high)>>28)&8u;
+            codes[(long long)row*(width/2)+g*8+l16]=(uint8_t)(lo|(hi<<4));
+        }
+        if(l16==0) { scales[(long long)row*groups+g]=s; if(g==0) rowScale[row]=1.0f; }
+    }
+}
 // One warp owns two independent K16 groups. Each half-warp handles a group;
 // paired lanes write TS's low8/high8 nibble convention, without requantizing weights.
 extern "C" __global__ void ts_ni_quant_nvfp4(const float* x,uint8_t* codes,uint8_t* scales,

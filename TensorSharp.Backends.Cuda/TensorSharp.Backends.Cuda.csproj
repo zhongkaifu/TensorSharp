@@ -64,6 +64,11 @@
     <_NinferVerify8Source>$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/tensorsharp_ninfer_prefill_attention.cu</_NinferVerify8Source>
     <_NinferVerify8Flags>-std=c++20 -O3 --ftz=false --fmad=true -arch=sm_120a -I&quot;$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/upstream/kernel/vendor/src&quot; -I&quot;$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/upstream/kernel/vendor/include&quot;</_NinferVerify8Flags>
     <!-- Independent BF16 T8 asset; never part of the generic/portable PTX loop. -->
+    <NinferGdnChunkOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'obj', 'cuda_ninfer_gdn_chunk'))</NinferGdnChunkOutputDir>
+    <_NinferGdnChunkSource>$(MSBuildProjectDirectory)/native/ninfer/chunk/tensorsharp_ninfer_gdn_chunk.cu</_NinferGdnChunkSource>
+    <!-- The exact flags of eng/validation/build-ninfer-gdn-chunk-module.py (C++20 for the
+         unchanged original prepare header's template lambdas; no fast math). -->
+    <_NinferGdnChunkFlags>-std=c++20 -O3 --fmad=true --ftz=false --prec-div=true --prec-sqrt=true -arch=sm_120a -I&quot;$(MSBuildProjectDirectory)/native/ninfer/chunk/upstream/kernel/vendor/src&quot;</_NinferGdnChunkFlags>
     <NinferBf16MmaOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'obj', 'cuda_ninfer_bf16_mma'))</NinferBf16MmaOutputDir>
     <_NinferBf16MmaSource>$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/tensorsharp_ninfer_bf16_mma.cu</_NinferBf16MmaSource>
     <_NinferBf16MmaFlags>-std=c++17 -O3 --ftz=false --fmad=true -lineinfo -arch=sm_120a -I&quot;$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/upstream&quot;</_NinferBf16MmaFlags>
@@ -105,6 +110,7 @@
     <CudaKernelHeader Include="$(MSBuildProjectDirectory)/native/w8/upstream/kernel/vendor/src/**/*.cuh" />
     <CudaKernelHeader Include="$(MSBuildProjectDirectory)/native/w8/upstream/kernel/vendor/src/**/*.h" />
     <NinferVerify8Input Include="$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/**/*.cu;$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/**/*.cuh;$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/**/*.h" />
+    <NinferGdnChunkInput Include="$(MSBuildProjectDirectory)/native/ninfer/chunk/**/*.cu;$(MSBuildProjectDirectory)/native/ninfer/chunk/**/*.cuh;$(MSBuildProjectDirectory)/native/ninfer/chunk/**/*.h" />
     <NinferBf16MmaInput Include="$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/**/*.cu;$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/**/*.cuh;$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/**/*.h;$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/upstream/LICENSE;$(MSBuildProjectDirectory)/native/ninfer/bf16_mma/upstream/manifest.json" />
     <!-- Headers the kernels #include (e.g. the vendored IQ2_XXS tables). Tracked as
          build inputs so editing them re-triggers the PTX compile below. -->
@@ -222,6 +228,37 @@
       <Content Include="$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/upstream/LICENSE" Link="cuda_kernels/ninfer_prefill_attention_licenses/ignis-LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
       <Content Include="$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/upstream/NOTICE" Link="cuda_kernels/ninfer_prefill_attention_licenses/NOTICE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
       <Content Include="$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/upstream/kernel/vendor/LICENSE" Link="cuda_kernels/ninfer_prefill_attention_licenses/ninfer-LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
+
+  <!-- Ignis-original chunked GDN prefill (native/ninfer/chunk), built with the Verify8 policy (sm_120 only). -->
+  <Target Name="CompileNinferGdnChunk"
+          BeforeTargets="BeforeBuild"
+          DependsOnTargets="ResolveCudaPtxBuildSettings;ResolveCudaHostCompiler;ResolveNinferVerify8BuildPolicy"
+          Condition="'$(TensorSharpSkipCudaPtx)' != 'true' And '$(DesignTimeBuild)' != 'true'"
+          Inputs="@(NinferGdnChunkInput);$(MSBuildProjectFullPath)"
+          Outputs="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.ptx;$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin;$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin.sha256;$(NinferGdnChunkOutputDir)/nvcc$(_NvccMajor).$(_NvccMinor).stamp">
+    <MakeDir Condition="'$(_NinferVerify8BuildEnabled)' == 'true'" Directories="$(NinferGdnChunkOutputDir)" />
+    <Exec Condition="'$(_NinferVerify8BuildEnabled)' == 'true'"
+          Command="&quot;$(CudaNvcc)&quot; $(_NinferGdnChunkFlags) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -ptx &quot;$(_NinferGdnChunkSource)&quot; -o &quot;$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.ptx&quot;" StandardOutputImportance="low" />
+    <Exec Condition="'$(_NinferVerify8BuildEnabled)' == 'true'"
+          Command="&quot;$(CudaNvcc)&quot; $(_NinferGdnChunkFlags) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -fatbin &quot;$(_NinferGdnChunkSource)&quot; -o &quot;$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin&quot;" StandardOutputImportance="low" />
+    <GetFileHash Condition="'$(_NinferVerify8BuildEnabled)' == 'true'" Files="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.ptx" Algorithm="SHA256" HashEncoding="hex">
+      <Output TaskParameter="Items" ItemName="_NinferGdnChunkPtxHash" />
+    </GetFileHash>
+    <WriteLinesToFile Condition="'$(_NinferVerify8BuildEnabled)' == 'true'" File="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin.sha256" Lines="%(_NinferGdnChunkPtxHash.FileHash)" Overwrite="true" />
+    <WriteLinesToFile Condition="'$(_NinferVerify8BuildEnabled)' == 'true'" File="$(NinferGdnChunkOutputDir)/nvcc$(_NvccMajor).$(_NvccMinor).stamp" Lines="$(_NinferGdnChunkFlags)" Overwrite="true" />
+  </Target>
+
+  <Target Name="SelectNinferGdnChunkContent" BeforeTargets="AssignTargetPaths"
+          DependsOnTargets="CompileNinferGdnChunk"
+          Condition="'$(TensorSharpSkipCudaPtx)' != 'true' And '$(DesignTimeBuild)' != 'true'">
+    <ItemGroup Condition="'$(_NinferVerify8BuildEnabled)' == 'true'">
+      <Content Include="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.ptx" Link="cuda_kernels/tensorsharp_ninfer_gdn_chunk.ptx" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin" Link="cuda_kernels/tensorsharp_ninfer_gdn_chunk.fatbin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin.sha256" Link="cuda_kernels/tensorsharp_ninfer_gdn_chunk.fatbin.sha256" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(MSBuildProjectDirectory)/native/ninfer/chunk/upstream/LICENSE" Link="cuda_kernels/ninfer_gdn_chunk_licenses/ignis-LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(MSBuildProjectDirectory)/native/ninfer/chunk/upstream/NOTICE" Link="cuda_kernels/ninfer_gdn_chunk_licenses/NOTICE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     </ItemGroup>
   </Target>
 

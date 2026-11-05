@@ -33,7 +33,7 @@ public sealed unsafe partial class Q35CudaEngine
         bool requested = NinferAutomaticOptimizationRequested(option, NinferResidualNormEnvironment);
         // Configured context does not enter this fixed T8 projection/norm math.
         // Attention independently keeps its actual-visible 40960-key cap and fallback.
-        bool supported = qualified && sms == 170 && (context is 40960 or 65536) && maximumRows >= 8
+        bool supported = qualified && sms == 170 && (context is 40960 or 65536 or 131072 or 262144) && maximumRows >= 8
             && verification && graphs && gemm8 && splitK && targetW8 && !flashInfer && !exactVerify && allDowns;
         if (option == "1" && !supported)
             throw new NotSupportedException(NinferResidualNormEnvironment
@@ -106,7 +106,7 @@ public sealed unsafe partial class Q35CudaEngine
             || !NinferResidualMatrixEligible(d.Format, d.AllowA4, rows, d.Rows, d.Columns)) return false;
         // This directly selects the admitted A4 implementation. FI/ExactVerify
         // were refused at construction; no requested flag can stand in for a launch.
-        _ninfer.QuantizeNvfp4(input, _fp4c, _fp4s, _fp4r, d.Columns, rows, d.InputScaleDivisor, Stream);
+        QuantizeNinferInput(input, matrix, rows);
         float alpha = 1.0f / (d.InputScaleDivisor * d.WeightScaleDivisor);
         _k.GemmNinferResidual(matrix.Data, matrix.Scales, d.Rows, d.Columns, _fp4c, _fp4s, _fp4r,
             rows, alpha, output, _partial, _counters, _x, Stream);
@@ -122,8 +122,10 @@ public sealed unsafe partial class Q35CudaEngine
     }
 
     private void NormalizeNinferResidual(NinferResidualState state, IntPtr weight, int rows,
-        bool candidatePass, bool postProjection)
+        bool candidatePass, bool postProjection, NinferMatrix quantizeFor = null)
     {
+        if (TryNormalizeNinferPrefill(state, weight, rows, candidatePass, quantizeFor))
+            return;
         switch (PlanNinferResidualNormalization(state, candidatePass, postProjection))
         {
             case NinferNormRoute.LegacyInitial:

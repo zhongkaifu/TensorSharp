@@ -9,14 +9,14 @@ public sealed class NinferFixedGovernorPolicyTests
     [Theory]
     [InlineData("qualified")] [InlineData("recipe")] [InlineData("sms")]
     [InlineData("verification")] [InlineData("native")] [InlineData("full-head")]
-    [InlineData("window")] [InlineData("verify8")] [InlineData("short-context")]
+    [InlineData("window")] [InlineData("short-context")]
     [InlineData("large-context")] [InlineData("graphs")] [InlineData("vector")]
     [InlineData("flashinfer")] [InlineData("exact-verify")] [InlineData("shortlist")]
     public void FixedGovernorRequiresTheCompleteMeasuredBackendProfile(string change)
         => Assert.Equal(change == "qualified", Q35CudaEngine.FixedDraftGovernorGeometry(
             change != "recipe", change == "sms" ? 169 : 170, change != "verification",
             change != "native", change != "full-head", change == "window" ? 6 : 7,
-            change != "verify8", change == "short-context" ? 40959 : change == "large-context" ? 40961 : 40960,
+            change == "short-context" ? 40959 : change == "large-context" ? 40961 : 40960,
             change != "graphs", change != "vector", change == "flashinfer", change == "exact-verify", change == "shortlist"));
 
     [Theory]

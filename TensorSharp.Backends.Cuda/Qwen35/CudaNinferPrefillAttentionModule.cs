@@ -7,21 +7,16 @@ using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda;
 
-/// <summary>Explicit BF16 prefill candidate, using original Ignis Br64/Bc64
-/// arithmetic with an owned pointer-page accessor. Callers own scratch/cache
-/// buffers and completion. No runtime allocation or KV conversion; the separate
-/// T8/B1 Verify entry is module-only until its independent qualification.</summary>
+/// <summary>BF16 prefill attention using original Ignis Br64/Bc64 arithmetic with an
+/// owned pointer-page accessor. Callers own scratch/cache buffers and completion. No
+/// runtime allocation or KV conversion. Decode and verification rows use the GQA-packed
+/// split kernel (CudaNinferAttention), which replaced this core's T8 verify entry.</summary>
 internal sealed unsafe class CudaNinferPrefillAttentionModule : IDisposable
 {
     internal const string EnvironmentVariable = "TS_Q35_NINFER_PREFILL_ATTN_PTX";
     internal const string Policy = "ignis-e600-bf16-br64-bc64-s1s4-ts256-pointerpages-v1";
     internal const int HeadDim = 256, QueryHeads = 24, KvHeads = 4, Width = HeadDim * QueryHeads;
     internal const int MaximumRows = 8192, MaximumContext = 262144, DynamicSharedBytes = 98304;
-    // Separate module-only qualification seam. Do not broaden ordinary-prefill
-    // Supports/Plan, or select this route without the B1/full-valid Verify guard.
-    // S4 is the original 170-SM Prompt dispatch for this exact T8 shape.
-    internal const int Verify8Rows = 8, Verify8Context = 40960, Verify8Splits = 4;
-    internal const string Verify8Policy = "ignis-e600-bf16-br64-bc64-verify8-b1-s4-c40960-devicebase-v1";
     internal const long KvPlaneBlockBytes = 4L * 256 * 256 * 2, KvBlockBytes = 16 * 2 * KvPlaneBlockBytes;
     private readonly CudaModule _module;
     private readonly IntPtr _context, _pack, _gate, _owned, _original, _reduce;
@@ -83,11 +78,17 @@ internal sealed unsafe class CudaNinferPrefillAttentionModule : IDisposable
         return kernel;
     }
 
+    /// <summary>Ordinary (non-verify) prompt rows of one sequence. Short incremental prompts
+    /// (a chat turn's new tokens over a long history: 2-63 rows) take the core too - its
+    /// single partial Br64 tile still splits the keys over the SMs, where the legacy kernel
+    /// ran 8 CTAs over the whole history (2.2 ms per layer at 30 rows over 2.9K keys).
+    /// One row stays on the graph-captured decode routes.</summary>
+    internal const int MinimumRows = 2;
     internal static bool Supports(int rows, int sequences, bool isVerify, bool allRowsValid = true)
-        => rows is >= 64 and <= MaximumRows && sequences == 1 && !isVerify && allRowsValid;
+        => rows >= MinimumRows && rows <= MaximumRows && sequences == 1 && !isVerify && allRowsValid;
     internal static int SplitCount(int rows, int sms)
     {
-        if (rows < 64 || rows > MaximumRows || sms < 1) throw new ArgumentOutOfRangeException(nameof(rows));
+        if (rows < MinimumRows || rows > MaximumRows || sms < 1) throw new ArgumentOutOfRangeException(nameof(rows));
         long items = ((long)rows + 63) / 64 * QueryHeads;
         double first = (double)((items + sms - 1) / sms), bestRatio = first; int best = 1;
         for (int split = 2; split <= 4; split++)
@@ -120,44 +121,6 @@ internal sealed unsafe class CudaNinferPrefillAttentionModule : IDisposable
             || maxBlocks < (maxVisibleKeys + 255) / 256 || maxBlocks > (MaximumContext + 255) / 256 + 1)
             throw new ArgumentOutOfRangeException(nameof(rows), "Prefill rows/history must fit the declared native BF16 pointer pages.");
         return AllocateLayout(rows, maxVisibleKeys, SplitCount(rows, sms));
-    }
-    internal static bool SupportsVerify8(int rows, int sequences, bool isVerify, bool allRowsValid, int maxVisibleKeys)
-        => rows == Verify8Rows && sequences == 1 && isVerify && allRowsValid
-            && maxVisibleKeys >= Verify8Rows && maxVisibleKeys <= Verify8Context;
-
-    /// <summary>Fixed graph-stable capacity. Visible history is admission metadata,
-    /// never a captured page count, base position, split count or kernel argument.</summary>
-    internal static Layout PlanVerify8(int maxVisibleKeys, int maxBlocks)
-    {
-        if (!SupportsVerify8(Verify8Rows, 1, true, true, maxVisibleKeys)
-            || maxBlocks < (maxVisibleKeys + 255) / 256 || maxBlocks > (MaximumContext + 255) / 256 + 1)
-            throw new ArgumentOutOfRangeException(nameof(maxVisibleKeys), "Verify8 must fit its fixed40960-token native BF16 cache capacity.");
-        return AllocateLayout(Verify8Rows, Verify8Context, Verify8Splits);
-    }
-    internal static long WorkspaceVerify8() => AllocateLayout(Verify8Rows, Verify8Context, Verify8Splits).Bytes;
-
-    // Pure host admission is separately testable without loading a CUDA device.
-    // The caller owns the pointees of blocks and must keep them alive until all
-    // graph executions complete. On each replay it must admit current physical
-    // base+8 <=40960; positionsBaseDev is not a RoPE-coordinate array.
-    internal static Layout ValidateVerify8Buffers(IntPtr qF32, IntPtr gateF32, IntPtr blocks, int maxBlocks,
-        long kOff, long vOff, IntPtr positionsBaseDev, int maxVisibleKeys, float scale,
-        IntPtr outputF32, IntPtr workspace, long workspaceBytes)
-    {
-        var plan = PlanVerify8(maxVisibleKeys, maxBlocks); ValidatePlaneOffsets(kOff, vOff); Scale(scale);
-        const long bytes = (long)Verify8Rows * Width * 4;
-        long tableBytes = (long)maxBlocks * 8;
-        if (workspaceBytes < plan.Bytes) throw new ArgumentException("Verify8 workspace is too small.");
-        Pointer(qF32, bytes, 4); Pointer(gateF32, bytes, 4); Pointer(blocks, tableBytes, 8);
-        Pointer(positionsBaseDev, 4, 4); Pointer(outputF32, bytes, 4); Pointer(workspace, workspaceBytes, 256);
-        Separate(workspace, workspaceBytes, qF32, bytes); Separate(workspace, workspaceBytes, gateF32, bytes);
-        Separate(workspace, workspaceBytes, blocks, tableBytes); Separate(workspace, workspaceBytes, positionsBaseDev, 4);
-        Separate(workspace, workspaceBytes, outputF32, bytes);
-        Separate(outputF32, bytes, qF32, bytes); Separate(outputF32, bytes, gateF32, bytes);
-        Separate(outputF32, bytes, blocks, tableBytes); Separate(outputF32, bytes, positionsBaseDev, 4);
-        Separate(positionsBaseDev, 4, qF32, bytes); Separate(positionsBaseDev, 4, gateF32, bytes);
-        Separate(positionsBaseDev, 4, blocks, tableBytes);
-        return plan;
     }
     internal static void ValidatePlaneOffsets(long kOff, long vOff)
     {
@@ -223,29 +186,6 @@ internal sealed unsafe class CudaNinferPrefillAttentionModule : IDisposable
         void** args = stackalloc void*[] { &output, &gateF32, &outputF32, &count };
         CudaDriverApi.cuLaunchKernel(_gate, checked((uint)((count + 255) / 256)), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
     }
-    /// <summary>Module-only T8/B1/full-valid Verify candidate. Core causality reads
-    /// positionsBaseDev directly on every graph replay. maxVisibleKeys is checked
-    /// only on the host and never enters a captured launch argument. No allocation,
-    /// synchronous readback or CPU-derived cache position occurs here.</summary>
-    internal void RunF32Verify8(IntPtr qF32, IntPtr gateF32, IntPtr blocks, int maxBlocks, long kOff, long vOff,
-        IntPtr positionsBaseDev, int maxVisibleKeys, float scale, IntPtr outputF32,
-        IntPtr workspace, long workspaceBytes, IntPtr stream)
-    {
-        var plan = ValidateVerify8Buffers(qF32, gateF32, blocks, maxBlocks, kOff, vOff,
-            positionsBaseDev, maxVisibleKeys, scale, outputF32, workspace, workspaceBytes);
-        Current();
-        IntPtr query = workspace + (nint)plan.Query, output = workspace + (nint)plan.Output;
-        ulong count = (ulong)Verify8Rows * Width;
-        // Pack's CPU position writes only the unused workspace.Positions cell.
-        // Its page count is always640, including capture at a short history.
-        Pack(qF32, query, count, workspace, plan, blocks, kOff, vOff, 0, stream);
-        Core(_owned, query, workspace + (nint)plan.Planes, workspace + (nint)(plan.Planes + 16),
-            workspace + (nint)plan.Table, positionsBaseDev, output, Verify8Rows, scale, Verify8Splits,
-            workspace + (nint)plan.PartialAcc, workspace + (nint)plan.PartialM, workspace + (nint)plan.PartialL, stream);
-        void** args = stackalloc void*[] { &output, &gateF32, &outputF32, &count };
-        CudaDriverApi.cuLaunchKernel(_gate, checked((uint)((count + 255) / 256)), 1, 1, 256, 1, 1, 0,
-            stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
-    }
     internal void RunPagedBf16(IntPtr qBf16, IntPtr blocks, int maxBlocks, long kOff, long vOff,
         int rows, int basePosition, float scale, IntPtr outputBf16, IntPtr workspace, long workspaceBytes, int sms, IntPtr stream)
     {
@@ -264,13 +204,6 @@ internal sealed unsafe class CudaNinferPrefillAttentionModule : IDisposable
         if (!Supports(rows, 1, false) || splits < 1 || splits > 4) throw new ArgumentOutOfRangeException(nameof(rows));
         RunOriginal(qBf16, cacheK, cacheV, table, positions, outputBf16, rows, scale, splits, partialAcc, partialM, partialL, stream);
     }
-    /// <summary>Unchanged original64-page T8/S4 oracle only. This does not relax
-    /// the ordinary-prefill API or provide engine dispatch/graph policy.</summary>
-    internal void RunOriginalVerify8Bf16(IntPtr qBf16, IntPtr cacheK, IntPtr cacheV, IntPtr table, IntPtr positionsBaseDev,
-        IntPtr outputBf16, float scale, IntPtr partialAcc, IntPtr partialM, IntPtr partialL, IntPtr stream)
-        => RunOriginal(qBf16, cacheK, cacheV, table, positionsBaseDev, outputBf16, Verify8Rows, scale,
-            Verify8Splits, partialAcc, partialM, partialL, stream);
-
     private void RunOriginal(IntPtr qBf16, IntPtr cacheK, IntPtr cacheV, IntPtr table, IntPtr positions,
         IntPtr outputBf16, int rows, float scale, int splits, IntPtr partialAcc, IntPtr partialM, IntPtr partialL, IntPtr stream)
     {

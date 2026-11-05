@@ -58,15 +58,28 @@ public sealed unsafe partial class Q35CudaEngine
     private void InitializeNinferGdnChunk()
     {
         string configured=Environment.GetEnvironmentVariable(NinferGdnChunkEnvironment);
-        if(configured==null)return;
+        bool automatic=configured==null&&_ninferAutomaticGdnChunk;
+        if(configured==null&&!automatic)return;
         if(_m.Ninfer==null)throw new NotSupportedException("The original NInfer GDN chunk policy requires the NInfer model route.");
         if(_ninferGdnChunk!=null)throw new InvalidOperationException("NInfer GDN chunk module was already initialized.");
-        string path=ResolveNinferGdnChunkPath(configured);
+        string path;
+        if(automatic)
+        {
+            path=LocateNinferAutomaticAsset(NinferQualifiedGdnChunkAsset,CudaKernels.LocatePtxPath);
+            if(path==null){Console.Error.WriteLine("[q35-cuda] automatic NInfer GDN chunk asset missing; using the sequential prefill scan");return;}
+        }
+        else path=ResolveNinferGdnChunkPath(configured);
         if(_m.NUbatch<64)throw new NotSupportedException("The configured NInfer chunk policy requires a prefill capacity of at least 64 rows.");
         // This buffer is owned by the engine's ordinary allocation list. Reserve
         // it before requests; no allocation occurs on the recurrence hot path.
         int fullCapacity=_m.NUbatch/64*64;
-        var module=new CudaNinferGdnChunk(path);
+        CudaNinferGdnChunk module;
+        try{module=new CudaNinferGdnChunk(path);}
+        catch(Exception error) when(automatic&&NinferAutomaticModuleUnavailable(error))
+        {
+            ReportNinferAutomaticFallback("GDN chunk",error);
+            return;
+        }
         try
         {
             long bytes=CudaNinferGdnChunk.WorkspaceBytes(fullCapacity);
@@ -76,16 +89,21 @@ public sealed unsafe partial class Q35CudaEngine
             _ninferGdnChunkWorkspaceBytes=bytes;
             _ninferGdnChunkNamespace=identity;
             _ninferGdnChunk=module;
-            Console.Error.WriteLine("[q35-cuda] explicit original-source NInfer GDN chunk candidate "+JsonSerializer.Serialize(new
+            Console.Error.WriteLine("[q35-cuda] "+(automatic?"automatic":"explicit")+" original-source NInfer GDN chunk "+JsonSerializer.Serialize(new
             {
                 profile=CudaNinferGdnChunk.Profile,modulePath=path,moduleImageSha256=module.ImageSha256,
                 workspaceBytes=bytes,prefillCapacity=_m.NUbatch,fullChunkCapacity=fullCapacity,
                 qkPolicy="spans-at-least64-materialize-normalized-qk-bf16-including-tail",
-                defaultEnabled=false,qualityQualification="required"
+                automatic
             }));
         }
         catch{module.Dispose();throw;}
     }
+    /// <summary>Only ordinary prefill spans of at least one complete 64-token chunk
+    /// take the chunked recurrence. Decode, verification and short spans keep the
+    /// one-launch batched sequential scan (and its graph-captured shape).</summary>
+    private bool UsesNinferGdnChunk(in RowGroup group)
+        =>_ninferGdnChunk!=null&&!group.Verify&&!group.Decode&&group.RowsPerSeq>=CudaNinferGdnChunk.ChunkSize;
     /// <summary>The disabled path is exactly the original batched helper dispatch.
     /// The optional policy applies the original chunk recipe to each sequence's
     /// real token span, then advances its tail through the existing F32 state.</summary>
@@ -117,7 +135,11 @@ public sealed unsafe partial class Q35CudaEngine
                 // Original NInfer also materializes the tail's normalized Q/K
                 // when there is at least one full chunk. V is already BF16;
                 // rerounding it is idempotent. Do not normalize a second time.
-                _ninfer.Round(q,(long)plan.ActualRows*ConvDim,Stream);
+                // The full chunks need no pass: the chunk pack converts them with
+                // the same round-to-nearest BF16 conversion. Only the tail, which
+                // the sequential scan reads as F32, is rounded in place.
+                if(plan.TailRows>0)
+                    _ninfer.Round(q+(nint)((long)plan.FullRows*ConvDim*sizeof(float)),(long)plan.TailRows*ConvDim,Stream);
                 if(CudaNinferGdnChunk.WorkspaceBytes(plan.FullRows)>_ninferGdnChunkWorkspaceBytes)
                     throw new InvalidOperationException("NInfer GDN full span exceeds the preallocated chunk capacity.");
                 IntPtr state=group.Slots[sequence].State[layer.Ordinal];

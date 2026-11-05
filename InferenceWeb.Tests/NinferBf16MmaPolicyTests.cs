@@ -18,7 +18,7 @@ public sealed class NinferBf16MmaPolicyTests
     public void QualifiedProfileSelectsAutomaticallyWithExplicitOptOut(string? value, bool expected) => Assert.Equal(expected, Plan(value));
 
     [Theory]
-    [InlineData(40960)] [InlineData(65536)]
+    [InlineData(40960)] [InlineData(65536)] [InlineData(131072)] [InlineData(262144)]
     public void OnlyTheTwoConfiguredContextProfilesCanUseTheSameT8Math(int context)
     {
         Assert.True(Plan(null, context: context)); Assert.True(Plan("1", context: context));
@@ -144,15 +144,15 @@ public sealed class NinferBf16MmaPolicyTests
     {
         string identity = Q35CudaEngine.BuildNinferBf16MmaStateSuffix(new string('A', 64));
         string another = Q35CudaEngine.BuildNinferBf16MmaStateSuffix(new string('b', 64));
-        var old = Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 74, true);
-        var next = Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 74, true, bf16MmaIdentity: identity);
+        var old = Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42));
+        var next = Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42), bf16MmaIdentity: identity);
         Assert.NotEqual(old, next);
-        Assert.NotEqual(next, Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 74, true, bf16MmaIdentity: another));
-        Assert.Equal(next, Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 1024, true, bf16MmaIdentity: identity));
-        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(2, 4, true, 0, 74, false, bf16MmaIdentity: identity));
-        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, false, 0, 74, true, bf16MmaIdentity: identity));
-        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 1, 74, true, bf16MmaIdentity: identity));
-        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 74, true, bf16MmaIdentity: identity.ToUpperInvariant()));
+        Assert.NotEqual(next, Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42), bf16MmaIdentity: another));
+        Assert.Equal(next, Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42), bf16MmaIdentity: identity));
+        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(2, 4, true, 0, new(0, 42), bf16MmaIdentity: identity));
+        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, false, 0, new(0, 42), bf16MmaIdentity: identity));
+        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 1, new(0, 42), bf16MmaIdentity: identity));
+        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42), bf16MmaIdentity: identity.ToUpperInvariant()));
         Assert.Throws<ArgumentException>(() => Q35CudaEngine.BuildNinferBf16MmaStateSuffix("bad"));
         Assert.Contains(CudaNinferBf16MmaModule.ArithmeticPolicy, identity); Assert.EndsWith(new string('a', 64), identity);
     }

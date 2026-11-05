@@ -133,15 +133,54 @@ __device__ __forceinline__ void ts_ninfer_dequant_tile(const uint8_t* head, long
  }
 }
 
-template <bool SPLIT>
+__device__ __forceinline__ void ts_ninfer_cp16(void* dst, const void* src, bool valid)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :: "r"(ts_ninfer_smem_u32(dst)), "l"(src), "r"(valid ? 16 : 0));
+#else
+    __trap();
+#endif
+}
+__device__ __forceinline__ void ts_ninfer_cp_commit()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+template <int N>
+__device__ __forceinline__ void ts_ninfer_cp_wait()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+}
+// 32 keys x 256 values of one head into the padded tile rows with 16-byte cp.async;
+// keys past `limit` are zero-filled exactly as ts_ninfer_dequant_tile writes them.
+__device__ __forceinline__ void ts_ninfer_async_tile(const uint8_t* head, long long stride, int limit, __nv_bfloat16* tile)
+{
+    for (int i = threadIdx.x; i < TS_NINFER_ATTN_KT * (TS_NINFER_HD / 8); i += blockDim.x)
+    {
+        const int key = i / (TS_NINFER_HD / 8), chunk = i % (TS_NINFER_HD / 8);
+        const bool ok = key < limit;
+        ts_ninfer_cp16(tile + key * TS_NINFER_ATTN_ROW + chunk * 8, head + (long long)(ok ? key : 0) * stride + chunk * 16, ok);
+    }
+}
+#define TS_NINFER_PIPE_SMEM (4 * TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW * 2)
+
+// PIPE (the split kernel): the K/V tiles are staged with 16-byte cp.async into two dynamic
+// shared-memory buffers so the next tile's load overlaps this tile's MMAs (the plain
+// version, kept for the unsplit prefill kernel, loads 2 bytes per thread per element in
+// lock-step with compute; as a split kernel it was load-bound on long verify histories).
+template <bool SPLIT, bool PIPE = false>
 __device__ __forceinline__ void ts_ninfer_attention(
     const float* __restrict__ q, const float* __restrict__ gate, const int* __restrict__ keyEnd,
     uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
     int rowsPerSeq, int nHead, int nKv, float scale, int chunk, int splits,
     float* __restrict__ partial, float* __restrict__ out)
 {
-    __shared__ __align__(16) __nv_bfloat16 ks[TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW];
-    __shared__ __align__(16) __nv_bfloat16 vs[TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW];
+    __shared__ __align__(16) __nv_bfloat16 ksStatic[PIPE ? 8 : TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW];
+    __shared__ __align__(16) __nv_bfloat16 vsStatic[PIPE ? 8 : TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW];
     const int kvh = blockIdx.y, seq = blockIdx.z;
     const int G = nHead / nKv;
     const int R = rowsPerSeq * G;
@@ -158,6 +197,14 @@ __device__ __forceinline__ void ts_ninfer_attention(
     int kLo = 0;
     if (SPLIT)
     {
+        // chunk <= 0: derive it on the device from this sequence's longest visible history,
+        // so a fixed split count (one graph-stable launch) spreads any history over the grid.
+        if (chunk <= 0)
+        {
+            const int total = ends[rowsPerSeq - 1];
+            chunk = ((total + (int)gridDim.x - 1) / (int)gridDim.x + TS_NINFER_ATTN_KT - 1) / TS_NINFER_ATTN_KT * TS_NINFER_ATTN_KT;
+            chunk = max(chunk, TS_NINFER_ATTN_KT);
+        }
         kLo = blockIdx.x * chunk;
         kHi = min(kHi, kLo + chunk);
     }
@@ -197,16 +244,56 @@ __device__ __forceinline__ void ts_ninfer_attention(
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
     const float log2Scale = scale * 1.4426950408889634f;
 
-    for (int first = kLo; first < kHi; first += TS_NINFER_ATTN_KT)
+    extern __shared__ __align__(16) unsigned char ts_ninfer_pipe_smem[];
+    auto tileOf = [&](int first) {
+        return blocks[first / TS_NINFER_KV_BLOCK]
+             + ((long long)kvh * TS_NINFER_KV_BLOCK + first % TS_NINFER_KV_BLOCK) * TS_NINFER_Q8_ROW;
+    };
+    if constexpr (PIPE)
     {
-        __syncthreads();
-        const uint8_t* tileBase = blocks[first / TS_NINFER_KV_BLOCK]
-                                + ((long long)kvh * TS_NINFER_KV_BLOCK + first % TS_NINFER_KV_BLOCK) * TS_NINFER_Q8_ROW;
-        ts_ninfer_dequant_tile(tileBase + kOff, keyStride, 0, kHi - first, ks);
-        ts_ninfer_dequant_tile(tileBase + vOff, keyStride, 0, kHi - first, vs);
-        __syncthreads();
+        if (kLo < kHi)
+        {
+            __nv_bfloat16* stage0 = reinterpret_cast<__nv_bfloat16*>(ts_ninfer_pipe_smem);
+            ts_ninfer_async_tile(tileOf(kLo) + kOff, keyStride, kHi - kLo, stage0);
+            ts_ninfer_async_tile(tileOf(kLo) + vOff, keyStride, kHi - kLo, stage0 + TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW);
+        }
+        ts_ninfer_cp_commit();
+    }
+    for (int first = kLo, it = 0; first < kHi; first += TS_NINFER_ATTN_KT, ++it)
+    {
+        const __nv_bfloat16* ks;
+        const __nv_bfloat16* vs;
+        if constexpr (PIPE)
+        {
+            __nv_bfloat16* base = reinterpret_cast<__nv_bfloat16*>(ts_ninfer_pipe_smem);
+            const int slot = it & 1;
+            const int next = first + TS_NINFER_ATTN_KT;
+            if (next < kHi)
+            {
+                __nv_bfloat16* dst = base + (slot ^ 1) * 2 * TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW;
+                ts_ninfer_async_tile(tileOf(next) + kOff, keyStride, kHi - next, dst);
+                ts_ninfer_async_tile(tileOf(next) + vOff, keyStride, kHi - next, dst + TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW);
+            }
+            ts_ninfer_cp_commit();
+            ts_ninfer_cp_wait<1>();
+            __syncthreads();
+            ks = base + slot * 2 * TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW;
+            vs = ks + TS_NINFER_ATTN_KT * TS_NINFER_ATTN_ROW;
+        }
+        else
+        {
+            __syncthreads();
+            ts_ninfer_dequant_tile(tileOf(first) + kOff, keyStride, 0, kHi - first, ksStatic);
+            ts_ninfer_dequant_tile(tileOf(first) + vOff, keyStride, 0, kHi - first, vsStatic);
+            __syncthreads();
+            ks = ksStatic;
+            vs = vsStatic;
+        }
         if (!warpLive)
+        {
+            if constexpr (PIPE) __syncthreads();
             continue;
+        }
         float s[4][4];
 #pragma unroll
         for (int j = 0; j < 4; ++j)
@@ -273,7 +360,10 @@ __device__ __forceinline__ void ts_ninfer_attention(
                 ts_ninfer_mma_bf16(acc[n], pa, b0, b1);
             }
         }
+        // The next iteration refills the other stage, which this one just read.
+        if constexpr (PIPE) __syncthreads();
     }
+    if constexpr (PIPE) ts_ninfer_cp_wait<0>();
     if (!warpLive)
         return;
 #pragma unroll
@@ -332,14 +422,18 @@ extern "C" __global__ void __launch_bounds__(256) ts_ninfer_attn_bf16_f32(
     ts_ninfer_attention<false>(q, gate, keyEnd, blockTable, maxBlocks, kOff, vOff, rowsPerSeq, nHead, nKv, scale, 0, 1, nullptr, out);
 }
 
-extern "C" __global__ void __launch_bounds__(128) ts_ninfer_attn_bf16_split_f32(
+// Decode/verify split attention: one CTA per (key split, KV head, sequence) with the cp.async
+// double-buffered K/V tiles (TS_NINFER_PIPE_SMEM bytes of dynamic shared memory). chunk 0
+// derives each split's key range on the device from the sequence's key end.
+extern "C" __global__ void __launch_bounds__(128) ts_ninfer_attn_bf16_split_pipe_f32(
     const float* __restrict__ q, const int* __restrict__ keyEnd,
     uint8_t* const* __restrict__ blockTable, int maxBlocks, long long kOff, long long vOff,
     int rowsPerSeq, int nHead, int nKv, float scale, int chunk, float* __restrict__ partial)
 {
-    ts_ninfer_attention<true>(q, nullptr, keyEnd, blockTable, maxBlocks, kOff, vOff, rowsPerSeq, nHead, nKv, scale, chunk,
-                           gridDim.x, partial, nullptr);
+    ts_ninfer_attention<true, true>(q, nullptr, keyEnd, blockTable, maxBlocks, kOff, vOff, rowsPerSeq, nHead, nKv, scale, chunk,
+                                 gridDim.x, partial, nullptr);
 }
+extern "C" __global__ void ts_ninfer_attn_pipe_smem_bytes(int* out) { out[0] = TS_NINFER_PIPE_SMEM; }
 
 // Merge the split partials of every (row, head) in split order and apply the gate:
 // out = (sum_s acc_s e^(m_s - M)) / (sum_s l_s e^(m_s - M)) * sigmoid(gate). One block per

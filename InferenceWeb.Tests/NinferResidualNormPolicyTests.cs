@@ -22,7 +22,7 @@ public sealed class NinferResidualNormPolicyTests
         => Assert.Equal(expected, Plan(option));
 
     [Theory]
-    [InlineData(40960)] [InlineData(65536)]
+    [InlineData(40960)] [InlineData(65536)] [InlineData(131072)] [InlineData(262144)]
     public void OnlyTheTwoConfiguredContextProfilesCanUseTheSameT8Math(int context)
     {
         Assert.True(Plan(null, context: context)); Assert.True(Plan("1", context: context));
@@ -184,16 +184,16 @@ public sealed class NinferResidualNormPolicyTests
     {
         string a = Q35CudaEngine.BuildNinferResidualNormStateSuffix(new string('A', 64));
         string b = Q35CudaEngine.BuildNinferResidualNormStateSuffix(new string('b', 64));
-        var legacy = Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 74, true);
-        var candidate = Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 74, true, a);
+        var legacy = Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42));
+        var candidate = Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42), a);
         Assert.NotEqual(legacy, candidate);
-        Assert.NotEqual(candidate, Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 74, true, b));
-        Assert.Equal(candidate, Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 1024, true, a));
+        Assert.NotEqual(candidate, Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42), b));
+        Assert.Equal(candidate, Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42), a));
         Assert.Contains(Q35Kernels.NinferResidualNormPolicy, a); Assert.EndsWith(new string('a', 64), a);
         Assert.Throws<ArgumentException>(() => Q35CudaEngine.BuildNinferResidualNormStateSuffix("bad"));
-        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(2, 8, true, 0, 74, false, a));
-        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 1, 74, true, a));
-        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, 74, true, ""));
+        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(2, 8, true, 0, new(0, 42), a));
+        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 1, new(0, 42), a));
+        Assert.Throws<ArgumentException>(() => Q35CudaEngine.PlanNinferDecodeGraphKey(1, 8, true, 0, new(0, 42), ""));
     }
 
     [Theory]

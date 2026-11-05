@@ -1185,6 +1185,7 @@ namespace TensorSharp.Cuda
                 DisposeNinferExactVerify();
                 DisposeNinferFlashInfer();
                 DisposeNinferBf16Mma();
+                DisposeNinferGdnChunk();
                 DisposeNinferDraft();
                 _ninfer?.Dispose();
                 _ninferAttention?.Dispose();

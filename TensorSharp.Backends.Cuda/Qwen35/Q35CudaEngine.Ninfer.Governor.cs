@@ -10,7 +10,7 @@ public sealed unsafe partial class Q35CudaEngine
         && FixedDraftGovernorGeometry(_ninferQualifiedDefaults?.Qualified == true, _sms,
             _ninferVerificationEnabled, HasNinferDrafter,
             _ninferDraftDesc?.HeadPolicy == CudaNinferDraftHeadPolicy.FullTargetVocabulary,
-            _ninferDraftDesc?.DraftTokens ?? 0, NinferVerify8AttentionEnabled, _m.NCtx,
+            _ninferDraftDesc?.DraftTokens ?? 0, _m.NCtx,
             NinferDecodeGraphsEnabled, HasQualifiedGovernorVector(NinferA16Selection, NinferA16ModulePath),
             NinferFlashInferEnabled, NinferExactVerifyEnabled, NinferDraftUsesShortlist);
 
@@ -19,8 +19,8 @@ public sealed unsafe partial class Q35CudaEngine
             && System.IO.Path.GetFileNameWithoutExtension(path) == "tensorsharp_q35_ninfer_a16_legacy_exact_vector";
 
     internal static bool FixedDraftGovernorGeometry(bool qualifiedRecipe, int sms, bool verification,
-        bool nativeDraft, bool fullHead, int draftTokens, bool verify8, int context,
+        bool nativeDraft, bool fullHead, int draftTokens, int context,
         bool graphs, bool legacyVector, bool flashInfer, bool exactVerify, bool shortlist)
         => qualifiedRecipe && sms == 170 && verification && nativeDraft && fullHead && draftTokens == 7
-            && verify8 && context == 40960 && graphs && legacyVector && !flashInfer && !exactVerify && !shortlist;
+            && context == 40960 && graphs && legacyVector && !flashInfer && !exactVerify && !shortlist;
 }

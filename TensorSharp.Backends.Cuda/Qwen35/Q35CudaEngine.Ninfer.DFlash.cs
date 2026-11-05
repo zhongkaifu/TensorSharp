@@ -244,6 +244,11 @@ public sealed unsafe partial class Q35CudaEngine
     }
     private void NinferDraftProject(NinferDraftMatrix matrix, IntPtr input, IntPtr output, int rows)
     {
+        // Wide context appends run on the tensor cores (ignis' A16 MMA route); the
+        // per-32-row CUDA-core loop remains for proposals and short appends.
+        if (_ninferDraftModule.TryProjectMma(matrix.Codes, matrix.Scales, input, output, matrix.Rows, matrix.Columns,
+                rows, matrix.InverseDivisor, Stream))
+            return;
         for (int first = 0; first < rows; first += 32)
             _ninferDraftModule.ProjectRaw(matrix.Codes, matrix.Scales, input + (nint)((long)first * matrix.Columns * 2),
                 output + (nint)((long)first * matrix.Rows * 2), matrix.Rows, matrix.Columns, Math.Min(32, rows - first), matrix.InverseDivisor, Stream);

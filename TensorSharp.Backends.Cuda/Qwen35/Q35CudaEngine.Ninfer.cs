@@ -26,13 +26,6 @@ namespace TensorSharp.Cuda
         public long NinferPrefillAttentionCoreSubmissions => _ninferAttention?.PrefillCoreSubmissions ?? 0;
         public long NinferPrefillAttentionWorkspaceBytes => _ninferAttention?.PrefillWorkspaceBytes ?? 0;
         public long NinferPrefill128CoreSubmissions => _ninferAttention?.Prefill128CoreSubmissions ?? 0;
-        public bool NinferVerify8AttentionEnabled => _ninferAttention?.Verify8Enabled == true;
-        public string NinferVerify8AttentionSelection => _ninferAttention?.Verify8Selection ?? "not-ninfer";
-        public string NinferVerify8AttentionImageSha256 => _ninferAttention?.Verify8ImageSha256;
-        public string NinferVerify8AttentionPolicy => NinferVerify8AttentionEnabled ? CudaNinferPrefillAttentionModule.Verify8Policy : null;
-        /// <summary>Host core submissions, including capture; GPU graph replays do not increment this count.</summary>
-        public long NinferVerify8AttentionCoreSubmissions => _ninferAttention?.Verify8CoreSubmissions ?? 0;
-        public long NinferVerify8AttentionWorkspaceBytes => _ninferAttention?.Verify8WorkspaceBytes ?? 0;
 
         internal static void ValidateNinferModel(ModelDesc model)
         {
@@ -113,8 +106,9 @@ namespace TensorSharp.Cuda
             if (_m.Ninfer == null) return;
             _ninfer = CudaNinferKernels.Create(_m.Ninfer.ModulePath);
             _ninferAttention = new CudaNinferAttention(_m.RopeBase, _m.NUbatch, _m.NCtx, _sms,
-                _ninferVerificationEnabled, _m.NHead, _m.NKvHead, _m.HeadDim, _ninferAutomaticVerify8);
+                _m.NHead, _m.NKvHead, _m.HeadDim, _ninferAutomaticPrefillAttention);
             _ninferLayers = new NinferLayer[_m.NLayer];
+            InitializeNinferGdnChunk();
         }
         private NinferMatrix LoadNinferMatrix(Loader loader, CudaNinferProjectionDesc d)
         {
@@ -161,8 +155,15 @@ namespace TensorSharp.Cuda
             }
             else if (d.AllowA4 && rows >= a4Threshold)
             {
-                _ninfer.QuantizeNvfp4(input, _fp4c, _fp4s, _fp4r, d.Columns, rows, d.InputScaleDivisor, Stream);
+                QuantizeNinferInput(input, matrix, rows);
                 float alpha = 1.0f / (d.InputScaleDivisor * d.WeightScaleDivisor);
+                if (UsesNinferPrefillEpilogue(rows, isVerify)
+                    && Q35Kernels.NinferPrefillEpilogueFits(matrix.Data, matrix.Scales, d.Rows, d.Columns))
+                {
+                    _k.GemmW4A4NinferPrefill(matrix.Data, matrix.Scales, d.Rows, d.Columns, _fp4c, _fp4s, _fp4r,
+                        rows, alpha, output, round ? Q35Kernels.NinferPrefillEpilogue.Round : Q35Kernels.NinferPrefillEpilogue.Plain, Stream);
+                    return;
+                }
                 _k.GemmW4A4(matrix.Data, matrix.Scales, d.Rows, d.Columns, _fp4c, _fp4s, _fp4r,
                     rows, alpha, output, _partial, _counters, _sms, rows <= 64 ? 8 : 1, Stream,
                     ninferVerify8: isVerify && rows == 8);
@@ -189,7 +190,7 @@ namespace TensorSharp.Cuda
             for (int il = 0; il < _m.NLayer; il++)
             {
                 var l = _layers[il]; var weights = _ninferLayers[il];
-                NormalizeNinferResidual(residualState, l.AttnNorm, rows, candidatePass, postProjection: false);
+                NormalizeNinferResidual(residualState, l.AttnNorm, rows, candidatePass, postProjection: false, weights.Input);
                 CaptureNinferDraftTargetTap(il, tapFirst, rows);
                 NinferProject(weights.Input, _xn, _proj, rows, l.Recurrent ? 1 : 4, isVerify: isVerify, bf16Mma: bf16Mma);
                 if (l.Recurrent)
@@ -210,8 +211,11 @@ namespace TensorSharp.Cuda
                             l.ConvW, TabConv(l) + (nint)(8L*q0), qkv, raw, !g.Verify, Stream, count);
                         _ninfer.GdnPrep(qkv, _ninferAlphaBeta + (nint)((long)r0*96*4), 96, g.Rows, _m.GdnKHeads,
                             _m.GdnVHeads, ConvDim, l.DtBias, l.SsmA, gd, beta, Stream, count, g.RowsPerSeq);
-                        _ninfer.GdnScan(qkv, ConvDim, _m.GdnKHeads, _m.GdnVHeads, g.RowsPerSeq, g.Slots.Length,
-                            gd, beta, TabState(l) + (nint)(8L*q0), _gdnO + (nint)((long)r0*ValueDim*4), g.Verify, Stream, count);
+                        if (UsesNinferGdnChunk(g))
+                            RunNinferGdnScan(l, g, q0, qkv, gd, beta, _gdnO + (nint)((long)r0*ValueDim*4));
+                        else
+                            _ninfer.GdnScan(qkv, ConvDim, _m.GdnKHeads, _m.GdnVHeads, g.RowsPerSeq, g.Slots.Length,
+                                gd, beta, TabState(l) + (nint)(8L*q0), _gdnO + (nint)((long)r0*ValueDim*4), g.Verify, Stream, count);
                     }
                     _ninfer.GdnOut(_gdnO, _proj, 16384, ConvDim, rows, _m.GdnVHeads, l.SsmNorm, _m.Eps, _gdnY, Stream);
                     residualState = ProjectNinferResidual(weights.Output, _gdnY, rows, isVerify, candidatePass, bf16Mma);
@@ -230,12 +234,18 @@ namespace TensorSharp.Cuda
                         _ninferAttention.Attention(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L*r0), tab,
                             _maxBlocks, kOff, vOff, g.RowsPerSeq, g.Slots.Length, _m.NHead, _m.NKvHead,
                             1.0f/MathF.Sqrt(_m.HeadDim), maxKeys[gi], g.Rows <= MaxVerifyRows ? _attnPartial : IntPtr.Zero, _attn + qOff, Stream,
-                            isVerify: g.Verify, allRowsValid: g.Counts == null, positionsBaseDev: _cacheRowDev + (nint)(4L*r0));
+                            isVerify: g.Verify, allRowsValid: g.Counts == null);
                     }
                     residualState = ProjectNinferResidual(weights.Output, _attn, rows, isVerify, candidatePass, bf16Mma);
                 }
-                NormalizeNinferResidual(residualState, l.PostNorm, rows, candidatePass, postProjection: true);
-                if (!TryNinferGateUpSwiGlu(weights.GateUp, rows, fusedGateUp))
+                NormalizeNinferResidual(residualState, l.PostNorm, rows, candidatePass, postProjection: true, weights.GateUp);
+                if (TryNinferPrefillGateUpSwiGluQuant(weights.GateUp, weights.Down, rows, isVerify))
+                {
+                    residualState = ProjectNinferPrequantizedDown(weights.Down, rows);
+                    continue;
+                }
+                if (!TryNinferGateUpSwiGlu(weights.GateUp, rows, fusedGateUp)
+                    && !TryNinferPrefillGateUpSwiGlu(weights.GateUp, rows, isVerify))
                 {
                     NinferProject(weights.GateUp, _xn, _proj, rows, 2, round: rows > 128 && rows != 1024, isVerify: isVerify);
                     _ninfer.SwiGlu(_proj, _act, _m.NFf, rows, Stream);

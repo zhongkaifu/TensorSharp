@@ -17,8 +17,8 @@ artifact; no separate tokenizer option or file is needed.
 Build with a toolkit supporting the target GPU, including the optional assets:
 
 ```sh
-dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release -p:CudaArch=sm_120a
-dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release -p:CudaArch=sm_120a
+dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release -p:CudaArch=compute_120
+dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release -p:CudaArch=compute_120
 ```
 
 Run from the repository root:
@@ -59,8 +59,7 @@ process environment can explicitly select a nonstandard deployed asset.
 The residual/norm, BF16 MMA and
 GateUp fusion selectors admit exactly configured context **40,960 or 65,536**
 on the qualified CC12.0/170-SM recipe. Their fixed T8/B1 mathematics do not use
-context capacity; other prerequisites and shape checks still apply. Verify8
-attention independently falls back above **40,960 actual visible keys**.
+context capacity; other prerequisites and shape checks still apply.
 
 On RTX 5090, the 64K shared settings passed an actual CLI generation and Host
 full45+30 evaluation: **38/45 text, 26/30 programs**, unchanged against R60 in

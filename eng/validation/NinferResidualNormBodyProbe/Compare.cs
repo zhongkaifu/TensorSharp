@@ -49,7 +49,7 @@ internal static class Compare
     {
         foreach(string key in new[]{"artifactDirectorySha256","sourceInputSha256","derivedInputSha256","context","ubatch","numericalEnvironment","operations","arguments"})
             Need(Encoded(a.Root.GetProperty(key))==Encoded(b.Root.GetProperty(key)),"Same-history contract differs: "+key);
-        foreach(string role in new[]{"helper","attention","verify8Attention","a16","draft","repack","w8"})
+        foreach(string role in new[]{"helper","attention","a16","draft","repack","w8"})
             Need(a.Root.GetProperty("loadedImages").GetProperty(role).GetString()==b.Root.GetProperty("loadedImages").GetProperty(role).GetString(),"Shared arithmetic image differs: "+role);
         Need(a.Root.GetProperty("draftPayloadSha256").GetString()==b.Root.GetProperty("draftPayloadSha256").GetString(),"Original draft payload differs.");
         Need(a.Vectors.Keys.ToHashSet().SetEquals(b.Vectors.Keys)&&a.States.Keys.ToHashSet().SetEquals(b.States.Keys),"Mandatory output/state keys differ.");
