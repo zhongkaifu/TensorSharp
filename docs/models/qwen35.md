@@ -905,16 +905,28 @@ process (kernels compiled).
 - **Drafter.** The DFlash2 block convolution runs on the device and the sliding-window mask is
   added, instead of reading coefficients, rows and scores back four to five times per layer: a
   draft 51 -> 32 ms.
+- **Decode matvec.** The one-row kernel of the codebook i-quants and the low-bit types gave every
+  weight row its own 256-thread threadgroup, which re-read the whole activation row (20 KB at
+  K = 5,120) and ended in a barrier. It now has ggml-metal's mul_mv layout: two simdgroups of four
+  weight rows each, a lane loading 32 activations once for all four rows. Plain decode
+  15.7 -> 20.4 tok/s (49 ms a token), the rate of ggml_metal (20.6) and llama.cpp (20.5) on the file.
+- **Few-row tiles.** The verify-window kernel takes eight simdgroups (64 output columns) per
+  threadgroup instead of four, so the activation tile is staged half as often: an 8-token forward
+  179 -> 159 ms.
 
 | UD-IQ3_XXS, MLX | Before | Now |
 |---|---:|---:|
-| Plain decode | 1.8 tok/s | 15.7 tok/s |
-| DFlash2, code answer | 2.4 tok/s | 23-25 tok/s |
-| DFlash2, list answer | - | 22.5 tok/s |
+| Plain decode | 1.8 tok/s | 20.4 tok/s |
+| DFlash2, code answer | 2.4 tok/s | 25.0 tok/s |
+| DFlash2, list answer | - | 25.7 tok/s |
 
-ggml_metal on the same files and requests: UD-IQ3_XXS plain 20.6, DFlash2 38.7 (code) / 53.0
-(list); Q8_0 plain 9.9, DFlash2 33.2 / 39.6. MLX with Q8_0 and DFlash2: 24.4 / 26.5. The remaining
-MLX gap is the verify (Q8_0: 155 vs 122 ms per 8-row step) and the drafter (26-32 vs 14 ms).
+ggml_metal on the same files and requests: UD-IQ3_XXS plain 20.6, DFlash2 38.6 (code) / 52.3
+(list); Q8_0 plain 9.9, DFlash2 33.2 / 39.6. MLX with Q8_0 and DFlash2: 23.5-24.4 / 26.5-27.6.
+The remaining MLX gap is the 8-row matmul kernel: in an 8-token UD-IQ3_XXS forward (159 ms against
+ggml_metal's 88) the few-row matmuls take 140 ms, the rest 20. It decodes each weight once, as the
+one-row kernel does in about 40 ms, so the difference is its access pattern (eight rows' 64-value
+pieces per simdgroup and chunk), not the codebooks; larger or smaller K chunks, more simdgroups and
+ggml's register-fragment layout were all slower or equal.
 
 ## 10. Memory and KV cache strategy
 

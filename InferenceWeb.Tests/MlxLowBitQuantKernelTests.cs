@@ -47,7 +47,11 @@ public class MlxLowBitQuantKernelTests
     [InlineData((int)GgmlTensorType.IQ1_M, 1)]
     [InlineData((int)GgmlTensorType.IQ1_M, 8)]
     [InlineData((int)GgmlTensorType.IQ1_M, 40)]
-    // Types with kernels before: their few-row and dequant-GEMM routes.
+    // Types with kernels before: the decode matvec, few-row and dequant-GEMM routes.
+    [InlineData((int)GgmlTensorType.IQ2_XXS, 1)]
+    [InlineData((int)GgmlTensorType.IQ2_S, 1)]
+    [InlineData((int)GgmlTensorType.IQ3_S, 1)]
+    [InlineData((int)GgmlTensorType.IQ3_XXS, 1)]
     [InlineData((int)GgmlTensorType.IQ2_XXS, 8)]
     [InlineData((int)GgmlTensorType.IQ2_XXS, 40)]
     [InlineData((int)GgmlTensorType.IQ2_S, 8)]

@@ -2309,46 +2309,51 @@ y[out_row * InDim + col] = static_cast<float>(d_half) * static_cast<float>(ls - 
         // bandwidth or scheduling.
 
         /// <summary>
-        /// Emit the decode matmul body for one IQ quant type.
-        /// <paramref name="blockBytes"/> is the GGUF super-block stride (256
-        /// weights per block for every type here), and the body relies on
-        /// the dispatch guard that InDim is a multiple of 256 - so every
-        /// 8-element group lands inside one super-block and starts on a
-        /// multiple of 8, which is what lets one codebook entry cover it.
+        /// Emit the decode matmul body for one IQ / low-bit K-quant type, on ggml-metal's mul_mv layout:
+        /// a threadgroup is 2 simdgroups, each owning 4 weight rows; lane l walks the 32-value sub-blocks
+        /// l, l + 32, ... of K, loads their 32 activations ONCE and dots them against all 4 rows (8 values
+        /// per <paramref name="dot8Helper"/> call). <paramref name="blockBytes"/> is the GGUF super-block
+        /// stride (256 weights per block for every type here), and the body relies on the dispatch guard
+        /// that InDim is a multiple of 256, so every 8-value group lands inside one super-block and starts
+        /// on a multiple of 8, which is what lets one codebook entry cover it.
+        /// The kernel this replaced gave every weight row its own 256-thread threadgroup, so each row
+        /// re-read the whole activation row (20 KB at K = 5120, 10x an IQ3_XXS row's own bytes) and ended
+        /// in a threadgroup barrier: Qwen3.8-27B-UD-IQ3_XXS decoded at 15.7 tok/s, now 20.5 (M5 Pro), the
+        /// rate of ggml_metal and llama.cpp on the same file.
+        /// Grid (64 x ceil(OutDim / 8), rows), threadgroup 64.
         /// </summary>
         private static string BuildIQuantMatmulSource(string dot8Helper, int blockBytes)
         {
-            string reduction = $@"
-float sum = 0.0f;
-for (int base_k = static_cast<int>(tid) * 8; base_k < InDim; base_k += 256 * 8) {{
-    int block_in_row = base_k >> 8;
-    int within_block = base_k & 255;
-    auto block = w + (out_col * BlocksPerRow + block_in_row) * {blockBytes};
-    int xbase = static_cast<int>(row_idx) * InDim + base_k;
-    float xv[8];
-    for (int j = 0; j < 8; ++j) {{
-        xv[j] = x[xbase + j];
-    }}
-    sum += {dot8Helper}(block, within_block, xv);
-}}";
-
             return $@"
-auto tid = thread_position_in_threadgroup.x;
-auto out_col = thread_position_in_grid.y;
-auto row_idx = thread_position_in_grid.z;
-auto simd_lane = tid & 31u;
-auto simd_id = tid >> 5;
-threadgroup float simd_partial[8];
-{reduction}
-
-float simd_total = simd_sum(sum);
-if (simd_lane == 0) simd_partial[simd_id] = simd_total;
-threadgroup_barrier(mem_flags::mem_threadgroup);
-float lane_v = simd_lane < 8u ? simd_partial[simd_lane] : 0.0f;
-float final_sum = simd_sum(lane_v);
-
-if (tid == 0) {{
-    y[row_idx * OutDim + out_col] = final_sum;
+const uint tid = thread_position_in_threadgroup.x;
+const uint lane = tid & 31u;
+const int row_idx = static_cast<int>(threadgroup_position_in_grid.y);
+const int first_col = (static_cast<int>(threadgroup_position_in_grid.x) * 2 + static_cast<int>(tid >> 5)) * 4;
+const int nb32 = InDim / 32;
+float sumf[4] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+const device float * xr = x + static_cast<long>(row_idx) * InDim;
+for (int ib32 = static_cast<int>(lane); ib32 < nb32; ib32 += 32) {{
+    float xv[32];
+    for (int j = 0; j < 32; ++j) {{
+        xv[j] = xr[ib32 * 32 + j];
+    }}
+    const int block_in_row = ib32 >> 3;
+    const int within = (ib32 & 7) * 32;
+    for (int r = 0; r < 4; ++r) {{
+        const int col = first_col + r;
+        if (col < OutDim) {{
+            auto block = w + (static_cast<long>(col) * BlocksPerRow + block_in_row) * {blockBytes};
+            sumf[r] += {dot8Helper}(block, within, xv) + {dot8Helper}(block, within + 8, xv + 8)
+                     + {dot8Helper}(block, within + 16, xv + 16) + {dot8Helper}(block, within + 24, xv + 24);
+        }}
+    }}
+}}
+for (int r = 0; r < 4; ++r) {{
+    const float total = simd_sum(sumf[r]);
+    const int col = first_col + r;
+    if (lane == 0u && col < OutDim) {{
+        y[static_cast<long>(row_idx) * OutDim + col] = total;
+    }}
 }}
 ";
         }
@@ -5112,41 +5117,7 @@ if (simd_id == 0) {
                 }
             }
 
-            return MlxWorker.Shared.Invoke(() =>
-            {
-                MlxFastMetalKernel kernel = EnsureIq2XxsMatmulKernel();
-                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
-                MlxVectorArray inputs = default;
-                MlxVectorArray outputs = default;
-                try
-                {
-                    AddTemplateInt(config, "InDim", inDim);
-                    AddTemplateInt(config, "OutDim", outDim);
-                    AddTemplateInt(config, "BlocksPerRow", inDim / 256);
-                    int[] shape = { rows, outDim };
-                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), "configuring IQ2_XXS matmul output");
-                    Check(mlx_fast_metal_kernel_config_set_grid(config, 256, outDim, rows), "configuring IQ2_XXS matmul grid");
-                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), "configuring IQ2_XXS matmul threadgroup");
-
-                    inputs = CreateVectorArray(input, rawWeight);
-                    outputs = mlx_vector_array_new();
-                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running IQ2_XXS matmul");
-                    if (mlx_vector_array_size(outputs) < 1)
-                        throw new InvalidOperationException("IQ2_XXS matmul produced no output.");
-
-                    Check(mlx_vector_array_get(out MlxArray result, outputs, 0), "reading IQ2_XXS matmul output");
-                    return result;
-                }
-                finally
-                {
-                    if (inputs.IsValid)
-                        _ = mlx_vector_array_free(inputs);
-                    if (outputs.IsValid)
-                        _ = mlx_vector_array_free(outputs);
-                    if (config.IsValid)
-                        _ = mlx_fast_metal_kernel_config_free(config);
-                }
-            });
+            return IQuantMatmul(input, rawWeight, rows, inDim, outDim, EnsureIq2XxsMatmulKernel, "IQ2_XXS");
         }
 
         // simdgroup_matrix-accelerated IQ2_XXS matmul. Grid is sized in
@@ -5647,8 +5618,8 @@ if (simd_id == 0) {
                     AddTemplateInt(config, "BlocksPerRow", inDim / 256);
                     int[] shape = { rows, outDim };
                     Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), $"configuring {label} matmul output");
-                    Check(mlx_fast_metal_kernel_config_set_grid(config, 256, outDim, rows), $"configuring {label} matmul grid");
-                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), $"configuring {label} matmul threadgroup");
+                    Check(mlx_fast_metal_kernel_config_set_grid(config, 64 * ((outDim + 7) / 8), rows, 1), $"configuring {label} matmul grid");
+                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1), $"configuring {label} matmul threadgroup");
 
                     inputs = CreateVectorArray(input, rawWeight);
                     outputs = mlx_vector_array_new();

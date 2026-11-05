@@ -985,56 +985,66 @@ TENSORSHARP_LOWBIT_DQ8(tensorsharp_dq8_iq1_m, tensorsharp_dequant_iq1_m)
     /// <summary>Input rows the few-row kernel takes per threadgroup (more rows: more threadgroups along z).</summary>
     private const int FewRowTile = 8;
 
-    // simdgroup_matrix tiles fed by the 8-value decoders: four simdgroups take 8 output columns each
-    // (32 per threadgroup) against up to 8 input rows. Per 64 K values the threadgroup stages the
+    // simdgroup_matrix tiles fed by the 8-value decoders: FewRowSimdgroups simdgroups take 8 output columns
+    // each against up to 8 input rows. Per 64 K values the threadgroup stages the
     // input rows once, every lane decodes 16 consecutive weights of one column with the dq8 helper
     // into its simdgroup's tile, and eight 8x8 multiply-accumulates follow. The tile precision keeps
     // what each row count had before: F32 below 8 rows (the F32 per-output kernel took them), F16 from
     // 8 rows (the F16 simdgroup kernel did; F16 operands verify 15% faster than F32 ones). The existing
     // simdgroup kernel decodes each weight with the per-element helper; scalar FMAs instead of the
     // matrix units made the first few-row kernels slower still.
-    private const int FewRowCols = 32;
+    // Eight simdgroups (64 output columns, 256 threads): the activation tile is staged once for twice the
+    // columns of four, and the 8-row IQ3_XXS verify step took 175 instead of 195 ms (M5 Pro). Sixteen are
+    // slower on F16 tiles (an 8-token forward 181 against 160 ms) and do not fit on F32 ones (38 KB of the
+    // 32 KB of threadgroup memory).
+    private const int FewRowSimdgroups = 8;
+    private const int FewRowCols = 8 * FewRowSimdgroups;
+    private const int FewRowThreads = 32 * FewRowSimdgroups;
 
     private static string BuildFewRowMatmulSource(string dq8, int blockBytes, bool half)
     {
         string t = half ? "half" : "float";
+        // K values per staged chunk (two threadgroup barriers each). Other chunks are not faster: an 8-token
+        // IQ3_XXS forward took 160 ms at 32 and at 64, 176 at 128, and 256 was slower still.
+        int kc = 64;
+        int seg = kc / 4, groups = seg / 8;
         return $$"""
 const int InDim = in_dim, OutDim = out_dim, InRows = in_rows, BlocksPerRow = in_dim / 256;
 const uint tid = thread_position_in_threadgroup.x;
 const uint lane = tid & 31u;
 const uint sg = tid >> 5;
-const int col_base = static_cast<int>(threadgroup_position_in_grid.y) * 32;
+const int col_base = static_cast<int>(threadgroup_position_in_grid.y) * {{8 * FewRowSimdgroups}};
 const int row0 = static_cast<int>(threadgroup_position_in_grid.z) * 8;
-threadgroup {{t}} X_tile[8 * 64];
-threadgroup {{t}} W_tile[4][8 * 64];
-threadgroup float C_out[4][8 * 8];
+threadgroup {{t}} X_tile[8 * {{kc}}];
+threadgroup {{t}} W_tile[{{FewRowSimdgroups}}][8 * {{kc}}];
+threadgroup float C_out[{{FewRowSimdgroups}}][8 * 8];
 simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-// This lane's column within its simdgroup's 8 and its 16 values of each 64-value chunk.
+// This lane's column within its simdgroup's 8 and its {{seg}} values of each {{kc}}-value chunk.
 const int my_col = col_base + static_cast<int>(sg) * 8 + static_cast<int>(lane >> 2);
-const int my_k = static_cast<int>(lane & 3u) * 16;
+const int my_k = static_cast<int>(lane & 3u) * {{seg}};
 const bool col_ok = my_col < OutDim;
 const device uchar * my_row = w + uint64_t(col_ok ? my_col : 0) * uint64_t(BlocksPerRow) * {{blockBytes}};
-for (int k0 = 0; k0 < InDim; k0 += 64) {
-    for (int i = static_cast<int>(tid); i < 8 * 64; i += 128) {
-        const int r = i >> 6, kk = i & 63;
-        X_tile[i] = (row0 + r < InRows) ? static_cast<{{t}}>(x[uint64_t(row0 + r) * uint64_t(InDim) + uint64_t(k0 + kk)]) : static_cast<{{t}}>(0.0f);
+for (int k0 = 0; k0 < InDim; k0 += {{kc}}) {
+    for (int i = static_cast<int>(tid); i < 8 * {{kc}}; i += {{32 * FewRowSimdgroups}}) {
+        const int r = i / {{kc}}, kk = i % {{kc}};
+        X_tile[i] = (row0 + r < InRows && k0 + kk < InDim) ? static_cast<{{t}}>(x[uint64_t(row0 + r) * uint64_t(InDim) + uint64_t(k0 + kk)]) : static_cast<{{t}}>(0.0f);
     }
-    for (int g = 0; g < 2; ++g) {
+    for (int g = 0; g < {{groups}}; ++g) {
         const int k = k0 + my_k + 8 * g;
         float wv[8];
-        if (col_ok) {
+        if (col_ok && k < InDim) {
             {{dq8}}(my_row + uint64_t(k >> 8) * {{blockBytes}}, k & 255, wv);
         } else {
             for (int j = 0; j < 8; ++j) wv[j] = 0.0f;
         }
-        threadgroup {{t}} * dst = &W_tile[sg][(lane >> 2) * 64 + my_k + 8 * g];
+        threadgroup {{t}} * dst = &W_tile[sg][(lane >> 2) * {{kc}} + my_k + 8 * g];
         for (int j = 0; j < 8; ++j) dst[j] = static_cast<{{t}}>(wv[j]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int kk = 0; kk < 64; kk += 8) {
+    for (int kk = 0; kk < {{kc}}; kk += 8) {
         simdgroup_{{t}}8x8 A, B;
-        simdgroup_load(A, X_tile + kk, 64);
-        simdgroup_load(B, W_tile[sg] + kk, 64, ulong2(0, 0), true);
+        simdgroup_load(A, X_tile + kk, {{kc}});
+        simdgroup_load(B, W_tile[sg] + kk, {{kc}}, ulong2(0, 0), true);
         simdgroup_multiply_accumulate(C, A, B, C);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1052,6 +1062,7 @@ for (int i = static_cast<int>(lane); i < 64; i += 32) {
 
 
     private static readonly System.Collections.Generic.Dictionary<string, MlxFastMetalKernel> fewRowKernels = new();
+
 
     private static MlxFastMetalKernel EnsureFewRowKernel(string label, string dq8, int blockBytes, string header, bool half)
     {
@@ -1098,8 +1109,8 @@ for (int i = static_cast<int>(lane); i < 64; i += 32) {
                     rowsArray = mlx_array_new_int(rows);
                     int[] shape = { rows, outDim };
                     Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), $"configuring {label} few-row matmul output");
-                    Check(mlx_fast_metal_kernel_config_set_grid(config, 128, (outDim + FewRowCols - 1) / FewRowCols, (rows + FewRowTile - 1) / FewRowTile), $"configuring {label} few-row matmul grid");
-                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1), $"configuring {label} few-row matmul threadgroup");
+                    Check(mlx_fast_metal_kernel_config_set_grid(config, FewRowThreads, (outDim + FewRowCols - 1) / FewRowCols, (rows + FewRowTile - 1) / FewRowTile), $"configuring {label} few-row matmul grid");
+                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, FewRowThreads, 1, 1), $"configuring {label} few-row matmul threadgroup");
                     inputs = CreateVectorArray(input, rawWeight, inDimArray, outDimArray, rowsArray);
                     outputs = mlx_vector_array_new();
                     Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), $"running {label} few-row matmul");
