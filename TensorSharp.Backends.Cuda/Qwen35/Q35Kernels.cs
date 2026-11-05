@@ -40,7 +40,7 @@ namespace TensorSharp.Cuda
         private static readonly bool PreparedGdnPrefill = Environment.GetEnvironmentVariable("TS_Q35_GDN_PREPARED_PREFILL") == "1";
         internal static bool GdnPreparedPrefillEnabled => PreparedGdnPrefill;
         internal long PreparedGdnLaunches { get; private set; }
-        private readonly IntPtr attnPrefill;
+        private readonly IntPtr attnPrefill, attnSplitPipe;
         private readonly int smemAttnPrefill;
         /// <summary>Prompt rows take ts_q35_attn_prefill_f32 (pipelined, short F16 accumulation runs; about 1.7x as fast)
         /// unless TS_Q35_ATTN_PREFILL=0 keeps them on ts_q35_attn_q8_f32.</summary>
@@ -105,6 +105,7 @@ namespace TensorSharp.Cuda
             attn = module.GetFunction("ts_q35_attn_q8_f32");
             attnPrefill = module.GetFunction("ts_q35_attn_prefill_f32");
             attnSplit = module.GetFunction("ts_q35_attn_q8_split_f32");
+            attnSplitPipe = module.GetFunction("ts_q35_attn_q8_split_pipe_f32");
             attnCombine = module.GetFunction("ts_q35_attn_combine_f32");
             argmax = module.GetFunction("ts_q35_argmax_f32");
             for (int n = 1; n <= GemvMaxRows; n++)
@@ -170,6 +171,7 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuFuncSetAttribute(gemm64SwiGlu, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem64).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(gemm128SwiGlu, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem128).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(attnPrefill, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smemAttnPrefill).ThrowOnError();
+            CudaDriverApi.cuFuncSetAttribute(attnSplitPipe, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smemAttnPrefill).ThrowOnError();
         }
 
         public static Q35Kernels Create()
@@ -425,6 +427,23 @@ namespace TensorSharp.Cuda
                 // a verify then draws exactly what plain steps of the same width draw.
                 var plan = GetSplitAttentionPlan(maxKeys);
                 int chunk = plan.Chunk, splits = plan.Splits;
+                if (DecodeAttentionPipelined)
+                {
+                    // The same key ranges on the prefill kernel's cp.async pipeline (one launch writes
+                    // the gated output when a single split covers every key).
+                    IntPtr p0 = q, p1 = gate, p2 = keyEnd, p3 = blockTable, p12 = partial, p13 = outRows;
+                    int p4 = maxBlocks, p7 = rowsPerSeq, p8 = nHead, p9 = nKv, p10 = splits, p11 = chunk;
+                    long p5 = kOff, p6 = vOff; float pscale = scale;
+                    void** sargs = stackalloc void*[] { &p0, &p1, &p2, &p3, &p4, &p5, &p6, &p7, &p8, &p9, &pscale, &p10, &p11, &p12, &p13 };
+                    Launch(attnSplitPipe, (uint)splits, (uint)nKv, (uint)nSeq, 256, smemAttnPrefill, stream, sargs);
+                    if (splits > 1)
+                    {
+                        IntPtr e0 = partial, e1 = gate, e3 = outRows; int e2 = splits;
+                        void** eargs = stackalloc void*[] { &e0, &e1, &e2, &e3 };
+                        Launch(attnCombine, (uint)(nSeq * rowsPerSeq * nHead), 1, 1, AttnHeadDim, 0, stream, eargs);
+                    }
+                    return;
+                }
                 IntPtr a0 = q, a1 = keyEnd, a2 = blockTable, a10 = partial;
                 int a3 = maxBlocks, a5 = rowsPerSeq, a6 = nHead, a7 = nKv, a9 = chunk; float a8 = scale; long a4 = kOff, a4v = vOff;
                 void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a4v, &a5, &a6, &a7, &a8, &a9, &a10 };
@@ -483,6 +502,9 @@ namespace TensorSharp.Cuda
         /// former cap of 64 left 61 splits (1.4 CTAs per SM) at 60K keys: long decode 135 tok/s there,
         /// 149 with 121 splits; 241 splits fell back to 134 (the partials cost more than they hide).</summary>
         private const int AttnSplitChunk = 128;
+        /// <summary>Decode and verify attention on the q8_0 route run the cp.async-pipelined kernel
+        /// (TS_Q35_DECODE_ATTN_PIPE=0: the synchronous split kernel). Same key ranges either way.</summary>
+        internal static readonly bool DecodeAttentionPipelined = Environment.GetEnvironmentVariable("TS_Q35_DECODE_ATTN_PIPE") != "0";
         internal const int AttnMaxSplits = 160;
         /// <summary>Split cap of the pipelined NInfer attention kernel (one CTA per SM) and of the
         /// partial buffer the NInfer route allocates.</summary>
