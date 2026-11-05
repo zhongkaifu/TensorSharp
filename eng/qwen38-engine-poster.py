@@ -9,8 +9,9 @@ the 1-lane runs for single-request measurements and the 2 / 4-lane runs for the 
 concurrent chats, so every measurement compares engines at the same lane count. The long-context
 tables show each lane count's own rows (<metric>@l<N>). The context JSON supplies what the evidence
 cannot: date, machine, per-engine setup rows, notes and the reasons behind results that did not run
-or ran slowly (per language). Writes REPORT_DIR/poster2_en.html and poster2_zh.html; render them at
-1600 px wide.
+or ran slowly (per language), and optionally "sticker", the path of an image (PNG with transparency)
+placed at the top left of the header, embedded so the page stays one file. Writes
+REPORT_DIR/poster2_en.html and poster2_zh.html; render them at 1600 px wide.
 
 Encoding: TensorSharp (both deployments: the NInfer .ninfer model and the GGUF model) is
 blue, the best value of each measurement gold, every other engine neutral gray; every bar
@@ -21,6 +22,7 @@ configuration that could not run shows its reason instead of a number.
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import json
 from pathlib import Path
@@ -184,6 +186,7 @@ table.q tr.ts td:first-child{color:var(--blue)} table.q td.tot{font-weight:700}
 table.st{width:100%;border-collapse:collapse;font-size:13px} table.st th{text-align:left;color:var(--ink2);border-bottom:1.5px solid var(--rule);padding:6px}
 table.st td{padding:6px;border-bottom:1px solid var(--rule);vertical-align:top} table.st tr.ts td{background:var(--blue-soft)}
 ul.nt{margin:0;padding-left:18px;font-size:13.5px;color:var(--ink2)} ul.nt li{margin:5px 0} ul.nt b{color:var(--ink)}
+.hdr.with-stk{grid-template-columns:auto 1fr 560px} .hdr .stk{height:236px;align-self:center;object-fit:contain;margin:-10px -4px -10px -12px}
 .foot{display:flex;justify-content:space-between;color:var(--muted);font-size:12.5px;margin-top:12px}
 .tg{font-size:10.5px;color:var(--muted);font-weight:400;margin-left:4px;letter-spacing:.02em} .tg.off{color:#a3541c}
 .speclegend{display:inline-block;margin-top:10px;font-size:14px;color:#ffd166;border:1px solid #4c5f82;border-radius:8px;padding:4px 10px}
@@ -533,6 +536,16 @@ def tldr(summary, lang, tail=""):
     return head + "Long context &mdash; " + "; ".join(parts) + ". " + tail
 
 
+def sticker_html(ctx):
+    """The context's optional sticker image as an embedded <img>; empty when there is none."""
+    path = ctx.get("sticker")
+    if not path:
+        return ""
+    data = base64.b64encode(Path(path).expanduser().read_bytes()).decode("ascii")
+    mime = "image/png" if str(path).lower().endswith(".png") else "image/jpeg"
+    return f'<img class="stk" src="data:{mime};base64,{data}" alt="">'
+
+
 def render(summary, ctx, lang):
     t = TXT[lang]
     c = ctx[lang]
@@ -545,9 +558,10 @@ def render(summary, ctx, lang):
     count = {"en": {4: "Four", 5: "Five", 6: "Six", 7: "Seven"}, "zh": {4: "四", 5: "五", 6: "六", 7: "七"}}[lang].get(others, str(others))
     title = t["title"].replace("Six", count) if lang == "en" else t["title"].replace("六", count)
     rank_sub = t["rank_sub"].format(n=len(summary["categories"]))
+    sticker = sticker_html(ctx)
     return f"""<!DOCTYPE html><html lang="{'zh-CN' if lang == 'zh' else 'en'}"><head><meta charset="utf-8"><title>{html.escape(title)}</title>
 <style>{CSS}</style></head><body><div class="page">
-<div class="hdr"><div><h1>{html.escape(title)}</h1><div class="meta">{html.escape(c['meta'])}</div><div class="speclegend">{html.escape(t['spec_legend'])}</div></div>
+<div class="hdr{' with-stk' if sticker else ''}">{sticker}<div><h1>{html.escape(title)}</h1><div class="meta">{html.escape(c['meta'])}</div><div class="speclegend">{html.escape(t['spec_legend'])}</div></div>
 <div class="tldr"><div class="h">{t['tldr']}</div>{tldr(summary, lang, c.get('tldr_tail', ''))}</div></div>
 <div class="row" style="grid-template-columns:1fr 1fr">
  <div class="card"><h2>{t['rank_g']}</h2><p class="sub">{html.escape(rank_sub)}</p>{ranking_block(summary, lang)}{excluded_block(ctx, lang)}{ts_compare(summary, lang)}</div>
