@@ -437,6 +437,14 @@ namespace TensorSharp.Server
             if (emitted.ToolCalls is { Count: > 0 } && string.IsNullOrWhiteSpace(clientContent)
                 && string.IsNullOrWhiteSpace(emittedContent))
                 return true;
+            // Prose before the calls ("I'll list the directory first.\n\n<tool_call>..."): the stream
+            // sends the blank line that separates them (and the newline between parallel calls) as
+            // content, the parser records the prose without it. Only the whitespace before the calls
+            // differs, so it is this turn; without this every such round re-prefilled everything after
+            // the shared prefix (agent loops on Qwen3.8: 0.27 s TTFT per round instead of 0.03 s).
+            if (emitted.ToolCalls is { Count: > 0 }
+                && string.Equals(clientContent.TrimEnd(), emittedContent.TrimEnd(), StringComparison.Ordinal))
+                return true;
             if (emitted.RawText != null
                 && string.Equals(clientContent, emitted.RawText, StringComparison.Ordinal))
                 return true;

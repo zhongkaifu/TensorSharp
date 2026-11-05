@@ -249,6 +249,36 @@ public class ModelServiceRawTokenHistoryTests
         Assert.Null(edited.InheritedScope);
     }
 
+    /// <summary>Prose before a tool call: the client echoes the prose with the blank line the
+    /// stream sent before the call, the parser recorded the prose without it. Still this turn;
+    /// different prose is not.</summary>
+    [Fact]
+    public void Augment_ProseBeforeToolCallWithEchoedTrailingBlankLine_StillSplices()
+    {
+        var store = NewStore();
+        var ask = new ChatMessage { Role = "user", Content = "What is the widget total?" };
+        List<ToolCall> Calls() => new()
+        {
+            new() { Id = "a", Name = "list_files", Arguments = new Dictionary<string, object> { ["directory"] = "/data" } },
+        };
+        store.Record(new List<ChatMessage> { ask }, Generated("I'll list the files first.\n\n<tool_call>..</tool_call>", new List<int> { 4, 5, 6 }),
+            Emitted("I'll list the files first.", toolCalls: Calls()), scope: "agent");
+
+        List<ChatMessage> Next(string content) => new()
+        {
+            new() { Role = "user", Content = ask.Content },
+            new() { Role = "assistant", Content = content, ToolCalls = Calls() },
+            new() { Role = "tool", Content = "orders.csv", ToolCallId = "a" },
+        };
+        var echoed = store.Augment(Next("I'll list the files first.\n\n"));
+        Assert.Equal(new[] { 4, 5, 6 }, echoed.History[1].RawOutputTokens);
+        Assert.Equal("agent", echoed.InheritedScope);
+
+        var edited = store.Augment(Next("I'll list the files, then read them.\n\n"));
+        Assert.Null(edited.History[1].RawOutputTokens);
+        Assert.Null(edited.InheritedScope);
+    }
+
     [Fact]
     public void Augment_UserMessageEdited_StopsSplicingAtEdit()
     {
