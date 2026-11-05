@@ -169,6 +169,57 @@ public sealed class InjectShortfallAccountingTests
     }
 
     [Fact]
+    public async Task ConcurrentArrivalsOnACachedPrefix_PrefillTheirSuffixesInOneBatchedForward_AndOutputsEqualCold()
+    {
+        // Two requests admitted in one step that both continue a cached prefix have no holder
+        // until each is bound and its prefix injected. The batched prefill takes only
+        // sequences whose holder sits at the chunk's position, so they used to prefill one
+        // after another (two chats on one 127K-token document: first tokens at 147 and
+        // 281 ms); the executor now binds them first and they share one batched forward.
+        int[] shared = Enumerable.Range(0, 3 * BlockSize).Select(i => 5 + (i * 19) % 80).ToArray();
+        int[] promptA = shared.Concat(new[] { 2, 3 }).ToArray();
+        int[] promptB = shared.Concat(new[] { 40, 41, 42 }).ToArray();
+        int[] promptD = shared.Concat(new[] { 50, 51, 52, 53 }).ToArray();
+        int[] promptC = Enumerable.Range(0, 10).Select(i => 60 + i).ToArray();
+        const int maxNew = 6, maxNewC = 120;
+        int[] coldB = await RunColdFusedAsync(promptB, maxNew);
+        int[] coldD = await RunColdFusedAsync(promptD, maxNew);
+        int[] coldC = await RunColdFusedAsync(promptC, maxNewC);
+
+        var model = new FusedHistoryHashModel { BatchPrefill = true };
+        using var engine = new InferenceEngine(model, FusedConfig(prefixCaching: true), NullLogger.Instance);
+        await RunAsync(engine, "a", promptA, maxNew: 4);
+
+        // c keeps the engine stepping; b and d arrive while one of its forwards is held, so
+        // the next step admits both.
+        int decodesBeforeC = model.DecodeForwards;
+        var c = new SequenceState("c", promptC.ToList(), maxNewC, BlockSize, SamplingConfig.Greedy, cacheScope: "other");
+        var hc = engine.SubmitRequest(c);
+        var until = DateTime.UtcNow.AddSeconds(20);
+        while (model.DecodeForwards - decodesBeforeC < 2 && DateTime.UtcNow < until)
+            await Task.Delay(1);
+        Assert.True(model.DecodeForwards - decodesBeforeC >= 2, "c never started decoding");
+
+        using var release = new SemaphoreSlim(0);
+        model.HoldNextForward(release);
+        Assert.True(model.Held.Wait(TimeSpan.FromSeconds(20)), "no forward was held");
+        var b = new SequenceState("b", promptB.ToList(), maxNew, BlockSize, SamplingConfig.Greedy, cacheScope: Conversation);
+        var d = new SequenceState("d", promptD.ToList(), maxNew, BlockSize, SamplingConfig.Greedy, cacheScope: Conversation);
+        var hb = engine.SubmitRequest(b);
+        var hd = engine.SubmitRequest(d);
+        release.Release();
+        var completions = await Task.WhenAll(hb.Completion, hd.Completion).WaitAsync(TimeSpan.FromSeconds(30));
+        await hc.Completion.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(3 * BlockSize, completions[0].PrefixCacheReusedTokens);
+        Assert.Equal(3 * BlockSize, completions[1].PrefixCacheReusedTokens);
+        Assert.Contains(model.BatchedPrefills, ids => ids.Contains("b") && ids.Contains("d"));
+        Assert.Equal(coldB, b.OutputTokens.ToArray());
+        Assert.Equal(coldD, d.OutputTokens.ToArray());
+        Assert.Equal(coldC, c.OutputTokens.ToArray());
+    }
+
+    [Fact]
     public async Task PerBlockCaptureModel_BacksOffToTheLastRestorableBlock_AndOutputEqualsCold()
     {
         // A recurrent model restores its running state from the LAST injected block.
@@ -518,8 +569,48 @@ public sealed class InjectShortfallAccountingTests
         public bool SupportsKVStateSnapshot => true;
         public string KVStateFingerprint => "fused-history-hash";
 
+        /// <summary>Batched prompt chunks over holders that sit at their chunk's position
+        /// (a fresh holder only at position 0), as the CUDA Qwen3.5 engine takes them.</summary>
+        public bool BatchPrefill { get; init; }
+        public bool BatchedPrefillTakesPrebound => BatchPrefill;
+        public List<string[]> BatchedPrefills { get; } = new();
+        public ManualResetEventSlim Held { get; } = new(false);
+        private SemaphoreSlim _hold;
+
+        /// <summary>The next forward signals <see cref="Held"/>, then waits for <paramref name="release"/>.</summary>
+        public void HoldNextForward(SemaphoreSlim release) => Volatile.Write(ref _hold, release);
+
+        public bool TryForwardBatchedFusedPrefill(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] positions,
+            float[][] outLogits)
+        {
+            if (!BatchPrefill)
+                return false;
+            lock (_gate)
+            {
+                for (int i = 0; i < requestIds.Count; i++)
+                    if (_holders.TryGetValue(requestIds[i], out var holder) ? holder.Count != positions[i] : positions[i] != 0)
+                        return false;
+                for (int i = 0; i < requestIds.Count; i++)
+                {
+                    if (!_holders.TryGetValue(requestIds[i], out var holder))
+                        _holders[requestIds[i]] = holder = new List<int>();
+                    holder.AddRange(tokens[i]);
+                    ulong h = Seed;
+                    for (int p = 0; p < holder.Count; p++) h = Fold(h, p, holder[p]);
+                    outLogits[i] = PeakLogits(h);
+                }
+                BatchedPrefills.Add(requestIds.ToArray());
+                return true;
+            }
+        }
+
         public float[] Forward(int[] tokens)
         {
+            if (Interlocked.Exchange(ref _hold, null) is { } hold)
+            {
+                Held.Set();
+                hold.Wait();
+            }
             lock (_gate)
             {
                 int position = _active.Count;

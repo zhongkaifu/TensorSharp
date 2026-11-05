@@ -121,7 +121,7 @@ namespace TensorSharp.Cuda
         private readonly Layer[] _layers;
         private readonly List<IntPtr> _owned = new List<IntPtr>();
         private IntPtr _tokEmbd, _output, _outputNorm;
-        private long _tokEmbdRowBytes, _outputRowBytes;
+        private long _tokEmbdRowBytes;
         private readonly int _sms;
         private readonly int _nAttn, _nGdn;
         private Slot _active;
@@ -274,11 +274,14 @@ namespace TensorSharp.Cuda
                     if (m.Ninfer != null)
                         _ninferHead = LoadNinferMatrix(loader, m.Ninfer.Head);
                     else
-                        _output = loader.Raw(m.Output, TQ6_K, out _outputRowBytes);
+                        _output = loader.Q6kTiled(m.Output);
                 }
                 CompleteNinferLoadRepack();
                 CompleteNinferFlashInferLoad();
                 _outputNorm = UploadF32(m.OutputNorm);
+                // Resolve the TMA GEMM entries now: the probe launches a kernel and allocates, which a
+                // stream capture (a verify graph wide enough for the TMA tiles) must not do.
+                _ = _k.NinferPrefillEpilogueAvailable;
                 AllocateScratch();
                 SetFeatureTaps(null);
                 _active = CreateSlot(InitialSlotTokens);
@@ -395,6 +398,32 @@ namespace TensorSharp.Cuda
                     row += w.Ne1;
                 }
                 return p;
+            }
+
+            /// <summary>The Q6_K LM head in the tiled layout its kernels stream (the same bytes, regrouped
+            /// per 64 rows and superblock at load; see Q35Kernels.GemvQ6kTiled).</summary>
+            public IntPtr Q6kTiled(in CudaWeightDesc w)
+            {
+                if (w.GgmlType != TQ6_K)
+                    throw new NotSupportedException($"[q35-cuda] {w.Name}: type {w.GgmlType}, expected {TQ6_K}");
+                int k = w.Ne0, rows = w.Ne1;
+                if (k % 256 != 0 || w.RowBytes != (long)k / 256 * 210)
+                    throw new NotSupportedException($"[q35-cuda] {w.Name}: Q6_K rows of {k} values in {w.RowBytes} bytes");
+                long bytes = Q35Kernels.Q6kTiledBytes(rows, k);
+                IntPtr dst = _e.Alloc(bytes);
+                // Rows past the last full tile read as zero.
+                CudaDriverApi.cuMemsetD8Async(dst, 0, new UIntPtr((ulong)bytes), _e.Stream).ThrowOnError();
+                int chunkRows = (int)Math.Max(1, StagingBytes / w.RowBytes);
+                for (int r0 = 0; r0 < rows; r0 += chunkRows)
+                {
+                    int n = Math.Min(chunkRows, rows - r0);
+                    long chunkBytes = n * w.RowBytes;
+                    Read(w, r0 * w.RowBytes, _host, chunkBytes);
+                    CudaDriverApi.cuMemcpyHtoD(_dev, _host, new UIntPtr((ulong)chunkBytes)).ThrowOnError();
+                    _e._k.RepackQ6kTiled(_dev, w.RowBytes, n, k, r0, dst, _e.Stream);
+                    _e.Sync();
+                }
+                return dst;
             }
 
             public IntPtr Raw(in CudaWeightDesc w, int type, out long rowBytes)
@@ -963,7 +992,7 @@ namespace TensorSharp.Cuda
                 {
                     _k.AddRmsNormNvfp4(_x, _block, L.PostNorm, _m.Eps, _fp4c, _fp4s, _fp4r, e, n, Stream);
                     _k.GemmW4A4(L.GateUp.Codes, L.GateUp.Scales, L.GateUp.Rows, L.GateUp.K, _fp4c, _fp4s, _fp4r, n, 1.0f, _act,
-                        _partial, _counters, _sms, 1, Stream, swiglu: true);
+                        _partial, _counters, _sms, 1, Stream, swiglu: true, tma: true);
                     RecordProjectionDispatch("GateUp", "NVFP4_W4A4", 0, n);
                 }
                 else
@@ -1062,7 +1091,7 @@ namespace TensorSharp.Cuda
             else
             {
                 _k.QuantizeQ81(normed, _q8, _q8d, e, rows, Stream);
-                _k.GemvQ6k(_output, _outputRowBytes, _m.NVocab, e, _q8, _q8d, _logits, rows, Stream);
+                _k.GemvQ6kTiled(_output, _m.NVocab, e, _q8, _q8d, _logits, rows, Stream);
             }
             if (argmaxOut != null)
                 _k.Argmax(_logits, rows, _m.NVocab, _argmax, Stream);
@@ -1094,7 +1123,8 @@ namespace TensorSharp.Cuda
         private void GemmQuantized(in Planes w, IntPtr output, int n)
         {
             int maxSplits = n <= 64 ? 8 : 1;
-            _k.GemmW4A4(w.Codes, w.Scales, w.Rows, w.K, _fp4c, _fp4s, _fp4r, n, 1.0f, output, _partial, _counters, _sms, maxSplits, Stream);
+            _k.GemmW4A4(w.Codes, w.Scales, w.Rows, w.K, _fp4c, _fp4s, _fp4r, n, 1.0f, output, _partial, _counters, _sms, maxSplits, Stream,
+                tma: true);
         }
 
         private IntPtr _a8K, _a8Ks, _a8Vt, _a8Vs;
@@ -1108,6 +1138,15 @@ namespace TensorSharp.Cuda
                && g.RowsPerSeq * (_m.NHead / _m.NKvHead) > Q35Kernels.AttnBlockRows
                && maxKeys >= Q35Kernels.Attn8MinKeys && maxKeys <= Attn8Capacity
                && _m.NHead == 24 && _m.NKvHead == 4 && _m.HeadDim == Q35Kernels.AttnHeadDim;
+
+        /// <summary>Whether the 8-bit prompt attention's CTAs (128 query rows of one KV head each, every
+        /// visible key, no key split) cover enough of the device to beat the 16-bit kernels, which split
+        /// the keys of a short chunk across it (both routes). RTX 5090, a session turn's 47-token chunk
+        /// over a 127K-token cache: 8 CTAs at 5.3 ms a layer, after 0.65 ms converting the band; that
+        /// turn's first token 140 -> 50 ms. From about 40% of the SMs (about 350 rows) the 8-bit
+        /// tensor cores' double rate wins.</summary>
+        private bool Attn8FillsDevice(in RowGroup g)
+            => (long)((g.RowsPerSeq * (_m.NHead / _m.NKvHead) + 127) / 128) * _m.NKvHead * 5 >= 2L * _sms;
 
         private static readonly bool Attn8Check = Environment.GetEnvironmentVariable("TS_Q35_ATTN8_CHECK") == "1";
 
@@ -1216,7 +1255,7 @@ namespace TensorSharp.Cuda
             _k.AttnPrep(_proj + (nint)((long)r0 * AttnProjWidth * 4), n, g.RowsPerSeq, _m.NHead, _m.NKvHead, L.QNorm, L.KNorm, _m.Eps,
                 _ropePosDev + (nint)(4L * r0), RowCap, _m.SectT, _m.SectH, _m.SectW, _m.RopeBase, _cacheRowDev + (nint)(4L * r0), tab,
                 _maxBlocks, kOff, vOff, _q + qOff, _gate + qOff, Stream);
-            if (UsesAttn8(g, maxKeys) && TryEnsureAttn8Band(maxKeys, out int cap))
+            if (UsesAttn8(g, maxKeys) && Attn8FillsDevice(g) && TryEnsureAttn8Band(maxKeys, out int cap))
             {
                 // 8-bit prompt attention: the visible keys once into the band, then INT8 QK / E4M3 PV.
                 _k.Attn8Band(Q35Kernels.Attn8Cache.Q8, tab, kOff, vOff, maxKeys, cap, _m.NKvHead, _a8K, _a8Ks, _a8Vt, _a8Vs, Stream);

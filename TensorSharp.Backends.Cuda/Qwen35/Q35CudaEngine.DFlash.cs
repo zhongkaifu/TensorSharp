@@ -492,7 +492,7 @@ namespace TensorSharp.Cuda
             // Both head policies leave these Q81 inputs live for the selector's
             // immediately following DMatMul(_dSelHidden), which consumes _dQ8/_dQ8d.
             DQuant(_dH2, e, lanes * g);
-            _k.GemmQuant(TQ6_K, _output, _outputRowBytes, _m.NVocab, e, _dQ8, _dQ8d, lanes * g, _dLogits, false, Stream);
+            _k.GemvQ6kTiled(_output, _m.NVocab, e, _dQ8, _dQ8d, _dLogits, lanes * g, Stream);
             _k.TopK(_dLogits, lanes * g, _m.NVocab, _d.SelTopK, _dCand, _dUnary, Stream, _dTopPartialIdx, _dTopPartialVal);
             DMatMul(_dSelHidden, _dSel, lanes * g);
             _k.DfSelect(_dCand, _dUnary, _dSel, _dSelPred.W, _dSelSucc.W, _dSelPred.RowBytes, anchorDev, lanes, g, _d.SelTopK,

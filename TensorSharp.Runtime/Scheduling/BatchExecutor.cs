@@ -1478,6 +1478,9 @@ namespace TensorSharp.Runtime.Scheduling
             // per-sequence loop below.
             if (options.BatchedFusedDecodeEnabled && n >= 2)
             {
+                PrebindCachedPrefixPrefills(fused, output, results, ref handledBatched);
+                if (handledBatched != null && handledBatched.Count == n)
+                    return results;
                 var prefillWork = new List<ScheduledSequenceWork>(n);
                 foreach (var work in output.ScheduledWork)
                 {
@@ -1842,6 +1845,68 @@ namespace TensorSharp.Runtime.Scheduling
             if (freshCache && seq.NumComputedTokens > 0)
                 InjectPrefixOrRecompute(seq, seq.NumComputedTokens);
             return true;
+        }
+
+        /// <summary>
+        /// Binds the holders of the step's prompt chunks that continue a cached prefix (the radix,
+        /// a shared-prefix checkpoint, the live cache) but have no holder yet, injecting the prefix
+        /// and taking the reservation as the per-sequence loop does, so they can join the batched
+        /// prefill, which takes only sequences whose holder sits at the chunk's position. These ran
+        /// one after another before: concurrent chats on one cached document (RTX 5090, Qwen3.8
+        /// 27B, two chats on a 127K-token document: 47-token suffixes, first tokens at 147 and
+        /// 281 ms). Only when at least two chunks would then batch; a sequence whose step ends
+        /// while binding goes to <paramref name="handled"/>.
+        /// </summary>
+        private void PrebindCachedPrefixPrefills(IBatchedPagedModel fused, SchedulerOutput output,
+            List<SequenceStepResult> results, ref HashSet<string>? handled)
+        {
+            List<ScheduledSequenceWork>? pending = null;
+            int ready = 0;
+            foreach (var work in output.ScheduledWork)
+            {
+                var seq = work.Sequence;
+                if (!work.IsPrefill || (handled != null && handled.Contains(seq.RequestId))
+                    || (_model.MultimodalInjector != null && _model.MultimodalInjector.HasPendingEmbeddings(seq.RequestId)))
+                    continue;
+                if (_pendingRetainedFusedTruncations.TryGetValue(seq.RequestId, out int rewindTo))
+                {
+                    if (fused.BatchedPrefillRewindsHolders && rewindTo == seq.NumComputedTokens)
+                        ready++;
+                    continue;
+                }
+                if (fused.HasFusedSequenceCache(seq.RequestId) || (seq.NumComputedTokens == 0 && !seq.UsesLiveCacheContinuation))
+                    ready++;
+                else
+                    (pending ??= new List<ScheduledSequenceWork>()).Add(work);
+            }
+            if (pending == null || ready + pending.Count < 2 || !fused.BatchedPrefillTakesPrebound)
+                return;
+            foreach (var work in pending)
+            {
+                var seq = work.Sequence;
+                int prevComputed = seq.NumComputedTokens;
+                try
+                {
+                    if (BindFusedHolder(fused, seq, results))
+                    {
+                        BuildPrefillChunk(seq, work);   // only its reservation: the chunk is taken again below
+                        continue;
+                    }
+                }
+                catch (SequenceSlotUnavailableException ex) when (seq.NumComputedTokens == prevComputed
+                                                                   && !fused.HasFusedSequenceCache(seq.RequestId))
+                {
+                    _logger.LogDebug("No sequence slot for {RequestId} yet: {Reason}", seq.RequestId, ex.Message);
+                    results.Add(new SequenceStepResult { Sequence = seq, SlotUnavailable = true });
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Fused per-seq step failed for sequence {RequestId}", seq.RequestId);
+                    results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
+                    seq.Error = ex;
+                }
+                (handled ??= new HashSet<string>(StringComparer.Ordinal)).Add(seq.RequestId);
+            }
         }
 
         private List<SequenceStepResult> ExecuteStepPerSequence(SchedulerOutput output)
@@ -4291,6 +4356,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// first step): the model rewinds such a holder to <c>positions[i]</c> itself, which must then be
         /// exact. Default false: those requests prefill in the per-sequence loop, one after another.</summary>
         bool BatchedPrefillRewindsHolders => false;
+
+        /// <summary>Whether <see cref="TryForwardBatchedFusedPrefill"/> takes a request whose holder the
+        /// executor created and filled from a cached prefix earlier in the same step (bound, injected,
+        /// reserved, not yet forwarded). The executor then binds such requests before the batched
+        /// prefill instead of leaving each to the per-sequence loop. Default false.</summary>
+        bool BatchedPrefillTakesPrebound => false;
     }
 
     /// <summary>Per-step metadata for the batched paged attention path.

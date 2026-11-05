@@ -17,9 +17,10 @@ namespace TensorSharp.Cuda;
 internal sealed unsafe partial class Q35Kernels
 {
     internal enum NinferPrefillEpilogue { Plain = 0, Round = 1, SwiGluRoundedInputs = 2, SwiGlu = 3 }
-    private const int SwiGluQuantRoundedInputs = 4, SwiGluQuant = 5;
-    private const int NinferTmaEpilogueCount = 6;
-    private static readonly string[] NinferTmaEpilogues = { "plain", "round", "swiglu_rin", "swiglu", "swiglu_rin_q", "swiglu_q" };
+    private const int SwiGluQuantRoundedInputs = 4, SwiGluQuant = 5, GgufSwiGlu = 6;
+    private const int NinferTmaEpilogueCount = 7;
+    // Entry suffixes: the NInfer epilogues, then the GGUF route's F32 SwiGLU (ts_q35_gemm_w4a4_<bn>_swiglu's).
+    private static readonly string[] NinferTmaEpilogues = { "ni_plain", "ni_round", "ni_swiglu_rin", "ni_swiglu", "ni_swiglu_rin_q", "ni_swiglu_q", "gguf_swiglu" };
     // [token tile: 0 = 256, 1 = 128][epilogue]
     private readonly IntPtr[][] _niTma = new IntPtr[2][];
     private readonly int[] _niTmaSmem = new int[2 * NinferTmaEpilogueCount];
@@ -47,7 +48,7 @@ internal sealed unsafe partial class Q35Kernels
                     {
                         _niTma[b] = new IntPtr[NinferTmaEpilogueCount];
                         for (int e = 0; e < NinferTmaEpilogueCount; e++)
-                            _niTma[b][e] = module.GetFunction($"ts_q35_gemm_w4a4_tma{(b == 0 ? 256 : 128)}_ni_{NinferTmaEpilogues[e]}");
+                            _niTma[b][e] = module.GetFunction($"ts_q35_gemm_w4a4_tma{(b == 0 ? 256 : 128)}_{NinferTmaEpilogues[e]}");
                     }
                     CudaDriverApi.cuMemAlloc(out IntPtr probe, new UIntPtr(16)).ThrowOnError();
                     try
@@ -94,6 +95,15 @@ internal sealed unsafe partial class Q35Kernels
         IntPtr rowScale, int m, float alpha, IntPtr y, NinferPrefillEpilogue epilogue, IntPtr stream)
         => LaunchNinferTma((int)epilogue, wCodes, wScales, outDim, k, xCodes, xScales, rowScale, m, alpha, y,
             IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0f, stream);
+
+    /// <summary>The GGUF route's prefill GEMMs (m &gt;= 65 rows, one K pass) on the TMA tiles: y = alpha *
+    /// rowScale * (x W^T), or for <paramref name="swiglu"/> the F32 FFN activation silu(gate) * up of
+    /// the interleaved gate|up planes - the arithmetic of ts_q35_gemm_w4a4_128(_swiglu), with the same
+    /// K64 MMA sequence per output (bit-identical).</summary>
+    internal void GemmW4A4Tma(IntPtr wCodes, IntPtr wScales, int outDim, int k, IntPtr xCodes, IntPtr xScales,
+        IntPtr rowScale, int m, float alpha, IntPtr y, bool swiglu, IntPtr stream)
+        => LaunchNinferTma(swiglu ? GgufSwiGlu : (int)NinferPrefillEpilogue.Plain, wCodes, wScales, outDim, k, xCodes, xScales,
+            rowScale, m, alpha, y, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0f, stream);
 
     /// <summary>gate|up projection whose epilogue computes the BF16 SwiGLU activation and
     /// quantizes it to NVFP4 (codes, E4M3 group scales, row scale 1) with the down

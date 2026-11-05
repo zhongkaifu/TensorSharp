@@ -761,6 +761,10 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>A holder the executor bound and filled from a cached prefix is a slot at that
+        /// prefix's length, which <see cref="TryForwardBatchedFusedPrefill"/> takes like any other.</summary>
+        public bool BatchedPrefillTakesPrebound => true;
+
         /// <summary>
         /// Concurrent prompt chunks in shared forwards (padded to the longest chunk of each group),
         /// so prefilling sequences share every weight read; a request without a slot gets a fresh one.

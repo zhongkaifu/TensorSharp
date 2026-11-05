@@ -34,7 +34,7 @@ namespace TensorSharp.Cuda
 
         private const int Block = 256;
         private readonly CudaModule module;
-        private readonly IntPtr repack, quantQ81, quantNvfp4, quantSwiGluNvfp4, normNvfp4, embed, addNorm, addNorm5120, attnPrep, gateMul, swiglu;
+        private readonly IntPtr repack, quantQ81, quantNvfp4, quantSwiGluNvfp4, normNvfp4, normNvfp4_5120, embed, addNorm, addNorm5120, attnPrep, gateMul, swiglu;
         private readonly IntPtr gdnConv, gdnConvState, gdnPrep, gdnScan, gdnScanVerify, gdnReplay, gdnChunk, gdnOut, copyRows, attn, attnSplit, attnCombine, argmax;
         private readonly IntPtr gdnPrepareQk, gdnPrepareControl, gdnChunkPrepared;
         private static readonly bool PreparedGdnPrefill = Environment.GetEnvironmentVariable("TS_Q35_GDN_PREPARED_PREFILL") == "1";
@@ -51,8 +51,10 @@ namespace TensorSharp.Cuda
         // reduction policy unless explicitly disabled; atomic draft split-K is not bit stable.
         private static readonly bool DraftSplitK = Environment.GetEnvironmentVariable("TS_Q35_DRAFT_SPLITK") != "0";
         private readonly IntPtr[] gemv = new IntPtr[GemvMaxRows + 1];
-        private readonly IntPtr[] gemvQ6k = new IntPtr[2];
-        private readonly IntPtr gemmQ6k16, gemmQ6k32, gemmQ6k64;
+        // The LM head on its tiled Q6_K layout (ts_q35_repack_q6k_tiled): one-row GEMV, then 8/16/32/64-row GEMMs.
+        private readonly IntPtr repackQ6kTiled, gemvQ6kTiled;
+        private readonly IntPtr[] gemmQ6kTiled = new IntPtr[4];
+        private readonly int[] smemQ6kTiled = new int[4];
         private readonly IntPtr[] mmaQ4k = new IntPtr[4], mmaQ6k = new IntPtr[4];   // 8, 16, 32, 64 rows
         private readonly IntPtr rowsByIndex, dfPrep, dfAttn, dfCombine, dfConv, dfGather, topk, dfSelect;
         private readonly IntPtr topkPartial, topkMerge;
@@ -64,6 +66,8 @@ namespace TensorSharp.Cuda
         public const int DraftHeadDim = 128;
         /// <summary>Activation rows one Q6_K launch takes (the LM head over a verify window).</summary>
         public const int Q6kMaxRows = 64;
+        /// <summary>Weight rows per tile of the tiled Q6_K head (TS_Q35_Q6KT_ROWS) and bytes per tile and superblock.</summary>
+        public const int Q6kTileRows = 64, Q6kTileChunkBytes = 13440;
         private readonly int[] gemvRows = new int[GemvMaxRows + 1];
         private readonly IntPtr gemm32, gemm64, gemm128, gemm32SwiGlu, gemm64SwiGlu, gemm128SwiGlu;
         private readonly int smem32, smem64, smem128;
@@ -81,6 +85,7 @@ namespace TensorSharp.Cuda
             quantNvfp4 = module.GetFunction("ts_q35_quantize_nvfp4_f32");
             quantSwiGluNvfp4 = module.GetFunction("ts_q35_quantize_swiglu_nvfp4_f32");
             normNvfp4 = module.GetFunction("ts_q35_add_rmsnorm_nvfp4_f32");
+            normNvfp4_5120 = module.GetFunction("ts_q35_add_rmsnorm_nvfp4_5120_f32");
             embed = module.GetFunction("ts_q35_embed_q4_0");
             addNorm = module.GetFunction("ts_q35_add_rmsnorm_f32");
             addNorm5120 = module.GetFunction("ts_q35_add_rmsnorm_5120_f32");
@@ -110,7 +115,10 @@ namespace TensorSharp.Cuda
             argmax = module.GetFunction("ts_q35_argmax_f32");
             for (int n = 1; n <= GemvMaxRows; n++)
                 gemv[n] = module.GetFunction($"ts_q35_gemv_nvfp4_{n}");
-            gemvQ6k[1] = module.GetFunction("ts_q35_gemv_q6k_1");
+            repackQ6kTiled = module.GetFunction("ts_q35_repack_q6k_tiled");
+            gemvQ6kTiled = module.GetFunction("ts_q35_gemv_q6kt_1");
+            for (int i = 0; i < 4; i++)
+                gemmQ6kTiled[i] = module.GetFunction($"ts_q35_gemm_q6kt_{1 << i}");
             for (int i = 0; i < 4; i++)
             {
                 mmaQ4k[i] = module.GetFunction($"ts_q35_gemm_q4k_{1 << i}");
@@ -126,9 +134,6 @@ namespace TensorSharp.Cuda
             topkPartial = module.GetFunction("ts_q35_topk_partial_f32");
             topkMerge = module.GetFunction("ts_q35_topk_merge_f32");
             dfSelect = module.GetFunction("ts_q35_df_select");
-            gemmQ6k16 = module.GetFunction("ts_q35_gemm_q6k_2");
-            gemmQ6k32 = module.GetFunction("ts_q35_gemm_q6k_4");
-            gemmQ6k64 = module.GetFunction("ts_q35_gemm_q6k_8");
             gemm32 = module.GetFunction("ts_q35_gemm_w4a4_32");
             gemm64 = module.GetFunction("ts_q35_gemm_w4a4_64");
             gemm128 = module.GetFunction("ts_q35_gemm_w4a4_128");
@@ -155,6 +160,10 @@ namespace TensorSharp.Cuda
                 Launch(module.GetFunction("ts_q35_attn_smem_bytes"), 1, 1, 1, 1, 0, IntPtr.Zero, args);
                 CudaDriverApi.cuMemcpyDtoH((IntPtr)host, probe, new UIntPtr(4)).ThrowOnError();
                 smemAttnPrefill = host[0];
+                Launch(module.GetFunction("ts_q35_gemm_q6kt_smem_bytes"), 1, 1, 1, 1, 0, IntPtr.Zero, args);
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)host, probe, new UIntPtr(4 * 4)).ThrowOnError();
+                for (int i = 0; i < 4; i++)
+                    smemQ6kTiled[i] = host[i];
             }
             finally
             {
@@ -172,6 +181,8 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuFuncSetAttribute(gemm128SwiGlu, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem128).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(attnPrefill, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smemAttnPrefill).ThrowOnError();
             CudaDriverApi.cuFuncSetAttribute(attnSplitPipe, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smemAttnPrefill).ThrowOnError();
+            for (int i = 0; i < 4; i++)
+                CudaDriverApi.cuFuncSetAttribute(gemmQ6kTiled[i], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smemQ6kTiled[i]).ThrowOnError();
         }
 
         public static Q35Kernels Create()
@@ -305,7 +316,11 @@ namespace TensorSharp.Cuda
         {
             IntPtr a0 = x, a1 = delta, a2 = w, a4 = codes, a5 = scales, a6 = rowScale; float a3 = eps; int a7 = k;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
-            Launch(normNvfp4, (uint)rows, 1, 1, 512, QuantSmem(k), stream, args);
+            // Width 5120 keeps the row in registers (static shared memory): bit-identical output.
+            if (k == 5120)
+                Launch(normNvfp4_5120, (uint)rows, 1, 1, 512, 0, stream, args);
+            else
+                Launch(normNvfp4, (uint)rows, 1, 1, 512, QuantSmem(k), stream, args);
         }
 
         /// <summary>NVFP4 planes of silu(gate) * up for fused gate|up rows [rows][2k] (the down
@@ -326,27 +341,41 @@ namespace TensorSharp.Cuda
             Launch(gemv[n], CeilDiv(outDim, perBlock), 1, 1, 128, 0, stream, args);
         }
 
-        /// <summary>y[n, outDim] = xq[n] W^T for a Q6_K weight: the dp4a GEMV for one row, the int8
-        /// tensor-core kernel for up to <see cref="Q6kMaxRows"/> per launch above that (the GEMV
-        /// re-reads every activation row per weight row and falls far behind at 8).</summary>
-        public void GemvQ6k(IntPtr w, long rowBytes, int outDim, int k, IntPtr xq, IntPtr xd, IntPtr y, int n, IntPtr stream)
+        /// <summary>Bytes of a Q6_K matrix in the tiled head layout (whole 64-row tiles).</summary>
+        public static long Q6kTiledBytes(int rows, int k)
+            => (long)((rows + Q6kTileRows - 1) / Q6kTileRows) * (k / 256) * Q6kTileChunkBytes;
+
+        /// <summary>rows Q6_K rows as stored ([rows][srcRowBytes]) into the tiled head layout at rowBase.</summary>
+        public void RepackQ6kTiled(IntPtr src, long srcRowBytes, int rows, int k, int rowBase, IntPtr dst, IntPtr stream)
+        {
+            IntPtr a0 = src, a5 = dst; long a1 = srcRowBytes; int a2 = rows, a3 = k, a4 = rowBase;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
+            Launch(repackQ6kTiled, CeilDiv((long)rows * (k / 256), Block), 1, 1, Block, 0, stream, args);
+        }
+
+        /// <summary>y[n, outDim] = xq[n] W^T for the tiled Q6_K head: the dp4a GEMV for one row, the int8
+        /// tensor-core kernel for up to <see cref="Q6kMaxRows"/> per launch above that. The logits equal
+        /// those of the raw-superblock kernels bit for bit (same products, same accumulation order).</summary>
+        public void GemvQ6kTiled(IntPtr w, int outDim, int k, IntPtr xq, IntPtr xd, IntPtr y, int n, IntPtr stream)
         {
             if (n == 1)
             {
-                IntPtr a0 = w, a4 = xq, a5 = xd, a6 = y; long a1 = rowBytes; int a2 = outDim, a3 = k;
-                void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6 };
-                Launch(gemvQ6k[1], CeilDiv(outDim, 4), 1, 1, 128, 0, stream, args);
+                IntPtr a0 = w, a3 = xq, a4 = xd, a5 = y; int a1 = outDim, a2 = k;
+                void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
+                Launch(gemvQ6kTiled, CeilDiv(outDim, 4), 1, 1, 128, 0, stream, args);
                 return;
             }
+            IntPtr b0 = w, b3 = IntPtr.Zero, b4 = IntPtr.Zero, b6 = IntPtr.Zero; int b1 = outDim, b2 = k, b5 = 0;
+            void** gargs = stackalloc void*[] { &b0, &b1, &b2, &b3, &b4, &b5, &b6 };
             for (int r0 = 0; r0 < n; r0 += Q6kMaxRows)
             {
                 int rows = Math.Min(Q6kMaxRows, n - r0);
-                IntPtr fn = rows <= 8 ? mmaQ6k[0] : rows <= 16 ? gemmQ6k16 : rows <= 32 ? gemmQ6k32 : gemmQ6k64;
-                // One split (gridDim.y = 1): the LM head has row tiles to spare.
-                IntPtr a0 = w, a4 = xq + (nint)((long)r0 * k), a5 = xd + (nint)((long)r0 * (k / 32) * 4), a7 = y + (nint)((long)r0 * outDim * 4);
-                long a1 = rowBytes; int a2 = outDim, a3 = k, a6 = rows;
-                void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
-                Launch(fn, CeilDiv(outDim, 64), 1, 1, 128, 0, stream, args);
+                int i = rows <= 8 ? 0 : rows <= 16 ? 1 : rows <= 32 ? 2 : 3;
+                b3 = xq + (nint)((long)r0 * k);
+                b4 = xd + (nint)((long)r0 * (k / 32) * 4);
+                b5 = rows;
+                b6 = y + (nint)((long)r0 * outDim * 4);
+                Launch(gemmQ6kTiled[i], CeilDiv(outDim, Q6kTileRows), 1, 1, 128, smemQ6kTiled[i], stream, gargs);
             }
         }
 
@@ -357,15 +386,27 @@ namespace TensorSharp.Cuda
         /// activation silu(gate) * up (never split over K).</param>
         public void GemmW4A4(IntPtr wCodes, IntPtr wScales, int outDim, int k, IntPtr xCodes, IntPtr xScales, IntPtr rowScale,
             int m, float alpha, IntPtr y, IntPtr partial, IntPtr counters, int sms, int maxSplits, IntPtr stream,
-            bool swiglu = false, bool ninferVerify8 = false)
+            bool swiglu = false, bool ninferVerify8 = false, bool tma = false)
         {
             _gemmWorkSubmitted = true;
             if (swiglu || !SplitK)
                 maxSplits = 1;
+            // Prompt chunks of the GGUF route: the TMA-fed tiles (same products, same order; 8K / 64K TTFT in
+            // eng/validation) when the image has them and the planes fit.
+            if (tma && maxSplits == 1 && m >= NinferPrefillEpilogueMinRows && NinferPrefillEpilogueAvailable
+                && NinferPrefillEpilogueFits(wCodes, wScales, outDim, k) && ((xCodes | xScales) & 15) == 0)
+            {
+                GemmW4A4Tma(wCodes, wScales, outDim, k, xCodes, xScales, rowScale, m, alpha, y, swiglu, stream);
+                return;
+            }
             int bn = m <= 32 ? 32 : m <= 64 ? 64 : 128;
             int tilesX = (outDim + GemmTileRows - 1) / GemmTileRows, tilesY = (m + bn - 1) / bn;
+            // Split K as far as the CTAs still fit one wave (one CTA per SM at these tiles): a second,
+            // partly filled wave costs more than the extra splits save. RTX 5090, 32 rows: the 129-tile
+            // GDN input projection 38.1 us at 2 splits, 30.6 us unsplit; the 40-tile output projection
+            // 18.1 us at 8 splits, 14.3 us at 4.
             int stages = k / GemmStageK, splits = 1;
-            while (tilesX * tilesY * splits < sms && splits * 2 <= stages / 2 && splits * 2 <= maxSplits)
+            while (tilesX * tilesY * splits * 2 <= sms && splits * 2 <= stages / 2 && splits * 2 <= maxSplits)
                 splits *= 2;
             IntPtr a0 = wCodes, a1 = wScales, a4 = xCodes, a5 = xScales, a6 = rowScale, a9 = y, a10 = partial, a11 = counters;
             int a2 = outDim, a3 = k, a7 = m; float a8 = alpha;
