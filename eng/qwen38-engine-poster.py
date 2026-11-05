@@ -42,11 +42,11 @@ TXT = {
         "kv": "KV cache", "drafter": "Drafter", "lower": "lower is better", "higher": "higher is better",
         "tldr": "TL;DR", "na": "n/a", "s": "s", "toks": "tok/s",
         "prompt": "prompt", "gen": "generated", "req": "requests", "total": "Total",
-        "long": "Long Context: 64K and 128K", "long_sub": "The longest prompts and the longest decodes of the campaign. Prefill = time to the first token of one long document (one request, single lane); decode = tok/s of a 512-token answer generated after the document (speculative decoding as served)",
+        "long": "Long Context: 64K, 128K and 256K", "long_sub": "The longest prompts and the longest decodes of the campaign. Prefill = time to the first token of one long document (one request, single lane); decode = tok/s of a 512-token answer generated after the document (speculative decoding as served)",
         "cmp": "TensorSharp: GGUF model vs NInfer model", "cmp_sub": "Same engine build and harness; bold = the better of the two",
         "cmp_rows": {"overall": "Overall score", "quality": "Quality (checks passed)", "ttft_63k": "Prefill 64K (s)", "ttft_127k": "Prefill 128K (s)",
                      "decode_gen": "Decode, speculative (tok/s)", "decode_nospec": "Decode, plain (tok/s)", "ld_60000": "Decode after 64K (tok/s)",
-                     "ld_120000": "Decode after 128K (tok/s)", "par4_tok_s": "4 concurrent requests (tok/s)", "agent_e2e": "Agentic tool loop (s)"},
+                     "ld_120000": "Decode after 128K (tok/s)", "ttft_250k": "Prefill 256K (s)", "par4_tok_s": "4 concurrent requests (tok/s)", "agent_e2e": "Agentic tool loop (s)"},
         "gguf": "GGUF model", "ninf": "NInfer model",
     },
     "zh": {
@@ -60,11 +60,11 @@ TXT = {
         "kv": "KV 缓存", "drafter": "草稿模型", "lower": "越低越好", "higher": "越高越好",
         "tldr": "要点", "na": "无", "s": "s", "toks": "tok/s",
         "prompt": "提示", "gen": "生成", "req": "个请求", "total": "合计",
-        "long": "长上下文：64K 与 128K", "long_sub": "本次评测中最长的提示与最长的解码。预填充 = 单个长文档的首 token 时间（单请求、单通道）；解码 = 在该文档之后生成 512 token 回答的 tok/s（按各引擎的服务配置启用推测解码）",
+        "long": "长上下文：64K、128K 与 256K", "long_sub": "本次评测中最长的提示与最长的解码。预填充 = 单个长文档的首 token 时间（单请求、单通道）；解码 = 在该文档之后生成 512 token 回答的 tok/s（按各引擎的服务配置启用推测解码）",
         "cmp": "TensorSharp：GGUF 模型 vs NInfer 模型", "cmp_sub": "同一引擎构建与测试工具；加粗 = 两者中更优者",
         "cmp_rows": {"overall": "综合得分", "quality": "质量（检查通过）", "ttft_63k": "64K 预填充（s）", "ttft_127k": "128K 预填充（s）",
                      "decode_gen": "推测解码（tok/s）", "decode_nospec": "普通解码（tok/s）", "ld_60000": "64K 后解码（tok/s）",
-                     "ld_120000": "128K 后解码（tok/s）", "par4_tok_s": "4 路并发（tok/s）", "agent_e2e": "智能体工具循环（s）"},
+                     "ld_120000": "128K 后解码（tok/s）", "ttft_250k": "256K 预填充（s）", "par4_tok_s": "4 路并发（tok/s）", "agent_e2e": "智能体工具循环（s）"},
         "gguf": "GGUF 模型", "ninf": "NInfer 模型",
     },
 }
@@ -88,8 +88,10 @@ KEY_METRICS = [
 LONG_METRICS = [
     ("ttft_63k", False, "s", "Prefill: 64K-token prompt", "预填充：64K token 提示", "time to first token, 64.4K-token document", "64.4K token 文档的首 token 时间"),
     ("ttft_127k", False, "s", "Prefill: 128K-token prompt", "预填充：128K token 提示", "time to first token, 130K-token document", "130K token 文档的首 token 时间"),
+    ("ttft_250k", False, "s", "Prefill: 256K-token prompt", "预填充：256K token 提示", "time to first token, 256K-token document", "256K token 文档的首 token 时间"),
     ("ld_60000", True, "tok/s", "Decode after a 64K context", "64K 上下文后解码", "512 tokens after a 61.7K-token prompt", "61.7K token 提示后生成 512 token"),
     ("ld_120000", True, "tok/s", "Decode after a 128K context", "128K 上下文后解码", "512 tokens after a 119K-token prompt", "119K token 提示后生成 512 token"),
+    ("ld_250000", True, "tok/s", "Decode after a 256K context", "256K 上下文后解码", "512 tokens after a 254K-token prompt", "254K token 提示后生成 512 token"),
 ]
 
 # (metric, higher, unit, en title, zh title)
@@ -325,7 +327,7 @@ def ts_compare(summary, lang):
     t = TXT[lang]
     e = summary["engines"]
     gg, ni = e["tensorsharp-gguf"], e["tensorsharp"]
-    rows = [("overall", True), ("quality", True), ("ttft_63k", False), ("ttft_127k", False), ("decode_gen", True),
+    rows = [("overall", True), ("quality", True), ("ttft_63k", False), ("ttft_127k", False), ("ttft_250k", False), ("decode_gen", True),
             ("decode_nospec", True), ("ld_60000", True), ("ld_120000", True), ("par4_tok_s", True), ("agent_e2e", False)]
     out = [f'<h3 class="cmp-h">{html.escape(t["cmp"])}</h3><p class="sub">{html.escape(t["cmp_sub"])}</p>'
            f'<table class="cmp"><tr><th></th><th class="ts">{t["gguf"]}</th><th class="ts">{t["ninf"]}</th></tr>']
@@ -348,7 +350,7 @@ def ts_compare(summary, lang):
     return "".join(out)
 
 
-def tldr(summary, lang):
+def tldr(summary, lang, tail=""):
     o = summary["order"]
     e = summary["engines"]
     m = lambda k, x: e[k]["metrics"].get(x)
@@ -356,6 +358,8 @@ def tldr(summary, lang):
     first = o[0]
     best = lambda x, hib: (max if hib else min)((k for k in o if m(k, x)), key=lambda k: m(k, x))
     b63, b127, b60, b120 = best("ttft_63k", False), best("ttft_127k", False), best("ld_60000", True), best("ld_120000", True)
+    has256 = any(m(k, "ttft_250k") for k in o)
+    b256 = best("ttft_250k", False) if has256 else None
     ni, gg = "tensorsharp", "tensorsharp-gguf"
     n = lambda k: name(k, lang)
     q = lambda k: f'{e[k]["checks"][0]}/{e[k]["checks"][1]}'
@@ -370,10 +374,11 @@ def tldr(summary, lang):
             head = (f'<span class="ts">{n(first)}</span> 综合 <b>{e[first]["overall"]:.1f}</b> 排名第一。'
                     f'TensorSharp 两种部署：<span class="ts">NInfer 模型</span> 第 <b>{rank(ni)}</b>（{e[ni]["overall"]:.1f}，质量 {q(ni)}），'
                     f'<span class="ts">GGUF 模型</span> 第 <b>{rank(gg)}</b>（{e[gg]["overall"]:.1f}，质量 {q(gg)}）。')
-        return (head + f'长上下文：64K 预填充最快 {n(b63)}（<b>{m(b63, "ttft_63k"):.2f} s</b>），128K 预填充最快 {n(b127)}（<b>{m(b127, "ttft_127k"):.1f} s</b>）；'
+        return (head + f'长上下文：64K 预填充最快 {n(b63)}（<b>{m(b63, "ttft_63k"):.2f} s</b>），128K 预填充最快 {n(b127)}（<b>{m(b127, "ttft_127k"):.1f} s</b>）'
+                + (f'，256K 预填充最快 {n(b256)}（<b>{m(b256, "ttft_250k"):.1f} s</b>）' if b256 else '') + '；'
                 + (f'64K 与 128K 后解码均最快为 {n(b60)}（<b>{m(b60, "ld_60000"):.0f}</b> / <b>{m(b120, "ld_120000"):.0f} tok/s</b>）。' if b60 == b120 else
                    f'64K / 128K 后解码最快 {n(b60)}（<b>{m(b60, "ld_60000"):.0f}</b>）/ {n(b120)}（<b>{m(b120, "ld_120000"):.0f} tok/s</b>）。')
-                + 'TensorSharp 以 BF16 计算提示注意力，NInfer、Ignis 与 velox 使用 FP8。')
+                + tail)
     if first in TS:
         other = ni if first == gg else gg
         head = (f'<span class="ts">{n(first)}</span> ranks <b>#1</b> overall (<b>{e[first]["overall"]:.1f}</b>, {q(first)} checks), ahead of '
@@ -385,11 +390,12 @@ def tldr(summary, lang):
                 f'TensorSharp as two deployments: the <span class="ts">NInfer model</span> ranks <b>#{rank(ni)}</b> ({e[ni]["overall"]:.1f}, '
                 f'{q(ni)} checks) and the <span class="ts">GGUF model</span> <b>#{rank(gg)}</b> ({e[gg]["overall"]:.1f}, {q(gg)} checks). ')
     return (head + f'Long context: {n(b63)} prefills 64K fastest (<b>{m(b63, "ttft_63k"):.2f} s</b>), '
-            f'{n(b127)} 128K (<b>{m(b127, "ttft_127k"):.1f} s</b>); '
+            f'{n(b127)} 128K (<b>{m(b127, "ttft_127k"):.1f} s</b>)'
+            + (f', {n(b256)} 256K (<b>{m(b256, "ttft_250k"):.1f} s</b>)' if b256 else '') + '; '
             + (f'{n(b60)} decodes fastest after both 64K and 128K (<b>{m(b60, "ld_60000"):.0f}</b> / <b>{m(b120, "ld_120000"):.0f} tok/s</b>). '
                if b60 == b120 else
                f'{n(b60)} / {n(b120)} decode fastest after 64K / 128K (<b>{m(b60, "ld_60000"):.0f}</b> / <b>{m(b120, "ld_120000"):.0f} tok/s</b>). ')
-            + 'TensorSharp computes prompt attention in BF16; NInfer, Ignis and velox use FP8.')
+            + tail)
 
 
 def render(summary, ctx, lang):
@@ -397,7 +403,7 @@ def render(summary, ctx, lang):
     not_run = ctx.get("not_run", {})
     c = ctx[lang]
     minis = "".join(f'<div class="mini"><div class="t">{html.escape(title_zh if lang == "zh" else title_en)}</div>'
-                    f'<div class="d">{html.escape(task_zh if lang == "zh" else task_en)} · {t["higher"] if hib else t["lower"]}</div>'
+                    f'<div class="d">{html.escape(c.get("key_tasks", {}).get(mid) or (task_zh if lang == "zh" else task_en))} · {t["higher"] if hib else t["lower"]}</div>'
                     f'{mini_chart(summary, mid, hib, unit, not_run, lang)}</div>'
                     for mid, hib, unit, title_en, title_zh, task_en, task_zh in KEY_METRICS)
     cards = "".join(scenario_card(summary, mid, hib, unit, zh if lang == "zh" else en, not_run, lang)
@@ -410,17 +416,21 @@ def render(summary, ctx, lang):
                          + "".join(f"<td>{html.escape(x)}</td>" for x in c["setup"][k]) + "</tr>"
                          for k in summary["order"] if k in c["setup"])
     notes = "".join(f"<li>{x}</li>" for x in c["notes"])
+    others = sum(1 for k in summary["order"] if k not in TS)
+    count = {"en": {4: "Four", 5: "Five", 6: "Six", 7: "Seven"}, "zh": {4: "四", 5: "五", 6: "六", 7: "七"}}[lang].get(others, str(others))
+    title = t["title"].replace("Six", count) if lang == "en" else t["title"].replace("六", count)
+    t = dict(t, title=title)
     return f"""<!DOCTYPE html><html lang="{'zh-CN' if lang == 'zh' else 'en'}"><head><meta charset="utf-8"><title>{html.escape(t['title'])}</title>
 <style>{CSS}</style></head><body><div class="page">
 <div class="hdr"><div><h1>{html.escape(t['title'])}</h1><div class="meta">{html.escape(c['meta'])}</div></div>
-<div class="tldr"><div class="h">{t['tldr']}</div>{tldr(summary, lang)}</div></div>
+<div class="tldr"><div class="h">{t['tldr']}</div>{tldr(summary, lang, c.get('tldr_tail', ''))}</div></div>
 <div class="row" style="grid-template-columns:1fr 1fr">
  <div class="card"><h2>{t['rank']}</h2><p class="sub">{html.escape(t['rank_sub'])}</p>{ranking_block(summary, lang)}{ts_compare(summary, lang)}</div>
- <div class="card"><h2>{t['decode']}</h2><p class="sub">{html.escape(t['decode_sub'])}</p>
+ <div class="card"><h2>{t['decode']}</h2><p class="sub">{html.escape(c.get('decode_sub', t['decode_sub']))}</p>
   <div class="legend"><span><span class="sw" style="background:var(--gray)"></span>{t['plain']}</span><span><span class="sw" style="background:var(--blue)"></span>{t['spec']}</span></div>
   {decode_chart(summary, lang)}</div>
 </div>
-<div class="row"><div class="card" style="border:2px solid var(--blue)"><h2>{t['long']}</h2><p class="sub">{html.escape(t['long_sub'])}</p><div class="minis">{longs}</div></div></div>
+<div class="row"><div class="card" style="border:2px solid var(--blue)"><h2>{t['long']}</h2><p class="sub">{html.escape(t['long_sub'])}</p><div class="minis" style="grid-template-columns:repeat(3,1fr)">{longs}</div></div></div>
 <div class="row"><div class="card"><h2>{t['key']}</h2><p class="sub">{html.escape(c['key_sub'])}</p><div class="minis">{minis}</div></div></div>
 <div class="row"><div class="card"><h2>{t['scen']}</h2><p class="sub">{html.escape(c['scen_sub'])}</p><div class="cards">{cards}</div></div></div>
 <div class="row"><div class="card"><h2>{t['qual']}</h2><p class="sub">{html.escape(c['qual_sub'])}</p>{quality_table(summary, lang)}</div></div>

@@ -32,6 +32,28 @@ def successful_case(repeat=0):
 
 
 class BenchmarkIntegrityTests(unittest.TestCase):
+    def test_application_context_is_static_system_then_unique_user_and_skips_long_prompts(self):
+        haystack = {"paragraphs": [f"Paragraph {i} " + "word " * 60 for i in range(400)]}
+        args = SimpleNamespace(nonce_seed=7, system_tokens=1000, context_tokens=500, chars_per_token=4.3)
+        ctx = bench.Ctx(args, None, haystack)
+        a = ctx.messages("short_chat", 0, "q1", 0)
+        b = ctx.messages("short_chat", 1, "q2", 3)
+        self.assertEqual(a[0]["content"], b[0]["content"], "a scenario's system message is static")
+        self.assertGreater(len(a[0]["content"]), 1000 * 4.3)
+        other = ctx.messages("tool_call_single", 0, "q", 0, system="You are an agent.")[0]["content"]
+        self.assertEqual(other[:other.index("</reference>")], a[0]["content"][:a[0]["content"].index("</reference>")])
+        self.assertNotEqual(a[1]["content"], b[1]["content"], "retrieved material and nonce are per request")
+        self.assertIn("<context>", a[1]["content"])
+        self.assertTrue(a[1]["content"].endswith("Request:\nq1"))
+        img = ctx.messages("image", 0, [{"type": "image_url", "image_url": {"url": "x"}}])[1]["content"]
+        self.assertEqual(img[0]["type"], "text")
+        self.assertEqual(img[1]["type"], "image_url")
+        self.assertNotIn("<reference>", ctx.messages("long_prompt_32k", 0, "q")[0]["content"])
+        run2 = bench.Ctx(SimpleNamespace(nonce_seed=8, system_tokens=1000, context_tokens=0, chars_per_token=4.3), None, haystack)
+        self.assertNotEqual(a[0]["content"][:30], run2.messages("short_chat", 0, "q")[0]["content"][:30], "another run never shares it")
+        plain = bench.Ctx(SimpleNamespace(nonce_seed=7), None, haystack).messages("short_chat", 0, "q")
+        self.assertEqual(plain[0]["content"], f"You are a helpful assistant. Session {ctx.nonce('short_chat', 0)}.")
+
     def test_http_failure_after_correct_content_is_not_a_pass(self):
         rec = bench.case("short_chat", 0, [{"name": "answer", "ok": True}], {},
                          [{"content": "391", "error": "connection reset"}], 100)

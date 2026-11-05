@@ -64,6 +64,23 @@ GSM8K subset. Requests default to temperature zero, no thinking and no
 repetition/presence/frequency penalties. Do not silently change these settings
 or force tool calls for just one engine.
 
+Realistic request sizes: the scenarios' own prompts are short (50-1,000 tokens).
+`--system-tokens N --context-tokens M` shapes every scenario request (except
+`long_prompt_*`, which keep their nominal lengths) like a deployed application's.
+- **System message:** static per scenario: a per-invocation nonce, about N tokens of
+  shared reference documentation, then the scenario's instructions. It is
+  prefix-cacheable across the run's requests, as in production, but never across
+  runs.
+- **User message:** opens with the request's session nonce and about M tokens of
+  retrieved material that no other request shares, followed by the request.
+
+The 2026-11-05 campaign used `--system-tokens 2048 --context-tokens 2048` (about
+4.4K prompt tokens per request). Per-request material belongs in the user
+message: a hybrid recurrent model can only resume from a recurrent-state
+checkpoint, which TensorSharp takes at the end of the leading system messages
+and tools. With per-request text inside the system message, no prefix would be
+reusable on such a model.
+
 GSM8K contains a small MIT-licensed regression fixture, not an official full
 benchmark. Eight question IDs repeated three times are eight independent
 questions, not twenty-four. Generated arithmetic checks the expression result,

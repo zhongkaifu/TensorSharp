@@ -100,7 +100,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MEDIA_DIR = ROOT / "eng" / "minimax-m3-bench-media"
-HARNESS_VERSION = "qwen38-engine-bench/3"
+HARNESS_VERSION = "qwen38-engine-bench/4"
 ENGINES = ["tensorsharp", "llamacpp", "vllm", "sglang", "velox", "ninfer",
            "infernix", "ignis", "eole", "strata", "basalt", "focus-llama"]
 
@@ -109,6 +109,9 @@ ENGINES = ["tensorsharp", "llamacpp", "vllm", "sglang", "velox", "ninfer",
 # from characters so every engine receives byte-identical text; the actual
 # prompt_tokens from each server are recorded.
 DEFAULT_CHARS_PER_TOKEN = 4.3
+# First haystack paragraph of the shared reference (--system-tokens); per-request context
+# (--context-tokens) starts at a hash of the request identity instead.
+SHARED_CONTEXT_START = 211
 
 SCENARIOS = ["short_chat", "quality_tasks", "long_prompt_4k", "long_prompt_16k", "long_prompt_32k",
              "long_prompt_128k", "long_prompt_250k",
@@ -722,9 +725,37 @@ class Ctx:
 
     def messages(self, scenario, repeat, user, index=0, system="You are a helpful assistant."):
         """A system line carrying the nonce, then the user turn (a nonce in the user turn can be
-        mistaken for content, e.g. an order number)."""
-        return [{"role": "system", "content": f"{system} Session {self.nonce(scenario, repeat, index)}."},
-                {"role": "user", "content": user}]
+        mistaken for content, e.g. an order number).
+
+        With --system-tokens / --context-tokens the request is shaped like a deployed application's:
+        the system message is static (a per-invocation nonce, a shared reference document of about
+        --system-tokens, then the scenario's instructions), so every request of a scenario shares
+        it and it is prefix-cacheable within the run as in production but never across runs; the
+        user message opens with the per-request session nonce and about --context-tokens of
+        retrieved material no other request shares, then the request itself. The long_prompt_*
+        scenarios keep their nominal lengths and take neither."""
+        nonce = self.nonce(scenario, repeat, index)
+        shared, unique = getattr(self.args, "system_tokens", 0), getattr(self.args, "context_tokens", 0)
+        if (not shared and not unique) or scenario.startswith("long_prompt_"):
+            return [{"role": "system", "content": f"{system} Session {nonce}."},
+                    {"role": "user", "content": user}]
+        cpt, parts = self.args.chars_per_token, []
+        if shared:
+            run = hashlib.sha256(f"{self.seed}:deployment".encode()).hexdigest()
+            prose = take_prose(self.haystack, int(shared * cpt), start=SHARED_CONTEXT_START)
+            parts.append(f"Deployment {int(run[:8], 16) % 900000 + 100000}. The product reference below is "
+                         "background for every conversation.\n\n<reference>\n" + "\n\n".join(prose) + "\n</reference>")
+        parts.append(system)
+        parts.append("Use the reference and any retrieved material only when the request needs them; "
+                     "otherwise follow the request exactly.")
+        head = f"[Session {nonce}]"
+        if unique:
+            h = hashlib.sha256(f"{self.seed}:{scenario}:{repeat}:{index}:context".encode()).hexdigest()
+            prose = take_prose(self.haystack, int(unique * cpt), start=int(h[:8], 16) % len(self.haystack["paragraphs"]))
+            head += " Material retrieved for this request:\n<context>\n" + "\n\n".join(prose) + "\n</context>"
+        head += "\n\nRequest:\n"
+        content = ([{"type": "text", "text": head}] + list(user)) if isinstance(user, list) else head + user
+        return [{"role": "system", "content": "\n\n".join(parts)}, {"role": "user", "content": content}]
 
     def rng(self, scenario, repeat):
         return random.Random(f"{self.seed}:{scenario}:{repeat}")
@@ -1918,6 +1949,12 @@ def main():
     ap.add_argument("--long-order-quality", action="store_true",
                     help="five randomized long-context needles plus document order and immediate-neighbor checks; no extra requests")
     ap.add_argument("--nonce-seed", type=int, default=None, help="default: random per invocation (recorded)")
+    ap.add_argument("--system-tokens", type=int, default=0,
+                    help="shared application reference prepended to every scenario's system message (about N tokens; "
+                         "identical across the invocation's requests, so prefix-cacheable within it); not long_prompt_*")
+    ap.add_argument("--context-tokens", type=int, default=0,
+                    help="per-request retrieved context in the system message (about N tokens, unique per request); "
+                         "not long_prompt_*")
     ap.add_argument("--extra-body", help="JSON object merged into every request body (engine-specific fields)")
     ap.add_argument("--metrics-url", help="Prometheus page with speculative counters "
                                           "(default: <url>/metrics for vllm and sglang, none otherwise)")
@@ -1943,6 +1980,8 @@ def main():
         ap.error("--engine, --url and --out are required")
     if args.repeats < 1 or args.quality_tasks < 1 or not 0 < args.long_prompt_tolerance <= 0.1:
         ap.error("--repeats/--quality-tasks must be positive and --long-prompt-tolerance in (0, 0.1]")
+    if args.system_tokens < 0 or args.context_tokens < 0:
+        ap.error("--system-tokens and --context-tokens must be nonnegative")
     if args.temperature < 0 or not 0 < args.top_p <= 1:
         ap.error("--temperature must be nonnegative and --top-p in (0, 1]")
     if not 1 <= args.gsm8k_limit <= 12:
@@ -1973,6 +2012,8 @@ def main():
             ap.error("quality baseline sampling settings differ")
         if baseline_header.get("long_order_quality", False) != args.long_order_quality:
             ap.error("quality baseline --long-order-quality setting differs")
+        if (baseline_header.get("system_tokens", 0), baseline_header.get("context_tokens", 0)) != (args.system_tokens, args.context_tokens):
+            ap.error("quality baseline --system-tokens/--context-tokens settings differ")
     ctx = Ctx(args, client, haystack)
     header = {"kind": "run", "harness": HARNESS_VERSION, "engine": args.engine, "mode": args.mode, "url": client.url,
               "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "python": sys.version,
@@ -1980,6 +2021,7 @@ def main():
               "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "loadavg": list(os.getloadavg()),
               "scenarios": names, "repeats": args.repeats, "answer_tokens": args.answer_tokens,
               "decode_tokens": args.decode_tokens, "nonce_seed": args.nonce_seed,
+              "system_tokens": args.system_tokens, "context_tokens": args.context_tokens,
               "chars_per_token": args.chars_per_token, "extra_body": client.extra,
               "metrics_url": client.metrics_url, "tokenizer": args.tokenizer,
               "tokenizer_sha256": hashlib.sha256(Path(args.tokenizer).read_bytes()).hexdigest() if args.tokenizer else None,

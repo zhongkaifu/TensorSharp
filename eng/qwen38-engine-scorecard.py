@@ -5,7 +5,7 @@
       [--context context.json]
 
 CAMPAIGN_DIR holds one directory per engine and context tier, as written by the campaign
-driver: <engine>-64k/{main,long}.jsonl, <engine>-128k/long128.jsonl, longdecode.jsonl
+driver: <engine>-64k/{main,long}.jsonl, <engine>-128k/long128.jsonl, <engine>-256k/long256.jsonl, longdecode.jsonl
 (one JSON line per long-context decode probe), ready.txt (load_s=...), vram.txt.
 TensorSharp is scored as two deployments: tensorsharp (the NInfer .ninfer artifact on the
 native CUDA engine, text only) and tensorsharp-gguf (the GGUF + mmproj model on the same
@@ -39,11 +39,11 @@ TS_ENGINES = ("tensorsharp", "tensorsharp-gguf")
 
 # (id, en, zh, weight, quality scenarios, perf metrics [(metric id, higher_is_better)])
 CATEGORIES = [
-    ("prefill", "Long-context prefill (8K-127K TTFT)", "长上下文预填充（8K–127K 首 token）", 1.5,
-     ["long_prompt_8k", "long_prompt_32k", "long_prompt_63k", "long_prompt_127k"],
-     [("ttft_8k", False), ("ttft_32k", False), ("ttft_63k", False), ("ttft_127k", False)]),
-    ("longdecode", "Long-context decode (32K/60K/120K)", "长上下文解码（32K/60K/120K）", 1.5, [],
-     [("ld_32000", True), ("ld_60000", True), ("ld_120000", True)]),
+    ("prefill", "Long-context prefill (8K-256K TTFT)", "长上下文预填充（8K–256K 首 token）", 1.5,
+     ["long_prompt_8k", "long_prompt_32k", "long_prompt_63k", "long_prompt_127k", "long_prompt_250k"],
+     [("ttft_8k", False), ("ttft_32k", False), ("ttft_63k", False), ("ttft_127k", False), ("ttft_250k", False)]),
+    ("longdecode", "Long-context decode (32K/60K/120K/250K)", "长上下文解码（32K/60K/120K/250K）", 1.5, [],
+     [("ld_32000", True), ("ld_60000", True), ("ld_120000", True), ("ld_250000", True)]),
     ("decode", "Decode, single request", "单请求解码", 1.0, ["long_generation", "short_chat"],
      [("decode_gen", True), ("ttft_short", False)]),
     ("concurrency", "Parallel requests (2 / 4)", "并行请求（2 / 4 路）", 1.0, ["parallel_2", "parallel_4"],
@@ -132,6 +132,7 @@ def metrics_for(e):
     out = {
         "ttft_8k": m("long_prompt_8k", "ttft_s"), "ttft_32k": m("long_prompt_32k", "ttft_s"),
         "ttft_63k": m("long_prompt_63k", "ttft_s"), "ttft_127k": m("long_prompt_127k", "ttft_s"),
+        "ttft_250k": m("long_prompt_250k", "ttft_s"),
         "decode_gen": m("long_generation", "decode_tok_s"), "ttft_short": m("short_chat", "ttft_s"),
         "par2_tok_s": m("parallel_2", "aggregate_tok_s"), "par4_tok_s": m("parallel_4", "aggregate_tok_s"),
         "agent_e2e": m("agentic_loop", "end_to_end_s"),
@@ -160,10 +161,10 @@ def metrics_for(e):
                                 if c["scenario"] == "long_generation" and c.get("verdict") in ("PASS", "FAIL")])
     out["spec_speedup"] = (out["decode_gen"] / out["decode_nospec"]
                            if out.get("decode_gen") and out["decode_nospec"] else None)
-    for size in (32000, 60000, 120000):
+    for size in (32000, 60000, 120000, 250000):
         out[f"ld_{size}"] = med([p.get("decode_tok_s") for p in e["probes"]
                                  if p.get("tag", "").endswith(f"-{size}") and p.get("completion_tokens")])
-    for size in (32000, 60000, 120000):
+    for size in (32000, 60000, 120000, 250000):
         out[f"ld_ttft_{size}"] = med([p.get("ttft_s") for p in e["probes"]
                                       if p.get("tag", "").endswith(f"-{size}") and p.get("completion_tokens")])
     q = {}
@@ -223,7 +224,7 @@ def score(engines, not_run=None):
 
 T = {
     "en": {"title": "Qwen3.8-27B inference engines on one RTX 5090: performance and quality",
-           "sub": "TensorSharp vs Ignis, NInfer, velox-inferer, llama.cpp, vLLM and SGLang - same prompts, greedy, thinking off",
+           "sub": "TensorSharp vs Ignis, NInfer, llama.cpp, vLLM and SGLang - same prompts, greedy, thinking off",
            "rank": "Overall ranking", "overall": "Overall", "quality": "Quality", "perf": "Performance",
            "engine": "Engine", "cats": "Category scores (0-100)", "metrics": "Key measurements",
            "method": "Method", "caveats": "Caveats", "ts": "TensorSharp improvements in this round",
@@ -231,7 +232,7 @@ T = {
            "checks": "checks passed", "load": "load", "table": "Table view",
            "lower": "lower is better", "higher": "higher is better", "na": "unsupported / not run"},
     "zh": {"title": "单张 RTX 5090 上的 Qwen3.8-27B 推理引擎：性能与质量评测",
-           "sub": "TensorSharp 对比 Ignis、NInfer、velox-inferer、llama.cpp、vLLM、SGLang —— 相同提示、贪心解码、关闭思考",
+           "sub": "TensorSharp 对比 Ignis、NInfer、llama.cpp、vLLM、SGLang —— 相同提示、贪心解码、关闭思考",
            "rank": "综合排名", "overall": "综合", "quality": "质量", "perf": "性能",
            "engine": "引擎", "cats": "分项得分（0–100）", "metrics": "关键测量值",
            "method": "方法", "caveats": "注意事项", "ts": "本轮 TensorSharp 优化",
@@ -247,6 +248,8 @@ METRIC_LABELS = {
     "ld_32000": ("Decode after 32K context (tok/s)", "32K 上下文后解码 (tok/s)", True),
     "ld_60000": ("Decode after 60K context (tok/s)", "60K 上下文后解码 (tok/s)", True),
     "ld_120000": ("Decode after 120K context (tok/s)", "120K 上下文后解码 (tok/s)", True),
+    "ttft_250k": ("TTFT 256K prompt (s)", "256K 提示首 token (s)", False),
+    "ld_250000": ("Decode after 250K context (tok/s)", "250K 上下文后解码 (tok/s)", True),
     "decode_gen": ("Decode, code/prose/copy (tok/s)", "解码：代码/散文/复制 (tok/s)", True),
     "ttft_short": ("Short chat TTFT (s)", "短问答首 token (s)", False),
     "par2_tok_s": ("2 parallel requests (tok/s total)", "2 路并行总吞吐 (tok/s)", True),
@@ -272,10 +275,12 @@ WORKLOADS = {
     "ttft_32k": ("long_prompt_32k", "same needle retrieval, 32K-token document", "同上检索任务，32K token 文档"),
     "ttft_63k": ("long_prompt_63k", "same needle retrieval, 63K-token document", "同上检索任务，63K token 文档"),
     "ttft_127k": ("long_prompt_127k", "same needle retrieval, 127K-token document", "同上检索任务，127K token 文档"),
+    "ttft_250k": ("long_prompt_250k", "same needle retrieval, 256K-token document", "同上检索任务，256K token 文档"),
     "ld_32000": ("probe:32000", "section-by-section summary of a technical document (512-token answer)",
                  "对技术文档逐节总结（生成 512 token）"),
     "ld_60000": ("probe:60000", "same summary task after 60K tokens of context", "同上总结任务，60K 上下文"),
     "ld_120000": ("probe:120000", "same summary task after 120K tokens of context", "同上总结任务，120K 上下文"),
+    "ld_250000": ("probe:250000", "same summary task after 250K tokens of context", "同上总结任务，250K 上下文"),
     "decode_gen": ("long_generation", "write code, write prose, copy and summarize a passage (greedy, spec decoding on)",
                    "写代码、写散文、复制并总结段落（贪心，开启推测解码）"),
     "ttft_short": ("short_chat", "eight short factual questions", "8 个简短事实问答"),
