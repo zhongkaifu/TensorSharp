@@ -81,6 +81,25 @@ Every 8K-127K retrieval and record-order check passed. Against the 16-bit kernel
 differs by about 2% relative RMS per layer (`TS_Q35_ATTN8_CHECK=1` prints it on the GGUF
 route). `TS_Q35_ATTN8=0` restores the 16-bit kernels.
 
+The band is scratch. It grows with the prompt in 16K-key steps and claims no growth reserve. A
+short slot or block allocation releases it, and so does the reserve check before every
+forward; the next prompt chunk rebuilds it. A chunk whose band does not fit runs the 16-bit
+kernels.
+
+## Decode and verify attention on the q8_0 (GGUF) route
+
+Decode and verify steps run the prefill kernel's two-stage `cp.async` pipeline over the fixed key
+splits of the decode plan (`ts_q35_attn_q8_split_pipe_f32`). The synchronous split kernel read a
+long q8_0 history at about half the device bandwidth. Decode after 120K went from 143 to 161 tok/s
+(`TS_Q35_DECODE_ATTN_PIPE=0` restores the synchronous kernel).
+
+Sequences that resume one cached prefix share its cache blocks. Splits that lie within the blocks
+every sequence shares run once, with all sequences' rows packed as one sequence; each sequence's
+own splits follow. The result is bit-identical: `TS_Q35_SHARED_PREFIX_CHECK=1` recomputes each
+shared launch without sharing and prints the largest difference. On the RTX 5090, four chats on
+one cached 60K-token document went from 330 to 380 tok/s (`TS_Q35_SHARED_PREFIX_ATTN=0` turns
+it off).
+
 ## Optional FP8 KV cache
 
 `TS_Q35_NINFER_KV=fp8` stores KV rows as 256 E4M3 codes plus two F32 group-128 scales (272
