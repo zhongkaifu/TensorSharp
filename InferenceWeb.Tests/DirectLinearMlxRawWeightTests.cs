@@ -43,7 +43,9 @@ public sealed class DirectLinearMlxRawWeightTests
             // Kept as the file's bytes: no dense F32 copy, one cached raw MLX array.
             Assert.Null(typeof(DirectLinear).GetField("_wCpu", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(linear));
             Assert.True(MlxQuantizedOps.CanPreloadDirectFloatType((int)type));
-            Assert.False(MlxQuantizedOps.CanPreloadQuantizedType((int)type));
+            // Q2_K and Q3_K also have quantized-matmul kernels now (MlxLowBitQuantKernels.cs); the
+            // direct F32 projection still dequantizes them exactly (TryAddmmDirectFloat32), BF16 only here.
+            Assert.Equal(type != GgmlTensorType.BF16, MlxQuantizedOps.CanPreloadQuantizedType((int)type));
             Assert.NotEqual(IntPtr.Zero, CachedMlxWeight(allocator.DeviceId, linear.CacheKey));
 
             // Every weight the projection multiplies is the CPU dequantizer's, bit for bit. Read

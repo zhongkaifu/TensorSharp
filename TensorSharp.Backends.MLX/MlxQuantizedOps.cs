@@ -179,7 +179,9 @@ namespace TensorSharp.MLX
                 type == (int)GgmlTensorType.IQ3_XXS ||
                 type == (int)GgmlTensorType.IQ4_XS ||
                 (type == (int)GgmlTensorType.IQ4_NL && Iq4NlGpuEnabled()) ||
-                type == (int)GgmlTensorType.MXFP4;
+                type == (int)GgmlTensorType.MXFP4 ||
+                // The low-bit types UD quants scatter over a few tensors (MlxLowBitQuantKernels.cs).
+                MlxNative.IsLowBitDeviceType(type);
         }
 
         /// <summary>
@@ -677,6 +679,12 @@ namespace TensorSharp.MLX
                 else if (ggmlType == (int)GgmlTensorType.IQ3_XXS)
                 {
                     output = MlxNative.Iq3XxsMatmul(inputView, weight.Weight, rows, (int)ne0, (int)ne1);
+                    SetDeviceResult(result, output);
+                    output = default;
+                }
+                else if (MlxNative.IsLowBitDeviceType(ggmlType))
+                {
+                    output = MlxNative.LowBitMatmul(ggmlType, inputView, weight.Weight, rows, (int)ne0, (int)ne1);
                     SetDeviceResult(result, output);
                     output = default;
                 }
@@ -1236,6 +1244,12 @@ namespace TensorSharp.MLX
                     SetDeviceResult(result, dequantized);
                     dequantized = default;
                 }
+                else if (MlxNative.IsLowBitDeviceType(ggmlType))
+                {
+                    dequantized = MlxNative.LowBitGetRows(ggmlType, weight.Weight, indicesView, (int)indices.Sizes[0], (int)ne0);
+                    SetDeviceResult(result, dequantized);
+                    dequantized = default;
+                }
                 else if (ggmlType == (int)GgmlTensorType.Q6_K && string.Equals(weight.Mode, "q6_k", StringComparison.Ordinal))
                 {
                     dequantized = MlxNative.Q6KGetRows(weight.Weight, indicesView, (int)indices.Sizes[0], (int)ne0);
@@ -1326,6 +1340,8 @@ namespace TensorSharp.MLX
                 return MlxNative.Iq3SMatmul(input, weight.Weight, rows, inDim, outDim);
             if (ggmlType == (int)GgmlTensorType.IQ3_XXS)
                 return MlxNative.Iq3XxsMatmul(input, weight.Weight, rows, inDim, outDim);
+            if (MlxNative.IsLowBitDeviceType(ggmlType))
+                return MlxNative.LowBitMatmul(ggmlType, input, weight.Weight, rows, inDim, outDim);
             if (ggmlType == (int)GgmlTensorType.Q6_K && string.Equals(weight.Mode, "q6_k", StringComparison.Ordinal))
                 return MlxNative.Q6KMatmul(input, weight.Weight, rows, inDim, outDim);
 
@@ -1531,10 +1547,15 @@ namespace TensorSharp.MLX
                     (int)GgmlTensorType.IQ4_XS => CreateIq4XsRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.IQ4_NL => CreateIq4NlRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.MXFP4 => CreateMxfp4Weight(deviceId, hostData, ne0, ne1, rawBytes),
-                    // Only the direct F32 projections reach these (TryAddmmDirectFloat32): no other
-                    // path has kernels for them, and CanPreloadQuantizedType does not list them.
+                    // Raw low-bit types: MlxLowBitQuantKernels.cs (and the direct F32 projections for Q2_K / Q3_K).
                     (int)GgmlTensorType.Q2_K => CreateRawKWeight(deviceId, ggmlType, hostData, ne0, ne1, rawBytes, Q2_KBlockBytes, "Q2_K", mode: "q2_k"),
                     (int)GgmlTensorType.Q3_K => CreateRawKWeight(deviceId, ggmlType, hostData, ne0, ne1, rawBytes, Q3_KBlockBytes, "Q3_K", mode: "q3_k"),
+                    (int)GgmlTensorType.IQ2_XS => CreateRawKWeight(deviceId, ggmlType, hostData, ne0, ne1, rawBytes,
+                        MlxNative.LowBitBlockBytes(ggmlType), "IQ2_XS", mode: "iq2_xs"),
+                    (int)GgmlTensorType.IQ1_S => CreateRawKWeight(deviceId, ggmlType, hostData, ne0, ne1, rawBytes,
+                        MlxNative.LowBitBlockBytes(ggmlType), "IQ1_S", mode: "iq1_s"),
+                    (int)GgmlTensorType.IQ1_M => CreateRawKWeight(deviceId, ggmlType, hostData, ne0, ne1, rawBytes,
+                        MlxNative.LowBitBlockBytes(ggmlType), "IQ1_M", mode: "iq1_m"),
                     (int)GgmlTensorType.BF16 => CreateRawBf16Weight(deviceId, hostData, ne0, ne1, rawBytes),
                     _ => throw new NotSupportedException($"MLX quantized preload does not support GGML tensor type {(GgmlTensorType)ggmlType}."),
                 };
@@ -2116,6 +2137,8 @@ namespace TensorSharp.MLX
                         : ggmlType == (int)GgmlTensorType.IQ2_S ? 2
                         : ggmlType == (int)GgmlTensorType.Q3_K ? 3
                         : ggmlType == (int)GgmlTensorType.Q2_K ? 2
+                        : ggmlType == (int)GgmlTensorType.IQ2_XS ? 2
+                        : ggmlType == (int)GgmlTensorType.IQ1_S || ggmlType == (int)GgmlTensorType.IQ1_M ? 1
                         : 5,
                     Mode = mode,
                 };

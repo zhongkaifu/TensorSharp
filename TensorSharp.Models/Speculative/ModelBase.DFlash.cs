@@ -94,6 +94,7 @@ using System;
 using System.Collections.Generic;
 using TensorSharp;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models
@@ -828,7 +829,7 @@ namespace TensorSharp.Models
                 // sublayer's input filter and the filter its OUTPUT is convolved
                 // with, so the coefficients are computed once and held across the
                 // attention.
-                float[] attnFinishDelta = null;
+                DFlashConvDelta attnFinishDelta = null;
                 if (cfg.HasConv)
                     h = DFlashConvPrepare(h, b, names[DfAttnConvProj], names[DfAttnConvBase], out attnFinishDelta);
 
@@ -858,7 +859,7 @@ namespace TensorSharp.Models
                 inpL.Dispose();
 
                 Tensor ffnIn = DFlashRmsNorm(attnOut, names[DfFfnNorm], eps);
-                float[] ffnFinishDelta = null;
+                DFlashConvDelta ffnFinishDelta = null;
                 if (cfg.HasConv)
                     ffnIn = DFlashConvPrepare(ffnIn, b, names[DfFfnConvProj], names[DfFfnConvBase], out ffnFinishDelta);
 
@@ -1168,8 +1169,25 @@ namespace TensorSharp.Models
             if (!any)
                 return;
 
-            float* sp = GetFloatPtr(scores);
             int rowsPerGroup = groupSize * b;
+            if (_backend == BackendType.Mlx)
+            {
+                // An additive mask built from positions alone: reading the scores back to fill them
+                // forced an MLX evaluation and a wait per layer. -inf + score is -inf; 0 + score is score.
+                var mask = new float[(long)kvHeads * rowsPerGroup * total];
+                for (int g = 0; g < kvHeads; g++)
+                    for (int j = 0; j < rowsPerGroup; j++)
+                    {
+                        int width = widths[j % b];
+                        if (width > 0)
+                            Array.Fill(mask, float.NegativeInfinity, (int)(((long)g * rowsPerGroup + j) * total), width);
+                    }
+                using Tensor maskT = new Tensor(_allocator, DType.Float32, kvHeads, rowsPerGroup, total);
+                maskT.SetElementsAsFloat(mask);
+                Ops.Add(scores, scores, maskT);
+                return;
+            }
+            float* sp = GetFloatPtr(scores);
             for (int g = 0; g < kvHeads; g++)
             {
                 float* groupScores = sp + (long)g * rowsPerGroup * total;
@@ -1256,35 +1274,84 @@ namespace TensorSharp.Models
         ///
         /// Consumes <paramref name="x"/> and returns a new [b, hidden] tensor.
         /// </summary>
+        /// <summary>The output-side filter coefficients <see cref="DFlashConvPrepare"/> hands to
+        /// <see cref="DFlashConvFinish"/>: host floats [b][taps * groups], or on MLX the projection's
+        /// device rows themselves (the output half starts at <see cref="Offset"/> of each
+        /// <see cref="Stride"/>-float row), so neither convolution reads anything back.</summary>
+        private sealed class DFlashConvDelta
+        {
+            public float[] Host;
+            public Tensor Device;
+            public int Stride, Offset;
+        }
+
         private unsafe Tensor DFlashConvPrepare(Tensor x, int b, string projName, string baseName,
-            out float[] finishDelta)
+            out DFlashConvDelta finishDelta)
         {
             var cfg = _dflash;
             int taps = cfg.ConvKernelSize, groups = cfg.ConvNumGroups;
             int half = taps * groups;
-
-            using Tensor coef = LinearForward(x, projName);   // [b, 2 * taps * groups]
-            float* cp = GetFloatPtr(coef);
             int stride = cfg.ConvProjOutSize;
 
-            // The output half is copied out because the sublayer between prepare
-            // and finish reuses (and may free) every device buffer in flight.
-            finishDelta = new float[(long)b * half];
-            for (int r = 0; r < b; r++)
-                for (int i = 0; i < half; i++)
-                    finishDelta[(long)r * half + i] = cp[(long)r * stride + half + i];
+            Tensor coef = LinearForward(x, projName);   // [b, 2 * taps * groups]
+            if (_backend == BackendType.Mlx)
+            {
+                // On the device, both convolutions read the projection's rows in place: the
+                // host loop's reads of coef and x each forced an MLX evaluation and a wait.
+                var device = new Tensor(_allocator, DType.Float32, b, cfg.HiddenSize);
+                if (MlxDFlashOps.TryGroupedConvolve(device, x, coef, stride, 0, _weights[baseName], 0,
+                        b, cfg.HiddenSize, taps, cfg.ConvGroupSize, groups))
+                {
+                    finishDelta = new DFlashConvDelta { Device = coef, Stride = stride, Offset = half };
+                    x.Dispose();
+                    return device;
+                }
+                device.Dispose();
+            }
+            try
+            {
+                float* cp = GetFloatPtr(coef);
 
-            Tensor result = DFlashConvApply(x, b, cp, stride, /*deltaOffset=*/0, baseName, /*side=*/0);
-            x.Dispose();
-            return result;
+                // The output half is copied out because the sublayer between prepare
+                // and finish reuses (and may free) every device buffer in flight.
+                var hostDelta = new float[(long)b * half];
+                for (int r = 0; r < b; r++)
+                    for (int i = 0; i < half; i++)
+                        hostDelta[(long)r * half + i] = cp[(long)r * stride + half + i];
+                finishDelta = new DFlashConvDelta { Host = hostDelta };
+
+                Tensor result = DFlashConvApply(x, b, cp, stride, /*deltaOffset=*/0, baseName, /*side=*/0);
+                x.Dispose();
+                return result;
+            }
+            finally
+            {
+                coef.Dispose();
+            }
         }
 
         /// <summary>Applies the output-side filter produced by
         /// <see cref="DFlashConvPrepare"/>. Consumes <paramref name="y"/>.</summary>
-        private unsafe Tensor DFlashConvFinish(Tensor y, int b, float[] finishDelta, string baseName)
+        private unsafe Tensor DFlashConvFinish(Tensor y, int b, DFlashConvDelta finishDelta, string baseName)
         {
             int half = _dflash.ConvKernelSize * _dflash.ConvNumGroups;
-            fixed (float* dp = finishDelta)
+            if (finishDelta.Device != null)
+            {
+                var cfg = _dflash;
+                var device = new Tensor(_allocator, DType.Float32, b, cfg.HiddenSize);
+                bool ok = MlxDFlashOps.TryGroupedConvolve(device, y, finishDelta.Device, finishDelta.Stride, finishDelta.Offset,
+                    _weights[baseName], 1, b, cfg.HiddenSize, cfg.ConvKernelSize, cfg.ConvGroupSize, cfg.ConvNumGroups);
+                finishDelta.Device.Dispose();
+                finishDelta.Device = null;
+                if (!ok)
+                {
+                    device.Dispose();
+                    throw new InvalidOperationException("The MLX DFlash output convolution declined after its input convolution ran on the device.");
+                }
+                y.Dispose();
+                return device;
+            }
+            fixed (float* dp = finishDelta.Host)
             {
                 Tensor result = DFlashConvApply(y, b, dp, half, /*deltaOffset=*/0, baseName, /*side=*/1);
                 y.Dispose();

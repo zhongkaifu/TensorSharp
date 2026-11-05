@@ -882,6 +882,40 @@ and a bit-identical 16-row tile gained at most 3%. Three other costs were real a
 | A short prompt chunk (a session turn, a new chat's suffix) over a long cache | the 8-bit prompt attention, with no key split: a 47-token chunk over 127K cached tokens ran 8 CTAs, 5.3 ms a layer, after 0.65 ms converting the band | the 16-bit kernels, which split the keys across the device, until the 8-bit CTAs cover about 40% of the SMs (about 350 rows; both routes): that turn's first token 140 -> 50 ms |
 | Chats admitted in one step on a cached prefix | a request restored from the radix cache has no holder yet, so the batched prefill skipped it and each suffix ran on its own | the executor binds the holders and injects the prefixes first (`PrebindCachedPrefixPrefills`), so the suffixes share one forward: three such chats on a 120K-token document reach their first tokens within 3 ms of each other |
 
+### MLX: UD quants and speculative decoding
+
+Measured on an M5 Pro (48 GB), Qwen3.8-27B GGUF with the DFlash2 Q4_K_M drafter (`--spec-draft 7`),
+a 2.3K-token prompt and 512-token answers; speculative numbers are the second request of one
+process (kernels compiled).
+
+- **Low-bit types on the device.** Unsloth's UD-IQ3_XXS keeps 1.2 GB of its 10.9 GB in Q2_K, Q3_K,
+  IQ2_XS, IQ1_S and IQ1_M, which had no MLX kernels and ran on the CPU managed-dequant path. They
+  now have device kernels (`MlxLowBitQuantKernels.cs`, the dequant arithmetic of
+  `ManagedQuantizedOps`): decode 1.8 -> 15.7 tok/s.
+- **Prompt chunks.** The raw i-quants' 32+-row products dequantize the weight to F16 slices and run
+  MLX's GEMM (`TS_MLX_IQ_DEQUANT_GEMM_MIN_ROWS`), as Q6_K and IQ4_XS do: the 2.3K-token prefill
+  361 s -> 6.05 s (ggml_metal: 7.0 s).
+- **Verify windows.** 2-31 rows decode each 8-weight group once into simdgroup-matrix tiles
+  (`TS_MLX_IQ_FEWROW_MAX_ROWS`; F32 below 8 rows, F16 from 8 as the kernel they replace): an 8-row
+  verify 359 -> 186 ms.
+- **No re-forward after a rejection.** The verify keeps the recurrent state after every row and the
+  accepted row's state is committed on the device, as the ggml verify's snapshots do; the
+  pre-verify snapshot is a reference to the immutable MLX arrays instead of a host copy (6 ms ->
+  0.1 ms a step). A rejection used to restore and forward the accepted prefix again: 135 ms each.
+- **Drafter.** The DFlash2 block convolution runs on the device and the sliding-window mask is
+  added, instead of reading coefficients, rows and scores back four to five times per layer: a
+  draft 51 -> 32 ms.
+
+| UD-IQ3_XXS, MLX | Before | Now |
+|---|---:|---:|
+| Plain decode | 1.8 tok/s | 15.7 tok/s |
+| DFlash2, code answer | 2.4 tok/s | 23-25 tok/s |
+| DFlash2, list answer | - | 22.5 tok/s |
+
+ggml_metal on the same files and requests: UD-IQ3_XXS plain 20.6, DFlash2 38.7 (code) / 53.0
+(list); Q8_0 plain 9.9, DFlash2 33.2 / 39.6. MLX with Q8_0 and DFlash2: 24.4 / 26.5. The remaining
+MLX gap is the verify (Q8_0: 155 vs 122 ms per 8-row step) and the drafter (26-32 vs 14 ms).
+
 ## 10. Memory and KV cache strategy
 
 - **FullAttention layers**: standard KV cache `[numKVHeads, maxSeqLen,

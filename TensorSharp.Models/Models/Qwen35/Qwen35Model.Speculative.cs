@@ -30,6 +30,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using TensorSharp;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 
@@ -789,6 +790,11 @@ namespace TensorSharp.Models
         public void SpecOnVerifyAccepted(int acceptedRows, int verifyRows)
         {
             _fvAcceptedPrefixCommitted = false;
+            if (TryCommitMlxVerifyRow(acceptedRows))
+            {
+                _fvAcceptedPrefixCommitted = true;
+                return;
+            }
             if (_fvSnapshotRows <= 0)
                 return;                       // the old path already drained the state
 
@@ -848,6 +854,9 @@ namespace TensorSharp.Models
             if (_fvSnapshotIsDeviceLive)
                 return;
 
+            if (TrySnapshotMlxRecurrentState())
+                return;
+
             // Direct-CUDA fast path: snapshot the GDN state device-to-device
             // (async cuMemcpyDtoD on the stream) instead of draining it to host
             // bytes. The host path does an EnsureHostReadable DtoH per recurrent
@@ -877,6 +886,8 @@ namespace TensorSharp.Models
         /// <summary>Restore the GDN recurrent state captured by <see cref="SpecSnapshotRecurrentState"/>.</summary>
         public void SpecRestoreRecurrentState()
         {
+            if (TryRestoreMlxRecurrentState())
+                return;
             if (_fvSnapshotIsDeviceLive)
             {
                 // The pre-verify state is in the live device slices; the host mirrors
@@ -1021,5 +1032,76 @@ namespace TensorSharp.Models
             => IsGgmlBackend && !IsTensorParallel && !HasDFlash && !_fdUnsupported;
 
         public bool SpecPlainStepCostsFamilySwitch => true;
+
+        // ------------------------------------------------------------------------------------
+        // MLX: the verify keeps the recurrent state after every row (GatedDeltaNetCache.
+        // KeepRowStates), so a partial acceptance commits the accepted row's state on the device
+        // instead of restoring the pre-verify state and forwarding the accepted prefix again (on
+        // Qwen3.8-27B that re-forward averaged 135 ms per rejection, 22% of a code reply). The
+        // pre-verify snapshot is a reference to the immutable MLX state arrays (no copy); it
+        // backs the restore path when a verify kept no rows (e.g. the unpacked GDN route).
+        // ------------------------------------------------------------------------------------
+        private MlxFusedOps.GatedDeltaNetCache[] _mlxSpecSnapshot;
+        private bool _mlxVerifyRowStates;
+
+        private bool TrySnapshotMlxRecurrentState()
+        {
+            if (_backend != BackendType.Mlx || _mlxGdnCache == null)
+                return false;
+            _mlxSpecSnapshot ??= new MlxFusedOps.GatedDeltaNetCache[Config.NumLayers];
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                _mlxSpecSnapshot[l]?.Dispose();
+                _mlxSpecSnapshot[l] = _isRecurrent[l] && _mlxGdnCache[l] != null ? _mlxGdnCache[l].CloneState() : null;
+            }
+            _mlxVerifyRowStates = true;
+            return true;
+        }
+
+        private bool TryRestoreMlxRecurrentState()
+        {
+            if (_backend != BackendType.Mlx || _mlxSpecSnapshot == null || _mlxGdnCache == null)
+                return false;
+            _mlxVerifyRowStates = false;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_mlxSpecSnapshot[l] == null || _mlxGdnCache[l] == null)
+                    continue;
+                _mlxGdnCache[l].RestoreFrom(_mlxSpecSnapshot[l]);
+            }
+            return true;
+        }
+
+        /// <summary>Whether the MLX verify that just ran should keep per-row states (consumed by the
+        /// next multi-row GDN run after a snapshot).</summary>
+        private bool MlxKeepVerifyRowStates(int seqLen) => _mlxVerifyRowStates && seqLen > 1;
+
+        private bool TryCommitMlxVerifyRow(int acceptedRows)
+        {
+            if (_backend != BackendType.Mlx || !_mlxVerifyRowStates || _mlxGdnCache == null)
+                return false;
+            _mlxVerifyRowStates = false;
+            int rows = -1;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!_isRecurrent[l] || _mlxGdnCache[l] == null)
+                    continue;
+                int kept = _mlxGdnCache[l].RowStates;
+                if (rows < 0) rows = kept;
+                if (kept == 0 || kept != rows)
+                    rows = 0;
+            }
+            bool ok = rows > 0 && acceptedRows >= 0 && acceptedRows < rows;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!_isRecurrent[l] || _mlxGdnCache[l] == null)
+                    continue;
+                if (ok)
+                    _mlxGdnCache[l].CommitRow(acceptedRows);
+                else
+                    _mlxGdnCache[l].ClearRows();
+            }
+            return ok;
+        }
     }
 }

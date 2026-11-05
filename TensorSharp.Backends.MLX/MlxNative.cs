@@ -4752,6 +4752,9 @@ if (simd_id == 0) {
             }
             else
             {
+                MlxArray fewRow = TryIq4XsFewRowMatmul(input, rawWeight, rows, inDim, outDim);
+                if (fewRow.IsValid)
+                    return fewRow;
                 try
                 {
                     return Iq4XsDequantMatmul(input, rawWeight, rows, inDim, outDim);
@@ -5079,6 +5082,12 @@ if (simd_id == 0) {
 
         internal static MlxArray Iq2XxsMatmul(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim)
         {
+            MlxArray dequantGemm = TryIq2XxsDequantMatmul(input, rawWeight, rows, inDim, outDim);
+            if (dequantGemm.IsValid)
+                return dequantGemm;
+            MlxArray fewRow = TryIq2XxsFewRowMatmul(input, rawWeight, rows, inDim, outDim);
+            if (fewRow.IsValid)
+                return fewRow;
             if (!input.IsValid || !rawWeight.IsValid)
                 throw new ArgumentException("IQ2_XXS matmul requires valid input and raw weight arrays.");
             if (rows <= 0 || inDim <= 0 || outDim <= 0 || inDim % 256 != 0)
@@ -5535,6 +5544,12 @@ if (simd_id == 0) {
 
         internal static MlxArray Iq2SMatmul(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim)
         {
+            MlxArray dequantGemm = TryIq2SDequantMatmul(input, rawWeight, rows, inDim, outDim);
+            if (dequantGemm.IsValid)
+                return dequantGemm;
+            MlxArray fewRow = TryIq2SFewRowMatmul(input, rawWeight, rows, inDim, outDim);
+            if (fewRow.IsValid)
+                return fewRow;
             if (rows >= Iq2XxsMatmulSimdgroupMinRows)
             {
                 try { return Iq2SMatmulSimdgroup(input, rawWeight, rows, inDim, outDim); }
@@ -5555,6 +5570,12 @@ if (simd_id == 0) {
 
         internal static MlxArray Iq3SMatmul(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim)
         {
+            MlxArray dequantGemm = TryIq3SDequantMatmul(input, rawWeight, rows, inDim, outDim);
+            if (dequantGemm.IsValid)
+                return dequantGemm;
+            MlxArray fewRow = TryIq3SFewRowMatmul(input, rawWeight, rows, inDim, outDim);
+            if (fewRow.IsValid)
+                return fewRow;
             if (rows >= Iq2XxsMatmulSimdgroupMinRows)
             {
                 try { return Iq3SMatmulSimdgroup(input, rawWeight, rows, inDim, outDim); }
@@ -5575,6 +5596,12 @@ if (simd_id == 0) {
 
         internal static MlxArray Iq3XxsMatmul(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim)
         {
+            MlxArray dequantGemm = TryIq3XxsDequantMatmul(input, rawWeight, rows, inDim, outDim);
+            if (dequantGemm.IsValid)
+                return dequantGemm;
+            MlxArray fewRow = TryIq3XxsFewRowMatmul(input, rawWeight, rows, inDim, outDim);
+            if (fewRow.IsValid)
+                return fewRow;
             if (rows >= Iq2XxsMatmulSimdgroupMinRows)
             {
                 try { return Iq3XxsMatmulSimdgroup(input, rawWeight, rows, inDim, outDim); }
@@ -5724,6 +5751,9 @@ if (simd_id == 0) {
             }
             else if (rows > Q6KMatvecMaxRows)
             {
+                MlxArray fewRow = TryQ6KFewRowMatmul(input, rawWeight, rows, inDim, outDim);
+                if (fewRow.IsValid)
+                    return fewRow;
                 try
                 {
                     return Q6KDequantMatmul(input, rawWeight, rows, inDim, outDim);

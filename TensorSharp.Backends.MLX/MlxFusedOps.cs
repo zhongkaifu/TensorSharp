@@ -910,6 +910,55 @@ namespace TensorSharp.MLX
                 MlxNative.FreeArray(deltaState);
                 convState = default;
                 deltaState = default;
+                ClearRows();
+            }
+
+            /// <summary>
+            /// Set by the model for a speculative verify: the next multi-row packed run keeps the
+            /// recurrent state after every row (<see cref="RowStates"/>), so the state at the end of
+            /// the accepted prefix can be committed (<see cref="CommitRow"/>) instead of restoring the
+            /// pre-verify state and forwarding the prefix again. The rows run the scan one at a time
+            /// (T=1 kernel); the conv states are slices of the old tail and the batch's raw rows.
+            /// </summary>
+            public bool KeepRowStates { get; set; }
+
+            private MlxNative.MlxArray[] rowConv, rowDelta;
+
+            /// <summary>Rows whose post-row state the last run kept (0: none).</summary>
+            public int RowStates => rowDelta?.Length ?? 0;
+
+            public void ClearRows()
+            {
+                if (rowConv != null)
+                    foreach (var a in rowConv) MlxNative.FreeArray(a);
+                if (rowDelta != null)
+                    foreach (var a in rowDelta) MlxNative.FreeArray(a);
+                rowConv = rowDelta = null;
+            }
+
+            /// <summary>Make the state after <paramref name="row"/> (0-based) of the last kept run live.</summary>
+            public bool CommitRow(int row)
+            {
+                if (rowDelta == null || rowConv == null || row < 0 || row >= rowDelta.Length)
+                    return false;
+                MlxNative.MlxArray conv = MlxNative.Retain(rowConv[row]), delta = MlxNative.Retain(rowDelta[row]);
+                MlxNative.FreeArray(convState);
+                MlxNative.FreeArray(deltaState);
+                convState = conv;
+                deltaState = delta;
+                ClearRows();
+                return true;
+            }
+
+            /// <summary>Take the state of <paramref name="snapshot"/> (a <see cref="CloneState"/>), dropping kept rows.</summary>
+            public void RestoreFrom(GatedDeltaNetCache snapshot)
+            {
+                MlxNative.MlxArray conv = MlxNative.Retain(snapshot.convState), delta = MlxNative.Retain(snapshot.deltaState);
+                MlxNative.FreeArray(convState);
+                MlxNative.FreeArray(deltaState);
+                convState = conv;
+                deltaState = delta;
+                ClearRows();
             }
 
             /// <summary>Whether a step has run since the last <see cref="Reset"/>; before
@@ -1145,21 +1194,26 @@ namespace TensorSharp.MLX
                         MlxNative.FreeArray(kScale);
                     }
 
-                    MlxNative.GatedDelta(
-                        qScaled,
-                        kScaled,
-                        v,
-                        gDecay,
-                        betaSig,
-                        deltaState,
-                        1,
-                        seqLen,
-                        numKeyHeads,
-                        numValueHeads,
-                        headKeyDim,
-                        headValueDim,
-                        out deltaOut,
-                        out nextDelta);
+                    ClearRows();
+                    if (KeepRowStates && seqLen > 1)
+                        RunRowwise(packedView, qScaled, kScaled, v, gDecay, betaSig, seqLen, qkvDim, convKernel - 1,
+                            numKeyHeads, numValueHeads, headKeyDim, headValueDim, out deltaOut, out nextDelta);
+                    else
+                        MlxNative.GatedDelta(
+                            qScaled,
+                            kScaled,
+                            v,
+                            gDecay,
+                            betaSig,
+                            deltaState,
+                            1,
+                            seqLen,
+                            numKeyHeads,
+                            numValueHeads,
+                            headKeyDim,
+                            headValueDim,
+                            out deltaOut,
+                            out nextDelta);
 
                     gated = MlxNative.Qwen35GdnPostprocess(
                         deltaOut,
@@ -1373,21 +1427,26 @@ namespace TensorSharp.MLX
                         qScaled = MulScalar(qNorm, 1.0f / headKeyDim);
                         kScaled = MulScalar(kNorm, 1.0f / MathF.Sqrt(headKeyDim));
 
-                        MlxNative.GatedDelta(
-                            qScaled,
-                            kScaled,
-                            v,
-                            gDecay,
-                            betaSig,
-                            deltaState,
-                            1,
-                            seqLen,
-                            numKeyHeads,
-                            numValueHeads,
-                            headKeyDim,
-                            headValueDim,
-                            out deltaOut,
-                            out nextDelta);
+                        ClearRows();
+                        if (KeepRowStates && seqLen > 1)
+                            RunRowwise(qkvView, qScaled, kScaled, v, gDecay, betaSig, seqLen, qkvDim, convKernel - 1,
+                                numKeyHeads, numValueHeads, headKeyDim, headValueDim, out deltaOut, out nextDelta);
+                        else
+                            MlxNative.GatedDelta(
+                                qScaled,
+                                kScaled,
+                                v,
+                                gDecay,
+                                betaSig,
+                                deltaState,
+                                1,
+                                seqLen,
+                                numKeyHeads,
+                                numValueHeads,
+                                headKeyDim,
+                                headValueDim,
+                                out deltaOut,
+                                out nextDelta);
 
                         gated2 = MlxNative.Qwen35GdnPostprocess(
                             deltaOut,
@@ -1472,21 +1531,26 @@ namespace TensorSharp.MLX
                     betaSig2 = MlxNative.Unary(MlxNative.MlxUnaryOp.Sigmoid, betaView);
                     betaSig = MlxNative.Reshape(betaSig2, new[] { 1, seqLen, numValueHeads });
 
-                    MlxNative.GatedDelta(
-                        qScaled,
-                        kScaled,
-                        v,
-                        gDecay,
-                        betaSig,
-                        deltaState,
-                        1,
-                        seqLen,
-                        numKeyHeads,
-                        numValueHeads,
-                        headKeyDim,
-                        headValueDim,
-                        out deltaOut,
-                        out nextDelta);
+                    ClearRows();
+                    if (KeepRowStates && seqLen > 1)
+                        RunRowwise(qkvView, qScaled, kScaled, v, gDecay, betaSig, seqLen, qkvDim, convKernel - 1,
+                            numKeyHeads, numValueHeads, headKeyDim, headValueDim, out deltaOut, out nextDelta);
+                    else
+                        MlxNative.GatedDelta(
+                            qScaled,
+                            kScaled,
+                            v,
+                            gDecay,
+                            betaSig,
+                            deltaState,
+                            1,
+                            seqLen,
+                            numKeyHeads,
+                            numValueHeads,
+                            headKeyDim,
+                            headValueDim,
+                            out deltaOut,
+                            out nextDelta);
 
                     normed = MlxNative.FastRmsNorm(deltaOut, normWeightView, eps);
                     z4 = MlxNative.Reshape(zView, new[] { 1, seqLen, numValueHeads, headValueDim });
@@ -1548,6 +1612,74 @@ namespace TensorSharp.MLX
                     MlxNative.FreeArray(zSilu);
                     MlxNative.FreeArray(gated4);
                     MlxNative.FreeArray(gated2);
+                }
+            }
+
+            /// <summary>The scan one row at a time, keeping each row's delta and conv state (see <see cref="KeepRowStates"/>).
+            /// <paramref name="rawRows"/>: [seqLen, >= qkvDim] whose first qkvDim columns are the raw (pre-conv) qkv rows.</summary>
+            private void RunRowwise(
+                MlxNative.MlxArray rawRows, MlxNative.MlxArray q, MlxNative.MlxArray k, MlxNative.MlxArray v,
+                MlxNative.MlxArray g, MlxNative.MlxArray beta, int seqLen, int qkvDim, int tail,
+                int numKeyHeads, int numValueHeads, int headKeyDim, int headValueDim,
+                out MlxNative.MlxArray deltaOut, out MlxNative.MlxArray nextDelta)
+            {
+                var ys = new MlxNative.MlxArray[seqLen];
+                var deltas = new MlxNative.MlxArray[seqLen];
+                var convs = new MlxNative.MlxArray[seqLen];
+                MlxNative.MlxArray raw = default, raw3 = default, joined = default, output = default;
+                deltaOut = default;
+                nextDelta = default;
+                try
+                {
+                    MlxNative.MlxArray state = deltaState;
+                    for (int r = 0; r < seqLen; r++)
+                    {
+                        MlxNative.MlxArray qr = default, kr = default, vr = default, gr = default, br = default;
+                        try
+                        {
+                            qr = MlxNative.Slice(q, new[] { 0, r, 0, 0 }, new[] { 1, r + 1, numKeyHeads, headKeyDim }, new[] { 1, 1, 1, 1 });
+                            kr = MlxNative.Slice(k, new[] { 0, r, 0, 0 }, new[] { 1, r + 1, numKeyHeads, headKeyDim }, new[] { 1, 1, 1, 1 });
+                            vr = MlxNative.Slice(v, new[] { 0, r, 0, 0 }, new[] { 1, r + 1, numValueHeads, headValueDim }, new[] { 1, 1, 1, 1 });
+                            gr = MlxNative.Slice(g, new[] { 0, r, 0 }, new[] { 1, r + 1, numValueHeads }, new[] { 1, 1, 1 });
+                            br = MlxNative.Slice(beta, new[] { 0, r, 0 }, new[] { 1, r + 1, numValueHeads }, new[] { 1, 1, 1 });
+                            MlxNative.GatedDelta(qr, kr, vr, gr, br, state, 1, 1, numKeyHeads, numValueHeads, headKeyDim, headValueDim,
+                                out ys[r], out deltas[r]);
+                            state = deltas[r];
+                        }
+                        finally
+                        {
+                            MlxNative.FreeArray(qr); MlxNative.FreeArray(kr); MlxNative.FreeArray(vr);
+                            MlxNative.FreeArray(gr); MlxNative.FreeArray(br);
+                        }
+                    }
+                    output = ys[0];
+                    ys[0] = default;
+                    for (int r = 1; r < seqLen; r++)
+                    {
+                        MlxNative.MlxArray next = MlxNative.ConcatenateAxis(output, ys[r], 1);
+                        MlxNative.FreeArray(output);
+                        output = next;
+                    }
+                    // Conv state after row r: rows r + 1 .. r + tail of [old tail ; this batch's raw qkv rows].
+                    raw = MlxNative.Slice(rawRows, new[] { 0, 0 }, new[] { seqLen, qkvDim }, new[] { 1, 1 });
+                    raw3 = MlxNative.Reshape(raw, new[] { 1, seqLen, qkvDim });
+                    joined = MlxNative.ConcatenateAxis(convState, raw3, 1);
+                    for (int r = 0; r < seqLen; r++)
+                        convs[r] = MlxNative.Slice(joined, new[] { 0, r + 1, 0 }, new[] { 1, r + 1 + tail, qkvDim }, new[] { 1, 1, 1 });
+                    nextDelta = MlxNative.Retain(deltas[seqLen - 1]);
+                    deltaOut = output;
+                    output = default;
+                    rowDelta = deltas;
+                    rowConv = convs;
+                    deltas = null;
+                    convs = null;
+                }
+                finally
+                {
+                    foreach (var a in ys) MlxNative.FreeArray(a);
+                    if (deltas != null) foreach (var a in deltas) MlxNative.FreeArray(a);
+                    if (convs != null) foreach (var a in convs) MlxNative.FreeArray(a);
+                    MlxNative.FreeArray(raw); MlxNative.FreeArray(raw3); MlxNative.FreeArray(joined); MlxNative.FreeArray(output);
                 }
             }
 

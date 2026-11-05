@@ -634,6 +634,24 @@ NVFP4 GGUF 走 `--backend cuda`（`Q35CudaEngine`）时，每一步都要把全�
 | 长缓存上的短提示块（会话的新一轮、新对话的后缀） | 8 位提示注意力不切分键：127K 缓存上 47 token 的块只有 8 个 CTA，每层 5.3 ms，另加 0.65 ms 转换 band | 改用把键切分到整卡的 16 位核函数，直到 8 位 CTA 能覆盖约 40% 的 SM（约 350 行；两条路线都适用）：该轮首 token 140 -> 50 ms |
 | 同一步进入、共享缓存前缀的多个对话 | 从 radix 缓存恢复的请求还没有 holder，批量预填充跳过它，后缀逐个预填充 | 执行器先绑定 holder、注入前缀（`PrebindCachedPrefixPrefills`），后缀共用一次前向：120K token 文档上 3 个这样的对话首 token 相差不到 3 ms |
 
+### MLX：UD 量化与推测解码
+
+M5 Pro（48 GB）实测：Qwen3.8-27B GGUF，DFlash2 Q4_K_M 草稿模型（`--spec-draft 7`），2.3K token 提示，512 token 回答；推测解码数据为同一进程的第二个请求（核函数已编译）。
+
+- **低比特格式上 GPU。** Unsloth 的 UD-IQ3_XXS 在 10.9 GB 中有 1.2 GB 是 Q2_K、Q3_K、IQ2_XS、IQ1_S、IQ1_M，此前 MLX 没有对应核函数，走 CPU 托管反量化。现在都有了设备核函数（`MlxLowBitQuantKernels.cs`，反量化运算与 `ManagedQuantizedOps` 一致）：解码 1.8 -> 15.7 tok/s。
+- **预填充。** 原始 i-quant 在 32 行以上时先把权重分片反量化为 F16，再用 MLX GEMM（`TS_MLX_IQ_DEQUANT_GEMM_MIN_ROWS`），与 Q6_K、IQ4_XS 的做法一致：2.3K token 预填充 361 s -> 6.05 s（ggml_metal 7.0 s）。
+- **验证窗口。** 2-31 行时每组 8 个权重只解码一次进 simdgroup 矩阵块（`TS_MLX_IQ_FEWROW_MAX_ROWS`；8 行以下 F32，8 行起 F16，与被替换的核函数精度相同）：8 行验证 359 -> 186 ms。
+- **拒绝后不再重算。** 验证保留每一行之后的循环状态，接受行的状态直接在设备上提交，与 ggml 验证的快照做法相同；验证前快照改为引用不可变的 MLX 数组，不再复制到主机（每步 6 ms -> 0.1 ms）。此前每次拒绝都要恢复状态并重新前向接受的前缀，平均 135 ms。
+- **草稿模型。** DFlash2 的分组卷积在设备上计算，滑动窗口掩码以加法施加，不再每层四五次把系数、行和分数读回主机：每次起草 51 -> 32 ms。
+
+| UD-IQ3_XXS，MLX | 改前 | 改后 |
+|---|---:|---:|
+| 普通解码 | 1.8 tok/s | 15.7 tok/s |
+| DFlash2，代码回答 | 2.4 tok/s | 23-25 tok/s |
+| DFlash2，列表回答 | - | 22.5 tok/s |
+
+同样的文件与请求在 ggml_metal 上：UD-IQ3_XXS 普通 20.6，DFlash2 38.7（代码）/ 53.0（列表）；Q8_0 普通 9.9，DFlash2 33.2 / 39.6。MLX 上 Q8_0 + DFlash2 为 24.4 / 26.5。MLX 剩下的差距在验证（Q8_0 每个 8 行步 155 vs 122 ms）和草稿模型（26-32 vs 14 ms）。
+
 ## 10. 内存与 KV cache 策略
 
 - **FullAttention 层**：标准 KV cache `[numKVHeads, maxSeqLen, headDim]` per layer。KV dtype 通过 `--kv-cache-dtype` 选 `f32` / `f16` / `q8_0` / `q4_0`。
