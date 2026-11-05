@@ -60,7 +60,9 @@ different model formats.
 The default launcher suite includes factual answers, 4K/16K/32K retrieval,
 structured JSON, tool calls, an agentic tool loop, multiple turns, images, long
 generation, two/four concurrent requests, generated arithmetic and a pinned
-GSM8K subset. Requests default to temperature zero, no thinking and no
+GSM8K subset. The cross-engine scorecard scores retrieval at 8K/64K/128K/256K and
+concurrency, KV-cache reuse and multi-turn on the long-context sessions below; it
+ignores the 16K/32K retrieval, `prefix_reuse_16k` and the short `parallel_N` scenarios. Requests default to temperature zero, no thinking and no
 repetition/presence/frequency penalties. Do not silently change these settings
 or force tool calls for just one engine.
 
@@ -111,6 +113,23 @@ retrieval, document order and immediate neighbors. Do not truncate requests or
 change RoPE to manufacture a completion. A smaller configured capacity may
 still admit a genuine 128K request; label its capacity accurately. CPU offload
 is a separate deployment configuration from GPU-resident inference.
+
+Long-context sessions (`long_session_64k`, `long_session_128k`, `long_session_256k`) measure
+what a deployed long-context application sees on one shared document. The document is the
+tier minus 4K tokens, fitted with the tokenizer and placed in the system message. Eleven
+ledger codes are hidden in it at 4-96% depth. One case runs, in order:
+1. chat A, turn 1: the document is new to the server (cold TTFT);
+2. chat A, turns 2-3: the conversation continues (multi-turn TTFT);
+3. chats B and C: new conversations on the same document (KV-cache reuse TTFT);
+4. waves of `--long-waves` (default 2,4) new chats on the document, sent at once. Each
+   retrieves a code and writes about 150 words (`--long-wave-tokens`, default 384). The
+   wave's throughput is all generated tokens over its wall time; per-request TTFTs are
+   recorded too.
+
+Every answer must contain its exact code. The document carries the repeat's nonce, so its
+first request never hits another run's cache. Run each tier on a server whose context is
+that tier (65,536 / 131,072 / 262,144 tokens) with at least four lanes, and record whether
+speculative decoding ran (the scorecard reads `spec.txt` beside each tier's results).
 
 `qwen38-quality-diagnostics.py` may identify a correct answer inside one outer
 Markdown fence, but never rescales or replaces the original score.

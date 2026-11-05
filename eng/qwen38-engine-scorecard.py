@@ -5,8 +5,12 @@
       [--context context.json]
 
 CAMPAIGN_DIR holds one directory per engine and context tier, as written by the campaign
-driver: <engine>-64k/{main,long}.jsonl, <engine>-128k/long128.jsonl, <engine>-256k/long256.jsonl, longdecode.jsonl
-(one JSON line per long-context decode probe), ready.txt (load_s=...), vram.txt.
+driver: <engine>-main/main.jsonl (the short scenarios), <engine>-{64k,128k,256k}/ with the tier's
+needle-retrieval TTFT (long_prompt_*), its long session (long_session_*: cold TTFT, multi-turn,
+KV-cache reuse, concurrent waves) and longdecode.jsonl (one JSON line per long-context decode
+probe), ready.txt (load_s=...), vram.txt and spec.txt ("on ..." or "off": whether speculative
+decoding ran; absent = on, except <engine>-nospec). Every metric records which (summary
+"spec": on / off / mixed) so the poster can label each result.
 TensorSharp is scored as two deployments: tensorsharp (the NInfer .ninfer artifact on the
 native CUDA engine, text only) and tensorsharp-gguf (the GGUF + mmproj model on the same
 engine). <engine>-nospec holds the same engine with speculative
@@ -27,30 +31,36 @@ the report): this ranks served configurations, not kernels in isolation.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import html
 import json
 import math
+import re
 import statistics
 from pathlib import Path
 
 ENGINE_NAMES = {"tensorsharp": "TensorSharp-NInfer", "tensorsharp-gguf": "TensorSharp-GGUF", "ignis": "Ignis",
-                "ninfer": "NInfer", "velox": "velox-inferer", "llamacpp": "llama.cpp", "vllm": "vLLM", "sglang": "SGLang"}
+                "ninfer": "NInfer", "llamacpp": "llama.cpp", "vllm": "vLLM", "sglang": "SGLang"}
+TIERS = ("64k", "128k", "256k")
 TS_ENGINES = ("tensorsharp", "tensorsharp-gguf")
 
-# (id, en, zh, weight, quality scenarios, perf metrics [(metric id, higher_is_better)])
+# (id, en, zh, weight, quality items, perf metrics [(metric id, higher_is_better)]). A quality item is a
+# scenario name, or "scenario-glob:check-name-regex" for some checks of the matching scenarios.
+SESSION = "long_session_*"
 CATEGORIES = [
-    ("prefill", "Long-context prefill (8K-256K TTFT)", "长上下文预填充（8K–256K 首 token）", 1.5,
-     ["long_prompt_8k", "long_prompt_32k", "long_prompt_63k", "long_prompt_127k", "long_prompt_250k"],
-     [("ttft_8k", False), ("ttft_32k", False), ("ttft_63k", False), ("ttft_127k", False), ("ttft_250k", False)]),
-    ("longdecode", "Long-context decode (32K/60K/120K/250K)", "长上下文解码（32K/60K/120K/250K）", 1.5, [],
-     [("ld_32000", True), ("ld_60000", True), ("ld_120000", True), ("ld_250000", True)]),
+    ("prefill", "Prefill TTFT (8K / 64K / 128K / 256K)", "预填充首 token（8K / 64K / 128K / 256K）", 1.5,
+     ["long_prompt_8k", "long_prompt_63k", "long_prompt_127k", "long_prompt_250k"],
+     [("ttft_8k", False), ("ttft_63k", False), ("ttft_127k", False), ("ttft_250k", False)]),
+    ("longdecode", "Decode after 64K / 128K / 256K of context", "64K / 128K / 256K 上下文后解码", 1.5, [],
+     [("ld_60000", True), ("ld_120000", True), ("ld_250000", True)]),
+    ("reuse", "KV-cache reuse and multi-turn (64K / 128K / 256K)", "KV 缓存复用与多轮对话（64K / 128K / 256K）", 1.0,
+     [SESSION + ":(turn|reuse|context_length)", "multi_turn"],
+     [(f"lreuse_{t}", False) for t in TIERS] + [(f"lmt_{t}", False) for t in TIERS] + [("multiturn_ttft", False)]),
+    ("concurrency", "Concurrent requests (64K / 128K / 256K)", "并发请求（64K / 128K / 256K）", 1.0,
+     [SESSION + ":par"], [(f"lpar{n}_{t}", True) for t in TIERS for n in (2, 4)]),
     ("decode", "Decode, single request", "单请求解码", 1.0, ["long_generation", "short_chat"],
      [("decode_gen", True), ("ttft_short", False)]),
-    ("concurrency", "Parallel requests (2 / 4)", "并行请求（2 / 4 路）", 1.0, ["parallel_2", "parallel_4"],
-     [("par2_tok_s", True), ("par4_tok_s", True)]),
     ("agent", "Agent tool loop", "智能体工具循环", 1.0, ["agentic_loop"], [("agent_e2e", False)]),
-    ("reuse", "Multi-turn and KV-cache reuse", "多轮对话与 KV 缓存复用", 1.0, ["multi_turn", "prefix_reuse_16k"],
-     [("multiturn_ttft", False), ("reuse_warm_ttft", False)]),
     ("subagent", "Sub-agent fan-out", "子智能体扇出", 1.0, ["subagent_fanout"], [("subagent_e2e", False)]),
     ("tools", "Tool and skill calls", "工具与 Skill 调用", 1.0, ["tool_call_single", "tool_call_parallel", "skill_call"],
      [("tool_single_s", False), ("tool_parallel_s", False), ("skill_e2e", False)]),
@@ -62,6 +72,32 @@ CATEGORIES = [
     ("reasoning", "Answer quality (chat, arithmetic, GSM8K)", "回答质量（问答、计算、GSM8K）", 1.0,
      ["short_chat", "quality_tasks", "quality_gsm8k"], []),
 ]
+
+
+def quality_items(m, items):
+    """(passed, total) over a category's quality items (see CATEGORIES)."""
+    ok = n = 0
+    for item in items:
+        if ":" in item:
+            glob, rx = item.split(":", 1)
+            for scenario, name, good in m["_checks"]:
+                if fnmatch.fnmatch(scenario, glob) and re.match(rx, name):
+                    n += 1
+                    ok += 1 if good else 0
+        else:
+            a, b = m["_quality"].get(item, (0, 0))
+            ok, n = ok + a, n + b
+    return ok, n
+
+
+def scored_scenario(scenario):
+    """True when some category scores this scenario's checks (older runs carry retired scenarios)."""
+    for c in CATEGORIES:
+        for item in c[4]:
+            glob = item.split(":", 1)[0]
+            if fnmatch.fnmatch(scenario, glob):
+                return True
+    return False
 
 
 def med(xs):
@@ -96,6 +132,18 @@ def load_dir(d: Path):
         vals = [int(x.split()[0]) for x in vt.read_text().split("\n") if x.strip()]
         meta["vram_mib"] = max(vals) if vals else None
     meta["failed"] = (d / "FAILED").exists()
+    st = d / "spec.txt"
+    if st.exists():
+        meta["spec"] = "off" if st.read_text().strip().lower().startswith("off") else "on"
+    else:
+        meta["spec"] = "off" if d.name.endswith("-nospec") or (d / "LEAN").exists() else "on"
+    vt2 = d / "variant.txt"
+    if vt2.exists():
+        meta["variant"] = vt2.read_text().strip()
+    for c in cases:
+        c["_spec"] = meta["spec"]
+    for p in probes:
+        p["_spec"] = meta["spec"]
     return cases, probes, meta
 
 
@@ -130,11 +178,10 @@ def metrics_for(e):
         return med([c["metrics"].get(key) for c in by.get(scenario, []) if not answered_only or c.get("verdict") in ("PASS", "FAIL")])
 
     out = {
-        "ttft_8k": m("long_prompt_8k", "ttft_s"), "ttft_32k": m("long_prompt_32k", "ttft_s"),
+        "ttft_8k": m("long_prompt_8k", "ttft_s"),
         "ttft_63k": m("long_prompt_63k", "ttft_s"), "ttft_127k": m("long_prompt_127k", "ttft_s"),
         "ttft_250k": m("long_prompt_250k", "ttft_s"),
         "decode_gen": m("long_generation", "decode_tok_s"), "ttft_short": m("short_chat", "ttft_s"),
-        "par2_tok_s": m("parallel_2", "aggregate_tok_s"), "par4_tok_s": m("parallel_4", "aggregate_tok_s"),
         "agent_e2e": m("agentic_loop", "end_to_end_s"),
         "subagent_e2e": m("subagent_fanout", "end_to_end_s"),
         "tool_single_s": m("tool_call_single", "total_s"), "tool_parallel_s": m("tool_call_parallel", "total_s"),
@@ -146,14 +193,20 @@ def metrics_for(e):
           if c.get("verdict") in ("PASS", "FAIL")]
     later = [t[1:] for t in mt if isinstance(t, list) and len(t) > 1]
     out["multiturn_ttft"] = med([x for t in later for x in t]) if later else m("multi_turn", "ttft_s")
-    reuse = [c["metrics"] for c in by.get("prefix_reuse_16k", []) if c.get("verdict") in ("PASS", "FAIL")]
-    out["reuse_cold_ttft"] = med([r.get("cold_ttft_s") for r in reuse])
-    out["reuse_warm_ttft"] = med([r.get("warm_ttft_s") for r in reuse])
-    out["reuse_speedup"] = (out["reuse_cold_ttft"] / out["reuse_warm_ttft"]
-                            if out["reuse_cold_ttft"] and out["reuse_warm_ttft"] else None)
-    out["reuse_cached"] = med([x for r in reuse for x in (r.get("turn_cached_tokens") or [])[1:]])
     out["mt_turn1_ttft"] = med([t[0] for t in mt if isinstance(t, list) and t])
     out["mt_cached"] = med([x for c in by.get("multi_turn", []) for x in (c["metrics"].get("turn_cached_tokens") or [])[1:]])
+    for tier in TIERS:
+        ss = [c["metrics"] for c in by.get(f"long_session_{tier}", []) if c.get("verdict") in ("PASS", "FAIL")]
+        out[f"lcold_{tier}"] = med([x.get("cold_ttft_s") for x in ss])
+        out[f"lmt_{tier}"] = med([y for x in ss for y in (x.get("turn_ttft_s") or [])[1:]])
+        out[f"lreuse_{tier}"] = med([y for x in ss for y in (x.get("reuse_ttft_s") or [])])
+        out[f"lmt_cached_{tier}"] = med([y for x in ss for y in (x.get("turn_cached_tokens") or [])[1:]])
+        out[f"lreuse_cached_{tier}"] = med([y for x in ss for y in (x.get("reuse_cached_tokens") or [])])
+        out[f"ldoc_{tier}"] = med([x.get("prompt_tokens") for x in ss])
+        for n in (2, 4):
+            waves = [x.get(f"par{n}") or {} for x in ss]
+            out[f"lpar{n}_{tier}"] = med([w.get("aggregate_tok_s") for w in waves])
+            out[f"lpar{n}_ttft_{tier}"] = med([w.get("ttft_s") for w in waves])
     gen = [c["metrics"] for c in by.get("long_generation", []) if c.get("verdict") in ("PASS", "FAIL")]
     out["spec_accept"] = med([g.get("acceptance_rate") for g in gen])
     out["spec_tokens_per_step"] = med([g.get("tokens_per_step") for g in gen])
@@ -161,17 +214,29 @@ def metrics_for(e):
                                 if c["scenario"] == "long_generation" and c.get("verdict") in ("PASS", "FAIL")])
     out["spec_speedup"] = (out["decode_gen"] / out["decode_nospec"]
                            if out.get("decode_gen") and out["decode_nospec"] else None)
-    for size in (32000, 60000, 120000, 250000):
+    for size in (60000, 120000, 250000):
         out[f"ld_{size}"] = med([p.get("decode_tok_s") for p in e["probes"]
                                  if p.get("tag", "").endswith(f"-{size}") and p.get("completion_tokens")])
-    for size in (32000, 60000, 120000, 250000):
         out[f"ld_ttft_{size}"] = med([p.get("ttft_s") for p in e["probes"]
                                       if p.get("tag", "").endswith(f"-{size}") and p.get("completion_tokens")])
+    # Whether speculative decoding ran for each measurement: on / off / mixed.
+    spec = {}
+    for mid, (scenario, _, _) in WORKLOADS.items():
+        if scenario.startswith("probe:"):
+            vals = {p.get("_spec") for p in e["probes"] if p.get("tag", "").endswith("-" + scenario.split(":")[1])
+                    and p.get("completion_tokens")}
+        else:
+            vals = {c.get("_spec") for c in by.get(scenario, []) if c.get("verdict") in ("PASS", "FAIL")}
+        vals.discard(None)
+        spec[mid] = (vals.pop() if len(vals) == 1 else "mixed") if vals else None
+    spec["decode_nospec"] = "off" if out["decode_nospec"] else None
+    out["_spec"] = spec
     q = {}
     for scenario, cs in by.items():
         checks = [ch for c in cs for ch in c.get("checks", [])]
         q[scenario] = (sum(1 for ch in checks if ch.get("ok")), len(checks))
     out["_quality"] = q
+    out["_checks"] = [(c["scenario"], ch.get("name", ""), bool(ch.get("ok"))) for c in e["cases"] for ch in c.get("checks", [])]
     return out
 
 
@@ -191,8 +256,7 @@ def score(engines, not_run=None):
     for k, m in mets.items():
         cats = {}
         for cid, en, zh, w, qs, ps in CATEGORIES:
-            qp = [m["_quality"].get(s, (0, 0)) for s in qs]
-            n_ok, n = sum(a for a, _ in qp), sum(b for _, b in qp)
+            n_ok, n = quality_items(m, qs)
             quality = 100.0 * n_ok / n if n else (0.0 if qs else None)
             perf_parts = []
             for mid, hib in ps:
@@ -208,8 +272,8 @@ def score(engines, not_run=None):
         overall = sum(c[3] * cats[c[0]]["score"] for c in CATEGORIES if cats[c[0]]["score"] is not None) / wsum
         qcats = [cats[c[0]]["quality"] for c in CATEGORIES if cats[c[0]]["quality"] is not None]
         pcats = [cats[c[0]]["perf"] for c in CATEGORIES if cats[c[0]]["perf"] is not None]
-        allq = [m["_quality"][s] for s in m["_quality"]]
-        result[k] = {"metrics": {a: b for a, b in m.items() if not a.startswith("_")}, "categories": cats,
+        allq = [m["_quality"][s] for s in m["_quality"] if scored_scenario(s)]
+        result[k] = {"metrics": {a: b for a, b in m.items() if not a.startswith("_")}, "spec": m["_spec"], "categories": cats,
                      "overall": overall, "quality": sum(qcats) / len(qcats) if qcats else None,
                      "performance": sum(pcats) / len(pcats) if pcats else None,
                      "checks": [sum(a for a, _ in allq), sum(b for _, b in allq)],
@@ -224,7 +288,7 @@ def score(engines, not_run=None):
 
 T = {
     "en": {"title": "Qwen3.8-27B inference engines on one RTX 5090: performance and quality",
-           "sub": "TensorSharp vs Ignis, NInfer, llama.cpp, vLLM and SGLang - same prompts, greedy, thinking off",
+           "sub": "TensorSharp vs Ignis, NInfer, llama.cpp and SGLang - same prompts, greedy, thinking off",
            "rank": "Overall ranking", "overall": "Overall", "quality": "Quality", "perf": "Performance",
            "engine": "Engine", "cats": "Category scores (0-100)", "metrics": "Key measurements",
            "method": "Method", "caveats": "Caveats", "ts": "TensorSharp improvements in this round",
@@ -232,7 +296,7 @@ T = {
            "checks": "checks passed", "load": "load", "table": "Table view",
            "lower": "lower is better", "higher": "higher is better", "na": "unsupported / not run"},
     "zh": {"title": "单张 RTX 5090 上的 Qwen3.8-27B 推理引擎：性能与质量评测",
-           "sub": "TensorSharp 对比 Ignis、NInfer、llama.cpp、vLLM、SGLang —— 相同提示、贪心解码、关闭思考",
+           "sub": "TensorSharp 对比 Ignis、NInfer、llama.cpp、SGLang —— 相同提示、贪心解码、关闭思考",
            "rank": "综合排名", "overall": "综合", "quality": "质量", "perf": "性能",
            "engine": "引擎", "cats": "分项得分（0–100）", "metrics": "关键测量值",
            "method": "方法", "caveats": "注意事项", "ts": "本轮 TensorSharp 优化",
@@ -240,23 +304,23 @@ T = {
            "checks": "项检查通过", "load": "加载", "table": "表格视图",
            "lower": "越低越好", "higher": "越高越好", "na": "不支持/未测"},
 }
+TIER_LABEL = {"64k": "64K", "128k": "128K", "256k": "256K"}
 METRIC_LABELS = {
     "ttft_8k": ("TTFT 8K prompt (s)", "8K 提示首 token (s)", False),
-    "ttft_32k": ("TTFT 32K prompt (s)", "32K 提示首 token (s)", False),
-    "ttft_63k": ("TTFT 63K prompt (s)", "63K 提示首 token (s)", False),
-    "ttft_127k": ("TTFT 127K prompt (s)", "127K 提示首 token (s)", False),
-    "ld_32000": ("Decode after 32K context (tok/s)", "32K 上下文后解码 (tok/s)", True),
-    "ld_60000": ("Decode after 60K context (tok/s)", "60K 上下文后解码 (tok/s)", True),
-    "ld_120000": ("Decode after 120K context (tok/s)", "120K 上下文后解码 (tok/s)", True),
+    "ttft_63k": ("TTFT 64K prompt (s)", "64K 提示首 token (s)", False),
+    "ttft_127k": ("TTFT 128K prompt (s)", "128K 提示首 token (s)", False),
     "ttft_250k": ("TTFT 256K prompt (s)", "256K 提示首 token (s)", False),
-    "ld_250000": ("Decode after 250K context (tok/s)", "250K 上下文后解码 (tok/s)", True),
+    "ld_60000": ("Decode after 64K context (tok/s)", "64K 上下文后解码 (tok/s)", True),
+    "ld_120000": ("Decode after 128K context (tok/s)", "128K 上下文后解码 (tok/s)", True),
+    "ld_250000": ("Decode after 256K context (tok/s)", "256K 上下文后解码 (tok/s)", True),
+    **{f"lreuse_{t}": (f"{TIER_LABEL[t]} shared document, new-chat TTFT (s)", f"{TIER_LABEL[t]} 共享文档新会话首 token (s)", False) for t in TIERS},
+    **{f"lmt_{t}": (f"{TIER_LABEL[t]} document, turns 2-3 TTFT (s)", f"{TIER_LABEL[t]} 文档多轮对话第 2–3 轮首 token (s)", False) for t in TIERS},
+    **{f"lpar{n}_{t}": (f"{TIER_LABEL[t]} document, {n} concurrent chats (tok/s total)", f"{TIER_LABEL[t]} 文档 {n} 路并发总吞吐 (tok/s)", True)
+       for t in TIERS for n in (2, 4)},
     "decode_gen": ("Decode, code/prose/copy (tok/s)", "解码：代码/散文/复制 (tok/s)", True),
     "ttft_short": ("Short chat TTFT (s)", "短问答首 token (s)", False),
-    "par2_tok_s": ("2 parallel requests (tok/s total)", "2 路并行总吞吐 (tok/s)", True),
-    "par4_tok_s": ("4 parallel requests (tok/s total)", "4 路并行总吞吐 (tok/s)", True),
     "agent_e2e": ("Agent loop end to end (s)", "智能体循环端到端 (s)", False),
     "multiturn_ttft": ("Multi-turn TTFT, turns 2-3 (s)", "多轮对话第 2–3 轮首 token (s)", False),
-    "reuse_warm_ttft": ("Shared 16K prefix, warm TTFT (s)", "共享 16K 前缀命中后首 token (s)", False),
     "subagent_e2e": ("Sub-agent fan-out end to end (s)", "子智能体扇出端到端 (s)", False),
     "tool_single_s": ("Single tool call (s)", "单次工具调用 (s)", False),
     "tool_parallel_s": ("Parallel tool calls (s)", "并行工具调用 (s)", False),
@@ -272,27 +336,26 @@ METRIC_LABELS = {
 WORKLOADS = {
     "ttft_8k": ("long_prompt_8k", "find the vault codes hidden at 5-95% depth of the document, answer as JSON",
                 "在文档 5%–95% 深度处找出隐藏的保险库代码，以 JSON 作答"),
-    "ttft_32k": ("long_prompt_32k", "same needle retrieval, 32K-token document", "同上检索任务，32K token 文档"),
-    "ttft_63k": ("long_prompt_63k", "same needle retrieval, 63K-token document", "同上检索任务，63K token 文档"),
-    "ttft_127k": ("long_prompt_127k", "same needle retrieval, 127K-token document", "同上检索任务，127K token 文档"),
+    "ttft_63k": ("long_prompt_63k", "same needle retrieval, 64K-token document", "同上检索任务，64K token 文档"),
+    "ttft_127k": ("long_prompt_127k", "same needle retrieval, 128K-token document", "同上检索任务，128K token 文档"),
     "ttft_250k": ("long_prompt_250k", "same needle retrieval, 256K-token document", "同上检索任务，256K token 文档"),
-    "ld_32000": ("probe:32000", "section-by-section summary of a technical document (512-token answer)",
-                 "对技术文档逐节总结（生成 512 token）"),
-    "ld_60000": ("probe:60000", "same summary task after 60K tokens of context", "同上总结任务，60K 上下文"),
+    "ld_60000": ("probe:60000", "section-by-section summary of a 60K-token technical document (512-token answer)",
+                 "对 60K token 技术文档逐节总结（生成 512 token）"),
     "ld_120000": ("probe:120000", "same summary task after 120K tokens of context", "同上总结任务，120K 上下文"),
     "ld_250000": ("probe:250000", "same summary task after 250K tokens of context", "同上总结任务，250K 上下文"),
+    **{f"lreuse_{t}": (f"long_session_{t}", f"new chats on a {TIER_LABEL[t]}-tier document another chat already read; TTFT",
+                       f"在已被其他会话读过的 {TIER_LABEL[t]} 档文档上开新会话；首 token") for t in TIERS},
+    **{f"lmt_{t}": (f"long_session_{t}", f"turns 2-3 of a chat over a {TIER_LABEL[t]}-tier document; TTFT",
+                    f"基于 {TIER_LABEL[t]} 档文档的对话第 2–3 轮；首 token") for t in TIERS},
+    **{f"lpar{n}_{t}": (f"long_session_{t}", f"{n} new chats at once on the {TIER_LABEL[t]}-tier document: retrieve a code, write ~150 words",
+                        f"{n} 个新会话同时基于 {TIER_LABEL[t]} 档文档：检索代码并写约 150 词") for t in TIERS for n in (2, 4)},
     "decode_gen": ("long_generation", "write code, write prose, copy and summarize a passage (greedy, spec decoding on)",
                    "写代码、写散文、复制并总结段落（贪心，开启推测解码）"),
     "ttft_short": ("short_chat", "eight short factual questions", "8 个简短事实问答"),
-    "par2_tok_s": ("parallel_2", "2 concurrent requests: compute a product, then explain a topic in ~200 words",
-                   "2 个并发请求：先算乘积，再用约 200 词解释一个主题"),
-    "par4_tok_s": ("parallel_4", "4 concurrent requests of the same kind", "4 个同类并发请求"),
     "agent_e2e": ("agentic_loop", "tool-using agent: read two files, call a calculator, report the total",
                   "工具型智能体：读取两个文件、调用计算器、给出总额"),
     "multiturn_ttft": ("multi_turn", "3-turn chat over the same records; TTFT of turns 2-3 (prefix reused)",
                        "基于同一记录的 3 轮对话；第 2–3 轮首 token（复用前缀）"),
-    "reuse_warm_ttft": ("prefix_reuse_16k", "3 fresh chats sharing a 16K-token document; TTFT of chats 2-3",
-                        "3 个新会话共享同一 16K token 文档；第 2–3 个会话首 token"),
     "subagent_e2e": ("subagent_fanout", "orchestrator delegates to sub-agents through tool calls and merges their results",
                      "主智能体通过工具调用委派子智能体并汇总结果"),
     "tool_single_s": ("tool_call_single", "one function call with typed arguments", "一次带类型参数的函数调用"),
@@ -441,25 +504,29 @@ SECTION = {
            "gen": "Generated tokens / request", "reqs": "Requests", "best": "Best", "metric": "Measurement",
            "spec": "Speculative decoding", "method": "Drafting", "accept": "Draft acceptance",
            "tps": "Tokens / verify step", "on": "Decode, spec on (tok/s)", "off": "Decode, spec off (tok/s)",
-           "gain": "Speed-up", "reuse": "Multi-turn and KV-cache reuse", "t1": "Turn 1 TTFT (s)",
-           "t23": "Turns 2-3 TTFT (s)", "mtc": "Turns 2-3 cached tokens", "cold": "16K prefix, cold TTFT (s)",
-           "warm": "16K prefix, warm TTFT (s)", "rx": "Reuse speed-up", "rc": "Warm cached tokens",
+           "gain": "Speed-up", "reuse": "Long-context sessions: TTFT, multi-turn, KV-cache reuse, concurrency", "t1": "Cold TTFT (s)",
+           "t23": "Turns 2-3 TTFT (s)", "mtc": "Turns 2-3 cached tokens", "doc": "Prompt tokens",
+           "warm": "New-chat TTFT (s)", "rc": "New-chat cached tokens", "p2": "2 concurrent (tok/s)", "p4": "4 concurrent (tok/s)",
+           "p2t": "2 concurrent TTFT (s)", "p4t": "4 concurrent TTFT (s)", "specc": "Spec decoding",
            "spec_note": "Same three long_generation prompts with the engine's speculative decoding switched off "
                         "(separate run). Acceptance and tokens per step are what the engine reports; blank where it reports neither.",
-           "reuse_note": "multi_turn: three turns over a 2.9K-token record. prefix_reuse_16k: three fresh chats that share "
-                         "a 16K-token document and ask different questions; chat 1 prefills it cold, chats 2-3 can reuse its KV.",
-           "spec_x": "Speculative decoding speed-up (x)", "reuse_x": "16K shared-prefix TTFT speed-up (x)"},
+           "reuse_note": "long_session_<tier>: one document of the tier minus 4K tokens is the system message of every request. "
+                         "Chat A turn 1 reads it cold; turns 2-3 continue that chat; chats B and C are new chats on it; then waves of 2 "
+                         "and 4 new chats arrive at once, each retrieving a code and writing about 150 words (tok/s = all generated "
+                         "tokens over the wave's wall time).",
+           "spec_x": "Speculative decoding speed-up (x)"},
     "zh": {"matrix": "测试矩阵：每项测量的具体内容", "task": "任务", "prompt": "提示 token 数",
            "gen": "每请求生成 token 数", "reqs": "请求数", "best": "最佳", "metric": "测量项",
            "spec": "推测解码", "method": "草稿方式", "accept": "草稿接受率",
            "tps": "每次验证步产出 token", "on": "开启推测解码 (tok/s)", "off": "关闭推测解码 (tok/s)",
-           "gain": "加速比", "reuse": "多轮对话与 KV 缓存复用", "t1": "第 1 轮首 token (s)",
-           "t23": "第 2–3 轮首 token (s)", "mtc": "第 2–3 轮命中缓存 token", "cold": "16K 前缀冷启动首 token (s)",
-           "warm": "16K 前缀命中后首 token (s)", "rx": "复用加速比", "rc": "命中缓存 token",
+           "gain": "加速比", "reuse": "长上下文会话：首 token、多轮、KV 缓存复用、并发", "t1": "冷启动首 token (s)",
+           "t23": "第 2–3 轮首 token (s)", "mtc": "第 2–3 轮命中缓存 token", "doc": "提示 token",
+           "warm": "新会话首 token (s)", "rc": "新会话命中缓存 token", "p2": "2 路并发 (tok/s)", "p4": "4 路并发 (tok/s)",
+           "p2t": "2 路并发首 token (s)", "p4t": "4 路并发首 token (s)", "specc": "推测解码",
            "spec_note": "同样三个 long_generation 提示，单独一轮关闭各引擎的推测解码。接受率与每步 token 数取自引擎自身上报；未上报者留空。",
-           "reuse_note": "multi_turn：基于 2.9K token 记录的三轮对话。prefix_reuse_16k：三个新会话共享同一份 16K token 文档并提出不同问题；"
-                         "第 1 个会话冷启动预填充，第 2–3 个会话可复用其 KV。",
-           "spec_x": "推测解码加速比 (x)", "reuse_x": "16K 共享前缀首 token 加速比 (x)"},
+           "reuse_note": "long_session_<档位>：一份（档位减 4K token）的文档作为每个请求的系统消息。会话 A 第 1 轮冷启动读入；第 2–3 轮延续该会话；"
+                         "会话 B、C 为基于同一文档的新会话；随后 2 路、4 路新会话同时到达，各自检索一个代码并写约 150 词（tok/s = 全部生成 token / 整波墙钟时间）。",
+           "spec_x": "推测解码加速比 (x)"},
 }
 
 
@@ -510,26 +577,28 @@ def spec_block(result, order, context, lang, charts=True):
 
 
 def reuse_block(result, order, stats, lang, charts=True):
+    """One table per context tier: the long session's measurements for every engine."""
     sec = SECTION[lang]
-    rows = []
-    for k in order:
-        m = result[k]["metrics"]
-        rows.append(f'<tr class="{"ts" if k in TS_ENGINES else ""}"><td>{ENGINE_NAMES[k]}</td>'
-                    f'<td>{fmt(m.get("mt_turn1_ttft"), 3)}</td><td>{fmt(m.get("multiturn_ttft"), 3)}</td><td>{fmt_tokens(m.get("mt_cached"))}</td>'
-                    f'<td>{fmt(m.get("reuse_cold_ttft"), 3)}</td><td>{fmt(m.get("reuse_warm_ttft"), 3)}</td>'
-                    f'<td>{fmt(m.get("reuse_speedup")) + "×" if m.get("reuse_speedup") else "–"}</td><td>{fmt_tokens(m.get("reuse_cached"))}</td></tr>')
-    out = (f'<h2>{html.escape(sec["reuse"])}</h2><p class="sub">{html.escape(sec["reuse_note"])}</p>'
-           f'<div style="overflow-x:auto"><table><tr><th>{T[lang]["engine"]}</th><th>{sec["t1"]}</th><th>{sec["t23"]}</th>'
-           f'<th>{sec["mtc"]}</th><th>{sec["cold"]}</th><th>{sec["warm"]}</th><th>{sec["rx"]}</th><th>{sec["rc"]}</th></tr>'
-           + "".join(rows) + "</table></div>")
-    if charts:
-        li = 1 if lang == "zh" else 0
-        out += '<div class="grid" style="margin-top:14px">' + "".join([
-            bar_chart(METRIC_LABELS["reuse_warm_ttft"][li], [(ENGINE_NAMES[k], result[k]["metrics"].get("reuse_warm_ttft")) for k in order],
-                      False, lang, note=workload_note("reuse_warm_ttft", stats, lang)),
-            bar_chart(sec["reuse_x"], [(ENGINE_NAMES[k], result[k]["metrics"].get("reuse_speedup")) for k in order], True, lang,
-                      note=workload_note("reuse_warm_ttft", stats, lang))]) + "</div>"
-    return out
+    out = [f'<h2>{html.escape(sec["reuse"])}</h2><p class="sub">{html.escape(sec["reuse_note"])}</p>']
+    for t in TIERS:
+        rows = []
+        for k in order:
+            m, sp = result[k]["metrics"], result[k].get("spec", {})
+            if not any(m.get(f"{x}_{t}") for x in ("lcold", "lmt", "lreuse")):
+                continue
+            rows.append(f'<tr class="{"ts" if k in TS_ENGINES else ""}"><td>{ENGINE_NAMES[k]}</td>'
+                        f'<td>{fmt_tokens(m.get(f"ldoc_{t}"))}</td><td>{fmt(m.get(f"lcold_{t}"))}</td>'
+                        f'<td>{fmt(m.get(f"lmt_{t}"), 3)}</td><td>{fmt_tokens(m.get(f"lmt_cached_{t}"))}</td>'
+                        f'<td>{fmt(m.get(f"lreuse_{t}"), 3)}</td><td>{fmt_tokens(m.get(f"lreuse_cached_{t}"))}</td>'
+                        f'<td>{fmt(m.get(f"lpar2_{t}"))}</td><td>{fmt(m.get(f"lpar2_ttft_{t}"))}</td>'
+                        f'<td>{fmt(m.get(f"lpar4_{t}"))}</td><td>{fmt(m.get(f"lpar4_ttft_{t}"))}</td>'
+                        f'<td>{html.escape(sp.get(f"lreuse_{t}") or "–")}</td></tr>')
+        if rows:
+            out.append(f'<h3>{TIER_LABEL[t]}</h3><div style="overflow-x:auto"><table><tr><th>{T[lang]["engine"]}</th>'
+                       f'<th>{sec["doc"]}</th><th>{sec["t1"]}</th><th>{sec["t23"]}</th><th>{sec["mtc"]}</th><th>{sec["warm"]}</th>'
+                       f'<th>{sec["rc"]}</th><th>{sec["p2"]}</th><th>{sec["p2t"]}</th><th>{sec["p4"]}</th><th>{sec["p4t"]}</th>'
+                       f'<th>{sec["specc"]}</th></tr>' + "".join(rows) + "</table></div>")
+    return "".join(out)
 
 
 def ranking_block(result, order, lang):
@@ -597,8 +666,8 @@ def render_poster(result, order, context, lang, stats=None, best=None):
     ts = result.get("tensorsharp", {})
     tiles = context.get("poster_tiles", {}).get(lang) or []
     tile_html = "".join(f'<div class="tile"><div class="big">{html.escape(a)}</div><div class="cap">{html.escape(b)}</div></div>' for a, b in tiles)
-    key = [("ttft_32k", False), ("ld_60000", True), ("decode_gen", True), ("par4_tok_s", True),
-           ("agent_e2e", False), ("reuse_warm_ttft", False)]
+    key = [("ttft_63k", False), ("ld_60000", True), ("decode_gen", True), ("lpar4_64k", True),
+           ("agent_e2e", False), ("lreuse_64k", False)]
     charts = "".join(bar_chart(METRIC_LABELS[m][1 if lang == "zh" else 0],
                                [(ENGINE_NAMES[k], result[k]["metrics"].get(m)) for k in order], h, lang, width=520,
                                note=workload_note(m, stats, lang))

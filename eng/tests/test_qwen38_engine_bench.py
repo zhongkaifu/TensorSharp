@@ -104,6 +104,56 @@ class BenchmarkIntegrityTests(unittest.TestCase):
             for actual, target in zip(positions, (.05, .5, .95)):
                 self.assertAlmostEqual(actual, target, delta=.005)
 
+    def test_long_session_runs_turns_reuse_and_concurrent_waves_on_one_document(self):
+        class FakeClient:
+            tokenizer = object()
+            count_tokens = staticmethod(len)
+            url = "http://fake"
+            systems = []
+
+            def answer(self, messages):
+                system, question = messages[0]["content"], messages[-1]["content"]
+                FakeClient.systems.append(system)
+                codes = dict(re.findall(r"Ledger note: the (\w+) ledger code is ([A-Z0-9-]+)\.", system))
+                label = re.search(r"What is the (\w+) ledger code", question).group(1)
+                text = codes[label] if "code only" in question else f"CODE: {codes[label]}\nAn explanation."
+                return {"content": text, "error": None, "ttft_s": 0.5 if len(messages) == 2 else 0.1,
+                        "prompt_tokens": sum(len(m["content"]) for m in messages) + 40,
+                        "completion_tokens": 30, "finish_reason": "stop", "decode_tok_s": 100.0}
+
+            def chat(self, messages, max_tokens, extra=None):
+                return self.answer(messages)
+
+            def body(self, messages, max_tokens):
+                return {"messages": messages, "max_tokens": max_tokens}
+
+            def finish(self, obs):
+                return self.answer(obs)
+
+        client = FakeClient()
+        old = bench.stream_chat
+        bench.stream_chat = lambda url, body, timeout: body["messages"]
+        try:
+            args = SimpleNamespace(nonce_seed=1234, answer_tokens=512, keep_text=1500, timeout=60,
+                                   long_waves="2,4", long_wave_tokens=384)
+            ctx = bench.Ctx(args, client, {"paragraphs": ["The archive contains a historical record. " * 5]})
+            rec = bench.run_long_session(ctx, 0, 64, "long_session_64k")
+        finally:
+            bench.stream_chat = old
+        self.assertTrue(rec["pass"], [c for c in rec["checks"] if not c["ok"]])
+        m = rec["metrics"]
+        self.assertEqual(m["document_tokens"], 64 * 1024 - 4096)
+        self.assertEqual(len(m["turn_ttft_s"]), 3)
+        self.assertEqual(m["cold_ttft_s"], 0.5)
+        self.assertEqual(m["mt_ttft_s"], 0.1)
+        self.assertEqual(m["reuse_warm_ttft_s"], 0.5)
+        self.assertEqual(m["par4"]["total_completion_tokens"], 120)
+        names = [c["name"] for c in rec["checks"]]
+        for want in ("turn1", "turn3", "reuse2", "par2_req1", "par4_req3", "context_length"):
+            self.assertIn(want, names)
+        # every request of the session carries the same document
+        self.assertEqual(len(set(FakeClient.systems)), 1)
+
     def test_128k_without_tokenizer_refuses_character_estimate(self):
         args = SimpleNamespace(nonce_seed=1234)
         ctx = bench.Ctx(args, SimpleNamespace(tokenizer=None), {"paragraphs": ["A document."]})

@@ -117,7 +117,8 @@ SCENARIOS = ["short_chat", "quality_tasks", "long_prompt_4k", "long_prompt_16k",
              "long_prompt_128k", "long_prompt_250k",
              "json_object", "json_schema", "tool_call_single", "tool_call_parallel", "agentic_loop",
              "multi_turn", "image", "long_generation", "parallel_2", "parallel_4",
-             "subagent_fanout", "skill_call", "code_edit", "code_run", "prefix_reuse_16k"]
+             "subagent_fanout", "skill_call", "code_edit", "code_run", "prefix_reuse_16k",
+             "long_session_64k", "long_session_128k", "long_session_256k"]
 OPTIONAL_SCENARIOS = ["quality_gsm8k"]
 GSM8K_FIXTURE = ROOT / "InferenceWeb.Tests" / "Fixtures" / "Qwen38" / "gsm8k-mini.json"
 
@@ -1385,6 +1386,138 @@ def run_prefix_reuse(ctx, r, k, name):
     return case(name, r, checks, m, results, ctx.args.keep_text)
 
 
+SESSION_TOPICS = ["how a lighthouse lens concentrates light", "how harbour tides are predicted",
+                  "how paper records are kept from decaying", "how a ship's chronometer keeps time"]
+
+
+def concurrent_wave(ctx, bodies_msgs, max_tokens):
+    """Send every message list at once (a barrier releases them together); results in input order."""
+    n = len(bodies_msgs)
+    results = [None] * n
+    barrier = threading.Barrier(n)
+
+    def worker(i):
+        barrier.wait()
+        body = ctx.client.body(bodies_msgs[i], max_tokens)
+        results[i] = ctx.client.finish(stream_chat(ctx.client.url, body, ctx.args.timeout))
+        results[i]["request_sha256"] = hashlib.sha256(json.dumps(request_identity(body), sort_keys=True,
+            ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    t0 = time.perf_counter()
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results, time.perf_counter() - t0
+
+
+def run_long_session(ctx, r, tier_k, name):
+    """One long document shared by a whole session of requests, as a deployed long-context
+    application sees it. The document (tier minus 4K tokens, so concurrent chats still fit beside
+    it) is the system message; eleven ledger codes are hidden at 4-96% depth. In order:
+      1. chat A, turn 1: the document is new to the server (cold TTFT);
+      2. chat A, turns 2-3: the conversation continues (multi-turn TTFT);
+      3. chats B and C: new conversations on the same document (KV-cache reuse TTFT);
+      4. waves of --long-waves concurrent new chats on the same document, each retrieving a code and
+         then writing about 150 words (aggregate tok/s over the wave's wall time, per-request TTFT).
+    The document carries the repeat's nonce, so its first request never hits another run's cache."""
+    rng = ctx.rng(name, r)
+    if ctx.client.tokenizer is None:
+        raise RuntimeError("long_session scenarios require --tokenizer")
+    waves = [int(x) for x in str(getattr(ctx.args, "long_waves", "2,4")).split(",") if x.strip()]
+    labels = ["harbor", "customs", "pilotage", "dredging", "salvage", "quarantine", "lighterage", "wharfage",
+              "towage", "ballast", "chandlery"]
+    codes = {}
+    while len(codes) < len(labels):
+        c = f"{rng.choice(CODE_WORDS_A)}-{rng.choice(CODE_WORDS_B)}-{rng.randint(1000, 9999)}"
+        if c not in codes.values():
+            codes[labels[len(codes)]] = c
+    order = list(labels)
+    rng.shuffle(order)
+    depths = [0.04 + 0.92 * i / (len(order) - 1) for i in range(len(order))]
+    target = tier_k * 1024 - 4096
+    prose = "\n\n".join(take_prose(ctx.haystack, int(target * 8), start=211 + 29 * tier_k + 7 * r))
+    if any(c in prose for c in codes.values()):
+        raise RuntimeError("ledger code collides with the haystack")
+    head = (f"Session {ctx.nonce(name, r)}. You are the archivist of the harbor archive. Answer questions about "
+            "the archive's records below; copy codes exactly.\n\n<records>\n")
+
+    def render(text):
+        pieces, start = [], 0
+        for label, depth in zip(order, depths):
+            at = int(len(text) * depth)
+            pieces.extend([text[start:at], f"\n\nLedger note: the {label} ledger code is {codes[label]}.\n\n"])
+            start = at
+        pieces.append(text[start:])
+        return head + "".join(pieces) + "\n</records>"
+
+    system, system_tokens = fit_prompt_tokens(render, prose, target, ctx.client.count_tokens)
+    sys_msg = {"role": "system", "content": system}
+
+    def ask(label):
+        return f"What is the {label} ledger code? Reply with the code only."
+
+    def has_code(res, label):
+        return codes[label] in (res.get("content") or "")
+
+    checks, results = [], []
+    q = iter(labels)
+    # 1-2: one conversation, three turns.
+    msgs, turns = [sys_msg], []
+    for i in range(3):
+        label = next(q)
+        msgs = msgs + [{"role": "user", "content": ask(label)}]
+        res = ctx.chat(msgs, ctx.args.answer_tokens)
+        turns.append(res)
+        check(checks, f"turn{i + 1}", has_code(res, label), budget_note(res))
+        msgs = msgs + [{"role": "assistant", "content": res.get("content") or ""}]
+    # 3: new conversations on the same document.
+    reuse = []
+    for i in range(2):
+        label = next(q)
+        res = ctx.chat([sys_msg, {"role": "user", "content": ask(label)}], ctx.args.answer_tokens)
+        reuse.append(res)
+        check(checks, f"reuse{i + 1}", has_code(res, label), budget_note(res))
+    results = turns + reuse
+    m = {"tier_k": tier_k, "document_tokens": system_tokens,
+         "prompt_tokens": turns[0].get("prompt_tokens"),
+         "cold_ttft_s": turns[0].get("ttft_s"),
+         "turn_ttft_s": [x.get("ttft_s") for x in turns],
+         "turn_cached_tokens": [x.get("cached_tokens") for x in turns],
+         "mt_ttft_s": med([x.get("ttft_s") for x in turns[1:]]),
+         "reuse_ttft_s": [x.get("ttft_s") for x in reuse],
+         "reuse_cached_tokens": [x.get("cached_tokens") for x in reuse],
+         "reuse_warm_ttft_s": med([x.get("ttft_s") for x in reuse])}
+    actual = turns[0].get("prompt_tokens")
+    check(checks, "context_length", isinstance(actual, int) and abs(actual - target) <= max(256, target * 0.02),
+          f"target={target}; server_usage={actual}; system_tokenizer={system_tokens}")
+    # 4: concurrent waves.
+    for n in waves:
+        labs = [next(q, None) for _ in range(n)]
+        labs = [x or labels[i % len(labels)] for i, x in enumerate(labs)]
+        wave_msgs = [[sys_msg, {"role": "user", "content":
+                      f"What is the {lab} ledger code? First write the line 'CODE: <code>'. Then explain "
+                      f"{SESSION_TOPICS[i % len(SESSION_TOPICS)]} in about 150 words."}]
+                     for i, lab in enumerate(labs)]
+        wave, wall = concurrent_wave(ctx, wave_msgs, ctx.args.long_wave_tokens)
+        results.extend(wave)
+        for i, (res, lab) in enumerate(zip(wave, labs)):
+            check(checks, f"par{n}_req{i}", has_code(res, lab), budget_note(res))
+        total = (sum(x["completion_tokens"] for x in wave)
+                 if all(x.get("completion_tokens") is not None for x in wave) else None)
+        m[f"par{n}"] = {"wall_s": wall, "total_completion_tokens": total,
+                        "aggregate_tok_s": total / wall if total and wall > 0 else None,
+                        "ttft_s": med([x.get("ttft_s") for x in wave]),
+                        "per_request_ttft_s": [x.get("ttft_s") for x in wave],
+                        "per_request_decode_tok_s": [x.get("decode_tok_s") for x in wave],
+                        "cached_tokens": [x.get("cached_tokens") for x in wave]}
+    m.update(spec_totals(results))
+    return case(name, r, checks, m, results, ctx.args.keep_text,
+                notes={"codes": codes, "physical_order": order, "depths": depths,
+                       "system_sha256": hashlib.sha256(system.encode("utf-8")).hexdigest()})
+
+
 def load_generator():
     spec = importlib.util.spec_from_file_location("bench_media_generate", MEDIA_DIR / "generate.py")
     mod = importlib.util.module_from_spec(spec)
@@ -1812,6 +1945,9 @@ def dispatch(name):
     if re.fullmatch(r"long_prompt_[1-9]\d*k", name):
         k = int(name[len("long_prompt_"):].rstrip("k"))
         return lambda ctx, r: run_long_prompt(ctx, r, k, name)
+    if re.fullmatch(r"long_session_[1-9]\d*k", name):
+        k = int(name[len("long_session_"):].rstrip("k"))
+        return lambda ctx, r: run_long_session(ctx, r, k, name)
     if re.fullmatch(r"prefix_reuse_[1-9]\d*k", name):
         k = int(name[len("prefix_reuse_"):].rstrip("k"))
         return lambda ctx, r: run_prefix_reuse(ctx, r, k, name)
@@ -1933,6 +2069,10 @@ def main():
     ap.add_argument("--model", help="model id to send (default: first id of GET /v1/models)")
     ap.add_argument("--answer-tokens", type=int, default=512, help="max_tokens for answer-checked scenarios")
     ap.add_argument("--decode-tokens", type=int, default=1024, help="max_tokens for long_generation and parallel_N")
+    ap.add_argument("--long-waves", default="2,4",
+                    help="long_session_*: sizes of the concurrent waves of new chats on the shared document")
+    ap.add_argument("--long-wave-tokens", type=int, default=384,
+                    help="long_session_*: max_tokens of each concurrent-wave request (a ~150-word answer)")
     ap.add_argument("--agent-max-turns", type=int, default=8)
     ap.add_argument("--quality-tasks", type=int, default=16, help="generated arithmetic/sorting questions per repeat")
     ap.add_argument("--gsm8k-limit", type=int, default=8,
