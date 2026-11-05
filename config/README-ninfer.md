@@ -78,5 +78,38 @@ Images: pass `--mmproj mmproj-BF16.gguf` (the Qwen3.8 vision tower, the same off
 weights the artifact carries); its rows replace the image placeholders' embeddings. The
 artifact's own vision and MTP weights are not read by this route.
 
+## ggml backends and MLX
+
+`--model qwen3_8_27b_nvfp4.ninfer` also works with `--backend ggml_metal`, `mlx`,
+`ggml_cuda`, `ggml_vulkan` and the CPU backends. TensorSharp converts the artifact once into a
+llama.cpp-layout `qwen35` GGUF and loads that. The converted file is written beside the artifact
+as `<artifact>.q8_0.gguf`, or under `TS_NINFER_GGUF_DIR`. It records the artifact id, so a
+different artifact at the same path is converted again. The conversion takes about 30 s on an
+M5 Pro and the file is about 27.7 GB.
+
+- Matrices become Q8_0 (ggml-metal and MLX have no FP8 type, and ggml-metal no NVFP4 matmul).
+  The 8-bit codes hold the artifact's E4M3 and E2M1 x E4M3 values almost exactly.
+- The embedded MTP block is carried over, so the ggml route can speculate with it. External
+  DFlash2 GGUF drafters work as with any GGUF.
+- The tokenizer, special tokens and chat template come from the artifact.
+- Checked against the same model's Q8_0 GGUF: every tokenizer array and hyperparameter is
+  identical (the padding id follows the artifact's `tokenizer_config.json`). All 866 tensors
+  have the same names and shapes and correlate 0.9996-1.0 with the reference tensors.
+
+Measured on an M5 Pro (48 GB), plain decoding, about 4.4K-token prompts with 2K tokens of
+shared prefix reused:
+
+| Backend | TTFT | Decode |
+|---|---:|---:|
+| ggml_metal | 6.7 s | 9.7 tok/s |
+| mlx | 5.6-5.9 s | 9.1 tok/s |
+| ggml_metal + `--draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-draft 7` | 7.2 s | 21.3 tok/s |
+
+MLX decodes the converted model at the same rate as the Unsloth Q8_0 GGUF (9.1 tok/s each,
+back to back).
+
+The DFlash2 drafter inside the artifact is not converted; on these backends pass the DFlash2
+GGUF with `--draft-model`.
+
 See the [native adapter guide](../TensorSharp.Backends.Cuda/native/ninfer/README.md) for
 the kernels and their numerical contracts.

@@ -4271,6 +4271,21 @@ internal enum GgmlIndexReductionOp
         // final-norm). Outputs per-row logits [vocab, N] AND post-norm hidden
         // [hidden, N] (normedOut, for the MTP draft head). GDN state advances from
         // each layer's ConvStateIn/DeltaStateIn to ConvStateOut/DeltaStateOut.
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial void TSGgml_Qwen35VerifyRequestArgmax(IntPtr output);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35VerifyArgmaxDone();
+
+        /// <summary>Greedy verify: the next full-row Qwen3.5 verify on this thread writes its row
+        /// argmaxes to <paramref name="output"/> (int32 per row) instead of downloading the logits.</summary>
+        internal static void Qwen35VerifyRequestArgmax(IntPtr output) => TSGgml_Qwen35VerifyRequestArgmax(output);
+
+        /// <summary>True when a verify since the request wrote the argmaxes; clears the request.</summary>
+        internal static bool Qwen35VerifyArgmaxDone() => TSGgml_Qwen35VerifyArgmaxDone() != 0;
+
         // Returns 0 when it cannot handle the shape so the caller falls back to per-op.
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

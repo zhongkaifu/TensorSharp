@@ -16,8 +16,13 @@ public sealed class NinferQwen38BodyLoadingTests
     [InlineData(BackendType.GgmlCuda)]
     [InlineData(BackendType.GgmlCpu)]
     [InlineData(BackendType.Mlx)]
-    public void FactoryRejectsUnsupportedBackendBeforeOpeningOrInitializingADevice(BackendType backend)
-        => Assert.Throws<NotSupportedException>(() => ModelBase.Create("/not-created/body.ninfer", backend));
+    public void FactoryRoutesNonCudaBackendsToTheGgufConversion(BackendType backend)
+    {
+        // The native CUDA engine reads the artifact; every other backend converts it to a qwen35 GGUF
+        // first (NinferQwen38GgufConverter), which opens the artifact before any device work.
+        var error = Record.Exception(() => ModelBase.Create("/not-created/body.ninfer", backend));
+        Assert.True(error is FileNotFoundException or DirectoryNotFoundException, error?.GetType().Name);
+    }
 
     [Fact]
     public void FactoryRejectsUnsupportedParallelAndDraftModesBeforeOpening()

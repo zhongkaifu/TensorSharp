@@ -3511,8 +3511,14 @@ namespace TensorSharp.Models
 
             if (NinferQwen38ModelSource.IsNinferArtifact(ggufPath))
             {
-                NinferQwen38ModelSource.ValidateExecutionRoute(backend, tpDegree, tpGroup, layerSplitDegree, draftModelPath);
-                return Qwen35CudaModel.FromNinfer(ggufPath);
+                // The native CUDA engine reads the artifact directly; the ggml backends and MLX read a
+                // qwen35 GGUF converted from it once (NinferQwen38GgufConverter, cached beside it).
+                if (backend == BackendType.Cuda)
+                {
+                    NinferQwen38ModelSource.ValidateExecutionRoute(backend, tpDegree, tpGroup, layerSplitDegree, draftModelPath);
+                    return Qwen35CudaModel.FromNinfer(ggufPath);
+                }
+                ggufPath = NinferQwen38GgufConverter.EnsureGguf(ggufPath);
             }
 
             using var probe = new GgufFile(ggufPath);

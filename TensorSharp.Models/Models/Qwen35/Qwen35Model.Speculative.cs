@@ -29,6 +29,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using TensorSharp;
+using TensorSharp.GGML;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 
@@ -530,6 +531,46 @@ namespace TensorSharp.Models
         public void ResetSpecLayerTimings()
         {
             SpecAttnLayerTicks = SpecRecurrentLayerTicks = SpecLmHeadTicks = 0;
+        }
+
+        private static readonly bool GgmlGreedyVerifyEnabled = Environment.GetEnvironmentVariable("TS_Q35_GREEDY_VERIFY") == "1";
+        private float[] _greedyVerifyLogits;
+
+        /// <summary>Greedy verify on the ggml backends (TS_Q35_GREEDY_VERIFY=1, as the direct-CUDA engine's):
+        /// the native verify graph reduces each logit row to its argmax on the device, so a verify step
+        /// downloads N ids instead of N x vocab floats and the host samples nothing. A forward that did not
+        /// reach the native verify (op-by-op fallback, tensor parallel) takes the argmax of its host logits,
+        /// so the result never depends on the path.</summary>
+        public unsafe bool TrySpecForwardGreedyVerify(int[] tokens, float[] hAllOut, int[] drawnOut)
+        {
+            if (!GgmlGreedyVerifyEnabled || tokens == null || tokens.Length < 2)
+                return false;
+            if (drawnOut == null || drawnOut.Length < tokens.Length)
+                throw new ArgumentException("A greedy verify needs one output token per row.", nameof(drawnOut));
+            int vocab = Config.VocabSize;
+            long need = (long)tokens.Length * vocab;
+            if (_greedyVerifyLogits == null || _greedyVerifyLogits.LongLength < need)
+                _greedyVerifyLogits = new float[need];
+            bool onDevice;
+            fixed (int* ids = drawnOut)
+            {
+                GgmlBasicOps.Qwen35VerifyRequestArgmax((IntPtr)ids);
+                try { SpecForward(tokens, hAllOut, _greedyVerifyLogits, allLogitsRows: true); }
+                finally { onDevice = GgmlBasicOps.Qwen35VerifyArgmaxDone(); }
+            }
+            if (!onDevice)
+            {
+                for (int r = 0; r < tokens.Length; r++)
+                {
+                    long o = (long)r * vocab;
+                    int best = 0;
+                    float bv = _greedyVerifyLogits[o];
+                    for (int i = 1; i < vocab; i++)
+                        if (_greedyVerifyLogits[o + i] > bv) { bv = _greedyVerifyLogits[o + i]; best = i; }
+                    drawnOut[r] = best;
+                }
+            }
+            return true;
         }
 
         public unsafe void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)

@@ -2832,6 +2832,12 @@ namespace TensorSharp.GGML
                 finalNorm);
         }
 
+        /// <summary>See <see cref="GgmlNative.Qwen35VerifyRequestArgmax"/>.</summary>
+        public static void Qwen35VerifyRequestArgmax(IntPtr output) => GgmlNative.Qwen35VerifyRequestArgmax(output);
+
+        /// <summary>See <see cref="GgmlNative.Qwen35VerifyArgmaxDone"/>.</summary>
+        public static bool Qwen35VerifyArgmaxDone() => GgmlNative.Qwen35VerifyArgmaxDone();
+
         /// <summary>Fused multi-token VERIFY: the whole hybrid transformer over N
         /// tokens of one sequence as a single graph. Outputs per-row logits
         /// [vocab, N] and post-norm hidden [hidden, N] (normedOut), advancing each
