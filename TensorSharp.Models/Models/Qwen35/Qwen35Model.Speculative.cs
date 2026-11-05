@@ -143,8 +143,24 @@ namespace TensorSharp.Models
         /// is not a property of either drafter.
         ///
         /// An operator who passes --spec-draft still gets exactly that number.
+        ///
+        /// Exception, ggml_metal with a DFlash block drafter: there the verify keeps
+        /// per-row recurrent snapshots and commits on the device (no rollback forward,
+        /// no PCIe), and an 8-row Metal verify costs about what one row does. Measured
+        /// on M5 Pro, Qwen3.8-27B-UD-IQ3_XXS + DFlash2 Q4_K_M, 1,224 greedy tokens
+        /// (identical text in every arm): window 3 / gate 0.35 26.1 tok/s, 5 / 0 28.9,
+        /// 7 / 0 28.5, 7 / 0.35 24.8, plain 20.5. Hence window 5 with no gate
+        /// (<see cref="SpecPreferredBlockGate"/>). ggml_cuda keeps 3: its solo verify
+        /// measured 7 drafts slower than 3 on prose (SpecSoloMaxDraftTokens).
         /// </summary>
-        public int SpecPreferredDraftWindow => HasAnyRecurrentLayer ? 3 : 0;
+        public int SpecPreferredDraftWindow => !HasAnyRecurrentLayer ? 0 : MetalBlockDraft ? 5 : 3;
+
+        /// <summary>No cumulative gate for a DFlash block drafter on ggml_metal (see
+        /// <see cref="SpecPreferredDraftWindow"/>): the 0.35 default, tuned on sparse-MoE
+        /// trunks, cut 1,224-token decode from 28.5 to 24.8 tok/s at window 7.</summary>
+        public float SpecPreferredBlockGate => MetalBlockDraft ? 0f : float.NaN;
+
+        private bool MetalBlockDraft => HasDFlash && _backend == BackendType.GgmlMetal;
 
         // Weight-free suffix matches can amortize a wider GEMM without paying
         // twelve learned draft-head forwards. IQ4_XS uses independent Metal

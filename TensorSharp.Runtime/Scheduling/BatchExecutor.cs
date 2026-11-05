@@ -229,7 +229,8 @@ namespace TensorSharp.Runtime.Scheduling
         {
             if (!configuration.EnablePrefixCaching || _model is not IPrefixCacheModel prefixModel) return;
             PrefixCacheCapabilities capabilities = prefixModel.GetPrefixCacheCapabilities();
-            RadixCache = new PrefixCacheCoordinator(_model, _pool, _scheduler, capabilities, _logger);
+            RadixCache = new PrefixCacheCoordinator(_model, _pool, _scheduler, capabilities, _logger,
+                configuration.PromptTailCheckpointMinTokens);
             _scheduler.AttachRadixCacheContinuation(RadixCache, ComputeFusedContinuationLcp, TryAdoptFusedContinuation);
         }
 
@@ -3466,6 +3467,11 @@ namespace TensorSharp.Runtime.Scheduling
         {
             // Every path's first token passes through here or PeekPendingOrSample, which is
             // what makes this the one place the first-token dump can be taken for all of them.
+            if (seq.EarlyFirstToken >= 0 && seq.OutputTokens.Count == 0)
+            {
+                seq.PendingDeviceToken = null;
+                return seq.EarlyFirstToken;
+            }
             var dump = seq.OutputTokens.Count == 0 && FirstTokenLogitsDump.IsArmed
                 ? CaptureFirstTokenLogits(seq) : null;
             if (seq.GetOrCreateSampler().TryGetForcedThinkingToken(seq.OutputTokens, out int thinkingEnd))
@@ -3495,6 +3501,8 @@ namespace TensorSharp.Runtime.Scheduling
         /// leaves the fallback loop a token source.</summary>
         private static int PeekPendingOrSample(SequenceState seq)
         {
+            if (seq.EarlyFirstToken >= 0 && seq.OutputTokens.Count == 0)
+                return seq.EarlyFirstToken;
             // A peeked first token is the one the step emits (a decline stashes it for the
             // fallback), so the dump is taken here as well; it is written once either way.
             var dump = seq.OutputTokens.Count == 0 && FirstTokenLogitsDump.IsArmed
@@ -3516,6 +3524,23 @@ namespace TensorSharp.Runtime.Scheduling
             int sampled = SampleFromLogits(seq);
             dump?.Complete(sampled, "sampled");
             return sampled;
+        }
+
+        /// <summary>Draws the first output token of a sequence whose prompt has just been
+        /// prefilled, so the engine can stream it before the step that forwards it. The draw
+        /// is the one that step makes (<see cref="SequenceState.EarlyFirstToken"/>); false
+        /// when the sequence already has output or no logits or device draw to take it from.</summary>
+        internal static bool TryDrawEarlyFirstToken(SequenceState seq, out int token)
+        {
+            token = -1;
+            if (seq.OutputTokens.Count != 0 || seq.EarlyFirstToken >= 0 || seq.NumUncomputedTokens != 0)
+                return false;
+            bool device = seq.PendingDeviceToken.HasValue && seq.PendingDevicePosition == seq.NumComputedTokens;
+            if (seq.LastLogits == null && !device)
+                return false;
+            token = PeekPendingOrSample(seq);
+            seq.EarlyFirstToken = token;
+            return true;
         }
 
         private static int SampleFromLogits(SequenceState seq)

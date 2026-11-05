@@ -162,6 +162,16 @@ namespace TensorSharp.Runtime.Speculative
         int SpecPreferredNGramDraftWindow => 0;
 
         /// <summary>
+        /// Default cumulative confidence gate this trunk wants for a BLOCK drafter
+        /// (<see cref="BlockDraftSpeculator.MinDraftProb"/>), or NaN for the
+        /// algorithm's own default. Like the window preference it only replaces a
+        /// default: an explicit <c>--spec-pmin</c> always wins. The block default is
+        /// tuned where an extra verify row is expensive (a sparse-MoE trunk); where a
+        /// verify row is nearly free, gating drafts away costs more than it saves.
+        /// </summary>
+        float SpecPreferredBlockGate => float.NaN;
+
+        /// <summary>
         /// True when a verify batch has already written reusable attention KV for
         /// EVERY token it processed (so the accepted prefix's KV is correct in the
         /// live cache), and the model has no recurrent state that a re-forward would

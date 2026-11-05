@@ -695,7 +695,12 @@ namespace TensorSharp.Server
                 sharedPrefixTokens: sharedPrefixTokens,
                 cacheScope: cacheScope,
                 publicCheckpointBoundaries: publicCheckpointBoundaries,
-                adapter: turnContext.Adapter);
+                adapter: turnContext.Adapter)
+            {
+                // Without reasoning the reply is rendered back verbatim, so the next turn
+                // resumes from this request's end state rather than its prompt tail.
+                PromptTailCheckpointOptional = !budgetThinking,
+            };
 
             bool announceSuffix = AnnouncesGenerationSuffix(arch, model.Config.ChatTemplate, recordedSuffix, cfg);
             if (announceSuffix)

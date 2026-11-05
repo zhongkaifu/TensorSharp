@@ -30,8 +30,10 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     private sealed record RequestKey(KeyRope Key, int Scope, MediaSpanRecord[] Spans);
 
     internal PrefixCacheCoordinator(IModelArchitecture model, BlockPool pool,
-        ContinuousBatchScheduler scheduler, PrefixCacheCapabilities capabilities, ILogger logger)
+        ContinuousBatchScheduler scheduler, PrefixCacheCapabilities capabilities, ILogger logger,
+        int promptTailCheckpointMinTokens = 0)
     {
+        _promptTailCheckpointMinTokens = promptTailCheckpointMinTokens;
         _model = model;
         _pool = pool;
         _scheduler = scheduler;
@@ -431,8 +433,29 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                         break;
                     }
         }
-        return length > sequence.SharedPrefixTokens && length >= _tree.Caps.MinRetainTokens ? length : 0;
+        if (length <= sequence.SharedPrefixTokens || length < _tree.Caps.MinRetainTokens)
+            return 0;
+        // The checkpoint splits the prompt's last forward in two, so every request pays a
+        // whole extra weight pass for it (a 1-row forward: ~19 ms on the 27B NInfer engine,
+        // more than an 8-row verify). It only pays back when a later request repeats this
+        // exact prompt AND the tokens it protects - those no other checkpoint already covers
+        // (the public shared prefix, or what this request itself resumed from) - would be
+        // expensive to recompute. A continuing conversation whose reply is rendered back
+        // verbatim resumes from the retained end state instead (PromptTailCheckpointOptional:
+        // no reasoning is stripped from history), so its short unprotected tail takes no
+        // checkpoint; a reasoning reply's next turn diverges right here and keeps it, and
+        // media prompts keep theirs (their spans are the expensive part to recompute).
+        if (sequence.MediaSpans.Count == 0 && sequence.PromptTailCheckpointOptional)
+        {
+            int covered = Math.Max(sequence.SharedPrefixTokens, sequence.PrefixCacheReusedTokens);
+            if (length - covered < _promptTailCheckpointMinTokens)
+                return 0;
+        }
+        return length;
     }
+
+    /// <summary><see cref="SchedulerConfig.PromptTailCheckpointMinTokens"/>.</summary>
+    private readonly int _promptTailCheckpointMinTokens;
 
     /// <summary>The second automatic checkpoint of a prompt with media
     /// (<see cref="PrefixCacheCapabilities.CheckpointPromptTailWithMedia"/>): before the

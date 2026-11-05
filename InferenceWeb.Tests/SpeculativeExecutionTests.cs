@@ -617,6 +617,21 @@ public partial class SpeculativeExecutionTests
         Assert.Empty(model.ProtocolViolations);
     }
 
+    [Theory]
+    [InlineData(float.NaN, null, BlockDraftSpeculator.DefaultGate)]  // no trunk preference: algorithm default
+    [InlineData(0f, null, 0f)]                                       // trunk preference replaces the default
+    [InlineData(0f, 0.5f, 0.5f)]                                     // explicit --spec-pmin always wins
+    public void BlockGate_TrunkPreferenceReplacesOnlyTheDefault(float preferred, float? explicitGate, float expected)
+    {
+        var model = new FakeSpeculativeModel { BlockDraftSize = 8, PreferredBlockGate = preferred };
+        var speculator = SpeculatorRegistry.Create(model,
+            new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.Block, MinDraftProb = explicitGate },
+            out string decline);
+        Assert.Null(decline);
+        Assert.IsType<BlockDraftSpeculator>(speculator);
+        Assert.Equal(expected, speculator.MinDraftProb);
+    }
+
     [Fact]
     public void SeedCommitted_WithAResumableLearnedHead_RunsOnePlainStepThenDrafts()
     {
@@ -1260,6 +1275,8 @@ public partial class SpeculativeExecutionTests
         // DraftBlock, and BlockConfidences is what the confidence head
         // reports for each block position.
         public int BlockDraftSize { get; set; }
+        public float PreferredBlockGate { get; set; } = float.NaN;
+        public float SpecPreferredBlockGate => PreferredBlockGate;
         public float[] BlockConfidences { get; set; }
         public int BlockDraftCalls { get; private set; }
         public bool PrefillSelfCatchUp { get; set; }

@@ -832,6 +832,9 @@ namespace TensorSharp.Runtime.Scheduling
                     continue;
                 }
 
+                if (r.SampledToken < 0 && r.IsPrefill && handle != null)
+                    PublishEarlyFirstToken(seq, handle);
+
                 if (r.SampledToken >= 0)
                 {
                     // A speculative step emits the sampled token plus the
@@ -868,7 +871,16 @@ namespace TensorSharp.Runtime.Scheduling
                             break;
                         }
 
-                        handle?.PublishToken(token);
+                        if (t == 0 && baseCount == 0 && seq.EarlyFirstTokenPublished)
+                        {
+                            // Streamed when the prompt finished (PublishEarlyFirstToken);
+                            // every draw of the first token returns that same token.
+                            if (token != seq.EarlyFirstToken)
+                                throw new InvalidOperationException(
+                                    $"Request {seq.RequestId} emitted first token {token} after streaming {seq.EarlyFirstToken}.");
+                        }
+                        else
+                            handle?.PublishToken(token);
 
                         // Stop on max-new-tokens, or where the context window ends. Every
                         // path forwards a decode token in the step that samples it, so the
@@ -938,6 +950,21 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                 }
             }
+        }
+
+        /// <summary>Stream a request's first token the moment its prompt is prefilled. The
+        /// step that forwards it -- with speculation a whole draft and verify, ~15 ms on a 27B
+        /// target -- used to run before the token was published, so every request's time to
+        /// first token included one extra step. EOS is not streamed; the forwarding step
+        /// still applies every stop and length check to the token.</summary>
+        private void PublishEarlyFirstToken(SequenceState seq, InferenceRequestHandle handle)
+        {
+            if (seq.MaxNewTokens < 1 || !BatchExecutor.TryDrawEarlyFirstToken(seq, out int token))
+                return;
+            if (_model.Tokenizer != null && _model.Tokenizer.IsEos(token))
+                return;
+            handle.PublishToken(token);
+            seq.EarlyFirstTokenPublished = true;
         }
 
         /// <summary>Drop speculatively accepted tokens past a mid-batch stop
