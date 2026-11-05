@@ -300,6 +300,8 @@ def decode_chart(summary, lang):
         if tick > vmax * 1.02:
             break
         x = left + plot * tick / vmax
+        if x > left + plot - 44:   # keep clear of the unit label at the end of the axis
+            continue
         out.append(f'<text x="{x:.1f}" y="{axis_y + 16}" text-anchor="middle" class="lab" style="font-size:12px">{tick}</text>')
     out.append(f'<text x="{left + plot}" y="{axis_y + 16}" text-anchor="end" class="lab" style="font-size:12px">tok/s</text></svg>')
     return "".join(out)
