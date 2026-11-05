@@ -127,7 +127,7 @@ PORTCHECK
       lanes=${SGLANG_SPEC_LANES:-$((LANES < 2 ? LANES : 2))}; frac=${SGLANG_MEMORY_FRAC:-0.88}
       spec=(--speculative-algorithm DFLASH --speculative-draft-model-path "$HF_DRAFT"
         --speculative-num-draft-tokens "$((SPEC_DRAFT + 1))" --speculative-draft-model-quantization fp8
-        --max-mamba-cache-size "${SGLANG_MAMBA_CACHE:-10}" --mamba-ssm-dtype "${SGLANG_SSM_DTYPE:-bfloat16}" --cuda-graph-max-bs-prefill 512)
+        --max-mamba-cache-size "${SGLANG_MAMBA_CACHE:-$((lanes * 5))}" --mamba-ssm-dtype "${SGLANG_SSM_DTYPE:-bfloat16}" --cuda-graph-max-bs-prefill 512)
     fi
     argv=("$SGLANG_VENV/bin/python" -m sglang.launch_server --model-path "$HF_MODEL" --served-model-name qwen3.8-27b
       --host 127.0.0.1 --port "$port" --context-length "$CTX" --max-running-requests "$lanes" --cuda-graph-max-bs-decode "$lanes"

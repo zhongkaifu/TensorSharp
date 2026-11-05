@@ -107,7 +107,10 @@ def med(xs):
 
 def load_dir(d: Path):
     cases = []
-    for f in sorted(d.glob("*.jsonl")):
+    # A configuration that did not run (FAILED: it did not load, its pool could not hold the
+    # context, or every request ran out of memory) contributes its reason, not its partial cases.
+    failed = (d / "FAILED").exists()
+    for f in ([] if failed else sorted(d.glob("*.jsonl"))):
         if f.name == "longdecode.jsonl":
             continue
         for line in f.read_text(encoding="utf-8").splitlines():
@@ -117,7 +120,7 @@ def load_dir(d: Path):
                     cases.append(rec)
     probes = []
     ld = d / "longdecode.jsonl"
-    if ld.exists():
+    if ld.exists() and not failed:
         for line in ld.read_text(encoding="utf-8").splitlines():
             if line.strip().startswith("{"):
                 probes.append(json.loads(line))
@@ -132,6 +135,13 @@ def load_dir(d: Path):
         vals = [int(x.split()[0]) for x in vt.read_text().split("\n") if x.strip()]
         meta["vram_mib"] = max(vals) if vals else None
     meta["failed"] = (d / "FAILED").exists()
+    rs = d / "reason.txt"
+    if rs.exists():
+        # First line: the campaign's reason; the rest: the server-log lines it was drawn from.
+        lines = [x.strip() for x in rs.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip()]
+        if lines:
+            meta["reason"] = lines[0]
+            meta["reason_log"] = lines[1:4]
     st = d / "spec.txt"
     if st.exists():
         meta["spec"] = "off" if st.read_text().strip().lower().startswith("off") else "on"
@@ -140,17 +150,27 @@ def load_dir(d: Path):
     vt2 = d / "variant.txt"
     if vt2.exists():
         meta["variant"] = vt2.read_text().strip()
+        for part in meta["variant"].split():
+            if part.startswith("lanes="):
+                meta["lanes"] = int(part.split("=", 1)[1])
     for c in cases:
         c["_spec"] = meta["spec"]
+        c["_lanes"] = meta.get("lanes")
     for p in probes:
         p["_spec"] = meta["spec"]
+        p["_lanes"] = meta.get("lanes")
     return cases, probes, meta
 
 
 def collect(campaign: Path):
     engines = {}
     for d in sorted(p for p in campaign.iterdir() if p.is_dir()):
-        name, _, tier = d.name.rpartition("-")
+        # <engine>-<tier>, or <engine>-<tier>-l<N> for a long tier run at N lanes (concurrent-request slots).
+        stem, lanes = d.name, None
+        head, _, last = stem.rpartition("-")
+        if head and last[:1] == "l" and last[1:].isdigit():
+            stem, lanes = head, int(last[1:])
+        name, _, tier = stem.rpartition("-")
         if not name:
             continue
         base = name
@@ -163,13 +183,30 @@ def collect(campaign: Path):
             continue
         e["cases"].extend(cases)
         e["probes"].extend(probes)
-        e["meta"][tier] = meta
+        n = lanes or meta.get("lanes")
+        if n:
+            e["meta"][f"{tier}@l{n}"] = meta
+        if n in (None, 1) or tier not in e["meta"]:
+            e["meta"][tier] = meta
     return engines
 
 
+LONG_PREFIXES = ("long_prompt_", "long_session_")
+
+
+def lanes_ok(c, n):
+    """Whether a case or probe was measured at n lanes (results without a lane count serve every n)."""
+    return c.get("_lanes") in (None, n)
+
+
 def metrics_for(e):
+    """Scored metrics: the main suite and every single-request long-context measurement at 1 lane, the waves
+    of 2 / 4 concurrent new chats from the runs at 2 / 4 lanes. Also <metric>@l<N> for each lane count the
+    long tiers ran at (the poster's per-lane rows; not scored)."""
     by = {}
     for c in e["cases"]:
+        if c["scenario"].startswith(LONG_PREFIXES) and not lanes_ok(c, 1):
+            continue
         by.setdefault(c["scenario"], []).append(c)
 
     def m(scenario, key, answered_only=True):
@@ -195,18 +232,31 @@ def metrics_for(e):
     out["multiturn_ttft"] = med([x for t in later for x in t]) if later else m("multi_turn", "ttft_s")
     out["mt_turn1_ttft"] = med([t[0] for t in mt if isinstance(t, list) and t])
     out["mt_cached"] = med([x for c in by.get("multi_turn", []) for x in (c["metrics"].get("turn_cached_tokens") or [])[1:]])
-    for tier in TIERS:
-        ss = [c["metrics"] for c in by.get(f"long_session_{tier}", []) if c.get("verdict") in ("PASS", "FAIL")]
-        out[f"lcold_{tier}"] = med([x.get("cold_ttft_s") for x in ss])
-        out[f"lmt_{tier}"] = med([y for x in ss for y in (x.get("turn_ttft_s") or [])[1:]])
-        out[f"lreuse_{tier}"] = med([y for x in ss for y in (x.get("reuse_ttft_s") or [])])
-        out[f"lmt_cached_{tier}"] = med([y for x in ss for y in (x.get("turn_cached_tokens") or [])[1:]])
-        out[f"lreuse_cached_{tier}"] = med([y for x in ss for y in (x.get("reuse_cached_tokens") or [])])
-        out[f"ldoc_{tier}"] = med([x.get("prompt_tokens") for x in ss])
+    def sessions(tier, n):
+        return [c["metrics"] for c in e["cases"] if c["scenario"] == f"long_session_{tier}" and lanes_ok(c, n)
+                and c.get("verdict") in ("PASS", "FAIL")]
+
+    def session_metrics(ss, tier, suffix=""):
+        r = {f"lcold_{tier}{suffix}": med([x.get("cold_ttft_s") for x in ss]),
+             f"lmt_{tier}{suffix}": med([y for x in ss for y in (x.get("turn_ttft_s") or [])[1:]]),
+             f"lreuse_{tier}{suffix}": med([y for x in ss for y in (x.get("reuse_ttft_s") or [])]),
+             f"lmt_cached_{tier}{suffix}": med([y for x in ss for y in (x.get("turn_cached_tokens") or [])[1:]]),
+             f"lreuse_cached_{tier}{suffix}": med([y for x in ss for y in (x.get("reuse_cached_tokens") or [])]),
+             f"ldoc_{tier}{suffix}": med([x.get("prompt_tokens") for x in ss])}
         for n in (2, 4):
             waves = [x.get(f"par{n}") or {} for x in ss]
-            out[f"lpar{n}_{tier}"] = med([w.get("aggregate_tok_s") for w in waves])
-            out[f"lpar{n}_ttft_{tier}"] = med([w.get("ttft_s") for w in waves])
+            r[f"lpar{n}_{tier}{suffix}"] = med([w.get("aggregate_tok_s") for w in waves])
+            r[f"lpar{n}_ttft_{tier}{suffix}"] = med([w.get("ttft_s") for w in waves])
+        return r
+
+    for tier in TIERS:
+        out.update(session_metrics(sessions(tier, 1), tier))
+        for n in (2, 4):
+            par = session_metrics(sessions(tier, n), tier)
+            out[f"lpar{n}_{tier}"] = par[f"lpar{n}_{tier}"]
+            out[f"lpar{n}_ttft_{tier}"] = par[f"lpar{n}_ttft_{tier}"]
+        for n in sorted({c.get("_lanes") for c in e["cases"] if c["scenario"].startswith(LONG_PREFIXES) and c.get("_lanes")}):
+            out.update(session_metrics(sessions(tier, n), tier, f"@l{n}"))
     gen = [c["metrics"] for c in by.get("long_generation", []) if c.get("verdict") in ("PASS", "FAIL")]
     out["spec_accept"] = med([g.get("acceptance_rate") for g in gen])
     out["spec_tokens_per_step"] = med([g.get("tokens_per_step") for g in gen])
@@ -214,11 +264,17 @@ def metrics_for(e):
                                 if c["scenario"] == "long_generation" and c.get("verdict") in ("PASS", "FAIL")])
     out["spec_speedup"] = (out["decode_gen"] / out["decode_nospec"]
                            if out.get("decode_gen") and out["decode_nospec"] else None)
+    lane_set = sorted({p.get("_lanes") for p in e["probes"] if p.get("_lanes")} |
+                      {c.get("_lanes") for c in e["cases"] if c["scenario"].startswith(LONG_PREFIXES) and c.get("_lanes")})
     for size in (60000, 120000, 250000):
-        out[f"ld_{size}"] = med([p.get("decode_tok_s") for p in e["probes"]
-                                 if p.get("tag", "").endswith(f"-{size}") and p.get("completion_tokens")])
-        out[f"ld_ttft_{size}"] = med([p.get("ttft_s") for p in e["probes"]
-                                      if p.get("tag", "").endswith(f"-{size}") and p.get("completion_tokens")])
+        for n, suffix in [(1, "")] + [(n, f"@l{n}") for n in lane_set]:
+            ps = [p for p in e["probes"] if p.get("tag", "").endswith(f"-{size}") and p.get("completion_tokens") and lanes_ok(p, n)]
+            out[f"ld_{size}{suffix}"] = med([p.get("decode_tok_s") for p in ps])
+            out[f"ld_ttft_{size}{suffix}"] = med([p.get("ttft_s") for p in ps])
+    for n in lane_set:
+        for scen, mid in (("long_prompt_63k", "ttft_63k"), ("long_prompt_127k", "ttft_127k"), ("long_prompt_250k", "ttft_250k")):
+            out[f"{mid}@l{n}"] = med([c["metrics"].get("ttft_s") for c in e["cases"] if c["scenario"] == scen and lanes_ok(c, n)
+                                      and c.get("verdict") in ("PASS", "FAIL")])
     # Whether speculative decoding ran for each measurement: on / off / mixed.
     spec = {}
     for mid, (scenario, _, _) in WORKLOADS.items():
@@ -231,12 +287,21 @@ def metrics_for(e):
         spec[mid] = (vals.pop() if len(vals) == 1 else "mixed") if vals else None
     spec["decode_nospec"] = "off" if out["decode_nospec"] else None
     out["_spec"] = spec
+    # Quality: a long session's own checks at 1 lane, its wave of N concurrent chats from the run at N lanes.
+    def scored_checks(c):
+        chs = c.get("checks", [])
+        if not c["scenario"].startswith("long_session_") or c.get("_lanes") is None:
+            return chs if (not c["scenario"].startswith(LONG_PREFIXES) or lanes_ok(c, 1)) else []
+        n = c["_lanes"]
+        return [ch for ch in chs if (ch.get("name", "").startswith(f"par{n}_") if n in (2, 4)
+                                    else (n == 1 and not ch.get("name", "").startswith("par")))]
     q = {}
-    for scenario, cs in by.items():
-        checks = [ch for c in cs for ch in c.get("checks", [])]
-        q[scenario] = (sum(1 for ch in checks if ch.get("ok")), len(checks))
+    for c in e["cases"]:
+        ok, total = q.get(c["scenario"], (0, 0))
+        chs = scored_checks(c)
+        q[c["scenario"]] = (ok + sum(1 for ch in chs if ch.get("ok")), total + len(chs))
     out["_quality"] = q
-    out["_checks"] = [(c["scenario"], ch.get("name", ""), bool(ch.get("ok"))) for c in e["cases"] for ch in c.get("checks", [])]
+    out["_checks"] = [(c["scenario"], ch.get("name", ""), bool(ch.get("ok"))) for c in e["cases"] for ch in scored_checks(c)]
     return out
 
 

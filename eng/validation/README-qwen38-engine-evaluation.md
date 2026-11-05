@@ -128,8 +128,42 @@ ledger codes are hidden in it at 4-96% depth. One case runs, in order:
 
 Every answer must contain its exact code. The document carries the repeat's nonce, so its
 first request never hits another run's cache. Run each tier on a server whose context is
-that tier (65,536 / 131,072 / 262,144 tokens) with at least four lanes, and record whether
-speculative decoding ran (the scorecard reads `spec.txt` beside each tier's results).
+that tier (65,536 / 131,072 / 262,144 tokens), and record whether speculative decoding ran
+(the scorecard reads `spec.txt` beside each tier's results).
+
+### Equal lanes and failure reasons
+
+A lane is a concurrent-request slot: TensorSharp `TS_SCHED_MAX_RUNNING_SEQS`, NInfer
+`--max-concurrency`, Ignis `--spec-decode-lanes`, llama.cpp `-np`, vLLM `--max-num-seqs`,
+SGLang `--max-running-requests` (with `--cuda-graph-max-bs-decode` equal to it). SGLang 0.5.23
+also caps running requests at `--max-mamba-cache-size` / 5 on this hybrid model (5 state slots
+per request with the radix cache on; its log says so), so the cache size is 5 x lanes: at
+3 x lanes one lane served no request and two lanes served one. The lane count
+changes memory per request and how a wave queues, so every engine runs every item at the same
+lane count: the main suite and the plain-decode run at 1 lane, each long tier at 1, 2 and 4
+lanes (`<engine>-<tier>-l<N>` directories). The scorecard takes a long tier's single-request
+measurements (TTFT, decode after the document, new-chat reuse, turns 2-3) from its 1-lane run,
+the wave of 2 concurrent chats from the 2-lane run and the wave of 4 from the 4-lane run; it
+also reports every lane count's own values as `<metric>@l<N>`, which the poster shows row by
+row (at 1 lane the waves queue).
+
+The long tiers run with speculative decoding (DFlash2, 7 drafts) only. A configuration that
+does not load, or whose KV pool cannot hold the tier's context, is not retried with other
+settings: its directory gets `FAILED` and `reason.txt` (the campaign's reason, then the
+server-log lines it came from), and the report shows the reason instead of a number. A tier that
+did not fit at L lanes is recorded as not run at more lanes, and at longer tiers with as many. A result
+that ran but is much slower than its peers carries the reason found in the server log (for
+example a request waiting for a slot, or a new chat re-prefilling the document).
+
+llama.cpp needs context checkpoints to reuse a prefix on this hybrid model: its recurrent
+(GatedDeltaNet) state must be restored at the end of the shared prefix. With `-ctxcp 0` only an
+exact continuation of a slot's own conversation is reusable; a new chat on a cached 64K
+document re-prefilled all of it (16.5 s, although the slot matched 99.9% of the prompt). Serve
+it with `-ctxcp 32 -cms 2048 --cache-ram 49152 -no-kvu`: a checkpoint every 2,048 prompt tokens
+and a host prompt cache. The new chat then took 0.23-0.25 s; follow-up turns cost about 170 ms
+more for the checkpoint. llama-server shares no prefix between slots (the prompt cache saves
+a slot's state only when the slot is evicted or idle), so a chat that lands on a slot without
+the document still prefills it; `-kvu` did not change that and made such waves slower.
 
 `qwen38-quality-diagnostics.py` may identify a correct answer inside one outer
 Markdown fence, but never rescales or replaces the original score.

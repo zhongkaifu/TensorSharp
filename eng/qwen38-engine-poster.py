@@ -3,15 +3,20 @@
 
   python3 eng/qwen38-engine-poster.py REPORT_DIR --context poster-context.json
 
-REPORT_DIR holds summary.json as written by eng/qwen38-engine-scorecard.py. The context
-JSON supplies what the evidence cannot: date, machine, per-engine setup rows and notes
-(per language). Every number on the poster comes from summary.json. Writes
-REPORT_DIR/poster2_en.html and poster2_zh.html; render them at 1600 px wide.
+REPORT_DIR holds summary.json as written by eng/qwen38-engine-scorecard.py. Every engine ran the
+main suite at 1 lane (one request at a time) and each long tier at 1, 2 and 4 lanes; the score uses
+the 1-lane runs for single-request measurements and the 2 / 4-lane runs for the waves of 2 / 4
+concurrent chats, so every measurement compares engines at the same lane count. The long-context
+tables show each lane count's own rows (<metric>@l<N>). The context JSON supplies what the evidence
+cannot: date, machine, per-engine setup rows, notes and the reasons behind results that did not run
+or ran slowly (per language). Writes REPORT_DIR/poster2_en.html and poster2_zh.html; render them at
+1600 px wide.
 
 Encoding: TensorSharp (both deployments: the NInfer .ninfer model and the GGUF model) is
 blue, the best value of each measurement gold, every other engine neutral gray; every bar
-and row carries its engine name and value, so no identity depends on color. Every value
-carries whether speculative decoding ran for it ("spec" / "plain", from summary.json "spec").
+and row carries its engine name and value, so no identity depends on color. Values carry
+whether speculative decoding ran for them ("spec" / "plain", from summary.json "spec"); a
+configuration that could not run shows its reason instead of a number.
 """
 from __future__ import annotations
 
@@ -54,8 +59,9 @@ TXT = {
         "cols": {"ttft": "TTFT (s)", "ld": "Decode after (tok/s)", "reuse": "New chat, KV reuse (s)", "mt": "Turns 2-3 (s)",
                  "p2": "2 concurrent (tok/s)", "p4": "4 concurrent (tok/s)", "spec": "Spec decoding"},
         "spec_on": "spec", "spec_off": "plain", "spec_mixed": "mixed", "spec_row_on": "spec on", "spec_row_off": "plain (spec off)",
-        "spec_legend": "spec = speculative decoding on (DFlash2, 7 drafts per step) · plain = off",
-        "lanes": "lanes", "ttft_short": "TTFT",
+        "spec_legend": "spec = speculative decoding on (DFlash2, 7 drafts per step) · plain = off · "
+                       "max N concurrent = the most requests the server ran at once (its configured slots; more wait in a queue)",
+        "lanes": "max {n} concurrent", "ttft_short": "TTFT",
         "cmp": "TensorSharp: GGUF model vs NInfer model", "cmp_sub": "Same engine build and harness; bold = the better of the two",
         "cmp_rows": {"overall": "Overall score", "quality": "Quality (checks passed)", "ttft_63k": "Prefill 64K (s)", "ttft_127k": "Prefill 128K (s)",
                      "decode_gen": "Decode, speculative (tok/s)", "decode_nospec": "Decode, plain (tok/s)", "ld_60000": "Decode after 64K (tok/s)",
@@ -63,6 +69,16 @@ TXT = {
                      "lreuse_64k": "64K new chat, KV reuse (s)", "lmt_128k": "128K turns 2-3 (s)", "lpar4_64k": "64K, 4 concurrent (tok/s)",
                      "lpar2_256k": "256K, 2 concurrent (tok/s)", "agent_e2e": "Agentic tool loop (s)"},
         "gguf": "GGUF model", "ninf": "NInfer model",
+        "group": {"1": "Max 1 concurrent request", "2": "Max 2 concurrent requests", "4": "Max 4 concurrent requests"},
+        "rank_g": "Overall Ranking", "excluded": "Not ranked",
+        "long_note": "Long-context results all use speculative decoding (DFlash2, 7 drafts per step). Each engine ran every tier three times, "
+                     "at max 1, 2 and 4 concurrent requests; bars and gold compare engines at the same lane count only. At 1 lane the waves "
+                     "of 2 / 4 chats queue. The score takes single-request columns from the 1-lane runs and the 2 / 4-concurrent columns "
+                     "from the 2 / 4-lane runs.",
+        "notrun": "did not run", "why": "Why",
+        "scen_g": "Performance by Task Scenario · one request at a time (1 lane)", "scen_tbl_sub": "Each row ranks the engines on one task (1 = best; gold = best). "
+                     "Lower is better for times, higher for tok/s.",
+        "task": "Task", "spec_all": "all results: speculative decoding",
     },
     "zh": {
         "title": "Qwen3.8-27B 推理基准：TensorSharp（NInfer / GGUF 模型）对比六款引擎",
@@ -81,8 +97,9 @@ TXT = {
         "cols": {"ttft": "首 token (s)", "ld": "上下文后解码 (tok/s)", "reuse": "新会话·KV 复用 (s)", "mt": "第 2–3 轮 (s)",
                  "p2": "2 路并发 (tok/s)", "p4": "4 路并发 (tok/s)", "spec": "推测解码"},
         "spec_on": "推测", "spec_off": "普通", "spec_mixed": "混合", "spec_row_on": "推测解码", "spec_row_off": "普通解码",
-        "spec_legend": "推测 = 开启推测解码（DFlash2，每步 7 个草稿）· 普通 = 关闭推测解码",
-        "lanes": "通道", "ttft_short": "首 token",
+        "spec_legend": "推测 = 开启推测解码（DFlash2，每步 7 个草稿）· 普通 = 关闭推测解码 · "
+                       "最多 N 路并发 = 服务端同时处理的请求上限（配置的并发槽位，多出的请求排队等待）",
+        "lanes": "最多 {n} 路并发", "ttft_short": "首 token",
         "cmp": "TensorSharp：GGUF 模型 vs NInfer 模型", "cmp_sub": "同一引擎构建与测试工具；加粗 = 两者中更优者",
         "cmp_rows": {"overall": "综合得分", "quality": "质量（检查通过）", "ttft_63k": "64K 预填充（s）", "ttft_127k": "128K 预填充（s）",
                      "decode_gen": "推测解码（tok/s）", "decode_nospec": "普通解码（tok/s）", "ld_60000": "64K 后解码（tok/s）",
@@ -90,6 +107,13 @@ TXT = {
                      "lreuse_64k": "64K 新会话·KV 复用（s）", "lmt_128k": "128K 第 2–3 轮（s）", "lpar4_64k": "64K 4 路并发（tok/s）",
                      "lpar2_256k": "256K 2 路并发（tok/s）", "agent_e2e": "智能体工具循环（s）"},
         "gguf": "GGUF 模型", "ninf": "NInfer 模型",
+        "group": {"1": "最多 1 路并发", "2": "最多 2 路并发", "4": "最多 4 路并发"},
+        "rank_g": "综合排名", "excluded": "未参与排名",
+        "long_note": "长上下文结果全部为推测解码（DFlash2，每步 7 个草稿）。每个引擎的每个档位跑三次：最多 1、2、4 路并发；"
+                     "条形与金色只在同一并发槽位数内比较。1 路时 2 / 4 个并发会话排队处理。计分时单请求各列取 1 路结果，2 / 4 路并发列取 2 / 4 路配置的结果。",
+        "notrun": "未能运行", "why": "原因",
+        "scen_g": "分场景性能排名 · 单请求（1 路并发）", "scen_tbl_sub": "每行是一个任务下各引擎的排名（1 = 最优，金色 = 最优）。时间越低越好，tok/s 越高越好。",
+        "task": "任务", "spec_all": "全部为推测解码",
     },
 }
 
@@ -174,6 +198,16 @@ table.bt .bar{display:inline-block;height:12px;border-radius:3px;background:var(
 table.bt tr.ts .bar{background:var(--blue)} table.bt td.best{background:var(--gold-soft)!important} table.bt td.best .bar{background:var(--gold)}
 table.bt td.best b{color:#7a5300} table.bt .sm{font-size:11px;color:var(--muted);margin-left:4px} table.bt td.na{color:var(--muted);font-size:12.5px}
 table.bt td.sp{font-size:12.5px;color:var(--ink2);white-space:normal} table.bt td.sp.off{color:#a3541c;font-weight:700}
+table.bt tr.grp td{background:#f2f1ee;font-weight:800;font-size:13px;color:var(--navy);padding:4px 6px}
+table.bt td.why{white-space:normal;font-size:12px;color:#7a3d12;line-height:1.25}
+table.cmp .sm2{display:block;font-size:11px;font-weight:400;color:var(--muted)}
+.exc{margin-top:10px;font-size:13px;color:#7a3d12} .exc ul{margin:4px 0 0;padding-left:18px}
+table.sct{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;font-size:14px}
+table.sct th{font-size:13px;color:var(--ink2);text-align:right;padding:4px 6px} table.sct th:first-child{text-align:left} table.sct th.ts{color:var(--blue)}
+table.sct td{padding:4px 6px;border-top:1px solid #efeee9;text-align:right;white-space:nowrap} table.sct td.ts{background:var(--blue-soft);color:var(--blue)}
+table.sct td.best{background:var(--gold-soft)} table.sct td.best.ts{box-shadow:inset 0 -2px 0 var(--gold)}
+table.sct td.tk{text-align:left;font-weight:700;white-space:normal} table.sct td.tk .w{display:block;font-weight:400;font-size:11px;color:var(--muted)}
+table.sct .rk2{font-size:11px;color:var(--muted);margin-left:5px} table.sct td.na{color:var(--muted);font-size:12px}
 """
 
 
@@ -234,34 +268,6 @@ def workload_text(summary, metric, lang):
     return f"{req}prompt {p} tok · {tok(w.get('output'))} tok generated per request"
 
 
-def mini_chart(summary, metric, higher, unit, not_run, lang):
-    """Horizontal bars, best first: blue = TensorSharp, gold = best, gray = the rest."""
-    rows = ranked(summary, metric, higher, not_run)
-    vals = [v for _, v in rows if v]
-    if not vals:
-        return ""
-    best = rows[0][1]
-    w, rowh, left, right = 360, 24, 96, 92
-    h = len(rows) * rowh + 6
-    plot = w - left - right
-    vmax = max(vals)
-    out = [f'<svg viewBox="0 0 {w} {h}" width="100%" role="img">']
-    for i, (k, v) in enumerate(rows):
-        y = 3 + i * rowh
-        ts = k in TS
-        out.append(f'<text x="{left - 8}" y="{y + 16}" text-anchor="end" class="lab{" ts" if ts else ""}" style="font-size:13px">{html.escape(SHORT[k])}</text>')
-        if not v:
-            out.append(f'<text x="{left + 4}" y="{y + 16}" class="val" style="fill:#8a8984;font-size:12.5px">{TXT[lang]["na"]}</text>')
-            continue
-        bw = max(3.0, plot * v / vmax)
-        color = "var(--blue)" if ts else ("var(--gold)" if v == best else "var(--gray)")
-        out.append(f'<rect x="{left}" y="{y + 4}" width="{bw:.1f}" height="16" rx="3" fill="{color}"><title>{html.escape(NAMES[k])}: {fmt(v, unit)} {unit}</title></rect>')
-        weight = 700 if (v == best or ts) else 400
-        out.append(f'<text x="{left + bw + 5:.1f}" y="{y + 16.5}" class="val" style="font-size:12.5px;font-weight:{weight}">{fmt(v, unit)}{spec_tag(summary, k, metric, lang, svg=True)}</text>')
-    out.append(f'<line x1="{left}" x2="{left}" y1="2" y2="{h - 2}" stroke="#e3e1db"/></svg>')
-    return "".join(out)
-
-
 def decode_chart(summary, lang):
     """Grouped horizontal bars (plain gray, speculative blue) with the speed-up badge per row."""
     t = TXT[lang]
@@ -305,25 +311,6 @@ def decode_chart(summary, lang):
         out.append(f'<text x="{x:.1f}" y="{axis_y + 16}" text-anchor="middle" class="lab" style="font-size:12px">{tick}</text>')
     out.append(f'<text x="{left + plot}" y="{axis_y + 16}" text-anchor="end" class="lab" style="font-size:12px">tok/s</text></svg>')
     return "".join(out)
-
-
-def scenario_card(summary, metric, higher, unit, title, not_run, lang):
-    rows = ranked(summary, metric, higher, not_run)
-    best = rows[0][1]
-    trs = []
-    for i, (k, v) in enumerate(rows):
-        cls = []
-        if k in TS:
-            cls.append("ts")
-        if v and v == best:
-            cls.append("best")
-        val = (f"{fmt(v, unit)} {unit if unit == 's' else ''}".strip() + spec_tag(summary, k, metric, lang)) if v else TXT[lang]["na"]
-        pos = f"{i + 1}." if v else "–"
-        trs.append(f'<tr class="{" ".join(cls)}"><td>{pos} {html.escape(name(k, lang))}</td><td class="v">{val}</td></tr>')
-    hint = TXT[lang]["higher"] if higher else TXT[lang]["lower"]
-    return (f'<div class="sc"><div class="t">{html.escape(title)}</div>'
-            f'<div class="d">{html.escape(workload_text(summary, metric, lang))} · {hint}</div>'
-            f'<table>{"".join(trs)}</table></div>')
 
 
 def tint(pct):
@@ -374,6 +361,8 @@ def ts_compare(summary, lang):
     """The two TensorSharp deployments side by side: score, quality and the headline metrics."""
     t = TXT[lang]
     e = summary["engines"]
+    if "tensorsharp-gguf" not in e or "tensorsharp" not in e:
+        return ""
     gg, ni = e["tensorsharp-gguf"], e["tensorsharp"]
     rows = [("overall", True), ("quality", True), ("ttft_63k", False), ("ttft_127k", False), ("ttft_250k", False),
             ("lreuse_64k", False), ("lmt_128k", False), ("lpar4_64k", True), ("lpar2_256k", True), ("decode_gen", True),
@@ -388,140 +377,166 @@ def ts_compare(summary, lang):
             fa, fb = f'{gg["checks"][0]}/{gg["checks"][1]}', f'{ni["checks"][0]}/{ni["checks"][1]}'
         else:
             a, b = gg["metrics"].get(key), ni["metrics"].get(key)
-            if a is None or b is None:
-                continue
             unit = "s" if key.startswith(("ttft", "lreuse", "lmt")) or key.endswith("_e2e") else "tok/s"
-            fa = fmt(a, unit) + spec_tag(summary, "tensorsharp-gguf", key, lang)
-            fb = fmt(b, unit) + spec_tag(summary, "tensorsharp", key, lang)
-        wa = a == b or (a > b) == hib
-        wb = a == b or (b > a) == hib
+            fa = (fmt(a, unit) + spec_tag(summary, "tensorsharp-gguf", key, lang)) if a else t["na"]
+            fb = (fmt(b, unit) + spec_tag(summary, "tensorsharp", key, lang)) if b else t["na"]
+            if not a and not b:
+                continue
+        wa = a is not None and (b is None or a == b or (a > b) == hib)
+        wb = b is not None and (a is None or a == b or (b > a) == hib)
         out.append(f'<tr><td>{html.escape(t["cmp_rows"][key])}</td><td{" class=w" if wa else ""}>{fa}</td><td{" class=w" if wb else ""}>{fb}</td></tr>')
     out.append("</table>")
     return "".join(out)
 
 
-def tier_table(summary, tier, lang, not_run):
-    """One context tier: every engine's TTFT, decode, KV reuse, multi-turn and concurrency, as a
-    bar table (bars scale within a column; gold = the column's best; blue rows = TensorSharp)."""
+def reason_text(ctx, lang, engine, mode, lanes, meta):
+    """Why a configuration did not run or ran slowly: the curated text from the context, else the campaign's reason."""
+    key = f"{engine}-{mode}-l{lanes}"
+    curated = (ctx.get(lang, {}).get("reasons") or {}).get(key)
+    if curated:
+        return curated
+    if meta and meta.get("failed"):
+        return meta.get("reason") or TXT[lang]["notrun"]
+    return None
+
+
+LANES = ("1", "2", "4")
+
+
+def tier_table(summary, tier, lang, ctx):
+    """One context tier: per lane count (max 1, 2, 4 concurrent), every engine's TTFT, decode, KV reuse,
+    multi-turn and concurrency as a bar table (bars and gold compare within the lane count only; blue rows =
+    TensorSharp). A configuration that did not run shows its reason; a slow one carries its reason too."""
     t = TXT[lang]
     cols = [(TIER_TTFT[tier], False, "s", "ttft"), (TIER_LD[tier], True, "tok/s", "ld"), (f"lreuse_{tier}", False, "s", "reuse"),
             (f"lmt_{tier}", False, "s", "mt"), (f"lpar2_{tier}", True, "tok/s", "p2"), (f"lpar4_{tier}", True, "tok/s", "p4")]
     eng = summary["engines"]
-    order = [k for k in summary["order"] if any(eng[k]["metrics"].get(c[0]) for c in cols)]
-    if not order:
-        return ""
     head = ['<th style="width:150px"></th>']
     for mid, hib, unit, key in cols:
         head.append(f'<th>{html.escape(t["cols"][key])}<span class="w">{html.escape(workload_text(summary, mid, lang))}'
                     f' · {t["higher"] if hib else t["lower"]}</span></th>')
-    head.append(f'<th style="width:128px">{t["cols"]["spec"]}</th>')
-    best = {}
-    for mid, hib, _, _ in cols:
-        vals = [eng[k]["metrics"].get(mid) for k in order if eng[k]["metrics"].get(mid) and mid not in not_run.get(k, [])]
-        best[mid] = ((max if hib else min)(vals), max(vals)) if vals else (None, None)
+    head.append(f'<th style="width:250px">{t["why"]}</th>')
     rows = []
-    for k in order:
-        m = eng[k]["metrics"]
-        cells = [f'<td class="nm">{html.escape(SHORT[k] if k in TS else NAMES[k])}</td>']
-        for mid, hib, unit, key in cols:
-            v = m.get(mid)
-            if not v or mid in not_run.get(k, []):
-                cells.append(f'<td class="na">{t["na"]}</td>')
+    for g in LANES:
+        sfx = f"@l{g}"
+        present = [k for k in summary["order"] if (eng[k].get("meta") or {}).get(f"{tier}{sfx}")]
+        if not present:
+            continue
+        best = {}
+        for mid, hib, _, _ in cols:
+            vals = [eng[k]["metrics"].get(mid + sfx) for k in present if eng[k]["metrics"].get(mid + sfx)]
+            best[mid] = ((max if hib else min)(vals), max(vals)) if vals else (None, None)
+        rows.append(f'<tr class="grp"><td colspan="{len(cols) + 2}">{html.escape(t["group"][g])}</td></tr>')
+        for k in present:
+            meta = eng[k]["meta"][f"{tier}{sfx}"]
+            m = eng[k]["metrics"]
+            why = reason_text(ctx, lang, k, tier, g, meta)
+            cells = [f'<td class="nm">{html.escape(SHORT[k] if k in TS else NAMES[k])}</td>']
+            if meta.get("failed") or not any(m.get(c[0] + sfx) for c in cols):
+                cells.append(f'<td class="na" colspan="{len(cols)}">{t["notrun"]}</td>')
+                cells.append(f'<td class="why">{html.escape(why or "")}</td>')
+                rows.append(f'<tr class="{"ts" if k in TS else ""}">{"".join(cells)}</tr>')
                 continue
-            b, vmax = best[mid]
-            sub = ""
-            if key in ("p2", "p4"):
-                tt = m.get(f"lpar{key[1]}_ttft_{tier}")
-                sub = f'<span class="sm">{t["ttft_short"]} {fmt(tt, "s")} s</span>' if tt else ""
-            cells.append(f'<td class="{"best" if v == b else ""}"><span class="bar" style="width:{max(3, 70 * v / vmax):.0f}px"></span>'
-                         f'<b>{fmt(v, unit)}</b>{sub}</td>')
-        sps = {spec_of(summary, k, c[0]) for c in cols if m.get(c[0])} - {None}
-        sp = (sps.pop() if len(sps) == 1 else "mixed") if sps else None
-        lanes = (eng[k].get("meta", {}).get(tier) or {}).get("variant", "")
-        lanes_txt = ""
-        if lanes.startswith("lanes="):
-            lanes_txt = f' · {lanes.split()[0].split("=")[1]} {t["lanes"]}'
-        sp_txt = t["spec_row_" + sp] if sp in ("on", "off") else (t["spec_mixed"] if sp else "–")
-        cells.append(f'<td class="sp{" off" if sp == "off" else ""}">{html.escape(sp_txt)}{lanes_txt}</td>')
-        rows.append(f'<tr class="{"ts" if k in TS else ""}">{"".join(cells)}</tr>')
+            for mid, hib, unit, key in cols:
+                v = m.get(mid + sfx)
+                if not v:
+                    cells.append(f'<td class="na">{t["na"]}</td>')
+                    continue
+                b, vmax = best[mid]
+                sub = ""
+                if key in ("p2", "p4"):
+                    tt = m.get(f"lpar{key[1]}_ttft_{tier}{sfx}")
+                    sub = f'<span class="sm">{t["ttft_short"]} {fmt(tt, "s")} s</span>' if tt else ""
+                cells.append(f'<td class="{"best" if v == b else ""}"><span class="bar" style="width:{max(3, 46 * v / vmax):.0f}px"></span>'
+                             f'<b>{fmt(v, unit)}</b>{sub}</td>')
+            cells.append(f'<td class="why">{html.escape(why or "")}</td>')
+            rows.append(f'<tr class="{"ts" if k in TS else ""}">{"".join(cells)}</tr>')
     return (f'<div class="tier"><div class="tl">{TIER_LABEL[tier]}</div><table class="bt"><tr>{"".join(head)}</tr>'
             f'{"".join(rows)}</table></div>')
 
 
+def scen_table(summary, lang):
+    """Per-scenario ranking (one request at a time): rows = tasks, columns = engines (overall order), value + rank."""
+    t = TXT[lang]
+    eng = summary["engines"]
+    order = summary["order"]
+    items = [(mid, hib, unit, zh if lang == "zh" else en) for mid, hib, unit, en, zh, _, _ in KEY_METRICS] + \
+            [(mid, hib, unit, zh if lang == "zh" else en) for mid, hib, unit, en, zh in CARDS]
+    head = "".join(f'<th class="{"ts" if k in TS else ""}">{html.escape(SHORT[k])}</th>' for k in order)
+    out = [f'<table class="sct"><tr><th>{t["task"]}</th>{head}</tr>']
+    for mid, hib, unit, title in items:
+        vals = {k: eng[k]["metrics"].get(mid) for k in order}
+        have = sorted([k for k in order if vals[k]], key=lambda k: -vals[k] if hib else vals[k])
+        if not have:
+            continue
+        rank = {k: i + 1 for i, k in enumerate(have)}
+        cells = []
+        for k in order:
+            v = vals[k]
+            if not v:
+                cells.append(f'<td class="na">{t["na"]}</td>')
+                continue
+            cls = ("best " if rank[k] == 1 else "") + ("ts" if k in TS else "")
+            unit_txt = " s" if unit == "s" else ""
+            cells.append(f'<td class="{cls.strip()}"><b>{fmt(v, unit)}{unit_txt}</b>{spec_tag(summary, k, mid, lang) if spec_of(summary, k, mid) == "off" else ""}'
+                         f'<span class="rk2">#{rank[k]}</span></td>')
+        desc = workload_text(summary, mid, lang)
+        out.append(f'<tr><td class="tk">{html.escape(title)}<span class="w">{html.escape(desc)} · {t["higher"] if hib else t["lower"]}</span></td>{"".join(cells)}</tr>')
+    out.append("</table>")
+    return "".join(out)
+
+
+def excluded_block(ctx, lang):
+    ex = ctx.get("excluded") or {}
+    if not ex:
+        return ""
+    items = "".join(f'<li><b>{html.escape(name(k, lang))}</b>: {html.escape(v.get(lang) or "")}</li>' for k, v in ex.items())
+    return f'<div class="exc"><b>{TXT[lang]["excluded"]}</b><ul>{items}</ul></div>'
+
+
 def tldr(summary, lang, tail=""):
+    t = TXT[lang]
     o = summary["order"]
     e = summary["engines"]
-    m = lambda k, x: e[k]["metrics"].get(x)
-    rank = lambda k: e[k]["rank"]
-    first = o[0]
-    ni, gg = "tensorsharp", "tensorsharp-gguf"
     n = lambda k: name(k, lang)
+    first = o[0]
+    ts_bits = [(k, e[k]) for k in TS if k in e and k != first]
     q = lambda k: f'{e[k]["checks"][0]}/{e[k]["checks"][1]}'
-    runner = next(k for k in o if k not in TS)  # best engine that is not TensorSharp
-
-    def best(x, hib):
-        have = [k for k in o if m(k, x)]
-        return (max if hib else min)(have, key=lambda k: m(k, x)) if have else None
-
-    def sp(k, x):
-        v = spec_of(summary, k, x)
-        return f' {TXT[lang]["spec_" + v]}' if v else ""
+    runner = next((k for k in o if k not in TS), None)
 
     def who(x, hib, unit):
-        k = best(x, hib)
-        if not k:
+        have = [k for k in o if e[k]["metrics"].get(x)]
+        if not have:
             return None
-        v = m(k, x)
+        k = (max if hib else min)(have, key=lambda k: e[k]["metrics"][x])
+        v = e[k]["metrics"][x]
         val = f"{v:.0f} tok/s" if unit == "tok/s" else (f"{v:.2f} s" if v < 10 else f"{v:.1f} s")
-        return f'{SHORT[k]} <b>{val}</b>{sp(k, x)}'
+        return f'{SHORT[k]} <b>{val}</b>'
 
-    if lang == "zh":
-        if first in TS:
-            other = ni if first == gg else gg
-            head = (f'<span class="ts">{n(first)}</span> 综合 <b>{e[first]["overall"]:.1f}</b> 排名<b>第一</b>（质量 {q(first)}），领先 {n(runner)}（{e[runner]["overall"]:.1f}）；'
-                    f'<span class="ts">{n(other)}</span> 第 <b>{rank(other)}</b>（{e[other]["overall"]:.1f}，质量 {q(other)}）。')
-        else:
-            head = (f'<span class="ts">{n(first)}</span> 综合 <b>{e[first]["overall"]:.1f}</b> 排名第一。'
-                    f'TensorSharp 两种部署：<span class="ts">NInfer 模型</span> 第 <b>{rank(ni)}</b>（{e[ni]["overall"]:.1f}，质量 {q(ni)}），'
-                    f'<span class="ts">GGUF 模型</span> 第 <b>{rank(gg)}</b>（{e[gg]["overall"]:.1f}，质量 {q(gg)}）。')
-        parts = []
-        for tier in TIERS:
-            bits = [x for x in (f"首 token 最快 {who(TIER_TTFT[tier], False, 's')}" if who(TIER_TTFT[tier], False, 's') else None,
-                                f"KV 复用最快 {who(f'lreuse_{tier}', False, 's')}" if who(f"lreuse_{tier}", False, "s") else None,
-                                f"4 路并发最快 {who(f'lpar4_{tier}', True, 'tok/s')}" if who(f"lpar4_{tier}", True, "tok/s") else None) if x]
-            if bits:
-                parts.append(f"{TIER_LABEL[tier]}：" + "，".join(bits))
-        return head + "长上下文 —— " + "；".join(parts) + "。" + tail
-    if first in TS:
-        other = ni if first == gg else gg
-        head = (f'<span class="ts">{n(first)}</span> ranks <b>#1</b> overall (<b>{e[first]["overall"]:.1f}</b>, {q(first)} checks), ahead of '
-                f'{n(runner)} ({e[runner]["overall"]:.1f}); the <span class="ts">{"NInfer" if other == ni else "GGUF"} model</span> ranks <b>#{rank(other)}</b> '
-                f'({e[other]["overall"]:.1f}, {q(other)} checks). ')
-    else:
-        head = (f'<span class="ts">{n(first)}</span> ranks <b>#1</b> overall (<b>{e[first]["overall"]:.1f}</b>). '
-                f'TensorSharp as two deployments: the <span class="ts">NInfer model</span> ranks <b>#{rank(ni)}</b> ({e[ni]["overall"]:.1f}, '
-                f'{q(ni)} checks) and the <span class="ts">GGUF model</span> <b>#{rank(gg)}</b> ({e[gg]["overall"]:.1f}, {q(gg)} checks). ')
     parts = []
     for tier in TIERS:
-        bits = [x for x in (f"fastest TTFT {who(TIER_TTFT[tier], False, 's')}" if who(TIER_TTFT[tier], False, 's') else None,
-                            f"KV reuse {who(f'lreuse_{tier}', False, 's')}" if who(f"lreuse_{tier}", False, "s") else None,
-                            f"4 concurrent {who(f'lpar4_{tier}', True, 'tok/s')}" if who(f"lpar4_{tier}", True, "tok/s") else None) if x]
+        a, b = who(TIER_TTFT[tier], False, "s"), who(f"lpar4_{tier}", True, "tok/s")
+        bits = [x for x in ((("首 token 最快 " if lang == "zh" else "fastest TTFT ") + a) if a else None,
+                            (("4 路并发最快 " if lang == "zh" else "4 concurrent ") + b) if b else None) if x]
         if bits:
-            parts.append(f"{TIER_LABEL[tier]}: " + ", ".join(bits))
+            parts.append(f"{TIER_LABEL[tier]}" + ("：" if lang == "zh" else ": ") + ("，" if lang == "zh" else ", ").join(bits))
+    if lang == "zh":
+        head = (f'<span class="ts">{n(first)}</span>' if first in TS else n(first)) + f' 综合 <b>{e[first]["overall"]:.1f}</b> 排名<b>第一</b>（质量 {q(first)}）'
+        if first in TS and runner:
+            head += f'，领先 {n(runner)}（{e[runner]["overall"]:.1f}）'
+        head += "".join(f'；<span class="ts">{"GGUF" if k == "tensorsharp-gguf" else "NInfer"} 模型</span> 第 <b>{v["rank"]}</b>（{v["overall"]:.1f}）' for k, v in ts_bits) + "。"
+        return head + "长上下文 —— " + "；".join(parts) + "。" + tail
+    head = (f'<span class="ts">{n(first)}</span>' if first in TS else n(first)) + f' ranks <b>#1</b> overall (<b>{e[first]["overall"]:.1f}</b>, {q(first)} checks)'
+    if first in TS and runner:
+        head += f', ahead of {n(runner)} ({e[runner]["overall"]:.1f})'
+    head += "".join(f'; the <span class="ts">{"GGUF" if k == "tensorsharp-gguf" else "NInfer"} model</span> ranks <b>#{v["rank"]}</b> ({v["overall"]:.1f})' for k, v in ts_bits) + ". "
     return head + "Long context &mdash; " + "; ".join(parts) + ". " + tail
 
 
 def render(summary, ctx, lang):
     t = TXT[lang]
-    not_run = ctx.get("not_run", {})
     c = ctx[lang]
-    minis = "".join(f'<div class="mini"><div class="t">{html.escape(title_zh if lang == "zh" else title_en)}</div>'
-                    f'<div class="d">{html.escape(c.get("key_tasks", {}).get(mid) or (task_zh if lang == "zh" else task_en))} · {t["higher"] if hib else t["lower"]}</div>'
-                    f'{mini_chart(summary, mid, hib, unit, not_run, lang)}</div>'
-                    for mid, hib, unit, title_en, title_zh, task_en, task_zh in KEY_METRICS)
-    cards = "".join(scenario_card(summary, mid, hib, unit, zh if lang == "zh" else en, not_run, lang)
-                    for mid, hib, unit, en, zh in CARDS)
-    longs = "".join(tier_table(summary, tier, lang, not_run) for tier in TIERS)
+    longs = "".join(tier_table(summary, tier, lang, ctx) for tier in TIERS)
     setup_rows = "".join(f'<tr class="{"ts" if k in TS else ""}"><td><b>{html.escape(name(k, lang))}</b></td>'
                          + "".join(f"<td>{html.escape(x)}</td>" for x in c["setup"][k]) + "</tr>"
                          for k in summary["order"] if k in c["setup"])
@@ -529,20 +544,19 @@ def render(summary, ctx, lang):
     others = sum(1 for k in summary["order"] if k not in TS)
     count = {"en": {4: "Four", 5: "Five", 6: "Six", 7: "Seven"}, "zh": {4: "四", 5: "五", 6: "六", 7: "七"}}[lang].get(others, str(others))
     title = t["title"].replace("Six", count) if lang == "en" else t["title"].replace("六", count)
-    t = dict(t, title=title, rank_sub=t["rank_sub"].format(n=len(summary["categories"])))
-    return f"""<!DOCTYPE html><html lang="{'zh-CN' if lang == 'zh' else 'en'}"><head><meta charset="utf-8"><title>{html.escape(t['title'])}</title>
+    rank_sub = t["rank_sub"].format(n=len(summary["categories"]))
+    return f"""<!DOCTYPE html><html lang="{'zh-CN' if lang == 'zh' else 'en'}"><head><meta charset="utf-8"><title>{html.escape(title)}</title>
 <style>{CSS}</style></head><body><div class="page">
-<div class="hdr"><div><h1>{html.escape(t['title'])}</h1><div class="meta">{html.escape(c['meta'])}</div><div class="speclegend">{html.escape(t['spec_legend'])}</div></div>
+<div class="hdr"><div><h1>{html.escape(title)}</h1><div class="meta">{html.escape(c['meta'])}</div><div class="speclegend">{html.escape(t['spec_legend'])}</div></div>
 <div class="tldr"><div class="h">{t['tldr']}</div>{tldr(summary, lang, c.get('tldr_tail', ''))}</div></div>
 <div class="row" style="grid-template-columns:1fr 1fr">
- <div class="card"><h2>{t['rank']}</h2><p class="sub">{html.escape(t['rank_sub'])}</p>{ranking_block(summary, lang)}{ts_compare(summary, lang)}</div>
+ <div class="card"><h2>{t['rank_g']}</h2><p class="sub">{html.escape(rank_sub)}</p>{ranking_block(summary, lang)}{excluded_block(ctx, lang)}{ts_compare(summary, lang)}</div>
  <div class="card"><h2>{t['decode']}</h2><p class="sub">{html.escape(c.get('decode_sub', t['decode_sub']))}</p>
   <div class="legend"><span><span class="sw" style="background:var(--gray)"></span>{t['plain']}</span><span><span class="sw" style="background:var(--blue)"></span>{t['spec']}</span></div>
   {decode_chart(summary, lang)}</div>
 </div>
-<div class="row"><div class="card" style="border:2px solid var(--blue)"><h2>{t['long']}</h2><p class="sub">{html.escape(t['long_sub'])}</p>{longs}</div></div>
-<div class="row"><div class="card"><h2>{t['key']}</h2><p class="sub">{html.escape(c['key_sub'])}</p><div class="minis">{minis}</div></div></div>
-<div class="row"><div class="card"><h2>{t['scen']}</h2><p class="sub">{html.escape(c['scen_sub'])}</p><div class="cards">{cards}</div></div></div>
+<div class="row"><div class="card" style="border:2px solid var(--blue)"><h2>{t['long']}</h2><p class="sub">{html.escape(t['long_note'])} {html.escape(t['long_sub'])}</p>{longs}</div></div>
+<div class="row"><div class="card"><h2>{html.escape(t['scen_g'])}</h2><p class="sub">{html.escape(t['scen_tbl_sub'])} {html.escape(c.get('scen_sub', ''))}</p>{scen_table(summary, lang)}</div></div>
 <div class="row"><div class="card"><h2>{t['qual']}</h2><p class="sub">{html.escape(c['qual_sub'])}</p>{quality_table(summary, lang)}</div></div>
 <div class="row" style="grid-template-columns:1.25fr 1fr">
  <div class="card"><h2>{t['setup']}</h2><p class="sub">{html.escape(c['setup_sub'])}</p><table class="st"><tr><th>{t['engine']}</th><th>{t['version']}</th><th>{t['weights']}</th><th>{t['kv']}</th><th>{t['drafter']}</th></tr>{setup_rows}</table></div>
