@@ -1,0 +1,39 @@
+{
+  "schema": "qwen38-cua-causality-jobs/1",
+  "profiles": [
+    {
+      "name": "Prod",
+      "cpu_simd": "0",
+      "splitk_policy": "production-unset"
+    },
+    {
+      "name": "Draft0",
+      "cpu_simd": "0",
+      "splitk_policy": "draft-zero"
+    },
+    {
+      "name": "Target0",
+      "cpu_simd": "0",
+      "splitk_policy": "target-zero"
+    },
+    {
+      "name": "Both0",
+      "cpu_simd": "0",
+      "splitk_policy": "splitk-zero"
+    }
+  ],
+  "comparisons": [
+    {
+      "left": "Prod",
+      "right": "Draft0"
+    },
+    {
+      "left": "Prod",
+      "right": "Target0"
+    },
+    {
+      "left": "Prod",
+      "right": "Both0"
+    }
+  ]
+}

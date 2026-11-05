@@ -69,7 +69,7 @@ already accepts (listed in `--help`), with or without the leading `--`. Comments
 | array               | a repeated flag                  | `"stop": ["</s>", "<\|eot\|>"]` → `--stop </s> --stop <\|eot\|>` |
 | object              | a downloadable file (see below)  | `{ "path": "...", "urls": ["..."] }` |
 
-`"variables"` (see below), its alias `"vars"`, `"$schema"`, and `"$unavailable"` are
+`"variables"` (see below), its alias `"vars"`, `"environment"`, `"$schema"`, and `"$unavailable"` are
 reserved and never become options. A key that names a removed option is refused with a message
 saying what to use instead, and `lora-scale` / `lora-config` cannot be arrays,
 because each binds to the one `--lora` before it.
@@ -95,6 +95,11 @@ in any string value. A `${name}` that is not defined there falls back to an
 environment variable of the same name (an empty one counts as unset), and variables may reference other
 variables. `${name:-fallback}` supplies a value for when the name is defined
 nowhere. See [`variables.json`](variables.json).
+
+`${appBaseDirectory}` is a reserved built-in: it resolves to the directory of
+the running CLI or Server.Host application, independently of the config file
+and working directory. A config cannot redefine it under `variables`. This
+lets one shared config name each application's own deployed native assets.
 
 ```json
 {
@@ -143,6 +148,33 @@ live in different folders each get their own root:
   "qwen-image-vl": "${encoderRoot}/Qwen3VL-8B-Instruct-Q4_K_M.gguf"
 }
 ```
+
+## Environment defaults
+
+The reserved `environment` object maps environment-variable names to **strings**:
+
+```json
+{
+  "environment": {
+    "MAX_CONTEXT": "40960",
+    "TS_Q35_NINFER_DRAFT_PTX": "${appBaseDirectory}/cuda_kernels/tensorsharp_q35_ninfer_draft.fatbin"
+  }
+}
+```
+
+Existing process environment values win over file defaults. If multiple config
+files set a default, the later file wins. Values use the same variable expansion
+as option strings. All maps are validated before preflight/downloads, and no
+defaults are applied until all config expansion, host preflight and required
+downloads succeed. The preview/preflight remains free of environment mutations.
+Names cannot be empty, contain `=` or control characters; values cannot contain
+NUL. A map does not download files and never becomes an `--environment` argument.
+Normal command-line option precedence is unchanged.
+
+The [NInfer guide](README-ninfer.md) provides two shared CLI/Server.Host presets,
+[40K](qwen3.8-27b-ninfer.json) and [64K](qwen3.8-27b-ninfer-64k.json), including
+the embedded DFlash module path. The 64K optimized profile's actual GPU/model
+qualification is separate from parsing or configured context capacity.
 
 ## Auto-download
 
@@ -248,6 +280,7 @@ TensorSharp.Server.Host --config config/gemma-4-26b-a4b.json
 | [`qwen3.6-27b.json`](qwen3.6-27b.json) | Qwen3.6-27B + vision | Multimodal LLM |
 | [`qwen3.6-35b-a3b.json`](qwen3.6-35b-a3b.json) | Qwen3.6-35B-A3B (MoE) + vision | Multimodal MoE LLM |
 | [`qwen3.8-flash-next.json`](qwen3.8-flash-next.json) | Qwen3.8 Flash Next (UD-Q2_K_XL, three shards) + vision | Multimodal MoE LLM; optional shared MTP head |
+| [`qwen3.8-27b-metal-dflash2.json`](qwen3.8-27b-metal-dflash2.json) | Qwen3.8-27B (UD-IQ3_XXS) + DFlash2 Q4_K_M drafter | Text LLM on Apple Silicon (`ggml_metal`), speculative decoding: 39-52 tok/s on code and lists on an M5 Pro |
 | [`gemma-4-e4b.json`](gemma-4-e4b.json) | Gemma-4 E4B **uncensored** (TrevorJS's community build, Q8_0) + stock unsloth vision projector + AtomicChat MTP draft | Multimodal LLM |
 | [`gemma-4-12b.json`](gemma-4-12b.json) | Gemma-4 12B (QAT) + vision + MTP draft | Multimodal LLM |
 | [`gemma-4-26b-a4b.json`](gemma-4-26b-a4b.json) | Gemma-4 26B-A4B (MoE) + vision + MTP draft | Multimodal MoE LLM |

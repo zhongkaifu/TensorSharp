@@ -73,14 +73,15 @@ namespace TensorSharp.Cuda
         // the draft pass's rows [MaxSeqs * b] ...
         private IntPtr _dAcc, _dQ8, _dQ8d, _dMeta, _dX, _dH, _dH2, _dCoef, _dQ, _dK, _dV, _dQn, _dAtt, _dO, _dGu, _dAct;
         private IntPtr _dBlockK, _dBlockV, _dBlockKTab, _dBlockVTab, _dPartial, _dLogits, _dCand, _dUnary, _dSel, _dDrafts, _dConf;
+        private IntPtr _dTopPartialIdx, _dTopPartialVal;
         private IntPtr _tabRingK, _tabRingV, _tabRingPos;
 
         /// <summary>True when a drafter is attached.</summary>
-        public bool HasDrafter => _d != null;
+        public bool HasDrafter => _d != null || HasNinferDrafter;
         /// <summary>The attached drafter's block (anchor included), 0 without one.</summary>
-        public int DraftBlockSize => _d?.BlockSize ?? 0;
+        public int DraftBlockSize => HasNinferDrafter ? _ninferDraftDesc.BlockSize : _d?.BlockSize ?? 0;
         /// <summary>Committed positions a slot's drafter ring keeps.</summary>
-        public int DraftRingRows => _ringRows;
+        public int DraftRingRows => RingRows;
 
         private int DraftRows => MaxSeqs * _d.BlockSize;
         private int Gamma => _d.BlockSize - 1;
@@ -88,6 +89,7 @@ namespace TensorSharp.Cuda
         /// <summary>Loads a drafter. Slots created before this have no ring: create them after.</summary>
         public void AttachDrafter(DraftDesc d)
         {
+            if (_m.Ninfer != null) throw new NotSupportedException("A GGUF drafter cannot be attached to the NInfer target numerical recipe.");
             if (d == null)
                 throw new ArgumentNullException(nameof(d));
             if (_d != null)
@@ -100,6 +102,7 @@ namespace TensorSharp.Cuda
             if (d.TargetLayers == null || d.Fc.Ne0 != d.TargetLayers.Length * _m.NEmbd)
                 throw new NotSupportedException("[q35-cuda] drafter fc width does not match its target taps");
             MakeCurrent();
+            InvalidateVerifyGraphs();
             _dTapOf = new int[_m.NLayer];
             Array.Fill(_dTapOf, -1);
             for (int i = 0; i < d.TargetLayers.Length; i++)
@@ -162,6 +165,9 @@ namespace TensorSharp.Cuda
             _dLogits = Alloc((long)MaxSeqs * Gamma * _m.NVocab * 4);
             _dCand = Alloc((long)MaxSeqs * Gamma * d.SelTopK * 4);
             _dUnary = Alloc((long)MaxSeqs * Gamma * d.SelTopK * 4);
+            long topPartialBytes = (long)MaxSeqs * Gamma * Q35Kernels.TopKPartitions * d.SelTopK * 4;
+            _dTopPartialIdx = Alloc(topPartialBytes);
+            _dTopPartialVal = Alloc(topPartialBytes);
             _dSel = Alloc((long)MaxSeqs * Gamma * d.SelRank * 4);
             _dDrafts = Alloc((long)MaxSeqs * Gamma * 4);
             _dConf = Alloc((long)MaxSeqs * Gamma * 4);
@@ -243,7 +249,7 @@ namespace TensorSharp.Cuda
         /// K and V per draft layer, then the position each row holds.</summary>
         private void PlaceRing(Slot s, IntPtr ringBase)
         {
-            int layers = _dl.Length;
+            int layers = RingLayers;
             long step = Align256(RingLayerBytes), off = 0;
             s.RingBase = ringBase;
             s.RingK = new IntPtr[layers];
@@ -261,7 +267,7 @@ namespace TensorSharp.Cuda
         private void ResetRing(Slot s)
         {
             if (s.RingPos != IntPtr.Zero)
-                CudaDriverApi.cuMemsetD8Async(s.RingPos, 0xFF, new UIntPtr(4UL * (ulong)_ringRows), Stream).ThrowOnError();
+                CudaDriverApi.cuMemsetD8Async(s.RingPos, 0xFF, new UIntPtr(4UL * (ulong)RingRows), Stream).ThrowOnError();
         }
 
         private void CopyRing(Slot src, Slot dst)
@@ -389,16 +395,23 @@ namespace TensorSharp.Cuda
         /// <summary>
         /// Drafts one block for each slot: anchors[i] is slot i's next token, at the slot's
         /// position (not yet forwarded). Fills draftsOut[i] (b - 1 tokens) and confOut[i] (the
-        /// selector's probability of each choice).
+        /// selector's probability of each choice). Optional logitsOut receives every proposal
+        /// row's full-vocabulary logits ([lanes * (b - 1)][vocab]) for numerical validation.
         /// </summary>
-        public void Draft(Slot[] slots, int[] anchors, int[][] draftsOut, float[][] confOut)
+        public void Draft(Slot[] slots, int[] anchors, int[][] draftsOut, float[][] confOut, float[] logitsOut = null)
         {
+            if (HasNinferDrafter)
+            {
+                ProposeNinfer(slots, anchors, draftsOut, confOut, logitsOut);
+                return;
+            }
             if (_d == null)
                 throw new InvalidOperationException("[q35-cuda] no drafter attached");
             MakeCurrent();
             BindSlots(slots);
-            int lanes = slots.Length, b = _d.BlockSize, rows = lanes * b, e = _m.NEmbd, g = Gamma;
-            int qd = _d.NHead * _d.HeadDim;
+            int lanes = slots.Length, b = _d.BlockSize, rows = lanes * b, g = Gamma;
+            if (logitsOut != null && logitsOut.Length < (long)lanes * g * _m.NVocab)
+                throw new ArgumentException("[q35-cuda] draft logits output is too short", nameof(logitsOut));
             var meta = new int[2 * rows + lanes];
             for (int q = 0; q < lanes; q++)
             {
@@ -411,8 +424,33 @@ namespace TensorSharp.Cuda
             }
             fixed (int* p = meta)
                 Upload(_dMeta, p, meta.Length);
-            IntPtr tokDev = _dMeta, posDev = _dMeta + (nint)(4L * rows), anchorDev = _dMeta + (nint)(8L * rows);
+            RunDraftPass(lanes);
+            Sync();
+            var drafts = new int[lanes * g];
+            var conf = new float[lanes * g];
+            fixed (int* p = drafts)
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)p, _dDrafts, new UIntPtr((ulong)drafts.Length * 4)).ThrowOnError();
+            fixed (float* p = conf)
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)p, _dConf, new UIntPtr((ulong)conf.Length * 4)).ThrowOnError();
+            if (logitsOut != null)
+                fixed (float* p = logitsOut)
+                    CudaDriverApi.cuMemcpyDtoH((IntPtr)p, _dLogits, new UIntPtr((ulong)lanes * (ulong)g * (ulong)_m.NVocab * 4)).ThrowOnError();
+            for (int q = 0; q < lanes; q++)
+            {
+                Array.Copy(drafts, q * g, draftsOut[q], 0, g);
+                Array.Copy(conf, q * g, confOut[q], 0, g);
+            }
+        }
 
+        // Every address below belongs to the engine for its lifetime. Slot addresses are read
+        // indirectly from _tabRing*; BindSlots refreshes those tables before each draft. Anchors
+        // and positions are read from _dMeta, uploaded on the same stream before this pass.
+        // Keep host transfers, allocations, synchronization and slot mutation outside this method.
+        private void DraftPass(int lanes)
+        {
+            int b = _d.BlockSize, rows = lanes * b, e = _m.NEmbd, g = Gamma;
+            int qd = _d.NHead * _d.HeadDim;
+            IntPtr tokDev = _dMeta, posDev = _dMeta + (nint)(4L * rows), anchorDev = _dMeta + (nint)(8L * rows);
             _k.EmbedQ4_0(_tokEmbd, _tokEmbdRowBytes, tokDev, _dX, rows, e, Stream);
             IntPtr pending = IntPtr.Zero;
             int coefW = _dl[0].AttnConv.Rows;
@@ -451,24 +489,15 @@ namespace TensorSharp.Cuda
             _k.AddRmsNorm(_dX, pending, _dOutNorm, _dH, rows, e, _d.Eps, Stream);
             // The proposal rows (each block's rows 1 .. b-1) through the target's LM head and the selector.
             _k.DfGather(_dH, e, b, 1, g, lanes, _dH2, Stream);
+            // Both head policies leave these Q81 inputs live for the selector's
+            // immediately following DMatMul(_dSelHidden), which consumes _dQ8/_dQ8d.
             DQuant(_dH2, e, lanes * g);
-            _k.GemmQuant(TQ6_K, _output, _outputRowBytes, _m.NVocab, e, _dQ8, _dQ8d, lanes * g, _dLogits, false, Stream);
-            _k.TopK(_dLogits, lanes * g, _m.NVocab, _d.SelTopK, _dCand, _dUnary, Stream);
+            _k.GemvQ6kTiled(_output, _m.NVocab, e, _dQ8, _dQ8d, _dLogits, lanes * g, Stream);
+            _k.TopK(_dLogits, lanes * g, _m.NVocab, _d.SelTopK, _dCand, _dUnary, Stream, _dTopPartialIdx, _dTopPartialVal);
             DMatMul(_dSelHidden, _dSel, lanes * g);
             _k.DfSelect(_dCand, _dUnary, _dSel, _dSelPred.W, _dSelSucc.W, _dSelPred.RowBytes, anchorDev, lanes, g, _d.SelTopK,
                 _d.SelRank, _d.LogitScale, _dDrafts, _dConf, Stream);
-            Sync();
-            var drafts = new int[lanes * g];
-            var conf = new float[lanes * g];
-            fixed (int* p = drafts)
-                CudaDriverApi.cuMemcpyDtoH((IntPtr)p, _dDrafts, new UIntPtr((ulong)drafts.Length * 4)).ThrowOnError();
-            fixed (float* p = conf)
-                CudaDriverApi.cuMemcpyDtoH((IntPtr)p, _dConf, new UIntPtr((ulong)conf.Length * 4)).ThrowOnError();
-            for (int q = 0; q < lanes; q++)
-            {
-                Array.Copy(drafts, q * g, draftsOut[q], 0, g);
-                Array.Copy(conf, q * g, confOut[q], 0, g);
-            }
         }
+
     }
 }

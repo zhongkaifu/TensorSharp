@@ -1,0 +1,22 @@
+{
+  "old_source_sha256": "7889e8d9113b00e096cef0d5ca071efa63fea93a2f7841b808adb8bdaf8b5ec1",
+  "old_source": "Qwen35Dp4aLaunchGeometryBench/bench.cu",
+  "deltas": [
+    {
+      "before": "// Standalone N8 DP4a R1/R2/R4 block64/256 launch-only runner.",
+      "after": "// Standalone N8/R4/block128 shared Q81 activation-tile runner."
+    },
+    {
+      "before": "shared!=0||threads<v.threads",
+      "after": "shared!=(std::strcmp(v.symbol,oracle.symbol)==0?0:22528)||threads<v.threads"
+    },
+    {
+      "before": "int acts=8,rounds=5,iterations=3;",
+      "after": "int acts=8,rounds=10,iterations=3;"
+    },
+    {
+      "before": "Quote(\"rows_and_launch_only\")",
+      "after": "Quote(\"shared_q81_activation_tile_only\")"
+    }
+  ]
+}

@@ -1,0 +1,193 @@
+import contextlib
+import importlib.util
+import io
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+
+TOOL = Path(__file__).resolve().parents[1] / "qwen38-availability-attempts.py"
+SPEC = importlib.util.spec_from_file_location("availability_attempts", TOOL)
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+
+
+class AvailabilityEvidenceTests(unittest.TestCase):
+    def run_audit(self, rows, observed=8, expected=8, exit_code=0, log=None):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "external-engine-status").mkdir()
+            (root / "raw").mkdir()
+            stem = "vllm-plain-fixture"
+            (root / "external-engine-status" / (stem + ".json")).write_text(json.dumps({
+                "observed_cases": observed, "expected_cases": expected,
+                "process_exit_code": exit_code, "quality_passed": True}))
+            if rows is not None:
+                (root / "raw" / (stem + ".jsonl")).write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            if log is not None:
+                (root / "external-engine-logs").mkdir()
+                (root / "external-engine-logs" / (stem + ".log")).write_text(log)
+            output = root / "availability.json"
+            with patch("sys.argv", [str(TOOL), "--root", str(root), "--output", str(output), "--engines", "vllm"]), contextlib.redirect_stdout(io.StringIO()):
+                MODULE.main()
+            return json.loads(output.read_text())
+
+    @staticmethod
+    def header(label="fixture"):
+        return {"kind": "run", "engine": "vllm", "mode": "plain", "label": label,
+                "scenarios": ["fixture_case"], "repeats": 8}
+
+    @staticmethod
+    def cases(n=8, passed=True):
+        return [{"kind": "case", "scenario": "fixture_case", "repeat": i,
+                 "pass": passed, "verdict": "PASS" if passed else "FAIL",
+                 "checks": [{"ok": passed}], "requests": [{"finish_reason": "stop"}]}
+                for i in range(n)]
+
+    def test_two_incomplete_appended_runs_cannot_combine_into_complete_run(self):
+        cases = self.cases(4)
+        audit = self.run_audit([self.header(), *cases, self.header(), *cases])
+        attempt = next(row for row in audit["missingEngines"] if row.get("label") == "fixture")
+        self.assertEqual(attempt["status"], "INCOMPLETE")
+        self.assertEqual(attempt["verified_local_raw_cases"], 4)
+        self.assertFalse(attempt["quality_passed"])
+        self.assertEqual(audit["executedProfiles"], [])
+
+    def test_last_header_identity_must_match_controller(self):
+        audit = self.run_audit([self.header("another-label"), *self.cases()])
+        attempt = next(row for row in audit["missingEngines"] if row.get("label") == "fixture")
+        self.assertEqual(attempt["status"], "INCOMPLETE")
+        self.assertFalse(attempt["last_raw_header_identity_matches"])
+        self.assertEqual(audit["executedProfiles"], [])
+
+    def test_controller_claim_without_raw_is_not_evidence_of_pass(self):
+        audit = self.run_audit(None)
+        attempt = next(row for row in audit["missingEngines"] if row.get("label") == "fixture")
+        self.assertEqual(attempt["status"], "INCOMPLETE")
+        self.assertFalse(attempt["quality_passed"])
+        self.assertFalse(attempt["artifacts"]["raw"]["exists_locally"])
+        self.assertIsNone(attempt["artifacts"]["raw"]["sha256"])
+
+    def test_warmup_header_with_success_exit_is_not_run(self):
+        audit = self.run_audit([self.header()], observed=0, expected=0)
+        attempt = next(row for row in audit["missingEngines"] if row.get("label") == "fixture")
+        self.assertEqual(attempt["status"], "NOT_RUN")
+        self.assertFalse(attempt["quality_passed"])
+
+    def test_complete_formal_case_count_still_does_not_assert_quality_pass(self):
+        audit = self.run_audit([self.header(), *self.cases(passed=False)])
+        # The controller claim stays available without overriding raw failures.
+        self.assertEqual(audit["executedProfiles"][0]["status"], "EXECUTED")
+        self.assertTrue(audit["executedProfiles"][0]["controller_quality_passed"])
+        self.assertFalse(audit["executedProfiles"][0]["quality_passed"])
+        self.assertIn("不是quality PASS", audit["executedProfiles"][0]["reason"])
+
+    def test_successful_complete_matrix_uses_original_quality_rule(self):
+        audit = self.run_audit([self.header(), *self.cases()])
+        self.assertTrue(audit["executedProfiles"][0]["quality_passed"])
+
+    def test_failed_process_exit_cannot_claim_quality_pass(self):
+        audit = self.run_audit([self.header(), *self.cases()], exit_code=1)
+        attempt = next(row for row in audit["missingEngines"] if row.get("label") == "fixture")
+        self.assertEqual(attempt["status"], "ERROR")
+        self.assertFalse(attempt["quality_passed"])
+
+    def test_duplicate_repeat_cannot_replace_expected_repeats(self):
+        audit = self.run_audit([self.header(), *[self.cases(1)[0]] * 8])
+        attempt = next(row for row in audit["missingEngines"] if row.get("label") == "fixture")
+        self.assertEqual(attempt["status"], "INCOMPLETE")
+        self.assertFalse(attempt["quality_passed"])
+
+    def test_original_failed_check_overrides_case_and_controller_claim(self):
+        cases = self.cases()
+        cases[0]["checks"][0]["ok"] = False
+        audit = self.run_audit([self.header(), *cases])
+        self.assertFalse(audit["executedProfiles"][0]["quality_passed"])
+
+    def test_header_repeat_count_must_be_integer_not_bool(self):
+        header = {**self.header(), "repeats": True}
+        audit = self.run_audit([header, *self.cases()])
+        attempt = next(row for row in audit["missingEngines"] if row.get("label") == "fixture")
+        self.assertEqual(attempt["status"], "INCOMPLETE")
+        self.assertFalse(attempt["quality_passed"])
+
+    def test_effective_configuration_preserves_prefix_disable_and_last_cpu_budget(self):
+        flags = MODULE.effective_flags(["vllm", "serve", "model", "--enable-prefix-caching",
+                                        "--cpu-offload-gb", "0", "--no-enable-prefix-caching",
+                                        "--cpu-offload-gb=1"])
+        self.assertIs(flags["--enable-prefix-caching"], False)
+        self.assertEqual(flags["--cpu-offload-gb"], "1")
+
+    def test_native_explicit_device_budget_refusal_is_configuration_unsupported(self):
+        line = "2026-11-02 01:27:56.342 FATAL server failed during startup | Device budget cannot hold model weights and required execution resources"
+        status, reason, excerpt = MODULE.classify(line)
+        self.assertEqual(status, "UNSUPPORTED")
+        self.assertIn("该配置", reason)
+        self.assertEqual(excerpt, line)
+        # An arbitrary planning failure does not establish a capacity limitation.
+        self.assertEqual(MODULE.classify("ERROR planning runtime failed")[0], "ERROR")
+
+    def test_native_kv_reservation_and_headroom_refusal_preserves_actual_bytes(self):
+        line = "FATAL automatic KV capacity requires 11502815489 bytes total (10429073665 bytes minimum Engine runtime reservation + 1073741824 bytes automatic headroom), but only 10082844672 bytes are available after weights"
+        status, _, excerpt = MODULE.classify(line)
+        self.assertEqual(status, "UNSUPPORTED")
+        self.assertEqual(excerpt, line)
+        self.assertEqual(MODULE.classify("automatic KV capacity requires an unsupported allocator")[0], "ERROR")
+
+    def test_ignis_actual_vram_plan_refusal_is_scoped_capacity_unsupported(self):
+        line = json.dumps({"event_name": "ignis.model.load_failed", "attributes": {
+            "error": "the VRAM plan needs 35951962248 bytes for the weights, workspaces, lanes, retained state and one --model-max-context sequence of KV, 3895879816 bytes more than the 32056082432-byte VRAM budget"}})
+        status, reason, excerpt = MODULE.classify(line)
+        self.assertEqual(status, "UNSUPPORTED")
+        self.assertIn("该配置", reason)
+        self.assertEqual(excerpt, line)
+
+    def test_missing_official_sidecar_is_setup_error_not_model_unsupported(self):
+        line = json.dumps({"event_name": "ignis.artifact.sidecar_missing", "attributes": {"error": "no sidecar next to model.ninfer"}})
+        status, reason, excerpt = MODULE.classify(line)
+        self.assertEqual(status, "ERROR")
+        self.assertIn("sidecar", reason)
+        self.assertEqual(excerpt, line)
+
+    def test_sglang_explicit_kv_budget_refusal_is_configuration_unsupported(self):
+        line = "ValueError: Loaded weights leave no GPU memory for the KV cache under --mem-fraction-static=0.9. Raise --mem-fraction-static above 0.741 (minimum viable = 1 - available/pre = 0.7400). If using speculative decoding, draft weights are now counted."
+        status, reason, excerpt = MODULE.classify(line)
+        self.assertEqual(status, "UNSUPPORTED")
+        self.assertIn("该配置", reason)
+        self.assertEqual(excerpt, line)
+        # Generic capture failures are not evidence of a whole-model limitation.
+        self.assertEqual(MODULE.classify("RuntimeError: markCaptureEnd called with no captures in progress")[0], "ERROR")
+
+    def test_sglang_no_accelerator_is_environment_error_not_capacity(self):
+        line = "RuntimeError: No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
+        status, reason, excerpt = MODULE.classify(line)
+        self.assertEqual(status, "ERROR")
+        self.assertIn("运行环境", reason)
+        self.assertEqual(excerpt, line)
+
+    def test_torch_startup_cuda_oom_is_scoped_capacity_not_cpu_or_kernel_error(self):
+        line = "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 512.00 MiB. GPU 0 has 13.69 MiB free."
+        audit = self.run_audit(None, observed=0, expected=8, exit_code=1, log=line)
+        attempt = next(row for row in audit["missingEngines"] if row.get("label") == "fixture")
+        self.assertEqual(attempt["status"], "UNSUPPORTED")
+        self.assertFalse(attempt["quality_passed"])
+        self.assertIn("该配置", attempt["reason"])
+        self.assertIn("不能据此推断引擎整体", attempt["reason"])
+        self.assertEqual(attempt["primary_log_evidence"], line)
+        for error in ("RuntimeError: DefaultCPUAllocator: not enough memory",
+                      "RuntimeError: CUDA error: an illegal memory access was encountered"):
+            with self.subTest(error=error):
+                self.assertEqual(MODULE.classify(error)[0], "ERROR")
+
+    def test_request_oom_in_complete_failed_raw_is_executed_without_quality_pass(self):
+        line = "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 512.00 MiB."
+        audit = self.run_audit([self.header(), *self.cases(passed=False)], log=line)
+        self.assertEqual(audit["executedProfiles"][0]["status"], "EXECUTED")
+        self.assertFalse(audit["executedProfiles"][0]["quality_passed"])
+        self.assertFalse(any(row.get("label") == "fixture" for row in audit["missingEngines"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -99,8 +99,10 @@ TensorAgent 在每次加载模型之前写入自己的取值（`EngineMemoryPoli
 |---|---|---|---|---|---|
 | `TS_MLX_BATCHED_MOE_DECODE` | MLX 上的 Qwen 3.5 / 3.6 MoE | 在堆叠的专家权重上每种 gate/up/down 一次批处理 dispatch，而不是按 expert dispatch；`0` 走按专家顺序执行并省去堆叠副本（内存紧张的机器） | 启用 | `0`, `1` | 是 |
 | `TS_MLX_HALF_MATMUL_MIN_ROWS` | MLX affine 量化 matmul | scales 为 F16 的 matmul 从多少行起使用 F16 激活；`0` 使所有 matmul 保持 F32 | `1`（全部） | `0`, `1`, `32` | 否 |
-| `TS_MLX_Q6K_MATVEC_MAX_ROWS` | MLX 上的精确 Q6_K matmul | 行数不超过该值时，Q6_K 以矩阵-向量乘运行（移植自 ggml-metal 的 `kernel_mul_mv_q6_K_f32`）；更多行时把 Q6_K 反量化为 F16（每片不超过 256 MB）并用 MLX 的 GEMM 相乘 | `4` | 整数 >= 0 | 否 |
-| `TS_MLX_IQ4XS_MATVEC_MAX_ROWS` | MLX 上的 IQ4_XS matmul | 行数不超过该值时，IQ4_XS 以矩阵-向量乘运行（移植自 ggml-metal 的 `kernel_mul_mv_iq4_xs_f32`）；更多行时把 IQ4_XS 反量化为 F16（每片不超过 256 MB）并用 MLX 的 GEMM 相乘 | `4` | 整数 >= 0 | 否 |
+| `TS_MLX_Q6K_MATVEC_MAX_ROWS` | MLX 上的精确 Q6_K matmul | 行数不超过该值时，Q6_K 以矩阵-向量乘运行（移植自 ggml-metal 的 `kernel_mul_mv_q6_K_f32`）；更多行且不超过 `TS_MLX_IQ_FEWROW_MAX_ROWS` 时走少行核函数，再多则把 Q6_K 反量化为 F16（每片不超过 256 MB）并用 MLX 的 GEMM 相乘 | `4` | 整数 >= 0 | 否 |
+| `TS_MLX_IQ4XS_MATVEC_MAX_ROWS` | MLX 上的 IQ4_XS matmul | 行数不超过该值时，IQ4_XS 以矩阵-向量乘运行（移植自 ggml-metal 的 `kernel_mul_mv_iq4_xs_f32`）；更多行且不超过 `TS_MLX_IQ_FEWROW_MAX_ROWS` 时走少行核函数，再多则把 IQ4_XS 反量化为 F16（每片不超过 256 MB）并用 MLX 的 GEMM 相乘 | `4` | 整数 >= 0 | 否 |
+| `TS_MLX_IQ_FEWROW_MAX_ROWS` | MLX 上原始 i-quant / K-quant 的 matmul（IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ1_S、IQ1_M、IQ4_XS、Q2_K、Q3_K、Q6_K） | 少行核函数接受的最大行数（从 2 行起）：每组 8 个权重只解码一次进 simdgroup 矩阵块（8 行以下 F32，8 行起 F16），与最多 8 行输入相乘，用于推测解码的验证窗口；`0` 让这些行数回到原核函数 | `31` | 整数 >= 0 | 否 |
+| `TS_MLX_IQ_DEQUANT_GEMM_MIN_ROWS` | 同上原始类型（Q6_K 与 IQ4_XS 用各自的开关） | 从该行数起把权重反量化为 F16（分片）并用 MLX 的 GEMM 相乘，而非 simdgroup 核函数：Qwen3.8-27B-UD-IQ3_XXS 2.3K token 预填充 74 s -> 6 s；`0` 保留 simdgroup 核函数 | `32` | 整数 >= 0 | 否 |
 
 ## 矩阵外的纯 C# CPU 后端变量
 

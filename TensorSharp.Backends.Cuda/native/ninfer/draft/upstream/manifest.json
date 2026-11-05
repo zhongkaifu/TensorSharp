@@ -1,0 +1,79 @@
+{
+  "repository": "gpillon/ignis",
+  "revision": "e600a7d9e0d5921d767a6cb464373583b3cdcaf4",
+  "reference_ninfer_revision": "a00648cb828457986cf5b4b4f712b4cbcd7af0d1",
+  "sources": [
+    {
+      "path": "kernel/vendor/src/core/pdl.cuh",
+      "blob": "f442d054f51900047485f858f53cea265c5b8f48",
+      "sha256": "787b6d0fdfc5b25fe29dcb32548de56637e4d5b9b3561b9caaa2544cba4eb57f",
+      "bytes": 2387
+    },
+    {
+      "path": "kernel/vendor/src/ops/common/memory.cuh",
+      "blob": "11f6253b060b515e48b504b964f32f065a9ab641",
+      "sha256": "68d4ce555d86761aa4c21d49726be2e48d82fcbdc4f6dbe4fc8b7356f945e205",
+      "bytes": 3424
+    },
+    {
+      "path": "kernel/vendor/src/ops/common/warp.cuh",
+      "blob": "00597abc97cebf7a29a91652426901dc45de367e",
+      "sha256": "7555cb64c0bfd8738209fc25ebe5972f4cb032fee03ea4fc769770da4ec2d839",
+      "bytes": 1890
+    },
+    {
+      "path": "kernel/vendor/src/ops/common/math.cuh",
+      "blob": "403922f00ccac9d0a0cca9df4fd1b5c57f56b22d",
+      "sha256": "5aedc4dccaa3cf3cf75a6b03cbe24c8ef830ef183488f002864103f0c35b760e",
+      "bytes": 1297
+    },
+    {
+      "path": "kernel/vendor/src/ops/common/math.h",
+      "blob": "dbbb88f558cfc52f02933a1ad4f355f0b75de1d8",
+      "sha256": "2f61fe7900d5584e700c824add008fe5c1d21e7d32a31e93ac9089b9f861f330",
+      "bytes": 1244
+    },
+    {
+      "path": "kernel/vendor/src/ops/common/mma.cuh",
+      "blob": "be39ac1478840e01e614271bca16832a921d352c",
+      "sha256": "4af04a39c2d1607819d1270ca9b890623e33a372179b00b80a9c8fb1a7f4484c",
+      "bytes": 5603
+    },
+    {
+      "path": "kernel/vendor/src/ops/linear/nvfp4/nvfp4_codec.cuh",
+      "blob": "8b5107af2047150660edda5c4e156cd8ebacc78b",
+      "sha256": "b1eb2a90ee717c85b1c6415015fffb588dbb7ed52ae675207bfcb0a3a22b8c63",
+      "bytes": 4771
+    },
+    {
+      "path": "kernel/vendor/src/ops/linear/nvfp4/nvfp4_config.h",
+      "blob": "8fb92ad1b889a03c885fea73b4df61d9e95b5d34",
+      "sha256": "78cbbffc7885290547acee338a55e40fe03fc11b715ba9e6c450fe4f2a788aee",
+      "bytes": 13563
+    },
+    {
+      "path": "kernel/vendor/src/ops/linear/nvfp4/nvfp4_output.cuh",
+      "blob": "4c95c9e8c94e51baa4f2023db9657f228a63c811",
+      "sha256": "5faad7191f065f18ed11039126c5c42ec491d8bf299e5f7e79926bfbbe65d74c",
+      "bytes": 953
+    },
+    {
+      "path": "kernel/vendor/src/ops/linear/nvfp4/nvfp4_gemv.cuh",
+      "blob": "1854e43bec31f3700fbd5ff230ee2b780e7d5bc9",
+      "sha256": "2829185e7658c77b1ae8728313aef8002287320a494ef802e66fd2f7f86cd8e5",
+      "bytes": 12140
+    },
+    {
+      "path": "kernel/vendor/src/ops/linear/nvfp4/nvfp4_small_t.cuh",
+      "blob": "9ece481163830b7981e78dca2b8db7a5e5e2e3a2",
+      "sha256": "ff606738b9f0de12ad0757649d7238d49acaf5aa5b002e4bea40bd0e10cfa6ae",
+      "bytes": 19342
+    },
+    {
+      "path": "kernel/vendor/src/ops/kernel/bidirectional_gqa_attention.cuh",
+      "blob": "d0a5eb2794ccfc97e683bba6c2add6548e44b688",
+      "sha256": "9b6fa9af13a525dff26b30ea2ac320f873da2594ff77c3c6eaf14374121fe099",
+      "bytes": 34339
+    }
+  ]
+}

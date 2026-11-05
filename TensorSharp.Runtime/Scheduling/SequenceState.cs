@@ -107,6 +107,14 @@ namespace TensorSharp.Runtime.Scheduling
         /// state at exactly this position and starts later requests with the same
         /// prefix from a clone of it. See <c>IBatchedPagedModel.SupportsPrefixCheckpoints</c>.
         /// </summary>
+        /// <summary>The reply will be rendered back verbatim in the next turn (no reasoning is
+        /// stripped), so the end state this request retains, not a checkpoint before the prompt's
+        /// last token, is what the next turn resumes from. The prefix cache then skips that
+        /// prompt-tail checkpoint when it would protect fewer than
+        /// <see cref="SchedulerConfig.PromptTailCheckpointMinTokens"/> tokens: it costs an extra
+        /// single-row forward on every request. False (the default) always takes it.</summary>
+        public bool PromptTailCheckpointOptional { get; init; }
+
         public int SharedPrefixTokens { get; }
 
         /// <summary>Exact state checkpoints within the declared public prefix, in
@@ -262,6 +270,15 @@ namespace TensorSharp.Runtime.Scheduling
         /// re-sampling from the logits it summarizes.</summary>
         internal int? PendingDeviceToken;
         internal int PendingDevicePosition;
+
+        /// <summary>The first output token, drawn and streamed as soon as the prompt's last
+        /// chunk produced its logits, before the step that forwards it (with speculation
+        /// that step is a whole draft-and-verify). Fixed once streamed: every later draw of
+        /// the first output token returns it, across preemption and recompute. -1: none.</summary>
+        internal int EarlyFirstToken = -1;
+
+        /// <summary><see cref="EarlyFirstToken"/> was already published to the consumer.</summary>
+        internal bool EarlyFirstTokenPublished;
 
         /// <summary>Reason the sequence finished, set when <see cref="Status"/>
         /// becomes one of the Finished* values.</summary>

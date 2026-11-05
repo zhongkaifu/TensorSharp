@@ -1,0 +1,21 @@
+{
+  "schema": "qwen38-cua-causality-jobs/1",
+  "profiles": [
+    {
+      "name": "TargetA1",
+      "cpu_simd": "0",
+      "splitk_policy": "target-zero"
+    },
+    {
+      "name": "TargetA2",
+      "cpu_simd": "0",
+      "splitk_policy": "target-zero"
+    }
+  ],
+  "comparisons": [
+    {
+      "left": "TargetA1",
+      "right": "TargetA2"
+    }
+  ]
+}

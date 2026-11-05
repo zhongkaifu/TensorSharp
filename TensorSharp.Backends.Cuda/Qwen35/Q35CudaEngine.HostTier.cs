@@ -37,6 +37,11 @@ namespace TensorSharp.Cuda
             public int RopeDelta { get; internal set; }
             internal HostBlock[] Blocks;
             internal IntPtr[] StateUnits;
+            internal object Owner;
+            internal string StateNamespace, StateProfile;
+            internal int StatePartCount;
+            internal NinferDraftSlotSnapshot NinferDraft;
+            internal long DraftMetadataBytes;
         }
 
         internal sealed class HostBlock
@@ -51,6 +56,7 @@ namespace TensorSharp.Cuda
         private readonly Dictionary<long, IntPtr> _deviceByKey = new Dictionary<long, IntPtr>();
         private long _nextBlockKey = 1;
         private readonly Dictionary<long, HostBlock> _hostBlocks = new Dictionary<long, HostBlock>();
+        private readonly object _hostSlotOwner = new object();
 
         // Pinned units (one block's bytes), and the pinner that tops them up. Guarded by _hostLock.
         private readonly object _hostLock = new object();
@@ -65,9 +71,14 @@ namespace TensorSharp.Cuda
         // Where each recurrent-state part of a slot lands (unit, offset), and the units one slot's state takes.
         private (int Unit, long Offset)[] _stateLayout;
         private int _stateUnits;
+        private string _stateLayoutProfile;
 
-        /// <summary>Pinned bytes the host slots hold (units kept for reuse excluded).</summary>
+        /// <summary>Host bytes held by slots: pinned units plus owned original-draft
+        /// snapshot metadata (units kept for reuse excluded).</summary>
         public long HostBytesInUse { get; private set; }
+        /// <summary>Owned native draft metadata charged within HostBytesInUse:
+        /// 64 bytes per capsule plus its optional 51,200-byte raw BF16 anchor.</summary>
+        public long HostDraftMetadataBytesInUse { get; private set; }
         /// <summary>Milliseconds the engine thread spent pinning and copying to host (diagnostics).</summary>
         public double HostPinMs { get; private set; }
         public double HostCopyMs { get; private set; }
@@ -170,26 +181,50 @@ namespace TensorSharp.Cuda
         /// <summary>Recurrent states and drafter ring of a slot, in the order a host slot stores them.</summary>
         private IEnumerable<(IntPtr Device, long Bytes)> StateParts(Slot s)
         {
+            if (s == null || s.Arena == IntPtr.Zero || s.Conv == null || s.State == null
+                || s.Conv.Length != _nGdn || s.State.Length != _nGdn)
+                throw new InvalidOperationException("Incomplete native slot recurrent-state layout.");
             for (int i = 0; i < _nGdn; i++)
             {
+                if (s.Conv[i] == IntPtr.Zero || s.State[i] == IntPtr.Zero)
+                    throw new InvalidOperationException("Missing native recurrent-state allocation.");
                 yield return (s.Conv[i], ConvBytes);
                 yield return (s.State[i], StateBytes);
             }
-            if (_d != null && s.RingPos != IntPtr.Zero)
+            if (HasDrafter || HasNinferDrafter)
             {
-                long ring = (long)_d.NKvHead * _ringRows * _d.HeadDim * 2;
-                for (int l = 0; l < _dl.Length; l++)
+                if (RingLayers < 1 || s.RingK == null || s.RingV == null || s.RingK.Length != RingLayers
+                    || s.RingV.Length != RingLayers || s.RingBase == IntPtr.Zero || s.RingPos == IntPtr.Zero)
+                    throw new InvalidOperationException("The slot lacks its complete attached-drafter ring layout.");
+                for (int l = 0; l < RingLayers; l++)
                 {
-                    yield return (s.RingK[l], ring);
-                    yield return (s.RingV[l], ring);
+                    if (s.RingK[l] == IntPtr.Zero || s.RingV[l] == IntPtr.Zero)
+                        throw new InvalidOperationException("Missing attached-drafter K/V allocation.");
+                    yield return (s.RingK[l], RingLayerBytes);
+                    yield return (s.RingV[l], RingLayerBytes);
                 }
-                yield return (s.RingPos, 4L * _ringRows);
+                // Native DFlash uses the typed frontier, not these compatibility
+                // tags, but the common arena owns them and copies them as bytes.
+                yield return (s.RingPos, 4L * RingRows);
             }
+        }
+
+        private string HostStateNamespace => KVStateNamespaceSuffix + "|host-native-draft=" + NinferDraftNamespaceSuffix;
+        private string HostStateProfile => $"host-slot-v2:{_nGdn}:{ConvBytes}:{StateBytes}:{KvBlockBytes}:{HasDrafter || HasNinferDrafter}:{RingLayers}:{RingRows}:{RingLayerBytes}";
+        private static long HostDraftMetadataCharge(NinferDraftSlotSnapshot snapshot) => snapshot == null ? 0 : checked(64L + snapshot.Pending.Length);
+
+        /// <summary>Attachment must not change the layout of existing host slots.</summary>
+        private void InvalidateHostStateLayout()
+        {
+            if (HostBytesInUse != 0) throw new InvalidOperationException("Cannot change native state layout while host snapshots are retained.");
+            _stateLayout = null; _stateUnits = 0; _stateLayoutProfile = null;
         }
 
         /// <summary>Packs the state parts into units in order; returns the units a slot's state takes.</summary>
         private int StateLayout()
         {
+            string profile = HostStateProfile;
+            if (_stateLayout != null && _stateLayoutProfile != profile) InvalidateHostStateLayout();
             if (_stateLayout != null)
                 return _stateUnits;
             var layout = new List<(int, long)>();
@@ -209,7 +244,34 @@ namespace TensorSharp.Cuda
             }
             _stateLayout = layout.ToArray();
             _stateUnits = unit + 1;
+            _stateLayoutProfile = profile;
             return _stateUnits;
+        }
+
+        /// <summary>Pure preflight, deliberately called before destination blocks,
+        /// metadata or device allocations are changed by a host restore.</summary>
+        internal static void ValidateHostSlotRestoreMetadata(HostSlot host, object owner, string stateNamespace, string profile,
+            int maximumContext, int units, int parts, bool nativeDraft, string draftNamespace)
+        {
+            ArgumentNullException.ThrowIfNull(host);
+            if (owner == null || maximumContext < 0 || units < 1 || parts < 0 || string.IsNullOrEmpty(profile)
+                || !ReferenceEquals(host.Owner, owner) || string.IsNullOrEmpty(stateNamespace)
+                || host.StateNamespace != stateNamespace || host.StateProfile != profile || host.NPast < 0 || host.NPast > maximumContext
+                || host.StateUnits == null || host.StateUnits.Length != units || host.StatePartCount != parts || host.Blocks == null
+                || host.Blocks.Length != (host.NPast + Q35Kernels.KvBlockTokens - 1L) / Q35Kernels.KvBlockTokens)
+                throw new InvalidOperationException("Host slot owner, numerical namespace, position or state geometry differs from this engine.");
+            foreach (IntPtr unit in host.StateUnits) if (unit == IntPtr.Zero) throw new InvalidOperationException("Incomplete host state units.");
+            foreach (HostBlock block in host.Blocks)
+                if (block == null || block.Data == IntPtr.Zero || block.Refs < 1)
+                    throw new InvalidOperationException("Incomplete owned host attention blocks.");
+            if (nativeDraft)
+            {
+                if (host.RopeDelta != 0) throw new InvalidOperationException("Original native draft host restore requires text positions.");
+                ValidateNinferDraftSnapshot(host.NinferDraft, host.NPast, draftNamespace);
+            }
+            else if (host.NinferDraft != null) throw new InvalidOperationException("Host snapshot carries an original drafter that this engine does not have.");
+            if (host.DraftMetadataBytes != HostDraftMetadataCharge(host.NinferDraft))
+                throw new InvalidOperationException("Host draft metadata byte ownership differs.");
         }
 
         /// <summary>A host copy of <paramref name="s"/> (the slot itself is unchanged; free it after).</summary>
@@ -276,48 +338,82 @@ namespace TensorSharp.Cuda
 
         private HostSlot IssueCopyToHost(Slot s, IntPtr stream)
         {
-            var h = new HostSlot { NPast = s.NPast, RopeDelta = s.RopeDelta };
+            // Capture immutable metadata before starting any copy. A native
+            // ring without its frontier/pending anchor is never a valid snapshot.
+            var snapshot = CaptureNinferDraftSlotState(s);
+            var parts = new List<(IntPtr Device, long Bytes)>(StateParts(s));
+            int units = StateLayout();
+            if (parts.Count != _stateLayout.Length || s.NPast < 0 || s.NPast > _m.NCtx)
+                throw new InvalidOperationException("Native host capture state profile differs from its current layout.");
+            var h = new HostSlot { NPast = s.NPast, RopeDelta = s.RopeDelta, Owner = _hostSlotOwner,
+                StateNamespace = HostStateNamespace, StateProfile = HostStateProfile, StatePartCount = parts.Count, NinferDraft = snapshot };
             int nb = (s.NPast + Q35Kernels.KvBlockTokens - 1) / Q35Kernels.KvBlockTokens;
+            if (s.Blocks.Count < nb) throw new InvalidOperationException("The source lacks its committed attention blocks.");
             h.Blocks = new HostBlock[nb];
-            for (int i = 0; i < nb; i++)
+            h.StateUnits = new IntPtr[units];
+            try
             {
-                IntPtr b = s.Blocks[i];
-                if (!_blockKey.TryGetValue(b, out long key))
+                for (int i = 0; i < nb; i++)
                 {
-                    key = _nextBlockKey++;
-                    SetBlockKey(b, key);
+                    IntPtr b = s.Blocks[i];
+                    if (!_blockKey.TryGetValue(b, out long key))
+                    {
+                        key = _nextBlockKey++;
+                        SetBlockKey(b, key);
+                    }
+                    bool copy = !_hostBlocks.TryGetValue(key, out HostBlock hb);
+                    if (copy)
+                    {
+                        hb = new HostBlock { Key = key, Data = TakeUnit() };
+                        _hostBlocks[key] = hb;
+                        HostBytesInUse += KvBlockBytes;
+                    }
+                    hb.Refs++; h.Blocks[i] = hb;
+                    if (copy) CudaDriverApi.cuMemcpyDtoHAsync(hb.Data, b, new UIntPtr((ulong)KvBlockBytes), stream).ThrowOnError();
                 }
-                if (!_hostBlocks.TryGetValue(key, out HostBlock hb))
+                for (int u = 0; u < h.StateUnits.Length; u++)
                 {
-                    hb = new HostBlock { Key = key, Data = TakeUnit() };
-                    CudaDriverApi.cuMemcpyDtoHAsync(hb.Data, b, new UIntPtr((ulong)KvBlockBytes), stream).ThrowOnError();
-                    _hostBlocks[key] = hb;
+                    h.StateUnits[u] = TakeUnit();
                     HostBytesInUse += KvBlockBytes;
                 }
-                hb.Refs++;
-                h.Blocks[i] = hb;
+                for (int p = 0; p < parts.Count; p++)
+                {
+                    var (dev, bytes) = parts[p]; var (unit, offset) = _stateLayout[p];
+                    CudaDriverApi.cuMemcpyDtoHAsync(h.StateUnits[unit] + (nint)offset, dev, new UIntPtr((ulong)bytes), stream).ThrowOnError();
+                }
+                h.DraftMetadataBytes = HostDraftMetadataCharge(snapshot);
+                HostDraftMetadataBytesInUse += h.DraftMetadataBytes; HostBytesInUse += h.DraftMetadataBytes;
+                return h;
             }
-            h.StateUnits = new IntPtr[StateLayout()];
-            for (int u = 0; u < h.StateUnits.Length; u++)
-                h.StateUnits[u] = TakeUnit();
-            int p = 0;
-            foreach (var (dev, bytes) in StateParts(s))
+            catch
             {
-                var (unit, offset) = _stateLayout[p++];
-                CudaDriverApi.cuMemcpyDtoHAsync(h.StateUnits[unit] + (nint)offset, dev, new UIntPtr((ulong)bytes), stream).ThrowOnError();
+                // Do not return a unit to the pool while an earlier enqueued
+                // transfer can still write it, even if a later transfer failed.
+                CudaDriverApi.cuStreamSynchronize(stream);
+                ReleaseHostSlotUnits(h); throw;
             }
-            HostBytesInUse += h.StateUnits.Length * KvBlockBytes;
-            return h;
         }
 
         /// <summary>Makes <paramref name="dst"/> the slot <paramref name="h"/> holds: blocks whose
         /// content is still on the device are shared, the others uploaded; states and ring uploaded.</summary>
         public void CopyFromHost(HostSlot h, Slot dst)
         {
+            ArgumentNullException.ThrowIfNull(dst);
+            int units = StateLayout();
+            ValidateHostSlotRestoreMetadata(h, _hostSlotOwner, HostStateNamespace, HostStateProfile, _m.NCtx,
+                units, _stateLayout.Length, HasNinferDrafter, _ninferDraftNamespace);
+            var parts = new List<(IntPtr Device, long Bytes)>(StateParts(dst));
+            if (parts.Count != _stateLayout.Length) throw new InvalidOperationException("Destination native state geometry differs.");
+            foreach (HostBlock block in h.Blocks)
+                if (!_hostBlocks.TryGetValue(block.Key, out HostBlock owned) || !ReferenceEquals(owned, block))
+                    throw new InvalidOperationException("A host block no longer belongs to the live host pool.");
+            // All owner/namespace/position/frontier/layout validation above is
+            // complete before destination blocks or any device bytes can change.
             MakeCurrent();
             // Host blocks another slot's copy is still filling must land before they are read.
             if (_copyStream != IntPtr.Zero)
                 CudaDriverApi.cuStreamSynchronize(_copyStream).ThrowOnError();
+            ForgetNinferVerification(dst);
             ReleaseBlocks(dst);
             foreach (HostBlock hb in h.Blocks)
             {
@@ -332,15 +428,15 @@ namespace TensorSharp.Cuda
                 dst.Blocks.Add(b);
             }
             dst.Version++;
-            int p = 0;
-            foreach (var (dev, bytes) in StateParts(dst))
+            for (int p = 0; p < parts.Count; p++)
             {
-                var (unit, offset) = _stateLayout[p++];
+                var (dev, bytes) = parts[p]; var (unit, offset) = _stateLayout[p];
                 CudaDriverApi.cuMemcpyHtoDAsync(dev, h.StateUnits[unit] + (nint)offset, new UIntPtr((ulong)bytes), Stream).ThrowOnError();
             }
             dst.NPast = h.NPast;
             dst.RopeDelta = h.RopeDelta;
             Sync();
+            RestoreNinferDraftSlotState(dst, h.NinferDraft);
         }
 
         /// <summary>Releases a host slot; returns the pinned bytes that freed.</summary>
@@ -348,9 +444,16 @@ namespace TensorSharp.Cuda
         {
             if (h == null || h.StateUnits == null)
                 return 0;
+            if (!ReferenceEquals(h.Owner, _hostSlotOwner)) throw new InvalidOperationException("Cannot release another engine's host slot.");
+            return ReleaseHostSlotUnits(h);
+        }
+
+        private long ReleaseHostSlotUnits(HostSlot h)
+        {
             long freed = 0;
             foreach (HostBlock hb in h.Blocks)
             {
+                if (hb == null) continue; // A failed capture may own a prefix only.
                 if (--hb.Refs > 0)
                     continue;
                 _hostBlocks.Remove(hb.Key);
@@ -358,8 +461,9 @@ namespace TensorSharp.Cuda
                 freed += KvBlockBytes;
             }
             foreach (IntPtr u in h.StateUnits)
-                ReturnUnit(u);
-            freed += h.StateUnits.Length * KvBlockBytes;
+                if (u != IntPtr.Zero) { ReturnUnit(u); freed += KvBlockBytes; }
+            freed += h.DraftMetadataBytes; HostDraftMetadataBytesInUse -= h.DraftMetadataBytes;
+            h.DraftMetadataBytes = 0; h.NinferDraft = null;
             h.StateUnits = null;
             h.Blocks = Array.Empty<HostBlock>();
             HostBytesInUse -= freed;
@@ -388,7 +492,7 @@ namespace TensorSharp.Cuda
         {
             if (h?.StateUnits == null)
                 return 0;
-            long bytes = h.StateUnits.Length * KvBlockBytes;
+            long bytes = h.StateUnits.Length * KvBlockBytes + h.DraftMetadataBytes;
             foreach (HostBlock hb in h.Blocks)
                 if (hb.Refs == 1)
                     bytes += KvBlockBytes;
@@ -399,7 +503,7 @@ namespace TensorSharp.Cuda
         /// by content are not counted).</summary>
         public long HostBytesToCopy(Slot s)
         {
-            long bytes = HostStateBytes;
+            long bytes = HostStateBytes + HostDraftMetadataCharge(CaptureNinferDraftSlotState(s));
             int nb = (s.NPast + Q35Kernels.KvBlockTokens - 1) / Q35Kernels.KvBlockTokens;
             for (int i = 0; i < nb; i++)
                 if (!_blockKey.TryGetValue(s.Blocks[i], out long key) || !_hostBlocks.ContainsKey(key))
@@ -435,6 +539,7 @@ namespace TensorSharp.Cuda
             }
             _hostBlocks.Clear();
             HostBytesInUse = 0;
+            HostDraftMetadataBytesInUse = 0;
         }
     }
 }

@@ -79,13 +79,15 @@ namespace TensorSharp.Runtime.Speculative
         /// output token and must be emitted as-is on the caller's next step -
         /// re-drawing from <see cref="NextLogits"/> later would bias the stream
         /// toward the drafts (the classic speculative-sampling pitfall).
-        /// -1 when the step degraded to a plain decode (no confident drafts):
-        /// the caller samples from <see cref="NextLogits"/> as usual.</summary>
+        /// -1 when the step degraded to a plain decode (the caller samples
+        /// NextLogits), or its row-selection callback stopped the accept loop.</summary>
         public int NextToken { get; init; }
 
         /// <summary>Caller-owned copy of the logits at the sequence's new last
-        /// position (verify row m, or the plain step's logits).</summary>
-        public float[] NextLogits { get; init; }
+        /// position (verify row m, or the plain step's logits). Null only after an
+        /// explicitly requested greedy verify: consume NextToken as drawn, or stop
+        /// when the caller's row-selection callback returned -1.</summary>
+        public float[]? NextLogits { get; init; }
 
         /// <summary>False when the step ran as a plain single-token decode.</summary>
         public bool UsedSpeculation { get; init; }

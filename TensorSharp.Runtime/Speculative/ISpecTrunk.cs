@@ -28,6 +28,10 @@ namespace TensorSharp.Runtime.Speculative
         /// by <c>tokens.Length</c>.</summary>
         void Forward(int[] tokens, float[]? hAllOut, float[] logitsOut, bool allLogitsRows);
 
+        /// <summary>Optional plain-greedy verify, with the same state effects as
+        /// <see cref="Forward"/>. False means nothing was forwarded or written.</summary>
+        bool TryForwardGreedyVerify(int[] tokens, float[]? hAllOut, int[] drawnOut) => false;
+
         /// <summary>
         /// One plain single-token step for a speculator that needs no hidden state:
         /// forward <paramref name="token"/> at the trunk's position, fill the
@@ -92,6 +96,9 @@ namespace TensorSharp.Runtime.Speculative
 
         public void Forward(int[] tokens, float[]? hAllOut, float[] logitsOut, bool allLogitsRows)
             => _model.SpecForward(tokens, hAllOut, logitsOut, allLogitsRows);
+
+        public bool TryForwardGreedyVerify(int[] tokens, float[]? hAllOut, int[] drawnOut)
+            => _model.TrySpecForwardGreedyVerify(tokens, hAllOut, drawnOut);
 
         private readonly int[] _plainToken = new int[1];
 

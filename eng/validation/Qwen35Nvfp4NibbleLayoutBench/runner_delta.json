@@ -1,0 +1,74 @@
+{
+  "old_source_sha256": "7889e8d9113b00e096cef0d5ca071efa63fea93a2f7841b808adb8bdaf8b5ec1",
+  "new_source_sha256": "3cf76c7ba8b5ed82834159e86f23092ad2796e78f190b2b4d91465bbbe18df56",
+  "deltas": [
+    {
+      "before": "// Standalone N8 DP4a R1/R2/R4 block64/256 launch-only runner.",
+      "after": "// Standalone exact N8/R4 word-nibble load-layout runner."
+    },
+    {
+      "before": "static const char* TimingPlane=\"NOT_TIMING\";",
+      "after": "static const char* TimingPlane=\"NOT_TIMING\";\nstatic const char* FixturePurpose=\"pilot\";\nstatic size_t PrepackCases=0;\n#include \"layout.h\""
+    },
+    {
+      "before": "    CUfunction quantizer=nullptr;",
+      "after": "    CUfunction quantizer=nullptr,packer=nullptr;"
+    },
+    {
+      "before": "        // Validate the existing production metadata query before any oracle",
+      "after": "        Cu(cuModuleGetFunction(&packer,module,\"ts_bench_nvfp4_nibble_pack\"));\n        {\n            int pr=0,pl=0,ps=0,pt=0,pa=0;\n            Cu(cuFuncGetAttribute(&pr,CU_FUNC_ATTRIBUTE_NUM_REGS,packer));\n            Cu(cuFuncGetAttribute(&pl,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,packer));\n            Cu(cuFuncGetAttribute(&ps,CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,packer));\n            Cu(cuFuncGetAttribute(&pt,CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,packer));\n            Cu(cuOccupancyMaxActiveBlocksPerMultiprocessor(&pa,packer,256,0));\n            std::printf(\"{\\\"event\\\":\\\"prepack_resources\\\",\\\"symbol\\\":\\\"ts_bench_nvfp4_nibble_pack\\\",\\\"registers\\\":%d,\\\"local_bytes\\\":%d,\\\"static_shared_bytes\\\":%d,\\\"max_block_threads\\\":%d,\\\"active_ctas\\\":%d,\\\"block_threads\\\":256}\\n\",pr,pl,ps,pt,pa);\n            if(pr<=0||pr>255||pl||ps||pt<256||pa<1)throw std::runtime_error(\"prepack launch/resource gate rejected\");\n        }\n        // Validate the existing production metadata query before any oracle"
+    },
+    {
+      "before": "    Shape shape;size_t count;Buffer codes,scales,xq,xd,out;",
+      "after": "    Shape shape;size_t count;Buffer codes,packedCodes,scales,xq,xd,out;\n    std::vector<uint8_t> originalCodes,originalScales,expectedPacked;\n    bool packedReady=false;"
+    },
+    {
+      "before": "    void Quantize() {",
+      "after": "    void Prepack(Module& module) {\n        if(packedReady)return;\n        owner=&module;\n        std::vector<uint8_t> previous,raw(codes.bytes),scale(scales.bytes);float ms[2]{};\n        for(int pass=0;pass<2;pass++) {\n            Rt(cudaMemset(packedCodes.Data(),pass?0x5a:0xa5,packedCodes.bytes));\n            void* src=codes.Data();void* dst=packedCodes.Data();long long words=static_cast<long long>(codes.bytes/4);\n            void* args[]={&src,&dst,&words};cudaEvent_t a,b;Rt(cudaEventCreate(&a));Rt(cudaEventCreate(&b));\n            Rt(cudaEventRecord(a));Cu(cuLaunchKernel(module.packer,unsigned((words+255)/256),1,1,256,1,1,0,nullptr,args,nullptr));Rt(cudaEventRecord(b));Rt(cudaEventSynchronize(b));Rt(cudaEventElapsedTime(&ms[pass],a,b));Rt(cudaEventDestroy(a));Rt(cudaEventDestroy(b));\n            if(!std::isfinite(ms[pass])||ms[pass]<=0)throw std::runtime_error(\"invalid load-once prepack event time\");\n            std::vector<uint8_t> actual(packedCodes.bytes);Rt(cudaMemcpy(actual.data(),packedCodes.Data(),packedCodes.bytes,cudaMemcpyDeviceToHost));\n            if(actual!=expectedPacked||UnpackNibbleReference(actual)!=originalCodes||(pass&&actual!=previous)) {\n                std::ofstream f(Output/\"failure-packed-codes.bin\",std::ios::binary);f.write(reinterpret_cast<const char*>(actual.data()),actual.size());\n                throw std::runtime_error(\"complete prepack bytes/inverse/dual-poison mismatch\");\n            }\n            previous=actual;codes.CheckGuard();packedCodes.CheckGuard();scales.CheckGuard();\n        }\n        Rt(cudaMemcpy(raw.data(),codes.Data(),codes.bytes,cudaMemcpyDeviceToHost));Rt(cudaMemcpy(scale.data(),scales.Data(),scales.bytes,cudaMemcpyDeviceToHost));\n        if(raw!=originalCodes||scale!=originalScales)throw std::runtime_error(\"load-once prepack mutated raw code/scales payload\");\n        packedReady=true;PrepackCases++;\n        std::printf(\"{\\\"event\\\":\\\"prepack_case_pass\\\",\\\"phase\\\":%s,\\\"plane_role\\\":%s,\\\"shape\\\":%s,\\\"codes_bytes\\\":%zu,\\\"extra_candidate_allocation_bytes\\\":%zu,\\\"steady_codes_bytes_delta\\\":0,\\\"all_code_bytes\\\":true,\\\"inverse_original_bytes\\\":true,\\\"dual_poison_AA\\\":true,\\\"raw_codes_unchanged\\\":true,\\\"scales_unchanged\\\":true,\\\"guards\\\":true,\\\"outside_inference_timing\\\":true,\\\"load_once_pass1_ms\\\":%.9g,\\\"load_once_pass2_ms\\\":%.9g}\\n\",Quote(FixturePurpose).c_str(),Quote(TimingPlane).c_str(),Quote(Name(shape)).c_str(),codes.bytes,codes.bytes,ms[0],ms[1]);\n    }\n    void Quantize() {"
+    },
+    {
+      "before": "codes(size_t(s.m)*(s.k/2)),",
+      "after": "codes(size_t(s.m)*(s.k/2)),packedCodes(size_t(s.m)*(s.k/2)),"
+    },
+    {
+      "before": "        codes.Upload(c.data());scales.Upload(d.data());xq.Upload(q.data());xd.Upload(x.data());",
+      "after": "        originalCodes=c;originalScales=d;expectedPacked=PackNibbleReference(c);\n        if(UnpackNibbleReference(expectedPacked)!=c)throw std::runtime_error(\"CPU layout reference inverse mismatch\");\n        codes.Upload(c.data());scales.Upload(d.data());xq.Upload(q.data());xd.Upload(x.data());"
+    },
+    {
+      "before": "        void* c=codes.Data();void* s=scales.Data();void* q=xq.Data();void* d=xd.Data();void* y=out.Data();",
+      "after": "        if(!packedReady||!owner)throw std::runtime_error(\"prepack gate must precede inference\");\n        void* c=variant.function==owner->oracle.function?codes.Data():packedCodes.Data();void* s=scales.Data();void* q=xq.Data();void* d=xd.Data();void* y=out.Data();"
+    },
+    {
+      "before": "        codes.CheckGuard();scales.CheckGuard();xq.CheckGuard();xd.CheckGuard();",
+      "after": "        codes.CheckGuard();packedCodes.CheckGuard();scales.CheckGuard();xq.CheckGuard();xd.CheckGuard();"
+    },
+    {
+      "before": "static std::vector<uint32_t> Oracle(Fixture& f,Module& module) {\n    f.Reset();",
+      "after": "static std::vector<uint32_t> Oracle(Fixture& f,Module& module) {\n    f.Prepack(module); // Load-once conversion is outside every inference/ABBA event interval.\n    f.Reset();"
+    },
+    {
+      "before": "    for(const Shape& s:StrictPlan) {",
+      "after": "    FixturePurpose=\"strict\";\n    for(const Shape& s:StrictPlan) {"
+    },
+    {
+      "before": "    if(mode==\"--bench\")for(const TimedRole& timedRole:TimedPlan) {",
+      "after": "    FixturePurpose=\"pipeline\";\n    if(mode==\"--bench\")for(const TimedRole& timedRole:TimedPlan) {"
+    },
+    {
+      "before": "Quote(\"rows_and_launch_only\").c_str()",
+      "after": "Quote(\"load_once_nibble_permutation_only\").c_str()"
+    },
+    {
+      "before": "        <<\",\\\"timed_unique_geometries\\\":5,",
+      "after": "        <<\",\\\"prepack_cases\\\":\"<<PrepackCases<<\",\\\"load_once_prepack_excluded_from_inference_events\\\":true,\\\"A4_prefill_layout_compatible\\\":false,\\\"timed_unique_geometries\\\":5,"
+    },
+    {
+      "before": "usage: dp4a-schedule-bench BUILD_DIR OUT_DIR --strict|--bench [--acts 8] [--rounds 5] [--iterations 3]",
+      "after": "usage: nvfp4-nibble-layout-bench BUILD_DIR OUT_DIR --strict|--bench [--acts 8] [--rounds 10] [--iterations 3]"
+    },
+    {
+      "before": "int acts=8,rounds=5,iterations=3;",
+      "after": "int acts=8,rounds=10,iterations=3;"
+    }
+  ]
+}

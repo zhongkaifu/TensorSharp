@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
+using System.Numerics;
 
 namespace TensorSharp.Runtime
 {
@@ -20,6 +21,7 @@ namespace TensorSharp.Runtime
     {
         private readonly SamplingConfig _config;
         private readonly Random _rng;
+        private readonly bool _vectorizeArgmax;
         private float[]? _scoreBuffer;
         private int[]? _indexBuffer;
         // Reused top-k heap. Sized k (typically 20-40), so this is only about
@@ -43,9 +45,17 @@ namespace TensorSharp.Runtime
             _messageThinkingTracker?.ExhaustedAt(observedOutputCount) == true;
 
         public TokenSampler(SamplingConfig config)
+            : this(config, Environment.GetEnvironmentVariable("TS_TOKEN_SAMPLER_SIMD") == "1")
+        {
+        }
+
+        // Explicit same-binary control for CPU validation; the public opt-in is
+        // read once per sampler, never in the per-logit scan.
+        internal TokenSampler(SamplingConfig config, bool vectorizeArgmax)
         {
             _config = config ?? SamplingConfig.Default;
             _rng = config?.Seed >= 0 ? new Random(config.Seed) : new Random();
+            _vectorizeArgmax = vectorizeArgmax;
         }
 
         /// <summary>
@@ -124,7 +134,7 @@ namespace TensorSharp.Runtime
             {
                 bool hasHistory = generatedTokenIds != null && generatedTokenIds.Count > 0;
                 if (!HasPenalties() || !hasHistory)
-                    return Argmax(logits);
+                    return SelectArgmax(logits);
                 return ArgmaxWithPenaltiesInPlace(logits, generatedTokenIds!);
             }
 
@@ -269,7 +279,7 @@ namespace TensorSharp.Runtime
             // not allocate a dictionary on every decoded token.
             var counts = CollectPenaltyCounts(logits.Length, generatedTokenIds, null);
             if (counts.Count == 0)
-                return Argmax(logits);
+                return SelectArgmax(logits);
 
             float repPenalty = _config.RepetitionPenalty > 0f ? _config.RepetitionPenalty : 1.0f;
             float presPenalty = _config.PresencePenalty;
@@ -298,7 +308,7 @@ namespace TensorSharp.Runtime
                 logits[tokenId] = v;
             }
 
-            int best = Argmax(logits);
+            int best = SelectArgmax(logits);
 
             for (int i = 0; i < si; i++)
                 logits[tokenBuffer[i]] = originalBuffer[i];
@@ -671,6 +681,52 @@ namespace TensorSharp.Runtime
         }
 
         private static int Argmax(float[] values)
+        {
+            // Preserve the original empty-array exception and leading-NaN rule.
+            // Never use ISA-dependent floating Max NaN/tie semantics: only the
+            // original ordered > comparison selects a new lane value.
+            float first = values[0];
+            if (values.Length < 128 || !Vector.IsHardwareAccelerated)
+                return ArgmaxScalar(values);
+            if (float.IsNaN(first))
+                return 0;
+
+            int width = Vector<float>.Count;
+            var maxima = new Vector<float>(first);
+            int i = 0;
+            for (; i <= values.Length - width; i += width)
+            {
+                var current = new Vector<float>(values, i);
+                maxima = Vector.ConditionalSelect(Vector.GreaterThan(current, maxima), current, maxima);
+            }
+            float maximum = first;
+            for (int lane = 0; lane < width; lane++)
+                if (maxima[lane] > maximum)
+                    maximum = maxima[lane];
+            for (; i < values.Length; i++)
+                if (values[i] > maximum)
+                    maximum = values[i];
+
+            // Equality intentionally includes both signed zeros and infinities.
+            // Scan blocks in input order, then the first matching lane, so ties
+            // retain the exact original lowest index. Later NaNs never compare
+            // equal and cannot be the selected maximum.
+            var target = new Vector<float>(maximum);
+            i = 0;
+            for (; i <= values.Length - width; i += width)
+                if (Vector.EqualsAny(new Vector<float>(values, i), target))
+                    for (int lane = 0; lane < width; lane++)
+                        if (values[i + lane] == maximum)
+                            return i + lane;
+            for (; i < values.Length; i++)
+                if (values[i] == maximum)
+                    return i;
+            return 0; // The non-NaN first element guarantees a match.
+        }
+
+        private int SelectArgmax(float[] values) => _vectorizeArgmax ? Argmax(values) : ArgmaxScalar(values);
+
+        private static int ArgmaxScalar(float[] values)
         {
             int best = 0;
             float bestVal = values[0];

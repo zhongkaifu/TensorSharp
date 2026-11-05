@@ -1,0 +1,8 @@
+{
+  "schema": "qwen38-cua-causality-jobs/1",
+  "profiles": [
+    {"name": "ScalarA1", "cpu_simd": "0", "splitk_policy": "production-unset"},
+    {"name": "ScalarA2", "cpu_simd": "0", "splitk_policy": "production-unset"}
+  ],
+  "comparisons": [{"left": "ScalarA1", "right": "ScalarA2"}]
+}

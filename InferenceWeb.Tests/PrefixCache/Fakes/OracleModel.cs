@@ -66,6 +66,8 @@ internal sealed record OracleTraits
     public bool LinearKvMigration { get; init; } = true;
 
     public bool ReuseAcrossMediaSpan { get; init; } = true;
+    /// <summary>A clone shares the payload's K/V (<see cref="PrefixCacheCapabilities.ClonesShareKv"/>).</summary>
+    public bool ClonesShareKv { get; init; }
 }
 
 /// <summary>
@@ -479,6 +481,7 @@ internal class OracleModel : IModelArchitecture, IBatchedPagedModel, IPrefixCach
         ReuseAcrossMediaSpan = Traits.ReuseAcrossMediaSpan,
         Persistable = Traits.Persistable,
         PagedEndStates = Traits.PagedEndStates,
+        ClonesShareKv = Traits.ClonesShareKv,
         MaxRetainedNativeSlots = 0,
     };
 

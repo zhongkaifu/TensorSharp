@@ -216,6 +216,69 @@ public class ModelServiceRawTokenHistoryTests
         Assert.Equal("t0", own.InheritedScope);
     }
 
+    /// <summary>Two parallel tool calls: the client received (and echoes back) the newline
+    /// between them as content, while the parser recorded none. It is still this
+    /// conversation's turn: the raw tokens splice and the scope carries over. Visible text
+    /// next to the same calls still does not.</summary>
+    [Fact]
+    public void Augment_ParallelToolCallsWithEchoedSeparatorNewline_StillSplices()
+    {
+        var store = NewStore();
+        var ask = new ChatMessage { Role = "user", Content = "Read both files." };
+        List<ToolCall> Calls() => new()
+        {
+            new() { Id = "a", Name = "read_file", Arguments = new Dictionary<string, object> { ["path"] = "/data/orders.csv" } },
+            new() { Id = "b", Name = "read_file", Arguments = new Dictionary<string, object> { ["path"] = "/data/prices.json" } },
+        };
+        store.Record(new List<ChatMessage> { ask }, Generated("<tool_call>..</tool_call>\n<tool_call>..</tool_call>", new List<int> { 4, 5, 6 }),
+            Emitted(string.Empty, rawText: "<tool_call>..</tool_call>\n<tool_call>..</tool_call>", toolCalls: Calls()), scope: "agent");
+
+        List<ChatMessage> Next(string content) => new()
+        {
+            new() { Role = "user", Content = ask.Content },
+            new() { Role = "assistant", Content = content, ToolCalls = Calls() },
+            new() { Role = "tool", Content = "id,qty", ToolCallId = "a" },
+            new() { Role = "tool", Content = "{}", ToolCallId = "b" },
+        };
+        var echoed = store.Augment(Next("\n"));
+        Assert.Equal(new[] { 4, 5, 6 }, echoed.History[1].RawOutputTokens);
+        Assert.Equal("agent", echoed.InheritedScope);
+
+        var edited = store.Augment(Next("Reading them now."));
+        Assert.Null(edited.History[1].RawOutputTokens);
+        Assert.Null(edited.InheritedScope);
+    }
+
+    /// <summary>Prose before a tool call: the client echoes the prose with the blank line the
+    /// stream sent before the call, the parser recorded the prose without it. Still this turn;
+    /// different prose is not.</summary>
+    [Fact]
+    public void Augment_ProseBeforeToolCallWithEchoedTrailingBlankLine_StillSplices()
+    {
+        var store = NewStore();
+        var ask = new ChatMessage { Role = "user", Content = "What is the widget total?" };
+        List<ToolCall> Calls() => new()
+        {
+            new() { Id = "a", Name = "list_files", Arguments = new Dictionary<string, object> { ["directory"] = "/data" } },
+        };
+        store.Record(new List<ChatMessage> { ask }, Generated("I'll list the files first.\n\n<tool_call>..</tool_call>", new List<int> { 4, 5, 6 }),
+            Emitted("I'll list the files first.", toolCalls: Calls()), scope: "agent");
+
+        List<ChatMessage> Next(string content) => new()
+        {
+            new() { Role = "user", Content = ask.Content },
+            new() { Role = "assistant", Content = content, ToolCalls = Calls() },
+            new() { Role = "tool", Content = "orders.csv", ToolCallId = "a" },
+        };
+        var echoed = store.Augment(Next("I'll list the files first.\n\n"));
+        Assert.Equal(new[] { 4, 5, 6 }, echoed.History[1].RawOutputTokens);
+        Assert.Equal("agent", echoed.InheritedScope);
+
+        var edited = store.Augment(Next("I'll list the files, then read them.\n\n"));
+        Assert.Null(edited.History[1].RawOutputTokens);
+        Assert.Null(edited.InheritedScope);
+    }
+
     [Fact]
     public void Augment_UserMessageEdited_StopsSplicingAtEdit()
     {

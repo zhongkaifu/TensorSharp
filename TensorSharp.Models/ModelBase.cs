@@ -36,8 +36,10 @@ namespace TensorSharp.Models
         public IMultimodalInjector MultimodalInjector { get; }
         public IBackendExecutionPlan ExecutionPlan { get; }
 
-        /// <summary>Every GGUF file opened for this checkpoint, including sibling shards.</summary>
-        public IReadOnlyList<string> ModelFilePaths => _gguf?.FilePaths ?? Array.Empty<string>();
+        /// <summary>Every model artifact opened for this checkpoint, including GGUF sibling shards.</summary>
+        public IReadOnlyList<string> ModelFilePaths => _gguf?.FilePaths ?? _externalModelFilePaths;
+
+        private readonly IReadOnlyList<string> _externalModelFilePaths = Array.Empty<string>();
 
         protected readonly GgufFile _gguf;
         private readonly GgmlContext _ggmlContext;
@@ -325,7 +327,7 @@ namespace TensorSharp.Models
         protected int LayerSplitDegree { get; }
 
         protected ModelBase(string ggufPath, BackendType backend, int tpDegree = 1,
-            ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1)
+            ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1, bool openGguf = true)
         {
             if (tpDegree < 1) throw new ArgumentOutOfRangeException(nameof(tpDegree));
             if (layerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(layerSplitDegree));
@@ -428,7 +430,10 @@ namespace TensorSharp.Models
                     _tpGroup?.GlobalDegree ?? 0, _tpGroup?.GlobalRankOffset ?? 0);
             }
 
-            _gguf = new GgufFile(ggufPath);
+            if (openGguf)
+                _gguf = new GgufFile(ggufPath);
+            else
+                _externalModelFilePaths = Array.AsReadOnly(new[] { System.IO.Path.GetFullPath(ggufPath) });
         }
 
         /// <summary>
@@ -3504,6 +3509,18 @@ namespace TensorSharp.Models
             if (layerSplitDegree <= 1)
                 layerSplitDegree = ReadParallelDegree("TENSORSHARP_LAYER_SPLIT_DEGREE", layerSplitDegree);
 
+            if (NinferQwen38ModelSource.IsNinferArtifact(ggufPath))
+            {
+                // The native CUDA engine reads the artifact directly; the ggml backends and MLX read a
+                // qwen35 GGUF converted from it once (NinferQwen38GgufConverter, cached beside it).
+                if (backend == BackendType.Cuda)
+                {
+                    NinferQwen38ModelSource.ValidateExecutionRoute(backend, tpDegree, tpGroup, layerSplitDegree, draftModelPath);
+                    return Qwen35CudaModel.FromNinfer(ggufPath);
+                }
+                ggufPath = NinferQwen38GgufConverter.EnsureGguf(ggufPath);
+            }
+
             using var probe = new GgufFile(ggufPath);
             var architecture = ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe);
 
@@ -3531,6 +3548,8 @@ namespace TensorSharp.Models
         /// execution before callers allocate GPU ranks or connect to peer nodes.</summary>
         public static void ValidateDistributedTensorParallelism(string ggufPath, BackendType backend)
         {
+            if (NinferQwen38ModelSource.IsNinferArtifact(ggufPath))
+                throw new NotSupportedException("NInfer Qwen3.8 body inference does not implement distributed tensor parallelism.");
             using var probe = new GgufFile(ggufPath);
             var architecture = ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe);
             ValidateDistributedTensorParallelism(architecture, backend);
@@ -3569,6 +3588,8 @@ namespace TensorSharp.Models
         /// <summary>Reject unavailable stage executors before allocating GPUs or connecting peers.</summary>
         public static void ValidateDistributedLayerSplit(string ggufPath, BackendType backend)
         {
+            if (NinferQwen38ModelSource.IsNinferArtifact(ggufPath))
+                throw new NotSupportedException("NInfer Qwen3.8 body inference does not implement distributed layer split.");
             using var probe = new GgufFile(ggufPath);
             ValidateDistributedLayerSplit(ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe), backend);
         }

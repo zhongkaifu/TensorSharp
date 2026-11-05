@@ -15,6 +15,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using TensorSharp.Models.Architecture;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
@@ -23,12 +24,14 @@ using TensorSharp.Runtime.Speculative;
 
 namespace TensorSharp.Models
 {
-    public sealed class Qwen35CudaModel : ModelBase, IBatchedPagedModel, IPrefixCacheModel, IPrefixCacheModelDiagnostics,
+    public sealed partial class Qwen35CudaModel : ModelBase, IBatchedPagedModel, IPrefixCacheModel, IPrefixCacheModelDiagnostics,
         ISpeculativeModel, IBatchedSpeculativeTarget, IMixedStepPrefillTarget, IVisionCapableModel, IMRoPEPositionSink, IMultimodalPromptExpander
     {
         private const string Tag = "q35-cuda";
         private Qwen35CudaExecutor _exec;
         private readonly object _sync = new object();
+        private readonly bool _reclaimVisionPool = Environment.GetEnvironmentVariable("TS_Q35_RECLAIM_VISION_POOL") == "1";
+        private long _visionPoolPressureTrimCount;
 
         // requestId -> engine slot. Guarded by _sync.
         private Dictionary<string, int> _slotByRequest;
@@ -96,15 +99,7 @@ namespace TensorSharp.Models
                     maxContext = Math.Min(maxContext, 65536);
                 int nUbatch = ParseEnvInt("TS_Q35_UBATCH", 2048);
                 _exec = new Qwen35CudaExecutor(ggufPath, maxContext, nUbatch, Qwen35Model.ResolveQwen35DFlashPath(draftGgufPath));
-                _exec.Engine.ReclaimMemory = ReclaimOneRetained;
-                _hostBudgetBytes = ResolveHostBudgetBytes();
-                // The pinner fills the whole budget from load on: pinning beside the copies slowed them
-                // several times over.
-                _exec.Engine.ConfigureHostPool(_hostBudgetBytes, _hostBudgetBytes);
-                _primarySlot = _exec.ActiveSlot;
-                _maxContextLength = _exec.ContextSize;
-                Config.VocabSize = _exec.VocabSize;
-                _logitsBuffer = new float[Config.VocabSize];
+                InitializeEngineRuntime();
                 Console.WriteLine($"Model: qwen35 on the direct-CUDA engine, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
                     $"Vocab={Config.VocabSize}, n_ctx={_maxContextLength}, drafter={(_exec.Draft != null ? "DFlash2" : "none")}");
             }
@@ -137,7 +132,12 @@ namespace TensorSharp.Models
         public override bool SupportsKVCacheTruncation => false;
 
         public override string KVStateFingerprint =>
-            $"qwen35|exec=cuda|L={Config.NumLayers}|H={Config.HiddenSize}|V={Config.VocabSize}|ctx={_maxContextLength}";
+            $"qwen35|exec=cuda|L={Config.NumLayers}|H={Config.HiddenSize}|V={Config.VocabSize}|ctx={_maxContextLength}" +
+            (_ninferCacheIdentity == null ? string.Empty : "|ninfer=" + _ninferCacheIdentity) +
+            (_exec?.Engine?.KVStateNamespaceSuffix ?? string.Empty);
+
+        /// <summary>Host metadata diagnostics only, immutable at native engine construction.</summary>
+        public bool ServingTraceEnabled => _exec?.Engine?.ServingTraceEnabled == true;
 
         protected override float[] ForwardCore(int[] tokens)
         {
@@ -160,6 +160,7 @@ namespace TensorSharp.Models
             _pendingVision.Clear();
             try
             {
+                _exec.Engine.TraceBindSequence(_activeSlotKey, _exec.Engine.Active);
                 _exec.Engine.Forward(tokens, logitsOut, ropePos, spans);
             }
             finally
@@ -212,6 +213,8 @@ namespace TensorSharp.Models
         /// its rows enter the engine's forward as embedding overrides copied device to device.</summary>
         public void LoadVisionEncoder(string mmProjPath)
         {
+            // The NInfer route takes the same Qwen3.8 vision tower from the mmproj GGUF; its rows
+            // replace the image placeholders' FP8 embeddings like on the GGUF route.
             _visionAllocator ??= new TensorSharp.Cuda.CudaAllocator(0);
             _vision = new Qwen35VisionEncoder(mmProjPath, _visionAllocator);
             _vision.SetHostModel(this);
@@ -294,7 +297,8 @@ namespace TensorSharp.Models
         {
             try
             {
-                ForwardCore(new[] { Tokenizer?.BosTokenId ?? 0 });
+                int bos = Tokenizer?.BosTokenId ?? -1;
+                ForwardCore(new[] { bos >= 0 ? bos : 0 });
             }
             catch (Exception ex)
             {
@@ -384,6 +388,7 @@ namespace TensorSharp.Models
                 if (!_exec.SetActiveSlot(slot))
                     throw new InvalidOperationException($"qwen35 slot {slot} missing for request {requestId}.");
                 _activeSlotKey = requestId;
+                _exec.Engine.TraceBindSequence(requestId, _exec.Engine.Active);
                 _cacheSeqLen = _exec.NPast;
                 return fresh;
             }
@@ -397,6 +402,7 @@ namespace TensorSharp.Models
                 _slotByRequest ??= new Dictionary<string, int>(StringComparer.Ordinal);
                 if (_activeSlotKey != null || _slotByRequest.ContainsKey(requestId)) return;
                 _slotByRequest[requestId] = _primarySlot;
+                _exec.Engine.TraceBindSequence(requestId, _exec.Slot(_primarySlot));
                 _activeSlotKey = requestId;
                 _primarySlot = -1;
             }
@@ -492,6 +498,53 @@ namespace TensorSharp.Models
                     Console.Error.WriteLine($"[q35-retire] {key} tokens={_retainedSlots[key].Tokens} checkpoint={_checkpointKeys.Contains(key)} " +
                         $"free={free >> 20}MiB host={_hostRetained.Count} ({engine.HostBytesInUse >> 20}MiB)");
                 pending += engine.SlotStateBytes + engine.SlotKvBytes(slot);
+            }
+        }
+
+        /// <summary>Called under _sync when the engine needs device memory. Media preparation can
+        /// hold _mediaLock while waiting for _sync, so never wait for that lock here. Dispose also
+        /// holds _sync: an allocator selected below cannot be disposed by the model during a trim.</summary>
+        private bool ReclaimDeviceMemory()
+        {
+            if (_reclaimVisionPool && _vision != null && _visionAllocator is TensorSharp.Cuda.CudaAllocator allocator)
+            {
+                bool freed = TryTrimIdleVisionPool(_mediaLock, () => allocator.GetStats().CachedBytes,
+                    allocator.TrimPool, out long before, out long after);
+                if (before > 0)
+                {
+                    ++_visionPoolPressureTrimCount;
+                    Console.Error.WriteLine($"[q35-vision-pool-reclaim] trim={_visionPoolPressureTrimCount} " +
+                        $"cached_before={before} cached_after={after} cached_reduction={before - after}");
+                }
+                if (freed)
+                    return true;
+            }
+            return ReclaimOneRetained();
+        }
+
+        /// <summary>Only trim returned, idle pool blocks. The allocator synchronizes its own
+        /// stream before draining; live weights, embeddings and graph-owned blocks stay owned.
+        /// A late finalizer may return another block, so only an observed cache reduction counts
+        /// as progress. Stats/trim errors propagate, with the media lock released in every case.</summary>
+        internal static bool TryTrimIdleVisionPool(object mediaLock, Func<long> cachedBytes, Action trim,
+            out long before, out long after)
+        {
+            before = after = 0;
+            if (!Monitor.TryEnter(mediaLock, 0))
+                return false;
+            try
+            {
+                before = cachedBytes();
+                after = before;
+                if (before <= 0)
+                    return false;
+                trim();
+                after = cachedBytes();
+                return after < before;
+            }
+            finally
+            {
+                Monitor.Exit(mediaLock);
             }
         }
 
@@ -607,7 +660,7 @@ namespace TensorSharp.Models
             _promoting = key;
             try
             {
-                int slot = AllocSlotReclaimingRetained();
+                int slot = AllocSlotReclaimingRetained(sharesPrefix: true);
                 if (slot < 0)
                     return false;
                 try
@@ -617,6 +670,14 @@ namespace TensorSharp.Models
                     if (RetainDebug)
                         Console.Error.WriteLine($"[q35-promote] {key} tokens={payload.Tokens} checkpoint={payload.Checkpoint} " +
                             $"{System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds:F0}ms host={_hostRetained.Count}");
+                }
+                catch (OutOfMemoryException ex)
+                {
+                    // The payload's blocks no longer on the device do not fit back now: decline (the
+                    // request waits for running ones, or prefills), and keep the host copy.
+                    _exec.SlotFree(slot);
+                    Console.Error.WriteLine($"[q35-cuda] {payload.Tokens}-token cached prefix stays in host memory: {ex.Message}");
+                    return false;
                 }
                 catch
                 {
@@ -639,11 +700,17 @@ namespace TensorSharp.Models
         private bool IsHostPayload(string key, int tokens, int target)
             => key != null && _hostRetained.TryGetValue(key, out var p) && p.Tokens == tokens && target == tokens;
 
-        private int AllocSlotReclaimingRetained()
+        /// <summary>A new slot, moving retained slots to host memory (or dropping them) until one fits.
+        /// <paramref name="sharesPrefix"/>: a checkpoint, or a copy of a cached prefix (a clone or a slot
+        /// coming back from host memory). Its attention blocks are the source's, so it keeps only the
+        /// engine's growth reserve; every later block it needs goes through the engine's reclaiming
+        /// allocator. A slot for a new prompt keeps the full reserve for the blocks of its prefill.</summary>
+        private int AllocSlotReclaimingRetained(bool sharesPrefix = false)
         {
-            int slot = _exec.SlotAlloc();
+            long reserve = sharesPrefix ? Qwen35CudaExecutor.CheckpointReserveBytes : Qwen35CudaExecutor.SlotReserveBytes;
+            int slot = _exec.SlotAlloc(reserve);
             while (slot < 0 && ReclaimOneRetained())
-                slot = _exec.SlotAlloc();
+                slot = _exec.SlotAlloc(reserve);
             return slot;
         }
 
@@ -661,6 +728,7 @@ namespace TensorSharp.Models
                 if (!_exec.SetActiveSlot(_primarySlot))
                     throw new InvalidOperationException($"qwen35 primary slot {_primarySlot} missing.");
                 _activeSlotKey = null;
+                _exec.Engine.TraceBindSequence(null, _exec.Engine.Active);
                 _cacheSeqLen = _exec.NPast;
             }
         }
@@ -678,6 +746,9 @@ namespace TensorSharp.Models
                         return false;
                 int vocab = Config.VocabSize;
                 var flat = new float[n * vocab];
+                if (_exec.Engine.ServingTraceEnabled)
+                    for (int i = 0; i < n; i++)
+                        _exec.Engine.TraceBindSequence(requestIds[i], _exec.Slot(slots[i]));
                 if (!_exec.ForwardBatchedDecode(slots, tokens, positions, flat)) return false;
                 for (int i = 0; i < n; i++)
                 {
@@ -689,6 +760,10 @@ namespace TensorSharp.Models
                 return true;
             }
         }
+
+        /// <summary>A holder the executor bound and filled from a cached prefix is a slot at that
+        /// prefix's length, which <see cref="TryForwardBatchedFusedPrefill"/> takes like any other.</summary>
+        public bool BatchedPrefillTakesPrebound => true;
 
         /// <summary>
         /// Concurrent prompt chunks in shared forwards (padded to the longest chunk of each group),
@@ -726,6 +801,9 @@ namespace TensorSharp.Models
                     if (slots[i] == null || slots[i].NPast != positions[i])
                         return Undo(fresh);
                 }
+                if (_exec.Engine.ServingTraceEnabled)
+                    for (int i = 0; i < n; i++)
+                        _exec.Engine.TraceBindSequence(requestIds[i], slots[i]);
                 _exec.Engine.PrefillBatch(slots, tokens.ToArray(), outLogits);
                 _cacheSeqLen = _exec.NPast;
                 return true;
@@ -776,16 +854,20 @@ namespace TensorSharp.Models
                 slots[i] = _exec.Slot(id);
                 if (slots[i] == null || (positions != null && slots[i].NPast != positions[i]))
                     return null;
+                _exec.Engine.TraceBindSequence(requestIds[i], slots[i]);
             }
             return slots;
         }
 
         // ---------------------------------------------------------------- speculation
 
-        private bool HasDrafter => _exec?.Draft != null;
-        private int DraftWidth => HasDrafter ? _exec.Draft.BlockSize - 1 : 0;
+        private bool HasDrafter => _exec?.Engine?.HasDrafter == true;
+        private int DraftWidth => HasDrafter ? _exec.Engine.DraftBlockSize - 1 : 0;
 
         public bool SpeculationProfitable => HasDrafter;
+        private static bool NativeGreedyVerifyEnabled => Environment.GetEnvironmentVariable("TS_Q35_GREEDY_VERIFY") == "1";
+        public bool SpecPrefersFixedCostGovernor => _exec?.HasEmbeddedNinferDrafter == true
+            && _exec.Engine.NinferFixedDraftGovernorQualified && NativeGreedyVerifyEnabled;
         public bool SpecTrunkFollowsBoundCache => true;
         /// <summary>The drafter's taps never leave the device: the executor's feature rows are a
         /// one-float placeholder.</summary>
@@ -820,6 +902,25 @@ namespace TensorSharp.Models
             }
             if (hAllOut != null && hAllOut.Length > 0)
                 hAllOut[0] = 0f;
+        }
+
+        /// <summary>Token-only version of the solo verify; explicit opt-in until
+        /// full sampler/state and model quality gates have passed on the device.</summary>
+        public bool TrySpecForwardGreedyVerify(int[] tokens, float[] hAllOut, int[] drawnOut)
+        {
+            if (!NativeGreedyVerifyEnabled
+                || tokens.Length < 2 || tokens.Length > TensorSharp.Cuda.Q35CudaEngine.MaxVerifyRows)
+                return false;
+            if (drawnOut == null || drawnOut.Length < tokens.Length)
+                throw new ArgumentException("A greedy verify needs one output token per row.", nameof(drawnOut));
+            lock (_sync)
+            {
+                _exec.Engine.Verify(new[] { _exec.Engine.Active }, tokens.Length, tokens, drawnOut);
+                _soloVerifyRows = tokens.Length;
+            }
+            if (hAllOut != null && hAllOut.Length > 0)
+                hAllOut[0] = 0f;
+            return true;
         }
 
         public void SpecOnVerifyAccepted(int acceptedRows, int verifyRows)
@@ -884,7 +985,9 @@ namespace TensorSharp.Models
         {
             if (!HasDrafter || sequences < 1 || sequences > TensorSharp.Cuda.Q35CudaEngine.MaxSeqs)
                 return 0;
-            return Math.Min(DraftWidth + 1, TensorSharp.Cuda.Q35CudaEngine.MaxVerifyRows / sequences);
+            if (_exec.Engine.HasNinferDrafter && sequences > _exec.Engine.NinferDraftMaximumLanes)
+                return 0;
+            return Math.Min(DraftWidth + 1, _exec.Engine.NinferExactVerifyMaximumRows / sequences);
         }
 
         public int FusedCacheSeqLen(string requestId)
@@ -926,6 +1029,8 @@ namespace TensorSharp.Models
                 var slots = SlotsOf(requestIds, positions);
                 if (slots == null || !HasDrafter)
                     return false;
+                if (_exec.Engine.HasNinferDrafter && slots.Length > _exec.Engine.NinferDraftMaximumLanes)
+                    return false;
                 _exec.Engine.Draft(slots, anchors, tokensOut, confOut);
                 return true;
             }
@@ -937,7 +1042,7 @@ namespace TensorSharp.Models
             lock (_sync)
             {
                 var slots = SlotsOf(requestIds, positions);
-                if (slots == null || window < 1 || slots.Length * window > TensorSharp.Cuda.Q35CudaEngine.MaxVerifyRows)
+                if (slots == null || window < 1 || (long)slots.Length * window > _exec.Engine.NinferExactVerifyMaximumRows)
                     return false;
                 foreach (var s in slots)
                     if (s.NPast + window > _maxContextLength)
@@ -999,7 +1104,7 @@ namespace TensorSharp.Models
         /// that only decodes beside a cold prompt waits that long per round; 1024 halves it at a
         /// small cost to the prompt (Qwen3.8-27B replay: image_replace c=2 1.02 -> 0.97 of Velox,
         /// c=4 0.99 -> 0.94, the rest unchanged within noise).</summary>
-        public int PreferredMixedStepPrefillTokens => MixedStep ? 1024 : 0;
+        public int PreferredMixedStepPrefillTokens => MixedStep && _ninferCacheIdentity == null ? 1024 : 0;
 
         public bool StageMixedPrefill(string requestId, int[] tokens, int position, bool whole)
         {
@@ -1022,7 +1127,7 @@ namespace TensorSharp.Models
                 _pendingVisionTensors.Clear();
                 // A chunk of a few tokens (a prompt's tail) takes the GEMV's 8-bit activations on its own:
                 // see MixedFp4Verify.
-                if (!MixedStep || requestId == null || tokens == null
+                if (_ninferCacheIdentity != null || !MixedStep || requestId == null || tokens == null
                     || !MixedNumericsAllowed(tokens.Length, int.MaxValue) || tokens.Length > _exec.Engine.UBatch
                     || position + tokens.Length > _maxContextLength || SlotsOf(new[] { requestId }, new[] { position }) == null)
                 {
@@ -1139,6 +1244,8 @@ namespace TensorSharp.Models
             // Checkpoints share the attention blocks: one past the media costs only the recurrent state.
             CheckpointPromptTailWithMedia = true,
             CountCapsByBytes = true,
+            // CopySlot shares every attention block of the payload; a block is copied when written.
+            ClonesShareKv = true,
             Persistable = false,
             MaxRetainedNativeSlots = 0,
         };
@@ -1169,7 +1276,10 @@ namespace TensorSharp.Models
                     return false;
                 var from = _slotByRequest != null && _slotByRequest.TryGetValue(requestId, out int own)
                     ? _exec.Slot(own) : _exec.Engine.Active;
-                int dst = AllocSlotReclaimingRetained();
+                int dst = AllocSlotReclaimingRetained(sharesPrefix: true);
+                if (dst < 0)
+                    Console.Error.WriteLine($"[q35-cuda] no device room for a {from.NPast}-token checkpoint slot " +
+                        $"({_exec.Engine.FreeDeviceBytes() >> 20} MiB free); later prompts re-prefill it");
                 if (dst < 0)
                     return false;
                 _exec.Engine.CopySlot(from, _exec.Slot(dst), from.NPast);
@@ -1195,7 +1305,7 @@ namespace TensorSharp.Models
                 _slotByRequest ??= new Dictionary<string, int>(StringComparer.Ordinal);
                 if (!_slotByRequest.TryGetValue(requestId, out int target))
                 {
-                    target = AllocSlotReclaimingRetained();
+                    target = AllocSlotReclaimingRetained(sharesPrefix: true);
                     if (target < 0)
                         return false;
                     _slotByRequest[requestId] = target;

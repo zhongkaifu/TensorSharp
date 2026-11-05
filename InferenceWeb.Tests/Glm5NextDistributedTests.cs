@@ -28,7 +28,12 @@ public sealed class Glm5NextDistributedTests : IDisposable
         environment.Set("TS_GLM_TP_OVERSUBSCRIBE", "1");
         environment.Set("MAX_CONTEXT", "256");
         environment.Set("TS_GLM_UBATCH", "4");
-        environment.Set("TS_GLM_THREADS", "1");
+        // One CPU worker per rank: every rank of these fixtures lives in this process. Without
+        // a GPU the native loader sizes each rank's CPU pool to every usable core and only
+        // TS_CPU_MOE_THREADS overrides that (TS_GLM_THREADS does not), so on an 18-core Mac two
+        // ranks spun 36 workers in ggml's barriers: 9-21 s warm-ups and the 45 s timeouts.
+        environment.Set("TS_GLM_THREADS", null);
+        environment.Set("TS_CPU_MOE_THREADS", "1");
         environment.Set("TS_GLM_NATIVE", null);
         environment.Set("TS_GLM_TP_SHARD", null);
         environment.Set("TS_GLM_TRACE", null);

@@ -1,0 +1,85 @@
+Exact NVFP4 word-nibble layout microexperiment; production remains unchanged
+
+This tool compares the frozen original N8/R4/block128 Q81-input DP4a GEMV
+against one private codeword layout candidate. Oracle is freshly compiled from
+TensorSharp source28ede, NOT the actually loaded production BBD module or a real
+model. Every original 4-byte codeword is permuted nibble-wise by
+P=[0,2,4,6,1,3,5,7]. Its four LOW nibbles become the low16 bits and its four HIGH
+nibbles the high16. Original first six source byte_perm operations/sign selection
+then directly produce int2(tmp0,tmp1); the original final two byte_perm operations
+are absent. Actual generated SASS/instruction count and performance are NOT_RUN
+until native compilation and GPU evidence. Source PRMT counts are not a stall or
+bottleneck measurement.
+
+Original scale bytes/UE4M3 conversion, Q81 quantizer, four dp4a order, lane b/s/n/j
+order, F32 multiplication/addition and warp sum all remain unchanged. The candidate
+does not reduce precision or requantize weights. This is distinct from rejected
+R/block, register/cache, Q81 shared-tile, Q6-layout and BF16/FP4-MMA experiments.
+
+Setup/generate (CPU only, native source/helpers must match pinned hashes):
+  python3 eng/validation/Qwen35Nvfp4NibbleLayoutBench/build.py \
+    --generate-only --out artifacts/nibble-build-plan
+No compiler/GPU is invoked; complete=false, no offline permit.
+
+Actual compile, ROOT's authorized Linux setup window only:
+  python3 eng/validation/Qwen35Nvfp4NibbleLayoutBench/build.py \
+    --out artifacts/nibble-build --nvcc /usr/local/cuda/bin/nvcc
+No GPU is launched by build.py. It records compiler version, exact flags, selected
+kernel ptxas resources and actual artifacts. No implicit NVCC flags or forced
+register caps. Selected oracle/candidate/quantizer/prepack must naturally have
+1..255 registers, zero stack/spill and zero shared. Driver activeCTA>=1 and actual
+resources are required later; occupancy alone is not a speedup.
+
+Fresh no-GPU plans (omit --execute):
+  python3 eng/validation/Qwen35Nvfp4NibbleLayoutBench/run.py --build artifacts/nibble-build --name strict-plan
+  python3 eng/validation/Qwen35Nvfp4NibbleLayoutBench/run.py --build artifacts/nibble-build --name warm-plan --bench
+  python3 eng/validation/Qwen35Nvfp4NibbleLayoutBench/run.py --build artifacts/nibble-build --name sweep-plan --bench --cache-sweep
+
+ROOT-only actual GPU entries use the same commands with --execute and new names.
+All run modes first pass the unchanged sealed96 full-output bit/actual-argmax,
+input/output guards and oracle/candidate A/A checks. All timed6 roles additionally
+regate the complete original Q81 quantizer+GEMV pipeline; 10 rounds of ABBA give
+60 timing events (240 independently verified halves), every half fully rechecked.
+Roles: GDNIn5120x16480, AttnIn5120x14336, GDNOut6144x5120,
+AttnOut6144x5120, GateUp5120x34816, Down17408x5120. The two Out roles deliberately
+share geometry but retain separate identities; these are synthetic inputs, not
+captured real model activations.
+
+GPU load-once prepack writes a separate candidate codes buffer with two different
+poisons, compares ALL bytes against an independent CPU logical-nibble reference,
+checks inverse-original bytes and unchanged original code/scales payloads, and
+checks guards. No byte pattern is assumed impossible. 97 such gates in strict
+(pilot1+96); 103 in bench (plus6 real roles). The two prepack event durations are
+reported separately, outside inference timers. They measure the GPU pack kernel
+ONLY, not cold disk loading, GGUF parsing, complete load time or startup benefit.
+Every inference event includes original Q81 quantization+GEMV and no format
+conversion. Candidate never silently falls back to raw weights.
+
+Warm mode repeats one matrix3 times inside each half. --cache-sweep requires
+--bench and forces iterations1; before each half, outside events, >=2x driver L2
+bytes are read with volatile ld.global.cg.u32 and checked with per-block u64
+sum+count, guards and synchronization. It is all-data/L2 eviction control,
+including packed inputs, NOT weights-only or guaranteed physical cold cache.
+
+Candidate steady codes/scales byte count equals original (zero format-size delta).
+The MICROBENCH retains original+candidate codes simultaneously for its oracle, so
+its additional GPU allocation is exactly codes_bytes=m*k/2 per fixture, plus
+allocator/guards; the full-model deployment memory peak is NOT measured here.
+No recommendation to keep two model code copies. Production A4 prefill still
+requires the ORIGINAL layout; directly enabling new codes there is INVALID.
+A future positive result would need TensorSharp loader to emit this format
+DIRECTLY, and an exact inverse/compatible A4 weight-loader preserving numerical
+order, followed by complete real-model quality/numeric/dispatch gates. Neither
+production integration nor an A4 adaptation exists. Reject this direction if it
+has no stable full-pipeline warm AND eviction-control benefit. Never infer a
+model-wide gain from source instruction counts or kernel-only timing.
+
+CPU validation:
+  python3 -m unittest discover -s eng/validation/Qwen35Nvfp4NibbleLayoutBench -p test_build.py -v
+Tests include full logical mapping/sign/negativezero, random/halfword coverage,
+mutation/inverse failures, unchanged original source/runner reverse deltas,
+actual host C++ execution of the pure prepack code and actual runner host syntax
+with API stubs. These are CPU evidence, not NVCC/device/model validation.
+Successful full F32 arrays are compared in producer memory, not persisted;
+failures retain output/raw pack diagnostics. All original failed experiments and
+raw results remain unchanged; ggml/upstream/native production source is untouched.

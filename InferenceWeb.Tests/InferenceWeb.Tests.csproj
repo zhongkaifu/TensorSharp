@@ -16,6 +16,8 @@
     <ProjectReference Include="Fixtures/PdfProcessFixture/PdfProcessFixture.csproj" ReferenceOutputAssembly="false" />
     <Compile Include="../eng/validation/Gemma4BatchedCacheProbe/Gemma4CacheProbe.cs" Link="Validation/Gemma4CacheProbe.cs" />
     <Compile Include="../eng/validation/Qwen35BatchedDecodeProbe/Qwen35DecodeProbe.cs" Link="Validation/Qwen35DecodeProbe.cs" />
+    <Compile Include="../eng/validation/NinferA16ScheduleReference.cs" Link="Validation/NinferA16ScheduleReference.cs" />
+    <Compile Include="../eng/validation/ValidationSha256.cs" Link="Validation/ValidationSha256.cs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
@@ -27,6 +29,7 @@
   </ItemGroup>
   <ItemGroup>
     <Using Include="Xunit" />
+    <EmbeddedResource Include="TestData/Ninfer/qwen38-nvfp4-v3-directory.json" />
     <EmbeddedResource Include="Fixtures/Knowledge/*.pdf" />
     <EmbeddedResource Include="Fixtures/Knowledge/manifest.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/chat_template.jinja" />
@@ -43,6 +46,7 @@
     <EmbeddedResource Include="Fixtures/MiniMaxM3/tokenizer_reference.json" />
     <EmbeddedResource Include="Fixtures/Ltx25/*" />
     <EmbeddedResource Include="Fixtures/Qwen35MRope/reference_positions.json" />
+    <EmbeddedResource Include="Fixtures/Qwen35W8Head/official-nvcc-symbols.json" />
     <EmbeddedResource Include="Fixtures/Glm4Tokenizer/reference.json" />
     <EmbeddedResource Include="Fixtures/DeepSeek41/layout-1017.json" />
     <EmbeddedResource Include="Fixtures/DesktopSurface/create_surface.c" />

@@ -40,6 +40,109 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(8, r["request_wall_minus_gpu_union_ms"])
         db.close()
 
+    def test_whole_graph_spans_are_unioned_with_nested_kernels_and_transfers(self):
+        with sqlite3.connect(":memory:") as db:
+            db.executescript('''
+              CREATE TABLE StringIds (id INTEGER, value TEXT);
+              INSERT INTO StringIds VALUES (1,'nvfp4_gemm'),(2,'gdn_scan'),(3,'cuGraphLaunch');
+              CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start INTEGER,end INTEGER,demangledName INTEGER,graphId INTEGER,graphNodeId INTEGER);
+              INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (0,4000000,1,NULL,NULL),(6000000,8000000,2,NULL,NULL);
+              CREATE TABLE CUPTI_ACTIVITY_KIND_GRAPH_TRACE (start INTEGER,end INTEGER,deviceId INTEGER,contextId INTEGER,
+                greenContextId INTEGER,streamId INTEGER,correlationId INTEGER,globalPid INTEGER,graphId INTEGER,graphExecId INTEGER);
+              INSERT INTO CUPTI_ACTIVITY_KIND_GRAPH_TRACE VALUES
+                (2000000,12000000,0,1,0,13,1,123,1,2),(5000000,9000000,0,1,0,13,2,123,1,2),
+                (10000000,20000000,0,1,0,13,3,123,1,2),(30000000,31000000,0,1,0,13,4,123,1,2);
+              CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (start INTEGER,end INTEGER,copyKind INTEGER,bytes INTEGER);
+              INSERT INTO CUPTI_ACTIVITY_KIND_MEMCPY VALUES (19000000,22000000,1,4096);
+              CREATE TABLE CUPTI_ACTIVITY_KIND_MEMSET (start INTEGER,end INTEGER,bytes INTEGER);
+              INSERT INTO CUPTI_ACTIVITY_KIND_MEMSET VALUES (28000000,30000000,64);
+              CREATE TABLE CUPTI_ACTIVITY_KIND_DRIVER (start INTEGER,end INTEGER,nameId INTEGER);
+              INSERT INTO CUPTI_ACTIVITY_KIND_DRIVER VALUES (0,500000,3);
+            ''')
+            r = summary.summarize(db, {"result": {"e2e_ms": 28}})
+        self.assertEqual(25, r["gpu_activity_union_ms"])
+        self.assertEqual(11, r["gpu_detailed_activity_union_ms"])
+        self.assertEqual(6, r["gpu_gap_between_first_and_last_ms"])
+        self.assertEqual(3, r["request_wall_minus_gpu_union_ms"])
+        self.assertEqual(8, r["gpu_events"])
+        self.assertEqual({"kernels": 2, "copies_and_memsets": 2, "graph_aggregates": 4}, r["gpu_event_record_counts"])
+        graph = r["cuda_graph_trace"]
+        self.assertEqual(25, graph["aggregate_inclusive_sum_ms"])
+        self.assertEqual(19, graph["aggregate_interval_union_ms"])
+        self.assertEqual(14, graph["aggregate_interval_without_individual_activity_ms"])
+        self.assertTrue(graph["aggregate_only"])
+        self.assertEqual("UNAVAILABLE_AGGREGATE_ONLY", graph["per_kernel_body_attribution"])
+        self.assertIs(graph["per_kernel_body_attribution_complete"], False)
+        self.assertEqual(1, graph["host_graph_launch_api_records"])
+        self.assertTrue(r["warnings"])
+        category = r["gpu_categories"]["cuda_graph_aggregate"]
+        self.assertEqual(25, category["sum_ms"])
+        self.assertIs(category["additive_with_kernel_or_copy_categories"], False)
+        self.assertEqual(2, len(r["top_kernels"]))
+        self.assertIn("not CPU execution", r["request_wall_minus_gpu_union_interpretation"])
+
+    def test_graph_only_capture_has_device_coverage_and_missing_kernel_attribution(self):
+        with sqlite3.connect(":memory:") as db:
+            db.executescript('''
+              CREATE TABLE CUPTI_ACTIVITY_KIND_GRAPH_TRACE (start INTEGER,end INTEGER);
+              INSERT INTO CUPTI_ACTIVITY_KIND_GRAPH_TRACE VALUES (1000000,6000000);
+            ''')
+            r = summary.summarize(db)
+        self.assertEqual(5, r["gpu_activity_union_ms"])
+        self.assertIsNone(r["gpu_detailed_activity_union_ms"])
+        self.assertTrue(r["cuda_graph_trace"]["aggregate_only"])
+        self.assertEqual(5, r["cuda_graph_trace"]["aggregate_interval_without_individual_activity_ms"])
+        self.assertIn("GPU kernel table absent", r["missing"])
+
+    def test_some_identified_node_records_do_not_certify_complete_graph_attribution(self):
+        with sqlite3.connect(":memory:") as db:
+            db.executescript('''
+              CREATE TABLE CUPTI_ACTIVITY_KIND_GRAPH_TRACE (start INTEGER,end INTEGER);
+              INSERT INTO CUPTI_ACTIVITY_KIND_GRAPH_TRACE VALUES (0,10000000);
+              CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start INTEGER,end INTEGER,graphId INTEGER,graphNodeId INTEGER);
+              INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (1000000,3000000,5,7),(4000000,5000000,5,0);
+            ''')
+            r = summary.summarize(db)
+        self.assertEqual(10, r["gpu_activity_union_ms"])
+        self.assertEqual(1, r["cuda_graph_trace"]["kernel_records_with_positive_graph_node_id"])
+        self.assertFalse(r["cuda_graph_trace"]["aggregate_only"])
+        self.assertEqual("NODE_RECORDS_PRESENT_COMPLETENESS_NOT_ESTABLISHED", r["cuda_graph_trace"]["per_kernel_body_attribution"])
+        self.assertIsNone(r["cuda_graph_trace"]["per_kernel_body_attribution_complete"])
+
+    def test_host_graph_launch_without_device_records_warns_about_missing_body(self):
+        with sqlite3.connect(":memory:") as db:
+            db.executescript('''
+              CREATE TABLE StringIds (id INTEGER,value TEXT);
+              INSERT INTO StringIds VALUES (1,'cuGraphLaunch'),(2,'w8_head');
+              CREATE TABLE CUPTI_ACTIVITY_KIND_DRIVER (start INTEGER,end INTEGER,nameId INTEGER);
+              INSERT INTO CUPTI_ACTIVITY_KIND_DRIVER VALUES (0,500000,1);
+              CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start INTEGER,end INTEGER,demangledName INTEGER);
+              INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (2000000,3000000,2);
+            ''')
+            r = summary.summarize(db, {"result": {"e2e_ms": 20}})
+        self.assertEqual(1, r["gpu_activity_union_ms"])
+        self.assertEqual("MISSING_GRAPH_DEVICE_COVERAGE", r["cuda_graph_trace"]["per_kernel_body_attribution"])
+        self.assertIs(r["cuda_graph_trace"]["per_kernel_body_attribution_complete"], False)
+        self.assertTrue(r["warnings"])
+        self.assertIn("not CPU execution", r["request_wall_minus_gpu_union_interpretation"])
+
+    def test_unsupported_or_invalid_graph_intervals_remain_explicitly_unavailable(self):
+        with sqlite3.connect(":memory:") as db:
+            db.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_GRAPH_TRACE (begin INTEGER,finish INTEGER)")
+            r = summary.summarize(db)
+        self.assertIsNone(r["gpu_activity_union_ms"])
+        self.assertEqual("UNSUPPORTED_GRAPH_INTERVAL_SCHEMA", r["cuda_graph_trace"]["per_kernel_body_attribution"])
+        self.assertTrue(r["missing"]); self.assertTrue(r["warnings"])
+        with sqlite3.connect(":memory:") as db:
+            db.executescript('''
+              CREATE TABLE CUPTI_ACTIVITY_KIND_GRAPH_TRACE (start INTEGER,end INTEGER);
+              INSERT INTO CUPTI_ACTIVITY_KIND_GRAPH_TRACE VALUES (0,0),(3,2),(NULL,5),(1000000,4000000);
+            ''')
+            r = summary.summarize(db)
+        self.assertEqual(3, r["gpu_activity_union_ms"])
+        self.assertEqual(3, r["cuda_graph_trace"]["invalid_intervals_omitted"])
+        self.assertTrue(r["warnings"])
+
     def test_missing_gpu_is_unavailable_not_zero(self):
         with sqlite3.connect(":memory:") as db:
             r = summary.summarize(db)

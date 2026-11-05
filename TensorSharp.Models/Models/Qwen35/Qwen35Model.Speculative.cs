@@ -29,6 +29,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using TensorSharp;
+using TensorSharp.GGML;
+using TensorSharp.MLX;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 
@@ -143,8 +145,24 @@ namespace TensorSharp.Models
         /// is not a property of either drafter.
         ///
         /// An operator who passes --spec-draft still gets exactly that number.
+        ///
+        /// Exception, ggml_metal with a DFlash block drafter: there the verify keeps
+        /// per-row recurrent snapshots and commits on the device (no rollback forward,
+        /// no PCIe), and an 8-row Metal verify costs about what one row does. Measured
+        /// on M5 Pro, Qwen3.8-27B-UD-IQ3_XXS + DFlash2 Q4_K_M, 1,224 greedy tokens
+        /// (identical text in every arm): window 3 / gate 0.35 26.1 tok/s, 5 / 0 28.9,
+        /// 7 / 0 28.5, 7 / 0.35 24.8, plain 20.5. Hence window 5 with no gate
+        /// (<see cref="SpecPreferredBlockGate"/>). ggml_cuda keeps 3: its solo verify
+        /// measured 7 drafts slower than 3 on prose (SpecSoloMaxDraftTokens).
         /// </summary>
-        public int SpecPreferredDraftWindow => HasAnyRecurrentLayer ? 3 : 0;
+        public int SpecPreferredDraftWindow => !HasAnyRecurrentLayer ? 0 : MetalBlockDraft ? 5 : 3;
+
+        /// <summary>No cumulative gate for a DFlash block drafter on ggml_metal (see
+        /// <see cref="SpecPreferredDraftWindow"/>): the 0.35 default, tuned on sparse-MoE
+        /// trunks, cut 1,224-token decode from 28.5 to 24.8 tok/s at window 7.</summary>
+        public float SpecPreferredBlockGate => MetalBlockDraft ? 0f : float.NaN;
+
+        private bool MetalBlockDraft => HasDFlash && _backend == BackendType.GgmlMetal;
 
         // Weight-free suffix matches can amortize a wider GEMM without paying
         // twelve learned draft-head forwards. IQ4_XS uses independent Metal
@@ -516,6 +534,46 @@ namespace TensorSharp.Models
             SpecAttnLayerTicks = SpecRecurrentLayerTicks = SpecLmHeadTicks = 0;
         }
 
+        private static readonly bool GgmlGreedyVerifyEnabled = Environment.GetEnvironmentVariable("TS_Q35_GREEDY_VERIFY") == "1";
+        private float[] _greedyVerifyLogits;
+
+        /// <summary>Greedy verify on the ggml backends (TS_Q35_GREEDY_VERIFY=1, as the direct-CUDA engine's):
+        /// the native verify graph reduces each logit row to its argmax on the device, so a verify step
+        /// downloads N ids instead of N x vocab floats and the host samples nothing. A forward that did not
+        /// reach the native verify (op-by-op fallback, tensor parallel) takes the argmax of its host logits,
+        /// so the result never depends on the path.</summary>
+        public unsafe bool TrySpecForwardGreedyVerify(int[] tokens, float[] hAllOut, int[] drawnOut)
+        {
+            if (!GgmlGreedyVerifyEnabled || tokens == null || tokens.Length < 2)
+                return false;
+            if (drawnOut == null || drawnOut.Length < tokens.Length)
+                throw new ArgumentException("A greedy verify needs one output token per row.", nameof(drawnOut));
+            int vocab = Config.VocabSize;
+            long need = (long)tokens.Length * vocab;
+            if (_greedyVerifyLogits == null || _greedyVerifyLogits.LongLength < need)
+                _greedyVerifyLogits = new float[need];
+            bool onDevice;
+            fixed (int* ids = drawnOut)
+            {
+                GgmlBasicOps.Qwen35VerifyRequestArgmax((IntPtr)ids);
+                try { SpecForward(tokens, hAllOut, _greedyVerifyLogits, allLogitsRows: true); }
+                finally { onDevice = GgmlBasicOps.Qwen35VerifyArgmaxDone(); }
+            }
+            if (!onDevice)
+            {
+                for (int r = 0; r < tokens.Length; r++)
+                {
+                    long o = (long)r * vocab;
+                    int best = 0;
+                    float bv = _greedyVerifyLogits[o];
+                    for (int i = 1; i < vocab; i++)
+                        if (_greedyVerifyLogits[o + i] > bv) { bv = _greedyVerifyLogits[o + i]; best = i; }
+                    drawnOut[r] = best;
+                }
+            }
+            return true;
+        }
+
         public unsafe void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
             EnterSpecSession();
@@ -732,6 +790,11 @@ namespace TensorSharp.Models
         public void SpecOnVerifyAccepted(int acceptedRows, int verifyRows)
         {
             _fvAcceptedPrefixCommitted = false;
+            if (TryCommitMlxVerifyRow(acceptedRows))
+            {
+                _fvAcceptedPrefixCommitted = true;
+                return;
+            }
             if (_fvSnapshotRows <= 0)
                 return;                       // the old path already drained the state
 
@@ -791,6 +854,9 @@ namespace TensorSharp.Models
             if (_fvSnapshotIsDeviceLive)
                 return;
 
+            if (TrySnapshotMlxRecurrentState())
+                return;
+
             // Direct-CUDA fast path: snapshot the GDN state device-to-device
             // (async cuMemcpyDtoD on the stream) instead of draining it to host
             // bytes. The host path does an EnsureHostReadable DtoH per recurrent
@@ -820,6 +886,8 @@ namespace TensorSharp.Models
         /// <summary>Restore the GDN recurrent state captured by <see cref="SpecSnapshotRecurrentState"/>.</summary>
         public void SpecRestoreRecurrentState()
         {
+            if (TryRestoreMlxRecurrentState())
+                return;
             if (_fvSnapshotIsDeviceLive)
             {
                 // The pre-verify state is in the live device slices; the host mirrors
@@ -964,5 +1032,76 @@ namespace TensorSharp.Models
             => IsGgmlBackend && !IsTensorParallel && !HasDFlash && !_fdUnsupported;
 
         public bool SpecPlainStepCostsFamilySwitch => true;
+
+        // ------------------------------------------------------------------------------------
+        // MLX: the verify keeps the recurrent state after every row (GatedDeltaNetCache.
+        // KeepRowStates), so a partial acceptance commits the accepted row's state on the device
+        // instead of restoring the pre-verify state and forwarding the accepted prefix again (on
+        // Qwen3.8-27B that re-forward averaged 135 ms per rejection, 22% of a code reply). The
+        // pre-verify snapshot is a reference to the immutable MLX state arrays (no copy); it
+        // backs the restore path when a verify kept no rows (e.g. the unpacked GDN route).
+        // ------------------------------------------------------------------------------------
+        private MlxFusedOps.GatedDeltaNetCache[] _mlxSpecSnapshot;
+        private bool _mlxVerifyRowStates;
+
+        private bool TrySnapshotMlxRecurrentState()
+        {
+            if (_backend != BackendType.Mlx || _mlxGdnCache == null)
+                return false;
+            _mlxSpecSnapshot ??= new MlxFusedOps.GatedDeltaNetCache[Config.NumLayers];
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                _mlxSpecSnapshot[l]?.Dispose();
+                _mlxSpecSnapshot[l] = _isRecurrent[l] && _mlxGdnCache[l] != null ? _mlxGdnCache[l].CloneState() : null;
+            }
+            _mlxVerifyRowStates = true;
+            return true;
+        }
+
+        private bool TryRestoreMlxRecurrentState()
+        {
+            if (_backend != BackendType.Mlx || _mlxSpecSnapshot == null || _mlxGdnCache == null)
+                return false;
+            _mlxVerifyRowStates = false;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_mlxSpecSnapshot[l] == null || _mlxGdnCache[l] == null)
+                    continue;
+                _mlxGdnCache[l].RestoreFrom(_mlxSpecSnapshot[l]);
+            }
+            return true;
+        }
+
+        /// <summary>Whether the MLX verify that just ran should keep per-row states (consumed by the
+        /// next multi-row GDN run after a snapshot).</summary>
+        private bool MlxKeepVerifyRowStates(int seqLen) => _mlxVerifyRowStates && seqLen > 1;
+
+        private bool TryCommitMlxVerifyRow(int acceptedRows)
+        {
+            if (_backend != BackendType.Mlx || !_mlxVerifyRowStates || _mlxGdnCache == null)
+                return false;
+            _mlxVerifyRowStates = false;
+            int rows = -1;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!_isRecurrent[l] || _mlxGdnCache[l] == null)
+                    continue;
+                int kept = _mlxGdnCache[l].RowStates;
+                if (rows < 0) rows = kept;
+                if (kept == 0 || kept != rows)
+                    rows = 0;
+            }
+            bool ok = rows > 0 && acceptedRows >= 0 && acceptedRows < rows;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!_isRecurrent[l] || _mlxGdnCache[l] == null)
+                    continue;
+                if (ok)
+                    _mlxGdnCache[l].CommitRow(acceptedRows);
+                else
+                    _mlxGdnCache[l].ClearRows();
+            }
+            return ok;
+        }
     }
 }

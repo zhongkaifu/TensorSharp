@@ -22,7 +22,7 @@ using TensorSharp.Runtime.Speculative;
 
 namespace InferenceWeb.Tests;
 
-public class SpeculativeExecutionTests
+public partial class SpeculativeExecutionTests
 {
     private const int VocabSize = 64;
     private const int HiddenSize = 4;
@@ -617,6 +617,21 @@ public class SpeculativeExecutionTests
         Assert.Empty(model.ProtocolViolations);
     }
 
+    [Theory]
+    [InlineData(float.NaN, null, BlockDraftSpeculator.DefaultGate)]  // no trunk preference: algorithm default
+    [InlineData(0f, null, 0f)]                                       // trunk preference replaces the default
+    [InlineData(0f, 0.5f, 0.5f)]                                     // explicit --spec-pmin always wins
+    public void BlockGate_TrunkPreferenceReplacesOnlyTheDefault(float preferred, float? explicitGate, float expected)
+    {
+        var model = new FakeSpeculativeModel { BlockDraftSize = 8, PreferredBlockGate = preferred };
+        var speculator = SpeculatorRegistry.Create(model,
+            new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.Block, MinDraftProb = explicitGate },
+            out string decline);
+        Assert.Null(decline);
+        Assert.IsType<BlockDraftSpeculator>(speculator);
+        Assert.Equal(expected, speculator.MinDraftProb);
+    }
+
     [Fact]
     public void SeedCommitted_WithAResumableLearnedHead_RunsOnePlainStepThenDrafts()
     {
@@ -831,7 +846,7 @@ public class SpeculativeExecutionTests
 
     private static SequenceState RunEngineRequest(FakeSpeculativeModel model, int promptLen, int maxNewTokens,
         bool specEnabled, bool enablePrefixCaching = false, int soloPrefillChunk = 0, string speculator = null,
-        Action beforeDispose = null, IRequestAdapter adapter = null)
+        Action beforeDispose = null, IRequestAdapter adapter = null, SamplingConfig sampling = null)
     {
         var cfg = new SchedulerConfig
         {
@@ -863,7 +878,7 @@ public class SpeculativeExecutionTests
             FrequencyPenalty = 0f,
         };
         var seq = new SequenceState("mtp-req", Enumerable.Range(1, promptLen).ToList(),
-            maxNewTokens, BlockSize, greedy, adapter: adapter);
+            maxNewTokens, BlockSize, sampling ?? greedy, adapter: adapter);
         var handle = engine.SubmitRequest(seq);
         var completion = handle.Completion.GetAwaiter().GetResult();
         Assert.True(completion.PrefillElapsedTicks > 0, "The engine must time all prompt chunks even when speculation is armed.");
@@ -1260,6 +1275,8 @@ public class SpeculativeExecutionTests
         // DraftBlock, and BlockConfidences is what the confidence head
         // reports for each block position.
         public int BlockDraftSize { get; set; }
+        public float PreferredBlockGate { get; set; } = float.NaN;
+        public float SpecPreferredBlockGate => PreferredBlockGate;
         public float[] BlockConfidences { get; set; }
         public int BlockDraftCalls { get; private set; }
         public bool PrefillSelfCatchUp { get; set; }
@@ -1271,6 +1288,10 @@ public class SpeculativeExecutionTests
         public int EosTokenId { get; set; } = -1;
 
         public int LinearSpecForwardCalls { get; private set; }
+        public bool EnableGreedyVerify { get; set; }
+        public bool ThrowGreedyVerify { get; set; }
+        public int GreedyVerifyCalls { get; private set; }
+        public int FullVerifyCalls { get; private set; }
 
         public FakeSpeculativeModel()
         {
@@ -1290,7 +1311,8 @@ public class SpeculativeExecutionTests
             BlockDraftCalls = 0;
         }
 
-        public int ExpectedNext(int position) => ((position * 13) + 7) % VocabSize;
+        public int ConstantNextToken { get; set; } = -1;
+        public int ExpectedNext(int position) => ConstantNextToken >= 0 ? ConstantNextToken : ((position * 13) + 7) % VocabSize;
 
         /// <summary>Tokens the trunk has actually committed to its KV cache.</summary>
         public IReadOnlyList<int> Trunk => _trunk;
@@ -1363,14 +1385,36 @@ public class SpeculativeExecutionTests
         // Mirrors a backend that lacks the accelerated MTP kernels (e.g. the
         // pure-C# CUDA backend for Gemma 4): the engine must NOT engage spec.
         public bool SpeculationProfitable { get; set; } = true;
+        private bool _prefersFixedCostGovernor;
+        public int FixedGovernorHintReads { get; private set; }
+        public bool SpecPrefersFixedCostGovernor
+        {
+            get { FixedGovernorHintReads++; return _prefersFixedCostGovernor; }
+            set => _prefersFixedCostGovernor = value;
+        }
+        public int SpecMaxDraftTokens { get; set; } = int.MaxValue;
         public int CacheSeqLen => _trunk.Count;
-        public int MaxContextLength => 4096;
+        public int ContextLimit { get; set; } = 4096;
+        public int MaxContextLength => ContextLimit;
 
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
             LinearSpecForwardCalls++;
+            if (allLogitsRows && tokens.Length > 1) FullVerifyCalls++;
             (Injector as FakeInjector)?.ConsumeSlice(_trunk.Count, tokens.Length);
             ForwardCore(tokens, hAllOut, logitsOut, allLogitsRows);
+        }
+
+        public bool TrySpecForwardGreedyVerify(int[] tokens, float[] hAllOut, int[] drawnOut)
+        {
+            if (!EnableGreedyVerify) return false;
+            GreedyVerifyCalls++;
+            if (ThrowGreedyVerify) throw new InvalidOperationException("injected verify failure");
+            var logits = new float[tokens.Length * VocabSize];
+            ForwardCore(tokens, hAllOut, logits, true);
+            for (int row = 0; row < tokens.Length; row++)
+                drawnOut[row] = Argmax(logits.AsSpan(row * VocabSize, VocabSize).ToArray());
+            return true;
         }
 
         private void ForwardCore(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)

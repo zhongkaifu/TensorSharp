@@ -71,6 +71,7 @@ namespace TensorSharp.Runtime.Speculative
         private readonly float[]? _catchUpH;      // [(K+1) * hidden]
         private readonly float[] _stepLogits;    // [vocab] for plain/re-advance steps
         private readonly float[] _rowLogits;     // [vocab] scratch row handed to drawNext
+        private readonly int[] _verifyDrawn;     // optional plain-greedy verify, one first-max id per row
         private readonly int[] _oneToken = new int[1];
 
         /// <summary>Logits handed back for a plain step; see the allocation note at
@@ -137,7 +138,9 @@ namespace TensorSharp.Runtime.Speculative
             // backend) carries from one request to the next, so a chat's short turns
             // do not each pay a fresh probe round to rediscover that drafting loses
             // on prose (it re-probes with backoff either way).
-            Governor = governor ?? new SpeculationCostGovernor();
+            // This constructor has no sampler context; its fallback cannot opt
+            // into the measured greedy-only default. HTTP supplies that profile.
+            Governor = governor ?? SpeculationGovernorFactory.CreateFor(model, speculator);
             Governor.NewSequence();   // a shared governor: this request starts fresh enough to re-probe
             _governorWinsAtStart = Governor.Wins;
             _governorLossesAtStart = Governor.Losses;
@@ -151,6 +154,7 @@ namespace TensorSharp.Runtime.Speculative
             _verifyLogits = new float[(k + 1) * (long)_vocab];
             _stepLogits = new float[_vocab];
             _rowLogits = new float[_vocab];
+            _verifyDrawn = new int[k + 1];
             if (speculator.NeedsHiddenState)
             {
                 _pendingH = new float[_hidden];
@@ -328,6 +332,10 @@ namespace TensorSharp.Runtime.Speculative
         /// in place given the drafts pending in this window;
         /// <paramref name="history"/> (optional) is the caller's emitted-token
         /// history, for algorithms that mine it.
+        /// <paramref name="drawGreedy"/> explicitly authorizes token-only verify
+        /// for a plain greedy sampler: it receives raw first-max ids and must apply
+        /// the same forced-token and stop checks as drawNext. A successful token-only
+        /// verify returns null NextLogits; the drawn NextToken must be retained.
         /// The trunk advances to <c>position + AcceptedCount + 1</c>.
         /// </summary>
         public SpeculativeStepOutcome DecodeStep(
@@ -337,7 +345,8 @@ namespace TensorSharp.Runtime.Speculative
             Func<float[], int> drawNext,
             Action<float[], IReadOnlyList<int>>? adjustDraftLogits = null,
             Action<int>? onDraftAccepted = null,
-            IReadOnlyList<int>? history = null)
+            IReadOnlyList<int>? history = null,
+            Func<int, int>? drawGreedy = null)
         {
             ArgumentNullException.ThrowIfNull(drawNext);
 
@@ -489,15 +498,26 @@ namespace TensorSharp.Runtime.Speculative
             _trunk.SnapshotRecurrentState();
             long tVerify0 = Stopwatch.GetTimestamp();
             Stats.SnapshotTicks += tVerify0 - tSnap0;
-            _trunk.Forward(batch, _verifyH, _verifyLogits, allLogitsRows: true);
+            // Supplying drawGreedy is an explicit promise that each row reduces to
+            // raw argmax after the caller's forced-token/stop checks. Legacy callers
+            // always receive full logits, including when a target declines the hook.
+            bool greedyVerify = drawGreedy != null && _trunk.TryForwardGreedyVerify(batch, _verifyH, _verifyDrawn);
+            if (!greedyVerify)
+                _trunk.Forward(batch, _verifyH, _verifyLogits, allLogitsRows: true);
             Stats.VerifyTicks += Stopwatch.GetTimestamp() - tVerify0;
 
             int m = 0;
             int nextToken;
             while (true)
             {
-                Array.Copy(_verifyLogits, (long)m * _vocab, _rowLogits, 0, _vocab);
-                int drawn = drawNext(_rowLogits);
+                int drawn;
+                if (greedyVerify)
+                    drawn = drawGreedy!(_verifyDrawn[m]);
+                else
+                {
+                    Array.Copy(_verifyLogits, (long)m * _vocab, _rowLogits, 0, _vocab);
+                    drawn = drawNext(_rowLogits);
+                }
                 if (m < k && drawn == _draftTokens[m])
                 {
                     onDraftAccepted?.Invoke(drawn);
@@ -557,8 +577,12 @@ namespace TensorSharp.Runtime.Speculative
             if (NeedsHidden)
                 Array.Copy(_verifyH, (long)m * _hidden, _pendingH, 0, _hidden);
 
-            float[] nextLogits = new float[_vocab];
-            Array.Copy(_verifyLogits, (long)m * _vocab, nextLogits, 0, _vocab);
+            float[]? nextLogits = null;
+            if (!greedyVerify)
+            {
+                nextLogits = new float[_vocab];
+                Array.Copy(_verifyLogits, (long)m * _vocab, nextLogits, 0, _vocab);
+            }
             // m accepted drafts plus the corrected/bonus token.
             RecordStep(speculated: true, tokensEmitted: m + 1, tStep0);
             return new SpeculativeStepOutcome

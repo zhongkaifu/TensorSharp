@@ -11,10 +11,10 @@ namespace TensorSharp.Models
 {
     /// <summary>
     /// Qwen3.5 / Qwen3.8 dense on the direct-CUDA engine (<see cref="Q35CudaEngine"/>): reads the
-    /// GGUF's hyper-parameters and hands the engine its weights as shard offsets its loader streams
-    /// into VRAM (NVFP4 projections repacked on the way).
+    /// GGUF's hyper-parameters or the validated NInfer recipe and hands the engine bounded weight
+    /// sources its loader streams into VRAM (NVFP4 byte planes repacked without requantization).
     /// </summary>
-    public sealed class Qwen35CudaExecutor : IDisposable
+    public sealed partial class Qwen35CudaExecutor : IDisposable
     {
         private const string Tag = "q35-cuda";
         private const string A = "qwen35";
@@ -29,7 +29,7 @@ namespace TensorSharp.Models
         private readonly System.Collections.Generic.List<Q35CudaEngine.Slot> _slots = new();
         /// <summary>Device memory a slot allocation must leave free (scratch growth, the drafter's
         /// per-step buffers, the CUDA context).</summary>
-        private const long SlotReserveBytes = 1L << 30;
+        internal const long SlotReserveBytes = 1L << 30;
 
         public int ActiveSlot { get; private set; }
         public int NPast => _engine.Active.NPast;
@@ -40,6 +40,14 @@ namespace TensorSharp.Models
         public Qwen35CudaExecutor(string ggufPath, int maxContext, int nUbatch, string draftGgufPath = null)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
+            if (NinferQwen38ModelSource.IsNinferArtifact(ggufPath))
+            {
+                NinferQwen38ModelSource.ValidateExecutionRoute(TensorSharp.Runtime.BackendType.Cuda, 1, null, 1, draftGgufPath);
+                using var source = NinferQwen38ModelSource.Open(ggufPath);
+                InitializeNinfer(source, maxContext, nUbatch);
+                Console.Error.WriteLine($"[{Tag}] NInfer target ready in {sw.Elapsed.TotalSeconds:F1}s");
+                return;
+            }
             _gguf = new GgufShardSet(ggufPath, Tag);
             try
             {
@@ -66,11 +74,19 @@ namespace TensorSharp.Models
 
         // ---- sequence slots ----
 
-        /// <summary>A new empty slot, or -1 when the device has no room for one.</summary>
-        public int SlotAlloc()
+        /// <summary>Device memory a checkpoint's slot must leave free: the engine's own growth reserve.
+        /// A checkpoint only copies recurrent states (its attention blocks are shared), and memory
+        /// pressure moves it to host memory or drops it, so it need not keep a running request's headroom.</summary>
+        internal const long CheckpointReserveBytes = 512L << 20;
+
+        /// <summary>A new empty slot, or -1 when the device has no room for one beside
+        /// <paramref name="reserveBytes"/> (default <see cref="SlotReserveBytes"/>). Prompt-attention
+        /// scratch is released first when it stands in the way.</summary>
+        public int SlotAlloc(long reserveBytes = SlotReserveBytes)
         {
             // No attention blocks yet: a prefill adds them as it goes, a checkpoint shares its source's.
-            if (_engine.FreeDeviceBytes() < _engine.SlotBytes(0) + SlotReserveBytes)
+            long need = _engine.SlotBytes(0) + reserveBytes;
+            if (_engine.FreeDeviceBytes() < need && !(_engine.ReleaseTransientScratch() && _engine.FreeDeviceBytes() >= need))
                 return -1;
             Q35CudaEngine.Slot s;
             try

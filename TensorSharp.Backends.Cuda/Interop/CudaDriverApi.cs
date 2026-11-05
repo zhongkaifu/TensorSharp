@@ -64,6 +64,12 @@ namespace TensorSharp.Cuda.Interop
         [LibraryImport(LibName, EntryPoint = "cuMemFreeHost")]
         public static partial int cuMemFreeHost(IntPtr hostPtr);
 
+        /// <summary>cuMemHostAlloc flags: PORTABLE (all contexts) and DEVICEMAP (kernels address it).</summary>
+        public const uint CU_MEMHOSTALLOC_PORTABLE = 0x01, CU_MEMHOSTALLOC_DEVICEMAP = 0x02;
+
+        [LibraryImport(LibName, EntryPoint = "cuMemHostGetDevicePointer_v2")]
+        public static partial int cuMemHostGetDevicePointer(out IntPtr devicePtr, IntPtr hostPtr, uint flags);
+
         [LibraryImport(LibName, EntryPoint = "cuMemcpyHtoD_v2")]
         public static partial int cuMemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, UIntPtr byteCount);
 
@@ -159,6 +165,13 @@ namespace TensorSharp.Cuda.Interop
             IntPtr stream,
             IntPtr kernelParams,
             IntPtr extra);
+
+        /// <summary>Encodes a TMA tensor map (CUtensorMap, 128 bytes, 64-byte aligned) for a tiled
+        /// bulk copy. Data type 0 is UINT8; swizzle 0 none, 2 64-byte; the rest are passed as 0.</summary>
+        [LibraryImport(LibName)]
+        public static unsafe partial int cuTensorMapEncodeTiled(void* tensorMap, int dataType, uint rank,
+            IntPtr globalAddress, ulong* globalDim, ulong* globalStrides, uint* boxDim, uint* elementStrides,
+            int interleave, int swizzle, int l2Promotion, int oobFill);
 
         [LibraryImport(LibName)]
         public static partial int cuStreamCreate(out IntPtr stream, uint flags);

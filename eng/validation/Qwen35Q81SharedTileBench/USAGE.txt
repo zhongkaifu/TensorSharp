@@ -1,0 +1,56 @@
+Qwen35 Q81 shared activation-tile microprototype (one exact N8/R4/block128 arm)
+
+Purpose: test reuse of the same Q81 bytes/scales across four weight-row warps.
+This is TensorSharp-owned code. No production source/native or ggml changes.
+The original template/quantizer/oracle prefix is SHA-pinned. Five declared
+kernel source deltas are reversible; the four dp4a operations, UE/E2 decoding,
+F32 expression/association, each lane's ascending b/s/n/j order, warp_sum,
+weight layout and alpha store remain unchanged. This is a source contract;
+only actual GPU full-bit gates can establish device equivalence.
+
+Candidate shared layout: int4[8][160] (64-byte block + 16-byte padding) and
+float[8][2][32], exactly 22,528 bytes. Four warps load one activation block
+cooperatively. Inactive row warps still cross both CTA barriers. Invalid K
+blocks are zero-filled and not consumed. Only K positive/multiple64, N8,
+R4/block128 are eligible. No forced register limit, new math/fast-math flags,
+cp.async, split-K, activation precision change or weight requantization.
+
+python3 eng/validation/Qwen35Q81SharedTileBench/build.py --out artifacts/q81-shared-build --generate-only
+python3 eng/validation/Qwen35Q81SharedTileBench/run.py --build artifacts/q81-shared-build --name plan --bench
+
+ROOT-exclusive GPU window ONLY (not run by the author):
+python3 eng/validation/Qwen35Q81SharedTileBench/build.py --out artifacts/q81-shared-gpu --timeout 600
+python3 eng/validation/Qwen35Q81SharedTileBench/run.py --build artifacts/q81-shared-gpu --name strict --execute --timeout 600
+python3 eng/validation/Qwen35Q81SharedTileBench/run.py --build artifacts/q81-shared-gpu --name warm --execute --bench --rounds 10 --iterations 3 --timeout 600
+python3 eng/validation/Qwen35Q81SharedTileBench/run.py --build artifacts/q81-shared-gpu --name sweep --execute --bench --cache-sweep --rounds 10 --iterations 1 --timeout 600
+
+A real offline permit is issued only after successful cubin/PTX/runner builds,
+actual compiler metadata (natural registers1..255, no stack/spill, oracle and
+quantizer staticshared0, candidate staticshared22528) and source recheck.
+Each GPU run checks actual driver local memory0 and activeCTA>=1 at actual
+block size; no target occupancy is assumed. A compiler/resource rejection
+remains a rejection; no automatic pruning, retry or old-FAIL reinterpretation.
+
+The runner uses frozen96 strict synthetic fixtures, complete output bits,
+actual host argmax, A/A and input/output canaries. Every bench invocation
+first repeats all96 strict checks. Six timed plane roles are five unique
+(K,outDim) geometries: GDN-in(5120,16480), attention-in(5120,14336), GDN-out
+and attention-out(6144,5120), GateUp(5120,34816), Down(17408,5120).
+Each role rechecks complete original Q81 quantizer bytes/scales with two
+poisons/A-A, then complete quantizer+GEMV fullbits before60 ABBA events
+(10 rounds x6 roles), checking every half in full. GPU event intervals
+include quantization+projection; reset/readback/control sweep are outside.
+Warm repeats3 complete projections/sample. Sweep forces1 projection/sample
+and uses >=2x actual driver L2, asm volatile ld.global.cg full read/checksum
+and synchronization before each of240 halves. This is ALL-DATA eviction
+control, not weights-only or a guarantee of physically cold caches.
+
+Default run is PLAN only, no GPU initialization. Offline compile also never
+initializes CUDA. Author CPU/source tests are not NVCC/GPU/model validation.
+The oracle is freshly recompiled original source, NOT the production BBD
+binary. Tools do not acquire a GPU lease: the executing ROOT coordinator
+must verify its active exclusive undelegated lease, benchmark lease inactive,
+GPU UUID/idle and global /root/ts-eval-gpu.lock before any --execute; retain
+source/runtime/provider/upstream pre/post inventory. No production integration
+until strict gates and meaningful full-pipeline warm+eviction gains plus
+separate model/quality gates; failure/timing noise does not justify retuning.

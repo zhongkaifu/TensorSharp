@@ -1,0 +1,77 @@
+Independent owned W4A16 weight-major MMA prototype (no production integration).
+Default build.py only generates source. run.py is PLAN unless --execute.
+All commands use a fresh absolute ignored OUT in this isolated checkout.
+
+ python3 eng/validation/Qwen35W4A16WeightMajorBench/test_build.py
+ python3 eng/validation/Qwen35W4A16WeightMajorBench/build.py --out "$ROOT/artifacts/wm-float" --compile --nvcc /usr/local/cuda/bin/nvcc --arch sm_120a
+ python3 eng/validation/Qwen35W4A16WeightMajorBench/run.py --build "$ROOT/artifacts/wm-float" --name strict --execute
+ python3 eng/validation/Qwen35W4A16WeightMajorBench/run.py --build "$ROOT/artifacts/wm-float" --name warm --bench --execute
+ python3 eng/validation/Qwen35W4A16WeightMajorBench/run.py --build "$ROOT/artifacts/wm-float" --name sweep --bench --cache-sweep --execute
+Optional independent exact-decoder ablation: use a NEW build OUT and add
+--integer-decode to build.py; then repeat strict/warm/sweep in that build.
+Never reinterpret a generated-only marker or CPU result as a device PASS.
+
+New geometry (independently derived, no upstream implementation copied):
+ The old owned prototype used A=16 padded tokens, B=8 weight rows, with two
+ weight-row tiles per warp. For N8 half the token outputs were unused.
+ New A=16 weight rows, B=8 tokens; each warp owns16 rows, four warps64 rows.
+ N8 issues8 MMA instructions per128K stage (4 chunks x2 K16), versus16 old.
+ N16 uses two8-token blocks and16 MMAs; N1/2/4 mask output tails normally.
+ This is source instruction geometry, not a measured SASS throughput/speedup.
+
+ CUDA13.2 PTX mma.m16n8k16.row.col.bf16 uses four A packed-pair registers:
+ row g,g+8,g,g+8 and K pairs2q,2q,2q+8,2q+8 (g=lane/4,q=lane%4).
+ B has two packed pairs at K2q and2q+8, token g. C rows g/g+8 map to
+ token2q/2q+1. TS's physical nibble order is unchanged: a local K index
+ l=16s+8h+2q+j reads logical p=16(q>>1)+4(q&1)+2s+h+8j.
+ New raw weight rows g andg+8 construct A directly in registers; activations
+ are read as B pairs from the same permuted BF16 shared tile. It keeps all
+ raw-W4 four-stage cp.async buffers,128threads,39936B dynamic shared, actual-SM
+ split partition, fixed-order combine and alpha handling from the old tool.
+
+Numerical contract/gates retained:
+ F32 activations are rounded once to BF16 RNE; GGUF NVFP4 codes/UE4M3 bytes
+ remain unchanged and decoded weights are exact in BF16. UE sign is ignored,
+ 0x7f/0xff scales become zero, old halfscale and doubled code cancel.
+ The default decoder retains old BF16 pair multiplication. Optional integer
+ decoder constructs EXACT same BF16 bits; the actual helper is CPU-compiled
+ and tested exhaustively on4096 code/scale combinations including signedzero.
+ Negative nonzero E2M1 times zero UE must remain -0; encoded E2M1 zero is
+ canonical+0. P0 cannot unconditionally become+0 for a bit-exact ablation.
+
+ Independent FP64 oracle directly reads logical K, its own literal E2 table,
+ full scale formula and integer BF16 input rounding. It shares no candidate
+ permutation/decode/pack helper. Full outputs are saved. Original criterion:
+ every |error| <= gamma*sumAbsProducts+2^-140 with
+ t=(2K+2splits+8)*2^-24,gamma=t/(1-t), AND relativeL2<=2e-5.
+ No threshold is relaxed. A/A/doublepoison/allguards/fullpack and explicit
+ wrongpermutation/1.01scale mutations remain mandatory.
+ Original67 fixtures remain in original order, then11 N1-only cases are added
+ (78total). Only the same12 original N8 shapes are timed in5 ABBA rounds for
+ each of matrix_kernel_only and full_pack_kernel_combine (120cells).
+ Each half's complete output is bit-compared to its own prior output.
+ This is NOT bit-equivalence to oldQ81 activation/reduction and not modelquality.
+
+ --cache-sweep retains the cg-r3 control: >=2actualdriverL2 buffer, explicit
+ asm volatile ld.global.cg.u32+memoryclobber fullread, perworkerchecksums and
+ synchronization BEFORE every event. iterations1 mandatory; warmdefault3.
+ 480sweep events for12x2scopesx5roundsx4halves. It evicts inputs too and is NOT
+ guaranteed physicalcold. Fullpack+kernel+combine is the primary projection
+ scope; matrix-only after sweep is a separate diagnostic with preparedinputs
+ also evicted. No norm, network, KV, head or recurrentstate timing is included.
+
+ Actual natural registers/stack/spill and driver occupancy are recorded. Only
+ actual launchability at128threads/39936B with>=1CTA is required; no arbitrary
+ maxregister or2CTA policy. No performance/quality claim from resource figures.
+ OriginalA8 prefix is recompiled under same numericflags, not loadedBBD.
+ New schema/weightmajor-bench identify this candidate; old W4 slow results and
+ frozen seven files/readiness are left untouched. GPU/wholemodel NOT_RUN here.
+
+Official references/inspiration:
+ https://docs.nvidia.com/cuda/archive/13.2.0/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-16816-float
+ https://github.com/Oceania2018/velox-inferer/blob/b67f7d4565f5335988c91869cf0590b1e05998cd/crates/velox-variant/kernels/rtx5090_skinny16.cu
+ The pinned Velox tree has no LICENSE/COPYING entry. Only public algorithm ideas
+ are used; no implementation is copied and no license grant is asserted.
+ This tool does not patch ggml or any production kernel/managed source.
+ Future model adoption requires a versioned activationpolicy/cache namespace,
+ N1 consistency, and actual original E2E quality checks with no per-item decline.

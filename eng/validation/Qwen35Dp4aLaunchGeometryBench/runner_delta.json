@@ -1,0 +1,57 @@
+{
+  "old_source_sha256": "ee761f4273e86211836ee047729b2a7ea273d18ebe44585b1be319e4fc5069c2",
+  "deltas": [
+    {
+      "before": "// Standalone DP4a R4 register/cache scheduling driver runner.",
+      "after": "// Standalone N8 DP4a R1/R2/R4 block64/256 launch-only runner."
+    },
+    {
+      "before": "#include \"plan.h\"",
+      "after": "#include \"plan.h\"\n#include \"timed.h\""
+    },
+    {
+      "before": "static fs::path Output;",
+      "after": "static fs::path Output;\nstatic const char* TimingPlane=\"NOT_TIMING\";"
+    },
+    {
+      "before": "    Variant oracle{4,128,\"ts_q35_gemv_nvfp4_8\"};",
+      "after": "    Variant oracle{4,128,\"ts_q35_gemv_nvfp4_8\"};\n    CUfunction quantizer=nullptr;"
+    },
+    {
+      "before": "        Inspect(oracle);for(auto& v:candidates)Inspect(v);",
+      "after": "        Inspect(oracle);for(auto& v:candidates)Inspect(v);\n        Cu(cuModuleGetFunction(&quantizer,module,\"ts_q35_quantize_q81_f32\"));\n        int qr=0,ql=0,qs=0,qt=0,qa=0;\n        Cu(cuFuncGetAttribute(&qr,CU_FUNC_ATTRIBUTE_NUM_REGS,quantizer));\n        Cu(cuFuncGetAttribute(&ql,CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,quantizer));\n        Cu(cuFuncGetAttribute(&qs,CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,quantizer));\n        Cu(cuFuncGetAttribute(&qt,CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,quantizer));\n        Cu(cuOccupancyMaxActiveBlocksPerMultiprocessor(&qa,quantizer,256,0));\n        std::printf(\"{\\\"event\\\":\\\"quantizer_resources\\\",\\\"symbol\\\":\\\"ts_q35_quantize_q81_f32\\\",\\\"registers\\\":%d,\\\"local_bytes\\\":%d,\\\"static_shared_bytes\\\":%d,\\\"max_block_threads\\\":%d,\\\"active_ctas\\\":%d,\\\"block_threads\\\":256}\\n\",qr,ql,qs,qt,qa);\n        if(qr<=0||qr>255||ql||qs||qt<256||qa<1)throw std::runtime_error(\"original quantizer launch/resource gate rejected\");"
+    },
+    {
+      "before": "    Shape shape;size_t count;Buffer codes,scales,xq,xd,out;",
+      "after": "    Shape shape;size_t count;Buffer codes,scales,xq,xd,out;\n    Module* owner=nullptr;std::unique_ptr<Buffer> input;\n    std::vector<uint8_t> expectedQ;std::vector<uint32_t> expectedD;\n    void Quantize() {\n        if(!input||!owner)throw std::runtime_error(\"pipeline not configured\");\n        void* x=input->Data();void* q=xq.Data();void* d=xd.Data();int k=shape.k,n=8;\n        void* args[]={&x,&q,&d,&k,&n};\n        Cu(cuLaunchKernel(owner->quantizer,(8*k+255)/256,1,1,256,1,1,0,nullptr,args,nullptr));\n    }\n    void EnablePipeline(Module& module) {\n        owner=&module;input=std::make_unique<Buffer>(size_t(8)*shape.k*4);\n        std::vector<float> values(size_t(8)*shape.k);\n        for(size_t i=0;i<values.size();i++){uint32_t h=Hash(0x19642026ull+uint64_t(shape.k)*31+i);values[i]=Float(((121u+h%7)<<23)|(h&0x807fffffu));}\n        input->Upload(values.data());expectedQ.resize(xq.bytes);expectedD.resize(xd.bytes/4);\n        for(int pass=0;pass<2;pass++) {\n            Rt(cudaMemset(xq.Data(),pass?0x5a:0xa5,xq.bytes));Rt(cudaMemset(xd.Data(),pass?0x5a:0xa5,xd.bytes));Quantize();Rt(cudaDeviceSynchronize());\n            std::vector<uint8_t> q(xq.bytes);std::vector<uint32_t>d(xd.bytes/4);\n            Rt(cudaMemcpy(q.data(),xq.Data(),xq.bytes,cudaMemcpyDeviceToHost));Rt(cudaMemcpy(d.data(),xd.Data(),xd.bytes,cudaMemcpyDeviceToHost));\n            if(pass==0){expectedQ=q;expectedD=d;}else if(q!=expectedQ||d!=expectedD)throw std::runtime_error(\"original Q81 dual-poison A/A mismatch\");\n            input->CheckGuard();xq.CheckGuard();xd.CheckGuard();\n        }\n    }"
+    },
+    {
+      "before": "    void Reset() {std::vector<uint32_t> v(count+2*Guard,Canary);Rt(cudaMemcpy(out.base,v.data(),v.size()*4,cudaMemcpyHostToDevice));}",
+      "after": "    void Reset() {std::vector<uint32_t> v(count+2*Guard,Canary);Rt(cudaMemcpy(out.base,v.data(),v.size()*4,cudaMemcpyHostToDevice));if(input){Rt(cudaMemset(xq.Data(),0xa5,xq.bytes));Rt(cudaMemset(xd.Data(),0xa5,xd.bytes));}}"
+    },
+    {
+      "before": "    void Issue(const Variant& variant) {",
+      "after": "    void Issue(const Variant& variant) {\n        if(input)Quantize(); // Full original quantizer+GEMV pipeline inside each event iteration."
+    },
+    {
+      "before": "        codes.CheckGuard();scales.CheckGuard();xq.CheckGuard();xd.CheckGuard();",
+      "after": "        codes.CheckGuard();scales.CheckGuard();xq.CheckGuard();xd.CheckGuard();\n        if(input){\n            input->CheckGuard();std::vector<uint8_t> q(xq.bytes);std::vector<uint32_t>d(xd.bytes/4);\n            Rt(cudaMemcpy(q.data(),xq.Data(),xq.bytes,cudaMemcpyDeviceToHost));Rt(cudaMemcpy(d.data(),xd.Data(),xd.bytes,cudaMemcpyDeviceToHost));\n            if(q!=expectedQ||d!=expectedD)throw std::runtime_error(\"full Q81 payload bits/scales differ after half\");\n        }"
+    },
+    {
+      "before": "    if(mode==\"--bench\")for(const Shape& s:StrictPlan)if(s.timed) {\n        Fixture f(s);auto oracle=Oracle(f,module);",
+      "after": "    if(mode==\"--bench\")for(const TimedRole& timedRole:TimedPlan) {\n        TimingPlane=timedRole.role;const Shape& s=timedRole.shape;Fixture f(s);f.EnablePipeline(module);auto oracle=Oracle(f,module);"
+    },
+    {
+      "before": "            StrictCandidate(f,v,oracle); // exact timed fixture re-gate",
+      "after": "            StrictCandidate(f,v,oracle); // Complete quantized pipeline fixture re-gate.\n            std::printf(\"{\\\"event\\\":\\\"pipeline_case_pass\\\",\\\"symbol\\\":%s,\\\"plane_role\\\":%s,\\\"shape\\\":%s,\\\"Q81_dual_poison_AA\\\":true,\\\"full_output_bits_AA_guards\\\":true}\\n\",Quote(v.symbol).c_str(),Quote(TimingPlane).c_str(),Quote(Name(s)).c_str());"
+    },
+    {
+      "before": "                std::printf(\"{\\\"event\\\":\\\"ABBA_gpu_ms\\\",\\\"symbol\\\":%s,\\\"rows_per_warp\\\":%d,\\\"block_threads\\\":%d,\\\"role\\\":%s,\\\"shape\\\":%s,\\\"k\\\":%d,\\\"out_dim\\\":%d,\\\"round\\\":%d,\\\"iterations_per_sample\\\":%d,\\\"fullbits_each_half\\\":true,\\\"A1_oracle_ms\\\":%.9g,\\\"B1_candidate_ms\\\":%.9g,\\\"B2_candidate_ms\\\":%.9g,\\\"A2_oracle_ms\\\":%.9g}\\n\",Quote(v.symbol).c_str(),v.rows,v.threads,Quote(std::string(v.symbol)==\"ts_bench_dp4a_r4_bounds3\"?\"bounds3_only\":std::string(v.symbol)==\"ts_bench_dp4a_r4_stream\"?\"weights_stream_only\":\"bounds3_and_weights_stream\").c_str(),Quote(Name(s)).c_str(),s.k,s.m,round,iterations,a,b,c,d);",
+      "after": "                std::printf(\"{\\\"event\\\":\\\"ABBA_gpu_ms\\\",\\\"symbol\\\":%s,\\\"rows_per_warp\\\":%d,\\\"block_threads\\\":%d,\\\"role\\\":%s,\\\"plane_role\\\":%s,\\\"scope\\\":\\\"complete_original_q81_quant_plus_gemv\\\",\\\"shape\\\":%s,\\\"k\\\":%d,\\\"out_dim\\\":%d,\\\"round\\\":%d,\\\"iterations_per_sample\\\":%d,\\\"fullbits_each_half\\\":true,\\\"A1_oracle_ms\\\":%.9g,\\\"B1_candidate_ms\\\":%.9g,\\\"B2_candidate_ms\\\":%.9g,\\\"A2_oracle_ms\\\":%.9g}\\n\",Quote(v.symbol).c_str(),v.rows,v.threads,Quote(\"rows_and_launch_only\").c_str(),Quote(TimingPlane).c_str(),Quote(Name(s)).c_str(),s.k,s.m,round,iterations,a,b,c,d);"
+    },
+    {
+      "before": "        <<\",\\\"cache_sweep\\\":",
+      "after": "        <<\",\\\"timed_unique_geometries\\\":5,\\\"scope\\\":\\\"complete_original_q81_quant_plus_gemv\\\",\\\"cache_sweep\\\":"
+    }
+  ]
+}

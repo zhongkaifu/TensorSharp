@@ -1,0 +1,17 @@
+{
+  "original_decoder_sha256": "4ba6f4bc8009ed763ba129b5c848b1dfdba885643a0fe6ce24e59f14dcd40568",
+  "candidate_decoder_sha256": "28d580e52bf3915e20f49bc7b882b5e9f341945b0ac3034a01dec12b3285ce3b",
+  "original_decoder": "__device__ __forceinline__ int2 ts_q35_e2m1x8(int q)\n{\n    const uint32_t t0 = 0x03020100u, t1 = 0x0C080604u, t2 = 0xFDFEFF00u, t3 = 0xF4F8FAFCu;\n    const uint32_t q4 = (uint32_t)q;\n    const uint32_t select = 0x32103210u | ((q4 & 0x88888888u) >> 1);\n    uint32_t tmp[2];\n#pragma unroll\n    for (int i = 0; i < 2; ++i)\n    {\n        const uint32_t shift = 16 * i;\n        const uint32_t lo = __byte_perm(t0, t1, q4 >> shift);\n        const uint32_t hi = __byte_perm(t2, t3, q4 >> shift);\n        tmp[i] = __byte_perm(lo, hi, select >> shift);\n    }\n    // tmp holds the values in nibble order (lo0, hi0, lo1, hi1, ...); split them.\n    return make_int2((int)__byte_perm(tmp[0], tmp[1], 0x6420), (int)__byte_perm(tmp[0], tmp[1], 0x7531));\n}\n\n",
+  "candidate_decoder": "__device__ __forceinline__ int2 ts_bench_e2m1x8_nibble(int q)\n{\n    const uint32_t t0 = 0x03020100u, t1 = 0x0C080604u, t2 = 0xFDFEFF00u, t3 = 0xF4F8FAFCu;\n    const uint32_t q4 = (uint32_t)q;\n    const uint32_t select = 0x32103210u | ((q4 & 0x88888888u) >> 1);\n    uint32_t tmp[2];\n#pragma unroll\n    for (int i = 0; i < 2; ++i)\n    {\n        const uint32_t shift = 16 * i;\n        const uint32_t lo = __byte_perm(t0, t1, q4 >> shift);\n        const uint32_t hi = __byte_perm(t2, t3, q4 >> shift);\n        tmp[i] = __byte_perm(lo, hi, select >> shift);\n    }\n    // Load-time permutation already groups the four LOW and four HIGH nibbles.\n    return make_int2((int)tmp[0], (int)tmp[1]);\n}\n\n",
+  "pack_kernel": "// PRIVATE_CODES_NIBBLE_PREPACK_BEGIN: load-once pure-byte permutation, never timed in inference.\nextern \"C\" __global__ void ts_bench_nvfp4_nibble_pack(const uint32_t* __restrict__ src,\n    uint32_t* __restrict__ dst, long long words)\n{\n    const long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;\n    if(i>=words)return;\n    const uint32_t q=src[i];\n    const uint32_t lo=(q&0xFu)|((q>>4)&0xF0u)|((q>>8)&0xF00u)|((q>>12)&0xF000u);\n    const uint32_t hi=((q>>4)&0xFu)|((q>>8)&0xF0u)|((q>>12)&0xF00u)|((q>>16)&0xF000u);\n    dst[i]=lo|(hi<<16);\n}\n// PRIVATE_CODES_NIBBLE_PREPACK_END\n",
+  "nibble_permutation": [
+    0,
+    2,
+    4,
+    6,
+    1,
+    3,
+    5,
+    7
+  ]
+}

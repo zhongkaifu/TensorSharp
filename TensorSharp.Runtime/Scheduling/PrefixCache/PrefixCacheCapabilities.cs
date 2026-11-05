@@ -61,6 +61,10 @@ public sealed record PrefixCacheCapabilities
     // caps (retained end states, public checkpoints) give way to the byte budgets unless the
     // operator sets them, since a count tuned for whole-cache copies evicts states that still fit.
     public bool CountCapsByBytes { get; init; }
+
+    // A clone of an end state or checkpoint shares the payload's K/V in the model (copy-on-write),
+    // so requests that clone the same payload share its blocks in the scheduler's pool too.
+    public bool ClonesShareKv { get; init; }
     public int MmReuseMinTokens { get; init; }                       // DEC-12
 
     // Persistence and threading

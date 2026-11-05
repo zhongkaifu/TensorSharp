@@ -1,0 +1,63 @@
+Standalone NVFP4 W4 / existing A8, N=8 exact-integer-MMA experiment
+
+No production dispatch or ggml source is modified. N=1..7 is NOT_SUPPORTED.
+Logical scale groups remain K=16; mma.sync m16n8k32 pads K=16..31 with zero.
+The oracle is the verbatim production source prefix containing the original
+ts_q35_gemv_nvfp4_8, compiled into the same standalone cubin as the candidate.
+The original production fatbin is not loaded or asserted equivalent to it.
+
+From the repository root, CPU-only tests and source generation:
+
+  python3 -m unittest discover -s eng/validation/Qwen35Int8MmaBench -p test_build.py -v
+  python3 eng/validation/Qwen35Int8MmaBench/build.py --out artifacts/qwen38-int8mma --generate-only
+
+One command for offline compilation plus resource/PTX/SASS evidence, without
+initializing CUDA or launching GPU work (requires CUDA 13.2+ nvcc):
+
+  python3 eng/validation/Qwen35Int8MmaBench/build.py --out artifacts/qwen38-int8mma --nvcc /usr/local/cuda/bin/nvcc --cuobjdump /usr/local/cuda/bin/cuobjdump --arch sm_120a
+
+For a harness separate from the production checkout, pass --source with the
+unchanged tensorsharp_q35_kernels.cu path. Output must remain under that harness
+checkout's ignored artifacts/ or docs/validation/. Keep the source file in place:
+the explicit GPU wrapper checks its full SHA as well as every prototype tool,
+compiled artifact, plan and permission manifest before launching its executable.
+
+The offline build fails closed if actual ptxas registers exceed 64/thread,
+stack/spill is nonzero, or the expected 16,508..16,512-byte shared layout differs.
+There is no maxrregcount, forced launch_bounds or resource-bypass flag. PTX/SASS
+are saved for inspecting the actual F32 contraction. Flags preserve subnormals
+and use the production-default FMA setting; matching C++ expressions alone do
+not prove compiled equivalence. Missing cuobjdump is explicitly recorded.
+NVCC_PREPEND_FLAGS and NVCC_APPEND_FLAGS must be unset; hidden precision or
+register constraints are rejected before compilation.
+
+Only during an explicitly authorized GPU window, full output-bit/guard/A-A gate:
+
+  python3 eng/validation/Qwen35Int8MmaBench/run.py --build artifacts/qwen38-int8mma --name strict-1
+
+Gate plus GPU-event ABBA microbenchmarks (entire strict plan runs first):
+
+  python3 eng/validation/Qwen35Int8MmaBench/run.py --build artifacts/qwen38-int8mma --name abba-1 --bench --rounds 5 --iterations 3
+
+Actual driver registers, local/shared size, max block threads and occupancy are
+checked first; a 1-row pilot then proves the 1,024-thread kernel actually launches.
+Any resource, launch, A-A, full-bit or guard failure rejects the run. All planned
+strict cases must pass before timing begins. No tolerance or skip flag exists.
+Failed bit comparisons save full reference/actual arrays and first mismatch.
+Success logs whole-array comparisons (every float including tails), not samples.
+
+The 96-case plan includes all 12 K={5120,6144,17408} x M={5120,14336,
+16480,34816} shapes, K blocks below/at/above 32, M<16 and ragged tails,
+all NVFP4 integer codes, signed activation extremes, UE4M3 boundary codes,
+positive/negative zero, normal/subnormal activation scales, alpha boundaries
+and cancellation/impulse patterns. All activation tensors contain exactly 8 rows.
+Synthetic scale and alpha boundaries deliberately extend beyond normal model
+inputs. The test rejects mismatched bits, including zero signs or NaN payloads;
+it never weakens the gate to accommodate compiler arithmetic changes.
+
+run.json includes build provenance; runner.jsonl contains actual device/driver
+resources, per-case strict verdicts and raw ABBA sample times. result.json remains
+complete=false on failure. Completed synthetic bit gates are not model-level
+quality or end-to-end performance evidence. Register usage, launchability,
+correctness and speed remain NOT_RUN until their respective real gates execute.
+Hardware counters are not collected by this tool.

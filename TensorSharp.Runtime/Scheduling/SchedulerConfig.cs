@@ -128,6 +128,16 @@ namespace TensorSharp.Runtime.Scheduling
         /// turn it off.</summary>
         public bool EnablePrefixCaching { get; init; } = true;
 
+        /// <summary>The fewest otherwise-unprotected prompt tokens an automatic prompt-tail
+        /// checkpoint of a recurrent model must protect, for a request whose reply is rendered
+        /// back verbatim (<see cref="SequenceState.PromptTailCheckpointOptional"/>; every other
+        /// request always takes it). The checkpoint stops prefill one
+        /// token short of the prompt end, so it costs one extra single-row forward (18.7 ms
+        /// on Qwen3.8-27B / RTX 5090) on every request it is taken for; a shorter unprotected
+        /// tail is cheaper to prefill again on the rare exact retry. Default 1024; 0 takes
+        /// one on every prompt. Env: <c>TS_SCHED_PROMPT_TAIL_CHECKPOINT_MIN</c>.</summary>
+        public int PromptTailCheckpointMinTokens { get; init; } = 1024;
+
         /// <summary>
         /// End a sequence whose output has locked into a loop (see
         /// <see cref="RepetitionGuard"/>) with the finish reason <c>repetition</c>,
@@ -189,6 +199,7 @@ namespace TensorSharp.Runtime.Scheduling
             NumBlocks = NumBlocks,
             BlockSize = blockSize,
             EnablePrefixCaching = EnablePrefixCaching,
+            PromptTailCheckpointMinTokens = PromptTailCheckpointMinTokens,
             StopRepetition = StopRepetition,
             DecodeQuantumTokens = DecodeQuantumTokens,
             Speculation = speculation,
@@ -210,6 +221,7 @@ namespace TensorSharp.Runtime.Scheduling
                 NumBlocks = ReadInt("TS_SCHED_NUM_BLOCKS", 256),
                 BlockSize = ReadInt("TS_SCHED_BLOCK_SIZE", 0),
                 EnablePrefixCaching = ReadBool("TS_SCHED_PREFIX_CACHE", true),
+                PromptTailCheckpointMinTokens = ReadNonNegativeInt("TS_SCHED_PROMPT_TAIL_CHECKPOINT_MIN", 1024),
                 StopRepetition = ReadBool("TS_SCHED_STOP_REPETITION", true),
                 DecodeQuantumTokens = ReadInt("TS_SCHED_DECODE_QUANTUM", 256),
                 Speculation = SpeculationOptions.FromEnvironment(),
@@ -220,6 +232,15 @@ namespace TensorSharp.Runtime.Scheduling
                 cfg = cfg.WithMixedStepPrefillBudget(ReadInt("TS_SCHED_MIXED_PREFILL_TOKENS", 0));
             int solo = ReadInt("TS_SCHED_SOLO_PREFILL_CHUNK", 0);
             return solo > 0 ? cfg.WithSoloPrefillChunkSize(solo) : cfg;
+        }
+
+        private static int ReadNonNegativeInt(string name, int fallback)
+        {
+            string? raw = System.Environment.GetEnvironmentVariable(name);
+            if (string.IsNullOrEmpty(raw)) return fallback;
+            if (!int.TryParse(raw, out int v) || v < 0)
+                throw new System.ArgumentException($"{name} must be a non-negative integer.");
+            return v;
         }
 
         private static int ReadInt(string name, int fallback)

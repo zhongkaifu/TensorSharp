@@ -497,6 +497,8 @@ extern "C" __global__ void ts_q35_df_gather_f32(
         dst[(long long)r * width + i] = in[i];
 }
 
+#include "tensorsharp_q35_topk.cuh"
+
 // ---------------------------------------------------------------------------
 // Top k (k <= 16) of each row, largest first (ties: lower index first): one 256-thread block per
 // row. Every thread keeps a sorted top 16 of its stride in registers (compile-time

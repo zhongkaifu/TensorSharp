@@ -1,0 +1,53 @@
+{
+  "schema": "tensorsharp-flashinfer-native-w4a16-n64-pristine-sources/1",
+  "repository": "flashinfer-ai/flashinfer",
+  "revision": "61bc8b6dd7049a44d614b2a0cd4a036cb3c46ad0",
+  "modifiedUpstreamFiles": [],
+  "files": [
+    {
+      "path": "flashinfer/gemm/kernels/native_bf16_fp4/staged_kernel.py",
+      "repository": "flashinfer-ai/flashinfer",
+      "revision": "61bc8b6dd7049a44d614b2a0cd4a036cb3c46ad0",
+      "gitBlobSha1": "b6227ae169bfd20b8041d92d9b8a35ecb0818cb5",
+      "bytes": 11023,
+      "sha256": "4f282ca749757fb89ad1e4309616b548c205bb845d087545b89e011cb6949112",
+      "url": "https://github.com/flashinfer-ai/flashinfer/blob/61bc8b6dd7049a44d614b2a0cd4a036cb3c46ad0/flashinfer/gemm/kernels/native_bf16_fp4/staged_kernel.py"
+    },
+    {
+      "path": "flashinfer/gemm/kernels/native_bf16_fp4/kernel.py",
+      "repository": "flashinfer-ai/flashinfer",
+      "revision": "61bc8b6dd7049a44d614b2a0cd4a036cb3c46ad0",
+      "gitBlobSha1": "8f9e1c8f89a96fdf67b790e73a6f04b5a45405fa",
+      "bytes": 14138,
+      "sha256": "6c340a3837d02340d5f9bfa4ad13e7e9ceb72b134f33fad4d32d44ed01be5f81",
+      "url": "https://github.com/flashinfer-ai/flashinfer/blob/61bc8b6dd7049a44d614b2a0cd4a036cb3c46ad0/flashinfer/gemm/kernels/native_bf16_fp4/kernel.py"
+    },
+    {
+      "path": "flashinfer/cute_dsl/fp4_common.py",
+      "repository": "flashinfer-ai/flashinfer",
+      "revision": "61bc8b6dd7049a44d614b2a0cd4a036cb3c46ad0",
+      "gitBlobSha1": "893084e792d08bf16fa39a0da5fd1d619ce2e418",
+      "bytes": 90283,
+      "sha256": "fbea61acc84fd2826d0bf7b9f48523df23f0adb1c10a785d4d473851ad66b9d3",
+      "url": "https://github.com/flashinfer-ai/flashinfer/blob/61bc8b6dd7049a44d614b2a0cd4a036cb3c46ad0/flashinfer/cute_dsl/fp4_common.py"
+    },
+    {
+      "path": "LICENSE",
+      "repository": "flashinfer-ai/flashinfer",
+      "revision": "61bc8b6dd7049a44d614b2a0cd4a036cb3c46ad0",
+      "gitBlobSha1": "ba557f2bb968c1334057e4c0c567bd4a4fe76380",
+      "bytes": 12332,
+      "sha256": "cb67c224f503e0a063908950b12f89a7280c6e527dcffac972aa114e4bf3c5de",
+      "url": "https://github.com/flashinfer-ai/flashinfer/blob/61bc8b6dd7049a44d614b2a0cd4a036cb3c46ad0/LICENSE"
+    },
+    {
+      "path": "flashinfer/gemm/kernels/native_bf16_fp4/n64_staged_kernel.py",
+      "repository": "flashinfer-ai/flashinfer",
+      "revision": "61bc8b6dd7049a44d614b2a0cd4a036cb3c46ad0",
+      "gitBlobSha1": "11e966e6d4d444ca409599ccf243cffa9bf59c05",
+      "bytes": 8916,
+      "sha256": "017e5ecef4c79ce02a043a456eec123299850c53047d3f128fd9991b6b0a44e3",
+      "url": "https://github.com/flashinfer-ai/flashinfer/blob/61bc8b6dd7049a44d614b2a0cd4a036cb3c46ad0/flashinfer/gemm/kernels/native_bf16_fp4/n64_staged_kernel.py"
+    }
+  ]
+}

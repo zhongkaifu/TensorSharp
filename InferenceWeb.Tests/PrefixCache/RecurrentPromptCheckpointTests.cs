@@ -18,19 +18,22 @@ public class RecurrentPromptCheckpointTests
         Truncation = TruncationKind.None, MinTailPrefillTokens = tail,
     };
 
-    private static SchedulerConfig Config(bool enabled = true) => new()
+    private static SchedulerConfig Config(bool enabled = true, int tailMin = 0) => new()
     {
         BlockSize = 8, NumBlocks = 256, MaxNumBatchedTokens = 128,
         MaxPrefillChunkSize = 32, SoloPrefillChunkSize = 128,
         EnablePrefixCaching = enabled, StopRepetition = false,
+        // These cases cover retry semantics on a 64-token prompt; the default skips a
+        // checkpoint that would protect fewer than 1024 tokens (see TailThreshold below).
+        PromptTailCheckpointMinTokens = tailMin,
     };
 
     private static List<int> Tokens() => Enumerable.Range(1, 64).ToList();
 
     private static SequenceState Request(string id, string? scope = "chat",
-        IReadOnlyList<PromptMediaSpan>? media = null, IReadOnlyList<int>? breaks = null) =>
+        IReadOnlyList<PromptMediaSpan>? media = null, IReadOnlyList<int>? breaks = null, bool tailOptional = false) =>
         new(id, Tokens(), 3, 8, SamplingConfig.Greedy, cacheScope: scope,
-            sharedPrefixTokens: 16, mediaSpans: media, cacheBreakpoints: breaks);
+            sharedPrefixTokens: 16, mediaSpans: media, cacheBreakpoints: breaks) { PromptTailCheckpointOptional = tailOptional };
 
     private static async Task<InferenceCompletion> Run(InferenceEngine engine, SequenceState sequence) =>
         await engine.SubmitRequest(sequence).Completion.WaitAsync(TimeSpan.FromSeconds(10));
@@ -126,5 +129,28 @@ public class RecurrentPromptCheckpointTests
         var completions = await Task.WhenAll(handles.Select(h => h.Completion)).WaitAsync(TimeSpan.FromSeconds(10));
         Assert.All(completions, c => Assert.Equal(63, c.PrefixCacheReusedTokens));
         Assert.All(requests, r => Assert.Equal(first.OutputTokens, r.OutputTokens));
+    }
+
+    [Fact]
+    public async Task TailThreshold_KeepsTheCheckpointOfAReplyThatIsNotRenderedBack()
+    {
+        var model = new OracleModel(Traits(), 8);
+        using var engine = new InferenceEngine(model, Config(tailMin: 1024));
+        await Run(engine, Request("first"));
+        Assert.Equal(63, (await Run(engine, Request("repeat"))).PrefixCacheReusedTokens);
+    }
+
+    [Fact]
+    public async Task TailThreshold_SkipsTheShortPromptCheckpointAndItsExtraForward()
+    {
+        var model = new OracleModel(Traits(), 8);
+        using var engine = new InferenceEngine(model, Config(tailMin: 1024));
+        var first = Request("first", tailOptional: true);
+        await Run(engine, first);
+        // No 63-token prompt-tail state: an exact retry resumes from the 16-token shared prefix.
+        Assert.DoesNotContain(model.RetainedPayloadKeys, key => model.MeasureEndState(key).Tokens == 63);
+        var repeated = Request("repeat", tailOptional: true);
+        Assert.Equal(16, (await Run(engine, repeated)).PrefixCacheReusedTokens);
+        Assert.Equal(first.OutputTokens, repeated.OutputTokens);
     }
 }

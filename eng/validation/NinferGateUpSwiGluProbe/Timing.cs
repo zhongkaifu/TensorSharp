@@ -1,0 +1,34 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// Licensed under the BSD-3-Clause license in the repository root.
+using TensorSharp.Cuda.Interop;
+
+internal static partial class Program
+{
+    private static double Median(List<double> values){var a=values.Order().ToArray();return(a[a.Length/2-1]+a[a.Length/2])/2;}
+    private static void RunTiming(Modules modules,Stream stream,string output,Dictionary<string,string> files,Dictionary<string,object?> state,Action checkpoint)
+    {
+        const int replays=128;var f=DenseTiming();using var memory=new Memory();var x=memory.Put("dense-input",Bytes(f.Input));var wc=memory.Put("dense-weight-codes",f.WeightCodes);var ws=memory.Put("dense-weight-scales",f.WeightScales);var arms=Enumerable.Range(0,3).Select(i=>new GemmArm(memory,"dense-"+ArmNames[i],i==2)).ToArray();var direct=new List<object>();
+        foreach(var a in arms)a.Reset(0xc1);CudaDriverApi.cuStreamSynchronize(IntPtr.Zero).ThrowOnError();for(int i=0;i<3;i++)modules.Chain(f,x,wc,ws,arms[i],i,stream.Pointer);stream.Sync();byte[][] raw=arms.Take(2).Select(a=>Memory.Body(a.Output)).ToArray(),final=arms.Select(a=>Memory.Body(a.Final)).ToArray();bool directBits=raw[0].AsSpan().SequenceEqual(raw[1])&&final.Skip(1).All(b=>b.AsSpan().SequenceEqual(final[0]));
+        var rawNumeric=raw.Select(b=>Check(b,f,false)).ToArray();var formats=final.Select(ConsumerFormat).ToArray();
+        for(int i=0;i<3;i++)direct.Add(new{arm=ArmNames[i],rawStatus=i<2?"CAPTURED_FULL_F32_FP64_ACTIVE_WITNESSES":"NOT_CAPTURED_FUSED_EPILOGUE",rawFile=i<2?Cas(raw[i],output,files):null,rawFp64=i<2?rawNumeric[i]:null,finalFile=Cas(final[i],output,files),finalFormat=formats[i]});
+        var intervals=new List<object>();var record=new Dictionary<string,object?>{["passed"]=false,["scope"]="One warm resident dense pseudorandom GateUp weight matrix, complete original3-node versus fused2-node quant/GEMM/SwiGLU chain. No physical cold/DRAM/full-model/E2E claim. Fused raw NOT_CAPTURED. Controls fullrawGPUbits, only fixed active-row FP64 witnesses for dense timing; final fullbits required.",["fixture"]=f.Name,["shape"]=new[]{Rows,N,Width},["splits"]=1,["weightBytes"]=f.WeightCodes.Length+f.WeightScales.Length,["weightCodesSha256"]=Sha(f.WeightCodes),["weightScalesSha256"]=Sha(f.WeightScales),["inputFile"]=Cas(Bytes(f.Input),output,files),["fp64WitnessRows"]=Active.Length,["fp64WitnessValues"]=Rows*Active.Length,["directAdmissions"]=direct,["directAdmissionFullFinalBitsExact"]=directBits,["timedReplaysPerInterval"]=replays,["minimumMedianSpeedupExclusive"]=1.01,["minimumSavingsMillisecondsPerChainInclusive"]=0.001,["minimumPairedRoundSpeedupExclusive"]=1.005,["minimumPairedRoundWinsAbove1_005"]=4,["intervals"]=intervals};state["timing"]=record;checkpoint();
+        Need(directBits&&rawNumeric.All(n=>n.Passed)&&formats.All(n=>n.Passed)&&arms.All(a=>a.QuantBits(f))&&memory.Guards()&&memory.Inputs(),"Dense direct three-arm chain not qualified.");
+        byte[] qualified=final[0],qualifiedRaw=raw[0];using var control=new ChainGraph(modules,f,x,wc,ws,arms[0],0,stream.Pointer);using var candidate=new ChainGraph(modules,f,x,wc,ws,arms[2],2,stream.Pointer);record["legacyNodes"]=control.Nodes;record["candidateNodes"]=candidate.Nodes;record["legacyDependencies"]=control.Dependencies;record["candidateDependencies"]=candidate.Dependencies;checkpoint();var oldSamples=new List<double>();var newSamples=new List<double>();var roundRatios=new List<double>();
+        for(int round=0;round<5;round++)
+        {
+            var sample=new double[4];for(int position=0;position<4;position++)
+            {
+                bool selected=position is 1 or 2;var graph=selected?candidate:control;var arm=arms[selected?2:0];arm.Reset(Poisons[(round+position)%3]);CudaDriverApi.cuStreamSynchronize(IntPtr.Zero).ThrowOnError();graph.Run(stream.Pointer);stream.Sync();
+                CudaDriverApi.cuEventCreate(out var begin,0).ThrowOnError();IntPtr end=IntPtr.Zero;float elapsed;
+                try{CudaDriverApi.cuEventCreate(out end,0).ThrowOnError();CudaDriverApi.cuEventRecord(begin,stream.Pointer).ThrowOnError();for(int i=0;i<replays;i++)graph.Run(stream.Pointer);CudaDriverApi.cuEventRecord(end,stream.Pointer).ThrowOnError();CudaDriverApi.cuEventSynchronize(end).ThrowOnError();CudaDriverApi.cuEventElapsedTime(out elapsed,begin,end).ThrowOnError();}
+                finally{if(end!=IntPtr.Zero)CudaDriverApi.cuEventDestroy(end).ThrowOnError();CudaDriverApi.cuEventDestroy(begin).ThrowOnError();}
+                Need(float.IsFinite(elapsed)&&elapsed>0,"Invalid full-chain CUDA event interval.");byte[] y=Memory.Body(arm.Final);byte[]? p=selected?null:Memory.Body(arm.Output);var numeric=p==null?null:Check(p,f,false);var format=ConsumerFormat(y);bool bits=y.AsSpan().SequenceEqual(qualified)&&(p==null||p.AsSpan().SequenceEqual(qualifiedRaw)),quant=arm.QuantBits(f),guards=memory.Guards(),inputs=memory.Inputs(),ok=bits&&quant&&guards&&inputs&&format.Passed&&(numeric?.Passed??true);double ms=(double)elapsed/replays;sample[position]=ms;(selected?newSamples:oldSamples).Add(ms);
+                intervals.Add(new{round,position,arm=ArmNames[selected?2:0],timedGraphReplays=replays,outsideWarmupReplays=1,kernelsPerReplay=selected?2:3,intervalMilliseconds=elapsed,millisecondsPerFullChain=ms,fullFinalBitsQualified=bits,controlProjectionF32BitsChecked=p!=null,beforeConsumerStatus=p==null?"NOT_CAPTURED_FUSED_EPILOGUE":"CAPTURED_FULL_F32_FP64_ACTIVE_WITNESSES",quantizedPayloadCpuBits=quant,unusedScratchGuardsOnly=true,countersReturnedZero=(bool?)null,allocationGuards=guards,immutableInputs=inputs,consumerFormat=format,fp64BeforeConsumer=numeric,finalFile=Cas(y,output,files),projectionFile=p==null?null:Cas(p,output,files),passed=ok});checkpoint();Need(ok,"Timed complete GateUp chain changed qualified output/operands/guards.");
+            }
+            roundRatios.Add((sample[0]+sample[3])/(sample[1]+sample[2]));
+        }
+        Need(intervals.Count==20&&oldSamples.Count==10&&newSamples.Count==10,"Exactly five complete ABBA rounds required.");double before=Median(oldSamples),after=Median(newSamples),speedup=before/after,savings=before-after;int wins=roundRatios.Count(r=>r>1.005);
+        record["passed"]=true;record["legacyMedianMilliseconds"]=before;record["candidateMedianMilliseconds"]=after;record["medianSpeedup"]=speedup;record["savingsMillisecondsPerFullChain"]=savings;record["pairedRoundSpeedups"]=roundRatios;record["pairedRoundsAbove1_005"]=wins;record["predeclaredWin"]=speedup>1.01&&savings>=0.001&&wins>=4;
+        record["actualTimedGraphReplays"]=2560;record["actualOutsideWarmupGraphReplays"]=20;record["actualTimedLegacyKernelExecutions"]=3840;record["actualTimedCandidateKernelExecutions"]=2560;record["actualWarmupLegacyKernelExecutions"]=30;record["actualWarmupCandidateKernelExecutions"]=20;record["directAdmissionKernelExecutions"]=8;checkpoint();
+    }
+}

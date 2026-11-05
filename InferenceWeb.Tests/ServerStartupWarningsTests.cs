@@ -73,13 +73,11 @@ public class ServerStartupWarningsTests : IDisposable
         var extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".cs", ".cpp", ".h", ".hpp", ".cu", ".cuh", ".mm", ".m", ".metal" };
         var skipped = new[] { "bin", "obj", ".git", "ExternalProjects", "InferenceWeb.Tests", "build", "docs", "artifacts" };
         var offenders = new List<string>();
-        foreach (string file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+        foreach (string file in SourceFiles(root, skipped))
         {
             if (!extensions.Contains(Path.GetExtension(file)) || file == registry)
                 continue;
             string relative = Path.GetRelativePath(root, file);
-            if (relative.Split(Path.DirectorySeparatorChar).Any(part => skipped.Contains(part, StringComparer.Ordinal)))
-                continue;
             string text = File.ReadAllText(file);
             foreach ((string name, _) in RemovedCliFlags.RemovedEnvironmentVariables)
             {
@@ -88,6 +86,28 @@ public class ServerStartupWarningsTests : IDisposable
             }
         }
         Assert.True(offenders.Count == 0, "removed variables still read:\n" + string.Join("\n", offenders));
+    }
+
+    /// <summary>Files of this checkout outside the <paramref name="skipped"/> directory names. A
+    /// directory below the root with its own .git entry is another checkout (a git worktree kept
+    /// inside the tree, such as .claude/worktrees/*), whose copies of the sources, the registry
+    /// included, are not this tree's.</summary>
+    private static IEnumerable<string> SourceFiles(string root, string[] skipped)
+    {
+        var pending = new Stack<string>();
+        pending.Push(root);
+        while (pending.Count > 0)
+        {
+            string dir = pending.Pop();
+            foreach (string file in Directory.EnumerateFiles(dir))
+                yield return file;
+            foreach (string sub in Directory.EnumerateDirectories(dir))
+            {
+                string git = Path.Combine(sub, ".git");
+                if (!skipped.Contains(Path.GetFileName(sub), StringComparer.Ordinal) && !Directory.Exists(git) && !File.Exists(git))
+                    pending.Push(sub);
+            }
+        }
     }
 
     private static string FindRepoRoot()

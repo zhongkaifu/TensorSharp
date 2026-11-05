@@ -62,6 +62,8 @@ namespace TensorSharp.Cuda
             public float RopeBase, Eps;
             public int NCtx, NUbatch;
             public CudaWeightDesc TokEmbd, Output;
+            public CudaNinferModelDesc Ninfer;
+            /// <summary>Explicit experimental companion output head; null retains the original Q6 path.</summary>
             public float[] OutputNorm;
             public LayerDesc[] Layers;
         }
@@ -119,7 +121,7 @@ namespace TensorSharp.Cuda
         private readonly Layer[] _layers;
         private readonly List<IntPtr> _owned = new List<IntPtr>();
         private IntPtr _tokEmbd, _output, _outputNorm;
-        private long _tokEmbdRowBytes, _outputRowBytes;
+        private long _tokEmbdRowBytes;
         private readonly int _sms;
         private readonly int _nAttn, _nGdn;
         private Slot _active;
@@ -138,11 +140,14 @@ namespace TensorSharp.Cuda
         private IntPtr _vRaw, _vQkv, _vG, _vBeta, _features, _keptDev;
         private int[] _featureSlot;
         private int _featureCount;
+        private int _featureBufferWidth;
 
         // ---- scratch, sized for NUbatch rows ----
         private IntPtr _x, _xn, _proj, _q, _gate, _attn, _block, _gdnQkv, _gdnG, _gdnBeta, _gdnO, _gdnY, _act;
         private IntPtr _q8, _q8d, _fp4c, _fp4s, _fp4r, _partial, _counters, _attnPartial, _logits, _argmax;
         private IntPtr _rowsDev, _tokensDev, _ropePosDev, _cacheRowDev, _keyEndDev, _countDev, _lastX, _lastBlock;
+        private IntPtr _gdnPreparedScratch;
+        private long _gdnPreparedScratchBytes;
         private IntPtr _pinned;
         private const int PinnedBytes = 1 << 20;
 
@@ -150,6 +155,9 @@ namespace TensorSharp.Cuda
         public int ContextSize => _m.NCtx;
         public int UBatch => _m.NUbatch;
         public int HiddenSize => _m.NEmbd;
+        /// <summary>Actually submitted prepared GDN prefill passes (diagnostic coverage).</summary>
+        public long PreparedGdnPrefillLaunchCount => _k.PreparedGdnLaunches;
+        public bool PreparedGdnScratchReusesProjection { get; private set; }
         /// <summary>The sequence <see cref="Forward"/> runs.</summary>
         public Slot Active
         {
@@ -163,6 +171,26 @@ namespace TensorSharp.Cuda
 
         /// <summary>The last verify's feature taps, [rows][FeatureWidth] F32 on the device.</summary>
         public IntPtr FeatureRows => _features;
+
+        /// <summary>Copies the last Verify's feature rows for numerical diagnostics. The
+        /// caller supplies at least rows * FeatureWidth floats; normal inference leaves
+        /// these rows on the device and does not incur this synchronization/readback.</summary>
+        public void ReadFeatureRows(float[] destination, int rows)
+        {
+            if (destination == null)
+                throw new ArgumentNullException(nameof(destination));
+            long count = (long)rows * FeatureWidth;
+            if (rows < 0 || rows > MaxVerifyRows || destination.LongLength < count)
+                throw new ArgumentException("[q35-cuda] feature output shape is invalid");
+            if (count == 0)
+                return;
+            if (_features == IntPtr.Zero)
+                throw new InvalidOperationException("[q35-cuda] no Verify feature rows are available");
+            MakeCurrent();
+            Sync();
+            fixed (float* dst = destination)
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)dst, _features, new UIntPtr((ulong)count * 4)).ThrowOnError();
+        }
 
         private int ConvDim => (2 * _m.GdnKHeads + _m.GdnVHeads) * Q35Kernels.GdnHeadDim;
         private int ValueDim => _m.GdnVHeads * Q35Kernels.GdnHeadDim;
@@ -207,6 +235,8 @@ namespace TensorSharp.Cuda
         public Q35CudaEngine(ModelDesc m)
         {
             _m = m ?? throw new ArgumentNullException(nameof(m));
+            ValidateNinferModel(m);
+            PreflightNinferFlashInfer();
             if (m.HeadDim != Q35Kernels.AttnHeadDim)
                 throw new NotSupportedException($"[q35-cuda] attention head_dim {m.HeadDim} (the kernels take {Q35Kernels.AttnHeadDim})");
             if (m.NKvHead <= 0 || m.NHead % m.NKvHead != 0 || m.NHead / m.NKvHead > Q35Kernels.AttnBlockRows)
@@ -216,30 +246,57 @@ namespace TensorSharp.Cuda
             if (m.SectT + m.SectH + m.SectW > Q35Kernels.RopeDims / 2)
                 throw new NotSupportedException("[q35-cuda] M-RoPE sections exceed the rotated width");
 
-            CudaBackend.Register();
-            CudaDriverApi.cuInit(0);
-            _alloc = new CudaAllocator(0);
-            MakeCurrent();
-            _k = Q35Kernels.Create();
-            CudaDriverApi.cuDeviceGetAttribute(out _sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, 0).ThrowOnError();
-
-            var sw = Stopwatch.StartNew();
-            _layers = new Layer[m.NLayer];
-            using (var loader = new Loader(this))
+            _servingTrace = ServingTraceLog.FromEnvironment();
+            try
             {
-                for (int il = 0; il < m.NLayer; il++)
+                ValidateVerifyDecodeQ81Graphs(_verifyDecodeQ81 || _projectionTrace, _verifyGraphsEnabled, _draftGraphsEnabled);
+                CudaBackend.Register();
+                CudaDriverApi.cuInit(0);
+                _alloc = new CudaAllocator(0);
+                MakeCurrent();
+                _k = Q35Kernels.Create(identifyImage: m.Ninfer != null);
+                CudaDriverApi.cuDeviceGetAttribute(out _sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, 0).ThrowOnError();
+
+                InitializeNinferModules();
+                var sw = Stopwatch.StartNew();
+                _layers = new Layer[m.NLayer];
+                using (var loader = new Loader(this))
                 {
-                    _layers[il] = LoadLayer(loader, m.Layers[il]);
-                    _layers[il].Ordinal = _layers[il].Recurrent ? _nGdn++ : _nAttn++;
+                    for (int il = 0; il < m.NLayer; il++)
+                    {
+                        _layers[il] = m.Ninfer == null ? LoadLayer(loader, m.Layers[il]) : LoadNinferLayer(loader, il);
+                        _layers[il].Ordinal = _layers[il].Recurrent ? _nGdn++ : _nAttn++;
+                    }
+                    if (m.Ninfer == null)
+                        _tokEmbd = loader.Raw(m.TokEmbd, TQ4_0, out _tokEmbdRowBytes);
+                    else
+                        _tokEmbd = LoadNinferEmbedding(loader, m.Ninfer.Embedding);
+                    if (m.Ninfer != null)
+                        _ninferHead = LoadNinferMatrix(loader, m.Ninfer.Head);
+                    else
+                        _output = loader.Q6kTiled(m.Output);
                 }
-                _tokEmbd = loader.Raw(m.TokEmbd, TQ4_0, out _tokEmbdRowBytes);
-                _output = loader.Raw(m.Output, TQ6_K, out _outputRowBytes);
+                CompleteNinferLoadRepack();
+                CompleteNinferFlashInferLoad();
+                _outputNorm = UploadF32(m.OutputNorm);
+                // Resolve the TMA GEMM entries now: the probe launches a kernel and allocates, which a
+                // stream capture (a verify graph wide enough for the TMA tiles) must not do.
+                _ = _k.NinferPrefillEpilogueAvailable;
+                AllocateScratch();
+                SetFeatureTaps(null);
+                _active = CreateSlot(InitialSlotTokens);
+                Console.Error.WriteLine($"[q35-cuda] weights loaded in {sw.Elapsed.TotalSeconds:F1}s, {_sms} SMs, n_ctx={m.NCtx}, ubatch={m.NUbatch}");
             }
-            _outputNorm = UploadF32(m.OutputNorm);
-            AllocateScratch();
-            SetFeatureTaps(null);
-            _active = CreateSlot(InitialSlotTokens);
-            Console.Error.WriteLine($"[q35-cuda] weights loaded in {sw.Elapsed.TotalSeconds:F1}s, {_sms} SMs, n_ctx={m.NCtx}, ubatch={m.NUbatch}");
+            catch
+            {
+                if (_alloc != null)
+                {
+                    try { Dispose(); }
+                    catch (Exception cleanup) { Console.Error.WriteLine("[q35-cuda] companion construction cleanup failed: " + cleanup.Message); }
+                }
+                _servingTrace?.Close("constructor_failed");
+                throw;
+            }
         }
 
         private IntPtr Stream => _alloc.Stream.Handle;
@@ -277,7 +334,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>Streams weight bytes from their source through pinned host and device staging:
         /// NVFP4 matrices are repacked into planes on the device, other weights copied as stored.</summary>
-        private sealed class Loader : IDisposable
+        private sealed partial class Loader : IDisposable
         {
             private const long StagingBytes = 128L << 20;
             private readonly Q35CudaEngine _e;
@@ -341,6 +398,32 @@ namespace TensorSharp.Cuda
                     row += w.Ne1;
                 }
                 return p;
+            }
+
+            /// <summary>The Q6_K LM head in the tiled layout its kernels stream (the same bytes, regrouped
+            /// per 64 rows and superblock at load; see Q35Kernels.GemvQ6kTiled).</summary>
+            public IntPtr Q6kTiled(in CudaWeightDesc w)
+            {
+                if (w.GgmlType != TQ6_K)
+                    throw new NotSupportedException($"[q35-cuda] {w.Name}: type {w.GgmlType}, expected {TQ6_K}");
+                int k = w.Ne0, rows = w.Ne1;
+                if (k % 256 != 0 || w.RowBytes != (long)k / 256 * 210)
+                    throw new NotSupportedException($"[q35-cuda] {w.Name}: Q6_K rows of {k} values in {w.RowBytes} bytes");
+                long bytes = Q35Kernels.Q6kTiledBytes(rows, k);
+                IntPtr dst = _e.Alloc(bytes);
+                // Rows past the last full tile read as zero.
+                CudaDriverApi.cuMemsetD8Async(dst, 0, new UIntPtr((ulong)bytes), _e.Stream).ThrowOnError();
+                int chunkRows = (int)Math.Max(1, StagingBytes / w.RowBytes);
+                for (int r0 = 0; r0 < rows; r0 += chunkRows)
+                {
+                    int n = Math.Min(chunkRows, rows - r0);
+                    long chunkBytes = n * w.RowBytes;
+                    Read(w, r0 * w.RowBytes, _host, chunkBytes);
+                    CudaDriverApi.cuMemcpyHtoD(_dev, _host, new UIntPtr((ulong)chunkBytes)).ThrowOnError();
+                    _e._k.RepackQ6kTiled(_dev, w.RowBytes, n, k, r0, dst, _e.Stream);
+                    _e.Sync();
+                }
+                return dst;
             }
 
             public IntPtr Raw(in CudaWeightDesc w, int type, out long rowBytes)
@@ -409,19 +492,48 @@ namespace TensorSharp.Cuda
             int nt = RowCap, e = _m.NEmbd;
             int widest = Math.Max(Math.Max(AttnProjWidth, GdnPackedWidth), 2 * _m.NFf);
             int widestK = Math.Max(Math.Max(e, _m.NFf), Math.Max(QDim, ValueDim));
+            SharedScratchEnabled = SharedScratchRequested(Environment.GetEnvironmentVariable("TS_Q35_SHARED_SCRATCH"));
             _x = Alloc((long)nt * e * 4);
-            _xn = Alloc((long)nt * e * 4);
+            if (SharedScratchEnabled)
+                AllocateSharedScratch(nt);
+            else
+                _xn = Alloc((long)nt * e * 4);
             _block = Alloc((long)nt * e * 4);
             _proj = Alloc((long)nt * widest * 4);
-            _q = Alloc((long)nt * QDim * 4);
-            _gate = Alloc((long)nt * QDim * 4);
-            _attn = Alloc((long)nt * QDim * 4);
-            _gdnQkv = Alloc((long)nt * ConvDim * 4);
-            _gdnG = Alloc((long)nt * _m.GdnVHeads * 4);
-            _gdnBeta = Alloc((long)nt * _m.GdnVHeads * 4);
-            _gdnO = Alloc((long)nt * ValueDim * 4);
-            _gdnY = Alloc((long)nt * ValueDim * 4);
-            _act = Alloc((long)nt * _m.NFf * 4);
+            if (!SharedScratchEnabled)
+            {
+                _q = Alloc((long)nt * QDim * 4);
+                _gate = Alloc((long)nt * QDim * 4);
+                _attn = Alloc((long)nt * QDim * 4);
+                _gdnQkv = Alloc((long)nt * ConvDim * 4);
+                _gdnG = Alloc((long)nt * _m.GdnVHeads * 4);
+                _gdnBeta = Alloc((long)nt * _m.GdnVHeads * 4);
+                _gdnO = Alloc((long)nt * ValueDim * 4);
+                _gdnY = Alloc((long)nt * ValueDim * 4);
+            }
+            if (Q35Kernels.GdnPreparedPrefillEnabled && _nGdn > 0)
+            {
+                _gdnPreparedScratchBytes = Q35Kernels.GdnPreparedScratchCapacityBytes(nt, MaxSeqs, _m.GdnKHeads, _m.GdnVHeads);
+                // Every GDN group's packed projection lives below this bound, including a
+                // mixed prefill/Verify step. Its unused tail can hold the packets until
+                // GdnOut finishes. The following FFN may overwrite that tail on the same
+                // stream; no packet is used by Commit or by the next layer. Only _proj's
+                // allocation is owned, so this alias must never be separately freed.
+                long packedBytes = checked((long)nt * GdnPackedWidth * sizeof(float));
+                long tailOffset = checked(packedBytes + 255) & ~255L;
+                long tailBytes = checked((long)nt * widest * sizeof(float)) - tailOffset;
+                if (tailBytes >= _gdnPreparedScratchBytes)
+                {
+                    _gdnPreparedScratch = _proj + (nint)tailOffset;
+                    PreparedGdnScratchReusesProjection = true;
+                }
+                else
+                    _gdnPreparedScratch = Alloc(_gdnPreparedScratchBytes);
+                Console.Error.WriteLine($"[q35-cuda] prepared GDN prefill enabled, scratch={_gdnPreparedScratchBytes} bytes, projectionTail={PreparedGdnScratchReusesProjection}");
+            }
+            if (!SharedScratchEnabled)
+                _act = Alloc((long)nt * _m.NFf * 4);
+            PublishScratchSpans(nt);
             if (nt < MaxVerifyRows)
                 throw new NotSupportedException($"[q35-cuda] ubatch {nt} below the {MaxVerifyRows}-row verify window");
             // q8_1 rows: a GEMV's activations, or the LM head's over a whole verify.
@@ -435,7 +547,9 @@ namespace TensorSharp.Cuda
             _partial = Alloc(8L * 64 * widest * 4);
             _counters = Alloc(1L << 20);
             CudaDriverApi.cuMemsetD8(_counters, 0, new UIntPtr(1u << 20)).ThrowOnError();
-            _attnPartial = Alloc(Q35Kernels.AttnSplitFloats(MaxVerifyRows, _m.NHead) * 4);
+            // The q8_0 split kernel (GGUF route) takes up to 160 splits, the NInfer pipelined kernel 64.
+            _attnPartial = Alloc(Q35Kernels.AttnSplitFloats(MaxVerifyRows, _m.NHead,
+                _m.Ninfer == null ? Q35Kernels.AttnMaxSplits : Q35Kernels.AttnMaxSplitCount) * 4);
             _logits = Alloc((long)MaxVerifyRows * _m.NVocab * 4);
             _argmax = Alloc(MaxVerifyRows * 4);
             _lastX = Alloc((long)MaxSeqs * e * 4);
@@ -457,15 +571,31 @@ namespace TensorSharp.Cuda
 
         private void EnsureVerifyBuffers()
         {
-            if (_vQkv != IntPtr.Zero)
-                return;
-            long rows = (long)Math.Max(1, _nGdn) * MaxVerifyRows;
-            _vRaw = Alloc(rows * ConvDim * 4);
-            _vQkv = Alloc(rows * ConvDim * 4);
-            _vG = Alloc(rows * _m.GdnVHeads * 4);
-            _vBeta = Alloc(rows * _m.GdnVHeads * 4);
-            if (_featureCount > 0)
-                _features = Alloc((long)MaxVerifyRows * FeatureWidth * 4);
+            if (_vQkv == IntPtr.Zero)
+            {
+                long rows = (long)Math.Max(1, _nGdn) * MaxVerifyRows;
+                _vRaw = Alloc(rows * ConvDim * 4);
+                _vQkv = Alloc(rows * ConvDim * 4);
+                _vG = Alloc(rows * _m.GdnVHeads * 4);
+                _vBeta = Alloc(rows * _m.GdnVHeads * 4);
+            }
+            // A feature layout may be selected after the first Verify. Grow before capture;
+            // never leave an executable graph pointing at replaced or undersized storage.
+            if (FeatureWidth > _featureBufferWidth)
+            {
+                InvalidateVerifyGraphs();
+                // Preserve the old buffer/capacity if allocation fails, so a later request
+                // selecting the old layout can still use it safely.
+                IntPtr grown = Alloc((long)MaxVerifyRows * FeatureWidth * 4);
+                if (_features != IntPtr.Zero)
+                {
+                    Sync();
+                    CudaDriverApi.cuMemFree(_features).ThrowOnError();
+                    _owned.Remove(_features);
+                }
+                _features = grown;
+                _featureBufferWidth = FeatureWidth;
+            }
         }
 
         // ---------------------------------------------------------------------------------------
@@ -496,14 +626,14 @@ namespace TensorSharp.Cuda
             var slots = new[] { _active };
             EnsureRoom(slots, tokens.Length);
             // The drafter keeps the last ringRows positions: tap only the rows that reach them.
-            int tapFrom = _d == null ? int.MaxValue : _active.NPast + tokens.Length - _ringRows;
+            int tapFrom = !HasDrafter ? int.MaxValue : _active.NPast + tokens.Length - RingRows;
             _embedSpans = embeds;
             try
             {
                 for (int start = 0; start < tokens.Length; start += _m.NUbatch)
                 {
                     int n = Math.Min(_m.NUbatch, tokens.Length - start);
-                    int first = _d == null ? n : Math.Clamp(tapFrom - (_active.NPast), 0, n);
+                    int first = !HasDrafter ? n : Math.Clamp(tapFrom - (_active.NPast), 0, n);
                     RunRows(slots, n, tokens, start, ropePos, tokens.Length, verify: false, tapFirst: first);
                 }
             }
@@ -531,7 +661,7 @@ namespace TensorSharp.Cuda
         {
             MakeCurrent();
             EnsureRoom(slots, 1);
-            RunRows(slots, 1, tokens, 0, null, tokens.Length, verify: false, tapFirst: 0);
+            RunRows(slots, 1, tokens, 0, null, tokens.Length, verify: false, tapFirst: 0, decode: true);
             HeadLastRows(slots.Length, 1, logitsOut, argmaxOut);
         }
 
@@ -544,16 +674,26 @@ namespace TensorSharp.Cuda
         /// </summary>
         public void Verify(Slot[] slots, int window, int[] tokens, int[] drawnOut, float[] logitsOut = null)
         {
+            RequireNinferVerification();
+            ValidateNinferVerifyRequest(slots, window, tokens, drawnOut, logitsOut);
+            if (_m.Ninfer != null) ForgetNinferVerification();
             int n = slots.Length * window;
             if (window < 1 || n > MaxVerifyRows || tokens.Length < n || drawnOut.Length < n)
                 throw new ArgumentException($"[q35-cuda] verify of {slots.Length} x {window} rows (at most {MaxVerifyRows})");
             MakeCurrent();
             EnsureRoom(slots, window);
             EnsureVerifyBuffers();
-            RunRows(slots, window, tokens, 0, null, n, verify: true, tapFirst: 0);
+            var pass = SelectNinferResidualPass(NinferResidualNormEnabled, 1, window, slots.Length,
+                true, false, _embedSpans != null, _featureCount != 0, _d != null);
+            RunRows(slots, window, tokens, 0, null, n, verify: true, tapFirst: 0, passMode: pass);
             _verifyRow0 = 0;
-            _k.AddRmsNorm(_x, _block, _outputNorm, _xn, n, _m.NEmbd, _m.Eps, Stream);
+            if (pass == NinferLayerPass.FusedResidualNorm && _ninferFinalResidualState == NinferResidualState.FusedCanonical)
+                _k.PlainNinferNorm(_x, _outputNorm, _xn, n, _m.NEmbd, _m.Eps, Stream);
+            else
+                FinalNorm(_x, _block, _outputNorm, _xn, n, _m.NEmbd, _m.Eps, Stream);
             Head(_xn, n, logitsOut, drawnOut);
+            RecordNinferVerification(slots, window);
+            if (pass == NinferLayerPass.FusedResidualNorm) NinferResidualNormCompletedVerifies++;
         }
 
         // The row of the last verify's first window row in the step's activations (its drafter taps).
@@ -571,6 +711,7 @@ namespace TensorSharp.Cuda
         public void MixedVerify(Slot prefill, int[] prefillTokens, float[] prefillLogits, Slot[] slots, int window, int[] tokens, int[] drawnOut,
             int[] ropePos = null, IReadOnlyList<EmbeddingSpan> embeds = null)
         {
+            if (_m.Ninfer != null) throw new NotSupportedException("NInfer target mixed draft verification is not yet supported.");
             int p = prefillTokens.Length, nv = slots.Length * window, e = _m.NEmbd;
             if (p < 1 || window < 1 || nv > MaxVerifyRows || p + nv > RowCap || tokens.Length < nv || drawnOut.Length < nv
                 || Array.IndexOf(slots, prefill) >= 0 || (ropePos != null && ropePos.Length < 4 * p))
@@ -600,9 +741,9 @@ namespace TensorSharp.Cuda
             _verifyRow0 = p;
             _k.CopyRows(_x + (nint)((long)(p - 1) * e * 4), e, _lastX, e, e, 1, Stream);
             _k.CopyRows(_block + (nint)((long)(p - 1) * e * 4), e, _lastBlock, e, e, 1, Stream);
-            _k.AddRmsNorm(_lastX, _lastBlock, _outputNorm, _xn, 1, e, _m.Eps, Stream);
+            FinalNorm(_lastX, _lastBlock, _outputNorm, _xn, 1, e, _m.Eps, Stream);
             Head(_xn, 1, prefillLogits, null);
-            _k.AddRmsNorm(_x + (nint)((long)p * e * 4), _block + (nint)((long)p * e * 4), _outputNorm, _xn, nv, e, _m.Eps, Stream);
+            FinalNorm(_x + (nint)((long)p * e * 4), _block + (nint)((long)p * e * 4), _outputNorm, _xn, nv, e, _m.Eps, Stream);
             Head(_xn, nv, null, drawnOut);
         }
 
@@ -620,6 +761,7 @@ namespace TensorSharp.Cuda
         /// recurrent states advance over them and the position moves past them.</summary>
         public void Commit(Slot[] slots, int window, int[] kept)
         {
+            if (_m.Ninfer != null) { CommitNinfer(slots, window, kept); return; }
             MakeCurrent();
             BindSlots(slots);
             for (int i = 0; i < slots.Length; i++)
@@ -643,6 +785,7 @@ namespace TensorSharp.Cuda
             if (_d != null)
                 DraftInjectKept(slots, window, kept, before);
             Sync();
+            _servingTrace?.CommitCompleted(slots, window, kept, before);
         }
 
         private void Upload(IntPtr dst, int* src, int count)
@@ -663,29 +806,35 @@ namespace TensorSharp.Cuda
         /// each position moves past its rows. Leaves the last layer's FFN output pending in _block.
         /// </summary>
         private void RunRows(Slot[] slots, int rowsPerSeq, int[] tokens, int start, int[] ropePos, int ropeTotal, bool verify, int tapFirst,
-            int[] counts = null)
-            => RunGroups(tapFirst, new RowGroup(slots, rowsPerSeq, verify, counts, tokens, start, ropePos, ropeTotal));
+            int[] counts = null, bool decode = false, NinferLayerPass passMode = NinferLayerPass.Legacy)
+            => RunGroups(tapFirst, new RowGroup(slots, rowsPerSeq, verify, counts, tokens, start, ropePos, ropeTotal, decode, passMode));
 
         /// <summary>rowsPerSeq rows of each of Slots (Tokens[Start ..], sequence-major); verify as in
         /// <see cref="RunRows"/>. Counts: the real rows of each sequence (padding beyond).</summary>
-        private readonly struct RowGroup
+        internal readonly struct RowGroup
         {
             public readonly Slot[] Slots;
             public readonly int RowsPerSeq, Start, RopeTotal;
-            public readonly bool Verify;
+            public readonly bool Verify, Decode;
             public readonly int[] Counts, Tokens, RopePos;
+            internal readonly NinferLayerPass PassMode;
 
             public RowGroup(Slot[] slots, int rowsPerSeq, bool verify, int[] counts, int[] tokens, int start = 0, int[] ropePos = null,
-                int ropeTotal = 0)
+                int ropeTotal = 0, bool decode = false, NinferLayerPass passMode = NinferLayerPass.Legacy)
             {
+                if (passMode != NinferLayerPass.Legacy && (passMode != NinferLayerPass.FusedResidualNorm
+                    || !verify || decode || counts != null || rowsPerSeq != 8 || slots?.Length != 1))
+                    throw new ArgumentException("The fused residual/norm pass requires one complete T8 verification lane.");
                 Slots = slots;
                 RowsPerSeq = rowsPerSeq;
                 Verify = verify;
+                Decode = decode;
                 Counts = counts;
                 Tokens = tokens;
                 Start = start;
                 RopePos = ropePos;
                 RopeTotal = ropeTotal;
+                PassMode = passMode;
             }
 
             public int Rows => Slots.Length * RowsPerSeq;
@@ -694,16 +843,23 @@ namespace TensorSharp.Cuda
         /// <summary>Groups of rows through the layers in one forward, each group's rows after the
         /// previous group's: the projections and the FFN run over every row, attention and the
         /// recurrence per group over its own sequences. Rows from tapFirst on feed the drafter.</summary>
-        private void RunGroups(int tapFirst, params RowGroup[] groups)
+        private void RunGroupsCore(int tapFirst, RowGroup[] groups)
         {
+            RequireNoPendingNinferVerification();
             int e = _m.NEmbd, nt = RowCap, n = 0, nSeq = 0;
             foreach (var g in groups)
             {
+                if (g.PassMode != NinferLayerPass.Legacy && SelectNinferResidualPass(NinferResidualNormEnabled,
+                    groups.Length, g.RowsPerSeq, g.Slots.Length, g.Verify, g.Counts != null,
+                    _embedSpans != null, _featureCount != 0, _d != null, tapFirst) != g.PassMode)
+                    throw new InvalidOperationException("The requested residual/norm pass is outside its admitted profile.");
                 n += g.Rows;
                 nSeq += g.Slots.Length;
             }
             if (n > nt)
                 throw new ArgumentException($"[q35-cuda] {n} rows in one step (at most {nt})");
+            KeepGrowthReserve();
+            ResetProjectionDispatchStats();
             var all = new Slot[nSeq];
             for (int gi = 0, q0 = 0; gi < groups.Length; q0 += groups[gi].Slots.Length, gi++)
                 Array.Copy(groups[gi].Slots, 0, all, q0, groups[gi].Slots.Length);
@@ -732,7 +888,10 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuMemcpyHtoDAsync(_rowsDev, _pinned, new UIntPtr((7UL * (ulong)nt + MaxSeqs) * 4), Stream).ThrowOnError();
             Sync();
 
-            _k.EmbedQ4_0(_tokEmbd, _tokEmbdRowBytes, _tokensDev, _x, n, e, Stream);
+            if (_m.Ninfer == null)
+                _k.EmbedQ4_0(_tokEmbd, _tokEmbdRowBytes, _tokensDev, _x, n, e, Stream);
+            else
+                _k.EmbedFp8(_tokEmbd, _tokEmbd + (nint)((long)_m.NVocab * e), _tokensDev, _x, n, e, _m.NVocab, Stream);
             if (_embedSpans != null)
             {
                 // Embedding overrides belong to the first group (a forward's prompt chunk).
@@ -761,6 +920,39 @@ namespace TensorSharp.Cuda
                     maxKeys[gi] = Math.Max(maxKeys[gi], s.NPast);
                 maxKeys[gi] += groups[gi].RowsPerSeq;
             }
+            if (!TryRunNinferDecodeGraph(n, tapFirst, groups, maxKeys))
+                RunVerifyLayerPass(n, tapFirst, groups, maxKeys);
+            for (int gi = 0, r0 = 0, q0 = 0; gi < groups.Length; r0 += groups[gi].Rows, q0 += groups[gi].Slots.Length, gi++)
+            {
+                var g = groups[gi];
+                if (g.Verify)
+                    continue;
+                var before = new int[g.Slots.Length];
+                for (int q = 0; q < g.Slots.Length; q++)
+                {
+                    before[q] = g.Slots[q].NPast;
+                    g.Slots[q].NPast += g.Counts != null ? g.Counts[q] : g.RowsPerSeq;
+                }
+                if (_d != null)
+                    DraftInjectRun(g.Slots, g.RowsPerSeq, Math.Clamp(tapFirst - r0, 0, g.Rows), before, g.Counts, r0, q0);
+                if (HasNinferDrafter)
+                    InjectNinferDraftRun(g, r0, q0, tapFirst, before);
+            }
+        }
+
+        // Device submissions only. BindSlots, metadata uploads, embedding overrides, position
+        // updates, drafter injection and all host reads stay in RunGroups or its caller.
+        private void RunLayerKernels(int n, int tapFirst, RowGroup[] groups, int[] maxKeys)
+        {
+            if (_m.Ninfer != null)
+            {
+                RunNinferLayers(n, tapFirst, groups, maxKeys);
+                return;
+            }
+            if (TryRunVerifyDecodeQ81(n, tapFirst, groups, maxKeys))
+                return;
+            _servingTrace?.LayerBranch(n <= Q35Kernels.GemvMaxRows ? "native_default_W4A8_Q81" : "native_default_W4A4");
+            int e = _m.NEmbd;
             IntPtr pending = IntPtr.Zero;   // the previous block's output, added before the next norm
             for (int il = 0; il < _m.NLayer; il++)
             {
@@ -779,9 +971,9 @@ namespace TensorSharp.Cuda
                 if (_d != null)
                     DraftTap(il, tapFirst, n);
                 if (fused)
-                    GemmQuantized(L.InProj, _proj, n);
+                    GemmObserved("InProj", L.InProj, _proj, n);
                 else
-                    Project(L.InProj, _xn, _proj, n);
+                    ProjectObserved("InProj", L.InProj, _xn, _proj, n);
                 for (int gi = 0, r0 = 0, q0 = 0; gi < groups.Length; r0 += groups[gi].Rows, q0 += groups[gi].Slots.Length, gi++)
                 {
                     if (L.Recurrent)
@@ -792,47 +984,34 @@ namespace TensorSharp.Cuda
                 if (L.Recurrent)
                 {
                     _k.GdnOut(_gdnO, _proj, GdnPackedWidth, ConvDim, n, _m.GdnVHeads, L.SsmNorm, _m.Eps, _gdnY, Stream);
-                    Project(L.OutProj, _gdnY, _block, n);
+                    ProjectObserved("OutProj", L.OutProj, _gdnY, _block, n);
                 }
                 else
-                    Project(L.OutProj, _attn, _block, n);
+                    ProjectObserved("OutProj", L.OutProj, _attn, _block, n);
                 if (fused)
                 {
                     _k.AddRmsNormNvfp4(_x, _block, L.PostNorm, _m.Eps, _fp4c, _fp4s, _fp4r, e, n, Stream);
                     _k.GemmW4A4(L.GateUp.Codes, L.GateUp.Scales, L.GateUp.Rows, L.GateUp.K, _fp4c, _fp4s, _fp4r, n, 1.0f, _act,
-                        _partial, _counters, _sms, 1, Stream, swiglu: true);
+                        _partial, _counters, _sms, 1, Stream, swiglu: true, tma: true);
+                    RecordProjectionDispatch("GateUp", "NVFP4_W4A4", 0, n);
                 }
                 else
                 {
                     _k.AddRmsNorm(_x, _block, L.PostNorm, _xn, n, e, _m.Eps, Stream);
-                    Project(L.GateUp, _xn, _proj, n);
+                    ProjectObserved("GateUp", L.GateUp, _xn, _proj, n);
                 }
                 if (!fused)
                 {
                     _k.SwiGlu(_proj, _act, _m.NFf, n, Stream, interleaved: true);
-                    Project(L.Down, _act, _block, n);
+                    ProjectObserved("Down", L.Down, _act, _block, n);
                 }
                 else
                 {
                     // SwiGLU happened in the gate|up GEMM's epilogue (half the bytes written and read back).
                     _k.QuantizeNvfp4(_act, _fp4c, _fp4s, _fp4r, _m.NFf, n, Stream);
-                    GemmQuantized(L.Down, _block, n);
+                    GemmObserved("Down", L.Down, _block, n);
                 }
                 pending = _block;
-            }
-            for (int gi = 0, r0 = 0, q0 = 0; gi < groups.Length; r0 += groups[gi].Rows, q0 += groups[gi].Slots.Length, gi++)
-            {
-                var g = groups[gi];
-                if (g.Verify)
-                    continue;
-                var before = new int[g.Slots.Length];
-                for (int q = 0; q < g.Slots.Length; q++)
-                {
-                    before[q] = g.Slots[q].NPast;
-                    g.Slots[q].NPast += g.Counts != null ? g.Counts[q] : g.RowsPerSeq;
-                }
-                if (_d != null)
-                    DraftInjectRun(g.Slots, g.RowsPerSeq, Math.Clamp(tapFirst - r0, 0, g.Rows), before, g.Counts, r0, q0);
             }
         }
 
@@ -878,7 +1057,7 @@ namespace TensorSharp.Cuda
                     _k.CopyRows(_x + (nint)(row * e * 4), e, _lastX + (nint)((long)q * e * 4), e, e, 1, Stream);
                     _k.CopyRows(_block + (nint)(row * e * 4), e, _lastBlock + (nint)((long)q * e * 4), e, e, 1, Stream);
                 }
-                _k.AddRmsNorm(_lastX, _lastBlock, _outputNorm, _xn, group.Length, e, _m.Eps, Stream);
+                FinalNorm(_lastX, _lastBlock, _outputNorm, _xn, group.Length, e, _m.Eps, Stream);
                 var flatLogits = new float[(long)group.Length * _m.NVocab];
                 Head(_xn, group.Length, flatLogits, null);
                 for (int q = 0; q < group.Length; q++)
@@ -898,7 +1077,7 @@ namespace TensorSharp.Cuda
             long last = (long)(rowsPerSeq - 1) * e * 4;
             _k.CopyRows(_x + (nint)last, (long)rowsPerSeq * e, _lastX, e, e, nSeq, Stream);
             _k.CopyRows(_block + (nint)last, (long)rowsPerSeq * e, _lastBlock, e, e, nSeq, Stream);
-            _k.AddRmsNorm(_lastX, _lastBlock, _outputNorm, _xn, nSeq, e, _m.Eps, Stream);
+            FinalNorm(_lastX, _lastBlock, _outputNorm, _xn, nSeq, e, _m.Eps, Stream);
             Head(_xn, nSeq, logitsOut, argmaxOut);
         }
 
@@ -907,8 +1086,13 @@ namespace TensorSharp.Cuda
         private void Head(IntPtr normed, int rows, float[] logitsOut, int[] argmaxOut)
         {
             int e = _m.NEmbd;
-            _k.QuantizeQ81(normed, _q8, _q8d, e, rows, Stream);
-            _k.GemvQ6k(_output, _outputRowBytes, _m.NVocab, e, _q8, _q8d, _logits, rows, Stream);
+            if (_ninferHead != null)
+                ProjectNinferFp8(_ninferHead, normed, _logits, rows, Q35Kernels.Fp8Epilogue.Round, isVerify: true);
+            else
+            {
+                _k.QuantizeQ81(normed, _q8, _q8d, e, rows, Stream);
+                _k.GemvQ6kTiled(_output, _m.NVocab, e, _q8, _q8d, _logits, rows, Stream);
+            }
             if (argmaxOut != null)
                 _k.Argmax(_logits, rows, _m.NVocab, _argmax, Stream);
             Sync();
@@ -918,6 +1102,7 @@ namespace TensorSharp.Cuda
             if (argmaxOut != null)
                 fixed (int* dst = argmaxOut)
                     CudaDriverApi.cuMemcpyDtoH((IntPtr)dst, _argmax, new UIntPtr((ulong)rows * 4)).ThrowOnError();
+            _servingTrace?.HeadCompleted(rows, _m.NVocab, logitsOut != null, argmaxOut != null);
         }
 
         /// <summary>output[n, w.Rows] = input[n, w.K] W^T: the q8_1 GEMV for up to 8 rows, the FP4
@@ -938,7 +1123,125 @@ namespace TensorSharp.Cuda
         private void GemmQuantized(in Planes w, IntPtr output, int n)
         {
             int maxSplits = n <= 64 ? 8 : 1;
-            _k.GemmW4A4(w.Codes, w.Scales, w.Rows, w.K, _fp4c, _fp4s, _fp4r, n, 1.0f, output, _partial, _counters, _sms, maxSplits, Stream);
+            _k.GemmW4A4(w.Codes, w.Scales, w.Rows, w.K, _fp4c, _fp4s, _fp4r, n, 1.0f, output, _partial, _counters, _sms, maxSplits, Stream,
+                tma: true);
+        }
+
+        private IntPtr _a8K, _a8Ks, _a8Vt, _a8Vs;
+        private int _a8Cap;
+        private int Attn8Capacity => (_m.NCtx + Q35Kernels.Attn8TileKeys - 1) / Q35Kernels.Attn8TileKeys * Q35Kernels.Attn8TileKeys;
+
+        /// <summary>One sequence's prompt chunk (not a verify window, not the split decode path) with at
+        /// least <see cref="Q35Kernels.Attn8MinKeys"/> visible keys, on Qwen3.5's 24/4 x 256 geometry.</summary>
+        private bool UsesAttn8(in RowGroup g, int maxKeys)
+            => Q35Kernels.Attn8Enabled && !g.Verify && g.Slots.Length == 1 && g.Counts == null
+               && g.RowsPerSeq * (_m.NHead / _m.NKvHead) > Q35Kernels.AttnBlockRows
+               && maxKeys >= Q35Kernels.Attn8MinKeys && maxKeys <= Attn8Capacity
+               && _m.NHead == 24 && _m.NKvHead == 4 && _m.HeadDim == Q35Kernels.AttnHeadDim;
+
+        /// <summary>Whether the 8-bit prompt attention's CTAs (128 query rows of one KV head each, every
+        /// visible key, no key split) cover enough of the device to beat the 16-bit kernels, which split
+        /// the keys of a short chunk across it (both routes). RTX 5090, a session turn's 47-token chunk
+        /// over a 127K-token cache: 8 CTAs at 5.3 ms a layer, after 0.65 ms converting the band; that
+        /// turn's first token 140 -> 50 ms. From about 40% of the SMs (about 350 rows) the 8-bit
+        /// tensor cores' double rate wins.</summary>
+        private bool Attn8FillsDevice(in RowGroup g)
+            => (long)((g.RowsPerSeq * (_m.NHead / _m.NKvHead) + 127) / 128) * _m.NKvHead * 5 >= 2L * _sms;
+
+        private static readonly bool Attn8Check = Environment.GetEnvironmentVariable("TS_Q35_ATTN8_CHECK") == "1";
+
+        /// <summary>Diagnostic (TS_Q35_ATTN8_CHECK=1): the q8_0 F16 prompt attention over the same rows,
+        /// and the 8-bit result's error against it (relative RMS and largest absolute difference).</summary>
+        private void CheckAttn8(Layer L, in RowGroup g, int r0, int q0, int maxKeys, long kOff, long vOff, IntPtr tab, nint qOff)
+        {
+            long count = (long)g.Rows * QDim;
+            IntPtr reference = Alloc(count * 4);
+            try
+            {
+                _k.Attention(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L * r0), tab, _maxBlocks, kOff, vOff, g.RowsPerSeq, g.Slots.Length,
+                    _m.NHead, _m.NKvHead, 1.0f / MathF.Sqrt(_m.HeadDim), maxKeys, IntPtr.Zero, reference, _sms, Stream, _act, (long)RowCap * _m.NFf * 4);
+                Sync();
+                var a = new float[count]; var b = new float[count];
+                fixed (float* pa = a) CudaDriverApi.cuMemcpyDtoH((IntPtr)pa, _attn + qOff, new UIntPtr((ulong)count * 4)).ThrowOnError();
+                fixed (float* pb = b) CudaDriverApi.cuMemcpyDtoH((IntPtr)pb, reference, new UIntPtr((ulong)count * 4)).ThrowOnError();
+                double err = 0, norm = 0, worst = 0;
+                for (long i = 0; i < count; i++)
+                {
+                    double d = a[i] - b[i];
+                    err += d * d; norm += (double)b[i] * b[i]; worst = Math.Max(worst, Math.Abs(d));
+                }
+                Console.Error.WriteLine($"[q35-cuda] attn8 check layer {L.Ordinal} rows {g.Rows} keys {maxKeys}: rel-rms {Math.Sqrt(err / Math.Max(norm, 1e-30)):E2} max-abs {worst:E2}");
+            }
+            finally { CudaDriverApi.cuMemFree(reference); _owned.Remove(reference); }
+        }
+
+        /// <summary>The band for at least <paramref name="keys"/> visible keys, grown in steps of
+        /// <see cref="Attn8BandStepKeys"/> up to the context; <paramref name="cap"/> is its key capacity
+        /// (the band's layout stride). It is scratch: it claims no growth reserve, a short slot or block
+        /// allocation releases it (<see cref="ReleaseAttn8Band"/>), and when even the band does not fit the
+        /// chunk runs the 16-bit kernels (false). Sized to the context up front it held 540 MB through a
+        /// 256K context's whole life, and the shared-prefix checkpoint of a 258K-token document found no
+        /// room for its slot.</summary>
+        private bool TryEnsureAttn8Band(int keys, out int cap)
+        {
+            cap = Math.Min(Attn8Capacity, (keys + Attn8BandStepKeys - 1) / Attn8BandStepKeys * Attn8BandStepKeys);
+            if (_a8Cap >= cap)
+            {
+                cap = _a8Cap;
+                return true;
+            }
+            ReleaseAttn8Band();
+            var (k, ks, vt, vs) = Q35Kernels.Attn8BandBytes(cap, _m.NKvHead);
+            try
+            {
+                EnsureDeviceMemory(k + ks + vt + vs, reserveBytes: 0);
+                _a8K = Alloc(k, _a8Owned); _a8Ks = Alloc(ks, _a8Owned); _a8Vt = Alloc(vt, _a8Owned); _a8Vs = Alloc(Math.Max(vs, 16), _a8Owned);
+            }
+            catch (Exception ex) when (ex is OutOfMemoryException or CudaException)
+            {
+                ReleaseAttn8Band();
+                if (!_attn8FallbackReported)
+                {
+                    _attn8FallbackReported = true;
+                    Console.Error.WriteLine($"[q35-cuda] no device room for the {cap}-key 8-bit attention band; such chunks run the 16-bit kernels");
+                }
+                cap = 0;
+                return false;
+            }
+            _a8Cap = cap;
+            return true;
+        }
+
+        private bool _attn8FallbackReported;
+        private const int Attn8BandStepKeys = 16384;
+        private readonly List<IntPtr> _a8Owned = new List<IntPtr>(4);
+
+        /// <summary>Frees scratch the next forward rebuilds (the 8-bit prompt-attention band). True when it held memory.</summary>
+        public bool ReleaseTransientScratch()
+        {
+            MakeCurrent();
+            return ReleaseScratchCore();
+        }
+
+        /// <summary>The 8-bit prompt-attention band, then the NInfer route's BF16 history scratch: memory
+        /// the next prompt chunk allocates again. True when any was freed.</summary>
+        private bool ReleaseScratchCore()
+        {
+            bool band = ReleaseAttn8Band();
+            bool history = _ninferAttention != null && _ninferAttention.ReleaseTransientScratch(Stream);
+            return band || history;
+        }
+
+        /// <summary>Frees the 8-bit attention band (the stream is synchronized first). True when it held memory.</summary>
+        internal bool ReleaseAttn8Band()
+        {
+            if (_a8Owned.Count == 0) return false;
+            Sync();
+            foreach (IntPtr b in _a8Owned) CudaDriverApi.cuMemFree(b);
+            _a8Owned.Clear();
+            _a8K = _a8Ks = _a8Vt = _a8Vs = IntPtr.Zero;
+            _a8Cap = 0;
+            return true;
         }
 
         /// <summary>Attention of one group's rows (rows r0.., sequences q0.. of the bound tables) over
@@ -952,10 +1255,82 @@ namespace TensorSharp.Cuda
             _k.AttnPrep(_proj + (nint)((long)r0 * AttnProjWidth * 4), n, g.RowsPerSeq, _m.NHead, _m.NKvHead, L.QNorm, L.KNorm, _m.Eps,
                 _ropePosDev + (nint)(4L * r0), RowCap, _m.SectT, _m.SectH, _m.SectW, _m.RopeBase, _cacheRowDev + (nint)(4L * r0), tab,
                 _maxBlocks, kOff, vOff, _q + qOff, _gate + qOff, Stream);
+            if (UsesAttn8(g, maxKeys) && Attn8FillsDevice(g) && TryEnsureAttn8Band(maxKeys, out int cap))
+            {
+                // 8-bit prompt attention: the visible keys once into the band, then INT8 QK / E4M3 PV.
+                _k.Attn8Band(Q35Kernels.Attn8Cache.Q8, tab, kOff, vOff, maxKeys, cap, _m.NKvHead, _a8K, _a8Ks, _a8Vt, _a8Vs, Stream);
+                _k.Attn8Prefill(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L * r0), _a8K, _a8Ks, _a8Vt, _a8Vs, cap,
+                    g.RowsPerSeq, _m.NHead, _m.NKvHead, 1.0f / MathF.Sqrt(_m.HeadDim), _attn + qOff, Stream);
+                if (Attn8Check)
+                    CheckAttn8(L, g, r0, q0, maxKeys, kOff, vOff, tab, qOff);
+                return;
+            }
             // The FFN activations are idle during attention: key-split partials of prompt chunks go there.
+            int sharedKeys = SharedPrefixKeys(g.Slots);
             _k.Attention(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L * r0), tab, _maxBlocks, kOff, vOff, g.RowsPerSeq, g.Slots.Length,
                 _m.NHead, _m.NKvHead, 1.0f / MathF.Sqrt(_m.HeadDim), maxKeys, n <= MaxVerifyRows ? _attnPartial : IntPtr.Zero, _attn + qOff,
-                _sms, Stream, _act, (long)RowCap * _m.NFf * 4);
+                _sms, Stream, _act, (long)RowCap * _m.NFf * 4, sharedKeys);
+            if (SharedPrefixCheck && n <= MaxVerifyRows && Q35Kernels.SharedSplitCount(sharedKeys, maxKeys, g.Slots.Length) > 0)
+                CheckSharedPrefixAttention(g, r0, n, maxKeys, kOff, vOff, tab, qOff);
+        }
+
+        private static readonly bool SharedPrefixCheck = Environment.GetEnvironmentVariable("TS_Q35_SHARED_PREFIX_CHECK") == "1";
+
+        /// <summary>Diagnostic (TS_Q35_SHARED_PREFIX_CHECK=1): the same rows without the shared-prefix
+        /// launch, and the largest difference to the shared result (the key ranges and each row's
+        /// arithmetic are the same, so it must be 0).</summary>
+        private void CheckSharedPrefixAttention(in RowGroup g, int r0, int n, int maxKeys, long kOff, long vOff, IntPtr tab, nint qOff)
+        {
+            long count = (long)n * QDim;
+            IntPtr reference = Alloc(count * 4);
+            try
+            {
+                _k.Attention(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L * r0), tab, _maxBlocks, kOff, vOff, g.RowsPerSeq, g.Slots.Length,
+                    _m.NHead, _m.NKvHead, 1.0f / MathF.Sqrt(_m.HeadDim), maxKeys, _attnPartial, reference, _sms, Stream, _act,
+                    (long)RowCap * _m.NFf * 4, sharedKeys: 0);
+                Sync();
+                var a = new float[count]; var b = new float[count];
+                fixed (float* pa = a) CudaDriverApi.cuMemcpyDtoH((IntPtr)pa, _attn + qOff, new UIntPtr((ulong)count * 4)).ThrowOnError();
+                fixed (float* pb = b) CudaDriverApi.cuMemcpyDtoH((IntPtr)pb, reference, new UIntPtr((ulong)count * 4)).ThrowOnError();
+                double worst = 0;
+                for (long i = 0; i < count; i++)
+                    worst = Math.Max(worst, Math.Abs((double)a[i] - b[i]));
+                Console.Error.WriteLine($"[q35-shared-check] seqs={g.Slots.Length} rows/seq={g.RowsPerSeq} keys={maxKeys} " +
+                    $"shared={SharedPrefixKeys(g.Slots)} max|diff|={worst:G3}");
+            }
+            finally
+            {
+                CudaDriverApi.cuMemFree(reference);
+                _owned.Remove(reference);
+            }
+        }
+
+        /// <summary>Keys at the start of every slot's cache that all of them read from the same cache
+        /// blocks (clones of one cached prefix share its blocks until a slot writes into one), 0 for a
+        /// single slot. Every such block lies before each slot's position: a slot copies a shared block
+        /// before its first write into it.</summary>
+        private static int SharedPrefixKeys(Slot[] slots)
+        {
+            if (slots == null || slots.Length < 2 || !Q35Kernels.SharedPrefixAttention)
+                return 0;
+            var first = slots[0].Blocks;
+            int n = first.Count;
+            foreach (var s in slots)
+                n = Math.Min(n, s.Blocks.Count);
+            int k = 0;
+            for (; k < n; k++)
+            {
+                IntPtr b = first[k];
+                bool same = true;
+                for (int i = 1; i < slots.Length && same; i++)
+                    same = slots[i].Blocks[k] == b;
+                if (!same)
+                    break;
+            }
+            int keys = k * Q35Kernels.KvBlockTokens;
+            foreach (var s in slots)
+                keys = Math.Min(keys, s.NPast);
+            return keys;
         }
 
         /// <summary>The Gated DeltaNet recurrence of one group's rows (rows r0.., sequences q0..) into
@@ -977,24 +1352,50 @@ namespace TensorSharp.Cuda
             _k.GdnPrep(qkv, proj, GdnPackedWidth, n, _m.GdnKHeads, hv, ConvDim, ValueDim, L.DtBias, L.SsmA, _m.Eps, gd, beta, Stream,
                 count, g.RowsPerSeq);
             _k.GdnScan(qkv, ConvDim, _m.GdnKHeads, hv, g.RowsPerSeq, g.Slots.Length, gd, beta, TabState(L) + (nint)(8L * q0),
-                _gdnO + (nint)((long)r0 * ValueDim * 4), verify, Stream);
+                _gdnO + (nint)((long)r0 * ValueDim * 4), verify, Stream, _gdnPreparedScratch, _gdnPreparedScratchBytes);
         }
 
         public void Dispose()
         {
-            MakeCurrent();
-            FreeSlot(_active);
-            ReleaseFreeBlocks();
-            ReleaseFreeArenas();
-            FreeHostPool();
-            foreach (IntPtr p in _owned)
-                CudaDriverApi.cuMemFree(p);
-            _owned.Clear();
-            if (_pinned != IntPtr.Zero)
-                CudaDriverApi.cuMemFreeHost(_pinned);
-            _pinned = IntPtr.Zero;
-            _k?.Dispose();
-            _alloc?.Dispose();
+            try
+            {
+                MakeCurrent();
+                Sync();
+                FreeDraftGraphs();
+                FreeVerifyGraphs();
+                LogNinferResidualNormSummary();
+                if (NinferGateUpSwiGluEnabled)
+                    Console.Error.WriteLine($"[q35-cuda] NInfer GateUp SwiGLU host submissions={NinferGateUpSwiGluHostSubmissions}, graph captures={NinferGateUpSwiGluCaptureCount}, graph launches={NinferGateUpSwiGluReplayCount} (capture included; not individual GPU kernel replay counts), module={NinferGateUpSwiGluImageSha256}");
+                InvalidateNinferDecodeGraphs();
+                FreeSlot(_active);
+                ReleaseFreeBlocks();
+                ReleaseFreeArenas();
+                FreeHostPool();
+                foreach (IntPtr p in _owned)
+                    CudaDriverApi.cuMemFree(p);
+                _owned.Clear();
+                foreach (IntPtr p in _a8Owned)
+                    CudaDriverApi.cuMemFree(p);
+                _a8Owned.Clear();
+                if (_pinned != IntPtr.Zero)
+                    CudaDriverApi.cuMemFreeHost(_pinned);
+                _pinned = IntPtr.Zero;
+                DisposeNinferLoadRepack();
+                DisposeNinferA16Candidate();
+                DisposeNinferExactVerify();
+                DisposeNinferFlashInfer();
+                DisposeNinferGdnChunk();
+                DisposeNinferDraft();
+                _ninfer?.Dispose();
+                _ninferAttention?.Dispose();
+                FreeNinferHostEmbedding();
+                _k?.Dispose();
+                _alloc?.Dispose();
+            }
+            finally
+            {
+                _servingTrace?.Close("engine_dispose_finally");
+            }
         }
     }
 }

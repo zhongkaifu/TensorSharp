@@ -68,7 +68,7 @@
   "model": {
     "path": "${root}/Qwen3.8-27B-UD-IQ3_XXS.gguf",
     "urls": ["${repo}/Qwen3.8-27B-UD-IQ3_XXS.gguf"],
-    "sha256": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e"
+    "sha256": "c0b7c3038681ed2e3040456c1dd45f9858b6c2290bed172c70388a94874f3eee"
   },
 
   // ---- Agent Skills -------------------------------------------------------

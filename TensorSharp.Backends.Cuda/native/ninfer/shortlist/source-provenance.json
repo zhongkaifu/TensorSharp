@@ -1,0 +1,57 @@
+{
+  "schema": "tensorsharp-original-shortlist-source-provenance/1",
+  "repository": "gpillon/ignis",
+  "revision": "e600a7d9e0d5921d767a6cb464373583b3cdcaf4",
+  "native_file": "tensorsharp_ninfer_shortlist.cu",
+  "original_templates": "unchanged upstream/manifest.json contains all compiled header bytes and production launch source hashes",
+  "reference_sources": [
+    {
+      "path": "kernel/vendor/src/ops/linear/q4/q4_dispatch.cpp",
+      "blob": "f3d14605d63d16c7f88c8571f852e4c019cf98ce",
+      "url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/src/ops/linear/q4/q4_dispatch.cpp",
+      "sha256": "74a5593660842463d0454edd89ecd0a108e053215535dffc7ef315f2316b1a93",
+      "bytes": 4356
+    },
+    {
+      "path": "kernel/vendor/src/ops/linear/q4/q4_small_t_mma.cu",
+      "blob": "81300b37364cf24e644cc00b7b6b2334d673d149",
+      "url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/src/ops/linear/q4/q4_small_t_mma.cu",
+      "sha256": "9a433c3947021d851189b7ee2dd9237ebe5cfc6bce1902c0a7e1d8882a72423d",
+      "bytes": 2808
+    },
+    {
+      "path": "kernel/vendor/src/ops/linear/q4/q4_rowsplit_gemm_mma.cu",
+      "blob": "0b2e812cc196fc9e35b2eb944b1413a7334802ce",
+      "url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/src/ops/linear/q4/q4_rowsplit_gemm_mma.cu",
+      "sha256": "16d8ef63764a3a9dda3f5e0ab6fb950e5e53cf8086bb1ac067b8abf0dc3a0735",
+      "bytes": 7062
+    },
+    {
+      "path": "kernel/vendor/src/ops/linear/q4/q4_rowsplit_gemv.cu",
+      "blob": "c8fa0acd3e214f5c7f42e4eed20737d052e25b57",
+      "url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/src/ops/linear/q4/q4_rowsplit_gemv.cu",
+      "sha256": "970d770b6d33a42c559e75738fa463b6b10b09b52eb54de9de1edae077bf2cc3",
+      "bytes": 1561
+    },
+    {
+      "path": "kernel/vendor/src/ops/wrapper/speculative_round.cpp",
+      "blob": "ec12be9c01c5161f8e0f685fef2d2175200c5ac9",
+      "url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/src/ops/wrapper/speculative_round.cpp",
+      "sha256": "593ac08a6a9bd23b82cd7837afb56e1465f11dfd21ea3d3fa8583f7c1930520e",
+      "bytes": 9526
+    },
+    {
+      "path": "kernel/vendor/src/ops/kernel/speculative_round.cuh",
+      "blob": "6cb955c80e1cb1a31bca915c002c783391e65b08",
+      "url": "https://github.com/gpillon/ignis/blob/e600a7d9e0d5921d767a6cb464373583b3cdcaf4/kernel/vendor/src/ops/kernel/speculative_round.cuh",
+      "sha256": "3cef808d138d4f86e43db3bad78d921b64d6f6491c7061e2e5a724574a7f2bb4",
+      "bytes": 20813
+    }
+  ],
+  "owned_changes": [
+    "Explicitly instantiate original global kernels for pinned K5120/N131072 routes; no numerical body or upstream header edits.",
+    "Export a small range-preserving remap bridge corresponding to original speculative_round.cuh442..448; original signedI32 count/range semantics retained.",
+    "Managed driver binding and actual parameter ABI checks; explicit standalone ownership, no engine default selection."
+  ],
+  "license": "Retain unchanged upstream/LICENSE,NOTICE,kernel/NOTICE,kernel/vendor/LICENSE; derived native portions preserve Apache-2.0 attribution and vendor notices."
+}

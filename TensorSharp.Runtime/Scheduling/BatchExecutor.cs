@@ -229,7 +229,8 @@ namespace TensorSharp.Runtime.Scheduling
         {
             if (!configuration.EnablePrefixCaching || _model is not IPrefixCacheModel prefixModel) return;
             PrefixCacheCapabilities capabilities = prefixModel.GetPrefixCacheCapabilities();
-            RadixCache = new PrefixCacheCoordinator(_model, _pool, _scheduler, capabilities, _logger);
+            RadixCache = new PrefixCacheCoordinator(_model, _pool, _scheduler, capabilities, _logger,
+                configuration.PromptTailCheckpointMinTokens);
             _scheduler.AttachRadixCacheContinuation(RadixCache, ComputeFusedContinuationLcp, TryAdoptFusedContinuation);
         }
 
@@ -1197,6 +1198,7 @@ namespace TensorSharp.Runtime.Scheduling
             _speculationDeclineWarned = false;
             _specPrefixReuseDeclineWarned = false;
             _sharedGovernor = null;   // a new policy is measured afresh
+            _sharedGovernorProfile = null;
         }
 
         private static readonly bool _cbDebug =
@@ -1476,6 +1478,9 @@ namespace TensorSharp.Runtime.Scheduling
             // per-sequence loop below.
             if (options.BatchedFusedDecodeEnabled && n >= 2)
             {
+                PrebindCachedPrefixPrefills(fused, output, results, ref handledBatched);
+                if (handledBatched != null && handledBatched.Count == n)
+                    return results;
                 var prefillWork = new List<ScheduledSequenceWork>(n);
                 foreach (var work in output.ScheduledWork)
                 {
@@ -1840,6 +1845,68 @@ namespace TensorSharp.Runtime.Scheduling
             if (freshCache && seq.NumComputedTokens > 0)
                 InjectPrefixOrRecompute(seq, seq.NumComputedTokens);
             return true;
+        }
+
+        /// <summary>
+        /// Binds the holders of the step's prompt chunks that continue a cached prefix (the radix,
+        /// a shared-prefix checkpoint, the live cache) but have no holder yet, injecting the prefix
+        /// and taking the reservation as the per-sequence loop does, so they can join the batched
+        /// prefill, which takes only sequences whose holder sits at the chunk's position. These ran
+        /// one after another before: concurrent chats on one cached document (RTX 5090, Qwen3.8
+        /// 27B, two chats on a 127K-token document: 47-token suffixes, first tokens at 147 and
+        /// 281 ms). Only when at least two chunks would then batch; a sequence whose step ends
+        /// while binding goes to <paramref name="handled"/>.
+        /// </summary>
+        private void PrebindCachedPrefixPrefills(IBatchedPagedModel fused, SchedulerOutput output,
+            List<SequenceStepResult> results, ref HashSet<string>? handled)
+        {
+            List<ScheduledSequenceWork>? pending = null;
+            int ready = 0;
+            foreach (var work in output.ScheduledWork)
+            {
+                var seq = work.Sequence;
+                if (!work.IsPrefill || (handled != null && handled.Contains(seq.RequestId))
+                    || (_model.MultimodalInjector != null && _model.MultimodalInjector.HasPendingEmbeddings(seq.RequestId)))
+                    continue;
+                if (_pendingRetainedFusedTruncations.TryGetValue(seq.RequestId, out int rewindTo))
+                {
+                    if (fused.BatchedPrefillRewindsHolders && rewindTo == seq.NumComputedTokens)
+                        ready++;
+                    continue;
+                }
+                if (fused.HasFusedSequenceCache(seq.RequestId) || (seq.NumComputedTokens == 0 && !seq.UsesLiveCacheContinuation))
+                    ready++;
+                else
+                    (pending ??= new List<ScheduledSequenceWork>()).Add(work);
+            }
+            if (pending == null || ready + pending.Count < 2 || !fused.BatchedPrefillTakesPrebound)
+                return;
+            foreach (var work in pending)
+            {
+                var seq = work.Sequence;
+                int prevComputed = seq.NumComputedTokens;
+                try
+                {
+                    if (BindFusedHolder(fused, seq, results))
+                    {
+                        BuildPrefillChunk(seq, work);   // only its reservation: the chunk is taken again below
+                        continue;
+                    }
+                }
+                catch (SequenceSlotUnavailableException ex) when (seq.NumComputedTokens == prevComputed
+                                                                   && !fused.HasFusedSequenceCache(seq.RequestId))
+                {
+                    _logger.LogDebug("No sequence slot for {RequestId} yet: {Reason}", seq.RequestId, ex.Message);
+                    results.Add(new SequenceStepResult { Sequence = seq, SlotUnavailable = true });
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Fused per-seq step failed for sequence {RequestId}", seq.RequestId);
+                    results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
+                    seq.Error = ex;
+                }
+                (handled ??= new HashSet<string>(StringComparer.Ordinal)).Add(seq.RequestId);
+            }
         }
 
         private List<SequenceStepResult> ExecuteStepPerSequence(SchedulerOutput output)
@@ -2293,12 +2360,18 @@ namespace TensorSharp.Runtime.Scheduling
         /// can serve this model, and the plan's next candidate then serves the
         /// step with plain decoding.
         /// </summary>
-        // One governor for every speculative execution this executor arms: its
-        // verdict is about the (model, drafter, backend) triple, which is the same
-        // for every request, and a chat's turns are short - re-measuring from
-        // scratch on each of them cost more than it decided. Replaced with the policy.
+        // Share measurements while the resolved model/head/configuration policy
+        // agrees. A different request profile receives a new governor, so a live
+        // execution never has its selected policy changed by the next request.
         private SpeculationCostGovernor? _sharedGovernor;
-        private SpeculationCostGovernor SharedGovernor => _sharedGovernor ??= new SpeculationCostGovernor();
+        private SpeculationGovernorFactory.Profile? _sharedGovernorProfile;
+        private SpeculationCostGovernor SharedGovernorFor(ISpeculativeTarget target, ISpeculator speculator, SequenceState sequence)
+        {
+            var profile = SpeculationGovernorFactory.Describe(target, speculator,
+                CanUseFixedGovernorGreedyProfile(sequence, FirstTokenLogitsDump.IsArmed || _cbDebug),
+                SpeculationCostGovernor.AdaptiveEnvironmentSnapshot);
+            return SpeculationGovernorFactory.Share(ref _sharedGovernor, ref _sharedGovernorProfile, profile);
+        }
 
         /// <summary>Whether a request can profit from drafting at all: it needs at
         /// least two tokens to decode, or every proposal would be wasted.</summary>
@@ -2323,11 +2396,12 @@ namespace TensorSharp.Runtime.Scheduling
             // state - release it here rather than leaving it to the GC.
             _specCtx?.Exec?.Dispose();
 
-            var exec = new SpeculativeExecution(spec, speculator, trunk, SharedGovernor);
+            var exec = new SpeculativeExecution(spec, speculator, trunk, SharedGovernorFor(spec, speculator, seq));
             _logger.LogInformation(
                 "Speculative decoding armed for {RequestId} (algorithm={Algorithm}, maxDraft={MaxDraft}, "
-                + "pMin={PMin}, trunk={Trunk})",
-                seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, trunkLabel);
+                + "pMin={PMin}, trunk={Trunk}, adaptive={Adaptive}, adaptiveSource={AdaptiveSource})",
+                seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, trunkLabel,
+                exec.AdaptiveSpeculation, exec.Governor.SelectionSource);
             return exec;
         }
 
@@ -2498,12 +2572,35 @@ namespace TensorSharp.Runtime.Scheduling
                         || (stopRepetition
                             && RepetitionGuard.IsLooping(seq.OutputTokens, seq.OutputTokens.Count, out _, out _)))
                         stopped = true;
-                });
+                },
+                drawGreedy: CanUseGreedySpecVerify(seq, FirstTokenLogitsDump.IsArmed || _cbDebug) ? drawn =>
+                {
+                    if (stopped) return -1;
+                    // Keep this check per row, AFTER onDraftAccepted updated the
+                    // committed history, exactly as TokenSampler.Sample does.
+                    if (!penaltySampler.TryGetForcedThinkingToken(seq.OutputTokens, out int forced))
+                        return drawn;
+                    if ((uint)forced >= (uint)_model.Config.VocabSize)
+                        throw new InvalidOperationException("Thinking end token is outside the model vocabulary.");
+                    return forced;
+                } : null);
             swDecode.Stop();
             accepted = acceptedTokens;
             elapsedTicks = swDecode.ElapsedTicks;
             return outcome;
         }
+
+        // Full-logit consumers and prompts containing media (including images,
+        // video or audio in earlier turns) retain the original solo verify path.
+        // MediaSpans survives prefill/prefix reuse; pending embedding queues do not.
+        // A future logprob/logit observer must join this gate rather than consume
+        // a token-only outcome. The existing batched verify path is unchanged.
+        internal static bool CanUseGreedySpecVerify(SequenceState seq, bool requiresLogits) =>
+            seq.OutputTokens.Count > 0 && CanUseFixedGovernorGreedyProfile(seq, requiresLogits);
+        // Arming precedes the first draw. History is a decode-time requirement,
+        // while sampler/media/logit-consumer eligibility is already knowable.
+        internal static bool CanUseFixedGovernorGreedyProfile(SequenceState seq, bool requiresLogits) =>
+            seq.MediaSpans.Count == 0 && seq.GetOrCreateSampler().IsPlainGreedyArgmax && !requiresLogits;
 
         // ---- Speculation on a per-request fused holder ----
         //
@@ -2996,7 +3093,7 @@ namespace TensorSharp.Runtime.Scheduling
                 _fusedSpecDeclined.Add(seq.RequestId);
                 return false;
             }
-            var exec = new SpeculativeExecution(spec, speculator, trunk: null, SharedGovernor);
+            var exec = new SpeculativeExecution(spec, speculator, trunk: null, SharedGovernorFor(spec, speculator, seq));
             if (!exec.CanSeedCommitted)
             {
                 exec.Dispose();
@@ -3012,8 +3109,9 @@ namespace TensorSharp.Runtime.Scheduling
             seq.SpecStats = exec.Stats;
             _logger.LogInformation(
                 "Speculative decoding armed for {RequestId} (algorithm={Algorithm}, maxDraft={MaxDraft}, "
-                + "pMin={PMin}, trunk=fused holder over {Committed} committed tokens)",
-                seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, prevComputed);
+                + "pMin={PMin}, trunk=fused holder over {Committed} committed tokens, adaptive={Adaptive}, adaptiveSource={AdaptiveSource})",
+                seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, prevComputed,
+                exec.AdaptiveSpeculation, exec.Governor.SelectionSource);
             return true;
         }
 
@@ -3434,6 +3532,11 @@ namespace TensorSharp.Runtime.Scheduling
         {
             // Every path's first token passes through here or PeekPendingOrSample, which is
             // what makes this the one place the first-token dump can be taken for all of them.
+            if (seq.EarlyFirstToken >= 0 && seq.OutputTokens.Count == 0)
+            {
+                seq.PendingDeviceToken = null;
+                return seq.EarlyFirstToken;
+            }
             var dump = seq.OutputTokens.Count == 0 && FirstTokenLogitsDump.IsArmed
                 ? CaptureFirstTokenLogits(seq) : null;
             if (seq.GetOrCreateSampler().TryGetForcedThinkingToken(seq.OutputTokens, out int thinkingEnd))
@@ -3463,6 +3566,8 @@ namespace TensorSharp.Runtime.Scheduling
         /// leaves the fallback loop a token source.</summary>
         private static int PeekPendingOrSample(SequenceState seq)
         {
+            if (seq.EarlyFirstToken >= 0 && seq.OutputTokens.Count == 0)
+                return seq.EarlyFirstToken;
             // A peeked first token is the one the step emits (a decline stashes it for the
             // fallback), so the dump is taken here as well; it is written once either way.
             var dump = seq.OutputTokens.Count == 0 && FirstTokenLogitsDump.IsArmed
@@ -3484,6 +3589,23 @@ namespace TensorSharp.Runtime.Scheduling
             int sampled = SampleFromLogits(seq);
             dump?.Complete(sampled, "sampled");
             return sampled;
+        }
+
+        /// <summary>Draws the first output token of a sequence whose prompt has just been
+        /// prefilled, so the engine can stream it before the step that forwards it. The draw
+        /// is the one that step makes (<see cref="SequenceState.EarlyFirstToken"/>); false
+        /// when the sequence already has output or no logits or device draw to take it from.</summary>
+        internal static bool TryDrawEarlyFirstToken(SequenceState seq, out int token)
+        {
+            token = -1;
+            if (seq.OutputTokens.Count != 0 || seq.EarlyFirstToken >= 0 || seq.NumUncomputedTokens != 0)
+                return false;
+            bool device = seq.PendingDeviceToken.HasValue && seq.PendingDevicePosition == seq.NumComputedTokens;
+            if (seq.LastLogits == null && !device)
+                return false;
+            token = PeekPendingOrSample(seq);
+            seq.EarlyFirstToken = token;
+            return true;
         }
 
         private static int SampleFromLogits(SequenceState seq)
@@ -4234,6 +4356,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// first step): the model rewinds such a holder to <c>positions[i]</c> itself, which must then be
         /// exact. Default false: those requests prefill in the per-sequence loop, one after another.</summary>
         bool BatchedPrefillRewindsHolders => false;
+
+        /// <summary>Whether <see cref="TryForwardBatchedFusedPrefill"/> takes a request whose holder the
+        /// executor created and filled from a cached prefix earlier in the same step (bound, injected,
+        /// reserved, not yet forwarded). The executor then binds such requests before the batched
+        /// prefill instead of leaving each to the per-sequence loop. Default false.</summary>
+        bool BatchedPrefillTakesPrebound => false;
     }
 
     /// <summary>Per-step metadata for the batched paged attention path.

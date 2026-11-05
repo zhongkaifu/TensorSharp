@@ -2843,6 +2843,7 @@ namespace TensorSharp.Models
                     && _ssmNormW[layer] != null)
                 {
                     gated = seqLen == 1 ? _gdnGatedOutT : new Tensor(_allocator, DType.Float32, seqLen, _ssmDInner);
+                    _mlxGdnCache[layer].KeepRowStates = MlxKeepVerifyRowStates(seqLen);
                     ranMlxNativeGdn = _mlxGdnCache[layer].TryRunQwen35Packed(
                         gated,
                         packedInput,
@@ -2894,6 +2895,7 @@ namespace TensorSharp.Models
                     && _ssmNormW[layer] != null)
                 {
                     gated = seqLen == 1 ? _gdnGatedOutT : new Tensor(_allocator, DType.Float32, seqLen, _ssmDInner);
+                    _mlxGdnCache[layer].KeepRowStates = MlxKeepVerifyRowStates(seqLen);
                     ranMlxNativeGdn = _mlxGdnCache[layer].TryRunQwen35(
                         gated,
                         qkvRaw,

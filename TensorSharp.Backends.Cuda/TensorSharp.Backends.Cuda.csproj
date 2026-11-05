@@ -58,6 +58,17 @@
          locally built kernels with the committed baseline, or copy over native
          assets. It requires an already populated output instead. -->
     <TensorSharpSkipCudaPtx Condition="'$(TensorSharpSkipCudaPtx)' == ''">false</TensorSharpSkipCudaPtx>
+    <!-- Kept outside the generic PTX directory: this unchanged C++20/SM120a
+         core must never enter compute_75 builds or the portable baseline. -->
+    <NinferVerify8OutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'obj', 'cuda_ninfer_verify8'))</NinferVerify8OutputDir>
+    <_NinferVerify8Source>$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/tensorsharp_ninfer_prefill_attention.cu</_NinferVerify8Source>
+    <_NinferVerify8Flags>-std=c++20 -O3 --ftz=false --fmad=true -arch=sm_120a -I&quot;$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/upstream/kernel/vendor/src&quot; -I&quot;$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/upstream/kernel/vendor/include&quot;</_NinferVerify8Flags>
+    <!-- Independent BF16 T8 asset; never part of the generic/portable PTX loop. -->
+    <NinferGdnChunkOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'obj', 'cuda_ninfer_gdn_chunk'))</NinferGdnChunkOutputDir>
+    <_NinferGdnChunkSource>$(MSBuildProjectDirectory)/native/ninfer/chunk/tensorsharp_ninfer_gdn_chunk.cu</_NinferGdnChunkSource>
+    <!-- The exact flags of eng/validation/build-ninfer-gdn-chunk-module.py (C++20 for the
+         unchanged original prepare header's template lambdas; no fast math). -->
+    <_NinferGdnChunkFlags>-std=c++20 -O3 --fmad=true --ftz=false --prec-div=true --prec-sqrt=true -arch=sm_120a -I&quot;$(MSBuildProjectDirectory)/native/ninfer/chunk/upstream/kernel/vendor/src&quot;</_NinferGdnChunkFlags>
   </PropertyGroup>
 
   <ItemGroup>
@@ -69,6 +80,28 @@
     <CudaKernel Update="$(CudaKernelDir)/tensorsharp_q35_kernels.cu">
       <CommittedBaseline>false</CommittedBaseline>
     </CudaKernel>
+    <CudaKernel Update="$(CudaKernelDir)/tensorsharp_q35_ninfer_attention.cu">
+      <CommittedBaseline>false</CommittedBaseline>
+    </CudaKernel>
+    <CudaKernel Include="$(MSBuildProjectDirectory)/native/ninfer/tensorsharp_q35_ninfer.cu">
+      <CommittedBaseline>false</CommittedBaseline>
+    </CudaKernel>
+    <CudaKernel Include="$(MSBuildProjectDirectory)/native/ninfer/tensorsharp_q35_ninfer_a16_legacy_exact_vector.cu">
+      <CommittedBaseline>false</CommittedBaseline>
+      <AdditionalOptions>-std=c++17 --ftz=false --fmad=true</AdditionalOptions>
+    </CudaKernel>
+    <CudaKernel Include="$(MSBuildProjectDirectory)/native/ninfer/tensorsharp_ninfer_repack.cu">
+      <CommittedBaseline>false</CommittedBaseline>
+      <AdditionalOptions>-std=c++17 --ftz=false --fmad=true</AdditionalOptions>
+    </CudaKernel>
+    <CudaKernel Include="$(MSBuildProjectDirectory)/native/ninfer/tensorsharp_q35_ninfer_draft.cu">
+      <CommittedBaseline>false</CommittedBaseline>
+      <AdditionalOptions>-std=c++17 --ftz=false --fmad=true -I&quot;$(MSBuildProjectDirectory)/native/ninfer/draft/upstream/kernel/vendor/src&quot;</AdditionalOptions>
+    </CudaKernel>
+    <CudaKernelHeader Include="$(MSBuildProjectDirectory)/native/ninfer/draft/upstream/**/*.cuh" />
+    <CudaKernelHeader Include="$(MSBuildProjectDirectory)/native/ninfer/draft/upstream/**/*.h" />
+    <NinferVerify8Input Include="$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/**/*.cu;$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/**/*.cuh;$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/**/*.h" />
+    <NinferGdnChunkInput Include="$(MSBuildProjectDirectory)/native/ninfer/chunk/**/*.cu;$(MSBuildProjectDirectory)/native/ninfer/chunk/**/*.cuh;$(MSBuildProjectDirectory)/native/ninfer/chunk/**/*.h" />
     <!-- Headers the kernels #include (e.g. the vendored IQ2_XXS tables). Tracked as
          build inputs so editing them re-triggers the PTX compile below. -->
     <CudaKernelHeader Include="$(CudaKernelDir)/*.cuh" />
@@ -101,6 +134,115 @@
     <Error Condition="Exists('$(_CudaPrebuiltPtxDir)/%(_CudaRequiredPrebuiltKernel.Filename).ptx') And !$([System.Text.RegularExpressions.Regex]::IsMatch($([System.IO.File]::ReadAllText('$(_CudaPrebuiltPtxDir)/%(_CudaRequiredPrebuiltKernel.Filename).ptx')), '(?m)^\.target\s+sm_\d+[a-z]?(?:\s*,[^\r\n]*)?\s*$'))"
            Text="Prebuilt CUDA PTX has no valid .target directive: $(_CudaPrebuiltPtxDir)/%(_CudaRequiredPrebuiltKernel.Filename).ptx." />
     <Message Importance="high" Text="TensorSharp CUDA managed-only build: preserving existing native assets in $(_CudaPrebuiltPtxDir); no PTX compilation, fallback selection or copying." />
+  </Target>
+
+  <!-- Pure policy target can be exercised without nvcc. The compile target
+       resolves the real toolchain/architecture before invoking this target. -->
+  <Target Name="ResolveNinferVerify8BuildPolicy">
+    <PropertyGroup>
+      <_NinferVerify8BuildEnabled>false</_NinferVerify8BuildEnabled>
+      <_NinferVerify8BuildEnabled Condition="'$(_NvccExitCode)' == '0' And '$(TensorSharpSkipCudaPtx)' != 'true' And '$(DesignTimeBuild)' != 'true' And '$(TensorSharpUpdateCommittedPtx)' != 'true' And ($([System.Text.RegularExpressions.Regex]::IsMatch('$(_ResolvedCudaArch)', '^(?:compute|sm)_120a?$')) Or $([System.Text.RegularExpressions.Regex]::IsMatch('$(CudaFatbinArchitectures)', '(^|[,; ])120a?($|[,; ])')))">true</_NinferVerify8BuildEnabled>
+    </PropertyGroup>
+  </Target>
+
+  <!-- Shared by generic and optional kernels, including incremental builds. -->
+  <Target Name="ResolveCudaHostCompiler" DependsOnTargets="ResolveCudaPtxBuildSettings"
+          Condition="'$(TensorSharpSkipCudaPtx)' != 'true'">
+    <PropertyGroup Condition="'$(_NvccExitCode)' == '0' And '$([MSBuild]::IsOSPlatform(Windows))' == 'true' And '$(VCToolsInstallDir)' != ''">
+      <_CompilerBinDir>--compiler-bindir="$(VCToolsInstallDir)bin\Hostx64\x64"</_CompilerBinDir>
+    </PropertyGroup>
+    <!-- The query below asks vswhere for "all, including prerelease" rather than
+         "latest": the VS installer flags an instance "incomplete" after an
+         interrupted update, and a latest-only query silently skips such instances
+         (prints nothing, exits 0) even though cl.exe on disk works fine. nvcc
+         would then run with no host compiler directory and fail with
+         "Cannot find compiler 'cl.exe' in PATH". Same reasoning as
+         eng/vs-locate.ps1. -->
+    <Exec Condition="'$(_NvccExitCode)' == '0' And '$([MSBuild]::IsOSPlatform(Windows))' == 'true' And '$(_CompilerBinDir)' == ''"
+          Command="for /f &quot;delims=&quot; %%i in ('&quot;%25ProgramFiles(x86)%25\Microsoft Visual Studio\Installer\vswhere.exe&quot; -all -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe') do @echo %%~dpi"
+          ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_ClExeDir" />
+    </Exec>
+    <PropertyGroup Condition="'$(_CompilerBinDir)' == '' And '$(_ClExeDir)' != ''">
+      <!-- vswhere prints one line per installed MSVC toolset and Exec joins them
+           with ';', which nvcc would reject as a single bogus compiler-bindir
+           path. Keep only the first (oldest) toolset: nvcc caps the host cl
+           version it accepts, so the oldest installed toolset is the safest. -->
+      <_ClExeDirClean>$(_ClExeDir.Split(';')[0].Trim().TrimEnd('\'))</_ClExeDirClean>
+      <_CompilerBinDir>--compiler-bindir=&quot;$(_ClExeDirClean)&quot;</_CompilerBinDir>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(_NvccExitCode)' == '0' And '$(_CompilerBinDir)' != ''">
+      <!-- MSVC 14.5x toolsets (VS 2026) are newer than the host-compiler range
+           current CUDA toolkits accept, so nvcc aborts in host_config.h with
+           "unsupported Microsoft Visual Studio version!". Let it proceed; the
+           flag is a no-op once the installed CUDA toolkit officially supports
+           the toolset. -->
+      <_NvccAllowUnsupportedCompilerFlag Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(_CompilerBinDir)', 'MSVC\\14\.[5-9][0-9]'))">-allow-unsupported-compiler</_NvccAllowUnsupportedCompilerFlag>
+    </PropertyGroup>
+  </Target>
+
+  <Target Name="CompileNinferVerify8Attention"
+          BeforeTargets="BeforeBuild"
+          DependsOnTargets="ResolveCudaPtxBuildSettings;ResolveCudaHostCompiler;ResolveNinferVerify8BuildPolicy"
+          Condition="'$(TensorSharpSkipCudaPtx)' != 'true' And '$(DesignTimeBuild)' != 'true'"
+          Inputs="@(NinferVerify8Input);$(MSBuildProjectFullPath)"
+          Outputs="$(NinferVerify8OutputDir)/tensorsharp_ninfer_prefill_attention.ptx;$(NinferVerify8OutputDir)/tensorsharp_ninfer_prefill_attention.fatbin;$(NinferVerify8OutputDir)/tensorsharp_ninfer_prefill_attention.fatbin.sha256;$(NinferVerify8OutputDir)/nvcc$(_NvccMajor).$(_NvccMinor).stamp">
+    <MakeDir Condition="'$(_NinferVerify8BuildEnabled)' == 'true'" Directories="$(NinferVerify8OutputDir)" />
+    <!-- Exact qualified build-script flags; global fast-math/vectorization
+         switches do not alter this core's numerical contract. -->
+    <Exec Condition="'$(_NinferVerify8BuildEnabled)' == 'true'"
+          Command="&quot;$(CudaNvcc)&quot; $(_NinferVerify8Flags) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -ptx &quot;$(_NinferVerify8Source)&quot; -o &quot;$(NinferVerify8OutputDir)/tensorsharp_ninfer_prefill_attention.ptx&quot;" StandardOutputImportance="low" />
+    <Exec Condition="'$(_NinferVerify8BuildEnabled)' == 'true'"
+          Command="&quot;$(CudaNvcc)&quot; $(_NinferVerify8Flags) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -fatbin &quot;$(_NinferVerify8Source)&quot; -o &quot;$(NinferVerify8OutputDir)/tensorsharp_ninfer_prefill_attention.fatbin&quot;" StandardOutputImportance="low" />
+    <GetFileHash Condition="'$(_NinferVerify8BuildEnabled)' == 'true'" Files="$(NinferVerify8OutputDir)/tensorsharp_ninfer_prefill_attention.ptx" Algorithm="SHA256" HashEncoding="hex">
+      <Output TaskParameter="Items" ItemName="_NinferVerify8PtxHash" />
+    </GetFileHash>
+    <WriteLinesToFile Condition="'$(_NinferVerify8BuildEnabled)' == 'true'" File="$(NinferVerify8OutputDir)/tensorsharp_ninfer_prefill_attention.fatbin.sha256" Lines="%(_NinferVerify8PtxHash.FileHash)" Overwrite="true" />
+    <WriteLinesToFile Condition="'$(_NinferVerify8BuildEnabled)' == 'true'" File="$(NinferVerify8OutputDir)/nvcc$(_NvccMajor).$(_NvccMinor).stamp" Lines="$(_NinferVerify8Flags)" Overwrite="true" />
+  </Target>
+
+  <Target Name="SelectNinferVerify8AttentionContent" BeforeTargets="AssignTargetPaths"
+          DependsOnTargets="CompileNinferVerify8Attention"
+          Condition="'$(TensorSharpSkipCudaPtx)' != 'true' And '$(DesignTimeBuild)' != 'true'">
+    <ItemGroup Condition="'$(_NinferVerify8BuildEnabled)' == 'true'">
+      <Content Include="$(NinferVerify8OutputDir)/tensorsharp_ninfer_prefill_attention.ptx" Link="cuda_kernels/tensorsharp_ninfer_prefill_attention.ptx" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(NinferVerify8OutputDir)/tensorsharp_ninfer_prefill_attention.fatbin" Link="cuda_kernels/tensorsharp_ninfer_prefill_attention.fatbin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(NinferVerify8OutputDir)/tensorsharp_ninfer_prefill_attention.fatbin.sha256" Link="cuda_kernels/tensorsharp_ninfer_prefill_attention.fatbin.sha256" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/upstream/LICENSE" Link="cuda_kernels/ninfer_prefill_attention_licenses/ignis-LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/upstream/NOTICE" Link="cuda_kernels/ninfer_prefill_attention_licenses/NOTICE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(MSBuildProjectDirectory)/native/ninfer/prefill_attention/upstream/kernel/vendor/LICENSE" Link="cuda_kernels/ninfer_prefill_attention_licenses/ninfer-LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
+
+  <!-- Ignis-original chunked GDN prefill (native/ninfer/chunk), built with the Verify8 policy (sm_120 only). -->
+  <Target Name="CompileNinferGdnChunk"
+          BeforeTargets="BeforeBuild"
+          DependsOnTargets="ResolveCudaPtxBuildSettings;ResolveCudaHostCompiler;ResolveNinferVerify8BuildPolicy"
+          Condition="'$(TensorSharpSkipCudaPtx)' != 'true' And '$(DesignTimeBuild)' != 'true'"
+          Inputs="@(NinferGdnChunkInput);$(MSBuildProjectFullPath)"
+          Outputs="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.ptx;$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin;$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin.sha256;$(NinferGdnChunkOutputDir)/nvcc$(_NvccMajor).$(_NvccMinor).stamp">
+    <MakeDir Condition="'$(_NinferVerify8BuildEnabled)' == 'true'" Directories="$(NinferGdnChunkOutputDir)" />
+    <Exec Condition="'$(_NinferVerify8BuildEnabled)' == 'true'"
+          Command="&quot;$(CudaNvcc)&quot; $(_NinferGdnChunkFlags) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -ptx &quot;$(_NinferGdnChunkSource)&quot; -o &quot;$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.ptx&quot;" StandardOutputImportance="low" />
+    <Exec Condition="'$(_NinferVerify8BuildEnabled)' == 'true'"
+          Command="&quot;$(CudaNvcc)&quot; $(_NinferGdnChunkFlags) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -fatbin &quot;$(_NinferGdnChunkSource)&quot; -o &quot;$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin&quot;" StandardOutputImportance="low" />
+    <GetFileHash Condition="'$(_NinferVerify8BuildEnabled)' == 'true'" Files="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.ptx" Algorithm="SHA256" HashEncoding="hex">
+      <Output TaskParameter="Items" ItemName="_NinferGdnChunkPtxHash" />
+    </GetFileHash>
+    <WriteLinesToFile Condition="'$(_NinferVerify8BuildEnabled)' == 'true'" File="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin.sha256" Lines="%(_NinferGdnChunkPtxHash.FileHash)" Overwrite="true" />
+    <WriteLinesToFile Condition="'$(_NinferVerify8BuildEnabled)' == 'true'" File="$(NinferGdnChunkOutputDir)/nvcc$(_NvccMajor).$(_NvccMinor).stamp" Lines="$(_NinferGdnChunkFlags)" Overwrite="true" />
+  </Target>
+
+  <Target Name="SelectNinferGdnChunkContent" BeforeTargets="AssignTargetPaths"
+          DependsOnTargets="CompileNinferGdnChunk"
+          Condition="'$(TensorSharpSkipCudaPtx)' != 'true' And '$(DesignTimeBuild)' != 'true'">
+    <ItemGroup Condition="'$(_NinferVerify8BuildEnabled)' == 'true'">
+      <Content Include="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.ptx" Link="cuda_kernels/tensorsharp_ninfer_gdn_chunk.ptx" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin" Link="cuda_kernels/tensorsharp_ninfer_gdn_chunk.fatbin" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(NinferGdnChunkOutputDir)/tensorsharp_ninfer_gdn_chunk.fatbin.sha256" Link="cuda_kernels/tensorsharp_ninfer_gdn_chunk.fatbin.sha256" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(MSBuildProjectDirectory)/native/ninfer/chunk/upstream/LICENSE" Link="cuda_kernels/ninfer_gdn_chunk_licenses/ignis-LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(MSBuildProjectDirectory)/native/ninfer/chunk/upstream/NOTICE" Link="cuda_kernels/ninfer_gdn_chunk_licenses/NOTICE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
   </Target>
 
   <Target Name="DetectCudaPtxBuildSettings" Condition="'$(TensorSharpSkipCudaPtx)' != 'true'">
@@ -232,53 +374,22 @@
   <Target Name="CompileCudaPtx"
           BeforeTargets="BeforeBuild"
           Condition="'$(TensorSharpSkipCudaPtx)' != 'true'"
-          DependsOnTargets="ResolveCudaPtxBuildSettings"
+          DependsOnTargets="ResolveCudaPtxBuildSettings;ResolveCudaHostCompiler"
           Inputs="@(CudaKernel);@(CudaKernelHeader);$(MSBuildProjectFullPath);$(CudaArchResolverPs1);$(CudaArchResolverSh)"
           Outputs="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx');$(_CudaFatbinOutputs);$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp">
     <Message Condition="'$(_NvccExitCode)' != '0'" Importance="high"
              Text="TensorSharp CUDA build: nvcc not found; using the committed PTX kernels." />
-    <PropertyGroup Condition="'$(_NvccExitCode)' == '0' And '$([MSBuild]::IsOSPlatform(Windows))' == 'true' And '$(VCToolsInstallDir)' != ''">
-      <_CompilerBinDir>--compiler-bindir="$(VCToolsInstallDir)bin\Hostx64\x64"</_CompilerBinDir>
-    </PropertyGroup>
-    <!-- The query below asks vswhere for "all, including prerelease" rather than
-         "latest": the VS installer flags an instance "incomplete" after an
-         interrupted update, and a latest-only query silently skips such instances
-         (prints nothing, exits 0) even though cl.exe on disk works fine. nvcc
-         would then run with no host compiler directory and fail with
-         "Cannot find compiler 'cl.exe' in PATH". Same reasoning as
-         eng/vs-locate.ps1. -->
-    <Exec Condition="'$(_NvccExitCode)' == '0' And '$([MSBuild]::IsOSPlatform(Windows))' == 'true' And '$(_CompilerBinDir)' == ''"
-          Command="for /f &quot;delims=&quot; %%i in ('&quot;%25ProgramFiles(x86)%25\Microsoft Visual Studio\Installer\vswhere.exe&quot; -all -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe') do @echo %%~dpi"
-          ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
-      <Output TaskParameter="ConsoleOutput" PropertyName="_ClExeDir" />
-    </Exec>
-    <PropertyGroup Condition="'$(_CompilerBinDir)' == '' And '$(_ClExeDir)' != ''">
-      <!-- vswhere prints one line per installed MSVC toolset and Exec joins them
-           with ';', which nvcc would reject as a single bogus compiler-bindir
-           path. Keep only the first (oldest) toolset: nvcc caps the host cl
-           version it accepts, so the oldest installed toolset is the safest. -->
-      <_ClExeDirClean>$(_ClExeDir.Split(';')[0].Trim().TrimEnd('\'))</_ClExeDirClean>
-      <_CompilerBinDir>--compiler-bindir=&quot;$(_ClExeDirClean)&quot;</_CompilerBinDir>
-    </PropertyGroup>
-    <PropertyGroup Condition="'$(_NvccExitCode)' == '0' And '$(_CompilerBinDir)' != ''">
-      <!-- MSVC 14.5x toolsets (VS 2026) are newer than the host-compiler range
-           current CUDA toolkits accept, so nvcc aborts in host_config.h with
-           "unsupported Microsoft Visual Studio version!". Let it proceed; the
-           flag is a no-op once the installed CUDA toolkit officially supports
-           the toolset. -->
-      <_NvccAllowUnsupportedCompilerFlag Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(_CompilerBinDir)', 'MSVC\\14\.[5-9][0-9]'))">-allow-unsupported-compiler</_NvccAllowUnsupportedCompilerFlag>
-    </PropertyGroup>
     <MakeDir Condition="'$(_NvccExitCode)' == '0'" Directories="$(PtxOutputDir);$(CudaPtxStampDir)" />
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="Compiling %(CudaKernel.Filename).cu to PTX for $(_ResolvedCudaArch)" />
     <Exec Condition="'$(_NvccExitCode)' == '0'"
-          Command="&quot;$(CudaNvcc)&quot; -ptx -arch=$(_ResolvedCudaArch) $(CudaNvccOptimizationFlags) $(CudaFastMathFlag) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
+          Command="&quot;$(CudaNvcc)&quot; -ptx -arch=$(_ResolvedCudaArch) $(CudaNvccOptimizationFlags) $(CudaFastMathFlag) %(CudaKernel.FastMathFlag) %(CudaKernel.AdditionalOptions) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
           StandardOutputImportance="low" />
     <!-- The fatbin is compiled from the same source and flags as the PTX just written
          (from source, so architecture-specific targets get their own code paths), and its
          sidecar records that PTX's SHA-256: CudaModule loads a fatbin only beside the PTX
          of its own build, so one left behind by an earlier build is never preferred. -->
     <Exec Condition="'$(_NvccExitCode)' == '0' And '$(_CudaFatbinGencode)' != ''"
-          Command="&quot;$(CudaNvcc)&quot; -fatbin $(_CudaFatbinGencode) $(CudaNvccOptimizationFlags) $(CudaFastMathFlag) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).fatbin&quot; &quot;%(CudaKernel.FullPath)&quot;"
+          Command="&quot;$(CudaNvcc)&quot; -fatbin $(_CudaFatbinGencode) $(CudaNvccOptimizationFlags) $(CudaFastMathFlag) %(CudaKernel.FastMathFlag) %(CudaKernel.AdditionalOptions) $(_CompilerBinDir) $(_NvccAllowUnsupportedCompilerFlag) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).fatbin&quot; &quot;%(CudaKernel.FullPath)&quot;"
           StandardOutputImportance="low" />
     <GetFileHash Condition="'$(_NvccExitCode)' == '0' And '$(_CudaFatbinGencode)' != ''"
                  Files="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx')" Algorithm="SHA256" HashEncoding="hex">

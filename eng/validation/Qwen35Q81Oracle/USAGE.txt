@@ -1,0 +1,88 @@
+Q81 component, partition and mixed trace oracle — documentation revision 2026-11-02/Main
+
+This project preserves the executed host-guard-v2 sources: Program.cs 05371d21,
+Native.cs ccd45805, project 3f09b1cd. The linked Probe Program.cs 14ccbf38 and
+MixedCapacityTrace.cs d4604529 provide the same fixed schedule and host API
+dispatch observations. A source/package inventory is required to bind a real run.
+The tool does not acquire a GPU lease or start a server. Run GPU phases only in
+an operator-owned exclusive window; CPU commands below do not use CUDA/models.
+
+Current acceptance status:
+* TS_Q35_VERIFY_DECODE_Q81 is experimental and defaults OFF. Actual serving
+  no-loss acceptance FAILED: enabling Q81 changed OCR-derived typed tool
+  arguments in the fixed media-history replay. Do not recommend or enable it
+  generally based on numeric partition consistency, throughput or aggregate scores.
+* The strict same-slot/partition numeric checks do not establish model-answer
+  equivalence to the original activation policy. Preserve the observed OCR
+  regressions; A/A variation is not a waiver of the serving quality gate.
+* The separate media guard on the optional solo greedy hook retains full logits
+  for sequences carrying prepared media spans. It does not fix Q81 OCR accuracy
+  or change the legacy batched verification path.
+* Q81 (or projection tracing) with either TS_Q35_CUDA_GRAPHS=1 or
+  TS_Q35_VERIFY_GRAPHS=1 is rejected before CUDA context creation. This tool's
+  successful numeric runs do not authorize a Q81+graphs combination.
+
+CPU preparation (run from repository root; select a new absolute output):
+  TENSORSHARP_GGML_NO_UPDATE=1 MSBUILDDISABLENODEREUSE=1 \
+    dotnet build eng/validation/Qwen35Q81Oracle/Qwen35Q81Oracle.csproj \
+    -c Release -o /ABS/FRESH/runtime -p:TensorSharpSkipGgmlNative=true \
+    -p:TensorSharpSkipMlxNative=true -p:CudaNvcc=/nonexistent/cpu-only \
+    -p:UseSharedCompilation=false -nr:false -m:2
+  dotnet /ABS/FRESH/runtime/Qwen35Q81Oracle.dll --self-test
+  dotnet /ABS/FRESH/runtime/Qwen35Q81Oracle.dll --host-guard-self-test
+  dotnet /ABS/FRESH/runtime/Qwen35Q81Oracle.dll --out /ABS/FRESH/plan \
+    --source-root /ABS/REPOSITORY --phase all
+
+GPU invocation (not a claim that any device/model phase ran):
+  TS_Q35_VERIFY_DECODE_Q81=0 or 1
+  TS_Q35_PROJECTION_TRACE=1
+  TS_Q35_SHARED_SCRATCH=0 or 1
+  TS_Q35_GDN_PREPARED_PREFILL=0
+  TS_Q35_CUDA_GRAPHS=0 TS_Q35_VERIFY_GRAPHS=0
+  TS_Q35_GREEDY_VERIFY=0 TS_Q35_TOPK_PARTITIONED=0
+  Leave TS_Q35_GEMM_SPLITK, TS_Q35_DRAFT_SPLITK and TS_Q35_ATTN_PREFILL unset.
+  dotnet /ABS/runtime/Qwen35Q81Oracle.dll --out /ABS/FRESH/result \
+    --source-root /ABS/REPOSITORY --phase component|partition|mixed \
+    --model /ABS/Qwen3.8-27B-NVFP4-MTP-N4_0.gguf --execute
+For a mixed candidate add --mixed-reference /ABS/baseline/mixed. Each run/output
+is independent. The tool requires the pinned d5659ecb target and original BBD
+Q35 provider; native files must be provided separately, not built by this tool.
+
+Interpretation and limits:
+* No --execute writes a plan and performs CPU contract checks only. It is NOT_RUN
+  for CUDA, models and GPU numerical validation. Default phase is all.
+* Component checks Q81 bytes/scales and complete outputs against independent
+  explicit existing N8/tail calls with guarded buffers/offsets. N1/N8 differences
+  remain strict FAIL. This is one comparison per fixture, not component A/A or
+  proof of serving eligibility. Model/native/source identities remain required.
+* Partition compares VerifyN2x8 and separate VerifyN1x8 on the same two physical
+  slots, prefix7/equal maxKeys, with reset A/A and ABBA/full F32/drawn/features.
+  It re-Verifies N2 before Commit after N1 overwrote verify buffers, and uses the
+  same DecodeBatch2 shape for both teacher arms. Unchanged head/attention shape
+  effects can still cause genuine strict failures; no tolerance is substituted.
+* Guard v2 paints and inspects uint32 bits before/after transfer, preserving all
+  three 16-word tails. The prior sNaN float-initialization failure remains in
+  historical evidence. Passing CPU guard tests does not prove a GPU result.
+* Mixed keeps the 4096+64, 9-slot schedule and 38 F32 records/292 vocab rows.
+  Cross-flag comparison covers two last-prefill full-vocabulary rows, NOT every
+  prefill position or full recurrent state. A baseline without --mixed-reference
+  can finish capture but exits1/quality=false with cross-flag NOT_RUN. Preserve it
+  and continue independent candidate arms; do not reclassify it as numeric PASS.
+* Host role/dtype/range/API counters are submitted calls, not a GPU profiler.
+  The immutable Main policy adds a separate cache fingerprint when enabled.
+  On current Main, TRACE=0 leaves the dispatch dictionary unallocated and avoids
+  the prototype's Q81Chunks arrays; TRACE=1 intentionally observes submissions.
+  Program.cs retains the executed prototype's old embedded limitation about
+  force1/TRACE0 allocations to preserve its exact source SHA. That sentence
+  describes the old prototype, not the current Main production implementation.
+* Candidate ImageSha256 may be null. Located-file hashes, loader/assembly/source
+  and module/function metadata are provenance, not a driver-provided image hash.
+* Numeric PASS is not a performance, serving quality, or unrestricted model
+  correctness claim. Legacy A4 and role-Q81 verification intentionally differ.
+
+The existing Probe also accepts:
+  dotnet /ABS/runtime/Qwen35CudaEngineProbe.dll \
+    --q81-projection-trace /ABS/FRESH/probe-plan --plan-only
+Without --plan-only set TS_TEST_QWEN35_MODEL plus the explicit flags above.
+This Probe mode is mixed reset A/A plus actual host dispatch observations; use
+the Oracle partition phase for the separate-vs-joint same-slot comparison.

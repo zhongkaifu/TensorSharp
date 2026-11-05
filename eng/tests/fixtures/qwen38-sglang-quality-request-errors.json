@@ -1,0 +1,909 @@
+{
+  "origin": {
+    "path": "docs/validation/qwen38-regression/raw/sglang-plain-v0523-nvidiafp4head-fp8kv-ssmfp32-cap2-short-r1.jsonl",
+    "sha256": "c7f099e5b0d2bab79906a3a7f69c2820c432847ab91663f2e0567462037f6f46",
+    "scope": "Structural projection of original 3x8 generated-task and 3x8 GSM8K cases. Original verdicts, question checks, metrics and request errors retained; unused request/notes/header fields omitted. This fixture does not rescore responses."
+  },
+  "records": [
+    {
+      "kind": "run",
+      "engine": "sglang",
+      "mode": "plain",
+      "label": "v0523-nvidiafp4head-fp8kv-ssmfp32-cap2-short-r1",
+      "run_id": "f26527a66f31",
+      "harness": "qwen38-engine-bench/3",
+      "repeats": 3,
+      "quality_tasks": 8,
+      "gsm8k_limit": 8,
+      "scenarios": [
+        "quality_tasks",
+        "quality_gsm8k"
+      ]
+    },
+    {
+      "kind": "case",
+      "run_id": "f26527a66f31",
+      "scenario": "quality_tasks",
+      "repeat": 0,
+      "pass": false,
+      "verdict": "ERROR",
+      "checks": [
+        {
+          "name": "task0",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task1",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task2",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task3",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task4",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task5",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task6",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task7",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "stream_completed",
+          "ok": false,
+          "detail": "each response must include a terminal finish_reason; partial successful text is insufficient"
+        }
+      ],
+      "metrics": {
+        "n_requests": 8,
+        "n_failed_requests": 8,
+        "ttft_s": null,
+        "decode_tok_s": null,
+        "prefill_tok_s": null,
+        "total_s": null,
+        "prompt_tokens": null,
+        "completion_tokens": 0,
+        "cached_tokens": null,
+        "n_correct": 0,
+        "n_questions": 8
+      },
+      "errors": [
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>"
+      ],
+      "notes": {},
+      "requests": [
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        }
+      ]
+    },
+    {
+      "kind": "case",
+      "run_id": "f26527a66f31",
+      "scenario": "quality_tasks",
+      "repeat": 1,
+      "pass": false,
+      "verdict": "ERROR",
+      "checks": [
+        {
+          "name": "task0",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task1",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task2",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task3",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task4",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task5",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task6",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task7",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "stream_completed",
+          "ok": false,
+          "detail": "each response must include a terminal finish_reason; partial successful text is insufficient"
+        }
+      ],
+      "metrics": {
+        "n_requests": 8,
+        "n_failed_requests": 8,
+        "ttft_s": null,
+        "decode_tok_s": null,
+        "prefill_tok_s": null,
+        "total_s": null,
+        "prompt_tokens": null,
+        "completion_tokens": 0,
+        "cached_tokens": null,
+        "n_correct": 0,
+        "n_questions": 8
+      },
+      "errors": [
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>"
+      ],
+      "notes": {},
+      "requests": [
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        }
+      ]
+    },
+    {
+      "kind": "case",
+      "run_id": "f26527a66f31",
+      "scenario": "quality_tasks",
+      "repeat": 2,
+      "pass": false,
+      "verdict": "ERROR",
+      "checks": [
+        {
+          "name": "task0",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task1",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task2",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task3",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task4",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task5",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task6",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "task7",
+          "ok": false,
+          "detail": "error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "stream_completed",
+          "ok": false,
+          "detail": "each response must include a terminal finish_reason; partial successful text is insufficient"
+        }
+      ],
+      "metrics": {
+        "n_requests": 8,
+        "n_failed_requests": 8,
+        "ttft_s": null,
+        "decode_tok_s": null,
+        "prefill_tok_s": null,
+        "total_s": null,
+        "prompt_tokens": null,
+        "completion_tokens": 0,
+        "cached_tokens": null,
+        "n_correct": 0,
+        "n_questions": 8
+      },
+      "errors": [
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>"
+      ],
+      "notes": {},
+      "requests": [
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        }
+      ]
+    },
+    {
+      "kind": "case",
+      "run_id": "f26527a66f31",
+      "scenario": "quality_gsm8k",
+      "repeat": 0,
+      "pass": false,
+      "verdict": "ERROR",
+      "checks": [
+        {
+          "name": "gsm8k-test-88",
+          "ok": false,
+          "detail": "expected=8000; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-103",
+          "ok": false,
+          "detail": "expected=140; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-122",
+          "ok": false,
+          "detail": "expected=48; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-186",
+          "ok": false,
+          "detail": "expected=5; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-237",
+          "ok": false,
+          "detail": "expected=90; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-256",
+          "ok": false,
+          "detail": "expected=45; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-290",
+          "ok": false,
+          "detail": "expected=390; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-448",
+          "ok": false,
+          "detail": "expected=539; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "stream_completed",
+          "ok": false,
+          "detail": "each response must include a terminal finish_reason; partial successful text is insufficient"
+        }
+      ],
+      "metrics": {
+        "n_requests": 8,
+        "n_failed_requests": 8,
+        "ttft_s": null,
+        "decode_tok_s": null,
+        "prefill_tok_s": null,
+        "total_s": null,
+        "prompt_tokens": null,
+        "completion_tokens": 0,
+        "cached_tokens": null,
+        "n_correct": 0,
+        "n_questions": 8
+      },
+      "errors": [
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>"
+      ],
+      "notes": {
+        "ids": [
+          "gsm8k-test-88",
+          "gsm8k-test-103",
+          "gsm8k-test-122",
+          "gsm8k-test-186",
+          "gsm8k-test-237",
+          "gsm8k-test-256",
+          "gsm8k-test-290",
+          "gsm8k-test-448"
+        ]
+      },
+      "requests": [
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        }
+      ]
+    },
+    {
+      "kind": "case",
+      "run_id": "f26527a66f31",
+      "scenario": "quality_gsm8k",
+      "repeat": 1,
+      "pass": false,
+      "verdict": "ERROR",
+      "checks": [
+        {
+          "name": "gsm8k-test-88",
+          "ok": false,
+          "detail": "expected=8000; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-103",
+          "ok": false,
+          "detail": "expected=140; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-122",
+          "ok": false,
+          "detail": "expected=48; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-186",
+          "ok": false,
+          "detail": "expected=5; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-237",
+          "ok": false,
+          "detail": "expected=90; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-256",
+          "ok": false,
+          "detail": "expected=45; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-290",
+          "ok": false,
+          "detail": "expected=390; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-448",
+          "ok": false,
+          "detail": "expected=539; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "stream_completed",
+          "ok": false,
+          "detail": "each response must include a terminal finish_reason; partial successful text is insufficient"
+        }
+      ],
+      "metrics": {
+        "n_requests": 8,
+        "n_failed_requests": 8,
+        "ttft_s": null,
+        "decode_tok_s": null,
+        "prefill_tok_s": null,
+        "total_s": null,
+        "prompt_tokens": null,
+        "completion_tokens": 0,
+        "cached_tokens": null,
+        "n_correct": 0,
+        "n_questions": 8
+      },
+      "errors": [
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>"
+      ],
+      "notes": {
+        "ids": [
+          "gsm8k-test-88",
+          "gsm8k-test-103",
+          "gsm8k-test-122",
+          "gsm8k-test-186",
+          "gsm8k-test-237",
+          "gsm8k-test-256",
+          "gsm8k-test-290",
+          "gsm8k-test-448"
+        ]
+      },
+      "requests": [
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        }
+      ]
+    },
+    {
+      "kind": "case",
+      "run_id": "f26527a66f31",
+      "scenario": "quality_gsm8k",
+      "repeat": 2,
+      "pass": false,
+      "verdict": "ERROR",
+      "checks": [
+        {
+          "name": "gsm8k-test-88",
+          "ok": false,
+          "detail": "expected=8000; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-103",
+          "ok": false,
+          "detail": "expected=140; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-122",
+          "ok": false,
+          "detail": "expected=48; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-186",
+          "ok": false,
+          "detail": "expected=5; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-237",
+          "ok": false,
+          "detail": "expected=90; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-256",
+          "ok": false,
+          "detail": "expected=45; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-290",
+          "ok": false,
+          "detail": "expected=390; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "gsm8k-test-448",
+          "ok": false,
+          "detail": "expected=539; error: URLError: <urlopen error [Errno 111] Connection refused>"
+        },
+        {
+          "name": "stream_completed",
+          "ok": false,
+          "detail": "each response must include a terminal finish_reason; partial successful text is insufficient"
+        }
+      ],
+      "metrics": {
+        "n_requests": 8,
+        "n_failed_requests": 8,
+        "ttft_s": null,
+        "decode_tok_s": null,
+        "prefill_tok_s": null,
+        "total_s": null,
+        "prompt_tokens": null,
+        "completion_tokens": 0,
+        "cached_tokens": null,
+        "n_correct": 0,
+        "n_questions": 8
+      },
+      "errors": [
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>",
+        "URLError: <urlopen error [Errno 111] Connection refused>"
+      ],
+      "notes": {
+        "ids": [
+          "gsm8k-test-88",
+          "gsm8k-test-103",
+          "gsm8k-test-122",
+          "gsm8k-test-186",
+          "gsm8k-test-237",
+          "gsm8k-test-256",
+          "gsm8k-test-290",
+          "gsm8k-test-448"
+        ]
+      },
+      "requests": [
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        },
+        {
+          "error": "URLError: <urlopen error [Errno 111] Connection refused>",
+          "http_status": null,
+          "finish_reason": null,
+          "completion_tokens": 0,
+          "completion_tokens_source": "tokenizer",
+          "decode_unavailable_reason": "request_error"
+        }
+      ]
+    }
+  ]
+}

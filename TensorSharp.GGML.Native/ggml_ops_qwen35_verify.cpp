@@ -42,6 +42,13 @@ using namespace tsg;
 // ============================================================================
 namespace
 {
+    // Greedy verify: the next full-row verify on this thread downloads its N row argmaxes
+    // (ggml_argmax over the logits) instead of N x vocab logits. The caller checks
+    // TSGgml_Qwen35VerifyArgmaxDone and computes them from host logits when a path that
+    // does not reach this verify (or a tensor-parallel build) served the forward.
+    thread_local std::int32_t* tl_q35v_argmax_out = nullptr;
+    thread_local bool tl_q35v_argmax_done = false;
+
     // Persistent verify-graph cache (multi-entry, keyed by N + window stride). The
     // per-(N,window) graph is built ONCE and
     // reused, so subsequent verify steps of the same shape only upload the per-call
@@ -80,6 +87,10 @@ namespace
         ggml_tensor* mask_t = nullptr;
         ggml_tensor* logits_out = nullptr;
         ggml_tensor* normed_out = nullptr;
+        /// Greedy verify (TSGgml_Qwen35VerifyRequestArgmax): the [N] I32 row argmaxes, part of
+        /// the entry's shape so a graph without the node is never replayed for such a call.
+        ggml_tensor* argmax_out = nullptr;
+        bool has_argmax = false;
         /// DFlash residual taps: one [H, N] block per requested layer, holding the
         /// residual ENTERING it. Empty unless the caller asked for them.
         std::vector<ggml_tensor*> capture_out;
@@ -130,7 +141,8 @@ namespace
             if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; valid = false;
-            hidden_t = pos_t = kv_index = mask_t = logits_out = normed_out = nullptr;
+            hidden_t = pos_t = kv_index = mask_t = logits_out = normed_out = argmax_out = nullptr;
+            has_argmax = false;
             conv_in.clear(); delta_in.clear(); conv_out.clear(); delta_out.clear();
             conv_snaps.clear(); delta_snaps.clear();
             conv_snap_slots.clear(); delta_snap_slots.clear(); n_snapshots = 0;
@@ -524,6 +536,7 @@ namespace
         // so a 2048-token prefill writes vocab*1 floats (not vocab*2048 ~ 2 GB) and
         // skips the lm_head matmul over the first N-1 tokens. <=0 or >=N => all N.
         const int n_logits = (n_logit_rows > 0 && n_logit_rows < N) ? n_logit_rows : N;
+        const bool want_argmax = tl_q35v_argmax_out != nullptr && n_logits == N && !(tp_degree >= 1 && tp_plan_out != nullptr);
         tsg::PhaseTimer phase_timer("Qwen3.5 model verify");
 
         // Persistent per-(N,window) graph cache (build amortization + CUDA-graph
@@ -673,6 +686,7 @@ namespace
                     c.n != N || c.window != window || c.sig != sig ||
                     c.num_layers != num_layers || c.out_vocab != vocab_size ||
                     c.n_logits != n_logits ||
+                    c.has_argmax != want_argmax ||
                     c.has_normed != (normed_out != nullptr) ||
                     c.capture_count != cap_count ||
                     c.n_snapshots != n_snap ||
@@ -757,7 +771,13 @@ namespace
                         capture_data + static_cast<std::size_t>(ci) * H * N,
                         static_cast<std::size_t>(H) * N * sizeof(float));
                 }
-                finalize_compute_with_download(c.logits_out, logits_data, static_cast<std::size_t>(vocab_size) * n_logits * sizeof(float));
+                if (want_argmax && c.argmax_out != nullptr)
+                {
+                    finalize_compute_with_download(c.argmax_out, tl_q35v_argmax_out, static_cast<std::size_t>(N) * sizeof(std::int32_t));
+                    tl_q35v_argmax_done = true;
+                }
+                else
+                    finalize_compute_with_download(c.logits_out, logits_data, static_cast<std::size_t>(vocab_size) * n_logits * sizeof(float));
                 host_read_barrier();
                 // This persistent graph now owns the newest recurrent state; any
                 // older non-persist ping-pong marker must no longer win a drain.
@@ -1727,6 +1747,12 @@ namespace
         ggml_tensor* logits_out_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, vocab_size, n_logits);
         ggml_tensor* logits_cpy = ggml_cpy(ctx, logits, logits_out_t);
         ggml_set_output(logits_cpy);
+        ggml_tensor* argmax_t = nullptr;
+        if (want_argmax)
+        {
+            argmax_t = ggml_argmax(ctx, logits);                       // [N] I32
+            ggml_set_output(argmax_t);
+        }
         // A capture whose layer never ran would leave an unwritten output; refuse
         // rather than hand the drafter uninitialised residuals.
         for (int ci = 0; ci < cap_count; ci++)
@@ -1744,6 +1770,8 @@ namespace
         for (int ci = 0; ci < cap_count; ci++)
             ggml_build_forward_expand(graph, capture_out[ci]);
         ggml_build_forward_expand(graph, logits_cpy);
+        if (argmax_t != nullptr)
+            ggml_build_forward_expand(graph, argmax_t);
 
         // Turn the recorded seams into node cut points (see
         // host_moe_build_segment_ends). It fails when the builder and the
@@ -2152,7 +2180,13 @@ namespace
             finalize_compute_with_download(capture_out[ci],
                 capture_data + static_cast<std::size_t>(ci) * H * N,
                 static_cast<std::size_t>(H) * N * sizeof(float));
-        finalize_compute_with_download(logits_out_t, logits_data, static_cast<std::size_t>(vocab_size) * n_logits * sizeof(float));
+        if (argmax_t != nullptr)
+        {
+            finalize_compute_with_download(argmax_t, tl_q35v_argmax_out, static_cast<std::size_t>(N) * sizeof(std::int32_t));
+            tl_q35v_argmax_done = true;
+        }
+        else
+            finalize_compute_with_download(logits_out_t, logits_data, static_cast<std::size_t>(vocab_size) * n_logits * sizeof(float));
         host_read_barrier();
         if (chain_state)
         {
@@ -2265,6 +2299,7 @@ namespace
             slot->hidden_t = hidden_t; slot->pos_t = pos_tensor;
             slot->kv_index = kv_index; slot->mask_t = attn_mask;
             slot->logits_out = logits_out_t; slot->normed_out = normed_out_t;
+            slot->argmax_out = argmax_t; slot->has_argmax = argmax_t != nullptr;
             slot->conv_in.clear(); slot->delta_in.clear(); slot->conv_out.clear(); slot->delta_out.clear();
             for (int l = 0; l < num_layers; l++)
             {
@@ -2374,6 +2409,23 @@ namespace
         }
         g_q35v_owners.erase(owner_id);
     }
+}
+
+/// Greedy verify: the next full-row Qwen3.5 verify on this thread writes its N row argmaxes
+/// (first maximum as ggml_argmax reduces it) to `out` instead of downloading the logits.
+TSG_EXPORT void TSGgml_Qwen35VerifyRequestArgmax(std::int32_t* out)
+{
+    tl_q35v_argmax_out = out;
+    tl_q35v_argmax_done = false;
+}
+
+/// 1 when a verify since the request wrote the argmaxes; clears the request either way.
+TSG_EXPORT int TSGgml_Qwen35VerifyArgmaxDone()
+{
+    const int done = tl_q35v_argmax_done ? 1 : 0;
+    tl_q35v_argmax_out = nullptr;
+    tl_q35v_argmax_done = false;
+    return done;
 }
 
 TSG_EXPORT int TSGgml_Qwen35ModelVerifyOwned(

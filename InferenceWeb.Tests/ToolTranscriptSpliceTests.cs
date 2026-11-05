@@ -81,13 +81,14 @@ public class ToolTranscriptSpliceTests
     /// <summary>
     /// An OpenAI client that sends <c>reasoning_content</c> back gets the reasoning of
     /// EVERY round of a tool-loop turn, since the loop streams each round's thinking. The
-    /// transcript must still expand: the record's reasoning is the rounds' reasoning, not
-    /// only the final round's (which read as a conflict and re-prefilled the whole turn).
+    /// transcript must still expand for the exact concatenated reasoning or its final
+    /// round. Inserting new whitespace is an edit, not proof of the recorded transcript.
     /// </summary>
     [Theory]
-    [InlineData("plan the conversion\n\nretry with packages\n\nall done")]
-    [InlineData("all done")]
-    public void AClientEchoingTheLoopsReasoning_StillExpands(string clientThinking)
+    [InlineData("plan the conversionretry with packagesall done", true)]
+    [InlineData("all done", true)]
+    [InlineData("plan the conversion\n\nretry with packages\n\nall done", false)]
+    public void AClientEchoingTheLoopsReasoning_RequiresTheExactRecordedForm(string clientThinking, bool accepts)
     {
         var store = new ConversationTranscriptStore(maxChains: 64, maxTokens: 100_000);
         store.Record(new List<ChatMessage>
@@ -108,6 +109,14 @@ public class ToolTranscriptSpliceTests
             new() { Role = "assistant", Content = CleanAssistantText, Thinking = clientThinking },
             new() { Role = "user", Content = "next" },
         });
+
+        if (!accepts)
+        {
+            Assert.Equal(3, result.History.Count);
+            Assert.Null(result.History[1].RawOutputTokens);
+            Assert.Null(result.InheritedScope);
+            return;
+        }
 
         Assert.Equal(7, result.History.Count);
         Assert.Same(Raw3, result.History[5].RawOutputTokens);

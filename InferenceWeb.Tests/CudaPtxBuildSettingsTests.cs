@@ -12,6 +12,65 @@ public sealed class CudaPtxBuildSettingsTests
     private const string Nvcc128 = "Cuda compilation tools, release 12.8, V12.8.93";
 
     [Theory]
+    [InlineData("compute_75", "", false, false, false)]
+    [InlineData("compute_80", "", false, false, false)]
+    [InlineData("compute_120", "", false, false, true)]
+    [InlineData("sm_120a", "", false, false, true)]
+    [InlineData("compute_121", "", false, false, false)]
+    [InlineData("compute_75", "75,86,120", false, false, true)]
+    [InlineData("compute_120", "", true, false, false)]
+    [InlineData("compute_120", "", false, true, false)]
+    public async Task OptionalVerify8BuildNeverAddsTheCoreToPortableOrSkippedBuilds(string architecture,
+        string fatbins, bool skip, bool refresh, bool expected)
+    {
+        var result = await RunTarget("ResolveNinferVerify8BuildPolicy", new()
+        {
+            ["_ResolvedCudaArch"] = architecture, ["_NvccExitCode"] = "0",
+            ["TensorSharpSkipCudaPtx"] = skip ? "true" : "false", ["TensorSharpUpdateCommittedPtx"] = refresh ? "true" : "false"
+        }, new() { ["CudaFatbinArchitectures"] = fatbins }, "_NinferVerify8BuildEnabled,_NinferVerify8Flags");
+        Assert.Equal(0, result.ExitCode);
+        using var json = JsonDocument.Parse(result.Output);
+        Assert.Equal(expected ? "true" : "false", json.RootElement.GetProperty("Properties").GetProperty("_NinferVerify8BuildEnabled").GetString());
+    }
+
+    [Theory]
+    [InlineData("compute_75", false)]
+    [InlineData("compute_120", true)]
+    public async Task OptionalVerify8UsesItsOwnFixedCompilerFlagsAndPairedPublishAssets(string architecture, bool expected)
+    {
+        string directory = NewDirectory(), tools = Path.Combine(directory, "tools"), output = Path.Combine(directory, "verify8");
+        Directory.CreateDirectory(tools);
+        try
+        {
+            string compiler = FakeCompilingNvcc(tools);
+            var result = await RunTarget("SelectNinferVerify8AttentionContent", new()
+            {
+                ["CudaArch"] = architecture, ["CudaNvcc"] = compiler, ["NinferVerify8OutputDir"] = output,
+                // These global settings must not relax the dedicated core.
+                ["CudaEnableFastMath"] = "true", ["CudaNvccOptimizationFlags"] = "-O0"
+            }, getProperties: "_NinferVerify8BuildEnabled,_NinferVerify8Flags", getItems: "Content");
+            Assert.True(result.ExitCode == 0, result.Output + result.Error);
+            using var json = JsonDocument.Parse(result.Output);
+            string flags = json.RootElement.GetProperty("Properties").GetProperty("_NinferVerify8Flags").GetString()!;
+            Assert.Contains("-std=c++20 -O3 --ftz=false --fmad=true -arch=sm_120a", flags);
+            Assert.DoesNotContain("--use_fast_math", flags); Assert.DoesNotContain("-O0", flags);
+            var assets = json.RootElement.GetProperty("Items").GetProperty("Content").EnumerateArray()
+                .Where(x => x.TryGetProperty("Link", out var link) && link.GetString()!.Contains("tensorsharp_ninfer_prefill_attention.")).ToArray();
+            Assert.True(assets.Length == (expected ? 3 : 0), result.Output + result.Error);
+            Assert.Equal(expected, File.Exists(Path.Combine(output, "tensorsharp_ninfer_prefill_attention.fatbin")));
+            if (expected)
+            {
+                Assert.All(assets, x => { Assert.Equal("PreserveNewest", x.GetProperty("CopyToOutputDirectory").GetString()); Assert.Equal("PreserveNewest", x.GetProperty("CopyToPublishDirectory").GetString());
+                    Assert.Equal("cuda_kernels/" + Path.GetFileName(x.GetProperty("Identity").GetString()), x.GetProperty("Link").GetString()!.Replace('\\', '/')); });
+                string ptx = Path.Combine(output, "tensorsharp_ninfer_prefill_attention.ptx");
+                Assert.Equal(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(ptx))),
+                    File.ReadAllText(Path.Combine(output, "tensorsharp_ninfer_prefill_attention.fatbin.sha256")).Trim(), ignoreCase: true);
+            }
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [Theory]
     [InlineData(true, null, "compute_120", "compute_86", "compute_75")]
     [InlineData(true, "auto", "compute_120", "compute_86", "compute_75")]
     [InlineData(true, "native", "compute_120", "compute_86", "compute_75")]
@@ -638,7 +697,7 @@ public sealed class CudaPtxBuildSettingsTests
     // use a fake nvcc and isolated fixture paths, never repository PTX.
     private static async Task<(int ExitCode, string Output, string Error)> RunTarget(
         string target, Dictionary<string, string> properties, Dictionary<string, string>? environment = null,
-        string getProperties = "_ResolvedCudaArch,_CudaBuildSettingsKey")
+        string getProperties = "_ResolvedCudaArch,_CudaBuildSettingsKey", string? getItems = null)
     {
         string root = RepositoryRoot();
         string? host = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");
@@ -657,6 +716,7 @@ public sealed class CudaPtxBuildSettingsTests
         foreach (string argument in new[] { "msbuild", Path.Combine(root, "TensorSharp.Backends.Cuda", "TensorSharp.Backends.Cuda.csproj"),
             "-nologo", "-verbosity:quiet", "-target:" + target, "-getProperty:" + getProperties })
             start.ArgumentList.Add(argument);
+        if (getItems != null) start.ArgumentList.Add("-getItem:" + getItems);
         foreach ((string name, string value) in properties) start.ArgumentList.Add("-property:" + name + "=" + value);
         using var process = Process.Start(start)!;
         var output = process.StandardOutput.ReadToEndAsync();

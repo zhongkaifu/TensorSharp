@@ -45,7 +45,7 @@ namespace TensorSharp.Runtime
     /// ... — the <c>AccumulatingFlags</c> table) keep every file's values, in file
     /// order, and add the command line's after them.
     ///
-    /// Three conveniences build on the basic key/value mapping:
+    /// Additional conveniences build on the basic key/value mapping:
     /// <list type="bullet">
     /// <item><b>Variables.</b> A reserved <c>"variables"</c> object defines
     /// names that any string value can reference with <c>${name}</c> — so a
@@ -56,7 +56,12 @@ namespace TensorSharp.Runtime
     /// configs stay portable: they resolve a model root from
     /// <c>TENSORSHARP_MODELS</c> when it is set and from a path relative to the
     /// config file otherwise, instead of hard-coding a drive letter that means
-    /// nothing on Linux or macOS.</item>
+    /// nothing on Linux or macOS. The reserved <c>${appBaseDirectory}</c> variable
+    /// names the running application's directory and cannot be overridden.</item>
+    /// <item><b>Environment defaults.</b> A reserved <c>"environment"</c> object
+    /// maps names to string values. All entries are validated before downloads;
+    /// defaults are applied only after expansion, preflight and downloads succeed.
+    /// The inherited process environment wins; later files win among defaults.</item>
     /// <item><b>Auto-download.</b> A file option may be an object
     /// <c>{ "path": "...", "urls": ["...", "..."], "optional": true }</c>. If <c>path</c> is missing
     /// on disk it is downloaded from the first working URL and saved there, so the
@@ -95,7 +100,7 @@ namespace TensorSharp.Runtime
         // Keys with a meaning of their own rather than a flag to emit.
         private static readonly HashSet<string> ReservedKeys = new(StringComparer.OrdinalIgnoreCase)
         {
-            "variables", "vars", "$schema", "$unavailable",
+            "variables", "vars", "environment", "$schema", "$unavailable",
         };
 
         // Options where every occurrence counts, so a config's values are kept even when
@@ -219,6 +224,7 @@ namespace TensorSharp.Runtime
             {
                 foreach (string configPath in configPaths)
                     files.Add(LoadConfig(configPath));
+                var environment = ReadEnvironmentDefaults(files);
 
                 // The host's own checks (a LoRA plug-in's locked sampling flags, say) would
                 // otherwise run only after the real pass had fetched every model file. The
@@ -248,12 +254,67 @@ namespace TensorSharp.Runtime
                     ExpandFile(files[f], f, merged, context);
                 context.ReportOverrides();
                 merged.AddRange(passThrough);
+                ApplyEnvironmentDefaults(environment);
                 return merged.ToArray();
             }
             finally
             {
                 foreach (LoadedConfig file in files)
                     file.Document.Dispose();
+            }
+        }
+
+        private static Dictionary<string, string> ReadEnvironmentDefaults(IReadOnlyList<LoadedConfig> files)
+        {
+            var defaults = new Dictionary<string, string>(OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+            foreach (LoadedConfig file in files)
+            {
+                var variables = VariableResolver.FromConfig(file.FullPath, file.Document.RootElement);
+                foreach (JsonProperty property in file.Document.RootElement.EnumerateObject())
+                {
+                    if (!property.Name.Equals("environment", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (property.Value.ValueKind != JsonValueKind.Object)
+                        throw new ArgumentException($"Configuration file '{file.FullPath}': 'environment' must be an object of string values.");
+                    foreach (JsonProperty entry in property.Value.EnumerateObject())
+                    {
+                        string name = entry.Name;
+                        if (string.IsNullOrWhiteSpace(name) || name.Length >= 32767
+                            || name.Contains('=') || name.Any(char.IsControl))
+                            throw new ArgumentException($"Configuration file '{file.FullPath}' has an invalid environment variable name.");
+                        if (entry.Value.ValueKind != JsonValueKind.String)
+                            throw new ArgumentException($"Configuration file '{file.FullPath}': environment variable '{name}' must have a string value.");
+                        string value = variables.Substitute(entry.Value.GetString()!);
+                        if (value.Contains('\0'))
+                            throw new ArgumentException($"Configuration file '{file.FullPath}': environment variable '{name}' contains NUL.");
+                        defaults[name] = value;
+                    }
+                }
+            }
+            return defaults;
+        }
+
+        private static void ApplyEnvironmentDefaults(IReadOnlyDictionary<string, string> defaults)
+        {
+            var applied = new List<string>();
+            try
+            {
+                foreach (var entry in defaults)
+                {
+                    // Check at publication as well: a host's preflight may have set
+                    // an explicit process value after we validated the configuration.
+                    if (Environment.GetEnvironmentVariable(entry.Key) != null) continue;
+                    Environment.SetEnvironmentVariable(entry.Key, entry.Value);
+                    applied.Add(entry.Key);
+                }
+            }
+            catch
+            {
+                // Validations/download failures never reach publication. If the
+                // platform rejects a setter, undo the defaults already published.
+                for (int i = applied.Count - 1; i >= 0; i--)
+                    Environment.SetEnvironmentVariable(applied[i], null);
+                throw;
             }
         }
 
@@ -840,6 +901,8 @@ namespace TensorSharp.Runtime
                         throw new ArgumentException($"Configuration file '{configPath}' \"variables\" must be a JSON object.");
                     foreach (JsonProperty v in vars.EnumerateObject())
                     {
+                        if (v.Name.Equals("appBaseDirectory", StringComparison.Ordinal))
+                            throw new ArgumentException($"Configuration file '{configPath}' cannot override the reserved variable 'appBaseDirectory'.");
                         raw[v.Name] = v.Value.ValueKind switch
                         {
                             JsonValueKind.String => v.Value.GetString()!,
@@ -890,6 +953,11 @@ namespace TensorSharp.Runtime
 
             private bool TryResolve(string name, HashSet<string> visiting, out string? value)
             {
+                if (name.Equals("appBaseDirectory", StringComparison.Ordinal))
+                {
+                    value = AppContext.BaseDirectory;
+                    return true;
+                }
                 if (_resolved.TryGetValue(name, out string? cached))
                 {
                     value = cached;

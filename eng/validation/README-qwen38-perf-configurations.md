@@ -1,5 +1,11 @@
 # Reproducing the Qwen3.8-27B comparison configurations
 
+This page records an earlier **ggml CUDA** campaign with the revisions and
+configuration templates below. The current **native CUDA** engine evaluation
+uses `--backend cuda` and the `Qwen35CudaModel` direct engine; see
+[its reproduction guide](README-qwen38-engine-evaluation.md). These are separate
+campaigns. Keep their results, source revisions and dependency evidence separate.
+
 Use [the replay harness](README-qwen38-agent-replay.md) for fixture generation,
 quality checks, paired comparisons and timing definitions. This page describes
 configuration inputs; the existence of a configuration does not mean its run

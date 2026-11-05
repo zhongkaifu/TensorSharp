@@ -456,6 +456,26 @@ The four Qwen rows are one uninterrupted sweep, so they are comparable to each
 other; the Muse-Glimmer rows are from a separate one and are not comparable to
 them in absolute terms.
 
+**Apple GPU (ggml_metal), 2026-11-04.** Same IQ3_XXS target on an M5 Pro, 1,224
+greedy tokens of code / prose / passage copy (identical text in every arm), after the
+verify kept per-row recurrent snapshots and committed on the device:
+
+| drafter | window / gate | tok/s |
+| --- | --- | ---: |
+| none | - | 20.5 |
+| NextN/MTP | 3 / default | 21.1 |
+| DFlash2 Q8_0 | 3 / 0.35 | 24.7 |
+| DFlash2 Q4_K_M | 3 / 0.35 (previous default) | 26.1 |
+| DFlash2 Q4_K_M | 7 / 0.35 | 24.8 |
+| DFlash2 Q4_K_M | 7 / 0 | 28.5 |
+| DFlash2 Q4_K_M | **5 / 0 (new Metal default)** | **28.9** |
+
+An 8-row Metal verify costs about what one row does, so the block gate's 0.35 -
+tuned where an extra verify row is expensive - only throws drafts away. On
+ggml_metal a Qwen 3.5-family trunk with a DFlash drafter now defaults to window 5
+and no gate (`SpecPreferredDraftWindow`, `SpecPreferredBlockGate`); `--spec-draft`
+and `--spec-pmin` still win. ggml_cuda keeps its measured solo-verify cap of 3.
+
 Treat the absolute numbers as indicative, not exact. On this laptop card a plain
 decode - which does identical work per token whatever the prompt - measured 18.7
 and 16.5 tok/s in two back-to-back runs of the same binary. Anything under about

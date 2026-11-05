@@ -1,0 +1,27 @@
+{
+  // Same shared profile as qwen3.8-27b-ninfer.json, with 65,536 context capacity.
+  "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
+  "model": {
+    "path": "${modelRoot}/qwen3_8_27b_nvfp4.ninfer",
+    "urls": ["https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer/resolve/0190293051af2c578f2f3d5264cf2bcd9af051c2/qwen3_8_27b_nvfp4.ninfer"],
+    "sha256": "74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82"
+  },
+  "backend": "cuda",
+  "max-tokens": 1024,
+  "temperature": 0,
+  "repeat-penalty": 1,
+  "no-skills": true,
+  "spec": true,
+  "spec-type": "block",
+  "spec-draft": 7,
+  "spec-pmin": 0,
+  "environment": {
+    "MAX_CONTEXT": "65536",
+    "TS_Q35_UBATCH": "2048",
+    "TS_SCHED_MAX_RUNNING_SEQS": "4",
+    "TS_Q35_NINFER_VERIFY": "1",
+    "TS_Q35_GREEDY_VERIFY": "1",
+    "TS_SPEC_ADAPTIVE": "0",
+    "TS_Q35_NINFER_DRAFT_PTX": "${appBaseDirectory}/cuda_kernels/tensorsharp_q35_ninfer_draft.fatbin"
+  }
+}
