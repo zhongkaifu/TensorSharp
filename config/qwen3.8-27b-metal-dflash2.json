@@ -1,0 +1,43 @@
+{
+  // Qwen3.8-27B on Apple Silicon at its fastest: the UD-IQ3_XXS GGUF on ggml_metal with the
+  // DFlash2 block drafter. Shared CLI/Server.Host profile; add --chat only for the interactive CLI.
+  //
+  //   TensorSharp.Cli         --config config/qwen3.8-27b-metal-dflash2.json --chat
+  //   TensorSharp.Server.Host --config config/qwen3.8-27b-metal-dflash2.json
+  //
+  // Measured on an M5 Pro (48 GB), greedy, 512-token answers: plain decoding 20.6 tok/s; with this
+  // drafter 38.6-44 tok/s on code and 51-52 on a list. Prose drafts are mostly rejected, so the
+  // speculative governor falls back to plain decoding there (about 21 tok/s). Slower in the same
+  // runs: 5 drafts (code 36.3), the Q8_0 drafter, the checkpoint's own NextN head, and the default
+  // confidence gate. Sampling (temperature > 0) still speculates, with fewer drafts accepted.
+  "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
+  "model": {
+    "path": "${modelRoot}/Qwen/Qwen3.8-27B-UD-IQ3_XXS.gguf",
+    "urls": ["https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-IQ3_XXS.gguf"],
+    "sha256": "c0b7c3038681ed2e3040456c1dd45f9858b6c2290bed172c70388a94874f3eee"
+  },
+
+  // Naming a DFlash file is the request to speculate with it (no --spec needed); it replaces the
+  // NextN head. Pass --no-spec on the command line to decode without it (the file is still fetched).
+  "draft-model": {
+    "path": "${modelRoot}/Qwen/Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+    "urls": ["https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/resolve/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"],
+    "sha256": "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd"
+  },
+  "backend": "ggml_metal",
+
+  // 7 drafts per step, every one verified (no confidence gate).
+  "spec-draft": 7,
+  "spec-pmin": 0,
+
+  "max-tokens": 1024,
+  "temperature": 0,
+  "repeat-penalty": 1,
+  "no-skills": true
+
+  // Not set, deliberately:
+  //   "kv-cache-dtype": "q8_0" -- the same speed per step at these lengths, and half the KV
+  //     memory; worth it for long contexts, where Metal charges the KV twice (host + mirror).
+  //   "mmproj" -- the vision projector costs ~0.9 GB; to ask about images, add the block given in
+  //     agent-qwen3.8-27b.json.
+}
