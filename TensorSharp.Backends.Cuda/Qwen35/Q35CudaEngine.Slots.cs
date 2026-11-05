@@ -75,9 +75,9 @@ namespace TensorSharp.Cuda
 
         /// <summary>Makes room for <paramref name="bytes"/> of device memory: the free blocks first,
         /// then retained slots through <see cref="ReclaimMemory"/>.</summary>
-        private void EnsureDeviceMemory(long bytes)
+        private void EnsureDeviceMemory(long bytes, long reserveBytes = GrowthReserveBytes)
         {
-            while (FreeDeviceBytes() < bytes + GrowthReserveBytes)
+            while (FreeDeviceBytes() < bytes + reserveBytes)
             {
                 if (_freeBlocks.Count > 0 || _freeArenas.Count > 0)
                 {
@@ -85,6 +85,8 @@ namespace TensorSharp.Cuda
                     ReleaseFreeArenas();
                     continue;
                 }
+                if (ReleaseAttn8Band())
+                    continue;
                 if (ReclaimMemory == null || !ReclaimMemory())
                     throw new OutOfMemoryException($"[q35-cuda] no device memory for {bytes >> 20} MB more");
             }

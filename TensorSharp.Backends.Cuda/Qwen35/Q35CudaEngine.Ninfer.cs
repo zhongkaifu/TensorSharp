@@ -310,10 +310,8 @@ namespace TensorSharp.Cuda
                             _m.NHead, _m.NKvHead, l.QNorm, l.KNorm, _m.Eps, _ropePosDev + (nint)(4L*r0), RowCap,
                             _m.SectT, _m.SectH, _m.SectW, _m.RopeBase, _cacheRowDev + (nint)(4L*r0), tab,
                             _maxBlocks, kOff, vOff, _q + qOff, _gate + qOff, Stream);
-                        if (UsesAttn8(g, maxKeys[gi]))
+                        if (UsesAttn8(g, maxKeys[gi]) && TryEnsureAttn8Band(maxKeys[gi], out int cap))
                         {
-                            int cap = Attn8Capacity;
-                            EnsureAttn8Band(cap);
                             _k.Attn8Band(_ninferKvFp8 ? Q35Kernels.Attn8Cache.Fp8 : Q35Kernels.Attn8Cache.Bf16, tab, kOff, vOff,
                                 maxKeys[gi], cap, _m.NKvHead, _a8K, _a8Ks, _a8Vt, _a8Vs, Stream);
                             _k.Attn8Prefill(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L*r0), _a8K, _a8Ks, _a8Vt, _a8Vs, cap,

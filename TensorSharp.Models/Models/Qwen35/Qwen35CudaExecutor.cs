@@ -29,7 +29,7 @@ namespace TensorSharp.Models
         private readonly System.Collections.Generic.List<Q35CudaEngine.Slot> _slots = new();
         /// <summary>Device memory a slot allocation must leave free (scratch growth, the drafter's
         /// per-step buffers, the CUDA context).</summary>
-        private const long SlotReserveBytes = 1L << 30;
+        internal const long SlotReserveBytes = 1L << 30;
 
         public int ActiveSlot { get; private set; }
         public int NPast => _engine.Active.NPast;
@@ -74,11 +74,19 @@ namespace TensorSharp.Models
 
         // ---- sequence slots ----
 
-        /// <summary>A new empty slot, or -1 when the device has no room for one.</summary>
-        public int SlotAlloc()
+        /// <summary>Device memory a checkpoint's slot must leave free: the engine's own growth reserve.
+        /// A checkpoint only copies recurrent states (its attention blocks are shared), and memory
+        /// pressure moves it to host memory or drops it, so it need not keep a running request's headroom.</summary>
+        internal const long CheckpointReserveBytes = 512L << 20;
+
+        /// <summary>A new empty slot, or -1 when the device has no room for one beside
+        /// <paramref name="reserveBytes"/> (default <see cref="SlotReserveBytes"/>). Prompt-attention
+        /// scratch is released first when it stands in the way.</summary>
+        public int SlotAlloc(long reserveBytes = SlotReserveBytes)
         {
             // No attention blocks yet: a prefill adds them as it goes, a checkpoint shares its source's.
-            if (_engine.FreeDeviceBytes() < _engine.SlotBytes(0) + SlotReserveBytes)
+            long need = _engine.SlotBytes(0) + reserveBytes;
+            if (_engine.FreeDeviceBytes() < need && !(_engine.ReleaseTransientScratch() && _engine.FreeDeviceBytes() >= need))
                 return -1;
             Q35CudaEngine.Slot s;
             try

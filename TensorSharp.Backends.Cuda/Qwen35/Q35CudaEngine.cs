@@ -1135,13 +1135,64 @@ namespace TensorSharp.Cuda
             finally { CudaDriverApi.cuMemFree(reference); _owned.Remove(reference); }
         }
 
-        private void EnsureAttn8Band(int cap)
+        /// <summary>The band for at least <paramref name="keys"/> visible keys, grown in steps of
+        /// <see cref="Attn8BandStepKeys"/> up to the context; <paramref name="cap"/> is its key capacity
+        /// (the band's layout stride). It is scratch: it claims no growth reserve, a short slot or block
+        /// allocation releases it (<see cref="ReleaseAttn8Band"/>), and when even the band does not fit the
+        /// chunk runs the 16-bit kernels (false). Sized to the context up front it held 540 MB through a
+        /// 256K context's whole life, and the shared-prefix checkpoint of a 258K-token document found no
+        /// room for its slot.</summary>
+        private bool TryEnsureAttn8Band(int keys, out int cap)
         {
-            if (_a8Cap == cap) return;
+            cap = Math.Min(Attn8Capacity, (keys + Attn8BandStepKeys - 1) / Attn8BandStepKeys * Attn8BandStepKeys);
+            if (_a8Cap >= cap)
+            {
+                cap = _a8Cap;
+                return true;
+            }
+            ReleaseAttn8Band();
             var (k, ks, vt, vs) = Q35Kernels.Attn8BandBytes(cap, _m.NKvHead);
-            _a8K = Alloc(k); _a8Ks = Alloc(ks); _a8Vt = Alloc(vt); _a8Vs = Alloc(Math.Max(vs, 16));
+            try
+            {
+                EnsureDeviceMemory(k + ks + vt + vs, reserveBytes: 0);
+                _a8K = Alloc(k, _a8Owned); _a8Ks = Alloc(ks, _a8Owned); _a8Vt = Alloc(vt, _a8Owned); _a8Vs = Alloc(Math.Max(vs, 16), _a8Owned);
+            }
+            catch (Exception ex) when (ex is OutOfMemoryException or CudaException)
+            {
+                ReleaseAttn8Band();
+                if (!_attn8FallbackReported)
+                {
+                    _attn8FallbackReported = true;
+                    Console.Error.WriteLine($"[q35-cuda] no device room for the {cap}-key 8-bit attention band; such chunks run the 16-bit kernels");
+                }
+                cap = 0;
+                return false;
+            }
             _a8Cap = cap;
-            Console.Error.WriteLine($"[q35-cuda] 8-bit prompt attention band: {cap} keys x {_m.NKvHead} KV heads ({(k + ks + vt + vs) >> 20} MiB)");
+            return true;
+        }
+
+        private bool _attn8FallbackReported;
+        private const int Attn8BandStepKeys = 16384;
+        private readonly List<IntPtr> _a8Owned = new List<IntPtr>(4);
+
+        /// <summary>Frees scratch the next forward rebuilds (the 8-bit prompt-attention band). True when it held memory.</summary>
+        public bool ReleaseTransientScratch()
+        {
+            MakeCurrent();
+            return ReleaseAttn8Band();
+        }
+
+        /// <summary>Frees the 8-bit attention band (the stream is synchronized first). True when it held memory.</summary>
+        internal bool ReleaseAttn8Band()
+        {
+            if (_a8Owned.Count == 0) return false;
+            Sync();
+            foreach (IntPtr b in _a8Owned) CudaDriverApi.cuMemFree(b);
+            _a8Owned.Clear();
+            _a8K = _a8Ks = _a8Vt = _a8Vs = IntPtr.Zero;
+            _a8Cap = 0;
+            return true;
         }
 
         /// <summary>Attention of one group's rows (rows r0.., sequences q0.. of the bound tables) over
@@ -1155,11 +1206,9 @@ namespace TensorSharp.Cuda
             _k.AttnPrep(_proj + (nint)((long)r0 * AttnProjWidth * 4), n, g.RowsPerSeq, _m.NHead, _m.NKvHead, L.QNorm, L.KNorm, _m.Eps,
                 _ropePosDev + (nint)(4L * r0), RowCap, _m.SectT, _m.SectH, _m.SectW, _m.RopeBase, _cacheRowDev + (nint)(4L * r0), tab,
                 _maxBlocks, kOff, vOff, _q + qOff, _gate + qOff, Stream);
-            if (UsesAttn8(g, maxKeys))
+            if (UsesAttn8(g, maxKeys) && TryEnsureAttn8Band(maxKeys, out int cap))
             {
                 // 8-bit prompt attention: the visible keys once into the band, then INT8 QK / E4M3 PV.
-                int cap = Attn8Capacity;
-                EnsureAttn8Band(cap);
                 _k.Attn8Band(Q35Kernels.Attn8Cache.Q8, tab, kOff, vOff, maxKeys, cap, _m.NKvHead, _a8K, _a8Ks, _a8Vt, _a8Vs, Stream);
                 _k.Attn8Prefill(_q + qOff, _gate + qOff, _keyEndDev + (nint)(4L * r0), _a8K, _a8Ks, _a8Vt, _a8Vs, cap,
                     g.RowsPerSeq, _m.NHead, _m.NKvHead, 1.0f / MathF.Sqrt(_m.HeadDim), _attn + qOff, Stream);
@@ -1214,6 +1263,9 @@ namespace TensorSharp.Cuda
                 foreach (IntPtr p in _owned)
                     CudaDriverApi.cuMemFree(p);
                 _owned.Clear();
+                foreach (IntPtr p in _a8Owned)
+                    CudaDriverApi.cuMemFree(p);
+                _a8Owned.Clear();
                 if (_pinned != IntPtr.Zero)
                     CudaDriverApi.cuMemFreeHost(_pinned);
                 _pinned = IntPtr.Zero;

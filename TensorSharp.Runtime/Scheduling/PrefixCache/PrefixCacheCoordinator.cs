@@ -96,6 +96,11 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     /// <summary>Why the last <see cref="ComputeReusablePrefix"/> reused nothing, in words, or null when it
     /// reused something or nothing cached matched at all.</summary>
     internal string? LastDeclineReason { get; private set; }
+
+    /// <summary>The last <see cref="TryAdopt"/> found its prefix but the model could not clone it (no
+    /// device memory for another sequence's state). Beside running requests admission waits for one to
+    /// finish instead of prefilling the whole prompt again, which fits even less.</summary>
+    internal bool LastAdoptDeclinedByModel { get; private set; }
     internal IPrefixCheckpointStore? CheckpointStore
     {
         get => Volatile.Read(ref _checkpointStore);
@@ -314,6 +319,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
 
     internal bool TryAdopt(SequenceState sequence, int length, Action<SequenceState, int> pendingTruncation)
     {
+        LastAdoptDeclinedByModel = false;
         if (length <= 0 || sequence.BlockTable.NumBlocks != 0 || ComputeReusablePrefix(sequence) != length)
             return false;
         LockReceipt receipt = _tree.Acquire(_plan);
@@ -329,12 +335,16 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             EndStatePayload payload = node.EndState!;
             if (_pagedEndStates.ContainsKey(payload.Key)) return TryAdoptPagedEndState(sequence, node, payload, length);
             int count = (int)(((long)length + _pool.BlockSize - 1) / _pool.BlockSize);
+            // A clone whose K/V the model shares with the payload shares the full blocks of a
+            // running request that cloned the same payload (see PrefixCacheCoordinator.SharedClones).
+            bool sharesKv = _tree.Caps.ClonesShareKv && _plan.Mode == MaterializeMode.CloneEndState;
+            KvBlock[] shared = sharesKv ? FindCloneSharer(payload.Key, sequence, length / _pool.BlockSize) : Array.Empty<KvBlock>();
             sequence.BlockTable.EnsureBlockCapacity(count);
-            EnsureFreePages(count);
-            KvBlock[]? blocks = _pool.AllocateNew(count);
+            EnsureFreePages(count - shared.Length);
+            KvBlock[]? blocks = _pool.AllocateNew(count - shared.Length);
             if (blocks is null)
             {
-                LastDeclineReason = $"the block pool has no {count} free blocks for the {length}-token prefix";
+                LastDeclineReason = $"the block pool has no {count - shared.Length} free blocks for the {length}-token prefix";
                 return false;
             }
             bool transferred = false;
@@ -361,6 +371,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                     if (!_cacheModel.TryMaterialize(materialize))
                     {
                         LastDeclineReason = $"the model declined to {(donate ? "donate" : "clone")} the {length}-token end state";
+                        LastAdoptDeclinedByModel = !donate;
                         return false;
                     }
                     // The clone already took this request's fitted reservation.
@@ -370,7 +381,13 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                     if (donate) _tree.DetachEndState(node, ReleaseReason.Rollback, enqueue: false);
                     if (length < payload.Footprint.Tokens) pendingTruncation(sequence, length);
                 }
+                foreach (KvBlock block in shared)
+                {
+                    _pool.Touch(block);
+                    sequence.BlockTable.AppendBlock(block);
+                }
                 foreach (KvBlock block in blocks) sequence.BlockTable.AppendBlock(block);
+                if (sharesKv) RecordCloneSharer(payload.Key, sequence, length / _pool.BlockSize);
                 sequence.SetComputedTokensForPrefixAdoption(length);
                 sequence.PrefixCacheReusedTokens = length;
                 sequence.PrefixCheckpointTaken = length >= sequence.SharedPrefixTokens && sequence.SharedPrefixTokens > 0;

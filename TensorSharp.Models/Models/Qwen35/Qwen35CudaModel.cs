@@ -660,7 +660,7 @@ namespace TensorSharp.Models
             _promoting = key;
             try
             {
-                int slot = AllocSlotReclaimingRetained();
+                int slot = AllocSlotReclaimingRetained(sharesPrefix: true);
                 if (slot < 0)
                     return false;
                 try
@@ -670,6 +670,14 @@ namespace TensorSharp.Models
                     if (RetainDebug)
                         Console.Error.WriteLine($"[q35-promote] {key} tokens={payload.Tokens} checkpoint={payload.Checkpoint} " +
                             $"{System.Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds:F0}ms host={_hostRetained.Count}");
+                }
+                catch (OutOfMemoryException ex)
+                {
+                    // The payload's blocks no longer on the device do not fit back now: decline (the
+                    // request waits for running ones, or prefills), and keep the host copy.
+                    _exec.SlotFree(slot);
+                    Console.Error.WriteLine($"[q35-cuda] {payload.Tokens}-token cached prefix stays in host memory: {ex.Message}");
+                    return false;
                 }
                 catch
                 {
@@ -692,11 +700,17 @@ namespace TensorSharp.Models
         private bool IsHostPayload(string key, int tokens, int target)
             => key != null && _hostRetained.TryGetValue(key, out var p) && p.Tokens == tokens && target == tokens;
 
-        private int AllocSlotReclaimingRetained()
+        /// <summary>A new slot, moving retained slots to host memory (or dropping them) until one fits.
+        /// <paramref name="sharesPrefix"/>: a checkpoint, or a copy of a cached prefix (a clone or a slot
+        /// coming back from host memory). Its attention blocks are the source's, so it keeps only the
+        /// engine's growth reserve; every later block it needs goes through the engine's reclaiming
+        /// allocator. A slot for a new prompt keeps the full reserve for the blocks of its prefill.</summary>
+        private int AllocSlotReclaimingRetained(bool sharesPrefix = false)
         {
-            int slot = _exec.SlotAlloc();
+            long reserve = sharesPrefix ? Qwen35CudaExecutor.CheckpointReserveBytes : Qwen35CudaExecutor.SlotReserveBytes;
+            int slot = _exec.SlotAlloc(reserve);
             while (slot < 0 && ReclaimOneRetained())
-                slot = _exec.SlotAlloc();
+                slot = _exec.SlotAlloc(reserve);
             return slot;
         }
 
@@ -1226,6 +1240,8 @@ namespace TensorSharp.Models
             // Checkpoints share the attention blocks: one past the media costs only the recurrent state.
             CheckpointPromptTailWithMedia = true,
             CountCapsByBytes = true,
+            // CopySlot shares every attention block of the payload; a block is copied when written.
+            ClonesShareKv = true,
             Persistable = false,
             MaxRetainedNativeSlots = 0,
         };
@@ -1256,7 +1272,10 @@ namespace TensorSharp.Models
                     return false;
                 var from = _slotByRequest != null && _slotByRequest.TryGetValue(requestId, out int own)
                     ? _exec.Slot(own) : _exec.Engine.Active;
-                int dst = AllocSlotReclaimingRetained();
+                int dst = AllocSlotReclaimingRetained(sharesPrefix: true);
+                if (dst < 0)
+                    Console.Error.WriteLine($"[q35-cuda] no device room for a {from.NPast}-token checkpoint slot " +
+                        $"({_exec.Engine.FreeDeviceBytes() >> 20} MiB free); later prompts re-prefill it");
                 if (dst < 0)
                     return false;
                 _exec.Engine.CopySlot(from, _exec.Slot(dst), from.NPast);
@@ -1282,7 +1301,7 @@ namespace TensorSharp.Models
                 _slotByRequest ??= new Dictionary<string, int>(StringComparer.Ordinal);
                 if (!_slotByRequest.TryGetValue(requestId, out int target))
                 {
-                    target = AllocSlotReclaimingRetained();
+                    target = AllocSlotReclaimingRetained(sharesPrefix: true);
                     if (target < 0)
                         return false;
                     _slotByRequest[requestId] = target;

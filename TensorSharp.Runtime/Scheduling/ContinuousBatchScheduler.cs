@@ -523,6 +523,13 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                     if (length > 0 && _prefixCacheAdopt?.Invoke(seq, length) == true)
                         soleAdmission = _radixCache.RequiresSoleAdmission;
+                    else if (length > 0 && _running.Count > 0 && _radixCache.LastAdoptDeclinedByModel)
+                    {
+                        // The model has no memory for another clone of a cached prefix now; a full
+                        // re-prefill beside the running requests would need more. Wait for one to finish.
+                        LogCloneWait(seq, length);
+                        break;
+                    }
                     string? why = seq.PrefixCacheReusedTokens == 0 ? _prefixCacheDeclineReason?.Invoke() : null;
                     string? source = seq.PrefixCacheReusedTokens > 0 ? _radixCache.LastSource : null;
                     _logger.LogInformation(
@@ -1029,8 +1036,29 @@ namespace TensorSharp.Runtime.Scheduling
                 if (missing > 0) outstanding += missing;
             }
             int need = BlocksFor(candidate.PromptTokens.Count, _cfg.BlockSize) - candidate.BlockTable.NumBlocks;
+            // Blocks of a cached prefix a running request already holds through its own clone of it
+            // are shared, not allocated (PrefixCacheCoordinator.SharedClones). Admission only runs
+            // this check beside running requests, so the primary cache is not on offer.
+            if (_radixCache != null && need > 0)
+            {
+                _radixCache.PrimaryAvailable = false;
+                need -= _radixCache.ShareablePrefixBlocks(candidate);
+            }
             _radixCache?.EnsureFreePages((int)Math.Min(_pool.NumBlocks, Math.Max(0, need + outstanding)));
             return (long)_pool.NumFreeBlocks - outstanding >= need;
+        }
+
+        private string? _cloneWaitLoggedFor;
+
+        private void LogCloneWait(SequenceState seq, int length)
+        {
+            if (string.Equals(_cloneWaitLoggedFor, seq.RequestId, StringComparison.Ordinal))
+                return;
+            _cloneWaitLoggedFor = seq.RequestId;
+            _logger.LogInformation(
+                "Prefix cache: {RequestId} waits to clone its {Length}-token cached prefix; the model has no memory for " +
+                "another sequence beside the {Running} running request(s). It is admitted when one of them finishes.",
+                seq.RequestId, length, _running.Count);
         }
 
         private string? _capacityWaitLoggedFor;

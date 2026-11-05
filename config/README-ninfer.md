@@ -64,7 +64,10 @@ KV cache: BF16 by default. `TS_Q35_NINFER_KV=fp8` stores 272-byte rows (256 E4M3
 two F32 group-128 scales), half the BF16 size; decode and verify widen FP8 tiles in shared
 memory and prefill reads a BF16 copy of the visible history per layer. On the RTX 5090 it
 measured no speed change at 32K-64K and the same answers on the long-context checks; use it
-for capacity (more lanes or longer contexts in the same memory).
+for capacity (more lanes or longer contexts in the same memory). Serve long documents with it:
+several chats on one cached document each need a slot of their own (recurrent states and drafter
+ring; the document's attention blocks are shared), and with a 64K BF16 cache a 32 GB card has no
+room for a second slot, so every new chat re-prefilled the document.
 
 Configured contexts are not file-format limits (the artifact declares 262,144); larger
 capacities need more KV memory (a 128K context on a 32 GB card needs `TS_Q35_NINFER_KV=fp8`).
