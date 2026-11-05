@@ -817,6 +817,7 @@ namespace TensorSharp.Cuda
         private void RunGroupsCore(int tapFirst, RowGroup[] groups)
         {
             RequireNoPendingNinferVerification();
+            KeepGrowthReserve();
             int e = _m.NEmbd, nt = RowCap, n = 0, nSeq = 0;
             foreach (var g in groups)
             {

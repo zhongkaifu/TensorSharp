@@ -92,6 +92,28 @@ namespace TensorSharp.Cuda
             }
         }
 
+        /// <summary>Restores the growth reserve before a forward, never failing: cached blocks and arenas,
+        /// then the 8-bit prompt-attention band (the next prompt chunk builds it again), then retained
+        /// slots through <see cref="ReclaimMemory"/>. Graph launches and scratch growth allocate outside
+        /// <see cref="EnsureDeviceMemory"/>; with the band left at the end of a 128K prompt the next
+        /// decode graph launch ran out of memory on the NInfer route.</summary>
+        private void KeepGrowthReserve()
+        {
+            while (FreeDeviceBytes() < GrowthReserveBytes)
+            {
+                if (_freeBlocks.Count > 0 || _freeArenas.Count > 0)
+                {
+                    ReleaseFreeBlocks();
+                    ReleaseFreeArenas();
+                    continue;
+                }
+                if (ReleaseAttn8Band())
+                    continue;
+                if (ReclaimMemory == null || !ReclaimMemory())
+                    return;
+            }
+        }
+
         private void ReleaseFreeBlocks()
         {
             while (_freeBlocks.Count > 0)
