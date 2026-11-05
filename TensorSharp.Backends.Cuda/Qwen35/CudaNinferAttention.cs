@@ -244,6 +244,21 @@ namespace TensorSharp.Cuda
             Launch(_fp8ToBf16, checked((uint)((keys + 7) / 8)), (uint)nKv, 2, 256, stream, args);
         }
 
+        /// <summary>Frees the BF16 history scratch (it grows again with the next widened prompt chunk). It
+        /// is sized to the longest history widened so far (about 1 GB at 128K) and kept for that whole
+        /// time; on a full 32 GB card it left no room for the slot of a second chat on a cached 127K-token
+        /// document. True when it held memory.</summary>
+        internal bool ReleaseTransientScratch(IntPtr stream)
+        {
+            if (_kvScratch == IntPtr.Zero) return false;
+            CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();
+            CudaDriverApi.cuMemFree(_kvScratch).ThrowOnError();
+            CudaDriverApi.cuMemFree(_kvScratchTable).ThrowOnError();
+            _kvScratch = _kvScratchTable = IntPtr.Zero;
+            _kvScratchBlocks = 0;
+            return true;
+        }
+
         public void Dispose()
         {
             if (_kvScratch != IntPtr.Zero) { CudaDriverApi.cuMemFree(_kvScratch); CudaDriverApi.cuMemFree(_kvScratchTable); _kvScratch = _kvScratchTable = IntPtr.Zero; }

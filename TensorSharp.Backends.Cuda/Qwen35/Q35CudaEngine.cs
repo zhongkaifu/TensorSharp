@@ -1181,7 +1181,16 @@ namespace TensorSharp.Cuda
         public bool ReleaseTransientScratch()
         {
             MakeCurrent();
-            return ReleaseAttn8Band();
+            return ReleaseScratchCore();
+        }
+
+        /// <summary>The 8-bit prompt-attention band, then the NInfer route's BF16 history scratch: memory
+        /// the next prompt chunk allocates again. True when any was freed.</summary>
+        private bool ReleaseScratchCore()
+        {
+            bool band = ReleaseAttn8Band();
+            bool history = _ninferAttention != null && _ninferAttention.ReleaseTransientScratch(Stream);
+            return band || history;
         }
 
         /// <summary>Frees the 8-bit attention band (the stream is synchronized first). True when it held memory.</summary>

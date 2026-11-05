@@ -85,7 +85,7 @@ namespace TensorSharp.Cuda
                     ReleaseFreeArenas();
                     continue;
                 }
-                if (ReleaseAttn8Band())
+                if (ReleaseScratchCore())
                     continue;
                 if (ReclaimMemory == null || !ReclaimMemory())
                     throw new OutOfMemoryException($"[q35-cuda] no device memory for {bytes >> 20} MB more");
@@ -107,7 +107,7 @@ namespace TensorSharp.Cuda
                     ReleaseFreeArenas();
                     continue;
                 }
-                if (ReleaseAttn8Band())
+                if (ReleaseScratchCore())
                     continue;
                 if (ReclaimMemory == null || !ReclaimMemory())
                     return;
