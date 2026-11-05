@@ -429,6 +429,14 @@ namespace TensorSharp.Server
             string emittedContent = emitted.Content ?? string.Empty;
             if (string.Equals(clientContent, emittedContent, StringComparison.Ordinal))
                 return true;
+            // Parallel tool calls: the stream sends the newline between two calls as a content
+            // delta, the parser records no content, and the client echoes the newline back.
+            // Whitespace beside tool calls is not text, and the splice restores exactly the
+            // generated tokens (newline included); without this the next turn lost its
+            // conversation scope and re-prefilled everything after the shared prefix.
+            if (emitted.ToolCalls is { Count: > 0 } && string.IsNullOrWhiteSpace(clientContent)
+                && string.IsNullOrWhiteSpace(emittedContent))
+                return true;
             if (emitted.RawText != null
                 && string.Equals(clientContent, emitted.RawText, StringComparison.Ordinal))
                 return true;
