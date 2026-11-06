@@ -2327,6 +2327,14 @@ namespace TensorSharp.Cli
             IList<string> refAudios = null, bool generateAudio = true, string videoMode = null,
             IList<string> refVideoAudios = null, IList<string> continuationVideos = null)
         {
+            // A clip can take minutes; find out now, not after it, that it could not be saved.
+            if (VideoOutputError(outputPath) is string outputError)
+            {
+                _log.LogError(LogEventIds.CliFailed, "cli.video-export-unavailable {Error}", outputError);
+                Console.Error.WriteLine("Configuration error: " + outputError);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
+            }
             Console.WriteLine(imagePath != null ? "=== Image-to-Video ===" : "=== Text-to-Video ===");
             Console.WriteLine($"  prompt : {prompt}");
             if (imagePath != null)
@@ -2392,6 +2400,34 @@ namespace TensorSharp.Cli
             var sw = Stopwatch.StartNew();
             var video = model.GenerateVideo(prompt, p);
             sw.Stop();
+            SaveGeneratedVideo(video, outputPath, sw.Elapsed);
+        }
+
+        /// <summary>Why a clip could not be saved to <paramref name="outputPath"/> on this
+        /// machine, or null. Only an MP4 needs an encoder (FFmpeg, or OpenCV, which has no
+        /// Windows on Arm build); an output ending in .png is written as PNG files.</summary>
+        internal static string VideoOutputError(string outputPath) =>
+            !outputPath.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
+            && TensorSharp.Models.WanVideo.VideoIO.Mp4ExportUnavailableReason() is string reason
+                ? reason + " Or pass --output <name>.png to save the frames as PNG files."
+                : null;
+
+        /// <summary>Write a generated clip to <paramref name="outputPath"/>: the soundtrack's WAV
+        /// first, so an MP4 export that fails still leaves it, then the frames as an MP4, or as
+        /// PNG files when the path ends in .png.</summary>
+        internal static void SaveGeneratedVideo(TensorSharp.Models.WanVideo.GeneratedVideo video, string outputPath, TimeSpan elapsed)
+        {
+            // Keep the original PCM alongside the encoded MP4, including when
+            // the platform's video writer cannot mux the soundtrack.
+            if (video.Audio is { ChannelCount: > 0, SampleCount: > 0 })
+            {
+                string wavPath = Path.ChangeExtension(outputPath, ".wav");
+                Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(wavPath)) ?? ".");
+                TensorSharp.Models.Video.WavWriter.Write(wavPath, video.Audio.Channels, video.Audio.SampleRate);
+                Console.WriteLine($"Saved {video.Audio.ChannelCount}-channel " +
+                    $"{video.Audio.SampleRate} Hz audio ({video.Audio.DurationSeconds:F2}s) to {wavPath}");
+            }
+
             string codec;
             if (outputPath.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
             {
@@ -2409,17 +2445,7 @@ namespace TensorSharp.Cli
                 if (audioMuxed) Console.WriteLine("  Generated soundtrack included in the MP4.");
             }
             Console.WriteLine($"Saved {video.Frames[0].Width}x{video.Frames[0].Height} x {video.Frames.Length} frames " +
-                $"({codec}, {video.Fps} fps, seed {video.Seed}) to {outputPath} in {sw.Elapsed.TotalSeconds:F1}s");
-
-            // Keep the original PCM alongside the encoded MP4, including when
-            // the platform's video writer cannot mux the soundtrack.
-            if (video.Audio is { ChannelCount: > 0, SampleCount: > 0 })
-            {
-                string wavPath = Path.ChangeExtension(outputPath, ".wav");
-                TensorSharp.Models.Video.WavWriter.Write(wavPath, video.Audio.Channels, video.Audio.SampleRate);
-                Console.WriteLine($"Saved {video.Audio.ChannelCount}-channel " +
-                    $"{video.Audio.SampleRate} Hz audio ({video.Audio.DurationSeconds:F2}s) to {wavPath}");
-            }
+                $"({codec}, {video.Fps} fps, seed {video.Seed}) to {outputPath} in {elapsed.TotalSeconds:F1}s");
         }
 
         static void RunDiffusion(DiffusionGemmaModel model, string rawText, string systemPrompt,

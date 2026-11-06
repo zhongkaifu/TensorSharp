@@ -31,6 +31,12 @@ namespace TensorSharp.Models.Media
                 $"{GetType().Name} does not provide the libx264 image-conditioning transform required by LTX. " +
                 "Use the desktop media provider with FFmpeg (including libx264) on PATH or set TS_FFMPEG.");
 
+        /// <summary>Why <see cref="SaveMp4(string, RgbImage[], int)"/> cannot write any MP4 on
+        /// this machine, or null when it has an encoder to try. Hosts check it before
+        /// generating, so a missing encoder is reported before a clip that takes minutes
+        /// rather than after it. Null does not promise that the export succeeds.</summary>
+        string Mp4ExportUnavailableReason => null;
+
         /// <summary>
         /// Write <paramref name="frames"/> (all the same size, HWC RGB float [0,1]) at
         /// <paramref name="fps"/> to <paramref name="path"/>, whose directory already exists.

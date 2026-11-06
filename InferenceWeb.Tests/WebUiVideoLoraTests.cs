@@ -47,6 +47,7 @@ public sealed class WebUiVideoLoraTests : IDisposable
 
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-video-lora-" + Guid.NewGuid().ToString("N"));
     private readonly EnvScope _env = new();
+    private readonly VideoExportScope _export = new();
     private readonly MiniMaxH3LoraFixtures _fixtures = new();
     private readonly Dictionary<string, ModelBase> _byFile = new(StringComparer.Ordinal);
     private readonly List<TurboStandIn> _turbos = new();
@@ -84,6 +85,7 @@ public sealed class WebUiVideoLoraTests : IDisposable
             turbo.ReleaseAll();
         _models.Dispose();
         _fixtures.Dispose();
+        _export.Dispose();
         _env.Dispose();
         try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
     }

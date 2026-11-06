@@ -17,6 +17,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using OpenCvSharp;
 using TensorSharp.Models.QwenImage;
 using TensorSharp.Models.Video;
@@ -135,6 +136,41 @@ namespace TensorSharp.Models.Media.Desktop
         }
 
         private static string FindFfmpeg() => MediaExecutableLocator.Find("ffmpeg", "TS_FFMPEG");
+
+        /// <summary>Null when <see cref="SaveMp4(string, RgbImage[], int)"/> has an encoder to
+        /// try: an FFmpeg that exists, or an OpenCV whose native library loads. OpenCvSharp ships
+        /// no native library for Windows on Arm, so there FFmpeg is the only encoder. FFmpeg is
+        /// looked up on every call, so installing it helps a running host; whether OpenCV loads
+        /// cannot change within a process, so that answer is kept.</summary>
+        public string Mp4ExportUnavailableReason => Mp4ExportUnavailable(FindFfmpeg(), () => OpenCvLoads.Value);
+
+        internal static string Mp4ExportUnavailable(string ffmpeg, Func<bool> openCvLoads)
+        {
+            if (ffmpeg != null && File.Exists(ffmpeg)) return null;
+            if (openCvLoads()) return null;
+            // MediaExecutableLocator checks that the files it finds on PATH exist, but returns
+            // TS_FFMPEG as configured, so a path that does not exist came from TS_FFMPEG.
+            string missing = ffmpeg == null
+                ? "none was found on PATH, at TS_FFMPEG or beside the application"
+                : $"TS_FFMPEG names '{ffmpeg}', which does not exist";
+            return $"Video export needs FFmpeg, but {missing}, and the fallback encoder, OpenCV, cannot load its " +
+                   $"native library (OpenCvSharpExtern) on {RuntimeInformation.RuntimeIdentifier}. Install FFmpeg " +
+                   "(https://ffmpeg.org) on PATH or set TS_FFMPEG to the ffmpeg executable.";
+        }
+
+        private static readonly Lazy<bool> OpenCvLoads = new(() =>
+        {
+            try
+            {
+                _ = Cv2.GetVersionString();
+                return true;
+            }
+            catch (Exception ex) when (ex is TypeInitializationException or DllNotFoundException
+                                           or BadImageFormatException or EntryPointNotFoundException)
+            {
+                return false;
+            }
+        });
 
         private static bool TrySaveWithOpenCv(string path, RgbImage[] frames, int fps, string fourcc)
         {
