@@ -34,16 +34,17 @@ option(TENSORSHARP_GGML_NATIVE_IOS "Build a static GgmlOps for iOS/iPadOS (devic
 # This is easy to hit by accident on Windows: the "Developer PowerShell for VS"
 # and "Developer Command Prompt" shortcuts default to the x86 toolset, so a
 # build started from one used to inherit a 32-bit cl.exe. build-windows.ps1 now
-# imports the x64 environment over such a prompt, and this check is the backstop
-# for every other entry point (a hand-run cmake, -A Win32, a cross toolchain
-# file). See https://github.com/zhongkaifu/TensorSharp/discussions/130
+# imports the x64 (or, on Windows on Arm, the ARM64) environment over such a
+# prompt, and this check is the backstop for every other entry point (a hand-run
+# cmake, -A Win32, a cross toolchain file). See
+# https://github.com/zhongkaifu/TensorSharp/discussions/130
 if (CMAKE_SIZEOF_VOID_P AND CMAKE_SIZEOF_VOID_P LESS 8)
     message(FATAL_ERROR
         "TensorSharp.GGML.Native requires a 64-bit toolchain, but this one targets "
         "${CMAKE_SIZEOF_VOID_P}-byte pointers (32-bit). On Windows, run build-windows.ps1 from a plain "
-        "PowerShell so it can set up the x64 MSVC environment itself, or from an \"x64 Native Tools\" "
-        "prompt - the default \"Developer PowerShell for VS\" targets x86. With a Visual Studio "
-        "generator, pass -A x64.")
+        "PowerShell so it can set up the x64 (or ARM64) MSVC environment itself, or from an "
+        "\"x64 Native Tools\" (\"ARM64 Native Tools\") prompt - the default \"Developer PowerShell for VS\" "
+        "targets x86. With a Visual Studio generator, pass -A x64 (-A ARM64 on Windows on Arm).")
 endif()
 
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA AND APPLE)

@@ -18,6 +18,27 @@ namespace TensorSharp.Models.Media.Desktop
     /// <summary>Frame access through OpenCvSharp's <c>VideoCapture</c>.</summary>
     public sealed partial class DesktopMediaProvider
     {
+        /// <summary>
+        /// Opens <paramref name="path"/> with OpenCV. OpenCvSharp's native library
+        /// (OpenCvSharpExtern) has no Windows on Arm build, so there the first
+        /// <see cref="VideoCapture"/> fails inside a type initializer with a
+        /// DllNotFoundException; report what is missing instead of that.
+        /// </summary>
+        private static VideoCapture OpenVideoCapture(string path)
+        {
+            try
+            {
+                return new VideoCapture(path);
+            }
+            catch (Exception ex) when (ex is DllNotFoundException || ex.InnerException is DllNotFoundException)
+            {
+                throw new PlatformNotSupportedException(
+                    "Video input needs OpenCV's native library (OpenCvSharpExtern), which could not be loaded on " +
+                    $"{RuntimeInformation.RuntimeIdentifier}. OpenCvSharp ships no Windows on Arm build of it; " +
+                    "elsewhere, check that its runtime package for this platform is installed.", ex);
+            }
+        }
+
         public VideoInfo Probe(string path)
         {
             if (string.IsNullOrWhiteSpace(path))
@@ -25,7 +46,7 @@ namespace TensorSharp.Models.Media.Desktop
             if (!File.Exists(path))
                 throw new FileNotFoundException($"video not found: {path}", path);
 
-            using var capture = new VideoCapture(path);
+            using var capture = OpenVideoCapture(path);
             if (!capture.IsOpened())
                 throw new InvalidOperationException($"Failed to open video file: {path}");
 
@@ -55,7 +76,7 @@ namespace TensorSharp.Models.Media.Desktop
             if (!File.Exists(path))
                 throw new FileNotFoundException($"video not found: {path}", path);
 
-            using var capture = new VideoCapture(path);
+            using var capture = OpenVideoCapture(path);
             if (!capture.IsOpened())
                 throw new InvalidOperationException($"Failed to open video file: {path}");
 

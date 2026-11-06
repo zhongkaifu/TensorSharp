@@ -48,7 +48,9 @@ COMPONENT_ALIASES = {
 def detect_platform() -> str:
     machine = platform.machine().lower()
     if sys.platform.startswith("win"):
-        return "windows-x86_64"
+        # platform.machine() is the interpreter's view: an x64 Python under
+        # emulation on Windows on Arm reports AMD64 and gets the x64 toolkit.
+        return "windows-arm64" if machine in ("arm64", "aarch64") else "windows-x86_64"
     if sys.platform.startswith("linux"):
         return "linux-sbsa" if machine in ("aarch64", "arm64") else "linux-x86_64"
     raise SystemExit(f"Unsupported host platform {sys.platform}/{machine}; pass --platform.")
@@ -179,9 +181,12 @@ def export_github_env(dest: Path, target: str) -> None:
         env.write(f"CUDA_PATH={root}\nCUDA_HOME={root}\n")
     with open(path_file, "a", encoding="utf-8") as paths:
         paths.write(str(dest.resolve() / "bin") + "\n")
-        # CUDA 13 on Windows keeps its DLLs in bin\x64.
+        # CUDA 13 on Windows keeps its DLLs in a per-architecture subdirectory of
+        # bin (bin\x64); add whichever the installed components created.
         if target.startswith("windows"):
-            paths.write(str(dest.resolve() / "bin" / "x64") + "\n")
+            for arch_dir in ("x64", "arm64"):
+                if (dest / "bin" / arch_dir).is_dir():
+                    paths.write(str(dest.resolve() / "bin" / arch_dir) + "\n")
 
 
 def main() -> int:
@@ -191,11 +196,13 @@ def main() -> int:
     parser.add_argument("--components", default=",".join(DEFAULT_COMPONENTS),
                         help="comma-separated redist component names (default: %(default)s)")
     parser.add_argument("--platform", default=None,
-                        help="redist platform key: linux-x86_64, linux-sbsa or windows-x86_64 (default: this host)")
+                        help="redist platform key: linux-x86_64, linux-sbsa, windows-x86_64 or windows-arm64 "
+                             "(default: this host)")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--cache", type=Path, default=None, help="keep downloaded archives here for reuse")
     parser.add_argument("--github-env", action="store_true",
-                        help="export CUDA_PATH/CUDA_HOME and add bin (and bin\\x64 on Windows) to PATH for later steps")
+                        help="export CUDA_PATH/CUDA_HOME and add bin (and bin\\x64 or bin\\arm64 on Windows) to PATH "
+                             "for later steps")
     args = parser.parse_args()
     target = args.platform or detect_platform()
     components = [c.strip() for c in args.components.split(",") if c.strip()]
