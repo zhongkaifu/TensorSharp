@@ -284,6 +284,7 @@ namespace TensorSharp.Cuda
         {
             if (!_slots.TryGetValue(slotId, out Slot s))
                 return false;
+            FlushBoundarySend();
             _active = s;
             return true;
         }
@@ -425,6 +426,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public bool Truncate(int nPast)
         {
+            FlushBoundarySend();
             Slot s = _active;
             if (TruncateAlign <= 0 || s.Failed)
                 return false;

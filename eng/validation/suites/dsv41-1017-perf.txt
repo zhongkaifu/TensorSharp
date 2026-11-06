@@ -1,0 +1,25 @@
+# DeepSeek V4.1 Flash 1017 perf rows for ONE engine process (TensorSharp.Cli --bench-suite, or
+# run-multinode-case.py --kind suite --suite-file). The S9 part 2 shapes: random tokens, decode 128, 4 runs
+# (medians of runs 2-4); the seed is --bench-random-tokens' own, so the ids are S9's.
+#
+# Cold rows first. 'cold' drops the Engram tables from every node's page cache before the row (inside the
+# processes, verified with mincore); later runs of a cold row warm up as they go, as in an S9 cold process.
+# A warm row right after the cold row of the same shape replays its ids, so its rows are cached (S9's warm method).
+# check=0 skips the untimed greedy chain after each row (one more full prefill); identity is the probes' job.
+# Needs TS_DSV41_ENGRAM_DEVICE=0 (host-mapped tables) and TS_DSV41_ENGRAM_WARM=0 (no background warm).
+# The defaults run the parallel Engram reads with MADV_RANDOM only. The opt-in switches go in the process environment,
+# one setting per process, for an A/B inside one build: TS_DSV41_ENGRAM_OWNER=balance (one table per node, needed for
+# a warm steady state on the 1017), TS_DSV41_ENGRAM_PREFETCH=1, TS_DSV4_ASYNC_SEND=1; TS_DSV41_ENGRAM_THREADS=1 is S9.
+label=pp512-cold,prefill=512,decode=128,runs=4,mode=random,check=0,cold
+label=pp2048-cold,prefill=2048,decode=128,runs=4,mode=random,check=0,cold
+label=pp2048-warm,prefill=2048,decode=128,runs=4,mode=random,check=0
+label=pp8192-cold,prefill=8192,decode=128,runs=4,mode=random,check=0,cold
+label=pp8192-warm,prefill=8192,decode=128,runs=4,mode=random,check=0
+label=pp20480-cold,prefill=20480,decode=128,runs=4,mode=random,check=0,cold
+label=pp20480-warm,prefill=20480,decode=128,runs=4,mode=random,check=0
+# Real text (the S7/S9 probe texts on VM1, read by the driver only): greedy decode from the text's own logits.
+label=r2k-cold,text=/root/s7/r2k.txt,decode=128,runs=2,mode=greedy,cold
+label=r2k-warm,text=/root/s7/r2k.txt,decode=128,runs=2,mode=greedy
+label=r8k-cold,text=/root/s7/r8k.txt,decode=128,runs=2,mode=greedy,cold
+label=r8k-warm,text=/root/s7/r8k.txt,decode=128,runs=2,mode=greedy
+label=rcode-cold,text=/root/s7/rcode.txt,decode=128,runs=2,mode=greedy,cold

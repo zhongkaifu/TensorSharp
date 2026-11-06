@@ -22,6 +22,7 @@
 // turn, which a thinking turn needs because its render drops the previous
 // answer's reasoning. Plain V4 and the pure-C# executor re-prefill.
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using TensorSharp.GGML;
 using TensorSharp.Runtime.Scheduling;
@@ -298,6 +299,34 @@ namespace TensorSharp.Models
         internal DeepSeek4CudaExecutor CudaExecutor => _cudaExec;
 
         /// <summary>
+        /// DeepSeek V4.1's Engram tables: llama.cpp's combined <c>per_layer_token_embd.weight</c>, or TensorSharp's
+        /// per-layer <c>blk.N.engram_embd.weight</c>. Every executor reads them a few scattered rows per token from
+        /// the model file unless it placed them in VRAM (TS_DSV41_ENGRAM_DEVICE), so their page cache is what makes a
+        /// request cold or warm. Taken from the checkpoint, not from this node's layers: every node of a distributed
+        /// group evicts the same ranges. Plain V4 has none.
+        /// </summary>
+        public override IReadOnlyList<TensorSharp.Runtime.HostFileRange> HostMappedTables
+        {
+            get
+            {
+                var tables = new List<TensorSharp.Runtime.HostFileRange>();
+                void Add(string name)
+                {
+                    if (_gguf.TryGetTensorFileRange(name, out string path, out long offset, out long bytes))
+                        tables.Add(new TensorSharp.Runtime.HostFileRange(name, path, offset, bytes));
+                }
+                Add(Dsv41EngramData.CombinedTableName);
+                for (int layer = 0; layer < Config.NumLayers; layer++)
+                    Add(Dsv41EngramData.TableName(layer));
+                return tables;
+            }
+        }
+
+        /// <summary>The direct-CUDA executor's own reads of the Engram tables (its read-ahead and a background warm)
+        /// stop before a page-cache eviction drops them.</summary>
+        protected override void QuiesceHostTableReaders() => _cudaExec?.QuiesceEngramReads();
+
+        /// <summary>
         /// Tests only: one node's value of an execution variable, for an in-process multi-node test where every
         /// node shares the process environment. Null (always, outside tests) reads the environment.
         /// </summary>
@@ -346,7 +375,8 @@ namespace TensorSharp.Models
                 $"on {local} GPU(s); the driver runs the last stage and the head.");
             var link = new LayerSplitStageLink(group,
                 stage > 0 ? LayerSplitPlan.NodeOfStage(stage - 1, nodes, driverLast) : -1,
-                stage < nodes - 1 ? LayerSplitPlan.NodeOfStage(stage + 1, nodes, driverLast) : -1);
+                stage < nodes - 1 ? LayerSplitPlan.NodeOfStage(stage + 1, nodes, driverLast) : -1,
+                other => other >= 0 && other < nodes && other != stage ? LayerSplitPlan.NodeOfStage(other, nodes, driverLast) : -1);
             return new DeepSeek4CudaExecutor(ggufPath, maxContext, nUbatch, new DeepSeek4CudaExecutor.DistributedStage
             {
                 Nodes = nodes,
@@ -371,35 +401,45 @@ namespace TensorSharp.Models
         /// The direct-CUDA engine's stage link over the node pipeline: the engine's pinned payload moves as
         /// lossless 32-bit words (it pads every payload to 4 bytes). A transport fault throws out of the engine's
         /// forward, which fails the request, and the model then aborts the mesh so no peer waits on it.
+        /// Each direction has its own word buffer: a middle stage (3 or more nodes) both receives and sends, and
+        /// the engine's deferred send of one ubatch runs after the receive of the next, so a shared buffer would
+        /// only be safe for as long as both stay on one thread.
         /// </summary>
-        private sealed unsafe class LayerSplitStageLink(ILayerSplitGroup group, int previousNode, int nextNode)
-            : TensorSharp.Cuda.IDsv4StageLink
+        private sealed unsafe class LayerSplitStageLink(ILayerSplitGroup group, int previousNode, int nextNode,
+            Func<int, int> nodeOfStage) : TensorSharp.Cuda.IDsv4StageLink
         {
-            private float[] _words = Array.Empty<float>();
+            private float[] _sendWords = Array.Empty<float>(), _receiveWords = Array.Empty<float>();
 
-            public void SendNext(IntPtr data, int bytes) => Move(nextNode, data, bytes, send: true);
+            public void SendNext(IntPtr data, int bytes) => Move(nextNode, data, bytes, ref _sendWords, send: true);
 
-            public void ReceivePrevious(IntPtr data, int bytes) => Move(previousNode, data, bytes, send: false);
+            public void ReceivePrevious(IntPtr data, int bytes) => Move(previousNode, data, bytes, ref _receiveWords, send: false);
 
-            private void Move(int peer, IntPtr data, int bytes, bool send)
+            // The Engram rows a node keeps for another node's layer (Dsv4StagePlan.EngramOwnerStage). The engine moves
+            // them on the forward's own thread, before any boundary of the forward and after the previous forward's
+            // deferred send has drained, through the same per-direction buffers, so they never overlap a boundary.
+            public void SendToStage(int stage, IntPtr data, int bytes) => Move(nodeOfStage(stage), data, bytes, ref _sendWords, send: true);
+
+            public void ReceiveFromStage(int stage, IntPtr data, int bytes) => Move(nodeOfStage(stage), data, bytes, ref _receiveWords, send: false);
+
+            private void Move(int peer, IntPtr data, int bytes, ref float[] buffer, bool send)
             {
                 if (peer < 0)
                     throw new InvalidOperationException("This pipeline stage has no neighbour in that direction.");
                 if (bytes < 0 || (bytes & 3) != 0)
                     throw new ArgumentException($"A stage payload must be a whole number of 32-bit words, got {bytes} bytes.");
                 int words = bytes / 4;
-                if (_words.Length < words)
-                    _words = new float[words];   // grows to the largest payload once
-                fixed (float* w = _words)
+                if (buffer.Length < words)
+                    buffer = new float[words];   // grows to the largest payload once
+                fixed (float* w = buffer)
                 {
                     if (send)
                     {
-                        Buffer.MemoryCopy((void*)data, w, (long)_words.Length * 4, bytes);
-                        group.Send(_words, words, peer);
+                        Buffer.MemoryCopy((void*)data, w, (long)buffer.Length * 4, bytes);
+                        group.Send(buffer, words, peer);
                     }
                     else
                     {
-                        group.Receive(_words, words, peer);
+                        group.Receive(buffer, words, peer);
                         Buffer.MemoryCopy(w, (void*)data, bytes, bytes);
                     }
                 }

@@ -305,8 +305,11 @@ public sealed partial class Dsv41CudaDistributedTests
     /// The script on one executor per node, each a stage of <paramref name="localDevices"/> logical GPUs on this CUDA
     /// device, the payloads through in-process queues and the startup agreements through an in-process vote. Node 0
     /// runs the last stage and returns the logits; every stage runs each forward concurrently, as the worker loop does.
+    /// <paramref name="drive"/>, when given, runs instead of the script: it gets the executors (by node) and the
+    /// pipeline's forward, and returns the logit rows.
     /// </summary>
-    private async Task<LocalRun> LocalStages(string path, int[] boundaries, int localDevices, Func<int, string> buildOf = null)
+    private async Task<LocalRun> LocalStages(string path, int[] boundaries, int localDevices, Func<int, string> buildOf = null,
+        Func<DeepSeek4CudaExecutor[], Func<int[], float[]>, float[][]> drive = null)
     {
         int nodes = (boundaries.Length - 1) / localDevices;
         Dsv4CudaEngine.LogicalDevicesForTests = localDevices;
@@ -353,7 +356,7 @@ public sealed partial class Dsv41CudaDistributedTests
                 foreach (var ex in executors)
                     ex.Reset();
             }
-            float[][] rows = await Task.Run(() => Script(Forward, Reset)).WaitAsync(RunDeadline);
+            float[][] rows = await Task.Run(() => drive != null ? drive(executors, Forward) : Script(Forward, Reset)).WaitAsync(RunDeadline);
             var byStage = executors.OrderBy(e => e.Engine.OwnedLayers.First).ToArray();
             return new LocalRun(rows, byStage.Select(Counters).ToArray(),
                 Enumerable.Range(0, nodes).Select(pipe.Identities).ToArray());
@@ -375,6 +378,17 @@ public sealed partial class Dsv41CudaDistributedTests
         private static readonly TimeSpan Deadline = TimeSpan.FromSeconds(120);
         private readonly BlockingCollection<byte[]>[] _queues =
             Enumerable.Range(0, Math.Max(0, stages - 1)).Select(_ => new BlockingCollection<byte[]>()).ToArray();
+        // Stage-to-stage messages (the Engram rows a node keeps for another's layer), one queue per (from, to).
+        private readonly BlockingCollection<byte[]>[,] _direct = DirectQueues(stages);
+
+        private static BlockingCollection<byte[]>[,] DirectQueues(int stages)
+        {
+            var queues = new BlockingCollection<byte[]>[stages, stages];
+            for (int a = 0; a < stages; a++)
+                for (int b = 0; b < stages; b++)
+                    queues[a, b] = new BlockingCollection<byte[]>();
+            return queues;
+        }
         private readonly CancellationTokenSource _abort = new();
         private readonly object _lock = new();
         private readonly List<string>[] _agreed = Enumerable.Range(0, stages).Select(_ => new List<string>()).ToArray();
@@ -424,6 +438,8 @@ public sealed partial class Dsv41CudaDistributedTests
             Abort();
             foreach (var queue in _queues)
                 queue.Dispose();
+            foreach (var queue in _direct)
+                queue.Dispose();
             _abort.Dispose();
         }
 
@@ -442,6 +458,22 @@ public sealed partial class Dsv41CudaDistributedTests
                     throw new TimeoutException($"stage {stage}: no payload from stage {stage - 1}");
                 if (payload.Length != bytes)
                     throw new InvalidOperationException($"stage {stage}: {payload.Length}-byte payload, {bytes} expected");
+                Marshal.Copy(payload, 0, data, bytes);
+            }
+
+            public void SendToStage(int to, IntPtr data, int bytes)
+            {
+                var copy = new byte[bytes];
+                Marshal.Copy(data, copy, 0, bytes);
+                pipe._direct[stage, to].Add(copy, pipe._abort.Token);
+            }
+
+            public void ReceiveFromStage(int from, IntPtr data, int bytes)
+            {
+                if (!pipe._direct[from, stage].TryTake(out byte[] payload, (int)Deadline.TotalMilliseconds, pipe._abort.Token))
+                    throw new TimeoutException($"stage {stage}: no message from stage {from}");
+                if (payload.Length != bytes)
+                    throw new InvalidOperationException($"stage {stage}: {payload.Length}-byte message from stage {from}, {bytes} expected");
                 Marshal.Copy(payload, 0, data, bytes);
             }
         }
