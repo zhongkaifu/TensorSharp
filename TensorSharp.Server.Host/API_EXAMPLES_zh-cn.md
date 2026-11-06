@@ -72,6 +72,7 @@ OpenAI / Ollama 响应附加 `knowledge_sources`、`knowledge_citation_repairs`�
 |---|---|
 | 承载模型 | 单个 GGUF 文件，通过 `--model` 选择；请求中的 `model` 必须是该文件名或 basename |
 | 投影器 | 可选单个投影器，通过 `--mmproj` 显式选择；供多模态模型使用 |
+| 聊天模板 | 使用 `--model` GGUF 自带的 `tokenizer.chat_template`，或用 `--chat-template-file`（与 llama.cpp 同名）给出的 Jinja 文件；该文件在启动时解析，只替换这一个模型的模板。在没有 `developer` 角色的模板上，OpenAI 的 `developer` 角色按 `system` 渲染。见[自带工具的智能体客户端](#自带工具的智能体客户端picodexopencode)。 |
 | 后端 | `mlx`、`cuda`、`ggml_metal`、`ggml_cuda`、`ggml_vulkan`、`ggml_cpu`、`cpu`；`/api/models` 会返回当前主机可用项 |
 | 并发 | 自回归聊天使用连续批处理引擎（`/api/queue/status` 报告它的实时负载）；DiffusionGemma Web UI 请求使用独立的 block 边界 diffusion scheduler。 |
 | 生成模式 | 自回归模型流式追加 token chunk。DiffusionGemma 在 append-only 兼容端点返回最终文本，在 Web UI `/api/chat` 上提供整条消息替换式实时去噪预览。 |
@@ -82,6 +83,7 @@ OpenAI / Ollama 响应附加 `knowledge_sources`、`knowledge_citation_repairs`�
 | Agent Skills | 技能目录：首先是二进制文件旁的 `skills` 目录（通过 `POST /api/skills` 上传的技能安装在此处；最先扫描，因此同名时其中的技能优先），然后是 `--skills-dir`（默认为从工作目录向上直到 Git 根目录的每个已存在的 `.agents/skills`，由近及远），在 `/v1/skills` 与 `/api/skills` 列出，也可通过 `POST /api/skills` 以 `.zip` 安装。所有聊天端点都可用 `"skills": [...]` 按请求选中。对同时支持工具声明与输出解析的模型族（包括 Qwen 3.8 Flash Next，`qwen4exp`），模型自己的技能调用在服务端内部应答，因此客户端拿到完整回复；不支持完整工具闭环的模型族则以内联方式获得选中技能说明。`skills_run` 只有在服务启动时传入 `--skills-allow-exec` 才可用。 |
 | Agent 式代码执行 | `--code-exec` 会为支持工具调用的模型族加入进程内执行的 `shell`、`read_file`、`write_file` 与 `apply_patch`。Web UI 每个聊天会话保留一个工作区；每个 OpenAI/Ollama HTTP 请求在内部轮次间使用私有工作区，响应结束后由服务删除。联网与安装软件包是相互独立且默认关闭的权限。 |
 | 子智能体 | 在 `/v1/chat/completions`、`/v1/responses`、`/api/chat/ollama` 与 Web UI `/api/chat` 上，对能渲染工具声明且有工具解析器的模型族（Mistral 3、Hunyuan Dense 与 DiffusionGemma 除外）默认开启。模型可以调用 `spawn_agent`、`wait_agent`、`send_input`、`close_agent` 与 `list_agents`；子智能体由服务端在进程内用同一个已加载模型运行；`explorer` 与 `reviewer` 子智能体只读，`worker` 只有在服务启动时传入 `--agents-allow-worker-tools` 时才获得父级的可写工具。`--no-multi-agent` 为整个服务关闭委派，`"multi_agent": false` 为单个请求关闭。见[子智能体](#子智能体multi_agent)。 |
+| 自带工具的智能体客户端 | 请求声明了 `tools`，或其消息里已有工具调用与工具结果，即视为客户端自己运行工具循环（pi、Codex、opencode）。这类请求不会得到服务端的任何工具（技能目录、技能工具、代码执行工具、子智能体工具），除非请求明确要求：技能用 `"skills": [...]` 或 `"skills_discovery": true`（在 `--code-exec` 下也随之提供代码工具），委派用 `"multi_agent": true`。请求指定的知识库集合仍然生效。Web UI 不受影响。见[自带工具的智能体客户端](#自带工具的智能体客户端picodexopencode)。 |
 | 文本 LoRA 适配器 | 只从 `--loras-dir` 加载（启动时加载顶层的每个适配器，运行时再通过 `POST /v1/loras` 加载；未配置该目录时返回 403），同时最多 32 个；在 `/v1/chat/completions` 与 `/v1/responses` 上用 `"lora"` 按请求选择（仅单设备上的 `nemotron_h`、`mistral3`、`hunyuan-dense`；其他情况返回 400）。见[文本模型 LoRA 适配器](#文本模型-lora-适配器lorav1loras)。 |
 | 结构化输出 | OpenAI `response_format` 支持 `text`、`json_object`、`json_schema`，`/v1/chat/completions` 在解码时用 JSON 语法约束它们；`response_format`（`json_object` / `json_schema`）不能与 `tools` 同时使用；只有声明了推理结束位置的模型家族（GPT-OSS、DeepSeek V4.1、Qwen 3.8 Flash Next、GLM-5.3-Flash、Gemma 4、Nemotron-H、Muse-Glimmer、Muse Spark）允许与 `think` 同时使用 |
 
@@ -818,6 +820,44 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 ```
 
 将 assistant 的 `tool_calls` 与一条 `{"role": "tool", "tool_call_id": "...", "content": "..."}` 消息追加到 messages，即可继续工具循环。
+
+### 自带工具的智能体客户端（pi、Codex、opencode）
+
+[pi](https://pi.dev) 这类编码智能体会发送自己的工具（`read`、`bash`、`edit`、`write`）并自行执行。请求声明了 `tools`，或其消息里已有工具调用与工具结果时，服务端把它视为这种循环的一部分，只用客户端的工具渲染：
+
+- **除非请求要求，否则不加服务端工具。** 不加入技能目录、技能工具、`--code-exec` 工具与子智能体工具。`"skills": ["pdf"]` 提供所点名的技能（不公布目录中的其他技能），`"skills_discovery": true` 提供目录；在 `--code-exec` 下两者都会带上代码工具。`"multi_agent": true` 在服务端允许时提供委派。没有这条规则时，pi 的每一轮都带着服务端的技能目录和另外七个工具：同一句 "hello" 的提示从 3,798 个 token 涨到 6,843 个；让 4B 模型读一个文件时，它先调用了八次 `skills_list`，最后回答看不到该文件（issue #285）。
+- **`developer` 即 `system`。** 对配置了 `"reasoning": true` 的模型，pi 用 `developer` 消息发送指令。只认识 `system` 的模板（例如 Qwen 3.5 的模板）以前会不报错地丢掉这条消息；现在它按 system 消息渲染，与 llama.cpp 一致。GPT-OSS（Harmony）、DeepSeek V4/V4.1、MiniMax-M3、GLM-5.x 与 Gemma 4 保留各自对该角色的处理。
+- **思考。** `"think": true` 与 `"chat_template_kwargs": {"enable_thinking": true}` 是同一个开关；pi 的 `qwen-chat-template` 思考格式发送后者。`reasoning_effort` 也接受 OpenAI 的 `none`、`minimal` 与 `xhigh`。
+- **用量就是实际提示。** 中间没有服务端的内部轮次，`prompt_tokens` 就是客户端所发提示的大小；pi 把这个数当作上下文占用。
+
+服务端以 `MAX_CONTEXT=16384 ... --max-tokens 8192` 启动时，pi 的 `models.json`（`~/.pi/agent/models.json`）：
+
+```json
+{
+  "providers": {
+    "tensorsharp": {
+      "baseUrl": "http://127.0.0.1:5000/v1",
+      "api": "openai-completions",
+      "apiKey": "none",
+      "models": [
+        {
+          "id": "mica-v0.1-4b-Q4_K_M",
+          "reasoning": true,
+          "contextWindow": 16384,
+          "maxTokens": 8192,
+          "compat": { "thinkingFormat": "qwen-chat-template" }
+        }
+      ]
+    }
+  }
+}
+```
+
+`id` 是 `GET /v1/models` 列出的托管模型名（GGUF 文件名去掉 `.gguf`）。把 `contextWindow` 设为服务端的上下文长度。上下文距 `contextWindow` 不足 `compaction.reserveTokens`（默认 16,384）时 pi 就开始压缩，所以在 16K 窗口下应在 pi 的 `settings.json` 中调低它，例如 `{"compaction": {"reserveTokens": 4096}}`。移除旧轮次后提示仍放不进服务端窗口时，服务端返回 HTTP 400 和 `"code": "context_length_exceeded"`，pi 能识别它并通过压缩处理。
+
+要用模型仓库里的 `chat_template.jinja` 代替 GGUF 中的模板，以 `--chat-template-file chat_template.jinja` 启动服务端。只有模板文本改变；输出解析器、服务端解析的工具调用格式和 BOS 处理仍沿用该模型族的。
+
+服务端启动时自己发出的单 token 预热请求在日志中记为 `chat.start ... origin=prefix-cache-warmup maxTokens=1` 与 `chat.complete tokens=1 origin=prefix-cache-warmup ... finishReason=max_tokens`，它们不是客户端请求。
 
 ### Chat Completions + Agent Skills
 
@@ -1807,7 +1847,8 @@ camelCase 和 snake_case 两种拼写（两者同时出现时以 camelCase 为�
 | `stop`              | string/array| null    | 停止序列                            |
 | `response_format`   | object      | null    | `text`、`json_object` 或 `json_schema` |
 | `think`             | bool        | false   | 非标准扩展：启用思维链 / 推理解析（以 `reasoning_content` 返回 / 流式输出） |
-| `reasoning_effort`  | string      | null    | `low`、`medium` 或 `high`；只有 GPT-OSS（Harmony）会渲染，其他模型族忽略；其他取值返回 HTTP 400。在 GPT-OSS 上，`"think": false` 且未指定强度时按 `low` 处理 |
+| `chat_template_kwargs` | object  | null    | llama.cpp / vLLM / SGLang 的约定。只读取 `enable_thinking`（bool），与 `think` 是同一个开关；`think` 与 `enable_thinking` 不一致时返回 HTTP 400。其他键被忽略，服务端对每个键记录一次日志 |
+| `reasoning_effort`  | string      | null    | `low`、`medium` 或 `high`；OpenAI 的 `none` 与 `minimal` 按 `low`、`xhigh` 按 `high` 处理。只有带强度行的模型族（GPT-OSS、GLM-5.3-Flash）会渲染，其他模型族忽略；其他取值返回 HTTP 400。在 GPT-OSS 上，`"think": false`（或 `enable_thinking: false`）且未指定强度时按 `low` 处理 |
 | `tool_choice`       | string/object | `auto` | Chat Completions：`auto`、`none`（不提供任何工具，包括内置技能、代码与子智能体工具）、`required`，或 `{"type": "function", "function": {"name": ...}}`；后两者须指向客户端声明的 `tools`（否则返回 HTTP 400），且只有 DeepSeek V4.1 会用工具调用语法强制执行，其他模型族接受该值但仍可能不调用工具直接作答 |
 | `parallel_tool_calls` | bool      | null    | Chat Completions：必须是布尔值（否则返回 HTTP 400）；只有 DeepSeek V4.1 会遵循 `false`（其工具调用语法只允许一次调用），其他模型族接受但忽略 |
 

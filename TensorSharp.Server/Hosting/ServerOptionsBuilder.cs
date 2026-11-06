@@ -150,6 +150,8 @@ public static class ServerOptionsBuilder
             skillOptions.ValidateRoots(createDefault: skillDirectoriesAreDefault);
 
         string? loraDirectory = ResolveLoraDirectory(args, embeddingsEnabled);
+        TensorSharp.Runtime.ChatTemplateFile? chatTemplate =
+            ResolveChatTemplateFile(args, embeddingsEnabled, startupModelPath);
 
         // TS_NO_WEBUI follows the TENSORSHARP_LOG_FILE convention: set to
         // anything but "0" counts as on.
@@ -199,7 +201,38 @@ public static class ServerOptionsBuilder
             embeddingThreads: embeddingThreads,
             embeddingContextSize: embeddingContextSize,
             multiAgent: ReadMultiAgentOptions(args),
-            loraDirectory: loraDirectory);
+            loraDirectory: loraDirectory,
+            chatTemplate: chatTemplate);
+    }
+
+    /// <summary>
+    /// The <c>--chat-template-file</c> template (the last one given), read and parsed now
+    /// so a missing or unparsable file stops the host before the model loads; null when
+    /// the flag is absent. It replaces the template of the <c>--model</c> file, so it
+    /// needs one, and an embedding server renders no chat prompt at all.
+    /// </summary>
+    private static TensorSharp.Runtime.ChatTemplateFile? ResolveChatTemplateFile(
+        string[] args, bool embeddingsEnabled, string? startupModelPath)
+    {
+        string? configured = null;
+        bool seen = false;
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (TryReadOption(args, ref i, TensorSharp.Runtime.ChatTemplateFile.Flag, out string? value))
+            {
+                configured = value;
+                seen = true;
+            }
+        }
+        if (!seen)
+            return null;
+        if (embeddingsEnabled)
+            throw new ArgumentException(
+                $"{TensorSharp.Runtime.ChatTemplateFile.Flag} does not apply to --embeddings: an embedding server renders no chat prompt.");
+        if (string.IsNullOrWhiteSpace(startupModelPath))
+            throw new ArgumentException(
+                $"{TensorSharp.Runtime.ChatTemplateFile.Flag} requires --model: it replaces the chat template of that model's GGUF.");
+        return TensorSharp.Runtime.ChatTemplateFile.Load(configured, TensorSharp.Runtime.ChatTemplateFile.Flag);
     }
 
     /// <summary>
@@ -1331,6 +1364,11 @@ public static class ServerOptionsBuilder
                 continue;
             }
 
+            // The chat template file is read and parsed by ResolveChatTemplateFile; this
+            // only lets it past the unknown-option trap.
+            if (TryReadOption(args, ref i, TensorSharp.Runtime.ChatTemplateFile.Flag, out _))
+                continue;
+
             // Text-model LoRA directory: the value is read and validated by
             // ResolveLoraDirectory; this only lets it past the unknown-option trap.
             if (TryReadOption(args, ref i, TextLoraHostOptions.DirectoryFlag, out _))
@@ -1542,7 +1580,7 @@ public static class ServerOptionsBuilder
             SkillHostOptions.AllowScriptsFlag, SkillHostOptions.MaxRoundsFlag,
             SkillHostOptions.SandboxFlag, SkillHostOptions.AllowNetworkFlag,
             SkillHostOptions.SelectFlag, SkillHostOptions.ListFlag,
-            TextLoraHostOptions.DirectoryFlag,
+            TextLoraHostOptions.DirectoryFlag, TensorSharp.Runtime.ChatTemplateFile.Flag,
             // Without these, a typo like --code-exe fell through to a bare
             // "Unknown option" with no hint, because CodeExecOptions.Parse does not
             // match a misspelling and nothing else knew the names.

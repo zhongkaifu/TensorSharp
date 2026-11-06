@@ -1120,6 +1120,19 @@ Every chat surface takes the same two optional fields:
 the skills it named. The same requests also accept `"multi_agent": false`, which
 turns off [sub-agent delegation](multi_agent.md) for that request only.
 
+**A client that runs its own tool loop gets skills only when it asks.** On
+`/v1/chat/completions`, `/v1/responses` and `/api/chat/ollama`, a request that
+declares `tools`, or whose messages already hold tool calls and tool results, is
+treated as part of a client's own agent loop (pi, Codex, opencode). It inherits
+neither the operator's `--skill` selection nor the discovery default, and it gets
+no code-execution tools: only `"skills": [...]` (the named skills; the catalog is
+advertised only with `"skills_discovery": true` as well) or `"skills_discovery": true`
+offers skills, and either brings the code tools with `--code-exec`. The Web UI is
+unchanged. With the catalog and host tools merged in, a pi turn carried 3,045 more
+prompt tokens, and a 4B model called `skills_list` eight times instead of the client's
+`read` (issue #285). See
+[Agent clients that run their own tools](../TensorSharp.Server.Host/API_EXAMPLES.md#agent-clients-that-run-their-own-tools-pi-codex-opencode).
+
 ```bash
 # OpenAI-compatible
 curl -X POST http://localhost:5000/v1/chat/completions \

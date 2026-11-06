@@ -46,6 +46,7 @@
       <tr><td><code>--image / --video / --audio &lt;path&gt;</code></td><td>用于视觉 / 视频 / 音频推理的媒体。</td></tr>
       <tr><td><code>--pdf &lt;path&gt;</code></td><td>PDF 文档单次输入：数字 PDF 内联为文本；扫描 PDF 转为页面图像交给视觉模型（页数上限：<code>TS_PDF_MAX_PAGES</code>）。</td></tr>
       <tr><td><code>--mmproj &lt;path|none&gt;</code></td><td>多模态投影器：mmproj GGUF，或者对 Gemma 4 家族（含 DiffusionGemma）而言，装有视觉塔的 Hugging Face <code>.safetensors</code> 分片。建议显式传入；省略它且给出了图像、音频或视频时，CLI 只会在模型旁查找该架构已知的投影器文件名（<code>.safetensors</code> 分片从不自动识别）。<code>none</code>（不区分大小写）不加载投影器并跳过该查找，与服务端一致。</td></tr>
+      <tr><td><code>--chat-template-file &lt;path&gt;</code></td><td>用 Jinja 聊天模板替换 GGUF 的 <code>tokenizer.chat_template</code>，与 llama.cpp 的同名选项相同。在模型加载前解析；无法读取或解析的文件属于配置错误。对 TensorSharp 平时用自带渲染器的模型族同样生效；输出解析器、工具调用格式和 BOS 处理仍沿用该模型族的。</td></tr>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>最大生成 token 数（默认 100）。</td></tr>
       <tr><td><code>--backend &lt;type&gt;</code></td><td><code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_vulkan</code>。所有操作系统上默认 <code>ggml_cpu</code>。</td></tr>
       <tr><td><code>--gpu-device &lt;N&gt;</code></td><td><code>ggml_vulkan</code> 在多 GPU 主机上使用的 Vulkan 设备索引（默认 0；环境变量 <code>TS_GGML_VULKAN_DEVICE</code>）。</td></tr>
@@ -122,6 +123,7 @@
     <tbody>
       <tr><td><code>--model &lt;path&gt;</code></td><td>启动时要托管的 GGUF 文件（必需）；无模型进程不能通过 <code>/api/models/load</code> 选择 GGUF。</td></tr>
       <tr><td><code>--mmproj &lt;path|none&gt;</code></td><td>显式多模态投影器：mmproj GGUF，或者对 Gemma 4 家族（含 DiffusionGemma）而言，Hugging Face <code>.safetensors</code> 视觉塔分片。裸文件名在模型旁解析；<code>none</code> 可禁用。服务端不会自动检测。</td></tr>
+      <tr><td><code>--chat-template-file &lt;path&gt;</code></td><td>用 Jinja 聊天模板替换 <code>--model</code> GGUF 的 <code>tokenizer.chat_template</code>（需要 <code>--model</code>；不能与 <code>--embeddings</code> 同用）。启动时解析；只作用于 <code>--model</code> 指定的文件，之后通过 <code>/api/models/load</code> 加载的模型保留自己的模板。见<a href="http-api_zh-cn.html#client-tool-loops">智能体客户端</a>。</td></tr>
       <tr><td><code>--embeddings</code> · <code>--embedding-threads &lt;N&gt;</code> · <code>--embedding-context-size &lt;N&gt;</code></td><td>托管 GGUF 嵌入编码器而不是聊天模型（<code>/v1/embeddings</code>、<code>/api/embed</code>）。需要 <code>--model</code>，不能与 <code>--mmproj</code> 同用，可在 <code>cpu</code>、<code>ggml_cpu</code>、<code>ggml_metal</code> 或 <code>ggml_cuda</code> 上运行；此模式下聊天、Jev、图像与视频路由都返回 400，显式指定本机没有的 <code>--backend</code> 时以退出码 2 结束。见<a href="embeddings_zh-cn.html">嵌入</a>。</td></tr>
       <tr><td><code>--port &lt;N&gt;</code> · <code>--host &lt;address&gt;</code> · <code>--urls &lt;urls&gt;</code></td><td>监听端口（默认 5000；环境变量 <code>PORT</code>）、绑定地址（默认 <code>0.0.0.0</code>；环境变量 <code>HOST</code>），或完整监听 URL（回落到 <code>ASPNETCORE_URLS</code>）。</td></tr>
       <tr><td><code>--no-webui</code></td><td>不提供内置 Web UI；HTTP API 与 <code>/uploads</code> 照常可用。环境变量 <code>TS_NO_WEBUI</code>。</td></tr>

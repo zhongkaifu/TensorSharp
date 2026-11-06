@@ -299,6 +299,14 @@ namespace TensorSharp.Cli
                     "*Nemotron*mmproj*.gguf or *mmproj*Nemotron*.gguf; DeepSeek V4.1: deepseek41.vision.gguf. " +
                     "Pass it explicitly for anything else.",
                     "--mmproj mmproj-gemma-4-E4B-it-Q8_0.gguf"),
+                new OptionHelp(ChatTemplateFile.Flag + " <path>",
+                    "Jinja chat template file that replaces the model's GGUF template (tokenizer.chat_template), as " +
+                    "llama.cpp's --chat-template-file does: for a repository's corrected chat_template.jinja, or a GGUF " +
+                    "converted without one. Parsed at startup; a file this engine cannot parse is a configuration " +
+                    "error. Used even for families TensorSharp normally renders with its own renderer. Only the " +
+                    "template text changes: output parsing, tool-call parsing and BOS handling stay the model " +
+                    "family's. Default: the GGUF's template.",
+                    ChatTemplateFile.Flag + " chat_template.jinja"),
             }),
             ("Compute backend and GPUs", new[]
             {

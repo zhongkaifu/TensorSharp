@@ -103,6 +103,7 @@ imports, collection rename, filters and safe previews.
 |---|---|
 | Hosted models | One GGUF file, selected with `--model`; requests must name that hosted file or its basename |
 | Projectors | Optional single projector, selected explicitly with `--mmproj`; used for multimodal-capable models |
+| Chat template | The `--model` GGUF's own `tokenizer.chat_template`, or the Jinja file given with `--chat-template-file` (llama.cpp's spelling), which is parsed at startup and replaces it for that model only. OpenAI's `developer` role renders as `system` on every template that has no role of that name. See [Agent clients that run their own tools](#agent-clients-that-run-their-own-tools-pi-codex-opencode). |
 | Backends | `mlx`, `cuda`, `ggml_metal`, `ggml_cuda`, `ggml_vulkan`, `ggml_cpu`, `cpu`; `/api/models` reports which are available on the host |
 | Concurrency | Autoregressive chat uses the continuous-batching engine (`/api/queue/status` reports its live load); DiffusionGemma Web UI requests use a separate block-boundary diffusion scheduler. |
 | Generation modes | Autoregressive models stream appended token chunks. DiffusionGemma returns final text on append-only compatibility endpoints and exposes live whole-message denoising previews on Web UI `/api/chat`. |
@@ -113,6 +114,7 @@ imports, collection rename, filters and safe previews.
 | Agent Skills | Skill directories: the `skills` folder beside the binary (where skills uploaded through `POST /api/skills` are installed; scanned first, so its skills win a name clash), then `--skills-dir` (by default, every existing `.agents/skills` from the working directory up to the Git root, nearest first), listed at `/v1/skills` and `/api/skills` and installable as a `.zip` through `POST /api/skills`. Selected per request with `"skills": [...]` on every chat endpoint. On families with both declaration and output-parser support, including Qwen 3.8 Flash Next (`qwen4exp`), the model's own skill calls are answered inside the server, so clients receive a finished completion. Families without usable tool support receive selected skill instructions inline instead. `skills_run` is off unless the server starts with `--skills-allow-exec`. |
 | Agentic code execution | `--code-exec` adds the in-process `shell`, `read_file`, `write_file`, and `apply_patch` tools on tool-capable model families. Web UI keeps one workspace per chat session; each OpenAI/Ollama HTTP request gets a private workspace across its internal rounds and the server deletes it after the response. Network and package installation are separate, off-by-default permissions. |
 | Sub-agents | On by default on `/v1/chat/completions`, `/v1/responses`, `/api/chat/ollama` and Web UI `/api/chat` for families that render tool declarations and have a tool parser (not Mistral 3, Hunyuan Dense or DiffusionGemma). The model may call `spawn_agent`, `wait_agent`, `send_input`, `close_agent` and `list_agents`; the server runs the children in process on the same loaded model; `explorer` and `reviewer` children are read-only, and a `worker` gets the parent's mutable tools only when the server starts with `--agents-allow-worker-tools`. `--no-multi-agent` disables delegation for the server and `"multi_agent": false` for one request. See [Sub-agents](#sub-agents-multi_agent). |
+| Agent clients with their own tools | A request that declares `tools`, or whose messages already hold tool calls and tool results, belongs to a client that runs its own tool loop (pi, Codex, opencode). It gets none of the server's tools (skills catalog, skill tools, code-execution tools, sub-agent tools) unless it asks: `"skills": [...]` or `"skills_discovery": true` for skills (and, with `--code-exec`, the code tools), `"multi_agent": true` for delegation. Knowledge collections the request names still apply. The Web UI is unchanged. See [Agent clients that run their own tools](#agent-clients-that-run-their-own-tools-pi-codex-opencode). |
 | Text-LoRA adapters | Loaded from `--loras-dir` only (every top-level adapter at startup, more through `POST /v1/loras`; 403 without the directory), at most 32 at once, and chosen per request with `"lora"` on `/v1/chat/completions` and `/v1/responses` (`nemotron_h`, `mistral3`, `hunyuan-dense` on one device; anything else is a 400). See [Text-model LoRA adapters](#text-model-lora-adapters-lora-v1loras). |
 | Structured outputs | OpenAI `response_format` supports `text`, `json_object`, and `json_schema`, which `/v1/chat/completions` enforces with a JSON grammar during decoding; `response_format` (`json_object` / `json_schema`) cannot be combined with `tools`, and combines with `think` only on families that declare where reasoning ends (GPT-OSS, DeepSeek V4.1, Qwen 3.8 Flash Next, GLM-5.3-Flash, Gemma 4, Nemotron-H, Muse-Glimmer, Muse Spark) |
 
@@ -874,6 +876,76 @@ When the model emits a tool call the response uses OpenAI-style fields:
 ```
 
 Append the assistant `tool_calls` plus a follow-up `{"role": "tool", "tool_call_id": "...", "content": "..."}` message to continue the loop.
+
+### Agent clients that run their own tools (pi, Codex, opencode)
+
+A coding agent such as [pi](https://pi.dev) sends its own tools (`read`, `bash`,
+`edit`, `write`) and executes them itself. The server treats a request as part of
+such a loop when it declares `tools`, or when its messages already hold tool calls
+and tool results. Such a request is rendered with the client's tools only:
+
+- **No server tools unless asked for.** The skills catalog, the skill tools, the
+  `--code-exec` tools and the sub-agent tools are not added. `"skills": ["pdf"]`
+  offers the named skills (the rest of the catalog is not advertised),
+  `"skills_discovery": true` offers the catalog, and either one brings the code tools
+  when the server runs with `--code-exec`. `"multi_agent": true` offers delegation on
+  a server that allows it. Without this rule a pi turn carried the server's catalog
+  and seven extra tools: its "hello" prompt grew from 3,798 to 6,843 tokens, and a 4B
+  model asked to read a file called `skills_list` eight times before answering that
+  it could not see the file (issue #285).
+- **`developer` is `system`.** pi sends its instructions as a `developer` message
+  for every model configured with `"reasoning": true`. Templates that know only
+  `system`, such as Qwen 3.5's, used to drop that message without an error. It now
+  renders as the system message, as llama.cpp does. GPT-OSS (Harmony), DeepSeek
+  V4/V4.1, MiniMax-M3, GLM-5.x and Gemma 4 keep their own handling of the role.
+- **Thinking.** `"think": true` and `"chat_template_kwargs": {"enable_thinking": true}`
+  are the same switch. pi sends the second in its `qwen-chat-template` thinking
+  format. `reasoning_effort` accepts OpenAI's `none`, `minimal` and `xhigh` too.
+- **Usage is the real prompt.** With no server-side rounds in between,
+  `prompt_tokens` is the size of the prompt the client sent. pi uses that number as
+  its context occupancy.
+
+A pi `models.json` (`~/.pi/agent/models.json`) for a server started with
+`MAX_CONTEXT=16384 ... --max-tokens 8192`:
+
+```json
+{
+  "providers": {
+    "tensorsharp": {
+      "baseUrl": "http://127.0.0.1:5000/v1",
+      "api": "openai-completions",
+      "apiKey": "none",
+      "models": [
+        {
+          "id": "mica-v0.1-4b-Q4_K_M",
+          "reasoning": true,
+          "contextWindow": 16384,
+          "maxTokens": 8192,
+          "compat": { "thinkingFormat": "qwen-chat-template" }
+        }
+      ]
+    }
+  }
+}
+```
+
+`id` is the hosted model's name as `GET /v1/models` lists it (the GGUF file name
+without `.gguf`). Set `contextWindow` to the server's context length. pi starts
+compacting when the context is within `compaction.reserveTokens` (16,384 by default)
+of `contextWindow`, so with a 16K window lower it in pi's `settings.json`, for example
+`{"compaction": {"reserveTokens": 4096}}`. When a prompt does not fit the server's
+window even after old turns are removed, the server answers HTTP 400 with
+`"code": "context_length_exceeded"`, which pi recognizes and handles by compacting.
+
+To use a repository's `chat_template.jinja` instead of the one in the GGUF, start
+the server with `--chat-template-file chat_template.jinja`. Only the template text
+changes; the output parser, the tool-call format the server parses and the BOS
+handling stay the model family's.
+
+The server's own one-token warm-up requests at startup are logged as
+`chat.start ... origin=prefix-cache-warmup maxTokens=1` and
+`chat.complete tokens=1 origin=prefix-cache-warmup ... finishReason=max_tokens`. They are
+not client requests.
 
 ### Chat with Agent Skills
 
@@ -2011,7 +2083,8 @@ the request.
 | `stop`              | string/array| null    | Stop sequences                     |
 | `response_format`   | object      | null    | `text`, `json_object`, or `json_schema` |
 | `think`             | bool        | false   | Non-standard extension: enables thinking/reasoning parsing (returned/streamed as `reasoning_content`) |
-| `reasoning_effort`  | string      | null    | `low`, `medium` or `high`; rendered only by GPT-OSS (Harmony), other families ignore it; any other value is HTTP 400. On GPT-OSS, `"think": false` with no effort means `low` |
+| `chat_template_kwargs` | object  | null    | llama.cpp / vLLM / SGLang convention. Only `enable_thinking` (bool) is read, as the same switch as `think`; a request whose `think` and `enable_thinking` disagree is HTTP 400. Other keys are ignored, and the server logs that once per key |
+| `reasoning_effort`  | string      | null    | `low`, `medium` or `high`; OpenAI's `none` and `minimal` read as `low` and `xhigh` as `high`. Rendered only by families with an effort line (GPT-OSS, GLM-5.3-Flash); other families ignore it; any other value is HTTP 400. On GPT-OSS, `"think": false` (or `enable_thinking: false`) with no effort means `low` |
 | `tool_choice`       | string/object | `auto` | Chat Completions: `auto`, `none` (offers no tools, including the built-in skill, code and sub-agent tools), `required`, or `{"type": "function", "function": {"name": ...}}`; the last two must name client-declared `tools` (HTTP 400 otherwise). Only DeepSeek V4.1 enforces them with a tool-call grammar; other families accept them but can still answer without calling the tool |
 | `parallel_tool_calls` | bool      | null    | Chat Completions: must be a boolean (HTTP 400 otherwise). Only DeepSeek V4.1 honors `false` (its tool grammar then allows a single call); other families accept and ignore it |
 

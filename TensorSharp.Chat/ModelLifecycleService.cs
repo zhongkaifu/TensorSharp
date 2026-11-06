@@ -46,6 +46,58 @@ namespace TensorSharp.Server
         public bool IsLoaded => _model != null;
 
         /// <summary>
+        /// The operator's <c>--chat-template-file</c>, and the model it was given for
+        /// (the host's <c>--model</c>). Applied at every load of that model, before
+        /// anything renders a prompt with it; another model loaded later keeps its own
+        /// template, and the load says so. Set before <see cref="LoadModel"/>.
+        /// </summary>
+        public (ChatTemplateFile Template, string ModelPath)? ChatTemplateOverride { get; set; }
+
+        private bool _chatTemplateOverrideSkipReported;
+
+        private void ApplyChatTemplateOverride(string modelPath)
+        {
+            if (ChatTemplateOverride is not { } chatOverride || _model?.Config == null)
+                return;
+
+            if (!SameFile(modelPath, chatOverride.ModelPath))
+            {
+                if (!_chatTemplateOverrideSkipReported)
+                {
+                    _chatTemplateOverrideSkipReported = true;
+                    _logger.LogWarning(LogEventIds.HostConfiguration,
+                        "{Flag} {TemplateFile} applies to {ConfiguredModel} only; {Model} keeps the chat template its GGUF ships.",
+                        ChatTemplateFile.Flag, chatOverride.Template.Path, Path.GetFileName(chatOverride.ModelPath),
+                        Path.GetFileName(modelPath));
+                }
+                return;
+            }
+
+            string shipped = _model.Config.ChatTemplate;
+            _model.Config.ChatTemplate = chatOverride.Template.Template;
+            _logger.LogInformation(LogEventIds.HostConfiguration,
+                "Chat template: {TemplateFile} ({TemplateChars} chars) replaces {Shipped} for {Model}. " +
+                "Output parsing and BOS handling stay the {Architecture} family's.",
+                chatOverride.Template.Path, chatOverride.Template.Template.Length,
+                string.IsNullOrEmpty(shipped) ? "the built-in renderer (the GGUF ships no template)" : $"the GGUF's template ({shipped.Length} chars)",
+                Path.GetFileName(modelPath), _model.Config.Architecture ?? "unknown");
+        }
+
+        private static bool SameFile(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
+            try
+            {
+                return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b),
+                    OperatingSystem.IsLinux() ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
         /// Builds the on-node <see cref="ITensorParallelGroup"/> a load shards across, given
         /// the resolved backend; null (the default) means a single-node load. Set by hosts
         /// that carry TensorSharp.Distributed. Read once per load, so it must be set before
@@ -333,6 +385,7 @@ namespace TensorSharp.Server
                 // counted by the layer split and uploaded with the trunk.
                 string blockDraftPath = SpeculativeDraftHeadLoader.ConfiguredDraftHeadPath();
                 _model = _createModel(modelPath, _backend, tpGroup, blockDraftPath);
+                ApplyChatTemplateOverride(modelPath);
 
                 // A worker node (--tp-node-id > 0) spends its life blocked in a
                 // mirror loop and cannot also serve HTTP requests, so the server

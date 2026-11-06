@@ -71,8 +71,10 @@ namespace TensorSharp.Server.Hosting
             int embeddingContextSize = 0,
             MultiAgentOptions? multiAgent = null,
             TensorSharp.Models.Video.VideoCanvasPolicy videoCanvasPolicy = TensorSharp.Models.Video.VideoCanvasPolicy.ModelRecipe,
-            string? loraDirectory = null)
+            string? loraDirectory = null,
+            TensorSharp.Runtime.ChatTemplateFile? chatTemplate = null)
         {
+            ChatTemplate = chatTemplate;
             LoraDirectory = loraDirectory;
             VideoCanvasPolicy = videoCanvasPolicy;
             MultiAgent = multiAgent ?? new MultiAgentOptions();
@@ -510,6 +512,13 @@ namespace TensorSharp.Server.Hosting
         /// (403) without it; the host also loads every adapter at its top level at startup.
         /// </summary>
         public string? LoraDirectory { get; }
+
+        /// <summary>
+        /// The <c>--chat-template-file</c> template that replaces the startup model's GGUF
+        /// template, read and parsed at startup; null when none is configured. It applies
+        /// to <see cref="StartupModelPath"/> only (see <c>ModelService.ChatTemplateOverride</c>).
+        /// </summary>
+        public TensorSharp.Runtime.ChatTemplateFile? ChatTemplate { get; }
 
         /// <summary>True when the file logger should be wired in.</summary>
         public bool FileLoggingEnabled { get; }

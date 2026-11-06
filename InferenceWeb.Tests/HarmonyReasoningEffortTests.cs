@@ -81,6 +81,10 @@ public class HarmonyReasoningEffortTests
     [InlineData("{}", null)]
     [InlineData("{\"reasoning_effort\":null,\"think\":false}", "low")]
     [InlineData("{\"reasoning\":{\"effort\":\"high\"}}", "high")]
+    // OpenAI's levels outside low..high read as the nearest one (pi sends "minimal").
+    [InlineData("{\"reasoning\":{\"effort\":\"minimal\"}}", "low")]
+    [InlineData("{\"reasoning_effort\":\"none\"}", "low")]
+    [InlineData("{\"reasoning_effort\":\"xhigh\"}", "high")]
     public void Parser_ReadsBothSpellings_AndTheThinkFalseMapping(string body, string? expected)
     {
         using var doc = JsonDocument.Parse(body);
@@ -91,7 +95,7 @@ public class HarmonyReasoningEffortTests
     [Theory]
     [InlineData("{\"reasoning_effort\":\"max\"}")]
     [InlineData("{\"reasoning_effort\":3}")]
-    [InlineData("{\"reasoning\":{\"effort\":\"minimal\"}}")]
+    [InlineData("{\"reasoning\":{\"effort\":\"ultra\"}}")]
     public void Parser_RefusesOtherValues(string body)
     {
         using var doc = JsonDocument.Parse(body);

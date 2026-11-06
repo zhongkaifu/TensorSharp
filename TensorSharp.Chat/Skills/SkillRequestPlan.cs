@@ -212,6 +212,36 @@ namespace TensorSharp.Server.Skills
             Selected.Count == 0 ? "(none)" : string.Join(",", Selected.Select(s => s.Id));
 
         /// <summary>
+        /// True when the CLIENT runs the tool loop: the request declares tools of its own,
+        /// or its history already holds tool calls and tool results, which only a client
+        /// that executes tools sends back (a turn whose tools are all off, as pi sends
+        /// with <c>"tools": []</c>, is still part of that loop).
+        ///
+        /// <para>
+        /// Such a request gets none of this host's tools unless it asks for them (see the
+        /// <c>clientRunsToolLoop</c> parameter of <see cref="Create"/>). Measured with pi
+        /// (issue #285): the merged skills catalog and host tools doubled every turn's
+        /// prompt (3,798 to 6,843 tokens for "hello") and a 4B model asked to read a file called
+        /// <c>skills_list</c> eight times on the host before answering that it could not
+        /// see the file.
+        /// </para>
+        /// </summary>
+        internal static bool ClientRunsToolLoop(
+            IReadOnlyCollection<ToolFunction>? clientTools, IReadOnlyList<ChatMessage>? messages) =>
+            clientTools is { Count: > 0 }
+            || (messages != null && messages.Any(m => m != null
+                && (m.Role == "tool" || m.ToolCalls is { Count: > 0 })));
+
+        /// <summary>
+        /// True when a request that runs its own tool loop still asks for skills: it names
+        /// skills, or sets <c>skills_discovery: true</c>. The operator's <c>--skill</c>
+        /// selection and the discovery default do not count; they are defaults, and a
+        /// client with its own tools did not ask for them.
+        /// </summary>
+        internal static bool ClientRequestsSkills(IReadOnlyList<string>? requestedSkills, bool? discovery) =>
+            requestedSkills is { Count: > 0 } || discovery == true;
+
+        /// <summary>
         /// Build the plan for one request, or null when neither skills nor code execution
         /// changes anything about it.
         /// </summary>
@@ -259,6 +289,13 @@ namespace TensorSharp.Server.Skills
         /// How files a skill script produced become user-downloadable. Only used
         /// together with <paramref name="workspace"/>.
         /// </param>
+        /// <param name="clientRunsToolLoop">
+        /// True when the client executes tools itself (<see cref="ClientRunsToolLoop"/>).
+        /// The request then gets this host's skills catalog, skill tools and shell only
+        /// when it asks for skills (<see cref="ClientRequestsSkills"/>), and sub-agent tools
+        /// only with <c>multi_agent: true</c>. Knowledge collections the request names
+        /// still apply. The Web UI never sets this: its tools are this host's.
+        /// </param>
         public static SkillRequestPlan Create(
             SkillRegistry registry,
             IReadOnlyList<string>? requestedSkills,
@@ -276,8 +313,23 @@ namespace TensorSharp.Server.Skills
             ILogger? logger = null,
             bool? multiAgent = null,
             KnowledgeToolScope? knowledge = null,
-            StudioToolScope? studio = null)
+            StudioToolScope? studio = null,
+            bool clientRunsToolLoop = false)
         {
+            if (clientRunsToolLoop)
+            {
+                if (!ClientRequestsSkills(requestedSkills, discovery))
+                {
+                    // An explicit "none": the operator's --skill selection is not
+                    // inherited, nothing is advertised, and no shell rides along.
+                    requestedSkills = Array.Empty<string>();
+                    codeRunner = null;
+                }
+                // Named skills are offered; the rest of the catalog only on request.
+                discovery ??= false;
+                multiAgent = multiAgent == true;
+            }
+
             SkillRequestPlan plan = CreateCore(registry, requestedSkills, discovery, clientTools,
                 architecture, contextTokens, options, out unknown, allowTools, codeRunner,
                 codeInputFiles, workspace, captureProducedFiles, logger);

@@ -95,6 +95,15 @@ namespace TensorSharp.Server.Host.Hosting
                     "(diffusiongemma-26B-A4B-it). A bare filename is resolved next to the model; 'none' disables " +
                     "it. Requires --model. Default: none — pass the matching projector explicitly.",
                     "--mmproj mmproj-gemma-4-E4B-it-Q8_0.gguf"),
+                new OptionHelp(TensorSharp.Runtime.ChatTemplateFile.Flag + " <path>",
+                    "Jinja chat template file that replaces the model's GGUF template (tokenizer.chat_template), as " +
+                    "llama.cpp's --chat-template-file does: for a repository's corrected chat_template.jinja, or a GGUF " +
+                    "converted without one. Parsed at startup; a file this engine cannot parse is a configuration " +
+                    "error. Used even for families TensorSharp normally renders with its own renderer. Only the " +
+                    "template text changes: output parsing, tool-call parsing and BOS handling stay the model " +
+                    "family's. Applies to the --model file only (a model loaded later through " +
+                    "/api/models/load keeps its own), so it requires --model. Default: the GGUF's template.",
+                    TensorSharp.Runtime.ChatTemplateFile.Flag + " chat_template.jinja"),
                 new OptionHelp("--embeddings",
                     "Host a GGUF embedding encoder instead of a chat model. Exposes /v1/embeddings and /api/embed. " +
                     "Requires --model; supports cpu (pure C#, no native libraries), ggml_cpu, ggml_metal, and ggml_cuda. Chat prefix warmup is skipped.",

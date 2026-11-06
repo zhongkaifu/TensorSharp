@@ -34,6 +34,8 @@
     <EmbeddedResource Include="Fixtures/Knowledge/manifest.json" />
     <EmbeddedResource Include="Fixtures/MuseGlimmer/chat_template.jinja" />
     <EmbeddedResource Include="Fixtures/MuseSpark/chat_template.jinja" />
+    <EmbeddedResource Include="Fixtures/Qwen35/chat_template.jinja" />
+    <EmbeddedResource Include="Fixtures/Qwen35/pi_tool_loop.transformers.txt" />
     <EmbeddedResource Include="Fixtures/MuseSpark/unsloth_chat_template.jinja" />
     <EmbeddedResource Include="Fixtures/MuseSpark/jinja_reference.json" />
     <EmbeddedResource Include="Fixtures/MuseSpark/llama_jinja_matched_reference.json" />
