@@ -187,7 +187,18 @@ public sealed partial class OpenAIChatAdapter
         // a JSON response after a tool round with the original tool catalog.
         if (toolsDisabled)
             openaiTools = null;
-        bool openaiThink = body.TryGetProperty("think", out var oaiThinkProp) && oaiThinkProp.GetBoolean();
+        // `think`, or llama.cpp/vLLM's `chat_template_kwargs.enable_thinking` (see
+        // ThinkingSwitchParser for why they must agree).
+        if (!ThinkingSwitchParser.TryParse(body, out bool openaiThink, out IReadOnlyList<string> ignoredKwargs,
+                out string? thinkError))
+        {
+            openaiLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                "/v1/chat/completions rejected: {Error} (id={ChatcmplId})", thinkError, requestId);
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = thinkError, type = "invalid_request_error" } }).ConfigureAwait(false);
+            return;
+        }
+        WarnIgnoredTemplateKwargsOnce(openaiLogger, ignoredKwargs);
         var requestedSkills = SkillSelectionParser.Parse(body);
 
         // A block-diffusion model has no tool-call loop: nothing could feed a result
@@ -256,15 +267,21 @@ public sealed partial class OpenAIChatAdapter
                 ctx, responseFormat, openaiThink, openaiTools, _svc.Architecture).ConfigureAwait(false))
             return;
 
+        // A client with tools of its own (pi, Codex, opencode ...) runs the tool loop; this
+        // host adds its own tools to such a request only when it asks for them.
+        bool clientRunsToolLoop = SkillRequestPlan.ClientRunsToolLoop(openaiTools, messages);
+        bool? requestedDiscovery = SkillSelectionParser.ParseDiscovery(body);
         using RequestWorkspaceLease? workspaceLease = RequestWorkspaceLease.Acquire(
-            _workspaces, _codeRunner, _svc.Architecture, allowTools: responseFormat == null && !toolsDisabled);
+            _workspaces, _codeRunner, _svc.Architecture, allowTools: responseFormat == null && !toolsDisabled
+                && (!clientRunsToolLoop || SkillRequestPlan.ClientRequestsSkills(requestedSkills, requestedDiscovery)));
 
         var skillPlan = SkillRequestPlan.Create(
-            _skills, requestedSkills, SkillSelectionParser.ParseDiscovery(body), openaiTools,
+            _skills, requestedSkills, requestedDiscovery, openaiTools,
             _svc.Architecture, _svc.ContextTokens, _options, out var unknownSkills,
             allowTools: responseFormat == null && !toolsDisabled, codeRunner: _codeRunner,
             workspace: workspaceLease?.Workspace, logger: openaiLogger,
-            multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope);
+            multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope,
+            clientRunsToolLoop: clientRunsToolLoop);
 
         knowledge.Plan = skillPlan;
 
@@ -368,6 +385,29 @@ public sealed partial class OpenAIChatAdapter
     }
 
     // ---- Validation ------------------------------------------------------
+
+    private static readonly HashSet<string> s_ignoredKwargsReported = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Say once per key that a <c>chat_template_kwargs</c> entry other than
+    /// <c>enable_thinking</c> has no effect here, instead of dropping it in silence.
+    /// pi sends <c>preserve_thinking</c> with every request in its
+    /// <c>qwen-chat-template</c> mode, so this is once per process, not per request.
+    /// </summary>
+    private static void WarnIgnoredTemplateKwargsOnce(ILogger logger, IReadOnlyList<string> keys)
+    {
+        foreach (string key in keys)
+        {
+            lock (s_ignoredKwargsReported)
+            {
+                if (!s_ignoredKwargsReported.Add(key)) continue;
+            }
+            logger.LogWarning(LogEventIds.RequestContentDropped,
+                "/v1/chat/completions: chat_template_kwargs.{Key} is ignored; only enable_thinking is read " +
+                "(the same switch as think). The prompt renders as if the key were absent. Reported once per key.",
+                key);
+        }
+    }
 
     private static async Task<bool> ValidateStructuredOutputCompatibilityAsync(
         HttpContext ctx,

@@ -84,10 +84,19 @@ namespace TensorSharp.Runtime
             _nodes = Parse(Tokenize(template));
         }
 
-        public string Render(Dictionary<string, object> context)
+        public string Render(Dictionary<string, object> context) => Render(context, out _);
+
+        /// <summary>
+        /// Render, and report every message the template passed to <c>raise_exception</c>.
+        /// The render does not stop at one (see <c>EvalExpr</c>); the list is empty when
+        /// the template raised nothing.
+        /// </summary>
+        public string Render(Dictionary<string, object> context, out IReadOnlyList<string> raised)
         {
             var sb = new StringBuilder();
-            RenderNodes(_nodes, new Context(context), sb);
+            var ctx = new Context(context);
+            RenderNodes(_nodes, ctx, sb);
+            raised = (IReadOnlyList<string>?)ctx.Raised ?? Array.Empty<string>();
             return sb.ToString();
         }
 
@@ -425,6 +434,9 @@ namespace TensorSharp.Runtime
         {
             private readonly List<Dictionary<string, object>> _scopes = new();
 
+            /// <summary>Messages the template passed to <c>raise_exception</c>, in order.</summary>
+            public List<string>? Raised { get; set; }
+
             public Context(Dictionary<string, object> global)
             {
                 _scopes.Add(global);
@@ -742,6 +754,16 @@ namespace TensorSharp.Runtime
             expr = expr.Trim();
             if (expr.StartsWith("not "))
                 return !Truthy(EvalNot(expr.Substring(4), ctx));
+            // `not(...)`: the operator written against its parenthesized operand, as the
+            // Qwen 3.5 template does to find the last real user turn
+            // (`if not(content.startswith('<tool_response>') and ...)`). It used to be
+            // read as a call to a function named `not`, which evaluates to nothing, so
+            // that template never found the user turn: it raised "No user query found
+            // in messages." on every prompt and rendered the current turn's assistant
+            // messages without the reasoning block the model generated them with.
+            if (expr.StartsWith("not(", StringComparison.Ordinal)
+                && FindClosing(expr, 3, '(', ')') == expr.Length - 1)
+                return !Truthy(EvalNot(expr.Substring(3), ctx));
             return EvalComparison(expr, ctx);
         }
 
@@ -961,9 +983,21 @@ namespace TensorSharp.Runtime
                 return dict;
             }
 
-            // raise_exception('...') → just return null (will be handled gracefully)
+            // raise_exception('...') renders nothing and the render goes on, as it always
+            // has: several shipped templates raise on shapes TensorSharp renders on
+            // purpose. What the template said is kept, so the caller can report it
+            // (see Render(context, out raised)); before, a template that refused a
+            // message dropped it without a word.
             if (expr.StartsWith("raise_exception("))
+            {
+                string inner = expr.EndsWith(")") ? expr.Substring(16, expr.Length - 17).Trim() : string.Empty;
+                object? message = null;
+                try { message = inner.Length > 0 ? EvalExpr(inner, ctx) : null; }
+                catch (Exception) { message = inner; }
+                ctx.Raised ??= new List<string>();
+                ctx.Raised.Add(message?.ToString() ?? inner);
                 return null;
+            }
 
             // range(stop) / range(start, stop) / range(start, stop, step) function
             if (expr.StartsWith("range(") && expr.EndsWith(")"))

@@ -326,6 +326,24 @@ namespace TensorSharp.Cli
                 return;
             }
 
+            // --chat-template-file, read and parsed before anything loads (as the server does),
+            // and taken out of args for the same reason as --qwen-image-variant above.
+            ChatTemplateFile chatTemplateFile = null;
+            try
+            {
+                var withoutTemplate = new List<string>();
+                string chatTemplatePath = ChatTemplateFile.TakePath(args, withoutTemplate);
+                args = withoutTemplate.ToArray();
+                if (chatTemplatePath != null)
+                    chatTemplateFile = ChatTemplateFile.Load(chatTemplatePath);
+            }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine("Configuration error: " + ex.Message);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
+            }
+
             // Pick up the KV cache dtype from the KV_CACHE_DTYPE environment variable
             // before parsing CLI args. The --kv-cache-dtype flag below overrides this.
             KvCacheDtypeConfig.ConfigureFromEnvironment();
@@ -1002,6 +1020,17 @@ namespace TensorSharp.Cli
                 return;
             }
             using var model = createdModel;
+            if (chatTemplateFile != null)
+            {
+                string shipped = model.Config.ChatTemplate;
+                model.Config.ChatTemplate = chatTemplateFile.Template;
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "Chat template: {TemplateFile} ({TemplateChars} chars) replaces {Shipped}. " +
+                    "Output parsing and BOS handling stay the {Architecture} family's.",
+                    chatTemplateFile.Path, chatTemplateFile.Template.Length,
+                    string.IsNullOrEmpty(shipped) ? "the built-in renderer (the GGUF ships no template)" : $"the GGUF's template ({shipped.Length} chars)",
+                    model.Config.Architecture ?? "unknown");
+            }
             imageMask.ValidateModel(model is TensorSharp.Models.QwenImage.QwenImageModel);
             if (keepSourceSize && model is not TensorSharp.Models.QwenImage.QwenImageModel)
                 throw new ArgumentException("--keep-source-size requires a Qwen-Image-2.1 model.");

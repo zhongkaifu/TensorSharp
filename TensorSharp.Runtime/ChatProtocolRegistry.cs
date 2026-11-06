@@ -101,6 +101,7 @@ namespace TensorSharp.Runtime
             {
                 Id = "gemma4",
                 Architectures = new[] { "gemma4" },
+                RendersDeveloperRole = true,
                 Render = r => ChatTemplate.RenderGemma4(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking),
                 AppendMediaPlaceholders = ChatTemplate.AppendGemma4MediaPlaceholders,
                 CapsVideoFrames = true,
@@ -221,6 +222,7 @@ namespace TensorSharp.Runtime
             {
                 Id = "harmony",
                 Architectures = new[] { "gptoss", "gpt-oss" },
+                RendersDeveloperRole = true,
                 Render = r => ChatTemplate.RenderHarmony(
                     r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking, r.ReasoningEffort),
                 // The embedded template relies on recursive macros, namespace(),
@@ -355,6 +357,7 @@ namespace TensorSharp.Runtime
             {
                 Id = "deepseek41",
                 Architectures = new[] { "deepseek41", "deepseek_v41" },
+                RendersDeveloperRole = true,
                 CapsVideoFrames = true,
                 AppendMediaPlaceholders = (msg, sb) =>
                 {
@@ -382,6 +385,7 @@ namespace TensorSharp.Runtime
             {
                 Id = "deepseek4",
                 Architectures = new[] { "deepseek4" },
+                RendersDeveloperRole = true,
                 Render = r => ChatTemplate.RenderDeepSeek4(r.Messages, r.AddGenerationPrompt, r.EnableThinking, r.Tools),
                 // The GGUF-embedded (Unsloth) template leans on Jinja features the
                 // lightweight engine handles inconsistently (nested namespaces,
@@ -399,6 +403,7 @@ namespace TensorSharp.Runtime
             {
                 Id = "minimax-m3",
                 Architectures = new[] { "minimax-m3", "minimax_m3" },
+                RendersDeveloperRole = true,
                 // The M3.1 template has no thinking switch ("Current thinking mode:
                 // adaptive", bare `]~b]ai\n` generation prompt), and TensorSharp's
                 // `think` is a boolean whose absence reads as false. So think=false renders
@@ -463,6 +468,7 @@ namespace TensorSharp.Runtime
             {
                 Id = "glm-dsa",
                 Architectures = new[] { "glm-dsa", "glm_dsa" },
+                RendersDeveloperRole = true,
                 Render = r => ChatTemplate.RenderGlmDsa(r.Messages, r.AddGenerationPrompt, r.EnableThinking, r.Tools),
                 // The shipped template is built out of macros, namespaces, tojson and a
                 // visible_text walker over structured content - the exact feature set
@@ -481,6 +487,7 @@ namespace TensorSharp.Runtime
             {
                 Id = "glm5next",
                 Architectures = new[] { "glm5next", "glm5-next" },
+                RendersDeveloperRole = true,
                 // GLM-5.3-Flash ALWAYS opens a <think> block in the generation prompt
                 // (its template has no thinking-off shape), with no newline after it.
                 // Re-rendered history goes through the template's empty-<think></think>

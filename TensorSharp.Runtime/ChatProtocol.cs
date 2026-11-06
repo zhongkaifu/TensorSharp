@@ -117,6 +117,16 @@ namespace TensorSharp.Runtime
         public Func<ChatRenderRequest, bool>? PreferOwnRenderer { get; init; }
 
         /// <summary>
+        /// True when <see cref="Render"/> gives OpenAI's <c>developer</c> role a meaning of
+        /// its own (Harmony's developer block, a user turn on GLM and DeepSeek 4, the
+        /// leading instructions on Gemma 4 ...). For every other family the purpose-built
+        /// renderer receives <c>developer</c> messages as <c>system</c> ones, which is
+        /// what a client using that role means; see
+        /// <see cref="ChatTemplate.MapDeveloperRoleToSystem"/>.
+        /// </summary>
+        public bool RendersDeveloperRole { get; init; }
+
+        /// <summary>
         /// Append the media placeholder tokens this family's template expects for one
         /// message, before its text content. Null for text-only protocols.
         ///

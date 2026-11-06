@@ -335,6 +335,17 @@ namespace TensorSharp.Server
         }
 
         /// <summary>
+        /// The operator's <c>--chat-template-file</c> and the model it applies to (the
+        /// host's <c>--model</c>); see <see cref="ModelLifecycleService.ChatTemplateOverride"/>.
+        /// Read at load time: set it before <see cref="LoadModel"/>.
+        /// </summary>
+        public (ChatTemplateFile Template, string ModelPath)? ChatTemplateOverride
+        {
+            get => _lifecycle.ChatTemplateOverride;
+            set => _lifecycle.ChatTemplateOverride = value;
+        }
+
+        /// <summary>
         /// Sizing for the continuous-batching engine built lazily on the first request
         /// (paged KV pool, batch limits, speculation). Null (the default) keeps
         /// <see cref="SchedulerConfig.FromEnvironment"/>, i.e. the TS_SCHED_* variables;

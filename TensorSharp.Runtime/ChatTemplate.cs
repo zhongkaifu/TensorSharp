@@ -190,10 +190,97 @@ namespace TensorSharp.Runtime
             }
             ContentCacheBreakpoints.Add(offset);
         }
+
+        /// <summary>
+        /// A shallow copy of this message, of the same runtime type, with
+        /// <see cref="Role"/> replaced. Lists are shared with the original, so the copy
+        /// is for rendering, not for editing.
+        /// </summary>
+        public ChatMessage WithRole(string role)
+        {
+            var copy = (ChatMessage)MemberwiseClone();
+            copy.Role = role;
+            return copy;
+        }
     }
 
     public static partial class ChatTemplate
     {
+        private static volatile string[] s_operatorTemplates = Array.Empty<string>();
+
+        /// <summary>
+        /// Record a template the operator supplied (<see cref="ChatTemplateFile"/>), which is
+        /// then rendered even for a family that bypasses its GGUF template for a purpose-built
+        /// renderer (<see cref="ChatProtocol.PreferOwnRenderer"/>). Without this the option
+        /// would be ignored on exactly those families, and in silence.
+        /// </summary>
+        public static void RegisterOperatorTemplate(string template)
+        {
+            if (string.IsNullOrEmpty(template)) return;
+            lock (s_operatorTemplateGate)
+            {
+                foreach (string known in s_operatorTemplates)
+                    if (string.Equals(known, template, StringComparison.Ordinal)) return;
+                var next = new string[s_operatorTemplates.Length + 1];
+                s_operatorTemplates.CopyTo(next, 0);
+                next[^1] = template;
+                s_operatorTemplates = next;
+            }
+        }
+
+        private static readonly object s_operatorTemplateGate = new();
+
+        /// <summary>True when <paramref name="template"/> is one the operator supplied.</summary>
+        public static bool IsOperatorTemplate(string? template)
+        {
+            if (string.IsNullOrEmpty(template)) return false;
+            foreach (string known in s_operatorTemplates)
+            {
+                // The model's config holds the very instance that was registered, so the
+                // reference test answers every render; the comparison covers a copy.
+                if (ReferenceEquals(known, template)
+                    || (known.Length == template.Length && string.Equals(known, template, StringComparison.Ordinal)))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// True when the template mentions OpenAI's <c>developer</c> role as a string
+        /// literal (<c>'developer'</c> or <c>"developer"</c>), which is how every template
+        /// that handles the role compares against it.
+        /// </summary>
+        internal static bool TemplateNamesDeveloperRole(string? template) =>
+            !string.IsNullOrEmpty(template)
+            && (template.Contains("'developer'", StringComparison.Ordinal)
+                || template.Contains("\"developer\"", StringComparison.Ordinal));
+
+        /// <summary>
+        /// Render <c>developer</c> messages as <c>system</c> ones.
+        ///
+        /// <para>
+        /// OpenAI renamed the instruction role to <c>developer</c> for its reasoning
+        /// models, and clients send it to any model they treat as one: pi does so for
+        /// every model configured with <c>"reasoning": true</c>. A template that knows
+        /// only <c>system</c> skipped the message. The Qwen 3.5 template renders a leading
+        /// <c>system</c> message and raises "Unexpected message role" for anything else,
+        /// and this engine's <c>raise_exception</c> renders nothing. pi's whole system
+        /// prompt (with the skills block merged into it) was missing from the prompt
+        /// without any error: 2,041 prompt tokens instead of 6,843 for the same "hello".
+        /// llama.cpp maps the role the same way for every template except Harmony's.
+        /// </para>
+        /// </summary>
+        /// <returns><paramref name="messages"/> itself when it holds no developer message.</returns>
+        public static List<ChatMessage> MapDeveloperRoleToSystem(List<ChatMessage> messages)
+        {
+            if (messages == null || !messages.Exists(m => m?.Role == "developer"))
+                return messages!;
+            var mapped = new List<ChatMessage>(messages.Count);
+            foreach (ChatMessage message in messages)
+                mapped.Add(message?.Role == "developer" ? message.WithRole("system") : message!);
+            return mapped;
+        }
+
         /// <summary>Render the generic ChatML conversation and optional tool declarations.</summary>
         public static string RenderChatMl(List<ChatMessage> messages, bool addGenerationPrompt = true,
             List<ToolFunction>? tools = null, bool enableThinking = false)
@@ -826,28 +913,41 @@ namespace TensorSharp.Runtime
             // ones, and under what condition, is declared once per family in
             // ChatProtocolRegistry rather than as a chain of name comparisons here.
             var protocol = ChatProtocolRegistry.For(architecture);
-            if (protocol?.PreferOwnRenderer != null
+            // A developer message is a system message to every renderer that gives the
+            // role no meaning of its own (see MapDeveloperRoleToSystem).
+            List<ChatMessage> hardcodedMessages = protocol?.RendersDeveloperRole == true
+                ? messages : MapDeveloperRoleToSystem(messages);
+            // An operator's --chat-template-file is rendered as given; see IsOperatorTemplate.
+            if (protocol?.PreferOwnRenderer != null && !IsOperatorTemplate(template)
                 && protocol.PreferOwnRenderer(new ChatRenderRequest(
                     messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort, template)))
             {
-                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort, template);
+                return RenderHardcoded(hardcodedMessages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort, template);
             }
 
             if (!string.IsNullOrWhiteSpace(template))
             {
                 try
                 {
+                    List<ChatMessage> templateMessages = TemplateNamesDeveloperRole(template)
+                        ? messages : MapDeveloperRoleToSystem(messages);
                     // Spark escapes control tokens in caller text. Keep media as
                     // typed content parts so real image placeholders are produced by
                     // the template, while literal markers in text remain escaped.
                     var preprocessed = protocol?.Id == "muse-spark"
-                        ? messages : InjectMultimodalTokens(messages, architecture);
+                        ? templateMessages : InjectMultimodalTokens(templateMessages, architecture);
                     string effectiveTemplate = EnableGemma4CachedToolReasoningReplay(
                         template, preprocessed, architecture);
                     var jinja = GetParsedTemplate(effectiveTemplate);
                     var context = BuildJinja2Context(
                         preprocessed, addGenerationPrompt, tools, enableThinking, architecture, reasoningEffort);
-                    string result = jinja.Render(context);
+                    string result = jinja.Render(context, out IReadOnlyList<string> raised);
+                    // A render with no user turn is this host's own instruction-only probe
+                    // (the shared-prefix boundary, ChatGenerationPipeline.ComputeSharedPrefixTokens),
+                    // which templates answer with "No user query found" and which wants exactly
+                    // the instructions they rendered before it. Only a conversation can lose a part.
+                    if (raised.Count > 0 && messages.Exists(m => m?.Role == "user"))
+                        WarnTemplateRaisedOnce(architecture, raised);
                     // Gemma's generation boundary is part of its published template:
                     // preserve its newline and any channel prefix exactly. Adding an
                     // empty thought block can make E4B continue unmarked reasoning.
@@ -899,7 +999,7 @@ namespace TensorSharp.Runtime
             }
 
             Console.Error.WriteLine($"[ChatTemplate] Using hardcoded template for '{architecture}'");
-            return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort, template);
+            return RenderHardcoded(hardcodedMessages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort, template);
         }
 
         // Parsing depends on the exact effective template, including the optional
@@ -961,6 +1061,27 @@ namespace TensorSharp.Runtime
                 $"[ChatTemplate] The model's GGUF Jinja chat template for '{architecture}' was abandoned: {detail} " +
                 "Affected requests render with the built-in hardcoded template instead; prompt formatting may " +
                 "differ from the model's shipped template. Reported once per architecture.");
+        }
+
+        /// <summary>
+        /// Report a <c>raise_exception</c> the template reached. The engine renders on
+        /// past it, so whatever the template refused (a message role it does not know, a
+        /// system message after the first turn ...) is missing from the prompt; say so
+        /// once per architecture and message instead of never.
+        /// </summary>
+        private static void WarnTemplateRaisedOnce(string? architecture, IReadOnlyList<string> raised)
+        {
+            foreach (string message in raised)
+            {
+                lock (TemplateFallbackReported)
+                {
+                    if (!TemplateFallbackReported.Add($"{architecture}|raise|{message}")) continue;
+                }
+                Console.Error.WriteLine(
+                    $"[ChatTemplate] The chat template for '{architecture}' raised \"{message}\" while rendering a " +
+                    "prompt. The render continued past it, so the part of the conversation the template refused is " +
+                    "missing from the prompt. Reported once per architecture and message.");
+            }
         }
 
         /// <summary>

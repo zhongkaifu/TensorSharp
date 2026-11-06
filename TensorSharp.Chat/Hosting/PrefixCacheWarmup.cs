@@ -37,6 +37,17 @@ namespace TensorSharp.Server.Hosting
     /// </summary>
     public static class PrefixCacheWarmup
     {
+        private static readonly AsyncLocal<int> s_runningHere = new();
+
+        /// <summary>
+        /// True on the async flow of a <see cref="RunAsync"/> warm-up. The chat log marks
+        /// its lines with it (<c>origin=prefix-cache-warmup</c>): a warm-up asks for one
+        /// token, and its unmarked <c>chat.start ... maxTokens=1</c> and
+        /// <c>chat.complete tokens=1 ... finishReason=max_tokens</c> lines read as the
+        /// operator's first client request being cut to a single token (issue #285).
+        /// </summary>
+        public static bool IsRunningHere => s_runningHere.Value > 0;
+
         /// <summary>How the warm-up ended, for a caller that wants to say so.</summary>
         public readonly record struct Result(bool Warmed, string Detail, TimeSpan Elapsed)
         {
@@ -130,6 +141,9 @@ namespace TensorSharp.Server.Hosting
             // request records it when it is created, so the warm-up stays excluded even if a
             // cancellation returns from here while it is still in the engine.
             using IDisposable noDump = TensorSharp.Runtime.Scheduling.FirstTokenLogitsDump.Suppress();
+            // Set on this async method's own flow, which the request's logging runs on; the
+            // change does not flow back to the caller when this method returns.
+            s_runningHere.Value++;
             try
             {
                 JsonElement body = BuildRequest(sessionId, think);

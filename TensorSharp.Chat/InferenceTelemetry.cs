@@ -97,7 +97,7 @@ namespace TensorSharp.Server
                         lastUserMessage = m;
                     }
                     else if (m.Role == "assistant") assistantMessageCount++;
-                    else if (m.Role == "system") systemMessageCount++;
+                    else if (m.Role is "system" or "developer") systemMessageCount++;
                     if (m.ImagePaths != null) imageAttachments += m.ImagePaths.Count;
                     if (m.AudioPaths != null) audioAttachments += m.AudioPaths.Count;
                     if (m.TextFilePaths != null) textFileAttachments += m.TextFilePaths.Count;
@@ -113,8 +113,8 @@ namespace TensorSharp.Server
 
             var effective = samplingConfig ?? new SamplingConfig();
             _logger.LogInformation(LogEventIds.ChatStarted,
-                "chat.start arch={Architecture} maxTokens={MaxTokens} thinking={EnableThinking} tools={ToolCount} messages(user={UserMessages},assistant={AssistantMessages},system={SystemMessages}) attachments(image={ImageCount},audio={AudioCount},textFile={TextFileCount}) uploads={Uploads} sampling(temp={Temperature},topK={TopK},topP={TopP},minP={MinP},repeatPenalty={RepeatPenalty},repeatLastN={RepeatLastN},presencePenalty={PresencePenalty},frequencyPenalty={FrequencyPenalty},seed={Seed},stop={StopSequences}) userInput=\"{LastUserContent}\" fullInput={FullInput}",
-                arch, maxTokens, enableThinking, tools?.Count ?? 0,
+                "chat.start arch={Architecture}{Origin} maxTokens={MaxTokens} thinking={EnableThinking} tools={ToolCount} messages(user={UserMessages},assistant={AssistantMessages},system={SystemMessages}) attachments(image={ImageCount},audio={AudioCount},textFile={TextFileCount}) uploads={Uploads} sampling(temp={Temperature},topK={TopK},topP={TopP},minP={MinP},repeatPenalty={RepeatPenalty},repeatLastN={RepeatLastN},presencePenalty={PresencePenalty},frequencyPenalty={FrequencyPenalty},seed={Seed},stop={StopSequences}) userInput=\"{LastUserContent}\" fullInput={FullInput}",
+                arch, RequestOrigin(), maxTokens, enableThinking, tools?.Count ?? 0,
                 userMessageCount, assistantMessageCount, systemMessageCount,
                 imageAttachments, audioAttachments, textFileAttachments,
                 turnUploads,
@@ -124,6 +124,15 @@ namespace TensorSharp.Server
                 DescribeStopSequences(effective),
                 lastUserContent, fullInput);
         }
+
+        /// <summary>
+        /// " origin=prefix-cache-warmup" for the host's own one-token warm-up request
+        /// (<see cref="Hosting.PrefixCacheWarmup.IsRunningHere"/>), empty for a client's.
+        /// Placed right after the line's first value so parsers keyed on
+        /// <c>chat.start arch=</c> / <c>chat.complete tokens=N </c> still match.
+        /// </summary>
+        private static string RequestOrigin() =>
+            Hosting.PrefixCacheWarmup.IsRunningHere ? " origin=prefix-cache-warmup" : string.Empty;
 
         public void LogChatFinished(
             bool wasCancelled,
@@ -149,8 +158,8 @@ namespace TensorSharp.Server
             else
             {
                 _logger.LogInformation(LogEventIds.ChatCompleted,
-                    "chat.complete tokens={Tokens} promptTokens={PromptTokens} kvReused={KvReusedTokens} kvReusePercent={KvReusePercent:F1} ttftMs={TimeToFirstTokenMs} elapsedMs={ElapsedMs:F1} tokensPerSec={TokensPerSec:F2} finishReason={FinishReason} assistantOutput=\"{AssistantContent}\"",
-                    generatedTokenCount, promptTokenCount, kvCacheReusedTokens, kvCacheReusePercent,
+                    "chat.complete tokens={Tokens}{Origin} promptTokens={PromptTokens} kvReused={KvReusedTokens} kvReusePercent={KvReusePercent:F1} ttftMs={TimeToFirstTokenMs} elapsedMs={ElapsedMs:F1} tokensPerSec={TokensPerSec:F2} finishReason={FinishReason} assistantOutput=\"{AssistantContent}\"",
+                    generatedTokenCount, RequestOrigin(), promptTokenCount, kvCacheReusedTokens, kvCacheReusePercent,
                     timeToFirstTokenMs, elapsedMs, tokensPerSecond, finishReason, assistantContent);
             }
         }

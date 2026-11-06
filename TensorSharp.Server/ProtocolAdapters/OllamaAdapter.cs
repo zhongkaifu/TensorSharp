@@ -401,14 +401,20 @@ public sealed class OllamaAdapter
             return;
         }
 
+        // A client with tools of its own runs the tool loop; this host adds its own
+        // tools to such a request only when it asks for them.
+        bool clientRunsToolLoop = SkillRequestPlan.ClientRunsToolLoop(ollamaTools, messages);
+        bool? requestedDiscovery = SkillSelectionParser.ParseDiscovery(body);
         using RequestWorkspaceLease? workspaceLease = RequestWorkspaceLease.Acquire(
-            _workspaces, _codeRunner, _svc.Architecture, allowTools: !toolsDisabled);
+            _workspaces, _codeRunner, _svc.Architecture, allowTools: !toolsDisabled
+                && (!clientRunsToolLoop || SkillRequestPlan.ClientRequestsSkills(requestedSkills, requestedDiscovery)));
 
         var skillPlan = SkillRequestPlan.Create(
-            _skills, requestedSkills, SkillSelectionParser.ParseDiscovery(body), ollamaTools,
+            _skills, requestedSkills, requestedDiscovery, ollamaTools,
             _svc.Architecture, _svc.ContextTokens, _options, out var unknownSkills, allowTools: !toolsDisabled, codeRunner: _codeRunner,
             workspace: workspaceLease?.Workspace, logger: ollamaLogger,
-            multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope);
+            multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope,
+            clientRunsToolLoop: clientRunsToolLoop);
 
         knowledge.Plan = skillPlan;
 

@@ -353,6 +353,10 @@ builder.Services.AddSingleton(sp => new ModelService(sp.GetRequiredService<ILogg
     // Inline Jev image input lands in the same governed upload directory as chat
     // attachments, so --upload-max-mb, --upload-quota-mb and --upload-ttl-hours cover it.
     MediaStorage = uploadPolicy,
+    // --chat-template-file replaces the --model file's GGUF template at every load of it.
+    ChatTemplateOverride = hostingOptions.ChatTemplate is { } chatTemplate && hostingOptions.StartupModelPath is { } startupModel
+        ? (chatTemplate, startupModel)
+        : null,
 });
 builder.Services.AddSingleton<SessionManager>();
 // Explicit opt-in for this unauthenticated standalone host. Remote deployments must

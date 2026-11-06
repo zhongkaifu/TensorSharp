@@ -9,6 +9,8 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 #nullable enable
+using System;
+using System.Collections.Generic;
 using System.Text.Json;
 using TensorSharp.Runtime;
 
@@ -31,6 +33,21 @@ namespace TensorSharp.Server.RequestParsers
     /// </summary>
     internal static class ReasoningEffortParser
     {
+        /// <summary>
+        /// OpenAI's other levels, read as the nearest one a template renders. GPT-5
+        /// added <c>minimal</c> and <c>none</c> below <c>low</c> and <c>xhigh</c> above
+        /// <c>high</c>, and clients pass them through: pi sends <c>minimal</c> for its
+        /// lowest thinking level, which was a 400 here. The trained lines stop at
+        /// low/high (GPT-OSS cannot stop reasoning, so <c>none</c> is its shortest,
+        /// <c>low</c>, exactly as <c>"think": false</c> is).
+        /// </summary>
+        private static readonly Dictionary<string, string> OpenAILevelAliases = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["none"] = ReasoningEffort.Low,
+            ["minimal"] = ReasoningEffort.Low,
+            ["xhigh"] = ReasoningEffort.High,
+        };
+
         /// <summary>
         /// The effective level for the request, or null for the family's default.
         /// Returns false with <paramref name="error"/> set when the field is present
@@ -65,15 +82,16 @@ namespace TensorSharp.Server.RequestParsers
                 }
             }
 
+            if (raw != null && OpenAILevelAliases.TryGetValue(raw.Trim(), out string? nearest))
+                raw = nearest;
             if (!ReasoningEffort.TryNormalize(raw, out string? level))
             {
-                error = $"reasoning_effort must be one of \"low\", \"medium\" or \"high\" (got \"{raw}\").";
+                error = $"reasoning_effort must be one of \"low\", \"medium\" or \"high\" " +
+                        $"(\"none\" and \"minimal\" read as low, \"xhigh\" as high; got \"{raw}\").";
                 return false;
             }
 
-            bool thinkExplicitlyFalse = body.ValueKind == JsonValueKind.Object
-                && body.TryGetProperty("think", out var think) && think.ValueKind == JsonValueKind.False;
-            effort = ReasoningEffort.ForRequest(level, thinkExplicitlyFalse);
+            effort = ReasoningEffort.ForRequest(level, ThinkingSwitchParser.ExplicitlyOff(body));
             return true;
         }
     }
