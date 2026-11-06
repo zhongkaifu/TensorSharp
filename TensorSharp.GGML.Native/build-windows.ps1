@@ -22,6 +22,7 @@ $UserSetCudaArchitectures = $false
 $UserSetGenerator = $false
 $UserGenerator = ""
 $UserSetPlatform = $false
+$UserPlatform = ""
 
 function Normalize-Bool([string] $Value) {
     switch -Regex ($Value) {
@@ -308,6 +309,22 @@ function Read-CachedPointerSize {
     return ""
 }
 
+function Read-CachedCompilerArchitecture {
+    # Target architecture an existing build tree's C++ compiler was identified as
+    # ("x64", "arm64" or "x86"), or "" when there is no configured tree yet. Like
+    # the pointer width above it is derived rather than cached: CMake records it as
+    # CMAKE_CXX_COMPILER_ARCHITECTURE_ID next to CMAKE_CXX_SIZEOF_DATA_PTR.
+    $compilerFiles = @(Get-ChildItem -Path (Join-Path $BuildDir "CMakeFiles") -Recurse -Filter "CMakeCXXCompiler.cmake" -ErrorAction SilentlyContinue)
+    foreach ($compilerFile in $compilerFiles) {
+        $line = Select-String -Path $compilerFile.FullName -Pattern '^\s*set\(CMAKE_CXX_COMPILER_ARCHITECTURE_ID\s+"?([A-Za-z0-9_]+)"?\)' | Select-Object -First 1
+        if ($null -ne $line) {
+            return $line.Matches[0].Groups[1].Value.ToLowerInvariant()
+        }
+    }
+
+    return ""
+}
+
 function Read-CachedCudaCompiler {
     $cacheFile = Join-Path $BuildDir "CMakeCache.txt"
     if (-not (Test-Path $cacheFile)) {
@@ -403,11 +420,13 @@ for ($i = 0; $i -lt $RemainingArgs.Length; $i++) {
             if ($i -ge $RemainingArgs.Length) {
                 throw "Missing value for -A"
             }
+            $UserPlatform = $RemainingArgs[$i]
             $ExtraCMakeArgs.Add($RemainingArgs[$i])
             continue
         }
         '^-A.+$' {
             $UserSetPlatform = $true
+            $UserPlatform = $arg.Substring(2)
             $ExtraCMakeArgs.Add($arg)
             continue
         }
@@ -416,6 +435,26 @@ for ($i = 0; $i -lt $RemainingArgs.Length; $i++) {
         }
     }
 }
+
+# Target architecture: the -A / CMAKE_GENERATOR_PLATFORM the caller chose, else
+# TENSORSHARP_GGML_NATIVE_ARCH, else this machine's own (Get-NativeBuildArchitecture),
+# so a plain `dotnet build` on Windows on Arm produces the ARM64 GgmlOps.dll its
+# ARM64 .NET runtime can load. Any other -A value (Win32) is left to CMakeLists.txt's
+# 64-bit check.
+$RequestedPlatform = if ($UserSetPlatform) { $UserPlatform } else { $env:CMAKE_GENERATOR_PLATFORM }
+$TargetArchitecture = switch -Regex ("$RequestedPlatform".Trim()) {
+    '^arm64$' { "arm64"; break }
+    '^(x64|amd64)$' { "x64"; break }
+    default { Get-NativeBuildArchitecture }
+}
+if ($TargetArchitecture -eq "arm64" -and (Get-OSArchitecture) -ne "arm64") {
+    throw ("An ARM64 GgmlOps.dll has to be built on an ARM64 machine: with MSVC, ggml detects the CPU's features " +
+        "by running probes at configure time (GGML_NATIVE), which a cross build from x64 cannot do.")
+}
+$TargetToolset = Get-MsvcTargetToolset $TargetArchitecture
+# The helper scripts below (fetch-vulkan-toolchain.ps1, fetch-cudnn.ps1) build
+# import libraries or download binaries for this same target.
+$env:TENSORSHARP_GGML_NATIVE_ARCH = $TargetArchitecture
 
 $EnableCuda = Normalize-Bool $EnableCuda
 if ([string]::IsNullOrWhiteSpace($EnableCuda)) {
@@ -473,8 +512,10 @@ if ($EnableVulkan -eq "ON") {
             -not (Test-Path $VulkanSdkIncompatibleMarker)
         if (-not $HasFullSdk) {
             $ToolchainDir = (Resolve-Path (Join-Path $ScriptDir "..\ExternalProjects\vulkan-toolchain")).Path
+            # One import library per architecture (see fetch-vulkan-toolchain.ps1).
+            $LoaderDirName = if ($TargetArchitecture -eq "arm64") { "loader-arm64" } else { "loader" }
             $VulkanCMakeArgs.Add("-DVulkan_INCLUDE_DIR=$(Join-Path $ToolchainDir 'Vulkan-Headers\include')")
-            $VulkanCMakeArgs.Add("-DVulkan_LIBRARY=$(Join-Path $ToolchainDir 'loader\vulkan-1.lib')")
+            $VulkanCMakeArgs.Add("-DVulkan_LIBRARY=$(Join-Path $ToolchainDir "$LoaderDirName\vulkan-1.lib")")
             $VulkanCMakeArgs.Add("-DVulkan_GLSLC_EXECUTABLE=$(Join-Path $ToolchainDir 'shaderc\bin\glslc.exe')")
             $VulkanCMakeArgs.Add("-DSPIRV-Headers_DIR=$(Join-Path $ToolchainDir 'spirv-headers-install\share\cmake\SPIRV-Headers')")
         }
@@ -550,7 +591,7 @@ if (($BuildParallelLevel -as [int]) -lt 1) {
 #   3. Nothing, letting CMake decide - warned about below, because CMake's own
 #      fallback when it cannot see a VS instance is the strictly serial
 #      NMake Makefiles generator, where `--parallel` is silently ignored.
-$VisualStudio = Get-VisualStudioInstallation
+$VisualStudio = Get-VisualStudioInstallation $TargetArchitecture
 $NinjaProgram = Find-NinjaProgram $VisualStudio
 # Resolved up front rather than at the first `cmake` call: CMake is a hard
 # prerequisite, and "not recognized as a cmdlet" 400 lines into a build does not
@@ -578,29 +619,44 @@ $effectiveGenerator =
     else { ($GeneratorArgs | Select-Object -Last 1) }
 if (-not $UserSetPlatform -and [string]::IsNullOrWhiteSpace($env:CMAKE_GENERATOR_PLATFORM) -and $effectiveGenerator -like "Visual Studio*") {
     $GeneratorArgs.Add("-A")
-    $GeneratorArgs.Add("x64")
+    $GeneratorArgs.Add($TargetToolset.CMakePlatform)
 }
 
 $GeneratorCMakeArgs = New-Object System.Collections.Generic.List[string]
 if ($effectiveGenerator -like "*Ninja*") {
     # Ninja drives cl.exe/link.exe/nvcc itself, so this process needs the MSVC
     # environment. Importing it here means a plain `dotnet build` works from any
-    # shell, not just from an "x64 Native Tools" prompt.
+    # shell, not just from an "x64 Native Tools" (or "ARM64 Native Tools") prompt.
     if ($null -ne $VisualStudio) {
-        Import-VcVarsEnvironment $VisualStudio.VcVars64
+        Import-VcVarsEnvironment $VisualStudio.VcVars $TargetArchitecture
     }
     elseif ([string]::IsNullOrWhiteSpace($env:VCToolsInstallDir)) {
         Write-Warning ("Generator '$effectiveGenerator' needs the MSVC command-line environment but no Visual Studio " +
-            "installation was found; run from an 'x64 Native Tools' prompt if the configure step cannot find a compiler.")
+            "installation with the MSVC $TargetArchitecture toolset was found; run from an " +
+            "'$($TargetToolset.PromptName)' prompt if the configure step cannot find a compiler.")
     }
-    elseif ((Get-ActiveVcTargetArchitecture) -notin @("", "x64")) {
-        # An MSVC environment is active but targets x86, and no Visual Studio was
-        # found to import the x64 one over it. Say so now: the configure would
-        # otherwise succeed and the build fail much later inside ggml's Vulkan
-        # backend, which does not compile 32-bit (discussion #130).
-        Write-Warning ("The active MSVC environment targets '$(Get-ActiveVcTargetArchitecture)', not x64, and no Visual Studio " +
-            "installation was found to import the x64 environment from. This native build is x64-only - run it " +
-            "from an 'x64 Native Tools' prompt, or set TENSORSHARP_VS_INSTALL_DIR to a Visual Studio installation root.")
+    elseif ((Get-ActiveVcTargetArchitecture) -notin @("", $TargetArchitecture)) {
+        # An MSVC environment is active but targets something else (typically
+        # x86), and no Visual Studio was found to import the target's over it. Say
+        # so now: the configure would otherwise succeed and the build fail much
+        # later, inside ggml's Vulkan backend for x86 (discussion #130) or at link
+        # time for the wrong 64-bit architecture.
+        Write-Warning ("The active MSVC environment targets '$(Get-ActiveVcTargetArchitecture)', not $TargetArchitecture, " +
+            "and no Visual Studio installation was found to import the $TargetArchitecture environment from. Run this " +
+            "build from an '$($TargetToolset.PromptName)' prompt, or set TENSORSHARP_VS_INSTALL_DIR to a Visual Studio " +
+            "installation root.")
+    }
+
+    # An x64 target on Windows on Arm is a cross build as far as CMake is
+    # concerned. Left alone it takes the host's processor (ARM64) as the target's,
+    # and ggml then compiles its ARM CPU kernels with the x64 compiler, which fails
+    # at link time. CMake keeps a processor only next to an explicit system name;
+    # that also marks the build as a cross build, so ggml skips its host CPU probes
+    # (GGML_NATIVE) and builds its portable x86 kernels. The Visual Studio
+    # generators carry the target in -A instead.
+    if ($TargetArchitecture -ne (Get-OSArchitecture)) {
+        $GeneratorCMakeArgs.Add("-DCMAKE_SYSTEM_NAME=Windows")
+        $GeneratorCMakeArgs.Add("-DCMAKE_SYSTEM_PROCESSOR=AMD64")
     }
 
     # Pin the ninja we found: when it comes from the Visual Studio install it is
@@ -672,7 +728,16 @@ if (-not [string]::IsNullOrWhiteSpace($CachedGenerator) -and
 # errors. Start such a tree over so the fix actually takes effect.
 $CachedPointerSize = Read-CachedPointerSize
 if (-not [string]::IsNullOrWhiteSpace($CachedPointerSize) -and $CachedPointerSize -ne "8") {
-    Write-Host "Existing build tree was configured for a $([int] $CachedPointerSize * 8)-bit target; removing $BuildDir to reconfigure as x64."
+    Write-Host "Existing build tree was configured for a $([int] $CachedPointerSize * 8)-bit target; removing $BuildDir to reconfigure as $TargetArchitecture."
+    Remove-Item -Recurse -Force $BuildDir
+}
+
+# The same holds between the two 64-bit targets: a tree configured for x64 keeps
+# driving the x64 cl.exe after TENSORSHARP_GGML_NATIVE_ARCH (or the machine)
+# says arm64, and the other way round. Start it over too.
+$CachedCompilerArchitecture = Read-CachedCompilerArchitecture
+if ($CachedCompilerArchitecture -in @("x64", "arm64") -and $CachedCompilerArchitecture -ne $TargetArchitecture) {
+    Write-Host "Existing build tree targets $CachedCompilerArchitecture; removing $BuildDir to reconfigure for $TargetArchitecture."
     Remove-Item -Recurse -Force $BuildDir
 }
 
@@ -709,7 +774,7 @@ if (-not [string]::IsNullOrWhiteSpace($ExplicitCudaCompiler) -and (Test-Path $Bu
 
 $GeneratorSummary = if ([string]::IsNullOrWhiteSpace($effectiveGenerator)) { "CMake default" } else { $effectiveGenerator }
 $CudaCompilerSummary = if ([string]::IsNullOrWhiteSpace($ExplicitCudaCompiler)) { "auto" } else { $ExplicitCudaCompiler }
-Write-Host "Configuring TensorSharp.GGML.Native (CUDA=$EnableCuda, CUDA_COMPILER=$CudaCompilerSummary, CUDA_ARCHITECTURES=$CudaArchSummary, VULKAN=$EnableVulkan, TESTS=$BuildTests, GENERATOR=$GeneratorSummary, PARALLEL=$BuildParallelLevel)"
+Write-Host "Configuring TensorSharp.GGML.Native (ARCH=$TargetArchitecture, CUDA=$EnableCuda, CUDA_COMPILER=$CudaCompilerSummary, CUDA_ARCHITECTURES=$CudaArchSummary, VULKAN=$EnableVulkan, TESTS=$BuildTests, GENERATOR=$GeneratorSummary, PARALLEL=$BuildParallelLevel)"
 
 $CMakeArgs = @(
     "-DCMAKE_BUILD_TYPE=Release",

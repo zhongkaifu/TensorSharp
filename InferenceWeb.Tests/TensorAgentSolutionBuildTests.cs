@@ -278,11 +278,16 @@ public class TensorAgentSolutionBuildTests
         Assert.EndsWith("net10.0-ios/iossimulator-arm64/TensorAgent.Maui.app", ios, StringComparison.Ordinal);
         Assert.Contains("net10.0-ios/iossimulator-arm64/TensorAgent.Maui.app", ScriptText("build-sim.sh"), StringComparison.Ordinal);
 
-        // The engine library is x64 only on Windows, as in build-windows.ps1.
+        // The Windows app is win-x64 only, as in build-windows.ps1, so it is built only where
+        // the engine library is x64 too: on Windows on Arm that library is ARM64.
         XElement windows = Head("net10.0-windows10.0.19041.0");
         Assert.Equal("-r win-x64", windows.Attribute("Arguments")!.Value);
         Assert.Contains("'-r', 'win-x64'", ScriptText("build-windows.ps1"), StringComparison.Ordinal);
         Assert.EndsWith("net10.0-windows10.0.19041.0/win-x64/TensorAgent.Maui.exe", Normalize(windows.Attribute("App")!.Value), StringComparison.Ordinal);
+        Assert.Contains("'$(_TensorAgentAppMachineArch)' != 'arm64'", ConditionOf(windows), StringComparison.Ordinal);
+        Assert.Contains("'$(_TensorAgentAppMachineArch)' != 'arm64'",
+            ConditionOf(Assert.Single(SolutionTargets.Descendants(Ns + "_TensorAgentAppTargetFramework"),
+                e => e.Attribute("Include")?.Value == "net10.0-windows10.0.19041.0")), StringComparison.Ordinal);
 
         // Each head names the script that builds it on its own, for its failure message.
         Assert.Equal("TensorAgent/scripts/build-mac.sh", Head("net10.0-maccatalyst").Attribute("Script")?.Value);

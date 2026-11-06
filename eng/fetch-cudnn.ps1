@@ -92,7 +92,16 @@ if ($null -ne $existing) {
 
 $version = if ([string]::IsNullOrWhiteSpace($env:TENSORSHARP_CUDNN_VERSION)) { $DefaultVersion } else { $env:TENSORSHARP_CUDNN_VERSION.Trim() }
 $cudaMajor = Get-CudaMajor
-$stamp = "$version-cuda$cudaMajor"
+# The native build's target (build-windows.ps1 passes it down), else this
+# process's. The ARM64 stamp names its platform so a tree that switches targets
+# re-downloads instead of linking the other architecture's cuDNN; the x64 stamp
+# keeps its original form, so existing x64 provisions stay valid.
+$targetArch = "$env:TENSORSHARP_GGML_NATIVE_ARCH".Trim().ToLowerInvariant()
+if ([string]::IsNullOrWhiteSpace($targetArch)) {
+    $targetArch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
+}
+if ($targetArch -eq "arm64") { $plat = "windows-arm64" } else { $plat = "windows-x86_64" }
+$stamp = if ($plat -eq "windows-arm64") { "$version-cuda$cudaMajor-$plat" } else { "$version-cuda$cudaMajor" }
 
 if (Test-Path $Marker) {
     $have = (Get-Content $Marker -Raw).Trim()
@@ -109,7 +118,6 @@ if (Test-Path $Marker) {
     Remove-Item -Recurse -Force $CudnnDir -ErrorAction SilentlyContinue
 }
 
-if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { $plat = "windows-arm64" } else { $plat = "windows-x86_64" }
 $archive = "cudnn-$plat-${version}_cuda${cudaMajor}-archive.zip"
 $url = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/$plat/$archive"
 

@@ -1,4 +1,5 @@
-# Locate the Visual Studio installation that carries the MSVC x64 C++ toolset.
+# Locate the Visual Studio installation that carries the MSVC C++ toolset for the
+# native build's target architecture: x64, or ARM64 on Windows on Arm.
 #
 # Why this exists instead of a bare `vswhere -latest`: the VS installer flags an
 # instance "incomplete" after an interrupted update or an unfinished repair, and
@@ -15,12 +16,89 @@
 #   2. vswhere -all -prerelease   - relaxed query that does see incomplete and
 #                                   preview instances (newest version first)
 #   3. filesystem probe           - the standard install roots, newest year
-#                                   first, for VC\Auxiliary\Build\vcvars64.bat
+#                                   first, for the target's vcvars script
 #
 # Dot-source this file to get Get-VisualStudioInstallation, or run it directly
 # to print what was found. Returns $null when no MSVC toolset can be located.
 
 $ErrorActionPreference = "Stop"
+
+# The operating system's own architecture: "arm64" on Windows on Arm, else "x64".
+#
+# Read from the registry rather than from this process. An x64 PowerShell (or an
+# x64 dotnet that launched it) runs under emulation on Windows on Arm and sees
+# PROCESSOR_ARCHITECTURE=AMD64, while Windows PowerShell 5.1 - what MSBuild's Exec
+# starts - has no RuntimeInformation.OSArchitecture to ask instead.
+function Get-OSArchitecture {
+    $machine = ""
+    try {
+        $machine = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" `
+            -Name PROCESSOR_ARCHITECTURE -ErrorAction Stop).PROCESSOR_ARCHITECTURE
+    }
+    catch {
+        $machine = $env:PROCESSOR_ARCHITECTURE
+    }
+
+    if ("$machine".Trim() -eq "ARM64") {
+        return "arm64"
+    }
+    return "x64"
+}
+
+# The architecture the native library is built for: "x64" or "arm64".
+#
+# TENSORSHARP_GGML_NATIVE_ARCH chooses it explicitly. Otherwise it is the
+# operating system's, which is what a plain `dotnet build` runs on: GgmlOps.dll is
+# loaded into that process, so it has to match it. An x64 library on an ARM64
+# machine (TENSORSHARP_GGML_NATIVE_ARCH=x64) is for an x64 .NET under emulation.
+function Get-NativeBuildArchitecture {
+    $requested = "$env:TENSORSHARP_GGML_NATIVE_ARCH".Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($requested)) {
+        return Get-OSArchitecture
+    }
+    if ($requested -in @("x64", "amd64")) {
+        return "x64"
+    }
+    if ($requested -eq "arm64") {
+        return "arm64"
+    }
+
+    throw "TENSORSHARP_GGML_NATIVE_ARCH='$env:TENSORSHARP_GGML_NATIVE_ARCH' is not supported; use x64 or arm64."
+}
+
+# The MSVC pieces that differ per target architecture.
+#
+# An x64 target always uses vcvars64.bat, whose x64-hosted compilers also run
+# under emulation on Windows on Arm. An ARM64 target uses the ARM64-hosted
+# compilers and needs an ARM64 machine: ggml probes the CPU's features at
+# configure time (GGML_NATIVE), which a cross build cannot do.
+function Get-MsvcTargetToolset([string] $Architecture) {
+    switch ($Architecture) {
+        "x64" {
+            return [pscustomobject]@{
+                Architecture  = "x64"
+                Component     = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+                VcVarsName    = "vcvars64.bat"
+                BinSubdir     = "bin\Hostx64\x64"
+                PromptName    = "x64 Native Tools"
+                CMakePlatform = "x64"
+            }
+        }
+        "arm64" {
+            return [pscustomobject]@{
+                Architecture  = "arm64"
+                Component     = "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+                VcVarsName    = "vcvarsarm64.bat"
+                BinSubdir     = "bin\Hostarm64\arm64"
+                PromptName    = "ARM64 Native Tools"
+                CMakePlatform = "ARM64"
+            }
+        }
+        default {
+            throw "Unsupported MSVC target architecture '$Architecture'; use x64 or arm64."
+        }
+    }
+}
 
 function Get-VisualStudioGeneratorName([string] $Version) {
     # Map the installed VS major version to its CMake generator name; a
@@ -70,15 +148,23 @@ function Get-VisualStudioVersionFromPath([string] $Path) {
     return ""
 }
 
-function New-VisualStudioInstallation([string] $Path, [string] $Version) {
+function New-VisualStudioInstallation([string] $Path, [string] $Version, [string] $Architecture = "x64") {
     if ([string]::IsNullOrWhiteSpace($Path)) {
         return $null
     }
 
-    # vcvars64.bat is the thing callers actually need (and the proof that the x64
-    # C++ toolset is really on disk, whatever the installer's state flag says).
-    $vcvars = Join-Path $Path "VC\Auxiliary\Build\vcvars64.bat"
+    # The target's vcvars script is the thing callers actually need, and its
+    # compiler directory is the proof that the toolset is really on disk, whatever
+    # the installer's state flag says. Both are checked: the vcvars scripts for
+    # every architecture can be present while only one toolset is installed.
+    $toolset = Get-MsvcTargetToolset $Architecture
+    $vcvars = Join-Path $Path "VC\Auxiliary\Build\$($toolset.VcVarsName)"
     if (-not (Test-Path $vcvars)) {
+        return $null
+    }
+    $compilers = @(Get-ChildItem -Path (Join-Path $Path "VC\Tools\MSVC") -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName "$($toolset.BinSubdir)\cl.exe") })
+    if ($compilers.Count -eq 0) {
         return $null
     }
 
@@ -87,14 +173,15 @@ function New-VisualStudioInstallation([string] $Path, [string] $Version) {
     }
 
     return [pscustomobject]@{
-        Path      = $Path
-        Version   = $Version
-        Generator = Get-VisualStudioGeneratorName $Version
-        VcVars64  = $vcvars
+        Path         = $Path
+        Version      = $Version
+        Generator    = Get-VisualStudioGeneratorName $Version
+        Architecture = $toolset.Architecture
+        VcVars       = $vcvars
     }
 }
 
-function Find-VisualStudioViaVswhere {
+function Find-VisualStudioViaVswhere([string] $Architecture = "x64") {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path $vswhere)) {
         return $null
@@ -104,7 +191,8 @@ function Find-VisualStudioViaVswhere {
     # preview instances. -format json keeps installationPath paired with
     # installationVersion on machines carrying several instances, which separate
     # -property queries would not.
-    $output = & $vswhere -all -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json
+    $toolset = Get-MsvcTargetToolset $Architecture
+    $output = & $vswhere -all -prerelease -products * -requires $toolset.Component -format json
     if ($LASTEXITCODE -ne 0) {
         return $null
     }
@@ -126,7 +214,7 @@ function Find-VisualStudioViaVswhere {
     } } -Descending
 
     foreach ($instance in $sorted) {
-        $found = New-VisualStudioInstallation $instance.installationPath $instance.installationVersion
+        $found = New-VisualStudioInstallation $instance.installationPath $instance.installationVersion $Architecture
         if ($null -ne $found) {
             return $found
         }
@@ -135,7 +223,7 @@ function Find-VisualStudioViaVswhere {
     return $null
 }
 
-function Find-VisualStudioViaFilesystem {
+function Find-VisualStudioViaFilesystem([string] $Architecture = "x64") {
     $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) |
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
         ForEach-Object { Join-Path $_ "Microsoft Visual Studio" }
@@ -153,10 +241,10 @@ function Find-VisualStudioViaFilesystem {
             Sort-Object -Property @{ Expression = { Get-VisualStudioMajorFromDirectoryName $_.Name } } -Descending
         foreach ($yearDir in $versionDirs) {
             # Any edition will do (Community/Professional/Enterprise/BuildTools);
-            # they all ship the same vcvars64.bat and MSVC toolset.
+            # they all ship the same vcvars scripts and MSVC toolsets.
             $editionDirs = Get-ChildItem -Path $yearDir.FullName -Directory -ErrorAction SilentlyContinue
             foreach ($editionDir in $editionDirs) {
-                $found = New-VisualStudioInstallation $editionDir.FullName ""
+                $found = New-VisualStudioInstallation $editionDir.FullName "" $Architecture
                 if ($null -ne $found) {
                     return $found
                 }
@@ -167,23 +255,27 @@ function Find-VisualStudioViaFilesystem {
     return $null
 }
 
-function Get-VisualStudioInstallation {
+# The Visual Studio installation carrying the MSVC toolset that targets
+# $Architecture ("x64" or "arm64"), or $null when there is none.
+function Get-VisualStudioInstallation([string] $Architecture = "x64") {
     if (-not [string]::IsNullOrWhiteSpace($env:TENSORSHARP_VS_INSTALL_DIR)) {
-        $override = New-VisualStudioInstallation $env:TENSORSHARP_VS_INSTALL_DIR ""
+        $override = New-VisualStudioInstallation $env:TENSORSHARP_VS_INSTALL_DIR "" $Architecture
         if ($null -ne $override) {
             return $override
         }
 
-        Write-Warning ("TENSORSHARP_VS_INSTALL_DIR='$env:TENSORSHARP_VS_INSTALL_DIR' does not contain " +
-            "VC\Auxiliary\Build\vcvars64.bat; ignoring it and probing for Visual Studio normally.")
+        $toolset = Get-MsvcTargetToolset $Architecture
+        Write-Warning ("TENSORSHARP_VS_INSTALL_DIR='$env:TENSORSHARP_VS_INSTALL_DIR' has no MSVC $Architecture toolset " +
+            "(VC\Auxiliary\Build\$($toolset.VcVarsName) and $($toolset.BinSubdir)\cl.exe); ignoring it and probing " +
+            "for Visual Studio normally.")
     }
 
-    $found = Find-VisualStudioViaVswhere
+    $found = Find-VisualStudioViaVswhere $Architecture
     if ($null -ne $found) {
         return $found
     }
 
-    return Find-VisualStudioViaFilesystem
+    return Find-VisualStudioViaFilesystem $Architecture
 }
 
 # Resolve the cmake to drive the native build.
@@ -231,9 +323,10 @@ function Get-RequiredCMakeProgram([object] $VisualStudio) {
 # environment already active in this process, or "" when none is active or it
 # cannot be determined.
 #
-# Only an *x64* environment is usable here, and "is VCToolsInstallDir set?" is
-# not enough to tell: the "Developer PowerShell for VS" and "Developer Command
-# Prompt" shortcuts default to the **x86** toolset and set VCToolsInstallDir
+# Only an environment for the build's target (x64, or arm64 on Windows on Arm) is
+# usable here, and "is VCToolsInstallDir set?" is not enough to tell: the
+# "Developer PowerShell for VS" and "Developer Command Prompt" shortcuts default
+# to the **x86** toolset and set VCToolsInstallDir
 # exactly like the "x64 Native Tools" prompt does. Inheriting that x86
 # environment builds the whole native library 32-bit, which fails deep inside
 # ggml's Vulkan backend rather than at configure time: a 32-bit target leaves
@@ -278,17 +371,19 @@ function Get-ActiveVcTargetArchitecture {
 }
 
 # Import the MSVC command-line environment (PATH/INCLUDE/LIB/LIBPATH) into the
-# current process, the way an "x64 Native Tools" prompt does. Generators that
-# invoke the compilers directly (Ninja, NMake) need it; the Visual Studio
-# generator does not, because MSBuild sets it up per project.
+# current process, the way an "x64 Native Tools" (or "ARM64 Native Tools") prompt
+# does. Generators that invoke the compilers directly (Ninja, NMake) need it; the
+# Visual Studio generator does not, because MSBuild sets it up per project.
+# $Architecture is the target $VcVarsPath sets up: "x64" or "arm64".
 #
 # The variables land in this PowerShell process only, so an MSBuild that shelled
 # out to this script never sees them.
-function Import-VcVarsEnvironment([string] $VcVarsPath) {
+function Import-VcVarsEnvironment([string] $VcVarsPath, [string] $Architecture = "x64") {
+    $toolset = Get-MsvcTargetToolset $Architecture
     $activeArch = Get-ActiveVcTargetArchitecture
     if (-not [string]::IsNullOrWhiteSpace($env:VCToolsInstallDir)) {
-        if ($activeArch -eq "x64") {
-            Write-Host "MSVC x64 environment already active (VCToolsInstallDir=$env:VCToolsInstallDir); not importing vcvars."
+        if ($activeArch -eq $Architecture) {
+            Write-Host "MSVC $Architecture environment already active (VCToolsInstallDir=$env:VCToolsInstallDir); not importing vcvars."
             return
         }
 
@@ -301,23 +396,24 @@ function Import-VcVarsEnvironment([string] $VcVarsPath) {
             # would drag it back to the default. Warn instead, so a genuinely
             # 32-bit environment still leaves a trace to explain a later failure.
             Write-Warning ("An MSVC environment is active (VCToolsInstallDir=$env:VCToolsInstallDir) but its target " +
-                "architecture could not be determined; assuming x64 and using it as-is. This native build is " +
-                "x64-only - if the compile fails inside ggml's Vulkan backend, re-run from a plain PowerShell so " +
-                "this script can set up the x64 environment itself.")
+                "architecture could not be determined; assuming $Architecture and using it as-is. This native build " +
+                "targets $Architecture - if the compile fails inside ggml's Vulkan backend, re-run from a plain " +
+                "PowerShell so this script can set up the $Architecture environment itself.")
             return
         }
     }
 
     if ([string]::IsNullOrWhiteSpace($VcVarsPath) -or -not (Test-Path $VcVarsPath)) {
-        throw "vcvars64.bat not found at '$VcVarsPath'."
+        throw "$($toolset.VcVarsName) not found at '$VcVarsPath'."
     }
 
     if (-not [string]::IsNullOrWhiteSpace($env:VCToolsInstallDir)) {
-        # Active and definitely not x64 - import the x64 environment over it
-        # instead of silently producing a 32-bit build.
-        Write-Host ("MSVC environment already active but targets '$activeArch', not x64 " +
+        # Active and targeting something else - import the target's environment
+        # over it instead of silently producing a 32-bit (or wrong-architecture)
+        # build.
+        Write-Host ("MSVC environment already active but targets '$activeArch', not $Architecture " +
             "(the 'Developer PowerShell for VS' and 'Developer Command Prompt' shortcuts default to x86); " +
-            "importing the x64 environment over it - this native build is x64-only.")
+            "importing the $Architecture environment over it - this native build targets $Architecture.")
     }
 
     Write-Host "Importing MSVC environment from $VcVarsPath"
@@ -365,7 +461,7 @@ function Import-VcVarsEnvironment([string] $VcVarsPath) {
     }
 
     if ($LASTEXITCODE -ne 0) {
-        throw "vcvars64.bat failed with exit code $LASTEXITCODE"
+        throw "$($toolset.VcVarsName) failed with exit code $LASTEXITCODE"
     }
 
     $applied = 0
@@ -388,26 +484,27 @@ function Import-VcVarsEnvironment([string] $VcVarsPath) {
     }
 
     if ($applied -eq 0) {
-        throw "vcvars64.bat produced no environment variables."
+        throw "$($toolset.VcVarsName) produced no environment variables."
     }
 
-    # Confirm the import actually landed an x64 toolset. Without this a surprise
-    # here (a mangled PATH, a vcvars that silently no-opped) degrades into a
-    # 32-bit build whose only symptom is a wall of vulkan.hpp template errors
+    # Confirm the import actually landed the target's toolset. Without this a
+    # surprise here (a mangled PATH, a vcvars that silently no-opped) degrades into
+    # a 32-bit build whose only symptom is a wall of vulkan.hpp template errors
     # hundreds of lines into the compile.
     $importedArch = Get-ActiveVcTargetArchitecture
-    if (-not [string]::IsNullOrWhiteSpace($importedArch) -and $importedArch -ne "x64") {
-        throw ("Imported '$VcVarsPath' but the MSVC environment still targets '$importedArch' rather than x64. " +
-            "This native build is x64-only; run it from a plain PowerShell (not a Developer Prompt) so the " +
-            "script can set up the environment itself, or from an 'x64 Native Tools' prompt.")
+    if (-not [string]::IsNullOrWhiteSpace($importedArch) -and $importedArch -ne $Architecture) {
+        throw ("Imported '$VcVarsPath' but the MSVC environment still targets '$importedArch' rather than " +
+            "$Architecture. Run this build from a plain PowerShell (not a Developer Prompt) so the script can set " +
+            "up the environment itself, or from an '$($toolset.PromptName)' prompt.")
     }
 }
 
 # Direct invocation (not dot-sourced): report what was found.
 if ($MyInvocation.InvocationName -ne '.') {
-    $installation = Get-VisualStudioInstallation
+    $architecture = Get-NativeBuildArchitecture
+    $installation = Get-VisualStudioInstallation $architecture
     if ($null -eq $installation) {
-        Write-Warning "No Visual Studio installation with the MSVC x64 C++ toolset was found."
+        Write-Warning "No Visual Studio installation with the MSVC $architecture C++ toolset was found."
         exit 1
     }
 

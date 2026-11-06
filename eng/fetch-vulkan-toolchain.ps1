@@ -36,6 +36,14 @@ $VulkanSdkIncompatibleMarker = Join-Path $ToolchainDir "vulkan-sdk-glslc-incompa
 # flagged incomplete); see eng/vs-locate.ps1.
 . (Join-Path $ScriptDir "vs-locate.ps1")
 
+# The vulkan-1 import library is generated for the native build's target
+# architecture (x64, or ARM64 on Windows on Arm; build-windows.ps1 passes its
+# choice down through TENSORSHARP_GGML_NATIVE_ARCH) and kept in a directory of its
+# own, so a tree that switches targets never links against the other one's. The
+# x64 directory keeps its original name.
+$TargetArchitecture = Get-NativeBuildArchitecture
+$LoaderDir = Join-Path $ToolchainDir $(if ($TargetArchitecture -eq "arm64") { "loader-arm64" } else { "loader" })
+
 function Test-Truthy([string] $Value) {
     return $Value -match '^(1|ON|on|On|TRUE|true|True|YES|yes|Yes)$'
 }
@@ -137,14 +145,14 @@ function Test-PinnedShaderc {
 
 function Test-ToolchainComplete {
     return (Test-Path (Join-Path $ToolchainDir "Vulkan-Headers\include\vulkan\vulkan.h")) -and
-           (Test-Path (Join-Path $ToolchainDir "loader\vulkan-1.lib")) -and
+           (Test-Path (Join-Path $LoaderDir "vulkan-1.lib")) -and
            (Test-PinnedShaderc) -and
            (Test-Path (Join-Path $ToolchainDir "spirv-headers-install\share\cmake\SPIRV-Headers\SPIRV-HeadersConfig.cmake"))
 }
 
 function Test-CompatibleToolchainComplete {
     return (Test-Path (Join-Path $ToolchainDir "Vulkan-Headers\include\vulkan\vulkan.h")) -and
-           (Test-Path (Join-Path $ToolchainDir "loader\vulkan-1.lib")) -and
+           (Test-Path (Join-Path $LoaderDir "vulkan-1.lib")) -and
            (Test-GlslcCompatible (Join-Path $ShadercDir "bin\glslc.exe")) -and
            (Test-Path (Join-Path $ToolchainDir "spirv-headers-install\share\cmake\SPIRV-Headers\SPIRV-HeadersConfig.cmake"))
 }
@@ -208,10 +216,11 @@ New-Item -ItemType Directory -Force -Path $ToolchainDir | Out-Null
 # Steps 2 and 4 need the MSVC toolset (a C/C++ compiler for the SPIRV-Headers
 # configure, dumpbin/lib.exe for the vulkan-1 import library). Locate it up
 # front so a box without Visual Studio fails fast instead of after the downloads.
-$VisualStudio = Get-VisualStudioInstallation
+$VisualStudio = Get-VisualStudioInstallation $TargetArchitecture
 if ($null -eq $VisualStudio) {
-    throw ("No Visual Studio installation with the MSVC x64 C++ toolset was found; it is required to build the " +
-        "SPIRV-Headers package and the vulkan-1 import library. Set TENSORSHARP_VS_INSTALL_DIR to a VS installation root.")
+    throw ("No Visual Studio installation with the MSVC $TargetArchitecture C++ toolset was found; it is required to " +
+        "build the SPIRV-Headers package and the vulkan-1 import library. Set TENSORSHARP_VS_INSTALL_DIR to a VS " +
+        "installation root.")
 }
 
 # --- 1. Vulkan headers -------------------------------------------------------
@@ -237,7 +246,7 @@ if (-not (Test-Path (Join-Path $SpirvInstallDir "share\cmake\SPIRV-Headers\SPIRV
     # own Visual Studio discovery trusts the installer state the way
     # `vswhere -latest` does. Import vcvars and pin the NMake generator (cl.exe
     # from PATH); SPIRV-Headers is header-only, so nothing is actually compiled.
-    Import-VcVarsEnvironment $VisualStudio.VcVars64
+    Import-VcVarsEnvironment $VisualStudio.VcVars $TargetArchitecture
     $SpirvBuildDir = Join-Path $SpirvSrcDir "build"
     if (Test-Path $SpirvBuildDir) { Remove-Item -Recurse -Force $SpirvBuildDir }
     Invoke-CMakeDefanged "SPIRV-Headers cmake configure failed" @(
@@ -321,17 +330,17 @@ if (-not (Test-PinnedShaderc)) {
 }
 
 # --- 4. vulkan-1.lib import library ------------------------------------------
-$LoaderDir = Join-Path $ToolchainDir "loader"
 if (-not (Test-Path (Join-Path $LoaderDir "vulkan-1.lib"))) {
     $systemDll = Join-Path $env:SystemRoot "System32\vulkan-1.dll"
     if (-not (Test-Path $systemDll)) {
         throw "No Vulkan runtime found at $systemDll - install a GPU driver with Vulkan support (or the LunarG Vulkan SDK)."
     }
 
+    $toolset = Get-MsvcTargetToolset $TargetArchitecture
     $vcVersion = (Get-Content (Join-Path $VisualStudio.Path "VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt")).Trim()
-    $vcBin = Join-Path $VisualStudio.Path "VC\Tools\MSVC\$vcVersion\bin\Hostx64\x64"
+    $vcBin = Join-Path $VisualStudio.Path "VC\Tools\MSVC\$vcVersion\$($toolset.BinSubdir)"
     if (-not (Test-Path (Join-Path $vcBin "lib.exe"))) {
-        throw "MSVC binaries not found under $vcBin - the Visual Studio installation at '$($VisualStudio.Path)' has no x64 C++ toolset."
+        throw "MSVC binaries not found under $vcBin - the Visual Studio installation at '$($VisualStudio.Path)' has no $TargetArchitecture C++ toolset."
     }
 
     New-Item -ItemType Directory -Force -Path $LoaderDir | Out-Null
@@ -340,7 +349,7 @@ if (-not (Test-Path (Join-Path $LoaderDir "vulkan-1.lib"))) {
     if ($names.Count -lt 10) { throw "dumpbin found only $($names.Count) exports in vulkan-1.dll; refusing to build a broken import library." }
     $defPath = Join-Path $LoaderDir "vulkan-1.def"
     Set-Content -Path $defPath -Value (@("LIBRARY vulkan-1.dll", "EXPORTS") + $names) -Encoding ascii
-    & (Join-Path $vcBin "lib.exe") /nologo "/def:$defPath" /machine:x64 "/out:$(Join-Path $LoaderDir 'vulkan-1.lib')"
+    & (Join-Path $vcBin "lib.exe") /nologo "/def:$defPath" "/machine:$TargetArchitecture" "/out:$(Join-Path $LoaderDir 'vulkan-1.lib')"
     if ($LASTEXITCODE -ne 0) { throw "lib.exe failed to generate vulkan-1.lib" }
 }
 

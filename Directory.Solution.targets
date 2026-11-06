@@ -29,8 +29,9 @@
            the SDK supplies the default), so the simulator build gets it here and is ad-hoc
            signed like build-sim.sh's app; being global, it reaches the share extension too,
            which build-sim.sh's leaves to whatever team profile the Mac has. The Windows head
-           keeps build-windows.ps1's win-x64 (the engine library is x64 only), at the price of
-           a second restore of its references per build.
+           keeps build-windows.ps1's win-x64, at the price of a second restore of its
+           references per build. On Windows on Arm the engine library is built for ARM64,
+           which a win-x64 app cannot load, so the Windows head is not built there.
          - Platform=AnyCPU, because Visual Studio's x64 prompts export Platform=x64 into the
            environment the child inherits (Directory.Solution.props covers only this build),
            which would move every output under bin/x64/.
@@ -133,7 +134,7 @@
     <_TensorAgentWindowsEngine Condition="!Exists('$(_TensorAgentWindowsEngine)') And Exists('$(MSBuildThisFileDirectory)TensorSharp.GGML.Native/build-windows/GgmlOps.dll')">$(MSBuildThisFileDirectory)TensorSharp.GGML.Native/build-windows/GgmlOps.dll</_TensorAgentWindowsEngine>
   </PropertyGroup>
 
-  <ItemGroup Condition="'$(SolutionFileName)' == 'TensorSharp.slnx' And $([MSBuild]::IsOSPlatform('Windows'))">
+  <ItemGroup Condition="'$(SolutionFileName)' == 'TensorSharp.slnx' And $([MSBuild]::IsOSPlatform('Windows')) And '$(_TensorAgentAppMachineArch)' != 'arm64'">
     <_TensorAgentAppTargetFramework Include="net10.0-windows10.0.19041.0" />
     <_TensorAgentAppHead Include="net10.0-windows10.0.19041.0"
                          DisplayName="Windows app"
@@ -170,8 +171,10 @@
 
   <!-- The heads this machine has whose workloads the selected app SDK provides. -->
   <Target Name="_ResolveTensorAgentAppHeads">
-    <Message Condition="'@(_TensorAgentAppTargetFramework)' == ''" Importance="normal"
+    <Message Condition="'@(_TensorAgentAppTargetFramework)' == '' And !($([MSBuild]::IsOSPlatform('Windows')) And '$(_TensorAgentAppMachineArch)' == 'arm64')" Importance="normal"
              Text="TensorAgent: the app has macOS and Windows heads only; none is built on this OS." />
+    <Message Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$(_TensorAgentAppMachineArch)' == 'arm64'" Importance="high"
+             Text="TensorAgent: the Windows app is built for win-x64 only, and on Windows on Arm the engine library is ARM64; the app is not built here." />
     <Message Condition="'@(_TensorAgentAppTargetFramework)' != '' And '$(TensorSharpSkipTensorAgentApp)' == 'true'" Importance="high"
              Text="TensorAgent: app skipped (TensorSharpSkipTensorAgentApp=true)." />
     <Message Condition="$([MSBuild]::IsOSPlatform('OSX')) And '$(_TensorAgentAppMachineArch)' != 'arm64'" Importance="normal"

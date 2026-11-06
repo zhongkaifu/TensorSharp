@@ -148,8 +148,17 @@
   <!-- Shared by generic and optional kernels, including incremental builds. -->
   <Target Name="ResolveCudaHostCompiler" DependsOnTargets="ResolveCudaPtxBuildSettings"
           Condition="'$(TensorSharpSkipCudaPtx)' != 'true'">
+    <!-- nvcc runs on this machine, so its host compiler is the machine's own MSVC
+         toolset: the ARM64-hosted, ARM64-targeting one on Windows on Arm (whose
+         CUDA toolkit is an ARM64 build too), the x64 one everywhere else. -->
+    <PropertyGroup>
+      <_MsvcHostBinSubdir>Hostx64\x64</_MsvcHostBinSubdir>
+      <_MsvcHostComponent>Microsoft.VisualStudio.Component.VC.Tools.x86.x64</_MsvcHostComponent>
+      <_MsvcHostBinSubdir Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'Arm64'">Hostarm64\arm64</_MsvcHostBinSubdir>
+      <_MsvcHostComponent Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'Arm64'">Microsoft.VisualStudio.Component.VC.Tools.ARM64</_MsvcHostComponent>
+    </PropertyGroup>
     <PropertyGroup Condition="'$(_NvccExitCode)' == '0' And '$([MSBuild]::IsOSPlatform(Windows))' == 'true' And '$(VCToolsInstallDir)' != ''">
-      <_CompilerBinDir>--compiler-bindir="$(VCToolsInstallDir)bin\Hostx64\x64"</_CompilerBinDir>
+      <_CompilerBinDir>--compiler-bindir="$(VCToolsInstallDir)bin\$(_MsvcHostBinSubdir)"</_CompilerBinDir>
     </PropertyGroup>
     <!-- The query below asks vswhere for "all, including prerelease" rather than
          "latest": the VS installer flags an instance "incomplete" after an
@@ -159,7 +168,7 @@
          "Cannot find compiler 'cl.exe' in PATH". Same reasoning as
          eng/vs-locate.ps1. -->
     <Exec Condition="'$(_NvccExitCode)' == '0' And '$([MSBuild]::IsOSPlatform(Windows))' == 'true' And '$(_CompilerBinDir)' == ''"
-          Command="for /f &quot;delims=&quot; %%i in ('&quot;%25ProgramFiles(x86)%25\Microsoft Visual Studio\Installer\vswhere.exe&quot; -all -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe') do @echo %%~dpi"
+          Command="for /f &quot;delims=&quot; %%i in ('&quot;%25ProgramFiles(x86)%25\Microsoft Visual Studio\Installer\vswhere.exe&quot; -all -prerelease -products * -requires $(_MsvcHostComponent) -find VC\Tools\MSVC\**\bin\$(_MsvcHostBinSubdir)\cl.exe') do @echo %%~dpi"
           ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="_ClExeDir" />
     </Exec>
