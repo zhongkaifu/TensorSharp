@@ -450,6 +450,8 @@ Hunyuan Dense、DiffusionGemma、LTX 2.5、Wan 2.1/2.2 与 MiniMax-H3 仅支持�
 
 输出解析器（`OutputParser.cs`）会自动从模型原始输出中提取工具调用，与架构无关。Mistral 3、Hunyuan Dense 与 DiffusionGemma 不渲染工具声明；DiffusionGemma 会以 HTTP 400 拒绝携带工具的请求。
 
+自带工具的请求按客户端自己的智能体循环（pi、Codex、opencode）处理：除非请求要求，服务端不加入技能、代码或子智能体工具；在没有 developer 角色的模板上把 `developer` 消息按 system 消息渲染；并把 `chat_template_kwargs.enable_thinking` 当作 `think` 开关。`--chat-template-file`（服务端与 CLI）用 Jinja 文件替换 GGUF 的聊天模板 → [自带工具的智能体客户端](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#自带工具的智能体客户端picodexopencode)
+
 ## Agent Skills（智能体技能）
 
 一个技能就是一个目录，里面放着 `SKILL.md`（YAML frontmatter + 写给模型看的 Markdown 说明），以及这些说明会用到的脚本、参考文档和素材。TensorSharp 扫描一个或多个技能目录（`--skills-dir`，可重复，或 `TS_SKILLS_DIR`；两者都不设时，依次使用从工作目录向上直到最近 Git 根目录的每个现有 `.agents/skills` 目录——由近及远；不在仓库内时只看工作目录——再加上二进制文件旁边的 `skills` 目录，缺失时会自动创建。CLI 上它排在最后；在服务端它同时是上传目录，总是最先扫描（同名时以它为准），即使显式给出 `--skills-dir` / `TS_SKILLS_DIR` 也会保留，显式根目录只替换 `.agents/skills` 默认值。个人或全局技能目录永远不会被导入），把每个技能的一行描述展示给模型，其余内容**只在模型主动索取时才加载**。

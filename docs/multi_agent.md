@@ -275,7 +275,11 @@ uses it; the desktop server never calls it). Existing server JSON configuration 
 flags. A request can set the top-level boolean `"multi_agent": false` to use a
 single agent. `true` or an omitted field follows the host policy and cannot
 enable delegation when the host has disabled it. Requests cannot raise host
-limits or enable worker tools.
+limits or enable worker tools. A request that runs its own tool loop (it declares
+`tools`, or its messages hold tool calls and tool results, as pi's and Codex's do) is
+the exception: an omitted field means off for it, and only `"multi_agent": true`
+offers the coordination tools. See
+[Agent clients that run their own tools](../TensorSharp.Server.Host/API_EXAMPLES.md#agent-clients-that-run-their-own-tools-pi-codex-opencode).
 
 | Flag | Default | Allowed range or meaning |
 |---|---|---|
