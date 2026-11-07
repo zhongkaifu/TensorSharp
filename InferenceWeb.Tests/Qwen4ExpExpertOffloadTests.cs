@@ -1,6 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -31,6 +32,9 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         Directory.CreateDirectory(_dir);
         _env.Set("MAX_CONTEXT", "1024");
         _env.ClearSpeculationVars();
+        // Offloaded runs record a routing profile; keep it out of the user's cache.
+        _env.Set("TENSORSHARP_MOE_PROFILE", null);
+        _env.Set("TENSORSHARP_MOE_PROFILE_DIR", _dir);
         MoeCpuOffloadConfig.Reset();
     }
 
@@ -49,7 +53,8 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
 
     private float[][] Run(BackendType backend, Action configure) => Run(backend, configure, Prompt);
 
-    private float[][] Run(BackendType backend, Action configure, int[] prompt, Action<ModelBase>? loaded = null)
+    private float[][] Run(BackendType backend, Action configure, int[] prompt, Action<ModelBase>? loaded = null,
+        Action<ModelBase>? done = null)
     {
         MoeCpuOffloadConfig.Reset();
         configure();
@@ -61,6 +66,7 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         rows[0] = (float[])model.ForwardRefill(prompt).Clone();
         for (int i = 0; i < Steps.Length; i++)
             rows[i + 1] = (float[])model.Forward(new[] { Steps[i] }).Clone();
+        done?.Invoke(model);
         return rows;
     }
 
@@ -98,6 +104,104 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     /// eng/validation/qwen4exp-offload-parity.py, retaining argmax equality in both checks.</summary>
     private static double Bound(BackendType backend, bool hostPrefill = false)
         => backend == BackendType.GgmlCuda ? (hostPrefill ? 2.5e-2 : 2e-2) : 5e-3;
+
+    /// <summary>Accelerator expert tiers on every offloaded layer (ggml_ops_moe_hot_tier.cpp). With a
+    /// window wide enough for every route, the accelerator computes every expert from the compact
+    /// slots with the all-accelerator span's own kernels, so the answer matches it far inside the
+    /// host bound. With only fixed slots, or a window too small for a step (evictions every token, the
+    /// rest overflowing to the host), the split meets the host's Q8_K arithmetic: the host bound.
+    /// Prefill (40 tokens) runs the split too; every decode step reads misses into the window.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TieredExperts_AnswerAsTheAccelerator_Metal()
+    {
+        float[][] device = Run(BackendType.GgmlMetal, () => { });
+        int experts = 0;
+        float[][] wide = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, model =>
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            experts = q.ExpertCountForTests;
+            Assert.Equal(8, q.RegisterExpertTiersForTests(experts / 4, experts));
+        });
+        float[][] fixedOnly = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, model =>
+            Assert.Equal(8, ((Qwen4ExpModel)model).RegisterExpertTiersForTests(experts / 2, 0)));
+        float[][] narrow = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, model =>
+            Assert.Equal(8, ((Qwen4ExpModel)model).RegisterExpertTiersForTests(1, 2)));
+        AssertClose("tier, window covers every route", wide, device, 1e-4);
+        AssertClose("tier, fixed slots only", fixedOnly, device, Bound(BackendType.GgmlMetal, hostPrefill: true));
+        AssertClose("tier, narrow window", narrow, device, Bound(BackendType.GgmlMetal, hostPrefill: true));
+    }
+
+    /// <summary>A batched verify-width span (here a 4-token prefill) reads up to two window misses a
+    /// row in the background while the accelerator computes the routes its slots already hold, then
+    /// computes those after a second cut (host_moe_build_hot_part's overlap group). Only the
+    /// order the routes are summed in changes, so with a window wide enough for every route the
+    /// answer still matches the all-accelerator span far inside the host bound; a misread or
+    /// half-written slot would not.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TieredExperts_VerifyWidthOverlap_Metal()
+    {
+        int[] verifyWidth = Prompt.Take(4).ToArray();
+        float[][] device = Run(BackendType.GgmlMetal, () => { }, verifyWidth);
+        long deferred = 0;
+        float[][] overlapped = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, verifyWidth, model =>
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 4, q.ExpertCountForTests));
+        }, _ => deferred = GgmlBasicOps.MoeHotTierStats().Deferred);
+        Assert.True(deferred > 0, "no window miss was read in the background");
+        AssertClose("tier, verify-width overlap", overlapped, device, 1e-4);
+    }
+
+    /// <summary>Discrete VRAM: fixed slots only (no host-writable window), the rest of every
+    /// route on the host. Prefill (40 tokens) runs the batched expert kernels on the slots.</summary>
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void TieredExperts_AnswerAsTheAccelerator_Cuda()
+    {
+        float[][] device = Run(BackendType.GgmlCuda, () => { });
+        float[][] tiered = Run(BackendType.GgmlCuda, MoeCpuOffloadConfig.SetAllLayers, Prompt, model =>
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 2, 0));
+        });
+        AssertClose("tier, fixed slots only (CUDA)", tiered, device, Bound(BackendType.GgmlCuda, hostPrefill: true));
+    }
+
+    /// <summary>A discrete-VRAM layer plan has no host seam on its resident layers, so a profile built
+    /// from the seams alone never covers the model and the next load could never tier it. While
+    /// recording, the resident layers' graphs hand their router ids to the same counters: every MoE
+    /// layer then counts the same routes, and the logits are those of the plan without recording.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void ResidentLayersRecordTheirRouting_Metal() => ResidentLayersRecordTheirRouting(BackendType.GgmlMetal);
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void ResidentLayersRecordTheirRouting_Cuda() => ResidentLayersRecordTheirRouting(BackendType.GgmlCuda);
+
+    private void ResidentLayersRecordTheirRouting(BackendType backend)
+    {
+        var plainTotals = new List<ulong>();
+        var totals = new List<ulong>();
+        void Collect(ModelBase model, List<ulong> into)
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            for (int l = 0; l < q.Config.NumLayers; l++)
+                if (q.RoutingCountsForTests(l) is ulong[] counts)
+                    into.Add(counts.Aggregate(0UL, (a, c) => a + c));
+                else
+                    into.Add(0);
+        }
+        float[][] plain = Run(backend, () => MoeCpuOffloadConfig.SetLayers(4), Prompt, done: m => Collect(m, plainTotals));
+        float[][] recorded = Run(backend, () => MoeCpuOffloadConfig.SetLayers(4), Prompt,
+            model => Assert.IsType<Qwen4ExpModel>(model).RecordDeviceRoutesForTests(true),
+            model => Collect(model, totals));
+
+        // Without recording only the four host layers count; with it every layer does, alike.
+        Assert.Contains(plainTotals, t => t == 0);
+        Assert.All(totals, t => Assert.True(t > 0));
+        Assert.Single(totals.Distinct());
+        Assert.Equal(plainTotals.Max(), totals[0]);
+        for (int i = 0; i < plain.Length; i++)
+            Assert.Equal(plain[i], recorded[i]);
+    }
 
     /// <summary>A 160-token prefill streams each offloaded layer's experts to the accelerator. The
     /// seam then reads a result the stream path published through an asynchronous download on

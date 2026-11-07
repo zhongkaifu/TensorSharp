@@ -1,6 +1,7 @@
 using System.Text.RegularExpressions;
 using TensorAgent.Core.Catalog;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Speculative;
 
 namespace TensorAgent.Tests;
 
@@ -15,7 +16,7 @@ public sealed class CatalogTests
             "gemma-4-e4b-iq4xs",
             "bonsai-2-27b-ptq1-0",
             "qwen3.5-9b-iq4xs",
-            "qwen3.8-27b-q4kxl",
+            "qwen3.8-27b-iq3xxs",
             "muse-glimmer-30b-q4kxl",
             "qwen3.8-flash-next-q2kxl",
             "qwen3.8-flash-next-iq1m",
@@ -225,7 +226,7 @@ public sealed class CatalogTests
 
     private static readonly string[] DesktopOnly =
     {
-        "qwen3.8-27b-q4kxl",
+        "qwen3.8-27b-iq3xxs",
         "muse-glimmer-30b-q4kxl",
         "qwen3.8-flash-next-q2kxl",
         "qwen3.8-flash-next-iq1m",
@@ -255,7 +256,7 @@ public sealed class CatalogTests
     /// for the measurements behind each number.
     /// </summary>
     [Theory]
-    [InlineData("qwen3.8-27b-q4kxl", 32)]
+    [InlineData("qwen3.8-27b-iq3xxs", 32)]
     [InlineData("muse-glimmer-30b-q4kxl", 32)]
     [InlineData("qwen-image-2.1-q4km", 24)]
     [InlineData("qwen-image-2.1-turbo-q5ks", 24)]
@@ -322,7 +323,7 @@ public sealed class CatalogTests
     }
 
     /// <summary>
-    /// What each desktop entry needs, MEASURED in the Mac app on 2026-09-30 (Apple M5 Pro,
+    /// What each desktop entry needs, MEASURED in the Mac app from 2026-09-30 (Apple M5 Pro,
     /// 48 GB, ggml_metal): the mapped files the model reads while it works, and the app's
     /// footprint at its highest. A Mac has no jetsam to kill the app, so nothing else in
     /// this file checks a desktop entry; but a dense model reads every weight for every
@@ -331,7 +332,10 @@ public sealed class CatalogTests
     /// </summary>
     private static readonly Dictionary<string, (double ResidentFilesGB, double FootprintGB, string How)> MeasuredOnAMac = new()
     {
-        ["qwen3.8-27b-q4kxl"] = (17.56, 8.8, "chat-e2e.py's seven scenarios with the projector, LeanCaches"),
+        // Measured 2026-11-05 in the Debug Mac app: the weights plus the DFlash2 drafter, and
+        // phys_footprint_peak (`footprint -p`) after chat-e2e.py's seven scenarios. The entry it
+        // replaced, UD-Q4_K_XL with no drafter, measured (17.56, 8.8) on 2026-09-30.
+        ["qwen3.8-27b-iq3xxs"] = (12.08, 9.89, "chat-e2e.py's seven scenarios with the projector and drafter, LeanCaches"),
         ["muse-glimmer-30b-q4kxl"] = (15.88, 10.9, "chat-e2e.py's seven scenarios with the projector, LeanCaches"),
         // The DiT stays mapped through the denoise; the text encoder is released first.
         ["qwen-image-2.1-q4km"] = (4.19, 14.3, "an edit at 1248x832, 40 steps (the CLI's peak footprint)"),
@@ -447,14 +451,25 @@ public sealed class CatalogTests
     }
 
     [Fact]
-    public void TheNewDesktopEntriesUseThePinnedFourBitArtifacts()
+    public void TheDesktopChatEntriesUseThePinnedArtifacts()
     {
-        CatalogModel qwen = ModelCatalog.Find("qwen3.8-27b-q4kxl")!;
+        // config/qwen3.8-27b-metal-dflash2.json's three files, pinned at the same revisions.
+        CatalogModel qwen = ModelCatalog.Find("qwen3.8-27b-iq3xxs")!;
         Assert.Equal(CatalogFamily.Qwen38, qwen.Family);
-        Assert.Equal("Qwen3.8-27B-UD-Q4_K_XL.gguf", qwen.Weights.FileName);
-        Assert.Equal(17_559_178_144, qwen.Weights.Bytes);
-        Assert.Equal("3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e", qwen.Weights.Sha256);
-        Assert.True(qwen.Projector is { Optional: true });
+        Assert.Equal("Qwen3.8-27B-UD-IQ3_XXS.gguf", qwen.Weights.FileName);
+        Assert.Equal(10_934_860_704, qwen.Weights.Bytes);
+        Assert.Equal("c0b7c3038681ed2e3040456c1dd45f9858b6c2290bed172c70388a94874f3eee", qwen.Weights.Sha256);
+        Assert.Contains("/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/", qwen.Weights.Url);
+        CatalogFile projector = Assert.IsType<CatalogFile>(qwen.Projector);
+        Assert.True(projector.Optional);
+        Assert.Equal(931_146_432, projector.Bytes);
+        Assert.Equal("83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53", projector.Sha256);
+        Assert.Contains("/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/mmproj-BF16.gguf", projector.Url);
+        CatalogFile draft = Assert.Single(qwen.Files, f => f.Role == CatalogFileRole.Draft);
+        Assert.Equal("Qwen3.8-27B-DFlash2-Q4_K_M.gguf", draft.FileName);
+        Assert.Equal(1_143_006_816, draft.Bytes);
+        Assert.Equal("1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd", draft.Sha256);
+        Assert.Equal(new CatalogDraftTuning(7, 0f), qwen.DraftTuning);
 
         CatalogModel muse = ModelCatalog.Find("muse-glimmer-30b-q4kxl")!;
         Assert.Equal(CatalogFamily.MuseGlimmer, muse.Family);
@@ -464,6 +479,25 @@ public sealed class CatalogTests
         Assert.True(muse.Projector is { Optional: true });
         Assert.True(Assert.Single(muse.Files, f => f.Role == CatalogFileRole.Draft).Optional);
         Assert.True(Assert.Single(qwen.Files, f => f.Role == CatalogFileRole.Draft).Optional);
+    }
+
+    /// <summary>
+    /// A draft tuning is measured with the entry's own draft file and applied only while that
+    /// file speculates, so an entry without one has nothing to apply it to. The values must
+    /// also be ones the engine accepts: <see cref="SpeculationOptions.FromEnvironment"/> drops
+    /// an out-of-range window or gate without a word, which would run the defaults.
+    /// </summary>
+    [Fact]
+    public void EveryDraftTuningHasTheDraftFileItWasMeasuredWithAndValuesTheEngineAccepts()
+    {
+        CatalogModel[] tuned = ModelCatalog.BuiltIn.Where(m => m.DraftTuning is not null).ToArray();
+        Assert.Equal(new[] { "qwen3.8-27b-iq3xxs" }, tuned.Select(m => m.Id));
+        foreach (CatalogModel m in tuned)
+        {
+            Assert.Contains(m.Files, f => f.Role == CatalogFileRole.Draft);
+            Assert.InRange(m.DraftTuning!.MaxDraftTokens, 1, SpeculationOptions.MaxAllowedDraftTokens);
+            Assert.InRange(m.DraftTuning.MinDraftProb, 0f, 1f);
+        }
     }
 
     [Theory]
@@ -633,6 +667,7 @@ public sealed class CatalogTests
         "qwen3.8-27b-iq2xxs",
         "qwen3.8-27b-iq1s",
         "qwen3.8-27b-q4kxl",
+        "qwen3.8-27b-iq3xxs",
         "muse-glimmer-30b-q4kxl",
         "qwen-image-edit-2511-q2k",
         "qwen-image-2.1-q4km",

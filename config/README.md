@@ -279,8 +279,8 @@ TensorSharp.Server.Host --config config/gemma-4-26b-a4b.json
 | [`qwen3.5-9b-uncensored-q8.json`](qwen3.5-9b-uncensored-q8.json) | Qwen3.5-9B Uncensored (Q8_0) | Text LLM |
 | [`qwen3.6-27b.json`](qwen3.6-27b.json) | Qwen3.6-27B + vision | Multimodal LLM |
 | [`qwen3.6-35b-a3b.json`](qwen3.6-35b-a3b.json) | Qwen3.6-35B-A3B (MoE) + vision | Multimodal MoE LLM |
-| [`qwen3.8-flash-next.json`](qwen3.8-flash-next.json) | Qwen3.8 Flash Next (UD-Q2_K_XL, three shards) + vision | Multimodal MoE LLM; optional shared MTP head |
-| [`qwen3.8-27b-metal-dflash2.json`](qwen3.8-27b-metal-dflash2.json) | Qwen3.8-27B (UD-IQ3_XXS) + DFlash2 Q4_K_M drafter | Text LLM on Apple Silicon (`ggml_metal`), speculative decoding: 39-52 tok/s on code and lists on an M5 Pro |
+| [`qwen3.8-flash-next.json`](qwen3.8-flash-next.json) | Qwen3.8 Flash Next (UD-Q2_K_XL, three shards) + vision + shared MTP head | Multimodal MoE LLM; ggml_metal high-performance preset (shared MTP head) |
+| [`qwen3.8-27b-metal-dflash2.json`](qwen3.8-27b-metal-dflash2.json) | Qwen3.8-27B (UD-IQ3_XXS) + vision + DFlash2 Q4_K_M drafter | Multimodal LLM on Apple Silicon (`ggml_metal`), speculative decoding: 39-52 tok/s on code and lists on an M5 Pro |
 | [`gemma-4-e4b.json`](gemma-4-e4b.json) | Gemma-4 E4B **uncensored** (TrevorJS's community build, Q8_0) + stock unsloth vision projector + AtomicChat MTP draft | Multimodal LLM |
 | [`gemma-4-12b.json`](gemma-4-12b.json) | Gemma-4 12B (QAT) + vision + MTP draft | Multimodal LLM |
 | [`gemma-4-26b-a4b.json`](gemma-4-26b-a4b.json) | Gemma-4 26B-A4B (MoE) + vision + MTP draft | Multimodal MoE LLM |

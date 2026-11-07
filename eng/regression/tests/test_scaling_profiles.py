@@ -223,6 +223,7 @@ class ScalingTests(unittest.TestCase):
         self.assertNotIn("--draft-model", command)
         self.assertNotIn("TS_SPEC_DRAFT_MODEL", kwargs["env"])
         self.assertEqual(kwargs["env"]["TS_SPEC_DRAFT"], "4")
+        self.assertEqual(kwargs["env"]["TS_Q4E_VERIFY_ROW_KERNELS"], "1")
         self.assertEqual(evidence["evidence"]["learned_parity"]["status"], "passed")
 
     def test_learned_inactive_is_untested_and_ngram_cannot_substitute(self):

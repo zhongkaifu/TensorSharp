@@ -41,10 +41,19 @@ public sealed class VideoTurnsTests
         SupportsEndImageConditioning = true,
     };
 
-    /// <summary>MiniMax-H3's reference checkpoint.</summary>
+    /// <summary>MiniMax-H3's reference checkpoint loaded alone, as the service reports it: no
+    /// first/last-frame partition, so no image conditioning (see MiniMaxH3Model).</summary>
     private static readonly FakeVideoModel References = new()
     {
+        SupportsReferenceConditioning = true,
+        MaxReferenceImages = 9,
+    };
+
+    /// <summary>A hybrid MiniMax-H3 load: both checkpoints, so both kinds of conditioning.</summary>
+    private static readonly FakeVideoModel Hybrid = new()
+    {
         SupportsImageConditioning = true,
+        SupportsEndImageConditioning = true,
         SupportsReferenceConditioning = true,
         MaxReferenceImages = 9,
     };
@@ -658,6 +667,35 @@ public sealed class VideoTurnsTests
             Assert.False(payload.ContainsKey(sampling), $"the H3 request carries {sampling}");
     }
 
+    /// <summary>A hybrid MiniMax-H3 load has both denoisers. Photos alone keep the first-frame
+    /// behavior (one photo i2v, two fl2v); only a turn that asks for references sends them as
+    /// identity inputs.</summary>
+    [Theory]
+    [InlineData(1, null, "i2v")]
+    [InlineData(2, null, "fl2v")]
+    [InlineData(1, "ref", "ref")]
+    [InlineData(2, "ref", "ref")]
+    public void AHybridMiniMaxH3LoadKeepsPhotosAsFramesUnlessReferencesAreAskedFor(int photos, string? mode, string expected)
+    {
+        string[] stills = Enumerable.Range(0, photos).Select(i => $"photo-{i}.png").ToArray();
+        object user = mode == null
+            ? new { role = "user", content = "a fox in falling snow", stillImagePaths = stills, imagePaths = stills }
+            : new { role = "user", content = "a fox in falling snow", stillImagePaths = stills, imagePaths = stills, videoMode = mode };
+        Dictionary<string, object> payload = Payload(VideoTurns.Read(Body(user), Hybrid));
+
+        Assert.Equal(expected, payload["videoMode"]);
+        if (expected == "ref")
+        {
+            Assert.Equal(stills, Assert.IsType<string[]>(payload["referenceImages"]));
+            Assert.False(payload.ContainsKey("imagePath"));
+        }
+        else
+        {
+            Assert.Equal(stills[0], payload["imagePath"]);
+            Assert.False(payload.ContainsKey("referenceImages"));
+        }
+    }
+
     /// <summary>With LoRA plug-ins, every step frame names them; the clip and the end do not.</summary>
     [Fact]
     public async Task TheStepFramesNameThePlugInsTheClipIsMadeWith()
@@ -831,7 +869,8 @@ public sealed class VideoTurnsTests
         public string VideoModelFamily { get; }
         public int DefaultPreviewFrames => SupportsKeyframeConditioning ? 17 : VideoTurns.DefaultFrames;
         public bool SupportsAudio => true;
-        public bool SupportsImageConditioning => true;
+        // MiniMax-H3's reference checkpoint alone has no first/last-frame partition.
+        public bool SupportsImageConditioning => !SupportsReferenceConditioning;
         public bool SupportsEndImageConditioning => !SupportsReferenceConditioning;
         public bool SupportsReferenceConditioning { get; }
         public bool SupportsKeyframeConditioning => VideoModelFamily == "ltx-2.5";

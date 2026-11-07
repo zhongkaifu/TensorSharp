@@ -67,7 +67,7 @@ TensorAgent 在每次加载模型之前写入自己的取值（`EngineMemoryPoli
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
 | `KV_CACHE_DTYPE` | 除 DeepSeek V4 / V4.1 执行器之外的全部：它们的 cache 固定为 F16，由自己的注意力、gather 与压缩器内核直接读取，`q8_0` / `q4_0` 会在**加载时被拒绝**并给出原因（打开检查点之前抛 `NotSupportedException`），`f32` 会被告知并按 `f16` 报告 | KV cache 元素类型 | 自动（随模型对齐：模型权重低于 F32 时为 `f16`，否则为 `f32`） | `f32`, `f16`, `q8_0`（运行时还接受 `q4_0`，不参与 sweep） | 是 |
-| `TS_N_CPU_MOE` | MoE 模型 | 前 N 层的路由专家留在系统内存：decode 时在主机上做乘法，prefill 时流式送到加速器上跑一整张图。在 `ggml_metal` 上未设置时，若专家放不下，Qwen 3.8 Flash Next（`qwen4exp`）会按 Metal 工作集与内存自行规划（48 GiB 的 Mac 上 48 层中有 15 层的专家留在 GPU 上） | 关闭（`0`） | `0`, `16`, `all` | 否（已为 GGML GPU 后端与 MoE 家族注册，但不在默认配置的列表中） |
+| `TS_N_CPU_MOE` | MoE 模型 | 前 N 层的路由专家留在系统内存：decode 时在主机上做乘法，prefill 时流式送到加速器上跑一整张图。在 `ggml_metal` 上未设置时，若专家放不下，Qwen 3.8 Flash Next（`qwen4exp`）会按 Metal 工作集与内存自行规划：每层都在主机接缝处调度，并保留按路由画像排序的加速器专家层与显式读取的窗口槽位（见 `TS_MOE_HOT_TIER`） | 关闭（`0`） | `0`, `16`, `all` | 否（已为 GGML GPU 后端与 MoE 家族注册，但不在默认配置的列表中） |
 | `TS_CPU_MOE` | MoE 模型 | 卸载所有层的路由专家（等价于 `TS_N_CPU_MOE=all`） | 关闭 | 未注册 | 否 |
 | `TS_CPU_MOE_THREADS` | MoE 模型 | 主机端专家 matmul 的工作线程数。可用 CPU（硬件线程数按亲和性掩码与 cgroup CPU 配额收敛后）超过 8 个时，默认取其一半，上限 64：decode 侧的 matmul 只有一个 token 宽，超过几十个线程后每多一个线程只是多一个屏障参与者（在双路 Xeon 上实测 192 线程比 32 线程慢 7 倍）。较小的主机几乎用满全部 CPU。DeepSeek V4 / V4.1 则默认使用全部可用 CPU（见下文） | 可用数 ≤2 时为 1，≤8 时为可用数−1，否则 min(可用数/2, 64) | - | 否 |
 | `TS_HOST_MOE_DEVICE_MIN_BATCH` | 启用卸载的 MoE 模型 | 达到或超过该 batch 大小时，被卸载的层改为在加速器上计算、专家权重流式送入，而不是在主机上算。`0` 恢复纯主机卸载 | `128` | 未注册 | 否 |
@@ -76,6 +76,15 @@ TensorAgent 在每次加载模型之前写入自己的取值（`EngineMemoryPoli
 | `TS_HOST_MOE_DECODE` | 启用卸载的 MoE 模型 | `0` 让单 token 的被卸载层改走 ggml CPU 计算图，而不是 TensorSharp 的 decode 内核（仍用 ggml 自己的 CPU 点积，但线程组每层只唤醒一次；在 M5 Pro 上跑 Qwen3.8-Flash-Next 时每层 0.6 → 0.32 ms）。用于 A/B 对比 | 启用 | 未注册 | 否 |
 | `TS_HOST_MOE_TIMING` | 启用卸载的 MoE 模型 | 诊断：`1` 主机侧每次调用的准备与 matmul 时间，以及流式 prefill 的字节数、传输速率与 GPU 时间；`2` 每个权重的拷贝速率（会同步，改变所测的东西）；`3` 每个 decode pass 的加速器分段、主机专家与上传时间；`4` 单 token 内核的各阶段与工作线程的唤醒 | 关闭 | 未注册 | 否 |
 | `TS_HOST_MOE_EXPERT_FILTER` | 启用卸载的 MoE 模型 | 只流式传输该 batch 实际路由到的专家，并合并成连续区间 | 启用 | 未注册 | 否 |
+| `TS_MOE_HOT_TIER` | 专家放不下时在 `ggml_metal` 或单卡 `ggml_cuda` 上运行的 Qwen 3.8 Flash Next（`qwen4exp`） | `0` 保留旧方案（整层把末尾若干层的专家常驻 GPU）。默认：每层的路由专家都在主机接缝处调度，每层保留一块紧凑的加速器专家层：按路由画像排序的高频专家占固定槽位；在统一内存上另有一块按需显式读取填充的窗口槽位，由加速器计算路由，主机只负责 id 重映射和读取未命中的专家（独立显存上，固定槽位以外的路由在主机 decode 内核上计算）。若尚无覆盖该模型的画像：Metal 上本次加载只用窗口槽位（与有画像时相差 3-5%）并记录画像；CUDA 上本次保留层计划，并记录所有层（包括常驻层）的路由，之后的加载即可分层。显式设置 `TS_HOST_MOE_EXPERT_CACHE_MB` 时 CUDA 仍使用 selected-expert cache | 启用 | 未注册 | 否 |
+| `TS_MOE_HOT_TIER_GB` | 同上 | 固定（按画像排序）槽位的字节预算，单位 GB | 旧方案会常驻的字节数（48 GiB Mac 上为 14.4 GB） | - | 否 |
+| `TS_HOST_MOE_IO_CACHE_GB` | 启用卸载的 MoE 模型，Apple | 显式读取专家（并行 `pread`，`F_NOCACHE`）所用的内存：有专家层时 7/8 作为窗口槽位，其余作为溢出路由的主机缓存；否则作为主机计算层读取的主机缓存。同时让 prefill 用 `pread` 直接读入加速器的暂存内存。模型放得进内存时默认关闭（页缓存即可）；`0` 改回读映射 | 扣除主机保留与所有常驻内容后剩余内存的 3/4 | - | 否 |
+| `TS_HOST_MOE_STREAM_PREAD` | 启用卸载的 MoE 模型，Apple | `0` 让 prefill 流式传输专家时改回缺页读入映射再拷贝，而不是直接读入 CPU 可见的加速器内存 | 启用 | 未注册 | 否 |
+| `TS_HOST_MOE_IO_THREADS` | 同上 | 显式 I/O 线程组的读取线程数（调用之间休眠） | `12` | - | 否 |
+| `TENSORSHARP_MOE_PROFILE_DIR` / `TENSORSHARP_MOE_PROFILE` | 专家会到达主机接缝的 MoE 模型 | 路由画像（每层专家被选中的次数，跨运行累加）的存放位置：按模型分文件的目录，或一个显式文件（可来自同一模型的其他量化版本） | `$XDG_CACHE_HOME/tensorsharp/moe-routing` 或 `~/.cache/tensorsharp/moe-routing` | - | 否 |
+| `TS_Q4E_VERIFY_ROW_KERNELS` | `ggml_metal` 上 Qwen 3.8 Flash Next 的投机解码 | `1` 让 k+1 行各自用单 token 内核验证，投机解码的贪心文本与普通 decode 逐位一致。默认：这些行作为一次批量前向来验证（与 NInfer、llama.cpp、vLLM 相同），在 48 GiB Mac 上代码场景的 MTP decode 比精确模式快 1.3 倍。CPU 与 CUDA 始终精确验证 | 批量（`ggml_metal`） | 未注册 | 否 |
+| `TS_Q4E_VERIFY_ROW_COMMIT` | `ggml_metal` / `ggml_cpu` 上 Qwen 3.8 Flash Next 的投机解码 | `0` 保留旧的部分接受回滚（恢复循环状态并重新前向保留的行，Flash Next 上约 60 ms）。默认：verify span 保留每一行的 GDN conv/SSM 状态与 PLE conv 历史，直接提交被接受的行（NInfer 的 ReplaySSM 思路） | 启用 | 未注册 | 否 |
+| `TS_MOE_TIER_STATS` | 同上 | 诊断：`1` 在模型卸载时打印专家槽位的命中、窗口读取（及其中由批量 verify 在后台完成的次数）与溢出次数，以及主机缓存的计数 | 关闭 | 未注册 | 否 |
 | `MAX_CONTEXT` | 长文本 / 上传文本 | 硬上下文上限。设置了就是硬性要求：缓存放得下就照办，放不下就带着数字拒绝。不设置时，GGUF 宣称的长度只是上限，加载器会按设备真正装得下的量来定——GLM-5.2 宣称 1M token，那是约 93 GiB 的 KV | 模型默认值（是上限而非承诺） | `4096`, `8192`, `16384` | 是 |
 
 ## Prefill / Decode 调优

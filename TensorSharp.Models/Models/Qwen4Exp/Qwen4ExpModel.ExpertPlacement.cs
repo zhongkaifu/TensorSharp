@@ -89,7 +89,17 @@ namespace TensorSharp.Models
                 }
                 for (int l = 0; l < n; l++)
                     _expertOnHost[l] = MoeCpuOffloadConfig.IsLayerOnCpu(l);
+                // Explicit offload still records routing, so a --cpu-moe run is also
+                // how a complete profile is collected for the tiered plan.
+                AttachRoutingProfile();
                 ReportExpertPlacement("--n-cpu-moe / --cpu-moe", null);
+                if (_backend == BackendType.GgmlMetal)
+                {
+                    long resident = 0;
+                    for (int l = 0; l < n; l++)
+                        if (!_expertOnHost[l]) resident += LayerExpertBytes(l);
+                    ConfigureHostExpertIo(HostExpertIoBudget(resident));
+                }
                 return;
             }
 
@@ -126,6 +136,16 @@ namespace TensorSharp.Models
                     Environment.GetEnvironmentVariable("TS_HOST_MOE_EXPERT_CACHE_LAYERS"));
                 int resident = PlanCudaDeviceExpertLayers(layerBytes, pending, free,
                     GpuMemoryBudget.ResolveHeadroomBytes(total), cacheBudget, cacheMinimum, cacheLayers, cacheAllocationFloor);
+                if (resident < n && cacheBudget == 0)
+                {
+                    // NInfer's RTX 5090 Flash Next layout: the VRAM the whole-layer plan
+                    // would spend holds every layer's most-routed experts instead, and
+                    // the host computes the rest. Needs a routing profile.
+                    long vram = 0;
+                    for (int l = n - resident; l < n; l++) vram += layerBytes[l];
+                    if (TryPlanExpertTiers(vram))
+                        return;
+                }
                 for (int l = 0; l < n - resident; l++) _expertOnHost[l] = true;
                 ReportExpertPlacement("planned", $"CUDA free {Gb(free)}, reserved scratch {Gb(DeviceScratchBytes)}" +
                     (cacheBudget > 0 ? $", expert cache ceiling {Gb(cacheBudget)}" : "") +
@@ -149,6 +169,10 @@ namespace TensorSharp.Models
             int onDevice = PlanDeviceExpertLayers(experts, other, workingSet, ram);
             if (onDevice >= n)
                 return;
+            long layerPlanBytes = 0;
+            for (int l = n - onDevice; l < n; l++) layerPlanBytes += experts[l];
+            if (TryPlanExpertTiers(layerPlanBytes))
+                return;
             // Offload the FIRST layers, keep the last ones resident (llama.cpp's
             // --n-cpu-moe order): a token then ends on the accelerator without a
             // final host round trip.
@@ -156,6 +180,7 @@ namespace TensorSharp.Models
                 _expertOnHost[l] = true;
             ReportExpertPlacement("planned", $"Metal working set {Gb(workingSet)}, RAM {Gb(ram)}; " +
                 "--n-cpu-moe N overrides");
+            ConfigureHostExpertIo(HostExpertIoBudget(layerPlanBytes));
         }
 
         internal static long ResolveCudaExpertCacheBudget(string value)

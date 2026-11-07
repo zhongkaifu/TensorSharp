@@ -136,6 +136,7 @@ namespace TensorSharp.Models
                 _q4eDistributed?.ValidateConfiguration($"qwen-cache|{_kvCacheDtype}|{initialCacheLength}|{maxContextLength}");
                 PlanExpertPlacement();
                 FinalizeMtpHead();
+                StartPleTableWarm();
             }
             catch (Exception failure)
             {

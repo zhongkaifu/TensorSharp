@@ -364,7 +364,6 @@
   "studio.keyframesTitle": "Fotos zu festgelegten Zeitpunkten",
   "studio.guideNamed": "Keyframe {index}",
   "studio.referencePhotosTitle": "Referenzfotos",
-  "studio.referencesHelp2": "Ihre Fotos zeigen, wer oder was vorkommen soll; der Take beginnt oder endet nicht mit ihnen. Wählen Sie bis zu {count}.",
   "studio.referenceRemoved": "{name} entfernt. Reihenfolge: {list}",
   "studio.referenceAdded": "Bild {index}: {name}",
   "studio.referenceTileOn": "{name}, Bild {index}",

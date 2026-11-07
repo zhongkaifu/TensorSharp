@@ -540,6 +540,11 @@ namespace
             }
             return 128;
         }();
+        // Experts read explicitly (pread into the staging tensor) stream several
+        // times faster than faulted-in mappings, so streaming pays off sooner:
+        // from just past the width a tiered layer still splits on the host.
+        if (std::getenv("TS_HOST_MOE_DEVICE_MIN_BATCH") == nullptr && host_expert_io_active())
+            return std::min(s_threshold, kHostMoeHotTierMaxRows + 1);
         return s_threshold;
     }
 
@@ -705,6 +710,29 @@ namespace
                 if (offset + len > total_bytes)
                     len = total_bytes - offset;
                 s_ranges.emplace_back(offset, len);
+            }
+        }
+
+        // Unified memory: when the staging tensor is CPU-visible accelerator memory
+        // and the weight's mapping is registered for explicit reads, read the
+        // ranges straight into it on the I/O team (13-14 GB/s on an M5 Pro SSD,
+        // against ~3.5 GB/s for faulting the mapping in and copying it).
+        static const bool s_direct_read = []() {
+            const char* e = std::getenv("TS_HOST_MOE_STREAM_PREAD");
+            return !(e != nullptr && e[0] == '0');
+        }();
+        if (s_direct_read && !pinned && tensor->data != nullptr && tensor->buffer != nullptr)
+        {
+            const char* name = ggml_backend_buft_name(ggml_backend_buffer_get_type(tensor->buffer));
+            const bool cpu_visible = ggml_backend_buffer_is_host(tensor->buffer)
+                || (name != nullptr && std::strncmp(name, "MTL", 3) == 0 && std::strstr(name, "_Private") == nullptr
+                    && std::strstr(name, "_Mapped") == nullptr);
+            if (cpu_visible)
+            {
+                std::size_t total = 0;
+                for (const auto& r : s_ranges) total += r.second;
+                if (host_expert_io_read_ranges(host_data, s_ranges, static_cast<std::uint8_t*>(tensor->data)))
+                    return total;
             }
         }
 
@@ -2131,6 +2159,63 @@ namespace tsg
         // The caller synchronized the segment that produced these, so the reads
         // see its results.
         ggml_backend_tensor_get(hm.sel_ids, s_ids.data(), 0, route_count * sizeof(std::int32_t));
+        moe_routing_count(hm.gate_data, hm.num_experts, s_ids.data(), route_count);
+
+        if (hm.hot_tier != nullptr && hm.hot_slot != nullptr && hm.hot_weight != nullptr)
+        {
+            // Tiered layer: the accelerator computes the tier's routes from its
+            // compact copy in the next segment; only the rest run here.
+            ggml_backend_tensor_get(hm.moe_in, s_moe_in.data(), 0, act_count * sizeof(float));
+            ggml_backend_tensor_get(hm.weights, s_weights.data(), 0, route_count * sizeof(float));
+            static thread_local std::vector<std::int32_t> s_cold_ids;
+            static thread_local std::vector<float> s_cold_w;
+            static thread_local std::vector<std::uint8_t> s_cold_pad;
+            int cold_used = 0;
+            const bool split_ok = host_moe_split_hot_routes(hm, s_ids.data(), s_weights.data(), s_cold_ids, s_cold_w, s_cold_pad, cold_used);
+            if (!split_ok)
+            {
+                set_last_error(std::string(kernel_name) + ": routed expert id outside the tiered layer.");
+                return false;
+            }
+            if (cold_used == 0)
+            {
+                std::fill(out.begin(), out.end(), 0.0f);
+                return true;
+            }
+            HostMoeSegment cold = hm;
+            cold.n_used = cold_used;
+            cold.hot_tier = nullptr;
+            if (host_moe_decode_experts(cold, s_moe_in.data(), s_cold_ids.data(), s_cold_w.data(), out.data(),
+                    s_cold_pad.data()))
+                return true;
+            // Up to the tier's row limit: the decode kernel in blocks of its own
+            // row limit (each row keeps its solo reductions), reading through the
+            // host expert cache rather than faulting the mapping.
+            {
+                constexpr int kBlock = 8;
+                bool all = cold.seq_len > 1;
+                for (int r0 = 0; all && r0 < cold.seq_len; r0 += kBlock)
+                {
+                    HostMoeSegment block = cold;
+                    block.seq_len = std::min(kBlock, cold.seq_len - r0);
+                    const std::size_t a = static_cast<std::size_t>(r0) * cold.hidden;
+                    const std::size_t w = static_cast<std::size_t>(r0) * cold_used;
+                    all = host_moe_decode_experts_rows(block, s_moe_in.data() + a, s_cold_ids.data() + w,
+                        s_cold_w.data() + w, out.data() + a, s_cold_pad.data() + w);
+                }
+                if (all) return true;
+            }
+            const bool ok = moe_ffn_host_experts(
+                s_moe_in.data(), out.data(), cold.seq_len, cold.hidden, cold.n_ff,
+                cold.num_experts, cold.n_used, s_cold_ids.data(), s_cold_w.data(),
+                cold.gate_data, cold.gate_type, cold.gate_ne0, cold.gate_ne1, cold.gate_bytes,
+                cold.up_data,   cold.up_type,   cold.up_ne0,   cold.up_ne1,   cold.up_bytes,
+                cold.down_data, cold.down_type, cold.down_ne0, cold.down_ne1, cold.down_bytes,
+                cold.gate_bias, cold.up_bias, cold.down_bias,
+                cold.activation, cold.oai_alpha, cold.oai_limit, allow_device_stream);
+            if (ok) host_read_barrier();
+            return ok;
+        }
 
         // CUDA compact slots can keep activations and routing probabilities on
         // the device. The host only needs IDs for slot selection; retain staged
@@ -2275,8 +2360,14 @@ namespace tsg
             return e != nullptr && e[0] == '3';
         }();
         using pass_clock = std::chrono::steady_clock;
-        static thread_local double s_acc_gpu = 0, s_acc_host = 0, s_acc_up = 0, s_acc_total = 0;
-        static thread_local int s_acc_passes = 0, s_acc_seq = -1;
+        // One accumulator per width class (decode, verify-sized, prefill-sized):
+        // a speculative session alternates widths every step.
+        struct PassAcc { double gpu = 0, host = 0, up = 0, total = 0; int passes = 0, seq = -1; };
+        static thread_local PassAcc s_acc[3];
+        const int pass_seq = segments.empty() ? 0 : segments[0].seq_len;
+        PassAcc& acc = s_acc[pass_seq <= 1 ? 0 : pass_seq <= 8 ? 1 : 2];
+        double& s_acc_gpu = acc.gpu; double& s_acc_host = acc.host; double& s_acc_up = acc.up;
+        double& s_acc_total = acc.total; int& s_acc_passes = acc.passes; int& s_acc_seq = acc.seq;
         const auto t_pass = s_pass_timing ? pass_clock::now() : pass_clock::time_point{};
         auto ms_since = [](pass_clock::time_point t) {
             return std::chrono::duration<double, std::milli>(pass_clock::now() - t).count();
@@ -2286,6 +2377,10 @@ namespace tsg
         for (std::size_t seg = 0; seg < seg_end.size(); ++seg)
         {
             const int end = seg_end[seg];
+            // An overlap cut (HostMoeSegment::io_wait) with no background reads in
+            // flight is not a cut at all: run on to the next one in the same submit.
+            if (seg < segments.size() && segments[seg].io_wait && !host_expert_io_async_pending())
+                continue;
             if (end > begin)
             {
                 const auto t_gpu = s_pass_timing ? pass_clock::now() : pass_clock::time_point{};
@@ -2305,6 +2400,15 @@ namespace tsg
             // ggml_backend_graph_compute above already synchronized, so the
             // helper's reads see this segment's results.
             const HostMoeSegment& hm = segments[seg];
+            if (hm.io_wait)
+            {
+                // The accelerator has computed the routes its slots held; the misses
+                // read meanwhile must be whole before the next segment reads them.
+                const auto t_wait = s_pass_timing ? pass_clock::now() : pass_clock::time_point{};
+                host_expert_io_wait_async();
+                if (s_pass_timing) s_acc_host += ms_since(t_wait);
+                continue;
+            }
 
             // Prefill-sized batch: evaluate the layer on the accelerator with
             // its experts streamed in, reading and writing the whole-model

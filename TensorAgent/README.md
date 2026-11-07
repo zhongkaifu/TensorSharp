@@ -277,7 +277,7 @@ the roughly 8.5 GB a 12 GB iPhone grants. The PQ2_0 file (7.21 GB) holds the sam
 ternary weights and repacks to about the same size, so the entry downloads the
 smaller PTQ1_0 file. See the [Bonsai2 card](../docs/models/bonsai2.md).
 Qwen3.8 27B and Muse-Glimmer 30B are models a phone could run only at one or two bits,
-offered at four where the memory exists; Qwen-Image 2.1 makes and edits pictures, and
+offered at three and four bits where the memory exists; Qwen-Image 2.1 makes and edits pictures, and
 Qwen-Image 2.1 Turbo, the same model distilled to 8 steps, does it in about a fifth of the
 time, its transformer at four bits or, closer to full precision, eight (with the same 4-bit
 text encoder either way); and the single MiniMax-H3 entry carries both denoisers
@@ -301,7 +301,7 @@ See [The desktop's larger models](#the-desktops-larger-models) for the historica
 | Gemma 4 E4B (IQ4_XS) | text, image, audio, video | download: 4,715,416,704-byte main GGUF + 559,874,816-byte projector; 98,653,280-byte draft optional | 12 GB | `unsloth/gemma-4-E4B-it-GGUF` + `ggml-org/gemma-4-E4B-it-GGUF` (projector and draft) |
 | Bonsai 2 27B (PTQ1_0) | text; image with optional projector | download: 5,946,648,928-byte main GGUF; 629,246,976-byte projector optional | 16 GB | `prism-ml/Ternary-Bonsai-2-27B-gguf` |
 | Qwen3.5 9B (IQ4_XS) | text; image and video with optional projector | download: 5,168,653,536-byte main GGUF; 918,166,080-byte projector optional | 12 GB | `unsloth/Qwen3.5-9B-GGUF` |
-| Qwen3.8 27B (UD-Q4_K_XL) | text; image and video with optional projector | download: 17,559,178,144-byte main GGUF; 927,607,488-byte projector optional | 32 GB | `unsloth/Qwen3.8-27B-GGUF` |
+| Qwen3.8 27B (UD-IQ3_XXS) | text; image and video with optional projector | download: 10,934,860,704-byte main GGUF; 931,146,432-byte BF16 projector and 1,143,006,816-byte DFlash2 Q4_K_M drafter optional (the files of [`qwen3.8-27b-metal-dflash2.json`](../config/qwen3.8-27b-metal-dflash2.json)) | 32 GB | `unsloth/Qwen3.8-27B-GGUF` + `z-lab/Qwen3.8-27B-DFlash2-GGUF` |
 | Muse-Glimmer 30B (UD-Q4_K_XL) | text; image with optional projector | download: 15,878,222,368-byte main GGUF; 2,051,685,088-byte projector optional | 32 GB | `unsloth/Muse-Glimmer-30B-GGUF` |
 | Qwen3.8 Flash Next (UD-Q2_K_XL) | text; images/video with optional projector | download: three shards of 10,946,624, 49,979,779,296 and 28,878,402,944 bytes (78.9 GB); 907,542,944-byte projector and 2,786,568,256-byte shared MTP head optional | 48 GB | `unsloth/Qwen3.8-Flash-Next-GGUF` |
 | Qwen3.8 Flash Next (UD-IQ1_M) | text; images/video with optional projector | download: three shards of 10,946,624, 49,988,981,792 and 24,538,827,360 bytes (74.54 GB total); 907,542,944-byte projector and 2,786,568,256-byte shared MTP head optional | 32 GB, experimental | `unsloth/Qwen3.8-Flash-Next-GGUF` |
@@ -1382,6 +1382,17 @@ the same pins):
 | speculative decoding in the app | n-gram: prose 0.93x, quoting 1.76-1.90x | declined by the engine on Metal |
 | prompt reuse, follow-up / new chat | 99.7% / 99.6% | 99.8% / 66% |
 | app footprint at its highest, beside the weights | 8.8 GB beside 17.6 GB | 10.9 GB beside 15.9 GB |
+
+On 2026-11-05 the Qwen3.8 27B entry moved to the files of
+[`qwen3.8-27b-metal-dflash2.json`](../config/qwen3.8-27b-metal-dflash2.json): UD-IQ3_XXS
+(10.9 GB), the BF16 projector and the DFlash2 Q4_K_M drafter. The app runs that drafter with
+7 drafts per step and no confidence gate, the config's measured settings (the entry's
+`DraftTuning`, applied only while that drafter speculates). In the Debug Mac app on the same
+M5 Pro it passed the same seven `chat-e2e.py` scenarios, and every turn after the first
+reused 98.3-99.7% of its prompt. The first turn reused nothing because the warm-up ran with
+thinking on and the question had it off. The footprint peaked at 9.9 GB
+(`phys_footprint_peak`) beside 12.1 GB of weights and drafter, so the entry stays at 32 GB.
+The column above is the UD-Q4_K_XL entry it replaced.
 
 The 5-7% plain-decode gap to the CLI was not broken down further; the two differ in
 more than the runtime (the app samples with the card's temperature, top-k and top-p and

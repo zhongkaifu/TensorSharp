@@ -364,7 +364,6 @@
   "studio.keyframesTitle": "지정한 시점의 사진",
   "studio.guideNamed": "키프레임 {index}",
   "studio.referencePhotosTitle": "참조 사진",
-  "studio.referencesHelp2": "사진으로 등장할 인물이나 사물을 보여 주세요. 테이크가 이 사진에서 시작하거나 끝나지는 않습니다. 최대 {count}장까지 선택할 수 있습니다.",
   "studio.referenceRemoved": "{name}을(를) 제거했습니다. 순서: {list}",
   "studio.referenceAdded": "사진 {index}: {name}",
   "studio.referenceTileOn": "{name}, 사진 {index}",

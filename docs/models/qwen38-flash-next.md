@@ -522,6 +522,31 @@ three-GPU layer split (A40), `--spec-draft 3`:
   against 52 plain for 512-token prose, and 34-38 against 40 after an 8k
   prompt.
 
+On `ggml_metal` with the expert tiers above (48 GiB M5 Pro, UD-Q2_K_XL), the MTP head
+pays off on code and lists: a 4-row verify costs ~115 ms against ~50 ms for a plain step
+(~197 ms with the old placement, where the host computed a verify's ~3x larger set of
+experts), acceptance 81% (3.4 tokens per verify). On `ggml_metal` the rows are verified as
+one batched forward by default, as NInfer, llama.cpp and vLLM do: 95 ms a verify and 1.3x the
+speed of verifying each row with the one-token kernels on code. Greedy text then differs from
+plain decode and depends on the verify widths the governor chose; `TS_Q4E_VERIFY_ROW_KERNELS=1`
+restores the exact rows (speculative text bit-identical to plain greedy, as on CPU and CUDA,
+which keep them). A partial acceptance no longer restores the
+recurrent state and re-forwards the kept rows (~60 ms each): the verify span keeps every
+row's GDN conv/SSM state (upstream `ggml_gated_delta_net`'s per-row snapshots) and PLE conv
+history, and the accepted row is copied into the live state (NInfer's ReplaySSM idea;
+`TS_Q4E_VERIFY_ROW_COMMIT=0` restores the old rollback). With the exact verify rows the
+speculative text is still identical to plain greedy.
+
+A batched verify also overlaps its window reads with the GPU, as NInfer's streaming window
+does: up to two experts a row that miss the window are read in the background (a second I/O
+team) while the GPU computes the routes the slots already hold, and run after a second cut
+that only waits for those reads (skipped, with no extra submit, when a layer deferred none).
+The host share of a 4-row verify fell from ~17-19 ms to 3-5 ms and the GPU's rose by ~9 ms
+(the extra cut and the second group's products), so a verify went from ~97-99 to ~94 ms:
+MTP decode 31.2 / 26.5 / 32.5 -> 32.5 / 27.2 / 33.6 tok/s (code / prose / list, greedy text
+unchanged). One-token decode and the exact verify rows keep a single group.
+`TS_MOE_TIER_STATS=1` counts the background reads.
+
 ### Verify rows run the one-token kernels
 
 A verify and the replay of its accepted prefix push 2-8 tokens through one span
@@ -590,29 +615,48 @@ it and reads those parts from the SSD as tokens need them.
   llama.cpp's `--lazy-mode`, on by default there for tensors over 4 GiB. Every such load
   logs it:
   `PLE n-gram table: 28.8 GB read on demand from the GGUF mapping, 16 rows a token (random-access advice).`
-  The direct `cuda` engine reads the rows from the mapping too, and warms the table into
-  the page cache after loading.
-- **The first layers' routed experts run on the host, from the same mapping.**
-  `--n-cpu-moe N` / `--cpu-moe` choose them on the GGML GPU backends (measured on
-  `ggml_metal` and `ggml_cuda`). On `ggml_metal` with neither set, the engine plans the
-  split itself: it keeps whole layers' experts on the GPU while they fit both the Metal
-  working set and the RAM that the host layers need as page cache, and offloads the rest.
-  On an M5 Pro with 48 GB (51.5 GB of RAM, a 40.2 GB Metal working set):
+  The direct `cuda` engine reads the rows from the mapping too. Both it and the GGML
+  backends warm the table into the page cache in the background after loading, but only
+  where the host can keep it cached: Linux, where the room is `MemAvailable` capped by the
+  process's memory cgroup (a container's limit, not the host's). The larger-than-memory
+  Mac skips it, since reading the table there would only evict experts. On a network
+  filesystem the warm matters most: an uncached row on a geesefs mount took 92-120 ms.
+- **Every layer's routed experts are scheduled at a host seam, and the GPU computes them
+  from per-layer expert slots.** On `ggml_metal` with neither `--n-cpu-moe` nor `--cpu-moe`
+  set, the engine plans the placement itself (the same scheme as NInfer's Flash Next expert
+  cache, on unified memory):
+  - *Fixed slots* hold each layer's most-routed experts for the whole load. They are chosen
+    from a **routing profile**: every host seam counts the expert ids it routes, and the
+    counts are merged into a per-model file (`~/.cache/tensorsharp/moe-routing/`,
+    `TENSORSHARP_MOE_PROFILE_DIR` / `TENSORSHARP_MOE_PROFILE`) when the model is disposed.
+    The budget is spent across layers where it covers the most routes per byte; by default
+    it is the 14.4 GB the old plan wired as whole layers (`TS_MOE_HOT_TIER_GB`).
+  - *Window slots* (7/8 of the explicit-I/O budget, `TS_HOST_MOE_IO_CACHE_GB`) are filled on
+    demand: a routed expert without a slot is read with `pread` straight into the least
+    recently used slot (Metal shared memory, the file opened with `F_NOCACHE`). On the M5 Pro
+    SSD that runs at 13-14 GB/s with 8-16 reads in flight, against 1-3.5 GB/s for page faults.
+  - The host only remaps ids and reads misses; the GPU computes all ten routes in the same
+    graph with the all-GPU span's own kernels. A route left without a slot (a step wider
+    than the window) runs on the host decode kernel as before.
 
   ```
-  [moe-offload] qwen4exp (planned): routed experts of 33 of 48 layers run on the host from the GGUF mapping (31.7 GB read on demand); the accelerator holds 15 layers' (14.4 GB). Metal working set 40.2 GB, RAM 51.5 GB; --n-cpu-moe N overrides.
+  [moe-offload] qwen4exp (tiered): all 48 layers' routed experts run at a host seam; 48 layers keep their most-routed experts on the accelerator (7659 experts, 14.4 GB of a 14.4 GB budget) covering 67.6% of profiled routes, plus 7466 window slots (14.0 GB) filled on demand.
   ```
 
-  Past a point, wiring more layers does not make it faster: a wired layer holds all 512
-  experts, used or not, and takes page cache from the layers that read theirs from the SSD.
-- **Decode** runs each host layer's ten experts on TensorSharp's own kernel: ggml's CPU
-  dot products on a thread team that is woken once per layer and parked when the layer is
-  done. A spinning team slowed the GPU's work between layers 1.5-2x on Apple silicon, so
-  the team sleeps. `TS_HOST_MOE_DECODE=0` restores the ggml graph path.
-- **Prefill** of 128 tokens or more (`TS_HOST_MOE_DEVICE_MIN_BATCH`) streams each host
-  layer's used experts to the GPU per chunk. Their pages are faulted in on 16 threads
-  first: on the M5 Pro that took a 1,818-token prefill from 37.2-38.0 s to 15.7-16.6 s and
-  left decode unchanged.
+  With no profile covering the model yet, every slot of that load is a window slot (least
+  recently used, no fixed set) while the seams record the profile: measured 18.4 / 19.4 /
+  20.4 tok/s, within 3-5% of a profiled load; the fixed slots come with the next load.
+  `TS_MOE_HOT_TIER=0` restores the old plan, which wires whole trailing layers. That plan
+  wastes RAM: a wired layer holds all 512 experts, used or not, and takes page cache from
+  the layers that read theirs from the SSD.
+- **Decode** of a step whose experts all have slots never computes on the host. Overflow
+  routes run on TensorSharp's host decode kernel (ggml's CPU dot products on a thread team
+  that is woken once per layer and parked when the layer is done; a spinning team slowed
+  the GPU's work between layers 1.5-2x on Apple silicon). `TS_HOST_MOE_DECODE=0` restores
+  the ggml graph path for those.
+- **Prefill** wider than 64 tokens streams each layer's used experts to the GPU per chunk,
+  read with `pread` straight into the CPU-visible staging memory (`TS_HOST_MOE_STREAM_PREAD=0`
+  faults the mapping in and copies instead). Up to 64 tokens a chunk uses the slots.
 - **`--backend mlx` is refused up front**: MLX has no kernels for the sparse-attention
   indexer, the hyper-connections, the n-gram table or the IQ2_XS/IQ3_XXS experts. Use
   `ggml_metal`.
@@ -651,10 +695,46 @@ cache, so it depends on what else the Mac is doing: the same run decoded at
 10.3-11.3 tok/s while other work kept 5 GB compressed. TensorAgent offers this file on
 48 GB Macs ([measured in the app](../../TensorAgent/README.md#the-macs-own-models)).
 
+### Expert tiers, 2026-11-06
+
+Same Mac and file, ggml `57e2c2ca` (unmodified), real text: four requests in one CLI
+process (`--input-jsonl`, a warm-up, then a ~50-token code prompt, a ~1,300-token prose
+prompt and a ~30-token list prompt, 256 greedy tokens each). Medians of three interleaved
+repetitions in one session; the profile came from a separate 12-prompt calibration run.
+
+| | decode tok/s, code / prose / list | TTFT s, code / prose / list |
+| --- | --- | --- |
+| Before (whole layers wired) | 13.80 / 13.87 / 15.59 | 3.14 / 13.58 / 2.78 |
+| Expert tiers + explicit reads | 19.16 / 19.88 / 20.70 | 0.78 / 6.39 / 0.53 |
+| Before, MTP head | 14.67 / 11.98 / 16.66 | 5.31 / 13.61 / 3.27 |
+| Expert tiers, MTP head, exact verify rows (`TS_Q4E_VERIFY_ROW_KERNELS=1`) | 23.47 / 19.01 / 24.60 | 0.77 / 7.39 / 0.57 |
+| Expert tiers, MTP head (batched verify, the default) | 30.87 / 21.31 / 28.31 | 0.75 / 7.03 / 0.56 |
+| `config/qwen3.8-flash-next.json` (the line above, with its sampling settings) | 27.00 / 20.62 / 32.72 | 0.80 / 7.96 / 0.53 |
+
+The tiered plan computes the experts with the GPU's F32 activations where the old plan's 33
+host layers quantized them to Q8_K, so greedy text can differ from before (here the prose
+answer, from character 655); with every route in a slot a tiered layer is bit-identical to
+the all-GPU span (`TieredExperts_AnswerAsTheAccelerator_Metal`). Teacher-forced perplexity
+over the same text: see the 2026-11-06 report.
+
 Single-device `ggml_cuda` also plans expert placement against current free VRAM,
 pending float weights and caches, driver headroom and a 3 GiB graph reserve.
 Explicit `--n-cpu-moe` / `--cpu-moe` settings override this plan. Tensor parallel
 and layer-split runs still require their explicit placement configuration.
+
+With a routing profile that covers every layer, that plan uses the same fixed slots as
+`ggml_metal` instead of whole layers: every layer keeps its most-routed experts in VRAM
+(the bytes the layer plan would have given whole layers) and the rest of each step's routes
+run on the host decode kernel; discrete VRAM has no host-writable window. A load without
+such a profile keeps the layer plan, and its resident layers' graphs also record their
+routing, so the profile it saves covers every layer and a later load is tiered. On an RTX
+5090 (32 GB, UD-Q2_K_XL, 12,245 experts / 23.0 GB in slots covering 85% of the profiled
+routes, everything in RAM) plain decode measured 51.3 / 50.4 / 45.8 tok/s against
+44.5 / 44.8 / 44.9 for the layer plan (code / prose / list), teacher-forced perplexity
+16.12 against 16.22 over 1,024 tokens. The MTP head did not pay off there: CUDA verifies
+each row with the one-token kernels (~75 ms a 4-row verify) and still re-forwards a partial
+acceptance, and its 2.8 GB cut the slots to 20.1 GB, so code and prose decoded at 42.2 and
+34.2 tok/s with it. `TS_MOE_HOT_TIER=0` keeps the layer plan.
 
 An optional CUDA selected-expert cache follows Strata's compact quantized-slot
 approach. It keeps only routed experts in persistent device buffers, preserves

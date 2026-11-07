@@ -3456,6 +3456,81 @@ namespace TensorSharp.GGML
         public static void Qwen4ExpMtpFree(IntPtr handle) => GgmlNative.TSGgml_Qwen4ExpMtpFree(handle);
         public static bool Qwen4ExpMtpCopyKv(IntPtr handle, IntPtr k, IntPtr v, long bytes)
             => GgmlNative.TSGgml_Qwen4ExpMtpCopyKv(handle, k, v, bytes) != 0;
+
+        /// <summary>While set, a 2-8 row qwen4exp span keeps every row's recurrent state.</summary>
+        public static void Qwen4ExpCaptureVerifyRows(bool enable) => GgmlNative.TSGgml_Qwen4ExpCaptureVerifyRows(enable ? 1 : 0);
+
+        /// <summary>Commit the state after <paramref name="row"/> of the last captured
+        /// <paramref name="rows"/>-row verify into the live state buffers.</summary>
+        public static bool Qwen4ExpCommitVerifyRow(int row, int rows) => GgmlNative.TSGgml_Qwen4ExpCommitVerifyRow(row, rows) != 0;
+
+        /// <summary>Copy <paramref name="experts"/> of one host-offloaded MoE layer (its
+        /// mapped gate/up/down stacks) into a compact accelerator tier; the layer's
+        /// graphs then run those routes on the accelerator and the rest on the host.
+        /// Register before the first graph that uses the layer is built.</summary>
+        public static unsafe bool MoeHotTierRegister(IntPtr gate, IntPtr up, IntPtr down,
+            int gateType, int upType, int downType, long gateBytes, long upBytes, long downBytes,
+            int numExperts, ReadOnlySpan<int> experts, int windowSlots, bool releaseSourcePages)
+        {
+            fixed (int* p = experts)
+                return GgmlNative.TSGgml_MoeHotTierRegister(gate, up, down, gateType, upType, downType,
+                    gateBytes, upBytes, downBytes, numExperts, p, experts.Length, windowSlots,
+                    releaseSourcePages ? 1 : 0) != 0;
+        }
+
+        /// <summary>(slot hits, window misses read from disk, routes left to the host) over
+        /// every accelerator expert tier.</summary>
+        /// <summary>Summed over every tier: slot hits, window reads, steps with routes
+        /// left for the host, and window reads done in the background (verify overlap).</summary>
+        public static unsafe (long Hits, long Misses, long Overflow, long Deferred) MoeHotTierStats()
+        {
+            long* s = stackalloc long[4];
+            GgmlNative.TSGgml_MoeHotTierStats(s);
+            return (s[0], s[1], s[2], s[3]);
+        }
+
+        public static long MoeHotTierTotalBytes() => GgmlNative.TSGgml_MoeHotTierTotalBytes();
+
+        /// <summary>Free the accelerator tier of the layer mapped at <paramref name="gate"/>
+        /// (<see cref="IntPtr.Zero"/>: all). Drop the graphs that bind it first.</summary>
+        public static void MoeHotTierRelease(IntPtr gate) => GgmlNative.TSGgml_MoeHotTierRelease(gate);
+
+        /// <summary>Routed-id counts the host seams saw for the layer whose gate stack is
+        /// mapped at <paramref name="gate"/>; null when it never reached a seam.</summary>
+        public static unsafe ulong[] MoeRoutingCounts(IntPtr gate)
+        {
+            int n = GgmlNative.TSGgml_MoeRoutingCounts(gate, null, 0);
+            if (n <= 0) return null;
+            var counts = new ulong[n];
+            fixed (ulong* p = counts)
+                n = GgmlNative.TSGgml_MoeRoutingCounts(gate, p, counts.Length);
+            return n == counts.Length ? counts : null;
+        }
+
+        public static void MoeRoutingReset(IntPtr gate) => GgmlNative.TSGgml_MoeRoutingReset(gate);
+
+        /// <summary>Count the router ids of accelerator-resident MoE layers too (they have no
+        /// host seam). Process-wide; the counters stay keyed by each layer's mapped gate stack.</summary>
+        public static void MoeRoutingRecordDevice(bool on) => GgmlNative.TSGgml_MoeRoutingRecordDevice(on ? 1 : 0);
+
+        /// <summary>Serve host-offloaded experts mapped inside [<paramref name="baseAddress"/>,
+        /// +<paramref name="length"/>) - a read-only mapping of <paramref name="path"/> from
+        /// offset 0 - from the explicitly read host expert cache.</summary>
+        public static bool HostExpertIoRegister(IntPtr baseAddress, long length, string path)
+            => GgmlNative.TSGgml_HostExpertIoRegister(baseAddress, length, path) != 0;
+
+        /// <summary>Byte budget of the host expert cache; 0 turns it off.</summary>
+        public static void HostExpertIoSetBudget(long bytes) => GgmlNative.TSGgml_HostExpertIoSetBudget(bytes);
+
+        public static void HostExpertIoUnregister(IntPtr baseAddress) => GgmlNative.TSGgml_HostExpertIoUnregister(baseAddress);
+
+        /// <summary>(hits, misses, bytes read, bytes held) of the host expert cache.</summary>
+        public static unsafe (long Hits, long Misses, long ReadBytes, long HeldBytes) HostExpertIoStats()
+        {
+            long* s = stackalloc long[4];
+            GgmlNative.TSGgml_HostExpertIoStats(s);
+            return (s[0], s[1], s[2], s[3]);
+        }
         public static bool Qwen4ExpStateSnapshotRestore(IntPtr handle)
             => GgmlNative.TSGgml_Qwen4ExpStateSnapshotRestore(handle) != 0;
         public static void Qwen4ExpStateSnapshotFree(IntPtr handle)

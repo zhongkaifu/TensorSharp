@@ -104,6 +104,11 @@ namespace
     thread_local bool g_q4e_prefill_combine = false;
     // Populated only while building a tensor-sliced FFN span.
     thread_local std::vector<ggml_tensor*>* g_q4e_tp_partials = nullptr;
+    // Device-layer routing for the routing profile (tsg::moe_record_device_routes):
+    // set while a span is built with recording on; each accelerator-resident MoE
+    // layer adds its router ids as a graph output, counted after the span runs.
+    struct Q4eRouteRecord { const void* gate; ggml_tensor* ids; int n_expert; };
+    thread_local std::vector<Q4eRouteRecord>* g_q4e_route_record = nullptr;
     thread_local int g_q4e_tp_degree = 1, g_q4e_tp_rank = 0;
     thread_local std::deque<tsg_dsv4_fused_desc>* g_q4e_tp_matmuls = nullptr;
 
@@ -255,6 +260,15 @@ namespace
     // topology 48 times a token. Holding the graph makes a decode step an upload of
     // the residual, a replay and a download - and keeps the topology byte-identical
     // token to token, which is what lets ggml-cuda's graph capture engage.
+    // One recurrent state a verify span captured per row (see q4e_capture_rows).
+    struct Q4eRowCapture
+    {
+        const void* key = nullptr;        // the live state's seq-state key
+        bool ple = false;
+        int T = 0, hist = 0, width = 0;   // GDN: conv_dim; PLE: hc_dim
+        std::size_t ssm_off = 0, ssm_bytes = 0, snaps_off = 0;
+    };
+
     struct Qwen4ExpFfnCache
     {
         bool valid = false;
@@ -315,12 +329,18 @@ namespace
         std::array<int, TSG_PRECISION_DECODE_COLUMNS> row_kv{};
         int row_kv_count = 0;
         bool row_scope = false;
+        bool capture_rows = false;
+        std::vector<Q4eRowCapture> capture_desc;
         // Span only, MoE CPU offload: one host seam per offloaded layer, the node
         // index each accelerator segment ends at, and the offloaded layers (part
         // of the replay key, so a changed placement rebuilds rather than replays).
         std::vector<tsg::HostMoeSegment> host_moe;
         std::vector<int> host_moe_seg_end;
         std::vector<int> host_moe_layers;
+        // Span only: the accelerator-resident MoE layers' router ids, when the
+        // graph was built recording them (part of the replay key).
+        std::vector<Q4eRouteRecord> route_record;
+        bool route_recording = false;
 
         // Drop the graph but KEEP the recurrent state: a shape change does this.
         void reset_graph()
@@ -333,6 +353,7 @@ namespace
             if (ctx) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; res_in = nullptr; res_out = nullptr;
             conv_in = conv_out = ssm_in = ssm_out = nullptr;
+            route_record.clear(); route_recording = false;
             valid = false; n_tokens = 0; hc_dim = 0; sig = nullptr;
             sig2 = nullptr; sig3 = nullptr; sig4 = nullptr; sig5 = nullptr;
             logits = nullptr; logits_rows = 1; export_hidden = false; ple_emb_in = nullptr;
@@ -475,7 +496,18 @@ namespace
     bool q4e_row_kernels_enabled()
     {
         if (ggml_backend_is_cpu(g_backend)) return true;
-        if (g_backend_type == BACKEND_TYPE_METAL) return true;
+        if (g_backend_type == BACKEND_TYPE_METAL)
+        {
+            // Metal verifies the k+1 rows as one batched forward (weights read
+            // once for every row), as NInfer, llama.cpp and vLLM do: 1.3x the
+            // speculative decode of one-token kernels per row on Flash Next.
+            // Verify rows then do not round like their decode steps, so
+            // speculative text is not bit-identical to plain greedy;
+            // TS_Q4E_VERIFY_ROW_KERNELS=1 restores the exact rows. Read per
+            // graph build (part of the cached span's key, row_scope).
+            const char* e = std::getenv("TS_Q4E_VERIFY_ROW_KERNELS");
+            return e != nullptr && e[0] == '1';
+        }
 #ifdef TSG_GGML_USE_CUDA
         if (!ggml_backend_is_cuda(g_backend)) return false;
 #ifdef TSG_GGML_TEST_HOOKS
@@ -897,6 +929,77 @@ static ggml_tensor* q4e_tp_projection(ggml_context* ctx, ggml_tensor* weight, gg
     return ids ? q4e_mul_mat_id(ctx, weight, input, ids) : q4e_mul_mat(ctx, weight, input);
 }
 
+// ---- verify row capture (ReplaySSM-style commit) ---------------------------
+namespace
+{
+    std::atomic<bool> g_q4e_capture_enabled{false};
+    struct Q4eRowBuffer { ggml_backend_buffer_t buf = nullptr; std::size_t bytes = 0; };
+    std::unordered_map<const void*, Q4eRowBuffer> g_q4e_row_buffers;
+    std::vector<Q4eRowCapture> g_q4e_capture_last;   // what the last span captured
+}
+thread_local ggml_tensor* g_q4e_ple_padded = nullptr;
+
+bool q4e_capture_rows(int T)
+{
+    return T >= 2 && T <= 8 && g_q4e_capture_enabled.load(std::memory_order_relaxed);
+}
+
+static Q4eRowBuffer* q4e_row_buffer(const void* key, std::size_t bytes)
+{
+    auto& rb = g_q4e_row_buffers[key];
+    if (rb.buf != nullptr && rb.bytes >= bytes) return &rb;
+    if (rb.buf != nullptr) ggml_backend_buffer_free(rb.buf);
+    rb.buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(g_backend), bytes);
+    rb.bytes = rb.buf != nullptr ? bytes : 0;
+    return rb.buf != nullptr ? &rb : nullptr;
+}
+
+static bool q4e_host_visible(ggml_backend_buffer_t b)
+{
+    if (b == nullptr) return false;
+    if (ggml_backend_buffer_is_host(b)) return true;
+    const char* name = ggml_backend_buft_name(ggml_backend_buffer_get_type(b));
+    return name != nullptr && std::strncmp(name, "MTL", 3) == 0 && std::strstr(name, "_Private") == nullptr
+        && std::strstr(name, "_Mapped") == nullptr;
+}
+
+static void q4e_free_row_buffers()
+{
+    for (auto& kv : g_q4e_row_buffers) if (kv.second.buf) ggml_backend_buffer_free(kv.second.buf);
+    g_q4e_row_buffers.clear();
+    g_q4e_capture_last.clear();
+}
+
+// Hand a span's recorded router ids (see g_q4e_route_record) to the routing counters.
+static void q4e_count_recorded_routes(const std::vector<Q4eRouteRecord>& records)
+{
+    static thread_local std::vector<std::int32_t> ids;
+    for (const Q4eRouteRecord& r : records)
+    {
+        const std::size_t n = static_cast<std::size_t>(ggml_nelements(r.ids));
+        ids.resize(n);
+        ggml_backend_tensor_get(r.ids, ids.data(), 0, n * sizeof(std::int32_t));
+        tsg::moe_routing_count(r.gate, r.n_expert, ids.data(), n);
+    }
+}
+
+// Copy `src` (contiguous F32) into the row buffer of `key` at `offset`.
+static ggml_tensor* q4e_capture_copy(ggml_context* ctx, Q4eRowBuffer* rb, std::size_t offset, ggml_tensor* src)
+{
+    ggml_tensor* dst = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(src));
+    if (ggml_backend_tensor_alloc(rb->buf, dst,
+            static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(rb->buf)) + offset) != GGML_STATUS_SUCCESS)
+        throw std::runtime_error("qwen4exp verify capture: row buffer bind failed");
+    return ggml_cpy(ctx, src, dst);
+}
+
+// Window misses a verify-width row may read in the background while the
+// accelerator computes the routes its slots hold. Measured on Flash Next
+// UD-Q2_K_XL (M5 Pro, MTP 3, batched verify): 0 / 1 / 2 / 3 -> code 31.2 /
+// 32.3 / 32.7 / 32.3 tok/s; each extra route costs a second-group product in
+// every row, deferred or not.
+constexpr int kQ4eOverlapRoutes = 2;
+
 ggml_tensor* q4e_nodes_ffn(
     ggml_context* ctx, Q4eBinder& bnd,
     const TSGgmlQwen4ExpFfnArgs* a, ggml_tensor* res_in,
@@ -1051,12 +1154,43 @@ ggml_tensor* q4e_nodes_ffn(
             bnd.add(w_down_e, a->down_exps, (std::size_t)a->down_exps_bytes);
         }
 
+        // Priority-ranked accelerator tier: the routes its compact copy holds run
+        // here, in the next segment; the host computes the rest into moe_out.
+        ggml_tensor* hot_sum = nullptr;
+        tsg::HostMoeSegment overlap_wait;
+        // Decode and verify widths only: a prefill-sized batch streams the whole
+        // layer to the accelerator (every expert it routes), tier members included.
+        if (hm.verify_gpu == nullptr && T <= tsg::kHostMoeHotTierMaxRows)
+            if (tsg::MoeHotTier* tier = tsg::moe_hot_tier_find(a->gate_exps))
+                // A tier needs one distinct slot per route of a row (see the split).
+                if (tier->num_experts == n_expert && tier->count >= n_expert_used
+                    && tier->type[0] == a->gate_exps_type
+                    && tier->type[1] == a->up_exps_type && tier->type[2] == a->down_exps_type)
+                {
+                    // A batched verify-width span overlaps its window reads with the
+                    // routes the slots already hold (see host_moe_build_hot_part). Not
+                    // decode (one row, little to overlap) and not the exact row kernels,
+                    // whose per-row reduction order it would change.
+                    const int overlap = (T >= 2 && T <= TSG_PRECISION_DECODE_COLUMNS && g_q4e_row_kernels.rows == 0)
+                        ? kQ4eOverlapRoutes : 0;
+                    hot_sum = tsg::host_moe_build_hot_part(ctx, hm, hm.moe_in, *tier, q4e_mul_mat_id,
+                        overlap, graph, &overlap_wait);
+                }
+
         host_moe->push_back(hm);
-        moe_out = hm.moe_out;
+        if (overlap_wait.io_wait) host_moe->push_back(overlap_wait);
+        moe_out = hot_sum != nullptr ? ggml_add(ctx, hm.moe_out, hot_sum) : hm.moe_out;
     }
     else
     {
         ggml_tensor* moe_in = ggml_reshape_3d(ctx, mixed, n_embd, 1, T);
+        if (g_q4e_route_record != nullptr && graph != nullptr && g_q4e_tp_partials == nullptr)
+        {
+            ggml_tensor* ids = ggml_cont(ctx, sel);                                 // [n_used, T] i32
+            ggml_set_output(ids);
+            ggml_build_forward_expand(graph, ids);
+            g_q4e_route_record->push_back({a->gate_exps, ids, n_expert});
+        }
         ggml_tensor* e_up = q4e_tp_projection(ctx, w_up_e, moe_in, sel, full_ff, n_ff, rank * n_ff);
         ggml_tensor* e_gate = q4e_tp_projection(ctx, w_gate_e, moe_in, sel, full_ff, n_ff, rank * n_ff);
         ggml_set_name(e_up, "q4e.ffn.expert_up");
@@ -1277,7 +1411,8 @@ ggml_tensor* q4e_nodes_gdn(
             1, n_v_heads, T, 1);
     ggml_tensor* s4 = ggml_reshape_4d(ctx, ssm_state, head_v_dim, head_v_dim, n_v_heads, 1);
 
-    ggml_tensor* gdn_out = ggml_gated_delta_net(ctx, q, k, v, g4, b4, s4, 1);
+    const bool capture = q4e_capture_rows(T);
+    ggml_tensor* gdn_out = ggml_gated_delta_net(ctx, q, k, v, g4, b4, s4, capture ? T : 1);
 
     const int64_t attn_elems = (int64_t)head_v_dim * n_v_heads * T;
     ggml_tensor* core = ggml_view_3d(ctx, gdn_out, head_v_dim, n_v_heads, T,
@@ -1324,6 +1459,14 @@ ggml_tensor* q4e_nodes_gdn(
 
     wb->tail = tail;
     wb->new_state = new_state;
+    if (capture)
+    {
+        // Snapshot slot s (s = 0 most recent) follows the token outputs; all T
+        // are contiguous, so one copy keeps every row's state.
+        const int64_t state_elems = (int64_t)head_v_dim * head_v_dim * n_v_heads;
+        wb->snaps = ggml_view_1d(ctx, gdn_out, state_elems * T, ggml_row_size(gdn_out->type, attn_elems));
+        wb->conv_in = conv_in;
+    }
     return res_out;
 }
 
@@ -1649,6 +1792,7 @@ ggml_tensor* q4e_nodes_ple(
         if (conv_hist != nullptr)
             tail = ggml_view_2d(ctx, padded, hc_dim2, hist,
                     padded->nb[1], (std::size_t)TT * padded->nb[1]);
+        if (conv_hist != nullptr && q4e_capture_rows(T)) g_q4e_ple_padded = padded;
     }
     else
     {
@@ -2390,6 +2534,7 @@ static int q4e_token_span_impl(
             && slot->valid && slot->tp_plan.valid() == tp_mode
             && slot->tp_degree == g_q4e_tp_degree && slot->tp_rank == g_q4e_tp_rank
             && slot->row_scope == row_scope && slot->row_kv_count == row_kv_count
+            && slot->capture_rows == q4e_capture_rows(T)
             && std::equal(row_kv.begin(), row_kv.begin() + row_kv_count, slot->row_kv.begin())
             && q4e_refresh_bindings(slot, ggml_backend_get_device(g_backend))
             && slot->n_tokens == T && slot->hc_dim == hc_dim
@@ -2403,7 +2548,8 @@ static int q4e_token_span_impl(
             && slot->export_hidden == (hidden_out != nullptr)
             && slot->sig5 == (const void*)(has_ple ? ple : nullptr)
             && slot->use_mrope == (use_mrope ? 1 : 0)
-            && slot->host_moe_layers == cpu_moe_layers)
+            && slot->host_moe_layers == cpu_moe_layers
+            && slot->route_recording == (tsg::moe_record_device_routes() && !tp_mode))
         {
             ggml_backend_tensor_set(slot->res_in, res_data, 0, res_bytes);
             if (slot->ple_emb_in != nullptr)
@@ -2429,6 +2575,7 @@ static int q4e_token_span_impl(
                 return 1;
             }
             ggml_backend_t span_backend = slot->precise_backend ? slot->precise_backend : g_backend;
+            g_q4e_capture_last = slot->capture_desc;
             const bool replayed = slot->host_moe.empty()
                 ? graph_compute_profiled(span_backend, slot->graph, kQwen4ExpSpanKernel) == GGML_STATUS_SUCCESS
                 : host_moe_execute_segments(slot->graph, slot->host_moe, slot->host_moe_seg_end,
@@ -2439,6 +2586,7 @@ static int q4e_token_span_impl(
                 set_last_error("qwen4exp token span: replay failed.");
                 return 0;
             }
+            q4e_count_recorded_routes(slot->route_record);
             if (slot->logits != nullptr)
             {
                 ggml_backend_tensor_get(slot->logits, logits_out, 0,
@@ -2554,10 +2702,19 @@ static int q4e_token_span_impl(
 
         std::vector<Qwen4ExpFfnCache*> seeded;              // unused since the seq-state map; kept for shape
         std::vector<Q4eSeqStateEntry*> seeded_states;
+        std::vector<Q4eRowCapture> capture_desc;
+        const bool capture = q4e_capture_rows(T);
         std::vector<ggml_tensor*> kv_tensors;
         std::vector<ggml_tensor*> trace_res;
         std::vector<ggml_tensor*> probe_nodes;
         std::vector<tsg::HostMoeSegment> host_moe;
+        std::vector<Q4eRouteRecord> route_record;
+        const bool route_recording = tsg::moe_record_device_routes() && !tp_mode;
+        struct RouteRecordScope
+        {
+            explicit RouteRecordScope(std::vector<Q4eRouteRecord>* r) { g_q4e_route_record = r; }
+            ~RouteRecordScope() { g_q4e_route_record = nullptr; }
+        } route_scope(route_recording ? &route_record : nullptr);
         int attn_seen = 0;
         ggml_tensor* res = res_in;
         bool failed = false;
@@ -2590,8 +2747,19 @@ static int q4e_token_span_impl(
                         seeded_states.push_back(ple_st);
                     }
                 }
+                g_q4e_ple_padded = nullptr;
                 res = q4e_nodes_ple(ctx, graph, binder, ple, res, ple_emb_in,
                         conv_state, n_embd, hc, T, 1, eps);
+                if (capture && hist > 0 && g_q4e_ple_padded != nullptr)
+                {
+                    const std::size_t bytes = ggml_nbytes(g_q4e_ple_padded);
+                    Q4eRowBuffer* rb = q4e_row_buffer(ple->conv_state, bytes);
+                    if (rb == nullptr) { failed = true; fail_what = "ple row buffer"; break; }
+                    ggml_build_forward_expand(graph, q4e_capture_copy(ctx, rb, 0, g_q4e_ple_padded));
+                    Q4eRowCapture c;
+                    c.key = ple->conv_state; c.ple = true; c.T = T; c.hist = hist; c.width = hc_dim;
+                    capture_desc.push_back(c);
+                }
             }
 
             if (kinds[il] != 0)
@@ -2630,6 +2798,19 @@ static int q4e_token_span_impl(
                 ggml_build_forward_expand(graph, res);
                 ggml_build_forward_expand(graph, ggml_cpy(ctx, wb.tail, conv_state));
                 ggml_build_forward_expand(graph, ggml_cpy(ctx, wb.new_state, ssm_state));
+                if (capture && wb.conv_in != nullptr && wb.snaps != nullptr)
+                {
+                    const std::size_t conv_in_bytes = ggml_nbytes(wb.conv_in);
+                    const std::size_t snaps_off = (conv_in_bytes + 255) & ~(std::size_t)255;
+                    Q4eRowBuffer* rb = q4e_row_buffer(gdn[il].conv_state, snaps_off + ggml_nbytes(wb.snaps));
+                    if (rb == nullptr) { failed = true; fail_what = "gdn row buffer"; break; }
+                    ggml_build_forward_expand(graph, q4e_capture_copy(ctx, rb, 0, wb.conv_in));
+                    ggml_build_forward_expand(graph, q4e_capture_copy(ctx, rb, snaps_off, wb.snaps));
+                    Q4eRowCapture c;
+                    c.key = gdn[il].conv_state; c.T = T; c.hist = d_conv - 1; c.width = (int)conv_dim;
+                    c.ssm_off = ssm_off; c.ssm_bytes = ssm_bytes; c.snaps_off = snaps_off;
+                    capture_desc.push_back(c);
+                }
             }
             else
             {
@@ -2785,6 +2966,7 @@ static int q4e_token_span_impl(
             set_last_error("qwen4exp token span: graph compute failed.");
             return 0;
         }
+        q4e_count_recorded_routes(route_record);
         if (q4e_phase_log() && T > 1)
         {
             tsg::sync_backend(g_backend);
@@ -2896,11 +3078,16 @@ static int q4e_token_span_impl(
         slot->tp_degree = g_q4e_tp_degree; slot->tp_rank = g_q4e_tp_rank;
         slot->kv_capacity = kv_capacity; slot->n_kv = n_kv_pad;
         slot->row_kv = row_kv; slot->row_kv_count = row_kv_count; slot->row_scope = row_scope;
+        slot->capture_rows = q4e_capture_rows(T);
+        slot->capture_desc = capture_desc;
+        g_q4e_capture_last = capture_desc;
         slot->use_mrope = use_mrope ? 1 : 0;
         slot->rebinds = std::move(binder.cached);
         slot->host_moe = std::move(host_moe);
         slot->host_moe_seg_end = std::move(host_moe_seg_end);
         slot->host_moe_layers = std::move(cpu_moe_layers);
+        slot->route_record = std::move(route_record);
+        slot->route_recording = route_recording;
         slot->valid = true;
         return 1;
     }
@@ -3159,6 +3346,7 @@ TSG_EXPORT void TSGgml_Qwen4ExpReleaseAllSeqState()
         g_q4e_seq_state.clear();
     }
     TSGgml_Qwen4ExpResetFfnCache();
+    q4e_free_row_buffers();
 }
 
 /// Free the sequence-state entries for a released sequence holder and drop
@@ -3365,4 +3553,61 @@ TSG_EXPORT void TSGgml_Qwen4ExpStateSnapshotFree(void* handle)
 {
     try { delete static_cast<Q4eStateSnapshot*>(handle); }
     catch (...) { set_last_error("qwen4exp state snapshot: release failed"); }
+}
+
+// ---- verify row commit (ReplaySSM-style) ------------------------------------
+// While enabled, a 2-8 row token span keeps every row's GDN conv/SSM state and
+// the PLE conv history (q4e_capture_rows). After the accept decision the
+// caller commits the state after `row` straight into the live buffers, so a
+// partial acceptance needs no restore and no re-forward of the kept rows.
+TSG_EXPORT void TSGgml_Qwen4ExpCaptureVerifyRows(int enable)
+{
+    g_q4e_capture_enabled.store(enable != 0, std::memory_order_relaxed);
+}
+
+TSG_EXPORT int TSGgml_Qwen4ExpCommitVerifyRow(int row, int rows)
+{
+    try
+    {
+        set_last_error("");
+        if (g_q4e_capture_last.empty() || row < 0 || row >= rows)
+        { set_last_error("qwen4exp verify commit: no captured rows for this verify"); return 0; }
+        struct Plan { const Q4eRowCapture* c; std::uint8_t* src; std::uint8_t* dst; Q4eSeqStateEntry* live; };
+        std::vector<Plan> plans;
+        plans.reserve(g_q4e_capture_last.size());
+        // Validate every entry before writing any: a partial commit would mix rows.
+        for (const auto& c : g_q4e_capture_last)
+        {
+            auto rb = g_q4e_row_buffers.find(c.key);
+            Q4eSeqStateEntry* live = q4e_seq_state_find(c.key);
+            if (c.T != rows || rb == g_q4e_row_buffers.end() || live == nullptr || !live->ready
+                || !q4e_host_visible(rb->second.buf) || !q4e_host_visible(live->buf))
+            { set_last_error("qwen4exp verify commit: captured rows unavailable"); return 0; }
+            plans.push_back({&c, static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(rb->second.buf)),
+                static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(live->buf)), live});
+        }
+        tsg::sync_backend(g_backend);
+        for (const auto& p : plans)
+        {
+            const Q4eRowCapture& c = *p.c;
+            if (c.ple)
+            {
+                // padded [width, hist + T]: the history after `row` is columns row+1 .. row+hist.
+                std::memcpy(p.dst, p.src + (std::size_t)(row + 1) * c.width * sizeof(float),
+                    (std::size_t)c.hist * c.width * sizeof(float));
+                continue;
+            }
+            // conv input [hist + T, width] (time innermost) -> live tail [hist, width].
+            const auto* in = reinterpret_cast<const float*>(p.src);
+            auto* out = reinterpret_cast<float*>(p.dst);
+            const int stride = c.hist + c.T;
+            for (int ch = 0; ch < c.width; ++ch)
+                std::memcpy(out + (std::size_t)ch * c.hist, in + (std::size_t)ch * stride + row + 1,
+                    (std::size_t)c.hist * sizeof(float));
+            // snapshot slot T-1-row is the state after `row` (slot 0 = after the last row).
+            std::memcpy(p.dst + c.ssm_off, p.src + c.snaps_off + (std::size_t)(c.T - 1 - row) * c.ssm_bytes, c.ssm_bytes);
+        }
+        return 1;
+    }
+    catch (const std::exception& e) { set_last_error(e.what()); return 0; }
 }

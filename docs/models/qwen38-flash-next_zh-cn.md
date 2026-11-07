@@ -292,6 +292,23 @@ prefill 的单独请求做投机（与其他序列共享的步，以及延续保
   带隐藏状态捕获的单行投机前向（约 24-26 ms，普通 decode 为 19 ms）：512 token 散文在 c1 下 decode 为
   44-46 tok/s，普通为 52；8k prompt 之后为 34-38，普通为 40。
 
+在 `ggml_metal` 上配合上面的专家层（48 GiB M5 Pro，UD-Q2_K_XL），MTP 头在代码与列表上有收益：4 行 verify
+约 115 ms，普通一步约 50 ms（旧放置下约 197 ms，因为主机要计算 verify 约 3 倍的专家集合），接受率 81%（每次
+verify 3.4 个 token）。在 `ggml_metal` 上这些行默认作为一次批量前向来验证（与 NInfer、llama.cpp、vLLM 相同）：
+每次 verify 95 ms，代码上比逐行用单 token kernel 验证快 1.3 倍。此时贪心文本会与普通 decode 不同，并取决于
+governor 选的 verify 宽度；`TS_Q4E_VERIFY_ROW_KERNELS=1` 恢复精确验证行（投机文本与普通贪心逐位一致，CPU 与
+CUDA 始终如此）。
+部分接受时不再恢复循环状态并重新前向保留的行（每次约 60 ms）：verify span 保留每一行的 GDN conv/SSM 状态
+（上游 `ggml_gated_delta_net` 的逐行快照）与 PLE conv 历史，直接把被接受的行复制进实时状态（NInfer 的 ReplaySSM
+思路；`TS_Q4E_VERIFY_ROW_COMMIT=0` 恢复旧的回滚）。使用精确验证行时，投机文本仍与普通贪心完全一致。
+
+批量 verify 还会让窗口读取与 GPU 计算重叠，与 NInfer 的流式窗口同一思路：每行最多两个未命中窗口的专家交给后台
+（第二个 I/O 线程组）读取，GPU 同时计算槽位里已有的路由，读到的专家在第二个切点之后计算；这个切点只等待后台读取，
+某层没有延迟读取时直接跳过，不额外提交。4 行 verify 的主机时间从约 17–19 ms 降到 3–5 ms，GPU 时间增加约 9 ms
+（多出的切点和第二组的乘积），单次 verify 从约 97–99 ms 降到约 94 ms：MTP decode 31.2 / 26.5 / 32.5 →
+32.5 / 27.2 / 33.6 tok/s（代码 / 文章 / 列表，贪心文本不变）。单 token decode 与精确验证行仍只用一组。
+`TS_MOE_TIER_STATS=1` 会统计后台读取次数。
+
 ### 验证行使用单 token kernel
 
 一次 verify 以及对其接受前缀的重放，都会把 2–8 个 token 放进同一张 span 计算图（同样长度的 prefill 也是如此），
@@ -338,25 +355,35 @@ UD-Q2_K_XL 文件共 78.9 GB，分三个分片：28.8 GB 的 n-gram（PLE）表�
   （`madvise(MADV_RANDOM)`），每个 token 的 16 行（每行 90 字节）按需并行收集。这正是 llama.cpp
   `--lazy-mode` 背后的思路，llama.cpp 对超过 4 GiB 的张量默认开启它。这类加载每次都会打印：
   `PLE n-gram table: 28.8 GB read on demand from the GGUF mapping, 16 rows a token (random-access advice).`
-  直连 `cuda` 引擎同样从映射中读取这些行，并在加载后把整张表预热进页缓存。
-- **最前面若干层的路由专家在主机上运行，同样直接读这份映射。** 在 GGML 的 GPU 后端上由
-  `--n-cpu-moe N` / `--cpu-moe` 选择这些层（在 `ggml_metal` 与 `ggml_cuda` 上实测）。在 `ggml_metal`
-  上两者都未设置时，引擎自行规划切分：在既放得进 Metal 工作集、又给主机层留够页缓存所需内存的前提下，
-  尽量把整层专家留在 GPU 上，其余卸载到主机。在 48 GB 的 M5 Pro 上（51.5 GB 内存、40.2 GB 的 Metal
-  工作集）：
+  直连 `cuda` 引擎同样从映射中读取这些行。它和 GGML 后端都会在加载后于后台把整张表预热进页缓存，
+  但仅限主机能留住它的情况：Linux 上，可用空间取 `MemAvailable` 与进程内存 cgroup 余量中的较小者
+  （容器的限额，而不是宿主机的）。大于内存的 Mac 会跳过预热，因为在那里读这张表只会挤掉专家。
+  网络文件系统上预热最有用：geesefs 挂载上一行未缓存的读取需要 92–120 ms。
+- **每层的路由专家都在主机接缝处调度，由 GPU 从每层的专家槽位计算。** 在 `ggml_metal` 上
+  `--n-cpu-moe` 与 `--cpu-moe` 都未设置时，引擎自行规划放置（与 NInfer 的 Flash Next 专家缓存同一思路，
+  落到统一内存上）：
+  - *固定槽位* 在整次加载期间保存每层被路由最多的专家，依据 **路由画像** 选出：每个主机接缝统计它路由到的
+    专家 id，模型释放时把计数合并进每个模型一个的文件（`~/.cache/tensorsharp/moe-routing/`，
+    `TENSORSHARP_MOE_PROFILE_DIR` / `TENSORSHARP_MOE_PROFILE`）。预算按"每字节覆盖最多路由"在各层之间分配，
+    默认等于旧方案按整层常驻的 14.4 GB（`TS_MOE_HOT_TIER_GB`）。
+  - *窗口槽位*（显式 I/O 预算 `TS_HOST_MOE_IO_CACHE_GB` 的 7/8）按需填充：没有槽位的专家被路由到时，用 `pread`
+    直接读进最久未用的槽位（Metal 共享内存，文件以 `F_NOCACHE` 打开）。在 M5 Pro 的 SSD 上，8-16 路并发读取
+    可达 13-14 GB/s，而缺页只有 1-3.5 GB/s。
+  - 主机只做 id 重映射和读取未命中的专家；GPU 在同一张图里用全 GPU span 自己的 kernel 计算全部 10 条路由。
+    没分到槽位的路由（一步宽于窗口时）仍在主机 decode 内核上计算。
 
   ```
-  [moe-offload] qwen4exp (planned): routed experts of 33 of 48 layers run on the host from the GGUF mapping (31.7 GB read on demand); the accelerator holds 15 layers' (14.4 GB). Metal working set 40.2 GB, RAM 51.5 GB; --n-cpu-moe N overrides.
+  [moe-offload] qwen4exp (tiered): all 48 layers' routed experts run at a host seam; 48 layers keep their most-routed experts on the accelerator (7659 experts, 14.4 GB of a 14.4 GB budget) covering 67.6% of profiled routes, plus 7466 window slots (14.0 GB) filled on demand.
   ```
 
-  常驻的层数超过一定程度后，再多常驻也不会更快：常驻的一层要占住全部 512 个专家，不论用到与否，
-  还会挤占那些从 SSD 读取专家的层所需的页缓存。
-- **Decode** 在 TensorSharp 自己的内核上运行每个主机层的 10 个专家：用的是 ggml 的 CPU 点积，
-  线程组每层只唤醒一次，该层算完即休眠。在 Apple 芯片上，自旋的线程组让层间的 GPU 段慢了
-  1.5-2 倍，所以线程组改为休眠。`TS_HOST_MOE_DECODE=0` 恢复 ggml 图路径。
-- **Prefill** 达到 128 个 token 及以上时（`TS_HOST_MOE_DEVICE_MIN_BATCH`），每个分块把各主机层用到的
-  专家流式送到 GPU，并先用 16 个线程把这些专家的页面缺页读入：在 M5 Pro 上，这一步让 1,818 token 的
-  prefill 从 37.2-38.0 秒缩短到 15.7-16.6 秒，decode 不受影响。
+  若尚无覆盖该模型的画像，本次加载的所有槽位都是窗口槽位（最近最少使用，没有固定集合），同时由接缝记录画像：
+  实测 18.4 / 19.4 / 20.4 tok/s，与有画像的加载相差 3-5%；下一次加载起启用固定槽位。`TS_MOE_HOT_TIER=0` 恢复旧方案（整层常驻末尾若干层）。旧方案浪费内存：常驻的一层要占住全部 512 个
+  专家，不论用到与否，还会挤占那些从 SSD 读取专家的层所需的页缓存。
+- **Decode** 时，若一步的专家都有槽位，主机不做任何计算。溢出的路由在 TensorSharp 的主机 decode 内核上运行
+  （ggml 的 CPU 点积，线程组每层只唤醒一次、算完即休眠；在 Apple 芯片上自旋的线程组会让层间的 GPU 段慢
+  1.5-2 倍）。`TS_HOST_MOE_DECODE=0` 让这些路由改走 ggml 图路径。
+- **Prefill** 宽于 64 个 token 时，每个分块把各层用到的专家流式送到 GPU，用 `pread` 直接读进 CPU 可见的暂存
+  内存（`TS_HOST_MOE_STREAM_PREAD=0` 改回缺页读入映射再拷贝）。64 个 token 以内的分块使用槽位。
 - **`--backend mlx` 会被直接拒绝**：MLX 没有稀疏注意力 indexer、hyper-connection、n-gram 表以及
   IQ2_XS/IQ3_XXS 专家的 kernel。请使用 `ggml_metal`。
 
@@ -393,8 +420,37 @@ decode 落后 6%（21.1 对 22.55）。
 10.3-11.3 tok/s。TensorAgent 在 48 GB 的 Mac 上提供这个文件
 （[应用内实测](../../TensorAgent/README.md#the-macs-own-models)）。
 
+### 专家层，2026-11-06
+
+同一台 Mac、同一文件，ggml `57e2c2ca`（未修改），真实文本：一个 CLI 进程里的四个请求（`--input-jsonl`：
+一次预热，然后约 50 token 的代码 prompt、约 1,300 token 的文章 prompt、约 30 token 的列表 prompt，各贪心生成
+256 个 token）。同一会话内交错重复三次取中位数；路由画像来自另一次 12 个 prompt 的校准运行。
+
+| | decode tok/s，代码 / 文章 / 列表 | TTFT 秒，代码 / 文章 / 列表 |
+| --- | --- | --- |
+| 之前（整层常驻） | 13.80 / 13.87 / 15.59 | 3.14 / 13.58 / 2.78 |
+| 专家层 + 显式读取 | 19.16 / 19.88 / 20.70 | 0.78 / 6.39 / 0.53 |
+| 之前，MTP 头 | 14.67 / 11.98 / 16.66 | 5.31 / 13.61 / 3.27 |
+| 专家层，MTP 头，精确验证行（`TS_Q4E_VERIFY_ROW_KERNELS=1`） | 23.47 / 19.01 / 24.60 | 0.77 / 7.39 / 0.57 |
+| 专家层，MTP 头（批量 verify，默认） | 30.87 / 21.31 / 28.31 | 0.75 / 7.03 / 0.56 |
+| `config/qwen3.8-flash-next.json`（即上一行，使用其采样设置） | 27.00 / 20.62 / 32.72 | 0.80 / 7.96 / 0.53 |
+
+专家层方案用 GPU 的 F32 激活计算专家，而旧方案的 33 个主机层把激活量化为 Q8_K，所以贪心文本可能与之前不同
+（此处是文章那个回答，从第 655 个字符起）；当每条路由都有槽位时，专家层与全 GPU span 逐位一致
+（`TieredExperts_AnswerAsTheAccelerator_Metal`）。同一文本上的 teacher-forcing 困惑度见 2026-11-06 的报告。
+
 单设备 `ggml_cuda` 也会按当前空闲显存、尚待绑定的浮点权重和缓存、驱动余量及 3 GiB 图工作区
 自动规划专家放置。显式 `--n-cpu-moe` / `--cpu-moe` 优先；张量并行和层切分仍使用显式配置。
+
+有覆盖所有层的路由画像时，这一规划使用与 `ggml_metal` 相同的固定槽位，而不是整层常驻：每层把被路由
+最多的专家放在显存里（预算即层计划原本给整层的显存），每步其余的路由在主机 decode 内核上计算；独立
+显存没有主机可写的窗口槽位。没有这样的画像时保留层计划，同时常驻层的计算图也会记录路由，因此保存的
+画像覆盖所有层，之后的加载即可分层。RTX 5090（32 GB，UD-Q2_K_XL，12,245 个专家 / 23.0 GB 放入槽位，
+覆盖画像中 85% 的路由，数据全部在内存中）上，普通 decode 实测 51.3 / 50.4 / 45.8 tok/s，层计划为
+44.5 / 44.8 / 44.9（代码 / 文章 / 列表）；1,024 个 token 的 teacher-forcing 困惑度为 16.12，层计划为
+16.22。在那里 MTP 头并不划算：CUDA 用单 token 内核逐行验证（4 行 verify 约 75 ms），部分接受时仍需
+重新前向，MTP 头还占用 2.8 GB 显存，使槽位降到 20.1 GB，开启后代码和文章分别为 42.2 与 34.2 tok/s。
+`TS_MOE_HOT_TIER=0` 保留层计划。
 
 可选的 CUDA 专家缓存借鉴 Strata 的紧凑量化槽位：只把被路由的专家保留在设备缓冲区，
 使用 LRU 淘汰，保留全部选中专家和原有归约顺序。缓存保存原始 GGUF 字节，调用未修改的上游

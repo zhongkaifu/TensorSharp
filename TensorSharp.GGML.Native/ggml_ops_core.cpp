@@ -3486,6 +3486,10 @@ TSG_EXPORT void TSGgml_Shutdown()
     // pool) for the host-side expert matmuls. It is independent of g_backend, so
     // it has to be released explicitly or the threads outlive the shutdown.
     tsg::moe_ffn_host_release();
+    // Accelerator expert tiers hold device buffers (Metal residency sets) that
+    // must go before the backend and device do.
+    tsg::moe_hot_tier_release();
+    tsg::host_expert_io_release();
     tsg::bonsai_clear_backend();
     tsg::free_spark_float32_backends();
 
@@ -3814,6 +3818,8 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     // Compact expert slots have their own allocations, so they must be dropped
     // even when the ordinary host-buffer cache had no copy of this pointer.
     tsg::host_moe_expert_cache_on_drop(ptr);
+    tsg::moe_hot_tier_on_drop(ptr);
+    tsg::host_expert_io_on_drop(ptr);
 
     // Same argument, one level up: the persistent whole-model graphs bake the
     // buffer we just freed into their nodes, so replaying one after this point is
