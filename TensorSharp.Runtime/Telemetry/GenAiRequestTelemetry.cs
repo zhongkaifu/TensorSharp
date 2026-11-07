@@ -366,12 +366,21 @@ namespace TensorSharp.Runtime.Telemetry
             return tags;
         }
 
-        /// <summary>A model file name for <c>gen_ai.request.model</c>: no directory, no extension.</summary>
+        /// <summary>
+        /// A model file name for <c>gen_ai.request.model</c>: no directory, no extension. Both
+        /// <c>/</c> and <c>\</c> end a directory on every OS, so a path written for another
+        /// system (a Windows path in a config read on Linux, where <c>\</c> is not a separator)
+        /// never puts its directories, which can name a user, on a span or a metric.
+        /// </summary>
         public static string ModelNameFromPath(string? path)
         {
             if (string.IsNullOrWhiteSpace(path)) return "unknown";
-            string name = System.IO.Path.GetFileNameWithoutExtension(path.Trim());
+            string trimmed = path.Trim();
+            int separator = trimmed.LastIndexOfAny(s_pathSeparators);
+            string name = System.IO.Path.GetFileNameWithoutExtension(separator >= 0 ? trimmed[(separator + 1)..] : trimmed);
             return string.IsNullOrEmpty(name) ? "unknown" : name;
         }
+
+        private static readonly char[] s_pathSeparators = { '/', '\\' };
     }
 }

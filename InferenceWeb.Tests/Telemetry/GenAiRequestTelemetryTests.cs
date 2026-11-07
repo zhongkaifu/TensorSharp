@@ -281,9 +281,14 @@ public sealed class GenAiRequestTelemetryTests : IDisposable
     [Fact]
     public void ModelNamesNeverCarryAPath()
     {
+        // Whatever OS the test runs on: a Windows path read on Linux, where '\' is not a
+        // separator, must not keep its directories either.
         Assert.Equal("Qwen3.5-9B-Q8_0", GenAiRequestTelemetry.ModelNameFromPath(@"C:\models\Qwen3.5-9B-Q8_0.gguf"));
+        Assert.Equal("Qwen3.5-9B-Q8_0", GenAiRequestTelemetry.ModelNameFromPath(@"\\server\share\users\me\Qwen3.5-9B-Q8_0.gguf"));
         Assert.Equal("gemma", GenAiRequestTelemetry.ModelNameFromPath("/srv/models/gemma.gguf"));
+        Assert.Equal("gemma", GenAiRequestTelemetry.ModelNameFromPath(@"C:/models\mixed/gemma.gguf"));
         Assert.Equal("unknown", GenAiRequestTelemetry.ModelNameFromPath("  "));
+        Assert.Equal("unknown", GenAiRequestTelemetry.ModelNameFromPath(@"C:\models\"));
     }
 }
 
