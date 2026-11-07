@@ -37,7 +37,8 @@ int maxDraft = EnvInt("TS_SPEC_DRAFT", 8);
 string mode = Environment.GetEnvironmentVariable("TS_BENCH_MODE") ?? "both"; // baseline | spec | both
 
 Console.WriteLine($"[gdn-bench] loading {Path.GetFileName(modelPath)} backend={backend} maxNew={maxNew} draft={maxDraft} mode={mode}");
-using var model = (Qwen35Model)ModelBase.Create(modelPath, backend);
+using var model = (Qwen35Model)ModelBase.Create(modelPath, backend,
+    draftModelPath: Environment.GetEnvironmentVariable("TS_BENCH_DRAFT_MODEL"));
 Console.WriteLine($"[gdn-bench] HasDraftHead={model.HasDraftHead}");
 
 if (mode is "concurrent")
@@ -121,6 +122,149 @@ if (mode is "scaling")
         sw2.Stop();
         double msPer = sw2.Elapsed.TotalMilliseconds / reps;
         Console.WriteLine($"[gdn-bench] forward(B={b}): {msPer:F1} ms/call = {msPer / b:F1} ms/token-in-batch");
+    }
+    return;
+}
+
+if (mode is "verify")
+{
+    // Cost of one speculative verify by row count, through the calls the speculative
+    // executor makes per step: the recurrent snapshot, the all-rows forward (with the
+    // drafter's feature taps when TS_BENCH_DRAFT_MODEL attaches a DFlash drafter), and
+    // the commit of the kept prefix - by default none of the drafts, so each step
+    // advances the trunk by one token. Only the forward is timed. TS_VERIFY_ROWS lists
+    // the row counts (anchor + drafts), TS_VERIFY_REPS the timed steps per count.
+    model.ResetKVCache();
+    model.ForwardRefill(tokens);
+    int[] rowCounts = (Environment.GetEnvironmentVariable("TS_VERIFY_ROWS") ?? "1,2,3,4,5,6,7,8,9,12,16")
+        .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).ToArray();
+    int reps = EnvInt("TS_VERIFY_REPS", 20);
+    const int warmup = 3;
+    int feat = model.SpecFeatureSize;
+    int vocab = model.Config.VocabSize;
+    var oneLogits = new float[vocab];
+    // TS_VERIFY_INTERLEAVE=1 cycles through the row counts on every step instead
+    // of timing one count at a time, as a window whose drafts are cut short by
+    // different amounts does; every shape then has to stay cached side by side.
+    bool interleave = Environment.GetEnvironmentVariable("TS_VERIFY_INTERLEAVE") == "1";
+    // TS_VERIFY_ACCEPT=cycle keeps a different number of drafts on each step instead
+    // of none, and the hash below covers every logit of every verify: two builds
+    // whose commits leave the same recurrent state print the same hash.
+    bool cycleAccept = Environment.GetEnvironmentVariable("TS_VERIFY_ACCEPT") == "cycle";
+    ulong logitHash = 14695981039346656037UL;
+    int step = 0;
+    var bySize = rowCounts.Distinct().ToDictionary(n => n, _ => new List<double>());
+    // The commit (and, when the trunk cannot keep the verify's state, the rollback
+    // re-forward) runs after the timed forward; it is timed separately.
+    var commitBySize = rowCounts.Distinct().ToDictionary(n => n, _ => new List<double>());
+    IEnumerable<(int n, int r)> schedule = interleave
+        ? Enumerable.Range(0, warmup + reps).SelectMany(r => rowCounts.Select(n => (n, r)))
+        : rowCounts.SelectMany(n => Enumerable.Range(0, warmup + reps).Select(r => (n, r)));
+    foreach (var (n, r) in schedule)
+    {
+        var probe = new int[n];
+        for (int i = 0; i < n; i++) probe[i] = tokens[(i + 7) % tokens.Length];
+        var hAll = new float[(long)n * feat];
+        var logits = new float[(long)n * vocab];
+        var samples = bySize[n];
+        {
+            int start = model.CacheSeqLen;
+            model.SpecEnsureCapacity(start + n + 1);
+            model.SpecSnapshotRecurrentState();
+            long t0 = Stopwatch.GetTimestamp();
+            model.SpecForward(probe, hAll, logits, allLogitsRows: true);
+            double ms = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+            foreach (float f in logits)
+                logitHash = (logitHash ^ BitConverter.SingleToUInt32Bits(f)) * 1099511628211UL;
+            int accepted = cycleAccept ? step++ % n : 0;
+            long tCommit = Stopwatch.GetTimestamp();
+            if (n > 1 && accepted == n - 1)
+            {
+                // The whole window was kept: commit it, nothing to rewind.
+                model.SpecOnVerifyAccepted(accepted, n - 1);
+            }
+            else if (n > 1)
+            {
+                model.SpecOnVerifyAccepted(accepted, n - 1);
+                if (model.SpecVerifyPersistsAcceptedKv)
+                {
+                    model.SpecRewindCache(start + accepted + 1);
+                }
+                else
+                {
+                    model.SpecRestoreRecurrentState();
+                    model.SpecRewindCache(start);
+                    model.SpecForward(probe[..(accepted + 1)], null, oneLogits, allLogitsRows: false);
+                }
+            }
+            if (r >= warmup)
+            {
+                samples.Add(ms);
+                commitBySize[n].Add(Stopwatch.GetElapsedTime(tCommit).TotalMilliseconds);
+            }
+        }
+    }
+    Console.WriteLine($"[gdn-bench] verify {(interleave ? "interleaved" : "one count at a time")}, {reps} timed steps per count, " +
+        $"position {model.CacheSeqLen}, logit hash {logitHash:x16}{(cycleAccept ? " (accept cycle)" : "")}");
+    foreach (int n in bySize.Keys)
+    {
+        var samples = bySize[n];
+        samples.Sort();
+        double median = samples[samples.Count / 2];
+        var commits = commitBySize[n];
+        commits.Sort();
+        Console.WriteLine($"[gdn-bench] verify rows={n,2}: median {median,6:F1} ms  mean {samples.Average(),6:F1}  " +
+            $"min {samples[0],6:F1}  max {samples[^1],6:F1}  ({median / n:F1} ms/row)  commit median {commits[commits.Count / 2]:F2} ms");
+    }
+    return;
+}
+
+if (mode is "parity")
+{
+    // How far an N-row verify's rows are from plain decoding the same tokens: decode
+    // eight tokens greedily, then verify the same tokens as one window of N rows from
+    // the same prefix, and compare each row's logits with the plain step's. A greedy
+    // stream with the drafter can only equal the plain one while these stay below
+    // the logit gaps the argmax decides on.
+    const int span = 8;
+    int vocabSize = model.Config.VocabSize;
+    model.ResetKVCache();
+    float[] last = model.ForwardRefill(tokens);
+    var cont = new int[span];
+    var plainLogits = new float[span][];
+    int next = Argmax(last);
+    for (int i = 0; i < span; i++)
+    {
+        cont[i] = next;
+        plainLogits[i] = (float[])model.Forward(new[] { next }).Clone();
+        next = Argmax(plainLogits[i]);
+    }
+    foreach (int n in new[] { 1, 2, 3, 4, 5, 6, 7, 8 })
+    {
+        model.ResetKVCache();
+        model.ForwardRefill(tokens);
+        var rowsLogits = new float[(long)n * vocabSize];
+        model.SpecSnapshotRecurrentState();
+        model.SpecForward(cont[..n], new float[(long)n * model.SpecFeatureSize], rowsLogits, allLogitsRows: true);
+        if (n > 1)
+            model.SpecOnVerifyAccepted(n - 1, n - 1);
+        double worst = 0;
+        int argmaxFlips = 0, exactRows = 0;
+        for (int r = 0; r < n; r++)
+        {
+            double rowWorst = 0;
+            int best = 0;
+            for (int v = 0; v < vocabSize; v++)
+            {
+                float x = rowsLogits[(long)r * vocabSize + v];
+                rowWorst = Math.Max(rowWorst, Math.Abs(x - plainLogits[r][v]));
+                if (x > rowsLogits[(long)r * vocabSize + best]) best = v;
+            }
+            worst = Math.Max(worst, rowWorst);
+            if (rowWorst == 0) exactRows++;
+            if (best != Argmax(plainLogits[r])) argmaxFlips++;
+        }
+        Console.WriteLine($"[gdn-bench] parity rows={n}: max |verify - plain| {worst:G4}, rows bit-identical {exactRows}/{n}, argmax differs on {argmaxFlips}");
     }
     return;
 }

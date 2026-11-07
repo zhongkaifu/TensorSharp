@@ -16,6 +16,8 @@ public sealed class Qwen35VerifyDeviceChainTests
     private readonly ITestOutputHelper _output;
     public Qwen35VerifyDeviceChainTests(ITestOutputHelper output) => _output = output;
 
+    private const int Hidden = 32, Head = 32, Conv = 3 * Head, Rows = 4, Vocab = 17;
+
     [Fact]
     public void AllRecurrentPackedVerify_InitialAndReplayMatchFreshGraphs()
     {
@@ -23,16 +25,15 @@ public sealed class Qwen35VerifyDeviceChainTests
         // persistent path enabled while deliberately omitting every attention
         // input from the graph. Before the upload guard, Metal packing aborted
         // on the first upload to the unallocated position tensor.
-        const int hidden = 32, head = 32, conv = 3 * head, rows = 4, vocab = 17;
         using var env = new NativeEnvScope();
         GgmlBackendType backend = TestGates.PinnedGgmlBackendType;
         bool metal = backend == GgmlBackendType.Metal;
         env.Set("TS_Q35_VERIFY_PACK", "0");
         env.Set("TS_Q35_GPU_STATE_COMMIT", "0");
-        var reference = Run(backend, rebuild: true);
+        var reference = RunAllRecurrent(backend, rebuild: true, new[] { 0, 2, 1 });
         env.Set("TS_Q35_VERIFY_PACK", "1");
         env.Set("TS_Q35_GPU_STATE_COMMIT", metal ? "2" : "0"); // Metal must execute its snapshot-copy graph.
-        var actual = Run(backend, rebuild: false);
+        var actual = RunAllRecurrent(backend, rebuild: false, new[] { 0, 2, 1 });
         Assert.Equal(reference.Count, actual.Count);
         for (int step = 0; step < reference.Count; step++)
         {
@@ -49,98 +50,127 @@ public sealed class Qwen35VerifyDeviceChainTests
             _output.WriteLine($"All-recurrent step {step}: relative L2={relative:E3}, max absolute={maxError:E3}");
             Assert.True(relative < 1e-4 && maxError < 1e-4);
         }
+    }
 
-        List<float[]> Run(GgmlBackendType backend, bool rebuild)
+    [CudaFact(GgmlBackend = BackendType.GgmlCuda)]
+    public void CudaReplayCommit_LeavesTheStateASnapshotCommitLeaves()
+    {
+        // ggml_cuda keeps no recurrent state per verify row: the verify keeps what
+        // each recurrence consumed and the commit replays the kept prefix with the
+        // rejected rows' gate and beta zeroed. Every acceptance of a window - none
+        // kept (slot 3), part (2, 1), all (0) - must commit exactly the state a
+        // per-row snapshot holds, and the next window must see it.
+        int[] slots = { 3, 0, 2, 1, 3, 1 };
+        using var env = new NativeEnvScope();
+        env.Set("TS_Q35_VERIFY_REPLAY", "0");
+        var snapshots = RunAllRecurrent(GgmlBackendType.Cuda, rebuild: false, slots);
+        env.Set("TS_Q35_VERIFY_REPLAY", "1");
+        var replay = RunAllRecurrent(GgmlBackendType.Cuda, rebuild: false, slots, expectNoSnapshots: true);
+        Assert.Equal(snapshots.Count, replay.Count);
+        for (int step = 0; step < snapshots.Count; step++)
+            Assert.Equal(snapshots[step], replay[step]);
+    }
+
+    // A two-layer all-recurrent trunk verified in 4-row windows, one window per
+    // entry of slots, each committed at that slot (0 keeps the whole window).
+    // Returns, per step, the logits, the normed rows and the committed state.
+    // expectNoSnapshots asserts that each verify kept no per-row state slots (the
+    // host fetch of a slot declines, leaving the pending verify untouched).
+    private static List<float[]> RunAllRecurrent(GgmlBackendType backend, bool rebuild, int[] slots,
+        bool expectNoSnapshots = false)
+    {
+        GgmlBasicOps.EnsureBackendAvailable(backend);
+        long owner = Qwen35Model.AllocateVerifyOwnerId();
+        var buffers = new List<IntPtr>();
+        var random = new Random(72819);
+        IntPtr Make(int count, float scale = 0.025f, float? constant = null)
         {
-            GgmlBasicOps.EnsureBackendAvailable(backend);
-            long owner = Qwen35Model.AllocateVerifyOwnerId();
-            var buffers = new List<IntPtr>();
-            var random = new Random(72819);
-            IntPtr Make(int count, float scale = 0.025f, float? constant = null)
-            {
-                IntPtr pointer = GgmlBasicOps.AlignedAlloc(count * sizeof(float));
-                Assert.NotEqual(IntPtr.Zero, pointer);
-                buffers.Add(pointer);
-                float[] values = Enumerable.Range(0, count)
-                    .Select(_ => constant ?? (float)(random.NextDouble() * 2 - 1) * scale).ToArray();
-                Marshal.Copy(values, 0, pointer, count);
-                return pointer;
-            }
-            float[] Read(IntPtr pointer, int count)
-            {
-                var values = new float[count];
-                Marshal.Copy(pointer, values, 0, count);
-                return values;
-            }
-            try
-            {
-                var layers = new Qwen35LayerDecodeArgs[2];
-                for (int i = 0; i < layers.Length; i++)
-                    layers[i] = new Qwen35LayerDecodeArgs
-                    {
-                        StructBytes = Marshal.SizeOf<Qwen35LayerDecodeArgs>(), IsRecurrent = 1, FfDense = hidden,
-                        AttnNormW = Make(hidden, constant: 1), PostAttnNormW = Make(hidden, constant: 1),
-                        GdnQkvW = Make(hidden * conv), GdnQkvNe0 = hidden, GdnQkvNe1 = conv,
-                        GdnQkvBytes = hidden * conv * sizeof(float),
-                        GdnGateW = Make(hidden * head), GdnGateNe0 = hidden, GdnGateNe1 = head,
-                        GdnGateBytes = hidden * head * sizeof(float),
-                        SsmBetaW = Make(hidden), SsmBetaNe0 = hidden, SsmBetaNe1 = 1, SsmBetaBytes = hidden * sizeof(float),
-                        SsmAlphaW = Make(hidden), SsmAlphaNe0 = hidden, SsmAlphaNe1 = 1, SsmAlphaBytes = hidden * sizeof(float),
-                        Conv1dW = Make(4 * conv), SsmDtW = Make(1), SsmAW = Make(1, constant: -0.15f),
-                        SsmNormW = Make(head, constant: 1),
-                        SsmOutW = Make(head * hidden), SsmOutNe0 = head, SsmOutNe1 = hidden,
-                        SsmOutBytes = head * hidden * sizeof(float),
-                        ConvStateIn = Make(3 * conv, scale: 0.002f), DeltaStateIn = Make(head * head, scale: 0.002f),
-                        ConvStateOut = Make(3 * conv), DeltaStateOut = Make(head * head),
-                        GuW = Make(hidden * 2 * hidden), GuNe0 = hidden, GuNe1 = 2 * hidden,
-                        GuBytes = hidden * 2 * hidden * sizeof(float),
-                        DownW = Make(hidden * hidden), DownNe0 = hidden, DownNe1 = hidden,
-                        DownBytes = hidden * hidden * sizeof(float),
-                        // GGML_TYPE_F32 is zero, matching all default type fields.
-                    };
-                IntPtr input = Make(hidden * rows), logits = Make(vocab * rows), normed = Make(hidden * rows);
-                IntPtr lmHead = Make(hidden * vocab), finalNorm = Make(hidden, constant: 1), used = Make(1);
-                var result = new List<float[]>();
-                int step = 0;
-                foreach (int slot in new[] { 0, 2, 1 })
+            IntPtr pointer = GgmlBasicOps.AlignedAlloc(count * sizeof(float));
+            Assert.NotEqual(IntPtr.Zero, pointer);
+            buffers.Add(pointer);
+            float[] values = Enumerable.Range(0, count)
+                .Select(_ => constant ?? (float)(random.NextDouble() * 2 - 1) * scale).ToArray();
+            Marshal.Copy(values, 0, pointer, count);
+            return pointer;
+        }
+        float[] Read(IntPtr pointer, int count)
+        {
+            var values = new float[count];
+            Marshal.Copy(pointer, values, 0, count);
+            return values;
+        }
+        try
+        {
+            var layers = new Qwen35LayerDecodeArgs[2];
+            for (int i = 0; i < layers.Length; i++)
+                layers[i] = new Qwen35LayerDecodeArgs
                 {
-                    if (rebuild) GgmlBasicOps.Qwen35ResetVerifyCache(owner);
-                    float[] values = Enumerable.Range(0, hidden * rows)
-                        .Select(i => 0.1f * MathF.Sin(i * 0.13f + step)).ToArray();
-                    Marshal.Copy(values, 0, input, values.Length);
-                    Assert.True(GgmlBasicOps.Qwen35ModelVerify(layers, layers.Length,
-                        input, hidden, step * rows, rows, 1, 1, head, 256, head, 0, 0,
-                        4, head, head, 1, 1, 1e-5f, 10000, 1, 0, 0, 0, 0, 0, 1,
-                        logits, vocab, lmHead, 0, hidden, vocab, hidden * vocab * sizeof(float),
-                        finalNorm, normed, stateSnapshots: rows, stateSnapshotsUsed: used,
-                        deferStateDownload: true, ownerId: owner));
-                    Assert.Equal(rows, Marshal.ReadInt32(used)); // Persistent deferred mode is required.
-                    Assert.True(GgmlBasicOps.Qwen35CommitStateSnapshot(slot, layers.Length, owner));
-                    // Fetch committed states into the next call's input buffers.
-                    // This tests the retained context-only views after compute,
-                    // and makes the next replay depend on the selected prefix.
-                    Assert.True(GgmlBasicOps.Qwen35DrainDeviceState(
-                        layers.Select(l => l.ConvStateIn).ToArray(),
-                        layers.Select(l => l.DeltaStateIn).ToArray(), layers.Length, owner));
-                    var observed = Read(logits, vocab * rows).Concat(Read(normed, hidden * rows)).ToList();
-                    foreach (var layer in layers)
-                    {
-                        observed.AddRange(Read(layer.ConvStateIn, 3 * conv));
-                        observed.AddRange(Read(layer.DeltaStateIn, head * head));
-                    }
-                    result.Add(observed.ToArray());
-                    step++;
-                }
-                return result;
-            }
-            finally
+                    StructBytes = Marshal.SizeOf<Qwen35LayerDecodeArgs>(), IsRecurrent = 1, FfDense = Hidden,
+                    AttnNormW = Make(Hidden, constant: 1), PostAttnNormW = Make(Hidden, constant: 1),
+                    GdnQkvW = Make(Hidden * Conv), GdnQkvNe0 = Hidden, GdnQkvNe1 = Conv,
+                    GdnQkvBytes = Hidden * Conv * sizeof(float),
+                    GdnGateW = Make(Hidden * Head), GdnGateNe0 = Hidden, GdnGateNe1 = Head,
+                    GdnGateBytes = Hidden * Head * sizeof(float),
+                    SsmBetaW = Make(Hidden), SsmBetaNe0 = Hidden, SsmBetaNe1 = 1, SsmBetaBytes = Hidden * sizeof(float),
+                    SsmAlphaW = Make(Hidden), SsmAlphaNe0 = Hidden, SsmAlphaNe1 = 1, SsmAlphaBytes = Hidden * sizeof(float),
+                    Conv1dW = Make(4 * Conv), SsmDtW = Make(1), SsmAW = Make(1, constant: -0.15f),
+                    SsmNormW = Make(Head, constant: 1),
+                    SsmOutW = Make(Head * Hidden), SsmOutNe0 = Head, SsmOutNe1 = Hidden,
+                    SsmOutBytes = Head * Hidden * sizeof(float),
+                    ConvStateIn = Make(3 * Conv, scale: 0.002f), DeltaStateIn = Make(Head * Head, scale: 0.002f),
+                    ConvStateOut = Make(3 * Conv), DeltaStateOut = Make(Head * Head),
+                    GuW = Make(Hidden * 2 * Hidden), GuNe0 = Hidden, GuNe1 = 2 * Hidden,
+                    GuBytes = Hidden * 2 * Hidden * sizeof(float),
+                    DownW = Make(Hidden * Hidden), DownNe0 = Hidden, DownNe1 = Hidden,
+                    DownBytes = Hidden * Hidden * sizeof(float),
+                    // GGML_TYPE_F32 is zero, matching all default type fields.
+                };
+            IntPtr input = Make(Hidden * Rows), logits = Make(Vocab * Rows), normed = Make(Hidden * Rows);
+            IntPtr lmHead = Make(Hidden * Vocab), finalNorm = Make(Hidden, constant: 1), used = Make(1);
+            var result = new List<float[]>();
+            int step = 0;
+            foreach (int slot in slots)
             {
-                GgmlBasicOps.Qwen35ReleaseVerifyOwner(owner);
-                foreach (IntPtr pointer in buffers)
+                if (rebuild) GgmlBasicOps.Qwen35ResetVerifyCache(owner);
+                float[] values = Enumerable.Range(0, Hidden * Rows)
+                    .Select(i => 0.1f * MathF.Sin(i * 0.13f + step)).ToArray();
+                Marshal.Copy(values, 0, input, values.Length);
+                Assert.True(GgmlBasicOps.Qwen35ModelVerify(layers, layers.Length,
+                    input, Hidden, step * Rows, Rows, 1, 1, Head, 256, Head, 0, 0,
+                    4, Head, Head, 1, 1, 1e-5f, 10000, 1, 0, 0, 0, 0, 0, 1,
+                    logits, Vocab, lmHead, 0, Hidden, Vocab, Hidden * Vocab * sizeof(float),
+                    finalNorm, normed, stateSnapshots: Rows, stateSnapshotsUsed: used,
+                    deferStateDownload: true, ownerId: owner));
+                Assert.Equal(Rows, Marshal.ReadInt32(used)); // Persistent deferred mode is required.
+                if (expectNoSnapshots)
+                    Assert.False(GgmlBasicOps.Qwen35FetchStateSnapshot(1,
+                        layers.Select(_ => Make(3 * Conv)).ToArray(),
+                        layers.Select(_ => Make(Head * Head)).ToArray(), layers.Length, owner));
+                Assert.True(GgmlBasicOps.Qwen35CommitStateSnapshot(slot, layers.Length, owner));
+                // Fetch committed states into the next call's input buffers.
+                // This tests the retained context-only views after compute,
+                // and makes the next replay depend on the selected prefix.
+                Assert.True(GgmlBasicOps.Qwen35DrainDeviceState(
+                    layers.Select(l => l.ConvStateIn).ToArray(),
+                    layers.Select(l => l.DeltaStateIn).ToArray(), layers.Length, owner));
+                var observed = Read(logits, Vocab * Rows).Concat(Read(normed, Hidden * Rows)).ToList();
+                foreach (var layer in layers)
                 {
-                    GgmlBasicOps.InvalidateHostBuffer(pointer);
-                    GgmlBasicOps.AlignedFree(pointer);
+                    observed.AddRange(Read(layer.ConvStateIn, 3 * Conv));
+                    observed.AddRange(Read(layer.DeltaStateIn, Head * Head));
                 }
+                result.Add(observed.ToArray());
+                step++;
+            }
+            return result;
+        }
+        finally
+        {
+            GgmlBasicOps.Qwen35ReleaseVerifyOwner(owner);
+            foreach (IntPtr pointer in buffers)
+            {
+                GgmlBasicOps.InvalidateHostBuffer(pointer);
+                GgmlBasicOps.AlignedFree(pointer);
             }
         }
     }

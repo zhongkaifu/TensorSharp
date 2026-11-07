@@ -1182,7 +1182,8 @@ namespace tsg
     // Set to 1 it runs the graph one node at a time with a synchronize around
     // each, accumulates the cost per op type (and per (op, shape) for the worst
     // offenders) and dumps a table every TS_GGML_NODE_PROFILE_EVERY calls
-    // (default 64).
+    // (default 64). Set to "types", it also splits MUL_MAT / MUL_MAT_ID by
+    // weight type.
     //
     // The per-node synchronize is itself ~5-10 us, so the profiled total runs
     // well above the real graph time; the dump prints both so the launch tax is
