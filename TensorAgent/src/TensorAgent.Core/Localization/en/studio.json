@@ -364,7 +364,6 @@
   "studio.keyframesTitle": "Photos at set moments",
   "studio.guideNamed": "Keyframe {index}",
   "studio.referencePhotosTitle": "Reference photos",
-  "studio.referencesHelp2": "Your photos show who or what to include; the take does not start or end on them. Choose up to {count}.",
   "studio.referenceRemoved": "Removed {name}. Order: {list}",
   "studio.referenceAdded": "Picture {index}: {name}",
   "studio.referenceTileOn": "{name}, picture {index}",
