@@ -59,7 +59,7 @@ public sealed class ModelBrowserTests
     public void VersionsIgnoreCaseWhitespaceAndPunctuation(string query)
     {
         string[] ids = Results(query).Select(model => model.Id).Order().ToArray();
-        Assert.Equal(new[] { "qwen3.8-27b-q4kxl", "qwen3.8-flash-next-iq1m", "qwen3.8-flash-next-q2kxl" }, ids);
+        Assert.Equal(new[] { "qwen3.8-27b-iq3xxs", "qwen3.8-flash-next-iq1m", "qwen3.8-flash-next-q2kxl" }, ids);
     }
 
     [Theory]
@@ -77,7 +77,7 @@ public sealed class ModelBrowserTests
     public void SearchRequiresEveryTermButAllowsTermsFromDifferentFields()
     {
         CatalogModel result = Assert.Single(Results("qwen3.8 27b vision dflash"));
-        Assert.Equal("qwen3.8-27b-q4kxl", result.Id);
+        Assert.Equal("qwen3.8-27b-iq3xxs", result.Id);
         Assert.Empty(Results("qwen3.8 27b no-such-feature"));
     }
 
@@ -94,8 +94,14 @@ public sealed class ModelBrowserTests
     {
         var results = Results("q4 k m");
         Assert.NotEmpty(results);
-        Assert.All(results, model => Assert.Contains("Q4_K_M", model.Quantization));
-        Assert.DoesNotContain(results, model => model.Id == "qwen3.8-27b-q4kxl");
+        // Q4_K_M in the quantization, or in a companion's file name, which search covers on
+        // purpose: Qwen3.8 27B is UD-IQ3_XXS with a Q4_K_M DFlash2 drafter. Never a stray "m".
+        Assert.All(results, model => Assert.True(model.Quantization.Contains("Q4_K_M", StringComparison.Ordinal)
+            || model.Files.Any(file => file.Role is not (CatalogFileRole.Weights or CatalogFileRole.WeightsShard)
+                && file.FileName.Contains("Q4_K_M", StringComparison.Ordinal)), model.Id));
+        Assert.Contains(results, model => model.Id == "qwen3.8-27b-iq3xxs");
+        // UD-Q4_K_XL, with "m" in "mmproj" and in "memory".
+        Assert.DoesNotContain(results, model => model.Id == "muse-glimmer-30b-q4kxl");
     }
 
     [Fact]
@@ -142,7 +148,7 @@ public sealed class ModelBrowserTests
     public void SelectedThenInstalledThenCompatibleModelsLeadBrowsingWithinTheirFamily()
     {
         string selected = "qwen3.8-flash-next-q2kxl";
-        string installed = "qwen3.8-27b-q4kxl";
+        string installed = "qwen3.8-27b-iq3xxs";
         var groups = Browse(memory: 16, installed: new HashSet<string> { installed }, selected: selected);
         var qwen = groups.Single(group => group.Id == "qwen").Models;
         Assert.Equal(selected, qwen[0].Id);
@@ -154,7 +160,7 @@ public sealed class ModelBrowserTests
     public void FamilyOrderRemainsStableAcrossSelectionChanges()
     {
         Assert.Equal(Browse().Select(group => group.Id),
-            Browse(selected: "qwen3.8-27b-q4kxl").Select(group => group.Id));
+            Browse(selected: "qwen3.8-27b-iq3xxs").Select(group => group.Id));
     }
 
     [Fact]

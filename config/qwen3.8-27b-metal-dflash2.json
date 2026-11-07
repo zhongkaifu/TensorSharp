@@ -17,6 +17,14 @@
     "sha256": "c0b7c3038681ed2e3040456c1dd45f9858b6c2290bed172c70388a94874f3eee"
   },
 
+  // The vision projector, for images and video frames: 0.93 GB on disk, held as F32 once
+  // loaded. Text-only runs can drop this block and keep that memory for the KV cache.
+  "mmproj": {
+    "path": "${modelRoot}/Qwen/Qwen3.8-27B-mmproj-BF16.gguf",
+    "urls": ["https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/mmproj-BF16.gguf"],
+    "sha256": "83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53"
+  },
+
   // Naming a DFlash file is the request to speculate with it (no --spec needed); it replaces the
   // NextN head. Pass --no-spec on the command line to decode without it (the file is still fetched).
   "draft-model": {
@@ -38,6 +46,4 @@
   // Not set, deliberately:
   //   "kv-cache-dtype": "q8_0" -- the same speed per step at these lengths, and half the KV
   //     memory; worth it for long contexts, where Metal charges the KV twice (host + mirror).
-  //   "mmproj" -- the vision projector costs ~0.9 GB; to ask about images, add the block given in
-  //     agent-qwen3.8-27b.json.
 }

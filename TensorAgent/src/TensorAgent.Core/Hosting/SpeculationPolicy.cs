@@ -4,6 +4,8 @@
 // This file is part of TensorSharp.
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using System.Globalization;
+using TensorAgent.Core.Catalog;
 using TensorAgent.Core.Settings;
 using TensorSharp.Runtime.Speculative;
 
@@ -45,6 +47,8 @@ public static class SpeculationPolicy
     public const string EnabledVariable = SpeculationEnvVars.Enabled;
     public const string TypeVariable = SpeculationEnvVars.Type;
     public const string DraftModelVariable = SpeculationEnvVars.DraftModel;
+    public const string DraftTokensVariable = SpeculationEnvVars.Draft;
+    public const string MinDraftProbVariable = SpeculationEnvVars.PMin;
 
     // What the process was launched with, recorded before the app writes anything.
     // An explicit static constructor: a field initializer alone runs at the first
@@ -52,19 +56,26 @@ public static class SpeculationPolicy
     // write of TS_SPEC, so it recorded that write as the launch environment.
     private static string? LaunchEnabled;
     private static string? LaunchType;
+    private static string? LaunchDraftTokens;
+    private static string? LaunchMinDraftProb;
 
     static SpeculationPolicy()
     {
         LaunchEnabled = Environment.GetEnvironmentVariable(EnabledVariable);
         LaunchType = Environment.GetEnvironmentVariable(TypeVariable);
+        LaunchDraftTokens = Environment.GetEnvironmentVariable(DraftTokensVariable);
+        LaunchMinDraftProb = Environment.GetEnvironmentVariable(MinDraftProbVariable);
     }
 
     /// <summary>Pin what counts as the launch environment - for a test process, whose
     /// first touch of this type may come after another test set the variables.</summary>
-    internal static void UseLaunchEnvironment(string? enabled, string? type)
+    internal static void UseLaunchEnvironment(string? enabled, string? type,
+        string? draftTokens = null, string? minDraftProb = null)
     {
         LaunchEnabled = enabled;
         LaunchType = type;
+        LaunchDraftTokens = draftTokens;
+        LaunchMinDraftProb = minDraftProb;
     }
 
     /// <summary>
@@ -137,5 +148,33 @@ public static class SpeculationPolicy
         string algorithm = draftHeadAttached ? SpeculatorRegistry.Auto : SpeculatorRegistry.NGram;
         Environment.SetEnvironmentVariable(TypeVariable, algorithm);
         return algorithm;
+    }
+
+    /// <summary>
+    /// After <see cref="ChooseAlgorithm(bool)"/>, before the engine reads the environment: the
+    /// entry's measured draft window and confidence gate while its own draft file speculates,
+    /// and the engine's defaults otherwise. Otherwise means CLEARED, so one model's tuning never
+    /// carries over to the next model or to n-gram. A value from the launch environment
+    /// wins, as <c>TS_SPEC</c> does. Returns a short account for the log.
+    /// </summary>
+    /// <param name="tuning">The entry's <see cref="CatalogModel.DraftTuning"/>.</param>
+    /// <param name="catalogDraftSpeculates">The catalog's draft file attached and the algorithm
+    /// is <c>auto</c>, the configuration the tuning was measured in.</param>
+    public static string ApplyDraftTuning(CatalogDraftTuning? tuning, bool catalogDraftSpeculates)
+        => ApplyDraftTuning(tuning, catalogDraftSpeculates, LaunchDraftTokens, LaunchMinDraftProb);
+
+    internal static string ApplyDraftTuning(CatalogDraftTuning? tuning, bool catalogDraftSpeculates,
+        string? launchDraftTokens, string? launchMinDraftProb)
+    {
+        CatalogDraftTuning? applied = catalogDraftSpeculates ? tuning : null;
+        if (string.IsNullOrWhiteSpace(launchDraftTokens))
+            Environment.SetEnvironmentVariable(DraftTokensVariable,
+                applied?.MaxDraftTokens.ToString(CultureInfo.InvariantCulture));
+        if (string.IsNullOrWhiteSpace(launchMinDraftProb))
+            Environment.SetEnvironmentVariable(MinDraftProbVariable,
+                applied?.MinDraftProb.ToString(CultureInfo.InvariantCulture));
+        string draft = Environment.GetEnvironmentVariable(DraftTokensVariable) ?? "default";
+        string pmin = Environment.GetEnvironmentVariable(MinDraftProbVariable) ?? "default";
+        return $"draft window {draft}, confidence gate {pmin}";
     }
 }

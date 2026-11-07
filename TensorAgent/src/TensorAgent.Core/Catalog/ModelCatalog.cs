@@ -15,7 +15,7 @@ namespace TensorAgent.Core.Catalog;
 /// <summary>
 /// The built-in model list. Downloadable entries' sizes and hashes were read from the
 /// Hugging Face tree API (LFS object ids) on 2026-09-01 (Bonsai 2 27B on 2026-09-28;
-/// Qwen3.8 27B, Muse-Glimmer 30B and Qwen-Image 2.1 on 2026-09-30; MiniMax-H3 on
+/// Muse-Glimmer 30B and Qwen-Image 2.1 on 2026-09-30, Qwen3.8 27B on 2026-11-05; MiniMax-H3 on
 /// 2026-09-30 from bare clones of unsloth/MiniMax-H3-GGUF at d629413c and
 /// MiniMaxAI/MiniMax-H3 at 42ed227e, their current heads, whose three tokenizer files are
 /// plain git blobs hashed from their bytes),
@@ -40,13 +40,13 @@ namespace TensorAgent.Core.Catalog;
 /// <para>
 /// The 24 and 32 GB tiers are desktop tiers, including Windows and macOS. Their dense
 /// entries are the models a phone can only run as one- or two-bit
-/// quantizations that cost real quality, so they are offered at four bits where the
-/// memory exists rather than squeezed onto a phone. A Mac has no jetsam, so the tier is
+/// quantizations that cost real quality, so they are offered at three or four bits where
+/// the memory exists rather than squeezed onto a phone. A Mac has no jetsam, so the tier is
 /// what the weights (which a dense model reads in full for every token) plus the app's
 /// measured footprint plus macOS need; below that every token pages the model in from
 /// disk. The large chat entries also keep the phone's cache budget
 /// (<see cref="CatalogModel.LeanCaches"/>), without which the engine's desktop defaults
-/// alone grew the app to 18.8 GB beside Qwen3.8 27B's weights.
+/// alone grew the app to 18.8 GB beside Qwen3.8 27B's UD-Q4_K_XL weights.
 /// </para>
 /// <para>
 /// Qwen3.8 Flash Next's file is larger than its tier's RAM, on purpose: the Q2_K_XL entry
@@ -228,46 +228,56 @@ public static partial class ModelCatalog
         },
         new CatalogModel
         {
-            Id = "qwen3.8-27b-q4kxl",
+            Id = "qwen3.8-27b-iq3xxs",
             DisplayName = "Qwen3.8 27B",
             Family = CatalogFamily.Qwen38,
             Kind = CatalogArchitectureKind.Dense,
             Parameters = "27B",
-            Quantization = "UD-Q4_K_XL",
+            Quantization = "UD-IQ3_XXS",
+            // config/qwen3.8-27b-metal-dflash2.json's files, pinned at the same revisions:
+            // unsloth 4ca720788d1e01f1bff70c033e0d0028fd02e502 and z-lab
+            // 2d9571f8ce46e151f61c6499c99dee6079e1d610, sizes and LFS ids read from the tree
+            // API on 2026-11-05.
             Files = new[]
             {
-                new CatalogFile(CatalogFileRole.Weights, "Qwen3.8-27B-UD-Q4_K_XL.gguf",
-                    Hf("unsloth/Qwen3.8-27B-GGUF", "Qwen3.8-27B-UD-Q4_K_XL.gguf"),
-                    17_559_178_144, "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e"),
-                new CatalogFile(CatalogFileRole.Projector, "mmproj-F16.gguf",
-                    Hf("unsloth/Qwen3.8-27B-GGUF", "mmproj-F16.gguf"),
-                    927_607_488, "cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e", Optional: true),
-                // z-lab revision 2d9571f8ce46e151f61c6499c99dee6079e1d610, verified 2026-10-07.
-                new CatalogFile(CatalogFileRole.Draft, "Qwen3.8-27B-DFlash2-Q8_0.gguf",
-                    "https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/resolve/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q8_0.gguf",
-                    2_056_414_816, "c18e800daedc59ca68fd13b6a856d795746af6d399a9279ac6a277d1d422f87e", Optional: true),
+                new CatalogFile(CatalogFileRole.Weights, "Qwen3.8-27B-UD-IQ3_XXS.gguf",
+                    "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-IQ3_XXS.gguf",
+                    10_934_860_704, "c0b7c3038681ed2e3040456c1dd45f9858b6c2290bed172c70388a94874f3eee"),
+                new CatalogFile(CatalogFileRole.Projector, "mmproj-BF16.gguf",
+                    "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/mmproj-BF16.gguf",
+                    931_146_432, "83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53", Optional: true),
+                // Q4_K_M, not Q8_0: the smaller drafter was the faster one on ggml_metal
+                // (the config's own measurements).
+                new CatalogFile(CatalogFileRole.Draft, "Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+                    "https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/resolve/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+                    1_143_006_816, "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd", Optional: true),
             },
             Modalities = CatalogModalities.Image | CatalogModalities.Video,
             // 32, not 24: the weights are mapped, not charged, but a dense model reads all
             // of them for every token, so they must stay resident beside what the app
-            // allocates. MEASURED in the Mac app (M5 Pro, ggml_metal, chat-e2e.py's seven
-            // scenarios with the projector): the footprint peaked at 8.8 GB with
-            // LeanCaches, so 17.6 + 8.8 GB plus macOS is about 31 GB. (The 1-bit build that
-            // fits a phone, UD-IQ1_S at 6.2 GB, was withdrawn on 2026-09-07 for quality.)
+            // allocates. MEASURED in the Debug Mac app on 2026-11-05 (M5 Pro, ggml_metal,
+            // chat-e2e.py's seven scenarios with the projector and the drafter, LeanCaches):
+            // phys_footprint_peak 9.9 GB, so 10.9 GB of weights + 1.1 GB of drafter + 9.9 GB
+            // plus macOS is about 27 GB. (The 1-bit build that fits a phone, UD-IQ1_S at
+            // 6.2 GB, was withdrawn on 2026-09-07 for quality.)
             MinDeviceMemoryGB = 32,
             // A qwen35 hybrid: one layer in four is full attention and the rest keep a
             // fixed linear-attention state, so a token costs about 35 KB of K/V at q8_0,
             // charged twice on Metal. The qwen35 fused graph reads q8_0 at decode parity.
             ContextLength = 32768,
             KvCacheDtype = "q8_0",
-            // MEASURED: the engine's desktop defaults grew the app's footprint to 18.8 GB
-            // over the same seven scenarios (the machine fell to 0.1 GB free with 10.6 GB
-            // compressed); the phone's budget held it at 8.8 GB with the same 99.6-99.7%
-            // prompt reuse on follow-ups and new chats.
+            // MEASURED on the UD-Q4_K_XL file this entry replaced: the engine's desktop
+            // defaults grew the app's footprint to 18.8 GB over chat-e2e.py's seven scenarios
+            // (the machine fell to 0.1 GB free with 10.6 GB compressed); the phone's budget
+            // held it at 8.8 GB with the same 99.6-99.7% prompt reuse.
             LeanCaches = true,
             // The publisher's non-thinking settings, as for Qwen3.5 9B: the app starts
             // with thinking off.
             Sampling = new CatalogSampling(0.7f, 20, 0.8f, 0.0f),
+            // The config's drafter settings, measured on an M5 Pro (ggml_metal, greedy, 512-token
+            // answers): 7 drafts with every one verified gave 38.6-44 tok/s on code against
+            // 20.6 plain; 5 drafts and the default confidence gate were both slower.
+            DraftTuning = new CatalogDraftTuning(MaxDraftTokens: 7, MinDraftProb: 0f),
             SupportsThinking = true,
             License = ApacheLicense,
             Notes = "catalog.model.qwen38Size27b.notes",
@@ -634,6 +644,9 @@ public static partial class ModelCatalog
         "qwen-image-2.1-turbo-q8",
         // Folded into MiniMax-H3's single catalog entry on 2026-10-19.
         "minimax-h3-ref2va-q4k",
+        // Re-pointed at config/qwen3.8-27b-metal-dflash2.json's UD-IQ3_XXS + DFlash2 Q4_K_M
+        // on 2026-11-05 (see Successors).
+        "qwen3.8-27b-q4kxl",
     };
 
     /// <summary>
@@ -651,6 +664,7 @@ public static partial class ModelCatalog
             ["qwen-image-2.1-turbo-adq4k"] = "qwen-image-2.1-turbo-q5ks",
             ["qwen-image-2.1-turbo-q8"] = "qwen-image-2.1-turbo-q8-0",
             ["minimax-h3-ref2va-q4k"] = "minimax-h3-fl2va-q4k",
+            ["qwen3.8-27b-q4kxl"] = "qwen3.8-27b-iq3xxs",
         };
 
     /// <summary>Whether <paramref name="id"/> is one of the <see cref="Retired"/> ids.</summary>
