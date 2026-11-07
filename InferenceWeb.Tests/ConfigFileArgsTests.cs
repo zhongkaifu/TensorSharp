@@ -110,6 +110,8 @@ public class ConfigFileArgsTests : IDisposable
         "model", "mmproj", "backend", "max-tokens", "host", "port", "urls", "no-webui",
         "embeddings", "embedding-threads", "embedding-context-size",
         "no-prefix-cache",
+        // Consumed by TelemetryCliFlags in Program.cs before ServerOptionsBuilder runs.
+        "otel-endpoint",
         "temperature", "top-k", "top-p", "min-p", "seed", "stop", "sampling-precedence",
         "repeat-penalty", "repeat-last-n", "presence-penalty", "frequency-penalty",
         "continuous-batching", "no-continuous-batching",

@@ -1,5 +1,6 @@
 // Copyright (c) Zhongkai Fu. Licensed under the BSD-3-Clause license.
 using System.Text;
+using System.Text.Json.Serialization;
 using System.Threading.Channels;
 
 namespace TensorSharp.Studio;
@@ -13,6 +14,13 @@ internal sealed class StudioJobRecord
     /// <summary>The take's last frame, saved losslessly in the job directory before its video was encoded; null when
     /// the adapter kept none. <see cref="StudioService.ExtractFrameAsync"/> starts the next segment of a chain on it.</summary>
     public string? LastFrameFileName { get; set; }
+    /// <summary>The W3C trace context (<c>traceparent</c>, <c>tracestate</c>) of the request that queued the job, when
+    /// Studio traces were being recorded. The job runs in a trace of its own that links back to it, also after a
+    /// restart. Left out of the file when null, and an older host skips them.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? TraceParent { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? TraceState { get; set; }
     // Live step timing behind the remaining-time estimate. Fields are not serialized: a restart interrupts running work.
     internal int FirstStep, LastStep;
     internal DateTimeOffset FirstStepAt, LastStepAt;
@@ -67,12 +75,15 @@ public sealed partial class StudioService
                     record.Job.Error = "The host stopped before this job finished. Retry with a new request identifier. Inference cannot resume mid-denoising.";
                 }
                 SaveJob(record);
+                // Any span the job had was lost with the process that queued or ran it, so this one records how it ended.
+                StudioTelemetry.TraceJobNotRun(record);
             }
             jobs.Add(id, record);
             // Partial work is never presented as a completed artifact. A restart can safely discard only job-owned scratch.
             var scratch = StudioPaths.SafeChild(directory, "work");
             if (Directory.Exists(scratch) && record.Job.State != "running") CleanupScratchTree(scratch, ref cleanupBudget);
         }
+        StudioTelemetry.Track(this);
         worker = Task.Run(ProcessJobsAsync);
     }
     public Task<IReadOnlyList<StudioJob>> ListJobsAsync(string projectId, CancellationToken cancellationToken = default)
@@ -91,7 +102,7 @@ public sealed partial class StudioService
         {
             if (!jobs.TryGetValue(jobId, out var record)) throw new StudioException("job_not_found", "Job does not exist.");
             var now = DateTimeOffset.UtcNow;
-            if (record.Job.State == "queued") { Finish(record.Job, "cancelled", now); SaveJob(record); }
+            if (record.Job.State == "queued") { Finish(record.Job, "cancelled", now); SaveJob(record); StudioTelemetry.TraceJobNotRun(record); }
             else if (record.Job.State == "running")
             {
                 record.Job.State = "cancelling"; EnterStage(record.Job, "cancelling", now); SaveJob(record);
@@ -246,6 +257,8 @@ public sealed partial class StudioService
             if (existing != null) return existing;
             if (jobs.Values.Count(r => r.Job.State is "queued" or "running" or "cancelling") >= Options.MaxQueuedJobs)
                 throw new StudioException("queue_full", "The local media job queue is full. Wait or cancel queued work before retrying.");
+            // The worker runs the job outside this request, so its trace can only link back to it.
+            StudioTelemetry.CaptureQueuingContext(record);
             jobs.Add(record.Job.Id, record); SaveJob(record);
             if (!queue.Writer.TryWrite(record.Job.Id)) { jobs.Remove(record.Job.Id); Directory.Delete(JobDirectory(record.Job.Id), true); throw new StudioException("queue_full", "The local job queue is full."); }
             return Present(record, DateTimeOffset.UtcNow);
@@ -266,11 +279,12 @@ public sealed partial class StudioService
         if (job.StageStartedAt is { } since) job.Stages.Add(new(job.Stage, Math.Max(0, (now - since).TotalSeconds)));
         job.Stage = stage; job.StageStartedAt = now; job.Detail = null;
     }
-    // Call under jobSync. A job that has ended is in no stage.
+    // Call under jobSync. A job that has ended is in no stage. Every way a job ends comes through here.
     static void Finish(StudioJob job, string state, DateTimeOffset now)
     {
         EnterStage(job, state, now);
         job.State = state; job.StageStartedAt = null; job.FinishedAt = now;
+        StudioTelemetry.RecordJobDuration(job);
     }
     // Call under jobSync. Returns whether the report opened a new stage.
     static bool Advance(StudioJobRecord record, StudioProgress p, DateTimeOffset now)
@@ -297,6 +311,19 @@ public sealed partial class StudioService
         int? ahead = job.State == "queued" ? jobs.Values.Count(r => r.Job.State is "running" or "cancelling" || r.Job.State == "queued" && r.Job.CreatedAt < job.CreatedAt) : null;
         job.Timing = Measure(record, now, active ? PreviousRun(record)?.Job : null, ahead);
         return job;
+    }
+    /// <summary>The jobs waiting for the worker and those it is running (a job being cancelled still holds it), for
+    /// Studio's gauges. Called on the metrics collection thread.</summary>
+    internal (int Queued, int Running) CountActiveJobs()
+    {
+        lock (jobSync)
+        {
+            int queued = 0, running = 0;
+            foreach (var r in jobs.Values)
+                if (r.Job.State == "queued") queued++;
+                else if (r.Job.State is "running" or "cancelling") running++;
+            return (queued, running);
+        }
     }
     // Call under jobSync. The latest completed generation of the same model and settings: the only measure of the
     // stages before and after denoising, which a live step rate cannot predict.
@@ -501,6 +528,8 @@ public sealed partial class StudioService
                         if (Advance(record, p, now) || now - lastSave > TimeSpan.FromMilliseconds(300)) { CheckDisk(); SaveJob(record); lastSave = now; }
                     }
                 });
+                // The job's own trace, current while it runs, so the generation's spans nest under it.
+                var activity = StudioTelemetry.StartJob(record); Exception? failure = null;
                 try
                 {
                     CheckDisk();
@@ -539,6 +568,7 @@ public sealed partial class StudioService
                 }
                 catch (Exception e)
                 {
+                    failure = e;
                     try { Options.LogJobFailure?.Invoke(FailureDiagnostic(record.Job, e)); }
                     catch (Exception) { /* A diagnostic sink must not stop this worker or prevent the durable job save. */ }
                     lock (jobSync) { Finish(record.Job, "failed", DateTimeOffset.UtcNow); record.Job.Error = e is OutOfMemoryException ? "Insufficient memory. Release other loaded models or explicitly choose lower settings, then retry." : e.Message; SaveJob(record); }
@@ -548,6 +578,8 @@ public sealed partial class StudioService
                     lock (jobSync) jobCancellations.Remove(id);
                     cancellation.Dispose();
                     try { if (Directory.Exists(workDirectory)) Directory.Delete(workDirectory, true); } catch (IOException) { }
+                    // After the cleanup, so telemetry can never leave a work directory behind. The job has ended by now.
+                    StudioTelemetry.EndJob(activity, record, failure);
                 }
             }
         }
@@ -559,8 +591,9 @@ public sealed partial class StudioService
         await worker;
         lock (jobSync)
         {
-            foreach (var record in jobs.Values.Where(r => r.Job.State == "queued")) { Finish(record.Job, "interrupted", DateTimeOffset.UtcNow); record.Job.Error = "Host stopped before this queued job started. Retry with a new request identifier."; SaveJob(record); }
+            foreach (var record in jobs.Values.Where(r => r.Job.State == "queued")) { Finish(record.Job, "interrupted", DateTimeOffset.UtcNow); record.Job.Error = "Host stopped before this queued job started. Retry with a new request identifier."; SaveJob(record); StudioTelemetry.TraceJobNotRun(record); }
         }
+        StudioTelemetry.Untrack(this);
         shutdown.Dispose();
     }
 }

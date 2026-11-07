@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Threading;
 
 namespace TensorSharp.MLX
@@ -84,6 +85,12 @@ namespace TensorSharp.MLX
 
         private void Run()
         {
+            // Thread.Start flowed the context of whatever first touched Shared (a model load,
+            // a request), including its Activity.Current. Work items do not carry their caller's
+            // context, so without this every later item, from any request, would see that old
+            // span as current and parent its own spans under an unrelated trace.
+            Activity.Current = null;
+            TensorSharp.Runtime.Telemetry.TelemetryContext.Clear();
             Volatile.Write(ref workerThreadId, Thread.CurrentThread.ManagedThreadId);
             foreach (IWorkItem item in queue.GetConsumingEnumerable())
                 item.Execute();

@@ -21,6 +21,7 @@
 - **文本与多模态模型。** 支持稠密与 MoE GGUF 模型、推理、图像 / 音频输入和文档问答。各模型家族的能力见[支持的模型](docs/supported_models_zh-cn.md)。
 - **嵌入与媒体生成。** [EmbeddingGemma 2](docs/embeddings_zh-cn.md) 提供文本 / 代码嵌入及可选的图像、音频和视频输入；[Qwen-Image-2.1 与 Turbo](docs/models/qwenimage21_zh-cn.md) 支持图像生成与蒙版编辑；[LTX 2.5 Distilled](docs/models/ltx-2.5_zh-cn.md)（48 kHz）与 [MiniMax-H3](docs/models/minimax-h3_zh-cn.md)（32 kHz）支持视频与立体声音频联合生成。
 - **高效服务。** 连续批处理与分页、Radix 前缀共享 KV 缓存默认开启；支持的模型还可使用投机解码与多 GPU 放置。详见[功能说明](FEATURES_zh-cn.md)。
+- **可选的 OpenTelemetry 遥测。** 服务端与 CLI 可以导出聊天、嵌入、工具调用、模型加载、图像与视频生成以及 Video Studio 任务的 trace、指标和日志，通过 OTLP 发送，或直接发往 Azure Application Insights。默认关闭；除非显式开启，提示词与输出都不会进入导出数据。详见[遥测](USAGE_zh-cn.md#遥测opentelemetry)与[现成的后端示例](examples/opentelemetry/README.md)（英文）。
 - **Agent Skills 与代码工具。** `TensorSharp.AgentHost` 提供文件、shell 和文档工作流。[17 个随附技能](docs/agent_skills.md)（英文）涵盖研究、文档、TDD、设计访谈与交接；开启联网后，`find-skills` 可搜索、检查并安装更多技能。服务端与 TensorAgent 聊天还支持[有界子智能体委派](docs/multi_agent.md)（英文），子智能体拥有私有工作区并默认只读。
 - **个人知识库。** [上传文件或嵌套目录，导入已保存聊天及其附件和产物](docs/knowledge-system_zh-cn.md)。按聊天选择集合，检索带页码 / 行号 / 时间位置的引用片段、预览原件，或让代码智能体打开完整数据集。默认使用本地 BM25，可选 GGUF 嵌入提供语义搜索；兼容的媒体模型可索引图像、音频和采样视频。提取状态与警告显示覆盖边界。
 - **生成中追加指令。** CLI、服务端 Web UI 和 TensorAgent 在推理或回答时都可提交新指令；后续回答使用对话、已有部分输出与新指导。仍可单独停止当前生成。

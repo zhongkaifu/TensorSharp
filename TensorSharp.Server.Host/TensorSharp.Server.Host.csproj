@@ -65,6 +65,13 @@
 
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Server\TensorSharp.Server.csproj" />
+    <ProjectReference Include="..\TensorSharp.Telemetry\TensorSharp.Telemetry.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- HTTP server spans and ASP.NET Core metrics for the opt-in OpenTelemetry pipeline;
+         the rest of the SDK comes from TensorSharp.Telemetry. -->
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.20.1" />
   </ItemGroup>
 
 </Project>

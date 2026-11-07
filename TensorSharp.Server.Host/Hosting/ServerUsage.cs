@@ -736,6 +736,19 @@ namespace TensorSharp.Server.Host.Hosting
                     "wanted. Default: 32768.",
                     "--code-exec-max-output 65536"),
             }),
+            ("Telemetry (OpenTelemetry traces, metrics and logs; off by default)", new[]
+            {
+                new OptionHelp("--otel-endpoint <url>",
+                    "Export traces, metrics and logs over OTLP to this collector (the Aspire dashboard, Jaeger, " +
+                    "Grafana, or an OpenTelemetry Collector). An absolute http:// or https:// URL: gRPC by " +
+                    "default, usually port 4317; port 4318 with OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf. It sets " +
+                    "OTEL_EXPORTER_OTLP_ENDPOINT and wins over an inherited value. Every other setting (protocol, " +
+                    "headers, service name, sampler, APPLICATIONINSIGHTS_CONNECTION_STRING) is an environment " +
+                    "variable, which a --config file can also set through its \"environment\" object. Prompts, " +
+                    "model output and upload names are redacted from exported data unless " +
+                    "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true. Default: off.",
+                    "--otel-endpoint http://localhost:4317"),
+            }),
             ("Configuration file", new[]
             {
                 new OptionHelp("--config <path>",
@@ -888,6 +901,10 @@ namespace TensorSharp.Server.Host.Hosting
             writer.WriteLine();
             writer.WriteLine("Logging env vars: TENSORSHARP_LOG_LEVEL (Information), TENSORSHARP_LOG_DIR (./logs),");
             writer.WriteLine("TENSORSHARP_LOG_FILE=0 disables file logging.");
+            writer.WriteLine("OpenTelemetry (off by default): OTEL_EXPORTER_OTLP_ENDPOINT or --otel-endpoint <url> (any collector),");
+            writer.WriteLine("APPLICATIONINSIGHTS_CONNECTION_STRING (Application Insights), TENSORSHARP_OTEL=1 (localhost:4317),");
+            writer.WriteLine("OTEL_SDK_DISABLED=true forces it off. Prompts and output are redacted unless");
+            writer.WriteLine("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true.");
         }
 
         private const int WrapColumn = 100;

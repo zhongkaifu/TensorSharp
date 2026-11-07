@@ -1492,6 +1492,14 @@ public static class ServerOptionsBuilder
             {
                 continue;
             }
+            // --otel-endpoint is consumed (and removed) by TelemetryCliFlags.Consume in
+            // Program.cs before Build runs, like the code-execution flags above, and is
+            // recognised + skipped here for the same reason: a Build handed the raw command
+            // line must not trip the unknown-arg trap on a documented flag.
+            if (TryReadOption(args, ref i, OtelEndpointFlag, out _))
+            {
+                continue;
+            }
             // Qwen-Image-2.1 companion flags are consumed by
             // ApplyQwenImageCompanionCliFlags(args) in a separate
             // pass. Recognise + skip them here so they don't trip the
@@ -1585,6 +1593,9 @@ public static class ServerOptionsBuilder
             // "Unknown option" with no hint, because CodeExecOptions.Parse does not
             // match a misspelling and nothing else knew the names.
             "--config",
+            // Consumed before Build, so a typo like --otel-endpiont reaches the trap
+            // here; without this entry it would get no hint.
+            OtelEndpointFlag,
         };
         // Taken from CodeExecOptions' own tables rather than copied: without these a
         // typo like --code-exe fell through to a bare "Unknown option" with no hint,
@@ -1625,6 +1636,14 @@ public static class ServerOptionsBuilder
 
     internal static readonly string[] CodeExecValueFlags =
         CodeExecOptions.ValueFlags.ToArray();
+
+    /// <summary>
+    /// The OpenTelemetry collector flag. A literal, because TensorSharp.Server does not
+    /// reference TensorSharp.Telemetry: it must equal
+    /// <c>TensorSharp.Telemetry.TelemetryCliFlags.EndpointFlag</c>, which Program.cs uses
+    /// to consume it.
+    /// </summary>
+    internal const string OtelEndpointFlag = "--otel-endpoint";
 
     /// <paramref name="flags"/> (case-insensitive). Used to consume the
     /// valueless switches an earlier applier pass already handled.</summary>

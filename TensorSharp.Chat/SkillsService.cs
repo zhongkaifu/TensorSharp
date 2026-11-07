@@ -310,8 +310,9 @@ namespace TensorSharp.Chat
             string extension = Path.GetExtension(fileName ?? string.Empty);
             if (!string.Equals(extension, ".zip", StringComparison.OrdinalIgnoreCase))
             {
+                // The client's own file name, so it is content.
                 logger.LogWarning(LogEventIds.SkillRejected,
-                    "skills.upload.rejected reason=extension name={FileName}", fileName);
+                    "skills.upload.rejected reason=extension name={FileName}", LogContent.Of(fileName));
                 throw new WebUiRequestRejectedException(400,
                     new { error = "A skill must be uploaded as a .zip containing its SKILL.md." });
             }

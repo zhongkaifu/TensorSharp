@@ -47,8 +47,15 @@ public partial class ModelService
             var childSession = new ChatSession();
             sessions.Add(childSession);
             var childTurn = CreateChildTurnContext(rootTurn, publicProfiles);
+            // The child's loop calls this once per round, so counting calls numbers its
+            // rounds for the generation spans (tensorsharp.round) without the loop's help.
+            int childRound = 0;
             return async (childMessages, childTools, ct) =>
             {
+                // An async method, not an iterator, so the round stays set for the whole
+                // generation; the parent's round, inherited when the child was spawned, is
+                // put back afterwards.
+                using var roundScope = TelemetryContextScope.Round(Interlocked.Increment(ref childRound));
                 var parser = OutputParserFactory.Create(Architecture);
                 parser.Init(enableThinking, childTools);
                 var content = new StringBuilder();

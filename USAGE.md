@@ -571,6 +571,7 @@ script gets that error instead of watching a setting be ignored.
 | `--log-dir <path>` | Directory for the JSON-line file logger (default: `<binDir>/logs`) |
 | `--log-file <0\|1>` | Disable (`0`) or enable (`1`) the file logger (default: enabled) |
 | `--log-console <0\|1>` | Disable (`0`) or enable (`1`) the console logger (default: enabled) |
+| `--otel-endpoint <url>` | Export OpenTelemetry traces, metrics and logs over OTLP to this collector or dashboard. Sets `OTEL_EXPORTER_OTLP_ENDPOINT`, replacing an inherited value; every other telemetry setting is an environment variable. Default: off. See [Telemetry (OpenTelemetry)](#telemetry-opentelemetry). |
 
 The CLI's companion lookup knows only the file names listed under `--mmproj`, and current repositories often use different ones, so pass the downloaded file explicitly with `--mmproj` for reliable multimodal runs. `TensorSharp.Server.Host` never auto-detects the projector.
 
@@ -872,6 +873,7 @@ of quietly losing a setting.
 | `--draft-model <path>` | Speculative-decoding draft model, for every drafter that ships as its own file: DeepSeek V4's DSpark support GGUF (see [DeepSeek V4](docs/models/deepseek4.md#dspark-speculative-decoding)), Muse-Glimmer's DFlash and Qwen 3.8's DFlash2 block drafters (see [Muse-Glimmer](docs/models/muse-glimmer.md#3-dflash-speculative-decoding)), Gemma 4's `gemma4-assistant` per-token head, and Qwen 3.8 Flash Next's shared MTP head (GGML backends only; it drafts only for a solo request that prefilled from position 0 — see [its card](docs/models/qwen38-flash-next.md#speculative-decoding-with-the-shared-mtp-head)). DeepSeek V4.1 accepts a `deepseek41-dspark` drafter on `ggml_cuda` / `ggml_cpu` only — experimental; initial text/image HTTP probes with trained weights passed using two-GPU layer split on `ggml_cuda`; broad quality and throughput remain unqualified. The file's own `general.architecture` decides how it loads — the operator never picks a mechanism — and naming a file here enables speculation by itself, with an explicit `--no-spec` as the veto. The draft's hidden size must match the target (e.g. pair the 12B target with its 12B draft, not the 26B-A4B draft); a mismatched or incomplete draft fails fast at startup with a remediation hint. Qwen 3.6, Qwen 3.8 27B, GLM 5.2 and GLM-5.3 embed their NextN block in the trunk GGUF and need no such flag — they take `--spec` instead. A block drafter drafts a whole block per step and the trunk verifies it in one batched forward. Every emitted token is still drawn from a trunk row — with argmax under a greedy config, with the run's own sampler otherwise — so the output stream is unchanged either way, up to floating-point near-ties between the verify and decode kernels ([what greedy parity delivers](docs/speculative_decoding.md#what-greedy-parity-delivers)). DeepSeek V4's DSpark block drafting needs `--backend cuda` or `--backend ggml_cuda`; the DFlash / DFlash2 drafters (Muse-Glimmer, Qwen 3.8) run as one fused GGML graph per pass on CUDA, Vulkan and Metal ([where it runs](docs/speculative_decoding.md#where-it-runs)), on one GPU: under `--tp N` > 1 a DFlash / DFlash2 drafter cannot activate, so an explicit one stops server startup (exit code 2) with a message saying to drop `--draft-model`. One caveat under a penalized sampler: a block drafter proposes its whole block in one pass, so the repetition/presence/frequency penalties that verification applies are not applied to the proposal, and acceptance falls as the penalized history grows. A per-token head does not have that problem — its drafts are penalized with the same history. Env: `TS_SPEC_DRAFT_MODEL`. **Nemotron-H refuses it:** an explicit `--draft-model` (such as Nemotron 3.5 Lightning's DSpark GGUF) stops server startup with the model's reason and says to drop the flag, and `--spec`/`--spec-type ngram` serve plain decoding with a one-time warning, because that trunk's verify and decode kernels disagree and speculation would change the output (see [speculative decoding](docs/speculative_decoding.md#nemotron-h-refuses-speculation)). |
 | `--paged-kv` / `--no-paged-kv` / `--paged-kv-*` | **Removed and rejected at startup, including as config-file keys**, as on the CLI (see the CLI table above): the standalone paged KV cache they configured is gone. Prompt reuse across requests is the radix prefix cache (`--no-prefix-cache`). |
 | `--redis-url <url>` | Redis connection string (e.g. `localhost:6379`) for the Responses API store (`--help` lists it under "Responses API store"). Sets `TS_RESPONSES_STORE_REDIS_URL`, which moves that store to Redis (an already-set `TS_RESPONSES_STORE_REDIS_URL` wins; in-memory otherwise; see [Redis-backed shared state](#redis-backed-shared-state)). Startup logs `Redis configured via --redis-url: the Responses API store uses <url>.` |
+| `--otel-endpoint <url>` | Export OpenTelemetry traces, metrics and logs over OTLP to this collector or dashboard: an absolute `http://` or `https://` URL, gRPC by default (usually port 4317; 4318 with `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`). Sets `OTEL_EXPORTER_OTLP_ENDPOINT`, replacing an inherited value; every other telemetry setting is an environment variable, which a `--config` file can set through its `"environment"` object. Default: off. See [Telemetry (OpenTelemetry)](#telemetry-opentelemetry). |
 
 Per-request fields in the chat / generate JSON payloads (e.g. `temperature`,
 `top_p`, `top_k`, `min_p`, `repeat_penalty`, `repeat_last_n`, `presence_penalty`,
@@ -940,6 +942,7 @@ latency, quality or delegation-rate measurements are published. Full design:
 | `TENSORSHARP_LOG_LEVEL` | Minimum log level for both console and file loggers: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical` (default: `Information`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_DIR` | Directory the JSON-line file logger writes to (default: `<binDir>/logs`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_FILE` | Set to `0` to disable the file logger and keep only the console output (default: enabled). Also honored by `TensorSharp.Cli`. |
+| `OTEL_*`, `APPLICATIONINSIGHTS_CONNECTION_STRING`, `TENSORSHARP_OTEL*`, `TENSORSHARP_AZURE_MONITOR_AAD` | OpenTelemetry export of traces, metrics and logs, off by default; see [Telemetry (OpenTelemetry)](#telemetry-opentelemetry). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_UPLOAD_DIR` | Directory for uploaded media and extracted video frames (default: `<binDir>/uploads`); point it outside the application directory for read-only or pinned deployments. Server only. |
 | `TS_UPLOAD_MAX_MB` / `TS_UPLOAD_QUOTA_MB` / `TS_UPLOAD_TTL_HOURS` | Upload per-file cap (default `500`), directory quota (default off) and file lifetime (default off) when `--upload-max-mb` / `--upload-quota-mb` / `--upload-ttl-hours` are not passed. Server only. |
 | `TENSORSHARP_PREFIX_CACHE_DIR` | Root of the persisted shared-prefix checkpoints (default: `<binDir>/prefix-cache`, one subdirectory per model). Server only; `--no-prefix-cache` turns persistence off. |
@@ -2454,6 +2457,23 @@ with `--sampling-precedence request` (see [Web Application](#web-application)).
 | File logger enabled | ON | `TENSORSHARP_LOG_FILE=0` to disable | `--log-file 0\|1` (CLI only) |
 | Console logger enabled | ON | — | `--log-console 0\|1` (CLI only) |
 
+#### Telemetry (OpenTelemetry, server + CLI)
+
+See [Telemetry (OpenTelemetry)](#telemetry-opentelemetry) for what each one does.
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| Export traces, metrics and logs | **OFF** | Any of **`OTEL_EXPORTER_OTLP_ENDPOINT`**, **`OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT`**, **`APPLICATIONINSIGHTS_CONNECTION_STRING`**, **`TENSORSHARP_OTEL=1`**, or an `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` naming `otlp` / `console` | `--otel-endpoint <url>` (CLI and server; sets `OTEL_EXPORTER_OTLP_ENDPOINT`) |
+| Force off | — | `OTEL_SDK_DISABLED=true` | — |
+| OTLP protocol, headers, timeout | `grpc`, none, `10000` ms | `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT`; per signal `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_{HEADERS,PROTOCOL,TIMEOUT}` | — |
+| Sinks of one signal | OTLP when an endpoint (or `TENSORSHARP_OTEL`) is set, plus Application Insights when its connection string is | `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=otlp,console,none` | — |
+| Service name and resource attributes | `tensorsharp-server` / `tensorsharp-cli`; `service.instance.id` = `<machine>:<pid>` | `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | — |
+| Trace sampling | every trace | `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` (mapped onto the Application Insights sampler while it receives traces) | — |
+| Application Insights with Entra ID | connection-string key | `TENSORSHARP_AZURE_MONITOR_AAD=1` | — |
+| Lowest exported log level | the console / file level | `TENSORSHARP_OTEL_LOG_LEVEL`; on the server also `Logging__OpenTelemetry__LogLevel__Default` | — |
+| Prompts, output and other content in exported data | **OFF** (redacted) | **`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`** | — |
+| One span per engine step | OFF | **`TENSORSHARP_OTEL_TRACE_STEPS=1`** | — |
+
 #### Native build (compile-time only)
 
 These are read by `build-linux.sh` / `build-windows.ps1` / the auto-build during `dotnet build` for `TensorSharp.GGML.Native`, not at run time.
@@ -2557,6 +2577,404 @@ The same per-turn KV cache reuse stats are surfaced through every API:
 
 The Web UI footer line under each assistant message also surfaces the cache hit
 inline (e.g. `187 tokens · 2.1s · 87.2 tok/s · KV 420/512 (82%)`).
+
+## Telemetry (OpenTelemetry)
+
+`TensorSharp.Server.Host` and `TensorSharp.Cli` can export traces, metrics and logs with
+OpenTelemetry: over OTLP to any collector or dashboard (the Aspire dashboard, Jaeger, Grafana, an
+OpenTelemetry Collector), directly to Azure Application Insights, or to both at once. It is off by
+default. With nothing set, no OpenTelemetry SDK is started, and TensorSharp's own instrumentation
+records nothing, because nothing listens to it. Ready-made backends and Application Insights queries
+are in [`examples/opentelemetry/`](examples/opentelemetry/README.md).
+
+### Turning it on
+
+Telemetry turns on as soon as one of these is set:
+
+| Setting | What it exports |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT=<url>`, or `--otel-endpoint <url>` | Traces, metrics and logs over OTLP to that endpoint |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT=<url>` | That one signal over OTLP, to its own endpoint |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING=<connection string>` | Every enabled signal also to Application Insights, from inside the process |
+| `TENSORSHARP_OTEL=1` | All three signals over OTLP to the default endpoint: `http://localhost:4317` for `grpc`, `http://localhost:4318` for `http/protobuf` |
+| `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` naming `otlp` or `console` | That signal to the sinks it names |
+
+`OTEL_SDK_DISABLED=true` keeps it off whatever else is set.
+
+```bash
+# Server: export to a collector or dashboard on this machine
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_cuda
+
+# The same with the flag, which the CLI takes too
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --otel-endpoint http://localhost:4317
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prompt.txt --otel-endpoint http://localhost:4317
+```
+
+`--otel-endpoint <url>` (or `--otel-endpoint=<url>`) is the only telemetry flag, on both hosts. It
+needs an absolute `http://` or `https://` URL, the last one given wins, and it sets
+`OTEL_EXPORTER_OTLP_ENDPOINT`, replacing a value inherited from the environment. Every other
+setting is an environment variable. A [configuration file](config/README.md#environment-defaults)
+can carry both: the flag as its `"otel-endpoint"` key, and any variable in its `"environment"`
+object, where a value already in the process environment wins over the file's:
+
+```json
+{
+  "model": "./models/model.gguf",
+  "otel-endpoint": "http://collector:4317",
+  "environment": {
+    "OTEL_SERVICE_NAME": "tensorsharp-gpu01",
+    "OTEL_RESOURCE_ATTRIBUTES": "deployment.environment=staging"
+  }
+}
+```
+
+Keep OTLP API keys and connection strings out of configuration files that are shared or checked in.
+
+A value TensorSharp cannot use stops either host before it starts, with `Configuration error: ...`
+and exit code `1`: an endpoint that is not an absolute `http://` or `https://` URL (or an
+`--otel-endpoint` with no URL), or, while telemetry is on, an unknown `TENSORSHARP_OTEL_LOG_LEVEL`.
+The protocol and the per-signal settings are checked only when a signal actually exports over OTLP;
+then a protocol other than `grpc` or `http/protobuf`, or a per-signal timeout that is not a positive
+number of milliseconds, is an error too. The `OTEL_*` variables are shared by every OpenTelemetry
+program on the machine, so a value set for another one never stops TensorSharp when its telemetry is
+off or goes to Application Insights only. An exporter name TensorSharp does not know, or a sampler the
+Application Insights exporter cannot apply, is ignored and reported on a `Telemetry: <warning>` line.
+
+### The startup line
+
+Both hosts log one Information line that starts with `Telemetry: `, right after their logging line.
+It names each signal's sinks, the destinations, the service name, whether content capture is on,
+and the trace sampler:
+
+```text
+Telemetry: traces(otlp) metrics(otlp) logs(otlp) -> OTLP http://localhost:4317 (grpc); service tensorsharp-server; content capture off; sampler parentbased_always_on
+Telemetry: traces(otlp,azuremonitor) metrics(otlp,azuremonitor) logs(otlp,azuremonitor) -> OTLP http://localhost:4317 (grpc), Azure Monitor; service tensorsharp-server; content capture off; sampler azuremonitor fixed_percentage(1)
+Telemetry: off (no OTLP endpoint, APPLICATIONINSIGHTS_CONNECTION_STRING or TENSORSHARP_OTEL set)
+```
+
+It never shows OTLP headers or the connection string, and drops a `user:password@` part from the
+endpoint. A signal's own OTLP endpoint or protocol is shown inside the parentheses, after the
+general protocol: `OTLP http://localhost:4317 (grpc; metrics: http/protobuf)`, or
+`OTLP http://collector:4317 (grpc; traces: http://tempo:4318/v1/traces http/protobuf)`.
+`Azure Monitor (Entra ID)`, `content capture ON` and `engine step spans ON` show the opt-ins below.
+
+### Settings
+
+Switches accept `1`, `true`, `yes` or `on`.
+
+| Variable | Effect |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP endpoint for every signal. With `grpc` it is usually port 4317. With `http/protobuf` it is usually port 4318, and the SDK appends `/v1/traces`, `/v1/metrics` and `/v1/logs`. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` (default) or `http/protobuf`. Any other value, `http/json` included, is a configuration error when a signal exports over OTLP, and is not read otherwise. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | `key=value,...` headers on every OTLP export, for example `x-otlp-api-key=<key>` for the Aspire dashboard. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | Export timeout in milliseconds, read by the SDK (default `10000`). |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT` | OTLP for that signal, sent to this URL exactly as given, so an `http/protobuf` URL includes its path (`http://collector:4318/v1/traces`). Signals without their own endpoint are unaffected: with no general endpoint and no `TENSORSHARP_OTEL`, they stay off. |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_HEADERS` | Replaces `OTEL_EXPORTER_OTLP_HEADERS` for that signal. Like the two below, it is read only while that signal exports over OTLP. |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_PROTOCOL` | `grpc` or `http/protobuf` for that signal; anything else is a configuration error. |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_TIMEOUT` | Export timeout for that signal, a positive number of milliseconds; anything else is a configuration error. |
+| `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` | Comma-separated sinks for that signal besides Application Insights: `otlp`, `console` (standard output) or `none`. When set, it replaces the default choice: `otlp` sends to the configured endpoint (or the default one), and `none` turns the signal off for every sink, Application Insights included. When unset, the signal goes over OTLP if the general endpoint, its own endpoint or `TENSORSHARP_OTEL` is set. Unknown names are ignored with a warning. TensorSharp reads these itself; the .NET SDK does not. |
+| `OTEL_SDK_DISABLED` | `true`: off, whatever else is set (`Telemetry: off (OTEL_SDK_DISABLED=true)`). |
+| `OTEL_SERVICE_NAME` | Service name. Default: `tensorsharp-server`, or `tensorsharp-cli`. |
+| `OTEL_RESOURCE_ATTRIBUTES` | `key=value,...` resource attributes. They win over TensorSharp's own: `service.version` (the TensorSharp version), `service.instance.id` (`<machine>:<pid>`), `host.name`, `process.pid`, and `tensorsharp.tp.node_id` / `tensorsharp.tp.degree` from `TENSORSHARP_TP_NODE_ID` / `TENSORSHARP_TP_DEGREE`. |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Trace sampling. Default `parentbased_always_on`: every trace, following the decision of a client's `traceparent`. Without Application Insights the SDK applies the standard values (`traceidratio` with `OTEL_TRACES_SAMPLER_ARG=0.1` keeps 10%). While Application Insights receives traces, the value is mapped onto its sampler; see [Application Insights](#application-insights). |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | Application Insights connection string. Every enabled signal also goes there, and on its own it turns all three on. |
+| `TENSORSHARP_AZURE_MONITOR_AAD` | Switch: authenticate to Application Insights with Entra ID (`DefaultAzureCredential`) instead of the connection string's key. The connection string is still required; without it this does nothing. |
+| `TENSORSHARP_OTEL` | Switch: turn telemetry on, with OTLP to the default endpoint, for a collector or dashboard on this machine. |
+| `TENSORSHARP_OTEL_LOG_LEVEL` | Lowest level of exported logs: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical` or `None`. Default: the console and file level (`TENSORSHARP_LOG_LEVEL`, or `--log-level` on the CLI). It does not change the console or the file. `Microsoft.AspNetCore` categories stay at `Warning` in the export, as on the console. |
+| `Logging__OpenTelemetry__LogLevel__Default` | Server only: the ASP.NET Core configuration key for the same level (also accepted in `appsettings.json`, and per category as `Logging__OpenTelemetry__LogLevel__<category>`). Set this or `TENSORSHARP_OTEL_LOG_LEVEL`, not both. |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | `true`: export content too (prompts, model output, tool arguments and results, commands, upload names and paths). Off by default; see [What stays private](#what-stays-private). |
+| `TENSORSHARP_OTEL_TRACE_STEPS` | Switch: one `inference.step` span per engine step, for profiling a single run. Noisy; leave it off in production. |
+
+The other standard variables the OpenTelemetry .NET SDK reads itself, such as
+`OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BLRP_SCHEDULE_DELAY` and `OTEL_METRIC_EXPORT_INTERVAL`, work as the
+OpenTelemetry documentation describes. The exception is Application Insights, which receives metrics
+every 60 seconds whatever `OTEL_METRIC_EXPORT_INTERVAL` says (its exporter fixes the interval). Either
+way, the server and the CLI export the metrics once more as they stop, while the model is still
+loaded, so a short run still reports its gauges. The server does this when it stops serving, with
+the spans and logs collected so far, and waits for it at most 5 seconds in all; then it goes on
+disposing the models while a slow or unreachable exporter finishes or times out in the background,
+and the exporters flush once more when they are disposed. The CLI does it at the end of the run,
+when a one-shot mode finishes or the interactive session exits, with the same 5-second limit; an
+interactive reset (a new system prompt, a skill change) or a `/model` switch skips it, so the
+prompt never waits on an export.
+
+### What is traced
+
+A chat request (`POST /v1/chat/completions`, `/v1/responses`, Ollama's `/api/chat/ollama`, or the
+Web UI's `/api/chat`) is one trace:
+
+```text
+POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensorsharp.protocol, gen_ai.response.id
+└─ chat <model>                gen_ai.request.model, gen_ai.request.* sampling, gen_ai.usage.input_tokens /
+   │                           output_tokens / cache_read.input_tokens, gen_ai.response.finish_reasons,
+   │                           tensorsharp.ttft_ms, tensorsharp.backend, tensorsharp.outcome
+   ├─ prompt.render            chat template and tokenization, until the request reaches the engine
+   ├─ inference.queue          waiting for the scheduler
+   ├─ inference.prefill        until the first token; tensorsharp.compute.prefill_ms
+   └─ inference.decode         the rest; tensorsharp.compute.decode_ms
+```
+
+- `<model>` is the model file name without its directory or extension. `tensorsharp.request_id` is
+  the `X-TensorSharp-Request-Id` the server returns (its first 64 characters), so a quoted id finds
+  its trace. `gen_ai.response.id` is on the server span of the OpenAI routes: `chatcmpl-...` always,
+  and `resp_...` only for a `/v1/responses` request with `"store": false` (or with content capture
+  on), because the id of a stored response is all it takes to read the whole response back. A client
+  that sends a W3C `traceparent` header gets the request in its own trace.
+- The `inference.*` spans are wall time. Under continuous batching that overlaps with other
+  requests, so `tensorsharp.compute.prefill_ms` and `tensorsharp.compute.decode_ms` give this
+  request's own share of engine time.
+- Ollama's `/api/generate` is `text_completion <model>`. Embeddings (`/v1/embeddings`, `/api/embed`)
+  are `embeddings <model>`, with `tensorsharp.embedding.inputs`.
+- DiffusionGemma's chat span has `prompt.render` and one `diffusion.denoise` span with a `preview`
+  event per preview. A Jev request (`POST /v1/systemone`) is a `chat <model>` span.
+- Skills and code-execution turns record one chat span per round (`tensorsharp.round`), one
+  `execute_tool <tool>` span per tool call TensorSharp runs (`gen_ai.tool.name`,
+  `gen_ai.tool.call.id`, `tensorsharp.outcome`), and a `codeexec.run` span under it when the tool
+  runs a command (`tensorsharp.codeexec.shell`, `.sandbox`, `.exit_code`, `.timed_out`, `.output_bytes`).
+- Loading a model is `model.load` (`tensorsharp.model.file`, `gen_ai.request.model`,
+  `tensorsharp.backend`, `tensorsharp.model.architecture`, the tensor-parallel and layer-split
+  degrees when above 1, and the outcome), the startup load included; unloading is `model.unload`.
+- TensorSharp's own model calls carry `tensorsharp.internal=true` and `tensorsharp.origin`:
+  `prefix-cache-warmup` for the startup warm-up, `warmup` for the CLI's `--warmup-runs` passes,
+  `knowledge-rerank` and `knowledge-media-extract` for the knowledge library. Leave them out of
+  client-facing dashboards.
+- Qwen-Image-2.1 requests are `generate_image <model>`, with `tensorsharp.image.mode` (`generate` or
+  `edit`) and the outcome.
+- `/health` and the Web UI's `/api/queue/status` polling get no spans and are left out of
+  ASP.NET Core's `http.server.request.duration` metric. Outgoing `HttpClient` calls the process
+  makes while telemetry runs are client spans.
+
+Request, tool, model-load and media spans end with `tensorsharp.outcome`: `completed`; `cancelled`
+(the client went away or the request was stopped, which is not an error); `refused` (turned down
+before any work, with a short code in `error.type` such as `context_overflow`, `model_unloaded` or
+`invalid_request`); or `failed` (span status Error, and `error.type` is the exception's full type
+name, never its message). Two cases differ. A tool that runs and reports a failure to the model (a
+non-zero exit, a file it could not read) ends `failed` with `error.type=tool_error` and no Error
+status. A refused `model.load` (a missing or invalid file, not enough memory) sets span status
+Error, because the model stays unloaded, and its `error.type` is the exception's full type name,
+not a short code.
+
+**Video.** A MiniMax-H3 or LTX 2.5 clip (`POST /v1/videos/generations`, `/api/video-generate`, a
+Video Studio job, or the CLI) is a `generate_video <model>` span with one child per phase and, inside
+a phase, one per stage:
+
+```text
+generate_video <model>         tensorsharp.video.mode / width / height / frames / fps / steps / seed / audio, tensorsharp.outcome
+├─ video.queue                 the wait for the one-clip-at-a-time video lock (server)
+├─ lora.apply                  when LoRA plug-ins are applied (server)
+├─ reference-encode            LTX 2.5 reference images or videos, when given
+├─ image-encode                LTX 2.5 image guides, when given
+├─ text-encode                 MiniMax-H3 stages: text-encoder, prefault-wait, dit-load, image-encode, reference-encode
+├─ denoise                     a "step" event per denoising step; LTX 2.5 stages: first-pass, upscale,
+│                              refine-image-encode, refinement (single-pass when there is no second stage)
+├─ vae-decode                  MiniMax-H3 stages: denoiser-release, vae-open, vae-decode
+├─ audio-decode
+└─ video.export                writing the MP4: tensorsharp.video.codec, tensorsharp.video.bytes
+```
+
+Phase spans carry `tensorsharp.video.phase`, stage spans also `tensorsharp.video.stage`, plus what
+the model reports, such as `tensorsharp.video.cached` on `dit-load` and
+`tensorsharp.video.prompt_cache_hit` on LTX 2.5's `text-encode`. `<model>` is the loaded file's
+name, as for chat, on the server and in the CLI, where the clip is the root of its own trace and a
+clip whose file could not be saved ends as `failed`. `tensorsharp.video.mode` is one of `t2v`, `i2v`, `fl2v`, `ref`,
+`keyframes` or `other`. A clip the server refuses (wrong model, bad parameters, quota) is a short
+`generate_video` span of its own with `tensorsharp.outcome=refused`. Other video models (Wan) get the
+clip span and the phases they report.
+
+**Video Studio.** A Studio job is a trace of its own, `studio.job generate` or `studio.job render`,
+linked to the request that queued it; the link is saved in the job's `job.json`, so it survives a
+restart. The span starts when the job was queued and has a `studio.queue` child, one
+`studio.stage <stage>` child per Studio stage (`starting`, `model-identity`, `encoding`,
+`importing`, `cancelling`, `rendering`, `validating`), and the generation's `generate_video` spans
+inside it. It carries `tensorsharp.studio.job_id`, `.job_kind`, `.project_id` and the outcome. A job
+that never ran (cancelled while queued, found at startup, or still queued at shutdown) gets a span
+with no duration.
+
+**Engine steps.** With `TENSORSHARP_OTEL_TRACE_STEPS=1`, every engine step is an `inference.step`
+span of its own, linked to the chat spans of up to 32 of the sequences it ran, with
+`tensorsharp.model.architecture`, `tensorsharp.engine.batch_size`, `tensorsharp.engine.step_kind`
+(`prefill`, `decode` or `mixed`) and `tensorsharp.engine.scheduled_tokens`.
+
+**The CLI** records the same chat spans (one trace per generation), `codeexec.run` and video clips,
+each as a trace of its own. It has no HTTP span, no `model.load` and no `execute_tool` span. Before
+it exits, after an unexpected error too, it flushes what is left, logs included; that can take a
+few seconds when the collector is slow or unreachable. Set `TENSORSHARP_TP_NODE_ID` rather than
+`--tp-node-id` for the CLI's resource to carry the node id.
+
+**Logs.** Exported log records carry the trace and span ids and, during an HTTP request,
+`tensorsharp.request_id` and `tensorsharp.protocol`; search by `tensorsharp.request_id`. Log scopes
+are not exported: ASP.NET Core's scope holds the raw request path (an upload's file name, a code
+artifact's run id, a stored response's id) and an id of its own under the same `RequestId` key, and
+the trace and span ids lead to the spans that carry the model, backend and session. The console and
+the log file keep their scopes. Lines the engine thread writes have no trace id and no request id;
+`tensorsharp.engine_request_id` on the chat span joins them to their request.
+
+### Metrics
+
+The meters are `TensorSharp` and `TensorSharp.Studio`, plus .NET's `System.Runtime` and
+`System.Net.Http` and, on the server, ASP.NET Core's. Metric attributes stay low-cardinality: ids,
+prompts, sizes and counts are on spans only. The `gen_ai.*` names follow the OpenTelemetry GenAI
+semantic conventions, which are still in development and may change.
+
+| Metric | Type, unit | Attributes |
+|---|---|---|
+| `gen_ai.server.request.duration` | histogram, `s` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `tensorsharp.backend`, `tensorsharp.protocol`, `tensorsharp.origin`, `tensorsharp.outcome`, `error.type` |
+| `gen_ai.server.time_to_first_token` | histogram, `s` | the same, without `tensorsharp.outcome` and `error.type`; completed requests only |
+| `gen_ai.server.time_per_output_token` | histogram, `s` | as time to first token; completed requests with at least two output tokens |
+| `tensorsharp.tokens` | counter, `{token}` | as time to first token, plus `tensorsharp.token.type` (`input`, `output`) |
+| `tensorsharp.tokens.cache_read` | counter, `{token}` | as time to first token. Prompt tokens served from the prefix cache, a subset of `input` |
+| `tensorsharp.engine.step.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind` |
+| `tensorsharp.engine.batch.size` | histogram, `{sequence}` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind` |
+| `tensorsharp.engine.requests.running`, `.waiting` | gauge, `{request}` | `tensorsharp.model.architecture` |
+| `tensorsharp.engine.steps` | counter, `{step}` | `tensorsharp.model.architecture` |
+| `tensorsharp.engine.forward.time` | counter, `s` | `tensorsharp.model.architecture` |
+| `tensorsharp.kv_cache.blocks.used`, `.total` | gauge, `{block}` | `tensorsharp.model.architecture` |
+| `tensorsharp.speculative.tokens.drafted`, `.accepted` | counter, `{token}` | `tensorsharp.model.architecture` |
+| `tensorsharp.model.load.duration` | histogram, `s` | `gen_ai.request.model`, `tensorsharp.backend`, `tensorsharp.outcome`, `error.type` |
+| `tensorsharp.tool.duration` | histogram, `s` | `gen_ai.tool.name`, `tensorsharp.outcome`, `error.type` |
+| `tensorsharp.image.generation.duration` | histogram, `s` | `gen_ai.request.model`, `tensorsharp.image.mode`, `tensorsharp.backend`, `tensorsharp.outcome`, `error.type` |
+| `tensorsharp.video.generation.duration` | histogram, `s` | `gen_ai.request.model`, `tensorsharp.backend`, `tensorsharp.video.mode`, `tensorsharp.video.audio`, `tensorsharp.outcome`, `error.type` |
+| `tensorsharp.video.phase.duration` | histogram, `s` | `gen_ai.request.model`, `tensorsharp.backend`, `tensorsharp.video.phase` |
+| `tensorsharp.video.denoise.step.duration` | histogram, `s` | `gen_ai.request.model`, `tensorsharp.backend`, `tensorsharp.video.stage` |
+| `tensorsharp.video.dit.loads` | counter, `{load}` | `gen_ai.request.model`, `tensorsharp.backend`, `tensorsharp.video.cached` |
+| `tensorsharp.media.generations.active` | gauge, `{generation}` | `tensorsharp.owner` |
+| `tensorsharp.video.queue.waiting` | gauge, `{clip}` | `tensorsharp.owner` |
+| `tensorsharp.gpu.memory.used`, `.total`, `.peak` | gauge, `By` | `tensorsharp.backend`, `tensorsharp.gpu.device` |
+| `tensorsharp.studio.job.duration` | histogram, `s` | `tensorsharp.studio.job_kind`, `tensorsharp.outcome` (the job's final state) |
+| `tensorsharp.studio.jobs.queued`, `.running` | gauge, `{job}` | none |
+
+- The request duration includes queueing and is recorded once per generation, so a skills turn
+  records one value per round. TensorSharp's own calls carry `tensorsharp.origin`; client traffic
+  has none.
+- The `gen_ai.server.*` histograms use the bucket boundaries the GenAI conventions recommend. Model
+  load, image, video and Studio durations use boundaries from 0.5 s up to 2 hours (4 hours for
+  Studio jobs).
+- `tensorsharp.engine.steps` and `tensorsharp.engine.forward.time` keep counting across model swaps.
+- `tensorsharp.video.generation.duration` includes the wait for the video lock. A phase that fails
+  or is cancelled has a span but no `tensorsharp.video.phase.duration` value.
+- The GPU memory gauges report the latest snapshot, taken on the thread that is doing that
+  backend's work, never on the metrics thread: the engine's worker takes one between steps (at most
+  four a second) for the loaded model, and a video clip one at every phase and stage change. A
+  backend appears once a model on it has taken one. MLX reports no total. Snapshots run only while
+  metrics are exported; with telemetry or metrics off, no device query runs.
+
+### What stays private
+
+With content capture off, which is the default:
+
+- Spans carry ids, model and file names (never directory paths), sizes, counts, timings and
+  outcomes. A failure is recorded by its exception type, never its message. As a backstop,
+  `gen_ai.input.messages`, `gen_ai.output.messages` and `tensorsharp.video.prompt` are removed from
+  every span before export.
+- In exported log records, every value TensorSharp marks as content (prompts, chat messages, model
+  output, uploaded file names, paths and URLs, tool arguments, commands, prompt token ids) reads
+  `[redacted: N chars]`, and a record that had content is sent as its message template instead of
+  the rendered line. The text of each marked value (4 characters or more) also becomes `[redacted]`
+  in the record's other attributes and in its exception's message, so an error message that quotes
+  a marked path does not export it either.
+- Exception messages in exported logs are kept, with these replacements: a path under the server's
+  upload directory (and, with `--code-exec`, its code-execution scratch and artifact directories)
+  becomes `<uploads>` as a whole, file name included (up to the closing quote when it is quoted);
+  `/uploads/<file>` URLs become `/uploads/{file}`; and the 32 hex digits of an upload storage name
+  followed by an extension (`<32 hex>.mp4`, `video-<32 hex>.mp4`) become `{id}` anywhere in the
+  message. An exception whose message changed is exported as
+  `TensorSharp.Telemetry.ScrubbedException` (the type OTLP's `exception.type` and Application
+  Insights' `exceptions.type` show), with a message that starts with the original exception's full
+  type name, as in `System.IO.IOException: Could not find file '<uploads>'.`, and the original
+  stack trace. Other exceptions are exported unchanged.
+- Some URLs need no sign-in and are guarded only by an id in the path, so the path itself is
+  content: an upload or generated file (`/uploads/<file>`), a code-execution run's files
+  (`/api/code/artifacts/<run>/...`) and a stored Responses API response (`/v1/responses/<id>`). Their
+  HTTP server spans have `/uploads/{file}`, `/api/code/artifacts/{run}[/{path}]` or
+  `/v1/responses/{id}` in `url.path` and in the name, and the request log lines' path is redacted.
+  For the same reason a stored response's id is not put on its span, and is redacted in the
+  request's log line.
+- The console and the log file are unchanged: they keep every path, id and scope.
+
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` exports all of it: unredacted logs, the
+real request paths and response ids, `gen_ai.input.messages` and `gen_ai.output.messages` on chat spans (role and content
+pairs as JSON, at most 64K characters, keeping the newest messages), `tensorsharp.video.prompt` on
+clips, `tensorsharp.tool.arguments` and `tensorsharp.tool.result` on tool spans, and
+`tensorsharp.codeexec.command` on `codeexec.run`. Image and Studio spans carry no prompt either way.
+Turn it on only when every place the data goes (the collector and its backends, the Application
+Insights resource and its retention, the exporter's local buffer) may hold your users' prompts.
+
+### Application Insights
+
+To send directly from TensorSharp, set the connection string from the resource's Overview page:
+
+```bash
+APPLICATIONINSIGHTS_CONNECTION_STRING="InstrumentationKey=...;IngestionEndpoint=https://..." \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf
+```
+
+- **Entra ID.** `TENSORSHARP_AZURE_MONITOR_AAD=1` signs in with `DefaultAzureCredential` (`az login`
+  locally, a managed identity in Azure). The identity needs the Monitoring Metrics Publisher role on
+  the resource, and the connection string still names the resource.
+- **Together with OTLP.** Set an OTLP endpoint as well, and every signal goes to both.
+- **Sampling.** Every trace is kept by default, not the exporter's own 5 traces per second. The
+  Application Insights sampler decides for the whole process, OTLP included, so
+  `OTEL_TRACES_SAMPLER` is mapped onto it: unset, `always_on` or `parentbased_always_on` keep
+  everything; `always_off` or `parentbased_always_off` keep nothing; `traceidratio`,
+  `parentbased_traceidratio` or `microsoft.fixed_percentage` keep the fraction in
+  `OTEL_TRACES_SAMPLER_ARG` (0 to 1, default 1); `microsoft.rate_limited` keeps
+  `OTEL_TRACES_SAMPLER_ARG` traces per second (default 5). Any other sampler logs a warning and keeps
+  everything. Metrics are never sampled. Below 100%, Application Insights also receives only the log
+  records of the traces that were kept; records outside any trace are always sent.
+- **Live Metrics** is not available: the per-signal exporters TensorSharp uses do not support it, so
+  it is turned off.
+- **Offline storage.** When the exporter cannot reach Application Insights, it keeps the telemetry on
+  local disk and retries later. That is the exporter's default and TensorSharp leaves it alone: under
+  `%LOCALAPPDATA%\Microsoft\AzureMonitor` on Windows, and under the temporary directory elsewhere.
+  What a process could not deliver before it exited is uploaded by a later run; Application
+  Insights refuses items older than 48 hours.
+- **Tables.** HTTP server spans are rows in `requests`. TensorSharp's own spans are all internal, so
+  they are rows in `dependencies` with type `InProc`. Log records go to `traces`, logged exceptions
+  to `exceptions` and metrics to `customMetrics`. `service.name` is `cloud_RoleName` and
+  `service.instance.id` is `cloud_RoleInstance`. Span attributes are in `customDimensions`, where
+  numbers are stored as strings (use `todouble()`).
+- **Percentiles.** Histograms arrive as count, sum, min and max, without buckets, so a metric gives
+  averages only. Take percentiles from span durations, and time to first token from
+  `tensorsharp.ttft_ms` on the chat span.
+- **Through a collector.** [`collector-azuremonitor.yaml`](examples/opentelemetry/collector/collector-azuremonitor.yaml)
+  forwards OTLP to Application Insights with the contrib `azure_monitor` exporter. Point TensorSharp
+  at that collector, and do not also set the connection string on TensorSharp, or every item arrives
+  twice.
+
+[`queries.kql`](examples/opentelemetry/application-insights/queries.kql) has commented queries for
+request and failure rates, time to first token, queue/prefill/decode time, token throughput, video
+phases, Studio jobs, model loads and the logs of one request.
+
+### Quick starts
+
+[`examples/opentelemetry/README.md`](examples/opentelemetry/README.md) has each of these in full.
+
+- **Aspire dashboard**: traces, metrics and structured logs in one browser page, with only Docker.
+  Pick a random key (`openssl rand -hex 32`), then:
+
+  ```bash
+  docker run --rm -d --name aspire-dashboard -p 127.0.0.1:18888:18888 -p 127.0.0.1:4317:18889 -p 127.0.0.1:4318:18890 \
+    -e Dashboard__Otlp__AuthMode=ApiKey -e Dashboard__Otlp__PrimaryApiKey=<key> mcr.microsoft.com/aspire/dashboard:13.6.2
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 OTEL_EXPORTER_OTLP_HEADERS=x-otlp-api-key=<key> \
+  dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf
+  ```
+
+  `docker logs aspire-dashboard` prints a login link; open it as
+  `http://localhost:18888/login?t=<token>`. The dashboard forgets everything when it stops.
+- **Jaeger, Prometheus and Grafana** behind an OpenTelemetry Collector:
+  `cd examples/opentelemetry/collector && docker compose up -d`, then run TensorSharp with
+  `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`. Jaeger is at <http://localhost:16686> (search
+  by the tag `tensorsharp.request_id=<id>`), Prometheus at <http://localhost:9090> and Grafana at
+  <http://localhost:3000>.
+- **Application Insights**: see [above](#application-insights).
+- **End-to-end checks**: [`eng/telemetry/aspire-e2e.ps1`](eng/telemetry/aspire-e2e.ps1) starts an
+  Aspire dashboard, runs the server with several telemetry settings, sends real requests and checks
+  what arrived. [`eng/telemetry/appinsights-e2e.ps1`](eng/telemetry/appinsights-e2e.ps1) does the
+  same against a real Application Insights resource: it reads the connection string with the Azure
+  CLI, never writes it anywhere, and queries the resource until the rows arrive
+  ([how to run them](eng/telemetry/README.md)). Both write their evidence to the git-ignored
+  `docs/validation/`.
 
 ## HTTP APIs
 

@@ -17,6 +17,8 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using TensorSharp.Runtime.Telemetry;
+using TensorSharp.Server.Hosting;
 
 namespace TensorSharp.Server.Logging;
 
@@ -67,6 +69,15 @@ public sealed class RequestLoggingMiddleware
         string requestId = ResolveRequestId(context);
         context.Response.Headers[RequestIdHeader] = requestId;
 
+        // A capability path (an /uploads file, a code-execution artifact, a stored Responses
+        // API response) is named by an unguessable id that is all that guards an
+        // unauthenticated URL, so it is user content. The {Path} arguments below are marked
+        // as such: local logs are unchanged and the OpenTelemetry exporter redacts them. Log
+        // scopes are not exported (TensorSharpTelemetrySetup.ConfigureLoggerOptions), so the
+        // Operation scope below stays as it always was.
+        string path = context.Request.Path.Value ?? "/";
+        object? logPath = CapabilityPaths.IsCapabilityPath(context.Request.Path) ? LogContent.Of(path) : path;
+
         var scopeProperties = new Dictionary<string, object>(StringComparer.Ordinal)
         {
             [LogScopeKeys.RequestId] = requestId,
@@ -76,6 +87,21 @@ public sealed class RequestLoggingMiddleware
         string? clientLabel = ClassifyClient(context.Request.Path);
         if (!string.IsNullOrEmpty(clientLabel))
             scopeProperties[LogScopeKeys.Client] = clientLabel;
+
+        // OpenTelemetry: the request id on the HTTP server span (so a quoted
+        // X-TensorSharp-Request-Id finds its trace), and the id and protocol for the
+        // generation spans and metrics further down, which do not see the HttpContext.
+        // The id may be the client's own header, of any length, so telemetry gets a
+        // bounded prefix; the response header and the log scope keep it whole.
+        string telemetryRequestId = TruncateForTelemetry(requestId);
+        TelemetryContext.RequestId = telemetryRequestId;
+        TelemetryContext.Protocol = clientLabel;
+        if (ServerSpan.Recorded(context) is { } serverSpan)
+        {
+            serverSpan.SetTag(TelemetryAttributes.RequestId, telemetryRequestId);
+            if (!string.IsNullOrEmpty(clientLabel))
+                serverSpan.SetTag(TelemetryAttributes.Protocol, clientLabel);
+        }
 
         using var scope = _logger.BeginScope(scopeProperties);
 
@@ -87,7 +113,7 @@ public sealed class RequestLoggingMiddleware
 
         _logger.Log(isLowNoise ? LogLevel.Debug : LogLevel.Information, LogEventIds.HttpRequestStarted,
             "HTTP {Method} {Path} from {RemoteIp} (content-type={ContentType}, content-length={ContentLength})",
-            context.Request.Method, context.Request.Path.Value ?? "/", remoteIp, contentType,
+            context.Request.Method, logPath, remoteIp, contentType,
             contentLength.HasValue ? contentLength.Value.ToString(CultureInfo.InvariantCulture) : "(none)");
 
         var sw = Stopwatch.StartNew();
@@ -110,7 +136,7 @@ public sealed class RequestLoggingMiddleware
 
             _logger.Log(completionLevel, completionEvent,
                 "HTTP {Method} {Path} -> {StatusCode} in {ElapsedMs:F1} ms (response content-type={ResponseContentType})",
-                context.Request.Method, context.Request.Path.Value ?? "/",
+                context.Request.Method, logPath,
                 context.Response.StatusCode, sw.Elapsed.TotalMilliseconds,
                 context.Response.ContentType ?? "(none)");
         }
@@ -119,7 +145,7 @@ public sealed class RequestLoggingMiddleware
             sw.Stop();
             _logger.Log(LogLevel.Error, LogEventIds.HttpRequestFailed, ex,
                 "HTTP {Method} {Path} threw {ExceptionType} after {ElapsedMs:F1} ms",
-                context.Request.Method, context.Request.Path.Value ?? "/",
+                context.Request.Method, logPath,
                 ex.GetType().Name, sw.Elapsed.TotalMilliseconds);
             throw;
         }
@@ -139,12 +165,34 @@ public sealed class RequestLoggingMiddleware
         return Guid.NewGuid().ToString("N")[..12];
     }
 
-    private static string? ClassifyClient(PathString path)
+    /// <summary>Longest request id telemetry carries (span attribute, <see cref="TelemetryContext.RequestId"/>).</summary>
+    internal const int MaxTelemetryRequestIdLength = 64;
+
+    /// <summary>
+    /// <paramref name="requestId"/> cut to <see cref="MaxTelemetryRequestIdLength"/>
+    /// characters, without splitting a surrogate pair. A generated id is 12 characters;
+    /// only an inbound header can be longer, and it is copied onto every generation span
+    /// and exported, so its length is bounded here.
+    /// </summary>
+    internal static string TruncateForTelemetry(string requestId)
+    {
+        if (requestId.Length <= MaxTelemetryRequestIdLength)
+            return requestId;
+        int length = MaxTelemetryRequestIdLength;
+        if (char.IsHighSurrogate(requestId[length - 1]))
+            length--;
+        return requestId[..length];
+    }
+
+    internal static string? ClassifyClient(PathString path)
     {
         string p = path.Value ?? string.Empty;
         if (p.StartsWith("/v1/", StringComparison.OrdinalIgnoreCase))
             return "openai";
+        // /api/embed is Ollama's embedding route (OllamaEndpoints / EmbeddingEndpoints),
+        // not a Web UI one, though it shares the /api/ prefix.
         if (p.Equals("/api/chat/ollama", StringComparison.OrdinalIgnoreCase) ||
+            p.StartsWith("/api/embed", StringComparison.OrdinalIgnoreCase) ||
             p.StartsWith("/api/generate", StringComparison.OrdinalIgnoreCase) ||
             p.StartsWith("/api/show", StringComparison.OrdinalIgnoreCase) ||
             p.StartsWith("/api/tags", StringComparison.OrdinalIgnoreCase) ||

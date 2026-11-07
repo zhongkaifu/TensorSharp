@@ -128,6 +128,12 @@ namespace TensorSharp.Runtime.Speculative
 
         public SpeculationStats Stats { get; } = new();
 
+        // Tag of the process-wide drafted/accepted counters (TensorSharpMetrics), built once per
+        // execution so a verify step records them without allocating. The counters add the same
+        // deltas as Stats, here and not at completion: a preempted request that re-arms gets a
+        // new execution, and work its earlier one did would otherwise go uncounted.
+        private readonly KeyValuePair<string, object?> _architectureTag;
+
         public SpeculativeExecution(ISpeculativeTarget model, ISpeculator speculator, ISpecTrunk? trunk = null,
             SpeculationCostGovernor? governor = null)
         {
@@ -148,6 +154,9 @@ namespace TensorSharp.Runtime.Speculative
 
             _hidden = model.SpecFeatureSize;
             _vocab = model.Config.VocabSize;
+            string architecture = model.Config.Architecture;
+            _architectureTag = new(Telemetry.TelemetryAttributes.ModelArchitecture,
+                string.IsNullOrEmpty(architecture) ? "unknown" : architecture);
 
             int k = Math.Min(speculator.MaxDraftTokens, Math.Max(0, model.SpecMaxDraftTokens));
             MaxDraftTokens = k;
@@ -530,6 +539,8 @@ namespace TensorSharp.Runtime.Speculative
 
             Stats.TokensDrafted += k;
             Stats.TokensAccepted += m;
+            Telemetry.TensorSharpMetrics.SpeculativeTokensDrafted.Add(k, _architectureTag);
+            Telemetry.TensorSharpMetrics.SpeculativeTokensAccepted.Add(m, _architectureTag);
 
             // Tell the trunk the accept count BEFORE deciding how to roll back: a
             // trunk that deferred post-verify state until this was known settles it
@@ -684,6 +695,8 @@ namespace TensorSharp.Runtime.Speculative
                 Stats.VerifySteps++;
                 Stats.TokensDrafted += k;
                 Stats.TokensAccepted += accepted;
+                Telemetry.TensorSharpMetrics.SpeculativeTokensDrafted.Add(k, _architectureTag);
+                Telemetry.TensorSharpMetrics.SpeculativeTokensAccepted.Add(accepted, _architectureTag);
                 if (accepted < k)
                     Stats.RollbackSteps++;
                 Stats.VerifyTicks += verifyTicks;

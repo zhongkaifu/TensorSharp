@@ -163,6 +163,10 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
         }
     }
 
+    /// <summary>Whether <see cref="Conditioning"/> would answer <paramref name="prompt"/> from the
+    /// prompt cache, for telemetry. Called under the generation lock, as Conditioning is.</summary>
+    internal bool HasCachedConditioning(string prompt) => prompt != null && _promptCache.ContainsKey(prompt);
+
     internal Ltx25PromptEncoding Conditioning(string prompt, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();

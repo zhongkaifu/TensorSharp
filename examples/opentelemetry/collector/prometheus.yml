@@ -1,0 +1,22 @@
+# Copyright (c) Zhongkai Fu. All rights reserved.
+# https://github.com/zhongkaifu/TensorSharp
+#
+# This file is part of TensorSharp.
+#
+# TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+#
+# Prometheus scrapes the collector's prometheus exporter (collector.yaml, port 8889), which holds
+# the metrics TensorSharp pushed over OTLP.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: otel-collector
+    # Keep the job and instance labels the exporter sets from service.name and
+    # service.instance.id (tensorsharp-server, machine:pid). Without this Prometheus renames them
+    # to exported_job / exported_instance and every series gets job="otel-collector".
+    honor_labels: true
+    static_configs:
+      - targets: ["otel-collector:8889"]

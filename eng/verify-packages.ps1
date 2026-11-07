@@ -105,17 +105,26 @@ $PublicPackages = @(
         EmbeddedAssemblies = @()
     },
     @{
-        # The runnable server. TensorSharp.Server is the library it builds on,
-        # and is its only direct dependency.
+        # The opt-in OpenTelemetry pipeline. Host-only: only the two hosts
+        # below reference it, so a consumer of the libraries never gets the
+        # OpenTelemetry SDK.
+        Id = "TensorSharp.Telemetry"
+        Project = "TensorSharp.Telemetry/TensorSharp.Telemetry.csproj"
+        TensorSharpDependencies = @("TensorSharp.Runtime")
+        EmbeddedAssemblies = @()
+    },
+    @{
+        # The runnable server. TensorSharp.Server is the library it builds on;
+        # TensorSharp.Telemetry is its opt-in OpenTelemetry pipeline.
         Id = "TensorSharp.Server.Host"
         Project = "TensorSharp.Server.Host/TensorSharp.Server.Host.csproj"
-        TensorSharpDependencies = @("TensorSharp.Server")
+        TensorSharpDependencies = @("TensorSharp.Server", "TensorSharp.Telemetry")
         EmbeddedAssemblies = @()
     },
     @{
         Id = "TensorSharp.Cli"
         Project = "TensorSharp.Cli/TensorSharp.Cli.csproj"
-        TensorSharpDependencies = @("TensorSharp.Tensors", "TensorSharp.Runtime", "TensorSharp.Runtime.Logging", "TensorSharp.AgentHost", "TensorSharp.Chat", "TensorSharp.Models", "TensorSharp.Backends.GGML", "TensorSharp.Backends.MLX", "TensorSharp.Distributed")
+        TensorSharpDependencies = @("TensorSharp.Tensors", "TensorSharp.Runtime", "TensorSharp.Runtime.Logging", "TensorSharp.AgentHost", "TensorSharp.Chat", "TensorSharp.Models", "TensorSharp.Backends.GGML", "TensorSharp.Backends.MLX", "TensorSharp.Distributed", "TensorSharp.Telemetry")
         EmbeddedAssemblies = @()
     }
 )

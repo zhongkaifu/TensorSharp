@@ -25,6 +25,7 @@ using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.AgentHost.Knowledge;
 using TensorSharp.Knowledge;
+using TensorSharp.Runtime.Telemetry;
 using TensorSharp.Server.Knowledge;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.ProtocolAdapters;
@@ -177,6 +178,11 @@ namespace TensorSharp.Chat
             _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
             _artifactUriPrefix = string.IsNullOrWhiteSpace(artifactUriPrefix) ? DefaultArtifactUriPrefix : artifactUriPrefix;
             _skillRouter = skillRouter;
+            // Read only when metrics are collected, so a request pays nothing for them. A server
+            // has one service; a later instance (a test) takes the owner name over, and the
+            // registrations last as long as the process.
+            TensorSharpMetrics.RegisterMediaGenerationCounter(MediaMetricsOwner, () => Volatile.Read(ref _mediaJobs));
+            TensorSharpMetrics.RegisterVideoQueueCounter(MediaMetricsOwner, () => Volatile.Read(ref _videoGenWaiting));
         }
 
         /// <summary>
@@ -572,7 +578,7 @@ namespace TensorSharp.Chat
             {
                 _loggerFactory.CreateLogger("TensorSharp.Server.Upload").LogWarning(LogEventIds.UploadRejected,
                     "Upload rejected: unsupported extension {Extension} (name={FileName})",
-                    ext.Length == 0 ? "(none)" : ext, originalFileName);
+                    ext.Length == 0 ? "(none)" : ext, LogContent.Of(originalFileName));
                 throw new WebUiRequestRejectedException(400, new
                 {
                     error = ext.Length == 0
@@ -654,7 +660,7 @@ namespace TensorSharp.Chat
             if (!reservationHeld && !_uploads.TryReserveClientWrite(length, out string limitError, out int limitStatus))
             {
                 uploadLogger.LogWarning(LogEventIds.UploadRejected,
-                    "Upload rejected: {Reason} (name={FileName} bytes={Length})", limitError, originalFileName, length);
+                    "Upload rejected: {Reason} (name={FileName} bytes={Length})", limitError, LogContent.Of(originalFileName), length);
                 throw new WebUiRequestRejectedException(limitStatus, new { error = limitError });
             }
 
@@ -683,7 +689,7 @@ namespace TensorSharp.Chat
             // (which records each attachment by its saved path).
             uploadLogger.LogInformation(LogEventIds.UploadReceived,
                 "Upload received: name={FileName} ext={Extension} mediaType={MediaType} bytes={Length} savedAs={SavedFile} savedPath={SavedPath}",
-                originalFileName, ext, mediaType, length, safeFileName, savePath);
+                LogContent.Of(originalFileName), ext, mediaType, length, LogContent.Of(safeFileName), LogContent.Of(savePath));
 
             if (mediaType == "video")
             {
@@ -706,7 +712,7 @@ namespace TensorSharp.Chat
                 {
                     uploadLogger.LogWarning(LogEventIds.UploadRejected,
                         "Video frame extraction failed: name={FileName} savedPath={SavedPath} error={Error}",
-                        originalFileName, savePath, ex.Message);
+                        LogContent.Of(originalFileName), LogContent.Of(savePath), LogContent.Of(ex.Message));
                     throw new WebUiRequestRejectedException(400, new { ok = false, error = "Could not read the video: " + ex.Message });
                 }
 
@@ -812,7 +818,7 @@ namespace TensorSharp.Chat
                 {
                     uploadLogger.LogWarning(LogEventIds.UploadRejected,
                         "PDF text extraction failed: name={FileName} savedPath={SavedPath} error={Error}",
-                        originalFileName, savePath, ex.Message);
+                        LogContent.Of(originalFileName), LogContent.Of(savePath), LogContent.Of(ex.Message));
                     throw new WebUiRequestRejectedException(400, new { ok = false, error = "Could not read the PDF: " + ex.Message });
                 }
 
@@ -832,13 +838,13 @@ namespace TensorSharp.Chat
                     {
                         uploadLogger.LogInformation(LogEventIds.UploadReceived,
                             "PDF text extracted without upload truncation: name={FileName} pages={Pages} extractedPages={ExtractedPages} chars={Chars}",
-                            originalFileName, pdf.PageCount, pdf.ExtractedPageCount, textContent.Length);
+                            LogContent.Of(originalFileName), pdf.PageCount, pdf.ExtractedPageCount, textContent.Length);
                     }
                     else
                     {
                         uploadLogger.LogWarning(LogEventIds.UploadReceived,
                             "PDF text extraction did not read every page: name={FileName} pages={Pages} extractedPages={ExtractedPages} chars={Chars}",
-                            originalFileName, pdf.PageCount, pdf.ExtractedPageCount, textContent.Length);
+                            LogContent.Of(originalFileName), pdf.PageCount, pdf.ExtractedPageCount, textContent.Length);
                     }
 
                     return TrackUpload(new
@@ -890,7 +896,7 @@ namespace TensorSharp.Chat
                 {
                     uploadLogger.LogWarning(LogEventIds.UploadReceived,
                         "PDF has no text layer and no vision model is loaded: name={FileName} pages={Pages}",
-                        originalFileName, pdf.PageCount);
+                        LogContent.Of(originalFileName), pdf.PageCount);
                     return TrackUpload(new
                     {
                         ok = true,
@@ -919,7 +925,7 @@ namespace TensorSharp.Chat
                 {
                     uploadLogger.LogWarning(LogEventIds.UploadRejected,
                         "PDF page-image extraction failed: name={FileName} savedPath={SavedPath} error={Error}",
-                        originalFileName, savePath, ex.Message);
+                        LogContent.Of(originalFileName), LogContent.Of(savePath), LogContent.Of(ex.Message));
                     throw new WebUiRequestRejectedException(400, new { ok = false, error = "Could not read the PDF: " + ex.Message });
                 }
 
@@ -929,7 +935,7 @@ namespace TensorSharp.Chat
                 if (pdfImages.ImagePaths.Count == 0)
                 {
                     uploadLogger.LogWarning(LogEventIds.UploadReceived,
-                        "PDF yielded neither text nor images: name={FileName} pages={Pages}", originalFileName, pdf.PageCount);
+                        "PDF yielded neither text nor images: name={FileName} pages={Pages}", LogContent.Of(originalFileName), pdf.PageCount);
                     return TrackUpload(new
                     {
                         ok = true,
@@ -955,13 +961,13 @@ namespace TensorSharp.Chat
                 {
                     uploadLogger.LogInformation(LogEventIds.UploadReceived,
                         "PDF rendered as page images: name={FileName} pages={Pages} images={Images} complete=true",
-                        originalFileName, pdf.PageCount, framePaths.Count);
+                        LogContent.Of(originalFileName), pdf.PageCount, framePaths.Count);
                 }
                 else
                 {
                     uploadLogger.LogWarning(LogEventIds.UploadReceived,
                         "PDF page-image extraction was incomplete: name={FileName} pages={Pages} images={Images}",
-                        originalFileName, pdf.PageCount, framePaths.Count);
+                        LogContent.Of(originalFileName), pdf.PageCount, framePaths.Count);
                 }
 
                 return TrackUpload(new
@@ -1021,7 +1027,7 @@ namespace TensorSharp.Chat
                 {
                     uploadLogger.LogWarning(LogEventIds.UploadReceived,
                         "HEIC browser image conversion failed for {FileName}: {Error}",
-                        originalFileName, ex.Message);
+                        LogContent.Of(originalFileName), LogContent.Of(ex.Message));
                     // Conversion is optional for upload, but a failed/partial PNG
                     // must never be used as a differently sized editing canvas.
                     foreach (string derivedPath in new[] { previewPath, editPath })
@@ -1544,7 +1550,11 @@ namespace TensorSharp.Chat
             return prompt;
         }
 
-        private async Task<object> ImageRequestAsync(
+        private Task<object> ImageRequestAsync(
+            JsonElement body, bool generate, IReadOnlyList<LoraSpec> loras, CancellationToken cancellationToken) =>
+            TraceImageRequestAsync(generate, () => ImageRequestCoreAsync(body, generate, loras, cancellationToken));
+
+        private async Task<object> ImageRequestCoreAsync(
             JsonElement body, bool generate, IReadOnlyList<LoraSpec> loras, CancellationToken cancellationToken)
         {
             var logger = _loggerFactory.CreateLogger("TensorSharp.Server.ImageEdit");
@@ -1563,7 +1573,11 @@ namespace TensorSharp.Chat
         }
 
         /// <summary>The multipart edit route uses the same validation and worker as JSON.</summary>
-        public async Task<object> ImageEditAsync(
+        public Task<object> ImageEditAsync(
+            JsonElement parameters, IReadOnlyList<byte[]> images, byte[] mask, CancellationToken cancellationToken) =>
+            TraceImageRequestAsync(generate: false, () => ImageEditCoreAsync(parameters, images, mask, cancellationToken));
+
+        private async Task<object> ImageEditCoreAsync(
             JsonElement parameters, IReadOnlyList<byte[]> images, byte[] mask, CancellationToken cancellationToken)
         {
             ArgumentNullException.ThrowIfNull(images);
@@ -1580,9 +1594,15 @@ namespace TensorSharp.Chat
         }
 
         /// <summary>Compatibility overload for callers supplying decoded multipart fields.</summary>
-        public async Task<object> ImageEditAsync(
+        public Task<object> ImageEditAsync(
             string prompt, int steps, float cfg, long seed, long targetArea, IReadOnlyList<byte[]> images, CancellationToken cancellationToken,
-            int width = 0, int height = 0, string negativePrompt = null)
+            int width = 0, int height = 0, string negativePrompt = null) =>
+            TraceImageRequestAsync(generate: false, () => ImageEditCoreAsync(
+                prompt, steps, cfg, seed, targetArea, images, cancellationToken, width, height, negativePrompt));
+
+        private async Task<object> ImageEditCoreAsync(
+            string prompt, int steps, float cfg, long seed, long targetArea, IReadOnlyList<byte[]> images, CancellationToken cancellationToken,
+            int width, int height, string negativePrompt)
         {
             if (images == null) throw new ArgumentNullException(nameof(images));
             if (images.Count == 0) throw new WebUiRequestRejectedException(400, new { error = "No image uploaded (field 'image')." });
@@ -1656,14 +1676,18 @@ namespace TensorSharp.Chat
         /// to the old recipe. Null means the caller bound none. Checked after the plug-ins are
         /// applied, under the lock the generation runs in, so nothing can change it in between.
         /// </summary>
-        private static void CheckSamplingRecipe(TensorSharp.Models.Video.IVideoGenerationModel model, string expected)
+        private static void CheckSamplingRecipe(TensorSharp.Models.Video.IVideoGenerationModel model, string expected,
+            TensorSharp.Models.Video.VideoClipTelemetry clip = null)
         {
             if (expected == null)
                 return;
             string actual = model.SamplingContract?.Id ?? TensorSharp.Models.Video.VideoSamplingContract.NativeId;
             if (!string.Equals(actual, expected, StringComparison.Ordinal))
+            {
+                clip?.MarkRefused(VideoRefusedSamplingRecipe);
                 throw new InvalidOperationException(
                     $"The video model's sampling recipe is {actual}; this job was admitted for {expected}. Refresh and retry.");
+            }
         }
 
         /// <summary>A plug-in set the model refused, or a set for a model that takes none; the
@@ -1679,7 +1703,7 @@ namespace TensorSharp.Chat
             string outPath = Path.Combine(_options.UploadDirectory, outName);
             logger.LogInformation(LogEventIds.UploadReceived,
                 "Image request: prompt='{Prompt}' steps={Steps} cfg={Cfg} images={Count} bytes={Bytes}",
-                prompt, p.Steps, p.CfgScale, imageBytesList.Count, imageBytesList.Sum(b => (long)b.Length));
+                LogContent.Of(prompt), p.Steps, p.CfgScale, imageBytesList.Count, imageBytesList.Sum(b => (long)b.Length));
             var sw = Stopwatch.StartNew();
             int w, h;
             Interlocked.Increment(ref _mediaJobs);
@@ -1723,7 +1747,7 @@ namespace TensorSharp.Chat
             _uploads.RecordFile(outPath);
             string url = BuildUploadUrl(outName);
             logger.LogInformation(LogEventIds.UploadReceived,
-                "Image request done: {W}x{H} -> {Url} ({Sec:F1}s)", w, h, url, sw.Elapsed.TotalSeconds);
+                "Image request done: {W}x{H} -> {Url} ({Sec:F1}s)", w, h, LogContent.Of(url), sw.Elapsed.TotalSeconds);
             return new { ok = true, url, width = w, height = h, elapsedSeconds = sw.Elapsed.TotalSeconds };
         }
 
@@ -1863,9 +1887,15 @@ namespace TensorSharp.Chat
         {
             var logger = _loggerFactory.CreateLogger("TensorSharp.Server.ImageEdit");
             var ct = cancellationToken;
+            // Held in a local (an iterator's ambient activity does not survive a yield). Ended
+            // here for a refusal, before its frame, and by the worker once that starts: a
+            // consumer that stops reading disposes this iterator without waiting for the picture.
+            var imageTelemetry = StartImageRequest(generate);
 
             if (_svc.Model is not TensorSharp.Models.QwenImage.QwenImageModel editModel)
             {
+                imageTelemetry.MarkRefused(ImageRefusedNotImageModel);
+                imageTelemetry.Dispose();
                 yield return new { done = true, error = generate ? NotAGenerationModelError : NotAnImageModelError };
                 yield break;
             }
@@ -1873,6 +1903,8 @@ namespace TensorSharp.Chat
             if (!_uploads.HasQuotaHeadroom(out string editStreamQuotaError))
             {
                 logger.LogWarning(LogEventIds.UploadRejected, "Image edit (stream) rejected: {Reason}", editStreamQuotaError);
+                imageTelemetry.MarkRefused(MediaRefusedUploadQuota);
+                imageTelemetry.Dispose();
                 yield return new { done = true, error = editStreamQuotaError };
                 yield break;
             }
@@ -1881,6 +1913,7 @@ namespace TensorSharp.Chat
             TensorSharp.Models.QwenImage.QwenImageParams p = null;
             var imageBytesList = new List<byte[]>();
             string parseError = null;
+            bool cancelledWhileReading = false;
             try
             {
                 p = ParseImageParameters(body);
@@ -1892,9 +1925,19 @@ namespace TensorSharp.Chat
                 }
             }
             catch (WebUiRequestRejectedException ex) { parseError = ex.Message; }
+            // The client went away while its uploads were read: a cancellation, not a bad request.
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { cancelledWhileReading = true; }
             catch (Exception ex) { parseError = "Bad request: " + ex.Message; }
+            if (cancelledWhileReading)
+            {
+                imageTelemetry.MarkCancelled();
+                imageTelemetry.Dispose();
+                yield break;
+            }
             if (parseError != null)
             {
+                imageTelemetry.MarkRefused(MediaRefusedInvalidRequest);
+                imageTelemetry.Dispose();
                 yield return new { done = true, error = parseError };
                 yield break;
             }
@@ -1903,7 +1946,7 @@ namespace TensorSharp.Chat
             string outPath = Path.Combine(_options.UploadDirectory, outName);
             logger.LogInformation(LogEventIds.UploadReceived,
                 "Image edit (stream): prompt='{Prompt}' steps={Steps} cfg={Cfg} images={Count} bytes={Bytes}",
-                prompt, p.Steps, p.CfgScale, imageBytesList.Count, imageBytesList.Sum(b => (long)b.Length));
+                LogContent.Of(prompt), p.Steps, p.CfgScale, imageBytesList.Count, imageBytesList.Sum(b => (long)b.Length));
 
             // The edit worker pushes frames into this channel; the stream drains it. The callback
             // never blocks on the consumer (unbounded TryWrite) so it can't stall the denoise.
@@ -1958,16 +2001,19 @@ namespace TensorSharp.Chat
                 }
                 catch (OperationCanceledException)
                 {
+                    imageTelemetry.MarkCancelled();
                     channel.Writer.TryWrite(new EditFrame { Final = true, Error = "cancelled" });
                 }
                 catch (Exception ex)
                 {
+                    imageTelemetry.MarkEnded(ex);
                     logger.LogError(LogEventIds.ChatFailed, ex, "Image edit (stream) failed");
                     channel.Writer.TryWrite(new EditFrame { Final = true, Error = ex.Message });
                 }
                 finally
                 {
                     Interlocked.Decrement(ref _mediaJobs);
+                    imageTelemetry.Dispose();
                     channel.Writer.Complete();
                 }
             }, CancellationToken.None);
@@ -1998,7 +2044,7 @@ namespace TensorSharp.Chat
                     else
                         yield return new { done = true, url = f.Url, width = f.Width, height = f.Height, elapsedSeconds = f.Seconds };
                     logger.LogInformation(LogEventIds.UploadReceived,
-                        "Image edit (stream) done: {W}x{H} -> {Url} ({Sec:F1}s)", f.Width, f.Height, f.Url, f.Seconds);
+                        "Image edit (stream) done: {W}x{H} -> {Url} ({Sec:F1}s)", f.Width, f.Height, LogContent.Of(f.Url), f.Seconds);
                 }
                 else
                 {
@@ -2081,30 +2127,40 @@ namespace TensorSharp.Chat
         public async Task<object> VideoGenerateAsync(JsonElement body, IReadOnlyList<LoraSpec> loras, CancellationToken cancellationToken)
         {
             var logger = _loggerFactory.CreateLogger("TensorSharp.Server.VideoGenerate");
+            if (LoadedVideoModel == null)
+                RecordVideoRefusal(VideoRefusedNotVideoModel);
             var videoModel = RequireVideoModel();
 
             string prompt = body.TryGetProperty("prompt", out var pr) ? pr.GetString() ?? "" : "";
             if (string.IsNullOrWhiteSpace(prompt))
+            {
+                RecordVideoRefusal(MediaRefusedInvalidRequest);
                 throw new WebUiRequestRejectedException(400, new { error = "prompt is required." });
+            }
             var p = VideoGenerationParamsParser.Parse(body, _options, out string imgError);
             imgError ??= VideoImageConditionsError(videoModel, p);
             if (imgError != null)
+            {
+                RecordVideoRefusal(MediaRefusedInvalidRequest, p);
                 throw new WebUiRequestRejectedException(400, new { error = imgError });
+            }
             if (TensorSharp.Models.WanVideo.VideoIO.Mp4ExportUnavailableReason() is string exportError)
             {
-                logger.LogWarning(LogEventIds.HttpRequestRejected, "Video generate rejected: {Reason}", exportError);
+                logger.LogWarning(LogEventIds.VideoGenerateRejected, "Video generate rejected: {Reason}", exportError);
+                RecordVideoRefusal(VideoRefusedExportUnavailable, p);
                 throw VideoExportUnavailable(exportError);
             }
 
             if (!_uploads.HasQuotaHeadroom(out string videoQuotaError))
             {
-                logger.LogWarning(LogEventIds.UploadRejected, "Video generate rejected: {Reason}", videoQuotaError);
+                logger.LogWarning(LogEventIds.VideoGenerateRejected, "Video generate rejected: {Reason}", videoQuotaError);
+                RecordVideoRefusal(MediaRefusedUploadQuota, p);
                 throw new WebUiRequestRejectedException(507, new { error = videoQuotaError });
             }
 
-            logger.LogInformation(LogEventIds.UploadReceived,
+            logger.LogInformation(LogEventIds.VideoGenerateStarted,
                 "Video generate: prompt='{Prompt}' {W}x{H}x{F} steps={Steps} i2v={I2V}",
-                prompt, p.Width, p.Height, p.Frames, p.Steps, p.ImageBytes != null);
+                LogContent.Of(prompt), p.Width, p.Height, p.Frames, p.Steps, p.ImageBytes != null);
 
             VideoGenerationResult result;
             try
@@ -2122,12 +2178,12 @@ namespace TensorSharp.Chat
                 // and why this checkpoint cannot do it — which checkpoint to load, which
                 // flag to drop. Swallowing them into a generic 500 would throw away the
                 // only thing that tells the caller how to fix it.
-                logger.LogWarning(LogEventIds.UploadReceived, ex, "Video generate rejected");
+                logger.LogWarning(LogEventIds.VideoGenerateRejected, ex, "Video generate rejected");
                 throw new WebUiRequestRejectedException(400, new { error = ex.Message });
             }
 
-            logger.LogInformation(LogEventIds.UploadReceived,
-                "Video generate done: {F} frames -> {Url} ({Sec:F1}s)", result.Frames, result.Url, result.ElapsedSeconds);
+            logger.LogInformation(LogEventIds.VideoGenerateCompleted,
+                "Video generate done: {F} frames -> {Url} ({Sec:F1}s)", result.Frames, LogContent.Of(result.Url), result.ElapsedSeconds);
             return new
             {
                 ok = true, url = result.Url, audioUrl = result.AudioUrl, audioMuxed = result.AudioMuxed,
@@ -2165,16 +2221,30 @@ namespace TensorSharp.Chat
             IReadOnlyList<LoraSpec> loras, string expectedSamplingRecipe, string lastFramePath = null)
         {
             if (parameters == null) throw new ArgumentNullException(nameof(parameters));
+            if (LoadedVideoModel == null)
+                RecordVideoRefusal(VideoRefusedNotVideoModel, parameters);
             var videoModel = RequireVideoModel();
             if (expectedModel != null && !ReferenceEquals(expectedModel, videoModel))
+            {
+                RecordVideoRefusal(VideoRefusedModelChanged, parameters);
                 throw new InvalidOperationException("The selected video model changed before generation began.");
+            }
             string conditioningError = VideoImageConditionsError(videoModel, parameters);
             if (conditioningError != null)
+            {
+                RecordVideoRefusal(MediaRefusedInvalidRequest, parameters);
                 throw new WebUiRequestRejectedException(400, new { error = conditioningError });
+            }
             if (TensorSharp.Models.WanVideo.VideoIO.Mp4ExportUnavailableReason() is string exportError)
+            {
+                RecordVideoRefusal(VideoRefusedExportUnavailable, parameters);
                 throw VideoExportUnavailable(exportError);
+            }
             if (!_uploads.HasQuotaHeadroom(out string quotaError))
+            {
+                RecordVideoRefusal(MediaRefusedUploadQuota, parameters);
                 throw new WebUiRequestRejectedException(507, new { error = quotaError });
+            }
             return GenerateVideoCoreAsync(videoModel, prompt ?? "", parameters, loras, expectedSamplingRecipe, lastFramePath);
         }
 
@@ -2192,17 +2262,33 @@ namespace TensorSharp.Chat
         /// </summary>
         private T RunVideoGeneration<T>(
             TensorSharp.Models.Video.IVideoGenerationModel videoModel, IReadOnlyList<LoraSpec> loras,
-            string expectedSamplingRecipe, ILogger logger, CancellationToken cancellationToken, Func<T> generate)
+            string expectedSamplingRecipe, ILogger logger, TensorSharp.Models.Video.VideoClipTelemetry clip,
+            CancellationToken cancellationToken, Func<T> generate)
         {
+            // The wait for the lock is the clip's video.queue span, built once the lock is held
+            // (nothing runs during a Monitor wait to record it), and the queue gauge. The wait
+            // cannot be cancelled, so a request stopped while it waits stays counted until then.
+            DateTime queuedUtc = DateTime.UtcNow;
+            Interlocked.Increment(ref _videoGenWaiting);
             lock (_videoGenLock)
             {
+                Interlocked.Decrement(ref _videoGenWaiting);
+                clip?.AddChild(VideoQueueSpanName, queuedUtc, DateTime.UtcNow);
                 // A request stopped while it waited behind another must not start.
+                if (cancellationToken.IsCancellationRequested)
+                    clip?.MarkCancelled();
                 cancellationToken.ThrowIfCancellationRequested();
                 if (!ReferenceEquals(videoModel, _svc.Model))
+                {
+                    clip?.MarkRefused(VideoRefusedModelChanged);
                     throw new InvalidOperationException("The selected video model changed while generation was queued.");
+                }
                 var owner = (ModelBase)videoModel;
                 if (!owner.TryEnterUse())
+                {
+                    clip?.MarkRefused(VideoRefusedModelUnloading);
                     throw new InvalidOperationException("The video model is being unloaded; retry after loading it.");
+                }
                 try
                 {
                     // Disposal uses the same lock after retiring the model. Keep it
@@ -2210,12 +2296,28 @@ namespace TensorSharp.Chat
                     lock (owner.GpuComputeLock)
                     {
                         if (owner.IsRetiring)
+                        {
+                            clip?.MarkRefused(VideoRefusedModelUnloading);
                             throw new InvalidOperationException("The selected video model is being unloaded.");
-                        ApplyVideoLoras(videoModel, loras, logger);
+                        }
+                        ApplyVideoLorasTraced(videoModel, loras, logger, clip);
                         if (owner.IsRetiring)
+                        {
+                            clip?.MarkRefused(VideoRefusedModelUnloading);
                             throw new InvalidOperationException("The selected video model is being unloaded.");
-                        CheckSamplingRecipe(videoModel, expectedSamplingRecipe);
-                        return generate();
+                        }
+                        CheckSamplingRecipe(videoModel, expectedSamplingRecipe, clip);
+                        try
+                        {
+                            return generate();
+                        }
+                        catch (Exception ex)
+                        {
+                            // The generation helper marks the model's own failure; this also
+                            // covers the export, the last frame and a stop after the model returned.
+                            clip?.MarkFailed(ex);
+                            throw;
+                        }
                     }
                 }
                 finally { owner.ExitUse(); }
@@ -2230,18 +2332,21 @@ namespace TensorSharp.Chat
             string outName = $"video-{Guid.NewGuid():N}.mp4";
             string outPath = Path.Combine(_options.UploadDirectory, outName);
 
+            // The clip, from before its wait for the video lock until the MP4 and last frame are
+            // saved. Started inside this async method so it is current here and on the worker,
+            // never in the caller's flow; everything under it takes it as an explicit parent.
+            var clip = StartVideoClip(p, prompt);
             var sw = Stopwatch.StartNew();
             Interlocked.Increment(ref _mediaJobs);
             (TensorSharp.Models.WanVideo.GeneratedVideo video, string codec, bool audioMuxed) result;
             try
             {
                 result = await Task.Run(() => RunVideoGeneration(
-                    videoModel, loras, expectedSamplingRecipe, logger, p.CancellationToken, () =>
+                    videoModel, loras, expectedSamplingRecipe, logger, clip, p.CancellationToken, () =>
                     {
-                        var video = videoModel.GenerateVideo(prompt, p);
+                        var video = TensorSharp.Models.Video.VideoGenerationTelemetry.Generate(videoModel, prompt, p, clip, logger);
                         p.CancellationToken.ThrowIfCancellationRequested();
-                        string codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(
-                            outPath, video.Frames, video.Fps, video.Audio, out bool audioMuxed);
+                        string codec = SaveVideoMp4(clip, outPath, video, out bool audioMuxed);
                         if (lastFramePath != null)
                         {
                             Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(lastFramePath)));
@@ -2253,6 +2358,7 @@ namespace TensorSharp.Chat
             finally
             {
                 Interlocked.Decrement(ref _mediaJobs);
+                clip.Dispose();
             }
             sw.Stop();
             _uploads.RecordFile(outPath);
@@ -2329,8 +2435,10 @@ namespace TensorSharp.Chat
             var logger = _loggerFactory.CreateLogger("TensorSharp.Server.VideoGenerate");
             var ct = cancellationToken;
 
+            // A refusal is a {done, error} frame on HTTP 200, so it is recorded here explicitly.
             if (_svc.Model is not TensorSharp.Models.Video.IVideoGenerationModel videoModel)
             {
+                RecordVideoRefusal(VideoRefusedNotVideoModel);
                 yield return new { done = true, error = "The loaded model is not a video-generation model." };
                 yield break;
             }
@@ -2355,34 +2463,41 @@ namespace TensorSharp.Chat
             }
             if (parseError != null)
             {
+                RecordVideoRefusal(MediaRefusedInvalidRequest, p);
                 yield return new { done = true, error = parseError };
                 yield break;
             }
 
             if (TensorSharp.Models.WanVideo.VideoIO.Mp4ExportUnavailableReason() is string exportError)
             {
-                logger.LogWarning(LogEventIds.HttpRequestRejected, "Video generate (stream) rejected: {Reason}", exportError);
+                logger.LogWarning(LogEventIds.VideoGenerateRejected, "Video generate (stream) rejected: {Reason}", exportError);
+                RecordVideoRefusal(VideoRefusedExportUnavailable, p);
                 yield return new { done = true, error = exportError };
                 yield break;
             }
 
             if (!_uploads.HasQuotaHeadroom(out string videoStreamQuotaError))
             {
-                logger.LogWarning(LogEventIds.UploadRejected, "Video generate (stream) rejected: {Reason}", videoStreamQuotaError);
+                logger.LogWarning(LogEventIds.VideoGenerateRejected, "Video generate (stream) rejected: {Reason}", videoStreamQuotaError);
+                RecordVideoRefusal(MediaRefusedUploadQuota, p);
                 yield return new { done = true, error = videoStreamQuotaError };
                 yield break;
             }
 
             string outName = $"video-{Guid.NewGuid():N}.mp4";
             string outPath = Path.Combine(_options.UploadDirectory, outName);
-            logger.LogInformation(LogEventIds.UploadReceived,
-                "Video generate (stream): prompt='{Prompt}' {W}x{H}x{F}", prompt, p.Width, p.Height, p.Frames);
+            logger.LogInformation(LogEventIds.VideoGenerateStarted,
+                "Video generate (stream): prompt='{Prompt}' {W}x{H}x{F}", LogContent.Of(prompt), p.Width, p.Height, p.Frames);
 
             // SingleWriter is false: the heartbeat below fires OnProgress from a timer
             // thread while the generation thread is blocked inside a DiT pass, so two
             // threads publish into this channel.
             var channel = Channel.CreateUnbounded<VideoFrame>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
 
+            // Held in a local (an iterator's ambient activity does not survive a yield) and
+            // ended by the worker: a consumer that stops reading disposes this iterator without
+            // waiting for the clip, which runs on until it sees the cancellation.
+            var clip = StartVideoClip(p, prompt);
             Interlocked.Increment(ref _mediaJobs);
             var genTask = Task.Run(() =>
             {
@@ -2391,7 +2506,7 @@ namespace TensorSharp.Chat
                 {
                     // The same guard as the plain path: the model this request found, alive and
                     // held for the whole clip, with the request's plug-ins applied.
-                    RunVideoGeneration(videoModel, loras, expectedSamplingRecipe: null, logger, ct, () =>
+                    RunVideoGeneration(videoModel, loras, expectedSamplingRecipe: null, logger, clip, ct, () =>
                     {
                         p.CancellationToken = ct;
                         int generatingThread = Environment.CurrentManagedThreadId;
@@ -2416,10 +2531,9 @@ namespace TensorSharp.Chat
                                 Detail = prog.Detail, Elapsed = prog.ElapsedSeconds, Eta = prog.EtaSeconds,
                             });
                         };
-                        var video = videoModel.GenerateVideo(prompt, p);
+                        var video = TensorSharp.Models.Video.VideoGenerationTelemetry.Generate(videoModel, prompt, p, clip, logger);
                         ct.ThrowIfCancellationRequested();
-                        string codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(
-                            outPath, video.Frames, video.Fps, video.Audio, out bool audioMuxed);
+                        string codec = SaveVideoMp4(clip, outPath, video, out bool audioMuxed);
                         _uploads.RecordFile(outPath);
                         channel.Writer.TryWrite(new VideoFrame
                         {
@@ -2443,7 +2557,10 @@ namespace TensorSharp.Chat
                 }
                 finally
                 {
+                    // How the clip ended was marked inside RunVideoGeneration, which can tell a
+                    // refusal from a failure; the catches above leave it as it was marked.
                     Interlocked.Decrement(ref _mediaJobs);
+                    clip.Dispose();
                     channel.Writer.Complete();
                 }
             }, CancellationToken.None);
@@ -2477,8 +2594,8 @@ namespace TensorSharp.Chat
                             frames = f.Frames, fps = f.Fps, seed = f.Seed, codec = f.Codec,
                             elapsedSeconds = f.Seconds,
                         };
-                    logger.LogInformation(LogEventIds.UploadReceived,
-                        "Video generate (stream) done: {F} frames -> {Url} ({Sec:F1}s)", f.Frames, f.Url, f.Seconds);
+                    logger.LogInformation(LogEventIds.VideoGenerateCompleted,
+                        "Video generate (stream) done: {F} frames -> {Url} ({Sec:F1}s)", f.Frames, LogContent.Of(f.Url), f.Seconds);
                 }
                 else
                 {
@@ -2491,6 +2608,298 @@ namespace TensorSharp.Chat
                 }
             }
             await genTask;
+        }
+
+        // ---- Media telemetry -------------------------------------------------
+
+        // Owner name of this service's media gauges (tensorsharp.media.generations.active,
+        // tensorsharp.video.queue.waiting).
+        private const string MediaMetricsOwner = "webui";
+
+        // Short stable codes for a request refused before its picture or clip was made: the
+        // error.type of its span and duration metric. Never the message, which can quote an
+        // uploaded file's name.
+        private const string MediaRefusedInvalidRequest = "invalid_request";
+        private const string MediaRefusedUploadQuota = "upload_quota_exceeded";
+        private const string MediaRefusedPayloadTooLarge = "payload_too_large";
+        private const string ImageRefusedNotImageModel = "not_an_image_model";
+        private const string VideoRefusedNotVideoModel = "not_a_video_model";
+        private const string VideoRefusedModelChanged = "model_changed";
+        private const string VideoRefusedModelUnloading = "model_unloading";
+        private const string VideoRefusedSamplingRecipe = "sampling_recipe_mismatch";
+        private const string VideoRefusedExportUnavailable = "video_export_unavailable";
+
+        private const string VideoQueueSpanName = "video.queue";
+        private const string LoraApplySpanName = "lora.apply";
+        private const string VideoExportSpanName = "video.export";
+
+        /// <summary><c>generate</c> (from words) or <c>edit</c> (from pictures), on the image span and metric.</summary>
+        private const string ImageModeAttribute = "tensorsharp.image.mode";
+        private const string MediaKindImage = "image";
+
+        // Clips waiting for _videoGenLock. Static like the lock, which serialises clips process-wide.
+        private static int _videoGenWaiting;
+
+        /// <summary>
+        /// Start the <c>generate_video</c> span and duration metric of one clip
+        /// (<see cref="TensorSharp.Models.Video.VideoClipTelemetry"/>), named after the loaded file
+        /// as chat spans are, without its directory. It is a child of whatever is current: the
+        /// HTTP request, or the Studio job that called <see cref="GenerateVideoAsync(string, TensorSharp.Models.Video.VideoGenerationParams, TensorSharp.Models.Video.IVideoGenerationModel)"/>.
+        /// </summary>
+        private TensorSharp.Models.Video.VideoClipTelemetry StartVideoClip(
+            TensorSharp.Models.Video.VideoGenerationParams parameters, string prompt) =>
+            TensorSharp.Models.Video.VideoClipTelemetry.Start(
+                GenAiRequestTelemetry.ModelNameFromPath(_svc.LoadedModelPath), _svc.LoadedBackend, parameters, prompt);
+
+        /// <summary>
+        /// Record a clip refused before it was queued: a <c>generate_video</c> span of its own with
+        /// outcome <c>refused</c> and <paramref name="errorType"/>, and its duration sample. It is
+        /// started here rather than at the top of the route because the span and the metric carry
+        /// the request's mode, which is known only once its parameters are read
+        /// (<paramref name="parameters"/>; null when they were not). Started and ended on the
+        /// calling thread, so it leaves the current activity as it found it.
+        /// </summary>
+        private void RecordVideoRefusal(string errorType, TensorSharp.Models.Video.VideoGenerationParams parameters = null)
+        {
+            using var clip = StartVideoClip(parameters, prompt: null);
+            clip.MarkRefused(errorType);
+        }
+
+        /// <summary>
+        /// <see cref="ApplyVideoLoras"/> for <paramref name="clip"/>: a <c>lora.apply</c> span when the
+        /// request chose plug-ins for a model that takes them (an H3 adapter takes seconds to pack;
+        /// the HTTP routes choose none and run with the load-time set, so on the server the span is
+        /// a Studio job's), the plug-in count the clip runs with, and a failure marked on both.
+        /// </summary>
+        private static void ApplyVideoLorasTraced(
+            TensorSharp.Models.Video.IVideoGenerationModel model, IReadOnlyList<LoraSpec> loras, ILogger logger,
+            TensorSharp.Models.Video.VideoClipTelemetry clip)
+        {
+            using Activity span = loras != null && model is ILoraPluginHost ? clip?.StartChild(LoraApplySpanName) : null;
+            if (span is { IsAllDataRequested: true })
+                span.SetTag(TelemetryAttributes.LoraCount, loras.Count);
+            try
+            {
+                ApplyVideoLoras(model, loras, logger);
+            }
+            catch (Exception ex)
+            {
+                FailSpan(span, ex);
+                clip?.MarkFailed(ex);
+                throw;
+            }
+            if (clip?.Activity is { IsAllDataRequested: true } && model is ILoraPluginHost host)
+                clip.SetTag(TelemetryAttributes.VideoLoraCount, host.LoraSpecs.Count);
+        }
+
+        /// <summary>
+        /// <c>VideoIO.SaveMp4</c> as the clip's <c>video.export</c> span, with the codec the
+        /// platform's encoder chose, whether the soundtrack went inside, and the file's size.
+        /// </summary>
+        private static string SaveVideoMp4(
+            TensorSharp.Models.Video.VideoClipTelemetry clip, string outPath,
+            TensorSharp.Models.WanVideo.GeneratedVideo video, out bool audioMuxed)
+        {
+            using Activity span = clip?.StartChild(VideoExportSpanName);
+            try
+            {
+                string codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(
+                    outPath, video.Frames, video.Fps, video.Audio, out audioMuxed);
+                if (span is { IsAllDataRequested: true })
+                {
+                    span.SetTag(TelemetryAttributes.VideoCodec, codec);
+                    span.SetTag(TelemetryAttributes.VideoAudioMuxed, audioMuxed);
+                    try { span.SetTag(TelemetryAttributes.VideoBytes, new FileInfo(outPath).Length); }
+                    catch (Exception) { /* the size is optional; the clip is saved */ }
+                }
+                return codec;
+            }
+            catch (Exception ex)
+            {
+                FailSpan(span, ex);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Record on a child span how <paramref name="exception"/> ended it: its type, never its
+        /// message (which can quote an upload's path or the prompt). A cancellation is not an error.
+        /// </summary>
+        private static void FailSpan(Activity span, Exception exception)
+        {
+            if (span == null)
+                return;
+            if (exception is OperationCanceledException)
+            {
+                if (span.IsAllDataRequested)
+                    span.SetTag(TelemetryAttributes.Outcome, TelemetryAttributes.OutcomeCancelled);
+                return;
+            }
+            span.SetStatus(ActivityStatusCode.Error, exception.GetType().Name);
+            if (span.IsAllDataRequested)
+            {
+                span.SetTag(TelemetryAttributes.Outcome, TelemetryAttributes.OutcomeFailed);
+                span.SetTag(TelemetryAttributes.ErrorType, exception.GetType().FullName ?? exception.GetType().Name);
+            }
+        }
+
+        private ImageRequestTelemetry StartImageRequest(bool generate) =>
+            new(GenAiRequestTelemetry.ModelNameFromPath(_svc.LoadedModelPath), _svc.LoadedBackend, generate);
+
+        /// <summary>
+        /// Run one picture request that answers once under its <see cref="ImageRequestTelemetry"/>,
+        /// so a refusal anywhere in its validation is recorded, as well as a failure or a
+        /// cancellation. Async, so the span is current only inside the request and never in the
+        /// caller's flow.
+        /// </summary>
+        private async Task<object> TraceImageRequestAsync(bool generate, Func<Task<object>> run)
+        {
+            using var image = StartImageRequest(generate);
+            try
+            {
+                return await run();
+            }
+            catch (Exception ex)
+            {
+                image.MarkEnded(ex);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// The <c>generate_image &lt;model&gt;</c> span and the
+        /// <c>tensorsharp.image.generation.duration</c> sample of one picture request, generated
+        /// or edited, from the moment it is accepted until its PNG is saved or it is refused. No
+        /// phase spans: Qwen-Image reports only its steps.
+        ///
+        /// <para>
+        /// The first outcome marked is the one recorded, so the precise mark made where a request
+        /// stops is not overwritten by the general one made on its way out. One writer at a time:
+        /// the request until its worker starts, then the worker.
+        /// </para>
+        /// </summary>
+        private sealed class ImageRequestTelemetry : IDisposable
+        {
+            private const string ModeGenerate = "generate";
+            private const string ModeEdit = "edit";
+
+            private readonly Activity _activity;
+            private readonly long _startTimestamp;
+            private readonly string _model;
+            private readonly string _backend;
+            private readonly string _mode;
+            private string _outcome;
+            private string _errorType;
+            private int _disposed;
+
+            public ImageRequestTelemetry(string model, string backend, bool generate)
+            {
+                _model = string.IsNullOrEmpty(model) ? "unknown" : model;
+                _backend = string.IsNullOrEmpty(backend) ? null : backend;
+                _mode = generate ? ModeGenerate : ModeEdit;
+                _startTimestamp = Stopwatch.GetTimestamp();
+                if (!TensorSharpTelemetry.Media.HasListeners())
+                    return;
+                // A child of whatever is current where the request is accepted: the HTTP request.
+                _activity = TensorSharpTelemetry.Media.StartActivity("generate_image " + _model, ActivityKind.Internal);
+                if (_activity is not { IsAllDataRequested: true })
+                    return;
+                _activity.SetTag(TelemetryAttributes.MediaKind, MediaKindImage);
+                _activity.SetTag(TelemetryAttributes.GenAiRequestModel, _model);
+                if (_backend != null) _activity.SetTag(TelemetryAttributes.Backend, _backend);
+                _activity.SetTag(ImageModeAttribute, _mode);
+                if (TelemetryContext.Protocol is { Length: > 0 } protocol) _activity.SetTag(TelemetryAttributes.Protocol, protocol);
+                if (TelemetryContext.RequestId is { Length: > 0 } requestId) _activity.SetTag(TelemetryAttributes.RequestId, requestId);
+            }
+
+            /// <summary>The client went away or the picture was stopped. Not an error.</summary>
+            public void MarkCancelled() => Mark(TelemetryAttributes.OutcomeCancelled, null, null);
+
+            /// <summary>Refused before the picture was made; <paramref name="errorType"/> is a short stable code.</summary>
+            public void MarkRefused(string errorType) => Mark(TelemetryAttributes.OutcomeRefused, errorType, null);
+
+            /// <summary>Failed: the exception's type, never its message. A cancellation counts as <see cref="MarkCancelled"/>.</summary>
+            public void MarkFailed(Exception exception)
+            {
+                if (exception is OperationCanceledException)
+                    MarkCancelled();
+                else
+                    Mark(TelemetryAttributes.OutcomeFailed, exception.GetType().FullName ?? exception.GetType().Name, exception);
+            }
+
+            /// <summary>
+            /// How <paramref name="exception"/> ended the request, by the rules the routes answer
+            /// with: a <see cref="WebUiRequestRejectedException"/> is a refusal unless it is a 5xx
+            /// other than 507 (no room for the result), and an <see cref="ArgumentException"/> is
+            /// the pipeline refusing the settings, which the plain route answers with a 400.
+            /// </summary>
+            public void MarkEnded(Exception exception)
+            {
+                switch (exception)
+                {
+                    case WebUiRequestRejectedException rejected when RefusalCode(rejected) is string code:
+                        MarkRefused(code);
+                        break;
+                    case ArgumentException and not ArgumentNullException:
+                        MarkRefused(MediaRefusedInvalidRequest);
+                        break;
+                    default:
+                        MarkFailed(exception);
+                        break;
+                }
+            }
+
+            private static string RefusalCode(WebUiRequestRejectedException rejected)
+            {
+                if (rejected.Message is NotAnImageModelError or NotAGenerationModelError)
+                    return ImageRefusedNotImageModel;
+                return rejected.StatusCode switch
+                {
+                    507 => MediaRefusedUploadQuota,
+                    413 => MediaRefusedPayloadTooLarge,
+                    >= 400 and < 500 => MediaRefusedInvalidRequest,
+                    _ => null,
+                };
+            }
+
+            private void Mark(string outcome, string errorType, Exception failure)
+            {
+                if (_outcome != null || Volatile.Read(ref _disposed) != 0)
+                    return;
+                _outcome = outcome;
+                _errorType = errorType;
+                if (_activity == null)
+                    return;
+                if (failure != null)
+                    _activity.SetStatus(ActivityStatusCode.Error, failure.GetType().Name);
+                if (_activity.IsAllDataRequested)
+                {
+                    _activity.SetTag(TelemetryAttributes.Outcome, outcome);
+                    if (errorType != null) _activity.SetTag(TelemetryAttributes.ErrorType, errorType);
+                }
+            }
+
+            /// <summary>Record the duration and stop the span, once.</summary>
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                    return;
+                string outcome = _outcome ?? TelemetryAttributes.OutcomeCompleted;
+                var tags = new TagList
+                {
+                    { TelemetryAttributes.GenAiRequestModel, _model },
+                    { ImageModeAttribute, _mode },
+                    { TelemetryAttributes.Outcome, outcome },
+                };
+                if (_backend != null) tags.Add(TelemetryAttributes.Backend, _backend);
+                if (_errorType != null) tags.Add(TelemetryAttributes.ErrorType, _errorType);
+                TensorSharpMetrics.ImageGenerationDuration.Record(Stopwatch.GetElapsedTime(_startTimestamp).TotalSeconds, tags);
+                if (_activity == null)
+                    return;
+                if (_outcome == null && _activity.IsAllDataRequested)
+                    _activity.SetTag(TelemetryAttributes.Outcome, outcome);
+                _activity.Stop();
+            }
         }
 
         // ---- Helpers ---------------------------------------------------------
@@ -2718,7 +3127,7 @@ namespace TensorSharp.Chat
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
                     webUiLogger.LogWarning(LogEventIds.HttpRequestRejected,
-                        "/api/chat could not read a file-backed CSV: {Error}", ex.Message);
+                        "/api/chat could not read a file-backed CSV: {Error}", LogContent.Of(ex.Message));
                     throw new WebUiRequestRejectedException(400, new
                     {
                         error = "The attached CSV could not be read from upload storage. Upload it again and retry.",
@@ -2863,7 +3272,7 @@ namespace TensorSharp.Chat
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 webUiLogger.LogWarning(LogEventIds.HttpRequestRejected,
-                    "/api/chat could not read a file-backed CSV: {Error}", ex.Message);
+                    "/api/chat could not read a file-backed CSV: {Error}", LogContent.Of(ex.Message));
                 throw new WebUiRequestRejectedException(400, new
                 {
                     error = "The attached CSV could not be read from upload storage. Upload it again and retry.",
@@ -3669,7 +4078,7 @@ namespace TensorSharp.Chat
                 _loggerFactory.CreateLogger("TensorSharp.Server.Upload").LogWarning(
                     LogEventIds.UploadReceived,
                     "Could not decode {Source} for the interpreter: {Error}; the original bytes are staged under the PNG name instead",
-                    source, ex.Message);
+                    LogContent.Of(source), LogContent.Of(ex.Message));
                 try { if (File.Exists(png)) File.Delete(png); } catch { /* best effort */ }
                 return false;
             }

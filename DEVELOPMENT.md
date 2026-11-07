@@ -619,7 +619,7 @@ TensorSharp/
 
 The repository is split along package boundaries so consumers can depend on only the layers they actually need.
 
-**Status verified 2026-09-25.** The publish set is **thirteen** packages — every row of the table below. `eng/verify-packages.ps1` is the authoritative list, and it gates the publish workflow, so adding a `ProjectReference` between two packable projects without updating that script fails the release.
+**Status verified 2026-09-25.** The publish set is **sixteen** packages — every row of the table below. `TensorSharp.Telemetry` is new and not on NuGet.org yet. `eng/verify-packages.ps1` is the authoritative list, and it gates the publish workflow, so adding a `ProjectReference` between two packable projects without updating that script fails the release.
 
 What is on [NuGet.org](https://www.nuget.org/profiles/TensorSharp): all thirteen ids at **2026.9.1**, published 2026-09-17 from tag `v2026.09.01`. **3.4.0** (2026-09-12, tag `v3.4.0.0`) was the first version to include `TensorSharp.Runtime.Logging`, `TensorSharp.AgentHost`, `TensorSharp.Chat`, `TensorSharp.Server.Host`, and `TensorSharp.Distributed`. The older **3.1.2** (2026-07-21) covers only eight ids — `TensorSharp.Tensors`, `TensorSharp.Runtime`, `TensorSharp.Models`, `TensorSharp.Backends.GGML`, `TensorSharp.Backends.Cuda`, `TensorSharp.Backends.MLX`, `TensorSharp.Server`, and `TensorSharp.Cli` — and its `TensorSharp.Server` predates the logging and chat splits, so it does not match the layering described here. Each package version is a snapshot of its tag; source changes made after `v2026.09.01` reach NuGet.org only with the next version tag.
 
@@ -635,10 +635,12 @@ What is on [NuGet.org](https://www.nuget.org/profiles/TensorSharp): all thirteen
 | `TensorSharp.Backends.Cuda` | `TensorSharp.Backends.Cuda` | `TensorSharp.Cuda` | Direct CUDA allocator, storage, cuBLAS GEMM, PTX kernels, and quantized CUDA ops |
 | `TensorSharp.Backends.MLX` | `TensorSharp.Backends.MLX` | `TensorSharp.MLX` | Apple Silicon MLX backend (mlx-c / Metal) with quantized / fused / compiled kernels and MoE expert offload |
 | `TensorSharp.Distributed` | `TensorSharp.Distributed` | `TensorSharp.Distributed` | Peer-to-peer TCP coordination for multi-node tensor parallelism |
+| `TensorSharp.Studio` | `TensorSharp.Studio` | `TensorSharp.Studio` | Shared local Video Studio services: projects, commands, jobs and rendering |
 | `TensorSharp.Chat` | `TensorSharp.Chat` | `TensorSharp.Chat` (new types); the moved pipeline keeps its `TensorSharp.Server.*` namespaces | Host-neutral chat pipeline: `ModelService`, sessions, generation, the skills loop and the Web UI request/stream contract (`WebUiChatService`, `SkillsService`) — no ASP.NET Core, no `TensorSharp.Distributed`; shared by the Server, the CLI and TensorAgent |
 | `TensorSharp.Server` | `TensorSharp.Server` | `TensorSharp.Server` | ASP.NET Core server, OpenAI/Ollama adapters, HTTP transport over TensorSharp.Chat, web UI |
 | `TensorSharp.Server.Host` | `TensorSharp.Server.Host` | `TensorSharp.Server.Host` | The **runnable** web application: `Program.cs`, host wiring, `wwwroot/`, and the command line. `TensorSharp.Server` is the library it builds on — building or running `TensorSharp.Server` alone produces no executable |
 | `TensorSharp.Cli` | `TensorSharp.Cli` | `TensorSharp.Cli` | Console host and debugging / batch tooling |
+| `TensorSharp.Telemetry` | `TensorSharp.Telemetry` | `TensorSharp.Telemetry` | Opt-in OpenTelemetry for the two hosts: settings, OTLP and Azure Monitor exporters, log redaction. Host-only, so library consumers never get the SDK; the libraries record on in-box `ActivitySource` / `Meter` (`TensorSharp.Runtime/Telemetry`) |
 
 This split keeps engine users off the web stack, keeps API-layer changes from leaking into core/runtime packages, and makes future benchmark or eval-harness projects easier to publish independently.
 

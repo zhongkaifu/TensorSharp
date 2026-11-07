@@ -1,0 +1,57 @@
+# Copyright (c) Zhongkai Fu. All rights reserved.
+# https://github.com/zhongkaifu/TensorSharp
+#
+# This file is part of TensorSharp.
+#
+# TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+#
+# The standalone Aspire dashboard as a local OTLP endpoint for TensorSharp: traces, metrics and
+# structured logs in one UI, nothing else to install.
+#
+#   cp .env.example .env        # then put two random keys in .env
+#   docker compose up -d
+#   docker compose logs aspire-dashboard    # the line with login?t=<token> opens the UI
+#
+# Then run TensorSharp with
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+#   OTEL_EXPORTER_OTLP_HEADERS=x-otlp-api-key=<ASPIRE_OTLP_API_KEY from .env>
+#
+# Both keys are read from .env, which Docker Compose loads from this directory. The compose file
+# refuses to start without them rather than run an unauthenticated OTLP endpoint.
+#
+# The dashboard keeps telemetry in a temporary SQLite database that is deleted when the container
+# stops, so nothing outlives `docker compose down`.
+#
+# Do not set ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS=true here: besides opening the UI it turns
+# off OTLP and API authentication as well.
+
+name: tensorsharp-aspire
+
+services:
+  aspire-dashboard:
+    # Pinned: 13.6.2 is listed in the registry's tag list
+    # (https://mcr.microsoft.com/v2/aspire/dashboard/tags/list), checked on 2026-11-06.
+    image: mcr.microsoft.com/aspire/dashboard:13.6.2
+    container_name: aspire-dashboard
+    restart: "no"
+    ports:
+      # Bound to loopback, so only this machine can reach the dashboard. Drop the "127.0.0.1:"
+      # prefixes to accept telemetry from other machines; the keys below still guard OTLP and
+      # the telemetry API, and the browser token guards the UI.
+      - "127.0.0.1:18888:18888"   # dashboard UI, and the telemetry HTTP API under /api/telemetry/*
+      - "127.0.0.1:4317:18889"    # OTLP/gRPC  (TensorSharp's default protocol)
+      - "127.0.0.1:4318:18890"    # OTLP/HTTP  (OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf)
+    environment:
+      # OTLP: every export must carry the header x-otlp-api-key with this value.
+      Dashboard__Otlp__AuthMode: ApiKey
+      Dashboard__Otlp__PrimaryApiKey: ${ASPIRE_OTLP_API_KEY:?Set ASPIRE_OTLP_API_KEY in .env (copy .env.example)}
+      # Telemetry HTTP API (GET /api/telemetry/resources, /spans, /logs, /traces): every request
+      # must carry the header x-api-key with this value. The configuration page says the API is
+      # on by default and the security page says it is off, so it is set explicitly. 13.6.2
+      # reads Dashboard:Api:Enabled as the inverse of the newer Dashboard:Api:Disabled; both are
+      # set and agree, so either spelling keeps it on.
+      Dashboard__Api__Enabled: "true"
+      Dashboard__Api__Disabled: "false"
+      Dashboard__Api__AuthMode: ApiKey
+      Dashboard__Api__PrimaryApiKey: ${ASPIRE_API_KEY:?Set ASPIRE_API_KEY in .env (copy .env.example)}
+      # The UI keeps its default browser-token login: the token is printed in the container log.

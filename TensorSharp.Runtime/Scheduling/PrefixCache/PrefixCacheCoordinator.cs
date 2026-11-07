@@ -196,7 +196,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         LastDeclineReason = _plan.HasReuse ? null
             : DescribeDecline(_plan, request.PublicBoundary, _tree.Caps.RewindCapTokens);
         if (ReleaseDebug && !_plan.HasReuse)
-            _logger.LogInformation("[prefix-plan] {RequestId} {Plan} route={Route} candidates={Candidates} blockedByScope={Blocked} nodes={Nodes} scoped={Scoped} public={Public} primary={Primary} decline={Decline}",
+            _logger.LogInformation("[prefix-plan] {EngineRequestId} {Plan} route={Route} candidates={Candidates} blockedByScope={Blocked} nodes={Nodes} scoped={Scoped} public={Public} primary={Primary} decline={Decline}",
                 sequence.RequestId, _plan.ToString(), request.Route, _plan.CandidateCount, _plan.BlockedByScope, _tree.NodeCount,
                 _tree.ScopedEndStateCount, _tree.PublicEndStateCount, _tree.PrimaryResidentCount,
                 $"{_plan.EndStateDecline}/{_plan.PrimaryDecline}/{_plan.TruncationDecline}/{_plan.PageDecline}");
@@ -542,7 +542,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         if (primary && _tree.Caps.DeferPrimaryConversion)
         {
             if (ReleaseDebug)
-                _logger.LogInformation("[prefix-retain] {RequestId} length={Length} registered as the primary", sequence.RequestId, length);
+                _logger.LogInformation("[prefix-retain] {EngineRequestId} length={Length} registered as the primary", sequence.RequestId, length);
             RegisterPrimary(node, payloadKey, length);
             return false; // The live primary still belongs to the executor, not a retained holder.
         }
@@ -563,7 +563,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             conversionFailed = !captured;
         }
         if (ReleaseDebug)
-            _logger.LogInformation("[prefix-retain] {RequestId} length={Length} primary={Primary} captured={Captured} origin={Origin}",
+            _logger.LogInformation("[prefix-retain] {EngineRequestId} length={Length} primary={Primary} captured={Captured} origin={Origin}",
                 sequence.RequestId, length, primary, captured, origin);
         if (captured)
         {
@@ -851,7 +851,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                         // Said, because nothing else says it: the admission line only
                         // shows the reuse, and a restore and a resident hit look alike there.
                         _logger.LogInformation(
-                            "Restored the {Length}-token public prefix checkpoint from disk for {RequestId}.",
+                            "Restored the {Length}-token public prefix checkpoint from disk for {EngineRequestId}.",
                             length, sequence.RequestId);
                         // This ancestor may serve a new branch beyond the two
                         // already resident endpoints. Prefer normal LRU for this

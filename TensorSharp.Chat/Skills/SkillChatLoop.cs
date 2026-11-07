@@ -21,6 +21,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Telemetry;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.Skills;
@@ -137,10 +138,14 @@ namespace TensorSharp.Server.Skills
             long promptNs = 0;
             long evalNs = 0;
             long totalNs = 0;
+            // The last round the loop ran, so the final generation's span says which
+            // round it really was (the loop can end early, for knowledge synthesis).
+            int roundsRun = 0;
 
             for (int round = 1; round <= maxRounds; round++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                roundsRun = round;
 
                 // The loop parses the stream itself, because it has to: it is looking
                 // for skills_read calls to answer. Having parsed, it forwards the
@@ -162,6 +167,8 @@ namespace TensorSharp.Server.Skills
                 // surfaces as content -- and the note to the model has to quote it.
                 var rawTail = new StringBuilder();
 
+                // Set right before the generation starts, which is when its span reads it.
+                using var roundScope = TelemetryContextScope.Round(round);
                 await foreach (ChatStreamUpdate update in
                     generate(working, activeTools, cancellationToken).ConfigureAwait(false))
                 {
@@ -241,9 +248,10 @@ namespace TensorSharp.Server.Skills
                 if (FinishReasonMapper.IsRepetition(terminal.FinishReason))
                 {
                     string loopNote = DescribeRepetition(rawTail.ToString());
+                    // The note quotes the model's raw output, so it is content.
                     logger?.LogWarning(LogEventIds.SkillToolInvoked,
                         "skills.loop.repetition round={Round} retried={Retried}: {What}",
-                        round, !repetitionRetried, loopNote);
+                        round, !repetitionRetried, LogContent.Of(loopNote));
 
                     foreach (ToolCall call in calls)
                         yield return ChatStreamUpdate.ToolProgress("finished", call.Name);
@@ -400,9 +408,10 @@ namespace TensorSharp.Server.Skills
 
                 foreach (ToolCall unknownCall in unknownCalls)
                 {
+                    // A name nobody declared is whatever the model wrote, so it is content.
                     logger?.LogWarning(LogEventIds.SkillToolInvoked,
                         "skills.tool round={Round} tool={Tool} skill={SkillId} path={Path} ok={Ok} bytes={Bytes}",
-                        round, unknownCall.Name ?? "-", "-", "-", false, 0);
+                        round, LogContent.Of(unknownCall.Name ?? "-"), "-", "-", false, 0);
 
                     string refusal = SkillTools.DescribeUnknownTool(unknownCall.Name, plan.Tools, KnownSkillIds(plan));
                     working.Add(BuildResult(plan, refusal, unknownCall.Name));
@@ -508,6 +517,7 @@ namespace TensorSharp.Server.Skills
             var finalTools = plan.ToolContext.Knowledge == null || guardCompletion
                 ? plan.Tools : plan.ClientTools?.ToList() ?? new List<ToolFunction>();
 
+            using var finalRoundScope = TelemetryContextScope.Round(roundsRun + 1);
             await foreach (ChatStreamUpdate update in
                 generate(working, finalTools, cancellationToken).ConfigureAwait(false))
             {
@@ -755,6 +765,7 @@ namespace TensorSharp.Server.Skills
             ChatStreamUpdate terminal = default;
             string toolBeingWritten = null;
 
+            using var roundScope = TelemetryContextScope.Round(correctionRound);
             await foreach (ChatStreamUpdate update in
                 generate(working, plan.Tools, cancellationToken).ConfigureAwait(false))
             {
@@ -797,7 +808,7 @@ namespace TensorSharp.Server.Skills
             {
                 logger?.LogWarning(LogEventIds.SkillLoopCapped,
                     "skills.loop.repetition round={Round} retried=False (artifact correction): {What}",
-                    correctionRound, DescribeRepetition(rawTail.ToString()));
+                    correctionRound, LogContent.Of(DescribeRepetition(rawTail.ToString())));
                 foreach (ToolCall call in calls)
                     yield return ChatStreamUpdate.ToolProgress("finished", call.Name);
                 calls.Clear();
@@ -840,7 +851,7 @@ namespace TensorSharp.Server.Skills
                 final = DescribeCompletedArtifact(completion.Artifact.Value);
                 logger?.LogInformation(LogEventIds.SkillToolInvoked,
                     "skills.completion.corrected round={Round} artifact={Artifact}",
-                    correctionRound, completion.Artifact.Value.Name);
+                    correctionRound, LogContent.Of(completion.Artifact.Value.Name));
             }
             else
             {
@@ -851,7 +862,7 @@ namespace TensorSharp.Server.Skills
                     + completion.Reason;
                 logger?.LogWarning(LogEventIds.SkillLoopCapped,
                     "skills.completion.failed round={Round} reason={Reason}",
-                    correctionRound, completion.Reason);
+                    correctionRound, LogContent.Of(completion.Reason));
             }
 
             yield return ChatStreamUpdate.Parsed(final, null, null);
@@ -957,11 +968,26 @@ namespace TensorSharp.Server.Skills
                         {
                             using (workspaceOperation)
                             {
-                                if (plan.Agents != null)
-                                    return MultiAgentTools.IsTool(call.Name)
-                                        ? await plan.Agents.ExecuteAsync(call, cancellationToken: cancellationToken).ConfigureAwait(false)
-                                        : await plan.Agents.ExecuteHostToolAsync(call, cancellationToken, liveOutput.Add).ConfigureAwait(false);
-                                return SkillTools.Execute(call, plan.ToolContext, liveOutput.Add, cancellationToken);
+                                // The span opens here, on the worker, and closes when the tool
+                                // returns, with no yield in between: it is Activity.Current for
+                                // exactly the tool's own work, so the code-execution span the
+                                // tool opens nests under it. Its parent is what the request had
+                                // current when this was queued (Task.Run carries the execution
+                                // context), the parent the round's chat span has too.
+                                ToolCallTelemetry tool = ToolCallTelemetry.Start(call, round);
+                                try
+                                {
+                                    if (plan.Agents != null)
+                                        return tool.Finished(MultiAgentTools.IsTool(call.Name)
+                                            ? await plan.Agents.ExecuteAsync(call, cancellationToken: cancellationToken).ConfigureAwait(false)
+                                            : await plan.Agents.ExecuteHostToolAsync(call, cancellationToken, liveOutput.Add).ConfigureAwait(false));
+                                    return tool.Finished(SkillTools.Execute(call, plan.ToolContext, liveOutput.Add, cancellationToken));
+                                }
+                                catch (Exception ex)
+                                {
+                                    tool.Failed(ex);
+                                    throw;
+                                }
                             }
                         });
                     }
@@ -1000,9 +1026,10 @@ namespace TensorSharp.Server.Skills
                 lock (plan.Invocations)
                     plan.Invocations.Add(invocation);
 
+                // The resource path is the model's argument (a workspace file it chose).
                 logger?.LogInformation(LogEventIds.SkillToolInvoked,
                     "skills.tool round={Round} tool={Tool} skill={SkillId} path={Path} ok={Ok} bytes={Bytes}",
-                    round, invocation.Tool, invocation.SkillId ?? "-", invocation.ResourcePath ?? "-",
+                    round, invocation.Tool, invocation.SkillId ?? "-", LogContent.Of(invocation.ResourcePath ?? "-"),
                     invocation.Ok, invocation.ResultBytes);
 
                 working.Add(BuildResult(plan, result.Content ?? string.Empty, call.Name));
@@ -1016,7 +1043,7 @@ namespace TensorSharp.Server.Skills
                 {
                     logger?.LogInformation(LogEventIds.SkillToolInvoked,
                         "skills.completion.early round={Round} artifact={Artifact}",
-                        round, artifact.Name);
+                        round, LogContent.Of(artifact.Name));
 
                     // Parsing happened before execution, so the UI may already have
                     // shown a "writing" phase for calls later in this same response.
@@ -1536,6 +1563,111 @@ namespace TensorSharp.Server.Skills
                 ? "Result of the skill lookup you requested:"
                 : $"Result of your {tool} call:";
             return new HostContinuationMessage { Role = "user", Content = prefix + "\n\n" + content };
+        }
+
+        /// <summary>
+        /// The <c>execute_tool &lt;name&gt;</c> span and <c>tensorsharp.tool.duration</c>
+        /// sample of one host tool call. <see cref="Finished"/> or <see cref="Failed"/> ends
+        /// it; call exactly one of them, once.
+        /// </summary>
+        private readonly struct ToolCallTelemetry
+        {
+            // Content: set only with OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT on.
+            private const string ToolArguments = "tensorsharp.tool.arguments";
+            private const string ToolResult = "tensorsharp.tool.result";
+
+            private const string SkillIdAttribute = "tensorsharp.skill.id";
+            private const string ResultBytes = "tensorsharp.tool.result_bytes";
+            // error.type of a tool that ran and reported a failure to the model (a script's
+            // non-zero exit, a file it could not read): a stable code, never the message.
+            private const string ToolErrorType = "tool_error";
+
+            private readonly Activity? _activity;
+            private readonly string _toolName;
+            private readonly long _startTimestamp;
+
+            private ToolCallTelemetry(Activity? activity, string toolName)
+            {
+                _activity = activity;
+                _toolName = toolName;
+                _startTimestamp = Stopwatch.GetTimestamp();
+            }
+
+            public static ToolCallTelemetry Start(ToolCall call, int round)
+            {
+                // Only host tools get here (SkillTools.IsBuiltInTool), so the name is one of
+                // a fixed set and safe as a metric attribute.
+                string toolName = string.IsNullOrEmpty(call.Name) ? "unknown" : call.Name;
+                // Checked first so the span name is not built when nothing listens.
+                Activity? activity = TensorSharpTelemetry.Agent.HasListeners()
+                    ? TensorSharpTelemetry.Agent.StartActivity(
+                        TelemetryAttributes.OperationExecuteTool + " " + toolName, ActivityKind.Internal)
+                    : null;
+                if (activity is { IsAllDataRequested: true })
+                {
+                    activity.SetTag(TelemetryAttributes.GenAiOperationName, TelemetryAttributes.OperationExecuteTool);
+                    activity.SetTag(TelemetryAttributes.GenAiToolName, toolName);
+                    if (!string.IsNullOrEmpty(call.Id))
+                        activity.SetTag(TelemetryAttributes.GenAiToolCallId, call.Id);
+                    activity.SetTag(TelemetryAttributes.Round, round);
+                    if (TensorSharpTelemetry.CaptureMessageContent)
+                        activity.SetTag(ToolArguments, JsonSerializer.Serialize(call.Arguments));
+                }
+                return new ToolCallTelemetry(activity, toolName);
+            }
+
+            /// <summary>The tool returned; <paramref name="result"/> is passed through.</summary>
+            public SkillToolResult Finished(SkillToolResult result)
+            {
+                if (_activity is { IsAllDataRequested: true })
+                {
+                    if (!string.IsNullOrEmpty(result.SkillId))
+                        _activity.SetTag(SkillIdAttribute, result.SkillId);
+                    _activity.SetTag(ResultBytes, result.Content?.Length ?? 0);
+                    if (TensorSharpTelemetry.CaptureMessageContent && result.Content != null)
+                        _activity.SetTag(ToolResult, result.Content);
+                }
+                End(result.Ok ? TelemetryAttributes.OutcomeCompleted : TelemetryAttributes.OutcomeFailed,
+                    result.Ok ? null : ToolErrorType);
+                return result;
+            }
+
+            /// <summary>
+            /// The tool threw. Records the exception's type, never its message (it can quote
+            /// the call's arguments); a cancelled call is not a failed one.
+            /// </summary>
+            public void Failed(Exception exception)
+            {
+                if (exception is OperationCanceledException)
+                {
+                    End(TelemetryAttributes.OutcomeCancelled, null);
+                    return;
+                }
+                Type type = exception.GetType();
+                _activity?.SetStatus(ActivityStatusCode.Error, type.Name);
+                End(TelemetryAttributes.OutcomeFailed, type.FullName ?? type.Name);
+            }
+
+            private void End(string outcome, string? errorType)
+            {
+                var tags = new TagList
+                {
+                    { TelemetryAttributes.GenAiToolName, _toolName },
+                    { TelemetryAttributes.Outcome, outcome },
+                };
+                if (errorType != null)
+                    tags.Add(TelemetryAttributes.ErrorType, errorType);
+                TensorSharpMetrics.ToolDuration.Record(Stopwatch.GetElapsedTime(_startTimestamp).TotalSeconds, tags);
+                if (_activity is null)
+                    return;
+                if (_activity.IsAllDataRequested)
+                {
+                    _activity.SetTag(TelemetryAttributes.Outcome, outcome);
+                    if (errorType != null)
+                        _activity.SetTag(TelemetryAttributes.ErrorType, errorType);
+                }
+                _activity.Stop();
+            }
         }
     }
 }

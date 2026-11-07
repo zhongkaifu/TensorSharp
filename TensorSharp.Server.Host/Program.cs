@@ -26,6 +26,9 @@ using TensorSharp.Models;
 using TensorSharp.Models.Embeddings;
 using TensorSharp.Knowledge;
 using TensorSharp.Server.Knowledge;
+using TensorSharp.Telemetry;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Trace;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 
@@ -101,6 +104,21 @@ codeExecOptions.ApplyEnvironment();
 // helpers downstream each re-parse the array, and every one of them would reject an
 // unrecognised flag; filtering once here is what keeps that guard useful for real typos.
 args = remainingArgs.ToArray();
+
+// --otel-endpoint is the one telemetry flag (so a --config file can name the collector); it
+// only sets OTEL_EXPORTER_OTLP_ENDPOINT and is consumed here for the same reason as the
+// code-execution flags above: ServerOptionsBuilder rejects any flag it does not recognise.
+try
+{
+    args = TelemetryCliFlags.Consume(args, out string? otelEndpoint);
+    TelemetryCliFlags.ApplyToEnvironment(otelEndpoint);
+}
+catch (ArgumentException ex)
+{
+    Console.Error.WriteLine("Configuration error: " + ex.Message);
+    Environment.ExitCode = HostExitCodes.ConfigurationError;
+    return;
+}
 
 ServerHostingOptions hostingOptions;
 try
@@ -249,8 +267,26 @@ catch (Exception ex) when (ex is ArgumentException or IOException)
     return;
 }
 
+// OpenTelemetry is off unless an OTLP endpoint, APPLICATIONINSIGHTS_CONNECTION_STRING or
+// TENSORSHARP_OTEL=1 asks for it (TelemetryOptions has every rule). Resolved after the flag
+// appliers above, which set the TENSORSHARP_TP_* variables the resource reports.
+TelemetryOptions telemetryOptions;
+try
+{
+    telemetryOptions = TelemetryOptions.FromEnvironment(TelemetryHost.Server);
+}
+catch (ArgumentException ex)
+{
+    Console.Error.WriteLine("Configuration error: " + ex.Message);
+    Environment.ExitCode = HostExitCodes.ConfigurationError;
+    return;
+}
+
 var builder = WebApplication.CreateBuilder(args);
 LoggingSetup.Configure(builder.Logging, hostingOptions, resolvedLogLevel);
+builder.Services.AddTensorSharpTelemetry(builder.Logging, telemetryOptions,
+    tracing => tracing.AddAspNetCoreInstrumentation(o => { o.Filter = ServerTelemetry.ShouldTrace; o.EnrichWithHttpRequest = ServerTelemetry.Enrich; }),
+    metrics => metrics.AddAspNetCoreInstrumentation());
 
 // Every route keeps the 500 MB request-body limit: the JSON endpoints buffer the whole
 // body, so raising it for them only raises what one request can pin in memory. The
@@ -427,6 +463,27 @@ if (hostingOptions.LoraDirectory != null)
 WebRootSetup.Resolve(builder.Environment, baseDirectory);
 
 var app = builder.Build();
+// Start the tracer and meter providers before anything below runs: the startup model load,
+// the prefix-cache warm-up and Studio's job recovery all happen before app.RunAsync, which is
+// where the hosting package would otherwise start them. No-op with telemetry off.
+app.Services.StartTensorSharpTelemetry();
+// The tensorsharp.gpu.memory.* gauges while serving: every load tracks its model, and the
+// engine's worker takes the snapshots between steps, on the thread already doing that
+// backend's work (video clips also take them at their phase boundaries).
+if (telemetryOptions.Enabled && telemetryOptions.Metrics != TelemetrySinks.None)
+{
+    TensorSharp.Models.Telemetry.GpuMemoryTelemetry.EnsureRegistered();
+    TensorSharp.Runtime.Telemetry.TensorSharpMetrics.SetEngineStepObserver(TensorSharp.Models.Telemetry.GpuMemoryTelemetry.Snapshot);
+}
+// Upload paths, and the code-execution workspaces and artifacts that hold the user's files
+// under their own names, are user content: an exported exception message has them replaced.
+TensorSharp.Runtime.Telemetry.TensorSharpTelemetry.RegisterSensitivePath(hostingOptions.UploadDirectory);
+if (codeExecOptions.Enabled)
+{
+    TensorSharp.Runtime.Telemetry.TensorSharpTelemetry.RegisterSensitivePath(codeExecOptions.ScratchDirectory);
+    TensorSharp.Runtime.Telemetry.TensorSharpTelemetry.RegisterSensitivePath(
+        codeExecOptions.ArtifactDirectory ?? Path.Combine(baseDirectory, "code-artifacts"));
+}
 
 ILogger startupLogger = app.Services.GetRequiredService<ILoggerFactory>()
     .CreateLogger("TensorSharp.Server.Host.Startup");
@@ -434,6 +491,9 @@ startupLogger.LogInformation(LogEventIds.LoggingInitialized,
     "Logging initialized: minimumLevel={MinimumLevel} fileLogging={FileLogging} logDir={LogDir}",
     resolvedLogLevel, hostingOptions.FileLoggingEnabled,
     hostingOptions.FileLoggingEnabled ? hostingOptions.LogDirectory : "(disabled)");
+startupLogger.LogInformation(LogEventIds.HostConfiguration, "{Telemetry}", telemetryOptions.Describe());
+foreach (string telemetryWarning in telemetryOptions.Warnings)
+    startupLogger.LogWarning(LogEventIds.HostConfiguration, "Telemetry: {Warning}", telemetryWarning);
 
 // --code-exec was asked for but the runner would refuse every call (no usable
 // sandbox on this host). Said once at startup rather than discovered one request

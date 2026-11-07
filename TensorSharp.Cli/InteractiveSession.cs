@@ -22,6 +22,7 @@ using TensorSharp.Models;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Runtime.Speculative;
+using TensorSharp.Runtime.Telemetry;
 
 namespace TensorSharp.Cli
 {
@@ -537,7 +538,8 @@ namespace TensorSharp.Cli
 
         private void ResetInference()
         {
-            _inference?.Dispose();
+            // Mid-session: no telemetry flush (CliInferenceSession.Discard).
+            _inference?.Discard();
             _inference = null;
             _model.ResetKVCache();
             _sharedPrefix = null;
@@ -938,7 +940,7 @@ namespace TensorSharp.Cli
                 newModel.ResetKVCache();
 
                 ModelBase previousModel = _model;
-                _inference?.Dispose();
+                _inference?.Discard();
                 _inference = null;
                 _model = newModel;
                 newModel = null; // ownership now belongs to the session
@@ -1230,7 +1232,8 @@ namespace TensorSharp.Cli
                             + (result.Ok ? string.Empty : " (failed)"));
                         _log.LogInformation(LogEventIds.SkillToolInvoked,
                             "interactive.skills.tool round={Round} tool={Tool} skill={SkillId} path={Path} ok={Ok} bytes={Bytes}",
-                            round, call.Name, result.SkillId ?? "-", result.ResourcePath ?? "-",
+                            // The resource path is the model's argument (a file it chose).
+                            round, call.Name, result.SkillId ?? "-", LogContent.Of(result.ResourcePath ?? "-"),
                             result.Ok, result.Content?.Length ?? 0);
                         roundResults.Add((result.Content, call.Name));
                         _history.Add(BuildSkillResultMessage(result.Content, call.Name));
@@ -1906,8 +1909,19 @@ namespace TensorSharp.Cli
                 }
                 var sw = Stopwatch.StartNew();
                 // A one-token request captures the prompt boundary. Its output is
-                // discarded; normal turns resume the same engine-owned prefix.
-                Inference.Generate(warm, 1, SamplingConfig.Greedy, sharedPrefixTokens: warm.Count);
+                // discarded; normal turns resume the same engine-owned prefix. Its span and
+                // request metrics are tagged as the host's own warm-up, as the server's are,
+                // so they stay out of a dashboard's latency figures.
+                string outerOrigin = TelemetryContext.Origin;
+                TelemetryContext.Origin = TelemetryAttributes.OriginPrefixCacheWarmup;
+                try
+                {
+                    Inference.Generate(warm, 1, SamplingConfig.Greedy, sharedPrefixTokens: warm.Count);
+                }
+                finally
+                {
+                    TelemetryContext.Origin = outerOrigin;
+                }
                 // The synthetic warmup tail belongs to no user conversation.
                 Inference.StartNewConversation();
                 _warmPrefixTokens = warm.Count;
