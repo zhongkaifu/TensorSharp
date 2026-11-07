@@ -1,0 +1,27 @@
+# Copyright (c) Zhongkai Fu. All rights reserved.
+# https://github.com/zhongkaifu/TensorSharp
+#
+# This file is part of TensorSharp.
+#
+# TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+#
+# Grafana data sources for the local stack: Prometheus for metrics, Jaeger for traces. Both are
+# reached by their compose service names. Mounted at /etc/grafana/provisioning/datasources.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+  - name: Jaeger
+    uid: jaeger
+    type: jaeger
+    access: proxy
+    # Jaeger's query service (the same port as its UI).
+    url: http://jaeger:16686
+    editable: false

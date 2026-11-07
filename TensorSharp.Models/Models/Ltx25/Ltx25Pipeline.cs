@@ -9,6 +9,7 @@ using TensorSharp.MLX;
 using TensorSharp.Models.QwenImage;
 using TensorSharp.Models.Video;
 using TensorSharp.Models.WanVideo;
+using TensorSharp.Runtime.Telemetry;
 
 namespace TensorSharp.Models.Ltx25;
 
@@ -37,7 +38,9 @@ internal static class Ltx25Pipeline
         var timer = Stopwatch.StartNew();
         var phase = Stopwatch.StartNew();
         int completed = 0, totalSteps = settings.TotalSteps;
-        void Report(string name, string detail)
+        // stage names the part of the phase a report belongs to, for telemetry (the two passes
+        // and what runs between them all report as denoise); attributes are facts about it.
+        void Report(string name, string detail, string stage = null, IReadOnlyDictionary<string, object> attributes = null)
         {
             parameters.CancellationToken.ThrowIfCancellationRequested();
             Console.WriteLine($"  [ltx25] {name}: {detail}");
@@ -45,6 +48,7 @@ internal static class Ltx25Pipeline
             {
                 Phase = name, Detail = detail, Step = completed, TotalSteps = totalSteps,
                 ElapsedSeconds = timer.Elapsed.TotalSeconds,
+                Stage = stage, Attributes = attributes,
             });
         }
         void EndPhase(string name)
@@ -76,11 +80,12 @@ internal static class Ltx25Pipeline
             // Progress phases follow the hosts' video contract (text-encode, denoise,
             // vae-decode, ...): everything between the two passes reports as denoise, so
             // the step count and ETA keep advancing. Timing lines keep the finer names.
-            List<Ltx25EncodedImage> EncodeImages(Ltx25GenerationSettings stage, string progressPhase, string timingPhase)
+            List<Ltx25EncodedImage> EncodeImages(Ltx25GenerationSettings stage, string progressPhase, string timingPhase,
+                string progressStage = null)
             {
                 var encoded = new List<Ltx25EncodedImage>(images.Count);
                 if (images.Count == 0) return encoded;
-                Report(progressPhase, $"encoding {images.Count} temporal image guides at {stage.Width}x{stage.Height}");
+                Report(progressPhase, $"encoding {images.Count} temporal image guides at {stage.Width}x{stage.Height}", progressStage);
                 for (int i = 0; i < images.Count; ++i)
                 {
                     parameters.CancellationToken.ThrowIfCancellationRequested();
@@ -160,9 +165,14 @@ internal static class Ltx25Pipeline
                 if (effectiveFirstStageStrength.HasValue)
                     encodedImages = WithFirstStageImageStrength(encodedImages, effectiveFirstStageStrength.Value);
             }
-            Report("text-encode", "Gemma 4 and learned AV conditioning");
-            Ltx25PromptEncoding conditioning = model.Conditioning(identity
-                ? Ltx25ReferencePrompt.Format(prompt, identityImageCount, identityVideoCount) : prompt, parameters.CancellationToken);
+            // Format cannot throw here: the reference counts it checks were refused above.
+            string conditioningPrompt = identity
+                ? Ltx25ReferencePrompt.Format(prompt, identityImageCount, identityVideoCount) : prompt;
+            // A repeated prompt comes from the model's small prompt cache and makes this phase
+            // almost instant, which would otherwise look like an anomaly in a trace.
+            Report("text-encode", "Gemma 4 and learned AV conditioning", attributes: parameters.OnProgress == null ? null
+                : new Dictionary<string, object> { [TelemetryAttributes.VideoPromptCacheHit] = model.HasCachedConditioning(conditioningPrompt) });
+            Ltx25PromptEncoding conditioning = model.Conditioning(conditioningPrompt, parameters.CancellationToken);
             Trim();
             EndPhase("text-encode");
 
@@ -202,11 +212,12 @@ internal static class Ltx25Pipeline
                 // The guide and the references occupy disjoint tokens (canvas frame 0, the appended tail), so pinning frame 0
                 // after the references equals upstream's images-then-references order.
                 if (identity && stageImages.Count > 0) input = Ltx25ImageConditioning.ApplyFirstFrame(input, stage, stageImages[0]);
+                string progressStage = priorVideo == null ? twoStage ? "first-pass" : "single-pass" : "refinement";
                 Report("denoise", $"{(priorVideo == null ? twoStage ? "first pass" : "single pass" : "refinement pass")} at {stage.Width}x{stage.Height}: {stage.VideoTokens} video + {guideTokens} guide, {stage.AudioTokens} audio, {conditioning.Tokens} prompt tokens, " +
                     (stage.Ancestral ? Ltx25GenerationSettings.AncestralSampler
                         : $"{Ltx25GenerationSettings.EulerSampler} (requested; the publisher samples LTX 2.5 with {Ltx25GenerationSettings.AncestralSampler})") +
                     (stageImages.Count == 0 ? "" : (identity ? "; first-frame guide strength: " : "; temporal guide strengths: ") + string.Join(", ", stageImages.Select(image =>
-                        $"frame {image.FrameIndex}={image.Strength.ToString("R", CultureInfo.InvariantCulture)}"))));
+                        $"frame {image.FrameIndex}={image.Strength.ToString("R", CultureInfo.InvariantCulture)}"))), progressStage);
                 Ltx25SamplingOutput result = model.Sample(input, stage, (step, total) =>
                     {
                         // One stage ahead of each companion's first use: the upscaler
@@ -217,7 +228,7 @@ internal static class Ltx25Pipeline
                         if (finalPass && step == Math.Min(1, total - 1)) model.PrefetchCompanion(Ltx25Model.CompanionFile.VideoDecoder);
                         completed = stepOffset + step;
                         parameters.OnStep?.Invoke(completed, totalSteps);
-                        Report("denoise", $"step {completed}/{totalSteps}");
+                        Report("denoise", $"step {completed}/{totalSteps}", progressStage);
                     }, parameters.CancellationToken, sigmas, noiseSeedOffset);
                 if (result.BlocksPerStep != 48) throw new InvalidOperationException("LTX generation did not execute all transformer blocks.");
                 Trim();
@@ -229,12 +240,12 @@ internal static class Ltx25Pipeline
                 Ltx25GenerationSettings.AncestralNoiseSeedOffset, 0, "denoise", null, null);
             if (twoStage)
             {
-                Report("denoise", $"x2 latent upscale to {settings.Width}x{settings.Height}");
+                Report("denoise", $"x2 latent upscale to {settings.Width}x{settings.Height}", "upscale");
                 float[] firstLatents = Ltx25Geometry.UnpackVideo(latents.Video.AsSpan(0, checked(first.VideoTokens * 128)), first.VideoTokens, 128);
                 float[] upsampled = model.UpsampleLatents(firstLatents, first.LatentFrames, first.LatentHeight, first.LatentWidth, parameters.CancellationToken);
                 Trim();
                 EndPhase("upsample");
-                var refinementImages = EncodeImages(settings, "denoise", "refine-image-encode");
+                var refinementImages = EncodeImages(settings, "denoise", "refine-image-encode", "refine-image-encode");
                 latents = RunStage(settings, refinementImages, Ltx25Scheduler.RefinementSigmas(),
                     Ltx25GenerationSettings.AncestralStage2NoiseSeedOffset, Ltx25GenerationSettings.Steps, "refine",
                     Ltx25Geometry.PackVideo(upsampled, settings.VideoTokens, 128), latents.Audio);

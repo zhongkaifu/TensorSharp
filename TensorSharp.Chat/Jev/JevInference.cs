@@ -14,10 +14,13 @@ internal static class JevInference
 {
     internal delegate float[][] Read(int[] prompt, int[] canvas, int[] positions, int[][] tokenIds, CancellationToken cancellation);
 
+    // reportUsage is told the input and output token counts the response's usage carries,
+    // once every read has succeeded (the host's request telemetry).
     internal static object Run(JevRequest request, string modelName, Func<string, int[]> encode,
         Func<string, string, int[]> renderPrompt, Read read, int maxWidth, int maxContext,
         int eos, int pad, int vocabSize, CancellationToken ct,
-        int? imageCount = null, object? attachments = null, double preprocessingMs = 0)
+        int? imageCount = null, object? attachments = null, double preprocessingMs = 0,
+        Action<int, int>? reportUsage = null)
     {
         ct.ThrowIfCancellationRequested();
         var timer = Stopwatch.StartNew();
@@ -79,6 +82,7 @@ internal static class JevInference
         }
         ct.ThrowIfCancellationRequested();
         double inferenceMs = timer.Elapsed.TotalMilliseconds;
+        reportUsage?.Invoke(totalInput, totalOutput);
         return new
         {
             model = modelName,

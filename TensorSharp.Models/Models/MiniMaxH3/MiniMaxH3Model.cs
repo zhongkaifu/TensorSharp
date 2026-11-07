@@ -67,6 +67,10 @@ namespace TensorSharp.Models.MiniMaxH3
         /// make the matching GGML backend the active one.</summary>
         internal BackendType Backend => _backend;
 
+        /// <summary>The allocator the networks are built on (a CudaAllocator on the direct CUDA
+        /// backend), for the GPU memory gauges (<see cref="Telemetry.GpuMemoryTelemetry"/>).</summary>
+        internal IAllocator DirectAllocator => _allocator;
+
         public MiniMaxH3Config DitConfig { get; }
         public MiniMaxH3Partition Partition { get; }
 

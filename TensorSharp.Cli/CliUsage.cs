@@ -841,6 +841,17 @@ namespace TensorSharp.Cli
                     "Enable/disable console log lines (generated text always prints regardless). Default: on.",
                     "--log-console off"),
             }),
+            ("Telemetry", new[]
+            {
+                new OptionHelp("--otel-endpoint <url>",
+                    "Export OpenTelemetry traces, metrics and logs over OTLP to this collector (sets " +
+                    "OTEL_EXPORTER_OTLP_ENDPOINT; the command line wins over the environment). Every other " +
+                    "setting is an environment variable: the standard OTEL_* ones, " +
+                    "APPLICATIONINSIGHTS_CONNECTION_STRING for Azure Monitor, TENSORSHARP_OTEL=1 for a local " +
+                    "collector. Prompts and output are redacted unless " +
+                    "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true. Default: off.",
+                    "--otel-endpoint http://localhost:4317"),
+            }),
             ("Help", new[]
             {
                 new OptionHelp("--help",

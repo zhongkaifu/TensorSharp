@@ -12,6 +12,7 @@
 // history-tracking containers used by the prompt renderer to reuse raw
 // assistant tokens across turns.
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Linq;
 using System.Globalization;
@@ -19,6 +20,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -26,6 +28,7 @@ using Microsoft.Extensions.Logging;
 using TensorSharp.AgentHost.Agents;
 using TensorSharp.Models.Architecture;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Telemetry;
 
 namespace TensorSharp.Server
 {
@@ -274,6 +277,12 @@ namespace TensorSharp.Server
         /// or null for the base model. Every generation of the turn, including skill-loop
         /// rounds and sub-agents, runs with it; it never affects another request.</summary>
         public TextLoraAdapter Adapter { get; set; }
+
+        /// <summary>The <c>gen_ai.operation.name</c> of the turn's generation spans and metrics:
+        /// <see cref="TelemetryAttributes.OperationChat"/> unless the caller is not a chat
+        /// (Ollama's <c>/api/generate</c> is a <see cref="TelemetryAttributes.OperationTextCompletion"/>).
+        /// Telemetry only; it changes nothing about how the turn is generated.</summary>
+        public string? OperationName { get; set; } = TelemetryAttributes.OperationChat;
     }
 
     internal sealed class ChatGenerationPipeline : IDisposable
@@ -349,7 +358,64 @@ namespace TensorSharp.Server
                 bool enableThinking = false,
                 ChatTurnContext turnContext = null)
         {
+            // One chat span and one set of request metrics per generation, and every exit has
+            // to report its outcome exactly once. An iterator cannot put a catch around a
+            // yield, so the generation runs in ChatStreamCoreAsync and this thin wrapper drives
+            // it: whatever the body throws (a refusal before submission, an engine error out of
+            // the token loop, a stopped turn) leaves through the MoveNextAsync below, and a
+            // consumer that stops reading ends up in the finally. The body records usage and
+            // the engine's phases in its own finally, which runs before either.
+            using GenAiRequestTelemetry requestTelemetry = StartGenerationTelemetry(
+                turnContext?.OperationName, maxTokens, samplingConfig);
+            IAsyncEnumerator<ChatStreamUpdate> updates = ChatStreamCoreAsync(
+                session, history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking,
+                turnContext, requestTelemetry).GetAsyncEnumerator();
+            bool terminal = false;
+            bool threw = false;
+            try
+            {
+                while (true)
+                {
+                    try
+                    {
+                        if (!await updates.MoveNextAsync().ConfigureAwait(false))
+                            break;
+                    }
+                    catch (Exception ex)
+                    {
+                        threw = true;
+                        RecordGenerationFailure(requestTelemetry, ex);
+                        throw;
+                    }
+                    ChatStreamUpdate update = updates.Current;
+                    terminal |= update.Done;
+                    yield return update;
+                }
+            }
+            finally
+            {
+                // Over before its terminal update and without an error: the consumer stopped
+                // reading (a client that went away, a caller that had what it needed).
+                if (!terminal && !threw)
+                    requestTelemetry.MarkCancelled();
+                await updates.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        private async IAsyncEnumerable<ChatStreamUpdate>
+            ChatStreamCoreAsync(
+                ChatSession session,
+                List<ChatMessage> history,
+                int maxTokens,
+                [EnumeratorCancellation] CancellationToken cancellationToken,
+                SamplingConfig samplingConfig,
+                List<ToolFunction> tools,
+                bool enableThinking,
+                ChatTurnContext turnContext,
+                GenAiRequestTelemetry requestTelemetry)
+        {
             session ??= new ChatSession("__svc_intrinsic__", sharedAcrossConversations: true);
+            TagConversation(requestTelemetry, session);
             // Which load this request runs on, read BEFORE the model: an unload advances it
             // first, so a request that still sees the old model never files its tokens as
             // the next model's (see ConversationTranscriptStore.Augment).
@@ -375,8 +441,10 @@ namespace TensorSharp.Server
                 if (turnContext?.Adapter != null)
                     throw new NotSupportedException(
                         "The loaded model generates by block diffusion, which does not apply LoRA adapters.");
-                await foreach (var u in DiffusionChatStreamAsync(session, history, maxTokens, cancellationToken, enableThinking, samplingConfig)
-                    .ConfigureAwait(false))
+                // The core, not the public DiffusionChatStreamAsync: this generation already has
+                // its span, and the denoising reports into it.
+                await foreach (var u in DiffusionChatStreamCoreAsync(session, history, maxTokens, cancellationToken, enableThinking,
+                    samplingConfig, requestTelemetry).ConfigureAwait(false))
                 {
                     if (u.Done)
                     {
@@ -418,6 +486,14 @@ namespace TensorSharp.Server
             long engineCapacityLong = (long)enginePoolStats.totalBlocks * enginePoolStats.blockSize;
             int engineContextLimit = (int)Math.Min(int.MaxValue, engineCapacityLong);
 
+            // prompt.render runs from here (after the engine lookup, which can build the
+            // engine) to the SequenceState constructor, which stamps SubmittedAt: history
+            // preparation, the template render, tokenizing, compaction and the media encode.
+            // It is built afterwards from the two times (RecordPromptRender), so an untraced
+            // request pays one clock read and no span has to be closed on each of the throws
+            // in between.
+            DateTime renderStartUtc = DateTime.UtcNow;
+
             string arch = model.Config.Architecture;
             // A prompt fact carried on the sampling config (see SamplingConfig.ReasoningEffort).
             string reasoningEffort = samplingConfig?.ReasoningEffort;
@@ -446,11 +522,28 @@ namespace TensorSharp.Server
             // the engine's per-sequence Forward path never queues from a
             // shared bucket).
             string requestId = $"chat-{Guid.NewGuid():N}";
+            requestTelemetry.SetTag(TelemetryAttributes.SequenceId, requestId);
             // Keep the HTTP RequestId scope key intact: this separately named field joins it
             // to native slot/forward metadata without adding anything to the HTTP response.
             if (model is TensorSharp.Models.Qwen35CudaModel { ServingTraceEnabled: true })
                 LogServingTraceRequestMapping(_logger, requestId);
             bool injectorBucketCreated = false;
+            // What the finally below reports for this generation. Every exit runs through it
+            // (completion, a stopped turn, an engine error out of the token loop, a consumer
+            // that stopped reading), so usage and the engine phases are recorded once, for
+            // however far the request got.
+            SequenceState seq = null;
+            bool submitted = false;
+            InferenceCompletion completion = null;
+            List<int> generatedTokens = null;
+            string finishReason = null;
+            int promptTokenCount = 0;
+            int kvCacheReusedTokens = 0;
+            bool wasCancelled = false;
+            // When the engine's channel and completion were read: finishReason is final. Unset
+            // when the engine failed or the consumer stopped reading first. The end of decode
+            // the finally reports is the completion's FinishedAt; this is only its fallback.
+            DateTime? generationEndUtc = null;
             try
             {
 
@@ -660,7 +753,12 @@ namespace TensorSharp.Server
                     forModel: model);
             }
 
-            int promptTokenCount = inputTokens.Count;
+            promptTokenCount = inputTokens.Count;
+            if (requestTelemetry.IsRecording && effectiveMaxTokens != maxTokens)
+                requestTelemetry.SetTag(EffectiveMaxTokensAttribute, effectiveMaxTokens);
+            // The history the prompt was rendered from, after compaction: what the model saw.
+            if (CapturesContent(requestTelemetry))
+                CaptureInputMessages(requestTelemetry, renderHistory);
             var cfg = samplingConfig ?? SamplingConfig.Default;
             // A family whose prompt opens the block with thinking off too is budgeted as if asked.
             bool budgetThinking = ReasonsWhetherAsked(arch, enableThinking);
@@ -683,7 +781,7 @@ namespace TensorSharp.Server
                 arch, enableThinking, reasoningEffort);
             LogSharedPrefix(turnContext, session, requestId, inputTokens, sharedPrefixTokens, publicCheckpointBoundaries);
 
-            var seq = new SequenceState(
+            seq = new SequenceState(
                 requestId: requestId,
                 promptTokens: inputTokens,
                 maxNewTokens: effectiveMaxTokens,
@@ -701,6 +799,10 @@ namespace TensorSharp.Server
                 // resumes from this request's end state rather than its prompt tail.
                 PromptTailCheckpointOptional = !budgetThinking,
             };
+            RecordPromptRender(requestTelemetry, renderStartUtc, seq.SubmittedAt);
+            // Lets the engine link its optional per-step spans to this request. Never a parent
+            // there: the engine's thread serves every request.
+            seq.TelemetryContext = requestTelemetry.Context;
 
             bool announceSuffix = AnnouncesGenerationSuffix(arch, model.Config.ChatTemplate, recordedSuffix, cfg);
             if (announceSuffix)
@@ -720,7 +822,8 @@ namespace TensorSharp.Server
                     throw new OperationCanceledException(ex.Message, ex, cancellationToken);
                 throw new ModelUnloadedException(ex);
             }
-            var generatedTokens = new List<int>();
+            submitted = true;
+            generatedTokens = new List<int>();
             var rawBytes = new List<byte>();
             int prevValidLen = 0;
             // Stop-sequence matching needs the full decoded text; only the rare
@@ -730,7 +833,7 @@ namespace TensorSharp.Server
             bool hasStopSequences = cfg.StopSequences != null && cfg.StopSequences.Count > 0;
             StringBuilder decodedForStops = hasStopSequences ? new StringBuilder() : null;
             TokenSampler stopSampler = hasStopSequences ? new TokenSampler(cfg) : null;
-            string finishReason = "max_tokens";
+            finishReason = "max_tokens";
 
             // A family whose model writes the tool's result itself after its call ends the
             // turn at its first complete call (ChatProtocol.ToolCallEndsTurn).
@@ -758,9 +861,7 @@ namespace TensorSharp.Server
                 ? new StringBuilder() : null;
             bool thinkingClosed = false;
             int thinkingTokens = 0;
-            bool wasCancelled = false;
             bool selfStopped = false;   // this layer aborted the request (stop sequence, thinking budget)
-            int kvCacheReusedTokens = 0;
             long timeToFirstTokenMs = 0;
             bool firstTokenSampled = false;
 
@@ -882,7 +983,6 @@ namespace TensorSharp.Server
                 stopped = new OperationCanceledException(cancellationToken);
             }
 
-            InferenceCompletion completion = null;
             try
             {
                 completion = await handle.Completion.ConfigureAwait(false);
@@ -902,6 +1002,10 @@ namespace TensorSharp.Server
                 _logger.LogError(ex, "Engine submission failed for session {SessionId}", session.Id);
                 throw;
             }
+            // The engine has finished with this request and finishReason is final. Taken here
+            // rather than in the finally, which runs only once the consumer has read the
+            // terminal update below.
+            generationEndUtc = DateTime.UtcNow;
 
             if (wasCancelled || selfStopped)
             {
@@ -921,6 +1025,8 @@ namespace TensorSharp.Server
 
             string assistantText = Encoding.UTF8.GetString(rawBytes.ToArray());
             totalSw.Stop();
+            if (CapturesContent(requestTelemetry))
+                CaptureOutputMessage(requestTelemetry, assistantText);
 
             // Record this turn for the next request of the same conversation: the raw
             // tokens the cache holds, and what the client was sent for them - the next
@@ -990,7 +1096,221 @@ namespace TensorSharp.Server
                     // finally block).
                     model.MultimodalInjector.ClearPreparedPromptState(requestId);
                 }
+
+                if (seq == null)
+                {
+                    // Preparation threw (the prompt did not fit, the model was unloaded): its
+                    // span still shows how long it ran first. The error is on the chat span.
+                    RecordPromptRender(requestTelemetry, renderStartUtc, DateTime.UtcNow);
+                }
+                else if (submitted)
+                {
+                    // The end of decode is when the engine finished the request, not when this
+                    // thread had drained its tokens: that waits on the client reading them.
+                    DateTime endUtc = completion?.FinishedAt ?? generationEndUtc ?? DateTime.UtcNow;
+                    requestTelemetry.RecordEnginePhases(seq.SubmittedAt, seq.FirstScheduledAt, seq.FirstTokenAt, endUtc,
+                        completion?.PrefillElapsedTicks ?? 0, completion?.DecodeElapsedTicks ?? 0, seq.PreemptionCount);
+                    // An engine error or an abandoned stream has no finish reason; the one
+                    // set before the token loop is only a default.
+                    requestTelemetry.RecordUsage(promptTokenCount, generatedTokens?.Count ?? 0, kvCacheReusedTokens,
+                        generationEndUtc.HasValue ? finishReason : null, seq.FirstTokenAt, endUtc);
+                }
+                if (wasCancelled)
+                    requestTelemetry.MarkCancelled();
             }
+        }
+
+        // Span attributes of this file that TelemetryAttributes does not name. Spans only.
+        /// <summary>The reply budget once the prompt was fitted to the context, when that is
+        /// less than <c>gen_ai.request.max_tokens</c>.</summary>
+        private const string EffectiveMaxTokensAttribute = "tensorsharp.request.effective_max_tokens";
+        private const string DiffusionBlockAttribute = "tensorsharp.diffusion.block";
+        private const string DiffusionStepAttribute = "tensorsharp.diffusion.step";
+        private const string DiffusionTotalStepsAttribute = "tensorsharp.diffusion.total_steps";
+
+        // error.type of a generation refused for a reason the caller can act on.
+        private const string RefusedContextOverflow = "context_overflow";
+        private const string RefusedModelUnloaded = "model_unloaded";
+
+        // Captured prompt and output text (content capture only) is cut to this many characters
+        // per attribute, so a long conversation does not build a megabyte attribute on every
+        // round; backends cap attribute sizes well below that anyway.
+        private const int MaxCapturedContentChars = 64 * 1024;
+
+        /// <summary>
+        /// Start one generation's span and request metrics, for the loaded model and backend
+        /// (read here, as the body reads the model). <paramref name="operation"/> is the turn's
+        /// <see cref="ChatTurnContext.OperationName"/>.
+        /// </summary>
+        private GenAiRequestTelemetry StartGenerationTelemetry(string? operation, int maxTokens, SamplingConfig samplingConfig)
+        {
+            GenAiRequestTelemetry requestTelemetry = GenAiRequestTelemetry.Start(
+                operation ?? TelemetryAttributes.OperationChat,
+                GenAiRequestTelemetry.ModelNameFromPath(_lifecycle.LoadedModelPath),
+                _lifecycle.LoadedBackend);
+            // The host's own startup request, so dashboards can leave it out. Set before
+            // anything is recorded: the origin is on this request's metrics too.
+            if (Hosting.PrefixCacheWarmup.IsRunningHere)
+                requestTelemetry.SetOrigin(TelemetryAttributes.OriginPrefixCacheWarmup);
+            if (requestTelemetry.IsRecording)
+            {
+                // The budget is the maxTokens argument; SamplingConfig.MaxTokens is not read
+                // on this path. What the context left of it is EffectiveMaxTokensAttribute.
+                SamplingConfig sampling = samplingConfig ?? SamplingConfig.Default;
+                requestTelemetry.SetSampling(maxTokens, sampling.Temperature, sampling.TopP, sampling.TopK, sampling.Seed);
+            }
+            return requestTelemetry;
+        }
+
+        /// <summary>
+        /// The outcome of a generation that threw. A prompt that does not fit the context and
+        /// a model unloaded under the request are refusals the caller can act on (shorten the
+        /// prompt, send it again), not server faults; a cancellation counts as cancelled
+        /// (<see cref="GenAiRequestTelemetry.MarkFailed"/>); anything else failed.
+        /// </summary>
+        private static void RecordGenerationFailure(GenAiRequestTelemetry requestTelemetry, Exception exception)
+        {
+            switch (exception)
+            {
+                case PromptContextOverflowException:
+                    requestTelemetry.MarkRefused(RefusedContextOverflow);
+                    break;
+                case ModelUnloadedException:
+                    requestTelemetry.MarkRefused(RefusedModelUnloaded);
+                    break;
+                default:
+                    requestTelemetry.MarkFailed(exception);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// <c>gen_ai.conversation.id</c> for a session that is one conversation (a Web UI chat).
+        /// A shared session (the stateless APIs, a one-shot generate) stands for many, and its
+        /// constant id would group unrelated requests as one conversation.
+        /// </summary>
+        private static void TagConversation(GenAiRequestTelemetry requestTelemetry, ChatSession session)
+        {
+            if (!session.SharedAcrossConversations)
+                requestTelemetry.SetTag(TelemetryAttributes.GenAiConversationId, session.Id);
+        }
+
+        /// <summary>
+        /// <c>prompt.render</c> under the chat span, from <paramref name="startUtc"/> to
+        /// <paramref name="endUtc"/>, built after the fact. Nothing when the request is not
+        /// recorded.
+        /// </summary>
+        private static void RecordPromptRender(GenAiRequestTelemetry requestTelemetry, DateTime startUtc, DateTime endUtc)
+        {
+            if (requestTelemetry.Activity is not { } parent)
+                return;
+            Activity? span = TensorSharpTelemetry.Inference.StartActivity(
+                "prompt.render", ActivityKind.Internal, parent.Context,
+                startTime: TensorSharpTelemetry.ToUtcOffset(startUtc));
+            if (span is null)
+                return;
+            if (endUtc < startUtc)
+                endUtc = startUtc;
+            span.SetEndTime(TensorSharpTelemetry.ToUtcOffset(endUtc).UtcDateTime);
+            span.Stop();
+        }
+
+        /// <summary>End a request's <c>diffusion.denoise</c> span; null-safe.</summary>
+        private static void EndDenoise(Activity? denoise, int previews)
+        {
+            if (denoise is null)
+                return;
+            if (denoise.IsAllDataRequested)
+                denoise.SetTag(TelemetryAttributes.DiffusionPreviews, previews);
+            denoise.Stop();
+        }
+
+        /// <summary>Whether message text goes on this request's span: the span is recorded
+        /// and content capture is on. The cheap check first.</summary>
+        private static bool CapturesContent(GenAiRequestTelemetry requestTelemetry) =>
+            requestTelemetry.IsRecording && TensorSharpTelemetry.CaptureMessageContent;
+
+        // Separate methods so the closure each factory needs is allocated only when content is
+        // captured: a lambda over a local makes the compiler allocate its closure on entry to
+        // that local's scope, whether or not the lambda ever runs.
+        private static void CaptureInputMessages(GenAiRequestTelemetry requestTelemetry, List<ChatMessage> messages) =>
+            requestTelemetry.SetInputMessages(() => CapturedMessagesJson(messages, null));
+
+        private static void CaptureOutputMessage(GenAiRequestTelemetry requestTelemetry, string text) =>
+            requestTelemetry.SetOutputMessages(() => CapturedMessagesJson(null, text));
+
+        /// <summary>
+        /// <c>[{"role":…,"content":…}]</c> for <c>gen_ai.input.messages</c> (<paramref name="messages"/>)
+        /// or <c>gen_ai.output.messages</c> (<paramref name="assistantText"/>), with at most
+        /// <see cref="MaxCapturedContentChars"/> characters of text: past that, a history keeps
+        /// its newest messages and the end of the oldest one kept, an answer its beginning.
+        /// Null when it cannot be built (text with a broken surrogate pair, say): telemetry
+        /// never fails a request.
+        /// </summary>
+        internal static string? CapturedMessagesJson(IReadOnlyList<ChatMessage>? messages, string? assistantText)
+        {
+            try
+            {
+                var buffer = new ArrayBufferWriter<byte>();
+                using (var writer = new Utf8JsonWriter(buffer,
+                    new JsonWriterOptions { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }))
+                {
+                    writer.WriteStartArray();
+                    if (messages != null)
+                    {
+                        int budget = MaxCapturedContentChars;
+                        int first = messages.Count;
+                        while (first > 0 && budget > 0)
+                            budget -= messages[--first]?.Content?.Length ?? 0;
+                        for (int i = first; i < messages.Count; i++)
+                        {
+                            if (messages[i] is not { } message)
+                                continue;
+                            string content = message.Content ?? string.Empty;
+                            // A negative budget left: the oldest message kept fits only in part.
+                            if (i == first && budget < 0)
+                                content = "…" + TailOf(content, content.Length + budget);
+                            WriteCapturedMessage(writer, message.Role, content);
+                        }
+                    }
+                    if (assistantText != null)
+                    {
+                        WriteCapturedMessage(writer, "assistant", assistantText.Length > MaxCapturedContentChars
+                            ? HeadOf(assistantText, MaxCapturedContentChars) + "…"
+                            : assistantText);
+                    }
+                    writer.WriteEndArray();
+                }
+                return Encoding.UTF8.GetString(buffer.WrittenSpan);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private static void WriteCapturedMessage(Utf8JsonWriter writer, string role, string content)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("role", role ?? string.Empty);
+            writer.WriteString("content", content);
+            writer.WriteEndObject();
+        }
+
+        // Cut text without splitting a surrogate pair, which the JSON writer refuses.
+        private static string HeadOf(string text, int length)
+        {
+            if (length > 0 && char.IsHighSurrogate(text[length - 1]))
+                length--;
+            return text[..length];
+        }
+
+        private static string TailOf(string text, int length)
+        {
+            int start = text.Length - length;
+            if (start > 0 && start < text.Length && char.IsLowSurrogate(text[start]))
+                start++;
+            return text[start..];
         }
 
         /// <summary>
@@ -1012,12 +1332,60 @@ namespace TensorSharp.Server
             bool enableThinking = false,
             SamplingConfig samplingConfig = null)
         {
+            // The Web UI's way in, so it gets the chat span and request metrics here; the other
+            // protocols reach DiffusionChatStreamCoreAsync from ChatStreamCoreAsync, inside the
+            // span ChatStreamWithMetricsAsync opened. Same wrapper shape, for the same reason.
+            using GenAiRequestTelemetry requestTelemetry = StartGenerationTelemetry(null, maxTokens, samplingConfig);
+            IAsyncEnumerator<DiffusionStreamUpdate> updates = DiffusionChatStreamCoreAsync(
+                session, history, maxTokens, cancellationToken, enableThinking, samplingConfig,
+                requestTelemetry).GetAsyncEnumerator();
+            bool terminal = false;
+            bool threw = false;
+            try
+            {
+                while (true)
+                {
+                    try
+                    {
+                        if (!await updates.MoveNextAsync().ConfigureAwait(false))
+                            break;
+                    }
+                    catch (Exception ex)
+                    {
+                        threw = true;
+                        RecordGenerationFailure(requestTelemetry, ex);
+                        throw;
+                    }
+                    DiffusionStreamUpdate update = updates.Current;
+                    terminal |= update.Done;
+                    yield return update;
+                }
+            }
+            finally
+            {
+                if (!terminal && !threw)
+                    requestTelemetry.MarkCancelled();
+                await updates.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        private async IAsyncEnumerable<DiffusionStreamUpdate> DiffusionChatStreamCoreAsync(
+            ChatSession session,
+            List<ChatMessage> history,
+            int maxTokens,
+            [EnumeratorCancellation] CancellationToken cancellationToken,
+            bool enableThinking,
+            SamplingConfig samplingConfig,
+            GenAiRequestTelemetry requestTelemetry)
+        {
             session ??= new ChatSession("__svc_intrinsic__", sharedAcrossConversations: true);
+            TagConversation(requestTelemetry, session);
             long loadEpoch = _lifecycle.LoadEpoch;   // before the model; see ChatStreamWithMetricsAsync
             var model = (DiffusionGemmaModel)(_lifecycle.Model
                 ?? throw new InvalidOperationException("No model is loaded."));
             string arch = model.Config.Architecture;
 
+            DateTime renderStartUtc = DateTime.UtcNow;   // prompt.render; see ChatStreamCoreAsync
             var preparedHistory = ChatHistoryPreparer.PrepareHistoryForInference(history, arch, _logger);
             // Read under the session lock so a parallel request's record can't race it.
             List<ChatMessage> renderHistory;
@@ -1089,7 +1457,17 @@ namespace TensorSharp.Server
             string generationSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking: false,
                 model.Config.ChatTemplate);
             promptSw.Stop();
+            RecordPromptRender(requestTelemetry, renderStartUtc, DateTime.UtcNow);
+            if (CapturesContent(requestTelemetry))
+                CaptureInputMessages(requestTelemetry, renderHistory);
 
+            // Read by the finally below, which every exit of the denoising runs through.
+            Activity? denoise = null;
+            int previews = 0;
+            bool firstOutputSeen = false;
+            bool submitted = false;
+            List<int> generated = null;
+            string finishReason = null;
             try
             {
                 var ebParams = CreateDiffusionParameters(maxTokens, model.CanvasLength, samplingConfig);
@@ -1098,7 +1476,13 @@ namespace TensorSharp.Server
                 // together in one batched forward per step (one background thread owns the GPU lock), so a second
                 // parallel request streams immediately instead of waiting for the first to finish.
                 var scheduler = GetDiffusionScheduler(model);
+                // One span per request, from submission to its result, with an event per
+                // preview. Not a span per denoising step: a scheduler step is shared by every
+                // request in its batch. Held here and parented on the chat span explicitly,
+                // since after a yield Activity.Current is whatever the consumer's is.
+                denoise = requestTelemetry.StartChild("diffusion.denoise");
                 var handle = scheduler.Submit(inputTokens.ToArray(), ebParams, cancellationToken, mediaRequestId);
+                submitted = true;
 
                 var totalSw = Stopwatch.StartNew();
 
@@ -1109,13 +1493,32 @@ namespace TensorSharp.Server
                     string previewText = DecodeDiffusionPreview(model, preview.Tokens);
                     var (previewContent, previewThinking) =
                         SeparateDiffusionChannels(arch, previewText, enableThinking, generationSuffix);
+                    previews++;
+                    // The first canvas with any text is this path's first output; denoising
+                    // has no first sampled token to time instead.
+                    if (!firstOutputSeen && (previewContent.Length > 0 || !string.IsNullOrEmpty(previewThinking)))
+                    {
+                        firstOutputSeen = true;
+                        requestTelemetry.RecordTimeToFirstToken(DateTime.UtcNow - requestTelemetry.StartedAtUtc);
+                    }
+                    if (denoise is { IsAllDataRequested: true })
+                    {
+                        denoise.AddEvent(new ActivityEvent("preview", tags: new ActivityTagsCollection
+                        {
+                            { DiffusionBlockAttribute, preview.Block },
+                            { DiffusionStepAttribute, preview.Step + 1 },
+                            { DiffusionTotalStepsAttribute, preview.TotalSteps },
+                        }));
+                    }
                     yield return new DiffusionStreamUpdate(
                         previewContent, IsPreview: true, Done: false, preview.Step + 1, preview.TotalSteps, 0, 0, 0,
                         previewThinking);
                 }
 
-                var generated = await handle.Completion.ConfigureAwait(false);
+                generated = await handle.Completion.ConfigureAwait(false);
                 totalSw.Stop();
+                EndDenoise(denoise, previews);
+                denoise = null;
 
                 generated ??= new List<int>();
                 string finalText = model.Tokenizer.Decode(generated);
@@ -1123,6 +1526,9 @@ namespace TensorSharp.Server
                 // gets the channels separated.
                 var (finalContent, finalThinking) =
                     SeparateDiffusionChannels(arch, finalText, enableThinking, generationSuffix);
+                finishReason = cancellationToken.IsCancellationRequested ? "cancelled" : "stop";
+                if (CapturesContent(requestTelemetry))
+                    CaptureOutputMessage(requestTelemetry, finalText);
 
                 RecordGeneratedTurn(session, preparedHistory, cacheScope: null,
                     new ChatMessage
@@ -1156,6 +1562,18 @@ namespace TensorSharp.Server
                 // tensors it pins) whether the turn completed, faulted or was abandoned.
                 if (mediaRequestId != null)
                     model.MultimodalInjector.ClearPreparedPromptState(mediaRequestId);
+
+                // Still open when the denoising faulted, was stopped or was abandoned.
+                EndDenoise(denoise, previews);
+                if (submitted)
+                {
+                    // No first-token time: a canvas is written all at once, so time per output
+                    // token would mean nothing. The first preview was timed above instead.
+                    requestTelemetry.RecordUsage(promptTokenCount, generated?.Count ?? 0, 0, finishReason,
+                        firstTokenAtUtc: null);
+                }
+                if (finishReason == "cancelled")
+                    requestTelemetry.MarkCancelled();
             }
         }
 
@@ -1467,7 +1885,7 @@ namespace TensorSharp.Server
             turnContext.LoggedSharedPrefix = logged;
             _logger.LogInformation(LogEventIds.KvCacheReusePlan,
                 "prompt.shared_prefix tokens={SharedPrefixTokens} hash={SharedPrefixHash} boundaries={Boundaries} "
-                + "of {PromptTokens} prompt tokens (requestId={RequestId}, sessionId={SessionId})",
+                + "of {PromptTokens} prompt tokens (requestId={EngineRequestId}, sessionId={SessionId})",
                 sharedPrefixTokens, hash, string.Join(",", publicCheckpointBoundaries), promptTokens.Count,
                 requestId, session?.Id ?? "(none)");
         }
@@ -1615,7 +2033,9 @@ namespace TensorSharp.Server
             };
             var freshSession = new ChatSession("__generate_intrinsic__", sharedAcrossConversations: true);
             await foreach (var item in ChatStreamWithMetricsAsync(
-                freshSession, oneShot, maxTokens, cancellationToken, samplingConfig))
+                freshSession, oneShot, maxTokens, cancellationToken, samplingConfig,
+                // The same generation as a chat, reported as the text completion it is.
+                turnContext: new ChatTurnContext { OperationName = TelemetryAttributes.OperationTextCompletion }))
             {
                 yield return item;
             }

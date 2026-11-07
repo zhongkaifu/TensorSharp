@@ -20,6 +20,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Runtime.Logging;
+using TensorSharp.Runtime.Telemetry;
 
 namespace TensorSharp.AgentHost.CodeExec
 {
@@ -332,11 +333,44 @@ namespace TensorSharp.AgentHost.CodeExec
                     + "raising timeout_ms if it needs longer.");
             }
 
+            // Started after the refusals above, which run nothing. The caller normally has
+            // its execute_tool span current (the skill loop sets it on the thread that calls
+            // here), so the implicit parent nests this run under that tool call. Disposed
+            // after the finally below, so an ephemeral workspace's cleanup is in the duration.
+            using Activity? activity = StartRunActivity(command, request.Background);
             SessionWorkspace session = workspace ?? CreateEphemeral();
             bool ephemeral = workspace == null;
             try
             {
-                return RunIn(request, command, session, onOutput, fileToolsAvailable: workspace != null);
+                CodeExecResult result = RunIn(request, command, session, onOutput, fileToolsAvailable: workspace != null, activity);
+                // A command that reached the shell has its timed_out (and exit code) on the
+                // span already. Every other way out (a refusal, an inline apply_patch, an
+                // install-only line, a background start) is told apart by the outcome alone.
+                if (activity is { IsAllDataRequested: true } && activity.GetTagItem(TelemetryAttributes.CodeExecTimedOut) is null)
+                {
+                    activity.SetTag(TelemetryAttributes.Outcome,
+                        result.Ok ? TelemetryAttributes.OutcomeCompleted : TelemetryAttributes.OutcomeRefused);
+                }
+                return result;
+            }
+            catch (Exception ex) when (activity is not null)
+            {
+                if (ex is OperationCanceledException)
+                {
+                    if (activity.IsAllDataRequested)
+                        activity.SetTag(TelemetryAttributes.Outcome, TelemetryAttributes.OutcomeCancelled);
+                }
+                else
+                {
+                    // The type only: a message can quote the command or a workspace path.
+                    activity.SetStatus(ActivityStatusCode.Error, ex.GetType().Name);
+                    if (activity.IsAllDataRequested)
+                    {
+                        activity.SetTag(TelemetryAttributes.Outcome, TelemetryAttributes.OutcomeFailed);
+                        activity.SetTag(TelemetryAttributes.ErrorType, ex.GetType().FullName ?? ex.GetType().Name);
+                    }
+                }
+                throw;
             }
             finally
             {
@@ -348,9 +382,34 @@ namespace TensorSharp.AgentHost.CodeExec
             }
         }
 
+        // Span attributes of codeexec.run beyond the shared ones in TelemetryAttributes.
+        private const string CodeExecCommandAttribute = "tensorsharp.codeexec.command";
+        private const string CodeExecInstallsAttribute = "tensorsharp.codeexec.installs";
+        private const string CodeExecOutputBytesAttribute = "tensorsharp.codeexec.output_bytes";
+        private const string CodeExecBackgroundAttribute = "tensorsharp.codeexec.background";
+
+        /// <summary>
+        /// The <c>codeexec.run</c> span, or null when nobody listens. The command is the
+        /// model's own text, so it goes on the span only with content capture on.
+        /// </summary>
+        private Activity? StartRunActivity(string command, bool background)
+        {
+            Activity? activity = TensorSharpTelemetry.Agent.StartActivity("codeexec.run", ActivityKind.Internal);
+            if (activity is { IsAllDataRequested: true })
+            {
+                if (_shell?.Name is { Length: > 0 } shell)
+                    activity.SetTag(TelemetryAttributes.CodeExecShell, shell);
+                if (background)
+                    activity.SetTag(CodeExecBackgroundAttribute, true);
+                if (TensorSharpTelemetry.CaptureMessageContent)
+                    activity.SetTag(CodeExecCommandAttribute, command);
+            }
+            return activity;
+        }
+
         private CodeExecResult RunIn(
             ShellRequest request, string command, SessionWorkspace workspace, Action<string>? onOutput,
-            bool fileToolsAvailable)
+            bool fileToolsAvailable, Activity? activity = null)
         {
             // The command AS THE MODEL WROTE IT. `command` is rewritten further down —
             // TryPerformInstalls reads each install out of the line and substitutes it
@@ -574,6 +633,32 @@ namespace TensorSharp.AgentHost.CodeExec
                 _shell!.Name, result.SandboxName, notes.Count,
                 result.ExitCode, result.TimedOut, (long)result.Elapsed.TotalMilliseconds,
                 result.Stdout.Length + result.Stderr.Length);
+
+            // The codeexec.ran fields, on the span. A non-zero exit is the model's command
+            // failing, which is the code tool working as intended, so it is not a span error;
+            // a command that never started is the host's fault and is.
+            if (activity is not null)
+            {
+                if (activity.IsAllDataRequested)
+                {
+                    activity.SetTag(TelemetryAttributes.CodeExecSandbox, result.SandboxName);
+                    activity.SetTag(TelemetryAttributes.CodeExecTimedOut, result.TimedOut);
+                    // Meaningless unless it started and was not killed (ConfinedResult).
+                    if (result.Started && !result.TimedOut)
+                        activity.SetTag(TelemetryAttributes.CodeExecExitCode, result.ExitCode);
+                    activity.SetTag(CodeExecInstallsAttribute, notes.Count);
+                    activity.SetTag(CodeExecOutputBytesAttribute, result.Stdout.Length + result.Stderr.Length);
+                }
+                if (!result.Started)
+                {
+                    activity.SetStatus(ActivityStatusCode.Error, "not_started");
+                    if (activity.IsAllDataRequested)
+                    {
+                        activity.SetTag(TelemetryAttributes.Outcome, TelemetryAttributes.OutcomeFailed);
+                        activity.SetTag(TelemetryAttributes.ErrorType, "not_started");
+                    }
+                }
+            }
 
             return Describe(
                 // The TYPED command, not the install-substituted residual: everything
@@ -2163,7 +2248,7 @@ namespace TensorSharp.AgentHost.CodeExec
             workspace.Reads.Record(full, seenText, first, last, complete);
             _logger.LogInformation(LogEventIds.CodeExecRead,
                 "codeexec.read path={Path} lines={Lines} complete={Complete}",
-                request.Path, last - first + 1, complete);
+                LogContent.Of(request.Path), last - first + 1, complete);
 
             return new CodeExecResult(true, sb.ToString(), Array.Empty<CodeArtifact>(), string.Empty);
         }
@@ -2323,7 +2408,7 @@ namespace TensorSharp.AgentHost.CodeExec
 
             _logger.LogInformation(LogEventIds.CodeExecEdited,
                 "codeexec.edited path={Path} rung={Rung} freshness={Freshness} matches={Matches} all={All}",
-                request.Path, match.Rung, seen.Freshness, match.Count, request.ReplaceAll);
+                LogContent.Of(request.Path), match.Rung, seen.Freshness, match.Count, request.ReplaceAll);
 
             return CompleteFileMutation(
                 DescribeEdit(request, match, seen, changedLine, restyled, workspace, from),
@@ -2432,7 +2517,7 @@ namespace TensorSharp.AgentHost.CodeExec
             {
                 sb.Append('\n').Append(retyped);
                 _logger.LogInformation(LogEventIds.CodeExecRewrote,
-                    "codeexec.rewrote path={Path} lines={Lines}", request.Path, lineCount);
+                    "codeexec.rewrote path={Path} lines={Lines}", LogContent.Of(request.Path), lineCount);
             }
             else if (_syntax.Verify(new[] { request.Path }, workspace, from) is { Length: > 0 } broken)
             {
@@ -3546,7 +3631,7 @@ namespace TensorSharp.AgentHost.CodeExec
             if (captured.Count > 0)
             {
                 _logger.LogInformation(LogEventIds.CodeExecArtifacts,
-                    "codeexec.artifacts run={RunId} files={Files}", runId, captured.Count);
+                    "codeexec.artifacts run={RunId} files={Files}", LogContent.Of(runId), captured.Count);
             }
             return captured;
         }

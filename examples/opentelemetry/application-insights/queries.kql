@@ -1,0 +1,404 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+//
+// Application Insights queries for TensorSharp's OpenTelemetry data.
+//
+// Run them from the Logs page of the Application Insights resource. They use the table and column
+// names that page shows (requests, dependencies, traces, exceptions, customMetrics; name,
+// duration, success, customDimensions, operation_Id, cloud_RoleName, valueSum, valueCount). The
+// Log Analytics workspace behind the resource holds the same rows in AppRequests,
+// AppDependencies, AppTraces, AppExceptions and AppMetrics, under different column names, so
+// these queries do not run there unchanged.
+//
+// The editor runs the query under the cursor and a blank line ends a query, so no query below
+// contains a blank line.
+//
+// How TensorSharp's telemetry is stored:
+//   - The ASP.NET Core server span of an HTTP request is a row in requests.
+//   - Every TensorSharp span ("chat <model>", inference.*, generate_video, model.load,
+//     studio.job, ...) is ActivityKind.Internal, so it is a row in dependencies (type InProc).
+//     id is the span id, operation_ParentId the parent span's id, operation_Id the trace id.
+//   - Log records are rows in traces; logged exceptions are rows in exceptions.
+//   - Metrics are rows in customMetrics. Histograms keep only count, sum, min and max (no
+//     buckets), so the percentiles below come from span durations and span attributes.
+//   - service.name is cloud_RoleName (tensorsharp-server, tensorsharp-cli by default) and
+//     service.instance.id (machine:pid) is cloud_RoleInstance. The queries keep every role
+//     whose name starts with "tensorsharp-"; change that filter if OTEL_SERVICE_NAME is set.
+//   - Span attributes are in customDimensions. The in-process exporter
+//     (APPLICATIONINSIGHTS_CONNECTION_STRING on TensorSharp) stores numbers there as strings;
+//     the collector's azure_monitor exporter (collector-azuremonitor.yaml) stores them as numbers
+//     in customMeasurements. Numeric attributes are therefore read as
+//     coalesce(todouble(customDimensions[k]), todouble(customMeasurements[k])).
+//   - With sampling (OTEL_TRACES_SAMPLER below 100%) a row stands for itemCount rows, so counts
+//     use sum(itemCount) and percentiles are weighted by it. A sampled trace keeps all its spans,
+//     so parent/child joins stay complete.
+//   - TensorSharp's own model calls (the startup prefix-cache warm-up, knowledge reranking) carry
+//     tensorsharp.internal = true and are left out of the request queries.
+
+
+// 1. Chat request rate and failure rate by protocol (openai, ollama, webui), from the
+//    "chat <model>" spans ("text_completion <model>" for Ollama's /api/generate). failed is a
+//    server-side error (the span's status is Error), refused a request the server turned down
+//    (a 4xx the client can fix), cancelled a client that went away or a stopped request.
+dependencies
+| where timestamp > ago(24h)
+| where cloud_RoleName startswith "tensorsharp-"
+| where tostring(customDimensions["gen_ai.operation.name"]) in ("chat", "text_completion")
+| where tolower(tostring(customDimensions["tensorsharp.internal"])) != "true"
+| extend protocol = coalesce(tostring(customDimensions["tensorsharp.protocol"]), "(none)"),
+         outcome = tostring(customDimensions["tensorsharp.outcome"])
+| summarize requests = sum(itemCount),
+            failed = sumif(itemCount, success == false or outcome == "failed"),
+            refused = sumif(itemCount, outcome == "refused"),
+            cancelled = sumif(itemCount, outcome == "cancelled")
+    by protocol, bin(timestamp, 15m)
+| extend requests_per_min = round(requests / 15.0, 2),
+         failure_rate_pct = round(100.0 * failed / requests, 2)
+| order by timestamp asc, protocol asc
+
+
+// 1b. The same at the HTTP level: every request by protocol and route, from the server spans.
+//     A failure here is whatever the exporter marked unsuccessful for the HTTP status.
+requests
+| where timestamp > ago(24h)
+| where cloud_RoleName startswith "tensorsharp-"
+| extend protocol = tostring(customDimensions["tensorsharp.protocol"])
+| where isnotempty(protocol)
+| summarize requests = sum(itemCount), failed = sumif(itemCount, success == false) by protocol, name
+| extend failure_rate_pct = round(100.0 * failed / requests, 2)
+| order by requests desc
+
+
+// 2. Time to first token, p50 and p95 by model, from tensorsharp.ttft_ms on the chat spans of
+//    completed requests. (The gen_ai.server.time_to_first_token metric has no buckets here, so
+//    it only gives an average: sum(valueSum) / sum(valueCount).)
+dependencies
+| where timestamp > ago(24h)
+| where cloud_RoleName startswith "tensorsharp-"
+| where tostring(customDimensions["gen_ai.operation.name"]) in ("chat", "text_completion")
+| where tolower(tostring(customDimensions["tensorsharp.internal"])) != "true"
+| where tostring(customDimensions["tensorsharp.outcome"]) == "completed"
+| extend ttft_ms = coalesce(todouble(customDimensions["tensorsharp.ttft_ms"]), todouble(customMeasurements["tensorsharp.ttft_ms"])),
+         model = tostring(customDimensions["gen_ai.request.model"])
+| where isnotnull(ttft_ms)
+| summarize requests = sum(itemCount), percentilesw(ttft_ms, itemCount, 50, 95) by model, bin(timestamp, 1h)
+| order by timestamp asc, model asc
+
+
+// 3. Where a chat request's time goes: queue wait (submitted until first scheduled), prefill (until
+//    the first token) and decode (the rest), from the inference.* children of each chat span,
+//    p50 and p95 per model plus each phase's share of the chat span. Under continuous batching
+//    the wall times overlap with other requests; compute_*_ms is this request's own share of
+//    engine compute (tensorsharp.compute.prefill_ms / decode_ms).
+let chats = dependencies
+    | where timestamp > ago(24h)
+    | where cloud_RoleName startswith "tensorsharp-"
+    | where tostring(customDimensions["gen_ai.operation.name"]) in ("chat", "text_completion")
+    | where tolower(tostring(customDimensions["tensorsharp.internal"])) != "true"
+    | project operation_Id, chat_id = id, model = tostring(customDimensions["gen_ai.request.model"]), chat_ms = duration;
+dependencies
+| where timestamp > ago(24h)
+| where name in ("inference.queue", "inference.prefill", "inference.decode")
+| extend compute_ms = coalesce(
+    todouble(customDimensions["tensorsharp.compute.prefill_ms"]), todouble(customMeasurements["tensorsharp.compute.prefill_ms"]),
+    todouble(customDimensions["tensorsharp.compute.decode_ms"]), todouble(customMeasurements["tensorsharp.compute.decode_ms"]))
+| summarize queue_ms = sumif(duration, name == "inference.queue"),
+            prefill_ms = sumif(duration, name == "inference.prefill"),
+            decode_ms = sumif(duration, name == "inference.decode"),
+            compute_prefill_ms = sumif(compute_ms, name == "inference.prefill"),
+            compute_decode_ms = sumif(compute_ms, name == "inference.decode")
+    by operation_Id, chat_id = operation_ParentId
+| join kind=inner chats on operation_Id, chat_id
+| summarize requests = count(),
+            p50_queue_ms = percentile(queue_ms, 50), p95_queue_ms = percentile(queue_ms, 95),
+            p50_prefill_ms = percentile(prefill_ms, 50), p95_prefill_ms = percentile(prefill_ms, 95),
+            p50_decode_ms = percentile(decode_ms, 50), p95_decode_ms = percentile(decode_ms, 95),
+            avg_compute_prefill_ms = round(avg(compute_prefill_ms), 1),
+            avg_compute_decode_ms = round(avg(compute_decode_ms), 1),
+            queue_share_pct = round(100.0 * sum(queue_ms) / sum(chat_ms), 1),
+            prefill_share_pct = round(100.0 * sum(prefill_ms) / sum(chat_ms), 1),
+            decode_share_pct = round(100.0 * sum(decode_ms) / sum(chat_ms), 1)
+    by model
+| order by requests desc
+
+
+// 4. Token throughput by model and token type, from the tensorsharp.tokens counter (input =
+//    prompt tokens, output = generated tokens) and tensorsharp.tokens.cache_read (prompt tokens
+//    served from the prefix cache, a subset of input). Each row is the increase over one export
+//    interval: the in-process exporter sends deltas, and collector-azuremonitor.yaml converts
+//    TensorSharp's cumulative OTLP sums to deltas.
+customMetrics
+| where timestamp > ago(24h)
+| where cloud_RoleName startswith "tensorsharp-"
+| where name in ("tensorsharp.tokens", "tensorsharp.tokens.cache_read")
+| extend model = tostring(customDimensions["gen_ai.request.model"]),
+         token_type = iff(name == "tensorsharp.tokens.cache_read", "cache_read", tostring(customDimensions["tensorsharp.token.type"]))
+| summarize tokens = sum(valueSum) by model, token_type, bin(timestamp, 5m)
+| extend tokens_per_s = round(tokens / 300.0, 1)
+| order by timestamp asc, model asc, token_type asc
+
+
+// 4b. Decode speed per request: output tokens after the first, divided by the wall time of the
+//     inference.decode span, by model. p5 is the slow end.
+let decode = dependencies
+    | where timestamp > ago(24h)
+    | where name == "inference.decode"
+    | project operation_Id, chat_id = operation_ParentId, decode_ms = duration;
+dependencies
+| where timestamp > ago(24h)
+| where cloud_RoleName startswith "tensorsharp-"
+| where tostring(customDimensions["gen_ai.operation.name"]) in ("chat", "text_completion")
+| where tostring(customDimensions["tensorsharp.outcome"]) == "completed"
+| extend output_tokens = coalesce(todouble(customDimensions["gen_ai.usage.output_tokens"]), todouble(customMeasurements["gen_ai.usage.output_tokens"]))
+| project operation_Id, chat_id = id, model = tostring(customDimensions["gen_ai.request.model"]), output_tokens
+| join kind=inner decode on operation_Id, chat_id
+| where decode_ms > 0 and output_tokens > 1
+| extend decode_tokens_per_s = (output_tokens - 1) / (decode_ms / 1000.0)
+| summarize requests = count(), percentiles(decode_tokens_per_s, 5, 50, 95) by model
+| order by requests desc
+
+
+// 5. Video clips for MiniMax-H3 and LTX 2.5 (gen_ai.request.model is the model file name, e.g.
+//    minimax_h3_fl2va_pruned-Q4_K or ltx-2.5-22b-distilled-UD-Q4_K_XL, so the regex matches both): clips
+//    and wall time by model, backend, mode, size and outcome, from the "generate_video <model>"
+//    spans. The time includes the wait for the one-clip-at-a-time video lock. Widen the regex to
+//    see other video models (wan, ...).
+dependencies
+| where timestamp > ago(7d)
+| where cloud_RoleName startswith "tensorsharp-"
+| where name startswith "generate_video "
+| extend model = tostring(customDimensions["gen_ai.request.model"])
+| where model matches regex @"(?i)minimax.?h3|ltx.?2\.?5"
+| extend backend = tostring(customDimensions["tensorsharp.backend"]),
+         mode = tostring(customDimensions["tensorsharp.video.mode"]),
+         outcome = tostring(customDimensions["tensorsharp.outcome"]),
+         width = coalesce(tolong(customDimensions["tensorsharp.video.width"]), tolong(customMeasurements["tensorsharp.video.width"])),
+         height = coalesce(tolong(customDimensions["tensorsharp.video.height"]), tolong(customMeasurements["tensorsharp.video.height"])),
+         frames = coalesce(tolong(customDimensions["tensorsharp.video.frames"]), tolong(customMeasurements["tensorsharp.video.frames"])),
+         steps = coalesce(tolong(customDimensions["tensorsharp.video.steps"]), tolong(customMeasurements["tensorsharp.video.steps"]))
+| extend size = strcat(width, "x", height, "x", frames, " @", steps, " steps")
+| summarize clips = sum(itemCount),
+            p50_s = round(percentilew(duration, itemCount, 50) / 1000, 1),
+            p95_s = round(percentilew(duration, itemCount, 95) / 1000, 1),
+            max_s = round(max(duration) / 1000, 1)
+    by model, backend, mode, size, outcome
+| order by model asc, clips desc
+
+
+// 5b. Phase breakdown of completed clips: average and p95 time of each child span of
+//     generate_video (video.queue, lora.apply, text-encode, image-encode, reference-encode,
+//     denoise, vae-decode, audio-decode, video.export) per model, and its share of the clip.
+let clips = dependencies
+    | where timestamp > ago(7d)
+    | where cloud_RoleName startswith "tensorsharp-"
+    | where name startswith "generate_video "
+    | extend model = tostring(customDimensions["gen_ai.request.model"])
+    | where model matches regex @"(?i)minimax.?h3|ltx.?2\.?5"
+    | where tostring(customDimensions["tensorsharp.outcome"]) == "completed"
+    | project operation_Id, clip_id = id, model, clip_ms = duration;
+dependencies
+| where timestamp > ago(7d)
+| project operation_Id, clip_id = operation_ParentId, phase = name, phase_ms = duration
+| join kind=inner clips on operation_Id, clip_id
+| summarize clips_with_phase = dcount(clip_id),
+            avg_s = round(avg(phase_ms) / 1000, 2),
+            p95_s = round(percentile(phase_ms, 95) / 1000, 2),
+            phase_ms_total = sum(phase_ms)
+    by model, phase
+| join kind=inner (clips | summarize clip_ms_total = sum(clip_ms) by model) on model
+| extend share_pct = round(100.0 * phase_ms_total / clip_ms_total, 1)
+| project model, phase, clips_with_phase, avg_s, p95_s, share_pct
+| order by model asc, share_pct desc
+
+
+// 5c. Stages inside the phases: text-encoder, prefault-wait, dit-load, image-encode and
+//     reference-encode inside MiniMax-H3's text-encode; first-pass, upscale, refinement or
+//     single-pass inside LTX 2.5's denoise; denoiser-release, vae-open and vae-decode inside
+//     MiniMax-H3's vae-decode. Stage spans carry tensorsharp.video.phase and
+//     tensorsharp.video.stage, and are matched to their clip through the trace (one clip per
+//     trace, which is how the server and Studio run them).
+let clips = dependencies
+    | where timestamp > ago(7d)
+    | where cloud_RoleName startswith "tensorsharp-"
+    | where name startswith "generate_video "
+    | extend model = tostring(customDimensions["gen_ai.request.model"])
+    | where model matches regex @"(?i)minimax.?h3|ltx.?2\.?5"
+    | where tostring(customDimensions["tensorsharp.outcome"]) == "completed"
+    | project operation_Id, model;
+dependencies
+| where timestamp > ago(7d)
+| extend phase = tostring(customDimensions["tensorsharp.video.phase"]),
+         stage = tostring(customDimensions["tensorsharp.video.stage"])
+| where isnotempty(stage)
+| join kind=inner clips on operation_Id
+| summarize spans = sum(itemCount),
+            avg_s = round(avg(duration) / 1000, 2),
+            p95_s = round(percentile(duration, 95) / 1000, 2)
+    by model, phase, stage
+| order by model asc, phase asc, avg_s desc
+
+
+// 5d. The same phases and stages from metrics, which trace sampling does not thin out: average
+//     time per phase (tensorsharp.video.phase.duration) and per denoising step
+//     (tensorsharp.video.denoise.step.duration), by model. Averages only: the histograms have
+//     no buckets in Application Insights.
+customMetrics
+| where timestamp > ago(7d)
+| where cloud_RoleName startswith "tensorsharp-"
+| where name in ("tensorsharp.video.phase.duration", "tensorsharp.video.denoise.step.duration")
+| extend model = tostring(customDimensions["gen_ai.request.model"])
+| where model matches regex @"(?i)minimax.?h3|ltx.?2\.?5"
+| extend phase = tostring(customDimensions["tensorsharp.video.phase"]),
+         stage = tostring(customDimensions["tensorsharp.video.stage"])
+| summarize samples = sum(valueCount), avg_s = round(sum(valueSum) / sum(valueCount), 3) by name, model, phase, stage
+| order by name asc, model asc, avg_s desc
+
+
+// 5e. Denoiser residency: how often a clip found its DiT already loaded (tensorsharp.video.cached
+//     = true) or had to build it, from the tensorsharp.video.dit.loads counter.
+customMetrics
+| where timestamp > ago(7d)
+| where cloud_RoleName startswith "tensorsharp-"
+| where name == "tensorsharp.video.dit.loads"
+| extend model = tostring(customDimensions["gen_ai.request.model"]),
+         cached = tolower(tostring(customDimensions["tensorsharp.video.cached"]))
+| summarize loads = sum(valueSum) by model, cached
+| order by model asc, cached asc
+
+
+// 6. Studio jobs by kind (generate, render) and outcome (completed, failed, cancelled,
+//    interrupted): time from queuing to the end, the queue wait (the studio.queue child), and
+//    what failed (tensorsharp.studio.error_code for Studio's own errors, error.type otherwise).
+//    Each job is a trace of its own, so its spans have no row in requests.
+let queue = dependencies
+    | where timestamp > ago(7d)
+    | where name == "studio.queue"
+    | project operation_Id, job_id = operation_ParentId, queue_ms = duration;
+dependencies
+| where timestamp > ago(7d)
+| where cloud_RoleName startswith "tensorsharp-"
+| where name startswith "studio.job"
+| extend kind = tostring(customDimensions["tensorsharp.studio.job_kind"]),
+         outcome = tostring(customDimensions["tensorsharp.outcome"]),
+         error = coalesce(tostring(customDimensions["tensorsharp.studio.error_code"]), tostring(customDimensions["error.type"]))
+| project operation_Id, job_id = id, kind, outcome, error, job_ms = duration
+| join kind=leftouter queue on operation_Id, job_id
+| summarize jobs = count(),
+            p50_job_s = round(percentile(job_ms, 50) / 1000, 1),
+            p95_job_s = round(percentile(job_ms, 95) / 1000, 1),
+            p50_queue_s = round(percentile(queue_ms, 50) / 1000, 1),
+            errors = make_set_if(error, isnotempty(error), 10)
+    by kind, outcome
+| order by kind asc, jobs desc
+
+
+// 6b. Each Studio job next to the HTTP request that queued it. The job span links to that
+//     request's trace; both exporters store links as JSON in customDimensions["_MS.links"]:
+//     [{"operation_Id":"<trace id>","id":"<span id>"}].
+dependencies
+| where timestamp > ago(7d)
+| where cloud_RoleName startswith "tensorsharp-"
+| where name startswith "studio.job"
+| extend link = parse_json(tostring(customDimensions["_MS.links"]))[0]
+| extend queued_by = tostring(link.operation_Id)
+| where isnotempty(queued_by)
+| project job_time = timestamp, job = name, job_id = tostring(customDimensions["tensorsharp.studio.job_id"]),
+          outcome = tostring(customDimensions["tensorsharp.outcome"]), job_s = round(duration / 1000, 1), queued_by
+| join kind=leftouter (
+    requests
+    | where timestamp > ago(8d)
+    | project queued_by = operation_Id, queued_at = timestamp, request = name, resultCode
+  ) on queued_by
+| project job_time, job, job_id, outcome, job_s, queued_at, request, resultCode, queued_by
+| order by job_time desc
+
+
+// 7. Model loads by model, architecture, backend and outcome (completed, refused, failed,
+//    cancelled), and whether it was the startup load. A load that found the model already
+//    serving (tensorsharp.model.load.skipped = true) did no work and is left out.
+dependencies
+| where timestamp > ago(30d)
+| where cloud_RoleName startswith "tensorsharp-"
+| where name == "model.load"
+| where tolower(tostring(customDimensions["tensorsharp.model.load.skipped"])) != "true"
+| extend model = tostring(customDimensions["gen_ai.request.model"]),
+         architecture = tostring(customDimensions["tensorsharp.model.architecture"]),
+         backend = tostring(customDimensions["tensorsharp.backend"]),
+         outcome = tostring(customDimensions["tensorsharp.outcome"]),
+         startup = tolower(tostring(customDimensions["tensorsharp.model.startup_load"])) == "true"
+| summarize loads = sum(itemCount),
+            p50_s = round(percentilew(duration, itemCount, 50) / 1000, 1),
+            p95_s = round(percentilew(duration, itemCount, 95) / 1000, 1),
+            max_s = round(max(duration) / 1000, 1),
+            last_load = max(timestamp)
+    by model, architecture, backend, outcome, startup
+| order by last_load desc
+
+
+// 8. Log lines of each HTTP request next to the request, joined through operation_Id (the trace
+//    id). With content capture off, a line that had content in it is exported as its message
+//    template, and the content values read [redacted: N chars]. CategoryName is set by the
+//    in-process exporter.
+traces
+| where timestamp > ago(1h)
+| where cloud_RoleName startswith "tensorsharp-"
+| where isnotempty(operation_Id)
+| join kind=inner (
+    requests
+    | where timestamp > ago(1h)
+    | project operation_Id, request_time = timestamp, request = name, resultCode, request_ms = duration,
+              request_id = tostring(customDimensions["tensorsharp.request_id"])
+  ) on operation_Id
+| project request_time, request, resultCode, request_id, timestamp, severityLevel, message,
+          category = tostring(customDimensions["CategoryName"])
+| order by request_time desc, timestamp asc
+
+
+// 8b. Everything recorded for one request, from the X-TensorSharp-Request-Id response header a
+//     client quotes (tensorsharp.request_id on the server span, the chat span and each log
+//     line): the request, its spans, its log lines and its exceptions, in time order.
+let requestId = "paste-the-request-id-here";
+let operations = union requests, dependencies, traces
+    | where timestamp > ago(7d)
+    | where tostring(customDimensions["tensorsharp.request_id"]) == requestId
+    | distinct operation_Id;
+union requests, dependencies, traces, exceptions
+| where timestamp > ago(7d)
+| where operation_Id in (operations)
+| project timestamp, itemType, name, duration, success, severityLevel, message, outerMessage, id, operation_ParentId
+| order by timestamp asc
+
+
+// 8c. Engine log lines. They are written on the engine's own thread and carry no trace id; they
+//     name the engine's sequence id (chat-...) instead, which the chat span carries as
+//     tensorsharp.engine_request_id. The engine and scheduler lines name it EngineRequestId.
+let chats = dependencies
+    | where timestamp > ago(1h)
+    | where tostring(customDimensions["gen_ai.operation.name"]) in ("chat", "text_completion")
+    | extend engine_request_id = tostring(customDimensions["tensorsharp.engine_request_id"])
+    | where isnotempty(engine_request_id)
+    | project engine_request_id, operation_Id, chat = name, request_id = tostring(customDimensions["tensorsharp.request_id"]);
+traces
+| where timestamp > ago(1h)
+| where cloud_RoleName startswith "tensorsharp-"
+| extend engine_request_id = tostring(customDimensions["EngineRequestId"])
+| where engine_request_id startswith "chat-"
+| join kind=inner chats on engine_request_id
+| project timestamp, chat, request_id, operation_Id, severityLevel, message
+| order by timestamp asc
+
+
+// 9. Engine load over time: sequences running and waiting, and paged KV cache blocks in use and
+//    in the pool, by model architecture. These are gauges: each row is one reading.
+customMetrics
+| where timestamp > ago(6h)
+| where cloud_RoleName startswith "tensorsharp-"
+| where name in ("tensorsharp.engine.requests.running", "tensorsharp.engine.requests.waiting",
+                 "tensorsharp.kv_cache.blocks.used", "tensorsharp.kv_cache.blocks.total")
+| extend series = strcat(tostring(customDimensions["tensorsharp.model.architecture"]), " ", name)
+| summarize value = max(value) by series, bin(timestamp, 5m)
+| render timechart

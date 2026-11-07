@@ -533,7 +533,7 @@ namespace TensorSharp.Runtime.Scheduling
                     string? why = seq.PrefixCacheReusedTokens == 0 ? _prefixCacheDeclineReason?.Invoke() : null;
                     string? source = seq.PrefixCacheReusedTokens > 0 ? _radixCache.LastSource : null;
                     _logger.LogInformation(
-                        "Radix prompt reuse for {RequestId}: {Reused}/{Prompt} tokens{Source}; {Prefill} token(s) to prefill{Why}.",
+                        "Radix prompt reuse for {EngineRequestId}: {Reused}/{PromptTokens} tokens{Source}; {Prefill} token(s) to prefill{Why}.",
                         seq.RequestId, seq.PrefixCacheReusedTokens, seq.PromptTokens.Count,
                         source == null ? string.Empty : $" from {source}",
                         seq.PromptTokens.Count - seq.PrefixCacheReusedTokens,
@@ -578,7 +578,11 @@ namespace TensorSharp.Runtime.Scheduling
                 _running[seq.RequestId] = seq;
                 _runningOrder.Add(seq);
                 seq.Status = SequenceStatus.Running;
-                seq.FirstScheduledAt = DateTime.UtcNow;
+                // The FIRST admission: a preempted sequence comes back through here, and
+                // overwriting the time put it after FirstTokenAt for a request preempted
+                // while decoding (a negative prefill phase in its trace). Every other
+                // reader only asks whether the sequence was ever scheduled.
+                seq.FirstScheduledAt ??= DateTime.UtcNow;
 
                 bool isPrefill = want > 1 || promptUncomputed > 0;
                 output.ScheduledWork.Add(new ScheduledSequenceWork(seq, want, true, isPrefill));
@@ -639,7 +643,7 @@ namespace TensorSharp.Runtime.Scheduling
                 return;
             _adapterWaitLoggedFor = seq.RequestId;
             _logger.LogInformation(
-                "{RequestId} (adapter {Adapter}) waits for the {Running} running request(s) of adapter {Epoch} " +
+                "{EngineRequestId} (adapter {Adapter}) waits for the {Running} running request(s) of adapter {Epoch} " +
                 "to finish: one step runs one LoRA adapter (or the base model), so requests of different " +
                 "adapters take turns, in arrival order.",
                 seq.RequestId, seq.Adapter?.Id ?? "none", _running.Count, _epochAdapter?.Id ?? "none");
@@ -770,7 +774,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 _lonePageWaitLoggedFor = producer.RequestId;
                 _logger.LogInformation(
-                    "{RequestId} and the requests sharing its first {Tokens} prompt tokens wait one step for {Producer} " +
+                    "{EngineRequestId} and the requests sharing its first {Tokens} prompt tokens wait one step for {Producer} " +
                     "to forward them alone: this model keeps a shared prefix only from a lone prefill step, so they " +
                     "then resume from it instead of each forwarding it again.",
                     sequence.RequestId, producerEnd, producer.RequestId);
@@ -1056,7 +1060,7 @@ namespace TensorSharp.Runtime.Scheduling
                 return;
             _cloneWaitLoggedFor = seq.RequestId;
             _logger.LogInformation(
-                "Prefix cache: {RequestId} waits to clone its {Length}-token cached prefix; the model has no memory for " +
+                "Prefix cache: {EngineRequestId} waits to clone its {Length}-token cached prefix; the model has no memory for " +
                 "another sequence beside the {Running} running request(s). It is admitted when one of them finishes.",
                 seq.RequestId, length, _running.Count);
         }
@@ -1069,7 +1073,7 @@ namespace TensorSharp.Runtime.Scheduling
                 return;
             _capacityWaitLoggedFor = seq.RequestId;
             _logger.LogInformation(
-                "KV block pool: {RequestId} ({PromptTokens} prompt tokens) waits for capacity; " +
+                "KV block pool: {EngineRequestId} ({PromptTokens} prompt tokens) waits for capacity; " +
                 "{Running} running request(s) still need their prompts' blocks ({Free}/{Total} blocks free). " +
                 "It is admitted when one of them finishes. Raise TS_SCHED_NUM_BLOCKS to run more at once.",
                 seq.RequestId, seq.PromptTokens.Count, _running.Count, _pool.NumFreeBlocks, _pool.NumBlocks);
@@ -1144,7 +1148,7 @@ namespace TensorSharp.Runtime.Scheduling
                 _sequenceSlotCapReported = true;
                 _logger.LogInformation(
                     "The model has no device slot for another concurrent request: {Running} running request(s) hold " +
-                    "every slot its memory fits, so {RequestId} and later arrivals wait for one to finish. Each slot " +
+                    "every slot its memory fits, so {EngineRequestId} and later arrivals wait for one to finish. Each slot " +
                     "holds a whole context ({Context} tokens); a smaller MAX_CONTEXT fits more at once. Reported once.",
                     _running.Count, seq.RequestId, contextTokens);
             }
@@ -1163,6 +1167,9 @@ namespace TensorSharp.Runtime.Scheduling
             _runningOrder.Remove(victim);
             victim.Status = SequenceStatus.Preempted;
             victim.ResetForPreemption();
+            // On the request's span (tensorsharp.preemptions): its prefill phase then
+            // includes the wait to be re-admitted and the re-prefill.
+            victim.PreemptionCount++;
 
             // Re-park at the front of the waiting queue so the victim resumes
             // soon - we don't want preemption to permanently demote a request.

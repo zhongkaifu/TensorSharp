@@ -10,6 +10,7 @@
 using System;
 using System.Linq;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.FileProviders;
 
@@ -24,6 +25,23 @@ namespace TensorSharp.Server.Hosting;
 /// </summary>
 public static class UploadStaticFiles
 {
+    /// <summary>Where the upload directory is served.</summary>
+    public const string MountPath = "/uploads";
+
+    /// <summary>
+    /// What leaves the process in place of an upload's path: span names, <c>url.path</c>
+    /// and the request logger's exported scope. The unguessable file name is the only
+    /// thing guarding an unauthenticated <c>/uploads</c> URL, so it is user content.
+    /// </summary>
+    public const string RedactedFilePath = MountPath + "/{file}";
+
+    /// <summary>
+    /// True for a request for a file under <c>/uploads/</c> (not <c>/uploads</c> itself),
+    /// matched the way the static-file middleware matches it: by segment, ignoring case.
+    /// </summary>
+    public static bool IsUploadFilePath(PathString path) =>
+        path.StartsWithSegments(MountPath, out PathString remaining) && remaining.Value is { Length: > 1 };
+
     internal static IContentTypeProvider BuildServeContentTypes() =>
         new FileExtensionContentTypeProvider(UploadContentPolicy.ServeContentTypes.ToDictionary(
             kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase));
@@ -31,7 +49,7 @@ public static class UploadStaticFiles
     public static StaticFileOptions BuildStaticFileOptions(string uploadDirectory) => new()
     {
         FileProvider = new PhysicalFileProvider(uploadDirectory),
-        RequestPath = "/uploads",
+        RequestPath = MountPath,
         ContentTypeProvider = BuildServeContentTypes(),
         OnPrepareResponse = ctx =>
             ctx.Context.Response.Headers["X-Content-Type-Options"] = "nosniff",

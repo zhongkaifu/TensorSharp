@@ -287,11 +287,29 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Optional exception when <see cref="Status"/> is FinishedError.</summary>
         public Exception? Error { get; internal set; }
 
-        /// <summary>Per-step telemetry: when scheduling started for this seq.</summary>
+        /// <summary>Per-step telemetry: when scheduling started for this seq. Its first
+        /// admission: re-admission after a preemption leaves it as it was.</summary>
         public DateTime? FirstScheduledAt { get; internal set; }
 
         /// <summary>When the very first token of generation was produced.</summary>
         public DateTime? FirstTokenAt { get; internal set; }
+
+        /// <summary>
+        /// Times the scheduler preempted this sequence: took its blocks back to make room for
+        /// others, or parked it again because the model had no device slot for it
+        /// (<see cref="ContinuousBatchScheduler.DeferForSequenceSlot"/>). Either way it re-queues
+        /// and re-prefills; <see cref="FirstScheduledAt"/> keeps its first admission, so the
+        /// trace's queue and prefill phases stay ordered. <see cref="ResetForPreemption"/> leaves
+        /// it alone.
+        /// </summary>
+        public int PreemptionCount { get; internal set; }
+
+        /// <summary>
+        /// The span of the request this sequence belongs to, set by the submitter. The engine
+        /// links its optional per-step spans (<c>TENSORSHARP_OTEL_TRACE_STEPS</c>) to it; it is
+        /// never used as an implicit parent, since the engine thread serves many requests.
+        /// </summary>
+        public System.Diagnostics.ActivityContext TelemetryContext { get; set; }
 
         /// <summary>How many tokens were restored from prefix cache (block hash
         /// hits) at admission time. Diagnostic only.</summary>

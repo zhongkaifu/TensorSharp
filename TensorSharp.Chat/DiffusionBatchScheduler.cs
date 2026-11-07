@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -122,6 +123,13 @@ namespace TensorSharp.Server
 
         private void WorkerLoop()
         {
+            // Thread.Start flowed the execution context of the request that first built this
+            // scheduler, its span as Activity.Current included. The worker denoises every
+            // request, so nothing it does belongs to that one: drop the span, as the engine's
+            // worker does. Not UnsafeStart, which would also drop the inherited logging scope
+            // the console and file logs print.
+            Activity.Current = null;
+            TensorSharp.Runtime.Telemetry.TelemetryContext.Clear();
             var active = new List<ActiveRequest>();
             var stopCt = _stop.Token;
             try

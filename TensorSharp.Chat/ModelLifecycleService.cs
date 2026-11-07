@@ -137,6 +137,16 @@ namespace TensorSharp.Server
         public ModelBase Model => Volatile.Read(ref _model);
         public BackendType Backend => _backend;
 
+        /// <summary>
+        /// How many GPUs, across every node, the loaded model's tensors are sharded over
+        /// (1: not tensor-parallel). Kept for the <c>model.load</c> span; the group itself
+        /// belongs to the model.
+        /// </summary>
+        internal int LoadedTensorParallelDegree { get; private set; } = 1;
+
+        /// <summary>How many GPUs, across every node, the loaded model's layers are split over (1: no layer split).</summary>
+        internal int LoadedLayerSplitDegree { get; private set; } = 1;
+
         public bool IsModelAlreadyLoaded(string modelName)
         {
             return _model != null && string.Equals(LoadedModelName, modelName, StringComparison.OrdinalIgnoreCase);
@@ -321,6 +331,8 @@ namespace TensorSharp.Server
             _loadedMmProjPath = null;
             DraftHeadActivationError = null;
             DraftHeadRefusedByModel = false;
+            LoadedTensorParallelDegree = 1;
+            LoadedLayerSplitDegree = 1;
             if (outgoing != null)
             {
                 Interlocked.Increment(ref _loadEpoch);
@@ -445,12 +457,21 @@ namespace TensorSharp.Server
                 }
 
                 loadSw.Stop();
+                // The split the model factory was given (see the constructor), counted
+                // across every node rather than this node's share.
+                LoadedTensorParallelDegree = tpGroup is ILayerSplitGroup ? 1 : tpGroup?.GlobalDegree ?? 1;
+                LoadedLayerSplitDegree = tpGroup is ILayerSplitGroup ? tpGroup.GlobalDegree : 1;
                 long modelBytes = _model.ModelFilePaths.Sum(SafeGetFileSize);
                 long mmProjBytes = SafeGetFileSize(mmProjPath);
                 _logger.LogInformation(LogEventIds.ModelLoadCompleted,
                     "Loaded model {Model} (architecture={Architecture}, backend={Backend}, modelBytes={ModelBytes}, mmproj={MmProjFile}, mmprojBytes={MmProjBytes}) in {ElapsedMs:F1} ms",
                     LoadedModelName, Architecture ?? "(unknown)", LoadedBackend ?? "(unknown)",
                     modelBytes, LoadedMmProjName ?? "(none)", mmProjBytes, loadSw.Elapsed.TotalMilliseconds);
+                // The tensorsharp.gpu.memory.* gauges cover this model's device from now on; the
+                // engine's worker refreshes them between steps. Every load, the startup one and a
+                // rollback to the previous model included, ends here. Never throws, and a model on
+                // host memory is not tracked.
+                TensorSharp.Models.Telemetry.GpuMemoryTelemetry.Track(_model);
             }
             catch (Exception ex)
             {
@@ -483,6 +504,8 @@ namespace TensorSharp.Server
                 _loadedMmProjPath = null;
                 DraftHeadActivationError = null;
                 DraftHeadRefusedByModel = false;
+                LoadedTensorParallelDegree = 1;
+                LoadedLayerSplitDegree = 1;
                 throw;
             }
         }

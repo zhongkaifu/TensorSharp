@@ -121,7 +121,7 @@ internal sealed partial class PrefixCacheCoordinator
             _tree.AttachPages(node, CollectionsMarshal.AsSpan(pages));
             if (_tree.Counters.PagesUpgraded > upgraded)
                 _logger.LogInformation(
-                    "Prefix cache: {RequestId}'s restore point replaced {Count} cached page(s) of the same tokens " +
+                    "Prefix cache: {EngineRequestId}'s restore point replaced {Count} cached page(s) of the same tokens " +
                     "that held no recurrent state; requests sharing that prefix resume from it now.",
                     seq.RequestId, _tree.Counters.PagesUpgraded - upgraded);
         }

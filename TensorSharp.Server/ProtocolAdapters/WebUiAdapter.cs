@@ -439,7 +439,7 @@ public sealed class WebUiAdapter
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInformation(LogEventIds.UploadReceived,
                 "OpenAI video generation done: {F} frames -> {Url} ({Sec:F1}s)",
-                result.Frames, result.Url, result.ElapsedSeconds);
+                result.Frames, LogContent.Of(result.Url), result.ElapsedSeconds);
         string? b64 = wantB64 ? Convert.ToBase64String(await File.ReadAllBytesAsync(result.OutputPath).ConfigureAwait(false)) : null;
         return Results.Json(new
         {
