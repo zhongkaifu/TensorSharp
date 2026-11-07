@@ -146,6 +146,7 @@
         "qwen3.6-27b",
         "qwen3.6-35b-a3b",
         "qwen3.8-27b",
+        "qwen3.8-27b-metal-dflash2",
         "qwen3.8-27b-ninfer",
         "qwen3.8-27b-ninfer-64k"
       ]
@@ -3139,6 +3140,33 @@
       ],
       "layout": "moe",
       "status": "configured"
+    },
+    {
+      "id": "qwen3.8-27b-metal-dflash2",
+      "config": "config/qwen3.8-27b-metal-dflash2.json",
+      "kind": "text",
+      "family": "qwen35",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "ggml_metal"
+      ],
+      "scenarios": [],
+      "source_evidence": [
+        "config/qwen3.8-27b-metal-dflash2.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "Qwen3.8-27B-UD-IQ3_XXS.gguf": 17559178144
+      },
+      "status": "configured",
+      "notes": [
+        "Apple Silicon profile: the qwen3.8-27b trunk on ggml_metal with the pinned DFlash2 block drafter (7 drafts, no confidence gate).",
+        "Offline inventory only; no automatic runner scenario claims this measured profile. The drafter's size is not recorded here; its SHA256 is pinned in the config."
+      ]
     },
     {
       "id": "qwen3.8-27b",
