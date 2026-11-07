@@ -171,6 +171,18 @@ Names cannot be empty, contain `=` or control characters; values cannot contain
 NUL. A map does not download files and never becomes an `--environment` argument.
 Normal command-line option precedence is unchanged.
 
+The map can also turn on [OpenTelemetry export](../USAGE.md#telemetry-opentelemetry) for
+either host. An `OTEL_EXPORTER_OTLP_ENDPOINT` already in the process environment still wins;
+the `"otel-endpoint"` option (`--otel-endpoint`) wins over both:
+
+```json
+{
+  "environment": {
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317"
+  }
+}
+```
+
 The [NInfer guide](README-ninfer.md) provides two shared CLI/Server.Host presets,
 [40K](qwen3.8-27b-ninfer.json) and [64K](qwen3.8-27b-ninfer-64k.json), including
 the embedded DFlash module path. The 64K optimized profile's actual GPU/model

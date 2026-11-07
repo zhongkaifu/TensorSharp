@@ -122,13 +122,13 @@ namespace TensorSharp.Runtime.Scheduling
                         _mediaAfterReusedPrefixWarned = true;
                         if (kept == 0)
                             _logger.LogWarning(
-                                "A {Prompt}-token prompt whose attachment follows a reusable {Clamped}-token prefix " +
+                                "A {PromptTokens}-token prompt whose attachment follows a reusable {Clamped}-token prefix " +
                                 "prefills from zero instead: this model cannot prefill media after a reused prefix " +
                                 "exactly at this length. Reported once.",
                                 seq.PromptTokens.Count, clamped);
                         else
                             _logger.LogWarning(
-                                "A {Prompt}-token prompt whose attachment follows a reusable {Clamped}-token prefix " +
+                                "A {PromptTokens}-token prompt whose attachment follows a reusable {Clamped}-token prefix " +
                                 "reuses only its {Kept}-token public prefix instead: this model cannot prefill media " +
                                 "after a longer reused prefix exactly at this length. Reported once.",
                                 seq.PromptTokens.Count, clamped, kept);
@@ -693,7 +693,7 @@ namespace TensorSharp.Runtime.Scheduling
                 if (batched.SupportsLinearKVMigration)
                 {
                     _logger.LogWarning(
-                        "BatchExecutor: linear-to-paged migration failed for {RequestId}; falling back to per-seq path.",
+                        "BatchExecutor: linear-to-paged migration failed for {EngineRequestId}; falling back to per-seq path.",
                         _currentOwner?.RequestId);
                 }
                 return ExecuteLinearAndPagedSplit(
@@ -867,7 +867,7 @@ namespace TensorSharp.Runtime.Scheduling
                         "linear fallback is unsafe because its K/V history exists only in model-owned paged storage.",
                         ex);
                     _logger.LogError(error,
-                        "BatchExecutor cannot safely fall back paged sequence {RequestId} to linear execution.",
+                        "BatchExecutor cannot safely fall back paged sequence {EngineRequestId} to linear execution.",
                         work.Sequence.RequestId);
                     resultBySequence[work.Sequence] = new SequenceStepResult
                     {
@@ -1665,12 +1665,12 @@ namespace TensorSharp.Runtime.Scheduling
                     // is held, so it waits for a running request to finish rather than failing: this is
                     // what four concurrent chats on GLM-5.3-Flash, whose context the loader sizes to fill
                     // the devices, used to return as "sequence-slot allocation failed".
-                    _logger.LogDebug("No sequence slot for {RequestId} yet: {Reason}", seq.RequestId, ex.Message);
+                    _logger.LogDebug("No sequence slot for {EngineRequestId} yet: {Reason}", seq.RequestId, ex.Message);
                     results.Add(new SequenceStepResult { Sequence = seq, SlotUnavailable = true });
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Fused per-seq step failed for sequence {RequestId}", seq.RequestId);
+                    _logger.LogError(ex, "Fused per-seq step failed for sequence {EngineRequestId}", seq.RequestId);
                     results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
                     seq.Error = ex;
                 }
@@ -1722,12 +1722,12 @@ namespace TensorSharp.Runtime.Scheduling
             catch (SequenceSlotUnavailableException ex) when (seq.NumComputedTokens == prevComputed
                                                                && !fused.HasFusedSequenceCache(seq.RequestId))
             {
-                _logger.LogDebug("No sequence slot for {RequestId} yet: {Reason}", seq.RequestId, ex.Message);
+                _logger.LogDebug("No sequence slot for {EngineRequestId} yet: {Reason}", seq.RequestId, ex.Message);
                 results.Add(new SequenceStepResult { Sequence = seq, SlotUnavailable = true });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Fused per-seq step failed for sequence {RequestId}", seq.RequestId);
+                _logger.LogError(ex, "Fused per-seq step failed for sequence {EngineRequestId}", seq.RequestId);
                 results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
                 seq.Error = ex;
             }
@@ -1765,7 +1765,7 @@ namespace TensorSharp.Runtime.Scheduling
             catch (Exception ex)
             {
                 // The forward that carried it may have written its cache: fail it rather than rerun it.
-                _logger.LogError(ex, "Mixed-step prefill failed for sequence {RequestId}", seq.RequestId);
+                _logger.LogError(ex, "Mixed-step prefill failed for sequence {EngineRequestId}", seq.RequestId);
                 results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
                 seq.Error = ex;
             }
@@ -1796,7 +1796,7 @@ namespace TensorSharp.Runtime.Scheduling
                 if (!_model.TryTruncateKVCache(retainedTruncationTarget))
                 {
                     _logger.LogInformation(
-                        "Retained fused cache for {RequestId} could not rewind to {Tokens}; " +
+                        "Retained fused cache for {EngineRequestId} could not rewind to {Tokens}; " +
                         "re-prefilling its prompt from the beginning.",
                         seq.RequestId, retainedTruncationTarget);
                     _model.ResetKVCache();
@@ -1831,7 +1831,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // without this line the user sees a full re-prefill on a
                 // turn the scheduler already counted as a cache hit.
                 _logger.LogInformation(
-                    "Planned live-cache continuation for {RequestId} was revoked before " +
+                    "Planned live-cache continuation for {EngineRequestId} was revoked before " +
                     "execution (the claimed live state is gone); re-prefilling the full prompt.",
                     seq.RequestId);
                 seq.ClearLiveCacheContinuation();
@@ -1896,12 +1896,12 @@ namespace TensorSharp.Runtime.Scheduling
                 catch (SequenceSlotUnavailableException ex) when (seq.NumComputedTokens == prevComputed
                                                                    && !fused.HasFusedSequenceCache(seq.RequestId))
                 {
-                    _logger.LogDebug("No sequence slot for {RequestId} yet: {Reason}", seq.RequestId, ex.Message);
+                    _logger.LogDebug("No sequence slot for {EngineRequestId} yet: {Reason}", seq.RequestId, ex.Message);
                     results.Add(new SequenceStepResult { Sequence = seq, SlotUnavailable = true });
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Fused per-seq step failed for sequence {RequestId}", seq.RequestId);
+                    _logger.LogError(ex, "Fused per-seq step failed for sequence {EngineRequestId}", seq.RequestId);
                     results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
                     seq.Error = ex;
                 }
@@ -1991,7 +1991,7 @@ namespace TensorSharp.Runtime.Scheduling
                     {
                         _pastCapSerializationWarned = true;
                         _logger.LogInformation(
-                            "{RequestId} holds {Tokens} tokens, past the {Cap} this model can swap out and " +
+                            "{EngineRequestId} holds {Tokens} tokens, past the {Cap} this model can swap out and " +
                             "restore; the other {Others} scheduled request(s) wait until it finishes instead " +
                             "of each swap re-prefilling it. Reported once.",
                             _currentOwner.RequestId, _ownerTokensInModel, _model.MaxReusablePrefixTokens,
@@ -2159,7 +2159,7 @@ namespace TensorSharp.Runtime.Scheduling
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Step failed for sequence {RequestId}", seq.RequestId);
+                    _logger.LogError(ex, "Step failed for sequence {EngineRequestId}", seq.RequestId);
                     results.Add(new SequenceStepResult
                     {
                         Sequence = seq,
@@ -2398,7 +2398,7 @@ namespace TensorSharp.Runtime.Scheduling
 
             var exec = new SpeculativeExecution(spec, speculator, trunk, SharedGovernorFor(spec, speculator, seq));
             _logger.LogInformation(
-                "Speculative decoding armed for {RequestId} (algorithm={Algorithm}, maxDraft={MaxDraft}, "
+                "Speculative decoding armed for {EngineRequestId} (algorithm={Algorithm}, maxDraft={MaxDraft}, "
                 + "pMin={PMin}, trunk={Trunk}, adaptive={Adaptive}, adaptiveSource={AdaptiveSource})",
                 seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, trunkLabel,
                 exec.AdaptiveSpeculation, exec.Governor.SelectionSource);
@@ -3108,7 +3108,7 @@ namespace TensorSharp.Runtime.Scheduling
             _fusedSpecCtx[seq.RequestId] = ctx;
             seq.SpecStats = exec.Stats;
             _logger.LogInformation(
-                "Speculative decoding armed for {RequestId} (algorithm={Algorithm}, maxDraft={MaxDraft}, "
+                "Speculative decoding armed for {EngineRequestId} (algorithm={Algorithm}, maxDraft={MaxDraft}, "
                 + "pMin={PMin}, trunk=fused holder over {Committed} committed tokens, adaptive={Adaptive}, adaptiveSource={AdaptiveSource})",
                 seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, prevComputed,
                 exec.AdaptiveSpeculation, exec.Governor.SelectionSource);
@@ -3366,7 +3366,7 @@ namespace TensorSharp.Runtime.Scheduling
                         else
                         {
                             _logger.LogInformation(
-                                "Live-cache continuation for {RequestId} needed a {Rewind}-token rewind the " +
+                                "Live-cache continuation for {EngineRequestId} needed a {Rewind}-token rewind the " +
                                 "model declined at execution time; its prompt re-prefills after all.",
                                 seq.RequestId, _liveCacheLen - seq.NumComputedTokens);
                         }
@@ -3394,7 +3394,7 @@ namespace TensorSharp.Runtime.Scheduling
                     // announced reuse silently became a full re-prefill is exactly the
                     // latency mystery this whole logging path exists to prevent.
                     _logger.LogInformation(
-                        "Live-cache continuation for {RequestId} was no longer valid at execution time " +
+                        "Live-cache continuation for {EngineRequestId} was no longer valid at execution time " +
                         "({Why}); its prompt re-prefills after all.",
                         seq.RequestId, LiveContinuationGateFailure(seq));
                     seq.ClearLiveCacheContinuation();
@@ -3778,7 +3778,7 @@ namespace TensorSharp.Runtime.Scheduling
                     if (expectedBytes <= 0)
                     {
                         _logger.LogWarning(
-                            "Inject found a block snapshot of neither known size for sequence {RequestId} block {Block}: have {Have} bytes",
+                            "Inject found a block snapshot of neither known size for sequence {EngineRequestId} block {Block}: have {Have} bytes",
                             seq.RequestId, b, src.Length);
                         break;
                     }
@@ -3787,7 +3787,7 @@ namespace TensorSharp.Runtime.Scheduling
                 if (src.Length < expectedBytes)
                 {
                     _logger.LogWarning(
-                        "Inject would underflow for sequence {RequestId} block {Block}: have {Have} need {Need}",
+                        "Inject would underflow for sequence {EngineRequestId} block {Block}: have {Have} need {Need}",
                         seq.RequestId, b, src.Length, expectedBytes);
                     break;
                 }
@@ -3795,7 +3795,7 @@ namespace TensorSharp.Runtime.Scheduling
                 if (!_model.TryInjectKVBlock(startToken, tokensInBlock, slice))
                 {
                     _logger.LogWarning(
-                        "Inject failed for sequence {RequestId} block {Block} at {Start}",
+                        "Inject failed for sequence {EngineRequestId} block {Block} at {Start}",
                         seq.RequestId, b, startToken);
                     break;
                 }
@@ -3846,7 +3846,7 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             _logger.LogWarning(
-                "Materializing the cached prefix of {RequestId} stopped at {Materialized} of {Claimed} tokens; " +
+                "Materializing the cached prefix of {EngineRequestId} stopped at {Materialized} of {Claimed} tokens; " +
                 "reuse is corrected to {Reused} and the remaining {Recompute} tokens are forwarded again.",
                 seq.RequestId, usable, tokens, Math.Min(seq.PrefixCacheReusedTokens, usable), tokens - usable);
 

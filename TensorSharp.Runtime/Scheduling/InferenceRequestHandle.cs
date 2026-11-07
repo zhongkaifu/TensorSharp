@@ -74,6 +74,7 @@ namespace TensorSharp.Runtime.Scheduling
                 PrefixCacheReusedTokens = Sequence.PrefixCacheReusedTokens,
                 FirstTokenAt = Sequence.FirstTokenAt,
                 SubmittedAt = Sequence.SubmittedAt,
+                FinishedAt = DateTime.UtcNow,
                 PrefillElapsedTicks = _prefillElapsedTicks + Sequence.ReplayPrefillElapsedTicks,
                 DecodeElapsedTicks = _decodeElapsedTicks + Sequence.ReplayDecodeElapsedTicks,
             };
@@ -100,6 +101,7 @@ namespace TensorSharp.Runtime.Scheduling
                 PrefixCacheReusedTokens = Sequence.PrefixCacheReusedTokens,
                 FirstTokenAt = Sequence.FirstTokenAt,
                 SubmittedAt = Sequence.SubmittedAt,
+                FinishedAt = DateTime.UtcNow,
                 PrefillElapsedTicks = _prefillElapsedTicks + Sequence.ReplayPrefillElapsedTicks,
                 DecodeElapsedTicks = _decodeElapsedTicks + Sequence.ReplayDecodeElapsedTicks,
             };
@@ -116,6 +118,12 @@ namespace TensorSharp.Runtime.Scheduling
         public int PrefixCacheReusedTokens { get; init; }
         public DateTime? FirstTokenAt { get; init; }
         public DateTime SubmittedAt { get; init; }
+
+        /// <summary>UTC time the engine worker finished (or aborted) the request: the end
+        /// of decode. The request thread drains the token channel later, at whatever pace
+        /// its client reads, so time measured from there includes a slow client. Null on a
+        /// completion built outside the engine.</summary>
+        public DateTime? FinishedAt { get; init; }
 
         /// <summary>Prompt forward time in <see cref="System.Diagnostics.Stopwatch"/>
         /// ticks, including prompt replay after a cache restoration shortfall.

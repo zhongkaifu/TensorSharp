@@ -29,6 +29,7 @@ using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Runtime.Speculative;
+using TensorSharp.Telemetry;
 
 namespace TensorSharp.Cli
 {
@@ -83,13 +84,51 @@ namespace TensorSharp.Cli
                 return;
             }
 
+            // OpenTelemetry, resolved before the logger factory is built so its log exporter is
+            // one of the factory's providers. Off unless an OTLP endpoint,
+            // APPLICATIONINSIGHTS_CONNECTION_STRING or TENSORSHARP_OTEL=1 asks for it
+            // (TelemetryOptions has every rule). --otel-endpoint is read without being removed,
+            // the way the --log-* flags are: Consume returns a new array and args is left as it
+            // is, and MainCore's switch ignores a flag it has no case for.
+            TelemetryOptions telemetryOptions;
+            try
+            {
+                _ = TelemetryCliFlags.Consume(args, out string otelEndpoint);
+                TelemetryCliFlags.ApplyToEnvironment(otelEndpoint);
+                telemetryOptions = TelemetryOptions.FromEnvironment(TelemetryHost.Cli);
+            }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine("Configuration error: " + ex.Message);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
+            }
+            // Null when telemetry is off. Declared before the logger factory, so on a normal
+            // exit the factory (and with it the log exporter) is flushed first, then the traces
+            // and metrics. The other exits flush it themselves: see RunToExit and the leave
+            // callback below.
+            using TelemetrySession telemetry = TelemetrySession.Start(telemetryOptions);
+            _telemetry = telemetry;
+
             var loggingOptions = CliLoggingSetup.ParseFromArgs(args);
-            using var loggerFactory = CliLoggingSetup.Build(loggingOptions);
+            using var loggerFactory = CliLoggingSetup.Build(loggingOptions,
+                telemetry is null ? null : telemetry.AddLogging);
+            _loggerFactory = loggerFactory;
             _log = loggerFactory.CreateLogger("TensorSharp.Cli");
             _log.LogInformation(LogEventIds.CliStarted,
                 "tensorsharp-cli started: argv={ArgCount} logLevel={LogLevel} logDir={LogDir} fileLogging={FileLogging} consoleLogging={ConsoleLogging}",
                 args.Length, loggingOptions.MinimumLevel, loggingOptions.Directory,
                 loggingOptions.FileEnabled, loggingOptions.ConsoleEnabled);
+            _log.LogInformation(LogEventIds.HostConfiguration, "{Telemetry}", telemetryOptions.Describe());
+            foreach (string telemetryWarning in telemetryOptions.Warnings)
+                _log.LogWarning(LogEventIds.HostConfiguration, "Telemetry: {Warning}", telemetryWarning);
+            // The tensorsharp.gpu.memory.* gauges. Video clips refresh them as they run, and the
+            // engine's worker between steps, on the thread already doing that backend's work.
+            if (telemetryOptions.Enabled && telemetryOptions.Metrics != TelemetrySinks.None)
+            {
+                TensorSharp.Models.Telemetry.GpuMemoryTelemetry.EnsureRegistered();
+                TensorSharp.Runtime.Telemetry.TensorSharpMetrics.SetEngineStepObserver(TensorSharp.Models.Telemetry.GpuMemoryTelemetry.Snapshot);
+            }
 
             // The ggml-metal device singleton asserts its residency set is empty
             // when its C++ static destructor runs at process exit; any GGML
@@ -116,6 +155,9 @@ namespace TensorSharp.Cli
                 if (OperatingSystem.IsLinux() && selectedBackend == "ggml_vulkan")
                 {
                     loggerFactory.Dispose();
+                    // _exit skips the using disposal above, so the spans and metrics are
+                    // exported here or not at all. Disposing twice is harmless.
+                    telemetry?.Dispose();
                     Console.Out.Flush();
                     Console.Error.Flush();
                     LibcExit(Environment.ExitCode);
@@ -132,7 +174,9 @@ namespace TensorSharp.Cli
         /// that way, so a prompt refused for MAX_CONTEXT after a Vulkan run went through the
         /// destructors, and its exit code 1 could become a segfault. An unexpected failure is
         /// rethrown with its stack trace. The code workspace is released before leaving:
-        /// <c>_exit</c> skips any finally block still pending.
+        /// <c>_exit</c> skips any finally block still pending. Telemetry is flushed before an
+        /// unexpected failure is rethrown, because an unhandled exception ends the process
+        /// without running Main's <c>using</c> disposal.
         /// </summary>
         internal static void RunToExit(Action mainCore, Action leave)
         {
@@ -166,6 +210,16 @@ namespace TensorSharp.Cli
             {
                 _log.LogCritical(LogEventIds.CliFailed, ex,
                     "tensorsharp-cli aborted with unhandled exception {ExceptionType}", ex.GetType().Name);
+                // The failed spans are the trace of the crash; export them before it. The
+                // OpenTelemetry log provider belongs to the logger factory, so the factory is
+                // disposed first, or the critical line above (and the batch queued before it)
+                // would never leave the process. Only with telemetry on: otherwise the run's
+                // ending stays exactly as it was.
+                if (_telemetry is not null)
+                {
+                    _loggerFactory?.Dispose();
+                    _telemetry.Dispose();
+                }
                 throw;
             }
             finally
@@ -181,6 +235,25 @@ namespace TensorSharp.Cli
             }
             leave();
         }
+
+        /// <summary>
+        /// This process's telemetry, or null when it is off. Held statically so
+        /// <see cref="RunToExit"/> can flush it on the path where Main's <c>using</c> never runs.
+        /// </summary>
+        private static TelemetrySession _telemetry;
+
+        /// <summary>
+        /// Export the metrics and spans collected so far, while the inference engine that is
+        /// about to be disposed can still answer its gauges (<see cref="TelemetrySession.Flush"/>).
+        /// A no-op with telemetry off.
+        /// </summary>
+        internal static void FlushTelemetryBeforeEngineDispose() => _telemetry?.Flush();
+
+        /// <summary>
+        /// The logger factory Main builds, held for the same reason as <see cref="_telemetry"/>:
+        /// it owns the OpenTelemetry log provider, which only its disposal flushes.
+        /// </summary>
+        private static ILoggerFactory _loggerFactory;
 
         /// <summary>
         /// This process's code-execution workspace, held statically so
@@ -1052,6 +1125,9 @@ namespace TensorSharp.Cli
                 Path.GetFileName(modelPath), model.Config.Architecture ?? "(unknown)",
                 model.MaxContextLength, model.KvCacheDtype.ToShortString(),
                 modelLoadSw.Elapsed.TotalMilliseconds);
+            // GPU memory gauges (with telemetry on) read the loaded model's allocator; the
+            // server does this in ModelLifecycleService. Track never throws.
+            TensorSharp.Models.Telemetry.GpuMemoryTelemetry.Track(model);
 
             // Qwen-Image-2.1: prompt -> generated image, or prompt + input image(s) -> edited
             // image (no autoregressive path). Repeat --image for multi-image edits (e.g.
@@ -1263,7 +1339,7 @@ namespace TensorSharp.Cli
             {
                 rawText = File.ReadAllText(inputFile).TrimEnd();
                 _log.LogInformation(LogEventIds.HostConfiguration,
-                    "Loaded input from {InputFile} ({Chars} chars)", inputFile, rawText.Length);
+                    "Loaded input from {InputFile} ({Chars} chars)", LogContent.Of(inputFile), rawText.Length);
             }
             else
             {
@@ -1285,7 +1361,7 @@ namespace TensorSharp.Cli
             {
                 if (!File.Exists(pdfPath))
                 {
-                    _log.LogError(LogEventIds.CliFailed, "PDF file not found: {PdfPath}", pdfPath);
+                    _log.LogError(LogEventIds.CliFailed, "PDF file not found: {PdfPath}", LogContent.Of(pdfPath));
                     return;
                 }
 
@@ -1298,7 +1374,7 @@ namespace TensorSharp.Cli
                 catch (Exception ex)
                 {
                     _log.LogError(LogEventIds.CliFailed, ex,
-                        "Failed to extract text from PDF {PdfPath}: {Error}", pdfPath, ex.Message);
+                        "Failed to extract text from PDF {PdfPath}: {Error}", LogContent.Of(pdfPath), LogContent.Of(ex.Message));
                     Console.Error.WriteLine("Could not read the PDF: " + ex.Message);
                     return;
                 }
@@ -1318,7 +1394,7 @@ namespace TensorSharp.Cli
 
                     _log.LogInformation(LogEventIds.UploadReceived,
                         "PDF input (untruncated text): {PdfPath} pages={Pages} extractedPages={ExtractedPages} complete={Complete} chars={Chars} extractMs={ExtractMs:F1}",
-                        pdfPath, pdf.PageCount, pdf.ExtractedPageCount, allPagesExtracted, docText.Length,
+                        LogContent.Of(pdfPath), pdf.PageCount, pdf.ExtractedPageCount, allPagesExtracted, docText.Length,
                         pdfSw.Elapsed.TotalMilliseconds);
                     if (allPagesExtracted)
                     {
@@ -1340,7 +1416,7 @@ namespace TensorSharp.Cli
                     {
                         _log.LogError(LogEventIds.CliFailed,
                             "PDF has no text layer and no vision model is loaded: {PdfPath} pages={Pages}",
-                            pdfPath, pdf.PageCount);
+                            LogContent.Of(pdfPath), pdf.PageCount);
                         Console.Error.WriteLine(
                             $"PDF \"{pdfName}\" has no selectable text (it appears to be scanned or image-only). " +
                             "Re-run with a vision-capable model and its projector, e.g. --mmproj <projector.gguf|vision.safetensors>, " +
@@ -1358,7 +1434,7 @@ namespace TensorSharp.Cli
                     catch (Exception ex)
                     {
                         _log.LogError(LogEventIds.CliFailed, ex,
-                            "Failed to extract page images from PDF {PdfPath}: {Error}", pdfPath, ex.Message);
+                            "Failed to extract page images from PDF {PdfPath}: {Error}", LogContent.Of(pdfPath), LogContent.Of(ex.Message));
                         Console.Error.WriteLine("Could not read the PDF: " + ex.Message);
                         return;
                     }
@@ -1366,7 +1442,7 @@ namespace TensorSharp.Cli
                     if (imgRes.ImagePaths.Count == 0)
                     {
                         _log.LogError(LogEventIds.CliFailed,
-                            "PDF yielded neither text nor images: {PdfPath}", pdfPath);
+                            "PDF yielded neither text nor images: {PdfPath}", LogContent.Of(pdfPath));
                         Console.Error.WriteLine($"Could not extract any text or images from \"{pdfName}\".");
                         return;
                     }
@@ -1377,7 +1453,7 @@ namespace TensorSharp.Cli
 
                     _log.LogInformation(LogEventIds.UploadReceived,
                         "PDF input (images): {PdfPath} pages={Pages} images={Images} extractMs={ExtractMs:F1}",
-                        pdfPath, pdf.PageCount, imgRes.ImagePaths.Count, pdfSw.Elapsed.TotalMilliseconds);
+                        LogContent.Of(pdfPath), pdf.PageCount, imgRes.ImagePaths.Count, pdfSw.Elapsed.TotalMilliseconds);
                     Console.WriteLine($"Loaded PDF as images: {pdfName} " +
                         $"({imgRes.ExtractedPageCount}/{pdf.PageCount} pages -> {imgRes.ImagePaths.Count} image(s) for the vision model)");
                 }
@@ -1396,7 +1472,7 @@ namespace TensorSharp.Cli
                     if (!model.HasVisionEncoder())
                     {
                         _log.LogError(LogEventIds.CliFailed,
-                            "Image input requires a vision projector: {ImagePath}", imagePath);
+                            "Image input requires a vision projector: {ImagePath}", LogContent.Of(imagePath));
                         Console.Error.WriteLine(
                             "This model has no vision encoder loaded, so the image cannot be analyzed. " +
                             "Re-run with --mmproj <projector.gguf|vision.safetensors>.");
@@ -1409,7 +1485,7 @@ namespace TensorSharp.Cli
                     {
                         if (File.Exists(p))
                             continue;
-                        _log.LogError(LogEventIds.CliFailed, "Image file not found: {ImagePath}", p);
+                        _log.LogError(LogEventIds.CliFailed, "Image file not found: {ImagePath}", LogContent.Of(p));
                         Console.Error.WriteLine($"Image file not found: {p}");
                         return;
                     }
@@ -1427,12 +1503,12 @@ namespace TensorSharp.Cli
             {
                 if (!File.Exists(videoPath))
                 {
-                    _log.LogError(LogEventIds.CliFailed, "Video file not found: {VideoPath}", videoPath);
+                    _log.LogError(LogEventIds.CliFailed, "Video file not found: {VideoPath}", LogContent.Of(videoPath));
                     return;
                 }
                 _log.LogInformation(LogEventIds.UploadReceived,
                     "Video input: {VideoPath} ({Bytes})",
-                    videoPath, LoggingExtensions.FormatBytes(new FileInfo(videoPath).Length));
+                    LogContent.Of(videoPath), LoggingExtensions.FormatBytes(new FileInfo(videoPath).Length));
                 imagePaths = MediaHelper.ExtractVideoFrames(videoPath);
                 _log.LogInformation(LogEventIds.VideoFrameDownsample,
                     "Extracted {FrameCount} frames from video", imagePaths.Count);
@@ -1443,7 +1519,7 @@ namespace TensorSharp.Cli
             {
                 if (!File.Exists(imagePath))
                 {
-                    _log.LogError(LogEventIds.CliFailed, "Image file not found: {ImagePath}", imagePath);
+                    _log.LogError(LogEventIds.CliFailed, "Image file not found: {ImagePath}", LogContent.Of(imagePath));
                     return;
                 }
                 // Every --image in order; imagePath alone would keep only the last.
@@ -1454,7 +1530,7 @@ namespace TensorSharp.Cli
                 {
                     if (!File.Exists(ip))
                     {
-                        _log.LogError(LogEventIds.CliFailed, "Image file not found: {ImagePath}", ip);
+                        _log.LogError(LogEventIds.CliFailed, "Image file not found: {ImagePath}", LogContent.Of(ip));
                         return;
                     }
                 }
@@ -1464,14 +1540,14 @@ namespace TensorSharp.Cli
                         : "What is in this image? Please describe it.";
                 _log.LogInformation(LogEventIds.UploadReceived,
                     "Image input: {ImagePath} ({Bytes})",
-                    imagePath, LoggingExtensions.FormatBytes(new FileInfo(imagePath).Length));
+                    LogContent.Of(imagePath), LoggingExtensions.FormatBytes(new FileInfo(imagePath).Length));
             }
 
             if (audioPath != null)
             {
                 if (!File.Exists(audioPath))
                 {
-                    _log.LogError(LogEventIds.CliFailed, "Audio file not found: {AudioPath}", audioPath);
+                    _log.LogError(LogEventIds.CliFailed, "Audio file not found: {AudioPath}", LogContent.Of(audioPath));
                     return;
                 }
                 // Same gate as the server's parsers: a family with no audio tower
@@ -1487,7 +1563,7 @@ namespace TensorSharp.Cli
                     rawText = "Listen to this audio and describe what you hear.";
                 _log.LogInformation(LogEventIds.UploadReceived,
                     "Audio input: {AudioPath} ({Bytes})",
-                    audioPath, LoggingExtensions.FormatBytes(new FileInfo(audioPath).Length));
+                    LogContent.Of(audioPath), LoggingExtensions.FormatBytes(new FileInfo(audioPath).Length));
             }
 
             // A scanned / image-only PDF was recovered as page images above; attach them as
@@ -1610,8 +1686,9 @@ namespace TensorSharp.Cli
                 _log.LogInformation(LogEventIds.HostConfiguration,
                     "Tokenized prompt: count={TokenCount} first20=[{First20}] last10=[{Last10}]",
                     tokens.Count,
-                    string.Join(", ", tokens.GetRange(0, Math.Min(20, tokens.Count))),
-                    string.Join(", ", tokens.GetRange(Math.Max(0, tokens.Count - 10), Math.Min(10, tokens.Count))));
+                    // Token ids decode straight back to the prompt's text, so they are content.
+                    LogContent.Of(string.Join(", ", tokens.GetRange(0, Math.Min(20, tokens.Count)))),
+                    LogContent.Of(string.Join(", ", tokens.GetRange(Math.Max(0, tokens.Count - 10), Math.Min(10, tokens.Count)))));
                 Console.WriteLine($"Token count: {tokens.Count}");
                 Console.WriteLine($"First 20 tokens: [{string.Join(", ", tokens.GetRange(0, Math.Min(20, tokens.Count)))}]");
                 Console.WriteLine($"Last 10 tokens: [{string.Join(", ", tokens.GetRange(Math.Max(0, tokens.Count - 10), Math.Min(10, tokens.Count)))}]");
@@ -1626,8 +1703,8 @@ namespace TensorSharp.Cli
             _log.LogInformation(LogEventIds.ChatStarted,
                 "cli.inference.start tokensRequested={MaxTokens} thinking={Thinking} tools={ToolCount} input=\"{Input}\" images={ImageCount} audio={AudioCount} video={Video} uploads={Uploads} warmupRuns={WarmupRuns}",
                 maxTokens, enableThinking, tools?.Count ?? 0,
-                LoggingExtensions.SanitizeForLog(rawText), imagePaths?.Count ?? 0,
-                audioPaths?.Count ?? 0, videoPath != null, cliTurnUploads, warmupInferenceRuns);
+                LogContent.Of(LoggingExtensions.SanitizeForLog(rawText)), imagePaths?.Count ?? 0,
+                audioPaths?.Count ?? 0, videoPath != null, LogContent.Of(cliTurnUploads), warmupInferenceRuns);
 
             // --warmup-runs N : run the full inference path N times silently
             // before the real timed pass.  This forces Metal pipeline JIT
@@ -1674,7 +1751,7 @@ namespace TensorSharp.Cli
 
             _log.LogInformation(LogEventIds.ChatCompleted,
                 "cli.inference.complete chars={Chars} preview=\"{Preview}\"",
-                result?.Length ?? 0, LoggingExtensions.SanitizeForLog(result ?? string.Empty, maxLength: 480));
+                result?.Length ?? 0, LogContent.Of(LoggingExtensions.SanitizeForLog(result ?? string.Empty, maxLength: 480)));
 
             if (outputFile != null)
             {
@@ -1703,7 +1780,7 @@ namespace TensorSharp.Cli
         {
             if (!File.Exists(jsonlPath))
             {
-                _log.LogError(LogEventIds.CliFailed, "Multi-turn jsonl not found: {File}", jsonlPath);
+                _log.LogError(LogEventIds.CliFailed, "Multi-turn jsonl not found: {File}", LogContent.Of(jsonlPath));
                 return;
             }
 
@@ -1767,7 +1844,7 @@ namespace TensorSharp.Cli
                 history.Add(new ChatMessage { Role = "user", Content = userMsg, ImagePaths = turnImages });
                 _log.LogInformation(LogEventIds.ChatStarted,
                     "multi-turn turn={Turn}/{TotalTurns} user=\"{User}\"",
-                    turn + 1, lines.Length, LoggingExtensions.SanitizeForLog(userMsg));
+                    turn + 1, lines.Length, LogContent.Of(LoggingExtensions.SanitizeForLog(userMsg)));
 
                 if (forceReset)
                 {
@@ -1815,20 +1892,20 @@ namespace TensorSharp.Cli
                 if (thinking.Length > 0)
                     _log.LogInformation(LogEventIds.ChatCompleted,
                         "multi-turn thinking ({ThinkingChars} chars): {ThinkingPreview}",
-                        thinking.Length, LoggingExtensions.SanitizeForLog(thinking));
+                        thinking.Length, LogContent.Of(LoggingExtensions.SanitizeForLog(thinking)));
 
                 _log.LogInformation(LogEventIds.ChatCompleted,
                     "multi-turn content chars={ContentChars} tokens={Tokens} decodeMs={DecodeMs:F0} tokPerSec={TokensPerSec:F1} preview={ContentPreview}",
                     content.Length, generatedTokens.Count, decodeMs,
                     generatedTokens.Count / (decodeMs / 1000.0),
-                    LoggingExtensions.SanitizeForLog(content, maxLength: 480));
+                    LogContent.Of(LoggingExtensions.SanitizeForLog(content, maxLength: 480)));
 
                 bool hasUnused = rawOutput.Contains("<unused");
                 if (hasUnused)
                 {
                     _log.LogError(LogEventIds.ChatFailed,
                         "multi-turn output contains <unused> tokens; first 500 chars: {RawPreview}",
-                        rawOutput.Substring(0, Math.Min(500, rawOutput.Length)));
+                        LogContent.Of(rawOutput.Substring(0, Math.Min(500, rawOutput.Length))));
                     break;
                 }
 
@@ -1854,7 +1931,7 @@ namespace TensorSharp.Cli
         {
             if (!File.Exists(inputJsonlPath))
             {
-                _log.LogError(LogEventIds.CliFailed, "JSONL file not found: {File}", inputJsonlPath);
+                _log.LogError(LogEventIds.CliFailed, "JSONL file not found: {File}", LogContent.Of(inputJsonlPath));
                 return;
             }
 
@@ -1869,7 +1946,7 @@ namespace TensorSharp.Cli
 
             _log.LogInformation(LogEventIds.CliBatchProgress,
                 "jsonl batch starting: total={Total} source={Source}",
-                total, inputJsonlPath);
+                total, LogContent.Of(inputJsonlPath));
 
             var totalSw = Stopwatch.StartNew();
 
@@ -1928,13 +2005,13 @@ namespace TensorSharp.Cli
 
                     _log.LogDebug(LogEventIds.ChatStarted,
                         "jsonl batch [{RequestId}] rendered prompt thinking={Thinking} preview={Preview}",
-                        id, reqThinking, LoggingExtensions.SanitizeForLog(rendered, maxLength: 320));
+                        id, reqThinking, LogContent.Of(LoggingExtensions.SanitizeForLog(rendered, maxLength: 320)));
 
                     var inputTokens = model.Tokenizer.Encode(rendered, addSpecial: true);
                     var sharedPrefix = ComputeSharedPrefix(model, messages, reqThinking);
                     _log.LogDebug(LogEventIds.ChatStarted,
                         "jsonl batch [{RequestId}] inputTokens={TokenCount} first20=[{First20}]",
-                        id, inputTokens.Count, string.Join(", ", inputTokens.Take(20)));
+                        id, inputTokens.Count, LogContent.Of(string.Join(", ", inputTokens.Take(20))));
 
                     var cfg = sampling ?? SamplingConfig.Greedy;
                     string requestId = $"cli-batch-{Guid.NewGuid():N}";
@@ -1967,7 +2044,7 @@ namespace TensorSharp.Cli
                     _log.LogInformation(LogEventIds.ChatCompleted,
                         "jsonl batch [{RequestId}] tokens={Tokens} tokPerSec={TokensPerSec:F1} totalMs={TotalMs:F1} output={OutputPreview}",
                         id, generatedTokens.Count, tokPerSec, totalMs,
-                        LoggingExtensions.SanitizeForLog(output, maxLength: 320));
+                        LogContent.Of(LoggingExtensions.SanitizeForLog(output, maxLength: 320)));
 
                     var resultObj = new Dictionary<string, object>
                     {
@@ -2397,10 +2474,35 @@ namespace TensorSharp.Cli
                 GenerateAudio = generateAudio,
                 Mode = videoMode,
             };
+            // The clip's generate_video span and duration metric, recorded as the server records
+            // its clips: the phases, stages and denoising steps come from the model's progress
+            // reports, and saving is the clip's video.export child. Nothing is current in the
+            // CLI, so the clip is the root of its own trace. The helper's one log line per phase
+            // is for following a long clip in an exported log; with logs not exported it is left
+            // out, so the console reads as it always has.
+            // Named after the model file, as the server names its clips and the CLI its chat
+            // requests, so a dashboard groups the CLI's and the server's clips of one model.
+            using var clip = TensorSharp.Models.Video.VideoClipTelemetry.Start(
+                TensorSharp.Runtime.Telemetry.GenAiRequestTelemetry.ModelNameFromPath(
+                    model is ModelBase loaded && loaded.ModelFilePaths is { Count: > 0 } files ? files[0] : null),
+                CliTelemetry.BackendOf(model), p, prompt);
             var sw = Stopwatch.StartNew();
-            var video = model.GenerateVideo(prompt, p);
+            var video = TensorSharp.Models.Video.VideoGenerationTelemetry.Generate(model, prompt, p, clip,
+                TensorSharp.Runtime.Telemetry.TensorSharpTelemetry.LogsExported ? _log : null);
+            // Ends when this method returns, once the frames and the WAV sidecar are written.
+            using var export = CliVideoExport.Start(clip, outputPath, video.Frames?.Length ?? 0);
             sw.Stop();
-            SaveGeneratedVideo(video, outputPath, sw.Elapsed);
+            try
+            {
+                export.Saved(SaveGeneratedVideo(video, outputPath, sw.Elapsed));
+            }
+            catch (Exception ex)
+            {
+                // A clip that could not be saved did not complete: record it as the server does,
+                // then let the failure take its usual course.
+                clip.MarkFailed(ex);
+                throw;
+            }
         }
 
         /// <summary>Why a clip could not be saved to <paramref name="outputPath"/> on this
@@ -2414,8 +2516,9 @@ namespace TensorSharp.Cli
 
         /// <summary>Write a generated clip to <paramref name="outputPath"/>: the soundtrack's WAV
         /// first, so an MP4 export that fails still leaves it, then the frames as an MP4, or as
-        /// PNG files when the path ends in .png.</summary>
-        internal static void SaveGeneratedVideo(TensorSharp.Models.WanVideo.GeneratedVideo video, string outputPath, TimeSpan elapsed)
+        /// PNG files when the path ends in .png. Returns the codec written ("png" for PNG files),
+        /// which the caller reports on the clip's video.export span.</summary>
+        internal static string SaveGeneratedVideo(TensorSharp.Models.WanVideo.GeneratedVideo video, string outputPath, TimeSpan elapsed)
         {
             // Keep the original PCM alongside the encoded MP4, including when
             // the platform's video writer cannot mux the soundtrack.
@@ -2446,6 +2549,7 @@ namespace TensorSharp.Cli
             }
             Console.WriteLine($"Saved {video.Frames[0].Width}x{video.Frames[0].Height} x {video.Frames.Length} frames " +
                 $"({codec}, {video.Fps} fps, seed {video.Seed}) to {outputPath} in {elapsed.TotalSeconds:F1}s");
+            return codec;
         }
 
         static void RunDiffusion(DiffusionGemmaModel model, string rawText, string systemPrompt,
@@ -2589,7 +2693,8 @@ namespace TensorSharp.Cli
                 {
                     _log.LogWarning(LogEventIds.SkillToolInvoked,
                         "cli.skills.tool round={Round} tool={Tool} skill={SkillId} path={Path} ok={Ok} bytes={Bytes}",
-                        round, call.Name ?? "-", "-", "-", false, 0);
+                        // A name no tool declares is whatever the model wrote, so it is content.
+                        round, LogContent.Of(call.Name ?? "-"), "-", "-", false, 0);
                     Console.Error.WriteLine($"[tool call] {call.Name} (no such tool)");
                     roundResults.Add((
                         SkillTools.DescribeUnknownTool(
@@ -2604,7 +2709,8 @@ namespace TensorSharp.Cli
                     var toolResult = SkillTools.Execute(call, skillContext);
                     _log.LogInformation(LogEventIds.SkillToolInvoked,
                         "cli.skills.tool round={Round} tool={Tool} skill={SkillId} path={Path} ok={Ok} bytes={Bytes}",
-                        round, call.Name, toolResult.SkillId ?? "-", toolResult.ResourcePath ?? "-",
+                        // The resource path is the model's argument (a file it chose).
+                        round, call.Name, toolResult.SkillId ?? "-", LogContent.Of(toolResult.ResourcePath ?? "-"),
                         toolResult.Ok, toolResult.Content?.Length ?? 0);
                     Console.Error.WriteLine(
                         $"[skill] {call.Name} {toolResult.SkillId ?? "?"} {toolResult.ResourcePath ?? string.Empty}"
@@ -3340,8 +3446,19 @@ namespace TensorSharp.Cli
                 _log.LogInformation(LogEventIds.HostConfiguration,
                     "cli.inference.warmup run={Run}/{Total} decodeTokens={DecodeTokens}",
                     w + 1, runs, warmupDecodeTokens);
-                using (FirstTokenLogitsDump.Suppress())
-                    runOnce(warmupDecodeTokens);
+                // Tagged as the host's own warm-up (tensorsharp.origin=warmup), so these passes stay out
+                // of a dashboard's latency and token figures, like the prefix-cache warm-up.
+                string outerOrigin = TensorSharp.Runtime.Telemetry.TelemetryContext.Origin;
+                TensorSharp.Runtime.Telemetry.TelemetryContext.Origin = TensorSharp.Runtime.Telemetry.TelemetryAttributes.OriginWarmup;
+                try
+                {
+                    using (FirstTokenLogitsDump.Suppress())
+                        runOnce(warmupDecodeTokens);
+                }
+                finally
+                {
+                    TensorSharp.Runtime.Telemetry.TelemetryContext.Origin = outerOrigin;
+                }
                 inference.StartNewConversation();
                 model.ResetForwardTiming();
             }

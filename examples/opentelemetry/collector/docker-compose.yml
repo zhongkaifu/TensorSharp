@@ -1,0 +1,78 @@
+# Copyright (c) Zhongkai Fu. All rights reserved.
+# https://github.com/zhongkaifu/TensorSharp
+#
+# This file is part of TensorSharp.
+#
+# TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+#
+# A local "bring your own collector" stack: TensorSharp exports OTLP to an OpenTelemetry Collector,
+# which sends traces to Jaeger, metrics to Prometheus (shown in Grafana) and logs to its own
+# console.
+#
+#   docker compose up -d
+#   # run TensorSharp with OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+#
+#   Jaeger      http://localhost:16686
+#   Prometheus  http://localhost:9090
+#   Grafana     http://localhost:3000   (admin / admin on first login, then Grafana asks for a new password)
+#   Logs        docker compose logs -f otel-collector
+#
+# This stack and the Aspire dashboard (../aspire) both publish ports 4317 and 4318; run one at a
+# time. Every port is bound to loopback, because none of these services authenticates OTLP or
+# its UI here. Nothing is meant to persist: Jaeger keeps traces in memory, and
+# `docker compose down -v` also removes any volumes the Prometheus and Grafana images create.
+#
+# Image tags are pinned to releases checked on 2026-11-06 against the GitHub release pages and
+# Docker Hub:
+#   otel/opentelemetry-collector-contrib  0.164.0  (opentelemetry-collector-releases v0.164.0, 2026-10-26)
+#   jaegertracing/jaeger                  2.22.0   (jaeger v2.22.0, 2026-10-06)
+#   prom/prometheus                       v3.15.1  (prometheus v3.15.1, 2026-10-21)
+#   grafana/grafana                       13.3.0   (grafana v13.3.0, 2026-10-27)
+
+name: tensorsharp-otel
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.164.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "127.0.0.1:4317:4317"   # OTLP/gRPC  (TensorSharp's default protocol)
+      - "127.0.0.1:4318:4318"   # OTLP/HTTP  (OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf)
+    # memory_limiter in collector.yaml is sized for this limit.
+    mem_limit: 1g
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  jaeger:
+    # Jaeger v2 accepts OTLP natively; the image listens on all interfaces
+    # (JAEGER_LISTEN_HOST=0.0.0.0) and stores traces in memory by default.
+    # Its OTLP ports are reachable only inside the compose network, from the collector.
+    image: jaegertracing/jaeger:2.22.0
+    ports:
+      - "127.0.0.1:16686:16686"   # Jaeger UI and query API
+    restart: unless-stopped
+
+  prometheus:
+    # Reads /etc/prometheus/prometheus.yml by default.
+    image: prom/prometheus:v3.15.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.3.0
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+      - jaeger
+    restart: unless-stopped

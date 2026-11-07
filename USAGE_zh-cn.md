@@ -500,6 +500,7 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--log-dir <path>` | JSON-line 文件日志的写入目录（默认：`<binDir>/logs`） |
 | `--log-file <0\|1>` | 关闭（`0`）或开启（`1`）文件日志（默认：开启） |
 | `--log-console <0\|1>` | 关闭（`0`）或开启（`1`）控制台日志（默认：开启） |
+| `--otel-endpoint <url>` | 通过 OTLP 把 OpenTelemetry trace、指标和日志导出到该 collector 或看板。它设置 `OTEL_EXPORTER_OTLP_ENDPOINT`，覆盖继承来的值；其他遥测设置都是环境变量。默认：关闭。见[遥测（OpenTelemetry）](#遥测opentelemetry)。 |
 
 CLI 的配套投影器查找只认 `--mmproj` 一行列出的那些文件名，而当前模型仓库经常使用不同名称。多模态运行请用 `--mmproj` 显式传入已下载文件；`TensorSharp.Server.Host` 从不自动检测投影器。
 
@@ -784,6 +785,7 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `--draft-model <path>` | 投机解码草稿模型，适用于所有以独立文件发布的草稿器：DeepSeek V4 的 DSpark 支持 GGUF（见 [DeepSeek V4](docs/models/deepseek4_zh-cn.md#dspark-投机解码)）、Muse-Glimmer 的 DFlash 与 Qwen 3.8 的 DFlash2 块级草稿器（见 [Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md)）、Gemma 4 的 `gemma4-assistant` 逐 token 草稿头，以及 Qwen 3.8 Flash Next 的共享 MTP 头（仅 GGML 后端；只对从位置 0 开始 prefill 的单序列请求起草——见[它的卡片](docs/models/qwen38-flash-next_zh-cn.md#共享-mtp-头的投机解码)）。DeepSeek V4.1 只在 `ggml_cuda` / `ggml_cpu` 上接受 `deepseek41-dspark` 草稿器——实验性，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证。文件自己的 `general.architecture` 决定它如何加载——操作者从不需要挑选机制；在这里给出文件本身就会启用投机，不需要再加 `--spec`，显式的 `--no-spec` 则会否决它。草稿的隐藏维度必须与目标一致（例如 12B 目标配 12B 草稿，而非 26B-A4B 草稿）；草稿不匹配或不完整会在启动时立即失败并给出修复提示。Qwen 3.6、Qwen 3.8 27B、GLM 5.2 与 GLM-5.3 将 NextN 块内嵌在主干 GGUF 中，不需要这个参数——它们用 `--spec`。块级草稿器每步起草一整块 token，主干用一次批量前向验证，因此贪心输出保持不变（浮点近平局处除外，见[贪心一致性的实际含义](docs/speculative_decoding.md#what-greedy-parity-delivers)）。DeepSeek V4 的 DSpark 块级起草需要 `cuda` 或 `ggml_cuda` 后端；DFlash / DFlash2 草稿器（Muse-Glimmer、Qwen 3.8）每一步都是一张融合的 GGML 图，可在 CUDA、Vulkan 与 Metal 上运行（见[运行位置](docs/speculative_decoding.md#where-it-runs)），但只用一张 GPU：在 `--tp N` > 1 下 DFlash / DFlash2 草稿器无法启用，因此显式给出的草稿器会让服务端启动失败（退出码 2），并提示去掉 `--draft-model`。服务端的每一行验证都用该请求自己的采样器（含惩罚项）。但在带惩罚的采样器下有一个注意点：块级草稿器一次提出整块，验证时施加的重复/存在/频率惩罚不会作用于提议本身，因此随着被惩罚的历史变长，接受率会下降；逐 token 草稿头没有这个问题，它的草稿按同一段历史施加惩罚。环境变量：`TS_SPEC_DRAFT_MODEL`。**Nemotron-H 会拒绝：**显式的 `--draft-model`（例如 Nemotron 3.5 Lightning 的 DSpark GGUF）会让服务器启动失败，报出模型给出的原因并提示去掉该参数；`--spec`/`--spec-type ngram` 也只提供普通解码并打印一次警告，因为该主干的 verify 与 decode 内核结果不一致，投机会改变输出（见 [投机解码](docs/speculative_decoding.md#nemotron-h-refuses-speculation)）。 |
 | `--paged-kv` / `--no-paged-kv` / `--paged-kv-*` | **已移除，启动时（包括作为配置文件键时）直接拒绝**，与 CLI 相同（见上面的 CLI 表）：它们配置的独立分页 KV 缓存已删除。跨请求的提示词复用由 radix 前缀缓存提供（`--no-prefix-cache`）。 |
 | `--redis-url <url>` | Redis 连接串（例如 `localhost:6379`），用于 Responses API 存储。它设置 `TS_RESPONSES_STORE_REDIS_URL`，把该存储移到 Redis（见 [Redis 支撑的共享状态](#redis-支撑的共享状态)）。`--help` 把它列在“Responses API store”一节；已设置的 `TS_RESPONSES_STORE_REDIS_URL` 优先，否则使用内存存储。启动日志打印 `Redis configured via --redis-url: the Responses API store uses <url>.` |
+| `--otel-endpoint <url>` | 通过 OTLP 把 OpenTelemetry trace、指标和日志导出到该 collector 或看板：绝对的 `http://` 或 `https://` URL，默认使用 gRPC（通常为 4317 端口；`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` 时为 4318）。它设置 `OTEL_EXPORTER_OTLP_ENDPOINT`，覆盖继承来的值；其他遥测设置都是环境变量，`--config` 文件可通过其 `"environment"` 对象设置。默认：关闭。见[遥测（OpenTelemetry）](#遥测opentelemetry)。 |
 
 请求 JSON 中的字段（如 `temperature`、`top_p`、`top_k`、`min_p`、
 `repeat_penalty`、`repeat_last_n`、`presence_penalty`、`frequency_penalty`、`seed`、
@@ -845,6 +847,7 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 | `TENSORSHARP_LOG_LEVEL` | 控制台与文件日志的最低输出级别：`Trace`、`Debug`、`Information`、`Warning`、`Error`、`Critical`（默认：`Information`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_DIR` | JSON-line 文件日志的写入目录（默认：`<binDir>/logs`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_FILE` | 设为 `0` 可关闭文件日志，仅保留控制台输出（默认：开启）。`TensorSharp.Cli` 同样识别该变量。 |
+| `OTEL_*`、`APPLICATIONINSIGHTS_CONNECTION_STRING`、`TENSORSHARP_OTEL*`、`TENSORSHARP_AZURE_MONITOR_AAD` | trace、指标和日志的 OpenTelemetry 导出，默认关闭；见[遥测（OpenTelemetry）](#遥测opentelemetry)。`TensorSharp.Cli` 同样识别这些变量。 |
 | `TENSORSHARP_UPLOAD_DIR` | 上传媒体与抽取出的视频帧的存放目录（默认：`<binDir>/uploads`）；只读或固定版本的部署可将其指向应用目录之外。仅服务端识别。 |
 | `TS_UPLOAD_MAX_MB` / `TS_UPLOAD_QUOTA_MB` / `TS_UPLOAD_TTL_HOURS` | 未传 `--upload-max-mb` / `--upload-quota-mb` / `--upload-ttl-hours` 时的上传单文件上限（默认 `500`）、目录配额（默认关闭）与文件保留时长（默认关闭）。仅服务端识别。 |
 | `TENSORSHARP_PREFIX_CACHE_DIR` | 持久化共享前缀 checkpoint 的根目录（默认：`<binDir>/prefix-cache`，每个模型一个子目录）。仅服务端识别；`--no-prefix-cache` 会关闭持久化。 |
@@ -2173,6 +2176,23 @@ CLI 没有子智能体。参见 [Web 应用](#web-应用)一节中的子智能�
 | 文件日志开关 | 启用 | `TENSORSHARP_LOG_FILE=0` 关闭 | `--log-file 0\|1`（仅 CLI） |
 | 控制台日志开关 | 启用 | — | `--log-console 0\|1`（仅 CLI） |
 
+#### 遥测（OpenTelemetry，服务端 + CLI）
+
+各变量的具体作用见[遥测（OpenTelemetry）](#遥测opentelemetry)。
+
+| 功能 | 默认 | 环境变量 | CLI 等价参数 |
+|---|---|---|---|
+| 导出 trace、指标和日志 | **关闭** | 以下任意一项：**`OTEL_EXPORTER_OTLP_ENDPOINT`**、**`OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT`**、**`APPLICATIONINSIGHTS_CONNECTION_STRING`**、**`TENSORSHARP_OTEL=1`**，或列出 `otlp` / `console` 的 `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` | `--otel-endpoint <url>`（CLI 与服务端；设置 `OTEL_EXPORTER_OTLP_ENDPOINT`） |
+| 强制关闭 | — | `OTEL_SDK_DISABLED=true` | — |
+| OTLP 协议、请求头、超时 | `grpc`、无、`10000` 毫秒 | `OTEL_EXPORTER_OTLP_PROTOCOL`、`OTEL_EXPORTER_OTLP_HEADERS`、`OTEL_EXPORTER_OTLP_TIMEOUT`；按信号设置用 `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_{HEADERS,PROTOCOL,TIMEOUT}` | — |
+| 单种信号的去处 | 设置了端点（或 `TENSORSHARP_OTEL`）时走 OTLP；设置了连接串时另发 Application Insights | `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=otlp,console,none` | — |
+| 服务名与 resource 属性 | `tensorsharp-server` / `tensorsharp-cli`；`service.instance.id` = `<机器名>:<pid>` | `OTEL_SERVICE_NAME`、`OTEL_RESOURCE_ATTRIBUTES` | — |
+| trace 采样 | 保留每条 trace | `OTEL_TRACES_SAMPLER`、`OTEL_TRACES_SAMPLER_ARG`（Application Insights 接收 trace 时映射到它的采样器） | — |
+| 用 Entra ID 连接 Application Insights | 使用连接串中的密钥 | `TENSORSHARP_AZURE_MONITOR_AAD=1` | — |
+| 导出日志的最低级别 | 与控制台 / 文件日志相同 | `TENSORSHARP_OTEL_LOG_LEVEL`；服务端也可用 `Logging__OpenTelemetry__LogLevel__Default` | — |
+| 导出数据中包含提示词、输出等内容 | **关闭**（脱敏） | **`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`** | — |
+| 每个引擎步骤一个 span | 关闭 | **`TENSORSHARP_OTEL_TRACE_STEPS=1`** | — |
+
 #### 原生构建（仅编译期）
 
 下列变量由 `build-linux.sh` / `build-windows.ps1` / `dotnet build` 时自动构建 `TensorSharp.GGML.Native` 的脚本读取，不在运行时生效。
@@ -2255,6 +2275,354 @@ Information 级别日志。只需对日志文件做一次 grep，即可获得紧
 - **OpenAI**（`POST /v1/chat/completions`） —— `usage` 块携带 `prompt_tokens_details.cached_tokens`，与 OpenAI 标准扩展一致，现有 SDK 可直接读取。
 
 Web UI 中每条助手消息下方的统计行也会展示命中率（例如 `187 tokens · 2.1s · 87.2 tok/s · KV 420/512 (82%)`）。
+
+## 遥测（OpenTelemetry）
+
+`TensorSharp.Server.Host` 与 `TensorSharp.Cli` 可以用 OpenTelemetry 导出 trace、指标和日志：通过
+OTLP 发往任意 collector 或看板（Aspire 看板、Jaeger、Grafana、OpenTelemetry Collector），直接发往
+Azure Application Insights，或同时发往两者。遥测默认关闭。什么都不设置时不会启动 OpenTelemetry SDK，
+TensorSharp 自身的埋点也因为没有监听者而不记录任何数据。现成的后端与 Application Insights 查询见
+[`examples/opentelemetry/`](examples/opentelemetry/README.md)（英文）。
+
+### 开启方式
+
+只要设置了下列任意一项，遥测即开启：
+
+| 设置 | 导出内容 |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT=<url>`，或 `--otel-endpoint <url>` | trace、指标和日志都通过 OTLP 发往该端点 |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT=<url>` | 对应的那一种信号通过 OTLP 发往它自己的端点 |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING=<连接串>` | 每种已开启的信号都在进程内额外发往 Application Insights |
+| `TENSORSHARP_OTEL=1` | 三种信号都通过 OTLP 发往默认端点：`grpc` 为 `http://localhost:4317`，`http/protobuf` 为 `http://localhost:4318` |
+| `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` 中列出 `otlp` 或 `console` | 对应信号发往它列出的去处 |
+
+无论其他变量如何设置，`OTEL_SDK_DISABLED=true` 都会让遥测保持关闭。
+
+```bash
+# 服务端：导出到本机上的 collector 或看板
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_cuda
+
+# 改用命令行参数，CLI 同样支持
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --otel-endpoint http://localhost:4317
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --input prompt.txt --otel-endpoint http://localhost:4317
+```
+
+`--otel-endpoint <url>`（或 `--otel-endpoint=<url>`）是两个宿主上唯一的遥测参数。它要求绝对的
+`http://` 或 `https://` URL，多次给出时以最后一次为准；它会设置 `OTEL_EXPORTER_OTLP_ENDPOINT`，覆盖从
+环境继承来的值。其他设置都是环境变量。[配置文件](config/README.md#environment-defaults)（英文）两者都能
+携带：参数写成 `"otel-endpoint"` 键，变量写进 `"environment"` 对象，其中进程环境里已有的值优先于文件中的值：
+
+```json
+{
+  "model": "./models/model.gguf",
+  "otel-endpoint": "http://collector:4317",
+  "environment": {
+    "OTEL_SERVICE_NAME": "tensorsharp-gpu01",
+    "OTEL_RESOURCE_ATTRIBUTES": "deployment.environment=staging"
+  }
+}
+```
+
+共享的或提交到仓库的配置文件中不要放 OTLP API 密钥和连接串。
+
+TensorSharp 无法使用的值会让两个宿主在启动前就停止，输出 `Configuration error: ...` 并以退出码 `1`
+退出：不是绝对 `http://` / `https://` URL 的端点（或没有给出 URL 的 `--otel-endpoint`），或遥测开启时
+无法识别的 `TENSORSHARP_OTEL_LOG_LEVEL`。协议和按信号设置的各项只在确实有信号通过 OTLP 导出时才检查；此时
+`grpc` 与 `http/protobuf` 以外的协议、不是正整数毫秒的按信号超时同样是配置错误。`OTEL_*` 变量由本机上所有
+OpenTelemetry 程序共用，因此为其他程序设置的值，在 TensorSharp 的遥测关闭或只发往 Application Insights 时，
+绝不会阻止它启动。TensorSharp 不认识的导出器名称，或 Application Insights
+导出器无法应用的采样器，会被忽略，并在一行 `Telemetry: <警告>` 中报告。
+
+### 启动日志行
+
+两个宿主都会紧接在日志初始化那一行之后，输出一条以 `Telemetry: ` 开头的 Information 日志，列出每种信号
+的去处、目标地址、服务名、是否开启内容捕获，以及 trace 采样器：
+
+```text
+Telemetry: traces(otlp) metrics(otlp) logs(otlp) -> OTLP http://localhost:4317 (grpc); service tensorsharp-server; content capture off; sampler parentbased_always_on
+Telemetry: traces(otlp,azuremonitor) metrics(otlp,azuremonitor) logs(otlp,azuremonitor) -> OTLP http://localhost:4317 (grpc), Azure Monitor; service tensorsharp-server; content capture off; sampler azuremonitor fixed_percentage(1)
+Telemetry: off (no OTLP endpoint, APPLICATIONINSIGHTS_CONNECTION_STRING or TENSORSHARP_OTEL set)
+```
+
+这一行从不显示 OTLP 请求头或连接串，并会去掉端点中的 `user:password@` 部分。某种信号自己的 OTLP 端点或协议
+显示在括号内、通用协议之后：`OTLP http://localhost:4317 (grpc; metrics: http/protobuf)`，或
+`OTLP http://collector:4317 (grpc; traces: http://tempo:4318/v1/traces http/protobuf)`。
+`Azure Monitor (Entra ID)`、`content capture ON` 和 `engine step spans ON` 表示下文对应的可选项已开启。
+
+### 配置项
+
+开关类变量接受 `1`、`true`、`yes` 或 `on`。
+
+| 变量 | 作用 |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | 所有信号的 OTLP 端点。`grpc` 通常使用 4317 端口；`http/protobuf` 通常使用 4318 端口，且 SDK 会追加 `/v1/traces`、`/v1/metrics` 和 `/v1/logs`。 |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc`（默认）或 `http/protobuf`。有信号通过 OTLP 导出时，其他取值（包括 `http/json`）都是配置错误；否则不读取该变量。 |
+| `OTEL_EXPORTER_OTLP_HEADERS` | 每次 OTLP 导出附带的 `key=value,...` 请求头，例如 Aspire 看板需要的 `x-otlp-api-key=<key>`。 |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | 导出超时（毫秒），由 SDK 读取（默认 `10000`）。 |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT` | 该信号的 OTLP 端点，按原样使用，因此 `http/protobuf` 的 URL 要包含路径（`http://collector:4318/v1/traces`）。没有自己端点的信号不受影响：既没有通用端点也没有 `TENSORSHARP_OTEL` 时，它们保持关闭。 |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_HEADERS` | 替换该信号的 `OTEL_EXPORTER_OTLP_HEADERS`。与下面两项一样，只在该信号通过 OTLP 导出时读取。 |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_PROTOCOL` | 该信号的协议，`grpc` 或 `http/protobuf`；其他取值是配置错误。 |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_TIMEOUT` | 该信号的导出超时，正整数毫秒；其他取值是配置错误。 |
+| `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` | 该信号除 Application Insights 之外的去处，逗号分隔：`otlp`、`console`（标准输出）或 `none`。设置后它取代默认选择：`otlp` 发往已配置的端点（或默认端点），`none` 让该信号对所有去处关闭，包括 Application Insights。未设置时，只要设置了通用端点、该信号自己的端点或 `TENSORSHARP_OTEL`，该信号就走 OTLP。无法识别的名称会被忽略并给出警告。这些变量由 TensorSharp 自己读取，.NET SDK 并不读取它们。 |
+| `OTEL_SDK_DISABLED` | `true`：无论其他设置如何都关闭（`Telemetry: off (OTEL_SDK_DISABLED=true)`）。 |
+| `OTEL_SERVICE_NAME` | 服务名。默认 `tensorsharp-server`，CLI 为 `tensorsharp-cli`。 |
+| `OTEL_RESOURCE_ATTRIBUTES` | `key=value,...` 形式的 resource 属性，优先于 TensorSharp 自带的属性：`service.version`（TensorSharp 版本）、`service.instance.id`（`<机器名>:<pid>`）、`host.name`、`process.pid`，以及取自 `TENSORSHARP_TP_NODE_ID` / `TENSORSHARP_TP_DEGREE` 的 `tensorsharp.tp.node_id` / `tensorsharp.tp.degree`。 |
+| `OTEL_TRACES_SAMPLER`、`OTEL_TRACES_SAMPLER_ARG` | trace 采样。默认 `parentbased_always_on`：保留每条 trace，并遵循客户端 `traceparent` 的采样决定。不接 Application Insights 时由 SDK 按标准取值处理（`traceidratio` 配合 `OTEL_TRACES_SAMPLER_ARG=0.1` 保留 10%）。Application Insights 接收 trace 时，该值会映射到它的采样器上，见 [Application Insights](#application-insights)。 |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | Application Insights 连接串。每种已开启的信号都会额外发往那里；单独设置它就会开启全部三种信号。 |
+| `TENSORSHARP_AZURE_MONITOR_AAD` | 开关：用 Entra ID（`DefaultAzureCredential`）代替连接串中的密钥向 Application Insights 认证。仍然需要连接串；没有连接串时它不起作用。 |
+| `TENSORSHARP_OTEL` | 开关：开启遥测，OTLP 发往默认端点，适合本机上的 collector 或看板。 |
+| `TENSORSHARP_OTEL_LOG_LEVEL` | 导出日志的最低级别：`Trace`、`Debug`、`Information`、`Warning`、`Error`、`Critical` 或 `None`。默认与控制台和文件日志相同（`TENSORSHARP_LOG_LEVEL`，CLI 上为 `--log-level`）。它不影响控制台和文件日志。`Microsoft.AspNetCore` 类别在导出中保持 `Warning`，与控制台一致。 |
+| `Logging__OpenTelemetry__LogLevel__Default` | 仅服务端：设置同一级别的 ASP.NET Core 配置键（也可写在 `appsettings.json` 中；按类别设置时用 `Logging__OpenTelemetry__LogLevel__<类别>`）。它与 `TENSORSHARP_OTEL_LOG_LEVEL` 二选一，不要同时设置。 |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | `true`：同时导出内容（提示词、模型输出、工具参数与结果、命令、上传文件名与路径）。默认关闭；见[哪些内容不会导出](#哪些内容不会导出)。 |
+| `TENSORSHARP_OTEL_TRACE_STEPS` | 开关：每个引擎步骤生成一个 `inference.step` span，用于剖析单次运行。数据量大，生产环境请保持关闭。 |
+
+OpenTelemetry .NET SDK 自己读取的其他标准变量，例如 `OTEL_BSP_SCHEDULE_DELAY`、
+`OTEL_BLRP_SCHEDULE_DELAY` 和 `OTEL_METRIC_EXPORT_INTERVAL`，按 OpenTelemetry 文档的说明生效。
+例外是 Application Insights：无论 `OTEL_METRIC_EXPORT_INTERVAL` 设为多少，它都每 60 秒接收一次指标
+（其导出器固定了这个间隔）。无论哪种方式，服务端和 CLI 在停止时、模型仍处于加载状态时都会再导出一次指标，
+因此运行时间很短也能报告各项 gauge。服务端在停止提供服务时执行这次导出，连同已收集的 span 和日志一起，总共最多
+等待 5 秒；之后它继续释放模型，较慢或无法连接的导出器在后台完成导出或超时，导出器被释放时还会再刷出一次。
+CLI 在运行结束时执行这次导出，即单次模式结束或交互式会话退出时，同样最多等待 5 秒；交互式重置（新的系统提示词、
+更换技能）或 `/model` 切换会跳过它，因此提示符从不等待导出。
+
+### 记录哪些 trace
+
+一次聊天请求（`POST /v1/chat/completions`、`/v1/responses`、Ollama 的 `/api/chat/ollama`，或 Web UI
+的 `/api/chat`）是一条 trace：
+
+```text
+POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、tensorsharp.protocol、gen_ai.response.id
+└─ chat <model>                gen_ai.request.model、gen_ai.request.* 采样参数、gen_ai.usage.input_tokens /
+   │                           output_tokens / cache_read.input_tokens、gen_ai.response.finish_reasons、
+   │                           tensorsharp.ttft_ms、tensorsharp.backend、tensorsharp.outcome
+   ├─ prompt.render            套用聊天模板并分词，直到请求进入引擎
+   ├─ inference.queue          等待调度器
+   ├─ inference.prefill        直到生成第一个 token；tensorsharp.compute.prefill_ms
+   └─ inference.decode         其余部分；tensorsharp.compute.decode_ms
+```
+
+- `<model>` 是不含目录和扩展名的模型文件名。`tensorsharp.request_id` 就是服务端返回的
+  `X-TensorSharp-Request-Id`（取前 64 个字符），因此凭客户端给出的 id 即可找到对应的 trace。
+  `gen_ai.response.id` 位于 OpenAI 路由的服务端 span 上：`chatcmpl-...` 总是设置；`resp_...` 只在
+  `/v1/responses` 请求带 `"store": false`（或开启了内容捕获）时设置，因为凭已存储响应的 id 就能读回整个响应。
+  客户端若发送 W3C `traceparent` 请求头，该请求会落在客户端自己的 trace 中。
+- `inference.*` span 记录的是墙钟时间。连续批处理下它会与其他请求重叠，因此
+  `tensorsharp.compute.prefill_ms` 和 `tensorsharp.compute.decode_ms` 给出本请求自己占用的引擎时间。
+- Ollama 的 `/api/generate` 为 `text_completion <model>`。嵌入请求（`/v1/embeddings`、`/api/embed`）为
+  `embeddings <model>`，带 `tensorsharp.embedding.inputs`。
+- DiffusionGemma 的聊天 span 下有 `prompt.render` 和一个 `diffusion.denoise` span，每次预览对应一个
+  `preview` 事件。Jev 请求（`POST /v1/systemone`）是一个 `chat <model>` span。
+- Skills 与代码执行回合每轮记录一个聊天 span（`tensorsharp.round`）；TensorSharp 执行的每次工具调用记录
+  一个 `execute_tool <tool>` span（`gen_ai.tool.name`、`gen_ai.tool.call.id`、`tensorsharp.outcome`），
+  工具运行命令时其下还有一个 `codeexec.run` span（`tensorsharp.codeexec.shell`、`.sandbox`、
+  `.exit_code`、`.timed_out`、`.output_bytes`）。
+- 模型加载为 `model.load`（`tensorsharp.model.file`、`gen_ai.request.model`、`tensorsharp.backend`、
+  `tensorsharp.model.architecture`、大于 1 时的张量并行与按层切分度数，以及结果），启动时的加载也包括在内；
+  卸载为 `model.unload`。
+- TensorSharp 自己发起的模型调用带有 `tensorsharp.internal=true` 和 `tensorsharp.origin`：启动预热为
+  `prefix-cache-warmup`，CLI 的 `--warmup-runs` 预热轮为 `warmup`，知识库为 `knowledge-rerank` 和
+  `knowledge-media-extract`。面向客户端的看板应把它们排除在外。
+- Qwen-Image-2.1 请求为 `generate_image <model>`，带 `tensorsharp.image.mode`（`generate` 或 `edit`）和结果。
+- `/health` 与 Web UI 对 `/api/queue/status` 的轮询不生成 span，也不计入 ASP.NET Core 的
+  `http.server.request.duration` 指标。遥测运行期间，进程通过 `HttpClient` 发出的调用记为客户端 span。
+
+请求、工具、模型加载与媒体 span 结束时都带有 `tensorsharp.outcome`：`completed`；`cancelled`（客户端
+断开或请求被停止，不算错误）；`refused`（开始工作前就被拒绝，`error.type` 为一个简短代码，例如
+`context_overflow`、`model_unloaded`、`invalid_request`）；或 `failed`（span 状态为 Error，`error.type`
+为异常的完整类型名，从不包含异常消息）。有两种情况不同。工具运行后向模型报告失败（退出码非零、无法读取某个
+文件）时以 `failed` 结束，`error.type=tool_error`，且不设 Error 状态。被拒绝的 `model.load`（文件缺失或无效、
+内存不足）会把 span 状态设为 Error，因为模型仍未加载，其 `error.type` 是异常的完整类型名，而不是简短代码。
+
+**视频。** MiniMax-H3 或 LTX 2.5 生成的一段视频（`POST /v1/videos/generations`、`/api/video-generate`、
+Video Studio 任务或 CLI）是一个 `generate_video <model>` span，每个阶段（phase）一个子 span，阶段内的
+每个子阶段（stage）再各一个子 span：
+
+```text
+generate_video <model>         tensorsharp.video.mode / width / height / frames / fps / steps / seed / audio、tensorsharp.outcome
+├─ video.queue                 等待"一次只生成一段"的视频锁（服务端）
+├─ lora.apply                  应用 LoRA 插件时（服务端）
+├─ reference-encode            LTX 2.5 的参考图像或参考视频（提供时）
+├─ image-encode                LTX 2.5 的图像引导（提供时）
+├─ text-encode                 MiniMax-H3 子阶段：text-encoder、prefault-wait、dit-load、image-encode、reference-encode
+├─ denoise                     每个去噪步一个 "step" 事件；LTX 2.5 子阶段：first-pass、upscale、
+│                              refine-image-encode、refinement（没有第二阶段时为 single-pass）
+├─ vae-decode                  MiniMax-H3 子阶段：denoiser-release、vae-open、vae-decode
+├─ audio-decode
+└─ video.export                写出 MP4：tensorsharp.video.codec、tensorsharp.video.bytes
+```
+
+阶段 span 带 `tensorsharp.video.phase`，子阶段 span 另带 `tensorsharp.video.stage`，以及模型报告的数值，
+例如 `dit-load` 上的 `tensorsharp.video.cached` 和 LTX 2.5 `text-encode` 上的
+`tensorsharp.video.prompt_cache_hit`。无论服务端还是 CLI，`<model>` 都与聊天一样是已加载文件的名称；在 CLI
+上每段视频都是一条独立 trace 的根，文件没能保存的视频以 `failed` 结束。`tensorsharp.video.mode` 取 `t2v`、
+`i2v`、`fl2v`、`ref`、`keyframes` 或 `other` 之一。服务端拒绝的视频请求（模型不对、参数错误、配额不足）
+单独记录一个很短的 `generate_video` span，带 `tensorsharp.outcome=refused`。其他视频模型（Wan）同样有
+视频 span，以及它们报告的阶段。
+
+**Video Studio。** 每个 Studio 任务是一条独立的 trace，即 `studio.job generate` 或 `studio.job render`，
+并链接（link）到提交它的那个请求；该链接保存在任务的 `job.json` 中，重启后依然有效。这个 span 从任务入队
+时开始，子 span 包括 `studio.queue`、每个 Studio 阶段一个的 `studio.stage <stage>`（`starting`、
+`model-identity`、`encoding`、`importing`、`cancelling`、`rendering`、`validating`），以及生成过程的
+`generate_video` span。它带有 `tensorsharp.studio.job_id`、`.job_kind`、`.project_id` 和结果。从未运行
+的任务（排队时被取消、启动时发现的、关闭时仍在排队的）会得到一个时长为零的 span。
+
+**引擎步骤。** 设置 `TENSORSHARP_OTEL_TRACE_STEPS=1` 后，每个引擎步骤都是一个独立的 `inference.step`
+span，链接到该步所运行序列中最多 32 个的聊天 span，并带有 `tensorsharp.model.architecture`、
+`tensorsharp.engine.batch_size`、`tensorsharp.engine.step_kind`（`prefill`、`decode` 或 `mixed`）和
+`tensorsharp.engine.scheduled_tokens`。
+
+**CLI** 记录同样的聊天 span（每次生成一条 trace）、`codeexec.run` 和视频，各自是独立的 trace。它没有 HTTP
+span、`model.load` 和 `execute_tool` span。退出前（包括因意外错误而停止时）它会把剩余数据刷出，日志也在其中；
+collector 很慢或无法连接时可能要多等几秒。要让 CLI 的 resource 带上节点 id，请设置 `TENSORSHARP_TP_NODE_ID`，
+而不是使用 `--tp-node-id`。
+
+**日志。** 导出的日志记录带有 trace 与 span id，在 HTTP 请求期间还带有 `tensorsharp.request_id` 和
+`tensorsharp.protocol`；请按 `tensorsharp.request_id` 搜索。日志 scope 不会导出：ASP.NET Core 的 scope
+带有原始请求路径（上传文件的文件名、代码产物的运行 id、已存储响应的 id），还在同一个 `RequestId` 键下放着它
+自己的 id；而 trace 与 span id 可以找到带有模型、后端和会话信息的 span。控制台和日志文件保留各自的 scope。
+引擎线程写出的日志行既没有 trace id，也没有请求 id；聊天 span 上的 `tensorsharp.engine_request_id` 可以把它们
+关联到所属的请求。
+
+### 指标
+
+meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runtime`、`System.Net.Http`，服务端
+还有 ASP.NET Core 的 meter。指标属性保持低基数：id、提示词、尺寸和计数只出现在 span 上。`gen_ai.*` 名称
+遵循 OpenTelemetry GenAI 语义约定，该约定仍处于开发阶段，今后可能变化。
+
+| 指标 | 类型、单位 | 属性 |
+|---|---|---|
+| `gen_ai.server.request.duration` | histogram，`s` | `gen_ai.operation.name`、`gen_ai.provider.name`、`gen_ai.request.model`、`tensorsharp.backend`、`tensorsharp.protocol`、`tensorsharp.origin`、`tensorsharp.outcome`、`error.type` |
+| `gen_ai.server.time_to_first_token` | histogram，`s` | 同上，但不含 `tensorsharp.outcome` 和 `error.type`；只统计成功完成的请求 |
+| `gen_ai.server.time_per_output_token` | histogram，`s` | 同首 token 时间；只统计至少输出两个 token 的成功请求 |
+| `tensorsharp.tokens` | counter，`{token}` | 同首 token 时间，另加 `tensorsharp.token.type`（`input`、`output`） |
+| `tensorsharp.tokens.cache_read` | counter，`{token}` | 同首 token 时间。由前缀缓存提供的提示 token，是 `input` 的子集 |
+| `tensorsharp.engine.step.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind` |
+| `tensorsharp.engine.batch.size` | histogram，`{sequence}` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind` |
+| `tensorsharp.engine.requests.running`、`.waiting` | gauge，`{request}` | `tensorsharp.model.architecture` |
+| `tensorsharp.engine.steps` | counter，`{step}` | `tensorsharp.model.architecture` |
+| `tensorsharp.engine.forward.time` | counter，`s` | `tensorsharp.model.architecture` |
+| `tensorsharp.kv_cache.blocks.used`、`.total` | gauge，`{block}` | `tensorsharp.model.architecture` |
+| `tensorsharp.speculative.tokens.drafted`、`.accepted` | counter，`{token}` | `tensorsharp.model.architecture` |
+| `tensorsharp.model.load.duration` | histogram，`s` | `gen_ai.request.model`、`tensorsharp.backend`、`tensorsharp.outcome`、`error.type` |
+| `tensorsharp.tool.duration` | histogram，`s` | `gen_ai.tool.name`、`tensorsharp.outcome`、`error.type` |
+| `tensorsharp.image.generation.duration` | histogram，`s` | `gen_ai.request.model`、`tensorsharp.image.mode`、`tensorsharp.backend`、`tensorsharp.outcome`、`error.type` |
+| `tensorsharp.video.generation.duration` | histogram，`s` | `gen_ai.request.model`、`tensorsharp.backend`、`tensorsharp.video.mode`、`tensorsharp.video.audio`、`tensorsharp.outcome`、`error.type` |
+| `tensorsharp.video.phase.duration` | histogram，`s` | `gen_ai.request.model`、`tensorsharp.backend`、`tensorsharp.video.phase` |
+| `tensorsharp.video.denoise.step.duration` | histogram，`s` | `gen_ai.request.model`、`tensorsharp.backend`、`tensorsharp.video.stage` |
+| `tensorsharp.video.dit.loads` | counter，`{load}` | `gen_ai.request.model`、`tensorsharp.backend`、`tensorsharp.video.cached` |
+| `tensorsharp.media.generations.active` | gauge，`{generation}` | `tensorsharp.owner` |
+| `tensorsharp.video.queue.waiting` | gauge，`{clip}` | `tensorsharp.owner` |
+| `tensorsharp.gpu.memory.used`、`.total`、`.peak` | gauge，`By` | `tensorsharp.backend`、`tensorsharp.gpu.device` |
+| `tensorsharp.studio.job.duration` | histogram，`s` | `tensorsharp.studio.job_kind`、`tensorsharp.outcome`（任务的最终状态） |
+| `tensorsharp.studio.jobs.queued`、`.running` | gauge，`{job}` | 无 |
+
+- 请求时长包含排队时间，并且每次生成记录一次，因此一个 skills 回合每轮记录一个值。TensorSharp 自己的调用
+  带 `tensorsharp.origin`，客户端流量没有这个属性。
+- `gen_ai.server.*` histogram 使用 GenAI 约定推荐的桶边界。模型加载、图像、视频与 Studio 的时长使用从 0.5 秒
+  到 2 小时的桶边界（Studio 任务到 4 小时）。
+- `tensorsharp.engine.steps` 和 `tensorsharp.engine.forward.time` 在切换模型后继续累计。
+- `tensorsharp.video.generation.duration` 包含等待视频锁的时间。失败或被取消的阶段有 span，但不记录
+  `tensorsharp.video.phase.duration`。
+- GPU 显存 gauge 报告最近一次快照。快照在执行该后端工作的线程上获取，从不在指标采集线程上获取：引擎工作线程
+  在两个步骤之间为已加载的模型取快照（每秒最多四次），视频在每次切换阶段或子阶段时取一次。某个后端要等其上的
+  模型取过快照后才会出现。MLX 不报告总量。只有在导出指标时才会取快照；遥测或指标关闭时，不会查询任何设备。
+
+### 哪些内容不会导出
+
+内容捕获关闭时（默认）：
+
+- span 只带 id、模型名与文件名（从不含目录路径）、尺寸、计数、耗时和结果。失败只记录异常类型，从不记录
+  消息。作为兜底，导出前会从每个 span 上移除 `gen_ai.input.messages`、`gen_ai.output.messages` 和
+  `tensorsharp.video.prompt`。
+- 在导出的日志记录中，TensorSharp 标记为内容的每个值（提示词、聊天消息、模型输出、上传文件的名称、路径和
+  URL、工具参数、命令、提示词的 token id）都显示为 `[redacted: N chars]`；含有内容的记录以消息模板而不是
+  渲染后的文本发送。每个被标记值的文本（4 个字符及以上）在该记录的其他属性及其异常消息中也替换为
+  `[redacted]`，因此引用了被标记路径的错误消息同样不会把它导出。
+- 导出日志中的异常消息会保留，但做以下替换：服务端上传目录（以及开启 `--code-exec` 时的代码执行临时目录和
+  产物目录）下的路径连同文件名整体替换为 `<uploads>`（带引号时替换到右引号为止）；`/uploads/<file>` URL
+  替换为 `/uploads/{file}`；上传存储名中后跟扩展名的 32 位十六进制数字（`<32 hex>.mp4`、
+  `video-<32 hex>.mp4`）无论出现在消息中何处都替换为 `{id}`。消息被改动过的异常以
+  `TensorSharp.Telemetry.ScrubbedException` 导出（OTLP 的 `exception.type` 和 Application Insights 的
+  `exceptions.type` 显示的就是这个类型），其消息以原异常的完整类型名开头，例如
+  `System.IO.IOException: Could not find file '<uploads>'.`，并保留原来的堆栈。其他异常原样导出。
+- 有些 URL 无需登录，只靠路径中的一个 id 保护，因此路径本身就是内容：上传或生成的文件（`/uploads/<file>`）、
+  一次代码执行产生的文件（`/api/code/artifacts/<run>/...`），以及已存储的 Responses API 响应
+  （`/v1/responses/<id>`）。它们的 HTTP 服务端 span 在 `url.path` 和名称中使用 `/uploads/{file}`、
+  `/api/code/artifacts/{run}[/{path}]` 或 `/v1/responses/{id}`，请求日志行中的路径会被脱敏。出于同样的原因，
+  已存储响应的 id 不会放到它的 span 上，在该请求的日志行中也会被脱敏。
+- 控制台和日志文件保持不变：每个路径、id 和 scope 都原样保留。
+
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` 会导出以上全部内容：不脱敏的日志、真实的请求路径和响应 id、
+聊天 span 上的 `gen_ai.input.messages` 和 `gen_ai.output.messages`（由角色与内容组成的 JSON，最多 64K 字符，
+保留最新的消息）、视频 span 上的 `tensorsharp.video.prompt`、工具 span 上的 `tensorsharp.tool.arguments` 和
+`tensorsharp.tool.result`，以及 `codeexec.run` 上的 `tensorsharp.codeexec.command`。图像与 Studio 的 span
+无论如何都不带提示词。只有当数据去往的每个地方（collector 及其后端、Application Insights 资源及其保留策略、
+导出器的本地缓冲）都允许保存用户提示词时，才开启这一项。
+
+### Application Insights
+
+直接从 TensorSharp 发送时，设置资源 Overview 页面上的连接串：
+
+```bash
+APPLICATIONINSIGHTS_CONNECTION_STRING="InstrumentationKey=...;IngestionEndpoint=https://..." \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf
+```
+
+- **Entra ID。** `TENSORSHARP_AZURE_MONITOR_AAD=1` 使用 `DefaultAzureCredential` 登录（本地为 `az login`，
+  Azure 中为托管标识）。该身份需要在资源上拥有 Monitoring Metrics Publisher 角色，连接串仍用于指明资源。
+- **与 OTLP 并用。** 再设置一个 OTLP 端点，每种信号就会两边各发一份。
+- **采样。** 默认保留每条 trace，而不是导出器自带的每秒 5 条。Application Insights 采样器对整个进程（包括
+  OTLP）做决定，因此 `OTEL_TRACES_SAMPLER` 会映射到它上面：未设置、`always_on` 或 `parentbased_always_on`
+  全部保留；`always_off` 或 `parentbased_always_off` 全部丢弃；`traceidratio`、`parentbased_traceidratio`
+  或 `microsoft.fixed_percentage` 按 `OTEL_TRACES_SAMPLER_ARG` 给出的比例保留（0 到 1，默认 1）；
+  `microsoft.rate_limited` 每秒保留 `OTEL_TRACES_SAMPLER_ARG` 条 trace（默认 5）。其他采样器会给出警告并
+  全部保留。指标从不采样。采样低于 100% 时，Application Insights 也只会收到被保留 trace 的日志记录；不属于
+  任何 trace 的记录始终发送。
+- **Live Metrics** 不可用：TensorSharp 使用的按信号导出器不支持它，因此它已被关闭。
+- **离线存储。** 导出器连不上 Application Insights 时，会把数据暂存在本地磁盘上并稍后重试。这是导出器的默认
+  行为，TensorSharp 不做改动：Windows 上位于 `%LOCALAPPDATA%\Microsoft\AzureMonitor`，其他系统位于临时目录下。
+  进程退出前没能送达的数据会由之后的某次运行上传；Application Insights 拒收超过 48 小时的数据。
+- **数据表。** HTTP 服务端 span 进入 `requests`。TensorSharp 自己的 span 都是 internal 类型，因此进入
+  `dependencies`，类型为 `InProc`。日志记录进入 `traces`，记录下来的异常进入 `exceptions`，指标进入
+  `customMetrics`。`service.name` 对应 `cloud_RoleName`，`service.instance.id` 对应 `cloud_RoleInstance`。
+  span 属性位于 `customDimensions`，其中数值以字符串存储（用 `todouble()` 转换）。
+- **百分位数。** histogram 只以计数、总和、最小值和最大值到达，没有分桶，所以指标只能给出平均值。百分位数
+  请从 span 时长计算，首 token 时间则用聊天 span 上的 `tensorsharp.ttft_ms`。
+- **经由 collector。** [`collector-azuremonitor.yaml`](examples/opentelemetry/collector/collector-azuremonitor.yaml)
+  用 contrib 的 `azure_monitor` 导出器把 OTLP 转发到 Application Insights。让 TensorSharp 指向这个 collector，
+  并且不要在 TensorSharp 上再设置连接串，否则每条数据都会到达两次。
+
+[`queries.kql`](examples/opentelemetry/application-insights/queries.kql) 提供带注释的查询：请求率与失败率、
+首 token 时间、排队 / prefill / decode 时间、token 吞吐、视频阶段、Studio 任务、模型加载，以及单个请求的日志。
+
+### 快速上手
+
+以下每一项的完整步骤见 [`examples/opentelemetry/README.md`](examples/opentelemetry/README.md)（英文）。
+
+- **Aspire 看板**：只需 Docker，就能在一个浏览器页面中查看 trace、指标和结构化日志。先选一个随机密钥
+  （`openssl rand -hex 32`），然后：
+
+  ```bash
+  docker run --rm -d --name aspire-dashboard -p 127.0.0.1:18888:18888 -p 127.0.0.1:4317:18889 -p 127.0.0.1:4318:18890 \
+    -e Dashboard__Otlp__AuthMode=ApiKey -e Dashboard__Otlp__PrimaryApiKey=<key> mcr.microsoft.com/aspire/dashboard:13.6.2
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 OTEL_EXPORTER_OTLP_HEADERS=x-otlp-api-key=<key> \
+  dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf
+  ```
+
+  `docker logs aspire-dashboard` 会打印一个登录链接，以 `http://localhost:18888/login?t=<token>` 的形式打开。
+  看板停止后，所有数据都会丢失。
+- **Jaeger、Prometheus 与 Grafana**（位于 OpenTelemetry Collector 之后）：
+  `cd examples/opentelemetry/collector && docker compose up -d`，然后以
+  `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317` 运行 TensorSharp。Jaeger 位于 <http://localhost:16686>
+  （按标签 `tensorsharp.request_id=<id>` 搜索），Prometheus 位于 <http://localhost:9090>，Grafana 位于
+  <http://localhost:3000>。
+- **Application Insights**：见[上文](#application-insights)。
+- **端到端检查**：[`eng/telemetry/aspire-e2e.ps1`](eng/telemetry/aspire-e2e.ps1) 会启动 Aspire 看板，用几种
+  遥测设置运行服务端，发送真实请求，并检查收到的数据。[`eng/telemetry/appinsights-e2e.ps1`](eng/telemetry/appinsights-e2e.ps1)
+  针对真实的 Application Insights 资源做同样的检查：它用 Azure CLI 读取连接串，从不把连接串写到任何地方，并持续
+  查询该资源直到数据到达（[运行方法](eng/telemetry/README.md)，英文）。两者都把证据写入被 git 忽略的
+  `docs/validation/`。
 
 ## HTTP API
 

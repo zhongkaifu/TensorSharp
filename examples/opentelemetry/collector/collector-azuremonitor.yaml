@@ -1,0 +1,83 @@
+# Copyright (c) Zhongkai Fu. All rights reserved.
+# https://github.com/zhongkaifu/TensorSharp
+#
+# This file is part of TensorSharp.
+#
+# TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+#
+# OpenTelemetry Collector configuration that forwards TensorSharp's OTLP traces, metrics and logs
+# to Application Insights with the contrib Azure Monitor exporter.
+#
+# The simpler path is usually the in-process exporter: set APPLICATIONINSIGHTS_CONNECTION_STRING
+# on TensorSharp itself and no collector is needed. Use this file when a collector is already part
+# of the deployment, or to fan the same OTLP stream out to more backends later. Do not use both for
+# the same signal: TensorSharp with the connection string set, exporting OTLP to this collector,
+# sends every span, log record and metric to Application Insights twice. Point TensorSharp at this
+# collector with OTEL_EXPORTER_OTLP_ENDPOINT only.
+#
+# Run it on its own from this directory (bash; in PowerShell set the variable with
+# $env:APPLICATIONINSIGHTS_CONNECTION_STRING = "..." and put the docker run command on one line):
+#   export APPLICATIONINSIGHTS_CONNECTION_STRING="InstrumentationKey=...;IngestionEndpoint=https://..."
+#   docker run --rm -p 127.0.0.1:4317:4317 -p 127.0.0.1:4318:4318 \
+#     -e APPLICATIONINSIGHTS_CONNECTION_STRING \
+#     -v "$PWD/collector-azuremonitor.yaml:/etc/otelcol-contrib/config.yaml:ro" \
+#     otel/opentelemetry-collector-contrib:0.164.0
+#
+# Written for otelcol-contrib 0.164.0. Component names follow that release: the exporter is
+# azure_monitor (formerly azuremonitor) and the processor cumulative_to_delta (formerly
+# cumulativetodelta); the old names are still accepted as deprecated aliases.
+#
+# How the data lands differs a little from the in-process exporter:
+#   - Numeric span attributes become customMeasurements (numbers); strings and booleans stay in
+#     customDimensions. The in-process exporter puts everything in customDimensions as strings.
+#     application-insights/queries.kql reads both.
+#   - Span links (Studio jobs link to the request that queued them) are in customDimensions["_MS.links"].
+#   - Span events are dropped (spaneventsenabled defaults to false). Turning them on would also send
+#     every per-step "step" event of a video denoise span as a row in traces.
+
+receivers:
+  otlp:
+    protocols:
+      # Listen on every interface of the container; the docker run line above decides who can
+      # reach these ports.
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 800
+    spike_limit_mib: 200
+  # TensorSharp's OTLP exporter sends cumulative sums and histograms (the OpenTelemetry .NET
+  # default). The Azure Monitor exporter writes each data point as it comes, so without this a
+  # customMetrics row would hold the running total since TensorSharp started instead of the
+  # increase since the previous export. Stateful: run one collector instance per TensorSharp
+  # process group, not behind a load balancer.
+  cumulative_to_delta: {}
+  batch:
+    timeout: 1s
+
+exporters:
+  azure_monitor:
+    # The collector expands ${env:NAME} from its own environment when it loads this file, so the
+    # connection string never has to be written into the file. (The exporter also reads
+    # APPLICATIONINSIGHTS_CONNECTION_STRING by itself and prefers it over this setting; naming it
+    # here keeps the dependency visible.)
+    connection_string: "${env:APPLICATIONINSIGHTS_CONNECTION_STRING}"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [azure_monitor]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, cumulative_to_delta, batch]
+      exporters: [azure_monitor]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [azure_monitor]

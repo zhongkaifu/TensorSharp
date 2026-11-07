@@ -35,7 +35,13 @@ namespace TensorSharp.Cli.Logging
         /// Build a logger factory. The returned factory's lifetime is tied to the
         /// caller; callers should dispose it on exit so the file logger flushes.
         /// </summary>
-        public static ILoggerFactory Build(Options options)
+        /// <param name="options">The console and file sinks.</param>
+        /// <param name="configure">
+        /// Adds further providers after the console and file ones: the OpenTelemetry log
+        /// exporter when telemetry is on (<c>TelemetrySession.AddLogging</c>). The factory owns
+        /// what it adds, so disposing it flushes those too.
+        /// </param>
+        public static ILoggerFactory Build(Options options, Action<ILoggingBuilder>? configure = null)
         {
             options ??= new Options();
 
@@ -62,6 +68,8 @@ namespace TensorSharp.Cli.Logging
                         file.MinimumLevel = options.MinimumLevel;
                     });
                 }
+
+                configure?.Invoke(builder);
             });
         }
 

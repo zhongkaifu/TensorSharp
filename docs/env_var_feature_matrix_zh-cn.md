@@ -458,6 +458,36 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 |---|---|---|---|---|---|
 | `TS_RESPONSES_STORE_REDIS_URL` | 仅服务端 | Responses API 存储的 Redis 连接串；设置后取代内存存储 | 未设置（关闭） | 未注册 | 否 |
 
+## 矩阵外的遥测（OpenTelemetry）变量
+
+这些变量配置 `TensorSharp.Server.Host` 与 `TensorSharp.Cli` 可选的 OpenTelemetry 导出（trace、指标和
+日志）。它们改变的是哪些数据离开进程，而不是模型的计算结果。它们未注册在 `EnvVarMatrix.All` 中，也不参与
+sweep。runner 也不会清除它们，所以 runner 自身环境中设置的值会传到每个 `TensorSharp.Cli` 子进程，由子进程
+各自导出遥测。两个宿主上的 `--otel-endpoint <url>` 都会设置 `OTEL_EXPORTER_OTLP_ENDPOINT`。开关类变量接受
+`1`、`true`、`yes` 或 `on`。完整说明（包括记录哪些 trace、哪些内容会被脱敏）见
+[遥测（OpenTelemetry）](../USAGE_zh-cn.md#遥测opentelemetry)。
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
+|---|---|---|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | 服务端、CLI | 开启遥测，并通过 OTLP 把三种信号发往这个绝对 `http://` / `https://` URL；`http/protobuf` 下 SDK 会追加 `/v1/traces`、`/v1/metrics`、`/v1/logs`。其他形式是配置错误（退出码 1） | 未设置（关闭） | 未注册 | 否 |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT` | 服务端、CLI | 只为该信号走 OTLP，URL 按原样使用；会开启遥测 | 未设置 | 未注册 | 否 |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | 服务端、CLI | `grpc` 或 `http/protobuf`；有信号通过 OTLP 导出时，其他取值是配置错误，否则不读取该变量 | `grpc` | 未注册 | 否 |
+| `OTEL_EXPORTER_OTLP_HEADERS` | 服务端、CLI | 每次 OTLP 导出附带的 `key=value,...` 请求头（例如 Aspire 看板的 `x-otlp-api-key=<key>`）；从不写入日志 | 无 | 未注册 | 否 |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | 服务端、CLI | OTLP 导出超时（毫秒），由 SDK 读取 | `10000` | 未注册 | 否 |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_{HEADERS,PROTOCOL,TIMEOUT}` | 服务端、CLI | 按信号覆盖上面三项，只在该信号通过 OTLP 导出时读取；此时协议无效或超时不是正整数毫秒是配置错误 | 沿用通用设置 | 未注册 | 否 |
+| `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` | 服务端、CLI | 单种信号除 Application Insights 之外的去处，逗号分隔：`otlp`、`console`、`none`。`otlp` 或 `console` 会开启遥测；`none` 让该信号在所有去处（包括 Application Insights）关闭；无法识别的名称会被忽略并给出警告 | 设置了端点或 `TENSORSHARP_OTEL` 时走 OTLP | 未注册 | 否 |
+| `OTEL_SDK_DISABLED` | 服务端、CLI | `true` 时无论其他设置如何都保持关闭 | 未设置 | 未注册 | 否 |
+| `OTEL_SERVICE_NAME` | 服务端、CLI | 所有信号上的服务名（在 Application Insights 中为 `cloud_RoleName`） | `tensorsharp-server` / `tensorsharp-cli` | 未注册 | 否 |
+| `OTEL_RESOURCE_ATTRIBUTES` | 服务端、CLI | 额外的 resource 属性，优先于 TensorSharp 自带的属性（`service.instance.id` = `<机器名>:<pid>`、`host.name`、`process.pid`、`tensorsharp.tp.*`） | 无 | 未注册 | 否 |
+| `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` | 服务端、CLI | trace 采样。OTLP 下由 SDK 读取；Application Insights 接收 trace 时映射到它的采样器，由它为所有 trace 导出器做决定（`traceidratio` / `microsoft.fixed_percentage` 取 0-1 的比例，`microsoft.rate_limited` 取每秒 trace 数） | `parentbased_always_on`（保留每条 trace） | 未注册 | 否 |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | 服务端、CLI | 开启遥测，并在进程内把每种已开启的信号发往 Application Insights；从不写入日志 | 未设置 | 未注册 | 否 |
+| `TENSORSHARP_AZURE_MONITOR_AAD` | 服务端、CLI（需同时设置连接串） | 用 Entra ID（`DefaultAzureCredential`）代替连接串中的密钥向 Application Insights 认证 | 关闭 | 未注册 | 否 |
+| `TENSORSHARP_OTEL` | 服务端、CLI | 开启遥测，OTLP 发往默认端点（`http://localhost:4317`；`http/protobuf` 时为 `http://localhost:4318`） | 关闭 | 未注册 | 否 |
+| `TENSORSHARP_OTEL_LOG_LEVEL` | 服务端、CLI | 导出日志的最低级别（`Trace` ... `Critical`、`None`）；控制台和文件日志保持各自的级别。遥测开启时，其他取值是配置错误 | 与控制台 / 文件日志相同 | 未注册 | 否 |
+| `Logging__OpenTelemetry__LogLevel__Default` | 仅服务端 | 通过 ASP.NET Core 配置设置同一级别（也可按类别设置）；与 `TENSORSHARP_OTEL_LOG_LEVEL` 二选一 | 与控制台 / 文件日志相同 | 未注册 | 否 |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | 服务端、CLI | `true` 时导出内容：不脱敏的日志、聊天 span 上的提示与输出消息、视频提示词、工具参数与结果、命令、上传路径 | 关闭（内容脱敏） | 未注册 | 否 |
+| `TENSORSHARP_OTEL_TRACE_STEPS` | 服务端、CLI | 每个引擎步骤一个 `inference.step` span，并链接到它运行的请求；用于剖析单次运行 | 关闭 | 未注册 | 否 |
+
 ## 矩阵外的通用运行时开关
 
 这些变量是真实运行时开关，但目前未注册到 `EnvVarMatrix.All`，也不在默认

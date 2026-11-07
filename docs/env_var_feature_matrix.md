@@ -509,6 +509,38 @@ This variable configures optional Redis-backed state. It is not registered in
 |---|---|---|---|---|---|
 | `TS_RESPONSES_STORE_REDIS_URL` | `TensorSharp.Server` | Redis connection string for the OpenAI Responses API store; when set, `RedisResponsesStore` replaces the in-memory store | unset (disabled, in-memory) | not registered | no |
 
+## Out-of-Matrix Telemetry (OpenTelemetry) Knobs
+
+These variables configure the opt-in OpenTelemetry export of traces, metrics and logs from
+`TensorSharp.Server.Host` and `TensorSharp.Cli`. They change what leaves the process, not what a
+model computes. They are not registered in `EnvVarMatrix.All` and are not swept. The runner does
+not scrub them either, so one set in the runner's own environment reaches every `TensorSharp.Cli`
+subprocess, which then exports its own telemetry. `--otel-endpoint <url>` on either host sets
+`OTEL_EXPORTER_OTLP_ENDPOINT`. Switches accept `1`, `true`, `yes` or `on`. The full reference,
+including what is traced and what is redacted, is
+[Telemetry (OpenTelemetry)](../USAGE.md#telemetry-opentelemetry).
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | server, CLI | Turns telemetry on and sends all three signals over OTLP to this absolute `http://` / `https://` URL; with `http/protobuf` the SDK appends `/v1/traces`, `/v1/metrics`, `/v1/logs`. Anything else is a configuration error (exit code 1) | unset (off) | not registered | no |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT` | server, CLI | OTLP for that one signal, to this URL exactly as given; turns telemetry on | unset | not registered | no |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | server, CLI | `grpc` or `http/protobuf`; when a signal exports over OTLP, any other value is a configuration error, and otherwise it is not read | `grpc` | not registered | no |
+| `OTEL_EXPORTER_OTLP_HEADERS` | server, CLI | `key=value,...` headers on every OTLP export (e.g. `x-otlp-api-key=<key>` for the Aspire dashboard); never logged | none | not registered | no |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | server, CLI | OTLP export timeout in milliseconds, read by the SDK | `10000` | not registered | no |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_{HEADERS,PROTOCOL,TIMEOUT}` | server, CLI | Per-signal overrides of the three settings above, read only while that signal exports over OTLP; then a bad protocol or a timeout that is not a positive number of milliseconds is a configuration error | the general setting | not registered | no |
+| `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` | server, CLI | Comma-separated sinks of one signal besides Application Insights: `otlp`, `console`, `none`. `otlp` or `console` turns telemetry on; `none` turns the signal off everywhere, Application Insights included; unknown names are ignored with a warning | OTLP when an endpoint or `TENSORSHARP_OTEL` is set | not registered | no |
+| `OTEL_SDK_DISABLED` | server, CLI | `true` keeps telemetry off whatever else is set | unset | not registered | no |
+| `OTEL_SERVICE_NAME` | server, CLI | Service name on every signal (`cloud_RoleName` in Application Insights) | `tensorsharp-server` / `tensorsharp-cli` | not registered | no |
+| `OTEL_RESOURCE_ATTRIBUTES` | server, CLI | Extra resource attributes; they win over TensorSharp's own (`service.instance.id` = `<machine>:<pid>`, `host.name`, `process.pid`, `tensorsharp.tp.*`) | none | not registered | no |
+| `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` | server, CLI | Trace sampling. Read by the SDK for OTLP; while Application Insights receives traces, mapped onto its sampler, which then decides for every trace exporter (`traceidratio` / `microsoft.fixed_percentage` take a 0-1 fraction, `microsoft.rate_limited` traces per second) | `parentbased_always_on` (every trace) | not registered | no |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | server, CLI | Turns telemetry on and sends every enabled signal to Application Insights from inside the process; never logged | unset | not registered | no |
+| `TENSORSHARP_AZURE_MONITOR_AAD` | server, CLI, with the connection string | Authenticate to Application Insights with Entra ID (`DefaultAzureCredential`) instead of the connection string's key | off | not registered | no |
+| `TENSORSHARP_OTEL` | server, CLI | Turns telemetry on with OTLP to the default endpoint (`http://localhost:4317`, or `http://localhost:4318` for `http/protobuf`) | off | not registered | no |
+| `TENSORSHARP_OTEL_LOG_LEVEL` | server, CLI | Lowest level of exported logs (`Trace` ... `Critical`, `None`); console and file logs keep their own level. While telemetry is on, any other value is a configuration error | the console / file level | not registered | no |
+| `Logging__OpenTelemetry__LogLevel__Default` | server only | The same level through ASP.NET Core configuration (also per category); set this or `TENSORSHARP_OTEL_LOG_LEVEL`, not both | the console / file level | not registered | no |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | server, CLI | `true` exports content: unredacted logs, prompt and output messages on chat spans, video prompts, tool arguments and results, commands, upload paths | off (content redacted) | not registered | no |
+| `TENSORSHARP_OTEL_TRACE_STEPS` | server, CLI | One `inference.step` span per engine step, linked to the requests it ran; for profiling a single run | off | not registered | no |
+
 ## Out-of-Matrix General Runtime Knobs
 
 These variables are real runtime knobs, but they are not registered in

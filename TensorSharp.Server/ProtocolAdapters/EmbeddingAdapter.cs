@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using TensorSharp.Models.Embeddings;
+using TensorSharp.Runtime.Telemetry;
 using TensorSharp.Server.Hosting;
 
 namespace TensorSharp.Server.ProtocolAdapters;
@@ -24,6 +25,8 @@ public sealed partial class EmbeddingAdapter : IDisposable, IAsyncDisposable
     private readonly ServerHostingOptions _options;
     private readonly EmbeddingRequestDispatcher _dispatcher;
     private readonly EmbeddingGemma2MultimodalEncoder? _multimodal;
+    /// <summary><c>tensorsharp.backend</c> of the embeddings span and metrics; fixed for the adapter's life.</summary>
+    private readonly string? _telemetryBackend;
 
     public EmbeddingAdapter(IEmbeddingModel model, ServerHostingOptions options, EmbeddingGemma2MultimodalEncoder? multimodal = null)
     {
@@ -31,6 +34,8 @@ public sealed partial class EmbeddingAdapter : IDisposable, IAsyncDisposable
         _options = options;
         _dispatcher = new EmbeddingRequestDispatcher(model);
         _multimodal = multimodal;
+        _telemetryBackend = ConcreteModel is { } embeddingModel
+            ? BackendCatalog.Canonicalize(embeddingModel.Backend) : options.DefaultBackend;
     }
 
     public void Dispose() => _dispatcher.Dispose();
@@ -112,6 +117,12 @@ public sealed partial class EmbeddingAdapter : IDisposable, IAsyncDisposable
     private async Task EmbedAsync(HttpContext context, bool openAI)
     {
         long started = Stopwatch.GetTimestamp();
+        // One "embeddings <model>" span and one request-duration measurement per request,
+        // around both the text path and the media path. Not inside the dispatcher: it
+        // batches several requests into one encoder call, so a span there would belong to
+        // no single request.
+        using var telemetry = GenAiRequestTelemetry.Start(TelemetryAttributes.OperationEmbeddings,
+            _model.ModelName, _telemetryBackend);
         try
         {
             using var document = await ReadBodyAsync(context).ConfigureAwait(false);
@@ -148,15 +159,20 @@ public sealed partial class EmbeddingAdapter : IDisposable, IAsyncDisposable
                 input.GetArrayLength() > 0 && input[0].ValueKind == JsonValueKind.Object))
             {
                 inputCount = input.ValueKind == JsonValueKind.Object ? 1 : input.GetArrayLength();
+                if (telemetry.IsRecording) telemetry.SetTag(TelemetryAttributes.EmbeddingInputs, inputCount);
                 result = await EmbedMediaAsync(input, context.RequestAborted).ConfigureAwait(false);
             }
             else
             {
                 var inputs = ParseInputs(input, openAI, truncate, context);
                 inputCount = inputs.Count;
+                if (telemetry.IsRecording) telemetry.SetTag(TelemetryAttributes.EmbeddingInputs, inputCount);
                 result = inputs.Count == 0 ? new EmbeddingBatchResult(Array.Empty<float[]>(), 0)
                     : await _dispatcher.EmbedAsync(inputs, context.RequestAborted).ConfigureAwait(false);
             }
+            // An encoder produces no output tokens; the prompt tokens are the request's usage.
+            telemetry.RecordUsage(result.PromptTokens, outputTokens: 0, cachedTokens: 0, finishReason: null,
+                firstTokenAtUtc: null);
             if (result.Embeddings.Length != inputCount)
                 throw new InvalidOperationException("Embedding result count does not match input count.");
             float[][] embeddings = result.Embeddings.Select(vector => ResizeAndNormalize(vector, dimensions)).ToArray();
@@ -178,18 +194,39 @@ public sealed partial class EmbeddingAdapter : IDisposable, IAsyncDisposable
         }
         catch (EmbeddingRequestException ex)
         {
+            telemetry.MarkRefused(RefusalErrorType(ex.Status));
             await WriteErrorAsync(context, ex.Message, ex.Status, ex.Param).ConfigureAwait(false);
         }
         catch (JsonException)
         {
+            telemetry.MarkRefused("invalid_json");
             await WriteErrorAsync(context, "Request body must contain valid JSON.", 400).ConfigureAwait(false);
         }
         catch (ArgumentException ex)
         {
             // Tokenization reports context overflow before native inference starts.
+            telemetry.MarkRefused("invalid_input");
             await WriteErrorAsync(context, ex.Message, 400, "input").ConfigureAwait(false);
         }
+        catch (Exception ex)
+        {
+            // Everything else still propagates to the error middleware; the span records the
+            // exception type only (a cancellation counts as cancelled, not failed).
+            telemetry.MarkFailed(ex);
+            throw;
+        }
     }
+
+    /// <summary>
+    /// A short, stable <c>error.type</c> for a refused request. It is a metric attribute,
+    /// so it names the kind of refusal, never the message.
+    /// </summary>
+    private static string RefusalErrorType(int status) => status switch
+    {
+        404 => "model_not_found",
+        413 => "request_too_large",
+        _ => "invalid_request",
+    };
 
     private void ValidateModel(JsonElement body)
     {

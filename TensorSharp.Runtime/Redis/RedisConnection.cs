@@ -12,6 +12,7 @@ using System.Linq;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using StackExchange.Redis;
+using TensorSharp.Runtime.Logging;
 
 namespace TensorSharp.Runtime.Redis
 {
@@ -54,7 +55,7 @@ namespace TensorSharp.Runtime.Redis
             }
             catch (RedisException ex)
             {
-                _logger.LogWarning(ex, "Redis SET failed for key {Key}", key);
+                _logger.LogWarning(ex, "Redis SET failed for key {Key}", LogContent.Of(key));
                 return false;
             }
         }
@@ -68,7 +69,8 @@ namespace TensorSharp.Runtime.Redis
             }
             catch (RedisException ex)
             {
-                _logger.LogWarning(ex, "Redis GET failed for key {Key}", key);
+                // A key can name a stored response (tsresp:<id>), whose id is a bearer key to it.
+                _logger.LogWarning(ex, "Redis GET failed for key {Key}", LogContent.Of(key));
                 return null;
             }
         }

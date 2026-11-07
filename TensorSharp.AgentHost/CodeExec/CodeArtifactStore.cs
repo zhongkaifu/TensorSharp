@@ -221,7 +221,7 @@ namespace TensorSharp.AgentHost.CodeExec
             if (kept.Count > 0)
             {
                 _logger.LogInformation(LogEventIds.SkillScriptExecuted,
-                    "codeexec.artifacts run={RunId} files={Count} bytes={Bytes}", runId, kept.Count, runTotal);
+                    "codeexec.artifacts run={RunId} files={Count} bytes={Bytes}", LogContent.Of(runId), kept.Count, runTotal);
                 EvictIfOverBudget(runTotal);
             }
 
@@ -450,7 +450,7 @@ namespace TensorSharp.AgentHost.CodeExec
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 _logger.LogWarning(LogEventIds.SkillScriptExecuted,
-                    "codeexec.artifact-evict-failed dir={Dir} reason={Reason}", dir.FullName, ex.Message);
+                    "codeexec.artifact-evict-failed dir={Dir} reason={Reason}", LogContent.Of(dir.FullName), LogContent.Of(ex.Message));
             }
         }
 

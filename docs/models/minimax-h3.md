@@ -2,6 +2,14 @@
 
 [English](minimax-h3.md) | [中文](minimax-h3_zh-cn.md)
 
+## License and legal disclaimer
+
+> **Important — MiniMax-H3 is subject to a separate third-party license.** Before downloading, running, deploying, modifying, redistributing, or using MiniMax-H3 or its outputs with TensorSharp, you must review and comply with the [MiniMax H3 Community License Agreement](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE), its Acceptable Use Policy, and all applicable laws and regulations.
+>
+> The community license expressly excludes the **United States, European Union, United Kingdom, and Republic of Korea (South Korea)** from its licensed territory. It does **not** authorize covered use in those territories. If you are in an excluded territory, obtain separate authorization from MiniMax before undertaking any use that requires a license. Consult the official license for the full terms and any changes.
+>
+> TensorSharp is an independent inference engine. Its technical compatibility with MiniMax-H3 does **not** grant a license, waive restrictions, or imply authorization or endorsement by MiniMax. **You are solely responsible for determining whether your intended use is permitted and for all risks, consequences, claims, penalties, damages, and other liabilities arising from your use or noncompliance. To the fullest extent permitted by applicable law, TensorSharp, its authors, contributors, and maintainers disclaim any responsibility or liability for your use of MiniMax-H3, its outputs, or any violation of its license or applicable law.** This notice does not override the MiniMax license or limit liability where such limitation is prohibited by law.
+
 MiniMax-H3 generates video and native 32 kHz stereo audio in one packed diffusion
 sequence. TensorSharp exposes it through `MiniMaxH3Model.GenerateVideo`, the CLI
 and the video HTTP routes. FL2VA handles text and keyframes; Ref2VA handles text

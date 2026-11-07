@@ -42,6 +42,10 @@
     <ProjectReference Include="..\TensorSharp.Backends.GGML\TensorSharp.Backends.GGML.csproj" />
     <ProjectReference Include="..\TensorSharp.Backends.MLX\TensorSharp.Backends.MLX.csproj" />
     <ProjectReference Include="..\TensorSharp.Distributed\TensorSharp.Distributed.csproj" />
+    <!-- The opt-in OpenTelemetry pipeline (off unless an OTEL_* endpoint, an Application
+         Insights connection string or TENSORSHARP_OTEL=1 asks for it). Host-only: no
+         ASP.NET Core dependency comes with it. -->
+    <ProjectReference Include="..\TensorSharp.Telemetry\TensorSharp.Telemetry.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.6" />

@@ -48,8 +48,11 @@ public static class HealthEndpoints
         });
 
         // Liveness probes that want the plain response rather than the UI
-        // keep a stable route now that "/" serves index.html.
-        endpoints.MapGet("/health", () => Results.Ok(LivenessMessage));
+        // keep a stable route now that "/" serves index.html. A probe is left
+        // out of ASP.NET Core's http.server.request.duration metric, as it is
+        // out of traces, so a tight probe loop does not drown real requests.
+        endpoints.MapGet("/health", () => Results.Ok(LivenessMessage))
+            .DisableHttpMetrics();
 
         endpoints.MapFallback(async ctx =>
         {

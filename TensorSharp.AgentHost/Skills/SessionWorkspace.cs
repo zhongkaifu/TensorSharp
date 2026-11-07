@@ -1089,7 +1089,7 @@ namespace TensorSharp.AgentHost.Skills
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 _logger.LogWarning(LogEventIds.SkillScriptExecuted,
-                    "workspace.sweep-failed root={Root} reason={Reason}", _root, ex.Message);
+                    "workspace.sweep-failed root={Root} reason={Reason}", _root, LogContent.Of(ex.Message));
             }
         }
 
@@ -1163,7 +1163,7 @@ namespace TensorSharp.AgentHost.Skills
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 _logger.LogWarning(LogEventIds.SkillScriptExecuted,
-                    "workspace.delete-failed dir={Dir} reason={Reason}", directory, ex.Message);
+                    "workspace.delete-failed dir={Dir} reason={Reason}", directory, LogContent.Of(ex.Message));
             }
         }
     }
