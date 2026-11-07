@@ -25,6 +25,7 @@ public sealed class WebUiAdapterVideoRefusalTests : IDisposable
 {
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-video-route-" + Guid.NewGuid().ToString("N"));
     private readonly EnvScope _env = new();
+    private readonly VideoExportScope _export = new();
     private readonly MiniMaxH3LoraFixtures _fixtures = new();
     private readonly ModelService _models;
     private readonly TurboStandIn _model;
@@ -50,6 +51,7 @@ public sealed class WebUiAdapterVideoRefusalTests : IDisposable
         _model.ReleaseAll();
         _models.Dispose();
         _fixtures.Dispose();
+        _export.Dispose();
         _env.Dispose();
         try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
     }

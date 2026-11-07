@@ -19,6 +19,11 @@ namespace TensorSharp.Models.WanVideo
 {
     public static class VideoIO
     {
+        /// <summary>Why the registered encoder cannot write any MP4 on this machine, or null
+        /// when it has one to try (<see cref="IVideoEncoder.Mp4ExportUnavailableReason"/>).
+        /// Hosts check it before generating a clip that is to be saved as MP4.</summary>
+        public static string Mp4ExportUnavailableReason() => MediaCodecs.VideoEncoder.Mp4ExportUnavailableReason;
+
         /// <summary>Write frames as an MP4. Returns the codec actually used
         /// ("h264" or "mp4v").</summary>
         public static string SaveMp4(string path, RgbImage[] frames, int fps)

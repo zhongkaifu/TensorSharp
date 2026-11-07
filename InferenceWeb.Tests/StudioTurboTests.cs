@@ -41,6 +41,7 @@ public sealed class StudioTurboTests : IDisposable
 
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-studio-turbo-" + Guid.NewGuid().ToString("N"));
     private readonly EnvScope _env = new();
+    private readonly VideoExportScope _export = new();
     private readonly MiniMaxH3LoraFixtures _fx = new();
     private readonly List<bool> _providerCalls = new();
     private ModelService _models;
@@ -64,6 +65,7 @@ public sealed class StudioTurboTests : IDisposable
     {
         _models?.Dispose();
         _fx.Dispose();
+        _export.Dispose();
         _env.Dispose();
         try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
     }

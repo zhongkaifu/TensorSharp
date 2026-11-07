@@ -171,6 +171,9 @@ namespace TensorSharp.Models.Media
         // IVideoEncoder
         // ------------------------------------------------------------------
 
+        public string Mp4ExportUnavailableReason =>
+            "No MP4 encoder is registered: the managed media provider cannot encode video.";
+
         public string SaveMp4(string path, RgbImage[] frames, int fps) => throw new NotSupportedException(
             "No MP4 encoder is registered: the managed media provider cannot encode video. Register an " +
             "IVideoEncoder on MediaCodecs.VideoEncoder — AVAssetWriter on iOS; desktop builds register " +

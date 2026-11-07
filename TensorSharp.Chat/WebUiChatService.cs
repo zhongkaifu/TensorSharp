@@ -2090,6 +2090,11 @@ namespace TensorSharp.Chat
             imgError ??= VideoImageConditionsError(videoModel, p);
             if (imgError != null)
                 throw new WebUiRequestRejectedException(400, new { error = imgError });
+            if (TensorSharp.Models.WanVideo.VideoIO.Mp4ExportUnavailableReason() is string exportError)
+            {
+                logger.LogWarning(LogEventIds.HttpRequestRejected, "Video generate rejected: {Reason}", exportError);
+                throw VideoExportUnavailable(exportError);
+            }
 
             if (!_uploads.HasQuotaHeadroom(out string videoQuotaError))
             {
@@ -2166,6 +2171,8 @@ namespace TensorSharp.Chat
             string conditioningError = VideoImageConditionsError(videoModel, parameters);
             if (conditioningError != null)
                 throw new WebUiRequestRejectedException(400, new { error = conditioningError });
+            if (TensorSharp.Models.WanVideo.VideoIO.Mp4ExportUnavailableReason() is string exportError)
+                throw VideoExportUnavailable(exportError);
             if (!_uploads.HasQuotaHeadroom(out string quotaError))
                 throw new WebUiRequestRejectedException(507, new { error = quotaError });
             return GenerateVideoCoreAsync(videoModel, prompt ?? "", parameters, loras, expectedSamplingRecipe, lastFramePath);
@@ -2265,6 +2272,12 @@ namespace TensorSharp.Chat
         private static bool IsVideoRequestRejection(Exception ex) =>
             ex is ArgumentException or InvalidOperationException or NotSupportedException;
 
+        /// <summary>A 503 for a clip this machine could not save: no encoder can write an MP4
+        /// (no FFmpeg, and no OpenCV, as on Windows on Arm). It is refused before generation,
+        /// which can take minutes, rather than failing after it.</summary>
+        private static WebUiRequestRejectedException VideoExportUnavailable(string reason) =>
+            new(503, new { code = "video_export_unavailable", error = reason });
+
         private static string VideoImageConditionsError(
             TensorSharp.Models.Video.IVideoGenerationModel model,
             TensorSharp.Models.Video.VideoGenerationParams parameters)
@@ -2343,6 +2356,13 @@ namespace TensorSharp.Chat
             if (parseError != null)
             {
                 yield return new { done = true, error = parseError };
+                yield break;
+            }
+
+            if (TensorSharp.Models.WanVideo.VideoIO.Mp4ExportUnavailableReason() is string exportError)
+            {
+                logger.LogWarning(LogEventIds.HttpRequestRejected, "Video generate (stream) rejected: {Reason}", exportError);
+                yield return new { done = true, error = exportError };
                 yield break;
             }
 
