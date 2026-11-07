@@ -360,6 +360,8 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_moe.cpp
     ggml_ops_host_moe_decode.cpp
     ggml_ops_host_moe_cache.cpp
+    ggml_ops_moe_hot_tier.cpp
+    ggml_ops_moe_expert_io.cpp
     ggml_ops_deepseek4.cpp
     ggml_ops_deepseek41_tp.cpp
     ggml_ops_deepseek41_vision.cpp

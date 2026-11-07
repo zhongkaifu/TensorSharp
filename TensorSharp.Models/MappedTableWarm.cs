@@ -80,8 +80,20 @@ namespace TensorSharp.Models
             });
         }
 
-        /// <summary>MemAvailable from /proc/meminfo in bytes, or 0 where there is none.</summary>
+        /// <summary>Host memory a table could still occupy as page cache, in bytes, or 0 where
+        /// the platform reports none: MemAvailable from /proc/meminfo, capped by the process's
+        /// cgroup. A container sees the host's MemAvailable, which can be far more than its own
+        /// memory limit lets it cache.</summary>
         public static long HostMemoryAvailable()
+        {
+            long available = MemInfoAvailable();
+            long cgroup = CgroupMemoryAvailable();
+            if (cgroup > 0 && (available <= 0 || cgroup < available))
+                available = cgroup;
+            return available;
+        }
+
+        private static long MemInfoAvailable()
         {
             try
             {
@@ -96,6 +108,68 @@ namespace TensorSharp.Models
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
             return 0;
+        }
+
+        /// <summary>The cgroup's limit minus what it holds that the kernel cannot reclaim
+        /// (its usage less its file cache), or 0 without a limited memory cgroup. cgroup v2
+        /// (<c>memory.max</c>) and v1 (<c>memory.limit_in_bytes</c>).</summary>
+        internal static long CgroupMemoryAvailable()
+        {
+            try
+            {
+                string v2 = null, v1 = null;
+                if (File.Exists("/proc/self/cgroup"))
+                    foreach (string line in File.ReadLines("/proc/self/cgroup"))
+                    {
+                        if (line.StartsWith("0::", StringComparison.Ordinal)) v2 = line.Substring(3);
+                        else
+                        {
+                            string[] f = line.Split(':', 3);
+                            if (f.Length == 3 && Array.IndexOf(f[1].Split(','), "memory") >= 0) v1 = f[2];
+                        }
+                    }
+                foreach (string dir in Candidates("/sys/fs/cgroup", v2))
+                    if (TryCgroup(dir, "memory.max", "memory.current", "active_file", "inactive_file", out long a))
+                        return a;
+                foreach (string dir in Candidates("/sys/fs/cgroup/memory", v1))
+                    if (TryCgroup(dir, "memory.limit_in_bytes", "memory.usage_in_bytes", "total_active_file", "total_inactive_file", out long a))
+                        return a;
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            catch (FormatException) { }
+            return 0;
+        }
+
+        private static IEnumerable<string> Candidates(string root, string relative)
+        {
+            if (!string.IsNullOrEmpty(relative) && relative != "/")
+                yield return root + relative;
+            yield return root;
+        }
+
+        internal static bool TryCgroup(string dir, string limitFile, string usageFile, string activeKey, string inactiveKey,
+            out long available)
+        {
+            available = 0;
+            string limitPath = Path.Combine(dir, limitFile), usagePath = Path.Combine(dir, usageFile);
+            string statPath = Path.Combine(dir, "memory.stat");
+            if (!File.Exists(limitPath) || !File.Exists(usagePath) || !File.Exists(statPath))
+                return false;
+            string limitText = File.ReadAllText(limitPath).Trim();
+            // "max" (v2) or a page-rounded huge number (v1): no limit, the host figure stands.
+            if (limitText == "max" || !long.TryParse(limitText, out long limit) || limit <= 0 || limit >= (1L << 62))
+                return false;
+            long usage = long.Parse(File.ReadAllText(usagePath).Trim());
+            long cache = 0;
+            foreach (string line in File.ReadLines(statPath))
+            {
+                string[] kv = line.Split(' ', 2);
+                if (kv.Length == 2 && (kv[0] == activeKey || kv[0] == inactiveKey))
+                    cache += long.Parse(kv[1]);
+            }
+            available = Math.Max(1, limit - usage + cache);
+            return true;
         }
     }
 }

@@ -4611,6 +4611,37 @@ internal enum GgmlIndexReductionOp
         internal static partial void TSGgml_Qwen4ExpMtpFree(IntPtr handle);
         [LibraryImport(DllName)]
         internal static partial int TSGgml_Qwen4ExpMtpCopyKv(IntPtr handle, IntPtr k, IntPtr v, long bytes);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_Qwen4ExpCaptureVerifyRows(int enable);
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_Qwen4ExpCommitVerifyRow(int row, int rows);
+
+        // Priority-ranked accelerator tier for host-offloaded routed experts and
+        // the routing counters the host seams keep (ggml_ops_moe_hot_tier.cpp).
+        [LibraryImport(DllName)]
+        internal static unsafe partial int TSGgml_MoeHotTierRegister(IntPtr gate, IntPtr up, IntPtr down,
+            int gateType, int upType, int downType, long gateBytes, long upBytes, long downBytes,
+            int numExperts, int* experts, int count, int window, int releaseSource);
+        [LibraryImport(DllName)]
+        internal static unsafe partial void TSGgml_MoeHotTierStats(long* stats4);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_MoeHotTierTotalBytes();
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_MoeHotTierRelease(IntPtr gate);
+        [LibraryImport(DllName)]
+        internal static unsafe partial int TSGgml_MoeRoutingCounts(IntPtr gate, ulong* counts, int capacity);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_MoeRoutingReset(IntPtr gate);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_MoeRoutingRecordDevice(int on);
+        [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+        internal static partial int TSGgml_HostExpertIoRegister(IntPtr baseAddress, long length, string path);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_HostExpertIoSetBudget(long bytes);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_HostExpertIoUnregister(IntPtr baseAddress);
+        [LibraryImport(DllName)]
+        internal static unsafe partial void TSGgml_HostExpertIoStats(long* stats4);
 
         [LibraryImport(DllName)]
         private static unsafe partial IntPtr TSGgml_Qwen4ExpStateSnapshotCreate(

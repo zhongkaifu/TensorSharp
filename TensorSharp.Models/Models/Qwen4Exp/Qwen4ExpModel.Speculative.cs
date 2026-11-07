@@ -19,7 +19,23 @@ namespace TensorSharp.Models
         public int SpecMaxDraftTokens => ResolveSpecMaxDraftTokens(_backend);
         internal static int ResolveSpecMaxDraftTokens(BackendType backend)
             => backend is BackendType.GgmlCpu or BackendType.GgmlCuda ? 7 : int.MaxValue;
-        public bool SpecVerifyPersistsAcceptedKv => false;
+        // True right after a partial acceptance was committed from the verify's own
+        // per-row states (SpecOnVerifyAccepted): the scheduler then only rewinds.
+        public bool SpecVerifyPersistsAcceptedKv => _specRowCommitted;
+
+        // ---- verify row commit (NInfer's ReplaySSM idea) ------------------------
+        // A partial acceptance used to restore the pre-verify recurrent state and
+        // re-forward the kept rows through all 48 layers (~60 ms on Flash Next,
+        // ggml_metal). The verify span now keeps every row's GDN conv/SSM state and
+        // PLE conv history (upstream ggml_gated_delta_net's per-row snapshots), and
+        // the accepted row is copied into the live state instead. Where the state
+        // buffers are host-visible (ggml_metal, ggml_cpu). TS_Q4E_VERIFY_ROW_COMMIT=0
+        // keeps the restore-and-re-forward path.
+        private static bool VerifyRowCommitEnabled()
+            => Environment.GetEnvironmentVariable("TS_Q4E_VERIFY_ROW_COMMIT") is not "0";
+        private bool _specCaptureArmed, _specRowCommitted;
+        private int _specCapturedRows, _specVerifyStart, _specCommitPosition;
+        private int[] _specVerifyTokens;
         public bool SpecPlainStepUsesForward => true;
         // SpecForward delegates to Forward's image injection and captures each
         // chunk's MRoPE positions before Forward consumes them for MTP catch-up.
@@ -123,14 +139,27 @@ namespace TensorSharp.Models
                 _specAllLogitsRows = allLogitsRows;
                 _specHiddenOutput = (IntPtr)hidden;
                 _specLogitsOutput = (IntPtr)logits;
+                bool capture = _specCaptureArmed && tokens.Length >= 2 && tokens.Length <= 8
+                    && (_backend is BackendType.GgmlMetal or BackendType.GgmlCpu) && VerifyRowCommitEnabled();
+                _specCaptureArmed = false;
+                _specCapturedRows = 0;
+                int verifyStart = _cacheSeqLen;
+                if (capture) GgmlBasicOps.Qwen4ExpCaptureVerifyRows(true);
                 try
                 {
                     Forward(tokens);
+                    if (capture)
+                    {
+                        _specCapturedRows = tokens.Length;
+                        _specVerifyTokens = (int[])tokens.Clone();
+                        _specVerifyStart = verifyStart;
+                    }
                     if (mtpPositions != null) PublishMtpPositions(_mtpPositions[mtpOwner], mtpPositions);
                 }
                 catch { _specStateFailed = true; throw; }
                 finally
                 {
+                    if (capture) GgmlBasicOps.Qwen4ExpCaptureVerifyRows(false);
                     _specForwardActive = false;
                     _specAllLogitsRows = false;
                     _specHiddenOutput = IntPtr.Zero;
@@ -203,6 +232,34 @@ namespace TensorSharp.Models
                 throw new InvalidOperationException("qwen4exp: recurrent snapshot capture failed.");
             }
             _specMetadata = metadata;
+            _specCaptureArmed = true;
+            _specRowCommitted = false;
+        }
+
+        /// <summary><paramref name="verifyRows"/> counts the drafts verified and
+        /// <paramref name="acceptedRows"/> the drafts accepted; the span ran the anchor
+        /// plus the drafts, so the state to keep is the one after row
+        /// <paramref name="acceptedRows"/> of <paramref name="verifyRows"/> + 1.</summary>
+        public void SpecOnVerifyAccepted(int acceptedRows, int verifyRows)
+        {
+            _specRowCommitted = false;
+            int captured = _specCapturedRows;
+            _specCapturedRows = 0;
+            // Full acceptance keeps the verify's final state; nothing to commit.
+            if (captured != verifyRows + 1 || verifyRows < 1 || acceptedRows < 0 || acceptedRows >= verifyRows
+                || _specMetadata == null || _specVerifyTokens == null)
+                return;
+            if (!GgmlBasicOps.Qwen4ExpCommitVerifyRow(acceptedRows, captured))
+                return;                       // live state untouched: the restore path still applies
+            // Host metadata back to the pre-verify state, then advanced over the kept
+            // rows exactly as their forward would have (the PLE n-gram history).
+            bool deviceAuthoritative = _deviceStateAuthoritative;
+            RestoreSpecMetadata(_specMetadata);
+            _deviceStateAuthoritative = deviceAuthoritative;
+            if (_pleHeads > 0)
+                ComputePleRows(_specVerifyTokens.AsSpan(0, acceptedRows + 1).ToArray(), _specVerifyStart);
+            _specCommitPosition = _specVerifyStart + acceptedRows + 1;
+            _specRowCommitted = true;
         }
 
         public void SpecRestoreRecurrentState()
@@ -228,6 +285,15 @@ namespace TensorSharp.Models
         {
             RefuseUnmirroredQwenOperation("speculative execution and rollback");
             ValidateSpecMetadata(_specMetadata);
+            if (_specRowCommitted)
+            {
+                if (length != _specCommitPosition || length > _cacheSeqLen)
+                    throw new InvalidOperationException("qwen4exp: a committed verify row must be kept exactly.");
+                _cacheSeqLen = length;
+                if (HasQsa) _qsaPositionCount = length;
+                _specRowCommitted = false;
+                return;
+            }
             if (!_specRecurrentRestored || length != _specMetadata.Position || length > _cacheSeqLen)
                 throw new InvalidOperationException("qwen4exp: recurrent rewind must return to the captured position, then replay accepted tokens.");
             _cacheSeqLen = length;

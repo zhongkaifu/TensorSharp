@@ -1720,6 +1720,11 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            // Before anything unmaps: the table warm reads through its own handle but
+            // reports against the mapping's shard, and the routing counters are keyed
+            // by the mapped expert addresses and drop with them.
+            StopPleTableWarm();
+            DetachRoutingProfile();
             DisposeMtpHead();
             ReleaseSpecSnapshot();
             // DisposeAllFusedHolders leaves the checked-out holder to the
@@ -1738,6 +1743,7 @@ namespace TensorSharp.Models
             if (_idxKCache != null)
                 foreach (var t in _idxKCache) t?.Dispose();
             DisposeQwen4ExpTensorParallel();
+            ReleaseExpertTiers();
             base.Dispose();
         }
     }

@@ -131,17 +131,35 @@ public sealed class ConfigDownloadGroupTests : IDisposable
         Directory.CreateDirectory(modelDirectory);
         var modelFiles = new[] { config["model"]! }.Concat(config["model"]!["files"]!.AsArray().Select(node => node!)).ToArray();
         Assert.Equal(3, modelFiles.Length);
-        foreach (JsonNode entry in modelFiles.Append(config["mmproj"]!))
+        foreach (JsonNode entry in modelFiles.Append(config["mmproj"]!).Append(config["draft-model"]!))
             File.WriteAllText(Path.Combine(modelDirectory, Path.GetFileName(entry["path"]!.GetValue<string>())), "cached fixture");
 
-        string path = Write(config);
-        string[] expanded = ConfigFileArgs.Expand(["--config", path], TextWriter.Null, false);
-        Assert.Single(expanded, value => value == "--model");
-        Assert.EndsWith("-00001-of-00003.gguf", expanded[Array.IndexOf(expanded, "--model") + 1]);
-        Assert.Equal(Path.Combine(modelDirectory, "mmproj-BF16.gguf"), expanded[Array.IndexOf(expanded, "--mmproj") + 1]);
-        Assert.DoesNotContain("--draft-model", expanded);
-        var options = ServerOptionsBuilder.Build(expanded, _directory);
-        Assert.Equal(1.0f, options.DefaultSamplingConfig.Temperature);
+        const string verifyRows = "TS_Q4E_VERIFY_ROW_KERNELS";
+        string? before = Environment.GetEnvironmentVariable(verifyRows);
+        NativeEnvironment.Set(verifyRows, null);
+        try
+        {
+            string path = Write(config);
+            string[] expanded = ConfigFileArgs.Expand(["--config", path], TextWriter.Null, false);
+            Assert.Single(expanded, value => value == "--model");
+            Assert.EndsWith("-00001-of-00003.gguf", expanded[Array.IndexOf(expanded, "--model") + 1]);
+            Assert.Equal(Path.Combine(modelDirectory, "mmproj-BF16.gguf"), expanded[Array.IndexOf(expanded, "--mmproj") + 1]);
+            // The high-performance preset speculates with the shared MTP head (3 drafts) on
+            // ggml_metal.
+            Assert.Equal(Path.Combine(modelDirectory, "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
+                expanded[Array.IndexOf(expanded, "--draft-model") + 1]);
+            Assert.Equal("3", expanded[Array.IndexOf(expanded, "--spec-draft") + 1]);
+            Assert.Equal("ggml_metal", expanded[Array.IndexOf(expanded, "--backend") + 1]);
+            // Batched verify is the ggml_metal default; the preset does not set the switch.
+            Assert.Null(Environment.GetEnvironmentVariable(verifyRows));
+            var options = ServerOptionsBuilder.Build(expanded, _directory);
+            Assert.Equal(1.0f, options.DefaultSamplingConfig.Temperature);
+        }
+        finally
+        {
+            // Never leave the batched-verify default to the other tests in this process.
+            NativeEnvironment.Set(verifyRows, before);
+        }
     }
 
     private string Write(object config, string filename = "config.json")

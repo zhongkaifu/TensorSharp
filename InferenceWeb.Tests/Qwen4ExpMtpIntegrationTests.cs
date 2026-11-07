@@ -210,6 +210,10 @@ public sealed class Qwen4ExpMtpIntegrationTests(ITestOutputHelper output)
     [Qwen4ExpMtpTinyFact]
     public void LearnedHead_DraftVerifyRollbackGreedyMatchesPlainWithEngagement()
     {
+        // Exact verify rows: ggml_metal verifies in one batched forward by default, which
+        // does not promise plain greedy's tokens. CPU and CUDA ignore the switch.
+        using var exact = new NativeEnvScope();
+        exact.Set("TS_Q4E_VERIFY_ROW_KERNELS", "1");
         using var fixture = new Fixture(output);
         using var model = fixture.Load();
         const int count = 16;

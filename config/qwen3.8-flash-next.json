@@ -1,19 +1,30 @@
 {
-  // Qwen3.8 Flash Next (UD-Q2_K_XL), all three GGUF shards (~78.9 GB)
-  // plus the BF16 vision projector (~0.9 GB). TensorSharp opens the other
+  // Qwen3.8 Flash Next (UD-Q2_K_XL), all three GGUF shards (~78.9 GB), the BF16 vision
+  // projector (~0.9 GB) and the shared Q8_0 MTP head (~2.8 GB), set up for its fastest path:
+  // ggml_metal on Apple Silicon with the MTP head speculating. TensorSharp opens the other
   // shards beside the first one; all three must be present before loading.
   //   TensorSharp.Cli         --config config/qwen3.8-flash-next.json --chat
   //   TensorSharp.Server.Host --config config/qwen3.8-flash-next.json
-  // Use --backend ggml_metal on Apple Silicon, or ggml_cpu for CPU execution.
-  // Expert/PLE disk paging permits a smaller resident working set than the
-  // download size; memory use and throughput depend on the device and SSD.
+  //
+  // On a 48 GB Mac the file is larger than memory by design. The engine keeps every layer's
+  // most-routed experts in fixed GPU slots (ranked by a routing profile it records itself),
+  // reads the rest into GPU window slots with parallel pread, and lets the GPU compute every
+  // route. Measured on an M5 Pro (48 GB), greedy, 256-token answers, against the previous
+  // whole-layer placement: plain decode 19.2 / 19.9 / 20.7 tok/s on code / prose / a list
+  // (was 13.8 / 13.9 / 15.6), with this config's MTP head (drafts verified as one batched
+  // forward, accepted rows committed without a re-forward) 31.3 / 25.7 / 32.5; time to first token 0.8 / 6.4 / 0.5 s (was 3.1 / 13.6 / 2.8). See
+  // docs/models/qwen38-flash-next.md ("Larger than memory", "Speculative decoding").
+  //
+  // NVIDIA: the direct engine (--backend cuda) is the fastest there but has no MTP head; pass
+  // --backend cuda --no-spec, or --backend ggml_cuda to keep the head (measured gains are
+  // smaller there; prose can be slower). ggml_cpu also works.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "root": "${modelRoot}/qwen3.8-flash-next",
     "repo": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6"
   },
 
-  "backend": "ggml_cuda",
+  "backend": "ggml_metal",
   "max-tokens": 4096,
   "continuous-batching": true,
   // Sparse attention requires F16/F32 KV; quantized KV is not supported here.
@@ -48,14 +59,17 @@
     "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355"
   }
 
-  // Optional learned speculative decoding: uncomment the following entry
-  // (including the leading comma) to download the shared Q8_0 MTP head
-  // (~2.8 GB) and enable it on GGML backends. It is not embedded in the trunk.
-  // Speedups depend on the request; retained-prefix and concurrent requests
-  // decode plainly. See docs/models/qwen38-flash-next.md for measured limits.
-  // ,"draft-model": {
-  //   "path": "${root}/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
-  //   "urls": ["${repo}/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"],
-  //   "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
-  // }
+  // The shared MTP head: naming it is the request to speculate (no --spec needed); pass
+  // --no-spec to decode without it. Three drafts a step: measured on the M5 Pro (greedy,
+  // three runs) 31.2 / 24.6 / 31.5 tok/s on code / prose / a list; five drafts gave
+  // 33.8 / 21.3 / 37.1 (faster code and lists, slower and less steady prose), so pass
+  // --spec-draft 5 for code- or table-heavy work. A zero confidence gate was slower. It
+  // speculates for a solo request that prefilled from position 0; continued (retained or
+  // shared-prefix) turns and concurrent requests decode plainly.
+  ,"draft-model": {
+    "path": "${root}/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+    "urls": ["${repo}/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"],
+    "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+  },
+  "spec-draft": 3
 }

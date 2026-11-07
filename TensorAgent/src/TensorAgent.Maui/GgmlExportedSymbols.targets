@@ -21,7 +21,7 @@
     with SIGABRT inside load_aot_module, before any managed code runs. Measured on
     device.
 
-    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 399 symbols.
+    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 412 symbols.
     Test-only exports (inside #if defined(TSG_GGML_TEST_HOOKS) or TSG_GGML_TEST_DIAGNOSTICS
     blocks) are left out: only the native test build compiles them, and a name listed here
     becomes a -u link root, so one the device archive lacks fails the Release link.
@@ -201,6 +201,10 @@
     <ReferenceNativeSymbol Include="TSGgml_GptOssSyncKvCacheToHost" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasBackendFailure" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasResidentDeviceCopy" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertIoRegister" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertIoSetBudget" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertIoStats" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertIoUnregister" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostMoeExpertCacheStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadBarrier" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexReductionF32" SymbolType="Function" />
@@ -252,6 +256,13 @@
     <ReferenceNativeSymbol Include="TSGgml_MoEExpertsSwiGLUResidualF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoEFFNPrefillRouteScaledF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoEFFNPrefillSwiGLUQuantF32" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeHotTierRegister" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeHotTierRelease" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeHotTierStats" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeHotTierTotalBytes" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeRoutingCounts" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeRoutingRecordDevice" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeRoutingReset" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MulMatIdF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MultiDeviceInit" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseGlimmerModelForward" SymbolType="Function" />
@@ -349,6 +360,8 @@
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaFlushHostPointerStatus" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaResetBatchedDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpAttnBlock" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCaptureVerifyRows" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCommitVerifyRow" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCopyQsaCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpFfnBlock" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpGdnBlock" SymbolType="Function" />

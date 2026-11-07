@@ -366,6 +366,48 @@ namespace TensorSharp.Models
                 $"{_pleHeads} rows a token" + (advised ? " (random-access advice)." : "."));
         }
 
+        private Task _pleWarm;
+        private System.Threading.CancellationTokenSource _pleWarmCancel;
+
+        /// <summary>
+        /// Read the table into the page cache in the background once the model is ready,
+        /// as the direct-CUDA executor does: on a network filesystem every uncached row is
+        /// a storage round trip (92-120 ms on a geesefs mount), so a cold table caps decode.
+        /// Only where the host reports how much it can keep cached (Linux, cgroup-aware) and
+        /// that is room for the table: on a machine that cannot hold it as well as the
+        /// experts (the larger-than-memory Mac) the read would only evict them.
+        /// </summary>
+        private void StartPleTableWarm()
+        {
+            if (!_pleTableOnDisk || _gguf == null
+                || !_quantWeights.TryGetValue("per_layer_token_embd.weight", out var qw)
+                || MappedTableWarm.HostMemoryAvailable() <= 0)
+                return;
+            long ptr = qw.Data.ToInt64();
+            foreach (var (basePtr, length, path) in _gguf.MappedRegions())
+            {
+                long offset = ptr - basePtr.ToInt64();
+                if (offset < 0 || offset + qw.RawBytes > length)
+                    continue;
+                _pleWarmCancel = new System.Threading.CancellationTokenSource();
+                _pleWarm = MappedTableWarm.Start(new[] { (path, offset, qw.RawBytes) }, "qwen4exp",
+                    "the PLE n-gram table", _pleWarmCancel.Token);
+                return;
+            }
+        }
+
+        private void StopPleTableWarm()
+        {
+            if (_pleWarmCancel == null)
+                return;
+            _pleWarmCancel.Cancel();
+            try { _pleWarm?.Wait(); }
+            catch (AggregateException) { }
+            _pleWarmCancel.Dispose();
+            _pleWarmCancel = null;
+            _pleWarm = null;
+        }
+
         /// <summary>
         /// Gather the n-gram rows into a raw [T * hidden] float buffer - the span
         /// uploads it as a graph input. A row read from disk costs a page fault, so a

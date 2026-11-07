@@ -1,8 +1,9 @@
 {
-  // Overlay, used with --config config/qwen3.8-flash-next.json first.
-  // This is a companion preset, not a standalone model. The source/hash
-  // already appear in the base config's optional MTP example.
-  // Supported on GGML backends; direct CUDA and MLX do not support this head.
+  // Overlay that adds the shared MTP head to another Flash Next preset (for example
+  // --config config/qwen3.8-flash-next-iq1_m.json --config config/qwen3.8-flash-next-mtp.json).
+  // config/qwen3.8-flash-next.json already names this head itself. This is a companion
+  // preset, not a standalone model. Supported on GGML backends; direct CUDA and MLX do not
+  // support this head.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "root": "${modelRoot}/qwen3.8-flash-next"

@@ -348,12 +348,14 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Image | CatalogModalities.Video,
             // 78.9 GB of weights on a 48 GB Mac, by design: a token reads 16 rows of the 28.8 GB
             // n-gram table and 10 of each layer's 512 experts, and the engine reads exactly those
-            // from the SSD. On a 48 GiB Mac its planner keeps 15 layers' experts on the GPU and
-            // runs the other 33 layers' (31.7 GB) on the host straight from the mapping; with the
-            // dense half that leaves 18.3 GB resident (see WeightsPagedFromDiskBytes).
+            // from the SSD. On a 48 GiB Mac its planner keeps every layer's most-routed experts in
+            // fixed GPU slots (14.4 GB, ranked by the routing profile it records) and reads the
+            // others with parallel pread into GPU window slots sized from the RAM left (about 14 GB),
+            // so the GPU computes every route (see docs/models/qwen38-flash-next.md).
             MinDeviceMemoryGB = 48,
-            // The n-gram table (28,800,138,240 bytes) plus the routed experts of the first 33
-            // layers (32 x 956,825,600 bytes of IQ2_XS/IQ4_NL plus layer 2's IQ3_XXS 1,114,112,000).
+            // The n-gram table (28,800,138,240 bytes) plus the routed experts outside the fixed
+            // slots (46.1 GB less the 14.4 GB the slots hold: the same 31.7 GB the old whole-layer
+            // plan left on the host). The window slots hold a working set of those, not all of them.
             WeightsPagedFromDiskBytes = 28_800_138_240 + 31_732_531_200,
             // 12 of the 48 layers hold K/V (two 256-wide heads) plus a 128-wide sparse-attention
             // index key: about 27 KiB a token in f16.
@@ -364,6 +366,11 @@ public static partial class ModelCatalog
             LeanCaches = true,
             // The defaults the publisher embedded in the GGUF (general.sampling).
             Sampling = new CatalogSampling(1.0f, 20, 0.95f, 0.0f),
+            // No DraftTuning: the engine's defaults are config/qwen3.8-flash-next.json's measured
+            // settings (three drafts, the per-token head's gate, drafts verified as one batched
+            // forward on ggml_metal). MEASURED with the CLI on an M5 Pro (48 GB, 256-token answers):
+            // greedy 30.9 / 21.3 / 28.3 tok/s on code / prose / a list against 19.2 / 19.9 / 20.7
+            // plain; with these sampling settings 27.0 / 20.6 / 32.7.
             SupportsThinking = true,
             Experimental = true,
             License = "Qwen Community License 1.0",
