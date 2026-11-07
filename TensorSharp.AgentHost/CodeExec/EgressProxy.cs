@@ -213,7 +213,7 @@ namespace TensorSharp.AgentHost.CodeExec
             if (Interlocked.Increment(ref _deniedCount) <= 32)
                 _denied.Enqueue(target);
             _logger.LogWarning(LogEventIds.SkillScriptExecuted,
-                "codeexec.egress.denied target={Target} (not on the install registry allowlist)", target);
+                "codeexec.egress.denied target={Target} (not on the install registry allowlist)", LogContent.Of(target));
         }
 
         private static async Task Refuse(NetworkStream stream, string status, string reason)

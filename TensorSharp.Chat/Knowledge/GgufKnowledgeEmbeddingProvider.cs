@@ -22,11 +22,23 @@ public sealed class GgufKnowledgeEmbeddingProvider : IKnowledgeEmbeddingProvider
 
     public GgufKnowledgeEmbeddingProvider(string path, string backend = "CPU", string queryPrefix = null, string documentPrefix = null)
     {
-        using var stream = File.OpenRead(path);
-        string hash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
-        _model = EmbeddingModel.Load(path, new EmbeddingModelOptions { Backend = backend });
-        (_queryPrefix, _documentPrefix) = ResolvePrefixes(_model.Architecture, queryPrefix, documentPrefix);
-        ModelId = $"gguf:sha256:{hash}:mean-parts-v1:{Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(_queryPrefix + "\0" + _documentPrefix)))}";
+        // A model load like the chat model's, so it gets the same model.load span and
+        // load-duration sample. The hash pass reads the whole file, so it counts too.
+        using var telemetry = ModelLoadTelemetry.StartLoad(path, mmProjPath: null, backend);
+        try
+        {
+            using var stream = File.OpenRead(path);
+            string hash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+            _model = EmbeddingModel.Load(path, new EmbeddingModelOptions { Backend = backend });
+            (_queryPrefix, _documentPrefix) = ResolvePrefixes(_model.Architecture, queryPrefix, documentPrefix);
+            ModelId = $"gguf:sha256:{hash}:mean-parts-v1:{Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(_queryPrefix + "\0" + _documentPrefix)))}";
+            telemetry.Loaded(_model.Architecture, (_model as EmbeddingModel)?.Backend);
+        }
+        catch (Exception ex)
+        {
+            telemetry.Failed(ex);
+            throw;
+        }
     }
 
     // An explicit empty prefix disables task prompting. Missing settings use

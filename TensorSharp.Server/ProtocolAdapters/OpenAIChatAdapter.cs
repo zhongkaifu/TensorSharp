@@ -178,6 +178,10 @@ public sealed partial class OpenAIChatAdapter
             return;
         }
         string requestId = OpenAIResponseFactory.NewRequestId();
+        // gen_ai.response.id on the HTTP server span, so a client quoting the chatcmpl id
+        // finds the trace. Set here, in this plain async method, from the request's own
+        // activity feature: the chat span below lives in a pipeline that never sees the id.
+        ServerSpan.SetResponseId(ctx, requestId);
 
         var openaiTools = ToolFunctionParser.ParseOpenAI(body);
         bool toolsDisabled = body.TryGetProperty("tool_choice", out var toolChoice) &&
@@ -239,7 +243,7 @@ public sealed partial class OpenAIChatAdapter
             openaiLogger.LogInformation(LogEventIds.ChatStarted,
                 "/v1/chat/completions request: id={ChatcmplId} model={Model} stream={Stream} maxTokens={MaxTokens} messages={Messages} tools={Tools} skills={Skills} thinking={Thinking} userInput=\"{LastUser}\"",
                 requestId, modelName, stream, maxTokens, messages.Count, openaiTools?.Count ?? 0,
-                requestedSkills?.Count ?? 0, openaiThink, lastOpenAiUserContent);
+                requestedSkills?.Count ?? 0, openaiThink, LogContent.Of(lastOpenAiUserContent));
 
         if (requestedSkills is { Count: > 0 } && !_options.SkillsEnabled)
         {

@@ -1,0 +1,68 @@
+# Copyright (c) Zhongkai Fu. All rights reserved.
+# https://github.com/zhongkaifu/TensorSharp
+#
+# This file is part of TensorSharp.
+#
+# TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+#
+# OpenTelemetry Collector configuration for the local stack in docker-compose.yml:
+#   traces  -> Jaeger (OTLP/gRPC inside the compose network)
+#   metrics -> a Prometheus scrape endpoint on :8889, scraped by the prometheus service
+#   logs    -> the debug exporter, i.e. the collector's own console (docker compose logs otel-collector)
+#
+# Written for otelcol-contrib 0.164.0 (the image tag in docker-compose.yml). Component names
+# follow that release: the OTLP gRPC exporter is otlp_grpc (formerly otlp, still accepted as a
+# deprecated alias).
+
+receivers:
+  otlp:
+    protocols:
+      # The receiver binds to localhost by default, which inside a container is unreachable from
+      # the host; listen on every interface of the container instead. docker-compose.yml decides
+      # who can reach these ports from outside.
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # First in every pipeline: refuses data before the collector runs out of memory. The limits fit
+  # the 1 GiB mem_limit in docker-compose.yml.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 800
+    spike_limit_mib: 200
+  # Last before the exporters: groups spans, data points and log records into fewer requests.
+  batch:
+    timeout: 1s
+
+exporters:
+  otlp_grpc/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      # Plain gRPC inside the compose network.
+      insecure: true
+  prometheus:
+    # Scraped by the prometheus service (prometheus.yml). service.name and service.instance.id
+    # become the job and instance labels; other resource attributes go to target_info.
+    endpoint: 0.0.0.0:8889
+  debug:
+    # normal: one line per log record. TensorSharp redacts content from exported logs unless
+    # OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true, so redacted values print as
+    # [redacted: N chars]. detailed also prints every attribute.
+    verbosity: normal
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_grpc/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]

@@ -186,13 +186,19 @@ public sealed class OpenAIResponsesAdapter
         var requestedSkills = SkillSelectionParser.Parse(body);
 
         string requestId = OpenAIResponsesFactory.NewResponseId();
+        // gen_ai.response.id on the HTTP server span (see OpenAIChatAdapter for why there) —
+        // except for a stored response with content capture off: GET /v1/responses/{id} returns
+        // a stored response, model output included, to anyone who has the id, so the id is a key
+        // to the content and stays out of telemetry like the content itself.
+        if (!store || TensorSharp.Runtime.Telemetry.TensorSharpTelemetry.CaptureMessageContent)
+            ServerSpan.SetResponseId(ctx, requestId);
 
         string lastUserContent = LoggingExtensions.SanitizeForLogFull(messages.LastOrDefault(m => m.Role == "user")?.Content ?? string.Empty);
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInformation(LogEventIds.ChatStarted,
                 "/v1/responses request: id={ResponseId} model={Model} stream={Stream} maxOutputTokens={MaxOutputTokens} messages={Messages} tools={Tools} skills={Skills} thinking={Thinking} userInput=\"{LastUser}\"",
-                requestId, modelName, stream, maxOutputTokens, messages.Count, tools?.Count ?? 0,
-                requestedSkills?.Count ?? 0, enableThinking, lastUserContent);
+                store ? LogContent.Of(requestId) : requestId, modelName, stream, maxOutputTokens, messages.Count, tools?.Count ?? 0,
+                requestedSkills?.Count ?? 0, enableThinking, LogContent.Of(lastUserContent));
 
         if (requestedSkills is { Count: > 0 } && !_options.SkillsEnabled)
         {
@@ -251,7 +257,7 @@ public sealed class OpenAIResponsesAdapter
             if (logger.IsEnabled(LogLevel.Information))
                 logger.LogInformation(LogEventIds.SkillSelected,
                     "/v1/responses skills: id={ResponseId} selected={Selected} announced={Announced} inlined={Inlined} catalog={Catalog} tools={ToolsOffered}",
-                    requestId, skillPlan.DescribeSelection(), skillPlan.Prompt.Deferred.Count,
+                    store ? LogContent.Of(requestId) : requestId, skillPlan.DescribeSelection(), skillPlan.Prompt.Deferred.Count,
                     skillPlan.Prompt.Inlined.Count,
                     skillPlan.Prompt.Catalog.Count, skillPlan.ToolsOffered);
         }
@@ -280,7 +286,7 @@ public sealed class OpenAIResponsesAdapter
             }
             if (lora != null)
                 logger.LogInformation(LogEventIds.ChatStarted,
-                    "/v1/responses lora: id={ResponseId} adapter={Adapter}", requestId, lora.Id);
+                    "/v1/responses lora: id={ResponseId} adapter={Adapter}", store ? LogContent.Of(requestId) : requestId, lora.Id);
         }
 
         inferenceMessages = await knowledge.PrepareAsync(ctx, inferenceMessages, skillPlan?.ToolsOffered == true,

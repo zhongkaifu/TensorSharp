@@ -1,0 +1,9 @@
+# Copyright (c) Zhongkai Fu. All rights reserved.
+# https://github.com/zhongkaifu/TensorSharp
+#
+# This file is part of TensorSharp.
+#
+# TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+#
+# The dashboard's real API keys live in .env, copied from .env.example.
+.env

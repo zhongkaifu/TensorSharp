@@ -494,7 +494,7 @@ TensorSharp/
 
 仓库按包边界拆成独立层，使用者可以只引用真正需要的部分。
 
-**状态核验于 2026-09-25。** 发布集合共 **13** 个包，即下表的每一行。`eng/verify-packages.ps1` 是这份清单的权威来源，并且它是发布流水线的门禁：在两个可打包项目之间新增 `ProjectReference` 而不同步更新该脚本，会直接让发布失败。
+**状态核验于 2026-09-25。** 发布集合共 **16** 个包，即下表的每一行。`TensorSharp.Telemetry` 是新增的包，尚未发布到 NuGet.org。`eng/verify-packages.ps1` 是这份清单的权威来源，并且它是发布流水线的门禁：在两个可打包项目之间新增 `ProjectReference` 而不同步更新该脚本，会直接让发布失败。
 
 [NuGet.org](https://www.nuget.org/profiles/TensorSharp) 上的现状：13 个包 ID 均已发布 **2026.9.1**，于 2026-09-17 由标签 `v2026.09.01` 发布。**3.4.0**（2026-09-12，标签 `v3.4.0.0`）是首个包含 `TensorSharp.Runtime.Logging`、`TensorSharp.AgentHost`、`TensorSharp.Chat`、`TensorSharp.Server.Host` 与 `TensorSharp.Distributed` 的版本。更早的 **3.1.2**（2026-07-21）只有 8 个包 ID——`TensorSharp.Tensors`、`TensorSharp.Runtime`、`TensorSharp.Models`、`TensorSharp.Backends.GGML`、`TensorSharp.Backends.Cuda`、`TensorSharp.Backends.MLX`、`TensorSharp.Server` 与 `TensorSharp.Cli`——且其中的 `TensorSharp.Server` 早于日志层与聊天层拆分，与这里描述的分层并不一致。每个包版本都是其标签时的快照；`v2026.09.01` 之后的源码改动要等下一个版本标签才会发布到 NuGet.org。
 
@@ -510,10 +510,12 @@ TensorSharp/
 | `TensorSharp.Backends.Cuda` | `TensorSharp.Backends.Cuda` | `TensorSharp.Cuda` | Direct CUDA 分配器、存储、cuBLAS GEMM、PTX 内核和量化 CUDA 算子 |
 | `TensorSharp.Backends.MLX` | `TensorSharp.Backends.MLX` | `TensorSharp.MLX` | Apple Silicon MLX 后端（mlx-c / Metal），含量化 / 融合 / 编译内核与 MoE 专家 offload |
 | `TensorSharp.Distributed` | `TensorSharp.Distributed` | `TensorSharp.Distributed` | 用于多节点张量并行的点对点 TCP 协调层 |
+| `TensorSharp.Studio` | `TensorSharp.Studio` | `TensorSharp.Studio` | 共享的本地 Video Studio 服务：项目、命令、任务与渲染 |
 | `TensorSharp.Chat` | `TensorSharp.Chat` | `TensorSharp.Chat`（新类型）；迁入的流水线保留 `TensorSharp.Server.*` 命名空间 | 与宿主无关的聊天流水线：`ModelService`、会话、生成、技能循环与 Web UI 请求/流式契约（`WebUiChatService`、`SkillsService`）——不依赖 ASP.NET Core 与 `TensorSharp.Distributed`；由 Server、CLI 与 TensorAgent 共用 |
 | `TensorSharp.Server` | `TensorSharp.Server` | `TensorSharp.Server` | ASP.NET Core 服务、OpenAI/Ollama 适配层、TensorSharp.Chat 之上的 HTTP 传输层与 Web UI |
 | `TensorSharp.Server.Host` | `TensorSharp.Server.Host` | `TensorSharp.Server.Host` | **可运行**的 Web 应用：`Program.cs`、宿主装配、`wwwroot/` 与命令行。`TensorSharp.Server` 是它依赖的库——单独构建或运行 `TensorSharp.Server` 不会产生任何可执行文件 |
 | `TensorSharp.Cli` | `TensorSharp.Cli` | `TensorSharp.Cli` | 控制台宿主、调试工具与 JSONL 批处理 |
+| `TensorSharp.Telemetry` | `TensorSharp.Telemetry` | `TensorSharp.Telemetry` | 两个宿主可选启用的 OpenTelemetry：配置解析、OTLP 与 Azure Monitor 导出器、日志脱敏。仅供宿主引用，库的使用者不会引入 SDK；各库通过内置的 `ActivitySource` / `Meter`（`TensorSharp.Runtime/Telemetry`）记录 |
 
 这样的拆分让引擎使用者不必带上 Web 依赖，也能把 API 层改动和核心运行时隔离开，并让后续 benchmark / eval harness 更容易独立发布。
 

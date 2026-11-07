@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\</OutputPath>
+    <IsPackable>true</IsPackable>
+    <Description>Opt-in OpenTelemetry traces, metrics and logs for TensorSharp hosts: OTLP to any collector, or Azure Monitor (Application Insights) with one setting.</Description>
+    <PackageTags>$(TensorSharpPackageTags);opentelemetry;observability;tracing;metrics;application-insights</PackageTags>
+  </PropertyGroup>
+  <!-- Host-only. The libraries instrument themselves with the in-box System.Diagnostics
+       ActivitySource and Meter (TensorSharp.Runtime/Telemetry); only the two hosts reference
+       this project, so a NuGet consumer of the libraries (and TensorAgent) never gets the SDK.
+       It deliberately has no ASP.NET Core dependency: the CLI references it too, and the
+       server host adds the ASP.NET Core instrumentation itself. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="InferenceWeb.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Azure.Identity" Version="1.21.0" />
+    <PackageReference Include="Azure.Monitor.OpenTelemetry.Exporter" Version="1.10.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.6" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.20.1" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.20.1" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.20.1" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.20.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
+  </ItemGroup>
+</Project>

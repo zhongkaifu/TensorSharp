@@ -21,6 +21,7 @@ using System.IO;
 using System.Linq;
 using TensorSharp.GGML;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Telemetry;
 using TensorSharp.Models.QwenImage;
 using TensorSharp.Models.Video;
 using TensorSharp.Models.WanVideo;
@@ -30,6 +31,13 @@ namespace TensorSharp.Models.MiniMaxH3
     /// <summary>Drives a MiniMax-H3 generation request end to end.</summary>
     internal sealed class MiniMaxH3Pipeline : IDisposable
     {
+        // Facts the progress reports carry for telemetry (VideoGenerationProgress.Attributes):
+        // the text encoder's open / trunk / remainder split, and why the denoiser was released.
+        private const string OpenSecondsAttribute = "tensorsharp.video.open_s";
+        private const string RunSecondsAttribute = "tensorsharp.video.run_s";
+        private const string TeardownSecondsAttribute = "tensorsharp.video.teardown_s";
+        private const string ReleaseReasonAttribute = "tensorsharp.video.release_reason";
+
         private readonly MiniMaxH3Model _model;
         private MiniMaxH3DiT _dit;
         private MiniMaxH3Partition? _ditPartition;
@@ -139,6 +147,12 @@ namespace TensorSharp.Models.MiniMaxH3
                 ? LoadReferences(p, width, height, shape.Frames)
                 : null;
 
+            // Everything up to the first denoise report counts as text-encode for the hosts, which
+            // show phases. The stages inside it are reported for telemetry: the encoder, the wait
+            // for the read-ahead, the DiT load and the keyframe or reference encodes are what make
+            // a first clip so much slower than the next.
+            Report(p, "text-encode", 0, steps, total, stage: "text-encoder");
+
             // Warming the denoiser file is pure disk work and the text encoder that runs
             // next is pure GPU work, so mode 2 starts it here and collects it just before
             // the first upload. Mode 1 does the same read serially after the encoder is
@@ -242,6 +256,16 @@ namespace TensorSharp.Models.MiniMaxH3
                                   + $"{textClock.Elapsed.TotalSeconds - teOpenClock.Elapsed.TotalSeconds - teRunSeconds:F1}s");
             Console.WriteLine($"  [h3] text conditioning: {textLength} tokens in " +
                               $"{textClock.Elapsed.TotalSeconds:F1}s");
+            Report(p, "text-encode", 0, steps, total, stage: "text-encoder",
+                attributes: p.OnProgress == null ? null : new Dictionary<string, object>
+                {
+                    [OpenSecondsAttribute] = Math.Round(teOpenClock.Elapsed.TotalSeconds, 3),
+                    [RunSecondsAttribute] = Math.Round(teRunSeconds, 3),
+                    // The remainder, as TS_H3_PHASE prints it: the dispose, plus the vision-tower
+                    // encodes and the tokenization that run between the open and the trunk.
+                    [TeardownSecondsAttribute] = Math.Round(
+                        textClock.Elapsed.TotalSeconds - teOpenClock.Elapsed.TotalSeconds - teRunSeconds, 3),
+                });
 
             // The encoder has just handed its ~17 GB back, so this is the moment the host has
             // room to cache the denoiser. Sequential read now beats scattered fault-in during
@@ -254,6 +278,7 @@ namespace TensorSharp.Models.MiniMaxH3
             // about the longer of the pair.
             if (prefault != null && PrefaultMode != 3)
             {
+                Report(p, "text-encode", 0, steps, total, stage: "prefault-wait");
                 var wait = Stopwatch.StartNew();
                 double pf = prefault.GetAwaiter().GetResult();
                 wait.Stop();
@@ -265,6 +290,13 @@ namespace TensorSharp.Models.MiniMaxH3
             }
 
 
+            // cached = the DiT object is reused, not that its weights are still on the device:
+            // Metal gives residency up before every text encode, CUDA after a denoise whose VAE
+            // would not fit, and the next Forward uploads them again inside step 1.
+            bool ditCached = _dit != null && _ditPartition == partition;
+            Report(p, "text-encode", 0, steps, total, stage: "dit-load",
+                attributes: p.OnProgress == null ? null
+                    : new Dictionary<string, object> { [TelemetryAttributes.VideoCached] = ditCached });
             var ditClock = Stopwatch.StartNew();
             if (_dit == null || _ditPartition != partition)
             {
@@ -286,6 +318,7 @@ namespace TensorSharp.Models.MiniMaxH3
             var keyframeAtEnd = new List<bool>();
             if (mode is MiniMaxH3Mode.ImageToVideo or MiniMaxH3Mode.FirstLastFrame)
             {
+                Report(p, "text-encode", 0, steps, total, stage: "image-encode");
                 _vae ??= _model.CreateVideoVae();
                 var parts = new List<float[]>();
                 void AddKeyframe(RgbImage scaled, bool atEnd)
@@ -320,6 +353,7 @@ namespace TensorSharp.Models.MiniMaxH3
             List<H3CondChunk> condChunks = null;
             if (references is { Count: > 0 })
             {
+                Report(p, "text-encode", 0, steps, total, stage: "reference-encode");
                 referenceBlocks = new List<MiniMaxH3ReferenceBlock>(references.Count);
                 condChunks = new List<H3CondChunk>();
                 var videoParts = new List<float[]>();
@@ -492,16 +526,25 @@ namespace TensorSharp.Models.MiniMaxH3
 
             // ---- decode video ----
             Report(p, "vae-decode", steps, steps, total);
-            ReleaseDenoiserIfVaeWouldNotFit();
+            ReleaseDenoiserIfVaeWouldNotFit(reason => Report(p, "vae-decode", steps, steps, total,
+                stage: "denoiser-release",
+                attributes: p.OnProgress == null ? null
+                    : new Dictionary<string, object> { [ReleaseReasonAttribute] = reason }));
             // The VAE is deliberately NOT prefaulted. Measured at 640x384 the read costs
             // 1.9 s and the decode does not move (9.4 s against 9.1 s), so it is a straight
             // loss: at 4.85 GB the VAE is small enough that its upload is not fault-bound the
             // way the 10.6 GB denoiser is, and its decode is compute-bound rather than
             // transfer-bound. Prefaulting pays only where a large file meets a first-touch
             // upload.
+            // cached: kept from an earlier clip or from this clip's keyframe encode, so the
+            // open is close to free; the weights upload inside the decode either way.
+            Report(p, "vae-decode", steps, steps, total, stage: "vae-open",
+                attributes: p.OnProgress == null ? null
+                    : new Dictionary<string, object> { [TelemetryAttributes.VideoCached] = _vae != null });
             var vaeOpenClock = Stopwatch.StartNew();
             _vae ??= _model.CreateVideoVae();
             vaeOpenClock.Stop();
+            Report(p, "vae-decode", steps, steps, total, stage: "vae-decode");
 
             float[] latent = MiniMaxH3DiT.UnpatchifyVideo(
                 videoPatches, shape.LatentFrames, shape.LatentHeight, shape.LatentWidth,
@@ -512,7 +555,9 @@ namespace TensorSharp.Models.MiniMaxH3
             var vaeRunClock = Stopwatch.StartNew();
             float[] pixels = _vae.Decode(
                 latent, shape.LatentFrames, shape.LatentHeight, shape.LatentWidth,
-                (tile, tiles) => Report(p, "vae-decode", steps, steps, total, $"tile {tile}/{tiles}"));
+                (tile, tiles) => Report(p, "vae-decode", steps, steps, total, $"tile {tile}/{tiles}", "vae-decode",
+                    p.OnProgress == null ? null
+                        : new Dictionary<string, object> { [TelemetryAttributes.VideoTiles] = tiles }));
             vaeRunClock.Stop();
             if (PhaseTiming)
                 Console.WriteLine($"  [h3] .. video VAE open {vaeOpenClock.Elapsed.TotalSeconds:F1}s, "
@@ -1384,8 +1429,13 @@ namespace TensorSharp.Models.MiniMaxH3
             return frames;
         }
 
+        /// <summary>Report progress. <paramref name="stage"/> names a part of the phase for
+        /// telemetry and is repeated on every report made inside it (a report without one ends
+        /// it); <paramref name="attributes"/> are facts about that stage. Neither changes the
+        /// phase the hosts show.</summary>
         private static void Report(VideoGenerationParams p, string phase, int step, int steps,
-                                  Stopwatch sw, string detail = null)
+                                  Stopwatch sw, string detail = null, string stage = null,
+                                  IReadOnlyDictionary<string, object> attributes = null)
         {
             if (p.OnProgress == null) return;
             double elapsed = sw.Elapsed.TotalSeconds;
@@ -1398,6 +1448,8 @@ namespace TensorSharp.Models.MiniMaxH3
                 Detail = detail,
                 ElapsedSeconds = elapsed,
                 EtaSeconds = eta,
+                Stage = stage,
+                Attributes = attributes,
             });
         }
 
@@ -1427,10 +1479,14 @@ namespace TensorSharp.Models.MiniMaxH3
         /// (<see cref="ReleaseKeptNetworksForTheTextEncoder"/>), and the next graph re-creates
         /// the gallocr, so releasing both here costs nothing. TS_H3_KEEP_RESIDENT=1 keeps
         /// the weights, as it does there; the gallocr goes regardless.</para></summary>
-        private void ReleaseDenoiserIfVaeWouldNotFit()
+        /// <param name="releasing">Told just before anything is released, with why ("metal" or
+        /// "vram"), so the caller can report the release as a stage of its own. Not called when
+        /// nothing is released.</param>
+        private void ReleaseDenoiserIfVaeWouldNotFit(Action<string> releasing = null)
         {
             if (_model.Backend == BackendType.GgmlMetal)
             {
+                releasing?.Invoke("metal");
                 if (Environment.GetEnvironmentVariable("TS_H3_KEEP_RESIDENT") != "1")
                     _dit?.ReleaseDeviceResidency();
                 GgmlBasicOps.ReleaseReuseComputeBuffers();
@@ -1443,6 +1499,7 @@ namespace TensorSharp.Models.MiniMaxH3
             long need = _model.VideoVaeResidentBytesEstimate();
             if (need <= 0 || spare >= need)
                 return;   // it fits alongside the denoiser; keep it resident
+            releasing?.Invoke("vram");
             _dit.ReleaseDeviceResidency();
         }
 

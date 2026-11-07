@@ -275,7 +275,7 @@ namespace TensorSharp.AgentHost.CodeExec
                   .Append(string.Join(", ", denied.Take(6)))
                   .Append(". Those connections were refused.\n");
                 _logger.LogInformation(LogEventIds.CodeExecEgressDenied,
-                    "codeexec.egress.denied hosts={Hosts}", string.Join(",", denied.Take(6)));
+                    "codeexec.egress.denied hosts={Hosts}", LogContent.Of(string.Join(",", denied.Take(6))));
             }
 
             // Not unconditional. This was appended after a TIMEOUT and after a proxy

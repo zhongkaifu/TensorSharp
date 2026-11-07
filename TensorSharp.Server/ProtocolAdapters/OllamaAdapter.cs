@@ -200,7 +200,7 @@ public sealed class OllamaAdapter
             generateLogger.LogInformation(LogEventIds.ChatStarted,
                 "/api/generate request: model={Model} stream={Stream} maxTokens={MaxTokens} images={ImageCount} promptChars={PromptLength} prompt=\"{Prompt}\"",
                 modelName, stream, maxTokens, imagePaths?.Count ?? 0, prompt?.Length ?? 0,
-                LoggingExtensions.SanitizeForLog(prompt, 512));
+                LogContent.Of(LoggingExtensions.SanitizeForLog(prompt, 512)));
 
         if (stream)
         {
@@ -390,7 +390,7 @@ public sealed class OllamaAdapter
             ollamaLogger.LogInformation(LogEventIds.ChatStarted,
             "/api/chat/ollama request: model={Model} stream={Stream} maxTokens={MaxTokens} messages={Messages} tools={Tools} skills={Skills} thinking={Thinking} userInput=\"{LastUser}\"",
             modelName, stream, maxTokens, messages.Count, ollamaTools?.Count ?? 0,
-            requestedSkills?.Count ?? 0, ollamaThink, lastOllamaUserContent);
+            requestedSkills?.Count ?? 0, ollamaThink, LogContent.Of(lastOllamaUserContent));
 
         if (requestedSkills is { Count: > 0 } && !_options.SkillsEnabled)
         {

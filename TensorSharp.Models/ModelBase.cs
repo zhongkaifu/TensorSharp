@@ -47,6 +47,10 @@ namespace TensorSharp.Models
         // outlives this model; the owner releases the context's pool when it is disposed.
         private readonly bool _ownsGgmlContext;
         protected IAllocator _allocator;
+        /// <summary>The allocator this model's tensors are on, for the GPU memory gauges
+        /// (<see cref="Telemetry.GpuMemoryTelemetry"/>), which pick their device query by its
+        /// type. Null on a model built without its constructor (a test fake).</summary>
+        internal IAllocator DirectAllocatorForTelemetry => _allocator;
         protected readonly BackendType _backend;
 
         protected readonly Dictionary<string, Tensor> _weights = new();

@@ -45,6 +45,7 @@
 - **消息编辑** —— 在 Web 聊天界面中编辑或删除历史消息，并从该位置重新生成回复
 - **文本/图像/音频/视频/PDF 上传** —— Web 界面支持最大 500 MB 的文件上传并完整保留文本内容；原生数字 PDF 会完整提取文本层并内联进提示词（可通过 `TS_PDF_MAX_PAGES` 显式限制页数），扫描版 PDF 则渲染成页面图像交给支持视觉的模型。最终提示词按模型的实际上下文窗口检查，而不是使用任意的上传预算。CLI 在单次模式下可通过 `--pdf <file>` 接受 PDF
 - **每轮可观测性** —— 结构化日志会完整保留用户输入与模型原始输出（包括 `<think>` 思维链和最终结果），并记录 KV 缓存命中率。同样的命中率指标通过所有 API 透出：Ollama 的 `prompt_cache_hit_tokens` / `prompt_cache_hit_ratio`、OpenAI 的 `usage.prompt_tokens_details.cached_tokens`，以及 Web UI SSE `done` 事件中的 `promptTokens` / `kvReusedTokens` / `kvReusePercent`
+- **OpenTelemetry（可选）** —— 服务端与 CLI 可通过 OTLP（`OTEL_EXPORTER_OTLP_ENDPOINT` 或 `--otel-endpoint`）导出 trace、指标和日志，也可直接发往 Application Insights（`APPLICATIONINSIGHTS_CONNECTION_STRING`）。一次聊天请求是一条 trace，从 HTTP span 一直覆盖到提示词渲染、排队、prefill 与 decode，并带有遵循 GenAI 语义约定的属性和指标（请求时长、首 token 时间、每个输出 token 的时间、token 数）。工具调用、代码执行、模型加载、嵌入、图像、MiniMax-H3 与 LTX 2.5 视频的各阶段和子阶段，以及 Video Studio 任务都有各自的 span。默认关闭；除非设置 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`，导出数据中的内容都会被脱敏。详见[遥测](USAGE_zh-cn.md#遥测opentelemetry)
 
 
 ## 个人知识库

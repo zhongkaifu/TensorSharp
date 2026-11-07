@@ -131,6 +131,13 @@ namespace TensorSharp.Runtime.Logging
         // and it quietly costing seconds on every tool call.
         public static readonly EventId CodeExecForkWedged = new(1629, nameof(CodeExecForkWedged));
 
+        // Media generation: their own ids so a query (or an exported log) can tell a clip's
+        // start, phase changes, completion and refusal apart.
+        public static readonly EventId VideoGenerateStarted = new(1640, nameof(VideoGenerateStarted));
+        public static readonly EventId VideoGenerateCompleted = new(1641, nameof(VideoGenerateCompleted));
+        public static readonly EventId VideoGenerateRejected = new(1642, nameof(VideoGenerateRejected));
+        public static readonly EventId VideoGeneratePhase = new(1643, nameof(VideoGeneratePhase));
+
         // CLI --------------------------------------------------------------
         public static readonly EventId CliStarted = new(1700, nameof(CliStarted));
         public static readonly EventId CliCompleted = new(1701, nameof(CliCompleted));

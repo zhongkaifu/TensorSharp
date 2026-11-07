@@ -25,7 +25,10 @@ public static class WebUiEndpoints
 {
     public static IEndpointRouteBuilder MapWebUiEndpoints(this IEndpointRouteBuilder endpoints)
     {
-        endpoints.MapGet("/api/queue/status", (WebUiAdapter adapter) => adapter.GetQueueStatus());
+        // The Web UI polls this on a tight loop, so it is left out of ASP.NET Core's
+        // http.server.request.duration metric as it is out of traces.
+        endpoints.MapGet("/api/queue/status", (WebUiAdapter adapter) => adapter.GetQueueStatus())
+            .DisableHttpMetrics();
         endpoints.MapGet("/api/models", (HttpContext ctx) => ctx.RequestServices.GetService<EmbeddingAdapter>()?.GetWebModels()
             ?? ctx.RequestServices.GetRequiredService<WebUiAdapter>().GetModels());
         endpoints.MapPost("/api/models/load",

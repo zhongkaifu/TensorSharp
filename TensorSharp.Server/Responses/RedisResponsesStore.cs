@@ -12,6 +12,7 @@ using System.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Redis;
+using TensorSharp.Runtime.Logging;
 
 namespace TensorSharp.Server.Responses;
 
@@ -54,7 +55,7 @@ public sealed class RedisResponsesStore : IResponsesStore, IDisposable
         byte[] json = Encoding.UTF8.GetBytes(response.Json);
         if (!_redis.StringSet(key, json, _ttl))
         {
-            _logger.LogWarning("Failed to store response {ResponseId} in Redis", response.Id);
+            _logger.LogWarning("Failed to store response {ResponseId} in Redis", LogContent.Of(response.Id));
         }
     }
 

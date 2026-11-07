@@ -12,6 +12,7 @@ using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using TensorSharp.Runtime.Logging;
 using TensorSharp.Runtime.Paged;
 using TensorSharp.Runtime.Scheduling.PrefixCache;
 using TensorSharp.Runtime.Speculative;
@@ -57,6 +58,23 @@ namespace TensorSharp.Runtime.Scheduling
         private long _totalForwardTicks;
         private bool _disposed;
 
+        // Tags of the per-step histograms, built once so recording a step allocates nothing.
+        // The step kind says whether a step's duration is a prompt chunk, a batched decode, or
+        // both; the values are TensorSharp's own (TelemetryAttributes.StepKind).
+        private const string StepKindPrefill = "prefill";
+        private const string StepKindDecode = "decode";
+        private const string StepKindMixed = "mixed";
+        private static readonly KeyValuePair<string, object?> s_prefillStepTag = new(Telemetry.TelemetryAttributes.StepKind, StepKindPrefill);
+        private static readonly KeyValuePair<string, object?> s_decodeStepTag = new(Telemetry.TelemetryAttributes.StepKind, StepKindDecode);
+        private static readonly KeyValuePair<string, object?> s_mixedStepTag = new(Telemetry.TelemetryAttributes.StepKind, StepKindMixed);
+        private readonly KeyValuePair<string, object?> _architectureTag;
+
+        // TENSORSHARP_OTEL_TRACE_STEPS: the step span, its link cap, and the one attribute only
+        // it carries (a count, so it stays off the metrics).
+        private const string StepSpanName = "inference.step";
+        private const int MaxStepSpanLinks = 32;
+        private const string ScheduledTokensAttribute = "tensorsharp.engine.scheduled_tokens";
+
         /// <summary>Whether the radix prefix cache serves this loaded model (prefix
         /// caching is on and the model implements the prefix-cache contract).</summary>
         public bool PrefixCacheActive => _executor.RadixPrefixCacheEnabled;
@@ -80,6 +98,10 @@ namespace TensorSharp.Runtime.Scheduling
             _stopRepetition = cfg.StopRepetition;   // cfg is null-checked above
             _nativeSlotContextLimit = UsesNativeDeepSeek41Slots(model) ? Math.Max(0, model.MaxContextLength) : 0;
             _contextLimit = Math.Max(0, model.MaxContextLength);
+            // The same name the engine gauges use (TensorSharpMetrics.RegisterEngine).
+            string? architecture = model.Config?.Architecture;
+            _architectureTag = new(Telemetry.TelemetryAttributes.ModelArchitecture,
+                string.IsNullOrEmpty(architecture) ? "unknown" : architecture);
 
             long blockBytes = ComputeBlockByteSize(model, cfg.BlockSize);
             int numBlocks = ResolveEffectiveNumBlocks(model, cfg, _logger);
@@ -127,6 +149,9 @@ namespace TensorSharp.Runtime.Scheduling
                 Name = $"TensorSharp.InferenceEngine[{model.Config?.Architecture ?? "model"}]",
             };
             _worker.Start();
+            // The engine gauges (running, waiting, steps, KV blocks) read the counters above at
+            // collection time; registering costs nothing when telemetry is off.
+            Telemetry.TensorSharpMetrics.RegisterEngine(this, model.Config?.Architecture);
         }
 
         public IModelArchitecture Model => _model;
@@ -323,6 +348,11 @@ namespace TensorSharp.Runtime.Scheduling
                 if (!left)
                     _logger.LogWarning("InferenceEngine worker did not leave its step within 60s of shutdown; releasing anyway");
             }
+            // Only now: a step that was running when Dispose began has counted itself in
+            // TotalStepsRun and TotalForwardTime (and the step histograms), and unregistering
+            // folds those totals into the retired ones, so the step counters match the histograms.
+            // Before the resources below are freed, so a metrics collection never reads them.
+            Telemetry.TensorSharpMetrics.UnregisterEngine(this);
             // Nobody is going to finish these now. A consumer awaiting one of them --
             // another conversation's turn, on a phone -- would otherwise wait forever.
             var abandoned = new ObjectDisposedException(nameof(InferenceEngine),
@@ -350,6 +380,12 @@ namespace TensorSharp.Runtime.Scheduling
 
         private void WorkerLoop()
         {
+            // Thread.Start flowed the ExecutionContext of whichever request lazily built the
+            // engine, and the engine serves every request, so nothing it traces should inherit
+            // that request's span. (UnsafeStart would also drop the inherited logging scope and
+            // change what the engine's log lines print.)
+            System.Diagnostics.Activity.Current = null;
+            Telemetry.TelemetryContext.Clear();
             var sw = new System.Diagnostics.Stopwatch();
             while (!_shutdownCts.IsCancellationRequested)
             {
@@ -448,8 +484,10 @@ namespace TensorSharp.Runtime.Scheduling
                         continue;
                     }
 
+                    long stepTicks = sw.ElapsedTicks;
                     Interlocked.Increment(ref _totalStepsRun);
-                    Interlocked.Add(ref _totalForwardTicks, sw.ElapsedTicks);
+                    Interlocked.Add(ref _totalForwardTicks, stepTicks);
+                    RecordStepMetrics(output, stepTicks);
 
                     // Post-step: emit tokens, detect stop conditions, finish sequences.
                     ApplyResults(results, output);
@@ -461,9 +499,95 @@ namespace TensorSharp.Runtime.Scheduling
                     // notification the slot pool grows unbounded and slot indices
                     // get reused incorrectly across abandoned sequences.
                     NotifyReleasedSequences(output);
+
+                    // The optional step span is built here, from the step's measured times
+                    // and after its tokens went out, so the step itself pays nothing for it.
+                    // A listener check first: TraceSteps may read the environment.
+                    if (Telemetry.TensorSharpTelemetry.Inference.HasListeners() && Telemetry.TensorSharpTelemetry.TraceSteps)
+                        TraceStep(output, stepTicks, sw.ElapsedTicks);
+
+                    // The step observer (device-memory snapshots) still runs under the GPU lock,
+                    // which a snapshot needs, but after the step's tokens went out, so it never
+                    // delays one. A null check unless an observer is registered.
+                    Telemetry.TensorSharpMetrics.OnEngineStep();
                 }
             }
         }
+
+        /// <summary>Step duration (scheduling plus execution, the time <see cref="TotalForwardTime"/>
+        /// sums) and batch size of a step that ran. Engine thread, once per step; with no meter
+        /// listener attached it is two flag reads.</summary>
+        private void RecordStepMetrics(SchedulerOutput output, long stepTicks)
+        {
+            var duration = Telemetry.TensorSharpMetrics.EngineStepDuration;
+            var batchSize = Telemetry.TensorSharpMetrics.EngineBatchSize;
+            if (!duration.Enabled && !batchSize.Enabled)
+                return;
+            var kind = StepKindTag(output.ScheduledWork);
+            duration.Record((double)stepTicks / System.Diagnostics.Stopwatch.Frequency, _architectureTag, kind);
+            batchSize.Record(output.ScheduledWork.Count, _architectureTag, kind);
+        }
+
+        /// <summary>Whether a step forwarded prompt chunks, decode tokens, or both.</summary>
+        private static KeyValuePair<string, object?> StepKindTag(List<ScheduledSequenceWork> work)
+        {
+            bool prefill = false, decode = false;
+            for (int i = 0; i < work.Count; i++)
+            {
+                if (work[i].IsPrefill) prefill = true;
+                else decode = true;
+            }
+            return prefill ? (decode ? s_mixedStepTag : s_prefillStepTag) : s_decodeStepTag;
+        }
+
+        /// <summary>
+        /// One <c>inference.step</c> span for a step that ran (TENSORSHARP_OTEL_TRACE_STEPS). A
+        /// batched step belongs to every request in it and a span has one parent, so the span is
+        /// a root in a trace of its own, linked to the request spans of the sequences it ran. It
+        /// is built after the fact: <paramref name="sinceStartTicks"/> is the step stopwatch now,
+        /// <paramref name="stepTicks"/> where the step itself ended.
+        /// </summary>
+        private void TraceStep(SchedulerOutput output, long stepTicks, long sinceStartTicks)
+        {
+            try
+            {
+                var work = output.ScheduledWork;
+                List<System.Diagnostics.ActivityLink>? links = null;
+                for (int i = 0; i < work.Count && (links == null || links.Count < MaxStepSpanLinks); i++)
+                {
+                    var context = work[i].Sequence.TelemetryContext;
+                    if (context == default)
+                        continue;
+                    links ??= new List<System.Diagnostics.ActivityLink>(Math.Min(work.Count, MaxStepSpanLinks));
+                    links.Add(new System.Diagnostics.ActivityLink(context));
+                }
+
+                DateTimeOffset start = DateTimeOffset.UtcNow - StopwatchTicksToTimeSpan(sinceStartTicks);
+                // parentContext default with Activity.Current null (WorkerLoop cleared it): a root.
+                var activity = Telemetry.TensorSharpTelemetry.Inference.StartActivity(
+                    StepSpanName, System.Diagnostics.ActivityKind.Internal, parentContext: default,
+                    links: links, startTime: start);
+                if (activity == null)
+                    return;
+                if (activity.IsAllDataRequested)
+                {
+                    activity.SetTag(Telemetry.TelemetryAttributes.ModelArchitecture, _architectureTag.Value);
+                    activity.SetTag(Telemetry.TelemetryAttributes.BatchSize, work.Count);
+                    activity.SetTag(Telemetry.TelemetryAttributes.StepKind, StepKindTag(work).Value);
+                    activity.SetTag(ScheduledTokensAttribute, output.TotalScheduledTokens);
+                }
+                activity.SetEndTime((start + StopwatchTicksToTimeSpan(stepTicks)).UtcDateTime);
+                activity.Stop();
+            }
+            catch (Exception ex)
+            {
+                // Profiling output must never fail the step loop that serves every request.
+                _logger.LogDebug(ex, "Recording the engine step span failed");
+            }
+        }
+
+        private static TimeSpan StopwatchTicksToTimeSpan(long ticks)
+            => TimeSpan.FromTicks((long)(ticks * ((double)TimeSpan.TicksPerSecond / System.Diagnostics.Stopwatch.Frequency)));
 
         private void NotifyReleasedSequences(SchedulerOutput output)
         {
@@ -514,7 +638,7 @@ namespace TensorSharp.Runtime.Scheduling
                 {
                     _logger.LogError(
                         cleanupEx,
-                        "Failed to release scheduler state for stalled sequence {RequestId}",
+                        "Failed to release scheduler state for stalled sequence {EngineRequestId}",
                         seq.RequestId);
                     released.Add(seq.RequestId);
                 }
@@ -570,7 +694,7 @@ namespace TensorSharp.Runtime.Scheduling
                 {
                     _logger.LogError(
                         cleanupEx,
-                        "Failed to release scheduler state for errored sequence {RequestId}",
+                        "Failed to release scheduler state for errored sequence {EngineRequestId}",
                         seq.RequestId);
                     released.Add(seq.RequestId);
                 }
@@ -658,8 +782,8 @@ namespace TensorSharp.Runtime.Scheduling
                 _logger.LogWarning(
                     ex,
                     retainFusedCache
-                        ? "Fused-cache retention failed for sequence {RequestId}"
-                        : "Fused-cache bookkeeping cleanup failed for sequence {RequestId}",
+                        ? "Fused-cache retention failed for sequence {EngineRequestId}"
+                        : "Fused-cache bookkeeping cleanup failed for sequence {EngineRequestId}",
                     requestId);
             }
 
@@ -670,7 +794,7 @@ namespace TensorSharp.Runtime.Scheduling
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Model release hook failed for sequence {RequestId}", requestId);
+                _logger.LogWarning(ex, "Model release hook failed for sequence {EngineRequestId}", requestId);
             }
         }
 
@@ -896,7 +1020,7 @@ namespace TensorSharp.Runtime.Scheduling
                         {
                             if (emittedCount < seq.MaxNewTokens)
                                 _logger.LogInformation(
-                                    "Request {RequestId} reached the model's {Context}-token context window after " +
+                                    "Request {EngineRequestId} reached the model's {Context}-token context window after " +
                                     "{Emitted} of {Requested} requested tokens; finishing it as a length stop",
                                     seq.RequestId, _contextLimit, emittedCount, seq.MaxNewTokens);
                             TruncateUnpublishedTail(seq, emittedCount);
@@ -928,17 +1052,18 @@ namespace TensorSharp.Runtime.Scheduling
                                 seq.GetOrCreateSampler().TryRequestThinkingClosure(seq.OutputTokens))
                             {
                                 _logger.LogWarning(
-                                    "Request {RequestId} closing looping reasoning after {Emitted} tokens (period {Period})",
+                                    "Request {EngineRequestId} closing looping reasoning after {Emitted} tokens (period {Period})",
                                     seq.RequestId, emittedCount, period);
                                 continue;
                             }
                             TruncateUnpublishedTail(seq, emittedCount);
                             LogSpeculationStatsIfAny(seq);
                             _logger.LogWarning(
-                                "Request {RequestId} stopped after {Emitted} tokens: {What} (period {Period})",
+                                "Request {EngineRequestId} stopped after {Emitted} tokens: {What} (period {Period})",
                                 seq.RequestId, emittedCount,
-                                RepetitionGuard.Describe(seq.OutputTokens, emittedCount, period, repeats,
-                                    ids => _model.Tokenizer?.Decode(ids)),
+                                // Quotes the repeated output, decoded: content, kept out of exported logs.
+                                LogContent.Of(RepetitionGuard.Describe(seq.OutputTokens, emittedCount, period, repeats,
+                                    ids => _model.Tokenizer?.Decode(ids))),
                                 period);
                             _scheduler.NotifyStop(seq, SequenceStatus.FinishedStopped, RepetitionGuard.FinishReason, output);
                             handle?.CompleteFinished();
@@ -989,7 +1114,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (st == null || (st.VerifySteps + st.PlainSteps) == 0)
                 return;
             _logger.LogInformation(
-                "Speculative decoding stats for {RequestId}: drafted={Drafted} accepted={Accepted} acceptance={Acceptance:P0} verifySteps={VerifySteps} plainSteps={PlainSteps} rollbacks={Rollbacks} | phaseMs draft={DraftMs:F0} verify={VerifyMs:F0} snapshot={SnapshotMs:F0} rollback={RollbackMs:F0} catchUp={CatchUpMs:F0} plain={PlainMs:F0} | governor plain={GovPlain:F1}ms/tok spec={GovSpec:F1}ms/tok wins={GovWins} losses={GovLosses} parked={GovParked}",
+                "Speculative decoding stats for {EngineRequestId}: drafted={Drafted} accepted={Accepted} acceptance={Acceptance:P0} verifySteps={VerifySteps} plainSteps={PlainSteps} rollbacks={Rollbacks} | phaseMs draft={DraftMs:F0} verify={VerifyMs:F0} snapshot={SnapshotMs:F0} rollback={RollbackMs:F0} catchUp={CatchUpMs:F0} plain={PlainMs:F0} | governor plain={GovPlain:F1}ms/tok spec={GovSpec:F1}ms/tok wins={GovWins} losses={GovLosses} parked={GovParked}",
                 seq.RequestId, st.TokensDrafted, st.TokensAccepted, st.AcceptanceRate,
                 st.VerifySteps, st.PlainSteps, st.RollbackSteps,
                 st.DraftMs, st.VerifyMs, st.SnapshotMs, st.RollbackMs, st.CatchUpMs, st.PlainMs,

@@ -7,6 +7,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using TensorSharp.Runtime.Telemetry;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.Jev;
 
@@ -37,7 +38,7 @@ public partial class ModelService
     public Task<object> JevAsync(JevRequest request, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _jevExecution.ExecuteAwaitedAsync(async ct =>
+        return TraceJevAsync(requestTelemetry => _jevExecution.ExecuteAwaitedAsync(async ct =>
         {
             if (_lifecycle.Model is not DiffusionGemmaModel model)
                 throw new JevModelUnavailableException("Jev inference requires a loaded DiffusionGemma model.");
@@ -106,7 +107,11 @@ public partial class ModelService
                     return JevInference.Run(inferenceRequest, LoadedModelName, text => model.Tokenizer.Encode(text, false).ToArray(),
                         Render, vision.Read, Math.Min(model.CanvasLength, ReadJevLimit("TS_JEV_MAX_CANVAS", 64, 8, 4096)),
                         model.MaxContextLength, eos, pad, model.Tokenizer.VocabSize, ct,
-                        imagePaths.Length, prepared?.Diagnostics, prepared?.PreprocessingMs ?? 0);
+                        imagePaths.Length, prepared?.Diagnostics, prepared?.PreprocessingMs ?? 0,
+                        // The same counts the response's usage reports. A read has no finish
+                        // reason and no first token: it scores labels, it does not stream.
+                        (inputTokens, outputTokens) => requestTelemetry.RecordUsage(
+                            inputTokens, outputTokens, 0, finishReason: null, firstTokenAtUtc: null));
                 }
                 finally
                 {
@@ -116,7 +121,52 @@ public partial class ModelService
                     if (entered) turns.Exit();
                 }
             }
-        }, cancellationToken);
+        }, cancellationToken));
+    }
+
+    // error.type of a Jev request refused for a reason the caller can act on (a 4xx or a retry).
+    private const string JevRefusedInvalidRequest = "invalid_request";
+    private const string JevRefusedModelNotFound = "model_not_found";
+    private const string JevRefusedModelUnavailable = "model_unavailable";
+    private const string JevRefusedQueueFull = "queue_full";
+
+    /// <summary>
+    /// The <c>chat</c> span and request metrics of one Jev request, which drives DiffusionGemma
+    /// itself rather than through ChatGenerationPipeline and so has no span of its own otherwise.
+    /// Started before the execution gate, so time queued behind other reads counts in the
+    /// request's duration; and in an async method of its own, so the span it makes current
+    /// does not stay current in the caller once this returns.
+    /// </summary>
+    private async Task<object> TraceJevAsync(Func<GenAiRequestTelemetry, Task<object>> run)
+    {
+        using GenAiRequestTelemetry requestTelemetry = GenAiRequestTelemetry.Start(
+            TelemetryAttributes.OperationChat, GenAiRequestTelemetry.ModelNameFromPath(LoadedModelPath), LoadedBackend);
+        try
+        {
+            return await run(requestTelemetry).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            switch (ex)
+            {
+                case JevValidationException:
+                    requestTelemetry.MarkRefused(JevRefusedInvalidRequest);
+                    break;
+                case JevModelNotFoundException:
+                    requestTelemetry.MarkRefused(JevRefusedModelNotFound);
+                    break;
+                case JevModelUnavailableException:
+                    requestTelemetry.MarkRefused(JevRefusedModelUnavailable);
+                    break;
+                case JevQueueFullException:
+                    requestTelemetry.MarkRefused(JevRefusedQueueFull);
+                    break;
+                default:
+                    requestTelemetry.MarkFailed(ex);   // a cancellation counts as cancelled
+                    break;
+            }
+            throw;
+        }
     }
 
     private UploadStoragePolicy ResolveMediaStorage()

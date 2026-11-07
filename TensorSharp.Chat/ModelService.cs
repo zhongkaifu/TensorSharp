@@ -370,16 +370,33 @@ namespace TensorSharp.Server
 
         private void LoadModelCore(string modelPath, string mmProjPath, string backendStr, bool startupLoad)
         {
-            using var jevLease = _jevExecution.BeginChange();
-            if (!_lifecycle.ShouldLoadDistributedModel(modelPath, mmProjPath, backendStr, startupLoad))
-                return;
-            // Tear down the per-model engine and the diffusion batch scheduler BEFORE the model is
-            // unloaded so their worker threads don't race the model disposal.
-            _engineHost.Reset();
-            _generation.ResetDiffusionScheduler();
-            lock (_intrinsicSession.HistoryLock)
-                _intrinsicSession.Transcripts.Clear();
-            _lifecycle.LoadModel(modelPath, mmProjPath, backendStr);
+            // Every server load (startup, the Web UI, a protocol adapter's reload) comes
+            // through here. Timed from the top, so the wait for a running Jev turn and the
+            // engine teardown count: they are part of how long the caller waits for a model.
+            using var telemetry = ModelLoadTelemetry.StartLoad(modelPath, mmProjPath, backendStr, startupLoad);
+            try
+            {
+                using var jevLease = _jevExecution.BeginChange();
+                if (!_lifecycle.ShouldLoadDistributedModel(modelPath, mmProjPath, backendStr, startupLoad))
+                {
+                    telemetry.Skipped();
+                    return;
+                }
+                // Tear down the per-model engine and the diffusion batch scheduler BEFORE the model is
+                // unloaded so their worker threads don't race the model disposal.
+                _engineHost.Reset();
+                _generation.ResetDiffusionScheduler();
+                lock (_intrinsicSession.HistoryLock)
+                    _intrinsicSession.Transcripts.Clear();
+                _lifecycle.LoadModel(modelPath, mmProjPath, backendStr);
+                telemetry.Loaded(_lifecycle.Architecture, _lifecycle.LoadedBackend,
+                    _lifecycle.LoadedTensorParallelDegree, _lifecycle.LoadedLayerSplitDegree);
+            }
+            catch (Exception ex)
+            {
+                telemetry.Failed(ex);
+                throw;
+            }
         }
 
         /// <summary>
@@ -397,11 +414,24 @@ namespace TensorSharp.Server
 
         private void UnloadModelCore()
         {
-            _engineHost.Reset();
-            _generation.ResetDiffusionScheduler();
-            lock (_intrinsicSession.HistoryLock)
-                _intrinsicSession.Transcripts.Clear();
-            _lifecycle.Unload();
+            // An explicit unload of a loaded model gets a span; with nothing loaded this
+            // only resets idle state, which is not worth one.
+            using ModelLoadTelemetry telemetry = _lifecycle.IsLoaded
+                ? ModelLoadTelemetry.StartUnload(_lifecycle.LoadedModelPath, _lifecycle.Architecture, _lifecycle.LoadedBackend)
+                : null;
+            try
+            {
+                _engineHost.Reset();
+                _generation.ResetDiffusionScheduler();
+                lock (_intrinsicSession.HistoryLock)
+                    _intrinsicSession.Transcripts.Clear();
+                _lifecycle.Unload();
+            }
+            catch (Exception ex)
+            {
+                telemetry?.Failed(ex);
+                throw;
+            }
         }
 
         /// <summary>
