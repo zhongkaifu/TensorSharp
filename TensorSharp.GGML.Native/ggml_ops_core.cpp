@@ -3008,11 +3008,20 @@ namespace tsg
 
         NodeProfileState& s = node_profile_state();
         std::lock_guard<std::mutex> lock(s.mu);
+        // TS_GGML_NODE_PROFILE=types splits the matmuls by weight type, which is
+        // what decides their kernel (and so how their cost grows with columns).
+        static const bool by_type = []{
+            const char* e = std::getenv("TS_GGML_NODE_PROFILE");
+            return e != nullptr && std::strcmp(e, "types") == 0;
+        }();
         for (int i = 0; i < n; i++)
         {
             ggml_tensor* node = ggml_graph_node(graph, i);
             const double us = per_node[static_cast<std::size_t>(i)];
-            NodeProfileBucket& b = s.buckets[ggml_op_name(node->op)];
+            std::string key = ggml_op_name(node->op);
+            if (by_type && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] != nullptr)
+                key += std::string(":") + ggml_type_name(node->src[0]->type);
+            NodeProfileBucket& b = s.buckets[key];
             b.us += us;
             b.calls++;
             if (us > b.shape_us) { b.shape_us = us; b.shape = node_shape_label(node); }
@@ -3030,7 +3039,7 @@ namespace tsg
                         tag != nullptr ? tag : "graph",
                         static_cast<long long>(s.graphs), s.nodes,
                         s.total_us / 1000.0 / static_cast<double>(s.graphs));
-            for (std::size_t i = 0; i < sorted.size() && i < 16; i++)
+            for (std::size_t i = 0; i < sorted.size() && i < 24; i++)
             {
                 const NodeProfileBucket& b = sorted[i].second;
                 std::fprintf(stderr, "    %-18s %8.3f ms/graph  %6.1f%%  %6lld nodes/graph  worst %s\n",

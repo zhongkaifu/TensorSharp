@@ -474,7 +474,8 @@ An 8-row Metal verify costs about what one row does, so the block gate's 0.35 -
 tuned where an extra verify row is expensive - only throws drafts away. On
 ggml_metal a Qwen 3.5-family trunk with a DFlash drafter now defaults to window 5
 and no gate (`SpecPreferredDraftWindow`, `SpecPreferredBlockGate`); `--spec-draft`
-and `--spec-pmin` still win. ggml_cuda keeps its measured solo-verify cap of 3.
+and `--spec-pmin` still win. ggml_cuda, whose verify replays the accepted prefix
+instead of keeping a state per row, now defaults to 7 (see the next sections).
 
 Treat the absolute numbers as indicative, not exact. On this laptop card a plain
 decode - which does identical work per token whatever the prompt - measured 18.7
@@ -569,7 +570,9 @@ WDDM paging and the trunk's own verify slows from 78 ms to 128 ms. Match the
 drafter quant to the headroom, not to the best available fidelity.
 
 **The window is a workload choice, and the default is the conservative one.**
-Qwen 3.8 defaults to 3 (see `SpecPreferredDraftWindow`). Widening it to 7 costs
+Qwen 3.8 defaults to 3 (see `SpecPreferredDraftWindow`; 5 with a DFlash drafter on
+`ggml_metal`, 7 on `ggml_cuda`, where the verify no longer keeps a state per row -
+see the replay below). On the snapshot verify, widening it to 7 costs
 9% on the factual prompt and 36% on prose, because a wider window buys verify
 rows that get rejected AND makes the recurrent-state snapshots below
 proportionally larger - ~150 MB per slot here, which on a card with no headroom
@@ -640,6 +643,75 @@ shape the kernel will not persist falls back to, automatically. The cost of the 
 VRAM: the GDN op's output grows by one state per slot, ~150 MB per slot for this
 model across all 48 recurrent layers, which is the other reason the default
 window is 3 rather than 8.
+
+**On `ggml_cuda` the verify keeps the recurrence inputs instead.** A state per row
+priced a wide window twice there. Every verify wrote a 151 MB state per row (1.2 GB
+at eight rows) and copied every layer's conv window out once per row; and every
+cached verify shape pinned all of it, so an eight-row graph alone was 1.2 GB of the
+1.5 GB budget for cached verify graphs. A window whose length changes from step to
+step - which is every window under the confidence gate - evicted and rebuilt a graph
+on most steps: 56 builds for 56 verifies cycling through two to eight rows.
+
+The CUDA verify now keeps what each recurrence consumed - the l2-normed q and k, v,
+the gate, beta and the conv input window, about 6 MB per row for the whole trunk -
+and the commit replays the accepted prefix from the input state, which the verify
+only read, with the gate and beta of the rejected rows zeroed. Below 64 rows ggml
+steps the recurrence row by row, and a row with g = 0 and beta = 0 leaves the state
+exactly where the kept prefix put it, so the committed state is the one a snapshot
+held: the same logits bit for bit over 120 verifies of one to eight rows with every
+kind of acceptance (`GdnDecodeBench` `TS_BENCH_MODE=verify TS_VERIFY_ACCEPT=cycle`,
+and `CudaReplayCommit_LeavesTheStateASnapshotCommitLeaves` on a toy trunk). It is the
+batched verify's commit (`ggml_ops_qwen35_batched_verify.cpp`): one captured graph
+serves every acceptance. A fully accepted window commits the verify's own post-window
+state, as before. `TS_Q35_VERIFY_REPLAY=0` restores the snapshots.
+
+Qwen3.8-27B-UD-IQ3_XXS + DFlash2 Q4_K_M, RTX Spark N1X, 4.3K-token context,
+median ms of the verify forward (`GdnDecodeBench` `TS_BENCH_MODE=verify`, 12 steps
+per row count; the commit after it costs 2-3 ms either way):
+
+| rows | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| snapshots, one row count at a time | 49.3 | 50.7 | 54.0 | 57.9 | 60.1 | 65.0 | 72.3 | 79.3 |
+| snapshots, row counts interleaved | 67.6 | 91.1 | 91.4 | 101.4 | 115.6 | 128.2 | 135.5 | 146.1 |
+| replay, one row count at a time | 51.6 | 51.8 | 54.0 | 56.5 | 58.1 | 63.0 | 69.2 | 74.8 |
+| replay, row counts interleaved | 51.1 | 51.8 | 54.2 | 57.7 | 59.2 | 62.5 | 69.3 | 76.4 |
+
+A cached shape is now 20-60 MB instead of 0.3-1.2 GB, and the interleaved run built
+each of its eight shapes once.
+
+What is left of the growth from four rows to eight (+18 ms) is mostly the matmuls.
+ggml-cuda serves one to eight columns with `mul_mat_vec_q`, which decodes every
+weight block again for each column, and this checkpoint is mostly i-quants (IQ3_XXS,
+IQ3_S, IQ4_XS, IQ2_*) whose decode is the expensive kind: the node profile puts +12 ms
+of the growth there. Nine or more columns switch to the tiled `mul_mat_q`, which is
+no cheaper here (a nine-row verify measured 88 ms against 84 at eight, and per weight
+type IQ3_S and IQ3_XXS cost more under it), so padding a verify to nine rows does not
+help. A matvec that decodes once for all columns would; that is a ggml kernel change.
+Past eight rows the replay leaves `mul_mat_q` as nearly the only cost that grows: 9, 12
+and 16 rows measured 76.2, 77.5 and 78.0 ms (interleaved; the snapshot path took 169 to
+214 ms there), which is what a drafter with a longer block would verify at. The replay and
+the snapshot commits left the same logits at those widths too.
+
+With the replay, a DFlash window of 7 (an eight-row verify, the most ggml-cuda serves
+with its matvec kernel) wins on every turn of a coding-agent workload against 3, and
+`ggml_cuda` now defaults to it. Same pair and GPU, the server's coding config (KV q8_0,
+temperature 0.3, top-k 20, top-p 0.8), decode tok/s, mean of two rounds (refactor
+weighted by tokens, as its sampled replies run from 350 to 2,048 tokens):
+
+| | agent edit | codegen | refactor |
+| --- | ---: | ---: | ---: |
+| plain (greedy, one round) | 20.2 | 21.0 | 20.5 |
+| before, window 3 (the old default) | 34.5 | 45.3 | 42.1 |
+| after, window 3 | 36.3 | 46.1 | 40.8 |
+| after, window 5 | 36.8 | 57.6 | 48.6 |
+| after, window 7 | **37.6** | **58.5** | **50.2** |
+| after, window 7, gate off (`--spec-pmin 0`) | 35.6 | 58.7 | 47.1 |
+
+Greedy (temperature 0), one round: window 3 32.3 / 41.3 / 36.8, window 7 37.6 / 59.6 / 45.9;
+the build before the change ran window 7 at 26.5 / 40.1 / 33.7,
+its verify costing 107 ms per step against 74 after. Window 7 keeps 4.9-5.0 tokens per
+verify step against 3.4 at window 3. Only this GPU was measured; `--spec-draft 3` restores
+the old window.
 
 **GLM-5.3-Flash takes the simple route.** Its 34 KDA layers are the same kind of
 recurrence (a gated delta rule with a short conv), but the whole model runs
@@ -1135,10 +1207,12 @@ which is the same boundary Gemma 4 already avoids for speed
 (`Gemma4Model.SpecPreferredDraftWindow`: 7, or 2 for a dense, mostly IQ4_XS
 checkpoint on `ggml_metal`).
 
-**The default on `ggml_cuda` is not affected.** `Qwen35Model.SpecPreferredDraftWindow` is 3 on a
-recurrent trunk, and a preferred window replaces the DEFAULT only - it never
-overrides a number the operator typed. So on `ggml_cuda` this is reachable by passing
-`--spec-draft 8` or wider, and not otherwise. On `ggml_metal`, n-gram's default
+**The default on `ggml_cuda` is not affected.** `Qwen35Model.SpecPreferredDraftWindow` is at most 7
+on a recurrent trunk (a DFlash drafter on `ggml_cuda`; 3 otherwise), and a preferred window
+replaces the DEFAULT only - it never overrides a number the operator typed. So on
+`ggml_cuda` this is reachable by passing `--spec-draft 8` or wider, and not otherwise. That
+measurement predates the replayed commit (`TS_Q35_VERIFY_REPLAY`), which no longer keeps
+snapshot slots on `ggml_cuda`; it has not been repeated on that path. On `ggml_metal`, n-gram's default
 for a dense, mostly IQ4_XS Qwen 3.5-family trunk is 12 drafts, a 13-row verify;
 that Metal path keeps only the last three recurrent states rather than one per
 row, and its recorded before/after comparison produced identical tokens (see

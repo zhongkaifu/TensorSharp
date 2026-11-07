@@ -128,9 +128,10 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// Three, not the shared default of eight, whenever this checkpoint has
-        /// GatedDeltaNet layers - which every Qwen 3.5/3.6/3.8 hybrid does.
+        /// GatedDeltaNet layers - which every Qwen 3.5/3.6/3.8 hybrid does - except
+        /// with a DFlash block drafter on ggml_metal (5) and ggml_cuda (7), below.
         ///
-        /// A wide window is priced by the trunk here, not by the drafter: a verify
+        /// A wide window is priced by the trunk here, not by the drafter. Originally a verify
         /// over N rows runs the GDN chunked scan rather than the single-token
         /// recurrent update, and a partial rejection has to restore the recurrent
         /// state (there is no per-row checkpoint to rewind to) and re-advance over
@@ -152,10 +153,24 @@ namespace TensorSharp.Models
         /// on M5 Pro, Qwen3.8-27B-UD-IQ3_XXS + DFlash2 Q4_K_M, 1,224 greedy tokens
         /// (identical text in every arm): window 3 / gate 0.35 26.1 tok/s, 5 / 0 28.9,
         /// 7 / 0 28.5, 7 / 0.35 24.8, plain 20.5. Hence window 5 with no gate
-        /// (<see cref="SpecPreferredBlockGate"/>). ggml_cuda keeps 3: its solo verify
-        /// measured 7 drafts slower than 3 on prose (SpecSoloMaxDraftTokens).
+        /// (<see cref="SpecPreferredBlockGate"/>).
+        ///
+        /// Exception, ggml_cuda with a DFlash block drafter: there the verify keeps the
+        /// recurrence inputs instead of a state per row and the commit replays the
+        /// accepted prefix, so a wider window costs only its matmul columns. An 8-row
+        /// verify costs 1.3x a 4-row one (75.8 against 57.8 ms on an RTX Spark N1X,
+        /// Qwen3.8-27B-UD-IQ3_XXS + DFlash2 Q4_K_M). Coding workload (agent edit,
+        /// codegen, refactor), decode tok/s at the server's sampling, two rounds: window 3
+        /// 36.3 / 46.1 / 40.8, 5 36.8 / 57.6 / 48.6, 7 37.6 / 58.5 / 50.2, against 21 plain;
+        /// greedy 32.3 / 41.3 / 36.8 at 3 and 37.6 / 59.6 / 45.9 at 7. Hence 7, the most
+        /// rows ggml-cuda serves with its matvec kernel. The 0.35 gate stays: turning it
+        /// off lost on the edit and refactor turns. Measured on that one GPU only;
+        /// --spec-draft 3 restores the old window. The NextN/MTP head and n-gram get the
+        /// same cheaper verify on ggml_cuda but keep 3 until they are measured.
         /// </summary>
-        public int SpecPreferredDraftWindow => !HasAnyRecurrentLayer ? 0 : MetalBlockDraft ? 5 : 3;
+        public int SpecPreferredDraftWindow => !HasAnyRecurrentLayer ? 0 : CudaBlockDraft ? 7 : MetalBlockDraft ? 5 : 3;
+
+        private bool CudaBlockDraft => HasDFlash && _backend == BackendType.GgmlCuda;
 
         /// <summary>No cumulative gate for a DFlash block drafter on ggml_metal (see
         /// <see cref="SpecPreferredDraftWindow"/>): the 0.35 default, tuned on sparse-MoE
