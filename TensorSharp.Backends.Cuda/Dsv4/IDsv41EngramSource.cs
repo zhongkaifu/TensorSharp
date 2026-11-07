@@ -55,6 +55,47 @@ namespace TensorSharp.Cuda
         /// the rows of a device-resident table itself from these.
         /// </summary>
         void CopyEngramRowIndices(int engramIndex, int count, int* dst);
+
+        /// <summary>
+        /// A forward of <paramref name="tokens"/> at <paramref name="startPos"/> of the sequence whose history is
+        /// <paramref name="history"/> is about to run in ubatches of <paramref name="ubatch"/>: start reading the rows
+        /// it will gather from this node's host-mapped tables, in the order its layers will ask for them. Advisory:
+        /// it hashes a copy (the history is not touched) and only reads ahead; the gathers still read every row.
+        /// </summary>
+        void PrefetchEngramRows(Dsv41EngramHistory history, ReadOnlySpan<int> tokens, int startPos, int ubatch);
+
+        /// <summary>
+        /// Stops the read-ahead <see cref="PrefetchEngramRows"/> started (a reset, or a forward that failed): its rows will
+        /// not be gathered. Returns at once; no result depends on it.
+        /// </summary>
+        void CancelEngramPrefetch();
+
+        /// <summary>
+        /// Bytes <see cref="ExportEngramRows"/> writes for <paramref name="count"/> tokens of table
+        /// <paramref name="engramIndex"/>: their row ids (int32, [token][hash column]) and then the raw quantized
+        /// rows in the same order, padded to a whole number of 32-bit words.
+        /// </summary>
+        long EngramTransferBytes(int engramIndex, int count);
+
+        /// <summary>
+        /// On the node that owns table <paramref name="engramIndex"/> for another node's layer: the row ids and raw
+        /// rows of the <paramref name="count"/> tokens the last <see cref="BeginEngramUbatch"/> hashed (a whole
+        /// forward), laid out as <see cref="EngramTransferBytes"/> says.
+        /// </summary>
+        void ExportEngramRows(int engramIndex, int count, byte* dst);
+
+        /// <summary>
+        /// On the node whose layer reads table <paramref name="engramIndex"/> while another node owns it: the rows
+        /// <see cref="ExportEngramRows"/> wrote there for the forward of <paramref name="count"/> tokens at
+        /// <paramref name="startPos"/>. Each later <see cref="GatherEngramRows"/> of that table in the forward
+        /// dequantizes from them (the same host function as a local gather, so the same floats), after checking their
+        /// row ids against this node's own hashes.
+        /// </summary>
+        void ImportEngramRows(int engramIndex, int startPos, int count, byte* src);
+
+        /// <summary>Stopwatch ticks the host has spent in <see cref="GatherEngramRows"/> and
+        /// <see cref="ExportEngramRows"/> so far (TS_DSV4_PERF reports the share of each forward).</summary>
+        long EngramReadTicks { get; }
     }
 
     /// <summary>One sequence's Engram hash history: its (mapped) token ids by absolute

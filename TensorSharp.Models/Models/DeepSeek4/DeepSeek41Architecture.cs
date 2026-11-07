@@ -312,9 +312,15 @@ namespace TensorSharp.Models
             {
                 "TS_DSV4_UBATCH", "TS_CUDA_QMM_F16GEMM_MAX_MB", "TS_CUDA_QMM_F16GEMM_MIN_ROWS", "TS_CUDA_Q80_VEC_MIN_OUT",
                 "TS_CUDA_Q80_MMQ_MAX_ROWS", "TENSORSHARP_CUDA_MOE_FUSION", "TS_CUDA_DECODE_ATTN_PARTITION_THRESHOLD",
-                "TS_DSV41_ENGRAM_DEVICE", YocoKeepVariable,
+                "TS_DSV41_ENGRAM_DEVICE", "TS_DSV41_ENGRAM_OWNER", YocoKeepVariable,
             })
-                options.Append('|').Append(name).Append('=').Append(read(name) ?? "<default>");
+            {
+                // The owner mode by meaning, not spelling: unset and 'local' are the same placement.
+                string value = name == "TS_DSV41_ENGRAM_OWNER"
+                    ? TensorSharp.Cuda.Dsv4StagePlacement.EngramOwnerModeName(read(name))
+                    : read(name) ?? "<default>";
+                options.Append('|').Append(name).Append('=').Append(value);
+            }
             return options.ToString();
         }
 

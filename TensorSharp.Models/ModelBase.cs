@@ -2932,6 +2932,7 @@ namespace TensorSharp.Models
                         case TpControlForwardRefill: ForwardRefillCore(payload); break;
                         case TpControlReset:         ResetKVCacheCore(); break;
                         case TpControlTruncate:      TruncateKVCacheCore(payload.Length > 0 ? payload[0] : 0); break;
+                        case TpControlEvictHostTables: RunHostTableEvictionControl(payload); break;
                         case TpControlShutdown:
                             Console.WriteLine("[TP worker] shutdown received; exiting worker loop.");
                             return;

@@ -1059,10 +1059,27 @@ flags on the CLI, the server (driver) and
   `TENSORSHARP_LAYER_SPLIT_DRIVER_STAGE=first` is refused on `cuda`. So are
   `--n-cpu-moe`/`--cpu-moe` and a DSpark drafter. As on `ggml_cuda`, the run
   serves one mirrored sequence: no slots, truncation or prefix reuse. Engram
-  tables stay host mappings unless `TS_DSV41_ENGRAM_DEVICE=1`.
+  tables stay host mappings unless `TS_DSV41_ENGRAM_DEVICE=1`, and each
+  host-mapped table is kept by one node (see
+  [Engram reads on `cuda`](#engram-reads-on-cuda)).
 - A node that fails mid-forward aborts the mesh: its peers fail the request at
   once instead of waiting out the transport deadline, and every node must then be
   restarted.
+- With `TS_DSV4_ASYNC_SEND=1` a sending node does not wait for one prefill
+  ubatch's payload to leave before it starts the next ubatch of the same
+  forward. It queues the payload's copies to pinned memory and sends it during
+  the next ubatch, once that ubatch's layers on the node's first GPU are queued,
+  so the node's GPUs work on consecutive ubatches at the same time instead of
+  taking turns. `=2` sends at the next ubatch's own send instead of its first
+  in-node hand-over. The last ubatch of every forward is sent before the forward
+  returns, so nothing is in flight between requests, and a decode step (one
+  ubatch) is unchanged. Unset or `0` (the default) sends each payload
+  synchronously, as before. The deferred send is opt-in until it has run with
+  each stage on GPUs of its own: on one shared GPU its gain cannot show, and the
+  wait on its copy event from another GPU's CUDA context has never run (every
+  test device shares one physical GPU's context). Payloads, their order and
+  every kernel are the same in every mode, so the logits are bit-identical and
+  the nodes need not agree on the setting.
 
 Coverage: a two-node loopback on one GPU (each node a process-local stage over
 real TCP) on the 1017-shaped synthetic fixture, with the cut forced past a KV
@@ -1076,7 +1093,14 @@ physical GPU d mod the visible count): on a synthetic topology whose ratio-1
 group is read by four layers, two nodes of two GPUs each (the received rows and
 mask handed on through node 0's in-node boundary) and three nodes of one GPU
 (the middle node receiving and sending them on) are bit-identical as well, and
-so is the single-process split over two to four GPUs. On one GPU every logical
+so is the single-process split over two to four GPUs. The deferred send is
+held to the same standard: with `TS_DSV4_ASYNC_SEND` at 1, 2 and 0, a script of
+prompts of 1 to 5 ubatches (odd and even counts, exact multiples and
+remainders), a prompt fed in three chunks, decode steps, refused truncations
+and resets answers byte-identically at three cuts of two nodes of two GPUs, on
+three nodes of two GPUs (a middle node that both receives and sends) and three
+of one GPU in process, and on three nodes of one GPU over TCP; so does a
+15-ubatch prompt. These runs share one GPU and measure no speed. On one GPU every logical
 device shares it. On a host with two A40s the two-nodes-of-two-GPUs run put
 each node's two devices on the two physical GPUs (both nodes, in one process,
 sharing them). All of these runs use the synthetic fixture. The one real
@@ -1084,6 +1108,120 @@ checkpoint run distributed on `cuda` so far is the whole 1017 on two pods of two
 A40s each, compared with `ggml_cuda` rather than with a single-process `cuda` run
 (no single host here holds it); see
 [Full 1017 on `cuda`](#full-1017-on-cuda-2-nodes-x-2-a40).
+
+### Engram reads on `cuda`
+
+On the direct engine the executor reads the host-mapped Engram tables itself
+(`Dsv41EngramReader`, `GatherEngramRows`). None of the settings below changes
+a result: every row goes through the same host dequantizer into the same place.
+
+- **Parallel rows** (on by default). A ubatch's rows of one table are
+  dequantized in parallel over (token, column), `TS_DSV41_ENGRAM_THREADS` (1-32,
+  default min(16, cores)) at a time, so a decode step's 24 rows per table are
+  read together instead of one after another. S9 parallelized over tokens only,
+  so a decoded token read its 48 rows serially (83.5-94.5 ms of node 1's time per
+  token cold). The rows are read by the reader's own threads
+  (`TS_DSV41_ENGRAM_THREADS` - 1 of them) and the thread that asks, never by the
+  .NET thread pool, which a busy server's request threads could starve.
+  `TS_DSV41_ENGRAM_THREADS=1` restores the S9 gather exactly (tokens in parallel
+  on the .NET pool, each token's columns one after another) and turns the advice
+  off unless it is asked for.
+- **Prefetch** (opt-in, `TS_DSV41_ENGRAM_PREFETCH=1`; unset or `0`: off). When a
+  forward starts, the reader's threads read one byte of each page of every row
+  the forward will gather from this node's tables, in the order the layers ask
+  for them (both tables of ubatch 0, then ubatch 1, ...), while the host issues
+  the layers. It hashes a copy of the history (`Dsv41EngramData.PreviewHashes`)
+  and only reads ahead. A gather always goes first: a thread that is reading
+  ahead joins it before its next row, so the reader never has more than
+  `TS_DSV41_ENGRAM_THREADS` rows in flight. A reset and a failed forward stop the
+  read-ahead; a page-cache eviction stops it and waits until no thread still
+  reads. It is off by default because what it gains on cold network storage, and
+  what reading a long prompt's rows ahead costs a cgroup that cannot hold the
+  tables, have not been measured on the full model.
+- **`MADV_RANDOM`.** The tables are mapped for random reads, so a fault reads
+  one page instead of a read-around window (S9 measured 55-60 KB of page cache
+  per row read without it, against ggml's 3-4 KB). `TS_DSV41_ENGRAM_RANDOM=0`/`1`
+  (unset: on when the threads are more than 1); Linux only. The warm below reads
+  with `pread`, which the mapping advice does not slow.
+- **Ownership** (distributed layer split, host-mapped tables). Each table is kept
+  by one node, which maps it, warms it and gathers its rows
+  (`Dsv4StagePlacement.EngramOwners`). `TS_DSV41_ENGRAM_OWNER` unset or `local`
+  (the default) keeps each table with the node that runs its layer, as S9 did;
+  `balance` hands the tables out in index order, each to the node holding the
+  fewest table bytes so far and to its reader on a tie. On the 1017 at
+  (12, 22, 31) both tables are read on node 1; with `balance` node 0 keeps
+  layer 14's 63 GiB slice and each node holds one, the only placement in which
+  each node's tables fit its 93.1 GiB cgroup. A table kept by another node
+  crosses at the start of every forward, before any boundary: the keeping node
+  hashes the forward with its own copy of the history (every node sees every
+  forward's tokens), gathers the rows and sends their ids and raw quantized
+  bytes, 24 x (4 + 176) = 4,320 B per token (8.8 MB for a 2,048-token prompt, in
+  16 MiB pieces). The reading node checks the ids against its own hashes, then
+  dequantizes the rows with the same function as a local gather, so the result
+  is bit-identical to `local`. `balance` is opt-in until a two-node run has
+  measured it: the reading node cannot start its first layer until the whole
+  forward's rows have arrived, and the keeping node does not read that table
+  ahead. The owners are part of the startup agreement, and the configuration
+  digest compares the mode by meaning (unset and `local` agree; `balance` on one
+  node only is refused). On the server a prompt arrives in chunks of at most
+  4,096 tokens, so a message is at most ~18 MB; a CLI prompt crosses whole. A
+  message buffer above 32 MiB (a long CLI prompt's) is released after its
+  exchange, and the reading node's copy of the rows shrinks back on the next
+  forward that needs at most half of it.
+- **Warm budget.** `TS_DSV41_ENGRAM_WARM` keeps its meaning (unset: background,
+  `0`: never, positive: before the model is handed out). A node warms only the
+  tables it keeps, after the weight upload, with `TS_DSV41_ENGRAM_WARM_THREADS`
+  (1-64, default 16) threads, each reading 64 MiB blocks with `pread` on its own
+  file handle. Before reading it checks the budget: the cgroup's limit
+  (`memory.limit_in_bytes` on v1, `memory.max` on v2) minus its anonymous and
+  shmem memory minus 8 GiB, and the host's `MemAvailable` minus 8 GiB. Tables
+  that do not fit are not warmed, and the log line gives the numbers. S9 sized
+  the warm against `MemAvailable` alone, which on the VMs is host-wide and let a
+  warm fill the 93.1 GiB cgroup. Each block is first checked with `mincore`, and
+  only the pages that are not resident are read, so a re-warm after an eviction
+  costs only what was lost. `mincore` reports every page of a file resident to a
+  process that may not write it (Linux 5.2 and later); such a process (not root,
+  read-only file) reads every block. With the default ownership, node 1 of the
+  1017 keeps both tables (126 GiB), which its cgroup cannot hold, so it refuses
+  the warm and its rows stay cold reads, made 16 at a time. A page-cache
+  eviction (a `cold` benchmark row) stops a background warm that is still
+  running.
+- **Weight page cache.** `TS_DSV4_LOAD_DROP_CACHE` has the native loader's
+  meaning (see [Load time](#load-time)): unset drops each weight chunk's page
+  cache once the loader has read it exactly when the bytes the node uploads plus
+  the tables it keeps plus 8 GiB exceed its cgroup limit (else `MemTotal`); `0`
+  never, `1` always; Linux only, and never for shards on tmpfs. A 1017 node
+  uploads ~76 GiB in a 93.1 GiB cgroup. With `balance` each node keeps 63 GiB, so
+  both drop, and the next process's weight read no longer evicts the warm slice;
+  with the default ownership node 1 keeps 126 GiB and drops, and node 0 keeps no
+  table and does not. The kernel drops whole folios only, so a folio that
+  straddles two chunks can stay.
+
+None of these settings has been run on the full 1017 checkpoint: the S9 figures
+above describe the engine before them, and their effect there has not been
+measured. The defaults turn on only what is bit-identical and low-risk (the
+parallel rows, `MADV_RANDOM`, the warm budget and the load's drop rule); the
+prefetch, `balance` and the deferred send stay opt-in until a two-node run has
+measured them.
+
+Tests: `Dsv41EngramReaderTests` (the parallel gather against the S9 gather, byte
+for byte at 1, 7 and 256 tokens and 2-32 threads; the reads on the reader's own
+threads, never on the .NET pool; a gather ahead of a busy read-ahead, with at
+most `TS_DSV41_ENGRAM_THREADS` rows in flight; the read-ahead stopped and waited
+for; a failed gather; the preview against the forward's hashing; the fixture
+engine bit-identical with the S9 gather, the default reader and two other
+settings), `Dsv41CudaDistributedTests.Engram` (the 1017 owners from its header;
+a two-node loopback with the table kept by the other node bit-identical to one
+process, to `local` and to the unset default, with the message buffers released;
+the digest reading unset as `local`; a different owner setting refused at
+startup; an owner failing before its rows),
+`Dsv41CudaDistributedTests.PerfSwitches` (each switch alone, all together and
+the defaults, byte-identical to every switch off in one process, on two nodes
+over TCP and on two nodes of two GPUs), `Dsv41CudaDistributedTests.Eviction`
+(an eviction stops the read-ahead first) and
+`MappedTableWarmTests` (cgroup v1/v2 parsing, the budget, and on Linux the
+`mincore` re-warm, the drop and the advice;
+`eng/validation/wsl-host-page-cache-tests.sh` runs them under WSL).
 
 ### Per-stage oracle against `ggml_cuda`
 

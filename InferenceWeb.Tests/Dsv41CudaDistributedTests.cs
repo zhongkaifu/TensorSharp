@@ -49,9 +49,10 @@ public sealed partial class Dsv41CudaDistributedTests : IDisposable
         // Host mappings on both sides: a distributed stage keeps the tables host-mapped unless =1 asks for
         // VRAM, so the single-process control asks for the same.
         _env.Set("TS_DSV41_ENGRAM_DEVICE", "0");
-        foreach (string name in new[] { "TS_DSV4_MMAP", "TS_DSV4_CUDA_TRACE_DIR", "TS_DSV4_PERF", "KV_CACHE_DTYPE",
+        foreach (string name in new[] { "TS_DSV4_MMAP", "TS_DSV4_CUDA_TRACE_DIR", "TS_DSV4_PERF", "KV_CACHE_DTYPE", "TS_DSV4_ASYNC_SEND",
                      "TENSORSHARP_TP_DEGREE", "TENSORSHARP_LAYER_SPLIT_DEGREE", "TENSORSHARP_TP_NODE_ID",
-                     "TENSORSHARP_TP_PEERS", LayerSplitPlan.DriverStageVariable, "TS_N_CPU_MOE", "TS_CPU_MOE" })
+                     "TENSORSHARP_TP_PEERS", LayerSplitPlan.DriverStageVariable, "TS_N_CPU_MOE", "TS_CPU_MOE",
+                     "TS_DSV41_ENGRAM_OWNER", "TS_DSV41_ENGRAM_THREADS", "TS_DSV41_ENGRAM_PREFETCH", "TS_DSV41_ENGRAM_RANDOM" })
             _env.Set(name, null);
         _speculation.ClearSpeculationVars();
     }
@@ -64,6 +65,7 @@ public sealed partial class Dsv41CudaDistributedTests : IDisposable
         Dsv4CudaEngine.TamperBoundary = null;
         Dsv4CudaEngine.BeforeBoundaryCopies = null;
         Dsv4CudaEngine.FreeVramForTests = null;
+        Dsv4CudaEngine.BeforeEngramRowsSend = null;
         Dsv4CudaEngine.LogicalDevicesForTests = 0;
         Dsv4CudaEngine.KernelModuleLoader = null;
         _speculation.Dispose();
@@ -486,7 +488,9 @@ public sealed partial class Dsv41CudaDistributedTests : IDisposable
         long SelectionsSent, long SelectionsReceived, long MasksSent, long MasksReceived, long MaskBytesReceived,
         int[] SourcesSent, int[] SourcesReceived, long[] LayerRuns, long[] EngramRuns, long BytesSent, long BytesReceived,
         double SendMs, double ReceiveMs, long LocalHandOvers, long LocalRows, long LocalSelections, long LocalMasks,
-        Dictionary<int, long> LocalRowsBySource, string[] Prefetched, Dsv4DeviceNeed[] Needs);
+        Dictionary<int, long> LocalRowsBySource, string[] Prefetched, Dsv4DeviceNeed[] Needs,
+        long EngramSent, long EngramReceived, long EngramBytesSent, long EngramBytesReceived, int[] EngramOwners, bool[] MapsEngram, long Deferred,
+        int EngramWireBytes, long RemoteRowsBytes);
 
     private static StageCounters Counters(DeepSeek4Model model) => Counters(model.CudaExecutor);
 
@@ -500,7 +504,10 @@ public sealed partial class Dsv41CudaDistributedTests : IDisposable
             s.SourcesSent.Order().ToArray(), s.SourcesReceived.Order().ToArray(), e.LayerRuns.ToArray(), e.EngramRuns.ToArray(),
             s.BytesSent, s.BytesReceived, s.SendTicks * f, s.ReceiveTicks * f, s.LocalHandOvers, s.LocalRowsHandedOver,
             s.LocalSelectionsHandedOver, s.LocalMasksHandedOver, new Dictionary<int, long>(s.LocalRowsBySource),
-            executor.PrefetchedTensorNames.ToArray(), e.StageNeeds?.ToArray());
+            executor.PrefetchedTensorNames.ToArray(), e.StageNeeds?.ToArray(),
+            s.EngramMessagesSent, s.EngramMessagesReceived, s.EngramBytesSent, s.EngramBytesReceived,
+            executor.EngramOwners?.ToArray(), Enumerable.Range(0, e.EngramRuns.Length).Select(executor.MapsEngramTable).ToArray(), s.Deferred,
+            e.EngramWireBytes, executor.RemoteRowsBytes);
     }
 
     /// <summary>Two nodes (each one stage on the same CUDA device) over TCP on 127.0.0.1, the cut forced after layer
