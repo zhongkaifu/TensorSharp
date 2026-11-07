@@ -2,6 +2,14 @@
 
 [English](minimax-h3.md) | [中文](minimax-h3_zh-cn.md)
 
+## 许可证与法律免责声明
+
+> **重要：MiniMax-H3 受独立的第三方许可证约束。** 在通过 TensorSharp 下载、运行、部署、修改、再分发或使用 MiniMax-H3 及其输出前，用户必须自行阅读并遵守 [MiniMax H3 Community License Agreement](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)、其中的可接受使用政策以及所有适用法律法规。
+>
+> 该社区许可证明确将**美国、欧盟、英国和韩国**排除在授权地域之外，**不授权**在这些地区进行受许可证约束的使用。位于排除地域的用户，应在进行需要授权的使用前向 MiniMax 取得单独许可。具体条件及后续变更请以官方许可证为准。
+>
+> TensorSharp 是独立的推理引擎。其对 MiniMax-H3 的技术支持**不代表**授予模型使用许可、豁免限制或获得 MiniMax 的授权或认可。**用户须自行确认使用行为是否合法合规，并自行承担使用或违反许可证产生的一切风险、后果、索赔、处罚、损害及其他责任。在适用法律允许的最大范围内，TensorSharp 及其作者、贡献者和维护者对用户使用 MiniMax-H3、其输出或违反相关许可证及法律的行为不承担任何责任。** 本声明不修改 MiniMax 的许可证，也不排除法律禁止排除的责任。
+
 MiniMax-H3 在同一条打包扩散序列中生成视频与原生 **32 kHz 立体声音频**。
 TensorSharp 通过 `MiniMaxH3Model.GenerateVideo`、CLI 和视频 HTTP API 提供该模型。
 FL2VA 用于文本和关键帧；Ref2VA 用于文本和参考媒体，两者是独立检查点。
