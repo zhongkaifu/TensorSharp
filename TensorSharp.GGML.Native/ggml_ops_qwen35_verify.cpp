@@ -29,7 +29,9 @@ using namespace tsg;
 // start_pos) + the N fresh K/V, causal F16 mask, append the N rows to the cache),
 // GDN recurrence over the N tokens via ggml_gated_delta_net(K=N) (the op also
 // emits a state snapshot per prefix length so partial-acceptance rollback can pick
-// the committed state without a re-forward), batched MoE/dense FFN, and a folded
+// the committed state without a re-forward; on CUDA the verify instead keeps the
+// recurrence inputs and the commit replays the accepted prefix, see
+// q35v_replay_commit_graph), batched MoE/dense FFN, and a folded
 // final-norm that outputs BOTH the per-row logits [vocab, N] AND the post-norm
 // hidden [hidden, N] the MTP draft head consumes.
 //
@@ -108,6 +110,21 @@ namespace
         /// a device-to-device tensor copy. Index [i * n_snapshots + slot].
         std::vector<ggml_tensor*> conv_snap_slots, delta_snap_slots;
         int n_snapshots = 0;
+        /// CUDA replay commit (q35v_replay_commit_graph): the verify kept no state per
+        /// row, only what each recurrent layer's recurrence consumed - l2-normed q/k, v,
+        /// gate, beta and the conv input window - so a partial accept replays the kept
+        /// prefix from the untouched input state. One entry per RECURRENT layer.
+        bool replay = false;
+        std::vector<ggml_tensor*> rp_q, rp_k, rp_v, rp_g, rp_beta, rp_conv;
+        struct ReplayCommit
+        {
+            ggml_context* ctx = nullptr;
+            ggml_gallocr_t galloc = nullptr;
+            ggml_cgraph* graph = nullptr;
+            ggml_tensor* keep_in = nullptr;     // F32 [1, 1, N, 1]: 1 for a kept row, 0 past it
+            ggml_tensor* window_in = nullptr;   // I32 [convDim]: conv rows ending at the last kept row
+            bool attempted = false;
+        } replay_commit;
         /// The post-window state was NOT downloaded; the caller commits it (or one
         /// snapshot slot) into the live slices on the device instead. True for every
         /// step of a speculative session, single-row plain steps included - which is
@@ -137,6 +154,11 @@ namespace
             for (auto& commit : commit_graphs)
                 if (commit.ctx != nullptr) ggml_free(commit.ctx);
             commit_graphs.clear();
+            if (replay_commit.galloc != nullptr) ggml_gallocr_free(replay_commit.galloc);
+            if (replay_commit.ctx != nullptr) ggml_free(replay_commit.ctx);
+            replay_commit = ReplayCommit();
+            replay = false;
+            rp_q.clear(); rp_k.clear(); rp_v.clear(); rp_g.clear(); rp_beta.clear(); rp_conv.clear();
             if (allocator != nullptr) { ggml_gallocr_free(allocator); allocator = nullptr; }
             if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
@@ -163,8 +185,10 @@ namespace
     bool q35v_cache_has_uncommitted_snapshot(const Q35VerifyCache& cache);
 
     // Total-VRAM budget for the resident persist verify graphs. Each entry is a
-    // whole-model graph in its own alloc_ctx buffer (own slots, needed for CUDA-graph
-    // capture), sized ~0.2 GB (N=1) to ~0.8 GB (N=maxDraft+1). Without a cap, a
+    // whole-model graph in its own packed buffer (planned once, so CUDA-graph
+    // capture sees stable addresses). Snapshot entries grow by one recurrent state
+    // per row (~0.15 GB per row on Qwen3.8-27B); CUDA's replay entries keep only the
+    // recurrence inputs (20-60 MB for 2-8 rows on the same model). Without a cap, a
     // session that exercises many draft lengths (plain N=1, speculative N=draft+1,
     // and every rollback N=accepted+1) could resident-cache all ~9 shapes and add
     // several GB on top of the weights + KV cache — re-overcommitting a 16 GB card.
@@ -660,7 +684,21 @@ namespace
         // (last-row logits), never the non-persist MTP-draft path.
         const bool chain_state = defer_state_download != 0 && n_logits < N && !fv_persist
             && !resident_state && (g_backend_type == BACKEND_TYPE_METAL || g_backend_type == BACKEND_TYPE_CUDA);
-        int n_snap = (defer_state && state_snapshots > 1 && state_snapshots <= N)
+        // CUDA keeps no state per row at all. A snapshot per row costs the GDN op a
+        // 151 MB state write per row on Qwen3.8-27B (1.2 GB at eight rows), 48 conv
+        // copies per row, and pins all of it in every cached shape - an eight-row
+        // entry alone outgrew the cache budget, so a window whose length changed
+        // from step to step rebuilt and recaptured its graph on most steps. Instead
+        // the verify keeps what each recurrence consumed and the commit replays the
+        // accepted prefix (q35v_replay_commit_graph), as the batched verify does.
+        // Below 64 rows ggml steps the recurrence row by row, so the replayed state
+        // is the one the verify computed. TS_Q35_VERIFY_REPLAY=0 restores snapshots
+        // (read per call, like TS_Q35_VERIFY_PACK, so a test can compare the two).
+        const char* replay_setting = std::getenv("TS_Q35_VERIFY_REPLAY");
+        const bool replay_commit = (replay_setting == nullptr || replay_setting[0] != '0')
+            && g_backend_type == BACKEND_TYPE_CUDA
+            && defer_state && state_snapshots > 1 && state_snapshots <= N && N < 64;
+        int n_snap = (!replay_commit && defer_state && state_snapshots > 1 && state_snapshots <= N)
             ? state_snapshots : 1;
         // Wide n-gram windows need not retain a complete recurrent-state matrix
         // for every prefix. Keep the last three states on Metal; an earlier
@@ -674,8 +712,10 @@ namespace
         //    0 -> deferred with no snapshots; commit slot -1 (the post-window state)
         //    1 -> downloaded, as it always used to be; nothing to do
         //   >1 -> deferred with N snapshots; commit slot (N-1-accepted)
+        // A replay verify answers N as well: its commit takes the same slots.
         if (state_snapshots_used != nullptr)
-            *state_snapshots_used = chain_state ? -1 : (defer_state ? (n_snap > 1 ? n_snap : 0) : 1);
+            *state_snapshots_used = chain_state ? -1
+                : (defer_state ? (replay_commit ? N : (n_snap > 1 ? n_snap : 0)) : 1);
 
         // ===== Persist reuse fast-path: upload the per-call inputs + replay =====
         if (fv_persist)
@@ -690,6 +730,7 @@ namespace
                     c.has_normed != (normed_out != nullptr) ||
                     c.capture_count != cap_count ||
                     c.n_snapshots != n_snap ||
+                    c.replay != replay_commit ||
                     c.deferred_state != defer_state)
                     continue;
                 // A cached graph permanently binds one side of this owner's
@@ -897,6 +938,9 @@ namespace
             ggml_tensor* delta_snaps = nullptr;  // [D, n_snap] (a view of the GDN output)
             std::vector<ggml_tensor*> conv_snap_slots;   // per slot, shaped like conv_state_in
             std::vector<ggml_tensor*> delta_snap_slots;  // per slot, shaped like delta_state_in
+            // Replay commit: the recurrence inputs, retained as graph outputs.
+            ggml_tensor* rp_q = nullptr; ggml_tensor* rp_k = nullptr; ggml_tensor* rp_v = nullptr;
+            ggml_tensor* rp_g = nullptr; ggml_tensor* rp_beta = nullptr; ggml_tensor* rp_conv = nullptr;
             ggml_tensor* gate_inp_w; ggml_tensor* gate_exps; ggml_tensor* up_exps; ggml_tensor* down_exps;
             ggml_tensor* shexp_gate_w; ggml_tensor* shexp_up_w; ggml_tensor* shexp_down_w; ggml_tensor* shexp_gate_inp_w;
             ggml_tensor* psc[TSQ35_SC_COUNT];
@@ -1448,6 +1492,14 @@ namespace
                     metal_strided_views ? beta_all : ggml_cont(ctx, beta_all),
                     1, num_v_heads, N, 1);
                 ggml_tensor* state4 = ggml_reshape_4d(ctx, t.delta_state_in, head_k_dim, head_v_dim, num_v_heads, 1);
+                if (replay_commit)
+                {
+                    // Kept until the commit decides how many rows to replay. Output
+                    // flags pin their storage and keep ggml-cuda from fusing them away.
+                    t.rp_q = q4; t.rp_k = k4; t.rp_v = v4; t.rp_g = g4; t.rp_beta = beta4; t.rp_conv = conv_input;
+                    for (ggml_tensor* kept : { q4, k4, v4, g4, beta4, conv_input })
+                        ggml_set_output(kept);
+                }
 
                 // K=1: the op recurs over all N tokens internally and emits the per-
                 // token outputs (rows [0,N)) + ONLY the FINAL state snapshot (we roll
@@ -2279,6 +2331,20 @@ namespace
             slot->host_bindings = std::move(graph_host_bindings);
             slot->conv_snaps.clear(); slot->delta_snaps.clear();
             slot->conv_snap_slots.clear(); slot->delta_snap_slots.clear();
+            slot->replay = replay_commit;
+            if (replay_commit)
+            {
+                for (int l = 0; l < num_layers; l++)
+                {
+                    if (layers[l].is_recurrent == 0) continue;
+                    slot->rp_q.push_back(lt[l].rp_q);
+                    slot->rp_k.push_back(lt[l].rp_k);
+                    slot->rp_v.push_back(lt[l].rp_v);
+                    slot->rp_g.push_back(lt[l].rp_g);
+                    slot->rp_beta.push_back(lt[l].rp_beta);
+                    slot->rp_conv.push_back(lt[l].rp_conv);
+                }
+            }
             if (n_snap > 1)
             {
                 for (int l = 0; l < num_layers; l++)
@@ -2623,6 +2689,122 @@ namespace
         commit.graph = graph;
         return graph;
     }
+
+    // The commit of a replay verify (Q35VerifyCache::replay): per recurrent layer,
+    // run the recurrence over the verified window again from the live INPUT state -
+    // which the verify only read - with the gate and beta of the rejected rows
+    // zeroed, store the result back into that input state, and take the conv window
+    // that ends at the last kept row. Below 64 rows ggml steps the recurrence row by
+    // row, and a row with g = 0 and beta = 0 computes S = exp(0) * S + k * 0, which
+    // leaves the state where the kept prefix put it. Only keep_in and window_in change
+    // between commits, so one graph serves every acceptance and ggml-cuda replays one
+    // captured CUDA graph. The same scheme as the batched verify's commit.
+    ggml_cgraph* q35v_replay_commit_graph(Q35VerifyCache& cache)
+    {
+        auto& rc = cache.replay_commit;
+        if (rc.attempted) return rc.graph;
+        rc.attempted = true;
+
+        const std::size_t count = cache.conv_in.size();
+        if (count == 0 || cache.rp_q.size() != count || cache.rp_k.size() != count || cache.rp_v.size() != count
+            || cache.rp_g.size() != count || cache.rp_beta.size() != count || cache.rp_conv.size() != count
+            || cache.delta_in.size() != count)
+            return nullptr;
+        const int N = cache.n;
+        const std::int64_t conv_rows = cache.conv_in[0]->ne[0];   // convDim: conv_state_in is [convDim, conv_dim]
+        const std::size_t n_nodes = count * 24 + 64;
+        const std::size_t bytes = ggml_graph_overhead_custom(n_nodes, false) + 3 * n_nodes * ggml_tensor_overhead() + 4096;
+        ggml_init_params params = { bytes, nullptr, /*no_alloc=*/true };
+        rc.ctx = ggml_init(params);
+        if (rc.ctx == nullptr) return nullptr;
+        ggml_context* ctx = rc.ctx;
+        auto fail = [&]() -> ggml_cgraph* {
+            if (rc.galloc != nullptr) { ggml_gallocr_free(rc.galloc); rc.galloc = nullptr; }
+            ggml_free(rc.ctx);
+            rc.ctx = nullptr;
+            rc.graph = nullptr;
+            rc.keep_in = rc.window_in = nullptr;
+            return nullptr;
+        };
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, n_nodes, false);
+
+        // A descriptor over a retained tensor's existing storage. A view is rebuilt
+        // over a descriptor of its root (ggml flattens view chains, so view_src is
+        // the root and view_offs absolute).
+        auto leaf = [&](ggml_tensor* source) -> ggml_tensor* {
+            if (source == nullptr) return nullptr;
+            ggml_tensor* root = source->view_src != nullptr ? source->view_src : source;
+            if (root->buffer == nullptr || root->data == nullptr || !ggml_is_contiguous(root)) return nullptr;
+            ggml_tensor* bound = ggml_dup_tensor(ctx, root);
+            if (ggml_backend_tensor_alloc(root->buffer, bound, root->data) != GGML_STATUS_SUCCESS) return nullptr;
+            if (source->view_src == nullptr) return bound;
+            return ggml_view_4d(ctx, bound, source->ne[0], source->ne[1], source->ne[2], source->ne[3],
+                source->nb[1], source->nb[2], source->nb[3], source->view_offs);
+        };
+
+        rc.keep_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, N, 1);
+        rc.window_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, conv_rows);
+        ggml_set_input(rc.keep_in);
+        ggml_set_input(rc.window_in);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            ggml_tensor* q = leaf(cache.rp_q[i]);
+            ggml_tensor* k = leaf(cache.rp_k[i]);
+            ggml_tensor* v = leaf(cache.rp_v[i]);
+            ggml_tensor* g = leaf(cache.rp_g[i]);
+            ggml_tensor* beta = leaf(cache.rp_beta[i]);
+            ggml_tensor* conv = leaf(cache.rp_conv[i]);
+            ggml_tensor* state = leaf(cache.delta_in[i]);
+            ggml_tensor* conv_state = leaf(cache.conv_in[i]);
+            if (q == nullptr || k == nullptr || v == nullptr || g == nullptr || beta == nullptr
+                || conv == nullptr || state == nullptr || conv_state == nullptr)
+                return fail();
+            const std::int64_t head_k = state->ne[0], head_v = state->ne[1], heads = state->ne[2];
+            const std::int64_t value_dim = head_v * heads;
+            ggml_tensor* state4 = ggml_reshape_4d(ctx, state, head_k, head_v, heads, 1);
+            ggml_tensor* gdn = ggml_gated_delta_net(ctx, q, k, v,
+                ggml_mul(ctx, g, rc.keep_in), ggml_mul(ctx, beta, rc.keep_in), state4, 1);
+            if (i == 0 && !backend_supports_op(gdn))
+                return fail();
+            ggml_tensor* new_state = ggml_view_4d(ctx, gdn, head_k, head_v, heads, 1,
+                ggml_row_size(gdn->type, head_k),
+                ggml_row_size(gdn->type, head_k * head_v),
+                ggml_row_size(gdn->type, head_k * head_v * heads),
+                ggml_row_size(gdn->type, value_dim) * static_cast<std::size_t>(N));
+            ggml_build_forward_expand(graph, ggml_cpy(ctx, new_state, state));
+
+            // conv is [convDim + N, conv_dim]; gather its time rows by index.
+            ggml_tensor* by_time = ggml_cont(ctx, ggml_transpose(ctx, conv));         // [conv_dim, convDim + N]
+            ggml_tensor* window = ggml_get_rows(ctx, by_time, rc.window_in);          // [conv_dim, convDim]
+            ggml_build_forward_expand(graph, ggml_cpy(ctx, ggml_transpose(ctx, window), conv_state));
+        }
+
+        rc.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+        if (rc.galloc == nullptr || !ggml_gallocr_alloc_graph(rc.galloc, graph))
+            return fail();
+        rc.graph = graph;
+        return graph;
+    }
+
+    /// Run a replay verify's commit for `accepted` kept drafts (0..N-1). The live
+    /// input state is written in place, so the caller's descriptor keeps its side.
+    bool q35v_run_replay_commit(Q35VerifyCache& cache, int accepted)
+    {
+        ggml_cgraph* graph = q35v_replay_commit_graph(cache);
+        if (graph == nullptr) return false;
+        auto& rc = cache.replay_commit;
+        const int N = cache.n;
+        const std::int64_t conv_rows = rc.window_in->ne[0];
+        std::vector<float> keep(static_cast<std::size_t>(N));
+        for (int r = 0; r < N; ++r) keep[static_cast<std::size_t>(r)] = r <= accepted ? 1.0f : 0.0f;
+        // The conv state after row m is rows [m + 1, m + 1 + convDim) of the window.
+        std::vector<std::int32_t> rows(static_cast<std::size_t>(conv_rows));
+        for (std::int64_t t = 0; t < conv_rows; ++t) rows[static_cast<std::size_t>(t)] = static_cast<std::int32_t>(accepted + 1 + t);
+        ggml_backend_tensor_set(rc.keep_in, keep.data(), 0, keep.size() * sizeof(float));
+        ggml_backend_tensor_set(rc.window_in, rows.data(), 0, rows.size() * sizeof(std::int32_t));
+        return tsg::compute_graph(g_backend, graph) == GGML_STATUS_SUCCESS
+            && !g_backend_compute_failed.load(std::memory_order_acquire);
+    }
 }
 
 // Commit ONE recurrent-state snapshot into the LIVE state, entirely on the device.
@@ -2647,15 +2829,20 @@ TSG_EXPORT int TSGgml_Qwen35CommitStateSnapshotOwned(
             c->rank < 0 || c->rank >= TSG_MAX_DEVICES || !c->deferred_state)
             return 0;
         // slot -1 is the post-window state in the *_state_out slices, which is what a
-        // single-row step (and a fully-accepted verify with no snapshots) commits.
-        const bool from_out = slot < 0;
-        if (!from_out && (c->n_snapshots <= 1 || slot >= c->n_snapshots))
+        // single-row step (and a fully-accepted verify with no snapshots) commits. A
+        // replay verify's slot 0 is that same state; its other slots replay a prefix.
+        const bool replay_prefix = c->replay && slot > 0;
+        const bool from_out = slot < 0 || (c->replay && slot == 0);
+        if (replay_prefix && slot >= c->n)
+            return 0;
+        if (!from_out && !replay_prefix && (c->n_snapshots <= 1 || slot >= c->n_snapshots))
             return 0;
         if (static_cast<int>(c->conv_in.size()) != num_recurrent_layers
             || static_cast<int>(c->delta_in.size()) != num_recurrent_layers
             || static_cast<int>(c->conv_out.size()) != num_recurrent_layers
             || static_cast<int>(c->delta_out.size()) != num_recurrent_layers
-            || (!from_out
+            || (replay_prefix && static_cast<int>(c->rp_conv.size()) != num_recurrent_layers)
+            || (!from_out && !replay_prefix
                 && (static_cast<int>(c->conv_snap_slots.size()) != num_recurrent_layers * c->n_snapshots
                     || static_cast<int>(c->delta_snap_slots.size()) != num_recurrent_layers * c->n_snapshots)))
         {
@@ -2670,7 +2857,21 @@ TSG_EXPORT int TSGgml_Qwen35CommitStateSnapshotOwned(
             return 0;
         }
 
-        for (int i = 0; i < num_recurrent_layers; i++)
+        bool copied = false;
+        if (replay_prefix)
+        {
+            // Nothing is copied: the replay writes the input slices in place. A
+            // failure before the graph runs leaves them as the verify found them.
+            ScopedRank rank(c->rank);
+            if (!q35v_run_replay_commit(*c, c->n - 1 - slot))
+            {
+                set_last_error("Qwen3.5 state commit: the replay commit graph failed.");
+                return 0;
+            }
+            copied = true;
+        }
+
+        for (int i = 0; i < num_recurrent_layers && !replay_prefix; i++)
         {
             const int idx = i * c->n_snapshots + (from_out ? 0 : slot);
             ggml_tensor* csrc = from_out ? c->conv_out[i] : c->conv_snap_slots[idx];
@@ -2693,13 +2894,12 @@ TSG_EXPORT int TSGgml_Qwen35CommitStateSnapshotOwned(
         // 2 requires the GPU path so regression tests cannot pass via a fallback.
         // CUDA: one graph of device copies replaces 2 x layers synchronous tensor
         // copies (each paying a stream synchronization) per speculative round.
-        bool copied = false;
         const char* gpu_commit = std::getenv("TS_Q35_GPU_STATE_COMMIT");
-        if ((g_backend_type == BACKEND_TYPE_METAL || g_backend_type == BACKEND_TYPE_CUDA)
+        if (!copied && (g_backend_type == BACKEND_TYPE_METAL || g_backend_type == BACKEND_TYPE_CUDA)
             && (gpu_commit == nullptr || gpu_commit[0] != '0'))
         {
             ScopedRank rank(c->rank);
-            if (ggml_cgraph* graph = q35v_commit_graph(*c, slot))
+            if (ggml_cgraph* graph = q35v_commit_graph(*c, from_out ? -1 : slot))
             {
                 if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS
                     || g_backend_compute_failed.load(std::memory_order_acquire))

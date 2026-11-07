@@ -36,10 +36,13 @@ namespace TensorSharp.Models
             int.TryParse(Environment.GetEnvironmentVariable("TS_QWEN35_BATCHED_SPEC_WINDOW"), out int w) ? w : 8;
 
         /// <summary>Draft cap of the single-sequence verify (see
-        /// ISpeculativeTarget.SpecSoloMaxDraftTokens): its per-row snapshots made 7
-        /// drafts slower than 3 on prose (TS_QWEN35_SOLO_SPEC_DRAFT overrides).</summary>
+        /// ISpeculativeTarget.SpecSoloMaxDraftTokens). It was 3 while the verify kept a
+        /// recurrent state per row; with the replayed commit an 8-row verify costs 1.3x a
+        /// 4-row one and window 7 won on every coding turn measured (see
+        /// SpecPreferredDraftWindow). Seven keeps the verify within ggml-cuda's matvec
+        /// kernel. TS_QWEN35_SOLO_SPEC_DRAFT overrides.</summary>
         private static readonly int s_soloSpecDraftSetting =
-            int.TryParse(Environment.GetEnvironmentVariable("TS_QWEN35_SOLO_SPEC_DRAFT"), out int sd) && sd > 0 ? sd : 3;
+            int.TryParse(Environment.GetEnvironmentVariable("TS_QWEN35_SOLO_SPEC_DRAFT"), out int sd) && sd > 0 ? sd : 7;
 
         public int SpecSoloMaxDraftTokens => HasDFlash && _backend == BackendType.GgmlCuda ? s_soloSpecDraftSetting : int.MaxValue;
 
