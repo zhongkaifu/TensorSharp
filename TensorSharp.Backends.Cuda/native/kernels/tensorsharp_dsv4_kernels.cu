@@ -4104,6 +4104,44 @@ extern "C" __global__ void ts_dsv4_moe_stage_copy(
         d4[u] = s4[u];
 }
 
+// ts_dsv4_moe_stage_copy for a plan that keeps what earlier calls staged (a prompt read layer by layer: each
+// layer's ubatches share one staging, so an expert crosses the bus once per layer, not once per ubatch): only
+// the experts planned since *stageFrom (the count before this call's plan) are copied.
+extern "C" __global__ void ts_dsv4_moe_stage_copy_from(
+    const int32_t* __restrict__ stageList,
+    const int32_t* __restrict__ stageCount,
+    const int32_t* __restrict__ stageFrom,
+    const unsigned long long* __restrict__ hostTabGate,
+    const unsigned long long* __restrict__ hostTabUp,
+    const unsigned long long* __restrict__ hostTabDown,
+    const long long bytesGate,
+    const long long bytesUp,
+    const long long bytesDown,
+    uint8_t* __restrict__ staging,
+    const long long stride,
+    const long long offUp,
+    const long long offDown,
+    const int capacity,
+    const int chunks)
+{
+    const int k = *stageFrom + (int)(blockIdx.x / chunks);
+    if (k >= min(*stageCount, capacity))
+        return;
+    const int e = stageList[k];
+    const int part = blockIdx.y;
+    const long long bytes = part == 0 ? bytesGate : part == 1 ? bytesUp : bytesDown;
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(part == 0 ? hostTabGate[e] : part == 1 ? hostTabUp[e] : hostTabDown[e]);
+    uint8_t* dst = staging + (size_t)k * (size_t)stride + (part == 0 ? 0 : part == 1 ? offUp : offDown);
+    const long long units = bytes / 16;
+    const long long per = (units + chunks - 1) / chunks;
+    const long long begin = (long long)(blockIdx.x % chunks) * per;
+    const long long end = min(units, begin + per);
+    const uint4* s4 = reinterpret_cast<const uint4*>(src);
+    uint4* d4 = reinterpret_cast<uint4*>(dst);
+    for (long long u = begin + threadIdx.x; u < end; u += blockDim.x)
+        d4[u] = s4[u];
+}
+
 // One block: points the staged experts' table entries back at their resting addresses (hostTab*: per expert,
 // its device-mapped host copy, or the zero expert when the host computes missed experts) and clears the plan.
 extern "C" __global__ void ts_dsv4_moe_unstage(

@@ -182,6 +182,8 @@ namespace TensorSharp.Cuda
             public Tensor Qkv, Z, Alpha, Beta, Scr, Core, GOut;
             // attention
             public Tensor Qg, K, V, Q, Gate, AttnO;
+            /// <summary>Split attention's partials [PerSlotMaxRows, NH, splits, part] and per-(row, head) arrival counts.</summary>
+            public Tensor AttnPart, AttnArrive;
             // QSA
             public Tensor IdxRaw, IdxQ, Scores, Cells, CellCnt;
             // PLE
@@ -193,6 +195,8 @@ namespace TensorSharp.Cuda
             public Tensor RouterF32;
             // head
             public Tensor Logits, BatchLogits;
+            /// <summary>A greedy verify's rows' first-max tokens.</summary>
+            public Tensor ArgIds;
             // A batched decode step's per-row state pointers: [layer][conv, ssm][row], then the
             // PLE histories [row], staged through pinned memory.
             public Tensor BatchStatePtrs;
@@ -237,7 +241,7 @@ namespace TensorSharp.Cuda
         private readonly int _pleLayer = -1;
         private DeviceWeight _tokEmbd, _output, _outHcDown, _outHcUp;
         private Tensor _outHcNorm;
-        private IntPtr _pinnedTokens, _pinnedLogits, _pinnedHidden;
+        private IntPtr _pinnedTokens, _pinnedLogits, _pinnedHidden, _pinnedIds;
         private Slot _active;
         private readonly int _perf;
         private readonly CudaStageTimer _stages;
@@ -520,6 +524,8 @@ namespace TensorSharp.Cuda
             long b = 4 * nt * hcE * 4 + 4 * nt * e * 4;
             b += nt * ((long)ConvDim + 3L * ValueDim) * 4 + nt * m.GdnVHeads * (4L * Q4eKernels.GdnHeadDim + 1) * 4;
             b += nt * (long)m.NHead * m.HeadDim * 4 * 5;
+            // Split attention's partials and arrival counts.
+            b += (long)PerSlotMaxRows * m.NHead * (MaxAttnSplits * (long)Q4eKernels.AttnSplitPartFloats * 4 + 4);
             b += nt * (long)(m.NCtx / 4 + m.IdxTopK + 4) * 4;
             b += CudaMoeScratch.Bytes(m.NUbatch, m.NExpertUsed, m.NEmbd, Math.Max(m.NFfExp, 1), m.NExpert);
             b += 3 * nt * (long)m.NFfShexp * 4;
@@ -888,6 +894,7 @@ namespace TensorSharp.Cuda
             if (_posPinned != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_posPinned);
             if (_pinnedLogits != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_pinnedLogits);
             if (_pinnedHidden != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_pinnedHidden);
+            if (_pinnedIds != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_pinnedIds);
             FreeMtpPinned();
         }
     }

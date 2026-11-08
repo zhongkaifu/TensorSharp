@@ -51,6 +51,8 @@ namespace TensorSharp.Cuda
         private readonly IntPtr denseQ81Rows;
         private readonly IntPtr moeScatterAdd;
         private readonly IntPtr moeStagePlan, moeStageCopy, moeUnstage, doorbellPublish, doorbellWaitAdd;
+        // Staging that keeps earlier calls' experts (optional: a module before it re-stages per call).
+        private readonly IntPtr moeStageCopyFrom;
         private readonly IntPtr doorbellPublishSkip, doorbellWaitAddSkip, moeDownDecodeShort;
         private readonly IntPtr denseBf16Rows, denseQ81RowsSplitK, denseBf16RowsSplitK;
         // The same products for 2..16 rows in one block, the weights read once (optional: a module before it launches a
@@ -185,6 +187,8 @@ namespace TensorSharp.Cuda
                 moeStageCopy = module.GetFunction("ts_dsv4_moe_stage_copy");
                 moeUnstage = module.GetFunction("ts_dsv4_moe_unstage");
                 HasExpertTables = true;
+                try { moeStageCopyFrom = module.GetFunction("ts_dsv4_moe_stage_copy_from"); }
+                catch (CudaException ex) when (ex.ErrorCode == 500) { moeStageCopyFrom = IntPtr.Zero; }
             }
             catch (CudaException ex) when (ex.ErrorCode == 500) { }
             try
@@ -237,6 +241,9 @@ namespace TensorSharp.Cuda
         /// <summary>Whether the module's expert kernels read per-expert address tables and it has the staging
         /// kernels (expert residency).</summary>
         public bool HasExpertTables { get; }
+
+        /// <summary>Whether staging can keep what earlier calls staged (<see cref="MoeStageCopyNew"/>).</summary>
+        public bool HasStageKeep => moeStageCopyFrom != IntPtr.Zero;
 
         /// <summary>Whether the module has the host experts' doorbell kernels.</summary>
         public bool HasHostExperts { get; }
@@ -766,6 +773,27 @@ namespace TensorSharp.Cuda
             int a12 = stage.Capacity, a13 = Chunks;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13 };
             Launch(moeStageCopy, (uint)(Math.Max(1, Math.Min(maxStaged, stage.Capacity)) * Chunks), 3, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>
+        /// The plan's experts that a staging kept across calls does not hold yet: <see cref="CudaExpertStage.StageFrom"/>
+        /// takes the planned count first (stream-ordered), then the plan adds this call's new experts and
+        /// <see cref="MoeStageCopyNew"/> copies only those.
+        /// </summary>
+        public void MoeStageMarkFrom(CudaExpertStage stage, IntPtr stream)
+            => CudaDriverApi.cuMemcpyDtoDAsync(stage.StageFrom, stage.StageCount, new UIntPtr(4), stream).ThrowOnError();
+
+        /// <summary>Copies the experts planned since <see cref="MoeStageMarkFrom"/>.</summary>
+        public void MoeStageCopyNew(in CudaExpertStageLayer layer, CudaExpertStage stage, int maxNew, IntPtr stream)
+        {
+            const int Chunks = 16;
+            IntPtr a0 = stage.StageList, a1 = stage.StageCount, a2 = stage.StageFrom, a3 = layer.SrcTabGate, a4 = layer.SrcTabUp,
+                a5 = layer.SrcTabDown;
+            long a6 = layer.BytesGate, a7 = layer.BytesUp, a8 = layer.BytesDown;
+            IntPtr a9 = stage.Staging; long a10 = stage.Stride, a11 = layer.OffUp, a12 = layer.OffDown;
+            int a13 = stage.Capacity, a14 = Chunks;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14 };
+            Launch(moeStageCopyFrom, (uint)(Math.Max(1, Math.Min(maxNew, stage.Capacity)) * Chunks), 3, 1, BlockSize, 0, stream, args);
         }
 
         /// <summary>Points the staged experts' table entries back at their resting addresses and clears the plan.</summary>

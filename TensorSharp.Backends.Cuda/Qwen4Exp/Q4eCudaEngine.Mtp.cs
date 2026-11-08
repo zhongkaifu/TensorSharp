@@ -180,7 +180,24 @@ namespace TensorSharp.Cuda
             // The block's layer, on its own KV.
             var L = _mtpLayer;
             HcPre(dev, L.HcAttnNorm, L.HcAttnDown, L.HcAttnUp, L.HcAttnInject, nt);
-            Attention(dev, L, -1, slot.Mtp, 0, nt, p0);
+            bool rest = logitsOut != null || hOut != null;
+            if (nt > 1 && _mtpKvOnly)
+            {
+                // A catch-up's rows only leave their K/V behind; the layer runs on past it for the last row alone, when
+                // that row drafts (Strata's MtpDrafter::record_front / record_rest). A prompt's catch-up so skips the
+                // attention over the whole prompt and every row's experts.
+                MtpCatchUpKv(dev, L, slot.Mtp, nt, p0, rest);
+                if (!rest)
+                {
+                    CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+                    return;
+                }
+                p0 += nt - 1;
+                nt = 1;
+                MtpLastRowAttention(dev, L, slot.Mtp, p0);
+            }
+            else
+                Attention(dev, L, -1, slot.Mtp, 0, nt, p0);
             dev.QK.HcPost(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), nt, e, hc, dev.Stream);
             HcPre(dev, L.HcFfnNorm, L.HcFfnDown, L.HcFfnUp, L.HcFfnInject, nt);
             Moe(dev, L, -1, nt, -1);
@@ -203,6 +220,58 @@ namespace TensorSharp.Cuda
             if (hOut != null)
                 fixed (float* dst = hOut)
                     Buffer.MemoryCopy((void*)_pinnedHidden, dst, hOut.LongLength * 4L, (long)HcDim * 4L);
+        }
+
+        // TS_Q4E_MTP_KV_ONLY=0: a catch-up runs the whole layer over every row (the outputs of all but the last are unused).
+        private readonly bool _mtpKvOnly = Environment.GetEnvironmentVariable("TS_Q4E_MTP_KV_ONLY") != "0";
+
+        /// <summary>
+        /// The K/V of every row of a catch-up into the block's cache (the rows' mixed inputs are in Cur): the K and V
+        /// projections over all rows, then the norm, RoPE and cache write. With <paramref name="lastRow"/> the last row's
+        /// query is projected too, and its query, gate, streams and scatter logits move to row 0 of the scratch, where
+        /// the rest of the layer runs for it alone.
+        /// </summary>
+        private void MtpCatchUpKv(Dev dev, DevLayer L, SlotLayer c, int nt, int p0, bool lastRow)
+        {
+            var m = _m;
+            int e = m.NEmbd, qd = m.NHead * m.HeadDim, last = nt - 1;
+            IntPtr cur = QuantizeShared(dev, dev.Cur, e, nt);
+            MatMul(dev, L.Wk, dev.Cur, cur, dev.K, nt);
+            MatMul(dev, L.Wv, dev.Cur, cur, dev.V, nt);
+            if (lastRow)
+                using (Tensor curLast = Block(dev.Cur, last, 1, e))
+                using (Tensor qgLast = Block(dev.Qg, last, 1, 2L * qd))
+                    MatMul(dev, L.Wq, curLast, QuantizeShared(dev, curLast, e, 1), qgLast, 1);
+            // Every row's K and V into the cache. The query heads normalize whatever Qg holds: only the last row's is read.
+            dev.QK.AttnPrep(Ptr(dev.Qg), Ptr(dev.K), Ptr(dev.V), Ptr(L.QNorm), Ptr(L.KNorm), Ptr(dev.Q), Ptr(dev.Gate),
+                Ptr(c.KCache), Ptr(c.VCache), IntPtr.Zero, p0, m.NHead, m.NKvHead, m.NRot, m.RopeBase, m.RopeFreqScale,
+                m.RmsEps, nt, dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
+            if (!lastRow)
+                return;
+            CopyRowToFirst(dev, dev.Xs, last, HcDim);
+            CopyRowToFirst(dev, dev.Q, last, qd);
+            CopyRowToFirst(dev, dev.Gate, last, qd);
+            CopyRowToFirst(dev, dev.Inject, last, m.Hc);
+        }
+
+        private static void CopyRowToFirst(Dev dev, Tensor t, int row, long width)
+            => CudaDriverApi.cuMemcpyDtoDAsync(Ptr(t), At(t, row * width), new UIntPtr((ulong)(width * 4)), dev.Stream).ThrowOnError();
+
+        /// <summary>The attention of the catch-up's last row (row 0 of the scratch, at <paramref name="pos"/>) over the
+        /// block's cache, and its output projection.</summary>
+        private void MtpLastRowAttention(Dev dev, DevLayer L, SlotLayer c, int pos)
+        {
+            var m = _m;
+            int splits = AttnSplits(dev, -1, 1, pos);
+            if (splits > 0)
+                dev.QK.AttentionSplit(Ptr(dev.Q), Ptr(c.KCache), Ptr(c.VCache), Ptr(dev.Gate), IntPtr.Zero, IntPtr.Zero,
+                    Ptr(dev.AttnO), IntPtr.Zero, pos, m.NHead, m.NKvHead, m.AttnScale, CellStride, 1, splits,
+                    Ptr(dev.AttnPart), Ptr(dev.AttnArrive), dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
+            else
+                dev.QK.Attention(Ptr(dev.Q), Ptr(c.KCache), Ptr(c.VCache), Ptr(dev.Gate), IntPtr.Zero, IntPtr.Zero,
+                    Ptr(dev.AttnO), IntPtr.Zero, pos, m.NHead, m.NKvHead, m.AttnScale, CellStride, 1, dev.Stream,
+                    PtrOrZero(c.KScale), PtrOrZero(c.VScale));
+            MatMulQ(dev, L.Wo, dev.AttnO, dev.BlockOut, 1);
         }
 
         /// <summary>One half of the join rows: <paramref name="src"/>'s [rows, E] into columns [col, col + E) of the

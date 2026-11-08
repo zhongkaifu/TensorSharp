@@ -116,7 +116,42 @@ namespace TensorSharp.Cuda
         /// row's logits into <paramref name="logitsAll"/> (rows x vocab) and, when given, every row's mixed hidden state into
         /// <paramref name="hAll"/>. The head advances over every row; <see cref="CommitVerify"/> then keeps a prefix.
         /// </summary>
-        public void ForwardVerify(int[] tokens, float[] logitsAll, float[] hAll)
+        public void ForwardVerify(int[] tokens, float[] logitsAll, float[] hAll) => ForwardVerify(tokens, logitsAll, hAll, null);
+
+        /// <summary>Whether <see cref="ForwardVerifyGreedy"/> computes the rows' tokens on the device.</summary>
+        public bool HasDeviceGreedyVerify => _devs[_lastDev].QK.HasArgmaxRows && CanCaptureDecode;
+
+        /// <summary>
+        /// A verify window that returns each row's first-max token in <paramref name="drawnOut"/> instead of its logits
+        /// (a plain greedy sampler's draw), the argmax computed on the device so the window's logits never cross the bus.
+        /// Otherwise as <see cref="ForwardVerify(int[], float[], float[])"/>; without a captured window the logits come back
+        /// and the host takes the same first maximum.
+        /// </summary>
+        public void ForwardVerifyGreedy(int[] tokens, int[] drawnOut, float[] hAll)
+        {
+            ArgumentNullException.ThrowIfNull(drawnOut);
+            if (drawnOut.Length < tokens.Length)
+                throw new ArgumentException("a greedy verify needs one output token per row", nameof(drawnOut));
+            if (HasDeviceGreedyVerify)
+            {
+                ForwardVerify(tokens, null, hAll, drawnOut);
+                return;
+            }
+            int vocab = _m.NVocab;
+            var all = new float[(long)tokens.Length * vocab];
+            ForwardVerify(tokens, all, hAll, null);
+            for (int r = 0; r < tokens.Length; r++)
+            {
+                int best = 0;
+                float bestV = float.NegativeInfinity;
+                long o = (long)r * vocab;
+                for (int i = 0; i < vocab; i++)
+                    if (all[o + i] > bestV) { bestV = all[o + i]; best = i; }
+                drawnOut[r] = best;
+            }
+        }
+
+        private void ForwardVerify(int[] tokens, float[] logitsAll, float[] hAll, int[] idsOut)
         {
             if (tokens == null || tokens.Length == 0 || tokens.Length > VerifyMaxRows)
                 throw new ArgumentException($"a verify window takes 1 to {VerifyMaxRows} tokens", nameof(tokens));
@@ -138,8 +173,12 @@ namespace TensorSharp.Cuda
             try
             {
                 // Captured per (sequence, regime, rows), as decode steps are; uncaptured when graphs are off.
-                if (!(CanCaptureDecode && logitsAll != null && ForwardVerifyGraphed(slot, tokens, p0, logitsAll, hAll)))
+                if (!(CanCaptureDecode && (logitsAll != null || idsOut != null) && ForwardVerifyGraphed(slot, tokens, p0, logitsAll, hAll, idsOut)))
+                {
+                    if (idsOut != null)
+                        throw new InvalidOperationException("[q4e-cuda] a greedy verify needs a captured window");
                     ForwardUbatch(slot, tokens, 0, nt, p0, logitsAll, allRows: true, hOut: hAll);
+                }
             }
             finally
             {

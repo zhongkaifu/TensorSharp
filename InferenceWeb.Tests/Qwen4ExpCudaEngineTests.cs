@@ -603,6 +603,44 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A prompt read layer by layer (TS_Q4E_PROMPT_GROUP) runs each layer over all the group's ubatches before the
+    /// next layer, its missed experts staged once per layer: every ubatch computes what it computes in ubatch order,
+    /// so the prompt's logits and the decode steps after it answer bit for bit as ubatch order does. Twelve-row
+    /// ubatches of the 40-token prompt and groups of 24 rows: the groups end inside the prompt and on its last,
+    /// four-row ubatch (the decode kernels' size).
+    /// </summary>
+    [CudaFact]
+    public void APromptReadLayerByLayer_AnswersBitForBitAsUbatchOrder()
+    {
+        // Staging only: a four-row ubatch would otherwise leave its missed experts to the CPU in ubatch order.
+        _env.Set("TS_Q4E_HOST_EXPERTS", "0");
+        _env.Set("TS_Q4E_UBATCH", "12");
+        string path = Fixture(indexerTopK: 16, q2kxlExperts: true);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+
+        (float[][] Rows, long Groups) Answer(string group)
+        {
+            _env.Set("TS_Q4E_PROMPT_GROUP", group);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            return (Run(model), engine.PromptGroupsRun);
+        }
+        var ubatchOrder = Answer("0");
+        var grouped = Answer("24");
+        _output.WriteLine($"prompt groups read layer by layer: ubatch order {ubatchOrder.Groups}, grouped {grouped.Groups}");
+        Assert.Equal(0, ubatchOrder.Groups);
+        Assert.Equal(2, grouped.Groups);
+        for (int i = 0; i < grouped.Rows.Length; i++)
+            Assert.True(grouped.Rows[i].AsSpan().SequenceEqual(ubatchOrder.Rows[i]),
+                $"{(i == 0 ? "prefill" : $"decode {i}")}: reading the prompt layer by layer changed the logits");
+    }
+
     /// <summary>Host experts (Strata's doorbell): decode steps leave the experts without a VRAM slot to the
     /// CPU inside the captured step, prompts stage them. The CPU's dot products quantize activations as
     /// ggml's CPU kernels do, so the answer matches the all-resident engine closely rather than bit for bit.</summary>
@@ -783,6 +821,49 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         spec.SpecRewindCache(Prompt.Length);
         double restoreErr = RelativeError(model.Forward(new[] { window[0] }), plainFirst);
         Assert.True(restoreErr <= 1e-5, $"after a restore the window's first token differs by {restoreErr:E2}");
+    }
+
+    /// <summary>
+    /// Split attention (flash decoding, TS_Q4E_ATTN_SPLITS): a decode-size row of more than 256 cells spreads them over
+    /// blocks whose partials the last block merges. Past a 600-token prompt (dense rows of 601 cells and more) the
+    /// decode steps answer as the one-block kernel does within float reassociation, the prompt itself (prefill-size
+    /// rows) bit for bit, and a verify window's rows compute their own decode steps (as AVerifyWindow_... holds them):
+    /// the split depends on a row's cells alone.
+    /// </summary>
+    [CudaFact]
+    public void SplitAttention_AnswersAsOneBlockPerRow_AndVerifiesAsItsOwnDecode()
+    {
+        string path = Fixture(indexerTopK: 2048);
+        int[] prompt = Enumerable.Range(0, 600).Select(i => (i * 37 + 11) % 250).ToArray();
+        int[] window = { Steps[0], Steps[1], Steps[2], Steps[3] };
+        int vocab = Qwen4ExpSyntheticModelBuilder.Vocab;
+        (float[][] Rows, float[] Window) Answer(string splits)
+        {
+            _env.Set("TS_Q4E_ATTN_SPLITS", splits);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var rows = new float[window.Length + 1][];
+            rows[0] = (float[])model.ForwardRefill(prompt).Clone();
+            for (int i = 0; i < window.Length; i++)
+                rows[i + 1] = (float[])model.Forward(new[] { window[i] }).Clone();
+            model.ResetKVCache();
+            model.ForwardRefill(prompt);
+            var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+            var all = new float[window.Length * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(window, null, all, true);
+            return (rows, all);
+        }
+        var split = Answer("16");
+        var whole = Answer("1");
+        Assert.True(split.Rows[0].AsSpan().SequenceEqual(whole.Rows[0]), "the prompt's logits moved");
+        for (int i = 1; i < split.Rows.Length; i++)
+        {
+            double err = RelativeError(split.Rows[i], whole.Rows[i]);
+            _output.WriteLine($"decode {i}: split vs one block per row, relative error {err:E2}");
+            Assert.True(err <= 1e-4, $"decode {i}: split attention differs by {err:E2}");
+            double rowErr = RelativeError(split.Window.AsSpan((i - 1) * vocab, vocab).ToArray(), split.Rows[i]);
+            Assert.True(rowErr <= 1e-5, $"verify row {i - 1} differs from its own decode step by {rowErr:E2} under split attention");
+        }
     }
 
     [GgmlFact(BackendType.GgmlCpu)]

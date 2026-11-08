@@ -105,7 +105,8 @@ namespace TensorSharp.Cuda
         /// A verify window of <paramref name="tokens"/> at <paramref name="p0"/> through its captured graphs (Verify.cs
         /// sets the capture flags around it). False when graphs are off: the caller runs the window uncaptured.
         /// </summary>
-        private bool ForwardVerifyGraphed(Slot slot, int[] tokens, int p0, float[] logitsAll, float[] hAll)
+        /// <param name="idsOut">A greedy verify: each row's first-max token instead of its logits (a graph of its own).</param>
+        private bool ForwardVerifyGraphed(Slot slot, int[] tokens, int p0, float[] logitsAll, float[] hAll, int[] idsOut = null)
         {
             int nt = tokens.Length;
             foreach (var dev in _devs)
@@ -121,12 +122,13 @@ namespace TensorSharp.Cuda
             if (_pleLayer >= 0)
                 GatherPleRows(slot, tokens, 0, nt, p0, null, null);
 
-            var key = (slot.Id, DecodeRegime(p0 + nt - 1), nt);
+            bool greedy = idsOut != null;
+            var key = (slot.Id, DecodeRegime(p0 + nt - 1), greedy ? GreedyWindowKey + nt : nt);
             if (!_graphs.TryGetValue(key, out IntPtr[] execs))
             {
                 try
                 {
-                    execs = CaptureSteps(dev => IssueVerifyStep(dev, slot, p0, nt));
+                    execs = CaptureSteps(dev => IssueVerifyStep(dev, slot, p0, nt, greedy));
                 }
                 catch (Exception ex)
                 {
@@ -137,9 +139,12 @@ namespace TensorSharp.Cuda
                 _graphs[key] = execs;
             }
             LaunchSteps(execs);
-            FinishHead(nt, logitsAll, true, hAll, 0);
+            FinishHead(nt, logitsAll, true, hAll, 0, idsOut);
             return true;
         }
+
+        /// <summary>Graph keys of greedy verify windows: this plus the window's rows.</summary>
+        private const int GreedyWindowKey = 64;
 
         /// <summary>One graph launch per device, the next device waiting on the previous one's boundary copy.</summary>
         private void LaunchSteps(IntPtr[] execs)
@@ -208,7 +213,7 @@ namespace TensorSharp.Cuda
         /// <summary>One device's part of a verify window, as captured: <see cref="IssueDecodeStep"/> over
         /// <paramref name="nt"/> rows, the recurrent states saved as the window runs (Verify.cs), and on the last
         /// device every row's logits and hidden streams.</summary>
-        private void IssueVerifyStep(Dev dev, Slot slot, int p0, int nt)
+        private void IssueVerifyStep(Dev dev, Slot slot, int p0, int nt, bool greedy = false)
         {
             var m = _m;
             var boundary = new UIntPtr((ulong)nt * (ulong)HcDim * 4);
@@ -229,7 +234,7 @@ namespace TensorSharp.Cuda
             if (dev.Ordinal < _lastDev)
                 CudaDriverApi.cuMemcpyDtoHAsync(dev.BoundaryPinned, Ptr(dev.Xs), boundary, dev.Stream).ThrowOnError();
             else
-                IssueHead(nt, logits: true, allRows: true, hidden: true);
+                IssueHead(nt, logits: true, allRows: true, hidden: true, greedy: greedy);
         }
 
         private void DestroySlotGraphs(int slotId)

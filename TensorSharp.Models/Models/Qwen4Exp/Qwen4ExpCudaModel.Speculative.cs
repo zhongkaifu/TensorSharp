@@ -62,6 +62,26 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>A greedy verify: each row's first-max token computed on the device (Q4eCudaEngine.ForwardVerifyGreedy), so
+        /// a window's logits (a megabyte a row) never cross the bus or the host's scan. TS_Q4E_GREEDY_VERIFY=0 returns
+        /// every row's logits instead.</summary>
+        bool ISpeculativeTarget.TrySpecForwardGreedyVerify(int[] tokens, float[] hAllOut, int[] drawnOut)
+        {
+            ArgumentNullException.ThrowIfNull(tokens);
+            if (!GreedyVerifyEnabled || tokens.Length == 0 || tokens.Length > TensorSharp.Cuda.Q4eCudaEngine.VerifyMaxRows
+                || drawnOut == null || drawnOut.Length < tokens.Length)
+                return false;
+            lock (_sync)
+            {
+                _specWindowStart = _exec.NPast;
+                _exec.ForwardVerifyGreedy(tokens, drawnOut, hAllOut);
+                _cacheSeqLen = _exec.NPast;
+            }
+            return true;
+        }
+
+        private static readonly bool GreedyVerifyEnabled = Environment.GetEnvironmentVariable("TS_Q4E_GREEDY_VERIFY") != "0";
+
         void ISpeculativeTarget.SpecEnsureCapacity(int requiredSeqLen)
         {
             if (requiredSeqLen > MaxContextLength)
