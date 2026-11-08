@@ -36,6 +36,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "ggml_ops_head_norm.h"
 #if defined(TSG_GGML_USE_METAL)
 #include "ggml-metal.h"
 #endif
@@ -101,19 +102,6 @@ namespace tsg_q4earena
 
 namespace tsg
 {
-    // Qwen3.5 GatedDeltaNet normalizes each Q/K head with
-    //
-    //     x * rsqrt(sum(x^2) + eps)
-    //
-    // ggml_l2_norm uses a different epsilon convention. Express the exact
-    // operation through RMSNorm instead: RMSNorm(x, eps / n) / sqrt(n), where
-    // n is the head dimension (ne[0]). This mirrors llama.cpp's GDN helper.
-    inline ggml_tensor* build_gdn_l2_norm(ggml_context* ctx, ggml_tensor* x, float eps)
-    {
-        const float n = static_cast<float>(x->ne[0]);
-        return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps / n), 1.0f / std::sqrt(n));
-    }
-
     // --- Tensor descriptor structs ---
 
     struct TensorView2DDesc

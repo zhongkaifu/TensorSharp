@@ -1,0 +1,6 @@
+{
+  "description": "Qwen-Image-2.1 Turbo Q5_K_S from config/qwen-image-2.1-turbo.json: text-to-image and editing in eight steps.",
+  "config": "config/qwen-image-2.1-turbo.json",
+  "args": ["--backend", "ggml_cuda"],
+  "service_name": "tensorsharp-comfyui-qwen-image"
+}

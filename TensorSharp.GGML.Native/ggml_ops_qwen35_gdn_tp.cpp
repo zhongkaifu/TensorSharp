@@ -307,10 +307,9 @@ TSG_EXPORT int TSGgml_Qwen35GdnLayerTP(
             ggml_tensor* v_part = ggml_cont(ctx, ggml_view_2d(ctx, conv_out, v_dim, N, conv_out->nb[1],
                 static_cast<std::size_t>(2 * qk_dim) * f32));
 
-            ggml_tensor* q_hn = build_gdn_l2_norm(ctx, ggml_reshape_2d(ctx, q_part, head_k_dim, num_k_heads * N), eps);
-            ggml_tensor* k_hn = build_gdn_l2_norm(ctx, ggml_reshape_2d(ctx, k_part, head_k_dim, num_k_heads * N), eps);
-            ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_hn, head_k_dim, num_k_heads, N);
-            ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_hn, head_k_dim, num_k_heads, N);
+            // Per (key head, token) in 3-D for ggml-vulkan (ggml_ops_head_norm.h).
+            ggml_tensor* q_3d = tsg::gdn_l2_norm_heads(ctx, q_part, head_k_dim, num_k_heads, N, eps);
+            ggml_tensor* k_3d = tsg::gdn_l2_norm_heads(ctx, k_part, head_k_dim, num_k_heads, N, eps);
 
             // Tile K-heads up to V-heads: local V head lv reads local K head
             // lv % num_k_heads, which is exactly what the block-cyclic TP shard
@@ -345,9 +344,8 @@ TSG_EXPORT int TSGgml_Qwen35GdnLayerTP(
                 ggml_row_size(gdn->type, head_k_dim * head_v_dim * num_v_heads),
                 ggml_row_size(gdn->type, v_dim) * static_cast<std::size_t>(N));
 
-            ggml_tensor* out_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, gdn_scores), head_v_dim, num_v_heads * N);
-            ggml_tensor* out_n = ggml_mul(ctx, ggml_rms_norm(ctx, out_2d, eps), ssm_norm_t);
-            ggml_tensor* out_n_3d = ggml_reshape_3d(ctx, out_n, head_v_dim, num_v_heads, N);
+            // Per (value head, token), kept 3-D for ggml-vulkan (ggml_ops_head_norm.h).
+            ggml_tensor* out_n_3d = tsg::rms_norm_heads(ctx, ggml_cont(ctx, gdn_scores), head_v_dim, num_v_heads, N, ssm_norm_t, eps);
             ggml_tensor* z_3d = ggml_reshape_3d(ctx, ggml_cont(ctx, z_v), head_v_dim, num_v_heads, N);
             ggml_tensor* gated = ggml_mul(ctx, out_n_3d, ggml_silu(ctx, z_3d));
 

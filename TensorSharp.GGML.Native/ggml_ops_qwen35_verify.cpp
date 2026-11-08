@@ -1272,11 +1272,12 @@ namespace
                 }
                 else
                 {
+                    // Per-head norms stay 3-D: flattened to [head_dim, heads * N],
+                    // ggml-vulkan's RMS_NORM X axis overflows past 4096 tokens
+                    // (ggml_ops_head_norm.h).
                     ggml_tensor* q_cont = ggml_cont(ctx, q_view); // [head_dim, num_heads, N]
-                    ggml_tensor* q_norm_in = ggml_reshape_2d(ctx, q_cont, head_dim, num_heads * N);
-                    ggml_tensor* k_norm_in = ggml_reshape_2d(ctx, k_3d_raw, head_dim, num_kv_heads * N);
-                    q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_norm_in, eps), t.q_norm_w);
-                    k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_norm_in, eps), t.k_norm_w);
+                    q_normed = tsg::rms_norm_heads(ctx, q_cont, head_dim, num_heads, N, t.q_norm_w, eps);
+                    k_normed = tsg::rms_norm_heads(ctx, k_3d_raw, head_dim, num_kv_heads, N, t.k_norm_w, eps);
                 }
 
                 ggml_tensor* q_4d = ggml_reshape_4d(ctx, q_normed, head_dim, num_heads, N, 1);
@@ -1477,10 +1478,9 @@ namespace
                         key_dim, N, conv_out->nb[1], static_cast<std::size_t>(key_dim) * sizeof(float)));
                     ggml_tensor* v_part = ggml_cont(ctx, ggml_view_2d(ctx, conv_out,
                         value_dim, N, conv_out->nb[1], static_cast<std::size_t>(2 * key_dim) * sizeof(float)));
-                    ggml_tensor* q_hn = build_gdn_l2_norm(ctx,
-                        ggml_reshape_2d(ctx, q_part, head_k_dim, num_k_heads * N), eps);
-                    ggml_tensor* k_hn = build_gdn_l2_norm(ctx,
-                        ggml_reshape_2d(ctx, k_part, head_k_dim, num_k_heads * N), eps);
+                    // Per (key head, token) in 3-D for ggml-vulkan (ggml_ops_head_norm.h).
+                    ggml_tensor* q_hn = tsg::gdn_l2_norm_heads(ctx, q_part, head_k_dim, num_k_heads, N, eps);
+                    ggml_tensor* k_hn = tsg::gdn_l2_norm_heads(ctx, k_part, head_k_dim, num_k_heads, N, eps);
                     q4 = ggml_reshape_4d(ctx, q_hn, head_k_dim, num_k_heads, N, 1);
                     k4 = ggml_reshape_4d(ctx, k_hn, head_k_dim, num_k_heads, N, 1);
                     v4 = ggml_reshape_4d(ctx, v_part, head_v_dim, num_v_heads, N, 1);
@@ -1552,11 +1552,12 @@ namespace
                 }
 
                 // gated RMSNorm with z, per token: rms_norm(out) * ssm_norm * silu(z).
-                ggml_tensor* out_2d = ggml_reshape_2d(ctx,
+                // Normed per (value head, token) in 3-D: the flattened
+                // [head_v_dim, num_v_heads * N] form overflowed ggml-vulkan's RMS_NORM
+                // X axis from a 2049-token step on (ggml_ops_head_norm.h).
+                ggml_tensor* out_n_3d = tsg::rms_norm_heads(ctx,
                     metal_strided_views ? gdn_out : ggml_cont(ctx, gdn_out),
-                    head_v_dim, num_v_heads * N);
-                ggml_tensor* out_n = ggml_mul(ctx, ggml_rms_norm(ctx, out_2d, eps), t.ssm_norm_w);
-                ggml_tensor* out_n_3d = ggml_reshape_3d(ctx, out_n, head_v_dim, num_v_heads, N);
+                    head_v_dim, num_v_heads, N, t.ssm_norm_w, eps);
                 ggml_tensor* z_3d = ggml_reshape_3d(ctx, z_all, head_v_dim, num_v_heads, N);
                 ggml_tensor* gated = ggml_mul(ctx, out_n_3d, ggml_silu(ctx, z_3d));
                 ggml_tensor* gated_flat = ggml_reshape_2d(ctx, gated, value_dim, N);

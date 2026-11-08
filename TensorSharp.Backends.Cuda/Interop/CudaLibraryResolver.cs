@@ -87,22 +87,34 @@ namespace TensorSharp.Cuda.Interop
         }
 
         /// <summary>
-        /// The Windows directories that may hold the CUDA 13 runtime DLLs, newest first. CUDA 13
-        /// installs them in bin\x64 (its bin holds only tools), so that is the only directory
-        /// probed, and of the installed toolkit folders only v13 and newer are considered.
+        /// The Windows directories that may hold the CUDA 13 runtime DLLs this process can load,
+        /// newest first. CUDA 13 installs them in bin\x64 (its bin holds only tools), and NVIDIA's
+        /// Windows on Arm redistributables in bin\arm64, so the one folder for this process's
+        /// architecture is probed, and of the installed toolkit folders only v13 and newer.
         /// </summary>
         internal static IEnumerable<string> EnumerateCudaBinDirectories(
             string cudaPath, string cudaHome, IEnumerable<string> installedToolkitDirectories)
+            => EnumerateCudaBinDirectories(cudaPath, cudaHome, installedToolkitDirectories, WindowsCudaBinArchitecture);
+
+        internal static IEnumerable<string> EnumerateCudaBinDirectories(
+            string cudaPath, string cudaHome, IEnumerable<string> installedToolkitDirectories, string binArchitecture)
         {
             foreach (string root in new[] { cudaPath, cudaHome })
             {
                 if (!string.IsNullOrWhiteSpace(root))
-                    yield return Path.Combine(root, "bin", "x64");
+                    yield return Path.Combine(root, "bin", binArchitecture);
             }
 
             foreach (string versionDir in OrderCuda13ToolkitDirectories(installedToolkitDirectories))
-                yield return Path.Combine(versionDir, "bin", "x64");
+                yield return Path.Combine(versionDir, "bin", binArchitecture);
         }
+
+        /// <summary>
+        /// The bin subfolder whose DLLs this process can load: arm64 for an ARM64 process, x64
+        /// otherwise (including an x64 process emulated on Windows on Arm).
+        /// </summary>
+        internal static string WindowsCudaBinArchitecture =>
+            RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "arm64" : "x64";
 
         /// <summary>
         /// The "vMAJOR.MINOR" toolkit folders of CUDA 13 or newer, newest first by parsed

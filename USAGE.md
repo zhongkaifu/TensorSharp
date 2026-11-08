@@ -1569,6 +1569,14 @@ graph; `TS_WAN_DIT_FLASH=0` forces materialized attention;
 silences it); `TS_FFMPEG` points at the `ffmpeg` used for near-lossless CRF 17
 H.264 export.
 
+## Generating from ComfyUI
+
+[`examples/comfyui/`](examples/comfyui/README.md) is a ComfyUI custom node pack that runs
+these video and image generations from a ComfyUI workflow. Its nodes start a server for
+a `config/` preset, send each generation to the server's streaming route with ComfyUI's
+progress bar and Cancel, and return the clip with its sound, its last frame and the
+pictures as ComfyUI types. ComfyUI needs no change.
+
 ## Mixture-of-Experts CPU offload (`--n-cpu-moe`)
 
 Large MoE models spend almost all of their bytes on routed experts while
@@ -2708,7 +2716,9 @@ Web UI's `/api/chat`) is one trace:
 POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensorsharp.protocol, gen_ai.response.id
 └─ chat <model>                gen_ai.request.model, gen_ai.request.* sampling, gen_ai.usage.input_tokens /
    │                           output_tokens / cache_read.input_tokens, gen_ai.response.finish_reasons,
-   │                           tensorsharp.ttft_ms, tensorsharp.backend, tensorsharp.outcome
+   │                           tensorsharp.ttft_ms, tensorsharp.backend, tensorsharp.outcome,
+   │                           tensorsharp.prompt.uncached_tokens, tensorsharp.prefill.tokens_per_second,
+   │                           tensorsharp.decode.tokens_per_second
    ├─ prompt.render            chat template and tokenization, until the request reaches the engine
    ├─ inference.queue          waiting for the scheduler
    ├─ inference.prefill        until the first token; tensorsharp.compute.prefill_ms
@@ -2724,6 +2734,11 @@ POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensors
 - The `inference.*` spans are wall time. Under continuous batching that overlaps with other
   requests, so `tensorsharp.compute.prefill_ms` and `tensorsharp.compute.decode_ms` give this
   request's own share of engine time.
+- `tensorsharp.prompt.uncached_tokens` is the prompt less what the prefix cache served.
+  `tensorsharp.prefill.tokens_per_second` divides it by the time from the request's first
+  admission to its first token, and `tensorsharp.decode.tokens_per_second` is the tokens after the
+  first over the time after it: the speeds this request saw, so a query can split them by prompt
+  size or by how many requests ran beside it. A rate whose interval is empty is left out.
 - Ollama's `/api/generate` is `text_completion <model>`. Embeddings (`/v1/embeddings`, `/api/embed`)
   are `embeddings <model>`, with `tensorsharp.embedding.inputs`.
 - DiffusionGemma's chat span has `prompt.render` and one `diffusion.denoise` span with a `preview`
@@ -2739,8 +2754,10 @@ POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensors
   `prefix-cache-warmup` for the startup warm-up, `warmup` for the CLI's `--warmup-runs` passes,
   `knowledge-rerank` and `knowledge-media-extract` for the knowledge library. Leave them out of
   client-facing dashboards.
-- Qwen-Image-2.1 requests are `generate_image <model>`, with `tensorsharp.image.mode` (`generate` or
-  `edit`) and the outcome.
+- Qwen-Image-2.1 pictures, from the server or the CLI, are `generate_image <model>`. Each has
+  `tensorsharp.image.mode` (`generate` or `edit`), the size and step count it was made with
+  (`tensorsharp.image.width`, `.height`, `.steps`), `.cfg` when the request sets it, `.seed`,
+  `.references` for an edit, and the outcome.
 - `/health` and the Web UI's `/api/queue/status` polling get no spans and are left out of
   ASP.NET Core's `http.server.request.duration` metric. Outgoing `HttpClient` calls the process
   makes while telemetry runs are client spans.
@@ -2826,6 +2843,19 @@ semantic conventions, which are still in development and may change.
 | `tensorsharp.tokens.cache_read` | counter, `{token}` | as time to first token. Prompt tokens served from the prefix cache, a subset of `input` |
 | `tensorsharp.engine.step.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind` |
 | `tensorsharp.engine.batch.size` | histogram, `{sequence}` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind` |
+| `tensorsharp.engine.step.prefill_tokens` | histogram, `{token}` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind`. Prompt tokens one step forwarded |
+| `tensorsharp.engine.inter_token.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind` (of the step that emitted the token). Time between a sequence's consecutive output tokens |
+| `tensorsharp.prefix_cache.lookups` | counter, `{lookup}` | `tensorsharp.model.architecture`, `tensorsharp.prefix_cache.outcome` (`full`, `partial`, `miss`), `tensorsharp.prefix_cache.source` |
+| `tensorsharp.engine.stage.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.stage`, `tensorsharp.engine.step_kind`, `tensorsharp.engine.rows` |
+| `tensorsharp.slots` | gauge, `{slot}` | `tensorsharp.model.architecture`, `tensorsharp.slot.state` (`running`, `retained`) |
+| `tensorsharp.slots.memory` / `.capacity` | gauge, `By` / `{token}` | `tensorsharp.model.architecture` |
+| `tensorsharp.slots.grows`, `.grow_failures` | counter | `tensorsharp.model.architecture` |
+| `tensorsharp.slots.reclaims` | counter, `{slot}` | `tensorsharp.model.architecture`, `tensorsharp.slot.reclaim_reason` (`new_slot`, `growth`) |
+| `tensorsharp.slots.rewinds` | counter, `{rewind}` | `tensorsharp.model.architecture`, `tensorsharp.rewind.route` (`checkpoint`, `replay`, `reset`, `refused`) |
+| `tensorsharp.slots.rewind.replayed_tokens` | counter, `{token}` | `tensorsharp.model.architecture` |
+| `tensorsharp.cuda_graph.captures`, `.launches` | counter | `tensorsharp.model.architecture`, `tensorsharp.cuda_graph.kind` (`solo`, `batched`) |
+| `tensorsharp.cuda_graph.capture_failures` | counter, `{failure}` | `tensorsharp.model.architecture` |
+| `tensorsharp.engine.forward.issue_time`, `.wait_time` | counter, `s` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.requests.running`, `.waiting` | gauge, `{request}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.steps` | counter, `{step}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.forward.time` | counter, `s` | `tensorsharp.model.architecture` |
@@ -2851,6 +2881,22 @@ semantic conventions, which are still in development and may change.
   load, image, video and Studio durations use boundaries from 0.5 s up to 2 hours (4 hours for
   Studio jobs).
 - `tensorsharp.engine.steps` and `tensorsharp.engine.forward.time` keep counting across model swaps.
+- A sequence's first token has no `tensorsharp.engine.inter_token.duration` value (its wait is the
+  time to first token); a speculative step that emits several tokens records the step's time split
+  between them. A mixed step that prefills other prompts stretches it for every sequence it runs,
+  so its `mixed` values against its `decode` ones are what sharing steps with prompts costs.
+- `tensorsharp.prefix_cache.lookups` counts each admission once. For a reuse, the source is where
+  the prefix came from (`end_state`, `primary`, `pages`, `batched_end_state`); for a miss, the
+  first reason the cache gave (`shared_prefix`, `rewind`, `breakpoints`, `live_cache`,
+  `retained_state`, `pages`, `none` when nothing was cached).
+- The `tensorsharp.slots.*`, `tensorsharp.cuda_graph.*` and `forward.issue_time` / `.wait_time`
+  instruments come from models that keep sequence slots of their own (the Qwen3.8-Flash-Next
+  direct-CUDA engine), read at each collection from counters the engine keeps; they start again
+  when the model is reloaded. Issue time close to `tensorsharp.engine.forward.time` means the
+  host, not the GPU, sets the pace.
+- `tensorsharp.engine.stage.duration` is recorded only when `TS_Q4E_PERF_SAMPLE=N` is set: every
+  Nth forward of that engine runs uncaptured, with GPU timers around each stage, and records one value per
+  stage. `tensorsharp.engine.rows` is the batch's rows in buckets (`1`, `2-4`, `5-8`, `9-16`, `17+`).
 - `tensorsharp.video.generation.duration` includes the wait for the video lock. A phase that fails
   or is cancelled has a span but no `tensorsharp.video.phase.duration` value.
 - The GPU memory gauges report the latest snapshot, taken on the thread that is doing that
@@ -2865,8 +2911,8 @@ With content capture off, which is the default:
 
 - Spans carry ids, model and file names (never directory paths), sizes, counts, timings and
   outcomes. A failure is recorded by its exception type, never its message. As a backstop,
-  `gen_ai.input.messages`, `gen_ai.output.messages` and `tensorsharp.video.prompt` are removed from
-  every span before export.
+  `gen_ai.input.messages`, `gen_ai.output.messages`, `tensorsharp.video.prompt` and
+  `tensorsharp.image.prompt` are removed from every span before export.
 - In exported log records, every value TensorSharp marks as content (prompts, chat messages, model
   output, uploaded file names, paths and URLs, tool arguments, commands, prompt token ids) reads
   `[redacted: N chars]`, and a record that had content is sent as its message template instead of
@@ -2895,8 +2941,8 @@ With content capture off, which is the default:
 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` exports all of it: unredacted logs, the
 real request paths and response ids, `gen_ai.input.messages` and `gen_ai.output.messages` on chat spans (role and content
 pairs as JSON, at most 64K characters, keeping the newest messages), `tensorsharp.video.prompt` on
-clips, `tensorsharp.tool.arguments` and `tensorsharp.tool.result` on tool spans, and
-`tensorsharp.codeexec.command` on `codeexec.run`. Image and Studio spans carry no prompt either way.
+clips, `tensorsharp.image.prompt` on pictures, `tensorsharp.tool.arguments` and `tensorsharp.tool.result`
+on tool spans, and `tensorsharp.codeexec.command` on `codeexec.run`. Studio spans carry no prompt either way.
 Turn it on only when every place the data goes (the collector and its backends, the Application
 Insights resource and its retention, the exporter's local buffer) may hold your users' prompts.
 

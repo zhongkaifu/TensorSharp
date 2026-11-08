@@ -3564,6 +3564,12 @@ extern "C" __global__ void ts_dsv4_moe_down_staged_f32(
 #define TS_MOE_MMA_M 128                          // weight rows per CTA (8 warps x 16)
 #define TS_MOE_MMA_N 32                           // member tokens per pass (4 n8 fragments)
 #define TS_MOE_MMA_NFRAG (TS_MOE_MMA_N / 8)
+// Passes that share one decode of each weight tile. Decoding the 128 x 128 tile to F16 is most
+// of a k-step's work, and it used to be repeated for every 32-token pass: a 4,096-token prefill
+// of Qwen3.8-Flash-Next (512 experts, top 10) gives an expert ~80 member tokens, three passes.
+// Now up to four passes (128 tokens) reuse the tile; every output still accumulates over k in
+// the same order, so the result is unchanged.
+#define TS_MOE_MMA_PASSES 4
 #define TS_MOE_MMA_KSUBS 4                        // 32-value sub-blocks per k-step
 #define TS_MOE_MMA_K (TS_MOE_MMA_KSUBS * 32)      // 128 values per k-step
 #define TS_MOE_MMA_LDS (TS_MOE_MMA_K + 8)         // row stride in halves: 272 B, conflict-free fragment loads
@@ -3612,17 +3618,19 @@ extern "C" __global__ void __launch_bounds__(TS_MOE_MMA_THREADS, 2) ts_dsv4_moe_
     const int tig = lane & 3;
     const int warpM = warp * 16;
 
-    for (int p0 = 0; p0 < m; p0 += TS_MOE_MMA_N)
+    for (int g0 = 0; g0 < m; g0 += TS_MOE_MMA_N * TS_MOE_MMA_PASSES)
     {
-        const int live = min(TS_MOE_MMA_N, m - p0);
-        const int liveFrags = (live + 7) >> 3;
+        // Block-uniform: every thread takes the same passes and barriers.
+        const int passes = min(TS_MOE_MMA_PASSES, (m - g0 + TS_MOE_MMA_N - 1) / TS_MOE_MMA_N);
 
-        float acc[TS_MOE_MMA_NFRAG][4];
+        float acc[TS_MOE_MMA_PASSES][TS_MOE_MMA_NFRAG][4];
 #pragma unroll
-        for (int nf = 0; nf < TS_MOE_MMA_NFRAG; ++nf)
-        {
-            acc[nf][0] = 0.0f; acc[nf][1] = 0.0f; acc[nf][2] = 0.0f; acc[nf][3] = 0.0f;
-        }
+        for (int ps = 0; ps < TS_MOE_MMA_PASSES; ++ps)
+#pragma unroll
+            for (int nf = 0; nf < TS_MOE_MMA_NFRAG; ++nf)
+            {
+                acc[ps][nf][0] = 0.0f; acc[ps][nf][1] = 0.0f; acc[ps][nf][2] = 0.0f; acc[ps][nf][3] = 0.0f;
+            }
 
         for (int k0 = 0; k0 < inDim; k0 += TS_MOE_MMA_K)
         {
@@ -3667,79 +3675,100 @@ extern "C" __global__ void __launch_bounds__(TS_MOE_MMA_THREADS, 2) ts_dsv4_moe_
                 }
             }
 
-            // Activations: 32 tokens x 128 values, 16 per thread (4 float4 loads).
-            {
-                const int n = tid >> 3;
-                const int c = (tid & 7) * 16;
-                uint4* dst = reinterpret_cast<uint4*>(&smA[n][c]);
-                if (n < live)
-                {
-                    const int arow = slotToken != nullptr ? slotToken[off + p0 + n] : off + p0 + n;
-                    const float4* src = reinterpret_cast<const float4*>(act + (size_t)arow * inDim + k0 + c);
-                    uint32_t h[8];
+            // The decoded tile serves every pass of the group. Each pass stages its 32 tokens'
+            // activations; the barrier after it covers the tile's writes on the first pass.
 #pragma unroll
-                    for (int k = 0; k < 4; ++k)
-                    {
-                        const float4 f = src[k];
-                        const half2 p = __floats2half2_rn(f.x, f.y);
-                        const half2 q = __floats2half2_rn(f.z, f.w);
-                        h[2 * k + 0] = *reinterpret_cast<const uint32_t*>(&p);
-                        h[2 * k + 1] = *reinterpret_cast<const uint32_t*>(&q);
-                    }
-                    dst[0] = make_uint4(h[0], h[1], h[2], h[3]);
-                    dst[1] = make_uint4(h[4], h[5], h[6], h[7]);
-                }
-                else
+            for (int ps = 0; ps < TS_MOE_MMA_PASSES; ++ps)
+            {
+                if (ps >= passes)
+                    break;
+                const int p0 = g0 + ps * TS_MOE_MMA_N;
+                const int live = min(TS_MOE_MMA_N, m - p0);
+                const int liveFrags = (live + 7) >> 3;
+
+                // Activations: 32 tokens x 128 values, 16 per thread (4 float4 loads).
                 {
-                    dst[0] = make_uint4(0, 0, 0, 0);
-                    dst[1] = make_uint4(0, 0, 0, 0);
+                    const int n = tid >> 3;
+                    const int c = (tid & 7) * 16;
+                    uint4* dst = reinterpret_cast<uint4*>(&smA[n][c]);
+                    if (n < live)
+                    {
+                        const int arow = slotToken != nullptr ? slotToken[off + p0 + n] : off + p0 + n;
+                        const float4* src = reinterpret_cast<const float4*>(act + (size_t)arow * inDim + k0 + c);
+                        uint32_t h[8];
+#pragma unroll
+                        for (int k = 0; k < 4; ++k)
+                        {
+                            const float4 f = src[k];
+                            const half2 p = __floats2half2_rn(f.x, f.y);
+                            const half2 q = __floats2half2_rn(f.z, f.w);
+                            h[2 * k + 0] = *reinterpret_cast<const uint32_t*>(&p);
+                            h[2 * k + 1] = *reinterpret_cast<const uint32_t*>(&q);
+                        }
+                        dst[0] = make_uint4(h[0], h[1], h[2], h[3]);
+                        dst[1] = make_uint4(h[4], h[5], h[6], h[7]);
+                    }
+                    else
+                    {
+                        dst[0] = make_uint4(0, 0, 0, 0);
+                        dst[1] = make_uint4(0, 0, 0, 0);
+                    }
                 }
-            }
-            __syncthreads();
+                __syncthreads();
 
 #pragma unroll
-            for (int kk = 0; kk < TS_MOE_MMA_K; kk += 16)
-            {
-                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(&smW[warpM + g][kk + 2 * tig]);
-                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(&smW[warpM + g + 8][kk + 2 * tig]);
-                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(&smW[warpM + g][kk + 8 + 2 * tig]);
-                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(&smW[warpM + g + 8][kk + 8 + 2 * tig]);
-#pragma unroll
-                for (int nf = 0; nf < TS_MOE_MMA_NFRAG; ++nf)
+                for (int kk = 0; kk < TS_MOE_MMA_K; kk += 16)
                 {
-                    if (nf >= liveFrags)
-                        break;
-                    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&smA[nf * 8 + g][kk + 2 * tig]);
-                    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(&smA[nf * 8 + g][kk + 8 + 2 * tig]);
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                        : "+f"(acc[nf][0]), "+f"(acc[nf][1]), "+f"(acc[nf][2]), "+f"(acc[nf][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                    const uint32_t a0 = *reinterpret_cast<const uint32_t*>(&smW[warpM + g][kk + 2 * tig]);
+                    const uint32_t a1 = *reinterpret_cast<const uint32_t*>(&smW[warpM + g + 8][kk + 2 * tig]);
+                    const uint32_t a2 = *reinterpret_cast<const uint32_t*>(&smW[warpM + g][kk + 8 + 2 * tig]);
+                    const uint32_t a3 = *reinterpret_cast<const uint32_t*>(&smW[warpM + g + 8][kk + 8 + 2 * tig]);
+#pragma unroll
+                    for (int nf = 0; nf < TS_MOE_MMA_NFRAG; ++nf)
+                    {
+                        if (nf >= liveFrags)
+                            break;
+                        const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&smA[nf * 8 + g][kk + 2 * tig]);
+                        const uint32_t b1 = *reinterpret_cast<const uint32_t*>(&smA[nf * 8 + g][kk + 8 + 2 * tig]);
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                            : "+f"(acc[ps][nf][0]), "+f"(acc[ps][nf][1]), "+f"(acc[ps][nf][2]), "+f"(acc[ps][nf][3])
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                    }
                 }
+                // Before the next pass restages smA, or the next k-step re-decodes smW.
+                __syncthreads();
             }
-            __syncthreads();
         }
 
         // c0/c1: weight row g, tokens 2*tig and 2*tig+1; c2/c3: row g+8.
         const int row0 = r0 + warpM + g;
         const int row1 = row0 + 8;
 #pragma unroll
-        for (int nf = 0; nf < TS_MOE_MMA_NFRAG; ++nf)
+        for (int ps = 0; ps < TS_MOE_MMA_PASSES; ++ps)
         {
-            const int t0 = nf * 8 + 2 * tig;
-            const int t1 = t0 + 1;
-            if (t0 < live)
+            if (ps >= passes)
+                break;
+            const int p0 = g0 + ps * TS_MOE_MMA_N;
+            const int live = min(TS_MOE_MMA_N, m - p0);
+#pragma unroll
+            for (int nf = 0; nf < TS_MOE_MMA_NFRAG; ++nf)
             {
-                float* o = out + (size_t)(off + p0 + t0) * rows;
-                if (row0 < rows) o[row0] = acc[nf][0];
-                if (row1 < rows) o[row1] = acc[nf][2];
-            }
-            if (t1 < live)
-            {
-                float* o = out + (size_t)(off + p0 + t1) * rows;
-                if (row0 < rows) o[row0] = acc[nf][1];
-                if (row1 < rows) o[row1] = acc[nf][3];
+                const int t0 = nf * 8 + 2 * tig;
+                const int t1 = t0 + 1;
+                if (t0 < live)
+                {
+                    float* o = out + (size_t)(off + p0 + t0) * rows;
+                    if (row0 < rows) o[row0] = acc[ps][nf][0];
+                    if (row1 < rows) o[row1] = acc[ps][nf][2];
+                }
+                if (t1 < live)
+                {
+                    float* o = out + (size_t)(off + p0 + t1) * rows;
+                    if (row0 < rows) o[row0] = acc[ps][nf][1];
+                    if (row1 < rows) o[row1] = acc[ps][nf][3];
+                }
             }
         }
     }

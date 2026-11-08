@@ -21,18 +21,25 @@ public sealed class DeepSeek41SchedulerCapacityTests : IDisposable
     public void Dispose() => _env.Dispose();
 
     [Theory]
-    [InlineData("deepseek41", true, false, 132)]
-    [InlineData("DEEPSEEK41", true, false, 132)]
-    [InlineData("deepseek4", true, false, 33)]
-    [InlineData("qwen35", true, false, 33)]
-    [InlineData("deepseek41", false, false, 33)]
-    [InlineData("deepseek41", true, true, 33)]
+    [InlineData("deepseek41", true, false, false, 132)]
+    [InlineData("DEEPSEEK41", true, false, false, 132)]
+    [InlineData("deepseek4", true, false, false, 33)]
+    [InlineData("qwen35", true, false, false, 33)]
+    [InlineData("deepseek41", false, false, false, 33)]
+    [InlineData("deepseek41", true, true, false, 33)]
+    // A model that declares native sequence slots (the direct-CUDA Qwen 3.8
+    // Flash Next engine), whatever its architecture; the declaration alone does
+    // not count without the per-sequence path, or with byte snapshots.
+    [InlineData("qwen4exp", true, false, true, 132)]
+    [InlineData("qwen4exp", true, false, false, 33)]
+    [InlineData("qwen4exp", false, false, true, 33)]
+    [InlineData("qwen4exp", true, true, true, 33)]
     public void AutoCapacityMatchesNativeSlotOwnershipOnly(
-        string architecture, bool perSequence, bool snapshots, int expectedBlocks)
+        string architecture, bool perSequence, bool snapshots, bool declaresNativeSlots, int expectedBlocks)
     {
         // Each 257-token slot needs 33 blocks. Rounding the aggregate instead
         // would leave three slots unable to reserve their final partial block.
-        using var model = new SlotModel(architecture, 257, perSequence, snapshots);
+        using var model = new SlotModel(architecture, 257, perSequence, snapshots, declaresNativeSlots);
         using var engine = new InferenceEngine(model, Config());
         Assert.Equal(expectedBlocks, engine.PoolStats.totalBlocks);
     }
@@ -73,6 +80,40 @@ public sealed class DeepSeek41SchedulerCapacityTests : IDisposable
         Assert.Equal(4, model.MaxConcurrentSlots);
         Assert.Equal(128, engine.PoolStats.totalBlocks);
         Assert.Equal(128, engine.PoolStats.freeBlocks);
+    }
+
+    [Fact]
+    public async Task FourLongDeclaredNativeSlotsPrefillExactlyOnceWithoutPoolPreemption()
+    {
+        // Four 200-token prompts on 256-token slots: a pool of one context (32
+        // blocks) would hold one of them and preempt the rest, and a delta
+        // recurrence cannot rewind, so each preemption re-prefills from zero.
+        using var model = new SlotModel("qwen4exp", declaresNativeSlots: true);
+        var gate = new ComputeGate();
+        gate.Close();
+        using var engine = new InferenceEngine(model, Config()) { ComputeGate = gate };
+        var handles = Enumerable.Range(0, 4).Select(i => engine.SubmitRequest(Sequence($"q4e-{i}", 200, 4))).ToArray();
+        gate.Open();
+
+        var completions = await Task.WhenAll(handles.Select(h => h.Completion)).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.All(completions, c => Assert.Equal(4, c.OutputTokenCount));
+        Assert.Equal(800, model.PromptTokensForwarded);
+        Assert.Equal(4, model.MaxConcurrentSlots);
+        Assert.Equal(128, engine.PoolStats.totalBlocks);
+    }
+
+    [Fact]
+    public async Task AggregateCapacityDoesNotEnlargeAnIndividualDeclaredNativeSlot()
+    {
+        using var model = new SlotModel("qwen4exp", declaresNativeSlots: true);
+        using var engine = new InferenceEngine(model, Config());
+        var oversized = Sequence("oversized", 253, 4);
+        var error = await Assert.ThrowsAsync<ContextLengthExceededException>(() =>
+            engine.SubmitRequest(oversized).Completion.WaitAsync(TimeSpan.FromSeconds(10)));
+
+        Assert.Contains("each native sequence slot", error.Message);
+        Assert.Equal(256, error.ContextTokens);
+        Assert.Equal(0, model.PromptTokensForwarded);
     }
 
     [Fact]
@@ -148,11 +189,14 @@ public sealed class DeepSeek41SchedulerCapacityTests : IDisposable
     private static SequenceState Sequence(string id, int prompt, int output)
         => new(id, Enumerable.Repeat(1, prompt).ToList(), output, 8, SamplingConfig.Greedy);
 
-    // Reproduces V4.1's independent native holders and metadata-only block pool;
-    // no batched graph or byte snapshot is available to mask recomputation.
+    // Reproduces V4.1's independent native holders and metadata-only block pool
+    // (or a model declaring the same, as the direct-CUDA Qwen 3.8 Flash Next
+    // engine does); no batched graph or byte snapshot is available to mask
+    // recomputation.
     private sealed class SlotModel(
         string architecture = "deepseek41", int context = 256,
-        bool perSequence = true, bool snapshots = false) : IModelArchitecture, IBatchedPagedModel
+        bool perSequence = true, bool snapshots = false,
+        bool declaresNativeSlots = false) : IModelArchitecture, IBatchedPagedModel
     {
         private readonly HashSet<string> _slots = new(StringComparer.Ordinal);
         public int PromptTokensForwarded { get; private set; }
@@ -167,6 +211,7 @@ public sealed class DeepSeek41SchedulerCapacityTests : IDisposable
         public int MaxContextLength => context;
         public bool BatchedForwardAvailable => false;
         public bool SupportsPerSequenceFusedForward => perSequence;
+        public bool UsesNativeSequenceSlots => declaresNativeSlots;
         public bool CanBatchDecode(string requestId, int position) => false;
         public float[] Forward(int[] tokens)
         {

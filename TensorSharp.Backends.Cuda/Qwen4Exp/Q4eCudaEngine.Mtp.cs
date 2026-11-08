@@ -106,6 +106,23 @@ namespace TensorSharp.Cuda
             _pinnedChain = IntPtr.Zero;
         }
 
+        /// <summary>The MTP block's K/V for a slot, for the whole context (it does not grow with the slot): F16, or
+        /// Q8_0 codes and their scales.</summary>
+        private void AllocKv(Slot slot, Dev dev, SlotLayer c)
+        {
+            long kv = (long)_m.NCtx * _m.NKvHead * _m.HeadDim;
+            if (!_m.KvQ8)
+            {
+                c.KCache = SlotTensor(slot, dev, DType.Float16, kv);
+                c.VCache = SlotTensor(slot, dev, DType.Float16, kv);
+                return;
+            }
+            c.KCache = SlotTensor(slot, dev, DType.UInt8, kv);
+            c.VCache = SlotTensor(slot, dev, DType.UInt8, kv);
+            c.KScale = SlotTensor(slot, dev, DType.Float16, kv / Q4eKernels.KvQ8Block);
+            c.VScale = SlotTensor(slot, dev, DType.Float16, kv / Q4eKernels.KvQ8Block);
+        }
+
         /// <summary>The block's KV for a slot, allocated at its first draft.</summary>
         private void EnsureMtpCache(Slot slot)
         {

@@ -1398,6 +1398,13 @@ UMT5-XXL 编码器同上。
 `TS_WAN_DIT_FLASH=0` 强制走物化注意力；`TS_WAN_HEARTBEAT_S` 设置进度心跳间隔（默认 30 秒，
 `0` 静默）；`TS_FFMPEG` 指定用于近无损 CRF 17 H.264 导出的 `ffmpeg`。
 
+## 在 ComfyUI 中生成
+
+[`examples/comfyui/`](examples/comfyui/README.md)（英文）是一个 ComfyUI 自定义节点包，可在
+ComfyUI 工作流中运行上述视频与图像生成。它的节点按 `config/` 中的预设启动服务器，把每次生成
+发送到服务器的流式接口，支持 ComfyUI 的进度条和取消，并以 ComfyUI 类型返回带音轨的视频、
+最后一帧以及生成的图片。ComfyUI 本身无需修改。
+
 ## 混合专家 CPU 卸载（`--n-cpu-moe`）
 
 大型 MoE 模型几乎所有权重都花在路由专家上，而每个 token 只激活其中很小一部分
@@ -2395,7 +2402,9 @@ CLI 在运行结束时执行这次导出，即单次模式结束或交互式会�
 POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、tensorsharp.protocol、gen_ai.response.id
 └─ chat <model>                gen_ai.request.model、gen_ai.request.* 采样参数、gen_ai.usage.input_tokens /
    │                           output_tokens / cache_read.input_tokens、gen_ai.response.finish_reasons、
-   │                           tensorsharp.ttft_ms、tensorsharp.backend、tensorsharp.outcome
+   │                           tensorsharp.ttft_ms、tensorsharp.backend、tensorsharp.outcome、
+   │                           tensorsharp.prompt.uncached_tokens、tensorsharp.prefill.tokens_per_second、
+   │                           tensorsharp.decode.tokens_per_second
    ├─ prompt.render            套用聊天模板并分词，直到请求进入引擎
    ├─ inference.queue          等待调度器
    ├─ inference.prefill        直到生成第一个 token；tensorsharp.compute.prefill_ms
@@ -2409,6 +2418,10 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
   客户端若发送 W3C `traceparent` 请求头，该请求会落在客户端自己的 trace 中。
 - `inference.*` span 记录的是墙钟时间。连续批处理下它会与其他请求重叠，因此
   `tensorsharp.compute.prefill_ms` 和 `tensorsharp.compute.decode_ms` 给出本请求自己占用的引擎时间。
+- `tensorsharp.prompt.uncached_tokens` 是提示词中未由前缀缓存提供的 token 数。
+  `tensorsharp.prefill.tokens_per_second` 是它除以从请求首次被调度到第一个 token 的时间，
+  `tensorsharp.decode.tokens_per_second` 是第一个 token 之后的 token 数除以之后的时间：即本请求实际得到的速度，
+  便于按提示词长度或同时运行的请求数拆分。区间为空的速率不记录。
 - Ollama 的 `/api/generate` 为 `text_completion <model>`。嵌入请求（`/v1/embeddings`、`/api/embed`）为
   `embeddings <model>`，带 `tensorsharp.embedding.inputs`。
 - DiffusionGemma 的聊天 span 下有 `prompt.render` 和一个 `diffusion.denoise` span，每次预览对应一个
@@ -2423,7 +2436,9 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
 - TensorSharp 自己发起的模型调用带有 `tensorsharp.internal=true` 和 `tensorsharp.origin`：启动预热为
   `prefix-cache-warmup`，CLI 的 `--warmup-runs` 预热轮为 `warmup`，知识库为 `knowledge-rerank` 和
   `knowledge-media-extract`。面向客户端的看板应把它们排除在外。
-- Qwen-Image-2.1 请求为 `generate_image <model>`，带 `tensorsharp.image.mode`（`generate` 或 `edit`）和结果。
+- Qwen-Image-2.1 的图像（无论来自服务端还是 CLI）为 `generate_image <model>`，带 `tensorsharp.image.mode`
+  （`generate` 或 `edit`）、实际生成所用的尺寸与步数（`tensorsharp.image.width`、`.height`、`.steps`）、
+  请求设置了时的 `.cfg`、`.seed`、编辑时的 `.references`，以及结果。
 - `/health` 与 Web UI 对 `/api/queue/status` 的轮询不生成 span，也不计入 ASP.NET Core 的
   `http.server.request.duration` 指标。遥测运行期间，进程通过 `HttpClient` 发出的调用记为客户端 span。
 
@@ -2499,6 +2514,19 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 | `tensorsharp.tokens.cache_read` | counter，`{token}` | 同首 token 时间。由前缀缓存提供的提示 token，是 `input` 的子集 |
 | `tensorsharp.engine.step.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind` |
 | `tensorsharp.engine.batch.size` | histogram，`{sequence}` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind` |
+| `tensorsharp.engine.step.prefill_tokens` | histogram，`{token}` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind`。一步前向的提示词 token 数 |
+| `tensorsharp.engine.inter_token.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind`（产生该 token 的步骤）。同一序列相邻两个输出 token 的间隔；`mixed` 与 `decode` 的差即与提示词共用步骤的代价 |
+| `tensorsharp.prefix_cache.lookups` | counter，`{lookup}` | `tensorsharp.model.architecture`、`tensorsharp.prefix_cache.outcome`（`full`、`partial`、`miss`）、`tensorsharp.prefix_cache.source` |
+| `tensorsharp.engine.stage.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.stage`、`tensorsharp.engine.step_kind`、`tensorsharp.engine.rows`；仅在设置 `TS_Q4E_PERF_SAMPLE=N` 时记录 |
+| `tensorsharp.slots` | gauge，`{slot}` | `tensorsharp.model.architecture`、`tensorsharp.slot.state`（`running`、`retained`） |
+| `tensorsharp.slots.memory` / `.capacity` | gauge，`By` / `{token}` | `tensorsharp.model.architecture` |
+| `tensorsharp.slots.grows`、`.grow_failures` | counter | `tensorsharp.model.architecture` |
+| `tensorsharp.slots.reclaims` | counter，`{slot}` | `tensorsharp.model.architecture`、`tensorsharp.slot.reclaim_reason`（`new_slot`、`growth`） |
+| `tensorsharp.slots.rewinds` | counter，`{rewind}` | `tensorsharp.model.architecture`、`tensorsharp.rewind.route`（`checkpoint`、`replay`、`reset`、`refused`） |
+| `tensorsharp.slots.rewind.replayed_tokens` | counter，`{token}` | `tensorsharp.model.architecture` |
+| `tensorsharp.cuda_graph.captures`、`.launches` | counter | `tensorsharp.model.architecture`、`tensorsharp.cuda_graph.kind`（`solo`、`batched`） |
+| `tensorsharp.cuda_graph.capture_failures` | counter，`{failure}` | `tensorsharp.model.architecture` |
+| `tensorsharp.engine.forward.issue_time`、`.wait_time` | counter，`s` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.requests.running`、`.waiting` | gauge，`{request}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.steps` | counter，`{step}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.forward.time` | counter，`s` | `tensorsharp.model.architecture` |
@@ -2533,8 +2561,8 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 内容捕获关闭时（默认）：
 
 - span 只带 id、模型名与文件名（从不含目录路径）、尺寸、计数、耗时和结果。失败只记录异常类型，从不记录
-  消息。作为兜底，导出前会从每个 span 上移除 `gen_ai.input.messages`、`gen_ai.output.messages` 和
-  `tensorsharp.video.prompt`。
+  消息。作为兜底，导出前会从每个 span 上移除 `gen_ai.input.messages`、`gen_ai.output.messages`、
+  `tensorsharp.video.prompt` 和 `tensorsharp.image.prompt`。
 - 在导出的日志记录中，TensorSharp 标记为内容的每个值（提示词、聊天消息、模型输出、上传文件的名称、路径和
   URL、工具参数、命令、提示词的 token id）都显示为 `[redacted: N chars]`；含有内容的记录以消息模板而不是
   渲染后的文本发送。每个被标记值的文本（4 个字符及以上）在该记录的其他属性及其异常消息中也替换为
@@ -2555,9 +2583,9 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 
 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` 会导出以上全部内容：不脱敏的日志、真实的请求路径和响应 id、
 聊天 span 上的 `gen_ai.input.messages` 和 `gen_ai.output.messages`（由角色与内容组成的 JSON，最多 64K 字符，
-保留最新的消息）、视频 span 上的 `tensorsharp.video.prompt`、工具 span 上的 `tensorsharp.tool.arguments` 和
-`tensorsharp.tool.result`，以及 `codeexec.run` 上的 `tensorsharp.codeexec.command`。图像与 Studio 的 span
-无论如何都不带提示词。只有当数据去往的每个地方（collector 及其后端、Application Insights 资源及其保留策略、
+保留最新的消息）、视频 span 上的 `tensorsharp.video.prompt`、图像 span 上的 `tensorsharp.image.prompt`、
+工具 span 上的 `tensorsharp.tool.arguments` 和 `tensorsharp.tool.result`，以及 `codeexec.run` 上的
+`tensorsharp.codeexec.command`。Studio 的 span 无论如何都不带提示词。只有当数据去往的每个地方（collector 及其后端、Application Insights 资源及其保留策略、
 导出器的本地缓冲）都允许保存用户提示词时，才开启这一项。
 
 ### Application Insights

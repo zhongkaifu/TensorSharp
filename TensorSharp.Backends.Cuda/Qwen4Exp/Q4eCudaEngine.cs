@@ -213,6 +213,9 @@ namespace TensorSharp.Cuda
         {
             public int Id;
             public int NPast;
+            /// <summary>Positions the slot's attention and indexer caches hold; they grow (doubling, up
+            /// to n_ctx) as the sequence does.</summary>
+            public int Capacity;
             /// <summary>Cache bytes per device.</summary>
             public long[] DeviceBytes;
             public bool Failed;
@@ -227,6 +230,16 @@ namespace TensorSharp.Cuda
             /// <summary>The MTP block's KV (allocated on the slot's first draft), and the positions it holds.</summary>
             public SlotLayer Mtp;
             public int MtpPast;
+
+            // The rewind checkpoint: the recurrent states as they stood at the end of the last
+            // multi-token forward (a prompt boundary), at CpNPast, or -1 for none. Decode steps leave
+            // it alone, so a turn whose prompt re-renders the previous reply differently can go back
+            // to where that reply began.
+            public int CpNPast = -1;
+            /// <summary>Per layer, the checkpoint copies of a GDN layer's conv and ssm states (null
+            /// for attention layers).</summary>
+            public Tensor[] ConvCp, SsmCp;
+            public Tensor PleHistCp;
         }
 
         private sealed class SlotLayer
@@ -247,6 +260,20 @@ namespace TensorSharp.Cuda
         private Slot _active;
         private readonly int _perf;
         private readonly CudaStageTimer _stages;
+        /// <summary>TS_Q4E_PERF_SAMPLE: every this many forwards one runs uncaptured with GPU events
+        /// between its stages, reported to <see cref="StageObserver"/>; 0 never.</summary>
+        private readonly int _perfSample;
+        private readonly CudaStageTimer _sampleStages;
+        private int _forwardsSinceSample;
+        /// <summary>The forward in flight is a sampled one (stages timed, graphs not used).</summary>
+        private bool _sampling;
+
+        /// <summary>
+        /// Receives a sampled forward's stages (TS_Q4E_PERF_SAMPLE): the stage's name, its GPU
+        /// seconds, the forward's rows and whether it was a decode step. Engine thread; it must be
+        /// cheap and must not throw.
+        /// </summary>
+        public Action<string, double, int, bool> StageObserver { get; set; }
 
         public int NPast => _active.NPast;
         public int ContextSize => _m.NCtx;
@@ -304,6 +331,8 @@ namespace TensorSharp.Cuda
                 throw new NotSupportedException("[q4e-cuda] the PLE block needs a row source as wide as the hidden state");
             _perf = EnvInt("TS_Q4E_PERF", 0);
             _stages = new CudaStageTimer("q4e-cuda", _perf, StageNames);
+            _perfSample = _perf < 2 ? Math.Max(0, EnvInt("TS_Q4E_PERF_SAMPLE", 0)) : 0;
+            _sampleStages = new CudaStageTimer("q4e-cuda", _perfSample > 0 ? 3 : 0, StageNames);
 
             CudaBackend.Register();
             CudaDriverApi.cuInit(0);
@@ -370,13 +399,15 @@ namespace TensorSharp.Cuda
             // ---- placement: contiguous runs of layers, each device filled to the same share of
             // what it has free after its fixed scratch ----
             var layerBytes = new long[m.NLayer];
+            var cacheBytes = new long[m.NLayer];
             for (int il = 0; il < m.NLayer; il++)
             {
                 foreach (var w in LayerWeights(m.Layers[il], experts: _residency == null))
                     layerBytes[il] += CudaWeightArena.Align(w.TotalBytes);
-                layerBytes[il] += LayerFloatBytes(m.Layers[il]) + LayerCacheBytes(il);
+                cacheBytes[il] = LayerCacheBytes(il);
+                layerBytes[il] += LayerFloatBytes(m.Layers[il]) + cacheBytes[il];
             }
-            int[] assignment = PlaceLayers(layerBytes);
+            int[] assignment = PlaceLayers(layerBytes, cacheBytes);
             _lastDev = assignment[m.NLayer - 1];
 
             // ---- arenas ----
@@ -438,7 +469,18 @@ namespace TensorSharp.Cuda
             StartHostExperts();
             _active = CreateSlot();
             _slots[_active.Id] = _active;
+            CountSlot(_active, +1);
             CachePrefillWeights();
+
+            // Admission (SlotFits): a new slot's initial caches, and room for one slot to grow to
+            // the whole context.
+            _slotInitialBytes = (long[])_active.DeviceBytes.Clone();
+            _slotGrowBytes = new long[useDevs];
+            for (int il = 0; il < m.NLayer; il++)
+                if (!_layers[il].Recurrent)
+                    _slotGrowBytes[_layers[il].Device] += AttentionCacheBytes(_layers[il], m.NCtx)
+                        - AttentionCacheBytes(_layers[il], _active.Capacity);
+            Console.Error.WriteLine($"[q4e-cuda] sequence slots start at {_active.Capacity} tokens and grow to {m.NCtx}");
 
             double gib = 0;
             foreach (long b in layerBytes)
@@ -500,6 +542,16 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>One sequence's cache bytes for a layer at the full context.</summary>
+        /// <summary>An attention layer's K/V and QSA key caches for <paramref name="tokens"/> positions.</summary>
+        private long AttentionCacheBytes(DevLayer L, int tokens)
+        {
+            var m = _m;
+            long b = (long)tokens * m.NKvHead * m.HeadDim * 2 * 2;
+            if (L.Ratio > 0)
+                b += (long)tokens * m.IdxDim * 2 + (long)(tokens / L.Ratio) * m.IdxDim * 4;
+            return b;
+        }
+
         private long LayerCacheBytes(int il)
         {
             var m = _m;
@@ -534,7 +586,17 @@ namespace TensorSharp.Cuda
             return b + (256L << 20);
         }
 
-        private int[] PlaceLayers(long[] layerBytes)
+        /// <summary>Sequence slots the placement plans room for, at most: as many as one batched
+        /// decode step takes. TS_Q4E_PLACEMENT_SLOTS overrides it (1 = the weights and one slot only).</summary>
+        private static int PlacementSlots => Math.Clamp(EnvInt("TS_Q4E_PLACEMENT_SLOTS", MaxBatchedDecodeRows), 1, 1024);
+
+        /// <param name="layerBytes">Each layer's weights plus one sequence slot's caches.</param>
+        /// <param name="cacheBytes">One slot's caches of each layer: the placement balances the
+        /// devices for as many slots as fit (up to <see cref="PlacementSlots"/>), not for one, since
+        /// every slot holds a whole context of every attention layer. Balanced for one, the device
+        /// with more attention layers (and the head) ran out first: on two H100 NVL at 262,144
+        /// tokens a 23/25 split held 7 slots while the other GPU had room for 15.</param>
+        private int[] PlaceLayers(long[] layerBytes, long[] cacheBytes)
         {
             int nDev = _devs.Length, n = layerBytes.Length;
             var budget = new long[nDev];
@@ -556,12 +618,42 @@ namespace TensorSharp.Cuda
                     $"[q4e-cuda] the model needs {total / 1073741824.0:F1} GiB of weights and caches but the " +
                     $"{nDev} GPU(s) have {totalBudget / 1073741824.0:F1} GiB free; lower the context or add devices.");
 
-            // Fill each device to the same fraction of its budget, leaving at least one layer for
-            // every device after it.
+            // The most slots that fit in all: place for them, each layer weighing its weights and
+            // that many slots' caches. Whole layers may not split that exactly, so fall back a slot
+            // at a time; one slot is the placement as it always was.
+            long oneSlot = 0;
+            foreach (long x in cacheBytes) oneSlot += x;
+            int slots = 1;
+            if (nDev > 1 && oneSlot > 0)
+                slots = (int)Math.Clamp(1 + (totalBudget - total) / oneSlot, 1, PlacementSlots);
+            for (; slots > 1; slots--)
+            {
+                var weighted = new long[n];
+                for (int il = 0; il < n; il++)
+                    weighted[il] = layerBytes[il] + (slots - 1) * cacheBytes[il];
+                int[] planned = FillDevices(weighted, budget, total + (slots - 1) * oneSlot, totalBudget, out _);
+                if (planned != null)
+                {
+                    Console.Error.WriteLine($"[q4e-cuda] layers placed for {slots} sequence slots of {_m.NCtx} tokens");
+                    return planned;
+                }
+            }
+            return FillDevices(layerBytes, budget, total, totalBudget, out int badLayer)
+                ?? throw new InvalidOperationException(
+                    $"[q4e-cuda] layer {badLayer} does not fit on device {_devs.Length - 1}");
+        }
+
+        /// <summary>Fill each device to the same fraction of its budget, leaving at least one layer
+        /// for every device after it. Null (and the layer that overflowed) when a device's run of
+        /// whole layers exceeds its budget.</summary>
+        private static int[] FillDevices(long[] layerBytes, long[] budget, long total, long totalBudget, out int badLayer)
+        {
+            int nDev = budget.Length, n = layerBytes.Length;
             double share = (double)total / totalBudget;
             var assignment = new int[n];
             int dev = 0;
             long used = 0;
+            badLayer = -1;
             for (int il = 0; il < n; il++)
             {
                 int layersLeft = n - il, devsAfter = nDev - 1 - dev;
@@ -574,7 +666,10 @@ namespace TensorSharp.Cuda
                 assignment[il] = dev;
                 used += layerBytes[il];
                 if (used > budget[dev])
-                    throw new InvalidOperationException($"[q4e-cuda] layer {il} does not fit on device {dev}");
+                {
+                    badLayer = il;
+                    return null;
+                }
             }
             return assignment;
         }
@@ -913,6 +1008,7 @@ namespace TensorSharp.Cuda
                 }
             }
             _stages.Dispose();
+            _sampleStages.Dispose();
             if (_pinnedTokens != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_pinnedTokens);
             if (_posPinned != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_posPinned);
             if (_pinnedLogits != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_pinnedLogits);

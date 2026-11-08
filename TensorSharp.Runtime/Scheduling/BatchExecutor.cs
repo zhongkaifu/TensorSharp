@@ -4296,6 +4296,19 @@ namespace TensorSharp.Runtime.Scheduling
         /// path described above. Default false (model keeps the batched path).</summary>
         bool SupportsPerSequenceFusedForward => false;
 
+        /// <summary>True when every sequence's complete state lives in a native
+        /// slot the model allocates itself for the whole context (a direct-CUDA
+        /// engine's sequence slots), so the scheduler's block pool holds no KV
+        /// bytes and only tracks reservations. The engine then sizes that pool for
+        /// one context per running sequence rather than one context in all, which
+        /// would otherwise cap every concurrent request's tokens together at one
+        /// context and preempt healthy slots, and it refuses a request whose
+        /// prompt plus output allowance cannot fit one slot. The model reports a
+        /// full device with <see cref="SequenceSlotUnavailableException"/>.
+        /// Requires <see cref="SupportsPerSequenceFusedForward"/>. Default false.
+        /// DeepSeek V4.1 is recognised by its architecture as well.</summary>
+        bool UsesNativeSequenceSlots => false;
+
         /// <summary>Make <paramref name="requestId"/>'s per-request KV cache the
         /// model's active cache (creating an empty one the first time). Returns
         /// true when the cache was freshly created, signalling the caller to

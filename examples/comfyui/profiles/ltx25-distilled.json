@@ -1,0 +1,6 @@
+{
+  "description": "LTX 2.5 22B distilled UD-Q4_K_XL from config/ltx-2.5-distilled.json: text-to-video, first and last frame, and reference pictures, with a 48 kHz stereo soundtrack.",
+  "config": "config/ltx-2.5-distilled.json",
+  "args": ["--backend", "ggml_cuda"],
+  "service_name": "tensorsharp-comfyui-ltx25"
+}

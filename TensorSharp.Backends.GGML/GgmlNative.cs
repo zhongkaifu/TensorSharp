@@ -1488,6 +1488,8 @@ internal enum GgmlIndexReductionOp
     {
         private const string DllName = "GgmlOps";
         private static int s_windowsDependencySearchPathsInitialized;
+        // The first GgmlOps file that exists but failed to load, and why (see ImportResolver).
+        private static (string Path, Exception Error)? s_bridgeLoadFailure;
 
         static GgmlNative()
         {
@@ -5288,7 +5290,9 @@ internal enum GgmlIndexReductionOp
             }
             catch (DllNotFoundException ex)
             {
-                throw new InvalidOperationException("Failed to load the native GGML bridge. Build `TensorSharp.GGML.Native` first.", ex);
+                var failure = s_bridgeLoadFailure;
+                throw new InvalidOperationException(
+                    DescribeBridgeLoadFailure(failure?.Path, failure?.Error, OperatingSystem.IsWindows(), OperatingSystem.IsLinux()), ex);
             }
             catch (EntryPointNotFoundException ex)
             {
@@ -7303,11 +7307,24 @@ internal enum GgmlIndexReductionOp
 
             foreach (string candidate in GetCandidatePaths(assembly))
             {
-                if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out IntPtr handle))
+                if (!File.Exists(candidate))
+                    continue;
+
+                IntPtr handle;
+                try
                 {
-                    GgmlNativeLibraryState.MarkLoaded();
-                    return handle;
+                    handle = NativeLibrary.Load(candidate);
                 }
+                catch (Exception ex) when (ex is DllNotFoundException || ex is BadImageFormatException)
+                {
+                    // The file is there, so the build is not what is missing: keep the OS loader's
+                    // reason (usually a dependency such as the CUDA runtime) for the error.
+                    s_bridgeLoadFailure ??= (candidate, ex);
+                    continue;
+                }
+
+                GgmlNativeLibraryState.MarkLoaded();
+                return handle;
             }
 
             // The runtime's own DllImport probing, which it would run next anyway: done here so
@@ -7422,16 +7439,21 @@ internal enum GgmlIndexReductionOp
         /// <summary>
         /// Where GgmlOps.dll (cublas64_13.dll) and cuDNN (cublasLt64_13.dll, nvrtc64_130_0.dll)
         /// find the CUDA 13 runtime. CUDA 13 installs its DLLs in bin\x64 (its bin holds only
-        /// tools), so that is the only directory probed, and of the installed toolkit folders
-        /// only v13 and newer are considered, newest first by parsed version.
+        /// tools), and NVIDIA's Windows on Arm redistributables in bin\arm64, so the one folder
+        /// for this process's architecture is probed, and of the installed toolkit folders only
+        /// v13 and newer are considered, newest first by parsed version.
         /// </summary>
         internal static IEnumerable<string> EnumerateWindowsNativeDependencyDirectories(
             string cudaPath, string cudaHome, IEnumerable<string> installedToolkitDirectories)
+            => EnumerateWindowsNativeDependencyDirectories(cudaPath, cudaHome, installedToolkitDirectories, WindowsCudaBinArchitecture);
+
+        internal static IEnumerable<string> EnumerateWindowsNativeDependencyDirectories(
+            string cudaPath, string cudaHome, IEnumerable<string> installedToolkitDirectories, string binArchitecture)
         {
             foreach (string root in new[] { cudaPath, cudaHome })
             {
                 if (!string.IsNullOrWhiteSpace(root))
-                    yield return Path.Combine(root, "bin", "x64");
+                    yield return Path.Combine(root, "bin", binArchitecture);
             }
 
             var toolkits = installedToolkitDirectories
@@ -7439,8 +7461,15 @@ internal enum GgmlIndexReductionOp
                 .Where(entry => entry.Version != null && entry.Version.Major >= 13)
                 .OrderByDescending(entry => entry.Version);
             foreach (var toolkit in toolkits)
-                yield return Path.Combine(toolkit.Dir, "bin", "x64");
+                yield return Path.Combine(toolkit.Dir, "bin", binArchitecture);
         }
+
+        /// <summary>
+        /// The CUDA bin subfolder whose DLLs this process can load: arm64 for an ARM64 process,
+        /// x64 otherwise (including an x64 process emulated on Windows on Arm).
+        /// </summary>
+        internal static string WindowsCudaBinArchitecture =>
+            RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "arm64" : "x64";
 
         private static Version ParseCudaToolkitFolderVersion(string folderName)
         {
@@ -7523,6 +7552,36 @@ internal enum GgmlIndexReductionOp
                 return string.Empty;
             IntPtr ptr = TSGgml_GetBackendFailureText();
             return ptr == IntPtr.Zero ? string.Empty : (Marshal.PtrToStringAnsi(ptr) ?? string.Empty);
+        }
+
+        /// <summary>
+        /// Why the native GGML bridge did not load. With no file found it was never built. A file
+        /// that exists but does not load has a missing dependency (on a CUDA build, usually the
+        /// CUDA 13 runtime) or the wrong architecture; the OS loader's own message is kept.
+        /// </summary>
+        internal static string DescribeBridgeLoadFailure(string path, Exception error, bool windows, bool linux)
+        {
+            if (string.IsNullOrEmpty(path))
+                return "Failed to load the native GGML bridge. Build `TensorSharp.GGML.Native` first.";
+
+            string reason = error?.Message?.Trim();
+            string found = $"The native GGML bridge {path} exists but could not be loaded"
+                + (string.IsNullOrEmpty(reason) ? "." : $": {reason}");
+
+            if (error is BadImageFormatException)
+            {
+                return $"{found} It was built for a different architecture than this {RuntimeInformation.ProcessArchitecture} process; "
+                    + "rebuild `TensorSharp.GGML.Native` on this machine, or run the .NET runtime that matches it.";
+            }
+
+            string hint = windows
+                ? "A library it depends on is missing. A CUDA build needs the CUDA 13 runtime (cublas64_13.dll, cublasLt64_13.dll, cudart64_13.dll): "
+                    + "set CUDA_PATH to the toolkit or put its bin\\x64 folder (bin\\arm64 on Windows on Arm) on PATH."
+                : linux
+                    ? "A library it depends on is missing; `ldd` on the file lists which. A CUDA build needs the CUDA 13 runtime "
+                        + "(libcublas.so.13, libcublasLt.so.13, libcudart.so.13) on the loader path, for example through LD_LIBRARY_PATH."
+                    : "A library it depends on is missing; `otool -L` on the file lists what it links against.";
+            return $"{found} {hint}";
         }
 
         private static string GetBackendAvailabilityHint(GgmlBackendType backendType)
