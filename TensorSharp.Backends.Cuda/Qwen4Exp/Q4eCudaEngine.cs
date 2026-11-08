@@ -757,7 +757,16 @@ namespace TensorSharp.Cuda
                 dev.DK.DenseBf16Rows(w.Ptr, Ptr(input), Ptr(output), w.Ne1, w.Ne0, rows, stream);
                 return;
             }
-            // Q2_0 rows past decode size: the shared route has no Q2_0 decoder, so quantize the input into the
+            // Q2_0 prompt rows (ISTA keeps a shared expert, some attention projections and the PLE key in it): an F16 copy
+            // of the weight for the call and the tensor-core GEMM, as the shared route does for the formats it lists. The
+            // warp-per-row kernel below re-read the weight for every row: 0.2 s of a 4K prompt on the RTX 5090.
+            if (xq == IntPtr.Zero && w.Type == 42 && rows >= PrefillF16MinRows && _q2_0PromptGemm && dev.Alloc.Kernels.DequantsQ2_0)
+            {
+                CudaDecodeCapture.Refuse("the Q2_0 prompt GEMM");
+                CudaQuantizedOps.RunPrefillF16Gemm(dev.Alloc, w.Ptr, w.Type, Ptr(input), Ptr(output), (int)w.Ne0, (int)w.Ne1, rows);
+                return;
+            }
+            // Q2_0 rows past decode size below that: the shared route has no Q2_0 decoder, so quantize the input into the
             // routed experts' q8_1 scratch (free outside their call) and run the warp-per-row kernel.
             if (xq == IntPtr.Zero && w.Type == 42 && dev.DK.DecodesLegacyQuants
                 && (long)rows * (w.Ne0 / 32) * 36 <= dev.Moe.ActQ8A.ElementCount())
@@ -809,6 +818,9 @@ namespace TensorSharp.Cuda
         private const long PrefillCacheMinElements = 1L << 21;
         /// <summary>Rows from which a projection with an F16 copy uses it.</summary>
         private const int PrefillF16MinRows = 64;
+
+        // TS_Q4E_Q2_0_PROMPT_GEMM=0: Q2_0 prompt rows keep the warp-per-row kernel.
+        private static readonly bool _q2_0PromptGemm = Environment.GetEnvironmentVariable("TS_Q4E_Q2_0_PROMPT_GEMM") != "0";
 
         private void CachePrefillWeights()
         {

@@ -817,6 +817,10 @@ prompt 共 320 ms，最后一部分计入回答的 decode 时间）。4 行验�
   最大值 token 及其 top-10 置信度并送入下一步，主机每个窗口只调用一次，也不读取草稿 logits。每个窗口的起草时间从 2.1-2.2 ms 降到
   1.9-2.1 ms；端到端数字仍在运行间噪声范围内（短对话 74-102，长生成 141-175，4K 108-131，16K 154-170 tok/s）。一个草稿步的大部分
   时间是 GPU 工作（覆盖 248K 个 token 的 LM head）。
+- **Q2_0 的 prompt 行走张量核**（`TS_Q4E_Q2_0_PROMPT_GEMM`，默认开启）。ISTA 把部分注意力投影、多数共享专家和 PLE key 存为
+  `Q2_0`，共享的 prompt 路径不能解码它们，所以这些 prompt 行原先走 warp-per-row 内核，每行都要重读一次权重（4K prompt 中占 0.23 s
+  GPU 时间）。现在为本次调用把权重反量化为 F16 副本并使用 cuBLAS GEMM：4K TTFT 从 1.85 s 降到 1.69 s，16K 从 7.4-7.5 s 降到
+  6.7-6.9 s，decode 不变。
 - **自适应驻留从 prompt 学习**（`TS_MOE_TIER_ADAPT_PROMPT_SWAPS`，默认 64）。在设备上统计 prompt 的专家选择，按 128 行的分量计入，
   并在回答 decode 之前让它最常选中的主机专家最多交换 64 个进入显存。16K prompt 之后，每个窗口交给 CPU 的专家从 156-200 个降到
   64-136 个；4K prompt 之后基本不变。

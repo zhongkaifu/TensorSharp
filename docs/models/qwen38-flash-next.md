@@ -1204,6 +1204,11 @@ after another. Changed:
   host makes one call a window and reads no draft logits. Drafting went from 2.1-2.2 to 1.9-2.1 ms a window; the end
   to end numbers stayed within run-to-run noise (short chat 74-102, long generation 141-175, 4K 108-131, 16K 154-170
   tok/s). Most of a draft step is GPU work (the LM head over 248K tokens).
+- **Q2_0 prompt rows through the tensor cores** (`TS_Q4E_Q2_0_PROMPT_GEMM`, on). ISTA keeps some attention
+  projections, most shared experts and the PLE key in `Q2_0`, which the shared prompt route did not decode, so their
+  prompt rows ran the warp-per-row kernel, reading the weight once per row (0.23 s of GPU time in a 4K prompt). They
+  now take an F16 copy of the weight dequantized for the call and the cuBLAS GEMM: 4K TTFT 1.85 to 1.69 s, 16K 7.4-7.5
+  to 6.7-6.9 s, decode unchanged.
 - **Adaptive residency learns from prompts** (`TS_MOE_TIER_ADAPT_PROMPT_SWAPS`, default 64). A prompt's expert
   selections are counted on the device, weighed as 128 rows' worth, and up to 64 of its most-selected host experts
   trade places before its answer decodes. After 16K prompts it left 64-136 experts of a window to the CPU instead of
