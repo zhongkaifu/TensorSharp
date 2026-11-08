@@ -336,6 +336,34 @@ namespace TensorSharp.Models
 
         /// <summary>The working set a new request's state may not eat into: the larger of 1 GB and 1/32 of it, what
         /// command buffers and the driver allocate beside the graphs (the native arena guard keeps the same).</summary>
+        /// <summary>
+        /// On Metal: what the working set lacks for one more request's state beside the headroom, after the idle
+        /// arenas are released, so the prefix cache evicts finished conversations' holders before a live request
+        /// needs the room. Under Strata's concurrency rounds a request was refused a holder for 42 s while three
+        /// finished conversations stayed retained, then ran on the primary cache, which has no admission check, and
+        /// the GPU ran out of memory.
+        /// </summary>
+        protected override long DeviceMemoryDeficitBytes()
+        {
+            if (_backend != BackendType.GgmlMetal)
+                return 0;
+            if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) || total <= 0)
+                return 0;
+            long need = CacheBytes() + MetalSequenceExtraBytes;
+            long deficit = SequenceDeficit(free, total, need);
+            if (deficit > 0 && GgmlBasicOps.ReleaseKeptArenas() > 0 && GgmlBasicOps.TryGetDeviceMemoryInfo(out free, out total))
+                deficit = SequenceDeficit(free, total, need);
+            if (deficit > 0)
+                Console.Error.WriteLine($"[qwen4exp] the Metal working set has {free / 1e9:F2} GB free of {total / 1e9:F2} GB; " +
+                    $"another request's state needs {need / 1e9:F2} GB beside {MetalHeadroom(total) / 1e9:F2} GB kept free, so the " +
+                    $"prefix cache is asked for {deficit / 1e9:F2} GB.");
+            return deficit;
+        }
+
+        /// <summary>Bytes missing for <paramref name="needBytes"/> beside the headroom (0 when it fits).</summary>
+        internal static long SequenceDeficit(long freeBytes, long totalBytes, long needBytes)
+            => Math.Max(0, needBytes + MetalHeadroom(totalBytes) - freeBytes);
+
         internal static long MetalHeadroom(long totalBytes) => Math.Max(1L << 30, totalBytes / 32);
 
         /// <summary>Whether <paramref name="needBytes"/> more fit in the Metal working set beside the headroom.</summary>

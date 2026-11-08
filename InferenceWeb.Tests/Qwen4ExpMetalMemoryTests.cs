@@ -36,4 +36,20 @@ public class Qwen4ExpMetalMemoryTests
         Assert.False(Qwen4ExpModel.FitsAnotherSequence(2156L << 20, WorkingSet, need));
         Assert.True(Qwen4ExpModel.FitsAnotherSequence(9 * Gb, WorkingSet, need));
     }
+
+    /// <summary>The deficit the prefix cache evicts retained state for is exactly what admission lacks: 0 whenever
+    /// another request would be admitted, and otherwise the bytes that would make it fit.</summary>
+    [Fact]
+    public void TheDeviceDeficit_IsWhatAdmissionLacks()
+    {
+        long need = 1100L << 20;
+        long headroom = Qwen4ExpModel.MetalHeadroom(WorkingSet);
+        foreach (long free in new[] { 0L, 2156L << 20, need + headroom - 1, need + headroom, 9 * Gb })
+        {
+            long deficit = Qwen4ExpModel.SequenceDeficit(free, WorkingSet, need);
+            Assert.Equal(Qwen4ExpModel.FitsAnotherSequence(free, WorkingSet, need), deficit == 0);
+            if (deficit > 0)
+                Assert.True(Qwen4ExpModel.FitsAnotherSequence(free + deficit, WorkingSet, need));
+        }
+    }
 }

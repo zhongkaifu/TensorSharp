@@ -64,11 +64,23 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// <see cref="IPrefixCacheModel.QueryHostMemoryDeficitBytes"/>: on a Mac, how far what macOS can
-        /// give without compressing has fallen below what it should keep (<see cref="UnifiedMemorySpareBytes"/>);
-        /// 0 when it has not, and off macOS.
+        /// give without compressing has fallen below what it should keep (<see cref="UnifiedMemorySpareBytes"/>),
+        /// or how far the device is from room for one more request (<see cref="DeviceMemoryDeficitBytes"/>),
+        /// whichever is more; 0 when neither.
         /// </summary>
         public long QueryHostMemoryDeficitBytes()
-            => OperatingSystem.IsMacOS() && UnifiedMemorySpareBytes() is long spare && spare < 0 ? -spare : 0;
+        {
+            long host = OperatingSystem.IsMacOS() && UnifiedMemorySpareBytes() is long spare && spare < 0 ? -spare : 0;
+            return Math.Max(host, DeviceMemoryDeficitBytes());
+        }
+
+        /// <summary>
+        /// Bytes the device is short of room for one more request's state beside a headroom, which the prefix
+        /// cache then evicts from retained state; 0 by default. The host figure alone cannot see this on a Mac
+        /// whose weights are mapped: their clean file pages count as available, so a model whose GPU working
+        /// set was full never reported a deficit.
+        /// </summary>
+        protected virtual long DeviceMemoryDeficitBytes() => 0;
 
         /// <summary>The larger of these and 15% of RAM is what <see cref="UnifiedMemorySpareBytes"/> leaves to
         /// macOS and other programs.</summary>
