@@ -510,7 +510,7 @@ The generation code in Chat cannot see the `HttpContext`, and Chat cannot refere
 | `chat <model>` for Jev | `ModelService.JevAsync` → `TraceJevAsync` | `POST /v1/systemone` drives DiffusionGemma through `JevInference.Run` and bypasses the pipeline. The span starts before the execution gate, so queueing counts. Usage comes from a callback with the same totals as the response. Refusals: `invalid_request`, `model_not_found`, `model_unavailable`, `queue_full`. |
 | `execute_tool <name>` | `SkillChatLoop.ExecuteSkillCallsAsync`, one per host tool call | Started and stopped **inside** the `Task.Run` worker with no `yield` in between, so it is `Activity.Current` for exactly the tool's work and `codeexec.run` nests under it. Its parent is what the request had current (Task.Run carries the context), so it is a sibling of the round's chat span. `gen_ai.operation.name`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `tensorsharp.round`, `tensorsharp.skill.id`, `tensorsharp.tool.result_bytes`; arguments and result only with capture on. A tool that reports failure is `failed` with `error.type=tool_error`; only an exception sets Error status. |
 | `codeexec.run` | `ShellRunner.Run`, after the early refusals that run nothing | Implicit parent (the current `execute_tool`). `tensorsharp.codeexec.shell`, `.sandbox`, `.timed_out`, `.installs`, `.output_bytes`, `.background`, and `.exit_code` only when the command started and was not killed. A command that never started is Error with `error.type=not_started`; a non-zero exit is the model's code failing, which is the tool working, so it is not an error. The command text only with capture on. |
-| `generate_image <model>` | `WebUiChatService`, plain and streaming image routes | One per request (`tensorsharp.media.kind=image`, `tensorsharp.image.mode` = `generate` or `edit`). The first outcome marked is kept. Refusals: `invalid_request`, `upload_quota_exceeded`, `payload_too_large`, `not_an_image_model`. No phase spans (Qwen-Image reports only steps) and no prompt, even with capture on. |
+| `generate_image <model>` | `ImageGenerationTelemetry`, from `WebUiChatService`'s plain and streaming image routes and the CLI | One per picture (`tensorsharp.media.kind=image`, `tensorsharp.image.mode` = `generate` or `edit`). Once the request is read: `tensorsharp.image.width`, `.height`, `.steps` and `.cfg` when it sets them, `.seed`, and `.references` for an edit. When the picture is made, the size and step count it was made with replace the requested ones. The first outcome marked is kept. Refusals: `invalid_request`, `upload_quota_exceeded`, `payload_too_large`, `not_an_image_model`. No phase spans (Qwen-Image reports only steps). The prompt only with capture on (§7.7). In the CLI the picture is the root of its own trace. |
 | `generate_video <model>` | §8 | |
 | outgoing HTTP | `AddHttpClientInstrumentation` | Startup downloads are not traced (§3.3). |
 
@@ -852,12 +852,13 @@ With it on:
   but Application Insights kept them whole only up to about 64,700 characters of JSON and stored a longer value as its
   first 8,192 (measured in November 2026: 64,701 characters kept whole, 65,007 cut). A history that reaches the 64K
   cap therefore arrives there as the start of the oldest message it kept, while an OTLP collector receives all of it;
-- `generate_video` gets `tensorsharp.video.prompt`, `execute_tool` gets `tensorsharp.tool.arguments` and
-  `tensorsharp.tool.result`, `codeexec.run` gets `tensorsharp.codeexec.command`.
+- `generate_video` gets `tensorsharp.video.prompt`, `generate_image` gets `tensorsharp.image.prompt`, `execute_tool`
+  gets `tensorsharp.tool.arguments` and `tensorsharp.tool.result`, `codeexec.run` gets `tensorsharp.codeexec.command`.
 
 With it off, [`ContentSpanProcessor`](../../TensorSharp.Telemetry/ContentRedactionProcessor.cs), registered before the
-trace exporters, removes `gen_ai.input.messages`, `gen_ai.output.messages` and `tensorsharp.video.prompt` from any span
-as a backstop for a call site that forgot to check. Jev, images and Studio record no content even with capture on.
+trace exporters, removes `gen_ai.input.messages`, `gen_ai.output.messages`, `tensorsharp.video.prompt` and
+`tensorsharp.image.prompt` from any span as a backstop for a call site that forgot to check. Jev and Studio record no
+content even with capture on.
 
 Other places content can travel: capability paths and the Responses API's stored response ids (masked, §5.6, §5.10,
 §7.4, §7.6); the Azure Monitor exporter's offline storage,

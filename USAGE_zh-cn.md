@@ -2430,7 +2430,9 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
 - TensorSharp 自己发起的模型调用带有 `tensorsharp.internal=true` 和 `tensorsharp.origin`：启动预热为
   `prefix-cache-warmup`，CLI 的 `--warmup-runs` 预热轮为 `warmup`，知识库为 `knowledge-rerank` 和
   `knowledge-media-extract`。面向客户端的看板应把它们排除在外。
-- Qwen-Image-2.1 请求为 `generate_image <model>`，带 `tensorsharp.image.mode`（`generate` 或 `edit`）和结果。
+- Qwen-Image-2.1 的图像（无论来自服务端还是 CLI）为 `generate_image <model>`，带 `tensorsharp.image.mode`
+  （`generate` 或 `edit`）、实际生成所用的尺寸与步数（`tensorsharp.image.width`、`.height`、`.steps`）、
+  请求设置了时的 `.cfg`、`.seed`、编辑时的 `.references`，以及结果。
 - `/health` 与 Web UI 对 `/api/queue/status` 的轮询不生成 span，也不计入 ASP.NET Core 的
   `http.server.request.duration` 指标。遥测运行期间，进程通过 `HttpClient` 发出的调用记为客户端 span。
 
@@ -2540,8 +2542,8 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 内容捕获关闭时（默认）：
 
 - span 只带 id、模型名与文件名（从不含目录路径）、尺寸、计数、耗时和结果。失败只记录异常类型，从不记录
-  消息。作为兜底，导出前会从每个 span 上移除 `gen_ai.input.messages`、`gen_ai.output.messages` 和
-  `tensorsharp.video.prompt`。
+  消息。作为兜底，导出前会从每个 span 上移除 `gen_ai.input.messages`、`gen_ai.output.messages`、
+  `tensorsharp.video.prompt` 和 `tensorsharp.image.prompt`。
 - 在导出的日志记录中，TensorSharp 标记为内容的每个值（提示词、聊天消息、模型输出、上传文件的名称、路径和
   URL、工具参数、命令、提示词的 token id）都显示为 `[redacted: N chars]`；含有内容的记录以消息模板而不是
   渲染后的文本发送。每个被标记值的文本（4 个字符及以上）在该记录的其他属性及其异常消息中也替换为
@@ -2562,9 +2564,9 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 
 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` 会导出以上全部内容：不脱敏的日志、真实的请求路径和响应 id、
 聊天 span 上的 `gen_ai.input.messages` 和 `gen_ai.output.messages`（由角色与内容组成的 JSON，最多 64K 字符，
-保留最新的消息）、视频 span 上的 `tensorsharp.video.prompt`、工具 span 上的 `tensorsharp.tool.arguments` 和
-`tensorsharp.tool.result`，以及 `codeexec.run` 上的 `tensorsharp.codeexec.command`。图像与 Studio 的 span
-无论如何都不带提示词。只有当数据去往的每个地方（collector 及其后端、Application Insights 资源及其保留策略、
+保留最新的消息）、视频 span 上的 `tensorsharp.video.prompt`、图像 span 上的 `tensorsharp.image.prompt`、
+工具 span 上的 `tensorsharp.tool.arguments` 和 `tensorsharp.tool.result`，以及 `codeexec.run` 上的
+`tensorsharp.codeexec.command`。Studio 的 span 无论如何都不带提示词。只有当数据去往的每个地方（collector 及其后端、Application Insights 资源及其保留策略、
 导出器的本地缓冲）都允许保存用户提示词时，才开启这一项。
 
 ### Application Insights

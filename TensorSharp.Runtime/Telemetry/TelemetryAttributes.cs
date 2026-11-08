@@ -130,6 +130,17 @@ namespace TensorSharp.Runtime.Telemetry
         public const string VideoPromptCacheHit = "tensorsharp.video.prompt_cache_hit";
         public const string VideoTiles = "tensorsharp.video.tiles";
         public const string VideoDetail = "tensorsharp.video.detail";
+        /// <summary><c>generate</c> (from words) or <c>edit</c> (from pictures), on the image span and metric.</summary>
+        public const string ImageMode = "tensorsharp.image.mode";
+        public const string ImageWidth = "tensorsharp.image.width";
+        public const string ImageHeight = "tensorsharp.image.height";
+        public const string ImageSteps = "tensorsharp.image.steps";
+        public const string ImageCfg = "tensorsharp.image.cfg";
+        public const string ImageSeed = "tensorsharp.image.seed";
+        /// <summary>The number of reference pictures an edit was given.</summary>
+        public const string ImageReferences = "tensorsharp.image.references";
+        /// <summary>The image prompt; only with content capture on.</summary>
+        public const string ImagePrompt = "tensorsharp.image.prompt";
 
         // Code execution ----------------------------------------------------------------
         public const string CodeExecShell = "tensorsharp.codeexec.shell";

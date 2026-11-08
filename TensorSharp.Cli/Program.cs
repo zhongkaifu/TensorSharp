@@ -2388,10 +2388,28 @@ namespace TensorSharp.Cli
                 Console.WriteLine($"  explicit output size {width}x{height}");
             if (keepSourceSize)
                 Console.WriteLine($"  keeping the source size {inputs[0].Width}x{inputs[0].Height}");
+            // The same generate_image span and duration metric the server records, named after the
+            // model file. Nothing is current in the CLI, so the picture is the root of its own trace.
+            using var image = TensorSharp.Models.QwenImage.ImageGenerationTelemetry.Start(
+                TensorSharp.Runtime.Telemetry.GenAiRequestTelemetry.ModelNameFromPath(
+                    model.ModelFilePaths is { Count: > 0 } files ? files[0] : null),
+                CliTelemetry.BackendOf(model), generate: inputs.Count == 0);
+            image.SetRequest(prompt, p, inputs.Count);
+            p.OnStep = (_, total, _) => image.RecordStep(total);
             var sw = Stopwatch.StartNew();
-            var output = inputs.Count == 0 ? model.GenerateImage(prompt, p) : model.EditImage(prompt, inputs, p);
-            sw.Stop();
-            TensorSharp.Models.QwenImage.ImageIO.SavePng(outputPath, output);
+            TensorSharp.Models.QwenImage.RgbImage output;
+            try
+            {
+                output = inputs.Count == 0 ? model.GenerateImage(prompt, p) : model.EditImage(prompt, inputs, p);
+                sw.Stop();
+                TensorSharp.Models.QwenImage.ImageIO.SavePng(outputPath, output);
+            }
+            catch (Exception ex)
+            {
+                image.MarkFailed(ex);
+                throw;
+            }
+            image.SetResult(output.Width, output.Height);
             Console.WriteLine($"Saved {output.Width}x{output.Height} image to {outputPath} " +
                 $"({sw.Elapsed.TotalSeconds:F1}s)");
         }

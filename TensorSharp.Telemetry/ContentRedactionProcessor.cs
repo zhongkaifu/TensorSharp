@@ -126,7 +126,7 @@ namespace TensorSharp.Telemetry
     /// <summary>
     /// Removes content attributes from spans when content capture is off: a backstop for a
     /// call site that set <c>gen_ai.input.messages</c>, <c>gen_ai.output.messages</c> or the video
-    /// prompt without checking <see cref="TensorSharpTelemetry.CaptureMessageContent"/>.
+    /// or image prompt without checking <see cref="TensorSharpTelemetry.CaptureMessageContent"/>.
     /// Registered before the trace exporters.
     /// </summary>
     public sealed class ContentSpanProcessor : BaseProcessor<Activity>
@@ -136,6 +136,7 @@ namespace TensorSharp.Telemetry
             TelemetryAttributes.GenAiInputMessages,
             TelemetryAttributes.GenAiOutputMessages,
             TelemetryAttributes.VideoPrompt,
+            TelemetryAttributes.ImagePrompt,
         };
 
         public override void OnEnd(Activity data)

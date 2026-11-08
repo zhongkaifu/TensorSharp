@@ -1552,10 +1552,11 @@ namespace TensorSharp.Chat
 
         private Task<object> ImageRequestAsync(
             JsonElement body, bool generate, IReadOnlyList<LoraSpec> loras, CancellationToken cancellationToken) =>
-            TraceImageRequestAsync(generate, () => ImageRequestCoreAsync(body, generate, loras, cancellationToken));
+            TraceImageRequestAsync(generate, image => ImageRequestCoreAsync(body, generate, loras, image, cancellationToken));
 
         private async Task<object> ImageRequestCoreAsync(
-            JsonElement body, bool generate, IReadOnlyList<LoraSpec> loras, CancellationToken cancellationToken)
+            JsonElement body, bool generate, IReadOnlyList<LoraSpec> loras,
+            TensorSharp.Models.QwenImage.ImageGenerationTelemetry image, CancellationToken cancellationToken)
         {
             var logger = _loggerFactory.CreateLogger("TensorSharp.Server.ImageEdit");
             var model = generate ? RequireImageGenerationModel() : RequireImageEditModel();
@@ -1569,16 +1570,17 @@ namespace TensorSharp.Chat
                 if (error != null) throw new WebUiRequestRejectedException(400, new { error });
                 await ReadUploadedMaskAsync(body, p, cancellationToken);
             }
-            return await RunImageEditAsync(model, prompt, p, images, logger, generate, loras, cancellationToken);
+            return await RunImageEditAsync(model, prompt, p, images, logger, generate, loras, image, cancellationToken);
         }
 
         /// <summary>The multipart edit route uses the same validation and worker as JSON.</summary>
         public Task<object> ImageEditAsync(
             JsonElement parameters, IReadOnlyList<byte[]> images, byte[] mask, CancellationToken cancellationToken) =>
-            TraceImageRequestAsync(generate: false, () => ImageEditCoreAsync(parameters, images, mask, cancellationToken));
+            TraceImageRequestAsync(generate: false, image => ImageEditCoreAsync(parameters, images, mask, image, cancellationToken));
 
         private async Task<object> ImageEditCoreAsync(
-            JsonElement parameters, IReadOnlyList<byte[]> images, byte[] mask, CancellationToken cancellationToken)
+            JsonElement parameters, IReadOnlyList<byte[]> images, byte[] mask,
+            TensorSharp.Models.QwenImage.ImageGenerationTelemetry image, CancellationToken cancellationToken)
         {
             ArgumentNullException.ThrowIfNull(images);
             if (images.Count == 0)
@@ -1590,19 +1592,19 @@ namespace TensorSharp.Chat
             string prompt = ParseImagePrompt(parameters, generate: false);
             ValidateMaskPresence(parameters, mask != null);
             if (mask != null) p.Mask = DecodeRequestImage(mask, "mask");
-            return await RunImageEditAsync(model, prompt, p, images.ToList(), logger, false, null, cancellationToken);
+            return await RunImageEditAsync(model, prompt, p, images.ToList(), logger, false, null, image, cancellationToken);
         }
 
         /// <summary>Compatibility overload for callers supplying decoded multipart fields.</summary>
         public Task<object> ImageEditAsync(
             string prompt, int steps, float cfg, long seed, long targetArea, IReadOnlyList<byte[]> images, CancellationToken cancellationToken,
             int width = 0, int height = 0, string negativePrompt = null) =>
-            TraceImageRequestAsync(generate: false, () => ImageEditCoreAsync(
-                prompt, steps, cfg, seed, targetArea, images, cancellationToken, width, height, negativePrompt));
+            TraceImageRequestAsync(generate: false, image => ImageEditCoreAsync(
+                prompt, steps, cfg, seed, targetArea, images, cancellationToken, width, height, negativePrompt, image));
 
         private async Task<object> ImageEditCoreAsync(
             string prompt, int steps, float cfg, long seed, long targetArea, IReadOnlyList<byte[]> images, CancellationToken cancellationToken,
-            int width, int height, string negativePrompt)
+            int width, int height, string negativePrompt, TensorSharp.Models.QwenImage.ImageGenerationTelemetry image)
         {
             if (images == null) throw new ArgumentNullException(nameof(images));
             if (images.Count == 0) throw new WebUiRequestRejectedException(400, new { error = "No image uploaded (field 'image')." });
@@ -1616,7 +1618,7 @@ namespace TensorSharp.Chat
             };
             p.TargetArea = p.ResolveTargetArea();
             ValidateImageParameters(p);
-            return await RunImageEditAsync(model, prompt ?? "", p, images.ToList(), logger, false, null, cancellationToken);
+            return await RunImageEditAsync(model, prompt ?? "", p, images.ToList(), logger, false, null, image, cancellationToken);
         }
 
         /// <summary>
@@ -1697,13 +1699,16 @@ namespace TensorSharp.Chat
         private async Task<object> RunImageEditAsync(
             TensorSharp.Models.QwenImage.QwenImageModel model,
             string prompt, TensorSharp.Models.QwenImage.QwenImageParams p, List<byte[]> imageBytesList, ILogger logger,
-            bool generate, IReadOnlyList<LoraSpec> loras, CancellationToken cancellationToken)
+            bool generate, IReadOnlyList<LoraSpec> loras,
+            TensorSharp.Models.QwenImage.ImageGenerationTelemetry telemetry, CancellationToken cancellationToken)
         {
+            ArgumentNullException.ThrowIfNull(telemetry);
             string outName = $"{(generate ? "generated" : "edit")}-{Guid.NewGuid():N}.png";
             string outPath = Path.Combine(_options.UploadDirectory, outName);
             logger.LogInformation(LogEventIds.UploadReceived,
                 "Image request: prompt='{Prompt}' steps={Steps} cfg={Cfg} images={Count} bytes={Bytes}",
                 LogContent.Of(prompt), p.Steps, p.CfgScale, imageBytesList.Count, imageBytesList.Sum(b => (long)b.Length));
+            telemetry.SetRequest(prompt, p, imageBytesList.Count);
             var sw = Stopwatch.StartNew();
             int w, h;
             Interlocked.Increment(ref _mediaJobs);
@@ -1717,9 +1722,14 @@ namespace TensorSharp.Chat
                         var inputs = imageBytesList.ConvertAll(bytes => DecodeRequestImage(bytes, "image"));
                         ValidateImageMaskGeometry(p, inputs);
                         ApplyLoras(model, loras, logger, "Image request");
-                        p.OnStep = (_, _, _) => cancellationToken.ThrowIfCancellationRequested();
+                        p.OnStep = (_, total, _) =>
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            telemetry.RecordStep(total);
+                        };
                         var output = generate ? model.GenerateImage(prompt, p) : model.EditImage(prompt, inputs, p);
                         TensorSharp.Models.QwenImage.ImageIO.SavePng(outPath, output);
+                        telemetry.SetResult(output.Width, output.Height);
                         return (output.Width, output.Height);
                     }
                 }, cancellationToken);
@@ -1947,6 +1957,7 @@ namespace TensorSharp.Chat
             logger.LogInformation(LogEventIds.UploadReceived,
                 "Image edit (stream): prompt='{Prompt}' steps={Steps} cfg={Cfg} images={Count} bytes={Bytes}",
                 LogContent.Of(prompt), p.Steps, p.CfgScale, imageBytesList.Count, imageBytesList.Sum(b => (long)b.Length));
+            imageTelemetry.SetRequest(prompt, p, imageBytesList.Count);
 
             // The edit worker pushes frames into this channel; the stream drains it. The callback
             // never blocks on the consumer (unbounded TryWrite) so it can't stall the denoise.
@@ -1974,6 +1985,7 @@ namespace TensorSharp.Chat
                         p.OnStep = (step, total, preview) =>
                             {
                                 if (ct.IsCancellationRequested) throw new OperationCanceledException(ct);
+                                imageTelemetry.RecordStep(total);
                                 // Preview encoding is best-effort: a failure here must degrade to a
                                 // plain progress tick (like the pipeline's own preview-decode guard),
                                 // not abort a nearly-finished edit.
@@ -1992,6 +2004,7 @@ namespace TensorSharp.Chat
                         var output = generate ? editModel.GenerateImage(prompt, p) : editModel.EditImage(prompt, inputs, p);
                         TensorSharp.Models.QwenImage.ImageIO.SavePng(outPath, output);
                         _uploads.RecordFile(outPath);
+                        imageTelemetry.SetResult(output.Width, output.Height);
                         channel.Writer.TryWrite(new EditFrame
                         {
                             Final = true, Url = BuildUploadUrl(outName),
@@ -2006,7 +2019,7 @@ namespace TensorSharp.Chat
                 }
                 catch (Exception ex)
                 {
-                    imageTelemetry.MarkEnded(ex);
+                    MarkImageEnded(imageTelemetry, ex);
                     logger.LogError(LogEventIds.ChatFailed, ex, "Image edit (stream) failed");
                     channel.Writer.TryWrite(new EditFrame { Final = true, Error = ex.Message });
                 }
@@ -2633,10 +2646,6 @@ namespace TensorSharp.Chat
         private const string LoraApplySpanName = "lora.apply";
         private const string VideoExportSpanName = "video.export";
 
-        /// <summary><c>generate</c> (from words) or <c>edit</c> (from pictures), on the image span and metric.</summary>
-        private const string ImageModeAttribute = "tensorsharp.image.mode";
-        private const string MediaKindImage = "image";
-
         // Clips waiting for _videoGenLock. Static like the lock, which serialises clips process-wide.
         private static int _videoGenWaiting;
 
@@ -2743,163 +2752,64 @@ namespace TensorSharp.Chat
             }
         }
 
-        private ImageRequestTelemetry StartImageRequest(bool generate) =>
-            new(GenAiRequestTelemetry.ModelNameFromPath(_svc.LoadedModelPath), _svc.LoadedBackend, generate);
+        private TensorSharp.Models.QwenImage.ImageGenerationTelemetry StartImageRequest(bool generate) =>
+            TensorSharp.Models.QwenImage.ImageGenerationTelemetry.Start(
+                GenAiRequestTelemetry.ModelNameFromPath(_svc.LoadedModelPath), _svc.LoadedBackend, generate);
 
         /// <summary>
-        /// Run one picture request that answers once under its <see cref="ImageRequestTelemetry"/>,
-        /// so a refusal anywhere in its validation is recorded, as well as a failure or a
-        /// cancellation. Async, so the span is current only inside the request and never in the
-        /// caller's flow.
+        /// Run one picture request that answers once under its
+        /// <see cref="TensorSharp.Models.QwenImage.ImageGenerationTelemetry"/>, so a refusal anywhere
+        /// in its validation is recorded, as well as a failure or a cancellation. Async, so the span
+        /// is current only inside the request and never in the caller's flow.
         /// </summary>
-        private async Task<object> TraceImageRequestAsync(bool generate, Func<Task<object>> run)
+        private async Task<object> TraceImageRequestAsync(
+            bool generate, Func<TensorSharp.Models.QwenImage.ImageGenerationTelemetry, Task<object>> run)
         {
             using var image = StartImageRequest(generate);
             try
             {
-                return await run();
+                return await run(image);
             }
             catch (Exception ex)
             {
-                image.MarkEnded(ex);
+                MarkImageEnded(image, ex);
                 throw;
             }
         }
 
         /// <summary>
-        /// The <c>generate_image &lt;model&gt;</c> span and the
-        /// <c>tensorsharp.image.generation.duration</c> sample of one picture request, generated
-        /// or edited, from the moment it is accepted until its PNG is saved or it is refused. No
-        /// phase spans: Qwen-Image reports only its steps.
-        ///
-        /// <para>
-        /// The first outcome marked is the one recorded, so the precise mark made where a request
-        /// stops is not overwritten by the general one made on its way out. One writer at a time:
-        /// the request until its worker starts, then the worker.
-        /// </para>
+        /// Mark how <paramref name="exception"/> ended a picture request, by the rules the routes
+        /// answer with: a <see cref="WebUiRequestRejectedException"/> is a refusal unless it is a
+        /// 5xx other than 507 (no room for the result), and an <see cref="ArgumentException"/> is
+        /// the pipeline refusing the settings, which the plain route answers with a 400.
         /// </summary>
-        private sealed class ImageRequestTelemetry : IDisposable
+        private static void MarkImageEnded(TensorSharp.Models.QwenImage.ImageGenerationTelemetry image, Exception exception)
         {
-            private const string ModeGenerate = "generate";
-            private const string ModeEdit = "edit";
-
-            private readonly Activity _activity;
-            private readonly long _startTimestamp;
-            private readonly string _model;
-            private readonly string _backend;
-            private readonly string _mode;
-            private string _outcome;
-            private string _errorType;
-            private int _disposed;
-
-            public ImageRequestTelemetry(string model, string backend, bool generate)
+            switch (exception)
             {
-                _model = string.IsNullOrEmpty(model) ? "unknown" : model;
-                _backend = string.IsNullOrEmpty(backend) ? null : backend;
-                _mode = generate ? ModeGenerate : ModeEdit;
-                _startTimestamp = Stopwatch.GetTimestamp();
-                if (!TensorSharpTelemetry.Media.HasListeners())
-                    return;
-                // A child of whatever is current where the request is accepted: the HTTP request.
-                _activity = TensorSharpTelemetry.Media.StartActivity("generate_image " + _model, ActivityKind.Internal);
-                if (_activity is not { IsAllDataRequested: true })
-                    return;
-                _activity.SetTag(TelemetryAttributes.MediaKind, MediaKindImage);
-                _activity.SetTag(TelemetryAttributes.GenAiRequestModel, _model);
-                if (_backend != null) _activity.SetTag(TelemetryAttributes.Backend, _backend);
-                _activity.SetTag(ImageModeAttribute, _mode);
-                if (TelemetryContext.Protocol is { Length: > 0 } protocol) _activity.SetTag(TelemetryAttributes.Protocol, protocol);
-                if (TelemetryContext.RequestId is { Length: > 0 } requestId) _activity.SetTag(TelemetryAttributes.RequestId, requestId);
+                case WebUiRequestRejectedException rejected when ImageRefusalCode(rejected) is string code:
+                    image.MarkRefused(code);
+                    break;
+                case ArgumentException and not ArgumentNullException:
+                    image.MarkRefused(MediaRefusedInvalidRequest);
+                    break;
+                default:
+                    image.MarkFailed(exception);
+                    break;
             }
+        }
 
-            /// <summary>The client went away or the picture was stopped. Not an error.</summary>
-            public void MarkCancelled() => Mark(TelemetryAttributes.OutcomeCancelled, null, null);
-
-            /// <summary>Refused before the picture was made; <paramref name="errorType"/> is a short stable code.</summary>
-            public void MarkRefused(string errorType) => Mark(TelemetryAttributes.OutcomeRefused, errorType, null);
-
-            /// <summary>Failed: the exception's type, never its message. A cancellation counts as <see cref="MarkCancelled"/>.</summary>
-            public void MarkFailed(Exception exception)
+        private static string ImageRefusalCode(WebUiRequestRejectedException rejected)
+        {
+            if (rejected.Message is NotAnImageModelError or NotAGenerationModelError)
+                return ImageRefusedNotImageModel;
+            return rejected.StatusCode switch
             {
-                if (exception is OperationCanceledException)
-                    MarkCancelled();
-                else
-                    Mark(TelemetryAttributes.OutcomeFailed, exception.GetType().FullName ?? exception.GetType().Name, exception);
-            }
-
-            /// <summary>
-            /// How <paramref name="exception"/> ended the request, by the rules the routes answer
-            /// with: a <see cref="WebUiRequestRejectedException"/> is a refusal unless it is a 5xx
-            /// other than 507 (no room for the result), and an <see cref="ArgumentException"/> is
-            /// the pipeline refusing the settings, which the plain route answers with a 400.
-            /// </summary>
-            public void MarkEnded(Exception exception)
-            {
-                switch (exception)
-                {
-                    case WebUiRequestRejectedException rejected when RefusalCode(rejected) is string code:
-                        MarkRefused(code);
-                        break;
-                    case ArgumentException and not ArgumentNullException:
-                        MarkRefused(MediaRefusedInvalidRequest);
-                        break;
-                    default:
-                        MarkFailed(exception);
-                        break;
-                }
-            }
-
-            private static string RefusalCode(WebUiRequestRejectedException rejected)
-            {
-                if (rejected.Message is NotAnImageModelError or NotAGenerationModelError)
-                    return ImageRefusedNotImageModel;
-                return rejected.StatusCode switch
-                {
-                    507 => MediaRefusedUploadQuota,
-                    413 => MediaRefusedPayloadTooLarge,
-                    >= 400 and < 500 => MediaRefusedInvalidRequest,
-                    _ => null,
-                };
-            }
-
-            private void Mark(string outcome, string errorType, Exception failure)
-            {
-                if (_outcome != null || Volatile.Read(ref _disposed) != 0)
-                    return;
-                _outcome = outcome;
-                _errorType = errorType;
-                if (_activity == null)
-                    return;
-                if (failure != null)
-                    _activity.SetStatus(ActivityStatusCode.Error, failure.GetType().Name);
-                if (_activity.IsAllDataRequested)
-                {
-                    _activity.SetTag(TelemetryAttributes.Outcome, outcome);
-                    if (errorType != null) _activity.SetTag(TelemetryAttributes.ErrorType, errorType);
-                }
-            }
-
-            /// <summary>Record the duration and stop the span, once.</summary>
-            public void Dispose()
-            {
-                if (Interlocked.Exchange(ref _disposed, 1) != 0)
-                    return;
-                string outcome = _outcome ?? TelemetryAttributes.OutcomeCompleted;
-                var tags = new TagList
-                {
-                    { TelemetryAttributes.GenAiRequestModel, _model },
-                    { ImageModeAttribute, _mode },
-                    { TelemetryAttributes.Outcome, outcome },
-                };
-                if (_backend != null) tags.Add(TelemetryAttributes.Backend, _backend);
-                if (_errorType != null) tags.Add(TelemetryAttributes.ErrorType, _errorType);
-                TensorSharpMetrics.ImageGenerationDuration.Record(Stopwatch.GetElapsedTime(_startTimestamp).TotalSeconds, tags);
-                if (_activity == null)
-                    return;
-                if (_outcome == null && _activity.IsAllDataRequested)
-                    _activity.SetTag(TelemetryAttributes.Outcome, outcome);
-                _activity.Stop();
-            }
+                507 => MediaRefusedUploadQuota,
+                413 => MediaRefusedPayloadTooLarge,
+                >= 400 and < 500 => MediaRefusedInvalidRequest,
+                _ => null,
+            };
         }
 
         // ---- Helpers ---------------------------------------------------------
