@@ -1389,6 +1389,24 @@ MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
 | before (d620953d) | 0.07-0.09 s / 84-108 | 166-178 | 1.07-1.08 s / 121-161 | 4.16-4.18 s / 179-189 | 0.63-0.68 s |
 | decode once, block router, group norm | 0.07-0.10 s / 86-127 | 202-222 | 1.07-1.08 s / 149-167 | 4.16-4.18 s / 207-217 | 0.63-0.69 s |
 
+#### A draft vocabulary for the MTP head, 2026-11-08
+
+Each draft step ran the trunk's LM head over all 248,320 tokens: about 270 us of a ~1 ms draft chain on the RTX 5090.
+The draft chain now scores token ids [0, 151643) only, the Qwen2 base vocabulary (`TS_Q4E_DRAFT_VOCAB`, `0` for the
+whole vocabulary); the ids past it are the later multilingual additions and the special tokens, 0.1-0.2% of English
+and mixed English/Chinese text and 0.01% of Chinese. The drafts only propose: the verify window scores every token, so
+the answers do not change. With the answers made history-independent (`TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0`)
+the English, Chinese and code answers were identical with the setting on and off, none of their tokens past the subset,
+and the acceptance moved within noise: English 58.3 vs 58.4%, Chinese 55.3 vs 56.0%, code 85.9 vs 85.2%. The head of a
+draft step reads 61% of its rows (~165 us).
+
+Same build, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
+
+| draft head | short chat | long generation | 4K prompt | 16K prompt | multi-turn first TTFT |
+| --- | --- | --- | --- | --- | --- |
+| all 248,320 tokens | 0.07-0.10 s / 86-127 | 202-222 | 1.07-1.08 s / 149-167 | 4.16-4.18 s / 207-217 | 0.63-0.69 s |
+| ids below 151,643 (default) | 0.07-0.09 s / 109-154 | 214-234 | 1.07-1.08 s / 150-183 | 4.16-4.17 s / 203-223 | 0.62-0.68 s |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the

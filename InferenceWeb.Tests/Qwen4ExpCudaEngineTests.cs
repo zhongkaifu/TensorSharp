@@ -1095,11 +1095,15 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     /// The MTP draft chain (Q4eCudaEngine.MtpDraftChain): one call folds the catch-up rows with the first step and runs
     /// the next steps on the device, each fed the previous step's first-max token and the head's own streams. It picks
     /// the tokens the step-by-step calls pick (a host argmax over their logits) and reports the per-token gate's
-    /// confidence (top-1 over the 10 largest logits) as the host computes it.
+    /// confidence (top-1 over the 10 largest logits) as the host computes it. With a draft vocabulary
+    /// (TS_Q4E_DRAFT_VOCAB) the chain scores the first ids only and picks what the host picks over those ids.
     /// </summary>
-    [CudaFact]
-    public void TheMtpDraftChain_PicksAsStepByStepCalls()
+    [CudaTheory]
+    [InlineData(0)]
+    [InlineData(97)]
+    public void TheMtpDraftChain_PicksAsStepByStepCalls(int draftVocab)
     {
+        _env.Set("TS_Q4E_DRAFT_VOCAB", draftVocab.ToString(System.Globalization.CultureInfo.InvariantCulture));
         string path = Fixture(indexerTopK: 2048);
         string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 2048);
         const int Steps3 = 3;
@@ -1128,7 +1132,8 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             head.DraftCatchUpAndStep(tokens, rows, 0, logits, h);
             for (int i = 0; i < Steps3; i++)
             {
-                ids[i] = TensorSharp.Runtime.Speculative.DraftHeadSpeculator.ArgmaxWithTopKConfidence(logits, vocab, out probs[i]);
+                ids[i] = TensorSharp.Runtime.Speculative.DraftHeadSpeculator.ArgmaxWithTopKConfidence(logits,
+                    draftVocab > 0 ? draftVocab : vocab, out probs[i]);
                 if (i + 1 < Steps3)
                 {
                     head.DraftStep(ids[i], h, tokens.Length + i, logits, next);
@@ -1142,6 +1147,8 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         _output.WriteLine($"step by step: [{string.Join(",", stepwise.Ids)}] p [{string.Join(",", stepwise.Probs.Select(p => p.ToString("F5")))}]");
         _output.WriteLine($"chained:      [{string.Join(",", chained.Ids)}] p [{string.Join(",", chained.Probs.Select(p => p.ToString("F5")))}]");
         Assert.Equal(stepwise.Ids, chained.Ids);
+        if (draftVocab > 0)
+            Assert.All(chained.Ids, id => Assert.True(id < draftVocab, $"drafted {id}, outside the first {draftVocab} ids"));
         for (int i = 0; i < Steps3; i++)
             Assert.True(Math.Abs(stepwise.Probs[i] - chained.Probs[i]) <= 1e-4f, $"step {i}: confidence {chained.Probs[i]} vs {stepwise.Probs[i]}");
     }
