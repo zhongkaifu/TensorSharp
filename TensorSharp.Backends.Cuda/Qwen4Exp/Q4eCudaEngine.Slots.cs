@@ -48,7 +48,15 @@ namespace TensorSharp.Cuda
                 // Captured batched steps are a cache, and their executable graphs hold device memory: a new sequence needs it
                 // more. In Strata's concurrency rounds the graphs of earlier rounds left the fourth request no slot, and it
                 // waited 4.2-4.6 s for a running one to finish.
-                if (!ReleaseBatchGraphsForMemory() || !SlotFits())
+                // Only when the graphs could make up the difference: with one lane every new request's slot falls short
+                // by a whole slot, and giving up the decode graphs there only made each request capture them again (139
+                // of 1,665 verify windows ran uncaptured, short-prompt decode 122-171 -> 95-116 tok/s).
+                if (SlotShortfall() > GraphReleaseBytes)
+                    return -1;
+                bool fits = false;
+                while (!fits && ReleaseBatchGraphsForMemory())
+                    fits = SlotFits();
+                if (!fits)
                     return -1;
             }
             Slot slot;
@@ -68,8 +76,13 @@ namespace TensorSharp.Cuda
         /// <summary>Whether one more slot fits, counting what the allocators hold pooled: its caches
         /// at the initial capacity, plus room for one slot to grow to the whole context, so the
         /// sequences already running are not left without memory to grow into.</summary>
-        private bool SlotFits()
+        private bool SlotFits() => SlotShortfall() <= 0;
+
+        /// <summary>Bytes the device shortest of room lacks for one more slot beside the reserve (0 or less when it fits),
+        /// counting what the allocators hold pooled.</summary>
+        private long SlotShortfall()
         {
+            long worst = long.MinValue;
             for (int d = 0; d < _devs.Length; d++)
             {
                 long need = _slotInitialBytes[d] + _slotGrowBytes[d];
@@ -78,11 +91,13 @@ namespace TensorSharp.Cuda
                 _devs[d].MakeCurrent();
                 (long free, _) = _devs[d].Alloc.GetMemoryInfo();
                 free += _devs[d].Alloc.GetStats().CachedBytes;
-                if (free - need < SlotReserveBytes)
-                    return false;
+                worst = Math.Max(worst, need + SlotReserveBytes - free);
             }
-            return true;
+            return worst == long.MinValue ? 0 : worst;
         }
+
+        /// <summary>A shortfall the captured graphs could make up (they hold well under this): beyond it they are kept.</summary>
+        private const long GraphReleaseBytes = 1L << 30;
 
         // ---------------------------------------------------------------- growing slots
         //

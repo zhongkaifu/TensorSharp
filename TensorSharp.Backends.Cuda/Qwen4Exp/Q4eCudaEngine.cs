@@ -435,7 +435,7 @@ namespace TensorSharp.Cuda
                     slotBytes += 2 * KvCacheBytes();
                 // Each slot also takes allocator rounding and its captured graphs; a slot is admitted only with
                 // SlotReserveBytes still free after it (SlotFits).
-                slotBytes += 128L << 20;
+                slotBytes += 256L << 20;
                 // With the MTP head the lanes verify their drafts together: the batched verify's window buffers and one
                 // set of saves a lane (BatchedVerify.cs).
                 // (Placement has not run: the batched verify needs one GPU, so device 0 is the last.)

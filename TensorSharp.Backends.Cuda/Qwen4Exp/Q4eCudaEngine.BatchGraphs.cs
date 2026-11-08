@@ -208,13 +208,31 @@ namespace TensorSharp.Cuda
                 RemoveBatchGraph(key);
         }
 
-        /// <summary>Drop every captured batched step for the memory a slot needs (they are a cache), once the streams have
-        /// run (a graph still running is freed when it completes). False when there were none.</summary>
+        /// <summary>
+        /// Give captured graphs' device memory to a slot that needs it (they are a cache, captured again on use): the batched
+        /// steps first, then the solo decode and verify graphs of the slots other than the active one (whose next step needs
+        /// its own). Once the streams have run (a graph still running is freed when it completes). False when there was
+        /// nothing to give. With 4 lanes on the RTX 5090 the plan left ~0.4 GiB beside the lanes, and the graphs captured over
+        /// a few rounds took it: the fourth of four requests waited 2.4-2.6 s for a running one to finish.
+        /// </summary>
         private bool ReleaseBatchGraphsForMemory()
         {
-            if (_batchGraphs.Count == 0)
-                return false;
-            DestroyBatchGraphs(-1);
+            if (_batchGraphs.Count > 0)
+                DestroyBatchGraphs(-1);
+            else
+            {
+                List<(int, int, int)> others = null;
+                foreach (var key in _graphs.Keys)
+                    if (key.Slot != _active.Id)
+                        (others ??= new List<(int, int, int)>()).Add(key);
+                if (others == null)
+                    return false;
+                foreach (var key in others)
+                {
+                    DestroyGraphs(_graphs[key]);
+                    _graphs.Remove(key);
+                }
+            }
             foreach (var dev in _devs)
             {
                 dev.MakeCurrent();
