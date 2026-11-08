@@ -1276,6 +1276,27 @@ RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/
 | 64 overlapped swaps a round (default) | 0.07-0.09 s / 75-110 | 174-179 | 1.61-1.69 s / 137-188 | 6.76-6.81 s / 183-198 | 31-146 / 26-33 |
 | 96 overlapped swaps a round | 0.07-0.09 s / 82-100 | 169-180 | 1.61-1.69 s / 151-193 | 6.71-6.79 s / 151-193 | 32-96 / 17-28 |
 
+#### The next prompt layer staged ahead, 2026-11-08
+
+Read layer by layer, a 4K prompt still spent 0.26 s of GPU time staging each layer's missed experts on its own
+stream, the layer waiting for the copy kernel. The staging now holds two halves with their own plans
+(`TS_Q4E_PROMPT_PREFETCH`, on): while a layer runs on the half that holds its experts, the copy engines bring every
+host expert of the next layer into the other half. The host keeps a layer's experts packed in host-index order, which
+becomes the staging slot order, so each matrix is one 2D copy and the plan (slots, list, the layer's tables pointing at
+the copies) is written from the host; the next layer waits for those copies instead of staging per ubatch. A half is
+reused two layers later, after its layer unstaged. Layers whose host experts do not fit a half (up to 228 of 256 on
+the 5090 run) stage per ubatch over the whole staging. The bytes the kernels read are the same, so the prompt answers
+bit for bit as before (the prompt-group test now runs it too). The first version used the copy kernel on the second
+stream: its blocks wait on the bus while holding the SMs the layer needs, and the 4K prompt took 1.82 s.
+
+RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
+
+| prompt staging | short chat | long generation | 4K prompt | 16K prompt | multi-turn first TTFT |
+| --- | --- | --- | --- | --- | --- |
+| per ubatch (after the overlapped swaps) | 0.07-0.09 s / 75-110 | 174-179 | 1.61-1.69 s / 137-188 | 6.76-6.81 s / 183-198 | 1.09-1.15 s |
+| next layer ahead, copy kernel | 0.07-0.09 s / 84-105 | 168-189 | 1.82-1.84 s / 98-148 | 7.37-7.39 s / 194-199 | 1.27-1.33 s |
+| next layer ahead, copy engines (default) | 0.07-0.09 s / 72-102 | 172-174 | 1.44-1.46 s / 135-146 | 5.84-5.87 s / 173-195 | 0.89-0.95 s |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the

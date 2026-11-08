@@ -895,6 +895,7 @@ namespace TensorSharp.Cuda
                     {
                         StopHostExperts();
                         DestroyAsyncSwaps();
+                        DestroyPromptPrefetch();
                         FreeHostExperts();
                     }
                     dev.Alloc?.Dispose();

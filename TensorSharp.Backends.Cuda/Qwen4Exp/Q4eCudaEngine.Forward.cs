@@ -480,8 +480,17 @@ namespace TensorSharp.Cuda
             FlushAsyncSwaps();
             Tensor ubatchXs = dev.Xs;
             _groupedPrompt = true;
+            bool prefetch = PromptPrefetchUsable();
             try
             {
+                if (prefetch)
+                {
+                    // Both halves are free from here (the previous group unstaged in this stream's order).
+                    for (int h = 0; h < 2; h++)
+                        CudaDriverApi.cuEventRecord(_halfFree[h], dev.Stream).ThrowOnError();
+                    PromptPrefetchGroups++;
+                }
+                bool staged = false;
                 // Every row's streams start as its token's embedding.
                 for (int r0 = 0; r0 < g; r0 += ub)
                 {
@@ -498,6 +507,22 @@ namespace TensorSharp.Cuda
                 for (int il = 0; il < m.NLayer; il++)
                 {
                     var L = _layers[il];
+                    // A layer whose host experts fit a half runs on it, staged ahead while the layer before ran when that
+                    // one did too; any other layer stages per ubatch over the whole staging.
+                    bool half = prefetch && _halfFits[il];
+                    var stage = half ? _halfStages[il & 1] : _expertStage;
+                    if (half)
+                    {
+                        if (staged)
+                            CudaDriverApi.cuStreamWaitEvent(dev.Stream, _prefetchDone[il & 1], 0).ThrowOnError();
+                        // The next layer's host experts cross the bus while this layer runs.
+                        staged = il + 1 < m.NLayer && _halfFits[il + 1];
+                        if (staged)
+                            PrefetchLayer(il + 1, (il + 1) & 1, _prefetchStream, waitFree: true);
+                    }
+                    else
+                        staged = false;
+                    _promptStage = stage;
                     for (int r0 = 0; r0 < g; r0 += ub)
                     {
                         int nt = Math.Min(ub, g - r0);
@@ -511,7 +536,13 @@ namespace TensorSharp.Cuda
                         RunLayer(dev, il, slot, nt, p0 + r0, null, null, IntPtr.Zero);
                     }
                     // The layer's ubatches shared one staging.
-                    CudaMoe.Unstage(dev.DK, _expertStage, L.Stage, dev.Stream);
+                    CudaMoe.Unstage(dev.DK, stage, L.Stage, dev.Stream);
+                    // A half is free again once its layer unstaged; the whole staging frees both.
+                    if (half)
+                        CudaDriverApi.cuEventRecord(_halfFree[il & 1], dev.Stream).ThrowOnError();
+                    else if (prefetch)
+                        for (int h = 0; h < 2; h++)
+                            CudaDriverApi.cuEventRecord(_halfFree[h], dev.Stream).ThrowOnError();
                 }
                 if (hOut != null && hRowOffset >= 0 && hOut.LongLength >= ((long)hRowOffset + g) * hc)
                 {
@@ -534,6 +565,7 @@ namespace TensorSharp.Cuda
             {
                 dev.Xs = ubatchXs;
                 _groupedPrompt = false;
+                _promptStage = null;
             }
         }
 
@@ -885,7 +917,7 @@ namespace TensorSharp.Cuda
 
             CudaMoe.Experts(dev.DK, dev.Alloc.Kernels, dev.Moe, L.GateExps, L.UpExps, L.DownExps,
                 dev.Cur, dev.ShDown, dev.BlockOut, nt, m.NExpertUsed, m.NExpert, e, m.NFfExp, 0f,
-                PerSlotMaxRows, dev.Stream, stage: host ? null : _expertStage, stageLayer: L.Stage,
+                PerSlotMaxRows, dev.Stream, stage: host ? null : _promptStage ?? _expertStage, stageLayer: L.Stage,
                 shDownReady: fork ? dev.ShJoinEv : IntPtr.Zero, keepStaged: _groupedPrompt);
             if (host)
             {

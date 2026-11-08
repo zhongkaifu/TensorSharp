@@ -624,23 +624,36 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             foreach (var (name, t) in g.Tensors)
                 if (name.Contains("_exps.", StringComparison.Ordinal))
                     expertBytes += g.GetTensorByteCount(t);
-        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        // Two thirds resident: a layer's host experts then fit half the staging, so the next layer can be staged ahead.
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes * 2 / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
 
-        (float[][] Rows, long Groups) Answer(string group)
+        (float[][] Rows, long Groups, long Prefetched) Answer(string group)
         {
             _env.Set("TS_Q4E_PROMPT_GROUP", group);
             using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
             var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
-            return (Run(model), engine.PromptGroupsRun);
+            var rows = Run(model);
+            return (rows, engine.PromptGroupsRun, engine.PromptPrefetchGroups);
         }
         var ubatchOrder = Answer("0");
+        _env.Set("TS_Q4E_PROMPT_PREFETCH", "0");
         var grouped = Answer("24");
-        _output.WriteLine($"prompt groups read layer by layer: ubatch order {ubatchOrder.Groups}, grouped {grouped.Groups}");
+        _env.Set("TS_Q4E_PROMPT_PREFETCH", null);
+        var prefetched = Answer("24");
+        _output.WriteLine($"prompt groups read layer by layer: ubatch order {ubatchOrder.Groups}, grouped {grouped.Groups}, "
+            + $"grouped with the next layer staged ahead {prefetched.Groups}");
         Assert.Equal(0, ubatchOrder.Groups);
         Assert.Equal(2, grouped.Groups);
+        Assert.Equal(2, prefetched.Groups);
+        Assert.Equal(0, grouped.Prefetched);
+        Assert.Equal(2, prefetched.Prefetched);
         for (int i = 0; i < grouped.Rows.Length; i++)
+        {
             Assert.True(grouped.Rows[i].AsSpan().SequenceEqual(ubatchOrder.Rows[i]),
                 $"{(i == 0 ? "prefill" : $"decode {i}")}: reading the prompt layer by layer changed the logits");
+            Assert.True(prefetched.Rows[i].AsSpan().SequenceEqual(ubatchOrder.Rows[i]),
+                $"{(i == 0 ? "prefill" : $"decode {i}")}: staging the next layer ahead changed the logits");
+        }
     }
 
     /// <summary>
@@ -658,6 +671,7 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             foreach (var (name, t) in g.Tensors)
                 if (name.Contains("_exps.", StringComparison.Ordinal))
                     expertBytes += g.GetTensorByteCount(t);
+        // Two thirds resident: a layer's host experts then fit half the staging, so the next layer can be staged ahead.
         _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
         (float[][] Rows, long Skipped, long Misses) Answer(string rank)
         {
