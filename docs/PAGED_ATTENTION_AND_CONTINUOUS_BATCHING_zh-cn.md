@@ -350,6 +350,12 @@ Hunyuan Dense 没有实现投机主干，对任何算法（包括 n-gram）都�
 Qwen 3.8 Flash Next、GLM 5.x、DeepSeek V4 / V4.1）的复用止于第一张图片、视频帧或音频片段。DiffusionGemma
 与图像/视频模型不使用它。
 
+在 Mac 上，字节数由 macOS 能给出的内存约束。那里 GPU 与其他一切共用同一块内存，保留的状态与权重一样被固定（wired），
+所以在它分配之后测得的空余量永远不会低于已缓存的量：一个 Qwen3.8-27B 的 MLX 服务在 48 GB 的 Mac 上保留了 16 个按整段上下文
+分配的会话，占用超过 34 GB，开始换页后解码慢了 3 倍。现在模型报告 macOS 不经压缩就能给出的内存（空闲与可清除页、干净的文件缓存）
+比 7 GB 与内存 15% 中的较大者少了多少，前缀缓存在接纳请求之前、保留一个状态之后，按从旧到新、不动公共前缀的顺序，淘汰同样多字节的
+保留状态（`IPrefixCacheModel.QueryHostMemoryDeficitBytes`）。克隆与 holder 池所依据的主机空余量也按同样的规则约束。其他平台不受影响。
+
 `TS_SCHED_PREFIX_CACHE=0` 关闭复用；`--no-prefix-cache`（CLI 与服务端）会设置它，并同时跳过共享 system /
 工具前缀的启动预热，以及服务端的检查点文件。`--spec` 不会关闭前缀缓存。（Radix 之前的块哈希共享及其各自独立的
 复用路径已被移除；设置 `TS_PREFIX_CACHE_MODE` 会报错。）

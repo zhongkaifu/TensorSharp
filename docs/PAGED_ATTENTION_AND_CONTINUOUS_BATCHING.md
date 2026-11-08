@@ -423,6 +423,18 @@ Hunyuan Dense, Qwen 3.8 Flash Next, GLM 5.x, DeepSeek V4 / V4.1) reuse stops at 
 first image, video frame or audio clip. DiffusionGemma and the image/video models
 do not use it.
 
+On a Mac the bytes are bounded by what macOS can give. The GPU and everything else
+share one memory there, and a retained state is wired like the weights, so a spare
+figure measured after it was allocated never drops below what is cached: a
+Qwen3.8-27B MLX server on a 48 GB Mac kept sixteen conversations sized for the whole
+context, passed 34 GB and decoded 3x slower once it swapped. The model reports how
+far what macOS can give without compressing (free and purgeable pages and the clean
+file cache) has fallen below the larger of 7 GB and 15% of RAM, and the prefix cache
+evicts that many bytes of retained state, oldest first and short of the public
+prefixes, before it admits a request and after it keeps one
+(`IPrefixCacheModel.QueryHostMemoryDeficitBytes`). The host spare that clones and
+holder pools are sized against is bounded the same way. Elsewhere nothing changes.
+
 `TS_SCHED_PREFIX_CACHE=0` disables reuse; `--no-prefix-cache` (CLI and server)
 sets it and also skips the startup warm-up of the shared system/tool prefix and, on
 the server, the checkpoint files. `--spec` leaves the prefix cache on. (The pre-Radix

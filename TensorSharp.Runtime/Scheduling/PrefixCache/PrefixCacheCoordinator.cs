@@ -169,6 +169,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     internal int ComputeReusablePrefix(SequenceState sequence)
     {
         Drain();
+        RelieveHostMemoryDeficit();
         RequiresSoleAdmission = false;
         LastSource = null;
         TryRestoreCheckpoint(sequence);
@@ -777,6 +778,42 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         // Public prefixes have eviction priority, not an exemption from byte caps.
         _tree.EnforceCaps(EvictionTier.PublicTop);
         Drain();
+        RelieveHostMemoryDeficit();
+    }
+
+    private static readonly ResourceClass[] s_deficitClasses =
+        { ResourceClass.HostKv, ResourceClass.StateSnapshot, ResourceClass.DeviceKv, ResourceClass.NativeSlot };
+
+    private long CachedDeficitBytes()
+    {
+        long total = 0;
+        foreach (ResourceClass cls in s_deficitClasses) total += _tree.Cached[cls];
+        return total;
+    }
+
+    /// <summary>Before a request is admitted and after a payload is kept: when the machine is short of
+    /// memory (<see cref="IPrefixCacheModel.QueryHostMemoryDeficitBytes"/>), evict that many cached bytes,
+    /// oldest first and short of the public prefixes. The memory is the machine's, so every byte class
+    /// counts: host K/V first, then recurrent state, device K/V and native slots.</summary>
+    private void RelieveHostMemoryDeficit()
+    {
+        long deficit = _cacheModel.QueryHostMemoryDeficitBytes();
+        if (deficit <= 0) return;
+        long start = CachedDeficitBytes();
+        if (start <= 0) return;
+        foreach (ResourceClass cls in s_deficitClasses)
+        {
+            // A payload or page evicted for one class frees its bytes of the others too.
+            long remaining = deficit - (start - CachedDeficitBytes());
+            if (remaining <= 0) break;
+            if (_tree.Cached[cls] > 0)
+                _tree.Evict(cls, remaining, ReleaseReason.Pressure, EvictionTier.ScopeNewest);
+        }
+        Drain();
+        long kept = CachedDeficitBytes();
+        if (kept != start)
+            _logger.LogInformation("Prefix cache: the machine is {Deficit} MiB short of memory; evicted {Evicted} MiB of cached state, kept {Kept} MiB.",
+                deficit >> 20, (start - kept) >> 20, kept >> 20);
     }
 
     internal string TrimIdleMemory()
