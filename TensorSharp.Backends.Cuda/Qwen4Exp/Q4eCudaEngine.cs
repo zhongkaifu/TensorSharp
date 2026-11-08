@@ -372,16 +372,25 @@ namespace TensorSharp.Cuda
 
             // ---- expert residency: one GPU that cannot hold every routed expert keeps the hottest in
             // VRAM slots and reads the rest from pinned host memory (Residency.cs) ----
-            PlanKvWindow();
-            long nonExpertBytes = 0;
-            for (int il = 0; il < m.NLayer; il++)
+            long NonExpertBytes()
             {
-                foreach (var w in LayerWeights(m.Layers[il], experts: false))
-                    nonExpertBytes += CudaWeightArena.Align(w.TotalBytes);
-                nonExpertBytes += LayerFloatBytes(m.Layers[il]) + LayerCacheBytes(il);
+                long b = 0;
+                for (int il = 0; il < m.NLayer; il++)
+                {
+                    foreach (var w in LayerWeights(m.Layers[il], experts: false))
+                        b += CudaWeightArena.Align(w.TotalBytes);
+                    b += LayerFloatBytes(m.Layers[il]) + LayerCacheBytes(il);
+                }
+                // The MTP block stays whole in VRAM (its experts included), with one sequence's draft KV and its scratch.
+                return b + MtpDeviceBytes();
             }
-            // The MTP block stays whole in VRAM (its experts included), with one sequence's draft KV and its scratch.
-            nonExpertBytes += MtpDeviceBytes();
+            // The resident KV window (TS_Q4E_KV_RESIDENT) is decided against the caches at the full context: by default it
+            // streams only when the experts would not fit whole beside them.
+            _kvWindow = 0;
+            long nonExpertBytes = NonExpertBytes();
+            PlanKvWindow(ExpertsFitWhole(useDevs, nonExpertBytes));
+            if (_kvWindow > 0)
+                nonExpertBytes = NonExpertBytes();
             // TS_Q4E_LANES: sequences the plan leaves VRAM for (their caches and draft KV) beside the first, so concurrent
             // requests get slots of their own instead of waiting for the first (expert slots pay for them).
             int lanes = Math.Clamp(EnvInt("TS_Q4E_LANES", 1), 1, MaxBatchedDecodeRows);

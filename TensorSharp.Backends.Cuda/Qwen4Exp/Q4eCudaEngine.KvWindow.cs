@@ -46,8 +46,13 @@ namespace TensorSharp.Cuda
         }
 
         // TS_Q4E_KV_RESIDENT: cells of each QSA attention layer's K/V kept in VRAM (Strata's --kv-resident); the rest of the
-        // context lives in pinned host memory. 0 keeps every layer's K/V resident.
-        private readonly int _kvResidentEnv = Math.Max(0, EnvInt("TS_Q4E_KV_RESIDENT", 0));
+        // context lives in pinned host memory. 0 keeps every layer's K/V resident. Unset: Strata's 32,768 when the routed
+        // experts do not fit in VRAM whole (expert residency: the VRAM goes to expert slots), every layer resident when
+        // they do.
+        private readonly int _kvResidentEnv = EnvInt("TS_Q4E_KV_RESIDENT", -1);
+
+        /// <summary>The window an unset TS_Q4E_KV_RESIDENT takes under expert residency (Strata's --kv-resident).</summary>
+        private const int KvResidentDefault = 32768;
 
         /// <summary>Cells a streamed layer keeps in VRAM, or 0 (every layer resident).</summary>
         private int _kvWindow;
@@ -57,13 +62,28 @@ namespace TensorSharp.Cuda
 
         private bool KvStreamed(int il) => _kvWindow > 0 && !_m.Layers[il].Recurrent && _m.Layers[il].CompressRatio > 0;
 
-        /// <summary>Decides the window before the residency plan sizes the caches.</summary>
-        private void PlanKvWindow()
+        /// <summary>Decides the window before the residency plan sizes the caches: TS_Q4E_KV_RESIDENT, or when it is unset,
+        /// <see cref="KvResidentDefault"/> unless the routed experts fit in VRAM whole.</summary>
+        private void PlanKvWindow(bool expertsFitWhole)
         {
             var m = _m;
             _kvWindow = 0;
-            if (_kvResidentEnv <= 0)
+            bool auto = _kvResidentEnv < 0;
+            int requested = auto ? (expertsFitWhole ? 0 : KvResidentDefault) : _kvResidentEnv;
+            if (requested <= 0)
                 return;
+            string setting = auto ? $"the default {KvResidentDefault}-cell window (the experts do not fit whole)" : $"TS_Q4E_KV_RESIDENT={requested}";
+            // A call of PerSlotMaxRows rows reads at most CellStride cells a row, in whole blocks: their pages, plus the
+            // row's own incomplete block.
+            int floor = PerSlotMaxRows * ((CellStride + Q4eKernels.KvPage - 1) / Q4eKernels.KvPage + 2) * Q4eKernels.KvPage;
+            int cells = Math.Max(requested, floor);
+            cells = (cells + Q4eKernels.KvPage - 1) / Q4eKernels.KvPage * Q4eKernels.KvPage;
+            if (cells >= m.NCtx)
+            {
+                if (!auto)
+                    Console.Error.WriteLine($"[q4e-cuda] {setting}: the {m.NCtx}-cell context fits; every layer's K/V stays in VRAM.");
+                return;
+            }
             bool anyQsa = false, aligned = true;
             foreach (var L in m.Layers)
                 if (!L.Recurrent && L.CompressRatio > 0)
@@ -78,17 +98,7 @@ namespace TensorSharp.Cuda
                     ? "the loaded tensorsharp_q4e_kernels module predates it (rebuild the CUDA kernels)" : null;
             if (why != null)
             {
-                Console.Error.WriteLine($"[q4e-cuda] TS_Q4E_KV_RESIDENT={_kvResidentEnv} ignored: {why}; every layer's K/V stays in VRAM.");
-                return;
-            }
-            // A call of PerSlotMaxRows rows reads at most CellStride cells a row, in whole blocks: their pages, plus the
-            // row's own incomplete block.
-            int floor = PerSlotMaxRows * ((CellStride + Q4eKernels.KvPage - 1) / Q4eKernels.KvPage + 2) * Q4eKernels.KvPage;
-            int cells = Math.Max(_kvResidentEnv, floor);
-            cells = (cells + Q4eKernels.KvPage - 1) / Q4eKernels.KvPage * Q4eKernels.KvPage;
-            if (cells >= m.NCtx)
-            {
-                Console.Error.WriteLine($"[q4e-cuda] TS_Q4E_KV_RESIDENT={_kvResidentEnv}: the {m.NCtx}-cell context fits; every layer's K/V stays in VRAM.");
+                Console.Error.WriteLine($"[q4e-cuda] {setting} not used: {why}; every layer's K/V stays in VRAM.");
                 return;
             }
             _kvWindow = cells;
@@ -103,7 +113,7 @@ namespace TensorSharp.Cuda
                 + $"(the rest in pinned host memory, {streamed * 2 * KvCacheBytes(m.NCtx) / 1073741824.0:F2} GiB a sequence) and "
                 + $"{_idxRing} raw indexer keys; {saved / 1073741824.0:F2} GiB of VRAM a sequence for experts, less one "
                 + $"{2 * KvCacheBytes(m.NCtx) / 1048576.0:F0} MiB prompt staging pool a GPU (TS_Q4E_KV_RESIDENT=0 keeps them resident"
-                + (cells > _kvResidentEnv ? $"; raised to one call's {floor} cells" : "") + ").");
+                + (cells > requested ? $"; raised to one call's {floor} cells" : "") + ").");
         }
 
         /// <summary>A streamed layer's map and slot bytes beside its window (device).</summary>

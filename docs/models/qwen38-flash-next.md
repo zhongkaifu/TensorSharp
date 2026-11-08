@@ -1506,8 +1506,22 @@ engine's QSA layers (Q8_0 KV only):
 The readers go through the page table with the resident kernels' arithmetic, cell for cell, so a streamed layer
 answers bit for bit as a resident one (`AResidentKvWindow_AnswersBitForBitAsResidentCaches`: a 600-token prompt in
 128-row ubatches, 150 decode steps whose selections move over the whole context and a verify window, through a
-448-cell window, against resident caches). `0` (the default until the commit after this one) keeps every layer
-resident.
+448-cell window, against resident caches). Unset, the engine streams with Strata's 32,768 cells (raised to the
+32,960-cell floor) whenever the routed experts do not fit in VRAM whole, and keeps every layer resident when they do;
+`0` keeps every layer resident.
+
+On by default since 2026-11-08 when the experts do not fit whole. On the RTX 5090 (ISTA `Q2_0`, MTP, 131K context)
+the window freed 1.43 GiB a sequence less the 136 MiB staging pool: 17,718 experts in VRAM instead of 16,608, 98.4% of
+the profiled routes instead of 97.6%. Same build and client, 3 repetitions (TTFT / decode tok/s; every needle found):
+
+| KV | short chat | long generation | 4K prompt | 16K prompt | 48K prompt | 100K prompt | multi-turn first |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| all resident (`0`) | 0.07-0.09 s / 114-162 | 222-238 | 1.07-1.08 s / 167-172 | 4.16-4.18 s / 234-249 | 12.9-13.0 s / 184-210 | 29.5 s / 158-169 | 0.64-0.67 s |
+| 32K window (default) | 0.07-0.09 s / 119-167 | 234-245 | 1.08 s / 181-185 | 4.38-4.40 s / 224-250 | 13.8-13.9 s / 201-221 | 31.7 s / 170-187 | 0.64-0.67 s |
+
+Decode gains everywhere (more experts resident; a step's missed pages are few and small). Prompts of 16K and more pay
+5-7% TTFT: each layer's cells are copied into the staging pool once per 4,096-row prompt group, on the prompt's
+stream. Staging the next layer ahead on a stream of its own (as the experts are) would hide most of it.
 
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 

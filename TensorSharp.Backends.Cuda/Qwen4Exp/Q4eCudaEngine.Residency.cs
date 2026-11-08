@@ -88,6 +88,32 @@ namespace TensorSharp.Cuda
         /// than one device, or every expert fits beside everything else. <paramref name="nonExpertBytes"/>
         /// is what the layers need besides their routed experts (weights, F32 tensors, caches).
         /// </summary>
+        /// <summary>What device 0 has for weights and caches after its scratch, a gigabyte of headroom, the embedding,
+        /// the output head and the prompt groups.</summary>
+        private long ExpertPlanBudget()
+        {
+            var m = _m;
+            _devs[0].MakeCurrent();
+            var (free, _) = _devs[0].Alloc.GetMemoryInfo();
+            return (long)free - DeviceScratchBytes() - (1L << 30) - m.TokEmbd.TotalBytes
+                - m.Output.TotalBytes - (long)m.NVocab * 8 - PromptGroupBytes();
+        }
+
+        /// <summary>Whether every routed expert fits in VRAM beside <paramref name="nonExpertBytes"/> (no expert residency
+        /// planned; a layer split never plans one, a forced TS_Q4E_EXPERT_VRAM_GB always does).</summary>
+        private bool ExpertsFitWhole(int useDevs, long nonExpertBytes)
+        {
+            var m = _m;
+            if (useDevs != 1)
+                return true;
+            if (m.ExpertVramBytes >= 0)
+                return false;
+            long expertTotal = 0;
+            for (int il = 0; il < m.NLayer; il++)
+                expertTotal += LayerExpertBytes(m.Layers[il]);
+            return nonExpertBytes + expertTotal <= ExpertPlanBudget();
+        }
+
         private ExpertResidency PlanResidency(int useDevs, long nonExpertBytes)
         {
             var m = _m;
@@ -102,10 +128,7 @@ namespace TensorSharp.Cuda
                 return null;
             }
 
-            _devs[0].MakeCurrent();
-            var (free, _) = _devs[0].Alloc.GetMemoryInfo();
-            long budget = (long)free - DeviceScratchBytes() - (1L << 30) - m.TokEmbd.TotalBytes
-                - m.Output.TotalBytes - (long)m.NVocab * 8 - PromptGroupBytes();
+            long budget = ExpertPlanBudget();
             if (!forced && nonExpertBytes + expertTotal <= budget)
                 return null;
             // The tables and the arena's per-slot alignment, besides the slots themselves, and the staging
