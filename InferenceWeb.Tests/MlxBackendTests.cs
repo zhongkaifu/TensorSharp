@@ -1004,6 +1004,55 @@ public class MlxBackendTests
         }
     }
 
+    /// <summary>Q4_K and Q8_0 load as MLX affine 4- and 8-bit weights; from 2 rows they go through the few-row kernels
+    /// (MLX's quantized_matmul re-read them at ~120 GB/s there). 3 and 8 rows take the F32 kernel; 13 and 24 the
+    /// tensor-API one where the device has it, MLX's otherwise, both with F16 activations.</summary>
+    [MlxTheory]
+    [InlineData((int)GgmlTensorType.Q4_K, 3)]
+    [InlineData((int)GgmlTensorType.Q4_K, 8)]
+    [InlineData((int)GgmlTensorType.Q4_K, 13)]
+    [InlineData((int)GgmlTensorType.Q4_K, 24)]
+    [InlineData((int)GgmlTensorType.Q8_0, 3)]
+    [InlineData((int)GgmlTensorType.Q8_0, 8)]
+    [InlineData((int)GgmlTensorType.Q8_0, 13)]
+    [InlineData((int)GgmlTensorType.Q8_0, 24)]
+    public void MlxQuantizedMatmul_AffineFewRowsMatchDequantizedReference(int ggmlType, int rows)
+    {
+        const int inDim = 512;
+        const int outDim = 70;   // two full 32-row tiles and a partial one
+        bool q4k = ggmlType == (int)GgmlTensorType.Q4_K;
+        byte[] weights = q4k ? CreateQ4KRows(outDim, inDim)
+            : CreateQ80Rows(outDim, inDim, (r, c) => (sbyte)(((r + 2) * (c - 23)) % 57), r => 0.0125f + r * 0.0003f);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((r + 1) * (c + 3) * 0.013f);
+        float[] expected = q4k ? DequantizedMatmulK(weights, outDim, inDim, input, DequantizeQ4KRow)
+            : DequantizedMatmulQ80(weights, outDim, inDim, input);
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new MlxAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var outputTensor = new Tensor(allocator, DType.Float32, rows, outDim);
+            Assert.True(MlxQuantizedOps.TryAddmmQuantizedToFloat32(outputTensor, inputTensor, host, host, ggmlType, inDim, outDim, weights.Length));
+            float[] actual = outputTensor.GetElementsAsFloat(rows * outDim);
+            // The affine scales and biases are F16 (Q4_K's d * scale, Q8_0's d), so even the F32 kernel differs from
+            // the exact dequantization by their rounding; the tensor kernel's F16 activations add their own.
+            double scale = 0;
+            foreach (float v in expected) scale = Math.Max(scale, Math.Abs(v));
+            double tolerance = (rows >= 9 ? 4e-3 : 1e-3) * scale + 1e-4;   // 9+: F16 activations on either route
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - actual[i]) <= tolerance,
+                    $"{(GgmlTensorType)ggmlType} rows={rows} [{i}]: expected {expected[i]}, got {actual[i]} (tolerance {tolerance:G3})");
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
     [MlxTheory]
     [InlineData((int)GgmlTensorType.Q4_K)]
     [InlineData((int)GgmlTensorType.Q5_K)]

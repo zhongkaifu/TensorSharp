@@ -924,6 +924,11 @@ process (kernels compiled).
   9-1024 rows). A forward of 16 rows 151 -> 82 ms (ggml_metal 153), 32 rows 599 -> 104 (291),
   128 rows 723 -> 325 (363), 512 rows 1377 -> 1205 (1289); it ties the dequant GEMM at 1024 rows,
   which keeps the longer chunks.
+- **Affine weights: the drafter.** Q4_K and Q8_0 load as MLX affine weights, which ran through MLX's
+  `quantized_matmul`: at the drafter's 7-8 rows it read them at ~120 GB/s. They now take the same
+  few-row kernels with an affine decoder (`TS_MLX_AFFINE_FEWROW_MAX_ROWS`, up to 128 rows with the
+  tensor API): a DFlash2 draft 17.6 -> 13.4 ms (layers 11.0 -> 9.0, the 248K-row head 5.9 -> 3.7),
+  and the verify window 92-96 -> 89 ms from the target's own Q4_K tensors.
 - **Unrolled register arrays.** The first port of that layout took 225 ms for the 8-row forward:
   the loops over its accumulator and pointer arrays were not unrolled, so the arrays lived in
   thread memory. With every such loop unrolled (`clang loop unroll(full)`, ggml's `FOR_UNROLL`)
@@ -939,15 +944,14 @@ Server, greedy, `--spec-draft 7 --spec-pmin 0`, MAX_CONTEXT 32768, two runs each
 
 | UD-IQ3_XXS + DFlash2 | ggml_metal | MLX before | MLX now |
 |---|---:|---:|---:|
-| Long generation (74-token prompt, 1,220 tokens) | 0.57-0.60 s / 30.1-31.3 tok/s | 1.27-1.43 s / 17.6-17.7 | 0.72-0.74 s / 27.3-28.3 |
-| 4K-token prompt | 12.9 s / 35-52 | 10.6-10.7 s / 15-18 | 9.8-9.9 s / 34.5-40.5 |
-| 16K-token prompt | 53.5 s / 33 | 43.1-43.3 s / 14-15 | 40.9 s / 28-34 |
-| Multi-turn: first turn, then cached turns | 9.2-9.3 s, 0.32-0.59 s | 8.4-8.8 s, 0.56-0.67 s | 6.7-7.0 s, 0.29-0.30 s |
-| Short chat | 0.57 s | 0.66-1.05 s | 0.65 s |
+| Long generation (74-token prompt, 1,220 tokens) | 0.57-0.60 s / 30.1-31.3 tok/s | 1.27-1.43 s / 17.6-17.7 | 0.34-0.37 s / 31.0-31.6 |
+| 4K-token prompt | 12.9 s / 35-52 | 10.6-10.7 s / 15-18 | 9.8-10.0 s / 39-41 |
+| 16K-token prompt | 53.5 s / 33 | 43.1-43.3 s / 14-15 | 41.1 s / 29 |
+| Multi-turn: first turn, then cached turns | 9.2-9.3 s, 0.32-0.59 s | 8.4-8.8 s, 0.56-0.67 s | 6.4-8.5 s, 0.12 s |
+| Short chat | 0.57 s | 0.66-1.05 s | 0.21 s |
 
-Plain decode is 46.8 ms a token on MLX against 48.4 on ggml_metal. What remains of the gap is
-long-generation decode (about 10%: the drafter's 17 ms against ggml_metal's 12.5, and the 8-row
-forward's 22 ms outside the matmuls) and the short-chat TTFT.
+Plain decode is 46.8 ms a token on MLX against 48.4 on ggml_metal. Decode after a 16K-token prompt
+(29 against 33 tok/s, over 56 tokens) is the one figure still behind.
 
 ## 10. Memory and KV cache strategy
 
