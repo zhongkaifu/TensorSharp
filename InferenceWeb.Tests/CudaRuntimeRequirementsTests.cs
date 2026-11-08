@@ -154,7 +154,7 @@ public sealed class CudaLibraryResolverTests
         string[] installed = { Toolkit("v12.6"), Toolkit("v13.4"), Toolkit("v11.8"), Toolkit("v13.10"), Toolkit("v13.0"), Toolkit("vNext"), Toolkit("extras") };
         string cudaPath = Toolkit("v13.4");
 
-        string[] actual = CudaLibraryResolver.EnumerateCudaBinDirectories(cudaPath, null, installed).ToArray();
+        string[] actual = CudaLibraryResolver.EnumerateCudaBinDirectories(cudaPath, null, installed, "x64").ToArray();
 
         string[] expected =
         {
@@ -168,25 +168,112 @@ public sealed class CudaLibraryResolverTests
     }
 
     [Fact]
+    public void OnWindowsOnArmTheArm64RuntimeFolderIsProbed()
+    {
+        // NVIDIA ships CUDA 13 for Windows on Arm as redistributables whose DLLs sit in bin\arm64
+        // (eng/install-cuda-redist.py lays them out the same way); CUDA_PATH alone must find them.
+        string cudaPath = Path.Combine(Path.GetTempPath(), "cuda-13.4.3-arm64");
+
+        Assert.Equal(new[] { Path.Combine(cudaPath, "bin", "arm64") },
+            CudaLibraryResolver.EnumerateCudaBinDirectories(cudaPath, null, Array.Empty<string>(), "arm64").ToArray());
+    }
+
+    [Fact]
+    public void TheProbedRuntimeFolderFollowsTheProcessArchitecture()
+    {
+        string expected = RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "arm64" : "x64";
+        Assert.Equal(expected, CudaLibraryResolver.WindowsCudaBinArchitecture);
+
+        string cudaPath = Path.Combine(Path.GetTempPath(), "cuda");
+        Assert.Equal(new[] { Path.Combine(cudaPath, "bin", expected) },
+            CudaLibraryResolver.EnumerateCudaBinDirectories(cudaPath, null, Array.Empty<string>()).ToArray());
+    }
+
+    private static readonly Type GgmlNative =
+        typeof(TensorSharp.GGML.GgmlBasicOps).Assembly.GetType("TensorSharp.GGML.GgmlNative", throwOnError: true)!;
+
+    private static string[] GgmlDependencyDirectories(string? cudaPath, string? cudaHome, string[] installed, string? binArchitecture)
+    {
+        Type[] signature = binArchitecture == null
+            ? new[] { typeof(string), typeof(string), typeof(IEnumerable<string>) }
+            : new[] { typeof(string), typeof(string), typeof(IEnumerable<string>), typeof(string) };
+        MethodInfo enumerate = GgmlNative.GetMethod("EnumerateWindowsNativeDependencyDirectories",
+            BindingFlags.NonPublic | BindingFlags.Static, signature)!;
+        Assert.NotNull(enumerate);
+        object?[] args = binArchitecture == null
+            ? new object?[] { cudaPath, cudaHome, installed }
+            : new object?[] { cudaPath, cudaHome, installed, binArchitecture };
+        return ((IEnumerable<string>)enumerate.Invoke(null, args)!).ToArray();
+    }
+
+    [Fact]
     public void TheGgmlBridgeSearchesTheSameCuda13Directories()
     {
         // GgmlOps (cublas64_13.dll) and cuDNN (cublasLt64_13.dll, nvrtc64_130_0.dll) resolve the
         // runtime through TensorSharp.Backends.GGML's own copy of this enumeration.
-        Type ggmlNative = typeof(TensorSharp.GGML.GgmlBasicOps).Assembly.GetType("TensorSharp.GGML.GgmlNative", throwOnError: true)!;
-        MethodInfo enumerate = ggmlNative.GetMethod("EnumerateWindowsNativeDependencyDirectories",
-            BindingFlags.NonPublic | BindingFlags.Static, new[] { typeof(string), typeof(string), typeof(IEnumerable<string>) })!;
-        Assert.NotNull(enumerate);
-
         string root = Path.Combine(Path.GetTempPath(), "nv", "CUDA");
         string[] installed = { Path.Combine(root, "v12.6"), Path.Combine(root, "v13.4"), Path.Combine(root, "v13.10") };
-        var actual = ((IEnumerable<string>)enumerate.Invoke(null, new object?[] { null, Path.Combine(root, "v13.4"), installed })!).ToArray();
 
-        Assert.Equal(new[]
+        foreach (string arch in new[] { "x64", "arm64" })
         {
-            Path.Combine(root, "v13.4", "bin", "x64"),
-            Path.Combine(root, "v13.10", "bin", "x64"),
-            Path.Combine(root, "v13.4", "bin", "x64"),
-        }, actual);
+            Assert.Equal(new[]
+            {
+                Path.Combine(root, "v13.4", "bin", arch),
+                Path.Combine(root, "v13.10", "bin", arch),
+                Path.Combine(root, "v13.4", "bin", arch),
+            }, GgmlDependencyDirectories(null, Path.Combine(root, "v13.4"), installed, arch));
+        }
+
+        Assert.Equal(CudaLibraryResolver.WindowsCudaBinArchitecture, GgmlNative
+            .GetProperty("WindowsCudaBinArchitecture", BindingFlags.NonPublic | BindingFlags.Static)!.GetValue(null));
+        Assert.Equal(new[] { Path.Combine(root, "v13.4", "bin", CudaLibraryResolver.WindowsCudaBinArchitecture) },
+            GgmlDependencyDirectories(Path.Combine(root, "v13.4"), null, Array.Empty<string>(), null));
+    }
+
+    private static string DescribeBridgeLoadFailure(string? path, Exception? error, bool windows, bool linux)
+    {
+        MethodInfo describe = GgmlNative.GetMethod("DescribeBridgeLoadFailure", BindingFlags.NonPublic | BindingFlags.Static)!;
+        Assert.NotNull(describe);
+        return (string)describe.Invoke(null, new object?[] { path, error, windows, linux })!;
+    }
+
+    [Fact]
+    public void AnUnbuiltBridgeStillSaysToBuildIt()
+    {
+        Assert.Equal("Failed to load the native GGML bridge. Build `TensorSharp.GGML.Native` first.",
+            DescribeBridgeLoadFailure(null, null, windows: true, linux: false));
+    }
+
+    [Fact]
+    public void ABuiltBridgeThatDoesNotLoadNamesTheFileTheReasonAndTheCudaRuntime()
+    {
+        // GgmlOps.dll present but cublas64_13.dll not on the search path: Windows reports only
+        // "The specified module could not be found", which used to read as "build it first".
+        string path = Path.Combine(Path.GetTempPath(), "bin", "GgmlOps.dll");
+        var error = new DllNotFoundException("The specified module could not be found. (0x8007007E)");
+
+        string windows = DescribeBridgeLoadFailure(path, error, windows: true, linux: false);
+        Assert.Contains(path, windows);
+        Assert.Contains("exists but could not be loaded", windows);
+        Assert.Contains("0x8007007E", windows);
+        Assert.Contains("cublas64_13.dll", windows);
+        Assert.Contains("CUDA_PATH", windows);
+        Assert.Contains("bin\\arm64", windows);
+        Assert.DoesNotContain("Build `TensorSharp.GGML.Native` first", windows);
+
+        string linux = DescribeBridgeLoadFailure("/opt/ts/libGgmlOps.so",
+            new DllNotFoundException("libcublas.so.13: cannot open shared object file"), windows: false, linux: true);
+        Assert.Contains("libcublas.so.13: cannot open shared object file", linux);
+        Assert.Contains("LD_LIBRARY_PATH", linux);
+    }
+
+    [Fact]
+    public void ABridgeForAnotherArchitectureSaysSo()
+    {
+        string message = DescribeBridgeLoadFailure(Path.Combine(Path.GetTempPath(), "GgmlOps.dll"),
+            new BadImageFormatException("An attempt was made to load a program with an incorrect format."), windows: true, linux: false);
+        Assert.Contains("different architecture", message);
+        Assert.Contains(RuntimeInformation.ProcessArchitecture.ToString(), message);
     }
 
     [Fact]

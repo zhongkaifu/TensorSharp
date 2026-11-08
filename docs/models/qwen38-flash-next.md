@@ -2051,6 +2051,61 @@ silently ignoring a value it cannot honour — useful because the automatic
 balance prices weights and cannot see the vision tower, which loads later and
 lands on GPU 0.
 
+## Serving on the direct-CUDA engine
+
+`--backend cuda` keeps each request in a sequence slot of its own (attention and
+indexer caches, GDN and PLE state) and decodes the running slots together, up to 16
+per step. These settings shape it as a server:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `TS_Q4E_SLOT_TOKENS` | `32768` | A slot's initial capacity. It doubles as its sequence grows, up to the context; a slot that cannot grow frees the oldest retained conversation's slot first. `MAX_CONTEXT` keeps bounding each request. |
+| `TS_Q4E_REWIND_CHECKPOINT` | on | Each slot keeps its recurrent states as they were at the end of its last multi-token forward. A next turn that matches the slot only partway into the previous reply (re-rendered reasoning or tool calls) rewinds there and replays the slot's own tokens up to the match; `0` turns it off. |
+| `TS_Q4E_BATCH_GRAPHS` | on | Batched steps (batched decode steps and batched speculative verifies) run as CUDA graphs, one per set of slots, their QSA regimes, rows and head form, captured on a set's third step and at most `TS_Q4E_BATCH_GRAPHS_MAX` (64) of them; `0` issues them kernel by kernel. |
+| `TS_Q4E_PLACEMENT_SLOTS` | `16` | The layer split balances weights plus this many slots' caches, as many as fit; `1` balances for one. |
+| `TS_Q4E_UBATCH` | `512` | Rows per prefill forward. |
+| `TS_Q4E_PERF` | `0` | `1` logs each forward's time; `3` logs each stage's GPU time per step (uncaptured). |
+| `TS_Q4E_PERF_SAMPLE` | `0` | Every Nth forward runs uncaptured with stage timers and records `tensorsharp.engine.stage.duration` per stage, step kind and rows, instead of a log line. With `TS_Q4E_PERF` at `2` or more it is off. |
+
+The scheduler sizes its reservation pool for one context per running sequence for this
+engine (`IBatchedPagedModel.UsesNativeSequenceSlots`), as for DeepSeek V4.1, instead of
+one context in all.
+
+The engine reports its slots and graphs as metrics (`IServingTelemetrySource`, see
+USAGE.md's telemetry section): slots running and retained, their memory and capacity,
+grows and grow failures, retained slots reclaimed for a new slot or for growth, rewinds
+by route (checkpoint, replay, reset, refused) and the tokens replayed, CUDA graph
+captures and launches by kind, and the host time spent issuing forwards versus waiting
+for them. A rising `tensorsharp.slots.reclaims` rate means conversations are evicting
+each other; captures that keep pace with launches mean graphs are not reused.
+
+Measured on 2026-11-07/08 on two H100 NVL 94 GB (`--layer-split 2`, Q8_0, 262,144
+context, ubatch 2048), the server behind a LiteLLM gateway:
+
+- Ten concurrent agent loops of four turns (22K-token system prompts, a tool call and
+  a 1,500-token tool result per turn): 91.0% of later turns' prompt tokens came from
+  cached slots, with first tokens at 3.5 s p50 and 6.3 s at most. With slots that
+  held the whole context from the start (`TS_Q4E_SLOT_TOKENS=262144`) only 7 fit;
+  the agents took each other's retained slots, 24.6% was reused, and later turns'
+  first tokens took 73 s p50 and up to 417 s.
+- One request decodes at 94 tok/s; 16 concurrent 512-token answers at 250 tok/s in
+  all (173 with whole-context slots). Batched-decode graphs added 7-12% at 8-16
+  streams.
+- A 36K-token prompt prefilled at ~3,300 tok/s. The tensor-core MoE kernel now
+  decodes each 128-row weight tile once for up to four 32-token passes; before, a
+  4,096-token chunk's experts (about 80 member tokens each) decoded every tile three
+  times.
+- Per decode step (`TS_Q4E_PERF=3`), one row: hyper-connection mixers 3.8 ms,
+  routed experts 2.4 ms, GDN projections 1.5 ms, shared expert 1.5 ms, router
+  1.2 ms of 13.5 ms uncaptured; four rows 22.6 ms. A step is ~2,000 small kernels
+  and latency-bound.
+
+Greedy answers are byte-identical with each switch on and off. The CUDA tests
+`BatchedDecode_ComputesEverySequencesOwnStep`, `AGrowingSlot_AnswersAsOneThatHeldTheWholeContext`
+and `ARewindFromTheCheckpoint_ContinuesAsTheSequenceThatStoppedThere` cover them on the
+synthetic fixture. The direct engine has no MTP drafter and refuses `--tp`; under a layer
+split one GPU computes at a time.
+
 ## Benchmark matrix
 
 [`benchmark_config_glm53_qwen38.json`](../../benchmarks/engine_comparison/benchmark_config_glm53_qwen38.json)

@@ -10,6 +10,7 @@
 #include "ggml_ops_internal.h"
 #include "ggml_ops_attention_alloc.h"
 #include "ggml_ops_transformer_common.h"
+#include "gemma4_ple_norm.h"
 #include <chrono>
 #include <cstdio>
 
@@ -432,10 +433,8 @@ static int gemma4_model_decode_batched_impl(
                 ple_model_proj_norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ple_dim);
                 ggml_tensor* proj = ggml_mul_mat(ctx, ple_model_proj_t, current);   // [total_ple_dim, N]
                 proj = ggml_scale(ctx, proj, 1.0f / sqrtf(static_cast<float>(hidden_size)));
-                // Per-(seq,layer) RMSNorm over ple_dim: view as [ple_dim, num_layers*N].
-                ggml_tensor* proj_r = ggml_reshape_2d(ctx, ggml_cont(ctx, proj), ple_dim, static_cast<std::int64_t>(num_layers) * n_seqs);
-                proj_r = ggml_mul(ctx, ggml_rms_norm(ctx, proj_r, eps), ple_model_proj_norm_t);
-                proj = ggml_reshape_2d(ctx, proj_r, total_ple_dim, n_seqs);
+                // Per-(seq,layer) RMSNorm over ple_dim, kept 3-D (gemma4_ple_norm.h).
+                proj = tsg_gemma4_ple::proj_norm(ctx, proj, ple_dim, num_layers, ple_model_proj_norm_t, eps);
                 ple_input = ggml_scale(ctx, ggml_add(ctx, proj, ple_tok), 1.0f / sqrtf(2.0f));
             }
             else

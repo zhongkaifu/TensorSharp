@@ -1723,13 +1723,13 @@ TSG_EXPORT int TSGgml_Qwen35AttentionLayerPrefill(
         ggml_tensor* k_3d_raw = ggml_reshape_3d(ctx, ggml_cont(ctx, k_raw), headDim, kvHeads, seqLen);
         ggml_tensor* v_3d_raw = ggml_reshape_3d(ctx, ggml_cont(ctx, v_raw), headDim, kvHeads, seqLen);
 
-        // 4. Per-head Q/K norm. RMSNorm normalizes along ne[0] (head_dim); we
-        // reshape to 2D [head_dim, numHeads*seqLen] so each "row" is one head's
-        // worth of values. Then multiply by the per-dim scale weights.
-        ggml_tensor* q_norm_in = ggml_reshape_2d(ctx, q_cont, headDim, numHeads * seqLen);
-        ggml_tensor* k_norm_in = ggml_reshape_2d(ctx, k_3d_raw, headDim, kvHeads * seqLen);
-        ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_norm_in, eps), q_norm_w);
-        ggml_tensor* k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_norm_in, eps), k_norm_w);
+        // 4. Per-head Q/K norm. RMSNorm normalizes along ne[0] (head_dim), one
+        // head's worth of values per row, then multiplies by the per-dim scale
+        // weights. The rows stay 3-D [head_dim, heads, seqLen]: flattened to
+        // [head_dim, heads * seqLen], ggml-vulkan's RMS_NORM X axis overflows on
+        // long prefill steps (ggml_ops_head_norm.h).
+        ggml_tensor* q_normed = tsg::rms_norm_heads(ctx, q_cont, headDim, numHeads, seqLen, q_norm_w, eps);
+        ggml_tensor* k_normed = tsg::rms_norm_heads(ctx, k_3d_raw, headDim, kvHeads, seqLen, k_norm_w, eps);
 
         // 5. RoPE (NeoX) on Q and K. Reshape back to 4D [head_dim, n_heads, seqLen, 1].
         ggml_tensor* q_4d = ggml_reshape_4d(ctx, q_normed, headDim, numHeads, seqLen, 1);

@@ -48,7 +48,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>Decode steps may be captured: not while stages are timed or the sparse selection or
         /// the router is probed (they read the device mid-step).</summary>
-        private bool CanCaptureDecode => _graphsEnabled && !_graphsFailed && _perf < 2 && SparseProbe == null
+        private bool CanCaptureDecode => _graphsEnabled && !_graphsFailed && _perf < 2 && !_sampling && SparseProbe == null
             && RouterProbe == null;
 
         /// <summary>Captured decode steps this engine holds (tests, diagnostics).</summary>
@@ -86,9 +86,11 @@ namespace TensorSharp.Cuda
                 try
                 {
                     execs = CaptureSteps(dev => IssueDecodeStep(dev, slot, p0));
+                    System.Threading.Interlocked.Increment(ref _tSoloCaptures);
                 }
                 catch (Exception ex)
                 {
+                    System.Threading.Interlocked.Increment(ref _tCaptureFailures);
                     _graphsFailed = true;
                     Console.Error.WriteLine($"[q4e-cuda] decode steps run uncaptured from here on: the capture failed ({ex.Message})");
                     return false;
@@ -98,6 +100,7 @@ namespace TensorSharp.Cuda
 
             LaunchSteps(execs);
             FinishHead(1, logitsOut, false, null);
+            System.Threading.Interlocked.Increment(ref _tSoloLaunches);
             return true;
         }
 
@@ -129,9 +132,11 @@ namespace TensorSharp.Cuda
                 try
                 {
                     execs = CaptureSteps(dev => IssueVerifyStep(dev, slot, p0, nt, greedy));
+                    System.Threading.Interlocked.Increment(ref _tSoloCaptures);
                 }
                 catch (Exception ex)
                 {
+                    System.Threading.Interlocked.Increment(ref _tCaptureFailures);
                     _graphsFailed = true;
                     Console.Error.WriteLine($"[q4e-cuda] decode steps run uncaptured from here on: a verify capture failed ({ex.Message})");
                     return false;
@@ -140,6 +145,7 @@ namespace TensorSharp.Cuda
             }
             LaunchSteps(execs);
             FinishHead(nt, logitsAll, true, hAll, 0, idsOut);
+            System.Threading.Interlocked.Increment(ref _tSoloLaunches);
             return true;
         }
 
@@ -159,8 +165,8 @@ namespace TensorSharp.Cuda
                 if (d < _lastDev)
                     CudaDriverApi.cuEventRecord(dev.XsReadyEv, dev.Stream).ThrowOnError();
             }
-            if (_perf > 0)
-                _issueEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+            // When the host had queued the step: telemetry's issue/wait split, and TS_Q4E_PERF.
+            _issueEnd = System.Diagnostics.Stopwatch.GetTimestamp();
         }
 
         private IntPtr[] CaptureSteps(Action<Dev> issue)
@@ -237,6 +243,8 @@ namespace TensorSharp.Cuda
                 IssueHead(nt, logits: true, allRows: true, hidden: true, greedy: greedy);
         }
 
+        // Batched decode steps and batched verifies are captured in Q4eCudaEngine.BatchGraphs.cs.
+
         private void DestroySlotGraphs(int slotId)
         {
             DestroyBatchGraphs(slotId);
@@ -244,13 +252,12 @@ namespace TensorSharp.Cuda
             foreach (var key in _graphs.Keys)
                 if (key.Slot == slotId)
                     (keys ??= new List<(int, int, int)>()).Add(key);
-            if (keys == null)
-                return;
-            foreach (var key in keys)
-            {
-                DestroyGraphs(_graphs[key]);
-                _graphs.Remove(key);
-            }
+            if (keys != null)
+                foreach (var key in keys)
+                {
+                    DestroyGraphs(_graphs[key]);
+                    _graphs.Remove(key);
+                }
         }
 
         private void DestroyGraphs(IntPtr[] execs)

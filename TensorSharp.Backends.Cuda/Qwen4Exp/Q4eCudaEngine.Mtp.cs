@@ -106,6 +106,23 @@ namespace TensorSharp.Cuda
             _pinnedChain = IntPtr.Zero;
         }
 
+        /// <summary>The MTP block's K/V for a slot, for the whole context (it does not grow with the slot): F16, or
+        /// Q8_0 codes and their scales.</summary>
+        private void AllocKv(Slot slot, Dev dev, SlotLayer c)
+        {
+            long kv = (long)_m.NCtx * _m.NKvHead * _m.HeadDim;
+            if (!_m.KvQ8)
+            {
+                c.KCache = SlotTensor(slot, dev, DType.Float16, kv);
+                c.VCache = SlotTensor(slot, dev, DType.Float16, kv);
+                return;
+            }
+            c.KCache = SlotTensor(slot, dev, DType.UInt8, kv);
+            c.VCache = SlotTensor(slot, dev, DType.UInt8, kv);
+            c.KScale = SlotTensor(slot, dev, DType.Float16, kv / Q4eKernels.KvQ8Block);
+            c.VScale = SlotTensor(slot, dev, DType.Float16, kv / Q4eKernels.KvQ8Block);
+        }
+
         /// <summary>The block's KV for a slot, allocated at its first draft.</summary>
         private void EnsureMtpCache(Slot slot)
         {
@@ -138,6 +155,17 @@ namespace TensorSharp.Cuda
             slot.MtpPast = position;
         }
 
+        // TS_Q4E_MTP_RESUME=0: the block never restarts by itself (Qwen4ExpCudaModel reads the same switch).
+        private static readonly bool s_mtpRestartOnGap = Environment.GetEnvironmentVariable("TS_Q4E_MTP_RESUME") != "0";
+
+        /// <summary>A call that starts past the rows the block holds (positions it never replayed: a rewind gave up the rows
+        /// after it, or a plain step ran) restarts the block there, as a catch-up without hidden rows would.</summary>
+        private static void MtpRestartOnGap(Slot slot, int p0)
+        {
+            if (s_mtpRestartOnGap && p0 > slot.MtpPast)
+                slot.MtpStart = slot.MtpPast = p0;
+        }
+
         /// <summary>The active slot's MTP cache: the first position it holds (its restart) and the end.</summary>
         internal (int Start, int Past) MtpSpan => _active.Mtp == null ? (0, 0) : (_active.MtpStart, _active.MtpPast);
 
@@ -161,6 +189,7 @@ namespace TensorSharp.Cuda
             if (slot.Failed)
                 throw new InvalidOperationException("[q4e-cuda] the sequence's last forward failed; reset it before reuse");
             EnsureMtpCache(slot);
+            MtpRestartOnGap(slot, p0);
             if (p0 < slot.MtpStart || p0 > slot.MtpPast)
                 throw new InvalidOperationException($"[q4e-cuda] the MTP block holds positions {slot.MtpStart}..{slot.MtpPast} and cannot draft from {p0}");
             // The block's cache rows count from its restart (MtpRestart).
@@ -336,6 +365,7 @@ namespace TensorSharp.Cuda
             if (slot.Failed)
                 throw new InvalidOperationException("[q4e-cuda] the sequence's last forward failed; reset it before reuse");
             EnsureMtpCache(slot);
+            MtpRestartOnGap(slot, p0);
             if (p0 < slot.MtpStart || p0 > slot.MtpPast)
                 throw new InvalidOperationException($"[q4e-cuda] the MTP block holds positions {slot.MtpStart}..{slot.MtpPast} and cannot draft from {p0}");
             // The block's cache rows count from its restart (MtpRestart).

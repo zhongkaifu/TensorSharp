@@ -19,6 +19,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Paged;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 using TensorSharp.Runtime.Telemetry;
 
 namespace InferenceWeb.Tests.Telemetry;
@@ -310,6 +311,278 @@ public sealed class EngineTelemetryTests
         // The first step forwards prompts only.
         Assert.Equal("prefill", durations.First().Kind);
     }
+
+    // ---------------------------------------------------------------- serving signals
+
+    private const string InterToken = "tensorsharp.engine.inter_token.duration";
+    private const string StepPrefillTokens = "tensorsharp.engine.step.prefill_tokens";
+    private const string PrefixLookups = "tensorsharp.prefix_cache.lookups";
+
+    private static readonly object[] MissSources =
+        { "none", "shared_prefix", "rewind", "breakpoints", "live_cache", "retained_state", "pages", "other" };
+    private static readonly object[] HitSources = { "end_state", "primary", "pages", "batched_end_state" };
+
+    [Fact]
+    public async Task EachOutputTokenAfterASequencesFirstRecordsTheTimeSinceTheOneBefore()
+    {
+        string architecture = EngineTestSupport.NewArchitecture();
+        using var readings = new Readings(architecture, InterToken);
+
+        var engine = EngineTestSupport.NewEngine(architecture);
+        try
+        {
+            await Task.WhenAll(
+                EngineTestSupport.RunToCompletion(engine, EngineTestSupport.NewSequence("five", promptLen: 6, maxNew: 5)),
+                EngineTestSupport.RunToCompletion(engine, EngineTestSupport.NewSequence("three", promptLen: 9, maxNew: 3)));
+        }
+        finally
+        {
+            engine.Dispose();
+        }
+
+        // 4 gaps after the first of five tokens, 2 after the first of three. A first token has
+        // no gap, so no gap ends in a prompt-only step.
+        var gaps = readings.Of(InterToken);
+        Assert.Equal(6, gaps.Count);
+        Assert.All(gaps, g =>
+        {
+            Assert.True(g.Value >= 0);
+            Assert.Contains(g.Tags[TelemetryAttributes.StepKind], new object[] { "decode", "mixed" });
+        });
+    }
+
+    [Fact]
+    public async Task AGapEndedByAStepThatAlsoPrefillsAnotherPromptIsTaggedMixed()
+    {
+        string architecture = EngineTestSupport.NewArchitecture();
+        using var readings = new Readings(architecture, InterToken);
+
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        // A batched model runs every sequence a step schedules, as the serving engines do.
+        var engine = EngineTestSupport.NewBatchedEngine(architecture, entered, release, holdAtForward: 3);
+        try
+        {
+            // The first request's third step (its prompt, then its first and second tokens) is
+            // held; the second request arrives meanwhile, so the next step decodes the first
+            // beside the second one's prompt.
+            var decoding = engine.SubmitRequest(EngineTestSupport.NewSequence("decoding", promptLen: 6, maxNew: 6));
+            Task<InferenceCompletion> arriving;
+            try
+            {
+                Assert.True(entered.Wait(TimeSpan.FromSeconds(10)), "The first request never reached the model.");
+                arriving = EngineTestSupport.RunToCompletion(engine, EngineTestSupport.NewSequence("arriving", promptLen: 30, maxNew: 2));
+            }
+            finally
+            {
+                release.Set();
+            }
+            await Task.WhenAll(decoding.Completion.WaitAsync(TimeSpan.FromSeconds(30)), arriving);
+        }
+        finally
+        {
+            engine.Dispose();
+        }
+
+        var kinds = readings.Of(InterToken).Select(g => g.Tags[TelemetryAttributes.StepKind] as string).ToList();
+        string seen = string.Join(",", kinds);
+        Assert.True(kinds.Contains("mixed"), $"no gap ended in a mixed step: {seen}");
+        Assert.True(kinds.Contains("decode"), $"no gap ended in a decode step: {seen}");
+        Assert.DoesNotContain("prefill", kinds);
+    }
+
+    [Fact]
+    public async Task EveryPromptTokenAStepForwardsIsCountedOnThatStep()
+    {
+        string architecture = EngineTestSupport.NewArchitecture();
+        using var readings = new Readings(architecture, StepPrefillTokens);
+
+        // A lone prompt in steps of up to 32 tokens: more than one prefill step.
+        var engine = EngineTestSupport.NewEngine(architecture, config: EngineTestSupport.EngineConfig(soloPrefillChunk: 32));
+        try
+        {
+            await EngineTestSupport.RunToCompletion(engine, EngineTestSupport.NewSequence("long", promptLen: 100, maxNew: 3));
+        }
+        finally
+        {
+            engine.Dispose();
+        }
+
+        var steps = readings.Of(StepPrefillTokens);
+        Assert.True(steps.Count >= 3, $"{steps.Count} prefill step(s) for a 100-token prompt in 32-token steps");
+        Assert.Equal(100, steps.Sum(s => s.Value));
+        Assert.All(steps, s =>
+        {
+            Assert.InRange(s.Value, 1, 64);
+            Assert.Contains(s.Tags[TelemetryAttributes.StepKind], new object[] { "prefill", "mixed" });
+        });
+    }
+
+    [Fact]
+    public async Task EachAdmissionCountsOnePrefixLookupByOutcomeAndSource()
+    {
+        string architecture = EngineTestSupport.NewArchitecture();
+        using var readings = new Readings(architecture, PrefixLookups);
+
+        var engine = EngineTestSupport.NewPrefixCachingEngine(architecture);
+        try
+        {
+            // The same 40-token prompt twice: the second turn finds the first one's prefix.
+            var first = await EngineTestSupport.RunToCompletion(engine,
+                EngineTestSupport.NewSequence("first", promptLen: 40, maxNew: 3, cacheScope: "conversation"));
+            Assert.Equal(0, first.PrefixCacheReusedTokens);
+            var second = await EngineTestSupport.RunToCompletion(engine,
+                EngineTestSupport.NewSequence("second", promptLen: 40, maxNew: 3, cacheScope: "conversation"));
+            Assert.True(second.PrefixCacheReusedTokens > 0, "The second turn reused the first one's prefix.");
+        }
+        finally
+        {
+            engine.Dispose();
+        }
+
+        var lookups = readings.Of(PrefixLookups);
+        Assert.Equal(2, lookups.Count);
+        Assert.All(lookups, l => Assert.Equal(1, l.Value));
+        Assert.Equal("miss", lookups[0].Tags[TelemetryAttributes.PrefixCacheOutcome]);
+        Assert.Contains(lookups[0].Tags[TelemetryAttributes.PrefixCacheSource], MissSources);
+        Assert.Contains(lookups[1].Tags[TelemetryAttributes.PrefixCacheOutcome], new object[] { "full", "partial" });
+        Assert.Contains(lookups[1].Tags[TelemetryAttributes.PrefixCacheSource], HitSources);
+    }
+
+    [Theory]
+    [InlineData("radix end state", "end_state")]
+    [InlineData("radix primary cache", "primary")]
+    [InlineData("radix pages", "pages")]
+    [InlineData("radix batched end state", "batched_end_state")]
+    [InlineData(null, "unknown")]
+    [InlineData("something new", "other")]
+    public void APrefixSourceMapsToAFixedValue(string? source, string expected) =>
+        Assert.Equal(expected, ContinuousBatchScheduler.PrefixSourceCode(source));
+
+    [Theory]
+    [InlineData(null, "none")]
+    [InlineData("", "none")]
+    [InlineData("no resumable radix prefix", "none")]
+    [InlineData("the prompt leaves every cached prefix at token 12, inside its 40-token shared prefix", "shared_prefix")]
+    [InlineData("rewinding the cached conversation is declined by the model", "rewind")]
+    [InlineData("the live cache is not continued for a request with explicit cache breakpoints", "breakpoints")]
+    [InlineData("the live cache belongs to another conversation", "live_cache")]
+    [InlineData("the retained state is cut short by a clamp", "retained_state")]
+    [InlineData("the cached pages is too short to clone", "pages")]
+    [InlineData("no reason anyone wrote down yet", "other")]
+    public void AMissReasonMapsToAFixedValue(string? why, string expected) =>
+        Assert.Equal(expected, ContinuousBatchScheduler.PrefixDeclineCode(why));
+
+    [Fact]
+    public void AModelWithSequenceSlotsReportsItsCountersWhileItsEngineLives()
+    {
+        string architecture = EngineTestSupport.NewArchitecture();
+        string plain = EngineTestSupport.NewArchitecture();
+        using var readings = new Readings(architecture,
+            "tensorsharp.slots", "tensorsharp.slots.memory", "tensorsharp.slots.rewinds",
+            "tensorsharp.cuda_graph.launches", "tensorsharp.engine.forward.issue_time");
+        using var plainReadings = new Readings(plain, "tensorsharp.slots", "tensorsharp.cuda_graph.launches");
+
+        var snapshot = new ServingTelemetrySnapshot
+        {
+            RunningSlots = 3,
+            RetainedSlots = 2,
+            SlotBytes = 5L << 30,
+            RewindsToCheckpoint = 7,
+            RewindsWithReplay = 2,
+            RewindsToZero = 1,
+            SoloGraphLaunches = 40,
+            BatchedGraphLaunches = 400,
+            ForwardIssueSeconds = 1.5,
+        };
+        bool broken = false;
+        using var withoutSlots = EngineTestSupport.NewEngine(plain);
+        var engine = EngineTestSupport.NewServingEngine(architecture,
+            () => broken ? throw new InvalidOperationException("A failing read must not break the collection.") : snapshot);
+        try
+        {
+            var live = readings.Collect();
+            double Value(string instrument, string? key = null, string? value = null) =>
+                Assert.Single(live, r => r.Instrument == instrument
+                    && (key == null ? r.Tags.Count == 1 : Equals(r.Tags.GetValueOrDefault(key), value))).Value;
+
+            Assert.Equal(3, Value("tensorsharp.slots", TelemetryAttributes.SlotState, "running"));
+            Assert.Equal(2, Value("tensorsharp.slots", TelemetryAttributes.SlotState, "retained"));
+            Assert.Equal(5L << 30, Value("tensorsharp.slots.memory"));
+            Assert.Equal(7, Value("tensorsharp.slots.rewinds", TelemetryAttributes.RewindRoute, "checkpoint"));
+            Assert.Equal(2, Value("tensorsharp.slots.rewinds", TelemetryAttributes.RewindRoute, "replay"));
+            Assert.Equal(1, Value("tensorsharp.slots.rewinds", TelemetryAttributes.RewindRoute, "reset"));
+            Assert.Equal(0, Value("tensorsharp.slots.rewinds", TelemetryAttributes.RewindRoute, "refused"));
+            Assert.Equal(40, Value("tensorsharp.cuda_graph.launches", TelemetryAttributes.GraphKind, "solo"));
+            Assert.Equal(400, Value("tensorsharp.cuda_graph.launches", TelemetryAttributes.GraphKind, "batched"));
+            Assert.Equal(1.5, Value("tensorsharp.engine.forward.issue_time"));
+
+            // A model without slots of its own reports none of them.
+            Assert.Empty(plainReadings.Collect());
+
+            // A read that throws leaves that engine out of the collection, which still completes.
+            broken = true;
+            Assert.Empty(readings.Collect());
+            broken = false;
+            snapshot = snapshot with { RunningSlots = 4 };
+            Assert.Equal(4, Assert.Single(readings.Collect(),
+                r => r.Instrument == "tensorsharp.slots" && Equals(r.Tags[TelemetryAttributes.SlotState], "running")).Value);
+        }
+        finally
+        {
+            engine.Dispose();
+        }
+
+        // A disposed engine stops reporting them.
+        Assert.Empty(readings.Collect());
+    }
+
+    /// <summary>Every measurement the named instruments make for one architecture, with its tags.</summary>
+    private sealed class Readings : IDisposable
+    {
+        private readonly MeterListener _listener;
+        private readonly string _architecture;
+        private readonly ConcurrentQueue<(string Instrument, double Value, Dictionary<string, object?> Tags)> _all = new();
+
+        public Readings(string architecture, params string[] instruments)
+        {
+            _architecture = architecture;
+            TensorSharpMetrics.EnsureInitialized();
+            _listener = new MeterListener
+            {
+                InstrumentPublished = (instrument, listener) =>
+                {
+                    if (instrument.Meter.Name == TensorSharpTelemetry.MeterName && instruments.Contains(instrument.Name))
+                        listener.EnableMeasurementEvents(instrument);
+                },
+            };
+            _listener.SetMeasurementEventCallback<double>((i, v, tags, _) => Add(i, v, tags));
+            _listener.SetMeasurementEventCallback<long>((i, v, tags, _) => Add(i, v, tags));
+            _listener.SetMeasurementEventCallback<int>((i, v, tags, _) => Add(i, v, tags));
+            _listener.Start();
+        }
+
+        private void Add(Instrument instrument, double value, ReadOnlySpan<KeyValuePair<string, object?>> tags)
+        {
+            var map = new Dictionary<string, object?>(StringComparer.Ordinal);
+            foreach (var tag in tags) map[tag.Key] = tag.Value;
+            if (Equals(map.GetValueOrDefault(TelemetryAttributes.ModelArchitecture), _architecture))
+                _all.Enqueue((instrument.Name, value, map));
+        }
+
+        public List<(string Instrument, double Value, Dictionary<string, object?> Tags)> Of(string instrument) =>
+            _all.Where(r => r.Instrument == instrument).ToList();
+
+        /// <summary>One collection of the observable instruments, as an exporter's would be.</summary>
+        public List<(string Instrument, double Value, Dictionary<string, object?> Tags)> Collect()
+        {
+            _all.Clear();
+            _listener.RecordObservableInstruments();
+            return _all.ToList();
+        }
+
+        public void Dispose() => _listener.Dispose();
+    }
 }
 
 /// <summary>
@@ -431,8 +704,25 @@ file static class EngineTestSupport
     public static string NewArchitecture() => "telemetry-test-" + Guid.NewGuid().ToString("N")[..8];
 
     public static InferenceEngine NewEngine(string architecture,
-        ManualResetEventSlim? forwardEntered = null, ManualResetEventSlim? releaseForward = null) =>
-        new(new StubModel(architecture, peakToken: 7, forwardEntered, releaseForward), EngineConfig(), NullLogger.Instance);
+        ManualResetEventSlim? forwardEntered = null, ManualResetEventSlim? releaseForward = null,
+        SchedulerConfig? config = null) =>
+        new(new StubModel(architecture, peakToken: 7, forwardEntered, releaseForward), config ?? EngineConfig(), NullLogger.Instance);
+
+    /// <summary>An engine over a batched model, which forwards every sequence a step schedules
+    /// together (a single-sequence model runs one of them per step).</summary>
+    public static InferenceEngine NewBatchedEngine(string architecture,
+        ManualResetEventSlim forwardEntered, ManualResetEventSlim releaseForward, int holdAtForward) =>
+        new(new BatchedStubModel(architecture, forwardEntered, releaseForward, holdAtForward), EngineConfig(), NullLogger.Instance);
+
+    /// <summary>An engine whose model keeps prompt pages in the radix prefix cache, so a later
+    /// request in the same conversation scope can reuse an earlier one's prefix.</summary>
+    public static InferenceEngine NewPrefixCachingEngine(string architecture) =>
+        new(new PrefixCachingStubModel(architecture), EngineConfig(), NullLogger.Instance);
+
+    /// <summary>An engine whose model reports slot and graph counters, as a model with
+    /// sequence slots of its own does.</summary>
+    public static InferenceEngine NewServingEngine(string architecture, Func<ServingTelemetrySnapshot> snapshot) =>
+        new(new ServingStubModel(architecture, snapshot), EngineConfig(), NullLogger.Instance);
 
     public static async Task<InferenceCompletion> RunToCompletion(InferenceEngine engine, SequenceState seq)
     {
@@ -440,8 +730,9 @@ file static class EngineTestSupport
         return await handle.Completion.WaitAsync(TimeSpan.FromSeconds(30));
     }
 
-    public static SequenceState NewSequence(string id, int promptLen, int maxNew) =>
-        new(id + "-" + Guid.NewGuid().ToString("N")[..6], Enumerable.Range(1, promptLen).ToList(), maxNew, BlockSize, SamplingConfig.Default);
+    public static SequenceState NewSequence(string id, int promptLen, int maxNew, string? cacheScope = null) =>
+        new(id + "-" + Guid.NewGuid().ToString("N")[..6], Enumerable.Range(1, promptLen).ToList(), maxNew, BlockSize,
+            SamplingConfig.Default, cacheScope: cacheScope);
 
     public static BlockPool NewPool(int numBlocks)
     {
@@ -449,17 +740,22 @@ file static class EngineTestSupport
         return new BlockPool(numBlocks, BlockSize, blockBytes);
     }
 
-    /// <summary>The engine settings ContinuousBatchSchedulerTests drives its stub with.</summary>
-    private static SchedulerConfig EngineConfig() => new()
+    /// <summary>The engine settings ContinuousBatchSchedulerTests drives its stub with,
+    /// optionally with a lone prompt's step capped.</summary>
+    public static SchedulerConfig EngineConfig(int soloPrefillChunk = 0)
     {
-        MaxNumBatchedTokens = 256,
-        MaxNumRunningSequences = 8,
-        MaxPrefillChunkSize = 64,
-        NumBlocks = 16,
-        BlockSize = BlockSize,
-        EnablePrefixCaching = true,
-        DecodeQuantumTokens = BlockSize,
-    };
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 256,
+            MaxNumRunningSequences = 8,
+            MaxPrefillChunkSize = 64,
+            NumBlocks = 16,
+            BlockSize = BlockSize,
+            EnablePrefixCaching = true,
+            DecodeQuantumTokens = BlockSize,
+        };
+        return soloPrefillChunk > 0 ? cfg.WithSoloPrefillChunkSize(soloPrefillChunk) : cfg;
+    }
 
     /// <summary>A scheduler on its own, without the radix cache an engine attaches.</summary>
     public static SchedulerConfig SchedulerOnlyConfig(int numBlocks, int maxRunning = 4) => new()
@@ -489,7 +785,7 @@ file static class EngineTestSupport
     /// with no EOS: a request runs to its token limit. Optionally holds every forward until
     /// released, so a test can act while a request is in flight.
     /// </summary>
-    private sealed class StubModel : IModelArchitecture
+    private class StubModel : IModelArchitecture
     {
         private readonly int _peak;
         private readonly ManualResetEventSlim? _forwardEntered;
@@ -515,11 +811,16 @@ file static class EngineTestSupport
         public bool SupportsKVStateSnapshot => true;
         public string KVStateFingerprint { get; }
 
-        public float[] Forward(int[] tokens)
+        protected void HoldIfAsked()
         {
             _forwardEntered?.Set();
             if (_releaseForward != null && !_releaseForward.Wait(TimeSpan.FromSeconds(10)))
                 throw new TimeoutException("The test did not release the held forward.");
+        }
+
+        public float[] Forward(int[] tokens)
+        {
+            HoldIfAsked();
 
             int newCount = _cacheSeqLen + tokens.Length;
             long needed = ComputeKVBlockByteSize(newCount);
@@ -590,5 +891,56 @@ file static class EngineTestSupport
             public bool IsEos(int tokenId) => false;
             public int LookupToken(string tokenStr) => -1;
         }
+    }
+
+    private sealed class BatchedStubModel : StubModel, IBatchedPagedModel
+    {
+        private readonly int _holdAt;
+        private int _forwards;
+
+        public BatchedStubModel(string architecture, ManualResetEventSlim forwardEntered, ManualResetEventSlim releaseForward, int holdAt)
+            : base(architecture, peakToken: 7, forwardEntered, releaseForward) => _holdAt = holdAt;
+
+        public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
+        {
+            if (++_forwards == _holdAt)
+                HoldIfAsked();
+            var logits = new float[ctx.Sequences.Count][];
+            for (int i = 0; i < logits.Length; i++)
+            {
+                logits[i] = new float[VocabSize];
+                logits[i][7] = 10.0f;
+            }
+            return logits;
+        }
+    }
+
+    private sealed class PrefixCachingStubModel : StubModel, IPageOnlyPrefixCacheModel
+    {
+        public PrefixCachingStubModel(string architecture)
+            : base(architecture, peakToken: 7, forwardEntered: null, releaseForward: null) { }
+
+        public PrefixCacheCapabilities GetPrefixCacheCapabilities() => new()
+        {
+            Class = FamilyClass.P,
+            NamespaceFingerprint = KVStateFingerprint,
+            EndState = EndStateSupport.None,
+            PrimaryResident = true,
+            Truncation = TruncationKind.Any,
+            RewindCapTokens = 16,
+            Pages = PageSupport.A1HostSlab,
+        };
+
+        public long QuerySpareBytes(ResourceClass cls) => -1;
+    }
+
+    private sealed class ServingStubModel : StubModel, IServingTelemetrySource
+    {
+        private readonly Func<ServingTelemetrySnapshot> _snapshot;
+
+        public ServingStubModel(string architecture, Func<ServingTelemetrySnapshot> snapshot)
+            : base(architecture, peakToken: 7, forwardEntered: null, releaseForward: null) => _snapshot = snapshot;
+
+        public ServingTelemetrySnapshot ReadServingTelemetry() => _snapshot();
     }
 }

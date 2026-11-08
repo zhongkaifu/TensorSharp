@@ -1709,6 +1709,104 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             Assert.Equal(plain[i], captured[i]);
     }
 
+    /// <summary>A slot that starts small and grows (prefill chunks, then decode steps past its
+    /// capacity, its captured graphs rebuilt each time) answers bit for bit as a slot that held the
+    /// whole context from the start.</summary>
+    [CudaFact]
+    public void AGrowingSlot_AnswersAsOneThatHeldTheWholeContext()
+    {
+        string path = Fixture();
+        int[] tokens = Enumerable.Range(0, 16).Select(i => Steps[i % Steps.Length] + i).ToArray();
+        float[][] Sequence(Qwen4ExpCudaExecutor ex)
+        {
+            var rows = new List<float[]> { Step(ex, Prompt[..24]), Step(ex, Prompt[24..40]) };
+            rows.AddRange(tokens.Select(t => Step(ex, new[] { t })));
+            return rows.ToArray();
+        }
+
+        float[][] whole;
+        using (var ex = OpenExecutor(path))
+        {
+            whole = Sequence(ex);
+            Assert.Equal(0, ex.ReadTelemetry().Grows);
+        }
+        _env.Set("TS_Q4E_SLOT_TOKENS", "8");
+        float[][] grown;
+        using (var ex = OpenExecutor(path))
+        {
+            grown = Sequence(ex);
+            // 8 positions grew to hold the 56 it forwarded: counted, with no failure.
+            var counters = ex.ReadTelemetry();
+            Assert.InRange(counters.Grows, 1, 64);
+            Assert.Equal(0, counters.GrowFailures);
+            Assert.True(counters.SlotCapacityTokens >= 56, $"{counters.SlotCapacityTokens} positions held");
+            Assert.True(counters.SlotBytes > 0);
+        }
+        Assert.Equal(whole.Length, grown.Length);
+        for (int i = 0; i < whole.Length; i++)
+            Assert.Equal(whole[i], grown[i]);
+    }
+
+    /// <summary>A slot rewinds to its prompt-boundary checkpoint, or past it by replaying its own
+    /// tokens, and continues exactly as a slot that never went further: the checkpoint is the
+    /// recurrent states at the end of the last multi-token forward, and the attention rows below the
+    /// head still hold their positions. Positions below the checkpoint stay refused.</summary>
+    [CudaFact]
+    public void ARewindFromTheCheckpoint_ContinuesAsTheSequenceThatStoppedThere()
+    {
+        using var ex = OpenExecutor(Fixture());
+        int[] next = Prompt[24..31];
+        int[] reply = Steps[..4];
+
+        // The reference: the prompt, two of the reply's tokens forwarded as one chunk, the rest.
+        int reference = NewActiveSlot(ex);
+        Step(ex, Prompt[..24]);
+        float[] wantAtBoundary = Step(ex, next);
+        int replayed = NewActiveSlot(ex);
+        Step(ex, Prompt[..24]);
+        Step(ex, reply[..2]);
+        float[] wantAfterReplay = Step(ex, next);
+
+        // The slot under test: the prompt (a checkpoint at 24), then the reply decoded token by token.
+        int slot = NewActiveSlot(ex);
+        Step(ex, Prompt[..24]);
+        foreach (int t in reply)
+            Step(ex, new[] { t });
+        Assert.True(ex.CanRewind(slot, 28, 24));
+        Assert.True(ex.CanRewind(slot, 28, 26));
+        Assert.False(ex.CanRewind(slot, 28, 23));
+        Assert.False(ex.CanRewind(slot, 27, 24));   // not the slot's head
+
+        var before = ex.ReadTelemetry();
+        Assert.True(ex.Rewind(24));
+        Assert.Equal(24, ex.NPast);
+        Assert.Equal(wantAtBoundary, Step(ex, next));
+        var atCheckpoint = ex.ReadTelemetry();
+        Assert.Equal(before.RewindsToCheckpoint + 1, atCheckpoint.RewindsToCheckpoint);
+        Assert.Equal(before.ReplayedTokens, atCheckpoint.ReplayedTokens);
+
+        // That chunk moved the checkpoint to 24 + next.Length; go back to it, then nothing earlier.
+        int head = 24 + next.Length;
+        Assert.False(ex.Rewind(24));
+        Assert.Equal(head, ex.NPast);
+        Assert.Equal(atCheckpoint.RewindsRefused + 1, ex.ReadTelemetry().RewindsRefused);
+
+        // Past the checkpoint: a second slot replays two of the reply's tokens.
+        int second = NewActiveSlot(ex);
+        Step(ex, Prompt[..24]);
+        foreach (int t in reply)
+            Step(ex, new[] { t });
+        var beforeReplay = ex.ReadTelemetry();
+        Assert.True(ex.Rewind(26));
+        Assert.Equal(26, ex.NPast);
+        Assert.Equal(wantAfterReplay, Step(ex, next));
+        var afterReplay = ex.ReadTelemetry();
+        Assert.Equal(beforeReplay.RewindsWithReplay + 1, afterReplay.RewindsWithReplay);
+        Assert.Equal(beforeReplay.ReplayedTokens + 2, afterReplay.ReplayedTokens);
+        Assert.Equal(beforeReplay.RewindsToCheckpoint, afterReplay.RewindsToCheckpoint);
+        _ = reference; _ = replayed; _ = second;
+    }
+
     /// <summary>A batched decode step computes each sequence's row exactly as that sequence's own step
     /// does, over several steps, with the rows at different positions on both sides of the QSA
     /// width.</summary>
@@ -1740,6 +1838,18 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
                 Assert.Equal(want, rows.AsSpan(i * ex.VocabSize, ex.VocabSize).ToArray());
             }
         }
+        // The steps ran as captured graphs (one per set of rows and their QSA regimes), and freeing a
+        // slot drops the graphs holding it.
+        int graphs = ex.Engine.CapturedBatchedDecodeGraphs;
+        Assert.True(graphs > 0);
+        // The batched steps launched captured graphs, and the counters saw every capture.
+        var counters = ex.ReadTelemetry();
+        Assert.True(counters.BatchedGraphCaptures >= graphs, $"{counters.BatchedGraphCaptures} captures, {graphs} graphs");
+        Assert.InRange(counters.BatchedGraphLaunches, 1, steps);
+        Assert.Equal(0, counters.GraphCaptureFailures);
+        Assert.True(counters.ForwardIssueSeconds > 0);
+        Assert.True(ex.SlotFree(batched[0]));
+        Assert.True(ex.Engine.CapturedBatchedDecodeGraphs < graphs);
     }
 
     /// <summary>A batched verify (several sequences' draft windows in one forward, Q4eCudaEngine.ForwardBatchedVerify) computes

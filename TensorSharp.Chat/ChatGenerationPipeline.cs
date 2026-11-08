@@ -1132,6 +1132,8 @@ namespace TensorSharp.Server
                     // set before the token loop is only a default.
                     requestTelemetry.RecordUsage(promptTokenCount, generatedTokens?.Count ?? 0, kvCacheReusedTokens,
                         generationEndUtc.HasValue ? finishReason : null, seq.FirstTokenAt, endUtc);
+                    requestTelemetry.RecordThroughput(promptTokenCount, kvCacheReusedTokens, generatedTokens?.Count ?? 0,
+                        seq.FirstScheduledAt, seq.FirstTokenAt, endUtc);
                 }
                 if (wasCancelled)
                     requestTelemetry.MarkCancelled();

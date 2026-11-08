@@ -510,7 +510,7 @@ The generation code in Chat cannot see the `HttpContext`, and Chat cannot refere
 | `chat <model>` for Jev | `ModelService.JevAsync` → `TraceJevAsync` | `POST /v1/systemone` drives DiffusionGemma through `JevInference.Run` and bypasses the pipeline. The span starts before the execution gate, so queueing counts. Usage comes from a callback with the same totals as the response. Refusals: `invalid_request`, `model_not_found`, `model_unavailable`, `queue_full`. |
 | `execute_tool <name>` | `SkillChatLoop.ExecuteSkillCallsAsync`, one per host tool call | Started and stopped **inside** the `Task.Run` worker with no `yield` in between, so it is `Activity.Current` for exactly the tool's work and `codeexec.run` nests under it. Its parent is what the request had current (Task.Run carries the context), so it is a sibling of the round's chat span. `gen_ai.operation.name`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `tensorsharp.round`, `tensorsharp.skill.id`, `tensorsharp.tool.result_bytes`; arguments and result only with capture on. A tool that reports failure is `failed` with `error.type=tool_error`; only an exception sets Error status. |
 | `codeexec.run` | `ShellRunner.Run`, after the early refusals that run nothing | Implicit parent (the current `execute_tool`). `tensorsharp.codeexec.shell`, `.sandbox`, `.timed_out`, `.installs`, `.output_bytes`, `.background`, and `.exit_code` only when the command started and was not killed. A command that never started is Error with `error.type=not_started`; a non-zero exit is the model's code failing, which is the tool working, so it is not an error. The command text only with capture on. |
-| `generate_image <model>` | `WebUiChatService`, plain and streaming image routes | One per request (`tensorsharp.media.kind=image`, `tensorsharp.image.mode` = `generate` or `edit`). The first outcome marked is kept. Refusals: `invalid_request`, `upload_quota_exceeded`, `payload_too_large`, `not_an_image_model`. No phase spans (Qwen-Image reports only steps) and no prompt, even with capture on. |
+| `generate_image <model>` | `ImageGenerationTelemetry`, from `WebUiChatService`'s plain and streaming image routes and the CLI | One per picture (`tensorsharp.media.kind=image`, `tensorsharp.image.mode` = `generate` or `edit`). Once the request is read: `tensorsharp.image.width`, `.height`, `.steps` and `.cfg` when it sets them, `.seed`, and `.references` for an edit. When the picture is made, the size and step count it was made with replace the requested ones. The first outcome marked is kept. Refusals: `invalid_request`, `upload_quota_exceeded`, `payload_too_large`, `not_an_image_model`. No phase spans (Qwen-Image reports only steps). The prompt only with capture on (§7.7). In the CLI the picture is the root of its own trace. |
 | `generate_video <model>` | §8 | |
 | outgoing HTTP | `AddHttpClientInstrumentation` | Startup downloads are not traced (§3.3). |
 
@@ -597,6 +597,11 @@ latency in one bucket.
 | `tensorsharp.engine.step.duration` | histogram, s (0.001 … 5.12) | per step that ran, `tensorsharp.engine.step_kind` |
 | `tensorsharp.engine.batch.size` | histogram, `{sequence}` (1 … 256) | `ScheduledWork.Count`, `tensorsharp.engine.step_kind` |
 | `tensorsharp.speculative.tokens.drafted`, `.accepted` | counter, `{token}` | the `SpeculationStats` increment sites (below) |
+| `tensorsharp.engine.step.prefill_tokens` | histogram, `{token}` (16 … 65536) | per step with prompt work: the `IsPrefill` work items' `NumScheduledTokens`, `tensorsharp.engine.step_kind` |
+| `tensorsharp.engine.inter_token.duration` | histogram, s (0.005 … 30) | per output token after a sequence's first: the time since `SequenceState.LastTokenTimestamp`, a multi-token step's time split evenly, `tensorsharp.engine.step_kind` of the step that emitted it |
+| `tensorsharp.prefix_cache.lookups` | counter, `{lookup}` | the scheduler's "Radix prompt reuse" admission log site, `tensorsharp.prefix_cache.outcome` and `.source` |
+| `tensorsharp.engine.stage.duration` | histogram, s (0.0001 … 1.024) | the direct-CUDA Qwen 3.8 engine's sampled forwards (`TS_Q4E_PERF_SAMPLE`), `tensorsharp.engine.stage`, `.step_kind`, `.rows` |
+| `tensorsharp.slots*`, `tensorsharp.cuda_graph.*`, `tensorsharp.engine.forward.issue_time`, `.wait_time` | observable gauges and counters | `IServingTelemetrySource.ReadServingTelemetry()` of a registered engine's model |
 
 All carry `tensorsharp.model.architecture`.
 
@@ -615,6 +620,19 @@ All carry `tensorsharp.model.architecture`.
   `KeyValuePair` fields, so a step allocates nothing, and the recording returns early unless one of the two
   instruments is enabled. Every waiting-queue admission is marked `IsPrefill`, including the one-token forward after
   a full prefix-cache hit, so those steps are `prefill` or `mixed`.
+- **Serving signals.** The prefill-token histogram is recorded with the step histograms and returns early the same
+  way. The inter-token histogram is recorded after the step from its results, before they are applied, so a sequence
+  that finishes in the step still gets its last gap. It has no stall counter for decodes a step leaves out: the
+  scheduler gives every decoding sequence its token before any prompt work, so under prompt traffic the cost shows as
+  `mixed` inter-token values, not as skipped decodes. The prefix outcome maps the coordinator's `LastSource`
+  and decline reason to fixed values (`PrefixSourceCode`, `PrefixDeclineCode`), never the reason's text, which
+  holds token counts.
+- **Slot-keeping models.** A model that keeps per-sequence slots in its own engine implements
+  `IServingTelemetrySource`; the observable callbacks read it for every registered engine on the collection thread.
+  The read is lock-free: the engine's counters are `Interlocked` fields, and the model reads its slot tables'
+  `Count` without its lock, which a forward holds for the whole step (a `TryEnter` would never see a running slot
+  under load). A read that throws drops that engine from that collection.
+  These are per engine and start again after a reload, unlike the step totals.
 - **Speculation.** The counters are added at the two places that add to `SpeculationStats`
   (`SpeculativeExecution.DecodeStep` and `CommitBatch`), with a tag cached per execution. That covers the CLI's
   standalone speculative decoder too, and work done before a preemption re-arms a new execution is not lost.
@@ -771,7 +789,8 @@ as a provider rule with no category (so ASP.NET Core stays at Warning under it).
 
 Many log lines carry prompts, model output, upload names, paths and URLs, tool arguments and commands. In a local
 file the operator owns that is fine; sending it to a collector or Application Insights is a different decision, and the
-Azure Monitor exporter silently truncates long values anyway (a message at 32,768 characters, an attribute at 8,192).
+Azure Monitor exporter silently truncates long values anyway (a message at 32,768 characters, an attribute at 8,192;
+the captured chat messages of §7.7 have limits of their own).
 
 **Why not a list of key names.** Names do not say what a value is. `{Prompt}` is a prompt in one line and a token
 count in another (`BatchExecutor`, `ContinuousBatchScheduler`, `CliInferenceSession`); `{Path}` is an HTTP route in the
@@ -867,13 +886,19 @@ With it on:
 - the chat span gets `gen_ai.input.messages` (the history the prompt was rendered from, after compaction) and
   `gen_ai.output.messages`, as JSON strings `[{"role":…,"content":…}]` (the JSON-string form the v1.41.0 conventions
   allow on spans), cut to 64K characters per attribute: a history keeps its newest messages, an answer its beginning.
-  The JSON is built only when the span is recorded, and a failure returns nothing rather than throw;
-- `generate_video` gets `tensorsharp.video.prompt`, `execute_tool` gets `tensorsharp.tool.arguments` and
-  `tensorsharp.tool.result`, `codeexec.run` gets `tensorsharp.codeexec.command`.
+  The JSON is built only when the span is recorded, and a failure returns nothing rather than throw. The 64K counts
+  message text, before the JSON adds quotes and escapes. The Azure Monitor exporter lets these two attributes through
+  up to 262,144 characters (exporter 1.10.0's `GenAi_Properties_MaxValueLength`, not the 8,192 of other attributes),
+  but Application Insights kept them whole only up to about 64,700 characters of JSON and stored a longer value as its
+  first 8,192 (measured in November 2026: 64,701 characters kept whole, 65,007 cut). A history that reaches the 64K
+  cap therefore arrives there as the start of the oldest message it kept, while an OTLP collector receives all of it;
+- `generate_video` gets `tensorsharp.video.prompt`, `generate_image` gets `tensorsharp.image.prompt`, `execute_tool`
+  gets `tensorsharp.tool.arguments` and `tensorsharp.tool.result`, `codeexec.run` gets `tensorsharp.codeexec.command`.
 
 With it off, [`ContentSpanProcessor`](../../TensorSharp.Telemetry/ContentRedactionProcessor.cs), registered before the
-trace exporters, removes `gen_ai.input.messages`, `gen_ai.output.messages` and `tensorsharp.video.prompt` from any span
-as a backstop for a call site that forgot to check. Jev, images and Studio record no content even with capture on.
+trace exporters, removes `gen_ai.input.messages`, `gen_ai.output.messages`, `tensorsharp.video.prompt` and
+`tensorsharp.image.prompt` from any span as a backstop for a call site that forgot to check. Jev and Studio record no
+content even with capture on.
 
 Other places content can travel: capability paths and the Responses API's stored response ids (masked, §5.6, §5.10,
 §7.4, §7.6); the Azure Monitor exporter's offline storage,
@@ -1625,7 +1650,7 @@ The draft was checked against the code before implementation. "Built" says what 
 | ASP.NET Core filter: any rule disables it | Only a provider rule whose category matches; ties go to the later rule | Registered for the provider (§7.3) |
 | Capture flag in `TelemetryOptions` | Libraries cannot see that project | Pinned static switch; Studio reads the variable; span backstop (§7.7) |
 | `/uploads` unauthenticated per Program.cs:362 | That line is the knowledge store; `/uploads` is `UseStaticFiles`; code artifacts and stored responses are guarded only by their ids too | Capability paths masked in spans and request log lines (§5.10, §7.6) |
-| Exported records may exceed the size limit | The exporter truncates silently (32,768 / 8,192) | §7.4 |
+| Exported records may exceed the size limit | The exporter truncates silently (32,768 / 8,192); Application Insights cuts captured chat messages over about 64,700 characters to 8,192 | §7.4, §7.7 |
 | Console-only output is the H3 and LTX timings | Also `[h3]` lines, warnings, MP4 fallbacks, Wan, Qwen-Image, grammar warnings | Listed (§7.8) |
 | **Video** | | |
 | Both pipelines check the token while reporting | Only LTX does; H3 stops only when a callback throws | §8.1 |

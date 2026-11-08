@@ -186,9 +186,12 @@ internal sealed class CliInferenceSession : IDisposable
     {
         DateTime endUtc = DateTime.UtcNow;
         // A stop the CLI made itself is a stop sequence, as the server's pipeline records it,
-        // not the abort the engine used to carry it out.
+        // whatever the engine reports. That is usually the abort the engine used to carry it
+        // out, but the engine runs ahead of the CLI reading its tokens, so it can reach its
+        // token limit or an end of sequence before the abort arrives; the reply the caller kept
+        // still ended at its own stop.
         string finishReason = reported?.FinishReason;
-        if (stoppedByCaller && finishReason == "aborted")
+        if (stoppedByCaller && reported != null)
             finishReason = StopSequenceFinishReason;
         InferenceCompletion engine = handle.Completion.IsCompletedSuccessfully ? handle.Completion.Result : null;
         telemetry.RecordEnginePhases(sequence.SubmittedAt, sequence.FirstScheduledAt, sequence.FirstTokenAt, endUtc,

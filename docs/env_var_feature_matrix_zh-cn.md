@@ -86,7 +86,12 @@ TensorAgent 在每次加载模型之前写入自己的取值（`EngineMemoryPoli
 | `TS_Q4E_COLLAPSE_Q81` | `--backend cuda` 上的 Qwen 3.8 Flash Next，decode 步与验证窗口 | `0` 让每个半层的混合输入单独启动一次量化。默认：hyper-connection 的 collapse 同时写出注意力、GDN、共享专家和路由专家投影读取的 q8_1 块（数值相同；每个半层、每次路由专家调用少一次启动）。 | 开启 | - | 否 |
 | `TS_Q4E_KV_RESIDENT` | `--backend cuda` 上使用 Q8_0 KV 缓存的 Qwen 3.8 Flash Next | 每个 QSA 注意力层留在显存中的 K/V 单元数（Strata 的 `--kv-resident`）；整个上下文的权威 K/V 放在锁页、设备映射的主机内存中，decode 步与验证窗口在捕获的步骤内把要读的页面调入显存、缺页经总线复制，prompt 读取从主机副本填充的暂存池；原始索引键改为环形缓冲。至少容纳一次调用的页面（16 行 x 2,051 单元；Flash Next 为 32,960 单元）。输出与常驻缓存逐位一致；腾出的显存给专家 slot。`0` 让每层全部常驻。未设置时：路由专家无法全部放入显存（专家驻留）时为 32768，能放下时每层全部常驻（自 2026-11-08 起为默认）。 | 未设置：专家驻留时 `32768`，否则 `0` | - | 否 |
 | `TS_Q4E_LANES` | 专家驻留下 `--backend cuda` 上的 Qwen 3.8 Flash Next | 驻留规划在第一个序列之外再为多少个序列（1-16）预留显存（缓存与草稿 KV），使并发请求拥有自己的 slot、以一次批量步解码，而不是排队等待；每条 lane 占用专家 slot（挂载 MTP 头时 131K 上下文的一条 lane：常驻约 2.6 GB，配合 `TS_Q4E_KV_RESIDENT` 约 0.9 GB）。 | `1` | - | 否 |
-| `TS_Q4E_BATCH_GRAPHS` | 并发请求时 `--backend cuda` 上的 Qwen 3.8 Flash Next | `0` 让批量步（多个序列的行在一次前向中：批量 decode 步与批量投机验证）不经 CUDA graph 捕获运行，用于测量 graph 的作用。捕获的步骤与未捕获的结果逐位相同；只有缺失专家留在主机上计算的步骤会被捕获。 | 开 | - | 否 |
+| `TS_Q4E_BATCH_GRAPHS` | 并发请求时 `--backend cuda` 上的 Qwen 3.8 Flash Next | `0` 让批量步（多个序列的行在一次前向中：批量 decode 步与批量投机验证）不经 CUDA graph 捕获运行。捕获时每个 GPU 以一张 graph 重放一步（包括层切分），以各序列的 slot 与 QSA 区段、行数和输出头形式为键；同一键第三次运行时才捕获，slot 无法分配或增长时已捕获的步骤会让出显存。捕获的步骤与未捕获的结果逐位相同；需要暂存缺失专家的步骤不捕获。 | 开 | - | 否 |
+| `TS_Q4E_BATCH_GRAPHS_MAX` | 同上 | 最多保留的已捕获批量步数量；超出时先丢弃最久未用的。 | `64` | - | 否 |
+| `TS_Q4E_SLOT_TOKENS` | `--backend cuda` 上的 Qwen 3.8 Flash Next | 序列 slot 的初始容量（向上取整到完整的 QSA 块）；随序列增长倍增直到上下文长度，无法增长时先释放最早保留的对话的 slot。处于常驻 KV 窗口（`TS_Q4E_KV_RESIDENT`）下的层不增长：其窗口与主机副本已覆盖整个上下文。 | `32768` | - | 否 |
+| `TS_Q4E_REWIND_CHECKPOINT` | 同上 | `0` 关闭每个 slot 在每次多 token 前向结束时对递归状态的检查点；有了它，只与上一轮回复部分匹配的新一轮可以回退到匹配处并重放该 slot 自己的 token。 | 开 | - | 否 |
+| `TS_Q4E_PLACEMENT_SLOTS` | 使用 `--layer-split` 时 `--backend cuda` 上的 Qwen 3.8 Flash Next | 层切分在权重之外为多少个 slot 的缓存做均衡（尽量容纳）；`1` 只为一个均衡。 | `16` | - | 否 |
+| `TS_Q4E_PERF_SAMPLE` | `--backend cuda` 上的 Qwen 3.8 Flash Next | 每 N 次前向中有一次不经捕获运行并带阶段计时，按阶段、步骤类型与行数记录 `tensorsharp.engine.stage.duration`；`TS_Q4E_PERF` 为 2 或以上时关闭。 | `0` | - | 否 |
 | `TS_Q4E_MTP_RESUME` | 挂载 MTP 头（`--draft-model`）时 `--backend cuda` 上的 Qwen 3.8 Flash Next | `0` 让 MTP 块在出现它从未重放过的位置后不重启自己的缓存：投机只用于提示词从位置 0 起经由其上下文预填的请求，因此并发请求（彼此并排预填）、复用前缀的轮次以及经历过普通解码间隔的请求都按普通方式解码。开启（默认）时，该块在间隔末尾重启，这些请求都会投机，并发请求在一次批量验证中完成。 | 开 | - | 否 |
 | `TS_Q4E_BATCHED_VERIFY_ROWS` | 并发请求且挂载 MTP 头时 `--backend cuda` 上的 Qwen 3.8 Flash Next | 一次批量投机验证步保持的行数（2-16）；各序列分摊这些行作为各自的窗口（不超过单序列窗口），每个序列不足两行时改为在一次批量步中普通解码。不同序列的行很少共享专家，验证成本几乎与行数成正比：取 8 时，两个序列各验证 4 行，三或四个序列各 2 行。 | `8` | - | 否 |
 | `TS_Q4E_MTP_EXPERTS` | 挂载共享 MTP 头（`--draft-model`）的 Qwen 3.8 Flash Next，GGML 后端和 `--backend cuda` | `q2_0`（在 GGML 后端上也可用 `q4_0`）在加载时用 ggml 的量化器重新量化该头的 512 个路由专家，与 Strata 发布其草稿层的方式相同。共享头的 Q8_0 专家从 2,550 MiB 降到 675 MiB，腾出的空间留给目标模型的专家分层或显存槽位；在 5090 上，常驻显存的路由从 95.0% 升到 96.8%。只影响草稿：每个 token 都由验证决定，长生成的接受率保持在 85-87%。`q8_0` 或 `file`（默认）保留文件中的专家。 |
@@ -351,6 +356,7 @@ Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有�
 | `TS_QWEN_VISION_ATTN` | Qwen 3.5 / 3.8 视觉编码器（CUDA sm_80+） | 视觉注意力内核：`mma`（张量核心，F16 操作数，F32 分数/softmax/输出；相对精确 F32 的精度与分解路径相同，编码器耗时约减半）、`ggml`（分解的 TF32 矩阵乘 + softmax）、`f32`（精确 F32 内核，较慢） | `mma` | 未注册 | 否 |
 | `TS_QWEN_VISION_F32` | Qwen 3.5 / 3.8 视觉编码器（CUDA） | `1` 选择精确 F32 注意力内核（等同 `TS_QWEN_VISION_ATTN=f32`） | 关 | 未注册 | 否 |
 | `TS_SPEC_ADAPTIVE` | 投机解码（所有草稿器） | `0` 关闭成本调节器，于是起草不再与普通 baseline 做对比、也永远不会被暂停。用于 A/B 测量：调节器每一轮的 baseline 步骤都是普通 decode，它们并不免费 | 开 | 未注册 | 否 |
+| `TS_SPEC_TURNS` | 并发解码、目标模型没有批量验证时的投机解码 | `0` 从不轮流投机，`1` 在目标模型支持时总是轮流。轮流：一个序列在自己的 holder 上做单序列投机步（最多 64 步），其他序列等待，然后由最久未被服务的序列接手，而不是每个序列在批量步中各解一个 token。未设置时：由目标模型决定（`ISpeculativeTarget.SpecTurnsPreferred`：`ggml_metal` 上带窗口专家分层的 Qwen 3.8 Flash Next）。M5 Pro、ISTA `Q2_0`、Strata 的 4 并发轮次：总吞吐 30-34 -> 37-43 tok/s | 由模型决定 | 未注册 | 否 |
 | `TS_GGML_LOG_DEBUG` | GGML 后端 | `1` 把 ggml 的 DEBUG 日志通道透传出来而不是丢弃。它承载 CUDA 后端的 "CUDA graph warmup complete" / "reset" 这两行，而这是唯一能看出一张图是否真的被 CUDA graph 捕获的途径 | 关 | 未注册 | 否 |
 
 ## 矩阵外的 Muse Spark 开关

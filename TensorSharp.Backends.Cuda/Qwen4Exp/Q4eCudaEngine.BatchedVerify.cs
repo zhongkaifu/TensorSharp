@@ -175,6 +175,17 @@ namespace TensorSharp.Cuda
                     || slots[i].NPast + window > _m.NCtx)
                     return false;
             }
+            // Each window's rows land in its slot's caches: grow them first. A slot that cannot grow sends the step back
+            // to the sequences' own steps, which report why.
+            try
+            {
+                foreach (var slot in slots)
+                    EnsureCapacity(slot, slot.NPast + window);
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
             int nt = n * window;
             var rows = new Slot[nt];
             var positions = new int[nt];
