@@ -1062,7 +1062,9 @@ RTX 5090、ISTA `Q2_0`、MTP、长生成，同一构建与客户端（decode tok
 | 本构建，4 `first`（默认） | 231-239 | 10.7-12.1 ms | 1-3 |
 | 之前（无份额），第二次 | 203-227 | 11.7-13.1 ms | 41-67 |
 
-4K 与 16K 的 TTFT 以及多轮对话首轮 TTFT 没有变化（prompt 仍按原方式暂存缺失专家）。
+4K 与 16K 的 TTFT 以及多轮对话首轮 TTFT 没有变化（prompt 仍按原方式暂存缺失专家）。nsys 采样（份额 2，`first`）显示了
+其中的取舍：doorbell 等待每窗口 2.0 -> 0.28 ms，暂存复制 2.7 ms（经总线约 47 GB/s，在专家内核之前的同一 stream 上）。
+让这些复制与常驻专家重叠（为暂存专家再做一遍专家计算）是下一步。
 
 #### 更小的 decode 内核，2026-11-08
 
@@ -1110,6 +1112,54 @@ RTX 5090、ISTA `Q2_0`、MTP、长生成，同一构建与客户端（decode tok
 
 decode 在所有场景都更快（常驻专家更多；一步缺失的页面很少也很小）。16K 及以上的 prompt 的 TTFT 增加 5-7%：每层的单元在每个
 4,096 行的 prompt 分组中复制进暂存池一次，且在 prompt 的 stream 上执行。像专家那样在独立 stream 上提前暂存下一层，可以掩盖其中大部分开销。
+
+#### 并发请求与 Strata 的 standard-v1 负载，2026-11-08
+
+`eng/strata-standard-bench.py` 以 Strata 运行器发送的原样载荷重放 Strata 冻结的 `bench/prompts/standard-v1` 包（Strata 检出
+146df3c4，已校验 `MANIFEST.sha256`）：开启思考（`reasoning_effort` xhigh、`preserve_thinking`、`reasoning_budget_tokens` 0），
+temperature 1.0、top_p 0.95、top_k 20、每个请求独立的种子、512 token 上限；短、4K、16K 请求各三次，12 个按 Strata 规则评分的
+健全性检查，以及三轮每轮四个同时发出的请求。服务器对这些字段的理解与 Strata 相同：GGUF 中的聊天模板就是 Strata 的
+`serve/chat_template.jinja`（文本相同），`xhigh` 以 `high` 传入模板，模板再把它映射回 xhigh；`preserve_thinking` 被报告为忽略，
+而模板在缺省时的默认值同样是 `true`；预算 0 在两边都表示不限。
+
+并发是差距所在。在专家驻留下，规划只为一个序列的 131K 上下文缓存（2.3 GB）预留显存，第二个请求找不到 slot 只能等待
+（"The model has no device slot for another concurrent request"）：同时发出的四个请求依次以单流速度运行，TTFT 为 0.1 / 3 / 6 / 9 s。
+`TS_Q4E_LANES`（1-16，默认 1）让规划为相应数量的序列预留显存；并发请求随即拥有各自的 slot 并一起解码。配合常驻 KV 窗口，
+一条 lane 约占 1.2 GB（四条 lane：常驻专家覆盖 95.4% 的剖析路由，而不是 98.4%）。
+
+并发请求也一起投机。调度器的每一步先在各自的 slot 上为每个序列起草 MTP 链，再在一次前向中验证所有序列的窗口
+（`Q4eCudaEngine.ForwardBatchedVerify`）：递归层从各序列自己的状态扫描它的行，注意力像该序列自己的验证那样发出它的窗口，
+提交时为拒绝了草稿的序列重放保留的行。贪心请求从设备取每行的首个最大 token；采样请求取每行的 logits，由各自的采样器抽取
+（各序列并行），抽到的 token 与草稿相同就保留该草稿，与单独一步相同。为此先改了两处：
+
+- MTP 块保存自己的 KV，过去拒绝在它从未重放过的位置之后起草，因此与其他请求并排（以普通方式）预填的请求永远无法开启投机，
+  并发请求每步只解码一个 token。现在该块在这样的间隔末尾重启自己的缓存（`Q4eCudaEngine.MtpRestart`；位置从重启处计数，
+  RoPE 分数只取决于距离），复用前缀的轮次也因此能够投机。`TS_Q4E_MTP_RESUME=0` 恢复旧规则。
+- 不同序列的行很少共享专家，验证成本几乎与行数成正比：4 / 8 / 12 行分别用 9.5 / 14.5 / 24.4 ms，每个草稿约 0.62 被保留。
+  三个序列各用 4 行窗口时总计 211 tok/s，而普通批量步约 296。每步保持 `TS_Q4E_BATCHED_VERIFY_ROWS` 行（默认 8）：
+  两个序列各验证 4 行，三或四个序列各 2 行（四个序列时 365 tok/s），更多序列改为普通解码。
+
+批量步（批量 decode 与批量验证）经 CUDA graph 捕获运行（`TS_Q4E_BATCH_GRAPHS`），slot 无法分配或增长时会让出显存。
+
+RTX 5090、ISTA Q2_0 加 MTP 头、`--sampling-precedence request`，各三次，总计 tok/s：
+
+| | engine-bench parallel_2 | engine-bench parallel_4 | standard-v1 并发（四个同时） |
+| --- | --- | --- | --- |
+| Strata `--batch 4` | 214-216 | 293 | 293-329 |
+| Strata，单独 | | | 231-243（串行） |
+| TensorSharp，本轮开始时（1 lane） | 149-169 | 161-165 | 148-161（串行） |
+| TensorSharp，1 lane（默认） | 191-203 | 198-216 | 200-201（串行，每个请求都投机） |
+| TensorSharp，4 lane，普通批量 decode | 202-212 | 282-296 | 263-272 |
+| TensorSharp，4 lane，批量验证 | 174-204 | 242-292 | 221-271 |
+
+单个请求而言，批量验证每秒解码 92-116 个 token，普通批量 decode 为 79-89；但在部分轮次中，四个请求里仍有一个要等待最多
+3 s 才拿到 slot（已结束对话的 slot 仍被保留时又申请第五个 slot），使总计停留在普通批量的水平。健全性检查保持 12/12，
+没有失败的请求。关闭依赖历史的捷径（`TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0 TS_Q4E_HYBRID_MISSES=0`，并关闭前缀复用）时，
+四个同时发出的请求的贪心答案与逐个发出时逐字节相同：4/4，两次单独运行之间也是 4/4。使用默认设置时，即便两次单独运行也会不同
+（1/4），这正是路由尾部跳过与自适应驻留的设计。
+
+ggml_cuda 无法在 32 GB 显卡上服务该模型：decode 为 0.5-4.7 tok/s（专家从网络卷读取），四个请求同时到来会在 ggml 内部耗尽显存，
+导致进程中止；它没有 ggml_metal 那样的准入检查。
 
 ### ggml_metal 上的 DFlash2 草稿模型，2026-11-08
 

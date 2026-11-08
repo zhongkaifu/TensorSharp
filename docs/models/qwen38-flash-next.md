@@ -1495,7 +1495,10 @@ the others (ABBA), 3 repetitions each:
 | this build, 4 `first` (default) | 231-239 | 10.7-12.1 ms | 1-3 |
 | before (no share), second run | 203-227 | 11.7-13.1 ms | 41-67 |
 
-4K and 16K TTFT and the multi-turn first TTFT did not move (prompts stage their misses as before).
+4K and 16K TTFT and the multi-turn first TTFT did not move (prompts stage their misses as before). An nsys capture
+(share 2, `first`) shows the trade: the doorbell waits 2.0 -> 0.28 ms a window, the staging copies 2.7 ms (about
+47 GB/s over the bus, on the stream before the expert kernels). Overlapping those copies with the resident experts
+(a second expert pass for the staged ones) is the next step.
 
 #### Smaller decode kernels, 2026-11-08
 
@@ -1558,6 +1561,65 @@ the profiled routes instead of 97.6%. Same build and client, 3 repetitions (TTFT
 Decode gains everywhere (more experts resident; a step's missed pages are few and small). Prompts of 16K and more pay
 5-7% TTFT: each layer's cells are copied into the staging pool once per 4,096-row prompt group, on the prompt's
 stream. Staging the next layer ahead on a stream of its own (as the experts are) would hide most of it.
+
+#### Concurrent requests and Strata's standard-v1 workload, 2026-11-08
+
+`eng/strata-standard-bench.py` replays Strata's frozen `bench/prompts/standard-v1` bundle (Strata checkout
+146df3c4, `MANIFEST.sha256` verified) with exactly the payload Strata's runner sends: thinking on (`reasoning_effort`
+xhigh, `preserve_thinking`, `reasoning_budget_tokens` 0), temperature 1.0, top_p 0.95, top_k 20, per-request seeds, a
+512-token cap; short, 4K and 16K requests three times, 12 sanity checks scored with Strata's rules, and three rounds of
+four requests at once. The server reads the fields as Strata's does: the GGUF's chat template is Strata's
+`serve/chat_template.jinja` (the same text), `xhigh` reaches it as `high`, which the template maps back to xhigh;
+`preserve_thinking` is reported as ignored, and the template's default without it is the same `true`; a budget of 0 is
+no budget on both.
+
+Concurrency was the gap. Under expert residency the plan left VRAM for one sequence's 131K-context caches (2.3 GB), so
+a second request found no slot and waited ("The model has no device slot for another concurrent request"): four
+requests at once ran one after another at the single-stream rate, TTFT 0.1 / 3 / 6 / 9 s. `TS_Q4E_LANES` (1-16,
+default 1) has the plan leave VRAM for that many sequences; concurrent requests then get slots of their own and decode
+together. A lane costs about 1.2 GB with the resident KV window (four lanes: 95.4% of the profiled routes resident
+instead of 98.4%).
+
+Concurrent requests also speculate together. Each scheduler step drafts every sequence's MTP chain on its own slot and
+verifies all of their windows in one forward (`Q4eCudaEngine.ForwardBatchedVerify`): the recurrent layers scan each
+sequence's rows from its own state, attention issues each sequence's window as its own verify does, and the commit
+replays the kept rows of a sequence that rejected a draft. Greedy requests take each row's first-max token from the
+device; sampled requests take every row's logits and draw them with their own samplers, sequences in parallel, a draft
+kept while the draw equals it, as a solo step does. Two things had to change first:
+
+- The MTP block keeps its own KV and refused to draft after positions it never replayed, so a request prefilled beside
+  others (plainly) could never arm speculation, and concurrent requests decoded one token a step. The block now restarts
+  its cache at the end of such a gap (`Q4eCudaEngine.MtpRestart`; positions count from the restart, RoPE scores depend
+  on distance alone). This also lets a turn that reuses a prefix speculate. `TS_Q4E_MTP_RESUME=0` restores the old rule.
+- Rows of different sequences share few experts, so a verify costs nearly in proportion to its rows: 4 / 8 / 12 rows in
+  9.5 / 14.5 / 24.4 ms, each draft kept at about 0.62. Three sequences with 4-row windows decoded 211 tok/s in all
+  against about 296 for plain batched steps. A step keeps to `TS_Q4E_BATCHED_VERIFY_ROWS` rows (default 8): two
+  sequences verify 4 rows each, three or four 2 (365 tok/s at four sequences), more decode plainly.
+
+Batched steps (batched decode and batched verify) run through captured CUDA graphs (`TS_Q4E_BATCH_GRAPHS`), and give
+their memory back when a slot cannot be allocated or grown.
+
+RTX 5090, ISTA Q2_0 with the MTP head, `--sampling-precedence request`, three repeats each, aggregate tok/s:
+
+| | engine-bench parallel_2 | engine-bench parallel_4 | standard-v1 concurrency (4 at once) |
+| --- | --- | --- | --- |
+| Strata `--batch 4` | 214-216 | 293 | 293-329 |
+| Strata, solo | | | 231-243 (serialized) |
+| TensorSharp at the round's start (1 lane) | 149-169 | 161-165 | 148-161 (serialized) |
+| TensorSharp, 1 lane (the default) | 191-203 | 198-216 | 200-201 (serialized, each request speculating) |
+| TensorSharp, 4 lanes, plain batched decode | 202-212 | 282-296 | 263-272 |
+| TensorSharp, 4 lanes, batched verify | 174-204 | 242-292 | 221-271 |
+
+Per request the batched verify decodes 92-116 tok/s against 79-89 for plain batched decode, but in some rounds one
+request of four still waits up to 3 s for a slot (a fifth slot is asked for while a finished conversation's is
+retained), which holds the aggregate at the plain batched rate. Sanity stays 12/12 and no request fails. Greedy answers
+of four requests at once are byte-identical to the same requests one at a time with the history-dependent shortcuts off
+(`TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0 TS_Q4E_HYBRID_MISSES=0`, prefix reuse off): 4 of 4, and so are two solo
+runs. With the defaults even two solo runs differ (1 of 4), as the route-tail skip and adaptive residency intend.
+
+ggml_cuda cannot serve this model on the 32 GB card: decode at 0.5-4.7 tok/s (the experts read from the network volume),
+and four requests at once run it out of device memory inside ggml, which aborts the process; it has no admission check
+like ggml_metal's.
 
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
