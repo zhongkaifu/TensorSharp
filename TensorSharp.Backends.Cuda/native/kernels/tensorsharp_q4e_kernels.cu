@@ -1101,6 +1101,314 @@ extern "C" __global__ void ts_q4e_attention_split_q8_f32(
 }
 
 // ---------------------------------------------------------------------------
+// Prompt attention on tensor cores. q4e_attention gives each (query head, row) its own block, whose warps take the
+// row's cells one warp-wide dot at a time; the G = NH / NKV query heads of a KV head each load and widen every cached
+// key and value again: 0.18 s of a 4K prompt's 12 attention layers on the RTX 5090, and a 16K prompt's rows each walk
+// 2,051 cells. Here a block of four warps takes one (row, KV head): the group's query heads are the rows of a 16-row
+// mma tile (G <= 16, the rest zero), the row's cells come in chunks of 16 (warp w takes chunks w, w + 4, ...), each
+// chunk's keys and then values are widened once to F16 in the warp's shared tile, and S = Q K^T and O += P V run on
+// mma.sync.m16n8k16 (F16 operands, F32 accumulation) under a per-warp online softmax; the warps merge at the end.
+// Queries, keys, values and probabilities are F16 operands where q4e_attention keeps F32, so a prompt row's attention
+// rounds differently from that kernel's (decode steps and verify windows keep the split kernel). sm_80 and newer.
+// ---------------------------------------------------------------------------
+
+#define Q4E_MMA_ATTN_WARPS 4
+#define Q4E_MMA_ATTN_LDS (Q4E_ATTN_HD + 8)   // halves a shared row holds: 528 B, so ldmatrix's eight rows hit distinct banks
+#define Q4E_MMA_ATTN_OLD (Q4E_ATTN_HD + 8)   // floats a row of the merged output holds
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+__device__ __forceinline__ void q4e_ldsm_x4(uint32_t (&r)[4], const half* p)
+{
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+__device__ __forceinline__ void q4e_ldsm_x4_trans(uint32_t (&r)[4], const half* p)
+{
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+__device__ __forceinline__ void q4e_mma_f16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
+{
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t q4e_pack_half2(float lo, float hi)
+{
+    const half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+// Cells base .. base + 15 of the list (cell i itself without one) of KV head kvh into sm[16][LDS] as F16, zero past
+// n: lane & 15 takes a cell, lane >> 4 half of its dims. A Q8_0 value is widened exactly (code + 1152 assembled as an
+// F16 1024 + (code + 128), minus 1152) and times its F16 scale rounded once, as q4e_load_kv8's F32 product rounds to F16.
+template <bool Q8>
+__device__ __forceinline__ void q4e_mma_attn_stage(half (*sm)[Q4E_MMA_ATTN_LDS], const void* __restrict__ cache,
+    const half* __restrict__ scale, const int32_t* __restrict__ list, const int base, const int n, const int NKV,
+    const int kvh, const int lane)
+{
+    const int j = lane & 15, part = lane >> 4;
+    uint4* dst = reinterpret_cast<uint4*>(&sm[j][part * 128]);
+    const int i = base + j;
+    if (i >= n)
+    {
+#pragma unroll
+        for (int s = 0; s < 16; ++s)
+            dst[s] = make_uint4(0u, 0u, 0u, 0u);
+        return;
+    }
+    const int c = list != nullptr ? list[i] : i;
+    const size_t at = ((size_t)c * NKV + kvh) * Q4E_ATTN_HD + part * 128;
+    if constexpr (Q8)
+    {
+        const int4* src = reinterpret_cast<const int4*>(static_cast<const signed char*>(cache) + at);
+        int4 w[8];
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+            w[s] = src[s];
+        const uint2 sw = *reinterpret_cast<const uint2*>(scale + at / Q4E_KV_Q8_BLOCK);
+        const half* sp = reinterpret_cast<const half*>(&sw);
+        const half2 magic = __float2half2_rn(1152.0f);
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+        {
+            const half2 sc = __half2half2(sp[s >> 1]);
+            const uint32_t words[4] = { (uint32_t)w[s].x, (uint32_t)w[s].y, (uint32_t)w[s].z, (uint32_t)w[s].w };
+            uint32_t h[8];
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+            {
+                const uint32_t u = words[k] ^ 0x80808080u;
+                const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+                const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+                const half2 vl = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&lo), magic), sc);
+                const half2 vh = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&hi), magic), sc);
+                h[2 * k] = *reinterpret_cast<const uint32_t*>(&vl);
+                h[2 * k + 1] = *reinterpret_cast<const uint32_t*>(&vh);
+            }
+            dst[2 * s] = make_uint4(h[0], h[1], h[2], h[3]);
+            dst[2 * s + 1] = make_uint4(h[4], h[5], h[6], h[7]);
+        }
+    }
+    else
+    {
+        const int4* src = reinterpret_cast<const int4*>(static_cast<const half*>(cache) + at);
+        int4 w[16];
+#pragma unroll
+        for (int s = 0; s < 16; ++s)
+            w[s] = src[s];
+#pragma unroll
+        for (int s = 0; s < 16; ++s)
+            dst[s] = make_uint4((uint32_t)w[s].x, (uint32_t)w[s].y, (uint32_t)w[s].z, (uint32_t)w[s].w);
+    }
+}
+#endif
+
+// grid (NKV, nt), Q4E_MMA_ATTN_WARPS * 32 threads. Arguments as q4e_attention's.
+template <bool Q8>
+__device__ __forceinline__ void q4e_attention_mma(
+    const float* __restrict__ q, const void* __restrict__ kCache, const void* __restrict__ vCache,
+    const half* __restrict__ kScale, const half* __restrict__ vScale,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int p0, const int NH, const int NKV, const float scale, const int cellStride)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    __shared__ __align__(16) half smQ[16][Q4E_MMA_ATTN_LDS];
+    __shared__ __align__(16) half smKV[Q4E_MMA_ATTN_WARPS][16][Q4E_MMA_ATTN_LDS];
+    __shared__ float smM[Q4E_MMA_ATTN_WARPS][16], smL[Q4E_MMA_ATTN_WARPS][16], smInv[16];
+
+    const int kvh = blockIdx.x, t = blockIdx.y;
+    const int G = NH / NKV;
+    const int p = positions != nullptr ? positions[t] : p0 + t;
+    const int32_t* list = nullptr;
+    int n = p + 1;
+    if (cells != nullptr && cellCnt[t] >= 0)
+    {
+        n = cellCnt[t];
+        list = cells + (size_t)t * cellStride;
+    }
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tig = lane & 3;
+
+    // The group's query heads as F16 rows, rows G..15 zero.
+    for (int u = tid; u < 16 * (Q4E_ATTN_HD / 4); u += blockDim.x)
+    {
+        const int r = u / (Q4E_ATTN_HD / 4), c4 = (u % (Q4E_ATTN_HD / 4)) * 4;
+        float4 f = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (r < G)
+            f = *reinterpret_cast<const float4*>(q + ((size_t)t * NH + kvh * G + r) * Q4E_ATTN_HD + c4);
+        *reinterpret_cast<uint2*>(&smQ[r][c4]) = make_uint2(q4e_pack_half2(f.x, f.y), q4e_pack_half2(f.z, f.w));
+    }
+    __syncthreads();
+
+    float o[Q4E_ATTN_HD / 8][4];
+#pragma unroll
+    for (int dt = 0; dt < Q4E_ATTN_HD / 8; ++dt)
+        o[dt][0] = o[dt][1] = o[dt][2] = o[dt][3] = 0.0f;
+    float mRow[2] = { -INFINITY, -INFINITY }, lRow[2] = { 0.0f, 0.0f };
+    const float sl2 = scale * 1.4426950408889634f;
+    half (*sm)[Q4E_MMA_ATTN_LDS] = smKV[warp];
+    const int nChunks = (n + 15) >> 4;
+    for (int ch = warp; ch < nChunks; ch += Q4E_MMA_ATTN_WARPS)
+    {
+        const int base = ch << 4;
+        q4e_mma_attn_stage<Q8>(sm, kCache, kScale, list, base, n, NKV, kvh, lane);
+        __syncwarp();
+        float s[2][4] = { { 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+#pragma unroll
+        for (int kk = 0; kk < Q4E_ATTN_HD; kk += 16)
+        {
+            uint32_t a[4], b[4];
+            q4e_ldsm_x4(a, &smQ[(lane & 7) + ((lane >> 3) & 1) * 8][kk + (lane >> 4) * 8]);
+            q4e_ldsm_x4(b, &sm[(lane & 7) + (lane >> 4) * 8][kk + ((lane >> 3) & 1) * 8]);
+            q4e_mma_f16(s[0], a, b[0], b[1]);
+            q4e_mma_f16(s[1], a, b[2], b[3]);
+        }
+        // Column 2 tig + (e & 1) of tile h is cell base + 8 h + 2 tig + (e & 1); e < 2 is head g, else g + 8.
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                s[h][e] = base + 8 * h + 2 * tig + (e & 1) < n ? s[h][e] * sl2 : -INFINITY;
+        float mx0 = fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1]));
+        float mx1 = fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3]));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float mN0 = fmaxf(mRow[0], mx0), mN1 = fmaxf(mRow[1], mx1);
+        const float c0 = exp2f(mRow[0] - mN0), c1 = exp2f(mRow[1] - mN1);
+        mRow[0] = mN0;
+        mRow[1] = mN1;
+        float pr[2][4];
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                pr[h][e] = exp2f(s[h][e] - (e < 2 ? mN0 : mN1));
+        float sum0 = pr[0][0] + pr[0][1] + pr[1][0] + pr[1][1];
+        float sum1 = pr[0][2] + pr[0][3] + pr[1][2] + pr[1][3];
+        sum0 += __shfl_xor_sync(0xffffffffu, sum0, 1);
+        sum0 += __shfl_xor_sync(0xffffffffu, sum0, 2);
+        sum1 += __shfl_xor_sync(0xffffffffu, sum1, 1);
+        sum1 += __shfl_xor_sync(0xffffffffu, sum1, 2);
+        lRow[0] = lRow[0] * c0 + sum0;
+        lRow[1] = lRow[1] * c1 + sum1;
+#pragma unroll
+        for (int dt = 0; dt < Q4E_ATTN_HD / 8; ++dt)
+        {
+            o[dt][0] *= c0; o[dt][1] *= c0;
+            o[dt][2] *= c1; o[dt][3] *= c1;
+        }
+        const uint32_t pa[4] = { q4e_pack_half2(pr[0][0], pr[0][1]), q4e_pack_half2(pr[0][2], pr[0][3]),
+                                 q4e_pack_half2(pr[1][0], pr[1][1]), q4e_pack_half2(pr[1][2], pr[1][3]) };
+        __syncwarp();
+        q4e_mma_attn_stage<Q8>(sm, vCache, vScale, list, base, n, NKV, kvh, lane);
+        __syncwarp();
+#pragma unroll
+        for (int dt = 0; dt < Q4E_ATTN_HD / 8; dt += 2)
+        {
+            uint32_t b[4];
+            q4e_ldsm_x4_trans(b, &sm[(lane & 7) + ((lane >> 3) & 1) * 8][dt * 8 + (lane >> 4) * 8]);
+            q4e_mma_f16(o[dt], pa, b[0], b[1]);
+            q4e_mma_f16(o[dt + 1], pa, b[2], b[3]);
+        }
+        __syncwarp();
+    }
+
+    // Merge the warps: each scales its output to the block's maximum and adds it in turn.
+    __syncthreads();
+    if (tig == 0)
+    {
+        smM[warp][g] = mRow[0];
+        smM[warp][g + 8] = mRow[1];
+        smL[warp][g] = lRow[0];
+        smL[warp][g + 8] = lRow[1];
+    }
+    __syncthreads();
+    float M0 = -INFINITY, M1 = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < Q4E_MMA_ATTN_WARPS; ++w)
+    {
+        M0 = fmaxf(M0, smM[w][g]);
+        M1 = fmaxf(M1, smM[w][g + 8]);
+    }
+    const float f0 = mRow[0] == -INFINITY ? 0.0f : exp2f(mRow[0] - M0);
+    const float f1 = mRow[1] == -INFINITY ? 0.0f : exp2f(mRow[1] - M1);
+    float* smO = reinterpret_cast<float*>(&smKV[0][0][0]);
+#pragma unroll
+    for (int w = 0; w < Q4E_MMA_ATTN_WARPS; ++w)
+    {
+        if (warp == w)
+        {
+#pragma unroll
+            for (int dt = 0; dt < Q4E_ATTN_HD / 8; ++dt)
+            {
+                const int d = dt * 8 + 2 * tig;
+                float2* r0 = reinterpret_cast<float2*>(&smO[g * Q4E_MMA_ATTN_OLD + d]);
+                float2* r1 = reinterpret_cast<float2*>(&smO[(g + 8) * Q4E_MMA_ATTN_OLD + d]);
+                float2 v0 = make_float2(o[dt][0] * f0, o[dt][1] * f0), v1 = make_float2(o[dt][2] * f1, o[dt][3] * f1);
+                if (w > 0)
+                {
+                    const float2 p0v = *r0, p1v = *r1;
+                    v0.x += p0v.x; v0.y += p0v.y;
+                    v1.x += p1v.x; v1.y += p1v.y;
+                }
+                *r0 = v0;
+                *r1 = v1;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < 16)
+    {
+        float M = -INFINITY;
+#pragma unroll
+        for (int w = 0; w < Q4E_MMA_ATTN_WARPS; ++w)
+            M = fmaxf(M, smM[w][tid]);
+        float L = 0.0f;
+#pragma unroll
+        for (int w = 0; w < Q4E_MMA_ATTN_WARPS; ++w)
+            L += smM[w][tid] == -INFINITY ? 0.0f : smL[w][tid] * exp2f(smM[w][tid] - M);
+        smInv[tid] = 1.0f / L;
+    }
+    __syncthreads();
+    for (int u = tid; u < G * Q4E_ATTN_HD; u += blockDim.x)
+    {
+        const int r = u / Q4E_ATTN_HD, d = u % Q4E_ATTN_HD;
+        const size_t off = ((size_t)t * NH + kvh * G + r) * Q4E_ATTN_HD + d;
+        out[off] = smO[r * Q4E_MMA_ATTN_OLD + d] * smInv[r] * q4e_sigmoid(gate[off]);
+    }
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(Q4E_MMA_ATTN_WARPS * 32) ts_q4e_attention_mma_f32(
+    const float* __restrict__ q, const half* __restrict__ kCache, const half* __restrict__ vCache,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int p0, const int NH, const int NKV, const float scale, const int cellStride)
+{
+    q4e_attention_mma<false>(q, kCache, vCache, nullptr, nullptr, gate, cells, cellCnt, out, positions,
+        p0, NH, NKV, scale, cellStride);
+}
+
+extern "C" __global__ void __launch_bounds__(Q4E_MMA_ATTN_WARPS * 32) ts_q4e_attention_mma_q8_f32(
+    const float* __restrict__ q, const signed char* __restrict__ kCache, const signed char* __restrict__ vCache,
+    const half* __restrict__ kScale, const half* __restrict__ vScale,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int p0, const int NH, const int NKV, const float scale, const int cellStride)
+{
+    q4e_attention_mma<true>(q, kCache, vCache, kScale, vScale, gate, cells, cellCnt, out, positions,
+        p0, NH, NKV, scale, cellStride);
+}
+
+// ---------------------------------------------------------------------------
 // Qwen Sparse Attention
 // ---------------------------------------------------------------------------
 

@@ -1322,6 +1322,27 @@ Same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
 | before (the next prompt layer staged ahead) | 0.07-0.09 s / 72-102 | 172-174 | 1.44-1.46 s / 135-146 | 5.84-5.87 s / 173-195 | 0.89-0.95 s |
 | two-stage pick, router loads in flight | 0.07-0.09 s / 82-102 | 169-182 | 1.38-1.44 s / 140-185 | 5.79-5.86 s / 189-193 | 0.89-0.95 s |
 
+#### Prompt attention on tensor cores, 2026-11-08
+
+A prompt's attention ran one block per query head and row, whose warps took the row's cells one warp-wide dot at a
+time; the 12 query heads sharing a KV head each loaded and widened every cached key and value again. That was 0.18 s
+of a 4K prompt, and a 16K prompt's rows each attend 2,051 cells. Prompt-size calls now run a block of four warps per
+row and KV head (`TS_Q4E_ATTN_MMA`, on): the group's query heads are the rows of a 16-row tensor-core tile, each warp
+widens a chunk of 16 cells' keys and then values to F16 in shared memory once, and S = QK^T and O += PV run on
+`mma.sync` (F16 operands, F32 accumulation) under an online softmax; the warps merge at the end. Decode steps and
+verify windows keep their kernels, so a verify row still answers as its own decode step. The operands round to F16:
+on the test fixture a prompt's logits move 4e-3 to 5e-3 relative (the `q8_0` cache moves them 4e-3 to 5e-3 from F16),
+and the kernel itself stays within 5.3e-4 a row of the F32 kernel (`Q4eAttentionMmaTests`). It needs sm_80 or newer and a module built
+for the GPU; the committed compute_75 baseline has no tensor-core body, and the engine then says so once and keeps the
+old kernel.
+
+RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
+
+| prompt attention | short chat | long generation | 4K prompt | 16K prompt | multi-turn first TTFT |
+| --- | --- | --- | --- | --- | --- |
+| a block per head and row | 0.07-0.09 s / 82-102 | 169-182 | 1.38-1.44 s / 140-185 | 5.79-5.86 s / 189-193 | 0.89-0.95 s |
+| tensor cores (default) | 0.07-0.09 s / 91-99 | 161-187 | 1.23-1.29 s / 99-161 | 4.99-5.08 s / 187-198 | 0.81-0.85 s |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the

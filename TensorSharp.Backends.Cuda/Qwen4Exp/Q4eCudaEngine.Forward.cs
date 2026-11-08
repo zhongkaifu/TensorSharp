@@ -775,7 +775,14 @@ namespace TensorSharp.Cuda
             StageEnd(dev, StAttnPrep);
 
             int splits = AttnSplits(dev, il, nt, p0);
-            if (splits > 0)
+            if (splits == 0 && AttnMmaFor(dev, nt))
+            {
+                dev.QK.AttentionMma(At(dev.Q, (long)row0 * qd), Ptr(c.KCache), Ptr(c.VCache), At(dev.Gate, (long)row0 * qd),
+                    cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
+                    CellStride, nt, dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
+                PromptAttentionMmaCalls++;
+            }
+            else if (splits > 0)
                 dev.QK.AttentionSplit(At(dev.Q, (long)row0 * qd), Ptr(c.KCache), Ptr(c.VCache), At(dev.Gate, (long)row0 * qd),
                     cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
                     CellStride, nt, splits, Ptr(dev.AttnPart), Ptr(dev.AttnArrive), dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
@@ -810,6 +817,35 @@ namespace TensorSharp.Cuda
             int cellsMax = p0 + nt;
             return Math.Clamp((cellsMax + 127) / 128, 1, MaxAttnSplits);
         }
+
+        // TS_Q4E_ATTN_MMA=0: prompt-size attention keeps the one-block-per-(head, row) kernel.
+        private readonly bool _attnMma = Environment.GetEnvironmentVariable("TS_Q4E_ATTN_MMA") != "0";
+
+        /// <summary>Attention calls that ran on tensor cores so far (a test proves the path engaged).</summary>
+        internal long PromptAttentionMmaCalls { get; private set; }
+
+        /// <summary>Whether an attention call of <paramref name="nt"/> rows runs on tensor cores: a prompt-size call (decode
+        /// steps and verify windows keep their kernels, so a row's answer does not depend on the window), the kernel built
+        /// for this GPU, and a query-head group of at most 16.</summary>
+        private bool AttnMmaFor(Dev dev, int nt)
+        {
+            if (!_attnMma || nt <= PerSlotMaxRows)
+                return false;
+            if (dev.QK.HasAttentionMma && _m.NHead % _m.NKvHead == 0 && _m.NHead / _m.NKvHead <= Q4eKernels.AttnMmaMaxGroup)
+                return true;
+            if (!_attnMmaDeclineWarned)
+            {
+                _attnMmaDeclineWarned = true;
+                Console.Error.WriteLine(dev.QK.HasAttentionMma
+                    ? $"[q4e-cuda] prompt attention runs on the CUDA cores: {_m.NHead} query heads over {_m.NKvHead} KV heads exceed the "
+                      + $"tensor-core kernel's {Q4eKernels.AttnMmaMaxGroup}-row group (prompts are slower; answers unchanged)."
+                    : "[q4e-cuda] prompt attention runs on the CUDA cores: the loaded tensorsharp_q4e_kernels module has no tensor-core "
+                      + "attention for this GPU (needs sm_80+ and a module built for it, not the compute_75 baseline); prompts are slower.");
+            }
+            return false;
+        }
+
+        private bool _attnMmaDeclineWarned;
 
         // The rows of the step in flight: a batched decode step sets it before its layers run.
         private int _rowsInFlight;

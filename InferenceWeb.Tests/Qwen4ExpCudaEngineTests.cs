@@ -934,6 +934,58 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Prompt-size attention on tensor cores (TS_Q4E_ATTN_MMA: a block per row and KV head, the group's query heads one
+    /// 16-row mma tile, F16 operands) against the one-block-per-(head, row) kernel: a 600-row prompt's logits and the
+    /// decode steps after it, dense (top_k 2048) and past the QSA width (top_k 16, every row from 19 on over its listed
+    /// cells), over the F16 and the Q8_0 cache. The operands round to F16, so the answers move a little (as much as the
+    /// Q8_0 cache moves them from F16); decode steps keep their kernels.
+    /// </summary>
+    [CudaTheory]
+    [InlineData(2048, false)]
+    [InlineData(16, false)]
+    [InlineData(16, true)]
+    public void TensorCorePromptAttention_AnswersAsTheScalarKernel(int indexerTopK, bool q8)
+    {
+        string path = Fixture(indexerTopK: indexerTopK);
+        int[] prompt = Enumerable.Range(0, 600).Select(i => (i * 37 + 11) % 250).ToArray();
+        KvCacheDtype saved = KvCacheDtypeConfig.Current;
+        bool savedExplicit = KvCacheDtypeConfig.IsExplicitlySet;
+        try
+        {
+            KvCacheDtypeConfig.Set(q8 ? KvCacheDtype.Q8_0 : KvCacheDtype.F16);
+            (float[][] Rows, long Calls) Answer(string mma)
+            {
+                _env.Set("TS_Q4E_ATTN_MMA", mma);
+                using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+                var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+                var rows = new float[Steps.Length + 1][];
+                rows[0] = (float[])model.ForwardRefill(prompt).Clone();
+                for (int i = 0; i < Steps.Length; i++)
+                    rows[i + 1] = (float[])model.Forward(new[] { Steps[i] }).Clone();
+                return (rows, engine.PromptAttentionMmaCalls);
+            }
+            var scalar = Answer("0");
+            var mma = Answer(null);
+            Assert.Equal(0, scalar.Calls);
+            Assert.True(mma.Calls > 0, "the prompt's attention did not run on tensor cores");
+            for (int i = 0; i < mma.Rows.Length; i++)
+            {
+                double err = RelativeError(mma.Rows[i], scalar.Rows[i]);
+                _output.WriteLine($"{(i == 0 ? "prefill" : $"decode {i}")}: tensor cores vs scalar kernel, relative error {err:E2}");
+                // Measured 4.2e-3 .. 5.4e-3 on the prefill and 3.0e-3 .. 5.2e-3 on the decode steps after it on an RTX 5090,
+                // through eight layers of the fixture (the Q8_0 cache moves them 3.7e-3 .. 4.8e-3 from F16);
+                // Q4eAttentionMmaTests holds the kernel itself to 1e-3 a row.
+                Assert.True(err <= 1e-2, $"{(i == 0 ? "prefill" : $"decode {i}")}: the tensor-core attention moved the logits by {err:E2}");
+            }
+        }
+        finally
+        {
+            KvCacheDtypeConfig.RestoreForTests(saved, savedExplicit);
+            _env.Set("TS_Q4E_ATTN_MMA", null);
+        }
+    }
+
     [GgmlFact(BackendType.GgmlCpu)]
     public void TheMtpFixture_DraftsOnTheNativeHead_Cpu() => NativeMtpSmoke(BackendType.GgmlCpu);
 

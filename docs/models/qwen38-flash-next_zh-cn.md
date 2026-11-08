@@ -919,6 +919,24 @@ RTX 5090，ISTA `Q2_0`，MTP，相同客户端，各重复 3 次（TTFT / decode
 | 之前（提前暂存下一层 prompt） | 0.07-0.09 s / 72-102 | 172-174 | 1.44-1.46 s / 135-146 | 5.84-5.87 s / 173-195 | 0.89-0.95 s |
 | 两阶段挑选、router 加载在途 | 0.07-0.09 s / 82-102 | 169-182 | 1.38-1.44 s / 140-185 | 5.79-5.86 s / 189-193 | 0.89-0.95 s |
 
+#### 在 tensor core 上计算 prompt 注意力，2026-11-08
+
+prompt 的注意力原来每个 query 头和行一个 block，block 的 warp 每次对一个 cell 做一次 warp 宽的点积；共享一个 KV 头的 12 个
+query 头各自重新加载并展开每个缓存的 key 和 value。这占 4K prompt 的 0.18 s，而 16K prompt 的每一行都要关注 2,051 个 cell。
+现在 prompt 大小的调用每个行和 KV 头运行一个四 warp 的 block（`TS_Q4E_ATTN_MMA`，默认开启）：该组的 query 头是一个 16 行
+tensor core tile 的行，每个 warp 把 16 个 cell 的 key 再把 value 在共享内存中展开为 F16 一次，S = QK^T 和 O += PV 在
+`mma.sync` 上运行（F16 操作数，F32 累加），配合在线 softmax；最后合并各 warp。decode 步和验证窗口保持原内核，所以验证行仍与
+它自己的 decode 步结果一致。操作数舍入到 F16：在测试 fixture 上 prompt 的 logits 相对变化 4e-3 到 5e-3（`q8_0` 缓存相对
+F16 变化 4e-3 到 5e-3），内核本身每行与 F32 内核相差不超过 5.3e-4（`Q4eAttentionMmaTests`）。需要 sm_80 或更新且模块为该 GPU 构建；提交的
+compute_75 基线没有 tensor core 实现，此时引擎提示一次并保留旧内核。
+
+RTX 5090，ISTA `Q2_0`，MTP，相同客户端，各重复 3 次（TTFT / decode tok/s；15/15 PASS）：
+
+| prompt 注意力 | 短对话 | 长生成 | 4K prompt | 16K prompt | 多轮首次 TTFT |
+| --- | --- | --- | --- | --- | --- |
+| 每个头和行一个 block | 0.07-0.09 s / 82-102 | 169-182 | 1.38-1.44 s / 140-185 | 5.79-5.86 s / 189-193 | 0.89-0.95 s |
+| tensor core（默认） | 0.07-0.09 s / 91-99 | 161-187 | 1.23-1.29 s / 99-161 | 4.99-5.08 s / 187-198 | 0.81-0.85 s |
+
 ### ggml_metal 上的 DFlash2 草稿模型，2026-11-08
 
 Strata 在 Mac 上用 DFlash2 起草：一种块草稿模型，一次前向最多提出 7 个 token。TensorSharp 现在在 GGML 后端上也能使用同一个草稿模型：
