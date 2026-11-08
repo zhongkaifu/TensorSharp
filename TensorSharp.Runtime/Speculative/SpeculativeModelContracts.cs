@@ -497,6 +497,18 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>Advance sequence i of the last verify by <c>kept[i]</c> tokens
         /// (1 .. window). Throws when the caches may be partially advanced.</summary>
         void CommitBatchedSpecVerify(IReadOnlyList<string> requestIds, int[] positions, int[] kept);
+
+        /// <summary>Whether <see cref="TryBatchedSpecVerifyLogits"/> serves the batched verify of
+        /// sequences that sample: each row's logits come back, and each sequence draws its rows
+        /// with its own sampler exactly as its solo step does.</summary>
+        bool SupportsBatchedSpecLogits => false;
+
+        /// <summary>
+        /// <see cref="TryBatchedSpecVerify"/> that fills <paramref name="logits"/>
+        /// ([sequences * window * vocab]) with every row's logits instead of their argmax.
+        /// </summary>
+        bool TryBatchedSpecVerifyLogits(IReadOnlyList<string> requestIds, int[] positions, int window,
+            int[] tokens, float[] logits, float[] features) => false;
     }
 
     /// <summary>

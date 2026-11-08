@@ -1703,6 +1703,162 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         }
     }
 
+    /// <summary>A batched verify (several sequences' draft windows in one forward, Q4eCudaEngine.ForwardBatchedVerify) computes
+    /// every sequence's own window: each row's first-max token and hidden streams as that sequence's own verify, and after
+    /// the commit (a different number of rows kept per sequence) the next step's logits as after its own commit. Dense
+    /// rows (top_k 2048) and QSA rows past the width (top_k 16).</summary>
+    [CudaTheory]
+    [InlineData(2048)]
+    [InlineData(16)]
+    public void BatchedVerify_ComputesEverySequencesOwnWindow(int indexerTopK)
+    {
+        using var ex = OpenExecutor(Fixture(indexerTopK: indexerTopK));
+        var engine = ex.Engine;
+        Assert.True(engine.SupportsBatchedVerify);
+        int[] prompts = { 30, 21, 37 };
+        int[][] windows = { new[] { 17, 203, 99, 4 }, new[] { 150, 61, 5, 77 }, new[] { 123, 9, 31, 200 } };
+        int[] keep = { 4, 2, 1 };
+        int n = prompts.Length, w = 4, h = engine.HiddenWidth;
+        var batched = new int[n];
+        var serial = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            batched[i] = NewActiveSlot(ex);
+            Step(ex, Prompt[..prompts[i]]);
+            serial[i] = NewActiveSlot(ex);
+            Step(ex, Prompt[..prompts[i]]);
+        }
+        var tokens = windows.SelectMany(x => x).ToArray();
+        var drawn = new int[n * w];
+        var hidden = new float[n * w * h];
+        Assert.True(engine.ForwardBatchedVerify(batched, w, tokens, drawn, hidden));
+        Assert.True(engine.CommitBatchedVerify(batched, keep));
+        for (int i = 0; i < n; i++)
+        {
+            Assert.True(ex.SetActiveSlot(serial[i]));
+            var wantDrawn = new int[w];
+            var wantHidden = new float[w * h];
+            engine.ForwardVerifyGreedy(windows[i], wantDrawn, wantHidden);
+            Assert.True(engine.CommitVerify(keep[i]));
+            Assert.Equal(wantDrawn, drawn.AsSpan(i * w, w).ToArray());
+            double hErr = RelativeError(hidden.AsSpan(i * w * h, w * h).ToArray(), wantHidden);
+            _output.WriteLine($"sequence {i}: hidden streams relative error {hErr:E2}");
+            Assert.True(hErr <= 1e-5, $"sequence {i}: the batched verify's hidden streams differ by {hErr:E2}");
+            float[] want = Step(ex, new[] { Steps[i] });
+            Assert.True(ex.SetActiveSlot(batched[i]));
+            Assert.Equal(prompts[i] + keep[i], engine.NPast);
+            float[] got = Step(ex, new[] { Steps[i] });
+            double err = RelativeError(got, want);
+            _output.WriteLine($"sequence {i}: next step after keeping {keep[i]} rows, relative error {err:E2}");
+            Assert.True(err <= 1e-5, $"sequence {i}: the step after the batched commit differs by {err:E2}");
+        }
+    }
+
+    /// <summary>A batched verify over the resident KV window (TS_Q4E_KV_RESIDENT, a window of one call's floor): every
+    /// sequence's QSA rows read their own slot's pages, fetched over the bus as the selections move, and each sequence's
+    /// rows and next step are its own verify's.</summary>
+    [CudaFact]
+    public void BatchedVerify_UnderAResidentKvWindow_ComputesEverySequencesOwnWindow()
+    {
+        _env.Set("TS_Q4E_KV_RESIDENT", "1");
+        // The window streams Q8_0 K/V; prompts in 128-row ubatches, each staged from the host copy.
+        using var ex = new Qwen4ExpCudaExecutor(Fixture(indexerTopK: 16), 1024, 128, 1, kvQ8: true);
+        var engine = ex.Engine;
+        Assert.True(engine.SupportsBatchedVerify);
+        Assert.True(engine.KvWindowCells > 0, "the KV window is off");
+        int[] lengths = { 600, 420, 520 };
+        int[][] windows = { new[] { 17, 203, 99, 4 }, new[] { 150, 61, 5, 77 }, new[] { 123, 9, 31, 200 } };
+        int[] keep = { 2, 4, 1 };
+        int n = lengths.Length, w = 4, h = engine.HiddenWidth;
+        var batched = new int[n];
+        var serial = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            int seed = i * 13;
+            int[] prompt = Enumerable.Range(0, lengths[i]).Select(t => (t * 37 + 11 + seed) % 250).ToArray();
+            batched[i] = NewActiveSlot(ex);
+            Step(ex, prompt);
+            serial[i] = NewActiveSlot(ex);
+            Step(ex, prompt);
+        }
+        var drawn = new int[n * w];
+        var hidden = new float[n * w * h];
+        // The batched slots' streamed layers, summed (the counters read the active slot).
+        (long Misses, long Overflows) Counters()
+        {
+            long misses = 0, overflows = 0;
+            foreach (int id in batched)
+            {
+                Assert.True(ex.SetActiveSlot(id));
+                var c = engine.KvStreamCounters();
+                misses += c.Misses;
+                overflows += c.Overflows;
+            }
+            return (misses, overflows);
+        }
+        var before = Counters();
+        Assert.True(engine.ForwardBatchedVerify(batched, w, windows.SelectMany(x => x).ToArray(), drawn, hidden));
+        var after = Counters();
+        _output.WriteLine($"window {engine.KvWindowCells} cells; pages fetched {before.Misses} before the batched verify, "
+            + $"{after.Misses - before.Misses} by it; {after.Overflows} overflowing resolves");
+        Assert.True(after.Misses > before.Misses, "the batched verify fetched no page over the bus");
+        Assert.Equal(0, after.Overflows);
+        Assert.True(engine.CommitBatchedVerify(batched, keep));
+        for (int i = 0; i < n; i++)
+        {
+            Assert.True(ex.SetActiveSlot(serial[i]));
+            var wantDrawn = new int[w];
+            var wantHidden = new float[w * h];
+            engine.ForwardVerifyGreedy(windows[i], wantDrawn, wantHidden);
+            Assert.True(engine.CommitVerify(keep[i]));
+            Assert.Equal(wantDrawn, drawn.AsSpan(i * w, w).ToArray());
+            double hErr = RelativeError(hidden.AsSpan(i * w * h, w * h).ToArray(), wantHidden);
+            _output.WriteLine($"sequence {i}: hidden streams relative error {hErr:E2}");
+            Assert.True(hErr <= 1e-5, $"sequence {i}: the batched verify's hidden streams differ by {hErr:E2}");
+            float[] want = Step(ex, new[] { Steps[i] });
+            Assert.True(ex.SetActiveSlot(batched[i]));
+            Assert.Equal(lengths[i] + keep[i], engine.NPast);
+            double err = RelativeError(Step(ex, new[] { Steps[i] }), want);
+            _output.WriteLine($"sequence {i}: next step after keeping {keep[i]} rows, relative error {err:E2}");
+            Assert.True(err <= 1e-5, $"sequence {i}: the step after the batched commit differs by {err:E2}");
+        }
+    }
+
+    /// <summary>The batched verify for sequences that sample returns every row's logits: each sequence's rows as its own
+    /// verify window's.</summary>
+    [CudaFact]
+    public void BatchedVerifyLogits_AreEachSequencesOwnVerifyLogits()
+    {
+        using var ex = OpenExecutor(Fixture(indexerTopK: 16));
+        var engine = ex.Engine;
+        int[] prompts = { 26, 33 };
+        int[][] windows = { new[] { 17, 203, 99, 4 }, new[] { 150, 61, 5, 77 } };
+        int n = prompts.Length, w = 4, vocab = ex.VocabSize;
+        var batched = new int[n];
+        var serial = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            batched[i] = NewActiveSlot(ex);
+            Step(ex, Prompt[..prompts[i]]);
+            serial[i] = NewActiveSlot(ex);
+            Step(ex, Prompt[..prompts[i]]);
+        }
+        var logits = new float[n * w * vocab];
+        Assert.True(engine.ForwardBatchedVerify(batched, w, windows.SelectMany(x => x).ToArray(), null, null, logits));
+        Assert.True(engine.CommitBatchedVerify(batched, new[] { 3, 1 }));
+        for (int i = 0; i < n; i++)
+        {
+            Assert.True(ex.SetActiveSlot(serial[i]));
+            var want = new float[w * vocab];
+            engine.ForwardVerify(windows[i], want, null);
+            for (int r = 0; r < w; r++)
+            {
+                double err = RelativeError(logits.AsSpan((i * w + r) * vocab, vocab).ToArray(), want.AsSpan(r * vocab, vocab).ToArray());
+                Assert.True(err <= 1e-5, $"sequence {i} row {r}: the batched verify's logits differ by {err:E2}");
+            }
+        }
+    }
+
     private static int ArgMax(float[] row)
     {
         int best = 0;

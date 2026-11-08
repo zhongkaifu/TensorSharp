@@ -112,8 +112,9 @@ namespace TensorSharp.Cuda
             {
                 dev.Logits = AllocF32(dev, 1, m.NVocab);
                 dev.BatchLogits = AllocF32(dev, MaxBatchedDecodeRows, m.NVocab);
-                dev.ArgIds = AllocT(dev, DType.Int32, VerifyMaxRows);
-                CudaDriverApi.cuMemHostAlloc(out _pinnedIds, new UIntPtr((ulong)VerifyMaxRows * 4), 0x1).ThrowOnError();
+                // A greedy verify's first-max tokens: a window, or a batched verify's windows (PerSlotMaxRows rows).
+                dev.ArgIds = AllocT(dev, DType.Int32, Math.Max(VerifyMaxRows, PerSlotMaxRows));
+                CudaDriverApi.cuMemHostAlloc(out _pinnedIds, new UIntPtr((ulong)Math.Max(VerifyMaxRows, PerSlotMaxRows) * 4), 0x1).ThrowOnError();
                 CudaDriverApi.cuMemHostAlloc(out _pinnedLogits,
                     new UIntPtr((ulong)MaxBatchedDecodeRows * (ulong)m.NVocab * 4), 0x1).ThrowOnError();
                 // Every row's streams of a ubatch (a speculative prompt chunk), a verify window or a batched step.
@@ -317,6 +318,7 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuStreamSynchronize(dev.Stream);
             }
             DestroySlotGraphs(slot.Id);
+            _bvSeq.Remove(slot.Id);
             foreach (var dev in _devs)
                 if (dev.KvStagedFor != null && Array.IndexOf(slot.Layers, dev.KvStagedFor) >= 0)
                     dev.KvStagedFor = null;
@@ -609,8 +611,10 @@ namespace TensorSharp.Cuda
             if (L.Recurrent)
                 Gdn(dev, L, il, slot, nt, rows, curQ);
             else if (rows != null)
-                for (int r = 0; r < nt; r++)
-                    Attention(dev, L, il, rows[r].Layers[il], r, 1, positions[r], curQ: curQ, curQRows: nt);
+                // A batched step's rows, a sequence's at a time: one row each in a batched decode step, a sequence's whole
+                // window (consecutive positions) in a batched verify, issued as that sequence's own verify issues it.
+                for (int r = 0; r < nt; r += _batchRowsPerSeq)
+                    Attention(dev, L, il, rows[r].Layers[il], r, _batchRowsPerSeq, positions[r], curQ: curQ, curQRows: nt);
             else
                 Attention(dev, L, il, slot.Layers[il], 0, nt, p0, pos, curQ, nt);
             // Decode-size halves meet in one launch: the scatter and the next mixer's first pass.
@@ -714,7 +718,8 @@ namespace TensorSharp.Cuda
             MatMulF32(dev, L.SsmBeta, dev.Cur, dev.Beta, m.NEmbd, m.GdnVHeads, nt);
             StageEnd(dev, StGdnProj);
 
-            // One sequence's nt rows in its own state, or one row of each batched sequence in theirs.
+            // One sequence's nt rows in its own state, or the rows of each batched sequence in theirs (one a sequence in a
+            // batched decode step, a window a sequence in a batched verify).
             IntPtr conv, ssm;
             int rowsPerSeq = nt, nSeq = 1;
             if (rows == null)
@@ -726,8 +731,8 @@ namespace TensorSharp.Cuda
             {
                 conv = BatchStatePtr(dev, il, 0);
                 ssm = BatchStatePtr(dev, il, 1);
-                rowsPerSeq = 1;
-                nSeq = nt;
+                rowsPerSeq = _batchRowsPerSeq;
+                nSeq = nt / _batchRowsPerSeq;
             }
             bool capture = _verifyCapture && rows == null;
             if (capture)
@@ -736,6 +741,8 @@ namespace TensorSharp.Cuda
                 Ptr(dev.Scr), rowsPerSeq, nSeq, m.GdnKHeads, m.GdnVHeads, m.DConv, m.RmsEps, dev.Stream);
             if (capture)
                 VerifySaveGdnInputs(dev, il, nt);
+            else if (_batchVerifyCapture && rows != null)
+                BatchVerifySaveGdnInputs(dev, il, nt);
             // After the prep read the previous inputs.
             dev.QK.ConvUpdate(Ptr(dev.Qkv), conv, rowsPerSeq, nSeq, ConvDim, m.DConv - 1, dev.Stream);
             dev.GK.KdaScan(Ptr(dev.Scr), ssm, Ptr(dev.Core), rowsPerSeq, nSeq, m.GdnVHeads, dev.Stream);
@@ -994,8 +1001,8 @@ namespace TensorSharp.Cuda
             else
             {
                 hists = BatchStatePtr(dev, m.NLayer, 0);
-                rowsPerSeq = 1;
-                nSeq = nt;
+                rowsPerSeq = _batchRowsPerSeq;
+                nSeq = nt / _batchRowsPerSeq;
             }
             dev.QK.PleConv(Ptr(dev.PleGated), Ptr(dev.PleNorm), hists, Ptr(L.PleConvT), Ptr(dev.Xs), rowsPerSeq, nSeq, hcE,
                 m.PleConvKernel, m.PleDilation, dev.Stream);
@@ -1003,6 +1010,8 @@ namespace TensorSharp.Cuda
             {
                 if (_verifyCapture && rows == null)
                     VerifySavePle(dev, slot, nt);
+                else if (_batchVerifyCapture && rows != null)
+                    BatchVerifySavePle(dev, nt);
                 dev.QK.ConvUpdate(Ptr(dev.PleNorm), hists, rowsPerSeq, nSeq, hcE, PleHistRows, dev.Stream);
             }
             StageEnd(dev, StPle);
