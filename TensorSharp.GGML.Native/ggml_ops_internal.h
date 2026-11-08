@@ -1030,6 +1030,8 @@ namespace tsg
                                  std::size_t offset[3], std::size_t bytes[3]);
     long long moe_stage_prefetch_hits();
     void moe_stage_prefetch_release();
+    // Decode / verify routes the route tail skip dropped in this process (ggml_ops_moe_hot_tier.cpp).
+    long long moe_tail_skipped_routes();
 
     // A buffer type over `inner` that keeps the one buffer its owner freed last and hands it to the owner's next
     // allocation it serves (ggml_ops_buffer_reuse.cpp): a graph slot rebuilt for every prompt chunk reuses its arena

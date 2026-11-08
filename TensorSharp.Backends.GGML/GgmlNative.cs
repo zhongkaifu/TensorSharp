@@ -4638,6 +4638,8 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static partial long TSGgml_Qwen4ExpQsaIncrementalSteps();
         [LibraryImport(DllName)]
+        internal static partial long TSGgml_MoeTailSkippedRoutes();
+        [LibraryImport(DllName)]
         internal static partial int TSGgml_Qwen4ExpCommitVerifyRow(int row, int rows);
 
         // Priority-ranked accelerator tier for host-offloaded routed experts and

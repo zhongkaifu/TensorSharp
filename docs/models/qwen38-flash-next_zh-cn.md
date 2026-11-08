@@ -920,6 +920,17 @@ indexer key（3.8 ms）、按 cell 的选择（1.1 ms），以及在选择掩码
 短回答、代码和长上下文解码现在与 Strata 持平或更快；散文约落后 10%。剩下的是读取提示：一个 4096 token 的块在短上下文时计算 8.2 s（16K 时 9.9 s），
 其中约 1 s 是在 GPU 计算之前暂存每层的全部专家（`TS_HOST_MOE_TIMING=1`）。
 
+#### Route tail skip（近似，默认开启），2026-11-08
+
+Strata 默认跳过这样的未命中专家：解码或验证窗口中每一行都只以排名 7 或更低路由到它（`STRATA_ROUTE_TAIL_SKIP=7`）。依用户的决定，TensorSharp
+现在在加速器专家分层（ggml_metal 与 ggml_cuda）中做同样的事：这样的专家既不读入窗口槽位，也不在主机上计算，其路由不贡献任何值
+（`TS_MOE_ROUTE_TAIL_SKIP`，`0` 计算所有路由）。提示规模、分层持有所有专家或持有 90% 以上时不启用（`TS_MOE_TAIL_SKIP_MAX_CACHED`）。结果因此是
+近似的：Strata 测得相对精确运行 KL 0.003-0.006，2-3 bit 包上 top-1 一致率约 98%。断言精确结果的一致性测试设置 `TS_MOE_ROUTE_TAIL_SKIP=0`；
+`RouteTailSkip_SkipsOnlyMissedLowRankRoutesAtDecode_Metal` 检查只有解码步会跳过、提示保持精确的位、持有所有专家的分层不跳过任何路由。
+
+M5 Pro、ISTA `Q2_0`、DFlash2，两组交替的关/开：每次解码的窗口读取 88-114 -> 33，短对话 22.4-24.6 -> 23.5-25.9 tok/s，长生成 39.8-44.2
+（均值 42.1）-> 42.1-44.3（均值 43.4）tok/s。一次解码约 31 ms 中约 26 ms 花在加速器分段上，所以减少读取只带来小幅提升。
+
 #### 读取提示：提前暂存专家、显式读取 PLE 行，2026-11-08
 
 `TS_Q4E_PHASE=1` 拆分一个提示块的耗时。GPU 之前有两项主机开销：

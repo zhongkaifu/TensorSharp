@@ -1329,6 +1329,21 @@ Short answers, code and long-context decoding now match or pass Strata; prose is
 remains: a 4096-token chunk takes 8.2 s of compute at a short context (9.9 s at 16K), of which ~1 s is staging every
 expert of each layer before the GPU may compute it (`TS_HOST_MOE_TIMING=1`).
 
+#### Route tail skip (approximate, on by default), 2026-11-08
+
+Strata skips, by default, a missed expert that every row of a decode or verify window routes only at rank 7 or lower
+(`STRATA_ROUTE_TAIL_SKIP=7`). TensorSharp does the same now, by the user's decision, in the accelerator expert tiers
+(ggml_metal and ggml_cuda): such an expert is neither read into a window slot nor computed on the host, and its routes
+contribute nothing (`TS_MOE_ROUTE_TAIL_SKIP`, `0` computes every route). It stays off at prompt widths, when the tier
+holds every expert, or 90% or more of them (`TS_MOE_TAIL_SKIP_MAX_CACHED`). Answers become approximate: Strata
+measured KL 0.003-0.006 against the exact run and ~98% top-1 agreement on 2-3-bit packs. Parity tests that assert
+exact answers set `TS_MOE_ROUTE_TAIL_SKIP=0`; `RouteTailSkip_SkipsOnlyMissedLowRankRoutesAtDecode_Metal` checks that
+only decode steps skip, that the prompt keeps its exact bits and that a tier holding every expert skips nothing.
+
+M5 Pro, ISTA `Q2_0`, DFlash2, two interleaved off/on pairs: window reads per decode pass 88-114 -> 33, short chat
+22.4-24.6 -> 23.5-25.9 tok/s, long generation 39.8-44.2 (mean 42.1) -> 42.1-44.3 (mean 43.4) tok/s. A decode pass
+spends ~26 of its ~31 ms in the accelerator's segments, so fewer reads move it only a little.
+
 #### Prompt reading: staged experts ahead, PLE rows read explicitly, 2026-11-08
 
 `TS_Q4E_PHASE=1` splits a prompt chunk's wall clock. Two host costs stood in front of the GPU:

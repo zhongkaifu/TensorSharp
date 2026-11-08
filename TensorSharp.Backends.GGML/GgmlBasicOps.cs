@@ -3552,6 +3552,14 @@ namespace TensorSharp.GGML
             catch (EntryPointNotFoundException) { return 0; }
         }
 
+        /// <summary>Test hook: decode / verify routes the route tail skip dropped in this process (missed experts routed
+        /// only at rank TS_MOE_ROUTE_TAIL_SKIP or lower; ggml_ops_moe_hot_tier.cpp). 0 when the hooks are not built.</summary>
+        public static long MoeTailSkippedRoutes()
+        {
+            try { return GgmlNative.TSGgml_MoeTailSkippedRoutes(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         /// <summary>DFlash feature taps for the following qwen4exp spans on this thread: after each
         /// <paramref name="layers"/>[i] (a completed-output layer id), the mean of its hyper-connection
         /// streams lands in row r of <paramref name="output"/> at column i * n_embd, rows

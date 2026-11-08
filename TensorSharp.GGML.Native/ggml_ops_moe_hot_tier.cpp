@@ -301,6 +301,34 @@ namespace tsg
         }
     }
 
+    // Strata's route tail skip (STRATA_ROUTE_TAIL_SKIP, on by default there since 0.1.42; on by default here by the
+    // user's decision of 2026-11-08): a missed expert - one the tier does not hold at the start of a decode or verify
+    // step - that every row of the step routes at rank TS_MOE_ROUTE_TAIL_SKIP or lower (0-based, the router's
+    // descending top-k; default 7, the 8th to 10th of 10) is neither read nor computed, and its routes contribute
+    // nothing (no renormalization, as Strata). Answers become approximate (Strata: KL 0.003-0.006 against the exact
+    // run, ~98% top-1 agreement on 2-3-bit packs). Not applied at prompt widths, when the tier holds every expert, or
+    // when it holds TS_MOE_TAIL_SKIP_MAX_CACHED percent of them or more (default 90). Read per step: a test toggles it.
+    namespace
+    {
+        std::atomic<long long> g_tail_skipped{0};   // routes skipped (moe_tail_skipped_routes)
+
+        int route_tail_skip_rank(const MoeHotTier& tier, int T, int n_used)
+        {
+            const char* e = std::getenv("TS_MOE_ROUTE_TAIL_SKIP");
+            const int rank = e ? std::atoi(e) : 7;
+            constexpr int kMaxWindowRows = 8;   // decode and verify windows (DFlash2's widest is 8 rows)
+            if (rank <= 0 || rank >= n_used || T > kMaxWindowRows) return 0;
+            const char* m = std::getenv("TS_MOE_TAIL_SKIP_MAX_CACHED");
+            const int max_cached = m ? std::atoi(m) : 90;
+            if (tier.count >= tier.num_experts
+                || static_cast<long long>(tier.count) * 100 >= static_cast<long long>(max_cached) * tier.num_experts)
+                return 0;
+            return rank;
+        }
+    }
+
+    long long moe_tail_skipped_routes() { return g_tail_skipped.load(std::memory_order_relaxed); }
+
     bool host_moe_split_hot_routes(const HostMoeSegment& hm, const std::int32_t* ids, const float* weights,
         std::vector<std::int32_t>& cold_ids, std::vector<float>& cold_weights, std::vector<std::uint8_t>& cold_pad,
         int& cold_used)
@@ -312,6 +340,33 @@ namespace tsg
             if (ids[i] < 0 || ids[i] >= tier.num_experts) return false;
         // Between segments: nothing the accelerator still runs reads the slots.
         if (tier_adapt_enabled()) tier_adapt(tier, ids, routes);
+
+        // The tail skip: the missed experts this step routes only at a low rank, decided against the slots as the step
+        // starts (before the window reads below).
+        static thread_local std::vector<std::int32_t> s_skip;   // skipped experts (a step routes a few dozen)
+        s_skip.clear();
+        if (const int skip_rank = route_tail_skip_rank(tier, T, n_used); skip_rank > 0)
+        {
+            for (std::size_t i = 0; i < routes; ++i)
+            {
+                const int e = ids[i];
+                if (tier.slot_of[e] >= 0 || static_cast<int>(i % n_used) < skip_rank) continue;
+                if (std::find(s_skip.begin(), s_skip.end(), e) != s_skip.end()) continue;
+                bool tail_only = true;
+                for (std::size_t j = 0; j < routes && tail_only; ++j)
+                    if (ids[j] == e && static_cast<int>(j % n_used) < skip_rank) tail_only = false;
+                if (tail_only) s_skip.push_back(e);
+            }
+        }
+        auto skipped = [&](int e) {
+            return !s_skip.empty() && std::find(s_skip.begin(), s_skip.end(), e) != s_skip.end();
+        };
+        if (!s_skip.empty())
+        {
+            long long n = 0;
+            for (std::size_t i = 0; i < routes; ++i) n += skipped(ids[i]) ? 1 : 0;
+            g_tail_skipped.fetch_add(n, std::memory_order_relaxed);
+        }
 
         // Window: give every routed expert that has no slot one, evicting the
         // least recently used window slot this step does not use, and read all
@@ -350,7 +405,7 @@ namespace tsg
             for (std::size_t i = 0; i < routes; ++i)
             {
                 const int e = ids[i];
-                if (tier.slot_of[e] >= 0) continue;
+                if (tier.slot_of[e] >= 0 || skipped(e)) continue;
                 int victim = -1;
                 for (int s2 = tier.fixed; s2 < tier.count; ++s2)
                     if (tier.step_used[s2] != step && (victim < 0 || tier.last_use[s2] < tier.last_use[victim]))
@@ -451,6 +506,7 @@ namespace tsg
                 }
                 row_slots[k] = next_free++;
                 if (slot >= 0) continue;          // deferred: computed in the second group
+                if (skipped(row[k])) continue;    // the tail skip: weight 0, nothing to compute
                 ++s_cold_count[r];
                 if (first_cold < 0) first_cold = row[k];
             }
@@ -479,7 +535,7 @@ namespace tsg
             // the host computes below.
             static thread_local std::vector<std::int32_t> s_tsm_slots;
             s_tsm_slots.resize(routes);
-            for (std::size_t i = 0; i < routes; ++i) s_tsm_slots[i] = tier.slot_of[ids[i]];
+            for (std::size_t i = 0; i < routes; ++i) s_tsm_slots[i] = tier.slot_of[ids[i]];   // skipped: -1, no host route
             // A seamed pass enqueued this seam's kernels ahead: the plan is all they still need.
             if (tsm::seams_active())
                 tsm::seams_write_plan(hm.hidden, hm.n_ff, T, n_used, s_tsm_slots.data(), weights);
@@ -515,7 +571,7 @@ namespace tsg
             for (int k = 0; k < n_used; ++k)
             {
                 const int e = row[k];
-                if (tier.slot_of[e] >= 0) continue;
+                if (tier.slot_of[e] >= 0 || skipped(e)) continue;
                 if (n == 0) pad = e;
                 cold_ids[static_cast<std::size_t>(r) * cold_used + n] = e;
                 cold_weights[static_cast<std::size_t>(r) * cold_used + n] = weights[static_cast<std::size_t>(r) * n_used + k];
@@ -842,3 +898,15 @@ TSG_EXPORT void TSGgml_MoeRoutingReset(const void* gate)
     if (gate == nullptr) tsg::g_counts.clear();
     else tsg::g_counts.erase(gate);
 }
+
+#ifdef TSG_GGML_TEST_HOOKS
+// Test hook: decode / verify routes the route tail skip dropped in this process (host_moe_split_hot_routes).
+// Kept out of the production ABI manifest's TSG_EXPORT scan.
+#ifndef TSG_TEST_EXPORT
+#define TSG_TEST_EXPORT TSG_EXPORT
+#endif
+extern "C" TSG_TEST_EXPORT long long TSGgml_MoeTailSkippedRoutes()
+{
+    return tsg::moe_tail_skipped_routes();
+}
+#endif

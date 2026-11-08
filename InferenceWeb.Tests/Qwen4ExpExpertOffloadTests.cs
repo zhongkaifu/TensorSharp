@@ -239,6 +239,49 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
                 $"step {i}: the event seams changed the logits ({(hostHalf ? "half the experts on the host" : "every route held")})");
     }
 
+    /// <summary>The route tail skip (Strata's STRATA_ROUTE_TAIL_SKIP, on by default at rank 7): a decode step does not
+    /// read or compute a missed expert that every row routes only at a low rank. The fixture routes 4 experts a token,
+    /// so the test lowers the rank to 2. With a window too small for the routes, decode steps skip some (the counter)
+    /// and stay close to the exact answer; the prompt (a prompt-width batch) never skips, so its logits are the exact
+    /// run's bits; and a tier that holds every expert skips nothing (the same bits throughout).</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void RouteTailSkip_SkipsOnlyMissedLowRankRoutesAtDecode_Metal()
+    {
+        float[][] Answer(string rank, bool allHeld)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_MOE_ROUTE_TAIL_SKIP", rank);
+            env.Set("TS_MOE_TAIL_SKIP_MAX_CACHED", "100");
+            return Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, model =>
+            {
+                var q = Assert.IsType<Qwen4ExpModel>(model);
+                int experts = q.ExpertCountForTests;
+                Assert.Equal(8, allHeld
+                    ? q.RegisterExpertTiersForTests(experts, 0)
+                    : q.RegisterExpertTiersForTests(experts / 4, 2));
+            });
+        }
+        float[][] exact = Answer("0", allHeld: false);
+        long before = GgmlBasicOps.MoeTailSkippedRoutes();
+        float[][] skipped = Answer("2", allHeld: false);
+        long dropped = GgmlBasicOps.MoeTailSkippedRoutes() - before;
+        _output.WriteLine($"routes skipped: {dropped}");
+        Assert.True(dropped > 0, "no decode step skipped a missed low-rank route");
+        Assert.True(skipped[0].AsSpan().SequenceEqual(exact[0]), "the prompt skipped routes (prompt widths compute every route)");
+        for (int i = 1; i < skipped.Length; i++)
+        {
+            Assert.All(skipped[i], v => Assert.True(float.IsFinite(v)));
+            _output.WriteLine($"decode {i}: relative error {RelativeError(skipped[i], exact[i]):E3}");
+        }
+
+        float[][] heldExact = Answer("0", allHeld: true);
+        before = GgmlBasicOps.MoeTailSkippedRoutes();
+        float[][] heldSkip = Answer("2", allHeld: true);
+        Assert.Equal(0, GgmlBasicOps.MoeTailSkippedRoutes() - before);
+        for (int i = 0; i < heldSkip.Length; i++)
+            Assert.True(heldSkip[i].AsSpan().SequenceEqual(heldExact[i]), $"row {i}: a tier holding every expert skipped routes");
+    }
+
     /// <summary>A prompt-width span runs its GDN layers' recurrence (conv, L2 norms, gates, the state scan, the gated
     /// norm) and its hyper-connection passes (the gated stream mean after the up projection, the scatter) on
     /// TensorSharp's Metal kernels (tsm/kernels/tsm_gdn_prompt.metal after Strata's gdn_prompt, tsm_hc_prompt.metal)
