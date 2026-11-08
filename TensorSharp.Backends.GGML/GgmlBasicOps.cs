@@ -3600,6 +3600,14 @@ namespace TensorSharp.GGML
         /// <paramref name="rows"/>-row verify into the live state buffers.</summary>
         public static bool Qwen4ExpCommitVerifyRow(int row, int rows) => GgmlNative.TSGgml_Qwen4ExpCommitVerifyRow(row, rows) != 0;
 
+        /// <summary>Bytes held by qwen4exp's verify row buffers (one set shared by every holder); 0 when the native
+        /// library predates the counter.</summary>
+        public static long Qwen4ExpRowBufferBytes()
+        {
+            try { return GgmlNative.TSGgml_Qwen4ExpRowBufferBytes(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         /// <summary>Copy <paramref name="experts"/> of one host-offloaded MoE layer (its
         /// mapped gate/up/down stacks) into a compact accelerator tier; the layer's
         /// graphs then run those routes on the accelerator and the rest on the host.

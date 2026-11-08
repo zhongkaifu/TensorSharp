@@ -4646,6 +4646,8 @@ internal enum GgmlIndexReductionOp
         internal static partial long TSGgml_MoeTailSkippedRoutes();
         [LibraryImport(DllName)]
         internal static partial int TSGgml_Qwen4ExpCommitVerifyRow(int row, int rows);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_Qwen4ExpRowBufferBytes();
 
         // Priority-ranked accelerator tier for host-offloaded routed experts and
         // the routing counters the host seams keep (ggml_ops_moe_hot_tier.cpp).
