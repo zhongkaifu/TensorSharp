@@ -413,9 +413,19 @@ if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
                 "-DFILES=${TSM_KERNEL_FILES_ARG}" -P "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
         DEPENDS ${TSM_KERNEL_FILES} "${TSM_GGML_COMMON}" "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
         COMMENT "Embedding the TensorSharp Metal kernels")
-    list(APPEND TSG_GGMLOPS_SOURCES tsm/tsm_moe.mm "${TSM_SOURCE_INC}")
+    # The tensor-API kernels: a library of their own (Metal language 4.0), so a device or SDK without the tensor API keeps
+    # every kernel above.
+    set(TSM_MPP_FILES "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_qsa_attn_mm.metal")
+    set(TSM_MPP_INC "${CMAKE_CURRENT_BINARY_DIR}/tsm_mpp_source.inc")
+    string(REPLACE ";" "\\;" TSM_MPP_FILES_ARG "${TSM_MPP_FILES}")
+    add_custom_command(OUTPUT "${TSM_MPP_INC}"
+        COMMAND ${CMAKE_COMMAND} -DOUT=${TSM_MPP_INC} -DVAR=kTsmMppSource -DMPP=1
+                "-DFILES=${TSM_MPP_FILES_ARG}" -P "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
+        DEPENDS ${TSM_MPP_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
+        COMMENT "Embedding the TensorSharp Metal tensor-API kernels")
+    list(APPEND TSG_GGMLOPS_SOURCES tsm/tsm_moe.mm "${TSM_SOURCE_INC}" "${TSM_MPP_INC}")
     set_source_files_properties(tsm/tsm_moe.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
-        OBJECT_DEPENDS "${TSM_SOURCE_INC}")
+        OBJECT_DEPENDS "${TSM_SOURCE_INC};${TSM_MPP_INC}")
 endif()
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)

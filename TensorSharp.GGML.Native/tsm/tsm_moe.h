@@ -131,8 +131,11 @@ namespace tsm
     // products. q F32 [D, T, H]; k, v the F16 caches [D, cells, kv heads] (any row / head strides); idx and cnt from
     // qsa_select_encode; mask_in F16 [cells, T] (each chosen cell's own mask value is added); out F32 [D, H, T] (ggml's
     // flash-attention layout). D = 256, up to 16 query heads a kv head. TS_METAL_QSA_ATTN=0 keeps ggml's flash
-    // attention; TS_METAL_QSA_ATTN_MIN_CELLS (default 12288) is the narrowest window it runs for.
+    // attention; TS_METAL_QSA_ATTN_MIN_CELLS (default 8192 on the tensor API, 12288 otherwise) is the narrowest window.
     bool qsa_attn_supported(ggml_backend* backend, int head_dim, int n_head, int n_head_kv, int kv_type, int n_cells);
+    // Whether it runs on the Metal 4 tensor API here (tsm_qsa_attn_mm: an M5-class device; TS_METAL_QSA_ATTN_MM=0 keeps
+    // the simdgroup kernel). The default window threshold is 8192 cells then, 12288 otherwise.
+    bool qsa_attn_tensor_api(ggml_backend* backend);
     bool qsa_attn_encode(ggml_backend* backend, const ggml_tensor* q, const ggml_tensor* k, const ggml_tensor* v,
                          const ggml_tensor* idx, const ggml_tensor* cnt, const ggml_tensor* mask_in, ggml_tensor* out,
                          int T, int n_head, int n_head_kv, int n_cells, int width, float scale);

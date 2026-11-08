@@ -1005,9 +1005,18 @@ argmax 全部相同；所有专家都在主机上时为 3.0e-4，Q8_K 激活放�
 差异（4.7e-5）。它的开销与窗口宽度无关，ggml 的则随窗口增长：4K 窗口每块 +0.40 s，8K +0.20 s，12K -0.23 s，16K -0.62 s，因此阈值为 12K
 （`TS_METAL_QSA_ATTN_MIN_CELLS`）。
 
+第一版内核用 simdgroup 矩阵计算，单位工作量比 ggml 的 flash attention 慢约 3 倍：在 M5 上，ggml 的注意力运行在 Metal 4 tensor API（矩阵单元）上。
+该内核也改写到了这个 API 上（`tsm_qsa_attn_mm.metal`，`TS_METAL_QSA_ATTN_MM`）：采用 ggml tensor flash attention 的结构（四个 simdgroup 上
+用 `matmul2d` 计算 Q.K^T 与 P.V，惰性重缩放，O 存于 cooperative tensor），所选 cell 的 key 与 value 收集到线程组内存。它以 Metal 语言 4.0 编译为
+独立的库，只在 M5 级设备上使用（ggml 的规则），因此没有该 API 的设备或 SDK 不影响其他内核，并回退到 simdgroup 内核。按 Flash Next 形状的探针
+（`QsaAttention_FlashNextShape_Timing`：4096 token、24 个查询头对 2 个 kv 头、16K 窗口）每层 42 ms，此前 79 ms；与双精度参考相比误差 1.9e-4。
+相对 ggml 的 flash attention，每块：4K 窗口 +0.18 s，8K -0.20 s，12K -0.57 s，16K -0.97 s，因此这里的阈值为 8K。16K 冒烟测试：各块
+5.06 / 5.24 / 5.29 / 5.34 s，用 ggml 的注意力时为 5.06 / 5.44 / 5.86 / 6.31 s。
+
 | 配置（同一客户端，DFlash2 Q4_K_M，3 次） | 短对话 | 长生成解码 | 4K TTFT | 16K TTFT | 多轮首轮 |
 | --- | --- | --- | --- | --- | --- |
 | + QSA 选择与注意力内核（`df2-sa`） | 0.30-0.32 s / 21-25 tok/s | 38.4-42.7 tok/s | **5.92-6.14 s** | **24.48-25.25 s** | 4.0-4.5 s |
+| + tensor API 上的注意力、route tail skip（`df2-mm`） | 0.30-0.32 s / 20.5-25.8 tok/s | 43.0-45.0 tok/s | **5.97-6.22 s** | **23.91-24.23 s** | 4.0-4.5 s |
 | Strata DFlash2 | 0.56 s / 19 tok/s | 47.8 tok/s | 6.32 s | 24.4 s | - |
 
 ## 多 GPU

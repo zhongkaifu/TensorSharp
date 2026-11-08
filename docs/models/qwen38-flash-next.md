@@ -1433,9 +1433,21 @@ attention over the same cells it differs by rounding (4.7e-5). Its cost does not
 +0.40 s a chunk at a 4K window, +0.20 s at 8K, -0.23 s at 12K, -0.62 s at 16K, hence the 12K threshold
 (`TS_METAL_QSA_ATTN_MIN_CELLS`).
 
+That first kernel computed with simdgroup matrices and ran ~3x below ggml's flash attention per unit of work: on an M5,
+ggml's attention runs on the Metal 4 tensor API (the matrix units). The kernel was rewritten on that API too
+(`tsm_qsa_attn_mm.metal`, `TS_METAL_QSA_ATTN_MM`): the structure of ggml's tensor flash attention (`matmul2d` for Q.K^T
+and P.V over four simdgroups, lazy rescaling, O in a cooperative tensor) with the chosen cells' keys and values
+gathered into threadgroup memory. It is compiled as its own library at Metal language 4.0, on M5-class devices only
+(ggml's rule), so a device or SDK without the API keeps every other kernel and falls back to the simdgroup one. A
+probe at Flash Next's shapes (`QsaAttention_FlashNextShape_Timing`: 4096 tokens, 24 query heads over 2 kv heads, a 16K
+window) takes 42 ms a layer instead of 79; it answers as a double-precision reference to 1.9e-4. Against ggml's flash
+attention per chunk: +0.18 s at a 4K window, -0.20 s at 8K, -0.57 s at 12K, -0.97 s at 16K, so the threshold is 8K
+there. 16K smoke: chunks 5.06 / 5.24 / 5.29 / 5.34 s instead of 5.06 / 5.44 / 5.86 / 6.31 s with ggml's attention.
+
 | run (same client, DFlash2 Q4_K_M, 3 repeats) | short chat | long-gen decode | 4K TTFT | 16K TTFT | multi-turn first turn |
 | --- | --- | --- | --- | --- | --- |
 | + QSA selection and attention kernels (`df2-sa`) | 0.30-0.32 s / 21-25 tok/s | 38.4-42.7 tok/s | **5.92-6.14 s** | **24.48-25.25 s** | 4.0-4.5 s |
+| + attention on the tensor API, route tail skip (`df2-mm`) | 0.30-0.32 s / 20.5-25.8 tok/s | 43.0-45.0 tok/s | **5.97-6.22 s** | **23.91-24.23 s** | 4.0-4.5 s |
 | Strata DFlash2 | 0.56 s / 19 tok/s | 47.8 tok/s | 6.32 s | 24.4 s | - |
 
 ## Multi-GPU

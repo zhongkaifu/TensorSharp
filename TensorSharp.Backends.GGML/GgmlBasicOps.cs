@@ -3506,6 +3506,23 @@ namespace TensorSharp.GGML
                     (IntPtr)mi, (IntPtr)mo) != 0;
         }
 
+        /// <summary>Test probe of the QSA attention over the chosen cells (tsm::qsa_attn_encode): q [H, T, 256] F32, k and
+        /// v [kv heads, cells, 256] F16 bits, idx [T, width], cnt [T], mask [T, cells] F16 bits in; out [T, H, 256]. With
+        /// <paramref name="iterations"/> > 0 also the time of one pass over that many (<paramref name="msPerPass"/>).</summary>
+        public static unsafe bool TsmQsaAttnProbe(int rows, int heads, int kvHeads, int cells, int width, float scale,
+            float[] q, ushort[] k, ushort[] v, int[] idx, int[] cnt, ushort[] mask, float[] output, int iterations,
+            out double msPerPass)
+        {
+            double ms = 0;
+            bool ok;
+            fixed (float* qp = q) fixed (ushort* kp = k) fixed (ushort* vp = v) fixed (int* ip = idx) fixed (int* cp = cnt)
+            fixed (ushort* mp = mask) fixed (float* op = output)
+                ok = GgmlNative.TSGgml_TsmQsaAttnProbe(rows, heads, kvHeads, cells, width, scale, (IntPtr)qp, (IntPtr)kp,
+                    (IntPtr)vp, (IntPtr)ip, (IntPtr)cp, (IntPtr)mp, (IntPtr)op, iterations, (IntPtr)(&ms)) != 0;
+            msPerPass = ms;
+            return ok;
+        }
+
         /// <summary>Test hook: the prompt-width QSA selections that ran on TensorSharp's Metal kernels
         /// (tsm::qsa_select_encode) in this process. 0 off Apple's Metal builds.</summary>
         public static long TsmQsaSelectCount()

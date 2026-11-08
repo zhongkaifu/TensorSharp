@@ -4632,6 +4632,9 @@ internal enum GgmlIndexReductionOp
         internal static partial int TSGgml_TsmQsaSelectProbe(int T, int nCells, int nBlocks, int heads, int width,
             IntPtr scores, IntPtr bias, IntPtr cellBlocks, IntPtr maskIn, IntPtr maskOut);
         [LibraryImport(DllName)]
+        internal static partial int TSGgml_TsmQsaAttnProbe(int T, int nHead, int nHeadKv, int nCells, int width, float scale,
+            IntPtr q, IntPtr k, IntPtr v, IntPtr idx, IntPtr cnt, IntPtr mask, IntPtr output, int iterations, IntPtr msPerPass);
+        [LibraryImport(DllName)]
         internal static partial long TSGgml_MoeStagePrefetchHits();
         [LibraryImport(DllName)]
         internal static partial int TSGgml_HostReadRows(IntPtr table, long rowBytes, IntPtr rows, int count, IntPtr dst);

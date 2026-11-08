@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "tsm_moe_source.inc"
+#include "tsm_mpp_source.inc"
 
 namespace
 {
@@ -66,9 +67,14 @@ namespace
         // gdn_prompt_encode's scratch: normalized q / k, conv'd v, gate+beta, k.q, the scan's output, the staged tail
         id<MTLBuffer> gqn = nil, gkn = nil, gvc = nil, ggb = nil, gkq = nil, go = nil, ghist = nil;
         std::size_t gqn_bytes = 0, gkn_bytes = 0, gvc_bytes = 0, ggb_bytes = 0, gkq_bytes = 0, go_bytes = 0, ghist_bytes = 0;
-        // qsa_select_encode's scratch: the per-token block scores
-        id<MTLBuffer> qs = nil;
-        std::size_t qs_bytes = 0;
+        // qsa_select_encode's scratch: the per-token block scores; qsa_attn_encode's: the queries in half
+        id<MTLBuffer> qs = nil, qh = nil;
+        std::size_t qs_bytes = 0, qh_bytes = 0;
+        // The tensor-API library (tsm_mpp_source.inc, Metal language 4.0), compiled on first use: 0 untried, 1 ready,
+        // -1 not available on this device or SDK (the simdgroup kernels run instead).
+        id<MTLLibrary> library_mpp = nil;
+        int mpp_state = 0;
+        std::map<std::string, id<MTLComputePipelineState>> pipelines_mpp;
     };
     State& state() { static State s; return s; }
 
@@ -107,8 +113,11 @@ namespace
         s.xp_bytes = s.h_bytes = s.ye_bytes = 0;
         s.gqn = s.gkn = s.gvc = s.ggb = s.gkq = s.go = s.ghist = nil;
         s.gqn_bytes = s.gkn_bytes = s.gvc_bytes = s.ggb_bytes = s.gkq_bytes = s.go_bytes = s.ghist_bytes = 0;
-        s.qs = nil;
-        s.qs_bytes = 0;
+        s.qs = s.qh = nil;
+        s.qs_bytes = s.qh_bytes = 0;
+        s.library_mpp = nil;
+        s.mpp_state = 0;
+        s.pipelines_mpp.clear();
         MTLCompileOptions* options = [MTLCompileOptions new];
         // Safe math, as Strata compiles them: no reassociation, so a row's sums do not depend on the window around it.
         if (@available(macOS 15.0, iOS 18.0, *)) options.mathMode = MTLMathModeSafe;
@@ -124,6 +133,52 @@ namespace
         s.plan = [device newBufferWithLength:P_INTS * sizeof(int) options:MTLResourceStorageModeShared];
         s.ent = [device newBufferWithLength:kMaxRows * 32 * sizeof(int) options:MTLResourceStorageModeShared];
         s.plan_host.assign(P_INTS, 0);
+    }
+
+    // Whether the tensor-API kernels run here: the Metal 4 family, an M5 / M6 / A19 / A20 (ggml's rule: the tensor API
+    // pays from those on; TS_METAL_TENSOR_ENABLE=1 tries it on any Metal 4 device), and the library compiles.
+    // TS_METAL_QSA_ATTN_MM=0 keeps the simdgroup kernels.
+    bool mpp_available(State& s, id<MTLDevice> device)
+    {
+        if (const char* e = std::getenv("TS_METAL_QSA_ATTN_MM"); e && e[0] == '0') return false;
+        if (s.mpp_state != 0) return s.mpp_state > 0;
+        s.mpp_state = -1;
+        const char* why = nullptr;
+        NSString* name = device.name;
+        const bool recent = [name containsString:@"M5"] || [name containsString:@"M6"] || [name containsString:@"A19"]
+            || [name containsString:@"A20"];
+        const char* force = std::getenv("TS_METAL_TENSOR_ENABLE");
+        if (![device supportsFamily:(MTLGPUFamily)5002]) why = "not a Metal 4 device";
+        else if (!recent && !(force && force[0] == '1')) why = "a pre-M5 device (TS_METAL_TENSOR_ENABLE=1 tries it)";
+        else
+        {
+            MTLCompileOptions* options = [MTLCompileOptions new];
+            options.languageVersion = (MTLLanguageVersion)(4 << 16);   // MTLLanguageVersion4_0, absent in older SDKs
+            if (@available(macOS 15.0, iOS 18.0, *)) options.mathMode = MTLMathModeSafe;
+            NSError* error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:kTsmMppSource]
+                                                          options:options error:&error];
+            if (library == nil) why = "the tensor-API kernels do not compile";
+            else { s.library_mpp = library; s.mpp_state = 1; }
+            if (library == nil && error != nil)
+                std::fprintf(stderr, "[tsm] tensor API: %s\n", error.localizedDescription.UTF8String);
+        }
+        if (why != nullptr) std::fprintf(stderr, "[tsm] the tensor-API kernels do not run here: %s\n", why);
+        return s.mpp_state > 0;
+    }
+
+    id<MTLComputePipelineState> pipeline_mpp(State& s, const std::string& name)
+    {
+        auto it = s.pipelines_mpp.find(name);
+        if (it != s.pipelines_mpp.end()) return it->second;
+        NSError* error = nil;
+        id<MTLFunction> f = [s.library_mpp newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]];
+        if (f == nil) throw std::runtime_error("tsm: no tensor-API kernel " + name);
+        id<MTLComputePipelineState> p = [s.device newComputePipelineStateWithFunction:f error:&error];
+        if (p == nil)
+            throw std::runtime_error("tsm: pipeline " + name + ": " + (error ? error.localizedDescription.UTF8String : "?"));
+        s.pipelines_mpp[name] = p;
+        return p;
     }
 
     id<MTLBuffer> grow(State& s, id<MTLBuffer> b, std::size_t& have, std::size_t need)
@@ -1057,14 +1112,36 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
 
     long long qsa_select_count() { return g_qsa_select_count.load(std::memory_order_relaxed); }
 
+    // Whether the attention over the chosen cells runs on the tensor-API kernel here (compiles it on first use).
+    bool qsa_attn_tensor_api(ggml_backend* backend)
+    {
+        ggml_metal_device_t dev = metal_device(backend);
+        if (dev == nullptr) return false;
+        try
+        {
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                ensure_library(s, device);
+                return mpp_available(s, device);
+            }
+        }
+        catch (const std::exception&) { return false; }
+    }
+
     bool qsa_attn_supported(ggml_backend* backend, int head_dim, int n_head, int n_head_kv, int kv_type, int n_cells)
     {
         const char* e = std::getenv("TS_METAL_QSA_ATTN");
         if (e && e[0] == '0') return false;
         const char* m = std::getenv("TS_METAL_QSA_ATTN_MIN_CELLS");   // read per graph build (a test lowers it)
-        // M5 Pro, Flash Next, a 4096-token chunk's 12 QSA layers: +0.40 s against ggml's flash attention at a 4K window,
-        // +0.20 s at 8K, -0.23 s at 12K, -0.62 s at 16K (the chosen cells' cost is flat; the window's is not).
-        const int min_cells = m && std::atoi(m) > 0 ? std::atoi(m) : 12288;
+        // M5 Pro, Flash Next, a 4096-token chunk's 12 QSA layers against ggml's flash attention: the simdgroup kernel
+        // +0.40 s at a 4K window, +0.20 s at 8K, -0.23 s at 12K, -0.62 s at 16K; the tensor-API kernel (1.9x faster)
+        // +0.18 s at 4K, -0.20 s at 8K, -0.57 s at 12K, -0.97 s at 16K.
+        int min_cells = 12288;
+        if (qsa_attn_tensor_api(backend)) min_cells = 8192;
+        if (m && std::atoi(m) > 0) min_cells = std::atoi(m);
         return metal_device(backend) != nullptr && head_dim == 256 && n_head_kv > 0 && n_head % n_head_kv == 0
             && n_head / n_head_kv <= 16 && kv_type == GGML_TYPE_F16 && n_cells >= min_cells;
     }
@@ -1100,10 +1177,17 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
                 id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
                 id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
                 ensure_library(s, device);
+                s.qh = grow(s, s.qh, s.qh_bytes, static_cast<std::size_t>(n_head_kv) * 16 * t * D * sizeof(std::uint16_t));
                 id<MTLCommandBuffer> cmd = [queue commandBuffer];
-                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-                [enc setComputePipelineState:pipeline(s, "tsm_qsa_attn")];
-                bind(enc, qi, 0, 0); bind(enc, ki, 0, 1); bind(enc, vi, 0, 2); bind(enc, xi, 0, 3);
+                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];   // serial: the attention reads qh
+                [enc setComputePipelineState:pipeline(s, "tsm_qsa_q_half")];
+                bind(enc, qi, 0, 0);
+                [enc setBuffer:s.qh offset:0 atIndex:1];
+                [enc setBytes:&args length:sizeof(args) atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(16, T, n_head_kv) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc setComputePipelineState:mpp_available(s, device) ? pipeline_mpp(s, "tsm_qsa_attn_mm")
+                                                                       : pipeline(s, "tsm_qsa_attn")];
+                [enc setBuffer:s.qh offset:0 atIndex:0]; bind(enc, ki, 0, 1); bind(enc, vi, 0, 2); bind(enc, xi, 0, 3);
                 bind(enc, ci, 0, 4); bind(enc, mi, 0, 5); bind(enc, oi, 0, 6);
                 [enc setBytes:&args length:sizeof(args) atIndex:7];
                 [enc dispatchThreadgroups:MTLSizeMake(T, n_head_kv, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -1275,4 +1359,69 @@ TSG_EXPORT int TSGgml_TsmQsaSelectProbe(int T, int n_cells, int n_blocks, int he
 TSG_EXPORT long long TSGgml_TsmQsaAttnCount()
 {
     return tsm::qsa_attn_count();
+}
+
+// ---- test probe: one QSA attention over the chosen cells (qsa_attn_encode) on inputs the caller gives - q F32
+// [256, T, H], k and v F16 bits [256, cells, kv heads], idx I32 [width, T], cnt I32 [T], mask F16 bits [cells, T] -
+// into out F32 [256, H, T]. With iterations > 0 it then times that many back-to-back passes (*ms_per_pass). Returns 1,
+// or 0 with the last error set.
+TSG_EXPORT int TSGgml_TsmQsaAttnProbe(int T, int n_head, int n_head_kv, int n_cells, int width, float scale,
+    const float* q, const std::uint16_t* k, const std::uint16_t* v, const std::int32_t* idx, const std::int32_t* cnt,
+    const std::uint16_t* mask, float* out, int iterations, double* ms_per_pass)
+{
+    using namespace tsg;
+    if (!ensure_backend()) return 0;
+    ggml_backend_t backend = g_backend;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_context* ctx = nullptr;
+    try
+    {
+        ggml_init_params ip{};
+        ip.mem_size = 10 * ggml_tensor_overhead();
+        ip.no_alloc = true;
+        ctx = ggml_init(ip);
+        ggml_tensor* tq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, T, n_head);
+        ggml_tensor* tk = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 256, n_cells, n_head_kv);
+        ggml_tensor* tv = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 256, n_cells, n_head_kv);
+        ggml_tensor* ti = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, T);
+        ggml_tensor* tc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+        ggml_tensor* tm = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_cells, T);
+        ggml_tensor* to = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, n_head, T);
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (buf == nullptr) throw std::runtime_error("tsm qsa attn probe: buffer");
+        ggml_backend_tensor_set(tq, q, 0, ggml_nbytes(tq));
+        ggml_backend_tensor_set(tk, k, 0, ggml_nbytes(tk));
+        ggml_backend_tensor_set(tv, v, 0, ggml_nbytes(tv));
+        ggml_backend_tensor_set(ti, idx, 0, ggml_nbytes(ti));
+        ggml_backend_tensor_set(tc, cnt, 0, ggml_nbytes(tc));
+        ggml_backend_tensor_set(tm, mask, 0, ggml_nbytes(tm));
+        auto wait_last = [] {
+            State& st = state();
+            std::lock_guard<std::mutex> lock(st.mu);
+            if (st.last != nil) [st.last waitUntilCompleted];
+        };
+        if (!tsm::qsa_attn_encode(backend, tq, tk, tv, ti, tc, tm, to, T, n_head, n_head_kv, n_cells, width, scale))
+            throw std::runtime_error(g_last_error);
+        wait_last();
+        ggml_backend_tensor_get(to, out, 0, ggml_nbytes(to));
+        if (iterations > 0 && ms_per_pass != nullptr)
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; ++i)
+                if (!tsm::qsa_attn_encode(backend, tq, tk, tv, ti, tc, tm, to, T, n_head, n_head_kv, n_cells, width, scale))
+                    throw std::runtime_error(g_last_error);
+            wait_last();
+            *ms_per_pass = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / iterations;
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return 1;
+    }
+    catch (const std::exception& e)
+    {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        set_last_error(e.what());
+        return 0;
+    }
 }

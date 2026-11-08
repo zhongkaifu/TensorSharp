@@ -1,6 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using TensorSharp;
 using TensorSharp.GGML;
@@ -170,5 +171,106 @@ public sealed class TsmMoeKernelTests
         }
         _output.WriteLine($"{rows} rows over {cells} cells: {boundaryTies} rows split a tie at the cutoff");
         Assert.True(boundaryTies > 0, "the fixture never split a tie at the cutoff");
+    }
+
+    // Random cell lists like a QSA selection's: blocks of 4 consecutive cells, ascending, the row's own cells last.
+    private static (int[] idx, int[] cnt) QsaLists(Random rng, int rows, int cells, int width, bool shortRows)
+    {
+        var idx = new int[rows * width];
+        var cnt = new int[rows];
+        int blocks = cells / 4;
+        for (int t = 0; t < rows; t++)
+        {
+            int n = shortRows && t % 3 == 0 ? width / 2 : width;
+            var set = new SortedSet<int>();
+            while (set.Count + 4 <= n) { int b = rng.Next(blocks); for (int c = 0; c < 4; c++) set.Add(b * 4 + c); }
+            while (set.Count < n) set.Add(rng.Next(cells));
+            int j = 0;
+            foreach (int c in set) idx[t * width + j++] = c;
+            for (; j < width; j++) idx[t * width + j] = -1;
+            cnt[t] = n;
+        }
+        return (idx, cnt);
+    }
+
+    private static ushort H(float x) => BitConverter.HalfToUInt16Bits((System.Half)x);
+    private static float F(ushort h) => (float)BitConverter.UInt16BitsToHalf(h);
+
+    /// <summary>The QSA attention over the chosen cells (tsm_qsa_attn) against a double-precision softmax over the same
+    /// cells, with q rounded to half as the kernel takes it: rows whose list is shorter than the width, a kv head's
+    /// query heads as the rows (Flash Next's 12, and 2), the mask's value added at each chosen cell.</summary>
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(6, 4, 2, 300, 40)]
+    [InlineData(5, 24, 2, 600, 67)]
+    public void QsaAttention_AnswersAsTheReference(int rows, int heads, int kvHeads, int cells, int width)
+    {
+        const int D = 256;
+        var rng = new Random(rows * 7 + heads);
+        var q = new float[heads * rows * D];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+        var k = new ushort[kvHeads * cells * D];
+        var v = new ushort[kvHeads * cells * D];
+        for (int i = 0; i < k.Length; i++) { k[i] = H((float)(rng.NextDouble() * 2 - 1)); v[i] = H((float)(rng.NextDouble() * 2 - 1)); }
+        var mask = new ushort[rows * cells];
+        for (int i = 0; i < mask.Length; i++) mask[i] = H(rng.Next(4) == 0 ? -0.5f : 0f);
+        var (idx, cnt) = QsaLists(rng, rows, cells, width, shortRows: true);
+        float scale = 1f / MathF.Sqrt(D);
+        var got = new float[rows * heads * D];
+        Assert.True(GgmlBasicOps.TsmQsaAttnProbe(rows, heads, kvHeads, cells, width, scale, q, k, v, idx, cnt, mask, got, 0,
+            out _), GgmlBasicOps.LastNativeError("probe failed"));
+        int hpg = heads / kvHeads;
+        double num = 0, den = 0;
+        for (int t = 0; t < rows; t++)
+            for (int h = 0; h < heads; h++)
+            {
+                int g = h / hpg, n = cnt[t];
+                var s = new double[n];
+                double m = double.NegativeInfinity;
+                for (int j = 0; j < n; j++)
+                {
+                    int c = idx[t * width + j];
+                    double dot = 0;
+                    for (int d = 0; d < D; d++)
+                        dot += (double)F(H(q[(h * rows + t) * D + d])) * F(k[(g * cells + c) * D + d]);
+                    s[j] = dot * scale + F(mask[t * cells + c]);
+                    m = Math.Max(m, s[j]);
+                }
+                double l = 0;
+                for (int j = 0; j < n; j++) { s[j] = Math.Exp(s[j] - m); l += s[j]; }
+                for (int d = 0; d < D; d++)
+                {
+                    double o = 0;
+                    for (int j = 0; j < n; j++) o += s[j] * F(v[(g * cells + idx[t * width + j]) * D + d]);
+                    o /= l;
+                    double diff = got[(t * heads + h) * D + d] - o;
+                    num += diff * diff;
+                    den += o * o;
+                }
+            }
+        double rel = Math.Sqrt(num / den);
+        _output.WriteLine($"rows {rows}, {heads} heads over {kvHeads}: relative error {rel:E3}");
+        Assert.True(rel < 2e-3, $"relative error {rel:E3}");
+    }
+
+    /// <summary>The QSA attention over the chosen cells at Flash Next's shapes (a 4096-token chunk, 24 query heads over
+    /// 2 kv heads, a 16K window, 2051 cells a token in blocks of 4): the time of one layer's pass (a probe for tuning;
+    /// the model runs 12 such layers a chunk).</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void QsaAttention_FlashNextShape_Timing()
+    {
+        const int rows = 4096, heads = 24, kvHeads = 2, cells = 16384, width = 2051, D = 256;
+        var rng = new Random(11);
+        var q = new float[heads * rows * D];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+        var k = new ushort[kvHeads * cells * D];
+        var v = new ushort[kvHeads * cells * D];
+        for (int i = 0; i < k.Length; i++) { k[i] = H((float)(rng.NextDouble() * 0.2 - 0.1)); v[i] = H((float)(rng.NextDouble() * 2 - 1)); }
+        var mask = new ushort[rows * cells];
+        var (idx, cnt) = QsaLists(rng, rows, cells, width, shortRows: false);
+        var got = new float[rows * heads * D];
+        Assert.True(GgmlBasicOps.TsmQsaAttnProbe(rows, heads, kvHeads, cells, width, 1f / 16f, q, k, v, idx, cnt, mask, got, 5,
+            out double ms), GgmlBasicOps.LastNativeError("probe failed"));
+        Assert.All(got, x => Assert.True(float.IsFinite(x)));
+        _output.WriteLine($"one layer: {ms:F2} ms ({ms * 12 / 1000:F2} s for the 12 QSA layers of a chunk)");
     }
 }

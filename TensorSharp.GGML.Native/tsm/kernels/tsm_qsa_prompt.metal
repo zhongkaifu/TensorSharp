@@ -174,28 +174,36 @@ struct TsmQsaAttnArgs {
 
 constant constexpr short kAttnD = 256, kAttnC = 32, kAttnR = 16;
 
-kernel void tsm_qsa_attn(device const float* q [[buffer(0)]], device const half* kc [[buffer(1)]],
+// The queries as the attention kernels read them: half, per (token, kv head) 16 rows (its query heads, then zeros),
+// qh[t][g][r][d]. grid (16, T, kv heads), 256 threads (D = 256).
+kernel void tsm_qsa_q_half(device const float* q [[buffer(0)]], device half* qh [[buffer(1)]],
+                           constant TsmQsaAttnArgs& a [[buffer(2)]], uint3 tg [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
+    const uint r = tg.x, t = tg.y, g = tg.z, T = a.n_tok, hpg = a.n_head / a.n_head_kv;
+    qh[((ulong(t) * a.n_head_kv + g) * 16 + r) * 256 + tid] =
+        r < hpg ? half(q[(ulong(g * hpg + r) * T + t) * 256 + tid]) : half(0.0f);
+}
+
+kernel void tsm_qsa_attn(device const half* qd [[buffer(0)]], device const half* kc [[buffer(1)]],
                          device const half* vc [[buffer(2)]], device const int* idx [[buffer(3)]],
                          device const int* cnt [[buffer(4)]], device const half* mask [[buffer(5)]],
                          device float* out [[buffer(6)]], constant TsmQsaAttnArgs& a [[buffer(7)]],
                          uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                          ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
-    threadgroup half qh[kAttnR * kAttnD];          //  8 KB
     threadgroup half kv[kAttnC * kAttnD];          // 16 KB: K, then V, then O's rows at the end (as float)
     threadgroup float st[kAttnR * kAttnC];         //  2 KB: S
     threadgroup half pt[kAttnR * kAttnC];          //  1 KB: P
     threadgroup float dg[2 * 64];                  //  diag(alpha) for the two row tiles
     threadgroup int cells[kAttnC];
     threadgroup float lsum[kAttnR];
+    threadgroup int rescale;
 
     const uint t = tg.x, g = tg.y, H = a.n_head, hpg = H / a.n_head_kv, T = a.n_tok;
     const int n_sel = cnt[t];
 
-    // Q rows (the kv head's query heads), half; rows past hpg zero.
-    for (uint i = tid; i < kAttnR * kAttnD; i += 128) {
-        const uint r = i / kAttnD, d = i % kAttnD;
-        qh[i] = r < hpg ? half(q[(ulong(g * hpg + r) * T + t) * kAttnD + d]) : half(0.0f);
-    }
+    // Q tiles straight from the half copy (L1-resident across the chunks): the (token, kv head)'s 16 rows.
+    device const half* qrow = qd + (ulong(t) * a.n_head_kv + g) * kAttnR * kAttnD;
+    const ulong qstride = kAttnD;
     for (uint i = tid; i < 2 * 64; i += 128) dg[i] = 0.0f;
 
     // Each simdgroup owns O columns [64 sg, 64 sg + 64): 2 row tiles x 8 column tiles.
@@ -237,8 +245,8 @@ kernel void tsm_qsa_attn(device const float* q [[buffer(0)]], device const half*
             for (short d0 = 0; d0 < kAttnD; d0 += 8) {
                 simdgroup_half8x8 kt, q0, q1;
                 simdgroup_load(kt, kv + (sg * 8) * kAttnD + d0, kAttnD, ulong2(0, 0), true);
-                simdgroup_load(q0, qh + 0 * kAttnD + d0, kAttnD);
-                simdgroup_load(q1, qh + 8 * kAttnD + d0, kAttnD);
+                simdgroup_load(q0, qrow + d0, qstride);
+                simdgroup_load(q1, qrow + 8 * qstride + d0, qstride);
                 simdgroup_multiply_accumulate(s0, q0, kt, s0);
                 simdgroup_multiply_accumulate(s1, q1, kt, s1);
             }
@@ -246,7 +254,9 @@ kernel void tsm_qsa_attn(device const float* q [[buffer(0)]], device const half*
             simdgroup_store(s1, st + 8 * kAttnC + sg * 8, kAttnC);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // Online softmax over this chunk's 32 cells.
+        // Online softmax over this chunk's 32 cells. The reference max moves only when a row's max passes it by more
+        // than 8 (P = exp(s - m) <= e^8 stays in half's range): most chunks then leave O as it is (no rescale).
+        if (tid == 0) rescale = 0;
         {
             float x[4];
             float mx = -INFINITY;
@@ -260,20 +270,24 @@ kernel void tsm_qsa_attn(device const float* q [[buffer(0)]], device const half*
             mx = max(mx, simd_shuffle_xor(mx, 4));
             mx = max(mx, simd_shuffle_xor(mx, 2));
             mx = max(mx, simd_shuffle_xor(mx, 1));
-            const float m_new = max(m_run, mx);
-            float alpha = 1.0f, ps = 0.0f;
+            const bool move = mx > m_run + 8.0f;
+            const float m_new = move ? mx : m_run;
+            const float alpha = move ? exp(m_run - m_new) : 1.0f;   // m_run = -inf: 0 (O is still zero)
+            float ps = 0.0f;
             for (short j = 0; j < 4; ++j) {
                 const float p = m_new == -INFINITY ? 0.0f : exp(x[j] - m_new);
                 pt[srow * kAttnC + scol + j] = half(p);
                 ps += p;
             }
-            if (m_new != -INFINITY) alpha = exp(m_run - m_new);
             ps += simd_shuffle_xor(ps, 4);
             ps += simd_shuffle_xor(ps, 2);
             ps += simd_shuffle_xor(ps, 1);
             l_run = l_run * alpha + ps;
             m_run = m_new;
-            if ((tid & 7) == 0) dg[(srow / 8) * 64 + (srow % 8) * 9] = alpha;   // diagonal entry (srow % 8, srow % 8)
+            if ((tid & 7) == 0) {
+                dg[(srow / 8) * 64 + (srow % 8) * 9] = alpha;   // diagonal entry (srow % 8, srow % 8)
+                if (move) rescale = 1;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // V rows into the same buffer.
@@ -299,11 +313,14 @@ kernel void tsm_qsa_attn(device const float* q [[buffer(0)]], device const half*
                 simdgroup_load(p0[k], pt + 0 * kAttnC + k * 8, kAttnC);
                 simdgroup_load(p1[k], pt + 8 * kAttnC + k * 8, kAttnC);
             }
+            const bool scale_o = rescale != 0;
             for (short j = 0; j < 8; ++j) {
                 const short col = sg * 64 + j * 8;
-                simdgroup_float8x8 a0, a1;
-                simdgroup_multiply(a0, d0m, o[0][j]);
-                simdgroup_multiply(a1, d1m, o[1][j]);
+                simdgroup_float8x8 a0 = o[0][j], a1 = o[1][j];
+                if (scale_o) {
+                    simdgroup_multiply(a0, d0m, o[0][j]);
+                    simdgroup_multiply(a1, d1m, o[1][j]);
+                }
                 for (short k = 0; k < 4; ++k) {
                     simdgroup_half8x8 vt;
                     simdgroup_load(vt, kv + (k * 8) * kAttnD + col, kAttnD);
