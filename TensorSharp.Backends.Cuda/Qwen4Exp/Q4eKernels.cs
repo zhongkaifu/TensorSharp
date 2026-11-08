@@ -67,6 +67,8 @@ namespace TensorSharp.Cuda
         private readonly IntPtr countSelected;
         // The MTP draft chain's per-step pick on the device (optional).
         private readonly IntPtr draftPick;
+        // The pick in two stages (optional): a block per slice of the row, then one merging block.
+        private readonly IntPtr draftPickPart, draftPickMerge;
 
         private Q4eKernels(CudaModule module)
         {
@@ -106,6 +108,12 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500) { countSelected = IntPtr.Zero; }
             try { draftPick = module.GetFunction("ts_q4e_draft_pick_f32"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { draftPick = IntPtr.Zero; }
+            try
+            {
+                draftPickPart = module.GetFunction("ts_q4e_draft_pick_part_f32");
+                draftPickMerge = module.GetFunction("ts_q4e_draft_pick_merge_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { draftPickPart = draftPickMerge = IntPtr.Zero; }
         }
 
         public static Q4eKernels Create()
@@ -451,15 +459,38 @@ namespace TensorSharp.Cuda
         /// <summary>Whether <see cref="DraftPick"/> is available.</summary>
         public bool HasDraftPick => draftPick != IntPtr.Zero;
 
+        /// <summary>Logits each block of the two-stage pick's first stage reads.</summary>
+        public const int DraftPickChunk = 1024;
+
+        /// <summary>Candidate entries (a float and an int each) the two-stage pick needs for <paramref name="vocab"/> logits.</summary>
+        public static int DraftPickCandidates(int vocab) => CeilDivInt(vocab, DraftPickChunk) * 10;
+
+        private static int CeilDivInt(int a, int b) => (a + b - 1) / b;
+
         /// <summary>A draft step's first-max token into ids[step] and nextToken[0], and its top-10 softmax confidence
-        /// into probs[step].</summary>
-        public void DraftPick(IntPtr logits, int vocab, IntPtr ids, IntPtr probs, int step, IntPtr nextToken, IntPtr stream)
+        /// into probs[step]. With <paramref name="candidates"/> (<see cref="DraftPickCandidates"/> floats then as many
+        /// ints) a block per 1,024 logits keeps its slice's ten largest and one block merges them: the same pick, bit for
+        /// bit (TS_Q4E_DRAFT_PICK_SPLIT=0 runs the one-block kernel).</summary>
+        public void DraftPick(IntPtr logits, int vocab, IntPtr ids, IntPtr probs, int step, IntPtr nextToken, IntPtr stream,
+            IntPtr candidates = default)
         {
             IntPtr a0 = logits, a2 = ids, a3 = probs, a5 = nextToken;
             int a1 = vocab, a4 = step;
+            if (candidates != IntPtr.Zero && draftPickPart != IntPtr.Zero && _draftPickSplit)
+            {
+                int blocks = CeilDivInt(vocab, DraftPickChunk), n = blocks * 10, chunk = DraftPickChunk;
+                IntPtr cv = candidates, ck = (IntPtr)((long)candidates + 4L * n);
+                void** pa = stackalloc void*[] { &a0, &a1, &chunk, &cv, &ck };
+                Launch(draftPickPart, (uint)blocks, 1, 1, 256, stream, pa);
+                void** ma = stackalloc void*[] { &cv, &ck, &n, &a2, &a3, &a4, &a5 };
+                Launch(draftPickMerge, 1, 1, 1, 1024, stream, ma);
+                return;
+            }
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
             Launch(draftPick, 1, 1, 1, 1024, stream, args);
         }
+
+        private static readonly bool _draftPickSplit = Environment.GetEnvironmentVariable("TS_Q4E_DRAFT_PICK_SPLIT") != "0";
 
         public void Dispose() => module.Dispose();
     }

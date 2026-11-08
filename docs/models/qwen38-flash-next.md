@@ -1297,6 +1297,31 @@ RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/
 | next layer ahead, copy kernel | 0.07-0.09 s / 84-105 | 168-189 | 1.82-1.84 s / 98-148 | 7.37-7.39 s / 194-199 | 1.27-1.33 s |
 | next layer ahead, copy engines (default) | 0.07-0.09 s / 72-102 | 172-174 | 1.44-1.46 s / 135-146 | 5.84-5.87 s / 173-195 | 0.89-0.95 s |
 
+#### Two latency-bound decode kernels, 2026-11-08
+
+An nsys capture of a long generation (RTX 5090, ISTA `Q2_0`, MTP) showed two kernels waiting on their own loads. A
+draft step's pick read the 248,320 logits in one block of 1,024 threads: 115 us a step, two or three steps a window. It
+now runs a block per 1,024 logits, each keeping its slice's ten largest and the first index of its largest, then one
+block merging those candidates by the same rules (`TS_Q4E_DRAFT_PICK_SPLIT`): 12.8 + 12.0 us, the same token and
+confidence bit for bit. The BF16 router (512 x 2560, a warp per expert) issued each lane's loads one at a time; it now
+keeps four in flight with the sums in their order: 14.2 -> 12.6 us a 4-row layer. About 0.3 ms of a ~13 ms window,
+inside the run-to-run noise of the client below; the window is bound by the CPU's missed experts (a third of the
+layer-windows wait 85-135 us for them) and the expert and dense kernels.
+
+Tried and dropped in the same round: the multi-row dense kernel reading each weight unit once with a sum per row
+(18.9 us a call against the current kernel's 17.8: its later passes over a row already hit L1; it was in the build of
+the table's second row); the decode experts
+grouped by expert, so a window's slots sharing an expert read it once (a verify window 12.8-13.1 ms against 10.3-11.6:
+the owning blocks serialize their slots and the grid shrinks); and letting the host-expert team spin between layers
+instead of sleeping (no change: a ringing layer's wait is the experts' arithmetic, not the wake-up).
+
+Same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
+
+| decode kernels | short chat | long generation | 4K prompt | 16K prompt | multi-turn first TTFT |
+| --- | --- | --- | --- | --- | --- |
+| before (the next prompt layer staged ahead) | 0.07-0.09 s / 72-102 | 172-174 | 1.44-1.46 s / 135-146 | 5.84-5.87 s / 173-195 | 0.89-0.95 s |
+| two-stage pick, router loads in flight | 0.07-0.09 s / 82-102 | 169-182 | 1.38-1.44 s / 140-185 | 5.79-5.86 s / 189-193 | 0.89-0.95 s |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the

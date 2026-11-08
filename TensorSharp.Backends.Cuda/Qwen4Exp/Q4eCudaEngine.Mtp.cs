@@ -89,6 +89,7 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuMemHostAlloc(out _pinnedMtpH, new UIntPtr((ulong)m.NUbatch * (ulong)HcDim * 4), 0x1).ThrowOnError();
             dev.DraftIds = AllocT(dev, DType.Int32, MaxDraftChainSteps);
             dev.DraftProbs = AllocF32(dev, MaxDraftChainSteps);
+            dev.DraftCand = AllocT(dev, DType.Int32, 2L * Q4eKernels.DraftPickCandidates(m.NVocab));
             CudaDriverApi.cuMemHostAlloc(out _pinnedChain, new UIntPtr((ulong)MaxDraftChainSteps * 8), 0x1).ThrowOnError();
         }
 
@@ -313,7 +314,8 @@ namespace TensorSharp.Cuda
             for (int s = 0; s < steps; s++)
             {
                 MtpHead(dev, row);
-                dev.QK.DraftPick(Ptr(dev.Logits), m.NVocab, Ptr(dev.DraftIds), Ptr(dev.DraftProbs), s, Ptr(dev.Tokens), dev.Stream);
+                dev.QK.DraftPick(Ptr(dev.Logits), m.NVocab, Ptr(dev.DraftIds), Ptr(dev.DraftProbs), s, Ptr(dev.Tokens), dev.Stream,
+                    Ptr(dev.DraftCand));
                 if (s + 1 == steps)
                     break;
                 // The next row: the picked token embedded into the streams, this row's output streams as its previous ones.

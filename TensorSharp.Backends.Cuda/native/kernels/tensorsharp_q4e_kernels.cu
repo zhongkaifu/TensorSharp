@@ -1720,3 +1720,139 @@ extern "C" __global__ void ts_q4e_draft_pick_f32(
         *nextToken = argIdx;
     }
 }
+
+// ts_q4e_draft_pick_f32 in two stages. One block reading a 248,320-token row took 112 us a draft step (each of its
+// 1,024 threads walking 243 logits); here every block keeps the ten largest logits of its slice and the first index of
+// its largest, and one block merges those candidates by the same rules. The ten largest of the row are among the
+// slices' ten largest, and its first maximum is the lowest first index among the slices holding the maximum (the slices
+// are in index order, and a thread meets its candidates in that order), so the pick and its confidence are the
+// one-block kernel's bit for bit.
+// Ten rounds of a block maximum over each thread's ten largest values of vals[0, n) (strided), the first round's tie
+// to the lower key: top[] gets the ten largest in descending order (-inf past the count), *head the key of the first
+// (-1 if none). keys == null keys element i as base + i.
+__device__ __forceinline__ void q4e_pick_topk_block(const float* __restrict__ vals, const int32_t* __restrict__ keys,
+    const int base, const int n, float* top, int* head)
+{
+    __shared__ float shV[32];
+    __shared__ int shK[32], shT[32];
+    float tv[Q4E_PICK_K];
+#pragma unroll
+    for (int j = 0; j < Q4E_PICK_K; ++j)
+        tv[j] = -INFINITY;
+    int headIdx = -1;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+    {
+        const float v = vals[i];
+        if (!(v > tv[Q4E_PICK_K - 1]))
+            continue;
+        int j = Q4E_PICK_K - 1;
+        while (j > 0 && tv[j - 1] < v)
+        {
+            tv[j] = tv[j - 1];
+            --j;
+        }
+        tv[j] = v;
+        if (j == 0)
+            headIdx = keys != nullptr ? keys[i] : base + i;
+    }
+    int ptr = 0;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nWarps = blockDim.x >> 5;
+    for (int r = 0; r < Q4E_PICK_K; ++r)
+    {
+        float v = ptr < Q4E_PICK_K ? tv[ptr] : -INFINITY;
+        int key = ptr == 0 && headIdx >= 0 ? headIdx : 0x7fffffff;
+        int who = threadIdx.x;
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            const float ov = __shfl_down_sync(0xffffffffu, v, o);
+            const int ok = __shfl_down_sync(0xffffffffu, key, o);
+            const int ow = __shfl_down_sync(0xffffffffu, who, o);
+            if (ov > v || (ov == v && (ok < key || (ok == key && ow < who))))
+            {
+                v = ov; key = ok; who = ow;
+            }
+        }
+        if (lane == 0)
+        {
+            shV[warp] = v; shK[warp] = key; shT[warp] = who;
+        }
+        __syncthreads();
+        if (warp == 0)
+        {
+            v = lane < nWarps ? shV[lane] : -INFINITY;
+            key = lane < nWarps ? shK[lane] : 0x7fffffff;
+            who = lane < nWarps ? shT[lane] : 0x7fffffff;
+            for (int o = 16; o > 0; o >>= 1)
+            {
+                const float ov = __shfl_down_sync(0xffffffffu, v, o);
+                const int ok = __shfl_down_sync(0xffffffffu, key, o);
+                const int ow = __shfl_down_sync(0xffffffffu, who, o);
+                if (ov > v || (ov == v && (ok < key || (ok == key && ow < who))))
+                {
+                    v = ov; key = ok; who = ow;
+                }
+            }
+            if (lane == 0)
+            {
+                top[r] = v;
+                shT[0] = who;
+                if (r == 0)
+                    *head = key == 0x7fffffff ? -1 : key;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == shT[0])
+            ++ptr;
+        __syncthreads();
+    }
+}
+
+// Stage one: block b's slice [b * chunk, +chunk) of the row into candidates [b * 10, +10) (values, and the slice's
+// first-max index beside its largest; the other keys are never compared first).
+extern "C" __global__ void ts_q4e_draft_pick_part_f32(
+    const float* __restrict__ logits,
+    const int V,
+    const int chunk,
+    float* __restrict__ candVal,         // [blocks * 10]
+    int32_t* __restrict__ candKey)       // [blocks * 10]
+{
+    __shared__ float top[Q4E_PICK_K];
+    __shared__ int head;
+    const int base = blockIdx.x * chunk;
+    const int n = max(0, min(chunk, V - base));
+    q4e_pick_topk_block(logits + base, nullptr, base, n, top, &head);
+    if (threadIdx.x < Q4E_PICK_K)
+    {
+        candVal[blockIdx.x * Q4E_PICK_K + threadIdx.x] = top[threadIdx.x];
+        candKey[blockIdx.x * Q4E_PICK_K + threadIdx.x] = threadIdx.x == 0 ? head : 0x7fffffff;
+    }
+}
+
+// Stage two: one block over the n candidates, then ts_q4e_draft_pick_f32's outputs.
+extern "C" __global__ void ts_q4e_draft_pick_merge_f32(
+    const float* __restrict__ candVal,
+    const int32_t* __restrict__ candKey,
+    const int n,
+    int32_t* __restrict__ ids,
+    float* __restrict__ probs,
+    const int step,
+    int32_t* __restrict__ nextToken)
+{
+    __shared__ float top[Q4E_PICK_K];
+    __shared__ int head;
+    q4e_pick_topk_block(candVal, candKey, 0, n, top, &head);
+    if (threadIdx.x == 0)
+    {
+        const int argIdx = head < 0 ? 0 : head;
+        float denom = 0.0f;
+        for (int j = 0; j < Q4E_PICK_K; ++j)
+        {
+            if (top[j] == -INFINITY)
+                break;
+            denom += expf(top[j] - top[0]);
+        }
+        ids[step] = argIdx;
+        probs[step] = denom > 0.0f ? 1.0f / denom : 0.0f;
+        *nextToken = argIdx;
+    }
+}
