@@ -10,6 +10,7 @@ Copyright (c) 2026 Niko1221 and the Strata contributors. The full license text i
 layout, to use ggml's L2 norm (`x / max(|x|, eps)`), to write fp32 only, and to stage the conv history's new tail
 (`tsm_gdn_hist_store`); its header lists the changes. `kernels/tsm_hc_prompt.metal` (the hyper-connection mix and
 scatter passes) is TensorSharp's, written after Strata's `gr_epi_up` and `gr_norm_h` (`metal/kernels/prompt.metal`).
+`kernels/tsm_qsa_prompt.metal` (the QSA cell selection) is TensorSharp's own.
 
 The rest of this directory is TensorSharp's own code under the repository's BSD-3-Clause license:
 `tsm_moe.mm` / `tsm_moe.h` (the plan, the dispatch geometry, the integration with the tiered MoE seams and the

@@ -246,31 +246,42 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     /// kernels left, so they also prove the conv history and the state are written in ggml's layout. Only the rounding
     /// differs (this fixture amplifies it): measured on an M5 Pro, at most 6.4e-5 relative error with the GDN kernels,
     /// every argmax equal. With every expert on the host the kernels share the pass with the host seams, whose Q8_K
-    /// activations amplify the difference to 3.0e-4. The counters prove the kernels ran.</summary>
+    /// activations amplify the difference to 3.0e-4. With the QSA selection kernels (tsm_qsa_prompt.metal) the cells a
+    /// row keeps can differ where a block's cells tie at the cutoff: ggml's top_k fills ties in atomic order, the
+    /// kernels lowest index first (QsaSelection_KeepsTheBestCells_TiesLowestFirst proves the contract), so the bound
+    /// is a valid choice's, not rounding's: measured 8.5e-3 at the first decode step, every argmax equal. The counters
+    /// prove the kernels ran.</summary>
     [GgmlTheory(BackendType.GgmlMetal)]
     [InlineData("gdn", false)]
     [InlineData("hc", false)]
     [InlineData("gdn,hc", false)]
     [InlineData("gdn,hc", true)]
+    [InlineData("qsa", false)]
+    [InlineData("gdn,hc,qsa", false)]
+    [InlineData("gdn,hc,qsa", true)]
     public void PromptKernels_OnTsm_AnswerAsGgml_Metal(string kernels, bool hostExperts)
     {
-        bool gdn = kernels.Contains("gdn"), hc = kernels.Contains("hc");
-        float[][] Answer(bool useGdn, bool useHc)
+        bool gdn = kernels.Contains("gdn"), hc = kernels.Contains("hc"), qsa = kernels.Contains("qsa");
+        float[][] Answer(bool useGdn, bool useHc, bool useQsa)
         {
             using var env = new NativeEnvScope();
             env.Set("TS_METAL_GDN_PROMPT", useGdn ? "1" : "0");
             env.Set("TS_METAL_HC_PROMPT", useHc ? "1" : "0");
+            env.Set("TS_METAL_QSA_SELECT", useQsa ? "1" : "0");
             return Run(BackendType.GgmlMetal, hostExperts ? MoeCpuOffloadConfig.SetAllLayers : () => { }, LongPrompt);
         }
-        float[][] ggml = Answer(false, false);
+        float[][] ggml = Answer(false, false, false);
         long gdnBefore = GgmlBasicOps.TsmGdnPromptCount(), hcBefore = GgmlBasicOps.TsmHcPromptCount();
-        float[][] tsm = Answer(gdn, hc);
+        long qsaBefore = GgmlBasicOps.TsmQsaSelectCount();
+        float[][] tsm = Answer(gdn, hc, qsa);
         long gdnLayers = GgmlBasicOps.TsmGdnPromptCount() - gdnBefore, hcPasses = GgmlBasicOps.TsmHcPromptCount() - hcBefore;
-        _output.WriteLine($"tsm kernels: {gdnLayers} GDN layers, {hcPasses} hyper-connection passes");
-        // The fixture's 8 layers: 6 GDN, 16 half-layers with a read and a scatter each.
+        long qsaLayers = GgmlBasicOps.TsmQsaSelectCount() - qsaBefore;
+        _output.WriteLine($"tsm kernels: {gdnLayers} GDN layers, {hcPasses} hyper-connection passes, {qsaLayers} QSA selections");
+        // The fixture's 8 layers: 6 GDN, 2 QSA, 16 half-layers with a read and a scatter each.
         Assert.Equal(gdn ? 6 : 0, gdnLayers);
         Assert.Equal(hc ? 32 : 0, hcPasses);
-        AssertClose($"tsm {kernels}", tsm, ggml, hostExperts ? 1e-3 : 2e-4);
+        Assert.Equal(qsa ? 2 : 0, qsaLayers);
+        AssertClose($"tsm {kernels}", tsm, ggml, qsa ? 2e-2 : hostExperts ? 1e-3 : 2e-4);
     }
 
     /// <summary>A prefill-width batch streams every expert an offloaded layer routes into its staging tensor. With a

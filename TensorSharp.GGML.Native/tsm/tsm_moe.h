@@ -111,4 +111,16 @@ namespace tsm
                            ggml_tensor* out, int n_embd, int hc, int T);
     // Hyper-connection passes that ran on these kernels (a test proves the path engaged).
     long long hc_prompt_count();
+
+    // ---- A QSA layer's cell selection for a prompt chunk (tsm/kernels/tsm_qsa_prompt.metal): the per-token block
+    // scores (relu, head sum, bias) and a radix select of the `width` best allowed cells, written as the attention
+    // mask, in place of ggml's gather of every cell's score, two transposes and a top-k sort over [cells, T].
+    // scores F32 [B, H, T], bias F32 [B, T], cell_blocks I32 [cells], masks F16 [cells, T]. Cutoff ties are taken
+    // lowest cell first. TS_METAL_QSA_SELECT=0 keeps ggml's ops.
+    bool qsa_select_supported(ggml_backend* backend);
+    bool qsa_select_encode(ggml_backend* backend, const ggml_tensor* scores, const ggml_tensor* bias,
+                           const ggml_tensor* cell_blocks, const ggml_tensor* mask_in, ggml_tensor* mask_out,
+                           int T, int n_cells, int n_blocks, int heads, int width);
+    // Selections that ran on these kernels (a test proves the path engaged).
+    long long qsa_select_count();
 }

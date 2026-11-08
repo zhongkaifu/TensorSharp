@@ -3495,6 +3495,25 @@ namespace TensorSharp.GGML
             catch (EntryPointNotFoundException) { return 0; }
         }
 
+        /// <summary>Test probe of the QSA selection kernels (tsm::qsa_select_encode): scores [T, H, B], bias [T, B],
+        /// cell_blocks [cells] and the mask [T, cells] (F16 bits) in; the selected mask (F16 bits) out.</summary>
+        public static unsafe bool TsmQsaSelectProbe(int rows, int cells, int blocks, int heads, int width, float[] scores,
+            float[] bias, int[] cellBlocks, ushort[] maskIn, ushort[] maskOut)
+        {
+            fixed (float* s = scores) fixed (float* b = bias) fixed (int* c = cellBlocks)
+            fixed (ushort* mi = maskIn) fixed (ushort* mo = maskOut)
+                return GgmlNative.TSGgml_TsmQsaSelectProbe(rows, cells, blocks, heads, width, (IntPtr)s, (IntPtr)b, (IntPtr)c,
+                    (IntPtr)mi, (IntPtr)mo) != 0;
+        }
+
+        /// <summary>Test hook: the prompt-width QSA selections that ran on TensorSharp's Metal kernels
+        /// (tsm::qsa_select_encode) in this process. 0 off Apple's Metal builds.</summary>
+        public static long TsmQsaSelectCount()
+        {
+            try { return GgmlNative.TSGgml_TsmQsaSelectCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         /// <summary>Fixed-size rows of a mapping registered for explicit reads (HostExpertIoRegister), one pread each,
         /// packed into <paramref name="dst"/> in list order. False (nothing read) when a row is outside every registered
         /// mapping; the caller then reads the mapping.</summary>

@@ -88,8 +88,33 @@ static ggml_tensor* q4e_nodes_qsa_mask(ggml_context* ctx, ggml_cgraph* graph,
     q = ggml_rope_multi(ctx, q, in.query_positions, nullptr, n_rot, sections,
         GGML_ROPE_TYPE_IMROPE, 0, base, scale, 0.f, 1.f, 0.f, 0.f);
     if (qsa.probes) { ggml_set_output(q); qsa.probes->push_back(q); }
-    auto* scores = ggml_reshape_3d(ctx,
-        q4e_qsa_matmul(ctx, pooled, ggml_reshape_2d(ctx, q, D, (int64_t)H * T)), B, H, T);
+    ggml_tensor* scores_mm = q4e_qsa_matmul(ctx, pooled, ggml_reshape_2d(ctx, q, D, (int64_t)H * T));
+    const int width = (int)std::min<int64_t>(padded, (int64_t)a.top_k + R - 1);
+#if defined(TSG_GGML_USE_METAL)
+    // A prompt-width span building with device operations: the selection runs on TensorSharp's kernels
+    // (tsm::qsa_select_encode) after the scores, writing the mask the attention reads.
+    if (const Q4eDeviceOps* dev = g_q4e_dev; dev != nullptr && dev->qsa && dev->T == T && qsa.probes == nullptr
+        && (std::size_t)padded <= dev->qsa_cells && (std::size_t)R >= dev->qsa_ratio && (std::size_t)H <= dev->qsa_heads
+        && scores_mm->view_src == nullptr && scores_mm->type == GGML_TYPE_F32)
+    {
+        dev->bind(scores_mm, dev->off_qsa_scores);
+        ggml_tensor* selected_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, padded, T);
+        dev->bind(selected_mask, dev->off_qsa_mask);
+        // The inputs it reads are pinned for the whole graph (the allocator would free them after their last graph
+        // consumer) and placed as leaves.
+        ggml_tensor* bias = in.bias;
+        ggml_tensor* cell_blocks = in.cell_blocks;
+        for (ggml_tensor* t : {bias, cell_blocks, original_mask}) { ggml_set_output(t); ggml_build_forward_expand(graph, t); }
+        ggml_tensor* inputs[] = { scores_mm };
+        dev->push(inputs, 1, {selected_mask}, g_q4e_dev_layer,
+            [scores_mm, bias, cell_blocks, original_mask, selected_mask, T, padded, B, H, width](ggml_backend_t backend) {
+                return tsm::qsa_select_encode(backend, scores_mm, bias, cell_blocks, original_mask, selected_mask,
+                    T, padded, B, H, width); });
+        if (sparse_width) *sparse_width = width;
+        return selected_mask;
+    }
+#endif
+    auto* scores = ggml_reshape_3d(ctx, scores_mm, B, H, T);
     scores = ggml_relu(ctx, scores);
     ggml_tensor* sum = nullptr;
     for (int h = 0; h < H; ++h)
@@ -101,7 +126,6 @@ static ggml_tensor* q4e_nodes_qsa_mask(ggml_context* ctx, ggml_cgraph* graph,
     sum = ggml_add(ctx, sum, in.bias);
     auto* expanded = ggml_get_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, sum)), in.cell_blocks);
     expanded = ggml_add(ctx, ggml_cont(ctx, ggml_transpose(ctx, expanded)), ggml_cast(ctx, original_mask, GGML_TYPE_F32));
-    const int width = (int)std::min<int64_t>(padded, (int64_t)a.top_k + R - 1);
     auto* selected = ggml_cont(ctx, ggml_top_k(ctx, expanded, width));
     // The mask's own value at every picked cell, -inf elsewhere: one fused op (ggml_top_k_mask) for what was a fill of
     // the whole [padded, T] mask, a scatter of zeros and an add - each O(padded * T).

@@ -403,7 +403,8 @@ if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
         "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/moe.metal"
         "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_moe_glue.metal"
         "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_gdn_prompt.metal"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_hc_prompt.metal")
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_hc_prompt.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_qsa_prompt.metal")
     set(TSM_GGML_COMMON "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src/ggml-common.h")
     set(TSM_SOURCE_INC "${CMAKE_CURRENT_BINARY_DIR}/tsm_moe_source.inc")
     string(REPLACE ";" "\\;" TSM_KERNEL_FILES_ARG "${TSM_KERNEL_FILES}")

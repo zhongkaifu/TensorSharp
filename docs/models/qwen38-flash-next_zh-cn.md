@@ -982,6 +982,13 @@ argmax 全部相同；所有专家都在主机上时为 3.0e-4，Q8_K 激活放�
 4K 提示的读取速度现在与 Strata 相当。16K 时，每块仍比前一块多出约每 4K 窗口 0.55 s：QSA 层把每个 cell 的块分数收集到 `[cells, T]`，
 对每一行排序取前 2051 个 cell，并对整个窗口做稠密注意力。
 
+选择现在也由 TensorSharp 内核完成（`tsm_qsa_prompt.metal`，`TS_METAL_QSA_SELECT`）：每块的各头 relu 分数之和加 bias，然后逐 token 基数选择
+允许的最佳 2051 个 cell，直接写入注意力掩码。cell 的比较方式与 ggml 的计算完全相同，所以保留的 cell 相同，只有截断处同一块内并列的 cell 可能不同
+（窗口保留 2048 + 3 个 cell，所以大多数行会切开一个块）：ggml 的 top-k 按原子操作的顺序填入并列项，内核按最小下标优先，这也让选择可复现
+（`QsaSelection_KeepsTheBestCells_TiesLowestFirst` 逐 cell 检查约定）。span 的 arena 不再随窗口增长（16K 提示的每一块都是 3.4 GB）。
+16K，`TS_Q4E_PHASE=1`：块计算 5.2 / 5.7 / 6.3 / 6.9 s -> 5.1 / 5.3 / 5.8 / 6.3 s，提示 + 约 50 token 32.3 -> 30.4 s。现在随窗口增长的是
+注意力本身，它会读取窗口中的每个 cell。
+
 ## 多 GPU
 
 `ggml_cuda` 的 `--tp N` 切分每个路由专家及共享专家：gate/up 按中间通道切分，汇集激活后，

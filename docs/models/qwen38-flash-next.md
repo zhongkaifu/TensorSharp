@@ -1401,6 +1401,16 @@ A 4K prompt now reads as fast as Strata's. At 16K each chunk still costs ~0.55 s
 before: the QSA layers gather every cell's block score into `[cells, T]`, sort each row for its top 2051 cells, and
 attend the whole window densely.
 
+The selection now runs on TensorSharp's kernels as well (`tsm_qsa_prompt.metal`, `TS_METAL_QSA_SELECT`): the heads'
+relu score sum and bias per block, then a per-token radix select of the best 2051 allowed cells, written straight into
+the attention mask. Cells are compared exactly as ggml computes them, so the kept cells are the same except where a
+block's cells tie at the cutoff (the window keeps 2048 + 3 cells, so most rows split a block): ggml's top-k fills ties
+in atomic order, the kernels lowest index first, which also makes the choice reproducible
+(`QsaSelection_KeepsTheBestCells_TiesLowestFirst` checks the contract cell by cell). The span's arena no longer grows
+with the window (3.4 GB at every chunk of a 16K prompt). 16K, `TS_Q4E_PHASE=1`: chunk compute 5.2 / 5.7 / 6.3 / 6.9 s
+-> 5.1 / 5.3 / 5.8 / 6.3 s, prompt + ~50 tokens 32.3 -> 30.4 s. What grows with the window now is the attention
+itself, which reads every cell of it.
+
 ## Multi-GPU
 
 `--tp N` on `ggml_cuda` partitions every routed and shared FFN across N local GPUs. Every rank

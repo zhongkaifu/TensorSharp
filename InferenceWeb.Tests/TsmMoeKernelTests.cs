@@ -100,4 +100,75 @@ public sealed class TsmMoeKernelTests
         _output.WriteLine($"{gateType}/{downType}, {rows} rows: max |error| {maxErr:E3} of max |y| {maxRef:E3} ({rel:E3})");
         Assert.True(rel <= 2e-5, $"{gateType}/{downType}: the grouped kernels strayed {rel:E3} from the reference");
     }
+
+    /// <summary>The QSA prompt selection kernels (tsm_qsa_prompt.metal) against the contract of
+    /// eng/tests/qwen4exp-qsa.py, on a window shaped like a prompt chunk's: every cell's value is (the heads' relu
+    /// scores summed in order + the block's bias) + the mask, in F32 as ggml computes it; the kept cells are the
+    /// <c>width</c> best of those the mask allows - every strictly better cell, exact cardinality - and the kernels
+    /// take the cells tied at the cutoff lowest index first. Blocks share their cells' score, a forced tail of 1e9
+    /// bias makes whole runs of ties, and early rows allow fewer cells than <c>width</c> (all of them kept).</summary>
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(512, 4, 4, 64, 96)]
+    [InlineData(2560, 4, 4, 2048, 64)]
+    [InlineData(4100, 4, 2, 2048, 40)]
+    public void QsaSelection_KeepsTheBestCells_TiesLowestFirst(int cells, int ratio, int heads, int topK, int rows)
+    {
+        int blocks = (cells + ratio - 1) / ratio, width = Math.Min(cells, topK + ratio - 1);
+        var rng = new Random(cells + rows);
+        var scores = new float[rows * heads * blocks];
+        for (int i = 0; i < scores.Length; i++) scores[i] = (float)(rng.NextDouble() * 4 - 1.5);
+        int tail = 3;   // forced recent blocks
+        var bias = new float[rows * blocks];
+        var cellBlocks = new int[cells];
+        for (int c = 0; c < cells; c++) cellBlocks[c] = c / ratio;
+        var maskIn = new ushort[rows * cells];
+        const ushort NegInf = 0xFC00, Zero = 0;
+        int live = cells - 7;   // the last cells are padding
+        for (int t = 0; t < rows; t++)
+        {
+            // Rows sit at the end of the live window; the first few rows of a short window allow few cells.
+            int pos = Math.Min(live - 1, t * (live / rows) + (t % 3));
+            for (int c = 0; c < cells; c++) maskIn[t * cells + c] = c <= pos ? Zero : NegInf;
+            for (int b = Math.Max(0, pos / ratio - tail + 1); b <= pos / ratio; b++) bias[t * blocks + b] = 1e9f;
+        }
+        var maskOut = new ushort[rows * cells];
+        Assert.True(GgmlBasicOps.TsmQsaSelectProbe(rows, cells, blocks, heads, width, scores, bias, cellBlocks, maskIn, maskOut),
+            GgmlBasicOps.LastNativeError("probe failed"));
+        int boundaryTies = 0;
+        for (int t = 0; t < rows; t++)
+        {
+            var s = new float[blocks];
+            for (int b = 0; b < blocks; b++)
+            {
+                float v = MathF.Max(scores[(t * heads) * blocks + b], 0f);
+                for (int h = 1; h < heads; h++) v += MathF.Max(scores[(t * heads + h) * blocks + b], 0f);
+                s[b] = v + bias[t * blocks + b];
+            }
+            var e = new float[cells];
+            var eligible = new System.Collections.Generic.List<int>();
+            for (int c = 0; c < cells; c++)
+            {
+                e[c] = s[cellBlocks[c]] + (maskIn[t * cells + c] == NegInf ? float.NegativeInfinity : 0f);
+                if (float.IsFinite(e[c])) eligible.Add(c);
+            }
+            int take = Math.Min(width, eligible.Count);
+            var sorted = eligible.ConvertAll(c => e[c]);
+            sorted.Sort();
+            float cutoff = take > 0 ? sorted[sorted.Count - take] : float.PositiveInfinity;
+            int above = 0;
+            foreach (int c in eligible) if (e[c] > cutoff) above++;
+            int tiesNeeded = take - above, tiesSeen = 0, chosen = 0;
+            for (int c = 0; c < cells; c++)
+            {
+                bool kept = maskOut[t * cells + c] != NegInf;
+                bool want = float.IsFinite(e[c]) && (e[c] > cutoff || (e[c] == cutoff && tiesSeen++ < tiesNeeded));
+                Assert.True(kept == want, $"row {t} cell {c}: kept {kept}, contract {want} (value {e[c]}, cutoff {cutoff})");
+                if (kept) { Assert.Equal(maskIn[t * cells + c], maskOut[t * cells + c]); chosen++; }
+            }
+            Assert.Equal(take, chosen);
+            if (tiesSeen > tiesNeeded && tiesNeeded > 0) boundaryTies++;
+        }
+        _output.WriteLine($"{rows} rows over {cells} cells: {boundaryTies} rows split a tie at the cutoff");
+        Assert.True(boundaryTies > 0, "the fixture never split a tie at the cutoff");
+    }
 }

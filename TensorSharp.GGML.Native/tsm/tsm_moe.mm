@@ -66,6 +66,9 @@ namespace
         // gdn_prompt_encode's scratch: normalized q / k, conv'd v, gate+beta, k.q, the scan's output, the staged tail
         id<MTLBuffer> gqn = nil, gkn = nil, gvc = nil, ggb = nil, gkq = nil, go = nil, ghist = nil;
         std::size_t gqn_bytes = 0, gkn_bytes = 0, gvc_bytes = 0, ggb_bytes = 0, gkq_bytes = 0, go_bytes = 0, ghist_bytes = 0;
+        // qsa_select_encode's scratch: the per-token block scores
+        id<MTLBuffer> qs = nil;
+        std::size_t qs_bytes = 0;
     };
     State& state() { static State s; return s; }
 
@@ -104,6 +107,8 @@ namespace
         s.xp_bytes = s.h_bytes = s.ye_bytes = 0;
         s.gqn = s.gkn = s.gvc = s.ggb = s.gkq = s.go = s.ghist = nil;
         s.gqn_bytes = s.gkn_bytes = s.gvc_bytes = s.ggb_bytes = s.gkq_bytes = s.go_bytes = s.ghist_bytes = 0;
+        s.qs = nil;
+        s.qs_bytes = 0;
         MTLCompileOptions* options = [MTLCompileOptions new];
         // Safe math, as Strata compiles them: no reassociation, so a row's sums do not depend on the window around it.
         if (@available(macOS 15.0, iOS 18.0, *)) options.mathMode = MTLMathModeSafe;
@@ -951,6 +956,88 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
     }
 
     long long hc_prompt_count() { return g_hc_prompt_count.load(std::memory_order_relaxed); }
+
+    // ---- prompt QSA selection (tsm_moe.h qsa_select_*)
+    namespace
+    {
+        struct TsmQsaArgs { std::uint32_t n_tok, n_cells, n_blocks, heads, width, pad0, pad1, pad2; };
+        static_assert(sizeof(TsmQsaArgs) == 32, "TsmQsaArgs must match tsm_qsa_prompt.metal");
+        std::atomic<long long> g_qsa_select_count{0};
+
+        void require_type(const ggml_tensor* t, ggml_type type, std::int64_t elems, const char* what)
+        {
+            if (t == nullptr || t->type != type || !ggml_is_contiguous(t) || ggml_nelements(t) != elems)
+                throw std::runtime_error(std::string("tsm qsa: ") + what + " is not a contiguous tensor of the type and shape");
+        }
+    }
+
+    bool qsa_select_supported(ggml_backend* backend)
+    {
+        const char* e = std::getenv("TS_METAL_QSA_SELECT");
+        if (e && e[0] == '0') return false;
+        return metal_device(backend) != nullptr;
+    }
+
+    bool qsa_select_encode(ggml_backend* backend, const ggml_tensor* scores, const ggml_tensor* bias,
+                           const ggml_tensor* cell_blocks, const ggml_tensor* mask_in, ggml_tensor* mask_out,
+                           int T, int n_cells, int n_blocks, int heads, int width)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm qsa: not a Metal backend");
+            if (T <= 0 || n_cells <= 0 || n_blocks <= 0 || heads <= 0 || width <= 0)
+                throw std::runtime_error("tsm qsa: empty selection");
+            const std::int64_t t = T, cells = n_cells, blocks = n_blocks;
+            require_type(scores, GGML_TYPE_F32, blocks * heads * t, "scores");
+            require_type(bias, GGML_TYPE_F32, blocks * t, "bias");
+            require_type(cell_blocks, GGML_TYPE_I32, cells, "cell_blocks");
+            require_type(mask_in, GGML_TYPE_F16, cells * t, "mask_in");
+            require_type(mask_out, GGML_TYPE_F16, cells * t, "mask_out");
+            const ggml_metal_buffer_id sc = tensor_id(scores), bi = tensor_id(bias), cb = tensor_id(cell_blocks),
+                mi = tensor_id(mask_in), mo = tensor_id(mask_out);
+            const TsmQsaArgs args{static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(n_cells),
+                static_cast<std::uint32_t>(n_blocks), static_cast<std::uint32_t>(heads), static_cast<std::uint32_t>(width),
+                0, 0, 0};
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                ensure_library(s, device);
+                s.qs = grow(s, s.qs, s.qs_bytes, static_cast<std::size_t>(blocks * t) * sizeof(float));
+                id<MTLCommandBuffer> cmd = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];   // serial: select reads the scores
+                [enc setComputePipelineState:pipeline(s, "tsm_qsa_block_scores")];
+                bind(enc, sc, 0, 0); bind(enc, bi, 0, 1);
+                [enc setBuffer:s.qs offset:0 atIndex:2];
+                [enc setBytes:&args length:sizeof(args) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake((n_blocks + 255) / 256, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc setComputePipelineState:pipeline(s, "tsm_qsa_select")];
+                [enc setBuffer:s.qs offset:0 atIndex:0];
+                bind(enc, cb, 0, 1); bind(enc, mi, 0, 2); bind(enc, mo, 0, 3);
+                [enc setBytes:&args length:sizeof(args) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                [cmd commit];
+                s.last = cmd;
+            }
+            g_qsa_select_count.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true))
+                std::fprintf(stderr, "[tsm] prompt QSA selection runs on TensorSharp's kernels (block scores, radix select; "
+                    "TS_METAL_QSA_SELECT=0 keeps ggml's ops)\n");
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
+
+    long long qsa_select_count() { return g_qsa_select_count.load(std::memory_order_relaxed); }
 }
 
 // ---- test probe: one layer's held routes through moe_encode, on expert bytes the caller gives (stacked [expert]
@@ -1041,3 +1128,57 @@ TSG_EXPORT long long TSGgml_TsmHcPromptCount()
     return tsm::hc_prompt_count();
 }
 
+// ---- test hook: prompt QSA selections that ran on the tsm kernels in this process.
+TSG_EXPORT long long TSGgml_TsmQsaSelectCount()
+{
+    return tsm::qsa_select_count();
+}
+
+// ---- test probe: one QSA selection through qsa_select_encode on inputs the caller gives (scores F32 [B, H, T], bias
+// F32 [B, T], cell_blocks I32 [cells], mask F16 bits [cells, T]); the selected mask (F16 bits) comes back. Returns 1, or
+// 0 with the last error set.
+TSG_EXPORT int TSGgml_TsmQsaSelectProbe(int T, int n_cells, int n_blocks, int heads, int width, const float* scores,
+    const float* bias, const std::int32_t* cell_blocks, const std::uint16_t* mask_in, std::uint16_t* mask_out)
+{
+    using namespace tsg;
+    if (!ensure_backend()) return 0;
+    ggml_backend_t backend = g_backend;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_context* ctx = nullptr;
+    try
+    {
+        ggml_init_params ip{};
+        ip.mem_size = 8 * ggml_tensor_overhead();
+        ip.no_alloc = true;
+        ctx = ggml_init(ip);
+        ggml_tensor* sc = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, heads, T);
+        ggml_tensor* bi = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_blocks, T);
+        ggml_tensor* cb = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_cells);
+        ggml_tensor* mi = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_cells, T);
+        ggml_tensor* mo = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_cells, T);
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (buf == nullptr) throw std::runtime_error("tsm qsa probe: buffer");
+        ggml_backend_tensor_set(sc, scores, 0, ggml_nbytes(sc));
+        ggml_backend_tensor_set(bi, bias, 0, ggml_nbytes(bi));
+        ggml_backend_tensor_set(cb, cell_blocks, 0, ggml_nbytes(cb));
+        ggml_backend_tensor_set(mi, mask_in, 0, ggml_nbytes(mi));
+        if (!tsm::qsa_select_encode(backend, sc, bi, cb, mi, mo, T, n_cells, n_blocks, heads, width))
+            throw std::runtime_error(g_last_error);
+        {
+            State& st = state();
+            std::lock_guard<std::mutex> lock(st.mu);
+            if (st.last != nil) [st.last waitUntilCompleted];
+        }
+        ggml_backend_tensor_get(mo, mask_out, 0, ggml_nbytes(mo));
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return 1;
+    }
+    catch (const std::exception& e)
+    {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        set_last_error(e.what());
+        return 0;
+    }
+}

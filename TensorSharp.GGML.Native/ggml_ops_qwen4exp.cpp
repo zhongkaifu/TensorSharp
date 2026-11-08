@@ -125,11 +125,15 @@ namespace
         ggml_backend_buffer_t io = nullptr;
         std::uint8_t* base = nullptr;
         int T = 0;
-        bool gdn = false, hc = false;
+        bool gdn = false, hc = false, qsa = false;
         // hyper connections: the residual (in place across the span), xn, the up projection, inject, mixed, the
         // block output; GDN: the input projections and the kernels' output
         std::size_t off_res = 0, off_xn = 0, off_g = 0, off_inject = 0, off_mixed = 0, off_proj = 0;
         std::size_t off_qkv = 0, off_z = 0, off_alpha = 0, off_beta = 0, off_y = 0;
+        // QSA selection: the indexer's scores [B, H, T] and the selected mask [cells, T] (F16), for windows up to
+        // qsa_cells cells, blocks of at least qsa_ratio cells and up to qsa_heads indexer heads
+        std::size_t off_qsa_scores = 0, off_qsa_mask = 0;
+        std::size_t qsa_cells = 0, qsa_ratio = 1, qsa_heads = 0;
         std::size_t bytes = 0;
 
         void layout(int rows, std::size_t hc_dim, std::size_t n_embd, std::size_t hc, std::size_t conv_dim,
@@ -149,6 +153,12 @@ namespace
             {
                 off_qkv = take(conv_dim * t); off_z = take(value_dim * t); off_alpha = take(n_v_heads * t);
                 off_beta = take(n_v_heads * t); off_y = take(value_dim * t);
+            }
+            if (qsa)
+            {
+                const std::size_t blocks = (qsa_cells + qsa_ratio - 1) / qsa_ratio;
+                off_qsa_scores = take(blocks * qsa_heads * t);
+                off_qsa_mask = take((qsa_cells * t + 1) / 2);   // F16
             }
             bytes = at;
         }
@@ -2852,6 +2862,10 @@ static int q4e_token_span_impl(
         {
             if (tsm::gdn_prompt_supported(g_backend, head_k_dim, head_v_dim, n_k_heads, n_v_heads, d_conv)) device_ops |= 1;
             if (tsm::hc_prompt_supported(g_backend)) device_ops |= 2;
+            // QSA selection, when a QSA layer in the span selects at all (a window wider than its top-k).
+            if (qsa != nullptr && tsm::qsa_select_supported(g_backend))
+                for (int il = layer_begin; il < layer_end; ++il)
+                    if (qsa[il].ratio > 0 && n_kv_pad > (int64_t)qsa[il].top_k + qsa[il].ratio - 1) { device_ops |= 4; break; }
         }
 #endif
         if (!q4e_dump_nodes
@@ -3069,11 +3083,27 @@ static int q4e_token_span_impl(
             dev_ops.segs = &host_moe;
             dev_ops.gdn = (device_ops & 1) != 0;
             dev_ops.hc = (device_ops & 2) != 0;
+            dev_ops.qsa = (device_ops & 4) != 0;
+            if (dev_ops.qsa)
+            {
+                dev_ops.qsa_cells = (std::size_t)n_kv_pad;
+                dev_ops.qsa_ratio = 0;
+                for (int il = layer_begin; il < layer_end; ++il)
+                    if (qsa[il].ratio > 0)
+                    {
+                        if (dev_ops.qsa_ratio == 0 || (std::size_t)qsa[il].ratio < dev_ops.qsa_ratio) dev_ops.qsa_ratio = (std::size_t)qsa[il].ratio;
+                        dev_ops.qsa_heads = std::max(dev_ops.qsa_heads, (std::size_t)qsa[il].heads);
+                    }
+            }
             dev_ops.layout(T, (std::size_t)hc_dim, (std::size_t)n_embd, (std::size_t)hc,
                     (std::size_t)(head_k_dim * n_k_heads) * 2 + (std::size_t)(head_v_dim * n_v_heads),
                     (std::size_t)head_v_dim * n_v_heads, (std::size_t)n_v_heads);
             if (slot->dev_io != nullptr && ggml_backend_buffer_get_size(slot->dev_io) < dev_ops.bytes)
             { ggml_backend_buffer_free(slot->dev_io); slot->dev_io = nullptr; }
+            // A quarter of headroom: the QSA regions grow with the window, chunk by chunk.
+            if (slot->dev_io == nullptr)
+                slot->dev_io = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(g_backend),
+                        dev_ops.bytes + dev_ops.bytes / 4);
             if (slot->dev_io == nullptr)
                 slot->dev_io = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(g_backend), dev_ops.bytes);
             if (slot->dev_io == nullptr)
