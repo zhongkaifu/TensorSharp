@@ -1824,6 +1824,60 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         }
     }
 
+    /// <summary>Four sequences' 4-row windows are a 16-row batched verify. Under expert residency with
+    /// TS_Q4E_HOST_EXPERT_ROWS=16 the CPU computes its missed experts inside the step (as it does for a solo window)
+    /// instead of the step staging them over the bus; each sequence's rows are still its own verify's, and the commit
+    /// leaves each sequence where its own commit would.</summary>
+    [CudaFact]
+    public void BatchedVerify_SixteenRowsWithHostComputedMisses_AreEachSequencesOwnWindow()
+    {
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", "0");
+        _env.Set("TS_Q4E_HOST_EXPERT_ROWS", "16");
+        using var ex = OpenExecutor(Fixture(indexerTopK: 2048, q2kxlExperts: true));
+        var engine = ex.Engine;
+        Assert.True(engine.SupportsBatchedVerify);
+        Assert.Equal(0, engine.ResidentExperts);
+        int[] prompts = { 30, 21, 37, 26 };
+        int[][] windows = { new[] { 17, 203, 99, 4 }, new[] { 150, 61, 5, 77 }, new[] { 123, 9, 31, 200 }, new[] { 8, 64, 180, 2 } };
+        int[] keep = { 4, 2, 1, 3 };
+        int n = prompts.Length, w = 4, h = engine.HiddenWidth;
+        var batched = new int[n];
+        var serial = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            batched[i] = NewActiveSlot(ex);
+            Step(ex, Prompt[..prompts[i]]);
+            serial[i] = NewActiveSlot(ex);
+            Step(ex, Prompt[..prompts[i]]);
+        }
+        var drawn = new int[n * w];
+        var hidden = new float[n * w * h];
+        long before = engine.HostExpertMisses;
+        Assert.True(engine.ForwardBatchedVerify(batched, w, windows.SelectMany(x => x).ToArray(), drawn, hidden));
+        long cpu = engine.HostExpertMisses - before;
+        _output.WriteLine($"16-row batched verify: {cpu} experts computed by the CPU");
+        Assert.True(cpu > 0, "the 16-row step left no expert to the CPU: it staged them instead");
+        Assert.True(engine.CommitBatchedVerify(batched, keep));
+        for (int i = 0; i < n; i++)
+        {
+            Assert.True(ex.SetActiveSlot(serial[i]));
+            var wantDrawn = new int[w];
+            var wantHidden = new float[w * h];
+            engine.ForwardVerifyGreedy(windows[i], wantDrawn, wantHidden);
+            Assert.True(engine.CommitVerify(keep[i]));
+            Assert.Equal(wantDrawn, drawn.AsSpan(i * w, w).ToArray());
+            double hErr = RelativeError(hidden.AsSpan(i * w * h, w * h).ToArray(), wantHidden);
+            _output.WriteLine($"sequence {i}: hidden streams relative error {hErr:E2}");
+            Assert.True(hErr <= 1e-5, $"sequence {i}: the batched verify's hidden streams differ by {hErr:E2}");
+            float[] want = Step(ex, new[] { Steps[i] });
+            Assert.True(ex.SetActiveSlot(batched[i]));
+            Assert.Equal(prompts[i] + keep[i], engine.NPast);
+            double err = RelativeError(Step(ex, new[] { Steps[i] }), want);
+            _output.WriteLine($"sequence {i}: next step after keeping {keep[i]} rows, relative error {err:E2}");
+            Assert.True(err <= 1e-5, $"sequence {i}: the step after the batched commit differs by {err:E2}");
+        }
+    }
+
     /// <summary>The batched verify for sequences that sample returns every row's logits: each sequence's rows as its own
     /// verify window's.</summary>
     [CudaFact]

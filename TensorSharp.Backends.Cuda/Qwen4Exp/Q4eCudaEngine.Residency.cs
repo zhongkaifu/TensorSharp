@@ -62,8 +62,11 @@ namespace TensorSharp.Cuda
         private CudaHostExpertMailbox _hostBox;
         private CudaHostExpertServer _hostServer;
 
-        /// <summary>Rows up to which the host computes missed experts (the host kernel's bound).</summary>
-        internal const int HostExpertMaxRows = 8;
+        /// <summary>Rows up to which the host can compute missed experts (the host kernel's bound, TSGgml_HostExpertRows).</summary>
+        internal const int HostExpertMaxRows = 16;
+
+        /// <summary>The default of TS_Q4E_HOST_EXPERT_ROWS: decode steps, verify windows and batched steps of up to 8 rows.</summary>
+        internal const int HostExpertDefaultRows = 8;
 
         /// <summary>Experts with a VRAM slot under residency, or -1 when every expert is resident (tests).</summary>
         internal int ResidentExperts => _residency?.SlotExperts ?? -1;
@@ -853,9 +856,10 @@ namespace TensorSharp.Cuda
             => _hostServer != null && nt <= _hostExpertRows && L.Stage.IsValid && !_groupedPrompt;
 
         /// <summary>Rows up to which a step leaves its missed experts to the CPU (TS_Q4E_HOST_EXPERT_ROWS, 1 to
-        /// <see cref="HostExpertMaxRows"/>); wider steps stage them over the bus. A verify window's rows miss more
-        /// experts between them than one decode row does, and the GPU waits for the CPU at every layer.</summary>
-        private readonly int _hostExpertRows = Math.Clamp(EnvInt("TS_Q4E_HOST_EXPERT_ROWS", HostExpertMaxRows), 1, HostExpertMaxRows);
+        /// <see cref="HostExpertMaxRows"/>, default <see cref="HostExpertDefaultRows"/>); wider steps stage them over the bus.
+        /// A verify window's rows miss more experts between them than one decode row does, and the GPU waits for the CPU at
+        /// every layer. A batched speculative verify of four sequences is 16 rows.</summary>
+        private readonly int _hostExpertRows = Math.Clamp(EnvInt("TS_Q4E_HOST_EXPERT_ROWS", HostExpertDefaultRows), 1, HostExpertMaxRows);
 
         /// <summary>A forward is about to run: keep the host experts' server spinning; and after it, report its failure.</summary>
         private void ArmHostExperts() => _hostServer?.Arm();
@@ -890,7 +894,7 @@ namespace TensorSharp.Cuda
                 $"[q4e-cuda] expert residency: {r.SlotExperts} of {r.TotalExperts} experts in VRAM " +
                 $"({r.SlotBytes / 1073741824.0:F1} GiB, {covered}); the other experts in pinned host memory " +
                 $"({r.HostBytes / 1073741824.0:F1} GiB), " +
-                (r.HostCompute ? $"computed by the CPU in decode steps of up to {HostExpertMaxRows} rows and staged over the bus in prompts."
+                (r.HostCompute ? $"computed by the CPU in decode steps of up to {_hostExpertRows} rows and staged over the bus in prompts."
                                : "staged over the bus when routed."));
             if (_groupXs != null)
                 Console.Error.WriteLine(
