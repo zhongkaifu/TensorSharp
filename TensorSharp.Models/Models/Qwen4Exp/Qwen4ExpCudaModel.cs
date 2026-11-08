@@ -52,7 +52,10 @@ namespace TensorSharp.Models
                 // sequence slot. Keep a practical default unless MAX_CONTEXT names one.
                 if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
                     maxContext = Math.Min(maxContext, 65536);
-                int nUbatch = ParseEnvInt("TS_Q4E_UBATCH", 512);
+                // 1024 prompt rows a forward: each expert's weights are decoded for twice the rows and a layer's fixed
+                // costs halve. RTX 5090, ISTA Q2_0: 4K TTFT 1.29 -> 1.07 s, 16K 5.05 -> 4.17 s, for 345 fewer expert
+                // slots (the larger scratch; long generation within noise); TS_Q4E_UBATCH=512 gives them back.
+                int nUbatch = ParseEnvInt("TS_Q4E_UBATCH", 1024);
                 // --kv-cache-dtype: the engine's kernels store F16 or Q8_0 (int8 codes, an F16 scale per 32 values).
                 // Q8_0 unless the operator chose otherwise (Strata's int8 KV): at 131K context it gives 1.5 GiB more to
                 // expert slots on a 32 GB card - 4K and 16K prompts 11-12% faster, their answers 9-30% faster.

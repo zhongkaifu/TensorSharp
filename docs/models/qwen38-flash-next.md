@@ -1343,6 +1343,22 @@ RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/
 | a block per head and row | 0.07-0.09 s / 82-102 | 169-182 | 1.38-1.44 s / 140-185 | 5.79-5.86 s / 189-193 | 0.89-0.95 s |
 | tensor cores (default) | 0.07-0.09 s / 91-99 | 161-187 | 1.23-1.29 s / 99-161 | 4.99-5.08 s / 187-198 | 0.81-0.85 s |
 
+#### A 1024-row prompt ubatch by default, 2026-11-08
+
+With the next layer staged ahead and the attention on tensor cores, what a prompt ubatch pays per call (each expert's
+weights decoded per 32-row pass of the grouped kernel, a layer's fixed launches and syncs) became the larger share, and
+`TS_Q4E_UBATCH=1024` read a 4K prompt 17% faster. The engine now defaults to 1024 prompt rows a forward
+(`TS_Q4E_UBATCH=512` restores the old value). The larger scratch takes 345 expert slots (16,609 instead of 16,954 in
+VRAM, 97.6% instead of 97.9% of the profiled routes); long generation stayed within the run-to-run noise.
+
+RTX 5090, ISTA `Q2_0`, MTP, the same build, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
+
+| prompt ubatch | short chat | long generation | 4K prompt | 16K prompt | multi-turn first TTFT |
+| --- | --- | --- | --- | --- | --- |
+| 512 | 0.07-0.09 s / 89-110 | 174-177 | 1.29 s / 121-155 | 5.05 s / 178-199 | 0.81-0.85 s |
+| 1024 (default) | 0.07-0.09 s / 80-118 | 168-179 | 1.07-1.08 s / 114-185 | 4.16-4.19 s / 182-189 | 0.63-0.68 s |
+| Strata (11-07) | 0.24 s / 93-115 | 300-307 | 0.92 s / 376-408 | 2.75 s / 387-421 | 1.08-1.18 s |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
