@@ -1755,11 +1755,13 @@ extern "C" __global__ void ts_q4e_group_norm_f32(
     const int HC,
     const float eps)
 {
+    // grid (nt, HC): a block per row and group (a block per row walked the four groups in turn, 21 us a call on the
+    // RTX 5090 for one row); each group's sum is the same block reduction as before, so the outputs are unchanged.
     __shared__ float sh[32];
     const int t = blockIdx.x;
     const float* xr = x + (size_t)t * HC * E;
     float* yr = y + (size_t)t * HC * E;
-    for (int c = 0; c < HC; ++c)
+    for (int c = blockIdx.y; c < HC; c += gridDim.y)
     {
         float ss = 0.0f;
         for (int i = threadIdx.x; i < E; i += blockDim.x)

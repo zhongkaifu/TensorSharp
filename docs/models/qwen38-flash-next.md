@@ -1359,6 +1359,36 @@ RTX 5090, ISTA `Q2_0`, MTP, the same build, same client, 3 repetitions (TTFT / d
 | 1024 (default) | 0.07-0.09 s / 80-118 | 168-179 | 1.07-1.08 s / 114-185 | 4.16-4.19 s / 182-189 | 0.63-0.68 s |
 | Strata (11-07) | 0.24 s / 93-115 | 300-307 | 0.92 s / 376-408 | 2.75 s / 387-421 | 1.08-1.18 s |
 
+#### Decode-once dense kernels, 2026-11-08
+
+A verify window's dense projections ran at 0.3-0.7 TB/s on the RTX 5090. A microbenchmark of the kernels at Flash
+Next's shapes (weights rotated past L2) showed why: the multi-row kernel's time grew with the rows (the 2560 -> 10240
+IQ4_XS projection 15 us for one row, 33 for four), because each activation row decoded every weight unit again and an
+IQ4 nibble went through a byte load from the lookup table. The pack's Q3_K projections (25 of the 36 GDN gates, 18 qkv
+projections) and the `TS_Q4E_HC_Q8` hyper-connections ran on the shared q8_1 kernels, up to 90 us a call.
+
+The new kernels (`TS_DENSE_FAST`, on) decode each unit once - the IQ4 table held in registers and applied with
+`__byte_perm`, as llama.cpp's `get_int_from_table_16` does - and dot it against every activation row, with 1, 2 or 4
+warps an output row by shape. They cover Q8_0, Q2_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS and IQ4_NL, decode steps (one row)
+included, so a row's sums depend on the shape alone and a verify window's row is still its own decode step's bit for
+bit (`Dsv4DenseRowInvarianceTests` holds rows 2-16 to the one-row call and to the dequantized weights). The router GEMV
+takes a block of 256 threads per expert (`TS_DSV4_GEMV_BLOCK`), and the PLE and MTP group norms a block per group
+instead of one per row (same sums).
+
+4 rows, RTX 5090, cold weights (us): IQ4_XS 2560 -> 10240 33.4 -> 11.1; Q3_K 2560 -> 10240 32.8 -> 15.4; Q3_K
+2560 -> 6144 22.9 -> 10.7; Q4_K 2560 -> 6144 18.9 -> 11.9; Q2_0 2560 -> 12288 18.7 -> 11.9; Q6_K 6144 -> 2560
+21.4 -> 11.8; Q8_0 hyper-connection 10240 -> 320 11.5 (shared kernel) -> 5.1 and 320 -> 10240 6.5 -> 4.9; the
+2560 -> 151643 Q5_K LM head 298 -> 208; the BF16 router 12.1 -> 4.4. Tried and slower: 2 or 4 warps an output for
+the long-output shapes; a "one pass" kernel that kept the per-format decoder and summed the rows in one walk (the
+compiler did not share the decode: no gain for IQ4_XS).
+
+MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
+
+| dense kernels | short chat | long generation | 4K prompt | 16K prompt | multi-turn first TTFT |
+| --- | --- | --- | --- | --- | --- |
+| before (d620953d) | 0.07-0.09 s / 84-108 | 166-178 | 1.07-1.08 s / 121-161 | 4.16-4.18 s / 179-189 | 0.63-0.68 s |
+| decode once, block router, group norm | 0.07-0.10 s / 86-127 | 202-222 | 1.07-1.08 s / 149-167 | 4.16-4.18 s / 207-217 | 0.63-0.69 s |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
