@@ -348,6 +348,7 @@ namespace
     struct Q4eRowCapture
     {
         const void* key = nullptr;        // the live state's seq-state key
+        const void* row_key = nullptr;    // its row buffer (q4e_row_key: one per layer, shared by every holder)
         bool ple = false;
         int T = 0, hist = 0, width = 0;   // GDN: conv_dim; PLE: hc_dim
         std::size_t ssm_off = 0, ssm_bytes = 0, snaps_off = 0;
@@ -1132,6 +1133,16 @@ bool q4e_capture_rows(int T)
 // into the buffers it was built against, and graphs of several widths stay alive at once (one
 // span slot per width), so a capturing graph built before the bump must rebuild, not replay.
 static std::uint64_t g_q4e_row_epoch = 0;
+
+// A verify's row buffers are read only by the commit that follows it, before the next verify of any sequence, so
+// one set serves every holder: keyed by layer, not by the holder's state (T x ~3 MB a GDN layer, ~0.9 GB a set at 8
+// rows on Flash Next). Keyed by holder they were never freed with it, and every request that speculated on a holder
+// of its own left a set behind - the Metal working set ran out in Strata's concurrency rounds.
+static const void* q4e_row_key(int layer)
+{
+    static char s_keys[258];
+    return &s_keys[std::clamp(layer + 1, 0, 257)];
+}
 
 static Q4eRowBuffer* q4e_row_buffer(const void* key, std::size_t bytes)
 {
@@ -3211,11 +3222,11 @@ static int q4e_token_span_impl(
                 if (capture && hist > 0 && g_q4e_ple_padded != nullptr)
                 {
                     const std::size_t bytes = ggml_nbytes(g_q4e_ple_padded);
-                    Q4eRowBuffer* rb = q4e_row_buffer(ple->conv_state, bytes);
+                    Q4eRowBuffer* rb = q4e_row_buffer(q4e_row_key(-1), bytes);
                     if (rb == nullptr) { failed = true; fail_what = "ple row buffer"; break; }
                     ggml_build_forward_expand(graph, q4e_capture_copy(ctx, rb, 0, g_q4e_ple_padded));
                     Q4eRowCapture c;
-                    c.key = ple->conv_state; c.ple = true; c.T = T; c.hist = hist; c.width = hc_dim;
+                    c.key = ple->conv_state; c.row_key = q4e_row_key(-1); c.ple = true; c.T = T; c.hist = hist; c.width = hc_dim;
                     capture_desc.push_back(c);
                 }
             }
@@ -3274,7 +3285,7 @@ static int q4e_token_span_impl(
                     const bool in_place = gdn_out != nullptr && gdn_out->view_src == nullptr && gdn_out->data == nullptr
                         && gdn_out->type == GGML_TYPE_F32 && ggml_is_contiguous(gdn_out);
                     const std::size_t snaps_bytes = in_place ? ggml_nbytes(gdn_out) : ggml_nbytes(wb.snaps);
-                    Q4eRowBuffer* rb = q4e_row_buffer(gdn[il].conv_state, out_off + snaps_bytes);
+                    Q4eRowBuffer* rb = q4e_row_buffer(q4e_row_key(il), out_off + snaps_bytes);
                     if (rb == nullptr) { failed = true; fail_what = "gdn row buffer"; break; }
                     ggml_build_forward_expand(graph, q4e_capture_copy(ctx, rb, 0, wb.conv_in));
                     std::size_t snaps_off = out_off;
@@ -3288,7 +3299,7 @@ static int q4e_token_span_impl(
                     else
                         ggml_build_forward_expand(graph, q4e_capture_copy(ctx, rb, out_off, wb.snaps));
                     Q4eRowCapture c;
-                    c.key = gdn[il].conv_state; c.T = T; c.hist = d_conv - 1; c.width = (int)conv_dim;
+                    c.key = gdn[il].conv_state; c.row_key = q4e_row_key(il); c.T = T; c.hist = d_conv - 1; c.width = (int)conv_dim;
                     c.ssm_off = ssm_off; c.ssm_bytes = ssm_bytes; c.snaps_off = snaps_off;
                     capture_desc.push_back(c);
                 }
@@ -4114,6 +4125,14 @@ TSG_EXPORT void TSGgml_Qwen4ExpCaptureVerifyRows(int enable)
     g_q4e_capture_enabled.store(enable != 0, std::memory_order_relaxed);
 }
 
+// Bytes held by the verify row buffers (one set, shared by every holder: q4e_row_key).
+TSG_EXPORT long long TSGgml_Qwen4ExpRowBufferBytes()
+{
+    long long total = 0;
+    for (const auto& kv : g_q4e_row_buffers) total += static_cast<long long>(kv.second.bytes);
+    return total;
+}
+
 TSG_EXPORT int TSGgml_Qwen4ExpCommitVerifyRow(int row, int rows)
 {
     try
@@ -4129,7 +4148,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpCommitVerifyRow(int row, int rows)
         // Validate every entry before writing any: a partial commit would mix rows.
         for (const auto& c : g_q4e_capture_last)
         {
-            auto rb = g_q4e_row_buffers.find(c.key);
+            auto rb = g_q4e_row_buffers.find(c.row_key);
             Q4eSeqStateEntry* live = q4e_seq_state_find(c.key);
             if (c.T != rows || rb == g_q4e_row_buffers.end() || live == nullptr || !live->ready)
             { set_last_error("qwen4exp verify commit: captured rows unavailable"); return 0; }

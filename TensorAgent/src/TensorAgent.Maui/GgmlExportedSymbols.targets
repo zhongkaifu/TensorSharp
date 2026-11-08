@@ -370,6 +370,7 @@
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCaptureVerifyRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpSetFeatureTaps" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCommitVerifyRow" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpRowBufferBytes" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCopyQsaCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpFfnBlock" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpGdnBlock" SymbolType="Function" />
