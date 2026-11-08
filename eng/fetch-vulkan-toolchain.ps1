@@ -48,6 +48,37 @@ function Test-Truthy([string] $Value) {
     return $Value -match '^(1|ON|on|On|TRUE|true|True|YES|yes|Yes)$'
 }
 
+# Hash and unzip through .NET, not Get-FileHash / Expand-Archive. Those two are
+# script-module commands (Microsoft.PowerShell.Utility's .psm1 and
+# Microsoft.PowerShell.Archive) that Windows PowerShell loads on first use, and
+# MSBuild's Exec starts this script in Windows PowerShell through cmd.exe. A
+# build started from PowerShell 7 hands it PowerShell 7's PSModulePath, whose
+# module folders come first; Windows PowerShell then finds modules it cannot
+# load and reports both commands as not recognized: a fresh download fails its
+# checksum step, and an already provisioned glslc is first judged "not the
+# compatible pinned build" (Test-PinnedShaderc treats any hashing error as a
+# mismatch), so the build downloads the 229 MB archive again and then fails.
+function Get-FileSha256([string] $Path) {
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($sha256.ComputeHash($stream)) -replace '-', '')
+        }
+        finally {
+            $sha256.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Expand-ZipArchive([string] $ArchivePath, [string] $DestinationPath) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($ArchivePath, $DestinationPath)
+}
+
 function Invoke-CMakeDefanged([string] $FailureMessage, [string[]] $Arguments) {
     # Resolved per call (rather than once at script scope) because the only
     # caller sits behind a Test-Path guard - a toolchain that is already
@@ -99,10 +130,17 @@ function Test-GlslcCompatible([string] $CompilerPath) {
         "layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;",
         "void main() {}"
     )
+    # Compile the probe from a file, not stdin. Windows PowerShell writes text piped
+    # to a native command in the console's input encoding, which in a UTF-8 console
+    # (code page 65001) starts with a byte-order mark; glslang then does not see
+    # `#version` at the start of the source, falls back to a default profile and
+    # fails on its own built-ins, so every compiler looked incompatible.
+    $probeFile = Join-Path ([System.IO.Path]::GetTempPath()) ("tensorsharp-glslc-probe-" + [Guid]::NewGuid().ToString("N") + ".comp")
+    [System.IO.File]::WriteAllLines($probeFile, $probeSource)
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $probeOutput = $probeSource | & $CompilerPath -fshader-stage=compute --target-env=vulkan1.2 -O - -o NUL 2>&1
+        $probeOutput = & $CompilerPath -fshader-stage=compute --target-env=vulkan1.2 -O $probeFile -o NUL 2>&1
         $probeExitCode = $LASTEXITCODE
     }
     catch {
@@ -110,6 +148,7 @@ function Test-GlslcCompatible([string] $CompilerPath) {
     }
     finally {
         $ErrorActionPreference = $previousPreference
+        Remove-Item -Force $probeFile -ErrorAction SilentlyContinue
     }
 
     return $probeExitCode -eq 0
@@ -125,7 +164,7 @@ function Test-PinnedShaderc {
     if (-not (Test-Path $compilerPath)) { return $false }
 
     try {
-        $compilerHash = (Get-FileHash -Path $compilerPath -Algorithm SHA256).Hash
+        $compilerHash = Get-FileSha256 $compilerPath
     }
     catch {
         return $false
@@ -271,7 +310,7 @@ if (-not (Test-PinnedShaderc)) {
     if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
     try {
         if (Test-Path $archivePath) {
-            $cachedArchiveHash = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash
+            $cachedArchiveHash = Get-FileSha256 $archivePath
             if ($cachedArchiveHash -eq $ShadercArchiveSha256) {
                 Write-Host "vulkan-toolchain: using verified cached shaderc archive at $archivePath"
             }
@@ -281,21 +320,31 @@ if (-not (Test-PinnedShaderc)) {
         }
         if (-not (Test-Path $archivePath)) {
             Write-Host "vulkan-toolchain: downloading pinned glslc from $ShadercArchiveUrl"
-            Invoke-WebRequest -UseBasicParsing -Uri $ShadercArchiveUrl -OutFile $archivePath
+            # Windows PowerShell redraws Invoke-WebRequest's progress bar for every
+            # chunk it reads; with it on, this 229 MB download took over 13 minutes on
+            # a link that delivers it in seconds.
+            $previousProgressPreference = $ProgressPreference
+            $ProgressPreference = "SilentlyContinue"
+            try {
+                Invoke-WebRequest -UseBasicParsing -Uri $ShadercArchiveUrl -OutFile $archivePath
+            }
+            finally {
+                $ProgressPreference = $previousProgressPreference
+            }
         }
 
-        $archiveHash = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash
+        $archiveHash = Get-FileSha256 $archivePath
         if ($archiveHash -ne $ShadercArchiveSha256) {
             throw "Pinned shaderc archive checksum mismatch (expected $ShadercArchiveSha256, got $archiveHash)."
         }
 
-        Expand-Archive -Path $archivePath -DestinationPath $extractDir
+        Expand-ZipArchive $archivePath $extractDir
         $stagedShadercDir = Join-Path $extractDir "install"
         $stagedCompiler = Join-Path $stagedShadercDir "bin\glslc.exe"
         if (-not (Test-Path $stagedCompiler)) {
             throw "Pinned shaderc archive does not contain install\bin\glslc.exe."
         }
-        $stagedCompilerHash = (Get-FileHash -Path $stagedCompiler -Algorithm SHA256).Hash
+        $stagedCompilerHash = Get-FileSha256 $stagedCompiler
         if ($stagedCompilerHash -ne $ShadercExecutableSha256) {
             throw "Pinned glslc executable checksum mismatch (expected $ShadercExecutableSha256, got $stagedCompilerHash)."
         }
@@ -324,8 +373,11 @@ if (-not (Test-PinnedShaderc)) {
         if (Test-Path $ShadercBackupDir) { Remove-Item -Recurse -Force $ShadercBackupDir }
     }
     finally {
-        if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
-        if (Test-Path $archivePath) { Remove-Item -Force $archivePath }
+        # Best effort: a just-probed glslc.exe can still be locked for a moment (an
+        # antivirus scan), and an error thrown here would replace the real failure.
+        # The extract directory is cleared again before the next extraction.
+        if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue }
+        if (Test-Path $archivePath) { Remove-Item -Force $archivePath -ErrorAction SilentlyContinue }
     }
 }
 
