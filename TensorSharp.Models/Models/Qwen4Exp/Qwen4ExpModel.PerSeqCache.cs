@@ -283,6 +283,8 @@ namespace TensorSharp.Models
 
             if (string.Equals(_activeFusedKey, requestId, StringComparison.Ordinal))
                 return false;
+            if (!_fusedHolders.ContainsKey(requestId))
+                EnsureDeviceRoomForAnotherSequence(requestId);
 
             if (_activeFusedKey == null)
                 _primaryHolder = SnapshotActiveCache();
@@ -304,6 +306,45 @@ namespace TensorSharp.Models
             _activeFusedKey = requestId;
             return fresh;
         }
+
+        /// <summary>
+        /// On Metal a concurrent request's holder (its K/V and indexer keys, recurrent and conv state) becomes device
+        /// copies on its first step, ~1.1 GB at a 32K context on Flash Next, and nothing else bounds how many run at
+        /// once: on a 48 GB M5 Pro the expert tier left ~14 GB of the 38.3 GB working set, Strata's benchmark ran four
+        /// concurrent requests after 16K-token prompts, and Metal ran out of memory mid-step (unrecoverable). So a new
+        /// request's holder needs that much free beside a headroom; the arenas graph slots keep idle go first, and when
+        /// it still does not fit the request waits for a running one to finish (SequenceSlotUnavailableException, the
+        /// scheduler's DeferForSequenceSlot). A lone request runs on the primary cache and never comes here.
+        /// </summary>
+        private void EnsureDeviceRoomForAnotherSequence(string requestId)
+        {
+            if (_backend != BackendType.GgmlMetal)
+                return;
+            if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) || total <= 0)
+                return;
+            long need = CacheBytes() + MetalSequenceExtraBytes;
+            if (FitsAnotherSequence(free, total, need))
+                return;
+            if (GgmlBasicOps.ReleaseKeptArenas() > 0 && GgmlBasicOps.TryGetDeviceMemoryInfo(out free, out total)
+                && FitsAnotherSequence(free, total, need))
+                return;
+            throw new SequenceSlotUnavailableException(
+                $"qwen4exp: no Metal memory for another concurrent request's state ({need / 1048576.0:F0} MB needed, " +
+                $"{free / 1048576.0:F0} MB free of {total / 1048576.0:F0} MB, {MetalHeadroom(total) / 1048576.0:F0} MB kept free); " +
+                $"{requestId} waits for a running request to finish.");
+        }
+
+        /// <summary>The working set a new request's state may not eat into: the larger of 1 GB and 1/32 of it, what
+        /// command buffers and the driver allocate beside the graphs (the native arena guard keeps the same).</summary>
+        internal static long MetalHeadroom(long totalBytes) => Math.Max(1L << 30, totalBytes / 32);
+
+        /// <summary>Whether <paramref name="needBytes"/> more fit in the Metal working set beside the headroom.</summary>
+        internal static bool FitsAnotherSequence(long freeBytes, long totalBytes, long needBytes)
+            => freeBytes - needBytes >= MetalHeadroom(totalBytes);
+
+        /// <summary>A holder's state beyond its K/V and indexer keys (GDN recurrent and conv state, PLE history) plus its
+        /// share of the batched-decode arena and the drafter's per-request ring.</summary>
+        private const long MetalSequenceExtraBytes = 256L << 20;
 
         public void AdoptPrimaryCacheToFused(string requestId)
         {
