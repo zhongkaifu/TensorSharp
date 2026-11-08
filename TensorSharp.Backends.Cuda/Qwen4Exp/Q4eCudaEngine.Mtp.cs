@@ -260,7 +260,7 @@ namespace TensorSharp.Cuda
 
             // The block's layer, on its own KV.
             var L = _mtpLayer;
-            HcPre(dev, L.HcAttnNorm, L.HcAttnDown, L.HcAttnUp, L.HcAttnInject, nt);
+            IntPtr curQ = HcPre(dev, L.HcAttnNorm, L.HcAttnDown, L.HcAttnUp, L.HcAttnInject, nt);
             if (nt > 1 && _mtpKvOnly)
             {
                 // A catch-up's rows only leave their K/V behind; the layer runs on past it for the last row alone, when
@@ -274,10 +274,10 @@ namespace TensorSharp.Cuda
                 MtpLastRowAttention(dev, L, slot.Mtp, p0);
             }
             else
-                Attention(dev, L, -1, slot.Mtp, 0, nt, p0);
+                Attention(dev, L, -1, slot.Mtp, 0, nt, p0, curQ: curQ, curQRows: nt);
             dev.QK.HcPost(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), nt, e, hc, dev.Stream);
-            HcPre(dev, L.HcFfnNorm, L.HcFfnDown, L.HcFfnUp, L.HcFfnInject, nt);
-            Moe(dev, L, -1, nt, -1);
+            curQ = HcPre(dev, L.HcFfnNorm, L.HcFfnDown, L.HcFfnUp, L.HcFfnInject, nt);
+            Moe(dev, L, -1, nt, -1, curQ);
             dev.QK.HcPost(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), nt, e, hc, dev.Stream);
             return nt;
         }

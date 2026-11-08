@@ -1446,6 +1446,27 @@ experts left to the CPU, from `TS_Q4E_PERF`):
 | 4, `odd` | 214-232 | 11.3-12.8 ms | 20-33 |
 | 2, `first` | 210-232 | 10.9-12.2 ms | 6-13 |
 
+#### Smaller decode kernels, 2026-11-08
+
+Kernel by kernel, each the same bits as before (old and new compared byte for byte at Flash Next's shapes, RTX 5090,
+CUDA-graph replays):
+
+- The hyper-connection partials (and the fused scatter-and-partials) summed their five values - the sum of squares and
+  four scatter logits - one block reduction after another, three barriers each; they now share one barrier, each value
+  summed in the same order: 2.56 -> 1.61 us a 4-row call, about 90 a window.
+- The mixer's collapse now also writes the q8_1 blocks of its output (`TS_Q4E_COLLAPSE_Q81`), which the attention, GDN,
+  shared-expert and routed-expert projections read instead of quantizing it again: 2.30 -> 1.58 us, and one launch
+  fewer on the routed experts' path.
+- The QSA selection walked its 256-bin histograms on one thread, four passes a row; a block-wide scan finds the same
+  bin: 15.2 -> 6.1 us at 4K context, 26.5 -> 18.1 us at 16K.
+- The GDN front end runs two warps a block instead of eight (more SMs for its 48-192 warps): 5.26 -> 4.74 us.
+
+Tried and dropped: four or two cells in flight per warp in the split attention (4-row QSA rows 32.8 -> 38.6 and 37.5
+us: the registers cost more occupancy than the overlapped loads gained); keeping the router's picks in lanes and
+storing them once (4.81 -> 4.74 us, inside the noise). A tensor-core verify attention (a window's rows sharing one
+read of each KV head's cells) is not built: a decode step would have to run the same kernel for its row to stay equal
+to a verify row, and the split kernel's 33 us for 4 QSA rows is about 0.4 ms of a window.
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the

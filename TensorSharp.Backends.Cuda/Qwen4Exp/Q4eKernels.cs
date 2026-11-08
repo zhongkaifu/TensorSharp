@@ -37,6 +37,11 @@ namespace TensorSharp.Cuda
 
         private readonly CudaModule module;
         private readonly IntPtr hcNorm, siluScale, hcCollapse, hcPost, hcPartials, hcApply, siluQ81, hcPostPartials, bf16ToF32;
+        // The collapse that also quantizes its output (optional: a module before it quantizes in a launch of its own).
+        private readonly IntPtr hcCollapseQ81;
+
+        /// <summary>Whether <see cref="HcCollapseQ81"/> runs here.</summary>
+        public bool HasHcCollapseQ81 => hcCollapseQ81 != IntPtr.Zero;
 
         /// <summary>Whether the module widens BF16 to F32 (<see cref="Bf16ToF32"/>).</summary>
         public bool HasBf16ToF32 => bf16ToF32 != IntPtr.Zero;
@@ -92,6 +97,8 @@ namespace TensorSharp.Cuda
             try { hcPostPartials = module.GetFunction("ts_q4e_hc_post_partials_f32"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { } // CUDA_ERROR_NOT_FOUND
             try { bf16ToF32 = module.GetFunction("ts_q4e_bf16_to_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { }
+            try { hcCollapseQ81 = module.GetFunction("ts_q4e_hc_collapse_q81_f32"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { }
             gdnPrep = module.GetFunction("ts_q4e_gdn_prep_f32");
             convUpdate = module.GetFunction("ts_q4e_conv_update_f32");
@@ -212,6 +219,16 @@ namespace TensorSharp.Cuda
             Launch(hcCollapse, CeilDiv(e, BlockSize), (uint)rows, 1, BlockSize, stream, args);
         }
 
+        /// <summary><see cref="HcCollapse"/>, its output also quantized to q8_1 (row t at block t * e / 32, as
+        /// LaunchQuantizeQ81Rows lays it out and rounds it) into <paramref name="xq"/>. <paramref name="e"/> % 32 == 0.</summary>
+        public void HcCollapseQ81(IntPtr xn, IntPtr g, IntPtr cur, IntPtr xq, int rows, int e, int hc, IntPtr stream)
+        {
+            IntPtr a0 = xn, a1 = g, a2 = cur, a3 = xq;
+            int a4 = e, a5 = hc;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
+            Launch(hcCollapseQ81, CeilDiv(e, BlockSize), (uint)rows, 1, BlockSize, stream, args);
+        }
+
         /// <summary>xs[t, c] += out[t] * 2 sigmoid(inject[t, c] / hc).</summary>
         /// <summary><see cref="HcPost"/>, then the next mixer's <see cref="HcPartials"/> over the updated streams, in one
         /// launch (decode-size rows; requires <see cref="HasHcPostPartials"/>).</summary>
@@ -252,7 +269,10 @@ namespace TensorSharp.Cuda
             float a13 = eps;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13 };
             long warps = (long)rowsPerSeq * nSeq * vHeads;
-            Launch(gdnPrep, CeilDiv(warps * 32, BlockSize), 1, 1, BlockSize, stream, args);
+            // Two warps a block: a decode step's 48 warps spread over 24 SMs instead of 6 (5.26 -> 4.74 us a 4-row window on
+            // the RTX 5090; each warp's arithmetic is the same).
+            const int GdnPrepBlock = 64;
+            Launch(gdnPrep, CeilDiv(warps * 32, GdnPrepBlock), 1, 1, GdnPrepBlock, stream, args);
         }
 
         /// <summary>Keep each sequence's last <paramref name="hist"/> rows of [state; x] as its state.</summary>

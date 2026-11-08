@@ -729,8 +729,15 @@ namespace TensorSharp.Cuda
         public void MoeGateUpDecode(IntPtr gateW, IntPtr upW, Tensor act, Tensor sel,
             Tensor gateOut, Tensor upOut, int wtype, int ff, int inDim, long rowBytes, int nt, int nUsed, IntPtr stream,
             IntPtr gateTab = default, IntPtr upTab = default)
+            => MoeGateUpDecode(gateW, upW, P(act), sel, gateOut, upOut, wtype, ff, inDim, rowBytes, nt, nUsed, stream, gateTab, upTab);
+
+        /// <summary><see cref="MoeGateUpDecode(IntPtr, IntPtr, Tensor, Tensor, Tensor, Tensor, int, int, int, long, int, int, IntPtr, IntPtr, IntPtr)"/>
+        /// of q8_1 activation rows at <paramref name="act"/>.</summary>
+        public void MoeGateUpDecode(IntPtr gateW, IntPtr upW, IntPtr act, Tensor sel,
+            Tensor gateOut, Tensor upOut, int wtype, int ff, int inDim, long rowBytes, int nt, int nUsed, IntPtr stream,
+            IntPtr gateTab = default, IntPtr upTab = default)
         {
-            IntPtr a0 = gateW, a1 = upW, a2 = P(act), a3 = P(sel), a4 = P(gateOut), a5 = P(upOut);
+            IntPtr a0 = gateW, a1 = upW, a2 = act, a3 = P(sel), a4 = P(gateOut), a5 = P(upOut);
             int a6 = wtype, a7 = ff, a8 = inDim; long a9 = rowBytes; int a10 = nUsed;
             IntPtr a11 = gateTab, a12 = upTab;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };

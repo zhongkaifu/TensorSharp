@@ -177,6 +177,9 @@ namespace TensorSharp.Cuda
             public Tensor HcPartials;
             /// <summary>A decode-size input quantized once for its projections (QuantizeShared).</summary>
             public Tensor SharedQ81;
+            /// <summary>The mixer's output Cur quantized by its collapse (HcCollapseQ81) for the half's projections; its
+            /// own buffer, so the shared expert's stream and the routed experts both read it while SharedQ81 is reused.</summary>
+            public Tensor CurQ81;
             public Tensor GemvScratch;
             // Gated DeltaNet
             public Tensor Qkv, Z, Alpha, Beta, Scr, Core, GOut;

@@ -46,6 +46,8 @@ namespace TensorSharp.Cuda
             // Every decode-size projection input: the widest is the hyper-connection streams.
             int sharedIn = Math.Max(Math.Max(Math.Max(e, (int)hcE), Math.Max(ValueDim, m.NHead * m.HeadDim)), Math.Max(m.NFfShexp, m.HcLowRank));
             dev.SharedQ81 = AllocT(dev, DType.UInt8, PerSlotMaxRows, (long)(sharedIn / 32) * 36);
+            if (e % 32 == 0)
+                dev.CurQ81 = AllocT(dev, DType.UInt8, PerSlotMaxRows, (long)(e / 32) * 36);
             dev.GemvScratch = AllocF32(dev, Dsv4Kernels.GemvScratchFloats);
             if (anyGdn)
             {
@@ -583,15 +585,15 @@ namespace TensorSharp.Cuda
             if (L.Ple)
                 Ple(dev, L, slot, nt, rows);
 
-            HcPre(dev, L.HcAttnNorm, L.HcAttnDown, L.HcAttnUp, L.HcAttnInject, nt, partialsReady: partialsReady && !L.Ple);
+            IntPtr curQ = HcPre(dev, L.HcAttnNorm, L.HcAttnDown, L.HcAttnUp, L.HcAttnInject, nt, partialsReady: partialsReady && !L.Ple);
             StageEnd(dev, StHc);
             if (L.Recurrent)
-                Gdn(dev, L, il, slot, nt, rows);
+                Gdn(dev, L, il, slot, nt, rows, curQ);
             else if (rows != null)
                 for (int r = 0; r < nt; r++)
-                    Attention(dev, L, il, rows[r].Layers[il], r, 1, positions[r]);
+                    Attention(dev, L, il, rows[r].Layers[il], r, 1, positions[r], curQ: curQ, curQRows: nt);
             else
-                Attention(dev, L, il, slot.Layers[il], 0, nt, p0, pos);
+                Attention(dev, L, il, slot.Layers[il], 0, nt, p0, pos, curQ, nt);
             // Decode-size halves meet in one launch: the scatter and the next mixer's first pass.
             bool fuse = nt <= PerSlotMaxRows && dev.QK.HasHcPostPartials && _fuseHc;
             if (fuse)
@@ -600,9 +602,9 @@ namespace TensorSharp.Cuda
             else
                 dev.QK.HcPost(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), nt, e, m.Hc, dev.Stream);
 
-            HcPre(dev, L.HcFfnNorm, L.HcFfnDown, L.HcFfnUp, L.HcFfnInject, nt, partialsReady: fuse);
+            curQ = HcPre(dev, L.HcFfnNorm, L.HcFfnDown, L.HcFfnUp, L.HcFfnInject, nt, partialsReady: fuse);
             StageEnd(dev, StHc);
-            Moe(dev, L, il, nt, pos == IntPtr.Zero && rows == null ? p0 : -1);
+            Moe(dev, L, il, nt, pos == IntPtr.Zero && rows == null ? p0 : -1, curQ);
             var next = il + 1 < m.NLayer ? _layers[il + 1] : null;
             bool fuseNext = fuse && next != null && next.Device == dev.Ordinal && !next.Ple;
             if (fuseNext)
@@ -642,7 +644,9 @@ namespace TensorSharp.Cuda
         /// mean into Cur.</summary>
         /// <param name="partialsReady">The first pass already ran, fused into the previous half's scatter
         /// (<see cref="HcPost"/>).</param>
-        private void HcPre(Dev dev, Tensor normW, in DeviceWeight down, in DeviceWeight up, Tensor injW, int nt,
+        /// <returns>Cur quantized to q8_1 (CurQ81) when the decode-size collapse quantized it, for the half's projections
+        /// in place of <see cref="QuantizeShared"/>; else zero.</returns>
+        private IntPtr HcPre(Dev dev, Tensor normW, in DeviceWeight down, in DeviceWeight up, Tensor injW, int nt,
             Tensor xs = null, bool partialsReady = false)
         {
             var m = _m;
@@ -659,6 +663,11 @@ namespace TensorSharp.Cuda
                 MatMul(dev, down, dev.Xn, Ptr(dev.SharedQ81), dev.Lo, nt);
                 dev.QK.SiluQ81(Ptr(dev.Lo), Ptr(dev.SharedQ81), (long)nt * m.HcLowRank, 1.0f / m.Hc, dev.Stream);
                 MatMul(dev, up, dev.Lo, Ptr(dev.SharedQ81), dev.G, nt);
+                if (_collapseQ81 && dev.CurQ81 != null && dev.QK.HasHcCollapseQ81)
+                {
+                    dev.QK.HcCollapseQ81(Ptr(dev.Xn), Ptr(dev.G), Ptr(dev.Cur), Ptr(dev.CurQ81), nt, m.NEmbd, m.Hc, dev.Stream);
+                    return Ptr(dev.CurQ81);
+                }
             }
             else
             {
@@ -668,12 +677,18 @@ namespace TensorSharp.Cuda
                 MatMulQ(dev, up, dev.Lo, dev.G, nt);
             }
             dev.QK.HcCollapse(Ptr(dev.Xn), Ptr(dev.G), Ptr(dev.Cur), nt, m.NEmbd, m.Hc, dev.Stream);
+            return IntPtr.Zero;
         }
 
-        private void Gdn(Dev dev, DevLayer L, int il, Slot slot, int nt, Slot[] rows)
+        // TS_Q4E_COLLAPSE_Q81=0: the decode-size collapse leaves Cur's q8_1 to each half's projections (a launch of its own,
+        // the same values; this is for measuring it).
+        private readonly bool _collapseQ81 = Environment.GetEnvironmentVariable("TS_Q4E_COLLAPSE_Q81") != "0";
+
+        /// <param name="curQ">Cur already quantized by the mixer's collapse (<see cref="HcPre"/>), or zero.</param>
+        private void Gdn(Dev dev, DevLayer L, int il, Slot slot, int nt, Slot[] rows, IntPtr curQ = default)
         {
             var m = _m;
-            IntPtr cur = QuantizeShared(dev, dev.Cur, m.NEmbd, nt);
+            IntPtr cur = curQ != IntPtr.Zero ? curQ : QuantizeShared(dev, dev.Cur, m.NEmbd, nt);
             MatMul(dev, L.Qkv, dev.Cur, cur, dev.Qkv, nt);
             MatMul(dev, L.Gate, dev.Cur, cur, dev.Z, nt);
             MatMulF32(dev, L.SsmAlpha, dev.Cur, dev.Alpha, m.NEmbd, m.GdnVHeads, nt);
@@ -714,14 +729,17 @@ namespace TensorSharp.Cuda
         /// <summary>Gated attention for rows [row0, row0 + nt) of the ubatch, one sequence's rows at
         /// p0, p0 + 1, ... against its caches <paramref name="c"/>. A batched decode step calls it
         /// per row; the projections then run for every row on the first call.</summary>
-        private void Attention(Dev dev, DevLayer L, int il, SlotLayer c, int row0, int nt, int p0, IntPtr pos = default)
+        /// <param name="curQ">Cur's <paramref name="curQRows"/> rows already quantized by the mixer's collapse
+        /// (<see cref="HcPre"/>), or zero.</param>
+        private void Attention(Dev dev, DevLayer L, int il, SlotLayer c, int row0, int nt, int p0, IntPtr pos = default,
+            IntPtr curQ = default, int curQRows = 0)
         {
             var m = _m;
             int qd = m.NHead * m.HeadDim, kvd = m.NKvHead * m.HeadDim;
             int allRows = row0 == 0 ? RowsInFlight(nt) : 0;
             if (allRows > 0)
             {
-                IntPtr cur = QuantizeShared(dev, dev.Cur, m.NEmbd, allRows);
+                IntPtr cur = curQ != IntPtr.Zero && curQRows == allRows ? curQ : QuantizeShared(dev, dev.Cur, m.NEmbd, allRows);
                 MatMul(dev, L.Wq, dev.Cur, cur, dev.Qg, allRows);
                 MatMul(dev, L.Wk, dev.Cur, cur, dev.K, allRows);
                 MatMul(dev, L.Wv, dev.Cur, cur, dev.V, allRows);
@@ -912,7 +930,9 @@ namespace TensorSharp.Cuda
 
         /// <param name="probeP0">The position of the ubatch's first row on the single-sequence uncaptured
         /// path, where <see cref="RouterProbe"/> may read the router back; -1 elsewhere.</param>
-        private void Moe(Dev dev, DevLayer L, int il, int nt, int probeP0)
+        /// <param name="curQ">Cur already quantized by the mixer's collapse (<see cref="HcPre"/>), or zero: the shared
+        /// expert's and the routed experts' input.</param>
+        private void Moe(Dev dev, DevLayer L, int il, int nt, int probeP0, IntPtr curQ = default)
         {
             var m = _m;
             int e = m.NEmbd;
@@ -925,7 +945,7 @@ namespace TensorSharp.Cuda
             {
                 CudaDriverApi.cuEventRecord(dev.ShForkEv, dev.Stream).ThrowOnError();
                 CudaDriverApi.cuStreamWaitEvent(dev.ShStream, dev.ShForkEv, 0).ThrowOnError();
-                SharedExpert(dev, L, nt, dev.ShStream);
+                SharedExpert(dev, L, nt, dev.ShStream, curQ);
                 CudaDriverApi.cuEventRecord(dev.ShJoinEv, dev.ShStream).ThrowOnError();
             }
             if (L.RouterBf16 != null && nt <= Dsv4Kernels.GemvMaxRows)
@@ -956,14 +976,14 @@ namespace TensorSharp.Cuda
 
             if (!fork)
             {
-                SharedExpert(dev, L, nt, dev.Stream);
+                SharedExpert(dev, L, nt, dev.Stream, curQ);
                 StageEnd(dev, StShexp);
             }
 
             CudaMoe.Experts(dev.DK, dev.Alloc.Kernels, dev.Moe, L.GateExps, L.UpExps, L.DownExps,
                 dev.Cur, dev.ShDown, dev.BlockOut, nt, m.NExpertUsed, m.NExpert, e, m.NFfExp, 0f,
                 PerSlotMaxRows, dev.Stream, stage: host ? null : _promptStage ?? _expertStage, stageLayer: L.Stage,
-                shDownReady: fork ? dev.ShJoinEv : IntPtr.Zero, keepStaged: _groupedPrompt);
+                shDownReady: fork ? dev.ShJoinEv : IntPtr.Zero, keepStaged: _groupedPrompt, curQ81: curQ);
             if (host)
             {
                 // The GPU's own experts end here; what follows is the wait for the CPU's share.
@@ -989,11 +1009,11 @@ namespace TensorSharp.Cuda
 
         /// <summary>The shared expert on <paramref name="stream"/>: gate and up from one quantized input, SwiGLU, down, and
         /// the sigmoid gate, into ShDown.</summary>
-        private void SharedExpert(Dev dev, DevLayer L, int nt, IntPtr stream)
+        private void SharedExpert(Dev dev, DevLayer L, int nt, IntPtr stream, IntPtr curQ = default)
         {
             var m = _m;
             int e = m.NEmbd;
-            IntPtr cur = QuantizeShared(dev, dev.Cur, e, nt, stream);
+            IntPtr cur = curQ != IntPtr.Zero ? curQ : QuantizeShared(dev, dev.Cur, e, nt, stream);
             MatMul(dev, L.GateShexp, dev.Cur, cur, dev.ShGate, nt, stream);
             MatMul(dev, L.UpShexp, dev.Cur, cur, dev.ShUp, nt, stream);
             dev.Alloc.Kernels.LaunchSiluMulClampF32(Ptr(dev.ShGate), Ptr(dev.ShGate), Ptr(dev.ShUp), (long)nt * m.NFfShexp, 0f, stream);

@@ -78,6 +78,33 @@ __device__ __forceinline__ float q4e_block_sum(float v, float* sh)
     return total;
 }
 
+// q4e_block_sum of N values with one barrier instead of three each: every value is summed exactly as q4e_block_sum
+// sums it (its warp's butterfly, then warp 0's over the warps' totals), so the totals are bit for bit the same. Only
+// thread 0 holds them afterwards. `sh` holds N x 32 floats.
+template <int N>
+__device__ __forceinline__ void q4e_block_sums_t0(float (&v)[N], float (*sh)[32])
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int k = 0; k < N; ++k)
+        v[k] = q4e_warp_sum(v[k]);
+    if (lane == 0)
+    {
+#pragma unroll
+        for (int k = 0; k < N; ++k)
+            sh[k][warp] = v[k];
+    }
+    __syncthreads();
+    if (warp == 0)
+    {
+        const int warps = (blockDim.x + 31) >> 5;
+#pragma unroll
+        for (int k = 0; k < N; ++k)
+            v[k] = q4e_warp_sum(lane < warps ? sh[k][lane] : 0.0f);
+    }
+}
+
 // The NEOX rotation of pair (i, i + nRot/2) at `pos`, as ggml-cuda's rope_neox computes it
 // (ext_factor 0, attn_factor 1).
 __device__ __forceinline__ void q4e_rope_angle(int pos, int i, int nRot, float base, float freqScale,
@@ -185,6 +212,27 @@ __device__ __forceinline__ void q4e_quantize_block(float v, q4e_block_q8_1* dst,
 #define Q4E_HC_SLICE 256
 #define Q4E_HC_PARTIAL (1 + Q4E_HC_MAX)
 
+// A slice's partials from its value x at flat index j: the sum of squares and, with injW, the scatter-logit partials
+// sum_j x_j * normW_j * injW[c][j], all reduced with one barrier (q4e_block_sums_t0); thread 0 writes them.
+__device__ __forceinline__ void q4e_hc_partials_out(const float x, const float* __restrict__ normW,
+    const float* __restrict__ injW, const int j, const int flat, const int HC, float (*sh)[32], float* __restrict__ out)
+{
+    float part[Q4E_HC_PARTIAL];
+    part[0] = x * x;
+    const float xw = injW != nullptr ? x * normW[j] : 0.0f;
+#pragma unroll
+    for (int c = 0; c < Q4E_HC_MAX; ++c)
+        part[1 + c] = injW != nullptr && c < HC ? xw * injW[(size_t)c * flat + j] : 0.0f;
+    q4e_block_sums_t0(part, sh);
+    if (threadIdx.x == 0)
+    {
+        out[0] = part[0];
+        if (injW != nullptr)
+            for (int c = 0; c < HC; ++c)
+                out[1 + c] = part[1 + c];
+    }
+}
+
 // The decode-size mixer in two wide passes instead of one block per row. Pass 1, per (row, slice of
 // 256 values of one stream): the slice's sum of squares and its scatter-logit partials
 // sum_j x_j * normW_j * injW[c][j]. grid (HC * E / 256, rows), 256 threads.
@@ -196,26 +244,13 @@ extern "C" __global__ void ts_q4e_hc_partials_f32(
     const int E,
     const int HC)
 {
-    __shared__ float sh[32];
+    __shared__ float sh[Q4E_HC_PARTIAL][32];
     const int slice = blockIdx.x;
     const int t = blockIdx.y;
     const int flat = HC * E;
     const int j = slice * Q4E_HC_SLICE + threadIdx.x;
     const float x = xs[(size_t)t * flat + j];
-    float* out = partials + ((size_t)t * gridDim.x + slice) * Q4E_HC_PARTIAL;
-    const float ss = q4e_block_sum(x * x, sh);
-    if (threadIdx.x == 0)
-        out[0] = ss;
-    if (injW != nullptr)
-    {
-        const float xw = x * normW[j];
-        for (int c = 0; c < HC; ++c)
-        {
-            const float p = q4e_block_sum(xw * injW[(size_t)c * flat + j], sh);
-            if (threadIdx.x == 0)
-                out[1 + c] = p;
-        }
-    }
+    q4e_hc_partials_out(x, normW, injW, j, flat, HC, sh, partials + ((size_t)t * gridDim.x + slice) * Q4E_HC_PARTIAL);
 }
 
 // One half's scatter (ts_q4e_hc_post_f32: xs[t, c, i] += out[t, i] * 2 * sigmoid(inject[t, c] / HC)) fused with
@@ -231,7 +266,7 @@ extern "C" __global__ void ts_q4e_hc_post_partials_f32(
     const int E,
     const int HC)
 {
-    __shared__ float sh[32];
+    __shared__ float sh[Q4E_HC_PARTIAL][32];
     const int slice = blockIdx.x;
     const int t = blockIdx.y;
     const int flat = HC * E;
@@ -243,20 +278,7 @@ extern "C" __global__ void ts_q4e_hc_post_partials_f32(
     float x = *xp;
     x += o * w;
     *xp = x;
-    float* dst = partials + ((size_t)t * gridDim.x + slice) * Q4E_HC_PARTIAL;
-    const float ss = q4e_block_sum(x * x, sh);
-    if (threadIdx.x == 0)
-        dst[0] = ss;
-    if (injW != nullptr)
-    {
-        const float xw = x * normW[j];
-        for (int k = 0; k < HC; ++k)
-        {
-            const float p = q4e_block_sum(xw * injW[(size_t)k * flat + j], sh);
-            if (threadIdx.x == 0)
-                dst[1 + k] = p;
-        }
-    }
+    q4e_hc_partials_out(x, normW, injW, j, flat, HC, sh, partials + ((size_t)t * gridDim.x + slice) * Q4E_HC_PARTIAL);
 }
 
 // BF16 values widened to F32 (exact): a prompt's router GEMM over weights kept as the file's BF16.
@@ -358,6 +380,31 @@ extern "C" __global__ void ts_q4e_hc_collapse_f32(
     for (int c = 1; c < HC; ++c)
         m += xr[c * E + i] * q4e_sigmoid(gr[c * E + i]);
     cur[(size_t)t * E + i] = m * (1.0f / (float)HC);
+}
+
+// ts_q4e_hc_collapse_f32 that also quantizes cur to q8_1 for the projections that read it (as
+// ts_quantize_q8_1_rows_warp_f32 rounds it, a warp per 32-value block): one launch instead of two. E % 32 == 0, so a
+// warp is wholly inside or past the row. grid (ceil(E / 256), nt).
+extern "C" __global__ void ts_q4e_hc_collapse_q81_f32(
+    const float* __restrict__ xn,        // [nt, HC, E]
+    const float* __restrict__ g,         // [nt, HC, E] pre-sigmoid
+    float* __restrict__ cur,             // [nt, E]
+    q4e_block_q8_1* __restrict__ xq,     // [nt, E / 32]
+    const int E,
+    const int HC)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (i >= E)
+        return;
+    const float* xr = xn + (size_t)t * HC * E;
+    const float* gr = g + (size_t)t * HC * E;
+    float m = xr[i] * q4e_sigmoid(gr[i]);
+    for (int c = 1; c < HC; ++c)
+        m += xr[c * E + i] * q4e_sigmoid(gr[c * E + i]);
+    const float v = m * (1.0f / (float)HC);
+    cur[(size_t)t * E + i] = v;
+    q4e_quantize_block(v, xq + (size_t)t * (E / 32) + i / 32, threadIdx.x & 31);
 }
 
 // xs[t, c, i] += out[t, i] * 2 * sigmoid(inject[t, c] / HC). grid (ceil(E / 256), nt).
@@ -1606,6 +1653,7 @@ extern "C" __global__ void ts_q4e_qsa_select_i32(
     __shared__ unsigned int hist[256];
     __shared__ unsigned int shPrefix;
     __shared__ int shNeed;
+    __shared__ int scanWarp[8];
     if (threadIdx.x == 0)
     {
         shPrefix = 0;
@@ -1627,22 +1675,37 @@ extern "C" __global__ void ts_q4e_qsa_select_i32(
             atomicAdd(&hist[(key >> shift) & 0xFF], 1u);
         }
         __syncthreads();
-        if (threadIdx.x == 0)
+        // The bin a walk from bin 255 down would stop at - the first whose count reaches the need left, the need then
+        // dropping by the bins above it - as a block-wide scan (thread i holds bin 255 - i) instead of 256 serial steps
+        // on one thread. No bin reaching it ends the walk at bin 0 with every count taken off, as the walk did.
         {
-            int n = shNeed;
-            unsigned int bin = 0;
-            for (int b2 = 255; b2 >= 0; --b2)
+            const int i = threadIdx.x;
+            const int c = (int)hist[255 - i];
+            int incl = c;
+#pragma unroll
+            for (int off = 1; off < 32; off <<= 1)
             {
-                const int c = (int)hist[b2];
-                if (c >= n)
-                {
-                    bin = (unsigned int)b2;
-                    break;
-                }
-                n -= c;
+                const int o = __shfl_up_sync(0xFFFFFFFFu, incl, off);
+                if ((i & 31) >= off)
+                    incl += o;
             }
-            shNeed = n;
-            shPrefix = (shPrefix << 8) | bin;
+            if ((i & 31) == 31)
+                scanWarp[i >> 5] = incl;
+            const int n = shNeed;
+            __syncthreads();
+            for (int w = 0; w < (i >> 5); ++w)
+                incl += scanWarp[w];
+            const int excl = incl - c;
+            if (incl >= n && excl < n)
+            {
+                shNeed = n - excl;
+                shPrefix = (shPrefix << 8) | (unsigned int)(255 - i);
+            }
+            else if (i == 255 && incl < n)
+            {
+                shNeed = n - incl;
+                shPrefix = shPrefix << 8;
+            }
         }
         __syncthreads();
     }

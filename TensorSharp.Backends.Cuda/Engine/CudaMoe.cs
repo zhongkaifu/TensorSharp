@@ -266,7 +266,7 @@ namespace TensorSharp.Cuda
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
             int perSlotMaxRows, IntPtr stream, bool? fused = null,
             CudaExpertStage stage = null, in CudaExpertStageLayer stageLayer = default, IntPtr shDownReady = default,
-            bool keepStaged = false)
+            bool keepStaged = false, IntPtr curQ81 = default)
         {
             int guType = gate.Type, downType = down.Type;
             int slots = nt * nUsed;
@@ -284,7 +284,7 @@ namespace TensorSharp.Cuda
                 dk.MoeStageCopy(stageLayer, stage, slots, stream);
             }
             RunExperts(dk, kernels, s, gate, up, down, cur, shDown, ffnOut, nt, nUsed, nExpert, e, ff, clamp,
-                perSlotMaxRows, stream, fused, shDownReady);
+                perSlotMaxRows, stream, fused, shDownReady, curQ81);
             if (staging && !keep)
                 dk.MoeUnstage(stageLayer, stage, stream);
         }
@@ -299,7 +299,7 @@ namespace TensorSharp.Cuda
         private static void RunExperts(Dsv4Kernels dk, CudaKernels kernels, CudaMoeScratch s,
             in DeviceWeight gate, in DeviceWeight up, in DeviceWeight down,
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
-            int perSlotMaxRows, IntPtr stream, bool? fused, IntPtr shDownReady = default)
+            int perSlotMaxRows, IntPtr stream, bool? fused, IntPtr shDownReady = default, IntPtr curQ81 = default)
         {
             int guType = gate.Type, downType = down.Type;
             int slots = nt * nUsed;
@@ -308,14 +308,16 @@ namespace TensorSharp.Cuda
             bool perSlot = route == ExpertRoute.PerSlot;
             bool mma = route == ExpertRoute.TensorCore;
             bool staged = route == ExpertRoute.Staged;
+            // The per-slot route reads cur's q8_1 rows: the caller's (curQ81, rounded as QuantizeQ81 rounds) when it has them.
+            bool given = perSlot && curQ81 != IntPtr.Zero;
             if (staged)
                 QuantizeQ81Split(kernels, cur, s.SplitQsA, s.SplitDA, e, nt, stream);
-            else if (!mma)
+            else if (!mma && !given)
                 QuantizeQ81(kernels, cur, s.ActQ8A, e, nt, stream);
 
             if (perSlot)
             {
-                dk.MoeGateUpDecode(gate.Ptr, up.Ptr, s.ActQ8A, s.Sel, s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes,
+                dk.MoeGateUpDecode(gate.Ptr, up.Ptr, given ? curQ81 : Dsv4CudaEngine.Ptr(s.ActQ8A), s.Sel, s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes,
                     nt, nUsed, stream, gate.Table, up.Table);
                 SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.ActQ8B, null, ff, slots, clamp, stream, fused);
                 dk.MoeDownDecode(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, downType, e, ff, down.RowBytes, slots, stream, down.Table);
