@@ -387,6 +387,9 @@ namespace TensorSharp.Cuda
             int e = m.NEmbd;
             var dev0 = _devs[0];
             dev0.MakeCurrent();
+            // A step that stages its missed experts needs the staging an overlapped swap round may hold.
+            if (nt > _hostExpertRows)
+                FlushAsyncSwaps();
             // The pinned tokens are rewritten per ubatch: the previous upload must have run.
             CudaDriverApi.cuStreamSynchronize(dev0.Stream).ThrowOnError();
             Marshal.Copy(tokens, tokOff, _pinnedTokens, nt);
@@ -474,6 +477,7 @@ namespace TensorSharp.Cuda
             var dev = _devs[0];
             int ub = m.NUbatch, hc = HcDim;
             dev.MakeCurrent();
+            FlushAsyncSwaps();
             Tensor ubatchXs = dev.Xs;
             _groupedPrompt = true;
             try

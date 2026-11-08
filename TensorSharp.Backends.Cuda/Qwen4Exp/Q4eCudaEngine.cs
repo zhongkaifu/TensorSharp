@@ -894,6 +894,7 @@ namespace TensorSharp.Cuda
                     if (dev.Ordinal == 0)
                     {
                         StopHostExperts();
+                        DestroyAsyncSwaps();
                         FreeHostExperts();
                     }
                     dev.Alloc?.Dispose();

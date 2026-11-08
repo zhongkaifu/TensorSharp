@@ -764,9 +764,17 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     /// <summary>Adaptive residency (TS_MOE_TIER_ADAPT=1 under host experts): between decode steps the most-selected
     /// host experts trade places with the least-selected VRAM experts. The swaps keep every expert reachable, so a
     /// long decode keeps answering as the all-resident engine does within the host-compute tolerance.</summary>
-    [CudaFact]
-    public void ExpertResidency_AdaptiveSwaps_KeepAnswering()
+    /// <remarks>Both the blocking swaps and the overlapped rounds (TS_MOE_TIER_ADAPT_ASYNC, the default: copies on a stream of
+    /// their own, the tables switched a forward boundary later), the overlapped ones every 2 steps so rounds follow each
+    /// other while decode steps run beside their copies.</remarks>
+    [CudaTheory]
+    [InlineData("0")]
+    [InlineData("1")]
+    public void ExpertResidency_AdaptiveSwaps_KeepAnswering(string overlapped)
     {
+        _env.Set("TS_MOE_TIER_ADAPT_ASYNC", overlapped);
+        if (overlapped == "1")
+            _env.Set("TS_MOE_TIER_ADAPT_EVERY", "2");
         string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
         long expertBytes = 0;
         using (var g = new GgufFile(path))

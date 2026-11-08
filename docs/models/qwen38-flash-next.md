@@ -1257,6 +1257,25 @@ Tried and dropped the same day: a prompt attention kernel with a KV head's query
 V read once into shared memory, each head's online softmax in one warp) read the 4K prompt in 1.72 s against 1.69 s and
 the 16K one in 7.0 s against 6.8 s; one warp walking every cell of a head was slower than eight warps sharing them.
 
+#### Adaptive residency without stalls, 2026-11-08
+
+Each expert the CPU computes costs a verify window 40-50 us, and after a long prompt the 8 blocking swaps a round left
+100-170 of them in a window for many windows (a round of 96, `TS_MOE_TIER_ADAPT_SWAPS=96`, caught up faster but stalled
+the GPU for its copies). A round now runs beside the decode (`TS_MOE_TIER_ADAPT_ASYNC`, on; Strata's overlapped
+adaptive tier): its copies go on a stream of their own in three steps a forward boundary apart, so a window's tables
+never name bytes in flight. First both experts of each trade are copied into the prompt staging (idle in decode),
+then the tables switch to those copies while the copies go to their final places (the hot expert into the cold one's
+slot, the cold one into the hot one's packed host place), then the tables switch to the final places. A prompt or a
+wide step first finishes a round in flight. With the stalls gone a round carries 64 swaps.
+
+RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
+
+| adaptation | short chat | long generation | 4K prompt | 16K prompt | CPU experts a window after 4K / 16K |
+| --- | --- | --- | --- | --- | --- |
+| 8 blocking swaps a round | 0.08-0.10 s / 88-102 | 154-182 | 1.62-1.70 s / 135-160 | 6.71-6.88 s / 167-184 | 115-171 / 69-98 |
+| 64 overlapped swaps a round (default) | 0.07-0.09 s / 75-110 | 174-179 | 1.61-1.69 s / 137-188 | 6.76-6.81 s / 183-198 | 31-146 / 26-33 |
+| 96 overlapped swaps a round | 0.07-0.09 s / 82-100 | 169-180 | 1.61-1.69 s / 151-193 | 6.71-6.79 s / 151-193 | 32-96 / 17-28 |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
