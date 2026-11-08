@@ -257,10 +257,9 @@ TSG_EXPORT int TSGgml_Qwen35RecurrentLayerPrefill(
             ggml_tensor* v_part = ggml_cont(ctx, ggml_view_2d(ctx, conv_out, value_dim, N, conv_out->nb[1],
                 static_cast<std::size_t>(2 * key_dim) * sizeof(float)));
 
-            ggml_tensor* q_hn = build_gdn_l2_norm(ctx, ggml_reshape_2d(ctx, q_part, head_k_dim, num_k_heads * N), eps);
-            ggml_tensor* k_hn = build_gdn_l2_norm(ctx, ggml_reshape_2d(ctx, k_part, head_k_dim, num_k_heads * N), eps);
-            ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_hn, head_k_dim, num_k_heads, N);
-            ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_hn, head_k_dim, num_k_heads, N);
+            // Per (key head, token) in 3-D for ggml-vulkan (ggml_ops_head_norm.h).
+            ggml_tensor* q_3d = tsg::gdn_l2_norm_heads(ctx, q_part, head_k_dim, num_k_heads, N, eps);
+            ggml_tensor* k_3d = tsg::gdn_l2_norm_heads(ctx, k_part, head_k_dim, num_k_heads, N, eps);
             ggml_tensor* q_tl = q_3d; ggml_tensor* k_tl = k_3d;
             for (int r = 1; r < head_tile; r++) { q_tl = ggml_concat(ctx, q_tl, q_3d, 1); k_tl = ggml_concat(ctx, k_tl, k_3d, 1); }
             ggml_tensor* q4 = ggml_reshape_4d(ctx, ggml_cont(ctx, q_tl), head_k_dim, num_v_heads, N, 1);
@@ -278,9 +277,8 @@ TSG_EXPORT int TSGgml_Qwen35RecurrentLayerPrefill(
                 ggml_row_size(gdn->type, head_k_dim * head_v_dim * num_v_heads),
                 ggml_row_size(gdn->type, value_dim) * static_cast<std::size_t>(N));
 
-            ggml_tensor* out_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, gdn_out), head_v_dim, num_v_heads * N);
-            ggml_tensor* out_n  = ggml_mul(ctx, ggml_rms_norm(ctx, out_2d, eps), ssm_norm_w);
-            ggml_tensor* out_n_3d = ggml_reshape_3d(ctx, out_n, head_v_dim, num_v_heads, N);
+            // Per (value head, token), kept 3-D for ggml-vulkan (ggml_ops_head_norm.h).
+            ggml_tensor* out_n_3d = tsg::rms_norm_heads(ctx, ggml_cont(ctx, gdn_out), head_v_dim, num_v_heads, N, ssm_norm_w, eps);
             ggml_tensor* z_3d = ggml_reshape_3d(ctx, z_all, head_v_dim, num_v_heads, N);
             ggml_tensor* gated = ggml_mul(ctx, out_n_3d, ggml_silu(ctx, z_3d));
             ggml_tensor* gated_flat = ggml_reshape_2d(ctx, gated, value_dim, N);
