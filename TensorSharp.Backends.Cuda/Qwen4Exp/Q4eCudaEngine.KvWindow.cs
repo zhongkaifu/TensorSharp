@@ -27,6 +27,7 @@
 // Reads go through the page table in the paged kernels; their arithmetic is the resident kernels', cell for cell, so a
 // streamed layer answers bit for bit as a resident one.
 using System;
+using System.Collections.Generic;
 using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
@@ -143,21 +144,86 @@ namespace TensorSharp.Cuda
                 MissPage = SlotTensor(slot, dev, DType.Int32, slots),
                 MissSlot = SlotTensor(slot, dev, DType.Int32, slots),
             };
-            kv.HostK = HostMapped(slot, full, out kv.DevK);
-            kv.HostV = HostMapped(slot, full, out kv.DevV);
-            kv.HostKs = HostMapped(slot, full / Q4eKernels.KvQ8Block * 2, out kv.DevKs);
-            kv.HostVs = HostMapped(slot, full / Q4eKernels.KvQ8Block * 2, out kv.DevVs);
+            var h = TakeKvHostSet();
+            slot.KvHostSets.Add(h);
+            kv.HostK = h.K; kv.HostV = h.V; kv.HostKs = h.Ks; kv.HostVs = h.Vs;
+            kv.DevK = h.DevK; kv.DevV = h.DevV; kv.DevKs = h.DevKs; kv.DevVs = h.DevVs;
             c.Kv = kv;
             ResetKvStream(dev, kv);
         }
 
-        private static IntPtr HostMapped(Slot slot, long bytes, out IntPtr device)
+        /// <summary>One streamed layer's pinned, device-mapped host copy: codes and scales of K and V at the full context.
+        /// Recycled across slots: pinning 1.6 GiB of host pages for a new sequence took most of a second of its TTFT.</summary>
+        private sealed class KvHostSet
+        {
+            public IntPtr K, V, Ks, Vs, DevK, DevV, DevKs, DevVs;
+        }
+
+        private readonly Stack<KvHostSet> _kvHostPool = new Stack<KvHostSet>();
+
+        private KvHostSet TakeKvHostSet()
+        {
+            lock (_kvHostPool)
+                if (_kvHostPool.Count > 0)
+                    return _kvHostPool.Pop();
+            long full = (long)_m.NCtx * _m.NKvHead * _m.HeadDim, scales = full / Q4eKernels.KvQ8Block * 2;
+            var h = new KvHostSet();
+            h.K = HostMapped(full, out h.DevK);
+            h.V = HostMapped(full, out h.DevV);
+            h.Ks = HostMapped(scales, out h.DevKs);
+            h.Vs = HostMapped(scales, out h.DevVs);
+            return h;
+        }
+
+        private static IntPtr HostMapped(long bytes, out IntPtr device)
         {
             CudaDriverApi.cuMemHostAlloc(out IntPtr host, new UIntPtr((ulong)bytes),
                 CudaDriverApi.CU_MEMHOSTALLOC_PORTABLE | CudaDriverApi.CU_MEMHOSTALLOC_DEVICEMAP).ThrowOnError();
-            slot.HostOwned.Add(host);
             CudaDriverApi.cuMemHostGetDevicePointer(out device, host, 0).ThrowOnError();
             return host;
+        }
+
+        /// <summary>A freed slot's host copies go back to the pool.</summary>
+        private void ReturnKvHostSets(Slot slot)
+        {
+            lock (_kvHostPool)
+                foreach (var h in slot.KvHostSets)
+                    _kvHostPool.Push(h);
+            slot.KvHostSets.Clear();
+        }
+
+        /// <summary>Pins the host copies the lanes beside the first will take (TS_Q4E_LANES), at load rather than in a
+        /// request's TTFT.</summary>
+        private void PrewarmKvHostPool(int lanes)
+        {
+            if (_kvWindow == 0 || lanes <= 1)
+                return;
+            int streamed = 0;
+            for (int il = 0; il < _m.NLayer; il++)
+                if (KvStreamed(il))
+                    streamed++;
+            _devs[0].MakeCurrent();
+            var sets = new List<KvHostSet>();
+            for (int i = 0; i < (lanes - 1) * streamed; i++)
+                sets.Add(TakeKvHostSet());
+            lock (_kvHostPool)
+                foreach (var h in sets)
+                    _kvHostPool.Push(h);
+        }
+
+        private void DisposeKvHostPool()
+        {
+            lock (_kvHostPool)
+            {
+                foreach (var h in _kvHostPool)
+                {
+                    CudaDriverApi.cuMemFreeHost(h.K);
+                    CudaDriverApi.cuMemFreeHost(h.V);
+                    CudaDriverApi.cuMemFreeHost(h.Ks);
+                    CudaDriverApi.cuMemFreeHost(h.Vs);
+                }
+                _kvHostPool.Clear();
+            }
         }
 
         /// <summary>Every page out of the window, every slot free, the counters zero.</summary>

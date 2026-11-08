@@ -233,8 +233,8 @@ namespace TensorSharp.Cuda
             public Tensor PleHist;
             public readonly Qwen4ExpPleHistory PleTokens = new Qwen4ExpPleHistory();
             public readonly List<Tensor> Owned = new List<Tensor>();
-            /// <summary>Pinned host memory of the slot (streamed layers' K/V host copies).</summary>
-            public readonly List<IntPtr> HostOwned = new List<IntPtr>();
+            /// <summary>The streamed layers' K/V host copies the slot holds (returned to the pool when it is freed).</summary>
+            public readonly List<KvHostSet> KvHostSets = new List<KvHostSet>();
             /// <summary>The MTP block's KV (allocated on the slot's first draft), and the positions it holds.</summary>
             public SlotLayer Mtp;
             public int MtpPast;
@@ -253,6 +253,8 @@ namespace TensorSharp.Cuda
         }
 
         private readonly ModelDesc _m;
+        /// <summary>Sequences the residency plan leaves VRAM for (TS_Q4E_LANES).</summary>
+        private int _lanes = 1;
         private readonly Dev[] _devs;
         private readonly DevLayer[] _layers;
         private readonly int _lastDev;
@@ -393,17 +395,20 @@ namespace TensorSharp.Cuda
                 nonExpertBytes = NonExpertBytes();
             // TS_Q4E_LANES: sequences the plan leaves VRAM for (their caches and draft KV) beside the first, so concurrent
             // requests get slots of their own instead of waiting for the first (expert slots pay for them).
-            int lanes = Math.Clamp(EnvInt("TS_Q4E_LANES", 1), 1, MaxBatchedDecodeRows);
-            if (lanes > 1)
+            _lanes = Math.Clamp(EnvInt("TS_Q4E_LANES", 1), 1, MaxBatchedDecodeRows);
+            if (_lanes > 1)
             {
                 long slotBytes = 0;
                 for (int il = 0; il < m.NLayer; il++)
                     slotBytes += LayerCacheBytes(il);
                 if (m.Mtp != null)
                     slotBytes += 2 * KvCacheBytes();
-                nonExpertBytes += (lanes - 1) * slotBytes;
-                Console.Error.WriteLine($"[q4e-cuda] {lanes} sequence lanes: {(lanes - 1) * slotBytes / 1073741824.0:F2} GiB of VRAM kept "
-                    + $"for the {lanes - 1} beside the first ({slotBytes / 1048576.0:F0} MiB each, TS_Q4E_LANES).");
+                // Each slot also takes allocator rounding and its captured graphs; a slot is admitted only with
+                // SlotReserveBytes still free after it (SlotFits).
+                slotBytes += 128L << 20;
+                nonExpertBytes += (_lanes - 1) * slotBytes + SlotReserveBytes;
+                Console.Error.WriteLine($"[q4e-cuda] {_lanes} sequence lanes: {((_lanes - 1) * slotBytes + SlotReserveBytes) / 1073741824.0:F2} GiB "
+                    + $"of VRAM kept for the {_lanes - 1} beside the first ({slotBytes / 1048576.0:F0} MiB each, TS_Q4E_LANES).");
             }
             _residency = PlanResidency(useDevs, nonExpertBytes);
 
@@ -477,6 +482,7 @@ namespace TensorSharp.Cuda
             ReportResidency();
             StartHostExperts();
             _active = CreateSlot();
+            PrewarmKvHostPool(_lanes);
             _slots[_active.Id] = _active;
             CachePrefillWeights();
 
@@ -921,6 +927,7 @@ namespace TensorSharp.Cuda
         {
             foreach (var slot in _slots.Values)
                 FreeSlot(slot);
+            DisposeKvHostPool();
             _graphs.Clear();
             _slots.Clear();
             foreach (var dev in _devs)

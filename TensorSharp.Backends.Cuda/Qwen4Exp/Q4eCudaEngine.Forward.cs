@@ -323,9 +323,7 @@ namespace TensorSharp.Cuda
             foreach (var t in slot.Owned)
                 t.Dispose();
             slot.Owned.Clear();
-            foreach (IntPtr h in slot.HostOwned)
-                CudaDriverApi.cuMemFreeHost(h);
-            slot.HostOwned.Clear();
+            ReturnKvHostSets(slot);
         }
 
         /// <summary>Back to position 0 on the active sequence.</summary>
