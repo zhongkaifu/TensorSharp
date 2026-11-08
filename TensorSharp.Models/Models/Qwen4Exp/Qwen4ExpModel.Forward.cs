@@ -309,8 +309,15 @@ namespace TensorSharp.Models
         }
 
         /// <summary>The longest prompt span that has fit in device memory since a longer one
-        /// failed to allocate its graph; <see cref="int.MaxValue"/> until then.</summary>
-        private int _spanTokenCap = int.MaxValue;
+        /// failed to allocate its graph; <see cref="int.MaxValue"/> until then, or
+        /// TS_Q4E_PROMPT_SPAN_CAP (a measurement aid).</summary>
+        private int _spanTokenCap = int.TryParse(Environment.GetEnvironmentVariable("TS_Q4E_PROMPT_SPAN_CAP"), out int spanCap)
+            && spanCap >= 64 ? spanCap : int.MaxValue;
+        /// <summary>Device memory free (idle arenas released) when the cap was last lowered, or -1.</summary>
+        private long _spanCapFreeBytes = -1;
+        /// <summary>Free device memory, beyond what it was when the cap was lowered, that lifts the cap: a
+        /// concurrent request's state on Flash Next is ~1.1 GB at a 32K context.</summary>
+        private const long SpanCapLiftBytes = 1L << 30;
         // Set by TryFusedTokenSpans when the first span of a forward could not allocate its
         // graph and nothing ran: the forward is retried as shorter spans.
         private bool _spanDidNotFit;
@@ -334,6 +341,7 @@ namespace TensorSharp.Models
             const int MinSpan = 64;
             if (!PromptSpanMaySplit(tokens.Length))
                 return ForwardCoreInner(tokens);
+            LiftSpanCapWhenMemoryReturned(tokens.Length);
             float[] result = null;
             int done = 0;
             // A speculative prompt (the MTP head needs every row's hidden state) writes its rows
@@ -363,8 +371,9 @@ namespace TensorSharp.Models
                                 $"qwen4exp: a {len}-token prompt span does not fit in device memory: {fit.Message}");
                         int cap = Math.Max(MinSpan, len / 2);
                         _spanTokenCap = cap;
+                        _spanCapFreeBytes = GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out _) ? free : -1;
                         Console.Error.WriteLine($"[qwen4exp] a {len}-token prompt span did not fit in device memory " +
-                            $"({fit.Message}); prompts now prefill in spans of at most {cap} tokens.");
+                            $"({fit.Message}); prompts now prefill in spans of at most {cap} tokens until more memory is free.");
                     }
                 }
             }
@@ -373,6 +382,27 @@ namespace TensorSharp.Models
                 if (_specForwardActive) { _specHiddenOutput = hidden0; _specLogitsOutput = logits0; }
             }
             return result;
+        }
+
+        /// <summary>
+        /// A lowered span cap was the memory of one moment: on a 48 GB Mac the cap fell to 1024 tokens while four
+        /// concurrent requests' state was resident, and every later prompt prefilled in quarter spans (Strata's 16K
+        /// prompt 23 -> 57 s) long after they had finished. Before a prompt longer than the cap, the idle arenas are
+        /// released (they count as allocated) and the cap is lifted when at least <see cref="SpanCapLiftBytes"/> more
+        /// is free than when it was lowered; a span that still does not fit halves again, and nothing has run when it
+        /// is refused.
+        /// </summary>
+        private void LiftSpanCapWhenMemoryReturned(int tokens)
+        {
+            if (_spanTokenCap == int.MaxValue || tokens <= _spanTokenCap || _spanCapFreeBytes < 0)
+                return;
+            GgmlBasicOps.ReleaseKeptArenas();
+            if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out _) || free < _spanCapFreeBytes + SpanCapLiftBytes)
+                return;
+            Console.Error.WriteLine($"[qwen4exp] {(free - _spanCapFreeBytes) / 1e9:F2} GB more device memory is free than when " +
+                $"prompt spans were capped at {_spanTokenCap} tokens; the cap is lifted.");
+            _spanTokenCap = int.MaxValue;
+            _spanCapFreeBytes = -1;
         }
 
         private bool PromptSpanMaySplit(int seqLen)
