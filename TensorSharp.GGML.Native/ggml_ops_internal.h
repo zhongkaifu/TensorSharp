@@ -1011,6 +1011,14 @@ namespace tsg
 
     using MulMatIdFn = ggml_tensor* (*)(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*);
     MoeHotTier* moe_hot_tier_find(const void* gate_source);
+    // Prompt-batch expert prefetch (ggml_ops_moe.cpp): the next offloaded layer's stacks staged on a thread.
+    bool moe_stage_prefetch_enabled();
+    void moe_stage_prefetch_start(const HostMoeSegment& hm);
+    void moe_stage_prefetch_join();
+    bool moe_stage_prefetch_take(const void* gate, const void* up, const void* down, ggml_backend_buffer_t& buf,
+                                 std::size_t offset[3], std::size_t bytes[3]);
+    long long moe_stage_prefetch_hits();
+    void moe_stage_prefetch_release();
     void moe_hot_tier_bind(const MoeHotTier& tier, int part, ggml_tensor* tensor);
     // Builds the accelerator half of a tiered layer: allocates hm's hot_slot /
     // hot_weight inputs and returns the F32 [hidden, seq] sum of the tier's
@@ -1060,6 +1068,9 @@ namespace tsg
         std::uint8_t* const* destinations, int count);
     bool host_expert_io_async_pending();
     bool host_expert_io_wait_async();
+    // Fixed-size rows of a registered mapping, one pread each, packed into dst (TSGgml_HostReadRows).
+    bool host_expert_io_read_rows(const std::uint8_t* table, std::size_t row_bytes, const std::int32_t* rows, int count,
+        std::uint8_t* dst);
     bool host_expert_io_read_ranges(const void* source_base,
         const std::vector<std::pair<std::size_t, std::size_t>>& ranges, std::uint8_t* destination_base);
     // Rows a tiered layer splits between its accelerator tier and the host

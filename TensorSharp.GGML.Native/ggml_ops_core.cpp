@@ -3497,6 +3497,7 @@ TSG_EXPORT void TSGgml_Shutdown()
     tsg::moe_ffn_host_release();
     // Accelerator expert tiers hold device buffers (Metal residency sets) that
     // must go before the backend and device do.
+    tsg::moe_stage_prefetch_release();
     tsg::moe_hot_tier_release();
     tsg::host_expert_io_release();
     tsg::bonsai_clear_backend();

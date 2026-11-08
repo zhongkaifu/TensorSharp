@@ -3479,6 +3479,28 @@ namespace TensorSharp.GGML
             catch (EntryPointNotFoundException) { return 0; }
         }
 
+        /// <summary>Fixed-size rows of a mapping registered for explicit reads (HostExpertIoRegister), one pread each,
+        /// packed into <paramref name="dst"/> in list order. False (nothing read) when a row is outside every registered
+        /// mapping; the caller then reads the mapping.</summary>
+        public static unsafe bool HostReadRows(IntPtr table, long rowBytes, int[] rows, IntPtr dst)
+        {
+            if (rows == null || rows.Length == 0) return false;
+            try
+            {
+                fixed (int* r = rows)
+                    return GgmlNative.TSGgml_HostReadRows(table, rowBytes, (IntPtr)r, rows.Length, dst) != 0;
+            }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+
+        /// <summary>Prompt-sized offloaded MoE layers whose experts were staged ahead while the accelerator ran the
+        /// layer before (process total; 0 off Metal).</summary>
+        public static long MoeStagePrefetchHits()
+        {
+            try { return GgmlNative.TSGgml_MoeStagePrefetchHits(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         /// <summary>Test hook: qwen4exp span steps whose QSA layers pooled only the blocks they completed (the pooled
         /// keys kept between steps).</summary>
         public static long Qwen4ExpQsaIncrementalSteps()

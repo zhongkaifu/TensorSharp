@@ -260,6 +260,65 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         }
     }
 
+    /// <summary>A prompt-width pass stages the next offloaded layer's experts on a thread while the accelerator runs
+    /// the current one (ggml_ops_moe.cpp moe_stage_prefetch_start), and the layer's MoE graph binds them instead of
+    /// staging its own. The staged bytes are the same, so the prompt answers bit for bit as staging each layer when it
+    /// runs - every expert offloaded, and with half of them in tier slots (copied from the slots ahead). The hit counter
+    /// proves the prefetched stacks were the ones used.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void PromptExpertPrefetch_AnswersAsStagingEachLayer_Metal()
+    {
+        foreach (bool tiered in new[] { false, true })
+        {
+            float[][] Answer(string prefetch)
+            {
+                using var env = new NativeEnvScope();
+                env.Set("TS_HOST_MOE_STAGE_PREFETCH", prefetch);
+                return Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, model =>
+                {
+                    if (!tiered) return;
+                    var q = Assert.IsType<Qwen4ExpModel>(model);
+                    Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 2, 0));
+                });
+            }
+            float[][] eachLayer = Answer("0");
+            long before = GgmlBasicOps.MoeStagePrefetchHits();
+            float[][] prefetched = Answer("1");
+            Assert.True(GgmlBasicOps.MoeStagePrefetchHits() - before >= 2,
+                $"the {LongPrompt.Length}-token prompt's layers did not take prefetched experts (tiered={tiered})");
+            for (int i = 0; i < prefetched.Length; i++)
+                Assert.True(prefetched[i].AsSpan().SequenceEqual(eachLayer[i]),
+                    $"row {i}: prefetched experts changed the logits (tiered={tiered})");
+        }
+    }
+
+    /// <summary>A prompt-sized gather of the on-disk PLE n-gram table reads its rows with one pread each on the native
+    /// I/O team (Qwen4ExpModel.ReadPleRowsPacked, TSGgml_HostReadRows) instead of faulting each row through the mapping.
+    /// The rows are the same bytes, so the prompt answers bit for bit as reading the mapping; the I/O layer's read bytes
+    /// prove the explicit reads ran.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void PleRows_ReadExplicitly_AnswerAsTheMapping_Metal()
+    {
+        float[][] Answer(string explicitRead, out long readBytes)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_PLE_EXPLICIT_READ", explicitRead);
+            long before = GgmlBasicOps.HostExpertIoStats().ReadBytes;
+            float[][] rows = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, model =>
+            {
+                var q = Assert.IsType<Qwen4ExpModel>(model);
+                Assert.True(q.EnableHostExpertIoForTests(256L << 20), "the mapping could not be registered for explicit reads");
+            });
+            readBytes = GgmlBasicOps.HostExpertIoStats().ReadBytes - before;
+            return rows;
+        }
+        float[][] mapping = Answer("0", out long mappingBytes);
+        float[][] explicitRows = Answer("1", out long explicitBytes);
+        Assert.True(explicitBytes > mappingBytes, $"no PLE rows were read explicitly ({explicitBytes} vs {mappingBytes} bytes)");
+        for (int i = 0; i < explicitRows.Length; i++)
+            Assert.True(explicitRows[i].AsSpan().SequenceEqual(mapping[i]), $"row {i}: explicitly read PLE rows changed the logits");
+    }
+
     /// <summary>A batched verify-width span (here a 4-token prefill) reads up to two window misses a
     /// row in the background while the accelerator computes the routes its slots already hold, then
     /// computes those after a second cut (host_moe_build_hot_part's overlap group). Only the

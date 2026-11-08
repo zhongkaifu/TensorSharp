@@ -4621,6 +4621,10 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static partial long TSGgml_TsmSeamPasses();
         [LibraryImport(DllName)]
+        internal static partial long TSGgml_MoeStagePrefetchHits();
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_HostReadRows(IntPtr table, long rowBytes, IntPtr rows, int count, IntPtr dst);
+        [LibraryImport(DllName)]
         internal static partial long TSGgml_Qwen4ExpQsaIncrementalSteps();
         [LibraryImport(DllName)]
         internal static partial int TSGgml_Qwen4ExpCommitVerifyRow(int row, int rows);

@@ -296,6 +296,28 @@ namespace TensorSharp.Models
         /// gives. The table is ~320 M rows and is read 16 rows per token, so it is
         /// dequantized row by row from host memory rather than made device-resident.
         /// </summary>
+        /// <summary>A prompt-sized gather of the on-disk n-gram table reads its rows explicitly - one pread each on the
+        /// native I/O team, packed in list order (TSGgml_HostReadRows) - instead of faulting each row's page through
+        /// the mapping: M5 Pro, a 4096-token chunk's 65K rows took 1.1-3.1 s as faults. Returns the packed rows (row i
+        /// at i * row bytes), or null to read the mapping (a decode-sized gather, rows the reader cannot serve,
+        /// <c>TS_PLE_EXPLICIT_READ=0</c>).</summary>
+        private const int PleExplicitReadMinRows = 1024;
+        private byte[] _plePackedRows;
+
+        private unsafe byte* ReadPleRowsPacked(QuantizedWeight qw, int[] rows, long qRowBytes)
+        {
+            if (!_pleTableOnDisk || rows.Length < PleExplicitReadMinRows || !qw.IsFileBacked
+                || Environment.GetEnvironmentVariable("TS_PLE_EXPLICIT_READ") == "0")
+                return null;
+            long need = rows.Length * qRowBytes;
+            if (need > int.MaxValue)
+                return null;
+            if (_plePackedRows == null || _plePackedRows.Length < need)
+                _plePackedRows = GC.AllocateUninitializedArray<byte>((int)need, pinned: true);
+            byte* packed = (byte*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref _plePackedRows[0]);
+            return TensorSharp.GGML.GgmlBasicOps.HostReadRows(qw.Data, qRowBytes, rows, (IntPtr)packed) ? packed : null;
+        }
+
         private unsafe void GatherPleRows(Tensor dest, int[] rows, int seqLen)
         {
             const string name = "per_layer_token_embd.weight";
@@ -317,11 +339,13 @@ namespace TensorSharp.Models
                 long baseA = (long)qw.Data;
                 long dstA = (long)GetFloatPtr(flat);
                 var ggmlType = qw.GgmlType;
+                long packedA = (long)ReadPleRowsPacked(qw, rows, qRowBytes);
                 void DequantRow(int i)
                 {
                     NativeDequant.DequantizeToFloat32Native(
                         ggmlType,
-                        (IntPtr)((byte*)baseA + (long)rows[i] * qRowBytes),
+                        packedA != 0 ? (IntPtr)((byte*)packedA + (long)i * qRowBytes)
+                            : (IntPtr)((byte*)baseA + (long)rows[i] * qRowBytes),
                         (IntPtr)((float*)dstA + (long)i * dim),
                         dim);
                 }
@@ -499,11 +523,13 @@ namespace TensorSharp.Models
                 long baseA = (long)qw.Data;
                 long dstA = (long)dst;
                 var ggmlType = qw.GgmlType;
+                long packedA = (long)ReadPleRowsPacked(qw, rows, qRowBytes);
                 void DequantRow(int i)
                 {
                     NativeDequant.DequantizeToFloat32Native(
                         ggmlType,
-                        (IntPtr)((byte*)baseA + (long)rows[i] * qRowBytes),
+                        packedA != 0 ? (IntPtr)((byte*)packedA + (long)i * qRowBytes)
+                            : (IntPtr)((byte*)baseA + (long)rows[i] * qRowBytes),
                         (IntPtr)((float*)dstA + (long)i * dim),
                         dim);
                 }

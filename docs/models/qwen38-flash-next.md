@@ -1329,6 +1329,34 @@ Short answers, code and long-context decoding now match or pass Strata; prose is
 remains: a 4096-token chunk takes 8.2 s of compute at a short context (9.9 s at 16K), of which ~1 s is staging every
 expert of each layer before the GPU may compute it (`TS_HOST_MOE_TIMING=1`).
 
+#### Prompt reading: staged experts ahead, PLE rows read explicitly, 2026-11-08
+
+`TS_Q4E_PHASE=1` splits a prompt chunk's wall clock. Two host costs stood in front of the GPU:
+
+- Every offloaded layer staged the experts it routes (tier copies and file reads) before its MoE graph could run, ~20 ms
+  a layer. A prompt routes nearly every expert, so the next offloaded layer's stacks are now staged whole, on a thread,
+  while the GPU runs the segment before it, and its MoE graph binds them (`TS_HOST_MOE_STAGE_PREFETCH`). Staging on the
+  critical path fell from ~600 to 24 ms per 30 layers. One buffer, reused once the previous layer has computed: two ran a
+  48 GB Mac's Metal out of memory on a 16K prompt.
+- The PLE n-gram rows (16 a token from the 29 GB table) were faulted in through the mapping: 1.1-3.1 s for a 4096-token
+  chunk's 65K rows. A prompt-sized gather now reads them with one `pread` each on the native I/O team, 0.52-0.54 s a
+  chunk, the rate Strata reports (`TS_PLE_EXPLICIT_READ`).
+
+Both stage the same bytes, so the logits are the same bits (`PromptExpertPrefetch_AnswersAsStagingEachLayer_Metal`,
+`PleRows_ReadExplicitly_AnswerAsTheMapping_Metal`). A block-first QSA selection (the best ~515 blocks, then their cells)
+was tried and dropped: no measurable gain, and it changes cutoff ties that the batched-arena parity tests pin.
+
+| run (same client, DFlash2 Q4_K_M, 3 repeats) | 4K TTFT | 16K TTFT |
+| --- | --- | --- |
+| QSA pooled keys (`df2-qsa`) | 8.9-9.6 s | 42.9-45.4 s |
+| + experts staged ahead, explicit PLE reads (`df2-pf1`) | 8.46-8.81 s | 38.0-38.3 s |
+| Strata DFlash2 | 6.32 s | 24.4 s |
+
+What remains is the chunk's compute, ~7.5 s per 4096 tokens: the routed experts (~1.5 s), ggml's gated delta net
+(~0.9 s), the per-token element-wise and layout work of the hyper-connections and the GDN block (~3 s: a [T, 10240]
+transpose, the conv input concat, q/k/v copies, the q/k head repeat), and the dense projections (~1.6 s). Strata runs
+those as fused prompt kernels (`gdn_prompt.metal`: conv + norms + gates, a column-parallel state scan, the gated norm).
+
 ## Multi-GPU
 
 `--tp N` on `ggml_cuda` partitions every routed and shared FFN across N local GPUs. Every rank

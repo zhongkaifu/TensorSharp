@@ -199,6 +199,10 @@ namespace TensorSharp.Models
         /// <summary>Test hook: give every host layer a tier holding experts 0..fixed-1 plus
         /// <paramref name="windowPerLayer"/> window slots. Call before the first forward.
         /// Returns the number of layers tiered.</summary>
+        /// <summary>Test hook: serve the GGUF mapping through the explicit-read I/O layer (as a tiered Mac load does),
+        /// with a host expert cache of <paramref name="budgetBytes"/>.</summary>
+        internal bool EnableHostExpertIoForTests(long budgetBytes) => EnableHostExpertIo(budgetBytes);
+
         internal int RegisterExpertTiersForTests(int fixedPerLayer, int windowPerLayer)
         {
             int tiered = 0;

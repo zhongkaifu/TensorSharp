@@ -495,6 +495,39 @@ namespace tsg
 #endif
     }
 
+    bool host_expert_io_read_rows(const std::uint8_t* table, std::size_t row_bytes, const std::int32_t* rows, int count,
+        std::uint8_t* dst)
+    {
+#if !defined(_WIN32)
+        std::lock_guard<std::mutex> lock(g_mutex);
+        static thread_local std::vector<IoRequest> s_requests;
+        s_requests.clear();
+        s_requests.reserve(static_cast<std::size_t>(count));
+        const MappedFile* last = nullptr;
+        for (int i = 0; i < count; ++i)
+        {
+            if (rows[i] < 0) return false;
+            const std::uint8_t* src = table + static_cast<std::size_t>(rows[i]) * row_bytes;
+            if (last == nullptr || src < last->base || src + row_bytes > last->base + last->length)
+                last = g_files.empty() ? nullptr : find_file(src, row_bytes);
+            if (last == nullptr) return false;
+            s_requests.push_back({last->fd, dst + static_cast<std::size_t>(i) * row_bytes, row_bytes,
+                static_cast<off_t>(src - last->base)});
+        }
+        g_read_bytes += static_cast<std::uint64_t>(count) * row_bytes;
+        if (g_team == nullptr)
+        {
+            const char* e = std::getenv("TS_HOST_MOE_IO_THREADS");
+            const int n = e != nullptr ? std::atoi(e) : 0;
+            g_team = new IoTeam(n > 0 && n <= 64 ? n - 1 : 11);
+        }
+        return g_team->run(s_requests);
+#else
+        (void)table; (void)row_bytes; (void)rows; (void)count; (void)dst;
+        return false;
+#endif
+    }
+
     void host_expert_io_read_slices_async(const void* const* sources, const std::size_t* bytes,
         std::uint8_t* const* destinations, int count)
     {
@@ -655,6 +688,18 @@ namespace tsg
 // Serve host-offloaded experts inside [base, base + length) - a read-only
 // mapping of `path` from offset 0 - from the explicitly read cache. Returns 1
 // when registered (or already registered).
+// Scattered fixed-size rows of a registered mapping - a prompt chunk's PLE n-gram rows, 16 a token from a 29 GB
+// table - read with one pread each on the I/O team, packed into dst in list order. A fault per row through the mapping
+// moved 21-59K rows/s (M5 Pro, a 4096-token chunk's 65K rows in 1.1-3.1 s); parallel reads do not queue on the VM
+// object. Returns 1, or 0 (nothing read) when a row lies outside every registered mapping: the caller reads the
+// mapping instead.
+TSG_EXPORT int TSGgml_HostReadRows(const void* table, long long row_bytes, const std::int32_t* rows, int count, void* dst)
+{
+    if (table == nullptr || row_bytes <= 0 || rows == nullptr || count <= 0 || dst == nullptr) return 0;
+    return tsg::host_expert_io_read_rows(static_cast<const std::uint8_t*>(table), static_cast<std::size_t>(row_bytes),
+        rows, count, static_cast<std::uint8_t*>(dst)) ? 1 : 0;
+}
+
 TSG_EXPORT int TSGgml_HostExpertIoRegister(const void* base, long long length, const char* path)
 {
 #if !defined(_WIN32)

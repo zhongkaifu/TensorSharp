@@ -920,6 +920,30 @@ indexer key（3.8 ms）、按 cell 的选择（1.1 ms），以及在选择掩码
 短回答、代码和长上下文解码现在与 Strata 持平或更快；散文约落后 10%。剩下的是读取提示：一个 4096 token 的块在短上下文时计算 8.2 s（16K 时 9.9 s），
 其中约 1 s 是在 GPU 计算之前暂存每层的全部专家（`TS_HOST_MOE_TIMING=1`）。
 
+#### 读取提示：提前暂存专家、显式读取 PLE 行，2026-11-08
+
+`TS_Q4E_PHASE=1` 拆分一个提示块的耗时。GPU 之前有两项主机开销：
+
+- 每个卸载层在其 MoE 图运行前暂存所路由的专家（分层复制与文件读取），每层约 20 ms。提示几乎会路由到每个专家，所以现在在 GPU 运行前一个段时，
+  在线程上把下一个卸载层的专家整体暂存，其 MoE 图直接绑定（`TS_HOST_MOE_STAGE_PREFETCH`）。关键路径上的暂存每 30 层从约 600 降到 24 ms。
+  只用一个缓冲区，在上一层计算完成后复用：两个缓冲区在 48 GB Mac 上的 16K 提示让 Metal 内存不足。
+- PLE n-gram 行（每 token 从 29 GB 表中取 16 行）原来通过映射缺页读取：一个 4096 token 块的 65K 行需要 1.1-3.1 s。现在提示规模的 gather
+  在原生 I/O 线程组上每行一次 `pread`，每块 0.52-0.54 s，与 Strata 报告的速度相同（`TS_PLE_EXPLICIT_READ`）。
+
+两者暂存的字节相同，所以 logits 逐位一致（`PromptExpertPrefetch_AnswersAsStagingEachLayer_Metal`、
+`PleRows_ReadExplicitly_AnswerAsTheMapping_Metal`）。先按块选择的 QSA（先选约 515 个最佳块，再选其 cell）试过后放弃：没有可测的收益，并且会改变
+批量 arena 一致性测试所固定的截断处的并列选择。
+
+| 配置（同一客户端，DFlash2 Q4_K_M，3 次） | 4K TTFT | 16K TTFT |
+| --- | --- | --- |
+| QSA 池化 key（`df2-qsa`） | 8.9-9.6 s | 42.9-45.4 s |
+| + 提前暂存专家、显式读取 PLE（`df2-pf1`） | 8.46-8.81 s | 38.0-38.3 s |
+| Strata DFlash2 | 6.32 s | 24.4 s |
+
+剩下的是块的计算，每 4096 token 约 7.5 s：路由专家（约 1.5 s）、ggml 的 gated delta net（约 0.9 s）、hyper-connection 与 GDN 块逐 token 的
+逐元素与布局操作（约 3 s：[T, 10240] 转置、conv 输入拼接、q/k/v 拷贝、q/k 头重复），以及稠密投影（约 1.6 s）。Strata 用融合的提示内核完成这些
+（`gdn_prompt.metal`：conv + 归一化 + 门控、按列并行的状态扫描、门控归一化）。
+
 ## 多 GPU
 
 `ggml_cuda` 的 `--tp N` 切分每个路由专家及共享专家：gate/up 按中间通道切分，汇集激活后，

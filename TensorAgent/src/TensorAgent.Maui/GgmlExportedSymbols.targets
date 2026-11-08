@@ -209,6 +209,7 @@
     <ReferenceNativeSymbol Include="TSGgml_HostExpertRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostMoeExpertCacheStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadBarrier" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostReadRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexReductionF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexSelectF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexSelectGradF32" SymbolType="Function" />
@@ -266,6 +267,7 @@
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingCounts" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingRecordDevice" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingReset" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeStagePrefetchHits" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MulMatIdF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MultiDeviceInit" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseGlimmerModelForward" SymbolType="Function" />

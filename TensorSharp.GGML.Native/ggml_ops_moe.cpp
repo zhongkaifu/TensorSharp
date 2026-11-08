@@ -723,6 +723,151 @@ namespace
         return staged + s_copies.size() * stride;
     }
 
+    // ---- Prompt-batch expert prefetch (unified memory) ----
+    //
+    // A prompt-sized batch on an offloaded layer stages the experts it routes before its MoE graph can run, and the
+    // accelerator waits meanwhile: ~20 ms a layer for Flash Next's ISTA Q2_0 on an M5 Pro (0.6 GB of tier copies and
+    // file reads), ~1 s of every 4096-token chunk. A prompt routes nearly every expert of every layer, so the next
+    // offloaded layer's stacks are staged whole, on a thread, while the accelerator runs the segment before it; the MoE
+    // graph then binds them and stages nothing. Same bytes, same arithmetic. One buffer, the size the staging tensors
+    // had in the graph's own allocation: a layer's prefetch starts only once the previous layer's MoE has computed (it
+    // is synchronous), so it reuses that layer's buffer - two buffers ran a 48 GB Mac's Metal out of memory on a 16K
+    // prompt. TS_HOST_MOE_STAGE_PREFETCH=0 stages each layer when it runs.
+    namespace
+    {
+        struct StagePrefetch
+        {
+            ggml_backend_buffer_t buf = nullptr;
+            std::size_t capacity = 0;
+            const void* src[3] = {};
+            std::size_t bytes[3] = {}, offset[3] = {};
+            std::thread worker;
+            bool ok = false, active = false;
+        };
+        StagePrefetch g_stage_prefetch[1];
+        std::atomic<long long> g_stage_prefetch_hits{0};
+
+        bool stage_prefetch_cpu_visible(ggml_backend_buffer_t b)
+        {
+            const char* name = ggml_backend_buft_name(ggml_backend_buffer_get_type(b));
+            return ggml_backend_buffer_is_host(b)
+                || (name != nullptr && std::strncmp(name, "MTL", 3) == 0 && std::strstr(name, "_Private") == nullptr
+                    && std::strstr(name, "_Mapped") == nullptr);
+        }
+
+        // One stack whole: the experts the tier's fixed slots hold copied from them, the rest read from the file.
+        bool stage_prefetch_stack(const MoeHotTier* tier, int part, int type, const void* host, std::size_t bytes,
+                                  int num_experts, std::uint8_t* dst)
+        {
+            if (num_experts <= 0 || bytes % static_cast<std::size_t>(num_experts) != 0) return false;
+            const std::size_t stride = bytes / static_cast<std::size_t>(num_experts);
+            ExpertRuns all;
+            all.runs.emplace_back(0, num_experts - 1);
+            all.used = num_experts;
+            if (tier != nullptr && tier->cpu_visible && tier->buffer != nullptr && tier->fixed > 0
+                && tier->source[part] == host && tier->num_experts == num_experts && tier->stride[part] == stride
+                && tier->type[part] == type && tier->slot_of.size() == static_cast<std::size_t>(num_experts))
+            {
+                auto* base = static_cast<const std::uint8_t*>(ggml_backend_buffer_get_base(tier->buffer)) + tier->offset[part];
+                return stage_experts_from_tier(base, *tier, host, bytes, stride, num_experts, all, dst) != 0;
+            }
+            std::vector<std::pair<std::size_t, std::size_t>> whole{{0, bytes}};
+            return host_expert_io_read_ranges(host, whole, dst);
+        }
+    }
+
+    bool stage_prefetch_enabled_impl()
+    {
+        const char* e = std::getenv("TS_HOST_MOE_STAGE_PREFETCH");
+        return !(e && e[0] == '0') && g_backend_type == BACKEND_TYPE_METAL;
+    }
+
+    void stage_prefetch_join_impl()
+    {
+        for (StagePrefetch& s : g_stage_prefetch)
+            if (s.worker.joinable()) s.worker.join();
+    }
+
+    void stage_prefetch_start_impl(const HostMoeSegment& hm)
+    {
+        if (!stage_prefetch_enabled_impl() || hm.gate_data == nullptr || hm.down_data == nullptr || hm.num_experts <= 0
+            || hm.gate_bytes <= 0 || hm.down_bytes <= 0 || (hm.up_data != nullptr && hm.up_bytes <= 0))
+            return;
+        for (const StagePrefetch& s : g_stage_prefetch)
+            if (s.active && s.src[0] == hm.gate_data) return;   // staged or staging already
+        // The previous layer's MoE has computed (moe_stage_prefetch_start runs after it), so its stacks can go.
+        StagePrefetch& s = g_stage_prefetch[0];
+        if (s.worker.joinable()) s.worker.join();
+        s.active = false;
+        auto align = [](std::size_t n) { return (n + 255) / 256 * 256; };
+        const std::size_t gb = static_cast<std::size_t>(hm.gate_bytes);
+        const std::size_t ub = hm.up_data ? static_cast<std::size_t>(hm.up_bytes) : 0;
+        const std::size_t db = static_cast<std::size_t>(hm.down_bytes);
+        const std::size_t total = align(gb) + align(ub) + align(db);
+        if (s.buf == nullptr || s.capacity < total)
+        {
+            if (s.buf) ggml_backend_buffer_free(s.buf);
+            s.buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(g_backend), total);
+            s.capacity = s.buf ? total : 0;
+            if (s.buf && !stage_prefetch_cpu_visible(s.buf)) { ggml_backend_buffer_free(s.buf); s.buf = nullptr; s.capacity = 0; }
+            if (s.buf == nullptr) return;
+        }
+        s.src[0] = hm.gate_data; s.src[1] = hm.up_data; s.src[2] = hm.down_data;
+        s.bytes[0] = gb; s.bytes[1] = ub; s.bytes[2] = db;
+        s.offset[0] = 0; s.offset[1] = align(gb); s.offset[2] = align(gb) + align(ub);
+        s.ok = false;
+        s.active = true;
+        const MoeHotTier* tier = moe_hot_tier_find(hm.gate_data);
+        const int types[3] = {hm.gate_type, hm.up_type, hm.down_type};
+        const int n = hm.num_experts;
+        auto* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(s.buf));
+        StagePrefetch* sp = &s;
+        s.worker = std::thread([sp, tier, types0 = types[0], types1 = types[1], types2 = types[2], n, base]() {
+            const int t[3] = {types0, types1, types2};
+            bool ok = true;
+            for (int p = 0; p < 3 && ok; ++p)
+                if (sp->src[p] != nullptr && sp->bytes[p] > 0)
+                    ok = stage_prefetch_stack(tier, p, t[p], sp->src[p], sp->bytes[p], n, base + sp->offset[p]);
+            sp->ok = ok;
+        });
+    }
+
+    // The MoE graph's lookup: the buffer and offsets of this layer's prefetched stacks (waiting for the staging to
+    // finish), or false. A miss joins any staging in flight - the caller stages through the same I/O and copy pools.
+    bool stage_prefetch_take_impl(const void* gate, const void* up, const void* down, ggml_backend_buffer_t& buf,
+                                 std::size_t offset[3], std::size_t bytes[3])
+    {
+        for (StagePrefetch& s : g_stage_prefetch)
+        {
+            if (!s.active || s.src[0] != gate || s.src[1] != up || s.src[2] != down) continue;
+            if (s.worker.joinable()) s.worker.join();
+            s.active = false;   // taken: the next start may reuse it only after this layer's compute (it is synchronous)
+            if (!s.ok) break;
+            buf = s.buf;
+            for (int p = 0; p < 3; ++p) { offset[p] = s.offset[p]; bytes[p] = s.bytes[p]; }
+            g_stage_prefetch_hits.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        stage_prefetch_join_impl();
+        return false;
+    }
+
+    long long stage_prefetch_hits_impl() { return g_stage_prefetch_hits.load(std::memory_order_relaxed); }
+
+    // Shutdown: the staging threads joined and their buffers freed before the device goes (a Metal buffer outliving
+    // its device trips ggml-metal's residency-set assert at exit).
+    void stage_prefetch_release_impl()
+    {
+        stage_prefetch_join_impl();
+        for (StagePrefetch& s : g_stage_prefetch)
+        {
+            if (s.buf) ggml_backend_buffer_free(s.buf);
+            s.buf = nullptr;
+            s.capacity = 0;
+            s.active = false;
+        }
+    }
+
     // Push a stacked expert weight to the device, restricted to `runs` when the
     // stacked layout is known to be contiguous per expert. Returns the bytes
     // actually transferred. `tier` / `part`: the layer's accelerator tier and which
@@ -1666,6 +1811,30 @@ namespace
         // calls), falling back to host-ptr mapping or deferred upload.
         // `stream_experts` skips both shortcuts (see bind_readonly_weight_3d)
         // and records the tensor for the streamed upload below.
+        // A layer the seam loop prefetched (moe_stage_prefetch_start): bind its staged stacks, stage nothing here.
+        bool prefetched = false;
+        if (stream_experts)
+        {
+            const bool has_up = !fused_gate_up && !single_projection_activation;
+            ggml_backend_buffer_t pbuf = nullptr;
+            std::size_t poff[3] = {}, pbytes[3] = {};
+            if (stage_prefetch_take_impl(gate_data, has_up ? up_data : nullptr, down_data, pbuf, poff, pbytes)
+                && pbytes[0] == ggml_nbytes(gate_w) && pbytes[2] == ggml_nbytes(down_w)
+                && (!has_up || (up_w != nullptr && pbytes[1] == ggml_nbytes(up_w))))
+            {
+                auto* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(pbuf));
+                prefetched = ggml_backend_tensor_alloc(pbuf, gate_w, base + poff[0]) == GGML_STATUS_SUCCESS
+                    && (!has_up || ggml_backend_tensor_alloc(pbuf, up_w, base + poff[1]) == GGML_STATUS_SUCCESS)
+                    && ggml_backend_tensor_alloc(pbuf, down_w, base + poff[2]) == GGML_STATUS_SUCCESS;
+                if (!prefetched)
+                {
+                    set_last_error("MoE prefill: could not bind the prefetched expert stacks.");
+                    return 0;
+                }
+            }
+        }
+        if (!prefetched)
+        {
         bind_readonly_weight_3d(ctx, g_backend, dev, gate_data,
             static_cast<std::size_t>(gate_total_bytes), gate_w, uploads, ephem_buffers,
             stream_experts);
@@ -1678,6 +1847,7 @@ namespace
         bind_readonly_weight_3d(ctx, g_backend, dev, down_data,
             static_cast<std::size_t>(down_total_bytes), down_w, uploads, ephem_buffers,
             stream_experts);
+        }
 
         // Allocate any tensors not bound above (hidden in/out fallback, ids,
         // weights, biases, and all per-graph intermediates) into the persistent,
@@ -2023,6 +2193,15 @@ namespace
 
 namespace tsg
 {
+    bool moe_stage_prefetch_enabled() { return stage_prefetch_enabled_impl(); }
+    void moe_stage_prefetch_start(const HostMoeSegment& hm) { stage_prefetch_start_impl(hm); }
+    void moe_stage_prefetch_join() { stage_prefetch_join_impl(); }
+    bool moe_stage_prefetch_take(const void* gate, const void* up, const void* down, ggml_backend_buffer_t& buf,
+                                 std::size_t offset[3], std::size_t bytes[3])
+    { return stage_prefetch_take_impl(gate, up, down, buf, offset, bytes); }
+    long long moe_stage_prefetch_hits() { return stage_prefetch_hits_impl(); }
+    void moe_stage_prefetch_release() { stage_prefetch_release_impl(); }
+
     void prefetch_mapped_ranges(const std::uint8_t* base,
         const std::vector<std::pair<std::size_t, std::size_t>>& ranges)
     {
@@ -2561,6 +2740,17 @@ namespace tsg
             return std::chrono::duration<double, std::milli>(pass_clock::now() - t).count();
         };
 
+        // Prompt-sized passes: stage the next offloaded layer's experts while the accelerator runs (see
+        // moe_stage_prefetch_start); every staging thread is joined before this returns.
+        struct PrefetchJoin { ~PrefetchJoin() { moe_stage_prefetch_join(); } } prefetch_join;
+        const int stream_threshold = moe_offload_stream_batch_threshold();
+        auto prefetchable = [&](std::size_t i) {
+            return i < segments.size() && !segments[i].io_wait && stream_threshold > 0
+                && segments[i].seq_len >= stream_threshold && segments[i].verify_gpu == nullptr;
+        };
+        const bool prefetch = moe_stage_prefetch_enabled() && !debug_this_call;
+        if (prefetch && prefetchable(0)) moe_stage_prefetch_start(segments[0]);
+
         int begin = 0;
 #if defined(TSG_GGML_USE_METAL)
         const bool seamed = host_moe_seams_eligible(segments, seg_end, backend, debug_this_call);
@@ -2647,6 +2837,8 @@ namespace tsg
             }
             if (s_pass_timing) s_acc_host += ms_since(t_host);
             if (hot.launched) begin = hot.end;   // the next slice starts after what already ran
+            // This layer's experts are computed: stage the next one's while the accelerator runs on.
+            if (prefetch && prefetchable(seg + 1)) moe_stage_prefetch_start(segments[seg + 1]);
 
             const std::size_t act_count = static_cast<std::size_t>(hm.hidden) * static_cast<std::size_t>(hm.seq_len);
             const std::size_t route_count = static_cast<std::size_t>(hm.n_used) * static_cast<std::size_t>(hm.seq_len);
@@ -2735,6 +2927,12 @@ namespace tsg
 
 extern "C"
 {
+    // Prompt-sized MoE layers whose experts the seam loop had staged ahead (moe_stage_prefetch_start), process total.
+    TSG_EXPORT long long TSGgml_MoeStagePrefetchHits()
+    {
+        return tsg::moe_stage_prefetch_hits();
+    }
+
     // Read-only observability; does not create a backend/arena or alter its
     // lifetime. Counts successful Spark CPU-offload dispatches using this arena.
     TSG_EXPORT int TSGgml_GetMuseSparkCpuMoeScratchState(
