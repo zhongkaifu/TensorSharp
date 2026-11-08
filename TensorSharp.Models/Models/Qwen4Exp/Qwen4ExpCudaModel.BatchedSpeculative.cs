@@ -26,9 +26,11 @@ namespace TensorSharp.Models
             var engine = _exec?.Engine;
             if (!HasDraftHead || engine == null || !engine.SupportsBatchedVerify || sequences < 1)
                 return 0;
-            // The solo window (three drafts after the anchor), as far as the decode-size kernels' rows allow.
+            // The solo window (three drafts after the anchor), as far as the step's row budget allows each sequence
+            // (Q4eCudaEngine.BatchedVerifyRowBudget); fewer than two rows a sequence decode plainly together.
             int window = Math.Min(((ISpeculativeTarget)this).SpecPreferredDraftWindow + 1, TensorSharp.Cuda.Q4eCudaEngine.VerifyMaxRows);
-            return Math.Min(window, engine.BatchedVerifyMaxRows / sequences);
+            int perSequence = Math.Min(engine.BatchedVerifyRowBudget, engine.BatchedVerifyMaxRows) / sequences;
+            return perSequence < 2 ? 0 : Math.Min(window, perSequence);
         }
 
         public int FusedCacheSeqLen(string requestId)

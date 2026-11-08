@@ -49,6 +49,18 @@ namespace TensorSharp.Cuda
         /// <summary>Rows one batched verify takes at most (the decode-size kernels' bound).</summary>
         public int BatchedVerifyMaxRows => PerSlotMaxRows;
 
+        /// <summary>
+        /// Rows a batched verify step keeps to (TS_Q4E_BATCHED_VERIFY_ROWS, 2 to <see cref="PerSlotMaxRows"/>, default 8): the
+        /// sequences split them into their windows. Rows of different sequences share few experts on this MoE, so a verify
+        /// costs nearly in proportion to its rows (4 / 8 / 12 rows in 9.5 / 14.5 / 24.4 ms on the RTX 5090, each draft kept at
+        /// about 0.62): three sequences with 4-row windows decoded 211 tok/s in all against 296 for four sequences' plain
+        /// batched steps. At 8, two sequences verify 4 rows each, three or four 2; more decode plainly together. 8 rows also
+        /// keep a step's missed experts on the host (TS_Q4E_HOST_EXPERT_ROWS) and its graph captured.
+        /// </summary>
+        public int BatchedVerifyRowBudget => _bvRowBudget;
+
+        private readonly int _bvRowBudget = Math.Clamp(EnvInt("TS_Q4E_BATCHED_VERIFY_ROWS", 8), 2, PerSlotMaxRows);
+
         /// <summary>Whether the engine verifies several sequences' windows in one forward (one GPU, the device argmax).</summary>
         public bool SupportsBatchedVerify => _devs.Length == 1 && _devs[_lastDev].QK.HasArgmaxRows;
 
