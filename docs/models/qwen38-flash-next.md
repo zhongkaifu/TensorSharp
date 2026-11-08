@@ -1418,6 +1418,34 @@ distinct). End to end it moved nothing measurable: in the layers that wait for t
 GPU's experts finish earlier only to wait longer, and the rest is inside the run-to-run noise (long generation 210-224 vs
 211-225 tok/s). Plain decode steps (one row) gain the most.
 
+#### The GPU's share of the missed experts, 2026-11-08
+
+A third of a verify window's layers wait for the CPU's missed experts: the host computes each (expert, row) route at
+DRAM speed, ~30-35 us on the pod's 7950X, while the GPU, its own experts done, waits (about 2 ms of an 11-13 ms window
+in an nsys capture). The GPU can now take some of those misses itself (`TS_Q4E_HYBRID_MISSES`, distinct experts a
+step): the doorbell kernel first plans the GPU's share - those experts' table entries point at slots of the expert
+staging, their ids reach the host as -1 - and rings the host for the rest at once; the staging copy then reads the
+planned experts over the bus, one copy per expert whatever rows use it, and the GPU's expert kernels compute them with
+the resident ones. A layer whose misses the GPU takes whole rings no doorbell. All of it is device state, so a
+captured step replays it.
+
+`TS_Q4E_HYBRID_SPLIT` picks the share. `odd` takes odd-numbered experts only, so an expert goes to the same side
+whatever else a call selects and a verify row computes what its own decode step does while the share holds them
+(`ExpertResidency_GpuShareOfMisses_VerifiesAsItsOwnDecode`); `first` takes the first misses in slot order - more of
+them, but which side a row's expert lands on depends on the window. The GPU's experts compute as all-resident ones do,
+so the answers move within the host-compute tolerance, towards all-resident: a share that takes every miss answers bit
+for bit as all-resident (`ExpertResidency_GpuShareOfMisses_AnswersAsAllResident`).
+
+RTX 5090, ISTA `Q2_0`, MTP, long generation, same build and client (decode tok/s; a 4-row window's verify time and the
+experts left to the CPU, from `TS_Q4E_PERF`):
+
+| share | long generation | 4-row verify | CPU experts a window |
+| --- | --- | --- | --- |
+| 0 (CPU takes every miss) | 208-217 | 11.7-13.3 ms | 41-66 |
+| 2, `odd` | 214-226 | 11.2-12.9 ms | 20-35 |
+| 4, `odd` | 214-232 | 11.3-12.8 ms | 20-33 |
+| 2, `first` | 210-232 | 10.9-12.2 ms | 6-13 |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the

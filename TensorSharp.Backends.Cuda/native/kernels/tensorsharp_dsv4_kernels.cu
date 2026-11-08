@@ -4863,6 +4863,132 @@ extern "C" __global__ void ts_moe_doorbell_publish_tail(
     }
 }
 
+// ---- missed experts split between the GPU and the host (TS_Q4E_HYBRID_MISSES) ----
+// A decode step's missed experts are computed by the host at DRAM speed, ~30-35 us an (expert, row) route on the RTX
+// 5090 pod's 7950X, while the GPU, its own experts done, waits. ts_moe_doorbell_publish_tail that first plans the GPU's
+// share: in one warp, the first `capacity` distinct missed experts in slot order (only those the route-tail rule keeps:
+// some slot routes them above the tail) get staging slots, their table entries pointing at the staging copies, which
+// ts_dsv4_moe_stage_copy fills over the bus next (ts_dsv4_moe_unstage restores them after the wait). The doorbell then
+// leaves them out of the host's share: they reach the host as id -1, which its server skips, and a layer whose misses
+// the GPU took whole rings no doorbell. The choice depends on the selection alone, so a replayed or repeated step splits
+// the same way. With `odd` set only odd-numbered experts are the GPU's: an expert then goes to the same side whatever
+// else the call selects (below capacity), so a verify window's row is computed as its decode step's.
+extern "C" __global__ void ts_moe_doorbell_publish_hybrid(
+    const float* __restrict__ x,
+    const int32_t* __restrict__ sel,
+    const float* __restrict__ selW,
+    const uint8_t* __restrict__ isHost,
+    const int n,
+    const int slots,
+    const int layer,
+    float* xOut,
+    int32_t* idsOut,
+    float* wOut,
+    int32_t* hdr,
+    unsigned int* seq,
+    int32_t* missDev,
+    unsigned int* counts,                // [layers, nExpert] selections (adaptive residency), or null
+    const int nExpert,
+    const int nUsed,
+    const int tailRank,
+    int32_t* __restrict__ stageOf,       // [nExpert], -1 between calls
+    int32_t* __restrict__ stageList,
+    int32_t* __restrict__ stageCount,
+    unsigned long long* __restrict__ tabGate,
+    unsigned long long* __restrict__ tabUp,
+    unsigned long long* __restrict__ tabDown,
+    const unsigned long long staging,
+    const long long stride,
+    const long long offUp,
+    const long long offDown,
+    const int capacity,
+    const int odd)
+{
+    if (threadIdx.x < 32)
+    {
+        const int lane = threadIdx.x;
+        int planned = 0;
+        for (int b = 0; b < slots && planned < capacity; b += 32)
+        {
+            const int i = b + lane;
+            bool cand = false;
+            int e = -1;
+            if (i < slots)
+            {
+                e = sel[i];
+                cand = e >= 0 && isHost[e] && (!odd || (e & 1));
+                // The first slot selecting e, and some slot routing it above the tail.
+                bool needed = tailRank <= 0;
+                for (int j = 0; j < slots && cand; ++j)
+                {
+                    const int ej = sel[j];
+                    if (ej != e)
+                        continue;
+                    if (j < i)
+                        cand = false;
+                    else if (j % nUsed < tailRank)
+                        needed = true;
+                }
+                cand = cand && needed;
+            }
+            const unsigned int ballot = __ballot_sync(0xffffffffu, cand);
+            if (cand)
+            {
+                const int k = planned + __popc(ballot & ((1u << lane) - 1u));
+                if (k < capacity)
+                {
+                    stageList[k] = e;
+                    const unsigned long long base = staging + (unsigned long long)k * (unsigned long long)stride;
+                    tabGate[e] = base;
+                    tabUp[e] = base + (unsigned long long)offUp;
+                    tabDown[e] = base + (unsigned long long)offDown;
+                    stageOf[e] = k;
+                }
+            }
+            planned += __popc(ballot);
+        }
+        if (lane == 0)
+            *stageCount = min(planned, capacity);
+    }
+    __syncthreads();
+
+    int miss = 0;
+    for (int i = threadIdx.x; i < slots; i += blockDim.x)
+    {
+        const int e = sel[i];
+        if (e >= 0 && isHost[e] && stageOf[e] < 0 && (tailRank <= 0 || i % nUsed < tailRank))
+            miss = 1;
+        if (counts != nullptr && e >= 0)
+            atomicAdd(counts + (size_t)layer * nExpert + e, 1u);
+    }
+    miss = __syncthreads_or(miss);
+    if (threadIdx.x == 0)
+        *missDev = miss;
+    if (!miss)
+        return;
+    for (int i = threadIdx.x; i < slots; i += blockDim.x)
+    {
+        const int e = sel[i];
+        idsOut[i] = e >= 0 && stageOf[e] >= 0 ? -1 : e;
+        wOut[i] = selW[i];
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        xOut[i] = x[i];
+    if (threadIdx.x == 0)
+    {
+        ((volatile int32_t*)hdr)[0] = layer;
+        ((volatile int32_t*)hdr)[1] = slots;
+        ((volatile int32_t*)hdr)[2] = 1;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        *(volatile unsigned int*)seq = *(volatile unsigned int*)seq + 1u;
+        __threadfence_system();
+    }
+}
+
 // ts_moe_doorbell_wait_add after ts_moe_doorbell_publish_skip: nothing to wait for when the layer rang no doorbell.
 extern "C" __global__ void ts_moe_doorbell_wait_add_skip(
     const unsigned int* flag,

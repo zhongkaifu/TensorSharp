@@ -60,6 +60,8 @@ namespace TensorSharp.Cuda
         private static readonly bool _moeGateUpHalf = Environment.GetEnvironmentVariable("TS_MOE_GATEUP_HALF") != "0";
         // The doorbell with the route-tail skip (optional).
         private readonly IntPtr doorbellPublishTail;
+        // The doorbell that plans the GPU's share of a decode step's missed experts and leaves it out (optional).
+        private readonly IntPtr doorbellPublishHybrid;
         private readonly IntPtr denseBf16Rows, denseQ81RowsSplitK, denseBf16RowsSplitK;
         // The same products for 2..16 rows in one block, the weights read once (optional: a module before it launches a
         // block per row).
@@ -255,6 +257,8 @@ namespace TensorSharp.Cuda
                     doorbellWaitAddSkip = module.GetFunction("ts_moe_doorbell_wait_add_skip");
                     try { doorbellPublishTail = module.GetFunction("ts_moe_doorbell_publish_tail"); }
                     catch (CudaException ex) when (ex.ErrorCode == 500) { doorbellPublishTail = IntPtr.Zero; }
+                    try { doorbellPublishHybrid = module.GetFunction("ts_moe_doorbell_publish_hybrid"); }
+                    catch (CudaException ex) when (ex.ErrorCode == 500) { doorbellPublishHybrid = IntPtr.Zero; }
                 }
                 catch (CudaException ex) when (ex.ErrorCode == 500)
                 {
@@ -898,6 +902,28 @@ namespace TensorSharp.Cuda
         /// into (adaptive residency), or zero.</param>
         /// <summary>Whether <see cref="MoeDoorbellPublish"/> takes a route-tail rank (with a miss word).</summary>
         public bool HasDoorbellTail => doorbellPublishTail != IntPtr.Zero;
+
+        /// <summary>Whether the module splits a decode step's missed experts between the GPU and the host.</summary>
+        public bool HasHybridMisses => doorbellPublishHybrid != IntPtr.Zero;
+
+        /// <summary><see cref="MoeDoorbellPublish"/> with the route-tail rule that first plans the GPU's share of the missed
+        /// experts into <paramref name="stage"/> - the first <see cref="CudaExpertStage.Capacity"/> distinct ones in slot
+        /// order, or with <paramref name="odd"/> the odd-numbered ones - and leaves them out of the host's: their table entries
+        /// point at the staging copies, which <see cref="MoeStageCopy"/> fills and <see cref="MoeUnstage"/> restores.</summary>
+        public void MoeDoorbellPublishHybrid(Tensor x, Tensor sel, Tensor selW, in CudaExpertStageLayer layerStage, int n, int slots,
+            int layer, CudaHostExpertMailbox box, IntPtr stream, IntPtr missDev, IntPtr counts, int nExpert, int nUsed, int tailRank,
+            CudaExpertStage stage, bool odd)
+        {
+            IntPtr a0 = P(x), a1 = P(sel), a2 = P(selW), a3 = layerStage.IsHost; int a4 = n, a5 = slots, a6 = layer;
+            IntPtr a7 = box.XDev, a8 = box.IdsDev, a9 = box.WDev, a10 = box.HeaderDev, a11 = box.SeqDev, a12 = missDev, a13 = counts;
+            int a14 = nExpert, a15 = nUsed, a16 = tailRank;
+            IntPtr a17 = stage.StageOf, a18 = stage.StageList, a19 = stage.StageCount;
+            IntPtr a20 = layerStage.TabGate, a21 = layerStage.TabUp, a22 = layerStage.TabDown, a23 = stage.Staging;
+            long a24 = stage.Stride, a25 = layerStage.OffUp, a26 = layerStage.OffDown; int a27 = stage.Capacity, a28 = odd ? 1 : 0;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15,
+                &a16, &a17, &a18, &a19, &a20, &a21, &a22, &a23, &a24, &a25, &a26, &a27, &a28 };
+            Launch(doorbellPublishHybrid, 1, 1, 1, 1024, 0, stream, args);
+        }
 
         /// <param name="tailRank">With <see cref="HasDoorbellTail"/> and a miss word: host experts every row routes at this
         /// rank or lower ring no doorbell (the route-tail skip); 0 rings for every host expert.</param>

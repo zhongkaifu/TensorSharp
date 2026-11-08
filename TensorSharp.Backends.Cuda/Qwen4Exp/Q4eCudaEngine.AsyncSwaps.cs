@@ -44,8 +44,9 @@ namespace TensorSharp.Cuda
         /// <summary>Whether rounds run overlapped: residency with adaptation and host experts, and the staging to borrow.</summary>
         private bool AsyncSwapsUsable => _asyncSwapsEnv && _residency?.Tab != null && _expertStage != null && _hostServer != null;
 
-        /// <summary>Swaps one overlapped round can carry: two staging slots each.</summary>
-        private int AsyncSwapCapacity => _expertStage == null ? 0 : _expertStage.Capacity / 2;
+        /// <summary>Swaps one overlapped round can carry: two staging slots each, short of the last ones the GPU's share of
+        /// a decode step's missed experts goes through (TS_Q4E_HYBRID_MISSES).</summary>
+        private int AsyncSwapCapacity => _expertStage == null ? 0 : (_expertStage.Capacity - (_hybridStage?.Capacity ?? 0)) / 2;
 
         private static long[] ExpertMatrixBytes(LayerDesc l, int nExpert)
             => new[] { l.GateExps.TotalBytes / nExpert, l.UpExps.TotalBytes / nExpert, l.DownExps.TotalBytes / nExpert };

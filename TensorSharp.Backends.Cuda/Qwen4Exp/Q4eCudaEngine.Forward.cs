@@ -941,7 +941,16 @@ namespace TensorSharp.Cuda
             // A prompt's selections teach adaptive residency what its answer will route (AdaptAfterPrompt).
             if (!host && il >= 0 && nt > _hostExpertRows && _promptCountsDev != IntPtr.Zero && L.Stage.IsValid)
                 dev.QK.CountSelected(Ptr(dev.Moe.Sel), nt * m.NExpertUsed, (IntPtr)((long)_promptCountsDev + 4L * il * m.NExpert), dev.Stream);
-            if (host)
+            // The GPU's share of the misses: planned by the doorbell (which leaves it out of the host's), copied over the bus
+            // after it, so the host starts at once.
+            bool hybrid = host && _hybridStage != null && _doorbellMiss != IntPtr.Zero && L.Stage.IsValid && L.Stage.Staged;
+            if (hybrid)
+            {
+                dev.DK.MoeDoorbellPublishHybrid(dev.Cur, dev.Moe.Sel, dev.Moe.SelW, L.Stage, nt * e, nt * m.NExpertUsed, il,
+                    _hostBox, dev.Stream, _doorbellMiss, _adaptCountsDev, m.NExpert, m.NExpertUsed, _tailRank, _hybridStage, _hybridOdd);
+                dev.DK.MoeStageCopy(L.Stage, _hybridStage, _hybridStage.Capacity, dev.Stream);
+            }
+            else if (host)
                 dev.DK.MoeDoorbellPublish(dev.Cur, dev.Moe.Sel, dev.Moe.SelW, L.Stage.IsHost, nt * e, nt * m.NExpertUsed, il,
                     _hostBox, dev.Stream, _doorbellMiss, _adaptCountsDev, m.NExpert, m.NExpertUsed, _tailRank);
 
@@ -960,6 +969,8 @@ namespace TensorSharp.Cuda
                 // The GPU's own experts end here; what follows is the wait for the CPU's share.
                 StageEnd(dev, StExperts);
                 dev.DK.MoeDoorbellWaitAdd(_hostBox, dev.BlockOut, nt * e, dev.Stream, _doorbellMiss);
+                if (hybrid)
+                    dev.DK.MoeUnstage(L.Stage, _hybridStage, dev.Stream);
                 StageEnd(dev, StHostWait);
             }
             else

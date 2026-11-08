@@ -208,6 +208,9 @@ namespace TensorSharp.Cuda
                 b += 9 * CudaWeightArena.Align((long)_m.NExpert * 8) + CudaWeightArena.Align(_m.NExpert);
             }
             // StageOf, StageList and the zero expert's pad, then StageCount and StageFrom (an aligned int each).
+            // The GPU's share of the missed experts (TS_Q4E_HYBRID_MISSES): its own StageOf, StageList and two ints.
+            if (_hybridMissesEnv > 0)
+                b += CudaWeightArena.Align((long)_m.NExpert * 4) + CudaWeightArena.Align((long)StagingExperts() * 4) + 512;
             return b + StagingBytes() + CudaWeightArena.Align(StagingStride()) + 3 * CudaWeightArena.Align((long)_m.NExpert * 4) + 512;
         }
 
@@ -249,8 +252,40 @@ namespace TensorSharp.Cuda
                 // The zero expert: all-zero blocks decode to zero weights, so a missed expert's GPU product is 0.
                 _zeroExpert = dev.Weights.Reserve(StagingStride());
                 CudaDriverApi.cuMemsetD8(_zeroExpert, 0, new UIntPtr((ulong)StagingStride())).ThrowOnError();
+                int g = Math.Min(_hybridMissesEnv, stage.Capacity / 2);
+                if (g > 0 && dev.DK.HasHybridMisses)
+                {
+                    // The GPU's share of a decode step's misses: the staging's last slots. An overlapped adaptive round
+                    // borrows the slots before them (AsyncSwapCapacity); a prompt, which stages through all of it, runs
+                    // between steps.
+                    var hybrid = new CudaExpertStage { Capacity = g, Stride = stage.Stride };
+                    fixed (int* p = minusOne)
+                        hybrid.StageOf = dev.Weights.PlaceBytes((IntPtr)p, (long)n * 4);
+                    hybrid.StageCount = dev.Weights.PlaceBytes((IntPtr)(&zero), 4);
+                    hybrid.StageFrom = dev.Weights.PlaceBytes((IntPtr)(&zero), 4);
+                    hybrid.StageList = dev.Weights.Reserve((long)g * 4);
+                    hybrid.Staging = stage.Staging + (nint)((long)(stage.Capacity - g) * stage.Stride);
+                    _hybridStage = hybrid;
+                    Console.Error.WriteLine($"[q4e-cuda] missed experts split: the GPU stages up to {g} of a decode step's "
+                        + $"missed experts over the bus ({(_hybridOdd ? "odd-numbered ones" : "the first in slot order")}) while the "
+                        + "host computes the rest (TS_Q4E_HYBRID_MISSES, TS_Q4E_HYBRID_SPLIT).");
+                }
+                else if (g > 0)
+                    Console.Error.WriteLine("[q4e-cuda] missed experts split off: the loaded tensorsharp_dsv4_kernels module predates "
+                        + "ts_moe_doorbell_publish_hybrid; the host computes every missed expert.");
             }
         }
+
+        // TS_Q4E_HYBRID_MISSES: distinct missed experts of a decode step or verify window the GPU stages over the bus and
+        // computes itself while the host computes the rest (0 = the host takes them all).
+        private readonly int _hybridMissesEnv = Math.Max(0, EnvInt("TS_Q4E_HYBRID_MISSES", 0));
+
+        // TS_Q4E_HYBRID_SPLIT=first: the GPU takes the first missed experts in slot order; default "odd": only odd-numbered
+        // experts are the GPU's, so an expert goes to the same side whatever else a call selects (below capacity).
+        private readonly bool _hybridOdd = Environment.GetEnvironmentVariable("TS_Q4E_HYBRID_SPLIT") != "first";
+
+        /// <summary>The staging the GPU's share of the missed experts goes through, or null (see TS_Q4E_HYBRID_MISSES).</summary>
+        private CudaExpertStage _hybridStage;
 
         /// <summary>
         /// Copies the experts without a slot into pinned host memory the GPU can address, packed per

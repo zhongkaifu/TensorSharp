@@ -775,6 +775,84 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         Assert.True(skip.Window.AsSpan().SequenceEqual(ring.Window), "skipping changed the verify window's logits");
     }
 
+    /// <summary>The GPU's share of a decode step's missed experts (TS_Q4E_HYBRID_MISSES): the GPU stages up to that many
+    /// over the bus and computes them itself while the CPU computes the rest. The fixture routes 4 of 16 experts, none
+    /// resident here. A share of four in slot order takes all of a decode step's experts: none is left to the CPU and the
+    /// steps answer bit for bit as the all-resident engine. The odd-numbered split (the default) and a share of two leave
+    /// fewer experts to the CPU than no share does, within the host-compute tolerance.</summary>
+    [CudaFact]
+    public void ExpertResidency_GpuShareOfMisses_AnswersAsAllResident()
+    {
+        string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
+        float[][] Load(string vramGb, string share, string split, out long misses)
+        {
+            _env.Set("TS_Q4E_EXPERT_VRAM_GB", vramGb);
+            _env.Set("TS_Q4E_HYBRID_MISSES", share);
+            _env.Set("TS_Q4E_HYBRID_SPLIT", split);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            float[][] r = Run(model);
+            misses = engine.HostExpertMisses;
+            return r;
+        }
+        float[][] all = Load(null, null, null, out _);
+        float[][] cpu = Load("0", null, null, out long cpuMisses);
+        float[][] whole = Load("0", "4", "first", out long wholeMisses);
+        float[][] odd = Load("0", "4", null, out long oddMisses);
+        float[][] two = Load("0", "2", "first", out long twoMisses);
+        _output.WriteLine($"experts on the CPU: no share {cpuMisses}, four in slot order {wholeMisses}, odd-numbered {oddMisses}, "
+            + $"two in slot order {twoMisses}");
+        Assert.True(cpuMisses > 0, "no expert was left to the CPU: the fixture did not exercise the doorbell");
+        Assert.Equal(0, wholeMisses);
+        Assert.True(oddMisses > 0 && oddMisses < cpuMisses, "the odd-numbered split left the CPU's share as it was");
+        Assert.True(twoMisses > 0 && twoMisses < cpuMisses, "a share of two left the CPU's share as it was");
+        for (int i = 0; i < all.Length; i++)
+        {
+            string at = i == 0 ? "prefill" : $"decode {i}";
+            Assert.True(whole[i].AsSpan().SequenceEqual(all[i]), $"{at}: the GPU computing every miss differs from all-resident");
+            double eCpu = RelativeError(cpu[i], all[i]), eOdd = RelativeError(odd[i], all[i]), eTwo = RelativeError(two[i], all[i]);
+            _output.WriteLine($"{at}: relative error to all-resident: no share {eCpu:E2}, odd-numbered {eOdd:E2}, two {eTwo:E2}");
+            Assert.True(eOdd <= 2e-2, $"{at}: the odd-numbered split differs by {eOdd:E2}");
+            Assert.True(eTwo <= 2e-2, $"{at}: a share of two differs by {eTwo:E2}");
+        }
+    }
+
+    /// <summary>The odd-numbered split gives an expert to the same side whatever else a call selects (while the share
+    /// holds them all: here eight, every odd-numbered expert of the fixture's 16), so a verify window's rows compute their
+    /// own decode steps as they do with no share. Slot order depends on the window; its row errors are only reported.</summary>
+    [CudaFact]
+    public void ExpertResidency_GpuShareOfMisses_VerifiesAsItsOwnDecode()
+    {
+        string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", "0");
+        int[] window = { Steps[0], Steps[1], Steps[2], Steps[3] };
+        int vocab = Qwen4ExpSyntheticModelBuilder.Vocab;
+        double[] RowErrors(string share, string split)
+        {
+            _env.Set("TS_Q4E_HYBRID_MISSES", share);
+            _env.Set("TS_Q4E_HYBRID_SPLIT", split);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            model.ForwardRefill(Prompt);
+            var plain = new float[window.Length][];
+            for (int i = 0; i < window.Length; i++)
+                plain[i] = (float[])model.Forward(new[] { window[i] }).Clone();
+            model.ResetKVCache();
+            model.ForwardRefill(Prompt);
+            var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+            var all = new float[window.Length * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(window, null, all, true);
+            return Enumerable.Range(0, window.Length).Select(i => RelativeError(all.AsSpan(i * vocab, vocab).ToArray(), plain[i])).ToArray();
+        }
+        double[] cpu = RowErrors(null, null), odd = RowErrors("8", null), first = RowErrors("2", "first");
+        for (int i = 0; i < window.Length; i++)
+        {
+            _output.WriteLine($"verify row {i} vs its decode step: no share {cpu[i]:E2}, odd-numbered {odd[i]:E2}, two in slot order {first[i]:E2}");
+            Assert.True(cpu[i] <= 1e-5, $"verify row {i} differs from its decode step by {cpu[i]:E2} with no share");
+            Assert.True(odd[i] <= 1e-5, $"verify row {i} differs from its decode step by {odd[i]:E2} under the odd-numbered split");
+        }
+    }
+
     /// <summary>Adaptive residency (TS_MOE_TIER_ADAPT=1 under host experts): between decode steps the most-selected
     /// host experts trade places with the least-selected VRAM experts. The swaps keep every expert reachable, so a
     /// long decode keeps answering as the all-resident engine does within the host-compute tolerance.</summary>
