@@ -40,6 +40,10 @@ namespace TensorSharp.Cuda
         /// <summary>A batched step's key is captured on its third run.</summary>
         private const int BatchCaptureAfter = 2;
 
+        /// <summary>Captured batched steps kept at most: a new capture past it drops the others first (each holds device
+        /// memory, and a slot that cannot be allocated drops them all too, SlotAlloc).</summary>
+        private const int MaxBatchGraphs = 8;
+
         // TS_Q4E_BATCH_GRAPHS=0: batched steps run uncaptured (for measuring the graphs).
         private readonly bool _batchGraphsEnabled =
             !string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_BATCH_GRAPHS"), "0", StringComparison.Ordinal);
@@ -95,6 +99,8 @@ namespace TensorSharp.Cuda
                 GatherPleRows(null, tokens, 0, nt, 0, rows, positions);
             if (!captured)
             {
+                if (_batchGraphs.Count >= MaxBatchGraphs)
+                    DestroyBatchGraphs(-2);
                 try
                 {
                     graph = (CaptureSteps(d => IssueBatchStep(d, rows, positions, nt, greedy, hidden)), slots);
@@ -125,12 +131,13 @@ namespace TensorSharp.Cuda
             IssueHead(nt, logits: true, allRows: true, hidden: hidden, greedy: greedy);
         }
 
-        /// <summary>Drop the captured batched steps that hold <paramref name="slotId"/> (every one when it is -1).</summary>
+        /// <summary>Drop the captured batched steps that hold <paramref name="slotId"/>: every one when it is -1 (with the run
+        /// counts) or -2 (the counts kept).</summary>
         private void DestroyBatchGraphs(int slotId)
         {
-            if (slotId < 0)
+            if (slotId == -1)
                 _batchKeyRuns.Clear();
-            else
+            else if (slotId >= 0)
             {
                 string id = ":" + slotId + "@";
                 List<string> stale = null;

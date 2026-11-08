@@ -44,7 +44,22 @@ namespace TensorSharp.Cuda
         public int SlotAlloc()
         {
             if (!SlotFits())
-                return -1;
+            {
+                // Captured batched steps are a cache, and their executable graphs hold device memory: a new sequence needs it
+                // more. In Strata's concurrency rounds the graphs of earlier rounds left the fourth request no slot, and it
+                // waited 4.2-4.6 s for a running one to finish.
+                if (_batchGraphs.Count == 0)
+                    return -1;
+                DestroyBatchGraphs(-1);
+                // A graph still running is freed when it completes.
+                foreach (var dev in _devs)
+                {
+                    dev.MakeCurrent();
+                    CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+                }
+                if (!SlotFits())
+                    return -1;
+            }
             Slot slot;
             try
             {
