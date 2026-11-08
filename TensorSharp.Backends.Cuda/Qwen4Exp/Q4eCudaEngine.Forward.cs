@@ -75,6 +75,8 @@ namespace TensorSharp.Cuda
                     Zero(dev, dev.AttnArrive, 4);
                 }
             }
+            if (anyQsa && _kvWindow > 0)
+                AllocKvStaging(dev);
             if (anyQsa)
             {
                 dev.IdxRaw = AllocF32(dev, nt, m.IdxDim);
@@ -163,8 +165,8 @@ namespace TensorSharp.Cuda
             get
             {
                 int r = int.MaxValue;
-                foreach (var L in _layers)
-                    if (L.Ratio > 0) r = Math.Min(r, L.Ratio);
+                foreach (var L in _m.Layers)
+                    if (!L.Recurrent && L.CompressRatio > 0) r = Math.Min(r, L.CompressRatio);
                 return r == int.MaxValue ? 1 : r;
             }
         }
@@ -174,8 +176,9 @@ namespace TensorSharp.Cuda
             get
             {
                 int r = 1;
-                foreach (var L in _layers)
-                    if (L.Ratio > 0) r = Math.Max(r, L.Ratio);
+                // The model's layers, not the placed ones: the resident KV window sizes itself before placement.
+                foreach (var L in _m.Layers)
+                    if (!L.Recurrent && L.CompressRatio > 0) r = Math.Max(r, L.CompressRatio);
                 return r;
             }
         }
@@ -212,10 +215,16 @@ namespace TensorSharp.Cuda
                 }
                 else
                 {
-                    AllocKv(slot, dev, c);
+                    if (KvStreamed(il))
+                    {
+                        AllocKvStream(slot, dev, c);
+                        c.IdxRing = _idxRing;
+                    }
+                    else
+                        AllocKv(slot, dev, c);
                     if (L.Ratio > 0)
                     {
-                        c.IdxRaw = SlotTensor(slot, dev, DType.Float16, (long)m.NCtx * m.IdxDim);
+                        c.IdxRaw = SlotTensor(slot, dev, DType.Float16, (long)(c.IdxRing > 0 ? c.IdxRing : m.NCtx) * m.IdxDim);
                         c.IdxPooled = SlotTensor(slot, dev, DType.Float32, (long)(m.NCtx / L.Ratio) * m.IdxDim);
                     }
                 }
@@ -280,6 +289,12 @@ namespace TensorSharp.Cuda
                     Zero(dev, c.ConvState, 4);
                     Zero(dev, c.Ssm, 4);
                 }
+                if (c.Kv != null)
+                {
+                    ResetKvStream(dev, c.Kv);
+                    if (ReferenceEquals(dev.KvStagedFor, c))
+                        dev.KvStagedFor = null;
+                }
                 if (_layers[il].Ple && slot.PleHist != null)
                     Zero(dev, slot.PleHist, 4);
             }
@@ -302,9 +317,15 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuStreamSynchronize(dev.Stream);
             }
             DestroySlotGraphs(slot.Id);
+            foreach (var dev in _devs)
+                if (dev.KvStagedFor != null && Array.IndexOf(slot.Layers, dev.KvStagedFor) >= 0)
+                    dev.KvStagedFor = null;
             foreach (var t in slot.Owned)
                 t.Dispose();
             slot.Owned.Clear();
+            foreach (IntPtr h in slot.HostOwned)
+                CudaDriverApi.cuMemFreeHost(h);
+            slot.HostOwned.Clear();
         }
 
         /// <summary>Back to position 0 on the active sequence.</summary>
@@ -373,7 +394,7 @@ namespace TensorSharp.Cuda
             {
                 double secs = sw.Elapsed.TotalSeconds;
                 Console.Error.WriteLine($"[q4e-cuda] forward {tokens.Length} tokens in {secs:F3}s ({tokens.Length / secs:F1} tok/s), "
-                    + $"host issue {IssueMs(start):F1}ms");
+                    + $"host issue {IssueMs(start):F1}ms" + KvFetchedNote(slot, tokens.Length > PerSlotMaxRows ? 1 : 32));
             }
         }
 
@@ -748,27 +769,56 @@ namespace TensorSharp.Cuda
                 StageEnd(dev, StAttnProj);
             }
 
-            dev.QK.AttnPrep(At(dev.Qg, (long)row0 * 2 * qd), At(dev.K, (long)row0 * kvd), At(dev.V, (long)row0 * kvd),
-                Ptr(L.QNorm), Ptr(L.KNorm), At(dev.Q, (long)row0 * qd), At(dev.Gate, (long)row0 * qd),
-                Ptr(c.KCache), Ptr(c.VCache), pos, p0, m.NHead, m.NKvHead, m.NRot, m.RopeBase, m.RopeFreqScale,
-                m.RmsEps, nt, dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
+            // A streamed layer (TS_Q4E_KV_RESIDENT): decode-size calls read and write the window through its page table, a
+            // prompt runs on the staging pool (the context's cells copied in from the host copy).
+            var kv = c.Kv;
+            bool paged = kv != null && nt <= PerSlotMaxRows;
+            bool staged = kv != null && !paged;
+            IntPtr kCache = Ptr(c.KCache), vCache = Ptr(c.VCache), kScale = PtrOrZero(c.KScale), vScale = PtrOrZero(c.VScale);
+            if (staged)
+            {
+                KvStageForPrompt(dev, c, p0);
+                kCache = Ptr(dev.KvStageK);
+                vCache = Ptr(dev.KvStageV);
+                kScale = Ptr(dev.KvStageKs);
+                vScale = Ptr(dev.KvStageVs);
+            }
+            if (paged)
+            {
+                if (ReferenceEquals(dev.KvStagedFor, c))
+                    dev.KvStagedFor = null;
+                dev.QK.AttnPrepPaged(At(dev.Qg, (long)row0 * 2 * qd), At(dev.K, (long)row0 * kvd), At(dev.V, (long)row0 * kvd),
+                    Ptr(L.QNorm), Ptr(L.KNorm), At(dev.Q, (long)row0 * qd), At(dev.Gate, (long)row0 * qd),
+                    kCache, vCache, kScale, vScale, pos, p0, m.NHead, m.NKvHead, m.NRot, m.RopeBase, m.RopeFreqScale,
+                    m.RmsEps, nt, Ptr(kv.Table), kv.DevK, kv.DevV, kv.DevKs, kv.DevVs, dev.Stream);
+            }
+            else
+            {
+                dev.QK.AttnPrep(At(dev.Qg, (long)row0 * 2 * qd), At(dev.K, (long)row0 * kvd), At(dev.V, (long)row0 * kvd),
+                    Ptr(L.QNorm), Ptr(L.KNorm), At(dev.Q, (long)row0 * qd), At(dev.Gate, (long)row0 * qd),
+                    kCache, vCache, pos, p0, m.NHead, m.NKvHead, m.NRot, m.RopeBase, m.RopeFreqScale,
+                    m.RmsEps, nt, dev.Stream, kScale, vScale);
+                if (staged)
+                    KvUnstagePrompt(dev, c, p0, nt);
+            }
 
             IntPtr cells = IntPtr.Zero, cellCnt = IntPtr.Zero;
             if (L.Ratio > 0)
             {
                 int R = L.Ratio, d = m.IdxDim;
-                dev.QK.QsaStore(At(dev.IdxRaw, (long)row0 * d), Ptr(c.IdxRaw), pos, p0, d, nt, dev.Stream);
+                if (c.IdxRing > 0)
+                    dev.QK.QsaStoreRing(At(dev.IdxRaw, (long)row0 * d), Ptr(c.IdxRaw), pos, p0, d, nt, c.IdxRing, dev.Stream);
+                else
+                    dev.QK.QsaStore(At(dev.IdxRaw, (long)row0 * d), Ptr(c.IdxRaw), pos, p0, d, nt, dev.Stream);
                 // The blocks this ubatch completes (their last member now cached).
                 int firstBlock = p0 / R, endBlock = (p0 + nt) / R;
                 if (pos == IntPtr.Zero || nt == 1)
-                    dev.QK.QsaPool(Ptr(c.IdxRaw), Ptr(L.IdxKNorm), Ptr(c.IdxPooled), pos, firstBlock, endBlock - firstBlock, R, d,
-                        m.NRot, m.RopeBase, m.RopeFreqScale, m.RmsEps, dev.Stream);
+                    QsaPool(dev, L, c, pos, firstBlock, endBlock - firstBlock);
                 else
                     // A captured window: the pooling kernel reads one row's position, so each row pools the block it
                     // completes, if it completes one.
                     for (int t = 0; t < nt; t++)
-                        dev.QK.QsaPool(Ptr(c.IdxRaw), Ptr(L.IdxKNorm), Ptr(c.IdxPooled), (IntPtr)((long)pos + 4L * (row0 + t)), 0, 0,
-                            R, d, m.NRot, m.RopeBase, m.RopeFreqScale, m.RmsEps, dev.Stream);
+                        QsaPool(dev, L, c, (IntPtr)((long)pos + 4L * (row0 + t)), 0, 0);
                 // Past the width the selection bites: score the complete blocks, keep the best.
                 if (p0 + nt > m.IdxTopK + R - 1)
                 {
@@ -790,24 +840,43 @@ namespace TensorSharp.Cuda
                         SparseProbe?.Invoke(CaptureSparse(dev, L, il, c, row0, nt, p0));
                 }
             }
+            if (paged)
+            {
+                // Every page the rows read made resident, the misses copied over the bus.
+                dev.QK.KvResolve(cells, cellCnt, pos, p0, nt, CellStride, Ptr(kv.Table), Ptr(kv.SlotPage), Ptr(kv.SlotStamp),
+                    Ptr(kv.Ctl), Ptr(kv.MissPage), Ptr(kv.MissSlot), kv.Slots, dev.Stream);
+                dev.QK.KvPageCopy(Ptr(kv.Ctl), Ptr(kv.MissPage), Ptr(kv.MissSlot), kv.DevK, kv.DevV, kv.DevKs, kv.DevVs,
+                    kCache, vCache, kScale, vScale, m.NKvHead, dev.Stream);
+            }
             StageEnd(dev, StAttnPrep);
 
             int splits = AttnSplits(dev, il, nt, p0);
-            if (splits == 0 && AttnMmaFor(dev, nt))
+            if (paged)
             {
-                dev.QK.AttentionMma(At(dev.Q, (long)row0 * qd), Ptr(c.KCache), Ptr(c.VCache), At(dev.Gate, (long)row0 * qd),
+                if (splits > 0)
+                    dev.QK.AttentionSplitPaged(At(dev.Q, (long)row0 * qd), kCache, vCache, kScale, vScale, At(dev.Gate, (long)row0 * qd),
+                        cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
+                        CellStride, nt, splits, Ptr(dev.AttnPart), Ptr(dev.AttnArrive), Ptr(kv.Table), dev.Stream);
+                else
+                    dev.QK.AttentionPaged(At(dev.Q, (long)row0 * qd), kCache, vCache, kScale, vScale, At(dev.Gate, (long)row0 * qd),
+                        cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
+                        CellStride, nt, Ptr(kv.Table), dev.Stream);
+            }
+            else if (splits == 0 && AttnMmaFor(dev, nt))
+            {
+                dev.QK.AttentionMma(At(dev.Q, (long)row0 * qd), kCache, vCache, At(dev.Gate, (long)row0 * qd),
                     cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
-                    CellStride, nt, dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
+                    CellStride, nt, dev.Stream, kScale, vScale);
                 PromptAttentionMmaCalls++;
             }
             else if (splits > 0)
-                dev.QK.AttentionSplit(At(dev.Q, (long)row0 * qd), Ptr(c.KCache), Ptr(c.VCache), At(dev.Gate, (long)row0 * qd),
+                dev.QK.AttentionSplit(At(dev.Q, (long)row0 * qd), kCache, vCache, At(dev.Gate, (long)row0 * qd),
                     cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
-                    CellStride, nt, splits, Ptr(dev.AttnPart), Ptr(dev.AttnArrive), dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
+                    CellStride, nt, splits, Ptr(dev.AttnPart), Ptr(dev.AttnArrive), dev.Stream, kScale, vScale);
             else
-                dev.QK.Attention(At(dev.Q, (long)row0 * qd), Ptr(c.KCache), Ptr(c.VCache), At(dev.Gate, (long)row0 * qd),
+                dev.QK.Attention(At(dev.Q, (long)row0 * qd), kCache, vCache, At(dev.Gate, (long)row0 * qd),
                     cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
-                    CellStride, nt, dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
+                    CellStride, nt, dev.Stream, kScale, vScale);
             StageEnd(dev, StAttnCore);
 
             if (row0 + nt == RowsInFlight(nt))
@@ -815,6 +884,19 @@ namespace TensorSharp.Cuda
                 MatMulQ(dev, L.Wo, dev.AttnO, dev.BlockOut, row0 + nt);
                 StageEnd(dev, StAttnOut);
             }
+        }
+
+        /// <summary>The QSA keys of blocks [first, first + count) from the layer's raw keys (a ring on a streamed layer); with
+        /// <paramref name="pos"/>, the block the row at pos[0] completes.</summary>
+        private void QsaPool(Dev dev, DevLayer L, SlotLayer c, IntPtr pos, int first, int count)
+        {
+            var m = _m;
+            if (c.IdxRing > 0)
+                dev.QK.QsaPoolRing(Ptr(c.IdxRaw), Ptr(L.IdxKNorm), Ptr(c.IdxPooled), pos, first, count, L.Ratio, m.IdxDim,
+                    m.NRot, m.RopeBase, m.RopeFreqScale, m.RmsEps, c.IdxRing, dev.Stream);
+            else
+                dev.QK.QsaPool(Ptr(c.IdxRaw), Ptr(L.IdxKNorm), Ptr(c.IdxPooled), pos, first, count, L.Ratio, m.IdxDim,
+                    m.NRot, m.RopeBase, m.RopeFreqScale, m.RmsEps, dev.Stream);
         }
 
         // TS_Q4E_ATTN_SPLITS: blocks a decode-size row's attention cells split over (flash decoding; 1 or 0 keeps one
@@ -1124,7 +1206,8 @@ namespace TensorSharp.Cuda
                 Layer = il, P0 = p0, Nt = nt, Ratio = L.Ratio, TopK = m.IdxTopK, IdxHeads = m.IdxHeads, IdxDim = d,
                 ScoreStride = ScoreStride, CellStride = CellStride, NRot = m.NRot, RopeBase = m.RopeBase,
                 RopeFreqScale = m.RopeFreqScale, Eps = m.RmsEps,
-                RawKeys = Download<System.Half>(Ptr(c.IdxRaw), (long)cached * d),
+                // A streamed layer keeps only a ring of its raw keys (TS_Q4E_KV_RESIDENT).
+                RawKeys = c.IdxRing > 0 ? null : Download<System.Half>(Ptr(c.IdxRaw), (long)cached * d),
                 Pooled = Download<float>(Ptr(c.IdxPooled), (long)(cached / L.Ratio) * d),
                 Queries = Download<float>(At(dev.IdxQ, (long)row0 * m.IdxHeads * d), (long)nt * m.IdxHeads * d),
                 Scores = Download<float>(At(dev.Scores, (long)row0 * ScoreStride), (long)nt * ScoreStride),

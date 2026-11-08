@@ -853,6 +853,51 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         }
     }
 
+    /// <summary>The resident KV window (TS_Q4E_KV_RESIDENT): a QSA layer's Q8_0 K/V lives in pinned host memory with a window
+    /// of pages in VRAM, its raw indexer keys in a ring. Asked for 1 cell, the window takes one call's floor (well under the
+    /// fixture's 1,024). A 600-token prompt read in 128-row ubatches (each layer staged from the host copy), 150 decode steps
+    /// whose selections move over the whole context (pages fetched over the bus, the window evicting), and a verify window
+    /// answer bit for bit as the resident caches.</summary>
+    [CudaFact]
+    public void AResidentKvWindow_AnswersBitForBitAsResidentCaches()
+    {
+        string path = Fixture(indexerTopK: 16);
+        int[] prompt = Enumerable.Range(0, 600).Select(i => (i * 37 + 11) % 250).ToArray();
+        int[] steps = Enumerable.Range(0, 150).Select(i => (i * 53 + 7) % 250).ToArray();
+        int[] window = { 5, 77, 123, 9 };
+        int vocab = Qwen4ExpSyntheticModelBuilder.Vocab;
+        KvCacheDtypeConfig.Set(KvCacheDtype.Q8_0);
+        _env.Set("TS_Q4E_UBATCH", "128");
+        (List<float[]> Rows, float[] Window, (long Misses, long Calls, long Overflows) Counters, int Cells, long Staged) Answer(string resident)
+        {
+            _env.Set("TS_Q4E_KV_RESIDENT", resident);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            var rows = new List<float[]> { (float[])model.ForwardRefill(prompt).Clone() };
+            foreach (int token in steps)
+                rows.Add((float[])model.Forward(new[] { token }).Clone());
+            var counters = engine.KvStreamCounters();
+            var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+            var all = new float[window.Length * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(window, null, all, true);
+            return (rows, all, counters, engine.KvWindowCells, engine.KvStagedBytes);
+        }
+        var resident = Answer("0");
+        var streamed = Answer("1");
+        _output.WriteLine($"window {streamed.Cells} cells; pages fetched {streamed.Counters.Misses} in {streamed.Counters.Calls} resolves, "
+            + $"{streamed.Counters.Overflows} overflowing; {streamed.Staged / 1048576.0:F1} MiB staged for the prompt");
+        Assert.Equal(0, resident.Cells);
+        Assert.True(streamed.Cells > 0 && streamed.Cells < 600, $"the window ({streamed.Cells} cells) does not stream the prompt");
+        Assert.True(streamed.Counters.Misses > 0, "no page was fetched over the bus");
+        Assert.Equal(0, streamed.Counters.Overflows);
+        Assert.True(streamed.Staged > 0, "no prompt ubatch was staged from the host copy");
+        for (int i = 0; i < resident.Rows.Count; i++)
+            Assert.True(streamed.Rows[i].AsSpan().SequenceEqual(resident.Rows[i]),
+                $"{(i == 0 ? "prefill" : $"decode {i}")}: the streamed caches changed the logits");
+        Assert.True(streamed.Window.AsSpan().SequenceEqual(resident.Window), "the streamed caches changed the verify window's logits");
+    }
+
     /// <summary>Adaptive residency (TS_MOE_TIER_ADAPT=1 under host experts): between decode steps the most-selected
     /// host experts trade places with the least-selected VRAM experts. The swaps keep every expert reachable, so a
     /// long decode keeps answering as the all-resident engine does within the host-compute tolerance.</summary>

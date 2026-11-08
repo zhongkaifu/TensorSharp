@@ -207,6 +207,12 @@ namespace TensorSharp.Cuda
             public Tensor BatchStatePtrs;
             public IntPtr BatchStatePinned;
 
+            /// <summary>The resident KV window's prompt staging pool (one layer's K/V at the full context), and the layer and
+            /// slot whose cells [0, KvStagedEnd) it holds.</summary>
+            public Tensor KvStageK, KvStageV, KvStageKs, KvStageVs;
+            public SlotLayer KvStagedFor;
+            public int KvStagedEnd;
+
             public IntPtr Stream => Alloc.Stream.Handle;
             public void MakeCurrent() => Alloc.Context.MakeCurrent();
         }
@@ -227,6 +233,8 @@ namespace TensorSharp.Cuda
             public Tensor PleHist;
             public readonly Qwen4ExpPleHistory PleTokens = new Qwen4ExpPleHistory();
             public readonly List<Tensor> Owned = new List<Tensor>();
+            /// <summary>Pinned host memory of the slot (streamed layers' K/V host copies).</summary>
+            public readonly List<IntPtr> HostOwned = new List<IntPtr>();
             /// <summary>The MTP block's KV (allocated on the slot's first draft), and the positions it holds.</summary>
             public SlotLayer Mtp;
             public int MtpPast;
@@ -237,6 +245,11 @@ namespace TensorSharp.Cuda
             public Tensor ConvState, Ssm;                    // Gated DeltaNet
             public Tensor KCache, VCache, IdxRaw, IdxPooled; // attention, QSA
             public Tensor KScale, VScale;                    // Q8_0 KV: one F16 scale per 32 cached values
+            /// <summary>A streamed layer's page map and host copy (TS_Q4E_KV_RESIDENT): KCache..VScale then hold the
+            /// window's slots; null when the layer's K/V is resident.</summary>
+            public KvStream Kv;
+            /// <summary>Cells IdxRaw holds as a ring (a streamed layer), or 0 (every cell).</summary>
+            public int IdxRing;
         }
 
         private readonly ModelDesc _m;
@@ -359,6 +372,7 @@ namespace TensorSharp.Cuda
 
             // ---- expert residency: one GPU that cannot hold every routed expert keeps the hottest in
             // VRAM slots and reads the rest from pinned host memory (Residency.cs) ----
+            PlanKvWindow();
             long nonExpertBytes = 0;
             for (int il = 0; il < m.NLayer; il++)
             {
@@ -368,6 +382,20 @@ namespace TensorSharp.Cuda
             }
             // The MTP block stays whole in VRAM (its experts included), with one sequence's draft KV and its scratch.
             nonExpertBytes += MtpDeviceBytes();
+            // TS_Q4E_LANES: sequences the plan leaves VRAM for (their caches and draft KV) beside the first, so concurrent
+            // requests get slots of their own instead of waiting for the first (expert slots pay for them).
+            int lanes = Math.Clamp(EnvInt("TS_Q4E_LANES", 1), 1, MaxBatchedDecodeRows);
+            if (lanes > 1)
+            {
+                long slotBytes = 0;
+                for (int il = 0; il < m.NLayer; il++)
+                    slotBytes += LayerCacheBytes(il);
+                if (m.Mtp != null)
+                    slotBytes += 2 * KvCacheBytes();
+                nonExpertBytes += (lanes - 1) * slotBytes;
+                Console.Error.WriteLine($"[q4e-cuda] {lanes} sequence lanes: {(lanes - 1) * slotBytes / 1073741824.0:F2} GiB of VRAM kept "
+                    + $"for the {lanes - 1} beside the first ({slotBytes / 1048576.0:F0} MiB each, TS_Q4E_LANES).");
+            }
             _residency = PlanResidency(useDevs, nonExpertBytes);
 
             // ---- placement: contiguous runs of layers, each device filled to the same share of
@@ -496,9 +524,12 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>One attention layer's K (or V) cache of one sequence at the full context, scales included.</summary>
-        private long KvCacheBytes()
+        private long KvCacheBytes() => KvCacheBytes(_m.NCtx);
+
+        /// <summary>One attention layer's K (or V) cache of <paramref name="cells"/> cells, scales included.</summary>
+        private long KvCacheBytes(long cells)
         {
-            long values = (long)_m.NCtx * _m.NKvHead * _m.HeadDim;
+            long values = cells * _m.NKvHead * _m.HeadDim;
             return _m.KvQ8 ? values + values / Q4eKernels.KvQ8Block * 2 : values * 2;
         }
 
@@ -512,9 +543,11 @@ namespace TensorSharp.Cuda
                 b += (long)(m.DConv - 1) * ConvDim * 4 + (long)m.GdnVHeads * Q4eKernels.GdnHeadDim * Q4eKernels.GdnHeadDim * 4;
             else
             {
-                b += 2 * KvCacheBytes();
+                // A streamed layer (TS_Q4E_KV_RESIDENT): the window, its map and the raw keys' ring.
+                bool streamed = KvStreamed(il);
+                b += streamed ? 2 * KvCacheBytes(_kvWindow) + KvMapBytes() : 2 * KvCacheBytes();
                 if (L.CompressRatio > 0)
-                    b += (long)m.NCtx * m.IdxDim * 2 + (long)(m.NCtx / L.CompressRatio) * m.IdxDim * 4;
+                    b += (long)(streamed ? _idxRing : m.NCtx) * m.IdxDim * 2 + (long)(m.NCtx / L.CompressRatio) * m.IdxDim * 4;
             }
             if (L.Ple)
                 b += (long)(m.PleConvKernel - 1) * m.PleDilation * m.Hc * m.NEmbd * 4;
@@ -534,6 +567,9 @@ namespace TensorSharp.Cuda
             b += nt * (long)(m.NCtx / 4 + m.IdxTopK + 4) * 4;
             b += CudaMoeScratch.Bytes(m.NUbatch, m.NExpertUsed, m.NEmbd, Math.Max(m.NFfExp, 1), m.NExpert);
             b += 3 * nt * (long)m.NFfShexp * 4;
+            // The resident KV window's prompt staging pool.
+            if (_kvWindow > 0)
+                b += 2 * KvCacheBytes();
             return b + (256L << 20);
         }
 

@@ -189,9 +189,12 @@ namespace TensorSharp.Cuda
             slot.Failed = false;
             AdaptResidency();
             if (_perf > 0)
-                Console.Error.WriteLine($"[q4e-cuda] verify {nt} rows in {System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds:F2} ms, "
-                    + $"host issue {IssueMs(start):F2} ms, {HostExpertMisses - missedBefore} experts on the CPU"
-                    + (_tailRank > 0 ? $", {TailSkipped - tailBefore} tail-skipped" : ""));
+            {
+                double ms = System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds, issue = IssueMs(start);
+                Console.Error.WriteLine($"[q4e-cuda] verify {nt} rows in {ms:F2} ms, "
+                    + $"host issue {issue:F2} ms, {HostExpertMisses - missedBefore} experts on the CPU"
+                    + (_tailRank > 0 ? $", {TailSkipped - tailBefore} tail-skipped" : "") + KvFetchedNote(slot, 32));
+            }
         }
 
         /// <summary>

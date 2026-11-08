@@ -73,6 +73,22 @@ namespace TensorSharp.Cuda
         /// <summary>Values per Q8_0 KV scale (Q4E_KV_Q8_BLOCK).</summary>
         public const int KvQ8Block = 32;
         private readonly IntPtr qsaStore, qsaPool, qsaQuery, qsaScores, qsaSelect;
+        // KV streaming (TS_Q4E_KV_RESIDENT; optional: a module before it keeps every layer's K/V resident).
+        private readonly IntPtr attnPrepQ8Paged, attentionQ8Paged, attentionSplitQ8Paged, kvResolve, kvPageCopy, kvInvalidate,
+            qsaStoreRing, qsaPoolRing;
+
+        /// <summary>Whether the module streams a Q8_0 attention layer's K/V through a window of VRAM pages
+        /// (<see cref="KvResolve"/> and the paged readers and writer), with the QSA raw keys in a ring.</summary>
+        public bool HasKvStreaming => attnPrepQ8Paged != IntPtr.Zero && attentionQ8Paged != IntPtr.Zero
+            && attentionSplitQ8Paged != IntPtr.Zero && kvResolve != IntPtr.Zero && kvPageCopy != IntPtr.Zero
+            && kvInvalidate != IntPtr.Zero && qsaStoreRing != IntPtr.Zero && qsaPoolRing != IntPtr.Zero;
+
+        /// <summary>Cells a streamed layer's residency page holds (Q4E_KV_PAGE).</summary>
+        public const int KvPage = 4;
+
+        /// <summary>Control words of a streamed layer's page map (Q4E_KV_CTL): [0] epoch, [1] hand, [2] the last call's
+        /// misses, [3] overflowing calls, [4] misses and [5] calls so far.</summary>
+        public const int KvCtlInts = 8;
         private readonly IntPtr pleGate, groupNorm, pleConv;
         private readonly IntPtr sharedGate, setStreamRows;
         // Each row's first-max token on the device (optional: a module before it returns logits to the host).
@@ -108,6 +124,22 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500) { attnPrepQ8 = attentionQ8 = IntPtr.Zero; }
             try { attentionSplit = module.GetFunction("ts_q4e_attention_split_f32"); attentionSplitQ8 = module.GetFunction("ts_q4e_attention_split_q8_f32"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { attentionSplit = attentionSplitQ8 = IntPtr.Zero; }
+            try
+            {
+                attnPrepQ8Paged = module.GetFunction("ts_q4e_attn_prep_q8_paged_f32");
+                attentionQ8Paged = module.GetFunction("ts_q4e_attention_q8_paged_f32");
+                attentionSplitQ8Paged = module.GetFunction("ts_q4e_attention_split_q8_paged_f32");
+                kvResolve = module.GetFunction("ts_q4e_kv_resolve");
+                kvPageCopy = module.GetFunction("ts_q4e_kv_page_copy");
+                kvInvalidate = module.GetFunction("ts_q4e_kv_invalidate");
+                qsaStoreRing = module.GetFunction("ts_q4e_qsa_store_ring_f32");
+                qsaPoolRing = module.GetFunction("ts_q4e_qsa_pool_ring_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                attnPrepQ8Paged = attentionQ8Paged = attentionSplitQ8Paged = kvResolve = kvPageCopy = kvInvalidate = IntPtr.Zero;
+                qsaStoreRing = qsaPoolRing = IntPtr.Zero;
+            }
             qsaStore = module.GetFunction("ts_q4e_qsa_store_f32");
             qsaPool = module.GetFunction("ts_q4e_qsa_pool_f32");
             qsaQuery = module.GetFunction("ts_q4e_qsa_query_f32");
@@ -381,6 +413,105 @@ namespace TensorSharp.Cuda
             }
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14 };
             Launch(attentionSplit, (uint)nHead, (uint)rows, (uint)splits, BlockSize, stream, args);
+        }
+
+        // ---- KV streaming (TS_Q4E_KV_RESIDENT) ----
+
+        /// <summary><see cref="AttnPrep"/> of a Q8_0 layer whose K/V streams: the host copy (device-mapped pointers) always,
+        /// the VRAM slot of a resident page through <paramref name="table"/>.</summary>
+        public void AttnPrepPaged(IntPtr qg, IntPtr k, IntPtr v, IntPtr qNorm, IntPtr kNorm, IntPtr q, IntPtr gate,
+            IntPtr kCache, IntPtr vCache, IntPtr kScale, IntPtr vScale, IntPtr positions, int p0, int nHead, int nKvHead, int nRot,
+            float ropeBase, float freqScale, float eps, int rows, IntPtr table, IntPtr hostK, IntPtr hostV, IntPtr hostKScale,
+            IntPtr hostVScale, IntPtr stream)
+        {
+            IntPtr a0 = qg, a1 = k, a2 = v, a3 = qNorm, a4 = kNorm, a5 = q, a6 = gate, a7 = kCache, a8 = vCache, a9 = kScale, a10 = vScale;
+            IntPtr a11 = positions; int a12 = p0, a13 = nHead, a14 = nKvHead, a15 = nRot;
+            float a16 = ropeBase, a17 = freqScale, a18 = eps;
+            IntPtr a19 = table, a20 = hostK, a21 = hostV, a22 = hostKScale, a23 = hostVScale;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15,
+                &a16, &a17, &a18, &a19, &a20, &a21, &a22, &a23 };
+            Launch(attnPrepQ8Paged, (uint)(nHead + nKvHead), (uint)rows, 1, AttnHeadDim, stream, args);
+        }
+
+        /// <summary><see cref="Attention"/> (Q8_0) of a streamed layer: cells read through <paramref name="table"/>.</summary>
+        public void AttentionPaged(IntPtr q, IntPtr kCache, IntPtr vCache, IntPtr kScale, IntPtr vScale, IntPtr gate, IntPtr cells,
+            IntPtr cellCnt, IntPtr output, IntPtr positions, int p0, int nHead, int nKvHead, float scale, int cellStride, int rows,
+            IntPtr table, IntPtr stream)
+        {
+            IntPtr a0 = q, a1 = kCache, a2 = vCache, a3 = kScale, a4 = vScale, a5 = gate, a6 = cells, a7 = cellCnt, a8 = output;
+            IntPtr a9 = positions; int a10 = p0, a11 = nHead, a12 = nKvHead; float a13 = scale; int a14 = cellStride;
+            IntPtr a15 = table;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15 };
+            Launch(attentionQ8Paged, (uint)nHead, (uint)rows, 1, BlockSize, stream, args);
+        }
+
+        /// <summary><see cref="AttentionSplit"/> (Q8_0) of a streamed layer: cells read through <paramref name="table"/>.</summary>
+        public void AttentionSplitPaged(IntPtr q, IntPtr kCache, IntPtr vCache, IntPtr kScale, IntPtr vScale, IntPtr gate, IntPtr cells,
+            IntPtr cellCnt, IntPtr output, IntPtr positions, int p0, int nHead, int nKvHead, float scale, int cellStride, int rows,
+            int splits, IntPtr part, IntPtr arrive, IntPtr table, IntPtr stream)
+        {
+            IntPtr a0 = q, a1 = kCache, a2 = vCache, a3 = kScale, a4 = vScale, a5 = gate, a6 = cells, a7 = cellCnt, a8 = output;
+            IntPtr a9 = positions; int a10 = p0, a11 = nHead, a12 = nKvHead; float a13 = scale; int a14 = cellStride;
+            IntPtr a15 = part, a16 = arrive, a17 = table;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15,
+                &a16, &a17 };
+            Launch(attentionSplitQ8Paged, (uint)nHead, (uint)rows, (uint)splits, BlockSize, stream, args);
+        }
+
+        /// <summary>Makes every page the call's rows read resident (their listed cells, or 0..p where
+        /// <paramref name="cellCnt"/> is zero or a row's count negative), claiming slots for the misses, which
+        /// <see cref="KvPageCopy"/> then fills. One block; capturable.</summary>
+        public void KvResolve(IntPtr cells, IntPtr cellCnt, IntPtr positions, int p0, int rows, int cellStride, IntPtr table,
+            IntPtr slotPage, IntPtr slotStamp, IntPtr ctl, IntPtr missPage, IntPtr missSlot, int nSlots, IntPtr stream)
+        {
+            IntPtr a0 = cellCnt == IntPtr.Zero ? IntPtr.Zero : cells, a1 = cellCnt, a2 = positions;
+            int a3 = p0, a4 = rows, a5 = cellStride;
+            IntPtr a6 = table, a7 = slotPage, a8 = slotStamp, a9 = ctl, a10 = missPage, a11 = missSlot;
+            int a12 = nSlots, a13 = nSlots;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13 };
+            Launch(kvResolve, 1, 1, 1, 1024, stream, args);
+        }
+
+        /// <summary>The pages the last <see cref="KvResolve"/> placed, copied from the host copy into their slots.</summary>
+        public void KvPageCopy(IntPtr ctl, IntPtr missPage, IntPtr missSlot, IntPtr hostK, IntPtr hostV, IntPtr hostKScale,
+            IntPtr hostVScale, IntPtr kCache, IntPtr vCache, IntPtr kScale, IntPtr vScale, int nKvHead, IntPtr stream)
+        {
+            IntPtr a0 = ctl, a1 = missPage, a2 = missSlot, a3 = hostK, a4 = hostV, a5 = hostKScale, a6 = hostVScale;
+            IntPtr a7 = kCache, a8 = vCache, a9 = kScale, a10 = vScale; int a11 = nKvHead;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11 };
+            Launch(kvPageCopy, 128, 1, 1, BlockSize, stream, args);
+        }
+
+        /// <summary>Pages [first, first + count) leave the window.</summary>
+        public void KvInvalidate(IntPtr table, IntPtr slotPage, int first, int count, IntPtr stream)
+        {
+            if (count <= 0)
+                return;
+            IntPtr a0 = table, a1 = slotPage; int a2 = first, a3 = count;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3 };
+            Launch(kvInvalidate, CeilDiv(count, BlockSize), 1, 1, BlockSize, stream, args);
+        }
+
+        /// <summary><see cref="QsaStore"/> into a ring of <paramref name="ring"/> cells.</summary>
+        public void QsaStoreRing(IntPtr raw, IntPtr cache, IntPtr positions, int p0, int d, int rows, int ring, IntPtr stream)
+        {
+            IntPtr a0 = raw, a1 = cache, a2 = positions;
+            int a3 = p0, a4 = d, a5 = ring;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
+            Launch(qsaStoreRing, (uint)rows, 1, 1, Math.Min(d, BlockSize), stream, args);
+        }
+
+        /// <summary><see cref="QsaPool"/> from a ring of <paramref name="ring"/> raw keys.</summary>
+        public void QsaPoolRing(IntPtr cache, IntPtr kNorm, IntPtr pooled, IntPtr positions, int first, int count, int ratio, int d,
+            int nRot, float ropeBase, float freqScale, float eps, int ring, IntPtr stream)
+        {
+            if (positions == IntPtr.Zero && count <= 0)
+                return;
+            IntPtr a0 = cache, a1 = kNorm, a2 = pooled, a3 = positions;
+            int a4 = first, a5 = ratio, a6 = d, a7 = nRot;
+            float a8 = ropeBase, a9 = freqScale, a10 = eps; int a11 = ring;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11 };
+            Launch(qsaPoolRing, positions == IntPtr.Zero ? (uint)count : 1u, 1, 1, d, stream, args);
         }
 
         private void RequireKvQ8()

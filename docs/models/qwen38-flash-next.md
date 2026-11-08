@@ -1467,6 +1467,33 @@ storing them once (4.81 -> 4.74 us, inside the noise). A tensor-core verify atte
 read of each KV head's cells) is not built: a decode step would have to run the same kernel for its row to stay equal
 to a verify row, and the split kernel's 33 us for 4 QSA rows is about 0.4 ms of a window.
 
+#### A resident KV window, 2026-11-08
+
+At a 131K context one sequence's attention caches and QSA indexer keys take 2.3 GB of the RTX 5090's 32 GB (Q8_0
+K/V 1.7 GB, raw keys 0.4, pooled keys 0.2) - about 1,700 expert slots. Strata keeps 32K cells of each attention
+layer resident and the rest in host memory (`--kv-resident 32768`); `TS_Q4E_KV_RESIDENT` does the same for the direct
+engine's QSA layers (Q8_0 KV only):
+
+- The authoritative K/V of the whole context lives in pinned, device-mapped host memory in the usual layout; VRAM
+  holds a window of 4-cell pages and a page table (page -> slot).
+- A decode step or verify window (up to 16 rows) reads at most 16 x 2,051 cells a layer: before its attention, one
+  block makes every page it reads resident - hits stamped, misses given slots no page of this call uses (round robin) -
+  and a copy kernel reads the misses over the bus. Both run inside the captured step. The window holds at least one
+  such call's pages (32,960 cells; a smaller request is raised to it).
+- The K/V writer stores each new cell into the host copy and, when its page is resident, into the page's slot, so a
+  slot never goes stale (a rejected draft's cells are simply written again).
+- A prompt reads whole contexts: each layer runs on a staging pool of the full context (one per GPU, 143 MB at 131K,
+  shared by the layers in turn), filled from the host copy once per layer and prompt group; the ubatch's new cells go
+  back to the host copy by DMA and leave the window.
+- The raw indexer keys become a ring of a ubatch plus two blocks (a block's raw keys are read only to pool it); the
+  pooled keys stay whole, since every step scores every block.
+
+The readers go through the page table with the resident kernels' arithmetic, cell for cell, so a streamed layer
+answers bit for bit as a resident one (`AResidentKvWindow_AnswersBitForBitAsResidentCaches`: a 600-token prompt in
+128-row ubatches, 150 decode steps whose selections move over the whole context and a verify window, through a
+448-cell window, against resident caches). `0` (the default until the commit after this one) keeps every layer
+resident.
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
