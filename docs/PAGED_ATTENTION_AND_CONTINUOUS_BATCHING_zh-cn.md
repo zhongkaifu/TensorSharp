@@ -356,6 +356,11 @@ Qwen 3.8 Flash Next、GLM 5.x、DeepSeek V4 / V4.1）的复用止于第一张图
 比 7 GB 与内存 15% 中的较大者少了多少，前缀缓存在接纳请求之前、保留一个状态之后，按从旧到新、不动公共前缀的顺序，淘汰同样多字节的
 保留状态（`IPrefixCacheModel.QueryHostMemoryDeficitBytes`）。克隆与 holder 池所依据的主机空余量也按同样的规则约束。其他平台不受影响。
 
+权重以映射方式加载时，这个数字看不到 GPU 工作集已满：映射文件的干净页被算作可用。因此 `ggml_metal` 上的 Qwen 3.8 Flash Next
+还会报告：释放空闲的计算图 arena 之后，工作集在保留余量之外还差多少才能放下再一个请求的状态；缺口取两者中的较大者。
+在 Strata 的并发轮次中，一个请求在三个已结束会话仍被保留的情况下连续 42 s 拿不到 holder，随后改走没有准入检查的主缓存，
+GPU 内存耗尽；现在会先淘汰这些保留的 holder。
+
 `TS_SCHED_PREFIX_CACHE=0` 关闭复用；`--no-prefix-cache`（CLI 与服务端）会设置它，并同时跳过共享 system /
 工具前缀的启动预热，以及服务端的检查点文件。`--spec` 不会关闭前缀缓存。（Radix 之前的块哈希共享及其各自独立的
 复用路径已被移除；设置 `TS_PREFIX_CACHE_MODE` 会报错。）

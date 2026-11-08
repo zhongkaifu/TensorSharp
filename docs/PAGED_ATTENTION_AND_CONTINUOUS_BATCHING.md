@@ -435,6 +435,14 @@ prefixes, before it admits a request and after it keeps one
 (`IPrefixCacheModel.QueryHostMemoryDeficitBytes`). The host spare that clones and
 holder pools are sized against is bounded the same way. Elsewhere nothing changes.
 
+That figure cannot see a full GPU working set when the weights are mapped: their clean
+file pages count as available. Qwen 3.8 Flash Next on `ggml_metal` therefore also
+reports what the working set lacks for one more request's state beside its headroom,
+after the idle graph arenas are released, and the deficit is the larger of the two.
+Under Strata's concurrency rounds a request was refused a holder for 42 s while three
+finished conversations stayed retained, then ran on the primary cache, which has no
+admission check, and the GPU ran out of memory; now the retained holders go first.
+
 `TS_SCHED_PREFIX_CACHE=0` disables reuse; `--no-prefix-cache` (CLI and server)
 sets it and also skips the startup warm-up of the shared system/tool prefix and, on
 the server, the checkpoint files. `--spec` leaves the prefix cache on. (The pre-Radix
