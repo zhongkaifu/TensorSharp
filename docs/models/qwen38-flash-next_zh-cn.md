@@ -633,6 +633,14 @@ llama-bench 的双 GPU 运行只有 210.74 / 41.99，远低于同一台机器上
   内存总量不超过内存的 65%；窗口槽位只能用分层之后工作集剩下的部分；保留的 KV 也按同样的方式受限。
   在 48 GB Mac 上跑 `Q2_0` 时，这意味着 23-26 GB 的分层（覆盖 97.6-99% 的已记录路由），之前会让
   Metal 内存耗尽的长提示词场景，现在普通模式和 MTP 模式都能通过。
+- **分层之外还要放什么。** 计划为临时缓冲预留约 3 GB，但一个 4K token 提示词 span 的 arena 就要
+  3-5 GB，每个并发请求的状态（K/V、索引键、递归状态）在 32K 上下文时约 1.1 GB，空闲的图槽位还会保留
+  上一次的 arena。Strata 的基准（会思考的 16K token 提示词，之后是四个并发请求）让 48 GB Mac 从 14 GB
+  空闲降到 2.2 GB，Metal 内存耗尽。现在：512 MB 及以上的图 arena 如果在释放保留的 arena 之后仍会让空闲
+  低于 max(1 GB, 工作集的 1/32)，就会被拒绝，提示词改为分两半处理（`[ts] a 2.89 GB graph arena does not
+  fit ...`）；新的并发请求如果状态放不下，就等待某个运行中的请求结束（`SequenceSlotUnavailableException`，
+  "The model has no device slot for another concurrent request"）。同样的流程随后完整跑通：引擎基准、
+  Strata 的请求包、12/12 sanity、三轮四路并发。
 
 在同一个文件上并排比较（`eng/qwen38-engine-bench.py`，贪心解码，重复 3 次），除了命中缓存的
 后续轮次外，Strata（github.com/Niko1221/Strata `146df3c4`）在各项上都更快：

@@ -202,6 +202,7 @@
     <ReferenceNativeSymbol Include="TSGgml_HasBackendFailure" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasResidentDeviceCopy" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostAvailableMemoryBytes" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ReleaseKeptArenas" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoRegister" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoSetBudget" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoStats" SymbolType="Function" />

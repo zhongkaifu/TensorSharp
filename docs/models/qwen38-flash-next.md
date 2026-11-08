@@ -976,6 +976,17 @@ small experts let the tier plan fill every byte it was given.
   set; retained KV is bounded the same way. On the 48 GB Mac with `Q2_0` that is a 23-26 GB
   tier (97.6-99% of the profiled routes), and the long-prompt scenarios that ran Metal out
   of memory before now pass, plain and with the MTP head.
+- **What runs beside the tier.** The plan sets ~3 GB aside for scratch, but a 4K-token prompt
+  span's arena alone is 3-5 GB, each concurrent request's state (K/V, indexer keys, recurrent
+  state) ~1.1 GB at a 32K context, and idle graph slots keep their last arena. Strata's
+  benchmark (16K-token prompts that think, then four concurrent requests) took a 48 GB Mac from
+  14 GB free to 2.2 GB and Metal out of memory. Now a graph arena of 512 MB or more that would not
+  leave max(1 GB, 1/32 of the working set) free is refused after the kept arenas are released,
+  so the prompt runs in halves (`[ts] a 2.89 GB graph arena does not fit ...`); and a new
+  concurrent request whose state would not fit waits for a running one to finish
+  (`SequenceSlotUnavailableException`, "The model has no device slot for another concurrent
+  request"). The same sequence then ran clean: the engine benchmark, Strata's bundle, 12/12
+  sanity, three four-request rounds.
 
 Side by side on the same file (`eng/qwen38-engine-bench.py`, greedy, 3 repeats), Strata
 (github.com/Niko1221/Strata `146df3c4`) was faster everywhere but on cached follow-ups:

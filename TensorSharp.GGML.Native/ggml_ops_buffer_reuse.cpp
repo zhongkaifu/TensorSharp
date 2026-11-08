@@ -12,11 +12,23 @@
 // kept buffer is not wastefully large, so a decode graph does not hold a prompt's arena idle. A new buffer gets a
 // quarter of headroom, so a window that grows by a chunk usually still fits. What it hands out are the backend's own
 // buffers (same type, same context, same interface but for the free), so every backend path sees an ordinary buffer.
+//
+// On Metal it also refuses a prompt-sized buffer that would not fit. Metal allocates past its working set without
+// complaint and fails the command buffer that touches the memory instead (kIOGPUCommandBufferCallbackErrorOutOfMemory),
+// which no later graph recovers from. Flash Next on a 48 GB M5 Pro left ~14 GB of a 38.3 GB working set beside its
+// expert tier; Strata's benchmark (16K-token prompts that think for 512 tokens) brought that to 2.2 GB, and the next
+// 16K prompt's arena (4-5 GB) took the server down. So before a new buffer of 512 MB or more is made, the working set
+// must hold it and a headroom: the kept arenas of every reusing type go first, then the quarter of headroom, and when
+// it still does not fit the allocation fails. The span builders report that as "failed to allocate graph tensors" and
+// prefill the prompt again in halves (Qwen4ExpModel.ForwardInSpans), as a failed allocation on CUDA always did.
 #include "ggml_ops_internal.h"
 #include "ggml-backend-impl.h"
 
+#include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace tsg
 {
@@ -36,10 +48,49 @@ namespace tsg
         // Handed-out buffer (its context, the inner buffer's) -> the inner buffer and its type.
         struct Handed { ggml_backend_buffer_t inner; ReuseBufferType* type; };
         std::unordered_map<void*, Handed> g_handed;
+        // Every live type, so a buffer that does not fit can take the others' kept arenas first.
+        std::unordered_set<ReuseBufferType*> g_types;
+
+        // Free working set on a Metal device, or false elsewhere (a CUDA allocation that does not fit fails by itself).
+        bool metal_free_bytes(ggml_backend_buffer_type_t inner, std::size_t& free_bytes, std::size_t& total_bytes)
+        {
+            ggml_backend_dev_t dev = inner != nullptr ? inner->device : nullptr;
+            if (dev == nullptr) return false;
+            const char* name = ggml_backend_dev_name(dev);
+            if (name == nullptr || std::strncmp(name, "MTL", 3) != 0) return false;
+            free_bytes = 0; total_bytes = 0;
+            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            return total_bytes > 0;
+        }
+
+        // Frees every reusing type's kept arena (the next allocation of a type makes its own again); the bytes freed.
+        long long release_kept_arenas()
+        {
+            std::vector<ggml_backend_buffer_t> idle;
+            long long bytes = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_reuse_mu);
+                for (ReuseBufferType* t : g_types)
+                    if (t->kept != nullptr)
+                    {
+                        bytes += (long long)ggml_backend_buffer_get_size(t->kept);
+                        idle.push_back(t->kept);
+                        t->kept = nullptr;
+                    }
+            }
+            for (ggml_backend_buffer_t b : idle) ggml_backend_buffer_free(b);
+            return bytes;
+        }
+
+        // What a new buffer must leave free: command buffers and the driver allocate beside the graphs.
+        std::size_t metal_headroom(std::size_t total_bytes)
+        {
+            return std::max<std::size_t>(std::size_t(1) << 30, total_bytes / 32);
+        }
 
         void reuse_free_locked(ReuseBufferType* type)
         {
-            if (type->released && type->live == 0 && type->kept == nullptr) delete type;
+            if (type->released && type->live == 0 && type->kept == nullptr) { g_types.erase(type); delete type; }
         }
 
         void reuse_buffer_free(ggml_backend_buffer_t buffer)
@@ -106,9 +157,40 @@ namespace tsg
             const std::size_t max = ggml_backend_buft_get_max_size(type->inner);
             std::size_t want = size + size / 4;
             if (want > max) want = size;
+            std::size_t free_bytes = 0, total_bytes = 0;
+            if (size >= kLargeRequest && metal_free_bytes(type->inner, free_bytes, total_bytes))
+            {
+                const std::size_t headroom = metal_headroom(total_bytes);
+                if (free_bytes < want + headroom)
+                {
+                    // Every idle kept arena goes before this one is refused.
+                    release_kept_arenas();
+                    metal_free_bytes(type->inner, free_bytes, total_bytes);
+                    if (free_bytes < want + headroom) want = size;
+                    if (free_bytes < size + headroom)
+                    {
+                        std::fprintf(stderr, "[ts] a %.2f GB graph arena does not fit the Metal working set (%.2f GB free of "
+                                     "%.2f GB, %.2f GB kept free); the graph is refused so it runs in smaller pieces.\n",
+                                     size / 1e9, free_bytes / 1e9, total_bytes / 1e9, headroom / 1e9);
+                        return nullptr;
+                    }
+                }
+            }
             ggml_backend_buffer_t inner = ggml_backend_buft_alloc_buffer(type->inner, want);
             if (inner == nullptr && want != size) inner = ggml_backend_buft_alloc_buffer(type->inner, size);
             if (inner == nullptr) return nullptr;
+            if (vram_log_enabled())
+            {
+                std::size_t f = 0, t = 0, kept_total = 0;
+                metal_free_bytes(type->inner, f, t);
+                {
+                    std::lock_guard<std::mutex> lock(g_reuse_mu);
+                    for (ReuseBufferType* k : g_types) if (k->kept) kept_total += ggml_backend_buffer_get_size(k->kept);
+                }
+                std::fprintf(stderr, "[TSVRAM] reuse-arena %p %10.1f MB (asked %.1f) | kept %.1f MB | dev free %.1f / %.1f MB\n",
+                             (void*)type, ggml_backend_buffer_get_size(inner) / 1048576.0, size / 1048576.0,
+                             kept_total / 1048576.0, f / 1048576.0, t / 1048576.0);
+            }
             std::lock_guard<std::mutex> lock(g_reuse_mu);
             ggml_backend_buffer_t outer = hand_out(type, inner);
             if (outer == nullptr) ggml_backend_buffer_free(inner);
@@ -129,6 +211,10 @@ namespace tsg
         if (inner == nullptr) return nullptr;
         auto* type = new ReuseBufferType();
         type->inner = inner;
+        {
+            std::lock_guard<std::mutex> lock(g_reuse_mu);
+            g_types.insert(type);
+        }
         type->buft.iface = {};
         type->buft.iface.get_name = reuse_get_name;
         type->buft.iface.alloc_buffer = reuse_alloc_buffer;
@@ -165,4 +251,11 @@ namespace tsg
         type->released = true;
         reuse_free_locked(type);
     }
+}
+
+// Frees the idle arenas every graph slot keeps for its next build (tsg::ReuseBufferType) and returns the bytes freed:
+// what a caller that is about to need device memory (a concurrent request's state on Metal) can get back first.
+TSG_EXPORT long long TSGgml_ReleaseKeptArenas()
+{
+    return tsg::release_kept_arenas();
 }

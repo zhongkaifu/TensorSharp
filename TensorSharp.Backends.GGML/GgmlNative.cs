@@ -4670,6 +4670,8 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static partial long TSGgml_HostAvailableMemoryBytes();
         [LibraryImport(DllName)]
+        internal static partial long TSGgml_ReleaseKeptArenas();
+        [LibraryImport(DllName)]
         internal static unsafe partial int TSGgml_MoeOffloadCounters(long* output, int capacity);
         [LibraryImport(DllName)]
         internal static unsafe partial int TSGgml_HostExpertRows(IntPtr gate, IntPtr up, IntPtr down,

@@ -3654,6 +3654,14 @@ namespace TensorSharp.GGML
         /// purgeable and clean file-cache pages); -1 where it is not measured.</summary>
         public static long HostAvailableMemoryBytes() => GgmlNative.TSGgml_HostAvailableMemoryBytes();
 
+        /// <summary>Frees the idle arenas the graph slots keep for their next build (Metal) and returns the bytes freed;
+        /// 0 when there were none or the native library predates the export.</summary>
+        public static long ReleaseKeptArenas()
+        {
+            try { return GgmlNative.TSGgml_ReleaseKeptArenas(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         /// <summary>Process totals of MoE expert offload (TSGgml_MoeOffloadCounters): tier hits, window reads, host
         /// overflow routes, background reads, adaptive swaps, host kernel ns, host kernel calls, host-computed slots,
         /// explicit expert I/O bytes. Monotonic; touches no backend.</summary>
