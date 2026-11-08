@@ -1362,6 +1362,27 @@ Folding it into the fused MTP graph is the next step.
   `thinking_budget`), and a bare `</think>` left Qwen3.5-9B reasoning on inside
   its answer. Qwen3.5-9B IQ4_XS on Metal, `max_tokens` 600, two concurrent
   three-turn conversations: 0/2 passed before (empty answers), 2/2 after.
+- **Reasoning that ends without an answer** (issue #338). Qwen3.8-27B NVFP4
+  under Aider ended 3 of 53 turns on a stop token in the middle of its
+  reasoning: each had settled into a counting loop (`Need maybe tests expect
+  to_string for 1:1533 -> 02:33. Good.`, then `1:1534`, for thousands of
+  tokens), and an OpenAI client received an empty `stop`. Three changes, for
+  every family with a trained closing token, whatever `TS_THINKING_BUDGET` is:
+  - a stop token drawn while the reasoning is open closes it instead - the
+    hand-over sentence, then `</think>` - and the model answers
+    (`ThinkingTokenBudget.CloseOnStop`, applied where every token is drawn:
+    host sampling, the device-argmax stash and each speculative verify row);
+  - reasoning that repeats a templated line 32 times in a row (digit runs
+    folded, up to a fifth of the line changed, so `twenty-nine` to `thirty`
+    still repeats: `ReasoningLoopDetector`) is closed the same way. Templated
+    lines in the answer are never touched;
+  - a turn that still ends with reasoning and no answer (a family without a
+    closing token) reports `thinking_budget`, which clients see as `length`.
+
+  On Qwen3.8-27B UD-IQ3_XXS (Metal), the issue's loop primed into the
+  reasoning was carried on by the model and closed after 32 generated lines,
+  and the answer was right (`02:33`); a stand-in stop mid-reasoning was closed
+  and answered `391` for 17 x 23.
 
 ## 13a. Tensor parallelism
 

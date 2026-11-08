@@ -41,8 +41,10 @@ namespace TensorSharp.Server.ProtocolAdapters
         public const string PipelineMaxTokens = "max_tokens";
 
         /// <summary>
-        /// The turn was stopped because reasoning consumed its thinking allowance. Maps
-        /// to the same client-visible "length" as running out of tokens, because from
+        /// The turn was stopped because reasoning consumed its thinking allowance, or the
+        /// model ended it with reasoning and no answer (a stop token inside the reasoning
+        /// of a family the sampler cannot close: ChatGenerationPipeline.IsAnswerlessReasoning).
+        /// Maps to the same client-visible "length" as running out of tokens, because from
         /// the caller's side it IS a length stop — the difference is only that it was
         /// caught early enough to say why.
         /// </summary>

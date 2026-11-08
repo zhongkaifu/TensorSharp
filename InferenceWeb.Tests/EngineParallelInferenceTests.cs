@@ -74,6 +74,11 @@ public class EngineParallelInferenceTests
             ModelPatterns: new[] { "Qwen3.6-35B-A3B-UD-IQ2_XXS", "Qwen3.6-35B-A3B" },
             ExcludePatterns: new[] { "mmproj" },
             MmprojPatterns: new[] { "Qwen3.6-35B-A3B-mmproj" }),
+        // Qwen3.8-27B (the qwen35 architecture), the family of issue #338.
+        ["qwen38"] = new ModelManifest(
+            ModelPatterns: new[] { "Qwen3.8-27B-UD-IQ3_XXS", "Qwen3.8-27B-" },
+            ExcludePatterns: new[] { "mmproj", "DFlash", "MTP" },
+            MmprojPatterns: null),
         ["nemotron3"] = new ModelManifest(
             ModelPatterns: new[] { "Nemotron-3-Nano-Omni" },
             ExcludePatterns: new[] { "mmproj" },
@@ -1017,6 +1022,92 @@ public class EngineParallelInferenceTests
         string[] ModelPatterns,
         string[] MmprojPatterns,
         string[] ExcludePatterns = null);
+
+    // ---- Issue #338: reasoning that would end without an answer ------------------------------------
+
+    /// <summary>
+    /// A stop drawn inside the reasoning closes it - Qwen's hand-over sentence, then &lt;/think&gt; -
+    /// and the model answers, on a real model through the engine's own draw paths. A real stop
+    /// mid-reasoning (3 of 53 Aider turns on the NVFP4 build) is not reproducible, so the policy's stop
+    /// test also matches the reasoning's second full stop, a token the model is certain to draw.
+    /// </summary>
+    [ParallelModelFact("qwen38")]
+    public async Task Qwen38_AStopInsideReasoning_ClosesIt_ThenTheModelAnswers()
+    {
+        using var ctx = Load("qwen38");
+        var tokenizer = ctx.Model.Tokenizer;
+        int stops = 0;
+        SamplingConfig sampling = ReasoningPolicy(ctx, "What is 17 * 23? Think it through, then give the number.",
+            null, out List<int> prompt, stop => t => stop(t) || (tokenizer.Decode(new List<int> { t }).Contains('.') && ++stops == 2));
+        var (text, finish) = await Generate(ctx, prompt, sampling, 768);
+        _output.WriteLine(text);
+        int close = text.IndexOf("Considering the limited time", StringComparison.Ordinal);
+        Assert.True(close >= 0, "the reasoning was not closed with the hand-over text");
+        int end = text.IndexOf("</think>", close, StringComparison.Ordinal);
+        Assert.True(end > close, "no </think> after the hand-over text");
+        Assert.Contains("391", text.Substring(end));
+        Assert.Equal("eos", finish);
+    }
+
+    /// <summary>
+    /// Issue #338's loop on a real model: the reasoning is primed with the counting lines the issue
+    /// logged (<c>Need maybe tests expect to_string for 1:1533 -> 02:33. Good.</c>, the number going up
+    /// by one a line), the model carries the count on, and the run is closed at
+    /// <see cref="ReasoningLoopDetector.MinLines"/> generated lines; the model then answers.
+    /// </summary>
+    [ParallelModelFact("qwen38")]
+    public async Task Qwen38_ACountingLoopInTheReasoning_IsClosed_ThenTheModelAnswers()
+    {
+        using var ctx = Load("qwen38");
+        var primed = new System.Text.StringBuilder("The clock normalizes minutes past the hour. Need check the tests.\n");
+        for (int k = 0; k < 12; k++)
+        {
+            int total = 60 + 1500 + k;
+            primed.Append($"Need maybe tests expect to_string for 1:{1500 + k} -> {total / 60 % 24:00}:{total % 60:00}. Good.\n");
+        }
+        SamplingConfig sampling = ReasoningPolicy(ctx,
+            "A 24-hour clock is set to 1:00 and then 1533 minutes are added (it is written 1:1533). What time does it show? Answer as HH:MM.",
+            primed.ToString(), out List<int> prompt, stop => stop);
+        var (text, finish) = await Generate(ctx, prompt, sampling, 2048);
+        _output.WriteLine(text);
+        int close = text.IndexOf("Considering the limited time", StringComparison.Ordinal);
+        Assert.True(close >= 0, "the counting loop was not closed");
+        int counted = System.Text.RegularExpressions.Regex.Matches(text.Substring(0, close), @"to_string for 1:\d+ ->").Count;
+        Assert.InRange(counted, ReasoningLoopDetector.MinLines - 2, ReasoningLoopDetector.MinLines + 2);
+        string answer = text.Substring(text.IndexOf("</think>", close, StringComparison.Ordinal));
+        Assert.Contains("02:33", answer);
+        Assert.Equal("eos", finish);
+    }
+
+    private static SamplingConfig ReasoningPolicy(EngineContext ctx, string question, string primedReasoning,
+        out List<int> prompt, Func<Func<int, bool>, Func<int, bool>> stopTest)
+    {
+        string arch = ctx.Model.Config?.Architecture ?? string.Empty;
+        var history = new List<ChatMessage> { new() { Role = "user", Content = question } };
+        prompt = ctx.Renderer.RenderToTokens(ctx.Model.Tokenizer, ctx.Model.Config?.ChatTemplate, history, arch,
+            addGenerationPrompt: true, out _, out _, tools: null, enableThinking: true);
+        // Reasoning the model is made to have written already: the generation prompt opened <think>.
+        if (primedReasoning != null)
+            prompt.AddRange(ctx.Model.Tokenizer.Encode(primedReasoning, addSpecial: false));
+        // The server's policy for this request (no cap), with the stop test the caller wraps.
+        SamplingConfig config = TensorSharp.Server.ChatGenerationPipeline.WithThinkingBudget(SamplingConfig.Greedy,
+            ctx.Model.Tokenizer, arch, 0, out bool installed, enableThinking: true, promptTokens: prompt);
+        Assert.True(installed);
+        var b = config.ThinkingBudget!;
+        config.ThinkingBudget = new ThinkingTokenBudget(b.TokenLimit, b.EndTokenId, b.CloseOnRepetition, b.OpenTokenId,
+            b.OpenAtStart, b.SuppressUnopenedEnd, b.CloseAtBoundary, b.ClosingTokenIds, stopTest(b.CloseOnStop!));
+        return config;
+    }
+
+    private static async Task<(string Text, string Finish)> Generate(EngineContext ctx, List<int> prompt,
+        SamplingConfig sampling, int maxNewTokens)
+    {
+        var seq = new SequenceState("reasoning-" + Guid.NewGuid().ToString("N"), prompt, maxNewTokens, ctx.BlockSize, sampling);
+        var handle = ctx.Engine.SubmitRequest(seq);
+        var output = await DrainHandle(handle);
+        var completion = await handle.Completion;
+        return (ctx.Model.Tokenizer.Decode(output), completion.FinishReason);
+    }
 
     private sealed class RequestResult
     {

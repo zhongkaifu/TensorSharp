@@ -2504,7 +2504,7 @@ namespace TensorSharp.Runtime.Scheduling
             // the stream toward the drafts), otherwise sampled as usual.
             if (ctx.PendingNextToken >= 0)
             {
-                sampledToken = ctx.PendingNextToken;
+                sampledToken = PendingVerifyDraw(seq, ctx.PendingNextToken);
                 ctx.PendingNextToken = -1;
                 seq.PendingDeviceToken = null;   // the same draw, published for the plain paths; consumed here
             }
@@ -2582,6 +2582,8 @@ namespace TensorSharp.Runtime.Scheduling
                     // Keep this check per row, AFTER onDraftAccepted updated the
                     // committed history, exactly as TokenSampler.Sample does.
                     if (!penaltySampler.TryGetForcedThinkingToken(seq.OutputTokens, out int forced))
+                        forced = penaltySampler.CloseInsteadOfStop(seq.OutputTokens, drawn);
+                    if (forced == drawn)
                         return drawn;
                     if ((uint)forced >= (uint)_model.Config.VocabSize)
                         throw new InvalidOperationException("Thinking end token is outside the model vocabulary.");
@@ -2765,7 +2767,7 @@ namespace TensorSharp.Runtime.Scheduling
             for (int i = 0; i < n; i++)
             {
                 var seq = decodeWork[i].Sequence;
-                peeked[i] = ctxs[i].PendingNextToken >= 0 ? ctxs[i].PendingNextToken : PeekPendingOrSample(seq);
+                peeked[i] = ctxs[i].PendingNextToken >= 0 ? PendingVerifyDraw(seq, ctxs[i].PendingNextToken) : PeekPendingOrSample(seq);
                 if (IsStop(peeked[i]) || seq.OutputTokens.Count + 1 >= seq.MaxNewTokens)
                     (ending ??= new()).Add((seq, ctxs[i], peeked[i]));
             }
@@ -2905,9 +2907,21 @@ namespace TensorSharp.Runtime.Scheduling
             long verifyTicks = verified - started;
 
             // Accept per sequence exactly as the solo step does: a draft is kept while
-            // it equals its row's draw, and nothing is accepted past a stop.
+            // it equals its row's draw, and nothing is accepted past a stop. A row's draw
+            // is what the solo step's drawGreedy returns: a forced reasoning-close token
+            // over the device argmax, and a stop inside open reasoning turned into one.
+            int RowDraw(SequenceState seq, int raw)
+            {
+                var sampler = seq.GetOrCreateSampler();
+                if (!sampler.TryGetForcedThinkingToken(seq.OutputTokens, out int row))
+                    row = sampler.CloseInsteadOfStop(seq.OutputTokens, raw);
+                if (row != raw && (uint)row >= (uint)_model.Config.VocabSize)
+                    throw new InvalidOperationException("Thinking end token is outside the model vocabulary.");
+                return row;
+            }
             var kept = new int[n];
             var accepted = new List<int>[n];
+            var nexts = new int[n];
             for (int i = 0; i < n; i++)
             {
                 var seq = decodeWork[i].Sequence;
@@ -2926,7 +2940,7 @@ namespace TensorSharp.Runtime.Scheduling
                 bool stopped = IsStop(anchors[i]);
                 var acc = new List<int>();
                 int m = 0;
-                while (!stopped && m < drafts[i].Count && drawn[i * window + m] == drafts[i][m])
+                while (!stopped && m < drafts[i].Count && RowDraw(seq, drawn[i * window + m]) == drafts[i][m])
                 {
                     int d = drafts[i][m];
                     seq.AppendOutputToken(d);
@@ -2938,6 +2952,7 @@ namespace TensorSharp.Runtime.Scheduling
                 }
                 kept[i] = m + 1;
                 accepted[i] = acc;
+                nexts[i] = RowDraw(seq, drawn[i * window + m]);
             }
 
             batched.CommitBatchedSpecVerify(requestIds, positions, kept);
@@ -2952,7 +2967,7 @@ namespace TensorSharp.Runtime.Scheduling
                 batched.BindDraftState(seq.RequestId);
                 ctx.Exec.CommitBatch(anchors[i], positions[i], drafts[i], m,
                     _batchedSpecFeatures, (long)i * window * feat, verifyTicks / n);
-                int next = drawn[i * window + m];
+                int next = nexts[i];
                 seq.LastLogits = null;
                 seq.AdvanceComputedTokens(kept[i]);
                 ctx.NextPosition = positions[i] + kept[i];
@@ -3554,6 +3569,8 @@ namespace TensorSharp.Runtime.Scheduling
                 seq.PendingDeviceToken = null;
                 if (seq.PendingDevicePosition == seq.NumComputedTokens)
                 {
+                    // A device draw meets the same reasoning-close rule as a host sample.
+                    t = seq.GetOrCreateSampler().CloseInsteadOfStop(seq.OutputTokens, t);
                     dump?.Complete(t, "device-pending");
                     return t;
                 }
@@ -3584,8 +3601,10 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 if (seq.PendingDevicePosition == seq.NumComputedTokens)
                 {
-                    dump?.Complete(seq.PendingDeviceToken.Value, "device-pending");
-                    return seq.PendingDeviceToken.Value;
+                    // The close it may start is history-derived, so a later Take repeats it.
+                    int t = seq.GetOrCreateSampler().CloseInsteadOfStop(seq.OutputTokens, seq.PendingDeviceToken.Value);
+                    dump?.Complete(t, "device-pending");
+                    return t;
                 }
                 seq.PendingDeviceToken = null;   // stale: position moved under it
             }
@@ -3593,6 +3612,13 @@ namespace TensorSharp.Runtime.Scheduling
             dump?.Complete(sampled, "sampled");
             return sampled;
         }
+
+        /// <summary>The token the previous verify drew for this position, unless a reasoning close
+        /// requested since (the repetition guard, the templated-loop detector: both ask after the
+        /// step) forces another. The draw was never forwarded, so replacing it is free, and the close
+        /// then writes its whole hand-over text rather than starting after a token that left it.</summary>
+        private static int PendingVerifyDraw(SequenceState seq, int pending)
+            => seq.GetOrCreateSampler().TryGetForcedThinkingToken(seq.OutputTokens, out int forced) ? forced : pending;
 
         /// <summary>Draws the first output token of a sequence whose prompt has just been
         /// prefilled, so the engine can stream it before the step that forwards it. The draw

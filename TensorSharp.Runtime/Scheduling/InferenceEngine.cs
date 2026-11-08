@@ -35,6 +35,8 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly IModelArchitecture _model;
         private readonly ILogger _logger;
         private readonly bool _stopRepetition;
+        // One emitted token's bytes for ReasoningLoopDetector (engine thread only).
+        private readonly List<byte> _loopBytes = new();
         private readonly int _nativeSlotContextLimit;
         // The model's context window (MAX_CONTEXT), or 0 when it advertises none. A request
         // must leave its prompt one token of room and stops generating where it ends.
@@ -972,6 +974,28 @@ namespace TensorSharp.Runtime.Scheduling
                     // because the executor appended the whole batch up front.
                     int baseCount = seq.OutputTokens.Count - totalNew;
 
+                    // A stop the sampler turned into a reasoning close (TokenSampler.CloseInsteadOfStop).
+                    var stepSampler = seq.GetOrCreateSampler();
+                    if (stepSampler.StopsClosedInThinking > seq.LoggedStopClosures)
+                    {
+                        seq.LoggedStopClosures = stepSampler.StopsClosedInThinking;
+                        _logger.LogWarning(
+                            "Request {EngineRequestId} drew a stop token inside its reasoning after {Emitted} tokens; " +
+                            "closing the reasoning so the model answers",
+                            seq.RequestId, baseCount);
+                    }
+
+                    // Only reasoning is fed to the templated-loop detector: the channel's state after
+                    // this step's tokens (a channel that closed or opened inside one step is rare,
+                    // and the detector only ever asks to close an open one).
+                    var reasoningLoops = _stopRepetition && (seq.SamplingConfig?.StopRepetition ?? true)
+                        && _model.Tokenizer != null ? seq.ReasoningLoops : null;
+                    if (reasoningLoops != null && !stepSampler.InOpenReasoning(seq.OutputTokens))
+                    {
+                        reasoningLoops.Reset();
+                        reasoningLoops = null;
+                    }
+
                     bool finished = false;
                     for (int t = 0; t < totalNew && !finished; t++)
                     {
@@ -1071,6 +1095,27 @@ namespace TensorSharp.Runtime.Scheduling
                             Interlocked.Increment(ref _totalCompleted);
                             finished = true;
                             break;
+                        }
+
+                        // Reasoning that settled into a templated loop (a line repeated with a
+                        // number or a word changed: ReasoningLoopDetector) is closed so the model
+                        // answers. Never a stop. Asked at the newest token only, as above.
+                        if (reasoningLoops is { } loops)
+                        {
+                            _loopBytes.Clear();
+                            _model.Tokenizer!.AppendTokenBytes(token, _loopBytes);
+                            loops.Observe(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_loopBytes));
+                            if (loops.Looping && emittedCount == seq.OutputTokens.Count)
+                            {
+                                if (stepSampler.TryRequestThinkingClosure(seq.OutputTokens))
+                                    _logger.LogWarning(
+                                        "Request {EngineRequestId} closing reasoning that repeated a templated line {Lines} times " +
+                                        "after {Emitted} tokens: {Line}",
+                                        seq.RequestId, loops.RunLines, emittedCount,
+                                        // The repeated line, decoded: content, kept out of exported logs.
+                                        LogContent.Of(loops.LastLine ?? string.Empty));
+                                loops.Reset();
+                            }
                         }
                     }
                 }

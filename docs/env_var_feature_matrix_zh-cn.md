@@ -47,7 +47,7 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | `TS_SCHED_DISABLE_BATCHED` | 全部 | `1` 让所有模型都走按序列 KV-swap 路径，投机解码也一样（`--no-continuous-batching`） | 关闭 | `0`, `1` | 是 |
 | `TS_SCHED_PREFIX_CACHE` | 全部自回归模型 | `0` 关闭准入时的全部提示复用（Radix 前缀缓存：页面、保留的终态与公共检查点在同一个索引里）。`--no-prefix-cache`（CLI 与服务端）会设置它，并同时跳过共享提示的启动预热，以及服务端的检查点文件 | 启用（`1`） | 未注册 | 否 |
 | `TS_SCHED_MAX_BATCHED_TOKENS` / `TS_SCHED_MAX_RUNNING_SEQS` / `TS_SCHED_PREFILL_CHUNK` / `TS_SCHED_SOLO_PREFILL_CHUNK` / `TS_SCHED_NUM_BLOCKS` / `TS_SCHED_BLOCK_SIZE` / `TS_SCHED_DECODE_QUANTUM` | 全部 | 调度器预算：每步 token 数、同时运行的序列数、有 decode 在跑时的 prefill 分块（服务端 `--prefill-chunk-size`）、solo prefill 分块、块池块数、每块 token 数（只靠页面做跨请求复用的家族为 16，其余为 256）、decode 时间片。有自己单请求步长的模型——启用流水化 prefill 的 Muse Spark：8192——在未设置 `TS_SCHED_SOLO_PREFILL_CHUNK` 时自行决定步长；设置了该变量则按文档生效并关闭模型自己的步长，只设置 `TS_SCHED_MAX_BATCHED_TOKENS` 不会关闭它。见[配置表](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md#配置) | `4096` / `16` / `256` / `8192` / `256` / `16` 或 `256` / `256` | 未注册 | 否 |
-| `TS_SCHED_STOP_REPETITION` | 全部 | `0` 时陷入循环的生成会一直跑到 token 上限，而不是以 `repetition` 结束原因停止 | 启用（`1`） | 未注册 | 否 |
+| `TS_SCHED_STOP_REPETITION` | 全部 | `0` 时陷入循环的生成会一直跑到 token 上限，而不是以 `repetition` 结束原因停止；重复模板行的思考也不再被闭合 | 启用（`1`） | 未注册 | 否 |
 
 本节的 executor 级开关（`TS_SCHED_DISABLE_BATCHED`、`TS_PER_SEQ_FUSED`、
 `TS_BATCHED_FUSED_DECODE`，以及保留 holder、检查点与 `TS_KV_*` 预算）通过 `ExecutionOptions.FromEnvironment()` 统一读取，由 `ExecutionPlanner` 消费
@@ -544,6 +544,7 @@ TestMatrix 配置中 sweep。
 | `TS_LORAS_DIR` | `TensorSharp.Server`（也可用 `--loras-dir`，命令行优先） | 文本模型 LoRA 适配器目录（llama.cpp 的 `.gguf` 适配器，或张量名为 `<tensor>.lora_a` / `.lora_b` 的 `.safetensors`）。顶层的每个适配器都在启动时、模型加载之后加载；`POST /v1/loras` 可以再加载，但只能从该目录内、以相对路径给出；最多同时保留 32 个。不是已存在目录的路径会导致启动失败。空值视为未设置；嵌入服务忽略它 | 未设置（没有适配器；`POST /v1/loras` 返回 403） | 未注册 | 否 |
 | `TENSORSHARP_PREFIX_CACHE_DIR` | `TensorSharp.Server` | 共享前缀检查点文件的根目录，使重启后不必再为共享提示做 prefill；每个模型有自己的 `<模型文件名>-<哈希>` 子目录，最多两个文件。`--no-prefix-cache` 关闭持久化。TensorAgent 把自己的检查点放在应用缓存目录下；CLI 只在内存中保留检查点 | 服务端二进制旁的 `prefix-cache` | 未注册 | 否 |
 | `TS_NO_MULTI_AGENT` | `TensorSharp.Server` 聊天端点 | 取 `0` 以外的任何值都会关闭子代理委派，等同 `--no-multi-agent` | 未设置（委派开启） | 未注册 | 否 |
+| `TS_THINKING_BUDGET` | 开启思考的聊天轮次（`TensorSharp.Server` 与交互式 CLI） | 思考块最多可用的 token 数。有训练过的闭合 token 的系列（DeepSeek V4.1、Nemotron 3.5 / Omni、Qwen 3.5-3.8、GLM 5.x）随后闭合思考，并在 `max_tokens` 内作答；Qwen 和 GLM 会先写入 Qwen 的交接句。其他系列以结束原因 `thinking_budget` 停止该轮。无论上限如何，有闭合 token 的系列在模型于思考中抽到停止 token，或思考重复模板行时（`ReasoningLoopDetector`，32 行），都会闭合思考而不是结束该轮；仍以只有思考、没有答案结束的轮次报告 `thinking_budget`（issue #338）。`0` 只取消上限 | `max_tokens` 不小于 512 时为其 75%，否则无 | 未注册 | 否 |
 | `TS_JEV_MAX_BODY_MB` / `TS_JEV_MAX_CANVAS` / `TS_JEV_MAX_PENDING` | `POST /v1/systemone`（Jev，DiffusionGemma） | 请求体上限（MiB，1-64）、每个问题分块的答案 canvas 宽度（token，8-4096，同时受检查点限制），以及同时可接纳的请求数（1-1024），超出后端点返回 HTTP 529。超出范围的值会报错而不是被截断 | `8` / `64` / `32` | 未注册 | 否 |
 | `TS_NEMOTRON_AUDIO_MMPROJ` | 带 `--mmproj` 的 Nemotron-H | 改从该音频配套 GGUF（NVIDIA `sound_encoder.*` / `sound_projection.*` 张量）而不是 `--mmproj` 文件加载 Parakeet 音频塔，从而可以同时使用视觉 mmproj 与音频配套文件。除非该文件的张量校验通过，音频仍被拒绝（HTTP 400）；见 `docs/models/nemotron_zh-cn.md` §4.7 | 未设置（`--mmproj` 含这些张量时从中读取音频塔） | 未注册 | 否 |
 | `TS_PDF_MAX_PAGES` | PDF 文档输入（CLI `--pdf`、服务端 `/api/upload`） | 文本提取与页面图像渲染读取的 PDF 页数上限 | `0`（全部页面） | 未注册 | 否 |

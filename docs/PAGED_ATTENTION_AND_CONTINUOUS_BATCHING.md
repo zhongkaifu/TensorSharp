@@ -566,7 +566,7 @@ request reused nothing, the first specific reason a source declined.
 | `TS_SCHED_NUM_BLOCKS` | `256` | Physical blocks in the engine pool. |
 | `TS_SCHED_BLOCK_SIZE` | `16` for a page-only family (Hunyuan Dense, Mistral 3, Muse-Glimmer), `256` otherwise | Tokens per block. A family whose only cross-request reuse is whole pages reuses at this granularity: at 256, a turn shorter than a block reused nothing. |
 | `TS_SCHED_PREFIX_CACHE` | `1` | Set `0` to disable all admission-time prompt reuse: Radix pages, end states and checkpoints. `--no-prefix-cache` (CLI and server) sets it. |
-| `TS_SCHED_STOP_REPETITION` | `1` | Set `0` to let a looping generation run to its token limit rather than ending it with finish reason `repetition`. |
+| `TS_SCHED_STOP_REPETITION` | `1` | Set `0` to let a looping generation run to its token limit rather than ending it with finish reason `repetition`; reasoning that repeats a templated line is then not closed either. |
 | `TS_SCHED_DECODE_QUANTUM` | `256` | Number of decode tokens before a sequence switch is allowed in fallback-heavy execution. |
 | `TS_PER_SEQ_FUSED` | `1` | Concurrent (N≥2) sequences on fused-capable models run per-request fused Forward, each on its own device K/V holder; `0` serves them on the op-by-op batched paged path instead, whose K/V lives in the shared host block pool (less device memory, a lower decode rate, and no retained holders). |
 | `TS_BATCHED_FUSED_DECODE` | `1` | `0` disables true token-batched fused decode inside the per-sequence fused path (one graph decodes all N sequences). |

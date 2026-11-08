@@ -1028,6 +1028,29 @@ namespace TensorSharp.Server
             if (CapturesContent(requestTelemetry))
                 CaptureOutputMessage(requestTelemetry, assistantText);
 
+            EmittedAssistantTurn emittedTurn = BuildEmittedTurn(arch, assistantText, enableThinking, tools,
+                // Parsers are primed with the prompt's tail exactly when this
+                // pipeline announced it (above); mirror that, or the recorded content
+                // would differ from what the adapters parsed.
+                announceSuffix ? recordedSuffix : null,
+                wasCancelled);
+
+            // A turn the model ended itself with reasoning and nothing else is not a
+            // finished answer: Qwen3.8-27B NVFP4 ended 3 of 53 Aider turns on a stop token
+            // in the middle of a reasoning loop, and an OpenAI client took the empty `stop`
+            // as the reply (issue #338). Where the family's reasoning has a trained close
+            // the sampler closes it instead (ThinkingTokenBudget.CloseOnStop); a turn that
+            // still ends this way is reported as the reasoning overrun it is, which the
+            // protocols send as `length` and the Web UI answers with its thinking-off retry.
+            if (!wasCancelled && !selfStopped && finishReason == "eos" && IsAnswerlessReasoning(emittedTurn))
+            {
+                _logger.LogWarning(LogEventIds.ChatCompleted,
+                    "chat.reasoning-without-answer sessionId={SessionId}: the model ended the turn after "
+                    + "{Tokens} tokens of reasoning and no answer; reporting it as thinking_budget",
+                    session?.Id ?? "(none)", generatedTokens.Count);
+                finishReason = "thinking_budget";
+            }
+
             // Record this turn for the next request of the same conversation: the raw
             // tokens the cache holds, and what the client was sent for them - the next
             // request's assistant message must match that to get the tokens back.
@@ -1040,12 +1063,7 @@ namespace TensorSharp.Server
                     RawPromptTrailingWhitespace = generationPromptTrailingWhitespace,
                     RawGenerationSuffix = recordedSuffix,
                 },
-                BuildEmittedTurn(arch, assistantText, enableThinking, tools,
-                    // Parsers are primed with the prompt's tail exactly when this
-                    // pipeline announced it (above); mirror that, or the recorded content
-                    // would differ from what the adapters parsed.
-                    announceSuffix ? recordedSuffix : null,
-                    wasCancelled),
+                emittedTurn,
                 loadEpoch);
 
             if (stopped != null)
@@ -1765,6 +1783,12 @@ namespace TensorSharp.Server
                 return new EmittedAssistantTurn(rawText, null, null, rawText, cancelled);
             }
         }
+
+        /// <summary>Reasoning with no answer and no tool call: what a client receives as an
+        /// empty reply.</summary>
+        internal static bool IsAnswerlessReasoning(EmittedAssistantTurn turn)
+            => !string.IsNullOrWhiteSpace(turn.Thinking) && string.IsNullOrWhiteSpace(turn.Content)
+                && (turn.ToolCalls == null || turn.ToolCalls.Count == 0);
 
         /// <summary>Below this many shared tokens a checkpoint is not worth its copy.</summary>
         internal const int MinSharedPrefixTokens = 64;
@@ -3157,7 +3181,10 @@ namespace TensorSharp.Server
                 return config;
             }
 
-            if (tokenBudget <= 0 && !suppressUnopenedEnd)
+            // A requested channel with no cap (TS_THINKING_BUDGET=0, a reply under 512
+            // tokens) still gets the policy, with no limit: it is what lets a loop or a stop
+            // inside the reasoning close the channel instead of ending the turn answerless.
+            if (tokenBudget <= 0 && !suppressUnopenedEnd && !enableThinking)
                 return config;
             // The caller's config can be shared by requests. Only this request
             // gets the immutable budget policy and an independent grammar position.
@@ -3172,7 +3199,8 @@ namespace TensorSharp.Server
             result.ThinkingBudget = new ThinkingTokenBudget(tokenBudget > 0 ? tokenBudget : int.MaxValue, id,
                 closeOnRepetition: true, openTokenId: openId, openAtStart: openAtStart,
                 suppressUnopenedEnd: suppressUnopenedEnd, closeAtBoundary: boundary,
-                closingTokenIds: enableThinking ? ClosingTextTokens(tokenizer, protocol.ThinkingBudgetClosingText, id) : null);
+                closingTokenIds: enableThinking ? ClosingTextTokens(tokenizer, protocol.ThinkingBudgetClosingText, id) : null,
+                closeOnStop: tokenizer.IsEos);
             installed = true;
             return result;
         }

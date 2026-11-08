@@ -840,6 +840,12 @@ llama.cpp 的 `draft-mtp` 在 `n_accepted + 1` 行上运行一次 MTP 块：一�
 - 聊天模板使用标准 Qwen `<|im_start|>` / `<|im_end|>` 格式，外加视觉占位符 `<|image_pad|>`。
 - `ChatTemplate.ExpandImageTokens(inputTokens, imagePadId, tokenCounts)` 把每个 `<|image_pad|>` 占位符展开为对应图像所需 token 数；多模态注入器随后在这些位置写入编码后的 embedding，再调用 `Forward()`。
 - **思考预算。** 开启思考时，思考内容一旦达到 `TS_THINKING_BUDGET`（`max_tokens` 不小于 512 时默认为其 75%），服务端和交互式 CLI 都会闭合思考块，答案随后在原 `max_tokens` 内生成。`</think>` 是单个训练过的 token（248069），宿主会先写入 Qwen 官方发布的交接句（"Considering the limited time by the user, I have to give the solution based on the thinking directly now."），它显示在思考内容的末尾。2026-09-29 之前该系列没有闭合 token：这样的轮次会以**空答案**结束（`finish_reason` 为 `thinking_budget`），而只写一个 `</think>` 时，Qwen3.5-9B 会在答案里继续推理。Qwen3.5-9B IQ4_XS（Metal，`max_tokens` 600，两个并发的三轮会话）：修复前 0/2 通过（答案为空），修复后 2/2。
+- **没有答案就结束的思考**（issue #338）。Qwen3.8-27B NVFP4 在 Aider 下有 53 轮中的 3 轮在思考中途抽到停止 token 而结束：每一轮都已陷入计数循环（`Need maybe tests expect to_string for 1:1533 -> 02:33. Good.`，接着是 `1:1534`，持续数千个 token），OpenAI 客户端收到的是空的 `stop`。对每个有训练过的闭合 token 的系列，无论 `TS_THINKING_BUDGET` 如何，都有三处改动：
+  - 思考尚未闭合时抽到的停止 token 改为闭合思考——先写交接句，再写 `</think>`——模型随后作答（`ThinkingTokenBudget.CloseOnStop`，在每个抽取 token 的位置生效：主机采样、设备 argmax 暂存和每个推测验证行）；
+  - 连续 32 行重复同一模板的思考（数字串折叠，每行最多改动五分之一，因此 `twenty-nine` 变为 `thirty` 仍算重复：`ReasoningLoopDetector`）以同样方式闭合。答案中的模板行不受影响；
+  - 仍以只有思考、没有答案结束的轮次（没有闭合 token 的系列）报告 `thinking_budget`，客户端看到的是 `length`。
+
+  在 Qwen3.8-27B UD-IQ3_XXS（Metal）上，预先写入思考的 issue 循环被模型继续下去，并在生成 32 行后被闭合，答案正确（`02:33`）；思考中途的替代停止 token 被闭合后，模型对 17 x 23 回答 `391`。
 
 ## 13a. 张量并行
 

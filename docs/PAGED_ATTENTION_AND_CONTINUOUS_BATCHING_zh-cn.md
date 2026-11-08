@@ -462,7 +462,7 @@ Qwen 3.5/3.6 声明为 `false`，因为 decode 使用绝对下标。
 | `TS_SCHED_NUM_BLOCKS` | `256` | 引擎块池物理块数。 |
 | `TS_SCHED_BLOCK_SIZE` | 只靠页面复用的家族（Hunyuan Dense、Mistral 3、Muse-Glimmer）为 `16`，其余为 `256` | 每块 token 数。只靠整页做跨请求复用的家族按这个粒度复用：块大小为 256 时，短于一块的一轮什么都复用不了。 |
 | `TS_SCHED_PREFIX_CACHE` | `1` | 设为 `0` 关闭准入时的全部提示复用：Radix 的页面、终态与检查点。`--no-prefix-cache`（CLI 与服务端）会设置它。 |
-| `TS_SCHED_STOP_REPETITION` | `1` | 设为 `0` 时，陷入重复循环的生成会继续跑到 token 上限，而不是以 `repetition` 结束原因停止。 |
+| `TS_SCHED_STOP_REPETITION` | `1` | 设为 `0` 时，陷入重复循环的生成会继续跑到 token 上限，而不是以 `repetition` 结束原因停止；重复模板行的思考也不再被闭合。 |
 | `TS_SCHED_DECODE_QUANTUM` | `256` | 在偏回退路径中，允许切换序列前的 decode token 数。 |
 | `TS_PER_SEQ_FUSED` | `1` | fused 能力模型上的并发（N≥2）序列走 per-request 融合 Forward，每个序列有自己的设备端 K/V holder；设为 `0` 改走逐算子批处理分页路径，其 K/V 位于共享的主机块池（设备内存更少、decode 速率更低、没有保留的 holder）。 |
 | `TS_BATCHED_FUSED_DECODE` | `1` | `0` 在 per-seq fused 路径内关闭真正的 token 批量融合 decode（一张图同时 decode 全部 N 个序列）。 |

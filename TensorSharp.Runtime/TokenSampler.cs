@@ -75,6 +75,9 @@ namespace TensorSharp.Runtime
             && _config.ThinkingBudget?.SuppressUnopenedEnd != true;
 
         public int Sample(float[] logits, IList<int>? generatedTokenIds = null)
+            => CloseInsteadOfStop(generatedTokenIds, Draw(logits, generatedTokenIds));
+
+        private int Draw(float[] logits, IList<int>? generatedTokenIds)
         {
             int vocabSize = logits.Length;
 
@@ -208,6 +211,49 @@ namespace TensorSharp.Runtime
             return true;
         }
 
+        /// <summary>Whether the committed history leaves this sampler's reasoning channel open
+        /// (false when it tracks none). Incremental, as every draw's scan is.</summary>
+        internal bool InOpenReasoning(IList<int> tokens)
+        {
+            if (_config.MessageThinkingBudget is { } messageBudget)
+                return (_messageThinkingTracker ??= messageBudget.CreateTracker()).IsThinkingOpen(tokens);
+            var budget = _config.ThinkingBudget;
+            if (budget == null)
+                return false;
+            ScanThinkingHistory(tokens, tokens.Count, budget);
+            return _channelOpen;
+        }
+
+        /// <summary>Stop tokens this sampler turned into a reasoning close
+        /// (<see cref="CloseInsteadOfStop"/>), for the engine's log.</summary>
+        internal int StopsClosedInThinking { get; private set; }
+
+        /// <summary>
+        /// Apply <see cref="ThinkingTokenBudget.CloseOnStop"/> to a token drawn by any path:
+        /// a stop drawn while the reasoning channel is open becomes the first token of the
+        /// channel's close (the closing text, then the end token), and the close continues
+        /// on the following draws as a budget close does. Every other draw is returned as
+        /// it is. Device-drawn tokens (an argmax stash, a verify row) pass through here as
+        /// host samples do, before anything forwards them.
+        /// </summary>
+        internal int CloseInsteadOfStop(IList<int>? tokens, int drawn)
+        {
+            var budget = _config.ThinkingBudget;
+            if (drawn < 0 || budget?.CloseOnStop is not { } isStop || !isStop(drawn)
+                || _config.Grammar?.IsActive == true)
+                return drawn;
+            int count = tokens?.Count ?? 0;
+            ScanThinkingHistory(tokens, count, budget);
+            if (!_channelOpen)
+                return drawn;
+            if (_thinkingCloseRequestedAt < 0)
+            {
+                _thinkingCloseRequestedAt = count;
+                StopsClosedInThinking++;
+            }
+            return TryGetForcedThinkingToken(tokens, out int forced) ? forced : drawn;
+        }
+
         /// <summary>Request a normal sampled closing token after a detected
         /// reasoning loop. The caller must supply only committed output history;
         /// this neither appends a token nor advances a grammar or model cache.</summary>
@@ -221,7 +267,10 @@ namespace TensorSharp.Runtime
                 return false;
             ScanThinkingHistory(tokens, tokens.Count, budget);
             if (!_channelOpen) return false;
-            _thinkingCloseRequestedAt = tokens.Count;
+            // A close already under way (requested, or the budget's) keeps its place:
+            // requesting again would restart the closing text halfway through.
+            if (_thinkingCloseRequestedAt < 0 && !TryGetForcedThinkingToken(tokens, out _))
+                _thinkingCloseRequestedAt = tokens.Count;
             return true;
         }
 
