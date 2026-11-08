@@ -1199,6 +1199,11 @@ after another. Changed:
 - **Greedy verify on the device** (`TS_Q4E_GREEDY_VERIFY`, on). A plain greedy sampler takes each verify row's first
   maximum from an argmax kernel in the captured window, instead of a megabyte of logits a row crossing the bus to the
   host's scan. Same tokens.
+- **The draft chain on the device** (`TS_Q4E_MTP_CHAIN`, on; one GPU, no sampling penalties). A window's drafts run as
+  one chain: a pick kernel takes each step's first-max token and its top-10 confidence and feeds the next step, so the
+  host makes one call a window and reads no draft logits. Drafting went from 2.1-2.2 to 1.9-2.1 ms a window; the end
+  to end numbers stayed within run-to-run noise (short chat 74-102, long generation 141-175, 4K 108-131, 16K 154-170
+  tok/s). Most of a draft step is GPU work (the LM head over 248K tokens).
 - **Adaptive residency learns from prompts** (`TS_MOE_TIER_ADAPT_PROMPT_SWAPS`, default 64). A prompt's expert
   selections are counted on the device, weighed as 128 rows' worth, and up to 64 of its most-selected host experts
   trade places before its answer decodes. After 16K prompts it left 64-136 experts of a window to the CPU instead of

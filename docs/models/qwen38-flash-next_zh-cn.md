@@ -813,6 +813,10 @@ prompt 共 320 ms，最后一部分计入回答的 decode 时间）。4 行验�
   运行（Strata 的 `record_front` / `record_rest`）：4K prompt 后从 59 ms 降到 23 ms，16K prompt 共从 320 ms 降到 45 ms。
 - **在设备上做贪心验证**（`TS_Q4E_GREEDY_VERIFY`，默认开启）。普通贪心采样器直接从捕获窗口中的 argmax 内核取得每个验证行的首个
   最大值，而不是让每行 1 MB 的 logits 经总线传到主机再扫描。token 完全相同。
+- **设备上的草稿链**（`TS_Q4E_MTP_CHAIN`，默认开启；单 GPU、无采样惩罚）。一个窗口的草稿作为一条链运行：挑选内核取得每一步的首个
+  最大值 token 及其 top-10 置信度并送入下一步，主机每个窗口只调用一次，也不读取草稿 logits。每个窗口的起草时间从 2.1-2.2 ms 降到
+  1.9-2.1 ms；端到端数字仍在运行间噪声范围内（短对话 74-102，长生成 141-175，4K 108-131，16K 154-170 tok/s）。一个草稿步的大部分
+  时间是 GPU 工作（覆盖 248K 个 token 的 LM head）。
 - **自适应驻留从 prompt 学习**（`TS_MOE_TIER_ADAPT_PROMPT_SWAPS`，默认 64）。在设备上统计 prompt 的专家选择，按 128 行的分量计入，
   并在回答 decode 之前让它最常选中的主机专家最多交换 64 个进入显存。16K prompt 之后，每个窗口交给 CPU 的专家从 156-200 个降到
   64-136 个；4K prompt 之后基本不变。

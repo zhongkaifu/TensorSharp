@@ -65,6 +65,8 @@ namespace TensorSharp.Cuda
         private readonly IntPtr argmaxRows;
         // A prompt's expert selections into adaptive residency's counts (optional).
         private readonly IntPtr countSelected;
+        // The MTP draft chain's per-step pick on the device (optional).
+        private readonly IntPtr draftPick;
 
         private Q4eKernels(CudaModule module)
         {
@@ -102,6 +104,8 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500) { argmaxRows = IntPtr.Zero; }
             try { countSelected = module.GetFunction("ts_q4e_count_selected"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { countSelected = IntPtr.Zero; }
+            try { draftPick = module.GetFunction("ts_q4e_draft_pick_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { draftPick = IntPtr.Zero; }
         }
 
         public static Q4eKernels Create()
@@ -442,6 +446,19 @@ namespace TensorSharp.Cuda
             int a1 = n;
             void** args = stackalloc void*[] { &a0, &a1, &a2 };
             Launch(countSelected, CeilDiv(n, BlockSize), 1, 1, BlockSize, stream, args);
+        }
+
+        /// <summary>Whether <see cref="DraftPick"/> is available.</summary>
+        public bool HasDraftPick => draftPick != IntPtr.Zero;
+
+        /// <summary>A draft step's first-max token into ids[step] and nextToken[0], and its top-10 softmax confidence
+        /// into probs[step].</summary>
+        public void DraftPick(IntPtr logits, int vocab, IntPtr ids, IntPtr probs, int step, IntPtr nextToken, IntPtr stream)
+        {
+            IntPtr a0 = logits, a2 = ids, a3 = probs, a5 = nextToken;
+            int a1 = vocab, a4 = step;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
+            Launch(draftPick, 1, 1, 1, 1024, stream, args);
         }
 
         public void Dispose() => module.Dispose();

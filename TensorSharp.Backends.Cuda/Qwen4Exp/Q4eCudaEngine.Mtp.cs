@@ -87,13 +87,22 @@ namespace TensorSharp.Cuda
             var m = _m;
             _mtpJoin = AllocF32(dev, (long)m.NUbatch * m.Hc, 2L * m.NEmbd);
             CudaDriverApi.cuMemHostAlloc(out _pinnedMtpH, new UIntPtr((ulong)m.NUbatch * (ulong)HcDim * 4), 0x1).ThrowOnError();
+            dev.DraftIds = AllocT(dev, DType.Int32, MaxDraftChainSteps);
+            dev.DraftProbs = AllocF32(dev, MaxDraftChainSteps);
+            CudaDriverApi.cuMemHostAlloc(out _pinnedChain, new UIntPtr((ulong)MaxDraftChainSteps * 8), 0x1).ThrowOnError();
         }
+
+        /// <summary>A draft chain's tokens then confidences, read back once per chain.</summary>
+        private IntPtr _pinnedChain;
 
         private void FreeMtpPinned()
         {
             if (_pinnedMtpH != IntPtr.Zero)
                 CudaDriverApi.cuMemFreeHost(_pinnedMtpH);
             _pinnedMtpH = IntPtr.Zero;
+            if (_pinnedChain != IntPtr.Zero)
+                CudaDriverApi.cuMemFreeHost(_pinnedChain);
+            _pinnedChain = IntPtr.Zero;
         }
 
         /// <summary>The block's KV for a slot, allocated at its first draft.</summary>
@@ -150,7 +159,46 @@ namespace TensorSharp.Cuda
         private void MtpUbatch(Slot slot, int[] tokens, float[] hPrev, int off, int nt, int p0, float[] logitsOut, float[] hOut)
         {
             var m = _m;
-            int e = m.NEmbd, hc = m.Hc;
+            var dev = _devs[_mtpLayer.Device];
+            MtpUploadRows(tokens, hPrev, off, nt);
+            int left = MtpRows(slot, nt, p0, logitsOut != null || hOut != null);
+            if (left == 0)
+            {
+                CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+                return;
+            }
+            nt = left;
+            if (hOut != null)
+                CudaDriverApi.cuMemcpyDtoHAsync(_pinnedHidden, At(dev.Xs, (long)(nt - 1) * HcDim),
+                    new UIntPtr((ulong)HcDim * 4), dev.Stream).ThrowOnError();
+            if (logitsOut != null)
+            {
+                MtpHead(dev, nt - 1);
+                CudaDriverApi.cuMemcpyDtoHAsync(_pinnedLogits, Ptr(dev.Logits), new UIntPtr((ulong)m.NVocab * 4), dev.Stream).ThrowOnError();
+            }
+            CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+            if (logitsOut != null)
+                fixed (float* dst = logitsOut)
+                    Buffer.MemoryCopy((void*)_pinnedLogits, dst, logitsOut.LongLength * 4L, (long)m.NVocab * 4L);
+            if (hOut != null)
+                fixed (float* dst = hOut)
+                    Buffer.MemoryCopy((void*)_pinnedHidden, dst, hOut.LongLength * 4L, (long)HcDim * 4L);
+        }
+
+        /// <summary>The block's head over the streams of scratch row <paramref name="row"/>: its output mixer, then the
+        /// trunk's LM head into the last device's logits.</summary>
+        private void MtpHead(Dev dev, int row)
+        {
+            using (Tensor xs = Block(dev.Xs, row, 1, HcDim))
+                HcPre(dev, _mtpHeadNorm, _mtpHeadDown, _mtpHeadUp, null, 1, xs);
+            MatMulQ(dev, _output, dev.Cur, dev.Logits, 1);
+        }
+
+        /// <summary>A call's token rows embedded into the streams (on the embedding's device) and the trunk streams of the
+        /// tokens before them into G (on the block's).</summary>
+        private void MtpUploadRows(int[] tokens, float[] hPrev, int off, int nt)
+        {
+            var m = _m;
             var dev0 = _devs[0];
             var dev = _devs[_mtpLayer.Device];
 
@@ -159,7 +207,7 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuStreamSynchronize(dev0.Stream).ThrowOnError();
             Marshal.Copy(tokens, off, _pinnedTokens, nt);
             CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev0.Tokens), _pinnedTokens, new UIntPtr((ulong)nt * 4), dev0.Stream).ThrowOnError();
-            dev0.DK.Embed(_tokEmbd.Ptr, dev0.Tokens, dev0.Xs, _tokEmbd.Type, _tokEmbd.RowBytes, nt, e, dev0.Stream);
+            dev0.DK.Embed(_tokEmbd.Ptr, dev0.Tokens, dev0.Xs, _tokEmbd.Type, _tokEmbd.RowBytes, nt, m.NEmbd, dev0.Stream);
             if (dev != dev0)
                 Handoff(dev0, dev, nt);
 
@@ -168,6 +216,20 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
             Marshal.Copy(hPrev, off * HcDim, _pinnedMtpH, nt * HcDim);
             CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev.G), _pinnedMtpH, new UIntPtr((ulong)nt * (ulong)HcDim * 4), dev.Stream).ThrowOnError();
+        }
+
+        /// <summary>
+        /// The block over <paramref name="nt"/> rows whose token streams are in Xs and whose previous streams are in G, at
+        /// <paramref name="p0"/>: the join, then the layer on the block's own KV. Returns the rows left in the scratch with
+        /// their output streams (the last row's are the last of them): 0 when <paramref name="rest"/> is false and the
+        /// rows only wrote their K/V, 1 when a catch-up ran the rest of the layer for its last row alone, else nt.
+        /// </summary>
+        private int MtpRows(Slot slot, int nt, int p0, bool rest)
+        {
+            var m = _m;
+            int e = m.NEmbd, hc = m.Hc;
+            var dev = _devs[_mtpLayer.Device];
+            dev.MakeCurrent();
 
             // Join: per stream [rms(e) * enorm, rms(h_s) * hnorm_s], then eh_proj over tokens x streams rows.
             dev.QK.GroupNorm(Ptr(dev.Xs), Ptr(_mtpEnorm), Ptr(dev.Xn), nt, e, hc, m.RmsEps, dev.Stream);
@@ -180,7 +242,6 @@ namespace TensorSharp.Cuda
             // The block's layer, on its own KV.
             var L = _mtpLayer;
             HcPre(dev, L.HcAttnNorm, L.HcAttnDown, L.HcAttnUp, L.HcAttnInject, nt);
-            bool rest = logitsOut != null || hOut != null;
             if (nt > 1 && _mtpKvOnly)
             {
                 // A catch-up's rows only leave their K/V behind; the layer runs on past it for the last row alone, when
@@ -188,10 +249,7 @@ namespace TensorSharp.Cuda
                 // attention over the whole prompt and every row's experts.
                 MtpCatchUpKv(dev, L, slot.Mtp, nt, p0, rest);
                 if (!rest)
-                {
-                    CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
-                    return;
-                }
+                    return 0;
                 p0 += nt - 1;
                 nt = 1;
                 MtpLastRowAttention(dev, L, slot.Mtp, p0);
@@ -202,24 +260,78 @@ namespace TensorSharp.Cuda
             HcPre(dev, L.HcFfnNorm, L.HcFfnDown, L.HcFfnUp, L.HcFfnInject, nt);
             Moe(dev, L, -1, nt, -1);
             dev.QK.HcPost(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), nt, e, hc, dev.Stream);
+            return nt;
+        }
 
-            if (hOut != null)
-                CudaDriverApi.cuMemcpyDtoHAsync(_pinnedHidden, At(dev.Xs, (long)(nt - 1) * HcDim),
-                    new UIntPtr((ulong)HcDim * 4), dev.Stream).ThrowOnError();
-            if (logitsOut != null)
+        /// <summary>Steps a <see cref="MtpDraftChain"/> takes at most.</summary>
+        public const int MaxDraftChainSteps = 8;
+
+        /// <summary>Whether <see cref="MtpDraftChain"/> runs here: an MTP block on one GPU and the pick kernel loaded.</summary>
+        public bool HasMtpDraftChain => _mtpLayer != null && _devs.Length == 1 && _devs[0].QK.HasDraftPick
+            && Environment.GetEnvironmentVariable("TS_Q4E_MTP_CHAIN") != "0";
+
+        /// <summary>
+        /// A whole per-token draft chain on the device: <see cref="MtpForward"/> over <paramref name="tokens"/> (the
+        /// verified run and the token the drafts start from), then <paramref name="steps"/> - 1 more steps, each feeding
+        /// the previous step's first-max token and output streams to the next without a host round trip. Each step's
+        /// token and its top-10 softmax confidence (what the per-token draft gate thresholds) go to
+        /// <paramref name="idsOut"/> and <paramref name="probsOut"/>. The block's KV then holds every step's row; the
+        /// caller keeps a prefix of the drafts. Returns <paramref name="steps"/>.
+        /// </summary>
+        public int MtpDraftChain(int[] tokens, float[] hPrev, int p0, int steps, int[] idsOut, float[] probsOut)
+        {
+            if (!HasMtpDraftChain)
+                throw new InvalidOperationException("[q4e-cuda] the MTP draft chain needs the block on one GPU and the pick kernel");
+            ArgumentNullException.ThrowIfNull(tokens);
+            ArgumentNullException.ThrowIfNull(hPrev);
+            int n = tokens.Length;
+            if (n == 0 || hPrev.LongLength < (long)n * HcDim || steps < 1 || steps > MaxDraftChainSteps
+                || idsOut == null || idsOut.Length < steps || probsOut == null || probsOut.Length < steps)
+                throw new ArgumentException("[q4e-cuda] the MTP chain's inputs or outputs do not cover the requested rows and steps");
+            Slot slot = _active;
+            if (slot.Failed)
+                throw new InvalidOperationException("[q4e-cuda] the sequence's last forward failed; reset it before reuse");
+            EnsureMtpCache(slot);
+            if (p0 < 0 || p0 > slot.MtpPast)
+                throw new InvalidOperationException($"[q4e-cuda] the MTP block holds {slot.MtpPast} positions and cannot draft from {p0}");
+            if (p0 + n + steps - 1 > _m.NCtx)
+                throw new InvalidOperationException($"[q4e-cuda] MTP context overflow: {p0} + {n + steps - 1} > n_ctx={_m.NCtx}");
+            slot.MtpPast = Math.Min(slot.MtpPast, p0);
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            var m = _m;
+            var dev = _devs[0];
+            int done = 0, left = 0;
+            while (done < n)
             {
-                using (Tensor xs = Block(dev.Xs, nt - 1, 1, HcDim))
-                    HcPre(dev, _mtpHeadNorm, _mtpHeadDown, _mtpHeadUp, null, 1, xs);
-                MatMulQ(dev, _output, dev.Cur, dev.Logits, 1);
-                CudaDriverApi.cuMemcpyDtoHAsync(_pinnedLogits, Ptr(dev.Logits), new UIntPtr((ulong)m.NVocab * 4), dev.Stream).ThrowOnError();
+                int nt = Math.Min(m.NUbatch, n - done);
+                bool last = done + nt == n;
+                MtpUploadRows(tokens, hPrev, done, nt);
+                left = MtpRows(slot, nt, p0 + done, last);
+                done += nt;
             }
+            int row = left - 1, pos = p0 + n - 1;
+            for (int s = 0; s < steps; s++)
+            {
+                MtpHead(dev, row);
+                dev.QK.DraftPick(Ptr(dev.Logits), m.NVocab, Ptr(dev.DraftIds), Ptr(dev.DraftProbs), s, Ptr(dev.Tokens), dev.Stream);
+                if (s + 1 == steps)
+                    break;
+                // The next row: the picked token embedded into the streams, this row's output streams as its previous ones.
+                CudaDriverApi.cuMemcpyDtoDAsync(Ptr(dev.G), At(dev.Xs, (long)row * HcDim), new UIntPtr((ulong)HcDim * 4), dev.Stream).ThrowOnError();
+                dev.DK.Embed(_tokEmbd.Ptr, dev.Tokens, dev.Xs, _tokEmbd.Type, _tokEmbd.RowBytes, 1, m.NEmbd, dev.Stream);
+                pos++;
+                MtpRows(slot, 1, pos, true);
+                row = 0;
+            }
+            CudaDriverApi.cuMemcpyDtoHAsync(_pinnedChain, Ptr(dev.DraftIds), new UIntPtr((ulong)steps * 4), dev.Stream).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoHAsync(_pinnedChain + MaxDraftChainSteps * 4, Ptr(dev.DraftProbs), new UIntPtr((ulong)steps * 4), dev.Stream).ThrowOnError();
             CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
-            if (logitsOut != null)
-                fixed (float* dst = logitsOut)
-                    Buffer.MemoryCopy((void*)_pinnedLogits, dst, logitsOut.LongLength * 4L, (long)m.NVocab * 4L);
-            if (hOut != null)
-                fixed (float* dst = hOut)
-                    Buffer.MemoryCopy((void*)_pinnedHidden, dst, hOut.LongLength * 4L, (long)HcDim * 4L);
+            Marshal.Copy(_pinnedChain, idsOut, 0, steps);
+            Marshal.Copy(_pinnedChain + MaxDraftChainSteps * 4, probsOut, 0, steps);
+            slot.MtpPast = p0 + n + steps - 1;
+            if (_perf > 0)
+                Console.Error.WriteLine($"[q4e-cuda] mtp chain {n} rows + {steps - 1} steps in {System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds:F2} ms");
+            return steps;
         }
 
         // TS_Q4E_MTP_KV_ONLY=0: a catch-up runs the whole layer over every row (the outputs of all but the last are unused).

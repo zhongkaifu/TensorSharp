@@ -157,6 +157,22 @@ namespace TensorSharp.Models
         public void DraftCatchUpAndStep(int[] tokens, float[] hRows, int startPos, float[] logitsOut, float[] hOut)
             => RunMtp(tokens, hRows, startPos, logitsOut, hOut);
 
+        // The whole per-token chain on the device (Q4eCudaEngine.MtpDraftChain): one host round trip a window instead of
+        // one per draft, and no draft logits on the host.
+        public bool SupportsDraftChain => _exec?.HasMtpDraftChain == true;
+
+        public int DraftChain(int[] tokens, float[] hRows, int startPos, int maxTokens, int[] draftOut, float[] probOut)
+        {
+            ArgumentNullException.ThrowIfNull(tokens);
+            if (hRows == null)
+                throw new ArgumentNullException(nameof(hRows), "the MTP block needs the trunk's hidden streams of every row it replays");
+            int steps = Math.Min(maxTokens, TensorSharp.Cuda.Q4eCudaEngine.MaxDraftChainSteps);
+            if (tokens.Length == 0 || steps < 1)
+                return 0;
+            lock (_sync)
+                return _exec.MtpDraftChain(tokens, hRows, startPos, steps, draftOut, probOut);
+        }
+
         private void RunMtp(int[] tokens, float[] hRows, int startPos, float[] logitsOut, float[] hOut)
         {
             ArgumentNullException.ThrowIfNull(tokens);

@@ -971,6 +971,61 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The MTP draft chain (Q4eCudaEngine.MtpDraftChain): one call folds the catch-up rows with the first step and runs
+    /// the next steps on the device, each fed the previous step's first-max token and the head's own streams. It picks
+    /// the tokens the step-by-step calls pick (a host argmax over their logits) and reports the per-token gate's
+    /// confidence (top-1 over the 10 largest logits) as the host computes it.
+    /// </summary>
+    [CudaFact]
+    public void TheMtpDraftChain_PicksAsStepByStepCalls()
+    {
+        string path = Fixture(indexerTopK: 2048);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 2048);
+        const int Steps3 = 3;
+        (int[] Ids, float[] Probs) Run(bool chain)
+        {
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp);
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var head = (TensorSharp.Runtime.Speculative.IDraftHead)model;
+            Assert.True(head.SupportsDraftChain, "the direct engine offers no draft chain");
+            int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            var hidden = new float[Prompt.Length * feat];
+            spec.SpecForward(Prompt, hidden, new float[vocab], false);
+            var rows = new float[(Prompt.Length + 1) * feat];
+            Array.Copy(hidden, 0, rows, feat, Prompt.Length * feat);
+            var tokens = Prompt.Append(Steps[0]).ToArray();
+            var ids = new int[Steps3];
+            var probs = new float[Steps3];
+            if (chain)
+            {
+                Assert.Equal(Steps3, head.DraftChain(tokens, rows, 0, Steps3, ids, probs));
+                return (ids, probs);
+            }
+            var logits = new float[vocab];
+            var h = new float[feat];
+            var next = new float[feat];
+            head.DraftCatchUpAndStep(tokens, rows, 0, logits, h);
+            for (int i = 0; i < Steps3; i++)
+            {
+                ids[i] = TensorSharp.Runtime.Speculative.DraftHeadSpeculator.ArgmaxWithTopKConfidence(logits, vocab, out probs[i]);
+                if (i + 1 < Steps3)
+                {
+                    head.DraftStep(ids[i], h, tokens.Length + i, logits, next);
+                    (h, next) = (next, h);
+                }
+            }
+            return (ids, probs);
+        }
+        var stepwise = Run(chain: false);
+        var chained = Run(chain: true);
+        _output.WriteLine($"step by step: [{string.Join(",", stepwise.Ids)}] p [{string.Join(",", stepwise.Probs.Select(p => p.ToString("F5")))}]");
+        _output.WriteLine($"chained:      [{string.Join(",", chained.Ids)}] p [{string.Join(",", chained.Probs.Select(p => p.ToString("F5")))}]");
+        Assert.Equal(stepwise.Ids, chained.Ids);
+        for (int i = 0; i < Steps3; i++)
+            Assert.True(Math.Abs(stepwise.Probs[i] - chained.Probs[i]) <= 1e-4f, $"step {i}: confidence {chained.Probs[i]} vs {stepwise.Probs[i]}");
+    }
+
     /// <summary>A decode step's hyper-connection scatter fused with the next mixer's first pass computes what the two
     /// launches compute: the prompt and every decode step, bit for bit, with QSA past its width.</summary>
     [CudaFact]

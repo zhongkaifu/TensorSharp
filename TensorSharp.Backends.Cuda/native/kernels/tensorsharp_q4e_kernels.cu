@@ -1616,3 +1616,107 @@ extern "C" __global__ void ts_q4e_count_selected(
     if (e >= 0)
         atomicAdd(counts + e, 1u);
 }
+
+// A draft step's pick on the device (the MTP draft chain): the row's first-max token, its confidence as the per-token
+// draft gate measures it on the host (DraftHeadSpeculator.ArgmaxWithTopKConfidence: the top-1 probability of a
+// softmax over the 10 largest logits), and the token again as the next step's input. One block of 1024 threads.
+#define Q4E_PICK_K 10
+extern "C" __global__ void ts_q4e_draft_pick_f32(
+    const float* __restrict__ logits,    // [V]
+    const int V,
+    int32_t* __restrict__ ids,           // [steps]
+    float* __restrict__ probs,           // [steps]
+    const int step,
+    int32_t* __restrict__ nextToken)     // [1]
+{
+    __shared__ float shV[32];
+    __shared__ int shK[32], shT[32];
+    __shared__ float top[Q4E_PICK_K];
+    __shared__ int argIdx;
+    // Each thread's own 10 largest values (descending; an equal value keeps the earlier index first) and the index of
+    // its largest.
+    float tv[Q4E_PICK_K];
+#pragma unroll
+    for (int j = 0; j < Q4E_PICK_K; ++j)
+        tv[j] = -INFINITY;
+    int headIdx = -1;
+    for (int i = threadIdx.x; i < V; i += blockDim.x)
+    {
+        const float v = logits[i];
+        if (!(v > tv[Q4E_PICK_K - 1]))
+            continue;
+        int j = Q4E_PICK_K - 1;
+        while (j > 0 && tv[j - 1] < v)
+        {
+            tv[j] = tv[j - 1];
+            --j;
+        }
+        tv[j] = v;
+        if (j == 0)
+            headIdx = i;
+    }
+    // Ten rounds of a block maximum over the threads' next values; the first round's tie goes to the lower index.
+    int ptr = 0;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nWarps = blockDim.x >> 5;
+    for (int r = 0; r < Q4E_PICK_K; ++r)
+    {
+        float v = ptr < Q4E_PICK_K ? tv[ptr] : -INFINITY;
+        int key = ptr == 0 && headIdx >= 0 ? headIdx : 0x7fffffff;
+        int who = threadIdx.x;
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            const float ov = __shfl_down_sync(0xffffffffu, v, o);
+            const int ok = __shfl_down_sync(0xffffffffu, key, o);
+            const int ow = __shfl_down_sync(0xffffffffu, who, o);
+            if (ov > v || (ov == v && (ok < key || (ok == key && ow < who))))
+            {
+                v = ov; key = ok; who = ow;
+            }
+        }
+        if (lane == 0)
+        {
+            shV[warp] = v; shK[warp] = key; shT[warp] = who;
+        }
+        __syncthreads();
+        if (warp == 0)
+        {
+            v = lane < nWarps ? shV[lane] : -INFINITY;
+            key = lane < nWarps ? shK[lane] : 0x7fffffff;
+            who = lane < nWarps ? shT[lane] : 0x7fffffff;
+            for (int o = 16; o > 0; o >>= 1)
+            {
+                const float ov = __shfl_down_sync(0xffffffffu, v, o);
+                const int ok = __shfl_down_sync(0xffffffffu, key, o);
+                const int ow = __shfl_down_sync(0xffffffffu, who, o);
+                if (ov > v || (ov == v && (ok < key || (ok == key && ow < who))))
+                {
+                    v = ov; key = ok; who = ow;
+                }
+            }
+            if (lane == 0)
+            {
+                top[r] = v;
+                shT[0] = who;
+                if (r == 0)
+                    argIdx = key == 0x7fffffff ? 0 : key;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == shT[0])
+            ++ptr;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+        float denom = 0.0f;
+        for (int j = 0; j < Q4E_PICK_K; ++j)
+        {
+            if (top[j] == -INFINITY)
+                break;
+            denom += expf(top[j] - top[0]);
+        }
+        ids[step] = argIdx;
+        probs[step] = denom > 0.0f ? 1.0f / denom : 0.0f;
+        *nextToken = argIdx;
+    }
+}

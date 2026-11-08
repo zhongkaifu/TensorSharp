@@ -197,6 +197,8 @@ namespace TensorSharp.Cuda
             public Tensor Logits, BatchLogits;
             /// <summary>A greedy verify's rows' first-max tokens.</summary>
             public Tensor ArgIds;
+            /// <summary>An MTP draft chain's tokens and confidences, one per step.</summary>
+            public Tensor DraftIds, DraftProbs;
             // A batched decode step's per-row state pointers: [layer][conv, ssm][row], then the
             // PLE histories [row], staged through pinned memory.
             public Tensor BatchStatePtrs;
