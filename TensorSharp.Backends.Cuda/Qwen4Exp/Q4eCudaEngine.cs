@@ -433,9 +433,10 @@ namespace TensorSharp.Cuda
                     slotBytes += LayerCacheBytes(il);
                 if (m.Mtp != null)
                     slotBytes += 2 * KvCacheBytes();
-                // Each slot also takes allocator rounding and its captured graphs; a slot is admitted only with
-                // SlotReserveBytes still free after it (SlotFits).
-                slotBytes += 256L << 20;
+                // Each slot also takes allocator rounding, its captured graphs and what the runtime allocates beside the
+                // plan; a slot is admitted only with SlotReserveBytes still free after it (SlotFits). At 256 MiB the fourth
+                // of four slots on the RTX 5090 was refused 266-292 MiB short.
+                slotBytes += 512L << 20;
                 // With the MTP head the lanes verify their drafts together: the batched verify's window buffers and one
                 // set of saves a lane (BatchedVerify.cs).
                 // (Placement has not run: the batched verify needs one GPU, so device 0 is the last.)

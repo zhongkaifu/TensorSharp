@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using TensorSharp.Cuda;
@@ -183,6 +184,7 @@ namespace TensorSharp.Models
         public int SlotAlloc() => _engine.SlotAlloc();
         public bool SetActiveSlot(int slot) => _engine.SetActiveSlot(slot);
         public bool SlotFree(int slot) => _engine.SlotFree(slot);
+        public int SlotFreeAllExcept(ICollection<int> keep) => _engine.SlotFreeAllExcept(keep);
         public bool SlotHead(int slot, out int head) => _engine.SlotHead(slot, out head);
         public bool ForwardBatchedDecode(int[] slots, int[] tokens, int[] positions, float[] logits)
             => _engine.ForwardBatchedDecode(slots, tokens, positions, logits);

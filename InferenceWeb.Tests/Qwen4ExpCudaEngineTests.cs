@@ -2126,6 +2126,28 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
                 i < 3 ? $"batched verify {i}: capturing changed the hidden streams" : $"batched decode step {i - 3}: capturing changed the logits");
     }
 
+    /// <summary>The engine frees the slots its owner no longer holds (Q4eCudaEngine.SlotFreeAllExcept): every slot but the
+    /// active one and those kept, never a kept or the selected one; nothing more on a second call.</summary>
+    [CudaFact]
+    public void SlotFreeAllExcept_FreesOnlyTheSlotsNothingHolds()
+    {
+        using var ex = OpenExecutor(Fixture());
+        int first = ex.ActiveSlot;
+        int a = NewActiveSlot(ex);
+        Step(ex, Prompt[..8]);
+        int lost = NewActiveSlot(ex);
+        Step(ex, Prompt[..8]);
+        int active = NewActiveSlot(ex);
+        Step(ex, Prompt[..8]);
+        Assert.Equal(1, ex.SlotFreeAllExcept(new[] { first, a }));
+        Assert.True(ex.SlotHead(first, out _));
+        Assert.True(ex.SlotHead(a, out _));
+        Assert.True(ex.SlotHead(active, out _));
+        Assert.False(ex.SlotHead(lost, out _));
+        Assert.Equal(active, ex.ActiveSlot);
+        Assert.Equal(0, ex.SlotFreeAllExcept(new[] { first, a }));
+    }
+
     private static int ArgMax(float[] row)
     {
         int best = 0;

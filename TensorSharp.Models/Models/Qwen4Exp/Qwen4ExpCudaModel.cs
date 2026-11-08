@@ -247,8 +247,13 @@ namespace TensorSharp.Models
                     slot = _exec.SlotAlloc();
                     if (slot < 0) slot = SlotRetention.TakeIdlePrimary(_slotByRequest, ref _primarySlot, _activeSlotKey, new Store(_exec));
                     if (slot < 0 && _retainedSlots is { Count: > 0 }) slot = AllocSlotReclaimingRetained();
+                    // Last, slots nothing holds any more (a free refused while one was the engine's selection).
+                    if (slot < 0 && FreeLostSlots() > 0) slot = _exec.SlotAlloc();
                     if (slot < 0)
+                    {
+                        NoteSlotRefusal(requestId);
                         throw new SequenceSlotUnavailableException("qwen4exp has no device memory for another sequence slot.");
+                    }
                     _slotByRequest[requestId] = slot;
                     fresh = true;
                 }
@@ -258,6 +263,46 @@ namespace TensorSharp.Models
                 _cacheSeqLen = _exec.NPast;
                 return fresh;
             }
+        }
+
+        private long _slotRefusalNoted;
+
+        /// <summary>Free the engine's slots that no request, the primary or a retained conversation holds; how many went.
+        /// Under <c>_sync</c>.</summary>
+        private int FreeLostSlots()
+        {
+            var keep = new HashSet<int>();
+            if (_slotByRequest != null)
+                foreach (int s in _slotByRequest.Values)
+                    keep.Add(s);
+            if (_primarySlot >= 0)
+                keep.Add(_primarySlot);
+            if (_retainedSlots != null)
+                foreach (var r in _retainedSlots.Values)
+                    keep.Add(r.Slot);
+            int freed = _exec.SlotFreeAllExcept(keep);
+            if (freed > 0)
+            {
+                System.Threading.Interlocked.Add(ref _lostSlotsFreed, freed);
+                Console.Error.WriteLine($"[qwen4exp] freed {freed} sequence slot(s) nothing held any more, for a new request");
+            }
+            return freed;
+        }
+
+        private long _lostSlotsFreed;
+
+        /// <summary>Who holds the slots when a request is refused one (at most every 30 s): the requests bound to slots, the
+        /// primary, the retained conversations and the active selection. Under <c>_sync</c>.</summary>
+        private void NoteSlotRefusal(string requestId)
+        {
+            long now = Environment.TickCount64;
+            if (now - _slotRefusalNoted < 30_000)
+                return;
+            _slotRefusalNoted = now;
+            string bound = _slotByRequest == null ? "" : string.Join(",", _slotByRequest.Select(kv => $"{kv.Key[^6..]}:{kv.Value}"));
+            string retained = _retainedSlots == null ? "" : string.Join(",", _retainedSlots.Values.Select(r => r.Slot));
+            Console.Error.WriteLine($"[qwen4exp] slot refused for {requestId[^6..]}: bound [{bound}], primary {_primarySlot}, "
+                + $"retained [{retained}], active {(_activeSlotKey == null ? "none" : _activeSlotKey[^6..])}, engine slot {_exec.ActiveSlot}");
         }
 
         public void AdoptPrimaryCacheToFused(string requestId)
@@ -452,7 +497,10 @@ namespace TensorSharp.Models
                     RestorePrimaryCache();
                 }
                 _slotByRequest.Remove(requestId);
-                _exec.SlotFree(slot);
+                // Refused only for the engine's selection; the next request short of room frees it (FreeLostSlots).
+                if (!_exec.SlotFree(slot))
+                    Console.Error.WriteLine($"[qwen4exp] slot {slot} of {requestId} could not be freed now (the engine's selection); "
+                        + "a request short of room frees it later");
             }
         }
 

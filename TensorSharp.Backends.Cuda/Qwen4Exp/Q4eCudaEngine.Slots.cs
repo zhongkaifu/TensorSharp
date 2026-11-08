@@ -286,6 +286,25 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        /// <summary>
+        /// Free every slot but the active one and those in <paramref name="keep"/> (the slots the owner still holds:
+        /// bound to requests, its primary, retained conversations), returning how many went. A slot the owner lost track
+        /// of (its free was refused while it was the selection) otherwise held a lane's memory for good: with 4 lanes on
+        /// the RTX 5090 one such slot made a new request wait for a running one to finish.
+        /// </summary>
+        public int SlotFreeAllExcept(ICollection<int> keep)
+        {
+            var lost = new List<int>();
+            foreach (var (id, slot) in _slots)
+                if (!ReferenceEquals(slot, _active) && !keep.Contains(id))
+                    lost.Add(id);
+            int freed = 0;
+            foreach (int id in lost)
+                if (SlotFree(id))
+                    freed++;
+            return freed;
+        }
+
         /// <summary>Free a slot; the active slot cannot be freed.</summary>
         public bool SlotFree(int id)
         {
