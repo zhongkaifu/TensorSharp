@@ -775,6 +775,13 @@ namespace TensorSharp.Cuda
                 dev.DK.DenseQ81Rows(w.Ptr, Ptr(dev.Moe.ActQ8A), Ptr(output), w.Type, w.Ne1, w.Ne0, w.RowBytes, rows, stream);
                 return;
             }
+            // The formats the decode-once dense kernels read (ISTA's Q8_0 hyper-connections with TS_Q4E_HC_Q8 among them,
+            // which the shared q8_1 kernels ran at 0.3-0.5 TB/s).
+            if (xq != IntPtr.Zero && dev.DK.DenseFastReads(w.Type, w.Ne0))
+            {
+                dev.DK.DenseQ81Rows(w.Ptr, xq, Ptr(output), w.Type, w.Ne1, w.Ne0, w.RowBytes, rows, stream);
+                return;
+            }
             if (xq != IntPtr.Zero
                 && CudaQuantizedOps.TryResidentMatmulQ81(dev.Alloc, w.Ptr, w.Type, xq, Ptr(output), w.Ne0, w.Ne1, rows, stream))
                 return;

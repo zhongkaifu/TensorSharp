@@ -54,18 +54,43 @@ namespace TensorSharp.Cuda
         // Staging that keeps earlier calls' experts (optional: a module before it re-stages per call).
         private readonly IntPtr moeStageCopyFrom;
         private readonly IntPtr doorbellPublishSkip, doorbellWaitAddSkip, moeDownDecodeShort;
+        // Gate/up decode with sixteen lanes a row (optional).
+        private readonly IntPtr moeGateUpDecodeHalf;
+        // TS_MOE_GATEUP_HALF=0: a warp a gate/up row again (the sums' order differs).
+        private static readonly bool _moeGateUpHalf = Environment.GetEnvironmentVariable("TS_MOE_GATEUP_HALF") != "0";
         // The doorbell with the route-tail skip (optional).
         private readonly IntPtr doorbellPublishTail;
         private readonly IntPtr denseBf16Rows, denseQ81RowsSplitK, denseBf16RowsSplitK;
         // The same products for 2..16 rows in one block, the weights read once (optional: a module before it launches a
         // block per row).
         private readonly IntPtr denseQ81RowsMulti;
+        // Decode once, dot every row (optional): [R index (1, 2, 4, 8 rows a pass), W index (1, 2, 4 warps an output)].
+        private readonly IntPtr[,] denseFast = new IntPtr[4, 3];
+        private readonly bool _hasDenseFast;
 
         /// <summary>Activation rows the one-block-for-every-row dense kernels take.</summary>
         public const int DenseMultiMaxRows = 16;
 
         // TS_DENSE_MULTI_ROWS=0: a block per row again (the products are the same; this is for measuring it).
         private static readonly bool _denseMulti = Environment.GetEnvironmentVariable("TS_DENSE_MULTI_ROWS") != "0";
+        // TS_DENSE_FAST=0: the formats the decode-once kernels read go back to the per-row kernels above.
+        private static readonly bool _denseFastEnv = Environment.GetEnvironmentVariable("TS_DENSE_FAST") != "0";
+
+        /// <summary>Whether <see cref="DenseQ81Rows"/> runs a <paramref name="wtype"/> projection of <paramref name="inDim"/>
+        /// inputs on the decode-once kernels (Q8_0, Q2_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ4_NL; up to 16 rows).</summary>
+        public bool DenseFastReads(int wtype, long inDim)
+            => _hasDenseFast && _denseFastEnv && wtype switch
+            {
+                8 or 20 => inDim % 32 == 0,                       // Q8_0, IQ4_NL
+                42 => inDim % 64 == 0,                            // Q2_0
+                11 or 12 or 13 or 14 or 23 => inDim % 256 == 0,   // Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS
+                _ => false,
+            };
+
+        /// <summary>Warps sharing an output row in the decode-once kernels: by shape alone, so a row's sums never depend on
+        /// how many rows a call holds. Few outputs need the K split to fill the GPU (measured on the RTX 5090 at Qwen3.8
+        /// Flash Next's shapes: 10240 -> 320 and 2560 -> 640 fastest at 4, 2560 -> 6144 at 2, the rest at 1).</summary>
+        private static int DenseFastWarps(int outDim) => outDim <= 2048 ? 4 : outDim > 4096 && outDim <= 8192 ? 2 : 1;
         private readonly IntPtr hcMean, hcMixPartials, hcPreFinish;
         private readonly IntPtr dsparkPrep;
         private readonly IntPtr dsparkGather;
@@ -86,6 +111,13 @@ namespace TensorSharp.Cuda
         private readonly IntPtr[] gemvWarp;
         // The warp GEMV over BF16 weights (null on a module without it).
         private readonly IntPtr[] gemvWarpBf16;
+        // The block-per-output GEMV, F32 and BF16 weights (null on a module without it).
+        private readonly IntPtr[] gemvBlock, gemvBlockBf16;
+        // TS_DSV4_GEMV_BLOCK=0: wide outputs keep a warp each (the sums' order differs).
+        private static readonly bool _gemvBlockEnv = Environment.GetEnvironmentVariable("TS_DSV4_GEMV_BLOCK") != "0";
+
+        /// <summary>Threads of the block-per-output GEMV (the kernel's TS_DSV4_GEMV_BLOCK_T).</summary>
+        private const int GemvBlockThreads = 256;
 
         /// <summary>Whether <see cref="GemvBf16"/> is available.</summary>
         public bool HasGemvBf16 => gemvWarpBf16 != null;
@@ -136,6 +168,23 @@ namespace TensorSharp.Cuda
             {
                 gemvWarpBf16 = null;
             }
+            try
+            {
+                gemvBlock = new[]
+                {
+                    module.GetFunction("ts_dsv4_gemv_block_1_f32"), module.GetFunction("ts_dsv4_gemv_block_4_f32"),
+                    module.GetFunction("ts_dsv4_gemv_block_8_f32"), module.GetFunction("ts_dsv4_gemv_block_16_f32"),
+                };
+                gemvBlockBf16 = new[]
+                {
+                    module.GetFunction("ts_dsv4_gemv_block_bf16_1_f32"), module.GetFunction("ts_dsv4_gemv_block_bf16_4_f32"),
+                    module.GetFunction("ts_dsv4_gemv_block_bf16_8_f32"), module.GetFunction("ts_dsv4_gemv_block_bf16_16_f32"),
+                };
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                gemvBlock = gemvBlockBf16 = null;
+            }
             gemvCombine = module.GetFunction("ts_dsv4_gemv_combine_f32");
             hcRms = module.GetFunction("ts_dsv4_hc_rms_f32");
             hcGatesComb = module.GetFunction("ts_dsv4_hc_gates_comb_f32");
@@ -165,6 +214,8 @@ namespace TensorSharp.Cuda
             moeDownDecode = module.GetFunction("ts_dsv4_moe_down_decode_f32");
             try { moeDownDecodeShort = module.GetFunction("ts_dsv4_moe_down_decode_short_f32"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { moeDownDecodeShort = IntPtr.Zero; }
+            try { moeGateUpDecodeHalf = module.GetFunction("ts_dsv4_moe_gateup_decode_half_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { moeGateUpDecodeHalf = IntPtr.Zero; }
             denseQ81Rows = module.GetFunction("ts_dsv4_dense_q81_rows_f32");
             moeScatterAdd = module.GetFunction("ts_dsv4_moe_scatter_add_f32");
             hcMean = module.GetFunction("ts_dsv4_hc_mean_f32");
@@ -219,6 +270,15 @@ namespace TensorSharp.Cuda
                 denseQ81RowsSplitK = module.GetFunction("ts_dsv4_dense_q81_rows_splitk_f32");
                 try { denseQ81RowsMulti = module.GetFunction("ts_dsv4_dense_q81_rows_multi_f32"); }
                 catch (CudaException ex) when (ex.ErrorCode == 500) { denseQ81RowsMulti = IntPtr.Zero; }
+                try
+                {
+                    int[] rs = { 1, 2, 4, 8 }, ws = { 1, 2, 4 };
+                    for (int ri = 0; ri < 4; ri++)
+                        for (int wi = 0; wi < 3; wi++)
+                            denseFast[ri, wi] = module.GetFunction($"ts_dsv4_dense_fast_r{rs[ri]}_w{ws[wi]}_f32");
+                    _hasDenseFast = true;
+                }
+                catch (CudaException ex) when (ex.ErrorCode == 500) { _hasDenseFast = false; }
                 denseBf16RowsSplitK = module.GetFunction("ts_dense_bf16_rows_splitk_f32");
             }
             catch (CudaException ex) when (ex.ErrorCode == 500) { }
@@ -670,7 +730,11 @@ namespace TensorSharp.Cuda
             int a6 = wtype, a7 = ff, a8 = inDim; long a9 = rowBytes; int a10 = nUsed;
             IntPtr a11 = gateTab, a12 = upTab;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };
-            Launch(moeGateUpDecode, (uint)(nt * nUsed), CeilDiv(ff, 32), 2, BlockSize, 0, stream, args);
+            // Sixteen lanes a row, two rows a warp: a decode step's ten Q2_0 experts 22.7 -> 4.4 us on the RTX 5090.
+            if (moeGateUpDecodeHalf != IntPtr.Zero && _moeGateUpHalf)
+                Launch(moeGateUpDecodeHalf, (uint)(nt * nUsed), CeilDiv(ff, 16), 2, BlockSize, 0, stream, args);
+            else
+                Launch(moeGateUpDecode, (uint)(nt * nUsed), CeilDiv(ff, 32), 2, BlockSize, 0, stream, args);
         }
 
         /// <summary>Down projection of <paramref name="slots"/> (token, selected expert) slots, one
@@ -736,6 +800,16 @@ namespace TensorSharp.Cuda
             IntPtr a0 = w, a1 = act, a2 = output;
             int a3 = wtype, a4 = outDim, a5 = inDim; long a6 = rowBytes; int a7 = rows;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
+            // The formats the decode-once kernels read: each unit decoded once and dotted against every row, W warps an
+            // output row by shape. A 4-row window's 2560 -> 10240 IQ4_XS projection 33 -> 11.5 us on the RTX 5090.
+            if (rows <= DenseMultiMaxRows && DenseFastReads(wtype, inDim))
+            {
+                int wi = DenseFastWarps(outDim);
+                int ri = rows <= 1 ? 0 : rows <= 2 ? 1 : rows <= 4 ? 2 : 3;
+                int perBlock = 8 / wi;
+                Launch(denseFast[ri, wi == 1 ? 0 : wi == 2 ? 1 : 2], (uint)((outDim + perBlock - 1) / perBlock), 1, 1, BlockSize, 0, stream, args);
+                return;
+            }
             // Few output rows of a long input (a 10240 -> 320 hyper-connection projection): split each row's units
             // over a block's warps, or 32 rows a block would leave most of the GPU idle.
             if (denseQ81RowsSplitK != IntPtr.Zero && outDim <= SplitKMaxOutDim && inDim >= SplitKMinInDim)
@@ -970,7 +1044,10 @@ namespace TensorSharp.Cuda
             IntPtr w0 = x, w1 = w, w2 = y;
             int w3 = inDim, w4 = outDim, w5 = rows;
             void** wargs = stackalloc void*[] { &w0, &w1, &w2, &w3, &w4, &w5 };
-            Launch(gemvWarpBf16[RowBoundIndex(rows)], (uint)((outDim + 3) / 4), 1, 1, 128, 0, stream, wargs);
+            if (gemvBlockBf16 != null && _gemvBlockEnv)
+                Launch(gemvBlockBf16[RowBoundIndex(rows)], (uint)outDim, 1, 1, GemvBlockThreads, 0, stream, wargs);
+            else
+                Launch(gemvWarpBf16[RowBoundIndex(rows)], (uint)((outDim + 3) / 4), 1, 1, 128, 0, stream, wargs);
         }
 
         public void Gemv(IntPtr x, IntPtr w, IntPtr y, int inDim, int outDim, int rows, IntPtr stream, IntPtr scratch,
@@ -984,7 +1061,11 @@ namespace TensorSharp.Cuda
                 IntPtr w0 = x, w1 = w, w2 = y;
                 int w3 = inDim, w4 = outDim, w5 = rows;
                 void** wargs = stackalloc void*[] { &w0, &w1, &w2, &w3, &w4, &w5 };
-                Launch(gemvWarp[RowBoundIndex(rows)], (uint)((outDim + 3) / 4), 1, 1, 128, 0, stream, wargs);
+                // A block per output (the sums' order as the BF16 form's, so the two give the same bits).
+                if (gemvBlock != null && _gemvBlockEnv)
+                    Launch(gemvBlock[RowBoundIndex(rows)], (uint)outDim, 1, 1, GemvBlockThreads, 0, stream, wargs);
+                else
+                    Launch(gemvWarp[RowBoundIndex(rows)], (uint)((outDim + 3) / 4), 1, 1, 128, 0, stream, wargs);
                 return;
             }
             int splits = splitsOverride > 0 ? splitsOverride : Math.Min(16, (256 + outDim - 1) / outDim);

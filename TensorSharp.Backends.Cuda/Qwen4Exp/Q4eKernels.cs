@@ -440,7 +440,7 @@ namespace TensorSharp.Cuda
             IntPtr a0 = x, a1 = w, a2 = y;
             int a3 = e, a4 = hc; float a5 = eps;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
-            Launch(groupNorm, (uint)rows, 1, 1, BlockSize, stream, args);
+            Launch(groupNorm, (uint)rows, (uint)hc, 1, BlockSize, stream, args);
         }
 
         public void PleConv(IntPtr gated, IntPtr normc, IntPtr hists, IntPtr convWT, IntPtr res,

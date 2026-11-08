@@ -187,13 +187,31 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>The block's head over the streams of scratch row <paramref name="row"/>: its output mixer, then the
-        /// trunk's LM head into the last device's logits.</summary>
-        private void MtpHead(Dev dev, int row)
+        /// trunk's LM head into the last device's logits - its first <paramref name="vocab"/> rows (the draft
+        /// vocabulary), or all of them.</summary>
+        private void MtpHead(Dev dev, int row, int vocab = 0)
         {
             using (Tensor xs = Block(dev.Xs, row, 1, HcDim))
                 HcPre(dev, _mtpHeadNorm, _mtpHeadDown, _mtpHeadUp, null, 1, xs);
-            MatMulQ(dev, _output, dev.Cur, dev.Logits, 1);
+            DeviceWeight head = _output;
+            if (vocab > 0 && vocab < head.Ne1)
+                head.Ne1 = vocab;
+            MatMulQ(dev, head, dev.Cur, dev.Logits, 1);
         }
+
+        // TS_Q4E_DRAFT_VOCAB: the draft chain's head scores token ids [0, N) only (0 = the whole vocabulary). The ids
+        // past the Qwen2 base vocabulary - the later multilingual additions and the special tokens - are almost never the
+        // next token (0.2% of mixed English/Chinese text, 0.01% of Chinese), and the LM head over all 248,320 rows was
+        // 270 us of each draft step on the RTX 5090. The drafts only propose: the verify window scores the full vocabulary,
+        // so the answers are the same; a token outside the set is just never drafted.
+        private readonly int _draftVocabEnv = EnvInt("TS_Q4E_DRAFT_VOCAB", DefaultDraftVocab);
+
+        /// <summary>The Qwen2 base vocabulary the draft head scores by default (ids below the first added token of the
+        /// Qwen3.5/3.8 tokenizer's extensions).</summary>
+        internal const int DefaultDraftVocab = 151643;
+
+        /// <summary>Token ids the draft chain's head scores: <c>TS_Q4E_DRAFT_VOCAB</c>, at most the vocabulary.</summary>
+        internal int DraftVocab => _draftVocabEnv <= 0 ? _m.NVocab : Math.Min(_draftVocabEnv, _m.NVocab);
 
         /// <summary>A call's token rows embedded into the streams (on the embedding's device) and the trunk streams of the
         /// tokens before them into G (on the block's).</summary>
@@ -313,8 +331,8 @@ namespace TensorSharp.Cuda
             int row = left - 1, pos = p0 + n - 1;
             for (int s = 0; s < steps; s++)
             {
-                MtpHead(dev, row);
-                dev.QK.DraftPick(Ptr(dev.Logits), m.NVocab, Ptr(dev.DraftIds), Ptr(dev.DraftProbs), s, Ptr(dev.Tokens), dev.Stream,
+                MtpHead(dev, row, DraftVocab);
+                dev.QK.DraftPick(Ptr(dev.Logits), DraftVocab, Ptr(dev.DraftIds), Ptr(dev.DraftProbs), s, Ptr(dev.Tokens), dev.Stream,
                     Ptr(dev.DraftCand));
                 if (s + 1 == steps)
                     break;
