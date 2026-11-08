@@ -1385,6 +1385,14 @@ namespace TensorSharp.MLX
                 return MlxNative.QuantizedMatmul(input, weight.Weight, weight.FloatScales, weight.FloatBiases,
                     transpose: true, weight.GroupSize, weight.Bits, weight.Mode);
             }
+            if (rows >= 2 && weight.HalfAffine && weight.Biases.IsValid && string.Equals(weight.Mode, MlxAffineMode, StringComparison.Ordinal))
+            {
+                MlxNative.MlxArray fewRow = MlxNative.TryAffineFewRowMatmul(input, weight.Weight, weight.Scales, weight.Biases,
+                    rows, checked((int)weight.Ne0), checked((int)weight.Ne1), weight.Bits, weight.GroupSize,
+                    halfActivations: rows >= HalfMatmulMinRows);
+                if (fewRow.IsValid)
+                    return fewRow;
+            }
             if (rows < HalfMatmulMinRows || !weight.HalfAffine)
             {
                 return MlxNative.QuantizedMatmul(

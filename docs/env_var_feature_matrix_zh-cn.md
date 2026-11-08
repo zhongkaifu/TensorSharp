@@ -163,6 +163,7 @@ TensorAgent 在每次加载模型之前写入自己的取值（`EngineMemoryPoli
 | `TS_MLX_FEWROW_TENSOR` | 上面的少行 matmul 在 9 行起、支持 Metal 4 张量 API 的 Apple GPU 上（M5 及以后；MLX 0.32+） | 改在 GPU 核心的矩阵单元上运行：8 行以上 F32 simdgroup 乘法与反量化 GEMM 每次调用都要复制一份 F16 权重，这两者都用不到矩阵单元。每个 simdgroup 把 32 个权重行的一个 64 值块解码进自己的 tile，再与 16、32 或 64 行输入相乘。启动后构建并运行一次核函数来判定；没有该 API 的设备或 SDK 继续使用 simdgroup 核函数（以及 31/32 行的默认值）。`0` 在所有设备上都不用它 | 启用（`1`） | `0`、`1` | 否 |
 | `TS_MLX_GDN_ROWS_FUSED` | MLX 上 Qwen 3.5-3.8 的 GatedDeltaNet，在前向需要每一行的递归状态时（推测验证窗口） | 用一个 kernel 跑完整个窗口的递归，并边算边写出每一行的状态，而不是每行调用一次递归；部分接受的验证会回滚到这些逐行状态。`0` 恢复为每行一次调用 | 启用（`1`） | `0`、`1` | 否 |
 | `TS_MLX_IQ_DEQUANT_GEMM_MIN_ROWS` | 同上原始类型（Q6_K 与 IQ4_XS 用各自的开关） | 从该行数起把权重反量化为 F16（分片）并用 MLX 的 GEMM 相乘，而非少行核函数：Qwen3.8-27B-UD-IQ3_XXS 2.3K token 预填充 74 s -> 6 s；2048 行时比张量 API 少行核函数快 5%，1024 行时持平。`0` 保留 simdgroup 核函数 | `TS_MLX_IQ_FEWROW_MAX_ROWS` 加一（有张量 API 时 `1025`，否则 `32`） | 整数 >= 0 | 否 |
+| `TS_MLX_AFFINE_FEWROW_MAX_ROWS` | MLX 仿射权重（Q4_K、Q8_0、Q4_0/Q4_1 以及 MLX 原生 4 位和 8 位文件，F16 缩放） | 这类 matmul 走上面少行核函数的最大行数（从 2 行起）：按所在组的缩放与偏置解码打包的值，而不是用 MLX 的 `quantized_matmul`（在 M5 Pro 上行数很少时它只有约 120 GB/s）。Qwen3.8-27B 的 DFlash2 草稿器（Q4_K）：每次起草 17.6 -> 13.4 ms，长生成 27-28 -> 29-32 tok/s；Gemma 4 E2B Q8_0：8 行 28 -> 22 ms，128 行 87 -> 68（256 行起 MLX 更快）。`0` 让所有行数都交给 MLX | 有张量 API 时 `128`，否则 `8` | 整数 >= 0 | 否 |
 
 ## 矩阵外的纯 C# CPU 后端变量
 
