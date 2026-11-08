@@ -1577,7 +1577,7 @@ Concurrency was the gap. Under expert residency the plan left VRAM for one seque
 a second request found no slot and waited ("The model has no device slot for another concurrent request"): four
 requests at once ran one after another at the single-stream rate, TTFT 0.1 / 3 / 6 / 9 s. `TS_Q4E_LANES` (1-16,
 default 1) has the plan leave VRAM for that many sequences; concurrent requests then get slots of their own and decode
-together. A lane costs about 1.2 GB with the resident KV window (four lanes: 95.4% of the profiled routes resident
+together. A lane costs about 1.5 GB with the resident KV window (four lanes: 92.9% of the profiled routes resident
 instead of 98.4%).
 
 Concurrent requests also speculate together. Each scheduler step drafts every sequence's MTP chain on its own slot and
@@ -1608,11 +1608,13 @@ RTX 5090, ISTA Q2_0 with the MTP head, `--sampling-precedence request`, three re
 | TensorSharp at the round's start (1 lane) | 149-169 | 161-165 | 148-161 (serialized) |
 | TensorSharp, 1 lane (the default) | 191-203 | 198-216 | 200-201 (serialized, each request speculating) |
 | TensorSharp, 4 lanes, plain batched decode | 202-212 | 282-296 | 263-272 |
-| TensorSharp, 4 lanes, batched verify | 174-204 | 242-292 | 221-271 |
+| TensorSharp, 4 lanes, batched verify | 162-196 | 281-286 | 243-258 |
 
-Per request the batched verify decodes 92-116 tok/s against 79-89 for plain batched decode, but in some rounds one
-request of four still waits up to 3 s for a slot (a fifth slot is asked for while a finished conversation's is
-retained), which holds the aggregate at the plain batched rate. Sanity stays 12/12 and no request fails. Greedy answers
+Per request the batched verify decodes 92-116 tok/s against 79-89 for plain batched decode. One request of four used to
+wait 3-6 s for a slot in the concurrency rounds: the lane plan did not count the rewind checkpoint's copies, a slot
+whose free was refused while it was the engine's selection was never freed, and the shared reclaim stopped at a
+retained slot it could not free. With those fixed every request's TTFT is 0.62-0.67 s. Sanity stays 12/12 and no
+request fails. Greedy answers
 of four requests at once are byte-identical to the same requests one at a time with the history-dependent shortcuts off
 (`TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0 TS_Q4E_HYBRID_MISSES=0`, prefix reuse off): 4 of 4, and so are two solo
 runs. With the defaults even two solo runs differ (1 of 4), as the route-tail skip and adaptive residency intend.
