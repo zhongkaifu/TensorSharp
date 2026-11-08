@@ -152,6 +152,8 @@ TensorAgent 在每次加载模型之前写入自己的取值（`EngineMemoryPoli
 | `TS_MLX_Q6K_MATVEC_MAX_ROWS` | MLX 上的精确 Q6_K matmul | 行数不超过该值时，Q6_K 以矩阵-向量乘运行（移植自 ggml-metal 的 `kernel_mul_mv_q6_K_f32`）；更多行且不超过 `TS_MLX_IQ_FEWROW_MAX_ROWS` 时走少行核函数，再多则把 Q6_K 反量化为 F16（每片不超过 256 MB）并用 MLX 的 GEMM 相乘 | `4` | 整数 >= 0 | 否 |
 | `TS_MLX_IQ4XS_MATVEC_MAX_ROWS` | MLX 上的 IQ4_XS matmul | 行数不超过该值时，IQ4_XS 以矩阵-向量乘运行（移植自 ggml-metal 的 `kernel_mul_mv_iq4_xs_f32`）；更多行且不超过 `TS_MLX_IQ_FEWROW_MAX_ROWS` 时走少行核函数，再多则把 IQ4_XS 反量化为 F16（每片不超过 256 MB）并用 MLX 的 GEMM 相乘 | `4` | 整数 >= 0 | 否 |
 | `TS_MLX_IQ_FEWROW_MAX_ROWS` | MLX 上原始 i-quant / K-quant 的 matmul（IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ1_S、IQ1_M、IQ4_XS、Q2_K、Q3_K、Q6_K） | 少行核函数接受的最大行数（从 2 行起）：每组 8 个权重只解码一次进 simdgroup 矩阵块（8 行以下 F32，8 行起 F16），与最多 8 行输入相乘，用于推测解码的验证窗口；`0` 让这些行数回到原核函数 | `31` | 整数 >= 0 | 否 |
+| `TS_MLX_FEWROW_TENSOR` | 上面的少行 kernel 在 8 行起（F16 激活）、支持 Metal 4 张量 API 的 Apple GPU 上（M5 及以后；MLX 0.32+） | 把少行 kernel 的乘积改为在 8 个 simdgroup 上运行 MetalPerformancePrimitives `matmul2d`（每个 8 值组仍只在 threadgroup 内存中解码一次，激活以 F16 从设备内存读取）。Qwen3.8-27B-UD-IQ3_XXS 配 DFlash2 在 M5 Pro 上：8 行验证窗口 188 ms -> 157 ms。没有张量 API 的设备或 SDK 在 kernel 探测时失败，继续使用 simdgroup kernel；`0` 在所有设备上都保留它 | 启用（`1`） | `0`、`1` | 否 |
+| `TS_MLX_GDN_ROWS_FUSED` | MLX 上 Qwen 3.5-3.8 的 GatedDeltaNet，在前向需要每一行的递归状态时（推测验证窗口） | 用一个 kernel 跑完整个窗口的递归，并边算边写出每一行的状态，而不是每行调用一次递归；部分接受的验证会回滚到这些逐行状态。`0` 恢复为每行一次调用 | 启用（`1`） | `0`、`1` | 否 |
 | `TS_MLX_IQ_DEQUANT_GEMM_MIN_ROWS` | 同上原始类型（Q6_K 与 IQ4_XS 用各自的开关） | 从该行数起把权重反量化为 F16（分片）并用 MLX 的 GEMM 相乘，而非 simdgroup 核函数：Qwen3.8-27B-UD-IQ3_XXS 2.3K token 预填充 74 s -> 6 s；`0` 保留 simdgroup 核函数 | `32` | 整数 >= 0 | 否 |
 
 ## 矩阵外的纯 C# CPU 后端变量
