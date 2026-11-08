@@ -1624,6 +1624,14 @@ namespace TensorSharp.Models
                 _attnMask = new ushort[need];
             const ushort NegInfF16 = 0xFC00;
             bool qsaMask = HasQsa && _qsaPositions != null;
+            // Text keeps the identity positions ((j, j, j) for cell j), and its mask is the ordinary causal one: each
+            // row a run of zeros up to its own token, then -inf. Filled as runs, not cell by cell: the per-cell fill
+            // took 85 / 168 / 253 / 341 ms for the four 4096-token chunks of a 16K-token prompt (0.85 s of its TTFT).
+            if (!qsaMask || QsaPositionsAreIdentity(_qsaPositions, totalLen))
+            {
+                FillCausalMask(_attnMask, seqLen, padded, startPos, totalLen);
+                return padded;
+            }
             // ONE fixed block around the whole fill. Pinning per row ends the pin at
             // that statement and leaves the writes going through a pointer into an
             // array the GC is free to move.
@@ -1645,6 +1653,46 @@ namespace TensorSharp.Models
                 }
             }
             return padded;
+        }
+
+        /// <summary>Whether the first <paramref name="count"/> cells carry identity positions (text only, no media
+        /// coordinates and no rotary gap), for which the QSA order is the cell order.</summary>
+        internal static bool QsaPositionsAreIdentity(int[] positions, int count)
+        {
+            if (positions == null || (long)count * 3 > positions.LongLength)
+                return false;
+            for (int j = 0, o = 0; j < count; j++, o += 3)
+                if (positions[o] != j || positions[o + 1] != j || positions[o + 2] != j)
+                    return false;
+            return true;
+        }
+
+        /// <summary>The causal mask, F16 [<paramref name="seqLen"/> rows x <paramref name="stride"/>]: row t sees cells
+        /// 0 .. startPos + t (and none past <paramref name="totalLen"/>). Rows are independent runs; a prompt-sized mask
+        /// (tens of millions of cells) fills on several threads.</summary>
+        internal static void FillCausalMask(ushort[] mask, int seqLen, int stride, int startPos, int totalLen)
+        {
+            const ushort NegInfF16 = 0xFC00;
+            void Rows(int from, int to)
+            {
+                Span<ushort> all = mask.AsSpan();
+                for (int t = from; t < to; t++)
+                {
+                    Span<ushort> row = all.Slice(t * stride, stride);
+                    int visible = Math.Clamp(Math.Min(startPos + t + 1, totalLen), 0, stride);
+                    row.Slice(0, visible).Clear();
+                    row.Slice(visible).Fill(NegInfF16);
+                }
+            }
+            long cells = (long)seqLen * stride;
+            if (cells < (1L << 22) || seqLen < 64)
+            {
+                Rows(0, seqLen);
+                return;
+            }
+            int blocks = Math.Min(Environment.ProcessorCount, 8);
+            int per = (seqLen + blocks - 1) / blocks;
+            System.Threading.Tasks.Parallel.For(0, blocks, b => Rows(b * per, Math.Min(seqLen, (b + 1) * per)));
         }
 
         private bool _fusedGdnUnsupported;
