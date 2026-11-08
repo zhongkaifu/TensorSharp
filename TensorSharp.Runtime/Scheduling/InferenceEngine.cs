@@ -96,7 +96,7 @@ namespace TensorSharp.Runtime.Scheduling
                     "TS_SCHED_MIXED_PREFILL_TOKENS overrides it, 0 for none)", cfg.MixedStepPrefillBudget);
             }
             _stopRepetition = cfg.StopRepetition;   // cfg is null-checked above
-            _nativeSlotContextLimit = UsesNativeDeepSeek41Slots(model) ? Math.Max(0, model.MaxContextLength) : 0;
+            _nativeSlotContextLimit = UsesNativeSequenceSlots(model) ? Math.Max(0, model.MaxContextLength) : 0;
             _contextLimit = Math.Max(0, model.MaxContextLength);
             // The same name the engine gauges use (TensorSharpMetrics.RegisterEngine).
             string? architecture = model.Config?.Architecture;
@@ -108,7 +108,10 @@ namespace TensorSharp.Runtime.Scheduling
             _pool = new BlockPool(numBlocks, cfg.BlockSize, blockBytes);
             _scheduler = new ContinuousBatchScheduler(cfg, _pool, logger,
                 supportsCrossSequenceKvReuse: model.SupportsCrossSequenceKvReuse,
-                requiresPerBlockCapture: model.RequiresPerBlockCapture);
+                requiresPerBlockCapture: model.RequiresPerBlockCapture)
+            {
+                TelemetryArchitecture = string.IsNullOrEmpty(architecture) ? "unknown" : architecture,
+            };
             AttachSoloPrefillPolicy(model, cfg, _scheduler, _logger);
             _executor = new BatchExecutor(model, _pool, _scheduler, logger);
             _executor.InitializeRadixCache(cfg);
@@ -156,6 +159,10 @@ namespace TensorSharp.Runtime.Scheduling
 
         public IModelArchitecture Model => _model;
         public BlockPoolStats PoolStats => _pool.GetStats();
+
+        /// <summary>The model's slot and graph counters, when it keeps sequence slots of its own
+        /// (read by <see cref="Telemetry.TensorSharpMetrics"/>).</summary>
+        internal Telemetry.IServingTelemetrySource? ServingTelemetrySource => _model as Telemetry.IServingTelemetrySource;
         /// <summary>The block pool itself, for tests that inspect its slabs.</summary>
         internal BlockPool Pool => _pool;
         /// <summary>The radix prefix cache, or null when it does not serve this model.</summary>
@@ -488,6 +495,7 @@ namespace TensorSharp.Runtime.Scheduling
                     Interlocked.Increment(ref _totalStepsRun);
                     Interlocked.Add(ref _totalForwardTicks, stepTicks);
                     RecordStepMetrics(output, stepTicks);
+                    RecordInterTokenLatency(results, output);
 
                     // Post-step: emit tokens, detect stop conditions, finish sequences.
                     ApplyResults(results, output);
@@ -521,11 +529,48 @@ namespace TensorSharp.Runtime.Scheduling
         {
             var duration = Telemetry.TensorSharpMetrics.EngineStepDuration;
             var batchSize = Telemetry.TensorSharpMetrics.EngineBatchSize;
-            if (!duration.Enabled && !batchSize.Enabled)
+            var prefillTokens = Telemetry.TensorSharpMetrics.StepPrefillTokens;
+            if (!duration.Enabled && !batchSize.Enabled && !prefillTokens.Enabled)
+                return;
+            var work = output.ScheduledWork;
+            var kind = StepKindTag(work);
+            duration.Record((double)stepTicks / System.Diagnostics.Stopwatch.Frequency, _architectureTag, kind);
+            batchSize.Record(work.Count, _architectureTag, kind);
+
+            int prompt = 0;
+            for (int i = 0; i < work.Count; i++)
+                if (work[i].IsPrefill)
+                    prompt += work[i].NumScheduledTokens;
+            if (prompt > 0 && prefillTokens.Enabled)
+                prefillTokens.Record(prompt, _architectureTag, kind);
+        }
+
+        /// <summary>The time since each sequence's previous output token, once per token this step
+        /// emitted for it (a speculative step's tokens share the step), by the kind of step that
+        /// emitted it: a decoding sequence's gap in a <c>mixed</c> step is what other requests'
+        /// prompts cost it. Engine thread.</summary>
+        private void RecordInterTokenLatency(List<SequenceStepResult> results, SchedulerOutput output)
+        {
+            var histogram = Telemetry.TensorSharpMetrics.InterTokenLatency;
+            if (!histogram.Enabled)
                 return;
             var kind = StepKindTag(output.ScheduledWork);
-            duration.Record((double)stepTicks / System.Diagnostics.Stopwatch.Frequency, _architectureTag, kind);
-            batchSize.Record(output.ScheduledWork.Count, _architectureTag, kind);
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            for (int i = 0; i < results.Count; i++)
+            {
+                var r = results[i];
+                if (r.SampledToken < 0 || r.Error != null || r.SlotUnavailable)
+                    continue;
+                var seq = r.Sequence;
+                int tokens = 1 + (r.ExtraTokens?.Count ?? 0);
+                if (seq.LastTokenTimestamp > 0)
+                {
+                    double each = (double)(now - seq.LastTokenTimestamp) / System.Diagnostics.Stopwatch.Frequency / tokens;
+                    for (int t = 0; t < tokens; t++)
+                        histogram.Record(each, _architectureTag, kind);
+                }
+                seq.LastTokenTimestamp = now;
+            }
         }
 
         /// <summary>Whether a step forwarded prompt chunks, decode tokens, or both.</summary>
@@ -821,7 +866,7 @@ namespace TensorSharp.Runtime.Scheduling
                         if (_nativeSlotContextLimit > 0 && requested > _nativeSlotContextLimit)
                             throw RefuseForContext(cmd.Sequence, new ContextLengthExceededException(
                                 promptTokens, _nativeSlotContextLimit,
-                                $"DeepSeek V4.1 request requires {requested} tokens, but each native sequence slot " +
+                                $"The request requires {requested} tokens, but each native sequence slot " +
                                 $"has a context limit of {_nativeSlotContextLimit}. Shorten the prompt or output allowance."));
                         _scheduler.Submit(cmd.Sequence);
                     }
@@ -1149,12 +1194,13 @@ namespace TensorSharp.Runtime.Scheduling
             if (contextLength <= 0)
                 return numBlocks;
 
-            // V4.1 stores complete per-request KV state in native slots. Its
+            // A model with native sequence slots (V4.1, the direct-CUDA Qwen 3.8
+            // Flash Next engine) stores complete per-request state in them. Its
             // zero-byte block pool only tracks scheduling reservations; limiting
             // that pool to one aggregate context needlessly evicts healthy slots
             // and recomputes their prompts. Size metadata for all admitted slots.
-            // Other architectures retain their existing shared-pool semantics.
-            int contexts = UsesNativeDeepSeek41Slots(model) ? Math.Max(1, cfg.MaxNumRunningSequences) : 1;
+            // Other models retain their existing shared-pool semantics.
+            int contexts = UsesNativeSequenceSlots(model) ? Math.Max(1, cfg.MaxNumRunningSequences) : 1;
             long neededLong = ((long)contextLength + cfg.BlockSize - 1) / cfg.BlockSize * contexts;
             if (neededLong > int.MaxValue)
                 throw new InvalidOperationException(
@@ -1224,10 +1270,14 @@ namespace TensorSharp.Runtime.Scheduling
                 ? SchedulerConfig.PageFamilyBlockSize
                 : SchedulerConfig.DefaultBlockSize;
 
-        private static bool UsesNativeDeepSeek41Slots(IModelArchitecture model)
-            => string.Equals(model.Config?.Architecture, "deepseek41", StringComparison.OrdinalIgnoreCase)
-                && !model.SupportsKVStateSnapshot
-                && model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true };
+        /// <summary>Whether the model keeps each sequence's whole state in a native slot
+        /// (<see cref="IBatchedPagedModel.UsesNativeSequenceSlots"/>, or DeepSeek V4.1's
+        /// holders), so the block pool only tracks reservations.</summary>
+        private static bool UsesNativeSequenceSlots(IModelArchitecture model)
+            => !model.SupportsKVStateSnapshot
+                && model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true } batched
+                && (batched.UsesNativeSequenceSlots
+                    || string.Equals(model.Config?.Architecture, "deepseek41", StringComparison.OrdinalIgnoreCase));
 
         private struct EngineCommand
         {

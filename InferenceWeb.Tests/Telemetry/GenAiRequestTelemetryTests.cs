@@ -190,6 +190,46 @@ public sealed class GenAiRequestTelemetryTests : IDisposable
     }
 
     [Fact]
+    public void TheSpanCarriesTheRequestsOwnPrefillAndDecodeRates()
+    {
+        string model = NewModel();
+        using (var telemetry = GenAiRequestTelemetry.Start(TelemetryAttributes.OperationChat, model, null))
+        {
+            DateTime scheduled = telemetry.StartedAtUtc.AddMilliseconds(10);
+            DateTime first = scheduled.AddMilliseconds(500);
+            DateTime end = first.AddSeconds(2);
+            // 3,000 prompt tokens, 1,000 cached: 2,000 prefilled in half a second; 41 tokens out,
+            // 40 after the first in two seconds.
+            telemetry.RecordThroughput(inputTokens: 3000, cachedTokens: 1000, outputTokens: 41, scheduled, first, end);
+        }
+        var chat = Assert.Single(_stopped, a => a.DisplayName == $"chat {model}");
+        Assert.Equal(2000, chat.GetTagItem(TelemetryAttributes.UncachedPromptTokens));
+        Assert.Equal(4000.0, (double)chat.GetTagItem(TelemetryAttributes.PrefillTokensPerSecond)!, 1);
+        Assert.Equal(20.0, (double)chat.GetTagItem(TelemetryAttributes.DecodeTokensPerSecond)!, 1);
+
+        // A fully cached prompt has no prefill rate, and one token out has no decode rate.
+        string cached = NewModel();
+        using (var telemetry = GenAiRequestTelemetry.Start(TelemetryAttributes.OperationChat, cached, null))
+        {
+            DateTime first = telemetry.StartedAtUtc.AddMilliseconds(30);
+            telemetry.RecordThroughput(inputTokens: 500, cachedTokens: 600, outputTokens: 1, telemetry.StartedAtUtc, first, first.AddMilliseconds(5));
+        }
+        var hit = Assert.Single(_stopped, a => a.DisplayName == $"chat {cached}");
+        Assert.Equal(0, hit.GetTagItem(TelemetryAttributes.UncachedPromptTokens));
+        Assert.Null(hit.GetTagItem(TelemetryAttributes.PrefillTokensPerSecond));
+        Assert.Null(hit.GetTagItem(TelemetryAttributes.DecodeTokensPerSecond));
+
+        // Without a first token there are no rates at all.
+        string failed = NewModel();
+        using (var telemetry = GenAiRequestTelemetry.Start(TelemetryAttributes.OperationChat, failed, null))
+            telemetry.RecordThroughput(100, 0, 0, telemetry.StartedAtUtc, null, telemetry.StartedAtUtc.AddSeconds(1));
+        var none = Assert.Single(_stopped, a => a.DisplayName == $"chat {failed}");
+        Assert.Equal(100, none.GetTagItem(TelemetryAttributes.UncachedPromptTokens));
+        Assert.Null(none.GetTagItem(TelemetryAttributes.PrefillTokensPerSecond));
+        Assert.Null(none.GetTagItem(TelemetryAttributes.DecodeTokensPerSecond));
+    }
+
+    [Fact]
     public void FailureRecordsTheTypeNeverTheMessageAndTimingIsOnlyForSuccess()
     {
         string model = NewModel();

@@ -2402,7 +2402,9 @@ CLI 在运行结束时执行这次导出，即单次模式结束或交互式会�
 POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、tensorsharp.protocol、gen_ai.response.id
 └─ chat <model>                gen_ai.request.model、gen_ai.request.* 采样参数、gen_ai.usage.input_tokens /
    │                           output_tokens / cache_read.input_tokens、gen_ai.response.finish_reasons、
-   │                           tensorsharp.ttft_ms、tensorsharp.backend、tensorsharp.outcome
+   │                           tensorsharp.ttft_ms、tensorsharp.backend、tensorsharp.outcome、
+   │                           tensorsharp.prompt.uncached_tokens、tensorsharp.prefill.tokens_per_second、
+   │                           tensorsharp.decode.tokens_per_second
    ├─ prompt.render            套用聊天模板并分词，直到请求进入引擎
    ├─ inference.queue          等待调度器
    ├─ inference.prefill        直到生成第一个 token；tensorsharp.compute.prefill_ms
@@ -2416,6 +2418,10 @@ POST /v1/chat/completions      HTTP 服务端 span：tensorsharp.request_id、te
   客户端若发送 W3C `traceparent` 请求头，该请求会落在客户端自己的 trace 中。
 - `inference.*` span 记录的是墙钟时间。连续批处理下它会与其他请求重叠，因此
   `tensorsharp.compute.prefill_ms` 和 `tensorsharp.compute.decode_ms` 给出本请求自己占用的引擎时间。
+- `tensorsharp.prompt.uncached_tokens` 是提示词中未由前缀缓存提供的 token 数。
+  `tensorsharp.prefill.tokens_per_second` 是它除以从请求首次被调度到第一个 token 的时间，
+  `tensorsharp.decode.tokens_per_second` 是第一个 token 之后的 token 数除以之后的时间：即本请求实际得到的速度，
+  便于按提示词长度或同时运行的请求数拆分。区间为空的速率不记录。
 - Ollama 的 `/api/generate` 为 `text_completion <model>`。嵌入请求（`/v1/embeddings`、`/api/embed`）为
   `embeddings <model>`，带 `tensorsharp.embedding.inputs`。
 - DiffusionGemma 的聊天 span 下有 `prompt.render` 和一个 `diffusion.denoise` span，每次预览对应一个
@@ -2508,6 +2514,19 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 | `tensorsharp.tokens.cache_read` | counter，`{token}` | 同首 token 时间。由前缀缓存提供的提示 token，是 `input` 的子集 |
 | `tensorsharp.engine.step.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind` |
 | `tensorsharp.engine.batch.size` | histogram，`{sequence}` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind` |
+| `tensorsharp.engine.step.prefill_tokens` | histogram，`{token}` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind`。一步前向的提示词 token 数 |
+| `tensorsharp.engine.inter_token.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind`（产生该 token 的步骤）。同一序列相邻两个输出 token 的间隔；`mixed` 与 `decode` 的差即与提示词共用步骤的代价 |
+| `tensorsharp.prefix_cache.lookups` | counter，`{lookup}` | `tensorsharp.model.architecture`、`tensorsharp.prefix_cache.outcome`（`full`、`partial`、`miss`）、`tensorsharp.prefix_cache.source` |
+| `tensorsharp.engine.stage.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.stage`、`tensorsharp.engine.step_kind`、`tensorsharp.engine.rows`；仅在设置 `TS_Q4E_PERF_SAMPLE=N` 时记录 |
+| `tensorsharp.slots` | gauge，`{slot}` | `tensorsharp.model.architecture`、`tensorsharp.slot.state`（`running`、`retained`） |
+| `tensorsharp.slots.memory` / `.capacity` | gauge，`By` / `{token}` | `tensorsharp.model.architecture` |
+| `tensorsharp.slots.grows`、`.grow_failures` | counter | `tensorsharp.model.architecture` |
+| `tensorsharp.slots.reclaims` | counter，`{slot}` | `tensorsharp.model.architecture`、`tensorsharp.slot.reclaim_reason`（`new_slot`、`growth`） |
+| `tensorsharp.slots.rewinds` | counter，`{rewind}` | `tensorsharp.model.architecture`、`tensorsharp.rewind.route`（`checkpoint`、`replay`、`reset`、`refused`） |
+| `tensorsharp.slots.rewind.replayed_tokens` | counter，`{token}` | `tensorsharp.model.architecture` |
+| `tensorsharp.cuda_graph.captures`、`.launches` | counter | `tensorsharp.model.architecture`、`tensorsharp.cuda_graph.kind`（`solo`、`batched`） |
+| `tensorsharp.cuda_graph.capture_failures` | counter，`{failure}` | `tensorsharp.model.architecture` |
+| `tensorsharp.engine.forward.issue_time`、`.wait_time` | counter，`s` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.requests.running`、`.waiting` | gauge，`{request}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.steps` | counter，`{step}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.forward.time` | counter，`s` | `tensorsharp.model.architecture` |

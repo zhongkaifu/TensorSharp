@@ -87,13 +87,15 @@ namespace TensorSharp.Cuda
             dev.ShGate = AllocF32(dev, nt, m.NFfShexp);
             dev.ShUp = AllocF32(dev, nt, m.NFfShexp);
             dev.ShDown = AllocF32(dev, nt, e);
-            dev.PosDev = AllocT(dev, DType.Int32, 1);
+            // One position per row of a captured step: a solo decode reads element 0, a batched one
+            // row r's at element r.
+            dev.PosDev = AllocT(dev, DType.Int32, MaxBatchedDecodeRows);
             if (dev.Ordinal == 0)
             {
                 dev.Tokens = AllocT(dev, DType.Int32, nt);
                 // PORTABLE: every device may read them.
                 CudaDriverApi.cuMemHostAlloc(out _pinnedTokens, new UIntPtr((ulong)nt * 4), 0x1).ThrowOnError();
-                CudaDriverApi.cuMemHostAlloc(out _posPinned, new UIntPtr(4), 0x1).ThrowOnError();
+                CudaDriverApi.cuMemHostAlloc(out _posPinned, new UIntPtr((ulong)MaxBatchedDecodeRows * 4), 0x1).ThrowOnError();
             }
             if (dev.Ordinal == _lastDev)
             {
@@ -149,9 +151,11 @@ namespace TensorSharp.Cuda
         private Slot CreateSlot()
         {
             var m = _m;
+            int capacity = InitialSlotTokens;
             var slot = new Slot
             {
                 Id = _nextSlotId++,
+                Capacity = capacity,
                 Layers = new SlotLayer[m.NLayer],
                 StatePtrs = new Tensor[_devs.Length],
                 DeviceBytes = new long[_devs.Length],
@@ -171,22 +175,27 @@ namespace TensorSharp.Cuda
                     c.Ssm = SlotTensor(slot, dev, DType.Float32, (long)m.GdnVHeads * Q4eKernels.GdnHeadDim * Q4eKernels.GdnHeadDim);
                     ptrs[dev.Ordinal][2 * il] = (long)Ptr(c.ConvState);
                     ptrs[dev.Ordinal][2 * il + 1] = (long)Ptr(c.Ssm);
+                    if (_rewindCheckpoint)
+                    {
+                        slot.ConvCp ??= new Tensor[m.NLayer];
+                        slot.SsmCp ??= new Tensor[m.NLayer];
+                        slot.ConvCp[il] = SlotTensor(slot, dev, DType.Float32, c.ConvState.ElementCount());
+                        slot.SsmCp[il] = SlotTensor(slot, dev, DType.Float32, c.Ssm.ElementCount());
+                    }
                 }
                 else
                 {
-                    long kv = (long)m.NCtx * m.NKvHead * m.HeadDim;
-                    c.KCache = SlotTensor(slot, dev, DType.Float16, kv);
-                    c.VCache = SlotTensor(slot, dev, DType.Float16, kv);
-                    if (L.Ratio > 0)
-                    {
-                        c.IdxRaw = SlotTensor(slot, dev, DType.Float16, (long)m.NCtx * m.IdxDim);
-                        c.IdxPooled = SlotTensor(slot, dev, DType.Float32, (long)(m.NCtx / L.Ratio) * m.IdxDim);
-                    }
+                    c = AllocAttentionCaches(dev, L, capacity, slot.DeviceBytes);
+                    foreach (Tensor t in new[] { c.KCache, c.VCache, c.IdxRaw, c.IdxPooled })
+                        if (t != null)
+                            slot.Owned.Add(t);
                 }
                 if (L.Ple && PleHistRows > 0)
                 {
                     slot.PleHist = SlotTensor(slot, dev, DType.Float32, (long)PleHistRows * HcDim);
                     ptrs[dev.Ordinal][2 * m.NLayer] = (long)Ptr(slot.PleHist);
+                    if (_rewindCheckpoint)
+                        slot.PleHistCp = SlotTensor(slot, dev, DType.Float32, (long)PleHistRows * HcDim);
                 }
                 slot.Layers[il] = c;
             }
@@ -201,6 +210,38 @@ namespace TensorSharp.Cuda
             }
             ClearSlot(slot);
             return slot;
+        }
+
+        /// <summary>An attention layer's caches for <paramref name="capacity"/> positions (K/V, and the
+        /// QSA raw and block keys), their bytes added to <paramref name="deviceBytes"/>.</summary>
+        private SlotLayer AllocAttentionCaches(Dev dev, DevLayer L, int capacity, long[] deviceBytes)
+        {
+            var m = _m;
+            dev.MakeCurrent();
+            var c = new SlotLayer();
+            Tensor Make(DType type, long elements)
+            {
+                var t = new Tensor(dev.Alloc, type, elements);
+                deviceBytes[dev.Ordinal] += elements * type.Size();
+                return t;
+            }
+            try
+            {
+                long kv = (long)capacity * m.NKvHead * m.HeadDim;
+                c.KCache = Make(DType.Float16, kv);
+                c.VCache = Make(DType.Float16, kv);
+                if (L.Ratio > 0)
+                {
+                    c.IdxRaw = Make(DType.Float16, (long)capacity * m.IdxDim);
+                    c.IdxPooled = Make(DType.Float32, (long)(capacity / L.Ratio) * m.IdxDim);
+                }
+                return c;
+            }
+            catch
+            {
+                c.KCache?.Dispose(); c.VCache?.Dispose(); c.IdxRaw?.Dispose();
+                throw;
+            }
         }
 
         private static Tensor SlotTensor(Slot slot, Dev dev, DType type, long elements)
@@ -232,6 +273,43 @@ namespace TensorSharp.Cuda
             slot.NPast = 0;
             slot.Failed = false;
             slot.PleTokens.Length = 0;
+            slot.CpNPast = -1;
+        }
+
+        /// <summary>Copy <paramref name="slot"/>'s recurrent states into its checkpoint
+        /// (<paramref name="restore"/> false) or back (true), on each layer's device stream.</summary>
+        private void CopyCheckpoint(Slot slot, bool restore)
+        {
+            for (int il = 0; il < _m.NLayer; il++)
+            {
+                if (slot.ConvCp?[il] == null)
+                    continue;
+                var dev = _devs[_layers[il].Device];
+                dev.MakeCurrent();
+                var c = slot.Layers[il];
+                CopyD(dev, restore ? c.ConvState : slot.ConvCp[il], restore ? slot.ConvCp[il] : c.ConvState);
+                CopyD(dev, restore ? c.Ssm : slot.SsmCp[il], restore ? slot.SsmCp[il] : c.Ssm);
+            }
+            if (slot.PleHistCp != null)
+            {
+                var dev = _devs[_layers[_pleLayer].Device];
+                dev.MakeCurrent();
+                CopyD(dev, restore ? slot.PleHist : slot.PleHistCp, restore ? slot.PleHistCp : slot.PleHist);
+            }
+        }
+
+        private static void CopyD(Dev dev, Tensor dst, Tensor src)
+            => CudaDriverApi.cuMemcpyDtoDAsync(Ptr(dst), Ptr(src), new UIntPtr((ulong)src.ElementCount() * 4), dev.Stream).ThrowOnError();
+
+        /// <summary>The active slot's states, at its head, become its rewind checkpoint: called at the
+        /// end of every multi-token forward, a prompt boundary.</summary>
+        private void CheckpointActive()
+        {
+            Slot s = _active;
+            if (!_rewindCheckpoint || s.Failed || s.ConvCp == null)
+                return;
+            CopyCheckpoint(s, restore: false);
+            s.CpNPast = s.NPast;
         }
 
         private static void Zero(Dev dev, Tensor t, int elementBytes)
@@ -247,6 +325,7 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuStreamSynchronize(dev.Stream);
             }
             DestroySlotGraphs(slot.Id);
+            CountSlot(slot, -1);
             foreach (var t in slot.Owned)
                 t.Dispose();
             slot.Owned.Clear();
@@ -277,24 +356,41 @@ namespace TensorSharp.Cuda
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            EnsureCapacity(slot, slot.NPast + tokens.Length);
+            bool sampled = logitsOut != null && BeginSampledForward();
+            _issueEnd = 0;
             slot.Failed = true;
-            if (tokens.Length == 1 && logitsOut != null && CanCaptureDecode && ForwardDecodeGraphed(slot, tokens[0], slot.NPast, logitsOut))
+            try
             {
-                slot.NPast++;
-            }
-            else
-            {
-                int done = 0;
-                while (done < tokens.Length)
+                if (tokens.Length == 1 && logitsOut != null && CanCaptureDecode && ForwardDecodeGraphed(slot, tokens[0], slot.NPast, logitsOut))
                 {
-                    int nt = Math.Min(_m.NUbatch, tokens.Length - done);
-                    bool last = done + nt == tokens.Length;
-                    ForwardUbatch(slot, tokens, done, nt, slot.NPast, last ? logitsOut : null);
-                    slot.NPast += nt;
-                    done += nt;
+                    slot.NPast++;
+                }
+                else
+                {
+                    int done = 0;
+                    while (done < tokens.Length)
+                    {
+                        int nt = Math.Min(_m.NUbatch, tokens.Length - done);
+                        bool last = done + nt == tokens.Length;
+                        ForwardUbatch(slot, tokens, done, nt, slot.NPast, last ? logitsOut : null);
+                        slot.NPast += nt;
+                        done += nt;
+                    }
                 }
             }
+            finally
+            {
+                if (sampled)
+                {
+                    try { EndSampledForward(tokens.Length, tokens.Length == 1); }
+                    catch (Exception) { _sampling = false; }
+                }
+            }
+            CountForwardTime(start);
             slot.Failed = false;
+            if (tokens.Length >= 2)
+                CheckpointActive();
             if (_perf > 0)
             {
                 double secs = sw.Elapsed.TotalSeconds;
@@ -346,7 +442,8 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>One layer: the PLE block where it sits, then both mixed halves. <paramref name="pos"/>
-        /// is the device copy of the row's position a captured decode step reads (zero: p0 is used).</summary>
+        /// is the device copy of the row's position a captured decode step reads (zero: p0 is used); in
+        /// a captured batched step (<paramref name="rows"/> set) row r reads element r.</summary>
         private void RunLayer(Dev dev, int il, Slot slot, int nt, int p0, Slot[] rows, int[] positions, IntPtr pos)
         {
             var m = _m;
@@ -361,7 +458,8 @@ namespace TensorSharp.Cuda
                 Gdn(dev, L, il, slot, nt, rows);
             else if (rows != null)
                 for (int r = 0; r < nt; r++)
-                    Attention(dev, L, il, rows[r].Layers[il], r, 1, positions[r]);
+                    Attention(dev, L, il, rows[r].Layers[il], r, 1, positions[r],
+                        pos == IntPtr.Zero ? IntPtr.Zero : (IntPtr)((long)pos + 4L * r));
             else
                 Attention(dev, L, il, slot.Layers[il], 0, nt, p0, pos);
             dev.QK.HcPost(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), nt, e, m.Hc, dev.Stream);
@@ -617,8 +715,8 @@ namespace TensorSharp.Cuda
         private void Head(int nt, float[] logitsOut, bool allRows, float[] hOut = null)
         {
             IssueHead(nt, logitsOut != null, allRows, hOut != null);
-            if (_perf > 0)
-                _issueEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+            // When the host had queued the step: telemetry's issue/wait split, and TS_Q4E_PERF.
+            _issueEnd = System.Diagnostics.Stopwatch.GetTimestamp();
             FinishHead(nt, logitsOut, allRows, hOut);
         }
 
@@ -755,8 +853,39 @@ namespace TensorSharp.Cuda
         private double IssueMs(long start)
             => _issueEnd > start ? (_issueEnd - start) * 1000.0 / System.Diagnostics.Stopwatch.Frequency : 0;
 
-        private void StageBegin(Dev dev) => _stages.SpanStart(dev.Alloc.Context, dev.Stream);
+        private void StageBegin(Dev dev) => (_sampling ? _sampleStages : _stages).SpanStart(dev.Alloc.Context, dev.Stream);
 
-        private void StageEnd(Dev dev, int stage) => _stages.End(dev.Alloc.Context, dev.Stream, stage);
+        private void StageEnd(Dev dev, int stage) => (_sampling ? _sampleStages : _stages).End(dev.Alloc.Context, dev.Stream, stage);
+
+        /// <summary>Whether the next forward is a sampled one (TS_Q4E_PERF_SAMPLE); sets
+        /// <see cref="_sampling"/> for it.</summary>
+        private bool BeginSampledForward()
+        {
+            if (_perfSample <= 0 || StageObserver == null || ++_forwardsSinceSample < _perfSample)
+                return false;
+            _forwardsSinceSample = 0;
+            _sampling = true;
+            return true;
+        }
+
+        /// <summary>A sampled forward's stage times to <see cref="StageObserver"/>, after every device
+        /// finished it.</summary>
+        private void EndSampledForward(int rows, bool decode)
+        {
+            if (!_sampling)
+                return;
+            _sampling = false;
+            double[] ms = _sampleStages.CollectAndReset(synchronize: true);
+            var observer = StageObserver;
+            if (observer == null)
+                return;
+            for (int i = 0; i < ms.Length && i < StageNames.Length; i++)
+            {
+                if (ms[i] <= 0)
+                    continue;
+                try { observer(StageNames[i], ms[i] / 1000.0, rows, decode); }
+                catch (Exception) { }
+            }
+        }
     }
 }

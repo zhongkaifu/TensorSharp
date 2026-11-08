@@ -294,6 +294,10 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>When the very first token of generation was produced.</summary>
         public DateTime? FirstTokenAt { get; internal set; }
 
+        /// <summary>Stopwatch timestamp of this sequence's latest output token (0 before the first),
+        /// for the inter-token latency metric.</summary>
+        internal long LastTokenTimestamp { get; set; }
+
         /// <summary>
         /// Times the scheduler preempted this sequence: took its blocks back to make room for
         /// others, or parked it again because the model had no device slot for it

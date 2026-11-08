@@ -260,6 +260,29 @@ namespace TensorSharp.Runtime.Telemetry
         }
 
         /// <summary>
+        /// The request's own speeds on its span, so a query can split them by prompt size without
+        /// joining the phase spans: the prompt tokens it actually prefilled (cached ones excluded)
+        /// and their rate from its first admission to its first token, and its decode rate after
+        /// the first token. Spans only; a rate whose interval is missing or empty is left out.
+        /// </summary>
+        public void RecordThroughput(int inputTokens, int cachedTokens, int outputTokens,
+            DateTime? firstScheduledAtUtc, DateTime? firstTokenAtUtc, DateTime endUtc)
+        {
+            if (_activity is not { IsAllDataRequested: true })
+                return;
+            int uncached = Math.Max(0, inputTokens - cachedTokens);
+            _activity.SetTag(TelemetryAttributes.UncachedPromptTokens, uncached);
+            if (firstTokenAtUtc is not { } first)
+                return;
+            if (firstScheduledAtUtc is { } scheduled && first > scheduled && uncached > 0)
+                _activity.SetTag(TelemetryAttributes.PrefillTokensPerSecond,
+                    Math.Round(uncached / (first - scheduled).TotalSeconds, 1));
+            if (outputTokens > 1 && endUtc > first)
+                _activity.SetTag(TelemetryAttributes.DecodeTokensPerSecond,
+                    Math.Round((outputTokens - 1) / (endUtc - first).TotalSeconds, 1));
+        }
+
+        /// <summary>
         /// Time to first token for a path that measures it itself (no scheduler timestamps).
         /// Recorded by <see cref="Dispose"/> if the request completes.
         /// </summary>

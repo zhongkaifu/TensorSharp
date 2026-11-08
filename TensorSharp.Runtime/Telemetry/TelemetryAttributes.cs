@@ -106,6 +106,47 @@ namespace TensorSharp.Runtime.Telemetry
         public const string TensorParallelNodeId = "tensorsharp.tp.node_id";
         public const string GpuDevice = "tensorsharp.gpu.device";
 
+        // Serving signals ----------------------------------------------------------------
+        /// <summary>A prefix-cache lookup's result: <c>full</c>, <c>partial</c> or <c>miss</c>.</summary>
+        public const string PrefixCacheOutcome = "tensorsharp.prefix_cache.outcome";
+        /// <summary>Where a reused prefix came from (<c>end_state</c>, <c>primary</c>, <c>pages</c>,
+        /// <c>batched_end_state</c>), or why a miss reused nothing (<c>shared_prefix</c>,
+        /// <c>rewind</c>, <c>live_cache</c>, <c>retained_state</c>, <c>pages</c>, <c>breakpoints</c>,
+        /// <c>none</c>).</summary>
+        public const string PrefixCacheSource = "tensorsharp.prefix_cache.source";
+        /// <summary>A sequence slot's state: <c>running</c> (bound to a request) or <c>retained</c>
+        /// (kept for a conversation's next turn).</summary>
+        public const string SlotState = "tensorsharp.slot.state";
+        /// <summary>Why a retained slot was given back: <c>new_slot</c> or <c>growth</c>.</summary>
+        public const string SlotReclaimReason = "tensorsharp.slot.reclaim_reason";
+        /// <summary>How a slot rewind went: <c>checkpoint</c> (to its checkpoint exactly),
+        /// <c>replay</c> (past it, replaying tokens), <c>reset</c> (to 0) or <c>refused</c>.</summary>
+        public const string RewindRoute = "tensorsharp.rewind.route";
+        /// <summary>A captured CUDA graph's kind: <c>solo</c> (one sequence's decode step) or
+        /// <c>batched</c>.</summary>
+        public const string GraphKind = "tensorsharp.cuda_graph.kind";
+        /// <summary>One stage of a forward, as the engine's stage timer names it (<c>hc</c>,
+        /// <c>experts</c>, <c>attncore</c>, ...).</summary>
+        public const string EngineStage = "tensorsharp.engine.stage";
+        /// <summary>A step's rows, bucketed: <c>1</c>, <c>2-4</c>, <c>5-8</c>, <c>9-16</c>, <c>17+</c>.</summary>
+        public const string RowsBucket = "tensorsharp.engine.rows";
+        /// <summary>Request span: output tokens a second after the first token.</summary>
+        public const string DecodeTokensPerSecond = "tensorsharp.decode.tokens_per_second";
+        /// <summary>Request span: prompt tokens prefilled a second, cached ones excluded.</summary>
+        public const string PrefillTokensPerSecond = "tensorsharp.prefill.tokens_per_second";
+        /// <summary>Request span: prompt tokens that were not served from the prefix cache.</summary>
+        public const string UncachedPromptTokens = "tensorsharp.prompt.uncached_tokens";
+
+        /// <summary>The <see cref="RowsBucket"/> value for <paramref name="rows"/>.</summary>
+        public static string RowsBucketOf(int rows) => rows switch
+        {
+            <= 1 => "1",
+            <= 4 => "2-4",
+            <= 8 => "5-8",
+            <= 16 => "9-16",
+            _ => "17+",
+        };
+
         // Media -------------------------------------------------------------------------
         public const string MediaKind = "tensorsharp.media.kind";
         public const string VideoMode = "tensorsharp.video.mode";
