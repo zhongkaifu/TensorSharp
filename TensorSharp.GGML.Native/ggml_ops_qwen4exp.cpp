@@ -125,7 +125,7 @@ namespace
         ggml_backend_buffer_t io = nullptr;
         std::uint8_t* base = nullptr;
         int T = 0;
-        bool gdn = false, hc = false, qsa = false;
+        bool gdn = false, hc = false, qsa = false, qsa_attn = false;
         // hyper connections: the residual (in place across the span), xn, the up projection, inject, mixed, the
         // block output; GDN: the input projections and the kernels' output
         std::size_t off_res = 0, off_xn = 0, off_g = 0, off_inject = 0, off_mixed = 0, off_proj = 0;
@@ -134,6 +134,10 @@ namespace
         // qsa_cells cells, blocks of at least qsa_ratio cells and up to qsa_heads indexer heads
         std::size_t off_qsa_scores = 0, off_qsa_mask = 0;
         std::size_t qsa_cells = 0, qsa_ratio = 1, qsa_heads = 0;
+        // QSA attention over the chosen cells: each token's cell list [width, T] and count [T], the queries [D, T, H] and
+        // the output [D, H, T]
+        std::size_t off_qsa_idx = 0, off_qsa_cnt = 0, off_attn_q = 0, off_attn_out = 0;
+        std::size_t qsa_width = 0, attn_elems = 0;   // the widest list; D * H
         std::size_t bytes = 0;
 
         void layout(int rows, std::size_t hc_dim, std::size_t n_embd, std::size_t hc, std::size_t conv_dim,
@@ -159,6 +163,11 @@ namespace
                 const std::size_t blocks = (qsa_cells + qsa_ratio - 1) / qsa_ratio;
                 off_qsa_scores = take(blocks * qsa_heads * t);
                 off_qsa_mask = take((qsa_cells * t + 1) / 2);   // F16
+            }
+            if (qsa_attn)
+            {
+                off_qsa_idx = take(qsa_width * t); off_qsa_cnt = take(t);
+                off_attn_q = take(attn_elems * t); off_attn_out = take(attn_elems * t);
             }
             bytes = at;
         }
@@ -1796,9 +1805,21 @@ ggml_tensor* q4e_nodes_attn(
     ggml_tensor* inject = hcr.inject;
 
     int qsa_width = 0;
+    // A prompt-width span building with device operations attends only each token's chosen cells (tsm::qsa_attn_encode)
+    // when the window is wide enough: the selection then writes the cell lists instead of the mask.
+    bool qsa_sparse = false;
+    ggml_tensor* qsa_idx = nullptr;
+    ggml_tensor* qsa_cnt = nullptr;
+#if defined(TSG_GGML_USE_METAL)
+    if (const Q4eDeviceOps* dev = g_q4e_dev; dev != nullptr && dev->qsa_attn && dev->T == T && qsa != nullptr
+        && arena == nullptr && owned_k == nullptr && owned_v == nullptr && use_flash && g_q4e_row_kernels.rows != T
+        && tsm::qsa_attn_supported(g_backend, head_dim, n_head, n_head_kv, a->kv_type, n_kv_pad))
+        qsa_sparse = true;
+#endif
     if (qsa != nullptr)
         mask = q4e_nodes_qsa_mask(ctx, graph, bnd, *qsa, mixed, mask, kv_idx,
-            n_embd, T, n_kv_pad, n_rot, rope_base, rope_freq_scale, eps, &qsa_width);
+            n_embd, T, n_kv_pad, n_rot, rope_base, rope_freq_scale, eps, &qsa_width,
+            qsa_sparse ? &qsa_idx : nullptr, qsa_sparse ? &qsa_cnt : nullptr);
     // A QSA mask keeps at most qsa_width cells a row: flash attention then reads only those (ggml's sparse path:
     // the finite mask entries gathered into index lists), not every cell of the window. At 17.5K cells a 1-row pass
     // spent 3.9 ms (M5 Pro) attending cells the mask had already excluded. TS_Q4E_QSA_SPARSE_FA: 0 off, 2 also for
@@ -1926,6 +1947,29 @@ ggml_tensor* q4e_nodes_attn(
             attn = attn ? ggml_concat(ctx, attn, ar, 2) : ar;
         }
     }
+#if defined(TSG_GGML_USE_METAL)
+    else if (qsa_idx != nullptr)
+    {
+        // The chosen cells only, on TensorSharp's kernel, after the cache write and the queries; [hd, nH, T] as the
+        // flash attention below returns it.
+        const Q4eDeviceOps* dev = g_q4e_dev;
+        if (q_attn->view_src != nullptr || q_attn->data != nullptr) q_attn = ggml_cont(ctx, q_attn);
+        dev->bind(q_attn, dev->off_attn_q);
+        attn = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, T);
+        dev->bind(attn, dev->off_attn_out);
+        ggml_tensor* out = attn;
+        ggml_tensor* idx = qsa_idx;
+        ggml_tensor* cnt = qsa_cnt;
+        ggml_tensor* mask_in = mask;
+        const int cells = n_kv_pad, width = qsa_width, heads = n_head, kv_heads = n_head_kv;
+        const float scale = attn_scale;
+        ggml_tensor* inputs[] = { q_attn, k_written, v_written };
+        dev->push(inputs, 3, {out}, g_q4e_dev_layer,
+            [q_attn, k_written, v_written, idx, cnt, mask_in, out, T, heads, kv_heads, cells, width, scale](ggml_backend_t backend) {
+                return tsm::qsa_attn_encode(backend, q_attn, k_written, v_written, idx, cnt, mask_in, out,
+                    T, heads, kv_heads, cells, width, scale); });
+    }
+#endif
     else if (use_flash)
     {
         // One fused kernel in place of mul_mat -> soft_max -> cont(permute(V)) ->
@@ -2865,7 +2909,14 @@ static int q4e_token_span_impl(
             // QSA selection, when a QSA layer in the span selects at all (a window wider than its top-k).
             if (qsa != nullptr && tsm::qsa_select_supported(g_backend))
                 for (int il = layer_begin; il < layer_end; ++il)
-                    if (qsa[il].ratio > 0 && n_kv_pad > (int64_t)qsa[il].top_k + qsa[il].ratio - 1) { device_ops |= 4; break; }
+                    if (qsa[il].ratio > 0 && n_kv_pad > (int64_t)qsa[il].top_k + qsa[il].ratio - 1)
+                    {
+                        device_ops |= 4;
+                        // and the attention over the chosen cells, for a wide enough window
+                        if (tsm::qsa_attn_supported(g_backend, head_dim, n_head, n_head_kv, attn[il].kv_type, n_kv_pad))
+                            device_ops |= 8;
+                        break;
+                    }
         }
 #endif
         if (!q4e_dump_nodes
@@ -3084,6 +3135,7 @@ static int q4e_token_span_impl(
             dev_ops.gdn = (device_ops & 1) != 0;
             dev_ops.hc = (device_ops & 2) != 0;
             dev_ops.qsa = (device_ops & 4) != 0;
+            dev_ops.qsa_attn = (device_ops & 8) != 0;
             if (dev_ops.qsa)
             {
                 dev_ops.qsa_cells = (std::size_t)n_kv_pad;
@@ -3093,7 +3145,10 @@ static int q4e_token_span_impl(
                     {
                         if (dev_ops.qsa_ratio == 0 || (std::size_t)qsa[il].ratio < dev_ops.qsa_ratio) dev_ops.qsa_ratio = (std::size_t)qsa[il].ratio;
                         dev_ops.qsa_heads = std::max(dev_ops.qsa_heads, (std::size_t)qsa[il].heads);
+                        dev_ops.qsa_width = std::max(dev_ops.qsa_width,
+                                (std::size_t)std::min<int64_t>(n_kv_pad, (int64_t)qsa[il].top_k + qsa[il].ratio - 1));
                     }
+                dev_ops.attn_elems = (std::size_t)head_dim * n_head;
             }
             dev_ops.layout(T, (std::size_t)hc_dim, (std::size_t)n_embd, (std::size_t)hc,
                     (std::size_t)(head_k_dim * n_k_heads) * 2 + (std::size_t)(head_v_dim * n_v_heads),

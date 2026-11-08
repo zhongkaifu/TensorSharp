@@ -1411,6 +1411,18 @@ with the window (3.4 GB at every chunk of a 16K prompt). 16K, `TS_Q4E_PHASE=1`: 
 -> 5.1 / 5.3 / 5.8 / 6.3 s, prompt + ~50 tokens 32.3 -> 30.4 s. What grows with the window now is the attention
 itself, which reads every cell of it.
 
+From a 12K window on, the attention reads only each token's chosen cells too (`TS_METAL_QSA_ATTN`): the selection
+writes them as ascending lists, and one threadgroup per (token, kv head) gathers them 32 at a time, with the kv head's
+12 query heads as the rows of the products (Strata's `qsa_attn_mm` arrangement, on F16 caches). Against ggml's flash
+attention over the same cells it differs by rounding (4.7e-5). Its cost does not depend on the window, ggml's does:
++0.40 s a chunk at a 4K window, +0.20 s at 8K, -0.23 s at 12K, -0.62 s at 16K, hence the 12K threshold
+(`TS_METAL_QSA_ATTN_MIN_CELLS`).
+
+| run (same client, DFlash2 Q4_K_M, 3 repeats) | short chat | long-gen decode | 4K TTFT | 16K TTFT | multi-turn first turn |
+| --- | --- | --- | --- | --- | --- |
+| + QSA selection and attention kernels (`df2-sa`) | 0.30-0.32 s / 21-25 tok/s | 38.4-42.7 tok/s | **5.92-6.14 s** | **24.48-25.25 s** | 4.0-4.5 s |
+| Strata DFlash2 | 0.56 s / 19 tok/s | 47.8 tok/s | 6.32 s | 24.4 s | - |
+
 ## Multi-GPU
 
 `--tp N` on `ggml_cuda` partitions every routed and shared FFN across N local GPUs. Every rank

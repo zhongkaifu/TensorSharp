@@ -259,29 +259,39 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     [InlineData("qsa", false)]
     [InlineData("gdn,hc,qsa", false)]
     [InlineData("gdn,hc,qsa", true)]
+    [InlineData("qsa,attn", false)]
+    [InlineData("gdn,hc,qsa,attn", true)]
     public void PromptKernels_OnTsm_AnswerAsGgml_Metal(string kernels, bool hostExperts)
     {
         bool gdn = kernels.Contains("gdn"), hc = kernels.Contains("hc"), qsa = kernels.Contains("qsa");
-        float[][] Answer(bool useGdn, bool useHc, bool useQsa)
+        bool attn = kernels.Contains("attn");
+        float[][] Answer(bool useGdn, bool useHc, bool useQsa, bool useAttn)
         {
             using var env = new NativeEnvScope();
             env.Set("TS_METAL_GDN_PROMPT", useGdn ? "1" : "0");
             env.Set("TS_METAL_HC_PROMPT", useHc ? "1" : "0");
             env.Set("TS_METAL_QSA_SELECT", useQsa ? "1" : "0");
+            env.Set("TS_METAL_QSA_ATTN", useAttn ? "1" : "0");
+            env.Set("TS_METAL_QSA_ATTN_MIN_CELLS", "1");   // the fixture's window is a few hundred cells
             return Run(BackendType.GgmlMetal, hostExperts ? MoeCpuOffloadConfig.SetAllLayers : () => { }, LongPrompt);
         }
-        float[][] ggml = Answer(false, false, false);
+        // The attention over the chosen cells is compared with ggml's flash attention over the same (deterministic)
+        // selection, so the tie freedom of the selection drops out of that comparison.
+        float[][] ggml = Answer(attn && gdn, attn && hc, attn, false);
         long gdnBefore = GgmlBasicOps.TsmGdnPromptCount(), hcBefore = GgmlBasicOps.TsmHcPromptCount();
-        long qsaBefore = GgmlBasicOps.TsmQsaSelectCount();
-        float[][] tsm = Answer(gdn, hc, qsa);
+        long qsaBefore = GgmlBasicOps.TsmQsaSelectCount(), attnBefore = GgmlBasicOps.TsmQsaAttnCount();
+        float[][] tsm = Answer(gdn, hc, qsa, attn);
         long gdnLayers = GgmlBasicOps.TsmGdnPromptCount() - gdnBefore, hcPasses = GgmlBasicOps.TsmHcPromptCount() - hcBefore;
-        long qsaLayers = GgmlBasicOps.TsmQsaSelectCount() - qsaBefore;
-        _output.WriteLine($"tsm kernels: {gdnLayers} GDN layers, {hcPasses} hyper-connection passes, {qsaLayers} QSA selections");
+        long qsaLayers = GgmlBasicOps.TsmQsaSelectCount() - qsaBefore, attnLayers = GgmlBasicOps.TsmQsaAttnCount() - attnBefore;
+        _output.WriteLine($"tsm kernels: {gdnLayers} GDN layers, {hcPasses} hyper-connection passes, {qsaLayers} QSA selections, "
+            + $"{attnLayers} QSA attention passes");
         // The fixture's 8 layers: 6 GDN, 2 QSA, 16 half-layers with a read and a scatter each.
         Assert.Equal(gdn ? 6 : 0, gdnLayers);
         Assert.Equal(hc ? 32 : 0, hcPasses);
         Assert.Equal(qsa ? 2 : 0, qsaLayers);
-        AssertClose($"tsm {kernels}", tsm, ggml, qsa ? 2e-2 : hostExperts ? 1e-3 : 2e-4);
+        Assert.Equal(attn ? 2 : 0, attnLayers);
+        double bound = attn ? (hostExperts ? 1e-3 : 2e-4) : qsa ? 2e-2 : hostExperts ? 1e-3 : 2e-4;
+        AssertClose($"tsm {kernels}", tsm, ggml, bound);
     }
 
     /// <summary>A prefill-width batch streams every expert an offloaded layer routes into its staging tensor. With a

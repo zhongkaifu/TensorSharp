@@ -20,7 +20,8 @@ static ggml_tensor* q4e_qsa_matmul(ggml_context* ctx, ggml_tensor* w, ggml_tenso
 static ggml_tensor* q4e_nodes_qsa_mask(ggml_context* ctx, ggml_cgraph* graph,
     Q4eBinder& binder, const Q4eQsaGraph& qsa, ggml_tensor* mixed,
     ggml_tensor* original_mask, ggml_tensor* kv_idx,
-    int n_embd, int T, int padded, int n_rot, float base, float scale, float eps, int* sparse_width = nullptr)
+    int n_embd, int T, int padded, int n_rot, float base, float scale, float eps, int* sparse_width = nullptr,
+    ggml_tensor** sel_idx = nullptr, ggml_tensor** sel_cnt = nullptr)
 {
     if (sparse_width) *sparse_width = 0;
     const auto& a = *qsa.args;
@@ -98,19 +99,35 @@ static ggml_tensor* q4e_nodes_qsa_mask(ggml_context* ctx, ggml_cgraph* graph,
         && scores_mm->view_src == nullptr && scores_mm->type == GGML_TYPE_F32)
     {
         dev->bind(scores_mm, dev->off_qsa_scores);
-        ggml_tensor* selected_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, padded, T);
-        dev->bind(selected_mask, dev->off_qsa_mask);
+        // The attention over the chosen cells takes them as lists; ggml's flash attention as the mask.
+        const bool lists = sel_idx != nullptr && sel_cnt != nullptr && dev->qsa_attn && (std::size_t)width <= dev->qsa_width;
+        ggml_tensor* selected_mask = nullptr;
+        ggml_tensor* idx = nullptr;
+        ggml_tensor* cnt = nullptr;
+        if (lists)
+        {
+            idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, T);
+            cnt = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+            dev->bind(idx, dev->off_qsa_idx);
+            dev->bind(cnt, dev->off_qsa_cnt);
+        }
+        else
+        {
+            selected_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, padded, T);
+            dev->bind(selected_mask, dev->off_qsa_mask);
+        }
         // The inputs it reads are pinned for the whole graph (the allocator would free them after their last graph
         // consumer) and placed as leaves.
         ggml_tensor* bias = in.bias;
         ggml_tensor* cell_blocks = in.cell_blocks;
         for (ggml_tensor* t : {bias, cell_blocks, original_mask}) { ggml_set_output(t); ggml_build_forward_expand(graph, t); }
         ggml_tensor* inputs[] = { scores_mm };
-        dev->push(inputs, 1, {selected_mask}, g_q4e_dev_layer,
-            [scores_mm, bias, cell_blocks, original_mask, selected_mask, T, padded, B, H, width](ggml_backend_t backend) {
+        dev->push(inputs, 1, {lists ? idx : selected_mask, lists ? cnt : selected_mask}, g_q4e_dev_layer,
+            [scores_mm, bias, cell_blocks, original_mask, selected_mask, idx, cnt, T, padded, B, H, width](ggml_backend_t backend) {
                 return tsm::qsa_select_encode(backend, scores_mm, bias, cell_blocks, original_mask, selected_mask,
-                    T, padded, B, H, width); });
+                    idx, cnt, T, padded, B, H, width); });
         if (sparse_width) *sparse_width = width;
+        if (lists) { *sel_idx = idx; *sel_cnt = cnt; return original_mask; }
         return selected_mask;
     }
 #endif

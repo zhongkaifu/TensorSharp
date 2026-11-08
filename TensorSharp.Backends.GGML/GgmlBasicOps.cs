@@ -3514,6 +3514,14 @@ namespace TensorSharp.GGML
             catch (EntryPointNotFoundException) { return 0; }
         }
 
+        /// <summary>Test hook: the prompt-width QSA attention passes over the chosen cells that ran on TensorSharp's Metal
+        /// kernel (tsm::qsa_attn_encode) in this process. 0 off Apple's Metal builds.</summary>
+        public static long TsmQsaAttnCount()
+        {
+            try { return GgmlNative.TSGgml_TsmQsaAttnCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         /// <summary>Fixed-size rows of a mapping registered for explicit reads (HostExpertIoRegister), one pread each,
         /// packed into <paramref name="dst"/> in list order. False (nothing read) when a row is outside every registered
         /// mapping; the caller then reads the mapping.</summary>

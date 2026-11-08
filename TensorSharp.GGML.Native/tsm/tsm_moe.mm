@@ -960,7 +960,15 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
     // ---- prompt QSA selection (tsm_moe.h qsa_select_*)
     namespace
     {
-        struct TsmQsaArgs { std::uint32_t n_tok, n_cells, n_blocks, heads, width, pad0, pad1, pad2; };
+        struct TsmQsaArgs { std::uint32_t n_tok, n_cells, n_blocks, heads, width, write_mask, write_idx, pad; };
+        struct TsmQsaAttnArgs
+        {
+            std::uint32_t n_tok, n_head, n_head_kv, n_cells, width, k_row, k_head, v_row, v_head;
+            float scale;
+            std::uint32_t pad0, pad1;
+        };
+        static_assert(sizeof(TsmQsaAttnArgs) == 48, "TsmQsaAttnArgs must match tsm_qsa_prompt.metal");
+        std::atomic<long long> g_qsa_attn_count{0};
         static_assert(sizeof(TsmQsaArgs) == 32, "TsmQsaArgs must match tsm_qsa_prompt.metal");
         std::atomic<long long> g_qsa_select_count{0};
 
@@ -980,7 +988,7 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
 
     bool qsa_select_encode(ggml_backend* backend, const ggml_tensor* scores, const ggml_tensor* bias,
                            const ggml_tensor* cell_blocks, const ggml_tensor* mask_in, ggml_tensor* mask_out,
-                           int T, int n_cells, int n_blocks, int heads, int width)
+                           ggml_tensor* idx, ggml_tensor* cnt, int T, int n_cells, int n_blocks, int heads, int width)
     {
         try
         {
@@ -993,12 +1001,21 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
             require_type(bias, GGML_TYPE_F32, blocks * t, "bias");
             require_type(cell_blocks, GGML_TYPE_I32, cells, "cell_blocks");
             require_type(mask_in, GGML_TYPE_F16, cells * t, "mask_in");
-            require_type(mask_out, GGML_TYPE_F16, cells * t, "mask_out");
+            if (mask_out == nullptr && idx == nullptr) throw std::runtime_error("tsm qsa: nothing to write");
+            if (mask_out) require_type(mask_out, GGML_TYPE_F16, cells * t, "mask_out");
+            if (idx)
+            {
+                require_type(idx, GGML_TYPE_I32, static_cast<std::int64_t>(width) * t, "idx");
+                require_type(cnt, GGML_TYPE_I32, t, "cnt");
+            }
             const ggml_metal_buffer_id sc = tensor_id(scores), bi = tensor_id(bias), cb = tensor_id(cell_blocks),
-                mi = tensor_id(mask_in), mo = tensor_id(mask_out);
+                mi = tensor_id(mask_in);
+            // Unwritten outputs are bound to an input (nothing reads or writes them).
+            const ggml_metal_buffer_id mo = mask_out ? tensor_id(mask_out) : mi;
+            const ggml_metal_buffer_id ix = idx ? tensor_id(idx) : cb, cn = idx ? tensor_id(cnt) : cb;
             const TsmQsaArgs args{static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(n_cells),
                 static_cast<std::uint32_t>(n_blocks), static_cast<std::uint32_t>(heads), static_cast<std::uint32_t>(width),
-                0, 0, 0};
+                mask_out ? 1u : 0u, idx ? 1u : 0u, 0};
             State& s = state();
             std::lock_guard<std::mutex> lock(s.mu);
             @autoreleasepool
@@ -1018,6 +1035,7 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
                 [enc setBuffer:s.qs offset:0 atIndex:0];
                 bind(enc, cb, 0, 1); bind(enc, mi, 0, 2); bind(enc, mo, 0, 3);
                 [enc setBytes:&args length:sizeof(args) atIndex:4];
+                bind(enc, ix, 0, 5); bind(enc, cn, 0, 6);
                 [enc dispatchThreadgroups:MTLSizeMake(T, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
                 [cmd commit];
@@ -1038,6 +1056,76 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
     }
 
     long long qsa_select_count() { return g_qsa_select_count.load(std::memory_order_relaxed); }
+
+    bool qsa_attn_supported(ggml_backend* backend, int head_dim, int n_head, int n_head_kv, int kv_type, int n_cells)
+    {
+        const char* e = std::getenv("TS_METAL_QSA_ATTN");
+        if (e && e[0] == '0') return false;
+        const char* m = std::getenv("TS_METAL_QSA_ATTN_MIN_CELLS");   // read per graph build (a test lowers it)
+        // M5 Pro, Flash Next, a 4096-token chunk's 12 QSA layers: +0.40 s against ggml's flash attention at a 4K window,
+        // +0.20 s at 8K, -0.23 s at 12K, -0.62 s at 16K (the chosen cells' cost is flat; the window's is not).
+        const int min_cells = m && std::atoi(m) > 0 ? std::atoi(m) : 12288;
+        return metal_device(backend) != nullptr && head_dim == 256 && n_head_kv > 0 && n_head % n_head_kv == 0
+            && n_head / n_head_kv <= 16 && kv_type == GGML_TYPE_F16 && n_cells >= min_cells;
+    }
+
+    bool qsa_attn_encode(ggml_backend* backend, const ggml_tensor* q, const ggml_tensor* k, const ggml_tensor* v,
+                         const ggml_tensor* idx, const ggml_tensor* cnt, const ggml_tensor* mask_in, ggml_tensor* out,
+                         int T, int n_head, int n_head_kv, int n_cells, int width, float scale)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm qsa attn: not a Metal backend");
+            const std::int64_t t = T, D = 256;
+            require_type(q, GGML_TYPE_F32, D * t * n_head, "q");
+            require_type(out, GGML_TYPE_F32, D * n_head * t, "out");
+            require_type(idx, GGML_TYPE_I32, static_cast<std::int64_t>(width) * t, "idx");
+            require_type(cnt, GGML_TYPE_I32, t, "cnt");
+            require_type(mask_in, GGML_TYPE_F16, static_cast<std::int64_t>(n_cells) * t, "mask_in");
+            for (const ggml_tensor* c : {k, v})
+                if (c == nullptr || c->type != GGML_TYPE_F16 || c->ne[0] != D || c->nb[0] != 2 || c->ne[2] != n_head_kv
+                    || c->ne[1] < n_cells || c->nb[1] % 8 != 0 || c->nb[2] % 8 != 0)
+                    throw std::runtime_error("tsm qsa attn: the cache is not F16 [256, cells, kv heads] with aligned rows");
+            const ggml_metal_buffer_id qi = tensor_id(q), ki = tensor_id(k), vi = tensor_id(v), xi = tensor_id(idx),
+                ci = tensor_id(cnt), mi = tensor_id(mask_in), oi = tensor_id(out);
+            const TsmQsaAttnArgs args{static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(n_head),
+                static_cast<std::uint32_t>(n_head_kv), static_cast<std::uint32_t>(n_cells), static_cast<std::uint32_t>(width),
+                static_cast<std::uint32_t>(k->nb[1] / 2), static_cast<std::uint32_t>(k->nb[2] / 2),
+                static_cast<std::uint32_t>(v->nb[1] / 2), static_cast<std::uint32_t>(v->nb[2] / 2), scale, 0, 0};
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                ensure_library(s, device);
+                id<MTLCommandBuffer> cmd = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+                [enc setComputePipelineState:pipeline(s, "tsm_qsa_attn")];
+                bind(enc, qi, 0, 0); bind(enc, ki, 0, 1); bind(enc, vi, 0, 2); bind(enc, xi, 0, 3);
+                bind(enc, ci, 0, 4); bind(enc, mi, 0, 5); bind(enc, oi, 0, 6);
+                [enc setBytes:&args length:sizeof(args) atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(T, n_head_kv, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc endEncoding];
+                [cmd commit];
+                s.last = cmd;
+            }
+            g_qsa_attn_count.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true))
+                std::fprintf(stderr, "[tsm] prompt QSA attention reads only the chosen cells (TS_METAL_QSA_ATTN=0 keeps "
+                    "ggml's flash attention)\n");
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
+
+    long long qsa_attn_count() { return g_qsa_attn_count.load(std::memory_order_relaxed); }
 }
 
 // ---- test probe: one layer's held routes through moe_encode, on expert bytes the caller gives (stacked [expert]
@@ -1162,7 +1250,7 @@ TSG_EXPORT int TSGgml_TsmQsaSelectProbe(int T, int n_cells, int n_blocks, int he
         ggml_backend_tensor_set(bi, bias, 0, ggml_nbytes(bi));
         ggml_backend_tensor_set(cb, cell_blocks, 0, ggml_nbytes(cb));
         ggml_backend_tensor_set(mi, mask_in, 0, ggml_nbytes(mi));
-        if (!tsm::qsa_select_encode(backend, sc, bi, cb, mi, mo, T, n_cells, n_blocks, heads, width))
+        if (!tsm::qsa_select_encode(backend, sc, bi, cb, mi, mo, nullptr, nullptr, T, n_cells, n_blocks, heads, width))
             throw std::runtime_error(g_last_error);
         {
             State& st = state();
@@ -1181,4 +1269,10 @@ TSG_EXPORT int TSGgml_TsmQsaSelectProbe(int T, int n_cells, int n_blocks, int he
         set_last_error(e.what());
         return 0;
     }
+}
+
+// ---- test hook: prompt QSA attention passes that ran on the tsm kernels in this process.
+TSG_EXPORT long long TSGgml_TsmQsaAttnCount()
+{
+    return tsm::qsa_attn_count();
 }

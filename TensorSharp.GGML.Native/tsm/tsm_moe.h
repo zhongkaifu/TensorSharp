@@ -117,10 +117,24 @@ namespace tsm
     // mask, in place of ggml's gather of every cell's score, two transposes and a top-k sort over [cells, T].
     // scores F32 [B, H, T], bias F32 [B, T], cell_blocks I32 [cells], masks F16 [cells, T]. Cutoff ties are taken
     // lowest cell first. TS_METAL_QSA_SELECT=0 keeps ggml's ops.
+    // mask_out (F16 [cells, T]) and / or idx (I32 [width, T], each token's chosen cells ascending) with cnt (I32 [T]);
+    // either may be null.
     bool qsa_select_supported(ggml_backend* backend);
     bool qsa_select_encode(ggml_backend* backend, const ggml_tensor* scores, const ggml_tensor* bias,
                            const ggml_tensor* cell_blocks, const ggml_tensor* mask_in, ggml_tensor* mask_out,
-                           int T, int n_cells, int n_blocks, int heads, int width);
+                           ggml_tensor* idx, ggml_tensor* cnt, int T, int n_cells, int n_blocks, int heads, int width);
     // Selections that ran on these kernels (a test proves the path engaged).
     long long qsa_select_count();
+
+    // ---- A QSA layer's attention for a prompt chunk over each token's chosen cells only (tsm_qsa_attn), instead of
+    // every cell of the window: one threadgroup per (token, kv head), the kv head's query heads as the rows of the
+    // products. q F32 [D, T, H]; k, v the F16 caches [D, cells, kv heads] (any row / head strides); idx and cnt from
+    // qsa_select_encode; mask_in F16 [cells, T] (each chosen cell's own mask value is added); out F32 [D, H, T] (ggml's
+    // flash-attention layout). D = 256, up to 16 query heads a kv head. TS_METAL_QSA_ATTN=0 keeps ggml's flash
+    // attention; TS_METAL_QSA_ATTN_MIN_CELLS (default 12288) is the narrowest window it runs for.
+    bool qsa_attn_supported(ggml_backend* backend, int head_dim, int n_head, int n_head_kv, int kv_type, int n_cells);
+    bool qsa_attn_encode(ggml_backend* backend, const ggml_tensor* q, const ggml_tensor* k, const ggml_tensor* v,
+                         const ggml_tensor* idx, const ggml_tensor* cnt, const ggml_tensor* mask_in, ggml_tensor* out,
+                         int T, int n_head, int n_head_kv, int n_cells, int width, float scale);
+    long long qsa_attn_count();
 }
