@@ -33,8 +33,13 @@ public class DeferredPrimaryCacheTests
     private static List<int> Extend(SequenceState sequence, params int[] tail) =>
         sequence.PromptTokens.Concat(sequence.OutputTokens).Take(sequence.NumComputedTokens).Concat(tail).ToList();
 
-    private static async Task<InferenceCompletion> Run(InferenceEngine engine, SequenceState sequence) =>
-        await engine.SubmitRequest(sequence).Completion.WaitAsync(TimeSpan.FromSeconds(10));
+    // The finished state is kept after the completion is signalled; the tests read the model and the tree next.
+    private static async Task<InferenceCompletion> Run(InferenceEngine engine, SequenceState sequence)
+    {
+        InferenceCompletion completion = await engine.SubmitRequest(sequence).Completion.WaitAsync(TimeSpan.FromSeconds(10));
+        await engine.WhenStepSettledAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        return completion;
+    }
 
     private static async Task AssertColdParity(SequenceState actual)
     {

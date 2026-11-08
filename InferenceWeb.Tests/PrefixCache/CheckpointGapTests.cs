@@ -45,8 +45,13 @@ public sealed class CheckpointGapTests
     private static SequenceState Request(string id, List<int> tokens) =>
         new(id, tokens, 3, 8, SamplingConfig.Greedy, cacheScope: "conversation", sharedPrefixTokens: Shared);
 
+    // The finished state is kept after the completion is signalled; the tests read the model and the tree next.
     private static async Task<InferenceCompletion> Run(InferenceEngine engine, SequenceState sequence)
-        => await engine.SubmitRequest(sequence).Completion.WaitAsync(TimeSpan.FromSeconds(10));
+    {
+        InferenceCompletion completion = await engine.SubmitRequest(sequence).Completion.WaitAsync(TimeSpan.FromSeconds(10));
+        await engine.WhenStepSettledAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        return completion;
+    }
 
     [Theory]
     [InlineData(0, new[] { 3, 10 })]
