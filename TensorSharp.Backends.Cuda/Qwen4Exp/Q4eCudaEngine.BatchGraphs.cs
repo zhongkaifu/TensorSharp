@@ -17,8 +17,10 @@
 // form (first-max tokens or logits, with or without hidden streams), and each sequence's slot and regime (the QSA layers
 // whose selection runs at its rows' positions). A key's graph stays valid until one of its slots is freed.
 //
-// Only steps that keep their missed experts on the host are captured (a staging step plans its copies on the host). A
-// capture that fails turns batched captures off for the engine with a note; solo graphs are unaffected.
+// Only steps that keep their missed experts on the host are captured (a staging step plans its copies on the host), and
+// a key only once it has run uncaptured twice: concurrent requests come and go, and a capture costs more than the steps
+// of a set of sequences that lasts a few steps. A capture that fails turns batched captures off for the engine with a
+// note; solo graphs are unaffected.
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -32,6 +34,11 @@ namespace TensorSharp.Cuda
         private readonly Dictionary<string, (IntPtr[] Execs, int[] Slots)> _batchGraphs =
             new Dictionary<string, (IntPtr[] Execs, int[] Slots)>();
         private bool _batchGraphsFailed;
+        // Uncaptured runs of each key not captured yet (BatchCaptureAfter).
+        private readonly Dictionary<string, int> _batchKeyRuns = new Dictionary<string, int>();
+
+        /// <summary>A batched step's key is captured on its third run.</summary>
+        private const int BatchCaptureAfter = 2;
 
         // TS_Q4E_BATCH_GRAPHS=0: batched steps run uncaptured (for measuring the graphs).
         private readonly bool _batchGraphsEnabled =
@@ -48,25 +55,15 @@ namespace TensorSharp.Cuda
 
         /// <summary>
         /// A batched step's rows (<paramref name="perSeq"/> consecutive rows a sequence) through its captured graph, capturing
-        /// it on first use; the head's results wait in pinned memory for FinishHead. False when the step cannot be captured
-        /// (the caller runs it uncaptured); the sequences' PLE histories have then taken the step's tokens already, which the
-        /// uncaptured step repeats at the same positions.
+        /// it on the key's third run; the head's results wait in pinned memory for FinishHead. False when the step runs
+        /// uncaptured (the caller runs it); after a failed capture the sequences' PLE histories have taken the step's tokens
+        /// already, which the uncaptured step repeats at the same positions.
         /// </summary>
         private bool ForwardBatchGraphed(Slot[] rows, int[] tokens, int[] positions, int perSeq, bool greedy, bool hidden)
         {
             int nt = tokens.Length;
             if (!CanCaptureBatch(nt) || perSeq < 1 || nt % perSeq != 0)
                 return false;
-            var dev = _devs[0];
-            dev.MakeCurrent();
-            // The pinned inputs are rewritten below: the previous step's work must have run.
-            CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
-            Marshal.Copy(tokens, 0, _pinnedTokens, nt);
-            for (int t = 0; t < nt; t++)
-                ((int*)_posPinned)[t] = positions[t];
-            if (_pleLayer >= 0)
-                GatherPleRows(null, tokens, 0, nt, 0, rows, positions);
-
             var key = new StringBuilder(16 + 8 * (nt / perSeq));
             key.Append(perSeq).Append(greedy ? 'g' : 'l').Append(hidden ? 'h' : '-');
             var slots = new int[nt / perSeq];
@@ -76,7 +73,27 @@ namespace TensorSharp.Cuda
                 key.Append(':').Append(rows[r].Id).Append('@').Append(DecodeRegime(positions[r] + perSeq - 1));
             }
             string k = key.ToString();
-            if (!_batchGraphs.TryGetValue(k, out var graph))
+            bool captured = _batchGraphs.TryGetValue(k, out var graph);
+            if (!captured)
+            {
+                _batchKeyRuns.TryGetValue(k, out int runs);
+                if (runs < BatchCaptureAfter)
+                {
+                    _batchKeyRuns[k] = runs + 1;
+                    return false;
+                }
+                _batchKeyRuns.Remove(k);
+            }
+            var dev = _devs[0];
+            dev.MakeCurrent();
+            // The pinned inputs are rewritten below: the previous step's work must have run.
+            CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+            Marshal.Copy(tokens, 0, _pinnedTokens, nt);
+            for (int t = 0; t < nt; t++)
+                ((int*)_posPinned)[t] = positions[t];
+            if (_pleLayer >= 0)
+                GatherPleRows(null, tokens, 0, nt, 0, rows, positions);
+            if (!captured)
             {
                 try
                 {
@@ -111,6 +128,19 @@ namespace TensorSharp.Cuda
         /// <summary>Drop the captured batched steps that hold <paramref name="slotId"/> (every one when it is -1).</summary>
         private void DestroyBatchGraphs(int slotId)
         {
+            if (slotId < 0)
+                _batchKeyRuns.Clear();
+            else
+            {
+                string id = ":" + slotId + "@";
+                List<string> stale = null;
+                foreach (var k in _batchKeyRuns.Keys)
+                    if (k.Contains(id, StringComparison.Ordinal))
+                        (stale ??= new List<string>()).Add(k);
+                if (stale != null)
+                    foreach (var k in stale)
+                        _batchKeyRuns.Remove(k);
+            }
             List<string> keys = null;
             foreach (var (key, graph) in _batchGraphs)
                 if (slotId < 0 || Array.IndexOf(graph.Slots, slotId) >= 0)

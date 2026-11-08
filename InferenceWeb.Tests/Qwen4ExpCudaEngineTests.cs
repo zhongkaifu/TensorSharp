@@ -1913,9 +1913,10 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         }
     }
 
-    /// <summary>Batched steps run through captured graphs (Q4eCudaEngine.BatchGraphs.cs): a batched verify, its commit and two
-    /// batched decode steps (the second replays the first's graph at the next positions) answer bit for bit as the same
-    /// steps uncaptured (TS_Q4E_BATCH_GRAPHS=0). Dense rows (top_k 2048) and QSA rows past the width (top_k 16).</summary>
+    /// <summary>Batched steps run through captured graphs (Q4eCudaEngine.BatchGraphs.cs), a key captured on its third run:
+    /// three batched verifies with their commits and four batched decode steps (the third captured, the fourth replaying it
+    /// at the next positions) answer bit for bit as the same steps uncaptured (TS_Q4E_BATCH_GRAPHS=0). Dense rows (top_k
+    /// 2048) and QSA rows past the width (top_k 16).</summary>
     [CudaTheory]
     [InlineData(2048)]
     [InlineData(16)]
@@ -1925,7 +1926,7 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         int[] prompts = { 30, 21, 37 };
         int[][] windows = { new[] { 17, 203, 99, 4 }, new[] { 150, 61, 5, 77 }, new[] { 123, 9, 31, 200 } };
         int[] keep = { 4, 2, 1 };
-        (int[] Drawn, float[] Hidden, float[] First, float[] Second, int Graphs) Run(string graphs)
+        (List<int[]> Drawn, List<float[]> Rows, int Graphs) Run(string graphs)
         {
             _env.Set("TS_Q4E_BATCH_GRAPHS", graphs);
             using var ex = OpenExecutor(path);
@@ -1937,37 +1938,43 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
                 slots[i] = NewActiveSlot(ex);
                 Step(ex, Prompt[..prompts[i]]);
             }
-            var drawn = new int[n * w];
-            var hidden = new float[n * w * h];
-            Assert.True(engine.ForwardBatchedVerify(slots, w, windows.SelectMany(x => x).ToArray(), drawn, hidden));
-            Assert.True(engine.CommitBatchedVerify(slots, keep));
+            var drawnAll = new List<int[]>();
+            var rows = new List<float[]>();
+            for (int round = 0; round < 3; round++)
+            {
+                var drawn = new int[n * w];
+                var hidden = new float[n * w * h];
+                Assert.True(engine.ForwardBatchedVerify(slots, w, windows.SelectMany(x => x).ToArray(), drawn, hidden));
+                Assert.True(engine.CommitBatchedVerify(slots, keep));
+                drawnAll.Add(drawn);
+                rows.Add(hidden);
+            }
             var tokens = new int[n];
             var positions = new int[n];
             for (int i = 0; i < n; i++)
+                positions[i] = prompts[i] + 3 * keep[i];
+            for (int step = 0; step < 4; step++)
             {
-                tokens[i] = Steps[i];
-                positions[i] = prompts[i] + keep[i];
+                for (int i = 0; i < n; i++)
+                    tokens[i] = Steps[(i + step) % Steps.Length];
+                var logits = new float[n * vocab];
+                Assert.True(engine.ForwardBatchedDecode(slots, tokens, positions, logits));
+                rows.Add(logits);
+                for (int i = 0; i < n; i++)
+                    positions[i]++;
             }
-            var first = new float[n * vocab];
-            Assert.True(engine.ForwardBatchedDecode(slots, tokens, positions, first));
-            for (int i = 0; i < n; i++)
-            {
-                tokens[i] = Steps[i + 3];
-                positions[i]++;
-            }
-            var second = new float[n * vocab];
-            Assert.True(engine.ForwardBatchedDecode(slots, tokens, positions, second));
-            return (drawn, hidden, first, second, engine.CapturedBatchGraphs);
+            return (drawnAll, rows, engine.CapturedBatchGraphs);
         }
         var plain = Run("0");
         var captured = Run(null);
         _output.WriteLine($"batched graphs: uncaptured {plain.Graphs}, captured {captured.Graphs}");
         Assert.Equal(0, plain.Graphs);
         Assert.Equal(2, captured.Graphs);
-        Assert.Equal(plain.Drawn, captured.Drawn);
-        Assert.True(captured.Hidden.AsSpan().SequenceEqual(plain.Hidden), "the captured batched verify changed the hidden streams");
-        Assert.True(captured.First.AsSpan().SequenceEqual(plain.First), "the captured batched decode step changed the logits");
-        Assert.True(captured.Second.AsSpan().SequenceEqual(plain.Second), "the replayed batched decode step changed the logits");
+        for (int i = 0; i < plain.Drawn.Count; i++)
+            Assert.Equal(plain.Drawn[i], captured.Drawn[i]);
+        for (int i = 0; i < plain.Rows.Count; i++)
+            Assert.True(captured.Rows[i].AsSpan().SequenceEqual(plain.Rows[i]),
+                i < 3 ? $"batched verify {i}: capturing changed the hidden streams" : $"batched decode step {i - 3}: capturing changed the logits");
     }
 
     private static int ArgMax(float[] row)
