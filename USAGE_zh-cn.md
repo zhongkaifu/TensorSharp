@@ -1398,6 +1398,13 @@ UMT5-XXL 编码器同上。
 `TS_WAN_DIT_FLASH=0` 强制走物化注意力；`TS_WAN_HEARTBEAT_S` 设置进度心跳间隔（默认 30 秒，
 `0` 静默）；`TS_FFMPEG` 指定用于近无损 CRF 17 H.264 导出的 `ffmpeg`。
 
+## 在 ComfyUI 中生成
+
+[`examples/comfyui/`](examples/comfyui/README.md)（英文）是一个 ComfyUI 自定义节点包，可在
+ComfyUI 工作流中运行上述视频与图像生成。它的节点按 `config/` 中的预设启动服务器，把每次生成
+发送到服务器的流式接口，支持 ComfyUI 的进度条和取消，并以 ComfyUI 类型返回带音轨的视频、
+最后一帧以及生成的图片。ComfyUI 本身无需修改。
+
 ## 混合专家 CPU 卸载（`--n-cpu-moe`）
 
 大型 MoE 模型几乎所有权重都花在路由专家上，而每个 token 只激活其中很小一部分
