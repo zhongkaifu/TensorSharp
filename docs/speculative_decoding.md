@@ -896,9 +896,26 @@ wins honestly and the free prose behind it then loses at 12-17% acceptance: held
 for 64 steps that ran E4B-IQ4_XS prose at 30-34 tok/s against 65 plain in two of
 three runs (61-69 verify steps of ~80). While a win holds, the governor keeps
 timing its speculative steps against the plain baseline the round measured and
-parks as soon as the last eight of them average a loss, so a wrong win now costs
-about eight steps. The hold is still re-measured every 64 steps (three plain
+parks once they average a loss, so a wrong win costs a handful of steps, not
+sixty-four. The hold is still re-measured every 64 steps (three plain
 steps, since the speculative samples are productive) to refresh the baseline.
+
+What "average a loss" means changed after Qwen3.8 Flash Next (M5 Pro, DFlash2):
+judging on the last eight steps - and a re-probe on three - parked speculation
+for up to 371 steps of a request whose speculative steps cost 13-27 ms a token
+against 30-35 plain, because one window that accepts little reads as a loss
+when a step emits anything from one token to a whole window, and each loss
+doubles the next park. Verdicts now compare long-run evidence: every measured
+step on either side, token-weighted and decayed 3% per further step of that side
+(a half-life of ~23 steps). A probe or a hold wins if its own samples or that
+evidence say so. A loss that holds still flips it quickly - a drafter at a
+quarter of the acceptance and four times a plain step's cost (E4B-IQ4_XS prose)
+parks after ~7 steps, one just over the margin after ~11 - while a win that
+comes in bursts (seven windows that accept nothing, then three that accept
+everything) is no longer parked. Flash Next, greedy long generation: 40-43 ->
+44-47 tok/s (46-47 with the governor off); Strata's sampled standard-v1
+requests, pooled: 36.2 -> 39.8 tok/s (42.0 off). `TS_SPEC_ADAPTIVE=0` still
+turns the governor off.
 
 The governor is shared by every request an executor runs, so a park earned on
 one turn's text would carry into the next: a quote turn after a prose turn
