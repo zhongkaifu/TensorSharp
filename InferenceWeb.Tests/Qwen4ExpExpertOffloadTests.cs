@@ -732,6 +732,22 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         Assert.True(wired + 957_000_000L > 20 * GB - 20 * GB / 16, "one more layer would still have fit");
     }
 
+    /// <summary>A DFlash drafter is attached after the Metal plan, into the same working set, so the plan counts its
+    /// file and one request's KV ring (unplanned, its 0.45 GB was what 4096-token prompt chunks lacked once a quiet
+    /// machine at load sized the tier to the limit). A file it cannot read counts nothing: the attach reports it.</summary>
+    [Fact]
+    public void ThePlan_CountsADFlashDrafterNamedForTheLoad()
+    {
+        string path = Path.Combine(Path.GetTempPath(), "ts-dflash-size-" + Guid.NewGuid().ToString("N") + ".gguf");
+        File.WriteAllBytes(path, new byte[12345]);
+        try
+        {
+            Assert.Equal(12345 + Qwen4ExpModel.DFlashRingAllowanceBytes, Qwen4ExpModel.PendingDFlashDraftBytes(path));
+        }
+        finally { File.Delete(path); }
+        Assert.Equal(0, Qwen4ExpModel.PendingDFlashDraftBytes(path));
+    }
+
     [Fact]
     public void Plan_TooSmallForAnyLayer_OffloadsEverything()
         => Assert.Equal(0, Qwen4ExpModel.PlanDeviceExpertLayers(

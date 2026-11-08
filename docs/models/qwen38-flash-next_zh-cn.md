@@ -142,6 +142,14 @@ MP4、WebM 或 MOV data URI（不会抓取远程 URL）：
 采样和 logits 属于各自的请求；第二个请求覆盖模型的共享输出缓冲区之前，执行器会复制
 首个请求借用的 solo logits。不可变的 PLE 卷积系数由模型持有，覆盖所有 holder 的生命周期。
 
+在 Metal 上，新请求的 holder 以 2048 个 token 的 K/V 起步，并随请求增长（请求在首个
+chunk 之前预留提示与回复所需空间）；主缓存仍按显式 `MAX_CONTEXT` 分配整个窗口。此前
+holder 也按整个窗口分配：在 `MAX_CONTEXT=32768` 下，每个在飞对话即使提示很短也占用
+约 1.6 GB 的 Mac 内存，四个并发时内存压力使每一步慢 20-50%（48 GB M5 Pro，
+parallel_4 由 29 提升到 36-37 tok/s）。增长后的 holder 与整窗口主缓存的输出逐位一致。
+`TS_KV_INITIAL_TOKENS` 同时决定主缓存与每个 holder 的初始大小（设为 `MAX_CONTEXT`
+即恢复整窗口 holder）。
+
 **并发 decode 默认使用融合 arena。** 单设备 GGML CPU、Metal 或 CUDA 后端，在 F16 KV
 缓存和 span 状态已初始化、几何受支持时，两个或更多就绪的 decode 请求一起执行一张可复用的
 ggml 图。路由专家卸载到主机时，执行会在后端图分段之间跨越主机专家接缝。

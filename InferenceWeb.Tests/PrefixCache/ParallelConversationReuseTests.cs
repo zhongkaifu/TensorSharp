@@ -161,6 +161,8 @@ public sealed class ParallelConversationReuseTests : IDisposable
             gate.Open();
             InferenceCompletion[] done = await Task.WhenAll(handles.Select(h => h.Completion)).WaitAsync(timeout.Token);
             reused[turn] = done.Select(d => d.PrefixCacheReusedTokens).ToArray();
+            // The last request's state is kept (and a deficit relieved) after its completion is signalled.
+            await engine.WhenStepSettledAsync().WaitAsync(timeout.Token);
             afterTurn?.Invoke(engine, turn);
             for (int i = 0; i < conversations; i++)
             {

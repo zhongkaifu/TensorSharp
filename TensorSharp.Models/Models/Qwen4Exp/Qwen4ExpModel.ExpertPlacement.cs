@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.IO;
 using TensorSharp.GGML;
 using TensorSharp.Runtime;
 
@@ -59,6 +60,29 @@ namespace TensorSharp.Models
         /// <summary>Graph scratch, KV growth and the driver's own allocations, on top
         /// of the weights, inside the Metal working set.</summary>
         internal const long DeviceScratchBytes = 3L << 30;
+
+        /// <summary>What a DFlash drafter named for this load takes once attached (its weights and the KV ring of the
+        /// first request), counted by the Metal plan like the MTP head: the drafter is attached last, after the experts
+        /// took the working set. Unplanned, the 0.45 GB of Flash Next's DFlash2 Q4_K_M was what a 4096-token prompt
+        /// chunk lacked whenever a quiet machine at load sized the tier past ~25.5 GB of a 48 GB M5 Pro: its 2.84 GB
+        /// arena found 3.87-4.0 GB free of the 4.1 GB it needs beside the kept headroom, every 4K chunk ran in halves,
+        /// and 16K-token prompts took a second longer.</summary>
+        private long _pendingDraftBytes;
+
+        internal static long PendingDFlashDraftBytes(string path)
+        {
+            try
+            {
+                return new FileInfo(path).Length + DFlashRingAllowanceBytes;
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is ArgumentException)
+            {
+                return 0;   // the attach reports the file itself
+            }
+        }
+
+        /// <summary>One request's DFlash KV ring (Flash Next DFlash2: 2080 rows x 5 layers, 81 MB F32), rounded up.</summary>
+        internal const long DFlashRingAllowanceBytes = 128L << 20;
 
         /// <summary>
         /// With host-served experts (offloaded or tiered layers), the 2048-token kernel warm-up
@@ -175,8 +199,8 @@ namespace TensorSharp.Models
             long[] experts = new long[n];
             for (int l = 0; l < n; l++)
                 experts[l] = LayerExpertBytes(l);
-            // The MTP head is loaded after this plan, into the same working set.
-            long other = AcceleratorBoundNonExpertBytes() + CacheBytes() + (_mtpReady ? 0 : _mtpResidentBytes);
+            // The MTP head and a DFlash drafter are loaded after this plan, into the same working set.
+            long other = AcceleratorBoundNonExpertBytes() + CacheBytes() + (_mtpReady ? 0 : _mtpResidentBytes) + _pendingDraftBytes;
 
             long deviceExpertBytes = workingSet - Math.Max(GpuMemoryBudget.MinHeadroomBytes, workingSet / 16)
                 - other - DeviceScratchBytes;
@@ -195,7 +219,8 @@ namespace TensorSharp.Models
             long available = GgmlBasicOps.HostAvailableMemoryBytes();
             long keep = Math.Max(7_000_000_000L, ram / 100 * 15);
             long fits = Math.Min(ram / 100 * 65 - other - DeviceScratchBytes,
-                available > 0 ? available - keep - DeviceScratchBytes - (_mtpReady ? 0 : _mtpResidentBytes) : long.MaxValue);
+                available > 0 ? available - keep - DeviceScratchBytes - (_mtpReady ? 0 : _mtpResidentBytes) - _pendingDraftBytes
+                    : long.MaxValue);
             if (fits < deviceExpertBytes)
                 Console.WriteLine($"[moe-offload] qwen4exp: experts on the accelerator stay within {Gb(Math.Max(0, fits))}: " +
                     $"65% of the RAM wired at most, and macOS can give {(available > 0 ? Gb(available) : "?")} without " +

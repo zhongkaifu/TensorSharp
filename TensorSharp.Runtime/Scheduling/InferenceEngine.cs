@@ -320,6 +320,22 @@ namespace TensorSharp.Runtime.Scheduling
         public bool ReleaseRetiredAdapters()
             => _commands.Writer.TryWrite(new EngineCommand { Kind = EngineCommandKind.ReleaseAdapters });
 
+        /// <summary>
+        /// Completes once the engine thread has finished the step it is in, including that step's
+        /// post-step bookkeeping. A request's completion is signalled while its step is still
+        /// finishing: the state it leaves for the next turn is kept (and a memory deficit relieved)
+        /// right after, on the engine thread. A request submitted next is queued behind that
+        /// bookkeeping, so serving never sees the gap, but a caller that reads the prefix cache or
+        /// the model from another thread does. Queued like a trim; completes at once after shutdown.
+        /// </summary>
+        internal Task WhenStepSettledAsync()
+        {
+            var settled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!_commands.Writer.TryWrite(new EngineCommand { Kind = EngineCommandKind.Barrier, Settled = settled }))
+                settled.TrySetResult();
+            return settled.Task;
+        }
+
         /// <summary>How many submitted, unfinished requests run with an adapter that
         /// <paramref name="match"/> accepts. Safe from any thread.</summary>
         public int CountInFlightRequests(Func<IRequestAdapter, bool> match)
@@ -371,6 +387,9 @@ namespace TensorSharp.Runtime.Scheduling
                 if (_handles.TryRemove(entry.Key, out var handle))
                     handle.CompleteWithError(abandoned);
             }
+            // A barrier queued behind the last step has nothing left to wait for.
+            while (_commands.Reader.TryRead(out var pending))
+                pending.Settled?.TrySetResult();
             if (!_worker.IsAlive)
             {
                 lock (_model.GpuComputeLock)
@@ -895,6 +914,10 @@ namespace TensorSharp.Runtime.Scheduling
                     SweepRetiredAdapters();
                     break;
 
+                case EngineCommandKind.Barrier:
+                    cmd.Settled?.TrySetResult();
+                    break;
+
                 case EngineCommandKind.Speculation:
                     _executor.SetSpeculation(cmd.Speculation);
                     _logger.LogInformation(
@@ -1330,6 +1353,7 @@ namespace TensorSharp.Runtime.Scheduling
             public SequenceState Sequence;
             public string RequestId;
             public SpeculationOptions Speculation;
+            public TaskCompletionSource? Settled;
         }
 
         private enum EngineCommandKind
@@ -1339,6 +1363,7 @@ namespace TensorSharp.Runtime.Scheduling
             Trim,
             Speculation,
             ReleaseAdapters,
+            Barrier,
         }
     }
 }

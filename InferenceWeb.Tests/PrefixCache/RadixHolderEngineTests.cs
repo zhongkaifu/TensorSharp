@@ -29,8 +29,14 @@ public class RadixHolderEngineTests
         int shared = 0, IReadOnlyList<int>? breaks = null) => new(id, tokens, 3, 8, SamplingConfig.Greedy,
             cacheScope: scope, sharedPrefixTokens: shared, cacheBreakpoints: breaks);
 
+    // A completion is signalled before its step's post-step bookkeeping (keeping the finished state) is done on the
+    // engine thread; these tests read the model and the tree right after, so they wait for that step to settle.
     private static async Task<InferenceCompletion> Run(InferenceEngine engine, SequenceState sequence)
-        => await engine.SubmitRequest(sequence).Completion.WaitAsync(TimeSpan.FromSeconds(10));
+    {
+        InferenceCompletion completion = await engine.SubmitRequest(sequence).Completion.WaitAsync(TimeSpan.FromSeconds(10));
+        await engine.WhenStepSettledAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        return completion;
+    }
 
     [Theory]
     [InlineData(false)]

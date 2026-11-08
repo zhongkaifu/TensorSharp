@@ -137,11 +137,14 @@ namespace TensorSharp.Models
                 int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
                 InitCaches(initialCacheLength, maxContextLength);
                 _q4eDistributed?.ValidateConfiguration($"qwen-cache|{_kvCacheDtype}|{initialCacheLength}|{maxContextLength}");
+                _pendingDraftBytes = dflashPath != null ? PendingDFlashDraftBytes(dflashPath) : 0;
                 PlanExpertPlacement();
                 FinalizeMtpHead();
                 StartPleTableWarm();
                 if (dflashPath != null)
                     TryLoadQwen4ExpDFlash(dflashPath);
+                // Attached, the drafter's tensors are the trunk's own (AcceleratorBoundNonExpertBytes counts them).
+                _pendingDraftBytes = 0;
             }
             catch (Exception failure)
             {
