@@ -2866,9 +2866,11 @@ namespace tsg
         // One accumulator per width class (decode, verify-sized, prefill-sized):
         // a speculative session alternates widths every step.
         struct PassAcc { double gpu = 0, host = 0, up = 0, total = 0; int passes = 0, seq = -1; long long c0[9] = {}; };
-        static thread_local PassAcc s_acc[3];
+        // One accumulator per decode/verify width (1-8; a speculative session's windows change width nearly every
+        // step, so a shared one never reached its print) and one for prompt widths.
+        static thread_local PassAcc s_acc[10];
         const int pass_seq = segments.empty() ? 0 : segments[0].seq_len;
-        PassAcc& acc = s_acc[pass_seq <= 1 ? 0 : pass_seq <= 8 ? 1 : 2];
+        PassAcc& acc = s_acc[pass_seq <= 1 ? 1 : pass_seq <= 8 ? pass_seq : 9];
         double& s_acc_gpu = acc.gpu; double& s_acc_host = acc.host; double& s_acc_up = acc.up;
         double& s_acc_total = acc.total; int& s_acc_passes = acc.passes; int& s_acc_seq = acc.seq;
         const auto t_pass = s_pass_timing ? pass_clock::now() : pass_clock::time_point{};
