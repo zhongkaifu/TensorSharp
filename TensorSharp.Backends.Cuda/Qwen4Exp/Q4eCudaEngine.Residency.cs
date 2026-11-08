@@ -588,9 +588,10 @@ namespace TensorSharp.Cuda
         private static bool AdaptiveResidencyEnabled => Environment.GetEnvironmentVariable("TS_MOE_TIER_ADAPT") != "0";
 
         /// <summary>Forwards (decode steps, verify windows, batched steps) between adaptation rounds (TS_MOE_TIER_ADAPT_EVERY).</summary>
-        private static readonly int AdaptEvery = Math.Max(1, EnvInt("TS_MOE_TIER_ADAPT_EVERY", 4));
-        /// <summary>Swaps a round makes at most, the largest gains first across the layers (TS_MOE_TIER_ADAPT_SWAPS).</summary>
-        private static readonly int AdaptSwapsPerCall = Math.Max(1, EnvInt("TS_MOE_TIER_ADAPT_SWAPS", 8));
+        private readonly int AdaptEvery = Math.Max(1, EnvInt("TS_MOE_TIER_ADAPT_EVERY", 4));
+        /// <summary>Swaps a round makes at most, the largest gains first across the layers (TS_MOE_TIER_ADAPT_SWAPS): 8 when
+        /// they block, 64 when they overlap the decode (Q4eCudaEngine.AsyncSwaps.cs).</summary>
+        private int AdaptSwapsPerCall => Math.Max(1, EnvInt("TS_MOE_TIER_ADAPT_SWAPS", AsyncSwapsUsable ? 64 : 8));
 
         /// <summary>Swaps a round after a prompt makes at most (TS_MOE_TIER_ADAPT_PROMPT_SWAPS; 0 = prompts teach nothing).
         /// The decode after a long prompt routes much as the prompt did: on the RTX 5090 the first verify windows after a
@@ -615,7 +616,11 @@ namespace TensorSharp.Cuda
         private void AdaptResidency()
         {
             var r = _residency;
-            if (r?.Tab == null || _adaptCounts == null || ++_adaptSteps % AdaptEvery != 0)
+            if (r?.Tab == null || _adaptCounts == null)
+                return;
+            // An overlapped round in flight takes its next step once its copies have landed.
+            AdvanceAsyncSwaps(force: false);
+            if (++_adaptSteps % AdaptEvery != 0)
                 return;
             AdaptRound(AdaptSwapsPerCall);
         }
@@ -654,6 +659,9 @@ namespace TensorSharp.Cuda
             var m = _m;
             var dev = _devs[0];
             dev.MakeCurrent();
+            // One overlapped round at a time: the counts keep gathering until it is done.
+            if (_swapStep != 0)
+                return;
             CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
             float[][] counts = _adaptCounts;
             if (decodeCounts && _adaptCountsDev != IntPtr.Zero)
@@ -667,6 +675,12 @@ namespace TensorSharp.Cuda
                     for (int e = 0; e < m.NExpert; e++)
                         c[e] += _adaptRaw[(long)il * m.NExpert + e];
                 }
+            }
+            if (AsyncSwapsUsable)
+            {
+                BeginAsyncSwaps(SelectTrades(swapBudget));
+                DecayAdaptCounts();
+                return;
             }
             // Each layer's best trade, then the largest gains first.
             var trades = new List<(float Gain, int Layer)>();
@@ -698,10 +712,15 @@ namespace TensorSharp.Cuda
             }
             foreach (int il in changed)
                 UploadLayerTables(il);
-            for (int il = 0; il < m.NLayer; il++)
+            DecayAdaptCounts();
+        }
+
+        private void DecayAdaptCounts()
+        {
+            for (int il = 0; il < _m.NLayer; il++)
             {
-                float[] c = counts[il];
-                for (int e = 0; e < m.NExpert; e++)
+                float[] c = _adaptCounts[il];
+                for (int e = 0; e < _m.NExpert; e++)
                     c[e] *= 0.75f;
             }
         }

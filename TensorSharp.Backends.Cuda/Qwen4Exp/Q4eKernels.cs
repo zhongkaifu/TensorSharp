@@ -51,6 +51,15 @@ namespace TensorSharp.Cuda
         private readonly IntPtr attnPrep, attention, attnPrepQ8, attentionQ8;
         // Decode-size attention split over the cells (optional: a module before it runs a block per head and row).
         private readonly IntPtr attentionSplit, attentionSplitQ8;
+        // Prompt attention on tensor cores, a block per (row, KV head) (optional; sm_80+ and a module built for it).
+        private readonly IntPtr attentionMma, attentionMmaQ8;
+
+        /// <summary>Whether <see cref="AttentionMma"/> runs here: the module carries it compiled for sm_80 or newer and the
+        /// device is one (the committed compute_75 baseline compiles its body to nothing).</summary>
+        public bool HasAttentionMma { get; }
+
+        /// <summary>Query heads per KV head <see cref="AttentionMma"/> takes (the rows of its 16-row tile).</summary>
+        public const int AttnMmaMaxGroup = 16;
 
         /// <summary>Whether the module stores and reads a Q8_0 KV cache (<c>--kv-cache-dtype q8_0</c>): int8 codes
         /// [nCtx, NKV, HD] beside F16 scales [nCtx, NKV, HD / 32].</summary>
@@ -67,6 +76,8 @@ namespace TensorSharp.Cuda
         private readonly IntPtr countSelected;
         // The MTP draft chain's per-step pick on the device (optional).
         private readonly IntPtr draftPick;
+        // The pick in two stages (optional): a block per slice of the row, then one merging block.
+        private readonly IntPtr draftPickPart, draftPickMerge;
 
         private Q4eKernels(CudaModule module)
         {
@@ -104,8 +115,23 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500) { argmaxRows = IntPtr.Zero; }
             try { countSelected = module.GetFunction("ts_q4e_count_selected"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { countSelected = IntPtr.Zero; }
+            try
+            {
+                attentionMma = module.GetFunction("ts_q4e_attention_mma_f32");
+                attentionMmaQ8 = module.GetFunction("ts_q4e_attention_mma_q8_f32");
+                CudaDriverApi.cuCtxGetDevice(out int device);
+                CudaDriverApi.cuDeviceGetAttribute(out int ccMajor, 75 /* CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR */, device);
+                HasAttentionMma = CudaKernels.ArchGuardedKernelsUsable(module.CompiledArchOf("ts_q4e_attention_mma_q8_f32"), ccMajor);
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { attentionMma = attentionMmaQ8 = IntPtr.Zero; }
             try { draftPick = module.GetFunction("ts_q4e_draft_pick_f32"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { draftPick = IntPtr.Zero; }
+            try
+            {
+                draftPickPart = module.GetFunction("ts_q4e_draft_pick_part_f32");
+                draftPickMerge = module.GetFunction("ts_q4e_draft_pick_merge_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { draftPickPart = draftPickMerge = IntPtr.Zero; }
         }
 
         public static Q4eKernels Create()
@@ -282,6 +308,28 @@ namespace TensorSharp.Cuda
             Launch(attention, (uint)nHead, (uint)rows, 1, BlockSize, stream, args);
         }
 
+        /// <summary><see cref="Attention"/> for prompt-size calls on tensor cores (needs <see cref="HasAttentionMma"/>, a head
+        /// dim of 256 and at most <see cref="AttnMmaMaxGroup"/> query heads per KV head): a block of four warps per (row, KV
+        /// head) computes the group's heads together, each cached key and value widened once to F16.</summary>
+        public void AttentionMma(IntPtr q, IntPtr kCache, IntPtr vCache, IntPtr gate, IntPtr cells, IntPtr cellCnt, IntPtr output,
+            IntPtr positions, int p0, int nHead, int nKvHead, float scale, int cellStride, int rows, IntPtr stream,
+            IntPtr kScale = default, IntPtr vScale = default)
+        {
+            if (!HasAttentionMma || nHead % nKvHead != 0 || nHead / nKvHead > AttnMmaMaxGroup)
+                throw new InvalidOperationException("[q4e-cuda] the tensor-core prompt attention is not available for this layout");
+            IntPtr a0 = q, a1 = kCache, a2 = vCache, a3 = gate, a4 = cells, a5 = cellCnt, a6 = output, a7 = positions;
+            int a8 = p0, a9 = nHead, a10 = nKvHead; float a11 = scale; int a12 = cellStride;
+            if (kScale != IntPtr.Zero)
+            {
+                IntPtr s0 = kScale, s1 = vScale;
+                void** q8 = stackalloc void*[] { &a0, &a1, &a2, &s0, &s1, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };
+                Launch(attentionMmaQ8, (uint)nKvHead, (uint)rows, 1, 128, stream, q8);
+                return;
+            }
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };
+            Launch(attentionMma, (uint)nKvHead, (uint)rows, 1, 128, stream, args);
+        }
+
         /// <summary>Whether <see cref="AttentionSplit"/> is available.</summary>
         public bool HasAttentionSplit => attentionSplit != IntPtr.Zero && attentionSplitQ8 != IntPtr.Zero;
 
@@ -451,15 +499,38 @@ namespace TensorSharp.Cuda
         /// <summary>Whether <see cref="DraftPick"/> is available.</summary>
         public bool HasDraftPick => draftPick != IntPtr.Zero;
 
+        /// <summary>Logits each block of the two-stage pick's first stage reads.</summary>
+        public const int DraftPickChunk = 1024;
+
+        /// <summary>Candidate entries (a float and an int each) the two-stage pick needs for <paramref name="vocab"/> logits.</summary>
+        public static int DraftPickCandidates(int vocab) => CeilDivInt(vocab, DraftPickChunk) * 10;
+
+        private static int CeilDivInt(int a, int b) => (a + b - 1) / b;
+
         /// <summary>A draft step's first-max token into ids[step] and nextToken[0], and its top-10 softmax confidence
-        /// into probs[step].</summary>
-        public void DraftPick(IntPtr logits, int vocab, IntPtr ids, IntPtr probs, int step, IntPtr nextToken, IntPtr stream)
+        /// into probs[step]. With <paramref name="candidates"/> (<see cref="DraftPickCandidates"/> floats then as many
+        /// ints) a block per 1,024 logits keeps its slice's ten largest and one block merges them: the same pick, bit for
+        /// bit (TS_Q4E_DRAFT_PICK_SPLIT=0 runs the one-block kernel).</summary>
+        public void DraftPick(IntPtr logits, int vocab, IntPtr ids, IntPtr probs, int step, IntPtr nextToken, IntPtr stream,
+            IntPtr candidates = default)
         {
             IntPtr a0 = logits, a2 = ids, a3 = probs, a5 = nextToken;
             int a1 = vocab, a4 = step;
+            if (candidates != IntPtr.Zero && draftPickPart != IntPtr.Zero && _draftPickSplit)
+            {
+                int blocks = CeilDivInt(vocab, DraftPickChunk), n = blocks * 10, chunk = DraftPickChunk;
+                IntPtr cv = candidates, ck = (IntPtr)((long)candidates + 4L * n);
+                void** pa = stackalloc void*[] { &a0, &a1, &chunk, &cv, &ck };
+                Launch(draftPickPart, (uint)blocks, 1, 1, 256, stream, pa);
+                void** ma = stackalloc void*[] { &cv, &ck, &n, &a2, &a3, &a4, &a5 };
+                Launch(draftPickMerge, 1, 1, 1, 1024, stream, ma);
+                return;
+            }
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
             Launch(draftPick, 1, 1, 1, 1024, stream, args);
         }
+
+        private static readonly bool _draftPickSplit = Environment.GetEnvironmentVariable("TS_Q4E_DRAFT_PICK_SPLIT") != "0";
 
         public void Dispose() => module.Dispose();
     }

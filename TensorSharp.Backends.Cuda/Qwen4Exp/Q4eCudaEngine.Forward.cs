@@ -387,6 +387,9 @@ namespace TensorSharp.Cuda
             int e = m.NEmbd;
             var dev0 = _devs[0];
             dev0.MakeCurrent();
+            // A step that stages its missed experts needs the staging an overlapped swap round may hold.
+            if (nt > _hostExpertRows)
+                FlushAsyncSwaps();
             // The pinned tokens are rewritten per ubatch: the previous upload must have run.
             CudaDriverApi.cuStreamSynchronize(dev0.Stream).ThrowOnError();
             Marshal.Copy(tokens, tokOff, _pinnedTokens, nt);
@@ -474,10 +477,20 @@ namespace TensorSharp.Cuda
             var dev = _devs[0];
             int ub = m.NUbatch, hc = HcDim;
             dev.MakeCurrent();
+            FlushAsyncSwaps();
             Tensor ubatchXs = dev.Xs;
             _groupedPrompt = true;
+            bool prefetch = PromptPrefetchUsable();
             try
             {
+                if (prefetch)
+                {
+                    // Both halves are free from here (the previous group unstaged in this stream's order).
+                    for (int h = 0; h < 2; h++)
+                        CudaDriverApi.cuEventRecord(_halfFree[h], dev.Stream).ThrowOnError();
+                    PromptPrefetchGroups++;
+                }
+                bool staged = false;
                 // Every row's streams start as its token's embedding.
                 for (int r0 = 0; r0 < g; r0 += ub)
                 {
@@ -494,6 +507,22 @@ namespace TensorSharp.Cuda
                 for (int il = 0; il < m.NLayer; il++)
                 {
                     var L = _layers[il];
+                    // A layer whose host experts fit a half runs on it, staged ahead while the layer before ran when that
+                    // one did too; any other layer stages per ubatch over the whole staging.
+                    bool half = prefetch && _halfFits[il];
+                    var stage = half ? _halfStages[il & 1] : _expertStage;
+                    if (half)
+                    {
+                        if (staged)
+                            CudaDriverApi.cuStreamWaitEvent(dev.Stream, _prefetchDone[il & 1], 0).ThrowOnError();
+                        // The next layer's host experts cross the bus while this layer runs.
+                        staged = il + 1 < m.NLayer && _halfFits[il + 1];
+                        if (staged)
+                            PrefetchLayer(il + 1, (il + 1) & 1, _prefetchStream, waitFree: true);
+                    }
+                    else
+                        staged = false;
+                    _promptStage = stage;
                     for (int r0 = 0; r0 < g; r0 += ub)
                     {
                         int nt = Math.Min(ub, g - r0);
@@ -507,7 +536,13 @@ namespace TensorSharp.Cuda
                         RunLayer(dev, il, slot, nt, p0 + r0, null, null, IntPtr.Zero);
                     }
                     // The layer's ubatches shared one staging.
-                    CudaMoe.Unstage(dev.DK, _expertStage, L.Stage, dev.Stream);
+                    CudaMoe.Unstage(dev.DK, stage, L.Stage, dev.Stream);
+                    // A half is free again once its layer unstaged; the whole staging frees both.
+                    if (half)
+                        CudaDriverApi.cuEventRecord(_halfFree[il & 1], dev.Stream).ThrowOnError();
+                    else if (prefetch)
+                        for (int h = 0; h < 2; h++)
+                            CudaDriverApi.cuEventRecord(_halfFree[h], dev.Stream).ThrowOnError();
                 }
                 if (hOut != null && hRowOffset >= 0 && hOut.LongLength >= ((long)hRowOffset + g) * hc)
                 {
@@ -530,6 +565,7 @@ namespace TensorSharp.Cuda
             {
                 dev.Xs = ubatchXs;
                 _groupedPrompt = false;
+                _promptStage = null;
             }
         }
 
@@ -739,7 +775,14 @@ namespace TensorSharp.Cuda
             StageEnd(dev, StAttnPrep);
 
             int splits = AttnSplits(dev, il, nt, p0);
-            if (splits > 0)
+            if (splits == 0 && AttnMmaFor(dev, nt))
+            {
+                dev.QK.AttentionMma(At(dev.Q, (long)row0 * qd), Ptr(c.KCache), Ptr(c.VCache), At(dev.Gate, (long)row0 * qd),
+                    cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
+                    CellStride, nt, dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
+                PromptAttentionMmaCalls++;
+            }
+            else if (splits > 0)
                 dev.QK.AttentionSplit(At(dev.Q, (long)row0 * qd), Ptr(c.KCache), Ptr(c.VCache), At(dev.Gate, (long)row0 * qd),
                     cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
                     CellStride, nt, splits, Ptr(dev.AttnPart), Ptr(dev.AttnArrive), dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
@@ -774,6 +817,35 @@ namespace TensorSharp.Cuda
             int cellsMax = p0 + nt;
             return Math.Clamp((cellsMax + 127) / 128, 1, MaxAttnSplits);
         }
+
+        // TS_Q4E_ATTN_MMA=0: prompt-size attention keeps the one-block-per-(head, row) kernel.
+        private readonly bool _attnMma = Environment.GetEnvironmentVariable("TS_Q4E_ATTN_MMA") != "0";
+
+        /// <summary>Attention calls that ran on tensor cores so far (a test proves the path engaged).</summary>
+        internal long PromptAttentionMmaCalls { get; private set; }
+
+        /// <summary>Whether an attention call of <paramref name="nt"/> rows runs on tensor cores: a prompt-size call (decode
+        /// steps and verify windows keep their kernels, so a row's answer does not depend on the window), the kernel built
+        /// for this GPU, and a query-head group of at most 16.</summary>
+        private bool AttnMmaFor(Dev dev, int nt)
+        {
+            if (!_attnMma || nt <= PerSlotMaxRows)
+                return false;
+            if (dev.QK.HasAttentionMma && _m.NHead % _m.NKvHead == 0 && _m.NHead / _m.NKvHead <= Q4eKernels.AttnMmaMaxGroup)
+                return true;
+            if (!_attnMmaDeclineWarned)
+            {
+                _attnMmaDeclineWarned = true;
+                Console.Error.WriteLine(dev.QK.HasAttentionMma
+                    ? $"[q4e-cuda] prompt attention runs on the CUDA cores: {_m.NHead} query heads over {_m.NKvHead} KV heads exceed the "
+                      + $"tensor-core kernel's {Q4eKernels.AttnMmaMaxGroup}-row group (prompts are slower; answers unchanged)."
+                    : "[q4e-cuda] prompt attention runs on the CUDA cores: the loaded tensorsharp_q4e_kernels module has no tensor-core "
+                      + "attention for this GPU (needs sm_80+ and a module built for it, not the compute_75 baseline); prompts are slower.");
+            }
+            return false;
+        }
+
+        private bool _attnMmaDeclineWarned;
 
         // The rows of the step in flight: a batched decode step sets it before its layers run.
         private int _rowsInFlight;
@@ -881,7 +953,7 @@ namespace TensorSharp.Cuda
 
             CudaMoe.Experts(dev.DK, dev.Alloc.Kernels, dev.Moe, L.GateExps, L.UpExps, L.DownExps,
                 dev.Cur, dev.ShDown, dev.BlockOut, nt, m.NExpertUsed, m.NExpert, e, m.NFfExp, 0f,
-                PerSlotMaxRows, dev.Stream, stage: host ? null : _expertStage, stageLayer: L.Stage,
+                PerSlotMaxRows, dev.Stream, stage: host ? null : _promptStage ?? _expertStage, stageLayer: L.Stage,
                 shDownReady: fork ? dev.ShJoinEv : IntPtr.Zero, keepStaged: _groupedPrompt);
             if (host)
             {

@@ -1275,6 +1275,7 @@ extern "C" __global__ void ts_dsv4_gemv_16_f32(const float* x, const float* w, f
 // CTA, lanes striding the whole input row in float4s. The CTA-per-output form gave each of its 128
 // threads five float4s of a 2560-wide row and spent the launch on CTA scheduling. Each output's sum
 // has one order whatever the row count.
+#define TS_DSV4_GEMV_WARP_UNROLL 4
 template <int MAXR>
 __device__ __forceinline__ void ts_dsv4_gemv_warp_rows(
     const float* __restrict__ x,      // [rows, inDim], inDim % 4 == 0
@@ -1294,16 +1295,28 @@ __device__ __forceinline__ void ts_dsv4_gemv_warp_rows(
 #pragma unroll
     for (int r = 0; r < MAXR; ++r)
         acc[r] = 0.0f;
-    for (int i = lane; i < n4; i += 32)
+    // Several loads in flight per lane (see ts_dsv4_gemv_warp_bf16_rows); the sums keep their order.
+    for (int i0 = lane; i0 < n4; i0 += 32 * TS_DSV4_GEMV_WARP_UNROLL)
     {
-        const float4 b = w4[i];
+        float4 bw[TS_DSV4_GEMV_WARP_UNROLL];
 #pragma unroll
-        for (int r = 0; r < MAXR; ++r)
+        for (int u = 0; u < TS_DSV4_GEMV_WARP_UNROLL; ++u)
+            bw[u] = i0 + 32 * u < n4 ? w4[i0 + 32 * u] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int u = 0; u < TS_DSV4_GEMV_WARP_UNROLL; ++u)
         {
-            if (r >= rows)
+            const int i = i0 + 32 * u;
+            if (i >= n4)
                 break;
-            const float4 a = ((const float4*)(x + (size_t)r * inDim))[i];
-            acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            const float4 b = bw[u];
+#pragma unroll
+            for (int r = 0; r < MAXR; ++r)
+            {
+                if (r >= rows)
+                    break;
+                const float4 a = ((const float4*)(x + (size_t)r * inDim))[i];
+                acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
         }
     }
 #pragma unroll
@@ -1339,21 +1352,35 @@ __device__ __forceinline__ void ts_dsv4_gemv_warp_bf16_rows(
 #pragma unroll
     for (int r = 0; r < MAXR; ++r)
         acc[r] = 0.0f;
-    for (int i = lane; i < n4; i += 32)
+    // TS_DSV4_GEMV_WARP_UNROLL loads of the lane's row in flight before the first is summed: one at a time, a
+    // 2560-wide router (512 warps over the whole GPU) waited on each load in turn, 14.2 us a 4-row verify layer
+    // for 2.6 MB on the RTX 5090; 12.6 us this way. The sums keep their order.
+    for (int i0 = lane; i0 < n4; i0 += 32 * TS_DSV4_GEMV_WARP_UNROLL)
     {
-        const uint2 p = w4[i];
-        float4 b;
-        b.x = __uint_as_float(p.x << 16);
-        b.y = __uint_as_float(p.x & 0xffff0000u);
-        b.z = __uint_as_float(p.y << 16);
-        b.w = __uint_as_float(p.y & 0xffff0000u);
+        uint2 pw[TS_DSV4_GEMV_WARP_UNROLL];
 #pragma unroll
-        for (int r = 0; r < MAXR; ++r)
+        for (int u = 0; u < TS_DSV4_GEMV_WARP_UNROLL; ++u)
+            pw[u] = i0 + 32 * u < n4 ? w4[i0 + 32 * u] : make_uint2(0u, 0u);
+#pragma unroll
+        for (int u = 0; u < TS_DSV4_GEMV_WARP_UNROLL; ++u)
         {
-            if (r >= rows)
+            const int i = i0 + 32 * u;
+            if (i >= n4)
                 break;
-            const float4 a = ((const float4*)(x + (size_t)r * inDim))[i];
-            acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            const uint2 p = pw[u];
+            float4 b;
+            b.x = __uint_as_float(p.x << 16);
+            b.y = __uint_as_float(p.x & 0xffff0000u);
+            b.z = __uint_as_float(p.y << 16);
+            b.w = __uint_as_float(p.y & 0xffff0000u);
+#pragma unroll
+            for (int r = 0; r < MAXR; ++r)
+            {
+                if (r >= rows)
+                    break;
+                const float4 a = ((const float4*)(x + (size_t)r * inDim))[i];
+                acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
         }
     }
 #pragma unroll

@@ -624,23 +624,36 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             foreach (var (name, t) in g.Tensors)
                 if (name.Contains("_exps.", StringComparison.Ordinal))
                     expertBytes += g.GetTensorByteCount(t);
-        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        // Two thirds resident: a layer's host experts then fit half the staging, so the next layer can be staged ahead.
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes * 2 / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
 
-        (float[][] Rows, long Groups) Answer(string group)
+        (float[][] Rows, long Groups, long Prefetched) Answer(string group)
         {
             _env.Set("TS_Q4E_PROMPT_GROUP", group);
             using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
             var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
-            return (Run(model), engine.PromptGroupsRun);
+            var rows = Run(model);
+            return (rows, engine.PromptGroupsRun, engine.PromptPrefetchGroups);
         }
         var ubatchOrder = Answer("0");
+        _env.Set("TS_Q4E_PROMPT_PREFETCH", "0");
         var grouped = Answer("24");
-        _output.WriteLine($"prompt groups read layer by layer: ubatch order {ubatchOrder.Groups}, grouped {grouped.Groups}");
+        _env.Set("TS_Q4E_PROMPT_PREFETCH", null);
+        var prefetched = Answer("24");
+        _output.WriteLine($"prompt groups read layer by layer: ubatch order {ubatchOrder.Groups}, grouped {grouped.Groups}, "
+            + $"grouped with the next layer staged ahead {prefetched.Groups}");
         Assert.Equal(0, ubatchOrder.Groups);
         Assert.Equal(2, grouped.Groups);
+        Assert.Equal(2, prefetched.Groups);
+        Assert.Equal(0, grouped.Prefetched);
+        Assert.Equal(2, prefetched.Prefetched);
         for (int i = 0; i < grouped.Rows.Length; i++)
+        {
             Assert.True(grouped.Rows[i].AsSpan().SequenceEqual(ubatchOrder.Rows[i]),
                 $"{(i == 0 ? "prefill" : $"decode {i}")}: reading the prompt layer by layer changed the logits");
+            Assert.True(prefetched.Rows[i].AsSpan().SequenceEqual(ubatchOrder.Rows[i]),
+                $"{(i == 0 ? "prefill" : $"decode {i}")}: staging the next layer ahead changed the logits");
+        }
     }
 
     /// <summary>
@@ -658,6 +671,7 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             foreach (var (name, t) in g.Tensors)
                 if (name.Contains("_exps.", StringComparison.Ordinal))
                     expertBytes += g.GetTensorByteCount(t);
+        // Two thirds resident: a layer's host experts then fit half the staging, so the next layer can be staged ahead.
         _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
         (float[][] Rows, long Skipped, long Misses) Answer(string rank)
         {
@@ -764,9 +778,17 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     /// <summary>Adaptive residency (TS_MOE_TIER_ADAPT=1 under host experts): between decode steps the most-selected
     /// host experts trade places with the least-selected VRAM experts. The swaps keep every expert reachable, so a
     /// long decode keeps answering as the all-resident engine does within the host-compute tolerance.</summary>
-    [CudaFact]
-    public void ExpertResidency_AdaptiveSwaps_KeepAnswering()
+    /// <remarks>Both the blocking swaps and the overlapped rounds (TS_MOE_TIER_ADAPT_ASYNC, the default: copies on a stream of
+    /// their own, the tables switched a forward boundary later), the overlapped ones every 2 steps so rounds follow each
+    /// other while decode steps run beside their copies.</remarks>
+    [CudaTheory]
+    [InlineData("0")]
+    [InlineData("1")]
+    public void ExpertResidency_AdaptiveSwaps_KeepAnswering(string overlapped)
     {
+        _env.Set("TS_MOE_TIER_ADAPT_ASYNC", overlapped);
+        if (overlapped == "1")
+            _env.Set("TS_MOE_TIER_ADAPT_EVERY", "2");
         string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
         long expertBytes = 0;
         using (var g = new GgufFile(path))
@@ -909,6 +931,58 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             Assert.True(err <= 1e-4, $"decode {i}: split attention differs by {err:E2}");
             double rowErr = RelativeError(split.Window.AsSpan((i - 1) * vocab, vocab).ToArray(), split.Rows[i]);
             Assert.True(rowErr <= 1e-5, $"verify row {i - 1} differs from its own decode step by {rowErr:E2} under split attention");
+        }
+    }
+
+    /// <summary>
+    /// Prompt-size attention on tensor cores (TS_Q4E_ATTN_MMA: a block per row and KV head, the group's query heads one
+    /// 16-row mma tile, F16 operands) against the one-block-per-(head, row) kernel: a 600-row prompt's logits and the
+    /// decode steps after it, dense (top_k 2048) and past the QSA width (top_k 16, every row from 19 on over its listed
+    /// cells), over the F16 and the Q8_0 cache. The operands round to F16, so the answers move a little (as much as the
+    /// Q8_0 cache moves them from F16); decode steps keep their kernels.
+    /// </summary>
+    [CudaTheory]
+    [InlineData(2048, false)]
+    [InlineData(16, false)]
+    [InlineData(16, true)]
+    public void TensorCorePromptAttention_AnswersAsTheScalarKernel(int indexerTopK, bool q8)
+    {
+        string path = Fixture(indexerTopK: indexerTopK);
+        int[] prompt = Enumerable.Range(0, 600).Select(i => (i * 37 + 11) % 250).ToArray();
+        KvCacheDtype saved = KvCacheDtypeConfig.Current;
+        bool savedExplicit = KvCacheDtypeConfig.IsExplicitlySet;
+        try
+        {
+            KvCacheDtypeConfig.Set(q8 ? KvCacheDtype.Q8_0 : KvCacheDtype.F16);
+            (float[][] Rows, long Calls) Answer(string mma)
+            {
+                _env.Set("TS_Q4E_ATTN_MMA", mma);
+                using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+                var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+                var rows = new float[Steps.Length + 1][];
+                rows[0] = (float[])model.ForwardRefill(prompt).Clone();
+                for (int i = 0; i < Steps.Length; i++)
+                    rows[i + 1] = (float[])model.Forward(new[] { Steps[i] }).Clone();
+                return (rows, engine.PromptAttentionMmaCalls);
+            }
+            var scalar = Answer("0");
+            var mma = Answer(null);
+            Assert.Equal(0, scalar.Calls);
+            Assert.True(mma.Calls > 0, "the prompt's attention did not run on tensor cores");
+            for (int i = 0; i < mma.Rows.Length; i++)
+            {
+                double err = RelativeError(mma.Rows[i], scalar.Rows[i]);
+                _output.WriteLine($"{(i == 0 ? "prefill" : $"decode {i}")}: tensor cores vs scalar kernel, relative error {err:E2}");
+                // Measured 4.2e-3 .. 5.4e-3 on the prefill and 3.0e-3 .. 5.2e-3 on the decode steps after it on an RTX 5090,
+                // through eight layers of the fixture (the Q8_0 cache moves them 3.7e-3 .. 4.8e-3 from F16);
+                // Q4eAttentionMmaTests holds the kernel itself to 1e-3 a row.
+                Assert.True(err <= 1e-2, $"{(i == 0 ? "prefill" : $"decode {i}")}: the tensor-core attention moved the logits by {err:E2}");
+            }
+        }
+        finally
+        {
+            KvCacheDtypeConfig.RestoreForTests(saved, savedExplicit);
+            _env.Set("TS_Q4E_ATTN_MMA", null);
         }
     }
 

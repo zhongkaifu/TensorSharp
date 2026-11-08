@@ -1257,6 +1257,108 @@ Tried and dropped the same day: a prompt attention kernel with a KV head's query
 V read once into shared memory, each head's online softmax in one warp) read the 4K prompt in 1.72 s against 1.69 s and
 the 16K one in 7.0 s against 6.8 s; one warp walking every cell of a head was slower than eight warps sharing them.
 
+#### Adaptive residency without stalls, 2026-11-08
+
+Each expert the CPU computes costs a verify window 40-50 us, and after a long prompt the 8 blocking swaps a round left
+100-170 of them in a window for many windows (a round of 96, `TS_MOE_TIER_ADAPT_SWAPS=96`, caught up faster but stalled
+the GPU for its copies). A round now runs beside the decode (`TS_MOE_TIER_ADAPT_ASYNC`, on; Strata's overlapped
+adaptive tier): its copies go on a stream of their own in three steps a forward boundary apart, so a window's tables
+never name bytes in flight. First both experts of each trade are copied into the prompt staging (idle in decode),
+then the tables switch to those copies while the copies go to their final places (the hot expert into the cold one's
+slot, the cold one into the hot one's packed host place), then the tables switch to the final places. A prompt or a
+wide step first finishes a round in flight. With the stalls gone a round carries 64 swaps.
+
+RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
+
+| adaptation | short chat | long generation | 4K prompt | 16K prompt | CPU experts a window after 4K / 16K |
+| --- | --- | --- | --- | --- | --- |
+| 8 blocking swaps a round | 0.08-0.10 s / 88-102 | 154-182 | 1.62-1.70 s / 135-160 | 6.71-6.88 s / 167-184 | 115-171 / 69-98 |
+| 64 overlapped swaps a round (default) | 0.07-0.09 s / 75-110 | 174-179 | 1.61-1.69 s / 137-188 | 6.76-6.81 s / 183-198 | 31-146 / 26-33 |
+| 96 overlapped swaps a round | 0.07-0.09 s / 82-100 | 169-180 | 1.61-1.69 s / 151-193 | 6.71-6.79 s / 151-193 | 32-96 / 17-28 |
+
+#### The next prompt layer staged ahead, 2026-11-08
+
+Read layer by layer, a 4K prompt still spent 0.26 s of GPU time staging each layer's missed experts on its own
+stream, the layer waiting for the copy kernel. The staging now holds two halves with their own plans
+(`TS_Q4E_PROMPT_PREFETCH`, on): while a layer runs on the half that holds its experts, the copy engines bring every
+host expert of the next layer into the other half. The host keeps a layer's experts packed in host-index order, which
+becomes the staging slot order, so each matrix is one 2D copy and the plan (slots, list, the layer's tables pointing at
+the copies) is written from the host; the next layer waits for those copies instead of staging per ubatch. A half is
+reused two layers later, after its layer unstaged. Layers whose host experts do not fit a half (up to 228 of 256 on
+the 5090 run) stage per ubatch over the whole staging. The bytes the kernels read are the same, so the prompt answers
+bit for bit as before (the prompt-group test now runs it too). The first version used the copy kernel on the second
+stream: its blocks wait on the bus while holding the SMs the layer needs, and the 4K prompt took 1.82 s.
+
+RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
+
+| prompt staging | short chat | long generation | 4K prompt | 16K prompt | multi-turn first TTFT |
+| --- | --- | --- | --- | --- | --- |
+| per ubatch (after the overlapped swaps) | 0.07-0.09 s / 75-110 | 174-179 | 1.61-1.69 s / 137-188 | 6.76-6.81 s / 183-198 | 1.09-1.15 s |
+| next layer ahead, copy kernel | 0.07-0.09 s / 84-105 | 168-189 | 1.82-1.84 s / 98-148 | 7.37-7.39 s / 194-199 | 1.27-1.33 s |
+| next layer ahead, copy engines (default) | 0.07-0.09 s / 72-102 | 172-174 | 1.44-1.46 s / 135-146 | 5.84-5.87 s / 173-195 | 0.89-0.95 s |
+
+#### Two latency-bound decode kernels, 2026-11-08
+
+An nsys capture of a long generation (RTX 5090, ISTA `Q2_0`, MTP) showed two kernels waiting on their own loads. A
+draft step's pick read the 248,320 logits in one block of 1,024 threads: 115 us a step, two or three steps a window. It
+now runs a block per 1,024 logits, each keeping its slice's ten largest and the first index of its largest, then one
+block merging those candidates by the same rules (`TS_Q4E_DRAFT_PICK_SPLIT`): 12.8 + 12.0 us, the same token and
+confidence bit for bit. The BF16 router (512 x 2560, a warp per expert) issued each lane's loads one at a time; it now
+keeps four in flight with the sums in their order: 14.2 -> 12.6 us a 4-row layer. About 0.3 ms of a ~13 ms window,
+inside the run-to-run noise of the client below; the window is bound by the CPU's missed experts (a third of the
+layer-windows wait 85-135 us for them) and the expert and dense kernels.
+
+Tried and dropped in the same round: the multi-row dense kernel reading each weight unit once with a sum per row
+(18.9 us a call against the current kernel's 17.8: its later passes over a row already hit L1; it was in the build of
+the table's second row); the decode experts
+grouped by expert, so a window's slots sharing an expert read it once (a verify window 12.8-13.1 ms against 10.3-11.6:
+the owning blocks serialize their slots and the grid shrinks); and letting the host-expert team spin between layers
+instead of sleeping (no change: a ringing layer's wait is the experts' arithmetic, not the wake-up).
+
+Same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
+
+| decode kernels | short chat | long generation | 4K prompt | 16K prompt | multi-turn first TTFT |
+| --- | --- | --- | --- | --- | --- |
+| before (the next prompt layer staged ahead) | 0.07-0.09 s / 72-102 | 172-174 | 1.44-1.46 s / 135-146 | 5.84-5.87 s / 173-195 | 0.89-0.95 s |
+| two-stage pick, router loads in flight | 0.07-0.09 s / 82-102 | 169-182 | 1.38-1.44 s / 140-185 | 5.79-5.86 s / 189-193 | 0.89-0.95 s |
+
+#### Prompt attention on tensor cores, 2026-11-08
+
+A prompt's attention ran one block per query head and row, whose warps took the row's cells one warp-wide dot at a
+time; the 12 query heads sharing a KV head each loaded and widened every cached key and value again. That was 0.18 s
+of a 4K prompt, and a 16K prompt's rows each attend 2,051 cells. Prompt-size calls now run a block of four warps per
+row and KV head (`TS_Q4E_ATTN_MMA`, on): the group's query heads are the rows of a 16-row tensor-core tile, each warp
+widens a chunk of 16 cells' keys and then values to F16 in shared memory once, and S = QK^T and O += PV run on
+`mma.sync` (F16 operands, F32 accumulation) under an online softmax; the warps merge at the end. Decode steps and
+verify windows keep their kernels, so a verify row still answers as its own decode step. The operands round to F16:
+on the test fixture a prompt's logits move 4e-3 to 5e-3 relative (the `q8_0` cache moves them 4e-3 to 5e-3 from F16),
+and the kernel itself stays within 5.3e-4 a row of the F32 kernel (`Q4eAttentionMmaTests`). It needs sm_80 or newer and a module built
+for the GPU; the committed compute_75 baseline has no tensor-core body, and the engine then says so once and keeps the
+old kernel.
+
+RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
+
+| prompt attention | short chat | long generation | 4K prompt | 16K prompt | multi-turn first TTFT |
+| --- | --- | --- | --- | --- | --- |
+| a block per head and row | 0.07-0.09 s / 82-102 | 169-182 | 1.38-1.44 s / 140-185 | 5.79-5.86 s / 189-193 | 0.89-0.95 s |
+| tensor cores (default) | 0.07-0.09 s / 91-99 | 161-187 | 1.23-1.29 s / 99-161 | 4.99-5.08 s / 187-198 | 0.81-0.85 s |
+
+#### A 1024-row prompt ubatch by default, 2026-11-08
+
+With the next layer staged ahead and the attention on tensor cores, what a prompt ubatch pays per call (each expert's
+weights decoded per 32-row pass of the grouped kernel, a layer's fixed launches and syncs) became the larger share, and
+`TS_Q4E_UBATCH=1024` read a 4K prompt 17% faster. The engine now defaults to 1024 prompt rows a forward
+(`TS_Q4E_UBATCH=512` restores the old value). The larger scratch takes 345 expert slots (16,609 instead of 16,954 in
+VRAM, 97.6% instead of 97.9% of the profiled routes); long generation stayed within the run-to-run noise.
+
+RTX 5090, ISTA `Q2_0`, MTP, the same build, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
+
+| prompt ubatch | short chat | long generation | 4K prompt | 16K prompt | multi-turn first TTFT |
+| --- | --- | --- | --- | --- | --- |
+| 512 | 0.07-0.09 s / 89-110 | 174-177 | 1.29 s / 121-155 | 5.05 s / 178-199 | 0.81-0.85 s |
+| 1024 (default) | 0.07-0.09 s / 80-118 | 168-179 | 1.07-1.08 s / 114-185 | 4.16-4.19 s / 182-189 | 0.63-0.68 s |
+| Strata (11-07) | 0.24 s / 93-115 | 300-307 | 0.92 s / 376-408 | 2.75 s / 387-421 | 1.08-1.18 s |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
