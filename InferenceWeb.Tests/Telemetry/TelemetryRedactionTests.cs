@@ -375,10 +375,12 @@ public class TelemetryRedactionTests
         using var activity = new Activity("chat test");
         activity.SetTag(TelemetryAttributes.GenAiInputMessages, "[{\"role\":\"user\",\"content\":\"secret\"}]");
         activity.SetTag(TelemetryAttributes.VideoPrompt, "a cat");
+        activity.SetTag(TelemetryAttributes.ImagePrompt, "a dog");
         activity.SetTag(TelemetryAttributes.GenAiRequestModel, "m");
         new ContentSpanProcessor().OnEnd(activity);
         Assert.Null(activity.GetTagItem(TelemetryAttributes.GenAiInputMessages));
         Assert.Null(activity.GetTagItem(TelemetryAttributes.VideoPrompt));
+        Assert.Null(activity.GetTagItem(TelemetryAttributes.ImagePrompt));
         Assert.Equal("m", activity.GetTagItem(TelemetryAttributes.GenAiRequestModel));
     }
 

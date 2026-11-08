@@ -2739,8 +2739,10 @@ POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensors
   `prefix-cache-warmup` for the startup warm-up, `warmup` for the CLI's `--warmup-runs` passes,
   `knowledge-rerank` and `knowledge-media-extract` for the knowledge library. Leave them out of
   client-facing dashboards.
-- Qwen-Image-2.1 requests are `generate_image <model>`, with `tensorsharp.image.mode` (`generate` or
-  `edit`) and the outcome.
+- Qwen-Image-2.1 pictures, from the server or the CLI, are `generate_image <model>`. Each has
+  `tensorsharp.image.mode` (`generate` or `edit`), the size and step count it was made with
+  (`tensorsharp.image.width`, `.height`, `.steps`), `.cfg` when the request sets it, `.seed`,
+  `.references` for an edit, and the outcome.
 - `/health` and the Web UI's `/api/queue/status` polling get no spans and are left out of
   ASP.NET Core's `http.server.request.duration` metric. Outgoing `HttpClient` calls the process
   makes while telemetry runs are client spans.
@@ -2865,8 +2867,8 @@ With content capture off, which is the default:
 
 - Spans carry ids, model and file names (never directory paths), sizes, counts, timings and
   outcomes. A failure is recorded by its exception type, never its message. As a backstop,
-  `gen_ai.input.messages`, `gen_ai.output.messages` and `tensorsharp.video.prompt` are removed from
-  every span before export.
+  `gen_ai.input.messages`, `gen_ai.output.messages`, `tensorsharp.video.prompt` and
+  `tensorsharp.image.prompt` are removed from every span before export.
 - In exported log records, every value TensorSharp marks as content (prompts, chat messages, model
   output, uploaded file names, paths and URLs, tool arguments, commands, prompt token ids) reads
   `[redacted: N chars]`, and a record that had content is sent as its message template instead of
@@ -2895,8 +2897,8 @@ With content capture off, which is the default:
 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` exports all of it: unredacted logs, the
 real request paths and response ids, `gen_ai.input.messages` and `gen_ai.output.messages` on chat spans (role and content
 pairs as JSON, at most 64K characters, keeping the newest messages), `tensorsharp.video.prompt` on
-clips, `tensorsharp.tool.arguments` and `tensorsharp.tool.result` on tool spans, and
-`tensorsharp.codeexec.command` on `codeexec.run`. Image and Studio spans carry no prompt either way.
+clips, `tensorsharp.image.prompt` on pictures, `tensorsharp.tool.arguments` and `tensorsharp.tool.result`
+on tool spans, and `tensorsharp.codeexec.command` on `codeexec.run`. Studio spans carry no prompt either way.
 Turn it on only when every place the data goes (the collector and its backends, the Application
 Insights resource and its retention, the exporter's local buffer) may hold your users' prompts.
 
