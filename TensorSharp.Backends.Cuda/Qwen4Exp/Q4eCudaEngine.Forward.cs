@@ -320,7 +320,6 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuStreamSynchronize(dev.Stream);
             }
             DestroySlotGraphs(slot.Id);
-            _bvSeq.Remove(slot.Id);
             foreach (var dev in _devs)
                 if (dev.KvStagedFor != null && Array.IndexOf(slot.Layers, dev.KvStagedFor) >= 0)
                     dev.KvStagedFor = null;

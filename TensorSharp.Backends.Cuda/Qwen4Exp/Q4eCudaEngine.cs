@@ -407,9 +407,14 @@ namespace TensorSharp.Cuda
                 // Each slot also takes allocator rounding and its captured graphs; a slot is admitted only with
                 // SlotReserveBytes still free after it (SlotFits).
                 slotBytes += 128L << 20;
-                nonExpertBytes += (_lanes - 1) * slotBytes + SlotReserveBytes;
-                Console.Error.WriteLine($"[q4e-cuda] {_lanes} sequence lanes: {((_lanes - 1) * slotBytes + SlotReserveBytes) / 1073741824.0:F2} GiB "
-                    + $"of VRAM kept for the {_lanes - 1} beside the first ({slotBytes / 1048576.0:F0} MiB each, TS_Q4E_LANES).");
+                // With the MTP head the lanes verify their drafts together: the batched verify's window buffers and one
+                // set of saves a lane (BatchedVerify.cs).
+                // (Placement has not run: the batched verify needs one GPU, so device 0 is the last.)
+                long verifyBytes = m.Mtp != null && _devs.Length == 1 && _devs[0].QK.HasArgmaxRows ? BatchVerifyBytes(_lanes) : 0;
+                nonExpertBytes += (_lanes - 1) * slotBytes + SlotReserveBytes + verifyBytes;
+                Console.Error.WriteLine($"[q4e-cuda] {_lanes} sequence lanes: {((_lanes - 1) * slotBytes + SlotReserveBytes + verifyBytes) / 1073741824.0:F2} GiB "
+                    + $"of VRAM kept for the {_lanes - 1} beside the first ({slotBytes / 1048576.0:F0} MiB each"
+                    + (verifyBytes > 0 ? $", {verifyBytes / 1048576.0:F0} MiB for their batched verify" : "") + ", TS_Q4E_LANES).");
             }
             _residency = PlanResidency(useDevs, nonExpertBytes);
 

@@ -30,8 +30,11 @@ namespace TensorSharp.Cuda
             public Tensor PleHist;
         }
 
-        /// <summary>Per slot id: its saves (allocated on its first batched verify, freed with the slot).</summary>
-        private readonly Dictionary<int, BatchVerifySeqSave> _bvSeq = new Dictionary<int, BatchVerifySeqSave>();
+        /// <summary>Per sequence of the batched verify in flight (its position in the step): its saves. A pool the steps reuse
+        /// (the saves live from the verify to its commit), grown to the widest step, which the lane plan reserves
+        /// (BatchVerifyBytes). Slot-owned saves allocated on each slot's first batched verify and kept with the slot (retained
+        /// conversations too) ran the RTX 5090 out of memory in Strata's concurrency rounds.</summary>
+        private readonly List<BatchVerifySeqSave> _bvPool = new List<BatchVerifySeqSave>();
         // Per layer: the window rows' recurrence inputs ([PerSlotMaxRows, ConvDim] and the scan scratch), and the PLE rows.
         private Tensor[] _bvQkv, _bvScr;
         private Tensor _bvPleNorm;
@@ -49,46 +52,92 @@ namespace TensorSharp.Cuda
         /// <summary>Whether the engine verifies several sequences' windows in one forward (one GPU, the device argmax).</summary>
         public bool SupportsBatchedVerify => _devs.Length == 1 && _devs[_lastDev].QK.HasArgmaxRows;
 
-        private BatchVerifySeqSave SeqSave(Slot slot)
+        /// <summary>Bytes of one sequence's saves: the recurrent layers' conv and SSM states, and the PLE history.</summary>
+        private long SeqSaveBytes()
         {
-            if (_bvSeq.TryGetValue(slot.Id, out var s))
-                return s;
             var m = _m;
-            s = new BatchVerifySeqSave { Conv = new Tensor[m.NLayer], Ssm = new Tensor[m.NLayer] };
+            long b = 0;
+            for (int il = 0; il < m.NLayer; il++)
+                if (m.Layers[il].Recurrent)
+                    b += ((long)(m.DConv - 1) * ConvDim + (long)m.GdnVHeads * Q4eKernels.GdnHeadDim * Q4eKernels.GdnHeadDim) * 4;
+            if (m.Ple != null && m.PleConvKernel > 1)
+                b += (long)PleHistRows * m.Hc * m.NEmbd * 4;
+            return b;
+        }
+
+        /// <summary>Bytes a batched verify of up to <paramref name="sequences"/> sequences holds: the window rows' recurrence
+        /// inputs and scan scratch, the PLE rows, and each sequence's saves.</summary>
+        private long BatchVerifyBytes(int sequences)
+        {
+            var m = _m;
+            long rows = 0;
+            for (int il = 0; il < m.NLayer; il++)
+                if (m.Layers[il].Recurrent)
+                    rows += ((long)PerSlotMaxRows * ConvDim + (long)PerSlotMaxRows * m.GdnVHeads * GlmKernels.KdaScratch) * 4;
+            rows += (long)PerSlotMaxRows * m.Hc * m.NEmbd * 4;
+            return rows + sequences * SeqSaveBytes();
+        }
+
+        private BatchVerifySeqSave NewSeqSave()
+        {
+            var m = _m;
+            var s = new BatchVerifySeqSave { Conv = new Tensor[m.NLayer], Ssm = new Tensor[m.NLayer] };
             for (int il = 0; il < m.NLayer; il++)
             {
                 if (!m.Layers[il].Recurrent)
                     continue;
                 var dev = _devs[_layers[il].Device];
                 dev.MakeCurrent();
-                s.Conv[il] = SlotTensor(slot, dev, DType.Float32, (long)(m.DConv - 1) * ConvDim);
-                s.Ssm[il] = SlotTensor(slot, dev, DType.Float32, (long)m.GdnVHeads * Q4eKernels.GdnHeadDim * Q4eKernels.GdnHeadDim);
+                s.Conv[il] = AllocF32(dev, (long)(m.DConv - 1) * ConvDim);
+                s.Ssm[il] = AllocF32(dev, (long)m.GdnVHeads * Q4eKernels.GdnHeadDim * Q4eKernels.GdnHeadDim);
             }
             if (_pleLayer >= 0 && PleHistRows > 0)
-                s.PleHist = SlotTensor(slot, _devs[_layers[_pleLayer].Device], DType.Float32, (long)PleHistRows * HcDim);
-            _bvSeq[slot.Id] = s;
+                s.PleHist = AllocF32(_devs[_layers[_pleLayer].Device], (long)PleHistRows * HcDim);
             return s;
         }
 
-        private void EnsureBatchVerifyBuffers()
+        /// <summary>The window buffers and <paramref name="sequences"/> sequences' saves; false (nothing in flight changed) when
+        /// the device has no room for them, and the step is then served without the batched verify.</summary>
+        private bool EnsureBatchVerifyBuffers(int sequences)
         {
-            if (_bvQkv != null)
-                return;
             var m = _m;
-            _bvQkv = new Tensor[m.NLayer];
-            _bvScr = new Tensor[m.NLayer];
-            for (int il = 0; il < m.NLayer; il++)
+            try
             {
-                if (!m.Layers[il].Recurrent)
-                    continue;
-                var dev = _devs[_layers[il].Device];
-                dev.MakeCurrent();
-                _bvQkv[il] = AllocF32(dev, PerSlotMaxRows, ConvDim);
-                _bvScr[il] = AllocF32(dev, (long)PerSlotMaxRows * m.GdnVHeads * GlmKernels.KdaScratch);
+                if (_bvQkv == null)
+                {
+                    var qkv = new Tensor[m.NLayer];
+                    var scr = new Tensor[m.NLayer];
+                    for (int il = 0; il < m.NLayer; il++)
+                    {
+                        if (!m.Layers[il].Recurrent)
+                            continue;
+                        var dev = _devs[_layers[il].Device];
+                        dev.MakeCurrent();
+                        qkv[il] = AllocF32(dev, PerSlotMaxRows, ConvDim);
+                        scr[il] = AllocF32(dev, (long)PerSlotMaxRows * m.GdnVHeads * GlmKernels.KdaScratch);
+                    }
+                    if (_pleLayer >= 0 && PleHistRows > 0)
+                        _bvPleNorm = AllocF32(_devs[_layers[_pleLayer].Device], PerSlotMaxRows, HcDim);
+                    _bvScr = scr;
+                    _bvQkv = qkv;
+                }
+                while (_bvPool.Count < sequences)
+                    _bvPool.Add(NewSeqSave());
+                return true;
             }
-            if (_pleLayer >= 0 && PleHistRows > 0)
-                _bvPleNorm = AllocF32(_devs[_layers[_pleLayer].Device], PerSlotMaxRows, HcDim);
+            catch (Exception ex) when (ex is CudaException || ex is OutOfMemoryException)
+            {
+                if (!_bvOomWarned)
+                {
+                    _bvOomWarned = true;
+                    Console.Error.WriteLine($"[q4e-cuda] a batched verify of {sequences} sequences has no device memory for its saves "
+                        + $"({ex.Message}); such steps decode without their drafts. Reported once.");
+                }
+                return false;
+            }
         }
+
+        private bool _bvOomWarned;
 
         /// <summary>
         /// Verify <paramref name="window"/> tokens of each of several slots in one forward: <paramref name="tokens"/> is
@@ -128,12 +177,14 @@ namespace TensorSharp.Cuda
                 }
             }
 
-            EnsureBatchVerifyBuffers();
+            if (!EnsureBatchVerifyBuffers(n))
+                return false;
             var m = _m;
             // Each sequence's states before the window.
-            foreach (var slot in slots)
+            for (int i = 0; i < n; i++)
             {
-                var s = SeqSave(slot);
+                var slot = slots[i];
+                var s = _bvPool[i];
                 for (int il = 0; il < m.NLayer; il++)
                 {
                     if (!m.Layers[il].Recurrent)
@@ -220,7 +271,7 @@ namespace TensorSharp.Cuda
                 int keep = kept[i], p0 = _bvP0[i];
                 if (keep < window)
                 {
-                    var s = _bvSeq[slot.Id];
+                    var s = _bvPool[i];
                     for (int il = 0; il < m.NLayer; il++)
                     {
                         if (!m.Layers[il].Recurrent)
