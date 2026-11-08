@@ -32,6 +32,8 @@ namespace TensorSharp.Cuda
                 anyQsa |= L.Ratio > 0;
                 ple |= L.Ple;
             }
+            // The MTP block is an attention layer on the last device.
+            anyAttn |= _mtpLayer != null && dev.Ordinal == _lastDev;
 
             dev.Xs = AllocF32(dev, nt, hcE);
             dev.Xn = AllocF32(dev, nt, hcE);
@@ -87,13 +89,14 @@ namespace TensorSharp.Cuda
             dev.ShGate = AllocF32(dev, nt, m.NFfShexp);
             dev.ShUp = AllocF32(dev, nt, m.NFfShexp);
             dev.ShDown = AllocF32(dev, nt, e);
-            dev.PosDev = AllocT(dev, DType.Int32, 1);
+            // A captured step's row positions (a decode step's one, a verify window's up to VerifyMaxRows).
+            dev.PosDev = AllocT(dev, DType.Int32, VerifyMaxRows);
             if (dev.Ordinal == 0)
             {
                 dev.Tokens = AllocT(dev, DType.Int32, nt);
                 // PORTABLE: every device may read them.
                 CudaDriverApi.cuMemHostAlloc(out _pinnedTokens, new UIntPtr((ulong)nt * 4), 0x1).ThrowOnError();
-                CudaDriverApi.cuMemHostAlloc(out _posPinned, new UIntPtr(4), 0x1).ThrowOnError();
+                CudaDriverApi.cuMemHostAlloc(out _posPinned, new UIntPtr((ulong)VerifyMaxRows * 4), 0x1).ThrowOnError();
             }
             if (dev.Ordinal == _lastDev)
             {
@@ -101,8 +104,11 @@ namespace TensorSharp.Cuda
                 dev.BatchLogits = AllocF32(dev, MaxBatchedDecodeRows, m.NVocab);
                 CudaDriverApi.cuMemHostAlloc(out _pinnedLogits,
                     new UIntPtr((ulong)MaxBatchedDecodeRows * (ulong)m.NVocab * 4), 0x1).ThrowOnError();
+                // Every row's streams of a ubatch (a speculative prompt chunk), a verify window or a batched step.
                 CudaDriverApi.cuMemHostAlloc(out _pinnedHidden,
-                    new UIntPtr((ulong)MaxBatchedDecodeRows * (ulong)m.NEmbd * 4), 0x1).ThrowOnError();
+                    new UIntPtr((ulong)Math.Max(nt, Math.Max(MaxBatchedDecodeRows, VerifyMaxRows)) * (ulong)hcE * 4), 0x1).ThrowOnError();
+                if (_mtpLayer != null)
+                    AllocateMtpScratch(dev);
             }
             if (anyGdn || ple)
             {
@@ -112,7 +118,16 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuMemHostAlloc(out dev.BoundaryPinned, new UIntPtr((ulong)((long)nt * hcE * 4)), 0x1).ThrowOnError();
             CudaDriverApi.cuEventCreate(out dev.XsReadyEv, 0x02 /*DISABLE_TIMING*/).ThrowOnError();
             CudaDriverApi.cuEventCreate(out dev.CopyDoneEv, 0x02).ThrowOnError();
+            if (_forkShexp)
+            {
+                CudaDriverApi.cuStreamCreate(out dev.ShStream, 0x1 /*NON_BLOCKING*/).ThrowOnError();
+                CudaDriverApi.cuEventCreate(out dev.ShForkEv, 0x02).ThrowOnError();
+                CudaDriverApi.cuEventCreate(out dev.ShJoinEv, 0x02).ThrowOnError();
+            }
         }
+
+        // TS_Q4E_FORK_SHEXP=0: the shared expert on the device's stream, between the router and the routed experts.
+        private readonly bool _forkShexp = Environment.GetEnvironmentVariable("TS_Q4E_FORK_SHEXP") != "0";
 
         /// <summary>Row stride of the block scores: every block the context holds.</summary>
         private int ScoreStride => Math.Max(1, _m.NCtx / MinRatio);
@@ -174,9 +189,7 @@ namespace TensorSharp.Cuda
                 }
                 else
                 {
-                    long kv = (long)m.NCtx * m.NKvHead * m.HeadDim;
-                    c.KCache = SlotTensor(slot, dev, DType.Float16, kv);
-                    c.VCache = SlotTensor(slot, dev, DType.Float16, kv);
+                    AllocKv(slot, dev, c);
                     if (L.Ratio > 0)
                     {
                         c.IdxRaw = SlotTensor(slot, dev, DType.Float16, (long)m.NCtx * m.IdxDim);
@@ -202,6 +215,24 @@ namespace TensorSharp.Cuda
             ClearSlot(slot);
             return slot;
         }
+
+        /// <summary>One attention layer's K/V caches for a slot: F16, or Q8_0 codes and their scales.</summary>
+        private void AllocKv(Slot slot, Dev dev, SlotLayer c)
+        {
+            long kv = (long)_m.NCtx * _m.NKvHead * _m.HeadDim;
+            if (!_m.KvQ8)
+            {
+                c.KCache = SlotTensor(slot, dev, DType.Float16, kv);
+                c.VCache = SlotTensor(slot, dev, DType.Float16, kv);
+                return;
+            }
+            c.KCache = SlotTensor(slot, dev, DType.UInt8, kv);
+            c.VCache = SlotTensor(slot, dev, DType.UInt8, kv);
+            c.KScale = SlotTensor(slot, dev, DType.Float16, kv / Q4eKernels.KvQ8Block);
+            c.VScale = SlotTensor(slot, dev, DType.Float16, kv / Q4eKernels.KvQ8Block);
+        }
+
+        private static IntPtr PtrOrZero(Tensor t) => t == null ? IntPtr.Zero : Ptr(t);
 
         private static Tensor SlotTensor(Slot slot, Dev dev, DType type, long elements)
         {
@@ -232,6 +263,7 @@ namespace TensorSharp.Cuda
             slot.NPast = 0;
             slot.Failed = false;
             slot.PleTokens.Length = 0;
+            slot.MtpPast = 0;
         }
 
         private static void Zero(Dev dev, Tensor t, int elementBytes)
@@ -265,7 +297,14 @@ namespace TensorSharp.Cuda
         // Forward
         // -------------------------------------------------------------------
 
-        public void Forward(int[] tokens, float[] logitsOut)
+        public void Forward(int[] tokens, float[] logitsOut) => Forward(tokens, logitsOut, null);
+
+        /// <summary>
+        /// A forward that also returns the hidden streams (<see cref="HiddenWidth"/> floats a row, before the output
+        /// mixer: what the MTP block reads): every row's when <paramref name="hOut"/> holds them all, else the last
+        /// row's.
+        /// </summary>
+        public void Forward(int[] tokens, float[] logitsOut, float[] hOut)
         {
             if (tokens == null || tokens.Length == 0)
                 throw new ArgumentException("empty token batch", nameof(tokens));
@@ -278,7 +317,9 @@ namespace TensorSharp.Cuda
             var sw = System.Diagnostics.Stopwatch.StartNew();
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
             slot.Failed = true;
-            if (tokens.Length == 1 && logitsOut != null && CanCaptureDecode && ForwardDecodeGraphed(slot, tokens[0], slot.NPast, logitsOut))
+            ArmHostExperts();
+            bool allHidden = hOut != null && hOut.LongLength >= (long)tokens.Length * HcDim;
+            if (tokens.Length == 1 && logitsOut != null && hOut == null && CanCaptureDecode && ForwardDecodeGraphed(slot, tokens[0], slot.NPast, logitsOut))
             {
                 slot.NPast++;
             }
@@ -289,11 +330,15 @@ namespace TensorSharp.Cuda
                 {
                     int nt = Math.Min(_m.NUbatch, tokens.Length - done);
                     bool last = done + nt == tokens.Length;
-                    ForwardUbatch(slot, tokens, done, nt, slot.NPast, last ? logitsOut : null);
+                    ForwardUbatch(slot, tokens, done, nt, slot.NPast, last ? logitsOut : null,
+                        hOut: allHidden || last ? hOut : null, hRowOffset: allHidden ? done : -1);
                     slot.NPast += nt;
                     done += nt;
                 }
             }
+            CheckHostExperts(tokens.Length <= _hostExpertRows ? tokens.Length : 0);
+            if (tokens.Length <= _hostExpertRows)
+                AdaptResidency();
             slot.Failed = false;
             if (_perf > 0)
             {
@@ -306,8 +351,10 @@ namespace TensorSharp.Cuda
         /// <param name="rows">A batched decode step: one row per sequence (<paramref name="slot"/> is
         /// then unused), each at <paramref name="positions"/>[row]; null for one sequence's ubatch at
         /// <paramref name="p0"/>.</param>
+        /// <param name="hRowOffset">The row of <paramref name="hOut"/> this ubatch's first row goes to; -1 writes only
+        /// the last row, to the start.</param>
         private void ForwardUbatch(Slot slot, int[] tokens, int tokOff, int nt, int p0, float[] logitsOut,
-            Slot[] rows = null, int[] positions = null, bool allRows = false, float[] hOut = null)
+            Slot[] rows = null, int[] positions = null, bool allRows = false, float[] hOut = null, int hRowOffset = 0)
         {
             var m = _m;
             int e = m.NEmbd;
@@ -327,27 +374,33 @@ namespace TensorSharp.Cuda
                 GatherPleRows(slot, tokens, tokOff, nt, p0, rows, positions);
 
             int curDev = 0;
+            bool ready = false;
             for (int il = 0; il < m.NLayer; il++)
             {
                 var L = _layers[il];
                 if (L.Device != curDev)
                 {
+                    ready = false;
                     Handoff(_devs[curDev], _devs[L.Device], nt);
                     curDev = L.Device;
                     StageEnd(_devs[curDev], StBoundary);
                 }
                 var dev = _devs[curDev];
                 dev.MakeCurrent();
-                RunLayer(dev, il, slot, nt, p0, rows, positions, IntPtr.Zero);
+                ready = RunLayer(dev, il, slot, nt, p0, rows, positions, IntPtr.Zero, ready);
             }
 
             if (logitsOut != null || hOut != null)
-                Head(nt, logitsOut, rows != null || allRows, hOut);
+                Head(nt, logitsOut, rows != null || allRows, hOut, hRowOffset);
         }
 
         /// <summary>One layer: the PLE block where it sits, then both mixed halves. <paramref name="pos"/>
         /// is the device copy of the row's position a captured decode step reads (zero: p0 is used).</summary>
-        private void RunLayer(Dev dev, int il, Slot slot, int nt, int p0, Slot[] rows, int[] positions, IntPtr pos)
+        /// <param name="partialsReady">The previous layer's last scatter already ran this layer's first mixer pass.</param>
+        /// <returns>Whether this layer's last scatter ran the next layer's first mixer pass (the next layer is on this
+        /// device and has no PLE block ahead of it).</returns>
+        private bool RunLayer(Dev dev, int il, Slot slot, int nt, int p0, Slot[] rows, int[] positions, IntPtr pos,
+            bool partialsReady = false)
         {
             var m = _m;
             var L = _layers[il];
@@ -355,7 +408,7 @@ namespace TensorSharp.Cuda
             if (L.Ple)
                 Ple(dev, L, slot, nt, rows);
 
-            HcPre(dev, L.HcAttnNorm, L.HcAttnDown, L.HcAttnUp, L.HcAttnInject, nt);
+            HcPre(dev, L.HcAttnNorm, L.HcAttnDown, L.HcAttnUp, L.HcAttnInject, nt, partialsReady: partialsReady && !L.Ple);
             StageEnd(dev, StHc);
             if (L.Recurrent)
                 Gdn(dev, L, il, slot, nt, rows);
@@ -364,14 +417,31 @@ namespace TensorSharp.Cuda
                     Attention(dev, L, il, rows[r].Layers[il], r, 1, positions[r]);
             else
                 Attention(dev, L, il, slot.Layers[il], 0, nt, p0, pos);
-            dev.QK.HcPost(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), nt, e, m.Hc, dev.Stream);
+            // Decode-size halves meet in one launch: the scatter and the next mixer's first pass.
+            bool fuse = nt <= PerSlotMaxRows && dev.QK.HasHcPostPartials && _fuseHc;
+            if (fuse)
+                dev.QK.HcPostPartials(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), Ptr(L.HcFfnNorm), Ptr(L.HcFfnInject),
+                    Ptr(dev.HcPartials), nt, e, m.Hc, dev.Stream);
+            else
+                dev.QK.HcPost(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), nt, e, m.Hc, dev.Stream);
 
-            HcPre(dev, L.HcFfnNorm, L.HcFfnDown, L.HcFfnUp, L.HcFfnInject, nt);
+            HcPre(dev, L.HcFfnNorm, L.HcFfnDown, L.HcFfnUp, L.HcFfnInject, nt, partialsReady: fuse);
             StageEnd(dev, StHc);
             Moe(dev, L, il, nt, pos == IntPtr.Zero && rows == null ? p0 : -1);
-            dev.QK.HcPost(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), nt, e, m.Hc, dev.Stream);
+            var next = il + 1 < m.NLayer ? _layers[il + 1] : null;
+            bool fuseNext = fuse && next != null && next.Device == dev.Ordinal && !next.Ple;
+            if (fuseNext)
+                dev.QK.HcPostPartials(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), Ptr(next.HcAttnNorm), Ptr(next.HcAttnInject),
+                    Ptr(dev.HcPartials), nt, e, m.Hc, dev.Stream);
+            else
+                dev.QK.HcPost(Ptr(dev.Xs), Ptr(dev.BlockOut), Ptr(dev.Inject), nt, e, m.Hc, dev.Stream);
             StageEnd(dev, StHc);
+            return fuseNext;
         }
+
+        // TS_Q4E_FUSE_HC=0: the scatter and the next mixer's first pass as two launches (the fused kernel computes the
+        // same values; this is for measuring it).
+        private readonly bool _fuseHc = Environment.GetEnvironmentVariable("TS_Q4E_FUSE_HC") != "0";
 
         /// <summary>Hand the streams to the next device through pinned host memory. Events are
         /// recorded on their own context's stream; only the waits cross contexts.</summary>
@@ -395,8 +465,10 @@ namespace TensorSharp.Cuda
         /// <summary>The low-rank mixer: the streams grouped-RMS-normed into Xn (and the scatter
         /// logits into Inject), the sigmoid gate from the rank-R bottleneck, and the gated stream
         /// mean into Cur.</summary>
+        /// <param name="partialsReady">The first pass already ran, fused into the previous half's scatter
+        /// (<see cref="HcPost"/>).</param>
         private void HcPre(Dev dev, Tensor normW, in DeviceWeight down, in DeviceWeight up, Tensor injW, int nt,
-            Tensor xs = null)
+            Tensor xs = null, bool partialsReady = false)
         {
             var m = _m;
             IntPtr xsPtr = Ptr(xs ?? dev.Xs), inj = injW == null ? IntPtr.Zero : Ptr(injW);
@@ -405,7 +477,8 @@ namespace TensorSharp.Cuda
                 // Decode size: the norm in two passes over every slice of the streams (one block per
                 // row would leave all but one SM idle), each pass quantizing what the next projection
                 // reads.
-                dev.QK.HcPartials(xsPtr, Ptr(normW), inj, Ptr(dev.HcPartials), nt, m.NEmbd, m.Hc, dev.Stream);
+                if (!partialsReady)
+                    dev.QK.HcPartials(xsPtr, Ptr(normW), inj, Ptr(dev.HcPartials), nt, m.NEmbd, m.Hc, dev.Stream);
                 dev.QK.HcApply(xsPtr, Ptr(normW), Ptr(dev.HcPartials), Ptr(dev.Xn), Ptr(dev.SharedQ81),
                     injW == null ? IntPtr.Zero : Ptr(dev.Inject), nt, m.NEmbd, m.Hc, m.RmsEps, dev.Stream);
                 MatMul(dev, down, dev.Xn, Ptr(dev.SharedQ81), dev.Lo, nt);
@@ -447,8 +520,13 @@ namespace TensorSharp.Cuda
                 rowsPerSeq = 1;
                 nSeq = nt;
             }
+            bool capture = _verifyCapture && rows == null;
+            if (capture)
+                VerifySaveGdnState(dev, il, slot);
             dev.QK.GdnPrep(Ptr(dev.Qkv), conv, Ptr(L.ConvW), Ptr(dev.Alpha), Ptr(dev.Beta), Ptr(L.DtBias), Ptr(L.SsmA),
                 Ptr(dev.Scr), rowsPerSeq, nSeq, m.GdnKHeads, m.GdnVHeads, m.DConv, m.RmsEps, dev.Stream);
+            if (capture)
+                VerifySaveGdnInputs(dev, il, nt);
             // After the prep read the previous inputs.
             dev.QK.ConvUpdate(Ptr(dev.Qkv), conv, rowsPerSeq, nSeq, ConvDim, m.DConv - 1, dev.Stream);
             dev.GK.KdaScan(Ptr(dev.Scr), ssm, Ptr(dev.Core), rowsPerSeq, nSeq, m.GdnVHeads, dev.Stream);
@@ -480,7 +558,7 @@ namespace TensorSharp.Cuda
             dev.QK.AttnPrep(At(dev.Qg, (long)row0 * 2 * qd), At(dev.K, (long)row0 * kvd), At(dev.V, (long)row0 * kvd),
                 Ptr(L.QNorm), Ptr(L.KNorm), At(dev.Q, (long)row0 * qd), At(dev.Gate, (long)row0 * qd),
                 Ptr(c.KCache), Ptr(c.VCache), pos, p0, m.NHead, m.NKvHead, m.NRot, m.RopeBase, m.RopeFreqScale,
-                m.RmsEps, nt, dev.Stream);
+                m.RmsEps, nt, dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
 
             IntPtr cells = IntPtr.Zero, cellCnt = IntPtr.Zero;
             if (L.Ratio > 0)
@@ -489,8 +567,15 @@ namespace TensorSharp.Cuda
                 dev.QK.QsaStore(At(dev.IdxRaw, (long)row0 * d), Ptr(c.IdxRaw), pos, p0, d, nt, dev.Stream);
                 // The blocks this ubatch completes (their last member now cached).
                 int firstBlock = p0 / R, endBlock = (p0 + nt) / R;
-                dev.QK.QsaPool(Ptr(c.IdxRaw), Ptr(L.IdxKNorm), Ptr(c.IdxPooled), pos, firstBlock, endBlock - firstBlock, R, d,
-                    m.NRot, m.RopeBase, m.RopeFreqScale, m.RmsEps, dev.Stream);
+                if (pos == IntPtr.Zero || nt == 1)
+                    dev.QK.QsaPool(Ptr(c.IdxRaw), Ptr(L.IdxKNorm), Ptr(c.IdxPooled), pos, firstBlock, endBlock - firstBlock, R, d,
+                        m.NRot, m.RopeBase, m.RopeFreqScale, m.RmsEps, dev.Stream);
+                else
+                    // A captured window: the pooling kernel reads one row's position, so each row pools the block it
+                    // completes, if it completes one.
+                    for (int t = 0; t < nt; t++)
+                        dev.QK.QsaPool(Ptr(c.IdxRaw), Ptr(L.IdxKNorm), Ptr(c.IdxPooled), (IntPtr)((long)pos + 4L * (row0 + t)), 0, 0,
+                            R, d, m.NRot, m.RopeBase, m.RopeFreqScale, m.RmsEps, dev.Stream);
                 // Past the width the selection bites: score the complete blocks, keep the best.
                 if (p0 + nt > m.IdxTopK + R - 1)
                 {
@@ -516,7 +601,7 @@ namespace TensorSharp.Cuda
 
             dev.QK.Attention(At(dev.Q, (long)row0 * qd), Ptr(c.KCache), Ptr(c.VCache), At(dev.Gate, (long)row0 * qd),
                 cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
-                CellStride, nt, dev.Stream);
+                CellStride, nt, dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
             StageEnd(dev, StAttnCore);
 
             if (row0 + nt == RowsInFlight(nt))
@@ -581,7 +666,11 @@ namespace TensorSharp.Cuda
             dev.QK.PleConv(Ptr(dev.PleGated), Ptr(dev.PleNorm), hists, Ptr(L.PleConvT), Ptr(dev.Xs), rowsPerSeq, nSeq, hcE,
                 m.PleConvKernel, m.PleDilation, dev.Stream);
             if (PleHistRows > 0)
+            {
+                if (_verifyCapture && rows == null)
+                    VerifySavePle(dev, slot, nt);
                 dev.QK.ConvUpdate(Ptr(dev.PleNorm), hists, rowsPerSeq, nSeq, hcE, PleHistRows, dev.Stream);
+            }
             StageEnd(dev, StPle);
         }
 
@@ -591,36 +680,90 @@ namespace TensorSharp.Cuda
         {
             var m = _m;
             int e = m.NEmbd;
-            MatMulF32(dev, L.Router, dev.Cur, dev.RouterLogits, e, m.NExpert, nt);
+            // A decode-size step runs the shared expert beside the router and the routed experts (Strata's forked
+            // shared-expert stream): it reads only the mixed input, and its output is first read by the routed experts'
+            // combine, which waits for it. A captured step holds both branches.
+            bool fork = dev.ShStream != IntPtr.Zero && nt <= PerSlotMaxRows && _perf < 2
+                && DecodeKernelFor(dev, L.GateShexp, nt) && DecodeKernelFor(dev, L.UpShexp, nt) && DecodeKernelFor(dev, L.DownShexp, nt);
+            if (fork)
+            {
+                CudaDriverApi.cuEventRecord(dev.ShForkEv, dev.Stream).ThrowOnError();
+                CudaDriverApi.cuStreamWaitEvent(dev.ShStream, dev.ShForkEv, 0).ThrowOnError();
+                SharedExpert(dev, L, nt, dev.ShStream);
+                CudaDriverApi.cuEventRecord(dev.ShJoinEv, dev.ShStream).ThrowOnError();
+            }
+            if (L.RouterBf16 != null && nt <= Dsv4Kernels.GemvMaxRows)
+                dev.DK.GemvBf16(Ptr(dev.Cur), Ptr(L.RouterBf16), Ptr(dev.RouterLogits), e, m.NExpert, nt, dev.Stream);
+            else
+                MatMulF32(dev, L.Router ?? FloatRouter(dev, L), dev.Cur, dev.RouterLogits, e, m.NExpert, nt);
             dev.DK.MoeSelect(dev.RouterLogits, IntPtr.Zero, IntPtr.Zero, null, dev.Moe.Sel, dev.Moe.SelW,
                 m.NExpert, m.NExpertUsed, 1, 1.0f, nt, dev.Stream, Dsv4Kernels.RouterSoftmax);
             if (probeP0 >= 0)
                 RouterProbe?.Invoke(CaptureRouter(dev, il, probeP0, nt));
             StageEnd(dev, StRouter);
+            bool host = HostExpertsFor(L, nt);
+            if (host)
+                dev.DK.MoeDoorbellPublish(dev.Cur, dev.Moe.Sel, dev.Moe.SelW, L.Stage.IsHost, nt * e, nt * m.NExpertUsed, il,
+                    _hostBox, dev.Stream, _doorbellMiss, _adaptCountsDev, m.NExpert);
 
-            IntPtr cur = QuantizeShared(dev, dev.Cur, e, nt);
-            MatMul(dev, L.GateShexp, dev.Cur, cur, dev.ShGate, nt);
-            MatMul(dev, L.UpShexp, dev.Cur, cur, dev.ShUp, nt);
-            CudaMoe.SwigluClamp(dev.ShGate, dev.ShUp, (long)nt * m.NFfShexp, 0f);
-            MatMulQ(dev, L.DownShexp, dev.ShGate, dev.ShDown, nt);
-            dev.QK.SharedGate(Ptr(dev.Cur), Ptr(L.ShexpGate), Ptr(dev.ShDown), nt, e, dev.Stream);
-            StageEnd(dev, StShexp);
+            if (!fork)
+            {
+                SharedExpert(dev, L, nt, dev.Stream);
+                StageEnd(dev, StShexp);
+            }
 
             CudaMoe.Experts(dev.DK, dev.Alloc.Kernels, dev.Moe, L.GateExps, L.UpExps, L.DownExps,
                 dev.Cur, dev.ShDown, dev.BlockOut, nt, m.NExpertUsed, m.NExpert, e, m.NFfExp, 0f,
-                PerSlotMaxRows, dev.Stream);
-            StageEnd(dev, StExperts);
+                PerSlotMaxRows, dev.Stream, stage: host ? null : _expertStage, stageLayer: L.Stage,
+                shDownReady: fork ? dev.ShJoinEv : IntPtr.Zero);
+            if (host)
+            {
+                // The GPU's own experts end here; what follows is the wait for the CPU's share.
+                StageEnd(dev, StExperts);
+                dev.DK.MoeDoorbellWaitAdd(_hostBox, dev.BlockOut, nt * e, dev.Stream, _doorbellMiss);
+                StageEnd(dev, StHostWait);
+            }
+            else
+                StageEnd(dev, StExperts);
+        }
+
+        /// <summary>A prompt's router weights as F32 (cuBLAS reads them so) when the layer keeps them as BF16: widened
+        /// into the device's scratch, which every layer of the ubatch reuses in turn.</summary>
+        private Tensor FloatRouter(Dev dev, DevLayer L)
+        {
+            long n = (long)_m.NExpert * _m.NEmbd;
+            dev.RouterF32 ??= AllocF32(dev, n);
+            dev.QK.Bf16ToF32(Ptr(L.RouterBf16), Ptr(dev.RouterF32), n, dev.Stream);
+            return dev.RouterF32;
+        }
+
+        /// <summary>The shared expert on <paramref name="stream"/>: gate and up from one quantized input, SwiGLU, down, and
+        /// the sigmoid gate, into ShDown.</summary>
+        private void SharedExpert(Dev dev, DevLayer L, int nt, IntPtr stream)
+        {
+            var m = _m;
+            int e = m.NEmbd;
+            IntPtr cur = QuantizeShared(dev, dev.Cur, e, nt, stream);
+            MatMul(dev, L.GateShexp, dev.Cur, cur, dev.ShGate, nt, stream);
+            MatMul(dev, L.UpShexp, dev.Cur, cur, dev.ShUp, nt, stream);
+            dev.Alloc.Kernels.LaunchSiluMulClampF32(Ptr(dev.ShGate), Ptr(dev.ShGate), Ptr(dev.ShUp), (long)nt * m.NFfShexp, 0f, stream);
+            MatMul(dev, L.DownShexp, dev.ShGate, QuantizeShared(dev, dev.ShGate, m.NFfShexp, nt, stream), dev.ShDown, nt, stream);
+            dev.QK.SharedGate(Ptr(dev.Cur), Ptr(L.ShexpGate), Ptr(dev.ShDown), nt, e, stream);
         }
 
         /// <summary>The output mixer, then the LM head: the last row's logits, or every row's (a
-        /// batched decode step). <paramref name="hOut"/> takes every row's mixed hidden state.</summary>
-        private void Head(int nt, float[] logitsOut, bool allRows, float[] hOut = null)
+        /// batched decode step). <paramref name="hOut"/> takes the rows' hidden streams (before the mixer)
+        /// from row <paramref name="hRowOffset"/> on, or the last row's alone when that is -1 or they do not fit.</summary>
+        private void Head(int nt, float[] logitsOut, bool allRows, float[] hOut = null, int hRowOffset = 0)
         {
             IssueHead(nt, logitsOut != null, allRows, hOut != null);
             if (_perf > 0)
                 _issueEnd = System.Diagnostics.Stopwatch.GetTimestamp();
-            FinishHead(nt, logitsOut, allRows, hOut);
+            FinishHead(nt, logitsOut, allRows, hOut, hRowOffset);
         }
+
+        /// <summary>Floats of a row's hidden streams (<see cref="Forward(int[], float[], float[])"/>).</summary>
+        public int HiddenWidth => HcDim;
 
         /// <summary>The head's kernels and the copies of its results into pinned memory.</summary>
         private void IssueHead(int nt, bool logits, bool allRows, bool hidden)
@@ -628,12 +771,15 @@ namespace TensorSharp.Cuda
             var m = _m;
             var dev = _devs[_lastDev];
             dev.MakeCurrent();
-            int normRows = allRows || hidden ? nt : 1;
+            if (hidden)
+                CudaDriverApi.cuMemcpyDtoHAsync(_pinnedHidden, Ptr(dev.Xs), new UIntPtr((ulong)nt * (ulong)HcDim * 4), dev.Stream).ThrowOnError();
+            if (!logits)
+                return;
+            int normRows = allRows ? nt : 1;
             using (Tensor xs = normRows == nt ? dev.Xs.CopyRef() : Block(dev.Xs, nt - 1, 1, HcDim))
                 HcPre(dev, _outHcNorm, _outHcDown, _outHcUp, null, normRows, xs);
             int headRows = allRows ? nt : 1;
             long count = (long)headRows * m.NVocab;
-            if (logits)
             {
                 Tensor output = allRows ? dev.BatchLogits : dev.Logits;
                 using (Tensor headIn = headRows == normRows ? dev.Cur.CopyRef() : Block(dev.Cur, nt - 1, 1, m.NEmbd))
@@ -641,27 +787,30 @@ namespace TensorSharp.Cuda
                 StageEnd(dev, StHead);
                 CudaDriverApi.cuMemcpyDtoHAsync(_pinnedLogits, Ptr(output), new UIntPtr((ulong)count * 4), dev.Stream).ThrowOnError();
             }
-            long hCount = (long)normRows * m.NEmbd;
-            if (hidden)
-                CudaDriverApi.cuMemcpyDtoHAsync(_pinnedHidden, Ptr(dev.Cur), new UIntPtr((ulong)hCount * 4), dev.Stream).ThrowOnError();
         }
 
         /// <summary>Wait for the head and copy its results out of pinned memory.</summary>
-        private void FinishHead(int nt, float[] logitsOut, bool allRows, float[] hOut)
+        private void FinishHead(int nt, float[] logitsOut, bool allRows, float[] hOut, int hRowOffset = 0)
         {
             var m = _m;
             var dev = _devs[_lastDev];
             dev.MakeCurrent();
-            int normRows = allRows || hOut != null ? nt : 1;
             long count = (long)(allRows ? nt : 1) * m.NVocab;
-            long hCount = (long)normRows * m.NEmbd;
             CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
             if (logitsOut != null)
                 fixed (float* dst = logitsOut)
                     Buffer.MemoryCopy((void*)_pinnedLogits, dst, logitsOut.LongLength * 4L, count * 4L);
             if (hOut != null)
+            {
+                long row = HcDim, all = nt * row;
                 fixed (float* dst = hOut)
-                    Buffer.MemoryCopy((void*)_pinnedHidden, dst, hOut.LongLength * 4L, hCount * 4L);
+                {
+                    if (hRowOffset >= 0 && hOut.LongLength >= (hRowOffset + nt) * row)
+                        Buffer.MemoryCopy((void*)_pinnedHidden, dst + hRowOffset * row, (hOut.LongLength - hRowOffset * row) * 4L, all * 4L);
+                    else
+                        Buffer.MemoryCopy((float*)_pinnedHidden + all - row, dst, hOut.LongLength * 4L, row * 4L);
+                }
+            }
             _stages.Report();
         }
 
@@ -742,11 +891,11 @@ namespace TensorSharp.Cuda
 
         // TS_Q4E_PERF=2 / 3: per-stage time, synchronized host time or GPU time (see CudaStageTimer).
         private const int StEmbed = 0, StHc = 1, StPle = 2, StGdnProj = 3, StGdnCore = 4, StAttnProj = 5, StAttnPrep = 6,
-            StAttnCore = 7, StAttnOut = 8, StRouter = 9, StExperts = 10, StShexp = 11, StHead = 12, StBoundary = 13;
+            StAttnCore = 7, StAttnOut = 8, StRouter = 9, StExperts = 10, StShexp = 11, StHead = 12, StBoundary = 13, StHostWait = 14;
         private static readonly string[] StageNames =
         {
             "embed", "hc", "ple", "gdnproj", "gdncore", "attnproj", "attnprep", "attncore", "attnout", "router",
-            "experts", "shexp", "head", "boundary",
+            "experts", "shexp", "head", "boundary", "hostwait",
         };
         // TS_Q4E_PERF>=1: when the host had queued the whole step (the last launch before the
         // logits sync). Close to the step's wall time = the step is bound by launch overhead.

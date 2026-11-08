@@ -401,6 +401,21 @@ namespace TensorSharp.Models
             catch (InvalidOperationException) { }
             catch (System.ComponentModel.Win32Exception) { }
             catch (NotSupportedException) { }
+            // On a Mac the working set and the RAM above are ceilings; retained KV is wired like
+            // everything else the GPU reads, and Metal running out of memory is not recoverable.
+            // So also only what macOS can give without compressing, less what it keeps (the rule
+            // the expert tiers are planned by): retaining a 16K-token conversation beside the next
+            // one's prefill ran Metal out of memory on the 48 GB Mac.
+            if (IsGgmlBackend)
+            {
+                long macAvailable = GgmlBasicOps.HostAvailableMemoryBytes();
+                long ram = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+                if (macAvailable > 0 && ram > 0)
+                {
+                    long macSpare = Math.Max(0, macAvailable - Math.Max(7_000_000_000L, ram / 100 * 15));
+                    spare = spare.HasValue ? Math.Min(spare.Value, macSpare) : macSpare;
+                }
+            }
             return spare;
         }
 

@@ -53,6 +53,8 @@
 #include <unistd.h>
 #endif
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <mach/mach.h>
 #include <pthread/qos.h>
 #endif
 
@@ -74,6 +76,7 @@ namespace tsg
             std::size_t bytes = 0;
             const void* key = nullptr;
             std::uint64_t pin = 0;          // call epoch that last used it
+            bool prefetched = false;        // read ahead and not yet used
             std::list<Slot*>::iterator lru;
         };
 
@@ -229,6 +232,7 @@ namespace tsg
         std::size_t g_budget = 0, g_used = 0;
         std::uint64_t g_epoch = 0;
         std::uint64_t g_hits = 0, g_misses = 0, g_read_bytes = 0;
+        std::uint64_t g_wire_failures = 0;   // slots mlock refused (they stay pageable)
         IoTeam* g_team = nullptr;
         // host_expert_io_read_slices_async: its own team (a seam's synchronous reads
         // may run while a batch is in flight) and the batch, for the copy fallback.
@@ -236,6 +240,11 @@ namespace tsg
         std::vector<const void*> g_async_src;
         std::vector<std::size_t> g_async_len;
         std::vector<std::uint8_t*> g_async_dst;
+        // host_expert_io_prefetch: slices read ahead into cache slots on a team of their
+        // own; the next resolve settles the batch before it reads any slot.
+        IoTeam* g_prefetch_team = nullptr;
+        std::vector<const void*> g_prefetch_keys;
+        std::uint64_t g_prefetch_reads = 0, g_prefetch_used = 0;
 
         const MappedFile* find_file(const void* p, std::size_t bytes)
         {
@@ -257,27 +266,57 @@ namespace tsg
 
         // A slot of exactly `bytes`, reusing the least recently used one of that
         // size when the budget is full; null when everything left is pinned.
+        // A model's slices come in a few sizes (DeepSeek V4.1 UD-IQ2_XXS: IQ1_S
+        // gate/up, IQ2_XXS or IQ2_S down), so the oldest unpinned slot is often
+        // the wrong size: a same-size one among the next oldest is reused instead
+        // of unmapping it and mapping (and zero-filling) a fresh one.
         Slot* take_slot(std::size_t bytes)
         {
+            constexpr int kSizeMatchWindow = 32;
             while (g_used + bytes > g_budget && !g_lru.empty())
             {
                 Slot* victim = nullptr;
-                for (auto it = g_lru.rbegin(); it != g_lru.rend(); ++it)
-                    if ((*it)->pin != g_epoch) { victim = *it; break; }
-                if (victim == nullptr) return nullptr;
-                if (victim->bytes == bytes)
+                Slot* same = nullptr;
+                int seen = 0;
+                for (auto it = g_lru.rbegin(); it != g_lru.rend() && seen < kSizeMatchWindow; ++it)
                 {
-                    g_slots.erase(victim->key);
-                    g_lru.erase(victim->lru);
-                    g_lru.push_front(victim);
-                    victim->lru = g_lru.begin();
-                    return victim;
+                    if ((*it)->pin == g_epoch) continue;
+                    if (victim == nullptr) victim = *it;
+                    if ((*it)->bytes == bytes) { same = *it; break; }
+                    ++seen;
+                }
+                if (victim == nullptr) return nullptr;
+                if (same != nullptr)
+                {
+                    g_slots.erase(same->key);
+                    g_lru.erase(same->lru);
+                    g_lru.push_front(same);
+                    same->lru = g_lru.begin();
+                    same->prefetched = false;
+                    return same;
                 }
                 free_slot(victim);
             }
             if (g_used + bytes > g_budget) return nullptr;
             void* data = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
             if (data == MAP_FAILED) return nullptr;
+#if defined(__APPLE__) && TARGET_OS_OSX
+            // Wired (macOS; iOS answers memory pressure with jetsam and is unmeasured
+            // here): expert weights barely compress (1.2:1 measured), so a slot macOS
+            // compresses frees a sixth of itself and turns every later hit into a
+            // decompression; overcommitted by 3 GB, a 23 GB cache had 15-17 GB in the
+            // compressor (DeepSeek V4.1, 48 GB Mac). Wired, macOS takes the room from
+            // the file cache and other programs' compressible memory instead - as
+            // Strata wires its arena (metal/src/engine/stream.cpp). munmap unwires.
+            static const bool wire = [] {
+                const char* e = std::getenv("TS_HOST_MOE_IO_WIRE");
+                return e == nullptr || e[0] != '0';
+            }();
+            if (wire && mlock(data, bytes) != 0 && g_wire_failures++ == 0)
+                std::fprintf(stderr, "[expert-io] mlock refused a %.1f MB cache slot (%s): slots that cannot be wired stay "
+                    "pageable, and macOS may compress them (TS_HOST_MOE_IO_WIRE=0 stops trying)\n", bytes / 1e6,
+                    std::strerror(errno));
+#endif
             auto* s = new Slot();
             s->data = static_cast<std::uint8_t*>(data);
             s->bytes = bytes;
@@ -291,6 +330,20 @@ namespace tsg
         {
             while (!g_lru.empty()) free_slot(g_lru.back());
         }
+
+        // Under g_mutex: wait for a read-ahead batch still in flight (its workers
+        // never take g_mutex) and drop its slots if any read came back short.
+        void prefetch_settle_locked()
+        {
+            if (g_prefetch_team == nullptr || !g_prefetch_team->pending()) return;
+            if (!g_prefetch_team->finish())
+                for (const void* key : g_prefetch_keys)
+                {
+                    auto it = g_slots.find(key);
+                    if (it != g_slots.end() && it->second->prefetched) free_slot(it->second);
+                }
+            g_prefetch_keys.clear();
+        }
 #endif
     }
 
@@ -301,6 +354,7 @@ namespace tsg
 #if !defined(_WIN32)
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_budget == 0 || g_files.empty()) return;
+        prefetch_settle_locked();
         ++g_epoch;
         static thread_local std::vector<IoRequest> s_requests;
         s_requests.clear();
@@ -316,6 +370,7 @@ namespace tsg
                 s->lru = g_lru.begin();
                 resolved[i] = s->data;
                 ++g_hits;
+                if (s->prefetched) { s->prefetched = false; ++g_prefetch_used; }
                 continue;
             }
             const MappedFile* file = find_file(sources[i], bytes[i]);
@@ -354,6 +409,56 @@ namespace tsg
                         if (it != g_slots.end()) free_slot(it->second);
                     }
         }
+#endif
+    }
+
+    void host_expert_io_prefetch(const void* const* sources, const std::size_t* bytes, int count)
+    {
+#if !defined(_WIN32)
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_budget == 0 || g_files.empty() || count <= 0) return;
+        prefetch_settle_locked();
+        std::vector<IoRequest> requests;
+        for (int i = 0; i < count; ++i)
+        {
+            if (g_slots.count(sources[i]) != 0) continue;
+            const MappedFile* file = find_file(sources[i], bytes[i]);
+            if (file == nullptr) continue;
+            // Pinned with the epoch of the call that just ran, so this batch neither
+            // evicts that call's slots nor its own; the next resolve unpins them.
+            Slot* s = take_slot(bytes[i]);
+            if (s == nullptr) break;
+            s->key = sources[i];
+            s->pin = g_epoch;
+            s->prefetched = true;
+            g_slots[sources[i]] = s;
+            g_prefetch_keys.push_back(sources[i]);
+            requests.push_back({file->fd, s->data, bytes[i],
+                static_cast<off_t>(static_cast<const std::uint8_t*>(sources[i]) - file->base)});
+            ++g_prefetch_reads;
+            g_read_bytes += bytes[i];
+        }
+        if (requests.empty()) return;
+        if (g_prefetch_team == nullptr)
+        {
+            const char* e = std::getenv("TS_HOST_MOE_IO_THREADS");
+            const int n = e != nullptr ? std::atoi(e) : 0;
+            g_prefetch_team = new IoTeam(n > 0 && n <= 64 ? n : 12);
+        }
+        g_prefetch_team->start(std::move(requests));
+#else
+        (void)sources; (void)bytes; (void)count;
+#endif
+    }
+
+    void host_expert_io_prefetch_stats(std::uint64_t& reads, std::uint64_t& used)
+    {
+#if !defined(_WIN32)
+        std::lock_guard<std::mutex> lock(g_mutex);
+        reads = g_prefetch_reads;
+        used = g_prefetch_used;
+#else
+        reads = used = 0;
 #endif
     }
 
@@ -498,6 +603,7 @@ namespace tsg
         if (ptr == nullptr) return;
         host_expert_io_wait_async();   // a batch in flight still reads these files
         std::lock_guard<std::mutex> lock(g_mutex);
+        prefetch_settle_locked();      // and a read-ahead one writes into slots
         for (auto it = g_files.begin(); it != g_files.end(); ++it)
         {
             const auto* q = static_cast<const std::uint8_t*>(ptr);
@@ -525,8 +631,10 @@ namespace tsg
         host_expert_io_wait_async();
         IoTeam* team = nullptr;
         IoTeam* async_team = nullptr;
+        IoTeam* prefetch_team = nullptr;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
+            prefetch_settle_locked();
             clear_locked();
             for (auto& f : g_files) close(f.fd);
             g_files.clear();
@@ -534,9 +642,12 @@ namespace tsg
             g_team = nullptr;
             async_team = g_async_team;
             g_async_team = nullptr;
+            prefetch_team = g_prefetch_team;
+            g_prefetch_team = nullptr;
         }
         delete team;
         delete async_team;
+        delete prefetch_team;
 #endif
     }
 }
@@ -555,7 +666,18 @@ TSG_EXPORT int TSGgml_HostExpertIoRegister(const void* base, long long length, c
     if (fd < 0) { tsg::set_last_error(std::string("host expert I/O: cannot open ") + path); return 0; }
 #if defined(__APPLE__)
     // The slots are the copy kept; the unified buffer cache need not hold another.
+    // F_NOCACHE alone does not do that: the kernel's read-ahead still brings the
+    // file's next pages into the cache, ~1.5 GB for every 3 GB of 3 MB slices read
+    // (vm_stat file-backed pages, M5 Pro), and ~0 with read-ahead off at the same
+    // speed. A DeepSeek V4.1 run reads 150-380 GiB this way: the cache filled with
+    // those pages, and macOS compressed anonymous memory to keep them - the slots
+    // included, most of them even at a 1 GB budget, so a hit was a decompression.
     fcntl(fd, F_NOCACHE, 1);
+    fcntl(fd, F_RDAHEAD, 0);
+#elif defined(__linux__)
+    // The same on Linux: the slices are read whole into the cache, so the kernel's read-ahead around
+    // each one only fills the page cache, which a container's memory limit counts.
+    posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
 #endif
     tsg::g_files.push_back({static_cast<const std::uint8_t*>(base), static_cast<std::size_t>(length), fd});
     return 1;
@@ -571,11 +693,32 @@ TSG_EXPORT void TSGgml_HostExpertIoUnregister(const void* base)
     tsg::host_expert_io_on_drop(base);
 }
 
+// What macOS can give now without compressing or swapping anything: free and purgeable
+// pages plus the clean file cache (inactive and speculative pages, at most the file-backed
+// ones). Other programs' inactive anonymous memory is left out - macOS frees it only by
+// compressing it. Strata's arena_avail (metal/src/engine/arena_budget.h). -1 elsewhere.
+TSG_EXPORT long long TSGgml_HostAvailableMemoryBytes()
+{
+#if defined(__APPLE__)
+    vm_statistics64_data_t vs{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vs), &count) != KERN_SUCCESS)
+        return -1;
+    const unsigned long long clean = std::min<unsigned long long>(
+        static_cast<unsigned long long>(vs.inactive_count) + vs.speculative_count, vs.external_page_count);
+    return static_cast<long long>((static_cast<unsigned long long>(vs.free_count) + vs.purgeable_count + clean)
+        * static_cast<unsigned long long>(vm_page_size));
+#else
+    return -1;
+#endif
+}
+
 // Byte budget of the cache (0 disables it and frees every slot).
 TSG_EXPORT void TSGgml_HostExpertIoSetBudget(long long bytes)
 {
 #if !defined(_WIN32)
     std::lock_guard<std::mutex> lock(tsg::g_mutex);
+    tsg::prefetch_settle_locked();
     tsg::g_budget = bytes > 0 ? static_cast<std::size_t>(bytes) : 0;
     while (tsg::g_used > tsg::g_budget && !tsg::g_lru.empty()) tsg::free_slot(tsg::g_lru.back());
 #else

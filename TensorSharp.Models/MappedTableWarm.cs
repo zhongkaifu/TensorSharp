@@ -23,7 +23,7 @@ namespace TensorSharp.Models
     internal static class MappedTableWarm
     {
         private const long Block = 64L << 20;
-        private const long Headroom = 8L << 30;
+        internal const long Headroom = 8L << 30;
 
         /// <summary>
         /// Start reading <paramref name="ranges"/> (shard path, byte offset, byte count), or return null
@@ -52,16 +52,26 @@ namespace TensorSharp.Models
                 foreach (var (path, offset, length) in ranges)
                     for (long at = 0; at < length; at += Block)
                         blocks.Add((path, offset + at, Math.Min(Block, length - at)));
-                using var handles = new ThreadLocal<Dictionary<string, Microsoft.Win32.SafeHandles.SafeFileHandle>>(
-                    () => new Dictionary<string, Microsoft.Win32.SafeHandles.SafeFileHandle>(), trackAllValues: true);
+                // Every handle is opened before the first read: some FUSE mounts (geesefs) drop a
+                // file's whole page cache at each open(), so a worker opening its handle lazily
+                // threw away the blocks the others had just read.
+                const int Readers = 16;
+                var handles = new Dictionary<string, Microsoft.Win32.SafeHandles.SafeFileHandle[]>();
                 using var buffers = new ThreadLocal<byte[]>(() => new byte[Block]);
+                int next = 0;
                 try
                 {
-                    Parallel.ForEach(blocks, new ParallelOptions { MaxDegreeOfParallelism = 16, CancellationToken = cancel }, block =>
+                    foreach (var (path, _, _) in ranges)
+                        if (!handles.ContainsKey(path))
+                        {
+                            var pool = new Microsoft.Win32.SafeHandles.SafeFileHandle[Readers];
+                            handles[path] = pool;
+                            for (int i = 0; i < Readers; i++)
+                                pool[i] = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                        }
+                    Parallel.ForEach(blocks, new ParallelOptions { MaxDegreeOfParallelism = Readers, CancellationToken = cancel }, block =>
                     {
-                        var open = handles.Value;
-                        if (!open.TryGetValue(block.Path, out var handle))
-                            open[block.Path] = handle = File.OpenHandle(block.Path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                        var handle = handles[block.Path][(Interlocked.Increment(ref next) & int.MaxValue) % Readers];
                         RandomAccess.Read(handle, new Span<byte>(buffers.Value, 0, (int)block.Bytes), block.Offset);
                     });
                     Console.Error.WriteLine($"[{tag}] warmed {bytes / (double)(1L << 30):F1} GiB of {what} in {sw.Elapsed.TotalSeconds:F1}s");
@@ -73,9 +83,9 @@ namespace TensorSharp.Models
                 }
                 finally
                 {
-                    foreach (var open in handles.Values)
-                        foreach (var handle in open.Values)
-                            handle.Dispose();
+                    foreach (var pool in handles.Values)
+                        foreach (var handle in pool)
+                            handle?.Dispose();
                 }
             });
         }

@@ -2238,7 +2238,7 @@ namespace TensorSharp.Runtime.Scheduling
                 var exec = TryArmSpeculation(spec, seq, trunk: null, trunkLabel: "linear");
                 if (exec == null)
                     return null;
-                if (exec.CanSeedCommitted)
+                if (exec.CanSeedCommitted && !exec.PrefillsThroughContext)
                 {
                     // A drafter that can be seeded from the trunk's tokens (n-gram, a
                     // head that resumes after a gap) does not need the prompt to run

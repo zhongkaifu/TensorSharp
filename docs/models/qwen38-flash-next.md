@@ -500,7 +500,7 @@ described below. These historical media/speculation checks do not qualify the
 distributed modes, which require ordinary text prefill and decode.
 
 `--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` attaches the per-token
-MTP block (GGML backends only, and the head must be a single GGUF file, attached
+MTP block (GGML backends and `--backend cuda`; the head must be a single GGUF file, attached
 when the model loads); it speculates for a solo request that prefilled from position 0
 (steps shared with other sequences, and turns that continue a retained holder or
 a shared-prefix clone, decode plainly — the head keeps its own K/V and cannot
@@ -529,12 +529,15 @@ experts), acceptance 81% (3.4 tokens per verify). On `ggml_metal` the rows are v
 one batched forward by default, as NInfer, llama.cpp and vLLM do: 95 ms a verify and 1.3x the
 speed of verifying each row with the one-token kernels on code. Greedy text then differs from
 plain decode and depends on the verify widths the governor chose; `TS_Q4E_VERIFY_ROW_KERNELS=1`
-restores the exact rows (speculative text bit-identical to plain greedy, as on CPU and CUDA,
-which keep them). A partial acceptance no longer restores the
+restores the exact rows (speculative text bit-identical to plain greedy, as on CPU and, by
+default, CUDA, which keep them; there `TS_Q4E_VERIFY_ROW_KERNELS=0` selects the batched
+verify). A partial acceptance no longer restores the
 recurrent state and re-forwards the kept rows (~60 ms each): the verify span keeps every
 row's GDN conv/SSM state (upstream `ggml_gated_delta_net`'s per-row snapshots) and PLE conv
-history, and the accepted row is copied into the live state (NInfer's ReplaySSM idea;
-`TS_Q4E_VERIFY_ROW_COMMIT=0` restores the old rollback). With the exact verify rows the
+history, and the accepted row is copied into the live state (NInfer's ReplaySSM idea; by
+`memcpy` where the state is host-visible, by one device copy graph on `ggml_cuda` and
+`ggml_vulkan`, and by the old rollback on a layer split whose state spans devices;
+`TS_Q4E_VERIFY_ROW_COMMIT=0` restores the old rollback everywhere). With the exact verify rows the
 speculative text is still identical to plain greedy.
 
 A batched verify also overlaps its window reads with the GPU, as NInfer's streaming window
@@ -621,6 +624,11 @@ it and reads those parts from the SSD as tokens need them.
   process's memory cgroup (a container's limit, not the host's). The larger-than-memory
   Mac skips it, since reading the table there would only evict experts. On a network
   filesystem the warm matters most: an uncached row on a geesefs mount took 92-120 ms.
+  On the GGML backends the same background warm also reads every routed expert the host
+  serves (the ones outside the accelerator tier, most-routed first), within what the
+  cgroup can keep cached: on a discrete GPU each route outside the tier is computed on the
+  host from the mapping, and a cold expert there is several storage round trips inside a
+  decode step. `TS_HOST_WARM_WAIT=1` makes the load wait for the warm (benchmarks).
 - **Every layer's routed experts are scheduled at a host seam, and the GPU computes them
   from per-layer expert slots.** On `ggml_metal` with neither `--n-cpu-moe` nor `--cpu-moe`
   set, the engine plans the placement itself (the same scheme as NInfer's Flash Next expert
@@ -695,6 +703,32 @@ cache, so it depends on what else the Mac is doing: the same run decoded at
 10.3-11.3 tok/s while other work kept 5 GB compressed. TensorAgent offers this file on
 48 GB Macs ([measured in the app](../../TensorAgent/README.md#the-macs-own-models)).
 
+### Loading from network storage
+
+A checkpoint larger than half the process's memory used to skip the parallel page-cache
+warm entirely, and everything the load reads then arrived through serial page faults.
+Measured on an RTX 5090 VM with the GGUF on a geesefs (S3 FUSE) mount and a 93 GB memory
+cgroup, `ggml_cuda`, profiled tier: the load took **505 s** (F32 tensors 43 s, dense
+weights uploaded to the GPU 94 s, the 23.0 GB tier filled through page faults 363 s at
+~63 MB/s), and the first answer then stalled on cold host experts and PLE rows. Now:
+
+- When the whole checkpoint is over the budget, the tensors the load reads at once
+  (everything but the routed experts) are still warmed in parallel: 3.7 GiB in 13 s.
+- The tier's experts are read with 32 parallel large reads before the slots are filled:
+  31.2 GB (the tier plus neighbouring host experts the reads coalesce over) in 52 s.
+- The PLE table and the host-served experts warm in the background (56 GiB in ~125 s).
+- The kernel warm-up prefills 64 tokens instead of 2,048 when experts are host-served: a
+  2,048-token dummy prompt routes to nearly every expert and streamed most of the 46 GB
+  (minutes on network storage, before the first request could start).
+
+The model is ready in about 70 s (202 s with `TS_HOST_WARM_WAIT=1`). Every read goes
+through a pool of 32 handles per shard, opened once before any tensor data is read: geesefs
+drops a file's entire page cache at every `open()` (a 64 MB range went from resident to 0
+when a second descriptor was opened, the mapping still live), so a reader that opened its
+own handle threw away what the others had read. For the same reason, do not open the model
+files from another process (a second server, `dd`, a GGUF inspector) while one is serving
+from such a mount: that open drops the serving process's warm cache.
+
 ### Expert tiers, 2026-11-06
 
 Same Mac and file, ggml `57e2c2ca` (unmodified), real text: four requests in one CLI
@@ -731,10 +765,43 @@ routing, so the profile it saves covers every layer and a later load is tiered. 
 5090 (32 GB, UD-Q2_K_XL, 12,245 experts / 23.0 GB in slots covering 85% of the profiled
 routes, everything in RAM) plain decode measured 51.3 / 50.4 / 45.8 tok/s against
 44.5 / 44.8 / 44.9 for the layer plan (code / prose / list), teacher-forced perplexity
-16.12 against 16.22 over 1,024 tokens. The MTP head did not pay off there: CUDA verifies
-each row with the one-token kernels (~75 ms a 4-row verify) and still re-forwards a partial
-acceptance, and its 2.8 GB cut the slots to 20.1 GB, so code and prose decoded at 42.2 and
-34.2 tok/s with it. `TS_MOE_HOT_TIER=0` keeps the layer plan.
+16.12 against 16.22 over 1,024 tokens. At first the MTP head did not pay off there: CUDA
+verified each row with the one-token kernels (~75 ms a 4-row verify) and re-forwarded a
+partial acceptance, and its 2.8 GB cut the slots to 20.1 GB, so code and prose decoded at
+42.2 and 34.2 tok/s with it. `TS_MOE_HOT_TIER=0` keeps the layer plan.
+
+#### CUDA tiers, 2026-11-07
+
+Same VM and file, ggml unmodified, four requests in one CLI process (code, ~1,300-token
+prose, list, and a 329-token code-edit answer; 256 greedy tokens otherwise). Every run starts
+from its own copy of one calibration profile (`TENSORSHARP_MOE_PROFILE`): each process merges
+its routing into the profile when it exits, and a chain of runs sharing one profile tunes the
+slots to the benchmark prompts (plain decode went 42.8 -> 57.5 tok/s on code over a chain).
+Repeated arms agreed within 1.5 tok/s.
+
+| decode tok/s | code | prose | list | edit | greedy text against plain |
+| --- | --- | --- | --- | --- | --- |
+| Plain | 52.2 | 52.4 | 47.6 | 43.1 | - |
+| Plain, `TS_HOST_MOE_OVERLAP=0` | 49.6 | 49.6 | 45.5 | 41.3 | identical |
+| MTP, old rollback (`TS_Q4E_VERIFY_ROW_COMMIT=0`) | 49.6 | 39.5 | 47.8 | 52.5 | differs on all four |
+| MTP, exact rows + row commit (default) | 60.9 | 49.6 | 58.1 | 53.1 | identical on code and edit |
+| MTP, batched verify (`TS_Q4E_VERIFY_ROW_KERNELS=0`) | 64.3 | 55.0 | 57.9 | 54.8 | not exact by design |
+| Plain, adaptive slots (`TS_MOE_TIER_ADAPT=1`) | 57.1 | 61.4 | 58.8 | 53.3 | depends on earlier output |
+| MTP + adaptive slots | 62.6 | 56.9 | 60.7 | 57.5 | depends on earlier output |
+
+- **Seam overlap** (default): a tiered seam launches the graph part for the routes its slots
+  hold asynchronously, then computes the other routes on the host meanwhile. Bit-identical.
+- **Row commit on the device**: the accepted row's GDN, conv and PLE state is copied by one
+  ggml copy graph instead of restoring the state and re-forwarding the kept rows. The old
+  rollback was not exact on tiered CUDA loads either.
+- **Adaptive slots** (opt-in): Strata's adaptive expert cache. Each layer keeps a decayed
+  route count per expert, and every 32 seams up to two clearly hotter host-served experts are
+  copied into its coldest slots. Over teacher-forced perplexity (2,048 tokens, eight 512-token
+  windows of these docs) the slots held 889k routes instead of 685k, and perplexity was
+  22.90 against 23.07 with the slots fixed. Which routes run on the host then depends on what
+  was generated before, so repeated requests need not give identical greedy text; that is
+  why it is off by default.
+
 
 An optional CUDA selected-expert cache follows Strata's compact quantized-slot
 approach. It keeps only routed experts in persistent device buffers, preserves
@@ -887,6 +954,380 @@ while the driver compiled the PTX; the driver caches the result. On random token
 llama-bench's two-GPU run gave 210.74 / 41.99, far below its own server's numbers on the same
 machine, so the real-text table is the comparison to go by. There, TensorSharp prefills
 1.2-2.1x faster and decodes at 88-90% (`ggml_cuda`) and 95-96% (`cuda`) of llama.cpp's speed.
+
+### Memory limits, 2026-11-07
+
+Two failures surfaced when this model ran beside Strata on ISTA-DASLab's `Q2_0` file, whose
+small experts let the tier plan fill every byte it was given.
+
+- **A prompt span that does not fit.** A span's graph grows with its length: 5.1 GB for a
+  4K-token span, which the 3 GiB reserve beside a full expert tier cannot hold on a 32 GB
+  card. The span used to mark itself unsupported, and with no other path for QSA every later
+  request failed. Now a prompt span whose graph cannot be allocated, before anything ran, is
+  prefilled again as two halves (recursively, down to 64 tokens), plain or for the MTP head,
+  and the length that fit caps later prompt spans; the log says so once per halving. A
+  verify window, an image prompt, tensor parallelism and layer splits keep their single span.
+- **Metal running out of memory.** Metal cannot fail an allocation and go on: an out-of-memory
+  command buffer ends the backend. The tier plan was sized against Metal's working set
+  (40.2 GB of a 48 GB Mac), which is a ceiling, not what macOS can give with an editor and a
+  browser open. The experts on the accelerator now also stay within what macOS can give
+  without compressing anything, less max(7 GB, 15% of the RAM) - Strata's arena rule - and
+  within 65% of the RAM wired in all; window slots fit what the tier leaves of the working
+  set; retained KV is bounded the same way. On the 48 GB Mac with `Q2_0` that is a 23-26 GB
+  tier (97.6-99% of the profiled routes), and the long-prompt scenarios that ran Metal out
+  of memory before now pass, plain and with the MTP head.
+
+Side by side on the same file (`eng/qwen38-engine-bench.py`, greedy, 3 repeats), Strata
+(github.com/Niko1221/Strata `146df3c4`) was faster everywhere but on cached follow-ups:
+
+| | long answer decode | 4K prompt TTFT | 16K prompt TTFT |
+| --- | --- | --- | --- |
+| RTX 5090, Strata (MTP) | 306 tok/s | 0.92 s | 2.75 s |
+| RTX 5090, TensorSharp (MTP) | 74 tok/s | 4.17 s | 27.4 s |
+| RTX 5090, TensorSharp `--backend cuda`, plain (later the same day, see below) | 98 tok/s | 4.24 s | 17.8 s |
+| M5 Pro 48 GB, Strata (DFlash2) | 48 tok/s | 6.32 s | 24.4 s |
+| M5 Pro 48 GB, TensorSharp (MTP) | 32 tok/s | 16.8 s | 65.3 s |
+
+A TensorSharp decode token on the 5090 took 11-13 ms: 8.6-10 ms in the 48 accelerator
+segments of the tiered span (each a submit and a wait; CUDA graphs on or off changed it by
+under 1 ms), 2.3-3.5 ms of host experts. Strata runs a token as one captured CUDA graph,
+decides hits on the device and computes misses on a CPU pool in place, concurrently.
+
+### The direct CUDA engine on one GPU that cannot hold the experts, 2026-11-07
+
+`--backend cuda` runs a decode step as one captured CUDA graph. It used to need every routed expert in
+VRAM; UD-Q2_K_XL (42.9 GiB of experts) and ISTA-DASLab's `Q2_0` (31.6 GiB) do not fit a 32 GB card.
+It now plans **expert residency**, as Strata runs this model:
+
+- The hottest experts by the routing profile, across all layers, get VRAM slots (98.4% of profiled
+  routes for `Q2_0`, 86.4% for UD-Q2_K_XL on an RTX 5090). Each stacked expert weight carries a
+  table of one address per expert, which the expert kernels read.
+- **Host experts** (Strata's doorbell): the other experts are copied once into pinned host memory.
+  In a decode step or verify window of up to 8 rows, each layer publishes its input and selection
+  to host-mapped memory. A host thread computes the missed experts with ggml's CPU kernels while
+  the GPU computes the resident ones, and a GPU kernel waits for the host's sum and adds it. The
+  step never leaves its graph and no expert crosses the bus. A missed expert's table entry points
+  at a zeroed expert in VRAM, so the GPU's share contributes nothing for it. Steps with misses
+  differ from an all-resident run in the last bits (the host quantizes activations as ggml's CPU
+  kernels do). `TS_Q4E_HOST_EXPERTS=0` stages every miss over the bus instead.
+- Prompts stage the missed experts into VRAM by a copy kernel inside the step.
+- The host's worker team takes the CPUs left after the two spinning threads (the stream wait and
+  the doorbell server): on the VM's 13.6-CPU quota, 6 workers gave 65.5/45.9/58.8 tok/s, 10 gave
+  69.0/48.0/63.5, and 16 (oversubscribed) 63.4/45.1/58.0. `--cpu-moe-threads` overrides.
+- `TS_MOE_TIER_ADAPT=1` (opt-in; text then depends on the history): the host counts every step's
+  selection, and every 8 steps up to two of a layer's hotter host experts trade places with its
+  coldest VRAM experts. The slot's bytes take the host expert's packed place, so memory stays as
+  planned.
+- Splitting a layer's misses between the CPU and the bus (Strata's PCIe share) was measured and
+  removed: with 10+ host workers it was slower (56.2/41.1/49.0 for one miss a layer on the CPU)
+  than leaving every miss to the CPU, since the copies sit on the GPU's path and the CPU work
+  overlaps it. Strata reports the share pays only with a small CPU pool.
+
+The engine now also reads ISTA's `Q2_0` file: Q2_0, Q4_0 and Q5_0 decoders in the warp-per-row
+kernels, a BF16 kernel with F32 activations for the BF16 hyper-connection and PLE value matrices,
+and split-K for dense projections with few output rows (the 10240 -> 320 hyper-connection down
+projection had run on 80 warps). Without split-K and with whole 64-value Q2_0 units, the engine ran
+`Q2_0` at 55.9/43.1/56.9 tok/s, below ggml_cuda.
+
+RTX 5090 (13.6-CPU quota), `requests.jsonl` (code / prose / list, 256 tokens each, greedy, no MTP),
+frozen routing profile, one run each:
+
+| file, backend | code | prose | list |
+| --- | --- | --- | --- |
+| UD-Q2_K_XL, ggml_cuda tiers | 52 | 52 | 48 |
+| UD-Q2_K_XL, cuda, staging only | 52.0 | 38.7 | 45.7 |
+| UD-Q2_K_XL, cuda, host experts | 70.6 | 47.9 | 64.5 |
+| UD-Q2_K_XL, cuda, host experts + `TS_MOE_TIER_ADAPT=1` | 71.6 | 50.8 | 77.4 |
+| `Q2_0`, ggml_cuda tiers | 82.6 | 46.4 | 88.4 |
+| `Q2_0`, cuda, host experts | 94.6 | 65.6 | 97.3 |
+| `Q2_0`, cuda, host experts + `TS_Q4E_HC_Q8=1` (Strata's Q8_0 hyper-connection read) | 106.0 | 70.4 | 109.1 |
+
+A `Q2_0` step's GPU time (`TS_Q4E_PERF=3`, uncaptured, stage timers on) is about 11 ms (9.9 ms with
+`TS_Q4E_HC_Q8=1`, whose hyper-connection stage takes 2.3 ms): hyper-connections 3.3 ms, routed experts 2.0, shared expert 1.2, GDN projections 1.1, attention
+output 0.9, router 0.7, GDN core 0.7. The weights it reads take about 2.3 ms at the card's
+bandwidth; the hyper-connection and shared-expert stages are mostly kernel boundaries, which is
+where Strata's fused kernels are ahead.
+
+Those `Q2_0` figures ran **uncaptured**. Layer 10's shared-expert down projection is IQ4_NL with a 640-wide
+input. The decode-size dense kernel admitted IQ4_NL only at multiples of 256, so the first capture failed and the
+engine issued every step from then on (`decode steps run uncaptured`). The rule now takes whole 32-value blocks for
+the formats decoded a block at a time (Q4_0, Q5_0, Q8_0, IQ4_NL, MXFP4). Captured, plain long-generation decode is
+103 tok/s instead of 98: the step is bound by the GPU, not by issuing kernels.
+
+#### Speculative decoding on `--backend cuda`, 2026-11-07
+
+- **MTP head.** `--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` attaches the shared NextN block to the
+  direct engine. It runs entirely on the trunk's kernels:
+  - the token row is embedded into all four streams;
+  - each stream joins `[rms(e) * enorm, rms(h_s) * hnorm_s]`, laid out by two strided copies;
+  - `eh_proj` runs over tokens x streams rows;
+  - then come the block's attention (its own KV per sequence) and MoE;
+  - its output mixer comes last, then the trunk's LM head.
+
+  The drafter reads the trunk's four streams before the output mixer, as on the GGML backends. On the synthetic
+  fixture, three chained draft steps stay within 0.5-0.8% relative error of the native MTP executor's logits, with
+  the same argmax.
+- **Verify windows** of up to 8 rows run as one ubatch with every row's logits and streams. They are captured as
+  CUDA graphs per sequence, QSA regime and row count. The accepted prefix is committed by replaying the recurrences
+  over it, bit-exact against a plain decode of the same tokens.
+- **One fused launch** for a half's hyper-connection scatter and the next mixer's first pass, about 95 fewer
+  launches a step; bit-exact (`TS_Q4E_FUSE_HC=0` restores the two launches).
+
+RTX 5090, `Q2_0` with `TS_Q4E_HC_Q8=1`, the same client as the comparison above:
+
+| run | short chat TTFT / decode | long-gen decode | 4K TTFT | 16K TTFT | cached follow-up TTFT |
+| --- | --- | --- | --- | --- | --- |
+| plain, uncaptured (before the fix) | 0.11 s / 65 | 98.1 | 2.67 s | 11.4 s | 0.12 s |
+| plain, captured | 0.10 s / 69 | 103 | 2.70 s | 11.4 s | 0.11 s |
+| MTP, window 3, captured | 0.13 s / 62 | 110 (87% accepted) | 3.36 s | 14.2 s | 0.13 s |
+| Strata, MTP | 0.24 s / 114 | 306 | 0.92 s | 2.75 s | 0.12 s |
+
+MTP gains little so far because a 4-row verify window takes 27-32 ms, about three decode steps. A draft step takes
+0.62 ms and the fused catch-up 0.88 ms. The head's 2.9 GiB (Q8_0 experts) comes out of the expert slots, leaving
+95.0% of routes resident instead of 97.6%. The CPU therefore computes about twice as many missed experts. A verify
+window's rows miss four times as many as one decode row, and the GPU waits for the CPU at every layer. Prompts stage
+more experts for the same reason, which is why they read slower with the head loaded.
+
+Where a 4-row verify window's GPU time goes (`TS_Q4E_PERF=3`, uncaptured, against a 1-row step): 18.5-23.6 ms
+against 10.9 ms. The routed experts take 5.8-10.7 ms against 3.1. The dense projections and the LM head grow with
+the rows: attention projections 1.8 against 0.33 ms, GDN projections 1.9 against 1.1, LM head 1.1 against 0.3. The
+decode-size dense kernels read every weight row once per activation row. Staging a window's missed experts over
+the bus instead of computing them on the CPU (`TS_Q4E_HOST_EXPERT_ROWS=1`) left the window at 27-30 ms. So the
+next steps are a multi-row dense kernel that reads each weight row once, and fused expert kernels, not the CPU
+side.
+
+A larger prompt ubatch (`TS_Q4E_UBATCH=2048`, default 512) stages each missed expert once per 2048 rows instead of
+per 512. 4K prompts take 1.75 s instead of 2.70, and 16K prompts 7.5 s instead of 11.4 (2,290 tok/s). Its scratch
+takes 1.2 GiB from the expert slots (96.6% of routes resident instead of 97.6%), so plain decode drops from 103 to
+98 tok/s. Strata reads the same prompts in 0.92 s and 2.75 s.
+
+#### Porting Strata's verify window, 2026-11-08
+
+Strata's own profile on the same RTX 5090 and `Q2_0` file (`STRATA_DECODE_TIMING=1 STRATA_VERIFY_PROFILE=1`):
+its verify windows hold 2.4-2.75 rows on average (`--spec 4 --spec-min-p 0.5`). Each takes 7.2-7.7 ms of GPU time
+and yields 1.9-2.3 tokens. 99.8% of the routed experts sit in its VRAM cache, which adapts every window, so the CPU
+computes about 16 experts a window. Ported, each measured against the change before it:
+
+- **Doorbell skip.** A layer whose selected experts all have slots no longer rings the host. The publish kernel
+  records it in a device word and the wait returns at once, where every layer used to wait for the host's echo:
+  20% of the GPU's time in an Nsight trace. Bit for bit the same (`TS_Q4E_DOORBELL_SKIP=0` rings every layer).
+- **Dense weights read once a window.** Verify rows of the warp-per-row formats (Q2_0, Q4_K, Q5_K, IQ4_XS, ...)
+  take one block for every row, a warp per output row: a 4-row window's LM head went from 1.11 to 0.48 ms. Bit for
+  bit the one-row kernel's sums.
+- **Shared expert on its own stream.** In decode steps and verify windows it runs beside the router and the routed
+  experts and joins at their combine, inside the captured graph. Bit for bit.
+- **Short expert rows.** The 640-wide expert down projection takes eight lanes a row instead of a warp.
+- **BF16 router as stored.** The router is read as the file's BF16, half the bytes of its F32 widening, with the
+  same sums.
+- **Smaller draft experts.** `TS_Q4E_MTP_EXPERTS=q2_0` requantizes the MTP head's experts at load (Strata ships
+  its draft layer so): 2,550 to 675 MiB, which the target's experts then use. This applies to the GGML backends too.
+- **Per-token draft gate 0.5** for this model on every backend (Strata's `--spec-min-p`). A draft the head is
+  unsure of costs a whole verify row; `--spec-pmin` still overrides it.
+- **Adaptive residency for verify windows.** The doorbell kernel counts every layer's selections on the device.
+  Every 4 forwards (decode steps, verify windows and batched steps alike) up to 8 trades run, largest gain first,
+  between a layer's most-selected host expert and its least-selected VRAM expert. Before, adaptation ran only after
+  one-token steps, so never under MTP. The live hit rate had been about 88% against the 96.8% the routing profile
+  predicted; adaptation halves the misses. On by default since 2026-11-08 (text then depends on the history;
+  `TS_MOE_TIER_ADAPT=0` turns it off); `TS_MOE_TIER_ADAPT_EVERY` and `TS_MOE_TIER_ADAPT_SWAPS` tune it.
+
+RTX 5090, `Q2_0`, `TS_Q4E_HC_Q8=1`, MTP `--spec-draft 3`, the same client (long generation is three answers of
+about 1,190 tokens in a row; the adaptive runs speed up as they learn):
+
+| run | long-gen decode | 4K TTFT | 16K TTFT | 4-row verify | experts on the CPU a 4-row window |
+| --- | --- | --- | --- | --- | --- |
+| MTP before this work (captured) | 109-112 | 3.36 s | 14.2 s | 23.9 ms | |
+| all of the above but adaptation, Q2_0 draft experts | 115-125 | 3.02 s | 12.7 s | 21.1 ms | 229 |
+| ... with `TS_MOE_TIER_ADAPT=1` and the 0.5 gate | 132-167 | 2.99 s | 12.4 s | 18.3 ms | 123 |
+| the same at 32K context (`MAX_CONTEXT=32768`) | 145-180 | 2.53 s | 10.6 s | 15.5 ms | 52 |
+| Strata, MTP (131K context, int8 KV with 32K resident) | 306 | 0.92 s | 2.75 s | ~7.5 ms GPU at 2.5 rows | ~16 |
+
+The 32K row shows what the 131K context's F16 attention cache costs: 2.9 GiB of expert slots. Strata keeps its KV
+in int8 with only the last 32K positions in VRAM. Left in a 4-row window at 32K: experts 3-4 ms with the CPU's
+share, GDN projections 1.9 ms, attention projections 1.8 ms, hyper-connections 3.1 ms, router 1.2 ms.
+
+On the Mac (M5 Pro 48 GB, `ggml_metal`, `Q2_0`, MTP, 32K) the same draft-side changes apply:
+
+| run | long-gen decode | 4K decode | 16K decode | accepted (code / prose / list) |
+| --- | --- | --- | --- | --- |
+| gate 0.15, Q8_0 draft experts (before) | 25.4-26.8 | 25.3-27.5 | 24.7-26.3 | 88 / 66 / 70% |
+| gate 0.5, Q8_0 draft experts | 29.9-31.0 | 30.7-36.2 | 27.5-30.3 | 90 / 72 / 79% |
+| gate 0.5, Q4_0 draft experts (`TS_Q4E_MTP_EXPERTS=q4_0`) | 29.3-30.4 | 32.0-37.5 | 29.0-34.4 | 90 / 72 / 81% |
+| gate 0.5, Q2_0 draft experts | 29.1-30.6 | 29.6-35.5 | 29.5-32.6 | 89 / 68 / 80% |
+
+The Metal expert tiers live in unified memory and follow their read-ahead window, so the adaptation above is
+CUDA-only.
+
+#### Q8_0 KV cache on the direct engine, 2026-11-08
+
+`q8_0` is the KV cache of `--backend cuda` unless `--kv-cache-dtype` names another (`f16` keeps F16). The 12
+attention layers keep K and V as int8 codes with
+one F16 scale per 32 values (ggml's Q8_0 arithmetic; codes and scales stored apart so a lane reads its 8 codes in one
+load), half the F16 cache's bytes. The planner gives the freed VRAM to expert slots. `q4_0` falls back to F16 with a
+line on stderr. Against the F16 cache the synthetic fixture's logits move by 3.7e-3 to 4.8e-3 (relative), and a
+verify window over the Q8_0 cache answers exactly as a plain decode on that cache.
+
+Same session, RTX 5090, `Q2_0`, `TS_Q4E_HC_Q8=1`, MTP with Q2_0 draft experts, `TS_MOE_TIER_ADAPT=1`, 131K context:
+
+| KV cache | experts in VRAM (profiled routes) | long-gen decode | 4K TTFT / decode | 16K TTFT / decode | 4-row verify | CPU experts a window |
+| --- | --- | --- | --- | --- | --- | --- |
+| F16 | 15,901 (96.9%) | 123-162 | 2.99 s / 87-96 | 12.5 s / 63-78 | 17.9 ms | 113 |
+| `q8_0` | 17,085 (98.0%) | 135-165 | 2.67 s / 98-104 | 11.1 s / 84-85 | 16.9 ms | 82 |
+
+### DFlash2 drafter on ggml_metal, 2026-11-08
+
+Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
+same drafter on the GGML backends: pass the official GGUF of
+[incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2-GGUF) as
+`--draft-model`. Strata's Mac pack is the same stock weights.
+
+```bash
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf --backend ggml_metal \
+  --draft-model Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf
+```
+
+- **Features.** The drafter was trained on the completed outputs of layers 5, 15, 25, 35 and 45, each averaged
+  over the four hyper-connection streams (12,800 floats a position). The token span computes those means inside its
+  own graph and writes them into the speculative forward's feature rows, so a verify, a plain step and a prompt
+  chunk all feed the drafter's ring. The drafter borrows the target's token embedding and LM head.
+- **Defaults.** Windows of up to 6 drafts, ended where the product of the drafter's confidences falls below 0.5
+  (Strata uses 0.7; on this Mac 0.5 decoded the code and prose answers at 47.3 / 30.8 tok/s against 46.4 / 28.0).
+  `--spec-draft` and `--spec-pmin` override them. Not under `--tp` or distributed stages.
+- **The prompt now reaches the drafter.** A block drafter used to be armed after a PLAIN prefill (a shortcut meant
+  for drafters that keep no context), so its ring held only the answer's own tokens. Prompts now prefill through the
+  speculative context (`ISpeculator.ConditionsOnPrompt`): short answers 13 -> 18 tok/s, 4K-prompt answers
+  30-39 -> 47-51. This applies to every DFlash target (Qwen 3.5/3.8, Muse-Glimmer).
+- **Verify graphs per width.** A token that runs as one span keeps one persisted graph per width (1..8 rows); one
+  shared graph was rebuilt whenever a window's width changed. Graphs that captured into a row buffer a wider window
+  has since grown are rebuilt, not replayed.
+- **Per-row states in place.** A verify window's GatedDeltaNet output, every row's state included, is allocated in
+  the buffer the commit reads, which removes a copy of about 3 MB a row per layer (7 ms of GPU time in a 4-row
+  window on the Mac).
+- **Prompts stage tier experts from their slots.** A prompt-width batch streams every expert an offloaded layer
+  routes into a staging tensor. The experts the layer's tier already holds are now copied from their slots in
+  memory instead of read from the file again: 4K TTFT 12.7 -> 8.9-10.2 s, 16K 62-67 -> 47-48 s. Same bytes, same
+  answers.
+
+Mac M5 Pro 48 GB, ISTA `Q2_0`, `ggml_metal`, 32K context, `TS_Q4E_HC_Q8=1`, tiered experts, the same client as the
+Strata comparison (3 repeats; long generation is a code answer, a prose answer and a passage copy):
+
+| run | short chat TTFT / decode | long-gen decode (code / prose answers) | 4K TTFT / decode | 16K TTFT / decode | pass |
+| --- | --- | --- | --- | --- | --- |
+| TensorSharp MTP, before | 0.43 s / 18 | 32.2 | 16.8 s / 38 | 65.3 s / 33 | 15/15 |
+| TensorSharp DFlash2 Q4_K_M | 0.32-0.35 s / 15-18 | 32.8-33.4 (50.1-52.7 / 32.8-33.5) | 8.9-10.2 s / 35-51 | 46.7-47.9 s / 37-45 | 15/15 |
+| Strata DFlash2 (`--spec 2`, streamed experts) | 0.56 s / 19 | 47.8 (53.7-55.2 / 47.6-48.0) | 6.32 s / 61 | 24.4 s / 61 | 15/15 |
+
+What did not help, measured and removed: every expert mapped on Metal (`--n-cpu-moe 0`; 36-63 tok/s but 34 GB of
+experts plus a 4K prompt's buffers ran Metal out of memory on the 48 GB Mac); dense IQ4_XS rewritten as IQ4_NL for
+ggml-metal's multi-row kernel; the speculation governor off. What remains is the verify window itself: 4 rows cost
+about 70 ms of which 63 ms on the GPU, against 39 ms for one row; Strata spends about 55 ms a 3.6-row step.
+
+Windows of more than 4 rows are verified as one batched forward on Metal (see "Verify rows run the one-token
+kernels"), so DFlash text can differ from plain greedy decoding; `TS_Q4E_VERIFY_ROW_KERNELS=1` keeps it exact.
+
+#### TensorSharp-owned Metal expert kernels, 2026-11-08
+
+A node profile of the token span on the Mac (`TS_GGML_NODE_PROFILE=types`, every expert mapped, the per-node sync
+subtracted) put the routed experts first: ggml-metal's MUL_MAT_ID reads each (row, route) pair's weights on its own,
+6.9 ms of GPU time for a 1-row step (89 GB/s) and 16.2 ms for a 4-row verify window. The tiered layers now compute
+the routes their slots hold with Strata's grouped expert kernels (MIT, ported unchanged into
+`TensorSharp.GGML.Native/tsm/`): each distinct slot's rows are read once for every row of the window that routes to
+it. The seam builds the grouping plan from the routes it already reads and encodes the kernels on ggml-metal's own
+command queue, so they run in order between the two segments with no host round trip of their own. They agree with
+MUL_MAT_ID to 1e-6 and with a double-precision reference to 2e-7 (`TsmMoeKernelTests`). `TS_METAL_MOE=0` keeps
+MUL_MAT_ID.
+
+M5 Pro, ISTA `Q2_0`, tiered: the experts of a 4-row window take 0.2 ms of GPU time a layer (0.08 ms at 1 row); a
+4-row verify pass 69.9 -> 59.8 ms, text identical. The same client as above, DFlash2 Q4_K_M, 15/15:
+
+| run | short chat decode | long-gen decode (code / prose answers) | 4K TTFT / decode | 16K TTFT / decode |
+| --- | --- | --- | --- | --- |
+| DFlash2, MUL_MAT_ID | 15-18 | 32.8-33.4 (50.1-52.7 / 32.8-33.5) | 8.9-10.2 s / 35-51 | 46.7-47.9 s / 37-45 |
+| DFlash2, grouped kernels | 15.6-19.0 | 34.8-36.1 (53.8-57.0 / 34.9-36.2) | 9.1-10.3 s / 45-49 | 46-48 s / 29-45 |
+| Strata DFlash2 | 19 | 47.8 (53.7-55.2 / 47.6-48.0) | 6.32 s / 61 | 24.4 s / 61 |
+
+This is the first piece of a TensorSharp-owned Metal decode window (Strata's design: a whole window in one command
+buffer, weights read in place, the host's turn at each layer through a shared event); the rest of the span still runs
+on ggml-metal.
+
+#### Seams on a shared event, and a GPU keep-alive, 2026-11-08
+
+A tiered pass used to end each of its 48 segments with a submit and a wait: the GPU idled while the host woke, read
+the routes, encoded the held routes and the next segment, and committed them. On Metal the seams now hand over on a
+shared event, as Strata's host turns do (`run_graph_seg`), without patching ggml: the segments are enqueued two ahead
+on ggml-metal's own queue (`ggml_backend_graph_compute_async`), and each seam is a TensorSharp command buffer between
+two of them - the prepared input (hazard tracking orders it after the segment that wrote the routes), a signal, a wait
+for the host's release, the grouped expert kernels with their grids read from the plan, and the combine whose output
+the next segment reads. The host spins until the signal, reads the routes, computes the ones no slot holds, writes
+the plan and releases the GPU. The kernels, their order and their buffers are those of a submit-and-wait seam, so the
+logits are the same bits (`TsmSeams_OnASharedEvent_AnswerAsSubmitAndWait_Metal`, with every route held and with half
+the experts left to the host). `TS_METAL_SEAM_EVENTS=0` keeps a submit and a wait per seam.
+
+A handshake still costs a round trip: on an M5 Pro ~190 us of GPU time on a quiet GPU. While seamed passes run, short
+spin kernels on a second queue keep the GPU awake (Strata's keep-alive): the round trip falls to ~83 us and its p90 from
+880 to 475 us. `TS_METAL_KEEPALIVE=0` turns it off. `TS_METAL_SEAM_PROFILE=1` prints, on the GPU's clock, the segments'
+time and the seams' (their kernels and the wait for the host); `TS_HOST_MOE_TIMING=3` now also prints the tier's routes
+held, window reads and host routes per pass.
+
+M5 Pro, ISTA `Q2_0`, tiered, per pass (`TS_HOST_MOE_TIMING=3`):
+
+| pass | submit and wait | event seams | + keep-alive | Strata window (`STRATA_METAL_PROFILE=1`) |
+| --- | --- | --- | --- | --- |
+| 1 row | 37.7-38.9 ms | 37.0-38.3 ms | 32.8-33.9 ms | 28.1 ms |
+| 4 rows | 59.0-64.5 ms | 56.7-62.1 ms | 52.8-59.0 ms | 45.7-46.2 ms |
+
+At one row the GPU spends 21.9 ms in ggml's segments and 8.6-9.7 ms in the seams, of which 3.7 ms is the expert
+kernels; the host's turns take 3.2-4.3 ms, mostly 9-13 window reads of ~1.3 MB each. At four rows the turns take 8-14 ms
+for 26-47 window reads and up to 13 routes the window could not hold. Plain decoding of a 512-token answer took 17.3-17.6
+s against 20.0 s. Splitting a window read into 64 or 128 KB requests was slower (more requests, more wake-ups) and was
+not kept. Strata's default `STRATA_ROUTE_TAIL_SKIP=7` skips a missed expert that every row of a window routes at rank 7
+or lower; TensorSharp computes every route.
+
+The same client as above, DFlash2 Q4_K_M, 15/15 (`df2-seams`):
+
+| run | short chat decode | long-gen decode (code / prose answers) | 4K TTFT / decode | 16K TTFT / decode |
+| --- | --- | --- | --- | --- |
+| DFlash2, grouped kernels | 15.6-19.0 | 34.8-36.1 (53.8-57.0 / 34.9-36.2) | 9.1-10.3 s / 45-49 | 46-48 s / 29-45 |
+| DFlash2, event seams + keep-alive | 18.8-19.8 | 37.8-39.5 (56.6-59.6 / 37.9-39.6) | 8.9-10.0 s / 42-56 | 41.6-47.3 s / 38-48 |
+| Strata DFlash2 | 19 | 47.8 (53.7-55.2 / 47.6-48.0) | 6.32 s / 61 | 24.4 s / 61 |
+
+Short answers and code now match or pass Strata. Prose is behind at the same acceptance (298-305 of 440-478 drafts
+against Strata's 314-318 of 469-501): a TensorSharp verify window of ~3.9 rows costs ~58 ms where Strata's 4-row
+window costs 46 ms, and the drafter declines to draft for 38-59 of a prose answer's steps.
+
+#### Long-context QSA and the expert window, 2026-11-08
+
+After a 16K prompt a 1-row pass spent 30.0 ms of GPU time in ggml's segments against 21.9 ms at a short context. The
+QSA layers explained all of it (timed by switching parts off): re-pooling every block's indexer key each step (3.8 ms),
+the cell-level selection (1.1 ms), and attention over every cell of the window under the selection mask. Three changes,
+all with upstream ggml ops:
+
+- Each QSA layer keeps its pooled keys between steps (`Q4eSeqStateEntry::aux`), and a step pools only the blocks its
+  cells complete. Block membership is fixed by position for text. A rollback leaves a block incomplete until it is
+  re-pooled, and any other writer of the raw keys (an upload, the concurrent-decode arena) makes the next step pool
+  everything. Same per-block arithmetic, so the logits are the same bits
+  (`QsaPooledKeys_KeptBetweenSteps_AnswerAsPoolingEveryBlock_Cpu/_Metal`). `TS_Q4E_QSA_POOL_CACHE=0` pools every block.
+- The selection mask comes from `ggml_top_k_mask` (one op for what was a fill, a scatter and an add over the whole
+  window), and decode steps and verify windows attend only the selected cells (`ggml_flash_attn_ext_set_n_kv_max`).
+  `TS_Q4E_QSA_SPARSE_FA=2` also does it for prompts; that was slower on an M5 Pro.
+- On unified memory 12% of the tier budget goes to window slots instead of profile-ranked fixed slots
+  (`TS_MOE_WINDOW_SHARE`). The window follows the text; the fixed slots follow other prompts.
+
+| pass (M5 Pro, ISTA `Q2_0`, tiered) | before | after |
+| --- | --- | --- |
+| 1 row after a 16K prompt, ggml segments (GPU) | 30.0 ms | 24.7 ms |
+| 4 rows, short context (window 0.3 -> 3.1 GB) | 52.8-59.0 ms (26-47 window reads) | 49.4-51.0 ms (14-19) |
+
+The same client, DFlash2 Q4_K_M, 15/15 (`df2-qsa`):
+
+| run | short chat decode | long-gen decode (code / prose answers) | 4K TTFT / decode | 16K TTFT / decode |
+| --- | --- | --- | --- | --- |
+| DFlash2, event seams + keep-alive | 18.8-19.8 | 37.8-39.5 (56.6-59.6 / 37.9-39.6) | 8.9-10.0 s / 42-56 | 41.6-47.3 s / 38-48 |
+| + QSA pooled keys, sparse decode attention, window share | 22.6-24.8 | 42.1-43.4 (63.1-69.7 / 42.2-43.5) | 8.9-9.6 s / 50-71 | 42.9-45.4 s / 54-66 |
+| Strata DFlash2 | 19 | 47.8 (53.7-55.2 / 47.6-48.0) | 6.32 s / 61 | 24.4 s / 61 |
+
+Short answers, code and long-context decoding now match or pass Strata; prose is ~10% behind. Prompt reading is what
+remains: a 4096-token chunk takes 8.2 s of compute at a short context (9.9 s at 16K), of which ~1 s is staging every
+expert of each layer before the GPU may compute it (`TS_HOST_MOE_TIMING=1`).
 
 ## Multi-GPU
 

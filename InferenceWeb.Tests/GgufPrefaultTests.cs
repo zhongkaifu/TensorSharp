@@ -153,6 +153,73 @@ public sealed class GgufPrefaultTests : IDisposable
         finally { Console.SetOut(original); }
     }
 
+    [Fact]
+    public void ACheckpointLargerThanTheBudgetStillWarmsItsEagerTensors()
+    {
+        // Three tensors against a two-tensor budget: before, nothing was warmed and every eagerly
+        // loaded weight arrived through serial page faults (505 s for Flash Next on geesefs).
+        using var file = new GgufFile(Write("constrained.gguf", false, 0,
+            "blk.0.ffn_up_exps.weight", "dense", "blk.0.ffn_down_exps.weight"));
+        try
+        {
+            GgufFile.AvailableMemoryOverrideForTests = 4L * TensorBytes;
+            file.PrefaultFileCache(null, info => !info.Name.Contains("_exps"), logProgress: false);
+        }
+        finally { GgufFile.AvailableMemoryOverrideForTests = null; }
+        Assert.Equal(TensorBytes, file.PrefaultReadBytes);
+        Assert.All(file.ReadTensorData(file.Tensors["dense"]), value => Assert.Equal((byte)18, value));
+        Assert.All(file.ReadTensorData(file.Tensors["blk.0.ffn_down_exps.weight"]), value => Assert.Equal((byte)19, value));
+    }
+
+    [Fact]
+    public void AnOversizedCheckpointWithoutAnEagerSubsetIsNotWarmed()
+    {
+        using var file = new GgufFile(Write("oversized.gguf", false, 0, "a", "b", "c"));
+        try
+        {
+            GgufFile.AvailableMemoryOverrideForTests = 4L * TensorBytes;
+            file.PrefaultFileCache(null, logProgress: false);
+        }
+        finally { GgufFile.AvailableMemoryOverrideForTests = null; }
+        Assert.Equal(0, file.PrefaultReadBytes);
+    }
+
+    [Fact]
+    public void ReadHandlesAreOpenedOnceAndOutliveEveryWarm()
+    {
+        // geesefs drops a file's whole page cache at each open(): later warms must reuse the
+        // handles opened before the first read instead of opening their own.
+        using var file = new GgufFile(Write("handles.gguf", false, 0, "a", "b"));
+        var handles = file.ReadHandles();
+        file.PrefaultFileCache();
+        Assert.True(file.TryGetTensorDataPointer(file.Tensors["b"], out IntPtr b));
+        Assert.Equal(TensorBytes, file.WarmMappedRanges(new[] { (b, (long)TensorBytes) }, 4));
+        Assert.Same(handles, file.ReadHandles());
+        Assert.All(handles, handle => Assert.False(handle.IsClosed));
+    }
+
+    [Fact]
+    public void WarmMappedRangesResolvesEachPointerToItsShardAndSkipsForeignMemory()
+    {
+        string first = Write("warm-00001-of-00002.gguf", true, 0, "first");
+        Write("warm-00002-of-00002.gguf", true, 1, "second");
+        using var file = new GgufFile(first);
+        Assert.True(file.TryGetTensorDataPointer(file.Tensors["first"], out IntPtr a));
+        Assert.True(file.TryGetTensorDataPointer(file.Tensors["second"], out IntPtr b));
+        Assert.True(file.TryResolveMapped(b, TensorBytes, out var owner, out long offset));
+        Assert.NotSame(file, owner);
+        Assert.True(offset > 0);
+        byte[] foreign = new byte[64];
+        unsafe
+        {
+            fixed (byte* p = foreign)
+            {
+                long read = file.WarmMappedRanges(new[] { (a, (long)TensorBytes), (b + 100, 1000L), ((IntPtr)p, 64L) }, 4);
+                Assert.Equal(TensorBytes + 1000L, read);
+            }
+        }
+    }
+
     private string Write(string name, bool split, int shard, params string[] tensors)
         => WriteSized(name, split, shard, TensorBytes, tensors);
 

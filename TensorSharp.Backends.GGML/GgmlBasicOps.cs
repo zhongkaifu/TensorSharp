@@ -3460,6 +3460,43 @@ namespace TensorSharp.GGML
         /// <summary>While set, a 2-8 row qwen4exp span keeps every row's recurrent state.</summary>
         public static void Qwen4ExpCaptureVerifyRows(bool enable) => GgmlNative.TSGgml_Qwen4ExpCaptureVerifyRows(enable ? 1 : 0);
 
+        /// <summary>Test probe of the TensorSharp Metal grouped expert kernels (tsm/tsm_moe.mm): one layer's held routes
+        /// (slot -1: a route the host computes) over stacked expert bytes, into <paramref name="output"/> [rows, hidden].</summary>
+        public static unsafe bool TsmMoeProbe(int gateType, int downType, int hidden, int nFf, int nExpert,
+            byte[] gate, byte[] up, byte[] down, int rows, int nUsed, int[] slots, float[] weights, float[] x, float[] output)
+        {
+            fixed (byte* g = gate) fixed (byte* u = up) fixed (byte* d = down)
+            fixed (int* s = slots) fixed (float* w = weights) fixed (float* xp = x) fixed (float* o = output)
+                return GgmlNative.TSGgml_TsmMoeProbe(gateType, downType, hidden, nFf, nExpert, (IntPtr)g, (IntPtr)u, (IntPtr)d,
+                    rows, nUsed, (IntPtr)s, (IntPtr)w, (IntPtr)xp, (IntPtr)o) != 0;
+        }
+
+        /// <summary>Test hook: the tiered seamed passes whose seams handed over on a shared event (tsm::seams_*) and ran
+        /// to the end in this process. 0 off Apple's Metal builds.</summary>
+        public static long TsmSeamPasses()
+        {
+            try { return GgmlNative.TSGgml_TsmSeamPasses(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Test hook: qwen4exp span steps whose QSA layers pooled only the blocks they completed (the pooled
+        /// keys kept between steps).</summary>
+        public static long Qwen4ExpQsaIncrementalSteps()
+        {
+            try { return GgmlNative.TSGgml_Qwen4ExpQsaIncrementalSteps(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>DFlash feature taps for the following qwen4exp spans on this thread: after each
+        /// <paramref name="layers"/>[i] (a completed-output layer id), the mean of its hyper-connection
+        /// streams lands in row r of <paramref name="output"/> at column i * n_embd, rows
+        /// <paramref name="rowStride"/> floats apart. A null output turns the taps off.</summary>
+        public static unsafe bool Qwen4ExpSetFeatureTaps(int[] layers, IntPtr output, int rowStride)
+        {
+            fixed (int* l = layers)
+                return GgmlNative.TSGgml_Qwen4ExpSetFeatureTaps((IntPtr)l, layers?.Length ?? 0, output, rowStride) != 0;
+        }
+
         /// <summary>Commit the state after <paramref name="row"/> of the last captured
         /// <paramref name="rows"/>-row verify into the live state buffers.</summary>
         public static bool Qwen4ExpCommitVerifyRow(int row, int rows) => GgmlNative.TSGgml_Qwen4ExpCommitVerifyRow(row, rows) != 0;
@@ -3521,6 +3558,29 @@ namespace TensorSharp.GGML
 
         /// <summary>Byte budget of the host expert cache; 0 turns it off.</summary>
         public static void HostExpertIoSetBudget(long bytes) => GgmlNative.TSGgml_HostExpertIoSetBudget(bytes);
+
+        /// <summary>Bytes macOS can give now without compressing or swapping anything (free,
+        /// purgeable and clean file-cache pages); -1 where it is not measured.</summary>
+        public static long HostAvailableMemoryBytes() => GgmlNative.TSGgml_HostAvailableMemoryBytes();
+
+        /// <summary>Process totals of MoE expert offload (TSGgml_MoeOffloadCounters): tier hits, window reads, host
+        /// overflow routes, background reads, adaptive swaps, host kernel ns, host kernel calls, host-computed slots,
+        /// explicit expert I/O bytes. Monotonic; touches no backend.</summary>
+        public static unsafe long[] MoeOffloadCounters()
+        {
+            var values = new long[9];
+            fixed (long* p = values)
+                GgmlNative.TSGgml_MoeOffloadCounters(p, values.Length);
+            return values;
+        }
+
+        /// <summary>Routed experts of up to 8 independent rows on the host, from expert stacks of
+        /// <paramref name="numExperts"/> experts (ggml's CPU dot products, as an offloaded layer computes them).
+        /// Slots with <paramref name="skip"/>[k] != 0 are left out. False for a shape or type it does not cover.</summary>
+        public static unsafe bool HostExpertRows(IntPtr gate, IntPtr up, IntPtr down, int gateType, int upType, int downType,
+            int numExperts, int hidden, int nFf, int nUsed, int rows, float* x, int* ids, float* weights, byte* skip, float* output)
+            => GgmlNative.TSGgml_HostExpertRows(gate, up, down, gateType, upType, downType, numExperts, hidden, nFf, nUsed, rows,
+                x, ids, weights, skip, output) != 0;
 
         public static void HostExpertIoUnregister(IntPtr baseAddress) => GgmlNative.TSGgml_HostExpertIoUnregister(baseAddress);
 

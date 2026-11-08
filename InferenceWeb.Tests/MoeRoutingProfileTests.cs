@@ -151,4 +151,17 @@ public sealed class MoeRoutingProfileTests : IDisposable
         Assert.Equal(expected, Qwen4ExpModel.ExpertTierBudgetOverride(value));
         Assert.Equal(expected, ModelBase.HostExpertIoBudgetOverride(value));
     }
+
+    /// <summary>TS_MOE_WINDOW_SHARE: the share of a unified-memory tier budget given to window slots, 0 to 0.9; anything
+    /// else (unset, negative, past 0.9, not a number) is the default.</summary>
+    [Theory]
+    [InlineData("0.25", 0.25)]
+    [InlineData("0", 0.0)]
+    [InlineData("0.9", 0.9)]
+    [InlineData("0.95", Qwen4ExpModel.DefaultWindowShare)]
+    [InlineData("-0.1", Qwen4ExpModel.DefaultWindowShare)]
+    [InlineData("abc", Qwen4ExpModel.DefaultWindowShare)]
+    [InlineData(null, Qwen4ExpModel.DefaultWindowShare)]
+    public void WindowShare_ParsesAFraction(string value, double expected)
+        => Assert.Equal(expected, Qwen4ExpModel.WindowShare(value));
 }

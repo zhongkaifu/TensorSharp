@@ -201,10 +201,12 @@
     <ReferenceNativeSymbol Include="TSGgml_GptOssSyncKvCacheToHost" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasBackendFailure" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasResidentDeviceCopy" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostAvailableMemoryBytes" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoRegister" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoSetBudget" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostExpertIoUnregister" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostMoeExpertCacheStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadBarrier" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexReductionF32" SymbolType="Function" />
@@ -260,6 +262,7 @@
     <ReferenceNativeSymbol Include="TSGgml_MoeHotTierRelease" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeHotTierStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeHotTierTotalBytes" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeOffloadCounters" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingCounts" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingRecordDevice" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingReset" SymbolType="Function" />
@@ -361,6 +364,7 @@
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaResetBatchedDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpAttnBlock" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCaptureVerifyRows" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpSetFeatureTaps" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCommitVerifyRow" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCopyQsaCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpFfnBlock" SymbolType="Function" />

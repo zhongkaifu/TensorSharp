@@ -724,13 +724,15 @@ namespace TensorSharp.Cuda
         /// type or shape that route would not send to a q8_1 kernel; the caller then takes
         /// <see cref="AddmmResidentToFloat32"/>.
         /// </summary>
+        /// <param name="stream">The stream to launch on; zero: the allocator's.</param>
         internal static bool TryResidentMatmulQ81(CudaAllocator allocator, IntPtr weightPtr, int ggmlType, IntPtr xq,
-            IntPtr resultPtr, int inDim, int outDim, int rows)
+            IntPtr resultPtr, int inDim, int outDim, int rows, IntPtr stream = default)
         {
             if (!ResidentMatmulTakesQ81(ggmlType, inDim, outDim, rows))
                 return false;
             CudaKernels kernels = allocator.Kernels;
-            IntPtr stream = allocator.Stream.Handle;
+            if (stream == IntPtr.Zero)
+                stream = allocator.Stream.Handle;
             if (ggmlType == 10 || ggmlType == 11)
                 kernels.LaunchQuantMatmulLowKDp4a(ggmlType, weightPtr, xq, resultPtr, inDim, outDim, rows, stream);
             else if (ggmlType == 14)

@@ -394,6 +394,24 @@ if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
     # operations, including temporary MPSGraphTensorData and grown staging buffers.
     set_source_files_properties(tsg_metal_mps_conv.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     set_source_files_properties(ggml_gemma4_audio_metal_precision.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    # TensorSharp Metal kernels (tsm/): grouped routed experts for the tiered MoE seams, ported from Strata's
+    # MIT kernels (tsm/LICENSE-STRATA). Embedded into the library at build time, compiled at run time.
+    set(TSM_KERNEL_FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/quant.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/units.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/moe.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_moe_glue.metal")
+    set(TSM_GGML_COMMON "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src/ggml-common.h")
+    set(TSM_SOURCE_INC "${CMAKE_CURRENT_BINARY_DIR}/tsm_moe_source.inc")
+    string(REPLACE ";" "\\;" TSM_KERNEL_FILES_ARG "${TSM_KERNEL_FILES}")
+    add_custom_command(OUTPUT "${TSM_SOURCE_INC}"
+        COMMAND ${CMAKE_COMMAND} -DOUT=${TSM_SOURCE_INC} -DGGML_COMMON=${TSM_GGML_COMMON}
+                "-DFILES=${TSM_KERNEL_FILES_ARG}" -P "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
+        DEPENDS ${TSM_KERNEL_FILES} "${TSM_GGML_COMMON}" "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
+        COMMENT "Embedding the TensorSharp Metal kernels")
+    list(APPEND TSG_GGMLOPS_SOURCES tsm/tsm_moe.mm "${TSM_SOURCE_INC}")
+    set_source_files_properties(tsm/tsm_moe.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
+        OBJECT_DEPENDS "${TSM_SOURCE_INC}")
 endif()
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)
@@ -532,6 +550,7 @@ endif()
 target_include_directories(GgmlOps PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src"
+    "${CMAKE_CURRENT_BINARY_DIR}"
 )
 target_link_libraries(GgmlOps PRIVATE ggml ${CMAKE_DL_LIBS})
 

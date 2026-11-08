@@ -634,6 +634,54 @@ staging 以 64 MiB 为单位分组；单张更大的表沿用此前的一表分�
 而不是一次明确的请求；启动时会逐个列出它作用到的设备。在你的硬件上实测之前，请把它
 当作可移植性与正确性通道。
 
+#### 路由专家全部放在主机上的 `ggml_metal`
+
+在放不下路由专家的 Mac 上（`--cpu-moe`），它们不再作为读取 GGUF 映射的 ggml CPU 算子
+运行。CPU 通道用 TensorSharp 的主机 decode 内核计算它们（`TS_DSV41_HOST_LANE=0` 恢复
+ggml 链路）；在 Apple 上，专家切片被显式读入 RAM 缓存，做法与 Strata 的 Mac 引擎流式
+读取专家相同：
+
+- **读取。** 未命中的切片用并行 `pread` 读取（`TS_HOST_MOE_IO_THREADS`），带
+  `F_NOCACHE` 并关闭内核预读。只用 `F_NOCACHE` 时，预读仍会把每次读取的约一半放进文件
+  缓存，进而把其他内容都挤进压缩器。
+- **锁定的缓存。** 缓存（`TS_HOST_MOE_IO_CACHE_GB`，默认为扣除保留量与已上传权重后剩余
+  RAM 的 3/4）用 `mlock` 锁定在内存中（`TS_HOST_MOE_IO_WIRE=0` 让它保持可换页）。专家权重
+  的压缩比只有约 1.2:1，macOS 压缩一个未锁定的槽位腾不出多少内存，之后每次命中还要先解压。
+- **Prefill** 按 8 行分块走这条通道，前一块计算时读取下一块的专家。**Decode** 把下一层的
+  路由器作用在本层的 FFN 输入上，预测下一层的专家（Strata 的 look-ahead，
+  `TS_DSV41_LOOKAHEAD=0` 关闭），并在本层计算时读入它们。
+
+测量环境：48 GiB M5 Pro，同时开着其他应用；UD-IQ2_XXS；23 token 的代码提示词，生成
+96 个 token，贪心解码，每次运行一个进程：
+
+| 配置 | 首 token 时间 | Decode |
+|---|---:|---:|
+| ggml CPU 链路（`TS_DSV41_HOST_LANE=0`） | 17.6 s | 每 token 797-856 ms |
+| CPU 通道，缓存未锁定 | 6.8-7.5 s | 每 token 977-1,278 ms |
+| CPU 通道，缓存锁定（默认） | 10.6 s | 每 token 453 ms |
+
+未锁定时，21 GB 缓存中有 15-17 GB 待在压缩器里；锁定后只有 0.15 GB。所有配置生成的文本
+完全相同。在 `n_ctx` 256 下对评测文本的 512 个 token 计算困惑度：ggml 链路 10.83，
+decode 走通道 10.89，prefill 与 decode 都走通道 10.92，处在各分块得分的运行间波动范围内。
+在 C# 构造、形状与 1017 相同的检查点上逐次调用比较（`InferenceWeb.Tests` 的
+`Dsv41MetalCpuLaneTests`：37 token 的 prefill、若干 decode 步和一次 3 token 的追加），通道的
+logits 与 ggml 链路的相对误差在 1.5e-5（prefill）到 1.9e-3（decode）之间，argmax 相同。
+
+部分 V4.1 专属算子（压缩器、索引器、Engram 查表）在 Metal 上没有内核，仍在 CPU 后端运行，
+每次一趟主机往返；这条路径接下来的瓶颈是它们，而不是专家。
+
+#### 主机专家超出内存时的 `ggml_cuda`
+
+当留在主机上的路由专家（`--n-cpu-moe N`）超过进程可常驻内存的 0.6 倍时，`ggml_cuda` 也使用同一条 lane。Linux 上这个上限是 cgroup
+限制，而不是整机内存。否则这些主机专家会作为 ggml CPU 算子运行在一个不断被内核换出的内存映射上。`TS_DSV41_HOST_LANE=1` 强制启用
+lane，`0` 保留 ggml 算子链。非 Apple 平台上，缓存按同一上限确定大小。专家文件以 `POSIX_FADV_RANDOM` 打开，lookahead 除 F32 路由器外
+也接受 ISTA-DASLab 文件中的 BF16 路由器。
+
+在 RTX 5090 容器（内存上限 93 GB，两边都从网络文件系统读取模型）上与 Strata 并排测量，使用 ISTA-DASLab 的 `GSQ-RCO-IQ2_XXS`、
+`--n-cpu-moe 34`：lane 承担 102.9 GiB 主机专家，缓存 51.1 GiB。启动用时 2.3 分钟，第一个请求因所有专家都要冷读，首 token 用了
+151 s。热态请求为 0.9-1.4 tok/s、首 token 8-15 s；Strata 启动用时 10.5 分钟，之后为 0.7-1.3 tok/s、6-12 s。两个引擎都以文件系统
+约 33 MB/s 的速度读取专家，因此这测的是存储，并不说明任何一方计算路径的性能。
+
 `--backend cpu` 根本不是 ggml 后端：它是纯 C# 的 `DeepSeek4CpuExecutor`，不依赖任何
 原生库，也不需要 GPU，并且实现了完整的 V4.1 计算图——比例 1 与比例 2 的块压缩器、
 共享的压缩 cache 与索引器 cache（含 lightning indexer 的 top-k）、候选块剪枝、
@@ -714,7 +762,7 @@ deepseek41.engram.pad_id` 失败。
 
 Direct CUDA 引擎还会在上传任何数据之前，按实际执行位置检查每个路由专家张量。它的 GPU 专家
 内核与 GLM-5.3-Flash、Qwen3.8 的 Direct 引擎共用，在所有路径上（逐 token 解码内核，以及 prefill
-的 tensor core、寄存器暂存与逐行 warp 内核）实现了 Q8_0、Q6_K、Q5_K、Q5_1、Q4_K、Q3_K、Q2_K、
+的 tensor core、寄存器暂存与逐行 warp 内核）实现了 Q8_0、Q6_K、Q5_K、Q5_1、Q4_K、Q3_K、Q2_K、Q2_0、
 IQ4_XS、IQ4_NL、IQ3_S、IQ3_XXS、IQ2_S、IQ2_XS、IQ2_XXS、IQ1_S 与 MXFP4。这覆盖了 1017
 `UD-IQ2_XXS` 文件的全部路由专家类型：gate/up 为 IQ1_S（10 层）、IQ2_S（15 层）与 IQ2_XXS（15 层），
 down 为 IQ2_S（15）、IQ3_XXS（15）、IQ2_XS（6）、IQ2_XXS（3）与 Q2_K（1）。用 `--n-cpu-moe`

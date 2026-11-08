@@ -158,6 +158,7 @@ namespace TensorSharp.Cuda
             foreach (var r in rows)
                 r.Failed = true;
             _rowsInFlight = n;
+            ArmHostExperts();
             try
             {
                 ForwardUbatch(null, tokens, 0, n, 0, logits, rows, positions);
@@ -166,6 +167,8 @@ namespace TensorSharp.Cuda
             {
                 _rowsInFlight = 0;
             }
+            CheckHostExperts(n);
+            AdaptResidency();
             foreach (var r in rows)
             {
                 r.NPast++;

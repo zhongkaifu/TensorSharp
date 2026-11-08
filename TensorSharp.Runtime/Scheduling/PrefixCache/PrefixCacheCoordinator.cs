@@ -514,15 +514,26 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             GetSpans(sequence));
         if (node.EndState is not null) return;
         string key = _tree.MintKey();
-        bool captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out var footprint);
-        if (!captured && ReleaseOldestScopedPayload())
-            captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
-        if (!captured)
+        // The new node holds no payload yet. Freeing room below can evict a payload in its subtree, and that
+        // eviction cascades through every childless payload-less parent: it returned this node to the pool,
+        // whose parent-less husk then read as the root at Publish ("End states attach to non-root nodes").
+        // The path lock keeps it in the tree until it is published; the release collects it if it was not.
+        LockReceipt guard = _tree.AcquirePath(node);
+        bool published;
+        PayloadFootprint footprint;
+        try
         {
-            _tree.CollectIfEmpty(node);
-            return;
+            bool captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
+            if (!captured && ReleaseOldestScopedPayload())
+                captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
+            if (!captured) return;
+            published = Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy);
         }
-        if (Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy) && publicBoundary)
+        finally
+        {
+            _tree.Release(ref guard);
+        }
+        if (published && publicBoundary)
             SaveCheckpoint(sequence, key, length, footprint);
         Trim();
     }
@@ -546,6 +557,20 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             RegisterPrimary(node, payloadKey, length);
             return false; // The live primary still belongs to the executor, not a retained holder.
         }
+        // As in CaptureCheckpoint: an eviction below this payload-less node would return it to the pool.
+        LockReceipt guard = _tree.AcquirePath(node);
+        try
+        {
+            return RetainFinishedLocked(sequence, primary, node, payloadKey, length);
+        }
+        finally
+        {
+            _tree.Release(ref guard);
+        }
+    }
+
+    private bool RetainFinishedLocked(SequenceState sequence, bool primary, RadixNode node, string payloadKey, int length)
+    {
         bool captured = RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
             && _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
         if (!captured && RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None

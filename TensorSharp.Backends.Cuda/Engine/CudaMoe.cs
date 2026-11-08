@@ -14,6 +14,32 @@ using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
 {
+    /// <summary>
+    /// One device's expert staging (expert residency): experts a call selects that have no VRAM slot are
+    /// copied into <see cref="Staging"/> (at most <see cref="Capacity"/> per call) and their table entries
+    /// point there for the call. Device buffers: StageOf [nExpert] (-1 between calls), StageList
+    /// [Capacity], StageCount [1].
+    /// </summary>
+    internal sealed class CudaExpertStage
+    {
+        public IntPtr StageOf, StageList, StageCount, Staging;
+        public long Stride;
+        public int Capacity;
+    }
+
+    /// <summary>One layer's view for staging: its tables, which experts live in host memory, tables of each
+    /// expert's device-mapped host copy (what staging copies from) and of the address each table entry
+    /// returns to after a call (the host copy, or the zero expert when the host computes missed experts),
+    /// per-expert bytes, and where up/down sit in a staging slot.</summary>
+    internal struct CudaExpertStageLayer
+    {
+        public IntPtr IsHost, TabGate, TabUp, TabDown, SrcTabGate, SrcTabUp, SrcTabDown, RestTabGate, RestTabUp, RestTabDown;
+        public long BytesGate, BytesUp, BytesDown, OffUp, OffDown;
+        /// <summary>Whether calls stage this layer's missed experts (expert sizes in whole 16-byte units).</summary>
+        public bool Staged;
+        public bool IsValid => IsHost != IntPtr.Zero;
+    }
+
     /// <summary>One device's routed-expert scratch, sized for a ubatch.</summary>
     internal sealed class CudaMoeScratch
     {
@@ -82,11 +108,11 @@ namespace TensorSharp.Cuda
         // ggml type ids of the expert weights the kernels take.
         private const int TQ5_1 = 7, TQ8_0 = 8, TQ2_K = 10, TQ3_K = 11, TQ4_K = 12, TQ5_K = 13, TQ6_K = 14,
             TIQ2_XXS = 16, TIQ2_XS = 17, TIQ3_XXS = 18, TIQ1_S = 19, TIQ4_NL = 20, TIQ3_S = 21, TIQ2_S = 22,
-            TIQ4_XS = 23, TMXFP4 = 39;
+            TIQ4_XS = 23, TMXFP4 = 39, TQ2_0 = 42;
 
         /// <summary>Every expert layout the kernels decode, as a refusal lists them.</summary>
         public const string SupportedExpertTypes =
-            "Q8_0, Q6_K, Q5_K, Q5_1, Q4_K, Q3_K, Q2_K, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, MXFP4";
+            "Q8_0, Q6_K, Q5_K, Q5_1, Q4_K, Q3_K, Q2_K, Q2_0, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, MXFP4";
 
         /// <summary>The layouts whose decoders came with the module's low-bit IQ marker
         /// (<see cref="Dsv4Kernels.DecodesLowBitIqExperts"/>): IQ1_S and IQ2_S on every route, IQ2_XXS
@@ -102,16 +128,17 @@ namespace TensorSharp.Cuda
         /// fallback its 1,823-token prefill ran at 500 tok/s on two A40s, against ggml-cuda's
         /// 1,174-1,217 and 1,612 once these kernels took the two layouts. Q5_1 is its UD-Q4_K_XL's
         /// down projection in 43 of 48 layers.</summary>
-        public static bool GroupedSupportsType(int type, bool decodesLowBitIq = false)
+        public static bool GroupedSupportsType(int type, bool decodesLowBitIq = false, bool decodesLegacy = false)
             => type == TIQ3_S || type == TMXFP4 || type == TQ8_0 || type == TQ6_K || type == TQ5_K || type == TQ4_K
                 || type == TQ3_K || type == TQ2_K || type == TIQ4_NL || type == TIQ4_XS
                 || type == TIQ2_XS || type == TIQ3_XXS || type == TQ5_1
-                || (decodesLowBitIq && LowBitIqType(type));
+                || (decodesLowBitIq && LowBitIqType(type))
+                || (decodesLegacy && type == TQ2_0);
 
         /// <summary>Whether some expert route of a module built from the current kernel source decodes
         /// this layout (<see cref="SupportedExpertTypes"/>); <see cref="RequireExpertDecoders"/> answers
         /// for the module actually loaded.</summary>
-        public static bool SupportsExpertType(int type) => GroupedSupportsType(type, decodesLowBitIq: true);
+        public static bool SupportsExpertType(int type) => GroupedSupportsType(type, decodesLowBitIq: true, decodesLegacy: true);
 
         /// <summary>The kernels <see cref="Experts"/> runs a ubatch on.</summary>
         internal enum ExpertRoute { PerSlot, TensorCore, Staged, Warp }
@@ -124,11 +151,12 @@ namespace TensorSharp.Cuda
         /// <see cref="GroupedSupportsType"/> grants this module.
         /// </summary>
         internal static ExpertRoute SelectRoute(int nt, int perSlotMaxRows, bool hasMoeMma, bool decodesLowBitIq,
-            int guType, int downType, int e, int ff)
+            int guType, int downType, int e, int ff, bool decodesLegacy = false)
         {
             if (nt <= perSlotMaxRows)
                 return ExpertRoute.PerSlot;
-            bool grouped = GroupedSupportsType(guType, decodesLowBitIq) && GroupedSupportsType(downType, decodesLowBitIq);
+            bool grouped = GroupedSupportsType(guType, decodesLowBitIq, decodesLegacy)
+                && GroupedSupportsType(downType, decodesLowBitIq, decodesLegacy);
             // hasMoeMma: from the committed compute_75 PTX the tensor-core kernel compiles to an
             // empty body and would leave ffnOut unwritten; the staged route serves those builds.
             if (grouped && hasMoeMma && e % Dsv4Kernels.MoeMmaK == 0 && ff % Dsv4Kernels.MoeMmaK == 0)
@@ -181,9 +209,10 @@ namespace TensorSharp.Cuda
         /// on such a module's warp-per-row kernels. Every device loads the same module file.
         /// </summary>
         public static void RequireExpertDecoders(string tag, bool decodesQ5_1, int layer,
-            in CudaWeightDesc gate, in CudaWeightDesc up, in CudaWeightDesc down, bool decodesLowBitIq = false)
+            in CudaWeightDesc gate, in CudaWeightDesc up, in CudaWeightDesc down, bool decodesLowBitIq = false,
+            bool decodesLegacy = false)
         {
-            if (decodesQ5_1 && decodesLowBitIq)
+            if (decodesQ5_1 && decodesLowBitIq && decodesLegacy)
                 return;
             foreach ((CudaWeightDesc w, string role) in new[] { (gate, "gate"), (up, "up"), (down, "down") })
             {
@@ -191,6 +220,7 @@ namespace TensorSharp.Cuda
                 {
                     TQ5_1 => decodesQ5_1,
                     TIQ1_S or TIQ2_S => decodesLowBitIq,
+                    TQ2_0 => decodesLegacy,
                     _ => true,
                 };
                 if (!decoded)
@@ -215,7 +245,7 @@ namespace TensorSharp.Cuda
             10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K", 14 => "Q6_K", 15 => "Q8_K",
             16 => "IQ2_XXS", 17 => "IQ2_XS", 18 => "IQ3_XXS", 19 => "IQ1_S", 20 => "IQ4_NL", 21 => "IQ3_S",
             22 => "IQ2_S", 23 => "IQ4_XS", 24 => "I8", 25 => "I16", 26 => "I32", 27 => "I64", 28 => "F64",
-            29 => "IQ1_M", 30 => "BF16", 34 => "TQ1_0", 35 => "TQ2_0", 39 => "MXFP4", 40 => "NVFP4",
+            29 => "IQ1_M", 30 => "BF16", 34 => "TQ1_0", 35 => "TQ2_0", 39 => "MXFP4", 40 => "NVFP4", 42 => "Q2_0",
             _ => $"type {type}",
         };
 
@@ -230,11 +260,32 @@ namespace TensorSharp.Cuda
         public static void Experts(Dsv4Kernels dk, CudaKernels kernels, CudaMoeScratch s,
             in DeviceWeight gate, in DeviceWeight up, in DeviceWeight down,
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
-            int perSlotMaxRows, IntPtr stream, bool? fused = null)
+            int perSlotMaxRows, IntPtr stream, bool? fused = null,
+            CudaExpertStage stage = null, in CudaExpertStageLayer stageLayer = default, IntPtr shDownReady = default)
         {
             int guType = gate.Type, downType = down.Type;
             int slots = nt * nUsed;
-            ExpertRoute route = SelectRoute(nt, perSlotMaxRows, dk.HasMoeMma, dk.DecodesLowBitIqExperts, guType, downType, e, ff);
+            bool staging = stage != null && stageLayer.IsValid && stageLayer.Staged;
+            if (staging)
+            {
+                dk.MoeStagePlan(s.Sel, slots, stageLayer, stage, stream);
+                dk.MoeStageCopy(stageLayer, stage, slots, stream);
+            }
+            RunExperts(dk, kernels, s, gate, up, down, cur, shDown, ffnOut, nt, nUsed, nExpert, e, ff, clamp,
+                perSlotMaxRows, stream, fused, shDownReady);
+            if (staging)
+                dk.MoeUnstage(stageLayer, stage, stream);
+        }
+
+        private static void RunExperts(Dsv4Kernels dk, CudaKernels kernels, CudaMoeScratch s,
+            in DeviceWeight gate, in DeviceWeight up, in DeviceWeight down,
+            Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
+            int perSlotMaxRows, IntPtr stream, bool? fused, IntPtr shDownReady = default)
+        {
+            int guType = gate.Type, downType = down.Type;
+            int slots = nt * nUsed;
+            ExpertRoute route = SelectRoute(nt, perSlotMaxRows, dk.HasMoeMma, dk.DecodesLowBitIqExperts, guType, downType, e, ff,
+                dk.DecodesLegacyQuants);
             bool perSlot = route == ExpertRoute.PerSlot;
             bool mma = route == ExpertRoute.TensorCore;
             bool staged = route == ExpertRoute.Staged;
@@ -246,9 +297,12 @@ namespace TensorSharp.Cuda
             if (perSlot)
             {
                 dk.MoeGateUpDecode(gate.Ptr, up.Ptr, s.ActQ8A, s.Sel, s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes,
-                    nt, nUsed, stream);
+                    nt, nUsed, stream, gate.Table, up.Table);
                 SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.ActQ8B, null, ff, slots, clamp, stream, fused);
-                dk.MoeDownDecode(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, downType, e, ff, down.RowBytes, slots, stream);
+                dk.MoeDownDecode(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, downType, e, ff, down.RowBytes, slots, stream, down.Table);
+                // A shared expert computed on another stream (a fork in the caller's step) joins here, where its output is read.
+                if (shDownReady != IntPtr.Zero)
+                    CudaDriverApi.cuStreamWaitEvent(stream, shDownReady, 0).ThrowOnError();
                 dk.MoeScatterAdd(s.ExpDown, null, s.SelW, shDown, ffnOut, nt, nUsed, e, stream);
                 return;
             }
@@ -262,29 +316,31 @@ namespace TensorSharp.Cuda
             if (mma)
             {
                 dk.MoeMma(gate.Ptr, up.Ptr, cur, s.Counts, s.Offsets, s.SlotToken,
-                    s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes, nExpert, stream);
+                    s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes, nExpert, stream, gate.Table, up.Table);
                 SwigluClamp(s.ExpGate, s.ExpUp, (long)slots * ff, clamp);
                 dk.MoeMma(down.Ptr, IntPtr.Zero, s.ExpGate, s.Counts, s.Offsets, null,
-                    s.ExpDown, null, downType, e, ff, down.RowBytes, nExpert, stream);
+                    s.ExpDown, null, downType, e, ff, down.RowBytes, nExpert, stream, down.Table);
             }
             else if (staged)
             {
                 // Staged-weight kernels decode each expert weight row once into registers and
                 // reuse it across the expert's member tokens.
                 dk.MoeGateUpStaged(gate.Ptr, up.Ptr, s.SplitQsA, s.SplitDA, s.Counts, s.Offsets, s.SlotToken,
-                    s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes, nExpert, stream);
+                    s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes, nExpert, stream, gate.Table, up.Table);
                 SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.SplitQsB, s.SplitDB, ff, slots, clamp, stream, fused);
                 dk.MoeDownStaged(down.Ptr, s.SplitQsB, s.SplitDB, s.Counts, s.Offsets, s.ExpDown,
-                    downType, e, ff, down.RowBytes, nExpert, stream);
+                    downType, e, ff, down.RowBytes, nExpert, stream, down.Table);
             }
             else
             {
                 dk.MoeGateUp(gate.Ptr, up.Ptr, s.ActQ8A, s.Counts, s.Offsets, s.SlotToken,
-                    s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes, nExpert, stream);
+                    s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes, nExpert, stream, gate.Table, up.Table);
                 SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.ActQ8B, null, ff, slots, clamp, stream, fused);
                 dk.MoeDown(down.Ptr, s.ActQ8B, s.Counts, s.Offsets, s.ExpDown,
-                    downType, e, ff, down.RowBytes, nExpert, stream);
+                    downType, e, ff, down.RowBytes, nExpert, stream, down.Table);
             }
+            if (shDownReady != IntPtr.Zero)
+                CudaDriverApi.cuStreamWaitEvent(stream, shDownReady, 0).ThrowOnError();
             dk.MoeScatterAdd(s.ExpDown, s.RowOfSlot, s.SelW, shDown, ffnOut, nt, nUsed, e, stream);
         }
 

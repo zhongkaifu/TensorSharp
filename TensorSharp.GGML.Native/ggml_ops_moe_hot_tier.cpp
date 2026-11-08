@@ -34,6 +34,12 @@
 // ============================================================================
 
 #include "ggml_ops_internal.h"
+#if defined(TSG_GGML_USE_METAL)
+#include "tsm/tsm_moe.h"
+#endif
+
+// ggml_ops_moe_expert_io.cpp
+TSG_EXPORT void TSGgml_HostExpertIoStats(long long* stats4);
 #include "ggml-backend.h"
 
 #include <algorithm>
@@ -62,8 +68,15 @@ namespace tsg
         std::mutex g_count_mutex;
         std::unordered_map<const void*, std::vector<std::uint64_t>> g_counts;
 
+        // Totals of tiers already freed (under g_tier_mutex), so the process counters stay monotonic
+        // across a model's unload: TSGgml_MoeOffloadCounters reports retired + live.
+        std::uint64_t g_retired_hits = 0, g_retired_misses = 0, g_retired_overflow = 0, g_retired_deferred = 0;
+
         void free_tier(MoeHotTier& tier)
         {
+            g_retired_hits += tier.hits; g_retired_misses += tier.misses;
+            g_retired_overflow += tier.overflow; g_retired_deferred += tier.deferred;
+            tier.hits = tier.misses = tier.overflow = tier.deferred = 0;
             if (tier.buffer != nullptr)
             {
                 // A graph replayed after this point would read freed memory; the
@@ -129,6 +142,15 @@ namespace tsg
             ggml_set_output(t);
             return t;
         };
+#if defined(TSG_GGML_USE_METAL)
+        // A decode step or verify window on Metal: the seam computes the held routes itself (tsm_moe), each slot's
+        // rows read once for every row of the window that routes to it.
+        if (tsm::moe_supported(g_backend, tier, hm.hidden, hm.n_ff, T, n_used))
+        {
+            hm.tsm_hot = pinned_input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hm.hidden, T));
+            return hm.tsm_hot;
+        }
+#endif
         hm.hot_slot = pinned_input(ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, T));
         hm.hot_weight = pinned_input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, T));
         ggml_tensor* w[3] = {
@@ -160,7 +182,11 @@ namespace tsg
         // waits for those reads.
         const bool overlap = overlap_routes > 0 && graph != nullptr && wait_out != nullptr
             && tier.count > tier.fixed && tier.cpu_visible && tier.count >= n_used + overlap_routes;
-        if (!overlap) return sum;
+        if (!overlap)
+        {
+            hm.hot_out = sum;
+            return sum;
+        }
         ggml_build_forward_expand(graph, sum);       // the first group precedes the cut
         *wait_out = HostMoeSegment{};
         wait_out->io_wait = true;
@@ -173,6 +199,108 @@ namespace tsg
         return ggml_add(ctx, sum, routes(hm.hot_slot_b, hm.hot_weight_b, overlap_routes));
     }
 
+    // ---- adaptive fixed slots (Strata's adaptive expert cache) -------------------------
+    // A tier's fixed slots come from the routing profile: the long-run hottest experts, which
+    // need not be this conversation's. Measured on an RTX 5090 (UD-Q2_K_XL, 23 GB of slots):
+    // the same prompts decoded 10-40% faster once the profile had seen them. So on discrete
+    // VRAM, where a tier has no window, the seams keep a decayed route count per expert and
+    // every kAdaptEvery calls swap up to kAdaptSwaps clearly hotter host-served experts into
+    // the coldest slots, copied from the (warm) mapping between segments. The slots' bytes
+    // change, their addresses do not, so built graphs stay valid. A route's numerics follow
+    // its placement (slot: the accelerator's kernels; host: the decode kernel), so with this
+    // on, greedy text depends on what was generated before. TS_MOE_TIER_ADAPT=1 turns it on.
+    namespace
+    {
+        constexpr int kAdaptEvery = 32;        // seam calls of a layer between rounds
+        constexpr int kAdaptSwaps = 2;         // at most this many swaps a layer a round
+        constexpr float kAdaptDecay = 0.75f;   // per round
+        constexpr float kAdaptPrior = 4.0f;    // a profile-chosen slot's starting heat
+        constexpr float kAdaptMinHeat = 2.0f;  // an incoming expert's evidence floor
+        constexpr float kAdaptMargin = 1.5f;   // incoming heat > margin x outgoing + 1
+        // Every layer's swaps since the last release: the tiers themselves are freed when
+        // their mapping is dropped, before the model reports.
+        std::atomic<std::uint64_t> g_adapt_swaps{0};
+        std::atomic<std::uint64_t> g_adapt_swaps_total{0};   // never reset (telemetry)
+
+        // On unless TS_MOE_TIER_ADAPT=0. Read per call (one getenv a layer a step), so a test
+        // process can toggle it.
+        bool tier_adapt_enabled()
+        {
+            const char* e = std::getenv("TS_MOE_TIER_ADAPT");
+            return e == nullptr || e[0] != '0';
+        }
+
+        void tier_copy_expert(MoeHotTier& tier, int expert, int slot)
+        {
+            auto* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(tier.buffer));
+            for (int p = 0; p < 3; ++p)
+            {
+                ggml_tensor view{};
+                view.type = GGML_TYPE_I8;
+                view.ne[0] = static_cast<std::int64_t>(tier.stride[p]) * tier.count;
+                view.ne[1] = view.ne[2] = view.ne[3] = 1;
+                view.nb[0] = 1; view.nb[1] = view.nb[2] = view.nb[3] = static_cast<std::size_t>(view.ne[0]);
+                view.buffer = tier.buffer;
+                view.data = base + tier.offset[p];
+                const auto* src = static_cast<const std::uint8_t*>(tier.source[p])
+                    + static_cast<std::size_t>(expert) * tier.stride[p];
+                ggml_backend_tensor_set(&view, src, static_cast<std::size_t>(slot) * tier.stride[p], tier.stride[p]);
+            }
+        }
+
+        void tier_adapt(MoeHotTier& tier, const std::int32_t* ids, std::size_t routes)
+        {
+            if (tier.cpu_visible || tier.fixed <= 0 || tier.fixed >= tier.num_experts) return;
+            if (tier.heat.empty())
+            {
+                tier.heat.assign(tier.num_experts, 0.0f);
+                for (int s = 0; s < tier.fixed; ++s)
+                    if (tier.expert_of[s] >= 0) tier.heat[tier.expert_of[s]] = kAdaptPrior;
+            }
+            for (std::size_t i = 0; i < routes; ++i) tier.heat[ids[i]] += 1.0f;
+            if (++tier.adapt_calls % kAdaptEvery != 0) return;
+            // The hottest experts without a slot, and the coldest slots, kAdaptSwaps of each.
+            int in[kAdaptSwaps], out[kAdaptSwaps];
+            for (int k = 0; k < kAdaptSwaps; ++k) in[k] = out[k] = -1;
+            for (int e = 0; e < tier.num_experts; ++e)
+            {
+                if (tier.slot_of[e] >= 0) continue;
+                for (int k = 0; k < kAdaptSwaps; ++k)
+                    if (in[k] < 0 || tier.heat[e] > tier.heat[in[k]])
+                    {
+                        for (int j = kAdaptSwaps - 1; j > k; --j) in[j] = in[j - 1];
+                        in[k] = e;
+                        break;
+                    }
+            }
+            for (int s = 0; s < tier.fixed; ++s)
+            {
+                const int e = tier.expert_of[s];
+                for (int k = 0; k < kAdaptSwaps; ++k)
+                    if (out[k] < 0 || tier.heat[e] < tier.heat[tier.expert_of[out[k]]])
+                    {
+                        for (int j = kAdaptSwaps - 1; j > k; --j) out[j] = out[j - 1];
+                        out[k] = s;
+                        break;
+                    }
+            }
+            for (int k = 0; k < kAdaptSwaps; ++k)
+            {
+                if (in[k] < 0 || out[k] < 0) break;
+                const int slot = out[k], incoming = in[k], outgoing = tier.expert_of[slot];
+                if (tier.heat[incoming] < kAdaptMinHeat || tier.heat[incoming] <= kAdaptMargin * tier.heat[outgoing] + 1.0f)
+                    break;
+                tier_copy_expert(tier, incoming, slot);
+                tier.slot_of[outgoing] = -1;
+                tier.slot_of[incoming] = slot;
+                tier.expert_of[slot] = incoming;
+                g_adapt_swaps.fetch_add(1, std::memory_order_relaxed);
+                g_adapt_swaps_total.fetch_add(1, std::memory_order_relaxed);
+            }
+            for (float& h : tier.heat) h *= kAdaptDecay;
+        }
+    }
+
     bool host_moe_split_hot_routes(const HostMoeSegment& hm, const std::int32_t* ids, const float* weights,
         std::vector<std::int32_t>& cold_ids, std::vector<float>& cold_weights, std::vector<std::uint8_t>& cold_pad,
         int& cold_used)
@@ -182,6 +310,8 @@ namespace tsg
         const std::size_t routes = static_cast<std::size_t>(T) * n_used;
         for (std::size_t i = 0; i < routes; ++i)
             if (ids[i] < 0 || ids[i] >= tier.num_experts) return false;
+        // Between segments: nothing the accelerator still runs reads the slots.
+        if (tier_adapt_enabled()) tier_adapt(tier, ids, routes);
 
         // Window: give every routed expert that has no slot one, evicting the
         // least recently used window slot this step does not use, and read all
@@ -342,8 +472,27 @@ namespace tsg
             }
             cold_used = std::max(cold_used, s_cold_count[r]);
         }
+#if defined(TSG_GGML_USE_METAL)
+        if (hm.tsm_hot != nullptr)
+        {
+            // Every route the tier holds now (the window's reads above are complete): its slot; the rest -1, which
+            // the host computes below.
+            static thread_local std::vector<std::int32_t> s_tsm_slots;
+            s_tsm_slots.resize(routes);
+            for (std::size_t i = 0; i < routes; ++i) s_tsm_slots[i] = tier.slot_of[ids[i]];
+            // A seamed pass enqueued this seam's kernels ahead: the plan is all they still need.
+            if (tsm::seams_active())
+                tsm::seams_write_plan(hm.hidden, hm.n_ff, T, n_used, s_tsm_slots.data(), weights);
+            else if (!tsm::moe_encode(g_backend, tier, hm.moe_in, hm.tsm_hot, hm.hidden, hm.n_ff, T, n_used,
+                    s_tsm_slots.data(), weights))
+                return false;
+        }
+        else
+#endif
+        {
         ggml_backend_tensor_set(hm.hot_slot, s_slots.data(), 0, routes * sizeof(std::int32_t));
         ggml_backend_tensor_set(hm.hot_weight, s_hot_w.data(), 0, routes * sizeof(float));
+        }
         if (hm.hot_b > 0)
         {
             ggml_backend_tensor_set(hm.hot_slot_b, s_slots_b.data(), 0, routes_b * sizeof(std::int32_t));
@@ -384,6 +533,13 @@ namespace tsg
     void moe_hot_tier_release()
     {
         std::lock_guard<std::mutex> lock(g_tier_mutex);
+        const std::uint64_t swaps = g_adapt_swaps.exchange(0, std::memory_order_relaxed);
+        if (tier_adapt_enabled())
+        {
+            const char* e = std::getenv("TS_MOE_TIER_STATS");
+            if (e != nullptr && e[0] == '1')
+                std::fprintf(stderr, "[moe-tier] adaptive slots: %llu swaps\n", static_cast<unsigned long long>(swaps));
+        }
         for (auto& tier : g_tiers) free_tier(*tier);
         g_tiers.clear();
         g_tier_bytes = 0;
@@ -615,6 +771,44 @@ TSG_EXPORT void TSGgml_MoeHotTierRelease(const void* gate)
         }
         else ++it;
     }
+}
+
+// Process totals of MoE expert offload, monotonic across model unloads, for telemetry
+// (tensorsharp.moe.* instruments). Touches no backend, only TensorSharp's own counters:
+//   [0] routes the accelerator tiers held (fixed + window hits)
+//   [1] routes whose expert a window slot read from storage first (window misses)
+//   [2] routes computed by the host instead (tier overflow)
+//   [3] window reads done in the background (verify overlap)
+//   [4] adaptive slot swaps (TS_MOE_TIER_ADAPT)
+//   [5] host expert kernel time, ns      [6] host expert kernel calls
+//   [7] host-computed expert slots       [8] bytes the explicit expert I/O read
+// Writes min(capacity, 9) values; returns the number written.
+TSG_EXPORT int TSGgml_MoeOffloadCounters(long long* out, int capacity)
+{
+    if (out == nullptr || capacity <= 0) return 0;
+    long long v[9] = {};
+    {
+        std::lock_guard<std::mutex> lock(tsg::g_tier_mutex);
+        v[0] = static_cast<long long>(tsg::g_retired_hits);
+        v[1] = static_cast<long long>(tsg::g_retired_misses);
+        v[2] = static_cast<long long>(tsg::g_retired_overflow);
+        v[3] = static_cast<long long>(tsg::g_retired_deferred);
+        for (const auto& t : tsg::g_tiers)
+        {
+            v[0] += static_cast<long long>(t->hits);
+            v[1] += static_cast<long long>(t->misses);
+            v[2] += static_cast<long long>(t->overflow);
+            v[3] += static_cast<long long>(t->deferred);
+        }
+    }
+    v[4] = static_cast<long long>(tsg::g_adapt_swaps_total.load(std::memory_order_relaxed));
+    tsg::host_moe_decode_counters(&v[5], &v[6], &v[7]);
+    long long io[4] = {};
+    TSGgml_HostExpertIoStats(io);
+    v[8] = io[2];
+    const int n = capacity < 9 ? capacity : 9;
+    for (int i = 0; i < n; ++i) out[i] = v[i];
+    return n;
 }
 
 TSG_EXPORT long long TSGgml_MoeHotTierTotalBytes()

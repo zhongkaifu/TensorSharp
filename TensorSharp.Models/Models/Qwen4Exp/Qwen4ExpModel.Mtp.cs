@@ -24,6 +24,8 @@ namespace TensorSharp.Models
         private Qwen4ExpFfnArgs _mtpFfn;
         private Qwen4ExpHeadArgs _mtpHead;
         private readonly Dictionary<object, MtpState> _mtpStates = new(ReferenceEqualityComparer.Instance);
+        // TS_Q4E_MTP_EXPERTS: the experts requantized at load (native memory the head owns).
+        private readonly List<IntPtr> _mtpRequant = new();
 
         private sealed class MtpState
         {
@@ -33,9 +35,13 @@ namespace TensorSharp.Models
             public bool Failed;
         }
 
-        public bool HasDraftHead => _mtpReady;
-        public DraftHeadKind DraftHeadKind => HasDraftHead ? DraftHeadKind.PerToken : DraftHeadKind.None;
-        public bool SupportsFusedCatchUpStep => HasDraftHead;
+        // Two drafters, alternatives rather than layers: the shared MTP head (per token) or an
+        // external DFlash/DFlash2 file (one block per pass, see Qwen4ExpModel.DFlash.cs). An
+        // attached DFlash file wins; the constructor never loads both.
+        public bool HasDraftHead => _mtpReady || HasDFlash;
+        public DraftHeadKind DraftHeadKind => HasDFlash ? DraftHeadKind.Block
+            : _mtpReady ? DraftHeadKind.PerToken : DraftHeadKind.None;
+        public bool SupportsFusedCatchUpStep => _mtpReady && !HasDFlash;
         public bool DraftHeadResumesAfterGap => false;
 
         public void LoadMtpDraftWeights(string path)
@@ -76,6 +82,36 @@ namespace TensorSharp.Models
                     if (!tensor.Name.Contains(".indexer.", StringComparison.Ordinal))
                         residentBytes = checked(residentBytes + bytes);
                 }
+                int expertType = WeightRequant.MtpExpertType();
+                if (expertType >= 0)
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    long before = 0, after = 0;
+                    foreach (string suffix in new[] { "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps" })
+                    {
+                        string name = $"blk.{layer}.{suffix}.weight";
+                        var w = weights[name];
+                        if (w.Type == expertType)
+                            continue;
+                        var info = file.Tensors[name];
+                        long cols = (long)info.Shape[0], rows = info.NumElements / cols, srcRow = w.Bytes / rows;
+                        IntPtr src = w.Data;
+                        IntPtr q = WeightRequant.Requantize((r0, n, buf) =>
+                        {
+                            unsafe { Buffer.MemoryCopy((void*)(src + (nint)(r0 * srcRow)), (void*)buf, n * srcRow, n * srcRow); }
+                        }, w.Type, cols, rows, expertType, out long bytes);
+                        if (q == IntPtr.Zero)
+                            continue;
+                        _mtpRequant.Add(q);
+                        before += w.Bytes;
+                        after += bytes;
+                        weights[name] = new MtpWeight(q, expertType, bytes);
+                        residentBytes = checked(residentBytes - w.Bytes + bytes);
+                    }
+                    if (before > 0)
+                        Console.WriteLine($"  Qwen4Exp shared MTP experts as {(GgmlTensorType)expertType}: {before / 1048576.0:F0} -> "
+                            + $"{after / 1048576.0:F0} MiB in {sw.Elapsed.TotalSeconds:F1}s (TS_Q4E_MTP_EXPERTS).");
+                }
                 _mtpFile = file;
                 _mtpWeights = weights;
                 _mtpResidentBytes = residentBytes;
@@ -86,7 +122,13 @@ namespace TensorSharp.Models
             catch
             {
                 if (ReferenceEquals(_mtpFile, file)) DisposeMtpHead();
-                else file.Dispose();
+                else
+                {
+                    foreach (IntPtr q in _mtpRequant)
+                        unsafe { NativeMemory.AlignedFree((void*)q); }
+                    _mtpRequant.Clear();
+                    file.Dispose();
+                }
                 throw;
             }
         }
@@ -186,7 +228,7 @@ namespace TensorSharp.Models
 
         private unsafe MtpState EnsureMtpState(int required)
         {
-            if (!HasDraftHead || required < 0 || required > MaxContextLength || !EnsureGdnArgs())
+            if (!_mtpReady || required < 0 || required > MaxContextLength || !EnsureGdnArgs())
                 throw new InvalidOperationException("qwen4exp MTP has no usable head/state or the requested position exceeds context capacity.");
             object owner = ActiveSpecOwner;
             if (!_mtpStates.TryGetValue(owner, out var state))
@@ -282,9 +324,17 @@ namespace TensorSharp.Models
         }
 
         public void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
-            => RunMtp(new[] { token }, hPrev, pos, logitsOut, hOut);
+        {
+            if (HasDFlash) throw new NotSupportedException("A DFlash drafter proposes whole blocks; use DraftBlock.");
+            RunMtp(new[] { token }, hPrev, pos, logitsOut, hOut);
+        }
         public void DraftCatchUp(int[] tokens, float[] hRows, int startPos)
-            => RunMtp(tokens, hRows, startPos, null, null);
+        {
+            // The DFlash ring holds committed positions only: the executor commits each
+            // accepted prefix (and every plain step) with its feature rows.
+            if (HasDFlash) { DFlashCommit(tokens, hRows, startPos); return; }
+            RunMtp(tokens, hRows, startPos, null, null);
+        }
         public void DraftCatchUpAndStep(int[] tokens, float[] hRows, int startPos, float[] logitsOut, float[] hOut)
             => RunMtp(tokens, hRows, startPos, logitsOut, hOut);
 
@@ -333,7 +383,7 @@ namespace TensorSharp.Models
         /// caller disposes the half-built holder.</summary>
         private void CloneMtpState(object sourceOwner, object targetOwner)
         {
-            if (!HasDraftHead || sourceOwner == null || targetOwner == null || ReferenceEquals(sourceOwner, targetOwner))
+            if (!_mtpReady || sourceOwner == null || targetOwner == null || ReferenceEquals(sourceOwner, targetOwner))
                 return;
             if (_mtpStates.TryGetValue(targetOwner, out var existing))
                 throw new InvalidOperationException("qwen4exp MTP: the clone target already owns draft state.");
@@ -428,6 +478,9 @@ namespace TensorSharp.Models
             if (_mtpWeights != null)
                 foreach (var weight in _mtpWeights.Values) GgmlBasicOps.InvalidateHostBuffer(weight.Data);
             _mtpWeights = null;
+            foreach (IntPtr q in _mtpRequant)
+                unsafe { NativeMemory.AlignedFree((void*)q); }
+            _mtpRequant.Clear();
             _mtpFile?.Dispose();
             _mtpFile = null;
             _mtpResidentBytes = 0;

@@ -60,6 +60,17 @@ namespace TensorSharp.Models
         /// of the weights, inside the Metal working set.</summary>
         internal const long DeviceScratchBytes = 3L << 30;
 
+        /// <summary>
+        /// With host-served experts (offloaded or tiered layers), the 2048-token kernel warm-up
+        /// routes to nearly every expert of every layer and streams them all: about 46 GB of
+        /// Flash Next's experts read before the first request, minutes on network storage (a
+        /// geesefs mount: over 75 s and still reading). 64 rows stay on the tier path
+        /// (<c>kHostMoeHotTierMaxRows</c>), whose graphs short prompts use; a long prompt then
+        /// streams only the experts it routes.
+        /// </summary>
+        protected override int GgmlPrefillChunkWarmupLength
+            => _expertOnHost != null && Array.IndexOf(_expertOnHost, true) >= 0 ? 64 : 0;
+
         private bool IsExpertLayerOnHost(int layer)
             => _expertOnHost != null && layer >= 0 && layer < _expertOnHost.Length && _expertOnHost[layer];
 
@@ -164,14 +175,50 @@ namespace TensorSharp.Models
             long[] experts = new long[n];
             for (int l = 0; l < n; l++)
                 experts[l] = LayerExpertBytes(l);
-            long other = AcceleratorBoundNonExpertBytes() + CacheBytes();
+            // The MTP head is loaded after this plan, into the same working set.
+            long other = AcceleratorBoundNonExpertBytes() + CacheBytes() + (_mtpReady ? 0 : _mtpResidentBytes);
+
+            long deviceExpertBytes = workingSet - Math.Max(GpuMemoryBudget.MinHeadroomBytes, workingSet / 16)
+                - other - DeviceScratchBytes;
+            // The working set is Metal's ceiling, not what this Mac can give: the expert tier is
+            // wired while the GPU runs, and macOS keeps a floor of file cache besides other
+            // programs' memory. ISTA Q2_0 on a 48 GB Mac planned 29.7 GB of tier against a 40.2 GB
+            // working set and Metal ran out of memory on the first long prompt (an unrecoverable
+            // command-buffer failure). So, as Strata sizes its arena, the experts also stay within
+            // what macOS can give without compressing anything, less max(7 GB, 15% of the RAM)
+            // kept for macOS, the scratch, and the MTP head still to come.
+            // That snapshot depends on the moment (just after another model exits most of the RAM
+            // is free), so the whole wired set - experts, the other accelerator buffers and the
+            // scratch - also stays within 65% of the RAM: on the 48 GB Mac with an editor and a
+            // browser open, ~32 GB wired ran clean and 38.6 GB (the MTP head beside a 26.9 GB tier)
+            // ran Metal out of memory. Strata leaves 30-40% of a Mac's RAM likewise.
+            long available = GgmlBasicOps.HostAvailableMemoryBytes();
+            long keep = Math.Max(7_000_000_000L, ram / 100 * 15);
+            long fits = Math.Min(ram / 100 * 65 - other - DeviceScratchBytes,
+                available > 0 ? available - keep - DeviceScratchBytes - (_mtpReady ? 0 : _mtpResidentBytes) : long.MaxValue);
+            if (fits < deviceExpertBytes)
+                Console.WriteLine($"[moe-offload] qwen4exp: experts on the accelerator stay within {Gb(Math.Max(0, fits))}: " +
+                    $"65% of the RAM wired at most, and macOS can give {(available > 0 ? Gb(available) : "?")} without " +
+                    $"compressing and keeps {Gb(keep)} (Metal working set {Gb(workingSet)}).");
+            deviceExpertBytes = Math.Min(deviceExpertBytes, Math.Max(0, fits));
 
             int onDevice = PlanDeviceExpertLayers(experts, other, workingSet, ram);
-            if (onDevice >= n)
-                return;
             long layerPlanBytes = 0;
             for (int l = n - onDevice; l < n; l++) layerPlanBytes += experts[l];
-            if (TryPlanExpertTiers(layerPlanBytes))
+            // The whole layers kept resident stay under the same cap as a tier.
+            while (onDevice > 0 && layerPlanBytes > deviceExpertBytes)
+                layerPlanBytes -= experts[n - onDevice--];
+            if (onDevice >= n)
+                return;
+            // A tier puts a host seam in every MoE layer; whole layers need one only where they are
+            // offloaded. On Metal a seam is a command buffer submitted and waited for (~0.17 ms) and the
+            // host computes the misses, so when the whole-layer plan keeps nearly every layer resident it
+            // wins: ISTA Q2_0 on the 48 GB Mac, 42 of 48 layers resident, decoded 25.0 / 19.8 / 24.8 tok/s
+            // against 22.6 / 15.9 / 23.2 tiered (code / prose / list). With most layers offloaded (UD-Q2_K_XL
+            // there) the tier wins. TS_MOE_HOT_TIER=1 keeps the tier anyway, =0 the whole layers.
+            bool preferLayers = Environment.GetEnvironmentVariable("TS_MOE_HOT_TIER") is not "1"
+                && (long)onDevice * 100 >= (long)n * 85;
+            if (!preferLayers && TryPlanExpertTiers(layerPlanBytes, deviceExpertBytes))
                 return;
             // Offload the FIRST layers, keep the last ones resident (llama.cpp's
             // --n-cpu-moe order): a token then ends on the accelerator without a
@@ -370,6 +417,10 @@ namespace TensorSharp.Models
                     || string.Equals(kv.Key, "per_layer_token_embd.weight", StringComparison.Ordinal))
                     continue;
                 bytes += kv.Value.RawBytes;
+                // TS_Q4E_HC_Q8=1: the Q8_0 copy of a BF16 hyper-connection matrix is resident besides the file's
+                // pages (without this a 16K-token prompt ran the 48 GB Mac's Metal out of memory).
+                if (HcQ8 && kv.Value.GgmlType == WeightRequant.GgmlTypeBf16 && IsHcMatrix(kv.Key) && kv.Value.Ne0 % 32 == 0)
+                    bytes += WeightRequant.Q8_0Bytes(kv.Value.Ne1, kv.Value.Ne0);
             }
             foreach (var kv in _weights)
                 bytes += kv.Value.Storage.ByteLength;

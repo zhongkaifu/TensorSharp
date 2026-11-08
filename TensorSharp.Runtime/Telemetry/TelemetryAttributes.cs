@@ -105,6 +105,15 @@ namespace TensorSharp.Runtime.Telemetry
         public const string TensorParallelDegree = "tensorsharp.tp.degree";
         public const string TensorParallelNodeId = "tensorsharp.tp.node_id";
         public const string GpuDevice = "tensorsharp.gpu.device";
+        /// <summary>Where a routed expert ran: <see cref="MoePlacementDevice"/>, <see cref="MoePlacementStreamed"/>
+        /// or <see cref="MoePlacementHost"/>.</summary>
+        public const string MoePlacement = "tensorsharp.moe.placement";
+        /// <summary>An expert the accelerator already held (a tier slot, a VRAM residency slot).</summary>
+        public const string MoePlacementDevice = "device";
+        /// <summary>An expert read from storage into an accelerator slot for the route (a window slot).</summary>
+        public const string MoePlacementStreamed = "streamed";
+        /// <summary>An expert the host's expert kernel computed.</summary>
+        public const string MoePlacementHost = "host";
 
         // Media -------------------------------------------------------------------------
         public const string MediaKind = "tensorsharp.media.kind";

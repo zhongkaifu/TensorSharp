@@ -672,7 +672,29 @@ exported (`Metrics != None`); without an observer `OnEngineStep` returns at once
 tracks every model it loads, the startup load and a rollback to the previous model included, and the CLI tracks the
 model it loads, so LLM serving feeds the gauges on both hosts, not only video clips.
 
-### 6.4 Other instruments
+### 6.4 MoE expert offload
+
+For a mixture-of-experts model whose routed experts do not all live on the accelerator: the GGML expert tiers and host
+seams (any model with `--n-cpu-moe`, Qwen3.8-Flash-Next's tiers) and the direct CUDA engines' expert residency. These are
+the figures expert placement is tuned with: a high `streamed` or `host` share, or host time per output token, says the
+accelerator's expert budget or the adaptive tier is where the decode time goes.
+
+| Instrument | Type | Source |
+|---|---|---|
+| `tensorsharp.moe.expert.routes` | observable counter, `{route}` | routed-expert selections by `tensorsharp.moe.placement`: `device` (an accelerator slot already held the expert: tier fixed and window hits, VRAM residency slots), `streamed` (a window slot read it from storage first), `host` (the host's expert kernel computed it) |
+| `tensorsharp.moe.host.compute.time` | observable counter, s | time in the host expert kernel (`host_moe_decode_experts_rows`, which the direct CUDA engine's host experts run as well) |
+| `tensorsharp.moe.expert.swaps` | observable counter, `{swap}` | adaptive residency swaps (`TS_MOE_TIER_ADAPT`) |
+| `tensorsharp.moe.expert.io` | observable counter, By | bytes explicit expert I/O read from storage (tier loads included) |
+
+All carry `tensorsharp.model.architecture`. The figures are process totals kept by TensorSharp's own counters
+(`TSGgml_MoeOffloadCounters` in GgmlOps, which touches no backend, and `CudaMoeOffloadCounters`), monotonic across model
+unloads (a freed tier's counts are kept). `MoeOffloadTelemetry.Snapshot` reads them on the engine's thread, from the
+engine step observer the hosts install with the GPU memory snapshot, at most every 250 ms and only while
+`TensorSharpMetrics.MoeOffloadObserved`; the collection thread reads the published snapshot only. A model is followed
+from `GpuMemoryTelemetry.Track` (models on host memory alone are not). With one MoE model per process the totals are that
+model's.
+
+### 6.5 Other instruments
 
 | Instrument | Type | Attributes |
 |---|---|---|
@@ -681,18 +703,18 @@ model it loads, so LLM serving feeds the gauges on both hosts, not only video cl
 | `tensorsharp.image.generation.duration` | histogram, s | `gen_ai.request.model`, `tensorsharp.backend`, `tensorsharp.image.mode`, `tensorsharp.outcome`, `error.type` |
 | video and Studio instruments | | §8.8, §9.5 |
 
-### 6.5 Built-in .NET meters
+### 6.6 Built-in .NET meters
 
 `System.Runtime` (GC, thread pool, exceptions), `System.Net.Http`, and ASP.NET Core's meters through the
 instrumentation's `AddAspNetCoreInstrumentation()` on the meter provider (server only).
 
-### 6.6 Cardinality
+### 6.7 Cardinality
 
 Metric attributes are limited to: `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`,
 `gen_ai.tool.name`, `tensorsharp.backend`, `tensorsharp.protocol`, `tensorsharp.origin`, `tensorsharp.outcome`,
 `error.type`, `tensorsharp.token.type`, `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind`,
 `tensorsharp.video.mode`, `.audio`, `.phase`, `.stage`, `.cached`, `tensorsharp.image.mode`, `tensorsharp.owner`,
-`tensorsharp.gpu.device` and `tensorsharp.studio.job_kind`. `error.type` is always a fixed code or an exception's full
+`tensorsharp.gpu.device`, `tensorsharp.moe.placement` and `tensorsharp.studio.job_kind`. `error.type` is always a fixed code or an exception's full
 type name, never a message. Video modes are normalized to a fixed set (§8.8). Session ids, request ids, prompts,
 resolutions and frame counts go on spans only.
 
@@ -1317,7 +1339,7 @@ keys. Existing tests that assert rendered log text (for example the "Radix promp
 pipeline's wrapper and outcome mapping (including the DiffusionGemma branch producing exactly one span),
 `CapturedMessagesJson` bounds, the Responses API's `gen_ai.response.id` rule, the workers' `TelemetryContext.Clear`
 calls themselves, the CLI's crash-path flush, the embeddings span, `ShellRunner`, `execute_tool`, `model.load`, and a
-`MeterListener` test that every metric tag key is in the §6.6 list; the engine unregistering only after its worker has stopped (§6.2), the streaming image route recording a client that leaves during the upload read as cancelled, and the `warmup` origin on the CLI's `--warmup-runs` passes.
+`MeterListener` test that every metric tag key is in the §6.7 list; the engine unregistering only after its worker has stopped (§6.2), the streaming image route recording a client that leaves during the upload read as cancelled, and the `warmup` origin on the CLI's `--warmup-runs` passes.
 
 ### 12.2 What end-to-end runs must show
 
@@ -1580,7 +1602,7 @@ The draft was checked against the code before implementation. "Built" says what 
 | `blocks.used` from `PoolStats` | No used field; forward time includes scheduling | total − free; documented (§6.2) |
 | Engine-wide speculation total | Per-sequence stats are replaced when a preempted sequence re-arms | Counted at the increment sites (§6.2) |
 | Trace filter keeps polling out | Built-in HTTP metrics ignore it | `DisableHttpMetrics` (§5.10) |
-| Cardinality list | Incomplete; `error.type` formation unspecified | Full list; codes or type names only (§6.6) |
+| Cardinality list | Incomplete; `error.type` formation unspecified | Full list; codes or type names only (§6.7) |
 | **GPU memory** | | |
 | CUDA `CachedBytes` / `PeakCachedBytes` as used and peak | Idle pooled blocks only, on a stats struct | Used = total − free from `GetMemoryInfo` (§6.3) |
 | `Ltx25Model.DirectAllocator` accessor | H3 had none, other models' allocators are protected, and LTX maps backends itself | `ModelBase.DirectAllocatorForTelemetry`; query chosen by allocator type (§6.3) |

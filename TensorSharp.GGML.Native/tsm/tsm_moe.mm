@@ -1,0 +1,836 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// Licensed under the BSD-3-Clause license in the repository root.
+//
+// See tsm_moe.h. Uses the unchanged ggml-metal device/buffer helpers at the build revision (its MTLDevice, its command
+// queue, a tensor's MTLBuffer); the kernels are Strata's grouped expert kernels (tsm/kernels, MIT) and the plan, the
+// dispatch geometry and the glue are TensorSharp's.
+#include "tsm_moe.h"
+#include "../ggml_ops_internal.h"
+#include "ggml-backend-impl.h"
+#include "ggml-metal.h"
+#include "ggml-metal/ggml-metal-device.h"
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <thread>
+#include <map>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "tsm_moe_source.inc"
+
+namespace
+{
+    // The plan layout of moe.metal (P_* there): one int buffer.
+    constexpr int P_NG = 0, P_IGU = 4, P_IDN = 8, P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE,
+                  P_ETOK = P_GSTART + P_MAXE + 4, P_EW = P_ETOK + P_MAXE, P_TOKENT = P_EW + P_MAXE,
+                  P_INTS = P_TOKENT + P_MAXE;
+    constexpr int kMaxRows = 8;   // a decode step or a verify window
+
+    // moe.metal's MoeArgs, byte for byte.
+    struct MoeArgs
+    {
+        std::uint64_t gate_off, up_off, down_off, gu_stride, d_stride;
+        std::uint32_t gu_row, d_row, n_embd, n_ff, n_tok, topk, n_expert, gx_gu, gx_dn, pad;
+    };
+    static_assert(sizeof(MoeArgs) == 80, "MoeArgs must match moe.metal");
+
+    // ggml types (= quant.metal's T_*) the instantiated moe_gu / moe_down take.
+    bool gate_up_type(int t)
+    {
+        switch (t) { case 42: case 16: case 17: case 18: case 21: case 22: case 23: case 12: case 13: case 14: case 8: return true; }
+        return false;
+    }
+    bool down_type(int t) { switch (t) { case 42: case 7: case 8: case 6: case 20: return true; } return false; }
+    // xprep's plane for a gate/up format (units.metal XKind): 0 raw, 1 Q2_0, 2 Q4_K/Q5_K, 3 Q6_K/Q3_K.
+    int x_kind(int t) { return t == 42 ? 1 : (t == 12 || t == 13) ? 2 : (t == 14 || t == 11) ? 3 : 0; }
+    std::size_t row_bytes(int type, int n) { return ggml_row_size(static_cast<ggml_type>(type), n); }
+
+    struct State
+    {
+        std::mutex mu;
+        id<MTLDevice> device = nil;
+        id<MTLLibrary> library = nil;
+        std::map<std::string, id<MTLComputePipelineState>> pipelines;
+        id<MTLBuffer> xp = nil, h = nil, ye = nil, plan = nil, ent = nil;
+        id<MTLCommandBuffer> last = nil;   // the last committed (for the probe's wait)
+        id<MTLSharedEvent> event = nil;    // the seams' handshakes (seams_*)
+        std::uint64_t event_value = 0;     // the last value a pass used
+        std::size_t xp_bytes = 0, h_bytes = 0, ye_bytes = 0;
+        std::vector<int> plan_host;
+    };
+    State& state() { static State s; return s; }
+
+    ggml_metal_device_t metal_device(ggml_backend_t backend)
+    {
+        if (backend == nullptr || !ggml_backend_is_metal(backend)) return nullptr;
+        return static_cast<ggml_metal_device_t>(ggml_backend_get_device(backend)->context);
+    }
+
+    id<MTLComputePipelineState> pipeline(State& s, const std::string& name)
+    {
+        auto it = s.pipelines.find(name);
+        if (it != s.pipelines.end()) return it->second;
+        NSError* error = nil;
+        MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
+        bool ctab = true;   // QUANT_CTAB (23): the i-quant grids from constant memory, as Strata runs them
+        [values setConstantValue:&ctab type:MTLDataTypeBool atIndex:23];
+        id<MTLFunction> f = [s.library newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]
+                                            constantValues:values error:&error];
+        if (f == nil)
+            throw std::runtime_error("tsm: no kernel " + name + (error ? std::string(": ") + error.localizedDescription.UTF8String : ""));
+        id<MTLComputePipelineState> p = [s.device newComputePipelineStateWithFunction:f error:&error];
+        if (p == nil)
+            throw std::runtime_error("tsm: pipeline " + name + ": " + (error ? error.localizedDescription.UTF8String : "?"));
+        s.pipelines[name] = p;
+        return p;
+    }
+
+    void ensure_library(State& s, id<MTLDevice> device)
+    {
+        if (s.library != nil && s.device == device) return;
+        s.pipelines.clear();
+        s.xp = s.h = s.ye = s.plan = s.ent = nil;
+        s.event = nil;
+        s.event_value = 0;
+        s.xp_bytes = s.h_bytes = s.ye_bytes = 0;
+        MTLCompileOptions* options = [MTLCompileOptions new];
+        // Safe math, as Strata compiles them: no reassociation, so a row's sums do not depend on the window around it.
+        if (@available(macOS 15.0, iOS 18.0, *)) options.mathMode = MTLMathModeSafe;
+        else options.fastMathEnabled = NO;
+        NSError* error = nil;
+        id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:kTsmMoeSource]
+                                                      options:options error:&error];
+        if (library == nil)
+            throw std::runtime_error(std::string("tsm: the expert kernels do not compile: ")
+                + (error ? error.localizedDescription.UTF8String : "?"));
+        s.device = device;
+        s.library = library;
+        s.plan = [device newBufferWithLength:P_INTS * sizeof(int) options:MTLResourceStorageModeShared];
+        s.ent = [device newBufferWithLength:kMaxRows * 32 * sizeof(int) options:MTLResourceStorageModeShared];
+        s.plan_host.assign(P_INTS, 0);
+    }
+
+    id<MTLBuffer> grow(State& s, id<MTLBuffer> b, std::size_t& have, std::size_t need)
+    {
+        if (b != nil && have >= need) return b;
+        have = need;
+        return [s.device newBufferWithLength:need options:MTLResourceStorageModeShared];
+    }
+
+    // The MTLBuffer and offset under host-visible address `data` of a ggml-metal buffer.
+    ggml_metal_buffer_id buffer_at(ggml_backend_buffer_t buffer, void* data, std::size_t bytes)
+    {
+        if (buffer == nullptr) throw std::runtime_error("tsm: an unbound tensor");
+        ggml_tensor view{};
+        view.type = GGML_TYPE_I8;
+        view.ne[0] = static_cast<std::int64_t>(bytes);
+        view.ne[1] = view.ne[2] = view.ne[3] = 1;
+        view.nb[0] = 1; view.nb[1] = view.nb[2] = view.nb[3] = bytes;
+        view.buffer = buffer;
+        view.data = data;
+        ggml_metal_buffer_id bid = ggml_metal_buffer_get_id(static_cast<ggml_metal_buffer_t>(buffer->context), &view);
+        if (bid.metal == nullptr) throw std::runtime_error("tsm: a tensor outside every Metal buffer");
+        return bid;
+    }
+
+    ggml_metal_buffer_id tensor_id(const ggml_tensor* t)
+    {
+        ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+        return buffer_at(buffer, t->data, ggml_nbytes(t));
+    }
+
+    void bind(id<MTLComputeCommandEncoder> enc, const ggml_metal_buffer_id& bid, std::size_t extra, int index)
+    {
+        [enc setBuffer:(__bridge id<MTLBuffer>)bid.metal offset:bid.offs + extra atIndex:index];
+    }
+
+    // The tiles: Strata's for these formats (gate/up 32 lanes a row, 1 row, 4 simdgroups; down Q2_0 8 lanes, 1 row;
+    // the others 4 lanes, 2 rows; 4 simdgroups).
+    struct Geometry
+    {
+        int gt = 0, dt = 0, gl = 32, gr = 1, gs = 4, dl = 4, dr = 2, ds = 4, gu_rows = 0, dn_rows = 0;
+        bool dq2 = false;
+        std::string gu, dn;
+    };
+
+    Geometry geometry(const tsg::MoeHotTier& tier, int hidden, int n_ff)
+    {
+        Geometry g;
+        g.gt = tier.type[0];
+        g.dt = tier.type[2];
+        g.dq2 = g.dt == 42;
+        g.dl = g.dq2 ? 8 : 4;
+        g.dr = g.dq2 ? 1 : 2;
+        g.gu_rows = g.gs * (32 / g.gl) * g.gr;
+        g.dn_rows = g.ds * (32 / g.dl) * g.dr;
+        if (n_ff % g.gu_rows != 0 || hidden % g.dn_rows != 0)
+            throw std::runtime_error("tsm: expert rows do not fill the kernel tiles");
+        g.gu = "moe_gu_" + std::to_string(g.gt) + "_" + std::to_string(g.gl) + "_" + std::to_string(g.gr) + "_" + std::to_string(g.gs);
+        g.dn = "moe_down_" + std::to_string(g.dq2 ? 142 : g.dt) + "_" + std::to_string(g.dl) + "_" + std::to_string(g.dr) + "_" + std::to_string(g.ds);
+        return g;
+    }
+
+    // The plan (moe.metal's layout) into s.plan and the route -> entry map into s.ent: by slot ascending, each slot's
+    // entries in route order; the grids of moe_gu / moe_down at P_IGU / P_IDN. Returns the number of slot groups.
+    int write_plan(State& s, const Geometry& g, int hidden, int n_ff, int T, int n_used, const std::int32_t* slots,
+                   const float* weights)
+    {
+        const int ne = T * n_used;
+        std::vector<int>& plan = s.plan_host;
+        std::fill(plan.begin(), plan.end(), 0);
+        int* ent = static_cast<int*>([s.ent contents]);
+        for (int i = 0; i < ne; ++i) ent[i] = -1;
+        static thread_local std::vector<int> order;
+        order.clear();
+        for (int i = 0; i < ne; ++i) if (slots[i] >= 0) order.push_back(i);
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return slots[a] < slots[b]; });
+        int ng = 0;
+        for (std::size_t j = 0; j < order.size(); ++j)
+        {
+            const int i = order[j];
+            if (j == 0 || slots[order[j - 1]] != slots[i])
+            {
+                plan[P_GEXP + ng] = slots[i];
+                plan[P_GSTART + ng] = static_cast<int>(j);
+                ++ng;
+            }
+            plan[P_ETOK + j] = i / n_used;
+            float w = weights[i];
+            std::memcpy(&plan[P_EW + j], &w, sizeof(float));
+            plan[P_TOKENT + i] = static_cast<int>(j);
+            ent[i] = static_cast<int>(j);
+        }
+        plan[P_NG] = ng;
+        plan[P_GSTART + ng] = static_cast<int>(order.size());
+        plan[P_IGU] = n_ff / g.gu_rows; plan[P_IGU + 1] = ng; plan[P_IGU + 2] = 1;
+        plan[P_IDN] = hidden / g.dn_rows; plan[P_IDN + 1] = ng; plan[P_IDN + 2] = 1;
+        std::memcpy([s.plan contents], plan.data(), P_INTS * sizeof(int));
+        return ng;
+    }
+
+    MoeArgs moe_args(const tsg::MoeHotTier& tier, const Geometry& g, int hidden, int n_ff, int T, int n_used)
+    {
+        MoeArgs a{};
+        a.gate_off = tier.offset[0];
+        a.up_off = tier.offset[1];
+        a.down_off = tier.offset[2];
+        a.gu_stride = tier.stride[0];
+        a.d_stride = tier.stride[2];
+        a.gu_row = static_cast<std::uint32_t>(row_bytes(g.gt, hidden));
+        a.d_row = static_cast<std::uint32_t>(row_bytes(g.dt, n_ff));
+        a.n_embd = static_cast<std::uint32_t>(hidden);
+        a.n_ff = static_cast<std::uint32_t>(n_ff);
+        a.n_tok = static_cast<std::uint32_t>(T);
+        a.topk = static_cast<std::uint32_t>(n_used);
+        a.n_expert = static_cast<std::uint32_t>(tier.count);
+        a.gx_gu = static_cast<std::uint32_t>(n_ff / g.gu_rows);
+        a.gx_dn = static_cast<std::uint32_t>(hidden / g.dn_rows);
+        return a;
+    }
+
+    // Scratch: the prepared x (4 planes + S16), h and ye per entry.
+    void ensure_scratch(State& s, int hidden, int n_ff, int T)
+    {
+        const std::size_t plane = static_cast<std::size_t>(T) * hidden;
+        s.xp = grow(s, s.xp, s.xp_bytes, (4 * plane + plane / 16) * sizeof(float));
+        s.h = grow(s, s.h, s.h_bytes, static_cast<std::size_t>(P_MAXE) * n_ff * sizeof(float));
+        s.ye = grow(s, s.ye, s.ye_bytes, static_cast<std::size_t>(P_MAXE) * hidden * sizeof(float));
+    }
+
+    // xprep: one thread per 16 values of a row.
+    void encode_xprep(State& s, id<MTLComputeCommandEncoder> enc, const ggml_metal_buffer_id& x_id, int hidden, int T)
+    {
+        id<MTLComputePipelineState> p = pipeline(s, "xprep");
+        const std::uint32_t n = static_cast<std::uint32_t>(hidden), nt = static_cast<std::uint32_t>(T);
+        [enc setComputePipelineState:p];
+        bind(enc, x_id, 0, 0);
+        [enc setBuffer:s.xp offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(n) atIndex:2];
+        [enc setBytes:&nt length:sizeof(nt) atIndex:3];
+        const NSUInteger threads = static_cast<NSUInteger>(hidden / 16) * T;
+        [enc dispatchThreadgroups:MTLSizeMake((threads + 63) / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    }
+
+    // moe_gu and moe_down over the plan's slot groups: `ng` of them, or (ng < 0) as many as the plan says when the
+    // kernels run (the grids read from P_IGU / P_IDN).
+    void encode_experts(State& s, id<MTLComputeCommandEncoder> enc, const Geometry& g, const MoeArgs& a,
+                        const ggml_metal_buffer_id& w_id, int hidden, int T, int ng)
+    {
+        const std::size_t plane = static_cast<std::size_t>(T) * hidden;
+        id<MTLComputePipelineState> pgu = pipeline(s, g.gu), pdn = pipeline(s, g.dn);
+        [enc setComputePipelineState:pgu];
+        bind(enc, w_id, 0, 0);
+        [enc setBuffer:s.xp offset:x_kind(g.gt) * plane * sizeof(float) atIndex:1];
+        [enc setBuffer:s.h offset:0 atIndex:2];
+        [enc setBuffer:s.plan offset:0 atIndex:3];
+        [enc setBytes:&a length:sizeof(a) atIndex:4];
+        [enc setBuffer:s.xp offset:4 * plane * sizeof(float) atIndex:5];
+        [enc setBuffer:s.plan offset:0 atIndex:6];   // smap: unused without the arena (constant 20)
+        for (int i = 7; i <= 9; ++i) bind(enc, w_id, 0, i);
+        if (ng < 0)
+            [enc dispatchThreadgroupsWithIndirectBuffer:s.plan indirectBufferOffset:P_IGU * sizeof(int)
+                                  threadsPerThreadgroup:MTLSizeMake(32 * g.gs, 1, 1)];
+        else
+            [enc dispatchThreadgroups:MTLSizeMake(a.gx_gu, ng, 1) threadsPerThreadgroup:MTLSizeMake(32 * g.gs, 1, 1)];
+
+        [enc setComputePipelineState:pdn];
+        bind(enc, w_id, 0, 0);
+        [enc setBuffer:s.h offset:0 atIndex:1];
+        [enc setBuffer:s.ye offset:0 atIndex:2];
+        [enc setBuffer:s.plan offset:0 atIndex:3];
+        [enc setBytes:&a length:sizeof(a) atIndex:4];
+        [enc setBuffer:s.h offset:0 atIndex:5];      // hs16: the raw-input formats read none
+        [enc setBuffer:s.plan offset:0 atIndex:6];
+        for (int i = 7; i <= 9; ++i) bind(enc, w_id, 0, i);
+        if (ng < 0)
+            [enc dispatchThreadgroupsWithIndirectBuffer:s.plan indirectBufferOffset:P_IDN * sizeof(int)
+                                  threadsPerThreadgroup:MTLSizeMake(32 * g.ds, 1, 1)];
+        else
+            [enc dispatchThreadgroups:MTLSizeMake(a.gx_dn, ng, 1) threadsPerThreadgroup:MTLSizeMake(32 * g.ds, 1, 1)];
+    }
+
+    void encode_combine(State& s, id<MTLComputeCommandEncoder> enc, const ggml_metal_buffer_id& out_id, int hidden,
+                        int T, int n_used)
+    {
+        id<MTLComputePipelineState> p = pipeline(s, "tsm_moe_combine_held");
+        const std::uint32_t args[4] = {static_cast<std::uint32_t>(hidden), static_cast<std::uint32_t>(T),
+                                       static_cast<std::uint32_t>(n_used), 0};
+        [enc setComputePipelineState:p];
+        [enc setBuffer:s.ye offset:0 atIndex:0];
+        [enc setBuffer:s.ent offset:0 atIndex:1];
+        bind(enc, out_id, 0, 2);
+        [enc setBytes:args length:sizeof(args) atIndex:3];
+        const NSUInteger threads = static_cast<NSUInteger>(hidden) * T;
+        [enc dispatchThreadgroups:MTLSizeMake((threads + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+
+    ggml_metal_buffer_id tier_id(const tsg::MoeHotTier& tier)
+    {
+        return buffer_at(tier.buffer, ggml_backend_buffer_get_base(tier.buffer), ggml_backend_buffer_get_size(tier.buffer));
+    }
+
+    void add_timing(id<MTLCommandBuffer> cb, int rows, int groups)
+    {
+        static const bool timing = [] { const char* e = std::getenv("TS_METAL_MOE_TIMING"); return e && e[0] == '1'; }();
+        if (!timing) return;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            static std::mutex m;
+            static double sum = 0; static int n = 0;
+            std::lock_guard<std::mutex> lk(m);
+            sum += (done.GPUEndTime - done.GPUStartTime) * 1e3;
+            if (++n % 96 == 0)
+            {
+                std::fprintf(stderr, "[tsm] grouped experts: %.3f ms GPU a layer (last: %d rows, %d slots)\n", sum / 96, rows, groups);
+                sum = 0;
+            }
+        }];
+    }
+
+    void report_once(int gt, int dt)
+    {
+        static bool reported = false;
+        if (reported) return;
+        reported = true;
+        std::fprintf(stderr, "[tsm] tiered MoE seams compute their held routes with the grouped expert kernels "
+            "(gate/up %d, down %d; TS_METAL_MOE=0 keeps MUL_MAT_ID)\n", gt, dt);
+    }
+}
+
+namespace tsm
+{
+    // Read per graph build (a test process toggles it).
+    bool moe_enabled()
+    {
+        const char* e = std::getenv("TS_METAL_MOE");
+        return !(e && e[0] == '0');
+    }
+
+    bool moe_supported(ggml_backend* backend, const tsg::MoeHotTier& tier, int hidden, int n_ff, int T, int n_used)
+    {
+        if (!moe_enabled() || metal_device(backend) == nullptr || tier.buffer == nullptr) return false;
+        if (T < 1 || T > kMaxRows || n_used < 1 || n_used > 32 || T * n_used > P_MAXE) return false;
+        const int gt = tier.type[0], dt = tier.type[2];
+        if (tier.type[1] != gt || !gate_up_type(gt) || !down_type(dt)) return false;
+        // Every unit of a row whole, and the tiles below covering the rows exactly.
+        if (hidden % 256 != 0 || n_ff % 64 != 0) return false;
+        if (n_ff % 4 != 0 || hidden % 32 != 0) return false;
+        // moe.metal addresses up at gate's per-expert stride.
+        if (tier.stride[0] != tier.stride[1] || tier.stride[0] != row_bytes(gt, hidden) * n_ff
+            || tier.stride[2] != row_bytes(dt, n_ff) * hidden) return false;
+        return true;
+    }
+
+    bool moe_encode(ggml_backend* backend, const tsg::MoeHotTier& tier, const ggml_tensor* moe_in, ggml_tensor* out,
+                    int hidden, int n_ff, int T, int n_used, const std::int32_t* slots, const float* weights)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm: not a Metal backend");
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                ensure_library(s, device);
+                const Geometry g = geometry(tier, hidden, n_ff);
+                const int ng = write_plan(s, g, hidden, n_ff, T, n_used, slots, weights);
+                const MoeArgs a = moe_args(tier, g, hidden, n_ff, T, n_used);
+                ensure_scratch(s, hidden, n_ff, T);
+                const ggml_metal_buffer_id x_id = tensor_id(moe_in), out_id = tensor_id(out), w_id = tier_id(tier);
+
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                encode_xprep(s, enc, x_id, hidden, T);
+                if (ng > 0) encode_experts(s, enc, g, a, w_id, hidden, T, ng);
+                encode_combine(s, enc, out_id, hidden, T, n_used);
+                [enc endEncoding];
+                add_timing(cb, T, ng);
+                [cb commit];
+                s.last = cb;
+                report_once(g.gt, g.dt);
+            }
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
+
+    // ---- seams on a shared event (tsm_moe.h)
+    namespace
+    {
+        struct SeamPass
+        {
+            bool active = false;
+            int n_seams = 0;
+            int current = -1;         // the seam whose host turn is running (seams_wait set it)
+            std::uint64_t base = 0;   // seam k: A = base + 2k + 1 (the GPU's), B = base + 2k + 2 (the host's)
+            id<MTLSharedEvent> event = nil;
+            std::vector<id<MTLCommandBuffer>> cbs;
+            std::vector<Geometry> geo;
+            // the current seam's plan, staged by the route split and written when the host releases the seam
+            std::vector<std::int32_t> slots;
+            std::vector<float> weights;
+            int hidden = 0, n_ff = 0, T = 0, n_used = 0;
+            bool staged = false;
+        };
+        thread_local SeamPass t_pass;
+        std::atomic<long long> g_seam_passes{0};   // passes that ran to the end (TSGgml_TsmSeamPasses)
+
+        // TS_METAL_SEAM_PROFILE=1: on the GPU's clock, per pass, the time between one seam's command buffer and the
+        // next (the ggml segment between them, its command buffer's start included) and the seams' own (their kernels
+        // and the waits for the host's B and C), summed over 32 passes of one width.
+        bool seam_profile()
+        {
+            static const bool on = [] { const char* e = std::getenv("TS_METAL_SEAM_PROFILE"); return e && e[0] == '1'; }();
+            return on;
+        }
+        struct SeamProfile
+        {
+            std::mutex m;
+            std::map<std::uint64_t, std::vector<std::pair<double, double>>> passes;   // by pass base: (start, end) a seam
+            double segments = 0, seams = 0;
+            int n = 0, rows = 0;
+        };
+        SeamProfile& seam_prof() { static SeamProfile p; return p; }
+        void seam_profile_note(std::uint64_t pass, int seam, int n_seams, int rows, double start, double end)
+        {
+            SeamProfile& p = seam_prof();
+            std::lock_guard<std::mutex> lk(p.m);
+            auto& v = p.passes[pass];
+            if (v.empty()) v.assign(n_seams, {0.0, 0.0});
+            v[seam] = {start, end};
+            for (const auto& x : v) if (x.second == 0.0) return;
+            if (rows != p.rows) { p.segments = p.seams = 0; p.n = 0; p.rows = rows; }
+            for (int k = 0; k < n_seams; ++k)
+            {
+                p.seams += v[k].second - v[k].first;
+                if (k > 0) p.segments += v[k].first - v[k - 1].second;
+            }
+            p.passes.erase(pass);
+            if (++p.n == 32)
+            {
+                std::fprintf(stderr, "[tsm] seamed pass on the GPU (%d rows, %d seams): segments 1..%d %.2f ms, seams %.2f ms "
+                    "(their kernels and the wait for the host)\n", rows, n_seams, n_seams - 1, p.segments * 1e3 / 32,
+                    p.seams * 1e3 / 32);
+                p.segments = p.seams = 0;
+                p.n = 0;
+            }
+        }
+    }
+
+    // ---- the keep-alive (Strata's, metal/src/mtl_rt.mm start_keepalive): while seamed passes run, short spin kernels
+    // on a second queue keep the GPU awake between a seam's signal and the host's release. On an M5 Pro a handshake
+    // [signal | wait | release] costs ~190 us of GPU time on a quiet GPU and ~83 us beside the spin (p90 880 -> 475 us);
+    // a pass has 48. Bounded kernels, re-committed by a thread, two in flight: a GPU spin cannot be stopped by a flag
+    // the CPU writes (the GPU does not see it). TS_METAL_KEEPALIVE=0 turns it off.
+    namespace
+    {
+        std::atomic<std::int64_t> g_ka_last_ns{0};
+        std::atomic<bool> g_ka_started{false};
+        std::int64_t ka_now_ns()
+        {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+        bool keepalive_enabled()
+        {
+            const char* e = std::getenv("TS_METAL_KEEPALIVE");
+            return !(e && e[0] == '0');
+        }
+        void keepalive_touch(id<MTLDevice> device)
+        {
+            g_ka_last_ns.store(ka_now_ns(), std::memory_order_relaxed);
+            if (g_ka_started.exchange(true)) return;
+            std::thread([device]() {
+                @autoreleasepool
+                {
+                    static const char* kSpin = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n [[buffer(1)]], uint t [[thread_position_in_grid]]) {
+    uint x = t;
+    for (uint i = 0; i < n; ++i) x = x * 1664525u + 1013904223u;
+    if (x == 0xdeadbeefu) atomic_fetch_add_explicit(c, 1u, memory_order_relaxed);
+}
+)MSL";
+                    NSError* err = nil;
+                    id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:kSpin] options:nil error:&err];
+                    id<MTLComputePipelineState> ps = lib ? [device newComputePipelineStateWithFunction:
+                        [lib newFunctionWithName:@"tsm_keepalive"] error:&err] : nil;
+                    if (ps == nil) return;
+                    id<MTLCommandQueue> q = [device newCommandQueue];
+                    id<MTLBuffer> sink = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+                    std::uint32_t iters = 20000;   // retuned toward ~150 us a kernel from the measured GPU time
+                    id<MTLCommandBuffer> prev = nil;
+                    for (;;)
+                    {
+                        if (ka_now_ns() - g_ka_last_ns.load(std::memory_order_relaxed) > 20'000'000LL)
+                        {
+                            if (prev != nil) { [prev waitUntilCompleted]; prev = nil; }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            continue;
+                        }
+                        @autoreleasepool
+                        {
+                            id<MTLCommandBuffer> cb = [q commandBuffer];
+                            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                            [enc setComputePipelineState:ps];
+                            [enc setBuffer:sink offset:0 atIndex:0];
+                            [enc setBytes:&iters length:sizeof(iters) atIndex:1];
+                            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                            [enc endEncoding];
+                            [cb commit];
+                            if (prev != nil)
+                            {
+                                [prev waitUntilCompleted];
+                                const double us = (prev.GPUEndTime - prev.GPUStartTime) * 1e6;
+                                if (us > 1.0)
+                                    iters = static_cast<std::uint32_t>(std::clamp(iters * (150.0 / us), 1000.0, 2'000'000.0));
+                            }
+                            prev = cb;
+                        }
+                    }
+                }
+            }).detach();
+        }
+    }
+
+    bool seams_enabled(ggml_backend* backend)
+    {
+        // Read per pass (a test process compares both).
+        const char* e = std::getenv("TS_METAL_SEAM_EVENTS");
+        return !(e && e[0] == '0') && moe_enabled() && metal_device(backend) != nullptr;
+    }
+
+    bool seams_host_visible(const ggml_tensor* t)
+    {
+        if (t == nullptr) return false;
+        ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+        // ggml-metal's buffers (shared, private, mapped) are its device's; their context is a ggml_metal_buffer_t.
+        if (buffer == nullptr || buffer->buft == nullptr || g_backend == nullptr
+            || !ggml_backend_is_metal(g_backend)
+            || ggml_backend_buft_get_device(buffer->buft) != ggml_backend_get_device(g_backend)) return false;
+        return ggml_metal_buffer_is_shared(static_cast<ggml_metal_buffer_t>(buffer->context));
+    }
+
+    bool seams_begin(ggml_backend* backend, int n_seams)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm: not a Metal backend");
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+            ensure_library(s, device);
+            if (s.event == nil)
+            {
+                s.event = [device newSharedEvent];
+                if (s.event == nil) throw std::runtime_error("tsm: no shared event");
+                s.event_value = s.event.signaledValue;
+            }
+            if (keepalive_enabled()) keepalive_touch(device);
+            SeamPass& p = t_pass;
+            p.active = true;
+            p.n_seams = n_seams;
+            p.base = s.event_value + 4;
+            s.event_value = p.base + 2 * static_cast<std::uint64_t>(n_seams) + 4;
+            p.event = s.event;
+            p.current = -1;
+            p.cbs.assign(n_seams, nil);
+            p.geo.assign(n_seams, Geometry{});
+            static bool reported = false;
+            if (!reported)
+            {
+                reported = true;
+                std::fprintf(stderr, "[tsm] tiered MoE seams hand over on a shared event: segments are enqueued ahead "
+                    "(TS_METAL_SEAM_EVENTS=0 keeps a submit and a wait per seam)\n");
+            }
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
+
+    bool seams_active() { return t_pass.active; }
+
+    bool seams_enqueue(int seam, const tsg::MoeHotTier& tier, const ggml_tensor* moe_in, const ggml_tensor* sel_ids,
+                       const ggml_tensor* weights, ggml_tensor* out, int hidden, int n_ff, int T, int n_used)
+    {
+        SeamPass& p = t_pass;
+        try
+        {
+            if (!p.active || seam < 0 || seam >= p.n_seams) throw std::runtime_error("tsm: a seam outside the pass");
+            ggml_metal_device_t dev = metal_device(tier.backend != nullptr ? tier.backend : g_backend);
+            if (dev == nullptr) throw std::runtime_error("tsm: not a Metal backend");
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                const Geometry g = geometry(tier, hidden, n_ff);
+                p.geo[seam] = g;
+                const MoeArgs a = moe_args(tier, g, hidden, n_ff, T, n_used);
+                ensure_scratch(s, hidden, n_ff, T);
+                const ggml_metal_buffer_id x_id = tensor_id(moe_in), out_id = tensor_id(out), w_id = tier_id(tier);
+                const ggml_metal_buffer_id ids_id = tensor_id(sel_ids), wts_id = tensor_id(weights);
+                const std::uint64_t A = p.base + 2 * static_cast<std::uint64_t>(seam) + 1;
+
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                // xprep reads moe_in, and declares the routes the host reads: hazard tracking runs it after the segment
+                // that wrote them, so A means "the segment is done" (as in one command buffer).
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                encode_xprep(s, enc, x_id, hidden, T);
+                [enc useResource:(__bridge id<MTLBuffer>)ids_id.metal usage:MTLResourceUsageRead];
+                [enc useResource:(__bridge id<MTLBuffer>)wts_id.metal usage:MTLResourceUsageRead];
+                [enc endEncoding];
+                [cb encodeSignalEvent:p.event value:A];
+                // One wait: the host releases the seam with its plan written and its own routes already in moe_out.
+                // (A second wait for those, so they could overlap the kernels, cost more than it hid: each wait is a
+                // 0.1-0.15 ms round trip on an M5 Pro, and at one row the host has no routes of its own.)
+                [cb encodeWaitForEvent:p.event value:A + 1];
+                enc = [cb computeCommandEncoder];
+                encode_experts(s, enc, g, a, w_id, hidden, T, -1);
+                // the combine writes `out`, which the next segment reads: the segment runs after it
+                encode_combine(s, enc, out_id, hidden, T, n_used);
+                [enc endEncoding];
+                add_timing(cb, T, -1);
+                if (seam_profile())
+                {
+                    const std::uint64_t pass = p.base;
+                    const int n_seams = p.n_seams, rows = T;
+                    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                        seam_profile_note(pass, seam, n_seams, rows, done.GPUStartTime, done.GPUEndTime);
+                    }];
+                }
+                [cb commit];
+                p.cbs[seam] = cb;
+                s.last = cb;
+                report_once(g.gt, g.dt);
+            }
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
+
+    bool seams_wait(int seam)
+    {
+        SeamPass& p = t_pass;
+        if (!p.active || seam < 0 || seam >= p.n_seams || p.cbs[seam] == nil)
+        {
+            tsg::set_last_error("tsm: waiting on a seam that was not enqueued");
+            return false;
+        }
+        const std::uint64_t want = p.base + 2 * static_cast<std::uint64_t>(seam) + 1;
+        id<MTLCommandBuffer> cb = p.cbs[seam];
+        // Spin (a segment is ~0.5 ms; a sleep would cost more than it saves), yielding now and then, and watch the
+        // command buffer: one that failed never signals.
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::uint64_t n = 0; p.event.signaledValue < want; ++n)
+        {
+            if ((n & 255) == 255)
+            {
+                const MTLCommandBufferStatus st = cb.status;
+                if (st == MTLCommandBufferStatusError)
+                {
+                    tsg::set_last_error(std::string("tsm: a seam's command buffer failed: ")
+                        + (cb.error ? cb.error.localizedDescription.UTF8String : "?"));
+                    return false;
+                }
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60))
+                {
+                    tsg::set_last_error("tsm: a seam waited 60 s for the accelerator");
+                    return false;
+                }
+                std::this_thread::yield();
+            }
+        }
+        p.current = seam;
+        g_ka_last_ns.store(ka_now_ns(), std::memory_order_relaxed);
+        return true;
+    }
+
+    void seams_write_plan(int hidden, int n_ff, int T, int n_used, const std::int32_t* slots, const float* weights)
+    {
+        SeamPass& p = t_pass;
+        const std::size_t routes = static_cast<std::size_t>(T) * n_used;
+        p.slots.assign(slots, slots + routes);
+        p.weights.assign(weights, weights + routes);
+        p.hidden = hidden; p.n_ff = n_ff; p.T = T; p.n_used = n_used;
+        p.staged = true;
+    }
+
+    void seams_release_out()
+    {
+        SeamPass& p = t_pass;
+        const int seam = p.current;
+        if (p.staged)
+        {
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            // Nothing reads the plan now: the previous seam's kernels ran before this seam's segment.
+            write_plan(s, p.geo[seam], p.hidden, p.n_ff, p.T, p.n_used, p.slots.data(), p.weights.data());
+        }
+        else
+        {
+            // No split ran (it failed): an empty plan, nothing held.
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            std::vector<std::int32_t> none(static_cast<std::size_t>(std::max(1, p.T * p.n_used)), -1);
+            std::vector<float> zero(none.size(), 0.0f);
+            write_plan(s, p.geo[seam], p.hidden, p.n_ff, std::max(1, p.T), std::max(1, p.n_used), none.data(), zero.data());
+        }
+        p.staged = false;
+        p.event.signaledValue = p.base + 2 * static_cast<std::uint64_t>(seam) + 2;
+    }
+
+    long long seams_pass_count() { return g_seam_passes.load(std::memory_order_relaxed); }
+
+    void seams_end(bool failed)
+    {
+        SeamPass& p = t_pass;
+        if (!p.active) return;
+        if (failed && p.event != nil)
+            p.event.signaledValue = p.base + 2 * static_cast<std::uint64_t>(p.n_seams) + 2;   // every wait released
+        else
+            g_seam_passes.fetch_add(1, std::memory_order_relaxed);
+        p.active = false;
+        p.staged = false;
+        p.cbs.clear();
+        p.event = nil;
+    }
+}
+
+// ---- test probe: one layer's held routes through moe_encode, on expert bytes the caller gives (stacked [expert]
+// gate rows, up rows, down rows in GGUF blocks), against a reference the caller computes. Returns 1, or 0 with the
+// last error set (the formats or shapes the kernels do not take, or no Metal backend).
+TSG_EXPORT int TSGgml_TsmMoeProbe(int gate_type, int down_type, int hidden, int n_ff, int n_expert,
+    const void* gate, const void* up, const void* down, int T, int n_used, const std::int32_t* slots,
+    const float* weights, const float* x, float* out)
+{
+    using namespace tsg;
+    if (!ensure_backend()) return 0;
+    ggml_backend_t backend = g_backend;
+    ggml_backend_buffer_t wbuf = nullptr, abuf = nullptr;
+    ggml_context* ctx = nullptr;
+    try
+    {
+        const std::size_t gs = row_bytes(gate_type, hidden) * n_ff, ds = row_bytes(down_type, n_ff) * hidden;
+        const std::size_t total = (2 * gs + ds) * static_cast<std::size_t>(n_expert);
+        wbuf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(backend), total);
+        if (wbuf == nullptr) throw std::runtime_error("tsm probe: weight buffer");
+        MoeHotTier tier;
+        tier.backend = backend; tier.buffer = wbuf; tier.cpu_visible = true;
+        tier.type[0] = tier.type[1] = gate_type; tier.type[2] = down_type;
+        tier.stride[0] = tier.stride[1] = gs; tier.stride[2] = ds;
+        tier.offset[0] = 0; tier.offset[1] = gs * n_expert; tier.offset[2] = 2 * gs * n_expert;
+        tier.num_experts = tier.count = tier.fixed = n_expert;
+        const void* parts[3] = {gate, up, down};
+        auto* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(wbuf));
+        for (int p = 0; p < 3; ++p)
+        {
+            ggml_tensor view{};
+            view.type = GGML_TYPE_I8;
+            view.ne[0] = static_cast<std::int64_t>(tier.stride[p]) * n_expert;
+            view.ne[1] = view.ne[2] = view.ne[3] = 1;
+            view.nb[0] = 1; view.nb[1] = view.nb[2] = view.nb[3] = static_cast<std::size_t>(view.ne[0]);
+            view.buffer = wbuf;
+            view.data = base + tier.offset[p];
+            ggml_backend_tensor_set(&view, parts[p], 0, static_cast<std::size_t>(view.ne[0]));
+        }
+        ggml_init_params ip{};
+        ip.mem_size = 4 * ggml_tensor_overhead();
+        ip.no_alloc = true;
+        ctx = ggml_init(ip);
+        ggml_tensor* in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, T);
+        ggml_tensor* res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, T);
+        abuf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (abuf == nullptr) throw std::runtime_error("tsm probe: activation buffer");
+        ggml_backend_tensor_set(in, x, 0, ggml_nbytes(in));
+        if (!tsm::moe_supported(backend, tier, hidden, n_ff, T, n_used))
+            throw std::runtime_error("tsm probe: the kernels do not take these formats or shapes");
+        if (!tsm::moe_encode(backend, tier, in, res, hidden, n_ff, T, n_used, slots, weights)) throw std::runtime_error(g_last_error);
+        {
+            State& st = state();
+            std::lock_guard<std::mutex> lock(st.mu);
+            if (st.last != nil) [st.last waitUntilCompleted];
+        }
+        ggml_backend_tensor_get(res, out, 0, ggml_nbytes(res));
+        ggml_backend_buffer_free(abuf);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx);
+        return 1;
+    }
+    catch (const std::exception& e)
+    {
+        if (abuf) ggml_backend_buffer_free(abuf);
+        if (wbuf) ggml_backend_buffer_free(wbuf);
+        if (ctx) ggml_free(ctx);
+        set_last_error(e.what());
+        return 0;
+    }
+}
+
+// ---- test hook: seamed passes (tsm::seams_*) that ran to the end in this process.
+TSG_EXPORT long long TSGgml_TsmSeamPasses()
+{
+    return tsm::seams_pass_count();
+}

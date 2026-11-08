@@ -50,6 +50,18 @@ namespace TensorSharp.Cuda
         private readonly IntPtr moeDownDecode;
         private readonly IntPtr denseQ81Rows;
         private readonly IntPtr moeScatterAdd;
+        private readonly IntPtr moeStagePlan, moeStageCopy, moeUnstage, doorbellPublish, doorbellWaitAdd;
+        private readonly IntPtr doorbellPublishSkip, doorbellWaitAddSkip, moeDownDecodeShort;
+        private readonly IntPtr denseBf16Rows, denseQ81RowsSplitK, denseBf16RowsSplitK;
+        // The same products for 2..16 rows in one block, the weights read once (optional: a module before it launches a
+        // block per row).
+        private readonly IntPtr denseQ81RowsMulti;
+
+        /// <summary>Activation rows the one-block-for-every-row dense kernels take.</summary>
+        public const int DenseMultiMaxRows = 16;
+
+        // TS_DENSE_MULTI_ROWS=0: a block per row again (the products are the same; this is for measuring it).
+        private static readonly bool _denseMulti = Environment.GetEnvironmentVariable("TS_DENSE_MULTI_ROWS") != "0";
         private readonly IntPtr hcMean, hcMixPartials, hcPreFinish;
         private readonly IntPtr dsparkPrep;
         private readonly IntPtr dsparkGather;
@@ -68,6 +80,11 @@ namespace TensorSharp.Cuda
         private readonly IntPtr v41EngramGather;
         private readonly IntPtr[] gemv;
         private readonly IntPtr[] gemvWarp;
+        // The warp GEMV over BF16 weights (null on a module without it).
+        private readonly IntPtr[] gemvWarpBf16;
+
+        /// <summary>Whether <see cref="GemvBf16"/> is available.</summary>
+        public bool HasGemvBf16 => gemvWarpBf16 != null;
         private readonly IntPtr gemvCombine;
 
         /// <summary>
@@ -103,6 +120,18 @@ namespace TensorSharp.Cuda
                 module.GetFunction("ts_dsv4_gemv_warp_1_f32"), module.GetFunction("ts_dsv4_gemv_warp_4_f32"),
                 module.GetFunction("ts_dsv4_gemv_warp_8_f32"), module.GetFunction("ts_dsv4_gemv_warp_16_f32"),
             };
+            try
+            {
+                gemvWarpBf16 = new[]
+                {
+                    module.GetFunction("ts_dsv4_gemv_warp_bf16_1_f32"), module.GetFunction("ts_dsv4_gemv_warp_bf16_4_f32"),
+                    module.GetFunction("ts_dsv4_gemv_warp_bf16_8_f32"), module.GetFunction("ts_dsv4_gemv_warp_bf16_16_f32"),
+                };
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500)
+            {
+                gemvWarpBf16 = null;
+            }
             gemvCombine = module.GetFunction("ts_dsv4_gemv_combine_f32");
             hcRms = module.GetFunction("ts_dsv4_hc_rms_f32");
             hcGatesComb = module.GetFunction("ts_dsv4_hc_gates_comb_f32");
@@ -130,6 +159,8 @@ namespace TensorSharp.Cuda
             moeMma = module.GetFunction("ts_dsv4_moe_mma_f32");
             moeGateUpDecode = module.GetFunction("ts_dsv4_moe_gateup_decode_f32");
             moeDownDecode = module.GetFunction("ts_dsv4_moe_down_decode_f32");
+            try { moeDownDecodeShort = module.GetFunction("ts_dsv4_moe_down_decode_short_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { moeDownDecodeShort = IntPtr.Zero; }
             denseQ81Rows = module.GetFunction("ts_dsv4_dense_q81_rows_f32");
             moeScatterAdd = module.GetFunction("ts_dsv4_moe_scatter_add_f32");
             hcMean = module.GetFunction("ts_dsv4_hc_mean_f32");
@@ -144,6 +175,44 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500) { } // CUDA_ERROR_NOT_FOUND
             // Likewise for the IQ1_S / IQ2_S decoders and IQ2_XXS's grouped one.
             try { module.GetFunction("ts_dsv4_caps_lowbit_iq_experts"); DecodesLowBitIqExperts = true; }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { }
+            // Expert residency's per-expert tables and staging kernels, and the host experts' doorbell: a module
+            // older than them (the committed baseline before its refresh) runs every model that fits as before,
+            // and the engines refuse residency on it rather than run kernels that ignore the tables.
+            try
+            {
+                moeStagePlan = module.GetFunction("ts_dsv4_moe_stage_plan");
+                moeStageCopy = module.GetFunction("ts_dsv4_moe_stage_copy");
+                moeUnstage = module.GetFunction("ts_dsv4_moe_unstage");
+                HasExpertTables = true;
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { }
+            try
+            {
+                doorbellPublish = module.GetFunction("ts_moe_doorbell_publish");
+                doorbellWaitAdd = module.GetFunction("ts_moe_doorbell_wait_add");
+                HasHostExperts = true;
+                try
+                {
+                    doorbellPublishSkip = module.GetFunction("ts_moe_doorbell_publish_skip");
+                    doorbellWaitAddSkip = module.GetFunction("ts_moe_doorbell_wait_add_skip");
+                }
+                catch (CudaException ex) when (ex.ErrorCode == 500)
+                {
+                    doorbellPublishSkip = doorbellWaitAddSkip = IntPtr.Zero;
+                }
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { }
+            try
+            {
+                module.GetFunction("ts_dsv4_caps_legacy_quants");
+                DecodesLegacyQuants = true;
+                denseBf16Rows = module.GetFunction("ts_dense_bf16_rows_f32");
+                denseQ81RowsSplitK = module.GetFunction("ts_dsv4_dense_q81_rows_splitk_f32");
+                try { denseQ81RowsMulti = module.GetFunction("ts_dsv4_dense_q81_rows_multi_f32"); }
+                catch (CudaException ex) when (ex.ErrorCode == 500) { denseQ81RowsMulti = IntPtr.Zero; }
+                denseBf16RowsSplitK = module.GetFunction("ts_dense_bf16_rows_splitk_f32");
+            }
             catch (CudaException ex) when (ex.ErrorCode == 500) { }
         }
 
@@ -160,6 +229,17 @@ namespace TensorSharp.Cuda
         /// <see cref="CudaMoe.RequireExpertDecoders"/> refuses IQ1_S and IQ2_S experts there, and
         /// <see cref="CudaMoe.GroupedSupportsType"/> keeps IQ2_XXS on the warp-per-row kernels.</summary>
         public bool DecodesLowBitIqExperts { get; }
+
+        /// <summary>Whether the loaded module's warp-per-row decoders read Q2_0, Q4_0 and Q5_0 and it has the BF16
+        /// dense kernel (ISTA-DASLab's Qwen3.8-Flash-Next Q2_0 pack); an older module answers NaN for them.</summary>
+        public bool DecodesLegacyQuants { get; }
+
+        /// <summary>Whether the module's expert kernels read per-expert address tables and it has the staging
+        /// kernels (expert residency).</summary>
+        public bool HasExpertTables { get; }
+
+        /// <summary>Whether the module has the host experts' doorbell kernels.</summary>
+        public bool HasHostExperts { get; }
 
         public static Dsv4Kernels Create()
         {
@@ -485,20 +565,23 @@ namespace TensorSharp.Cuda
         }
 
         public void MoeGateUp(IntPtr gateW, IntPtr upW, Tensor act, Tensor counts, Tensor offsets, Tensor slotToken,
-            Tensor gateOut, Tensor upOut, int wtype, int ff, int inDim, long rowBytes, int nExpert, IntPtr stream)
+            Tensor gateOut, Tensor upOut, int wtype, int ff, int inDim, long rowBytes, int nExpert, IntPtr stream,
+            IntPtr gateTab = default, IntPtr upTab = default)
         {
             IntPtr a0 = gateW, a1 = upW, a2 = P(act), a3 = P(counts), a4 = P(offsets), a5 = P(slotToken), a6 = P(gateOut), a7 = P(upOut);
             int a8 = wtype, a9 = ff, a10 = inDim; long a11 = rowBytes;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11 };
+            IntPtr a12 = gateTab, a13 = upTab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13 };
             Launch(moeGateUp, (uint)nExpert, CeilDiv(ff, 32), 2, BlockSize, 0, stream, args);
         }
 
         public void MoeDown(IntPtr downW, Tensor act, Tensor counts, Tensor offsets, Tensor downOut,
-            int wtype, int e, int ff, long rowBytes, int nExpert, IntPtr stream)
+            int wtype, int e, int ff, long rowBytes, int nExpert, IntPtr stream, IntPtr downTab = default)
         {
             IntPtr a0 = downW, a1 = P(act), a2 = P(counts), a3 = P(offsets), a4 = P(downOut);
             int a5 = wtype, a6 = e, a7 = ff; long a8 = rowBytes;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8 };
+            IntPtr a9 = downTab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9 };
             Launch(moeDown, (uint)nExpert, CeilDiv(e, 32), 1, BlockSize, 0, stream, args);
         }
 
@@ -516,12 +599,14 @@ namespace TensorSharp.Cuda
 
         public void MoeGateUpStaged(IntPtr gateW, IntPtr upW, Tensor actQs, Tensor actD,
             Tensor counts, Tensor offsets, Tensor slotToken,
-            Tensor gateOut, Tensor upOut, int wtype, int ff, int inDim, long rowBytes, int nExpert, IntPtr stream)
+            Tensor gateOut, Tensor upOut, int wtype, int ff, int inDim, long rowBytes, int nExpert, IntPtr stream,
+            IntPtr gateTab = default, IntPtr upTab = default)
         {
             IntPtr a0 = gateW, a1 = upW, a2 = P(actQs), a3 = P(actD), a4 = P(counts), a5 = P(offsets), a6 = P(slotToken),
                 a7 = P(gateOut), a8 = P(upOut);
             int a9 = wtype, a10 = ff, a11 = inDim; long a12 = rowBytes;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };
+            IntPtr a13 = gateTab, a14 = upTab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14 };
             // grid.x = row tiles, grid.y = experts (blockIdx.x varies fastest,
             // so one expert's blocks stay co-resident and share its activations)
             uint rowTiles = CeilDiv(ff, StageWarps * StageRows);
@@ -529,11 +614,12 @@ namespace TensorSharp.Cuda
         }
 
         public void MoeDownStaged(IntPtr downW, Tensor actQs, Tensor actD, Tensor counts, Tensor offsets, Tensor downOut,
-            int wtype, int e, int ff, long rowBytes, int nExpert, IntPtr stream)
+            int wtype, int e, int ff, long rowBytes, int nExpert, IntPtr stream, IntPtr downTab = default)
         {
             IntPtr a0 = downW, a1 = P(actQs), a2 = P(actD), a3 = P(counts), a4 = P(offsets), a5 = P(downOut);
             int a6 = wtype, a7 = e, a8 = ff; long a9 = rowBytes;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9 };
+            IntPtr a10 = downTab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10 };
             uint rowTiles = CeilDiv(e, StageWarps * StageRows);
             Launch(moeDownStaged, rowTiles, (uint)nExpert, 1, BlockSize, 0, stream, args);
         }
@@ -549,44 +635,87 @@ namespace TensorSharp.Cuda
         /// or zero/null. <paramref name="slotToken"/> null: <paramref name="act"/> is in slot order.
         /// </summary>
         public void MoeMma(IntPtr w0, IntPtr w1, Tensor act, Tensor counts, Tensor offsets, Tensor slotToken,
-            Tensor out0, Tensor out1, int wtype, int rows, int inDim, long rowBytes, int nExpert, IntPtr stream)
+            Tensor out0, Tensor out1, int wtype, int rows, int inDim, long rowBytes, int nExpert, IntPtr stream,
+            IntPtr tab0 = default, IntPtr tab1 = default)
         {
             if (inDim % MoeMmaK != 0)
                 throw new ArgumentException($"expert input width {inDim} is not a multiple of {MoeMmaK}");
             IntPtr a0 = w0, a1 = w1, a2 = P(act), a3 = P(counts), a4 = P(offsets), a5 = P(slotToken),
                 a6 = P(out0), a7 = P(out1);
             int a8 = wtype, a9 = rows, a10 = inDim; long a11 = rowBytes;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11 };
-            uint pairs = w1 != IntPtr.Zero ? 2u : 1u;
+            IntPtr a12 = tab0, a13 = tab1;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13 };
+            uint pairs = w1 != IntPtr.Zero || tab1 != IntPtr.Zero ? 2u : 1u;
             Launch(moeMma, CeilDiv(rows, MoeMmaRows), (uint)nExpert, pairs, BlockSize, 0, stream, args);
         }
 
         /// <summary>Gate/up of every (token, selected expert) slot of <paramref name="nt"/> tokens,
         /// each computed as a lone token's decode step computes it.</summary>
         public void MoeGateUpDecode(IntPtr gateW, IntPtr upW, Tensor act, Tensor sel,
-            Tensor gateOut, Tensor upOut, int wtype, int ff, int inDim, long rowBytes, int nt, int nUsed, IntPtr stream)
+            Tensor gateOut, Tensor upOut, int wtype, int ff, int inDim, long rowBytes, int nt, int nUsed, IntPtr stream,
+            IntPtr gateTab = default, IntPtr upTab = default)
         {
             IntPtr a0 = gateW, a1 = upW, a2 = P(act), a3 = P(sel), a4 = P(gateOut), a5 = P(upOut);
             int a6 = wtype, a7 = ff, a8 = inDim; long a9 = rowBytes; int a10 = nUsed;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10 };
+            IntPtr a11 = gateTab, a12 = upTab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };
             Launch(moeGateUpDecode, (uint)(nt * nUsed), CeilDiv(ff, 32), 2, BlockSize, 0, stream, args);
         }
 
         /// <summary>Down projection of <paramref name="slots"/> (token, selected expert) slots, one
         /// activation row each.</summary>
         public void MoeDownDecode(IntPtr downW, Tensor act, Tensor sel, Tensor downOut,
-            int wtype, int e, int ff, long rowBytes, int slots, IntPtr stream)
+            int wtype, int e, int ff, long rowBytes, int slots, IntPtr stream, IntPtr downTab = default)
         {
             IntPtr a0 = downW, a1 = P(act), a2 = P(sel), a3 = P(downOut);
             int a4 = wtype, a5 = e, a6 = ff; long a7 = rowBytes;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
-            Launch(moeDownDecode, (uint)slots, CeilDiv(e, 32), 1, BlockSize, 0, stream, args);
+            IntPtr a8 = downTab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8 };
+            // Short rows (Qwen3.8-Flash-Next's 640-wide down projection): eight lanes a row.
+            bool shortRows = moeDownDecodeShort != IntPtr.Zero && ff <= MoeDownShortMaxFf && _moeDownShort;
+            Launch(shortRows ? moeDownDecodeShort : moeDownDecode, (uint)slots, CeilDiv(e, 32), 1, BlockSize, 0, stream, args);
         }
 
+        /// <summary>Expert widths up to which the down projection takes eight lanes a row.</summary>
+        public const int MoeDownShortMaxFf = 1024;
+        // TS_MOE_DOWN_SHORT=0: a warp a row at every width (for measuring it; the sums' order differs).
+        private static readonly bool _moeDownShort = Environment.GetEnvironmentVariable("TS_MOE_DOWN_SHORT") != "0";
+
         /// <summary>Whether <see cref="DenseQ81Rows"/> decodes this weight layout at this input width:
-        /// the formats the warp-per-row dot handles, at widths of whole 256-value super-blocks.</summary>
+        /// the formats the warp-per-row dot handles, at widths of whole decode units (32-value blocks,
+        /// 64-value Q2_0 blocks, 256-value super-blocks).</summary>
         public static bool DenseQ81RowsSupports(int wtype, int inDim)
-            => inDim > 0 && inDim % 256 == 0 && wtype is 8 or 10 or 11 or 12 or 13 or 14 or 16 or 17 or 18 or 20 or 21 or 23 or 39;
+            => inDim > 0 && (wtype switch
+            {
+                // 32-value blocks, decoded one block at a time: Q4_0, Q5_0, Q8_0, IQ4_NL, MXFP4. ISTA's Flash Next
+                // keeps a 640-wide shared-expert down projection in IQ4_NL, which a 256 rule sent to the shared
+                // matmul route: no decode step of that file was captured.
+                2 or 6 or 8 or 20 or 39 => inDim % 32 == 0,
+                42 => inDim % 64 == 0,       // Q2_0
+                // 256-value super-blocks.
+                10 or 11 or 12 or 13 or 14 or 16 or 17 or 18 or 21 or 23 => inDim % 256 == 0,
+                _ => false,
+            });
+
+        /// <summary>Dense projections up to this many output rows (and inputs at least this long) run split-K.</summary>
+        private const int SplitKMaxOutDim = 2048, SplitKMinInDim = 1024;
+
+        /// <summary>A split-K block: a warp per 32 decode units, at most 8 warps.</summary>
+        private static int SplitKThreads(int units) => Math.Clamp((units + 31) / 32 * 32, 32, 256);
+
+        /// <summary>out[rows, outDim] = x[rows, inDim] x bf16(w)^T for up to 16 rows of F32 activations (inDim even);
+        /// capturable. Needs <see cref="DecodesLegacyQuants"/>.</summary>
+        public void DenseBf16Rows(IntPtr w, IntPtr x, IntPtr output, int outDim, int inDim, int rows, IntPtr stream)
+        {
+            IntPtr a0 = w, a1 = x, a2 = output; int a3 = outDim, a4 = inDim, a5 = rows;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
+            if (outDim <= SplitKMaxOutDim && inDim >= SplitKMinInDim)
+            {
+                Launch(denseBf16RowsSplitK, (uint)outDim, 1, 1, SplitKThreads(inDim / 8), 0, stream, args);
+                return;
+            }
+            Launch(denseBf16Rows, CeilDiv((long)outDim * 32, BlockSize), 1, 1, BlockSize, 0, stream, args);
+        }
 
         /// <summary>out[rows, outDim] = act[rows, inDim] x w^T for an input already quantized to q8_1,
         /// one warp per output row. Reads only the buffers passed, so it can be captured.</summary>
@@ -594,9 +723,90 @@ namespace TensorSharp.Cuda
             int rows, IntPtr stream)
         {
             IntPtr a0 = w, a1 = act, a2 = output;
-            int a3 = wtype, a4 = outDim, a5 = inDim; long a6 = rowBytes;
+            int a3 = wtype, a4 = outDim, a5 = inDim; long a6 = rowBytes; int a7 = rows;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
+            // Few output rows of a long input (a 10240 -> 320 hyper-connection projection): split each row's units
+            // over a block's warps, or 32 rows a block would leave most of the GPU idle.
+            if (denseQ81RowsSplitK != IntPtr.Zero && outDim <= SplitKMaxOutDim && inDim >= SplitKMinInDim)
+            {
+                Launch(denseQ81RowsSplitK, (uint)outDim, (uint)rows, 1, SplitKThreads(inDim / 32), 0, stream, args);
+                return;
+            }
+            // A verify window or a batched step: every row in one block, a warp per output row, so each weight row is read
+            // from memory once (a block per row read it once per row: a 4-row window's LM head took 4x one row's time).
+            // Bit for bit the one-row kernel's sums. (A split-K grid of few outputs keeps a block per row: one block
+            // looping over the rows left the GPU too few blocks, and the shared expert slowed down.)
+            if (rows > 1 && rows <= DenseMultiMaxRows && denseQ81RowsMulti != IntPtr.Zero && _denseMulti)
+                Launch(denseQ81RowsMulti, CeilDiv(outDim, 8), 1, 1, BlockSize, 0, stream, args);
+            else
+                Launch(denseQ81Rows, CeilDiv(outDim, 32), (uint)rows, 1, BlockSize, 0, stream, args);
+        }
+
+        // ---- expert staging (expert residency): see the kernels' comment in tensorsharp_dsv4_kernels.cu ----
+
+        /// <summary>Staging slots for the distinct selected experts of <paramref name="slots"/> slots that live in
+        /// host memory; their table entries move to the staging copies.</summary>
+        public void MoeStagePlan(Tensor sel, int slots, in CudaExpertStageLayer layer, CudaExpertStage stage, IntPtr stream)
+        {
+            IntPtr a0 = P(sel); int a1 = slots;
+            IntPtr a2 = layer.IsHost, a3 = stage.StageOf, a4 = stage.StageList, a5 = stage.StageCount;
+            IntPtr a6 = layer.TabGate, a7 = layer.TabUp, a8 = layer.TabDown, a9 = stage.Staging;
+            long a10 = stage.Stride, a11 = layer.OffUp, a12 = layer.OffDown; int a13 = stage.Capacity;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13 };
+            Launch(moeStagePlan, CeilDiv(slots, BlockSize), 1, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>Copies at most <paramref name="maxStaged"/> planned experts into staging.</summary>
+        public void MoeStageCopy(in CudaExpertStageLayer layer, CudaExpertStage stage, int maxStaged, IntPtr stream)
+        {
+            const int Chunks = 16;
+            IntPtr a0 = stage.StageList, a1 = stage.StageCount, a2 = layer.SrcTabGate, a3 = layer.SrcTabUp, a4 = layer.SrcTabDown;
+            long a5 = layer.BytesGate, a6 = layer.BytesUp, a7 = layer.BytesDown;
+            IntPtr a8 = stage.Staging; long a9 = stage.Stride, a10 = layer.OffUp, a11 = layer.OffDown;
+            int a12 = stage.Capacity, a13 = Chunks;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13 };
+            Launch(moeStageCopy, (uint)(Math.Max(1, Math.Min(maxStaged, stage.Capacity)) * Chunks), 3, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>Points the staged experts' table entries back at their resting addresses and clears the plan.</summary>
+        public void MoeUnstage(in CudaExpertStageLayer layer, CudaExpertStage stage, IntPtr stream)
+        {
+            IntPtr a0 = stage.StageList, a1 = stage.StageCount, a2 = stage.StageOf;
+            IntPtr a3 = layer.TabGate, a4 = layer.TabUp, a5 = layer.TabDown, a6 = layer.RestTabGate, a7 = layer.RestTabUp, a8 = layer.RestTabDown;
+            int a9 = stage.Capacity;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9 };
+            Launch(moeUnstage, 1, 1, 1, BlockSize, 0, stream, args);
+        }
+
+        // ---- host experts (Strata's doorbell): see the kernels' comment in tensorsharp_dsv4_kernels.cu ----
+
+        /// <summary>Publishes a layer's FFN input (when a selected expert has no slot) and its selection into the
+        /// host-mapped mailbox, then rings the doorbell.</summary>
+        /// <summary>Whether the module rings the doorbell only for layers with a host expert (an older one rings it for every
+        /// layer, and the GPU waits for the host's echo each time).</summary>
+        public bool HasDoorbellSkip => doorbellPublishSkip != IntPtr.Zero;
+
+        /// <param name="missDev">With <see cref="HasDoorbellSkip"/>: a device int that records whether the layer rang the
+        /// host; <see cref="MoeDoorbellWaitAdd"/> then reads it. Zero rings for every layer.</param>
+        /// <param name="counts">With <paramref name="missDev"/>: a device [layers, nExpert] table each selection is counted
+        /// into (adaptive residency), or zero.</param>
+        public void MoeDoorbellPublish(Tensor x, Tensor sel, Tensor selW, IntPtr isHost, int n, int slots, int layer,
+            CudaHostExpertMailbox box, IntPtr stream, IntPtr missDev = default, IntPtr counts = default, int nExpert = 0)
+        {
+            IntPtr a0 = P(x), a1 = P(sel), a2 = P(selW), a3 = isHost; int a4 = n, a5 = slots, a6 = layer;
+            IntPtr a7 = box.XDev, a8 = box.IdsDev, a9 = box.WDev, a10 = box.HeaderDev, a11 = box.SeqDev, a12 = missDev, a13 = counts;
+            int a14 = nExpert;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14 };
+            Launch(missDev != IntPtr.Zero ? doorbellPublishSkip : doorbellPublish, 1, 1, 1, 1024, 0, stream, args);
+        }
+
+        /// <summary>Waits for the host's answer to the last doorbell and adds its sum into <paramref name="dst"/>.</summary>
+        public void MoeDoorbellWaitAdd(CudaHostExpertMailbox box, Tensor dst, int n, IntPtr stream, IntPtr missDev = default)
+        {
+            IntPtr a0 = box.FlagDev, a1 = box.SeqDev, a2 = box.CountDev, a3 = box.OutDev, a4 = P(dst); int a5 = n; IntPtr a6 = missDev;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6 };
-            Launch(denseQ81Rows, CeilDiv(outDim, 32), (uint)rows, 1, BlockSize, 0, stream, args);
+            Launch(missDev != IntPtr.Zero ? doorbellWaitAddSkip : doorbellWaitAdd, Math.Min(16u, CeilDiv(n, BlockSize)), 1, 1, BlockSize, 0,
+                stream, args);
         }
 
         public void MoeScatterAdd(Tensor downOut, Tensor rowOfSlot, Tensor wSel, Tensor shexp, Tensor ffnOut,
@@ -707,6 +917,18 @@ namespace TensorSharp.Cuda
         /// <see cref="GemvMaxRows"/> rows (inDim % 4 == 0). A narrow output splits the input across
         /// CTAs and combines the partial sums through <paramref name="scratch"/>
         /// (<see cref="GemvScratchFloats"/> floats).</summary>
+        /// <summary><see cref="Gemv"/> of a wide output (256 or more) over BF16 weights: the same sums, bit for bit, as
+        /// the F32 weights they widen to, at half the bytes. Requires <see cref="HasGemvBf16"/>.</summary>
+        public void GemvBf16(IntPtr x, IntPtr w, IntPtr y, int inDim, int outDim, int rows, IntPtr stream)
+        {
+            if ((inDim & 3) != 0 || rows > GemvMaxRows || outDim < 256)
+                throw new ArgumentException($"the BF16 GEMV takes inDim % 4 == 0, at most {GemvMaxRows} rows and 256 or more outputs");
+            IntPtr w0 = x, w1 = w, w2 = y;
+            int w3 = inDim, w4 = outDim, w5 = rows;
+            void** wargs = stackalloc void*[] { &w0, &w1, &w2, &w3, &w4, &w5 };
+            Launch(gemvWarpBf16[RowBoundIndex(rows)], (uint)((outDim + 3) / 4), 1, 1, 128, 0, stream, wargs);
+        }
+
         public void Gemv(IntPtr x, IntPtr w, IntPtr y, int inDim, int outDim, int rows, IntPtr stream, IntPtr scratch,
             int splitsOverride = 0)
         {

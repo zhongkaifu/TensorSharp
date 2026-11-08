@@ -292,7 +292,7 @@ namespace TensorSharp.Models
                 // this holder runs again. Check its flush status before a
                 // fused-kernel fallback can consume any older solo state.
                 if (_kvCacheHostStale) FlushArenaCache(_kCache);
-                return ForwardCoreInner(tokens);
+                return ForwardInSpans(tokens);
             }
             catch (Exception failure)
             {
@@ -307,6 +307,77 @@ namespace TensorSharp.Models
                 throw;
             }
         }
+
+        /// <summary>The longest prompt span that has fit in device memory since a longer one
+        /// failed to allocate its graph; <see cref="int.MaxValue"/> until then.</summary>
+        private int _spanTokenCap = int.MaxValue;
+        // Set by TryFusedTokenSpans when the first span of a forward could not allocate its
+        // graph and nothing ran: the forward is retried as shorter spans.
+        private bool _spanDidNotFit;
+
+        private sealed class SpanDidNotFitException : Exception
+        {
+            public SpanDidNotFitException(string detail) : base(detail) { }
+        }
+
+        /// <summary>A prompt span's graph grows with its length (a 4K-token one needs 5.1 GB of
+        /// compute buffer on Flash Next), and the expert tiers leave the device little beyond the
+        /// planned scratch. A prompt whose span cannot allocate is therefore not an error and must
+        /// not disable the span path - QSA has no other path, so every later request failed: it is
+        /// prefilled again as two halves, recursively, and the length that fit caps every later
+        /// prompt span so the failed allocation is not paid again. Prompts split, plain or for the
+        /// MTP head; a speculative verify window stays one span (its rows are committed together),
+        /// an image prompt carries one position table, and tensor parallelism and layer splits keep
+        /// their own paths.</summary>
+        private float[] ForwardInSpans(int[] tokens)
+        {
+            const int MinSpan = 64;
+            if (!PromptSpanMaySplit(tokens.Length))
+                return ForwardCoreInner(tokens);
+            float[] result = null;
+            int done = 0;
+            // A speculative prompt (the MTP head needs every row's hidden state) writes its rows
+            // into the caller's buffers: each span writes from its own first row on.
+            IntPtr hidden0 = _specHiddenOutput, logits0 = _specLogitsOutput;
+            try
+            {
+                while (done < tokens.Length)
+                {
+                    int len = Math.Min(tokens.Length - done, _spanTokenCap);
+                    int[] chunk = done == 0 && len == tokens.Length ? tokens : tokens[done..(done + len)];
+                    if (_specForwardActive)
+                    {
+                        _specHiddenOutput = hidden0 == IntPtr.Zero ? IntPtr.Zero
+                            : hidden0 + checked((nint)done * SpecFeatureSize * sizeof(float));
+                        _specLogitsOutput = _specAllLogitsRows ? logits0 + checked((nint)done * Config.VocabSize * sizeof(float)) : logits0;
+                    }
+                    try
+                    {
+                        result = ForwardCoreInner(chunk);
+                        done += len;
+                    }
+                    catch (SpanDidNotFitException fit)
+                    {
+                        if (len <= MinSpan)
+                            throw new InvalidOperationException(
+                                $"qwen4exp: a {len}-token prompt span does not fit in device memory: {fit.Message}");
+                        int cap = Math.Max(MinSpan, len / 2);
+                        _spanTokenCap = cap;
+                        Console.Error.WriteLine($"[qwen4exp] a {len}-token prompt span did not fit in device memory " +
+                            $"({fit.Message}); prompts now prefill in spans of at most {cap} tokens.");
+                    }
+                }
+            }
+            finally
+            {
+                if (_specForwardActive) { _specHiddenOutput = hidden0; _specLogitsOutput = logits0; }
+            }
+            return result;
+        }
+
+        private bool PromptSpanMaySplit(int seqLen)
+            => seqLen > 1 && (!_specForwardActive || _specPromptRows) && _pendingMRoPEPositions == null && _visionEmbeddingsList.Count == 0
+               && !IsTensorParallel && LayerSplitDegree <= 1 && _q4eStage == null && _q4eDistributed == null;
 
         private float[] ForwardCoreInner(int[] tokens)
         {
@@ -345,6 +416,16 @@ namespace TensorSharp.Models
             {
                 res.Dispose();
                 throw;
+            }
+            if (!spanDone && _spanDidNotFit)
+            {
+                // Nothing ran: the KV cache, the recurrent state and the cache head are
+                // as they were; only the QSA position history was written ahead.
+                _spanDidNotFit = false;
+                res.Dispose();
+                if (HasQsa) _qsaPositionCount = startPos;
+                _forwardSw.Stop();
+                throw new SpanDidNotFitException(GgmlBasicOps.LastNativeError("graph allocation failed"));
             }
             if (!spanDone && (IsTensorParallel || _specForwardActive || HasQsa))
             {
@@ -1273,6 +1354,15 @@ namespace TensorSharp.Models
                 {
                     int end = _q4eStage?.EndLayer ?? Config.NumLayers;
                     int begin = _q4eStage?.FirstLayer ?? 0, spanIdx = 0;
+                    // A token that runs as ONE span keys its persisted graph by width too: a plain step
+                    // and each verify width (2..8 rows) replay their own graph, where one shared slot
+                    // rebuilt the 48-layer graph whenever the width changed - nearly every step under a
+                    // block drafter, whose windows end wherever its confidence does. A holder owns 16
+                    // slots (ClaimSlotBase). Prompts keep the decode graph's slot, so their large compute
+                    // buffer is given back when decoding resumes.
+                    bool singleSpan = !IsTensorParallel && LayerSplitDegree <= 1 && _q4eStage == null
+                        && _diagnosticSpanLayers <= 0 && (fusePle || Array.IndexOf(_isPle, true) < 0);
+                    int widthSlot = singleSpan && seqLen >= 2 && seqLen <= 8 ? seqLen - 1 : 0;
                     for (int il = begin; il <= end; il++)
                     {
                         // The host-side PLE layer cuts the token into spans - unless
@@ -1323,7 +1413,14 @@ namespace TensorSharp.Models
                                 if (input.Length != target.Length) throw new InvalidOperationException("Diagnostic span input shape mismatch.");
                                 input.AsSpan().CopyTo(target);
                             }
-                            bool ok = ExecuteQwen4ExpSpan(
+                            // DFlash: every span taps its own layers into the caller's feature rows;
+                            // the drafter never reads the final residual.
+                            bool dflashTaps = _specForwardActive && _dflashTapLayers != null && _specHiddenOutput != IntPtr.Zero;
+                            if (dflashTaps) SetDFlashTaps(_specHiddenOutput);
+                            bool ok;
+                            try
+                            {
+                            ok = ExecuteQwen4ExpSpan(
                                 (IntPtr)fp, (IntPtr)gp, (IntPtr)ap, (IntPtr)kp,
                                 begin, il,
                                 (IntPtr)GetFloatPtr(res), (IntPtr)mp,
@@ -1333,17 +1430,28 @@ namespace TensorSharp.Models
                                 _kvCacheCapacity, totalLen, startPos,
                                 _ropeDimCount, Config.RopeBase, 1.0f / Config.RopeScale, _attnScale,
                                 _numExperts, _numExpertsUsed, _expertFf, _sharedFf,
-                                Config.Eps, cacheSlot: spanIdx + _seqSlotBase,
+                                Config.Eps, cacheSlot: spanIdx + _seqSlotBase + widthSlot,
                                 head: headPtr, logitsOut: logitsPtr,
                                 ple: plePtr, pleLayer: pleLayerArg, pleEmb: pleEmbPtr,
                                 mropePos: mropePtr, mropeSections: sectPtr,
                                 ropePosition: useMrope ? -1 : startPos - _mropeCacheGap,
                                 device: DeviceForLayer(begin),
-                                hiddenOut: last && _specForwardActive ? _specHiddenOutput
+                                hiddenOut: last && _specForwardActive && !dflashTaps ? _specHiddenOutput
                                     : last && !string.IsNullOrEmpty(_driverDump) ? (IntPtr)GetFloatPtr(res) : IntPtr.Zero,
                                 logitsRows: last && _specForwardActive && _specAllLogitsRows ? seqLen : 1,
                                 qsa: (IntPtr)qp, qsaPositions: (IntPtr)qpositions, qsaPositionCount: _qsaPositionCount);
+                            }
+                            finally
+                            {
+                                if (dflashTaps) SetDFlashTaps(IntPtr.Zero);
+                            }
                             if (ok && last) _spanLogitsValid = true;
+                            if (!ok && !ranAnything && PromptSpanMaySplit(seqLen)
+                                && GgmlBasicOps.LastNativeError("").Contains("failed to allocate graph tensors", StringComparison.Ordinal))
+                            {
+                                _spanDidNotFit = true;
+                                return false;
+                            }
                             if (!ok)
                             {
                                 _tokenGraphUnsupported = true;
@@ -1652,6 +1760,11 @@ namespace TensorSharp.Models
         {
             if (_quantWeights.TryGetValue(name, out var qw))
             {
+                if (TryHcQ8(name, qw, out ptr, out bytes))
+                {
+                    type = GgmlTypeQ8_0;
+                    return true;
+                }
                 ptr = qw.CacheKey; type = qw.GgmlType; bytes = qw.RawBytes;
                 return true;
             }
@@ -1726,6 +1839,7 @@ namespace TensorSharp.Models
             StopPleTableWarm();
             DetachRoutingProfile();
             DisposeMtpHead();
+            DisposeDFlash();
             ReleaseSpecSnapshot();
             // DisposeAllFusedHolders leaves the checked-out holder to the
             // direct tensor disposal below. Drop its native registration first:
@@ -1736,6 +1850,7 @@ namespace TensorSharp.Models
             DisposeAllFusedHolders();
             if (IsGgmlBackend)
                 GgmlBasicOps.Qwen4ExpReleaseAllSeqState();
+            FreeHcQ8();
             if (_kCache != null)
                 foreach (var t in _kCache) t?.Dispose();
             if (_vCache != null)

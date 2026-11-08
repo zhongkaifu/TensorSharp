@@ -172,6 +172,16 @@ namespace TensorSharp.Runtime.Speculative
         float SpecPreferredBlockGate => float.NaN;
 
         /// <summary>
+        /// Default per-token confidence gate this trunk wants for a learned PER-TOKEN head
+        /// (<see cref="DraftHeadSpeculator.MinDraftProb"/>), or NaN for the algorithm's own default
+        /// (<see cref="DraftHeadSpeculator.DefaultGate"/>). Like the window preference it only replaces a
+        /// default: an explicit <c>--spec-pmin</c> always wins. Where each verify row costs a sizeable share of a
+        /// decode step (a sparse-MoE trunk whose rows each route their own experts), a draft the head is unsure of
+        /// costs more than it saves.
+        /// </summary>
+        float SpecPreferredDraftGate => float.NaN;
+
+        /// <summary>
         /// True when a verify batch has already written reusable attention KV for
         /// EVERY token it processed (so the accepted prefix's KV is correct in the
         /// live cache), and the model has no recurrent state that a re-forward would

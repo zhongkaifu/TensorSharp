@@ -920,6 +920,9 @@ namespace tsg
         int activation = 0;          // tsg MoE activation enum (see moe_ffn_host_experts)
         float oai_alpha = 1.702f;
         float oai_limit = 7.0f;
+        // activation 0 only: > 0 clamps before silu(gate) * up as DeepSeek V4.1 does
+        // (gate to (-inf, limit], up to [-limit, limit]); the host decode kernel honours it.
+        float swiglu_limit = 0.0f;
 
         int num_experts = 0;
         int n_used = 0;
@@ -968,6 +971,15 @@ namespace tsg
         // background reads (and is skipped, with no extra synchronize, when this
         // pass deferred none). moe_in = sel_ids = weights = the tensor it ends at.
         bool io_wait = false;
+        // The F32 [hidden, seq] sum of the tier's routes when it is ONE group (no
+        // io_wait cut): every node up to it in the next segment depends only on what
+        // the seam has already uploaded, never on moe_out, so the seam launches that
+        // slice on the accelerator before it computes the cold routes on the host and
+        // the two run at the same time (host_moe_execute_segments).
+        ggml_tensor* hot_out = nullptr;
+        // TensorSharp Metal (tsm/tsm_moe.h): the tier's routes computed at the seam by the grouped expert kernels,
+        // into this pinned F32 [hidden, seq] input, instead of MUL_MAT_ID in the next segment. Null otherwise.
+        ggml_tensor* tsm_hot = nullptr;
     };
 
     // One layer's accelerator expert slots: `fixed` slots hold the layer's
@@ -991,6 +1003,10 @@ namespace tsg
         std::uint64_t clock = 0, step = 0;
         std::uint64_t hits = 0, misses = 0, overflow = 0;
         std::uint64_t deferred = 0;       // misses read in the background (verify overlap)
+        // Adaptive fixed slots (TS_MOE_TIER_ADAPT, discrete VRAM): decayed route counts per
+        // expert; every few seams the hottest host-served experts take the coldest slots.
+        std::vector<float> heat;
+        std::uint64_t adapt_calls = 0;
     };
 
     using MulMatIdFn = ggml_tensor* (*)(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*);
@@ -1022,6 +1038,13 @@ namespace tsg
     // pointer outside every registered mapping resolves to itself.
     void host_expert_io_resolve(const void* const* sources, const std::size_t* bytes, int count,
         const std::uint8_t** resolved);
+    // Read slices ahead into cache slots on a background team and return at once
+    // (Strata's lookahead); the next resolve waits for the batch before reading any
+    // slot. Slices already cached are skipped. Callers hold the resolver's lock
+    // (host_moe_prefetch_experts takes it). Stats: slices read ahead, and how many
+    // of them a later resolve used.
+    void host_expert_io_prefetch(const void* const* sources, const std::size_t* bytes, int count);
+    void host_expert_io_prefetch_stats(std::uint64_t& reads, std::uint64_t& used);
     // Prefill streaming: read `ranges` (offsets from source_base, a registered
     // mapping) straight into CPU-visible accelerator memory at destination_base +
     // offset, in parallel. False when source_base is not registered.
@@ -1390,10 +1413,15 @@ namespace tsg
         const std::int32_t* sel_ids = nullptr;
         const float* weights = nullptr;
     };
+    // after_split (tiered layers only): called once the tier's slot ids and weights
+    // are uploaded and before the host computes the cold routes, so the caller can
+    // launch the accelerator's half (HostMoeSegment::hot_out) to run alongside.
+    bool host_moe_overlap_enabled();
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
                                   HostMoeStagedInputs* staged = nullptr,
                                   bool allow_device_stream = true,
-                                  bool* output_on_device = nullptr);
+                                  bool* output_on_device = nullptr,
+                                  void (*after_split)(void*) = nullptr, void* after_split_ctx = nullptr);
 
     // One-token routed experts on the host (ggml_ops_host_moe_decode.cpp): ggml's
     // CPU dot kernels on a team woken once per layer instead of a ggml graph per
@@ -1406,8 +1434,19 @@ namespace tsg
     // Bounded independent decode rows (1..8), one team dispatch per layer.
     // Dot products and expert summation order remain identical to solo decode.
     // Unsupported input returns false without writing any output row.
+    // `ahead`: experts (of ahead->hm's layer, possibly another one) whose gate/up/down
+    // slices are read ahead into the explicitly read cache (host_expert_io_prefetch)
+    // once this call's own slices are resolved, so the reads overlap its compute.
+    // Keyed exactly as a later call resolves them; a no-op when the cache is off.
+    struct HostMoePrefetch
+    {
+        const HostMoeSegment* hm = nullptr;
+        const std::int32_t* ids = nullptr;
+        int count = 0;
+    };
     bool host_moe_decode_experts_rows(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
-                                     const float* weights, float* out, const std::uint8_t* skip = nullptr);
+                                     const float* weights, float* out, const std::uint8_t* skip = nullptr,
+                                     const HostMoePrefetch* ahead = nullptr);
     // Opt-in Qwen4Exp CUDA expert tier: 1 computed, 0 unsupported/disabled,
     // -1 execution failed. Owns bounded compact quantized slots and graphs.
     // x/weights both null reads hm.moe_in/hm.weights through CUDA row copies;
@@ -1420,6 +1459,9 @@ namespace tsg
     void prefetch_mapped_ranges(const std::uint8_t* base,
                                const std::vector<std::pair<std::size_t, std::size_t>>& ranges);
     void host_moe_decode_release();
+    // Monotonic totals of the host expert kernel (host_moe_decode_experts_rows): time in ns,
+    // calls, and expert slots it computed. For telemetry.
+    void host_moe_decode_counters(long long* ns, long long* calls, long long* slots);
     void host_moe_upload_segment(const HostMoeSegment& hm, const float* data);
     void host_moe_zero_segment(const HostMoeSegment& hm);
 
@@ -2062,6 +2104,11 @@ struct Q4eQsaInputs
     ggml_tensor* block_positions = nullptr;
     ggml_tensor* query_positions = nullptr;
     ggml_tensor* bias = nullptr;
+    // Incremental pooling (Q4eQsaGraph::pooled): the complete blocks this step's cells belong to - their slots, member
+    // cells and positions - padded with a scratch slot.
+    ggml_tensor* new_blocks = nullptr;
+    ggml_tensor* new_block_cells = nullptr;
+    ggml_tensor* new_block_positions = nullptr;
 };
 
 struct Q4eQsaGraph
@@ -2071,6 +2118,10 @@ struct Q4eQsaGraph
     ggml_tensor* cache = nullptr;
     // Optional test-only outputs, never retained by production graphs.
     std::vector<ggml_tensor*>* probes = nullptr;
+    // The layer's persistent pooled keys [head_dim, blocks + 1] (Q4eSeqStateEntry::aux), or null: pool every block.
+    // With `incremental`, only the inputs' new blocks are pooled and written; else every block is, and written too.
+    ggml_tensor* pooled = nullptr;
+    bool incremental = false;
 };
 
 // A weight binding resolved through the resident cache, remembered so a
@@ -2150,6 +2201,14 @@ struct Q4eSeqStateEntry
     ggml_backend_buffer_t buf = nullptr;
     std::size_t bytes = 0;
     bool ready = false;
+    // A QSA layer's pooled indexer keys (one F32 row per complete block), derived from `buf`'s raw keys and kept so a
+    // step pools only the blocks it completes. Valid while aux_ready and the span itself last wrote the raw keys up to
+    // aux_upto: any other writer (an upload, the concurrent-decode arena) leaves aux_upto behind the next step's start,
+    // and that step pools every block again.
+    ggml_backend_buffer_t aux = nullptr;
+    std::size_t aux_bytes = 0;
+    bool aux_ready = false;
+    std::int64_t aux_upto = -1;
 };
 
 // Create-or-grow the active rank's entry for `key` (the span/per-layer path).

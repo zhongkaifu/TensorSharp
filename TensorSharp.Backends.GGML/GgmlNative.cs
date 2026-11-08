@@ -4614,6 +4614,15 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static partial void TSGgml_Qwen4ExpCaptureVerifyRows(int enable);
         [LibraryImport(DllName)]
+        internal static partial int TSGgml_Qwen4ExpSetFeatureTaps(IntPtr layers, int count, IntPtr output, int rowStride);
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_TsmMoeProbe(int gateType, int downType, int hidden, int nFf, int nExpert,
+            IntPtr gate, IntPtr up, IntPtr down, int rows, int nUsed, IntPtr slots, IntPtr weights, IntPtr x, IntPtr output);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_TsmSeamPasses();
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_Qwen4ExpQsaIncrementalSteps();
+        [LibraryImport(DllName)]
         internal static partial int TSGgml_Qwen4ExpCommitVerifyRow(int row, int rows);
 
         // Priority-ranked accelerator tier for host-offloaded routed experts and
@@ -4638,6 +4647,14 @@ internal enum GgmlIndexReductionOp
         internal static partial int TSGgml_HostExpertIoRegister(IntPtr baseAddress, long length, string path);
         [LibraryImport(DllName)]
         internal static partial void TSGgml_HostExpertIoSetBudget(long bytes);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_HostAvailableMemoryBytes();
+        [LibraryImport(DllName)]
+        internal static unsafe partial int TSGgml_MoeOffloadCounters(long* output, int capacity);
+        [LibraryImport(DllName)]
+        internal static unsafe partial int TSGgml_HostExpertRows(IntPtr gate, IntPtr up, IntPtr down,
+            int gateType, int upType, int downType, int numExperts, int hidden, int nFf, int nUsed, int rows,
+            float* x, int* ids, float* weights, byte* skip, float* output);
         [LibraryImport(DllName)]
         internal static partial void TSGgml_HostExpertIoUnregister(IntPtr baseAddress);
         [LibraryImport(DllName)]

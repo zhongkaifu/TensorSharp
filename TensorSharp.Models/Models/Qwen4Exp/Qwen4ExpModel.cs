@@ -106,7 +106,10 @@ namespace TensorSharp.Models
                 ConfigureQwenDistributed(ggufPath);
                 ValidateQwen4ExpTensorParallelMetadata();
                 ParseTokenizer();
-                if (!string.IsNullOrWhiteSpace(draftGgufPath))
+                // --draft-model names either the shared MTP head or a DFlash/DFlash2
+                // drafter; the file's architecture decides. DFlash attaches last.
+                string dflashPath = IsDFlashDraftFile(draftGgufPath) ? draftGgufPath : null;
+                if (!string.IsNullOrWhiteSpace(draftGgufPath) && dflashPath == null)
                     LoadMtpDraftWeights(draftGgufPath);
 
                 Console.WriteLine($"Model: {ArchitectureId}, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
@@ -137,6 +140,8 @@ namespace TensorSharp.Models
                 PlanExpertPlacement();
                 FinalizeMtpHead();
                 StartPleTableWarm();
+                if (dflashPath != null)
+                    TryLoadQwen4ExpDFlash(dflashPath);
             }
             catch (Exception failure)
             {

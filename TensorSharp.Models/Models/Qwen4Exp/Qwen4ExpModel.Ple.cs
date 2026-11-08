@@ -377,22 +377,95 @@ namespace TensorSharp.Models
         /// that is room for the table: on a machine that cannot hold it as well as the
         /// experts (the larger-than-memory Mac) the read would only evict them.
         /// </summary>
+        /// <remarks>
+        /// The routed experts the host serves are warmed with it, most-routed first: on a discrete
+        /// GPU every route its tier does not hold is computed on the host from the mapping, and on
+        /// a network mount a cold expert is several round trips inside a decode step. Measured on a
+        /// 5090 VM with the GGUF on geesefs: the first answer after a cold load stalled on exactly
+        /// these faults. Everything is read through the checkpoint's shared handles (an open() on
+        /// such a mount drops the file's whole page cache), within what the cgroup can keep cached.
+        /// </remarks>
         private void StartPleTableWarm()
         {
-            if (!_pleTableOnDisk || _gguf == null
-                || !_quantWeights.TryGetValue("per_layer_token_embd.weight", out var qw)
-                || MappedTableWarm.HostMemoryAvailable() <= 0)
+            long available = MappedTableWarm.HostMemoryAvailable();
+            if (_gguf == null || available <= 0)
                 return;
-            long ptr = qw.Data.ToInt64();
-            foreach (var (basePtr, length, path) in _gguf.MappedRegions())
+            long room = available - MappedTableWarm.Headroom;
+            var ranges = new List<(IntPtr Pointer, long Bytes)>();
+            long pleBytes = 0, expertBytes = 0;
+            int experts = 0;
+            if (_pleTableOnDisk && _quantWeights.TryGetValue("per_layer_token_embd.weight", out var qw)
+                && qw.RawBytes <= room)
             {
-                long offset = ptr - basePtr.ToInt64();
-                if (offset < 0 || offset + qw.RawBytes > length)
-                    continue;
-                _pleWarmCancel = new System.Threading.CancellationTokenSource();
-                _pleWarm = MappedTableWarm.Start(new[] { (path, offset, qw.RawBytes) }, "qwen4exp",
-                    "the PLE n-gram table", _pleWarmCancel.Token);
+                ranges.Add((qw.Data, qw.RawBytes));
+                pleBytes = qw.RawBytes;
+                room -= qw.RawBytes;
+            }
+            foreach (var (pointer, bytes) in HostServedExpertSlices())
+            {
+                if (bytes > room) break;
+                ranges.Add((pointer, bytes));
+                room -= bytes;
+                expertBytes += bytes;
+                experts++;
+            }
+            if (ranges.Count == 0)
                 return;
+            experts /= 3;
+            string what = (pleBytes > 0 ? "the PLE n-gram table" : "") + (pleBytes > 0 && experts > 0 ? " and " : "")
+                + (experts > 0 ? $"{experts} host-served experts" : "");
+            _pleWarmCancel = new System.Threading.CancellationTokenSource();
+            var cancel = _pleWarmCancel.Token;
+            GgufFile gguf = _gguf;
+            _pleWarm = System.Threading.Tasks.Task.Run(() =>
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                try
+                {
+                    long read = gguf.WarmMappedRanges(ranges, GgufFile.DefaultWarmThreads(), cancel);
+                    if (!cancel.IsCancellationRequested)
+                        Console.Error.WriteLine($"[qwen4exp] warmed {read / (double)(1L << 30):F1} GiB of {what} " +
+                            $"in {sw.Elapsed.TotalSeconds:F1}s");
+                }
+                catch (OperationCanceledException) { }
+            });
+            // TS_HOST_WARM_WAIT=1: the load returns only once the warm is done (benchmarks that must
+            // not time the first requests against a cold network mount).
+            if (Environment.GetEnvironmentVariable("TS_HOST_WARM_WAIT") == "1")
+            {
+                Console.WriteLine($"[qwen4exp] warming {(pleBytes + expertBytes) / (double)(1L << 30):F1} GiB of {what} " +
+                    "before serving (TS_HOST_WARM_WAIT=1)");
+                _pleWarm.Wait();
+                return;
+            }
+            Console.WriteLine($"[qwen4exp] warming {(pleBytes + expertBytes) / (double)(1L << 30):F1} GiB of {what} " +
+                "in the background (the first answers read the rest from the model files)");
+        }
+
+        /// <summary>The (pointer, bytes) slices of every routed expert the host computes, one per
+        /// gate/up/down part, the most-routed first when a routing profile covers the model.</summary>
+        private IEnumerable<(IntPtr Pointer, long Bytes)> HostServedExpertSlices()
+        {
+            if (_expertOnHost == null || _backend == BackendType.GgmlMetal)
+                yield break;   // Metal reads host experts explicitly, into slots (ConfigureHostExpertIo)
+            var order = new List<(ulong Count, int Layer, int Expert)>();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!IsExpertLayerOnHost(l) || !TryGetLayerExperts(l, out _, out _, out _))
+                    continue;
+                var held = new HashSet<int>(_tierExperts?[l] ?? Array.Empty<int>());
+                ReadOnlySpan<ulong> counts = _routingProfile != null && _routingProfile.CoversLayers(new[] { l })
+                    ? _routingProfile.Counts(l) : default;
+                for (int e = 0; e < _numExperts; e++)
+                    if (!held.Contains(e))
+                        order.Add((counts.IsEmpty ? 0 : counts[e], l, e));
+            }
+            order.Sort((a, b) => b.Count.CompareTo(a.Count));
+            foreach (var (_, l, e) in order)
+            {
+                TryGetLayerExperts(l, out var gate, out var up, out var down);
+                foreach (var w in new[] { gate, up, down })
+                    yield return (w.Data + (nint)(e * w.PerExpertRawBytes), w.PerExpertRawBytes);
             }
         }
 

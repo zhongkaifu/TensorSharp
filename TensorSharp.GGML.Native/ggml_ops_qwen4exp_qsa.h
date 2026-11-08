@@ -18,7 +18,15 @@ struct Q4eQsaPlan
     std::vector<int32_t> cell_blocks, block_cells, block_positions, query_positions;
     std::vector<float> bias;
     bool ranked = false;
+    // Text order (cell c at position c): block b is cells [b * ratio, (b + 1) * ratio) at every step, so a block's
+    // pooled key, once made, stays valid until one of its cells is written again. new_* list the complete blocks this
+    // step's cells belong to (q4e_qsa_new_blocks), padded to a fixed count with a scratch slot.
+    bool identity = false;
+    std::vector<int32_t> new_blocks, new_block_cells, new_block_positions;
 };
+
+// The fixed number of blocks a step of `query_count` cells can complete or rewrite, for the graph's input shapes.
+inline int q4e_qsa_new_block_capacity(int query_count, int ratio) { return (query_count + ratio - 1) / ratio + 1; }
 
 inline Q4eQsaPlan q4e_qsa_plan(const int32_t* positions, int live_keys,
     int padded_keys, int query_start, int query_count, int ratio)
@@ -96,6 +104,27 @@ inline Q4eQsaPlan q4e_qsa_plan(const int32_t* positions, int live_keys,
         for (int b = 0; b < full; ++b)
             result.bias[(size_t)i * blocks + b] = starts[b] >= tail ? 1e9f : 0.f;
         if (full < blocks) result.bias[(size_t)i * blocks + dead] = 1e9f;
+    }
+    if (!result.ranked)
+    {
+        result.identity = true;
+        for (int c = 0; c < live_keys && result.identity; ++c) result.identity = positions[3LL * c] == c;
+    }
+    if (result.identity)
+    {
+        // The complete blocks holding this step's cells; slot (scratch) = `scratch` pads, reading cell 0.
+        const int cap = q4e_qsa_new_block_capacity(query_count, ratio);
+        const int scratch = (padded_keys + ratio - 1) / ratio;   // one past the last block the pooled cache holds
+        result.new_blocks.assign(cap, scratch);
+        result.new_block_cells.assign((size_t)ratio * cap, 0);
+        result.new_block_positions.assign((size_t)4 * cap, 0);
+        int n = 0;
+        for (int b = query_start / ratio; b <= (query_start + query_count - 1) / ratio && b < full && n < cap; ++b, ++n)
+        {
+            result.new_blocks[n] = b;
+            for (int s = 0; s < ratio; ++s) result.new_block_cells[(size_t)n * ratio + s] = result.block_cells[(size_t)b * ratio + s];
+            for (int s = 0; s < 4; ++s) result.new_block_positions[(size_t)s * cap + n] = result.block_positions[(size_t)s * blocks + b];
+        }
     }
     return result;
 }

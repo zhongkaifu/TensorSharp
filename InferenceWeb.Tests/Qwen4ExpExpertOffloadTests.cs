@@ -25,10 +25,13 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     private readonly ITestOutputHelper _output;
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-qwen4exp-offload-" + Guid.NewGuid().ToString("N"));
     private readonly EnvScope _env = new EnvScope();
+    // Adaptive tier slots are on by default; these tests hold fixed slots to the accelerator unless they turn it on.
+    private readonly NativeEnvScope _nativeEnv = new NativeEnvScope();
 
     public Qwen4ExpExpertOffloadTests(ITestOutputHelper output)
     {
         _output = output;
+        _nativeEnv.Set("TS_MOE_TIER_ADAPT", "0");
         Directory.CreateDirectory(_dir);
         _env.Set("MAX_CONTEXT", "1024");
         _env.ClearSpeculationVars();
@@ -41,6 +44,7 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     public void Dispose()
     {
         MoeCpuOffloadConfig.Reset();
+        _nativeEnv.Dispose();
         _env.Dispose();
         try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
     }
@@ -54,18 +58,21 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     private float[][] Run(BackendType backend, Action configure) => Run(backend, configure, Prompt);
 
     private float[][] Run(BackendType backend, Action configure, int[] prompt, Action<ModelBase>? loaded = null,
-        Action<ModelBase>? done = null)
+        Action<ModelBase>? done = null) => Run(backend, configure, prompt, Steps, loaded, done);
+
+    private float[][] Run(BackendType backend, Action configure, int[] prompt, int[] steps, Action<ModelBase>? loaded,
+        Action<ModelBase>? done, string? fixture = null)
     {
         MoeCpuOffloadConfig.Reset();
         configure();
-        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "qwen4exp.gguf"), 16);
+        string path = fixture ?? Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "qwen4exp.gguf"), 16);
         using ModelBase model = ModelBase.Create(path, backend);
         Assert.IsType<Qwen4ExpModel>(model);
         loaded?.Invoke(model);
-        var rows = new float[Steps.Length + 1][];
+        var rows = new float[steps.Length + 1][];
         rows[0] = (float[])model.ForwardRefill(prompt).Clone();
-        for (int i = 0; i < Steps.Length; i++)
-            rows[i + 1] = (float[])model.Forward(new[] { Steps[i] }).Clone();
+        for (int i = 0; i < steps.Length; i++)
+            rows[i + 1] = (float[])model.Forward(new[] { steps[i] }).Clone();
         done?.Invoke(model);
         return rows;
     }
@@ -114,6 +121,8 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     [GgmlFact(BackendType.GgmlMetal)]
     public void TieredExperts_AnswerAsTheAccelerator_Metal()
     {
+        // ggml's tier mechanics on its own kernels; the grouped tsm kernels are held to these in TsmExperts_*.
+        _nativeEnv.Set("TS_METAL_MOE", "0");
         float[][] device = Run(BackendType.GgmlMetal, () => { });
         int experts = 0;
         float[][] wide = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, model =>
@@ -131,6 +140,126 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         AssertClose("tier, narrow window", narrow, device, Bound(BackendType.GgmlMetal, hostPrefill: true));
     }
 
+    /// <summary>A tier's held routes on Metal through tsm's grouped expert kernels (Strata's, tsm/kernels) against
+    /// ggml-metal's MUL_MAT_ID over the same slots, format by format: every route held (the window covers them all), so
+    /// the decode steps differ only in the expert arithmetic. Prompts (40 rows) take MUL_MAT_ID either way.</summary>
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData("iq3s-iq4nl")]
+    [InlineData("q2_0")]
+    [InlineData("q4k-q51")]
+    [InlineData("iq2xs-iq4nl")]
+    public void TsmExperts_AnswerAsMulMatId_Metal(string formats)
+    {
+        string path = formats switch
+        {
+            "q2_0" => Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q2_0.gguf"), 16,
+                expertGateUpType: SyntheticGguf.GgmlType.Q2_0, expertDownType: SyntheticGguf.GgmlType.Q2_0),
+            "q4k-q51" => Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4k.gguf"), 16, q4kxlExperts: true),
+            "iq2xs-iq4nl" => Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q2kxl.gguf"), 16, q2kxlExperts: true),
+            _ => Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "default.gguf"), 16),
+        };
+        float[][] Answer(string tsm)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_METAL_MOE", tsm);
+            return Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, Steps, model =>
+            {
+                var q = Assert.IsType<Qwen4ExpModel>(model);
+                Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 4, q.ExpertCountForTests));
+            }, null, path);
+        }
+        float[][] mulMatId = Answer("0"), grouped = Answer("1");
+        // Both are float arithmetic over the same bytes in a different order: measured 1.1e-7 .. 1.1e-6 on an M5 Pro
+        // (the grouped kernels alone agree with a double-precision reference to ~2e-7, TsmMoeKernelTests).
+        AssertClose($"tsm vs MUL_MAT_ID ({formats})", grouped, mulMatId, 1e-5);
+    }
+
+    /// <summary>QSA keeps each layer's pooled indexer keys between steps (Q4eSeqStateEntry::aux), so a step pools only
+    /// the blocks its cells complete instead of every block of the window. A block's key is the same arithmetic either
+    /// way, so the logits are the same bits as pooling every block every step (TS_Q4E_QSA_POOL_CACHE=0) - over a
+    /// prompt, then decode steps that cross several block boundaries. The step counter proves the cache was used.
+    /// </summary>
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void QsaPooledKeys_KeptBetweenSteps_AnswerAsPoolingEveryBlock_Cpu() => QsaPooledKeys(BackendType.GgmlCpu);
+
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void QsaPooledKeys_KeptBetweenSteps_AnswerAsPoolingEveryBlock_Metal() => QsaPooledKeys(BackendType.GgmlMetal);
+
+    private void QsaPooledKeys(BackendType backend)
+    {
+        int[] steps = Enumerable.Range(0, 14).Select(i => (i * 61 + 5) % 250).ToArray();
+        float[][] Answer(string keep)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_Q4E_QSA_POOL_CACHE", keep);
+            return Run(backend, () => { }, Prompt, steps, null, null);
+        }
+        float[][] everyBlock = Answer("0");
+        long before = GgmlBasicOps.Qwen4ExpQsaIncrementalSteps();
+        float[][] kept = Answer("1");
+        Assert.True(GgmlBasicOps.Qwen4ExpQsaIncrementalSteps() - before >= steps.Length,
+            "the decode steps did not pool incrementally");
+        for (int i = 0; i < kept.Length; i++)
+            Assert.True(kept[i].AsSpan().SequenceEqual(everyBlock[i]), $"step {i}: the kept pooled keys changed the logits");
+    }
+
+    /// <summary>Seams on a shared event (tsm_moe.h seams_*): the decode steps' segments are enqueued ahead and each seam
+    /// is a handshake on ggml-metal's queue instead of a submit and a wait. The kernels, their order and their buffers
+    /// are the same, so the logits are the same bits - with every route in a slot, and with half the experts left to
+    /// the host (whose routes reach the GPU at the seam's last handshake). The pass counter proves the event path ran.
+    /// </summary>
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TsmSeams_OnASharedEvent_AnswerAsSubmitAndWait_Metal(bool hostHalf)
+    {
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q2_0.gguf"), 16,
+            expertGateUpType: SyntheticGguf.GgmlType.Q2_0, expertDownType: SyntheticGguf.GgmlType.Q2_0);
+        float[][] Answer(string events)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_METAL_SEAM_EVENTS", events);
+            return Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, Steps, model =>
+            {
+                var q = Assert.IsType<Qwen4ExpModel>(model);
+                int experts = q.ExpertCountForTests;
+                Assert.Equal(8, hostHalf
+                    ? q.RegisterExpertTiersForTests(experts / 2, 0)
+                    : q.RegisterExpertTiersForTests(experts / 4, experts));
+            }, null, path);
+        }
+        float[][] submitAndWait = Answer("0");
+        long before = GgmlBasicOps.TsmSeamPasses();
+        float[][] events = Answer("1");
+        Assert.True(GgmlBasicOps.TsmSeamPasses() - before >= Steps.Length,
+            "the decode steps did not run on the event seams");
+        Assert.Equal(submitAndWait.Length, events.Length);
+        for (int i = 0; i < events.Length; i++)
+            Assert.True(events[i].AsSpan().SequenceEqual(submitAndWait[i]),
+                $"step {i}: the event seams changed the logits ({(hostHalf ? "half the experts on the host" : "every route held")})");
+    }
+
+    /// <summary>A prefill-width batch streams every expert an offloaded layer routes into its staging tensor. With a
+    /// tier on unified memory, the experts the tier's fixed slots hold are copied from those slots instead of read
+    /// from the file (ggml_ops_moe.cpp stage_experts_from_tier); the staged bytes are the same, so the prompt answers
+    /// bit for bit as the untiered offload does - every expert in a slot, and half of them (copies and reads mixed).
+    /// </summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TieredExperts_StagePrefillFromTheirSlots_Metal()
+    {
+        float[][] plain = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt);
+        foreach (int divisor in new[] { 1, 2 })
+        {
+            float[][] tiered = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, model =>
+            {
+                var q = Assert.IsType<Qwen4ExpModel>(model);
+                Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / divisor, 0));
+            });
+            Assert.True(tiered[0].AsSpan().SequenceEqual(plain[0]),
+                $"fixed slots for 1/{divisor} of the experts: the {LongPrompt.Length}-token prompt's staging changed its logits");
+        }
+    }
+
     /// <summary>A batched verify-width span (here a 4-token prefill) reads up to two window misses a
     /// row in the background while the accelerator computes the routes its slots already hold, then
     /// computes those after a second cut (host_moe_build_hot_part's overlap group). Only the
@@ -140,6 +269,8 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     [GgmlFact(BackendType.GgmlMetal)]
     public void TieredExperts_VerifyWidthOverlap_Metal()
     {
+        // The overlap group is MUL_MAT_ID's; the grouped tsm kernels read a window's misses before they run.
+        _nativeEnv.Set("TS_METAL_MOE", "0");
         int[] verifyWidth = Prompt.Take(4).ToArray();
         float[][] device = Run(BackendType.GgmlMetal, () => { }, verifyWidth);
         long deferred = 0;
@@ -164,6 +295,41 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
             Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 2, 0));
         });
         AssertClose("tier, fixed slots only (CUDA)", tiered, device, Bound(BackendType.GgmlCuda, hostPrefill: true));
+    }
+
+    /// <summary>Adaptive fixed slots (<c>TS_MOE_TIER_ADAPT=1</c>, discrete VRAM): 96 decode steps over a
+    /// few repeating tokens concentrate the routing on experts the initial slots (ids 0..n/4-1) mostly
+    /// do not hold. Every 32 seams the hottest of them are copied into the coldest slots, so more
+    /// routes land in slots than with the slots fixed, and a swapped-in slot must hold exactly that
+    /// expert's bytes: the logits stay within the host bound of the all-accelerator span.</summary>
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void AdaptiveSlots_FollowTheRoutesAndStillAnswerAsTheAccelerator_Cuda()
+    {
+        int[] steps = Enumerable.Range(0, 96).Select(i => 40 + (i * 7) % 5).ToArray();
+        float[][] device = Run(BackendType.GgmlCuda, () => { }, Prompt, steps, null, null);
+        long fixedHits = 0, adaptiveHits = 0;
+        void Register(ModelBase model)
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 4, 0));
+        }
+        float[][] fixedRows = Run(BackendType.GgmlCuda, MoeCpuOffloadConfig.SetAllLayers, Prompt, steps, Register,
+            _ => fixedHits = GgmlBasicOps.MoeHotTierStats().Hits);
+        float[][] adaptive;
+        using (var env = new NativeEnvScope())
+        {
+            env.Set("TS_MOE_TIER_ADAPT", "1");
+            adaptive = Run(BackendType.GgmlCuda, MoeCpuOffloadConfig.SetAllLayers, Prompt, steps, Register,
+                _ => adaptiveHits = GgmlBasicOps.MoeHotTierStats().Hits);
+        }
+        _output.WriteLine($"slot hits: fixed {fixedHits}, adaptive {adaptiveHits}");
+        Assert.True(adaptiveHits > fixedHits, $"adaptive slots held no more routes ({adaptiveHits} vs {fixedHits})");
+        // 96 steps on random weights meet near-ties (one measured at a normal 5.7e-3 step): a
+        // differing argmax must be one the step's own deviation explains.
+        AssertClose("tier, fixed slots (long decode)", fixedRows, device, Bound(BackendType.GgmlCuda, hostPrefill: true),
+            allowExplainedTies: true);
+        AssertClose("tier, adaptive slots", adaptive, device, Bound(BackendType.GgmlCuda, hostPrefill: true),
+            allowExplainedTies: true);
     }
 
     /// <summary>A discrete-VRAM layer plan has no host seam on its resident layers, so a profile built
@@ -267,7 +433,11 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         }
     }
 
-    private void AssertClose(string what, float[][] actual, float[][] expected, double bound)
+    /// <param name="allowExplainedTies">Accept a differing argmax when the expected logits rank the
+    /// actual choice within twice the step's largest absolute deviation of the expected maximum: a
+    /// near-tie the measured error explains, not a wrong answer.</param>
+    private void AssertClose(string what, float[][] actual, float[][] expected, double bound,
+        bool allowExplainedTies = false)
     {
         Assert.Equal(expected.Length, actual.Length);
         double worst = 0;
@@ -279,7 +449,19 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
             worst = Math.Max(worst, err);
             _output.WriteLine($"{what} {(i == 0 ? "prefill" : $"decode {i}")}: relative error {err:E3}, " +
                 $"argmax {ArgMax(actual[i])} vs {ArgMax(expected[i])}");
-            Assert.Equal(ArgMax(expected[i]), ArgMax(actual[i]));
+            int want = ArgMax(expected[i]), got = ArgMax(actual[i]);
+            if (allowExplainedTies && want != got)
+            {
+                double deviation = 0;
+                for (int v = 0; v < expected[i].Length; v++)
+                    deviation = Math.Max(deviation, Math.Abs(actual[i][v] - expected[i][v]));
+                double gap = expected[i][want] - expected[i][got];
+                _output.WriteLine($"  near-tie: expected gap {gap:E3}, largest deviation {deviation:E3}");
+                Assert.True(gap <= 2 * deviation, $"{what}: argmax {got} vs {want} with a gap of {gap:E3}, " +
+                    $"more than twice the step's deviation {deviation:E3}");
+                continue;
+            }
+            Assert.Equal(want, got);
         }
         Assert.True(worst <= bound, $"{what} strayed {worst:E3} from the all-accelerator span");
     }

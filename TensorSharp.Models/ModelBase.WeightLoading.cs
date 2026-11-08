@@ -34,6 +34,12 @@ namespace TensorSharp.Models
     {
         // Sparse host lookup tables can opt out of reading every row at startup.
         protected virtual bool ShouldPrefaultWeight(GgufTensorInfo info) => true;
+
+        /// <summary>When the checkpoint is larger than the page cache can hold, the tensors still
+        /// warmed in parallel before the load reads them: everything but the routed experts, which
+        /// are read later and only in part (a tier's or a host cache's share).</summary>
+        protected virtual bool ShouldPrefaultWeightWhenConstrained(GgufTensorInfo info)
+            => !info.Name.Contains("_exps", StringComparison.Ordinal);
         /// <summary>A stage executor excludes other nodes' weights before touching their pages.</summary>
         protected virtual bool ShouldLoadWeight(GgufTensorInfo info) => true;
         protected virtual IAllocator AllocatorForWeight(string name) => _allocator;
@@ -45,7 +51,8 @@ namespace TensorSharp.Models
             // otherwise reads the file at one-or-two-stream speed, which is the
             // whole cold-load time on network-backed model storage.
             ReadBonsaiMetadata();
-            _gguf.PrefaultFileCache(info => ShouldLoadWeight(info) && ShouldPrefaultWeight(info));
+            _gguf.PrefaultFileCache(info => ShouldLoadWeight(info) && ShouldPrefaultWeight(info),
+                ShouldPrefaultWeightWhenConstrained, logProgress: true);
             Console.Write("Loading model weights...");
             int countF32 = 0;
             int countQuant = 0;

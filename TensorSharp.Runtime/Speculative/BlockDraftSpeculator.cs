@@ -88,6 +88,11 @@ namespace TensorSharp.Runtime.Speculative
 
         public int PrefillContextRows => _head.DraftContextRows;
 
+        /// <summary>The ring a block drafter attends over is the prompt's feature rows: drafted from a plain prefill,
+        /// the first answer had only its own tokens as context (Qwen3.8-Flash-Next DFlash2 on ggml_metal: a 24-token
+        /// short-chat answer decoded at 13 tok/s, with most steps plain).</summary>
+        public bool ConditionsOnPrompt => true;
+
         public int Propose(in DraftContext ctx, List<int> draftOut)
         {
             int n = _head.DraftBlock(ctx.LastToken, ctx.CarryHidden, ctx.Position, _blockTokens, _blockConf);

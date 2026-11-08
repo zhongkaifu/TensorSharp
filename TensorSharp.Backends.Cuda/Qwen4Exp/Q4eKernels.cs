@@ -36,12 +36,26 @@ namespace TensorSharp.Cuda
         private const uint MaxScoreBlocks = 512;
 
         private readonly CudaModule module;
-        private readonly IntPtr hcNorm, siluScale, hcCollapse, hcPost, hcPartials, hcApply, siluQ81;
+        private readonly IntPtr hcNorm, siluScale, hcCollapse, hcPost, hcPartials, hcApply, siluQ81, hcPostPartials, bf16ToF32;
+
+        /// <summary>Whether the module widens BF16 to F32 (<see cref="Bf16ToF32"/>).</summary>
+        public bool HasBf16ToF32 => bf16ToF32 != IntPtr.Zero;
+
+        /// <summary>Whether the module carries the fused scatter-and-partials kernel (a committed baseline built before
+        /// it does not; the engine then launches the two kernels).</summary>
+        public bool HasHcPostPartials => hcPostPartials != IntPtr.Zero;
 
         /// <summary>Values per mixer slice (Q4E_HC_SLICE) and floats of partials per slice (Q4E_HC_PARTIAL).</summary>
         public const int HcSlice = 256, HcPartialFloats = 1 + MaxStreams;
         private readonly IntPtr gdnPrep, convUpdate;
-        private readonly IntPtr attnPrep, attention;
+        private readonly IntPtr attnPrep, attention, attnPrepQ8, attentionQ8;
+
+        /// <summary>Whether the module stores and reads a Q8_0 KV cache (<c>--kv-cache-dtype q8_0</c>): int8 codes
+        /// [nCtx, NKV, HD] beside F16 scales [nCtx, NKV, HD / 32].</summary>
+        public bool HasKvQ8 => attnPrepQ8 != IntPtr.Zero && attentionQ8 != IntPtr.Zero;
+
+        /// <summary>Values per Q8_0 KV scale (Q4E_KV_Q8_BLOCK).</summary>
+        public const int KvQ8Block = 32;
         private readonly IntPtr qsaStore, qsaPool, qsaQuery, qsaScores, qsaSelect;
         private readonly IntPtr pleGate, groupNorm, pleConv;
         private readonly IntPtr sharedGate, setStreamRows;
@@ -56,10 +70,16 @@ namespace TensorSharp.Cuda
             hcPartials = module.GetFunction("ts_q4e_hc_partials_f32");
             hcApply = module.GetFunction("ts_q4e_hc_apply_f32");
             siluQ81 = module.GetFunction("ts_q4e_silu_q81_f32");
+            try { hcPostPartials = module.GetFunction("ts_q4e_hc_post_partials_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { } // CUDA_ERROR_NOT_FOUND
+            try { bf16ToF32 = module.GetFunction("ts_q4e_bf16_to_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { }
             gdnPrep = module.GetFunction("ts_q4e_gdn_prep_f32");
             convUpdate = module.GetFunction("ts_q4e_conv_update_f32");
             attnPrep = module.GetFunction("ts_q4e_attn_prep_f32");
             attention = module.GetFunction("ts_q4e_attention_f32");
+            try { attnPrepQ8 = module.GetFunction("ts_q4e_attn_prep_q8_f32"); attentionQ8 = module.GetFunction("ts_q4e_attention_q8_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { attnPrepQ8 = attentionQ8 = IntPtr.Zero; }
             qsaStore = module.GetFunction("ts_q4e_qsa_store_f32");
             qsaPool = module.GetFunction("ts_q4e_qsa_pool_f32");
             qsaQuery = module.GetFunction("ts_q4e_qsa_query_f32");
@@ -151,6 +171,25 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>xs[t, c] += out[t] * 2 sigmoid(inject[t, c] / hc).</summary>
+        /// <summary><see cref="HcPost"/>, then the next mixer's <see cref="HcPartials"/> over the updated streams, in one
+        /// launch (decode-size rows; requires <see cref="HasHcPostPartials"/>).</summary>
+        public void HcPostPartials(IntPtr xs, IntPtr output, IntPtr inject, IntPtr normW, IntPtr injW, IntPtr partials,
+            int rows, int e, int hc, IntPtr stream)
+        {
+            IntPtr a0 = xs, a1 = output, a2 = inject, a3 = normW, a4 = injW, a5 = partials;
+            int a6 = e, a7 = hc;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
+            Launch(hcPostPartials, (uint)(hc * e / HcSlice), (uint)rows, 1, HcSlice, stream, args);
+        }
+
+        /// <summary>dst[i] = (float)src[i] for <paramref name="n"/> BF16 values.</summary>
+        public void Bf16ToF32(IntPtr src, IntPtr dst, long n, IntPtr stream)
+        {
+            IntPtr a0 = src, a1 = dst; long a2 = n;
+            void** args = stackalloc void*[] { &a0, &a1, &a2 };
+            Launch(bf16ToF32, (uint)((n + BlockSize - 1) / BlockSize), 1, 1, BlockSize, stream, args);
+        }
+
         public void HcPost(IntPtr xs, IntPtr output, IntPtr inject, int rows, int e, int hc, IntPtr stream)
         {
             IntPtr a0 = xs, a1 = output, a2 = inject;
@@ -186,27 +225,51 @@ namespace TensorSharp.Cuda
         // ---- attention ----
 
         /// <summary>Norms and rotary of the query and key heads, the gates split out, K and V
-        /// stored into the F16 caches.</summary>
+        /// stored into the caches: F16, or Q8_0 codes with their scales when <paramref name="kScale"/> is set.</summary>
         public void AttnPrep(IntPtr qg, IntPtr k, IntPtr v, IntPtr qNorm, IntPtr kNorm, IntPtr q, IntPtr gate,
             IntPtr kCache, IntPtr vCache, IntPtr positions, int p0, int nHead, int nKvHead, int nRot,
-            float ropeBase, float freqScale, float eps, int rows, IntPtr stream)
+            float ropeBase, float freqScale, float eps, int rows, IntPtr stream, IntPtr kScale = default, IntPtr vScale = default)
         {
             IntPtr a0 = qg, a1 = k, a2 = v, a3 = qNorm, a4 = kNorm, a5 = q, a6 = gate, a7 = kCache, a8 = vCache, a9 = positions;
             int a10 = p0, a11 = nHead, a12 = nKvHead, a13 = nRot;
             float a14 = ropeBase, a15 = freqScale, a16 = eps;
+            uint grid = (uint)(nHead + nKvHead);
+            if (kScale != IntPtr.Zero)
+            {
+                RequireKvQ8();
+                IntPtr s0 = kScale, s1 = vScale;
+                void** q8 = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &s0, &s1, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16 };
+                Launch(attnPrepQ8, grid, (uint)rows, 1, AttnHeadDim, stream, q8);
+                return;
+            }
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16 };
-            Launch(attnPrep, (uint)(nHead + nKvHead), (uint)rows, 1, AttnHeadDim, stream, args);
+            Launch(attnPrep, grid, (uint)rows, 1, AttnHeadDim, stream, args);
         }
 
         /// <summary>Gated attention of every query head over 0..p, or over the listed cells where
-        /// <paramref name="cellCnt"/>[row] is not negative.</summary>
+        /// <paramref name="cellCnt"/>[row] is not negative. A Q8_0 cache passes its scales.</summary>
         public void Attention(IntPtr q, IntPtr kCache, IntPtr vCache, IntPtr gate, IntPtr cells, IntPtr cellCnt, IntPtr output,
-            IntPtr positions, int p0, int nHead, int nKvHead, float scale, int cellStride, int rows, IntPtr stream)
+            IntPtr positions, int p0, int nHead, int nKvHead, float scale, int cellStride, int rows, IntPtr stream,
+            IntPtr kScale = default, IntPtr vScale = default)
         {
             IntPtr a0 = q, a1 = kCache, a2 = vCache, a3 = gate, a4 = cells, a5 = cellCnt, a6 = output, a7 = positions;
             int a8 = p0, a9 = nHead, a10 = nKvHead; float a11 = scale; int a12 = cellStride;
+            if (kScale != IntPtr.Zero)
+            {
+                RequireKvQ8();
+                IntPtr s0 = kScale, s1 = vScale;
+                void** q8 = stackalloc void*[] { &a0, &a1, &a2, &s0, &s1, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };
+                Launch(attentionQ8, (uint)nHead, (uint)rows, 1, BlockSize, stream, q8);
+                return;
+            }
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };
             Launch(attention, (uint)nHead, (uint)rows, 1, BlockSize, stream, args);
+        }
+
+        private void RequireKvQ8()
+        {
+            if (!HasKvQ8)
+                throw new InvalidOperationException("The loaded q4e kernel module has no Q8_0 KV kernels; rebuild the CUDA kernels.");
         }
 
         // ---- QSA ----

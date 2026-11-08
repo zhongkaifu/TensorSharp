@@ -506,7 +506,8 @@ TensorAgent 为每个模型在应用缓存目录下挂一个。CLI 只在内存�
 CLI 与服务端均支持。默认按模型自动选择（模型权重低于 F32 时为 `f16`，否则为 `f32`）；
 块量化档位（`q8_0`、`q4_0`）要求原生 GGML
 flash-attention 路径，`q4_0`（约为 f32 的 1/7）面向 KV cache 主导内存占用的
-128K–256K 超长上下文。
+128K–256K 超长上下文。Qwen3.8-Flash-Next 的直接引擎（`--backend cuda`）有自己的 `q8_0`
+注意力内核，默认使用 `q8_0`，`q4_0` 时保持 `f16`（见 `docs/models/qwen38-flash-next_zh-cn.md`）。
 
 ## 后续工作
 

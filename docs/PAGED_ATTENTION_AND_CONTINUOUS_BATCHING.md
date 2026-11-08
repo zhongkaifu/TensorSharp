@@ -618,7 +618,8 @@ both the CLI and the server. The default is chosen automatically per model
 (`f16` when the model's weights are below F32, `f32` otherwise); the block-quantized tiers
 (`q8_0`, `q4_0`) require the native GGML flash-attention path, and `q4_0`
 (~1/7 of f32) targets very long 128K–256K contexts where the KV cache
-dominates memory.
+dominates memory. Qwen3.8-Flash-Next's direct engine (`--backend cuda`) has its own
+`q8_0` attention kernels, defaults to `q8_0`, and keeps `f16` for `q4_0` (see `docs/models/qwen38-flash-next.md`).
 
 ## Remaining Work
 

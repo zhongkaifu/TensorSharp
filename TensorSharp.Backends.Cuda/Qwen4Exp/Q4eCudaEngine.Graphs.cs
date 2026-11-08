@@ -21,6 +21,10 @@
 // only issued past the indexer's width): the sets are nested as the position grows, so their size
 // names them.
 //
+// A speculative verify window of n rows (Verify.cs) is captured the same way per (sequence, regime, n): the
+// rows' tokens and positions come from pinned memory, the recurrent states are saved inside the graph, and the
+// head writes every row's logits and hidden streams.
+//
 // Every buffer a captured step touches belongs to the engine or the sequence, so graphs stay valid
 // until their sequence is freed (CudaDecodeCapture refuses a step that allocates or reads shared
 // scratch). A capture that fails for any reason turns graphs off for the engine with a note and
@@ -36,8 +40,9 @@ namespace TensorSharp.Cuda
         private readonly bool _graphsEnabled =
             !string.Equals(Environment.GetEnvironmentVariable("TS_Q4E_GRAPHS"), "0", StringComparison.Ordinal);
         private bool _graphsFailed;
-        /// <summary>Per (sequence, regime): one executable graph per device holding layers.</summary>
-        private readonly Dictionary<(int Slot, int Regime), IntPtr[]> _graphs = new Dictionary<(int, int), IntPtr[]>();
+        /// <summary>Per (sequence, regime, window): one executable graph per device holding layers. Window 0 is a
+        /// decode step, n a verify window of n rows.</summary>
+        private readonly Dictionary<(int Slot, int Regime, int Window), IntPtr[]> _graphs = new Dictionary<(int, int, int), IntPtr[]>();
         /// <summary>The step's position, read by every device's graph (PORTABLE pinned memory).</summary>
         private IntPtr _posPinned;
 
@@ -75,12 +80,12 @@ namespace TensorSharp.Cuda
             if (_pleLayer >= 0)
                 GatherPleRows(slot, new[] { token }, 0, 1, p0, null, null);
 
-            var key = (slot.Id, DecodeRegime(p0));
+            var key = (slot.Id, DecodeRegime(p0), 0);
             if (!_graphs.TryGetValue(key, out IntPtr[] execs))
             {
                 try
                 {
-                    execs = CaptureDecode(slot, p0);
+                    execs = CaptureSteps(dev => IssueDecodeStep(dev, slot, p0));
                 }
                 catch (Exception ex)
                 {
@@ -91,6 +96,54 @@ namespace TensorSharp.Cuda
                 _graphs[key] = execs;
             }
 
+            LaunchSteps(execs);
+            FinishHead(1, logitsOut, false, null);
+            return true;
+        }
+
+        /// <summary>
+        /// A verify window of <paramref name="tokens"/> at <paramref name="p0"/> through its captured graphs (Verify.cs
+        /// sets the capture flags around it). False when graphs are off: the caller runs the window uncaptured.
+        /// </summary>
+        private bool ForwardVerifyGraphed(Slot slot, int[] tokens, int p0, float[] logitsAll, float[] hAll)
+        {
+            int nt = tokens.Length;
+            foreach (var dev in _devs)
+            {
+                dev.MakeCurrent();
+                CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+            }
+            for (int t = 0; t < nt; t++)
+            {
+                ((int*)_pinnedTokens)[t] = tokens[t];
+                ((int*)_posPinned)[t] = p0 + t;
+            }
+            if (_pleLayer >= 0)
+                GatherPleRows(slot, tokens, 0, nt, p0, null, null);
+
+            var key = (slot.Id, DecodeRegime(p0 + nt - 1), nt);
+            if (!_graphs.TryGetValue(key, out IntPtr[] execs))
+            {
+                try
+                {
+                    execs = CaptureSteps(dev => IssueVerifyStep(dev, slot, p0, nt));
+                }
+                catch (Exception ex)
+                {
+                    _graphsFailed = true;
+                    Console.Error.WriteLine($"[q4e-cuda] decode steps run uncaptured from here on: a verify capture failed ({ex.Message})");
+                    return false;
+                }
+                _graphs[key] = execs;
+            }
+            LaunchSteps(execs);
+            FinishHead(nt, logitsAll, true, hAll, 0);
+            return true;
+        }
+
+        /// <summary>One graph launch per device, the next device waiting on the previous one's boundary copy.</summary>
+        private void LaunchSteps(IntPtr[] execs)
+        {
             for (int d = 0; d <= _lastDev; d++)
             {
                 var dev = _devs[d];
@@ -103,11 +156,9 @@ namespace TensorSharp.Cuda
             }
             if (_perf > 0)
                 _issueEnd = System.Diagnostics.Stopwatch.GetTimestamp();
-            FinishHead(1, logitsOut, false, null);
-            return true;
         }
 
-        private IntPtr[] CaptureDecode(Slot slot, int p0)
+        private IntPtr[] CaptureSteps(Action<Dev> issue)
         {
             var execs = new IntPtr[_lastDev + 1];
             try
@@ -116,7 +167,7 @@ namespace TensorSharp.Cuda
                 {
                     var dev = _devs[d];
                     dev.MakeCurrent();
-                    execs[d] = CudaDecodeCapture.Capture(dev.Alloc, () => IssueDecodeStep(dev, slot, p0));
+                    execs[d] = CudaDecodeCapture.Capture(dev.Alloc, () => issue(dev));
                 }
                 return execs;
             }
@@ -144,21 +195,49 @@ namespace TensorSharp.Cuda
             {
                 CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev.Xs), _devs[dev.Ordinal - 1].BoundaryPinned, boundary, dev.Stream).ThrowOnError();
             }
+            bool ready = false;
             for (int il = 0; il < m.NLayer; il++)
                 if (_layers[il].Device == dev.Ordinal)
-                    RunLayer(dev, il, slot, 1, p0, null, null, Ptr(dev.PosDev));
+                    ready = RunLayer(dev, il, slot, 1, p0, null, null, Ptr(dev.PosDev), ready);
             if (dev.Ordinal < _lastDev)
                 CudaDriverApi.cuMemcpyDtoHAsync(dev.BoundaryPinned, Ptr(dev.Xs), boundary, dev.Stream).ThrowOnError();
             else
                 IssueHead(1, logits: true, allRows: false, hidden: false);
         }
 
+        /// <summary>One device's part of a verify window, as captured: <see cref="IssueDecodeStep"/> over
+        /// <paramref name="nt"/> rows, the recurrent states saved as the window runs (Verify.cs), and on the last
+        /// device every row's logits and hidden streams.</summary>
+        private void IssueVerifyStep(Dev dev, Slot slot, int p0, int nt)
+        {
+            var m = _m;
+            var boundary = new UIntPtr((ulong)nt * (ulong)HcDim * 4);
+            CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev.PosDev), _posPinned, new UIntPtr((ulong)nt * 4), dev.Stream).ThrowOnError();
+            if (dev.Ordinal == 0)
+            {
+                CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev.Tokens), _pinnedTokens, new UIntPtr((ulong)nt * 4), dev.Stream).ThrowOnError();
+                dev.DK.Embed(_tokEmbd.Ptr, dev.Tokens, dev.Xs, _tokEmbd.Type, _tokEmbd.RowBytes, nt, m.NEmbd, dev.Stream);
+            }
+            else
+            {
+                CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev.Xs), _devs[dev.Ordinal - 1].BoundaryPinned, boundary, dev.Stream).ThrowOnError();
+            }
+            bool ready = false;
+            for (int il = 0; il < m.NLayer; il++)
+                if (_layers[il].Device == dev.Ordinal)
+                    ready = RunLayer(dev, il, slot, nt, p0, null, null, Ptr(dev.PosDev), ready);
+            if (dev.Ordinal < _lastDev)
+                CudaDriverApi.cuMemcpyDtoHAsync(dev.BoundaryPinned, Ptr(dev.Xs), boundary, dev.Stream).ThrowOnError();
+            else
+                IssueHead(nt, logits: true, allRows: true, hidden: true);
+        }
+
         private void DestroySlotGraphs(int slotId)
         {
-            List<(int, int)> keys = null;
+            List<(int, int, int)> keys = null;
             foreach (var key in _graphs.Keys)
                 if (key.Slot == slotId)
-                    (keys ??= new List<(int, int)>()).Add(key);
+                    (keys ??= new List<(int, int, int)>()).Add(key);
             if (keys == null)
                 return;
             foreach (var key in keys)

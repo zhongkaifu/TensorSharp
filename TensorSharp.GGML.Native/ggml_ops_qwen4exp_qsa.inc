@@ -15,11 +15,14 @@ static ggml_tensor* q4e_qsa_matmul(ggml_context* ctx, ggml_tensor* w, ggml_tenso
     return q4e_mul_mat(ctx, w, x);
 }
 
+// Returns the attention mask; *sparse_width (when given) is set to the most cells a row of it keeps, or 0 when it is
+// the dense mask (a window short enough to attend everything).
 static ggml_tensor* q4e_nodes_qsa_mask(ggml_context* ctx, ggml_cgraph* graph,
     Q4eBinder& binder, const Q4eQsaGraph& qsa, ggml_tensor* mixed,
     ggml_tensor* original_mask, ggml_tensor* kv_idx,
-    int n_embd, int T, int padded, int n_rot, float base, float scale, float eps)
+    int n_embd, int T, int padded, int n_rot, float base, float scale, float eps, int* sparse_width = nullptr)
 {
+    if (sparse_width) *sparse_width = 0;
     const auto& a = *qsa.args;
     const auto& in = *qsa.inputs;
     const int D = a.head_dim, H = a.heads, R = a.ratio;
@@ -38,21 +41,47 @@ static ggml_tensor* q4e_nodes_qsa_mask(ggml_context* ctx, ggml_cgraph* graph,
     binder.add(nk, a.k_norm, (size_t)D * sizeof(float));
     binder.add(nq, a.q_norm, (size_t)D * sizeof(float));
     auto* keys = ggml_view_2d(ctx, written, D, padded, written->nb[1], 0);
-    auto* members = ggml_reshape_3d(ctx, ggml_get_rows(ctx, keys, in.block_cells), D, R, B);
-    ggml_tensor* pooled = nullptr;
-    for (int r = 0; r < R; ++r)
-    {
-        auto* part = ggml_cont(ctx, ggml_view_2d(ctx, members, D, B, members->nb[2], r * members->nb[1]));
-        pooled = pooled ? ggml_add(ctx, pooled, part) : part;
-    }
-    pooled = ggml_scale(ctx, pooled, 1.f / R);
-    if (qsa.probes) { ggml_set_output(pooled); qsa.probes->push_back(pooled); }
-    pooled = ggml_mul(ctx, ggml_rms_norm(ctx, pooled, eps), nk);
-    pooled = ggml_reshape_3d(ctx, pooled, D, 1, B);
     int sections[4] = {a.rope_sections[0], a.rope_sections[1], a.rope_sections[2], a.rope_sections[3]};
-    pooled = ggml_rope_multi(ctx, pooled, in.block_positions, nullptr, n_rot, sections,
-        GGML_ROPE_TYPE_IMROPE, 0, base, scale, 0.f, 1.f, 0.f, 0.f);
-    pooled = ggml_reshape_2d(ctx, pooled, D, B);
+    // A block's pooled key: the mean of its member cells' raw keys, rms-normed and rotated to its first member.
+    // `probe` takes the pre-norm mean (the arithmetic probe's first stage).
+    auto pool = [&](ggml_tensor* cells, ggml_tensor* positions, int n, bool probe) {
+        auto* members = ggml_reshape_3d(ctx, ggml_get_rows(ctx, keys, cells), D, R, n);
+        ggml_tensor* p = nullptr;
+        for (int r = 0; r < R; ++r)
+        {
+            auto* part = ggml_cont(ctx, ggml_view_2d(ctx, members, D, n, members->nb[2], r * members->nb[1]));
+            p = p ? ggml_add(ctx, p, part) : part;
+        }
+        p = ggml_scale(ctx, p, 1.f / R);
+        if (probe && qsa.probes) { ggml_set_output(p); qsa.probes->push_back(p); }
+        p = ggml_mul(ctx, ggml_rms_norm(ctx, p, eps), nk);
+        p = ggml_rope_multi(ctx, ggml_reshape_3d(ctx, p, D, 1, n), positions, nullptr, n_rot, sections,
+            GGML_ROPE_TYPE_IMROPE, 0, base, scale, 0.f, 1.f, 0.f, 0.f);
+        return ggml_reshape_2d(ctx, p, D, n);
+    };
+    ggml_tensor* pooled = nullptr;
+    if (qsa.pooled != nullptr && qsa.incremental)
+    {
+        // Only the blocks this step completes (or rewrites after a rollback) are pooled; every other complete block's
+        // key is already in the layer's pooled cache. At 17.5K cells re-pooling all of them cost 3.8 ms a decode step
+        // (M5 Pro, 12 QSA layers). Same per-block arithmetic, so the same keys.
+        const int n_new = (int)in.new_blocks->ne[0];
+        auto* stored = ggml_set_rows(ctx, qsa.pooled, pool(in.new_block_cells, in.new_block_positions, n_new, false),
+            in.new_blocks);
+        ggml_build_forward_expand(graph, stored);
+        pooled = ggml_view_2d(ctx, stored, D, B, stored->nb[1], 0);
+    }
+    else
+    {
+        pooled = pool(in.block_cells, in.block_positions, B, true);
+        if (qsa.pooled != nullptr)
+        {
+            // Every block pooled (a fresh or re-uploaded cache): kept for the steps after this one.
+            auto* stored = ggml_cpy(ctx, pooled, ggml_view_2d(ctx, qsa.pooled, D, B, qsa.pooled->nb[1], 0));
+            ggml_build_forward_expand(graph, stored);
+            pooled = stored;
+        }
+    }
     if (qsa.probes) { ggml_set_output(pooled); qsa.probes->push_back(pooled); }
     auto* q = ggml_reshape_3d(ctx, q4e_qsa_matmul(ctx, wq, mixed), D, H, T);
     q = ggml_mul(ctx, ggml_rms_norm(ctx, q, eps), nq);
@@ -74,12 +103,10 @@ static ggml_tensor* q4e_nodes_qsa_mask(ggml_context* ctx, ggml_cgraph* graph,
     expanded = ggml_add(ctx, ggml_cont(ctx, ggml_transpose(ctx, expanded)), ggml_cast(ctx, original_mask, GGML_TYPE_F32));
     const int width = (int)std::min<int64_t>(padded, (int64_t)a.top_k + R - 1);
     auto* selected = ggml_cont(ctx, ggml_top_k(ctx, expanded, width));
-    auto* all = ggml_fill(ctx, original_mask, -INFINITY);
-    auto* rows = ggml_view_3d(ctx, all, 1, padded, T, all->nb[0], all->nb[1], 0);
-    auto* zeros = ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, width, T), 0.f);
-    auto* sparse = ggml_set_rows(ctx, rows, zeros, selected);
-    sparse = ggml_view_2d(ctx, sparse, padded, T, sparse->nb[2], 0);
-    return ggml_add(ctx, sparse, original_mask);
+    // The mask's own value at every picked cell, -inf elsewhere: one fused op (ggml_top_k_mask) for what was a fill of
+    // the whole [padded, T] mask, a scatter of zeros and an add - each O(padded * T).
+    if (sparse_width) *sparse_width = width;
+    return ggml_top_k_mask(ctx, original_mask, selected, nullptr, nullptr, nullptr);
 }
 
 #ifdef TSG_GGML_TEST_HOOKS

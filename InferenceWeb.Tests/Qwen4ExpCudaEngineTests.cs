@@ -23,16 +23,24 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-qwen4exp-cuda-" + Guid.NewGuid().ToString("N"));
     private readonly EnvScope _env = new EnvScope();
 
+    private readonly KvCacheDtype _savedKv = KvCacheDtypeConfig.Current;
+    private readonly bool _savedKvExplicit = KvCacheDtypeConfig.IsExplicitlySet;
+
     public Qwen4ExpCudaEngineTests(ITestOutputHelper output)
     {
         _output = output;
         Directory.CreateDirectory(_dir);
         _env.Set("MAX_CONTEXT", "1024");
         _env.ClearSpeculationVars();
+        // The direct engine's defaults (q8_0 KV, adaptive residency) are pinned off here: these tests hold it to the
+        // native span (F16 KV) and to fixed placements bit for bit. The tests of those features turn them on.
+        KvCacheDtypeConfig.Set(KvCacheDtype.F16);
+        _env.Set("TS_MOE_TIER_ADAPT", "0");
     }
 
     public void Dispose()
     {
+        KvCacheDtypeConfig.RestoreForTests(_savedKv, _savedKvExplicit);
         _env.Dispose();
         try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
     }
@@ -84,6 +92,139 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             if (i > 0)
                 Assert.True(RelativeError(rows[i], rows[i - 1]) > 1e-3, "the step did not change the logits");
         }
+    }
+
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void TheFeatureTaps_AverageTheStreamsOfACompletedLayer_Cpu() => NativeFeatureTaps(BackendType.GgmlCpu);
+
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TheFeatureTaps_AverageTheStreamsOfACompletedLayer_Metal() => NativeFeatureTaps(BackendType.GgmlMetal);
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void TheFeatureTaps_AverageTheStreamsOfACompletedLayer_Cuda() => NativeFeatureTaps(BackendType.GgmlCuda);
+
+    /// <summary>The DFlash feature taps of the native token span (TSGgml_Qwen4ExpSetFeatureTaps): after a tapped layer,
+    /// the mean of its hyper-connection streams lands in the tap's column block of each row. The last layer's completed
+    /// output is the residual a speculative forward already exports, so its tap must be that residual's stream mean; a
+    /// middle layer's tap fills its own block, and a block no tap names stays untouched. A prompt, a decode step and a
+    /// verify-width window alike.</summary>
+    private void NativeFeatureTaps(BackendType backend)
+    {
+        string path = Fixture(indexerTopK: 2048);
+        using ModelBase model = ModelBase.Create(path, backend);
+        var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+        int hcDim = spec.SpecFeatureSize, nEmbd = model.Config.HiddenSize, hc = hcDim / nEmbd;
+        int last = model.Config.NumLayers - 1, vocab = model.Config.VocabSize, stride = 3 * nEmbd;
+        Assert.Equal(hcDim, hc * nEmbd);
+        foreach (int[] tokens in new[] { Prompt, new[] { Steps[0] }, new[] { Steps[1], 77, 123 } })
+        {
+            var hidden = new float[tokens.Length * hcDim];
+            float[] taps = GC.AllocateArray<float>(tokens.Length * stride, pinned: true);
+            Array.Fill(taps, float.NaN);
+            IntPtr at = System.Runtime.InteropServices.Marshal.UnsafeAddrOfPinnedArrayElement(taps, 0);
+            Assert.True(TensorSharp.GGML.GgmlBasicOps.Qwen4ExpSetFeatureTaps(new[] { 1, last }, at, stride));
+            try
+            {
+                spec.SpecForward(tokens, hidden, new float[tokens.Length * vocab], true);
+            }
+            finally
+            {
+                TensorSharp.GGML.GgmlBasicOps.Qwen4ExpSetFeatureTaps(null, IntPtr.Zero, 0);
+            }
+            double worst = 0;
+            for (int r = 0; r < tokens.Length; r++)
+            {
+                bool middleDiffers = false;
+                for (int d = 0; d < nEmbd; d++)
+                {
+                    float mean = hidden[(long)r * hcDim + d];
+                    for (int c = 1; c < hc; c++)
+                        mean += hidden[(long)r * hcDim + (long)c * nEmbd + d];
+                    mean *= 1.0f / hc;
+                    float lastTap = taps[(long)r * stride + nEmbd + d], middle = taps[(long)r * stride + d];
+                    worst = Math.Max(worst, Math.Abs(lastTap - mean) / Math.Max(1.0, Math.Abs(mean)));
+                    Assert.True(float.IsFinite(middle), $"T={tokens.Length} row {r}: the middle tap left its block unwritten");
+                    Assert.True(float.IsNaN(taps[(long)r * stride + 2 * nEmbd + d]), $"T={tokens.Length} row {r}: a tap wrote past its slot");
+                    middleDiffers |= middle != lastTap;
+                }
+                Assert.True(middleDiffers, $"T={tokens.Length} row {r}: the middle tap repeats the last layer's");
+            }
+            _output.WriteLine($"T={tokens.Length}: last-layer tap vs the exported streams' mean, worst relative error {worst:E2}");
+            Assert.True(worst <= 1e-6, $"T={tokens.Length}: the last layer's tap is not its streams' mean ({worst:E2})");
+        }
+    }
+
+    /// <summary>A prompt chunk older than a block drafter's ring asks for its last row's features only (a one-row
+    /// buffer from SpeculativeExecution.PrefillStep); it gets exactly the last row of the full capture.</summary>
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void ASpeculativePromptChunk_CanAskForItsLastRowOnly_Cpu()
+    {
+        string path = Fixture(indexerTopK: 2048);
+        using ModelBase model = ModelBase.Create(path, BackendType.GgmlCpu);
+        var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+        int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+        var all = new float[Prompt.Length * feat];
+        spec.SpecForward(Prompt, all, new float[vocab], false);
+        model.ResetKVCache();
+        var last = new float[feat];
+        spec.SpecForward(Prompt, last, new float[vocab], false);
+        Assert.True(last.AsSpan().SequenceEqual(all.AsSpan((Prompt.Length - 1) * feat, feat)),
+            "the one-row capture is not the full capture's last row");
+    }
+
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void VerifyWindowsOfChangingWidth_CommitAsPlainDecode_Cpu() => NativeChangingWidths(BackendType.GgmlCpu, 1e-5);
+
+    /// <summary>Metal verifies a window as one batched forward, which does not round like its decode steps.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void VerifyWindowsOfChangingWidth_CommitAsPlainDecode_Metal() => NativeChangingWidths(BackendType.GgmlMetal, 2e-2);
+
+    /// <summary>ggml_cuda verifies with the one-token kernels per row (exact).</summary>
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void VerifyWindowsOfChangingWidth_CommitAsPlainDecode_Cuda() => NativeChangingWidths(BackendType.GgmlCuda, 1e-5);
+
+    /// <summary>Verify windows of changing width on the native token span, some partly accepted (committed from the
+    /// window's own per-row states), against a plain decode of the same tokens. Each width keeps its own persisted graph,
+    /// and a wider window grows the buffers the narrower graphs captured into: those graphs must rebuild, never replay
+    /// against a freed buffer.</summary>
+    private void NativeChangingWidths(BackendType backend, double bound)
+    {
+        string path = Fixture(indexerTopK: 2048);
+        int[] seq = Enumerable.Range(0, 15).Select(i => (i * 29 + 5) % 250).ToArray();
+        (int Width, int Keep)[] windows = { (2, 2), (4, 2), (2, 1), (4, 4), (3, 2), (4, 1), (2, 2) };
+        using ModelBase model = ModelBase.Create(path, backend);
+        int vocab = model.Config.VocabSize;
+        model.ResetKVCache();
+        model.ForwardRefill(Prompt);
+        var plain = seq.Select(t => (float[])model.Forward(new[] { t }).Clone()).ToArray();
+
+        var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+        model.ResetKVCache();
+        model.ForwardRefill(Prompt);
+        int pos = 0;
+        foreach (var (width, keep) in windows)
+        {
+            int[] window = seq[pos..(pos + width)];
+            var all = new float[width * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(window, null, all, true);
+            spec.SpecOnVerifyAccepted(keep - 1, width - 1);
+            // A fully accepted window keeps the verify's state as it is (the executor does not rewind).
+            if (keep < width)
+            {
+                Assert.True(spec.SpecVerifyPersistsAcceptedKv, $"window {width}/{keep} at {pos}: the verify did not commit its prefix");
+                spec.SpecRewindCache(Prompt.Length + pos + keep);
+            }
+            for (int r = 0; r < keep; r++)
+            {
+                double err = RelativeError(all.AsSpan(r * vocab, vocab).ToArray(), plain[pos + r]);
+                Assert.True(err <= bound, $"window {width}/{keep} at {pos}: row {r} differs from its decode by {err:E2}");
+            }
+            pos += keep;
+        }
+        double next = RelativeError(model.Forward(new[] { seq[pos] }), plain[pos]);
+        _output.WriteLine($"after {windows.Length} windows: next decode relative error {next:E2}");
+        Assert.True(next <= bound, $"the committed state differs from a plain decode by {next:E2}");
     }
 
     // ---------------------------------------------------------------- the direct-CUDA engine
@@ -213,6 +354,8 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     [GgmlTheory(BackendType.GgmlCuda)]
     [InlineData((int)SyntheticGguf.GgmlType.IQ2_XXS, (int)SyntheticGguf.GgmlType.IQ2_XXS)]
     [InlineData((int)SyntheticGguf.GgmlType.IQ1_S, (int)SyntheticGguf.GgmlType.IQ2_S)]
+    // ISTA-DASLab's Q2_0 pack: every routed expert in Q2_0, decoded on the warp-per-row routes.
+    [InlineData((int)SyntheticGguf.GgmlType.Q2_0, (int)SyntheticGguf.GgmlType.Q2_0)]
     public void TheDirectCudaEngine_AnswersAsTheNativeSpan_LowBitIqExperts(int gateUpType, int downType)
     {
         var gateUp = (SyntheticGguf.GgmlType)gateUpType;
@@ -253,7 +396,7 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             Assert.True(dk.DecodesLowBitIqExperts, "the loaded kernel module predates the low-bit IQ decoders");
             route = TensorSharp.Cuda.CudaMoe.SelectRoute(Prompt.Length, TensorSharp.Cuda.Q4eCudaEngine.PerSlotMaxRows,
                 dk.HasMoeMma, dk.DecodesLowBitIqExperts, gateUpType, downType,
-                Qwen4ExpSyntheticModelBuilder.Hidden, ff);
+                Qwen4ExpSyntheticModelBuilder.Hidden, ff, dk.DecodesLegacyQuants);
             Assert.Equal(dk.HasMoeMma ? TensorSharp.Cuda.CudaMoe.ExpertRoute.TensorCore : TensorSharp.Cuda.CudaMoe.ExpertRoute.Staged,
                 route);
         }
@@ -418,6 +561,459 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     /// <summary>An expert layout no direct-CUDA kernel decodes (Q4_0 down) is refused at load as one
     /// <see cref="NotSupportedException"/> naming the tensor, which the hosts report as a load refusal,
     /// and not from inside the per-device upload.</summary>
+    /// <summary>
+    /// Expert residency (Q4eCudaEngine.Residency.cs): with every routed expert in pinned host memory, and
+    /// with only some of them in VRAM slots, each expert's rows are read through a per-expert table the
+    /// GPU follows into VRAM or over the bus. The kernels' arithmetic does not depend on where the bytes
+    /// live, so prefill (grouped kernels) and every decode step (per-slot kernels, captured graphs) answer
+    /// as the all-resident engine does, bit for bit.
+    /// </summary>
+    [CudaFact]
+    public void ExpertResidency_HostAndPartialSlots_AnswerAsAllResidentBitForBit()
+    {
+        // Staging only: every expert's product comes from the same GPU kernels wherever its bytes live.
+        _env.Set("TS_Q4E_HOST_EXPERTS", "0");
+        string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+
+        float[][] Load(string vramGb, out int resident)
+        {
+            _env.Set("TS_Q4E_EXPERT_VRAM_GB", vramGb);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            resident = Assert.IsType<Qwen4ExpCudaModel>(model).Engine.ResidentExperts;
+            return Run(model);
+        }
+
+        float[][] all = Load(null, out int allResident);
+        float[][] host = Load("0", out int hostResident);
+        float[][] partial = Load((expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+            out int partialResident);
+        _output.WriteLine($"expert bytes {expertBytes}; slots: all-resident {allResident}, host {hostResident}, partial {partialResident}");
+        Assert.Equal(-1, allResident);
+        Assert.Equal(0, hostResident);
+        Assert.InRange(partialResident, 1, Qwen4ExpSyntheticModelBuilder.Layers * Qwen4ExpSyntheticModelBuilder.Experts - 1);
+        for (int i = 0; i < all.Length; i++)
+        {
+            Assert.Equal(all[i], host[i]);
+            Assert.Equal(all[i], partial[i]);
+        }
+    }
+
+    /// <summary>Host experts (Strata's doorbell): decode steps leave the experts without a VRAM slot to the
+    /// CPU inside the captured step, prompts stage them. The CPU's dot products quantize activations as
+    /// ggml's CPU kernels do, so the answer matches the all-resident engine closely rather than bit for bit.</summary>
+    [CudaFact]
+    public void ExpertResidency_HostComputedMisses_AnswerAsAllResident()
+    {
+        string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+
+        float[][] Load(string vramGb, out long misses)
+        {
+            _env.Set("TS_Q4E_EXPERT_VRAM_GB", vramGb);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            float[][] r = Run(model);
+            misses = engine.HostExpertMisses;
+            return r;
+        }
+
+        float[][] all = Load(null, out long allMisses);
+        float[][] host = Load("0", out long hostMisses);
+        string third = (expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+        float[][] partial = Load(third, out long partialMisses);
+        _output.WriteLine($"host-computed experts: all-resident {allMisses}, none resident {hostMisses}, a third resident {partialMisses}");
+        Assert.Equal(-1, allMisses);
+        Assert.True(hostMisses > 0 && partialMisses > 0 && partialMisses < hostMisses);
+        for (int i = 0; i < all.Length; i++)
+        {
+            double eHost = RelativeError(host[i], all[i]), ePartial = RelativeError(partial[i], all[i]);
+            _output.WriteLine($"forward {i}: relative error none resident {eHost:E2}, a third resident {ePartial:E2}");
+            Assert.True(eHost <= 2e-2, $"forward {i}: host-computed experts differ by {eHost:E2}");
+            Assert.True(ePartial <= 2e-2, $"forward {i}: partly host-computed experts differ by {ePartial:E2}");
+        }
+    }
+
+    /// <summary>A layer whose selected experts all have VRAM slots rings no doorbell (the GPU skips the host's echo):
+    /// with a third of the experts resident some layers ring and some do not, and the answers are bit for bit those of
+    /// ringing every layer, decode steps and a verify window alike, with the same experts left to the CPU.</summary>
+    [CudaFact]
+    public void ExpertResidency_DoorbellSkip_AnswersBitForBitAsRingingEveryLayer()
+    {
+        string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        int vocab = Qwen4ExpSyntheticModelBuilder.Vocab;
+        (float[][] Rows, float[] Window, long Misses) Answer()
+        {
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            float[][] rows = Run(model);
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var window = new float[4 * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(new[] { 5, 77, 123, 9 }, null, window, true);
+            return (rows, window, Assert.IsType<Qwen4ExpCudaModel>(model).Engine.HostExpertMisses);
+        }
+        var skip = Answer();
+        _env.Set("TS_Q4E_DOORBELL_SKIP", "0");
+        var ring = Answer();
+        _output.WriteLine($"experts on the CPU: skipping {skip.Misses}, ringing every layer {ring.Misses}");
+        Assert.True(skip.Misses > 0, "no expert was left to the CPU: the fixture did not exercise the doorbell");
+        Assert.Equal(ring.Misses, skip.Misses);
+        for (int i = 0; i < skip.Rows.Length; i++)
+            Assert.True(skip.Rows[i].AsSpan().SequenceEqual(ring.Rows[i]), $"{(i == 0 ? "prefill" : $"decode {i}")}: skipping changed the logits");
+        Assert.True(skip.Window.AsSpan().SequenceEqual(ring.Window), "skipping changed the verify window's logits");
+    }
+
+    /// <summary>Adaptive residency (TS_MOE_TIER_ADAPT=1 under host experts): between decode steps the most-selected
+    /// host experts trade places with the least-selected VRAM experts. The swaps keep every expert reachable, so a
+    /// long decode keeps answering as the all-resident engine does within the host-compute tolerance.</summary>
+    [CudaFact]
+    public void ExpertResidency_AdaptiveSwaps_KeepAnswering()
+    {
+        string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        int[] steps = Enumerable.Range(0, 40).Select(i => (i * 53 + 7) % 250).ToArray();
+        float[][] Decode(ModelBase model)
+        {
+            var rows = new float[steps.Length + 1][];
+            rows[0] = (float[])model.ForwardRefill(Prompt).Clone();
+            for (int i = 0; i < steps.Length; i++)
+                rows[i + 1] = (float[])model.Forward(new[] { steps[i] }).Clone();
+            return rows;
+        }
+
+        float[][] all;
+        using (ModelBase model = ModelBase.Create(path, BackendType.Cuda))
+            all = Decode(model);
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        _env.Set("TS_MOE_TIER_ADAPT", "1");
+        float[][] adaptive;
+        long swaps;
+        using (ModelBase model = ModelBase.Create(path, BackendType.Cuda))
+        {
+            adaptive = Decode(model);
+            swaps = Assert.IsType<Qwen4ExpCudaModel>(model).Engine.AdaptiveSwaps;
+        }
+        _output.WriteLine($"adaptive swaps over {steps.Length} decode steps: {swaps}");
+        Assert.True(swaps > 0, "no expert changed places");
+        // A swapped expert moves between the host's arithmetic and the GPU's, so a near-tie route can flip: one flip's
+        // measured mark on a step's logits (FlipLogitCap). 36 swaps over these 40 steps flipped one at forward 22
+        // (2.47e-2) once the F16 attention kernels were rebuilt; within a flip's mark either way.
+        for (int i = 0; i < all.Length; i++)
+        {
+            double err = RelativeError(adaptive[i], all[i]);
+            Assert.True(err <= FlipLogitCap, $"forward {i}: adaptive residency differs by {err:E2}");
+        }
+    }
+
+    /// <summary>Speculative verify on the direct engine: a window's accepted prefix is committed by replaying the
+    /// recurrences over it, which must leave the state a plain decode of those tokens leaves - the next token's
+    /// logits included - and every kept row's verify logits must be that decode's. A restore returns to the window's
+    /// start. Rows past the accepted prefix are arbitrary drafts.</summary>
+    /// <remarks>With top_k 16 the QSA selection runs from the prompt on, so a captured window pools the blocks its
+    /// rows complete one row at a time.</remarks>
+    [CudaTheory]
+    [InlineData(2048)]
+    [InlineData(16)]
+    public void AVerifyWindow_CommitsItsAcceptedPrefix_AsAPlainDecodeOfThoseTokens(int indexerTopK)
+    {
+        string path = Fixture(indexerTopK: indexerTopK);
+        int[] window = { Steps[0], 77, 123, 9 };
+        int next = Steps[1];
+        int vocab = Qwen4ExpSyntheticModelBuilder.Vocab;
+        using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+        var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+
+        foreach (int keep in new[] { 1, 2, 4 })
+        {
+            model.ResetKVCache();
+            model.ForwardRefill(Prompt);
+            var plain = new List<float[]>();
+            for (int i = 0; i < keep; i++)
+                plain.Add((float[])model.Forward(new[] { window[i] }).Clone());
+            float[] plainNext = (float[])model.Forward(new[] { next }).Clone();
+
+            model.ResetKVCache();
+            model.ForwardRefill(Prompt);
+            var all = new float[window.Length * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(window, null, all, true);
+            spec.SpecOnVerifyAccepted(keep - 1, window.Length - 1);
+            Assert.True(spec.SpecVerifyPersistsAcceptedKv, "the verify did not commit its prefix");
+            spec.SpecRewindCache(Prompt.Length + keep);
+            Assert.Equal(Prompt.Length + keep, model.CacheSeqLen);
+            for (int i = 0; i < keep; i++)
+            {
+                double rowErr = RelativeError(all.AsSpan(i * vocab, vocab).ToArray(), plain[i]);
+                _output.WriteLine($"keep {keep}: verify row {i} relative error {rowErr:E2}");
+                Assert.True(rowErr <= 1e-5, $"keep {keep}: verify row {i} differs from its decode by {rowErr:E2}");
+            }
+            float[] specNext = model.Forward(new[] { next });
+            double err = RelativeError(specNext, plainNext);
+            _output.WriteLine($"keep {keep}: next token after the commit, relative error {err:E2}");
+            Assert.True(err <= 1e-5, $"keep {keep}: the committed state differs from a plain decode by {err:E2}");
+        }
+
+        // Every draft rejected through the restore path: the head returns to the window's start.
+        model.ResetKVCache();
+        model.ForwardRefill(Prompt);
+        float[] plainFirst = (float[])model.Forward(new[] { window[0] }).Clone();
+        model.ResetKVCache();
+        model.ForwardRefill(Prompt);
+        spec.SpecSnapshotRecurrentState();
+        spec.SpecForward(window, null, new float[window.Length * vocab], true);
+        spec.SpecRestoreRecurrentState();
+        spec.SpecRewindCache(Prompt.Length);
+        double restoreErr = RelativeError(model.Forward(new[] { window[0] }), plainFirst);
+        Assert.True(restoreErr <= 1e-5, $"after a restore the window's first token differs by {restoreErr:E2}");
+    }
+
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void TheMtpFixture_DraftsOnTheNativeHead_Cpu() => NativeMtpSmoke(BackendType.GgmlCpu);
+
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TheMtpFixture_DraftsOnTheNativeHead_Metal() => NativeMtpSmoke(BackendType.GgmlMetal);
+
+    /// <summary>The synthetic NextN file passes the published head's validation and the native head drafts from it.</summary>
+    private void NativeMtpSmoke(BackendType backend)
+    {
+        string path = Fixture(indexerTopK: 2048);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 2048);
+        using ModelBase model = ModelBase.Create(path, backend, draftModelPath: mtp);
+        var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+        var head = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.IDraftHead>(model);
+        Assert.True(head.HasDraftHead);
+        int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+        var hidden = new float[Prompt.Length * feat];
+        spec.SpecForward(Prompt, hidden, new float[Prompt.Length * vocab], true);
+        var rows = new float[Prompt.Length * feat];
+        Array.Copy(hidden, 0, rows, feat, (Prompt.Length - 1) * feat);
+        head.DraftCatchUp(Prompt, rows, 0);
+        var logits = new float[vocab];
+        var streams = new float[feat];
+        head.DraftStep(Steps[0], hidden.AsSpan((Prompt.Length - 1) * feat, feat).ToArray(), Prompt.Length, logits, streams);
+        Assert.All(logits, v => Assert.True(float.IsFinite(v)));
+        Assert.All(streams, v => Assert.True(float.IsFinite(v)));
+        _output.WriteLine($"draft argmax {ArgMax(logits)}, |streams| {Math.Sqrt(streams.Sum(v => (double)v * v)):F3}");
+        Assert.True(streams.Any(v => v != 0f), "degenerate draft streams");
+    }
+
+    /// <summary>
+    /// The MTP block of a shared-target NextN file on the direct engine, against the native MTP executor ggml_cuda
+    /// runs (ggml_ops_qwen4exp_mtp.cpp): the trunk's hidden streams of a prompt (the drafter's input, before the
+    /// output mixer), a catch-up over the prompt (token k with the streams of token k - 1), then three chained draft
+    /// steps, each step's logits and streams. Then the fused catch-up-and-step answers as a catch-up and a step.
+    /// </summary>
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void TheMtpBlock_DraftsAsTheNativeHead()
+    {
+        string path = Fixture(indexerTopK: 2048);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 2048);
+        (float[] Hidden, float[][] Logits, float[][] Streams) Drafts(BackendType backend)
+        {
+            using ModelBase model = ModelBase.Create(path, backend, draftModelPath: mtp);
+            var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+            var head = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.IDraftHead>(model);
+            Assert.True(head.HasDraftHead, $"{backend}: no draft head");
+            int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            Assert.Equal(Qwen4ExpSyntheticModelBuilder.Hc * Qwen4ExpSyntheticModelBuilder.Hidden, feat);
+            var hidden = new float[Prompt.Length * feat];
+            spec.SpecForward(Prompt, hidden, new float[vocab], false);
+            var rows = new float[Prompt.Length * feat];
+            Array.Copy(hidden, 0, rows, feat, (Prompt.Length - 1) * feat);
+            head.DraftCatchUp(Prompt, rows, 0);
+            var logits = new float[3][];
+            var streams = new float[3][];
+            float[] h = hidden.AsSpan((Prompt.Length - 1) * feat, feat).ToArray();
+            int token = Steps[0];
+            for (int i = 0; i < 3; i++)
+            {
+                logits[i] = new float[vocab];
+                streams[i] = new float[feat];
+                head.DraftStep(token, h, Prompt.Length + i, logits[i], streams[i]);
+                token = ArgMax(logits[i]);
+                h = streams[i];
+            }
+            return (hidden, logits, streams);
+        }
+        var native = Drafts(BackendType.GgmlCuda);
+        var cuda = Drafts(BackendType.Cuda);
+        double hiddenErr = RelativeError(cuda.Hidden, native.Hidden);
+        _output.WriteLine($"trunk streams: relative error {hiddenErr:E3}");
+        Assert.True(hiddenErr <= 2e-2, $"the trunk's hidden streams strayed {hiddenErr:E3} from the native span");
+        for (int i = 0; i < 3; i++)
+        {
+            double le = RelativeError(cuda.Logits[i], native.Logits[i]), se = RelativeError(cuda.Streams[i], native.Streams[i]);
+            _output.WriteLine($"draft {i}: logits relative error {le:E3} (argmax {ArgMax(cuda.Logits[i])} vs {ArgMax(native.Logits[i])}), streams {se:E3}");
+            Assert.True(le <= 2e-2 && se <= 2e-2, $"draft step {i} strayed from the native head: logits {le:E3}, streams {se:E3}");
+        }
+
+        // One call over the catch-up rows and the first draft row answers as the two calls.
+        using (ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp))
+        {
+            // The server's attach step after load takes the head the constructor already attached (it used to refuse
+            // it: "does not use a separate draft GGUF").
+            _env.Set(TensorSharp.Runtime.Speculative.SpeculationEnvVars.DraftModel, mtp);
+            Assert.True(SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(model, out string attachError), attachError);
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var head = (TensorSharp.Runtime.Speculative.IDraftHead)model;
+            int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            var hidden = new float[Prompt.Length * feat];
+            spec.SpecForward(Prompt, hidden, new float[vocab], false);
+            var rows = new float[(Prompt.Length + 1) * feat];
+            Array.Copy(hidden, 0, rows, feat, Prompt.Length * feat);
+            var tokens = Prompt.Append(Steps[0]).ToArray();
+            var fusedLogits = new float[vocab];
+            var fusedStreams = new float[feat];
+            head.DraftCatchUpAndStep(tokens, rows, 0, fusedLogits, fusedStreams);
+            double le = RelativeError(fusedLogits, cuda.Logits[0]), se = RelativeError(fusedStreams, cuda.Streams[0]);
+            _output.WriteLine($"fused catch-up and step: logits relative error {le:E3}, streams {se:E3}");
+            // Its join rows (tokens x streams) take the prompt-size matmul route instead of the decode kernels.
+            Assert.True(le <= 1e-2 && se <= 1e-2, $"the fused call differs from catch-up + step: logits {le:E3}, streams {se:E3}");
+        }
+    }
+
+    /// <summary>A decode step's hyper-connection scatter fused with the next mixer's first pass computes what the two
+    /// launches compute: the prompt and every decode step, bit for bit, with QSA past its width.</summary>
+    [CudaFact]
+    public void TheFusedScatterAndMixerPass_AnswersBitForBitAsTwoLaunches()
+    {
+        string path = Fixture();
+        float[][] fused, split;
+        using (ModelBase model = ModelBase.Create(path, BackendType.Cuda))
+            fused = Run(model);
+        _env.Set("TS_Q4E_FUSE_HC", "0");
+        using (ModelBase model = ModelBase.Create(path, BackendType.Cuda))
+            split = Run(model);
+        for (int i = 0; i < fused.Length; i++)
+            Assert.True(fused[i].AsSpan().SequenceEqual(split[i]), $"{(i == 0 ? "prefill" : $"decode {i}")}: the fused kernel changed the logits");
+    }
+
+    /// <summary>The shared expert on its own stream beside the router and the routed experts (forked and joined inside the
+    /// captured step) computes what the serial chain computes, bit for bit, decode steps and a verify window alike.</summary>
+    [CudaFact]
+    public void TheForkedSharedExpert_AnswersBitForBitAsTheSerialChain()
+    {
+        string path = Fixture();
+        int vocab = Qwen4ExpSyntheticModelBuilder.Vocab;
+        (float[][] Rows, float[] Window) Answer()
+        {
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            float[][] rows = Run(model);
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var window = new float[4 * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(new[] { 5, 77, 123, 9 }, null, window, true);
+            return (rows, window);
+        }
+        var forked = Answer();
+        _env.Set("TS_Q4E_FORK_SHEXP", "0");
+        var serial = Answer();
+        for (int i = 0; i < forked.Rows.Length; i++)
+            Assert.True(forked.Rows[i].AsSpan().SequenceEqual(serial.Rows[i]), $"{(i == 0 ? "prefill" : $"decode {i}")}: the fork changed the logits");
+        Assert.True(forked.Window.AsSpan().SequenceEqual(serial.Window), "the fork changed the verify window's logits");
+    }
+
+    /// <summary>--kv-cache-dtype q8_0 on the direct engine: the attention cache as int8 codes with an F16 scale per 32
+    /// values (ggml's Q8_0 arithmetic), half the F16 cache's bytes. The prompt and every decode step stay close to the F16
+    /// cache's answers, and a verify window over the Q8_0 cache answers as a plain decode on that same cache does.</summary>
+    [CudaFact]
+    public void AQ8KvCache_AnswersCloseToF16_AndVerifiesAsItsOwnDecode()
+    {
+        string path = Fixture();
+        int vocab = Qwen4ExpSyntheticModelBuilder.Vocab;
+        KvCacheDtype saved = KvCacheDtypeConfig.Current;
+        bool savedExplicit = KvCacheDtypeConfig.IsExplicitlySet;
+        try
+        {
+            float[][] f16;
+            using (ModelBase model = ModelBase.Create(path, BackendType.Cuda))
+                f16 = Run(model);
+            // q8_0 is the direct engine's default when the operator names no dtype.
+            KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, explicitlySet: false);
+            using (ModelBase byDefault = ModelBase.Create(path, BackendType.Cuda))
+                Assert.Equal(KvCacheDtype.Q8_0, byDefault.KvCacheDtype);
+            KvCacheDtypeConfig.Set(KvCacheDtype.Q8_0);
+            using ModelBase q8 = ModelBase.Create(path, BackendType.Cuda);
+            Assert.Equal(KvCacheDtype.Q8_0, q8.KvCacheDtype);
+            float[][] rows = Run(q8);
+            for (int i = 0; i < rows.Length; i++)
+            {
+                double err = RelativeError(rows[i], f16[i]);
+                _output.WriteLine($"{(i == 0 ? "prefill" : $"decode {i}")}: q8_0 vs f16 KV relative error {err:E2}");
+                // Measured 3.7e-3 .. 4.8e-3 on an RTX 5090 (the engine-vs-native-span difference is 4.5e-3 .. 6.4e-3).
+                Assert.True(err <= 1e-2, $"{(i == 0 ? "prefill" : $"decode {i}")}: the q8_0 cache moved the logits by {err:E2}");
+            }
+
+            int[] window = { Steps[0], 77, 123, 9 };
+            q8.ResetKVCache();
+            q8.ForwardRefill(Prompt);
+            var plain = new List<float[]>();
+            foreach (int token in window)
+                plain.Add((float[])q8.Forward(new[] { token }).Clone());
+            q8.ResetKVCache();
+            q8.ForwardRefill(Prompt);
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)q8;
+            var all = new float[window.Length * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(window, null, all, true);
+            for (int i = 0; i < window.Length; i++)
+            {
+                double err = RelativeError(all.AsSpan(i * vocab, vocab).ToArray(), plain[i]);
+                Assert.True(err <= 1e-5, $"verify row {i} over the q8_0 cache differs from its decode by {err:E2}");
+            }
+        }
+        finally
+        {
+            KvCacheDtypeConfig.RestoreForTests(saved, savedExplicit);
+        }
+    }
+
+    /// <summary>A router the file stores as BF16 (ISTA's) is read as stored at decode size, half the bytes of its F32
+    /// widening, with the same sums: decode steps and a verify window bit for bit as the F32 router's, and a prompt (which
+    /// widens it for its GEMM) as well.</summary>
+    [CudaFact]
+    public void ABf16Router_AnswersBitForBitAsItsF32Widening()
+    {
+        // 256 experts: the BF16 GEMV is the wide (warp-per-output) form a real router takes.
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "qwen4exp-bf16router.gguf"), 2048,
+            routerType: SyntheticGguf.GgmlType.BF16, expertCount: 256, expertUsedCount: 8);
+        int vocab = Qwen4ExpSyntheticModelBuilder.Vocab;
+        (float[][] Rows, float[] Window) Answer()
+        {
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            float[][] rows = Run(model);
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var window = new float[4 * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(new[] { 5, 77, 123, 9 }, null, window, true);
+            return (rows, window);
+        }
+        var bf16 = Answer();
+        _env.Set("TS_Q4E_BF16_ROUTER", "0");
+        var f32 = Answer();
+        for (int i = 0; i < bf16.Rows.Length; i++)
+            Assert.True(bf16.Rows[i].AsSpan().SequenceEqual(f32.Rows[i]), $"{(i == 0 ? "prefill" : $"decode {i}")}: the BF16 router changed the logits");
+        Assert.True(bf16.Window.AsSpan().SequenceEqual(f32.Window), "the BF16 router changed the verify window's logits");
+    }
+
     [CudaFact]
     public void AnUndecodableExpertLayout_IsRefusedAtLoadByTensorName()
     {

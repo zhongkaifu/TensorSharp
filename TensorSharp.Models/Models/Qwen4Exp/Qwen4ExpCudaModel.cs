@@ -19,7 +19,8 @@ using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 namespace TensorSharp.Models
 {
-    public sealed class Qwen4ExpCudaModel : ModelBase, IBatchedPagedModel, IPrefixCacheModel, IPrefixCacheModelDiagnostics
+    public sealed partial class Qwen4ExpCudaModel : ModelBase, IBatchedPagedModel, IPrefixCacheModel, IPrefixCacheModelDiagnostics,
+        TensorSharp.Runtime.Speculative.ISpeculativeTarget
     {
         private Qwen4ExpCudaExecutor _exec;
         private readonly object _sync = new object();
@@ -44,10 +45,6 @@ namespace TensorSharp.Models
             {
                 ParseBaseConfig();
                 ParseTokenizer();
-                if (!string.IsNullOrWhiteSpace(draftGgufPath))
-                    throw new NotSupportedException(
-                        "Qwen3.8-Flash-Next's MTP draft head is not built on --backend cuda yet; drop --draft-model " +
-                        "or run --backend ggml_cuda.");
                 // The direct-CUDA engine has no host-expert seam; the GGML token span does.
                 MoeCpuOffloadConfig.WarnUnsupportedBackend(Qwen4ExpModel.ArchitectureId, "cuda");
                 int maxContext = ResolveConfiguredContextLength();
@@ -56,7 +53,23 @@ namespace TensorSharp.Models
                 if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
                     maxContext = Math.Min(maxContext, 65536);
                 int nUbatch = ParseEnvInt("TS_Q4E_UBATCH", 512);
-                _exec = new Qwen4ExpCudaExecutor(ggufPath, maxContext, nUbatch, Math.Max(1, layerSplitDegree));
+                // --kv-cache-dtype: the engine's kernels store F16 or Q8_0 (int8 codes, an F16 scale per 32 values).
+                // Q8_0 unless the operator chose otherwise (Strata's int8 KV): at 131K context it gives 1.5 GiB more to
+                // expert slots on a 32 GB card - 4K and 16K prompts 11-12% faster, their answers 9-30% faster.
+                if (!KvCacheDtypeConfig.IsExplicitlySet)
+                    _kvCacheDtype = KvCacheDtype.Q8_0;
+                if (_kvCacheDtype == KvCacheDtype.Q4_0)
+                {
+                    Console.Error.WriteLine("[kv-cache] the direct-CUDA qwen4exp engine stores the KV cache as f16 or q8_0; "
+                        + "using f16 for q4_0.");
+                    _kvCacheDtype = KvCacheDtype.F16;
+                }
+                bool kvQ8 = _kvCacheDtype == KvCacheDtype.Q8_0;
+                _exec = new Qwen4ExpCudaExecutor(ggufPath, maxContext, nUbatch, Math.Max(1, layerSplitDegree),
+                    string.IsNullOrWhiteSpace(draftGgufPath) ? null : draftGgufPath, kvQ8);
+                Console.WriteLine(kvQ8
+                    ? "  KV cache: q8_0 (int8 codes, one F16 scale per 32 values; --kv-cache-dtype f16 keeps F16)"
+                    : "  KV cache: f16");
                 _primarySlot = _exec.ActiveSlot;
                 _maxContextLength = _exec.ContextSize;
                 Config.VocabSize = _exec.VocabSize;

@@ -39,6 +39,10 @@ namespace TensorSharp.Models
     public partial class Qwen4ExpModel
     {
         private MoeRoutingProfile _routingProfile;
+
+        /// <summary>Per layer, the experts its accelerator tier holds in fixed slots (null for a
+        /// layer without a tier). The host serves every other route of a host layer.</summary>
+        private int[][] _tierExperts;
         private string _routingProfilePath;
         private bool _routingProfileExitHook;
         // The accelerator-resident layers' graphs also count their routing (see
@@ -51,6 +55,19 @@ namespace TensorSharp.Models
         internal static long? ExpertTierBudgetOverride(string value)
             => double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out double gb)
                && gb >= 0 && gb < 1e6 ? (long)(gb * 1e9) : null;
+
+        /// <summary>The share of a unified-memory tier budget given to window slots (least recently used, filled as the
+        /// text routes) instead of profile-ranked fixed slots. The profile ranks experts over other prompts; the window
+        /// follows this one. ISTA Q2_0 on the 48 GB M5 Pro, the same 25 GB either way: 0.3 GB of window (what the fixed
+        /// slots left) read 26-47 missed experts a 4-row verify pass and computed up to 13 routes on the host, 3.1 GB
+        /// (this share) read 14-19 and none on the host - the pass 52.8-59.0 -> 49.4-51.0 ms, a 1-row step 32.5-33.9 ->
+        /// 31.9-32.5 ms. <c>TS_MOE_WINDOW_SHARE</c> (0 to 0.9) sets it; an explicit <c>TS_MOE_HOT_TIER_GB</c> keeps its
+        /// own split (the window gets what the fixed slots leave).</summary>
+        internal const double DefaultWindowShare = 0.12;
+
+        internal static double WindowShare(string value)
+            => double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out double share)
+               && share >= 0 && share <= 0.9 ? share : DefaultWindowShare;
 
         private bool TryGetLayerExperts(int layer, out StackedExpertWeights gate, out StackedExpertWeights up,
             out StackedExpertWeights down)
@@ -228,9 +245,43 @@ namespace TensorSharp.Models
                     GgmlBasicOps.MoeHotTierRelease(gate.Data);
         }
 
+        /// <summary>
+        /// Read every fixed slot's expert slices into the page cache with parallel large reads
+        /// before the tiers copy them. The native fill faults its sources in on 16 threads, a page
+        /// at a time; on a network mount each fault is a round trip: measured on a geesefs mount,
+        /// the 23.0 GB tier of Qwen3.8-Flash-Next took 363 s that way (~63 MB/s).
+        /// </summary>
+        private void WarmTierExperts(List<int> layers, int[][] tiers)
+        {
+            if (_gguf == null)
+                return;
+            var ranges = new List<(IntPtr Pointer, long Bytes)>();
+            foreach (int l in layers)
+            {
+                if (tiers[l].Length == 0 || !TryGetLayerExperts(l, out var gate, out var up, out var down))
+                    continue;
+                foreach (var w in new[] { gate, up, down })
+                {
+                    long per = w.PerExpertRawBytes;
+                    foreach (int e in tiers[l])
+                        ranges.Add((w.Data + (nint)(e * per), per));
+                }
+            }
+            if (ranges.Count == 0)
+                return;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int threads = GgufFile.DefaultWarmThreads();
+            long read = _gguf.WarmMappedRanges(ranges, threads);
+            if (sw.Elapsed.TotalSeconds >= 1)
+                Console.WriteLine($"[moe-offload] qwen4exp: read the accelerator tier's experts ({Gb(read)}) in " +
+                    $"{sw.Elapsed.TotalSeconds:F1}s with {threads} parallel reads.");
+        }
+
         /// <summary>The tiered plan for a Metal run whose experts do not fit. Returns
-        /// false to keep the layer plan.</summary>
-        private bool TryPlanExpertTiers(long layerPlanBytes)
+        /// false to keep the layer plan. <paramref name="deviceExpertBytes"/> bounds the
+        /// tier and the window slots together: on unified memory both are accelerator
+        /// buffers inside the Metal working set.</summary>
+        private bool TryPlanExpertTiers(long layerPlanBytes, long deviceExpertBytes = long.MaxValue)
         {
             bool unified = _backend == BackendType.GgmlMetal;
             if (!ExpertTiersEnabled() || _fusedGateUpExperts || !(unified || _backend == BackendType.GgmlCuda))
@@ -278,8 +329,11 @@ namespace TensorSharp.Models
                     $"({_routingProfilePath}); this load gives every layer window slots only and records the routing, " +
                     "the next load also keeps each layer's most-routed experts in fixed slots.");
 
-            long budget = !profiled ? 0
-                : ExpertTierBudgetOverride(Environment.GetEnvironmentVariable("TS_MOE_HOT_TIER_GB")) ?? layerPlanBytes;
+            long? tierOverride = ExpertTierBudgetOverride(Environment.GetEnvironmentVariable("TS_MOE_HOT_TIER_GB"));
+            long budget = !profiled ? 0 : tierOverride ?? Math.Min(layerPlanBytes, deviceExpertBytes);
+            // On unified memory a share of the budget goes to window slots (see DefaultWindowShare).
+            if (profiled && unified && tierOverride == null)
+                budget -= (long)(budget * WindowShare(Environment.GetEnvironmentVariable("TS_MOE_WINDOW_SHARE")));
             // The explicitly read budget becomes each layer's window: accelerator slots
             // the seams fill on demand, so a cold expert is read once into a slot and
             // computed on the accelerator, never on the host. A small share stays a
@@ -287,9 +341,19 @@ namespace TensorSharp.Models
             long ioBudget = unified ? HostExpertIoBudget(budget) : 0;
             bool explicitIo = unified && ConfigureHostExpertIo(Math.Max(ioBudget / 8, 1L << 30));
             long windowBudget = explicitIo ? ioBudget - ioBudget / 8 : 0;
-            long perLayerWindow = windowBudget / Math.Max(1, moeLayers.Count);
             int[][] tiers = profiled ? _routingProfile.SelectTiers(expertBytes, budget) : new int[n][];
             for (int l = 0; l < n; l++) tiers[l] ??= Array.Empty<int>();
+            // The window is sized from host RAM, but its slots are accelerator buffers too:
+            // what the tier leaves of the working set bounds it. A layer plan that already
+            // fills the working set (ISTA Q2_0: 29.7 GB of experts on a 40.2 GB set) left the
+            // 3.1 GB of window slots it was given out of every account, and Metal ran out of
+            // memory on the first long answer.
+            long tierBytes = 0;
+            foreach (int l in moeLayers) tierBytes += (long)tiers[l].Length * expertBytes[l];
+            windowBudget = Math.Min(windowBudget, Math.Max(0, deviceExpertBytes - tierBytes));
+            long perLayerWindow = windowBudget / Math.Max(1, moeLayers.Count);
+            WarmTierExperts(moeLayers, tiers);
+            _tierExperts = new int[n][];
             int tiered = 0, experts = 0, windowSlots = 0;
             long bytes = 0;
             double covered = 0;
@@ -309,6 +373,7 @@ namespace TensorSharp.Models
                     continue;
                 }
                 tiered++;
+                _tierExperts[l] = tier;
                 experts += tier.Length;
                 bytes += tier.Length * expertBytes[l];
                 windowSlots += window;

@@ -1068,6 +1068,7 @@ namespace TensorSharp.Runtime
             _mappedView = null;
             _mappedFile?.Dispose();
             _mappedFile = null;
+            DisposeReadHandles();
             _stream?.Dispose();
             _stream = null!;
         }

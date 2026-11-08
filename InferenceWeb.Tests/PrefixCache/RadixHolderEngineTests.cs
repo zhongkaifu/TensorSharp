@@ -746,6 +746,34 @@ public class RadixHolderEngineTests
     }
 
     [Fact]
+    public async Task CheckpointCapture_ThatFreesRoomBelowItsOwnNode_StillPublishes()
+    {
+        // A capture that fails for room frees the oldest scoped payload and retries. When that payload lies
+        // below the checkpoint's freshly split node, the eviction cascaded through the payload-less node and
+        // returned it to the pool, and Publish threw "End states attach to non-root nodes" (Qwen3.8 Flash
+        // Next's first CLI turn on ggml_cuda failed this way).
+        var model = OracleFakes.R(8);
+        using var engine = new InferenceEngine(model, Configuration());
+        // The CLI's load-time warm of its system prefix: the checkpoint at the shared boundary finds no room
+        // (nothing to free yet), so only the finished request's state is kept, one edge below that boundary.
+        model.FailNext("capture");
+        var warmDone = await Run(engine, Request("warm", Tokens(16), "warm", shared: 16));
+        // Another conversation displaces the primary, which converts it into a scoped holder: an eviction
+        // candidate (the primary itself never is).
+        await Run(engine, Request("other", Tokens(8, 200), "elsewhere"));
+        Assert.Contains(model.RetainedPayloadKeys, key => model.MeasureEndState(key).Tokens > 16);
+
+        // Turn 1 shares the boundary, not the warm's tail. Its capture at 16 fails once, frees the warm's
+        // holder below the boundary node, and must still publish there.
+        model.FailNext("capture");
+        var turn = Request("turn", Tokens(16).Concat(Tokens(16, 81)).ToList(), "conversation", shared: 16);
+        var completion = await Run(engine, turn);
+        Assert.Equal(warmDone.Status, completion.Status);
+        Assert.Equal(warmDone.OutputTokenCount, completion.OutputTokenCount);
+        Assert.Contains(model.RetainedPayloadKeys, key => model.MeasureEndState(key).Tokens == 16);
+    }
+
+    [Fact]
     public async Task OtherScope_CannotUsePrivateEndState()
     {
         using var engine = new InferenceEngine(OracleFakes.R(8), Configuration());

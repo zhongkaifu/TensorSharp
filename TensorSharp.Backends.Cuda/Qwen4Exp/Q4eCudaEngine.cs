@@ -76,9 +76,28 @@ namespace TensorSharp.Cuda
             // ---- FFN ----
             /// <summary>[nExpert, E].</summary>
             public float[] Router;
+            /// <summary>The router as the file's BF16 [nExpert, E], when it ships so (read at half the bytes, the same sums).</summary>
+            public ushort[] RouterBf16;
             /// <summary>The shared expert's gate vector [E].</summary>
             public float[] ShexpGate;
             public CudaWeightDesc GateExps, UpExps, DownExps, GateShexp, UpShexp, DownShexp;
+        }
+
+        /// <summary>
+        /// The NextN (MTP) draft block of a separate shared-target GGUF: each hyper-connection stream joins the
+        /// normed token embedding and its own normed stream ([enorm(e), hnorm(h_s)], 2E wide) and eh_proj maps it
+        /// back to E; one dense-attention layer and its MoE follow, with their own KV; the output mixer is the
+        /// block's own, the LM head the trunk's. Reference: ggml_ops_qwen4exp_mtp.cpp.
+        /// </summary>
+        public sealed class MtpDesc
+        {
+            /// <summary>The block's layer: gated attention without QSA or PLE, and the routed MoE.</summary>
+            public LayerDesc Layer;
+            /// <summary>[E] for the token embedding, [hc * E] for the trunk streams.</summary>
+            public float[] Enorm, Hnorm;
+            /// <summary>The block's output mixer.</summary>
+            public float[] HeadHcNorm;
+            public CudaWeightDesc EhProj, HeadHcDown, HeadHcUp;
         }
 
         public sealed class ModelDesc
@@ -92,12 +111,25 @@ namespace TensorSharp.Cuda
             public int PleConvKernel, PleDilation;
             public float RmsEps;
             public int NCtx, NUbatch;
+            /// <summary>The attention KV cache as Q8_0 (<c>--kv-cache-dtype q8_0</c>): int8 codes with an F16 scale per
+            /// 32 values, about half the F16 cache's bytes, which a GPU then spends on expert slots.</summary>
+            public bool KvQ8;
             public CudaWeightDesc TokEmbd, Output;
             public float[] OutputHcNorm;
             public CudaWeightDesc OutputHcDown, OutputHcUp;
             public LayerDesc[] Layers;
             /// <summary>The PLE rows' host gather; required when a layer carries the PLE block.</summary>
             public IQwen4ExpPleSource Ple;
+            /// <summary>Per layer, how often each expert was routed (the routing profile), or null: ranks
+            /// the experts that get VRAM slots when one GPU cannot hold them all (Residency.cs).</summary>
+            public ulong[][] ExpertRouteCounts;
+            /// <summary>VRAM for expert slots, forcing residency on one GPU; negative plans it from free memory.</summary>
+            public long ExpertVramBytes = -1;
+            /// <summary>The host's expert kernel; with it a decode step under residency computes its missed experts
+            /// on the CPU (Residency.cs). Null keeps staging them.</summary>
+            public CudaHostExpertRows HostExperts;
+            /// <summary>The MTP draft block, or null.</summary>
+            public MtpDesc Mtp;
         }
 
         private sealed class DevLayer
@@ -113,8 +145,10 @@ namespace TensorSharp.Cuda
             public Tensor QNorm, KNorm, IdxK, IdxQ, IdxKNorm, IdxQNorm;
             public DeviceWeight PleKey, PleValue;
             public Tensor PleNormKey, PleNormQuery, PleNormConv, PleConvT;
-            public Tensor Router, ShexpGate;
+            public Tensor Router, ShexpGate, RouterBf16;
             public DeviceWeight GateExps, UpExps, DownExps, GateShexp, UpShexp, DownShexp;
+            /// <summary>Expert residency's staging view of this layer (invalid when every expert is resident).</summary>
+            public CudaExpertStageLayer Stage;
         }
 
         private sealed class Dev
@@ -129,6 +163,9 @@ namespace TensorSharp.Cuda
             // Layer-boundary handoff of the streams through pinned host memory: DtoH on this
             // device's stream, HtoD on the next.
             public IntPtr BoundaryPinned, XsReadyEv, CopyDoneEv;
+            /// <summary>The shared expert's stream in a decode-size step, forked from and joined back into the device's
+            /// stream (a captured step holds both branches).</summary>
+            public IntPtr ShStream, ShForkEv, ShJoinEv;
             public Tensor Tokens;
             /// <summary>A captured decode step's position, copied in from pinned memory at launch.</summary>
             public Tensor PosDev;
@@ -152,6 +189,8 @@ namespace TensorSharp.Cuda
             public IntPtr PlePinned;
             // FFN
             public Tensor RouterLogits, ShGate, ShUp, ShDown;
+            /// <summary>A prompt's router widened from BF16 (allocated on first use).</summary>
+            public Tensor RouterF32;
             // head
             public Tensor Logits, BatchLogits;
             // A batched decode step's per-row state pointers: [layer][conv, ssm][row], then the
@@ -179,12 +218,16 @@ namespace TensorSharp.Cuda
             public Tensor PleHist;
             public readonly Qwen4ExpPleHistory PleTokens = new Qwen4ExpPleHistory();
             public readonly List<Tensor> Owned = new List<Tensor>();
+            /// <summary>The MTP block's KV (allocated on the slot's first draft), and the positions it holds.</summary>
+            public SlotLayer Mtp;
+            public int MtpPast;
         }
 
         private sealed class SlotLayer
         {
             public Tensor ConvState, Ssm;                    // Gated DeltaNet
             public Tensor KCache, VCache, IdxRaw, IdxPooled; // attention, QSA
+            public Tensor KScale, VScale;                    // Q8_0 KV: one F16 scale per 32 cached values
         }
 
         private readonly ModelDesc _m;
@@ -240,6 +283,15 @@ namespace TensorSharp.Cuda
                 }
                 anyQsa |= !L.Recurrent && L.CompressRatio > 0;
             }
+            if (m.Mtp != null)
+            {
+                var ml = m.Mtp.Layer;
+                if (ml == null || ml.Recurrent || ml.Ple || ml.CompressRatio != 0 || m.Mtp.Enorm?.Length != m.NEmbd
+                    || m.Mtp.Hnorm?.Length != m.Hc * m.NEmbd || m.Mtp.HeadHcNorm?.Length != m.Hc * m.NEmbd
+                    || !m.Mtp.EhProj.IsValid || m.Mtp.EhProj.Ne0 != 2L * m.NEmbd || m.Mtp.EhProj.Ne1 != m.NEmbd)
+                    throw new NotSupportedException("[q4e-cuda] the MTP block is not a dense-attention NextN layer of this model");
+                CudaMoe.RequireExpertWeights("q4e-cuda", m.NLayer, ml.GateExps, ml.UpExps, ml.DownExps);
+            }
             if (anyQsa && (m.IdxDim % 32 != 0 || m.IdxDim > Q4eKernels.MaxIndexerDim || m.IdxDim < m.NRot || m.IdxTopK <= 0))
                 throw new NotSupportedException($"[q4e-cuda] indexer head width {m.IdxDim}, top_k {m.IdxTopK}");
             if (_pleLayer >= 0 && (m.Ple == null || m.Ple.RowWidth != m.NEmbd))
@@ -263,20 +315,58 @@ namespace TensorSharp.Cuda
                 dev.GK = GlmKernels.Create();
                 dev.QK = Q4eKernels.Create();
                 _devs[d] = dev;
+                if (m.KvQ8 && !dev.QK.HasKvQ8)
+                    throw new NotSupportedException("[q4e-cuda] --kv-cache-dtype q8_0 needs the Q8_0 KV kernels, which the loaded "
+                        + "tensorsharp_q4e_kernels module predates (a committed PTX baseline not yet regenerated). Rebuild "
+                        + "TensorSharp.Backends.Cuda with a CUDA 13 nvcc on PATH, or run with the F16 cache.");
             }
             for (int il = 0; il < m.NLayer; il++)
             {
                 var L = m.Layers[il];
                 CudaMoe.RequireExpertDecoders("q4e-cuda", _devs[0].DK.DecodesQ5_1Experts, il, L.GateExps, L.UpExps, L.DownExps,
-                    decodesLowBitIq: _devs[0].DK.DecodesLowBitIqExperts);
+                    decodesLowBitIq: _devs[0].DK.DecodesLowBitIqExperts, decodesLegacy: _devs[0].DK.DecodesLegacyQuants);
+                // Dense Q2_0/Q4_0/Q5_0 rows and BF16 matrices (ISTA's pack) need the module's legacy decoders too.
+                if (!_devs[0].DK.DecodesLegacyQuants)
+                    foreach (var w in LayerWeights(L, experts: false))
+                        if (w.GgmlType is 2 or 6 or 42 or 30)
+                            throw new NotSupportedException(
+                                $"[q4e-cuda] {w.Name ?? $"a layer {il} weight"} is {CudaMoe.GgmlTypeName(w.GgmlType)}, and the loaded tensorsharp_dsv4_kernels " +
+                                "module predates its decoder (a committed PTX baseline not yet regenerated). Rebuild TensorSharp.Backends.Cuda " +
+                                "with a CUDA 13 nvcc on PATH, or run this model with --backend ggml_cuda.");
             }
+
+            if (m.Mtp != null)
+            {
+                var ml = m.Mtp.Layer;
+                CudaMoe.RequireExpertDecoders("q4e-cuda", _devs[0].DK.DecodesQ5_1Experts, m.NLayer, ml.GateExps, ml.UpExps, ml.DownExps,
+                    decodesLowBitIq: _devs[0].DK.DecodesLowBitIqExperts, decodesLegacy: _devs[0].DK.DecodesLegacyQuants);
+                if (!_devs[0].DK.DecodesLegacyQuants)
+                    foreach (var w in MtpWeights(m.Mtp, experts: false))
+                        if (w.GgmlType is 2 or 6 or 42 or 30)
+                            throw new NotSupportedException(
+                                $"[q4e-cuda] the MTP block's {w.Name ?? "weight"} is {CudaMoe.GgmlTypeName(w.GgmlType)}, which the loaded " +
+                                "tensorsharp_dsv4_kernels module cannot decode; rebuild TensorSharp.Backends.Cuda with a CUDA 13 nvcc on PATH.");
+            }
+
+            // ---- expert residency: one GPU that cannot hold every routed expert keeps the hottest in
+            // VRAM slots and reads the rest from pinned host memory (Residency.cs) ----
+            long nonExpertBytes = 0;
+            for (int il = 0; il < m.NLayer; il++)
+            {
+                foreach (var w in LayerWeights(m.Layers[il], experts: false))
+                    nonExpertBytes += CudaWeightArena.Align(w.TotalBytes);
+                nonExpertBytes += LayerFloatBytes(m.Layers[il]) + LayerCacheBytes(il);
+            }
+            // The MTP block stays whole in VRAM (its experts included), with one sequence's draft KV and its scratch.
+            nonExpertBytes += MtpDeviceBytes();
+            _residency = PlanResidency(useDevs, nonExpertBytes);
 
             // ---- placement: contiguous runs of layers, each device filled to the same share of
             // what it has free after its fixed scratch ----
             var layerBytes = new long[m.NLayer];
             for (int il = 0; il < m.NLayer; il++)
             {
-                foreach (var w in LayerWeights(m.Layers[il]))
+                foreach (var w in LayerWeights(m.Layers[il], experts: _residency == null))
                     layerBytes[il] += CudaWeightArena.Align(w.TotalBytes);
                 layerBytes[il] += LayerFloatBytes(m.Layers[il]) + LayerCacheBytes(il);
             }
@@ -286,11 +376,14 @@ namespace TensorSharp.Cuda
             // ---- arenas ----
             var arenaNeed = new long[useDevs];
             for (int il = 0; il < m.NLayer; il++)
-                foreach (var w in LayerWeights(m.Layers[il]))
+                foreach (var w in LayerWeights(m.Layers[il], experts: _residency == null))
                     arenaNeed[assignment[il]] += CudaWeightArena.Align(w.TotalBytes);
+            if (_residency != null)
+                arenaNeed[0] += ResidencyArenaBytes();
             arenaNeed[0] += CudaWeightArena.Align(m.TokEmbd.TotalBytes);
             arenaNeed[_lastDev] += CudaWeightArena.Align(m.Output.TotalBytes)
                 + CudaWeightArena.Align(m.OutputHcDown.TotalBytes) + CudaWeightArena.Align(m.OutputHcUp.TotalBytes);
+            arenaNeed[_lastDev] += MtpArenaBytes();
             for (int d = 0; d < useDevs; d++)
             {
                 _devs[d].MakeCurrent();
@@ -303,8 +396,15 @@ namespace TensorSharp.Cuda
                 var L = m.Layers[il];
                 _layers[il] = new DevLayer { Device = assignment[il], Recurrent = L.Recurrent, Ple = L.Ple, Ratio = L.Recurrent ? 0 : L.CompressRatio };
             }
+            if (m.Mtp != null)
+                _mtpLayer = new DevLayer { Device = _lastDev };
 
             var sw = Stopwatch.StartNew();
+            if (_residency != null)
+            {
+                LoadHostExperts();
+                CreateExpertStage(_devs[0]);
+            }
             Parallel.For(0, useDevs, d =>
             {
                 var dev = _devs[d];
@@ -320,12 +420,16 @@ namespace TensorSharp.Cuda
                     _outHcDown = dev.Weights.Place(m.OutputHcDown);
                     _outHcUp = dev.Weights.Place(m.OutputHcUp);
                     _outHcNorm = UploadF32(dev, m.OutputHcNorm);
+                    if (_mtpLayer != null)
+                        UploadMtp(dev);
                 }
             });
             CudaWeightArena.StreamAll(Array.ConvertAll(_devs, d => d.Weights), "q4e-cuda");
 
             foreach (var dev in _devs)
                 AllocateScratch(dev);
+            ReportResidency();
+            StartHostExperts();
             _active = CreateSlot();
             _slots[_active.Id] = _active;
             CachePrefillWeights();
@@ -344,24 +448,31 @@ namespace TensorSharp.Cuda
         // Placement and upload
         // -------------------------------------------------------------------
 
-        private static IEnumerable<CudaWeightDesc> LayerWeights(LayerDesc l)
+        private static IEnumerable<CudaWeightDesc> LayerWeights(LayerDesc l, bool experts = true)
         {
             foreach (var w in new[]
                 {
                     l.HcAttnDown, l.HcAttnUp, l.HcFfnDown, l.HcFfnUp,
                     l.Qkv, l.Gate, l.SsmOut, l.Wq, l.Wk, l.Wv, l.Wo, l.PleKey, l.PleValue,
-                    l.GateExps, l.UpExps, l.DownExps, l.GateShexp, l.UpShexp, l.DownShexp,
+                    l.GateShexp, l.UpShexp, l.DownShexp,
                 })
             {
                 if (w.IsValid)
                     yield return w;
             }
+            if (!experts)
+                yield break;
+            foreach (var w in new[] { l.GateExps, l.UpExps, l.DownExps })
+                if (w.IsValid)
+                    yield return w;
         }
 
         /// <summary>The F32 tensors a layer uploads beside its arena weights.</summary>
         private static long LayerFloatBytes(LayerDesc l)
         {
-            long n = 0;
+            // A BF16 router is uploaded as stored (UploadLayer), not widened.
+            long n = l.RouterBf16 != null && l.Router.Length / Math.Max(1, l.ShexpGate?.Length ?? 1) >= 256
+                ? CudaWeightArena.Align((long)l.RouterBf16.Length * 2) - CudaWeightArena.Align((long)l.Router.Length * 4) : 0;
             foreach (var a in new[]
                 {
                     l.HcAttnNorm, l.HcFfnNorm, l.HcAttnInject, l.HcFfnInject, l.SsmAlpha, l.SsmBeta, l.ConvW, l.DtBias,
@@ -375,6 +486,13 @@ namespace TensorSharp.Cuda
             return n;
         }
 
+        /// <summary>One attention layer's K (or V) cache of one sequence at the full context, scales included.</summary>
+        private long KvCacheBytes()
+        {
+            long values = (long)_m.NCtx * _m.NKvHead * _m.HeadDim;
+            return _m.KvQ8 ? values + values / Q4eKernels.KvQ8Block * 2 : values * 2;
+        }
+
         /// <summary>One sequence's cache bytes for a layer at the full context.</summary>
         private long LayerCacheBytes(int il)
         {
@@ -385,7 +503,7 @@ namespace TensorSharp.Cuda
                 b += (long)(m.DConv - 1) * ConvDim * 4 + (long)m.GdnVHeads * Q4eKernels.GdnHeadDim * Q4eKernels.GdnHeadDim * 4;
             else
             {
-                b += (long)m.NCtx * m.NKvHead * m.HeadDim * 2 * 2;
+                b += 2 * KvCacheBytes();
                 if (L.CompressRatio > 0)
                     b += (long)m.NCtx * m.IdxDim * 2 + (long)(m.NCtx / L.CompressRatio) * m.IdxDim * 4;
             }
@@ -419,7 +537,7 @@ namespace TensorSharp.Cuda
                 var (free, _) = _devs[d].Alloc.GetMemoryInfo();
                 long b = (long)free - scratch - (1L << 30);
                 if (d == 0) b -= _m.TokEmbd.TotalBytes;
-                if (d == nDev - 1) b -= _m.Output.TotalBytes + (long)_m.NVocab * 8;
+                if (d == nDev - 1) b -= _m.Output.TotalBytes + (long)_m.NVocab * 8 + MtpDeviceBytes();
                 budget[d] = Math.Max(0, b);
             }
             long total = 0, totalBudget = 0;
@@ -461,10 +579,11 @@ namespace TensorSharp.Cuda
             return c;
         }
 
-        private void UploadLayer(Dev dev, int il)
+        private void UploadLayer(Dev dev, int il) => UploadLayer(dev, _m.Layers[il], _layers[il], il);
+
+        /// <param name="il">The trunk layer, or -1 for the MTP block (whose experts always go to the arena).</param>
+        private void UploadLayer(Dev dev, LayerDesc src, DevLayer dst, int il)
         {
-            var src = _m.Layers[il];
-            var dst = _layers[il];
             dst.HcAttnNorm = UploadF32(dev, src.HcAttnNorm);
             dst.HcFfnNorm = UploadF32(dev, src.HcFfnNorm);
             dst.HcAttnInject = UploadF32(dev, src.HcAttnInject);
@@ -510,11 +629,21 @@ namespace TensorSharp.Cuda
                 dst.PleNormConv = UploadF32(dev, src.PleNormConv);
                 dst.PleConvT = UploadF32(dev, src.PleConvT);
             }
-            dst.Router = UploadF32(dev, src.Router);
+            // The BF16 GEMV is the warp-per-output form, for 256 or more experts (Flash Next's 512).
+            if (src.RouterBf16 != null && _m.NExpert >= 256 && dev.DK.HasGemvBf16 && dev.QK.HasBf16ToF32 && src.RouterBf16.Length == src.Router?.Length
+                && Environment.GetEnvironmentVariable("TS_Q4E_BF16_ROUTER") != "0")
+                dst.RouterBf16 = UploadU16(dev, src.RouterBf16);
+            else
+                dst.Router = UploadF32(dev, src.Router);
             dst.ShexpGate = UploadF32(dev, src.ShexpGate);
-            dst.GateExps = dev.Weights.Place(src.GateExps);
-            dst.UpExps = dev.Weights.Place(src.UpExps);
-            dst.DownExps = dev.Weights.Place(src.DownExps);
+            if (_residency != null && il >= 0)
+                PlaceResidentExperts(dev, il, dst);
+            else
+            {
+                dst.GateExps = dev.Weights.Place(src.GateExps);
+                dst.UpExps = dev.Weights.Place(src.UpExps);
+                dst.DownExps = dev.Weights.Place(src.DownExps);
+            }
             dst.GateShexp = dev.Weights.Place(src.GateShexp);
             dst.UpShexp = dev.Weights.Place(src.UpShexp);
             dst.DownShexp = dev.Weights.Place(src.DownShexp);
@@ -549,6 +678,14 @@ namespace TensorSharp.Cuda
             return t;
         }
 
+        private static Tensor UploadU16(Dev dev, ushort[] data)
+        {
+            Tensor t = AllocT(dev, DType.UInt8, (long)data.Length * 2);
+            fixed (ushort* src = data)
+                CudaDriverApi.cuMemcpyHtoD(Ptr(t), (IntPtr)src, new UIntPtr((ulong)data.Length * 2)).ThrowOnError();
+            return t;
+        }
+
         private static Tensor Block(Tensor t, long first, long rows, long cols)
         {
             using Tensor flat = t.View(t.ElementCount());
@@ -579,27 +716,57 @@ namespace TensorSharp.Cuda
         /// <summary>A decode-size input quantized to q8_1 once, for its several projections; zero past
         /// <see cref="PerSlotMaxRows"/> rows, where each projection quantizes for its own kernel. The
         /// device holds one such input at a time.</summary>
-        private static IntPtr QuantizeShared(Dev dev, Tensor input, int inDim, int rows)
+        private static IntPtr QuantizeShared(Dev dev, Tensor input, int inDim, int rows) => QuantizeShared(dev, input, inDim, rows, dev.Stream);
+
+        private static IntPtr QuantizeShared(Dev dev, Tensor input, int inDim, int rows, IntPtr stream)
         {
             if (rows > PerSlotMaxRows)
                 return IntPtr.Zero;
-            CudaQuantizedOps.QuantizeRowsQ81(dev.Alloc, Ptr(input), Ptr(dev.SharedQ81), inDim, rows);
+            dev.Alloc.Kernels.LaunchQuantizeQ81Rows(Ptr(input), Ptr(dev.SharedQ81), inDim, rows, stream, CudaQuantizedOps.Q81WarpQuantizeEnabled);
             return Ptr(dev.SharedQ81);
         }
 
         /// <summary><see cref="MatMul(in DeviceWeight, Tensor, Tensor, int)"/> of an input
         /// <see cref="QuantizeShared"/> already quantized: the same kernel, without quantizing again.</summary>
         private static void MatMul(Dev dev, in DeviceWeight w, Tensor input, IntPtr xq, Tensor output, int rows)
+            => MatMul(dev, w, input, xq, output, rows, dev.Stream);
+
+        /// <summary>Whether <see cref="MatMul(Dev, in DeviceWeight, Tensor, IntPtr, Tensor, int, IntPtr)"/> of a quantized
+        /// decode-size input takes a kernel that launches on the stream given (not the shared route, which is the
+        /// allocator's and not capturable).</summary>
+        private static bool DecodeKernelFor(Dev dev, in DeviceWeight w, int rows)
+            => rows <= PerSlotMaxRows
+               && ((w.Type == 30 && w.Ne0 % 2 == 0 && dev.DK.DecodesLegacyQuants)
+                   || CudaQuantizedOps.ResidentMatmulTakesQ81(w.Type, (int)w.Ne0, (int)w.Ne1, rows)
+                   || Dsv4Kernels.DenseQ81RowsSupports(w.Type, (int)w.Ne0));
+
+        private static void MatMul(Dev dev, in DeviceWeight w, Tensor input, IntPtr xq, Tensor output, int rows, IntPtr stream)
         {
+            // BF16 matrices (ISTA's hyper-connection and PLE value weights) at decode size: F32 activations, as
+            // ggml computes them, in a kernel a captured step can hold.
+            if (w.Type == 30 && rows <= PerSlotMaxRows && w.Ne0 % 2 == 0 && dev.DK.DecodesLegacyQuants)
+            {
+                dev.DK.DenseBf16Rows(w.Ptr, Ptr(input), Ptr(output), w.Ne1, w.Ne0, rows, stream);
+                return;
+            }
+            // Q2_0 rows past decode size: the shared route has no Q2_0 decoder, so quantize the input into the
+            // routed experts' q8_1 scratch (free outside their call) and run the warp-per-row kernel.
+            if (xq == IntPtr.Zero && w.Type == 42 && dev.DK.DecodesLegacyQuants
+                && (long)rows * (w.Ne0 / 32) * 36 <= dev.Moe.ActQ8A.ElementCount())
+            {
+                CudaQuantizedOps.QuantizeRowsQ81(dev.Alloc, Ptr(input), Ptr(dev.Moe.ActQ8A), w.Ne0, rows);
+                dev.DK.DenseQ81Rows(w.Ptr, Ptr(dev.Moe.ActQ8A), Ptr(output), w.Type, w.Ne1, w.Ne0, w.RowBytes, rows, stream);
+                return;
+            }
             if (xq != IntPtr.Zero
-                && CudaQuantizedOps.TryResidentMatmulQ81(dev.Alloc, w.Ptr, w.Type, xq, Ptr(output), w.Ne0, w.Ne1, rows))
+                && CudaQuantizedOps.TryResidentMatmulQ81(dev.Alloc, w.Ptr, w.Type, xq, Ptr(output), w.Ne0, w.Ne1, rows, stream))
                 return;
             // The q8_1 decode kernels above cover Q2_K/Q3_K/Q6_K/Q8_0. Any other layout the warp-per-row
             // dot reads (UD-Q2_K_XL keeps much of its dense half in Q5_K) runs here rather than on the
             // shared route, which quantizes into shared scratch and would cost the step its capture.
             if (xq != IntPtr.Zero && Dsv4Kernels.DenseQ81RowsSupports(w.Type, w.Ne0))
             {
-                dev.DK.DenseQ81Rows(w.Ptr, xq, Ptr(output), w.Type, w.Ne1, w.Ne0, w.RowBytes, rows, dev.Stream);
+                dev.DK.DenseQ81Rows(w.Ptr, xq, Ptr(output), w.Type, w.Ne1, w.Ne0, w.RowBytes, rows, stream);
                 return;
             }
             MatMul(w, input, output, rows);
@@ -695,12 +862,20 @@ namespace TensorSharp.Cuda
                     dev.Weights?.Dispose();
                     if (dev.XsReadyEv != IntPtr.Zero) CudaDriverApi.cuEventDestroy(dev.XsReadyEv);
                     if (dev.CopyDoneEv != IntPtr.Zero) CudaDriverApi.cuEventDestroy(dev.CopyDoneEv);
+                    if (dev.ShForkEv != IntPtr.Zero) CudaDriverApi.cuEventDestroy(dev.ShForkEv);
+                    if (dev.ShJoinEv != IntPtr.Zero) CudaDriverApi.cuEventDestroy(dev.ShJoinEv);
+                    if (dev.ShStream != IntPtr.Zero) CudaDriverApi.cuStreamDestroy(dev.ShStream);
                     if (dev.BoundaryPinned != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(dev.BoundaryPinned);
                     if (dev.BatchStatePinned != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(dev.BatchStatePinned);
                     if (dev.PlePinned != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(dev.PlePinned);
                     dev.DK?.Dispose();
                     dev.GK?.Dispose();
                     dev.QK?.Dispose();
+                    if (dev.Ordinal == 0)
+                    {
+                        StopHostExperts();
+                        FreeHostExperts();
+                    }
                     dev.Alloc?.Dispose();
                 }
                 catch
@@ -713,6 +888,7 @@ namespace TensorSharp.Cuda
             if (_posPinned != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_posPinned);
             if (_pinnedLogits != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_pinnedLogits);
             if (_pinnedHidden != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_pinnedHidden);
+            FreeMtpPinned();
         }
     }
 }

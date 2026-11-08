@@ -86,6 +86,10 @@ namespace TensorSharp.Models
             {
                 return true;
             }
+            // Likewise a per-token head the constructor attached itself: Qwen3.8-Flash-Next's MTP block on
+            // --backend cuda lives in the direct engine's own placement, so it is loaded with the model.
+            if (model is Qwen4ExpCudaModel { HasDraftHead: true })
+                return true;
 
             if (!File.Exists(draftPath))
             {
@@ -95,6 +99,14 @@ namespace TensorSharp.Models
 
             if (model is Qwen4ExpModel qwen4Exp)
             {
+                // A DFlash drafter attaches in the constructor, where its feature taps are
+                // set up; reaching here means the constructor declined it and said why.
+                if (Qwen4ExpModel.IsDFlashDraftFile(draftPath))
+                {
+                    error = $"DFlash drafter '{Path.GetFileName(draftPath)}' was not attached when the model loaded "
+                            + "(the load log gives the reason).";
+                    return false;
+                }
                 try
                 {
                     qwen4Exp.LoadMtpDraftWeights(draftPath);
