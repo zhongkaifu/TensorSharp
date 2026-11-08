@@ -59,6 +59,11 @@ public sealed class CliTelemetryTests : IDisposable
     private Activity ChatSpan(string requestId) =>
         Assert.Single(_stopped, a => Equals(a.GetTagItem(TelemetryAttributes.SequenceId), requestId));
 
+    // The engine runs ahead of the CLI reading its tokens, so the abort a stop asks for can
+    // arrive before or after the engine finishes on its own (its token limit, here): both are
+    // the same stop to the caller.
+    private static readonly SequenceStatus[] StopEndings = { SequenceStatus.FinishedAborted, SequenceStatus.FinishedLengthCapped };
+
     [Fact]
     public void AStopTheCliMakesItselfIsRecordedAsAStopSequence()
     {
@@ -72,7 +77,29 @@ public sealed class CliTelemetryTests : IDisposable
         var result = session.Generate(Enumerable.Range(1, 32).ToArray(), 64, SamplingConfig.Greedy,
             _ => false, timeout.Token, requestId: requestId);
 
-        Assert.Equal(SequenceStatus.FinishedAborted, result.Completion.Status);
+        Assert.Single(result.Tokens);
+        Assert.Contains(result.Completion.Status, StopEndings);
+        var span = ChatSpan(requestId);
+        Assert.Equal(new[] { "stop_sequence" }, Assert.IsType<string[]>(span.GetTagItem(TelemetryAttributes.GenAiResponseFinishReasons)));
+        Assert.Equal(TelemetryAttributes.OutcomeCompleted, span.GetTagItem(TelemetryAttributes.Outcome));
+    }
+
+    [Fact]
+    public void AStopThatArrivesAfterTheEngineFinishedIsStillAStopSequence()
+    {
+        // With a one-token limit the engine finishes in the step that publishes the token, and
+        // the caller stops on that token only afterwards: the engine reports its length cap,
+        // which recorded max_tokens for a reply that ended where the caller stopped it.
+        using var model = OracleFakes.P();
+        using var session = new CliInferenceSession(model, Config, NullLogger.Instance);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        string requestId = "cli-late-stop-" + Guid.NewGuid().ToString("N");
+
+        var result = session.Generate(Enumerable.Range(1, 32).ToArray(), 1, SamplingConfig.Greedy,
+            _ => { Thread.Sleep(100); return false; }, timeout.Token, requestId: requestId);
+
+        Assert.Single(result.Tokens);
+        Assert.Contains(result.Completion.Status, StopEndings);
         var span = ChatSpan(requestId);
         Assert.Equal(new[] { "stop_sequence" }, Assert.IsType<string[]>(span.GetTagItem(TelemetryAttributes.GenAiResponseFinishReasons)));
         Assert.Equal(TelemetryAttributes.OutcomeCompleted, span.GetTagItem(TelemetryAttributes.Outcome));
