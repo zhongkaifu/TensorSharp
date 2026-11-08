@@ -1446,6 +1446,21 @@ experts left to the CPU, from `TS_Q4E_PERF`):
 | 4, `odd` | 214-232 | 11.3-12.8 ms | 20-33 |
 | 2, `first` | 210-232 | 10.9-12.2 ms | 6-13 |
 
+On by default since 2026-11-08 (`TS_Q4E_HYBRID_MISSES=4`, `TS_Q4E_HYBRID_SPLIT=first`): with four misses a step the
+GPU takes nearly all of them (one to three left to the CPU a window). Same client, the earlier build before and after
+the others (ABBA), 3 repetitions each:
+
+| build, share | long generation | 4-row verify | CPU experts a window |
+| --- | --- | --- | --- |
+| before (no share), first run | 215-226 | 11.6-13.1 ms | 41-64 |
+| this build, no share | 213-229 | 11.4-13.0 ms | 40-67 |
+| this build, 2 `odd` | 216-236 | 11.1-12.3 ms | 22-35 |
+| this build, 2 `first` | 223-245 | 10.7-12.0 ms | 7-13 |
+| this build, 4 `first` (default) | 231-239 | 10.7-12.1 ms | 1-3 |
+| before (no share), second run | 203-227 | 11.7-13.1 ms | 41-67 |
+
+4K and 16K TTFT and the multi-turn first TTFT did not move (prompts stage their misses as before).
+
 #### Smaller decode kernels, 2026-11-08
 
 Kernel by kernel, each the same bits as before (old and new compared byte for byte at Flash Next's shapes, RTX 5090,

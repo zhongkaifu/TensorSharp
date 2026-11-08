@@ -38,6 +38,9 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         _env.Set("TS_MOE_TIER_ADAPT", "0");
         // The route-tail skip (on by default) leaves rank-7+ misses out: these tests hold every route computed.
         _env.Set("TS_MOE_ROUTE_TAIL_SKIP", "0");
+        // The GPU's share of the missed experts (on by default) moves host-computed answers: these tests leave every miss
+        // to the CPU; its own tests set it.
+        _env.Set("TS_Q4E_HYBRID_MISSES", "0");
     }
 
     public void Dispose()
@@ -778,8 +781,8 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     /// <summary>The GPU's share of a decode step's missed experts (TS_Q4E_HYBRID_MISSES): the GPU stages up to that many
     /// over the bus and computes them itself while the CPU computes the rest. The fixture routes 4 of 16 experts, none
     /// resident here. A share of four in slot order takes all of a decode step's experts: none is left to the CPU and the
-    /// steps answer bit for bit as the all-resident engine. The odd-numbered split (the default) and a share of two leave
-    /// fewer experts to the CPU than no share does, within the host-compute tolerance.</summary>
+    /// steps answer bit for bit as the all-resident engine. The odd-numbered split and a share of two in slot order (the
+    /// default) leave fewer experts to the CPU than no share does, within the host-compute tolerance.</summary>
     [CudaFact]
     public void ExpertResidency_GpuShareOfMisses_AnswersAsAllResident()
     {
@@ -795,10 +798,10 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             misses = engine.HostExpertMisses;
             return r;
         }
-        float[][] all = Load(null, null, null, out _);
-        float[][] cpu = Load("0", null, null, out long cpuMisses);
+        float[][] all = Load(null, "0", null, out _);
+        float[][] cpu = Load("0", "0", null, out long cpuMisses);
         float[][] whole = Load("0", "4", "first", out long wholeMisses);
-        float[][] odd = Load("0", "4", null, out long oddMisses);
+        float[][] odd = Load("0", "4", "odd", out long oddMisses);
         float[][] two = Load("0", "2", "first", out long twoMisses);
         _output.WriteLine($"experts on the CPU: no share {cpuMisses}, four in slot order {wholeMisses}, odd-numbered {oddMisses}, "
             + $"two in slot order {twoMisses}");
@@ -844,7 +847,7 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             spec.SpecForward(window, null, all, true);
             return Enumerable.Range(0, window.Length).Select(i => RelativeError(all.AsSpan(i * vocab, vocab).ToArray(), plain[i])).ToArray();
         }
-        double[] cpu = RowErrors(null, null), odd = RowErrors("8", null), first = RowErrors("2", "first");
+        double[] cpu = RowErrors("0", null), odd = RowErrors("8", "odd"), first = RowErrors("2", "first");
         for (int i = 0; i < window.Length; i++)
         {
             _output.WriteLine($"verify row {i} vs its decode step: no share {cpu[i]:E2}, odd-numbered {odd[i]:E2}, two in slot order {first[i]:E2}");

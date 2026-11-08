@@ -277,12 +277,14 @@ namespace TensorSharp.Cuda
         }
 
         // TS_Q4E_HYBRID_MISSES: distinct missed experts of a decode step or verify window the GPU stages over the bus and
-        // computes itself while the host computes the rest (0 = the host takes them all).
-        private readonly int _hybridMissesEnv = Math.Max(0, EnvInt("TS_Q4E_HYBRID_MISSES", 0));
+        // computes itself while the host computes the rest (0 = the host takes them all). Default 4: on the RTX 5090
+        // pod a 4-row window's verify 11.4-13.0 -> 10.7-12.1 ms with the first misses in slot order.
+        private readonly int _hybridMissesEnv = Math.Max(0, EnvInt("TS_Q4E_HYBRID_MISSES", 4));
 
-        // TS_Q4E_HYBRID_SPLIT=first: the GPU takes the first missed experts in slot order; default "odd": only odd-numbered
-        // experts are the GPU's, so an expert goes to the same side whatever else a call selects (below capacity).
-        private readonly bool _hybridOdd = Environment.GetEnvironmentVariable("TS_Q4E_HYBRID_SPLIT") != "first";
+        // TS_Q4E_HYBRID_SPLIT=odd: only odd-numbered experts are the GPU's, so an expert goes to the same side whatever else
+        // a call selects (below capacity) and a verify row computes what its own decode step does; default "first": the
+        // first missed experts in slot order (more of them; which side a row's expert lands on depends on the window).
+        private readonly bool _hybridOdd = Environment.GetEnvironmentVariable("TS_Q4E_HYBRID_SPLIT") == "odd";
 
         /// <summary>The staging the GPU's share of the missed experts goes through, or null (see TS_Q4E_HYBRID_MISSES).</summary>
         private CudaExpertStage _hybridStage;
