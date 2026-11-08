@@ -10,6 +10,7 @@
 #include "ggml_ops_internal.h"
 #include "ggml_ops_transformer_common.h"
 #include "gemma4_mm_mask.h"
+#include "gemma4_ple_norm.h"
 #include <chrono>
 #include <cstdio>
 
@@ -276,7 +277,6 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         // In-kernel mode gathers it here via get_rows on the resident table; the
         // uploaded-ple_data mode allocates a plain F32 tensor filled by H2D below.
         const bool ple_in_kernel = ple_token_embd_data != nullptr && ple_token_ids != nullptr && ple_dim > 0;
-        const int total_ple_dim = num_layers * ple_dim;
         ggml_tensor* ple_input = nullptr;
         ggml_tensor* ple_table = nullptr;
         ggml_tensor* ple_ids = nullptr;
@@ -301,11 +301,9 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 ple_proj_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ple_dim);
                 ggml_tensor* proj = ggml_mul_mat(ctx, ple_proj_w, current);   // [total_ple_dim, N]
                 proj = ggml_scale(ctx, proj, 1.0f / sqrtf(static_cast<float>(hidden_size)));
-                // Per-(token,layer) RMSNorm over ple_dim: view [total_ple_dim, N] as
-                // [ple_dim, num_layers*N], norm rows, scale by norm weight, reshape back.
-                ggml_tensor* proj_r = ggml_reshape_2d(ctx, ggml_cont(ctx, proj), ple_dim, static_cast<std::int64_t>(num_layers) * NQ);
-                proj_r = ggml_mul(ctx, ggml_rms_norm(ctx, proj_r, eps), ple_proj_norm_w);
-                proj = ggml_reshape_2d(ctx, proj_r, total_ple_dim, NQ);
+                // Per-(token,layer) RMSNorm over ple_dim, kept 3-D so ggml-vulkan's
+                // row axis is num_layers, not num_layers*N (gemma4_ple_norm.h).
+                proj = tsg_gemma4_ple::proj_norm(ctx, proj, ple_dim, num_layers, ple_proj_norm_w, eps);
                 // combined = (proj + tok) / sqrt(2)
                 ple_input = ggml_scale(ctx, ggml_add(ctx, proj, ple_tok), 1.0f / sqrtf(2.0f));
             }
