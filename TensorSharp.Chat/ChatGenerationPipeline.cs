@@ -826,13 +826,12 @@ namespace TensorSharp.Server
             generatedTokens = new List<int>();
             var rawBytes = new List<byte>();
             int prevValidLen = 0;
-            // Stop-sequence matching needs the full decoded text; only the rare
-            // request that configures string stop sequences pays for accumulating
-            // it. The common path decodes just the newly-completed bytes per token
-            // (below) instead of re-decoding the whole buffer every step (O(n^2)).
-            bool hasStopSequences = cfg.StopSequences != null && cfg.StopSequences.Count > 0;
-            StringBuilder decodedForStops = hasStopSequences ? new StringBuilder() : null;
-            TokenSampler stopSampler = hasStopSequences ? new TokenSampler(cfg) : null;
+            // String stop sequences: a matched one is not sent, and text that could begin
+            // one is held back until the next piece settles it (StopSequenceStream). Only
+            // the rare request that configures them pays for it. The common path decodes
+            // just the newly-completed bytes per token (below) instead of re-decoding the
+            // whole buffer every step (O(n^2)).
+            StopSequenceStream stopSequences = StopSequenceStream.For(cfg.StopSequences);
             finishReason = "max_tokens";
 
             // A family whose model writes the tool's result itself after its call ends the
@@ -917,12 +916,11 @@ namespace TensorSharp.Server
                 }
 
                 bool stopRequested = false;
-                if (hasStopSequences)
+                string send = piece;
+                if (stopSequences != null)
                 {
-                    if (piece.Length > 0)
-                        decodedForStops.Append(piece);
-                    var (_, shouldStop) = stopSampler.CheckStopSequences(decodedForStops.ToString());
-                    if (shouldStop)
+                    send = stopSequences.Append(piece);
+                    if (stopSequences.Matched)
                     {
                         stopRequested = true;
                         finishReason = "stop_sequence";
@@ -966,8 +964,13 @@ namespace TensorSharp.Server
                     }
                 }
 
-                if (piece.Length > 0)
-                    yield return ChatStreamUpdate.Text(piece);
+                // Another of this layer's stops ends the turn here: what was held back for a
+                // stop sequence can no longer become one.
+                if (stopRequested && stopSequences is { Matched: false })
+                    send += stopSequences.Flush();
+
+                if (send.Length > 0)
+                    yield return ChatStreamUpdate.Text(send);
 
                 if (stopRequested)
                 {
@@ -981,6 +984,15 @@ namespace TensorSharp.Server
                 wasCancelled = true;
                 finishReason = "cancelled";
                 stopped = new OperationCanceledException(cancellationToken);
+            }
+
+            // The engine ended the turn (end of sequence, token limit) with text held back for a
+            // stop sequence that never came: it is part of the reply.
+            if (stopSequences != null && !wasCancelled)
+            {
+                string rest = stopSequences.Flush();
+                if (rest.Length > 0)
+                    yield return ChatStreamUpdate.Text(rest);
             }
 
             try
@@ -1023,7 +1035,10 @@ namespace TensorSharp.Server
                     generatedTokens.Add(forwarded[i]);
             }
 
-            string assistantText = Encoding.UTF8.GetString(rawBytes.ToArray());
+            // What the client was sent: a matched stop sequence and anything decoded after it are not.
+            string assistantText = stopSequences is { Matched: true }
+                ? stopSequences.SentText
+                : Encoding.UTF8.GetString(rawBytes.ToArray());
             totalSw.Stop();
             if (CapturesContent(requestTelemetry))
                 CaptureOutputMessage(requestTelemetry, assistantText);
