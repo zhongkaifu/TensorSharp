@@ -4469,6 +4469,57 @@ TS_DSV4_DENSE_FAST(4, 4)
 TS_DSV4_DENSE_FAST(8, 4)
 #undef TS_DSV4_DENSE_FAST
 
+// ts_dsv4_moe_gateup_decode_f32 with sixteen lanes an output row and two rows a warp (the short down kernel's layout):
+// a warp per row walked a 2560-wide Q2_0 row in 16-value quarters, five dependent steps a lane and four rows in turn,
+// and a decode step's ten experts took 22.7 us on the RTX 5090 (412 GB/s) against 3.9 us for their down projection.
+// Q2_0 rows go in 32-value units (ts_dsv4_fast_q2_0), the other layouts through ts_dsv4_dot_row_part; 4.4 us. Each slot
+// is computed the same way whatever the call's row count. grid (slots, ceil(ff / 16), 2), 256 threads.
+extern "C" __global__ void ts_dsv4_moe_gateup_decode_half_f32(
+    const uint8_t* __restrict__ gateW,
+    const uint8_t* __restrict__ upW,
+    const ts_dsv4_block_q8_1* __restrict__ act, // [nt] rows
+    const int32_t* __restrict__ sel,     // [nt * nUsed]
+    float* __restrict__ gateOut,         // [nt * nUsed, ff]
+    float* __restrict__ upOut,           // [nt * nUsed, ff]
+    const int wtype,
+    const int ff,
+    const int inDim,
+    const long long rowBytes,
+    const int nUsed,
+    const unsigned long long* __restrict__ gateTab,
+    const unsigned long long* __restrict__ upTab)
+{
+    const int slot = blockIdx.x;
+    const int e = sel[slot];
+    const ts_dsv4_block_q8_1* a = act + (size_t)(slot / nUsed) * (inDim / TS_DSV4_QK8_1);
+    const int lane = threadIdx.x & 31, group = lane >> 4, sub = lane & 15;
+    const int rr = blockIdx.y * 16 + (threadIdx.x >> 5) * 2 + group;
+    const bool isUp = blockIdx.z == 1;
+    const uint8_t* wBase = isUp ? ts_dsv4_expert_rows(upW, upTab, e, (size_t)ff * rowBytes)
+                                : ts_dsv4_expert_rows(gateW, gateTab, e, (size_t)ff * rowBytes);
+    float v = 0.0f;
+    if (rr < ff)
+    {
+        const uint8_t* wRow = wBase + (size_t)rr * rowBytes;
+        if (wtype == TS_DSV4_WTYPE_Q2_0)
+        {
+            const ts_dsv4_block_q8_1* aa[1] = { a };
+            float s[1] = { 0.0f };
+            for (int u = sub; u < inDim / 32; u += 16)
+                ts_dsv4_fast_q2_0<1>(wRow, u, aa, s);
+            v = s[0];
+        }
+        else
+            v = ts_dsv4_dot_row_part(wRow, wtype, a, inDim, sub, 16);
+    }
+    v += __shfl_xor_sync(0xffffffffu, v, 8);
+    v += __shfl_xor_sync(0xffffffffu, v, 4);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    if (sub == 0 && rr < ff)
+        (isUp ? upOut : gateOut)[(size_t)slot * ff + rr] = v;
+}
+
 // Clamped SwiGLU now comes from the shared kernel set
 // (ts_silu_mul_clamp_f32, reached via Ops.SiLUMulClamp).
 

@@ -1407,6 +1407,16 @@ Same build, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
 | all 248,320 tokens | 0.07-0.10 s / 86-127 | 202-222 | 1.07-1.08 s / 149-167 | 4.16-4.18 s / 207-217 | 0.63-0.69 s |
 | ids below 151,643 (default) | 0.07-0.09 s / 109-154 | 214-234 | 1.07-1.08 s / 150-183 | 4.16-4.17 s / 203-223 | 0.62-0.68 s |
 
+#### Gate/up experts at sixteen lanes a row, 2026-11-08
+
+The decode expert gate/up kernel gave each 2560-wide row a warp that walked it in 16-value Q2_0 quarters, five
+dependent steps a lane and four rows in turn: a decode step's ten experts took 22.7 us on the RTX 5090 (412 GB/s over
+their bytes) while their down projections took 3.9 us. It now takes sixteen lanes a row and two rows a warp, Q2_0 rows
+in 32-value units (`TS_MOE_GATEUP_HALF`): 4.4 us, and a 4-row window's 40 slots 44 -> 23 us (14 us when 25 of them are
+distinct). End to end it moved nothing measurable: in the layers that wait for the CPU's experts (a third of them) the
+GPU's experts finish earlier only to wait longer, and the rest is inside the run-to-run noise (long generation 210-224 vs
+211-225 tok/s). Plain decode steps (one row) gain the most.
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
