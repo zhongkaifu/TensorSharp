@@ -81,6 +81,35 @@ namespace TensorSharp.Runtime.Telemetry
             "Sequences in one engine step.",
             advice: new InstrumentAdvice<int> { HistogramBucketBoundaries = s_batchBuckets });
 
+        // Serving signals: what a step's batch and a sequence's cadence looked like, for finding
+        // where an engine loses time under concurrent requests.
+
+        private static readonly double[] s_interTokenBuckets =
+            { 0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.06, 0.08, 0.1, 0.15, 0.2, 0.3, 0.5, 1, 2, 5, 10, 30 };
+        private static readonly int[] s_prefillTokenBuckets =
+            { 16, 64, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
+        private static readonly double[] s_stageBuckets =
+            { 0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.512, 1.024 };
+
+        public static readonly Histogram<double> InterTokenLatency = M.CreateHistogram(
+            "tensorsharp.engine.inter_token.duration", "s",
+            "Time between a sequence's consecutive output tokens, by the kind of step that emitted the later one. A mixed step that prefills other requests' prompts stretches it for every sequence it runs.",
+            advice: new InstrumentAdvice<double> { HistogramBucketBoundaries = s_interTokenBuckets });
+
+        public static readonly Histogram<int> StepPrefillTokens = M.CreateHistogram(
+            "tensorsharp.engine.step.prefill_tokens", "{token}",
+            "Prompt tokens one step forwarded, by step kind (prefill or mixed).",
+            advice: new InstrumentAdvice<int> { HistogramBucketBoundaries = s_prefillTokenBuckets });
+
+        public static readonly Counter<long> PrefixCacheLookups = M.CreateCounter<long>(
+            "tensorsharp.prefix_cache.lookups", "{lookup}",
+            "Prefix-cache lookups at admission, by outcome (full, partial, miss) and source (where a reused prefix came from, or why a miss reused nothing).");
+
+        public static readonly Histogram<double> EngineStageDuration = M.CreateHistogram(
+            "tensorsharp.engine.stage.duration", "s",
+            "GPU time of one stage of a sampled forward (TS_Q4E_PERF_SAMPLE on the Qwen3.8-Flash-Next direct-CUDA engine), by stage, step kind and rows.",
+            advice: new InstrumentAdvice<double> { HistogramBucketBoundaries = s_stageBuckets });
+
         public static readonly Counter<long> SpeculativeTokensDrafted = M.CreateCounter<long>(
             "tensorsharp.speculative.tokens.drafted", "{token}", "Tokens a speculator proposed.");
 
@@ -159,6 +188,79 @@ namespace TensorSharp.Runtime.Telemetry
                 () => GpuMeasurements(r => r.TotalBytes), "By", "Device memory on the device.");
             M.CreateObservableGauge("tensorsharp.gpu.memory.peak",
                 () => GpuMeasurements(r => r.PeakBytes), "By", "Peak device memory the allocator has held.");
+
+            // Engines that keep sequence slots of their own (IServingTelemetrySource). Per engine:
+            // reloading the model starts its counters again.
+            M.CreateObservableGauge("tensorsharp.slots",
+                () => ServingMeasurements(
+                    (s => s.RunningSlots, TelemetryAttributes.SlotState, "running"),
+                    (s => s.RetainedSlots, TelemetryAttributes.SlotState, "retained")),
+                "{slot}", "Sequence slots, by state: bound to a request, or kept for a conversation's next turn.");
+            M.CreateObservableGauge("tensorsharp.slots.memory",
+                () => ServingMeasurements((s => s.SlotBytes, null, null)), "By", "Device memory every sequence slot holds.");
+            M.CreateObservableGauge("tensorsharp.slots.capacity",
+                () => ServingMeasurements((s => s.SlotCapacityTokens, null, null)), "{token}",
+                "Positions every sequence slot's caches hold together (capacity, not use).");
+            M.CreateObservableCounter("tensorsharp.slots.grows",
+                () => ServingMeasurements((s => s.SlotGrows, null, null)), "{grow}", "Times a slot's caches grew.");
+            M.CreateObservableCounter("tensorsharp.slots.grow_failures",
+                () => ServingMeasurements((s => s.SlotGrowFailures, null, null)), "{failure}",
+                "Times a slot could not grow for lack of device memory, even after retained slots were given back.");
+            M.CreateObservableCounter("tensorsharp.slots.reclaims",
+                () => ServingMeasurements(
+                    (s => s.ReclaimsForNewSlot, TelemetryAttributes.SlotReclaimReason, "new_slot"),
+                    (s => s.ReclaimsForGrowth, TelemetryAttributes.SlotReclaimReason, "growth")),
+                "{slot}", "Retained slots given back, by what needed the memory. A steady rate means conversations evict each other.");
+            M.CreateObservableCounter("tensorsharp.slots.rewinds",
+                () => ServingMeasurements(
+                    (s => s.RewindsToCheckpoint, TelemetryAttributes.RewindRoute, "checkpoint"),
+                    (s => s.RewindsWithReplay, TelemetryAttributes.RewindRoute, "replay"),
+                    (s => s.RewindsToZero, TelemetryAttributes.RewindRoute, "reset"),
+                    (s => s.RewindsRefused, TelemetryAttributes.RewindRoute, "refused")),
+                "{rewind}", "Slot rewinds, by route.");
+            M.CreateObservableCounter("tensorsharp.slots.rewind.replayed_tokens",
+                () => ServingMeasurements((s => s.ReplayedTokens, null, null)), "{token}",
+                "Tokens a rewind past its checkpoint forwarded again.");
+            M.CreateObservableCounter("tensorsharp.cuda_graph.captures",
+                () => ServingMeasurements(
+                    (s => s.SoloGraphCaptures, TelemetryAttributes.GraphKind, "solo"),
+                    (s => s.BatchedGraphCaptures, TelemetryAttributes.GraphKind, "batched")),
+                "{graph}", "CUDA graphs captured, by kind. Captures that keep pace with launches mean the graphs do not get reused.");
+            M.CreateObservableCounter("tensorsharp.cuda_graph.launches",
+                () => ServingMeasurements(
+                    (s => s.SoloGraphLaunches, TelemetryAttributes.GraphKind, "solo"),
+                    (s => s.BatchedGraphLaunches, TelemetryAttributes.GraphKind, "batched")),
+                "{launch}", "Decode steps launched as CUDA graphs, by kind.");
+            M.CreateObservableCounter("tensorsharp.cuda_graph.capture_failures",
+                () => ServingMeasurements((s => s.GraphCaptureFailures, null, null)), "{failure}",
+                "CUDA graph captures that failed (those steps then run uncaptured).");
+            M.CreateObservableCounter("tensorsharp.engine.forward.issue_time",
+                () => ServingMeasurements((s => s.ForwardIssueSeconds, null, null)), "s",
+                "Host time spent issuing forwards' GPU work. Close to tensorsharp.engine.forward.time: bound by the host.");
+            M.CreateObservableCounter("tensorsharp.engine.forward.wait_time",
+                () => ServingMeasurements((s => s.ForwardWaitSeconds, null, null)), "s",
+                "Host time spent waiting for forwards' GPU work after issuing it.");
+        }
+
+        private static IEnumerable<Measurement<T>> ServingMeasurements<T>(
+            params (Func<ServingTelemetrySnapshot, T> Pick, string? Key, string? Value)[] series) where T : struct
+        {
+            foreach (var entry in s_engines)
+            {
+                ServingTelemetrySnapshot snapshot;
+                try
+                {
+                    if (entry.Key.ServingTelemetrySource is not { } source)
+                        continue;
+                    snapshot = source.ReadServingTelemetry();
+                }
+                catch (Exception) { continue; }
+                var architecture = new KeyValuePair<string, object?>(TelemetryAttributes.ModelArchitecture, entry.Value);
+                foreach (var (pick, key, value) in series)
+                    yield return key == null
+                        ? new Measurement<T>(pick(snapshot), architecture)
+                        : new Measurement<T>(pick(snapshot), architecture, new KeyValuePair<string, object?>(key, value));
+            }
         }
 
         /// <summary>Touch the class so its observable instruments exist before an exporter starts.</summary>

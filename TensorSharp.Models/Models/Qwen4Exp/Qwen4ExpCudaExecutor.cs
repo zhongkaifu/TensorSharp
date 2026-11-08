@@ -77,6 +77,15 @@ namespace TensorSharp.Models
         public void Reset() => _engine.Reset();
         public bool ResetChecked() => _engine.ResetChecked();
         public bool Rewind(int nPast) => _engine.Rewind(nPast);
+        /// <summary>Whether slot <paramref name="slot"/>, holding <paramref name="head"/> tokens, can
+        /// rewind to <paramref name="target"/> (its head, 0, or from its checkpoint up). Side-effect free.</summary>
+        public bool CanRewind(int slot, int head, int target) => _engine.CanRewind(slot, head, target);
+        /// <summary>What a slot that cannot grow calls: free one retained slot, true when it did.</summary>
+        public Func<bool> ReclaimRetainedSlot { set => _engine.ReclaimRetainedSlot = value; }
+        /// <summary>The engine's serving counters, from any thread.</summary>
+        public TensorSharp.Cuda.Q4eCudaEngine.TelemetryCounters ReadTelemetry() => _engine.ReadTelemetry();
+        /// <summary>Receives sampled forwards' stage times (TS_Q4E_PERF_SAMPLE).</summary>
+        public Action<string, double, int, bool> StageObserver { set => _engine.StageObserver = value; }
 
         // ---- sequence slots ----
         public int SlotAlloc() => _engine.SlotAlloc();

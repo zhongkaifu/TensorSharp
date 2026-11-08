@@ -16,10 +16,12 @@ using System.Linq;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Runtime.Scheduling.PrefixCache;
+using TensorSharp.Runtime.Telemetry;
 
 namespace TensorSharp.Models
 {
-    public sealed class Qwen4ExpCudaModel : ModelBase, IBatchedPagedModel, IPrefixCacheModel, IPrefixCacheModelDiagnostics
+    public sealed class Qwen4ExpCudaModel : ModelBase, IBatchedPagedModel, IPrefixCacheModel, IPrefixCacheModelDiagnostics,
+        IServingTelemetrySource
     {
         private Qwen4ExpCudaExecutor _exec;
         private readonly object _sync = new object();
@@ -57,6 +59,8 @@ namespace TensorSharp.Models
                     maxContext = Math.Min(maxContext, 65536);
                 int nUbatch = ParseEnvInt("TS_Q4E_UBATCH", 512);
                 _exec = new Qwen4ExpCudaExecutor(ggufPath, maxContext, nUbatch, Math.Max(1, layerSplitDegree));
+                _exec.ReclaimRetainedSlot = ReclaimOldestRetainedSlot;
+                _exec.StageObserver = RecordStage;
                 _primarySlot = _exec.ActiveSlot;
                 _maxContextLength = _exec.ContextSize;
                 Config.VocabSize = _exec.VocabSize;
@@ -91,9 +95,17 @@ namespace TensorSharp.Models
         /// <summary>The engine behind this model, for tests that probe its stages.</summary>
         internal TensorSharp.Cuda.Q4eCudaEngine Engine => _exec?.Engine;
 
-        /// <summary>A delta recurrence cannot be rewound: a cached prefix is reusable only when the new
-        /// prompt extends it exactly.</summary>
-        public override bool SupportsKVCacheTruncation => false;
+        /// <summary>A delta recurrence cannot run backwards, but a slot keeps a checkpoint of its states
+        /// at its last prompt boundary: it rewinds to any position from there to its head (the engine
+        /// replays its own tokens past the checkpoint), or to 0. Anything else is refused, so callers
+        /// use the refusable <see cref="ModelBase.TryTruncateKVCache"/>.</summary>
+        public override bool SupportsKVCacheTruncation => _exec != null;
+
+        public override bool CanTruncateKVCache(int cachedTokenCount, int targetTokenCount)
+        {
+            lock (_sync)
+                return _exec != null && _exec.CanRewind(_exec.ActiveSlot, cachedTokenCount, targetTokenCount);
+        }
 
         public override string KVStateFingerprint =>
             $"qwen4exp|exec=cuda|L={Config.NumLayers}|H={Config.HiddenSize}|V={Config.VocabSize}|ctx={_maxContextLength}";
@@ -193,6 +205,13 @@ namespace TensorSharp.Models
 
         public bool SupportsPerSequenceFusedForward => _exec != null;
 
+        /// <summary>Each request's caches are an engine slot sized for the whole context, so the
+        /// scheduler's block pool only tracks reservations: sized for one context in all, it capped
+        /// every request's tokens together at one context (two 100K-token agent turns at
+        /// MAX_CONTEXT=262144) while the GPUs had room for more slots. A full device answers
+        /// <see cref="SequenceSlotUnavailableException"/>, and the request waits for a slot.</summary>
+        public bool UsesNativeSequenceSlots => _exec != null;
+
         public bool HasFusedSequenceCache(string requestId)
         {
             lock (_sync)
@@ -239,13 +258,87 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>A running slot that cannot grow takes memory back from the oldest retained
+        /// conversation, as a new slot does (<see cref="AllocSlotReclaimingRetained"/>).</summary>
+        private bool ReclaimOldestRetainedSlot()
+        {
+            lock (_sync)
+            {
+                if (_retainedSlots == null || _retainedSlots.Count == 0) return false;
+                string oldest = _retainedSlots.Keys.First();
+                SlotRetention.ReleaseSlots(_retainedSlots, new[] { oldest }, new Store(_exec));
+                System.Threading.Interlocked.Increment(ref _reclaimsForGrowth);
+                _prefixCacheSink?.OnPayloadInvalidated(oldest, InvalidationReason.NativeSlotReclaimed);
+                return true;
+            }
+        }
+
         private int AllocSlotReclaimingRetained()
         {
             var reclaimed = new List<string>(0);
             int slot = SlotRetention.AllocReclaiming(_retainedSlots, new Store(_exec), reclaimed);
+            System.Threading.Interlocked.Add(ref _reclaimsForNewSlot, reclaimed.Count);
             foreach (string key in reclaimed)
                 _prefixCacheSink?.OnPayloadInvalidated(key, InvalidationReason.NativeSlotReclaimed);
             return slot;
+        }
+
+        // ---------------------------------------------------------------- serving telemetry
+
+        private long _reclaimsForNewSlot, _reclaimsForGrowth;
+        private static readonly KeyValuePair<string, object> s_architectureTag =
+            new(TelemetryAttributes.ModelArchitecture, Qwen4ExpModel.ArchitectureId);
+
+        /// <summary>The engine's counters and this model's slot ownership, for TensorSharp's
+        /// instruments. Runs on the metrics thread and never takes <c>_sync</c>: a forward holds
+        /// it for its whole step, so under load a collection would wait behind GPU work, or,
+        /// skipping when busy, never see a running slot. The two ownership counts are read
+        /// racily instead; <c>Count</c> is a field read on both collections, so a read during an
+        /// update is at worst one off for that collection, which a gauge tolerates.</summary>
+        public ServingTelemetrySnapshot ReadServingTelemetry()
+        {
+            var exec = _exec;
+            if (exec == null)
+                return default;
+            // Slots bound to a request (one that adopted the primary included).
+            int running = System.Threading.Volatile.Read(ref _slotByRequest)?.Count ?? 0;
+            int retained = System.Threading.Volatile.Read(ref _retainedSlots)?.Count ?? 0;
+            var c = exec.ReadTelemetry();
+            return new ServingTelemetrySnapshot
+            {
+                RunningSlots = running,
+                RetainedSlots = retained,
+                SlotBytes = c.SlotBytes,
+                SlotCapacityTokens = c.SlotCapacityTokens,
+                SlotGrows = c.Grows,
+                SlotGrowFailures = c.GrowFailures,
+                ReclaimsForNewSlot = System.Threading.Interlocked.Read(ref _reclaimsForNewSlot),
+                ReclaimsForGrowth = System.Threading.Interlocked.Read(ref _reclaimsForGrowth),
+                RewindsToCheckpoint = c.RewindsToCheckpoint,
+                RewindsWithReplay = c.RewindsWithReplay,
+                RewindsToZero = c.RewindsToZero,
+                RewindsRefused = c.RewindsRefused,
+                ReplayedTokens = c.ReplayedTokens,
+                SoloGraphCaptures = c.SoloGraphCaptures,
+                SoloGraphLaunches = c.SoloGraphLaunches,
+                BatchedGraphCaptures = c.BatchedGraphCaptures,
+                BatchedGraphLaunches = c.BatchedGraphLaunches,
+                GraphCaptureFailures = c.GraphCaptureFailures,
+                ForwardIssueSeconds = c.ForwardIssueSeconds,
+                ForwardWaitSeconds = c.ForwardWaitSeconds,
+            };
+        }
+
+        /// <summary>One sampled forward's stage (TS_Q4E_PERF_SAMPLE), as tensorsharp.engine.stage.duration.</summary>
+        private static void RecordStage(string stage, double seconds, int rows, bool decode)
+        {
+            var histogram = TensorSharpMetrics.EngineStageDuration;
+            if (!histogram.Enabled)
+                return;
+            histogram.Record(seconds, s_architectureTag,
+                new KeyValuePair<string, object>(TelemetryAttributes.EngineStage, stage),
+                new KeyValuePair<string, object>(TelemetryAttributes.StepKind, decode ? "decode" : "prefill"),
+                new KeyValuePair<string, object>(TelemetryAttributes.RowsBucket, TelemetryAttributes.RowsBucketOf(rows)));
         }
 
         public void RestorePrimaryCache()
@@ -359,10 +452,16 @@ namespace TensorSharp.Models
             AdoptPrimaryOnDisplacement = true,
             PrimaryResident = true,
             MinRetainTokens = 32,
-            // The recurrence cannot be rewound: only an exact extension reuses a slot.
-            Truncation = TruncationKind.None,
+            // The slot decides (Q4eCudaEngine.CanRewind): from the checkpoint it took at its last
+            // prompt boundary up to its head. A turn whose prompt re-renders the previous reply
+            // matches the slot only partway into that reply; the slot goes back to the boundary and
+            // replays its own tokens up to the match, instead of the whole prompt prefilling again.
+            Truncation = TruncationKind.ModelDecides,
             TruncationGranularity = 1,
-            RewindCapTokens = 16,
+            RewindCapTokens = int.MaxValue,
+            // Only a multi-token forward records the checkpoint: forwarding at least two prompt
+            // tokens after any reuse leaves the next turn a boundary to rewind to (as DeepSeek V4.1).
+            MinTailPrefillTokens = 2,
             Pages = PageSupport.None,
             ReuseAcrossMediaSpan = false,
             Persistable = false,
@@ -396,7 +495,8 @@ namespace TensorSharp.Models
             {
                 if (_slotByRequest == null) return false;
                 _retainedSlots ??= new OrderedDictionary<string, SlotRetention.RetainedSlot>(StringComparer.Ordinal);
-                if (!SlotRetention.RetainSlot(_slotByRequest, _retainedSlots, requestId, payloadKey, length, canRewind: false,
+                // A length below the head rewinds first, which the engine refuses unless it can.
+                if (!SlotRetention.RetainSlot(_slotByRequest, _retainedSlots, requestId, payloadKey, length, canRewind: true,
                         ref _primarySlot, ref _activeSlotKey, new Store(_exec)))
                     return false;
                 _cacheSeqLen = _exec.NPast;   // the selection may have moved to the primary
@@ -424,7 +524,8 @@ namespace TensorSharp.Models
             if (request.Op != MaterializeOp.Donate) return false;   // slots are moved, never copied
             lock (_sync)
             {
-                if (!SlotRetention.CanDonate(_retainedSlots, request.PayloadKey, request.PayloadTokens, request.TargetTokens, canRewind: false))
+                // A target below the payload is the executor's truncation at the first bind.
+                if (!CanDonateLocked(request.PayloadKey, request.PayloadTokens, request.TargetTokens))
                     return false;
                 _slotByRequest ??= new Dictionary<string, int>(StringComparer.Ordinal);
                 return SlotRetention.DonateSlot(_slotByRequest, _retainedSlots, request.PayloadKey, request.TargetRequestId, out _);
@@ -445,7 +546,25 @@ namespace TensorSharp.Models
         public bool CanMaterialize(string payloadKey, int payloadTokens, int targetTokens)
         {
             lock (_sync)
-                return SlotRetention.CanDonate(_retainedSlots, payloadKey, payloadTokens, targetTokens, canRewind: false);
+                return CanDonateLocked(payloadKey, payloadTokens, targetTokens);
+        }
+
+        /// <summary>A retained slot holding <paramref name="payloadTokens"/> serves a request that keeps
+        /// <paramref name="targetTokens"/> of them when the slot can rewind there (its checkpoint).</summary>
+        private bool CanDonateLocked(string payloadKey, int payloadTokens, int targetTokens)
+        {
+            if (!SlotRetention.CanDonate(_retainedSlots, payloadKey, payloadTokens, targetTokens, canRewind: true))
+                return false;
+            return targetTokens == payloadTokens
+                || _exec.CanRewind(_retainedSlots[payloadKey].Slot, payloadTokens, targetTokens);
+        }
+
+        /// <summary>The idle primary slot decides, as for a retained one (see <see cref="CanDonateLocked"/>).</summary>
+        public bool CanRewindPrimary(int cachedTokens, int targetTokens)
+        {
+            lock (_sync)
+                return _exec != null && _activeSlotKey == null && _primarySlot >= 0
+                    && _exec.CanRewind(_primarySlot, cachedTokens, targetTokens);
         }
 
         public void ReleasePayloads(ReadOnlySpan<string> payloadKeys, ReleaseReason reason)

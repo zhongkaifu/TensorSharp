@@ -597,6 +597,11 @@ latency in one bucket.
 | `tensorsharp.engine.step.duration` | histogram, s (0.001 … 5.12) | per step that ran, `tensorsharp.engine.step_kind` |
 | `tensorsharp.engine.batch.size` | histogram, `{sequence}` (1 … 256) | `ScheduledWork.Count`, `tensorsharp.engine.step_kind` |
 | `tensorsharp.speculative.tokens.drafted`, `.accepted` | counter, `{token}` | the `SpeculationStats` increment sites (below) |
+| `tensorsharp.engine.step.prefill_tokens` | histogram, `{token}` (16 … 65536) | per step with prompt work: the `IsPrefill` work items' `NumScheduledTokens`, `tensorsharp.engine.step_kind` |
+| `tensorsharp.engine.inter_token.duration` | histogram, s (0.005 … 30) | per output token after a sequence's first: the time since `SequenceState.LastTokenTimestamp`, a multi-token step's time split evenly, `tensorsharp.engine.step_kind` of the step that emitted it |
+| `tensorsharp.prefix_cache.lookups` | counter, `{lookup}` | the scheduler's "Radix prompt reuse" admission log site, `tensorsharp.prefix_cache.outcome` and `.source` |
+| `tensorsharp.engine.stage.duration` | histogram, s (0.0001 … 1.024) | the direct-CUDA Qwen 3.8 engine's sampled forwards (`TS_Q4E_PERF_SAMPLE`), `tensorsharp.engine.stage`, `.step_kind`, `.rows` |
+| `tensorsharp.slots*`, `tensorsharp.cuda_graph.*`, `tensorsharp.engine.forward.issue_time`, `.wait_time` | observable gauges and counters | `IServingTelemetrySource.ReadServingTelemetry()` of a registered engine's model |
 
 All carry `tensorsharp.model.architecture`.
 
@@ -615,6 +620,19 @@ All carry `tensorsharp.model.architecture`.
   `KeyValuePair` fields, so a step allocates nothing, and the recording returns early unless one of the two
   instruments is enabled. Every waiting-queue admission is marked `IsPrefill`, including the one-token forward after
   a full prefix-cache hit, so those steps are `prefill` or `mixed`.
+- **Serving signals.** The prefill-token histogram is recorded with the step histograms and returns early the same
+  way. The inter-token histogram is recorded after the step from its results, before they are applied, so a sequence
+  that finishes in the step still gets its last gap. It has no stall counter for decodes a step leaves out: the
+  scheduler gives every decoding sequence its token before any prompt work, so under prompt traffic the cost shows as
+  `mixed` inter-token values, not as skipped decodes. The prefix outcome maps the coordinator's `LastSource`
+  and decline reason to fixed values (`PrefixSourceCode`, `PrefixDeclineCode`), never the reason's text, which
+  holds token counts.
+- **Slot-keeping models.** A model that keeps per-sequence slots in its own engine implements
+  `IServingTelemetrySource`; the observable callbacks read it for every registered engine on the collection thread.
+  The read is lock-free: the engine's counters are `Interlocked` fields, and the model reads its slot tables'
+  `Count` without its lock, which a forward holds for the whole step (a `TryEnter` would never see a running slot
+  under load). A read that throws drops that engine from that collection.
+  These are per engine and start again after a reload, unlike the step totals.
 - **Speculation.** The counters are added at the two places that add to `SpeculationStats`
   (`SpeculativeExecution.DecodeStep` and `CommitBatch`), with a tag cached per execution. That covers the CLI's
   standalone speculative decoder too, and work done before a preemption re-arms a new execution is not lost.

@@ -2708,7 +2708,9 @@ Web UI's `/api/chat`) is one trace:
 POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensorsharp.protocol, gen_ai.response.id
 └─ chat <model>                gen_ai.request.model, gen_ai.request.* sampling, gen_ai.usage.input_tokens /
    │                           output_tokens / cache_read.input_tokens, gen_ai.response.finish_reasons,
-   │                           tensorsharp.ttft_ms, tensorsharp.backend, tensorsharp.outcome
+   │                           tensorsharp.ttft_ms, tensorsharp.backend, tensorsharp.outcome,
+   │                           tensorsharp.prompt.uncached_tokens, tensorsharp.prefill.tokens_per_second,
+   │                           tensorsharp.decode.tokens_per_second
    ├─ prompt.render            chat template and tokenization, until the request reaches the engine
    ├─ inference.queue          waiting for the scheduler
    ├─ inference.prefill        until the first token; tensorsharp.compute.prefill_ms
@@ -2724,6 +2726,11 @@ POST /v1/chat/completions      HTTP server span: tensorsharp.request_id, tensors
 - The `inference.*` spans are wall time. Under continuous batching that overlaps with other
   requests, so `tensorsharp.compute.prefill_ms` and `tensorsharp.compute.decode_ms` give this
   request's own share of engine time.
+- `tensorsharp.prompt.uncached_tokens` is the prompt less what the prefix cache served.
+  `tensorsharp.prefill.tokens_per_second` divides it by the time from the request's first
+  admission to its first token, and `tensorsharp.decode.tokens_per_second` is the tokens after the
+  first over the time after it: the speeds this request saw, so a query can split them by prompt
+  size or by how many requests ran beside it. A rate whose interval is empty is left out.
 - Ollama's `/api/generate` is `text_completion <model>`. Embeddings (`/v1/embeddings`, `/api/embed`)
   are `embeddings <model>`, with `tensorsharp.embedding.inputs`.
 - DiffusionGemma's chat span has `prompt.render` and one `diffusion.denoise` span with a `preview`
@@ -2826,6 +2833,19 @@ semantic conventions, which are still in development and may change.
 | `tensorsharp.tokens.cache_read` | counter, `{token}` | as time to first token. Prompt tokens served from the prefix cache, a subset of `input` |
 | `tensorsharp.engine.step.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind` |
 | `tensorsharp.engine.batch.size` | histogram, `{sequence}` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind` |
+| `tensorsharp.engine.step.prefill_tokens` | histogram, `{token}` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind`. Prompt tokens one step forwarded |
+| `tensorsharp.engine.inter_token.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind` (of the step that emitted the token). Time between a sequence's consecutive output tokens |
+| `tensorsharp.prefix_cache.lookups` | counter, `{lookup}` | `tensorsharp.model.architecture`, `tensorsharp.prefix_cache.outcome` (`full`, `partial`, `miss`), `tensorsharp.prefix_cache.source` |
+| `tensorsharp.engine.stage.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.stage`, `tensorsharp.engine.step_kind`, `tensorsharp.engine.rows` |
+| `tensorsharp.slots` | gauge, `{slot}` | `tensorsharp.model.architecture`, `tensorsharp.slot.state` (`running`, `retained`) |
+| `tensorsharp.slots.memory` / `.capacity` | gauge, `By` / `{token}` | `tensorsharp.model.architecture` |
+| `tensorsharp.slots.grows`, `.grow_failures` | counter | `tensorsharp.model.architecture` |
+| `tensorsharp.slots.reclaims` | counter, `{slot}` | `tensorsharp.model.architecture`, `tensorsharp.slot.reclaim_reason` (`new_slot`, `growth`) |
+| `tensorsharp.slots.rewinds` | counter, `{rewind}` | `tensorsharp.model.architecture`, `tensorsharp.rewind.route` (`checkpoint`, `replay`, `reset`, `refused`) |
+| `tensorsharp.slots.rewind.replayed_tokens` | counter, `{token}` | `tensorsharp.model.architecture` |
+| `tensorsharp.cuda_graph.captures`, `.launches` | counter | `tensorsharp.model.architecture`, `tensorsharp.cuda_graph.kind` (`solo`, `batched`) |
+| `tensorsharp.cuda_graph.capture_failures` | counter, `{failure}` | `tensorsharp.model.architecture` |
+| `tensorsharp.engine.forward.issue_time`, `.wait_time` | counter, `s` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.requests.running`, `.waiting` | gauge, `{request}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.steps` | counter, `{step}` | `tensorsharp.model.architecture` |
 | `tensorsharp.engine.forward.time` | counter, `s` | `tensorsharp.model.architecture` |
@@ -2851,6 +2871,22 @@ semantic conventions, which are still in development and may change.
   load, image, video and Studio durations use boundaries from 0.5 s up to 2 hours (4 hours for
   Studio jobs).
 - `tensorsharp.engine.steps` and `tensorsharp.engine.forward.time` keep counting across model swaps.
+- A sequence's first token has no `tensorsharp.engine.inter_token.duration` value (its wait is the
+  time to first token); a speculative step that emits several tokens records the step's time split
+  between them. A mixed step that prefills other prompts stretches it for every sequence it runs,
+  so its `mixed` values against its `decode` ones are what sharing steps with prompts costs.
+- `tensorsharp.prefix_cache.lookups` counts each admission once. For a reuse, the source is where
+  the prefix came from (`end_state`, `primary`, `pages`, `batched_end_state`); for a miss, the
+  first reason the cache gave (`shared_prefix`, `rewind`, `breakpoints`, `live_cache`,
+  `retained_state`, `pages`, `none` when nothing was cached).
+- The `tensorsharp.slots.*`, `tensorsharp.cuda_graph.*` and `forward.issue_time` / `.wait_time`
+  instruments come from models that keep sequence slots of their own (the Qwen3.8-Flash-Next
+  direct-CUDA engine), read at each collection from counters the engine keeps; they start again
+  when the model is reloaded. Issue time close to `tensorsharp.engine.forward.time` means the
+  host, not the GPU, sets the pace.
+- `tensorsharp.engine.stage.duration` is recorded only when `TS_Q4E_PERF_SAMPLE=N` is set: every
+  Nth forward of that engine runs uncaptured, with GPU timers around each stage, and records one value per
+  stage. `tensorsharp.engine.rows` is the batch's rows in buckets (`1`, `2-4`, `5-8`, `9-16`, `17+`).
 - `tensorsharp.video.generation.duration` includes the wait for the video lock. A phase that fails
   or is cancelled has a span but no `tensorsharp.video.phase.duration` value.
 - The GPU memory gauges report the latest snapshot, taken on the thread that is doing that

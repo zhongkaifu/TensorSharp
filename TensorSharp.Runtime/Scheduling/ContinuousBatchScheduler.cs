@@ -241,6 +241,50 @@ namespace TensorSharp.Runtime.Scheduling
             return result;
         }
 
+        /// <summary>The <c>tensorsharp.model.architecture</c> value the scheduler's own metrics carry
+        /// (set by the engine that owns it).</summary>
+        internal string? TelemetryArchitecture { get; set; }
+
+        /// <summary>One <c>tensorsharp.prefix_cache.lookups</c> count for an admission's lookup: how
+        /// much it reused and from where, or, for a miss, which source declined first. The source
+        /// and reason are the coordinator's own words (LastSource, DescribeDecline), mapped here to
+        /// a few fixed values so the metric stays low-cardinality.</summary>
+        private void RecordPrefixLookup(int reused, int promptTokens, string? source, string? why)
+        {
+            var counter = Telemetry.TensorSharpMetrics.PrefixCacheLookups;
+            if (!counter.Enabled)
+                return;
+            string outcome = reused <= 0 ? "miss" : reused >= promptTokens - 1 ? "full" : "partial";
+            counter.Add(1,
+                new KeyValuePair<string, object?>(Telemetry.TelemetryAttributes.ModelArchitecture, TelemetryArchitecture ?? "unknown"),
+                new KeyValuePair<string, object?>(Telemetry.TelemetryAttributes.PrefixCacheOutcome, outcome),
+                new KeyValuePair<string, object?>(Telemetry.TelemetryAttributes.PrefixCacheSource,
+                    reused > 0 ? PrefixSourceCode(source) : PrefixDeclineCode(why)));
+        }
+
+        internal static string PrefixSourceCode(string? source) => source switch
+        {
+            "radix end state" => "end_state",
+            "radix primary cache" => "primary",
+            "radix pages" => "pages",
+            "radix batched end state" => "batched_end_state",
+            null => "unknown",
+            _ => "other",
+        };
+
+        internal static string PrefixDeclineCode(string? why)
+        {
+            // The executor's words when nothing cached matched (BatchExecutor), as for no reason.
+            if (string.IsNullOrEmpty(why) || why.StartsWith("no resumable radix prefix", StringComparison.Ordinal)) return "none";
+            if (why.StartsWith("the prompt leaves every cached prefix", StringComparison.Ordinal)) return "shared_prefix";
+            if (why.StartsWith("rewinding the cached conversation", StringComparison.Ordinal)) return "rewind";
+            if (why.StartsWith("the live cache is not continued", StringComparison.Ordinal)) return "breakpoints";
+            if (why.StartsWith("the live cache", StringComparison.Ordinal)) return "live_cache";
+            if (why.StartsWith("the retained state", StringComparison.Ordinal)) return "retained_state";
+            if (why.StartsWith("the cached pages", StringComparison.Ordinal)) return "pages";
+            return "other";
+        }
+
         /// <summary>Snapshot the currently-running sequences in fairness order.
         /// Used by the engine only after an empty schedule proves that none of
         /// them can make forward progress.</summary>
@@ -532,6 +576,7 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                     string? why = seq.PrefixCacheReusedTokens == 0 ? _prefixCacheDeclineReason?.Invoke() : null;
                     string? source = seq.PrefixCacheReusedTokens > 0 ? _radixCache.LastSource : null;
+                    RecordPrefixLookup(seq.PrefixCacheReusedTokens, seq.PromptTokens.Count, source, why);
                     _logger.LogInformation(
                         "Radix prompt reuse for {EngineRequestId}: {Reused}/{PromptTokens} tokens{Source}; {Prefill} token(s) to prefill{Why}.",
                         seq.RequestId, seq.PrefixCacheReusedTokens, seq.PromptTokens.Count,
