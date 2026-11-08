@@ -40,6 +40,9 @@ namespace TensorSharp.Models
         private int _kvCacheCapacity;
         private int _initialKvCacheCapacity;
 
+        /// <summary>Rows the bound cache (the primary or a request's holder) holds now.</summary>
+        internal int KvCacheCapacity => _kvCacheCapacity;
+
         // Per-phase tick counters. Cheap (one timestamp per phase per layer) and the
         // only way to tell a slow recurrence from a slow MoE without a profiler.
         // Reported by TS_Q4E_PROFILE=1.

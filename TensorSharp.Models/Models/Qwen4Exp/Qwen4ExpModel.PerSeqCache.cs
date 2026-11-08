@@ -185,8 +185,39 @@ namespace TensorSharp.Models
             _seqSlotBase = h.SlotBase;
         }
 
-        private Qwen4ExpKvCacheHolder CreateFreshHolder()
-            => AllocateHolder(_initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity);
+        private Qwen4ExpKvCacheHolder CreateFreshHolder() => AllocateHolder(FreshHolderCapacity());
+
+        /// <summary>Rows a new per-request holder starts with on Metal when nothing set them
+        /// (<c>TS_KV_INITIAL_TOKENS</c>): a request reserves its prompt and reply before its first chunk
+        /// (EnsureCacheCapacity), so what a holder starts with only has to be small.</summary>
+        internal const int MetalFreshHolderTokens = 2048;
+
+        private bool _freshHolderCapacityLogged;
+
+        /// <summary>
+        /// An explicit MAX_CONTEXT allocates the whole window up front (ResolveInitialCacheAllocationLength),
+        /// which is right for the primary and was paid again by every concurrent request's holder: on Flash Next
+        /// at MAX_CONTEXT=32768 each live conversation took ~1.6 GB of a Mac's memory for a 29-token prompt (K/V
+        /// and indexer keys 865 MB, recurrent state, the drafter's ring), four of them took the footprint from
+        /// 31 to 39-40 GB on a 48 GB M5 Pro, and every step of Strata's 4-at-once rounds ran 20-50% slower under
+        /// the memory pressure (parallel_4 29 tok/s; 36-37 with holders started at 2048). On Metal a new holder
+        /// starts at <see cref="MetalFreshHolderTokens"/> and grows with its request; an explicit
+        /// <c>TS_KV_INITIAL_TOKENS</c> is used as given (set it to MAX_CONTEXT for whole-window holders).
+        /// </summary>
+        private int FreshHolderCapacity()
+        {
+            int initial = _initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity;
+            if (_backend != BackendType.GgmlMetal || initial <= MetalFreshHolderTokens
+                || ExecutionOptions.FromEnvironment().KvInitialTokens > 0)
+                return initial;
+            if (!_freshHolderCapacityLogged)
+            {
+                _freshHolderCapacityLogged = true;
+                Console.WriteLine($"[qwen4exp] per-request caches start at {MetalFreshHolderTokens} tokens and grow with " +
+                    $"their request (the primary keeps {initial}); TS_KV_INITIAL_TOKENS sets both.");
+            }
+            return MetalFreshHolderTokens;
+        }
 
         /// <summary>A brand-new, zeroed holder with attention K/V and QSA raw-key
         /// caches of <paramref name="cap"/> rows and zeroed recurrent/PLE state. The

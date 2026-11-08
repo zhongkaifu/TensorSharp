@@ -240,6 +240,17 @@ second request can overwrite the model's output buffer. Immutable PLE
 convolution coefficients remain owned by the model throughout every holder's
 lifetime.
 
+On Metal a new request's holder starts at 2048 tokens of K/V and grows with
+its request (a request reserves its prompt and reply before its first chunk),
+while the primary cache keeps the whole window an explicit `MAX_CONTEXT` asks
+for. Holders used to be the whole window too: at `MAX_CONTEXT=32768` each live
+conversation took ~1.6 GB of the Mac's memory for a short prompt, and four of
+them ran every step 20-50% slower under the memory pressure (48 GB M5 Pro,
+parallel_4 29 -> 36-37 tok/s with small holders). A holder that grew answers
+bit for bit as the whole-window primary does. `TS_KV_INITIAL_TOKENS` sizes the
+primary and every holder alike (set it to `MAX_CONTEXT` for whole-window
+holders).
+
 **Concurrent decode uses the fused arena by default.** On a single-device GGML
 CPU, Metal or CUDA backend with F16 KV caches and initialized span state, two
 or more ready decoders run together in one reusable ggml graph. When routed
