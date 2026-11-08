@@ -1398,7 +1398,8 @@ and mixed English/Chinese text and 0.01% of Chinese. The drafts only propose: th
 the answers do not change. With the answers made history-independent (`TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0`)
 the English, Chinese and code answers were identical with the setting on and off, none of their tokens past the subset,
 and the acceptance moved within noise: English 58.3 vs 58.4%, Chinese 55.3 vs 56.0%, code 85.9 vs 85.2%. The head of a
-draft step reads 61% of its rows (~165 us).
+draft step reads 61% of its rows (~165 us). `eng/draft-acceptance.py` runs that comparison (`run` the prompts against a
+server, `stats` from its log, `compare` two runs' texts).
 
 Same build, same client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS):
 

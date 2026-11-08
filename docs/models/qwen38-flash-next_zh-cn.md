@@ -985,7 +985,8 @@ token id [0, 151643) 打分，即 Qwen2 的基础词表（`TS_Q4E_DRAFT_VOCAB`�
 和特殊 token，在英文和中英混合文本中占 0.1-0.2%，纯中文 0.01%。草稿只是提议：验证窗口对所有 token 打分，所以答案不变。在让答案
 不依赖历史（`TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0`）的运行中，开关前后的英文、中文和代码答案完全一致，没有任何 token
 超出该子集，接受率变化在噪声之内：英文 58.3 vs 58.4%，中文 55.3 vs 56.0%，代码 85.9 vs 85.2%。草稿步的 head 只读 61% 的行
-（约 165 us）。
+（约 165 us）。`eng/draft-acceptance.py` 用于这种对比（`run` 向服务器发送提示，`stats` 从其日志统计，`compare` 比较两次运行的
+文本）。
 
 同一构建，相同客户端，各重复 3 次（TTFT / decode tok/s；15/15 PASS）：
 
