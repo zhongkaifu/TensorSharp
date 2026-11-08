@@ -2975,15 +2975,6 @@ namespace tsg
                 && (tag == nullptr || std::strstr(tag, want) == nullptr))
                 return tsg::compute_graph(backend, graph);
         }
-        // TSG debug: identify the backend object actually executing graphs.
-        { static int tsg_dbg_n = 0;
-          if (tsg_dbg_n < 4) { tsg_dbg_n++;
-              FILE* f = fopen("/tmp/tsg_backend_id.log", "a");
-              if (f) { fprintf(f, "backend=%p name=%s compute=%p tag=%s n=%d\n",
-                               (void*)backend, ggml_backend_name(backend),
-                               (void*)nullptr, /* iface opaque here */
-                               tag ? tag : "?", graph ? ggml_graph_n_nodes(graph) : -1);
-                       fclose(f); } } }
         if (!graph_node_profile_enabled())
             return tsg::compute_graph(backend, graph);
 
