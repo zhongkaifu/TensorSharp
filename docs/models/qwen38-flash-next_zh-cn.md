@@ -944,6 +944,44 @@ indexer key（3.8 ms）、按 cell 的选择（1.1 ms），以及在选择掩码
 逐元素与布局操作（约 3 s：[T, 10240] 转置、conv 输入拼接、q/k/v 拷贝、q/k 头重复），以及稠密投影（约 1.6 s）。Strata 用融合的提示内核完成这些
 （`gdn_prompt.metal`：conv + 归一化 + 门控、按列并行的状态扫描、门控归一化）。
 
+#### 提示内核：GDN 递推与 hyper-connection 逐元素步骤，2026-11-08
+
+`ggml_metal` 上提示规模的 span（64 行以上，`TS_METAL_PROMPT_OPS_MIN_ROWS`）把两类工作交给 TensorSharp 自有的 Metal 内核（`tsm/`），
+在图分段之间编码到 ggml-metal 的队列上：
+
+- GDN 递推（`tsm_gdn_prompt.metal`，移植自 Strata 的 `gdn_prompt.metal`）：conv + SiLU + q/k L2 归一化 + 门控一遍完成，按列并行的状态扫描
+  （一个线程组在寄存器中保存一个头的 32 列状态），以及门控 RMS 归一化。它替代 ggml 的 `[T, conv_dim]` 转置、conv 输入拼接、`ssm_conv`、
+  q/k/v 拷贝、q/k 头重复、gated delta net 与归一化。conv 历史与状态按 ggml 的布局原地更新，因此运行 ggml 算子的解码可以直接接着用
+  （`TS_METAL_GDN_PROMPT`）。
+- hyper-connection 步骤（`tsm_hc_prompt.metal`，参照 Strata 的 `gr_epi_up`）：每个半层在 up 投影之后的门控流均值，以及其散射
+  `res + b * 2 sigmoid(inject / hc)`，各一遍完成。ggml 原来在 `[hc * n, T]` 上运行算子链：sigmoid、乘积、一次拷贝和三次加法、缩放；
+  然后是缩放、sigmoid、一次 repeat、乘积、加法（`TS_METAL_HC_PROMPT`）。
+
+span 在每个内核处切分图，作为 host-MoE 分段执行器的设备操作。内核的操作数放在每个槽位的 IO 缓冲区中：图分配器在张量的最后一个图消费者之后释放它，
+没有消费者时则永不释放，所以留在图中要么把它们的内存交给后面的节点，要么让每一层的副本一直存活。残差在整个 span 期间留在该缓冲区里，由每次散射
+原地更新。如果某个节点在内核运行之前读取其输出，构建检查会让该 span 失败。
+
+span 的图 arena 也在提示的各块重建之间保留。新建 Metal 缓冲区映射并驻留约每 GB 75 ms，而窗口每块都在增长（16K 时 3.1 -> 3.5 -> 4.2 GB），
+所以每次重建要付出 100-400 ms。
+
+一致性（`PromptKernels_OnTsm_AnswerAsGgml_Metal`：合成夹具上 160 token 的提示和六步解码）：GDN 6.4e-5、HC 5.3e-5、两者同时 6.9e-5 相对误差，
+argmax 全部相同；所有专家都在主机上时为 3.0e-4，Q8_K 激活放大了差异。
+
+| 16K 提示，`TS_Q4E_PHASE=1`（M5 Pro） | 每个 4096 token 块的计算 | 提示 + 50-70 token |
+| --- | --- | --- |
+| ggml 的算子 | 7.6 / 8.3 / 9.0 / 9.5 s | 44.3 s |
+| + GDN 内核 | 6.3 / 6.8 / 7.4 / 8.0 s | 36.9 s |
+| + hyper-connection 内核 | 5.2 / 5.7 / 6.3 / 6.9 s | 33.1 s |
+
+| 配置（同一客户端，DFlash2 Q4_K_M，3 次） | 短对话 | 长生成解码 | 4K TTFT | 16K TTFT | 多轮首轮 |
+| --- | --- | --- | --- | --- | --- |
+| 之前（`df2-pf1`） | 0.30 s / 15-25 tok/s | 41-43 tok/s | 8.46-8.81 s | 38.0-38.3 s | 5.7-6.2 s |
+| 提示内核 + 保留的 arena（`df2-pk`） | 0.30-0.33 s / 22-25 tok/s | 42.7-43.3 tok/s | **6.04-6.44 s** | 27.2-28.1 s | 4.1-4.6 s |
+| Strata DFlash2 | 0.56 s / 19 tok/s | 47.8 tok/s | 6.32 s | 24.4 s | - |
+
+4K 提示的读取速度现在与 Strata 相当。16K 时，每块仍比前一块多出约每 4K 窗口 0.55 s：QSA 层把每个 cell 的块分数收集到 `[cells, T]`，
+对每一行排序取前 2051 个 cell，并对整个窗口做稠密注意力。
+
 ## 多 GPU
 
 `ggml_cuda` 的 `--tp N` 切分每个路由专家及共享专家：gate/up 按中间通道切分，汇集激活后，

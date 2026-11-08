@@ -14,6 +14,9 @@
 #include "ggml_ops_matmul_precision.h"
 #include "ggml_ops_dsv4_fused.h"
 #include "ggml_ops_precision_policy.h"
+#if defined(TSG_GGML_USE_METAL)
+#include "tsm/tsm_moe.h"
+#endif
 #ifdef TSG_GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -109,6 +112,68 @@ namespace
     // layer adds its router ids as a graph output, counted after the span runs.
     struct Q4eRouteRecord { const void* gate; ggml_tensor* ids; int n_expert; };
     thread_local std::vector<Q4eRouteRecord>* g_q4e_route_record = nullptr;
+    // A prompt-width span building with device operations - TensorSharp's Metal kernels encoded between graph
+    // segments (tsm_moe.h: the GDN recurrence, the hyper-connection passes): the graph, its segment list and the
+    // span's IO buffer, whose regions hold everything a kernel reads or writes. The graph allocator frees a tensor
+    // only after its last graph consumer and never frees one without consumers, so a kernel's operands are bound
+    // here instead: one region per role, reused by every layer (a layer's are consumed before the next layer's are
+    // written; the queue orders the kernels and the segments). Null otherwise.
+    struct Q4eDeviceOps
+    {
+        ggml_cgraph* graph = nullptr;
+        std::vector<tsg::HostMoeSegment>* segs = nullptr;
+        ggml_backend_buffer_t io = nullptr;
+        std::uint8_t* base = nullptr;
+        int T = 0;
+        bool gdn = false, hc = false;
+        // hyper connections: the residual (in place across the span), xn, the up projection, inject, mixed, the
+        // block output; GDN: the input projections and the kernels' output
+        std::size_t off_res = 0, off_xn = 0, off_g = 0, off_inject = 0, off_mixed = 0, off_proj = 0;
+        std::size_t off_qkv = 0, off_z = 0, off_alpha = 0, off_beta = 0, off_y = 0;
+        std::size_t bytes = 0;
+
+        void layout(int rows, std::size_t hc_dim, std::size_t n_embd, std::size_t hc, std::size_t conv_dim,
+                    std::size_t value_dim, std::size_t n_v_heads)
+        {
+            T = rows;
+            std::size_t at = 0;
+            auto take = [&](std::size_t elems) {
+                const std::size_t o = at; at = (at + elems * sizeof(float) + 255) & ~(std::size_t)255; return o; };
+            const std::size_t t = (std::size_t)rows;
+            if (hc)
+            {
+                off_res = take(hc_dim * t); off_xn = take(hc_dim * t); off_g = take(hc_dim * t);
+                off_inject = take(hc * t); off_mixed = take(n_embd * t); off_proj = take(n_embd * t);
+            }
+            if (gdn)
+            {
+                off_qkv = take(conv_dim * t); off_z = take(value_dim * t); off_alpha = take(n_v_heads * t);
+                off_beta = take(n_v_heads * t); off_y = take(value_dim * t);
+            }
+            bytes = at;
+        }
+        void bind(ggml_tensor* t, std::size_t off) const
+        {
+            if (ggml_backend_tensor_alloc(io, t, base + off) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("qwen4exp: binding a device operation's operand failed");
+        }
+        // Whether t's memory is the residual region (a view of it counts).
+        bool is_residual(const ggml_tensor* t) const { return t != nullptr && t->data == base + off_res; }
+        void push(ggml_tensor* const* inputs, std::size_t n_inputs, std::initializer_list<ggml_tensor*> outputs, int layer,
+                  std::function<bool(ggml_backend_t)> op) const
+        {
+            tsg::HostMoeSegment seg;
+            seg.layer = layer;
+            seg.seq_len = T;
+            seg.device_inputs.assign(inputs, inputs + n_inputs);
+            seg.device_outputs.assign(outputs.begin(), outputs.end());
+            for (ggml_tensor* t : seg.device_inputs) ggml_build_forward_expand(graph, t);
+            seg.device_op = std::move(op);
+            segs->push_back(std::move(seg));
+        }
+    };
+    thread_local Q4eDeviceOps* g_q4e_dev = nullptr;
+    thread_local int g_q4e_dev_layer = -1;
     thread_local int g_q4e_tp_degree = 1, g_q4e_tp_rank = 0;
     thread_local std::deque<tsg_dsv4_fused_desc>* g_q4e_tp_matmuls = nullptr;
 
@@ -344,6 +409,14 @@ namespace
         std::vector<tsg::HostMoeSegment> host_moe;
         std::vector<int> host_moe_seg_end;
         std::vector<int> host_moe_layers;
+        // Span only, prompt-width device operations (Q4eDeviceOps; the mode is part of the replay key: 1 GDN, 2 hyper
+        // connections) and their IO buffer, kept across the rebuilds that use it (a prompt's chunks rebuild as the KV
+        // window grows; allocating the buffer again each time cost ~50 ms) and freed by one that does not.
+        int device_ops = 0;
+        ggml_backend_buffer_t dev_io = nullptr;
+        // Span only, Metal: the graph allocator's buffer type, which keeps the arena a rebuild frees for the next
+        // build (tsg::ReuseBufferType): a prompt rebuilds for every chunk.
+        tsg::ReuseBufferType* arena = nullptr;
         // Span only: the accelerator-resident MoE layers' router ids, when the
         // graph was built recording them (part of the replay key).
         std::vector<Q4eRouteRecord> route_record;
@@ -370,6 +443,7 @@ namespace
             rebinds.clear(); gdn_probe.clear();
             span_masks.clear(); span_pos.clear(); span_kvidx.clear();
             host_moe.clear(); host_moe_seg_end.clear(); host_moe_layers.clear();
+            device_ops = 0;
             tap_layers.clear(); tap_slots.clear(); tap_out.clear();
         }
 
@@ -378,6 +452,8 @@ namespace
         {
             reset_graph();
             if (state_buf) { ggml_backend_buffer_free(state_buf); state_buf = nullptr; }
+            if (dev_io) { ggml_backend_buffer_free(dev_io); dev_io = nullptr; }
+            if (arena) { tsg::reuse_buffer_type_release(arena); arena = nullptr; }
             state_ready = false;
         }
     };
@@ -770,6 +846,19 @@ namespace
                     g_q4e_stat[3].builds, g_q4e_stat[3].replays);
     }
 
+    // Prompt-width spans run device operations (TensorSharp's Metal kernels for the GDN recurrence and the
+    // hyper-connection passes, Q4eDeviceOps) from this many rows (TS_METAL_PROMPT_OPS_MIN_ROWS; the kernels' own
+    // switches are TS_METAL_GDN_PROMPT and TS_METAL_HC_PROMPT).
+    int q4e_device_ops_min_rows()
+    {
+        static const int v = [] {
+            const char* e = std::getenv("TS_METAL_PROMPT_OPS_MIN_ROWS");
+            const int n = e ? std::atoi(e) : 0;
+            return n > 0 ? n : 64;
+        }();
+        return v;
+    }
+
     // TS_Q4E_PHASE=1 prints wall times for the span build phases at T>1.
     bool q4e_phase_log()
     {
@@ -1095,6 +1184,96 @@ static ggml_tensor* q4e_cont(ggml_context* ctx, ggml_tensor* t)
     return ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
 }
 
+// The hyper-connection read every half-layer opens with: a grouped RMS norm (each residual stream normalised on its
+// own, then the hc-wide row scaled by gamma), the low-rank gate, the streams' gated mean (`mixed`, the block's input)
+// and the injection weights the scatter uses. In a span building with device operations (g_q4e_dev, prompt width)
+// the gate's sigmoid, the product and the mean run as one pass on TensorSharp's kernels (tsm::hc_mix_encode) after
+// the up projection; otherwise ggml's ops, in this order.
+struct Q4eHcRead { ggml_tensor* res3; ggml_tensor* xn; ggml_tensor* mixed; ggml_tensor* inject; };
+
+static Q4eHcRead q4e_nodes_hc_read(ggml_context* ctx, ggml_tensor* res_in, ggml_tensor* w_norm, ggml_tensor* w_down,
+    ggml_tensor* w_up, ggml_tensor* w_inject, int n_embd, int hc, int T, float eps, const char* mixed_name = nullptr)
+{
+    const int hc_dim = hc * n_embd;
+    Q4eHcRead r{};
+    r.res3 = ggml_reshape_3d(ctx, res_in, n_embd, hc, T);
+    ggml_tensor* xn = ggml_rms_norm(ctx, r.res3, eps);
+    xn = ggml_reshape_2d(ctx, xn, hc_dim, T);
+    xn = ggml_mul(ctx, xn, w_norm);
+    r.xn = xn;
+
+    ggml_tensor* lo = q4e_mul_mat(ctx, w_down, xn);
+    lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float)hc));
+#if defined(TSG_GGML_USE_METAL)
+    if (const Q4eDeviceOps* dev = g_q4e_dev; dev != nullptr && dev->hc && dev->T == T)
+    {
+        ggml_tensor* G = q4e_mul_mat(ctx, w_up, lo);
+        r.inject = q4e_mul_mat(ctx, w_inject, xn);
+        dev->bind(xn, dev->off_xn);
+        dev->bind(G, dev->off_g);
+        dev->bind(r.inject, dev->off_inject);
+        r.mixed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+        dev->bind(r.mixed, dev->off_mixed);
+        if (mixed_name != nullptr) ggml_set_name(r.mixed, mixed_name);
+        ggml_tensor* inputs[] = { G, r.inject };
+        ggml_tensor* mixed = r.mixed;
+        dev->push(inputs, 2, {mixed}, g_q4e_dev_layer, [xn, G, mixed, n_embd, hc, T](ggml_backend_t backend) {
+            return tsm::hc_mix_encode(backend, xn, G, mixed, n_embd, hc, T); });
+        return r;
+    }
+#endif
+    ggml_tensor* gate = ggml_sigmoid(ctx, q4e_mul_mat(ctx, w_up, lo));
+
+    ggml_tensor* gated = ggml_mul(ctx, xn, gate);
+    gated = ggml_reshape_3d(ctx, gated, n_embd, hc, T);
+
+    // Collapse the streams by their mean.
+    ggml_tensor* mixed = q4e_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
+            ggml_row_size(gated->type, n_embd) * hc, 0));
+    for (int c = 1; c < hc; ++c)
+    {
+        ggml_tensor* sv = ggml_view_2d(ctx, gated, n_embd, T,
+                ggml_row_size(gated->type, n_embd) * hc,
+                ggml_row_size(gated->type, n_embd) * c);
+        mixed = ggml_add(ctx, mixed, sv);
+    }
+    mixed = ggml_scale(ctx, mixed, 1.0f / (float)hc);
+    if (mixed_name != nullptr) ggml_set_name(mixed, mixed_name);
+    r.mixed = mixed;
+    r.inject = q4e_mul_mat(ctx, w_inject, xn);   // [hc, T]
+    return r;
+}
+
+// The hyper-connection scatter every half-layer closes with: res + b in every stream, weighted by 2 * sigmoid(inject /
+// hc) (centred on 1, so an untrained injection matrix reproduces a plain residual add). With device operations, one
+// pass on TensorSharp's kernels (tsm::hc_scatter_encode) writing the span's residual region in place; the block's
+// residual must already live there (the span's input, an earlier scatter's or the PLE block's output).
+static ggml_tensor* q4e_nodes_hc_scatter(ggml_context* ctx, ggml_tensor* res3, ggml_tensor* b, ggml_tensor* inject,
+    int n_embd, int hc, int T)
+{
+    const int hc_dim = hc * n_embd;
+#if defined(TSG_GGML_USE_METAL)
+    if (const Q4eDeviceOps* dev = g_q4e_dev; dev != nullptr && dev->hc && dev->T == T)
+    {
+        if (!dev->is_residual(res3))
+            throw std::logic_error("qwen4exp: a hyper-connection scatter's residual is outside the span's residual region");
+        if (b->view_src != nullptr || b->data != nullptr || b->type != GGML_TYPE_F32) b = ggml_cont(ctx, b);
+        dev->bind(b, dev->off_proj);
+        ggml_tensor* out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, T);
+        dev->bind(out, dev->off_res);
+        ggml_tensor* inputs[] = { b };
+        dev->push(inputs, 1, {out}, g_q4e_dev_layer, [res3, b, inject, out, n_embd, hc, T](ggml_backend_t backend) {
+            return tsm::hc_scatter_encode(backend, res3, b, inject, out, n_embd, hc, T); });
+        return out;
+    }
+#endif
+    ggml_tensor* wsc = ggml_scale(ctx, ggml_sigmoid(ctx,
+            ggml_scale(ctx, inject, 1.0f / (float)hc)), 2.0f);
+    wsc = ggml_reshape_3d(ctx, wsc, 1, hc, T);
+    ggml_tensor* bexp = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, b, n_embd, 1, T), n_embd, hc, T, 1);
+    return ggml_reshape_2d(ctx, ggml_add(ctx, res3, ggml_mul(ctx, bexp, wsc)), hc_dim, T);
+}
+
 ggml_tensor* q4e_nodes_ffn(
     ggml_context* ctx, Q4eBinder& bnd,
     const TSGgmlQwen4ExpFfnArgs* a, ggml_tensor* res_in,
@@ -1131,34 +1310,11 @@ ggml_tensor* q4e_nodes_ffn(
     ggml_tensor* w_sh_d = ggml_new_tensor_2d(ctx, (ggml_type)a->sh_down_type, full_shared_ff, output_rows);
 
     // ---- hyper-connection mixer ------------------------------------------
-    // Grouped RMS norm: normalise over ONE residual stream, then scale the
-    // whole hc-wide row by the gamma vector.
-    ggml_tensor* res3 = ggml_reshape_3d(ctx, res_in, n_embd, hc, T);
-    ggml_tensor* xn = ggml_rms_norm(ctx, res3, eps);
-    xn = ggml_reshape_2d(ctx, xn, hc_dim, T);
-    xn = ggml_mul(ctx, xn, w_norm);
-
-    ggml_tensor* lo = q4e_mul_mat(ctx, w_down, xn);
-    lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float)hc));
-    ggml_tensor* gate = ggml_sigmoid(ctx, q4e_mul_mat(ctx, w_up, lo));
-
-    ggml_tensor* gated = ggml_mul(ctx, xn, gate);
-    gated = ggml_reshape_3d(ctx, gated, n_embd, hc, T);
-
-    // Collapse the streams by their mean.
-    ggml_tensor* mixed = q4e_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
-            ggml_row_size(gated->type, n_embd) * hc, 0));
-    for (int c = 1; c < hc; ++c)
-    {
-        ggml_tensor* s = ggml_view_2d(ctx, gated, n_embd, T,
-                ggml_row_size(gated->type, n_embd) * hc,
-                ggml_row_size(gated->type, n_embd) * c);
-        mixed = ggml_add(ctx, mixed, s);
-    }
-    mixed = ggml_scale(ctx, mixed, 1.0f / (float)hc);
-    ggml_set_name(mixed, "q4e.ffn.mixed");
-
-    ggml_tensor* inject = q4e_mul_mat(ctx, w_inject, xn);   // [hc, T]
+    const Q4eHcRead hcr = q4e_nodes_hc_read(ctx, res_in, w_norm, w_down, w_up, w_inject, n_embd, hc, T, eps,
+            "q4e.ffn.mixed");
+    ggml_tensor* res3 = hcr.res3;
+    ggml_tensor* mixed = hcr.mixed;
+    ggml_tensor* inject = hcr.inject;   // [hc, T]
 
     // ---- routed experts ---------------------------------------------------
     // Softmax over every expert, top-k, then renormalise the selected
@@ -1363,17 +1519,7 @@ ggml_tensor* q4e_nodes_ffn(
     }
 
     // ---- hyper-connection scatter ----------------------------------------
-    // 2*sigmoid centres the weights on 1, so an untrained injection matrix
-    // reproduces a plain residual add.
-    ggml_tensor* wsc = ggml_scale(ctx, ggml_sigmoid(ctx,
-            ggml_scale(ctx, inject, 1.0f / (float)hc)), 2.0f);
-    wsc = ggml_reshape_3d(ctx, wsc, 1, hc, T);
-
-    ggml_tensor* b = ggml_reshape_3d(ctx, ffn_out, n_embd, 1, T);
-    b = ggml_repeat_4d(ctx, b, n_embd, hc, T, 1);
-
-    ggml_tensor* res_out = ggml_add(ctx, res3, ggml_mul(ctx, b, wsc));
-    res_out = ggml_reshape_2d(ctx, res_out, hc_dim, T);
+    ggml_tensor* res_out = q4e_nodes_hc_scatter(ctx, res3, ffn_out, inject, n_embd, hc, T);
 
     bnd.add(w_norm, a->hc_norm, (std::size_t)hc_dim * sizeof(float));
     bnd.add(w_down, a->hc_down, (std::size_t)a->hc_down_bytes);
@@ -1434,25 +1580,10 @@ ggml_tensor* q4e_nodes_gdn(
     ggml_tensor* w_out     = ggml_new_tensor_2d(ctx, (ggml_type)a->out_proj_type, value_dim, n_embd);
 
     // ---- hyper-connection mixer ----
-    ggml_tensor* res3 = ggml_reshape_3d(ctx, res_in, n_embd, hc, T);
-    ggml_tensor* xn = ggml_rms_norm(ctx, res3, eps);
-    xn = ggml_reshape_2d(ctx, xn, hc_dim, T);
-    xn = ggml_mul(ctx, xn, w_norm);
-
-    ggml_tensor* lo = ggml_silu(ctx, ggml_scale(ctx, q4e_mul_mat(ctx, w_down, xn), 1.0f / (float)hc));
-    ggml_tensor* gt = ggml_sigmoid(ctx, q4e_mul_mat(ctx, w_up, lo));
-    ggml_tensor* gated = ggml_reshape_3d(ctx, ggml_mul(ctx, xn, gt), n_embd, hc, T);
-
-    ggml_tensor* mixed = q4e_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
-            ggml_row_size(gated->type, n_embd) * hc, 0));
-    for (int c = 1; c < hc; ++c)
-    {
-        mixed = ggml_add(ctx, mixed, ggml_view_2d(ctx, gated, n_embd, T,
-                ggml_row_size(gated->type, n_embd) * hc,
-                ggml_row_size(gated->type, n_embd) * c));
-    }
-    mixed = ggml_scale(ctx, mixed, 1.0f / (float)hc);
-    ggml_tensor* inject = q4e_mul_mat(ctx, w_inject, xn);
+    const Q4eHcRead hcr = q4e_nodes_hc_read(ctx, res_in, w_norm, w_down, w_up, w_inject, n_embd, hc, T, eps);
+    ggml_tensor* res3 = hcr.res3;
+    ggml_tensor* mixed = hcr.mixed;
+    ggml_tensor* inject = hcr.inject;
 
     // ---- projections ----
     ggml_tensor* qkv = q4e_mul_mat(ctx, w_qkv, mixed);        // [conv_dim, T]
@@ -1460,77 +1591,113 @@ ggml_tensor* q4e_nodes_gdn(
     ggml_tensor* beta_raw = q4e_mul_mat(ctx, w_beta, mixed);  // [n_v_heads, T]
     ggml_tensor* alpha_raw = q4e_mul_mat(ctx, w_alpha, mixed);
 
-    // ---- causal depthwise conv over the ring history ----
-    // conv_state is [hist, conv_dim]; qkv transposed is [T, conv_dim].
-    ggml_tensor* qkv_t = ggml_reshape_3d(ctx, q4e_cont(ctx, ggml_transpose(ctx, qkv)),
-            T, conv_dim, 1);
-    ggml_tensor* conv_in = ggml_concat(ctx, conv_state, qkv_t, 0); // [hist + T, conv_dim, 1]
-    ggml_tensor* conv_out = ggml_silu(ctx, tsg::ssm_conv_any(ctx, conv_in, w_conv)); // [conv_dim, T, 1]
-
-    // keep the last `hist` columns for the next token
-    ggml_tensor* tail = ggml_cont(ctx, ggml_view_3d(ctx, conv_in, hist, conv_dim, 1,
-            conv_in->nb[1], conv_in->nb[2], ggml_row_size(conv_in->type, T)));
-
-    // ---- delta net ----
-    ggml_tensor* q = ggml_view_3d(ctx, conv_out, head_k_dim, n_k_heads, T,
-            ggml_row_size(conv_out->type, head_k_dim), conv_out->nb[1], 0);
-    ggml_tensor* k = ggml_view_3d(ctx, conv_out, head_k_dim, n_k_heads, T,
-            ggml_row_size(conv_out->type, head_k_dim), conv_out->nb[1],
-            ggml_row_size(conv_out->type, key_dim));
-    ggml_tensor* v = ggml_view_3d(ctx, conv_out, head_v_dim, n_v_heads, T,
-            ggml_row_size(conv_out->type, head_v_dim), conv_out->nb[1],
-            ggml_row_size(conv_out->type, 2 * key_dim));
-
-    q = ggml_l2_norm(ctx, q4e_cont(ctx, q), eps);
-    k = ggml_l2_norm(ctx, q4e_cont(ctx, k), eps);
-
-    // Repeat q/k up to the value-head count. ggml_repeat TILES (head h reads
-    // h % n_k_heads), which is the convention Qwen 3.5's kernel and llama.cpp's
-    // non-fused path both use; leaving it to the op's own broadcast produced
-    // fluent-looking noise.
-    if (n_k_heads != n_v_heads)
+    ggml_tensor* out2 = nullptr;
+    ggml_tensor* tail = nullptr;
+    ggml_tensor* conv_in = nullptr;
+    ggml_tensor* conv_out = nullptr;
+    ggml_tensor* gdn_out = nullptr;
+    ggml_tensor* new_state = nullptr;
+    int64_t attn_elems = 0;
+#if defined(TSG_GGML_USE_METAL)
+    const Q4eDeviceOps* dev = g_q4e_dev;
+    const bool device = dev != nullptr && dev->gdn && dev->T == T && probe == nullptr;
+#else
+    const bool device = false;
+#endif
+    const bool capture = !device && q4e_capture_rows(T);
+#if defined(TSG_GGML_USE_METAL)
+    if (device)
     {
-        q = ggml_repeat_4d(ctx, q, head_k_dim, n_v_heads, T, 1);
-        k = ggml_repeat_4d(ctx, k, head_k_dim, n_v_heads, T, 1);
+        // The recurrence runs on TensorSharp's kernels between this layer's two graph segments: the projections end
+        // the first, the kernels update the conv history and the state in place and write y, which the output
+        // projection reads in the second. The small weights the kernels read are graph leaves, so the allocator
+        // places them.
+        ggml_tensor* y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, value_dim, T);
+        dev->bind(y, dev->off_y);
+        dev->bind(qkv, dev->off_qkv);
+        dev->bind(z, dev->off_z);
+        dev->bind(alpha_raw, dev->off_alpha);
+        dev->bind(beta_raw, dev->off_beta);
+        for (ggml_tensor* t : {w_conv, w_dt, w_a, w_ssmnorm}) ggml_build_forward_expand(dev->graph, t);
+        tsm::GdnPromptIO io;
+        io.qkv = qkv; io.z = z; io.alpha = alpha_raw; io.beta = beta_raw;
+        io.conv_w = w_conv; io.dt = w_dt; io.a = w_a; io.norm_w = w_ssmnorm;
+        io.conv_state = conv_state; io.ssm_state = ssm_state; io.y = y;
+        io.T = T; io.h_k = n_k_heads; io.h_v = n_v_heads; io.channels = conv_dim; io.eps = eps;
+        ggml_tensor* inputs[] = { qkv, z, beta_raw, alpha_raw };
+        dev->push(inputs, 4, {y}, g_q4e_dev_layer, [io](ggml_backend_t backend) { return tsm::gdn_prompt_encode(backend, io); });
+        wb->device_y = y;
+        out2 = y;
     }
-    q = ggml_reshape_4d(ctx, q4e_cont(ctx, q), head_k_dim, n_v_heads, T, 1);
-    k = ggml_reshape_4d(ctx, q4e_cont(ctx, k), head_k_dim, n_v_heads, T, 1);
-    v = ggml_reshape_4d(ctx, q4e_cont(ctx, v), head_v_dim, n_v_heads, T, 1);
+    else
+#endif
+    {
+        // ---- causal depthwise conv over the ring history ----
+        // conv_state is [hist, conv_dim]; qkv transposed is [T, conv_dim].
+        ggml_tensor* qkv_t = ggml_reshape_3d(ctx, q4e_cont(ctx, ggml_transpose(ctx, qkv)),
+                T, conv_dim, 1);
+        conv_in = ggml_concat(ctx, conv_state, qkv_t, 0); // [hist + T, conv_dim, 1]
+        conv_out = ggml_silu(ctx, tsg::ssm_conv_any(ctx, conv_in, w_conv)); // [conv_dim, T, 1]
 
-    // The op scales q internally (llama.cpp passes it unscaled), and a uniform
-    // scale here would be absorbed by the RMS norm below in any case.
+        // keep the last `hist` columns for the next token
+        tail = ggml_cont(ctx, ggml_view_3d(ctx, conv_in, hist, conv_dim, 1,
+                conv_in->nb[1], conv_in->nb[2], ggml_row_size(conv_in->type, T)));
 
-    ggml_tensor* b4 = ggml_reshape_4d(ctx, ggml_sigmoid(ctx, beta_raw), 1, n_v_heads, T, 1);
-    ggml_tensor* g4 = ggml_reshape_4d(ctx,
-            ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha_raw, w_dt)), w_a),
-            1, n_v_heads, T, 1);
-    ggml_tensor* s4 = ggml_reshape_4d(ctx, ssm_state, head_v_dim, head_v_dim, n_v_heads, 1);
+        // ---- delta net ----
+        ggml_tensor* q = ggml_view_3d(ctx, conv_out, head_k_dim, n_k_heads, T,
+                ggml_row_size(conv_out->type, head_k_dim), conv_out->nb[1], 0);
+        ggml_tensor* k = ggml_view_3d(ctx, conv_out, head_k_dim, n_k_heads, T,
+                ggml_row_size(conv_out->type, head_k_dim), conv_out->nb[1],
+                ggml_row_size(conv_out->type, key_dim));
+        ggml_tensor* v = ggml_view_3d(ctx, conv_out, head_v_dim, n_v_heads, T,
+                ggml_row_size(conv_out->type, head_v_dim), conv_out->nb[1],
+                ggml_row_size(conv_out->type, 2 * key_dim));
 
-    const bool capture = q4e_capture_rows(T);
-    ggml_tensor* gdn_out = ggml_gated_delta_net(ctx, q, k, v, g4, b4, s4, capture ? T : 1);
+        q = ggml_l2_norm(ctx, q4e_cont(ctx, q), eps);
+        k = ggml_l2_norm(ctx, q4e_cont(ctx, k), eps);
 
-    const int64_t attn_elems = (int64_t)head_v_dim * n_v_heads * T;
-    ggml_tensor* core = ggml_view_3d(ctx, gdn_out, head_v_dim, n_v_heads, T,
-            ggml_row_size(gdn_out->type, head_v_dim),
-            ggml_row_size(gdn_out->type, head_v_dim * n_v_heads), 0);
-    ggml_tensor* new_state = ggml_view_3d(ctx, gdn_out, head_v_dim, head_v_dim, n_v_heads,
-            ggml_row_size(gdn_out->type, head_v_dim),
-            ggml_row_size(gdn_out->type, head_v_dim * head_v_dim),
-            ggml_row_size(gdn_out->type, attn_elems));
+        // Repeat q/k up to the value-head count. ggml_repeat TILES (head h reads
+        // h % n_k_heads), which is the convention Qwen 3.5's kernel and llama.cpp's
+        // non-fused path both use; leaving it to the op's own broadcast produced
+        // fluent-looking noise.
+        if (n_k_heads != n_v_heads)
+        {
+            q = ggml_repeat_4d(ctx, q, head_k_dim, n_v_heads, T, 1);
+            k = ggml_repeat_4d(ctx, k, head_k_dim, n_v_heads, T, 1);
+        }
+        q = ggml_reshape_4d(ctx, q4e_cont(ctx, q), head_k_dim, n_v_heads, T, 1);
+        k = ggml_reshape_4d(ctx, q4e_cont(ctx, k), head_k_dim, n_v_heads, T, 1);
+        v = ggml_reshape_4d(ctx, q4e_cont(ctx, v), head_v_dim, n_v_heads, T, 1);
 
-    // qwen4exp closes with a SIGMOID gate, where Qwen 3.5 uses SiLU.
-    ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, q4e_cont(ctx, core), eps), w_ssmnorm);
-    ggml_tensor* zg = ggml_sigmoid(ctx, ggml_reshape_3d(ctx, z, head_v_dim, n_v_heads, T));
-    ggml_tensor* out2 = ggml_reshape_2d(ctx, ggml_mul(ctx, normed, zg), value_dim, T);
+        // The op scales q internally (llama.cpp passes it unscaled), and a uniform
+        // scale here would be absorbed by the RMS norm below in any case.
+
+        ggml_tensor* b4 = ggml_reshape_4d(ctx, ggml_sigmoid(ctx, beta_raw), 1, n_v_heads, T, 1);
+        ggml_tensor* g4 = ggml_reshape_4d(ctx,
+                ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha_raw, w_dt)), w_a),
+                1, n_v_heads, T, 1);
+        ggml_tensor* s4 = ggml_reshape_4d(ctx, ssm_state, head_v_dim, head_v_dim, n_v_heads, 1);
+
+        gdn_out = ggml_gated_delta_net(ctx, q, k, v, g4, b4, s4, capture ? T : 1);
+
+        attn_elems = (int64_t)head_v_dim * n_v_heads * T;
+        ggml_tensor* core = ggml_view_3d(ctx, gdn_out, head_v_dim, n_v_heads, T,
+                ggml_row_size(gdn_out->type, head_v_dim),
+                ggml_row_size(gdn_out->type, head_v_dim * n_v_heads), 0);
+        new_state = ggml_view_3d(ctx, gdn_out, head_v_dim, head_v_dim, n_v_heads,
+                ggml_row_size(gdn_out->type, head_v_dim),
+                ggml_row_size(gdn_out->type, head_v_dim * head_v_dim),
+                ggml_row_size(gdn_out->type, attn_elems));
+
+        // qwen4exp closes with a SIGMOID gate, where Qwen 3.5 uses SiLU.
+        ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, q4e_cont(ctx, core), eps), w_ssmnorm);
+        ggml_tensor* zg = ggml_sigmoid(ctx, ggml_reshape_3d(ctx, z, head_v_dim, n_v_heads, T));
+        out2 = ggml_reshape_2d(ctx, ggml_mul(ctx, normed, zg), value_dim, T);
+    }
     ggml_tensor* proj = q4e_mul_mat(ctx, w_out, out2);        // [n_embd, T]
 
     // ---- hyper-connection scatter ----
-    ggml_tensor* wsc = ggml_reshape_3d(ctx, ggml_scale(ctx,
-            ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float)hc)), 2.0f), 1, hc, T);
-    ggml_tensor* bexp = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, proj, n_embd, 1, T),
-            n_embd, hc, T, 1);
-    ggml_tensor* res_out = ggml_reshape_2d(ctx,
-            ggml_add(ctx, res3, ggml_mul(ctx, bexp, wsc)), hc_dim, T);
+    ggml_tensor* res_out = q4e_nodes_hc_scatter(ctx, res3, proj, inject, n_embd, hc, T);
 
     bnd.add(w_norm, a->hc_norm, (std::size_t)hc_dim * sizeof(float));
     bnd.add(w_down, a->hc_down, (std::size_t)a->hc_down_bytes);
@@ -1546,7 +1713,7 @@ ggml_tensor* q4e_nodes_gdn(
     bnd.add(w_ssmnorm, a->ssm_norm, (std::size_t)head_v_dim * sizeof(float));
     bnd.add(w_out, a->out_proj, (std::size_t)a->out_proj_bytes);
 
-    if (probe != nullptr)
+    if (probe != nullptr && wb->device_y == nullptr)
     {
         ggml_tensor* nodes[] = { mixed, qkv, conv_out, gdn_out, proj };
         for (ggml_tensor* t : nodes) { ggml_set_output(t); probe->push_back(t); }
@@ -1613,19 +1780,10 @@ ggml_tensor* q4e_nodes_attn(
     }
 
     // ---- hyper-connection mixer ----
-    ggml_tensor* res3 = ggml_reshape_3d(ctx, res_in, n_embd, hc, T);
-    ggml_tensor* xn = ggml_mul(ctx,
-            ggml_reshape_2d(ctx, ggml_rms_norm(ctx, res3, eps), hc_dim, T), w_norm);
-    ggml_tensor* lo = ggml_silu(ctx, ggml_scale(ctx, q4e_mul_mat(ctx, w_down, xn), 1.0f / (float)hc));
-    ggml_tensor* gt = ggml_sigmoid(ctx, q4e_mul_mat(ctx, w_up, lo));
-    ggml_tensor* gated = ggml_reshape_3d(ctx, ggml_mul(ctx, xn, gt), n_embd, hc, T);
-    ggml_tensor* mixed = q4e_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
-            ggml_row_size(gated->type, n_embd) * hc, 0));
-    for (int c = 1; c < hc; ++c)
-        mixed = ggml_add(ctx, mixed, ggml_view_2d(ctx, gated, n_embd, T,
-                ggml_row_size(gated->type, n_embd) * hc, ggml_row_size(gated->type, n_embd) * c));
-    mixed = ggml_scale(ctx, mixed, 1.0f / (float)hc);
-    ggml_tensor* inject = q4e_mul_mat(ctx, w_inject, xn);
+    const Q4eHcRead hcr = q4e_nodes_hc_read(ctx, res_in, w_norm, w_down, w_up, w_inject, n_embd, hc, T, eps);
+    ggml_tensor* res3 = hcr.res3;
+    ggml_tensor* mixed = hcr.mixed;
+    ggml_tensor* inject = hcr.inject;
 
     int qsa_width = 0;
     if (qsa != nullptr)
@@ -1790,12 +1948,7 @@ ggml_tensor* q4e_nodes_attn(
     ggml_tensor* proj = q4e_mul_mat(ctx, wo, ggml_reshape_2d(ctx, attn, q_dim, T));
 
     // ---- hyper-connection scatter ----
-    ggml_tensor* wsc = ggml_reshape_3d(ctx, ggml_scale(ctx,
-            ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float)hc)), 2.0f), 1, hc, T);
-    ggml_tensor* bexp = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, proj, n_embd, 1, T),
-            n_embd, hc, T, 1);
-    ggml_tensor* res_out = ggml_reshape_2d(ctx,
-            ggml_add(ctx, res3, ggml_mul(ctx, bexp, wsc)), hc_dim, T);
+    ggml_tensor* res_out = q4e_nodes_hc_scatter(ctx, res3, proj, inject, n_embd, hc, T);
 
     bnd.add(w_norm, a->hc_norm, (std::size_t)hc_dim * sizeof(float));
     bnd.add(w_down, a->hc_down, (std::size_t)a->hc_down_bytes);
@@ -2691,8 +2844,19 @@ static int q4e_token_span_impl(
         struct RowKernelScope {
             ~RowKernelScope() { g_q4e_row_kernels = Q4eRowKernels{}; g_q4e_prefill_combine = false; }
         } row_kernel_scope;
+        // Prompt-width device operations (Q4eDeviceOps): 1 the GDN recurrence, 2 the hyper-connection passes.
+        int device_ops = 0;
+#if defined(TSG_GGML_USE_METAL)
+        if (!tp_mode && !row_scope && !q4e_capture_rows(T) && T >= q4e_device_ops_min_rows() && !q4e_dump_nodes
+            && slot->precise_backend == nullptr)
+        {
+            if (tsm::gdn_prompt_supported(g_backend, head_k_dim, head_v_dim, n_k_heads, n_v_heads, d_conv)) device_ops |= 1;
+            if (tsm::hc_prompt_supported(g_backend)) device_ops |= 2;
+        }
+#endif
         if (!q4e_dump_nodes
             && slot->valid && slot->tp_plan.valid() == tp_mode
+            && slot->device_ops == device_ops
             && slot->tp_degree == g_q4e_tp_degree && slot->tp_rank == g_q4e_tp_rank
             && slot->row_scope == row_scope && slot->row_kv_count == row_kv_count
             && slot->capture_rows == q4e_capture_rows(T)
@@ -2895,8 +3059,39 @@ static int q4e_token_span_impl(
         bool failed = false;
         const char* fail_what = nullptr;
 
+        // Device operations: the IO buffer (grown, never shrunk, while the slot's rebuilds use it) and, with the
+        // hyper-connection passes, the residual in its region from the span's input on.
+        Q4eDeviceOps dev_ops;
+        struct DevOpsScope { ~DevOpsScope() { g_q4e_dev = nullptr; g_q4e_dev_layer = -1; } } dev_ops_scope;
+        if (device_ops != 0)
+        {
+            dev_ops.graph = graph;
+            dev_ops.segs = &host_moe;
+            dev_ops.gdn = (device_ops & 1) != 0;
+            dev_ops.hc = (device_ops & 2) != 0;
+            dev_ops.layout(T, (std::size_t)hc_dim, (std::size_t)n_embd, (std::size_t)hc,
+                    (std::size_t)(head_k_dim * n_k_heads) * 2 + (std::size_t)(head_v_dim * n_v_heads),
+                    (std::size_t)head_v_dim * n_v_heads, (std::size_t)n_v_heads);
+            if (slot->dev_io != nullptr && ggml_backend_buffer_get_size(slot->dev_io) < dev_ops.bytes)
+            { ggml_backend_buffer_free(slot->dev_io); slot->dev_io = nullptr; }
+            if (slot->dev_io == nullptr)
+                slot->dev_io = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(g_backend), dev_ops.bytes);
+            if (slot->dev_io == nullptr)
+                throw std::runtime_error("qwen4exp token span: the device operations' IO buffer could not be allocated");
+            dev_ops.io = slot->dev_io;
+            dev_ops.base = (std::uint8_t*)ggml_backend_buffer_get_base(slot->dev_io);
+            if (dev_ops.hc) dev_ops.bind(res_in, dev_ops.off_res);
+            g_q4e_dev = &dev_ops;
+        }
+        else if (slot->dev_io != nullptr)
+        {
+            ggml_backend_buffer_free(slot->dev_io);
+            slot->dev_io = nullptr;
+        }
+
         for (int il = layer_begin; il < layer_end && !failed; ++il)
         {
+            g_q4e_dev_layer = il;
             if (has_ple && il == ple_layer)
             {
                 // ---- the PLE block, ahead of this layer's halves ----
@@ -2925,6 +3120,8 @@ static int q4e_token_span_impl(
                 g_q4e_ple_padded = nullptr;
                 res = q4e_nodes_ple(ctx, graph, binder, ple, res, ple_emb_in,
                         conv_state, n_embd, hc, T, 1, eps);
+                // The residual stays in its region: the block's output add writes it in place.
+                if (dev_ops.hc) dev_ops.bind(res, dev_ops.off_res);
                 if (capture && hist > 0 && g_q4e_ple_padded != nullptr)
                 {
                     const std::size_t bytes = ggml_nbytes(g_q4e_ple_padded);
@@ -2967,12 +3164,19 @@ static int q4e_token_span_impl(
                         head_k_dim, head_v_dim, n_k_heads, n_v_heads, d_conv, eps, &wb,
                         (q4e_span_trace() && il == layer_begin && cache_slot == 0 && T == 1)
                             ? &slot->gdn_probe : nullptr);
-                // The residual first: its tree holds every node that READS the state
-                // (the concat, the delta-net input). Then the write-back, so node
-                // order puts the write strictly after the read.
-                ggml_build_forward_expand(graph, res);
-                ggml_build_forward_expand(graph, ggml_cpy(ctx, wb.tail, conv_state));
-                ggml_build_forward_expand(graph, ggml_cpy(ctx, wb.new_state, ssm_state));
+                // Prompt GDN on TensorSharp's kernels (q4e_nodes_gdn pushed the device operation): the state is
+                // updated in place, and nothing else reads it.
+                if (wb.device_y != nullptr)
+                    ggml_build_forward_expand(graph, res);
+                else
+                {
+                    // The residual first: its tree holds every node that READS the state
+                    // (the concat, the delta-net input). Then the write-back, so node
+                    // order puts the write strictly after the read.
+                    ggml_build_forward_expand(graph, res);
+                    ggml_build_forward_expand(graph, ggml_cpy(ctx, wb.tail, conv_state));
+                    ggml_build_forward_expand(graph, ggml_cpy(ctx, wb.new_state, ssm_state));
+                }
                 if (capture && wb.conv_in != nullptr && wb.snaps != nullptr)
                 {
                     const std::size_t conv_in_bytes = ggml_nbytes(wb.conv_in);
@@ -3086,6 +3290,8 @@ static int q4e_token_span_impl(
             }
         }
 
+        g_q4e_dev = nullptr;   // the head builds ggml's ops
+        g_q4e_dev_layer = -1;
         if (failed)
         {
             set_last_error(std::string("qwen4exp token span: ") + (fail_what ? fail_what : "build") + " failed.");
@@ -3125,7 +3331,19 @@ static int q4e_token_span_impl(
         if (!host_moe_build_segment_ends(graph, host_moe, host_moe_seg_end, kQwen4ExpSpanKernel))
             return 0;
         const double t_pregal = q4e_phase_log() ? q4e_now_ms() : 0.0;
-        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+        // On Metal the arena comes from the slot's reusing buffer type (unified memory: a kept arena is memory the
+        // next chunk needs anyway); elsewhere straight from the backend's, as device memory is not kept idle.
+        ggml_backend_buffer_type_t arena_buft = ggml_backend_get_default_buffer_type(g_backend);
+#if defined(TSG_GGML_USE_METAL)
+        if (ggml_backend_is_metal(g_backend))
+        {
+            if (slot->arena != nullptr && tsg::reuse_buffer_type_inner(slot->arena) != arena_buft)
+            { tsg::reuse_buffer_type_release(slot->arena); slot->arena = nullptr; }
+            if (slot->arena == nullptr) slot->arena = tsg::reuse_buffer_type_new(arena_buft);
+            if (slot->arena != nullptr) arena_buft = tsg::reuse_buffer_type_get(slot->arena);
+        }
+#endif
+        ggml_gallocr_t alloc = ggml_gallocr_new(arena_buft);
         std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, decltype(&ggml_gallocr_free)>
             owned_alloc(alloc, ggml_gallocr_free);
         if (alloc == nullptr || !ggml_gallocr_alloc_graph(alloc, graph))
@@ -3195,9 +3413,10 @@ static int q4e_token_span_impl(
         {
             tsg::sync_backend(g_backend);
             const double t_cmp = q4e_now_ms();
-            fprintf(stderr, "[q4e-phase] span %d..%d T=%d: nodes=%.1fms binder=%.1fms gallocr=%.1fms uploads=%.1fms compute=%.1fms%c",
+            fprintf(stderr, "[q4e-phase] span %d..%d T=%d: nodes=%.1fms binder=%.1fms gallocr=%.1fms (%.0f MB) uploads=%.1fms compute=%.1fms%c",
                     layer_begin, layer_end, T,
-                    t_nodes - t0, t_pregal - t_nodes, t_gal - t_pregal, t_up - t_gal, t_cmp - t_up, 10);
+                    t_nodes - t0, t_pregal - t_nodes, t_gal - t_pregal,
+                    ggml_gallocr_get_buffer_size(alloc, 0) / 1048576.0, t_up - t_gal, t_cmp - t_up, 10);
         }
 
         if (logits != nullptr)
@@ -3303,6 +3522,7 @@ static int q4e_token_span_impl(
         slot->tp_degree = g_q4e_tp_degree; slot->tp_rank = g_q4e_tp_rank;
         slot->kv_capacity = kv_capacity; slot->n_kv = n_kv_pad;
         slot->row_kv = row_kv; slot->row_kv_count = row_kv_count; slot->row_scope = row_scope;
+        slot->device_ops = device_ops;
         slot->capture_rows = q4e_capture_rows(T);
         slot->row_epoch = g_q4e_row_epoch;
         slot->capture_desc = capture_desc;

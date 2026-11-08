@@ -2374,10 +2374,37 @@ namespace tsg
         seg_end.reserve(segments.size() + 1);
         for (const HostMoeSegment& hm : segments)
         {
+            if (hm.device_op)
+            {
+                int cut = 0;
+                for (ggml_tensor* t : hm.device_inputs)
+                {
+                    const int i = host_moe_graph_node_index(graph, t);
+                    if (i < 0)
+                    {
+                        set_last_error(std::string(kernel_name) + ": a device operation's input is missing from the graph.");
+                        seg_end.clear();
+                        return false;
+                    }
+                    if (i + 1 > cut) cut = i + 1;
+                }
+                if (hm.device_inputs.empty() || (!seg_end.empty() && cut <= seg_end.back()))
+                {
+                    set_last_error(std::string(kernel_name) + ": host-MoE segments are not in graph order.");
+                    seg_end.clear();
+                    return false;
+                }
+                seg_end.push_back(cut);
+                continue;
+            }
+            // A leaf (an input, or a device operation's output bound outside the allocator) is whole before the
+            // pass, or before any segment after the operation: only computed tensors place the cut.
+            auto placed = [&](const ggml_tensor* t, int i) { return i >= 0 || (t != nullptr && t->op == GGML_OP_NONE); };
             const int i_in = host_moe_graph_node_index(graph, hm.moe_in);
             const int i_id = host_moe_graph_node_index(graph, hm.sel_ids);
             const int i_w  = host_moe_graph_node_index(graph, hm.weights);
-            if (i_in < 0 || i_id < 0 || i_w < 0)
+            if (!placed(hm.moe_in, i_in) || !placed(hm.sel_ids, i_id) || !placed(hm.weights, i_w)
+                || (i_in < 0 && i_id < 0 && i_w < 0))
             {
                 set_last_error(std::string(kernel_name) + ": host-MoE boundary tensor missing from the graph.");
                 seg_end.clear();
@@ -2398,6 +2425,28 @@ namespace tsg
             seg_end.push_back(cut);
         }
         seg_end.push_back(n_nodes);
+        // A device operation's outputs are read only after it runs.
+        for (std::size_t k = 0; k < segments.size(); ++k)
+        {
+            const std::vector<ggml_tensor*>& outs = segments[k].device_outputs;
+            if (!segments[k].device_op || outs.empty()) continue;
+            for (int i = 0; i < seg_end[k]; ++i)
+            {
+                const ggml_tensor* node = ggml_graph_node(graph, i);
+                for (const ggml_tensor* src : node->src)
+                {
+                    if (src == nullptr) continue;
+                    const ggml_tensor* base = src->view_src ? src->view_src : src;
+                    if (std::find(outs.begin(), outs.end(), base) != outs.end())
+                    {
+                        set_last_error(std::string(kernel_name) + ": node " + std::to_string(i) + " (" + ggml_op_desc(node)
+                            + ") reads a device operation's output before the operation runs (cut " + std::to_string(seg_end[k]) + ").");
+                        seg_end.clear();
+                        return false;
+                    }
+                }
+            }
+        }
         return true;
     }
 
@@ -2744,12 +2793,17 @@ namespace tsg
         // moe_stage_prefetch_start); every staging thread is joined before this returns.
         struct PrefetchJoin { ~PrefetchJoin() { moe_stage_prefetch_join(); } } prefetch_join;
         const int stream_threshold = moe_offload_stream_batch_threshold();
+        // The next host-expert segment at or after i (device operations have no experts to stage).
+        auto next_host = [&](std::size_t i) {
+            while (i < segments.size() && segments[i].device_op) ++i;
+            return i;
+        };
         auto prefetchable = [&](std::size_t i) {
             return i < segments.size() && !segments[i].io_wait && stream_threshold > 0
                 && segments[i].seq_len >= stream_threshold && segments[i].verify_gpu == nullptr;
         };
         const bool prefetch = moe_stage_prefetch_enabled() && !debug_this_call;
-        if (prefetch && prefetchable(0)) moe_stage_prefetch_start(segments[0]);
+        if (prefetch && prefetchable(next_host(0))) moe_stage_prefetch_start(segments[next_host(0)]);
 
         int begin = 0;
 #if defined(TSG_GGML_USE_METAL)
@@ -2771,6 +2825,27 @@ namespace tsg
             // flight is not a cut at all: run on to the next one in the same submit.
             if (seg < segments.size() && segments[seg].io_wait && !host_expert_io_async_pending())
                 continue;
+            if (seg < segments.size() && segments[seg].device_op)
+            {
+                // Submitted without a wait: the operation is queued behind the segment (the queue and the buffers'
+                // hazard tracking order it) and the next segment behind it.
+                if (end > begin)
+                {
+                    ggml_cgraph view = ggml_graph_view(graph, begin, end);
+                    if (ggml_backend_graph_compute_async(backend, &view) != GGML_STATUS_SUCCESS)
+                    {
+                        set_last_error(std::string(kernel_name) + ": host-MoE segment execution failed.");
+                        return false;
+                    }
+                }
+                begin = end;
+                if (!segments[seg].device_op(backend))
+                {
+                    sync_backend(backend);
+                    return false;
+                }
+                continue;
+            }
             if (end > begin)
             {
                 const auto t_gpu = s_pass_timing ? pass_clock::now() : pass_clock::time_point{};
@@ -2838,7 +2913,7 @@ namespace tsg
             if (s_pass_timing) s_acc_host += ms_since(t_host);
             if (hot.launched) begin = hot.end;   // the next slice starts after what already ran
             // This layer's experts are computed: stage the next one's while the accelerator runs on.
-            if (prefetch && prefetchable(seg + 1)) moe_stage_prefetch_start(segments[seg + 1]);
+            if (prefetch && prefetchable(next_host(seg + 1))) moe_stage_prefetch_start(segments[next_host(seg + 1)]);
 
             const std::size_t act_count = static_cast<std::size_t>(hm.hidden) * static_cast<std::size_t>(hm.seq_len);
             const std::size_t route_count = static_cast<std::size_t>(hm.n_used) * static_cast<std::size_t>(hm.seq_len);

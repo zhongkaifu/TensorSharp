@@ -1357,6 +1357,50 @@ What remains is the chunk's compute, ~7.5 s per 4096 tokens: the routed experts 
 transpose, the conv input concat, q/k/v copies, the q/k head repeat), and the dense projections (~1.6 s). Strata runs
 those as fused prompt kernels (`gdn_prompt.metal`: conv + norms + gates, a column-parallel state scan, the gated norm).
 
+#### Prompt kernels: the GDN recurrence and the hyper-connection passes, 2026-11-08
+
+A prompt-width span (64+ rows, `TS_METAL_PROMPT_OPS_MIN_ROWS`) on `ggml_metal` runs two kinds of work on TensorSharp's
+own Metal kernels (`tsm/`), encoded on ggml-metal's queue between graph segments:
+
+- The GDN recurrence (`tsm_gdn_prompt.metal`, ported from Strata's `gdn_prompt.metal`): conv + SiLU + q/k L2 norms +
+  gates in one pass, a column-parallel state scan (a threadgroup keeps 32 columns of a head's state in registers), and
+  the gated RMS norm. It replaces ggml's `[T, conv_dim]` transpose, the conv-input concat, `ssm_conv`, the q/k/v
+  copies, the q/k head repeat, the gated delta net and the norm. The conv history and the state are updated in place in
+  ggml's layout, so decode, which runs ggml's ops, continues from them (`TS_METAL_GDN_PROMPT`).
+- The hyper-connection passes (`tsm_hc_prompt.metal`, after Strata's `gr_epi_up`): every half-layer's gated stream mean
+  after the up projection and its scatter `res + b * 2 sigmoid(inject / hc)`, one pass each. ggml ran chains over
+  `[hc * n, T]` for these: sigmoid, product, a copy and three adds, scale; then scale, sigmoid, a repeat, product, add
+  (`TS_METAL_HC_PROMPT`).
+
+The span cuts its graph at each kernel, as the device operations of the host-MoE segment executor. The kernels'
+operands live in a per-slot IO buffer: the graph allocator frees a tensor after its last graph consumer, or never when
+it has none, so leaving them in the graph would either hand their memory to later nodes or keep every layer's copy
+alive. The residual stays in that buffer for the whole span, updated in place by each scatter. A build check fails the
+span if a node reads a kernel's output before the kernel runs.
+
+The span's graph arena is also kept across a prompt's chunk rebuilds. A new Metal buffer costs ~75 ms a GB to map and
+make resident, and the window grows every chunk (3.1 -> 3.5 -> 4.2 GB at 16K), so each rebuild paid 100-400 ms.
+
+Parity (`PromptKernels_OnTsm_AnswerAsGgml_Metal`: a 160-token prompt and six decode steps on the synthetic fixture):
+GDN 6.4e-5, HC 5.3e-5, both 6.9e-5 relative error, every argmax equal; 3.0e-4 with every expert on the host, where
+the Q8_K activations amplify the difference.
+
+| 16K prompt, `TS_Q4E_PHASE=1` (M5 Pro) | compute per 4096-token chunk | prompt + 50-70 tokens |
+| --- | --- | --- |
+| ggml's ops | 7.6 / 8.3 / 9.0 / 9.5 s | 44.3 s |
+| + GDN kernels | 6.3 / 6.8 / 7.4 / 8.0 s | 36.9 s |
+| + hyper-connection kernels | 5.2 / 5.7 / 6.3 / 6.9 s | 33.1 s |
+
+| run (same client, DFlash2 Q4_K_M, 3 repeats) | short chat | long-gen decode | 4K TTFT | 16K TTFT | multi-turn first turn |
+| --- | --- | --- | --- | --- | --- |
+| before (`df2-pf1`) | 0.30 s / 15-25 tok/s | 41-43 tok/s | 8.46-8.81 s | 38.0-38.3 s | 5.7-6.2 s |
+| prompt kernels + kept arena (`df2-pk`) | 0.30-0.33 s / 22-25 tok/s | 42.7-43.3 tok/s | **6.04-6.44 s** | 27.2-28.1 s | 4.1-4.6 s |
+| Strata DFlash2 | 0.56 s / 19 tok/s | 47.8 tok/s | 6.32 s | 24.4 s | - |
+
+A 4K prompt now reads as fast as Strata's. At 16K each chunk still costs ~0.55 s more per 4K of window than the one
+before: the QSA layers gather every cell's block score into `[cells, T]`, sort each row for its top 2051 cells, and
+attend the whole window densely.
+
 ## Multi-GPU
 
 `--tp N` on `ggml_cuda` partitions every routed and shared FFN across N local GPUs. Every rank

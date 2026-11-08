@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <list>
 #include <memory>
@@ -980,6 +981,16 @@ namespace tsg
         // TensorSharp Metal (tsm/tsm_moe.h): the tier's routes computed at the seam by the grouped expert kernels,
         // into this pinned F32 [hidden, seq] input, instead of MUL_MAT_ID in the next segment. Null otherwise.
         ggml_tensor* tsm_hot = nullptr;
+
+        // A device operation in place of host experts (no host work, no transfers): the cut follows the last of
+        // device_inputs in graph order, and device_op encodes its work on the accelerator's queue right after that
+        // segment is submitted, before the next one, which reads what it writes (ggml_ops_qwen4exp.cpp's prompt GDN
+        // layers on TensorSharp's Metal kernels). False with set_last_error on a failure.
+        std::function<bool(ggml_backend_t)> device_op;
+        std::vector<ggml_tensor*> device_inputs;
+        // What it writes (tensors bound outside the allocator): no node before the cut may read them, which
+        // host_moe_build_segment_ends checks - a node order that put a reader first would read stale values.
+        std::vector<ggml_tensor*> device_outputs;
     };
 
     // One layer's accelerator expert slots: `fixed` slots hold the layer's
@@ -1019,6 +1030,18 @@ namespace tsg
                                  std::size_t offset[3], std::size_t bytes[3]);
     long long moe_stage_prefetch_hits();
     void moe_stage_prefetch_release();
+
+    // A buffer type over `inner` that keeps the one buffer its owner freed last and hands it to the owner's next
+    // allocation it serves (ggml_ops_buffer_reuse.cpp): a graph slot rebuilt for every prompt chunk reuses its arena
+    // instead of mapping and making resident a new one each time. One per owner; release it after the owner's
+    // allocator is freed (buffers still out are freed when they come back).
+    struct ReuseBufferType;
+    ReuseBufferType* reuse_buffer_type_new(ggml_backend_buffer_type_t inner);
+    ggml_backend_buffer_type_t reuse_buffer_type_get(ReuseBufferType* type);
+    ggml_backend_buffer_type_t reuse_buffer_type_inner(const ReuseBufferType* type);
+    // Frees the kept buffer.
+    void reuse_buffer_type_trim(ReuseBufferType* type);
+    void reuse_buffer_type_release(ReuseBufferType* type);
     void moe_hot_tier_bind(const MoeHotTier& tier, int part, ggml_tensor* tensor);
     // Builds the accelerator half of a tiered layer: allocates hm's hot_slot /
     // hot_weight inputs and returns the F32 [hidden, seq] sum of the tier's
@@ -2176,6 +2199,10 @@ struct Q4eGdnWriteback
     // and the T state snapshots (most recent first), else null.
     ggml_tensor* conv_in = nullptr;
     ggml_tensor* snaps = nullptr;
+    // Set when the builder ran the recurrence on TensorSharp's Metal kernels (a token span building with device
+    // operations, tsm::gdn_prompt_encode): the [value_dim, T] tensor they write. tail and new_state stay null then, as
+    // the kernels update the state in place.
+    ggml_tensor* device_y = nullptr;
 };
 // ReplaySSM-style verify commit: while set, a 2-8 row span keeps every row's
 // recurrent state (GDN conv + SSM, PLE conv history) so the accepted prefix can

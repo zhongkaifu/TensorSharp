@@ -3479,6 +3479,22 @@ namespace TensorSharp.GGML
             catch (EntryPointNotFoundException) { return 0; }
         }
 
+        /// <summary>Test hook: the prompt-width GDN layers that ran on TensorSharp's Metal kernels
+        /// (tsm::gdn_prompt_encode) in this process. 0 off Apple's Metal builds.</summary>
+        public static long TsmGdnPromptCount()
+        {
+            try { return GgmlNative.TSGgml_TsmGdnPromptCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Test hook: the prompt-width hyper-connection passes (mix, scatter) that ran on TensorSharp's Metal
+        /// kernels (tsm::hc_mix_encode, tsm::hc_scatter_encode) in this process. 0 off Apple's Metal builds.</summary>
+        public static long TsmHcPromptCount()
+        {
+            try { return GgmlNative.TSGgml_TsmHcPromptCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         /// <summary>Fixed-size rows of a mapping registered for explicit reads (HostExpertIoRegister), one pread each,
         /// packed into <paramref name="dst"/> in list order. False (nothing read) when a row is outside every registered
         /// mapping; the caller then reads the mapping.</summary>

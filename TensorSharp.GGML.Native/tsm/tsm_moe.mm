@@ -63,6 +63,9 @@ namespace
         std::uint64_t event_value = 0;     // the last value a pass used
         std::size_t xp_bytes = 0, h_bytes = 0, ye_bytes = 0;
         std::vector<int> plan_host;
+        // gdn_prompt_encode's scratch: normalized q / k, conv'd v, gate+beta, k.q, the scan's output, the staged tail
+        id<MTLBuffer> gqn = nil, gkn = nil, gvc = nil, ggb = nil, gkq = nil, go = nil, ghist = nil;
+        std::size_t gqn_bytes = 0, gkn_bytes = 0, gvc_bytes = 0, ggb_bytes = 0, gkq_bytes = 0, go_bytes = 0, ghist_bytes = 0;
     };
     State& state() { static State s; return s; }
 
@@ -99,6 +102,8 @@ namespace
         s.event = nil;
         s.event_value = 0;
         s.xp_bytes = s.h_bytes = s.ye_bytes = 0;
+        s.gqn = s.gkn = s.gvc = s.ggb = s.gkq = s.go = s.ghist = nil;
+        s.gqn_bytes = s.gkn_bytes = s.gvc_bytes = s.ggb_bytes = s.gkq_bytes = s.go_bytes = s.ghist_bytes = 0;
         MTLCompileOptions* options = [MTLCompileOptions new];
         // Safe math, as Strata compiles them: no reassociation, so a row's sums do not depend on the window around it.
         if (@available(macOS 15.0, iOS 18.0, *)) options.mathMode = MTLMathModeSafe;
@@ -757,6 +762,195 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
         p.cbs.clear();
         p.event = nil;
     }
+
+    // ---- prompt GDN (tsm_moe.h GdnPromptIO)
+    namespace
+    {
+        struct TsmGdnArgs { std::uint32_t n_tok, h_k, h_v, channels; float eps; std::uint32_t pad; };
+        static_assert(sizeof(TsmGdnArgs) == 24, "TsmGdnArgs must match tsm_gdn_prompt.metal");
+        std::atomic<long long> g_gdn_prompt_count{0};
+    }
+
+    bool gdn_prompt_supported(ggml_backend* backend, int head_k_dim, int head_v_dim, int h_k, int h_v, int d_conv)
+    {
+        const char* e = std::getenv("TS_METAL_GDN_PROMPT");
+        if (e && e[0] == '0') return false;
+        return metal_device(backend) != nullptr && head_k_dim == 128 && head_v_dim == 128 && d_conv == 4
+            && h_k > 0 && h_v > 0 && h_v % 2 == 0 && h_v % h_k == 0;
+    }
+
+    bool gdn_prompt_encode(ggml_backend* backend, const GdnPromptIO& io)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm gdn: not a Metal backend");
+            if (io.T <= 0 || io.channels != 2 * io.h_k * 128 + io.h_v * 128)
+                throw std::runtime_error("tsm gdn: shapes do not match the kernels");
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                ensure_library(s, device);
+                const std::size_t T = static_cast<std::size_t>(io.T);
+                s.gqn = grow(s, s.gqn, s.gqn_bytes, T * io.h_k * 128 * sizeof(float));
+                s.gkn = grow(s, s.gkn, s.gkn_bytes, T * io.h_k * 128 * sizeof(float));
+                s.gvc = grow(s, s.gvc, s.gvc_bytes, T * io.h_v * 128 * sizeof(float));
+                s.ggb = grow(s, s.ggb, s.ggb_bytes, T * io.h_v * 2 * sizeof(float));
+                s.gkq = grow(s, s.gkq, s.gkq_bytes, T * io.h_k * sizeof(float));
+                s.go = grow(s, s.go, s.go_bytes, T * io.h_v * 128 * sizeof(float));
+                s.ghist = grow(s, s.ghist, s.ghist_bytes, static_cast<std::size_t>(io.channels) * 3 * sizeof(float));
+                const TsmGdnArgs args{static_cast<std::uint32_t>(io.T), static_cast<std::uint32_t>(io.h_k),
+                    static_cast<std::uint32_t>(io.h_v), static_cast<std::uint32_t>(io.channels), io.eps, 0};
+                const ggml_metal_buffer_id qkv = tensor_id(io.qkv), z = tensor_id(io.z), al = tensor_id(io.alpha),
+                    be = tensor_id(io.beta), cw = tensor_id(io.conv_w), dt = tensor_id(io.dt), sa = tensor_id(io.a),
+                    nw = tensor_id(io.norm_w), hist = tensor_id(io.conv_state), st = tensor_id(io.ssm_state),
+                    y = tensor_id(io.y);
+
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];   // serial: each pass sees the last
+                [enc setComputePipelineState:pipeline(s, "tsm_gdn_pre")];
+                bind(enc, qkv, 0, 0); bind(enc, hist, 0, 1); bind(enc, cw, 0, 2); bind(enc, al, 0, 3); bind(enc, be, 0, 4);
+                bind(enc, dt, 0, 5); bind(enc, sa, 0, 6);
+                [enc setBuffer:s.gqn offset:0 atIndex:7]; [enc setBuffer:s.gkn offset:0 atIndex:8];
+                [enc setBuffer:s.gvc offset:0 atIndex:9]; [enc setBuffer:s.ggb offset:0 atIndex:10];
+                [enc setBuffer:s.gkq offset:0 atIndex:11]; [enc setBuffer:s.ghist offset:0 atIndex:12];
+                [enc setBytes:&args length:sizeof(args) atIndex:13];
+                [enc dispatchThreadgroups:MTLSizeMake(io.h_k + io.h_v / 2, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+                [enc setComputePipelineState:pipeline(s, "tsm_gdn_hist_store")];
+                [enc setBuffer:s.ghist offset:0 atIndex:0]; bind(enc, hist, 0, 1);
+                [enc setBytes:&args length:sizeof(args) atIndex:2];
+                const NSUInteger hist_n = static_cast<NSUInteger>(io.channels) * 3;
+                [enc dispatchThreadgroups:MTLSizeMake((hist_n + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+                [enc setComputePipelineState:pipeline(s, "tsm_gdn_scan")];
+                bind(enc, st, 0, 0);
+                [enc setBuffer:s.gqn offset:0 atIndex:1]; [enc setBuffer:s.gkn offset:0 atIndex:2];
+                [enc setBuffer:s.gvc offset:0 atIndex:3]; [enc setBuffer:s.ggb offset:0 atIndex:4];
+                [enc setBuffer:s.gkq offset:0 atIndex:5]; [enc setBuffer:s.go offset:0 atIndex:6];
+                [enc setBytes:&args length:sizeof(args) atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(io.h_v) * 4, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                [enc setComputePipelineState:pipeline(s, "tsm_gdn_post")];
+                [enc setBuffer:s.go offset:0 atIndex:0]; bind(enc, z, 0, 1); bind(enc, nw, 0, 2); bind(enc, y, 0, 3);
+                [enc setBytes:&args length:sizeof(args) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(io.h_v, T, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                s.last = cb;
+            }
+            g_gdn_prompt_count.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true))
+                std::fprintf(stderr, "[tsm] prompt GDN layers run on TensorSharp's kernels (Strata's gdn_prompt: pre, scan, "
+                    "post; TS_METAL_GDN_PROMPT=0 keeps ggml's ops)\n");
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
+
+    long long gdn_prompt_count() { return g_gdn_prompt_count.load(std::memory_order_relaxed); }
+
+    // ---- prompt hyper-connection passes (tsm_moe.h hc_*)
+    namespace
+    {
+        struct TsmHcArgs { std::uint32_t n_tok, n_embd, hc, pad; };
+        static_assert(sizeof(TsmHcArgs) == 16, "TsmHcArgs must match tsm_hc_prompt.metal");
+        std::atomic<long long> g_hc_prompt_count{0};
+
+        void require_f32(const ggml_tensor* t, std::int64_t elems, const char* what)
+        {
+            if (t == nullptr || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || ggml_nelements(t) != elems)
+                throw std::runtime_error(std::string("tsm hc: ") + what + " is not a contiguous F32 tensor of the shape");
+        }
+
+        // One dispatch of `name` over (ceil(n / 256), T) threadgroups of 256, on ggml-metal's queue.
+        bool hc_encode(ggml_backend* backend, const char* name, std::initializer_list<const ggml_tensor*> tensors,
+                       const TsmHcArgs& args)
+        {
+            try
+            {
+                ggml_metal_device_t dev = metal_device(backend);
+                if (dev == nullptr) throw std::runtime_error("tsm hc: not a Metal backend");
+                std::vector<ggml_metal_buffer_id> ids;
+                for (const ggml_tensor* t : tensors) ids.push_back(tensor_id(t));
+                State& s = state();
+                std::lock_guard<std::mutex> lock(s.mu);
+                @autoreleasepool
+                {
+                    id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                    ensure_library(s, device);
+                    id<MTLCommandBuffer> cb = [queue commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    [enc setComputePipelineState:pipeline(s, name)];
+                    int index = 0;
+                    for (const ggml_metal_buffer_id& bid : ids) bind(enc, bid, 0, index++);
+                    [enc setBytes:&args length:sizeof(args) atIndex:index];
+                    [enc dispatchThreadgroups:MTLSizeMake((args.n_embd + 255) / 256, args.n_tok, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                    [cb commit];
+                    s.last = cb;
+                }
+                g_hc_prompt_count.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<bool> reported{false};
+                if (!reported.exchange(true))
+                    std::fprintf(stderr, "[tsm] prompt hyper-connection passes run on TensorSharp's kernels (mix, scatter; "
+                        "TS_METAL_HC_PROMPT=0 keeps ggml's ops)\n");
+                return true;
+            }
+            catch (const std::exception& e)
+            {
+                tsg::set_last_error(e.what());
+                return false;
+            }
+        }
+    }
+
+    bool hc_prompt_supported(ggml_backend* backend)
+    {
+        const char* e = std::getenv("TS_METAL_HC_PROMPT");
+        if (e && e[0] == '0') return false;
+        return metal_device(backend) != nullptr;
+    }
+
+    bool hc_mix_encode(ggml_backend* backend, const ggml_tensor* xn, const ggml_tensor* G, ggml_tensor* mixed,
+                       int n_embd, int hc, int T)
+    {
+        try
+        {
+            const std::int64_t n = n_embd, wide = static_cast<std::int64_t>(hc) * n_embd * T;
+            require_f32(xn, wide, "xn"); require_f32(G, wide, "G"); require_f32(mixed, n * T, "mixed");
+        }
+        catch (const std::exception& e) { tsg::set_last_error(e.what()); return false; }
+        const TsmHcArgs args{static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(n_embd), static_cast<std::uint32_t>(hc), 0};
+        return hc_encode(backend, "tsm_hc_mix", {xn, G, mixed}, args);
+    }
+
+    bool hc_scatter_encode(ggml_backend* backend, const ggml_tensor* res, const ggml_tensor* b, const ggml_tensor* inject,
+                           ggml_tensor* out, int n_embd, int hc, int T)
+    {
+        try
+        {
+            const std::int64_t n = n_embd, wide = static_cast<std::int64_t>(hc) * n_embd * T;
+            require_f32(res, wide, "res"); require_f32(b, n * T, "b");
+            require_f32(inject, static_cast<std::int64_t>(hc) * T, "inject"); require_f32(out, wide, "out");
+        }
+        catch (const std::exception& e) { tsg::set_last_error(e.what()); return false; }
+        const TsmHcArgs args{static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(n_embd), static_cast<std::uint32_t>(hc), 0};
+        return hc_encode(backend, "tsm_hc_scatter", {res, b, inject, out}, args);
+    }
+
+    long long hc_prompt_count() { return g_hc_prompt_count.load(std::memory_order_relaxed); }
 }
 
 // ---- test probe: one layer's held routes through moe_encode, on expert bytes the caller gives (stacked [expert]
@@ -834,3 +1028,16 @@ TSG_EXPORT long long TSGgml_TsmSeamPasses()
 {
     return tsm::seams_pass_count();
 }
+
+// ---- test hook: prompt GDN layers that ran on the tsm kernels in this process.
+TSG_EXPORT long long TSGgml_TsmGdnPromptCount()
+{
+    return tsm::gdn_prompt_count();
+}
+
+// ---- test hook: prompt hyper-connection passes that ran on the tsm kernels in this process.
+TSG_EXPORT long long TSGgml_TsmHcPromptCount()
+{
+    return tsm::hc_prompt_count();
+}
+

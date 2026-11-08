@@ -239,6 +239,40 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
                 $"step {i}: the event seams changed the logits ({(hostHalf ? "half the experts on the host" : "every route held")})");
     }
 
+    /// <summary>A prompt-width span runs its GDN layers' recurrence (conv, L2 norms, gates, the state scan, the gated
+    /// norm) and its hyper-connection passes (the gated stream mean after the up projection, the scatter) on
+    /// TensorSharp's Metal kernels (tsm/kernels/tsm_gdn_prompt.metal after Strata's gdn_prompt, tsm_hc_prompt.metal)
+    /// between graph segments, instead of ggml's ops. The decode steps run ggml's gated delta net on the state the
+    /// kernels left, so they also prove the conv history and the state are written in ggml's layout. Only the rounding
+    /// differs (this fixture amplifies it): measured on an M5 Pro, at most 6.4e-5 relative error with the GDN kernels,
+    /// every argmax equal. With every expert on the host the kernels share the pass with the host seams, whose Q8_K
+    /// activations amplify the difference to 3.0e-4. The counters prove the kernels ran.</summary>
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData("gdn", false)]
+    [InlineData("hc", false)]
+    [InlineData("gdn,hc", false)]
+    [InlineData("gdn,hc", true)]
+    public void PromptKernels_OnTsm_AnswerAsGgml_Metal(string kernels, bool hostExperts)
+    {
+        bool gdn = kernels.Contains("gdn"), hc = kernels.Contains("hc");
+        float[][] Answer(bool useGdn, bool useHc)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_METAL_GDN_PROMPT", useGdn ? "1" : "0");
+            env.Set("TS_METAL_HC_PROMPT", useHc ? "1" : "0");
+            return Run(BackendType.GgmlMetal, hostExperts ? MoeCpuOffloadConfig.SetAllLayers : () => { }, LongPrompt);
+        }
+        float[][] ggml = Answer(false, false);
+        long gdnBefore = GgmlBasicOps.TsmGdnPromptCount(), hcBefore = GgmlBasicOps.TsmHcPromptCount();
+        float[][] tsm = Answer(gdn, hc);
+        long gdnLayers = GgmlBasicOps.TsmGdnPromptCount() - gdnBefore, hcPasses = GgmlBasicOps.TsmHcPromptCount() - hcBefore;
+        _output.WriteLine($"tsm kernels: {gdnLayers} GDN layers, {hcPasses} hyper-connection passes");
+        // The fixture's 8 layers: 6 GDN, 16 half-layers with a read and a scatter each.
+        Assert.Equal(gdn ? 6 : 0, gdnLayers);
+        Assert.Equal(hc ? 32 : 0, hcPasses);
+        AssertClose($"tsm {kernels}", tsm, ggml, hostExperts ? 1e-3 : 2e-4);
+    }
+
     /// <summary>A prefill-width batch streams every expert an offloaded layer routes into its staging tensor. With a
     /// tier on unified memory, the experts the tier's fixed slots hold are copied from those slots instead of read
     /// from the file (ggml_ops_moe.cpp stage_experts_from_tier); the staged bytes are the same, so the prompt answers

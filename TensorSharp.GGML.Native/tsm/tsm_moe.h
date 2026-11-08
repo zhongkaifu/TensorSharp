@@ -69,4 +69,46 @@ namespace tsm
     void seams_end(bool failed);
     // Passes that ran to the end in this process (a test proves the path engaged).
     long long seams_pass_count();
+
+    // ---- A GDN layer's recurrence for a prompt chunk (tsm/kernels/tsm_gdn_prompt.metal, ported from Strata's
+    // gdn_prompt.metal): conv + SiLU + q/k L2 norms + gates, the state scan, the gated RMS norm - three dispatches in
+    // place of ggml's transpose, concat, ssm_conv, q/k/v copies, head repeat, gated delta net and norm. The span cuts
+    // its graph after the layer's input projections and encodes these on ggml-metal's queue between the two segments
+    // (hazard tracking orders them); the conv history and the recurrent state (ggml's layout) are updated in place.
+    // TS_METAL_GDN_PROMPT=0 keeps ggml's ops.
+    struct GdnPromptIO
+    {
+        const ggml_tensor* qkv = nullptr;      // [channels, T]: q | k | v
+        const ggml_tensor* z = nullptr;        // [h_v * 128, T]
+        const ggml_tensor* alpha = nullptr;    // [h_v, T]
+        const ggml_tensor* beta = nullptr;     // [h_v, T]
+        const ggml_tensor* conv_w = nullptr;   // [4, channels]
+        const ggml_tensor* dt = nullptr;       // [h_v]
+        const ggml_tensor* a = nullptr;        // [h_v]
+        const ggml_tensor* norm_w = nullptr;   // [128]
+        ggml_tensor* conv_state = nullptr;     // [3, channels], updated in place
+        ggml_tensor* ssm_state = nullptr;      // [128, 128, h_v], updated in place
+        ggml_tensor* y = nullptr;              // [h_v * 128, T], written
+        int T = 0, h_k = 0, h_v = 0, channels = 0;
+        float eps = 0.0f;
+    };
+    // Whether the kernels take this layer's shapes (128-wide heads, a 4-tap conv) on this backend.
+    bool gdn_prompt_supported(ggml_backend* backend, int head_k_dim, int head_v_dim, int h_k, int h_v, int d_conv);
+    // Encodes and commits (without waiting) the layer's three passes. False with set_last_error on a failure.
+    bool gdn_prompt_encode(ggml_backend* backend, const GdnPromptIO& io);
+    // Prompt chunks whose GDN layers ran on these kernels (a test proves the path engaged).
+    long long gdn_prompt_count();
+
+    // ---- A prompt chunk's hyper-connection element-wise passes (tsm/kernels/tsm_hc_prompt.metal, after Strata's
+    // gr_epi_up / gr_norm_h): one pass each in place of ggml's chains, encoded between graph segments like the GDN
+    // kernels. Tensors F32 and contiguous. TS_METAL_HC_PROMPT=0 keeps ggml's ops.
+    bool hc_prompt_supported(ggml_backend* backend);
+    // mixed [n, T] = (sum over the hc streams of xn * sigmoid(G)) / hc; xn and G [hc * n, T].
+    bool hc_mix_encode(ggml_backend* backend, const ggml_tensor* xn, const ggml_tensor* G, ggml_tensor* mixed,
+                       int n_embd, int hc, int T);
+    // out [hc * n, T] = res + b (x) 2 sigmoid(inject / hc); b [n, T], inject [hc, T]; out may be res.
+    bool hc_scatter_encode(ggml_backend* backend, const ggml_tensor* res, const ggml_tensor* b, const ggml_tensor* inject,
+                           ggml_tensor* out, int n_embd, int hc, int T);
+    // Hyper-connection passes that ran on these kernels (a test proves the path engaged).
+    long long hc_prompt_count();
 }
