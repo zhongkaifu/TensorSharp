@@ -66,6 +66,12 @@ namespace TensorSharp.Cuda
                 dev.Q = AllocF32(dev, nt, qd);
                 dev.Gate = AllocF32(dev, nt, qd);
                 dev.AttnO = AllocF32(dev, nt, qd);
+                if (dev.QK.HasAttentionSplit && AttnSplitsEnabled)
+                {
+                    dev.AttnPart = AllocF32(dev, (long)PerSlotMaxRows * m.NHead * MaxAttnSplits, Q4eKernels.AttnSplitPartFloats);
+                    dev.AttnArrive = AllocT(dev, DType.Int32, (long)PerSlotMaxRows * m.NHead);
+                    Zero(dev, dev.AttnArrive, 4);
+                }
             }
             if (anyQsa)
             {
@@ -102,6 +108,8 @@ namespace TensorSharp.Cuda
             {
                 dev.Logits = AllocF32(dev, 1, m.NVocab);
                 dev.BatchLogits = AllocF32(dev, MaxBatchedDecodeRows, m.NVocab);
+                dev.ArgIds = AllocT(dev, DType.Int32, VerifyMaxRows);
+                CudaDriverApi.cuMemHostAlloc(out _pinnedIds, new UIntPtr((ulong)VerifyMaxRows * 4), 0x1).ThrowOnError();
                 CudaDriverApi.cuMemHostAlloc(out _pinnedLogits,
                     new UIntPtr((ulong)MaxBatchedDecodeRows * (ulong)m.NVocab * 4), 0x1).ThrowOnError();
                 // Every row's streams of a ubatch (a speculative prompt chunk), a verify window or a batched step.
@@ -116,6 +124,19 @@ namespace TensorSharp.Cuda
                 CudaDriverApi.cuMemHostAlloc(out dev.BatchStatePinned, new UIntPtr((ulong)BatchStateTableBytes), 0x1).ThrowOnError();
             }
             CudaDriverApi.cuMemHostAlloc(out dev.BoundaryPinned, new UIntPtr((ulong)((long)nt * hcE * 4)), 0x1).ThrowOnError();
+            // A prompt read layer by layer (one GPU under expert residency, whose plan reserved the bytes).
+            if (_residency != null && _devs.Length == 1 && _expertStage != null && PromptGroupBytes() > 0)
+            {
+                if (!dev.DK.HasStageKeep)
+                    Console.Error.WriteLine("[q4e-cuda] prompts run in ubatch order: the loaded tensorsharp_dsv4_kernels module predates "
+                        + "ts_dsv4_moe_stage_copy_from (a committed PTX baseline not yet regenerated), so each ubatch stages its missed "
+                        + "experts again. Rebuild TensorSharp.Backends.Cuda with a CUDA 13 nvcc on PATH.");
+                else if (_expertStage.Capacity < m.NExpert)
+                    Console.Error.WriteLine($"[q4e-cuda] prompts run in ubatch order: a layer's staging holds {_expertStage.Capacity} "
+                        + $"experts, fewer than its {m.NExpert} (ubatch {m.NUbatch}), so it cannot be kept across a layer's ubatches.");
+                else
+                    _groupXs = AllocF32(dev, PromptGroupRows, hcE);
+            }
             CudaDriverApi.cuEventCreate(out dev.XsReadyEv, 0x02 /*DISABLE_TIMING*/).ThrowOnError();
             CudaDriverApi.cuEventCreate(out dev.CopyDoneEv, 0x02).ThrowOnError();
             if (_forkShexp)
@@ -323,6 +344,10 @@ namespace TensorSharp.Cuda
             {
                 slot.NPast++;
             }
+            else if (UsePromptGroups(tokens.Length))
+            {
+                ForwardGrouped(slot, tokens, logitsOut, hOut, allHidden);
+            }
             else
             {
                 int done = 0;
@@ -339,6 +364,8 @@ namespace TensorSharp.Cuda
             CheckHostExperts(tokens.Length <= _hostExpertRows ? tokens.Length : 0);
             if (tokens.Length <= _hostExpertRows)
                 AdaptResidency();
+            else
+                AdaptAfterPrompt(tokens.Length);
             slot.Failed = false;
             if (_perf > 0)
             {
@@ -392,6 +419,118 @@ namespace TensorSharp.Cuda
 
             if (logitsOut != null || hOut != null)
                 Head(nt, logitsOut, rows != null || allRows, hOut, hRowOffset);
+        }
+
+        // -------------------------------------------------------------------
+        // Prompts read layer by layer
+        // -------------------------------------------------------------------
+
+        /// <summary>
+        /// Rows of a prompt read layer by layer (TS_Q4E_PROMPT_GROUP, default 4096; 0 keeps ubatch order). Under expert
+        /// residency a prompt ubatch stages the experts it selects that have no VRAM slot over the bus, and the next ubatch
+        /// of the same layer stages most of them again: a 4K-token prompt in 512-row ubatches crossed each layer's cold
+        /// experts eight times. A group runs every layer over all its ubatches before the next layer, the layer's
+        /// staging kept between them (each expert crosses once per layer and group), at the price of the group's streams
+        /// [rows, hc * E] held in VRAM. Each ubatch computes exactly what it computes in ubatch order: the same kernels
+        /// over the same rows, the attention and recurrent caches filled in position order layer by layer.
+        /// Strata reads a prompt in 8192-token chunks for the same reason (src/prefill/prefill.cpp).
+        /// </summary>
+        private readonly int _promptGroupEnv = Math.Max(0, EnvInt("TS_Q4E_PROMPT_GROUP", 4096));
+        private Tensor _groupXs;
+        // Inside a grouped prompt: the routed experts stage (never the host's doorbell) and keep their staging per layer.
+        private bool _groupedPrompt;
+
+        /// <summary>Rows per group: whole ubatches, so the ubatches are the ones ubatch order runs.</summary>
+        private int PromptGroupRows => _promptGroupEnv / _m.NUbatch * _m.NUbatch;
+
+        /// <summary>The group's stream bytes residency plans around (one GPU only).</summary>
+        private long PromptGroupBytes() => PromptGroupRows > _m.NUbatch ? (long)PromptGroupRows * HcDim * 4 : 0;
+
+        /// <summary>Prompt groups read layer by layer so far (a test proves the path engaged).</summary>
+        internal long PromptGroupsRun { get; private set; }
+
+        private bool UsePromptGroups(int rows)
+            => _groupXs != null && rows > _m.NUbatch && _devs.Length == 1;
+
+        private void ForwardGrouped(Slot slot, int[] tokens, float[] logitsOut, float[] hOut, bool allHidden)
+        {
+            int done = 0, n = tokens.Length, cap = PromptGroupRows;
+            while (done < n)
+            {
+                int g = Math.Min(cap, n - done);
+                bool last = done + g == n;
+                ForwardGroup(slot, tokens, done, g, slot.NPast, last ? logitsOut : null,
+                    allHidden || last ? hOut : null, allHidden ? done : -1);
+                slot.NPast += g;
+                done += g;
+            }
+        }
+
+        /// <param name="hRowOffset">The row of <paramref name="hOut"/> the group's first row goes to; -1 writes only the
+        /// last row, to the start.</param>
+        private void ForwardGroup(Slot slot, int[] tokens, int tokOff, int g, int p0, float[] logitsOut, float[] hOut, int hRowOffset)
+        {
+            var m = _m;
+            var dev = _devs[0];
+            int ub = m.NUbatch, hc = HcDim;
+            dev.MakeCurrent();
+            Tensor ubatchXs = dev.Xs;
+            _groupedPrompt = true;
+            try
+            {
+                // Every row's streams start as its token's embedding.
+                for (int r0 = 0; r0 < g; r0 += ub)
+                {
+                    int nt = Math.Min(ub, g - r0);
+                    // The pinned tokens are rewritten per ubatch: the previous upload must have run.
+                    CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+                    Marshal.Copy(tokens, tokOff + r0, _pinnedTokens, nt);
+                    CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev.Tokens), _pinnedTokens, new UIntPtr((ulong)nt * 4), dev.Stream).ThrowOnError();
+                    StageBegin(dev);
+                    using (Tensor xs = Block(_groupXs, r0, nt, hc))
+                        dev.DK.Embed(_tokEmbd.Ptr, dev.Tokens, xs, _tokEmbd.Type, _tokEmbd.RowBytes, nt, m.NEmbd, dev.Stream);
+                    StageEnd(dev, StEmbed);
+                }
+                for (int il = 0; il < m.NLayer; il++)
+                {
+                    var L = _layers[il];
+                    for (int r0 = 0; r0 < g; r0 += ub)
+                    {
+                        int nt = Math.Min(ub, g - r0);
+                        using Tensor xs = Block(_groupXs, r0, nt, hc);
+                        dev.Xs = xs;
+                        // The PLE rows of a ubatch are gathered when its PLE block runs (the histories take its tokens
+                        // then, in position order as before).
+                        if (L.Ple)
+                            GatherPleRows(slot, tokens, tokOff + r0, nt, p0 + r0, null, null);
+                        // No fused scatter into the next layer's mixer: the next call is the next ubatch of this layer.
+                        RunLayer(dev, il, slot, nt, p0 + r0, null, null, IntPtr.Zero);
+                    }
+                    // The layer's ubatches shared one staging.
+                    CudaMoe.Unstage(dev.DK, _expertStage, L.Stage, dev.Stream);
+                }
+                if (hOut != null && hRowOffset >= 0 && hOut.LongLength >= ((long)hRowOffset + g) * hc)
+                {
+                    CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+                    fixed (float* dst = hOut)
+                        CudaDriverApi.cuMemcpyDtoH((IntPtr)(dst + (long)hRowOffset * hc), Ptr(_groupXs),
+                            new UIntPtr((ulong)g * (ulong)hc * 4)).ThrowOnError();
+                    hOut = null;
+                }
+                PromptGroupsRun++;
+                int lastNt = g - (g - 1) / ub * ub;
+                if (logitsOut != null || hOut != null)
+                    using (Tensor xs = Block(_groupXs, g - lastNt, lastNt, hc))
+                    {
+                        dev.Xs = xs;
+                        Head(lastNt, logitsOut, false, hOut, -1);
+                    }
+            }
+            finally
+            {
+                dev.Xs = ubatchXs;
+                _groupedPrompt = false;
+            }
         }
 
         /// <summary>One layer: the PLE block where it sits, then both mixed halves. <paramref name="pos"/>
@@ -599,9 +738,15 @@ namespace TensorSharp.Cuda
             }
             StageEnd(dev, StAttnPrep);
 
-            dev.QK.Attention(At(dev.Q, (long)row0 * qd), Ptr(c.KCache), Ptr(c.VCache), At(dev.Gate, (long)row0 * qd),
-                cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
-                CellStride, nt, dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
+            int splits = AttnSplits(dev, il, nt, p0);
+            if (splits > 0)
+                dev.QK.AttentionSplit(At(dev.Q, (long)row0 * qd), Ptr(c.KCache), Ptr(c.VCache), At(dev.Gate, (long)row0 * qd),
+                    cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
+                    CellStride, nt, splits, Ptr(dev.AttnPart), Ptr(dev.AttnArrive), dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
+            else
+                dev.QK.Attention(At(dev.Q, (long)row0 * qd), Ptr(c.KCache), Ptr(c.VCache), At(dev.Gate, (long)row0 * qd),
+                    cells, cellCnt, At(dev.AttnO, (long)row0 * qd), pos, p0, m.NHead, m.NKvHead, m.AttnScale,
+                    CellStride, nt, dev.Stream, PtrOrZero(c.KScale), PtrOrZero(c.VScale));
             StageEnd(dev, StAttnCore);
 
             if (row0 + nt == RowsInFlight(nt))
@@ -609,6 +754,25 @@ namespace TensorSharp.Cuda
                 MatMulQ(dev, L.Wo, dev.AttnO, dev.BlockOut, row0 + nt);
                 StageEnd(dev, StAttnOut);
             }
+        }
+
+        // TS_Q4E_ATTN_SPLITS: blocks a decode-size row's attention cells split over (flash decoding; 1 or 0 keeps one
+        // block per head and row). A trunk layer's split count is fixed (a captured step's grid cannot change with the
+        // position); the MTP block, never captured, sizes it from its context.
+        private readonly int _attnSplits = Math.Clamp(EnvInt("TS_Q4E_ATTN_SPLITS", 16), 0, MaxAttnSplits);
+        private const int MaxAttnSplits = 32;
+        private bool AttnSplitsEnabled => _attnSplits > 1;
+
+        /// <summary>Blocks a decode-size attention call splits its rows' cells over, or 0 for the one-block kernel.</summary>
+        private int AttnSplits(Dev dev, int il, int nt, int p0)
+        {
+            if (dev.AttnPart == null || nt > PerSlotMaxRows)
+                return 0;
+            if (il >= 0)
+                return _attnSplits;
+            // The MTP block's dense rows: about 128 cells a block.
+            int cellsMax = p0 + nt;
+            return Math.Clamp((cellsMax + 127) / 128, 1, MaxAttnSplits);
         }
 
         // The rows of the step in flight: a batched decode step sets it before its layers run.
@@ -702,9 +866,12 @@ namespace TensorSharp.Cuda
                 RouterProbe?.Invoke(CaptureRouter(dev, il, probeP0, nt));
             StageEnd(dev, StRouter);
             bool host = HostExpertsFor(L, nt);
+            // A prompt's selections teach adaptive residency what its answer will route (AdaptAfterPrompt).
+            if (!host && il >= 0 && nt > _hostExpertRows && _promptCountsDev != IntPtr.Zero && L.Stage.IsValid)
+                dev.QK.CountSelected(Ptr(dev.Moe.Sel), nt * m.NExpertUsed, (IntPtr)((long)_promptCountsDev + 4L * il * m.NExpert), dev.Stream);
             if (host)
                 dev.DK.MoeDoorbellPublish(dev.Cur, dev.Moe.Sel, dev.Moe.SelW, L.Stage.IsHost, nt * e, nt * m.NExpertUsed, il,
-                    _hostBox, dev.Stream, _doorbellMiss, _adaptCountsDev, m.NExpert);
+                    _hostBox, dev.Stream, _doorbellMiss, _adaptCountsDev, m.NExpert, m.NExpertUsed, _tailRank);
 
             if (!fork)
             {
@@ -715,7 +882,7 @@ namespace TensorSharp.Cuda
             CudaMoe.Experts(dev.DK, dev.Alloc.Kernels, dev.Moe, L.GateExps, L.UpExps, L.DownExps,
                 dev.Cur, dev.ShDown, dev.BlockOut, nt, m.NExpertUsed, m.NExpert, e, m.NFfExp, 0f,
                 PerSlotMaxRows, dev.Stream, stage: host ? null : _expertStage, stageLayer: L.Stage,
-                shDownReady: fork ? dev.ShJoinEv : IntPtr.Zero);
+                shDownReady: fork ? dev.ShJoinEv : IntPtr.Zero, keepStaged: _groupedPrompt);
             if (host)
             {
                 // The GPU's own experts end here; what follows is the wait for the CPU's share.
@@ -766,7 +933,8 @@ namespace TensorSharp.Cuda
         public int HiddenWidth => HcDim;
 
         /// <summary>The head's kernels and the copies of its results into pinned memory.</summary>
-        private void IssueHead(int nt, bool logits, bool allRows, bool hidden)
+        /// <param name="greedy">Each row's first-max token goes to pinned memory instead of its logits (a greedy verify).</param>
+        private void IssueHead(int nt, bool logits, bool allRows, bool hidden, bool greedy = false)
         {
             var m = _m;
             var dev = _devs[_lastDev];
@@ -785,18 +953,27 @@ namespace TensorSharp.Cuda
                 using (Tensor headIn = headRows == normRows ? dev.Cur.CopyRef() : Block(dev.Cur, nt - 1, 1, m.NEmbd))
                     MatMulQ(dev, _output, headIn, output, headRows);
                 StageEnd(dev, StHead);
-                CudaDriverApi.cuMemcpyDtoHAsync(_pinnedLogits, Ptr(output), new UIntPtr((ulong)count * 4), dev.Stream).ThrowOnError();
+                if (greedy)
+                {
+                    dev.QK.ArgmaxRows(Ptr(output), Ptr(dev.ArgIds), headRows, m.NVocab, dev.Stream);
+                    CudaDriverApi.cuMemcpyDtoHAsync(_pinnedIds, Ptr(dev.ArgIds), new UIntPtr((ulong)headRows * 4), dev.Stream).ThrowOnError();
+                }
+                else
+                    CudaDriverApi.cuMemcpyDtoHAsync(_pinnedLogits, Ptr(output), new UIntPtr((ulong)count * 4), dev.Stream).ThrowOnError();
             }
         }
 
         /// <summary>Wait for the head and copy its results out of pinned memory.</summary>
-        private void FinishHead(int nt, float[] logitsOut, bool allRows, float[] hOut, int hRowOffset = 0)
+        /// <param name="idsOut">A greedy verify's rows' tokens (the head ran with greedy), else null.</param>
+        private void FinishHead(int nt, float[] logitsOut, bool allRows, float[] hOut, int hRowOffset = 0, int[] idsOut = null)
         {
             var m = _m;
             var dev = _devs[_lastDev];
             dev.MakeCurrent();
             long count = (long)(allRows ? nt : 1) * m.NVocab;
             CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+            if (idsOut != null)
+                Marshal.Copy(_pinnedIds, idsOut, 0, nt);
             if (logitsOut != null)
                 fixed (float* dst = logitsOut)
                     Buffer.MemoryCopy((void*)_pinnedLogits, dst, logitsOut.LongLength * 4L, count * 4L);

@@ -49,6 +49,8 @@ namespace TensorSharp.Cuda
         public const int HcSlice = 256, HcPartialFloats = 1 + MaxStreams;
         private readonly IntPtr gdnPrep, convUpdate;
         private readonly IntPtr attnPrep, attention, attnPrepQ8, attentionQ8;
+        // Decode-size attention split over the cells (optional: a module before it runs a block per head and row).
+        private readonly IntPtr attentionSplit, attentionSplitQ8;
 
         /// <summary>Whether the module stores and reads a Q8_0 KV cache (<c>--kv-cache-dtype q8_0</c>): int8 codes
         /// [nCtx, NKV, HD] beside F16 scales [nCtx, NKV, HD / 32].</summary>
@@ -59,6 +61,12 @@ namespace TensorSharp.Cuda
         private readonly IntPtr qsaStore, qsaPool, qsaQuery, qsaScores, qsaSelect;
         private readonly IntPtr pleGate, groupNorm, pleConv;
         private readonly IntPtr sharedGate, setStreamRows;
+        // Each row's first-max token on the device (optional: a module before it returns logits to the host).
+        private readonly IntPtr argmaxRows;
+        // A prompt's expert selections into adaptive residency's counts (optional).
+        private readonly IntPtr countSelected;
+        // The MTP draft chain's per-step pick on the device (optional).
+        private readonly IntPtr draftPick;
 
         private Q4eKernels(CudaModule module)
         {
@@ -80,6 +88,8 @@ namespace TensorSharp.Cuda
             attention = module.GetFunction("ts_q4e_attention_f32");
             try { attnPrepQ8 = module.GetFunction("ts_q4e_attn_prep_q8_f32"); attentionQ8 = module.GetFunction("ts_q4e_attention_q8_f32"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { attnPrepQ8 = attentionQ8 = IntPtr.Zero; }
+            try { attentionSplit = module.GetFunction("ts_q4e_attention_split_f32"); attentionSplitQ8 = module.GetFunction("ts_q4e_attention_split_q8_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { attentionSplit = attentionSplitQ8 = IntPtr.Zero; }
             qsaStore = module.GetFunction("ts_q4e_qsa_store_f32");
             qsaPool = module.GetFunction("ts_q4e_qsa_pool_f32");
             qsaQuery = module.GetFunction("ts_q4e_qsa_query_f32");
@@ -90,6 +100,12 @@ namespace TensorSharp.Cuda
             pleConv = module.GetFunction("ts_q4e_ple_conv_f32");
             sharedGate = module.GetFunction("ts_q4e_shared_gate_f32");
             setStreamRows = module.GetFunction("ts_q4e_set_stream_rows_f32");
+            try { argmaxRows = module.GetFunction("ts_q4e_argmax_rows_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { argmaxRows = IntPtr.Zero; }
+            try { countSelected = module.GetFunction("ts_q4e_count_selected"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { countSelected = IntPtr.Zero; }
+            try { draftPick = module.GetFunction("ts_q4e_draft_pick_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { draftPick = IntPtr.Zero; }
         }
 
         public static Q4eKernels Create()
@@ -266,6 +282,39 @@ namespace TensorSharp.Cuda
             Launch(attention, (uint)nHead, (uint)rows, 1, BlockSize, stream, args);
         }
 
+        /// <summary>Whether <see cref="AttentionSplit"/> is available.</summary>
+        public bool HasAttentionSplit => attentionSplit != IntPtr.Zero && attentionSplitQ8 != IntPtr.Zero;
+
+        /// <summary>Floats of one (row, head, split) partial of <see cref="AttentionSplit"/>: max, sum and the output.</summary>
+        public const int AttnSplitPartFloats = 2 + AttnHeadDim;
+
+        /// <summary>Cells up to which a row runs whole in one block (the kernel's Q4E_ATTN_SPLIT_MIN).</summary>
+        public const int AttnSplitMinCells = 256;
+
+        /// <summary>
+        /// <see cref="Attention"/> for decode-size calls, each row of more than <see cref="AttnSplitMinCells"/> cells split
+        /// over <paramref name="splits"/> blocks (flash decoding), merged by the last block to finish.
+        /// <paramref name="part"/> holds rows x heads x splits x <see cref="AttnSplitPartFloats"/> floats and
+        /// <paramref name="arrive"/> rows x heads ints, zero between calls (the kernel leaves them so).
+        /// </summary>
+        public void AttentionSplit(IntPtr q, IntPtr kCache, IntPtr vCache, IntPtr gate, IntPtr cells, IntPtr cellCnt, IntPtr output,
+            IntPtr positions, int p0, int nHead, int nKvHead, float scale, int cellStride, int rows, int splits, IntPtr part,
+            IntPtr arrive, IntPtr stream, IntPtr kScale = default, IntPtr vScale = default)
+        {
+            IntPtr a0 = q, a1 = kCache, a2 = vCache, a3 = gate, a4 = cells, a5 = cellCnt, a6 = output, a7 = positions;
+            int a8 = p0, a9 = nHead, a10 = nKvHead; float a11 = scale; int a12 = cellStride;
+            IntPtr a13 = part, a14 = arrive;
+            if (kScale != IntPtr.Zero)
+            {
+                IntPtr s0 = kScale, s1 = vScale;
+                void** q8 = stackalloc void*[] { &a0, &a1, &a2, &s0, &s1, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14 };
+                Launch(attentionSplitQ8, (uint)nHead, (uint)rows, (uint)splits, BlockSize, stream, q8);
+                return;
+            }
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14 };
+            Launch(attentionSplit, (uint)nHead, (uint)rows, (uint)splits, BlockSize, stream, args);
+        }
+
         private void RequireKvQ8()
         {
             if (!HasKvQ8)
@@ -373,6 +422,43 @@ namespace TensorSharp.Cuda
             int a2 = firstRow, a3 = e, a4 = hc;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
             Launch(setStreamRows, CeilDiv(e, BlockSize), (uint)nRows, 1, BlockSize, stream, args);
+        }
+
+        /// <summary>Whether <see cref="ArgmaxRows"/> is available.</summary>
+        public bool HasArgmaxRows => argmaxRows != IntPtr.Zero;
+
+        /// <summary>ids[r] = the first index of row r's largest logit (0 when it has no finite one).</summary>
+        public void ArgmaxRows(IntPtr logits, IntPtr ids, int rows, int vocab, IntPtr stream)
+        {
+            IntPtr a0 = logits, a1 = ids;
+            int a2 = vocab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2 };
+            Launch(argmaxRows, (uint)rows, 1, 1, 1024, stream, args);
+        }
+
+        /// <summary>Whether <see cref="CountSelected"/> is available.</summary>
+        public bool HasCountSelected => countSelected != IntPtr.Zero;
+
+        /// <summary>counts[sel[i]] += 1 for the <paramref name="n"/> selections (unsigned counts of one layer).</summary>
+        public void CountSelected(IntPtr sel, int n, IntPtr counts, IntPtr stream)
+        {
+            IntPtr a0 = sel, a2 = counts;
+            int a1 = n;
+            void** args = stackalloc void*[] { &a0, &a1, &a2 };
+            Launch(countSelected, CeilDiv(n, BlockSize), 1, 1, BlockSize, stream, args);
+        }
+
+        /// <summary>Whether <see cref="DraftPick"/> is available.</summary>
+        public bool HasDraftPick => draftPick != IntPtr.Zero;
+
+        /// <summary>A draft step's first-max token into ids[step] and nextToken[0], and its top-10 softmax confidence
+        /// into probs[step].</summary>
+        public void DraftPick(IntPtr logits, int vocab, IntPtr ids, IntPtr probs, int step, IntPtr nextToken, IntPtr stream)
+        {
+            IntPtr a0 = logits, a2 = ids, a3 = probs, a5 = nextToken;
+            int a1 = vocab, a4 = step;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5 };
+            Launch(draftPick, 1, 1, 1, 1024, stream, args);
         }
 
         public void Dispose() => module.Dispose();

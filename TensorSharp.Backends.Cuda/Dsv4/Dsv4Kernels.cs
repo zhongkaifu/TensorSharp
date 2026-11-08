@@ -51,7 +51,11 @@ namespace TensorSharp.Cuda
         private readonly IntPtr denseQ81Rows;
         private readonly IntPtr moeScatterAdd;
         private readonly IntPtr moeStagePlan, moeStageCopy, moeUnstage, doorbellPublish, doorbellWaitAdd;
+        // Staging that keeps earlier calls' experts (optional: a module before it re-stages per call).
+        private readonly IntPtr moeStageCopyFrom;
         private readonly IntPtr doorbellPublishSkip, doorbellWaitAddSkip, moeDownDecodeShort;
+        // The doorbell with the route-tail skip (optional).
+        private readonly IntPtr doorbellPublishTail;
         private readonly IntPtr denseBf16Rows, denseQ81RowsSplitK, denseBf16RowsSplitK;
         // The same products for 2..16 rows in one block, the weights read once (optional: a module before it launches a
         // block per row).
@@ -185,6 +189,8 @@ namespace TensorSharp.Cuda
                 moeStageCopy = module.GetFunction("ts_dsv4_moe_stage_copy");
                 moeUnstage = module.GetFunction("ts_dsv4_moe_unstage");
                 HasExpertTables = true;
+                try { moeStageCopyFrom = module.GetFunction("ts_dsv4_moe_stage_copy_from"); }
+                catch (CudaException ex) when (ex.ErrorCode == 500) { moeStageCopyFrom = IntPtr.Zero; }
             }
             catch (CudaException ex) when (ex.ErrorCode == 500) { }
             try
@@ -196,6 +202,8 @@ namespace TensorSharp.Cuda
                 {
                     doorbellPublishSkip = module.GetFunction("ts_moe_doorbell_publish_skip");
                     doorbellWaitAddSkip = module.GetFunction("ts_moe_doorbell_wait_add_skip");
+                    try { doorbellPublishTail = module.GetFunction("ts_moe_doorbell_publish_tail"); }
+                    catch (CudaException ex) when (ex.ErrorCode == 500) { doorbellPublishTail = IntPtr.Zero; }
                 }
                 catch (CudaException ex) when (ex.ErrorCode == 500)
                 {
@@ -237,6 +245,9 @@ namespace TensorSharp.Cuda
         /// <summary>Whether the module's expert kernels read per-expert address tables and it has the staging
         /// kernels (expert residency).</summary>
         public bool HasExpertTables { get; }
+
+        /// <summary>Whether staging can keep what earlier calls staged (<see cref="MoeStageCopyNew"/>).</summary>
+        public bool HasStageKeep => moeStageCopyFrom != IntPtr.Zero;
 
         /// <summary>Whether the module has the host experts' doorbell kernels.</summary>
         public bool HasHostExperts { get; }
@@ -768,6 +779,27 @@ namespace TensorSharp.Cuda
             Launch(moeStageCopy, (uint)(Math.Max(1, Math.Min(maxStaged, stage.Capacity)) * Chunks), 3, 1, BlockSize, 0, stream, args);
         }
 
+        /// <summary>
+        /// The plan's experts that a staging kept across calls does not hold yet: <see cref="CudaExpertStage.StageFrom"/>
+        /// takes the planned count first (stream-ordered), then the plan adds this call's new experts and
+        /// <see cref="MoeStageCopyNew"/> copies only those.
+        /// </summary>
+        public void MoeStageMarkFrom(CudaExpertStage stage, IntPtr stream)
+            => CudaDriverApi.cuMemcpyDtoDAsync(stage.StageFrom, stage.StageCount, new UIntPtr(4), stream).ThrowOnError();
+
+        /// <summary>Copies the experts planned since <see cref="MoeStageMarkFrom"/>.</summary>
+        public void MoeStageCopyNew(in CudaExpertStageLayer layer, CudaExpertStage stage, int maxNew, IntPtr stream)
+        {
+            const int Chunks = 16;
+            IntPtr a0 = stage.StageList, a1 = stage.StageCount, a2 = stage.StageFrom, a3 = layer.SrcTabGate, a4 = layer.SrcTabUp,
+                a5 = layer.SrcTabDown;
+            long a6 = layer.BytesGate, a7 = layer.BytesUp, a8 = layer.BytesDown;
+            IntPtr a9 = stage.Staging; long a10 = stage.Stride, a11 = layer.OffUp, a12 = layer.OffDown;
+            int a13 = stage.Capacity, a14 = Chunks;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14 };
+            Launch(moeStageCopyFrom, (uint)(Math.Max(1, Math.Min(maxNew, stage.Capacity)) * Chunks), 3, 1, BlockSize, 0, stream, args);
+        }
+
         /// <summary>Points the staged experts' table entries back at their resting addresses and clears the plan.</summary>
         public void MoeUnstage(in CudaExpertStageLayer layer, CudaExpertStage stage, IntPtr stream)
         {
@@ -790,12 +822,24 @@ namespace TensorSharp.Cuda
         /// host; <see cref="MoeDoorbellWaitAdd"/> then reads it. Zero rings for every layer.</param>
         /// <param name="counts">With <paramref name="missDev"/>: a device [layers, nExpert] table each selection is counted
         /// into (adaptive residency), or zero.</param>
+        /// <summary>Whether <see cref="MoeDoorbellPublish"/> takes a route-tail rank (with a miss word).</summary>
+        public bool HasDoorbellTail => doorbellPublishTail != IntPtr.Zero;
+
+        /// <param name="tailRank">With <see cref="HasDoorbellTail"/> and a miss word: host experts every row routes at this
+        /// rank or lower ring no doorbell (the route-tail skip); 0 rings for every host expert.</param>
         public void MoeDoorbellPublish(Tensor x, Tensor sel, Tensor selW, IntPtr isHost, int n, int slots, int layer,
-            CudaHostExpertMailbox box, IntPtr stream, IntPtr missDev = default, IntPtr counts = default, int nExpert = 0)
+            CudaHostExpertMailbox box, IntPtr stream, IntPtr missDev = default, IntPtr counts = default, int nExpert = 0,
+            int nUsed = 0, int tailRank = 0)
         {
             IntPtr a0 = P(x), a1 = P(sel), a2 = P(selW), a3 = isHost; int a4 = n, a5 = slots, a6 = layer;
             IntPtr a7 = box.XDev, a8 = box.IdsDev, a9 = box.WDev, a10 = box.HeaderDev, a11 = box.SeqDev, a12 = missDev, a13 = counts;
-            int a14 = nExpert;
+            int a14 = nExpert, a15 = nUsed, a16 = tailRank;
+            if (tailRank > 0 && nUsed > 0 && missDev != IntPtr.Zero && HasDoorbellTail)
+            {
+                void** tail = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16 };
+                Launch(doorbellPublishTail, 1, 1, 1, 1024, 0, stream, tail);
+                return;
+            }
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14 };
             Launch(missDev != IntPtr.Zero ? doorbellPublishSkip : doorbellPublish, 1, 1, 1, 1024, 0, stream, args);
         }

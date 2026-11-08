@@ -334,6 +334,10 @@ namespace TensorSharp.Runtime
             return (decodedSoFar, false);
         }
 
+        /// <summary>Whether <see cref="ApplyPenalties"/> can change logits (a draft head must then draft from the same
+        /// penalized distribution the verify draws from).</summary>
+        internal bool AdjustsDraftLogits => HasPenalties();
+
         private bool HasPenalties()
         {
             // RepetitionPenalty <= 0 means "disabled" to operators

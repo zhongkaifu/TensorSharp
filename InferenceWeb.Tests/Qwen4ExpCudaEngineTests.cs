@@ -36,6 +36,8 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         // native span (F16 KV) and to fixed placements bit for bit. The tests of those features turn them on.
         KvCacheDtypeConfig.Set(KvCacheDtype.F16);
         _env.Set("TS_MOE_TIER_ADAPT", "0");
+        // The route-tail skip (on by default) leaves rank-7+ misses out: these tests hold every route computed.
+        _env.Set("TS_MOE_ROUTE_TAIL_SKIP", "0");
     }
 
     public void Dispose()
@@ -603,6 +605,88 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A prompt read layer by layer (TS_Q4E_PROMPT_GROUP) runs each layer over all the group's ubatches before the
+    /// next layer, its missed experts staged once per layer: every ubatch computes what it computes in ubatch order,
+    /// so the prompt's logits and the decode steps after it answer bit for bit as ubatch order does. Twelve-row
+    /// ubatches of the 40-token prompt and groups of 24 rows: the groups end inside the prompt and on its last,
+    /// four-row ubatch (the decode kernels' size).
+    /// </summary>
+    [CudaFact]
+    public void APromptReadLayerByLayer_AnswersBitForBitAsUbatchOrder()
+    {
+        // Staging only: a four-row ubatch would otherwise leave its missed experts to the CPU in ubatch order.
+        _env.Set("TS_Q4E_HOST_EXPERTS", "0");
+        _env.Set("TS_Q4E_UBATCH", "12");
+        string path = Fixture(indexerTopK: 16, q2kxlExperts: true);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+
+        (float[][] Rows, long Groups) Answer(string group)
+        {
+            _env.Set("TS_Q4E_PROMPT_GROUP", group);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            return (Run(model), engine.PromptGroupsRun);
+        }
+        var ubatchOrder = Answer("0");
+        var grouped = Answer("24");
+        _output.WriteLine($"prompt groups read layer by layer: ubatch order {ubatchOrder.Groups}, grouped {grouped.Groups}");
+        Assert.Equal(0, ubatchOrder.Groups);
+        Assert.Equal(2, grouped.Groups);
+        for (int i = 0; i < grouped.Rows.Length; i++)
+            Assert.True(grouped.Rows[i].AsSpan().SequenceEqual(ubatchOrder.Rows[i]),
+                $"{(i == 0 ? "prefill" : $"decode {i}")}: reading the prompt layer by layer changed the logits");
+    }
+
+    /// <summary>
+    /// The route-tail skip (TS_MOE_ROUTE_TAIL_SKIP; Strata's STRATA_ROUTE_TAIL_SKIP): in decode steps and verify windows a
+    /// host expert every row routes at the given rank or lower is left out. The fixture routes 4 of 16 experts, so rank 2
+    /// leaves out misses at ranks 2-3: some slots are skipped and the answers move; a rank as wide as the selection skips
+    /// nothing and answers bit for bit as off; the prompt (staged) is untouched.
+    /// </summary>
+    [CudaFact]
+    public void TheRouteTailSkip_LeavesOutOnlyLowRankedMisses()
+    {
+        string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        (float[][] Rows, long Skipped, long Misses) Answer(string rank)
+        {
+            _env.Set("TS_MOE_ROUTE_TAIL_SKIP", rank);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            float[][] rows = Run(model);
+            return (rows, engine.TailSkipped, engine.HostExpertMisses);
+        }
+        var off = Answer("0");
+        var wide = Answer(Qwen4ExpSyntheticModelBuilder.ExpertsUsed.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var tail = Answer("2");
+        _output.WriteLine($"host experts computed: off {off.Misses}, rank 4 {wide.Misses}, rank 2 {tail.Misses} ({tail.Skipped} skipped)");
+        Assert.Equal(0, off.Skipped);
+        Assert.Equal(0, wide.Skipped);
+        // A layer whose misses are all in the tail rings no doorbell, so the host's count of skipped slots covers only the
+        // layers that rang; the computed misses fall either way.
+        Assert.True(tail.Misses < off.Misses, "the tail skip did not lower the host's share");
+        Assert.True(off.Rows[0].AsSpan().SequenceEqual(tail.Rows[0]), "the tail skip changed the prompt");
+        bool moved = false;
+        for (int i = 0; i < off.Rows.Length; i++)
+        {
+            Assert.True(off.Rows[i].AsSpan().SequenceEqual(wide.Rows[i]), $"{(i == 0 ? "prefill" : $"decode {i}")}: a rank as wide as the selection changed the logits");
+            Assert.All(tail.Rows[i], v => Assert.True(float.IsFinite(v)));
+            moved |= !off.Rows[i].AsSpan().SequenceEqual(tail.Rows[i]);
+        }
+        Assert.True(moved, "skipping routes left every decode step as it was");
+    }
+
     /// <summary>Host experts (Strata's doorbell): decode steps leave the experts without a VRAM slot to the
     /// CPU inside the captured step, prompts stage them. The CPU's dot products quantize activations as
     /// ggml's CPU kernels do, so the answer matches the all-resident engine closely rather than bit for bit.</summary>
@@ -785,6 +869,49 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         Assert.True(restoreErr <= 1e-5, $"after a restore the window's first token differs by {restoreErr:E2}");
     }
 
+    /// <summary>
+    /// Split attention (flash decoding, TS_Q4E_ATTN_SPLITS): a decode-size row of more than 256 cells spreads them over
+    /// blocks whose partials the last block merges. Past a 600-token prompt (dense rows of 601 cells and more) the
+    /// decode steps answer as the one-block kernel does within float reassociation, the prompt itself (prefill-size
+    /// rows) bit for bit, and a verify window's rows compute their own decode steps (as AVerifyWindow_... holds them):
+    /// the split depends on a row's cells alone.
+    /// </summary>
+    [CudaFact]
+    public void SplitAttention_AnswersAsOneBlockPerRow_AndVerifiesAsItsOwnDecode()
+    {
+        string path = Fixture(indexerTopK: 2048);
+        int[] prompt = Enumerable.Range(0, 600).Select(i => (i * 37 + 11) % 250).ToArray();
+        int[] window = { Steps[0], Steps[1], Steps[2], Steps[3] };
+        int vocab = Qwen4ExpSyntheticModelBuilder.Vocab;
+        (float[][] Rows, float[] Window) Answer(string splits)
+        {
+            _env.Set("TS_Q4E_ATTN_SPLITS", splits);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var rows = new float[window.Length + 1][];
+            rows[0] = (float[])model.ForwardRefill(prompt).Clone();
+            for (int i = 0; i < window.Length; i++)
+                rows[i + 1] = (float[])model.Forward(new[] { window[i] }).Clone();
+            model.ResetKVCache();
+            model.ForwardRefill(prompt);
+            var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+            var all = new float[window.Length * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(window, null, all, true);
+            return (rows, all);
+        }
+        var split = Answer("16");
+        var whole = Answer("1");
+        Assert.True(split.Rows[0].AsSpan().SequenceEqual(whole.Rows[0]), "the prompt's logits moved");
+        for (int i = 1; i < split.Rows.Length; i++)
+        {
+            double err = RelativeError(split.Rows[i], whole.Rows[i]);
+            _output.WriteLine($"decode {i}: split vs one block per row, relative error {err:E2}");
+            Assert.True(err <= 1e-4, $"decode {i}: split attention differs by {err:E2}");
+            double rowErr = RelativeError(split.Window.AsSpan((i - 1) * vocab, vocab).ToArray(), split.Rows[i]);
+            Assert.True(rowErr <= 1e-5, $"verify row {i - 1} differs from its own decode step by {rowErr:E2} under split attention");
+        }
+    }
+
     [GgmlFact(BackendType.GgmlCpu)]
     public void TheMtpFixture_DraftsOnTheNativeHead_Cpu() => NativeMtpSmoke(BackendType.GgmlCpu);
 
@@ -888,6 +1015,61 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             // Its join rows (tokens x streams) take the prompt-size matmul route instead of the decode kernels.
             Assert.True(le <= 1e-2 && se <= 1e-2, $"the fused call differs from catch-up + step: logits {le:E3}, streams {se:E3}");
         }
+    }
+
+    /// <summary>
+    /// The MTP draft chain (Q4eCudaEngine.MtpDraftChain): one call folds the catch-up rows with the first step and runs
+    /// the next steps on the device, each fed the previous step's first-max token and the head's own streams. It picks
+    /// the tokens the step-by-step calls pick (a host argmax over their logits) and reports the per-token gate's
+    /// confidence (top-1 over the 10 largest logits) as the host computes it.
+    /// </summary>
+    [CudaFact]
+    public void TheMtpDraftChain_PicksAsStepByStepCalls()
+    {
+        string path = Fixture(indexerTopK: 2048);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 2048);
+        const int Steps3 = 3;
+        (int[] Ids, float[] Probs) Run(bool chain)
+        {
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp);
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var head = (TensorSharp.Runtime.Speculative.IDraftHead)model;
+            Assert.True(head.SupportsDraftChain, "the direct engine offers no draft chain");
+            int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            var hidden = new float[Prompt.Length * feat];
+            spec.SpecForward(Prompt, hidden, new float[vocab], false);
+            var rows = new float[(Prompt.Length + 1) * feat];
+            Array.Copy(hidden, 0, rows, feat, Prompt.Length * feat);
+            var tokens = Prompt.Append(Steps[0]).ToArray();
+            var ids = new int[Steps3];
+            var probs = new float[Steps3];
+            if (chain)
+            {
+                Assert.Equal(Steps3, head.DraftChain(tokens, rows, 0, Steps3, ids, probs));
+                return (ids, probs);
+            }
+            var logits = new float[vocab];
+            var h = new float[feat];
+            var next = new float[feat];
+            head.DraftCatchUpAndStep(tokens, rows, 0, logits, h);
+            for (int i = 0; i < Steps3; i++)
+            {
+                ids[i] = TensorSharp.Runtime.Speculative.DraftHeadSpeculator.ArgmaxWithTopKConfidence(logits, vocab, out probs[i]);
+                if (i + 1 < Steps3)
+                {
+                    head.DraftStep(ids[i], h, tokens.Length + i, logits, next);
+                    (h, next) = (next, h);
+                }
+            }
+            return (ids, probs);
+        }
+        var stepwise = Run(chain: false);
+        var chained = Run(chain: true);
+        _output.WriteLine($"step by step: [{string.Join(",", stepwise.Ids)}] p [{string.Join(",", stepwise.Probs.Select(p => p.ToString("F5")))}]");
+        _output.WriteLine($"chained:      [{string.Join(",", chained.Ids)}] p [{string.Join(",", chained.Probs.Select(p => p.ToString("F5")))}]");
+        Assert.Equal(stepwise.Ids, chained.Ids);
+        for (int i = 0; i < Steps3; i++)
+            Assert.True(Math.Abs(stepwise.Probs[i] - chained.Probs[i]) <= 1e-4f, $"step {i}: confidence {chained.Probs[i]} vs {stepwise.Probs[i]}");
     }
 
     /// <summary>A decode step's hyper-connection scatter fused with the next mixer's first pass computes what the two

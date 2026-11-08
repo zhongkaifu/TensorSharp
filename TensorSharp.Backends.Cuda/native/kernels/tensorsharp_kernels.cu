@@ -26,6 +26,7 @@
 #define GGML_IQ4_XS 23
 #define GGML_MXFP4 39
 #define GGML_NVFP4 40
+#define GGML_Q2_0 42
 #define TS_QK8_1 32
 #define TS_Q80_F16_CHUNK 2048
 #define TS_Q80_BLOCK_BYTES 34
@@ -141,6 +142,7 @@ __device__ __forceinline__ int qrow_bytes(int type, int cols)
         case GGML_MXFP4: return (cols / 32) * 17;
         case GGML_NVFP4: return (cols / 64) * 36;
         case GGML_IQ4_XS: return (cols / 256) * 136;
+        case GGML_Q2_0: return (cols / 64) * 18;
         default: return 0;
     }
 }
@@ -519,8 +521,23 @@ __device__ __forceinline__ float qvalue_at(const uint8_t* row, int type, int col
         return dl * (float)ts_kvalues_iq4nl[nib];
     }
 
+    if (type == GGML_Q2_0)
+    {
+        // block_q2_0: d (half), qs[16] = 18 bytes for 64 weights. Weight j of the block sits in byte (j / 32) * 8 +
+        // (j % 32) / 4 at bit 2 * (j % 4), its code 0..3 meaning -1..2 (ggml's dequantize_row_q2_0).
+        const uint8_t* block = row + (col / 64) * 18;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        int j = col & 63;
+        uint8_t packed = block[2 + (j >> 5) * 8 + ((j & 31) >> 2)];
+        int q = (packed >> (2 * (j & 3))) & 3;
+        return d * (float)(q - 1);
+    }
+
     return 0.0f;
 }
+
+// Marker: ts_dequant_weight_f16 decodes Q2_0 (a module without it reads Q2_0 rows as zeros).
+extern "C" __global__ void ts_caps_q2_0_dequant() {}
 
 __device__ __forceinline__ void quantize_q8_1_block(const float* x, ts_block_q8_1* dst)
 {

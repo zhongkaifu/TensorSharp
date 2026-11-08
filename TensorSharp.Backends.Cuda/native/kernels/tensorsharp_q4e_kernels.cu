@@ -910,6 +910,196 @@ extern "C" __global__ void ts_q4e_attention_q8_f32(
         p0, NH, NKV, scale, cellStride);
 }
 
+// Decode-size attention split over the cells (flash decoding): grid (NH, nt, S). One block per (head, row) leaves
+// all but 24 x rows SMs idle and walks up to the QSA width's 2,051 cells (or a dense row's whole context) one
+// dependent load after another: 0.2 ms a layer at 4K context, 0.4 ms at 16K, for 4 rows. A row of more than
+// Q4E_ATTN_SPLIT_MIN cells instead gives each of the S blocks a contiguous share of them; each block writes its
+// (max, sum, unnormalized output) partial, and the block that arrives last merges the partials in split order and
+// applies the gate (no second launch; it resets the row's arrival count for the next call). A row of at most
+// Q4E_ATTN_SPLIT_MIN cells runs whole in block z = 0 with the arithmetic of q4e_attention (the other blocks exit),
+// so short contexts answer bit for bit as before. The split depends on the row's cell count alone, never on how
+// many rows the call holds: a verify window's row computes what that row's own decode step computes.
+#define Q4E_ATTN_SPLIT_MIN 256
+template <bool Q8>
+__device__ __forceinline__ void q4e_attention_split(
+    const float* __restrict__ q, const void* __restrict__ kCache, const void* __restrict__ vCache,
+    const half* __restrict__ kScale, const half* __restrict__ vScale,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int p0, const int NH, const int NKV, const float scale, const int cellStride,
+    float* __restrict__ part,   // [nt, NH, S, 2 + HD]: max, sum, unnormalized output
+    int* __restrict__ arrive)   // [nt, NH], zero between calls
+{
+    const int h = blockIdx.x;
+    const int t = blockIdx.y;
+    const int z = blockIdx.z;
+    const int nSplit = gridDim.z;
+    const int kvh = h / (NH / NKV);
+    const int p = positions != nullptr ? positions[t] : p0 + t;
+    const int32_t* list = nullptr;
+    int n = p + 1;
+    if (cells != nullptr && cellCnt[t] >= 0)
+    {
+        n = cellCnt[t];
+        list = cells + (size_t)t * cellStride;
+    }
+    const bool split = n > Q4E_ATTN_SPLIT_MIN && nSplit > 1;
+    if (!split && z > 0)
+        return;
+    int begin = 0, end = n;
+    if (split)
+    {
+        const int chunk = (n + nSplit - 1) / nSplit;
+        begin = min(n, z * chunk);
+        end = min(n, begin + chunk);
+    }
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const float* qRow = q + ((size_t)t * NH + h) * Q4E_ATTN_HD + lane * 8;
+    float qReg[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        qReg[i] = qRow[i];
+
+    float m = -INFINITY, sum = 0.0f, acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        acc[i] = 0.0f;
+    for (int i = begin + warp; i < end; i += 8)
+    {
+        const int c = list != nullptr ? list[i] : i;
+        const size_t at = ((size_t)c * NKV + kvh) * Q4E_ATTN_HD + lane * 8;
+        float kf[8], vf[8];
+        q4e_load_kv8<Q8>(kCache, kScale, at, kf);
+        q4e_load_kv8<Q8>(vCache, vScale, at, vf);
+        float partDot = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            partDot += qReg[j] * kf[j];
+        const float s = q4e_warp_sum(partDot) * scale;
+        if (s > m)
+        {
+            const float r = expf(m - s);
+            sum *= r;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                acc[j] *= r;
+            m = s;
+        }
+        const float w = expf(s - m);
+        sum += w;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            acc[j] += w * vf[j];
+    }
+
+    __shared__ float shAcc[8][Q4E_ATTN_HD];
+    __shared__ float shM[8], shSum[8];
+    __shared__ int isLast;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        shAcc[warp][lane * 8 + j] = acc[j];
+    if (lane == 0)
+    {
+        shM[warp] = m;
+        shSum[warp] = sum;
+    }
+    __syncthreads();
+    float M = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < 8; ++w)
+        M = fmaxf(M, shM[w]);
+    float S = 0.0f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w)
+        S += shSum[w] * (shM[w] == -INFINITY ? 0.0f : expf(shM[w] - M));
+    const size_t off = ((size_t)t * NH + h) * Q4E_ATTN_HD;
+    if (!split)
+    {
+        const float invS = 1.0f / S;
+        for (int d = threadIdx.x; d < Q4E_ATTN_HD; d += blockDim.x)
+        {
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w)
+                v += shM[w] == -INFINITY ? 0.0f : shAcc[w][d] * expf(shM[w] - M);
+            out[off + d] = v * invS * q4e_sigmoid(gate[off + d]);
+        }
+        return;
+    }
+
+    const size_t stride = 2 + Q4E_ATTN_HD;
+    float* rowPart = part + ((size_t)t * NH + h) * nSplit * stride;
+    float* mine = rowPart + (size_t)z * stride;
+    for (int d = threadIdx.x; d < Q4E_ATTN_HD; d += blockDim.x)
+    {
+        float v = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w)
+            v += shM[w] == -INFINITY ? 0.0f : shAcc[w][d] * expf(shM[w] - M);
+        mine[2 + d] = v;
+    }
+    if (threadIdx.x == 0)
+    {
+        mine[0] = M;
+        mine[1] = S;
+    }
+    // Publish the partial, then count this block in: the last block to arrive merges.
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0)
+        isLast = atomicAdd(&arrive[(size_t)t * NH + h], 1) == nSplit - 1;
+    __syncthreads();
+    if (!isLast)
+        return;
+    __threadfence();
+    float MM = -INFINITY;
+    for (int s = 0; s < nSplit; ++s)
+        MM = fmaxf(MM, __ldcg(rowPart + (size_t)s * stride));
+    float SS = 0.0f;
+    for (int s = 0; s < nSplit; ++s)
+    {
+        const float ms = __ldcg(rowPart + (size_t)s * stride);
+        SS += ms == -INFINITY ? 0.0f : __ldcg(rowPart + (size_t)s * stride + 1) * expf(ms - MM);
+    }
+    const float invS = 1.0f / SS;
+    for (int d = threadIdx.x; d < Q4E_ATTN_HD; d += blockDim.x)
+    {
+        float v = 0.0f;
+        for (int s = 0; s < nSplit; ++s)
+        {
+            const float ms = __ldcg(rowPart + (size_t)s * stride);
+            v += ms == -INFINITY ? 0.0f : __ldcg(rowPart + (size_t)s * stride + 2 + d) * expf(ms - MM);
+        }
+        out[off + d] = v * invS * q4e_sigmoid(gate[off + d]);
+    }
+    if (threadIdx.x == 0)
+        arrive[(size_t)t * NH + h] = 0;
+}
+
+extern "C" __global__ void ts_q4e_attention_split_f32(
+    const float* __restrict__ q, const half* __restrict__ kCache, const half* __restrict__ vCache,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int p0, const int NH, const int NKV, const float scale, const int cellStride,
+    float* __restrict__ part, int* __restrict__ arrive)
+{
+    q4e_attention_split<false>(q, kCache, vCache, nullptr, nullptr, gate, cells, cellCnt, out, positions,
+        p0, NH, NKV, scale, cellStride, part, arrive);
+}
+
+extern "C" __global__ void ts_q4e_attention_split_q8_f32(
+    const float* __restrict__ q, const signed char* __restrict__ kCache, const signed char* __restrict__ vCache,
+    const half* __restrict__ kScale, const half* __restrict__ vScale,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int p0, const int NH, const int NKV, const float scale, const int cellStride,
+    float* __restrict__ part, int* __restrict__ arrive)
+{
+    q4e_attention_split<true>(q, kCache, vCache, kScale, vScale, gate, cells, cellCnt, out, positions,
+        p0, NH, NKV, scale, cellStride, part, arrive);
+}
+
 // ---------------------------------------------------------------------------
 // Qwen Sparse Attention
 // ---------------------------------------------------------------------------
@@ -1350,4 +1540,183 @@ extern "C" __global__ void ts_q4e_set_stream_rows_f32(
     const float v = rows[(size_t)r * E + i];
     for (int c = 0; c < HC; ++c)
         xs[((size_t)(firstRow + r) * HC + c) * E + i] = v;
+}
+
+// Each row's first-max index (ties to the lowest index, as a host scan with `>` finds it; a row with no finite
+// maximum answers 0): a greedy verify returns the window's tokens instead of every row's logits. grid rows, 1024
+// threads.
+extern "C" __global__ void ts_q4e_argmax_rows_f32(
+    const float* __restrict__ logits,    // [rows, V]
+    int32_t* __restrict__ ids,           // [rows]
+    const int V)
+{
+    __shared__ float shV[32];
+    __shared__ int shI[32];
+    const float* row = logits + (size_t)blockIdx.x * V;
+    float best = -INFINITY;
+    int bestIdx = -1;
+    for (int i = threadIdx.x; i < V; i += blockDim.x)
+    {
+        const float v = row[i];
+        if (v > best)
+        {
+            best = v;
+            bestIdx = i;
+        }
+    }
+    // Warp then block: the larger value wins, a tie the lower index.
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        const float ov = __shfl_down_sync(0xffffffffu, best, o);
+        const int oi = __shfl_down_sync(0xffffffffu, bestIdx, o);
+        if (oi >= 0 && (bestIdx < 0 || ov > best || (ov == best && oi < bestIdx)))
+        {
+            best = ov;
+            bestIdx = oi;
+        }
+    }
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (lane == 0)
+    {
+        shV[warp] = best;
+        shI[warp] = bestIdx;
+    }
+    __syncthreads();
+    if (warp == 0)
+    {
+        const int nWarps = blockDim.x >> 5;
+        best = lane < nWarps ? shV[lane] : -INFINITY;
+        bestIdx = lane < nWarps ? shI[lane] : -1;
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            const float ov = __shfl_down_sync(0xffffffffu, best, o);
+            const int oi = __shfl_down_sync(0xffffffffu, bestIdx, o);
+            if (oi >= 0 && (bestIdx < 0 || ov > best || (ov == best && oi < bestIdx)))
+            {
+                best = ov;
+                bestIdx = oi;
+            }
+        }
+        if (lane == 0)
+            ids[blockIdx.x] = bestIdx < 0 ? 0 : bestIdx;
+    }
+}
+
+// Adaptive residency's selection counts from a prompt ubatch (decode steps count inside the doorbell kernel):
+// counts[sel[i]] += 1 for each of the ubatch's n selections, counts being the layer's row of the table.
+extern "C" __global__ void ts_q4e_count_selected(
+    const int32_t* __restrict__ sel,
+    const int n,
+    unsigned int* __restrict__ counts)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    const int e = sel[i];
+    if (e >= 0)
+        atomicAdd(counts + e, 1u);
+}
+
+// A draft step's pick on the device (the MTP draft chain): the row's first-max token, its confidence as the per-token
+// draft gate measures it on the host (DraftHeadSpeculator.ArgmaxWithTopKConfidence: the top-1 probability of a
+// softmax over the 10 largest logits), and the token again as the next step's input. One block of 1024 threads.
+#define Q4E_PICK_K 10
+extern "C" __global__ void ts_q4e_draft_pick_f32(
+    const float* __restrict__ logits,    // [V]
+    const int V,
+    int32_t* __restrict__ ids,           // [steps]
+    float* __restrict__ probs,           // [steps]
+    const int step,
+    int32_t* __restrict__ nextToken)     // [1]
+{
+    __shared__ float shV[32];
+    __shared__ int shK[32], shT[32];
+    __shared__ float top[Q4E_PICK_K];
+    __shared__ int argIdx;
+    // Each thread's own 10 largest values (descending; an equal value keeps the earlier index first) and the index of
+    // its largest.
+    float tv[Q4E_PICK_K];
+#pragma unroll
+    for (int j = 0; j < Q4E_PICK_K; ++j)
+        tv[j] = -INFINITY;
+    int headIdx = -1;
+    for (int i = threadIdx.x; i < V; i += blockDim.x)
+    {
+        const float v = logits[i];
+        if (!(v > tv[Q4E_PICK_K - 1]))
+            continue;
+        int j = Q4E_PICK_K - 1;
+        while (j > 0 && tv[j - 1] < v)
+        {
+            tv[j] = tv[j - 1];
+            --j;
+        }
+        tv[j] = v;
+        if (j == 0)
+            headIdx = i;
+    }
+    // Ten rounds of a block maximum over the threads' next values; the first round's tie goes to the lower index.
+    int ptr = 0;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nWarps = blockDim.x >> 5;
+    for (int r = 0; r < Q4E_PICK_K; ++r)
+    {
+        float v = ptr < Q4E_PICK_K ? tv[ptr] : -INFINITY;
+        int key = ptr == 0 && headIdx >= 0 ? headIdx : 0x7fffffff;
+        int who = threadIdx.x;
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            const float ov = __shfl_down_sync(0xffffffffu, v, o);
+            const int ok = __shfl_down_sync(0xffffffffu, key, o);
+            const int ow = __shfl_down_sync(0xffffffffu, who, o);
+            if (ov > v || (ov == v && (ok < key || (ok == key && ow < who))))
+            {
+                v = ov; key = ok; who = ow;
+            }
+        }
+        if (lane == 0)
+        {
+            shV[warp] = v; shK[warp] = key; shT[warp] = who;
+        }
+        __syncthreads();
+        if (warp == 0)
+        {
+            v = lane < nWarps ? shV[lane] : -INFINITY;
+            key = lane < nWarps ? shK[lane] : 0x7fffffff;
+            who = lane < nWarps ? shT[lane] : 0x7fffffff;
+            for (int o = 16; o > 0; o >>= 1)
+            {
+                const float ov = __shfl_down_sync(0xffffffffu, v, o);
+                const int ok = __shfl_down_sync(0xffffffffu, key, o);
+                const int ow = __shfl_down_sync(0xffffffffu, who, o);
+                if (ov > v || (ov == v && (ok < key || (ok == key && ow < who))))
+                {
+                    v = ov; key = ok; who = ow;
+                }
+            }
+            if (lane == 0)
+            {
+                top[r] = v;
+                shT[0] = who;
+                if (r == 0)
+                    argIdx = key == 0x7fffffff ? 0 : key;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == shT[0])
+            ++ptr;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+        float denom = 0.0f;
+        for (int j = 0; j < Q4E_PICK_K; ++j)
+        {
+            if (top[j] == -INFINITY)
+                break;
+            denom += expf(top[j] - top[0]);
+        }
+        ids[step] = argIdx;
+        probs[step] = denom > 0.0f ? 1.0f / denom : 0.0f;
+        *nextToken = argIdx;
+    }
 }

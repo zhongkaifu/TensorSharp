@@ -18,11 +18,12 @@ namespace TensorSharp.Cuda
     /// One device's expert staging (expert residency): experts a call selects that have no VRAM slot are
     /// copied into <see cref="Staging"/> (at most <see cref="Capacity"/> per call) and their table entries
     /// point there for the call. Device buffers: StageOf [nExpert] (-1 between calls), StageList
-    /// [Capacity], StageCount [1].
+    /// [Capacity], StageCount [1], and StageFrom [1] (the count before a call's plan, when calls keep what earlier
+    /// ones staged: <see cref="CudaMoe.Experts"/> keepStaged).
     /// </summary>
     internal sealed class CudaExpertStage
     {
-        public IntPtr StageOf, StageList, StageCount, Staging;
+        public IntPtr StageOf, StageList, StageCount, StageFrom, Staging;
         public long Stride;
         public int Capacity;
     }
@@ -257,23 +258,41 @@ namespace TensorSharp.Cuda
         /// expert and run on tensor cores when the widths allow, else through the
         /// register-staged kernels.
         /// </summary>
+        /// <param name="keepStaged">The call leaves its staged experts in place for the next call on the same layer
+        /// (which then copies only experts not staged yet); the caller unstages with <see cref="Unstage"/> once the
+        /// layer's calls are done. Needs <see cref="Dsv4Kernels.HasStageKeep"/>.</param>
         public static void Experts(Dsv4Kernels dk, CudaKernels kernels, CudaMoeScratch s,
             in DeviceWeight gate, in DeviceWeight up, in DeviceWeight down,
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
             int perSlotMaxRows, IntPtr stream, bool? fused = null,
-            CudaExpertStage stage = null, in CudaExpertStageLayer stageLayer = default, IntPtr shDownReady = default)
+            CudaExpertStage stage = null, in CudaExpertStageLayer stageLayer = default, IntPtr shDownReady = default,
+            bool keepStaged = false)
         {
             int guType = gate.Type, downType = down.Type;
             int slots = nt * nUsed;
             bool staging = stage != null && stageLayer.IsValid && stageLayer.Staged;
-            if (staging)
+            bool keep = staging && keepStaged && dk.HasStageKeep && stage.StageFrom != IntPtr.Zero;
+            if (keep)
+            {
+                dk.MoeStageMarkFrom(stage, stream);
+                dk.MoeStagePlan(s.Sel, slots, stageLayer, stage, stream);
+                dk.MoeStageCopyNew(stageLayer, stage, slots, stream);
+            }
+            else if (staging)
             {
                 dk.MoeStagePlan(s.Sel, slots, stageLayer, stage, stream);
                 dk.MoeStageCopy(stageLayer, stage, slots, stream);
             }
             RunExperts(dk, kernels, s, gate, up, down, cur, shDown, ffnOut, nt, nUsed, nExpert, e, ff, clamp,
                 perSlotMaxRows, stream, fused, shDownReady);
-            if (staging)
+            if (staging && !keep)
+                dk.MoeUnstage(stageLayer, stage, stream);
+        }
+
+        /// <summary>Ends a layer's run of <see cref="Experts"/> calls that kept their staging.</summary>
+        public static void Unstage(Dsv4Kernels dk, CudaExpertStage stage, in CudaExpertStageLayer stageLayer, IntPtr stream)
+        {
+            if (stage != null && stageLayer.IsValid && stageLayer.Staged)
                 dk.MoeUnstage(stageLayer, stage, stream);
         }
 

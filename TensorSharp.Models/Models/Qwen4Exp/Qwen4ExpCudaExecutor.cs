@@ -157,6 +157,10 @@ namespace TensorSharp.Models
         public void MtpForward(int[] tokens, float[] hPrev, int p0, float[] logitsOut, float[] hOut)
             => _engine.MtpForward(tokens, hPrev, p0, logitsOut, hOut);
         public void ForwardVerify(int[] tokens, float[] logitsAll, float[] hAll) => _engine.ForwardVerify(tokens, logitsAll, hAll);
+        public void ForwardVerifyGreedy(int[] tokens, int[] drawnOut, float[] hAll) => _engine.ForwardVerifyGreedy(tokens, drawnOut, hAll);
+        public bool HasMtpDraftChain => _engine.HasMtpDraftChain;
+        public int MtpDraftChain(int[] tokens, float[] hPrev, int p0, int steps, int[] idsOut, float[] probsOut)
+            => _engine.MtpDraftChain(tokens, hPrev, p0, steps, idsOut, probsOut);
         public bool CommitVerify(int keep) => _engine.CommitVerify(keep);
         public bool RestoreVerify() => _engine.RestoreVerify();
         public void Reset() => _engine.Reset();

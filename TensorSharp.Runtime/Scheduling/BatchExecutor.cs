@@ -2562,8 +2562,11 @@ namespace TensorSharp.Runtime.Scheduling
                 // Penalty-aligned drafting: the draft head must argmax the
                 // same penalized distribution verification draws from, or
                 // acceptance decays toward zero as the output history grows.
-                adjustDraftLogits: (draftLogits, pendingDrafts) =>
-                    penaltySampler.ApplyPenalties(draftLogits, seq.OutputTokens, pendingDrafts),
+                // Without penalties the adjustment is a no-op; leaving it out lets a head draft its whole window on
+                // its device (IDraftHead.DraftChain), where no draft logits reach the host.
+                adjustDraftLogits: penaltySampler.AdjustsDraftLogits
+                    ? (draftLogits, pendingDrafts) => penaltySampler.ApplyPenalties(draftLogits, seq.OutputTokens, pendingDrafts)
+                    : null,
                 onDraftAccepted: d =>
                 {
                     seq.AppendOutputToken(d);

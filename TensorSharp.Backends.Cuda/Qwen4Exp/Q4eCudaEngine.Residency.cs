@@ -105,7 +105,7 @@ namespace TensorSharp.Cuda
             _devs[0].MakeCurrent();
             var (free, _) = _devs[0].Alloc.GetMemoryInfo();
             long budget = (long)free - DeviceScratchBytes() - (1L << 30) - m.TokEmbd.TotalBytes
-                - m.Output.TotalBytes - (long)m.NVocab * 8;
+                - m.Output.TotalBytes - (long)m.NVocab * 8 - PromptGroupBytes();
             if (!forced && nonExpertBytes + expertTotal <= budget)
                 return null;
             // The tables and the arena's per-slot alignment, besides the slots themselves, and the staging
@@ -207,7 +207,8 @@ namespace TensorSharp.Cuda
                 // The expert tables, the tables staging copies from and restores to, and the host flags.
                 b += 9 * CudaWeightArena.Align((long)_m.NExpert * 8) + CudaWeightArena.Align(_m.NExpert);
             }
-            return b + StagingBytes() + CudaWeightArena.Align(StagingStride()) + 3 * CudaWeightArena.Align((long)_m.NExpert * 4) + 256;
+            // StageOf, StageList and the zero expert's pad, then StageCount and StageFrom (an aligned int each).
+            return b + StagingBytes() + CudaWeightArena.Align(StagingStride()) + 3 * CudaWeightArena.Align((long)_m.NExpert * 4) + 512;
         }
 
         /// <summary>Experts one call can stage: every slot's expert at most, and never more than a layer has.</summary>
@@ -239,6 +240,7 @@ namespace TensorSharp.Cuda
                 stage.StageOf = dev.Weights.PlaceBytes((IntPtr)p, (long)n * 4);
             int zero = 0;
             stage.StageCount = dev.Weights.PlaceBytes((IntPtr)(&zero), 4);
+            stage.StageFrom = dev.Weights.PlaceBytes((IntPtr)(&zero), 4);
             stage.StageList = dev.Weights.Reserve((long)stage.Capacity * 4);
             stage.Staging = dev.Weights.Reserve(StagingBytes());
             _expertStage = stage;
@@ -494,10 +496,63 @@ namespace TensorSharp.Cuda
                     _adaptCountsT = AllocT(_devs[0], DType.Int32, (long)m.NLayer * m.NExpert);
                     _adaptCountsDev = Ptr(_adaptCountsT);
                     Zero(_devs[0], _adaptCountsT, 4);
+                    if (PromptAdaptSwaps > 0 && _devs[0].QK.HasCountSelected)
+                    {
+                        _promptCountsT = AllocT(_devs[0], DType.Int32, (long)m.NLayer * m.NExpert);
+                        _promptCountsDev = Ptr(_promptCountsT);
+                        Zero(_devs[0], _promptCountsT, 4);
+                        Console.Error.WriteLine($"[q4e-cuda] adaptive residency learns from prompts: after a prompt of more than "
+                            + $"{_hostExpertRows} rows up to {PromptAdaptSwaps} of its most-selected host experts trade places "
+                            + "(TS_MOE_TIER_ADAPT_PROMPT_SWAPS, 0 = off).");
+                    }
                 }
             }
             if (_adaptCounts != null && _adaptCountsDev == IntPtr.Zero)
                 _hostServer.Counts = _adaptCounts;   // an older module: the host counts what every layer's doorbell names
+            ConfigureTailSkip();
+        }
+
+        /// <summary>The route-tail skip's rank in force (0: off).</summary>
+        private int _tailRank;
+
+        /// <summary>Host slots the route-tail skip left out so far, or -1 without host experts (tests).</summary>
+        internal long TailSkipped => _hostServer?.TailSkipped ?? -1;
+
+        /// <summary>
+        /// Strata's route-tail skip (STRATA_ROUTE_TAIL_SKIP=7, its default): in a decode step or verify window a host expert
+        /// that every row routes at rank TS_MOE_ROUTE_TAIL_SKIP or lower (0-based in the row's descending top-k: the 8th to
+        /// 10th of Flash Next's 10) is neither computed nor waited for; its routes add nothing and the weights are not
+        /// renormalized, so answers become approximate. Off when every expert is resident, when at least
+        /// TS_MOE_TAIL_SKIP_MAX_CACHED percent of the experts have VRAM slots, and for prompts (they stage every route).
+        /// </summary>
+        private void ConfigureTailSkip()
+        {
+            var r = _residency;
+            var m = _m;
+            int rank = Math.Max(0, EnvInt("TS_MOE_ROUTE_TAIL_SKIP", 7));
+            int maxCached = Math.Clamp(EnvInt("TS_MOE_TAIL_SKIP_MAX_CACHED", 90), 0, 100);
+            _tailRank = 0;
+            if (_hostServer == null || r == null || rank <= 0 || rank >= m.NExpertUsed)
+                return;
+            double cached = r.TotalExperts > 0 ? (double)r.SlotExperts / r.TotalExperts : 1.0;
+            if (cached * 100.0 >= maxCached)
+            {
+                Console.Error.WriteLine($"[q4e-cuda] route-tail skip off: {cached * 100:F1}% of the experts have VRAM slots "
+                    + $"(TS_MOE_TAIL_SKIP_MAX_CACHED={maxCached}).");
+                return;
+            }
+            if (_doorbellMiss == IntPtr.Zero || !_devs[0].DK.HasDoorbellTail)
+            {
+                Console.Error.WriteLine("[q4e-cuda] route-tail skip off: the loaded tensorsharp_dsv4_kernels module predates "
+                    + "ts_moe_doorbell_publish_tail (or the doorbell skip is off); every missed expert is computed. Rebuild "
+                    + "TensorSharp.Backends.Cuda with a CUDA 13 nvcc on PATH.");
+                return;
+            }
+            _tailRank = rank;
+            _hostServer.TailRank = rank;
+            Console.Error.WriteLine($"[q4e-cuda] route-tail skip: in decode steps and verify windows a host expert every row routes "
+                + $"at rank {rank} or lower (0-based, of {m.NExpertUsed}) is left out, unrenormalized (Strata's "
+                + "STRATA_ROUTE_TAIL_SKIP; answers become approximate). TS_MOE_ROUTE_TAIL_SKIP=0 computes every route.");
         }
 
         /// <summary>A device int the doorbell kernels share per layer: whether the layer rang the host (zero: every layer
@@ -519,6 +574,9 @@ namespace TensorSharp.Cuda
         }
 
         private IntPtr _adaptTemp;
+        // A prompt's selections per (layer, expert), counted on the device while it runs (Moe).
+        private Tensor _promptCountsT;
+        private IntPtr _promptCountsDev;
         private int _adaptSteps;
         private long _adaptSwaps;
         private float[][] _adaptCounts;
@@ -533,6 +591,14 @@ namespace TensorSharp.Cuda
         private static readonly int AdaptEvery = Math.Max(1, EnvInt("TS_MOE_TIER_ADAPT_EVERY", 4));
         /// <summary>Swaps a round makes at most, the largest gains first across the layers (TS_MOE_TIER_ADAPT_SWAPS).</summary>
         private static readonly int AdaptSwapsPerCall = Math.Max(1, EnvInt("TS_MOE_TIER_ADAPT_SWAPS", 8));
+
+        /// <summary>Swaps a round after a prompt makes at most (TS_MOE_TIER_ADAPT_PROMPT_SWAPS; 0 = prompts teach nothing).
+        /// The decode after a long prompt routes much as the prompt did: on the RTX 5090 the first verify windows after a
+        /// 4K-token prompt left 170-290 experts to the CPU against 25-60 once adaptation had caught up.</summary>
+        private static readonly int PromptAdaptSwaps = Math.Max(0, EnvInt("TS_MOE_TIER_ADAPT_PROMPT_SWAPS", 64));
+
+        /// <summary>A prompt's selections weigh as this many rows' worth of decode selections in the counts.</summary>
+        private const float PromptAdaptRows = 128f;
 
         /// <summary>Swaps performed by adaptive residency so far (tests).</summary>
         internal long AdaptiveSwaps => _adaptSwaps;
@@ -551,12 +617,46 @@ namespace TensorSharp.Cuda
             var r = _residency;
             if (r?.Tab == null || _adaptCounts == null || ++_adaptSteps % AdaptEvery != 0)
                 return;
+            AdaptRound(AdaptSwapsPerCall);
+        }
+
+        /// <summary>
+        /// After a prompt of <paramref name="rows"/> rows: its selections (counted on the device as it ran) join the counts,
+        /// scaled to <see cref="PromptAdaptRows"/> rows' worth, and a round of up to <see cref="PromptAdaptSwaps"/> swaps
+        /// brings the prompt's most-selected host experts into VRAM before its answer decodes.
+        /// </summary>
+        private void AdaptAfterPrompt(int rows)
+        {
+            var r = _residency;
+            if (r?.Tab == null || _adaptCounts == null || _promptCountsDev == IntPtr.Zero || rows <= _hostExpertRows)
+                return;
+            var m = _m;
+            var dev = _devs[0];
+            dev.MakeCurrent();
+            CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+            fixed (uint* raw = _adaptRaw)
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)raw, _promptCountsDev, new UIntPtr((ulong)_adaptRaw.Length * 4)).ThrowOnError();
+            Zero(dev, _promptCountsT, 4);
+            float scale = Math.Min(1f, PromptAdaptRows / rows);
+            for (int il = 0; il < m.NLayer; il++)
+            {
+                float[] c = _adaptCounts[il];
+                for (int e = 0; e < m.NExpert; e++)
+                    c[e] += scale * _adaptRaw[(long)il * m.NExpert + e];
+            }
+            AdaptRound(PromptAdaptSwaps, decodeCounts: false);
+        }
+
+        /// <param name="decodeCounts">Fold in the decode selections the device counted since the last round.</param>
+        private void AdaptRound(int swapBudget, bool decodeCounts = true)
+        {
+            var r = _residency;
             var m = _m;
             var dev = _devs[0];
             dev.MakeCurrent();
             CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
             float[][] counts = _adaptCounts;
-            if (_adaptCountsDev != IntPtr.Zero)
+            if (decodeCounts && _adaptCountsDev != IntPtr.Zero)
             {
                 fixed (uint* raw = _adaptRaw)
                     CudaDriverApi.cuMemcpyDtoH((IntPtr)raw, _adaptCountsDev, new UIntPtr((ulong)_adaptRaw.Length * 4)).ThrowOnError();
@@ -579,7 +679,7 @@ namespace TensorSharp.Cuda
                     trades.Add((counts[il][hot] - counts[il][cold], il));
             }
             trades.Sort((a, b) => b.Gain.CompareTo(a.Gain));
-            int budget = AdaptSwapsPerCall;
+            int budget = swapBudget;
             var changed = new HashSet<int>();
             foreach (var (_, il) in trades)
             {
@@ -671,7 +771,7 @@ namespace TensorSharp.Cuda
 
         /// <summary>Whether a call of <paramref name="nt"/> rows on layer <paramref name="L"/> leaves its missed experts to the host.</summary>
         private bool HostExpertsFor(DevLayer L, int nt)
-            => _hostServer != null && nt <= _hostExpertRows && L.Stage.IsValid;
+            => _hostServer != null && nt <= _hostExpertRows && L.Stage.IsValid && !_groupedPrompt;
 
         /// <summary>Rows up to which a step leaves its missed experts to the CPU (TS_Q4E_HOST_EXPERT_ROWS, 1 to
         /// <see cref="HostExpertMaxRows"/>); wider steps stage them over the bus. A verify window's rows miss more
@@ -713,6 +813,10 @@ namespace TensorSharp.Cuda
                 $"({r.HostBytes / 1073741824.0:F1} GiB), " +
                 (r.HostCompute ? $"computed by the CPU in decode steps of up to {HostExpertMaxRows} rows and staged over the bus in prompts."
                                : "staged over the bus when routed."));
+            if (_groupXs != null)
+                Console.Error.WriteLine(
+                    $"[q4e-cuda] prompts read layer by layer in groups of up to {PromptGroupRows} rows ({PromptGroupBytes() / 1048576.0:F0} MiB "
+                    + "of streams; TS_Q4E_PROMPT_GROUP, 0 = ubatch order): a missed expert crosses the bus once per layer and group.");
         }
 
         private void FreeHostExperts()

@@ -406,6 +406,23 @@ namespace TensorSharp.Runtime.Speculative
             float[] logitsOut, float[] hOut)
             => throw new NotSupportedException(
                 "This draft head cannot fuse its catch-up with the first draft step.");
+
+        /// <summary>
+        /// True when this head can run a whole per-token draft chain on its device, via <see cref="DraftChain"/>: the
+        /// speculator then makes one call per window instead of one per draft, and never reads draft logits. Used only
+        /// when the draft distribution is not adjusted (no penalties), since the chain picks each step's first maximum.
+        /// </summary>
+        bool SupportsDraftChain => false;
+
+        /// <summary>
+        /// <see cref="DraftCatchUpAndStep"/> (or, for a single token, <see cref="DraftStep"/>) followed by up to
+        /// <paramref name="maxTokens"/> - 1 further steps, each fed the previous step's first-max token and the head's own
+        /// hidden output on the device. Writes each step's token to <paramref name="draftOut"/> and its confidence (the
+        /// top-1 probability over the step's 10 largest logits, the per-token gate's measure) to
+        /// <paramref name="probOut"/>, and returns the steps run (at most <paramref name="maxTokens"/>). The head's own
+        /// state then covers every step's row; later calls start at or before positions it holds.
+        /// </summary>
+        int DraftChain(int[] tokens, float[] hRows, int startPos, int maxTokens, int[] draftOut, float[] probOut) => 0;
     }
 
     /// <summary>Convenience alias for the common case: a model that is its own

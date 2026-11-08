@@ -182,6 +182,8 @@ namespace TensorSharp.Cuda
             public Tensor Qkv, Z, Alpha, Beta, Scr, Core, GOut;
             // attention
             public Tensor Qg, K, V, Q, Gate, AttnO;
+            /// <summary>Split attention's partials [PerSlotMaxRows, NH, splits, part] and per-(row, head) arrival counts.</summary>
+            public Tensor AttnPart, AttnArrive;
             // QSA
             public Tensor IdxRaw, IdxQ, Scores, Cells, CellCnt;
             // PLE
@@ -193,6 +195,10 @@ namespace TensorSharp.Cuda
             public Tensor RouterF32;
             // head
             public Tensor Logits, BatchLogits;
+            /// <summary>A greedy verify's rows' first-max tokens.</summary>
+            public Tensor ArgIds;
+            /// <summary>An MTP draft chain's tokens and confidences, one per step.</summary>
+            public Tensor DraftIds, DraftProbs;
             // A batched decode step's per-row state pointers: [layer][conv, ssm][row], then the
             // PLE histories [row], staged through pinned memory.
             public Tensor BatchStatePtrs;
@@ -237,7 +243,7 @@ namespace TensorSharp.Cuda
         private readonly int _pleLayer = -1;
         private DeviceWeight _tokEmbd, _output, _outHcDown, _outHcUp;
         private Tensor _outHcNorm;
-        private IntPtr _pinnedTokens, _pinnedLogits, _pinnedHidden;
+        private IntPtr _pinnedTokens, _pinnedLogits, _pinnedHidden, _pinnedIds;
         private Slot _active;
         private readonly int _perf;
         private readonly CudaStageTimer _stages;
@@ -520,6 +526,8 @@ namespace TensorSharp.Cuda
             long b = 4 * nt * hcE * 4 + 4 * nt * e * 4;
             b += nt * ((long)ConvDim + 3L * ValueDim) * 4 + nt * m.GdnVHeads * (4L * Q4eKernels.GdnHeadDim + 1) * 4;
             b += nt * (long)m.NHead * m.HeadDim * 4 * 5;
+            // Split attention's partials and arrival counts.
+            b += (long)PerSlotMaxRows * m.NHead * (MaxAttnSplits * (long)Q4eKernels.AttnSplitPartFloats * 4 + 4);
             b += nt * (long)(m.NCtx / 4 + m.IdxTopK + 4) * 4;
             b += CudaMoeScratch.Bytes(m.NUbatch, m.NExpertUsed, m.NEmbd, Math.Max(m.NFfExp, 1), m.NExpert);
             b += 3 * nt * (long)m.NFfShexp * 4;
@@ -749,7 +757,16 @@ namespace TensorSharp.Cuda
                 dev.DK.DenseBf16Rows(w.Ptr, Ptr(input), Ptr(output), w.Ne1, w.Ne0, rows, stream);
                 return;
             }
-            // Q2_0 rows past decode size: the shared route has no Q2_0 decoder, so quantize the input into the
+            // Q2_0 prompt rows (ISTA keeps a shared expert, some attention projections and the PLE key in it): an F16 copy
+            // of the weight for the call and the tensor-core GEMM, as the shared route does for the formats it lists. The
+            // warp-per-row kernel below re-read the weight for every row: 0.2 s of a 4K prompt on the RTX 5090.
+            if (xq == IntPtr.Zero && w.Type == 42 && rows >= PrefillF16MinRows && _q2_0PromptGemm && dev.Alloc.Kernels.DequantsQ2_0)
+            {
+                CudaDecodeCapture.Refuse("the Q2_0 prompt GEMM");
+                CudaQuantizedOps.RunPrefillF16Gemm(dev.Alloc, w.Ptr, w.Type, Ptr(input), Ptr(output), (int)w.Ne0, (int)w.Ne1, rows);
+                return;
+            }
+            // Q2_0 rows past decode size below that: the shared route has no Q2_0 decoder, so quantize the input into the
             // routed experts' q8_1 scratch (free outside their call) and run the warp-per-row kernel.
             if (xq == IntPtr.Zero && w.Type == 42 && dev.DK.DecodesLegacyQuants
                 && (long)rows * (w.Ne0 / 32) * 36 <= dev.Moe.ActQ8A.ElementCount())
@@ -801,6 +818,9 @@ namespace TensorSharp.Cuda
         private const long PrefillCacheMinElements = 1L << 21;
         /// <summary>Rows from which a projection with an F16 copy uses it.</summary>
         private const int PrefillF16MinRows = 64;
+
+        // TS_Q4E_Q2_0_PROMPT_GEMM=0: Q2_0 prompt rows keep the warp-per-row kernel.
+        private static readonly bool _q2_0PromptGemm = Environment.GetEnvironmentVariable("TS_Q4E_Q2_0_PROMPT_GEMM") != "0";
 
         private void CachePrefillWeights()
         {
@@ -888,6 +908,7 @@ namespace TensorSharp.Cuda
             if (_posPinned != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_posPinned);
             if (_pinnedLogits != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_pinnedLogits);
             if (_pinnedHidden != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_pinnedHidden);
+            if (_pinnedIds != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_pinnedIds);
             FreeMtpPinned();
         }
     }

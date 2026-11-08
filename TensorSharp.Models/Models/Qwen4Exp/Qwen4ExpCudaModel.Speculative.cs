@@ -62,6 +62,26 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>A greedy verify: each row's first-max token computed on the device (Q4eCudaEngine.ForwardVerifyGreedy), so
+        /// a window's logits (a megabyte a row) never cross the bus or the host's scan. TS_Q4E_GREEDY_VERIFY=0 returns
+        /// every row's logits instead.</summary>
+        bool ISpeculativeTarget.TrySpecForwardGreedyVerify(int[] tokens, float[] hAllOut, int[] drawnOut)
+        {
+            ArgumentNullException.ThrowIfNull(tokens);
+            if (!GreedyVerifyEnabled || tokens.Length == 0 || tokens.Length > TensorSharp.Cuda.Q4eCudaEngine.VerifyMaxRows
+                || drawnOut == null || drawnOut.Length < tokens.Length)
+                return false;
+            lock (_sync)
+            {
+                _specWindowStart = _exec.NPast;
+                _exec.ForwardVerifyGreedy(tokens, drawnOut, hAllOut);
+                _cacheSeqLen = _exec.NPast;
+            }
+            return true;
+        }
+
+        private static readonly bool GreedyVerifyEnabled = Environment.GetEnvironmentVariable("TS_Q4E_GREEDY_VERIFY") != "0";
+
         void ISpeculativeTarget.SpecEnsureCapacity(int requiredSeqLen)
         {
             if (requiredSeqLen > MaxContextLength)
@@ -136,6 +156,22 @@ namespace TensorSharp.Models
 
         public void DraftCatchUpAndStep(int[] tokens, float[] hRows, int startPos, float[] logitsOut, float[] hOut)
             => RunMtp(tokens, hRows, startPos, logitsOut, hOut);
+
+        // The whole per-token chain on the device (Q4eCudaEngine.MtpDraftChain): one host round trip a window instead of
+        // one per draft, and no draft logits on the host.
+        public bool SupportsDraftChain => _exec?.HasMtpDraftChain == true;
+
+        public int DraftChain(int[] tokens, float[] hRows, int startPos, int maxTokens, int[] draftOut, float[] probOut)
+        {
+            ArgumentNullException.ThrowIfNull(tokens);
+            if (hRows == null)
+                throw new ArgumentNullException(nameof(hRows), "the MTP block needs the trunk's hidden streams of every row it replays");
+            int steps = Math.Min(maxTokens, TensorSharp.Cuda.Q4eCudaEngine.MaxDraftChainSteps);
+            if (tokens.Length == 0 || steps < 1)
+                return 0;
+            lock (_sync)
+                return _exec.MtpDraftChain(tokens, hRows, startPos, steps, draftOut, probOut);
+        }
 
         private void RunMtp(int[] tokens, float[] hRows, int startPos, float[] logitsOut, float[] hOut)
         {

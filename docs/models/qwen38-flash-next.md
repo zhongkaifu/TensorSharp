@@ -1173,6 +1173,90 @@ Same session, RTX 5090, `Q2_0`, `TS_Q4E_HC_Q8=1`, MTP with Q2_0 draft experts, `
 | F16 | 15,901 (96.9%) | 123-162 | 2.99 s / 87-96 | 12.5 s / 63-78 | 17.9 ms | 113 |
 | `q8_0` | 17,085 (98.0%) | 135-165 | 2.67 s / 98-104 | 11.1 s / 84-85 | 16.9 ms | 82 |
 
+#### Prompt groups, split attention and a lighter MTP catch-up, 2026-11-08
+
+A `TS_Q4E_PERF=3` profile of the 4K prompt on the RTX 5090 showed where the direct engine's time went. Of each 512-row
+prompt ubatch's 311 ms of GPU time, 197 ms were the routed experts, almost all of it staging the experts without a
+VRAM slot over the bus, and the next ubatch staged most of them again. After the prompt, the first draft replayed it
+through the whole MTP layer (attention over the prompt and every row's experts: 59 ms after a 4K prompt, 320 ms in
+all for a 16K one, the last part of it in the answer's decode time). And the 12 attention layers of a 4-row verify
+window took 2.4 ms at 4K context and 4.9 ms at 16K: one block per head and row, walking up to 2,051 cells one load
+after another. Changed:
+
+- **Prompts read layer by layer** (`TS_Q4E_PROMPT_GROUP`, default 4096 rows; one GPU under expert residency). Each
+  layer runs over all the group's ubatches before the next one and keeps its staged experts between them
+  (`ts_dsv4_moe_stage_copy_from` copies only the experts a ubatch adds), so a missed expert crosses the bus once per
+  layer and group. Bit for bit the ubatch order's logits (`APromptReadLayerByLayer_AnswersBitForBitAsUbatchOrder`).
+  The group's streams, 160 MiB, come out of the expert slots (16,954 instead of 17,085 resident, 97.9% of profiled
+  routes instead of 98.0%).
+- **Split attention** (`TS_Q4E_ATTN_SPLITS`, default 16). A decode-size row of more than 256 cells spreads them over
+  16 blocks, and the last block to finish merges their partials (flash decoding), inside the captured graph. Shorter
+  rows run whole, bit for bit as before; longer ones move within float reassociation (the test's bound is 1e-4
+  relative), and a verify row still computes its own decode step.
+- **K/V-only MTP catch-up** (`TS_Q4E_MTP_KV_ONLY`, on). A catch-up's rows only write the MTP layer's K/V; the rest of
+  the layer runs for the last row alone when it drafts (Strata's `record_front` / `record_rest`): 59 to 23 ms after a
+  4K prompt, 320 to 45 ms for a 16K one.
+- **Greedy verify on the device** (`TS_Q4E_GREEDY_VERIFY`, on). A plain greedy sampler takes each verify row's first
+  maximum from an argmax kernel in the captured window, instead of a megabyte of logits a row crossing the bus to the
+  host's scan. Same tokens.
+- **The draft chain on the device** (`TS_Q4E_MTP_CHAIN`, on; one GPU, no sampling penalties). A window's drafts run as
+  one chain: a pick kernel takes each step's first-max token and its top-10 confidence and feeds the next step, so the
+  host makes one call a window and reads no draft logits. Drafting went from 2.1-2.2 to 1.9-2.1 ms a window; the end
+  to end numbers stayed within run-to-run noise (short chat 74-102, long generation 141-175, 4K 108-131, 16K 154-170
+  tok/s). Most of a draft step is GPU work (the LM head over 248K tokens).
+- **Q2_0 prompt rows through the tensor cores** (`TS_Q4E_Q2_0_PROMPT_GEMM`, on). ISTA keeps some attention
+  projections, most shared experts and the PLE key in `Q2_0`, which the shared prompt route did not decode, so their
+  prompt rows ran the warp-per-row kernel, reading the weight once per row (0.23 s of GPU time in a 4K prompt). They
+  now take an F16 copy of the weight dequantized for the call and the cuBLAS GEMM: 4K TTFT 1.85 to 1.69 s, 16K 7.4-7.5
+  to 6.7-6.9 s, decode unchanged.
+- **Adaptive residency learns from prompts** (`TS_MOE_TIER_ADAPT_PROMPT_SWAPS`, default 64). A prompt's expert
+  selections are counted on the device, weighed as 128 rows' worth, and up to 64 of its most-selected host experts
+  trade places before its answer decodes. After 16K prompts it left 64-136 experts of a window to the CPU instead of
+  156-200; after 4K prompts the misses stayed about where they were.
+
+RTX 5090, ISTA `Q2_0`, `TS_Q4E_HC_Q8=1`, MTP (Q2_0 draft experts, `--spec-draft 3`), q8_0 KV, adaptive residency,
+131K context, the same client and scenarios, 3 repetitions each (TTFT / decode tok/s; 15/15 PASS in every run):
+
+| run | short chat | long generation | 4K prompt | 16K prompt | multi-turn first TTFT |
+| --- | --- | --- | --- | --- | --- |
+| before (2026-11-08 morning) | 0.10 s / 62-80 | 130-167 | 2.65 s / 79-115 | 11.1 s / 74-85 | 1.75-1.87 s |
+| prompt groups, split attention, K/V-only catch-up | 0.10 s / 63-78 | 141-173 | 1.85 s / 89-129 | 7.5 s / 137-141 | 1.24-1.30 s |
+| ... and greedy verify on the device | 0.10 s / 69-74 | 142-179 | 1.78-1.86 s / 96-132 | 7.5 s / 132-153 | 1.27-1.30 s |
+| ... and prompts teach the residency (all defaults now) | 0.08-0.10 s / 75-96 | 137-175 | 1.77-1.86 s / 112-137 | 7.3-7.5 s / 152-164 | 1.24-1.28 s |
+| Strata (MTP `--spec 4`, int8 KV with 32K resident, route tail skip on) | 0.24 s / 93-115 | 300-307 | 0.92 s / 376-408 | 2.75 s / 387-421 | 1.08-1.18 s |
+
+What is left. After a long prompt 100-270 experts of a 4-row window still go to the CPU, and each costs 40-50 us of
+the window (a 4-row window took 12.7 ms with 20 CPU experts and 20-22 ms with 170-270). Strata trades up to 96 experts
+a round (`TS_MOE_TIER_ADAPT_SWAPS=96` here cut the misses to about 50 in the 16K requests that followed the 4K ones,
+but each round stalls the GPU while it copies) and skips missed experts that every row of the window routes at rank 7 or lower
+(`STRATA_ROUTE_TAIL_SKIP=7`, on by default, which changes its output). Prompts still read at 2,150-2,250 tok/s
+against Strata's 4,360-5,950, and Strata's windows hold a fifth token (`--spec 4`).
+
+#### Route-tail skip on the direct engine (default), 2026-11-08
+
+Strata skips, by default, the missed experts a window routes only at its tail (`STRATA_ROUTE_TAIL_SKIP=7`). The direct
+engine now does the same (`TS_MOE_ROUTE_TAIL_SKIP`, default 7; `TS_MOE_TAIL_SKIP_MAX_CACHED`, default 90; the switch
+names are shared with the GGML backends' expert tiers). In a decode step or verify window, a host expert (no VRAM slot)
+that every row of the window routes at 0-based rank 7 or lower, the 8th to 10th of Flash Next's 10, is neither
+computed by the CPU nor waited for. Its routes add nothing and the weights are not renormalized, so answers become
+approximate (Strata measures a KL of 0.003-0.006 and about 98% top-1 agreement on 2-3 bit packs). The doorbell kernel
+(`ts_moe_doorbell_publish_tail`) applies the rule to whether a layer rings the host at all, so a layer whose only misses
+are in the tail costs no round trip; the host server applies it to the slots of a layer that rings. It is off when
+every expert is resident, when 90% or more of the experts have slots, and for prompts, which stage every route.
+`TS_MOE_ROUTE_TAIL_SKIP=0` computes every route; the parity tests pin it there.
+
+RTX 5090, ISTA `Q2_0`, MTP, same build and client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS both):
+
+| route-tail skip | short chat | long generation | 4K prompt | 16K prompt | CPU experts a window after 4K / 16K |
+| --- | --- | --- | --- | --- | --- |
+| `0` (every route) | 0.08-0.10 s / 87-113 | 140-175 | 1.62-1.70 s / 119-144 | 6.75-6.87 s / 150-170 | 185-242 / 95-147 |
+| `7` (default) | 0.08-0.11 s / 83-99 | 153-188 | 1.62-1.70 s / 128-176 | 6.76-6.87 s / 163-183 | 128-140 / 42-96 |
+| Strata (its default, `7`) | 0.24 s / 93-115 | 300-307 | 0.92 s / 376-408 | 2.75 s / 387-421 | |
+
+Tried and dropped the same day: a prompt attention kernel with a KV head's query heads in one block (each cell's K and
+V read once into shared memory, each head's online softmax in one warp) read the 4K prompt in 1.72 s against 1.69 s and
+the 16K one in 7.0 s against 6.8 s; one warp walking every cell of a head was slower than eight warps sharing them.
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
