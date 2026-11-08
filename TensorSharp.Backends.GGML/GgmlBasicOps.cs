@@ -3562,11 +3562,12 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>Test hook: qwen4exp span steps whose QSA layers pooled only the blocks they completed (the pooled
-        /// keys kept between steps).</summary>
+        /// keys kept between steps). -1 when the native library was built without the test hooks
+        /// (TENSORSHARP_GGML_NATIVE_BUILD_TESTS off, as in the release and CI builds).</summary>
         public static long Qwen4ExpQsaIncrementalSteps()
         {
             try { return GgmlNative.TSGgml_Qwen4ExpQsaIncrementalSteps(); }
-            catch (EntryPointNotFoundException) { return 0; }
+            catch (EntryPointNotFoundException) { return -1; }
         }
 
         /// <summary>Test hook: decode / verify routes the route tail skip dropped in this process (missed experts routed

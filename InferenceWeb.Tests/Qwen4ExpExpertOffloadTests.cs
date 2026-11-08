@@ -197,8 +197,11 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         float[][] everyBlock = Answer("0");
         long before = GgmlBasicOps.Qwen4ExpQsaIncrementalSteps();
         float[][] kept = Answer("1");
-        Assert.True(GgmlBasicOps.Qwen4ExpQsaIncrementalSteps() - before >= steps.Length,
-            "the decode steps did not pool incrementally");
+        // The counter is a native test hook: a library built without them (the CI and release builds) reports -1, and
+        // the bits are still compared.
+        if (before >= 0)
+            Assert.True(GgmlBasicOps.Qwen4ExpQsaIncrementalSteps() - before >= steps.Length,
+                "the decode steps did not pool incrementally");
         for (int i = 0; i < kept.Length; i++)
             Assert.True(kept[i].AsSpan().SequenceEqual(everyBlock[i]), $"step {i}: the kept pooled keys changed the logits");
     }
