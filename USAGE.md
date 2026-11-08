@@ -1569,6 +1569,14 @@ graph; `TS_WAN_DIT_FLASH=0` forces materialized attention;
 silences it); `TS_FFMPEG` points at the `ffmpeg` used for near-lossless CRF 17
 H.264 export.
 
+## Generating from ComfyUI
+
+[`examples/comfyui/`](examples/comfyui/README.md) is a ComfyUI custom node pack that runs
+these video and image generations from a ComfyUI workflow. Its nodes start a server for
+a `config/` preset, send each generation to the server's streaming route with ComfyUI's
+progress bar and Cancel, and return the clip with its sound, its last frame and the
+pictures as ComfyUI types. ComfyUI needs no change.
+
 ## Mixture-of-Experts CPU offload (`--n-cpu-moe`)
 
 Large MoE models spend almost all of their bytes on routed experts while
