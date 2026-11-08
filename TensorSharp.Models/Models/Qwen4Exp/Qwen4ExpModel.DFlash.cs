@@ -31,8 +31,15 @@ using TensorSharp.Runtime.Speculative;
 
 namespace TensorSharp.Models
 {
-    public partial class Qwen4ExpModel
+    public partial class Qwen4ExpModel : IPerRequestDraftState
     {
+        /// <summary>Each request drafts over a DFlash ring of its own (ModelBase.DFlash.Rings.cs, 81 MB on Flash Next's
+        /// DFlash2), so requests that take turns at speculating keep their drafting context. The MTP head's state is
+        /// already per holder (Qwen4ExpModel.Mtp.cs).</summary>
+        public void BindDraftState(string requestId) => BindDFlashRing(requestId);
+
+        public void ReleaseDraftState(string requestId) => ReleaseDFlashRing(requestId);
+
         /// <summary>Completed-output layer ids the native span taps, in feature-row
         /// order (dflash.target_layers - 1). Null without a DFlash drafter.</summary>
         private int[] _dflashTapLayers;

@@ -1421,6 +1421,22 @@ prefill chunk - was measured and rejected (the newcomer's first token slipped
 by 600 ms on E4B), as was speculating on a solo step while another request is
 still prefilling; the gate is "alone in the engine".
 
+### Taking turns (Flash Next on Metal)
+
+A trunk whose decode step is bound by the experts it reads, rather than by its dense weights, can serve
+concurrent requests faster one at a time than batched. Qwen 3.8 Flash Next on a 48 GB M5 Pro streams its
+expert misses: four requests decoding one token each in the arena step made 30-34 tokens/s in all, while
+one request speculating alone made 40-44 (Strata serves requests strictly one at a time, at 52-55). Such a
+trunk reports `ISpeculativeTarget.SpecTurnsPreferred`, and when every scheduled sequence is decoding and
+there is no batched verify, `BatchExecutor.TrySpeculativeTurn` gives one sequence solo speculative steps on
+its own holder for up to 64 steps while the others wait, then hands the turn to the sequence served
+longest ago. Each request drafts over its own drafter state (`IPerRequestDraftState`: a DFlash ring per
+request, 81 MB on Flash Next's DFlash2), and its context catches up over tokens it took in batched steps.
+A turn's first step pays for the switch (the arena hands the holder back, the drafter catches up:
+100-250 ms), which is why a turn lasts 64 steps: turning every step was measured at 6-13 tokens/s against
+25-35 batched. Strata's 4-at-once rounds went from 30-34 to 37-43 tokens/s in all; the engine benchmark's
+two- and four-request scenarios (shorter greedy answers) stayed at 32-34. `TS_SPEC_TURNS=0/1` overrides.
+
 ## Where n-gram pays
 
 `--spec-type ngram` needs no trained weights, so it works on any checkpoint of a

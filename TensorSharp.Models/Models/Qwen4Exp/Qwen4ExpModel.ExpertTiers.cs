@@ -49,6 +49,9 @@ namespace TensorSharp.Models
         // TryPlanExpertTiers): a discrete-VRAM plan without a covering profile.
         private bool _recordingDeviceRoutes;
 
+        /// <summary>Window slots the registered tiers fill on demand (0 without tiers or on discrete VRAM).</summary>
+        private int _tierWindowSlots;
+
         internal static bool ExpertTiersEnabled()
             => Environment.GetEnvironmentVariable("TS_MOE_HOT_TIER") is not "0";
 
@@ -386,6 +389,7 @@ namespace TensorSharp.Models
                 foreach (int e in tier) hit += counts[e];
                 if (profiled) covered += (double)hit / _routingProfile.Routes(l);
             }
+            _tierWindowSlots = windowSlots;
             Console.WriteLine($"[moe-offload] qwen4exp (tiered): all {moeLayers.Count} layers' routed experts run at " +
                 $"a host seam; {tiered} layers keep their most-routed experts on the accelerator ({experts} experts, " +
                 $"{Gb(bytes)} of a {Gb(budget)} budget) covering {covered / Math.Max(1, moeLayers.Count) * 100:F1}% " +

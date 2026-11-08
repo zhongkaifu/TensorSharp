@@ -1319,6 +1319,9 @@ namespace TensorSharp.Runtime.Scheduling
                 bool speculated = speculate && TryRunBatchedSpeculativeSubset(decodeWork, results, ref handledBatched);
                 if (mixedWork != null)
                     CompleteMixedPrefill(mixedWork, Stopwatch.GetTimestamp() - specStarted, results, ref mixedHandled);
+                // No batched verify: on a trunk that prefers it, one sequence takes a solo speculative turn instead.
+                if (!speculated && dn >= 2 && dn == n && TrySpeculativeTurn(fused, decodeWork, results))
+                    return results;
                 if (!speculated && dn >= 2)
                 {
                     var reqIds = new string[dn];
@@ -2420,7 +2423,7 @@ namespace TensorSharp.Runtime.Scheduling
         private SequenceStepResult ExecuteSpeculativeWorkCore(
             SpecSeqContext context, SequenceState seq, ScheduledSequenceWork work, int prevComputed)
         {
-            (_model as IBatchedSpeculativeTarget)?.BindDraftState(seq.RequestId);
+            (_model as IPerRequestDraftState)?.BindDraftState(seq.RequestId);
             if (work.IsPrefill)
             {
                 int[] chunk = BuildPrefillChunk(seq, work);
@@ -2622,13 +2625,91 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly Dictionary<string, SpecSeqContext> _fusedSpecCtx = new(StringComparer.Ordinal);
         private readonly HashSet<string> _fusedSpecDeclined = new(StringComparer.Ordinal);
 
+        // Speculative turns (TrySpeculativeTurn): TS_SPEC_TURNS=0 never, =1 always (where the trunk can), unset where
+        // the trunk prefers them (ISpeculativeTarget.SpecTurnsPreferred).
+        private static readonly string? s_specTurns = Environment.GetEnvironmentVariable("TS_SPEC_TURNS");
+        /// <summary>Speculative steps one sequence keeps the turn for before the next takes it (if still decoding).
+        /// A turn's first step pays for switching holders (100-250 ms on Flash Next: the arena hands the holder back,
+        /// the drafter catches up), so turning every step served 6-13 tokens/s against 25-35 batched; 64 steps
+        /// (~180 tokens) amortize it.</summary>
+        internal const int SpeculativeTurnSteps = 64;
+        private readonly Dictionary<string, long> _turnLastServed = new(StringComparer.Ordinal);
+        private string? _turnHolder;
+        private int _turnSteps;
+        private long _turnClock;
+        private long _speculativeTurns;
+
+        /// <summary>Solo speculative steps served as turns to concurrent decoders.</summary>
+        internal long SpeculativeTurns => _speculativeTurns;
+
+        /// <summary>
+        /// Concurrent decoders on a trunk with no batched verify that prefers turns (<see cref="ISpeculativeTarget.SpecTurnsPreferred"/>):
+        /// the turn's sequence takes one solo speculative step on its own holder while the others wait, and keeps the
+        /// turn for <see cref="SpeculativeTurnSteps"/> steps; then the sequence served longest ago takes it. Each drafts
+        /// over its own drafter state (<see cref="IPerRequestDraftState"/>), and its context catches up over the tokens
+        /// it took in batched steps. What a sequence emits does not change, only when (in bursts). Returns false -
+        /// nothing forwarded, the holder checked in by the batched step - when turns are off or this sequence cannot
+        /// speculate now.
+        /// </summary>
+        private bool TrySpeculativeTurn(IBatchedPagedModel fused, List<ScheduledSequenceWork> decodeWork,
+            List<SequenceStepResult> results)
+        {
+            if (s_specTurns == "0" || !SpeculationEnabledThisStep)
+                return false;
+            if (_model is not ISpeculativeTarget spec || !spec.SpeculationProfitable || !spec.SpecTrunkFollowsBoundCache
+                || _model is not IPerRequestDraftState)
+                return false;
+            if (s_specTurns != "1" && !spec.SpecTurnsPreferred)
+                return false;
+            bool Eligible(SequenceState candidate) => CanSpeculate(candidate)
+                && !_pendingRetainedFusedTruncations.ContainsKey(candidate.RequestId)
+                && !_fusedSpecDeclined.Contains(candidate.RequestId)
+                && fused.HasFusedSequenceCache(candidate.RequestId);
+            ScheduledSequenceWork? chosen = null;
+            if (_turnHolder != null && _turnSteps < SpeculativeTurnSteps)
+                foreach (var work in decodeWork)
+                    if (string.Equals(work.Sequence.RequestId, _turnHolder, StringComparison.Ordinal) && Eligible(work.Sequence))
+                    { chosen = work; break; }
+            if (chosen == null)
+            {
+                long oldest = long.MaxValue;
+                foreach (var work in decodeWork)
+                {
+                    if (!Eligible(work.Sequence)) continue;
+                    long last = _turnLastServed.TryGetValue(work.Sequence.RequestId, out long t) ? t : 0;
+                    if (last < oldest) { oldest = last; chosen = work; }
+                }
+                if (chosen == null) { _turnHolder = null; return false; }
+                _turnHolder = chosen.Sequence.RequestId;
+                _turnSteps = 0;
+            }
+            var seq = chosen.Sequence;
+            int prevComputed = seq.NumComputedTokens;
+            if (!BindFusedHolder(fused, seq, results))
+                return true;   // its result (a rewind that re-prefills) is the step's; the others wait one step
+            if (!TrySpeculativeFusedDecode(seq, prevComputed, out SequenceStepResult? specResult))
+            {
+                _turnHolder = null;
+                return false;
+            }
+            results.Add(specResult);
+            _turnLastServed[seq.RequestId] = ++_turnClock;
+            ++_turnSteps;
+            ++_speculativeTurns;
+            if (_cbDebug)
+                Console.Error.WriteLine($"[cb] spec turn {seq.RequestId} step {_turnSteps}: {specResult.TokensForwarded} tokens");
+            return true;
+        }
+
         private void DisposeFusedSpecContext(string requestId)
         {
             if (string.IsNullOrEmpty(requestId)) return;
+            _turnLastServed.Remove(requestId);
+            if (string.Equals(_turnHolder, requestId, StringComparison.Ordinal)) _turnHolder = null;
             if (_fusedSpecCtx.Remove(requestId, out var ctx))
                 ctx.Exec?.Dispose();
             _fusedSpecDeclined.Remove(requestId);
-            (_model as IBatchedSpeculativeTarget)?.ReleaseDraftState(requestId);
+            (_model as IPerRequestDraftState)?.ReleaseDraftState(requestId);
         }
 
         /// <summary>
@@ -2659,7 +2740,7 @@ namespace TensorSharp.Runtime.Scheduling
             // The bound holder must agree with the scheduler about the position.
             if (spec.CacheSeqLen != prevComputed)
                 return false;
-            (_model as IBatchedSpeculativeTarget)?.BindDraftState(seq.RequestId);
+            (_model as IPerRequestDraftState)?.BindDraftState(seq.RequestId);
             if (!TryGetFusedSpecContext(spec, seq, prevComputed, out SpecSeqContext? ctx))
                 return false;
 

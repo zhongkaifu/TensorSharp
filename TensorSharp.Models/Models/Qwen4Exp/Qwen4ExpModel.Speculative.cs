@@ -52,6 +52,11 @@ namespace TensorSharp.Models
         // chunk's MRoPE positions before Forward consumes them for MTP catch-up.
         public bool SpecSupportsMultimodalPrefill => !HasDistributedQwen;
         public bool SpecTrunkFollowsBoundCache => !HasDistributedQwen;
+
+        /// <summary>On ggml_metal with expert tiers that read their misses into window slots (unified memory), a step
+        /// is bound by the experts it reads: four requests batched decoded 30-35 tokens/s in all on a 48 GB M5 Pro
+        /// against 40-44 for one speculating alone, so concurrent requests take turns (BatchExecutor).</summary>
+        public bool SpecTurnsPreferred => _backend == BackendType.GgmlMetal && _tierWindowSlots > 0;
         public bool SpeculationProfitable => !HasDistributedQwen && !_specStateFailed && IsGgmlBackend
             && !_tokenGraphUnsupported && !_fusedGateUpExperts
             && !_fusedFfnUnsupported && !_fusedGdnUnsupported && !_fusedAttnUnsupported

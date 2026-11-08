@@ -239,6 +239,17 @@ namespace TensorSharp.Runtime.Speculative
         bool SpecTrunkFollowsBoundCache => false;
 
         /// <summary>
+        /// Concurrent decoders should take turns at solo speculative steps (one request keeps the turn for a stretch
+        /// of steps) rather than decode one token each in the token-batched graph. True where a speculative step
+        /// serves more tokens per second than a batched step for several sequences: Flash Next streaming its expert
+        /// misses on a 48 GB M5 Pro decoded four requests at 30-35 tokens/s in all batched against 40-44 for one
+        /// request speculating alone, the way Strata serves them (one at a time, 52-55). Needs per-request drafter
+        /// state (<see cref="IPerRequestDraftState"/>). TS_SPEC_TURNS=0/1 overrides. False by default: on a discrete
+        /// GPU a batched step costs little more than a solo one.
+        /// </summary>
+        bool SpecTurnsPreferred => false;
+
+        /// <summary>
         /// Trunk forward identical to <see cref="IModelArchitecture.Forward"/>
         /// but additionally captures the post-final-norm hidden state of every
         /// row into <paramref name="hAllOut"/> (n*<see cref="SpecFeatureSize"/>
@@ -430,6 +441,21 @@ namespace TensorSharp.Runtime.Speculative
     public interface ISpeculativeModel : ISpeculativeTarget, IDraftHead { }
 
     /// <summary>
+    /// A drafter that keeps one state per request (a DFlash ring is the context of ONE sequence). Concurrent
+    /// requests that speculate - in a batched verify, or taking turns at solo speculative steps - each bind their own
+    /// before drafting, so one request's drafts never read another's context.
+    /// </summary>
+    public interface IPerRequestDraftState
+    {
+        /// <summary>Point the drafter's per-sequence state at
+        /// <paramref name="requestId"/> (created on first use); null selects the shared state.</summary>
+        void BindDraftState(string? requestId);
+
+        /// <summary>Return <paramref name="requestId"/>'s drafter state.</summary>
+        void ReleaseDraftState(string requestId);
+    }
+
+    /// <summary>
     /// A trunk that verifies the draft windows of SEVERAL concurrent sequences, each
     /// in its own per-request cache, in one forward. Without it concurrent requests
     /// decode one token per step in a token-batched graph while a lone request
@@ -440,7 +466,7 @@ namespace TensorSharp.Runtime.Speculative
     /// state per request (<see cref="BindDraftState"/>), because several sequences
     /// now draft between the same pair of verifies.
     /// </summary>
-    public interface IBatchedSpeculativeTarget
+    public interface IBatchedSpeculativeTarget : IPerRequestDraftState
     {
         /// <summary>Tokens per sequence (anchor plus drafts) one batched verify of
         /// <paramref name="sequences"/> sequences forwards, or 0 when the trunk cannot
@@ -456,13 +482,6 @@ namespace TensorSharp.Runtime.Speculative
         /// writes its whole window for every sequence, padding included, so the window
         /// must fit every sequence's free rows.</summary>
         int FusedCacheFreeRows(string requestId) => 0;
-
-        /// <summary>Point the drafter's per-sequence state at
-        /// <paramref name="requestId"/> (created on first use); null selects the shared state.</summary>
-        void BindDraftState(string? requestId);
-
-        /// <summary>Return <paramref name="requestId"/>'s drafter state.</summary>
-        void ReleaseDraftState(string requestId);
 
         /// <summary>Scope of one batched step: drafting inside it must not end or
         /// re-enter the trunk's single-sequence speculative session.</summary>
