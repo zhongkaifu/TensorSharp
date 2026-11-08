@@ -103,7 +103,15 @@ namespace TensorSharp.Cuda
         private long _hotUntil;
         private volatile bool _stop;
         private Exception _error;
-        private long _served, _missed, _rows;
+        private long _served, _missed, _rows, _tailSkipped;
+
+        /// <summary>The route-tail skip (Strata's STRATA_ROUTE_TAIL_SKIP): a host expert every row of a call routes at
+        /// this rank or lower is not computed (its routes add nothing; the weights are not renormalized). 0: off. The
+        /// publish kernel applies the same rule to whether the layer rings at all.</summary>
+        public int TailRank { get; set; }
+
+        /// <summary>Host slots the route-tail skip left out so far.</summary>
+        public long TailSkipped => Interlocked.Read(ref _tailSkipped);
 
         /// <summary>Per layer, how often each expert was selected in decode steps (adaptive residency), or null.
         /// Written by the server while steps run, read and decayed by the engine between them.</summary>
@@ -183,16 +191,30 @@ namespace TensorSharp.Cuda
                     var L = _layers[layer];
                     int* ids = stackalloc int[slots];
                     byte* skip = stackalloc byte[slots];
-                    int misses = 0;
+                    int misses = 0, tail = TailRank, tailSkipped = 0;
                     for (int k = 0; k < slots; k++)
                     {
                         int e = box.Ids[k];
                         int idx = (uint)e < (uint)L.HostIndex.Length ? L.HostIndex[e] : -1;
                         bool host = idx >= 0;
+                        if (host && tail > 0 && k % _nUsed >= tail)
+                        {
+                            // Computed only when some row routes the same expert above the tail.
+                            bool needed = false;
+                            for (int k2 = 0; k2 < slots && !needed; k2++)
+                                needed = box.Ids[k2] == e && k2 % _nUsed < tail;
+                            if (!needed)
+                            {
+                                host = false;
+                                tailSkipped++;
+                            }
+                        }
                         ids[k] = host ? idx : 0;
                         skip[k] = host ? (byte)0 : (byte)1;
                         if (host) misses++;
                     }
+                    if (tailSkipped > 0)
+                        Interlocked.Add(ref _tailSkipped, tailSkipped);
                     if (misses > 0)
                     {
                         int rows = slots / _nUsed;

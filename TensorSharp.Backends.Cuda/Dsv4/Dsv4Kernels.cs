@@ -54,6 +54,8 @@ namespace TensorSharp.Cuda
         // Staging that keeps earlier calls' experts (optional: a module before it re-stages per call).
         private readonly IntPtr moeStageCopyFrom;
         private readonly IntPtr doorbellPublishSkip, doorbellWaitAddSkip, moeDownDecodeShort;
+        // The doorbell with the route-tail skip (optional).
+        private readonly IntPtr doorbellPublishTail;
         private readonly IntPtr denseBf16Rows, denseQ81RowsSplitK, denseBf16RowsSplitK;
         // The same products for 2..16 rows in one block, the weights read once (optional: a module before it launches a
         // block per row).
@@ -200,6 +202,8 @@ namespace TensorSharp.Cuda
                 {
                     doorbellPublishSkip = module.GetFunction("ts_moe_doorbell_publish_skip");
                     doorbellWaitAddSkip = module.GetFunction("ts_moe_doorbell_wait_add_skip");
+                    try { doorbellPublishTail = module.GetFunction("ts_moe_doorbell_publish_tail"); }
+                    catch (CudaException ex) when (ex.ErrorCode == 500) { doorbellPublishTail = IntPtr.Zero; }
                 }
                 catch (CudaException ex) when (ex.ErrorCode == 500)
                 {
@@ -818,12 +822,24 @@ namespace TensorSharp.Cuda
         /// host; <see cref="MoeDoorbellWaitAdd"/> then reads it. Zero rings for every layer.</param>
         /// <param name="counts">With <paramref name="missDev"/>: a device [layers, nExpert] table each selection is counted
         /// into (adaptive residency), or zero.</param>
+        /// <summary>Whether <see cref="MoeDoorbellPublish"/> takes a route-tail rank (with a miss word).</summary>
+        public bool HasDoorbellTail => doorbellPublishTail != IntPtr.Zero;
+
+        /// <param name="tailRank">With <see cref="HasDoorbellTail"/> and a miss word: host experts every row routes at this
+        /// rank or lower ring no doorbell (the route-tail skip); 0 rings for every host expert.</param>
         public void MoeDoorbellPublish(Tensor x, Tensor sel, Tensor selW, IntPtr isHost, int n, int slots, int layer,
-            CudaHostExpertMailbox box, IntPtr stream, IntPtr missDev = default, IntPtr counts = default, int nExpert = 0)
+            CudaHostExpertMailbox box, IntPtr stream, IntPtr missDev = default, IntPtr counts = default, int nExpert = 0,
+            int nUsed = 0, int tailRank = 0)
         {
             IntPtr a0 = P(x), a1 = P(sel), a2 = P(selW), a3 = isHost; int a4 = n, a5 = slots, a6 = layer;
             IntPtr a7 = box.XDev, a8 = box.IdsDev, a9 = box.WDev, a10 = box.HeaderDev, a11 = box.SeqDev, a12 = missDev, a13 = counts;
-            int a14 = nExpert;
+            int a14 = nExpert, a15 = nUsed, a16 = tailRank;
+            if (tailRank > 0 && nUsed > 0 && missDev != IntPtr.Zero && HasDoorbellTail)
+            {
+                void** tail = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14, &a15, &a16 };
+                Launch(doorbellPublishTail, 1, 1, 1, 1024, 0, stream, tail);
+                return;
+            }
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13, &a14 };
             Launch(missDev != IntPtr.Zero ? doorbellPublishSkip : doorbellPublish, 1, 1, 1, 1024, 0, stream, args);
         }

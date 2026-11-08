@@ -509,6 +509,50 @@ namespace TensorSharp.Cuda
             }
             if (_adaptCounts != null && _adaptCountsDev == IntPtr.Zero)
                 _hostServer.Counts = _adaptCounts;   // an older module: the host counts what every layer's doorbell names
+            ConfigureTailSkip();
+        }
+
+        /// <summary>The route-tail skip's rank in force (0: off).</summary>
+        private int _tailRank;
+
+        /// <summary>Host slots the route-tail skip left out so far, or -1 without host experts (tests).</summary>
+        internal long TailSkipped => _hostServer?.TailSkipped ?? -1;
+
+        /// <summary>
+        /// Strata's route-tail skip (STRATA_ROUTE_TAIL_SKIP=7, its default): in a decode step or verify window a host expert
+        /// that every row routes at rank TS_MOE_ROUTE_TAIL_SKIP or lower (0-based in the row's descending top-k: the 8th to
+        /// 10th of Flash Next's 10) is neither computed nor waited for; its routes add nothing and the weights are not
+        /// renormalized, so answers become approximate. Off when every expert is resident, when at least
+        /// TS_MOE_TAIL_SKIP_MAX_CACHED percent of the experts have VRAM slots, and for prompts (they stage every route).
+        /// </summary>
+        private void ConfigureTailSkip()
+        {
+            var r = _residency;
+            var m = _m;
+            int rank = Math.Max(0, EnvInt("TS_MOE_ROUTE_TAIL_SKIP", 7));
+            int maxCached = Math.Clamp(EnvInt("TS_MOE_TAIL_SKIP_MAX_CACHED", 90), 0, 100);
+            _tailRank = 0;
+            if (_hostServer == null || r == null || rank <= 0 || rank >= m.NExpertUsed)
+                return;
+            double cached = r.TotalExperts > 0 ? (double)r.SlotExperts / r.TotalExperts : 1.0;
+            if (cached * 100.0 >= maxCached)
+            {
+                Console.Error.WriteLine($"[q4e-cuda] route-tail skip off: {cached * 100:F1}% of the experts have VRAM slots "
+                    + $"(TS_MOE_TAIL_SKIP_MAX_CACHED={maxCached}).");
+                return;
+            }
+            if (_doorbellMiss == IntPtr.Zero || !_devs[0].DK.HasDoorbellTail)
+            {
+                Console.Error.WriteLine("[q4e-cuda] route-tail skip off: the loaded tensorsharp_dsv4_kernels module predates "
+                    + "ts_moe_doorbell_publish_tail (or the doorbell skip is off); every missed expert is computed. Rebuild "
+                    + "TensorSharp.Backends.Cuda with a CUDA 13 nvcc on PATH.");
+                return;
+            }
+            _tailRank = rank;
+            _hostServer.TailRank = rank;
+            Console.Error.WriteLine($"[q4e-cuda] route-tail skip: in decode steps and verify windows a host expert every row routes "
+                + $"at rank {rank} or lower (0-based, of {m.NExpertUsed}) is left out, unrenormalized (Strata's "
+                + "STRATA_ROUTE_TAIL_SKIP; answers become approximate). TS_MOE_ROUTE_TAIL_SKIP=0 computes every route.");
         }
 
         /// <summary>A device int the doorbell kernels share per layer: whether the layer rang the host (zero: every layer

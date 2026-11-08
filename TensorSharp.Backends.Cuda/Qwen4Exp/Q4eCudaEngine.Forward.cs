@@ -871,7 +871,7 @@ namespace TensorSharp.Cuda
                 dev.QK.CountSelected(Ptr(dev.Moe.Sel), nt * m.NExpertUsed, (IntPtr)((long)_promptCountsDev + 4L * il * m.NExpert), dev.Stream);
             if (host)
                 dev.DK.MoeDoorbellPublish(dev.Cur, dev.Moe.Sel, dev.Moe.SelW, L.Stage.IsHost, nt * e, nt * m.NExpertUsed, il,
-                    _hostBox, dev.Stream, _doorbellMiss, _adaptCountsDev, m.NExpert);
+                    _hostBox, dev.Stream, _doorbellMiss, _adaptCountsDev, m.NExpert, m.NExpertUsed, _tailRank);
 
             if (!fork)
             {

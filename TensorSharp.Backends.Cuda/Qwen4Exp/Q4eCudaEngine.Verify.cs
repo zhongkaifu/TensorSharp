@@ -163,7 +163,7 @@ namespace TensorSharp.Cuda
                 throw new InvalidOperationException($"[q4e-cuda] context overflow: n_past={p0} + {nt} > n_ctx={_m.NCtx}");
             EnsureVerifySaves();
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
-            long missedBefore = _perf > 0 ? HostExpertMisses : 0;
+            long missedBefore = _perf > 0 ? HostExpertMisses : 0, tailBefore = _perf > 0 ? TailSkipped : 0;
             slot.Failed = true;
             ArmHostExperts();
             _verifyCapture = true;
@@ -190,7 +190,8 @@ namespace TensorSharp.Cuda
             AdaptResidency();
             if (_perf > 0)
                 Console.Error.WriteLine($"[q4e-cuda] verify {nt} rows in {System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds:F2} ms, "
-                    + $"host issue {IssueMs(start):F2} ms, {HostExpertMisses - missedBefore} experts on the CPU");
+                    + $"host issue {IssueMs(start):F2} ms, {HostExpertMisses - missedBefore} experts on the CPU"
+                    + (_tailRank > 0 ? $", {TailSkipped - tailBefore} tail-skipped" : ""));
         }
 
         /// <summary>

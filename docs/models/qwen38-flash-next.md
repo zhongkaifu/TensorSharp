@@ -1232,6 +1232,31 @@ but each round stalls the GPU while it copies) and skips missed experts that eve
 (`STRATA_ROUTE_TAIL_SKIP=7`, on by default, which changes its output). Prompts still read at 2,150-2,250 tok/s
 against Strata's 4,360-5,950, and Strata's windows hold a fifth token (`--spec 4`).
 
+#### Route-tail skip on the direct engine (default), 2026-11-08
+
+Strata skips, by default, the missed experts a window routes only at its tail (`STRATA_ROUTE_TAIL_SKIP=7`). The direct
+engine now does the same (`TS_MOE_ROUTE_TAIL_SKIP`, default 7; `TS_MOE_TAIL_SKIP_MAX_CACHED`, default 90; the switch
+names are shared with the GGML backends' expert tiers). In a decode step or verify window, a host expert (no VRAM slot)
+that every row of the window routes at 0-based rank 7 or lower, the 8th to 10th of Flash Next's 10, is neither
+computed by the CPU nor waited for. Its routes add nothing and the weights are not renormalized, so answers become
+approximate (Strata measures a KL of 0.003-0.006 and about 98% top-1 agreement on 2-3 bit packs). The doorbell kernel
+(`ts_moe_doorbell_publish_tail`) applies the rule to whether a layer rings the host at all, so a layer whose only misses
+are in the tail costs no round trip; the host server applies it to the slots of a layer that rings. It is off when
+every expert is resident, when 90% or more of the experts have slots, and for prompts, which stage every route.
+`TS_MOE_ROUTE_TAIL_SKIP=0` computes every route; the parity tests pin it there.
+
+RTX 5090, ISTA `Q2_0`, MTP, same build and client, 3 repetitions (TTFT / decode tok/s; 15/15 PASS both):
+
+| route-tail skip | short chat | long generation | 4K prompt | 16K prompt | CPU experts a window after 4K / 16K |
+| --- | --- | --- | --- | --- | --- |
+| `0` (every route) | 0.08-0.10 s / 87-113 | 140-175 | 1.62-1.70 s / 119-144 | 6.75-6.87 s / 150-170 | 185-242 / 95-147 |
+| `7` (default) | 0.08-0.11 s / 83-99 | 153-188 | 1.62-1.70 s / 128-176 | 6.76-6.87 s / 163-183 | 128-140 / 42-96 |
+| Strata (its default, `7`) | 0.24 s / 93-115 | 300-307 | 0.92 s / 376-408 | 2.75 s / 387-421 | |
+
+Tried and dropped the same day: a prompt attention kernel with a KV head's query heads in one block (each cell's K and
+V read once into shared memory, each head's online softmax in one warp) read the 4K prompt in 1.72 s against 1.69 s and
+the 16K one in 7.0 s against 6.8 s; one warp walking every cell of a head was slower than eight warps sharing them.
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the

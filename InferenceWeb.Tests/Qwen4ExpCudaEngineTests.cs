@@ -36,6 +36,8 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         // native span (F16 KV) and to fixed placements bit for bit. The tests of those features turn them on.
         KvCacheDtypeConfig.Set(KvCacheDtype.F16);
         _env.Set("TS_MOE_TIER_ADAPT", "0");
+        // The route-tail skip (on by default) leaves rank-7+ misses out: these tests hold every route computed.
+        _env.Set("TS_MOE_ROUTE_TAIL_SKIP", "0");
     }
 
     public void Dispose()
@@ -639,6 +641,50 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         for (int i = 0; i < grouped.Rows.Length; i++)
             Assert.True(grouped.Rows[i].AsSpan().SequenceEqual(ubatchOrder.Rows[i]),
                 $"{(i == 0 ? "prefill" : $"decode {i}")}: reading the prompt layer by layer changed the logits");
+    }
+
+    /// <summary>
+    /// The route-tail skip (TS_MOE_ROUTE_TAIL_SKIP; Strata's STRATA_ROUTE_TAIL_SKIP): in decode steps and verify windows a
+    /// host expert every row routes at the given rank or lower is left out. The fixture routes 4 of 16 experts, so rank 2
+    /// leaves out misses at ranks 2-3: some slots are skipped and the answers move; a rank as wide as the selection skips
+    /// nothing and answers bit for bit as off; the prompt (staged) is untouched.
+    /// </summary>
+    [CudaFact]
+    public void TheRouteTailSkip_LeavesOutOnlyLowRankedMisses()
+    {
+        string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        (float[][] Rows, long Skipped, long Misses) Answer(string rank)
+        {
+            _env.Set("TS_MOE_ROUTE_TAIL_SKIP", rank);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            float[][] rows = Run(model);
+            return (rows, engine.TailSkipped, engine.HostExpertMisses);
+        }
+        var off = Answer("0");
+        var wide = Answer(Qwen4ExpSyntheticModelBuilder.ExpertsUsed.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var tail = Answer("2");
+        _output.WriteLine($"host experts computed: off {off.Misses}, rank 4 {wide.Misses}, rank 2 {tail.Misses} ({tail.Skipped} skipped)");
+        Assert.Equal(0, off.Skipped);
+        Assert.Equal(0, wide.Skipped);
+        // A layer whose misses are all in the tail rings no doorbell, so the host's count of skipped slots covers only the
+        // layers that rang; the computed misses fall either way.
+        Assert.True(tail.Misses < off.Misses, "the tail skip did not lower the host's share");
+        Assert.True(off.Rows[0].AsSpan().SequenceEqual(tail.Rows[0]), "the tail skip changed the prompt");
+        bool moved = false;
+        for (int i = 0; i < off.Rows.Length; i++)
+        {
+            Assert.True(off.Rows[i].AsSpan().SequenceEqual(wide.Rows[i]), $"{(i == 0 ? "prefill" : $"decode {i}")}: a rank as wide as the selection changed the logits");
+            Assert.All(tail.Rows[i], v => Assert.True(float.IsFinite(v)));
+            moved |= !off.Rows[i].AsSpan().SequenceEqual(tail.Rows[i]);
+        }
+        Assert.True(moved, "skipping routes left every decode step as it was");
     }
 
     /// <summary>Host experts (Strata's doorbell): decode steps leave the experts without a VRAM slot to the
