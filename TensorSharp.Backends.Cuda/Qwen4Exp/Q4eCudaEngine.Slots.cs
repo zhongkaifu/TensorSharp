@@ -52,12 +52,12 @@ namespace TensorSharp.Cuda
                 // by a whole slot, and giving up the decode graphs there only made each request capture them again (139
                 // of 1,665 verify windows ran uncaptured, short-prompt decode 122-171 -> 95-116 tok/s).
                 if (SlotShortfall() > GraphReleaseBytes)
-                    return -1;
+                    return RefuseSlot();
                 bool fits = false;
                 while (!fits && ReleaseBatchGraphsForMemory())
                     fits = SlotFits();
                 if (!fits)
-                    return -1;
+                    return RefuseSlot();
             }
             Slot slot;
             try
@@ -77,6 +77,26 @@ namespace TensorSharp.Cuda
         /// at the initial capacity, plus room for one slot to grow to the whole context, so the
         /// sequences already running are not left without memory to grow into.</summary>
         private bool SlotFits() => SlotShortfall() <= 0;
+
+        private long _slotRefusalNoted;
+
+        /// <summary>-1, saying (at most every 30 s) how far the devices are from another slot: the model's own message names
+        /// only the running requests.</summary>
+        private int RefuseSlot()
+        {
+            long now = Environment.TickCount64;
+            if (now - _slotRefusalNoted >= 30_000)
+            {
+                _slotRefusalNoted = now;
+                long need = 0;
+                for (int d = 0; d < _devs.Length; d++)
+                    need = Math.Max(need, _slotInitialBytes[d] + _slotGrowBytes[d]);
+                Console.Error.WriteLine($"[q4e-cuda] no room for another sequence slot: {SlotShortfall() / 1048576.0:F0} MiB short of "
+                    + $"{need / 1048576.0:F0} MiB plus the {SlotReserveBytes / 1048576.0:F0} MiB reserve ({_slots.Count} slots, "
+                    + $"{_graphs.Count} solo and {_batchGraphs.Count} batched graphs held)");
+            }
+            return -1;
+        }
 
         /// <summary>Bytes the device shortest of room lacks for one more slot beside the reserve (0 or less when it fits),
         /// counting what the allocators hold pooled.</summary>

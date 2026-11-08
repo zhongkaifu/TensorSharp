@@ -614,8 +614,10 @@ namespace TensorSharp.Cuda
             var m = _m;
             var L = m.Layers[il];
             long b = 0;
+            // The rewind checkpoint (TS_Q4E_REWIND_CHECKPOINT) keeps a second copy of each recurrent state and the PLE history.
+            int copies = _rewindCheckpoint ? 2 : 1;
             if (L.Recurrent)
-                b += (long)(m.DConv - 1) * ConvDim * 4 + (long)m.GdnVHeads * Q4eKernels.GdnHeadDim * Q4eKernels.GdnHeadDim * 4;
+                b += copies * ((long)(m.DConv - 1) * ConvDim * 4 + (long)m.GdnVHeads * Q4eKernels.GdnHeadDim * Q4eKernels.GdnHeadDim * 4);
             else
             {
                 // A streamed layer (TS_Q4E_KV_RESIDENT): the window, its map and the raw keys' ring.
@@ -625,7 +627,7 @@ namespace TensorSharp.Cuda
                     b += (long)(streamed ? _idxRing : m.NCtx) * m.IdxDim * 2 + (long)(m.NCtx / L.CompressRatio) * m.IdxDim * 4;
             }
             if (L.Ple)
-                b += (long)(m.PleConvKernel - 1) * m.PleDilation * m.Hc * m.NEmbd * 4;
+                b += copies * ((long)(m.PleConvKernel - 1) * m.PleDilation * m.Hc * m.NEmbd * 4);
             return b;
         }
 
