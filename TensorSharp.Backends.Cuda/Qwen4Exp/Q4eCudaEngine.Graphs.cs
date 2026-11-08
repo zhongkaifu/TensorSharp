@@ -239,6 +239,7 @@ namespace TensorSharp.Cuda
 
         private void DestroySlotGraphs(int slotId)
         {
+            DestroyBatchGraphs(slotId);
             List<(int, int, int)> keys = null;
             foreach (var key in _graphs.Keys)
                 if (key.Slot == slotId)

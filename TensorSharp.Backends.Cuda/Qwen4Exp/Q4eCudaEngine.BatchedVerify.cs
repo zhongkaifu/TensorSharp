@@ -157,9 +157,12 @@ namespace TensorSharp.Cuda
             ArmHostExperts();
             try
             {
-                ForwardUbatch(null, tokens, 0, nt, 0, null, rows, positions);
                 // Each row's first-max token from the device, or (a sampled verify) every row's logits.
-                IssueHead(nt, logits: true, allRows: true, hidden: hAll != null, greedy: logitsOut == null);
+                if (!ForwardBatchGraphed(rows, tokens, positions, window, greedy: logitsOut == null, hidden: hAll != null))
+                {
+                    ForwardUbatch(null, tokens, 0, nt, 0, null, rows, positions);
+                    IssueHead(nt, logits: true, allRows: true, hidden: hAll != null, greedy: logitsOut == null);
+                }
                 FinishHead(nt, logitsOut, true, hAll, 0, logitsOut == null ? drawnOut : null);
             }
             finally

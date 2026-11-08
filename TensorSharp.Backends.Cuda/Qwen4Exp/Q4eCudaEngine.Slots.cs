@@ -161,7 +161,10 @@ namespace TensorSharp.Cuda
             ArmHostExperts();
             try
             {
-                ForwardUbatch(null, tokens, 0, n, 0, logits, rows, positions);
+                if (ForwardBatchGraphed(rows, tokens, positions, 1, greedy: false, hidden: false))
+                    FinishHead(n, logits, true, null);
+                else
+                    ForwardUbatch(null, tokens, 0, n, 0, logits, rows, positions);
             }
             finally
             {

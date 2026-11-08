@@ -100,13 +100,14 @@ namespace TensorSharp.Cuda
             dev.ShUp = AllocF32(dev, nt, m.NFfShexp);
             dev.ShDown = AllocF32(dev, nt, e);
             // A captured step's row positions (a decode step's one, a verify window's up to VerifyMaxRows).
-            dev.PosDev = AllocT(dev, DType.Int32, VerifyMaxRows);
+            // A verify window's rows, or a batched step's (BatchGraphs.cs).
+            dev.PosDev = AllocT(dev, DType.Int32, Math.Max(VerifyMaxRows, PerSlotMaxRows));
             if (dev.Ordinal == 0)
             {
                 dev.Tokens = AllocT(dev, DType.Int32, nt);
                 // PORTABLE: every device may read them.
                 CudaDriverApi.cuMemHostAlloc(out _pinnedTokens, new UIntPtr((ulong)nt * 4), 0x1).ThrowOnError();
-                CudaDriverApi.cuMemHostAlloc(out _posPinned, new UIntPtr((ulong)VerifyMaxRows * 4), 0x1).ThrowOnError();
+                CudaDriverApi.cuMemHostAlloc(out _posPinned, new UIntPtr((ulong)Math.Max(VerifyMaxRows, PerSlotMaxRows) * 4), 0x1).ThrowOnError();
             }
             if (dev.Ordinal == _lastDev)
             {
@@ -612,9 +613,11 @@ namespace TensorSharp.Cuda
                 Gdn(dev, L, il, slot, nt, rows, curQ);
             else if (rows != null)
                 // A batched step's rows, a sequence's at a time: one row each in a batched decode step, a sequence's whole
-                // window (consecutive positions) in a batched verify, issued as that sequence's own verify issues it.
+                // window (consecutive positions) in a batched verify, issued as that sequence's own verify issues it. A
+                // captured step's sequences read their rows' device positions.
                 for (int r = 0; r < nt; r += _batchRowsPerSeq)
-                    Attention(dev, L, il, rows[r].Layers[il], r, _batchRowsPerSeq, positions[r], curQ: curQ, curQRows: nt);
+                    Attention(dev, L, il, rows[r].Layers[il], r, _batchRowsPerSeq, positions[r],
+                        pos == IntPtr.Zero ? IntPtr.Zero : (IntPtr)((long)pos + 4L * r), curQ, nt);
             else
                 Attention(dev, L, il, slot.Layers[il], 0, nt, p0, pos, curQ, nt);
             // Decode-size halves meet in one launch: the scatter and the next mixer's first pass.
@@ -823,7 +826,7 @@ namespace TensorSharp.Cuda
                     // A captured window: the pooling kernel reads one row's position, so each row pools the block it
                     // completes, if it completes one.
                     for (int t = 0; t < nt; t++)
-                        QsaPool(dev, L, c, (IntPtr)((long)pos + 4L * (row0 + t)), 0, 0);
+                        QsaPool(dev, L, c, (IntPtr)((long)pos + 4L * t), 0, 0);
                 // Past the width the selection bites: score the complete blocks, keep the best.
                 if (p0 + nt > m.IdxTopK + R - 1)
                 {

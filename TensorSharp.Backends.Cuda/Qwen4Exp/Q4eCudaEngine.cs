@@ -928,6 +928,7 @@ namespace TensorSharp.Cuda
             foreach (var slot in _slots.Values)
                 FreeSlot(slot);
             DisposeKvHostPool();
+            DestroyBatchGraphs(-1);
             _graphs.Clear();
             _slots.Clear();
             foreach (var dev in _devs)
