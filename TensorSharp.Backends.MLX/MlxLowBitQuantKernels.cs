@@ -812,11 +812,13 @@ y[out_row * InDim + col] = {{LowBitTypes[i].Dequant}}(block, int(col & 255));
     // ---------------------------------------------------------------------------------------------
 
     /// <summary>Input rows from which the raw i-quant / low-bit matmuls dequantize to F16 and use
-    /// MLX's GEMM (TS_MLX_IQ_DEQUANT_GEMM_MIN_ROWS; 0 keeps the simdgroup kernel).</summary>
-    internal static readonly int IQuantDequantGemmMinRows =
+    /// MLX's GEMM (TS_MLX_IQ_DEQUANT_GEMM_MIN_ROWS; 0 keeps the simdgroup kernel). Unset, the row after
+    /// the few-row kernel's last (<see cref="IQuantFewRowMaxRows"/>).</summary>
+    internal static int IQuantDequantGemmMinRows => s_dequantGemmMinRows ??=
         int.TryParse(Environment.GetEnvironmentVariable("TS_MLX_IQ_DEQUANT_GEMM_MIN_ROWS"), out int parsedMinRows) && parsedMinRows >= 0
             ? parsedMinRows
-            : 32;
+            : IQuantFewRowMaxRows + 1;
+    private static int? s_dequantGemmMinRows;
 
     private static readonly System.Collections.Generic.Dictionary<string, MlxFastMetalKernel> dequantF16Kernels = new();
 
@@ -984,7 +986,8 @@ TENSORSHARP_LOWBIT_DQ8(tensorsharp_dq8_iq1_m, tensorsharp_dequant_iq1_m)
 
     // ---------------------------------------------------------------------------------------------
     // The few-row kernel: 2 to TS_MLX_IQ_FEWROW_MAX_ROWS input rows (a speculative verify window, a short
-    // prompt chunk) against a raw i-quant / low-bit weight, laid out as ggml-metal's few-row MMA kernels.
+    // prompt chunk; 2-8 rows where the tensor-API kernel below takes the rest) against a raw i-quant /
+    // low-bit weight, laid out as ggml-metal's few-row MMA kernels.
     // Every simdgroup of a threadgroup takes every NSG-th 64-value chunk of K for NT tiles of 8 weight rows,
     // and each lane decodes its 16 weights of a tile once, straight into simdgroup-matrix registers: no
     // threadgroup staging and no barrier until the closing sum of the NSG partial tiles. Lane l holds A row
@@ -1070,6 +1073,202 @@ for (int idx = static_cast<int>(tid); idx < {{rt * nt * 64}}; idx += {{32 * nsg}
 }
 """.Replace("UNROLL ", "_Pragma(\"clang loop unroll(full)\") ");
 
+    // ---------------------------------------------------------------------------------------------
+    // The same K split with the products on the Metal 4 tensor API (M5's per-core matrix units), for
+    // 9 rows and up. The kernel above is bound by the F32 simdgroup products past 8 rows (16 rows 151 ms
+    // against 79 for 8, an 8-row forward being ~430 GFLOP) and the dequant GEMM by writing the whole
+    // weight as F16 for every call (~590 ms from 32 rows). Here a threadgroup takes 32 weight rows and
+    // M = 16, 32 or 64 input rows; each simdgroup decodes its 64-value chunk of the 32 rows once into
+    // a tile of its own (only a simdgroup barrier) and multiplies it on the matrix units into its
+    // partial result, and the partials are summed once at the end. Operands are F16 (the activations
+    // read in place), the sums F32. Qwen3.8-27B-UD-IQ3_XXS, M5 Pro, a forward of N rows: 16 rows
+    // 151 -> 82 ms, 32 rows 599 -> 104 (ggml_metal 291), 128 rows 723 -> 325 (363), 512 rows
+    // 1377 -> 1205 (1289); at 1024 rows it ties the dequant GEMM and at 2048 loses by 5%.
+    // ---------------------------------------------------------------------------------------------
+    internal const string MppHeader = """
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
+""";
+
+    private static string BuildFewRowTensorSource(string dq8, int blockBytes, int nsg, int m) => $$"""
+const int InDim = in_dim, OutDim = out_dim, InRows = in_rows, BlocksPerRow = in_dim / 256;
+const uint tid = thread_position_in_threadgroup.x;
+const uint lane = tid & 31u;
+const uint sg = tid >> 5;
+const int col0 = static_cast<int>(threadgroup_position_in_grid.y) * 32;
+const int row0 = static_cast<int>(threadgroup_position_in_grid.z) * {{m}};
+// Each simdgroup's 32 x 64 weight tile; after the loop the same memory holds the partial sums.
+threadgroup half4 smem4[{{nsg * Math.Max(32 * 64 * 2, m * 32 * 4) / 8}}];
+threadgroup half * Wsg = reinterpret_cast<threadgroup half *>(smem4) + sg * 32 * 64;
+// The input rows straight from device memory (x is half here): rows past the end are outside the extents.
+auto tXd = tensor(const_cast<device half *>(x + uint64_t(row0) * uint64_t(InDim)), dextents<int32_t, 2>(InDim, min({{m}}, InRows - row0)));
+auto tX0 = tXd.template slice<64, {{m}}>(0, 0);
+auto tW = tensor(Wsg, dextents<int32_t, 2>(64, 32));
+matmul2d<matmul2d_descriptor({{m}}, 32, 64, false, true, false, matmul2d_descriptor::mode::multiply_accumulate),
+         execution_simdgroups<1>> mm;
+auto co = mm.template get_destination_cooperative_tensor<decltype(tX0), decltype(tW), float>();
+for (short i = 0; i < co.get_capacity(); ++i) if (co.is_valid_element(i)) co[i] = 0.0f;
+// Lane l decodes 16 values (at (l & 3) * 16 of the chunk) of weight rows 8t + (l >> 2), t = 0..3.
+const device uchar * wr[4];
+UNROLL for (short t = 0; t < 4; ++t) {
+    const int r = min(col0 + 8 * t + static_cast<int>(lane >> 2), OutDim - 1);
+    wr[t] = w + uint64_t(r) * uint64_t(BlocksPerRow) * {{blockBytes}};
+}
+const int segk = static_cast<int>(lane & 3u) * 16;
+const int nch = InDim / 64;
+for (int g = static_cast<int>(sg); g < nch; g += {{nsg}}) {
+    const int k = 64 * g + segk;
+    UNROLL for (short t = 0; t < 4; ++t) {
+        float w0[8], w1[8];
+        {{dq8}}(wr[t] + uint64_t(k >> 8) * {{blockBytes}}, k & 255, w0);
+        {{dq8}}(wr[t] + uint64_t((k + 8) >> 8) * {{blockBytes}}, (k + 8) & 255, w1);
+        threadgroup half4 * dst = reinterpret_cast<threadgroup half4 *>(Wsg + (8 * t + static_cast<int>(lane >> 2)) * 64 + segk);
+        dst[0] = half4(w0[0], w0[1], w0[2], w0[3]);
+        dst[1] = half4(w0[4], w0[5], w0[6], w0[7]);
+        dst[2] = half4(w1[0], w1[1], w1[2], w1[3]);
+        dst[3] = half4(w1[4], w1[5], w1[6], w1[7]);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    auto tA = tXd.template slice<64, {{m}}>(64 * g, 0);
+    mm.run(tA, tW, co);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+threadgroup float * red = reinterpret_cast<threadgroup float *>(smem4);
+auto tC = tensor(red + sg * {{m * 32}}, dextents<int32_t, 2>(32, {{m}}));
+co.store(tC);
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (int idx = static_cast<int>(tid); idx < {{m * 32}}; idx += {{32 * nsg}}) {
+    float sum = 0.0f;
+    for (short j = 0; j < {{nsg}}; ++j) sum += red[j * {{m * 32}} + idx];
+    const int r = idx / 32, c = idx % 32;
+    if (row0 + r < InRows && col0 + c < OutDim) y[uint64_t(row0 + r) * uint64_t(OutDim) + uint64_t(col0 + c)] = sum;
+}
+""".Replace("UNROLL ", "_Pragma(\"clang loop unroll(full)\") ");
+
+    /// <summary>Whether the few-row matmuls of 9 rows and up run on the tensor API (TS_MLX_FEWROW_TENSOR; default on
+    /// where it works: M5 and later with MLX 0.32+).</summary>
+    internal static readonly bool FewRowTensorEnabled = Environment.GetEnvironmentVariable("TS_MLX_FEWROW_TENSOR") != "0";
+
+    /// <summary>Rows from which the few-row matmuls take the tensor-API kernel (8 and fewer stay F32: as fast, and
+    /// a verify window keeps its precision).</summary>
+    private const int FewRowTensorMinRows = 9;
+
+    /// <summary>Whether this device runs the tensor-API kernel: MLX compiles a custom kernel at its first eval, so a
+    /// source the device or SDK cannot build would fail a forward. Decided once, by building and running one.</summary>
+    internal static bool FewRowTensorAvailable => s_fewRowTensorAvailable ??= FewRowTensorEnabled && ProbeFewRowTensor();
+    private static bool? s_fewRowTensorAvailable;
+
+    private static bool ProbeFewRowTensor()
+    {
+        try
+        {
+            const int inDim = 256, outDim = 32, rows = 16;
+            MlxFastMetalKernel kernel = EnsureFewRowTensorKernel("IQ4_XS", "tensorsharp_dq8_iq4xs", 136, Iq4XsHelpersHeader + Dq8Iq4Xs, 4, 16);
+            bool ok = MlxWorker.Shared.Invoke(() =>
+            {
+                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
+                MlxVectorArray inputs = default, outputs = default;
+                MlxArray x = default, w = default, inDimArray = default, outDimArray = default, rowsArray = default, y = default;
+                try
+                {
+                    var xh = new ushort[rows * inDim];
+                    var wb = new byte[outDim * 136];
+                    var hx = System.Runtime.InteropServices.GCHandle.Alloc(xh, System.Runtime.InteropServices.GCHandleType.Pinned);
+                    var hw = System.Runtime.InteropServices.GCHandle.Alloc(wb, System.Runtime.InteropServices.GCHandleType.Pinned);
+                    try
+                    {
+                        x = NewArrayFromHost(hx.AddrOfPinnedObject(), new[] { rows, inDim }, DType.Float16);
+                        w = NewArrayFromHost(hw.AddrOfPinnedObject(), new[] { wb.Length }, DType.UInt8);
+                    }
+                    finally { hx.Free(); hw.Free(); }
+                    inDimArray = mlx_array_new_int(inDim);
+                    outDimArray = mlx_array_new_int(outDim);
+                    rowsArray = mlx_array_new_int(rows);
+                    int[] shape = { rows, outDim };
+                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), "probe output");
+                    Check(mlx_fast_metal_kernel_config_set_grid(config, 128, 1, 1), "probe grid");
+                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1), "probe threadgroup");
+                    inputs = CreateVectorArray(x, w, inDimArray, outDimArray, rowsArray);
+                    outputs = mlx_vector_array_new();
+                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "probe run");
+                    Check(mlx_vector_array_get(out y, outputs, 0), "probe read");
+                    Eval(y);
+                    return true;
+                }
+                finally
+                {
+                    FreeArray(x); FreeArray(w); FreeArray(inDimArray); FreeArray(outDimArray); FreeArray(rowsArray); FreeArray(y);
+                    if (inputs.IsValid) _ = mlx_vector_array_free(inputs);
+                    if (outputs.IsValid) _ = mlx_vector_array_free(outputs);
+                    if (config.IsValid) _ = mlx_fast_metal_kernel_config_free(config);
+                }
+            });
+            return ok;
+        }
+        catch (Exception)
+        {
+            Console.Error.WriteLine("[mlx] the tensor-API few-row kernel did not build on this device; 9+ rows use the simdgroup kernel and the dequant GEMM");
+            return false;
+        }
+    }
+
+    private static MlxFastMetalKernel EnsureFewRowTensorKernel(string label, string dq8, int blockBytes, string header, int nsg, int m)
+    {
+        string key = $"{label}_tensor_sg{nsg}_m{m}";
+        lock (fastKernelSync)
+        {
+            if (fewRowKernels.TryGetValue(key, out MlxFastMetalKernel kernel) && kernel.IsValid)
+                return kernel;
+            kernel = CreateFastMetalKernel($"tensorsharp_fewrow_tensor_{key.ToLowerInvariant()}", new[] { "x", "w", "in_dim", "out_dim", "in_rows" }, new[] { "y" },
+                BuildFewRowTensorSource(dq8, blockBytes, nsg, m), MppHeader + header);
+            if (!kernel.IsValid)
+                throw new NotSupportedException($"Unable to initialize the MLX {label} tensor-API few-row matmul kernel.");
+            fewRowKernels[key] = kernel;
+            return kernel;
+        }
+    }
+
+    private static MlxArray FewRowTensorMatmul(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim,
+        string label, string dq8, int blockBytes, string header)
+    {
+        // 16, 32 or 64 input rows a threadgroup (each weight decoded once per M rows); the partial sums of 64 rows
+        // take 8 KB a simdgroup, so two simdgroups split K there and four below.
+        int m = rows <= 16 ? 16 : rows <= 32 ? 32 : 64;
+        int nsg = m == 64 ? 2 : 4;
+        MlxFastMetalKernel kernel = EnsureFewRowTensorKernel(label, dq8, blockBytes, header, nsg, m);
+        return MlxWorker.Shared.Invoke(() =>
+        {
+            MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
+            MlxVectorArray inputs = default, outputs = default;
+            MlxArray inDimArray = default, outDimArray = default, rowsArray = default, inputHalf = default;
+            try
+            {
+                inputHalf = Astype(input, DType.Float16);
+                inDimArray = mlx_array_new_int(inDim);
+                outDimArray = mlx_array_new_int(outDim);
+                rowsArray = mlx_array_new_int(rows);
+                int[] shape = { rows, outDim };
+                Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), $"configuring {label} tensor few-row matmul output");
+                Check(mlx_fast_metal_kernel_config_set_grid(config, 32 * nsg, (outDim + 31) / 32, (rows + m - 1) / m), $"configuring {label} tensor few-row matmul grid");
+                Check(mlx_fast_metal_kernel_config_set_thread_group(config, 32 * nsg, 1, 1), $"configuring {label} tensor few-row matmul threadgroup");
+                inputs = CreateVectorArray(inputHalf, rawWeight, inDimArray, outDimArray, rowsArray);
+                outputs = mlx_vector_array_new();
+                Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), $"running {label} tensor few-row matmul");
+                Check(mlx_vector_array_get(out MlxArray result, outputs, 0), $"reading {label} tensor few-row matmul output");
+                return result;
+            }
+            finally
+            {
+                FreeArray(inDimArray); FreeArray(outDimArray); FreeArray(rowsArray); FreeArray(inputHalf);
+                if (inputs.IsValid) _ = mlx_vector_array_free(inputs);
+                if (outputs.IsValid) _ = mlx_vector_array_free(outputs);
+                if (config.IsValid) _ = mlx_fast_metal_kernel_config_free(config);
+            }
+        });
+    }
+
     // ggml-metal's tiling for its few-row kernels: more simdgroups (a finer K split) for fewer weight rows, two
     // 8-row input tiles past 8 rows, and fewer weight tiles when the partial sums would outgrow 16 KB or too few
     // threadgroups would fill the GPU. Other tilings were no faster on an M5 Pro (79-81 ms an 8-row forward; eight
@@ -1104,12 +1303,13 @@ for (int idx = static_cast<int>(tid); idx < {{rt * nt * 64}}; idx += {{32 * nsg}
         }
     }
 
-    /// <summary>Largest input-row count the few-row kernel takes (TS_MLX_IQ_FEWROW_MAX_ROWS; 0 disables it).
-    /// From 2 rows up to this, below the dequant-GEMM rows.</summary>
-    internal static readonly int IQuantFewRowMaxRows =
+    /// <summary>Largest input-row count the few-row kernels take (TS_MLX_IQ_FEWROW_MAX_ROWS; 0 disables them), from 2
+    /// rows: 1024 where the tensor-API kernel runs (where it ties the dequant GEMM), 31 elsewhere.</summary>
+    internal static int IQuantFewRowMaxRows => s_fewRowMaxRows ??=
         int.TryParse(Environment.GetEnvironmentVariable("TS_MLX_IQ_FEWROW_MAX_ROWS"), out int parsedFewRows) && parsedFewRows >= 0
             ? parsedFewRows
-            : 31;
+            : FewRowTensorAvailable ? 1024 : 31;
+    private static int? s_fewRowMaxRows;
 
     private static MlxArray TryFewRowMatmul(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim,
         string label, string dq8, int blockBytes, string header)
@@ -1118,6 +1318,8 @@ for (int idx = static_cast<int>(tid); idx < {{rt * nt * 64}}; idx += {{32 * nsg}
             return default;
         try
         {
+            if (rows >= FewRowTensorMinRows && FewRowTensorAvailable)
+                return FewRowTensorMatmul(input, rawWeight, rows, inDim, outDim, label, dq8, blockBytes, header);
             (int nt, int rt, int nsg) = FewRowTiling(rows, inDim, outDim);
             MlxFastMetalKernel kernel = EnsureFewRowKernel(label, dq8, blockBytes, header, nt, rt, nsg);
             return MlxWorker.Shared.Invoke(() =>

@@ -81,6 +81,11 @@ public class MlxLowBitQuantKernelTests
     [InlineData((int)GgmlTensorType.IQ2_XXS, 16, 512, 37)]
     [InlineData((int)GgmlTensorType.Q2_K, 12, 512, 37)]
     [InlineData((int)GgmlTensorType.IQ1_M, 4, 1280, 37)]
+    // The tensor-API kernel's 32- and 64-row tiles (and a partial last tile of each).
+    [InlineData((int)GgmlTensorType.IQ3_XXS, 24, 1280, 2100)]
+    [InlineData((int)GgmlTensorType.IQ3_S, 100, 512, 37)]
+    [InlineData((int)GgmlTensorType.IQ4_XS, 64, 1280, 4099)]
+    [InlineData((int)GgmlTensorType.Q6_K, 33, 512, 2100)]
     public void Matmul_FewRowShapes_MatchManagedDequantReference(int ggmlType, int rows, int inDim, int outDim)
         => MatmulMatchesReference(ggmlType, rows, inDim, outDim);
 
@@ -106,11 +111,13 @@ public class MlxLowBitQuantKernelTests
             Assert.True(MlxQuantizedOps.TryAddmmQuantizedToFloat32(outputTensor, inputTensor, cacheKey, IntPtr.Zero,
                 ggmlType, inDim, outDim, weights.Length));
             float[] actual = outputTensor.GetElementsAsFloat(rows * outDim);
-            // Below the dequant-GEMM rows (32) every route decodes to F32 and only the summation order
-            // differs; from 32 rows the weight is dequantized to F16 for MLX's GEMM.
+            // Up to 8 rows (and below the dequant-GEMM rows without the tensor API) every route decodes to F32
+            // and only the summation order differs; the tensor-API kernel (9+ rows) and the dequant GEMM
+            // multiply F16 operands.
             double scale = 0;
             foreach (float v in expected) scale = Math.Max(scale, Math.Abs(v));
-            double tolerance = rows >= 32 ? 4e-3 * scale + 1e-3 : 2e-5 * scale + 1e-5;
+            bool f16 = rows >= MlxNative.IQuantDequantGemmMinRows || (rows >= 9 && MlxNative.FewRowTensorAvailable);
+            double tolerance = f16 ? 4e-3 * scale + 1e-3 : 2e-5 * scale + 1e-5;
             AssertClose($"{(GgmlTensorType)ggmlType} rows={rows}", expected, actual, tolerance);
         }
         finally

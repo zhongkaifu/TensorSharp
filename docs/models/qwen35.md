@@ -916,6 +916,14 @@ process (kernels compiled).
   K = 5,120) and ended in a barrier. It now has ggml-metal's mul_mv layout: two simdgroups of four
   weight rows each, a lane loading 32 activations once for all four rows. Plain decode
   15.7 -> 20.4 tok/s (49 ms a token), the rate of ggml_metal (20.6) and llama.cpp (20.5) on the file.
+- **Short prompts and wider windows on the matrix units.** Past 8 rows that kernel is bound by
+  its F32 simdgroup products (an 8-row forward is ~430 GFLOP), and from 32 rows the dequant GEMM
+  wrote the whole weight as F16 on every call (~590 ms whatever the row count). On M5 the same K
+  split now multiplies on the tensor API: each simdgroup decodes its chunk of 32 weight rows into
+  a tile of its own and multiplies it against 16, 32 or 64 input rows (`TS_MLX_FEWROW_TENSOR`,
+  9-1024 rows). A forward of 16 rows 151 -> 82 ms (ggml_metal 153), 32 rows 599 -> 104 (291),
+  128 rows 723 -> 325 (363), 512 rows 1377 -> 1205 (1289); it ties the dequant GEMM at 1024 rows,
+  which keeps the longer chunks.
 - **Unrolled register arrays.** The first port of that layout took 225 ms for the 8-row forward:
   the loops over its accumulator and pointer arrays were not unrolled, so the arrays lived in
   thread memory. With every such loop unrolled (`clang loop unroll(full)`, ggml's `FOR_UNROLL`)
