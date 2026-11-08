@@ -895,9 +895,15 @@ process (kernels compiled).
 - **Prompt chunks.** The raw i-quants' 32+-row products dequantize the weight to F16 slices and run
   MLX's GEMM (`TS_MLX_IQ_DEQUANT_GEMM_MIN_ROWS`), as Q6_K and IQ4_XS do: the 2.3K-token prefill
   361 s -> 6.05 s (ggml_metal: 7.0 s).
-- **Verify windows.** 2-31 rows decode each 8-weight group once into simdgroup-matrix tiles
-  (`TS_MLX_IQ_FEWROW_MAX_ROWS`; F32 below 8 rows, F16 from 8 as the kernel they replace): an 8-row
-  verify 359 -> 186 ms.
+- **Verify windows.** 2-31 rows take the few-row kernel (`TS_MLX_IQ_FEWROW_MAX_ROWS`), now laid
+  out as ggml-metal's few-row MMA kernels: the simdgroups of a threadgroup split K, each lane
+  decodes its 16 weights of a chunk once straight into simdgroup-matrix registers (F32), and the
+  partial tiles are summed once at the end. The kernel it replaces staged 64 decoded columns in
+  threadgroup memory with a barrier pair per 64 weights; even with a near-free decoder it took
+  106 of an 8-row forward's 128 ms. An 8-row forward 128 -> 79 ms (ggml_metal 87), 2 rows
+  159 -> 75, 16 rows 212 -> 151 (ggml_metal 153), 31 rows 383 -> 279; the verify window 155 ->
+  92 ms (ggml_metal 88). IQ4_XS and Q6_K decode their 8 values with one scale read instead of
+  value by value.
 - **No re-forward after a rejection.** The verify keeps the recurrent state after every row and the
   accepted row's state is committed on the device, as the ggml verify's snapshots do; the
   pre-verify snapshot is a reference to the immutable MLX arrays instead of a host copy (6 ms ->
@@ -910,23 +916,30 @@ process (kernels compiled).
   K = 5,120) and ended in a barrier. It now has ggml-metal's mul_mv layout: two simdgroups of four
   weight rows each, a lane loading 32 activations once for all four rows. Plain decode
   15.7 -> 20.4 tok/s (49 ms a token), the rate of ggml_metal (20.6) and llama.cpp (20.5) on the file.
-- **Few-row tiles.** The verify-window kernel takes eight simdgroups (64 output columns) per
-  threadgroup instead of four, so the activation tile is staged half as often: an 8-token forward
-  179 -> 159 ms.
+- **Unrolled register arrays.** The first port of that layout took 225 ms for the 8-row forward:
+  the loops over its accumulator and pointer arrays were not unrolled, so the arrays lived in
+  thread memory. With every such loop unrolled (`clang loop unroll(full)`, ggml's `FOR_UNROLL`)
+  it takes 79 ms. Tiling, by contrast, hardly matters on the M5 Pro (79-81 ms for every shape
+  tried; eight weight tiles 85 ms).
+- **Retained conversations on a 48 GB Mac.** Each retained conversation is sized for the whole
+  context (about 2.5 GB at 32K), and sixteen of them took the server past 34 GB and into swap,
+  where every scenario ran 3x slower. Retained state is now bounded by what macOS can give
+  (see [the batching doc](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)): the full benchmark
+  below stayed at 18-23 GB.
 
-| UD-IQ3_XXS, MLX | Before | Now |
-|---|---:|---:|
-| Plain decode | 1.8 tok/s | 20.4 tok/s |
-| DFlash2, code answer | 2.4 tok/s | 25.0 tok/s |
-| DFlash2, list answer | - | 25.7 tok/s |
+Server, greedy, `--spec-draft 7 --spec-pmin 0`, MAX_CONTEXT 32768, two runs each (TTFT / decode):
 
-ggml_metal on the same files and requests: UD-IQ3_XXS plain 20.6, DFlash2 38.6 (code) / 52.3
-(list); Q8_0 plain 9.9, DFlash2 33.2 / 39.6. MLX with Q8_0 and DFlash2: 23.5-24.4 / 26.5-27.6.
-The remaining MLX gap is the 8-row matmul kernel: in an 8-token UD-IQ3_XXS forward (159 ms against
-ggml_metal's 88) the few-row matmuls take 140 ms, the rest 20. It decodes each weight once, as the
-one-row kernel does in about 40 ms, so the difference is its access pattern (eight rows' 64-value
-pieces per simdgroup and chunk), not the codebooks; larger or smaller K chunks, more simdgroups and
-ggml's register-fragment layout were all slower or equal.
+| UD-IQ3_XXS + DFlash2 | ggml_metal | MLX before | MLX now |
+|---|---:|---:|---:|
+| Long generation (74-token prompt, 1,220 tokens) | 0.57-0.60 s / 30.1-31.3 tok/s | 1.27-1.43 s / 17.6-17.7 | 0.72-0.74 s / 27.3-28.3 |
+| 4K-token prompt | 12.9 s / 35-52 | 10.6-10.7 s / 15-18 | 9.8-9.9 s / 34.5-40.5 |
+| 16K-token prompt | 53.5 s / 33 | 43.1-43.3 s / 14-15 | 40.9 s / 28-34 |
+| Multi-turn: first turn, then cached turns | 9.2-9.3 s, 0.32-0.59 s | 8.4-8.8 s, 0.56-0.67 s | 6.7-7.0 s, 0.29-0.30 s |
+| Short chat | 0.57 s | 0.66-1.05 s | 0.65 s |
+
+Plain decode is 46.8 ms a token on MLX against 48.4 on ggml_metal. What remains of the gap is
+long-generation decode (about 10%: the drafter's 17 ms against ggml_metal's 12.5, and the 8-row
+forward's 22 ms outside the matmuls) and the short-chat TTFT.
 
 ## 10. Memory and KV cache strategy
 

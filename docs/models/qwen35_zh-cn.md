@@ -640,20 +640,25 @@ M5 Pro（48 GB）实测：Qwen3.8-27B GGUF，DFlash2 Q4_K_M 草稿模型（`--sp
 
 - **低比特格式上 GPU。** Unsloth 的 UD-IQ3_XXS 在 10.9 GB 中有 1.2 GB 是 Q2_K、Q3_K、IQ2_XS、IQ1_S、IQ1_M，此前 MLX 没有对应核函数，走 CPU 托管反量化。现在都有了设备核函数（`MlxLowBitQuantKernels.cs`，反量化运算与 `ManagedQuantizedOps` 一致）：解码 1.8 -> 15.7 tok/s。
 - **预填充。** 原始 i-quant 在 32 行以上时先把权重分片反量化为 F16，再用 MLX GEMM（`TS_MLX_IQ_DEQUANT_GEMM_MIN_ROWS`），与 Q6_K、IQ4_XS 的做法一致：2.3K token 预填充 361 s -> 6.05 s（ggml_metal 7.0 s）。
-- **验证窗口。** 2-31 行时每组 8 个权重只解码一次进 simdgroup 矩阵块（`TS_MLX_IQ_FEWROW_MAX_ROWS`；8 行以下 F32，8 行起 F16，与被替换的核函数精度相同）：8 行验证 359 -> 186 ms。
+- **验证窗口。** 2-31 行走少行核函数（`TS_MLX_IQ_FEWROW_MAX_ROWS`），现在的布局与 ggml-metal 的少行 MMA 核函数相同：threadgroup 内各 simdgroup 切分 K，每个 lane 把一块中自己的 16 个权重只解码一次、直接放进 simdgroup 矩阵寄存器（F32），最后把各部分块相加一次。被替换的核函数把 64 列解码结果暂存在 threadgroup 内存里，每 64 个权重一对 barrier；即使解码几乎不花时间，8 行前向的 128 ms 里它仍占 106 ms。8 行前向 128 -> 79 ms（ggml_metal 87），2 行 159 -> 75，16 行 212 -> 151（ggml_metal 153），31 行 383 -> 279；验证窗口 155 -> 92 ms（ggml_metal 88）。IQ4_XS 与 Q6_K 解码 8 个值时只读一次缩放，不再逐值读取。
 - **拒绝后不再重算。** 验证保留每一行之后的循环状态，接受行的状态直接在设备上提交，与 ggml 验证的快照做法相同；验证前快照改为引用不可变的 MLX 数组，不再复制到主机（每步 6 ms -> 0.1 ms）。此前每次拒绝都要恢复状态并重新前向接受的前缀，平均 135 ms。
 - **草稿模型。** DFlash2 的分组卷积在设备上计算，滑动窗口掩码以加法施加，不再每层四五次把系数、行和分数读回主机：每次起草 51 -> 32 ms。
 
 - **单行解码 matvec。** codebook i-quant 与低比特类型的单行核函数原先每个权重行占一个 256 线程的 threadgroup，每行都要把整行激活（K = 5,120 时 20 KB）重读一遍，最后还有一次 barrier。现在改为 ggml-metal 的 mul_mv 布局：每个 threadgroup 两个 simdgroup、各负责 4 个权重行，每个 lane 只读一次 32 个激活值供 4 行共用。普通解码 15.7 -> 20.4 tok/s（每 token 49 ms），与同一文件上的 ggml_metal（20.6）和 llama.cpp（20.5）持平。
-- **少行 tile。** 验证窗口的核函数每个 threadgroup 由 4 个 simdgroup 增加到 8 个（64 个输出列），激活 tile 的暂存次数减半：8 token 前向 179 -> 159 ms。
+- **寄存器数组要展开。** 这一布局第一次移植时 8 行前向要 225 ms：遍历累加器与指针数组的循环没有展开，数组落在线程内存里。把这些循环全部展开（`clang loop unroll(full)`，即 ggml 的 `FOR_UNROLL`）后为 79 ms。相比之下分块方式在 M5 Pro 上几乎无关紧要（试过的形状都是 79-81 ms，8 个权重块为 85 ms）。
+- **48 GB Mac 上保留的会话。** 每个保留的会话都按整段上下文分配（32K 时约 2.5 GB），16 个就让服务占用超过 34 GB 并开始换页，所有场景都慢了 3 倍。现在保留状态受 macOS 能给出的内存约束（见[批处理文档](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)）：下面的完整基准始终在 18-23 GB。
 
-| UD-IQ3_XXS，MLX | 改前 | 改后 |
-|---|---:|---:|
-| 普通解码 | 1.8 tok/s | 20.4 tok/s |
-| DFlash2，代码回答 | 2.4 tok/s | 25.0 tok/s |
-| DFlash2，列表回答 | - | 25.7 tok/s |
+服务端，贪心，`--spec-draft 7 --spec-pmin 0`，MAX_CONTEXT 32768，各跑两次（首 token 时间 / 解码速度）：
 
-同样的文件与请求在 ggml_metal 上：UD-IQ3_XXS 普通 20.6，DFlash2 38.6（代码）/ 52.3（列表）；Q8_0 普通 9.9，DFlash2 33.2 / 39.6。MLX 上 Q8_0 + DFlash2 为 23.5-24.4 / 26.5-27.6。MLX 剩下的差距在 8 行矩阵乘核函数：UD-IQ3_XXS 的 8 token 前向（159 ms，ggml_metal 为 88 ms）中少行矩阵乘占 140 ms，其余 20 ms。它和单行核函数一样每个权重只解码一次（单行约 40 ms），差别在访存方式（每个 simdgroup 每块读 8 行各 64 个值的小段），不在 codebook；更大或更小的 K 块、更多 simdgroup、以及 ggml 的寄存器 fragment 写法都更慢或持平。
+| UD-IQ3_XXS + DFlash2 | ggml_metal | MLX 改前 | MLX 现在 |
+|---|---:|---:|---:|
+| 长生成（74 token 提示，1,220 token） | 0.57-0.60 s / 30.1-31.3 tok/s | 1.27-1.43 s / 17.6-17.7 | 0.72-0.74 s / 27.3-28.3 |
+| 4K token 提示 | 12.9 s / 35-52 | 10.6-10.7 s / 15-18 | 9.8-9.9 s / 34.5-40.5 |
+| 16K token 提示 | 53.5 s / 33 | 43.1-43.3 s / 14-15 | 40.9 s / 28-34 |
+| 多轮：首轮，之后命中缓存的轮次 | 9.2-9.3 s，0.32-0.59 s | 8.4-8.8 s，0.56-0.67 s | 6.7-7.0 s，0.29-0.30 s |
+| 短对话 | 0.57 s | 0.66-1.05 s | 0.65 s |
+
+普通解码 MLX 每 token 46.8 ms，ggml_metal 48.4 ms。剩下的差距是长生成解码（约 10%：草稿器 17 ms 对 ggml_metal 的 12.5 ms，以及 8 行前向中矩阵乘以外的 22 ms）和短对话的首 token 时间。
 
 ## 10. 内存与 KV cache 策略
 
