@@ -269,6 +269,7 @@
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingRecordDevice" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingReset" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeStagePrefetchHits" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeStageBorrows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MulMatIdF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MultiDeviceInit" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseGlimmerModelForward" SymbolType="Function" />

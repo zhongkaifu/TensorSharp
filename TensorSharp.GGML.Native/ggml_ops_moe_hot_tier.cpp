@@ -109,6 +109,17 @@ namespace tsg
         }
     }
 
+    // Read per graph build (once a layer), so a test can toggle it.
+    int host_moe_tier_max_rows(const MoeHotTier& tier)
+    {
+        if (const char* e = std::getenv("TS_HOST_MOE_TIER_MAX_ROWS"))
+        {
+            const int n = std::atoi(e);
+            if (n >= 0) return n;
+        }
+        return tier.cpu_visible && tier.count > tier.fixed ? kHostMoeHotTierWindowMaxRows : kHostMoeHotTierMaxRows;
+    }
+
     MoeHotTier* moe_hot_tier_find(const void* gate_source)
     {
         if (gate_source == nullptr || g_backend == nullptr) return nullptr;

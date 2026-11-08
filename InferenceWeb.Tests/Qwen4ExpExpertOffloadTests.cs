@@ -361,6 +361,66 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         }
     }
 
+    /// <summary>A tier with window slots on unified memory splits prompt chunks too (up to
+    /// <c>kHostMoeHotTierWindowMaxRows</c>): the fixed slots hold most of a prompt's routes and the window reads the
+    /// rest, where streaming would first stage the whole layer (~1.3 s a chunk on Flash Next at any width, which made
+    /// every prompt past 64 tokens take ~1.35 s to its first token). With a window that holds every route the split
+    /// computes every expert from the slots on the accelerator's own kernels, so the 160-token prompt answers as the
+    /// all-accelerator span, and as the streamed prompt it replaces. No layer stages: the prefetch counter does not move
+    /// unless <c>TS_HOST_MOE_TIER_MAX_ROWS</c> narrows the split back below the prompt.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TieredExperts_WithAWindow_SplitPromptChunks_Metal()
+    {
+        float[][] device = Run(BackendType.GgmlMetal, () => { }, LongPrompt);
+        float[][] Tiered(string? maxRows, out long staged)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_HOST_MOE_TIER_MAX_ROWS", maxRows);
+            long before = GgmlBasicOps.MoeStagePrefetchHits();
+            float[][] rows = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, model =>
+            {
+                var q = Assert.IsType<Qwen4ExpModel>(model);
+                int experts = q.ExpertCountForTests;
+                Assert.Equal(8, q.RegisterExpertTiersForTests(experts / 4, experts - experts / 4));
+            });
+            staged = GgmlBasicOps.MoeStagePrefetchHits() - before;
+            return rows;
+        }
+        float[][] split = Tiered(null, out long splitStaged);
+        float[][] streamed = Tiered("64", out long streamedStaged);
+        Assert.Equal(0, splitStaged);
+        Assert.True(streamedStaged >= 2, $"the narrowed split did not stream the {LongPrompt.Length}-token prompt");
+        AssertClose("windowed tier, prompt split", split, device, 1e-4);
+        AssertClose("windowed tier, prompt split vs streamed", split, streamed, 1e-4);
+    }
+
+    /// <summary>A prompt-width split whose routes overflow the window (one fixed slot and three window slots for four
+    /// routes a token here)
+    /// computes the overflow on the accelerator too, its experts staged by explicit reads into the one staging buffer,
+    /// rather than on the host decode kernel in blocks of 8 rows, which read every overflow expert again per block
+    /// (3.2-3.7 s a 1024-token span of Strata's records prompt). So the prompt answers as the all-accelerator span far
+    /// inside the host bound; the decode steps still put their overflow on the host.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TieredExperts_PromptOverflow_RunsOnTheAccelerator_Metal()
+    {
+        float[][] device = Run(BackendType.GgmlMetal, () => { }, LongPrompt);
+        // (2, 2) leaves rows with three overflow routes, which ggml-metal's MUL_MAT_ID has no kernel for: they are
+        // padded to four (an abort before the padding).
+        foreach (var (fixedSlots, window) in new[] { (1, 3), (2, 2) })
+        {
+            long before = GgmlBasicOps.MoeStageBorrows();
+            float[][] narrow = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, model =>
+                Assert.Equal(8, ((Qwen4ExpModel)model).RegisterExpertTiersForTests(fixedSlots, window)));
+            long borrows = GgmlBasicOps.MoeStageBorrows() - before;
+            _output.WriteLine($"{fixedSlots} fixed + {window} window slots: staging borrows {borrows}");
+            Assert.True(borrows >= 8,
+                $"the {LongPrompt.Length}-token prompt's overflow did not run on the accelerator ({borrows} borrows)");
+            AssertClose($"{fixedSlots}+{window} slots, prompt overflow on the accelerator", new[] { narrow[0] }, new[] { device[0] }, 1e-4);
+            AssertClose($"{fixedSlots}+{window} slots, decode overflow on the host", narrow, device,
+                Bound(BackendType.GgmlMetal, hostPrefill: true));
+        }
+    }
+
     /// <summary>A prompt-width pass stages the next offloaded layer's experts on a thread while the accelerator runs
     /// the current one (ggml_ops_moe.cpp moe_stage_prefetch_start), and the layer's MoE graph binds them instead of
     /// staging its own. The staged bytes are the same, so the prompt answers bit for bit as staging each layer when it

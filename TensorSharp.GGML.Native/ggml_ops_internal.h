@@ -1102,6 +1102,16 @@ namespace tsg
     // decode kernel (in blocks of its row limit); wider batches stream the whole
     // layer instead, which explicit reads make cheap from this width up.
     constexpr int kHostMoeHotTierMaxRows = 64;
+    // A tier with on-demand window slots in host-writable memory (unified memory) keeps splitting prompt chunks up to
+    // this width: its fixed slots hold nearly every route a prompt makes and the window reads the rest, while streaming
+    // first stages the whole layer (~0.7 GB a layer of Flash Next's ISTA Q2_0, ~1.3 s a chunk on an M5 Pro, whatever
+    // its width). Measured cold TTFT, 88-473 token prompts: 1.35-1.4 s streamed, 0.33-0.76 s split; 900 / 1770 /
+    // 3500 tokens: 1.76-2.0 / 2.7 / 5.2 s against 1.33-1.55 / 2.55 / 5.1-5.3 s.
+    constexpr int kHostMoeHotTierWindowMaxRows = 2048;
+    // The widest span `tier` still splits: TS_HOST_MOE_TIER_MAX_ROWS, else kHostMoeHotTierWindowMaxRows for a
+    // host-writable tier with window slots and kHostMoeHotTierMaxRows otherwise (a discrete GPU's tier has no window,
+    // so a wide span's misses would all run on the host). A wider span streams the layer. Read per graph build.
+    int host_moe_tier_max_rows(const MoeHotTier& tier);
     bool host_expert_io_active();
     void host_expert_io_on_drop(const void* ptr);
     void host_expert_io_release();
