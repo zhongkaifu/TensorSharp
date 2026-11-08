@@ -304,6 +304,7 @@ namespace TensorSharp.Cuda
             slot.Failed = false;
             slot.PleTokens.Length = 0;
             slot.MtpPast = 0;
+            slot.MtpStart = 0;
         }
 
         private static void Zero(Dev dev, Tensor t, int elementBytes)

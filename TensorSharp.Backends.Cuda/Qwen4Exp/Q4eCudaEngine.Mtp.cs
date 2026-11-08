@@ -116,7 +116,30 @@ namespace TensorSharp.Cuda
             AllocKv(slot, dev, c);
             slot.Mtp = c;
             slot.MtpPast = 0;
+            slot.MtpStart = 0;
         }
+
+        /// <summary>
+        /// Restart the active slot's MTP cache at <paramref name="position"/>: the trunk holds positions the block never
+        /// replayed (a prompt read plainly beside other requests, a reused prefix, plain batched steps), so from here on the
+        /// block keeps a fresh cache whose row 0 is that position, and its attention reads only what it replayed since. RoPE
+        /// scores depend on the rows' distance alone, so the shifted positions answer as the absolute ones up to rounding;
+        /// the drafts only propose, and the verify keeps the answers exact (Qwen35Model's MTP restarts the same way).
+        /// </summary>
+        public void MtpRestart(int position)
+        {
+            if (_mtpLayer == null)
+                throw new InvalidOperationException("[q4e-cuda] no MTP block is loaded");
+            if (position < 0 || position > _m.NCtx)
+                throw new ArgumentOutOfRangeException(nameof(position), $"[q4e-cuda] an MTP restart at {position} is outside n_ctx={_m.NCtx}");
+            Slot slot = _active;
+            EnsureMtpCache(slot);
+            slot.MtpStart = position;
+            slot.MtpPast = position;
+        }
+
+        /// <summary>The active slot's MTP cache: the first position it holds (its restart) and the end.</summary>
+        internal (int Start, int Past) MtpSpan => _active.Mtp == null ? (0, 0) : (_active.MtpStart, _active.MtpPast);
 
         /// <summary>
         /// Run the MTP block over <paramref name="tokens"/> at positions <paramref name="p0"/>, ... of the active slot,
@@ -138,10 +161,12 @@ namespace TensorSharp.Cuda
             if (slot.Failed)
                 throw new InvalidOperationException("[q4e-cuda] the sequence's last forward failed; reset it before reuse");
             EnsureMtpCache(slot);
-            if (p0 < 0 || p0 > slot.MtpPast)
-                throw new InvalidOperationException($"[q4e-cuda] the MTP block holds {slot.MtpPast} positions and cannot draft from {p0}");
-            if (p0 + n > _m.NCtx)
-                throw new InvalidOperationException($"[q4e-cuda] MTP context overflow: {p0} + {n} > n_ctx={_m.NCtx}");
+            if (p0 < slot.MtpStart || p0 > slot.MtpPast)
+                throw new InvalidOperationException($"[q4e-cuda] the MTP block holds positions {slot.MtpStart}..{slot.MtpPast} and cannot draft from {p0}");
+            // The block's cache rows count from its restart (MtpRestart).
+            int q0 = p0 - slot.MtpStart;
+            if (q0 + n > _m.NCtx)
+                throw new InvalidOperationException($"[q4e-cuda] MTP context overflow: {q0} + {n} > n_ctx={_m.NCtx}");
             slot.MtpPast = Math.Min(slot.MtpPast, p0);
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
             int done = 0;
@@ -149,7 +174,7 @@ namespace TensorSharp.Cuda
             {
                 int nt = Math.Min(_m.NUbatch, n - done);
                 bool last = done + nt == n;
-                MtpUbatch(slot, tokens, hPrev, done, nt, p0 + done, last ? logitsOut : null, last ? hOut : null);
+                MtpUbatch(slot, tokens, hPrev, done, nt, q0 + done, last ? logitsOut : null, last ? hOut : null);
                 done += nt;
             }
             slot.MtpPast = p0 + n;
@@ -311,10 +336,12 @@ namespace TensorSharp.Cuda
             if (slot.Failed)
                 throw new InvalidOperationException("[q4e-cuda] the sequence's last forward failed; reset it before reuse");
             EnsureMtpCache(slot);
-            if (p0 < 0 || p0 > slot.MtpPast)
-                throw new InvalidOperationException($"[q4e-cuda] the MTP block holds {slot.MtpPast} positions and cannot draft from {p0}");
-            if (p0 + n + steps - 1 > _m.NCtx)
-                throw new InvalidOperationException($"[q4e-cuda] MTP context overflow: {p0} + {n + steps - 1} > n_ctx={_m.NCtx}");
+            if (p0 < slot.MtpStart || p0 > slot.MtpPast)
+                throw new InvalidOperationException($"[q4e-cuda] the MTP block holds positions {slot.MtpStart}..{slot.MtpPast} and cannot draft from {p0}");
+            // The block's cache rows count from its restart (MtpRestart).
+            int q0 = p0 - slot.MtpStart;
+            if (q0 + n + steps - 1 > _m.NCtx)
+                throw new InvalidOperationException($"[q4e-cuda] MTP context overflow: {q0} + {n + steps - 1} > n_ctx={_m.NCtx}");
             slot.MtpPast = Math.Min(slot.MtpPast, p0);
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
             var m = _m;
@@ -325,10 +352,10 @@ namespace TensorSharp.Cuda
                 int nt = Math.Min(m.NUbatch, n - done);
                 bool last = done + nt == n;
                 MtpUploadRows(tokens, hPrev, done, nt);
-                left = MtpRows(slot, nt, p0 + done, last);
+                left = MtpRows(slot, nt, q0 + done, last);
                 done += nt;
             }
-            int row = left - 1, pos = p0 + n - 1;
+            int row = left - 1, pos = q0 + n - 1;
             for (int s = 0; s < steps; s++)
             {
                 MtpHead(dev, row, DraftVocab);

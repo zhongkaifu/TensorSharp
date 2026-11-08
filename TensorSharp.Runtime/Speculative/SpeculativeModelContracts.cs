@@ -353,6 +353,14 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         bool DraftHeadResumesAfterGap => false;
 
+        /// <summary>
+        /// True when the head's drafts condition on the prompt's rows, so a request whose
+        /// prompt prefills from position 0 reads it through its speculative context (the
+        /// head replays every prompt row) even when the head could restart after a gap
+        /// (<see cref="DraftHeadResumesAfterGap"/>) at the first decode step instead.
+        /// </summary>
+        bool DraftHeadConditionsOnPrompt => false;
+
         /// <summary>One per-token draft step at <paramref name="pos"/>: consume
         /// (token, previous hidden), fill next-token logits and the chained
         /// hidden state. Only called for <see cref="DraftHeadKind.PerToken"/>.</summary>

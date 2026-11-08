@@ -44,21 +44,41 @@ namespace TensorSharp.Models
             return head < 0 ? 0 : MaxContextLength - head;
         }
 
-        /// <summary>The drafter's state is its slot's: binding a request's draft state makes its slot the active one.</summary>
+        // The request whose drafter the MTP calls serve (BindDraftState): its slot holds the block's cache.
+        private string _draftRequest;
+
+        /// <summary>The drafter's state is its slot's: the MTP calls that follow run on the request's slot (OnDraftSlot). The
+        /// bound cache the trunk's calls and slot retention use stays as it is.</summary>
         public void BindDraftState(string requestId)
         {
-            if (requestId == null)
-                return;
             lock (_sync)
-            {
-                if (_slotByRequest == null || !_slotByRequest.TryGetValue(requestId, out int slot) || !_exec.SetActiveSlot(slot))
-                    return;
-                _activeSlotKey = requestId;
-                _cacheSeqLen = _exec.NPast;
-            }
+                _draftRequest = requestId;
         }
 
-        public void ReleaseDraftState(string requestId) { }
+        public void ReleaseDraftState(string requestId)
+        {
+            lock (_sync)
+                if (string.Equals(_draftRequest, requestId, StringComparison.Ordinal))
+                    _draftRequest = null;
+        }
+
+        /// <summary>Run an MTP call on the bound draft request's slot, or the active slot when it has none of its own (a lone
+        /// request on the primary cache); the active slot is restored after. Under <c>_sync</c>.</summary>
+        private T OnDraftSlot<T>(Func<T> call)
+        {
+            int active = _exec.ActiveSlot;
+            bool swapped = _draftRequest != null && _slotByRequest != null && _slotByRequest.TryGetValue(_draftRequest, out int slot)
+                && slot != active && _exec.SetActiveSlot(slot);
+            try
+            {
+                return call();
+            }
+            finally
+            {
+                if (swapped)
+                    _exec.SetActiveSlot(active);
+            }
+        }
 
         private sealed class NoBatchedScope : IDisposable
         {

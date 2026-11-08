@@ -161,6 +161,9 @@ namespace TensorSharp.Models
         public bool HasMtpDraftChain => _engine.HasMtpDraftChain;
         public int MtpDraftChain(int[] tokens, float[] hPrev, int p0, int steps, int[] idsOut, float[] probsOut)
             => _engine.MtpDraftChain(tokens, hPrev, p0, steps, idsOut, probsOut);
+
+        /// <summary>Restart the active slot's MTP cache at <paramref name="position"/> (Q4eCudaEngine.MtpRestart).</summary>
+        public void MtpRestart(int position) => _engine.MtpRestart(position);
         public bool CommitVerify(int keep) => _engine.CommitVerify(keep);
         public bool RestoreVerify() => _engine.RestoreVerify();
         public void Reset() => _engine.Reset();

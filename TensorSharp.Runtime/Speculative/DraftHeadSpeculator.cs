@@ -112,6 +112,8 @@ namespace TensorSharp.Runtime.Speculative
 
         public bool HandlesOwnPrefill => _head.DraftSelfCatchUp;
 
+        public bool ConditionsOnPrompt => _head.DraftHeadConditionsOnPrompt;
+
         /// <summary>
         /// A head that keeps per-position state of its own (a NextN/MTP block with
         /// its own KV cache) cannot start drafting after trunk positions it never

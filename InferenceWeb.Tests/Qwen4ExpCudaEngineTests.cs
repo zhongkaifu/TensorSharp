@@ -1279,6 +1279,45 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             Assert.True(Math.Abs(stepwise.Probs[i] - chained.Probs[i]) <= 1e-4f, $"step {i}: confidence {chained.Probs[i]} vs {stepwise.Probs[i]}");
     }
 
+    /// <summary>The MTP block restarts its cache after a gap (IDraftHead.DraftHeadResumesAfterGap): a catch-up without hidden
+    /// rows moves its row 0 to the end of the gap, and the rows replayed from there answer bit for bit as a block that
+    /// started with them at position 0 (its cache counts from the restart, and RoPE scores depend on distance alone). A
+    /// draft from before the restart is refused. A lone request still reads its prompt through the context
+    /// (DraftHeadConditionsOnPrompt).</summary>
+    [CudaFact]
+    public void TheMtpBlock_RestartsAfterAGap_AsABlockThatStartedThere()
+    {
+        string path = Fixture(indexerTopK: 2048);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 2048);
+        using ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp);
+        var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+        var head = (TensorSharp.Runtime.Speculative.IDraftHead)model;
+        Assert.True(head.DraftHeadResumesAfterGap);
+        Assert.True(head.DraftHeadConditionsOnPrompt);
+        int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+        var hidden = new float[Prompt.Length * feat];
+        spec.SpecForward(Prompt, hidden, new float[vocab], false);
+        // Rows from position S: token S + t with the streams of the token before it.
+        const int S = 20;
+        int k = Prompt.Length - S;
+        int[] tokens = Prompt[S..];
+        var rows = new float[k * feat];
+        Array.Copy(hidden, (long)(S - 1) * feat, rows, 0, (long)k * feat);
+
+        var fresh = new float[vocab];
+        var hFresh = new float[feat];
+        head.DraftCatchUpAndStep(tokens, rows, 0, fresh, hFresh);
+        // The gap [0, S) reported, then the same rows at their own positions.
+        head.DraftCatchUp(Prompt[..S], null, 0);
+        var restarted = new float[vocab];
+        var hRestarted = new float[feat];
+        head.DraftCatchUpAndStep(tokens, rows, S, restarted, hRestarted);
+        Assert.True(restarted.AsSpan().SequenceEqual(fresh), "the restarted block's draft logits differ from a block that started there");
+        Assert.True(hRestarted.AsSpan().SequenceEqual(hFresh), "the restarted block's streams differ from a block that started there");
+        Assert.ThrowsAny<InvalidOperationException>(
+            () => head.DraftCatchUpAndStep(tokens[..1], rows[..feat], S - 1, new float[vocab], new float[feat]));
+    }
+
     /// <summary>A decode step's hyper-connection scatter fused with the next mixer's first pass computes what the two
     /// launches compute: the prompt and every decode step, bit for bit, with QSA past its width.</summary>
     [CudaFact]

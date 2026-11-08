@@ -235,9 +235,10 @@ namespace TensorSharp.Cuda
             public readonly List<Tensor> Owned = new List<Tensor>();
             /// <summary>The streamed layers' K/V host copies the slot holds (returned to the pool when it is freed).</summary>
             public readonly List<KvHostSet> KvHostSets = new List<KvHostSet>();
-            /// <summary>The MTP block's KV (allocated on the slot's first draft), and the positions it holds.</summary>
+            /// <summary>The MTP block's KV (allocated on the slot's first draft), and the positions it holds: from its restart
+            /// (cache row 0, <see cref="MtpRestart"/>) to MtpPast.</summary>
             public SlotLayer Mtp;
-            public int MtpPast;
+            public int MtpPast, MtpStart;
         }
 
         private sealed class SlotLayer
