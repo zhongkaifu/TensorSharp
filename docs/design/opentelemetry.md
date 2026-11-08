@@ -749,7 +749,8 @@ as a provider rule with no category (so ASP.NET Core stays at Warning under it).
 
 Many log lines carry prompts, model output, upload names, paths and URLs, tool arguments and commands. In a local
 file the operator owns that is fine; sending it to a collector or Application Insights is a different decision, and the
-Azure Monitor exporter silently truncates long values anyway (a message at 32,768 characters, an attribute at 8,192).
+Azure Monitor exporter silently truncates long values anyway (a message at 32,768 characters, an attribute at 8,192;
+the captured chat messages of §7.7 have limits of their own).
 
 **Why not a list of key names.** Names do not say what a value is. `{Prompt}` is a prompt in one line and a token
 count in another (`BatchExecutor`, `ContinuousBatchScheduler`, `CliInferenceSession`); `{Path}` is an HTTP route in the
@@ -845,7 +846,12 @@ With it on:
 - the chat span gets `gen_ai.input.messages` (the history the prompt was rendered from, after compaction) and
   `gen_ai.output.messages`, as JSON strings `[{"role":…,"content":…}]` (the JSON-string form the v1.41.0 conventions
   allow on spans), cut to 64K characters per attribute: a history keeps its newest messages, an answer its beginning.
-  The JSON is built only when the span is recorded, and a failure returns nothing rather than throw;
+  The JSON is built only when the span is recorded, and a failure returns nothing rather than throw. The 64K counts
+  message text, before the JSON adds quotes and escapes. The Azure Monitor exporter lets these two attributes through
+  up to 262,144 characters (exporter 1.10.0's `GenAi_Properties_MaxValueLength`, not the 8,192 of other attributes),
+  but Application Insights kept them whole only up to about 64,700 characters of JSON and stored a longer value as its
+  first 8,192 (measured in November 2026: 64,701 characters kept whole, 65,007 cut). A history that reaches the 64K
+  cap therefore arrives there as the start of the oldest message it kept, while an OTLP collector receives all of it;
 - `generate_video` gets `tensorsharp.video.prompt`, `execute_tool` gets `tensorsharp.tool.arguments` and
   `tensorsharp.tool.result`, `codeexec.run` gets `tensorsharp.codeexec.command`.
 
@@ -1603,7 +1609,7 @@ The draft was checked against the code before implementation. "Built" says what 
 | ASP.NET Core filter: any rule disables it | Only a provider rule whose category matches; ties go to the later rule | Registered for the provider (§7.3) |
 | Capture flag in `TelemetryOptions` | Libraries cannot see that project | Pinned static switch; Studio reads the variable; span backstop (§7.7) |
 | `/uploads` unauthenticated per Program.cs:362 | That line is the knowledge store; `/uploads` is `UseStaticFiles`; code artifacts and stored responses are guarded only by their ids too | Capability paths masked in spans and request log lines (§5.10, §7.6) |
-| Exported records may exceed the size limit | The exporter truncates silently (32,768 / 8,192) | §7.4 |
+| Exported records may exceed the size limit | The exporter truncates silently (32,768 / 8,192); Application Insights cuts captured chat messages over about 64,700 characters to 8,192 | §7.4, §7.7 |
 | Console-only output is the H3 and LTX timings | Also `[h3]` lines, warnings, MP4 fallbacks, Wan, Qwen-Image, grammar warnings | Listed (§7.8) |
 | **Video** | | |
 | Both pipelines check the token while reporting | Only LTX does; H3 stops only when a callback throws | §8.1 |
