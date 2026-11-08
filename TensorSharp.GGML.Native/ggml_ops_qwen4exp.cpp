@@ -1428,12 +1428,13 @@ ggml_tensor* q4e_nodes_ffn(
         // here, in the next segment; the host computes the rest into moe_out.
         ggml_tensor* hot_sum = nullptr;
         tsg::HostMoeSegment overlap_wait;
-        // Decode and verify widths only: a prefill-sized batch streams the whole
-        // layer to the accelerator (every expert it routes), tier members included.
-        if (hm.verify_gpu == nullptr && T <= tsg::kHostMoeHotTierMaxRows)
+        // Up to the tier's row limit (see host_moe_tier_max_rows): a wider batch streams
+        // the whole layer to the accelerator (every expert it routes), tier members included.
+        if (hm.verify_gpu == nullptr)
             if (tsg::MoeHotTier* tier = tsg::moe_hot_tier_find(a->gate_exps))
                 // A tier needs one distinct slot per route of a row (see the split).
-                if (tier->num_experts == n_expert && tier->count >= n_expert_used
+                if (T <= tsg::host_moe_tier_max_rows(*tier)
+                    && tier->num_experts == n_expert && tier->count >= n_expert_used
                     && tier->type[0] == a->gate_exps_type
                     && tier->type[1] == a->up_exps_type && tier->type[2] == a->down_exps_type)
                 {

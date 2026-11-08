@@ -854,6 +854,35 @@ namespace
 
     long long stage_prefetch_hits_impl() { return g_stage_prefetch_hits.load(std::memory_order_relaxed); }
 
+    // A streamed MoE graph that no prefetch staged for (a tiered layer's overflow routes at a prompt width, or a
+    // prefetch miss) stages into the same one buffer instead of a whole stack of its own in the graph's allocation:
+    // waits for any staging in flight (whose layer then misses and stages again), and hands out the buffer, grown to
+    // `bytes`, with the stacks' offsets. Only the routed experts' ranges are then written. False when the buffer
+    // cannot be had (not unified memory, or the allocation failed).
+    std::atomic<long long> g_stage_borrows{0};
+    bool stage_prefetch_borrow_impl(const std::size_t bytes[3], ggml_backend_buffer_t& buf, std::size_t offset[3])
+    {
+        if (!stage_prefetch_enabled_impl() || g_backend == nullptr) return false;
+        StagePrefetch& s = g_stage_prefetch[0];
+        if (s.worker.joinable()) s.worker.join();
+        s.active = false;
+        s.src[0] = s.src[1] = s.src[2] = nullptr;
+        auto align = [](std::size_t n) { return (n + 255) / 256 * 256; };
+        const std::size_t total = align(bytes[0]) + align(bytes[1]) + align(bytes[2]);
+        if (s.buf == nullptr || s.capacity < total)
+        {
+            if (s.buf) ggml_backend_buffer_free(s.buf);
+            s.buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(g_backend), total);
+            s.capacity = s.buf ? total : 0;
+            if (s.buf && !stage_prefetch_cpu_visible(s.buf)) { ggml_backend_buffer_free(s.buf); s.buf = nullptr; s.capacity = 0; }
+            if (s.buf == nullptr) return false;
+        }
+        offset[0] = 0; offset[1] = align(bytes[0]); offset[2] = align(bytes[0]) + align(bytes[1]);
+        buf = s.buf;
+        g_stage_borrows.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
     // Shutdown: the staging threads joined and their buffers freed before the device goes (a Metal buffer outliving
     // its device trips ggml-metal's residency-set assert at exit).
     void stage_prefetch_release_impl()
@@ -1833,6 +1862,27 @@ namespace
                 }
             }
         }
+        if (!prefetched && stream_experts)
+        {
+            const bool has_up = !fused_gate_up && !single_projection_activation;
+            const std::size_t want[3] = {ggml_nbytes(gate_w), has_up && up_w != nullptr ? ggml_nbytes(up_w) : 0,
+                                         ggml_nbytes(down_w)};
+            ggml_backend_buffer_t sbuf = nullptr;
+            std::size_t soff[3] = {};
+            if (stage_prefetch_borrow_impl(want, sbuf, soff))
+            {
+                // Allocated here, so the graph's allocator leaves them out; the uploads below write the routed
+                // experts' ranges straight into them.
+                auto* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(sbuf));
+                if (ggml_backend_tensor_alloc(sbuf, gate_w, base + soff[0]) != GGML_STATUS_SUCCESS
+                    || (want[1] > 0 && ggml_backend_tensor_alloc(sbuf, up_w, base + soff[1]) != GGML_STATUS_SUCCESS)
+                    || ggml_backend_tensor_alloc(sbuf, down_w, base + soff[2]) != GGML_STATUS_SUCCESS)
+                {
+                    set_last_error("MoE prefill: could not bind the expert staging buffer.");
+                    return 0;
+                }
+            }
+        }
         if (!prefetched)
         {
         bind_readonly_weight_3d(ctx, g_backend, dev, gate_data,
@@ -2506,12 +2556,49 @@ namespace tsg
             HostMoeSegment cold = hm;
             cold.n_used = cold_used;
             cold.hot_tier = nullptr;
-            if (host_moe_decode_experts(cold, s_moe_in.data(), s_cold_ids.data(), s_cold_w.data(), out.data(),
+            // A prompt-width span's overflow (the routes neither the slots nor the window took) runs on the
+            // accelerator, its experts staged by explicit reads: the decode kernel's blocks of 8 rows read every
+            // overflow expert again for each block, 3.2-3.7 s a 1024-token span of Strata's records prompt (6,300
+            // overflow routes a pass) against ~1.4 s streaming the whole layer.
+            const int stream_from = moe_offload_stream_batch_threshold();
+            bool wide = allow_device_stream && g_backend_type == BACKEND_TYPE_METAL && stream_from > 0
+                && cold.seq_len >= stream_from;
+            if (wide)
+            {
+                // ggml-metal's MUL_MAT_ID map kernel exists for these routes-a-row counts only (kernel_mul_mm_id_map0
+                // instantiations, upstream ggml-metal.metal): a row's overflow is padded up to the next one with
+                // weight-0 copies of a route it already has. None that large: the host computes them.
+                static const int kMetalIdRoutes[] = {1, 2, 4, 5, 6, 8, 9, 10, 16, 22};
+                int routes = -1;
+                for (int r : kMetalIdRoutes) if (r >= cold_used) { routes = r; break; }
+                wide = routes > 0;
+                if (wide && routes > cold_used)
+                {
+                    static thread_local std::vector<std::int32_t> s_wide_ids;
+                    static thread_local std::vector<float> s_wide_w;
+                    const std::size_t rows = static_cast<std::size_t>(cold.seq_len);
+                    s_wide_ids.resize(rows * routes);
+                    s_wide_w.assign(rows * routes, 0.0f);
+                    for (std::size_t r = 0; r < rows; ++r)
+                        for (int k = 0; k < routes; ++k)
+                        {
+                            const std::size_t from = r * cold_used + (k < cold_used ? k : 0);
+                            s_wide_ids[r * routes + k] = s_cold_ids[from];
+                            if (k < cold_used) s_wide_w[r * routes + k] = s_cold_w[from];
+                        }
+                    s_cold_ids.swap(s_wide_ids);
+                    s_cold_w.swap(s_wide_w);
+                    cold_used = routes;
+                    cold.n_used = routes;
+                }
+            }
+            if (!wide && host_moe_decode_experts(cold, s_moe_in.data(), s_cold_ids.data(), s_cold_w.data(), out.data(),
                     s_cold_pad.data()))
                 return true;
             // Up to the tier's row limit: the decode kernel in blocks of its own
             // row limit (each row keeps its solo reductions), reading through the
             // host expert cache rather than faulting the mapping.
+            if (!wide)
             {
                 constexpr int kBlock = 8;
                 bool all = cold.seq_len > 1;
@@ -2800,7 +2887,8 @@ namespace tsg
         };
         auto prefetchable = [&](std::size_t i) {
             return i < segments.size() && !segments[i].io_wait && stream_threshold > 0
-                && segments[i].seq_len >= stream_threshold && segments[i].verify_gpu == nullptr;
+                && segments[i].seq_len >= stream_threshold && segments[i].verify_gpu == nullptr
+                && segments[i].hot_tier == nullptr;   // a tiered layer splits: it stages nothing
         };
         const bool prefetch = moe_stage_prefetch_enabled() && !debug_this_call;
         if (prefetch && prefetchable(next_host(0))) moe_stage_prefetch_start(segments[next_host(0)]);
@@ -3006,6 +3094,13 @@ extern "C"
     TSG_EXPORT long long TSGgml_MoeStagePrefetchHits()
     {
         return tsg::moe_stage_prefetch_hits();
+    }
+
+    // Streamed MoE graphs that staged into the one staging buffer without a prefetch (a tiered layer's prompt-width
+    // overflow, or a prefetch miss), process total.
+    TSG_EXPORT long long TSGgml_MoeStageBorrows()
+    {
+        return g_stage_borrows.load(std::memory_order_relaxed);
     }
 
     // Read-only observability; does not create a backend/arena or alter its

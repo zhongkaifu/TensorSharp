@@ -662,9 +662,23 @@ it and reads those parts from the SSD as tokens need them.
   that is woken once per layer and parked when the layer is done; a spinning team slowed
   the GPU's work between layers 1.5-2x on Apple silicon). `TS_HOST_MOE_DECODE=0` restores
   the ggml graph path for those.
-- **Prefill** wider than 64 tokens streams each layer's used experts to the GPU per chunk,
-  read with `pread` straight into the CPU-visible staging memory (`TS_HOST_MOE_STREAM_PREAD=0`
-  faults the mapping in and copies instead). Up to 64 tokens a chunk uses the slots.
+- **Prefill** up to 2,048 tokens a chunk uses the slots like decode: the fixed slots hold
+  nearly every route a prompt makes and the window reads the misses. A wider chunk streams
+  each layer's used experts to the GPU, read with `pread` straight into the CPU-visible
+  staging memory (`TS_HOST_MOE_STREAM_PREAD=0` faults the mapping in and copies instead).
+  Streaming first stages the whole layer, about 0.7 GB a layer for ISTA `Q2_0` and about
+  1.3 s a chunk whatever its width. When streaming started at 65 tokens, every short prompt
+  paid that: cold TTFT for 88-473 token prompts went from 1.35-1.4 s to 0.33-0.76 s with
+  the split, and 900 / 1,770 tokens from 1.76-2.0 / 2.7 s to 1.33-1.55 / 2.55 s. At 3,500
+  tokens the two paths are level. `TS_HOST_MOE_TIER_MAX_ROWS` sets the width; a tier
+  without window slots (a discrete GPU's) keeps 64. Routes that neither the slots nor the
+  window take at a prompt width run on the GPU too, their experts read into the one
+  staging buffer: on the host decode kernel, which works in blocks of 8 rows and reads
+  every overflow expert again per block, a 1,024-token span of Strata's records prompt
+  took 3.2-3.7 s (that prompt routes far outside the profile). With prompts forced into
+  1,024-token spans, Strata's 4K / 16K prompts took 14.4-15.0 / 52.5-54.2 s with host
+  overflow, 6.8-7.7 / 26.9-27.4 s with GPU overflow, and 7.0-7.7 / 28.1-29.7 s streaming
+  whole layers.
 - **`--backend mlx` is refused up front**: MLX has no kernels for the sparse-attention
   indexer, the hyper-connections, the n-gram table or the IQ2_XS/IQ3_XXS experts. Use
   `ggml_metal`.
