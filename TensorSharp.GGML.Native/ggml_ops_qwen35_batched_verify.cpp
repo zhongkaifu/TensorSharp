@@ -850,8 +850,8 @@ TSG_EXPORT int TSGgml_Qwen35BatchedVerify(
                         static_cast<std::size_t>(key_dim) * sizeof(float)));
                     ggml_tensor* v_part = ggml_cont(ctx, ggml_view_2d(ctx, conv_2d, value_dim, NT, conv_2d->nb[1],
                         static_cast<std::size_t>(2 * key_dim) * sizeof(float)));
-                    ggml_tensor* q_hn = build_gdn_l2_norm(ctx, ggml_reshape_2d(ctx, q_part, head_k_dim, static_cast<std::int64_t>(num_k_heads) * NT), eps);
-                    ggml_tensor* k_hn = build_gdn_l2_norm(ctx, ggml_reshape_2d(ctx, k_part, head_k_dim, static_cast<std::int64_t>(num_k_heads) * NT), eps);
+                    ggml_tensor* q_hn = tsg::gdn_l2_norm_heads(ctx, q_part, head_k_dim, num_k_heads, NT, eps);
+                    ggml_tensor* k_hn = tsg::gdn_l2_norm_heads(ctx, k_part, head_k_dim, num_k_heads, NT, eps);
                     ggml_tensor* q4 = ggml_reshape_4d(ctx, q_hn, head_k_dim, num_k_heads, T, N);
                     ggml_tensor* k4 = ggml_reshape_4d(ctx, k_hn, head_k_dim, num_k_heads, T, N);
                     ggml_tensor* v4 = ggml_reshape_4d(ctx, v_part, head_v_dim, num_v_heads, T, N);
