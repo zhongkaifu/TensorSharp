@@ -36,10 +36,13 @@ using namespace tsg;
 //
 // Reading the whole ring (rather than the live window) is deliberate: attention is
 // permutation-invariant over the KV axis, so the ring's circular order does not
-// matter, and a FIXED [ring_rows + b] key length keeps the graph shape constant
-// across steps - which is what lets ggml-cuda capture and replay it. The host
-// supplies a per-slot position map so the mask can express exactly which slots are
-// live and visible.
+// matter, and a FIXED key length keeps the graph shape constant across steps -
+// which is what lets ggml-cuda capture and replay it. The block's own keys are
+// written into the ring at their slots (df_ring_block; the ring has a block of
+// headroom past the window), so the key length is ring_rows; TS_DFLASH_RING_BLOCK=0
+// concatenates the ring with the block instead ([ring_rows + b], a copy of the whole
+// ring per layer). The host supplies a per-slot position map so the mask can express
+// exactly which slots are live and visible.
 //
 // Mask semantics mirror the (llama.cpp-verified) managed implementation: a ring
 // slot holding position p is masked from a block query at position qp when
@@ -276,6 +279,17 @@ namespace
     {
         const char* e = std::getenv("TS_DFLASH_METAL_FUSE");
         return g_backend_type == BACKEND_TYPE_METAL && !(e != nullptr && e[0] == '0');
+    }
+
+    // The draft block's keys and values written into the ring at their own slots (position % ring_rows) and the
+    // attention run over the ring alone, instead of over a concatenation of the whole ring with the block in every
+    // layer. TS_DFLASH_RING_BLOCK=0 keeps the concatenation. The ring has a block and an anchor of headroom past the
+    // sliding window (DFlashConfig.RingRows), so a block slot only ever held a position no query can see; the rows
+    // stay until the committed positions' inject overwrites them, and the slot map never labels them live.
+    bool df_ring_block()
+    {
+        const char* e = std::getenv("TS_DFLASH_RING_BLOCK");
+        return !(e != nullptr && e[0] == '0');
     }
 
     // shift_all [n * taps] I32 / mask_all [1, n, taps] F32, tap-major: row r of tap t reads row shift_all[t*n + r]
@@ -832,7 +846,12 @@ static int df_draft_block(
         { set_last_error("DFlash draft: invalid arguments."); return 0; }
 
         const int b = block_len;
-        const int kv_len = ring_rows + b;      // FIXED across steps -> capturable
+        // The block at its own ring slots (df_ring_block) needs the ring's headroom past the window for a whole block.
+        // A block slot last held position p - ring_rows for a block position p; the nearest block query sees it only
+        // when ring_rows - (b - 1) < the window.
+        const bool ring_block = df_ring_block() && sliding_window > 0 && b < ring_rows
+            && ring_rows - (b - 1) >= sliding_window;
+        const int kv_len = ring_block ? ring_rows : ring_rows + b;      // FIXED across steps -> capturable
         const int q_dim = num_heads * head_dim;
         const int out_count = b;
 
@@ -891,16 +910,27 @@ static int df_draft_block(
                 row[s] = vis;
             }
             for (int j = 0; j < b; j++)
-                row[ring_rows + j] = vis;
+                row[ring_block ? positions[j] % ring_rows : ring_rows + j] = vis;
         }
+        // The block's ring slots (df_ring_block), written by every layer before its attention.
+        std::vector<std::int64_t> block_slots(ring_block ? b : 0);
+        for (int j = 0; j < static_cast<int>(block_slots.size()); j++)
+            block_slots[j] = positions[j] % ring_rows;
 
         DfCache* dc = can_persist ? df_draft_pool().find(sig, sig_ring, b, scale_sig) : nullptr;
+        if (dc != nullptr && (dc->kv_index != nullptr) != ring_block)
+        {
+            dc->reset();   // built under the other TS_DFLASH_RING_BLOCK setting
+            dc = nullptr;
+        }
         if (dc != nullptr && dc->graph != nullptr && dc->out_count == out_count)
         {
             host_read_barrier();
             decode_input_set_async(dc->in_main, block_ids, static_cast<std::size_t>(b) * sizeof(std::int32_t));
             decode_input_set_async(dc->pos, positions, static_cast<std::size_t>(b) * sizeof(std::int32_t));
             decode_input_set_async(dc->mask, mask_data.data(), mask_data.size() * sizeof(ggml_fp16_t));
+            if (dc->kv_index != nullptr)
+                decode_input_set_async(dc->kv_index, block_slots.data(), block_slots.size() * sizeof(std::int64_t));
             if (tsg::graph_compute_profiled(g_backend, dc->graph, "dflash draft") != GGML_STATUS_SUCCESS)
             {
                 set_last_error("DFlash draft: cached graph execution failed.");
@@ -956,6 +986,12 @@ static int df_draft_block(
         ggml_tensor* pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, b);
         ggml_tensor* mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv_len, b, 1, 1);
         ggml_set_input(ids_t); ggml_set_input(pos_t); ggml_set_input(mask_t);
+        ggml_tensor* block_slot_t = nullptr;
+        if (ring_block)
+        {
+            block_slot_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, b);
+            ggml_set_input(block_slot_t);
+        }
 
         // Constant per-tap row shift and block-boundary mask for the DFlash2
         // convolution. They depend only on the block width, which is part of the
@@ -1080,10 +1116,21 @@ static int df_draft_block(
 
             // [ring | this block's own keys]; the ring is read whole and the mask
             // decides which slots are live (attention is order-invariant over KV).
-            ggml_tensor* kb = ggml_cont(ctx, ggml_permute(ctx, k3, 0, 2, 1, 3));   // [hd, b, kv_heads]
-            ggml_tensor* vb = ggml_cont(ctx, ggml_permute(ctx, v3, 0, 2, 1, 3));
-            ggml_tensor* kcat = ggml_concat(ctx, lt.ring_k, kb, 1);
-            ggml_tensor* vcat = ggml_concat(ctx, lt.ring_v, vb, 1);
+            // With df_ring_block the block's keys go into the ring at their own slots instead.
+            ggml_tensor* kcat;
+            ggml_tensor* vcat;
+            if (ring_block)
+            {
+                kcat = ggml_set_rows(ctx, lt.ring_k, ggml_permute(ctx, k3, 0, 2, 1, 3), block_slot_t);
+                vcat = ggml_set_rows(ctx, lt.ring_v, ggml_permute(ctx, v3, 0, 2, 1, 3), block_slot_t);
+            }
+            else
+            {
+                ggml_tensor* kb = ggml_cont(ctx, ggml_permute(ctx, k3, 0, 2, 1, 3));   // [hd, b, kv_heads]
+                ggml_tensor* vb = ggml_cont(ctx, ggml_permute(ctx, v3, 0, 2, 1, 3));
+                kcat = ggml_concat(ctx, lt.ring_k, kb, 1);
+                vcat = ggml_concat(ctx, lt.ring_v, vb, 1);
+            }
 
             ggml_tensor* qa = ggml_permute(ctx, q3, 0, 2, 1, 3);                   // [hd, b, heads]
             ggml_tensor* attn_flat;
@@ -1319,6 +1366,8 @@ static int df_draft_block(
         ggml_backend_tensor_set(ids_t, block_ids, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
         ggml_backend_tensor_set(pos_t, positions, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
         ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+        if (block_slot_t != nullptr)
+            ggml_backend_tensor_set(block_slot_t, block_slots.data(), 0, block_slots.size() * sizeof(std::int64_t));
         for (int tap = 1; tap < (use_conv && !conv_all_taps ? conv_taps : 0); tap++)
         {
             ggml_backend_tensor_set(conv_shift[tap], conv_shift_data[tap].data(), 0,
@@ -1367,7 +1416,7 @@ static int df_draft_block(
         if (can_persist && slot != nullptr)
         {
             slot->ctx = ctx; slot->galloc = persist_galloc; slot->graph = graph;
-            slot->in_main = ids_t; slot->pos = pos_t; slot->mask = mask_t;
+            slot->in_main = ids_t; slot->pos = pos_t; slot->mask = mask_t; slot->kv_index = block_slot_t;
             slot->out = out; slot->out_conf = out_conf;
             slot->out_s0 = sel_s0; slot->out_scores = sel_scores; slot->out_cand = sel_cand;
             slot->sig = sig; slot->sig_ring = sig_ring; slot->n_rows = b; slot->out_count = out_count;
@@ -1408,6 +1457,7 @@ namespace
         ggml_tensor* pos = nullptr;
         ggml_tensor* mask = nullptr;
         ggml_tensor* anchors = nullptr;
+        ggml_tensor* block_slots = nullptr;   // df_ring_block: each lane's block slots
         ggml_tensor* out = nullptr;
         ggml_tensor* out_conf = nullptr;
         ggml_tensor* out_s0 = nullptr;
@@ -1426,7 +1476,7 @@ namespace
             if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; valid = false;
-            ids = pos = mask = anchors = out = out_conf = out_s0 = out_scores = out_cand = nullptr;
+            ids = pos = mask = anchors = block_slots = out = out_conf = out_s0 = out_scores = out_cand = nullptr;
             sig = nullptr; rings.clear(); b = lanes = 0; scale_signature = 0;
         }
     };
@@ -1489,7 +1539,10 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
         const int L = n_lanes;
         const int b = block_len;
         const int nb = L * b;
-        const int kv_len = ring_rows + b;
+        // As the single draft (df_ring_block): each lane's block goes into its own ring at the block's slots.
+        const bool ring_block = df_ring_block() && sliding_window > 0 && b < ring_rows
+            && ring_rows - (b - 1) >= sliding_window;
+        const int kv_len = ring_block ? ring_rows : ring_rows + b;
         const int q_dim = num_heads * head_dim;
         const bool use_conv = conv_taps > 0 && conv_group_size > 0 && conv_num_groups > 0
             && attn_conv_base_arr != nullptr && attn_conv_proj_arr != nullptr
@@ -1529,16 +1582,20 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
                     row[s] = vis;
                 }
                 for (int j = 0; j < b; j++)
-                    row[ring_rows + j] = vis;
+                    row[ring_block ? lpos[j] % ring_rows : ring_rows + j] = vis;
             }
         }
+        std::vector<std::int64_t> block_slots(ring_block ? nb : 0);
+        for (int i = 0; i < static_cast<int>(block_slots.size()); i++)
+            block_slots[i] = positions[i] % ring_rows;
 
         const void* sig = attn_norm_arr[0];
         std::vector<const void*> rings(ring_k_arr, ring_k_arr + static_cast<std::size_t>(L) * num_layers);
         DfBatchPool& pool = df_batch_pool();
         DfBatchCache* dc = nullptr;
         for (auto& e : pool.entries)
-            if (e.valid && e.sig == sig && e.b == b && e.lanes == L && e.scale_signature == scale_sig && e.rings == rings)
+            if (e.valid && e.sig == sig && e.b == b && e.lanes == L && e.scale_signature == scale_sig && e.rings == rings
+                && (e.block_slots != nullptr) == ring_block)
             { dc = &e; break; }
 
         auto download = [&](DfBatchCache& c) {
@@ -1578,6 +1635,8 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
             decode_input_set_async(dc->mask, mask_data.data(), mask_data.size() * sizeof(ggml_fp16_t));
             if (dc->anchors != nullptr)
                 decode_input_set_async(dc->anchors, anchors.data(), anchors.size() * sizeof(std::int32_t));
+            if (dc->block_slots != nullptr)
+                decode_input_set_async(dc->block_slots, block_slots.data(), block_slots.size() * sizeof(std::int64_t));
             if (tsg::graph_compute_profiled(g_backend, dc->graph, "dflash batched draft") != GGML_STATUS_SUCCESS)
             {
                 set_last_error("DFlash batched draft: cached graph execution failed.");
@@ -1610,6 +1669,12 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
         ggml_tensor* pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
         ggml_tensor* mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv_len, b, 1, L);
         ggml_set_input(ids_t); ggml_set_input(pos_t); ggml_set_input(mask_t);
+        ggml_tensor* block_slot_t = nullptr;
+        if (ring_block)
+        {
+            block_slot_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nb);
+            ggml_set_input(block_slot_t);
+        }
         ggml_tensor* anchors_t = nullptr;
         if (use_selector)
         {
@@ -1745,10 +1810,22 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
                     static_cast<std::size_t>(lane) * b * k3->nb[2]);
                 ggml_tensor* vl = ggml_view_3d(ctx, v3, head_dim, num_kv_heads, b, v3->nb[1], v3->nb[2],
                     static_cast<std::size_t>(lane) * b * v3->nb[2]);
-                ggml_tensor* kb = ggml_cont(ctx, ggml_permute(ctx, kl, 0, 2, 1, 3));   // [hd, b, kv_heads]
-                ggml_tensor* vb = ggml_cont(ctx, ggml_permute(ctx, vl, 0, 2, 1, 3));
-                ggml_tensor* kcat = ggml_concat(ctx, ring_k[ix], kb, 1);
-                ggml_tensor* vcat = ggml_concat(ctx, ring_v[ix], vb, 1);
+                ggml_tensor* kcat;
+                ggml_tensor* vcat;
+                if (ring_block)
+                {
+                    ggml_tensor* sl = ggml_view_1d(ctx, block_slot_t, b,
+                        static_cast<std::size_t>(lane) * b * sizeof(std::int64_t));
+                    kcat = ggml_set_rows(ctx, ring_k[ix], ggml_permute(ctx, kl, 0, 2, 1, 3), sl);
+                    vcat = ggml_set_rows(ctx, ring_v[ix], ggml_permute(ctx, vl, 0, 2, 1, 3), sl);
+                }
+                else
+                {
+                    ggml_tensor* kb = ggml_cont(ctx, ggml_permute(ctx, kl, 0, 2, 1, 3));   // [hd, b, kv_heads]
+                    ggml_tensor* vb = ggml_cont(ctx, ggml_permute(ctx, vl, 0, 2, 1, 3));
+                    kcat = ggml_concat(ctx, ring_k[ix], kb, 1);
+                    vcat = ggml_concat(ctx, ring_v[ix], vb, 1);
+                }
                 ggml_tensor* ql = ggml_view_3d(ctx, q3, head_dim, num_heads, b, q3->nb[1], q3->nb[2],
                     static_cast<std::size_t>(lane) * b * q3->nb[2]);
                 ggml_tensor* qa = ggml_permute(ctx, ql, 0, 2, 1, 3);                    // [hd, b, heads]
@@ -1952,6 +2029,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
         }
         slot->ctx = ctx; slot->galloc = persist_galloc; slot->graph = graph;
         slot->ids = ids_t; slot->pos = pos_t; slot->mask = mask_t; slot->anchors = anchors_t;
+        slot->block_slots = block_slot_t;
         slot->out = out; slot->out_conf = out_conf;
         slot->out_s0 = sel_s0; slot->out_scores = sel_scores; slot->out_cand = sel_cand;
         slot->sig = sig; slot->rings = rings; slot->b = b; slot->lanes = L;
@@ -1964,6 +2042,8 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
         ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
         if (anchors_t != nullptr)
             ggml_backend_tensor_set(anchors_t, anchors.data(), 0, anchors.size() * sizeof(std::int32_t));
+        if (block_slot_t != nullptr)
+            ggml_backend_tensor_set(block_slot_t, block_slots.data(), 0, block_slots.size() * sizeof(std::int64_t));
         if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
         {
             set_last_error("DFlash batched draft: graph execution failed.");
