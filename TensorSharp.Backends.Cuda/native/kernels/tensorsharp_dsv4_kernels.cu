@@ -111,6 +111,41 @@ __device__ __forceinline__ float ts_dsv4_warp_sum(float v)
     return v;
 }
 
+// The warp sums of a lane's R values as one reduce-scatter: at each step of ts_dsv4_warp_sum's butterfly (xor 16, 8, ...,
+// 1) a lane keeps half of its values (both halves keep the middle one of an odd count) and adds its partner's for them,
+// so R values take ceil(R / 2) + ceil(R / 4) + ... shuffles where R warp sums took 5 R. Every add is the butterfly's own -
+// this lane's partial plus its partner's, the same partners in the same order - so each value's sum is ts_dsv4_warp_sum's
+// bit for bit, whatever R. Returns the sum of value *row, the one this lane ends up holding (several lanes hold each; the
+// lowest of them is the first lane of __match_any_sync(row)).
+template <int R>
+__device__ __forceinline__ float ts_dsv4_rows_reduce_scatter(float (&s)[R], const int lane, int* row)
+{
+    int base = 0;
+#pragma unroll
+    for (int k = 0; k < 5; ++k)
+    {
+        const int off = 16 >> k;
+        const int m = (R + (1 << k) - 1) >> k;            // values held before the step
+        const int m2 = (R + (2 << k) - 1) >> (k + 1);     // and after it
+        const bool up = (lane & off) != 0;
+#pragma unroll
+        for (int j = 0; j < R; ++j)
+        {
+            if (j < m2)
+            {
+                const int lo = j, hi = m - m2 + j;
+                const float send = up ? s[lo] : s[hi];
+                const float recv = __shfl_xor_sync(0xffffffffu, send, off);
+                s[j] = (up ? s[hi] : s[lo]) + recv;
+            }
+        }
+        if (up)
+            base += m - m2;
+    }
+    *row = base;
+    return s[0];
+}
+
 __device__ __forceinline__ float ts_dsv4_sigmoid(float x)
 {
     return 1.0f / (1.0f + expf(-x));
@@ -4971,23 +5006,42 @@ __device__ __forceinline__ void ts_dsv4_dense_fast(
             for (int r = 0; r < R; ++r)
                 s[r] = 0.0f;
         }
-        if (W == 1)
+        if constexpr (R >= 4)
         {
+            // Four rows or more: one reduce-scatter (each row's sum the warp sum's bits, ts_dsv4_rows_reduce_scatter).
+            // Fewer keep a warp sum each: the reduce-scatter took their kernels from 64-80 registers to 128.
+            int hr;
+            const float hv = ts_dsv4_rows_reduce_scatter<R>(s, lane, &hr);
+            const bool first = lane == __ffs(__match_any_sync(0xffffffffu, hr)) - 1;
+            if (W == 1)
+            {
+                if (first && hr < n && rr < outDim)
+                    out[(size_t)(r0 + hr) * outDim + rr] = hv;
+                continue;
+            }
+            if (first)
+                part[warp][hr] = hv;
+        }
+        else
+        {
+            if (W == 1)
+            {
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+                {
+                    const float v = ts_dsv4_warp_sum(s[r]);
+                    if (lane == 0 && r < n && rr < outDim)
+                        out[(size_t)(r0 + r) * outDim + rr] = v;
+                }
+                continue;
+            }
 #pragma unroll
             for (int r = 0; r < R; ++r)
             {
                 const float v = ts_dsv4_warp_sum(s[r]);
-                if (lane == 0 && r < n && rr < outDim)
-                    out[(size_t)(r0 + r) * outDim + rr] = v;
+                if (lane == 0)
+                    part[warp][r] = v;
             }
-            continue;
-        }
-#pragma unroll
-        for (int r = 0; r < R; ++r)
-        {
-            const float v = ts_dsv4_warp_sum(s[r]);
-            if (lane == 0)
-                part[warp][r] = v;
         }
         __syncthreads();
         if (sub == 0 && lane < n && rr < outDim)
