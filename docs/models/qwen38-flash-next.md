@@ -1942,6 +1942,22 @@ Same client as above. The engine bench runs 256-token decodes twice; standard-v1
 | 1 lane | 80.7-98.1 tok/s | 59-65 tok/s, 2/2 correct | 92-95 tok/s, 4/4 | 12 of 12 completed, 31-37 tok/s each |
 | 4 lanes | 79.0-88.6 tok/s | 66-75 tok/s, 2/2 | 91-94 tok/s, 4/4 | 12 of 12 completed, 30-36 tok/s each |
 
+Those requests still waited ~5 s for their first tokens, and a lone 73-token prompt waited 1.1-1.4 s. A prompt span of
+65-127 rows was wider than a discrete GPU's tier splits (64) and narrower than the seam streams (128). Every route of
+every layer ran on the host: 1.1-1.4 s of compute against 0.27-0.29 s at 64 rows. The tier now splits up to the
+streaming width (see Expert tiers above).
+
+After that, at 1 lane following four concurrent requests, a 4K prompt failed. The draft head's catch-up over its
+1,045-row chunk asked 1.29 GB of a GPU with ~1.4 GB free. A catch-up whose graph does not fit now goes in halves, as
+the target's prompt spans do (that run halved it 1.32 GB -> 660 -> 330 -> 165 MB).
+
+| run, both fixes | long-gen TTFT / decode | standard-v1 concurrency TTFT | parallel_2 | parallel_4 | 4K / 16K TTFT |
+| --- | --- | --- | --- | --- | --- |
+| 1 lane | 0.20-0.23 s / 90-97 tok/s | 0.84-1.47 s | 91-106 tok/s | 93-128 tok/s | 5.8 / 21-27 s (after the concurrency rounds) |
+| 4 lanes | 0.20-0.25 s / 90-92 tok/s | 1.20-1.72 s | 90-104 tok/s | 122-126 tok/s | 5.8 / 22.1 s |
+
+No request failed in either arm.
+
 Greedy identity holds only in an exact arm that runs each sequence through its own one-row span:
 
 - The exact arm turns off the prefix cache, the route tail skip, tier adaptation and hybrid misses

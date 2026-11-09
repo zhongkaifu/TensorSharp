@@ -81,6 +81,13 @@ namespace
             throw std::invalid_argument("qwen4exp MTP: rotary sections exceed rotary width");
     }
 
+    // A graph arena that does not fit the device: raised before anything runs, so the executor stays usable and the
+    // caller can forward the same rows in smaller pieces (the managed RunMtp halves them).
+    struct Q4eMtpAllocFailed : std::runtime_error
+    {
+        using std::runtime_error::runtime_error;
+    };
+
     struct Q4eMtpExecutor
     {
         TSGgmlQwen4ExpMtpConfig config{};
@@ -252,7 +259,11 @@ namespace
             }
             alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(tsg::active_backend()));
             if (!alloc || !ggml_gallocr_alloc_graph(alloc, graph))
-                throw std::runtime_error("qwen4exp MTP graph allocation failed");
+            {
+                // Nothing ran: the draft head's K/V is as it was, so the caller may retry with fewer rows.
+                reset_graph();
+                throw Q4eMtpAllocFailed("qwen4exp MTP graph allocation failed (no device memory for the graph)");
+            }
             binder.flush();
             bindings = std::move(binder.cached);
             tokens = count;
@@ -368,6 +379,12 @@ TSG_EXPORT int TSGgml_Qwen4ExpMtpForward(void* handle,
         if (logits_out)
             ggml_backend_tensor_get(executor->logits, logits_out, 0, (std::size_t)executor->head.vocab * sizeof(float));
         return 1;
+    }
+    catch (const Q4eMtpAllocFailed& e)
+    {
+        // Not a failed executor: its K/V and position are untouched and the next build starts afresh.
+        tsg::set_last_error(e.what());
+        return 0;
     }
     catch (const std::exception& e)
     {

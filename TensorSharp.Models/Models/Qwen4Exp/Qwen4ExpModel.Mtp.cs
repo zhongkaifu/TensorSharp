@@ -304,24 +304,63 @@ namespace TensorSharp.Models
             var state = EnsureMtpState(checked(position + tokens.Length));
             if (position > state.Position)
                 throw new InvalidOperationException("qwen4exp MTP cannot draft across a gap in its own KV history.");
-            using var embedding = Embedding(tokens); // the target owns the borrowed embedding weights
-            _mtpPositions.TryGetValue(ActiveSpecOwner, out var positions);
-            var (ropePosition, mrope) = ResolveMtpPositions(positions, position, tokens.Length, _mropeCacheGap);
-            try
+            try { RunMtpRows(state, tokens, 0, tokens.Length, previous, position, logits, hidden); }
+            catch { state.Failed = true; throw; }
+        }
+
+        /// <summary>
+        /// One draft-head forward over <paramref name="count"/> of <paramref name="tokens"/> from
+        /// <paramref name="start"/> (their hidden rows from row <paramref name="start"/> of <paramref name="previous"/>),
+        /// at <paramref name="position"/>. A graph whose arena does not fit the device leaves the head untouched, and the
+        /// rows then go in halves, only the last half writing the logits and hidden row: on ggml_cuda after four
+        /// concurrent requests the catch-up over a 1,045-row prompt chunk asked 1.29 GB, did not get it, and failed
+        /// the request with HTTP 500, where the target's own prompt span already falls back to halves.
+        /// </summary>
+        private unsafe void RunMtpRows(MtpState state, int[] tokens, int start, int count, float[] previous, int position,
+            float[] logits, float[] hidden)
+        {
+            void Halves()
             {
+                int first = count / 2;
+                RunMtpRows(state, tokens, start, first, previous, position, null, null);
+                RunMtpRows(state, tokens, start + first, count - first, previous, position + first, logits, hidden);
+            }
+            if (MtpForwardRowsForTest > 0 && count > MtpForwardRowsForTest)
+            {
+                Halves();
+                return;
+            }
+            int[] rows = start == 0 && count == tokens.Length ? tokens : tokens[start..(start + count)];
+            bool ok;
+            using (var embedding = Embedding(rows)) // the target owns the borrowed embedding weights
+            {
+                _mtpPositions.TryGetValue(ActiveSpecOwner, out var positions);
+                var (ropePosition, mrope) = ResolveMtpPositions(positions, position, count, _mropeCacheGap);
                 fixed (float* hp = previous)
                 fixed (float* ho = hidden)
                 fixed (float* lp = logits)
                 fixed (int* mp = mrope)
-                    if (!GgmlBasicOps.Qwen4ExpMtpForward(state.Executor, (IntPtr)GetFloatPtr(embedding),
-                        (IntPtr)hp, tokens.Length, position, ropePosition,
-                        (IntPtr)mp, (IntPtr)ho, (IntPtr)lp))
-                        throw new InvalidOperationException("qwen4exp MTP forward failed; reset the conversation before reuse.");
-                state.Position = position + tokens.Length;
-                PruneMtpPositions(ActiveSpecOwner, state.Position);
+                    ok = GgmlBasicOps.Qwen4ExpMtpForward(state.Executor, (IntPtr)GetFloatPtr(embedding),
+                        (IntPtr)(hp + (long)start * _hcDim), count, position, ropePosition,
+                        (IntPtr)mp, (IntPtr)ho, (IntPtr)lp);
             }
-            catch { state.Failed = true; throw; }
+            if (!ok)
+            {
+                string error = GgmlBasicOps.LastNativeError();
+                if (count > 1 && error != null && error.Contains("MTP graph allocation failed", StringComparison.Ordinal))
+                {
+                    Halves();
+                    return;
+                }
+                throw new InvalidOperationException("qwen4exp MTP forward failed; reset the conversation before reuse. " + error);
+            }
+            state.Position = position + count;
+            PruneMtpPositions(ActiveSpecOwner, state.Position);
         }
+
+        /// <summary>Test seam: a draft-head forward wider than this many rows takes the halving branch a failed graph
+        /// allocation takes (0: off).</summary>
+        internal static int MtpForwardRowsForTest;
 
         public void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
         {
