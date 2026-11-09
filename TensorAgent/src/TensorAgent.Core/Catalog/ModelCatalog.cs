@@ -323,6 +323,51 @@ public static partial class ModelCatalog
         },
         new CatalogModel
         {
+            // The fastest Flash Next on a 48 GB Mac (config/qwen3.8-flash-next.json): ISTA-DASLab's GSQ-RCO Q2_0 with
+            // the DFlash2 drafter. Its own id: "Q2_0" alone is also the name of an unsloth UD export, a different file.
+            Id = "qwen3.8-flash-next-gsq-q2-0",
+            DisplayName = "Qwen3.8 Flash Next",
+            Family = CatalogFamily.Qwen38FlashNext,
+            Kind = CatalogArchitectureKind.MixtureOfExperts,
+            Parameters = "catalog.model.qwen38FlashNext.parameters",
+            Quantization = "GSQ-RCO Q2_0",
+            // Two gguf-split shards (pinned and read at ed59f92082b1e93c0e96d60a8b11aab089b52f09 on 2026-11-08): the
+            // trunk with the experts, then the 28.8 GB n-gram table. The engine is pointed at the first.
+            Files = new[]
+            {
+                new CatalogFile(CatalogFileRole.Weights, "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+                    Hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF", "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"),
+                    37_623_740_192, "69820c02ec7d0b45ef2ebb19d6620299db749fe2aded7f39f93c6b88b199b720"),
+                new CatalogFile(CatalogFileRole.WeightsShard, "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf",
+                    Hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF", "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"),
+                    28_800_138_432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+                FlashNextProjector(),
+                FlashNextDFlash2Draft(),
+            },
+            Modalities = CatalogModalities.Image | CatalogModalities.Video,
+            // 66.4 GB of weights on a 48 GB Mac, by design, as with the Q2_K_XL entry: the engine copies every layer's
+            // most-routed experts into fixed and window GPU slots (26.0 GB of the 34.0 GB of experts in the app on the
+            // M5 Pro, 97.3% of the profiled routes) and reads the others and the n-gram table from the SSD on demand.
+            MinDeviceMemoryGB = 48,
+            // The n-gram table (shard 2) plus the experts outside the slots (33,973,878,784 bytes less 26.0 GB). The
+            // slots are resident weights here, beside the 3.65 GB of dense weights.
+            WeightsPagedFromDiskBytes = 28_800_138_432 + 7_973_878_784,
+            ContextLength = 32768,
+            // f16: the qwen4exp span reads F16/F32 K/V only (sparse attention has no other path).
+            KvCacheDtype = "f16",
+            LeanCaches = true,
+            // The publisher's sampling defaults (general.sampling).
+            Sampling = new CatalogSampling(1.0f, 20, 0.95f, 0.0f),
+            // No DraftTuning: the DFlash2 drafter's engine defaults (block drafts of up to 6, gate 0.5) are what was
+            // measured. M5 Pro (48 GB), the server with config/qwen3.8-flash-next.json: decode 43-48 tok/s, 4K-token
+            // prompt TTFT 5.8-6.0 s, four requests at once 43.4 tok/s in all.
+            SupportsThinking = true,
+            Experimental = true,
+            License = "Qwen Community License 1.0",
+            Notes = "catalog.model.qwen38FlashNextGsqQ20.notes",
+        },
+        new CatalogModel
+        {
             Id = "qwen3.8-flash-next-q2kxl",
             DisplayName = "Qwen3.8 Flash Next",
             Family = CatalogFamily.Qwen38FlashNext,
@@ -547,6 +592,12 @@ public static partial class ModelCatalog
     private static CatalogFile FlashNextDraft() => new(CatalogFileRole.Draft, "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
         "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
         2_786_568_256, "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6", Optional: true);
+
+    // The DFlash2 drafter for Flash Next (the GGUF's architecture is dflash, which routes it to the block drafter).
+    // Verified against upstream revision 4f5a39be8f0a9e9a573ac9824251830a8f4096d9 on 2026-11-08.
+    private static CatalogFile FlashNextDFlash2Draft() => new(CatalogFileRole.Draft, "Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf",
+        "https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2-GGUF/resolve/4f5a39be8f0a9e9a573ac9824251830a8f4096d9/Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf",
+        362_124_704, "2f174e593998c77df0eb7ca13961915a26f25f7944d784a1838e1856e857ff0d", Optional: true);
 
     /// <summary>
     /// A MiniMax-H3 entry: its primary FL2VA denoiser, the companion Ref2VA denoiser, and

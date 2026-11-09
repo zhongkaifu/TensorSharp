@@ -10,6 +10,7 @@
   "catalog.model.museGlimmer30b.notes": "能夠讀取影像和呼叫工具的 300 億參數稠密模型。即使關閉思考，它也會先在獨立通道中推理，再回答。需要 32 GB 系統記憶體（RAM）。視覺可選下載，載入後約需額外 8 GB 記憶體。 可選擇下載 DFlash 草稿模型。加速效果取決於後端和取樣設定。",
   "catalog.model.qwen38FlashNext.parameters": "1250 億（啟用 60 億）",
   "catalog.model.qwen38FlashNext.notes": "Qwen 的 UD-Q2_K_XL 混合量化 1250 億參數混合專家模型（每個 token 啟用 60 億參數）。需要 48 GB 系統記憶體（RAM），三個分片約需 79 GB SSD 空間。選中的專家和 n-gram 表按需從 SSD 讀取，因此載入後的最初幾次回答可能較慢，相關記憶體頁預熱後會加快。 圖像與影片影格視覺投影器及共用 MTP 推測解碼草稿模型皆可選擇下載。",
+  "catalog.model.qwen38FlashNextGsqQ20.notes": "Qwen 的 1250 億參數混合專家模型（每個 token 啟用 60 億參數），採用 ISTA-DASLab 的 GSQ-RCO Q2_0 量化，是 Mac 上最快的 Qwen3.8 Flash Next：在 M5 Pro 上搭配 DFlash2 推測解碼草稿模型約每秒 45 個 token。需要 48 GB 系統記憶體（RAM），兩個分片約需 66 GB SSD 空間。選中的專家與 n-gram 表會按需從 SSD 讀取，因此載入後最初幾次回答可能較慢，相關記憶體頁預熱後會加快。圖像與影片影格的視覺投影器及 DFlash2 草稿模型皆為選擇性下載。",
   "catalog.model.qwen38FlashNextIq1m.notes": "Qwen 的 UD-IQ1_M 混合量化 1250 億參數混合專家模型（每個 token 啟用 60 億參數）。至少需要 32 GB 系統記憶體（RAM），三個分片約需 75 GB SSD 空間。專家和 n-gram 表按需從 SSD 讀取，因此首次回答可能較慢。影像支援需要下載可選的 0.9 GB 投影器。已在 Windows CUDA、32 GB 記憶體和 16 GB 顯示記憶體的配置上驗證。 圖像與影片影格視覺投影器及共用 MTP 推測解碼草稿模型皆可選擇下載。",
   "catalog.model.qwenImage21.parameters": "Qwen-Image-2.1 DiT + Qwen3-VL-8B 文字編碼器",
   "catalog.model.qwenImage21.quantization": "Q4_K_M（DiT）/ Q4_K_M（文字編碼器）",

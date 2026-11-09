@@ -18,6 +18,7 @@ public sealed class CatalogTests
             "qwen3.5-9b-iq4xs",
             "qwen3.8-27b-iq3xxs",
             "muse-glimmer-30b-q4kxl",
+            "qwen3.8-flash-next-gsq-q2-0",
             "qwen3.8-flash-next-q2kxl",
             "qwen3.8-flash-next-iq1m",
             "qwen-image-2.1-q4km",
@@ -228,6 +229,7 @@ public sealed class CatalogTests
     {
         "qwen3.8-27b-iq3xxs",
         "muse-glimmer-30b-q4kxl",
+        "qwen3.8-flash-next-gsq-q2-0",
         "qwen3.8-flash-next-q2kxl",
         "qwen3.8-flash-next-iq1m",
         "qwen-image-2.1-q4km",
@@ -262,6 +264,7 @@ public sealed class CatalogTests
     [InlineData("qwen-image-2.1-turbo-q5ks", 24)]
     [InlineData("qwen-image-2.1-turbo-q8-0", 32)]
     [InlineData("minimax-h3-fl2va-q4k", 32)]
+    [InlineData("qwen3.8-flash-next-gsq-q2-0", 48)]
     [InlineData("qwen3.8-flash-next-q2kxl", 48)]
     [InlineData("qwen3.8-flash-next-iq1m", 32)]
     public void TheDesktopTiersHoldTheModelsNoPhoneCanRunWell(string id, int tier)
@@ -288,6 +291,7 @@ public sealed class CatalogTests
     {
         var approved = new Dictionary<string, int>
         {
+            ["qwen3.8-flash-next-gsq-q2-0"] = 48,
             ["qwen3.8-flash-next-q2kxl"] = 48,
             ["qwen3.8-flash-next-iq1m"] = 32,
         };
@@ -355,6 +359,10 @@ public sealed class CatalogTests
         // SSD (CatalogModel.WeightsPagedFromDiskBytes). The footprint is phys_footprint_peak over
         // the warm-up of the 7.2k-token agent prompt and chat-e2e.py's six text scenarios.
         ["qwen3.8-flash-next-q2kxl"] = (18.34, 7.31, "chat-e2e.py's text scenarios in the Mac app, phys_footprint_peak"),
+        // Measured 2026-11-08 in the Debug Mac app with the DFlash2 drafter: phys_footprint_peak 31-33 GB over
+        // chat-e2e.py's text scenarios (fact, follow, newchat, long, think, tool) in three runs, less the 24.1-26.0 GB
+        // of expert slots the engine copies into Metal memory, which are counted as resident weights with the dense ones.
+        ["qwen3.8-flash-next-gsq-q2-0"] = (29.65, 7.0, "chat-e2e.py's text scenarios in the Mac app, phys_footprint_peak less the expert slots"),
     };
 
     // IQ1_M's 32 GB tier was validated on Windows with 16 GB CUDA VRAM and SSD paging.
@@ -673,6 +681,7 @@ public sealed class CatalogTests
         "qwen-image-2.1-q4km",
         "minimax-h3-fl2va-q4k",
         "minimax-h3-ref2va-q4k",
+        "qwen3.8-flash-next-gsq-q2-0",
         "qwen3.8-flash-next-q2kxl",
         "qwen3.8-flash-next-iq1m",
         "qwen-image-2.1-turbo-adq4k",

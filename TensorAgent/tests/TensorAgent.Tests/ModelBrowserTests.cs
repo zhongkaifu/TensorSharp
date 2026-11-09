@@ -59,7 +59,7 @@ public sealed class ModelBrowserTests
     public void VersionsIgnoreCaseWhitespaceAndPunctuation(string query)
     {
         string[] ids = Results(query).Select(model => model.Id).Order().ToArray();
-        Assert.Equal(new[] { "qwen3.8-27b-iq3xxs", "qwen3.8-flash-next-iq1m", "qwen3.8-flash-next-q2kxl" }, ids);
+        Assert.Equal(new[] { "qwen3.8-27b-iq3xxs", "qwen3.8-flash-next-gsq-q2-0", "qwen3.8-flash-next-iq1m", "qwen3.8-flash-next-q2kxl" }, ids);
     }
 
     [Theory]

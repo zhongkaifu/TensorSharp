@@ -10,6 +10,7 @@
   "catalog.model.museGlimmer30b.notes": "画像を読み取り、ツールを呼び出せる密な 30B モデルです。思考をオフにしていても、回答前に専用チャネルで推論します。32 GB のシステムメモリ（RAM）が必要です。画像認識は追加でダウンロードでき、読み込むと約 8 GB のメモリがさらに必要になります。 DFlash ドラフトモデルを追加でダウンロードできます。速度向上はバックエンドとサンプリング設定に依存します。",
   "catalog.model.qwen38FlashNext.parameters": "125B（稼働 6B）",
   "catalog.model.qwen38FlashNext.notes": "Qwen の 125B 混合エキスパートを UD-Q2_K_XL 混合量子化したモデルで、各トークンで 6B が稼働します。48 GB のシステムメモリ（RAM）と、3 つの分割ファイル用に約 79 GB の SSD 容量が必要です。選択されたエキスパートと n-gram テーブルを必要に応じて SSD から読み込むため、読み込み直後の回答は、それらのページがキャッシュに入るまで遅くなることがあります。 画像・動画フレーム用のビジョンプロジェクターと共有 MTP 投機的デコード用ドラフトは、追加でダウンロードできます。",
+  "catalog.model.qwen38FlashNextGsqQ20.notes": "Qwen の 1250 億パラメータの Mixture of Experts（トークンごとに 60 億がアクティブ）を ISTA-DASLab の GSQ-RCO Q2_0 で量子化した、Mac で最速の Qwen3.8 Flash Next です。M5 Pro では DFlash2 投機的デコードのドラフトモデルと組み合わせて毎秒約 45 トークン。システムメモリ（RAM）48 GB と、2 つのシャードで約 66 GB の SSD 容量が必要です。選ばれたエキスパートと n-gram テーブルは必要に応じて SSD から読み込まれるため、読み込み直後の最初の回答は遅くなることがあります。画像・動画フレーム用のビジョンプロジェクターと DFlash2 ドラフトモデルは任意でダウンロードできます。",
   "catalog.model.qwen38FlashNextIq1m.notes": "Qwen の 125B 混合エキスパートを UD-IQ1_M 混合量子化したモデルで、各トークンで 6B が稼働します。最低 32 GB のシステムメモリ（RAM）と、3 つの分割ファイル用に約 75 GB の SSD 容量が必要です。エキスパートと n-gram テーブルは必要に応じて SSD から読み込むため、最初の回答は遅くなることがあります。画像対応は、0.9 GB のプロジェクターを追加でダウンロードして有効にできます。Windows の CUDA、32 GB RAM、16 GB GPU メモリの構成で検証済みです。 画像・動画フレーム用のビジョンプロジェクターと共有 MTP 投機的デコード用ドラフトは、追加でダウンロードできます。",
   "catalog.model.qwenImage21.parameters": "Qwen-Image-2.1 DiT + Qwen3-VL-8B テキストエンコーダー",
   "catalog.model.qwenImage21.quantization": "Q4_K_M（DiT）/ Q4_K_M（テキストエンコーダー）",
