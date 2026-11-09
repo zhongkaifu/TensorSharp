@@ -9,6 +9,9 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
 #include "ggml_ops_transformer_common.h"
+#if defined(TSG_GGML_USE_METAL)
+#include "tsm/tsm_moe.h"
+#endif
 #include <cmath>
 #include <cstdio>
 
@@ -162,6 +165,9 @@ namespace
         ggml_tensor* out_s0 = nullptr;     // DFlash2 selector: [k] anchor row
         ggml_tensor* out_scores = nullptr; // DFlash2 selector: [k, k, gamma-1]
         ggml_tensor* out_cand = nullptr;   // DFlash2 selector: [k, gamma] I32
+        ggml_tensor* tail_h = nullptr;     // DFlash2 on tsm::df_tail_run: the final normed rows
+        ggml_tensor* tail_ph = nullptr;    // and the selector's hidden projection
+        ggml_tensor* tail_head = nullptr, *tail_pred = nullptr, *tail_succ = nullptr;   // the tail's weights (bound)
         const void* sig = nullptr;
         const void* sig_ring = nullptr;
         int n_rows = 0;
@@ -177,6 +183,7 @@ namespace
             graph = nullptr; valid = false;
             in_main = pos = kv_index = mask = out = out_conf = nullptr;
             out_s0 = out_scores = out_cand = nullptr;
+            tail_h = tail_ph = tail_head = tail_pred = tail_succ = nullptr;
             sig = sig_ring = nullptr;
             n_rows = out_count = 0;
             scale_signature = 0;
@@ -867,6 +874,16 @@ static int df_draft_block(
             set_last_error("DFlash draft: selector needs at least one proposal row and top_k <= vocab.");
             return 0;
         }
+        // The head, top-k and selector lattice on TensorSharp's Metal kernels after the graph (tsm::df_tail_run).
+#if defined(TSG_GGML_USE_METAL)
+        const bool use_tail = use_selector && g_backend_type == BACKEND_TYPE_METAL && lm_head_ne0 == hidden_size
+            && lm_head_ne1 == vocab_size && sel_pred_ne0 == sel_rank && sel_succ_ne0 == sel_rank
+            && sel_pred_ne1 == vocab_size && sel_succ_ne1 == vocab_size
+            && tsm::df_tail_supported(g_backend, lm_head_type, hidden_size, vocab_size, sel_rank, sel_top_k,
+                                      sel_pred_type, sel_succ_type, gamma);
+#else
+        const bool use_tail = false;
+#endif
         if (use_conv && conv_taps > b)
         {
             set_last_error("DFlash draft: conv_kernel_size exceeds the block width.");
@@ -917,10 +934,29 @@ static int df_draft_block(
         for (int j = 0; j < static_cast<int>(block_slots.size()); j++)
             block_slots[j] = positions[j] % ring_rows;
 
+        // The tail after the graph (use_tail): it runs behind the graph on the same queue and waits for itself.
+        auto run_tail = [&](ggml_tensor* tail_h, ggml_tensor* tail_ph, ggml_tensor* head_t, ggml_tensor* pred_t,
+                            ggml_tensor* succ_t) -> bool {
+#if defined(TSG_GGML_USE_METAL)
+            tsm::DfTailIO io;
+            io.h = tail_h; io.ph = tail_ph; io.head = head_t; io.pred = pred_t; io.succ = succ_t;
+            io.gamma = gamma; io.anchor = block_ids[0];
+            io.head_scale = scales != nullptr ? scales[2] : 1.0f;
+            io.pred_scale = scales != nullptr ? scales[4] : 1.0f;
+            io.succ_scale = scales != nullptr ? scales[5] : 1.0f;
+            io.logit_scale = sel_logit_scale; io.softcap = sel_logit_softcap;
+            io.cand_out = sel_cand_out; io.scores_out = sel_scores_out;
+            return tsm::df_tail_run(g_backend, io);
+#else
+            (void)tail_h; (void)tail_ph; (void)head_t; (void)pred_t; (void)succ_t;
+            return false;
+#endif
+        };
+
         DfCache* dc = can_persist ? df_draft_pool().find(sig, sig_ring, b, scale_sig) : nullptr;
-        if (dc != nullptr && (dc->kv_index != nullptr) != ring_block)
+        if (dc != nullptr && ((dc->kv_index != nullptr) != ring_block || (dc->tail_h != nullptr) != use_tail))
         {
-            dc->reset();   // built under the other TS_DFLASH_RING_BLOCK setting
+            dc->reset();   // built under the other TS_DFLASH_RING_BLOCK / TS_METAL_DF_TAIL setting
             dc = nullptr;
         }
         if (dc != nullptr && dc->graph != nullptr && dc->out_count == out_count)
@@ -936,6 +972,16 @@ static int df_draft_block(
                 set_last_error("DFlash draft: cached graph execution failed.");
                 dc->reset();
                 return 0;
+            }
+            if (dc->tail_h != nullptr)
+            {
+                if (!run_tail(dc->tail_h, dc->tail_ph, dc->tail_head, dc->tail_pred, dc->tail_succ))
+                {
+                    dc->reset();
+                    return 0;
+                }
+                clear_last_error();
+                return 1;
             }
             // Metal's graph_compute is async and a shared-buffer tensor_get is a
             // raw memcpy, so the draft ids must not be read until the queue
@@ -1174,7 +1220,18 @@ static int df_draft_block(
         ggml_tensor* sel_s0 = nullptr;
         ggml_tensor* sel_scores = nullptr;
         ggml_tensor* sel_cand = nullptr;
-        if (use_selector)
+        ggml_tensor* tail_h = nullptr;
+        ggml_tensor* tail_ph = nullptr;
+        if (use_tail)
+        {
+            // The graph ends at the final rows and the selector's hidden projection; tsm::df_tail_run reads them.
+            ggml_tensor* pred_h = ggml_view_2d(ctx, cur, hidden_size, gamma, cur->nb[1], cur->nb[1]);
+            tail_ph = df_scaled(ctx, ggml_mul_mat(ctx, sel_hidden_t, pred_h), scales, 3);   // [r, gamma]
+            tail_h = cur;
+            ggml_set_output(tail_h);
+            ggml_set_output(tail_ph);
+        }
+        else if (use_selector)
         {
             // Only the gamma PROPOSAL rows reach the head; row 0 is the anchor's
             // own prediction, which the selector never consumes.
@@ -1278,7 +1335,12 @@ static int df_draft_block(
         }
 
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, static_cast<std::size_t>(num_layers) * 256 + 1024, false);
-        if (use_selector)
+        if (use_tail)
+        {
+            ggml_build_forward_expand(graph, tail_h);
+            ggml_build_forward_expand(graph, tail_ph);
+        }
+        else if (use_selector)
         {
             ggml_build_forward_expand(graph, sel_cand);
             ggml_build_forward_expand(graph, sel_s0);
@@ -1389,29 +1451,40 @@ static int df_draft_block(
             if (can_persist) { ggml_gallocr_free(persist_galloc); ggml_free(ctx); }
             return 0;
         }
-        // See the replay path above: Metal must drain before reading the ids.
-        if (g_backend_type == BACKEND_TYPE_METAL)
-            tsg::sync_backend(g_backend);
-        if (use_selector)
+        if (use_tail)
         {
-            ggml_backend_tensor_get(sel_cand, sel_cand_out, 0,
-                static_cast<std::size_t>(sel_top_k) * gamma * sizeof(std::int32_t));
-            ggml_backend_tensor_get(sel_s0, sel_scores_out, 0,
-                static_cast<std::size_t>(sel_top_k) * sizeof(float));
-            if (sel_scores != nullptr)
+            if (!run_tail(tail_h, tail_ph, lm_head_t, sel_pred_t, sel_succ_t))
             {
-                finalize_compute_with_download(sel_scores, sel_scores_out + sel_top_k,
-                    (sel_scores_floats - sel_top_k) * sizeof(float));
+                if (can_persist) { ggml_gallocr_free(persist_galloc); ggml_free(ctx); }
+                return 0;
             }
         }
         else
         {
-            ggml_backend_tensor_get(out, ids_out, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
-            finalize_compute_with_download(out_conf, conf_out, static_cast<std::size_t>(b) * sizeof(float));
+            // See the replay path above: Metal must drain before reading the ids.
+            if (g_backend_type == BACKEND_TYPE_METAL)
+                tsg::sync_backend(g_backend);
+            if (use_selector)
+            {
+                ggml_backend_tensor_get(sel_cand, sel_cand_out, 0,
+                    static_cast<std::size_t>(sel_top_k) * gamma * sizeof(std::int32_t));
+                ggml_backend_tensor_get(sel_s0, sel_scores_out, 0,
+                    static_cast<std::size_t>(sel_top_k) * sizeof(float));
+                if (sel_scores != nullptr)
+                {
+                    finalize_compute_with_download(sel_scores, sel_scores_out + sel_top_k,
+                        (sel_scores_floats - sel_top_k) * sizeof(float));
+                }
+            }
+            else
+            {
+                ggml_backend_tensor_get(out, ids_out, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
+                finalize_compute_with_download(out_conf, conf_out, static_cast<std::size_t>(b) * sizeof(float));
+            }
+            // Unconditional: the outputs above land in caller host arrays and on Metal
+            // async mode the download is only QUEUED.
+            host_read_barrier();
         }
-        // Unconditional: the outputs above land in caller host arrays and on Metal
-        // async mode the download is only QUEUED.
-        host_read_barrier();
 
         if (can_persist && slot != nullptr)
         {
@@ -1419,6 +1492,8 @@ static int df_draft_block(
             slot->in_main = ids_t; slot->pos = pos_t; slot->mask = mask_t; slot->kv_index = block_slot_t;
             slot->out = out; slot->out_conf = out_conf;
             slot->out_s0 = sel_s0; slot->out_scores = sel_scores; slot->out_cand = sel_cand;
+            slot->tail_h = tail_h; slot->tail_ph = tail_ph;
+            if (use_tail) { slot->tail_head = lm_head_t; slot->tail_pred = sel_pred_t; slot->tail_succ = sel_succ_t; }
             slot->sig = sig; slot->sig_ring = sig_ring; slot->n_rows = b; slot->out_count = out_count;
             slot->valid = true;
             slot->scale_signature = scale_sig;

@@ -3497,6 +3497,29 @@ namespace TensorSharp.GGML
                     (IntPtr)u, (IntPtr)g, rows, (IntPtr)r, eps, (IntPtr)m, (IntPtr)j) != 0;
         }
 
+        /// <summary>Test probe of a DFlash2 draft's tail on TensorSharp's Metal kernels (tsm::df_tail_run): the q5_K head
+        /// <paramref name="head"/> [vocab rows of hidden] over rows 1..gamma of <paramref name="h"/> [(gamma + 1) * hidden],
+        /// the top-16 of each row, and the selector lattice over the q4_K codebooks [vocab rows of rank] with
+        /// <paramref name="ph"/> [gamma * rank]. Writes <paramref name="cand"/> [gamma * 16], <paramref name="scores"/>
+        /// [16 + 256 * (gamma - 1)] and <paramref name="logits"/> [gamma * vocab]. False where the kernels do not run.</summary>
+        public static unsafe bool TsmDfTailProbe(int hidden, int vocab, int rank, int gamma, byte[] head, byte[] pred, byte[] succ,
+            float[] h, float[] ph, int anchor, float headScale, float predScale, float succScale, float logitScale, float softcap,
+            int[] cand, float[] scores, float[] logits)
+        {
+            fixed (byte* hd = head) fixed (byte* p = pred) fixed (byte* s = succ) fixed (float* x = h) fixed (float* q = ph)
+            fixed (int* c = cand) fixed (float* o = scores) fixed (float* l = logits)
+                return GgmlNative.TSGgml_TsmDfTailProbe(hidden, vocab, rank, gamma, (IntPtr)hd, (IntPtr)p, (IntPtr)s, (IntPtr)x,
+                    (IntPtr)q, anchor, headScale, predScale, succScale, logitScale, softcap, (IntPtr)c, (IntPtr)o, (IntPtr)l, 1) != 0;
+        }
+
+        /// <summary>Test hook: the DFlash2 draft tails that ran on TensorSharp's kernels (tsm::df_tail_run) in this process.
+        /// 0 off Apple's Metal builds.</summary>
+        public static long TsmDfTailCount()
+        {
+            try { return GgmlNative.TSGgml_TsmDfTailCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         /// <summary>Test hook: the prompt hyper-connection reads that ran fused (tsm::hc_read_encode) in this process. 0 off
         /// Apple's Metal builds.</summary>
         public static long TsmHcReadCount()

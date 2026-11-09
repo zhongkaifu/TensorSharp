@@ -18,6 +18,10 @@ kernel bodies are unchanged and its header lists what was left out.
 `gr_epi_down` and `gemm_hc_up` (`metal/kernels/prompt.metal`) and `gemm_f16` (`metal/kernels/dense_mm.metal`), same
 commit and terms: the two GEMM bodies follow Strata's, the norm, the epilogue and the dequantization kernels are
 TensorSharp's, and its header lists the changes.
+`kernels/tsm_df_tail.metal` (the end of a DFlash2 draft) is TensorSharp's: the two top-k passes and the selector
+kernel's structure follow Strata's `df2_topk_part`, `df2_topk_merge` and `df2_select`
+(`metal/src/engine/msl/dflash2.metal`, same commit and terms), and the q5_K head uses the fragment mapping of Strata's
+`df2_mma8` on ggml's own blocks; its header lists the changes.
 `kernels/tsm_qsa_prompt.metal` (the QSA cell selection and attention) is TensorSharp's own; `kernels/tsm_qsa_attn_mm.metal`
 (the attention on the Metal 4 tensor API) is TensorSharp's, structured after ggml's `kernels/fa_tensor.metal` (MIT) with
 the query heads as rows as in Strata's `qsa_attn_mm`.

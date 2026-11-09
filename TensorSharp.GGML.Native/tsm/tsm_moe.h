@@ -189,4 +189,30 @@ namespace tsm
     bool hc_read_supported(ggml_backend* backend, int down_type, int inject_type, int up_type, int n_embd, int hc, int lr);
     bool hc_read_encode(ggml_backend* backend, const HcReadIO& io);
     long long hc_read_count();
+
+    // ---- The end of a DFlash2 draft (tsm/kernels/tsm_df_tail.metal): the target's q5_K output head over the block's
+    // proposal rows on the matrix units, the top-16 of each row, and the candidate selector's transition lattice over
+    // q4_K codebooks of rank 256, in one command buffer behind the draft graph on ggml-metal's queue, in place of
+    // ggml's per-row head, a vocabulary-wide top-k and the selector's small ops. The outputs are the ggml path's: the
+    // candidates [gamma][16] and the lattice (16 anchor scores, then a [16 predecessor][16 candidate] matrix per later
+    // position). TS_METAL_DF_TAIL=0 keeps the ggml path.
+    struct DfTailIO
+    {
+        const ggml_tensor* h = nullptr;      // F32 [hidden, rows], the final normed rows; the proposals are rows 1..gamma
+        const ggml_tensor* ph = nullptr;     // F32 [rank, gamma], the selector's hidden projection (scaled)
+        const ggml_tensor* head = nullptr;   // q5_K [hidden, vocab]
+        const ggml_tensor* pred = nullptr;   // q4_K [rank, vocab], the predecessor codebook
+        const ggml_tensor* succ = nullptr;   // q4_K [rank, vocab], the successor codebook
+        int gamma = 0, anchor = 0;
+        float head_scale = 1.0f, pred_scale = 1.0f, succ_scale = 1.0f, logit_scale = 1.0f, softcap = 0.0f;
+        int* cand_out = nullptr;             // host [gamma * 16]
+        float* scores_out = nullptr;         // host [16 + 16 * 16 * (gamma - 1)]
+        float* logits_out = nullptr;         // optional host [gamma * vocab] (the probe)
+    };
+    bool df_tail_enabled();
+    bool df_tail_supported(ggml_backend* backend, int head_type, int hidden, int vocab, int rank, int top_k,
+                           int pred_type, int succ_type, int gamma);
+    // Encodes and commits the tail, waits for it, and copies the outputs to the host arrays.
+    bool df_tail_run(ggml_backend* backend, const DfTailIO& io);
+    long long df_tail_count();
 }

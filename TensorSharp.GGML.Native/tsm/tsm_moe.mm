@@ -84,6 +84,11 @@ namespace
         // hc_read_encode's scratch: xn in fp16, the down GEMM's output, silu(down) in fp16, the fp16 weights
         id<MTLBuffer> hr_xnh = nil, hr_v = nil, hr_lo = nil, hr_wd = nil, hr_wu = nil;
         std::size_t hr_xnh_bytes = 0, hr_v_bytes = 0, hr_lo_bytes = 0, hr_wd_bytes = 0, hr_wu_bytes = 0;
+        // df_tail_run's scratch: the head's operand in fp16 and its sub-block sums, the logits, the top-k partials, the
+        // candidates and the lattice
+        id<MTLBuffer> df_xh = nil, df_xs = nil, df_logits = nil, df_cval = nil, df_cidx = nil, df_tok = nil, df_out = nil;
+        std::size_t df_xh_bytes = 0, df_xs_bytes = 0, df_logits_bytes = 0, df_cval_bytes = 0, df_cidx_bytes = 0,
+            df_tok_bytes = 0, df_out_bytes = 0;
         id<MTLBuffer> mm_bcnt = nil, mm_boff = nil, mm_eoff = nil, mm_tiles = nil, mm_meta = nil, mm_stok = nil,
             mm_sw = nil, mm_pos = nil, mm_xs = nil, mm_hs = nil, mm_ye = nil;
         std::size_t mm_bcnt_bytes = 0, mm_boff_bytes = 0, mm_eoff_bytes = 0, mm_tiles_bytes = 0, mm_meta_bytes = 0,
@@ -1723,6 +1728,197 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
         s.mm_bcnt_bytes = s.mm_boff_bytes = s.mm_eoff_bytes = s.mm_tiles_bytes = 0;
         s.mm_stok_bytes = s.mm_sw_bytes = s.mm_pos_bytes = s.mm_xs_bytes = s.mm_hs_bytes = s.mm_ye_bytes = 0;
     }
+
+    // ---- the end of a DFlash2 draft (tsm_df_tail.metal)
+    namespace
+    {
+        std::atomic<long long> g_df_tail_count{0};
+        constexpr int kDfTopK = 16;          // TSM_DF_TOPK
+        constexpr int kDfTopBlocksMax = 128; // TSM_DF_TOPB_MAX
+        struct TsmDfHeadArgs { std::uint32_t K, rows, row_bytes, ncol, x_row0; float scale; std::uint32_t pad0, pad1; };
+        struct TsmDfTopkArgs { std::int32_t n, blocks; };
+        struct TsmDfSelArgs { std::uint32_t rank, k, gamma, vocab; std::int32_t anchor;
+                              float pred_scale, succ_scale, logit_scale, softcap; std::uint32_t pad0, pad1, pad2; };
+
+        constexpr int kDfHeadSimdgroups = 4;   // tsm_df_head_q5k: one 8-row tile per simdgroup, 4 simdgroups a threadgroup
+    }
+
+    bool df_tail_enabled()
+    {
+        const char* e = std::getenv("TS_METAL_DF_TAIL");   // read per call (tests switch it)
+        return !(e && e[0] == '0');
+    }
+
+    bool df_tail_supported(ggml_backend* backend, int head_type, int hidden, int vocab, int rank, int top_k,
+                           int pred_type, int succ_type, int gamma)
+    {
+        if (!df_tail_enabled()) return false;
+        if (metal_device(backend) == nullptr) return false;
+        // q5_K head rows of whole 256-blocks; one 4096-column top-k block per threadgroup, at most kDfTopBlocksMax of them;
+        // q4_K codebook rows of one block (rank 256, a thread per element); at most 8 proposal rows (one fragment).
+        return head_type == GGML_TYPE_Q5_K && hidden > 0 && hidden % 256 == 0
+            && vocab >= kDfTopK && (static_cast<std::int64_t>(vocab) + 4095) / 4096 <= kDfTopBlocksMax
+            && rank == 256 && top_k == kDfTopK && pred_type == GGML_TYPE_Q4_K && succ_type == GGML_TYPE_Q4_K
+            && gamma >= 1 && gamma <= 8;
+    }
+
+    bool df_tail_run(ggml_backend* backend, const DfTailIO& io)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm df tail: not a Metal backend");
+            if (io.h == nullptr || io.ph == nullptr || io.head == nullptr || io.pred == nullptr || io.succ == nullptr
+                || io.cand_out == nullptr || io.scores_out == nullptr)
+                throw std::runtime_error("tsm df tail: missing a tensor or an output");
+            const std::int64_t K = io.head->ne[0], vocab = io.head->ne[1], rank = io.pred->ne[0];
+            const int gamma = io.gamma, k = kDfTopK;
+            if (!df_tail_supported(backend, io.head->type, static_cast<int>(K), static_cast<int>(vocab), static_cast<int>(rank),
+                                   k, io.pred->type, io.succ->type, gamma))
+                throw std::runtime_error("tsm df tail: these types or shapes are not the kernels'");
+            if (io.h->type != GGML_TYPE_F32 || io.h->ne[0] != K || io.h->ne[1] < gamma + 1 || !ggml_is_contiguous(io.h)
+                || io.ph->type != GGML_TYPE_F32 || io.ph->ne[0] != rank || io.ph->ne[1] < gamma || !ggml_is_contiguous(io.ph)
+                || io.succ->ne[0] != rank || io.pred->ne[1] != vocab || io.succ->ne[1] != vocab
+                || io.anchor < 0 || io.anchor >= vocab)
+                throw std::runtime_error("tsm df tail: the rows do not match the weights");
+            const ggml_metal_buffer_id h = tensor_id(io.h), ph = tensor_id(io.ph), head = tensor_id(io.head),
+                pred = tensor_id(io.pred), succ = tensor_id(io.succ);
+            const int blocks = static_cast<int>((vocab + 4095) / 4096);
+            const std::size_t g = static_cast<std::size_t>(gamma), V = static_cast<std::size_t>(vocab);
+            const std::size_t out_floats = static_cast<std::size_t>(k) + static_cast<std::size_t>(k) * k * (g - 1);
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                ensure_library(s, device);
+                s.df_xh = grow(s, s.df_xh, s.df_xh_bytes, 8 * static_cast<std::size_t>(K) * 2);
+                s.df_xs = grow(s, s.df_xs, s.df_xs_bytes, 8 * static_cast<std::size_t>(K / 32) * 4);
+                s.df_logits = grow(s, s.df_logits, s.df_logits_bytes, g * V * 4);
+                s.df_cval = grow(s, s.df_cval, s.df_cval_bytes, g * blocks * k * 4);
+                s.df_cidx = grow(s, s.df_cidx, s.df_cidx_bytes, g * blocks * k * 4);
+                s.df_tok = grow(s, s.df_tok, s.df_tok_bytes, g * k * 4);
+                s.df_out = grow(s, s.df_out, s.df_out_bytes, out_floats * 4);
+                const TsmDfHeadArgs ha{static_cast<std::uint32_t>(K), static_cast<std::uint32_t>(vocab),
+                    static_cast<std::uint32_t>(io.head->nb[1]), static_cast<std::uint32_t>(gamma), 1u, io.head_scale, 0, 0};
+                const TsmDfTopkArgs ta{static_cast<std::int32_t>(vocab), blocks};
+                const TsmDfSelArgs sa{static_cast<std::uint32_t>(rank), static_cast<std::uint32_t>(k),
+                    static_cast<std::uint32_t>(gamma), static_cast<std::uint32_t>(vocab), io.anchor,
+                    io.pred_scale, io.succ_scale, io.logit_scale, io.softcap, 0, 0, 0};
+
+                const std::string hk = "tsm_df_head_q5k";
+                const std::size_t nrt = (V + 7) / 8, per_tg = kDfHeadSimdgroups;
+                // The five passes, in order; serial in one encoder, so each sees the last.
+                auto encode_stage = [&](id<MTLComputeCommandEncoder> enc, int stage) {
+                    switch (stage)
+                    {
+                    case 0:
+                        [enc setComputePipelineState:pipeline(s, "tsm_df_xprep")];
+                        bind(enc, h, 0, 0);
+                        [enc setBuffer:s.df_xh offset:0 atIndex:1]; [enc setBuffer:s.df_xs offset:0 atIndex:2];
+                        [enc setBytes:&ha length:sizeof(ha) atIndex:3];
+                        [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(K / 32), 8, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+                        break;
+                    case 1:
+                        [enc setComputePipelineState:pipeline(s, hk)];
+                        bind(enc, head, 0, 0);
+                        [enc setBuffer:s.df_xh offset:0 atIndex:1]; [enc setBuffer:s.df_xs offset:0 atIndex:2];
+                        [enc setBuffer:s.df_logits offset:0 atIndex:3];
+                        [enc setBytes:&ha length:sizeof(ha) atIndex:4];
+                        [enc dispatchThreadgroups:MTLSizeMake((nrt + per_tg - 1) / per_tg, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(kDfHeadSimdgroups * 32, 1, 1)];
+                        break;
+                    case 2:
+                        [enc setComputePipelineState:pipeline(s, "tsm_df_topk_part")];
+                        [enc setBuffer:s.df_logits offset:0 atIndex:0]; [enc setBuffer:s.df_cval offset:0 atIndex:1];
+                        [enc setBuffer:s.df_cidx offset:0 atIndex:2];
+                        [enc setBytes:&ta length:sizeof(ta) atIndex:3];
+                        [enc dispatchThreadgroups:MTLSizeMake(g, static_cast<NSUInteger>(blocks), 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        break;
+                    case 3:
+                        [enc setComputePipelineState:pipeline(s, "tsm_df_topk_merge")];
+                        [enc setBuffer:s.df_cval offset:0 atIndex:0]; [enc setBuffer:s.df_cidx offset:0 atIndex:1];
+                        [enc setBuffer:s.df_tok offset:0 atIndex:2];
+                        [enc setBytes:&ta length:sizeof(ta) atIndex:3];
+                        [enc dispatchThreadgroups:MTLSizeMake(g, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        break;
+                    default:
+                        [enc setComputePipelineState:pipeline(s, "tsm_df_select_q4k")];
+                        bind(enc, ph, 0, 0);
+                        [enc setBuffer:s.df_logits offset:0 atIndex:1]; [enc setBuffer:s.df_tok offset:0 atIndex:2];
+                        bind(enc, pred, 0, 3); bind(enc, succ, 0, 4);
+                        [enc setBuffer:s.df_out offset:0 atIndex:5];
+                        [enc setBytes:&sa length:sizeof(sa) atIndex:6];
+                        [enc dispatchThreadgroups:MTLSizeMake(1 + static_cast<std::size_t>(k) * (g - 1), 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        break;
+                    }
+                };
+                auto finish = [](id<MTLCommandBuffer> cb) {
+                    [cb waitUntilCompleted];
+                    if (cb.status != MTLCommandBufferStatusCompleted)
+                        throw std::runtime_error(std::string("tsm df tail: the command buffer failed: ")
+                            + (cb.error ? cb.error.localizedDescription.UTF8String : "?"));
+                    return 1000.0 * (cb.GPUEndTime - cb.GPUStartTime);
+                };
+                // TS_METAL_DF_TAIL_PROF=1 reports the tail's accelerator time every 64 drafts; =2 runs each pass in its own
+                // command buffer and reports them apart (measurement only: the passes no longer overlap).
+                static const int prof = [] { const char* e = std::getenv("TS_METAL_DF_TAIL_PROF"); return e ? std::atoi(e) : 0; }();
+                static double prof_ms[6] = {};
+                static long long prof_n = 0;
+                if (prof == 2)
+                {
+                    for (int stage = 0; stage < 5; ++stage)
+                    {
+                        id<MTLCommandBuffer> cb = [queue commandBuffer];
+                        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                        encode_stage(enc, stage);
+                        [enc endEncoding];
+                        [cb commit];
+                        s.last = cb;
+                        prof_ms[stage] += finish(cb);
+                    }
+                }
+                else
+                {
+                    id<MTLCommandBuffer> cb = [queue commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    for (int stage = 0; stage < 5; ++stage) encode_stage(enc, stage);
+                    [enc endEncoding];
+                    [cb commit];
+                    s.last = cb;
+                    prof_ms[5] += finish(cb);
+                }
+                if (prof > 0 && ++prof_n % 64 == 0)
+                {
+                    if (prof == 2)
+                        std::fprintf(stderr, "[tsm] df tail over 64 drafts (passes apart): xprep %.3f, head %.3f, top-k %.3f + %.3f, "
+                            "lattice %.3f ms\n", prof_ms[0] / 64, prof_ms[1] / 64, prof_ms[2] / 64, prof_ms[3] / 64, prof_ms[4] / 64);
+                    else
+                        std::fprintf(stderr, "[tsm] df tail over 64 drafts: %.3f ms of accelerator time\n", prof_ms[5] / 64);
+                    for (double& v : prof_ms) v = 0;
+                }
+                std::memcpy(io.cand_out, s.df_tok.contents, g * k * sizeof(std::int32_t));
+                std::memcpy(io.scores_out, s.df_out.contents, out_floats * sizeof(float));
+                if (io.logits_out != nullptr)
+                    std::memcpy(io.logits_out, s.df_logits.contents, g * V * sizeof(float));
+            }
+            g_df_tail_count.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true))
+                std::fprintf(stderr, "[tsm] DFlash2 drafts end on TensorSharp kernels (q5_K head on the matrix units, top-16, "
+                    "selector lattice; TS_METAL_DF_TAIL=0 keeps ggml's ops)\n");
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
+
+    long long df_tail_count() { return g_df_tail_count.load(std::memory_order_relaxed); }
 }
 
 // ---- test probe: one layer's held routes through moe_encode, on expert bytes the caller gives (stacked [expert]
@@ -1852,6 +2048,64 @@ TSG_EXPORT int TSGgml_TsmHcReadProbe(int n_embd, int hc, int lr, int down_type, 
 
 // Test hook: the hyper-connection reads that ran on hc_read_encode in this process.
 TSG_EXPORT long long TSGgml_TsmHcReadCount() { return tsm::hc_read_count(); }
+
+// ---- test probe: a DFlash2 draft's tail (tsm::df_tail_run) on bytes the caller gives: the q5_K head [vocab][hidden],
+// the q4_K predecessor and successor codebooks [vocab][rank], gamma + 1 final rows h (row 0 the anchor's, unused), the
+// selector's hidden projection ph [gamma][rank]; out: the candidates [gamma][16], the lattice (16 + 16 * 16 * (gamma - 1)
+// floats) and the head's logits [gamma][vocab]. `repeat` runs the tail that many times on the same upload (timing with
+// TS_METAL_DF_TAIL_PROF). Returns 1, or 0 with the last error set.
+TSG_EXPORT int TSGgml_TsmDfTailProbe(int hidden, int vocab, int rank, int gamma, const void* head, const void* pred,
+    const void* succ, const float* h, const float* ph, int anchor, float head_scale, float pred_scale, float succ_scale,
+    float logit_scale, float softcap, int* cand, float* scores, float* logits, int repeat)
+{
+    using namespace tsg;
+    if (!ensure_backend()) return 0;
+    ggml_backend_t backend = g_backend;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_context* ctx = nullptr;
+    try
+    {
+        if (!tsm::df_tail_supported(backend, GGML_TYPE_Q5_K, hidden, vocab, rank, 16, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, gamma))
+            throw std::runtime_error("tsm df tail probe: the kernels do not run here or take these shapes");
+        ggml_init_params ip{};
+        ip.mem_size = 16 * ggml_tensor_overhead();
+        ip.no_alloc = true;
+        ctx = ggml_init(ip);
+        ggml_tensor* wh = ggml_new_tensor_2d(ctx, GGML_TYPE_Q5_K, hidden, vocab);
+        ggml_tensor* wp = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, rank, vocab);
+        ggml_tensor* ws = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, rank, vocab);
+        ggml_tensor* th = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, gamma + 1);
+        ggml_tensor* tp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, gamma);
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (buf == nullptr) throw std::runtime_error("tsm df tail probe: buffer");
+        ggml_backend_tensor_set(wh, head, 0, ggml_nbytes(wh));
+        ggml_backend_tensor_set(wp, pred, 0, ggml_nbytes(wp));
+        ggml_backend_tensor_set(ws, succ, 0, ggml_nbytes(ws));
+        ggml_backend_tensor_set(th, h, 0, ggml_nbytes(th));
+        ggml_backend_tensor_set(tp, ph, 0, ggml_nbytes(tp));
+        tsm::DfTailIO io;
+        io.h = th; io.ph = tp; io.head = wh; io.pred = wp; io.succ = ws;
+        io.gamma = gamma; io.anchor = anchor;
+        io.head_scale = head_scale; io.pred_scale = pred_scale; io.succ_scale = succ_scale;
+        io.logit_scale = logit_scale; io.softcap = softcap;
+        io.cand_out = cand; io.scores_out = scores; io.logits_out = logits;
+        bool ok = true;
+        for (int i = 0; ok && i < (repeat > 1 ? repeat : 1); ++i) ok = tsm::df_tail_run(backend, io);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return ok ? 1 : 0;
+    }
+    catch (const std::exception& e)
+    {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        tsg::set_last_error(e.what());
+        return 0;
+    }
+}
+
+// Test hook: the DFlash2 draft tails that ran on tsm::df_tail_run in this process.
+TSG_EXPORT long long TSGgml_TsmDfTailCount() { return tsm::df_tail_count(); }
 
 TSG_EXPORT int TSGgml_TsmMoeProbe(int gate_type, int down_type, int hidden, int n_ff, int n_expert,
     const void* gate, const void* up, const void* down, int T, int n_used, const std::int32_t* slots,

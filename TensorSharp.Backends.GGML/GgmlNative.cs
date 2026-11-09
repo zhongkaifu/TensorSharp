@@ -4633,6 +4633,12 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static partial long TSGgml_TsmHcReadCount();
         [LibraryImport(DllName)]
+        internal static partial int TSGgml_TsmDfTailProbe(int hidden, int vocab, int rank, int gamma, IntPtr head, IntPtr pred,
+            IntPtr succ, IntPtr h, IntPtr ph, int anchor, float headScale, float predScale, float succScale, float logitScale,
+            float softcap, IntPtr cand, IntPtr scores, IntPtr logits, int repeat);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_TsmDfTailCount();
+        [LibraryImport(DllName)]
         internal static partial long TSGgml_TsmGdnPromptCount();
         [LibraryImport(DllName)]
         internal static partial long TSGgml_TsmHcPromptCount();
