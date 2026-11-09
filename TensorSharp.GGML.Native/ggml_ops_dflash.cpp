@@ -174,9 +174,11 @@ namespace
         int out_count = 0;
         std::uint64_t scale_signature = 0;
         ggml_gallocr_t galloc = nullptr;     // draft graphs: storage planned by a private gallocr
+        tsg::PersistedBindings bindings;     // replayed only while every cached buffer it was bound to lives
 
         void reset()
         {
+            bindings.release();
             if (galloc != nullptr) { ggml_gallocr_free(galloc); galloc = nullptr; }
             if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
@@ -205,7 +207,11 @@ namespace
             for (int i = 0; i < kDfMaxCaches; i++)
                 if (entries[i].valid && entries[i].sig == sig && entries[i].sig_ring == ring
                     && entries[i].n_rows == n_rows && entries[i].scale_signature == scale_sig)
-                { used[i] = ++clock; return &entries[i]; }
+                {
+                    // A cached buffer it was bound to has been freed or replaced: rebuild (claim resets it).
+                    if (!entries[i].bindings.still_bound()) return nullptr;
+                    used[i] = ++clock; return &entries[i];
+                }
             return nullptr;
         }
 
@@ -235,6 +241,7 @@ namespace
         struct Upload { ggml_tensor* t; void* data; std::size_t bytes; };
         std::vector<Upload> uploads;
         std::vector<BufferHandle> ephemeral;
+        std::vector<const void*> cached_keys;   // the cache keys a persisted graph must hold (PersistedBindings)
         ggml_backend_dev_t dev = nullptr;
 
         void bind(ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
@@ -246,7 +253,8 @@ namespace
                 bool needs_upload = false;
                 if (try_bind_cached_tensor(g_backend, dev, t, data, bytes, needs_upload, usage))
                 {
-                    if (needs_upload) uploads.push_back({ t, data, bytes });
+                    if (needs_upload) { uploads.push_back({ t, data, bytes }); fresh.push_back(data); }
+                    cached_keys.push_back(data);
                     return;
                 }
             }
@@ -257,7 +265,10 @@ namespace
                 {
                     if (!cacheable) ephemeral.emplace_back(buf);
                     if (ggml_backend_tensor_alloc(buf, t, data) == GGML_STATUS_SUCCESS)
+                    {
+                        if (cacheable) cached_keys.push_back(data);
                         return;
+                    }
                 }
             }
             uploads.push_back({ t, data, bytes });
@@ -267,8 +278,34 @@ namespace
         {
             for (auto& u : uploads)
                 ggml_backend_tensor_set(u.t, resolve_upload_source(u.data), 0, u.bytes);
+            fresh.clear();
         }
+
+        // A graph abandoned before flush(): the cache entries its binds created were published but never written
+        // (try_get_cacheable_tensor_buffer's contract), so drop them rather than leave later graphs reading them.
+        void abandon()
+        {
+            for (void* d : fresh) invalidate_cached_buffer(d);
+            fresh.clear();
+        }
+
+        std::vector<void*> fresh;   // cache entries created by bind(), not yet written
     };
+
+    // Test hook (TSGgml_DFlashTestFailAllocs, native test builds only): the next N graph-storage allocations of the
+    // injects fail as an out-of-memory would, so a test can drive the decline path without exhausting a device.
+#if defined(TSG_GGML_TEST_HOOKS)
+    std::atomic<int> g_df_test_fail_allocs{0};
+    bool df_test_fail_alloc()
+    {
+        int n = g_df_test_fail_allocs.load(std::memory_order_acquire);
+        while (n > 0)
+            if (g_df_test_fail_allocs.compare_exchange_weak(n, n - 1, std::memory_order_acq_rel)) return true;
+        return false;
+    }
+#else
+    constexpr bool df_test_fail_alloc() { return false; }
+#endif
 
     // DFlash2 grouped dynamic depthwise convolution over one block.
     //
@@ -419,7 +456,7 @@ namespace
 // PASS A + B: encode the target's per-layer residual features and inject the
 // resulting K/V into the drafter's ring.
 // ---------------------------------------------------------------------------
-static int df_inject(
+static int df_inject_one(
     const float* feat_rows, int feature_size, int n_rows,
     const std::int64_t* ring_rows_idx,          // ring slot per row (position % ring_rows)
     const int* positions,                        // absolute position per row (for RoPE)
@@ -556,10 +593,11 @@ static int df_inject(
         ggml_backend_buffer_t persist_buf = nullptr;
         if (can_persist)
         {
-            persist_buf = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            persist_buf = df_test_fail_alloc() ? nullptr : ggml_backend_alloc_ctx_tensors(ctx, g_backend);
             if (persist_buf == nullptr)
             {
                 set_last_error("DFlash inject: failed to allocate persist buffer.");
+                binder.abandon();
                 ggml_free(ctx);
                 return 0;
             }
@@ -567,9 +605,10 @@ static int df_inject(
         else
         {
             for (auto& u : binder.uploads) ggml_set_input(u.t);
-            if (!alloc_graph_reuse_gallocr(graph))
+            if (df_test_fail_alloc() || !alloc_graph_reuse_gallocr(graph))
             {
                 set_last_error("DFlash inject: failed to allocate graph.");
+                binder.abandon();
                 return 0;
             }
         }
@@ -594,6 +633,7 @@ static int df_inject(
             slot->in_main = feat; slot->pos = pos_t; slot->kv_index = idx_t;
             slot->sig = sig; slot->sig_ring = sig_ring; slot->n_rows = n_rows;
             slot->valid = true;
+            slot->bindings.keep(binder.cached_keys);
             slot->scale_signature = scale_sig;
         }
         clear_last_error();
@@ -601,6 +641,78 @@ static int df_inject(
     }
     catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
     catch (...) { set_last_error("Unknown error in DFlash inject."); return 0; }
+}
+
+// A prompt's inject in chunks. One graph over all of a 4K-row prompt held 1.17 GB of encode activations, and its
+// persisted graph kept them (every distinct prompt length cached one). Rows above kDfInjectChunkRows run as graphs of
+// exactly that many rows: the last chunk repeats its last row (feature, position and ring slot alike), so the extra
+// set_rows writes store the bytes that slot receives anyway, and every long prompt replays the same cached graph.
+// Rows are independent through the encode (per-column matmuls, per-row norms and RoPE); a chunk's rows match a
+// single-shot inject up to the GEMM kernel the row count selects (GgmlOpsDFlashInjectTest measures it).
+namespace
+{
+    constexpr int kDfInjectChunkRows = 512;
+#if defined(TSG_GGML_TEST_HOOKS)
+    std::atomic<int> g_df_test_inject_chunk{0};   // test hook: another chunk size (TSGgml_DFlashTestInjectChunk)
+    int df_inject_chunk_rows()
+    {
+        const int test_chunk = g_df_test_inject_chunk.load(std::memory_order_acquire);
+        return test_chunk > 0 ? test_chunk : kDfInjectChunkRows;
+    }
+#else
+    constexpr int df_inject_chunk_rows() { return kDfInjectChunkRows; }
+#endif
+}
+
+static int df_inject(
+    const float* feat_rows, int feature_size, int n_rows,
+    const std::int64_t* ring_rows_idx, const int* positions,
+    int num_layers, int hidden_size, int head_dim, int num_kv_heads, int ring_rows,
+    float eps, float rope_base, float rope_freq_scale,
+    const void* fc_data, int fc_type, std::int64_t fc_ne0, std::int64_t fc_ne1, std::int64_t fc_bytes,
+    const void* enc_norm_data,
+    void** k_arr, int* k_type_arr, std::int64_t* k_ne0_arr, std::int64_t* k_ne1_arr, std::int64_t* k_bytes_arr,
+    void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr,
+    void** k_norm_arr,
+    void** ring_k_arr, void** ring_v_arr,
+    int ring_dtype,
+    const float* scales, int scale_count)
+{
+    const int C = df_inject_chunk_rows();
+    auto one = [&](const float* f, int n, const std::int64_t* idx, const int* pos) {
+        return df_inject_one(f, feature_size, n, idx, pos, num_layers, hidden_size, head_dim, num_kv_heads, ring_rows,
+            eps, rope_base, rope_freq_scale, fc_data, fc_type, fc_ne0, fc_ne1, fc_bytes, enc_norm_data,
+            k_arr, k_type_arr, k_ne0_arr, k_ne1_arr, k_bytes_arr, v_arr, v_type_arr, v_ne0_arr, v_ne1_arr, v_bytes_arr,
+            k_norm_arr, ring_k_arr, ring_v_arr, ring_dtype, scales, scale_count);
+    };
+    if (n_rows <= C || feat_rows == nullptr || ring_rows_idx == nullptr || positions == nullptr)
+        return one(feat_rows, n_rows, ring_rows_idx, positions);
+    try
+    {
+        std::vector<float> f;
+        std::vector<std::int64_t> idx;
+        std::vector<int> pos;
+        for (int off = 0; off < n_rows; off += C)
+        {
+            const int rows = std::min(C, n_rows - off);
+            const float* fr = feat_rows + static_cast<std::size_t>(off) * feature_size;
+            const std::int64_t* ir = ring_rows_idx + off;
+            const int* pr = positions + off;
+            if (rows < C)
+            {
+                const std::size_t row_floats = static_cast<std::size_t>(feature_size);
+                f.assign(fr, fr + static_cast<std::size_t>(rows) * row_floats);
+                for (int r = rows; r < C; r++)
+                    f.insert(f.end(), fr + static_cast<std::size_t>(rows - 1) * row_floats, fr + static_cast<std::size_t>(rows) * row_floats);
+                idx.assign(ir, ir + rows); idx.resize(C, ir[rows - 1]);
+                pos.assign(pr, pr + rows); pos.resize(C, pr[rows - 1]);
+                fr = f.data(); ir = idx.data(); pr = pos.data();
+            }
+            if (!one(fr, C, ir, pr)) return 0;   // last error says why; the rows before stay written
+        }
+        return 1;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
 }
 
 // ---------------------------------------------------------------------------
@@ -635,9 +747,11 @@ namespace
         int max_rows = 0, lanes = 0;
         std::uint64_t scale_signature = 0;
         std::uint64_t lru = 0;
+        tsg::PersistedBindings bindings;
 
         void reset()
         {
+            bindings.release();
             if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; valid = false;
@@ -699,7 +813,10 @@ static int df_inject_batched(
         DfInjectBatchCache* dc = nullptr;
         for (auto& e : pool.entries)
             if (e.valid && e.sig == sig && e.max_rows == R && e.lanes == L && e.scale_signature == scale_sig && e.rings == rings)
-            { dc = &e; break; }
+            {
+                if (!e.bindings.still_bound()) { e.reset(); break; }   // bound to a buffer since freed: rebuild
+                dc = &e; break;
+            }
 
         auto run = [&](DfInjectBatchCache& c) {
             decode_input_set_async(c.feat, feat_rows, static_cast<std::size_t>(feature_size) * total_rows * sizeof(float));
@@ -812,10 +929,11 @@ static int df_inject_batched(
             }
         }
 
-        ggml_backend_buffer_t persist_buf = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+        ggml_backend_buffer_t persist_buf = df_test_fail_alloc() ? nullptr : ggml_backend_alloc_ctx_tensors(ctx, g_backend);
         if (persist_buf == nullptr)
         {
             set_last_error("DFlash batched inject: failed to allocate persist buffer.");
+            binder.abandon();
             ggml_free(ctx);
             return 0;
         }
@@ -828,6 +946,7 @@ static int df_inject_batched(
         slot->scale_signature = scale_sig;
         slot->lru = ++pool.clock;
         slot->valid = true;
+        slot->bindings.keep(binder.cached_keys);
         if (!run(*slot))
         {
             set_last_error("DFlash batched inject: graph execution failed.");
@@ -1440,6 +1559,7 @@ static int df_draft_block(
             if (!df_alloc_persistent(ctx, graph, persist_galloc))
             {
                 set_last_error("DFlash draft: failed to allocate persist buffer.");
+                binder.abandon();
                 ggml_free(ctx);
                 return 0;
             }
@@ -1450,6 +1570,7 @@ static int df_draft_block(
             if (!alloc_graph_reuse_gallocr(graph))
             {
                 set_last_error("DFlash draft: failed to allocate graph.");
+                binder.abandon();
                 return 0;
             }
         }
@@ -1520,6 +1641,7 @@ static int df_draft_block(
             if (use_tail) { slot->tail_head = lm_head_t; slot->tail_pred = sel_pred_t; slot->tail_succ = sel_succ_t; }
             slot->sig = sig; slot->sig_ring = sig_ring; slot->n_rows = b; slot->out_count = out_count;
             slot->valid = true;
+            slot->bindings.keep(binder.cached_keys);
             slot->scale_signature = scale_sig;
         }
         clear_last_error();
@@ -1568,9 +1690,11 @@ namespace
         std::uint64_t scale_signature = 0;
         std::uint64_t lru = 0;
         ggml_gallocr_t galloc = nullptr;
+        tsg::PersistedBindings bindings;
 
         void reset()
         {
+            bindings.release();
             if (galloc != nullptr) { ggml_gallocr_free(galloc); galloc = nullptr; }
             if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
@@ -1695,7 +1819,10 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
         for (auto& e : pool.entries)
             if (e.valid && e.sig == sig && e.b == b && e.lanes == L && e.scale_signature == scale_sig && e.rings == rings
                 && (e.block_slots != nullptr) == ring_block)
-            { dc = &e; break; }
+            {
+                if (!e.bindings.still_bound()) { e.reset(); break; }   // bound to a buffer since freed: rebuild
+                dc = &e; break;
+            }
 
         auto download = [&](DfBatchCache& c) {
             if (use_selector)
@@ -2112,7 +2239,10 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
 
         ggml_gallocr_t persist_galloc = nullptr;
         if (!df_alloc_persistent(ctx, graph, persist_galloc))
+        {
+            binder.abandon();
             return fail("DFlash batched draft: failed to allocate persist buffer.");
+        }
 
         host_read_barrier();
         binder.flush();
@@ -2135,6 +2265,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
         slot->scale_signature = scale_sig;
         slot->lru = ++pool.clock;
         slot->valid = true;
+        slot->bindings.keep(binder.cached_keys);
 
         ggml_backend_tensor_set(ids_t, block_ids, 0, static_cast<std::size_t>(nb) * sizeof(std::int32_t));
         ggml_backend_tensor_set(pos_t, positions, 0, static_cast<std::size_t>(nb) * sizeof(std::int32_t));
@@ -2156,6 +2287,20 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
     catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
     catch (...) { set_last_error("Unknown error in DFlash batched draft."); return 0; }
 }
+
+#if defined(TSG_GGML_TEST_HOOKS)
+// Test hook: make the next n inject graph-storage allocations fail (see df_test_fail_alloc). Not a user setting.
+TSG_EXPORT void TSGgml_DFlashTestFailAllocs(int n)
+{
+    g_df_test_fail_allocs.store(n > 0 ? n : 0, std::memory_order_release);
+}
+
+// Test hook: run injects longer than `rows` in chunks of `rows` (0 restores kDfInjectChunkRows). Not a user setting.
+TSG_EXPORT void TSGgml_DFlashTestInjectChunk(int rows)
+{
+    g_df_test_inject_chunk.store(rows > 0 ? rows : 0, std::memory_order_release);
+}
+#endif
 
 TSG_EXPORT void TSGgml_DFlashResetCaches()
 {

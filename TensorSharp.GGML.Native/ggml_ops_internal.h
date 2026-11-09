@@ -1844,6 +1844,39 @@ namespace tsg
     // must invalidate downstream state keyed on that buffer use the result to skip
     // the work when the pointer had no device copy to begin with.
     bool invalidate_cached_buffer(void* data);
+    // The cached-buffer epoch (ggml_ops_core.cpp): it moves when a path frees or replaces a cached device/host-pointer
+    // buffer that a persisted graph holds (key registered through PersistedBindings), or on a bulk clear (key null).
+    std::uint64_t cached_buffer_epoch();
+    void note_cached_buffer_released(const void* key);
+    void persisted_key_hold(const void* key);
+    void persisted_key_drop(const void* key);
+
+    // A persisted graph's cached bindings: keep() registers the cache keys the graph was bound to and records the
+    // epoch; still_bound() is false once any registered key's buffer was freed or replaced since, and the graph must be
+    // rebuilt instead of replayed (a replay would run over released device memory).
+    struct PersistedBindings
+    {
+        std::vector<const void*> keys;
+        std::uint64_t epoch = 0;
+        bool held = false;
+
+        void keep(const std::vector<const void*>& bound)
+        {
+            release();
+            keys = bound;
+            for (const void* k : keys) persisted_key_hold(k);
+            held = true;
+            epoch = cached_buffer_epoch();
+        }
+        void release()
+        {
+            if (held)
+                for (const void* k : keys) persisted_key_drop(k);
+            keys.clear();
+            held = false;
+        }
+        bool still_bound() const { return held && epoch == cached_buffer_epoch(); }
+    };
     // Retire Qwen-Image-2.1 graphs before an immutable weight is changed/freed.
     void qwen_image21_invalidate_weight(const void* data);
 

@@ -1208,6 +1208,47 @@ namespace tsg
 #endif
     }
 
+    // --- The cached-buffer epoch ---
+    //
+    // A persisted graph (a captured CUDA graph above all) holds the device addresses of the cached copies it was bound
+    // to. A graph cache that keeps graphs across calls registers those cache keys (PersistedBindings), and every path
+    // below that frees or replaces the buffer of a registered key, or clears the caches wholesale, moves this epoch; the
+    // cache then rebuilds instead of replaying over released memory. The DFlash inject did replay over released memory
+    // on CUDA, after its per-op fallback replaced a copy its cached graphs were bound to. Frees of keys no persisted
+    // graph holds (per-step activations, say) leave the epoch alone, so the caches do not rebuild every step.
+    static std::atomic<std::uint64_t> g_cached_buffer_epoch{0};
+    static std::mutex g_persisted_keys_mutex;
+    static std::unordered_map<const void*, int> g_persisted_keys;
+
+    std::uint64_t cached_buffer_epoch() { return g_cached_buffer_epoch.load(std::memory_order_acquire); }
+
+    void note_cached_buffer_released(const void* key)
+    {
+        if (key != nullptr)
+        {
+            std::lock_guard<std::mutex> lock(g_persisted_keys_mutex);
+            if (g_persisted_keys.find(key) == g_persisted_keys.end())
+                return;
+        }
+        g_cached_buffer_epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void persisted_key_hold(const void* key)
+    {
+        if (key == nullptr) return;
+        std::lock_guard<std::mutex> lock(g_persisted_keys_mutex);
+        ++g_persisted_keys[key];
+    }
+
+    void persisted_key_drop(const void* key)
+    {
+        if (key == nullptr) return;
+        std::lock_guard<std::mutex> lock(g_persisted_keys_mutex);
+        auto it = g_persisted_keys.find(key);
+        if (it != g_persisted_keys.end() && --it->second <= 0)
+            g_persisted_keys.erase(it);
+    }
+
     // --- Device-copy budget accounting (caller holds g_host_buffer_cache_mutex) ---
 
     static void device_copy_account_remove_locked(const CachedHostBuffer& entry)
@@ -1266,6 +1307,7 @@ namespace tsg
         device_copy_account_remove_locked(cit->second);
         ggml_backend_buffer_free(cit->second.buffer);
         g_host_buffer_cache.erase(cit);
+        note_cached_buffer_released(key);
         advise_pages_dont_need(key, freed);
         if (g_offloadable_resident_bytes >= static_cast<std::int64_t>(freed))
             g_offloadable_resident_bytes -= static_cast<std::int64_t>(freed);
@@ -1299,6 +1341,7 @@ namespace tsg
             {
                 ggml_backend_buffer_free(it->second.buffer);
                 g_preloaded_buffer_cache.erase(it);
+                note_cached_buffer_released(data);
                 return true;
             }
         }
@@ -1320,6 +1363,7 @@ namespace tsg
             ggml_backend_buffer_free(it->second.buffer);
             g_host_buffer_cache.erase(it);
         }
+        note_cached_buffer_released(data);
         return true;
     }
 
@@ -1459,6 +1503,7 @@ namespace tsg
                 }
                 ggml_backend_buffer_free(it->second.buffer);
                 g_preloaded_buffer_cache.erase(it);
+                note_cached_buffer_released(data);
             }
         }
 
@@ -1483,6 +1528,7 @@ namespace tsg
                 device_copy_account_remove_locked(it->second);
                 ggml_backend_buffer_free(it->second.buffer);
                 g_host_buffer_cache.erase(it);
+                note_cached_buffer_released(data);
             }
         }
 
@@ -3470,6 +3516,7 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
             for (auto& [ptr, cached] : g_host_buffer_cache)
                 ggml_backend_buffer_free(cached.buffer);
             g_host_buffer_cache.clear();
+            tsg::note_cached_buffer_released(nullptr);
             g_offloadable_lru.clear();
             g_offloadable_lru_map.clear();
             g_offloadable_resident_bytes = 0;
@@ -4668,6 +4715,7 @@ TSG_EXPORT int TSGgml_PreloadQuantizedWeight(
                 }
                 ggml_backend_buffer_free(it->second.buffer);
                 g_preloaded_buffer_cache.erase(it);
+                tsg::note_cached_buffer_released(cache_key);
             }
         }
 

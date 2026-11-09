@@ -166,6 +166,8 @@ namespace
         struct Upload { ggml_tensor* t; const void* data; std::size_t bytes; };
         std::vector<Upload> uploads;
         std::vector<BufferHandle> ephemeral;
+        std::vector<const void*> cached_keys;   // the cache keys a persisted graph must hold (PersistedBindings)
+        std::vector<void*> fresh;               // cache entries created by bind(), not yet written
         ggml_backend_dev_t dev = nullptr;
 
         void bind(ggml_tensor* t, const void* data, std::size_t bytes, bool cacheable,
@@ -178,7 +180,8 @@ namespace
                 bool needs_upload = false;
                 if (try_bind_cached_tensor(g_backend, dev, t, d, bytes, needs_upload, usage))
                 {
-                    if (needs_upload) uploads.push_back({ t, data, bytes });
+                    if (needs_upload) { uploads.push_back({ t, data, bytes }); fresh.push_back(d); }
+                    cached_keys.push_back(data);
                     return;
                 }
             }
@@ -189,10 +192,20 @@ namespace
                 {
                     if (!cacheable) ephemeral.emplace_back(buf);
                     if (ggml_backend_tensor_alloc(buf, t, d) == GGML_STATUS_SUCCESS)
+                    {
+                        if (cacheable) cached_keys.push_back(data);
                         return;
+                    }
                 }
             }
             uploads.push_back({ t, data, bytes });
+        }
+
+        // A graph abandoned before flush(): drop the cache entries its binds created but never wrote.
+        void abandon()
+        {
+            for (void* d : fresh) invalidate_cached_buffer(d);
+            fresh.clear();
         }
 
         ggml_tensor* weight(ggml_context* ctx, const TsgDsWeight& w)
@@ -215,6 +228,7 @@ namespace
         {
             for (auto& u : uploads)
                 ggml_backend_tensor_set(u.t, resolve_upload_source(u.data), 0, u.bytes);
+            fresh.clear();
         }
 
         std::vector<Upload> pending;
@@ -281,9 +295,11 @@ namespace
         const DsTables* tables = nullptr;
         int b = 0;
         std::uint64_t used = 0;
+        tsg::PersistedBindings bindings;   // replayed only while every cached buffer it was bound to lives
 
         void reset()
         {
+            bindings.release();
             if (galloc != nullptr) { ggml_gallocr_free(galloc); galloc = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr;
@@ -306,7 +322,10 @@ namespace
         {
             for (auto& e : entries)
                 if (e.valid && e.sig == sig && e.ring == ring && e.b == b && e.tables == tables)
-                { e.used = ++clock; return &e; }
+                {
+                    if (!e.bindings.still_bound()) { e.reset(); return nullptr; }   // a bound buffer was freed: rebuild
+                    e.used = ++clock; return &e;
+                }
             return nullptr;
         }
 
@@ -821,6 +840,7 @@ TSG_EXPORT int TSGgml_DSpineDraftBlock(
         if (!ds_alloc(ctx, g.graph, galloc))
         {
             set_last_error("DSpine draft: graph allocation failed.");
+            binder.abandon();
             ggml_free(ctx);
             return 0;
         }
@@ -853,6 +873,7 @@ TSG_EXPORT int TSGgml_DSpineDraftBlock(
         slot.cand = g.cand; slot.s0 = g.s0; slot.scores = g.scores;
         slot.sig = sig; slot.ring = ring_k[0]; slot.tables = tables; slot.b = b;
         slot.valid = true;
+        slot.bindings.keep(binder.cached_keys);
         clear_last_error();
         return 1;
     }

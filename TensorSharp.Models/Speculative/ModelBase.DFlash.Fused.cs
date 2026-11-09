@@ -503,7 +503,10 @@ namespace TensorSharp.Models
             if (_dflashDeferInjects)
                 DeferDFlashInject(hRows, rowOffset + skip, keep, startPos + skip, a);
             else if (!RunFusedDFlashInject(a, hRows, rowOffset + skip, keep, startPos + skip, a.RingK, a.RingV))
+            {
+                _dflashFusedInjectFailed = true;
                 return false;
+            }
 
             // See DFlashInjectKv: the frontier must be able to move backwards.
             NoteDFlashRingWrite(startPos + skip, keep);

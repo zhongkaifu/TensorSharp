@@ -675,12 +675,58 @@ namespace TensorSharp.Models
         private void DFlashEncodeAndInject(float[] hRows, int rowOffset, int n, int startPos)
         {
             RecordDSpineDumpRows(hRows, rowOffset, n, startPos);
+            if (DFlashDraftingDeclined)
+                return;   // this request's ring is incomplete; it decodes without drafts
+            _dflashFusedInjectFailed = false;
             if (TryFusedDFlashInject(hRows, rowOffset, n, startPos))
+                return;
+
+            if (_dflashFusedInjectFailed && DeclineDraftingAfterFailedInject(GgmlBasicOps.LastNativeError()))
                 return;
 
             EnsureDFlashRingHostSynchronized();
             using Tensor g = DFlashEncode(hRows, rowOffset, n);
             DFlashInjectKv(g, n, startPos);
+        }
+
+        /// <summary>
+        /// After a fused inject that ran and failed (device memory, typically): on a discrete GPU the bound request
+        /// stops drafting and decodes plainly, with one warning per model naming the consequence, and this returns
+        /// true. The per-op fallback is not taken there: it rewrites the ring through ordinary ops, replacing the
+        /// device copy the persisted drafter graphs were bound to (an illegal memory access on CUDA before those
+        /// graphs held their bindings), and it needs the device memory the fused inject just failed to get.
+        /// Elsewhere this returns false and the per-op inject runs.
+        /// </summary>
+        internal bool DeclineDraftingAfterFailedInject(string nativeError)
+        {
+            if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan)
+                return false;
+            DFlashDraftingDeclined = true;
+            if (!_dflashInjectDeclineWarned)
+            {
+                _dflashInjectDeclineWarned = true;
+                Console.Error.WriteLine($"[dflash] the drafter's context inject failed on {_backend} ({nativeError}); " +
+                    "this request decodes without drafts. Further failures are not reported.");
+            }
+            return true;
+        }
+
+        /// <summary>Set by <see cref="TryFusedDFlashInject"/> when the native inject ran and failed (as opposed to
+        /// the fused path not applying).</summary>
+        private bool _dflashFusedInjectFailed;
+        private bool _dflashInjectDeclineWarned;
+        private bool _dflashModelDraftingDeclined;
+
+        /// <summary>The bound request stopped drafting after a failed inject (DFlashRing.DraftingDeclined; the
+        /// model-level flag when no ring object is bound, cleared when a request releases its draft state).</summary>
+        internal bool DFlashDraftingDeclined
+        {
+            get => _dflashActiveRing?.DraftingDeclined ?? _dflashModelDraftingDeclined;
+            set
+            {
+                if (_dflashActiveRing != null) _dflashActiveRing.DraftingDeclined = value;
+                else _dflashModelDraftingDeclined = value;
+            }
         }
 
         /// <summary>
@@ -694,7 +740,7 @@ namespace TensorSharp.Models
         private protected int DFlashPropose(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
         {
             RequireDFlash();
-            if (position <= 0 || draftOut == null || draftOut.Length == 0)
+            if (position <= 0 || draftOut == null || draftOut.Length == 0 || DFlashDraftingDeclined)
                 return 0;
 
             // The drafter's own key for the last committed position, exactly like

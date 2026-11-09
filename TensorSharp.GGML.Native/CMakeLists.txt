@@ -1385,6 +1385,16 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_link_libraries(GgmlOpsDFlashScaleTest PRIVATE GgmlOps ggml-base)
     add_test(NAME dflash-sidecar-scales-cpu COMMAND GgmlOpsDFlashScaleTest cpu)
     set_tests_properties(dflash-sidecar-scales-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
+    # The DFlash/DSpine ring inject under a failed allocation, in chunks, and with its ring copy released under a
+    # persisted graph (ggml_ops_dflash.cpp; the epoch in ggml_ops_core.cpp).
+    # Its hooks (TSGgml_DFlashTestFailAllocs, TSGgml_DFlashTestInjectChunk) exist only in a test build of the source.
+    set_property(SOURCE ggml_ops_dflash.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    add_executable(GgmlOpsDFlashInjectTest tests/dflash_inject_test.cpp)
+    target_link_libraries(GgmlOpsDFlashInjectTest PRIVATE GgmlOps ggml-base)
+    foreach(TSG_DFINJ_BACKEND IN ITEMS cpu cuda metal)
+        add_test(NAME dflash-inject-${TSG_DFINJ_BACKEND} COMMAND GgmlOpsDFlashInjectTest ${TSG_DFINJ_BACKEND})
+        set_tests_properties(dflash-inject-${TSG_DFINJ_BACKEND} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
+    endforeach()
     add_executable(GgmlOpsDFlashRingBlockTest tests/dflash_ring_block_test.cpp)
     target_link_libraries(GgmlOpsDFlashRingBlockTest PRIVATE GgmlOps ggml-base)
     foreach(TSG_DFRING_BACKEND IN ITEMS cpu cuda metal)
