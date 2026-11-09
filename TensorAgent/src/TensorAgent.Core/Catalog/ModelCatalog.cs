@@ -276,7 +276,10 @@ public static partial class ModelCatalog
             Sampling = new CatalogSampling(0.7f, 20, 0.8f, 0.0f),
             // The config's drafter settings, measured on an M5 Pro (ggml_metal, greedy, 512-token
             // answers): 7 drafts with every one verified gave 38.6-44 tok/s on code against
-            // 20.6 plain; 5 drafts and the default confidence gate were both slower.
+            // 20.6 plain; 5 drafts and the default confidence gate were both slower. 2026-11-09,
+            // eng/qwen38-engine-bench.py: long generation 34.5 tok/s (plain 21.3), 49.7 after a
+            // 4K-token prompt. DFlash2 stays the drafter: Tencent's DSpine (converted locally, no
+            // published GGUF) was faster only after 4K-8K prompts (65.0) and tied elsewhere.
             DraftTuning = new CatalogDraftTuning(MaxDraftTokens: 7, MinDraftProb: 0f),
             SupportsThinking = true,
             License = ApacheLicense,
@@ -359,8 +362,10 @@ public static partial class ModelCatalog
             // The publisher's sampling defaults (general.sampling).
             Sampling = new CatalogSampling(1.0f, 20, 0.95f, 0.0f),
             // No DraftTuning: the DFlash2 drafter's engine defaults (block drafts of up to 6, gate 0.5) are what was
-            // measured. M5 Pro (48 GB), the server with config/qwen3.8-flash-next.json: decode 43-48 tok/s, 4K-token
-            // prompt TTFT 5.8-6.0 s, four requests at once 43.4 tok/s in all.
+            // measured. M5 Pro (48 GB), the server with config/qwen3.8-flash-next.json (2026-11-09): long-generation
+            // decode 50-51 tok/s, 4K-token prompt TTFT 4.4-4.6 s, 16K 17.2-17.6 s, four requests at once 55.5-56.3
+            // tok/s in all. Those runs read the hyper-connection matrices as Q8_0 (TS_Q4E_HC_Q8=1), which the desktop
+            // app now sets at startup (MauiProgram.ApplyDesktopEngineSettings).
             SupportsThinking = true,
             Experimental = true,
             License = "Qwen Community License 1.0",
