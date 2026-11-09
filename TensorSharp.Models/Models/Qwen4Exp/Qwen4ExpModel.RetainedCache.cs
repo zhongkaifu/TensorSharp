@@ -341,7 +341,8 @@ namespace TensorSharp.Models
                 Console.Error.WriteLine(
                     $"[q4e retained] refused {what}: {bytes / 1048576.0:F1} MB does not fit the retention budget " +
                     $"({DescribeRetentionBudget(spare)}, retained {RetainedBytesTotal() / 1048576.0:F1} MB" +
-                    (spare.HasValue ? $", headroom {spare.Value / 1048576.0:F0} MB" : "") + ") and the prefix cache owns eviction. Reported once.");
+                    (spare.HasValue ? $", headroom {spare.Value / 1048576.0:F0} MB: {DescribeSpareSources()}" : "") +
+                    ") and the prefix cache owns eviction. Reported once.");
             }
             return false;
         }
@@ -378,6 +379,25 @@ namespace TensorSharp.Models
             if (holder.QsaPositions != null) bytes = checked(bytes + (long)holder.QsaPositions.Length * sizeof(int));
             bytes = checked(bytes + MtpStateBytes((object)holder.GdnConvStateT ?? holder.K));
             return bytes;
+        }
+
+        /// <summary>The terms the headroom is the least of, for the refusal message.</summary>
+        private string DescribeSpareSources()
+        {
+            var parts = new List<string>();
+            if (GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) && total > 0)
+                parts.Add($"device {free / 1048576.0:F0} MB free of {total / 1048576.0:F0} MB" +
+                    (GpuMemoryBudget.TryGetReservationSpareBytes(_backend, out long device) ? $" ({device / 1048576.0:F0} MB past its headroom)" : ""));
+            try
+            {
+                long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+                using var process = Process.GetCurrentProcess();
+                parts.Add($"host {available / 1048576.0:F0} MB, working set {process.WorkingSet64 / 1048576.0:F0} MB");
+            }
+            catch (InvalidOperationException) { }
+            if (IsGgmlBackend && UnifiedMemorySpareBytes() is long mac)
+                parts.Add($"macOS spare {mac / 1048576.0:F0} MB");
+            return string.Join("; ", parts);
         }
 
         /// <summary>Headroom for retained holders: both the host allocation and a GPU
