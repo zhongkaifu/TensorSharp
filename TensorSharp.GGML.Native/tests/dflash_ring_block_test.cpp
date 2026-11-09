@@ -6,6 +6,10 @@
 // selector lattices over a wrapping ring, step after step (replayed graphs included), and the ring rows a later window
 // can read left exactly as the injects wrote them. On CUDA the batched draft (two lanes, each on its own ring) is checked
 // against the single-lane drafts too.
+//
+// The selector keeps every token (top-k = the vocabulary) and its lattice is compared keyed by token ids: the drafts
+// differ by float rounding, which can reorder near-tied candidates (on CUDA's attention, ~6e-5) and so permute the
+// lattice without changing a single score.
 #include "ggml.h"
 #include <algorithm>
 #include <cmath>
@@ -74,7 +78,7 @@ int TSGgml_DFlashDraftBlockBatched(
 namespace {
 // Two query heads over one KV head; the ring has a block and an anchor of headroom past the window (DFlashConfig.RingRows).
 constexpr int N = 2, H = 64, NH = 2, NKV = 1, HD = 32, FF = 128, FEAT = 128, VOCAB = 64;
-constexpr int RING = 160, SW = 128, B = 8, RANK = 16, TOPK = 4, TAPS = 2, GROUP = 16;
+constexpr int RING = 160, SW = 128, B = 8, RANK = 16, TOPK = VOCAB, TAPS = 2, GROUP = 16;
 constexpr int PROMPT = 150, STEPS = 14;
 
 std::uint32_t random_state;
@@ -166,6 +170,29 @@ std::vector<int> block_tokens(const Lane& lane, int step) {
     return t;
 }
 
+// The lattice keyed by token ids: each position's candidates sorted by id, the anchor scores and every
+// [predecessor][candidate] matrix permuted to match.
+void canonical(std::vector<int>& cand, std::vector<float>& scores) {
+    constexpr int G = B - 1;
+    std::vector<std::vector<int>> order(G, std::vector<int>(TOPK));
+    for (int e = 0; e < G; ++e) {
+        for (int i = 0; i < TOPK; ++i) order[e][i] = i;
+        std::sort(order[e].begin(), order[e].end(), [&](int a, int b) { return cand[e * TOPK + a] < cand[e * TOPK + b]; });
+    }
+    std::vector<int> c2(cand.size());
+    std::vector<float> s2(scores.size());
+    for (int e = 0; e < G; ++e)
+        for (int i = 0; i < TOPK; ++i) c2[e * TOPK + i] = cand[e * TOPK + order[e][i]];
+    for (int i = 0; i < TOPK; ++i) s2[i] = scores[order[0][i]];
+    for (int e = 1; e < G; ++e)
+        for (int p = 0; p < TOPK; ++p)
+            for (int c = 0; c < TOPK; ++c)
+                s2[TOPK + (e - 1) * TOPK * TOPK + p * TOPK + c] =
+                    scores[TOPK + (e - 1) * TOPK * TOPK + order[e - 1][p] * TOPK + order[e][c]];
+    cand.swap(c2);
+    scores.swap(s2);
+}
+
 int draft_one(Weights& w, Lane& lane, const std::vector<int>& tokens, bool selector, std::vector<int>& ids, std::vector<float>& vals) {
     std::vector<int> positions(B), map = lane.slot_map();
     for (int i = 0; i < B; ++i) positions[i] = lane.filled + i;
@@ -180,6 +207,7 @@ int draft_one(Weights& w, Lane& lane, const std::vector<int>& tokens, bool selec
         selector ? RANK : 0, TOPK, .8f, 3.f, ONE(w.sh), ONE(w.sp), ONE(w.ss), scores.data(), cand.data(), nullptr, 0);
     ids = selector ? cand : id;
     vals = selector ? scores : conf;
+    if (selector && status == 1) canonical(ids, vals);
     return status;
 }
 
@@ -263,6 +291,16 @@ bool batched(Weights& w, bool selector) {
         std::vector<int> ids = selector ? cand : id, single = ids_a;
         single.insert(single.end(), ids_b.begin(), ids_b.end());
         std::vector<float> vals = selector ? scores : conf, sv = va;
+        if (selector) {
+            // each lane's block of the batched outputs, keyed by token ids as the single drafts are
+            const std::size_t nc = std::size_t(TOPK) * (B - 1), ns = TOPK + std::size_t(TOPK) * TOPK * (B - 2);
+            std::vector<int> c0(ids.begin(), ids.begin() + nc), c1(ids.begin() + nc, ids.end());
+            std::vector<float> s0(vals.begin(), vals.begin() + ns), s1(vals.begin() + ns, vals.end());
+            canonical(c0, s0);
+            canonical(c1, s1);
+            ids = c0; ids.insert(ids.end(), c1.begin(), c1.end());
+            vals = s0; vals.insert(vals.end(), s1.begin(), s1.end());
+        }
         sv.insert(sv.end(), vb.begin(), vb.end());
         same = same && ids == single;
         worst = std::max(worst, max_rel(vals, sv));
