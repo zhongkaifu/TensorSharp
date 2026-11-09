@@ -165,6 +165,15 @@ namespace TensorSharp.Models
                 // again. The optional MTP head is preloaded AFTER this plan.
                 long pending = checked(CacheBytes() + (_mtpReady ? 0 : _mtpResidentBytes));
                 foreach (var weight in _weights.Values) pending = checked(pending + weight.Storage.ByteLength);
+                // Concurrent requests' holders come out of the same VRAM later: without a reserve the tier
+                // (19.1 GB on the RTX 5090) left ~4.6 GB, and four requests' state plus the batched arena did not fit.
+                int lanes = GgmlCudaLanes(Environment.GetEnvironmentVariable("TS_Q4E_LANES"));
+                long laneReserve = ConcurrentSequenceReserveBytes(lanes,
+                    HolderCacheBytes(Math.Min(_maxContextLength, CudaSequenceGrowthTokens)), MetalSequenceExtraBytes);
+                pending = checked(pending + laneReserve);
+                if (laneReserve > 0)
+                    Console.WriteLine($"[qwen4exp] {lanes} concurrent sequences on ggml_cuda: {Gb(laneReserve)} of VRAM kept beside the " +
+                        $"experts for the {lanes - 1} beside the first ({CudaSequenceGrowthTokens} K/V rows and their state each; TS_Q4E_LANES).");
                 long cacheBudget = ResolveCudaExpertCacheBudget(
                     Environment.GetEnvironmentVariable("TS_HOST_MOE_EXPERT_CACHE_MB"));
                 ulong cacheLayers = ResolveCudaExpertCacheLayers(
@@ -253,6 +262,21 @@ namespace TensorSharp.Models
             ReportExpertPlacement("planned", $"Metal working set {Gb(workingSet)}, RAM {Gb(ram)}; " +
                 "--n-cpu-moe N overrides");
             ConfigureHostExpertIo(HostExpertIoBudget(layerPlanBytes));
+        }
+
+        /// <summary>Concurrent sequences ggml_cuda plans VRAM for (<c>TS_Q4E_LANES</c>, as on the direct CUDA engine):
+        /// 1 to 16, 1 when unset or unreadable. Requests beyond what fits wait for a running one either way.</summary>
+        internal static int GgmlCudaLanes(string value)
+            => int.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int lanes)
+                ? Math.Clamp(lanes, 1, 16) : 1;
+
+        /// <summary>VRAM the expert plan keeps for the sequences beside the first: each a holder of
+        /// <paramref name="holderBytes"/> plus <paramref name="extraBytes"/> of recurrent state and arena share.</summary>
+        internal static long ConcurrentSequenceReserveBytes(int lanes, long holderBytes, long extraBytes)
+        {
+            if (lanes < 1 || holderBytes < 0 || extraBytes < 0)
+                throw new ArgumentOutOfRangeException(nameof(lanes));
+            return checked((lanes - 1) * (holderBytes + extraBytes));
         }
 
         internal static long ResolveCudaExpertCacheBudget(string value)

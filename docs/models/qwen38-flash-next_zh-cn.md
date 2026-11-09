@@ -1397,6 +1397,45 @@ argmax 全部相同；所有专家都在主机上时为 3.0e-4，Q8_K 激活放�
 | + tensor API 上的注意力、route tail skip（`df2-mm`） | 0.30-0.32 s / 20.5-25.8 tok/s | 43.0-45.0 tok/s | **5.97-6.22 s** | **23.91-24.23 s** | 4.0-4.5 s |
 | Strata DFlash2 | 0.56 s / 19 tok/s | 47.8 tok/s | 6.32 s | 24.4 s | - |
 
+### ggml_cuda 上的并发请求，2026-11-09
+
+在 `--backend ggml_cuda` 上同时发送的请求曾经失败（RTX 5090，32 GB；ISTA Q2_0 加 MTP 头，MAX_CONTEXT 131072）：
+
+- 每个并发请求的缓存 holder 都是整个窗口：3.6 GB 的 K/V 与索引键。
+- 19.1 GB 的专家层级只剩约 4.6 GB，第二个请求的状态就占满了 GPU 的最后一点显存。
+- 随后它的 token span 无法分配，所有并发请求都返回 HTTP 500。
+- 在更早的一次运行中，第四个请求的每 slot cuBLAS 句柄无法创建，ggml 终止了服务。
+
+现在：
+
+- 并发请求的 holder 从 2048 行开始，随请求增长（与 Metal 相同）。
+- 状态放不下（需留 1 GB 余量）的请求会等待正在运行的请求（调度器推迟它）。其状态按 8192 行加循环状态计，
+  F16 下约 0.5 GB；prefix cache 会先逐出保留的会话。
+- `TS_Q4E_LANES` 让专家层级为相应数量的序列预留这部分空间。4 条 lane 预留 1.5 GB：层级从 19.1 GB 降到 17.7 GB，
+  覆盖的已分析路由从 94.2% 降到约 92%。
+- 拿不到 cuBLAS 句柄的每请求后端只让该请求失败，而不是整个进程。
+
+客户端同上。引擎基准的 256-token 解码各跑两次；standard-v1 并发为三轮、每轮四个请求。
+
+| 配置 | 长生成解码 | parallel_2 | parallel_4 | standard-v1 并发 |
+| --- | --- | --- | --- | --- |
+| 修改前 | 85.6-94.2 tok/s | HTTP 500 | HTTP 500 | 12 个全部失败 |
+| 1 条 lane | 80.7-98.1 tok/s | 59-65 tok/s，2/2 正确 | 92-95 tok/s，4/4 | 12 个全部完成，每个 31-37 tok/s |
+| 4 条 lane | 79.0-88.6 tok/s | 66-75 tok/s，2/2 | 91-94 tok/s，4/4 | 12 个全部完成，每个 30-36 tok/s |
+
+贪心一致性只在让每个序列走自己的单行 span 的精确配置下成立：
+
+- 精确配置关闭 prefix cache、route tail skip、层级自适应与 hybrid misses
+  （`TS_SCHED_PREFIX_CACHE=0 TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0 TS_Q4E_HYBRID_MISSES=0`）。
+- 再加 `TS_Q4E_DISABLE_ARENA_DECODE=1` 时，同时发送的四个请求与单独运行的文本一致（4/4），单独重复运行也一致（4/4）。
+  该配置跑一轮 parallel_4 需 18.5 s，使用批处理 arena 时为 14 s。
+- 使用批处理 arena 时，并行与单独一致的只有 0 到 1/4，有无投机解码都一样：ggml 按行数选择矩阵内核，
+  批处理步的舍入与单个请求不同，贪心文本可能在近似并列处分叉。
+- 默认设置下单独重复运行也不一致（1/4），与直接引擎相同。
+
+ggml 路径通过页缓存读取 host 专家与 PLE n-gram 表。在本机的网络卷上（文件每次被打开都会丢弃页缓存），ggml_cuda
+解码只有 1.8-4.7 tok/s；上面的测量从内存（`/dev/shm`）读取 PLE 分片。
+
 ## 多 GPU
 
 `ggml_cuda` 的 `--tp N` 切分每个路由专家及共享专家：gate/up 按中间通道切分，汇集激活后，

@@ -1913,6 +1913,47 @@ there. 16K smoke: chunks 5.06 / 5.24 / 5.29 / 5.34 s instead of 5.06 / 5.44 / 5.
 | + attention on the tensor API, route tail skip (`df2-mm`) | 0.30-0.32 s / 20.5-25.8 tok/s | 43.0-45.0 tok/s | **5.97-6.22 s** | **23.91-24.23 s** | 4.0-4.5 s |
 | Strata DFlash2 | 0.56 s / 19 tok/s | 47.8 tok/s | 6.32 s | 24.4 s | - |
 
+### Concurrent requests on ggml_cuda, 2026-11-09
+
+Requests at once on `--backend ggml_cuda` (RTX 5090, 32 GB; ISTA Q2_0 with the MTP head, MAX_CONTEXT 131072) failed:
+
+- Every concurrent request's cache holder was the whole window: 3.6 GB of K/V and indexer keys.
+- The 19.1 GB expert tier left about 4.6 GB, so the second request's state took the GPU's last memory.
+- Its token span then could not allocate, and every concurrent request answered HTTP 500.
+- In an earlier run, the fourth request's per-slot cuBLAS handle could not be created, and ggml aborted the server.
+
+Now:
+
+- A concurrent request's holder starts at 2048 rows and grows with its request, as on Metal.
+- A request whose state does not fit beside a 1 GB headroom waits for a running request (the scheduler defers it).
+  Its state is counted at 8192 rows plus its recurrent state, about 0.5 GB at F16. The prefix cache evicts retained
+  conversations first.
+- `TS_Q4E_LANES` has the expert tier keep that room for that many sequences. With 4 lanes the reserve is 1.5 GB: the
+  tier goes from 19.1 to 17.7 GB, and from 94.2% to about 92% of the profiled routes.
+- A per-request backend that cannot get its cuBLAS handle fails that request, not the process.
+
+Same client as above. The engine bench runs 256-token decodes twice; standard-v1 concurrency is three rounds of four.
+
+| run | long-gen decode | parallel_2 | parallel_4 | standard-v1 concurrency |
+| --- | --- | --- | --- | --- |
+| before | 85.6-94.2 tok/s | HTTP 500 | HTTP 500 | 12 of 12 failed |
+| 1 lane | 80.7-98.1 tok/s | 59-65 tok/s, 2/2 correct | 92-95 tok/s, 4/4 | 12 of 12 completed, 31-37 tok/s each |
+| 4 lanes | 79.0-88.6 tok/s | 66-75 tok/s, 2/2 | 91-94 tok/s, 4/4 | 12 of 12 completed, 30-36 tok/s each |
+
+Greedy identity holds only in an exact arm that runs each sequence through its own one-row span:
+
+- The exact arm turns off the prefix cache, the route tail skip, tier adaptation and hybrid misses
+  (`TS_SCHED_PREFIX_CACHE=0 TS_MOE_ROUTE_TAIL_SKIP=0 TS_MOE_TIER_ADAPT=0 TS_Q4E_HYBRID_MISSES=0`).
+- With `TS_Q4E_DISABLE_ARENA_DECODE=1` added, four requests at once give the same text as alone, 4 of 4, and so do
+  repeats of each alone, 4 of 4. That arm does a parallel_4 wave in 18.5 s, against 14 s with the batched arena.
+- With the batched arena, parallel matches solo 0 to 1 of 4, with or without speculation. ggml picks its matrix kernels
+  by row count, so a batched step rounds differently from a lone request's, and greedy text can part at a near tie.
+- Under the default settings solo repeats are not identical either (1 of 4), as on the direct engine.
+
+The ggml path reads its host experts and the PLE n-gram table through the page cache. On this pod's network volume,
+which drops a file's page cache whenever it is opened, ggml_cuda decoded at 1.8-4.7 tok/s. The runs above read the PLE
+shard from RAM (`/dev/shm`).
+
 ## Multi-GPU
 
 `--tp N` on `ggml_cuda` partitions every routed and shared FFN across N local GPUs. Every rank
