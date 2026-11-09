@@ -36,6 +36,13 @@ namespace TensorSharp.Cuda
     {
         private const int TF32 = 0, TF16 = 1, TQ8_0 = 8;
 
+        /// <summary>TS_Q4E_Q80_PAIR=0 sends Q8_0 decode projections back to the decode-once dense kernels (A/B; the
+        /// two differ in the last bits).</summary>
+        private static readonly bool Q80Pair = Environment.GetEnvironmentVariable("TS_Q4E_Q80_PAIR") != "0";
+
+        /// <summary>TS_Q4E_EXPERT_VEC=0 sends Q8_0 decode experts back to the shared decode kernels (A/B).</summary>
+        private static readonly bool ExpertVecDecode = Environment.GetEnvironmentVariable("TS_Q4E_EXPERT_VEC") != "0";
+
         /// <summary>The Gated DeltaNet state size (head width) the kernels are written for.</summary>
         public const int GdnStateSize = Q4eKernels.GdnHeadDim;
 
@@ -914,6 +921,14 @@ namespace TensorSharp.Cuda
 
         private static void MatMul(Dev dev, in DeviceWeight w, Tensor input, IntPtr xq, Tensor output, int rows, IntPtr stream)
         {
+            // Q8_0 decode projections: the pair matvec (tensor cores from three rows, its dp4a twin below), one
+            // arithmetic at every row count, so batched rows still compute as each sequence's own step does.
+            if (xq != IntPtr.Zero && w.Type == TQ8_0 && Q80Pair && dev.Alloc.Kernels.HasQ80Pair && rows <= CudaKernels.Q80PairMaxRows
+                && (w.Ne0 & 31) == 0)
+            {
+                dev.Alloc.Kernels.LaunchQuantMatmulQ80Pair(w.Ptr, xq, Ptr(output), w.Ne0, w.Ne1, rows, stream);
+                return;
+            }
             // BF16 matrices (ISTA's hyper-connection and PLE value weights) at decode size: F32 activations, as
             // ggml computes them, in a kernel a captured step can hold.
             if (w.Type == 30 && rows <= PerSlotMaxRows && w.Ne0 % 2 == 0 && dev.DK.DecodesLegacyQuants)

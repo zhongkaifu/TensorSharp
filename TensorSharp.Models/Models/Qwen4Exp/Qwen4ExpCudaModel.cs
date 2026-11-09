@@ -36,6 +36,12 @@ namespace TensorSharp.Models
         private OrderedDictionary<string, SlotRetention.RetainedSlot> _retainedSlots;
         private IPrefixPayloadSink _prefixCacheSink;
         private bool _batchedChunkingLatched;
+        // A batched decode step's logits: one flat buffer for the engine's rows, and two arrays per slot used in
+        // turn, so a step allocates nothing. A sequence's LastLogits (the array its step wrote) is read by the next
+        // step's sampler before that step's forward writes the slot's other array.
+        private float[] _batchFlat;
+        private float[][][] _slotLogits;
+        private int[] _slotLogitsTurn;
 
         public Qwen4ExpCudaModel(string ggufPath, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
             int layerSplitDegree = 1, string draftGgufPath = null)
@@ -432,14 +438,34 @@ namespace TensorSharp.Models
                         return false;
                 int vocab = Config.VocabSize;
                 if ((long)n * vocab > int.MaxValue) return false;
-                var flat = new float[n * vocab];
+                if (_batchFlat == null || _batchFlat.Length < n * vocab)
+                    _batchFlat = new float[n * vocab];
+                var flat = _batchFlat;
                 if (!ForwardBatchedDecodeChunks(slots, tokens, positions, flat, vocab)) return false;
+                int maxSlot = 0;
+                for (int i = 0; i < n; i++)
+                    maxSlot = Math.Max(maxSlot, slots[i]);
+                if (_slotLogits == null || _slotLogits.Length <= maxSlot)
+                {
+                    Array.Resize(ref _slotLogits, maxSlot + 1);
+                    Array.Resize(ref _slotLogitsTurn, maxSlot + 1);
+                }
+                var rows = new float[n][];
                 for (int i = 0; i < n; i++)
                 {
-                    var row = new float[vocab];
-                    Array.Copy(flat, (long)i * vocab, row, 0, vocab);
-                    outLogits[i] = row;
+                    int slot = slots[i];
+                    var pair = _slotLogits[slot] ??= new float[2][];
+                    int turn = _slotLogitsTurn[slot] ^= 1;
+                    rows[i] = pair[turn] != null && pair[turn].Length == vocab ? pair[turn] : (pair[turn] = new float[vocab]);
                 }
+                // 1 MB a row: the copies run side by side.
+                if (n >= 4)
+                    System.Threading.Tasks.Parallel.For(0, n, i => Array.Copy(flat, (long)i * vocab, rows[i], 0, vocab));
+                else
+                    for (int i = 0; i < n; i++)
+                        Array.Copy(flat, (long)i * vocab, rows[i], 0, vocab);
+                for (int i = 0; i < n; i++)
+                    outLogits[i] = rows[i];
                 return true;
             }
         }

@@ -421,6 +421,17 @@ namespace TensorSharp.Runtime.Scheduling
         private static readonly TimeSpan MaxYieldToPreparation = TimeSpan.FromMilliseconds(
             int.TryParse(Environment.GetEnvironmentVariable("TS_GPU_LOCK_YIELD_MS"), out int yieldMs) && yieldMs >= 0 ? yieldMs : 100);
 
+        /// <summary>TS_SCHED_PARALLEL_SAMPLE=0: a batched decode step samples its rows one after another
+        /// (settable for tests).</summary>
+        internal static bool ParallelSampling { get; set; } =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_SCHED_PARALLEL_SAMPLE"), "0", StringComparison.Ordinal);
+
+        /// <summary>Batched decode steps whose rows were sampled in parallel, process-wide (tests).</summary>
+        internal static long ParallelSampledSteps;
+
+        /// <summary>Rows from which a batched step samples them in parallel.</summary>
+        private const int ParallelSamplingMinRows = 4;
+
         private static readonly bool _stepLog =
             string.Equals(Environment.GetEnvironmentVariable("TS_SCHED_STEP_LOG"), "1", StringComparison.Ordinal);
         private long _stepLogLastEnd;
@@ -1331,6 +1342,24 @@ namespace TensorSharp.Runtime.Scheduling
                     try
                     {
                         bool allGreedy = true;
+                        // Each sequence samples with its own sampler (its own RNG and buffers) from its own
+                        // logits, so a batch's draws run side by side: a full-vocabulary top-k is ~0.3 ms a
+                        // row at Qwen's 248K tokens.
+                        int[]? peeked = null;
+                        if (ParallelSampling && dn >= ParallelSamplingMinRows && !FirstTokenLogitsDump.IsArmed)
+                        {
+                            var drawn = new int[dn];
+                            try
+                            {
+                                System.Threading.Tasks.Parallel.For(0, dn, i => drawn[i] = PeekPendingOrSample(decodeWork[i].Sequence));
+                            }
+                            catch (AggregateException ae) when (ae.InnerExceptions.Count > 0)
+                            {
+                                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
+                            }
+                            peeked = drawn;
+                            Interlocked.Increment(ref ParallelSampledSteps);
+                        }
                         for (int i = 0; i < dn; i++)
                         {
                             var seq = decodeWork[i].Sequence;
@@ -1338,7 +1367,7 @@ namespace TensorSharp.Runtime.Scheduling
                             // consume the device-sampled stash yet, so a decline below
                             // leaves the round-robin fallback a valid token source
                             // (device-sampled sequences have no LastLogits to re-sample).
-                            btokens[i] = PeekPendingOrSample(seq);
+                            btokens[i] = peeked != null ? peeked[i] : PeekPendingOrSample(seq);
                             bpositions[i] = seq.NumComputedTokens;
                             reqIds[i] = seq.RequestId;
                             if (allGreedy && !seq.GetOrCreateSampler().IsPlainGreedyArgmax)

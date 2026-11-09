@@ -209,6 +209,97 @@ extern "C" __global__ void ts_glm_kda_scan_f32(
             S[(size_t)(r0 + ri) * TS_GLM_KDA_HD + lane + 32 * j] = st[ri][j];
 }
 
+// The same recurrence with one state row per warp, and the next row's inputs loaded while this one computes:
+// a prefill ubatch walks its rows in order, so each step waited on its loads and four rows a warp kept three
+// quarters of the SMs' warp slots empty. Every state element computes exactly as ts_glm_kda_scan_f32 has it.
+// grid (H, 128 / warps, nSeq).
+extern "C" __global__ void ts_glm_kda_scan_r1_f32(
+    const float* __restrict__ scr,
+    float* const* __restrict__ ssmStates, // [nSeq] -> [H, 128, 128]
+    float* __restrict__ core,             // [nSeq * rowsPerSeq, H * 128]
+    const int rowsPerSeq,
+    const int H)
+{
+    const int h = blockIdx.x;
+    const int seq = blockIdx.z;
+    const int lane = threadIdx.x & 31;
+    const int r = blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (r >= TS_GLM_KDA_HD)
+        return;
+
+    const float* base = scr + ((size_t)seq * H + h) * rowsPerSeq * TS_GLM_KDA_SCR;
+    float* S = ssmStates[seq] + (size_t)h * TS_GLM_KDA_HD * TS_GLM_KDA_HD;
+    const float scale = rsqrtf((float)TS_GLM_KDA_HD);
+
+    float st[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        st[j] = S[(size_t)r * TS_GLM_KDA_HD + lane + 32 * j];
+
+    float nq[4], nk[4], ng[4], nv = 0.0f, nb = 0.0f;
+    if (rowsPerSeq > 0)
+    {
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            nq[j] = base[lane + 32 * j];
+            nk[j] = base[TS_GLM_KDA_HD + lane + 32 * j];
+            ng[j] = base[3 * TS_GLM_KDA_HD + lane + 32 * j];
+        }
+        nv = base[2 * TS_GLM_KDA_HD + r];
+        nb = base[4 * TS_GLM_KDA_HD];
+    }
+    for (int s = 0; s < rowsPerSeq; ++s)
+    {
+        float qj[4], kj[4], dj[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            qj[j] = nq[j];
+            kj[j] = nk[j];
+            dj[j] = expf(ng[j]);
+        }
+        const float v = nv, beta = nb;
+        if (s + 1 < rowsPerSeq)
+        {
+            const float* next = base + (size_t)(s + 1) * TS_GLM_KDA_SCR;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                nq[j] = next[lane + 32 * j];
+                nk[j] = next[TS_GLM_KDA_HD + lane + 32 * j];
+                ng[j] = next[3 * TS_GLM_KDA_HD + lane + 32 * j];
+            }
+            nv = next[2 * TS_GLM_KDA_HD + r];
+            nb = next[4 * TS_GLM_KDA_HD];
+        }
+        float* out = core + ((size_t)seq * rowsPerSeq + s) * H * TS_GLM_KDA_HD + h * TS_GLM_KDA_HD;
+        float kvDot = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            st[j] *= dj[j];
+            kvDot += st[j] * kj[j];
+        }
+        kvDot = ts_glm_warp_sum(kvDot);
+        const float delta = (v - kvDot) * beta;
+        float o = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            st[j] += kj[j] * delta;
+            o += st[j] * qj[j];
+        }
+        o = ts_glm_warp_sum(o);
+        if (lane == 0)
+            out[r] = o * scale;
+    }
+
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        S[(size_t)r * TS_GLM_KDA_HD + lane + 32 * j] = st[j];
+}
+
 // One warp per (row, head): RMS norm over the head (one weight shared by every head),
 // then the plain sigmoid output gate g_b(g_a(x)) - not SiLU.
 extern "C" __global__ void ts_glm_kda_out_f32(

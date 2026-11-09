@@ -53,6 +53,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr q2i8QuantAct, q2i8GateUp, q2i8Down, moeRowMap;
         private readonly IntPtr moeGateUpDecode;
         private readonly IntPtr moeDownDecode;
+        private readonly IntPtr moeGateUpDecodeQ80V, moeDownDecodeQ80V;
         private readonly IntPtr denseQ81Rows;
         private readonly IntPtr moeScatterAdd;
         private readonly IntPtr moeStagePlan, moeStageCopy, moeUnstage, doorbellPublish, doorbellWaitAdd;
@@ -249,6 +250,12 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500) { moeDownDecodeShort = IntPtr.Zero; }
             try { moeGateUpDecodeHalf = module.GetFunction("ts_dsv4_moe_gateup_decode_half_f32"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { moeGateUpDecodeHalf = IntPtr.Zero; }
+            try
+            {
+                moeGateUpDecodeQ80V = module.GetFunction("ts_dsv4_moe_gateup_decode_q80v_f32");
+                moeDownDecodeQ80V = module.GetFunction("ts_dsv4_moe_down_decode_q80v_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { moeGateUpDecodeQ80V = moeDownDecodeQ80V = IntPtr.Zero; }
             denseQ81Rows = module.GetFunction("ts_dsv4_dense_q81_rows_f32");
             moeScatterAdd = module.GetFunction("ts_dsv4_moe_scatter_add_f32");
             hcMean = module.GetFunction("ts_dsv4_hc_mean_f32");
@@ -899,6 +906,37 @@ namespace TensorSharp.Cuda
         public const int MoeDownShortMaxFf = 1024;
         // TS_MOE_DOWN_SHORT=0: a warp a row at every width (for measuring it; the sums' order differs).
         private static readonly bool _moeDownShort = Environment.GetEnvironmentVariable("TS_MOE_DOWN_SHORT") != "0";
+
+        /// <summary>Whether the module has the Q8_0 decode experts with the dense matvec's row layout
+        /// (<see cref="MoeGateUpDecodeQ80Vec"/>, <see cref="MoeDownDecodeQ80Vec"/>).</summary>
+        public bool HasQ80VecDecode => moeGateUpDecodeQ80V != IntPtr.Zero && moeDownDecodeQ80V != IntPtr.Zero;
+
+        /// <summary><see cref="MoeGateUpDecode"/> for Q8_0 experts with a warp per weight row and four lanes per
+        /// 32-value block (<c>ts_dsv4_moe_gateup_decode_q80v_f32</c>): its own arithmetic, the same for every
+        /// slot whatever the row count, from q8_1 activation rows at <paramref name="act"/>; an expert's rows follow
+        /// its residency table when one is given, as the shared decode kernels' do. Requires
+        /// <paramref name="inDim"/> a multiple of 32 and <see cref="HasQ80VecDecode"/>.</summary>
+        public void MoeGateUpDecodeQ80Vec(IntPtr gateW, IntPtr upW, IntPtr act, Tensor sel,
+            Tensor gateOut, Tensor upOut, int ff, int inDim, long rowBytes, int nt, int nUsed, IntPtr stream,
+            IntPtr gateTab = default, IntPtr upTab = default)
+        {
+            IntPtr a0 = gateW, a1 = upW, a2 = act, a3 = P(sel), a4 = P(gateOut), a5 = P(upOut);
+            int a6 = ff, a7 = inDim; long a8 = rowBytes; int a9 = nUsed;
+            IntPtr a10 = gateTab, a11 = upTab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11 };
+            Launch(moeGateUpDecodeQ80V, (uint)(nt * nUsed), CeilDiv(ff, 8), 2, BlockSize, 0, stream, args);
+        }
+
+        /// <summary><see cref="MoeDownDecode"/> for Q8_0 experts, as <see cref="MoeGateUpDecodeQ80Vec"/> reads a row.</summary>
+        public void MoeDownDecodeQ80Vec(IntPtr downW, Tensor act, Tensor sel, Tensor downOut,
+            int e, int ff, long rowBytes, int slots, IntPtr stream, IntPtr downTab = default)
+        {
+            IntPtr a0 = downW, a1 = P(act), a2 = P(sel), a3 = P(downOut);
+            int a4 = e, a5 = ff; long a6 = rowBytes;
+            IntPtr a7 = downTab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
+            Launch(moeDownDecodeQ80V, (uint)slots, CeilDiv(e, 8), 1, BlockSize, 0, stream, args);
+        }
 
         /// <summary>Whether <see cref="DenseQ81Rows"/> decodes this weight layout at this input width:
         /// the formats the warp-per-row dot handles, at widths of whole decode units (32-value blocks,

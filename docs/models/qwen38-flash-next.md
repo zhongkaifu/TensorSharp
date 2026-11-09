@@ -2460,10 +2460,13 @@ per step. These settings shape it as a server:
 | `TS_Q4E_SLOT_TOKENS` | `32768` | A slot's initial capacity. It doubles as its sequence grows, up to the context; a slot that cannot grow frees the oldest retained conversation's slot first. `MAX_CONTEXT` keeps bounding each request. |
 | `TS_Q4E_REWIND_CHECKPOINT` | on | Each slot keeps its recurrent states as they were at the end of its last multi-token forward. A next turn that matches the slot only partway into the previous reply (re-rendered reasoning or tool calls) rewinds there and replays the slot's own tokens up to the match; `0` turns it off. |
 | `TS_Q4E_BATCH_GRAPHS` | on | Batched steps (batched decode steps and batched speculative verifies) run as CUDA graphs, one per set of slots, their QSA regimes, rows and head form, captured on a set's third step and at most `TS_Q4E_BATCH_GRAPHS_MAX` (64) of them; `0` issues them kernel by kernel. |
+| `TS_Q4E_Q80_PAIR` | on | Q8_0 decode projections (1 to 16 rows) on int8 tensor cores (sm_80+), with a dp4a twin of the same arithmetic for one or two rows; `0` runs the decode-once dense kernels (`TS_DENSE_FAST`). The two sum in different orders, so answers differ in the last bits. |
+| `TS_Q4E_EXPERT_VEC` | on | Q8_0 decode experts read each weight row four lanes per 32-value block; `0` runs the shared decode kernels (sixteen lanes a gate/up row, eight a short down row; a different order). Paged-in experts follow their residency table, as resident ones compute. |
 | `TS_Q4E_PLACEMENT_SLOTS` | `16` | The layer split balances weights plus this many slots' caches, as many as fit; `1` balances for one. |
 | `TS_Q4E_UBATCH` | `512` | Rows per prefill forward. |
 | `TS_Q4E_PERF` | `0` | `1` logs each forward's time; `3` logs each stage's GPU time per step (uncaptured). |
 | `TS_Q4E_PERF_SAMPLE` | `0` | Every Nth forward runs uncaptured with stage timers and records `tensorsharp.engine.stage.duration` per stage, step kind and rows, instead of a log line. With `TS_Q4E_PERF` at `2` or more it is off. |
+| `TS_KDA_SCAN_R4` | off | `1` runs the gated-delta scan four state rows a warp in prefill too; unset, a prefill ubatch's scan runs one row a warp and prefetches the next row's inputs (bit-identical). |
 
 The scheduler sizes its reservation pool for one context per running sequence for this
 engine (`IBatchedPagedModel.UsesNativeSequenceSlots`), as for DeepSeek V4.1, instead of
@@ -2498,11 +2501,31 @@ context, ubatch 2048), the server behind a LiteLLM gateway:
   1.2 ms of 13.5 ms uncaptured; four rows 22.6 ms. A step is ~2,000 small kernels
   and latency-bound.
 
-Greedy answers are byte-identical with each switch on and off. The CUDA tests
+Decode projections and experts were the per-row cost of a batched step: from one row to 16 a
+step's GPU time grew ~2.8 ms a row, the Q8_0 matvecs alone from 4.0 to 20.1 ms (their weight
+words load once per call, but each row's dot product and block reduction run on their own) and
+the experts from 2.4 to 18.9 ms (a lane per 34-byte block, ~1.5 TB/s for one row). With the pair
+matvec and the experts' row layout (2026-11-09, the same two H100 NVL), greedy decode ran at
+100 / 144 / 197 / 273 / 345 tok/s for 1 / 2 / 4 / 8 / 16 streams against 94 / 141 / 188 / 234 /
+270 with both switched off, and a 16-row step's GPU time fell from 55.8 to 42.5 ms.
+`Q80PairMatvecTests` holds every row of a 2-16-row pair call bit-equal to the one-row call at
+this model's shapes and the experts bit-equal at every batch size, and the engine's
+batched-decode tests still pass bit for bit. These two do change answers: against the shared
+kernels their outputs move by ~1e-7 relative, enough to flip a near tie under greedy decoding
+(of ten paraphrases of a two-city weather prompt with tools, 9 made both calls under either
+arithmetic, a different one missing each time).
+
+With each of the other switches on and off greedy answers are byte-identical. The CUDA tests
 `BatchedDecode_ComputesEverySequencesOwnStep`, `AGrowingSlot_AnswersAsOneThatHeldTheWholeContext`
 and `ARewindFromTheCheckpoint_ContinuesAsTheSequenceThatStoppedThere` cover them on the
 synthetic fixture. The direct engine has no MTP drafter and refuses `--tp`; under a layer
 split one GPU computes at a time.
+
+A prefill ubatch's gated-delta scan with one state row a warp computes exactly what the
+four-rows-a-warp scan computes (`Qwen4ExpPrefillKernelTests`); on the same two H100 NVL
+(2026-11-09) the 2,048-token forward's scan fell from 137 to 113 ms.
+Sampling a batched step's rows in parallel took 16 streams at temperature 1 (top-k 20) from
+291 to 316 tok/s in all and 8 from 235 to 250; the draws are unchanged.
 
 ## Benchmark matrix
 

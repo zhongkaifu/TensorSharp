@@ -4467,6 +4467,84 @@ extern "C" __global__ void ts_dsv4_moe_gateup_decode_f32(
     }
 }
 
+// Q8_0 decode experts for Qwen3.8-Flash-Next's direct engine: a warp per weight row, four lanes on each
+// 32-value block (two ints each, dp4a) and eight blocks a warp pass, as TensorSharp's dense Q8_0 matvec reads a
+// row. The warp-per-block dot above gives each lane a whole 34-byte block in 16-bit loads and keeps few blocks
+// in flight: one decode row read its ten experts at ~1.5 TB/s. A slot still computes as a lone token's step
+// does, however many share the launch (its own arithmetic, not ts_dsv4_dot_row_warp's).
+__device__ __forceinline__ float ts_dsv4_dot_q8_0_row_vec(const uint8_t* wRow, const ts_dsv4_block_q8_1* act, int inDim, int lane)
+{
+    const int nBlk = inDim / 32;
+    const int q = (lane & 3) * 2;
+    float acc = 0.0f;
+    for (int b = lane >> 2; b < nBlk; b += 8)
+    {
+        const uint8_t* wb = wRow + (size_t)b * TS_DSV4_Q8_0_BLOCK_BYTES;
+        const float dw = __half2float(*reinterpret_cast<const half*>(wb));
+        const uint16_t* w16 = reinterpret_cast<const uint16_t*>(wb + 2);
+        const int w0 = (int)w16[2 * q] | ((int)w16[2 * q + 1] << 16);
+        const int w1 = (int)w16[2 * q + 2] | ((int)w16[2 * q + 3] << 16);
+        const int* aq = reinterpret_cast<const int*>(act[b].qs);
+        const int s = __dp4a(w1, aq[q + 1], __dp4a(w0, aq[q], 0));
+        acc += dw * __half2float(act[b].d) * (float)s;
+    }
+    return ts_dsv4_warp_sum(acc);
+}
+
+// grid (slots, ceil(ff / 8), 2): eight rows a block, z = 0 gate, 1 up. An expert's rows follow its residency table
+// when there is one (ts_dsv4_expert_rows), so a paged-in expert computes as a resident one.
+extern "C" __global__ void ts_dsv4_moe_gateup_decode_q80v_f32(
+    const uint8_t* __restrict__ gateW,
+    const uint8_t* __restrict__ upW,
+    const ts_dsv4_block_q8_1* __restrict__ act, // [nt] rows
+    const int32_t* __restrict__ sel,     // [nt * nUsed]
+    float* __restrict__ gateOut,         // [nt * nUsed, ff]
+    float* __restrict__ upOut,           // [nt * nUsed, ff]
+    const int ff,
+    const int inDim,
+    const long long rowBytes,
+    const int nUsed,
+    const unsigned long long* __restrict__ gateTab,
+    const unsigned long long* __restrict__ upTab)
+{
+    const int slot = blockIdx.x;
+    const int e = sel[slot];
+    act += (size_t)(slot / nUsed) * (inDim / TS_DSV4_QK8_1);
+    const int rr = blockIdx.y * 8 + threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    if (rr >= ff)
+        return;
+    const bool isUp = blockIdx.z == 1;
+    const uint8_t* wRow = (isUp ? ts_dsv4_expert_rows(upW, upTab, e, (size_t)ff * rowBytes)
+                                : ts_dsv4_expert_rows(gateW, gateTab, e, (size_t)ff * rowBytes)) + (size_t)rr * rowBytes;
+    const float dot = ts_dsv4_dot_q8_0_row_vec(wRow, act, inDim, lane);
+    if (lane == 0)
+        (isUp ? upOut : gateOut)[(size_t)slot * ff + rr] = dot;
+}
+
+// grid (slots, ceil(E / 8)).
+extern "C" __global__ void ts_dsv4_moe_down_decode_q80v_f32(
+    const uint8_t* __restrict__ downW,
+    const ts_dsv4_block_q8_1* __restrict__ act, // [nt * nUsed] rows
+    const int32_t* __restrict__ sel,
+    float* __restrict__ downOut,         // [nt * nUsed, E]
+    const int E,
+    const int ff,
+    const long long rowBytes,
+    const unsigned long long* __restrict__ downTab)
+{
+    const int slot = blockIdx.x;
+    const int e = sel[slot];
+    const int rr = blockIdx.y * 8 + threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    if (rr >= E)
+        return;
+    const float dot = ts_dsv4_dot_q8_0_row_vec(ts_dsv4_expert_rows(downW, downTab, e, (size_t)E * rowBytes) + (size_t)rr * rowBytes,
+        act + (size_t)slot * (ff / TS_DSV4_QK8_1), ff, lane);
+    if (lane == 0)
+        downOut[(size_t)slot * E + rr] = dot;
+}
+
 extern "C" __global__ void ts_dsv4_moe_down_decode_f32(
     const uint8_t* __restrict__ downW,
     const ts_dsv4_block_q8_1* __restrict__ act, // [nt * nUsed] rows
