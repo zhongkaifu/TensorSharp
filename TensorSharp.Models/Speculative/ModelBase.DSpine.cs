@@ -116,6 +116,13 @@ namespace TensorSharp.Models
         {
             if (TryDFlashQuant(name, out var qw))
             {
+                // The DSpine graph binds weights as stored; an NVFP4 scale2 sidecar (which the DFlash graphs
+                // multiply in) would be silently dropped.
+                if (qw.Scale != 1f)
+                {
+                    throw new NotSupportedException(
+                        $"DSpine drafter: {name} carries a sidecar scale ({qw.Scale}); the DSpine graph binds unscaled weights.");
+                }
                 w = new GgmlDSpineWeight(qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
                 return true;
             }
