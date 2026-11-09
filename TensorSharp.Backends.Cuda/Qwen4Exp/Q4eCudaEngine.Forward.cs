@@ -810,6 +810,34 @@ namespace TensorSharp.Cuda
             return IntPtr.Zero;
         }
 
+        /// <summary>
+        /// Whether a single sequence's <paramref name="nt"/> prompt rows take the chunked recurrence (Q4eKernels.GdnChunked)
+        /// instead of KdaScan's token-by-token walk: 128 rows or more (below that its two launches cost more than they save,
+        /// as Strata measured), three value heads a key head, and a GPU whose SMs hold every scan block in one wave
+        /// (16 key heads x 8 column tiles: 128 SMs; with fewer it runs in waves and loses). TS_Q4E_GDN_CHUNKED=0 keeps KdaScan.
+        /// </summary>
+        private bool GdnChunkedFor(Dev dev, int nt)
+            => _gdnChunked && nt >= GdnChunkedMinRows && dev.QK.HasGdnChunked && _m.GdnVHeads == 3 * _m.GdnKHeads
+               && dev.QK.GdnChunkedSms >= _m.GdnKHeads * 8;
+
+        internal const int GdnChunkedMinRows = 128;
+        private readonly bool _gdnChunked = Environment.GetEnvironmentVariable("TS_Q4E_GDN_CHUNKED") != "0";
+
+        /// <summary>The chunked recurrence's scratch on <paramref name="dev"/>, allocated on first use (~25 MB for Flash Next);
+        /// null once an allocation failed, so the prompt keeps KdaScan.</summary>
+        private Tensor GdnChunkScratch(Dev dev)
+        {
+            if (dev.GdnChunkScr != null || dev.GdnChunkUnavailable)
+                return dev.GdnChunkScr;
+            try { dev.GdnChunkScr = AllocF32(dev, Q4eKernels.GdnChunkScratchFloats(_m.GdnVHeads)); }
+            catch (Exception ex) when (ex is OutOfMemoryException or CudaException or InvalidOperationException)
+            {
+                dev.GdnChunkUnavailable = true;
+                Console.Error.WriteLine($"[q4e-cuda] the chunked prompt recurrence's scratch did not fit ({ex.Message}); prompts keep the token-by-token scan.");
+            }
+            return dev.GdnChunkScr;
+        }
+
         // TS_Q4E_COLLAPSE_Q81=0: the decode-size collapse leaves Cur's q8_1 to each half's projections (a launch of its own,
         // the same values; this is for measuring it).
         private readonly bool _collapseQ81 = Environment.GetEnvironmentVariable("TS_Q4E_COLLAPSE_Q81") != "0";
@@ -852,7 +880,15 @@ namespace TensorSharp.Cuda
                 BatchVerifySaveGdnInputs(dev, il, nt);
             // After the prep read the previous inputs.
             dev.QK.ConvUpdate(Ptr(dev.Qkv), conv, rowsPerSeq, nSeq, ConvDim, m.DConv - 1, dev.Stream);
-            dev.GK.KdaScan(Ptr(dev.Scr), ssm, Ptr(dev.Core), rowsPerSeq, nSeq, m.GdnVHeads, dev.Stream);
+            if (rows == null && !capture && GdnChunkedFor(dev, nt) && GdnChunkScratch(dev) is Tensor gs)
+            {
+                long tp = Q4eKernels.GdnChunkTPFloats(m.GdnVHeads) * 4;
+                IntPtr tm = Ptr(gs);
+                dev.QK.GdnChunked(Ptr(dev.Scr), ssm, Ptr(dev.Core), tm, (IntPtr)((long)tm + tp), (IntPtr)((long)tm + 2 * tp),
+                    nt, m.GdnKHeads, m.GdnVHeads, dev.Stream);
+            }
+            else
+                dev.GK.KdaScan(Ptr(dev.Scr), ssm, Ptr(dev.Core), rowsPerSeq, nSeq, m.GdnVHeads, dev.Stream);
             dev.GK.KdaOut(Ptr(dev.Core), Ptr(dev.Z), Ptr(L.SsmNorm), Ptr(dev.GOut), nt, m.GdnVHeads, m.RmsEps, dev.Stream);
             StageEnd(dev, StGdnCore);
             MatMulQ(dev, L.SsmOut, dev.GOut, dev.BlockOut, nt);

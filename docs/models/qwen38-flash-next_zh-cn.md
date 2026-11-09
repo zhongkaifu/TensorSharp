@@ -1173,6 +1173,26 @@ slot：lane 规划没有计入回退检查点的副本，作为引擎当前选�
 ggml_cuda 无法在 32 GB 显卡上服务该模型：decode 为 0.5-4.7 tok/s（专家从网络卷读取），四个请求同时到来会在 ggml 内部耗尽显存，
 导致进程中止；它没有 ggml_metal 那样的准入检查。
 
+#### 分块计算 prompt 的 DeltaNet 递推，2026-11-09
+
+prompt 的门控 DeltaNet 层原来逐行推进（KdaScan：每个 value 头一个 block，每个 token 对 128 x 128 的状态做一次秩一更新）。
+这占 16K prompt 的 0.49 s，而 Strata 只用 0.07 s。现在单个序列 128 行及以上的 prompt 改用 Strata 的分块形式
+（`TS_Q4E_GDN_CHUNKED`，默认开启），移植到 `tensorsharp_q4e_kernels.cu`。准备内核以 FP32 为每个 32 token 的块构建 WY
+因子（块内三角求解与门控乘积）。扫描内核随后把一个块当作两个小矩阵乘积来应用，而不是 32 次秩一更新；它以 16 个 key 头 x
+8 个列 tile 运行，每个 384 个线程，在 GPU 上一波完成，并在共享内存中跨块携带状态。每 2,048 行一个超级块，限制了 scratch
+大小（约 25 MB，在第一个长 prompt 时分配）。decode 步、验证窗口、批量步、捕获的图以及不足 128 行的 prompt 保持 KdaScan。
+全部保持 FP32，但求和顺序不同：与逐 token 扫描相比，输出相对变化 3e-7，状态每个头最多 6.2e-7（`Q4eGdnChunkedTests`，128、
+200 与 4,171 行）。扫描内核每个 block 需要 93,696 字节的 opt-in 共享内存，并需要至少 128 个 SM 的 GPU，使所有 block 一波
+完成；SM 更少时会分波运行，反而更慢。不满足条件时引擎保持 KdaScan。
+
+RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（旧扫描用 `TS_Q4E_GDN_CHUNKED=0`）。三次运行的 TTFT，第一次为
+冷启动；引擎基准的长 prompt 与长生成 needle 两组均为 6/6 通过：
+
+| prompt 递推 | 4K prompt（3,541 token） | 16K prompt（14,094 token） | 引擎基准 4K / 16K TTFT | 长生成 |
+| --- | --- | --- | --- | --- |
+| 逐 token | 1.06 / 0.79 / 0.79 s | 3.36 / 3.35 / 3.35 s | 1.00 s / 4.20-4.22 s | 239-242 tok/s |
+| 分块（默认） | 0.99 / 0.71 / 0.70 s | 3.04 / 3.02 / 3.02 s | 0.91 s / 3.79 s | 242-249 tok/s |
+
 ### ggml_metal 上的 DFlash2 草稿模型，2026-11-08
 
 Strata 在 Mac 上用 DFlash2 起草：一种块草稿模型，一次前向最多提出 7 个 token。TensorSharp 现在在 GGML 后端上也能使用同一个草稿模型：
