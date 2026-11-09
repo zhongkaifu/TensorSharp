@@ -69,7 +69,9 @@ namespace tsg
     namespace
     {
         constexpr int kMaxUsed = 64;
-        constexpr int kMaxRows = 8;
+        // 16: the direct CUDA engine's batched speculative verify (four sequences' 4-row windows in one step). The
+        // ggml callers still pass blocks of 8; a row's arithmetic does not depend on how many rows share the call.
+        constexpr int kMaxRows = 16;
         constexpr int kRowsPerChunk = 64;
         constexpr int kSlots = 4;
 
@@ -679,7 +681,7 @@ namespace tsg
     }
 }
 
-// Routed experts of up to 8 independent rows on the host, from raw expert stacks: the direct CUDA
+// Routed experts of up to 16 independent rows on the host, from raw expert stacks: the direct CUDA
 // engine's host experts (expert residency), where the stacks are pinned host copies of the experts
 // without a VRAM slot, packed in expert order (ids index the packed stacks; skip[k] != 0 leaves slot
 // k to the GPU). The same kernel, dot products and summation order as an offloaded ggml layer.

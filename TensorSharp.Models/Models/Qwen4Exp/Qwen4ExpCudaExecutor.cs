@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using TensorSharp.Cuda;
@@ -161,6 +162,9 @@ namespace TensorSharp.Models
         public bool HasMtpDraftChain => _engine.HasMtpDraftChain;
         public int MtpDraftChain(int[] tokens, float[] hPrev, int p0, int steps, int[] idsOut, float[] probsOut)
             => _engine.MtpDraftChain(tokens, hPrev, p0, steps, idsOut, probsOut);
+
+        /// <summary>Restart the active slot's MTP cache at <paramref name="position"/> (Q4eCudaEngine.MtpRestart).</summary>
+        public void MtpRestart(int position) => _engine.MtpRestart(position);
         public bool CommitVerify(int keep) => _engine.CommitVerify(keep);
         public bool RestoreVerify() => _engine.RestoreVerify();
         public void Reset() => _engine.Reset();
@@ -180,6 +184,7 @@ namespace TensorSharp.Models
         public int SlotAlloc() => _engine.SlotAlloc();
         public bool SetActiveSlot(int slot) => _engine.SetActiveSlot(slot);
         public bool SlotFree(int slot) => _engine.SlotFree(slot);
+        public int SlotFreeAllExcept(ICollection<int> keep) => _engine.SlotFreeAllExcept(keep);
         public bool SlotHead(int slot, out int head) => _engine.SlotHead(slot, out head);
         public bool ForwardBatchedDecode(int[] slots, int[] tokens, int[] positions, float[] logits)
             => _engine.ForwardBatchedDecode(slots, tokens, positions, logits);

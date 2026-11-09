@@ -78,6 +78,33 @@ __device__ __forceinline__ float q4e_block_sum(float v, float* sh)
     return total;
 }
 
+// q4e_block_sum of N values with one barrier instead of three each: every value is summed exactly as q4e_block_sum
+// sums it (its warp's butterfly, then warp 0's over the warps' totals), so the totals are bit for bit the same. Only
+// thread 0 holds them afterwards. `sh` holds N x 32 floats.
+template <int N>
+__device__ __forceinline__ void q4e_block_sums_t0(float (&v)[N], float (*sh)[32])
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int k = 0; k < N; ++k)
+        v[k] = q4e_warp_sum(v[k]);
+    if (lane == 0)
+    {
+#pragma unroll
+        for (int k = 0; k < N; ++k)
+            sh[k][warp] = v[k];
+    }
+    __syncthreads();
+    if (warp == 0)
+    {
+        const int warps = (blockDim.x + 31) >> 5;
+#pragma unroll
+        for (int k = 0; k < N; ++k)
+            v[k] = q4e_warp_sum(lane < warps ? sh[k][lane] : 0.0f);
+    }
+}
+
 // The NEOX rotation of pair (i, i + nRot/2) at `pos`, as ggml-cuda's rope_neox computes it
 // (ext_factor 0, attn_factor 1).
 __device__ __forceinline__ void q4e_rope_angle(int pos, int i, int nRot, float base, float freqScale,
@@ -185,6 +212,27 @@ __device__ __forceinline__ void q4e_quantize_block(float v, q4e_block_q8_1* dst,
 #define Q4E_HC_SLICE 256
 #define Q4E_HC_PARTIAL (1 + Q4E_HC_MAX)
 
+// A slice's partials from its value x at flat index j: the sum of squares and, with injW, the scatter-logit partials
+// sum_j x_j * normW_j * injW[c][j], all reduced with one barrier (q4e_block_sums_t0); thread 0 writes them.
+__device__ __forceinline__ void q4e_hc_partials_out(const float x, const float* __restrict__ normW,
+    const float* __restrict__ injW, const int j, const int flat, const int HC, float (*sh)[32], float* __restrict__ out)
+{
+    float part[Q4E_HC_PARTIAL];
+    part[0] = x * x;
+    const float xw = injW != nullptr ? x * normW[j] : 0.0f;
+#pragma unroll
+    for (int c = 0; c < Q4E_HC_MAX; ++c)
+        part[1 + c] = injW != nullptr && c < HC ? xw * injW[(size_t)c * flat + j] : 0.0f;
+    q4e_block_sums_t0(part, sh);
+    if (threadIdx.x == 0)
+    {
+        out[0] = part[0];
+        if (injW != nullptr)
+            for (int c = 0; c < HC; ++c)
+                out[1 + c] = part[1 + c];
+    }
+}
+
 // The decode-size mixer in two wide passes instead of one block per row. Pass 1, per (row, slice of
 // 256 values of one stream): the slice's sum of squares and its scatter-logit partials
 // sum_j x_j * normW_j * injW[c][j]. grid (HC * E / 256, rows), 256 threads.
@@ -196,26 +244,13 @@ extern "C" __global__ void ts_q4e_hc_partials_f32(
     const int E,
     const int HC)
 {
-    __shared__ float sh[32];
+    __shared__ float sh[Q4E_HC_PARTIAL][32];
     const int slice = blockIdx.x;
     const int t = blockIdx.y;
     const int flat = HC * E;
     const int j = slice * Q4E_HC_SLICE + threadIdx.x;
     const float x = xs[(size_t)t * flat + j];
-    float* out = partials + ((size_t)t * gridDim.x + slice) * Q4E_HC_PARTIAL;
-    const float ss = q4e_block_sum(x * x, sh);
-    if (threadIdx.x == 0)
-        out[0] = ss;
-    if (injW != nullptr)
-    {
-        const float xw = x * normW[j];
-        for (int c = 0; c < HC; ++c)
-        {
-            const float p = q4e_block_sum(xw * injW[(size_t)c * flat + j], sh);
-            if (threadIdx.x == 0)
-                out[1 + c] = p;
-        }
-    }
+    q4e_hc_partials_out(x, normW, injW, j, flat, HC, sh, partials + ((size_t)t * gridDim.x + slice) * Q4E_HC_PARTIAL);
 }
 
 // One half's scatter (ts_q4e_hc_post_f32: xs[t, c, i] += out[t, i] * 2 * sigmoid(inject[t, c] / HC)) fused with
@@ -231,7 +266,7 @@ extern "C" __global__ void ts_q4e_hc_post_partials_f32(
     const int E,
     const int HC)
 {
-    __shared__ float sh[32];
+    __shared__ float sh[Q4E_HC_PARTIAL][32];
     const int slice = blockIdx.x;
     const int t = blockIdx.y;
     const int flat = HC * E;
@@ -243,20 +278,7 @@ extern "C" __global__ void ts_q4e_hc_post_partials_f32(
     float x = *xp;
     x += o * w;
     *xp = x;
-    float* dst = partials + ((size_t)t * gridDim.x + slice) * Q4E_HC_PARTIAL;
-    const float ss = q4e_block_sum(x * x, sh);
-    if (threadIdx.x == 0)
-        dst[0] = ss;
-    if (injW != nullptr)
-    {
-        const float xw = x * normW[j];
-        for (int k = 0; k < HC; ++k)
-        {
-            const float p = q4e_block_sum(xw * injW[(size_t)k * flat + j], sh);
-            if (threadIdx.x == 0)
-                dst[1 + k] = p;
-        }
-    }
+    q4e_hc_partials_out(x, normW, injW, j, flat, HC, sh, partials + ((size_t)t * gridDim.x + slice) * Q4E_HC_PARTIAL);
 }
 
 // BF16 values widened to F32 (exact): a prompt's router GEMM over weights kept as the file's BF16.
@@ -358,6 +380,31 @@ extern "C" __global__ void ts_q4e_hc_collapse_f32(
     for (int c = 1; c < HC; ++c)
         m += xr[c * E + i] * q4e_sigmoid(gr[c * E + i]);
     cur[(size_t)t * E + i] = m * (1.0f / (float)HC);
+}
+
+// ts_q4e_hc_collapse_f32 that also quantizes cur to q8_1 for the projections that read it (as
+// ts_quantize_q8_1_rows_warp_f32 rounds it, a warp per 32-value block): one launch instead of two. E % 32 == 0, so a
+// warp is wholly inside or past the row. grid (ceil(E / 256), nt).
+extern "C" __global__ void ts_q4e_hc_collapse_q81_f32(
+    const float* __restrict__ xn,        // [nt, HC, E]
+    const float* __restrict__ g,         // [nt, HC, E] pre-sigmoid
+    float* __restrict__ cur,             // [nt, E]
+    q4e_block_q8_1* __restrict__ xq,     // [nt, E / 32]
+    const int E,
+    const int HC)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (i >= E)
+        return;
+    const float* xr = xn + (size_t)t * HC * E;
+    const float* gr = g + (size_t)t * HC * E;
+    float m = xr[i] * q4e_sigmoid(gr[i]);
+    for (int c = 1; c < HC; ++c)
+        m += xr[c * E + i] * q4e_sigmoid(gr[c * E + i]);
+    const float v = m * (1.0f / (float)HC);
+    cur[(size_t)t * E + i] = v;
+    q4e_quantize_block(v, xq + (size_t)t * (E / 32) + i / 32, threadIdx.x & 31);
 }
 
 // xs[t, c, i] += out[t, i] * 2 * sigmoid(inject[t, c] / HC). grid (ceil(E / 256), nt).
@@ -507,6 +554,46 @@ extern "C" __global__ void ts_q4e_conv_update_f32(
 #define Q4E_KV_Q8_BLOCK 32
 
 // One warp holds one 32-value block (threads 32w .. 32w + 31 of the head's 256).
+// KV streaming (TS_Q4E_KV_RESIDENT): a streamed layer keeps its authoritative Q8_0 K/V in pinned, device-mapped host
+// memory in the usual [nCtx, NKV, HD] layout and only a window of pages in VRAM. A page is Q4E_KV_PAGE consecutive cells
+// (all KV heads); the page table maps a page to the VRAM slot holding it (-1: not resident). Readers go through the
+// table (PAGED); ts_q4e_kv_resolve makes every page a call reads resident before it reads them.
+#define Q4E_KV_PAGE 4
+
+// The VRAM row holding cell c: the identity, or through the page table.
+template <bool PAGED>
+__device__ __forceinline__ int q4e_kv_row(const int32_t* __restrict__ table, const int c)
+{
+    if constexpr (PAGED)
+        return table[c / Q4E_KV_PAGE] * Q4E_KV_PAGE + c % Q4E_KV_PAGE;
+    else
+        return c;
+}
+
+// q4e_store_kv_q8's value at two places: its VRAM row (vramOk) and the host copy.
+__device__ __forceinline__ void q4e_store_kv_q8_2(signed char* __restrict__ codes, half* __restrict__ scales,
+    const size_t at, const bool vramOk, signed char* __restrict__ hostCodes, half* __restrict__ hostScales,
+    const size_t hostAt, const float x)
+{
+    float amax = fabsf(x);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float dq = amax / 127.0f;
+    const float id = dq != 0.0f ? 1.0f / dq : 0.0f;
+    const signed char q = (signed char)(int)roundf(x * id);
+    const half hs = __float2half(dq);
+    if (vramOk)
+    {
+        codes[at] = q;
+        if ((threadIdx.x & 31) == 0)
+            scales[at / Q4E_KV_Q8_BLOCK] = hs;
+    }
+    hostCodes[hostAt] = q;
+    if ((threadIdx.x & 31) == 0)
+        hostScales[hostAt / Q4E_KV_Q8_BLOCK] = hs;
+}
+
 __device__ __forceinline__ void q4e_store_kv_q8(signed char* __restrict__ codes, half* __restrict__ scales,
     const size_t at, const float x)
 {
@@ -525,7 +612,7 @@ __device__ __forceinline__ void q4e_store_kv_q8(signed char* __restrict__ codes,
 // interleaved q|gate projection; the KV heads' norm and rotary, stored with the values into the
 // caches at the row's position. Rows sit at p0, p0 + 1, ... or at positions[row].
 // grid (NH + NKV, nt), Q4E_ATTN_HD threads.
-template <bool Q8>
+template <bool Q8, bool PAGED = false>
 __device__ __forceinline__ void q4e_attn_prep(
     const float* __restrict__ qg,        // [nt, NH, 2, HD]
     const float* __restrict__ k,         // [nt, NKV, HD]
@@ -545,7 +632,12 @@ __device__ __forceinline__ void q4e_attn_prep(
     const int nRot,
     const float base,
     const float freqScale,
-    const float eps)
+    const float eps,
+    const int32_t* __restrict__ table = nullptr,     // PAGED: page -> VRAM slot, -1 not resident
+    signed char* __restrict__ hostK = nullptr,       // PAGED: the host copies, [nCtx, NKV, HD] and their scales
+    signed char* __restrict__ hostV = nullptr,
+    half* __restrict__ hostKScale = nullptr,
+    half* __restrict__ hostVScale = nullptr)
 {
     __shared__ float sh[32];
     __shared__ float row[Q4E_ATTN_HD];
@@ -581,6 +673,17 @@ __device__ __forceinline__ void q4e_attn_prep(
     if (isQ)
     {
         q[((size_t)t * NH + head) * Q4E_ATTN_HD + d] = x;
+    }
+    else if constexpr (PAGED)
+    {
+        // The host copy always; the VRAM slot when the cell's page is resident (a page that is not gets the cell from
+        // the host copy when a read makes it resident).
+        const int slot = table[pos / Q4E_KV_PAGE];
+        const size_t hostAt = ((size_t)pos * NKV + kvh) * Q4E_ATTN_HD + d;
+        const size_t at = ((size_t)(slot < 0 ? 0 : slot * Q4E_KV_PAGE + pos % Q4E_KV_PAGE) * NKV + kvh) * Q4E_ATTN_HD + d;
+        const float vx = v[((size_t)t * NKV + kvh) * Q4E_ATTN_HD + d];
+        q4e_store_kv_q8_2(static_cast<signed char*>(kCache), kScale, at, slot >= 0, hostK, hostKScale, hostAt, x);
+        q4e_store_kv_q8_2(static_cast<signed char*>(vCache), vScale, at, slot >= 0, hostV, hostVScale, hostAt, vx);
     }
     else
     {
@@ -660,6 +763,20 @@ extern "C" __global__ void ts_q4e_attn_prep_q8_f32(
         p0, NH, NKV, nRot, base, freqScale, eps);
 }
 
+// ts_q4e_attn_prep_q8_f32 for a streamed layer: K/V into the host copy, and into the VRAM slot of a resident page.
+extern "C" __global__ void ts_q4e_attn_prep_q8_paged_f32(
+    const float* __restrict__ qg, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ qNorm, const float* __restrict__ kNorm, float* __restrict__ q, float* __restrict__ gate,
+    signed char* __restrict__ kCache, signed char* __restrict__ vCache, half* __restrict__ kScale, half* __restrict__ vScale,
+    const int32_t* __restrict__ positions,
+    const int p0, const int NH, const int NKV, const int nRot, const float base, const float freqScale, const float eps,
+    const int32_t* __restrict__ table, signed char* __restrict__ hostK, signed char* __restrict__ hostV,
+    half* __restrict__ hostKScale, half* __restrict__ hostVScale)
+{
+    q4e_attn_prep<true, true>(qg, k, v, qNorm, kNorm, q, gate, kCache, vCache, kScale, vScale, positions,
+        p0, NH, NKV, nRot, base, freqScale, eps, table, hostK, hostV, hostKScale, hostVScale);
+}
+
 // One lane's 8 consecutive values of a cached K or V row (at = its first element).
 template <bool Q8>
 __device__ __forceinline__ void q4e_load_kv8(const void* __restrict__ cache, const half* __restrict__ scale,
@@ -690,7 +807,7 @@ __device__ __forceinline__ void q4e_load_kv8(const void* __restrict__ cache, con
 // Online-softmax attention of one query head over its KV head's cells, then the sigmoid gate.
 // The cells are 0..p (cellCnt null or cellCnt[t] < 0) or the cellCnt[t] listed in cells.
 // grid (NH, nt), 256 threads = 8 warps splitting the cells; lane owns 8 of the 256 dims.
-template <bool Q8>
+template <bool Q8, bool PAGED = false>
 __device__ __forceinline__ void q4e_attention(
     const float* __restrict__ q,         // [nt, NH, HD]
     const void* __restrict__ kCache,     // [nCtx, NKV, HD] F16 or int8 codes
@@ -706,7 +823,8 @@ __device__ __forceinline__ void q4e_attention(
     const int NH,
     const int NKV,
     const float scale,
-    const int cellStride)
+    const int cellStride,
+    const int32_t* __restrict__ table = nullptr)   // PAGED: page -> VRAM slot
 {
     const int h = blockIdx.x;
     const int t = blockIdx.y;
@@ -733,7 +851,7 @@ __device__ __forceinline__ void q4e_attention(
         acc[i] = 0.0f;
     for (int i = warp; i < n; i += 8)
     {
-        const int c = list != nullptr ? list[i] : i;
+        const int c = q4e_kv_row<PAGED>(table, list != nullptr ? list[i] : i);
         const size_t at = ((size_t)c * NKV + kvh) * Q4E_ATTN_HD + lane * 8;
         float kf[8], vf[8];
         q4e_load_kv8<Q8>(kCache, kScale, at, kf);
@@ -910,6 +1028,18 @@ extern "C" __global__ void ts_q4e_attention_q8_f32(
         p0, NH, NKV, scale, cellStride);
 }
 
+// ts_q4e_attention_q8_f32 of a streamed layer: every cell read through the page table.
+extern "C" __global__ void ts_q4e_attention_q8_paged_f32(
+    const float* __restrict__ q, const signed char* __restrict__ kCache, const signed char* __restrict__ vCache,
+    const half* __restrict__ kScale, const half* __restrict__ vScale,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int p0, const int NH, const int NKV, const float scale, const int cellStride, const int32_t* __restrict__ table)
+{
+    q4e_attention<true, true>(q, kCache, vCache, kScale, vScale, gate, cells, cellCnt, out, positions,
+        p0, NH, NKV, scale, cellStride, table);
+}
+
 // Decode-size attention split over the cells (flash decoding): grid (NH, nt, S). One block per (head, row) leaves
 // all but 24 x rows SMs idle and walks up to the QSA width's 2,051 cells (or a dense row's whole context) one
 // dependent load after another: 0.2 ms a layer at 4K context, 0.4 ms at 16K, for 4 rows. A row of more than
@@ -920,7 +1050,7 @@ extern "C" __global__ void ts_q4e_attention_q8_f32(
 // so short contexts answer bit for bit as before. The split depends on the row's cell count alone, never on how
 // many rows the call holds: a verify window's row computes what that row's own decode step computes.
 #define Q4E_ATTN_SPLIT_MIN 256
-template <bool Q8>
+template <bool Q8, bool PAGED = false>
 __device__ __forceinline__ void q4e_attention_split(
     const float* __restrict__ q, const void* __restrict__ kCache, const void* __restrict__ vCache,
     const half* __restrict__ kScale, const half* __restrict__ vScale,
@@ -928,7 +1058,8 @@ __device__ __forceinline__ void q4e_attention_split(
     float* __restrict__ out, const int32_t* __restrict__ positions,
     const int p0, const int NH, const int NKV, const float scale, const int cellStride,
     float* __restrict__ part,   // [nt, NH, S, 2 + HD]: max, sum, unnormalized output
-    int* __restrict__ arrive)   // [nt, NH], zero between calls
+    int* __restrict__ arrive,   // [nt, NH], zero between calls
+    const int32_t* __restrict__ table = nullptr)   // PAGED: page -> VRAM slot
 {
     const int h = blockIdx.x;
     const int t = blockIdx.y;
@@ -967,7 +1098,7 @@ __device__ __forceinline__ void q4e_attention_split(
         acc[i] = 0.0f;
     for (int i = begin + warp; i < end; i += 8)
     {
-        const int c = list != nullptr ? list[i] : i;
+        const int c = q4e_kv_row<PAGED>(table, list != nullptr ? list[i] : i);
         const size_t at = ((size_t)c * NKV + kvh) * Q4E_ATTN_HD + lane * 8;
         float kf[8], vf[8];
         q4e_load_kv8<Q8>(kCache, kScale, at, kf);
@@ -1098,6 +1229,215 @@ extern "C" __global__ void ts_q4e_attention_split_q8_f32(
 {
     q4e_attention_split<true>(q, kCache, vCache, kScale, vScale, gate, cells, cellCnt, out, positions,
         p0, NH, NKV, scale, cellStride, part, arrive);
+}
+
+// ts_q4e_attention_split_q8_f32 of a streamed layer: every cell read through the page table.
+extern "C" __global__ void ts_q4e_attention_split_q8_paged_f32(
+    const float* __restrict__ q, const signed char* __restrict__ kCache, const signed char* __restrict__ vCache,
+    const half* __restrict__ kScale, const half* __restrict__ vScale,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions,
+    const int p0, const int NH, const int NKV, const float scale, const int cellStride,
+    float* __restrict__ part, int* __restrict__ arrive, const int32_t* __restrict__ table)
+{
+    q4e_attention_split<true, true>(q, kCache, vCache, kScale, vScale, gate, cells, cellCnt, out, positions,
+        p0, NH, NKV, scale, cellStride, part, arrive, table);
+}
+
+// ---- KV streaming: residency of a streamed layer's pages ----
+// Control words of a layer's page map (ctl): [0] the epoch of the last resolve, [1] the eviction hand, [2] the pages
+// the last resolve missed (what ts_q4e_kv_page_copy copies), [3] calls that could not place every page (overflow),
+// [4] misses and [5] calls, running totals (wrapping).
+#define Q4E_KV_CTL 8
+
+// Makes every page the call's rows read resident, inside a captured step: one block of 1,024 threads. A row reads its
+// listed cells (cells / cellCnt[t] >= 0: the QSA selection) or cells 0..p. A resident page gets this call's epoch
+// (slotStamp), a missing one is claimed once (table -1 -> -2) into the miss list; then each miss takes a slot no page of
+// this call uses, sweeping from the hand (round robin), the slot's old page leaving the table. The page data follow in
+// ts_q4e_kv_page_copy. The host keeps the window at least one call's pages (TS_Q4E_KV_RESIDENT's floor), so a call never
+// runs out of slots; if it did, its unplaced pages would point at slot 0 and ctl[3] would count it.
+extern "C" __global__ void __launch_bounds__(1024) ts_q4e_kv_resolve(
+    const int32_t* __restrict__ cells,
+    const int32_t* __restrict__ cellCnt,
+    const int32_t* __restrict__ positions,
+    const int p0,
+    const int nt,
+    const int cellStride,
+    int32_t* __restrict__ table,         // [nPages]
+    int32_t* __restrict__ slotPage,      // [nSlots]
+    int32_t* __restrict__ slotStamp,     // [nSlots]
+    int32_t* __restrict__ ctl,           // [Q4E_KV_CTL]
+    int32_t* __restrict__ missPage,      // [maxMiss]
+    int32_t* __restrict__ missSlot,      // [maxMiss]
+    const int nSlots,
+    const int maxMiss)
+{
+    __shared__ int shEpoch, shMiss, shHand, shTaken, shLast;
+    __shared__ int warpCnt[32];
+    if (threadIdx.x == 0)
+    {
+        shEpoch = ctl[0] + 1;
+        shHand = ctl[1];
+        shMiss = 0;
+        shTaken = 0;
+        shLast = -1;
+    }
+    __syncthreads();
+    const int epoch = shEpoch;
+    for (int t = 0; t < nt; ++t)
+    {
+        const int p = positions != nullptr ? positions[t] : p0 + t;
+        const bool listed = cells != nullptr && cellCnt[t] >= 0;
+        const int32_t* list = listed ? cells + (size_t)t * cellStride : nullptr;
+        const int n = listed ? cellCnt[t] : p / Q4E_KV_PAGE + 1;   // listed: cells; dense: pages 0..p
+        for (int i = threadIdx.x; i < n; i += blockDim.x)
+        {
+            const int pg = listed ? list[i] / Q4E_KV_PAGE : i;
+            const int s = ((volatile int32_t*)table)[pg];
+            if (s >= 0)
+                slotStamp[s] = epoch;
+            else if (s == -1 && atomicCAS(&table[pg], -1, -2) == -1)
+            {
+                const int k = atomicAdd(&shMiss, 1);
+                if (k < maxMiss)
+                    missPage[k] = pg;
+            }
+        }
+    }
+    __syncthreads();
+    const int nMiss = min(shMiss, maxMiss);
+    // Victims: slots this call does not use, in round-robin order from the hand; a block-wide ballot scan assigns them
+    // to the misses in order.
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    const int hand = shHand;
+    for (int sweep = 0; sweep < nSlots && shTaken < nMiss; sweep += blockDim.x)
+    {
+        const int off = sweep + threadIdx.x;
+        const int s = (hand + off) % nSlots;
+        const bool elig = off < nSlots && slotStamp[s] != epoch;
+        const unsigned int ballot = __ballot_sync(0xffffffffu, elig);
+        if (lane == 0)
+            warpCnt[warp] = __popc(ballot);
+        __syncthreads();
+        int rank = shTaken + __popc(ballot & ((1u << lane) - 1u));
+        for (int w = 0; w < warp; ++w)
+            rank += warpCnt[w];
+        if (elig && rank < nMiss)
+        {
+            const int pg = missPage[rank];
+            const int old = slotPage[s];
+            if (old >= 0)
+                table[old] = -1;
+            slotPage[s] = pg;
+            slotStamp[s] = epoch;
+            table[pg] = s;
+            missSlot[rank] = s;
+            if (rank == nMiss - 1)
+                shLast = off;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            int total = 0;
+            for (int w = 0; w < warps; ++w)
+                total += warpCnt[w];
+            shTaken += total;
+        }
+        __syncthreads();
+    }
+    // Pages no slot took (never, with the window's floor): read slot 0 rather than out of bounds, and counted.
+    const int placed = min(shTaken, nMiss);
+    for (int k = placed + threadIdx.x; k < nMiss; k += blockDim.x)
+    {
+        table[missPage[k]] = 0;
+        missSlot[k] = -1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        ctl[0] = epoch;
+        if (shLast >= 0)
+            ctl[1] = (hand + shLast + 1) % nSlots;
+        ctl[2] = nMiss;
+        if (placed < nMiss || shMiss > maxMiss)
+            ctl[3] += 1;
+        ctl[4] += shMiss;
+        ctl[5] += 1;
+    }
+}
+
+// The pages the last resolve placed (ctl[2] of them), copied from the host copy into their VRAM slots: Q8_0 codes and
+// scales of K and V, all KV heads of the page's cells. Any grid; 16-byte units (a page's codes are 4 x NKV x 256 bytes,
+// its scales 4 x NKV x 8 halves).
+extern "C" __global__ void ts_q4e_kv_page_copy(
+    const int32_t* __restrict__ ctl,
+    const int32_t* __restrict__ missPage,
+    const int32_t* __restrict__ missSlot,
+    const signed char* __restrict__ hostK,
+    const signed char* __restrict__ hostV,
+    const half* __restrict__ hostKScale,
+    const half* __restrict__ hostVScale,
+    signed char* __restrict__ kCache,
+    signed char* __restrict__ vCache,
+    half* __restrict__ kScale,
+    half* __restrict__ vScale,
+    const int NKV)
+{
+    const int n = ctl[2];
+    const int codes16 = Q4E_KV_PAGE * NKV * Q4E_ATTN_HD / 16;
+    const int scales16 = Q4E_KV_PAGE * NKV * (Q4E_ATTN_HD / Q4E_KV_Q8_BLOCK) * 2 / 16;
+    const int per = 2 * codes16 + 2 * scales16;
+    for (int m = blockIdx.x; m < n; m += gridDim.x)
+    {
+        const int slot = missSlot[m];
+        if (slot < 0)
+            continue;
+        const size_t src = (size_t)missPage[m], dst = (size_t)slot;
+        for (int i = threadIdx.x; i < per; i += blockDim.x)
+        {
+            const int4* from;
+            int4* to;
+            int j = i;
+            if (j < codes16)
+            {
+                from = reinterpret_cast<const int4*>(hostK) + src * codes16 + j;
+                to = reinterpret_cast<int4*>(kCache) + dst * codes16 + j;
+            }
+            else if ((j -= codes16) < codes16)
+            {
+                from = reinterpret_cast<const int4*>(hostV) + src * codes16 + j;
+                to = reinterpret_cast<int4*>(vCache) + dst * codes16 + j;
+            }
+            else if ((j -= codes16) < scales16)
+            {
+                from = reinterpret_cast<const int4*>(hostKScale) + src * scales16 + j;
+                to = reinterpret_cast<int4*>(kScale) + dst * scales16 + j;
+            }
+            else
+            {
+                j -= scales16;
+                from = reinterpret_cast<const int4*>(hostVScale) + src * scales16 + j;
+                to = reinterpret_cast<int4*>(vScale) + dst * scales16 + j;
+            }
+            *to = *from;
+        }
+    }
+}
+
+// Pages [first, first + count) leave the window (their cells were rewritten through another path: a prompt's staging).
+extern "C" __global__ void ts_q4e_kv_invalidate(int32_t* __restrict__ table, int32_t* __restrict__ slotPage,
+    const int first, const int count)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x)
+    {
+        const int pg = first + i;
+        const int s = table[pg];
+        if (s >= 0)
+        {
+            slotPage[s] = -1;
+            table[pg] = -1;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1426,6 +1766,22 @@ extern "C" __global__ void ts_q4e_qsa_store_f32(
         cache[(size_t)pos * D + d] = __float2half(raw[(size_t)t * D + d]);
 }
 
+// ts_q4e_qsa_store_f32 into a ring of `ring` cells (cell p at row p % ring): only a block's members are ever read back
+// (ts_q4e_qsa_pool_ring_f32), the latest of them at most a prompt ubatch before the block completes.
+extern "C" __global__ void ts_q4e_qsa_store_ring_f32(
+    const float* __restrict__ raw,       // [nt, D]
+    half* __restrict__ cache,            // [ring, D]
+    const int32_t* __restrict__ positions,
+    const int p0,
+    const int D,
+    const int ring)
+{
+    const int t = blockIdx.x;
+    const int pos = positions != nullptr ? positions[t] : p0 + t;
+    for (int d = threadIdx.x; d < D; d += blockDim.x)
+        cache[(size_t)(pos % ring) * D + d] = __float2half(raw[(size_t)t * D + d]);
+}
+
 // The keys of blocks [first, first + count): the mean of their R cached raw keys (read back
 // through the cache's F16), RMS-normed times kNorm and rotated to the block's first position.
 // grid count, D threads. With positions (a captured decode step, one row), the block the row at
@@ -1460,6 +1816,59 @@ extern "C" __global__ void ts_q4e_qsa_pool_f32(
         x = __half2float(cache[(size_t)b * R * D + d]);
         for (int r = 1; r < R; ++r)
             x += __half2float(cache[((size_t)b * R + r) * D + d]);
+        x *= 1.0f / (float)R;
+    }
+    const float ss = q4e_block_sum(x * x, sh);
+    if (d < D)
+    {
+        x = x * rsqrtf(ss / (float)D + eps) * kNorm[d];
+        row[d] = x;
+    }
+    __syncthreads();
+    if (d < nRot)
+    {
+        const int half = nRot / 2;
+        const int i = d < half ? d : d - half;
+        float c, s;
+        q4e_rope_angle(b * R, i, nRot, base, freqScale, &c, &s);
+        x = d < half ? row[d] * c - row[d + half] * s : row[d - half] * s + row[d] * c;
+    }
+    if (d < D)
+        pooled[(size_t)b * D + d] = x;
+}
+
+// ts_q4e_qsa_pool_f32 over the raw keys' ring (ts_q4e_qsa_store_ring_f32).
+extern "C" __global__ void ts_q4e_qsa_pool_ring_f32(
+    const half* __restrict__ cache,      // [ring, D]
+    const float* __restrict__ kNorm,     // [D]
+    float* __restrict__ pooled,          // [nCtx / R, D]
+    const int32_t* __restrict__ positions,
+    const int first,
+    const int R,
+    const int D,
+    const int nRot,
+    const float base,
+    const float freqScale,
+    const float eps,
+    const int ring)
+{
+    __shared__ float sh[32];
+    __shared__ float row[512];
+    int b = first + blockIdx.x;
+    if (positions != nullptr)
+    {
+        const int p = positions[0];
+        if ((p + 1) % R != 0)
+            return;
+        b = p / R;
+    }
+    const int d = threadIdx.x;
+    float x = 0.0f;
+    if (d < D)
+    {
+        x = __half2float(cache[(size_t)((b * R) % ring) * D + d]);
+        for (int r = 1; r < R; ++r)
+            x += __half2float(cache[(size_t)((b * R + r) % ring) * D + d]);
         x *= 1.0f / (float)R;
     }
     const float ss = q4e_block_sum(x * x, sh);
@@ -1606,6 +2015,7 @@ extern "C" __global__ void ts_q4e_qsa_select_i32(
     __shared__ unsigned int hist[256];
     __shared__ unsigned int shPrefix;
     __shared__ int shNeed;
+    __shared__ int scanWarp[8];
     if (threadIdx.x == 0)
     {
         shPrefix = 0;
@@ -1627,22 +2037,37 @@ extern "C" __global__ void ts_q4e_qsa_select_i32(
             atomicAdd(&hist[(key >> shift) & 0xFF], 1u);
         }
         __syncthreads();
-        if (threadIdx.x == 0)
+        // The bin a walk from bin 255 down would stop at - the first whose count reaches the need left, the need then
+        // dropping by the bins above it - as a block-wide scan (thread i holds bin 255 - i) instead of 256 serial steps
+        // on one thread. No bin reaching it ends the walk at bin 0 with every count taken off, as the walk did.
         {
-            int n = shNeed;
-            unsigned int bin = 0;
-            for (int b2 = 255; b2 >= 0; --b2)
+            const int i = threadIdx.x;
+            const int c = (int)hist[255 - i];
+            int incl = c;
+#pragma unroll
+            for (int off = 1; off < 32; off <<= 1)
             {
-                const int c = (int)hist[b2];
-                if (c >= n)
-                {
-                    bin = (unsigned int)b2;
-                    break;
-                }
-                n -= c;
+                const int o = __shfl_up_sync(0xFFFFFFFFu, incl, off);
+                if ((i & 31) >= off)
+                    incl += o;
             }
-            shNeed = n;
-            shPrefix = (shPrefix << 8) | bin;
+            if ((i & 31) == 31)
+                scanWarp[i >> 5] = incl;
+            const int n = shNeed;
+            __syncthreads();
+            for (int w = 0; w < (i >> 5); ++w)
+                incl += scanWarp[w];
+            const int excl = incl - c;
+            if (incl >= n && excl < n)
+            {
+                shNeed = n - excl;
+                shPrefix = (shPrefix << 8) | (unsigned int)(255 - i);
+            }
+            else if (i == 255 && incl < n)
+            {
+                shNeed = n - incl;
+                shPrefix = shPrefix << 8;
+            }
         }
         __syncthreads();
     }

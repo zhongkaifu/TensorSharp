@@ -177,6 +177,9 @@ namespace TensorSharp.Cuda
             public Tensor HcPartials;
             /// <summary>A decode-size input quantized once for its projections (QuantizeShared).</summary>
             public Tensor SharedQ81;
+            /// <summary>The mixer's output Cur quantized by its collapse (HcCollapseQ81) for the half's projections; its
+            /// own buffer, so the shared expert's stream and the routed experts both read it while SharedQ81 is reused.</summary>
+            public Tensor CurQ81;
             public Tensor GemvScratch;
             // Gated DeltaNet
             public Tensor Qkv, Z, Alpha, Beta, Scr, Core, GOut;
@@ -204,6 +207,12 @@ namespace TensorSharp.Cuda
             public Tensor BatchStatePtrs;
             public IntPtr BatchStatePinned;
 
+            /// <summary>The resident KV window's prompt staging pool (one layer's K/V at the full context), and the layer and
+            /// slot whose cells [0, KvStagedEnd) it holds.</summary>
+            public Tensor KvStageK, KvStageV, KvStageKs, KvStageVs;
+            public SlotLayer KvStagedFor;
+            public int KvStagedEnd;
+
             public IntPtr Stream => Alloc.Stream.Handle;
             public void MakeCurrent() => Alloc.Context.MakeCurrent();
         }
@@ -227,9 +236,12 @@ namespace TensorSharp.Cuda
             public Tensor PleHist;
             public readonly Qwen4ExpPleHistory PleTokens = new Qwen4ExpPleHistory();
             public readonly List<Tensor> Owned = new List<Tensor>();
-            /// <summary>The MTP block's KV (allocated on the slot's first draft), and the positions it holds.</summary>
+            /// <summary>The streamed layers' K/V host copies the slot holds (returned to the pool when it is freed).</summary>
+            public readonly List<KvHostSet> KvHostSets = new List<KvHostSet>();
+            /// <summary>The MTP block's KV (allocated on the slot's first draft), and the positions it holds: from its restart
+            /// (cache row 0, <see cref="MtpRestart"/>) to MtpPast.</summary>
             public SlotLayer Mtp;
-            public int MtpPast;
+            public int MtpPast, MtpStart;
 
             // The rewind checkpoint: the recurrent states as they stood at the end of the last
             // multi-token forward (a prompt boundary), at CpNPast, or -1 for none. Decode steps leave
@@ -247,9 +259,16 @@ namespace TensorSharp.Cuda
             public Tensor ConvState, Ssm;                    // Gated DeltaNet
             public Tensor KCache, VCache, IdxRaw, IdxPooled; // attention, QSA
             public Tensor KScale, VScale;                    // Q8_0 KV: one F16 scale per 32 cached values
+            /// <summary>A streamed layer's page map and host copy (TS_Q4E_KV_RESIDENT): KCache..VScale then hold the
+            /// window's slots; null when the layer's K/V is resident.</summary>
+            public KvStream Kv;
+            /// <summary>Cells IdxRaw holds as a ring (a streamed layer), or 0 (every cell).</summary>
+            public int IdxRing;
         }
 
         private readonly ModelDesc _m;
+        /// <summary>Sequences the residency plan leaves VRAM for (TS_Q4E_LANES).</summary>
+        private int _lanes = 1;
         private readonly Dev[] _devs;
         private readonly DevLayer[] _layers;
         private readonly int _lastDev;
@@ -385,15 +404,48 @@ namespace TensorSharp.Cuda
 
             // ---- expert residency: one GPU that cannot hold every routed expert keeps the hottest in
             // VRAM slots and reads the rest from pinned host memory (Residency.cs) ----
-            long nonExpertBytes = 0;
-            for (int il = 0; il < m.NLayer; il++)
+            long NonExpertBytes()
             {
-                foreach (var w in LayerWeights(m.Layers[il], experts: false))
-                    nonExpertBytes += CudaWeightArena.Align(w.TotalBytes);
-                nonExpertBytes += LayerFloatBytes(m.Layers[il]) + LayerCacheBytes(il);
+                long b = 0;
+                for (int il = 0; il < m.NLayer; il++)
+                {
+                    foreach (var w in LayerWeights(m.Layers[il], experts: false))
+                        b += CudaWeightArena.Align(w.TotalBytes);
+                    b += LayerFloatBytes(m.Layers[il]) + LayerCacheBytes(il);
+                }
+                // The MTP block stays whole in VRAM (its experts included), with one sequence's draft KV and its scratch.
+                return b + MtpDeviceBytes();
             }
-            // The MTP block stays whole in VRAM (its experts included), with one sequence's draft KV and its scratch.
-            nonExpertBytes += MtpDeviceBytes();
+            // The resident KV window (TS_Q4E_KV_RESIDENT) is decided against the caches at the full context: by default it
+            // streams only when the experts would not fit whole beside them.
+            _kvWindow = 0;
+            long nonExpertBytes = NonExpertBytes();
+            PlanKvWindow(ExpertsFitWhole(useDevs, nonExpertBytes));
+            if (_kvWindow > 0)
+                nonExpertBytes = NonExpertBytes();
+            // TS_Q4E_LANES: sequences the plan leaves VRAM for (their caches and draft KV) beside the first, so concurrent
+            // requests get slots of their own instead of waiting for the first (expert slots pay for them).
+            _lanes = Math.Clamp(EnvInt("TS_Q4E_LANES", 1), 1, MaxBatchedDecodeRows);
+            if (_lanes > 1)
+            {
+                long slotBytes = 0;
+                for (int il = 0; il < m.NLayer; il++)
+                    slotBytes += LayerCacheBytes(il);
+                if (m.Mtp != null)
+                    slotBytes += 2 * KvCacheBytes();
+                // Each slot also takes allocator rounding, its captured graphs and what the runtime allocates beside the
+                // plan; a slot is admitted only with SlotReserveBytes still free after it (SlotFits). At 256 MiB the fourth
+                // of four slots on the RTX 5090 was refused 266-292 MiB short.
+                slotBytes += 512L << 20;
+                // With the MTP head the lanes verify their drafts together: the batched verify's window buffers and one
+                // set of saves a lane (BatchedVerify.cs).
+                // (Placement has not run: the batched verify needs one GPU, so device 0 is the last.)
+                long verifyBytes = m.Mtp != null && _devs.Length == 1 && _devs[0].QK.HasArgmaxRows ? BatchVerifyBytes(_lanes) : 0;
+                nonExpertBytes += (_lanes - 1) * slotBytes + SlotReserveBytes + verifyBytes;
+                Console.Error.WriteLine($"[q4e-cuda] {_lanes} sequence lanes: {((_lanes - 1) * slotBytes + SlotReserveBytes + verifyBytes) / 1073741824.0:F2} GiB "
+                    + $"of VRAM kept for the {_lanes - 1} beside the first ({slotBytes / 1048576.0:F0} MiB each"
+                    + (verifyBytes > 0 ? $", {verifyBytes / 1048576.0:F0} MiB for their batched verify" : "") + ", TS_Q4E_LANES).");
+            }
             _residency = PlanResidency(useDevs, nonExpertBytes);
 
             // ---- placement: contiguous runs of layers, each device filled to the same share of
@@ -468,6 +520,7 @@ namespace TensorSharp.Cuda
             ReportResidency();
             StartHostExperts();
             _active = CreateSlot();
+            PrewarmKvHostPool(_lanes);
             _slots[_active.Id] = _active;
             CountSlot(_active, +1);
             CachePrefillWeights();
@@ -476,8 +529,9 @@ namespace TensorSharp.Cuda
             // the whole context.
             _slotInitialBytes = (long[])_active.DeviceBytes.Clone();
             _slotGrowBytes = new long[useDevs];
+            // A streamed layer (TS_Q4E_KV_RESIDENT) never grows: its window and host copy cover the context.
             for (int il = 0; il < m.NLayer; il++)
-                if (!_layers[il].Recurrent)
+                if (!_layers[il].Recurrent && !KvStreamed(il))
                     _slotGrowBytes[_layers[il].Device] += AttentionCacheBytes(_layers[il], m.NCtx)
                         - AttentionCacheBytes(_layers[il], _active.Capacity);
             Console.Error.WriteLine($"[q4e-cuda] sequence slots start at {_active.Capacity} tokens and grow to {m.NCtx}");
@@ -535,38 +589,46 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>One attention layer's K (or V) cache of one sequence at the full context, scales included.</summary>
-        private long KvCacheBytes()
+        private long KvCacheBytes() => KvCacheBytes(_m.NCtx);
+
+        /// <summary>One attention layer's K (or V) cache of <paramref name="cells"/> cells, scales included.</summary>
+        private long KvCacheBytes(long cells)
         {
-            long values = (long)_m.NCtx * _m.NKvHead * _m.HeadDim;
+            long values = cells * _m.NKvHead * _m.HeadDim;
             return _m.KvQ8 ? values + values / Q4eKernels.KvQ8Block * 2 : values * 2;
         }
 
-        /// <summary>One sequence's cache bytes for a layer at the full context.</summary>
-        /// <summary>An attention layer's K/V and QSA key caches for <paramref name="tokens"/> positions.</summary>
+        /// <summary>An attention layer's K/V (Q8_0 codes and scales, or F16) and QSA key caches for <paramref name="tokens"/>
+        /// positions, as AllocAttentionCaches allocates them.</summary>
         private long AttentionCacheBytes(DevLayer L, int tokens)
         {
             var m = _m;
-            long b = (long)tokens * m.NKvHead * m.HeadDim * 2 * 2;
+            long b = 2 * KvCacheBytes(tokens);
             if (L.Ratio > 0)
                 b += (long)tokens * m.IdxDim * 2 + (long)(tokens / L.Ratio) * m.IdxDim * 4;
             return b;
         }
 
+        /// <summary>One sequence's cache bytes for a layer at the full context.</summary>
         private long LayerCacheBytes(int il)
         {
             var m = _m;
             var L = m.Layers[il];
             long b = 0;
+            // The rewind checkpoint (TS_Q4E_REWIND_CHECKPOINT) keeps a second copy of each recurrent state and the PLE history.
+            int copies = _rewindCheckpoint ? 2 : 1;
             if (L.Recurrent)
-                b += (long)(m.DConv - 1) * ConvDim * 4 + (long)m.GdnVHeads * Q4eKernels.GdnHeadDim * Q4eKernels.GdnHeadDim * 4;
+                b += copies * ((long)(m.DConv - 1) * ConvDim * 4 + (long)m.GdnVHeads * Q4eKernels.GdnHeadDim * Q4eKernels.GdnHeadDim * 4);
             else
             {
-                b += 2 * KvCacheBytes();
+                // A streamed layer (TS_Q4E_KV_RESIDENT): the window, its map and the raw keys' ring.
+                bool streamed = KvStreamed(il);
+                b += streamed ? 2 * KvCacheBytes(_kvWindow) + KvMapBytes() : 2 * KvCacheBytes();
                 if (L.CompressRatio > 0)
-                    b += (long)m.NCtx * m.IdxDim * 2 + (long)(m.NCtx / L.CompressRatio) * m.IdxDim * 4;
+                    b += (long)(streamed ? _idxRing : m.NCtx) * m.IdxDim * 2 + (long)(m.NCtx / L.CompressRatio) * m.IdxDim * 4;
             }
             if (L.Ple)
-                b += (long)(m.PleConvKernel - 1) * m.PleDilation * m.Hc * m.NEmbd * 4;
+                b += copies * ((long)(m.PleConvKernel - 1) * m.PleDilation * m.Hc * m.NEmbd * 4);
             return b;
         }
 
@@ -583,6 +645,9 @@ namespace TensorSharp.Cuda
             b += nt * (long)(m.NCtx / 4 + m.IdxTopK + 4) * 4;
             b += CudaMoeScratch.Bytes(m.NUbatch, m.NExpertUsed, m.NEmbd, Math.Max(m.NFfExp, 1), m.NExpert);
             b += 3 * nt * (long)m.NFfShexp * 4;
+            // The resident KV window's prompt staging pool.
+            if (_kvWindow > 0)
+                b += 2 * KvCacheBytes();
             return b + (256L << 20);
         }
 
@@ -968,6 +1033,8 @@ namespace TensorSharp.Cuda
         {
             foreach (var slot in _slots.Values)
                 FreeSlot(slot);
+            DisposeKvHostPool();
+            DestroyBatchGraphs(-1);
             _graphs.Clear();
             _slots.Clear();
             foreach (var dev in _devs)

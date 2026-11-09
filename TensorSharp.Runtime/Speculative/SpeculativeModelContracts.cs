@@ -364,6 +364,14 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         bool DraftHeadResumesAfterGap => false;
 
+        /// <summary>
+        /// True when the head's drafts condition on the prompt's rows, so a request whose
+        /// prompt prefills from position 0 reads it through its speculative context (the
+        /// head replays every prompt row) even when the head could restart after a gap
+        /// (<see cref="DraftHeadResumesAfterGap"/>) at the first decode step instead.
+        /// </summary>
+        bool DraftHeadConditionsOnPrompt => false;
+
         /// <summary>One per-token draft step at <paramref name="pos"/>: consume
         /// (token, previous hidden), fill next-token logits and the chained
         /// hidden state. Only called for <see cref="DraftHeadKind.PerToken"/>.</summary>
@@ -516,6 +524,18 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>Advance sequence i of the last verify by <c>kept[i]</c> tokens
         /// (1 .. window). Throws when the caches may be partially advanced.</summary>
         void CommitBatchedSpecVerify(IReadOnlyList<string> requestIds, int[] positions, int[] kept);
+
+        /// <summary>Whether <see cref="TryBatchedSpecVerifyLogits"/> serves the batched verify of
+        /// sequences that sample: each row's logits come back, and each sequence draws its rows
+        /// with its own sampler exactly as its solo step does.</summary>
+        bool SupportsBatchedSpecLogits => false;
+
+        /// <summary>
+        /// <see cref="TryBatchedSpecVerify"/> that fills <paramref name="logits"/>
+        /// ([sequences * window * vocab]) with every row's logits instead of their argmax.
+        /// </summary>
+        bool TryBatchedSpecVerifyLogits(IReadOnlyList<string> requestIds, int[] positions, int window,
+            int[] tokens, float[] logits, float[] features) => false;
     }
 
     /// <summary>

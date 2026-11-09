@@ -38,6 +38,9 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         _env.Set("TS_MOE_TIER_ADAPT", "0");
         // The route-tail skip (on by default) leaves rank-7+ misses out: these tests hold every route computed.
         _env.Set("TS_MOE_ROUTE_TAIL_SKIP", "0");
+        // The GPU's share of the missed experts (on by default) moves host-computed answers: these tests leave every miss
+        // to the CPU; its own tests set it.
+        _env.Set("TS_Q4E_HYBRID_MISSES", "0");
     }
 
     public void Dispose()
@@ -775,6 +778,129 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         Assert.True(skip.Window.AsSpan().SequenceEqual(ring.Window), "skipping changed the verify window's logits");
     }
 
+    /// <summary>The GPU's share of a decode step's missed experts (TS_Q4E_HYBRID_MISSES): the GPU stages up to that many
+    /// over the bus and computes them itself while the CPU computes the rest. The fixture routes 4 of 16 experts, none
+    /// resident here. A share of four in slot order takes all of a decode step's experts: none is left to the CPU and the
+    /// steps answer bit for bit as the all-resident engine. The odd-numbered split and a share of two in slot order (the
+    /// default) leave fewer experts to the CPU than no share does, within the host-compute tolerance.</summary>
+    [CudaFact]
+    public void ExpertResidency_GpuShareOfMisses_AnswersAsAllResident()
+    {
+        string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
+        float[][] Load(string vramGb, string share, string split, out long misses)
+        {
+            _env.Set("TS_Q4E_EXPERT_VRAM_GB", vramGb);
+            _env.Set("TS_Q4E_HYBRID_MISSES", share);
+            _env.Set("TS_Q4E_HYBRID_SPLIT", split);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            float[][] r = Run(model);
+            misses = engine.HostExpertMisses;
+            return r;
+        }
+        float[][] all = Load(null, "0", null, out _);
+        float[][] cpu = Load("0", "0", null, out long cpuMisses);
+        float[][] whole = Load("0", "4", "first", out long wholeMisses);
+        float[][] odd = Load("0", "4", "odd", out long oddMisses);
+        float[][] two = Load("0", "2", "first", out long twoMisses);
+        _output.WriteLine($"experts on the CPU: no share {cpuMisses}, four in slot order {wholeMisses}, odd-numbered {oddMisses}, "
+            + $"two in slot order {twoMisses}");
+        Assert.True(cpuMisses > 0, "no expert was left to the CPU: the fixture did not exercise the doorbell");
+        Assert.Equal(0, wholeMisses);
+        Assert.True(oddMisses > 0 && oddMisses < cpuMisses, "the odd-numbered split left the CPU's share as it was");
+        Assert.True(twoMisses > 0 && twoMisses < cpuMisses, "a share of two left the CPU's share as it was");
+        for (int i = 0; i < all.Length; i++)
+        {
+            string at = i == 0 ? "prefill" : $"decode {i}";
+            Assert.True(whole[i].AsSpan().SequenceEqual(all[i]), $"{at}: the GPU computing every miss differs from all-resident");
+            double eCpu = RelativeError(cpu[i], all[i]), eOdd = RelativeError(odd[i], all[i]), eTwo = RelativeError(two[i], all[i]);
+            _output.WriteLine($"{at}: relative error to all-resident: no share {eCpu:E2}, odd-numbered {eOdd:E2}, two {eTwo:E2}");
+            Assert.True(eOdd <= 2e-2, $"{at}: the odd-numbered split differs by {eOdd:E2}");
+            Assert.True(eTwo <= 2e-2, $"{at}: a share of two differs by {eTwo:E2}");
+        }
+    }
+
+    /// <summary>The odd-numbered split gives an expert to the same side whatever else a call selects (while the share
+    /// holds them all: here eight, every odd-numbered expert of the fixture's 16), so a verify window's rows compute their
+    /// own decode steps as they do with no share. Slot order depends on the window; its row errors are only reported.</summary>
+    [CudaFact]
+    public void ExpertResidency_GpuShareOfMisses_VerifiesAsItsOwnDecode()
+    {
+        string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", "0");
+        int[] window = { Steps[0], Steps[1], Steps[2], Steps[3] };
+        int vocab = Qwen4ExpSyntheticModelBuilder.Vocab;
+        double[] RowErrors(string share, string split)
+        {
+            _env.Set("TS_Q4E_HYBRID_MISSES", share);
+            _env.Set("TS_Q4E_HYBRID_SPLIT", split);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            model.ForwardRefill(Prompt);
+            var plain = new float[window.Length][];
+            for (int i = 0; i < window.Length; i++)
+                plain[i] = (float[])model.Forward(new[] { window[i] }).Clone();
+            model.ResetKVCache();
+            model.ForwardRefill(Prompt);
+            var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+            var all = new float[window.Length * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(window, null, all, true);
+            return Enumerable.Range(0, window.Length).Select(i => RelativeError(all.AsSpan(i * vocab, vocab).ToArray(), plain[i])).ToArray();
+        }
+        double[] cpu = RowErrors("0", null), odd = RowErrors("8", "odd"), first = RowErrors("2", "first");
+        for (int i = 0; i < window.Length; i++)
+        {
+            _output.WriteLine($"verify row {i} vs its decode step: no share {cpu[i]:E2}, odd-numbered {odd[i]:E2}, two in slot order {first[i]:E2}");
+            Assert.True(cpu[i] <= 1e-5, $"verify row {i} differs from its decode step by {cpu[i]:E2} with no share");
+            Assert.True(odd[i] <= 1e-5, $"verify row {i} differs from its decode step by {odd[i]:E2} under the odd-numbered split");
+        }
+    }
+
+    /// <summary>The resident KV window (TS_Q4E_KV_RESIDENT): a QSA layer's Q8_0 K/V lives in pinned host memory with a window
+    /// of pages in VRAM, its raw indexer keys in a ring. Asked for 1 cell, the window takes one call's floor (well under the
+    /// fixture's 1,024). A 600-token prompt read in 128-row ubatches (each layer staged from the host copy), 150 decode steps
+    /// whose selections move over the whole context (pages fetched over the bus, the window evicting), and a verify window
+    /// answer bit for bit as the resident caches.</summary>
+    [CudaFact]
+    public void AResidentKvWindow_AnswersBitForBitAsResidentCaches()
+    {
+        string path = Fixture(indexerTopK: 16);
+        int[] prompt = Enumerable.Range(0, 600).Select(i => (i * 37 + 11) % 250).ToArray();
+        int[] steps = Enumerable.Range(0, 150).Select(i => (i * 53 + 7) % 250).ToArray();
+        int[] window = { 5, 77, 123, 9 };
+        int vocab = Qwen4ExpSyntheticModelBuilder.Vocab;
+        KvCacheDtypeConfig.Set(KvCacheDtype.Q8_0);
+        _env.Set("TS_Q4E_UBATCH", "128");
+        (List<float[]> Rows, float[] Window, (long Misses, long Calls, long Overflows) Counters, int Cells, long Staged) Answer(string resident)
+        {
+            _env.Set("TS_Q4E_KV_RESIDENT", resident);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            var rows = new List<float[]> { (float[])model.ForwardRefill(prompt).Clone() };
+            foreach (int token in steps)
+                rows.Add((float[])model.Forward(new[] { token }).Clone());
+            var counters = engine.KvStreamCounters();
+            var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+            var all = new float[window.Length * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(window, null, all, true);
+            return (rows, all, counters, engine.KvWindowCells, engine.KvStagedBytes);
+        }
+        var resident = Answer("0");
+        var streamed = Answer("1");
+        _output.WriteLine($"window {streamed.Cells} cells; pages fetched {streamed.Counters.Misses} in {streamed.Counters.Calls} resolves, "
+            + $"{streamed.Counters.Overflows} overflowing; {streamed.Staged / 1048576.0:F1} MiB staged for the prompt");
+        Assert.Equal(0, resident.Cells);
+        Assert.True(streamed.Cells > 0 && streamed.Cells < 600, $"the window ({streamed.Cells} cells) does not stream the prompt");
+        Assert.True(streamed.Counters.Misses > 0, "no page was fetched over the bus");
+        Assert.Equal(0, streamed.Counters.Overflows);
+        Assert.True(streamed.Staged > 0, "no prompt ubatch was staged from the host copy");
+        for (int i = 0; i < resident.Rows.Count; i++)
+            Assert.True(streamed.Rows[i].AsSpan().SequenceEqual(resident.Rows[i]),
+                $"{(i == 0 ? "prefill" : $"decode {i}")}: the streamed caches changed the logits");
+        Assert.True(streamed.Window.AsSpan().SequenceEqual(resident.Window), "the streamed caches changed the verify window's logits");
+    }
+
     /// <summary>Adaptive residency (TS_MOE_TIER_ADAPT=1 under host experts): between decode steps the most-selected
     /// host experts trade places with the least-selected VRAM experts. The swaps keep every expert reachable, so a
     /// long decode keeps answering as the all-resident engine does within the host-compute tolerance.</summary>
@@ -1151,6 +1277,45 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             Assert.All(chained.Ids, id => Assert.True(id < draftVocab, $"drafted {id}, outside the first {draftVocab} ids"));
         for (int i = 0; i < Steps3; i++)
             Assert.True(Math.Abs(stepwise.Probs[i] - chained.Probs[i]) <= 1e-4f, $"step {i}: confidence {chained.Probs[i]} vs {stepwise.Probs[i]}");
+    }
+
+    /// <summary>The MTP block restarts its cache after a gap (IDraftHead.DraftHeadResumesAfterGap): a catch-up without hidden
+    /// rows moves its row 0 to the end of the gap, and the rows replayed from there answer bit for bit as a block that
+    /// started with them at position 0 (its cache counts from the restart, and RoPE scores depend on distance alone). A
+    /// draft from before the restart is refused. A lone request still reads its prompt through the context
+    /// (DraftHeadConditionsOnPrompt).</summary>
+    [CudaFact]
+    public void TheMtpBlock_RestartsAfterAGap_AsABlockThatStartedThere()
+    {
+        string path = Fixture(indexerTopK: 2048);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 2048);
+        using ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp);
+        var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+        var head = (TensorSharp.Runtime.Speculative.IDraftHead)model;
+        Assert.True(head.DraftHeadResumesAfterGap);
+        Assert.True(head.DraftHeadConditionsOnPrompt);
+        int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+        var hidden = new float[Prompt.Length * feat];
+        spec.SpecForward(Prompt, hidden, new float[vocab], false);
+        // Rows from position S: token S + t with the streams of the token before it.
+        const int S = 20;
+        int k = Prompt.Length - S;
+        int[] tokens = Prompt[S..];
+        var rows = new float[k * feat];
+        Array.Copy(hidden, (long)(S - 1) * feat, rows, 0, (long)k * feat);
+
+        var fresh = new float[vocab];
+        var hFresh = new float[feat];
+        head.DraftCatchUpAndStep(tokens, rows, 0, fresh, hFresh);
+        // The gap [0, S) reported, then the same rows at their own positions.
+        head.DraftCatchUp(Prompt[..S], null, 0);
+        var restarted = new float[vocab];
+        var hRestarted = new float[feat];
+        head.DraftCatchUpAndStep(tokens, rows, S, restarted, hRestarted);
+        Assert.True(restarted.AsSpan().SequenceEqual(fresh), "the restarted block's draft logits differ from a block that started there");
+        Assert.True(hRestarted.AsSpan().SequenceEqual(hFresh), "the restarted block's streams differ from a block that started there");
+        Assert.ThrowsAny<InvalidOperationException>(
+            () => head.DraftCatchUpAndStep(tokens[..1], rows[..feat], S - 1, new float[vocab], new float[feat]));
     }
 
     /// <summary>A decode step's hyper-connection scatter fused with the next mixer's first pass computes what the two
@@ -1685,6 +1850,302 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         Assert.True(counters.ForwardIssueSeconds > 0);
         Assert.True(ex.SlotFree(batched[0]));
         Assert.True(ex.Engine.CapturedBatchedDecodeGraphs < graphs);
+    }
+
+    /// <summary>A batched verify (several sequences' draft windows in one forward, Q4eCudaEngine.ForwardBatchedVerify) computes
+    /// every sequence's own window: each row's first-max token and hidden streams as that sequence's own verify, and after
+    /// the commit (a different number of rows kept per sequence) the next step's logits as after its own commit. Dense
+    /// rows (top_k 2048) and QSA rows past the width (top_k 16).</summary>
+    [CudaTheory]
+    [InlineData(2048)]
+    [InlineData(16)]
+    public void BatchedVerify_ComputesEverySequencesOwnWindow(int indexerTopK)
+    {
+        using var ex = OpenExecutor(Fixture(indexerTopK: indexerTopK));
+        var engine = ex.Engine;
+        Assert.True(engine.SupportsBatchedVerify);
+        int[] prompts = { 30, 21, 37 };
+        int[][] windows = { new[] { 17, 203, 99, 4 }, new[] { 150, 61, 5, 77 }, new[] { 123, 9, 31, 200 } };
+        int[] keep = { 4, 2, 1 };
+        int n = prompts.Length, w = 4, h = engine.HiddenWidth;
+        var batched = new int[n];
+        var serial = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            batched[i] = NewActiveSlot(ex);
+            Step(ex, Prompt[..prompts[i]]);
+            serial[i] = NewActiveSlot(ex);
+            Step(ex, Prompt[..prompts[i]]);
+        }
+        var tokens = windows.SelectMany(x => x).ToArray();
+        var drawn = new int[n * w];
+        var hidden = new float[n * w * h];
+        Assert.True(engine.ForwardBatchedVerify(batched, w, tokens, drawn, hidden));
+        Assert.True(engine.CommitBatchedVerify(batched, keep));
+        for (int i = 0; i < n; i++)
+        {
+            Assert.True(ex.SetActiveSlot(serial[i]));
+            var wantDrawn = new int[w];
+            var wantHidden = new float[w * h];
+            engine.ForwardVerifyGreedy(windows[i], wantDrawn, wantHidden);
+            Assert.True(engine.CommitVerify(keep[i]));
+            Assert.Equal(wantDrawn, drawn.AsSpan(i * w, w).ToArray());
+            double hErr = RelativeError(hidden.AsSpan(i * w * h, w * h).ToArray(), wantHidden);
+            _output.WriteLine($"sequence {i}: hidden streams relative error {hErr:E2}");
+            Assert.True(hErr <= 1e-5, $"sequence {i}: the batched verify's hidden streams differ by {hErr:E2}");
+            float[] want = Step(ex, new[] { Steps[i] });
+            Assert.True(ex.SetActiveSlot(batched[i]));
+            Assert.Equal(prompts[i] + keep[i], engine.NPast);
+            float[] got = Step(ex, new[] { Steps[i] });
+            double err = RelativeError(got, want);
+            _output.WriteLine($"sequence {i}: next step after keeping {keep[i]} rows, relative error {err:E2}");
+            Assert.True(err <= 1e-5, $"sequence {i}: the step after the batched commit differs by {err:E2}");
+        }
+    }
+
+    /// <summary>A batched verify over the resident KV window (TS_Q4E_KV_RESIDENT, a window of one call's floor): every
+    /// sequence's QSA rows read their own slot's pages, fetched over the bus as the selections move, and each sequence's
+    /// rows and next step are its own verify's.</summary>
+    [CudaFact]
+    public void BatchedVerify_UnderAResidentKvWindow_ComputesEverySequencesOwnWindow()
+    {
+        _env.Set("TS_Q4E_KV_RESIDENT", "1");
+        // The window streams Q8_0 K/V; prompts in 128-row ubatches, each staged from the host copy.
+        using var ex = new Qwen4ExpCudaExecutor(Fixture(indexerTopK: 16), 1024, 128, 1, kvQ8: true);
+        var engine = ex.Engine;
+        Assert.True(engine.SupportsBatchedVerify);
+        Assert.True(engine.KvWindowCells > 0, "the KV window is off");
+        int[] lengths = { 600, 420, 520 };
+        int[][] windows = { new[] { 17, 203, 99, 4 }, new[] { 150, 61, 5, 77 }, new[] { 123, 9, 31, 200 } };
+        int[] keep = { 2, 4, 1 };
+        int n = lengths.Length, w = 4, h = engine.HiddenWidth;
+        var batched = new int[n];
+        var serial = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            int seed = i * 13;
+            int[] prompt = Enumerable.Range(0, lengths[i]).Select(t => (t * 37 + 11 + seed) % 250).ToArray();
+            batched[i] = NewActiveSlot(ex);
+            Step(ex, prompt);
+            serial[i] = NewActiveSlot(ex);
+            Step(ex, prompt);
+        }
+        var drawn = new int[n * w];
+        var hidden = new float[n * w * h];
+        // The batched slots' streamed layers, summed (the counters read the active slot).
+        (long Misses, long Overflows) Counters()
+        {
+            long misses = 0, overflows = 0;
+            foreach (int id in batched)
+            {
+                Assert.True(ex.SetActiveSlot(id));
+                var c = engine.KvStreamCounters();
+                misses += c.Misses;
+                overflows += c.Overflows;
+            }
+            return (misses, overflows);
+        }
+        var before = Counters();
+        Assert.True(engine.ForwardBatchedVerify(batched, w, windows.SelectMany(x => x).ToArray(), drawn, hidden));
+        var after = Counters();
+        _output.WriteLine($"window {engine.KvWindowCells} cells; pages fetched {before.Misses} before the batched verify, "
+            + $"{after.Misses - before.Misses} by it; {after.Overflows} overflowing resolves");
+        Assert.True(after.Misses > before.Misses, "the batched verify fetched no page over the bus");
+        Assert.Equal(0, after.Overflows);
+        Assert.True(engine.CommitBatchedVerify(batched, keep));
+        for (int i = 0; i < n; i++)
+        {
+            Assert.True(ex.SetActiveSlot(serial[i]));
+            var wantDrawn = new int[w];
+            var wantHidden = new float[w * h];
+            engine.ForwardVerifyGreedy(windows[i], wantDrawn, wantHidden);
+            Assert.True(engine.CommitVerify(keep[i]));
+            Assert.Equal(wantDrawn, drawn.AsSpan(i * w, w).ToArray());
+            double hErr = RelativeError(hidden.AsSpan(i * w * h, w * h).ToArray(), wantHidden);
+            _output.WriteLine($"sequence {i}: hidden streams relative error {hErr:E2}");
+            Assert.True(hErr <= 1e-5, $"sequence {i}: the batched verify's hidden streams differ by {hErr:E2}");
+            float[] want = Step(ex, new[] { Steps[i] });
+            Assert.True(ex.SetActiveSlot(batched[i]));
+            Assert.Equal(lengths[i] + keep[i], engine.NPast);
+            double err = RelativeError(Step(ex, new[] { Steps[i] }), want);
+            _output.WriteLine($"sequence {i}: next step after keeping {keep[i]} rows, relative error {err:E2}");
+            Assert.True(err <= 1e-5, $"sequence {i}: the step after the batched commit differs by {err:E2}");
+        }
+    }
+
+    /// <summary>Four sequences' 4-row windows are a 16-row batched verify. Under expert residency with
+    /// TS_Q4E_HOST_EXPERT_ROWS=16 the CPU computes its missed experts inside the step (as it does for a solo window)
+    /// instead of the step staging them over the bus; each sequence's rows are still its own verify's, and the commit
+    /// leaves each sequence where its own commit would.</summary>
+    [CudaFact]
+    public void BatchedVerify_SixteenRowsWithHostComputedMisses_AreEachSequencesOwnWindow()
+    {
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", "0");
+        _env.Set("TS_Q4E_HOST_EXPERT_ROWS", "16");
+        using var ex = OpenExecutor(Fixture(indexerTopK: 2048, q2kxlExperts: true));
+        var engine = ex.Engine;
+        Assert.True(engine.SupportsBatchedVerify);
+        Assert.Equal(0, engine.ResidentExperts);
+        int[] prompts = { 30, 21, 37, 26 };
+        int[][] windows = { new[] { 17, 203, 99, 4 }, new[] { 150, 61, 5, 77 }, new[] { 123, 9, 31, 200 }, new[] { 8, 64, 180, 2 } };
+        int[] keep = { 4, 2, 1, 3 };
+        int n = prompts.Length, w = 4, h = engine.HiddenWidth;
+        var batched = new int[n];
+        var serial = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            batched[i] = NewActiveSlot(ex);
+            Step(ex, Prompt[..prompts[i]]);
+            serial[i] = NewActiveSlot(ex);
+            Step(ex, Prompt[..prompts[i]]);
+        }
+        var drawn = new int[n * w];
+        var hidden = new float[n * w * h];
+        long before = engine.HostExpertMisses;
+        Assert.True(engine.ForwardBatchedVerify(batched, w, windows.SelectMany(x => x).ToArray(), drawn, hidden));
+        long cpu = engine.HostExpertMisses - before;
+        _output.WriteLine($"16-row batched verify: {cpu} experts computed by the CPU");
+        Assert.True(cpu > 0, "the 16-row step left no expert to the CPU: it staged them instead");
+        Assert.True(engine.CommitBatchedVerify(batched, keep));
+        for (int i = 0; i < n; i++)
+        {
+            Assert.True(ex.SetActiveSlot(serial[i]));
+            var wantDrawn = new int[w];
+            var wantHidden = new float[w * h];
+            engine.ForwardVerifyGreedy(windows[i], wantDrawn, wantHidden);
+            Assert.True(engine.CommitVerify(keep[i]));
+            Assert.Equal(wantDrawn, drawn.AsSpan(i * w, w).ToArray());
+            double hErr = RelativeError(hidden.AsSpan(i * w * h, w * h).ToArray(), wantHidden);
+            _output.WriteLine($"sequence {i}: hidden streams relative error {hErr:E2}");
+            Assert.True(hErr <= 1e-5, $"sequence {i}: the batched verify's hidden streams differ by {hErr:E2}");
+            float[] want = Step(ex, new[] { Steps[i] });
+            Assert.True(ex.SetActiveSlot(batched[i]));
+            Assert.Equal(prompts[i] + keep[i], engine.NPast);
+            double err = RelativeError(Step(ex, new[] { Steps[i] }), want);
+            _output.WriteLine($"sequence {i}: next step after keeping {keep[i]} rows, relative error {err:E2}");
+            Assert.True(err <= 1e-5, $"sequence {i}: the step after the batched commit differs by {err:E2}");
+        }
+    }
+
+    /// <summary>The batched verify for sequences that sample returns every row's logits: each sequence's rows as its own
+    /// verify window's.</summary>
+    [CudaFact]
+    public void BatchedVerifyLogits_AreEachSequencesOwnVerifyLogits()
+    {
+        using var ex = OpenExecutor(Fixture(indexerTopK: 16));
+        var engine = ex.Engine;
+        int[] prompts = { 26, 33 };
+        int[][] windows = { new[] { 17, 203, 99, 4 }, new[] { 150, 61, 5, 77 } };
+        int n = prompts.Length, w = 4, vocab = ex.VocabSize;
+        var batched = new int[n];
+        var serial = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            batched[i] = NewActiveSlot(ex);
+            Step(ex, Prompt[..prompts[i]]);
+            serial[i] = NewActiveSlot(ex);
+            Step(ex, Prompt[..prompts[i]]);
+        }
+        var logits = new float[n * w * vocab];
+        Assert.True(engine.ForwardBatchedVerify(batched, w, windows.SelectMany(x => x).ToArray(), null, null, logits));
+        Assert.True(engine.CommitBatchedVerify(batched, new[] { 3, 1 }));
+        for (int i = 0; i < n; i++)
+        {
+            Assert.True(ex.SetActiveSlot(serial[i]));
+            var want = new float[w * vocab];
+            engine.ForwardVerify(windows[i], want, null);
+            for (int r = 0; r < w; r++)
+            {
+                double err = RelativeError(logits.AsSpan((i * w + r) * vocab, vocab).ToArray(), want.AsSpan(r * vocab, vocab).ToArray());
+                Assert.True(err <= 1e-5, $"sequence {i} row {r}: the batched verify's logits differ by {err:E2}");
+            }
+        }
+    }
+
+    /// <summary>Batched steps run through captured graphs (Q4eCudaEngine.BatchGraphs.cs), a key captured on its third run:
+    /// three batched verifies with their commits and four batched decode steps (the third captured, the fourth replaying it
+    /// at the next positions) answer bit for bit as the same steps uncaptured (TS_Q4E_BATCH_GRAPHS=0). Dense rows (top_k
+    /// 2048) and QSA rows past the width (top_k 16).</summary>
+    [CudaTheory]
+    [InlineData(2048)]
+    [InlineData(16)]
+    public void BatchedSteps_CapturedAnswerBitForBitAsUncaptured(int indexerTopK)
+    {
+        string path = Fixture(indexerTopK: indexerTopK);
+        int[] prompts = { 30, 21, 37 };
+        int[][] windows = { new[] { 17, 203, 99, 4 }, new[] { 150, 61, 5, 77 }, new[] { 123, 9, 31, 200 } };
+        int[] keep = { 4, 2, 1 };
+        (List<int[]> Drawn, List<float[]> Rows, int Graphs) Run(string graphs)
+        {
+            _env.Set("TS_Q4E_BATCH_GRAPHS", graphs);
+            using var ex = OpenExecutor(path);
+            var engine = ex.Engine;
+            int n = prompts.Length, w = 4, h = engine.HiddenWidth, vocab = ex.VocabSize;
+            var slots = new int[n];
+            for (int i = 0; i < n; i++)
+            {
+                slots[i] = NewActiveSlot(ex);
+                Step(ex, Prompt[..prompts[i]]);
+            }
+            var drawnAll = new List<int[]>();
+            var rows = new List<float[]>();
+            for (int round = 0; round < 3; round++)
+            {
+                var drawn = new int[n * w];
+                var hidden = new float[n * w * h];
+                Assert.True(engine.ForwardBatchedVerify(slots, w, windows.SelectMany(x => x).ToArray(), drawn, hidden));
+                Assert.True(engine.CommitBatchedVerify(slots, keep));
+                drawnAll.Add(drawn);
+                rows.Add(hidden);
+            }
+            var tokens = new int[n];
+            var positions = new int[n];
+            for (int i = 0; i < n; i++)
+                positions[i] = prompts[i] + 3 * keep[i];
+            for (int step = 0; step < 4; step++)
+            {
+                for (int i = 0; i < n; i++)
+                    tokens[i] = Steps[(i + step) % Steps.Length];
+                var logits = new float[n * vocab];
+                Assert.True(engine.ForwardBatchedDecode(slots, tokens, positions, logits));
+                rows.Add(logits);
+                for (int i = 0; i < n; i++)
+                    positions[i]++;
+            }
+            return (drawnAll, rows, engine.CapturedBatchGraphs);
+        }
+        var plain = Run("0");
+        var captured = Run(null);
+        _output.WriteLine($"batched graphs: uncaptured {plain.Graphs}, captured {captured.Graphs}");
+        Assert.Equal(0, plain.Graphs);
+        Assert.Equal(2, captured.Graphs);
+        for (int i = 0; i < plain.Drawn.Count; i++)
+            Assert.Equal(plain.Drawn[i], captured.Drawn[i]);
+        for (int i = 0; i < plain.Rows.Count; i++)
+            Assert.True(captured.Rows[i].AsSpan().SequenceEqual(plain.Rows[i]),
+                i < 3 ? $"batched verify {i}: capturing changed the hidden streams" : $"batched decode step {i - 3}: capturing changed the logits");
+    }
+
+    /// <summary>The engine frees the slots its owner no longer holds (Q4eCudaEngine.SlotFreeAllExcept): every slot but the
+    /// active one and those kept, never a kept or the selected one; nothing more on a second call.</summary>
+    [CudaFact]
+    public void SlotFreeAllExcept_FreesOnlyTheSlotsNothingHolds()
+    {
+        using var ex = OpenExecutor(Fixture());
+        int first = ex.ActiveSlot;
+        int a = NewActiveSlot(ex);
+        Step(ex, Prompt[..8]);
+        int lost = NewActiveSlot(ex);
+        Step(ex, Prompt[..8]);
+        int active = NewActiveSlot(ex);
+        Step(ex, Prompt[..8]);
+        Assert.Equal(1, ex.SlotFreeAllExcept(new[] { first, a }));
+        Assert.True(ex.SlotHead(first, out _));
+        Assert.True(ex.SlotHead(a, out _));
+        Assert.True(ex.SlotHead(active, out _));
+        Assert.False(ex.SlotHead(lost, out _));
+        Assert.Equal(active, ex.ActiveSlot);
+        Assert.Equal(0, ex.SlotFreeAllExcept(new[] { first, a }));
     }
 
     private static int ArgMax(float[] row)

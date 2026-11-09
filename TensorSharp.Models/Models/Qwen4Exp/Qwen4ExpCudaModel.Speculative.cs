@@ -145,8 +145,18 @@ namespace TensorSharp.Models
         public bool HasDraftHead => _exec?.HasMtp == true;
         public DraftHeadKind DraftHeadKind => HasDraftHead ? DraftHeadKind.PerToken : DraftHeadKind.None;
         public bool SupportsFusedCatchUpStep => HasDraftHead;
-        // The block keeps its own KV: it cannot draft after positions it never replayed.
-        public bool DraftHeadResumesAfterGap => false;
+        // The block keeps its own KV, so after positions it never replayed (a prompt read plainly beside other requests, a
+        // reused prefix, plain batched steps) it restarts that cache at the end of the gap (Q4eCudaEngine.MtpRestart):
+        // concurrent requests then arm speculation at their first decode step, and verify their windows together
+        // (IBatchedSpeculativeTarget). TS_Q4E_MTP_RESUME=0 keeps the old rule: speculation only for a request whose
+        // prompt ran through its context from position 0.
+        public bool DraftHeadResumesAfterGap => HasDraftHead && s_mtpResume;
+
+        private static readonly bool s_mtpResume = Environment.GetEnvironmentVariable("TS_Q4E_MTP_RESUME") != "0";
+
+        // A lone request still reads its prompt through the context, so the block's cache holds the prompt (the drafts
+        // condition on it), as before.
+        public bool DraftHeadConditionsOnPrompt => HasDraftHead;
 
         public void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
             => RunMtp(new[] { token }, hPrev, pos, logitsOut, hOut);
@@ -170,18 +180,25 @@ namespace TensorSharp.Models
             if (tokens.Length == 0 || steps < 1)
                 return 0;
             lock (_sync)
-                return _exec.MtpDraftChain(tokens, hRows, startPos, steps, draftOut, probOut);
+                return OnDraftSlot(() => _exec.MtpDraftChain(tokens, hRows, startPos, steps, draftOut, probOut));
         }
 
         private void RunMtp(int[] tokens, float[] hRows, int startPos, float[] logitsOut, float[] hOut)
         {
             ArgumentNullException.ThrowIfNull(tokens);
             if (hRows == null)
-                throw new ArgumentNullException(nameof(hRows), "the MTP block needs the trunk's hidden streams of every row it replays");
+            {
+                // A catch-up without hidden rows reports a gap ending after these tokens (IDraftHead.DraftHeadResumesAfterGap).
+                if (!DraftHeadResumesAfterGap || logitsOut != null || hOut != null)
+                    throw new ArgumentNullException(nameof(hRows), "the MTP block needs the trunk's hidden streams of every row it replays");
+                lock (_sync)
+                    OnDraftSlot(() => { _exec.MtpRestart(startPos + tokens.Length); return 0; });
+                return;
+            }
             if (tokens.Length == 0)
                 return;
             lock (_sync)
-                _exec.MtpForward(tokens, hRows, startPos, logitsOut, hOut);
+                OnDraftSlot(() => { _exec.MtpForward(tokens, hRows, startPos, logitsOut, hOut); return 0; });
         }
     }
 }

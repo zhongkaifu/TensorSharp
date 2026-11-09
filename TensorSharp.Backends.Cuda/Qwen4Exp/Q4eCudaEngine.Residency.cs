@@ -62,8 +62,11 @@ namespace TensorSharp.Cuda
         private CudaHostExpertMailbox _hostBox;
         private CudaHostExpertServer _hostServer;
 
-        /// <summary>Rows up to which the host computes missed experts (the host kernel's bound).</summary>
-        internal const int HostExpertMaxRows = 8;
+        /// <summary>Rows up to which the host can compute missed experts (the host kernel's bound, TSGgml_HostExpertRows).</summary>
+        internal const int HostExpertMaxRows = 16;
+
+        /// <summary>The default of TS_Q4E_HOST_EXPERT_ROWS: decode steps, verify windows and batched steps of up to 8 rows.</summary>
+        internal const int HostExpertDefaultRows = 8;
 
         /// <summary>Experts with a VRAM slot under residency, or -1 when every expert is resident (tests).</summary>
         internal int ResidentExperts => _residency?.SlotExperts ?? -1;
@@ -88,6 +91,32 @@ namespace TensorSharp.Cuda
         /// than one device, or every expert fits beside everything else. <paramref name="nonExpertBytes"/>
         /// is what the layers need besides their routed experts (weights, F32 tensors, caches).
         /// </summary>
+        /// <summary>What device 0 has for weights and caches after its scratch, a gigabyte of headroom, the embedding,
+        /// the output head and the prompt groups.</summary>
+        private long ExpertPlanBudget()
+        {
+            var m = _m;
+            _devs[0].MakeCurrent();
+            var (free, _) = _devs[0].Alloc.GetMemoryInfo();
+            return (long)free - DeviceScratchBytes() - (1L << 30) - m.TokEmbd.TotalBytes
+                - m.Output.TotalBytes - (long)m.NVocab * 8 - PromptGroupBytes();
+        }
+
+        /// <summary>Whether every routed expert fits in VRAM beside <paramref name="nonExpertBytes"/> (no expert residency
+        /// planned; a layer split never plans one, a forced TS_Q4E_EXPERT_VRAM_GB always does).</summary>
+        private bool ExpertsFitWhole(int useDevs, long nonExpertBytes)
+        {
+            var m = _m;
+            if (useDevs != 1)
+                return true;
+            if (m.ExpertVramBytes >= 0)
+                return false;
+            long expertTotal = 0;
+            for (int il = 0; il < m.NLayer; il++)
+                expertTotal += LayerExpertBytes(m.Layers[il]);
+            return nonExpertBytes + expertTotal <= ExpertPlanBudget();
+        }
+
         private ExpertResidency PlanResidency(int useDevs, long nonExpertBytes)
         {
             var m = _m;
@@ -102,10 +131,7 @@ namespace TensorSharp.Cuda
                 return null;
             }
 
-            _devs[0].MakeCurrent();
-            var (free, _) = _devs[0].Alloc.GetMemoryInfo();
-            long budget = (long)free - DeviceScratchBytes() - (1L << 30) - m.TokEmbd.TotalBytes
-                - m.Output.TotalBytes - (long)m.NVocab * 8 - PromptGroupBytes();
+            long budget = ExpertPlanBudget();
             if (!forced && nonExpertBytes + expertTotal <= budget)
                 return null;
             // The tables and the arena's per-slot alignment, besides the slots themselves, and the staging
@@ -208,6 +234,9 @@ namespace TensorSharp.Cuda
                 b += 9 * CudaWeightArena.Align((long)_m.NExpert * 8) + CudaWeightArena.Align(_m.NExpert);
             }
             // StageOf, StageList and the zero expert's pad, then StageCount and StageFrom (an aligned int each).
+            // The GPU's share of the missed experts (TS_Q4E_HYBRID_MISSES): its own StageOf, StageList and two ints.
+            if (_hybridMissesEnv > 0)
+                b += CudaWeightArena.Align((long)_m.NExpert * 4) + CudaWeightArena.Align((long)StagingExperts() * 4) + 512;
             return b + StagingBytes() + CudaWeightArena.Align(StagingStride()) + 3 * CudaWeightArena.Align((long)_m.NExpert * 4) + 512;
         }
 
@@ -249,8 +278,42 @@ namespace TensorSharp.Cuda
                 // The zero expert: all-zero blocks decode to zero weights, so a missed expert's GPU product is 0.
                 _zeroExpert = dev.Weights.Reserve(StagingStride());
                 CudaDriverApi.cuMemsetD8(_zeroExpert, 0, new UIntPtr((ulong)StagingStride())).ThrowOnError();
+                int g = Math.Min(_hybridMissesEnv, stage.Capacity / 2);
+                if (g > 0 && dev.DK.HasHybridMisses)
+                {
+                    // The GPU's share of a decode step's misses: the staging's last slots. An overlapped adaptive round
+                    // borrows the slots before them (AsyncSwapCapacity); a prompt, which stages through all of it, runs
+                    // between steps.
+                    var hybrid = new CudaExpertStage { Capacity = g, Stride = stage.Stride };
+                    fixed (int* p = minusOne)
+                        hybrid.StageOf = dev.Weights.PlaceBytes((IntPtr)p, (long)n * 4);
+                    hybrid.StageCount = dev.Weights.PlaceBytes((IntPtr)(&zero), 4);
+                    hybrid.StageFrom = dev.Weights.PlaceBytes((IntPtr)(&zero), 4);
+                    hybrid.StageList = dev.Weights.Reserve((long)g * 4);
+                    hybrid.Staging = stage.Staging + (nint)((long)(stage.Capacity - g) * stage.Stride);
+                    _hybridStage = hybrid;
+                    Console.Error.WriteLine($"[q4e-cuda] missed experts split: the GPU stages up to {g} of a decode step's "
+                        + $"missed experts over the bus ({(_hybridOdd ? "odd-numbered ones" : "the first in slot order")}) while the "
+                        + "host computes the rest (TS_Q4E_HYBRID_MISSES, TS_Q4E_HYBRID_SPLIT).");
+                }
+                else if (g > 0)
+                    Console.Error.WriteLine("[q4e-cuda] missed experts split off: the loaded tensorsharp_dsv4_kernels module predates "
+                        + "ts_moe_doorbell_publish_hybrid; the host computes every missed expert.");
             }
         }
+
+        // TS_Q4E_HYBRID_MISSES: distinct missed experts of a decode step or verify window the GPU stages over the bus and
+        // computes itself while the host computes the rest (0 = the host takes them all). Default 4: on the RTX 5090
+        // pod a 4-row window's verify 11.4-13.0 -> 10.7-12.1 ms with the first misses in slot order.
+        private readonly int _hybridMissesEnv = Math.Max(0, EnvInt("TS_Q4E_HYBRID_MISSES", 4));
+
+        // TS_Q4E_HYBRID_SPLIT=odd: only odd-numbered experts are the GPU's, so an expert goes to the same side whatever else
+        // a call selects (below capacity) and a verify row computes what its own decode step does; default "first": the
+        // first missed experts in slot order (more of them; which side a row's expert lands on depends on the window).
+        private readonly bool _hybridOdd = Environment.GetEnvironmentVariable("TS_Q4E_HYBRID_SPLIT") == "odd";
+
+        /// <summary>The staging the GPU's share of the missed experts goes through, or null (see TS_Q4E_HYBRID_MISSES).</summary>
+        private CudaExpertStage _hybridStage;
 
         /// <summary>
         /// Copies the experts without a slot into pinned host memory the GPU can address, packed per
@@ -793,9 +856,10 @@ namespace TensorSharp.Cuda
             => _hostServer != null && nt <= _hostExpertRows && L.Stage.IsValid && !_groupedPrompt;
 
         /// <summary>Rows up to which a step leaves its missed experts to the CPU (TS_Q4E_HOST_EXPERT_ROWS, 1 to
-        /// <see cref="HostExpertMaxRows"/>); wider steps stage them over the bus. A verify window's rows miss more
-        /// experts between them than one decode row does, and the GPU waits for the CPU at every layer.</summary>
-        private readonly int _hostExpertRows = Math.Clamp(EnvInt("TS_Q4E_HOST_EXPERT_ROWS", HostExpertMaxRows), 1, HostExpertMaxRows);
+        /// <see cref="HostExpertMaxRows"/>, default <see cref="HostExpertDefaultRows"/>); wider steps stage them over the bus.
+        /// A verify window's rows miss more experts between them than one decode row does, and the GPU waits for the CPU at
+        /// every layer. A batched speculative verify of four sequences is 16 rows.</summary>
+        private readonly int _hostExpertRows = Math.Clamp(EnvInt("TS_Q4E_HOST_EXPERT_ROWS", HostExpertDefaultRows), 1, HostExpertMaxRows);
 
         /// <summary>A forward is about to run: keep the host experts' server spinning; and after it, report its failure.</summary>
         private void ArmHostExperts() => _hostServer?.Arm();
@@ -830,7 +894,7 @@ namespace TensorSharp.Cuda
                 $"[q4e-cuda] expert residency: {r.SlotExperts} of {r.TotalExperts} experts in VRAM " +
                 $"({r.SlotBytes / 1073741824.0:F1} GiB, {covered}); the other experts in pinned host memory " +
                 $"({r.HostBytes / 1073741824.0:F1} GiB), " +
-                (r.HostCompute ? $"computed by the CPU in decode steps of up to {HostExpertMaxRows} rows and staged over the bus in prompts."
+                (r.HostCompute ? $"computed by the CPU in decode steps of up to {_hostExpertRows} rows and staged over the bus in prompts."
                                : "staged over the bus when routed."));
             if (_groupXs != null)
                 Console.Error.WriteLine(

@@ -11,6 +11,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Paged;
@@ -2798,13 +2799,21 @@ namespace TensorSharp.Runtime.Scheduling
             int window = batched.BatchedSpecWindow(n);
             if (window < 2)
                 return false;
+            // Sequences that sample join when the trunk returns every row's logits: each draws its
+            // rows with its own sampler, as its solo step does (a draft is kept while the draw equals it).
+            bool sampledVerify = false;
             for (int i = 0; i < n; i++)
             {
                 var seq = decodeWork[i].Sequence;
                 int prev = seq.NumComputedTokens;
-                if (prev <= 0 || !CanSpeculate(seq) || !seq.GetOrCreateSampler().IsPlainGreedyArgmax
-                    || batched.FusedCacheSeqLen(seq.RequestId) != prev)
+                if (prev <= 0 || !CanSpeculate(seq) || batched.FusedCacheSeqLen(seq.RequestId) != prev)
                     return false;
+                if (!seq.GetOrCreateSampler().IsPlainGreedyArgmax)
+                {
+                    if (!batched.SupportsBatchedSpecLogits)
+                        return false;
+                    sampledVerify = true;
+                }
             }
 
             using var scope = batched.BeginBatchedSpeculation();
@@ -2982,7 +2991,16 @@ namespace TensorSharp.Runtime.Scheduling
                 _batchedSpecFeatures = new float[featNeeded];
             var drawn = new int[n * window];
             long drafted = Stopwatch.GetTimestamp();
-            if (!batched.TryBatchedSpecVerify(requestIds, positions, window, tokens, drawn, _batchedSpecFeatures))
+            int vocab = _model.Config.VocabSize;
+            if (sampledVerify)
+            {
+                long logitsNeeded = (long)n * window * vocab;
+                if (_batchedSpecLogits == null || _batchedSpecLogits.LongLength < logitsNeeded)
+                    _batchedSpecLogits = new float[logitsNeeded];
+                if (!batched.TryBatchedSpecVerifyLogits(requestIds, positions, window, tokens, _batchedSpecLogits, _batchedSpecFeatures))
+                    return false;
+            }
+            else if (!batched.TryBatchedSpecVerify(requestIds, positions, window, tokens, drawn, _batchedSpecFeatures))
                 return false;
             long verified = Stopwatch.GetTimestamp();
             long verifyTicks = verified - started;
@@ -3003,6 +3021,7 @@ namespace TensorSharp.Runtime.Scheduling
             var kept = new int[n];
             var accepted = new List<int>[n];
             var nexts = new int[n];
+            // The anchors, in order: each sequence's pending draw, or a draw from its logits.
             for (int i = 0; i < n; i++)
             {
                 var seq = decodeWork[i].Sequence;
@@ -3017,11 +3036,36 @@ namespace TensorSharp.Runtime.Scheduling
                     TakePendingOrSample(seq);
                 }
                 seq.AppendOutputToken(anchors[i]);
+            }
+            if (sampledVerify && (_batchedSpecRows == null || _batchedSpecRows.Length < n))
+                Array.Resize(ref _batchedSpecRows, n);
+            // Each sequence's drafts against its own rows. A sequence's acceptance touches only its own state (output,
+            // sampler, grammar), so sequences that sample draw in parallel: a sampled row is a copy, penalties and a
+            // top-k pass over the whole vocabulary, and four sequences' rows one after another held the GPU idle.
+            void Accept(int i)
+            {
+                var seq = decodeWork[i].Sequence;
                 bool seqStopRepetition = stopRepetition && (seq.SamplingConfig?.StopRepetition ?? true);
                 bool stopped = IsStop(anchors[i]);
                 var acc = new List<int>();
                 int m = 0;
-                while (!stopped && m < drafts[i].Count && RowDraw(seq, drawn[i * window + m]) == drafts[i][m])
+                // A row is drawn once: a sampled row advances the sequence's sampler.
+                int Draw(int row)
+                {
+                    if (!sampledVerify)
+                        return RowDraw(seq, drawn[i * window + row]);
+                    float[] buf = _batchedSpecRows![i] is { } b && b.Length == vocab ? b : (_batchedSpecRows[i] = new float[vocab]);
+                    Array.Copy(_batchedSpecLogits!, ((long)i * window + row) * vocab, buf, 0, vocab);
+                    var sampler = seq.GetOrCreateSampler();
+                    if (!sampler.IsPlainGreedyArgmax)
+                        return sampler.Sample(buf, seq.OutputTokens);
+                    int best = 0;
+                    for (int v = 1; v < vocab; v++)
+                        if (buf[v] > buf[best]) best = v;
+                    return RowDraw(seq, best);
+                }
+                int draw = stopped ? -1 : Draw(0);
+                while (!stopped && m < drafts[i].Count && draw == drafts[i][m])
                 {
                     int d = drafts[i][m];
                     seq.AppendOutputToken(d);
@@ -3030,10 +3074,29 @@ namespace TensorSharp.Runtime.Scheduling
                     if (IsStop(d) || (seqStopRepetition
                             && RepetitionGuard.IsLooping(seq.OutputTokens, seq.OutputTokens.Count, out _, out _)))
                         stopped = true;
+                    else
+                        draw = Draw(m);
                 }
                 kept[i] = m + 1;
                 accepted[i] = acc;
-                nexts[i] = RowDraw(seq, drawn[i * window + m]);
+                // The row after the kept ones: its draw is the next token (drawn above unless a stop ended the run).
+                nexts[i] = stopped ? Draw(m) : draw;
+            }
+            if (sampledVerify && n > 1)
+            {
+                try
+                {
+                    Parallel.For(0, n, Accept);
+                }
+                catch (AggregateException ae) when (ae.InnerExceptions.Count == 1)
+                {
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
+                }
+            }
+            else
+            {
+                for (int i = 0; i < n; i++)
+                    Accept(i);
             }
 
             batched.CommitBatchedSpecVerify(requestIds, positions, kept);
@@ -3114,6 +3177,9 @@ namespace TensorSharp.Runtime.Scheduling
             Environment.GetEnvironmentVariable("TS_BATCHED_SPEC_LOG") == "1";
 
         private float[]? _batchedSpecFeatures;
+        // A sampled batched verify's rows' logits, and per sequence the row handed to its sampler.
+        private float[]? _batchedSpecLogits;
+        private float[]?[]? _batchedSpecRows;
 
         // The verify window a step falls back to when every gated draft fits it.
         private const int NarrowBatchedWindow = 4;
