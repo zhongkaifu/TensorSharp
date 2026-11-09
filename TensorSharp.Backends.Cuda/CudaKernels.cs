@@ -140,6 +140,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr[] quantMatmulQ80Warp;
         private readonly IntPtr[] q80PairMma;
         private readonly IntPtr[][] q80PairTwin;
+        private readonly IntPtr[][] q80PairLane;
         private readonly IntPtr[] quantMatmulLowKDp4aF32;
         private readonly IntPtr quantMatmulQ4KDp4aF32;
         private readonly IntPtr quantMatmulQ5KDp4aF32;
@@ -348,16 +349,27 @@ namespace TensorSharp.Cuda
             {
                 var pairMma = new IntPtr[Q80PairSliceCounts.Length];
                 var pairTwin = new IntPtr[Q80PairSliceCounts.Length][];
+                var pairLane = new IntPtr[Q80PairSliceCounts.Length][];
                 for (int i = 0; i < Q80PairSliceCounts.Length; i++)
                 {
                     int s = Q80PairSliceCounts[i];
                     pairMma[i] = module.GetFunction("ts_q80_pair_mma_" + s);
-                    pairTwin[i] = new[] { module.GetFunction("ts_q80_pair_twin_" + s + "_1"), module.GetFunction("ts_q80_pair_twin_" + s + "_2") };
+                    pairTwin[i] = new[]
+                    {
+                        module.GetFunction("ts_q80_pair_twin_" + s + "_1"), module.GetFunction("ts_q80_pair_twin_" + s + "_2"),
+                        module.GetFunction("ts_q80_pair_twin_" + s + "_4"),
+                    };
+                    pairLane[i] = new[]
+                    {
+                        module.GetFunction("ts_q80_pair_lane_" + s + "_2"), module.GetFunction("ts_q80_pair_lane_" + s + "_4"),
+                        module.GetFunction("ts_q80_pair_lane_" + s + "_8"),
+                    };
                 }
                 q80PairMma = pairMma;
                 q80PairTwin = pairTwin;
+                q80PairLane = pairLane;
             }
-            catch (CudaException ex) when (ex.ErrorCode == 500) { q80PairMma = null; q80PairTwin = null; }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { q80PairMma = null; q80PairTwin = null; q80PairLane = null; }
             quantMatmulLowKDp4aF32 = LowKFunctions(module, "ts_quant_matmul_lowk_dp4a_f32");
             quantMatmulQ4KDp4aF32 = module.GetFunction("ts_quant_matmul_q4k_dp4a_f32");
             quantMatmulQ5KDp4aF32 = module.GetFunction("ts_quant_matmul_q5k_dp4a_f32");
@@ -3257,22 +3269,64 @@ namespace TensorSharp.Cuda
             return s;
         }
 
+        /// <summary>The kernels that compute <see cref="LaunchQuantMatmulQ80Pair"/>'s sums, all bit for bit alike.</summary>
+        internal enum Q80PairKernel
+        {
+            /// <summary>dp4a, four lanes on each block (a warp per column and slice), 1-4 rows.</summary>
+            Twin,
+            /// <summary>dp4a, a lane on each block (eight lanes per column and slice), 1-8 rows.</summary>
+            Lane,
+            /// <summary>int8 tensor cores, a warp per 16 x 8 tile and slice, 1-16 rows.</summary>
+            Mma,
+        }
+
+        /// <summary>
+        /// The pair's kernel for a call. Every kernel computes the same bits, so this is speed alone (measured on an
+        /// H100 NVL at Qwen3.8 Flash Next's decode shapes, 2026-11-09): the twin for one row, and for two where a
+        /// slice is long (48+ blocks), the output wide (8192-65536 of 1024+ inputs) or the slices many (16); the lane
+        /// kernel for two to four, but the twin for three or four on a long slice of a narrow output (6144 -> 2560);
+        /// the tensor cores from five rows, but the lane kernel up to eight on a wide output or 16 slices
+        /// (10240 -> 320: 40 tiles of 16 slices give the tensor cores too small a grid); the tensor cores past eight.
+        /// </summary>
+        internal static Q80PairKernel Q80PairKernelFor(int inDim, int outDim, int rows)
+        {
+            int s = Q80PairSlices(inDim, outDim);
+            bool longSlice = inDim / 32 / s >= 48;
+            bool wide = outDim >= 8192 && outDim <= 65536 && inDim >= 1024;
+            if (rows <= 1)
+                return Q80PairKernel.Twin;
+            if (rows == 2)
+                return longSlice || wide || s == 16 ? Q80PairKernel.Twin : Q80PairKernel.Lane;
+            if (rows <= 4)
+                return longSlice && outDim <= 4096 ? Q80PairKernel.Twin : Q80PairKernel.Lane;
+            if (rows <= 8)
+                return wide || s == 16 ? Q80PairKernel.Lane : Q80PairKernel.Mma;
+            return Q80PairKernel.Mma;
+        }
+
         /// <summary>
         /// Q8_0 matvec over 1..<see cref="Q80PairMaxRows"/> q8_1 activation rows (<c>inDim</c> a multiple of 32) as
-        /// one arithmetic run by two kernels: int8 tensor cores (one Q8_0 block is one m16n8k32 step) for three
-        /// rows and more, a dp4a twin for one or two. Each output sums every block's exact int32 dot, scaled by
-        /// fma in block order into eight interleaved partials per K slice, then fixed pairwise trees over the
+        /// one arithmetic run by three kernels: int8 tensor cores (one Q8_0 block is one m16n8k32 step) and two dp4a
+        /// kernels, picked by <see cref="Q80PairKernelFor"/>. Each output sums every block's exact int32 dot, scaled
+        /// by fma in block order into eight interleaved partials per K slice, then fixed pairwise trees over the
         /// partials and the slices, so a row's result does not depend on the row count or the kernel that ran it.
         /// It is not the arithmetic of <see cref="LaunchQuantMatmulQ80VecRows"/>: a model switching to it decodes
         /// differently in the last bits once.
         /// </summary>
         public void LaunchQuantMatmulQ80Pair(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim,
             int rows, IntPtr stream)
+            => LaunchQuantMatmulQ80PairKernel(Q80PairKernelFor(inDim, outDim, rows), weights, xqScratch, output, inDim,
+                outDim, rows, stream);
+
+        /// <summary><see cref="LaunchQuantMatmulQ80Pair"/> on a given kernel (tests: each must give the others' bits).</summary>
+        internal void LaunchQuantMatmulQ80PairKernel(Q80PairKernel kernel, IntPtr weights, IntPtr xqScratch, IntPtr output,
+            int inDim, int outDim, int rows, IntPtr stream)
         {
             if (!HasQ80Pair)
                 throw new InvalidOperationException("Q8_0 pair matvec: the loaded module has no pair for this GPU (needs sm_80+ code)");
-            if (rows < 1 || rows > Q80PairMaxRows || (inDim & 31) != 0)
-                throw new ArgumentOutOfRangeException(nameof(rows), $"Q8_0 pair matvec: {rows} rows of width {inDim}");
+            int maxRows = kernel == Q80PairKernel.Twin ? 4 : kernel == Q80PairKernel.Lane ? 8 : Q80PairMaxRows;
+            if (rows < 1 || rows > maxRows || (inDim & 31) != 0)
+                throw new ArgumentOutOfRangeException(nameof(rows), $"Q8_0 pair matvec ({kernel}): {rows} rows of width {inDim}");
             IntPtr weightsArg = weights;
             IntPtr xqArg = xqScratch;
             IntPtr outputArg = output;
@@ -3282,16 +3336,27 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[] { &weightsArg, &xqArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
             int s = Q80PairSlices(inDim, outDim);
             int si = System.Numerics.BitOperations.Log2((uint)s);
-            if (rows <= 2)
+            switch (kernel)
             {
-                int c = s >= 8 ? 1 : 8 / s;
-                Launch(q80PairTwin[si][rows - 1], (uint)((outDim + c - 1) / c), 1, 1, 32 * s * c, 1, 1, 0, stream, args);
-            }
-            else
-            {
-                int tpc = s == 1 ? 4 : s == 2 ? 2 : 1;
-                int tiles = (outDim + 7) / 8;
-                Launch(q80PairMma[si], (uint)((tiles + tpc - 1) / tpc), 1, 1, 32 * s * tpc, 1, 1, 0, stream, args);
+                case Q80PairKernel.Twin:
+                {
+                    int c = s >= 8 ? 1 : 8 / s;
+                    Launch(q80PairTwin[si][rows <= 1 ? 0 : rows <= 2 ? 1 : 2], (uint)((outDim + c - 1) / c), 1, 1, 32 * s * c, 1, 1, 0, stream, args);
+                    break;
+                }
+                case Q80PairKernel.Lane:
+                {
+                    int cols = 32 / s;
+                    Launch(q80PairLane[si][rows <= 2 ? 0 : rows <= 4 ? 1 : 2], (uint)((outDim + cols - 1) / cols), 1, 1, 256, 1, 1, 0, stream, args);
+                    break;
+                }
+                default:
+                {
+                    int tpc = s == 1 ? 4 : s == 2 ? 2 : 1;
+                    int tiles = (outDim + 7) / 8;
+                    Launch(q80PairMma[si], (uint)((tiles + tpc - 1) / tpc), 1, 1, 32 * s * tpc, 1, 1, 0, stream, args);
+                    break;
+                }
             }
         }
 

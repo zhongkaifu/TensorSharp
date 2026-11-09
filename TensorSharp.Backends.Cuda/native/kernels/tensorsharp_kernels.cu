@@ -6776,7 +6776,8 @@ extern "C" __global__ void ts_quant_matmul_q8_0_warp_f32_16(
 //   slice = ((P0 + P1) + (P2 + P3)) + ((P4 + P5) + (P6 + P7));  result = the slices' pairwise tree.
 // ts_q80_pair_mma_rows runs it on int8 tensor cores (one Q8_0 block is one m16n8k32 step; a warp per 16 x 8 tile and
 // slice); ts_q80_pair_twin_rows on dp4a for a few rows (a warp per column and slice, four lanes on each block,
-// coalesced like TensorSharp's matvec).
+// coalesced like TensorSharp's matvec); ts_q80_pair_lane_rows on dp4a with a lane on each block (eight lanes per
+// column and slice, each walking its own partial's blocks). CudaKernels.Q80PairKernelFor picks one by shape and rows.
 
 // Below sm_80 the step compiles to nothing (CudaKernels.HasQ80Pair is then false and nothing launches the kernels).
 __device__ __forceinline__ void ts_q80_pair_mma_step(int (&d)[4], const int (&a)[4], int b0, int b1)
@@ -6914,6 +6915,11 @@ __device__ __forceinline__ void ts_q80_pair_twin_rows(
     const int grp = lane >> 2, q = (lane & 3) * 2;
     const unsigned gmask = 0xFu << (grp * 4);
     const uint8_t* wcol = weights + (size_t)min(col, out_dim - 1) * (size_t)kb * 34;
+    // Rows past the call's last read the last row again and are never stored: no row's loads wait on a branch.
+    const ts_block_q8_1* arow[MAXR];
+#pragma unroll
+    for (int r = 0; r < MAXR; r++)
+        arow[r] = xq + (size_t)min(r, rows - 1) * kb;
     float acc[MAXR];
 #pragma unroll
     for (int r = 0; r < MAXR; r++)
@@ -6927,9 +6933,7 @@ __device__ __forceinline__ void ts_q80_pair_twin_rows(
 #pragma unroll
         for (int r = 0; r < MAXR; r++)
         {
-            if (r >= rows)
-                break;
-            const ts_block_q8_1* a = &xq[(size_t)r * kb + ib];
+            const ts_block_q8_1* a = arow[r] + ib;
             int s = dp4a_i8(w1, get_int_b4(a->qs, q + 1), dp4a_i8(w0, get_int_b4(a->qs, q), 0));
             // The block's exact dot over its four lanes; every lane of the group then holds it.
             s += __shfl_xor_sync(gmask, s, 1);
@@ -6964,6 +6968,81 @@ __device__ __forceinline__ void ts_q80_pair_twin_rows(
 #pragma unroll
         for (int s = 0; s < S; s++)
             v[s] = part[cIn][s][r];
+        output[(size_t)r * out_dim + col] = ts_q80_pair_slice_tree<S>(v);
+    }
+}
+
+// The same sums with a lane on each block: eight lanes hold one (column, slice)'s eight partials, lane j walking the
+// slice's blocks k0 + j, k0 + j + 8, ... whole (eight dp4a a row, no shuffle per block), four (column, slice)s a warp,
+// 32 / S columns a 256-thread block. Rows are clamped as in the twin. Bit for bit the twin's and the tensor cores'.
+template <int S, int MAXR>
+__device__ __forceinline__ void ts_q80_pair_lane_rows(
+    const uint8_t* __restrict__ weights, const ts_block_q8_1* __restrict__ xq, float* __restrict__ output,
+    int in_dim, int out_dim, int rows)
+{
+    constexpr int COLS = 32 / S;
+    __shared__ float part[32][MAXR];
+    const int lane = threadIdx.x & 31;
+    const int g = threadIdx.x >> 3, j = lane & 7;
+    const int cInCta = g / S, slice = g % S;
+    const int col = blockIdx.x * COLS + cInCta;
+    const int kb = in_dim / 32;
+    const int k0 = slice * kb / S, k1 = (slice + 1) * kb / S;
+    const uint8_t* wcol = weights + (size_t)min(col, out_dim - 1) * (size_t)kb * 34;
+    const ts_block_q8_1* arow[MAXR];
+#pragma unroll
+    for (int r = 0; r < MAXR; r++)
+        arow[r] = xq + (size_t)min(r, rows - 1) * kb;
+    float acc[MAXR];
+#pragma unroll
+    for (int r = 0; r < MAXR; r++)
+        acc[r] = 0.0f;
+#pragma unroll 4
+    for (int ib = k0 + j; ib < k1; ib += 8)
+    {
+        const uint8_t* wb = wcol + (size_t)ib * 34;
+        const float dw = __half2float(*reinterpret_cast<const half*>(wb));
+        int w[8];
+#pragma unroll
+        for (int k = 0; k < 8; k++)
+            w[k] = get_int_b2(wb + 2, k);
+#pragma unroll
+        for (int r = 0; r < MAXR; r++)
+        {
+            const ts_block_q8_1* a = arow[r] + ib;
+            int s = 0;
+#pragma unroll
+            for (int k = 0; k < 8; k++)
+                s = dp4a_i8(w[k], get_int_b4(a->qs, k), s);
+            acc[r] = __fmaf_rn(__fmul_rn(dw, __half2float(a->d)), (float)s, acc[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MAXR; r++)
+    {
+        // tree8 over the group's lanes: xor 1 pairs P_j with P_(j^1), 2 with j^2, 4 with j^4.
+        float v = acc[r];
+        v = v + __shfl_xor_sync(0xFFFFFFFF, v, 1);
+        v = v + __shfl_xor_sync(0xFFFFFFFF, v, 2);
+        v = v + __shfl_xor_sync(0xFFFFFFFF, v, 4);
+        acc[r] = v;
+    }
+    if (j == 0)
+#pragma unroll
+        for (int r = 0; r < MAXR; r++)
+            part[g][r] = acc[r];
+    __syncthreads();
+    if (slice != 0 || j != 0 || col >= out_dim)
+        return;
+#pragma unroll
+    for (int r = 0; r < MAXR; r++)
+    {
+        if (r >= rows)
+            break;
+        float v[S];
+#pragma unroll
+        for (int s = 0; s < S; s++)
+            v[s] = part[g + s][r];
         output[(size_t)r * out_dim + col] = ts_q80_pair_slice_tree<S>(v);
     }
 }
@@ -7013,6 +7092,66 @@ extern "C" __global__ void __launch_bounds__(512) ts_q80_pair_twin_16_1(
 extern "C" __global__ void __launch_bounds__(512) ts_q80_pair_twin_16_2(
     const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
 { ts_q80_pair_twin_rows<16, 2>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_1_4(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_twin_rows<1, 4>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_2_4(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_twin_rows<2, 4>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_4_4(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_twin_rows<4, 4>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_twin_8_4(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_twin_rows<8, 4>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(512) ts_q80_pair_twin_16_4(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_twin_rows<16, 4>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_1_2(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<1, 2>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_1_4(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<1, 4>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_1_8(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<1, 8>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_2_2(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<2, 2>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_2_4(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<2, 4>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_2_8(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<2, 8>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_4_2(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<4, 2>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_4_4(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<4, 4>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_4_8(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<4, 8>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_8_2(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<8, 2>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_8_4(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<8, 4>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_8_8(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<8, 8>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_16_2(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<16, 2>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_16_4(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<16, 4>(weights, xq, output, in_dim, out_dim, rows); }
+extern "C" __global__ void __launch_bounds__(256) ts_q80_pair_lane_16_8(
+    const uint8_t* weights, const ts_block_q8_1* xq, float* output, int in_dim, int out_dim, int rows)
+{ ts_q80_pair_lane_rows<16, 8>(weights, xq, output, in_dim, out_dim, rows); }
 
 // dp4a (int8) Q4_K single-token decode matvec. The generic scalar path
 // (ts_quant_matmul_vec_f32 -> qvalue_at) re-parses the Q4_K super-block header
