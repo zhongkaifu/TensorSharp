@@ -3471,6 +3471,26 @@ namespace TensorSharp.GGML
                     rows, nUsed, (IntPtr)s, (IntPtr)w, (IntPtr)xp, (IntPtr)o) != 0;
         }
 
+        /// <summary>Test probe of Strata's prompt expert GEMM on the Metal tensor API (tsm::moe_mm_encode): one layer's
+        /// routes (<paramref name="ids"/>, <paramref name="weights"/>: nUsed a row) over stacked Q2_0 expert bytes, into
+        /// <paramref name="output"/> [rows, hidden]. False where the kernels do not run (no tensor API) or fail.</summary>
+        public static unsafe bool TsmMoeMmProbe(int hidden, int nFf, int nExpert, byte[] gate, byte[] up, byte[] down,
+            int rows, int nUsed, int[] ids, float[] weights, float[] x, float[] output)
+        {
+            fixed (byte* g = gate) fixed (byte* u = up) fixed (byte* d = down)
+            fixed (int* i = ids) fixed (float* w = weights) fixed (float* xp = x) fixed (float* o = output)
+                return GgmlNative.TSGgml_TsmMoeMmProbe(hidden, nFf, nExpert, (IntPtr)g, (IntPtr)u, (IntPtr)d,
+                    rows, nUsed, (IntPtr)i, (IntPtr)w, (IntPtr)xp, (IntPtr)o) != 0;
+        }
+
+        /// <summary>Test hook: the prompt expert layers that ran on Strata's grouped GEMM (tsm::moe_mm_encode) in this
+        /// process. 0 off Apple's Metal builds.</summary>
+        public static long TsmMoeMmCount()
+        {
+            try { return GgmlNative.TSGgml_TsmMoeMmCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         /// <summary>Test hook: the tiered seamed passes whose seams handed over on a shared event (tsm::seams_*) and ran
         /// to the end in this process. 0 off Apple's Metal builds.</summary>
         public static long TsmSeamPasses()

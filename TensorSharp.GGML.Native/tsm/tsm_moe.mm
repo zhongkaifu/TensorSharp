@@ -24,6 +24,7 @@
 
 #include "tsm_moe_source.inc"
 #include "tsm_mpp_source.inc"
+#include "tsm_moe_mm_source.inc"
 
 namespace
 {
@@ -75,6 +76,15 @@ namespace
         id<MTLLibrary> library_mpp = nil;
         int mpp_state = 0;
         std::map<std::string, id<MTLComputePipelineState>> pipelines_mpp;
+        // The prompt expert GEMM library (tsm_moe_mm_source.inc: quant.metal + Strata's moe_mm, language 4.0) and
+        // moe_mm_encode's plan and scratch.
+        id<MTLLibrary> library_mm = nil;
+        int mm_state = 0;
+        std::map<std::string, id<MTLComputePipelineState>> pipelines_mm;
+        id<MTLBuffer> mm_bcnt = nil, mm_boff = nil, mm_eoff = nil, mm_tiles = nil, mm_meta = nil, mm_stok = nil,
+            mm_sw = nil, mm_pos = nil, mm_xs = nil, mm_hs = nil, mm_ye = nil;
+        std::size_t mm_bcnt_bytes = 0, mm_boff_bytes = 0, mm_eoff_bytes = 0, mm_tiles_bytes = 0, mm_meta_bytes = 0,
+            mm_stok_bytes = 0, mm_sw_bytes = 0, mm_pos_bytes = 0, mm_xs_bytes = 0, mm_hs_bytes = 0, mm_ye_bytes = 0;
     };
     State& state() { static State s; return s; }
 
@@ -118,6 +128,13 @@ namespace
         s.library_mpp = nil;
         s.mpp_state = 0;
         s.pipelines_mpp.clear();
+        s.library_mm = nil;
+        s.mm_state = 0;
+        s.pipelines_mm.clear();
+        s.mm_bcnt = s.mm_boff = s.mm_eoff = s.mm_tiles = s.mm_meta = s.mm_stok = s.mm_sw = s.mm_pos = nil;
+        s.mm_xs = s.mm_hs = s.mm_ye = nil;
+        s.mm_bcnt_bytes = s.mm_boff_bytes = s.mm_eoff_bytes = s.mm_tiles_bytes = s.mm_meta_bytes = 0;
+        s.mm_stok_bytes = s.mm_sw_bytes = s.mm_pos_bytes = s.mm_xs_bytes = s.mm_hs_bytes = s.mm_ye_bytes = 0;
         MTLCompileOptions* options = [MTLCompileOptions new];
         // Safe math, as Strata compiles them: no reassociation, so a row's sums do not depend on the window around it.
         if (@available(macOS 15.0, iOS 18.0, *)) options.mathMode = MTLMathModeSafe;
@@ -178,6 +195,48 @@ namespace
         if (p == nil)
             throw std::runtime_error("tsm: pipeline " + name + ": " + (error ? error.localizedDescription.UTF8String : "?"));
         s.pipelines_mpp[name] = p;
+        return p;
+    }
+
+    // The prompt expert GEMM library, compiled on first use where the tensor API runs (mpp_available decides that).
+    bool mm_library(State& s, id<MTLDevice> device)
+    {
+        if (s.mm_state != 0) return s.mm_state > 0;
+        s.mm_state = -1;
+        if (!mpp_available(s, device)) return false;
+        MTLCompileOptions* options = [MTLCompileOptions new];
+        options.languageVersion = (MTLLanguageVersion)(4 << 16);
+        if (@available(macOS 15.0, iOS 18.0, *)) options.mathMode = MTLMathModeSafe;
+        NSError* error = nil;
+        id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:kTsmMoeMmSource]
+                                                      options:options error:&error];
+        if (library == nil)
+        {
+            std::fprintf(stderr, "[tsm] the prompt expert GEMM does not compile: %s\n",
+                error ? error.localizedDescription.UTF8String : "?");
+            return false;
+        }
+        s.library_mm = library;
+        s.mm_state = 1;
+        return true;
+    }
+
+    id<MTLComputePipelineState> pipeline_mm(State& s, const std::string& name)
+    {
+        auto it = s.pipelines_mm.find(name);
+        if (it != s.pipelines_mm.end()) return it->second;
+        NSError* error = nil;
+        MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
+        bool ctab = true;   // QUANT_CTAB (23), as the expert kernels above
+        [values setConstantValue:&ctab type:MTLDataTypeBool atIndex:23];
+        id<MTLFunction> f = [s.library_mm newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]
+                                               constantValues:values error:&error];
+        if (f == nil)
+            throw std::runtime_error("tsm: no prompt expert kernel " + name + (error ? std::string(": ") + error.localizedDescription.UTF8String : ""));
+        id<MTLComputePipelineState> p = [s.device newComputePipelineStateWithFunction:f error:&error];
+        if (p == nil)
+            throw std::runtime_error("tsm: pipeline " + name + ": " + (error ? error.localizedDescription.UTF8String : "?"));
+        s.pipelines_mm[name] = p;
         return p;
     }
 
@@ -1211,11 +1270,293 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
     }
 
     long long qsa_attn_count() { return g_qsa_attn_count.load(std::memory_order_relaxed); }
+
+    // ---- the prompt expert GEMM (Strata's moe_mm: tsm/kernels/tsm_moe_mm.metal) ---------------------------------
+    namespace
+    {
+        std::atomic<long long> g_moe_mm_count{0};
+        constexpr int kMmTm = 16;   // the plan's tile height (rows of one expert)
+        struct MmPlanArgs { std::uint32_t n_ent, topk, n_expert, tm, n_blocks; };
+        struct MmArgs
+        {
+            std::uint64_t gate_off, up_off, down_off, gu_stride, d_stride;
+            std::uint32_t gu_row, d_row, n_embd, n_ff;
+        };
+        static_assert(sizeof(MmArgs) == 56, "MmArgs must match tsm_moe_mm.metal");
+    }
+
+    bool moe_mm_enabled()
+    {
+        const char* e = std::getenv("TS_METAL_MOE_MM");
+        return !(e != nullptr && e[0] == '0');
+    }
+
+    bool moe_mm_supported(ggml_backend* backend, int gate_type, int up_type, int down_type, int hidden, int n_ff,
+                          int n_expert, int n_used)
+    {
+        if (!moe_mm_enabled()) return false;
+        ggml_metal_device_t dev = metal_device(backend);
+        if (dev == nullptr) return false;
+        // The instantiated tiles: Q2_0 everywhere; gate/up 128 n_ff rows a threadgroup, down 128 n_embd rows; K in
+        // chunks of 32; the plan's scan runs one thread an expert in one threadgroup.
+        if (gate_type != 42 || up_type != 42 || down_type != 42) return false;
+        if (hidden <= 0 || n_ff <= 0 || hidden % 128 != 0 || n_ff % 128 != 0) return false;
+        if (n_expert <= 0 || n_expert > 1024 || n_used <= 0) return false;
+        try
+        {
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+            ensure_library(s, device);
+            return mm_library(s, device);
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+    }
+
+    bool moe_mm_encode(ggml_backend* backend, const ggml_tensor* x, const ggml_tensor* ids, const ggml_tensor* wts,
+                       const ggml_tensor* gate, const ggml_tensor* up, const ggml_tensor* down, ggml_tensor* out,
+                       int T, int hidden, int n_ff, int n_expert, int n_used, bool wait)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm moe mm: not a Metal backend");
+            const std::int64_t t = T;
+            require_type(x, GGML_TYPE_F32, hidden * t, "x");
+            require_type(out, GGML_TYPE_F32, hidden * t, "out");
+            require_type(ids, GGML_TYPE_I32, n_used * t, "ids");
+            require_type(wts, GGML_TYPE_F32, n_used * t, "weights");
+            for (const ggml_tensor* w : {gate, up, down})
+                if (w == nullptr || w->type != GGML_TYPE_Q2_0 || w->ne[2] != n_expert || !ggml_is_contiguous(w))
+                    throw std::runtime_error("tsm moe mm: the experts are not contiguous Q2_0 stacks");
+            if (gate->ne[0] != hidden || gate->ne[1] != n_ff || up->ne[0] != hidden || up->ne[1] != n_ff
+                || down->ne[0] != n_ff || down->ne[1] != hidden)
+                throw std::runtime_error("tsm moe mm: expert shapes");
+            const ggml_metal_buffer_id gi = tensor_id(gate), ui = tensor_id(up), di = tensor_id(down);
+            // Strata's kernels address gate, up and down from one buffer: base + offset + expert * stride.
+            if (gi.metal != ui.metal || gi.metal != di.metal)
+                throw std::runtime_error("tsm moe mm: the expert stacks are in different buffers");
+            const std::size_t base = std::min({gi.offs, ui.offs, di.offs});
+            MmArgs ma{};
+            ma.gate_off = gi.offs - base; ma.up_off = ui.offs - base; ma.down_off = di.offs - base;
+            ma.gu_row = static_cast<std::uint32_t>(row_bytes(GGML_TYPE_Q2_0, hidden));
+            ma.d_row = static_cast<std::uint32_t>(row_bytes(GGML_TYPE_Q2_0, n_ff));
+            ma.gu_stride = static_cast<std::uint64_t>(ma.gu_row) * n_ff;
+            ma.d_stride = static_cast<std::uint64_t>(ma.d_row) * hidden;
+            ma.n_embd = static_cast<std::uint32_t>(hidden);
+            ma.n_ff = static_cast<std::uint32_t>(n_ff);
+            if (gate->nb[2] != ma.gu_stride || up->nb[2] != ma.gu_stride || down->nb[2] != ma.d_stride)
+                throw std::runtime_error("tsm moe mm: expert strides");
+            const std::uint32_t n_ent = static_cast<std::uint32_t>(n_used) * static_cast<std::uint32_t>(T);
+            const std::uint32_t n_blocks = (n_ent + 1023) / 1024;
+            const std::size_t max_rows = static_cast<std::size_t>(n_ent) + static_cast<std::size_t>(n_expert) * (kMmTm - 1);
+            const std::size_t max_tiles = (max_rows + kMmTm - 1) / kMmTm;
+            const MmPlanArgs pa{n_ent, static_cast<std::uint32_t>(n_used), static_cast<std::uint32_t>(n_expert),
+                static_cast<std::uint32_t>(kMmTm), n_blocks};
+            const ggml_metal_buffer_id xi = tensor_id(x), ii = tensor_id(ids), wi = tensor_id(wts), oi = tensor_id(out);
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                ensure_library(s, device);
+                if (!mm_library(s, device)) throw std::runtime_error("tsm moe mm: the tensor API does not run here");
+                const std::size_t blocks_bytes = static_cast<std::size_t>(n_blocks) * n_expert * sizeof(std::uint32_t);
+                s.mm_bcnt = grow(s, s.mm_bcnt, s.mm_bcnt_bytes, blocks_bytes);
+                s.mm_boff = grow(s, s.mm_boff, s.mm_boff_bytes, blocks_bytes);
+                s.mm_eoff = grow(s, s.mm_eoff, s.mm_eoff_bytes, static_cast<std::size_t>(n_expert) * sizeof(std::uint32_t));
+                s.mm_tiles = grow(s, s.mm_tiles, s.mm_tiles_bytes, max_tiles * 2 * sizeof(std::int32_t));
+                s.mm_stok = grow(s, s.mm_stok, s.mm_stok_bytes, max_rows * sizeof(std::int32_t));
+                s.mm_sw = grow(s, s.mm_sw, s.mm_sw_bytes, max_rows * sizeof(float));
+                s.mm_pos = grow(s, s.mm_pos, s.mm_pos_bytes, static_cast<std::size_t>(n_ent) * sizeof(std::int32_t));
+                s.mm_xs = grow(s, s.mm_xs, s.mm_xs_bytes, max_rows * hidden * sizeof(std::uint16_t));
+                s.mm_hs = grow(s, s.mm_hs, s.mm_hs_bytes, max_rows * n_ff * sizeof(std::uint16_t));
+                s.mm_ye = grow(s, s.mm_ye, s.mm_ye_bytes, max_rows * hidden * sizeof(float));
+                if (s.mm_meta == nil)
+                    s.mm_meta = grow(s, s.mm_meta, s.mm_meta_bytes, 16 * sizeof(std::uint32_t));
+                // The GEMMs' grid widths, which the scan leaves to the host (it writes their heights and the gather's).
+                auto* meta = static_cast<std::uint32_t*>([s.mm_meta contents]);
+                meta[2] = static_cast<std::uint32_t>(n_ff / (32 * 4));
+                meta[5] = static_cast<std::uint32_t>(hidden / (64 * 2));
+                id<MTLBuffer> W = (__bridge id<MTLBuffer>)gi.metal;
+                id<MTLCommandBuffer> cmd = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];   // serial: each pass reads the last
+                const std::uint32_t nclr = static_cast<std::uint32_t>(max_rows);
+                [enc setComputePipelineState:pipeline_mm(s, "mm_clear")];
+                [enc setBuffer:s.mm_stok offset:0 atIndex:0];
+                [enc setBytes:&nclr length:sizeof(nclr) atIndex:1];
+                [enc dispatchThreadgroups:MTLSizeMake((max_rows + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc setComputePipelineState:pipeline_mm(s, "mm_hist")];
+                bind(enc, ii, 0, 0);
+                [enc setBuffer:s.mm_bcnt offset:0 atIndex:1];
+                [enc setBytes:&pa length:sizeof(pa) atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(n_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+                [enc setComputePipelineState:pipeline_mm(s, "mm_scan")];
+                [enc setBuffer:s.mm_bcnt offset:0 atIndex:0];
+                [enc setBuffer:s.mm_boff offset:0 atIndex:1];
+                [enc setBuffer:s.mm_eoff offset:0 atIndex:2];
+                [enc setBuffer:s.mm_tiles offset:0 atIndex:3];
+                [enc setBuffer:s.mm_meta offset:0 atIndex:4];
+                [enc setBytes:&pa length:sizeof(pa) atIndex:5];
+                // whole simdgroups: each publishes its totals from lane 31 (threads past the experts count 0 rows)
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(static_cast<std::size_t>((n_expert + 31) / 32 * 32), 1, 1)];
+                [enc setComputePipelineState:pipeline_mm(s, "mm_place")];
+                bind(enc, ii, 0, 0);
+                bind(enc, wi, 0, 1);
+                [enc setBuffer:s.mm_boff offset:0 atIndex:2];
+                [enc setBuffer:s.mm_eoff offset:0 atIndex:3];
+                [enc setBuffer:s.mm_stok offset:0 atIndex:4];
+                [enc setBuffer:s.mm_sw offset:0 atIndex:5];
+                [enc setBuffer:s.mm_pos offset:0 atIndex:6];
+                [enc setBytes:&pa length:sizeof(pa) atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(n_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+                const std::uint32_t ne = static_cast<std::uint32_t>(hidden);
+                [enc setComputePipelineState:pipeline_mm(s, "mm_gather")];
+                bind(enc, xi, 0, 0);
+                [enc setBuffer:s.mm_stok offset:0 atIndex:1];
+                [enc setBuffer:s.mm_xs offset:0 atIndex:2];
+                [enc setBytes:&ne length:sizeof(ne) atIndex:3];
+                [enc dispatchThreadgroupsWithIndirectBuffer:s.mm_meta indirectBufferOffset:8 * sizeof(std::uint32_t)
+                                      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                // gate/up then down; buffers 5..8 (the SSD arena's slot map and chunks) are unused without its constant
+                [enc setComputePipelineState:pipeline_mm(s, "mm_gu3_42_16_32_32_4")];
+                [enc setBuffer:W offset:base atIndex:0];
+                [enc setBuffer:s.mm_xs offset:0 atIndex:1];
+                [enc setBuffer:s.mm_hs offset:0 atIndex:2];
+                [enc setBuffer:s.mm_tiles offset:0 atIndex:3];
+                [enc setBytes:&ma length:sizeof(ma) atIndex:4];
+                for (int b = 5; b <= 8; ++b) [enc setBuffer:W offset:base atIndex:b];
+                [enc dispatchThreadgroupsWithIndirectBuffer:s.mm_meta indirectBufferOffset:2 * sizeof(std::uint32_t)
+                                      threadsPerThreadgroup:MTLSizeMake(32 * 4, 1, 1)];
+                [enc setComputePipelineState:pipeline_mm(s, "mm_down3_42_16_64_32_2")];
+                [enc setBuffer:W offset:base atIndex:0];
+                [enc setBuffer:s.mm_hs offset:0 atIndex:1];
+                [enc setBuffer:s.mm_ye offset:0 atIndex:2];
+                [enc setBuffer:s.mm_tiles offset:0 atIndex:3];
+                [enc setBytes:&ma length:sizeof(ma) atIndex:4];
+                for (int b = 5; b <= 8; ++b) [enc setBuffer:W offset:base atIndex:b];
+                [enc dispatchThreadgroupsWithIndirectBuffer:s.mm_meta indirectBufferOffset:5 * sizeof(std::uint32_t)
+                                      threadsPerThreadgroup:MTLSizeMake(32 * 2, 1, 1)];
+                const std::uint32_t ca[4] = {static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(hidden),
+                    static_cast<std::uint32_t>(n_used), 0};
+                [enc setComputePipelineState:pipeline_mm(s, "mm_combine")];
+                [enc setBuffer:s.mm_ye offset:0 atIndex:0];
+                [enc setBuffer:s.mm_pos offset:0 atIndex:1];
+                [enc setBuffer:s.mm_sw offset:0 atIndex:2];
+                bind(enc, oi, 0, 3);
+                [enc setBytes:ca length:sizeof(ca) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake((static_cast<std::size_t>(T) * hidden + 255) / 256, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                [cmd commit];
+                s.last = cmd;
+                if (wait)
+                {
+                    [cmd waitUntilCompleted];
+                    if (cmd.status == MTLCommandBufferStatusError)
+                        throw std::runtime_error(std::string("tsm moe mm: ") +
+                            (cmd.error ? cmd.error.localizedDescription.UTF8String : "command buffer failed"));
+                }
+            }
+            g_moe_mm_count.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true))
+                std::fprintf(stderr, "[tsm] prompt experts run on Strata's grouped GEMM (moe_mm on the tensor API; "
+                    "TS_METAL_MOE_MM=0 keeps MUL_MAT_ID)\n");
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
+
+    long long moe_mm_count() { return g_moe_mm_count.load(std::memory_order_relaxed); }
+
+    void moe_mm_release()
+    {
+        State& s = state();
+        std::lock_guard<std::mutex> lock(s.mu);
+        if (s.mm_xs == nil && s.mm_ye == nil) return;
+        // The last pass's command buffer holds its own references; dropping ours frees the scratch once it completes.
+        s.mm_bcnt = s.mm_boff = s.mm_eoff = s.mm_tiles = s.mm_stok = s.mm_sw = s.mm_pos = nil;
+        s.mm_xs = s.mm_hs = s.mm_ye = nil;
+        s.mm_bcnt_bytes = s.mm_boff_bytes = s.mm_eoff_bytes = s.mm_tiles_bytes = 0;
+        s.mm_stok_bytes = s.mm_sw_bytes = s.mm_pos_bytes = s.mm_xs_bytes = s.mm_hs_bytes = s.mm_ye_bytes = 0;
+    }
 }
 
 // ---- test probe: one layer's held routes through moe_encode, on expert bytes the caller gives (stacked [expert]
 // gate rows, up rows, down rows in GGUF blocks), against a reference the caller computes. Returns 1, or 0 with the
 // last error set (the formats or shapes the kernels do not take, or no Metal backend).
+// ---- test probe: one layer's routed experts through moe_mm_encode (Strata's prompt expert GEMM) on stacked Q2_0
+// expert bytes the caller gives (gate [expert][n_ff rows of hidden], up likewise, down [expert][hidden rows of n_ff]),
+// T rows of x and n_used (id, weight) routes a row, into out [T][hidden]. Returns 1, or 0 with the last error set.
+TSG_EXPORT int TSGgml_TsmMoeMmProbe(int hidden, int n_ff, int n_expert, const void* gate, const void* up, const void* down,
+    int T, int n_used, const std::int32_t* ids, const float* weights, const float* x, float* out)
+{
+    using namespace tsg;
+    if (!ensure_backend()) return 0;
+    ggml_backend_t backend = g_backend;
+    ggml_backend_buffer_t wbuf = nullptr, abuf = nullptr;
+    ggml_context* ctx = nullptr;
+    try
+    {
+        if (!tsm::moe_mm_supported(backend, 42, 42, 42, hidden, n_ff, n_expert, n_used))
+            throw std::runtime_error("tsm moe mm probe: the kernels do not run here or take these shapes");
+        ggml_init_params ip{};
+        ip.mem_size = 16 * ggml_tensor_overhead();
+        ip.no_alloc = true;
+        ctx = ggml_init(ip);
+        ggml_tensor* g = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, hidden, n_ff, n_expert);
+        ggml_tensor* u = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, hidden, n_ff, n_expert);
+        ggml_tensor* d = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, n_ff, hidden, n_expert);
+        wbuf = ggml_backend_alloc_ctx_tensors(ctx, backend);   // the three stacks in one buffer, as the kernels address them
+        if (wbuf == nullptr) throw std::runtime_error("tsm moe mm probe: weight buffer");
+        ggml_backend_tensor_set(g, gate, 0, ggml_nbytes(g));
+        ggml_backend_tensor_set(u, up, 0, ggml_nbytes(u));
+        ggml_backend_tensor_set(d, down, 0, ggml_nbytes(d));
+        ggml_context* actx = nullptr;
+        ggml_init_params ap{};
+        ap.mem_size = 8 * ggml_tensor_overhead();
+        ap.no_alloc = true;
+        actx = ggml_init(ap);
+        ggml_tensor* xin = ggml_new_tensor_2d(actx, GGML_TYPE_F32, hidden, T);
+        ggml_tensor* res = ggml_new_tensor_2d(actx, GGML_TYPE_F32, hidden, T);
+        ggml_tensor* it = ggml_new_tensor_2d(actx, GGML_TYPE_I32, n_used, T);
+        ggml_tensor* wt = ggml_new_tensor_3d(actx, GGML_TYPE_F32, 1, n_used, T);
+        abuf = ggml_backend_alloc_ctx_tensors(actx, backend);
+        if (abuf == nullptr) { ggml_free(actx); throw std::runtime_error("tsm moe mm probe: activation buffer"); }
+        ggml_backend_tensor_set(xin, x, 0, ggml_nbytes(xin));
+        ggml_backend_tensor_set(it, ids, 0, ggml_nbytes(it));
+        ggml_backend_tensor_set(wt, weights, 0, ggml_nbytes(wt));
+        const bool ok = tsm::moe_mm_encode(backend, xin, it, wt, g, u, d, res, T, hidden, n_ff, n_expert, n_used, true);
+        if (ok) ggml_backend_tensor_get(res, out, 0, ggml_nbytes(res));
+        ggml_backend_buffer_free(abuf);
+        ggml_free(actx);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx);
+        return ok ? 1 : 0;
+    }
+    catch (const std::exception& e)
+    {
+        if (abuf) ggml_backend_buffer_free(abuf);
+        if (wbuf) ggml_backend_buffer_free(wbuf);
+        if (ctx) ggml_free(ctx);
+        tsg::set_last_error(e.what());
+        return 0;
+    }
+}
+
+// Test hook: the prompt expert layers that ran on moe_mm_encode in this process.
+TSG_EXPORT long long TSGgml_TsmMoeMmCount() { return tsm::moe_mm_count(); }
+
 TSG_EXPORT int TSGgml_TsmMoeProbe(int gate_type, int down_type, int hidden, int n_ff, int n_expert,
     const void* gate, const void* up, const void* down, int T, int n_used, const std::int32_t* slots,
     const float* weights, const float* x, float* out)

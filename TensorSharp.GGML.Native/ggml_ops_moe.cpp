@@ -2032,7 +2032,27 @@ namespace
         }
 
         const auto t_compute = std::chrono::steady_clock::now();
-        ggml_status status = tsg::compute_graph(g_backend, graph);
+        // A plain streamed layer of Q2_0 experts on Metal: Strata's grouped expert GEMM (tsm::moe_mm_encode) on the
+        // staged stacks instead of the graph's three MUL_MAT_ID - gate, up and SwiGLU in one pass on the matrix units,
+        // the down projection, then each token's weighted sum in route order into hidden_out_t.
+        bool experts_on_tsm = false;
+#if defined(TSG_GGML_USE_METAL)
+        if (stream_experts && standalone_mode && activation_type == 0 && up_w != nullptr && !fused_gate_up
+            && !single_projection_activation && gate_bias_t == nullptr && up_bias_t == nullptr && down_bias_t == nullptr
+            && post_expert_norm_t == nullptr && route_up_scale_t == nullptr
+            && tsm::moe_mm_supported(g_backend, gate_type, up_type, down_type, hidden_dim, n_ff, num_experts, n_used))
+        {
+            experts_on_tsm = tsm::moe_mm_encode(g_backend, hidden_t, ids_t, weights_t, gate_w, up_w, down_w, hidden_out_t,
+                seq_len, hidden_dim, n_ff, num_experts, n_used, true);
+            if (!experts_on_tsm)
+            {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true))
+                    std::fprintf(stderr, "[tsm] prompt experts fall back to MUL_MAT_ID: %s\n", g_last_error.c_str());
+            }
+        }
+#endif
+        ggml_status status = experts_on_tsm ? GGML_STATUS_SUCCESS : tsg::compute_graph(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
         {
             set_last_error("MoE prefill: ggml_backend_graph_compute failed.");
@@ -3115,6 +3135,10 @@ namespace tsg
                 std::fflush(stderr);
             }
         }
+#if defined(TSG_GGML_USE_METAL)
+        // A prompt pass may have run its experts on the tensor-API GEMM: its scratch goes with the pass.
+        if (pass_seq > 8) tsm::moe_mm_release();
+#endif
         if (s_pass_timing)
         {
             const int seq = segments.empty() ? 0 : segments[0].seq_len;

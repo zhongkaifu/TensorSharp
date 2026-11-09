@@ -140,4 +140,20 @@ namespace tsm
                          const ggml_tensor* idx, const ggml_tensor* cnt, const ggml_tensor* mask_in, ggml_tensor* out,
                          int T, int n_head, int n_head_kv, int n_cells, int width, float scale);
     long long qsa_attn_count();
+
+    // A prompt chunk's routed experts on Strata's grouped GEMM (tsm/kernels/tsm_moe_mm.metal, the Metal 4 tensor API):
+    // the (token, expert) entries sorted by expert into 16-row tiles, gate+up+SwiGLU in one pass, down, then each
+    // token's weighted sum in route order. Q2_0 gate/up/down stacks in one Metal buffer; TS_METAL_MOE_MM=0 turns it off.
+    bool moe_mm_enabled();
+    bool moe_mm_supported(ggml_backend* backend, int gate_type, int up_type, int down_type, int hidden, int n_ff,
+                          int n_expert, int n_used);
+    // x / out F32 [hidden, T]; ids I32 and wts F32 [n_used, T]; gate / up [hidden, n_ff, n_expert], down [n_ff, hidden,
+    // n_expert]. wait: return only once the output is written. False with the last error set.
+    bool moe_mm_encode(ggml_backend* backend, const ggml_tensor* x, const ggml_tensor* ids, const ggml_tensor* wts,
+                       const ggml_tensor* gate, const ggml_tensor* up, const ggml_tensor* down, ggml_tensor* out,
+                       int T, int hidden, int n_ff, int n_expert, int n_used, bool wait);
+    long long moe_mm_count();
+    // Drops moe_mm_encode's scratch (~0.8 GB at a 4096-row chunk of Flash Next): called once a prompt pass is done, so
+    // decode does not carry it.
+    void moe_mm_release();
 }

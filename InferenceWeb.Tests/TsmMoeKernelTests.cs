@@ -273,4 +273,106 @@ public sealed class TsmMoeKernelTests
         Assert.All(got, x => Assert.True(float.IsFinite(x)));
         _output.WriteLine($"one layer: {ms:F2} ms ({ms * 12 / 1000:F2} s for the 12 QSA layers of a chunk)");
     }
+
+    /// <summary>Strata's prompt expert GEMM (tsm::moe_mm_encode, the Metal 4 tensor API): a prompt chunk's routes sorted
+    /// by expert into 16-row tiles (an expert with 1 row, one past a tile, most spanning several), gate+up+SwiGLU in one
+    /// pass, down, each row's weighted sum in route order. Against a double-precision reference over ggml's own
+    /// dequantization that rounds where the kernels do (x and the SwiGLU product to fp16, as the matrix units take them):
+    /// within accumulation-order noise; against the unrounded reference: fp16's rounding.</summary>
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(40)]
+    [InlineData(301)]
+    public void PromptExpertGemm_AnswersAsTheDoublePrecisionReference(int rows)
+    {
+        const int hidden = 512, nFf = 256, nExpert = 12, nUsed = 4;
+        var q2 = SyntheticGguf.GgmlType.Q2_0;
+        byte[] Stack(string name, int cols, int rowsPerExpert, float scale)
+            => SyntheticGguf.Blocks(name, q2, scale, cols, rowsPerExpert, nExpert).RawBlocks;
+        byte[] gate = Stack("mm-gate", hidden, nFf, 1.5f / MathF.Sqrt(hidden));
+        byte[] up = Stack("mm-up", hidden, nFf, 1.5f / MathF.Sqrt(hidden));
+        byte[] down = Stack("mm-down", nFf, hidden, 0.5f / MathF.Sqrt(nFf));
+        float[] Dequant(byte[] bytes, long n)
+        {
+            var f = new float[n];
+            var h = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+            var o = GCHandle.Alloc(f, GCHandleType.Pinned);
+            try { GgmlGgufTensorDequant.DequantizeToFloat32Native((int)q2, h.AddrOfPinnedObject(), o.AddrOfPinnedObject(), n); }
+            finally { h.Free(); o.Free(); }
+            return f;
+        }
+        float[] gw = Dequant(gate, (long)nExpert * nFf * hidden), uw = Dequant(up, (long)nExpert * nFf * hidden);
+        float[] dw = Dequant(down, (long)nExpert * hidden * nFf);
+
+        var rng = new Random(rows * 17 + 5);
+        var x = new float[rows * hidden];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+        // Expert 3 in every row (several tiles), expert 11 in row 0 only (one row), the rest spread; distinct within a row.
+        var ids = new int[rows * nUsed];
+        var weights = new float[rows * nUsed];
+        for (int r = 0; r < rows; r++)
+        {
+            var used = new HashSet<int> { 3 };
+            ids[r * nUsed] = 3;
+            for (int k = 1; k < nUsed; k++)
+            {
+                int e = r == 0 && k == 1 ? 11 : (r * 5 + k * 7) % 11;
+                while (!used.Add(e)) e = (e + 1) % 11;
+                ids[r * nUsed + k] = e;
+            }
+            for (int k = 0; k < nUsed; k++) weights[r * nUsed + k] = (float)(0.1 + rng.NextDouble());
+        }
+
+        var got = new float[rows * hidden];
+        long before = GgmlBasicOps.TsmMoeMmCount();
+        Assert.True(GgmlBasicOps.TsmMoeMmProbe(hidden, nFf, nExpert, gate, up, down, rows, nUsed, ids, weights, x, got),
+            GgmlBasicOps.LastNativeError("probe failed"));
+        Assert.Equal(before + 1, GgmlBasicOps.TsmMoeMmCount());
+
+        static double F16(double v) => (double)(System.Half)(float)v;
+        double maxRounded = 0, maxPlain = 0, maxRef = 0;
+        var hRounded = new double[nFf];
+        var hPlain = new double[nFf];
+        for (int r = 0; r < rows; r++)
+        {
+            var yRounded = new double[hidden];
+            var yPlain = new double[hidden];
+            for (int k = 0; k < nUsed; k++)
+            {
+                int e = ids[r * nUsed + k];
+                for (int j = 0; j < nFf; j++)
+                {
+                    double g = 0, u = 0, g16 = 0, u16 = 0;
+                    long row = ((long)e * nFf + j) * hidden;
+                    for (int c = 0; c < hidden; c++)
+                    {
+                        double xc = x[r * hidden + c], x16 = F16(xc);
+                        g += gw[row + c] * xc; u += uw[row + c] * xc;
+                        g16 += gw[row + c] * x16; u16 += uw[row + c] * x16;
+                    }
+                    hPlain[j] = g / (1 + Math.Exp(-g)) * u;
+                    hRounded[j] = F16(g16 / (1 + Math.Exp(-g16)) * u16);
+                }
+                for (int i = 0; i < hidden; i++)
+                {
+                    double d = 0, d16 = 0;
+                    long row = ((long)e * hidden + i) * nFf;
+                    for (int j = 0; j < nFf; j++) { d += dw[row + j] * hPlain[j]; d16 += dw[row + j] * hRounded[j]; }
+                    yPlain[i] += weights[r * nUsed + k] * d;
+                    yRounded[i] += weights[r * nUsed + k] * d16;
+                }
+            }
+            for (int i = 0; i < hidden; i++)
+            {
+                double v = got[r * hidden + i];
+                Assert.True(double.IsFinite(v));
+                maxRounded = Math.Max(maxRounded, Math.Abs(v - yRounded[i]));
+                maxPlain = Math.Max(maxPlain, Math.Abs(v - yPlain[i]));
+                maxRef = Math.Max(maxRef, Math.Abs(yPlain[i]));
+            }
+        }
+        _output.WriteLine($"rows {rows}: max |ref| {maxRef:E3}; error vs the fp16-rounded reference {maxRounded / maxRef:E3}, "
+            + $"vs the unrounded {maxPlain / maxRef:E3}");
+        Assert.True(maxRounded / maxRef < 1e-4, $"vs the rounded reference: {maxRounded / maxRef:E3}");
+        Assert.True(maxPlain / maxRef < 5e-3, $"vs the unrounded reference: {maxPlain / maxRef:E3}");
+    }
 }
