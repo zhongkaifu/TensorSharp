@@ -1734,6 +1734,32 @@ both arms:
 | a warp per block | 0.85 / 0.58 / 0.56 s | 2.48 / 2.47 / 2.47 s | 0.74 s / 3.12-3.13 s |
 | tensor cores (default) | 0.84 / 0.56 / 0.55 s | 2.39 / 2.38 / 2.38 s | 0.73-0.74 s / 3.00-3.01 s |
 
+#### A layer's dense weights dequantized once per prompt group, 2026-11-09
+
+A prompt's dense projections (Q4_K, IQ4_XS, Q5_K, Q3_K, Q4_0 and Q2_0 in the ISTA pack, and the Q8_0 hyper-connection
+copies under `TS_Q4E_HC_Q8=1`) run as F16 tensor-core GEMMs on a copy of the weight dequantized for the call. A prompt
+group (`TS_Q4E_PROMPT_GROUP`, 4,096 rows) already runs each layer over its four 1,024-row ubatches back to back, but
+each ubatch dequantized the layer's weights again. On a 16K prompt that was 183 ms of the 242 ms that dequantizing and
+converting took (nsys). Strata dequantizes per 8K-token chunk.
+
+Now (`TS_Q4E_GROUP_F16`, on) the first ubatch of a layer dequantizes each weight into the group's F16 arena and the
+others reuse that copy. The copy is the same kernel's output, so every product is the same bit for bit.
+`APromptGroupsDenseWeights_DequantizedOncePerLayer_AnswerBitForBit` runs two 520-row ubatches a layer and checks that the
+prompt's and the decode steps' logits are unchanged.
+
+The arena holds the largest layer's quantized projections as F16: 194 MiB for the ISTA pack, a GDN layer with the PLE
+key. Residency plans around it, as around the group's streams, so 147 experts fewer stay in VRAM (17,632 -> 17,485,
+98.4% -> 98.3% of the profiled routes). That can move decode steps, which compute host experts on the CPU.
+
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q4E_GROUP_F16=0` dequantizes per ubatch). TTFT of three
+runs, the first cold. The engine bench's short_chat, long_prompt_4k/16k and long_generation checks pass 8/8 in both
+arms:
+
+| dense weights in a prompt group | 4K prompt (3,541 tokens) | 16K prompt (14,093 tokens) | engine bench 4K / 16K TTFT | long generation |
+| --- | --- | --- | --- | --- |
+| dequantized per ubatch | 0.85 / 0.56 / 0.55 s | 2.39 / 2.38 / 2.38 s | 0.74 s / 3.00-3.01 s | 241-244 tok/s |
+| once per layer and group (default) | 0.80 / 0.53 / 0.51 s | 2.28 / 2.27 / 2.27 s | 0.70 s / 2.85-2.86 s | 237-252 tok/s |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the

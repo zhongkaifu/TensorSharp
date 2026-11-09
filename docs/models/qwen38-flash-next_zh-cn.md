@@ -1257,6 +1257,29 @@ RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（warp 内
 | 每个块一个 warp | 0.85 / 0.58 / 0.56 s | 2.48 / 2.47 / 2.47 s | 0.74 s / 3.12-3.13 s |
 | tensor core（默认） | 0.84 / 0.56 / 0.55 s | 2.39 / 2.38 / 2.38 s | 0.73-0.74 s / 3.00-3.01 s |
 
+#### 每个 prompt 组只把一层的稠密权重反量化一次，2026-11-09
+
+prompt 的稠密投影（ISTA 包中的 Q4_K、IQ4_XS、Q5_K、Q3_K、Q4_0 与 Q2_0，以及 `TS_Q4E_HC_Q8=1` 下 hyper-connection 的 Q8_0
+副本）在为本次调用反量化出的权重副本上以 F16 tensor core GEMM 运行。prompt 组（`TS_Q4E_PROMPT_GROUP`，4,096 行）已经让每一层
+连续处理它的四个 1,024 行 ubatch，但每个 ubatch 都重新反量化这一层的权重。在 16K prompt 上，反量化与转换共用 242 ms，其中
+183 ms 是这一部分（nsys）。Strata 每个 8K token 的分块反量化一次。
+
+现在（`TS_Q4E_GROUP_F16`，默认开启）一层的第一个 ubatch 把每个权重反量化到组的 F16 arena 中，其余 ubatch 复用该副本。副本就是
+同一内核的输出，因此每个乘积逐位相同。`APromptGroupsDenseWeights_DequantizedOncePerLayer_AnswerBitForBit` 让每层运行两个 520 行
+的 ubatch，并检查 prompt 与 decode 步的 logits 不变。
+
+arena 保存最大一层的量化投影的 F16 形式：ISTA 包为 194 MiB，即带 PLE key 的 GDN 层。驻留规划会像为组的流预留空间一样为它
+预留，因此显存中少留 147 个专家（17,632 -> 17,485，所分析路由的 98.4% -> 98.3%）。这可能改变 decode 步的结果，因为 decode
+步在 CPU 上计算主机专家。
+
+RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（`TS_Q4E_GROUP_F16=0` 时每个 ubatch 反量化一次）。三次运行的 TTFT，
+第一次为冷启动。引擎基准的 short_chat、long_prompt_4k/16k 与 long_generation 检查两组均为 8/8 通过：
+
+| prompt 组中的稠密权重 | 4K prompt（3,541 token） | 16K prompt（14,093 token） | 引擎基准 4K / 16K TTFT | 长生成 |
+| --- | --- | --- | --- | --- |
+| 每个 ubatch 反量化 | 0.85 / 0.56 / 0.55 s | 2.39 / 2.38 / 2.38 s | 0.74 s / 3.00-3.01 s | 241-244 tok/s |
+| 每层每组一次（默认） | 0.80 / 0.53 / 0.51 s | 2.28 / 2.27 / 2.27 s | 0.70 s / 2.85-2.86 s | 237-252 tok/s |
+
 ### ggml_metal 上的 DFlash2 草稿模型，2026-11-08
 
 Strata 在 Mac 上用 DFlash2 起草：一种块草稿模型，一次前向最多提出 7 个 token。TensorSharp 现在在 GGML 后端上也能使用同一个草稿模型：

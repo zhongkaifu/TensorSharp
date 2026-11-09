@@ -142,7 +142,19 @@ namespace TensorSharp.Cuda
                     Console.Error.WriteLine($"[q4e-cuda] prompts run in ubatch order: a layer's staging holds {_expertStage.Capacity} "
                         + $"experts, fewer than its {m.NExpert} (ubatch {m.NUbatch}), so it cannot be kept across a layer's ubatches.");
                 else
+                {
                     _groupXs = AllocF32(dev, PromptGroupRows, hcE);
+                    long f16Bytes = GroupF16Bytes();
+                    if (f16Bytes > 0)
+                    {
+                        try { _groupF16 = AllocT(dev, DType.UInt8, f16Bytes); }
+                        catch (Exception ex) when (ex is OutOfMemoryException or CudaException or InvalidOperationException)
+                        {
+                            Console.Error.WriteLine($"[q4e-cuda] the prompt groups' F16 weight arena ({f16Bytes / 1048576.0:F0} MiB) did not fit "
+                                + $"({ex.Message}); each ubatch dequantizes its weights again.");
+                        }
+                    }
+                }
             }
             CudaDriverApi.cuEventCreate(out dev.XsReadyEv, 0x02 /*DISABLE_TIMING*/).ThrowOnError();
             CudaDriverApi.cuEventCreate(out dev.CopyDoneEv, 0x02).ThrowOnError();
@@ -576,6 +588,35 @@ namespace TensorSharp.Cuda
         /// <summary>The group's stream bytes residency plans around (one GPU only).</summary>
         private long PromptGroupBytes() => PromptGroupRows > _m.NUbatch ? (long)PromptGroupRows * HcDim * 4 : 0;
 
+        // TS_Q4E_GROUP_F16=0: every ubatch of a prompt group dequantizes its layer's dense weights to F16 again.
+        private readonly bool _groupF16Env = Environment.GetEnvironmentVariable("TS_Q4E_GROUP_F16") != "0";
+        private Tensor _groupF16;
+
+        /// <summary>F16 weight arena bytes of a prompt group: the largest layer's quantized dense projections as F16, each on
+        /// a 256-byte boundary (the F16 GEMM route's copies; F32, F16 and BF16 weights are used as they are). Zero without
+        /// prompt groups. Residency plans around it, as around the group's streams.</summary>
+        private long GroupF16Bytes()
+        {
+            if (!_groupF16Env || PromptGroupBytes() == 0 || _m.Layers == null)
+                return 0;
+            static long F16(in CudaWeightDesc w)
+                => w.GgmlType is 0 or 1 or 30 || w.Ne0 <= 0 || w.Ne1 <= 0 ? 0 : ((long)w.Ne0 * w.Ne1 * 2 + 255) & ~255L;
+            long most = 0;
+            foreach (var l in _m.Layers)
+            {
+                long sum = F16(l.HcAttnDown) + F16(l.HcAttnUp) + F16(l.HcFfnDown) + F16(l.HcFfnUp)
+                    + F16(l.Qkv) + F16(l.Gate) + F16(l.SsmOut) + F16(l.Wq) + F16(l.Wk) + F16(l.Wv) + F16(l.Wo)
+                    + F16(l.PleKey) + F16(l.PleValue) + F16(l.GateShexp) + F16(l.UpShexp) + F16(l.DownShexp);
+                most = Math.Max(most, sum);
+            }
+            return most;
+        }
+
+        /// <summary>Dense weights the prompt groups dequantized into the arena, and GEMM calls that reused such a copy
+        /// (a test proves the path engaged).</summary>
+        internal long GroupF16Dequantized { get; private set; }
+        internal long GroupF16Reused { get; private set; }
+
         /// <summary>Prompt groups read layer by layer so far (a test proves the path engaged).</summary>
         internal long PromptGroupsRun { get; private set; }
 
@@ -650,17 +691,33 @@ namespace TensorSharp.Cuda
                     else
                         staged = false;
                     _promptStage = stage;
-                    for (int r0 = 0; r0 < g; r0 += ub)
+                    // The layer's ubatches share its dense weights' F16 copies: dequantized by the first, reused by the rest.
+                    CudaQuantizedOps.F16WeightScope f16 = _groupF16 != null && g > ub
+                        ? CudaQuantizedOps.BeginF16WeightScope(dev.Alloc, Ptr(_groupF16), _groupF16.ElementCount())
+                        : null;
+                    try
                     {
-                        int nt = Math.Min(ub, g - r0);
-                        using Tensor xs = Block(_groupXs, r0, nt, hc);
-                        dev.Xs = xs;
-                        // The PLE rows of a ubatch are gathered when its PLE block runs (the histories take its tokens
-                        // then, in position order as before).
-                        if (L.Ple)
-                            GatherPleRows(slot, tokens, tokOff + r0, nt, p0 + r0, null, null);
-                        // No fused scatter into the next layer's mixer: the next call is the next ubatch of this layer.
-                        RunLayer(dev, il, slot, nt, p0 + r0, null, null, IntPtr.Zero);
+                        for (int r0 = 0; r0 < g; r0 += ub)
+                        {
+                            int nt = Math.Min(ub, g - r0);
+                            using Tensor xs = Block(_groupXs, r0, nt, hc);
+                            dev.Xs = xs;
+                            // The PLE rows of a ubatch are gathered when its PLE block runs (the histories take its tokens
+                            // then, in position order as before).
+                            if (L.Ple)
+                                GatherPleRows(slot, tokens, tokOff + r0, nt, p0 + r0, null, null);
+                            // No fused scatter into the next layer's mixer: the next call is the next ubatch of this layer.
+                            RunLayer(dev, il, slot, nt, p0 + r0, null, null, IntPtr.Zero);
+                        }
+                    }
+                    finally
+                    {
+                        if (f16 != null)
+                        {
+                            GroupF16Dequantized += f16.Dequantized;
+                            GroupF16Reused += f16.Reused;
+                            f16.Dispose();
+                        }
                     }
                     // The layer's ubatches shared one staging.
                     CudaMoe.Unstage(dev.DK, stage, L.Stage, dev.Stream);

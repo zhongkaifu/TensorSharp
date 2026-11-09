@@ -660,6 +660,55 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     }
 
     /// <summary>
+    /// A prompt group's ubatches share their layer's dense weights as F16 (TS_Q4E_GROUP_F16): the first ubatch of a layer
+    /// dequantizes each quantized projection into the group's arena and the others reuse that copy, which is the same
+    /// kernel's output, so the prompt and the decode steps after it answer bit for bit as dequantizing per ubatch does.
+    /// 520-row ubatches (past the Q8_0 MMQ's 512 rows, so the fixture's Q8_0 projections take the F16 route) of an
+    /// 1,100-token prompt in groups of 1,040 rows: two ubatches a layer, then a group of one.
+    /// </summary>
+    [CudaFact]
+    public void APromptGroupsDenseWeights_DequantizedOncePerLayer_AnswerBitForBit()
+    {
+        _env.Set("TS_Q4E_HOST_EXPERTS", "0");
+        _env.Set("MAX_CONTEXT", "2048");    // the class keeps 1024; the prompt is 1,100 tokens
+        _env.Set("TS_Q4E_UBATCH", "520");
+        _env.Set("TS_Q4E_PROMPT_GROUP", "1040");
+        string path = Fixture(indexerTopK: 16, q2kxlExperts: true);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        // Prompt groups need expert residency: two thirds resident.
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes * 2 / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        int[] prompt = Enumerable.Range(0, 1100).Select(i => (i * 37 + 11) % 250).ToArray();
+
+        (float[][] Rows, long Groups, long Dequantized, long Reused) Answer(string f16)
+        {
+            _env.Set("TS_Q4E_GROUP_F16", f16);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            var rows = new float[Steps.Length + 1][];
+            rows[0] = (float[])model.ForwardRefill(prompt).Clone();
+            for (int i = 0; i < Steps.Length; i++)
+                rows[i + 1] = (float[])model.Forward(new[] { Steps[i] }).Clone();
+            return (rows, engine.PromptGroupsRun, engine.GroupF16Dequantized, engine.GroupF16Reused);
+        }
+        var perUbatch = Answer("0");
+        var shared = Answer(null);
+        _output.WriteLine($"prompt groups {shared.Groups}: F16 copies dequantized {shared.Dequantized}, reused {shared.Reused} " +
+            $"(per ubatch: {perUbatch.Dequantized} / {perUbatch.Reused})");
+        Assert.Equal(2, perUbatch.Groups);
+        Assert.Equal(2, shared.Groups);
+        Assert.Equal(0, perUbatch.Dequantized + perUbatch.Reused);
+        Assert.True(shared.Dequantized > 0, "no layer dequantized a weight into the group's arena");
+        Assert.Equal(shared.Dequantized, shared.Reused);    // two ubatches a layer in the first group, the second alone
+        for (int i = 0; i < shared.Rows.Length; i++)
+            Assert.True(shared.Rows[i].AsSpan().SequenceEqual(perUbatch.Rows[i]),
+                $"{(i == 0 ? "prefill" : $"decode {i}")}: sharing the layer's F16 weights changed the logits");
+    }
+
+    /// <summary>
     /// The route-tail skip (TS_MOE_ROUTE_TAIL_SKIP; Strata's STRATA_ROUTE_TAIL_SKIP): in decode steps and verify windows a
     /// host expert every row routes at the given rank or lower is left out. The fixture routes 4 of 16 experts, so rank 2
     /// leaves out misses at ranks 2-3: some slots are skipped and the answers move; a rank as wide as the selection skips
