@@ -491,6 +491,7 @@ AdaLN 来自学习的 `[8,1025]` 曲线表，三模态分别取调制参数。
 | `TS_H3_CUDNN_ATTENTION=0` | `ggml_cuda`：注意力保留在 ggml 的 flash attention，而不用 cuDNN 融合 SDPA；`TS_H3_CUDNN_ATTENTION_VERBOSE=1` 打印 cuDNN 计划与回退 |
 | `TS_H3_CUBLAS_MATMUL=0` | `ggml_cuda`：DiT 的宽 Q4_K 投影保留在 MMQ，而不用 cuBLAS BF16；`TS_H3_CUBLAS_MIN_ROWS`（默认 1024）为 token 阈值 |
 | `TS_H3_FUSED=0` | `ggml_cuda`：构建未融合的 DiT 与 VAE 图（不融合注意力前处理、调制、门控残差与 LoRA 合并） |
+| `TS_H3_CUDA_F32_PRODUCTS=1` | `ggml_cuda`：DiT 前向的权重矩阵乘（F32/F16/BF16 权重与 LoRA 因子；量化权重与注意力自身的乘法不在内）改在 TensorSharp 的 F32 GEMM（pedantic cuBLAS 句柄）上计算，而不用 ggml-cuda 的 TF32 cuBLAS。默认关闭（真实检查点上的开销未测）；在全 F32 的 LoRA 一致性夹具上，原生路径对直接 CPU 路径的底噪由 6.08e-4 降到 8.07e-6。无法走该路径的乘法会在 stderr 上点名一次并在 ggml 上运行 |
 | `TS_H3_PREFAULT` | 托管去噪器预读：0 关、1 串行、2 提前重叠、3 默认流水线 |
 | `TS_H3_PREFAULT_THREADS` | 去噪器预读的读取线程；macOS 默认 1，Linux 默认 16（同一遍扫描中并发读取 8 MiB 块，网络卷需要这种并发） |
 | `TS_VIDEO_READAHEAD=0` | 关闭 `ggml_cuda` 文本编码器预读（在上传的页预热之前并发读取）；与 LTX 2.5 共用 |
