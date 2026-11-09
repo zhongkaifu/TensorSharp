@@ -2664,6 +2664,57 @@ __device__ __forceinline__ float ts_dsv4_router_score(float logit, int gating)
 #define TS_DSV4_SELECT_PER_LANE 16   // register-held router scores per lane (512 experts)
 #define TS_DSV4_SELECT_MAX_USED 16   // experts a token may select
 
+// The warp select's scores of a lane's experts (lane + 32 i): raw, the weight's score (Qwen's softmax over the row, or the
+// gating's own), and v = raw + bias, the ranking score (-inf past nExpert). Both select kernels take them from here.
+__device__ __forceinline__ void ts_dsv4_select_scores(
+    const float* __restrict__ lg, const float* __restrict__ bias, const int nExpert, const int gating, const int lane,
+    float (&v)[TS_DSV4_SELECT_PER_LANE], float (&raw)[TS_DSV4_SELECT_PER_LANE])
+{
+    if (gating == TS_DSV4_ROUTER_SOFTMAX)
+    {
+        // ggml's soft_max: exp(l - max) times the reciprocal of their sum.
+        float mx = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
+        {
+            const int e = lane + 32 * i;
+            raw[i] = e < nExpert ? lg[e] : -INFINITY;
+            mx = fmaxf(mx, raw[i]);
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
+        {
+            raw[i] = lane + 32 * i < nExpert ? expf(raw[i] - mx) : 0.0f;
+            sum += raw[i];
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            sum += __shfl_xor_sync(0xffffffffu, sum, off);
+        const float inv = 1.0f / sum;
+#pragma unroll
+        for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
+        {
+            const int e = lane + 32 * i;
+            raw[i] *= inv;
+            v[i] = e < nExpert ? raw[i] + (bias != nullptr ? bias[e] : 0.0f) : -INFINITY;
+        }
+    }
+    else
+    {
+#pragma unroll
+        for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
+        {
+            const int e = lane + 32 * i;
+            raw[i] = e < nExpert ? ts_dsv4_router_score(lg[e], gating) : 0.0f;
+            v[i] = e < nExpert ? raw[i] + (bias != nullptr ? bias[e] : 0.0f) : -INFINITY;
+        }
+    }
+}
+
 extern "C" __global__ void ts_dsv4_moe_select_f32(
     const float* __restrict__ logits,   // [nt, nExpert]
     const float* __restrict__ bias,     // [nExpert] or null
@@ -2699,49 +2750,7 @@ extern "C" __global__ void ts_dsv4_moe_select_f32(
         {
             const int lane = threadIdx.x;
             float v[TS_DSV4_SELECT_PER_LANE], raw[TS_DSV4_SELECT_PER_LANE];
-            if (gating == TS_DSV4_ROUTER_SOFTMAX)
-            {
-                // ggml's soft_max: exp(l - max) times the reciprocal of their sum.
-                float mx = -INFINITY;
-#pragma unroll
-                for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
-                {
-                    const int e = lane + 32 * i;
-                    raw[i] = e < nExpert ? lg[e] : -INFINITY;
-                    mx = fmaxf(mx, raw[i]);
-                }
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1)
-                    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-                float sum = 0.0f;
-#pragma unroll
-                for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
-                {
-                    raw[i] = lane + 32 * i < nExpert ? expf(raw[i] - mx) : 0.0f;
-                    sum += raw[i];
-                }
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1)
-                    sum += __shfl_xor_sync(0xffffffffu, sum, off);
-                const float inv = 1.0f / sum;
-#pragma unroll
-                for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
-                {
-                    const int e = lane + 32 * i;
-                    raw[i] *= inv;
-                    v[i] = e < nExpert ? raw[i] + (bias != nullptr ? bias[e] : 0.0f) : -INFINITY;
-                }
-            }
-            else
-            {
-#pragma unroll
-                for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
-                {
-                    const int e = lane + 32 * i;
-                    raw[i] = e < nExpert ? ts_dsv4_router_score(lg[e], gating) : 0.0f;
-                    v[i] = e < nExpert ? raw[i] + (bias != nullptr ? bias[e] : 0.0f) : -INFINITY;
-                }
-            }
+            ts_dsv4_select_scores(lg, bias, nExpert, gating, lane, v, raw);
             // Each lane keeps the best of its own scores (the higher score, then the lower index), so
             // a pick is one shuffle argmax over the lanes' bests and only the winning lane rescans.
             // Every register array is indexed by unrolled constants: the pick loop itself runs at
@@ -2887,6 +2896,101 @@ extern "C" __global__ void ts_dsv4_moe_select_f32(
         }
         for (int j = 0; j < nUsed; ++j)
             wT[j] = w[j] * wScale;
+    }
+}
+
+// A select key: the ranking score's order-preserving bits above the expert's complement, so the larger key is the higher
+// score, then the lower expert - ts_dsv4_moe_select_f32's order. 0 for a score never picked (-inf or NaN); -0 ranks as +0
+// (the float compare's equals).
+__device__ __forceinline__ unsigned long long ts_dsv4_select_key(const float v, const int e)
+{
+    if (!(v > -INFINITY))
+        return 0ull;
+    unsigned int u = __float_as_uint(v == 0.0f ? 0.0f : v);
+    u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ((unsigned long long)u << 32) | (unsigned int)~e;
+}
+
+__device__ __forceinline__ unsigned long long ts_dsv4_key_max(const unsigned long long a, const unsigned long long b)
+{
+    return a > b ? a : b;
+}
+
+// The largest of a lane's keys, as a tree (four steps, where a scan in order chained sixteen compares).
+__device__ __forceinline__ unsigned long long ts_dsv4_key_max16(const unsigned long long (&k)[TS_DSV4_SELECT_PER_LANE])
+{
+    unsigned long long a[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        a[i] = ts_dsv4_key_max(k[2 * i], k[2 * i + 1]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        a[i] = ts_dsv4_key_max(a[2 * i], a[2 * i + 1]);
+    return ts_dsv4_key_max(ts_dsv4_key_max(a[0], a[1]), ts_dsv4_key_max(a[2], a[3]));
+}
+
+// ts_dsv4_moe_select_f32's warp path (up to 512 experts, no hash LUT) for up to 32 picks, with the same picks and weights in
+// fewer dependent steps. One warp a row (a block of 32). Each score is a 64-bit key (ts_dsv4_select_key), so a pick is a
+// max over two shuffles a step where the float argmax carried score, weight and expert through three, and the winning lane
+// re-takes its best as a tree. Lane k keeps pick k; the weights are read back from shared memory at the end and summed in
+// pick order (the same sum, add for add), and every lane writes its own pick, where lane 0 wrote each pick and read the
+// weights back from global memory to scale them. Requires nExpert <= 512 and nUsed <= 32.
+extern "C" __global__ void __launch_bounds__(32) ts_dsv4_moe_select_keys_f32(
+    const float* __restrict__ logits,   // [nt, nExpert]
+    const float* __restrict__ bias,     // [nExpert] or null
+    int32_t* __restrict__ sel,          // [nt, nUsed]
+    float* __restrict__ wOut,           // [nt, nUsed]
+    const int nExpert,
+    const int nUsed,
+    const int norm,
+    const float wScale,
+    const int gating)
+{
+    const int t = blockIdx.x, lane = threadIdx.x;
+    const float* lg = logits + (size_t)t * nExpert;
+    __shared__ float shRaw[32 * TS_DSV4_SELECT_PER_LANE];
+    float v[TS_DSV4_SELECT_PER_LANE], raw[TS_DSV4_SELECT_PER_LANE];
+    ts_dsv4_select_scores(lg, bias, nExpert, gating, lane, v, raw);
+    unsigned long long key[TS_DSV4_SELECT_PER_LANE];
+#pragma unroll
+    for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
+    {
+        const int e = lane + 32 * i;
+        shRaw[e] = raw[i];
+        key[i] = e < nExpert ? ts_dsv4_select_key(v[i], e) : 0ull;
+    }
+    unsigned long long best = ts_dsv4_key_max16(key);
+    int mySel = 0;
+    for (int k = 0; k < nUsed; ++k)
+    {
+        unsigned long long m = best;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            m = ts_dsv4_key_max(m, __shfl_xor_sync(0xffffffffu, m, off));
+        // No candidate left (every score -inf or NaN): expert 0, weighed by its own score.
+        const int chosen = m == 0ull ? 0 : (int)~(unsigned int)m;
+        if (lane == k)
+            mySel = chosen;
+        if (m != 0ull && (chosen & 31) == lane)
+        {
+            const int slot = chosen >> 5;
+#pragma unroll
+            for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
+                if (i == slot)
+                    key[i] = 0ull;
+            best = ts_dsv4_key_max16(key);
+        }
+    }
+    __syncwarp();
+    const float myW = lane < nUsed ? shRaw[mySel] : 0.0f;
+    float wsum = 0.0f;
+    for (int k = 0; k < nUsed; ++k)
+        wsum += __shfl_sync(0xffffffffu, myW, k);
+    if (lane < nUsed)
+    {
+        const float inv = 1.0f / fmaxf(wsum, 6.103515625e-5f);
+        sel[(size_t)t * nUsed + lane] = mySel;
+        wOut[(size_t)t * nUsed + lane] = (norm ? myW * inv : myW) * wScale;
     }
 }
 
