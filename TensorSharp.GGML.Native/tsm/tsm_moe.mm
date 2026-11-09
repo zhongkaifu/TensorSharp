@@ -500,12 +500,14 @@ namespace tsm
             static const bool on = [] { const char* e = std::getenv("TS_METAL_SEAM_PROFILE"); return e && e[0] == '1'; }();
             return on;
         }
+        // One accumulator per width (a speculative session changes width nearly every pass, so a shared one that
+        // restarted on every change never printed).
+        struct SeamWidthAcc { double segments = 0, seams = 0; int n = 0; };
         struct SeamProfile
         {
             std::mutex m;
             std::map<std::uint64_t, std::vector<std::pair<double, double>>> passes;   // by pass base: (start, end) a seam
-            double segments = 0, seams = 0;
-            int n = 0, rows = 0;
+            std::map<int, SeamWidthAcc> widths;
         };
         SeamProfile& seam_prof() { static SeamProfile p; return p; }
         void seam_profile_note(std::uint64_t pass, int seam, int n_seams, int rows, double start, double end)
@@ -516,20 +518,19 @@ namespace tsm
             if (v.empty()) v.assign(n_seams, {0.0, 0.0});
             v[seam] = {start, end};
             for (const auto& x : v) if (x.second == 0.0) return;
-            if (rows != p.rows) { p.segments = p.seams = 0; p.n = 0; p.rows = rows; }
+            SeamWidthAcc& a = p.widths[rows];
             for (int k = 0; k < n_seams; ++k)
             {
-                p.seams += v[k].second - v[k].first;
-                if (k > 0) p.segments += v[k].first - v[k - 1].second;
+                a.seams += v[k].second - v[k].first;
+                if (k > 0) a.segments += v[k].first - v[k - 1].second;
             }
             p.passes.erase(pass);
-            if (++p.n == 32)
+            if (++a.n == 32)
             {
                 std::fprintf(stderr, "[tsm] seamed pass on the GPU (%d rows, %d seams): segments 1..%d %.2f ms, seams %.2f ms "
-                    "(their kernels and the wait for the host)\n", rows, n_seams, n_seams - 1, p.segments * 1e3 / 32,
-                    p.seams * 1e3 / 32);
-                p.segments = p.seams = 0;
-                p.n = 0;
+                    "(their kernels and the wait for the host)\n", rows, n_seams, n_seams - 1, a.segments * 1e3 / 32,
+                    a.seams * 1e3 / 32);
+                a = SeamWidthAcc{};
             }
         }
     }
