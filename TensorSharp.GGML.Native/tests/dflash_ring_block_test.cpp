@@ -5,7 +5,8 @@
 // concatenates the ring with the block in every layer (TS_DFLASH_RING_BLOCK=0): the same drafts, confidences and
 // selector lattices over a wrapping ring, step after step (replayed graphs included), and the ring rows a later window
 // can read left exactly as the injects wrote them. On CUDA the batched draft (two lanes, each on its own ring) is checked
-// against the single-lane drafts too.
+// against the single-lane drafts too. On Metal the fused convolution (TS_DFLASH_METAL_FUSE: row-offset views) is
+// checked bit for bit against the per-tap chains.
 //
 // The selector keeps every token (top-k = the vocabulary) and its lattice is compared keyed by token ids: the drafts
 // differ by float rounding, which can reorder near-tied candidates (on CUDA's attention, ~6e-5) and so permute the
@@ -77,7 +78,8 @@ int TSGgml_DFlashDraftBlockBatched(
 
 namespace {
 // Two query heads over one KV head; the ring has a block and an anchor of headroom past the window (DFlashConfig.RingRows).
-constexpr int N = 2, H = 64, NH = 2, NKV = 1, HD = 32, FF = 128, FEAT = 128, VOCAB = 64;
+// The hidden size is Flash Next's: rows past 1024 floats once caught a ggml-metal copy that stopped at 1024.
+constexpr int N = 2, H = 2560, NH = 2, NKV = 1, HD = 32, FF = 128, FEAT = 128, VOCAB = 64;
 constexpr int RING = 160, SW = 128, B = 8, RANK = 16, TOPK = VOCAB, TAPS = 2, GROUP = 16;
 constexpr int PROMPT = 150, STEPS = 14;
 
@@ -231,8 +233,9 @@ std::vector<float> live_rows(Lane& lane) {
 int accepted(int step) { return (step * 3) % B + 1; }
 
 // The whole sequence (prompt, then STEPS of draft + accept) under one TS_DFLASH_RING_BLOCK setting.
-bool run(Weights& w, bool ring_block, bool selector, std::uint32_t seed, std::vector<Step>& out) {
+bool run(Weights& w, bool ring_block, bool selector, std::uint32_t seed, std::vector<Step>& out, bool fuse = true) {
     setenv("TS_DFLASH_RING_BLOCK", ring_block ? "1" : "0", 1);
+    setenv("TS_DFLASH_METAL_FUSE", fuse ? "1" : "0", 1);
     Lane lane(seed);
     bool ok = true;
     for (int p = 0; ok && p < PROMPT; p += B) ok = inject(w, lane, p, std::min(B, PROMPT - p));
@@ -333,7 +336,20 @@ int main(int argc, char** argv) {
                     "live ring rows identical %d\n", selector ? 2 : 1, STEPS, worst, int(same_picks), int(same_rows));
         if (!(worst < 1e-3f) || !same_picks || !same_rows) return 1;
         if (backend == 3 && !batched(w, selector)) return 1;
+        if (backend == 1) {
+            std::vector<Step> chains;
+            if (!run(w, true, selector, 3, chains, false)) return 1;
+            bool exact = true;
+            for (int s = 0; s < STEPS; ++s)
+                exact = exact && chains[s].ids == slots[s].ids && chains[s].floats == slots[s].floats && chains[s].ring == slots[s].ring;
+            float fdiff = 0;
+            for (int s = 0; s < STEPS; ++s) fdiff = std::max(fdiff, max_rel(chains[s].floats, slots[s].floats));
+            std::printf("DFlash%d: fused convolution vs per-tap chains: bit-identical %d (max relative difference %.3g)\n",
+                        selector ? 2 : 1, int(exact), fdiff);
+            if (!exact) return 1;
+        }
     }
+    unsetenv("TS_DFLASH_METAL_FUSE");
     unsetenv("TS_DFLASH_RING_BLOCK");
     TSGgml_Shutdown();
     std::puts("PASS DFlash ring-slot block: drafts, confidences, selector lattices and live ring rows match the concatenation");
