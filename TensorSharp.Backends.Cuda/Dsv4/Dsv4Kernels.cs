@@ -46,7 +46,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr moeGateUpStaged;
         private readonly IntPtr moeDownStaged;
         private readonly IntPtr moeMma;
-        private readonly IntPtr q2i8QuantAct, q2i8GateUp, q2i8Down;
+        private readonly IntPtr q2i8QuantAct, q2i8GateUp, q2i8Down, moeRowMap;
         private readonly IntPtr moeGateUpDecode;
         private readonly IntPtr moeDownDecode;
         private readonly IntPtr denseQ81Rows;
@@ -228,6 +228,9 @@ namespace TensorSharp.Cuda
                 q2i8GateUp = module.GetFunction("ts_dsv4_moe_q2i8_gateup_f32");
                 q2i8Down = module.GetFunction("ts_dsv4_moe_q2i8_down_f32");
                 HasMoeQ2I8 = CudaKernels.ArchGuardedKernelsUsable(module.CompiledArchOf("ts_dsv4_moe_q2i8_gateup_f32"), ccMajor);
+                // The down kernel's act-row map came with this kernel: a module without it ignores the map.
+                try { moeRowMap = module.GetFunction("ts_dsv4_moe_row_map_i32"); }
+                catch (CudaException ex) when (ex.ErrorCode == 500) { moeRowMap = IntPtr.Zero; }
             }
             catch (CudaException ex) when (ex.ErrorCode == 500) { }
             moeGateUpDecode = module.GetFunction("ts_dsv4_moe_gateup_decode_f32");
@@ -789,15 +792,34 @@ namespace TensorSharp.Cuda
         /// <summary>Q2_0 down projection of every member slot of every expert on int8 tensor cores, from
         /// <see cref="MoeQ2I8GateUp"/>'s <paramref name="hq"/> (slot order) into <paramref name="output"/> [slots][rows].</summary>
         public void MoeQ2I8Down(IntPtr downW, IntPtr hq, Tensor counts, Tensor offsets, Tensor output, int rows, int ff,
-            long rowBytes, int nExpert, IntPtr stream, IntPtr downTab = default)
+            long rowBytes, int nExpert, IntPtr stream, IntPtr downTab = default, IntPtr actRow = default)
         {
             if (!MoeQ2I8Supports(rows, ff))
                 throw new ArgumentException($"expert widths {rows} x {ff} are not multiples of 128");
+            if (actRow != IntPtr.Zero && !HasMoeRowMap)
+                throw new InvalidOperationException("the loaded module's int8 down kernel predates its act-row map");
             IntPtr a0 = downW, a1 = hq, a2 = P(counts), a3 = P(offsets), a4 = P(output);
             int a5 = rows, a6 = ff; long a7 = rowBytes;
-            IntPtr a8 = downTab;
-            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8 };
+            IntPtr a8 = downTab, a9 = actRow;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9 };
             Launch(q2i8Down, CeilDiv(rows, 128), (uint)nExpert, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>Whether the module maps a ubatch's slots onto a group's int8 H rows (<see cref="MoeRowMap"/> and
+        /// <see cref="MoeQ2I8Down"/>'s actRow).</summary>
+        public bool HasMoeRowMap => HasMoeQ2I8 && moeRowMap != IntPtr.Zero;
+
+        /// <summary>For one ubatch of a group: actRow[rowOfSlot[s]] = groupRowOfSlot[baseSlot + s] over its
+        /// <paramref name="slots"/> slots, the group grouping's row holding each slot's H at the row the ubatch's own grouping
+        /// gives it.</summary>
+        public void MoeRowMap(Tensor rowOfSlot, Tensor groupRowOfSlot, int baseSlot, Tensor actRow, int slots, IntPtr stream)
+        {
+            if (slots <= 0)
+                return;
+            IntPtr a0 = P(rowOfSlot), a1 = P(groupRowOfSlot), a3 = P(actRow);
+            int a2 = baseSlot, a4 = slots;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
+            Launch(moeRowMap, CeilDiv(slots, BlockSize), 1, 1, BlockSize, 0, stream, args);
         }
 
         /// <summary>Gate/up of every (token, selected expert) slot of <paramref name="nt"/> tokens,

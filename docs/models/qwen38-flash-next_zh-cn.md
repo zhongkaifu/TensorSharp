@@ -1280,6 +1280,36 @@ RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（`TS_Q4E_
 | 每个 ubatch 反量化 | 0.85 / 0.56 / 0.55 s | 2.39 / 2.38 / 2.38 s | 0.74 s / 3.00-3.01 s | 241-244 tok/s |
 | 每层每组一次（默认） | 0.80 / 0.53 / 0.51 s | 2.28 / 2.27 / 2.27 s | 0.70 s / 2.85-2.86 s | 237-252 tok/s |
 
+#### 每个 prompt 组只运行一次路由专家的 gate/up，2026-11-09
+
+在 int8 内核上，1,024 行的 ubatch 平均每个专家约 20 个 token，而每个 ubatch 都重新读取每个专家的权重。16K 时仅重复读取就约
+476 GB，以 RTX 5090 的带宽计算，未做任何运算就要 264 ms。一层的 gate/up 在 1,024 行上用 0.52 ms，在 4,096 行上用 1.27 ms
+（`CudaMoeQ2_0Int8Tests` 计时）。Strata 以 8K token 的分块读取 prompt。
+
+在 prompt 组中，下一层要等组内所有 ubatch 都跑完这一层才开始。因此组内的 ubatch 现在把路由专家留到这一层的最后
+（`TS_Q4E_GROUP_EXPERTS`，默认开启）：
+
+- 每个 ubatch 暂存它缺失的专家（整层保留），并运行它的 router 与共享专家。
+- 它把选择结果、int8 激活、共享专家输出与 scatter logits 留在组的缓冲区中。
+- 最后一个 ubatch 之后，一次分组计划和一次 gate/up 覆盖整个组，因此每个专家的 gate 与 up 权重每层每组只读取一次。
+- down 仍按 ubatch 运行，因此其逐 slot 输出保持原大小。每个 ubatch 的 down 通过组的计划读取其 slot 的 H
+  （`ts_dsv4_moe_row_map_i32` 与 down 内核的 act-row 映射），随后是合并与写入流的 scatter。
+
+每个 slot 的乘积都与按 ubatch 顺序相同，因此 prompt 的结果逐位相同
+（`APromptGroupsExpertGateUp_RunOncePerLayer_AnswersBitForBit`：每组 192 行的 64 行 ubatch，Q2_0 专家）。
+
+4,096 行时这些缓冲区占 85 MiB，主要是共享专家输出与 H，因此显存中少留 64 个专家（17,485 -> 17,421）。组的最后一个
+ubatch 不超过 16 行时，该组保持 ubatch 顺序，因为该 ubatch 运行逐 slot 内核；int8 路线不接管的层也一样。
+
+RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（`TS_Q4E_GROUP_EXPERTS=0` 时按 ubatch 运行 gate/up）。三次运行的
+TTFT，第一次为冷启动。引擎基准的 short_chat、long_prompt_4k/16k 与 long_generation 检查两组均为 8/8 通过：
+
+| prompt 组中路由专家的 gate/up | 4K prompt（3,541 token） | 16K prompt（14,092 token） | 引擎基准 4K / 16K TTFT | 长生成 |
+| --- | --- | --- | --- | --- |
+| 每个 ubatch | 0.81 / 0.53 / 0.53 s | 2.28 / 2.27 / 2.27 s | 0.70 s / 2.86 s | 240-251 tok/s |
+| 每层每组一次（默认） | 0.79 / 0.51 / 0.49 s | 2.23 / 2.21 / 2.21 s | 0.67 s / 2.74-2.76 s | 243-254 tok/s |
+| Strata（11-07） | | | 0.92 s / 2.75 s | 300-307 tok/s |
+
 ### ggml_metal 上的 DFlash2 草稿模型，2026-11-08
 
 Strata 在 Mac 上用 DFlash2 起草：一种块草稿模型，一次前向最多提出 7 个 token。TensorSharp 现在在 GGML 后端上也能使用同一个草稿模型：

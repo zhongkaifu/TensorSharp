@@ -279,11 +279,13 @@ public sealed class CudaMoeQ2_0Int8Tests
     /// engine's default, on the F16 and the int8 tensor-core kernels. Uniform random routes, so nearly every
     /// expert's weights are read once per ubatch, as in a long prompt.
     /// </summary>
-    [CudaFact]
+    [CudaTheory]
     [Trait("Category", "Bench")]
-    public void ALayerOfFlashNextExperts_F16AgainstInt8_Timing()
+    [InlineData(1024)]
+    [InlineData(4096)]
+    public void ALayerOfFlashNextExperts_F16AgainstInt8_Timing(int nt)
     {
-        const int experts = 512, used = 10, nt = 1024, perSlotMaxRows = 16, reps = 20;
+        const int experts = 512, used = 10, perSlotMaxRows = 16, reps = 20;
         long guRowBytes = E / 64 * 18L, downRowBytes = Ff / 64 * 18L;
         byte[] gate = Q2_0Rows(experts * Ff, E, seed: 41);
         byte[] up = Q2_0Rows(experts * Ff, E, seed: 42);
@@ -338,8 +340,25 @@ public sealed class CudaMoeQ2_0Int8Tests
                 return sw.Elapsed.TotalMilliseconds / reps;
             }
             double f16 = Time(false), i8 = Time(true), f16Again = Time(false), i8Again = Time(true);
+            // The int8 kernels alone, on the grouping and activations the last int8 call left in the scratch.
+            IntPtr xa = Ptr(scratch.ExpUp), hq = Ptr(scratch.ExpGate), stream = allocator.Stream.Handle;
+            double Kernel(Action launch)
+            {
+                for (int i = 0; i < 3; i++)
+                    launch();
+                allocator.Stream.Synchronize();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int i = 0; i < reps; i++)
+                    launch();
+                allocator.Stream.Synchronize();
+                return sw.Elapsed.TotalMilliseconds / reps;
+            }
+            double gu = Kernel(() => dk.MoeQ2I8GateUp(g.Ptr, u.Ptr, xa, scratch.Counts, scratch.Offsets, scratch.SlotToken, hq,
+                Ff, E, guRowBytes, 0f, experts, stream));
+            double dn = Kernel(() => dk.MoeQ2I8Down(d.Ptr, hq, scratch.Counts, scratch.Offsets, scratch.ExpDown, E, Ff, downRowBytes,
+                experts, stream));
             _output.WriteLine($"512 experts, top 10, {nt} rows, 2560 x 640 Q2_0: F16 tensor cores {f16:F3} / {f16Again:F3} ms, " +
-                $"int8 tensor cores {i8:F3} / {i8Again:F3} ms a layer");
+                $"int8 tensor cores {i8:F3} / {i8Again:F3} ms a layer (int8 gate/up {gu:F3} ms, down {dn:F3} ms)");
         }
         finally
         {

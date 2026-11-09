@@ -329,6 +329,38 @@ namespace TensorSharp.Cuda
                 dk.MoeUnstage(stageLayer, stage, stream);
         }
 
+        /// <summary>Whether <see cref="StageKept"/> can serve a layer: nothing to stage, or staging that keeps what earlier
+        /// calls of the layer staged.</summary>
+        internal static bool CanStageKept(Dsv4Kernels dk, CudaExpertStage stage, in CudaExpertStageLayer stageLayer)
+            => stage == null || !stageLayer.IsValid || !stageLayer.Staged || (dk.HasStageKeep && stage.StageFrom != IntPtr.Zero);
+
+        /// <summary>
+        /// The staging <see cref="Experts"/> does with keepStaged, for a call that runs its products later (Flash Next's
+        /// prompt groups): the experts <paramref name="sel"/> selects that have no VRAM slot are staged, and what earlier
+        /// calls of the layer staged stays. The layer ends with <see cref="Unstage"/>. Needs <see cref="CanStageKept"/>.
+        /// </summary>
+        internal static void StageKept(Dsv4Kernels dk, Tensor sel, int slots, CudaExpertStage stage,
+            in CudaExpertStageLayer stageLayer, IntPtr stream)
+        {
+            if (stage == null || !stageLayer.IsValid || !stageLayer.Staged)
+                return;
+            dk.MoeStageMarkFrom(stage, stream);
+            dk.MoeStagePlan(sel, slots, stageLayer, stage, stream);
+            dk.MoeStageCopyNew(stageLayer, stage, slots, stream);
+        }
+
+        /// <summary>The grouping plan of <paramref name="slots"/> selections, all on the device: per-expert counts, their
+        /// exclusive scan, each slot's row in expert order and each row's token (the plan <see cref="Experts"/> builds for
+        /// a long ubatch).</summary>
+        internal static void Plan(Dsv4Kernels dk, CudaKernels kernels, Tensor sel, Tensor counts, Tensor offsets, Tensor cursors,
+            Tensor rowOfSlot, Tensor slotToken, int slots, int nUsed, int nExpert, IntPtr stream)
+        {
+            kernels.LaunchFillF32(Dsv4CudaEngine.Ptr(counts), nExpert, 0f, stream);
+            dk.MoeCount(sel, counts, slots, stream);
+            dk.MoeScan(counts, offsets, cursors, nExpert, stream);
+            dk.MoeScatter(sel, cursors, rowOfSlot, slotToken, slots, nUsed, stream);
+        }
+
         private static void RunExperts(Dsv4Kernels dk, CudaKernels kernels, CudaMoeScratch s,
             in DeviceWeight gate, in DeviceWeight up, in DeviceWeight down,
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
@@ -364,10 +396,7 @@ namespace TensorSharp.Cuda
             }
 
             // The grouping plan, all on the device.
-            kernels.LaunchFillF32(Dsv4CudaEngine.Ptr(s.Counts), nExpert, 0f, stream);
-            dk.MoeCount(s.Sel, s.Counts, slots, stream);
-            dk.MoeScan(s.Counts, s.Offsets, s.Cursors, nExpert, stream);
-            dk.MoeScatter(s.Sel, s.Cursors, s.RowOfSlot, s.SlotToken, slots, nUsed, stream);
+            Plan(dk, kernels, s.Sel, s.Counts, s.Offsets, s.Cursors, s.RowOfSlot, s.SlotToken, slots, nUsed, nExpert, stream);
 
             if (int8)
             {

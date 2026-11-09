@@ -709,6 +709,54 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     }
 
     /// <summary>
+    /// A prompt group runs its routed experts' gate/up once over all its ubatches (TS_Q4E_GROUP_EXPERTS): each ubatch
+    /// stages its missed experts and leaves its selections, int8 activations, shared-expert outputs and scatter logits to
+    /// the group; after the last, gate/up runs over the group and each ubatch's down reads its slots' H through the group's
+    /// plan. Every slot's products are ubatch order's, so the prompt and the decode steps after it answer bit for bit as
+    /// the per-ubatch experts do. Q2_0 experts on the int8 route, 64-row ubatches of a 300-token prompt in groups of 192
+    /// rows: three ubatches, then 64 and 44.
+    /// </summary>
+    [CudaFact]
+    public void APromptGroupsExpertGateUp_RunOncePerLayer_AnswersBitForBit()
+    {
+        _env.Set("TS_Q4E_HOST_EXPERTS", "0");
+        _env.Set("TS_Q4E_UBATCH", "64");
+        _env.Set("TS_Q4E_PROMPT_GROUP", "192");
+        string path = Fixture(indexerTopK: 16, expertGateUpType: SyntheticGguf.GgmlType.Q2_0, expertDownType: SyntheticGguf.GgmlType.Q2_0);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        // Prompt groups need expert residency: two thirds resident.
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes * 2 / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        int[] prompt = Enumerable.Range(0, 300).Select(i => (i * 37 + 11) % 250).ToArray();
+
+        (float[][] Rows, long Groups, long Deferred) Answer(string grouped)
+        {
+            _env.Set("TS_Q4E_GROUP_EXPERTS", grouped);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            var rows = new float[Steps.Length + 1][];
+            rows[0] = (float[])model.ForwardRefill(prompt).Clone();
+            for (int i = 0; i < Steps.Length; i++)
+                rows[i + 1] = (float[])model.Forward(new[] { Steps[i] }).Clone();
+            return (rows, engine.PromptGroupsRun, engine.GroupExpertsRun);
+        }
+        var perUbatch = Answer("0");
+        var grouped = Answer(null);
+        _output.WriteLine($"prompt groups {grouped.Groups}: layers whose gate/up ran over the group {grouped.Deferred} " +
+            $"(per ubatch: {perUbatch.Deferred})");
+        Assert.Equal(2, perUbatch.Groups);
+        Assert.Equal(2, grouped.Groups);
+        Assert.Equal(0, perUbatch.Deferred);
+        Assert.Equal(2L * Qwen4ExpSyntheticModelBuilder.Layers, grouped.Deferred);
+        for (int i = 0; i < grouped.Rows.Length; i++)
+            Assert.True(grouped.Rows[i].AsSpan().SequenceEqual(perUbatch.Rows[i]),
+                $"{(i == 0 ? "prefill" : $"decode {i}")}: running the group's gate/up at once changed the logits");
+    }
+
+    /// <summary>
     /// The route-tail skip (TS_MOE_ROUTE_TAIL_SKIP; Strata's STRATA_ROUTE_TAIL_SKIP): in decode steps and verify windows a
     /// host expert every row routes at the given rank or lower is left out. The fixture routes 4 of 16 experts, so rank 2
     /// leaves out misses at ranks 2-3: some slots are skipped and the answers move; a rank as wide as the selection skips

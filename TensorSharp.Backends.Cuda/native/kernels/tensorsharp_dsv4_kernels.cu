@@ -3901,7 +3901,8 @@ __device__ __forceinline__ void ts_q2i8_block(const uint32_t* __restrict__ w, in
 // One CTA of either projection over every member token of its expert, in passes of 64. GU: gate and up of
 // features [r0, r0 + 64) against the members' tokens' activations (act per token, slotToken maps a member
 // to it), SwiGLU, and H quantized per 32 features into hq (per member row, the down kernel's activations).
-// !GU: down rows [r0, r0 + 128) against hq (act per member row), F32 into out per member row.
+// !GU: down rows [r0, r0 + 128) against hq (act per member row, or the row slotToken names when it is set),
+// F32 into out per member row.
 template <bool GU>
 __device__ __forceinline__ void ts_q2i8_expert(
     const uint8_t* __restrict__ wA, const uint8_t* __restrict__ wB, const long long rowBytes, const int r0,
@@ -3930,7 +3931,10 @@ __device__ __forceinline__ void ts_q2i8_expert(
         const int nrows8 = (nrows + 7) & ~7;            // rows a live n8 tile reads
         __syncthreads();                                // the previous pass is done with smem and srow
         if (tid < TS_Q2I8_TILE)
-            srow[tid] = GU ? slotToken[off + p0 + min(tid, nrows - 1)] : off + p0 + min(tid, nrows - 1);
+        {
+            const int r = off + p0 + min(tid, nrows - 1);
+            srow[tid] = slotToken != nullptr ? slotToken[r] : r;
+        }
         __syncthreads();
 
         auto load = [&](int kp) {
@@ -4144,8 +4148,10 @@ extern "C" __global__ void __launch_bounds__(TS_Q2I8_THREADS, 2) ts_dsv4_moe_q2i
 #endif
 }
 
-// Down rows [blockIdx.x * 128, +128) of expert blockIdx.y against its member slots' H (hq, in slot order),
-// F32 into out [slots][rows]. Requires ff % 128 == 0 and rows % 128 == 0.
+// Down rows [blockIdx.x * 128, +128) of expert blockIdx.y against its member slots' H, F32 into out [slots][rows].
+// hq holds H in this grouping's member order, or (actRow set) in another grouping's: member i reads row actRow[i]
+// (Flash Next's prompt groups run gate/up once over a group's ubatches and down per ubatch). Requires ff % 128 == 0
+// and rows % 128 == 0.
 extern "C" __global__ void __launch_bounds__(TS_Q2I8_THREADS, 2) ts_dsv4_moe_q2i8_down_f32(
     const uint8_t* __restrict__ downW,
     const uint8_t* __restrict__ hq,
@@ -4155,7 +4161,8 @@ extern "C" __global__ void __launch_bounds__(TS_Q2I8_THREADS, 2) ts_dsv4_moe_q2i
     const int rows,
     const int ff,
     const long long rowBytes,
-    const unsigned long long* __restrict__ downTab)
+    const unsigned long long* __restrict__ downTab,
+    const int32_t* __restrict__ actRow)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     const int e = blockIdx.y;
@@ -4164,11 +4171,29 @@ extern "C" __global__ void __launch_bounds__(TS_Q2I8_THREADS, 2) ts_dsv4_moe_q2i
     if (m == 0 || r0 >= rows)
         return;
     ts_q2i8_expert<false>(ts_dsv4_expert_rows(downW, downTab, e, (size_t)rows * rowBytes), nullptr, rowBytes, r0,
-        hq, (long long)(ff / 64) * TS_Q2I8_AB, ff / 128, nullptr, offsets[e], m,
+        hq, (long long)(ff / 64) * TS_Q2I8_AB, ff / 128, actRow, offsets[e], m,
         nullptr, 0, 0, 0.0f, out, rows);
 #else
     (void)downW; (void)hq; (void)counts; (void)offsets; (void)out; (void)rows; (void)ff; (void)rowBytes; (void)downTab;
+    (void)actRow;
 #endif
+}
+
+// For the slots of one ubatch of a group: actRow[rowOfSlot[s]] = groupRowOfSlot[base + s], the row of the group's
+// grouping that holds slot s's H, at the row the ubatch's own grouping gives the slot.
+extern "C" __global__ void ts_dsv4_moe_row_map_i32(
+    const int32_t* __restrict__ rowOfSlot,
+    const int32_t* __restrict__ groupRowOfSlot,
+    const int base,
+    int32_t* __restrict__ actRow,
+    const int slots)
+{
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= slots)
+        return;
+    const int r = rowOfSlot[s];
+    if (r >= 0)
+        actRow[r] = groupRowOfSlot[base + s];
 }
 
 // Expert gate/up projections over grouped tokens. grid (nExpert, ffTiles, 2);

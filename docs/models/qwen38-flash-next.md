@@ -1760,6 +1760,42 @@ arms:
 | dequantized per ubatch | 0.85 / 0.56 / 0.55 s | 2.39 / 2.38 / 2.38 s | 0.74 s / 3.00-3.01 s | 241-244 tok/s |
 | once per layer and group (default) | 0.80 / 0.53 / 0.51 s | 2.28 / 2.27 / 2.27 s | 0.70 s / 2.85-2.86 s | 237-252 tok/s |
 
+#### The routed experts' gate/up once per prompt group, 2026-11-09
+
+On the int8 kernels, a 1,024-row ubatch gives an expert about 20 tokens, and every ubatch read every expert's weights
+again. At 16K, that re-reading alone is about 476 GB, 264 ms at the RTX 5090's bandwidth before any arithmetic. One layer's
+gate/up takes 0.52 ms over 1,024 rows and 1.27 ms over 4,096 (`CudaMoeQ2_0Int8Tests` timing). Strata reads its prompts in
+8K-token chunks.
+
+Within a prompt group the next layer starts only after all the group's ubatches have run this one. So a group's ubatches
+now leave their routed experts to the end of the layer (`TS_Q4E_GROUP_EXPERTS`, on):
+
+- Each ubatch stages its missed experts (kept for the layer) and runs its router and shared expert.
+- It leaves its selections, int8 activations, shared-expert outputs and scatter logits in the group's buffers.
+- After the last ubatch, one grouping plan and one gate/up run over the whole group, so each expert's gate and up
+  weights are read once per layer and group.
+- Down stays per ubatch, so its per-slot outputs keep their size. Each ubatch's down reads its slots' H through the
+  group's plan (`ts_dsv4_moe_row_map_i32`, and the down kernel's act-row map). The combine and the scatter into the
+  streams follow.
+
+Every slot's products are ubatch order's, so a prompt answers the same bit for bit
+(`APromptGroupsExpertGateUp_RunOncePerLayer_AnswersBitForBit`: 64-row ubatches in groups of 192 rows, Q2_0 experts).
+
+The buffers take 85 MiB at 4,096 rows, mostly the shared-expert outputs and H, so 64 experts fewer stay in VRAM
+(17,485 -> 17,421). A group whose last ubatch has
+16 rows or fewer keeps ubatch order, because that ubatch runs the per-slot kernels. So does any layer the int8 route does
+not take.
+
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q4E_GROUP_EXPERTS=0` runs gate/up per ubatch). TTFT
+of three runs, the first cold. The engine bench's short_chat, long_prompt_4k/16k and long_generation
+checks pass 8/8 in both arms:
+
+| routed experts' gate/up in a prompt group | 4K prompt (3,541 tokens) | 16K prompt (14,092 tokens) | engine bench 4K / 16K TTFT | long generation |
+| --- | --- | --- | --- | --- |
+| per ubatch | 0.81 / 0.53 / 0.53 s | 2.28 / 2.27 / 2.27 s | 0.70 s / 2.86 s | 240-251 tok/s |
+| once per layer and group (default) | 0.79 / 0.51 / 0.49 s | 2.23 / 2.21 / 2.21 s | 0.67 s / 2.74-2.76 s | 243-254 tok/s |
+| Strata (11-07) | | | 0.92 s / 2.75 s | 300-307 tok/s |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
