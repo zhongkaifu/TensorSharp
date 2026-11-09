@@ -123,8 +123,9 @@ public sealed class Q80PairMatvecTests
 
     /// <summary>
     /// The direct engine's Q8_0 decode experts with the dense matvec's row layout: a token's expert output is the
-    /// same to the bit however many tokens share the launch, and within 1e-4 relative L2 of the shared
-    /// warp-per-block kernel (the two sum a row in different orders).
+    /// same to the bit however many tokens share the launch (the 16-token launch's 64 slots take the gate+up pair
+    /// kernel, the 1-7-token ones the separate rows), and within 1e-4 relative L2 of the shared warp-per-block kernel
+    /// (the two sum a row in different orders).
     /// </summary>
     [CudaFact]
     public void Q80VecDecodeExperts_AnswerEachTokenAlike_AtEveryBatchSize()

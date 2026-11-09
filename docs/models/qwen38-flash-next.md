@@ -2211,6 +2211,7 @@ per step. These settings shape it as a server:
 | `TS_Q4E_BATCH_GRAPHS` | on | Batched steps (batched decode steps and batched speculative verifies) run as CUDA graphs, one per set of slots, their QSA regimes, rows and head form, captured on a set's third step and at most `TS_Q4E_BATCH_GRAPHS_MAX` (64) of them; `0` issues them kernel by kernel. |
 | `TS_Q4E_Q80_PAIR` | on | Q8_0 decode projections (1 to 16 rows) on int8 tensor cores (sm_80+), with a dp4a twin of the same arithmetic for one or two rows; `0` runs the decode-once dense kernels (`TS_DENSE_FAST`). The two sum in different orders, so answers differ in the last bits. |
 | `TS_Q4E_EXPERT_VEC` | on | Q8_0 decode experts read each weight row four lanes per 32-value block; `0` runs the shared decode kernels (sixteen lanes a gate/up row, eight a short down row; a different order). Paged-in experts follow their residency table, as resident ones compute. |
+| `TS_MOE_GATEUP_Q80_PAIR` | on | From 32 slots one warp computes a Q8_0 decode slot's gate and up rows together (the activation loaded once; the same sums); `0` keeps them in separate warps. |
 | `TS_Q4E_PLACEMENT_SLOTS` | `16` | The layer split balances weights plus this many slots' caches, as many as fit; `1` balances for one. |
 | `TS_Q4E_UBATCH` | `512` | Rows per prefill forward. |
 | `TS_Q4E_PERF` | `0` | `1` logs each forward's time; `3` logs each stage's GPU time per step (uncaptured). |
