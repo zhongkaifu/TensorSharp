@@ -348,6 +348,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_muse_glimmer_vision.cpp
     ggml_ops_minimax_m3_vision.cpp
     ggml_ops_dflash.cpp
+    ggml_ops_dspine.cpp
     ggml_ops_diffusion.cpp
     ggml_ops_qwen_image.cpp
     ggml_ops_qwen_image21.cpp
@@ -1383,6 +1384,14 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     foreach(TSG_DFRING_BACKEND IN ITEMS cpu cuda metal)
         add_test(NAME dflash-ring-block-${TSG_DFRING_BACKEND} COMMAND GgmlOpsDFlashRingBlockTest ${TSG_DFRING_BACKEND})
         set_tests_properties(dflash-ring-block-${TSG_DFRING_BACKEND} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
+    endforeach()
+    # The DSpine draft (ggml_ops_dspine.cpp) against eng/dspine-reference.py's expected values.
+    add_executable(GgmlOpsDSpineDraftTest tests/dspine_draft_test.cpp)
+    target_link_libraries(GgmlOpsDSpineDraftTest PRIVATE GgmlOps ggml-base)
+    foreach(TSG_DSPINE_BACKEND IN ITEMS cpu cuda metal)
+        add_test(NAME dspine-draft-${TSG_DSPINE_BACKEND} COMMAND GgmlOpsDSpineDraftTest ${TSG_DSPINE_BACKEND}
+                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/dspine_draft_reference.bin")
+        set_tests_properties(dspine-draft-${TSG_DSPINE_BACKEND} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300 RUN_SERIAL TRUE)
     endforeach()
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         add_test(NAME qwen35-arena-sidecar-scales-cuda COMMAND GgmlOpsQwen35ArenaScaleTest cuda default)
