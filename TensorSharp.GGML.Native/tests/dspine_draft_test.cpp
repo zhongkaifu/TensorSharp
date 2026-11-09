@@ -356,7 +356,14 @@ void compare_tail(const Config& c, int g, const std::string& pre, const std::str
         ++r.cand_rows;
         if (!same[e]) {
             if (gap.f[e] < t.gap) ++r.cand_ambiguous;
-            else { std::fprintf(stderr, "  %s row %d: candidate set differs (k-gap %.3g)\n", step.c_str(), e, gap.f[e]); r.fail("candidates"); }
+            else {
+                std::fprintf(stderr, "  %s row %d: candidate set differs (k-gap %.3g, band %.3g); native", pre.c_str(), e, gap.f[e], t.gap);
+                for (int i = 0; i < K; ++i) std::fprintf(stderr, " %d", d.cand[e * K + i]);
+                std::fprintf(stderr, " vs reference");
+                for (int i = 0; i < K; ++i) std::fprintf(stderr, " %d", rc.i[e * K + i]);
+                std::fprintf(stderr, "\n");
+                r.fail("candidates");
+            }
         }
     }
     if (have_scores) {
@@ -431,6 +438,7 @@ bool run_config(const std::string& name, int backend, bool bridge_bf16, const To
         if (!inject(m, ring, steps[si][0], steps[si][1])) return false;
         const int anchor = steps[si][2], b = steps[si][3], g = b - 1;
         const std::string step = name + ".step" + std::to_string(si);
+        double dscore = 0;   // this step's largest head-logit error at a candidate both sides chose (F32 tables)
         for (int ti = 0; ti < 2; ++ti) {
             const std::string pre = step + (ti == 0 ? ".f32" : ".bf16");
             Draft d;
@@ -490,9 +498,21 @@ bool run_config(const std::string& name, int backend, bool bridge_bf16, const To
                     }
                 r.worst_stage = std::max(r.worst_stage, num / den);
                 if (!(num / den < t.stage)) r.fail("base logits");
+                dscore = num;
             }
             canonical(c.K, g, d.cand, d.scores);
-            compare_tail(c, g, pre, step, d, t, ti == 0 || (name == "small" && si == 0), r);
+            // CUDA's candidate band, from this step's own head-logit error (main() explains why CUDA's logits are
+            // TF32-rounded): the K-th and (K+1)-th logits trade places only if their two errors together reach the
+            // reference's k-gap, and each is at most max |dscore| (measured at the candidates, the logits at the
+            // boundary), so a differing candidate set is rounding exactly when its k-gap is below 2 max |dscore|.
+            // The BF16-table draft (no probe) takes the step's F32-table measurement.
+            Tol tt = t;
+            if (backend == 3) {
+                tt.gap = 2 * dscore;
+                std::printf("  %s %s tables: head logits max |dscore| %.3g -> candidate band %.3g\n", step.c_str(),
+                            ti == 0 ? "F32" : "BF16", dscore, tt.gap);
+            }
+            compare_tail(c, g, pre, step, d, tt, ti == 0 || (name == "small" && si == 0), r);
 
             if (si == 2 && ti == 1) {
                 // A replay of the cached graph returns exactly what the first run returned.
@@ -528,14 +548,22 @@ int main(int argc, char** argv) {
     if (!TSGgml_IsBackendAvailable(backend)) return 77;
     if (!load_fixture(argv[2])) return 1;
 
-    // Tolerances. CPU and CUDA keep F32 in the F32 matmuls; ggml-metal's batched matmuls round activations to
-    // half, and a BF16 bridge weight makes CPU round the activation it multiplies to BF16. The reference holds
-    // exact (float64) values, so these bound the backend's rounding, not a difference in the math.
+    // Tolerances. CPU keeps F32 in the F32 matmuls; ggml-metal's batched matmuls round activations to half, and a
+    // BF16 bridge weight makes CPU round the activation it multiplies to BF16. ggml-cuda keeps F32 only below 5
+    // rows (mmvf, 3-4 rows by type): from 5 rows its MMF runs F32 products on TF32 tensor cores
+    // (mma.sync ... f32.tf32.tf32.f32, ggml-cuda/mma.cuh), and the draft's 16-row blocks always take it, so
+    // NVIDIA_TF32_OVERRIDE=0 cannot make CUDA exact (it only reaches cuBLAS: the F32 TG table went 2.2e-4 ->
+    // 1.5e-7 with it, the layer stages stayed at 3e-3). CUDA's bracket, for both bridge types, is twice the
+    // worst the RTX 5090 measured across them (stages 4.0e-3, checksums 4.5e-3, lattice 2.6e-3, all from the
+    // small BF16-bridge config); its chain margin is Metal's scaled by the same factor as its stage bound
+    // (8e-3 / 3e-3), and its candidate band is derived per step from the measured head-logit error (run_config).
+    // The reference holds exact (float64) values, so these bound the backend's rounding, not a difference in the math.
     // gap / margin: a candidate set or chain step is only compared where the reference's own separation is larger.
     bool all = true;
     for (bool bridge_bf16 : {true, false}) {
         Tol t;
         if (backend == 1)      t = { 3e-3, 2e-3, 3e-3, 1e-2, 1e-2 };
+        else if (backend == 3) t = { 8e-3, 5.3e-3, 9e-3, 0, 2.7e-2 };   // gap: per step, 2 max |dscore|
         else if (bridge_bf16)  t = { 8e-3, 4e-3, 8e-3, 2e-2, 2e-2 };
         else                   t = { 1e-4, 1e-4, 1e-4, 1e-3, 1e-3 };
         for (const char* name : {"small", "wide"}) {
