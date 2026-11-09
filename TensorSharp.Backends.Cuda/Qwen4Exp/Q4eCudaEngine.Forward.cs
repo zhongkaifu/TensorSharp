@@ -144,6 +144,8 @@ namespace TensorSharp.Cuda
                 else
                 {
                     _groupXs = AllocF32(dev, PromptGroupRows, hcE);
+                    if (GroupMoeBytes() > 0 && dev.DK.HasMoeRowMap)
+                        AllocateGroupMoe(dev);
                     long f16Bytes = GroupF16Bytes();
                     if (f16Bytes > 0)
                     {
@@ -617,6 +619,144 @@ namespace TensorSharp.Cuda
         internal long GroupF16Dequantized { get; private set; }
         internal long GroupF16Reused { get; private set; }
 
+        // TS_Q4E_GROUP_EXPERTS=0: each ubatch of a prompt group runs its routed experts' gate/up itself.
+        private readonly bool _groupExpertsEnv = Environment.GetEnvironmentVariable("TS_Q4E_GROUP_EXPERTS") != "0";
+
+        /// <summary>A prompt group's routed-expert inputs while its gate/up waits for the layer's last ubatch: the
+        /// selections, the tokens' int8 activations, the shared expert's outputs and the scatter logits per group row; the
+        /// group's grouping plan and H; and the act rows a ubatch's down reads H by.</summary>
+        private sealed class GroupMoeBuffers
+        {
+            public Tensor Sel, SelW, Xa, H, ShDown, Inject, Counts, Offsets, Cursors, RowOfSlot, SlotToken, ActRow;
+        }
+
+        private GroupMoeBuffers _groupMoe;
+
+        /// <summary>Layers whose prompt groups ran the routed experts' gate/up once over the group (a test proves the path
+        /// engaged).</summary>
+        internal long GroupExpertsRun { get; private set; }
+
+        /// <summary>Whether the prompt groups plan for group gate/up, from the descriptors: groups on, the int8 Q2_0 expert
+        /// route switched on and taking the widths, every layer's experts Q2_0, and ubatches past the per-slot rows.</summary>
+        private bool GroupExpertsPlanned()
+        {
+            var m = _m;
+            if (!_groupExpertsEnv || PromptGroupBytes() == 0 || !CudaMoe.Q2_0ExpertsInt8 || m.Layers == null
+                || m.NUbatch <= PerSlotMaxRows || !Dsv4Kernels.MoeQ2I8Supports(m.NEmbd, m.NFfExp))
+                return false;
+            foreach (var l in m.Layers)
+                if (l.GateExps.GgmlType != TQ2_0 || l.UpExps.GgmlType != TQ2_0 || l.DownExps.GgmlType != TQ2_0)
+                    return false;
+            return true;
+        }
+
+        private const int TQ2_0 = 42;
+
+        /// <summary>Bytes of <see cref="GroupMoeBuffers"/> (residency plans around them, as around the group's streams).</summary>
+        private long GroupMoeBytes()
+        {
+            if (!GroupExpertsPlanned())
+                return 0;
+            var m = _m;
+            long g = PromptGroupRows, slots = g * m.NExpertUsed;
+            return slots * 8 + Dsv4Kernels.MoeQ2I8ActRowsBytes(g, m.NEmbd) + Dsv4Kernels.MoeQ2I8ActRowsBytes(slots, m.NFfExp)
+                + g * m.NEmbd * 4L + g * m.Hc * 4L + 3L * m.NExpert * 4 + slots * 8 + (long)m.NUbatch * m.NExpertUsed * 4;
+        }
+
+        private void AllocateGroupMoe(Dev dev)
+        {
+            var m = _m;
+            long g = PromptGroupRows, slots = g * m.NExpertUsed;
+            var b = new GroupMoeBuffers();
+            try
+            {
+                b.Sel = AllocT(dev, DType.Int32, g, m.NExpertUsed);
+                b.SelW = AllocF32(dev, g, m.NExpertUsed);
+                b.Xa = AllocT(dev, DType.UInt8, Dsv4Kernels.MoeQ2I8ActRowsBytes(g, m.NEmbd));
+                b.H = AllocT(dev, DType.UInt8, Dsv4Kernels.MoeQ2I8ActRowsBytes(slots, m.NFfExp));
+                b.ShDown = AllocF32(dev, g, m.NEmbd);
+                b.Inject = AllocF32(dev, g, m.Hc);
+                b.Counts = AllocT(dev, DType.Int32, m.NExpert);
+                b.Offsets = AllocT(dev, DType.Int32, m.NExpert);
+                b.Cursors = AllocT(dev, DType.Int32, m.NExpert);
+                b.RowOfSlot = AllocT(dev, DType.Int32, slots);
+                b.SlotToken = AllocT(dev, DType.Int32, slots);
+                b.ActRow = AllocT(dev, DType.Int32, (long)m.NUbatch * m.NExpertUsed);
+                _groupMoe = b;
+            }
+            catch (Exception ex) when (ex is OutOfMemoryException or CudaException or InvalidOperationException)
+            {
+                Console.Error.WriteLine($"[q4e-cuda] the prompt groups' routed-expert buffers ({GroupMoeBytes() / 1048576.0:F0} MiB) did not "
+                    + $"fit ({ex.Message}); each ubatch runs its experts' gate/up itself.");
+            }
+        }
+
+        /// <summary>Whether layer <paramref name="L"/> of a <paramref name="g"/>-row group runs its routed experts' gate/up
+        /// once over the group: buffers and kernels there, the int8 route taking this layer's experts, staging that keeps
+        /// across the layer's ubatches, and every ubatch past the per-slot rows (a short last ubatch runs the per-slot
+        /// kernels in ubatch order, so the group keeps that order there).</summary>
+        private bool GroupExpertsFor(Dev dev, DevLayer L, int g)
+        {
+            var m = _m;
+            int ub = m.NUbatch, last = g - (g - 1) / ub * ub;
+            return _groupMoe != null && g > ub && last > PerSlotMaxRows && dev.DK.HasMoeRowMap
+                && CudaMoe.UsesQ2I8(CudaMoe.Q2_0ExpertsInt8, dev.DK.HasMoeQ2I8, L.GateExps, L.UpExps, L.DownExps, m.NEmbd, m.NFfExp, m.NExpertUsed)
+                && CudaMoe.SelectRoute(last, PerSlotMaxRows, dev.DK.HasMoeMma, dev.DK.DecodesLowBitIqExperts, L.GateExps.Type,
+                    L.DownExps.Type, m.NEmbd, m.NFfExp, dev.DK.DecodesLegacyQuants) == CudaMoe.ExpertRoute.TensorCore
+                && CudaMoe.CanStageKept(dev.DK, _promptStage ?? _expertStage, L.Stage);
+        }
+
+        /// <summary>Phase one of a deferred ubatch (rows <paramref name="row0"/> of the group): its missed experts staged (kept
+        /// for the layer), its selections, int8 activations, shared-expert outputs and scatter logits into the group's
+        /// buffers. The router and the shared expert ran as for any ubatch.</summary>
+        private void DeferExperts(Dev dev, DevLayer L, int nt, int row0)
+        {
+            var m = _m;
+            var b = _groupMoe;
+            int nUsed = m.NExpertUsed, e = m.NEmbd;
+            IntPtr stream = dev.Stream;
+            CudaMoe.StageKept(dev.DK, dev.Moe.Sel, nt * nUsed, _promptStage ?? _expertStage, L.Stage, stream);
+            CudaDriverApi.cuMemcpyDtoDAsync(At(b.Sel, (long)row0 * nUsed), Ptr(dev.Moe.Sel), new UIntPtr((ulong)nt * (ulong)nUsed * 4), stream).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoDAsync(At(b.SelW, (long)row0 * nUsed), Ptr(dev.Moe.SelW), new UIntPtr((ulong)nt * (ulong)nUsed * 4), stream).ThrowOnError();
+            dev.DK.MoeQ2I8QuantAct(Ptr(dev.Cur), (IntPtr)((long)Ptr(b.Xa) + Dsv4Kernels.MoeQ2I8ActRowsBytes(row0, e)), nt, e, stream);
+            CudaDriverApi.cuMemcpyDtoDAsync(At(b.ShDown, (long)row0 * e), Ptr(dev.ShDown), new UIntPtr((ulong)nt * (ulong)e * 4), stream).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoDAsync(At(b.Inject, (long)row0 * m.Hc), Ptr(dev.Inject), new UIntPtr((ulong)nt * (ulong)m.Hc * 4), stream).ThrowOnError();
+        }
+
+        /// <summary>Phase two of a layer's deferred group: the group's grouping plan and gate/up once over all its rows
+        /// (each expert's gate and up weights read once instead of once per ubatch), then per ubatch its own plan, its
+        /// slots' H rows mapped from the group's, down, the combine with the shared expert, and the scatter into the
+        /// streams. Each slot's products are those of ubatch order bit for bit.</summary>
+        private void GroupExperts(Dev dev, DevLayer L, int g)
+        {
+            var m = _m;
+            var b = _groupMoe;
+            int ub = m.NUbatch, nUsed = m.NExpertUsed, e = m.NEmbd, ff = m.NFfExp, hc = HcDim;
+            IntPtr stream = dev.Stream;
+            using (Tensor sel = Block(b.Sel, 0, g, nUsed))
+                CudaMoe.Plan(dev.DK, dev.Alloc.Kernels, sel, b.Counts, b.Offsets, b.Cursors, b.RowOfSlot, b.SlotToken, g * nUsed,
+                    nUsed, m.NExpert, stream);
+            dev.DK.MoeQ2I8GateUp(L.GateExps.Ptr, L.UpExps.Ptr, Ptr(b.Xa), b.Counts, b.Offsets, b.SlotToken, Ptr(b.H), ff, e,
+                L.GateExps.RowBytes, 0f, m.NExpert, stream, L.GateExps.Table, L.UpExps.Table);
+            for (int r0 = 0; r0 < g; r0 += ub)
+            {
+                int nt = Math.Min(ub, g - r0), slots = nt * nUsed;
+                using Tensor sel = Block(b.Sel, r0, nt, nUsed);
+                using Tensor selW = Block(b.SelW, r0, nt, nUsed);
+                using Tensor shDown = Block(b.ShDown, r0, nt, e);
+                CudaMoe.Plan(dev.DK, dev.Alloc.Kernels, sel, dev.Moe.Counts, dev.Moe.Offsets, dev.Moe.Cursors, dev.Moe.RowOfSlot,
+                    dev.Moe.SlotToken, slots, nUsed, m.NExpert, stream);
+                dev.DK.MoeRowMap(dev.Moe.RowOfSlot, b.RowOfSlot, r0 * nUsed, b.ActRow, slots, stream);
+                dev.DK.MoeQ2I8Down(L.DownExps.Ptr, Ptr(b.H), dev.Moe.Counts, dev.Moe.Offsets, dev.Moe.ExpDown, e, ff,
+                    L.DownExps.RowBytes, m.NExpert, stream, L.DownExps.Table, Ptr(b.ActRow));
+                dev.DK.MoeScatterAdd(dev.Moe.ExpDown, dev.Moe.RowOfSlot, selW, shDown, dev.BlockOut, nt, nUsed, e, stream);
+                using Tensor xs = Block(_groupXs, r0, nt, hc);
+                dev.QK.HcPost(Ptr(xs), Ptr(dev.BlockOut), At(b.Inject, (long)r0 * m.Hc), nt, e, m.Hc, stream);
+            }
+            StageEnd(dev, StExperts);
+            GroupExpertsRun++;
+        }
+
         /// <summary>Prompt groups read layer by layer so far (a test proves the path engaged).</summary>
         internal long PromptGroupsRun { get; private set; }
 
@@ -695,6 +835,9 @@ namespace TensorSharp.Cuda
                     CudaQuantizedOps.F16WeightScope f16 = _groupF16 != null && g > ub
                         ? CudaQuantizedOps.BeginF16WeightScope(dev.Alloc, Ptr(_groupF16), _groupF16.ElementCount())
                         : null;
+                    // The routed experts' gate/up once over the group, after its last ubatch: each expert's gate and up
+                    // weights are read once per layer and group instead of once per ubatch.
+                    bool deferExperts = GroupExpertsFor(dev, L, g);
                     try
                     {
                         for (int r0 = 0; r0 < g; r0 += ub)
@@ -707,8 +850,10 @@ namespace TensorSharp.Cuda
                             if (L.Ple)
                                 GatherPleRows(slot, tokens, tokOff + r0, nt, p0 + r0, null, null);
                             // No fused scatter into the next layer's mixer: the next call is the next ubatch of this layer.
-                            RunLayer(dev, il, slot, nt, p0 + r0, null, null, IntPtr.Zero);
+                            RunLayer(dev, il, slot, nt, p0 + r0, null, null, IntPtr.Zero, deferRow: deferExperts ? r0 : -1);
                         }
+                        if (deferExperts)
+                            GroupExperts(dev, L, g);
                     }
                     finally
                     {
@@ -759,8 +904,10 @@ namespace TensorSharp.Cuda
         /// <param name="partialsReady">The previous layer's last scatter already ran this layer's first mixer pass.</param>
         /// <returns>Whether this layer's last scatter ran the next layer's first mixer pass (the next layer is on this
         /// device and has no PLE block ahead of it).</returns>
+        /// <param name="deferRow">At or past zero: a prompt group's ubatch whose routed experts and last scatter run later,
+        /// over the whole group (<see cref="GroupExperts"/>).</param>
         private bool RunLayer(Dev dev, int il, Slot slot, int nt, int p0, Slot[] rows, int[] positions, IntPtr pos,
-            bool partialsReady = false)
+            bool partialsReady = false, int deferRow = -1)
         {
             var m = _m;
             var L = _layers[il];
@@ -791,7 +938,9 @@ namespace TensorSharp.Cuda
 
             curQ = HcPre(dev, L.HcFfnNorm, L.HcFfnDown, L.HcFfnUp, L.HcFfnInject, nt, partialsReady: fuse);
             StageEnd(dev, StHc);
-            Moe(dev, L, il, nt, pos == IntPtr.Zero && rows == null ? p0 : -1, curQ);
+            Moe(dev, L, il, nt, pos == IntPtr.Zero && rows == null ? p0 : -1, curQ, deferRow);
+            if (deferRow >= 0)
+                return false;
             var next = il + 1 < m.NLayer ? _layers[il + 1] : null;
             bool fuseNext = fuse && next != null && next.Device == dev.Ordinal && !next.Ple;
             if (fuseNext)
@@ -1234,7 +1383,9 @@ namespace TensorSharp.Cuda
         /// path, where <see cref="RouterProbe"/> may read the router back; -1 elsewhere.</param>
         /// <param name="curQ">Cur already quantized by the mixer's collapse (<see cref="HcPre"/>), or zero: the shared
         /// expert's and the routed experts' input.</param>
-        private void Moe(Dev dev, DevLayer L, int il, int nt, int probeP0, IntPtr curQ = default)
+        /// <param name="groupRow">At or past zero: a prompt group's ubatch (rows <paramref name="groupRow"/> of the group) whose
+        /// routed experts run later over the whole group (<see cref="DeferExperts"/>, <see cref="GroupExperts"/>).</param>
+        private void Moe(Dev dev, DevLayer L, int il, int nt, int probeP0, IntPtr curQ = default, int groupRow = -1)
         {
             var m = _m;
             int e = m.NEmbd;
@@ -1280,6 +1431,13 @@ namespace TensorSharp.Cuda
             {
                 SharedExpert(dev, L, nt, dev.Stream, curQ);
                 StageEnd(dev, StShexp);
+            }
+
+            if (groupRow >= 0)
+            {
+                DeferExperts(dev, L, nt, groupRow);
+                StageEnd(dev, StExperts);
+                return;
             }
 
             CudaMoe.Experts(dev.DK, dev.Alloc.Kernels, dev.Moe, L.GateExps, L.UpExps, L.DownExps,
