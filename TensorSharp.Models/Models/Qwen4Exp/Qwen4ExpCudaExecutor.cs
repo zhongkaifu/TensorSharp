@@ -79,10 +79,17 @@ namespace TensorSharp.Models
             if (MoeCpuOffloadConfig.CpuThreads > 0 || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TS_CPU_MOE_THREADS")))
                 return;
             int cpus = Environment.ProcessorCount;   // the cgroup quota, rounded up
-            int threads = Math.Clamp(cpus - 3, Math.Max(1, cpus / 2), 32);
+            int threads = HostExpertTeamThreads(cpus);
             TensorSharp.GGML.GgmlBasicOps.SetHostMoeThreads(threads);
             Console.Error.WriteLine($"[{Tag}] host experts: {threads} CPU threads (of {cpus}); --cpu-moe-threads overrides.");
         }
+
+        /// <summary>
+        /// The host experts' default team on <paramref name="cpus"/> CPUs: all but three, at least half, at most 32. On
+        /// 66 CPUs or more half is past the cap, which then wins: <c>Math.Clamp(cpus - 3, cpus / 2, 32)</c> threw there
+        /// (min greater than max), so a model with host experts failed to load on an 80-vCPU machine.
+        /// </summary>
+        internal static int HostExpertTeamThreads(int cpus) => Math.Min(32, Math.Max(cpus - 3, Math.Max(1, cpus / 2)));
 
         private void FreeRequantized()
         {
