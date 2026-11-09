@@ -981,8 +981,11 @@ namespace TensorSharp.Cuda
                     cellCnt = (IntPtr)((long)Ptr(dev.CellCnt) + (long)row0 * 4);
                     // A captured step's grid covers every block the context can hold (its blocks past
                     // the row's position exit at once).
-                    dev.QK.QsaScores(qIdx, Ptr(c.IdxPooled), scores, pos, p0, m.IdxHeads, d, R, ScoreStride,
-                        pos != IntPtr.Zero ? ScoreStride : (p0 + nt) / R, nt, dev.Stream);
+                    if (pos == IntPtr.Zero && QsaScoresMmaFor(dev, nt))
+                        dev.QK.QsaScoresMma(qIdx, Ptr(c.IdxPooled), scores, p0, d, R, ScoreStride, (p0 + nt) / R, nt, dev.Stream);
+                    else
+                        dev.QK.QsaScores(qIdx, Ptr(c.IdxPooled), scores, pos, p0, m.IdxHeads, d, R, ScoreStride,
+                            pos != IntPtr.Zero ? ScoreStride : (p0 + nt) / R, nt, dev.Stream);
                     dev.QK.QsaSelect(scores, cells, cellCnt, pos, p0, R, m.IdxTopK, ScoreStride, CellStride, nt, dev.Stream);
                     if (pos == IntPtr.Zero)
                         SparseProbe?.Invoke(CaptureSparse(dev, L, il, c, row0, nt, p0));
@@ -1068,6 +1071,16 @@ namespace TensorSharp.Cuda
 
         // TS_Q4E_ATTN_MMA=0: prompt-size attention keeps the one-block-per-(head, row) kernel.
         private readonly bool _attnMma = Environment.GetEnvironmentVariable("TS_Q4E_ATTN_MMA") != "0";
+
+        // TS_Q4E_QSA_SCORES_MMA=0: a prompt's QSA block scores keep the warp-per-block kernel.
+        private readonly bool _qsaScoresMma = Environment.GetEnvironmentVariable("TS_Q4E_QSA_SCORES_MMA") != "0";
+
+        /// <summary>Whether a QSA layer's block scores for <paramref name="nt"/> prompt rows run on tensor cores
+        /// (Q4eKernels.QsaScoresMma): a prompt-size call (decode steps, verify windows and batched steps keep the
+        /// warp-per-block kernel, so a row scores as its own decode step does), the kernel built for this GPU, and four
+        /// indexer heads of a width in 64s.</summary>
+        private bool QsaScoresMmaFor(Dev dev, int nt)
+            => _qsaScoresMma && nt > PerSlotMaxRows && dev.QK.HasQsaScoresMma && Q4eKernels.QsaScoresMmaSupports(_m.IdxHeads, _m.IdxDim);
 
         /// <summary>Attention calls that ran on tensor cores so far (a test proves the path engaged).</summary>
         internal long PromptAttentionMmaCalls { get; private set; }

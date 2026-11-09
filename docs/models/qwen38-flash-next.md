@@ -1704,6 +1704,36 @@ both arms:
 | F16 tensor cores | 0.99 / 0.71 / 0.70 s | 3.04 / 3.02 / 3.03 s | 0.86-0.90 s / 3.79-3.80 s | 248-255 tok/s |
 | int8 tensor cores (default) | 0.84 / 0.57 / 0.55 s | 2.48 / 2.47 / 2.47 s | 0.74-0.75 s / 3.13-3.14 s | 240-249 tok/s |
 
+#### QSA block scores of a prompt on tensor cores, 2026-11-09
+
+A QSA layer scores every complete block a row can see (the sum over the four indexer heads of relu(block key . query
+head)) before it keeps the best. A prompt's rows did this one warp per block on the CUDA cores, each row reading every
+key again: 0.10 s of a 16K prompt, where Strata spends 0.02 s.
+
+Strata scores a prompt's rows on tensor cores, and that is now ported (`TS_Q4E_QSA_SCORES_MMA`, on) as
+`ts_q4e_qsa_scores_mma_f32`:
+
+- A block of four warps takes 16 rows (their four heads, 64 query rows) against 64 blocks' keys, so a key is read
+  once per 16 rows.
+- Strata's keys are F16; TensorSharp keeps the pooled keys in F32. So both operands go in as F16 high and low halves:
+  q . k = qh . kh + ql . kh + qh . kl, with F32 accumulation. The dropped ql . kl term is below 2^-22 of the product.
+- The heads' relus are summed in head order, as before.
+- Decode steps, verify windows and batched steps keep the warp kernel, so a row still scores as its own decode step.
+- It needs sm_80 or newer and a module built for the GPU; the committed compute_75 baseline keeps the warp kernel.
+
+On rows starting at the context's beginning and 3,000 and 9,000 positions in (`Q4eQsaScoresMmaTests`), the scores stay
+within 4.6e-7 of the sum of |q . k| from the scores computed in double (the warp kernel: 6.1e-8). The blocks the
+selection keeps are the same in all 1,045 rows, 712 of them past the selection width.
+
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q4E_QSA_SCORES_MMA=0` for the warp kernel). TTFT of
+three runs, the first cold. The engine bench's short_chat, long_prompt_4k/16k and long_generation checks pass 8/8 in
+both arms:
+
+| prompt QSA scores | 4K prompt (3,541 tokens) | 16K prompt (14,093 tokens) | engine bench 4K / 16K TTFT |
+| --- | --- | --- | --- |
+| a warp per block | 0.85 / 0.58 / 0.56 s | 2.48 / 2.47 / 2.47 s | 0.74 s / 3.12-3.13 s |
+| tensor cores (default) | 0.84 / 0.56 / 0.55 s | 2.39 / 2.38 / 2.38 s | 0.73-0.74 s / 3.00-3.01 s |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
