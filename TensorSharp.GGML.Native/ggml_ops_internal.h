@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1368,6 +1369,11 @@ namespace tsg
     // gap needs before anything is rewritten.
     bool graph_node_profile_enabled();
     ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag);
+    // The node profile's buckets (op, or op:type[:shape]) as totals: a snapshot at a pass's start, and the pass's own
+    // share printed as the difference at its end (a prompt pass's segments by op and projection).
+    using NodeProfileTotals = std::map<std::string, std::pair<double, long long>>;
+    NodeProfileTotals node_profile_totals();
+    void node_profile_print_since(const NodeProfileTotals& before, const char* label, int top);
 #if defined(TSG_GGML_USE_METAL)
     void metal_set_extra_command_buffers(ggml_backend_t backend, int n);
 #endif

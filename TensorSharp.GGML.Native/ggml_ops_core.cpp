@@ -3063,6 +3063,34 @@ namespace tsg
         return GGML_STATUS_SUCCESS;
     }
 
+    NodeProfileTotals node_profile_totals()
+    {
+        NodeProfileState& s = node_profile_state();
+        std::lock_guard<std::mutex> lock(s.mu);
+        NodeProfileTotals out;
+        for (const auto& kv : s.buckets) out[kv.first] = { kv.second.us, kv.second.calls };
+        return out;
+    }
+
+    void node_profile_print_since(const NodeProfileTotals& before, const char* label, int top)
+    {
+        std::vector<std::pair<std::string, std::pair<double, long long>>> d;
+        double tot = 0;
+        for (const auto& kv : node_profile_totals())
+        {
+            auto it = before.find(kv.first);
+            const double us = kv.second.first - (it != before.end() ? it->second.first : 0.0);
+            const long long n = kv.second.second - (it != before.end() ? it->second.second : 0);
+            if (n <= 0) continue;
+            d.push_back({ kv.first, { us, n } });
+            tot += us;
+        }
+        std::sort(d.begin(), d.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+        std::fprintf(stderr, "[node-profile] %s: graph nodes %.1f ms (each synchronized)\n", label, tot / 1000.0);
+        for (int i = 0; i < (int)d.size() && i < top; i++)
+            std::fprintf(stderr, "    %-30s %8.1f ms over %lld\n", d[i].first.c_str(), d[i].second.first / 1000.0, d[i].second.second);
+    }
+
     // ------------------------------------------------------------------
     // Whole-model kernel phase timer (TS_GGML_PHASE_TIMING) - see the header.
     // ------------------------------------------------------------------

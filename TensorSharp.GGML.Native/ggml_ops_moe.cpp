@@ -2936,6 +2936,7 @@ namespace tsg
         struct ProfPassReport
         {
             bool on; int seq; pass_clock::time_point t0;
+            NodeProfileTotals nodes0 = on ? node_profile_totals() : NodeProfileTotals{};
             ~ProfPassReport()
             {
                 if (!on) return;
@@ -2944,6 +2945,7 @@ namespace tsg
                              s_prof_device_op_ms, s_prof_device_ops);
                 for (const auto& kv : s_prof_device_by_name)
                     std::fprintf(stderr, "    %-12s %8.1f ms over %d\n", kv.first.c_str(), kv.second.first, kv.second.second);
+                node_profile_print_since(nodes0, "this pass's segments", 40);
                 s_prof_device_op_ms = 0;
                 s_prof_device_ops = 0;
                 s_prof_device_by_name.clear();

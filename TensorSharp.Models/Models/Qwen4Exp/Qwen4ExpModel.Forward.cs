@@ -464,7 +464,8 @@ namespace TensorSharp.Models
             {
                 res.Dispose();
                 throw new InvalidOperationException(
-                    "qwen4exp: required token-span path declined; this configuration cannot use the per-layer fallback.");
+                    "qwen4exp: required token-span path declined; this configuration cannot use the per-layer fallback ("
+                    + GgmlBasicOps.LastNativeError("no native error recorded") + ").");
             }
             if (spanDone) Q4eSpanTicks += Stopwatch.GetTimestamp() - tSpan;
             if (!spanDone && LayerSplitDegree > 1)
