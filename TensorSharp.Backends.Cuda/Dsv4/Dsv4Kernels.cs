@@ -67,9 +67,13 @@ namespace TensorSharp.Cuda
         // The same products for 2..16 rows in one block, the weights read once (optional: a module before it launches a
         // block per row).
         private readonly IntPtr denseQ81RowsMulti;
-        // Decode once, dot every row (optional): [R index (1, 2, 4, 8 rows a pass), W index (1, 2, 4 warps an output)].
-        private readonly IntPtr[,] denseFast = new IntPtr[4, 3];
+        // Decode once, dot every row (optional): [R (rows a pass, 1..8), W index (1, 2, 4 warps an output)]. A module from
+        // before the 3/5/6/7-row instantiations fills those widths with the next power of two's kernel.
+        private readonly IntPtr[,] denseFast = new IntPtr[9, 3];
         private readonly bool _hasDenseFast;
+
+        /// <summary>Whether the module has a decode-once kernel for every width 1..8 (each window computes its own rows).</summary>
+        public bool HasDenseFastEveryWidth { get; }
 
         /// <summary>Activation rows the one-block-for-every-row dense kernels take.</summary>
         public const int DenseMultiMaxRows = 16;
@@ -298,10 +302,25 @@ namespace TensorSharp.Cuda
                 try
                 {
                     int[] rs = { 1, 2, 4, 8 }, ws = { 1, 2, 4 };
-                    for (int ri = 0; ri < 4; ri++)
+                    foreach (int r in rs)
                         for (int wi = 0; wi < 3; wi++)
-                            denseFast[ri, wi] = module.GetFunction($"ts_dsv4_dense_fast_r{rs[ri]}_w{ws[wi]}_f32");
+                            denseFast[r, wi] = module.GetFunction($"ts_dsv4_dense_fast_r{r}_w{ws[wi]}_f32");
                     _hasDenseFast = true;
+                    try
+                    {
+                        foreach (int r in new[] { 3, 5, 6, 7 })
+                            for (int wi = 0; wi < 3; wi++)
+                                denseFast[r, wi] = module.GetFunction($"ts_dsv4_dense_fast_r{r}_w{ws[wi]}_f32");
+                        HasDenseFastEveryWidth = true;
+                    }
+                    catch (CudaException ex) when (ex.ErrorCode == 500)
+                    {
+                        for (int wi = 0; wi < 3; wi++)
+                        {
+                            denseFast[3, wi] = denseFast[4, wi];
+                            denseFast[5, wi] = denseFast[6, wi] = denseFast[7, wi] = denseFast[8, wi];
+                        }
+                    }
                 }
                 catch (CudaException ex) when (ex.ErrorCode == 500) { _hasDenseFast = false; }
                 denseBf16RowsSplitK = module.GetFunction("ts_dense_bf16_rows_splitk_f32");
@@ -903,20 +922,23 @@ namespace TensorSharp.Cuda
 
         /// <summary>out[rows, outDim] = act[rows, inDim] x w^T for an input already quantized to q8_1,
         /// one warp per output row. Reads only the buffers passed, so it can be captured.</summary>
+        /// <param name="fastWidth">Tests only: the decode-once kernel's rows a pass (1..8) instead of the window's own width
+        /// (at least the rows, or more passes run); 0 picks it as the engines do.</param>
         public void DenseQ81Rows(IntPtr w, IntPtr act, IntPtr output, int wtype, int outDim, int inDim, long rowBytes,
-            int rows, IntPtr stream)
+            int rows, IntPtr stream, int fastWidth = 0)
         {
             IntPtr a0 = w, a1 = act, a2 = output;
             int a3 = wtype, a4 = outDim, a5 = inDim; long a6 = rowBytes; int a7 = rows;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
             // The formats the decode-once kernels read: each unit decoded once and dotted against every row, W warps an
-            // output row by shape. A 4-row window's 2560 -> 10240 IQ4_XS projection 33 -> 11.5 us on the RTX 5090.
+            // output row by shape. A 4-row window's 2560 -> 10240 IQ4_XS projection 33 -> 11.5 us on the RTX 5090. A window
+            // of up to 8 rows runs the kernel of its own width; longer ones take passes of 8.
             if (rows <= DenseMultiMaxRows && DenseFastReads(wtype, inDim))
             {
                 int wi = DenseFastWarps(outDim);
-                int ri = rows <= 1 ? 0 : rows <= 2 ? 1 : rows <= 4 ? 2 : 3;
+                int r = fastWidth > 0 ? Math.Min(fastWidth, 8) : Math.Min(Math.Max(rows, 1), 8);
                 int perBlock = 8 / wi;
-                Launch(denseFast[ri, wi == 1 ? 0 : wi == 2 ? 1 : 2], (uint)((outDim + perBlock - 1) / perBlock), 1, 1, BlockSize, 0, stream, args);
+                Launch(denseFast[r, wi == 1 ? 0 : wi == 2 ? 1 : 2], (uint)((outDim + perBlock - 1) / perBlock), 1, 1, BlockSize, 0, stream, args);
                 return;
             }
             // Few output rows of a long input (a 10240 -> 320 hyper-connection projection): split each row's units

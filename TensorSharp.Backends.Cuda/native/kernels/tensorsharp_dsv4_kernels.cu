@@ -4914,6 +4914,20 @@ TS_DSV4_DENSE_FAST(1, 4)
 TS_DSV4_DENSE_FAST(2, 4)
 TS_DSV4_DENSE_FAST(4, 4)
 TS_DSV4_DENSE_FAST(8, 4)
+// Every width up to 8, so a window of 3, 5, 6 or 7 rows (a verify of 2, 4, 5 or 6 drafts) computes its own rows instead of
+// the next power of two's: a row's arithmetic does not depend on R, so each width answers as the padded dispatch did.
+TS_DSV4_DENSE_FAST(3, 1)
+TS_DSV4_DENSE_FAST(5, 1)
+TS_DSV4_DENSE_FAST(6, 1)
+TS_DSV4_DENSE_FAST(7, 1)
+TS_DSV4_DENSE_FAST(3, 2)
+TS_DSV4_DENSE_FAST(5, 2)
+TS_DSV4_DENSE_FAST(6, 2)
+TS_DSV4_DENSE_FAST(7, 2)
+TS_DSV4_DENSE_FAST(3, 4)
+TS_DSV4_DENSE_FAST(5, 4)
+TS_DSV4_DENSE_FAST(6, 4)
+TS_DSV4_DENSE_FAST(7, 4)
 #undef TS_DSV4_DENSE_FAST
 
 // ts_dsv4_moe_gateup_decode_f32 with sixteen lanes an output row and two rows a warp (the short down kernel's layout):
