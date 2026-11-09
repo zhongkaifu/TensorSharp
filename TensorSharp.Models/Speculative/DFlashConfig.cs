@@ -202,6 +202,36 @@ namespace TensorSharp.Models
         /// transform applied before it enters the lattice.</summary>
         public bool HasUnaryLogitTransform => LogitScale != 1f || FinalLogitSoftcap > 0f;
 
+        /// <summary>dflash.attention.causal: block row i attends to block rows 0..i only.
+        /// False (or absent) for DFlash / DFlash2, which draft non-causally inside the
+        /// block; true for a DSpine drafter.</summary>
+        public bool CausalBlock { get; private set; }
+
+        /// <summary>dflash.dspine.version: the layout of a DSpine export (eng/dspine-to-gguf.py
+        /// writes 1). 0 = not a DSpine drafter. DSpine (Tencent) is a DFlash block drafter with
+        /// block-causal attention and a code bridge written into the residual stream after
+        /// every layer; its block is read off an exact-sender refinement of the last write
+        /// (see ModelBase.DSpine.cs).</summary>
+        public int DSpineVersion { get; private set; }
+
+        /// <summary>dflash.dspine.code_size: width of the bridge's token codes (C).</summary>
+        public int DSpineCodeSize { get; private set; }
+
+        /// <summary>dflash.dspine.rank: width of the bridge's gated messages (R).</summary>
+        public int DSpineRank { get; private set; }
+
+        /// <summary>dflash.dspine.eps: the bridge's normalization epsilon.</summary>
+        public float DSpineEps { get; private set; }
+
+        /// <summary>dflash.dspine.head_topk: candidates per block row of the refinement lattice (K).</summary>
+        public int DSpineTopK { get; private set; }
+
+        /// <summary>True for a DSpine drafter.</summary>
+        public bool IsDSpine => DSpineVersion > 0;
+
+        /// <summary>The DSpine export layout this TensorSharp reads.</summary>
+        public const int SupportedDSpineVersion = 1;
+
         /// <summary>True for a second-generation drafter (either extension
         /// present). Descriptive only - every code path keys on
         /// <see cref="HasConv"/> / <see cref="HasSelector"/> individually.</summary>
@@ -277,6 +307,12 @@ namespace TensorSharp.Models
                 SelectorTopK = (int)gguf.GetUint32($"{ArchName}.selector_top_k", 0),
                 LogitScale = gguf.GetFloat32($"{ArchName}.logit_scale", 1f),
                 FinalLogitSoftcap = gguf.GetFloat32($"{ArchName}.final_logit_softcapping", 0f),
+                CausalBlock = gguf.GetBool($"{ArchName}.attention.causal", false),
+                DSpineVersion = (int)gguf.GetUint32($"{ArchName}.dspine.version", 0),
+                DSpineCodeSize = (int)gguf.GetUint32($"{ArchName}.dspine.code_size", 0),
+                DSpineRank = (int)gguf.GetUint32($"{ArchName}.dspine.rank", 0),
+                DSpineEps = gguf.GetFloat32($"{ArchName}.dspine.eps", 0f),
+                DSpineTopK = (int)gguf.GetUint32($"{ArchName}.dspine.head_topk", 0),
             };
 
             // DSpark Markov head. The GGUF carries no dflash.markov_rank key
@@ -392,6 +428,7 @@ namespace TensorSharp.Models
                     "DFlash selector needs selector_rank and selector_top_k together "
                     + $"(got {SelectorRank} / {SelectorTopK}).");
             }
+            ValidateDSpine();
             if (SwaPattern.Length != NumLayers)
             {
                 throw new InvalidOperationException(
@@ -410,8 +447,49 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>
+        /// A DSpine file is all-or-nothing, like the DFlash2 extensions: a bridge without the
+        /// causal block, a causal block without a bridge, or a bridge next to a DFlash2/DSpark
+        /// head describes a drafter no TensorSharp graph runs as trained, so each is refused
+        /// rather than run as something else.
+        /// </summary>
+        private void ValidateDSpine()
+        {
+            if (!IsDSpine)
+            {
+                if (CausalBlock)
+                {
+                    throw new NotSupportedException(
+                        $"{ArchName}.attention.causal = true without the {ArchName}.dspine.* keys: TensorSharp runs a "
+                        + "block-causal drafter only as DSpine (a code bridge after every layer).");
+                }
+                return;
+            }
+            if (DSpineVersion != SupportedDSpineVersion)
+            {
+                throw new NotSupportedException(
+                    $"{ArchName}.dspine.version {DSpineVersion} is not supported (this TensorSharp reads version "
+                    + $"{SupportedDSpineVersion}); reconvert with eng/dspine-to-gguf.py.");
+            }
+            if (!CausalBlock)
+                throw new NotSupportedException($"A DSpine drafter must have {ArchName}.attention.causal = true.");
+            if (HasConv || HasSelector || MarkovRank > 0 || HasAttentionSinks)
+            {
+                throw new NotSupportedException(
+                    "A DSpine drafter carries no DFlash2 convolution or selector and no DSpark Markov head or attention sinks.");
+            }
+            if (DSpineCodeSize <= 0 || DSpineRank <= 0 || !(DSpineEps > 0f))
+            {
+                throw new InvalidOperationException(
+                    $"DSpine bridge geometry is invalid (code_size {DSpineCodeSize}, rank {DSpineRank}, eps {DSpineEps}).");
+            }
+            int k = DSpineTopK;
+            if (k < 2 || k > 64 || (k & (k - 1)) != 0)
+                throw new InvalidOperationException($"{ArchName}.dspine.head_topk {k} must be a power of two in [2, 64].");
+        }
+
         public override string ToString()
-            => $"{(MarkovRank > 0 ? "dspark" : IsDFlash2 ? "dflash2" : "dflash")}(layers={NumLayers}, hidden={HiddenSize}, " +
+            => $"{(IsDSpine ? "dspine" : MarkovRank > 0 ? "dspark" : IsDFlash2 ? "dflash2" : "dflash")}(layers={NumLayers}, hidden={HiddenSize}, " +
                $"ffn={IntermediateSize}, heads={NumHeads}/{NumKVHeads}x{HeadDim}, " +
                $"block={BlockSize}, drafts={MaxDraftTokens}, swa={SlidingWindow}, ring={RingRows}, " +
                $"targets=[{string.Join(",", TargetLayerIds)}], feature={FeatureSize}, mask={MaskTokenId}" +
@@ -419,6 +497,7 @@ namespace TensorSharp.Models
                (HasAttentionSinks ? ", attn-sinks" : string.Empty) +
                (HasConv ? $", conv={ConvKernelSize}x{ConvGroupSize}({ConvNumGroups}g)" : string.Empty) +
                (HasSelector ? $", selector=r{SelectorRank}/k{SelectorTopK}" : string.Empty) +
+               (IsDSpine ? $", causal block, bridge=c{DSpineCodeSize}/r{DSpineRank}, refine k{DSpineTopK}" : string.Empty) +
                (LogitScale != 1f ? $", logit_scale={LogitScale:G6}" : string.Empty) +
                (FinalLogitSoftcap > 0f ? $", softcap={FinalLogitSoftcap:G6}" : string.Empty) + ")";
     }

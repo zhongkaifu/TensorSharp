@@ -265,8 +265,10 @@ namespace TensorSharp.Models
             }
             if (cfg.BlockSize > cfg.RingRows)
                 throw new InvalidOperationException($"DFlash block_size {cfg.BlockSize} exceeds the ring ({cfg.RingRows} rows).");
+            if (cfg.IsDSpine && DSpineBackendRefusal() is { } dspineRefusal)
+                throw new NotSupportedException($"DSpine drafter refused: {dspineRefusal}.");
 
-            LoadDFlashDraftTensors(draft);
+            LoadDFlashDraftTensors(draft, cfg.IsDSpine);
             AttachDFlashSidecarScales();
 
             _dflash = cfg;
@@ -304,6 +306,20 @@ namespace TensorSharp.Models
                 _dflashLayerNames = null;
                 return;
             }
+            if (cfg.IsDSpine)
+            {
+                try
+                {
+                    AttachDSpine();
+                }
+                catch
+                {
+                    DisposeDSpine();
+                    _dflash = null;
+                    _dflashLayerNames = null;
+                    throw;
+                }
+            }
 
             _dflashCaptureSlot = new int[Config.NumLayers];
             for (int l = 0; l < Config.NumLayers; l++)
@@ -340,12 +356,17 @@ namespace TensorSharp.Models
         /// converter-spelling normalization DFlash does not need: the drafter's
         /// tensor names are already the final ones.
         /// </summary>
-        private unsafe void LoadDFlashDraftTensors(GgufFile draft)
+        private unsafe void LoadDFlashDraftTensors(GgufFile draft, bool dspine = false)
         {
             foreach (var kv in draft.Tensors)
             {
                 var info = kv.Value;
                 string name = DFlashConfig.WeightPrefix + info.Name;
+                if (dspine && KeepDSpineRaw(info))
+                {
+                    LoadDSpineRawTensor(draft, info, name);
+                    continue;
+                }
                 long byteCount = draft.GetTensorByteCount(info);
 
                 // F16/BF16 linears are NOT "quantized" for this path: the GGML
@@ -439,7 +460,7 @@ namespace TensorSharp.Models
         /// <summary>True when <paramref name="name"/> resolves to something
         /// <see cref="LinearForward"/> can multiply by.</summary>
         private bool HasDFlashLinear(string name)
-            => _quantWeights.ContainsKey(name) || _weights.ContainsKey(name);
+            => _quantWeights.ContainsKey(name) || _weights.ContainsKey(name) || (_dspineRaw?.ContainsKey(name) ?? false);
 
         private bool VerifyDFlashTensors(out string missing)
         {
@@ -543,6 +564,12 @@ namespace TensorSharp.Models
                 }
             }
 
+            if (_dflash.IsDSpine && MissingDSpineTensor() is { } dspineMissing)
+            {
+                missing = dspineMissing;
+                return false;
+            }
+
             // The drafter has no LM head of its own: it borrows the target's.
             if (!HasDFlashLinear(DFlashTargetOutputWeightName)) { missing = DFlashTargetOutputWeightName; return false; }
             if (!HasDFlashLinear("token_embd.weight")) { missing = "token_embd.weight"; return false; }
@@ -565,6 +592,7 @@ namespace TensorSharp.Models
             _dflashDeferInjects = false;
             _dflashPendingInjects.Clear();
             _dflashPendingRowCount = 0;
+            DisposeDSpine();
             DisposeDFlashRingPool();
             if (_dflashRingK != null)
                 foreach (var t in _dflashRingK) t?.Dispose();
@@ -641,6 +669,7 @@ namespace TensorSharp.Models
         /// supports it, otherwise the per-op pair.</summary>
         private void DFlashEncodeAndInject(float[] hRows, int rowOffset, int n, int startPos)
         {
+            RecordDSpineDumpRows(hRows, rowOffset, n, startPos);
             if (TryFusedDFlashInject(hRows, rowOffset, n, startPos))
                 return;
 
