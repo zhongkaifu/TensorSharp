@@ -13,14 +13,13 @@
 // over N separate single-sequence decodes); the cheap per-token recurrent /
 // attention ops are emitted per-sequence inside the same graph.
 //
-// KV is PAGED: each attention layer owns a device-resident pool
-// [total_slots, num_kv_heads*head_dim]; token t writes its K/V to slot_mapping[t]
+// KV is PAGED: each attention layer owns a device pool [device_slots,
+// num_kv_heads*head_dim]; token t writes its K/V to its device slot
 // (ggml_set_rows) and each sequence gathers its own history from the pool
-// (ggml_get_rows over its block-table slot list). The pool persists across
-// decode steps (in-place set_rows append). It is seeded from the op-by-op host
-// paged pool (_q35PagedK/V) on the first decode after any op-by-op / prefill
-// step, and the freshly written token slots are mirrored back to the host pool
-// so the two stay consistent (fallback-safe).
+// (ggml_get_rows over its block table's device slots). The host paged pool
+// (_q35PagedK/V) stays the source of truth: BatchedDecodePool maps the batch's
+// blocks into a compact device pool, seeds it from the host pool and downloads
+// every row a step writes (see BatchedDecodePool.cs for the order).
 //
 // GDN recurrent state lives in the existing per-slot host buffers
 // (_q35GdnSlotConvBuf / _q35GdnSlotSsmTensor, keyed by the sequence's primary
@@ -32,21 +31,24 @@
 // It serves all-decode batches on ggml_cuda; when the kernel declines,
 // ForwardBatch runs its op-by-op layer loop.
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using TensorSharp;
 using TensorSharp.GGML;
+using TensorSharp.Runtime.Paged;
 using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models
 {
     public partial class Qwen35Model
     {
-        // Per-attention-layer device-resident paged K/V pools [total_slots, kvFlat] F32.
-        private Tensor[] _bfdPoolK;
-        private Tensor[] _bfdPoolV;
-        private int _bfdTotalSlots;
-        private bool _bfdPoolSeeded;
+        // The device K/V pool, its block map and its transfers (BatchedDecodePool.cs).
+        private BatchedDecodePool _bfdPool;
+        private GgmlBfdPoolTransfers _bfdTransfers;
+        private KvBlock[] _bfdBlockRefs;   // host block id -> the block the scheduler owns (liveness)
+        private readonly List<int> _bfdStepBlocks = new();
         private bool _bfdUnsupported;
+        private bool _bfdDeferWarned;
 
         // Reusable unmanaged scratch for the batched GDN conv ring (ggml layout)
         // and delta state, plus the per-call descriptor array.
@@ -57,37 +59,44 @@ namespace TensorSharp.Models
         private Qwen35LayerDecodeArgs[] _bfdLayers;
         private int[] _bfdGdnSlot;        // layer -> gdn index (or -1)
 
-        /// <summary>Invalidate the batched-fused KV-pool seed. Called whenever the
-        /// op-by-op path runs (it writes the host paged pool the device pool is
-        /// seeded from) or the KV cache is reset, so the next fused decode re-seeds.</summary>
-        private void InvalidateBatchedFusedSeed() => _bfdPoolSeeded = false;
+        /// <summary>The host paged pool was written under the device pool: an op-by-op step, a restore or a KV reset.
+        /// Rows a fused step still owes the host pool reach it first; the next fused decode reseeds.</summary>
+        private void InvalidateBatchedFusedSeed() => _bfdPool?.InvalidateSeed();
 
-        private void EnsureBatchedKvPools(int totalSlots, int numLayers)
+        /// <summary>
+        /// Whether a native decline of the batched fused decode is a shortage (allocating its graph, context or
+        /// device pool) that a later step may not meet, rather than something the kernel does not support. A
+        /// shortage defers that step to the op-by-op loop; anything else stops the kernel for the model.
+        /// </summary>
+        internal static bool BfdDeclineIsDeferrable(string nativeError)
+            => !string.IsNullOrEmpty(nativeError)
+               && (nativeError.Contains("allocat", StringComparison.OrdinalIgnoreCase)
+                   || nativeError.Contains("acquire", StringComparison.OrdinalIgnoreCase)
+                   || nativeError.Contains("out of memory", StringComparison.OrdinalIgnoreCase)
+                   || nativeError.Contains("budget", StringComparison.OrdinalIgnoreCase));
+
+        private void DeferBatchedFusedDecode(string reason)
         {
-            int kvFlat = Config.NumKVHeads * Config.HeadDim;
-            bool needRealloc = _bfdPoolK == null || _bfdTotalSlots < totalSlots;
-            if (!needRealloc) return;
+            if (_bfdDeferWarned)
+                return;
+            _bfdDeferWarned = true;
+            Console.Error.WriteLine($"[bfd] the batched fused decode is short of device memory ({reason}); such steps " +
+                "run op-by-op (slower) until memory frees, and the kernel is tried again on the next step. Further " +
+                "deferrals are not reported.");
+        }
 
-            if (_bfdPoolK != null)
-                for (int l = 0; l < _bfdPoolK.Length; l++) { _bfdPoolK[l]?.Dispose(); _bfdPoolV[l]?.Dispose(); }
-
-            _bfdPoolK = new Tensor[numLayers];
-            _bfdPoolV = new Tensor[numLayers];
-            for (int l = 0; l < numLayers; l++)
-            {
-                if (_isRecurrent != null && _isRecurrent[l]) continue; // attention layers only
-                _bfdPoolK[l] = new Tensor(_allocator, DType.Float32, totalSlots, kvFlat);
-                _bfdPoolV[l] = new Tensor(_allocator, DType.Float32, totalSlots, kvFlat);
-            }
-            _bfdTotalSlots = totalSlots;
-            _bfdPoolSeeded = false; // fresh pools must be (re)seeded from host
+        private void DeclineBatchedFusedDecode(string reason)
+        {
+            _bfdUnsupported = true;
+            Console.Error.WriteLine($"[bfd] batched fused decode declined ({reason}); every later all-decode batch " +
+                "runs op-by-op.");
         }
 
         /// <summary>Run the whole hybrid transformer over the batch's decode tokens
         /// (one token per sequence) via the native batched fused kernel. Returns the
         /// final pre-output-norm hidden state [numTokens, hidden], or null to decline
-        /// (caller falls back to the op-by-op layer loop). On decline the KV-pool seed
-        /// is invalidated so state stays consistent.</summary>
+        /// (caller falls back to the op-by-op layer loop, which invalidates the
+        /// device pool's seed).</summary>
         private unsafe Tensor TryRunBatchedFusedDecode(
             Tensor hiddenStates, BatchedForwardContext ctx,
             int numTokens, int numSeqs, int[] positions, int[] slotMapping,
@@ -133,7 +142,11 @@ namespace TensorSharp.Models
                             && HasW(_ssmBetaQW[l], _ssmBetaF32[l]) && HasW(_ssmAlphaQW[l], _ssmAlphaF32[l])
                             && _ssmConv1dW[l] != null && _ssmDtBiasW[l] != null && _ssmAW[l] != null
                             && _ssmNormW[l] != null && HasW(_ssmOutQW[l], _ssmOutF32[l]);
-                    if (!ok) { _bfdUnsupported = true; return null; }
+                    if (!ok)
+                    {
+                        DeclineBatchedFusedDecode($"layer {l} lacks a weight the fused kernel binds");
+                        return null;
+                    }
                 }
                 _bfdGdnSlot = new int[n];
                 int gc = 0;
@@ -143,29 +156,49 @@ namespace TensorSharp.Models
 
             int gdnCount = 0;
             for (int l = 0; l < n; l++) if (_isRecurrent[l]) gdnCount++;
+            if (_q35PagedNumBlocks <= 0 || _q35PagedBlockSize != blockSize) return null;
+            for (int l = 0; l < n; l++)
+                if (!_isRecurrent[l] && (_q35PagedK[l] == null || _q35PagedV[l] == null)) return null;
 
-            // Device pools sized to the op-by-op host pool capacity.
-            int totalSlots = _q35PagedNumBlocks * _q35PagedBlockSize;
-            if (totalSlots <= 0) return null;
-            EnsureBatchedKvPools(totalSlots, n);
-
-            int kvFlat = Config.NumKVHeads * headDim;
-
-            // Seed the device pools from the host paged pool (prefill + prior-step
-            // history) when not already seeded for the current host-pool contents.
-            if (!_bfdPoolSeeded)
+            // The blocks this step reads (each sequence's history) and writes (its new token's slot).
+            if (_bfdPool == null || _bfdPool.BlockSize != blockSize)
             {
-                for (int l = 0; l < n; l++)
-                {
-                    if (_isRecurrent[l]) continue;
-                    if (_bfdPoolK[l] == null || _q35PagedK[l] == null) { _bfdUnsupported = true; return null; }
-                    long need = (long)totalSlots * kvFlat;
-                    if (_q35PagedK[l].LongLength < need) return null;
-                    _bfdPoolK[l].SetElementsAsFloat(_q35PagedK[l]);
-                    _bfdPoolV[l].SetElementsAsFloat(_q35PagedV[l]);
-                }
-                _bfdPoolSeeded = true;
+                _bfdTransfers?.Release();
+                _bfdTransfers = new GgmlBfdPoolTransfers(this);
+                _bfdPool = new BatchedDecodePool(blockSize, _bfdTransfers);
             }
+            if (_bfdBlockRefs == null || _bfdBlockRefs.Length < _q35PagedNumBlocks)
+                Array.Resize(ref _bfdBlockRefs, _q35PagedNumBlocks);
+            _bfdStepBlocks.Clear();
+            for (int s = 0; s < numSeqs; s++)
+            {
+                IReadOnlyList<KvBlock> blocks = ctx.Sequences[s].BlockTable.Blocks;
+                int used = Math.Max(1, (seqLens[s] + blockSize - 1) / blockSize);   // seqLens counts the new token
+                int written = slotMapping[s] / blockSize;
+                bool writesMapped = false;
+                for (int b = 0; b < blocks.Count && b < used; b++)
+                {
+                    _bfdStepBlocks.Add(blocks[b].Id);
+                    _bfdBlockRefs[blocks[b].Id] = blocks[b];
+                    writesMapped |= blocks[b].Id == written;
+                }
+                for (int b = used; !writesMapped && b < blocks.Count; b++)
+                    if (blocks[b].Id == written)
+                    {
+                        _bfdStepBlocks.Add(written);
+                        _bfdBlockRefs[written] = blocks[b];
+                        writesMapped = true;
+                    }
+                if (!writesMapped)
+                    return null;   // the token's slot is in none of the sequence's blocks: not a plain decode step
+            }
+            KvBlock[] refs = _bfdBlockRefs;
+            if (!_bfdPool.TryPrepare(_bfdStepBlocks, id => id < refs.Length && refs[id] is { RefCount: > 0 }, out string deferReason))
+            {
+                DeferBatchedFusedDecode(deferReason);
+                return null;
+            }
+            int deviceSlots = _bfdPool.DeviceSlots;
 
             // GDN state scratch (ggml layout), grown as needed.
             long convScratchBytes = (long)gdnCount * convDim * qkvDim * numSeqs * sizeof(float);
@@ -258,8 +291,8 @@ namespace TensorSharp.Models
                     }
                     a.QNormW = (IntPtr)GetFloatPtr(_attnQNormW[l]);
                     a.KNormW = (IntPtr)GetFloatPtr(_attnKNormW[l]);
-                    a.KCache = TensorComputePrimitives.GetStoragePointer(_bfdPoolK[l]);
-                    a.VCache = TensorComputePrimitives.GetStoragePointer(_bfdPoolV[l]);
+                    a.KCache = TensorComputePrimitives.GetStoragePointer(_bfdTransfers.PoolK[l]);
+                    a.VCache = TensorComputePrimitives.GetStoragePointer(_bfdTransfers.PoolV[l]);
                 }
                 else
                 {
@@ -287,8 +320,8 @@ namespace TensorSharp.Models
                 _bfdLayers[l] = a;
             }
 
-            // Build per-token positions / slot mapping (I64) and PADDED per-seq gather
-            // lists. The gather length is fixed at padKv = round_up(maxSeqLen, stride)
+            // Build per-token device slots and PADDED per-seq gather lists of device
+            // slots. The gather length is fixed at padKv = round_up(maxSeqLen, stride)
             // so the captured graph topology is identical token-to-token (CUDA-graph
             // capture); padded positions point at slot 0 and are masked out by the
             // per-seq attention mask (driven by seqLens).
@@ -296,11 +329,11 @@ namespace TensorSharp.Models
             int maxSeqLen = 0;
             for (int s = 0; s < numSeqs; s++) if (seqLens[s] > maxSeqLen) maxSeqLen = seqLens[s];
             int padKv = ((maxSeqLen + kStride - 1) / kStride) * kStride;
-            if (padKv > totalSlots) padKv = totalSlots;
+            if (padKv > deviceSlots) padKv = deviceSlots;
             if (padKv < 1) padKv = kStride;
 
             long[] slotMap64 = new long[numTokens];
-            for (int t = 0; t < numTokens; t++) slotMap64[t] = slotMapping[t];
+            for (int t = 0; t < numTokens; t++) slotMap64[t] = _bfdPool.DeviceSlotOf(slotMapping[t]);
             int[] gatherIdx = new int[(long)numSeqs * padKv];
             int[] seqLensArr = new int[numSeqs];
             for (int s = 0; s < numSeqs; s++)
@@ -312,11 +345,13 @@ namespace TensorSharp.Models
                 for (int p = 0; p < realLen; p++)
                 {
                     int blk = seq.BlockTable.Blocks[p / blockSize].Id;
-                    gatherIdx[baseOff + p] = blk * blockSize + (p % blockSize);
+                    gatherIdx[baseOff + p] = checked((int)_bfdPool.DeviceSlotOf((long)blk * blockSize + p % blockSize));
                 }
                 // padded positions [realLen, padKv) default to slot 0 (masked out).
             }
 
+            // The rows this step writes are owed to the host pool from here on (BatchedDecodePool.BeginStep).
+            _bfdPool.BeginStep(slotMapping.AsSpan(0, numTokens));
             float* hiddenPtr = GetFloatPtr(hiddenStates);
             bool ok2;
             fixed (int* posPtr = positions, gidxPtr = gatherIdx, slPtr = seqLensArr)
@@ -324,7 +359,7 @@ namespace TensorSharp.Models
             {
                 ok2 = GgmlBasicOps.Qwen35ModelDecodeBatched(
                     _bfdLayers, n, (IntPtr)hiddenPtr, Config.HiddenSize, numTokens, numSeqs,
-                    (IntPtr)posPtr, (IntPtr)slotPtr, (IntPtr)gidxPtr, (IntPtr)slPtr, padKv, totalSlots,
+                    (IntPtr)posPtr, (IntPtr)slotPtr, (IntPtr)gidxPtr, (IntPtr)slPtr, padKv, deviceSlots,
                     // rope_n_dims must be the model's partial-rotary width (rope.dimension_count,
                     // 64 of the 256-dim head), NOT headDim — passing headDim rotates all dims with
                     // the wrong frequencies and mismatches the KV cache, degenerating output. See
@@ -337,8 +372,12 @@ namespace TensorSharp.Models
             }
             if (!ok2)
             {
-                _bfdUnsupported = true;
-                Console.Error.WriteLine("[bfd] batched fused decode declined (native 0); using op-by-op.");
+                _bfdPool.AbandonStep();
+                string error = GgmlBasicOps.LastNativeError();
+                if (BfdDeclineIsDeferrable(error))
+                    DeferBatchedFusedDecode(error);
+                else
+                    DeclineBatchedFusedDecode(error);
                 return null;
             }
 
@@ -366,11 +405,141 @@ namespace TensorSharp.Models
                 }
             }
 
-            // Mirror the freshly written token K/V slots back into the host paged
-            // pool so it stays the consistent source of truth (re-seed / op-by-op
-            // fallback). Download the touched slots from the device pools.
-            MirrorNewSlotsToHostPool(slotMapping, numTokens, kvFlat);
+            // The K/V rows the step wrote in the device pool, into the host paged pool.
+            _bfdPool.CompleteStep();
             return hiddenStates;
+        }
+
+        /// <summary>
+        /// The device pool's tensors and its transfers: [device_slots, kvFlat] F32 per attention layer, whose device
+        /// copies the native graph binds (keyed by the tensors' host pointers) and appends to. Seeds are uploaded
+        /// straight into those device copies and written rows downloaded straight from them; the tensors' own host
+        /// bytes are never read.
+        /// </summary>
+        private sealed class GgmlBfdPoolTransfers : IBatchedDecodePoolTransfers
+        {
+            private readonly Qwen35Model _model;
+            public Tensor[] PoolK { get; private set; }
+            public Tensor[] PoolV { get; private set; }
+            public int DeviceSlots { get; private set; }
+            public string LastError { get; private set; } = "";
+
+            public GgmlBfdPoolTransfers(Qwen35Model model) => _model = model;
+
+            private int KvFlat => _model.Config.NumKVHeads * _model.Config.HeadDim;
+            private long RowBytes => (long)KvFlat * sizeof(float);
+
+            public bool Resize(int deviceSlots)
+            {
+                Release();
+                int n = _model.Config.NumLayers;
+                try
+                {
+                    PoolK = new Tensor[n];
+                    PoolV = new Tensor[n];
+                    for (int l = 0; l < n; l++)
+                    {
+                        if (_model._isRecurrent[l]) continue;
+                        PoolK[l] = new Tensor(_model._allocator, DType.Float32, deviceSlots, KvFlat);
+                        PoolV[l] = new Tensor(_model._allocator, DType.Float32, deviceSlots, KvFlat);
+                    }
+                }
+                catch (Exception ex) when (ex is OutOfMemoryException or InvalidOperationException)
+                {
+                    LastError = ex.Message;
+                    Release();
+                    return false;
+                }
+                DeviceSlots = deviceSlots;
+                return true;
+            }
+
+            /// <summary>Drop the pool's tensors and their device copies (a disposed tensor's device copy would
+            /// otherwise stay cached under its host pointer).</summary>
+            public void Release()
+            {
+                foreach (Tensor[] set in new[] { PoolK, PoolV })
+                    if (set != null)
+                        foreach (Tensor t in set)
+                            if (t != null)
+                            {
+                                _model.InvalidateTensorDeviceCache(t);
+                                t.Dispose();
+                            }
+                PoolK = PoolV = null;
+                DeviceSlots = 0;
+            }
+
+            public unsafe bool Upload(IReadOnlyList<PoolRowRange> ranges, bool zeroFirst)
+            {
+                long rowBytes = RowBytes;
+                var src = new long[ranges.Count];
+                var dst = new long[ranges.Count];
+                var len = new long[ranges.Count];
+                for (int i = 0; i < ranges.Count; i++)
+                {
+                    src[i] = ranges[i].HostSlot * rowBytes;
+                    dst[i] = ranges[i].DeviceSlot * rowBytes;
+                    len[i] = ranges[i].Rows * rowBytes;
+                }
+                for (int l = 0; l < _model.Config.NumLayers; l++)
+                {
+                    if (_model._isRecurrent[l]) continue;
+                    foreach (var (host, pool) in new[] { (_model._q35PagedK[l], PoolK[l]), (_model._q35PagedV[l], PoolV[l]) })
+                        fixed (float* h = host)
+                            if (!GgmlBasicOps.UploadToDeviceCopyRanges((IntPtr)h, host.LongLength * sizeof(float),
+                                    TensorComputePrimitives.GetStoragePointer(pool), pool.Storage.ByteLength, src, dst, len, zeroFirst))
+                            {
+                                LastError = GgmlBasicOps.LastNativeError();
+                                return false;
+                            }
+                }
+                return true;
+            }
+
+            public unsafe bool Download(IReadOnlyList<PoolRowRange> ranges)
+            {
+                long rowBytes = RowBytes;
+                var src = new long[ranges.Count];
+                var dst = new long[ranges.Count];
+                var len = new long[ranges.Count];
+                for (int i = 0; i < ranges.Count; i++)
+                {
+                    src[i] = ranges[i].DeviceSlot * rowBytes;
+                    dst[i] = ranges[i].HostSlot * rowBytes;
+                    len[i] = ranges[i].Rows * rowBytes;
+                }
+                for (int l = 0; l < _model.Config.NumLayers; l++)
+                {
+                    if (_model._isRecurrent[l]) continue;
+                    foreach (var (host, pool) in new[] { (_model._q35PagedK[l], PoolK[l]), (_model._q35PagedV[l], PoolV[l]) })
+                        fixed (float* h = host)
+                        {
+                            int r = GgmlBasicOps.DownloadDeviceCopyRanges(TensorComputePrimitives.GetStoragePointer(pool),
+                                (IntPtr)h, src, dst, len);
+                            if (r != 1)
+                            {
+                                LastError = r == 0 ? "the device pool has no resident copy" : GgmlBasicOps.LastNativeError();
+                                return false;
+                            }
+                        }
+                }
+                return true;
+            }
+
+            public bool Resident
+            {
+                get
+                {
+                    if (PoolK == null) return false;
+                    for (int l = 0; l < PoolK.Length; l++)
+                        foreach (Tensor t in new[] { PoolK[l], PoolV[l] })
+                            if (t != null && !GgmlBasicOps.HasResidentDeviceCopy(
+                                    TensorComputePrimitives.GetStoragePointer(t), t.Storage.ByteLength))
+                                return false;
+                    return true;
+                }
+            }
         }
 
         // Drain the device-resident GDN state left by the N=1 fast-path fused decode
@@ -402,27 +571,6 @@ namespace TensorSharp.Models
             if (buf != IntPtr.Zero) Marshal.FreeHGlobal(buf);
             buf = Marshal.AllocHGlobal((IntPtr)needBytes);
             curBytes = needBytes;
-        }
-
-        // Download only the newly-written token slots from the device pools back
-        // into the host paged pool (_q35PagedK/V) so the host pool remains the full
-        // source of truth for the next re-seed and for any op-by-op fallback. Only
-        // the N touched rows per attention layer are downloaded (not the whole pool).
-        private unsafe void MirrorNewSlotsToHostPool(int[] slotMapping, int numTokens, int kvFlat)
-        {
-            int n = Config.NumLayers;
-            for (int l = 0; l < n; l++)
-            {
-                if (_isRecurrent[l] || _bfdPoolK[l] == null) continue;
-                for (int t = 0; t < numTokens; t++)
-                {
-                    int slot = slotMapping[t];
-                    using (var rowK = _bfdPoolK[l].Narrow(0, slot, 1))
-                        Array.Copy(rowK.GetElementsAsFloat(kvFlat), 0, _q35PagedK[l], (long)slot * kvFlat, kvFlat);
-                    using (var rowV = _bfdPoolV[l].Narrow(0, slot, 1))
-                        Array.Copy(rowV.GetElementsAsFloat(kvFlat), 0, _q35PagedV[l], (long)slot * kvFlat, kvFlat);
-                }
-            }
         }
     }
 }

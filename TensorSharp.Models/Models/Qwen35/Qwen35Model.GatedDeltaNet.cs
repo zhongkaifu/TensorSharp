@@ -1212,7 +1212,7 @@ namespace TensorSharp.Models
             _fdStateResident = false;
             // The batched-fused device KV pool is seeded from the host paged pool;
             // any state reset/rebuild must force a re-seed before the next fused decode.
-            _bfdPoolSeeded = false;
+            InvalidateBatchedFusedSeed();
             // CUDA/Vulkan persistent graphs still use their established hard-drop
             // lifecycle. Metal can retain its graph across a logical state change:
             // the next replay receives an explicit reseed flag and uploads the
@@ -2033,7 +2033,7 @@ namespace TensorSharp.Models
             if (_fdStateResident)
             {
                 _fdStateResident = false;
-                _bfdPoolSeeded = false;
+                InvalidateBatchedFusedSeed();
                 GgmlBasicOps.Qwen35ResetDecodeCache();
                 CountDecodeGraphReset();
             }
