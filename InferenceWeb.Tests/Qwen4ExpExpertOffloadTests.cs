@@ -1,6 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -24,19 +25,26 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     private readonly ITestOutputHelper _output;
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-qwen4exp-offload-" + Guid.NewGuid().ToString("N"));
     private readonly EnvScope _env = new EnvScope();
+    // Adaptive tier slots are on by default; these tests hold fixed slots to the accelerator unless they turn it on.
+    private readonly NativeEnvScope _nativeEnv = new NativeEnvScope();
 
     public Qwen4ExpExpertOffloadTests(ITestOutputHelper output)
     {
         _output = output;
+        _nativeEnv.Set("TS_MOE_TIER_ADAPT", "0");
         Directory.CreateDirectory(_dir);
         _env.Set("MAX_CONTEXT", "1024");
         _env.ClearSpeculationVars();
+        // Offloaded runs record a routing profile; keep it out of the user's cache.
+        _env.Set("TENSORSHARP_MOE_PROFILE", null);
+        _env.Set("TENSORSHARP_MOE_PROFILE_DIR", _dir);
         MoeCpuOffloadConfig.Reset();
     }
 
     public void Dispose()
     {
         MoeCpuOffloadConfig.Reset();
+        _nativeEnv.Dispose();
         _env.Dispose();
         try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
     }
@@ -49,18 +57,23 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
 
     private float[][] Run(BackendType backend, Action configure) => Run(backend, configure, Prompt);
 
-    private float[][] Run(BackendType backend, Action configure, int[] prompt, Action<ModelBase>? loaded = null)
+    private float[][] Run(BackendType backend, Action configure, int[] prompt, Action<ModelBase>? loaded = null,
+        Action<ModelBase>? done = null) => Run(backend, configure, prompt, Steps, loaded, done);
+
+    private float[][] Run(BackendType backend, Action configure, int[] prompt, int[] steps, Action<ModelBase>? loaded,
+        Action<ModelBase>? done, string? fixture = null)
     {
         MoeCpuOffloadConfig.Reset();
         configure();
-        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "qwen4exp.gguf"), 16);
+        string path = fixture ?? Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "qwen4exp.gguf"), 16);
         using ModelBase model = ModelBase.Create(path, backend);
         Assert.IsType<Qwen4ExpModel>(model);
         loaded?.Invoke(model);
-        var rows = new float[Steps.Length + 1][];
+        var rows = new float[steps.Length + 1][];
         rows[0] = (float[])model.ForwardRefill(prompt).Clone();
-        for (int i = 0; i < Steps.Length; i++)
-            rows[i + 1] = (float[])model.Forward(new[] { Steps[i] }).Clone();
+        for (int i = 0; i < steps.Length; i++)
+            rows[i + 1] = (float[])model.Forward(new[] { steps[i] }).Clone();
+        done?.Invoke(model);
         return rows;
     }
 
@@ -98,6 +111,561 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     /// eng/validation/qwen4exp-offload-parity.py, retaining argmax equality in both checks.</summary>
     private static double Bound(BackendType backend, bool hostPrefill = false)
         => backend == BackendType.GgmlCuda ? (hostPrefill ? 2.5e-2 : 2e-2) : 5e-3;
+
+    /// <summary>Accelerator expert tiers on every offloaded layer (ggml_ops_moe_hot_tier.cpp). With a
+    /// window wide enough for every route, the accelerator computes every expert from the compact
+    /// slots with the all-accelerator span's own kernels, so the answer matches it far inside the
+    /// host bound. With only fixed slots, or a window too small for a step (evictions every token, the
+    /// rest overflowing to the host), the split meets the host's Q8_K arithmetic: the host bound.
+    /// Prefill (40 tokens) runs the split too; every decode step reads misses into the window.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TieredExperts_AnswerAsTheAccelerator_Metal()
+    {
+        // ggml's tier mechanics on its own kernels; the grouped tsm kernels are held to these in TsmExperts_*.
+        _nativeEnv.Set("TS_METAL_MOE", "0");
+        float[][] device = Run(BackendType.GgmlMetal, () => { });
+        int experts = 0;
+        float[][] wide = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, model =>
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            experts = q.ExpertCountForTests;
+            Assert.Equal(8, q.RegisterExpertTiersForTests(experts / 4, experts));
+        });
+        float[][] fixedOnly = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, model =>
+            Assert.Equal(8, ((Qwen4ExpModel)model).RegisterExpertTiersForTests(experts / 2, 0)));
+        float[][] narrow = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, model =>
+            Assert.Equal(8, ((Qwen4ExpModel)model).RegisterExpertTiersForTests(1, 2)));
+        AssertClose("tier, window covers every route", wide, device, 1e-4);
+        AssertClose("tier, fixed slots only", fixedOnly, device, Bound(BackendType.GgmlMetal, hostPrefill: true));
+        AssertClose("tier, narrow window", narrow, device, Bound(BackendType.GgmlMetal, hostPrefill: true));
+    }
+
+    /// <summary>A tier's held routes on Metal through tsm's grouped expert kernels (Strata's, tsm/kernels) against
+    /// ggml-metal's MUL_MAT_ID over the same slots, format by format: every route held (the window covers them all), so
+    /// the decode steps differ only in the expert arithmetic. Prompts (40 rows) take MUL_MAT_ID either way.</summary>
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData("iq3s-iq4nl")]
+    [InlineData("q2_0")]
+    [InlineData("q4k-q51")]
+    [InlineData("iq2xs-iq4nl")]
+    public void TsmExperts_AnswerAsMulMatId_Metal(string formats)
+    {
+        string path = formats switch
+        {
+            "q2_0" => Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q2_0.gguf"), 16,
+                expertGateUpType: SyntheticGguf.GgmlType.Q2_0, expertDownType: SyntheticGguf.GgmlType.Q2_0),
+            "q4k-q51" => Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4k.gguf"), 16, q4kxlExperts: true),
+            "iq2xs-iq4nl" => Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q2kxl.gguf"), 16, q2kxlExperts: true),
+            _ => Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "default.gguf"), 16),
+        };
+        float[][] Answer(string tsm)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_METAL_MOE", tsm);
+            return Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, Steps, model =>
+            {
+                var q = Assert.IsType<Qwen4ExpModel>(model);
+                Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 4, q.ExpertCountForTests));
+            }, null, path);
+        }
+        float[][] mulMatId = Answer("0"), grouped = Answer("1");
+        // Both are float arithmetic over the same bytes in a different order: measured 1.1e-7 .. 1.1e-6 on an M5 Pro
+        // (the grouped kernels alone agree with a double-precision reference to ~2e-7, TsmMoeKernelTests).
+        AssertClose($"tsm vs MUL_MAT_ID ({formats})", grouped, mulMatId, 1e-5);
+    }
+
+    /// <summary>QSA keeps each layer's pooled indexer keys between steps (Q4eSeqStateEntry::aux), so a step pools only
+    /// the blocks its cells complete instead of every block of the window. A block's key is the same arithmetic either
+    /// way, so the logits are the same bits as pooling every block every step (TS_Q4E_QSA_POOL_CACHE=0) - over a
+    /// prompt, then decode steps that cross several block boundaries. The step counter proves the cache was used.
+    /// </summary>
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void QsaPooledKeys_KeptBetweenSteps_AnswerAsPoolingEveryBlock_Cpu() => QsaPooledKeys(BackendType.GgmlCpu);
+
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void QsaPooledKeys_KeptBetweenSteps_AnswerAsPoolingEveryBlock_Metal() => QsaPooledKeys(BackendType.GgmlMetal);
+
+    private void QsaPooledKeys(BackendType backend)
+    {
+        int[] steps = Enumerable.Range(0, 14).Select(i => (i * 61 + 5) % 250).ToArray();
+        float[][] Answer(string keep)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_Q4E_QSA_POOL_CACHE", keep);
+            return Run(backend, () => { }, Prompt, steps, null, null);
+        }
+        float[][] everyBlock = Answer("0");
+        long before = GgmlBasicOps.Qwen4ExpQsaIncrementalSteps();
+        float[][] kept = Answer("1");
+        // The counter is a native test hook: a library built without them (the CI and release builds) reports -1, and
+        // the bits are still compared.
+        if (before >= 0)
+            Assert.True(GgmlBasicOps.Qwen4ExpQsaIncrementalSteps() - before >= steps.Length,
+                "the decode steps did not pool incrementally");
+        for (int i = 0; i < kept.Length; i++)
+            Assert.True(kept[i].AsSpan().SequenceEqual(everyBlock[i]), $"step {i}: the kept pooled keys changed the logits");
+    }
+
+    /// <summary>Seams on a shared event (tsm_moe.h seams_*): the decode steps' segments are enqueued ahead and each seam
+    /// is a handshake on ggml-metal's queue instead of a submit and a wait. The kernels, their order and their buffers
+    /// are the same, so the logits are the same bits - with every route in a slot, and with half the experts left to
+    /// the host (whose routes reach the GPU at the seam's last handshake). The pass counter proves the event path ran.
+    /// </summary>
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TsmSeams_OnASharedEvent_AnswerAsSubmitAndWait_Metal(bool hostHalf)
+    {
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q2_0.gguf"), 16,
+            expertGateUpType: SyntheticGguf.GgmlType.Q2_0, expertDownType: SyntheticGguf.GgmlType.Q2_0);
+        float[][] Answer(string events)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_METAL_SEAM_EVENTS", events);
+            return Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, Steps, model =>
+            {
+                var q = Assert.IsType<Qwen4ExpModel>(model);
+                int experts = q.ExpertCountForTests;
+                Assert.Equal(8, hostHalf
+                    ? q.RegisterExpertTiersForTests(experts / 2, 0)
+                    : q.RegisterExpertTiersForTests(experts / 4, experts));
+            }, null, path);
+        }
+        float[][] submitAndWait = Answer("0");
+        long before = GgmlBasicOps.TsmSeamPasses();
+        float[][] events = Answer("1");
+        Assert.True(GgmlBasicOps.TsmSeamPasses() - before >= Steps.Length,
+            "the decode steps did not run on the event seams");
+        Assert.Equal(submitAndWait.Length, events.Length);
+        for (int i = 0; i < events.Length; i++)
+            Assert.True(events[i].AsSpan().SequenceEqual(submitAndWait[i]),
+                $"step {i}: the event seams changed the logits ({(hostHalf ? "half the experts on the host" : "every route held")})");
+    }
+
+    /// <summary>The route tail skip (Strata's STRATA_ROUTE_TAIL_SKIP, on by default at rank 7): a decode step does not
+    /// read or compute a missed expert that every row routes only at a low rank. The fixture routes 4 experts a token,
+    /// so the test lowers the rank to 2. With a window too small for the routes, decode steps skip some (the counter)
+    /// and stay close to the exact answer; the prompt (a prompt-width batch) never skips, so its logits are the exact
+    /// run's bits; and a tier that holds every expert skips nothing (the same bits throughout).</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void RouteTailSkip_SkipsOnlyMissedLowRankRoutesAtDecode_Metal()
+    {
+        float[][] Answer(string rank, bool allHeld)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_MOE_ROUTE_TAIL_SKIP", rank);
+            env.Set("TS_MOE_TAIL_SKIP_MAX_CACHED", "100");
+            return Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, model =>
+            {
+                var q = Assert.IsType<Qwen4ExpModel>(model);
+                int experts = q.ExpertCountForTests;
+                Assert.Equal(8, allHeld
+                    ? q.RegisterExpertTiersForTests(experts, 0)
+                    : q.RegisterExpertTiersForTests(experts / 4, 2));
+            });
+        }
+        float[][] exact = Answer("0", allHeld: false);
+        long before = GgmlBasicOps.MoeTailSkippedRoutes();
+        float[][] skipped = Answer("2", allHeld: false);
+        long dropped = GgmlBasicOps.MoeTailSkippedRoutes() - before;
+        _output.WriteLine($"routes skipped: {dropped}");
+        Assert.True(dropped > 0, "no decode step skipped a missed low-rank route");
+        Assert.True(skipped[0].AsSpan().SequenceEqual(exact[0]), "the prompt skipped routes (prompt widths compute every route)");
+        for (int i = 1; i < skipped.Length; i++)
+        {
+            Assert.All(skipped[i], v => Assert.True(float.IsFinite(v)));
+            _output.WriteLine($"decode {i}: relative error {RelativeError(skipped[i], exact[i]):E3}");
+        }
+
+        float[][] heldExact = Answer("0", allHeld: true);
+        before = GgmlBasicOps.MoeTailSkippedRoutes();
+        float[][] heldSkip = Answer("2", allHeld: true);
+        Assert.Equal(0, GgmlBasicOps.MoeTailSkippedRoutes() - before);
+        for (int i = 0; i < heldSkip.Length; i++)
+            Assert.True(heldSkip[i].AsSpan().SequenceEqual(heldExact[i]), $"row {i}: a tier holding every expert skipped routes");
+    }
+
+    /// <summary>A prompt-width span runs its GDN layers' recurrence (conv, L2 norms, gates, the state scan, the gated
+    /// norm) and its hyper-connection passes (the gated stream mean after the up projection, the scatter) on
+    /// TensorSharp's Metal kernels (tsm/kernels/tsm_gdn_prompt.metal after Strata's gdn_prompt, tsm_hc_prompt.metal)
+    /// between graph segments, instead of ggml's ops. The decode steps run ggml's gated delta net on the state the
+    /// kernels left, so they also prove the conv history and the state are written in ggml's layout. Only the rounding
+    /// differs (this fixture amplifies it): measured on an M5 Pro, at most 6.4e-5 relative error with the GDN kernels,
+    /// every argmax equal. With every expert on the host the kernels share the pass with the host seams, whose Q8_K
+    /// activations amplify the difference to 3.0e-4. With the QSA selection kernels (tsm_qsa_prompt.metal) the cells a
+    /// row keeps can differ where a block's cells tie at the cutoff: ggml's top_k fills ties in atomic order, the
+    /// kernels lowest index first (QsaSelection_KeepsTheBestCells_TiesLowestFirst proves the contract), so the bound
+    /// is a valid choice's, not rounding's: measured 8.5e-3 at the first decode step, every argmax equal. The counters
+    /// prove the kernels ran.</summary>
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData("gdn", false)]
+    [InlineData("hc", false)]
+    [InlineData("gdn,hc", false)]
+    [InlineData("gdn,hc", true)]
+    [InlineData("qsa", false)]
+    [InlineData("gdn,hc,qsa", false)]
+    [InlineData("gdn,hc,qsa", true)]
+    [InlineData("qsa,attn", false)]
+    [InlineData("gdn,hc,qsa,attn", true)]
+    public void PromptKernels_OnTsm_AnswerAsGgml_Metal(string kernels, bool hostExperts)
+    {
+        bool gdn = kernels.Contains("gdn"), hc = kernels.Contains("hc"), qsa = kernels.Contains("qsa");
+        bool attn = kernels.Contains("attn");
+        float[][] Answer(bool useGdn, bool useHc, bool useQsa, bool useAttn)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_METAL_GDN_PROMPT", useGdn ? "1" : "0");
+            env.Set("TS_METAL_HC_PROMPT", useHc ? "1" : "0");
+            env.Set("TS_METAL_QSA_SELECT", useQsa ? "1" : "0");
+            env.Set("TS_METAL_QSA_ATTN", useAttn ? "1" : "0");
+            env.Set("TS_METAL_QSA_ATTN_MIN_CELLS", "1");   // the fixture's window is a few hundred cells
+            return Run(BackendType.GgmlMetal, hostExperts ? MoeCpuOffloadConfig.SetAllLayers : () => { }, LongPrompt);
+        }
+        // The attention over the chosen cells is compared with ggml's flash attention over the same (deterministic)
+        // selection, so the tie freedom of the selection drops out of that comparison.
+        float[][] ggml = Answer(attn && gdn, attn && hc, attn, false);
+        long gdnBefore = GgmlBasicOps.TsmGdnPromptCount(), hcBefore = GgmlBasicOps.TsmHcPromptCount();
+        long qsaBefore = GgmlBasicOps.TsmQsaSelectCount(), attnBefore = GgmlBasicOps.TsmQsaAttnCount();
+        float[][] tsm = Answer(gdn, hc, qsa, attn);
+        long gdnLayers = GgmlBasicOps.TsmGdnPromptCount() - gdnBefore, hcPasses = GgmlBasicOps.TsmHcPromptCount() - hcBefore;
+        long qsaLayers = GgmlBasicOps.TsmQsaSelectCount() - qsaBefore, attnLayers = GgmlBasicOps.TsmQsaAttnCount() - attnBefore;
+        _output.WriteLine($"tsm kernels: {gdnLayers} GDN layers, {hcPasses} hyper-connection passes, {qsaLayers} QSA selections, "
+            + $"{attnLayers} QSA attention passes");
+        // The fixture's 8 layers: 6 GDN, 2 QSA, 16 half-layers with a read and a scatter each.
+        Assert.Equal(gdn ? 6 : 0, gdnLayers);
+        Assert.Equal(hc ? 32 : 0, hcPasses);
+        Assert.Equal(qsa ? 2 : 0, qsaLayers);
+        Assert.Equal(attn ? 2 : 0, attnLayers);
+        double bound = attn ? (hostExperts ? 1e-3 : 2e-4) : qsa ? 2e-2 : hostExperts ? 1e-3 : 2e-4;
+        AssertClose($"tsm {kernels}", tsm, ggml, bound);
+    }
+
+    /// <summary>A prefill-width batch streams every expert an offloaded layer routes into its staging tensor. With a
+    /// tier on unified memory, the experts the tier's fixed slots hold are copied from those slots instead of read
+    /// from the file (ggml_ops_moe.cpp stage_experts_from_tier); the staged bytes are the same, so the prompt answers
+    /// bit for bit as the untiered offload does - every expert in a slot, and half of them (copies and reads mixed).
+    /// </summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TieredExperts_StagePrefillFromTheirSlots_Metal()
+    {
+        float[][] plain = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt);
+        foreach (int divisor in new[] { 1, 2 })
+        {
+            float[][] tiered = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, model =>
+            {
+                var q = Assert.IsType<Qwen4ExpModel>(model);
+                Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / divisor, 0));
+            });
+            Assert.True(tiered[0].AsSpan().SequenceEqual(plain[0]),
+                $"fixed slots for 1/{divisor} of the experts: the {LongPrompt.Length}-token prompt's staging changed its logits");
+        }
+    }
+
+    /// <summary>A tier with window slots on unified memory splits prompt chunks too (up to
+    /// <c>kHostMoeHotTierWindowMaxRows</c>): the fixed slots hold most of a prompt's routes and the window reads the
+    /// rest, where streaming would first stage the whole layer (~1.3 s a chunk on Flash Next at any width, which made
+    /// every prompt past 64 tokens take ~1.35 s to its first token). With a window that holds every route the split
+    /// computes every expert from the slots on the accelerator's own kernels, so the 160-token prompt answers as the
+    /// all-accelerator span, and as the streamed prompt it replaces. No layer stages: the prefetch counter does not move
+    /// unless <c>TS_HOST_MOE_TIER_MAX_ROWS</c> narrows the split back below the prompt.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TieredExperts_WithAWindow_SplitPromptChunks_Metal()
+    {
+        float[][] device = Run(BackendType.GgmlMetal, () => { }, LongPrompt);
+        float[][] Tiered(string? maxRows, out long staged)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_HOST_MOE_TIER_MAX_ROWS", maxRows);
+            long before = GgmlBasicOps.MoeStagePrefetchHits();
+            float[][] rows = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, model =>
+            {
+                var q = Assert.IsType<Qwen4ExpModel>(model);
+                int experts = q.ExpertCountForTests;
+                Assert.Equal(8, q.RegisterExpertTiersForTests(experts / 4, experts - experts / 4));
+            });
+            staged = GgmlBasicOps.MoeStagePrefetchHits() - before;
+            return rows;
+        }
+        float[][] split = Tiered(null, out long splitStaged);
+        float[][] streamed = Tiered("64", out long streamedStaged);
+        Assert.Equal(0, splitStaged);
+        Assert.True(streamedStaged >= 2, $"the narrowed split did not stream the {LongPrompt.Length}-token prompt");
+        AssertClose("windowed tier, prompt split", split, device, 1e-4);
+        // Streaming stages the layer and computes its experts on other kernels, so the two prompts differ in
+        // rounding (4.3e-5 at the prefill on an M5 Pro), which this fixture amplifies; with the router on ggml-metal's
+        // fused top-k chain (q4e_metal_fusions) one decode step measured 1.4e-4, every argmax equal.
+        AssertClose("windowed tier, prompt split vs streamed", split, streamed, 3e-4);
+    }
+
+    /// <summary>A prompt-width split whose routes overflow the window (one fixed slot and three window slots for four
+    /// routes a token here)
+    /// computes the overflow on the accelerator too, its experts staged by explicit reads into the one staging buffer,
+    /// rather than on the host decode kernel in blocks of 8 rows, which read every overflow expert again per block
+    /// (3.2-3.7 s a 1024-token span of Strata's records prompt). So the prompt answers as the all-accelerator span far
+    /// inside the host bound; the decode steps still put their overflow on the host.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TieredExperts_PromptOverflow_RunsOnTheAccelerator_Metal()
+    {
+        float[][] device = Run(BackendType.GgmlMetal, () => { }, LongPrompt);
+        // (2, 2) leaves rows with three overflow routes, which ggml-metal's MUL_MAT_ID has no kernel for: they are
+        // padded to four (an abort before the padding).
+        foreach (var (fixedSlots, window) in new[] { (1, 3), (2, 2) })
+        {
+            long before = GgmlBasicOps.MoeStageBorrows();
+            float[][] narrow = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, model =>
+                Assert.Equal(8, ((Qwen4ExpModel)model).RegisterExpertTiersForTests(fixedSlots, window)));
+            long borrows = GgmlBasicOps.MoeStageBorrows() - before;
+            _output.WriteLine($"{fixedSlots} fixed + {window} window slots: staging borrows {borrows}");
+            Assert.True(borrows >= 8,
+                $"the {LongPrompt.Length}-token prompt's overflow did not run on the accelerator ({borrows} borrows)");
+            AssertClose($"{fixedSlots}+{window} slots, prompt overflow on the accelerator", new[] { narrow[0] }, new[] { device[0] }, 1e-4);
+            AssertClose($"{fixedSlots}+{window} slots, decode overflow on the host", narrow, device,
+                Bound(BackendType.GgmlMetal, hostPrefill: true));
+        }
+    }
+
+    /// <summary>A prompt-width pass stages the next offloaded layer's experts on a thread while the accelerator runs
+    /// the current one (ggml_ops_moe.cpp moe_stage_prefetch_start), and the layer's MoE graph binds them instead of
+    /// staging its own. The staged bytes are the same, so the prompt answers bit for bit as staging each layer when it
+    /// runs - every expert offloaded, and with half of them in tier slots (copied from the slots ahead). The hit counter
+    /// proves the prefetched stacks were the ones used.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void PromptExpertPrefetch_AnswersAsStagingEachLayer_Metal()
+    {
+        foreach (bool tiered in new[] { false, true })
+        {
+            float[][] Answer(string prefetch)
+            {
+                using var env = new NativeEnvScope();
+                env.Set("TS_HOST_MOE_STAGE_PREFETCH", prefetch);
+                return Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, model =>
+                {
+                    if (!tiered) return;
+                    var q = Assert.IsType<Qwen4ExpModel>(model);
+                    Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 2, 0));
+                });
+            }
+            float[][] eachLayer = Answer("0");
+            long before = GgmlBasicOps.MoeStagePrefetchHits();
+            float[][] prefetched = Answer("1");
+            Assert.True(GgmlBasicOps.MoeStagePrefetchHits() - before >= 2,
+                $"the {LongPrompt.Length}-token prompt's layers did not take prefetched experts (tiered={tiered})");
+            for (int i = 0; i < prefetched.Length; i++)
+                Assert.True(prefetched[i].AsSpan().SequenceEqual(eachLayer[i]),
+                    $"row {i}: prefetched experts changed the logits (tiered={tiered})");
+        }
+    }
+
+    /// <summary>A prompt-sized gather of the on-disk PLE n-gram table reads its rows with one pread each on the native
+    /// I/O team (Qwen4ExpModel.ReadPleRowsPacked, TSGgml_HostReadRows) instead of faulting each row through the mapping.
+    /// The rows are the same bytes, so the prompt answers bit for bit as reading the mapping; the I/O layer's read bytes
+    /// prove the explicit reads ran.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void PleRows_ReadExplicitly_AnswerAsTheMapping_Metal()
+    {
+        float[][] Answer(string explicitRead, out long readBytes)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_PLE_EXPLICIT_READ", explicitRead);
+            long before = GgmlBasicOps.HostExpertIoStats().ReadBytes;
+            float[][] rows = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, model =>
+            {
+                var q = Assert.IsType<Qwen4ExpModel>(model);
+                Assert.True(q.EnableHostExpertIoForTests(256L << 20), "the mapping could not be registered for explicit reads");
+            });
+            readBytes = GgmlBasicOps.HostExpertIoStats().ReadBytes - before;
+            return rows;
+        }
+        float[][] mapping = Answer("0", out long mappingBytes);
+        float[][] explicitRows = Answer("1", out long explicitBytes);
+        Assert.True(explicitBytes > mappingBytes, $"no PLE rows were read explicitly ({explicitBytes} vs {mappingBytes} bytes)");
+        for (int i = 0; i < explicitRows.Length; i++)
+            Assert.True(explicitRows[i].AsSpan().SequenceEqual(mapping[i]), $"row {i}: explicitly read PLE rows changed the logits");
+    }
+
+    /// <summary>A batched verify-width span (here a 4-token prefill) reads up to two window misses a
+    /// row in the background while the accelerator computes the routes its slots already hold, then
+    /// computes those after a second cut (host_moe_build_hot_part's overlap group). Only the
+    /// order the routes are summed in changes, so with a window wide enough for every route the
+    /// answer still matches the all-accelerator span far inside the host bound; a misread or
+    /// half-written slot would not.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TieredExperts_VerifyWidthOverlap_Metal()
+    {
+        // The overlap group is MUL_MAT_ID's; the grouped tsm kernels read a window's misses before they run.
+        _nativeEnv.Set("TS_METAL_MOE", "0");
+        int[] verifyWidth = Prompt.Take(4).ToArray();
+        float[][] device = Run(BackendType.GgmlMetal, () => { }, verifyWidth);
+        long deferred = 0;
+        float[][] overlapped = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, verifyWidth, model =>
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 4, q.ExpertCountForTests));
+        }, _ => deferred = GgmlBasicOps.MoeHotTierStats().Deferred);
+        Assert.True(deferred > 0, "no window miss was read in the background");
+        AssertClose("tier, verify-width overlap", overlapped, device, 1e-4);
+    }
+
+    /// <summary>Strata's read-ahead: at each seam the next layer's router, applied to this layer's FFN input, names
+    /// the experts the next tier will likely miss, and they are read into its window while the accelerator works. A
+    /// slot holds the expert's bytes wherever it came from, so with the route tail skip off (it decides on what the
+    /// slots hold) decoding answers as without the read-ahead; the counters show it read and was used.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TieredExperts_ReadAhead_AnswersAsWithout_Metal()
+    {
+        _nativeEnv.Set("TS_MOE_ROUTE_TAIL_SKIP", "0");
+        Action<ModelBase> smallTier = model =>
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            // A few fixed slots and a window, so decode steps miss and the read-ahead has something to read.
+            Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 8, q.ExpertCountForTests / 2));
+        };
+        _nativeEnv.Set("TS_MOE_TIER_PREFETCH", "0");
+        long readsBefore = GgmlBasicOps.MoeTierPrefetchStats().Reads;
+        float[][] without = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, smallTier, null);
+        Assert.Equal(readsBefore, GgmlBasicOps.MoeTierPrefetchStats().Reads);
+
+        _nativeEnv.Set("TS_MOE_TIER_PREFETCH", "6");
+        var before = GgmlBasicOps.MoeTierPrefetchStats();
+        float[][] with = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, smallTier, null);
+        var after = GgmlBasicOps.MoeTierPrefetchStats();
+        _output.WriteLine($"read ahead {after.Reads - before.Reads}, used {after.Hits - before.Hits}, failed {after.Failed - before.Failed}");
+        Assert.True(after.Reads > before.Reads, "the read-ahead read nothing");
+        Assert.True(after.Hits > before.Hits, "no expert read ahead was routed to");
+        Assert.Equal(before.Failed, after.Failed);
+        AssertClose("tier, read-ahead", with, without, 1e-5);
+    }
+
+    /// <summary>The node shapes ggml-metal runs as fewer kernels (q4e_metal_fusions: the hyper-connection norm's
+    /// gamma in the streams' shape, the router's top-k as ggml-metal's fused chain, the shared expert's GLU, the
+    /// scatter's one-term outer product) form the same products as the plain ops. All on the accelerator, and with
+    /// every layer's experts at tiered seams (the path whose router chain fuses), decode answers as with
+    /// TS_Q4E_METAL_FUSE=0 within float rounding, every argmax equal. The kernels differ from the plain ops in
+    /// rounding only (the fused norm's products may associate differently; the fused softmax reduces in its own
+    /// order), which this fixture's residual stack amplifies ~40x (its CPU-vs-Metal floor is 0.6-1.8e-2): measured
+    /// on an M5 Pro 4.6e-5 at the 40-token prefill falling to 4.7e-6 by the sixth decode step on the accelerator.
+    /// A wrong broadcast or a wrong expert would be orders of magnitude past the bound.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void FusedNodeShapes_AnswerAsThePlainOps_Metal()
+    {
+        _nativeEnv.Set("TS_MOE_ROUTE_TAIL_SKIP", "0");
+        Action<ModelBase> tier = model =>
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 4, q.ExpertCountForTests));
+        };
+        _nativeEnv.Set("TS_Q4E_METAL_FUSE", "0");
+        float[][] plainDevice = Run(BackendType.GgmlMetal, () => { });
+        float[][] plainTier = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, tier, null);
+        _nativeEnv.Set("TS_Q4E_METAL_FUSE", null);
+        float[][] fusedDevice = Run(BackendType.GgmlMetal, () => { });
+        float[][] fusedTier = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, tier, null);
+        AssertClose("fused node shapes, accelerator", fusedDevice, plainDevice, 2e-4);
+        AssertClose("fused node shapes, tiered seams", fusedTier, plainTier, 2e-4);
+    }
+
+    /// <summary>Discrete VRAM: fixed slots only (no host-writable window), the rest of every
+    /// route on the host. Prefill (40 tokens) runs the batched expert kernels on the slots.</summary>
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void TieredExperts_AnswerAsTheAccelerator_Cuda()
+    {
+        float[][] device = Run(BackendType.GgmlCuda, () => { });
+        float[][] tiered = Run(BackendType.GgmlCuda, MoeCpuOffloadConfig.SetAllLayers, Prompt, model =>
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 2, 0));
+        });
+        AssertClose("tier, fixed slots only (CUDA)", tiered, device, Bound(BackendType.GgmlCuda, hostPrefill: true));
+    }
+
+    /// <summary>A 100-token prompt is wider than a discrete GPU tier's old 64-row split and narrower than the 128 rows
+    /// the seam streams from, so it ran every route of every layer on the host (ggml_cuda Flash Next: 1.1-1.4 s for a
+    /// 73-76 token prompt against 0.27-0.29 s at 64 rows). The tier now splits up to the streaming width: the slots
+    /// compute their routes on the GPU, the host the rest, and the prompt answers as the all-accelerator span.</summary>
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void TieredExperts_SplitASpanNarrowerThanTheStreamingWidth_Cuda()
+    {
+        int[] prompt = Enumerable.Range(0, 100).Select(i => (i * 29 + 3) % 250).ToArray();
+        float[][] device = Run(BackendType.GgmlCuda, () => { }, prompt);
+        float[][] tiered = Run(BackendType.GgmlCuda, MoeCpuOffloadConfig.SetAllLayers, prompt, model =>
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 2, 0));
+        });
+        AssertClose("tier, fixed slots only, 100-row prompt split (CUDA)", tiered, device, Bound(BackendType.GgmlCuda, hostPrefill: true));
+    }
+
+    /// <summary>Adaptive fixed slots (<c>TS_MOE_TIER_ADAPT=1</c>, discrete VRAM): 96 decode steps over a
+    /// few repeating tokens concentrate the routing on experts the initial slots (ids 0..n/4-1) mostly
+    /// do not hold. Every 32 seams the hottest of them are copied into the coldest slots, so more
+    /// routes land in slots than with the slots fixed, and a swapped-in slot must hold exactly that
+    /// expert's bytes: the logits stay within the host bound of the all-accelerator span.</summary>
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void AdaptiveSlots_FollowTheRoutesAndStillAnswerAsTheAccelerator_Cuda()
+    {
+        int[] steps = Enumerable.Range(0, 96).Select(i => 40 + (i * 7) % 5).ToArray();
+        float[][] device = Run(BackendType.GgmlCuda, () => { }, Prompt, steps, null, null);
+        long fixedHits = 0, adaptiveHits = 0;
+        void Register(ModelBase model)
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 4, 0));
+        }
+        float[][] fixedRows = Run(BackendType.GgmlCuda, MoeCpuOffloadConfig.SetAllLayers, Prompt, steps, Register,
+            _ => fixedHits = GgmlBasicOps.MoeHotTierStats().Hits);
+        float[][] adaptive;
+        using (var env = new NativeEnvScope())
+        {
+            env.Set("TS_MOE_TIER_ADAPT", "1");
+            adaptive = Run(BackendType.GgmlCuda, MoeCpuOffloadConfig.SetAllLayers, Prompt, steps, Register,
+                _ => adaptiveHits = GgmlBasicOps.MoeHotTierStats().Hits);
+        }
+        _output.WriteLine($"slot hits: fixed {fixedHits}, adaptive {adaptiveHits}");
+        Assert.True(adaptiveHits > fixedHits, $"adaptive slots held no more routes ({adaptiveHits} vs {fixedHits})");
+        // 96 steps on random weights meet near-ties (one measured at a normal 5.7e-3 step): a
+        // differing argmax must be one the step's own deviation explains.
+        AssertClose("tier, fixed slots (long decode)", fixedRows, device, Bound(BackendType.GgmlCuda, hostPrefill: true),
+            allowExplainedTies: true);
+        AssertClose("tier, adaptive slots", adaptive, device, Bound(BackendType.GgmlCuda, hostPrefill: true),
+            allowExplainedTies: true);
+    }
+
+    /// <summary>A discrete-VRAM layer plan has no host seam on its resident layers, so a profile built
+    /// from the seams alone never covers the model and the next load could never tier it. While
+    /// recording, the resident layers' graphs hand their router ids to the same counters: every MoE
+    /// layer then counts the same routes, and the logits are those of the plan without recording.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void ResidentLayersRecordTheirRouting_Metal() => ResidentLayersRecordTheirRouting(BackendType.GgmlMetal);
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void ResidentLayersRecordTheirRouting_Cuda() => ResidentLayersRecordTheirRouting(BackendType.GgmlCuda);
+
+    private void ResidentLayersRecordTheirRouting(BackendType backend)
+    {
+        var plainTotals = new List<ulong>();
+        var totals = new List<ulong>();
+        void Collect(ModelBase model, List<ulong> into)
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            for (int l = 0; l < q.Config.NumLayers; l++)
+                if (q.RoutingCountsForTests(l) is ulong[] counts)
+                    into.Add(counts.Aggregate(0UL, (a, c) => a + c));
+                else
+                    into.Add(0);
+        }
+        float[][] plain = Run(backend, () => MoeCpuOffloadConfig.SetLayers(4), Prompt, done: m => Collect(m, plainTotals));
+        float[][] recorded = Run(backend, () => MoeCpuOffloadConfig.SetLayers(4), Prompt,
+            model => Assert.IsType<Qwen4ExpModel>(model).RecordDeviceRoutesForTests(true),
+            model => Collect(model, totals));
+
+        // Without recording only the four host layers count; with it every layer does, alike.
+        Assert.Contains(plainTotals, t => t == 0);
+        Assert.All(totals, t => Assert.True(t > 0));
+        Assert.Single(totals.Distinct());
+        Assert.Equal(plainTotals.Max(), totals[0]);
+        for (int i = 0; i < plain.Length; i++)
+            Assert.Equal(plain[i], recorded[i]);
+    }
 
     /// <summary>A 160-token prefill streams each offloaded layer's experts to the accelerator. The
     /// seam then reads a result the stream path published through an asynchronous download on
@@ -163,7 +731,11 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         }
     }
 
-    private void AssertClose(string what, float[][] actual, float[][] expected, double bound)
+    /// <param name="allowExplainedTies">Accept a differing argmax when the expected logits rank the
+    /// actual choice within twice the step's largest absolute deviation of the expected maximum: a
+    /// near-tie the measured error explains, not a wrong answer.</param>
+    private void AssertClose(string what, float[][] actual, float[][] expected, double bound,
+        bool allowExplainedTies = false)
     {
         Assert.Equal(expected.Length, actual.Length);
         double worst = 0;
@@ -175,7 +747,19 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
             worst = Math.Max(worst, err);
             _output.WriteLine($"{what} {(i == 0 ? "prefill" : $"decode {i}")}: relative error {err:E3}, " +
                 $"argmax {ArgMax(actual[i])} vs {ArgMax(expected[i])}");
-            Assert.Equal(ArgMax(expected[i]), ArgMax(actual[i]));
+            int want = ArgMax(expected[i]), got = ArgMax(actual[i]);
+            if (allowExplainedTies && want != got)
+            {
+                double deviation = 0;
+                for (int v = 0; v < expected[i].Length; v++)
+                    deviation = Math.Max(deviation, Math.Abs(actual[i][v] - expected[i][v]));
+                double gap = expected[i][want] - expected[i][got];
+                _output.WriteLine($"  near-tie: expected gap {gap:E3}, largest deviation {deviation:E3}");
+                Assert.True(gap <= 2 * deviation, $"{what}: argmax {got} vs {want} with a gap of {gap:E3}, " +
+                    $"more than twice the step's deviation {deviation:E3}");
+                continue;
+            }
+            Assert.Equal(want, got);
         }
         Assert.True(worst <= bound, $"{what} strayed {worst:E3} from the all-accelerator span");
     }
@@ -224,6 +808,22 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         long wired = 4 * GB + Qwen4ExpModel.DeviceScratchBytes + onDevice * 957_000_000L;
         Assert.True(wired <= 20 * GB - 20 * GB / 16, $"{onDevice} layers wire {wired} bytes");
         Assert.True(wired + 957_000_000L > 20 * GB - 20 * GB / 16, "one more layer would still have fit");
+    }
+
+    /// <summary>A DFlash drafter is attached after the Metal plan, into the same working set, so the plan counts its
+    /// file and one request's KV ring (unplanned, its 0.45 GB was what 4096-token prompt chunks lacked once a quiet
+    /// machine at load sized the tier to the limit). A file it cannot read counts nothing: the attach reports it.</summary>
+    [Fact]
+    public void ThePlan_CountsADFlashDrafterNamedForTheLoad()
+    {
+        string path = Path.Combine(Path.GetTempPath(), "ts-dflash-size-" + Guid.NewGuid().ToString("N") + ".gguf");
+        File.WriteAllBytes(path, new byte[12345]);
+        try
+        {
+            Assert.Equal(12345 + Qwen4ExpModel.DFlashRingAllowanceBytes, Qwen4ExpModel.PendingDFlashDraftBytes(path));
+        }
+        finally { File.Delete(path); }
+        Assert.Equal(0, Qwen4ExpModel.PendingDFlashDraftBytes(path));
     }
 
     [Fact]

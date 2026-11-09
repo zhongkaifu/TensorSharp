@@ -28,8 +28,7 @@ public class MlxLowBitQuantKernelTests
 
     public MlxLowBitQuantKernelTests(ITestOutputHelper output) => _output = output;
 
-    // rows 1: the decode kernel; 3 and 5: the few-row simdgroup kernel on F32 tiles, 8 on F16 tiles;
-    // 40: F16 dequant + GEMM.
+    // rows 1: the decode kernel; 3, 5 and 8: the few-row kernel; 40: F16 dequant + GEMM.
     [MlxTheory]
     [InlineData((int)GgmlTensorType.Q2_K, 1)]
     [InlineData((int)GgmlTensorType.Q2_K, 3)]
@@ -64,9 +63,34 @@ public class MlxLowBitQuantKernelTests
     [InlineData((int)GgmlTensorType.IQ4_XS, 8)]
     [InlineData((int)GgmlTensorType.Q6_K, 8)]
     public void Matmul_MatchesManagedDequantReference(int ggmlType, int rows)
+        => MatmulMatchesReference(ggmlType, rows, inDim: 512, outDim: 37); // 37: not a multiple of a kernel's output tile
+
+    // The K-split few-row kernel's edges: 2 rows, one and two 8-row input tiles (12, 16), 17 rows (past it), an
+    // inner dimension whose 64-value chunks do not divide evenly among the simdgroups (1280: 20 chunks, 16
+    // simdgroups), and output sizes that take one, two and four 8-row weight tiles a threadgroup (37, 2100, 4099).
+    [MlxTheory]
+    [InlineData((int)GgmlTensorType.IQ3_XXS, 2, 512, 37)]
+    [InlineData((int)GgmlTensorType.IQ3_XXS, 12, 1280, 37)]
+    [InlineData((int)GgmlTensorType.IQ3_XXS, 16, 1280, 2100)]
+    [InlineData((int)GgmlTensorType.IQ3_XXS, 17, 512, 37)]
+    [InlineData((int)GgmlTensorType.IQ3_S, 7, 1280, 4099)]
+    [InlineData((int)GgmlTensorType.IQ3_S, 16, 512, 37)]
+    [InlineData((int)GgmlTensorType.IQ4_XS, 2, 1280, 37)]
+    [InlineData((int)GgmlTensorType.IQ4_XS, 13, 512, 4099)]
+    [InlineData((int)GgmlTensorType.IQ2_S, 9, 1280, 2100)]
+    [InlineData((int)GgmlTensorType.IQ2_XXS, 16, 512, 37)]
+    [InlineData((int)GgmlTensorType.Q2_K, 12, 512, 37)]
+    [InlineData((int)GgmlTensorType.IQ1_M, 4, 1280, 37)]
+    // The tensor-API kernel's 32- and 64-row tiles (and a partial last tile of each).
+    [InlineData((int)GgmlTensorType.IQ3_XXS, 24, 1280, 2100)]
+    [InlineData((int)GgmlTensorType.IQ3_S, 100, 512, 37)]
+    [InlineData((int)GgmlTensorType.IQ4_XS, 64, 1280, 4099)]
+    [InlineData((int)GgmlTensorType.Q6_K, 33, 512, 2100)]
+    public void Matmul_FewRowShapes_MatchManagedDequantReference(int ggmlType, int rows, int inDim, int outDim)
+        => MatmulMatchesReference(ggmlType, rows, inDim, outDim);
+
+    private void MatmulMatchesReference(int ggmlType, int rows, int inDim, int outDim)
     {
-        const int inDim = 512;
-        const int outDim = 37;   // not a multiple of the few-row kernel's 32 columns
         byte[] weights = CreateRows(ggmlType, outDim, inDim, seed: 0x4B1D + ggmlType * 7);
         float[,] input = new float[rows, inDim];
         for (int r = 0; r < rows; r++)
@@ -76,7 +100,7 @@ public class MlxLowBitQuantKernelTests
 
         using var allocator = new MlxAllocator();
         IntPtr host = Marshal.AllocHGlobal(weights.Length);
-        IntPtr cacheKey = new(0x6A0000 + ggmlType * 64 + rows);
+        IntPtr cacheKey = new(0x6A0000 + ggmlType * 4096 + rows * 64 + outDim % 61 + inDim / 256);
         try
         {
             Marshal.Copy(weights, 0, host, weights.Length);
@@ -87,11 +111,13 @@ public class MlxLowBitQuantKernelTests
             Assert.True(MlxQuantizedOps.TryAddmmQuantizedToFloat32(outputTensor, inputTensor, cacheKey, IntPtr.Zero,
                 ggmlType, inDim, outDim, weights.Length));
             float[] actual = outputTensor.GetElementsAsFloat(rows * outDim);
-            // Below 8 rows the routes are F32 (only the summation order differs); from 8 rows the
-            // few-row tiles and the dequant GEMM are F16, as the simdgroup kernel those rows took was.
+            // Up to 8 rows (and below the dequant-GEMM rows without the tensor API) every route decodes to F32
+            // and only the summation order differs; the tensor-API kernel (9+ rows) and the dequant GEMM
+            // multiply F16 operands.
             double scale = 0;
             foreach (float v in expected) scale = Math.Max(scale, Math.Abs(v));
-            double tolerance = rows >= 8 ? 4e-3 * scale + 1e-3 : 2e-5 * scale + 1e-5;
+            bool f16 = rows >= MlxNative.IQuantDequantGemmMinRows || (rows >= 9 && MlxNative.FewRowTensorAvailable);
+            double tolerance = f16 ? 4e-3 * scale + 1e-3 : 2e-5 * scale + 1e-5;
             AssertClose($"{(GgmlTensorType)ggmlType} rows={rows}", expected, actual, tolerance);
         }
         finally

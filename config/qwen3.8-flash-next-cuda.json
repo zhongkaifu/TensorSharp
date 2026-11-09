@@ -1,0 +1,63 @@
+{
+  // Qwen3.8 Flash Next on NVIDIA, the fastest measured setup: ISTA-DASLab's GSQ-RCO Q2_0 (two GGUF shards, 66.4 GB)
+  // on the direct CUDA engine with the shared MTP head (three drafts).
+  //   TensorSharp.Server.Host --config config/qwen3.8-flash-next-cuda.json
+  // For several concurrent users add config/qwen3.8-flash-next-cuda-4lanes.json after this file.
+  //
+  // Measured on an RTX 5090 (32 GB), 2026-11-08, one sequence lane: decode 131-177 tok/s (short answers) and
+  // 231-250 (long ones); TTFT 1.0 s at 4K tokens, 4.2 s at 16K, 13.2 s at 48K, 30.4 s at 100K (prefill ~3,900
+  // tok/s); four requests at once 200 tok/s in all. With four lanes: four at once 243-258 tok/s, parallel_4 281-286,
+  // single-stream decode 7-11% lower (fewer experts fit the VRAM). See docs/models/qwen38-flash-next.md.
+  //
+  // The experts do not fit a 32 GB card: the engine keeps the most-routed ones in VRAM (ranked by a routing profile
+  // it records on the first load) and computes the rest on the host, so the host needs ~45 GB of RAM (the 28.8 GB
+  // n-gram table, ~15 GB of pinned host experts, ~1.6 GB of pinned KV per sequence). Loading takes ~3 minutes.
+  // Apple Silicon: config/qwen3.8-flash-next.json.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/qwen3.8-flash-next-ista-q2_0",
+    "headRoot": "${modelRoot}/qwen3.8-flash-next",
+    "ista": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+    "unsloth": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6"
+  },
+
+  "backend": "cuda",
+  "max-tokens": 4096,
+  "continuous-batching": true,
+  // The engine's KV cache is q8_0 unless --kv-cache-dtype names another.
+  "temperature": 1.0,
+  "top-k": 20,
+  "top-p": 0.95,
+  "min-p": 0,
+  "repeat-penalty": 1.0,
+
+  "environment": {
+    // The model declares 262,144 tokens; 131,072 was the measured setup (a resident KV window keeps 32,960 cells
+    // in VRAM and the rest in pinned host memory).
+    "MAX_CONTEXT": "131072",
+    // The hyper-connection matrices (BF16 in the file) run as a Q8_0 copy.
+    "TS_Q4E_HC_Q8": "1",
+    // The MTP head's experts as Q2_0 (2,550 -> 675 MiB of VRAM), leaving that much more for the model's experts.
+    "TS_Q4E_MTP_EXPERTS": "q2_0"
+  },
+
+  "model": {
+    "path": "${root}/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "urls": ["${ista}/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"],
+    "sha256": "69820c02ec7d0b45ef2ebb19d6620299db749fe2aded7f39f93c6b88b199b720",
+    "files": [
+      {
+        "path": "${root}/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf",
+        "urls": ["${ista}/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"],
+        "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"
+      }
+    ]
+  },
+  // The shared MTP head: naming it is the request to speculate. Three drafts a step (four measured slower).
+  "draft-model": {
+    "path": "${headRoot}/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+    "urls": ["${unsloth}/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"],
+    "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+  },
+  "spec-draft": 3
+}

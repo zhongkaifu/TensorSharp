@@ -396,6 +396,110 @@ extern "C" __global__ void ts_dsv4_caps_q5_1_experts() {}
 // Never launched.
 extern "C" __global__ void ts_dsv4_caps_lowbit_iq_experts() {}
 
+// ggml's legacy block formats that ISTA-DASLab's Qwen3.8-Flash-Next Q2_0 pack stores: Q2_0 (its routed
+// experts and some dense projections), Q4_0 and Q5_0 (shared-expert down projections). Each against
+// q8_1 activations with dp4a; the offset term sums the int8 activations with dp4a as Q5_1 does.
+
+#define TS_DSV4_Q2_0_BLOCK_BYTES 18   // half d, qs[16]: 64 two-bit codes, value = (code - 1) * d
+#define TS_DSV4_Q4_0_BLOCK_BYTES 18   // half d, qs[16]: 32 nibbles (values 0-15 low, 16-31 high), value = (q - 8) * d
+#define TS_DSV4_Q5_0_BLOCK_BYTES 22   // half d, uint32 qh, qs[16]: value = (nibble | qh bit << 4) - 16, times d
+
+// One Q2_0 block (64 values) against the two q8_1 blocks it spans. Byte i holds values 4i..4i+3 at bit
+// offsets 0, 2, 4, 6 (ggml's dequantize_row_q2_0), which is exactly q8_1 int i's four activations.
+__device__ __forceinline__ float ts_dsv4_dot_q2_0_block(
+    const uint8_t* __restrict__ blk, const ts_dsv4_block_q8_1* __restrict__ q8)
+{
+    const uint8_t* qs = blk + 2;
+    float acc = 0.0f;
+#pragma unroll
+    for (int b = 0; b < 2; ++b)
+    {
+        const int* a = (const int*)q8[b].qs;
+        int dot = 0, asum = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+        {
+            const int c = qs[8 * b + i];
+            const int w = (c & 0x03) | ((c & 0x0C) << 6) | ((c & 0x30) << 12) | ((c & 0xC0) << 18);
+            dot = ts_dsv4_dp4a(w, a[i], dot);
+            asum = ts_dsv4_dp4a(0x01010101, a[i], asum);
+        }
+        acc += __half2float(q8[b].d) * (float)(dot - asum);
+    }
+    return __half2float(*(const half*)blk) * acc;
+}
+
+// A quarter of a Q2_0 block (16 values, code bytes 4m..4m+3) against the q8_1 block holding them: bytes 4m..4m+3
+// are values 16m..16m+15, the q8_1 block's ints 4(m & 1)..4(m & 1)+3. The block's codes start 2 bytes in.
+__device__ __forceinline__ float ts_dsv4_dot_q2_0_quarter(
+    const uint8_t* __restrict__ blk, int m, const ts_dsv4_block_q8_1* __restrict__ q8)
+{
+    const int c4 = ts_dsv4_get_int_b2(blk + 2, m);
+    const int* a = (const int*)q8->qs + 4 * (m & 1);
+    int dot = 0, asum = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        const int c = (c4 >> (8 * i)) & 0xFF;
+        const int w = (c & 0x03) | ((c & 0x0C) << 6) | ((c & 0x30) << 12) | ((c & 0xC0) << 18);
+        dot = ts_dsv4_dp4a(w, a[i], dot);
+        asum = ts_dsv4_dp4a(0x01010101, a[i], asum);
+    }
+    return __half2float(*(const half*)blk) * __half2float(q8->d) * (float)(dot - asum);
+}
+
+__device__ __forceinline__ float ts_dsv4_dot_q4_0_block(
+    const uint8_t* __restrict__ blk, const ts_dsv4_block_q8_1* __restrict__ q8)
+{
+    const int* a = (const int*)q8->qs;
+    int dot = 0, asum = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+    {
+        const int v = ts_dsv4_get_int_b2(blk + 2, k);
+        dot = ts_dsv4_dp4a(v & 0x0F0F0F0F, a[k], dot);
+        dot = ts_dsv4_dp4a((v >> 4) & 0x0F0F0F0F, a[k + 4], dot);
+        asum = ts_dsv4_dp4a(0x01010101, a[k], asum);
+        asum = ts_dsv4_dp4a(0x01010101, a[k + 4], asum);
+    }
+    return __half2float(*(const half*)blk) * __half2float(q8->d) * (float)(dot - 8 * asum);
+}
+
+// Q5_0's fifth bits sit as Q5_1's do (ts_dsv4_q5_1_ints), with qh at byte 2 and the nibbles at byte 6.
+__device__ __forceinline__ float ts_dsv4_dot_q5_0_block(
+    const uint8_t* __restrict__ blk, const ts_dsv4_block_q8_1* __restrict__ q8)
+{
+    const int qh = ts_dsv4_get_int_b2(blk + 2, 0);
+    const int* a = (const int*)q8->qs;
+    int dot = 0, asum = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+    {
+        const int ql = ts_dsv4_get_int_b2(blk + 6, k);
+        const int h0 = qh >> (4 * k);
+        const int h1 = qh >> (4 * k + 16);
+        int lo = ql & 0x0F0F0F0F;
+        lo |= (h0 << 4) & 0x00000010;
+        lo |= (h0 << 11) & 0x00001000;
+        lo |= (h0 << 18) & 0x00100000;
+        lo |= (h0 << 25) & 0x10000000;
+        int hi = (ql >> 4) & 0x0F0F0F0F;
+        hi |= (h1 << 4) & 0x00000010;
+        hi |= (h1 << 11) & 0x00001000;
+        hi |= (h1 << 18) & 0x00100000;
+        hi |= (h1 << 25) & 0x10000000;
+        dot = ts_dsv4_dp4a(lo, a[k], dot);
+        dot = ts_dsv4_dp4a(hi, a[k + 4], dot);
+        asum = ts_dsv4_dp4a(0x01010101, a[k], asum);
+        asum = ts_dsv4_dp4a(0x01010101, a[k + 4], asum);
+    }
+    return __half2float(*(const half*)blk) * __half2float(q8->d) * (float)(dot - 16 * asum);
+}
+
+// Present only in a module whose warp-per-row decoders (decode steps, dense rows, the warp expert route)
+// read Q2_0, Q4_0 and Q5_0; an older module answers NaN for them. Never launched.
+extern "C" __global__ void ts_dsv4_caps_legacy_quants() {}
+
 #define TS_DSV4_WTYPE_Q5_1 7
 #define TS_DSV4_WTYPE_Q8_0 8
 #define TS_DSV4_WTYPE_Q6_K 14
@@ -412,6 +516,9 @@ extern "C" __global__ void ts_dsv4_caps_lowbit_iq_experts() {}
 #define TS_DSV4_WTYPE_IQ4NL 20
 #define TS_DSV4_WTYPE_IQ2S 22
 #define TS_DSV4_WTYPE_IQ4XS 23
+#define TS_DSV4_WTYPE_Q4_0 2
+#define TS_DSV4_WTYPE_Q5_0 6
+#define TS_DSV4_WTYPE_Q2_0 42
 #define TS_DSV4_IQ4NL_BLOCK_BYTES 18  // half d + qs[16], 32 values
 #define TS_DSV4_IQ4XS_BLOCK_BYTES 136 // half d, u16 scales_h, scales_l[4], qs[128], 256 values
 #define TS_DSV4_Q2_K_BLOCK_BYTES 84
@@ -848,8 +955,11 @@ __device__ __forceinline__ float ts_dsv4_dot_q45k_pair(
     return sum;
 }
 
-__device__ __forceinline__ float ts_dsv4_dot_row_warp(
-    const uint8_t* wRow, int wtype, const ts_dsv4_block_q8_1* act, int inDim, int lane)
+// One thread's share of a row against q8_1 activations: the units first, first + step, ... of the row's
+// decode units (blocks, groups or half-superblocks by format). A warp passes (lane, 32); a split-K kernel
+// passes its block's thread index and thread count.
+__device__ __forceinline__ float ts_dsv4_dot_row_part(
+    const uint8_t* wRow, int wtype, const ts_dsv4_block_q8_1* act, int inDim, int first, int step)
 {
     float sum = 0.0f;
     if (wtype == TS_DSV4_WTYPE_IQ3S)
@@ -857,7 +967,7 @@ __device__ __forceinline__ float ts_dsv4_dot_row_warp(
         // Two half-superblocks per lane-pair: a 4096-wide row is only 16
         // superblocks, so whole-superblock striding would idle half the warp.
         const int nHalves = inDim / 128;
-        for (int h = lane; h < nHalves; h += 32)
+        for (int h = first; h < nHalves; h += step)
         {
             const int sb = h >> 1;
             const int iqsBegin = (h & 1) ? 8 : 0;
@@ -868,7 +978,7 @@ __device__ __forceinline__ float ts_dsv4_dot_row_warp(
     else if (wtype == TS_DSV4_WTYPE_MXFP4)
     {
         const int nBlk = inDim / 32;
-        for (int b = lane; b < nBlk; b += 32)
+        for (int b = first; b < nBlk; b += step)
             sum += ts_dsv4_dot_mxfp4_block(wRow + (size_t)b * TS_DSV4_MXFP4_BLOCK_BYTES, act + b);
     }
     else if (wtype == TS_DSV4_WTYPE_IQ2XXS)
@@ -876,35 +986,35 @@ __device__ __forceinline__ float ts_dsv4_dot_row_warp(
         // 8 groups of 32 values per super-block: stride whole groups so a
         // 4096-wide row (16 super-blocks) still fills the warp.
         const int nGroups = inDim / 32;
-        for (int g = lane; g < nGroups; g += 32)
+        for (int g = first; g < nGroups; g += step)
             sum += ts_dsv4_dot_iq2xxs_group(wRow + (size_t)(g >> 3) * TS_DSV4_IQ2XXS_BLOCK_BYTES,
                                             act + (size_t)(g >> 3) * 8, g & 7);
     }
     else if (wtype == TS_DSV4_WTYPE_IQ2XS)
     {
         const int nGroups = inDim / 32;
-        for (int g = lane; g < nGroups; g += 32)
+        for (int g = first; g < nGroups; g += step)
             sum += ts_dsv4_dot_iq2xs_group(wRow + (size_t)(g >> 3) * TS_DSV4_IQ2XS_BLOCK_BYTES,
                                            act + (size_t)(g >> 3) * 8, g & 7);
     }
     else if (wtype == TS_DSV4_WTYPE_IQ3XXS)
     {
         const int nGroups = inDim / 32;
-        for (int g = lane; g < nGroups; g += 32)
+        for (int g = first; g < nGroups; g += step)
             sum += ts_dsv4_dot_iq3xxs_group(wRow + (size_t)(g >> 3) * TS_DSV4_IQ3XXS_BLOCK_BYTES,
                                             act + (size_t)(g >> 3) * 8, g & 7);
     }
     else if (wtype == TS_DSV4_WTYPE_Q2_K)
     {
         const int nGroups = inDim / 32;
-        for (int g = lane; g < nGroups; g += 32)
+        for (int g = first; g < nGroups; g += step)
             sum += ts_dsv4_dot_q2k_group(wRow + (size_t)(g >> 3) * TS_DSV4_Q2_K_BLOCK_BYTES,
                                          act + (size_t)(g >> 3) * 8, g & 7);
     }
     else if (wtype == TS_DSV4_WTYPE_Q3_K)
     {
         const int nGroups = inDim / 32;
-        for (int g = lane; g < nGroups; g += 32)
+        for (int g = first; g < nGroups; g += step)
             sum += ts_dsv4_dot_q3k_group(wRow + (size_t)(g >> 3) * TS_DSV4_Q3_K_BLOCK_BYTES,
                                          act + (size_t)(g >> 3) * 8, g & 7);
     }
@@ -912,7 +1022,7 @@ __device__ __forceinline__ float ts_dsv4_dot_row_warp(
     {
         const bool q5 = wtype == TS_DSV4_WTYPE_Q5_K;
         const int nPairs = inDim / 64;
-        for (int p = lane; p < nPairs; p += 32)
+        for (int p = first; p < nPairs; p += step)
             sum += ts_dsv4_dot_q45k_pair(wRow, q5, p, act);
     }
     else if (wtype == TS_DSV4_WTYPE_Q6_K || wtype == TS_DSV4_WTYPE_IQ4NL || wtype == TS_DSV4_WTYPE_IQ4XS)
@@ -920,14 +1030,14 @@ __device__ __forceinline__ float ts_dsv4_dot_row_warp(
         // One 32-value sub-block per lane: a whole 256-value super-block per lane would leave
         // 24 of 32 lanes idle on a 2048-wide expert row.
         const int nGroups = inDim / 32;
-        for (int g = lane; g < nGroups; g += 32)
+        for (int g = first; g < nGroups; g += step)
             sum += ts_dsv4_dot_sub_q8_1(wRow, wtype, g, act + g);
     }
     else if (wtype == TS_DSV4_WTYPE_Q5_1)
     {
         // Unsloth's UD-Q4_K_XL keeps most of Qwen3.8-Flash-Next's expert down projections in Q5_1.
         const int nBlk = inDim / 32;
-        for (int b = lane; b < nBlk; b += 32)
+        for (int b = first; b < nBlk; b += step)
             sum += ts_dsv4_dot_q5_1_block(wRow + (size_t)b * TS_DSV4_Q5_1_BLOCK_BYTES, act + b);
     }
     else if (wtype == TS_DSV4_WTYPE_IQ2S)
@@ -935,22 +1045,41 @@ __device__ __forceinline__ float ts_dsv4_dot_row_warp(
         // Unsloth's DeepSeek V4.1 1017 UD-IQ2_XXS keeps its gate/up experts in IQ1_S, IQ2_S or
         // IQ2_XXS and most down projections in IQ2_S, IQ3_XXS or IQ2_XS.
         const int nGroups = inDim / 32;
-        for (int g = lane; g < nGroups; g += 32)
+        for (int g = first; g < nGroups; g += step)
             sum += ts_dsv4_dot_iq2s_group(wRow + (size_t)(g >> 3) * TS_DSV4_IQ2S_BLOCK_BYTES,
                                           act + (size_t)(g >> 3) * 8, g & 7);
     }
     else if (wtype == TS_DSV4_WTYPE_IQ1S)
     {
         const int nGroups = inDim / 32;
-        for (int g = lane; g < nGroups; g += 32)
+        for (int g = first; g < nGroups; g += step)
             sum += ts_dsv4_dot_iq1s_group(wRow + (size_t)(g >> 3) * TS_DSV4_IQ1S_BLOCK_BYTES,
                                           act + (size_t)(g >> 3) * 8, g & 7);
     }
     else if (wtype == TS_DSV4_WTYPE_Q8_0)
     {
         const int nBlk = inDim / 32;
-        for (int b = lane; b < nBlk; b += 32)
+        for (int b = first; b < nBlk; b += step)
             sum += ts_dsv4_dot_q8_0_block(wRow + (size_t)b * TS_DSV4_Q8_0_BLOCK_BYTES, act + b);
+    }
+    else if (wtype == TS_DSV4_WTYPE_Q2_0)
+    {
+        // 16-value units (4 code bytes): a 640-wide expert row is 10 blocks but 40 units, so the warp stays busy.
+        const int nUnits = inDim / 16;
+        for (int u = first; u < nUnits; u += step)
+            sum += ts_dsv4_dot_q2_0_quarter(wRow + (size_t)(u >> 2) * TS_DSV4_Q2_0_BLOCK_BYTES, u & 3, act + 2 * (u >> 2) + ((u & 3) >> 1));
+    }
+    else if (wtype == TS_DSV4_WTYPE_Q4_0)
+    {
+        const int nBlk = inDim / 32;
+        for (int b = first; b < nBlk; b += step)
+            sum += ts_dsv4_dot_q4_0_block(wRow + (size_t)b * TS_DSV4_Q4_0_BLOCK_BYTES, act + b);
+    }
+    else if (wtype == TS_DSV4_WTYPE_Q5_0)
+    {
+        const int nBlk = inDim / 32;
+        for (int b = first; b < nBlk; b += step)
+            sum += ts_dsv4_dot_q5_0_block(wRow + (size_t)b * TS_DSV4_Q5_0_BLOCK_BYTES, act + b);
     }
     else
     {
@@ -958,7 +1087,13 @@ __device__ __forceinline__ float ts_dsv4_dot_row_warp(
         // gate admitting a type before its decoder read the rows as Q8_0, wrong with no error.
         sum = __int_as_float(0x7fc00000);
     }
-    return ts_dsv4_warp_sum(sum);
+    return sum;
+}
+
+__device__ __forceinline__ float ts_dsv4_dot_row_warp(
+    const uint8_t* wRow, int wtype, const ts_dsv4_block_q8_1* act, int inDim, int lane)
+{
+    return ts_dsv4_warp_sum(ts_dsv4_dot_row_part(wRow, wtype, act, inDim, lane, 32));
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,6 +1275,7 @@ extern "C" __global__ void ts_dsv4_gemv_16_f32(const float* x, const float* w, f
 // CTA, lanes striding the whole input row in float4s. The CTA-per-output form gave each of its 128
 // threads five float4s of a 2560-wide row and spent the launch on CTA scheduling. Each output's sum
 // has one order whatever the row count.
+#define TS_DSV4_GEMV_WARP_UNROLL 4
 template <int MAXR>
 __device__ __forceinline__ void ts_dsv4_gemv_warp_rows(
     const float* __restrict__ x,      // [rows, inDim], inDim % 4 == 0
@@ -1159,16 +1295,28 @@ __device__ __forceinline__ void ts_dsv4_gemv_warp_rows(
 #pragma unroll
     for (int r = 0; r < MAXR; ++r)
         acc[r] = 0.0f;
-    for (int i = lane; i < n4; i += 32)
+    // Several loads in flight per lane (see ts_dsv4_gemv_warp_bf16_rows); the sums keep their order.
+    for (int i0 = lane; i0 < n4; i0 += 32 * TS_DSV4_GEMV_WARP_UNROLL)
     {
-        const float4 b = w4[i];
+        float4 bw[TS_DSV4_GEMV_WARP_UNROLL];
 #pragma unroll
-        for (int r = 0; r < MAXR; ++r)
+        for (int u = 0; u < TS_DSV4_GEMV_WARP_UNROLL; ++u)
+            bw[u] = i0 + 32 * u < n4 ? w4[i0 + 32 * u] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int u = 0; u < TS_DSV4_GEMV_WARP_UNROLL; ++u)
         {
-            if (r >= rows)
+            const int i = i0 + 32 * u;
+            if (i >= n4)
                 break;
-            const float4 a = ((const float4*)(x + (size_t)r * inDim))[i];
-            acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            const float4 b = bw[u];
+#pragma unroll
+            for (int r = 0; r < MAXR; ++r)
+            {
+                if (r >= rows)
+                    break;
+                const float4 a = ((const float4*)(x + (size_t)r * inDim))[i];
+                acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
         }
     }
 #pragma unroll
@@ -1181,6 +1329,151 @@ __device__ __forceinline__ void ts_dsv4_gemv_warp_rows(
             y[(size_t)r * outDim + o] = v;
     }
 }
+
+// ts_dsv4_gemv_warp_rows with the weights kept as the file's BF16 (a router that ships in BF16): each group of four
+// is widened to F32 exactly, and the sums are that kernel's, in its order, so the outputs are the same bits at half
+// the bytes read.
+template <int MAXR>
+__device__ __forceinline__ void ts_dsv4_gemv_warp_bf16_rows(
+    const float* __restrict__ x,      // [rows, inDim], inDim % 4 == 0
+    const unsigned short* __restrict__ w, // [outDim, inDim] BF16
+    float* __restrict__ y,            // [rows, outDim]
+    const int inDim,
+    const int outDim,
+    const int rows)
+{
+    const int lane = threadIdx.x & 31;
+    const int o = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (o >= outDim)
+        return;
+    const int n4 = inDim / 4;
+    const uint2* w4 = (const uint2*)(w + (size_t)o * inDim);
+    float acc[MAXR];
+#pragma unroll
+    for (int r = 0; r < MAXR; ++r)
+        acc[r] = 0.0f;
+    // TS_DSV4_GEMV_WARP_UNROLL loads of the lane's row in flight before the first is summed: one at a time, a
+    // 2560-wide router (512 warps over the whole GPU) waited on each load in turn, 14.2 us a 4-row verify layer
+    // for 2.6 MB on the RTX 5090; 12.6 us this way. The sums keep their order.
+    for (int i0 = lane; i0 < n4; i0 += 32 * TS_DSV4_GEMV_WARP_UNROLL)
+    {
+        uint2 pw[TS_DSV4_GEMV_WARP_UNROLL];
+#pragma unroll
+        for (int u = 0; u < TS_DSV4_GEMV_WARP_UNROLL; ++u)
+            pw[u] = i0 + 32 * u < n4 ? w4[i0 + 32 * u] : make_uint2(0u, 0u);
+#pragma unroll
+        for (int u = 0; u < TS_DSV4_GEMV_WARP_UNROLL; ++u)
+        {
+            const int i = i0 + 32 * u;
+            if (i >= n4)
+                break;
+            const uint2 p = pw[u];
+            float4 b;
+            b.x = __uint_as_float(p.x << 16);
+            b.y = __uint_as_float(p.x & 0xffff0000u);
+            b.z = __uint_as_float(p.y << 16);
+            b.w = __uint_as_float(p.y & 0xffff0000u);
+#pragma unroll
+            for (int r = 0; r < MAXR; ++r)
+            {
+                if (r >= rows)
+                    break;
+                const float4 a = ((const float4*)(x + (size_t)r * inDim))[i];
+                acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MAXR; ++r)
+    {
+        if (r >= rows)
+            break;
+        const float v = ts_dsv4_warp_sum(acc[r]);
+        if (lane == 0)
+            y[(size_t)r * outDim + o] = v;
+    }
+}
+
+// The wide-output GEMV with a block of TS_DSV4_GEMV_BLOCK_T threads per output (the router's 512 experts): a warp per
+// output gave the whole GPU 512 warps, each walking 640 float4s of a 2560-wide row - 12.6 us a 4-row verify layer on the
+// RTX 5090 for 2.6 MB, 4.4 us this way. Thread t sums elements t, t + T, ... in order, the warps' sums are added in warp order, so an
+// output's sum has one order whatever the row count; the BF16 form widens each weight exactly, so it gives the F32
+// form's bits.
+#define TS_DSV4_GEMV_BLOCK_T 256
+template <int MAXR, bool BF16>
+__device__ __forceinline__ void ts_dsv4_gemv_block_rows(
+    const float* __restrict__ x, const void* __restrict__ w, float* __restrict__ y, const int inDim, const int outDim,
+    const int rows)
+{
+    const int o = blockIdx.x;
+    const int n4 = inDim / 4;
+    float acc[MAXR];
+#pragma unroll
+    for (int r = 0; r < MAXR; ++r)
+        acc[r] = 0.0f;
+    for (int i = threadIdx.x; i < n4; i += TS_DSV4_GEMV_BLOCK_T)
+    {
+        float4 b;
+        if (BF16)
+        {
+            const uint2 p = ((const uint2*)((const unsigned short*)w + (size_t)o * inDim))[i];
+            b.x = __uint_as_float(p.x << 16);
+            b.y = __uint_as_float(p.x & 0xffff0000u);
+            b.z = __uint_as_float(p.y << 16);
+            b.w = __uint_as_float(p.y & 0xffff0000u);
+        }
+        else
+            b = ((const float4*)((const float*)w + (size_t)o * inDim))[i];
+#pragma unroll
+        for (int r = 0; r < MAXR; ++r)
+        {
+            if (r >= rows)
+                break;
+            const float4 a = ((const float4*)(x + (size_t)r * inDim))[i];
+            acc[r] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        }
+    }
+    __shared__ float part[TS_DSV4_GEMV_BLOCK_T / 32][MAXR];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+#pragma unroll
+    for (int r = 0; r < MAXR; ++r)
+    {
+        const float v = ts_dsv4_warp_sum(acc[r]);
+        if (lane == 0)
+            part[warp][r] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < MAXR && threadIdx.x < rows)
+    {
+        float s = 0.0f;
+#pragma unroll
+        for (int k = 0; k < TS_DSV4_GEMV_BLOCK_T / 32; ++k)
+            s += part[k][threadIdx.x];
+        y[(size_t)threadIdx.x * outDim + o] = s;
+    }
+}
+
+#define TS_DSV4_GEMV_BLOCK(R)                                                                                          \
+    extern "C" __global__ void __launch_bounds__(TS_DSV4_GEMV_BLOCK_T) ts_dsv4_gemv_block_##R##_f32(                   \
+        const float* x, const float* w, float* y, int inDim, int outDim, int rows)                                     \
+    { ts_dsv4_gemv_block_rows<R, false>(x, w, y, inDim, outDim, rows); }                                               \
+    extern "C" __global__ void __launch_bounds__(TS_DSV4_GEMV_BLOCK_T) ts_dsv4_gemv_block_bf16_##R##_f32(              \
+        const float* x, const unsigned short* w, float* y, int inDim, int outDim, int rows)                            \
+    { ts_dsv4_gemv_block_rows<R, true>(x, w, y, inDim, outDim, rows); }
+TS_DSV4_GEMV_BLOCK(1)
+TS_DSV4_GEMV_BLOCK(4)
+TS_DSV4_GEMV_BLOCK(8)
+TS_DSV4_GEMV_BLOCK(16)
+#undef TS_DSV4_GEMV_BLOCK
+
+extern "C" __global__ void ts_dsv4_gemv_warp_bf16_1_f32(const float* x, const unsigned short* w, float* y, int inDim, int outDim, int rows)
+{ ts_dsv4_gemv_warp_bf16_rows<1>(x, w, y, inDim, outDim, rows); }
+extern "C" __global__ void ts_dsv4_gemv_warp_bf16_4_f32(const float* x, const unsigned short* w, float* y, int inDim, int outDim, int rows)
+{ ts_dsv4_gemv_warp_bf16_rows<4>(x, w, y, inDim, outDim, rows); }
+extern "C" __global__ void ts_dsv4_gemv_warp_bf16_8_f32(const float* x, const unsigned short* w, float* y, int inDim, int outDim, int rows)
+{ ts_dsv4_gemv_warp_bf16_rows<8>(x, w, y, inDim, outDim, rows); }
+extern "C" __global__ void ts_dsv4_gemv_warp_bf16_16_f32(const float* x, const unsigned short* w, float* y, int inDim, int outDim, int rows)
+{ ts_dsv4_gemv_warp_bf16_rows<16>(x, w, y, inDim, outDim, rows); }
 
 extern "C" __global__ void ts_dsv4_gemv_warp_1_f32(const float* x, const float* w, float* y, int inDim, int outDim, int rows)
 { ts_dsv4_gemv_warp_rows<1>(x, w, y, inDim, outDim, rows); }
@@ -2982,6 +3275,23 @@ __device__ __forceinline__ void ts_dsv4_decode_sub_grouped(
         *scLo = sc;
         *scHi = sc;
     }
+    else if (wtype == TS_DSV4_WTYPE_Q2_0)
+    {
+        // ISTA's Q2_0 experts: half of a 64-value block per sub-block. Code c decodes to (c - 1) * d, and c - 1
+        // is already a signed int8 in {-1, 0, 1, 2}, so nothing is subtracted afterwards. Byte i of the half
+        // holds values 4i..4i+3 at bit offsets 0, 2, 4, 6.
+        const uint8_t* blk = wRow + (size_t)(sub >> 1) * TS_DSV4_Q2_0_BLOCK_BYTES;
+        const uint8_t* qs = blk + 2 + 8 * (sub & 1);
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+        {
+            const int c = qs[i];
+            const int w = (c & 0x03) | ((c & 0x0C) << 6) | ((c & 0x30) << 12) | ((c & 0xC0) << 18);
+            w8[i] = __vsub4(w, 0x01010101);
+        }
+        *scLo = __half2float(*(const half*)blk);
+        *scHi = *scLo;
+    }
     else if (wtype == TS_DSV4_WTYPE_IQ3S || wtype == TS_DSV4_WTYPE_MXFP4 || wtype == TS_DSV4_WTYPE_IQ4NL
              || wtype == TS_DSV4_WTYPE_IQ4XS || wtype == TS_DSV4_WTYPE_Q6_K || wtype == TS_DSV4_WTYPE_Q2_K
              || wtype == TS_DSV4_WTYPE_Q3_K || wtype == TS_DSV4_WTYPE_Q4_K || wtype == TS_DSV4_WTYPE_Q5_K
@@ -3113,6 +3423,16 @@ __device__ __forceinline__ void ts_dsv4_expert_row_tokens(
 // Staged gate/up. grid.x = row tiles, grid.y = expert, grid.z = 0 gate / 1 up.
 // grid.y carries the expert because blockIdx.x varies fastest at launch, so a
 // single expert's blocks stay co-resident and share its activations in cache.
+// An expert's weight rows: the stacked tensor's expert e, or - when the engine keeps only some
+// experts in VRAM - wherever its table says they are: a VRAM slot, or pinned host memory the GPU
+// reads over the bus (the Qwen3.8-Flash-Next engine's expert residency). A null table is the
+// stacked layout, so every caller that passes none runs exactly as before.
+__device__ __forceinline__ const uint8_t* ts_dsv4_expert_rows(
+    const uint8_t* stacked, const unsigned long long* __restrict__ table, int e, size_t expertBytes)
+{
+    return table != nullptr ? reinterpret_cast<const uint8_t*>(table[e]) : stacked + (size_t)e * expertBytes;
+}
+
 extern "C" __global__ void ts_dsv4_moe_gateup_staged_f32(
     const uint8_t* __restrict__ gateW,
     const uint8_t* __restrict__ upW,
@@ -3126,7 +3446,9 @@ extern "C" __global__ void ts_dsv4_moe_gateup_staged_f32(
     const int wtype,
     const int ff,
     const int inDim,
-    const long long rowBytes)
+    const long long rowBytes,
+    const unsigned long long* __restrict__ gateTab,
+    const unsigned long long* __restrict__ upTab)
 {
     const int e = blockIdx.y;
     const int m = counts[e];
@@ -3140,7 +3462,8 @@ extern "C" __global__ void ts_dsv4_moe_gateup_staged_f32(
         return;
 
     const bool isUp = blockIdx.z == 1;
-    const uint8_t* wBase = (isUp ? upW : gateW) + (size_t)e * ff * rowBytes;
+    const uint8_t* wBase = isUp ? ts_dsv4_expert_rows(upW, upTab, e, (size_t)ff * rowBytes)
+                                : ts_dsv4_expert_rows(gateW, gateTab, e, (size_t)ff * rowBytes);
     float* outBase = isUp ? upOut : gateOut;
     const int off = offsets[e];
 
@@ -3181,7 +3504,8 @@ extern "C" __global__ void ts_dsv4_moe_down_staged_f32(
     const int wtype,
     const int E,
     const int ff,
-    const long long rowBytes)
+    const long long rowBytes,
+    const unsigned long long* __restrict__ downTab)
 {
     const int e = blockIdx.y;
     const int m = counts[e];
@@ -3194,7 +3518,7 @@ extern "C" __global__ void ts_dsv4_moe_down_staged_f32(
     if (r >= E)
         return;
 
-    const uint8_t* wBase = downW + (size_t)e * E * rowBytes;
+    const uint8_t* wBase = ts_dsv4_expert_rows(downW, downTab, e, (size_t)E * rowBytes);
     const int off = offsets[e];
 
     switch ((ff + 1023) / 1024)
@@ -3267,7 +3591,9 @@ extern "C" __global__ void __launch_bounds__(TS_MOE_MMA_THREADS, 2) ts_dsv4_moe_
     const int wtype,
     const int rows,
     const int inDim,
-    const long long rowBytes)
+    const long long rowBytes,
+    const unsigned long long* __restrict__ tab0,
+    const unsigned long long* __restrict__ tab1)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     const int e = blockIdx.y;
@@ -3276,7 +3602,8 @@ extern "C" __global__ void __launch_bounds__(TS_MOE_MMA_THREADS, 2) ts_dsv4_moe_
     if (m == 0 || r0 >= rows)
         return;
 
-    const uint8_t* wBase = (blockIdx.z == 0 ? w0 : w1) + (size_t)e * rows * rowBytes;
+    const uint8_t* wBase = blockIdx.z == 0 ? ts_dsv4_expert_rows(w0, tab0, e, (size_t)rows * rowBytes)
+                                           : ts_dsv4_expert_rows(w1, tab1, e, (size_t)rows * rowBytes);
     float* out = blockIdx.z == 0 ? out0 : out1;
     const int off = offsets[e];
     const int nSub = inDim / 32;
@@ -3469,7 +3796,9 @@ extern "C" __global__ void ts_dsv4_moe_gateup_f32(
     const int wtype,
     const int ff,
     const int inDim,
-    const long long rowBytes)
+    const long long rowBytes,
+    const unsigned long long* __restrict__ gateTab,
+    const unsigned long long* __restrict__ upTab)
 {
     const int e = blockIdx.x;
     const int m = counts[e];
@@ -3482,7 +3811,8 @@ extern "C" __global__ void ts_dsv4_moe_gateup_f32(
     const int rEnd = blockIdx.y * TS_DSV4_MOE_TILE + (warpId + 1) * (TS_DSV4_MOE_TILE / 8);
 
     const bool isUp = blockIdx.z == 1;
-    const uint8_t* wBase = (isUp ? upW : gateW) + (size_t)e * ff * rowBytes;
+    const uint8_t* wBase = isUp ? ts_dsv4_expert_rows(upW, upTab, e, (size_t)ff * rowBytes)
+                                : ts_dsv4_expert_rows(gateW, gateTab, e, (size_t)ff * rowBytes);
     float* outBase = isUp ? upOut : gateOut;
     const int off = offsets[e];
     const int actBlocks = inDim / TS_DSV4_QK8_1;
@@ -3510,7 +3840,8 @@ extern "C" __global__ void ts_dsv4_moe_down_f32(
     const int wtype,
     const int E,
     const int ff,
-    const long long rowBytes)
+    const long long rowBytes,
+    const unsigned long long* __restrict__ downTab)
 {
     const int e = blockIdx.x;
     const int m = counts[e];
@@ -3522,7 +3853,7 @@ extern "C" __global__ void ts_dsv4_moe_down_f32(
     const int rBegin = blockIdx.y * TS_DSV4_MOE_TILE + warpId * (TS_DSV4_MOE_TILE / 8);
     const int rEnd = blockIdx.y * TS_DSV4_MOE_TILE + (warpId + 1) * (TS_DSV4_MOE_TILE / 8);
 
-    const uint8_t* wBase = downW + (size_t)e * E * rowBytes;
+    const uint8_t* wBase = ts_dsv4_expert_rows(downW, downTab, e, (size_t)E * rowBytes);
     const int off = offsets[e];
     const int actBlocks = ff / TS_DSV4_QK8_1;
 
@@ -3553,7 +3884,9 @@ extern "C" __global__ void ts_dsv4_moe_gateup_decode_f32(
     const int ff,
     const int inDim,
     const long long rowBytes,
-    const int nUsed)
+    const int nUsed,
+    const unsigned long long* __restrict__ gateTab,
+    const unsigned long long* __restrict__ upTab)
 {
     const int slot = blockIdx.x;
     const int e = sel[slot];
@@ -3565,7 +3898,8 @@ extern "C" __global__ void ts_dsv4_moe_gateup_decode_f32(
     const int rEnd = blockIdx.y * TS_DSV4_MOE_TILE + (warpId + 1) * (TS_DSV4_MOE_TILE / 8);
 
     const bool isUp = blockIdx.z == 1;
-    const uint8_t* wBase = (isUp ? upW : gateW) + (size_t)e * ff * rowBytes;
+    const uint8_t* wBase = isUp ? ts_dsv4_expert_rows(upW, upTab, e, (size_t)ff * rowBytes)
+                                : ts_dsv4_expert_rows(gateW, gateTab, e, (size_t)ff * rowBytes);
     float* outBase = isUp ? upOut : gateOut;
 
     for (int rr = rBegin; rr < rEnd && rr < ff; ++rr)
@@ -3584,7 +3918,8 @@ extern "C" __global__ void ts_dsv4_moe_down_decode_f32(
     const int wtype,
     const int E,
     const int ff,
-    const long long rowBytes)
+    const long long rowBytes,
+    const unsigned long long* __restrict__ downTab)
 {
     const int slot = blockIdx.x;
     const int e = sel[slot];
@@ -3594,7 +3929,7 @@ extern "C" __global__ void ts_dsv4_moe_down_decode_f32(
     const int rBegin = blockIdx.y * TS_DSV4_MOE_TILE + warpId * (TS_DSV4_MOE_TILE / 8);
     const int rEnd = blockIdx.y * TS_DSV4_MOE_TILE + (warpId + 1) * (TS_DSV4_MOE_TILE / 8);
 
-    const uint8_t* wBase = downW + (size_t)e * E * rowBytes;
+    const uint8_t* wBase = ts_dsv4_expert_rows(downW, downTab, e, (size_t)E * rowBytes);
     const int actBlocks = ff / TS_DSV4_QK8_1;
 
     for (int rr = rBegin; rr < rEnd && rr < E; ++rr)
@@ -3605,12 +3940,188 @@ extern "C" __global__ void ts_dsv4_moe_down_decode_f32(
     }
 }
 
+// ts_dsv4_moe_down_decode_f32 for short expert rows (ff <= 1024: Qwen3.8-Flash-Next's 640): eight lanes per output
+// row, four rows a warp at once. A whole warp per 640-wide row left most lanes one unit each and spent the row on its
+// five-step reduction; this kernel's down projection moved half the gate/up's bytes in more time. Every slot is
+// computed the same way whatever the call's row count (a verify window's rows equal a decode step's).
+extern "C" __global__ void ts_dsv4_moe_down_decode_short_f32(
+    const uint8_t* __restrict__ downW,
+    const ts_dsv4_block_q8_1* __restrict__ act, // [nt * nUsed] rows
+    const int32_t* __restrict__ sel,
+    float* __restrict__ downOut,         // [nt * nUsed, E]
+    const int wtype,
+    const int E,
+    const int ff,
+    const long long rowBytes,
+    const unsigned long long* __restrict__ downTab)
+{
+    const int slot = blockIdx.x;
+    const int e = sel[slot];
+    const int lane = threadIdx.x % 32;
+    const int group = lane >> 3, sub = lane & 7;
+    // 32 rows a block: 8 warps x 4 groups.
+    const int rr = blockIdx.y * 32 + (threadIdx.x / 32) * 4 + group;
+    const uint8_t* wBase = ts_dsv4_expert_rows(downW, downTab, e, (size_t)E * rowBytes);
+    const int actBlocks = ff / TS_DSV4_QK8_1;
+    float v = rr < E ? ts_dsv4_dot_row_part(wBase + (size_t)rr * rowBytes, wtype, act + (size_t)slot * actBlocks, ff, sub, 8) : 0.0f;
+    v += __shfl_xor_sync(0xffffffffu, v, 4);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    if (sub == 0 && rr < E)
+        downOut[(size_t)slot * E + rr] = v;
+}
+
 // Dense projection of decode-size inputs already quantized to q8_1: one warp per
 // output row through ts_dsv4_dot_row_warp, grid (ceil(outDim / 32), rows). It
 // reads only the caller's buffers, so a captured decode step can replay it - the
 // shared matmul route quantizes into shared scratch and cannot be captured, and
 // a checkpoint whose dense weights are K-quants the q8_1 decode kernels do not
 // cover (UD-Q2_K_XL's Q5_K) otherwise lost decode capture altogether.
+// out[r, o] = sum_i bf16(w[o, i]) * x[r, i] for up to 16 rows: one warp per output row, F32 activations
+// (as ggml computes a BF16 matmul), every row's sum in its own register so the weights are read once.
+// inDim is even. Reads only the buffers passed, so a decode step can capture it.
+extern "C" __global__ void ts_dense_bf16_rows_f32(
+    const unsigned short* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    const int outDim,
+    const int inDim,
+    const int rows)
+{
+    const int o = (int)((blockIdx.x * (size_t)blockDim.x + threadIdx.x) >> 5);
+    const int lane = threadIdx.x & 31;
+    if (o >= outDim)
+        return;
+    const unsigned int* wr = (const unsigned int*)(w + (size_t)o * inDim);
+    float acc[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r)
+        acc[r] = 0.0f;
+    for (int i = lane; i < inDim / 2; i += 32)
+    {
+        const unsigned int p = wr[i];
+        const float w0 = __uint_as_float(p << 16), w1 = __uint_as_float(p & 0xffff0000u);
+#pragma unroll
+        for (int r = 0; r < 16; ++r)
+            if (r < rows)
+            {
+                const float2 xv = *(const float2*)(x + (size_t)r * inDim + 2 * i);
+                acc[r] = fmaf(w1, xv.y, fmaf(w0, xv.x, acc[r]));
+            }
+    }
+#pragma unroll
+    for (int r = 0; r < 16; ++r)
+        if (r < rows)
+        {
+            const float v = ts_dsv4_warp_sum(acc[r]);
+            if (lane == 0)
+                out[(size_t)r * outDim + o] = v;
+        }
+}
+
+// Split-K form of ts_dsv4_dense_q81_rows_f32 for projections with few output rows and long inputs (the
+// hyper-connections' 10240 -> 320 down projection): one 256-thread block per output row and token, its 8
+// warps sharing the row's decode units, so the projection fills the GPU instead of 80 warps of it.
+extern "C" __global__ void ts_dsv4_dense_q81_rows_splitk_f32(
+    const uint8_t* __restrict__ w,
+    const ts_dsv4_block_q8_1* __restrict__ act,
+    float* __restrict__ out,
+    const int wtype,
+    const int outDim,
+    const int inDim,
+    const long long rowBytes)
+{
+    const int o = blockIdx.x, row = blockIdx.y;
+    const int warpId = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    __shared__ float part[8];
+    const float v = ts_dsv4_warp_sum(ts_dsv4_dot_row_part(w + (size_t)o * rowBytes, wtype,
+        act + (size_t)row * (inDim / TS_DSV4_QK8_1), inDim, threadIdx.x, blockDim.x));
+    if (lane == 0)
+        part[warpId] = v;
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        float s = 0.0f;
+        for (int i = 0; i < (int)(blockDim.x >> 5); ++i)
+            s += part[i];
+        out[(size_t)row * outDim + o] = s;
+    }
+}
+
+// Split-K form of ts_dense_bf16_rows_f32: one 256-thread block per output row, up to 16 tokens.
+extern "C" __global__ void ts_dense_bf16_rows_splitk_f32(
+    const unsigned short* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    const int outDim,
+    const int inDim,
+    const int rows)
+{
+    const int o = blockIdx.x;
+    const int warpId = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const unsigned int* wr = (const unsigned int*)(w + (size_t)o * inDim);
+    float acc[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r)
+        acc[r] = 0.0f;
+    for (int i = threadIdx.x; i < inDim / 2; i += blockDim.x)
+    {
+        const unsigned int p = wr[i];
+        const float w0 = __uint_as_float(p << 16), w1 = __uint_as_float(p & 0xffff0000u);
+#pragma unroll
+        for (int r = 0; r < 16; ++r)
+            if (r < rows)
+            {
+                const float2 xv = *(const float2*)(x + (size_t)r * inDim + 2 * i);
+                acc[r] = fmaf(w1, xv.y, fmaf(w0, xv.x, acc[r]));
+            }
+    }
+    __shared__ float part[16][8];
+#pragma unroll
+    for (int r = 0; r < 16; ++r)
+        if (r < rows)
+        {
+            const float v = ts_dsv4_warp_sum(acc[r]);
+            if (lane == 0)
+                part[r][warpId] = v;
+        }
+    __syncthreads();
+    if (threadIdx.x < rows)
+    {
+        float s = 0.0f;
+        for (int i = 0; i < (int)(blockDim.x >> 5); ++i)
+            s += part[threadIdx.x][i];
+        out[(size_t)threadIdx.x * outDim + o] = s;
+    }
+}
+
+// ts_dsv4_dense_q81_rows_f32 for up to 16 activation rows in one block: a warp per output row, dotted against every
+// activation row in turn, so the weight row comes from memory once and from L1 after it (a block per activation row read
+// it once per row: a 4-row verify window's LM head took 4x one row's time). Eight output rows a block keep the grid as
+// wide as four rows' blocks of the one-row kernel. Every row's dot is that kernel's (ts_dsv4_dot_row_warp), bit for bit.
+extern "C" __global__ void ts_dsv4_dense_q81_rows_multi_f32(
+    const uint8_t* __restrict__ w,               // [outDim, inDim] rows of rowBytes
+    const ts_dsv4_block_q8_1* __restrict__ act,  // [rows, inDim / 32]
+    float* __restrict__ out,                     // [rows, outDim]
+    const int wtype,
+    const int outDim,
+    const int inDim,
+    const long long rowBytes,
+    const int rows)
+{
+    const int lane = threadIdx.x % 32;
+    const int rr = blockIdx.x * 8 + threadIdx.x / 32;
+    if (rr >= outDim)
+        return;
+    const uint8_t* wRow = w + (size_t)rr * rowBytes;
+    for (int row = 0; row < rows; ++row)
+    {
+        const float dot = ts_dsv4_dot_row_warp(wRow, wtype, act + (size_t)row * (inDim / TS_DSV4_QK8_1), inDim, lane);
+        if (lane == 0)
+            out[(size_t)row * outDim + rr] = dot;
+    }
+}
+
 extern "C" __global__ void ts_dsv4_dense_q81_rows_f32(
     const uint8_t* __restrict__ w,               // [outDim, inDim] rows of rowBytes
     const ts_dsv4_block_q8_1* __restrict__ act,  // [rows, inDim / 32]
@@ -3635,11 +4146,907 @@ extern "C" __global__ void ts_dsv4_dense_q81_rows_f32(
     }
 }
 
+// ---- decode-size dense projections, decode once and dot every row ----
+// The kernels above walk a weight row once per activation row and decode each unit again for each: a 4-row verify
+// window's 2560 -> 10240 IQ4_XS projection took 33 us (0.42 TB/s) on the RTX 5090 against 15 us for one row, the cost
+// being the decode, not the bytes (an IQ4 nibble went through a byte load from the lookup table). Here each unit's
+// weights are decoded to int8 lanes once - the IQ4 table held in registers and applied with __byte_perm, as llama.cpp's
+// get_int_from_table_16 does - and dotted against every activation row (TS_DSV4_FAST_R at a time). W warps share an
+// output row's units (few outputs of long rows need them to fill the GPU), 8 / W output rows a 256-thread block, the
+// warps' partials added in warp order. A row's sum depends on the shape alone, never on how many rows the call holds,
+// so a verify window's row is its own decode step's bit for bit. 11.5 us for that projection; the formats are the ones
+// Qwen3.8 Flash Next's ISTA pack and DeepSeek V4.1 keep dense (Q8_0, Q2_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ4_NL).
+
+#define TS_DSV4_FAST_R_MAX 8
+
+struct ts_dsv4_table16 { uint32_t t[4]; };
+
+__device__ __forceinline__ ts_dsv4_table16 ts_dsv4_load_table16(const int8_t* table)
+{
+    ts_dsv4_table16 r;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        r.t[i] = (uint32_t)(uint8_t)table[4 * i] | ((uint32_t)(uint8_t)table[4 * i + 1] << 8)
+               | ((uint32_t)(uint8_t)table[4 * i + 2] << 16) | ((uint32_t)(uint8_t)table[4 * i + 3] << 24);
+    return r;
+}
+
+// Eight packed nibbles onto table values: .x the low nibbles', .y the high nibbles' (llama.cpp get_int_from_table_16).
+__device__ __forceinline__ int2 ts_dsv4_table16_perm(const uint32_t q4, const ts_dsv4_table16& tb)
+{
+    uint32_t tmp[2];
+    const uint32_t sel = 0x32103210u | ((q4 & 0x88888888u) >> 1);
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+    {
+        const uint32_t shift = 16 * i;
+        const uint32_t lo = __byte_perm(tb.t[0], tb.t[1], q4 >> shift);
+        const uint32_t hi = __byte_perm(tb.t[2], tb.t[3], q4 >> shift);
+        tmp[i] = __byte_perm(lo, hi, sel >> shift);
+    }
+    return make_int2((int)__byte_perm(tmp[0], tmp[1], 0x6420), (int)__byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
+__device__ __forceinline__ int ts_dsv4_q81_int(const ts_dsv4_block_q8_1* a, int k)
+{
+    return reinterpret_cast<const int*>(a->qs)[k];
+}
+
+// IQ4_XS: unit g is the row's 32-value sub-block g.
+template <int R>
+__device__ __forceinline__ void ts_dsv4_fast_iq4xs(const uint8_t* __restrict__ wRow, int g, const ts_dsv4_table16& tb,
+    const ts_dsv4_block_q8_1* const (&a)[R], float (&sum)[R])
+{
+    const uint8_t* blk = wRow + (size_t)(g >> 3) * TS_DSV4_IQ4XS_BLOCK_BYTES;
+    const int ib = g & 7;
+    const uint2 q01 = *reinterpret_cast<const uint2*>(blk + 8 + 16 * ib);
+    const uint2 q23 = *reinterpret_cast<const uint2*>(blk + 16 + 16 * ib);
+    const uint32_t hdr = *reinterpret_cast<const uint32_t*>(blk);        // d, scales_h
+    const uint32_t sl = *reinterpret_cast<const uint32_t*>(blk + 4);     // scales_l[4]
+    const int ls = ((sl >> (8 * (ib >> 1) + 4 * (ib & 1))) & 0xF) | ((((int)(hdr >> 16) >> (2 * ib)) & 3) << 4);
+    const float scale = __half2float(__ushort_as_half((unsigned short)(hdr & 0xFFFF))) * (float)(ls - 32);
+    const uint32_t q[4] = { q01.x, q01.y, q23.x, q23.y };
+    int w[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+        const int2 v = ts_dsv4_table16_perm(q[j], tb);
+        w[j] = v.x;
+        w[j + 4] = v.y;
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+    {
+        const ts_dsv4_block_q8_1* ab = a[r] + g;
+        int dot = 0;
+#pragma unroll
+        for (int k = 0; k < 8; ++k)
+            dot = ts_dsv4_dp4a(w[k], ts_dsv4_q81_int(ab, k), dot);
+        sum[r] += __half2float(ab->d) * (scale * (float)dot);
+    }
+}
+
+// Q8_0: unit b is the row's 32-value block b.
+template <int R>
+__device__ __forceinline__ void ts_dsv4_fast_q8_0(const uint8_t* __restrict__ wRow, int b,
+    const ts_dsv4_block_q8_1* const (&a)[R], float (&sum)[R])
+{
+    const uint8_t* blk = wRow + (size_t)b * TS_DSV4_Q8_0_BLOCK_BYTES;
+    const float d = __half2float(*reinterpret_cast<const half*>(blk));
+    int w[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+        w[k] = ts_dsv4_get_int_b2(blk + 2, k);
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+    {
+        const ts_dsv4_block_q8_1* ab = a[r] + b;
+        int dot = 0;
+#pragma unroll
+        for (int k = 0; k < 8; ++k)
+            dot = ts_dsv4_dp4a(w[k], ts_dsv4_q81_int(ab, k), dot);
+        sum[r] += __half2float(ab->d) * (d * (float)dot);
+    }
+}
+
+// Q2_0 (ISTA): unit u is the row's 32-value half u of its 64-value blocks; value = (code - 1) * d.
+__device__ __forceinline__ int ts_dsv4_q2_0_spread(uint32_t c)
+{
+    c &= 0xFF;
+    return (int)((c & 0x03) | ((c & 0x0C) << 6) | ((c & 0x30) << 12) | ((c & 0xC0) << 18));
+}
+
+template <int R>
+__device__ __forceinline__ void ts_dsv4_fast_q2_0(const uint8_t* __restrict__ wRow, int u,
+    const ts_dsv4_block_q8_1* const (&a)[R], float (&sum)[R])
+{
+    const uint8_t* blk = wRow + (size_t)(u >> 1) * TS_DSV4_Q2_0_BLOCK_BYTES;
+    const float d = __half2float(*reinterpret_cast<const half*>(blk));
+    const uint8_t* qs = blk + 2 + 8 * (u & 1);
+    const uint32_t lo = (uint32_t)ts_dsv4_get_int_b2(qs, 0), hi = (uint32_t)ts_dsv4_get_int_b2(qs, 1);
+    int w[8];
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+    {
+        w[k] = ts_dsv4_q2_0_spread(lo >> (8 * k));
+        w[k + 4] = ts_dsv4_q2_0_spread(hi >> (8 * k));
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+    {
+        const ts_dsv4_block_q8_1* ab = a[r] + u;
+        int dot = 0, asum = 0;
+#pragma unroll
+        for (int k = 0; k < 8; ++k)
+        {
+            const int av = ts_dsv4_q81_int(ab, k);
+            dot = ts_dsv4_dp4a(w[k], av, dot);
+            asum = ts_dsv4_dp4a(0x01010101, av, asum);
+        }
+        sum[r] += __half2float(ab->d) * (d * (float)(dot - asum));
+    }
+}
+
+// Q4_K / Q5_K: unit p is the pair of 32-value sub-blocks 2c, 2c + 1 of super-block p >> 2 (they share 32 nibble bytes).
+template <int R, bool Q5>
+__device__ __forceinline__ void ts_dsv4_fast_q45k(const uint8_t* __restrict__ wRow, int p,
+    const ts_dsv4_block_q8_1* const (&a)[R], float (&sum)[R])
+{
+    const int sb = p >> 2, c = p & 3;
+    const uint8_t* blk = wRow + (size_t)sb * (Q5 ? TS_DSV4_Q5_K_BLOCK_BYTES : TS_DSV4_Q4_K_BLOCK_BYTES);
+    const uint4* qs = reinterpret_cast<const uint4*>(blk + (Q5 ? 48 : 16) + c * 32);
+    const uint4 q0 = qs[0], q1 = qs[1];
+    const int qw[8] = { (int)q0.x, (int)q0.y, (int)q0.z, (int)q0.w, (int)q1.x, (int)q1.y, (int)q1.z, (int)q1.w };
+    int hw[8];
+    if (Q5)
+    {
+        const uint4* qh = reinterpret_cast<const uint4*>(blk + 16);
+        const uint4 h0 = qh[0], h1 = qh[1];
+        hw[0] = (int)h0.x; hw[1] = (int)h0.y; hw[2] = (int)h0.z; hw[3] = (int)h0.w;
+        hw[4] = (int)h1.x; hw[5] = (int)h1.y; hw[6] = (int)h1.z; hw[7] = (int)h1.w;
+    }
+    const uint32_t dd = *reinterpret_cast<const uint32_t*>(blk);
+    const float d = __half2float(__ushort_as_half((unsigned short)(dd & 0xFFFF)));
+    const float dmin = __half2float(__ushort_as_half((unsigned short)(dd >> 16)));
+    const uint8_t* sc = blk + 4;
+#pragma unroll
+    for (int hi = 0; hi < 2; ++hi)
+    {
+        const int is = 2 * c + hi;
+        int scale, mn;
+        if (is < 4) { scale = sc[is] & 63; mn = sc[is + 4] & 63; }
+        else { scale = (sc[is + 4] & 0xF) | ((sc[is - 4] >> 6) << 4); mn = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4); }
+        int v[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k)
+        {
+            v[k] = hi ? ((qw[k] >> 4) & 0x0F0F0F0F) : (qw[k] & 0x0F0F0F0F);
+            if (Q5)
+                v[k] |= ((hw[k] >> is) & 0x01010101) << 4;
+        }
+        const float ds = d * (float)scale, dm = dmin * (float)mn;
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+        {
+            const ts_dsv4_block_q8_1* a8 = a[r] + sb * 8 + is;
+            int dot = 0, asum = 0;
+#pragma unroll
+            for (int k = 0; k < 8; ++k)
+            {
+                const int av = ts_dsv4_q81_int(a8, k);
+                dot = ts_dsv4_dp4a(v[k], av, dot);
+                asum = ts_dsv4_dp4a(0x01010101, av, asum);
+            }
+            sum[r] += __half2float(a8->d) * (ds * (float)dot - dm * (float)asum);
+        }
+    }
+}
+
+// Q3_K: unit g is the row's 32-value group g (two 16-value halves, a scale each).
+template <int R>
+__device__ __forceinline__ void ts_dsv4_fast_q3k(const uint8_t* __restrict__ wRow, int g,
+    const ts_dsv4_block_q8_1* const (&a)[R], float (&sum)[R])
+{
+    int w[8];
+    float scLo, scHi;
+    ts_dsv4_q3k_group_ints(wRow + (size_t)(g >> 3) * TS_DSV4_Q3_K_BLOCK_BYTES, g & 7, w, &scLo, &scHi);
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+    {
+        const ts_dsv4_block_q8_1* ab = a[r] + g;
+        int lo = 0, hi = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+        {
+            lo = ts_dsv4_dp4a(w[k], ts_dsv4_q81_int(ab, k), lo);
+            hi = ts_dsv4_dp4a(w[k + 4], ts_dsv4_q81_int(ab, k + 4), hi);
+        }
+        sum[r] += __half2float(ab->d) * (scLo * (float)lo + scHi * (float)hi);
+    }
+}
+
+// The symmetric 32-value sub-block layouts ts_dsv4_decode_sub reads (Q6_K, IQ4_NL): unit g is sub-block g.
+template <int R>
+__device__ __forceinline__ void ts_dsv4_fast_sub(const uint8_t* __restrict__ wRow, int wtype, int g,
+    const ts_dsv4_block_q8_1* const (&a)[R], float (&sum)[R])
+{
+    int w[8];
+    float scLo, scHi, mnLo, mnHi;
+    ts_dsv4_decode_sub(wRow, wtype, g, w, &scLo, &scHi, &mnLo, &mnHi);
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+    {
+        const ts_dsv4_block_q8_1* ab = a[r] + g;
+        int lo = 0, hi = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+        {
+            lo = ts_dsv4_dp4a(w[k], ts_dsv4_q81_int(ab, k), lo);
+            hi = ts_dsv4_dp4a(w[k + 4], ts_dsv4_q81_int(ab, k + 4), hi);
+        }
+        sum[r] += __half2float(ab->d) * (scLo * (float)lo + scHi * (float)hi);
+    }
+}
+
+// One thread's units first, first + step, ... of a row, a sum per activation row.
+template <int R>
+__device__ __forceinline__ void ts_dsv4_fast_row(const uint8_t* __restrict__ wRow, int wtype,
+    const ts_dsv4_block_q8_1* const (&a)[R], int inDim, int first, int step, const ts_dsv4_table16& tb, float (&sum)[R])
+{
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        sum[r] = 0.0f;
+    if (wtype == TS_DSV4_WTYPE_IQ4XS)
+        for (int u = first; u < inDim / 32; u += step) ts_dsv4_fast_iq4xs<R>(wRow, u, tb, a, sum);
+    else if (wtype == TS_DSV4_WTYPE_Q8_0)
+        for (int u = first; u < inDim / 32; u += step) ts_dsv4_fast_q8_0<R>(wRow, u, a, sum);
+    else if (wtype == TS_DSV4_WTYPE_Q2_0)
+        for (int u = first; u < inDim / 32; u += step) ts_dsv4_fast_q2_0<R>(wRow, u, a, sum);
+    else if (wtype == TS_DSV4_WTYPE_Q4_K)
+        for (int u = first; u < inDim / 64; u += step) ts_dsv4_fast_q45k<R, false>(wRow, u, a, sum);
+    else if (wtype == TS_DSV4_WTYPE_Q5_K)
+        for (int u = first; u < inDim / 64; u += step) ts_dsv4_fast_q45k<R, true>(wRow, u, a, sum);
+    else if (wtype == TS_DSV4_WTYPE_Q3_K)
+        for (int u = first; u < inDim / 32; u += step) ts_dsv4_fast_q3k<R>(wRow, u, a, sum);
+    else if (wtype == TS_DSV4_WTYPE_Q6_K || wtype == TS_DSV4_WTYPE_IQ4NL)
+        for (int u = first; u < inDim / 32; u += step) ts_dsv4_fast_sub<R>(wRow, wtype, u, a, sum);
+    else
+    {
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            sum[r] = __int_as_float(0x7fc00000);
+    }
+}
+
+// out[rows, outDim] = act[rows] . w^T: W warps an output row, R activation rows a pass (rows past R take further passes,
+// each row's arithmetic unchanged). grid ceil(outDim / (8 / W)), 256 threads.
+template <int R, int W>
+__device__ __forceinline__ void ts_dsv4_dense_fast(
+    const uint8_t* __restrict__ w, const ts_dsv4_block_q8_1* __restrict__ act, float* __restrict__ out,
+    const int wtype, const int outDim, const int inDim, const long long rowBytes, const int rows)
+{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int sub = warp % W;
+    const int rr = blockIdx.x * (8 / W) + warp / W;
+    ts_dsv4_table16 tb;
+    if (wtype == TS_DSV4_WTYPE_IQ4XS)
+        tb = ts_dsv4_load_table16(ts_dsv4_kvalues_iq4nl);
+    const int actBlocks = inDim / TS_DSV4_QK8_1;
+    __shared__ float part[8][R];
+    for (int r0 = 0; r0 < rows; r0 += R)
+    {
+        const int n = min(R, rows - r0);
+        const ts_dsv4_block_q8_1* a[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            a[r] = act + (size_t)(r0 + min(r, n - 1)) * actBlocks;
+        float s[R];
+        if (rr < outDim)
+            ts_dsv4_fast_row<R>(w + (size_t)rr * rowBytes, wtype, a, inDim, sub * 32 + lane, 32 * W, tb, s);
+        else
+        {
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+                s[r] = 0.0f;
+        }
+        if (W == 1)
+        {
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+            {
+                const float v = ts_dsv4_warp_sum(s[r]);
+                if (lane == 0 && r < n && rr < outDim)
+                    out[(size_t)(r0 + r) * outDim + rr] = v;
+            }
+            continue;
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+        {
+            const float v = ts_dsv4_warp_sum(s[r]);
+            if (lane == 0)
+                part[warp][r] = v;
+        }
+        __syncthreads();
+        if (sub == 0 && lane < n && rr < outDim)
+        {
+            float t = 0.0f;
+            for (int k = 0; k < W; ++k)
+                t += part[warp + k][lane];
+            out[(size_t)(r0 + lane) * outDim + rr] = t;
+        }
+        __syncthreads();
+    }
+}
+
+#define TS_DSV4_DENSE_FAST(R, W)                                                                                         \
+    extern "C" __global__ void __launch_bounds__(256) ts_dsv4_dense_fast_r##R##_w##W##_f32(                              \
+        const uint8_t* w, const ts_dsv4_block_q8_1* act, float* out, const int wtype, const int outDim, const int inDim, \
+        const long long rowBytes, const int rows)                                                                         \
+    { ts_dsv4_dense_fast<R, W>(w, act, out, wtype, outDim, inDim, rowBytes, rows); }
+TS_DSV4_DENSE_FAST(1, 1)
+TS_DSV4_DENSE_FAST(2, 1)
+TS_DSV4_DENSE_FAST(4, 1)
+TS_DSV4_DENSE_FAST(8, 1)
+TS_DSV4_DENSE_FAST(1, 2)
+TS_DSV4_DENSE_FAST(2, 2)
+TS_DSV4_DENSE_FAST(4, 2)
+TS_DSV4_DENSE_FAST(8, 2)
+TS_DSV4_DENSE_FAST(1, 4)
+TS_DSV4_DENSE_FAST(2, 4)
+TS_DSV4_DENSE_FAST(4, 4)
+TS_DSV4_DENSE_FAST(8, 4)
+#undef TS_DSV4_DENSE_FAST
+
+// ts_dsv4_moe_gateup_decode_f32 with sixteen lanes an output row and two rows a warp (the short down kernel's layout):
+// a warp per row walked a 2560-wide Q2_0 row in 16-value quarters, five dependent steps a lane and four rows in turn,
+// and a decode step's ten experts took 22.7 us on the RTX 5090 (412 GB/s) against 3.9 us for their down projection.
+// Q2_0 rows go in 32-value units (ts_dsv4_fast_q2_0), the other layouts through ts_dsv4_dot_row_part; 4.4 us. Each slot
+// is computed the same way whatever the call's row count. grid (slots, ceil(ff / 16), 2), 256 threads.
+extern "C" __global__ void ts_dsv4_moe_gateup_decode_half_f32(
+    const uint8_t* __restrict__ gateW,
+    const uint8_t* __restrict__ upW,
+    const ts_dsv4_block_q8_1* __restrict__ act, // [nt] rows
+    const int32_t* __restrict__ sel,     // [nt * nUsed]
+    float* __restrict__ gateOut,         // [nt * nUsed, ff]
+    float* __restrict__ upOut,           // [nt * nUsed, ff]
+    const int wtype,
+    const int ff,
+    const int inDim,
+    const long long rowBytes,
+    const int nUsed,
+    const unsigned long long* __restrict__ gateTab,
+    const unsigned long long* __restrict__ upTab)
+{
+    const int slot = blockIdx.x;
+    const int e = sel[slot];
+    const ts_dsv4_block_q8_1* a = act + (size_t)(slot / nUsed) * (inDim / TS_DSV4_QK8_1);
+    const int lane = threadIdx.x & 31, group = lane >> 4, sub = lane & 15;
+    const int rr = blockIdx.y * 16 + (threadIdx.x >> 5) * 2 + group;
+    const bool isUp = blockIdx.z == 1;
+    const uint8_t* wBase = isUp ? ts_dsv4_expert_rows(upW, upTab, e, (size_t)ff * rowBytes)
+                                : ts_dsv4_expert_rows(gateW, gateTab, e, (size_t)ff * rowBytes);
+    float v = 0.0f;
+    if (rr < ff)
+    {
+        const uint8_t* wRow = wBase + (size_t)rr * rowBytes;
+        if (wtype == TS_DSV4_WTYPE_Q2_0)
+        {
+            const ts_dsv4_block_q8_1* aa[1] = { a };
+            float s[1] = { 0.0f };
+            for (int u = sub; u < inDim / 32; u += 16)
+                ts_dsv4_fast_q2_0<1>(wRow, u, aa, s);
+            v = s[0];
+        }
+        else
+            v = ts_dsv4_dot_row_part(wRow, wtype, a, inDim, sub, 16);
+    }
+    v += __shfl_xor_sync(0xffffffffu, v, 8);
+    v += __shfl_xor_sync(0xffffffffu, v, 4);
+    v += __shfl_xor_sync(0xffffffffu, v, 2);
+    v += __shfl_xor_sync(0xffffffffu, v, 1);
+    if (sub == 0 && rr < ff)
+        (isUp ? upOut : gateOut)[(size_t)slot * ff + rr] = v;
+}
+
 // Clamped SwiGLU now comes from the shared kernel set
 // (ts_silu_mul_clamp_f32, reached via Ops.SiLUMulClamp).
 
 // ffnOut[t] = sum_j w[t,j] * downOut[row(t,j)] (+ shexp[t]); rowOfSlot null
 // means identity (decode: slot j -> row j).
+// ---- expert staging (the Qwen3.8-Flash-Next engine's expert residency) --------------------------------
+// The experts a call selects that have no VRAM slot are copied once each, by coalesced 16-byte loads over
+// the bus, from pinned host memory into VRAM staging, and their table entries point at the copy until
+// ts_dsv4_moe_unstage puts them back. The expert kernels' own row reads straight from host memory are a
+// stream of small uncoalesced bus transactions (UD-Q2_K_XL decoded at 0.4 tok/s that way). All three
+// kernels read and write device state only, so a captured decode step replays them.
+
+// Assigns staging slots to the distinct selected experts that live in host memory. stageOf[e] is -1
+// between calls; over capacity an expert stays a read over the bus, in place.
+extern "C" __global__ void ts_dsv4_moe_stage_plan(
+    const int32_t* __restrict__ sel,
+    const int slots,
+    const uint8_t* __restrict__ isHost,
+    int32_t* __restrict__ stageOf,
+    int32_t* __restrict__ stageList,
+    int32_t* __restrict__ stageCount,
+    unsigned long long* __restrict__ tabGate,
+    unsigned long long* __restrict__ tabUp,
+    unsigned long long* __restrict__ tabDown,
+    const unsigned long long staging,
+    const long long stride,
+    const long long offUp,
+    const long long offDown,
+    const int capacity)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < slots; i += gridDim.x * blockDim.x)
+    {
+        const int e = sel[i];
+        if (e < 0 || !isHost[e] || atomicCAS(&stageOf[e], -1, -2) != -1)
+            continue;
+        const int k = atomicAdd(stageCount, 1);
+        if (k >= capacity)
+        {
+            stageOf[e] = -1;
+            continue;
+        }
+        stageList[k] = e;
+        const unsigned long long base = staging + (unsigned long long)k * (unsigned long long)stride;
+        tabGate[e] = base;
+        tabUp[e] = base + (unsigned long long)offUp;
+        tabDown[e] = base + (unsigned long long)offDown;
+        stageOf[e] = k;
+    }
+}
+
+// grid.x = staged-expert bound * chunks, grid.y = the three matrices (gate, up, down). Every byte count and
+// base is 16-byte aligned (the engine checks before it enables staging).
+extern "C" __global__ void ts_dsv4_moe_stage_copy(
+    const int32_t* __restrict__ stageList,
+    const int32_t* __restrict__ stageCount,
+    const unsigned long long* __restrict__ hostTabGate,
+    const unsigned long long* __restrict__ hostTabUp,
+    const unsigned long long* __restrict__ hostTabDown,
+    const long long bytesGate,
+    const long long bytesUp,
+    const long long bytesDown,
+    uint8_t* __restrict__ staging,
+    const long long stride,
+    const long long offUp,
+    const long long offDown,
+    const int capacity,
+    const int chunks)
+{
+    const int k = blockIdx.x / chunks;
+    if (k >= min(*stageCount, capacity))
+        return;
+    const int e = stageList[k];
+    const int part = blockIdx.y;
+    const long long bytes = part == 0 ? bytesGate : part == 1 ? bytesUp : bytesDown;
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(part == 0 ? hostTabGate[e] : part == 1 ? hostTabUp[e] : hostTabDown[e]);
+    uint8_t* dst = staging + (size_t)k * (size_t)stride + (part == 0 ? 0 : part == 1 ? offUp : offDown);
+    const long long units = bytes / 16;
+    const long long per = (units + chunks - 1) / chunks;
+    const long long begin = (long long)(blockIdx.x % chunks) * per;
+    const long long end = min(units, begin + per);
+    const uint4* s4 = reinterpret_cast<const uint4*>(src);
+    uint4* d4 = reinterpret_cast<uint4*>(dst);
+    for (long long u = begin + threadIdx.x; u < end; u += blockDim.x)
+        d4[u] = s4[u];
+}
+
+// ts_dsv4_moe_stage_copy for a plan that keeps what earlier calls staged (a prompt read layer by layer: each
+// layer's ubatches share one staging, so an expert crosses the bus once per layer, not once per ubatch): only
+// the experts planned since *stageFrom (the count before this call's plan) are copied.
+extern "C" __global__ void ts_dsv4_moe_stage_copy_from(
+    const int32_t* __restrict__ stageList,
+    const int32_t* __restrict__ stageCount,
+    const int32_t* __restrict__ stageFrom,
+    const unsigned long long* __restrict__ hostTabGate,
+    const unsigned long long* __restrict__ hostTabUp,
+    const unsigned long long* __restrict__ hostTabDown,
+    const long long bytesGate,
+    const long long bytesUp,
+    const long long bytesDown,
+    uint8_t* __restrict__ staging,
+    const long long stride,
+    const long long offUp,
+    const long long offDown,
+    const int capacity,
+    const int chunks)
+{
+    const int k = *stageFrom + (int)(blockIdx.x / chunks);
+    if (k >= min(*stageCount, capacity))
+        return;
+    const int e = stageList[k];
+    const int part = blockIdx.y;
+    const long long bytes = part == 0 ? bytesGate : part == 1 ? bytesUp : bytesDown;
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(part == 0 ? hostTabGate[e] : part == 1 ? hostTabUp[e] : hostTabDown[e]);
+    uint8_t* dst = staging + (size_t)k * (size_t)stride + (part == 0 ? 0 : part == 1 ? offUp : offDown);
+    const long long units = bytes / 16;
+    const long long per = (units + chunks - 1) / chunks;
+    const long long begin = (long long)(blockIdx.x % chunks) * per;
+    const long long end = min(units, begin + per);
+    const uint4* s4 = reinterpret_cast<const uint4*>(src);
+    uint4* d4 = reinterpret_cast<uint4*>(dst);
+    for (long long u = begin + threadIdx.x; u < end; u += blockDim.x)
+        d4[u] = s4[u];
+}
+
+// One block: points the staged experts' table entries back at their resting addresses (hostTab*: per expert,
+// its device-mapped host copy, or the zero expert when the host computes missed experts) and clears the plan.
+extern "C" __global__ void ts_dsv4_moe_unstage(
+    const int32_t* __restrict__ stageList,
+    int32_t* __restrict__ stageCount,
+    int32_t* __restrict__ stageOf,
+    unsigned long long* __restrict__ tabGate,
+    unsigned long long* __restrict__ tabUp,
+    unsigned long long* __restrict__ tabDown,
+    const unsigned long long* __restrict__ hostTabGate,
+    const unsigned long long* __restrict__ hostTabUp,
+    const unsigned long long* __restrict__ hostTabDown,
+    const int capacity)
+{
+    const int n = min(*stageCount, capacity);
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+    {
+        const int e = stageList[i];
+        tabGate[e] = hostTabGate[e];
+        tabUp[e] = hostTabUp[e];
+        tabDown[e] = hostTabDown[e];
+        stageOf[e] = -1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+        *stageCount = 0;
+}
+
+// ---- host experts (expert residency, Strata's doorbell): the experts without a VRAM slot are computed by
+// the host while the GPU computes the rest, inside one captured step. Per layer the GPU publishes the FFN
+// input and the selection into host-mapped memory and advances a counter (the doorbell); a host thread
+// sees it, computes the missed experts from pinned memory and sets a flag to the counter's value; the
+// GPU's wait kernel then adds the host's sum into the layer's output. Each of these reads the counter
+// from memory rather than taking it as an argument, so a replayed graph carries no stale value.
+// hdr: [0] layer, [1] slots, [2] 1 when a selected expert has no slot (x was published).
+extern "C" __global__ void ts_moe_doorbell_publish(
+    const float* __restrict__ x,
+    const int32_t* __restrict__ sel,
+    const float* __restrict__ selW,
+    const uint8_t* __restrict__ isHost,
+    const int n,
+    const int slots,
+    const int layer,
+    float* xOut,
+    int32_t* idsOut,
+    float* wOut,
+    int32_t* hdr,
+    unsigned int* seq)
+{
+    int miss = 0;
+    for (int i = threadIdx.x; i < slots; i += blockDim.x)
+    {
+        const int e = sel[i];
+        idsOut[i] = e;
+        wOut[i] = selW[i];
+        if (e >= 0 && isHost[e])
+            miss = 1;
+    }
+    miss = __syncthreads_or(miss);
+    if (miss)
+        for (int i = threadIdx.x; i < n; i += blockDim.x)
+            xOut[i] = x[i];
+    if (threadIdx.x == 0)
+    {
+        ((volatile int32_t*)hdr)[0] = layer;
+        ((volatile int32_t*)hdr)[1] = slots;
+        ((volatile int32_t*)hdr)[2] = miss;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        *(volatile unsigned int*)seq = *(volatile unsigned int*)seq + 1u;
+        __threadfence_system();
+    }
+}
+
+// Every block waits for the host's flag to reach the counter, then adds its part of the host's sum
+// (count == 0: the host had nothing to add).
+extern "C" __global__ void ts_moe_doorbell_wait_add(
+    const unsigned int* flag,
+    const unsigned int* seq,
+    const int32_t* count,
+    const float* hostOut,
+    float* __restrict__ dst,
+    const int n)
+{
+    __shared__ int add;
+    if (threadIdx.x == 0)
+    {
+        const unsigned int want = *(const volatile unsigned int*)seq;
+        while (*(const volatile unsigned int*)flag != want)
+        {
+        }
+        __threadfence_system();
+        add = *(const volatile int32_t*)count;
+    }
+    __syncthreads();
+    if (!add)
+        return;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        dst[i] += ((const volatile float*)hostOut)[i];
+}
+
+// The doorbell for a layer whose selected experts may all have VRAM slots (Strata's device-planned groups): `missDev`
+// (device memory) records whether any slot's expert lives on the host. Without one, the host is not rung and the wait
+// below returns at once, so an all-resident layer costs no round trip over the bus; with one, as ts_moe_doorbell_publish.
+extern "C" __global__ void ts_moe_doorbell_publish_skip(
+    const float* __restrict__ x,
+    const int32_t* __restrict__ sel,
+    const float* __restrict__ selW,
+    const uint8_t* __restrict__ isHost,
+    const int n,
+    const int slots,
+    const int layer,
+    float* xOut,
+    int32_t* idsOut,
+    float* wOut,
+    int32_t* hdr,
+    unsigned int* seq,
+    int32_t* missDev,
+    unsigned int* counts,                // [layers, nExpert] selections (adaptive residency), or null
+    const int nExpert)
+{
+    int miss = 0;
+    for (int i = threadIdx.x; i < slots; i += blockDim.x)
+    {
+        const int e = sel[i];
+        if (e >= 0 && isHost[e])
+            miss = 1;
+        if (counts != nullptr && e >= 0)
+            atomicAdd(counts + (size_t)layer * nExpert + e, 1u);
+    }
+    miss = __syncthreads_or(miss);
+    if (threadIdx.x == 0)
+        *missDev = miss;
+    if (!miss)
+        return;
+    for (int i = threadIdx.x; i < slots; i += blockDim.x)
+    {
+        idsOut[i] = sel[i];
+        wOut[i] = selW[i];
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        xOut[i] = x[i];
+    if (threadIdx.x == 0)
+    {
+        ((volatile int32_t*)hdr)[0] = layer;
+        ((volatile int32_t*)hdr)[1] = slots;
+        ((volatile int32_t*)hdr)[2] = 1;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        *(volatile unsigned int*)seq = *(volatile unsigned int*)seq + 1u;
+        __threadfence_system();
+    }
+}
+
+// ts_moe_doorbell_publish_skip with Strata's route-tail skip (STRATA_ROUTE_TAIL_SKIP): a host expert that every row of
+// the call routes at rank tailRank or lower (the row's selections are in descending order, slot i at rank i % nUsed) is
+// not computed, so only a host expert some row routes above that rank rings the host. The host server applies the same
+// rule to the slots of a layer that does ring (CudaHostExpertServer). tailRank <= 0 is ts_moe_doorbell_publish_skip.
+extern "C" __global__ void ts_moe_doorbell_publish_tail(
+    const float* __restrict__ x,
+    const int32_t* __restrict__ sel,
+    const float* __restrict__ selW,
+    const uint8_t* __restrict__ isHost,
+    const int n,
+    const int slots,
+    const int layer,
+    float* xOut,
+    int32_t* idsOut,
+    float* wOut,
+    int32_t* hdr,
+    unsigned int* seq,
+    int32_t* missDev,
+    unsigned int* counts,                // [layers, nExpert] selections (adaptive residency), or null
+    const int nExpert,
+    const int nUsed,
+    const int tailRank)
+{
+    int miss = 0;
+    for (int i = threadIdx.x; i < slots; i += blockDim.x)
+    {
+        const int e = sel[i];
+        if (e >= 0 && isHost[e] && (tailRank <= 0 || i % nUsed < tailRank))
+            miss = 1;
+        if (counts != nullptr && e >= 0)
+            atomicAdd(counts + (size_t)layer * nExpert + e, 1u);
+    }
+    miss = __syncthreads_or(miss);
+    if (threadIdx.x == 0)
+        *missDev = miss;
+    if (!miss)
+        return;
+    for (int i = threadIdx.x; i < slots; i += blockDim.x)
+    {
+        idsOut[i] = sel[i];
+        wOut[i] = selW[i];
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        xOut[i] = x[i];
+    if (threadIdx.x == 0)
+    {
+        ((volatile int32_t*)hdr)[0] = layer;
+        ((volatile int32_t*)hdr)[1] = slots;
+        ((volatile int32_t*)hdr)[2] = 1;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        *(volatile unsigned int*)seq = *(volatile unsigned int*)seq + 1u;
+        __threadfence_system();
+    }
+}
+
+// ---- missed experts split between the GPU and the host (TS_Q4E_HYBRID_MISSES) ----
+// A decode step's missed experts are computed by the host at DRAM speed, ~30-35 us an (expert, row) route on the RTX
+// 5090 pod's 7950X, while the GPU, its own experts done, waits. ts_moe_doorbell_publish_tail that first plans the GPU's
+// share: in one warp, the first `capacity` distinct missed experts in slot order (only those the route-tail rule keeps:
+// some slot routes them above the tail) get staging slots, their table entries pointing at the staging copies, which
+// ts_dsv4_moe_stage_copy fills over the bus next (ts_dsv4_moe_unstage restores them after the wait). The doorbell then
+// leaves them out of the host's share: they reach the host as id -1, which its server skips, and a layer whose misses
+// the GPU took whole rings no doorbell. The choice depends on the selection alone, so a replayed or repeated step splits
+// the same way. With `odd` set only odd-numbered experts are the GPU's: an expert then goes to the same side whatever
+// else the call selects (below capacity), so a verify window's row is computed as its decode step's.
+extern "C" __global__ void ts_moe_doorbell_publish_hybrid(
+    const float* __restrict__ x,
+    const int32_t* __restrict__ sel,
+    const float* __restrict__ selW,
+    const uint8_t* __restrict__ isHost,
+    const int n,
+    const int slots,
+    const int layer,
+    float* xOut,
+    int32_t* idsOut,
+    float* wOut,
+    int32_t* hdr,
+    unsigned int* seq,
+    int32_t* missDev,
+    unsigned int* counts,                // [layers, nExpert] selections (adaptive residency), or null
+    const int nExpert,
+    const int nUsed,
+    const int tailRank,
+    int32_t* __restrict__ stageOf,       // [nExpert], -1 between calls
+    int32_t* __restrict__ stageList,
+    int32_t* __restrict__ stageCount,
+    unsigned long long* __restrict__ tabGate,
+    unsigned long long* __restrict__ tabUp,
+    unsigned long long* __restrict__ tabDown,
+    const unsigned long long staging,
+    const long long stride,
+    const long long offUp,
+    const long long offDown,
+    const int capacity,
+    const int odd)
+{
+    if (threadIdx.x < 32)
+    {
+        const int lane = threadIdx.x;
+        int planned = 0;
+        for (int b = 0; b < slots && planned < capacity; b += 32)
+        {
+            const int i = b + lane;
+            bool cand = false;
+            int e = -1;
+            if (i < slots)
+            {
+                e = sel[i];
+                cand = e >= 0 && isHost[e] && (!odd || (e & 1));
+                // The first slot selecting e, and some slot routing it above the tail.
+                bool needed = tailRank <= 0;
+                for (int j = 0; j < slots && cand; ++j)
+                {
+                    const int ej = sel[j];
+                    if (ej != e)
+                        continue;
+                    if (j < i)
+                        cand = false;
+                    else if (j % nUsed < tailRank)
+                        needed = true;
+                }
+                cand = cand && needed;
+            }
+            const unsigned int ballot = __ballot_sync(0xffffffffu, cand);
+            if (cand)
+            {
+                const int k = planned + __popc(ballot & ((1u << lane) - 1u));
+                if (k < capacity)
+                {
+                    stageList[k] = e;
+                    const unsigned long long base = staging + (unsigned long long)k * (unsigned long long)stride;
+                    tabGate[e] = base;
+                    tabUp[e] = base + (unsigned long long)offUp;
+                    tabDown[e] = base + (unsigned long long)offDown;
+                    stageOf[e] = k;
+                }
+            }
+            planned += __popc(ballot);
+        }
+        if (lane == 0)
+            *stageCount = min(planned, capacity);
+    }
+    __syncthreads();
+
+    int miss = 0;
+    for (int i = threadIdx.x; i < slots; i += blockDim.x)
+    {
+        const int e = sel[i];
+        if (e >= 0 && isHost[e] && stageOf[e] < 0 && (tailRank <= 0 || i % nUsed < tailRank))
+            miss = 1;
+        if (counts != nullptr && e >= 0)
+            atomicAdd(counts + (size_t)layer * nExpert + e, 1u);
+    }
+    miss = __syncthreads_or(miss);
+    if (threadIdx.x == 0)
+        *missDev = miss;
+    if (!miss)
+        return;
+    for (int i = threadIdx.x; i < slots; i += blockDim.x)
+    {
+        const int e = sel[i];
+        idsOut[i] = e >= 0 && stageOf[e] >= 0 ? -1 : e;
+        wOut[i] = selW[i];
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        xOut[i] = x[i];
+    if (threadIdx.x == 0)
+    {
+        ((volatile int32_t*)hdr)[0] = layer;
+        ((volatile int32_t*)hdr)[1] = slots;
+        ((volatile int32_t*)hdr)[2] = 1;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        *(volatile unsigned int*)seq = *(volatile unsigned int*)seq + 1u;
+        __threadfence_system();
+    }
+}
+
+// ts_moe_doorbell_wait_add after ts_moe_doorbell_publish_skip: nothing to wait for when the layer rang no doorbell.
+extern "C" __global__ void ts_moe_doorbell_wait_add_skip(
+    const unsigned int* flag,
+    const unsigned int* seq,
+    const int32_t* count,
+    const float* hostOut,
+    float* __restrict__ dst,
+    const int n,
+    const int32_t* __restrict__ missDev)
+{
+    if (*missDev == 0)
+        return;
+    __shared__ int add;
+    if (threadIdx.x == 0)
+    {
+        const unsigned int want = *(const volatile unsigned int*)seq;
+        while (*(const volatile unsigned int*)flag != want)
+        {
+        }
+        __threadfence_system();
+        add = *(const volatile int32_t*)count;
+    }
+    __syncthreads();
+    if (!add)
+        return;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        dst[i] += ((const volatile float*)hostOut)[i];
+}
+
 extern "C" __global__ void ts_dsv4_moe_scatter_add_f32(
     const float* __restrict__ downOut,
     const int32_t* __restrict__ rowOfSlot, // [nt*nUsed] or null

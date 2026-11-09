@@ -665,7 +665,9 @@ namespace TensorSharp.Models
 
             // The drafter's own key for the last committed position, exactly like
             // the reference's ring[start_pos % win] = kv(main_x).
+            long t0 = s_dflashTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             DFlashEncodeAndInject(hPrev, 0, 1, position - 1);
+            long t1 = s_dflashTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
             // A plain DFlash block needs one extra row for the anchor (row 0 is the
             // anchor's own prediction and is discarded). A Markov drafter is the
@@ -674,8 +676,25 @@ namespace TensorSharp.Models
             int b = _dflash.MarkovRank > 0
                 ? Math.Min(_dflash.BlockSize, draftOut.Length)
                 : Math.Min(_dflash.BlockSize, draftOut.Length + 1);
-            return DFlashDraftBlockCore(lastToken, position, b, draftOut, confOut);
+            int drafted = DFlashDraftBlockCore(lastToken, position, b, draftOut, confOut);
+            if (s_dflashTiming)
+            {
+                long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+                _dflashInjectTicks += t1 - t0; _dflashDraftTicks += t2 - t1;
+                if (++_dflashTimedCalls == 64)
+                {
+                    double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency / 64;
+                    Console.Error.WriteLine($"[dflash] per draft over 64: inject {_dflashInjectTicks * f:F2} ms, block ({b} rows) {_dflashDraftTicks * f:F2} ms");
+                    _dflashInjectTicks = _dflashDraftTicks = 0; _dflashTimedCalls = 0;
+                }
+            }
+            return drafted;
         }
+
+        // TS_DFLASH_TIMING=1: a draft's two halves (the ring inject of the last position, the block), averaged over 64.
+        private static readonly bool s_dflashTiming = Environment.GetEnvironmentVariable("TS_DFLASH_TIMING") == "1";
+        private long _dflashInjectTicks, _dflashDraftTicks;
+        private int _dflashTimedCalls;
 
         private void RequireDFlash()
         {

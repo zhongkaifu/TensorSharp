@@ -896,9 +896,26 @@ wins honestly and the free prose behind it then loses at 12-17% acceptance: held
 for 64 steps that ran E4B-IQ4_XS prose at 30-34 tok/s against 65 plain in two of
 three runs (61-69 verify steps of ~80). While a win holds, the governor keeps
 timing its speculative steps against the plain baseline the round measured and
-parks as soon as the last eight of them average a loss, so a wrong win now costs
-about eight steps. The hold is still re-measured every 64 steps (three plain
+parks once they average a loss, so a wrong win costs a handful of steps, not
+sixty-four. The hold is still re-measured every 64 steps (three plain
 steps, since the speculative samples are productive) to refresh the baseline.
+
+What "average a loss" means changed after Qwen3.8 Flash Next (M5 Pro, DFlash2):
+judging on the last eight steps - and a re-probe on three - parked speculation
+for up to 371 steps of a request whose speculative steps cost 13-27 ms a token
+against 30-35 plain, because one window that accepts little reads as a loss
+when a step emits anything from one token to a whole window, and each loss
+doubles the next park. Verdicts now compare long-run evidence: every measured
+step on either side, token-weighted and decayed 3% per further step of that side
+(a half-life of ~23 steps). A probe or a hold wins if its own samples or that
+evidence say so. A loss that holds still flips it quickly - a drafter at a
+quarter of the acceptance and four times a plain step's cost (E4B-IQ4_XS prose)
+parks after ~7 steps, one just over the margin after ~11 - while a win that
+comes in bursts (seven windows that accept nothing, then three that accept
+everything) is no longer parked. Flash Next, greedy long generation: 40-43 ->
+44-47 tok/s (46-47 with the governor off); Strata's sampled standard-v1
+requests, pooled: 36.2 -> 39.8 tok/s (42.0 off). `TS_SPEC_ADAPTIVE=0` still
+turns the governor off.
 
 The governor is shared by every request an executor runs, so a park earned on
 one turn's text would carry into the next: a quote turn after a prose turn
@@ -1403,6 +1420,22 @@ A third idea - letting the lone decoder keep speculating beside a newcomer's
 prefill chunk - was measured and rejected (the newcomer's first token slipped
 by 600 ms on E4B), as was speculating on a solo step while another request is
 still prefilling; the gate is "alone in the engine".
+
+### Taking turns (Flash Next on Metal)
+
+A trunk whose decode step is bound by the experts it reads, rather than by its dense weights, can serve
+concurrent requests faster one at a time than batched. Qwen 3.8 Flash Next on a 48 GB M5 Pro streams its
+expert misses: four requests decoding one token each in the arena step made 30-34 tokens/s in all, while
+one request speculating alone made 40-44 (Strata serves requests strictly one at a time, at 52-55). Such a
+trunk reports `ISpeculativeTarget.SpecTurnsPreferred`, and when every scheduled sequence is decoding and
+there is no batched verify, `BatchExecutor.TrySpeculativeTurn` gives one sequence solo speculative steps on
+its own holder for up to 64 steps while the others wait, then hands the turn to the sequence served
+longest ago. Each request drafts over its own drafter state (`IPerRequestDraftState`: a DFlash ring per
+request, 81 MB on Flash Next's DFlash2), and its context catches up over tokens it took in batched steps.
+A turn's first step pays for the switch (the arena hands the holder back, the drafter catches up:
+100-250 ms), which is why a turn lasts 64 steps: turning every step was measured at 6-13 tokens/s against
+25-35 batched. Strata's 4-at-once rounds went from 30-34 to 37-43 tokens/s in all; the engine benchmark's
+two- and four-request scenarios (shorter greedy answers) stayed at 32-34. `TS_SPEC_TURNS=0/1` overrides.
 
 ## Where n-gram pays
 

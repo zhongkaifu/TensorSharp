@@ -360,6 +360,9 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_moe.cpp
     ggml_ops_host_moe_decode.cpp
     ggml_ops_host_moe_cache.cpp
+    ggml_ops_moe_hot_tier.cpp
+    ggml_ops_moe_expert_io.cpp
+    ggml_ops_buffer_reuse.cpp
     ggml_ops_deepseek4.cpp
     ggml_ops_deepseek41_tp.cpp
     ggml_ops_deepseek41_vision.cpp
@@ -392,6 +395,37 @@ if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
     # operations, including temporary MPSGraphTensorData and grown staging buffers.
     set_source_files_properties(tsg_metal_mps_conv.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     set_source_files_properties(ggml_gemma4_audio_metal_precision.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    # TensorSharp Metal kernels (tsm/): grouped routed experts for the tiered MoE seams, ported from Strata's
+    # MIT kernels (tsm/LICENSE-STRATA). Embedded into the library at build time, compiled at run time.
+    set(TSM_KERNEL_FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/quant.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/units.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/moe.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_moe_glue.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_gdn_prompt.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_hc_prompt.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_qsa_prompt.metal")
+    set(TSM_GGML_COMMON "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src/ggml-common.h")
+    set(TSM_SOURCE_INC "${CMAKE_CURRENT_BINARY_DIR}/tsm_moe_source.inc")
+    string(REPLACE ";" "\\;" TSM_KERNEL_FILES_ARG "${TSM_KERNEL_FILES}")
+    add_custom_command(OUTPUT "${TSM_SOURCE_INC}"
+        COMMAND ${CMAKE_COMMAND} -DOUT=${TSM_SOURCE_INC} -DGGML_COMMON=${TSM_GGML_COMMON}
+                "-DFILES=${TSM_KERNEL_FILES_ARG}" -P "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
+        DEPENDS ${TSM_KERNEL_FILES} "${TSM_GGML_COMMON}" "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
+        COMMENT "Embedding the TensorSharp Metal kernels")
+    # The tensor-API kernels: a library of their own (Metal language 4.0), so a device or SDK without the tensor API keeps
+    # every kernel above.
+    set(TSM_MPP_FILES "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_qsa_attn_mm.metal")
+    set(TSM_MPP_INC "${CMAKE_CURRENT_BINARY_DIR}/tsm_mpp_source.inc")
+    string(REPLACE ";" "\\;" TSM_MPP_FILES_ARG "${TSM_MPP_FILES}")
+    add_custom_command(OUTPUT "${TSM_MPP_INC}"
+        COMMAND ${CMAKE_COMMAND} -DOUT=${TSM_MPP_INC} -DVAR=kTsmMppSource -DMPP=1
+                "-DFILES=${TSM_MPP_FILES_ARG}" -P "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
+        DEPENDS ${TSM_MPP_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
+        COMMENT "Embedding the TensorSharp Metal tensor-API kernels")
+    list(APPEND TSG_GGMLOPS_SOURCES tsm/tsm_moe.mm "${TSM_SOURCE_INC}" "${TSM_MPP_INC}")
+    set_source_files_properties(tsm/tsm_moe.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
+        OBJECT_DEPENDS "${TSM_SOURCE_INC};${TSM_MPP_INC}")
 endif()
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)
@@ -530,6 +564,7 @@ endif()
 target_include_directories(GgmlOps PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src"
+    "${CMAKE_CURRENT_BINARY_DIR}"
 )
 target_link_libraries(GgmlOps PRIVATE ggml ${CMAKE_DL_LIBS})
 
@@ -668,6 +703,7 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_test(NAME embedding-cpu-matmul COMMAND GgmlOpsEmbeddingCpuMatmulTest)
     set_property(SOURCE ggml_ops_qwen4exp.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_qwen4exp_arena.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    set_property(SOURCE ggml_ops_moe_hot_tier.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     add_executable(GgmlOpsQwen4ExpQsaPlanTest tests/qwen4exp_qsa_plan_test.cpp)
     target_include_directories(GgmlOpsQwen4ExpQsaPlanTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     if (MSVC)

@@ -75,6 +75,7 @@ namespace TensorSharp.MLX
         private static MlxFastMetalKernel iq4XsDequantF16Kernel;
         private static MlxFastMetalKernel q6KGetRowsKernel;
         private static MlxFastMetalKernel gatedDeltaKernel;
+        private static MlxFastMetalKernel gatedDeltaRowsKernel;
         private static MlxFastMetalKernel gatedDeltaT1Kernel;
         private static MlxFastMetalKernel gatedDeltaBlockedKernel;
         private static MlxFastMetalKernel qwen35GdnPreprocessKernel;
@@ -1348,6 +1349,83 @@ for (int t = 0; t < T; ++t) {
     y[dv_idx] = out;
   }
 
+  q_ += Hk * Dk;
+  k_ += Hk * Dk;
+  v_ += Hv * Dv;
+  y += Hv * Dv;
+  g_ += Hv;
+  beta_ += Hv;
+}
+
+for (int i = 0; i < n_per_t; ++i) {
+  auto s_idx = n_per_t * dk_idx + i;
+  o_state[s_idx] = state[i];
+}
+";
+
+        // GatedDeltaSource that also writes the state after every row into state_rows [T][B * Hv][Dv][Dk]: a speculative
+        // verify window keeps each row's state (GatedDeltaNetCache.KeepRowStates) with one dispatch a layer instead of
+        // one per row plus the slices and concatenations around them.
+        private const string GatedDeltaRowsSource = @"
+auto n = thread_position_in_grid.z;
+auto b_idx = n / Hv;
+auto hv_idx = n % Hv;
+auto hk_idx = hv_idx % Hk;
+constexpr int n_per_t = Dk / 32;
+
+// q, k: [B, T, Hk, Dk]
+auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+// v, y: [B, T, Hv, Dv]
+auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+auto dk_idx = thread_position_in_threadgroup.x;
+auto dv_idx = thread_position_in_grid.y;
+
+// state_in, state_out: [B, Hv, Dv, Dk]
+auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+float state[n_per_t];
+for (int i = 0; i < n_per_t; ++i) {
+  auto s_idx = n_per_t * dk_idx + i;
+  state[i] = i_state[s_idx];
+}
+
+// g, beta: [B, T, Hv]
+auto g_ = g + b_idx * T * Hv;
+auto beta_ = beta + b_idx * T * Hv;
+
+for (int t = 0; t < T; ++t) {
+  float kv_mem = 0.0f;
+  for (int i = 0; i < n_per_t; ++i) {
+    auto s_idx = n_per_t * dk_idx + i;
+    state[i] = state[i] * g_[hv_idx];
+    kv_mem += state[i] * k_[s_idx];
+  }
+  kv_mem = simd_sum(kv_mem);
+
+  auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+  float out = 0.0f;
+  for (int i = 0; i < n_per_t; ++i) {
+    auto s_idx = n_per_t * dk_idx + i;
+    state[i] = state[i] + k_[s_idx] * delta;
+    out += state[i] * q_[s_idx];
+  }
+  out = simd_sum(out);
+  if (thread_index_in_simdgroup == 0) {
+    y[dv_idx] = out;
+  }
+
+  {
+    auto r_state = state_rows + ((t * NB + n) * Dv + dv_idx) * Dk;
+    for (int i = 0; i < n_per_t; ++i) {
+      r_state[n_per_t * dk_idx + i] = state[i];
+    }
+  }
   q_ += Hk * Dk;
   k_ += Hk * Dk;
   v_ += Hv * Dv;
@@ -6089,6 +6167,66 @@ if (simd_id == 0) {
             });
             y = yResult;
             nextState = stateResult;
+        }
+
+        /// <summary>GatedDelta over seqLen rows that also returns the state after every row, [seqLen, batch, Hv, Dv, Dk].</summary>
+        internal static void GatedDeltaRows(
+            MlxArray q, MlxArray k, MlxArray v, MlxArray g, MlxArray beta, MlxArray state,
+            int batch, int seqLen, int numKeyHeads, int numValueHeads, int keyDim, int valueDim,
+            out MlxArray y, out MlxArray nextState, out MlxArray rowStates)
+        {
+            y = default; nextState = default; rowStates = default;
+            if (!q.IsValid || !k.IsValid || !v.IsValid || !g.IsValid || !beta.IsValid || !state.IsValid)
+                throw new ArgumentException("GatedDeltaRows requires valid input arrays.");
+            if (batch <= 0 || seqLen <= 0 || keyDim % 32 != 0 || numValueHeads % numKeyHeads != 0)
+                throw new ArgumentOutOfRangeException(nameof(seqLen));
+            MlxArray yResult = default, stateResult = default, rowsResult = default;
+            MlxWorker.Shared.Invoke(() =>
+            {
+                MlxFastMetalKernel kernel;
+                lock (fastKernelSync)
+                {
+                    if (!gatedDeltaRowsKernel.IsValid)
+                        gatedDeltaRowsKernel = CreateFastMetalKernel("tensorsharp_gated_delta_rows",
+                            new[] { "q", "k", "v", "g", "beta", "state_in" }, new[] { "y", "state_out", "state_rows" },
+                            GatedDeltaRowsSource, string.Empty);
+                    if (!gatedDeltaRowsKernel.IsValid)
+                        throw new NotSupportedException("Unable to initialize the MLX gated-delta rows kernel.");
+                    kernel = gatedDeltaRowsKernel;
+                }
+                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
+                MlxVectorArray inputs = default, outputs = default;
+                try
+                {
+                    AddTemplateInt(config, "T", seqLen);
+                    AddTemplateInt(config, "Dk", keyDim);
+                    AddTemplateInt(config, "Dv", valueDim);
+                    AddTemplateInt(config, "Hk", numKeyHeads);
+                    AddTemplateInt(config, "Hv", numValueHeads);
+                    AddTemplateInt(config, "NB", batch * numValueHeads);
+                    int[] yShape = { batch, seqLen, numValueHeads, valueDim };
+                    int[] stateShape = { batch, numValueHeads, valueDim, keyDim };
+                    int[] rowsShape = { seqLen, batch, numValueHeads, valueDim, keyDim };
+                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, yShape, (nuint)yShape.Length, ToMlxDtype(DType.Float32)), "configuring gated-delta rows output");
+                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, stateShape, (nuint)stateShape.Length, ToMlxDtype(DType.Float32)), "configuring gated-delta rows state");
+                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, rowsShape, (nuint)rowsShape.Length, ToMlxDtype(DType.Float32)), "configuring gated-delta row states");
+                    Check(mlx_fast_metal_kernel_config_set_grid(config, 32, valueDim, batch * numValueHeads), "configuring gated-delta rows grid");
+                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 32, Math.Min(valueDim, 4), 1), "configuring gated-delta rows threadgroup");
+                    inputs = CreateVectorArray(q, k, v, g, beta, state);
+                    outputs = mlx_vector_array_new();
+                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running gated-delta rows kernel");
+                    Check(mlx_vector_array_get(out yResult, outputs, 0), "reading gated-delta rows output");
+                    Check(mlx_vector_array_get(out stateResult, outputs, 1), "reading gated-delta rows next state");
+                    Check(mlx_vector_array_get(out rowsResult, outputs, 2), "reading gated-delta row states");
+                }
+                finally
+                {
+                    if (inputs.IsValid) _ = mlx_vector_array_free(inputs);
+                    if (outputs.IsValid) _ = mlx_vector_array_free(outputs);
+                    if (config.IsValid) _ = mlx_fast_metal_kernel_config_free(config);
+                }
+            });
+            y = yResult; nextState = stateResult; rowStates = rowsResult;
         }
 
         internal static void Qwen35GdnPreprocess(

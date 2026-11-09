@@ -160,6 +160,7 @@ namespace TensorSharp.Runtime.Telemetry
         private static readonly ConcurrentDictionary<string, Func<int>> s_mediaJobCounters = new();
         private static readonly ConcurrentDictionary<string, Func<int>> s_videoQueueCounters = new();
         private static readonly ConcurrentDictionary<string, Func<IEnumerable<GpuMemoryReading>>> s_gpuMemorySources = new();
+        private static readonly ConcurrentDictionary<string, Func<MoeOffloadReading?>> s_moeOffloadSources = new();
 
         static TensorSharpMetrics()
         {
@@ -188,6 +189,17 @@ namespace TensorSharp.Runtime.Telemetry
                 () => GpuMeasurements(r => r.TotalBytes), "By", "Device memory on the device.");
             M.CreateObservableGauge("tensorsharp.gpu.memory.peak",
                 () => GpuMeasurements(r => r.PeakBytes), "By", "Peak device memory the allocator has held.");
+            // MoE expert offload: where routed experts ran and what the host did for them (see MoeOffloadReading).
+            s_moeRoutes = M.CreateObservableCounter("tensorsharp.moe.expert.routes", MoeRouteMeasurements, "{route}",
+                "Routed-expert selections by where the expert ran (tensorsharp.moe.placement: device, streamed, host).");
+            M.CreateObservableCounter("tensorsharp.moe.host.compute.time",
+                () => MoeMeasurements(r => r.HostComputeSeconds), "s",
+                "Time the host's expert kernel spent computing experts the accelerator did not hold.");
+            M.CreateObservableCounter("tensorsharp.moe.expert.swaps",
+                () => MoeMeasurements(r => r.Swaps), "{swap}",
+                "Experts adaptive residency moved between accelerator slots and the host.");
+            M.CreateObservableCounter("tensorsharp.moe.expert.io",
+                () => MoeMeasurements(r => r.IoBytes), "By", "Expert bytes read from storage by explicit expert I/O.");
 
             // Engines that keep sequence slots of their own (IServingTelemetrySource). Per engine:
             // reloading the model starts its counters again.
@@ -240,6 +252,52 @@ namespace TensorSharp.Runtime.Telemetry
             M.CreateObservableCounter("tensorsharp.engine.forward.wait_time",
                 () => ServingMeasurements((s => s.ForwardWaitSeconds, null, null)), "s",
                 "Host time spent waiting for forwards' GPU work after issuing it.");
+        }
+
+        private static readonly ObservableCounter<long> s_moeRoutes;
+
+        /// <summary>Whether anything collects the MoE offload instruments; the models' counter snapshots are skipped
+        /// otherwise, as the GPU memory ones are.</summary>
+        public static bool MoeOffloadObserved => s_moeRoutes.Enabled;
+
+        /// <summary>
+        /// Report MoE expert offload counters for one model architecture. <paramref name="read"/> runs on the metrics
+        /// collection thread: return a snapshot taken on the engine's thread, never query a backend there. Returns a
+        /// handle that unregisters it.
+        /// </summary>
+        public static IDisposable RegisterMoeOffloadSource(string architecture, Func<MoeOffloadReading?> read) =>
+            Register(s_moeOffloadSources, architecture, read);
+
+        private static IEnumerable<Measurement<long>> MoeRouteMeasurements()
+        {
+            foreach (var source in s_moeOffloadSources)
+            {
+                MoeOffloadReading? r;
+                try { r = source.Value(); }
+                catch (Exception) { continue; }
+                if (r is not MoeOffloadReading reading)
+                    continue;
+                var arch = new KeyValuePair<string, object?>(TelemetryAttributes.ModelArchitecture, source.Key);
+                yield return new Measurement<long>(reading.DeviceRoutes, arch,
+                    new KeyValuePair<string, object?>(TelemetryAttributes.MoePlacement, TelemetryAttributes.MoePlacementDevice));
+                yield return new Measurement<long>(reading.StreamedRoutes, arch,
+                    new KeyValuePair<string, object?>(TelemetryAttributes.MoePlacement, TelemetryAttributes.MoePlacementStreamed));
+                yield return new Measurement<long>(reading.HostRoutes, arch,
+                    new KeyValuePair<string, object?>(TelemetryAttributes.MoePlacement, TelemetryAttributes.MoePlacementHost));
+            }
+        }
+
+        private static IEnumerable<Measurement<T>> MoeMeasurements<T>(Func<MoeOffloadReading, T> pick) where T : struct
+        {
+            foreach (var source in s_moeOffloadSources)
+            {
+                MoeOffloadReading? r;
+                try { r = source.Value(); }
+                catch (Exception) { continue; }
+                if (r is MoeOffloadReading reading)
+                    yield return new Measurement<T>(pick(reading),
+                        new KeyValuePair<string, object?>(TelemetryAttributes.ModelArchitecture, source.Key));
+            }
         }
 
         private static IEnumerable<Measurement<T>> ServingMeasurements<T>(
@@ -431,6 +489,14 @@ namespace TensorSharp.Runtime.Telemetry
             public void Dispose() => System.Threading.Interlocked.Exchange(ref _remove, null)?.Invoke();
         }
     }
+
+    /// <summary>
+    /// Process totals of MoE expert offload, monotonic (they survive a model's unload): routes by where the expert ran
+    /// (an accelerator slot already holding it, a slot that read it from storage first, the host's expert kernel), the
+    /// host kernel's time, adaptive residency swaps, and bytes explicit expert I/O read.
+    /// </summary>
+    public readonly record struct MoeOffloadReading(long DeviceRoutes, long StreamedRoutes, long HostRoutes,
+        double HostComputeSeconds, long Swaps, long IoBytes);
 
     /// <summary>One device's memory figures; a figure a backend cannot report is <c>null</c>.</summary>
     public readonly record struct GpuMemoryReading(int Device, long? UsedBytes, long? TotalBytes, long? PeakBytes);

@@ -204,7 +204,11 @@ def run_ngram(case, context):
             # context overrides restore a drafter or alter speculative policy.
             env = {k: v for k, v in context.get("env", {}).items()
                    if not re.search(r"SPEC|DRAFT|DFLASH|DSPARK|NGRAM|MTP", k, re.I)}
-            env.update(MAX_CONTEXT="2048", TS_SCHED_NUM_BLOCKS="16", TS_SCHED_BLOCK_SIZE="128")
+            # Exact parity is the contract: verify each row with the one-token kernels.
+            # (ggml_metal verifies Qwen3.8 Flash Next rows as one batched forward by
+            # default, which is faster and not bit-identical to plain decode.)
+            env.update(MAX_CONTEXT="2048", TS_SCHED_NUM_BLOCKS="16", TS_SCHED_BLOCK_SIZE="128",
+                       TS_Q4E_VERIFY_ROW_KERNELS="1")
             result["inputs"] = {"scenario": "spec", "candidate": "ngram", "decode_token_cap": 64,
                 "family": context.get("family") or context.get("model_family"),
                 "code_fixture_target_tokens": 128, "fixture": "Corpus.CodeText plus Corpus.AgentSystemPrompt in AgentTurnBench/Program.cs",
@@ -215,7 +219,7 @@ def run_ngram(case, context):
                 "model_hash_note": "Full model/shard integrity belongs to the suite preparation manifest; this adapter does not rehash weights.",
                 "source_revision": context.get("source_revision"),
                 "sources": [{"path": path, "sha256": _hash(repo / path)} for path in _SOURCES],
-                "bounded_environment": {key: env[key] for key in ("MAX_CONTEXT", "TS_SCHED_NUM_BLOCKS", "TS_SCHED_BLOCK_SIZE")}}
+                "bounded_environment": {key: env[key] for key in ("MAX_CONTEXT", "TS_SCHED_NUM_BLOCKS", "TS_SCHED_BLOCK_SIZE", "TS_Q4E_VERIFY_ROW_KERNELS")}}
             result["evidence"].update(artifact_dir=str(run_dir), rows_path=str(rows), reproduce_argv=command,
                 scope="Within-model plain versus n-gram token parity and active verification; no learned-head or performance coverage.",
                 binary={"path": launcher[-1], "sha256": _hash(launcher[-1])})

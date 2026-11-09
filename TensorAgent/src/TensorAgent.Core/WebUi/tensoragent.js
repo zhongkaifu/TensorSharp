@@ -799,12 +799,13 @@
     state.video = d && d.video ? Object.assign({}, d.video) : null;
     if (previousModel !== state.model) modelChanged();
     // A foreground capability refresh must not discard an unsent clip's
-    // length or image semantics. A different checkpoint starts a fresh choice.
-    if (previousModel === state.model && state.video && state.video.supportsImageConditioning
-        && state.video.supportsReferenceConditioning && previousVideo
-        && previousVideo.supportsImageConditioning && previousVideo.supportsReferenceConditioning) {
-      if (Number.isInteger(previousVideo.clipFrames)) state.video.clipFrames = previousVideo.clipFrames;
-      if (state.video.supportsReferenceConditioning && previousVideo.referenceMode) state.video.referenceMode = true;
+    // length or image semantics. A different checkpoint starts a fresh choice,
+    // and a choice the refreshed checkpoint no longer offers is dropped: the
+    // length while the clip still has one, references while it still takes them.
+    if (previousModel === state.model && previousVideo) {
+      if (takesClipLength(state.video) && takesClipLength(previousVideo)
+          && Number.isInteger(previousVideo.clipFrames)) state.video.clipFrames = previousVideo.clipFrames;
+      if (choosesReferences(state.video) && previousVideo.referenceMode) state.video.referenceMode = true;
     }
     paintComposerHint();
     paintModelButton();
@@ -840,11 +841,24 @@
   // plug-ins). Which plug-ins, if any, the host says (WebUiRoutes.MapLoras).
   function takesLoras() { return makesImages() || makesVideo(); }
 
+  // A clip whose length the composer chooses: timed keyframes, or a load that can
+  // either start on a photo or keep it as a reference (the length menu and videoFrames).
+  function takesClipLength(v) {
+    return !!v && (!!v.supportsKeyframeConditioning || choosesReferences(v));
+  }
+
+  // A load that offers both uses of a photo, so the composer asks which one.
+  function choosesReferences(v) {
+    return !!v && !!v.supportsImageConditioning && !!v.supportsReferenceConditioning;
+  }
+
   // MiniMax-H3 can choose between its first/last-frame and reference denoisers without
   // changing the loaded model. LTX also offers the shared selector for timed guides.
+  // Continuing a clip starts the take on its last frame, so only a checkpoint that
+  // takes a first frame says it can (VideoTurns refuses the clip otherwise).
   function videoPlaceholder(v) {
-    if (v.supportsImageConditioning && v.supportsReferenceConditioning && v.referenceMode) return t('page.composer.videoWithIdentityReferences');
-    if (v.family === 'minimax-h3' || v.family === 'ltx-2.5') return t('page.composer.videoWithContinuations');
+    if (choosesReferences(v) && v.referenceMode) return t('page.composer.videoWithIdentityReferences');
+    if ((v.family === 'minimax-h3' || v.family === 'ltx-2.5') && v.supportsImageConditioning) return t('page.composer.videoWithContinuations');
     if (v.supportsImageConditioning && v.supportsReferenceConditioning) return t('page.composer.videoWithKeyframes');
     if (v.supportsKeyframeConditioning) return t('page.composer.videoWithKeyframes');
     if (v.supportsReferenceConditioning) return t('page.composer.videoWithReferences');
@@ -1603,9 +1617,7 @@
     if (textParts.length) msg.content = textParts.join('\n\n') + '\n\n' + msg.content;
     if (imagePaths.length) msg.imagePaths = imagePaths;
     if (stillImagePaths.length) msg.stillImagePaths = stillImagePaths;
-    if (state.video && (state.video.supportsKeyframeConditioning
-        || state.video.supportsImageConditioning && state.video.supportsReferenceConditioning)
-        && state.video.clipFrames) msg.videoFrames = state.video.clipFrames;
+    if (takesClipLength(state.video) && state.video.clipFrames) msg.videoFrames = state.video.clipFrames;
     if (stillImagePaths.length && state.video && state.video.supportsImageConditioning
         && state.video.supportsReferenceConditioning && state.video.referenceMode) {
       msg.videoMode = 'ref';
@@ -2899,8 +2911,7 @@
     });
     var imageIndex = 0;
     var imageCount = state.attachments.filter(function (a) { return a.mediaType === 'image'; }).length;
-    if (imageCount && state.video && (state.video.supportsKeyframeConditioning
-        || state.video.supportsImageConditioning && state.video.supportsReferenceConditioning) && !state.video.referenceMode) {
+    if (imageCount && takesClipLength(state.video) && !state.video.referenceMode) {
       var lengthLabel = el('label', 'video-keyframe-controls', t('page.chips.clipLength') + ' ');
       var lengthChoice = el('select', 'video-clip-length'); lengthChoice.setAttribute('aria-label', t('page.chips.clipLength'));
       var lengths = state.video.family === 'minimax-h3'

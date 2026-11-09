@@ -364,7 +364,6 @@
   "studio.keyframesTitle": "指定した時点の写真",
   "studio.guideNamed": "キーフレーム {index}",
   "studio.referencePhotosTitle": "参照写真",
-  "studio.referencesHelp2": "写真で、登場させる人物や物を示します。テイクがこれらの写真で始まったり終わったりすることはありません。最大 {count} 枚まで選べます。",
   "studio.referenceRemoved": "{name} を削除しました。順序：{list}",
   "studio.referenceAdded": "Picture {index}：{name}",
   "studio.referenceTileOn": "{name}、Picture {index}",

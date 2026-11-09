@@ -67,6 +67,10 @@ public sealed class Dsv4DenseRowInvarianceTests
     [InlineData(IQ3_XXS, 5120, 512)]
     [InlineData(IQ3_S, 5120, 512)]
     [InlineData(IQ4_NL, 5120, 512)]
+    // ISTA's Flash Next keeps a 640-wide shared-expert down projection in IQ4_NL: whole 32-value blocks, not
+    // whole super-blocks.
+    [InlineData(IQ4_NL, 640, 2560)]
+    [InlineData(Q8_0, 640, 2560)]
     [InlineData(IQ4_XS, 5120, 512)]
     [InlineData(MXFP4, 5120, 512)]
     public void EveryRowOfABatchedCall_IsTheOneRowCallBitForBit(int ggmlType, int inDim, int outDim)

@@ -271,6 +271,29 @@ namespace TensorSharp.Runtime.Scheduling
         internal int? PendingDeviceToken;
         internal int PendingDevicePosition;
 
+        /// <summary>Templated-loop detection over this request's reasoning
+        /// (<see cref="Scheduling.ReasoningLoopDetector"/>); null when its sampler has no
+        /// reasoning channel it can close. Engine-owned, fed committed output only.</summary>
+        internal ReasoningLoopDetector? ReasoningLoops
+        {
+            get
+            {
+                if (!_reasoningLoopsResolved)
+                {
+                    _reasoningLoopsResolved = true;
+                    if (SamplingConfig?.ThinkingBudget?.CloseOnRepetition == true || SamplingConfig?.MessageThinkingBudget != null)
+                        _reasoningLoops = new ReasoningLoopDetector();
+                }
+                return _reasoningLoops;
+            }
+        }
+        private ReasoningLoopDetector? _reasoningLoops;
+        private bool _reasoningLoopsResolved;
+
+        /// <summary>Reasoning closes the engine has logged for stops the sampler turned
+        /// into a close (<see cref="TokenSampler.StopsClosedInThinking"/>).</summary>
+        internal int LoggedStopClosures;
+
         /// <summary>The first output token, drawn and streamed as soon as the prompt's last
         /// chunk produced its logits, before the step that forwards it (with speculation
         /// that step is a whole draft-and-verify). Fixed once streamed: every later draw of

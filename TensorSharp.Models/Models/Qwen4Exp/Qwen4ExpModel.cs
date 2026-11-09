@@ -106,7 +106,10 @@ namespace TensorSharp.Models
                 ConfigureQwenDistributed(ggufPath);
                 ValidateQwen4ExpTensorParallelMetadata();
                 ParseTokenizer();
-                if (!string.IsNullOrWhiteSpace(draftGgufPath))
+                // --draft-model names either the shared MTP head or a DFlash/DFlash2
+                // drafter; the file's architecture decides. DFlash attaches last.
+                string dflashPath = IsDFlashDraftFile(draftGgufPath) ? draftGgufPath : null;
+                if (!string.IsNullOrWhiteSpace(draftGgufPath) && dflashPath == null)
                     LoadMtpDraftWeights(draftGgufPath);
 
                 Console.WriteLine($"Model: {ArchitectureId}, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
@@ -134,8 +137,14 @@ namespace TensorSharp.Models
                 int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
                 InitCaches(initialCacheLength, maxContextLength);
                 _q4eDistributed?.ValidateConfiguration($"qwen-cache|{_kvCacheDtype}|{initialCacheLength}|{maxContextLength}");
+                _pendingDraftBytes = dflashPath != null ? PendingDFlashDraftBytes(dflashPath) : 0;
                 PlanExpertPlacement();
                 FinalizeMtpHead();
+                StartPleTableWarm();
+                if (dflashPath != null)
+                    TryLoadQwen4ExpDFlash(dflashPath);
+                // Attached, the drafter's tensors are the trunk's own (AcceleratorBoundNonExpertBytes counts them).
+                _pendingDraftBytes = 0;
             }
             catch (Exception failure)
             {

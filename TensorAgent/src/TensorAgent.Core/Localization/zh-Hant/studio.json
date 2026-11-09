@@ -364,7 +364,6 @@
   "studio.keyframesTitle": "指定時刻的照片",
   "studio.guideNamed": "關鍵影格 {index}",
   "studio.referencePhotosTitle": "參考照片",
-  "studio.referencesHelp2": "你的照片用來表明要包含哪些人物或物體；片段不會從這些照片開始或結束。最多選擇 {count} 張。",
   "studio.referenceRemoved": "已移除 {name}。順序：{list}",
   "studio.referenceAdded": "圖片 {index}：{name}",
   "studio.referenceTileOn": "{name}，圖片 {index}",

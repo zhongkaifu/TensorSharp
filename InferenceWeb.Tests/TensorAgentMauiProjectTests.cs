@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -228,25 +229,109 @@ public class TensorAgentMauiProjectTests
         // builds and then disappears under the Release device strip step. Keep
         // the manifest identical to the native source exports so the next model
         // kernel cannot repeat that delayed EntryPointNotFound failure.
+        // The other direction fails too, and sooner: every listed name is a -u link
+        // root, so a test-only export (compiled only when the native test build
+        // defines TSG_GGML_TEST_HOOKS or TSG_GGML_TEST_DIAGNOSTICS) that the device
+        // archive lacks fails the Release link with "Undefined symbols".
         string nativeDir = Path.Combine(RepoRoot, "TensorSharp.GGML.Native");
-        var exportPattern = new Regex(
-            @"^\s*TSG_EXPORT[^\r\n]*\b(TSGgml_[A-Za-z0-9_]+)\s*\(",
-            RegexOptions.Multiline | RegexOptions.CultureInvariant);
-        string[] nativeExports = Directory.EnumerateFiles(nativeDir, "*.*", SearchOption.TopDirectoryOnly)
-            .Where(path => path.EndsWith(".cpp", StringComparison.Ordinal) ||
-                           path.EndsWith(".c", StringComparison.Ordinal) ||
-                           path.EndsWith(".inc", StringComparison.Ordinal) ||
-                           path.EndsWith(".h", StringComparison.Ordinal))
-            .SelectMany(path => exportPattern.Matches(File.ReadAllText(path))
-                .Select(match => match.Groups[1].Value))
-            .Distinct(StringComparer.Ordinal)
-            .OrderBy(name => name, StringComparer.Ordinal)
-            .ToArray();
+        var production = new HashSet<string>(StringComparer.Ordinal);
+        var testOnly = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string path in Directory.EnumerateFiles(nativeDir, "*.*", SearchOption.TopDirectoryOnly)
+                     .Where(path => path.EndsWith(".cpp", StringComparison.Ordinal) ||
+                                    path.EndsWith(".c", StringComparison.Ordinal) ||
+                                    path.EndsWith(".inc", StringComparison.Ordinal) ||
+                                    path.EndsWith(".h", StringComparison.Ordinal)))
+        {
+            foreach ((string name, bool test) in NativeExports(File.ReadAllLines(path)))
+                (test ? testOnly : production).Add(name);
+        }
+        string[] nativeExports = production.OrderBy(name => name, StringComparer.Ordinal).ToArray();
 
         Assert.Equal(nativeExports,
             retained.Distinct(StringComparer.Ordinal)
                 .OrderBy(name => name, StringComparer.Ordinal)
                 .ToArray());
+        Assert.Empty(retained.Intersect(testOnly.Except(production), StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public void ExportScanSeparatesTestOnlyExportsFromProductionOnes()
+    {
+        string[] source =
+        {
+            "TSG_EXPORT int TSGgml_Kept(void) {",
+            "#if defined(TSG_GGML_TEST_HOOKS)",
+            "TSG_EXPORT int TSGgml_HookOnly(void) {",
+            "#  if defined(__APPLE__)",
+            "TSG_EXPORT int TSGgml_NestedHook(void) {",
+            "#  endif",
+            "#else",
+            "TSG_EXPORT int TSGgml_ElseOfHook(void) {",
+            "#endif",
+            "#if !defined(TSG_GGML_TEST_DIAGNOSTICS)",
+            "TSG_EXPORT int TSGgml_NotDiagnostics(void) {",
+            "#else",
+            "TSG_EXPORT int TSGgml_DiagnosticsOnly(void) {",
+            "#endif",
+            "#ifdef TSG_GGML_TEST_DIAGNOSTICS",
+            "TSG_EXPORT int TSGgml_IfdefDiagnostics(void) {",
+            "#elif defined(TSG_GGML_USE_METAL)",
+            "TSG_EXPORT int TSGgml_ElifMetal(void) {",
+            "#endif",
+        };
+        Assert.Equal(
+            new[]
+            {
+                ("TSGgml_Kept", false), ("TSGgml_HookOnly", true), ("TSGgml_NestedHook", true),
+                ("TSGgml_ElseOfHook", false), ("TSGgml_NotDiagnostics", false), ("TSGgml_DiagnosticsOnly", true),
+                ("TSGgml_IfdefDiagnostics", true), ("TSGgml_ElifMetal", false),
+            },
+            NativeExports(source).ToArray());
+    }
+
+    /// <summary>The TSG_EXPORT names in one native source, each marked test-only when an
+    /// enclosing preprocessor branch is taken only with TSG_GGML_TEST_HOOKS or
+    /// TSG_GGML_TEST_DIAGNOSTICS defined.</summary>
+    private static IEnumerable<(string Name, bool TestOnly)> NativeExports(IEnumerable<string> lines)
+    {
+        var export = new Regex(@"^\s*TSG_EXPORT[^\r\n]*\b(TSGgml_[A-Za-z0-9_]+)\s*\(", RegexOptions.CultureInvariant);
+        var directive = new Regex(@"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$", RegexOptions.CultureInvariant);
+        var negatedTest = new Regex(@"!\s*defined\s*\(?\s*TSG_GGML_TEST_", RegexOptions.CultureInvariant);
+        // One frame per open #if: +1 when its taken branch needs a test macro, -1 when
+        // it needs one undefined (so the #else needs it), 0 otherwise.
+        var frames = new List<int>();
+        int Classify(string keyword, string condition) =>
+            !condition.Contains("TSG_GGML_TEST_", StringComparison.Ordinal) ? 0
+            : keyword == "ifndef" || negatedTest.IsMatch(condition) ? -1
+            : 1;
+        foreach (string line in lines)
+        {
+            Match d = directive.Match(line);
+            if (d.Success)
+            {
+                string keyword = d.Groups[1].Value;
+                string condition = d.Groups[2].Value;
+                switch (keyword)
+                {
+                    case "if" or "ifdef" or "ifndef":
+                        frames.Add(Classify(keyword, condition));
+                        break;
+                    case "elif" when frames.Count > 0:
+                        frames[^1] = Classify("if", condition);
+                        break;
+                    case "else" when frames.Count > 0:
+                        frames[^1] = -frames[^1];
+                        break;
+                    case "endif" when frames.Count > 0:
+                        frames.RemoveAt(frames.Count - 1);
+                        break;
+                }
+                continue;
+            }
+            Match e = export.Match(line);
+            if (e.Success)
+                yield return (e.Groups[1].Value, frames.Any(frame => frame > 0));
+        }
     }
 
     [Fact]

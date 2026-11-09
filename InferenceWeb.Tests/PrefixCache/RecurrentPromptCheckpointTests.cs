@@ -35,8 +35,13 @@ public class RecurrentPromptCheckpointTests
         new(id, Tokens(), 3, 8, SamplingConfig.Greedy, cacheScope: scope,
             sharedPrefixTokens: 16, mediaSpans: media, cacheBreakpoints: breaks) { PromptTailCheckpointOptional = tailOptional };
 
-    private static async Task<InferenceCompletion> Run(InferenceEngine engine, SequenceState sequence) =>
-        await engine.SubmitRequest(sequence).Completion.WaitAsync(TimeSpan.FromSeconds(10));
+    // The finished state is kept after the completion is signalled; the tests read the model and the tree next.
+    private static async Task<InferenceCompletion> Run(InferenceEngine engine, SequenceState sequence)
+    {
+        InferenceCompletion completion = await engine.SubmitRequest(sequence).Completion.WaitAsync(TimeSpan.FromSeconds(10));
+        await engine.WhenStepSettledAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        return completion;
+    }
 
     [Theory]
     [InlineData(1)]

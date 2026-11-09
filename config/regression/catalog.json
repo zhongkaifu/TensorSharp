@@ -178,8 +178,11 @@
       "configuration_status": "configured",
       "presets": [
         "qwen3.8-flash-next",
+        "qwen3.8-flash-next-cuda",
+        "qwen3.8-flash-next-cuda-4lanes",
         "qwen3.8-flash-next-iq1_m",
-        "qwen3.8-flash-next-mtp"
+        "qwen3.8-flash-next-mtp",
+        "qwen3.8-flash-next-ud-q2_k_xl"
       ]
     },
     {
@@ -970,7 +973,7 @@
       ],
       "layout": "dense",
       "file_sizes": {
-        "Qwen3.8-27B-UD-IQ3_XXS.gguf": 17559178144
+        "Qwen3.8-27B-UD-IQ3_XXS.gguf": 10934860704
       },
       "notes": [
         "Privileged host settings are never replayed automatically; use isolated fixture tools. Existing absolute skills/model defaults need explicit overrides."
@@ -3142,33 +3145,6 @@
       "status": "configured"
     },
     {
-      "id": "qwen3.8-27b-metal-dflash2",
-      "config": "config/qwen3.8-27b-metal-dflash2.json",
-      "kind": "text",
-      "family": "qwen35",
-      "modalities": [
-        "text"
-      ],
-      "backends": [
-        "ggml_metal"
-      ],
-      "scenarios": [],
-      "source_evidence": [
-        "config/qwen3.8-27b-metal-dflash2.json",
-        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
-        "docs/models/qwen35.md"
-      ],
-      "layout": "dense",
-      "file_sizes": {
-        "Qwen3.8-27B-UD-IQ3_XXS.gguf": 17559178144
-      },
-      "status": "configured",
-      "notes": [
-        "Apple Silicon profile: the qwen3.8-27b trunk on ggml_metal with the pinned DFlash2 block drafter (7 drafts, no confidence gate).",
-        "Offline inventory only; no automatic runner scenario claims this measured profile. The drafter's size is not recorded here; its SHA256 is pinned in the config."
-      ]
-    },
-    {
       "id": "qwen3.8-27b",
       "config": "config/qwen3.8-27b.json",
       "kind": "text",
@@ -3210,7 +3186,7 @@
       ],
       "layout": "dense",
       "file_sizes": {
-        "Qwen3.8-27B-UD-IQ3_XXS.gguf": 17559178144
+        "Qwen3.8-27B-UD-IQ3_XXS.gguf": 10934860704
       },
       "status": "configured"
     },
@@ -3273,6 +3249,37 @@
       ]
     },
     {
+      "id": "qwen3.8-27b-metal-dflash2",
+      "config": "config/qwen3.8-27b-metal-dflash2.json",
+      "kind": "text",
+      "family": "qwen35",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "backends": [
+        "ggml_metal"
+      ],
+      "scenarios": [],
+      "source_evidence": [
+        "config/qwen3.8-27b-metal-dflash2.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "Qwen3.8-27B-UD-IQ3_XXS.gguf": 10934860704,
+        "Qwen3.8-27B-mmproj-BF16.gguf": 931146432,
+        "Qwen3.8-27B-DFlash2-Q4_K_M.gguf": 1143006816
+      },
+      "status": "configured",
+      "notes": [
+        "Apple Silicon profile: UD-IQ3_XXS with the DFlash2 Q4_K_M drafter (7 drafts, no confidence gate); the files of TensorAgent's qwen3.8-27b-iq3xxs entry.",
+        "No automatic runner scenario claims it: a ggml_metal DFlash2 verify is not bit-identical to plain decode, so the speculation scenario's exact-sequence assertion does not apply; the qwen3.8-27b preset carries the family's scenarios."
+      ]
+    },
+    {
       "id": "qwen3.8-flash-next-mtp",
       "config": "config/qwen3.8-flash-next-mtp.json",
       "kind": "overlay",
@@ -3300,10 +3307,10 @@
         "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf": 2786568256
       },
       "notes": [
-        "Apply after config/qwen3.8-flash-next.json; no standalone model."
+        "Apply after config/qwen3.8-flash-next-ud-q2_k_xl.json or config/qwen3.8-flash-next-iq1_m.json; no standalone model."
       ],
       "requires_configs": [
-        "config/qwen3.8-flash-next.json"
+        "config/qwen3.8-flash-next-ud-q2_k_xl.json"
       ],
       "status": "configured"
     },
@@ -3352,11 +3359,142 @@
       ],
       "layout": "moe",
       "file_sizes": {
+        "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf": 37623740192,
+        "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf": 28800138432,
+        "mmproj-BF16.gguf": 907542944,
+        "Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf": 362124704
+      },
+      "status": "configured",
+      "notes": [
+        "ISTA-DASLab GSQ-RCO Q2_0 (pinned ed59f920) with the DFlash2 Q4_K_M drafter (incoai, pinned 4f5a39be): the fastest measured setup on Apple Silicon (M5 Pro 48 GB, 2026-11-08: decode 43-48 tok/s, 4K TTFT 5.8-6.0 s). Files verified by size and sha256 against the publishers' API."
+      ]
+    },
+    {
+      "id": "qwen3.8-flash-next-ud-q2_k_xl",
+      "config": "config/qwen3.8-flash-next-ud-q2_k_xl.json",
+      "kind": "text",
+      "family": "qwen4exp",
+      "modalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "backends": [
+        "cpu",
+        "ggml_cpu",
+        "ggml_cuda",
+        "ggml_metal",
+        "ggml_vulkan",
+        "cuda"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "forced_logits",
+        "forced_logits_sequence",
+        "server_chat",
+        "client_http_live",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools",
+        "cli_image",
+        "cli_video"
+      ],
+      "source_evidence": [
+        "config/qwen3.8-flash-next-ud-q2_k_xl.json",
+        "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpArchitecture.cs",
+        "docs/models/qwen38-flash-next.md",
+        "TensorAgent/src/TensorAgent.Core/Catalog/ModelCatalog.cs"
+      ],
+      "layout": "moe",
+      "file_sizes": {
         "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf": 10946624,
         "Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf": 49979779296,
         "Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf": 28878402944,
-        "mmproj-BF16.gguf": 907542944
+        "mmproj-BF16.gguf": 907542944,
+        "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf": 2786568256
       },
+      "status": "configured",
+      "notes": [
+        "The previous ggml_metal high-performance preset (UD-Q2_K_XL with the shared MTP head), kept for those files."
+      ]
+    },
+    {
+      "id": "qwen3.8-flash-next-cuda",
+      "config": "config/qwen3.8-flash-next-cuda.json",
+      "kind": "text",
+      "family": "qwen4exp",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cuda"
+      ],
+      "scenarios": [
+        "cli_text",
+        "cli_prefill",
+        "cli_decode",
+        "cli_multi_turn",
+        "cli_thinking",
+        "cli_tools",
+        "server_chat",
+        "client_http_live",
+        "server_stream",
+        "server_cancel",
+        "server_reset_cache",
+        "server_structured",
+        "server_tools"
+      ],
+      "source_evidence": [
+        "config/qwen3.8-flash-next-cuda.json",
+        "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpArchitecture.cs",
+        "TensorSharp.Backends.Cuda/Qwen4Exp/Q4eCudaEngine.cs",
+        "docs/models/qwen38-flash-next.md"
+      ],
+      "layout": "moe",
+      "file_sizes": {
+        "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf": 37623740192,
+        "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf": 28800138432,
+        "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf": 2786568256
+      },
+      "notes": [
+        "The direct CUDA engine with the shared MTP head (3 drafts): RTX 5090 (2026-11-08) decode 131-250 tok/s, 4K / 16K / 100K TTFT 1.0 / 4.2 / 30.4 s. Needs ~45 GB of host RAM for the n-gram table and host experts."
+      ],
+      "status": "configured"
+    },
+    {
+      "id": "qwen3.8-flash-next-cuda-4lanes",
+      "config": "config/qwen3.8-flash-next-cuda-4lanes.json",
+      "kind": "overlay",
+      "family": "qwen4exp",
+      "modalities": [
+        "text"
+      ],
+      "backends": [
+        "cuda"
+      ],
+      "scenarios": [
+        "server_chat"
+      ],
+      "source_evidence": [
+        "config/qwen3.8-flash-next-cuda-4lanes.json",
+        "TensorSharp.Backends.Cuda/Qwen4Exp/Q4eCudaEngine.cs",
+        "docs/models/qwen38-flash-next.md"
+      ],
+      "layout": "moe",
+      "file_sizes": {},
+      "notes": [
+        "Apply after config/qwen3.8-flash-next-cuda.json; four sequence lanes for concurrent users (RTX 5090: four requests at once 243-258 tok/s). No standalone model."
+      ],
+      "requires_configs": [
+        "config/qwen3.8-flash-next-cuda.json"
+      ],
       "status": "configured"
     },
     {

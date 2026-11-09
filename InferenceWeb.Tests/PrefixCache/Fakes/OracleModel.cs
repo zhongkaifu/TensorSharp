@@ -110,6 +110,8 @@ internal class OracleModel : IModelArchitecture, IBatchedPagedModel, IPrefixCach
     internal IPrefixPayloadSink? Sink { get; private set; }
     internal long StateMemberCalls { get; private set; }
     internal long SpareBytes { get; set; } = -1;
+    /// <summary>What <see cref="QueryHostMemoryDeficitBytes"/> reports (0: the machine is not short).</summary>
+    internal long HostMemoryDeficitBytes { get; set; }
     internal int PrimaryConversionCalls { get; private set; }
     internal List<(string Key, InvalidationReason Reason)> ReportedInvalidations { get; } = new();
     /// <summary>Token count of every <see cref="Forward"/> call, in order (the prefill steps a scheduler chose).</summary>
@@ -741,6 +743,8 @@ internal class OracleModel : IModelArchitecture, IBatchedPagedModel, IPrefixCach
         StateMemberCalls++;
         return cls == ResourceClass.PoolPages ? -1 : SpareBytes;
     }
+
+    public long QueryHostMemoryDeficitBytes() => HostMemoryDeficitBytes;
 
     // ------------------------------------------------------------------ IPrefixCacheModelDiagnostics
 

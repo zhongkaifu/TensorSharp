@@ -1,61 +1,75 @@
 {
-  // Qwen3.8 Flash Next (UD-Q2_K_XL), all three GGUF shards (~78.9 GB)
-  // plus the BF16 vision projector (~0.9 GB). TensorSharp opens the other
-  // shards beside the first one; all three must be present before loading.
+  // Qwen3.8 Flash Next, the fastest measured setup on Apple Silicon: ISTA-DASLab's GSQ-RCO Q2_0 (two GGUF shards,
+  // 66.4 GB: 37.6 GB trunk and experts, 28.8 GB n-gram table) with the DFlash2 drafter (Q4_K_M, 0.36 GB) on ggml_metal.
   //   TensorSharp.Cli         --config config/qwen3.8-flash-next.json --chat
   //   TensorSharp.Server.Host --config config/qwen3.8-flash-next.json
-  // Use --backend ggml_metal on Apple Silicon, or ggml_cpu for CPU execution.
-  // Expert/PLE disk paging permits a smaller resident working set than the
-  // download size; memory use and throughput depend on the device and SSD.
+  //
+  // Measured on an M5 Pro (48 GB), 2026-11-08, Strata's standard-v1 bundle and eng/qwen38-engine-bench.py:
+  //   decode 43-48 tok/s (short and long answers), 4K-token prompt TTFT 5.8-6.0 s, 16K 22.7-24.3 s,
+  //   four requests at once 43.4 tok/s in all, parallel_4 35-37 tok/s, Strata's 12 sanity checks 12/12.
+  // The UD-Q2_K_XL files with the MTP head (config/qwen3.8-flash-next-ud-q2_k_xl.json) decode ~31 tok/s there.
+  //
+  // On a 48 GB Mac the files are larger than memory by design. The engine keeps every layer's most-routed experts in
+  // GPU slots (ranked by a routing profile it records on the first load), reads the rest with parallel pread into
+  // window slots, and the GPU computes every route; per-request caches start small and grow with the request. See
+  // docs/models/qwen38-flash-next.md.
+  //
+  // NVIDIA: config/qwen3.8-flash-next-cuda.json (the direct CUDA engine).
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
-    "root": "${modelRoot}/qwen3.8-flash-next",
-    "repo": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6"
+    "root": "${modelRoot}/qwen3.8-flash-next-ista-q2_0",
+    "draftRoot": "${modelRoot}/qwen3.8-flash-next-dflash2",
+    "projectorRoot": "${modelRoot}/qwen3.8-flash-next",
+    "ista": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+    "dflash": "https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2-GGUF/resolve/4f5a39be8f0a9e9a573ac9824251830a8f4096d9",
+    "unsloth": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6"
   },
 
-  "backend": "ggml_cuda",
+  "backend": "ggml_metal",
   "max-tokens": 4096,
   "continuous-batching": true,
   // Sparse attention requires F16/F32 KV; quantized KV is not supported here.
   "kv-cache-dtype": "f16",
+  // The publisher's sampling defaults (the GGUF's general.sampling).
   "temperature": 1.0,
   "top-k": 20,
   "top-p": 0.95,
   "min-p": 0,
   "repeat-penalty": 1.0,
 
+  "environment": {
+    // A 16K-token prompt with a long answer fits; the primary cache is allocated at this size, a request's own
+    // cache starts at 2048 tokens and grows with it.
+    "MAX_CONTEXT": "32768",
+    // The hyper-connection matrices (BF16 in the file) run as a Q8_0 copy: faster decode, part of every
+    // measurement above.
+    "TS_Q4E_HC_Q8": "1"
+  },
+
   "model": {
-    "path": "${root}/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
-    "urls": ["${repo}/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf"],
-    "sha256": "a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86",
+    "path": "${root}/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+    "urls": ["${ista}/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"],
+    "sha256": "69820c02ec7d0b45ef2ebb19d6620299db749fe2aded7f39f93c6b88b199b720",
     "files": [
       {
-        "path": "${root}/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf",
-        "urls": ["${repo}/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf"],
-        "sha256": "2e3bf1ee7d2a04e261e9f342a2d968f696cce5941d082b0e434deb9b1edc12c6"
-      },
-      {
-        "path": "${root}/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf",
-        "urls": ["${repo}/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf"],
-        "sha256": "ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9"
+        "path": "${root}/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf",
+        "urls": ["${ista}/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"],
+        "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"
       }
     ]
   },
-  // Pass --mmproj none to run text-only and skip the projector download.
+  // The vision projector (the one validated with Flash Next). Pass --mmproj none to run text-only and skip it.
   "mmproj": {
-    "path": "${root}/mmproj-BF16.gguf",
-    "urls": ["${repo}/mmproj-BF16.gguf"],
+    "path": "${projectorRoot}/mmproj-BF16.gguf",
+    "urls": ["${unsloth}/mmproj-BF16.gguf"],
     "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355"
+  },
+  // The DFlash2 drafter: naming it is the request to speculate (no --spec needed); pass --no-spec to decode without
+  // it. Its block drafts (up to 6 a step, confidence gate 0.5) are the engine's defaults; drafts are verified as one
+  // batched forward on ggml_metal, and concurrent requests take speculative turns.
+  "draft-model": {
+    "path": "${draftRoot}/Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf",
+    "urls": ["${dflash}/Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf"],
+    "sha256": "2f174e593998c77df0eb7ca13961915a26f25f7944d784a1838e1856e857ff0d"
   }
-
-  // Optional learned speculative decoding: uncomment the following entry
-  // (including the leading comma) to download the shared Q8_0 MTP head
-  // (~2.8 GB) and enable it on GGML backends. It is not embedded in the trunk.
-  // Speedups depend on the request; retained-prefix and concurrent requests
-  // decode plainly. See docs/models/qwen38-flash-next.md for measured limits.
-  // ,"draft-model": {
-  //   "path": "${root}/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
-  //   "urls": ["${repo}/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"],
-  //   "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
-  // }
 }

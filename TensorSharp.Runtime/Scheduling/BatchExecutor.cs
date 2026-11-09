@@ -11,6 +11,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Paged;
@@ -1330,6 +1331,9 @@ namespace TensorSharp.Runtime.Scheduling
                 bool speculated = speculate && TryRunBatchedSpeculativeSubset(decodeWork, results, ref handledBatched);
                 if (mixedWork != null)
                     CompleteMixedPrefill(mixedWork, Stopwatch.GetTimestamp() - specStarted, results, ref mixedHandled);
+                // No batched verify: on a trunk that prefers it, one sequence takes a solo speculative turn instead.
+                if (!speculated && dn >= 2 && dn == n && TrySpeculativeTurn(fused, decodeWork, results))
+                    return results;
                 if (!speculated && dn >= 2)
                 {
                     var reqIds = new string[dn];
@@ -2267,7 +2271,7 @@ namespace TensorSharp.Runtime.Scheduling
                 var exec = TryArmSpeculation(spec, seq, trunk: null, trunkLabel: "linear");
                 if (exec == null)
                     return null;
-                if (exec.CanSeedCommitted)
+                if (exec.CanSeedCommitted && !exec.PrefillsThroughContext)
                 {
                     // A drafter that can be seeded from the trunk's tokens (n-gram, a
                     // head that resumes after a gap) does not need the prompt to run
@@ -2449,7 +2453,7 @@ namespace TensorSharp.Runtime.Scheduling
         private SequenceStepResult ExecuteSpeculativeWorkCore(
             SpecSeqContext context, SequenceState seq, ScheduledSequenceWork work, int prevComputed)
         {
-            (_model as IBatchedSpeculativeTarget)?.BindDraftState(seq.RequestId);
+            (_model as IPerRequestDraftState)?.BindDraftState(seq.RequestId);
             if (work.IsPrefill)
             {
                 int[] chunk = BuildPrefillChunk(seq, work);
@@ -2533,7 +2537,7 @@ namespace TensorSharp.Runtime.Scheduling
             // the stream toward the drafts), otherwise sampled as usual.
             if (ctx.PendingNextToken >= 0)
             {
-                sampledToken = ctx.PendingNextToken;
+                sampledToken = PendingVerifyDraw(seq, ctx.PendingNextToken);
                 ctx.PendingNextToken = -1;
                 seq.PendingDeviceToken = null;   // the same draw, published for the plain paths; consumed here
             }
@@ -2591,8 +2595,11 @@ namespace TensorSharp.Runtime.Scheduling
                 // Penalty-aligned drafting: the draft head must argmax the
                 // same penalized distribution verification draws from, or
                 // acceptance decays toward zero as the output history grows.
-                adjustDraftLogits: (draftLogits, pendingDrafts) =>
-                    penaltySampler.ApplyPenalties(draftLogits, seq.OutputTokens, pendingDrafts),
+                // Without penalties the adjustment is a no-op; leaving it out lets a head draft its whole window on
+                // its device (IDraftHead.DraftChain), where no draft logits reach the host.
+                adjustDraftLogits: penaltySampler.AdjustsDraftLogits
+                    ? (draftLogits, pendingDrafts) => penaltySampler.ApplyPenalties(draftLogits, seq.OutputTokens, pendingDrafts)
+                    : null,
                 onDraftAccepted: d =>
                 {
                     seq.AppendOutputToken(d);
@@ -2608,6 +2615,8 @@ namespace TensorSharp.Runtime.Scheduling
                     // Keep this check per row, AFTER onDraftAccepted updated the
                     // committed history, exactly as TokenSampler.Sample does.
                     if (!penaltySampler.TryGetForcedThinkingToken(seq.OutputTokens, out int forced))
+                        forced = penaltySampler.CloseInsteadOfStop(seq.OutputTokens, drawn);
+                    if (forced == drawn)
                         return drawn;
                     if ((uint)forced >= (uint)_model.Config.VocabSize)
                         throw new InvalidOperationException("Thinking end token is outside the model vocabulary.");
@@ -2646,13 +2655,91 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly Dictionary<string, SpecSeqContext> _fusedSpecCtx = new(StringComparer.Ordinal);
         private readonly HashSet<string> _fusedSpecDeclined = new(StringComparer.Ordinal);
 
+        // Speculative turns (TrySpeculativeTurn): TS_SPEC_TURNS=0 never, =1 always (where the trunk can), unset where
+        // the trunk prefers them (ISpeculativeTarget.SpecTurnsPreferred).
+        private static readonly string? s_specTurns = Environment.GetEnvironmentVariable("TS_SPEC_TURNS");
+        /// <summary>Speculative steps one sequence keeps the turn for before the next takes it (if still decoding).
+        /// A turn's first step pays for switching holders (100-250 ms on Flash Next: the arena hands the holder back,
+        /// the drafter catches up), so turning every step served 6-13 tokens/s against 25-35 batched; 64 steps
+        /// (~180 tokens) amortize it.</summary>
+        internal const int SpeculativeTurnSteps = 64;
+        private readonly Dictionary<string, long> _turnLastServed = new(StringComparer.Ordinal);
+        private string? _turnHolder;
+        private int _turnSteps;
+        private long _turnClock;
+        private long _speculativeTurns;
+
+        /// <summary>Solo speculative steps served as turns to concurrent decoders.</summary>
+        internal long SpeculativeTurns => _speculativeTurns;
+
+        /// <summary>
+        /// Concurrent decoders on a trunk with no batched verify that prefers turns (<see cref="ISpeculativeTarget.SpecTurnsPreferred"/>):
+        /// the turn's sequence takes one solo speculative step on its own holder while the others wait, and keeps the
+        /// turn for <see cref="SpeculativeTurnSteps"/> steps; then the sequence served longest ago takes it. Each drafts
+        /// over its own drafter state (<see cref="IPerRequestDraftState"/>), and its context catches up over the tokens
+        /// it took in batched steps. What a sequence emits does not change, only when (in bursts). Returns false -
+        /// nothing forwarded, the holder checked in by the batched step - when turns are off or this sequence cannot
+        /// speculate now.
+        /// </summary>
+        private bool TrySpeculativeTurn(IBatchedPagedModel fused, List<ScheduledSequenceWork> decodeWork,
+            List<SequenceStepResult> results)
+        {
+            if (s_specTurns == "0" || !SpeculationEnabledThisStep)
+                return false;
+            if (_model is not ISpeculativeTarget spec || !spec.SpeculationProfitable || !spec.SpecTrunkFollowsBoundCache
+                || _model is not IPerRequestDraftState)
+                return false;
+            if (s_specTurns != "1" && !spec.SpecTurnsPreferred)
+                return false;
+            bool Eligible(SequenceState candidate) => CanSpeculate(candidate)
+                && !_pendingRetainedFusedTruncations.ContainsKey(candidate.RequestId)
+                && !_fusedSpecDeclined.Contains(candidate.RequestId)
+                && fused.HasFusedSequenceCache(candidate.RequestId);
+            ScheduledSequenceWork? chosen = null;
+            if (_turnHolder != null && _turnSteps < SpeculativeTurnSteps)
+                foreach (var work in decodeWork)
+                    if (string.Equals(work.Sequence.RequestId, _turnHolder, StringComparison.Ordinal) && Eligible(work.Sequence))
+                    { chosen = work; break; }
+            if (chosen == null)
+            {
+                long oldest = long.MaxValue;
+                foreach (var work in decodeWork)
+                {
+                    if (!Eligible(work.Sequence)) continue;
+                    long last = _turnLastServed.TryGetValue(work.Sequence.RequestId, out long t) ? t : 0;
+                    if (last < oldest) { oldest = last; chosen = work; }
+                }
+                if (chosen == null) { _turnHolder = null; return false; }
+                _turnHolder = chosen.Sequence.RequestId;
+                _turnSteps = 0;
+            }
+            var seq = chosen.Sequence;
+            int prevComputed = seq.NumComputedTokens;
+            if (!BindFusedHolder(fused, seq, results))
+                return true;   // its result (a rewind that re-prefills) is the step's; the others wait one step
+            if (!TrySpeculativeFusedDecode(seq, prevComputed, out SequenceStepResult? specResult))
+            {
+                _turnHolder = null;
+                return false;
+            }
+            results.Add(specResult);
+            _turnLastServed[seq.RequestId] = ++_turnClock;
+            ++_turnSteps;
+            ++_speculativeTurns;
+            if (_cbDebug)
+                Console.Error.WriteLine($"[cb] spec turn {seq.RequestId} step {_turnSteps}: {specResult.TokensForwarded} tokens");
+            return true;
+        }
+
         private void DisposeFusedSpecContext(string requestId)
         {
             if (string.IsNullOrEmpty(requestId)) return;
+            _turnLastServed.Remove(requestId);
+            if (string.Equals(_turnHolder, requestId, StringComparison.Ordinal)) _turnHolder = null;
             if (_fusedSpecCtx.Remove(requestId, out var ctx))
                 ctx.Exec?.Dispose();
             _fusedSpecDeclined.Remove(requestId);
-            (_model as IBatchedSpeculativeTarget)?.ReleaseDraftState(requestId);
+            (_model as IPerRequestDraftState)?.ReleaseDraftState(requestId);
         }
 
         /// <summary>
@@ -2683,7 +2770,7 @@ namespace TensorSharp.Runtime.Scheduling
             // The bound holder must agree with the scheduler about the position.
             if (spec.CacheSeqLen != prevComputed)
                 return false;
-            (_model as IBatchedSpeculativeTarget)?.BindDraftState(seq.RequestId);
+            (_model as IPerRequestDraftState)?.BindDraftState(seq.RequestId);
             if (!TryGetFusedSpecContext(spec, seq, prevComputed, out SpecSeqContext? ctx))
                 return false;
 
@@ -2741,13 +2828,21 @@ namespace TensorSharp.Runtime.Scheduling
             int window = batched.BatchedSpecWindow(n);
             if (window < 2)
                 return false;
+            // Sequences that sample join when the trunk returns every row's logits: each draws its
+            // rows with its own sampler, as its solo step does (a draft is kept while the draw equals it).
+            bool sampledVerify = false;
             for (int i = 0; i < n; i++)
             {
                 var seq = decodeWork[i].Sequence;
                 int prev = seq.NumComputedTokens;
-                if (prev <= 0 || !CanSpeculate(seq) || !seq.GetOrCreateSampler().IsPlainGreedyArgmax
-                    || batched.FusedCacheSeqLen(seq.RequestId) != prev)
+                if (prev <= 0 || !CanSpeculate(seq) || batched.FusedCacheSeqLen(seq.RequestId) != prev)
                     return false;
+                if (!seq.GetOrCreateSampler().IsPlainGreedyArgmax)
+                {
+                    if (!batched.SupportsBatchedSpecLogits)
+                        return false;
+                    sampledVerify = true;
+                }
             }
 
             using var scope = batched.BeginBatchedSpeculation();
@@ -2791,7 +2886,7 @@ namespace TensorSharp.Runtime.Scheduling
             for (int i = 0; i < n; i++)
             {
                 var seq = decodeWork[i].Sequence;
-                peeked[i] = ctxs[i].PendingNextToken >= 0 ? ctxs[i].PendingNextToken : PeekPendingOrSample(seq);
+                peeked[i] = ctxs[i].PendingNextToken >= 0 ? PendingVerifyDraw(seq, ctxs[i].PendingNextToken) : PeekPendingOrSample(seq);
                 if (IsStop(peeked[i]) || seq.OutputTokens.Count + 1 >= seq.MaxNewTokens)
                     (ending ??= new()).Add((seq, ctxs[i], peeked[i]));
             }
@@ -2925,15 +3020,37 @@ namespace TensorSharp.Runtime.Scheduling
                 _batchedSpecFeatures = new float[featNeeded];
             var drawn = new int[n * window];
             long drafted = Stopwatch.GetTimestamp();
-            if (!batched.TryBatchedSpecVerify(requestIds, positions, window, tokens, drawn, _batchedSpecFeatures))
+            int vocab = _model.Config.VocabSize;
+            if (sampledVerify)
+            {
+                long logitsNeeded = (long)n * window * vocab;
+                if (_batchedSpecLogits == null || _batchedSpecLogits.LongLength < logitsNeeded)
+                    _batchedSpecLogits = new float[logitsNeeded];
+                if (!batched.TryBatchedSpecVerifyLogits(requestIds, positions, window, tokens, _batchedSpecLogits, _batchedSpecFeatures))
+                    return false;
+            }
+            else if (!batched.TryBatchedSpecVerify(requestIds, positions, window, tokens, drawn, _batchedSpecFeatures))
                 return false;
             long verified = Stopwatch.GetTimestamp();
             long verifyTicks = verified - started;
 
             // Accept per sequence exactly as the solo step does: a draft is kept while
-            // it equals its row's draw, and nothing is accepted past a stop.
+            // it equals its row's draw, and nothing is accepted past a stop. A row's draw
+            // is what the solo step's drawGreedy returns: a forced reasoning-close token
+            // over the device argmax, and a stop inside open reasoning turned into one.
+            int RowDraw(SequenceState seq, int raw)
+            {
+                var sampler = seq.GetOrCreateSampler();
+                if (!sampler.TryGetForcedThinkingToken(seq.OutputTokens, out int row))
+                    row = sampler.CloseInsteadOfStop(seq.OutputTokens, raw);
+                if (row != raw && (uint)row >= (uint)_model.Config.VocabSize)
+                    throw new InvalidOperationException("Thinking end token is outside the model vocabulary.");
+                return row;
+            }
             var kept = new int[n];
             var accepted = new List<int>[n];
+            var nexts = new int[n];
+            // The anchors, in order: each sequence's pending draw, or a draw from its logits.
             for (int i = 0; i < n; i++)
             {
                 var seq = decodeWork[i].Sequence;
@@ -2948,11 +3065,36 @@ namespace TensorSharp.Runtime.Scheduling
                     TakePendingOrSample(seq);
                 }
                 seq.AppendOutputToken(anchors[i]);
+            }
+            if (sampledVerify && (_batchedSpecRows == null || _batchedSpecRows.Length < n))
+                Array.Resize(ref _batchedSpecRows, n);
+            // Each sequence's drafts against its own rows. A sequence's acceptance touches only its own state (output,
+            // sampler, grammar), so sequences that sample draw in parallel: a sampled row is a copy, penalties and a
+            // top-k pass over the whole vocabulary, and four sequences' rows one after another held the GPU idle.
+            void Accept(int i)
+            {
+                var seq = decodeWork[i].Sequence;
                 bool seqStopRepetition = stopRepetition && (seq.SamplingConfig?.StopRepetition ?? true);
                 bool stopped = IsStop(anchors[i]);
                 var acc = new List<int>();
                 int m = 0;
-                while (!stopped && m < drafts[i].Count && drawn[i * window + m] == drafts[i][m])
+                // A row is drawn once: a sampled row advances the sequence's sampler.
+                int Draw(int row)
+                {
+                    if (!sampledVerify)
+                        return RowDraw(seq, drawn[i * window + row]);
+                    float[] buf = _batchedSpecRows![i] is { } b && b.Length == vocab ? b : (_batchedSpecRows[i] = new float[vocab]);
+                    Array.Copy(_batchedSpecLogits!, ((long)i * window + row) * vocab, buf, 0, vocab);
+                    var sampler = seq.GetOrCreateSampler();
+                    if (!sampler.IsPlainGreedyArgmax)
+                        return sampler.Sample(buf, seq.OutputTokens);
+                    int best = 0;
+                    for (int v = 1; v < vocab; v++)
+                        if (buf[v] > buf[best]) best = v;
+                    return RowDraw(seq, best);
+                }
+                int draw = stopped ? -1 : Draw(0);
+                while (!stopped && m < drafts[i].Count && draw == drafts[i][m])
                 {
                     int d = drafts[i][m];
                     seq.AppendOutputToken(d);
@@ -2961,9 +3103,29 @@ namespace TensorSharp.Runtime.Scheduling
                     if (IsStop(d) || (seqStopRepetition
                             && RepetitionGuard.IsLooping(seq.OutputTokens, seq.OutputTokens.Count, out _, out _)))
                         stopped = true;
+                    else
+                        draw = Draw(m);
                 }
                 kept[i] = m + 1;
                 accepted[i] = acc;
+                // The row after the kept ones: its draw is the next token (drawn above unless a stop ended the run).
+                nexts[i] = stopped ? Draw(m) : draw;
+            }
+            if (sampledVerify && n > 1)
+            {
+                try
+                {
+                    Parallel.For(0, n, Accept);
+                }
+                catch (AggregateException ae) when (ae.InnerExceptions.Count == 1)
+                {
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
+                }
+            }
+            else
+            {
+                for (int i = 0; i < n; i++)
+                    Accept(i);
             }
 
             batched.CommitBatchedSpecVerify(requestIds, positions, kept);
@@ -2978,7 +3140,7 @@ namespace TensorSharp.Runtime.Scheduling
                 batched.BindDraftState(seq.RequestId);
                 ctx.Exec.CommitBatch(anchors[i], positions[i], drafts[i], m,
                     _batchedSpecFeatures, (long)i * window * feat, verifyTicks / n);
-                int next = drawn[i * window + m];
+                int next = nexts[i];
                 seq.LastLogits = null;
                 seq.AdvanceComputedTokens(kept[i]);
                 ctx.NextPosition = positions[i] + kept[i];
@@ -3044,6 +3206,9 @@ namespace TensorSharp.Runtime.Scheduling
             Environment.GetEnvironmentVariable("TS_BATCHED_SPEC_LOG") == "1";
 
         private float[]? _batchedSpecFeatures;
+        // A sampled batched verify's rows' logits, and per sequence the row handed to its sampler.
+        private float[]? _batchedSpecLogits;
+        private float[]?[]? _batchedSpecRows;
 
         // The verify window a step falls back to when every gated draft fits it.
         private const int NarrowBatchedWindow = 4;
@@ -3580,6 +3745,8 @@ namespace TensorSharp.Runtime.Scheduling
                 seq.PendingDeviceToken = null;
                 if (seq.PendingDevicePosition == seq.NumComputedTokens)
                 {
+                    // A device draw meets the same reasoning-close rule as a host sample.
+                    t = seq.GetOrCreateSampler().CloseInsteadOfStop(seq.OutputTokens, t);
                     dump?.Complete(t, "device-pending");
                     return t;
                 }
@@ -3610,8 +3777,10 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 if (seq.PendingDevicePosition == seq.NumComputedTokens)
                 {
-                    dump?.Complete(seq.PendingDeviceToken.Value, "device-pending");
-                    return seq.PendingDeviceToken.Value;
+                    // The close it may start is history-derived, so a later Take repeats it.
+                    int t = seq.GetOrCreateSampler().CloseInsteadOfStop(seq.OutputTokens, seq.PendingDeviceToken.Value);
+                    dump?.Complete(t, "device-pending");
+                    return t;
                 }
                 seq.PendingDeviceToken = null;   // stale: position moved under it
             }
@@ -3619,6 +3788,13 @@ namespace TensorSharp.Runtime.Scheduling
             dump?.Complete(sampled, "sampled");
             return sampled;
         }
+
+        /// <summary>The token the previous verify drew for this position, unless a reasoning close
+        /// requested since (the repetition guard, the templated-loop detector: both ask after the
+        /// step) forces another. The draw was never forwarded, so replacing it is free, and the close
+        /// then writes its whole hand-over text rather than starting after a token that left it.</summary>
+        private static int PendingVerifyDraw(SequenceState seq, int pending)
+            => seq.GetOrCreateSampler().TryGetForcedThinkingToken(seq.OutputTokens, out int forced) ? forced : pending;
 
         /// <summary>Draws the first output token of a sequence whose prompt has just been
         /// prefilled, so the engine can stream it before the step that forwards it. The draw

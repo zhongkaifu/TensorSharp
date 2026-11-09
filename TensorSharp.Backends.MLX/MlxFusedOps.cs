@@ -1617,6 +1617,9 @@ namespace TensorSharp.MLX
 
             /// <summary>The scan one row at a time, keeping each row's delta and conv state (see <see cref="KeepRowStates"/>).
             /// <paramref name="rawRows"/>: [seqLen, >= qkvDim] whose first qkvDim columns are the raw (pre-conv) qkv rows.</summary>
+            /// <summary>Every row's state from one dispatch (TS_MLX_GDN_ROWS_FUSED=0 runs a dispatch per row).</summary>
+            private static readonly bool RowsFused = Environment.GetEnvironmentVariable("TS_MLX_GDN_ROWS_FUSED") != "0";
+
             private void RunRowwise(
                 MlxNative.MlxArray rawRows, MlxNative.MlxArray q, MlxNative.MlxArray k, MlxNative.MlxArray v,
                 MlxNative.MlxArray g, MlxNative.MlxArray beta, int seqLen, int qkvDim, int tail,
@@ -1631,6 +1634,36 @@ namespace TensorSharp.MLX
                 nextDelta = default;
                 try
                 {
+                    if (RowsFused)
+                    {
+                        // One dispatch for every row's state (MlxNative.GatedDeltaRows); each row's state is a view of it.
+                        MlxNative.MlxArray rows = default;
+                        try
+                        {
+                            MlxNative.GatedDeltaRows(q, k, v, g, beta, deltaState, 1, seqLen, numKeyHeads, numValueHeads,
+                                headKeyDim, headValueDim, out output, out nextDelta, out rows);
+                            for (int r = 0; r < seqLen; r++)
+                            {
+                                MlxNative.MlxArray row = MlxNative.Slice(rows, new[] { r, 0, 0, 0, 0 },
+                                    new[] { r + 1, 1, numValueHeads, headValueDim, headKeyDim }, new[] { 1, 1, 1, 1, 1 });
+                                try { deltas[r] = MlxNative.Reshape(row, new[] { 1, numValueHeads, headValueDim, headKeyDim }); }
+                                finally { MlxNative.FreeArray(row); }
+                            }
+                        }
+                        finally { MlxNative.FreeArray(rows); }
+                        raw = MlxNative.Slice(rawRows, new[] { 0, 0 }, new[] { seqLen, qkvDim }, new[] { 1, 1 });
+                        raw3 = MlxNative.Reshape(raw, new[] { 1, seqLen, qkvDim });
+                        joined = MlxNative.ConcatenateAxis(convState, raw3, 1);
+                        for (int r = 0; r < seqLen; r++)
+                            convs[r] = MlxNative.Slice(joined, new[] { 0, r + 1, 0 }, new[] { 1, r + 1 + tail, qkvDim }, new[] { 1, 1, 1 });
+                        deltaOut = output;
+                        output = default;
+                        rowDelta = deltas;
+                        rowConv = convs;
+                        deltas = null;
+                        convs = null;
+                        return;
+                    }
                     MlxNative.MlxArray state = deltaState;
                     for (int r = 0; r < seqLen; r++)
                     {

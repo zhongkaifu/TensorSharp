@@ -102,7 +102,7 @@ public sealed class EngineMemoryPolicyTests : IDisposable
         EngineMemoryPolicy.Apply(Entry("qwen3.5-9b-iq4xs"), AppSettings.DesktopDefaults(), DeviceClass.Desktop);
         Assert.Null(Environment.GetEnvironmentVariable(EngineMemoryPolicy.KvInitialTokensVariable));
         Assert.Null(Environment.GetEnvironmentVariable(EngineMemoryPolicy.RetainedFusedCacheMaxVariable));
-        foreach (string id in new[] { "muse-glimmer-30b-q4kxl", "qwen3.8-27b-q4kxl", "qwen3.8-flash-next-iq1m", "qwen3.8-flash-next-q2kxl" })
+        foreach (string id in new[] { "muse-glimmer-30b-q4kxl", "qwen3.8-27b-iq3xxs", "qwen3.8-flash-next-iq1m", "qwen3.8-flash-next-q2kxl" })
             Assert.True(Entry(id).LeanCaches);
         Assert.All(ModelCatalog.BuiltIn.Where(m => m.Experimental && m.MinDeviceMemoryGB >= 24),
             m => Assert.True(m.LeanCaches));

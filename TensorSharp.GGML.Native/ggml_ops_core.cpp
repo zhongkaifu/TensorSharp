@@ -17,6 +17,7 @@
 
 #if defined(TSG_GGML_USE_METAL)
 #include "ggml-backend-impl.h"
+#include "ggml-metal/ggml-metal-context.h"   // ggml_metal_set_n_cb (metal_set_extra_command_buffers)
 #endif
 
 #if defined(__APPLE__) || defined(__linux__)
@@ -823,6 +824,17 @@ namespace tsg
     {
         return op != nullptr && g_backend != nullptr && ggml_backend_supports_op(g_backend, op);
     }
+
+#if defined(TSG_GGML_USE_METAL)
+    // ggml-metal encodes a graph on the calling thread's command buffer plus n extra ones (the backend starts with 1:
+    // the caller encodes MAX(64, n_nodes/10) nodes and commits while a second thread encodes the rest). Not exported
+    // by the backend interface; ggml-metal's own context function, ggml unchanged.
+    void metal_set_extra_command_buffers(ggml_backend_t backend, int n)
+    {
+        if (backend != nullptr && ggml_backend_is_metal(backend))
+            ggml_metal_set_n_cb(static_cast<ggml_metal_t>(backend->context), n);
+    }
+#endif
 
     // --- Size / layout queries ---
 
@@ -2975,15 +2987,6 @@ namespace tsg
                 && (tag == nullptr || std::strstr(tag, want) == nullptr))
                 return tsg::compute_graph(backend, graph);
         }
-        // TSG debug: identify the backend object actually executing graphs.
-        { static int tsg_dbg_n = 0;
-          if (tsg_dbg_n < 4) { tsg_dbg_n++;
-              FILE* f = fopen("/tmp/tsg_backend_id.log", "a");
-              if (f) { fprintf(f, "backend=%p name=%s compute=%p tag=%s n=%d\n",
-                               (void*)backend, ggml_backend_name(backend),
-                               (void*)nullptr, /* iface opaque here */
-                               tag ? tag : "?", graph ? ggml_graph_n_nodes(graph) : -1);
-                       fclose(f); } } }
         if (!graph_node_profile_enabled())
             return tsg::compute_graph(backend, graph);
 
@@ -3495,6 +3498,11 @@ TSG_EXPORT void TSGgml_Shutdown()
     // pool) for the host-side expert matmuls. It is independent of g_backend, so
     // it has to be released explicitly or the threads outlive the shutdown.
     tsg::moe_ffn_host_release();
+    // Accelerator expert tiers hold device buffers (Metal residency sets) that
+    // must go before the backend and device do.
+    tsg::moe_stage_prefetch_release();
+    tsg::moe_hot_tier_release();
+    tsg::host_expert_io_release();
     tsg::bonsai_clear_backend();
     tsg::free_spark_float32_backends();
 
@@ -3823,6 +3831,8 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     // Compact expert slots have their own allocations, so they must be dropped
     // even when the ordinary host-buffer cache had no copy of this pointer.
     tsg::host_moe_expert_cache_on_drop(ptr);
+    tsg::moe_hot_tier_on_drop(ptr);
+    tsg::host_expert_io_on_drop(ptr);
 
     // Same argument, one level up: the persistent whole-model graphs bake the
     // buffer we just freed into their nodes, so replaying one after this point is

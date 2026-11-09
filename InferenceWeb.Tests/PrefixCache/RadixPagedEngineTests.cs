@@ -47,6 +47,8 @@ public class RadixPagedEngineTests
         var seq = new SequenceState(id, prompt, 3, BlockSize, SamplingConfig.Greedy,
             cacheScope: scope, sharedPrefixTokens: publicTokens, cacheBreakpoints: breakpoints, mediaSpans: media);
         await engine.SubmitRequest(seq).Completion.WaitAsync(TimeSpan.FromSeconds(10));
+        // The finished state is kept after the completion is signalled; the tests read the tree next.
+        await engine.WhenStepSettledAsync().WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(SequenceStatus.FinishedLengthCapped, seq.Status);
         return seq;
     }

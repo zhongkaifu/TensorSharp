@@ -249,15 +249,18 @@ public class DeepSeek41ThinkingBudgetTests
         Assert.False(sampler.TryRequestThinkingClosure(history));
     }
 
+    /// <summary>A stop drawn before the loop threshold, with the reasoning still open, closes the
+    /// reasoning first (issue #338: such a turn used to end with no answer); the model's next stop,
+    /// after the close, ends the turn as usual.</summary>
     [Fact]
-    public async Task NaturalEosBeforeLoopThresholdKeepsItsOrdinaryStop()
+    public async Task NaturalEosInsideReasoning_ClosesTheReasoningFirst()
     {
         using var model = new ReasoningModel { EosAfterThoughtTokens = RepetitionGuard.MinSpan - 1 };
         using var engine = Engine(model);
         var handle = engine.SubmitRequest(Sequence("natural-eos", Config(model.Tokenizer, 400), 512));
         int[] output = await Collect(handle);
-        Assert.Equal(RepetitionGuard.MinSpan - 1, output.Length);
-        Assert.DoesNotContain(End, output);
+        Assert.Equal(RepetitionGuard.MinSpan, output.Length);
+        Assert.Equal(End, output[^1]);
         Assert.Equal("eos", (await handle.Completion).FinishReason);
     }
 
@@ -326,7 +329,7 @@ public class DeepSeek41ThinkingBudgetTests
     [Theory]
     [InlineData("deepseek41", 2, true)]
     [InlineData("deepseek_v41", 2, true)]
-    [InlineData("deepseek41", 0, false)]
+    [InlineData("deepseek41", 0, true)]   // no cap: installed without a limit, for the closes
     [InlineData("nemotron_h_moe", 2, true)]
     [InlineData("deepseek4", 2, false)]
     // Qwen 3.5/3.6/3.8 and GLM 5.x close their block at the budget too (they used to take the
@@ -337,7 +340,7 @@ public class DeepSeek41ThinkingBudgetTests
     [InlineData("qwen4exp", 2, true)]
     [InlineData("glm-dsa", 2, true)]
     [InlineData("glm5next", 2, true)]
-    [InlineData("qwen35", 0, false)]
+    [InlineData("qwen35", 0, true)]
     public void HostInstallsCapabilityOnlyForSupportedThinkingProtocol(string architecture, int budget, bool expected)
     {
         var tokenizer = new PieceTokenizer();

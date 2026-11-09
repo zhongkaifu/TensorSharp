@@ -121,6 +121,11 @@ public enum CatalogModalities
 /// chat request the way the Web UI sends the server's configured defaults.</summary>
 public sealed record CatalogSampling(float Temperature, int TopK, float TopP, float MinP);
 
+/// <summary>How an entry's own draft file speculates, for an entry whose drafter measured faster
+/// away from the engine's defaults: tokens drafted per step (the CLI's <c>--spec-draft</c>) and
+/// the draft-confidence gate (<c>--spec-pmin</c>; 0 verifies every draft).</summary>
+public sealed record CatalogDraftTuning(int MaxDraftTokens, float MinDraftProb);
+
 /// <summary>
 /// A built-in model the user can pick. Everything the app needs to obtain, size and
 /// load it lives here so the catalog is data, not code: the UI shows it, the store
@@ -229,6 +234,13 @@ public sealed record CatalogModel
     /// </summary>
     public bool LeanCaches { get; init; }
     public required CatalogSampling Sampling { get; init; }
+    /// <summary>
+    /// The draft window and confidence gate for the entry's <see cref="CatalogFileRole.Draft"/>
+    /// file, or null for the engine's defaults. Applied only while that file is what speculates
+    /// (<see cref="Hosting.SpeculationPolicy.ApplyDraftTuning(CatalogDraftTuning?, bool)"/>): the
+    /// numbers were measured with it, and n-gram's gate thresholds a different quantity.
+    /// </summary>
+    public CatalogDraftTuning? DraftTuning { get; init; }
     /// <summary>Whether the family has a thinking channel the app may enable.</summary>
     public bool SupportsThinking { get; init; }
     /// <summary>

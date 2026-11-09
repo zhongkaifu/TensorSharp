@@ -79,10 +79,17 @@ public sealed class MessageThinkingTokenBudget
             return true;
         }
 
+        internal bool IsThinkingOpen(IList<int> history)
+        {
+            Scan(history);
+            return _parser.IsThinkingChannelOpen;
+        }
+
         internal bool RequestClosure(IList<int> history, bool grammarActive)
         {
             Scan(history);
             if (grammarActive || Exhausted || !_parser.IsThinkingChannelOpen) return false;
+            if (_transitionFrom >= 0) return true;   // one under way keeps its place
             if (_transitions >= MaxTransitions) { _exhaustedAt = history.Count; return false; }
             _transitionFrom = history.Count;
             return true;

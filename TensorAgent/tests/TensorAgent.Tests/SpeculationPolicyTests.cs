@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using TensorAgent.Core;
+using TensorAgent.Core.Catalog;
 using TensorAgent.Core.Hosting;
 using TensorAgent.Core.Settings;
 using TensorSharp.Runtime.Speculative;
@@ -21,6 +22,8 @@ public sealed class SpeculationPolicyTests : IDisposable
     private readonly string? _savedEnabled = Environment.GetEnvironmentVariable(SpeculationPolicy.EnabledVariable);
     private readonly string? _savedType = Environment.GetEnvironmentVariable(SpeculationPolicy.TypeVariable);
     private readonly string? _savedDraft = Environment.GetEnvironmentVariable(SpeculationPolicy.DraftModelVariable);
+    private readonly string? _savedDraftTokens = Environment.GetEnvironmentVariable(SpeculationPolicy.DraftTokensVariable);
+    private readonly string? _savedMinDraftProb = Environment.GetEnvironmentVariable(SpeculationPolicy.MinDraftProbVariable);
 
     public SpeculationPolicyTests()
     {
@@ -34,6 +37,8 @@ public sealed class SpeculationPolicyTests : IDisposable
         Environment.SetEnvironmentVariable(SpeculationPolicy.EnabledVariable, _savedEnabled);
         Environment.SetEnvironmentVariable(SpeculationPolicy.TypeVariable, _savedType);
         Environment.SetEnvironmentVariable(SpeculationPolicy.DraftModelVariable, _savedDraft);
+        Environment.SetEnvironmentVariable(SpeculationPolicy.DraftTokensVariable, _savedDraftTokens);
+        Environment.SetEnvironmentVariable(SpeculationPolicy.MinDraftProbVariable, _savedMinDraftProb);
     }
 
     [Fact]
@@ -123,5 +128,59 @@ public sealed class SpeculationPolicyTests : IDisposable
         Assert.Equal(speculatesWithHead, SpeculationPolicy.SpeculatesWithDraftHead(catalogHead, attached));
         Assert.Equal(speculatesWithHead ? SpeculatorRegistry.Auto : SpeculatorRegistry.NGram,
             SpeculationPolicy.ChooseAlgorithm(SpeculationPolicy.SpeculatesWithDraftHead(catalogHead, attached), launchType: null));
+    }
+
+    /// <summary>
+    /// Qwen3.8 27B's DFlash2 drafter measured fastest at 7 drafts with every one verified
+    /// (config/qwen3.8-27b-metal-dflash2.json). The app hands those to the engine the way
+    /// the CLI's --spec-draft / --spec-pmin do, only while that drafter speculates, and
+    /// clears them for the next model so they never reach n-gram or another drafter.
+    /// </summary>
+    [Fact]
+    public void TheEntrysDraftTuningReachesTheEngineOnlyWhileItsDraftSpeculates()
+    {
+        var tuning = new CatalogDraftTuning(MaxDraftTokens: 7, MinDraftProb: 0f);
+
+        string note = SpeculationPolicy.ApplyDraftTuning(tuning, catalogDraftSpeculates: true,
+            launchDraftTokens: null, launchMinDraftProb: null);
+        Assert.Equal("7", Environment.GetEnvironmentVariable(SpeculationPolicy.DraftTokensVariable));
+        Assert.Equal("0", Environment.GetEnvironmentVariable(SpeculationPolicy.MinDraftProbVariable));
+        Assert.Equal("draft window 7, confidence gate 0", note);
+        SpeculationOptions options = SpeculationOptions.FromEnvironment();
+        Assert.Equal(7, options.MaxDraftTokens);
+        Assert.True(options.MaxDraftTokensExplicit);
+        Assert.Equal(0f, options.MinDraftProb);
+
+        // The drafter did not attach (n-gram instead): the defaults, not the tuning.
+        SpeculationPolicy.ApplyDraftTuning(tuning, catalogDraftSpeculates: false,
+            launchDraftTokens: null, launchMinDraftProb: null);
+        Assert.Null(Environment.GetEnvironmentVariable(SpeculationPolicy.DraftTokensVariable));
+        Assert.Null(Environment.GetEnvironmentVariable(SpeculationPolicy.MinDraftProbVariable));
+
+        // The next model declares none: what the previous one set is cleared.
+        SpeculationPolicy.ApplyDraftTuning(tuning, catalogDraftSpeculates: true,
+            launchDraftTokens: null, launchMinDraftProb: null);
+        string defaults = SpeculationPolicy.ApplyDraftTuning(null, catalogDraftSpeculates: true,
+            launchDraftTokens: null, launchMinDraftProb: null);
+        Assert.Null(Environment.GetEnvironmentVariable(SpeculationPolicy.DraftTokensVariable));
+        Assert.Null(Environment.GetEnvironmentVariable(SpeculationPolicy.MinDraftProbVariable));
+        Assert.Equal("draft window default, confidence gate default", defaults);
+    }
+
+    [Fact]
+    public void TheLaunchEnvironmentWinsOverTheEntrysDraftTuning()
+    {
+        Environment.SetEnvironmentVariable(SpeculationPolicy.DraftTokensVariable, "4");
+        Environment.SetEnvironmentVariable(SpeculationPolicy.MinDraftProbVariable, "0.5");
+        SpeculationPolicy.ApplyDraftTuning(new CatalogDraftTuning(7, 0f), catalogDraftSpeculates: true,
+            launchDraftTokens: "4", launchMinDraftProb: "0.5");
+        Assert.Equal("4", Environment.GetEnvironmentVariable(SpeculationPolicy.DraftTokensVariable));
+        Assert.Equal("0.5", Environment.GetEnvironmentVariable(SpeculationPolicy.MinDraftProbVariable));
+
+        // And a developer's value is not cleared when the next model declares nothing.
+        SpeculationPolicy.ApplyDraftTuning(null, catalogDraftSpeculates: false,
+            launchDraftTokens: "4", launchMinDraftProb: "0.5");
+        Assert.Equal("4", Environment.GetEnvironmentVariable(SpeculationPolicy.DraftTokensVariable));
+        Assert.Equal("0.5", Environment.GetEnvironmentVariable(SpeculationPolicy.MinDraftProbVariable));
     }
 }

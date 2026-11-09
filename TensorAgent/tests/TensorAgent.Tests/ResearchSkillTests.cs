@@ -69,7 +69,13 @@ public sealed class ResearchSkillTests : IDisposable
         // change here is that a request no longer has to carry a URL. If that stops
         // being said, the skill stops being chosen for "look this up".
         Assert.Contains("without being given any URLs", declared, StringComparison.OrdinalIgnoreCase);
-        Assert.True(declared.Length > 200, "one line is not enough for a skill this broad");
+        // The declaration is read on every turn, from a catalog that a phone-sized
+        // context shortens to its shortest rung (160 characters, see
+        // SkillPrompt.FitCatalogDescriptions). Any longer and the cut falls on the
+        // clauses that say when to use it; SkillCatalogVisibilityTests checks the line
+        // the model is actually shown.
+        Assert.True(declared.Length <= 160,
+            $"{declared.Length} characters: a phone-sized catalog would cut the description short");
 
         // And the scripts it documents have to be the scripts that exist.
         var documented = new HashSet<string>(StringComparer.Ordinal);

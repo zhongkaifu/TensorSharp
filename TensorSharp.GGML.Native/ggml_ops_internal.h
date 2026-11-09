@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <list>
 #include <memory>
@@ -908,6 +909,9 @@ namespace tsg
         int activation = 0;          // tsg MoE activation enum (see moe_ffn_host_experts)
         float oai_alpha = 1.702f;
         float oai_limit = 7.0f;
+        // activation 0 only: > 0 clamps before silu(gate) * up as DeepSeek V4.1 does
+        // (gate to (-inf, limit], up to [-limit, limit]); the host decode kernel honours it.
+        float swiglu_limit = 0.0f;
 
         int num_experts = 0;
         int n_used = 0;
@@ -934,7 +938,190 @@ namespace tsg
         //
         // Ignored outside tp_execute_plans.
         int tp_reduced = 0;
+
+        // --- priority-ranked accelerator tier (ggml_ops_moe_hot_tier.cpp) ---
+        // Non-null: routes whose expert the tier holds run on the accelerator
+        // inside the graph (host_moe_build_hot_part); the host computes only the
+        // rest. The seam writes hot_slot (I32 [n_used, seq], tier slots) and
+        // hot_weight (F32 [1, n_used, seq], the route weight or 0) before the
+        // segment that consumes them.
+        struct MoeHotTier* hot_tier = nullptr;
+        ggml_tensor* hot_slot = nullptr;
+        ggml_tensor* hot_weight = nullptr;
+        // Verify-width overlap (host_moe_build_hot_part with overlap_routes > 0):
+        // up to hot_b window misses a row are read in the background while the
+        // accelerator computes the routes it already holds, and computed after a
+        // second cut (an io_wait segment) through hot_slot_b / hot_weight_b
+        // (I32 [hot_b, seq] / F32 [1, hot_b, seq]).
+        int hot_b = 0;
+        ggml_tensor* hot_slot_b = nullptr;
+        ggml_tensor* hot_weight_b = nullptr;
+        // The second cut itself: no host experts, the seam only waits for the
+        // background reads (and is skipped, with no extra synchronize, when this
+        // pass deferred none). moe_in = sel_ids = weights = the tensor it ends at.
+        bool io_wait = false;
+        // The F32 [hidden, seq] sum of the tier's routes when it is ONE group (no
+        // io_wait cut): every node up to it in the next segment depends only on what
+        // the seam has already uploaded, never on moe_out, so the seam launches that
+        // slice on the accelerator before it computes the cold routes on the host and
+        // the two run at the same time (host_moe_execute_segments).
+        ggml_tensor* hot_out = nullptr;
+        // TensorSharp Metal (tsm/tsm_moe.h): the tier's routes computed at the seam by the grouped expert kernels,
+        // into this pinned F32 [hidden, seq] input, instead of MUL_MAT_ID in the next segment. Null otherwise.
+        ggml_tensor* tsm_hot = nullptr;
+        // The NEXT layer's router logits from this layer's FFN input (F32 [num_experts, seq], pinned), computed in
+        // this segment so the seam can read the next tier's predicted misses ahead (moe_hot_tier_prefetch,
+        // Strata's read-ahead). Null when the next layer has no window or TS_MOE_TIER_PREFETCH=0.
+        ggml_tensor* pred_next = nullptr;
+
+        // A device operation in place of host experts (no host work, no transfers): the cut follows the last of
+        // device_inputs in graph order, and device_op encodes its work on the accelerator's queue right after that
+        // segment is submitted, before the next one, which reads what it writes (ggml_ops_qwen4exp.cpp's prompt GDN
+        // layers on TensorSharp's Metal kernels). False with set_last_error on a failure.
+        std::function<bool(ggml_backend_t)> device_op;
+        std::vector<ggml_tensor*> device_inputs;
+        // What it writes (tensors bound outside the allocator): no node before the cut may read them, which
+        // host_moe_build_segment_ends checks - a node order that put a reader first would read stale values.
+        std::vector<ggml_tensor*> device_outputs;
     };
+
+    // One layer's accelerator expert slots: `fixed` slots hold the layer's
+    // most-routed experts for the tier's lifetime; the rest form a window that
+    // the seams fill on demand (least recently used first), reading the expert
+    // straight into the slot. slot_of maps a routed id to its slot or -1.
+    // Owned by the registry in ggml_ops_moe_hot_tier.cpp.
+    struct MoeHotTier
+    {
+        ggml_backend_t backend = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        bool cpu_visible = false;         // slots writable from the host (unified memory)
+        const void* source[3] = {};       // mapped gate / up / down stacks
+        int type[3] = {};
+        std::size_t stride[3] = {};       // bytes of one expert per part
+        std::size_t offset[3] = {};       // part offsets inside `buffer`
+        int num_experts = 0, count = 0, fixed = 0;
+        std::vector<std::int32_t> slot_of;
+        std::vector<std::int32_t> expert_of;
+        std::vector<std::uint64_t> last_use, step_used;
+        std::uint64_t clock = 0, step = 0;
+        std::uint64_t hits = 0, misses = 0, overflow = 0;
+        std::uint64_t deferred = 0;       // misses read in the background (verify overlap)
+        // Read-ahead (moe_hot_tier_prefetch): window slots being read for the predicted routes of this layer's next
+        // step, settled when that step's seam starts; and the slots it filled, until that step counts its hits.
+        std::vector<int> prefetch_pending;
+        std::vector<int> prefetched;
+        // Adaptive fixed slots (TS_MOE_TIER_ADAPT, discrete VRAM): decayed route counts per
+        // expert; every few seams the hottest host-served experts take the coldest slots.
+        std::vector<float> heat;
+        std::uint64_t adapt_calls = 0;
+    };
+
+    using MulMatIdFn = ggml_tensor* (*)(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*);
+    MoeHotTier* moe_hot_tier_find(const void* gate_source);
+    // Prompt-batch expert prefetch (ggml_ops_moe.cpp): the next offloaded layer's stacks staged on a thread.
+    bool moe_stage_prefetch_enabled();
+    void moe_stage_prefetch_start(const HostMoeSegment& hm);
+    void moe_stage_prefetch_join();
+    bool moe_stage_prefetch_take(const void* gate, const void* up, const void* down, ggml_backend_buffer_t& buf,
+                                 std::size_t offset[3], std::size_t bytes[3]);
+    long long moe_stage_prefetch_hits();
+    void moe_stage_prefetch_release();
+    // Decode / verify routes the route tail skip dropped in this process (ggml_ops_moe_hot_tier.cpp).
+    long long moe_tail_skipped_routes();
+    // Strata's read-ahead into a tier's window (ggml_ops_moe_hot_tier.cpp): the experts each row's top
+    // moe_tier_prefetch_k() predicted logits name that `tier` does not hold are read into its least recently used
+    // window slots in the background; the tier's next seam waits for them. Exact: a slot holds the expert's bytes.
+    int moe_tier_prefetch_k();
+    void moe_hot_tier_prefetch(MoeHotTier& tier, const float* logits, int T);
+
+    // A buffer type over `inner` that keeps the one buffer its owner freed last and hands it to the owner's next
+    // allocation it serves (ggml_ops_buffer_reuse.cpp): a graph slot rebuilt for every prompt chunk reuses its arena
+    // instead of mapping and making resident a new one each time. One per owner; release it after the owner's
+    // allocator is freed (buffers still out are freed when they come back).
+    struct ReuseBufferType;
+    ReuseBufferType* reuse_buffer_type_new(ggml_backend_buffer_type_t inner);
+    ggml_backend_buffer_type_t reuse_buffer_type_get(ReuseBufferType* type);
+    ggml_backend_buffer_type_t reuse_buffer_type_inner(const ReuseBufferType* type);
+    // Frees the kept buffer.
+    void reuse_buffer_type_trim(ReuseBufferType* type);
+    void reuse_buffer_type_release(ReuseBufferType* type);
+    void moe_hot_tier_bind(const MoeHotTier& tier, int part, ggml_tensor* tensor);
+    // Builds the accelerator half of a tiered layer: allocates hm's hot_slot /
+    // hot_weight inputs and returns the F32 [hidden, seq] sum of the tier's
+    // routes. The caller adds it to hm.moe_out.
+    // With overlap_routes > 0 (and a window the host can write) the tier's routes
+    // are built as two groups split by a second cut: *wait_out receives that cut's
+    // io_wait segment, which the caller appends right after hm; graph is where
+    // the first group is expanded so it precedes the cut.
+    ggml_tensor* host_moe_build_hot_part(ggml_context* ctx, HostMoeSegment& hm, ggml_tensor* moe_in,
+        MoeHotTier& tier, MulMatIdFn mul_mat_id = nullptr, int overlap_routes = 0,
+        ggml_cgraph* graph = nullptr, HostMoeSegment* wait_out = nullptr);
+    // At the seam: uploads hot_slot / hot_weight and returns the routes left for
+    // the host, padded to one count per row (weight 0). cold_used == 0 means the
+    // tier held every route.
+    bool host_moe_split_hot_routes(const HostMoeSegment& hm, const std::int32_t* ids, const float* weights,
+        std::vector<std::int32_t>& cold_ids, std::vector<float>& cold_weights, std::vector<std::uint8_t>& cold_pad,
+        int& cold_used);
+    void moe_routing_count(const void* gate_source, int num_experts, const std::int32_t* ids, std::size_t count);
+    bool moe_record_device_routes();
+    void moe_set_record_device_routes(bool on);
+    void moe_hot_tier_on_drop(const void* ptr);
+    void moe_hot_tier_release();
+    // Explicitly read host expert cache (ggml_ops_moe_expert_io.cpp): resolves
+    // each mapped expert slice to a cached copy, reading misses together; a
+    // pointer outside every registered mapping resolves to itself.
+    void host_expert_io_resolve(const void* const* sources, const std::size_t* bytes, int count,
+        const std::uint8_t** resolved);
+    // Read slices ahead into cache slots on a background team and return at once
+    // (Strata's lookahead); the next resolve waits for the batch before reading any
+    // slot. Slices already cached are skipped. Callers hold the resolver's lock
+    // (host_moe_prefetch_experts takes it). Stats: slices read ahead, and how many
+    // of them a later resolve used.
+    void host_expert_io_prefetch(const void* const* sources, const std::size_t* bytes, int count);
+    void host_expert_io_prefetch_stats(std::uint64_t& reads, std::uint64_t& used);
+    // Prefill streaming: read `ranges` (offsets from source_base, a registered
+    // mapping) straight into CPU-visible accelerator memory at destination_base +
+    // offset, in parallel. False when source_base is not registered.
+    // Read expert slices (mapped addresses) into `destinations`, the misses of
+    // one seam together; a slice outside every registered mapping is copied from
+    // the mapping. False when a read failed (the destination is then undefined).
+    bool host_expert_io_read_slices(const void* const* sources, const std::size_t* bytes,
+        std::uint8_t* const* destinations, int count);
+    // The same reads on a background team: returns at once; wait_async blocks
+    // until they are done (false: some read failed, and the destinations were
+    // then copied from the mapping instead). One batch is in flight at a time.
+    void host_expert_io_read_slices_async(const void* const* sources, const std::size_t* bytes,
+        std::uint8_t* const* destinations, int count);
+    bool host_expert_io_async_pending();
+    bool host_expert_io_wait_async();
+    // Fixed-size rows of a registered mapping, one pread each, packed into dst (TSGgml_HostReadRows).
+    bool host_expert_io_read_rows(const std::uint8_t* table, std::size_t row_bytes, const std::int32_t* rows, int count,
+        std::uint8_t* dst);
+    bool host_expert_io_read_ranges(const void* source_base,
+        const std::vector<std::pair<std::size_t, std::size_t>>& ranges, std::uint8_t* destination_base);
+    // Rows a tiered layer splits between its accelerator tier and the host
+    // decode kernel (in blocks of its row limit); wider batches stream the whole
+    // layer instead, which explicit reads make cheap from this width up.
+    constexpr int kHostMoeHotTierMaxRows = 64;
+    // A tier with on-demand window slots in host-writable memory (unified memory) keeps splitting prompt chunks up to
+    // this width: its fixed slots hold nearly every route a prompt makes and the window reads the rest, while streaming
+    // first stages the whole layer (~0.7 GB a layer of Flash Next's ISTA Q2_0, ~1.3 s a chunk on an M5 Pro, whatever
+    // its width). Measured cold TTFT, 88-473 token prompts: 1.35-1.4 s streamed, 0.33-0.76 s split; 900 / 1770 /
+    // 3500 tokens: 1.76-2.0 / 2.7 / 5.2 s against 1.33-1.55 / 2.55 / 5.1-5.3 s.
+    constexpr int kHostMoeHotTierWindowMaxRows = 2048;
+    // The widest span `tier` still splits: TS_HOST_MOE_TIER_MAX_ROWS, else kHostMoeHotTierWindowMaxRows for a
+    // host-writable tier with window slots, and otherwise (a discrete GPU's tier has no window, so a wide span's misses
+    // run on the host) the span width just below the one the seam starts streaming at (moe_stream_rows_threshold),
+    // and never below kHostMoeHotTierMaxRows. A span the tier does not split and the seam does not stream runs every
+    // route on the host: with the split ending at 64 rows and streaming starting at 128, ggml_cuda Flash Next spent
+    // 1.1-1.4 s on a 73-76 token prompt (0.27-0.29 s at 64) and 2.2 s on 120 tokens; split up to 127 rows, 0.55-0.77 s.
+    // A wider span streams the layer. Read per graph build.
+    int host_moe_tier_max_rows(const MoeHotTier& tier);
+    // The span width from which an offloaded MoE layer streams its routed experts to the accelerator.
+    int moe_stream_rows_threshold();
+    bool host_expert_io_active();
+    void host_expert_io_on_drop(const void* ptr);
+    void host_expert_io_release();
 
     struct TpRankPlan
     {
@@ -1180,6 +1367,9 @@ namespace tsg
     // gap needs before anything is rewritten.
     bool graph_node_profile_enabled();
     ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag);
+#if defined(TSG_GGML_USE_METAL)
+    void metal_set_extra_command_buffers(ggml_backend_t backend, int n);
+#endif
 
     // Platform convolution offload for the VAEs (MPSGraph on Metal, cuDNN on
     // CUDA). ggml lowers conv2d to im2col + mul_mat, which dominates a VAE graph
@@ -1279,10 +1469,15 @@ namespace tsg
         const std::int32_t* sel_ids = nullptr;
         const float* weights = nullptr;
     };
+    // after_split (tiered layers only): called once the tier's slot ids and weights
+    // are uploaded and before the host computes the cold routes, so the caller can
+    // launch the accelerator's half (HostMoeSegment::hot_out) to run alongside.
+    bool host_moe_overlap_enabled();
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
                                   HostMoeStagedInputs* staged = nullptr,
                                   bool allow_device_stream = true,
-                                  bool* output_on_device = nullptr);
+                                  bool* output_on_device = nullptr,
+                                  void (*after_split)(void*) = nullptr, void* after_split_ctx = nullptr);
 
     // One-token routed experts on the host (ggml_ops_host_moe_decode.cpp): ggml's
     // CPU dot kernels on a team woken once per layer instead of a ggml graph per
@@ -1291,12 +1486,23 @@ namespace tsg
     // CPU dot traits); the caller then keeps the graph path. TS_HOST_MOE_DECODE=0
     // turns it off for A/B runs.
     bool host_moe_decode_experts(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
-                                 const float* weights, float* out);
+                                 const float* weights, float* out, const std::uint8_t* skip = nullptr);
     // Bounded independent decode rows (1..8), one team dispatch per layer.
     // Dot products and expert summation order remain identical to solo decode.
     // Unsupported input returns false without writing any output row.
+    // `ahead`: experts (of ahead->hm's layer, possibly another one) whose gate/up/down
+    // slices are read ahead into the explicitly read cache (host_expert_io_prefetch)
+    // once this call's own slices are resolved, so the reads overlap its compute.
+    // Keyed exactly as a later call resolves them; a no-op when the cache is off.
+    struct HostMoePrefetch
+    {
+        const HostMoeSegment* hm = nullptr;
+        const std::int32_t* ids = nullptr;
+        int count = 0;
+    };
     bool host_moe_decode_experts_rows(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
-                                     const float* weights, float* out);
+                                     const float* weights, float* out, const std::uint8_t* skip = nullptr,
+                                     const HostMoePrefetch* ahead = nullptr);
     // Opt-in Qwen4Exp CUDA expert tier: 1 computed, 0 unsupported/disabled,
     // -1 execution failed. Owns bounded compact quantized slots and graphs.
     // x/weights both null reads hm.moe_in/hm.weights through CUDA row copies;
@@ -1309,6 +1515,9 @@ namespace tsg
     void prefetch_mapped_ranges(const std::uint8_t* base,
                                const std::vector<std::pair<std::size_t, std::size_t>>& ranges);
     void host_moe_decode_release();
+    // Monotonic totals of the host expert kernel (host_moe_decode_experts_rows): time in ns,
+    // calls, and expert slots it computed. For telemetry.
+    void host_moe_decode_counters(long long* ns, long long* calls, long long* slots);
     void host_moe_upload_segment(const HostMoeSegment& hm, const float* data);
     void host_moe_zero_segment(const HostMoeSegment& hm);
 
@@ -1951,6 +2160,11 @@ struct Q4eQsaInputs
     ggml_tensor* block_positions = nullptr;
     ggml_tensor* query_positions = nullptr;
     ggml_tensor* bias = nullptr;
+    // Incremental pooling (Q4eQsaGraph::pooled): the complete blocks this step's cells belong to - their slots, member
+    // cells and positions - padded with a scratch slot.
+    ggml_tensor* new_blocks = nullptr;
+    ggml_tensor* new_block_cells = nullptr;
+    ggml_tensor* new_block_positions = nullptr;
 };
 
 struct Q4eQsaGraph
@@ -1960,6 +2174,10 @@ struct Q4eQsaGraph
     ggml_tensor* cache = nullptr;
     // Optional test-only outputs, never retained by production graphs.
     std::vector<ggml_tensor*>* probes = nullptr;
+    // The layer's persistent pooled keys [head_dim, blocks + 1] (Q4eSeqStateEntry::aux), or null: pool every block.
+    // With `incremental`, only the inputs' new blocks are pooled and written; else every block is, and written too.
+    ggml_tensor* pooled = nullptr;
+    bool incremental = false;
 };
 
 // A weight binding resolved through the resident cache, remembered so a
@@ -1995,7 +2213,23 @@ struct Q4eBinder
 // GDN write-back sources: the caller decides how they reach the persistent
 // state (copied out after the compute, or cpy-expanded in graph after the
 // reads).
-struct Q4eGdnWriteback { ggml_tensor* tail; ggml_tensor* new_state; };
+struct Q4eGdnWriteback
+{
+    ggml_tensor* tail;
+    ggml_tensor* new_state;
+    // Verify row capture (q4e_capture_rows): the conv input [hist + T, conv_dim]
+    // and the T state snapshots (most recent first), else null.
+    ggml_tensor* conv_in = nullptr;
+    ggml_tensor* snaps = nullptr;
+    // Set when the builder ran the recurrence on TensorSharp's Metal kernels (a token span building with device
+    // operations, tsm::gdn_prompt_encode): the [value_dim, T] tensor they write. tail and new_state stay null then, as
+    // the kernels update the state in place.
+    ggml_tensor* device_y = nullptr;
+};
+// ReplaySSM-style verify commit: while set, a 2-8 row span keeps every row's
+// recurrent state (GDN conv + SSM, PLE conv history) so the accepted prefix can
+// be committed without restoring and re-forwarding it.
+bool q4e_capture_rows(int T);
 
 // Arena override for q4e_nodes_attn: the KV lives in a slot-stable 2D arena
 // [head_dim, (n_slots+1) * n_head_kv * cap] instead of the holder's resident
@@ -2027,6 +2261,14 @@ struct Q4eSeqStateEntry
     ggml_backend_buffer_t buf = nullptr;
     std::size_t bytes = 0;
     bool ready = false;
+    // A QSA layer's pooled indexer keys (one F32 row per complete block), derived from `buf`'s raw keys and kept so a
+    // step pools only the blocks it completes. Valid while aux_ready and the span itself last wrote the raw keys up to
+    // aux_upto: any other writer (an upload, the concurrent-decode arena) leaves aux_upto behind the next step's start,
+    // and that step pools every block again.
+    ggml_backend_buffer_t aux = nullptr;
+    std::size_t aux_bytes = 0;
+    bool aux_ready = false;
+    std::int64_t aux_upto = -1;
 };
 
 // Create-or-grow the active rank's entry for `key` (the span/per-layer path).
@@ -2062,7 +2304,8 @@ ggml_tensor* q4e_nodes_ffn(
     const TSGgmlQwen4ExpFfnArgs* a, ggml_tensor* res_in,
     int n_embd, int hc, int hc_low_rank, int T,
     int n_expert, int n_expert_used, int n_ff, int n_ff_sh, float eps,
-    ggml_cgraph* graph = nullptr, std::vector<tsg::HostMoeSegment>* host_moe = nullptr, int layer = -1);
+    ggml_cgraph* graph = nullptr, std::vector<tsg::HostMoeSegment>* host_moe = nullptr, int layer = -1,
+    const TSGgmlQwen4ExpFfnArgs* next_a = nullptr);
 
 ggml_tensor* q4e_nodes_gdn(
     ggml_context* ctx, Q4eBinder& bnd,

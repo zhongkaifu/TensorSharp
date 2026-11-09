@@ -296,6 +296,28 @@ namespace TensorSharp.Models
         /// gives. The table is ~320 M rows and is read 16 rows per token, so it is
         /// dequantized row by row from host memory rather than made device-resident.
         /// </summary>
+        /// <summary>A prompt-sized gather of the on-disk n-gram table reads its rows explicitly - one pread each on the
+        /// native I/O team, packed in list order (TSGgml_HostReadRows) - instead of faulting each row's page through
+        /// the mapping: M5 Pro, a 4096-token chunk's 65K rows took 1.1-3.1 s as faults. Returns the packed rows (row i
+        /// at i * row bytes), or null to read the mapping (a decode-sized gather, rows the reader cannot serve,
+        /// <c>TS_PLE_EXPLICIT_READ=0</c>).</summary>
+        private const int PleExplicitReadMinRows = 1024;
+        private byte[] _plePackedRows;
+
+        private unsafe byte* ReadPleRowsPacked(QuantizedWeight qw, int[] rows, long qRowBytes)
+        {
+            if (!_pleTableOnDisk || rows.Length < PleExplicitReadMinRows || !qw.IsFileBacked
+                || Environment.GetEnvironmentVariable("TS_PLE_EXPLICIT_READ") == "0")
+                return null;
+            long need = rows.Length * qRowBytes;
+            if (need > int.MaxValue)
+                return null;
+            if (_plePackedRows == null || _plePackedRows.Length < need)
+                _plePackedRows = GC.AllocateUninitializedArray<byte>((int)need, pinned: true);
+            byte* packed = (byte*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref _plePackedRows[0]);
+            return TensorSharp.GGML.GgmlBasicOps.HostReadRows(qw.Data, qRowBytes, rows, (IntPtr)packed) ? packed : null;
+        }
+
         private unsafe void GatherPleRows(Tensor dest, int[] rows, int seqLen)
         {
             const string name = "per_layer_token_embd.weight";
@@ -317,11 +339,13 @@ namespace TensorSharp.Models
                 long baseA = (long)qw.Data;
                 long dstA = (long)GetFloatPtr(flat);
                 var ggmlType = qw.GgmlType;
+                long packedA = (long)ReadPleRowsPacked(qw, rows, qRowBytes);
                 void DequantRow(int i)
                 {
                     NativeDequant.DequantizeToFloat32Native(
                         ggmlType,
-                        (IntPtr)((byte*)baseA + (long)rows[i] * qRowBytes),
+                        packedA != 0 ? (IntPtr)((byte*)packedA + (long)i * qRowBytes)
+                            : (IntPtr)((byte*)baseA + (long)rows[i] * qRowBytes),
                         (IntPtr)((float*)dstA + (long)i * dim),
                         dim);
                 }
@@ -366,6 +390,121 @@ namespace TensorSharp.Models
                 $"{_pleHeads} rows a token" + (advised ? " (random-access advice)." : "."));
         }
 
+        private Task _pleWarm;
+        private System.Threading.CancellationTokenSource _pleWarmCancel;
+
+        /// <summary>
+        /// Read the table into the page cache in the background once the model is ready,
+        /// as the direct-CUDA executor does: on a network filesystem every uncached row is
+        /// a storage round trip (92-120 ms on a geesefs mount), so a cold table caps decode.
+        /// Only where the host reports how much it can keep cached (Linux, cgroup-aware) and
+        /// that is room for the table: on a machine that cannot hold it as well as the
+        /// experts (the larger-than-memory Mac) the read would only evict them.
+        /// </summary>
+        /// <remarks>
+        /// The routed experts the host serves are warmed with it, most-routed first: on a discrete
+        /// GPU every route its tier does not hold is computed on the host from the mapping, and on
+        /// a network mount a cold expert is several round trips inside a decode step. Measured on a
+        /// 5090 VM with the GGUF on geesefs: the first answer after a cold load stalled on exactly
+        /// these faults. Everything is read through the checkpoint's shared handles (an open() on
+        /// such a mount drops the file's whole page cache), within what the cgroup can keep cached.
+        /// </remarks>
+        private void StartPleTableWarm()
+        {
+            long available = MappedTableWarm.HostMemoryAvailable();
+            if (_gguf == null || available <= 0)
+                return;
+            long room = available - MappedTableWarm.Headroom;
+            var ranges = new List<(IntPtr Pointer, long Bytes)>();
+            long pleBytes = 0, expertBytes = 0;
+            int experts = 0;
+            if (_pleTableOnDisk && _quantWeights.TryGetValue("per_layer_token_embd.weight", out var qw)
+                && qw.RawBytes <= room)
+            {
+                ranges.Add((qw.Data, qw.RawBytes));
+                pleBytes = qw.RawBytes;
+                room -= qw.RawBytes;
+            }
+            foreach (var (pointer, bytes) in HostServedExpertSlices())
+            {
+                if (bytes > room) break;
+                ranges.Add((pointer, bytes));
+                room -= bytes;
+                expertBytes += bytes;
+                experts++;
+            }
+            if (ranges.Count == 0)
+                return;
+            experts /= 3;
+            string what = (pleBytes > 0 ? "the PLE n-gram table" : "") + (pleBytes > 0 && experts > 0 ? " and " : "")
+                + (experts > 0 ? $"{experts} host-served experts" : "");
+            _pleWarmCancel = new System.Threading.CancellationTokenSource();
+            var cancel = _pleWarmCancel.Token;
+            GgufFile gguf = _gguf;
+            _pleWarm = System.Threading.Tasks.Task.Run(() =>
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                try
+                {
+                    long read = gguf.WarmMappedRanges(ranges, GgufFile.DefaultWarmThreads(), cancel);
+                    if (!cancel.IsCancellationRequested)
+                        Console.Error.WriteLine($"[qwen4exp] warmed {read / (double)(1L << 30):F1} GiB of {what} " +
+                            $"in {sw.Elapsed.TotalSeconds:F1}s");
+                }
+                catch (OperationCanceledException) { }
+            });
+            // TS_HOST_WARM_WAIT=1: the load returns only once the warm is done (benchmarks that must
+            // not time the first requests against a cold network mount).
+            if (Environment.GetEnvironmentVariable("TS_HOST_WARM_WAIT") == "1")
+            {
+                Console.WriteLine($"[qwen4exp] warming {(pleBytes + expertBytes) / (double)(1L << 30):F1} GiB of {what} " +
+                    "before serving (TS_HOST_WARM_WAIT=1)");
+                _pleWarm.Wait();
+                return;
+            }
+            Console.WriteLine($"[qwen4exp] warming {(pleBytes + expertBytes) / (double)(1L << 30):F1} GiB of {what} " +
+                "in the background (the first answers read the rest from the model files)");
+        }
+
+        /// <summary>The (pointer, bytes) slices of every routed expert the host computes, one per
+        /// gate/up/down part, the most-routed first when a routing profile covers the model.</summary>
+        private IEnumerable<(IntPtr Pointer, long Bytes)> HostServedExpertSlices()
+        {
+            if (_expertOnHost == null || _backend == BackendType.GgmlMetal)
+                yield break;   // Metal reads host experts explicitly, into slots (ConfigureHostExpertIo)
+            var order = new List<(ulong Count, int Layer, int Expert)>();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!IsExpertLayerOnHost(l) || !TryGetLayerExperts(l, out _, out _, out _))
+                    continue;
+                var held = new HashSet<int>(_tierExperts?[l] ?? Array.Empty<int>());
+                ReadOnlySpan<ulong> counts = _routingProfile != null && _routingProfile.CoversLayers(new[] { l })
+                    ? _routingProfile.Counts(l) : default;
+                for (int e = 0; e < _numExperts; e++)
+                    if (!held.Contains(e))
+                        order.Add((counts.IsEmpty ? 0 : counts[e], l, e));
+            }
+            order.Sort((a, b) => b.Count.CompareTo(a.Count));
+            foreach (var (_, l, e) in order)
+            {
+                TryGetLayerExperts(l, out var gate, out var up, out var down);
+                foreach (var w in new[] { gate, up, down })
+                    yield return (w.Data + (nint)(e * w.PerExpertRawBytes), w.PerExpertRawBytes);
+            }
+        }
+
+        private void StopPleTableWarm()
+        {
+            if (_pleWarmCancel == null)
+                return;
+            _pleWarmCancel.Cancel();
+            try { _pleWarm?.Wait(); }
+            catch (AggregateException) { }
+            _pleWarmCancel.Dispose();
+            _pleWarmCancel = null;
+            _pleWarm = null;
+        }
+
         /// <summary>
         /// Gather the n-gram rows into a raw [T * hidden] float buffer - the span
         /// uploads it as a graph input. A row read from disk costs a page fault, so a
@@ -384,11 +523,13 @@ namespace TensorSharp.Models
                 long baseA = (long)qw.Data;
                 long dstA = (long)dst;
                 var ggmlType = qw.GgmlType;
+                long packedA = (long)ReadPleRowsPacked(qw, rows, qRowBytes);
                 void DequantRow(int i)
                 {
                     NativeDequant.DequantizeToFloat32Native(
                         ggmlType,
-                        (IntPtr)((byte*)baseA + (long)rows[i] * qRowBytes),
+                        packedA != 0 ? (IntPtr)((byte*)packedA + (long)i * qRowBytes)
+                            : (IntPtr)((byte*)baseA + (long)rows[i] * qRowBytes),
                         (IntPtr)((float*)dstA + (long)i * dim),
                         dim);
                 }

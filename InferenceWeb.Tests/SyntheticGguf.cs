@@ -16,7 +16,7 @@ namespace InferenceWeb.Tests;
 /// </summary>
 internal static class SyntheticGguf
 {
-    public enum GgmlType { F32 = 0, F16 = 1, Q4_0 = 2, Q5_1 = 7, Q8_0 = 8, Q4_K = 12, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, BF16 = 30, MXFP4 = 39 }
+    public enum GgmlType { F32 = 0, F16 = 1, Q4_0 = 2, Q5_1 = 7, Q8_0 = 8, Q4_K = 12, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, BF16 = 30, MXFP4 = 39, Q2_0 = 42 }
 
     private const int Q8Block = 32;
     private const int Q8BlockBytes = 2 + Q8Block;   // f16 scale + 32 int8
@@ -39,6 +39,7 @@ internal static class SyntheticGguf
         GgmlType.IQ2_S => (256, 82),     // f16 d, qs[64] (32 grid bytes + 32 sign bytes), qh[8], scales[8]
         GgmlType.IQ1_S => (256, 50),     // f16 d, qs[32] grid bytes, u16 qh[8] (grid high bits, scale, delta sign)
         GgmlType.MXFP4 => (32, 17),      // u8 E8M0 exponent e, 16 bytes of 4-bit E2M1 codes
+        GgmlType.Q2_0 => (64, 18),       // f16 d, 16 bytes of 2-bit codes (d * (code - 1))
         _ => (1, 0),
     };
 

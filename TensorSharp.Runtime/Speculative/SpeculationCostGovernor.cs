@@ -157,6 +157,34 @@ namespace TensorSharp.Runtime.Speculative
         private bool _specWins = true;
 
         /// <summary>
+        /// Long-run evidence: every measured step's (ticks, tokens) on each side, token-weighted and decayed by this
+        /// much per further step of the same side (a half-life of ~23 steps). Verdicts compare these, not the round
+        /// alone: a speculative step emits between one token and a whole window, so eight steps - three on a re-probe -
+        /// are a noisy sample, and on Qwen3.8 Flash Next (M5 Pro, DFlash2) single unlucky windows parked speculation
+        /// for up to 371 steps of a request whose speculative steps cost 13-27 ms a token against 30-35 plain. Greedy
+        /// long generation 40-43 -> 46-47 tok/s without that, sampled (temperature 1.0) decode after a 4K prompt
+        /// 34.5 -> 45. A loss that holds still flips the evidence within a dozen steps: a drafter at a quarter of the
+        /// acceptance and four times a plain step's cost parks after ~7, one barely over the margin after ~11.
+        /// </summary>
+        private const double EvidenceDecay = 0.97;
+        private double _evSpecTicks, _evSpecTokens, _evPlainTicks, _evPlainTokens;
+
+        private void AddSpecEvidence(long ticks, int tokens)
+        {
+            _evSpecTicks = _evSpecTicks * EvidenceDecay + ticks;
+            _evSpecTokens = _evSpecTokens * EvidenceDecay + tokens;
+        }
+
+        private void AddPlainEvidence(long ticks, int tokens)
+        {
+            _evPlainTicks = _evPlainTicks * EvidenceDecay + ticks;
+            _evPlainTokens = _evPlainTokens * EvidenceDecay + tokens;
+        }
+
+        private double EvidenceSpecMs => _evSpecTokens > 0 ? _evSpecTicks * 1000.0 / Stopwatch.Frequency / _evSpecTokens : 0;
+        private double EvidencePlainMs => _evPlainTokens > 0 ? _evPlainTicks * 1000.0 / Stopwatch.Frequency / _evPlainTokens : 0;
+
+        /// <summary>
         /// Measure speculation against plain decoding at runtime and skip drafting
         /// while it is measurably slower. On by default; set false to force the
         /// drafter on for A/B measurement (TS_SPEC_ADAPTIVE=0 does the same from
@@ -276,12 +304,12 @@ namespace TensorSharp.Runtime.Speculative
                     _winHead = (_winHead + 1) % WinWindow;
                     if (_winCount < WinWindow)
                         _winCount++;
+                    AddSpecEvidence(elapsedTicks, tokensEmitted);
                     if (_winCount == WinWindow)
                     {
-                        long ticks = 0, tokens = 0;
-                        for (int i = 0; i < WinWindow; i++) { ticks += _winTicks[i]; tokens += _winTokens[i]; }
-                        SpecMsPerToken = MsPerToken(ticks, tokens);
-                        if (SpecMsPerToken > PlainMsPerToken * SpecWinMargin)
+                        // Judged on the long-run evidence the window has just been added to, not on the window alone.
+                        SpecMsPerToken = EvidenceSpecMs;
+                        if (SpecMsPerToken > EvidencePlainMs * SpecWinMargin)
                         {
                             // The win stopped being one: park with the usual backoff.
                             _specWins = false;
@@ -302,6 +330,7 @@ namespace TensorSharp.Runtime.Speculative
                 _specTicks += elapsedTicks;
                 _specTokens += tokensEmitted;
                 _specSamples++;
+                AddSpecEvidence(elapsedTicks, tokensEmitted);
                 if (_specWorstTokens == 0 ||
                     MsPerToken(elapsedTicks, tokensEmitted) > MsPerToken(_specWorstTicks, _specWorstTokens))
                 {
@@ -342,7 +371,11 @@ namespace TensorSharp.Runtime.Speculative
                     specMs = Math.Min(specMs, MsPerToken(keptTicks, keptTokens));
             }
 
-            _specWins = specMs <= MsPerToken(_plainTicks, _plainTokens) * SpecWinMargin;
+            // A win on either the round (worst sample trimmed) or the long-run evidence: a short re-probe that lands on
+            // an unlucky stretch does not overrule the steps before it, and a real loss shows in both.
+            double plainMs = MsPerToken(_plainTicks, _plainTokens);
+            _specWins = specMs <= plainMs * SpecWinMargin
+                || (EvidenceSpecMs > 0 && EvidencePlainMs > 0 && EvidenceSpecMs <= EvidencePlainMs * SpecWinMargin);
             if (_specWins) Wins++; else Losses++;
             _consecutiveLosses = _specWins ? 0 : _consecutiveLosses + 1;
             _parkedRemaining = _specWins
@@ -364,6 +397,7 @@ namespace TensorSharp.Runtime.Speculative
             _plainTicks += elapsedTicks;
             _plainTokens += tokensEmitted;
             _plainSamples++;
+            AddPlainEvidence(elapsedTicks, tokensEmitted);
             PlainMsPerToken = MsPerToken(_plainTicks, _plainTokens);
         }
 
@@ -380,6 +414,7 @@ namespace TensorSharp.Runtime.Speculative
             _consecutiveLosses = 0;
             _specWins = true;
             Wins = Losses = ParkedSteps = 0;
+            _evSpecTicks = _evSpecTokens = _evPlainTicks = _evPlainTokens = 0;
             // A fresh governor has measured nothing; leaving the last run's
             // rates behind would make a per-turn log report numbers from the
             // previous turn's context length.

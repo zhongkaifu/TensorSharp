@@ -156,6 +156,24 @@ namespace TensorSharp.Runtime
         /// <summary>True when the model is stored across more than one GGUF file.</summary>
         public bool IsSplit => _shards.Count > 0;
 
+        /// <summary>The read-only mappings behind this model's tensor pointers: one per
+        /// file (this one, then its shards), each mapped from file offset 0, so a
+        /// tensor pointer minus its <c>Base</c> is its file offset. Files not mapped
+        /// yet are mapped now. Native readers use this to fetch tensor bytes with
+        /// explicit reads instead of page faults.</summary>
+        public unsafe IReadOnlyList<(IntPtr Base, long Length, string Path)> MappedRegions()
+        {
+            var regions = new List<(IntPtr, long, string)>(_shards.Count + 1);
+            EnsureMappedView();
+            regions.Add(((IntPtr)_mappedBase, _stream.Length, _path));
+            foreach (var shard in _shards)
+            {
+                shard.EnsureMappedView();
+                regions.Add(((IntPtr)shard._mappedBase, shard._stream.Length, shard._path));
+            }
+            return regions;
+        }
+
         /// <summary>
         /// Open the remaining files of a split GGUF and merge their tensor tables into
         /// this one, so callers see a single flat <see cref="Tensors"/> table and read
@@ -1050,6 +1068,7 @@ namespace TensorSharp.Runtime
             _mappedView = null;
             _mappedFile?.Dispose();
             _mappedFile = null;
+            DisposeReadHandles();
             _stream?.Dispose();
             _stream = null!;
         }
