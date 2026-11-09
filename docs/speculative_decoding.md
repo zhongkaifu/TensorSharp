@@ -1231,8 +1231,15 @@ replaces the DEFAULT only - it never overrides a number the operator typed. So o
 measurement predates the replayed commit (`TS_Q35_VERIFY_REPLAY`), which no longer keeps
 snapshot slots on `ggml_cuda`; it has not been repeated on that path. On `ggml_metal`, n-gram's default
 for a dense, mostly IQ4_XS Qwen 3.5-family trunk is 12 drafts, a 13-row verify;
-that Metal path keeps only the last three recurrent states rather than one per
-row, and its recorded before/after comparison produced identical tokens (see
+a `ggml_metal` verify wider than eight rows now replays the accepted prefix at
+commit, as `ggml_cuda` does, instead of keeping the last three recurrent states
+(until 2026-11-09, an earlier rejection there restored and re-forwarded the
+accepted prefix; `TS_Q35_VERIFY_REPLAY=0` restores that). On an M5 Pro,
+Qwen3.8-27B-UD-IQ3_XXS, n-gram 12 on three copy prompts (1,110 tokens, identical
+text): 42.2 -> 46.6 tok/s, rollback 27.7 -> 0 ms per verify step, the 13-row
+verify graph 496 -> 97 MB; a DSpine block of 16 (six prompts, identical text):
+15.5 -> 18.6 tok/s, rollback 85.9 -> 0 ms per step, the 16-row graph 509 -> 119 MB.
+The earlier three-state comparison produced identical tokens too (see
 [Building against unchanged ggml](perf/ggml-without-patches.md)).
 
 **Workaround until it is fixed:** `--spec-draft 7` or lower, or

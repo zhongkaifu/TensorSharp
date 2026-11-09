@@ -338,9 +338,10 @@ Three algorithms share the `SpeculativeExecution` core; the design is in
 | `ngram` | No weights: suffix matching over the sequence's own tokens. |
 
 On rejection a Qwen 3.5-family trunk restores its GatedDeltaNet recurrent state
-(the GGML fused verify keeps a snapshot per row, only the last three on a
-`ggml_metal` verify wider than eight rows, and commits the accepted one on the
-device; an earlier rejection restores and re-forwards the accepted prefix); Gemma 4
+(the GGML fused verify keeps a snapshot per row on a `ggml_metal` verify of up to
+eight rows and commits the accepted one on the device; a wider `ggml_metal` verify,
+and every `ggml_cuda` verify, keeps the recurrence inputs instead and replays the
+accepted prefix at commit); Gemma 4
 rewinds its attention-KV position and puts back the sliding-window rows the verify
 overwrote (its drafter is stateless given `(token, h)`); GLM-5.3-Flash restores a
 snapshot of its KDA state (a device copy on the native executor) and re-forwards
