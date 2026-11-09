@@ -1862,6 +1862,33 @@ passes:
 | a warp sum per row | 232-245 tok/s | 10.02-10.03 ms | 13.36 / 11.05-11.07 ms |
 | one reduce-scatter (default) | 234-248 tok/s | 9.89-9.94 ms | 13.28-13.30 / 10.93-10.96 ms |
 
+#### The MTP catch-up reads the prompt's streams on the device, 2026-11-09
+
+After a long prompt, the first draft window runs the MTP block over the prompt's last 4,000 rows. Only their K/V are
+written: the KV-only catch-up. On the RTX 5090 that took 22.6 ms, about 8% of a 4K answer's decode time, and only
+4.6 ms of it was kernels. The rest was the rows' trunk streams, 4,000 x 10,240 floats (164 MB). They came back from the
+runtime's host copy: each ubatch was copied into pinned memory, then host to device. The same values were still on the
+device.
+
+The last prompt group's output streams stay in the group's buffer until the next group runs. The engine now records
+which positions of which sequence that buffer holds. The catch-up takes those rows' streams device to device, and only
+the rest from the host (`TS_Q4E_MTP_D2D`, on).
+
+The values are the ones the host's copy holds, so the drafts are the same bits. In
+`TheMtpCatchUpAfterAGroupedPrompt_ReadsTheLastGroupsStreams_BitForBit` (a 300-token prompt in 192-row groups, catch-up
+from position 150), the last group's 108 rows come from the device. The chain picks the same tokens with the same
+confidences.
+
+Engine bench, one build, two alternating passes per arm (decode tok/s of the three requests). Every greedy output is
+identical across arms, and every check passes:
+
+| catch-up rows | 4,000-row catch-up | long_prompt_4k | long_prompt_16k |
+| --- | --- | --- | --- |
+| from the host (`TS_Q4E_MTP_D2D=0`) | 21.6-22.7 ms | 177 / 186 / 206, 170 / 185 / 241 | 206 / 230 / 257, 209 / 234 / 256 |
+| from the device (default) | 5.8-6.1 ms | 179 / 198 / 219, 176 / 201 / 255 | 208 / 257 / 277, 211 / 253 / 278 |
+
+The prompt forward still copies the streams to the host (164 MB D2H) for the runtime, so TTFT is unchanged.
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
