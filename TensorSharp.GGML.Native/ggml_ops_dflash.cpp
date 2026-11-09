@@ -269,11 +269,58 @@ namespace
     // out side-major then tap then group (the order the checkpoint exports).
     // shift_idx[t] / tap_mask[t] are the constant row-shift and boundary mask for
     // tap t (both null at t == 0, which is never shifted and never masked).
+    // The all-taps form of df_grouped_conv on Metal (TS_DFLASH_METAL_FUSE=0 keeps one chain per tap). A tap costs the
+    // per-tap form five to seven dependent kernels, and a draft runs four convolutions; this form runs every tap in
+    // each kernel (~7 a convolution with 3 taps instead of 18) with the same products and sums in the same order.
+    bool df_metal_fused_conv()
+    {
+        const char* e = std::getenv("TS_DFLASH_METAL_FUSE");
+        return g_backend_type == BACKEND_TYPE_METAL && !(e != nullptr && e[0] == '0');
+    }
+
+    // shift_all [n * taps] I32 / mask_all [1, n, taps] F32, tap-major: row r of tap t reads row shift_all[t*n + r]
+    // (r - t, or 0), kept where mask_all is 1. Tap 0 is the identity, unmasked.
+    ggml_tensor* df_grouped_conv_all_taps(
+        ggml_context* ctx, ggml_tensor* x, ggml_tensor* coef, ggml_tensor* base_w,
+        int side, int taps, int groups, int group_size, int hidden, int n,
+        ggml_tensor* shift_all, ggml_tensor* mask_all)
+    {
+        // Every tap's shifted, masked rows: [hidden, n, taps]. (x * 1 and x * 0 are exact, so masking before the
+        // product gives the per-tap form's values.)
+        ggml_tensor* xs = ggml_reshape_3d(ctx, ggml_get_rows(ctx, x, shift_all), hidden, n, taps);
+        xs = ggml_mul(ctx, xs, mask_all);
+        // base[side][t] for every tap, [hidden, 1, taps], over the rows.
+        ggml_tensor* b3 = ggml_view_3d(ctx, base_w, hidden, 1, taps,
+                                       static_cast<std::size_t>(hidden) * sizeof(float),
+                                       static_cast<std::size_t>(hidden) * sizeof(float),
+                                       static_cast<std::size_t>(side) * taps * hidden * sizeof(float));
+        ggml_tensor* brep = ggml_repeat_4d(ctx, b3, hidden, n, taps, 1);
+        // delta[r][side][t][g]: coef's side block viewed [G, taps, n], laid out [G, n, taps].
+        ggml_tensor* dv = ggml_view_3d(ctx, coef, groups, taps, n,
+                                       static_cast<std::size_t>(groups) * sizeof(float), coef->nb[1],
+                                       static_cast<std::size_t>(side) * taps * groups * sizeof(float));
+        ggml_tensor* d = ggml_cont(ctx, ggml_permute(ctx, dv, 0, 2, 1, 3));
+        ggml_tensor* kern = ggml_add(ctx, ggml_reshape_4d(ctx, brep, group_size, groups, n, taps),
+                                     ggml_reshape_4d(ctx, d, 1, groups, n, taps));            // [S, G, n, taps]
+        ggml_tensor* term = ggml_mul(ctx, kern, ggml_reshape_4d(ctx, xs, group_size, groups, n, taps));
+        term = ggml_reshape_3d(ctx, term, hidden, n, taps);
+        // Taps summed in order (an ADD chain ggml-metal runs as one kernel).
+        ggml_tensor* out = ggml_view_2d(ctx, term, hidden, n, term->nb[1], 0);
+        for (int tap = 1; tap < taps; tap++)
+            out = ggml_add(ctx, out, ggml_view_2d(ctx, term, hidden, n, term->nb[1],
+                                                  static_cast<std::size_t>(tap) * term->nb[2]));
+        return out;
+    }
+
     ggml_tensor* df_grouped_conv(
         ggml_context* ctx, ggml_tensor* x, ggml_tensor* coef, ggml_tensor* base_w,
         int side, int taps, int groups, int group_size, int hidden, int n,
-        ggml_tensor** shift_idx, ggml_tensor** tap_mask)
+        ggml_tensor** shift_idx, ggml_tensor** tap_mask,
+        ggml_tensor* shift_all = nullptr, ggml_tensor* mask_all = nullptr)
     {
+        if (shift_all != nullptr && mask_all != nullptr && taps >= 2)
+            return df_grouped_conv_all_taps(ctx, x, coef, base_w, side, taps, groups, group_size, hidden, n,
+                                            shift_all, mask_all);
         ggml_tensor* x3 = ggml_reshape_3d(ctx, x, group_size, groups, n);   // [S, G, n]
         ggml_tensor* out = nullptr;
         for (int tap = 0; tap < taps; tap++)
@@ -917,7 +964,29 @@ static int df_draft_block(
         std::vector<ggml_tensor*> conv_mask(use_conv ? conv_taps : 0, nullptr);
         std::vector<std::vector<std::int32_t>> conv_shift_data(use_conv ? conv_taps : 0);
         std::vector<std::vector<float>> conv_mask_data(use_conv ? conv_taps : 0);
-        for (int tap = 1; tap < (use_conv ? conv_taps : 0); tap++)
+        // Metal takes every tap at once (df_grouped_conv_all_taps): the same shifts and masks, tap-major, and no
+        // per-tap inputs (an input no node reads is never allocated).
+        const bool conv_all_taps = use_conv && conv_taps >= 2 && df_metal_fused_conv();
+        ggml_tensor* conv_shift_all = nullptr;
+        ggml_tensor* conv_mask_all = nullptr;
+        std::vector<std::int32_t> conv_shift_all_data;
+        std::vector<float> conv_mask_all_data;
+        if (conv_all_taps)
+        {
+            conv_shift_all = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, static_cast<std::int64_t>(b) * conv_taps);
+            conv_mask_all = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, b, conv_taps);
+            ggml_set_input(conv_shift_all);
+            ggml_set_input(conv_mask_all);
+            conv_shift_all_data.resize(static_cast<std::size_t>(b) * conv_taps);
+            conv_mask_all_data.resize(static_cast<std::size_t>(b) * conv_taps);
+            for (int tap = 0; tap < conv_taps; tap++)
+                for (int r = 0; r < b; r++)
+                {
+                    conv_shift_all_data[static_cast<std::size_t>(tap) * b + r] = r >= tap ? r - tap : 0;
+                    conv_mask_all_data[static_cast<std::size_t>(tap) * b + r] = r >= tap ? 1.0f : 0.0f;
+                }
+        }
+        for (int tap = 1; tap < (use_conv && !conv_all_taps ? conv_taps : 0); tap++)
         {
             conv_shift[tap] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, b);
             conv_mask[tap] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, b);
@@ -992,7 +1061,7 @@ static int df_draft_block(
                 attn_conv_coef = df_scaled(ctx, ggml_mul_mat(ctx, lt.attn_conv_proj, h), scales, 6 + 9 * l + 7);   // [2*taps*G, b]
                 h = df_grouped_conv(ctx, h, attn_conv_coef, lt.attn_conv_base, /*side=*/0,
                                     conv_taps, conv_num_groups, conv_group_size, hidden_size, b,
-                                    conv_shift.data(), conv_mask.data());
+                                    conv_shift.data(), conv_mask.data(), conv_shift_all, conv_mask_all);
             }
 
             ggml_tensor* q = df_scaled(ctx, ggml_mul_mat(ctx, lt.q_w, h), scales, 6 + 9 * l + 0);
@@ -1027,7 +1096,7 @@ static int df_draft_block(
             {
                 attn_out = df_grouped_conv(ctx, attn_out, attn_conv_coef, lt.attn_conv_base, /*side=*/1,
                                            conv_taps, conv_num_groups, conv_group_size, hidden_size, b,
-                                           conv_shift.data(), conv_mask.data());
+                                           conv_shift.data(), conv_mask.data(), conv_shift_all, conv_mask_all);
             }
             ggml_tensor* ffn_inp = ggml_add(ctx, attn_out, inpL);
 
@@ -1038,7 +1107,7 @@ static int df_draft_block(
                 ffn_conv_coef = df_scaled(ctx, ggml_mul_mat(ctx, lt.ffn_conv_proj, fh), scales, 6 + 9 * l + 8);
                 fh = df_grouped_conv(ctx, fh, ffn_conv_coef, lt.ffn_conv_base, /*side=*/0,
                                      conv_taps, conv_num_groups, conv_group_size, hidden_size, b,
-                                     conv_shift.data(), conv_mask.data());
+                                     conv_shift.data(), conv_mask.data(), conv_shift_all, conv_mask_all);
             }
             ggml_tensor* gate = df_scaled(ctx, ggml_mul_mat(ctx, lt.gate_w, fh), scales, 6 + 9 * l + 4);
             ggml_tensor* up   = df_scaled(ctx, ggml_mul_mat(ctx, lt.up_w, fh), scales, 6 + 9 * l + 5);
@@ -1048,7 +1117,7 @@ static int df_draft_block(
             {
                 down = df_grouped_conv(ctx, down, ffn_conv_coef, lt.ffn_conv_base, /*side=*/1,
                                        conv_taps, conv_num_groups, conv_group_size, hidden_size, b,
-                                       conv_shift.data(), conv_mask.data());
+                                       conv_shift.data(), conv_mask.data(), conv_shift_all, conv_mask_all);
             }
             inpL = ggml_add(ctx, down, ffn_inp);
         }
@@ -1250,12 +1319,19 @@ static int df_draft_block(
         ggml_backend_tensor_set(ids_t, block_ids, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
         ggml_backend_tensor_set(pos_t, positions, 0, static_cast<std::size_t>(b) * sizeof(std::int32_t));
         ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
-        for (int tap = 1; tap < (use_conv ? conv_taps : 0); tap++)
+        for (int tap = 1; tap < (use_conv && !conv_all_taps ? conv_taps : 0); tap++)
         {
             ggml_backend_tensor_set(conv_shift[tap], conv_shift_data[tap].data(), 0,
                 static_cast<std::size_t>(b) * sizeof(std::int32_t));
             ggml_backend_tensor_set(conv_mask[tap], conv_mask_data[tap].data(), 0,
                 static_cast<std::size_t>(b) * sizeof(float));
+        }
+        if (conv_all_taps)
+        {
+            ggml_backend_tensor_set(conv_shift_all, conv_shift_all_data.data(), 0,
+                conv_shift_all_data.size() * sizeof(std::int32_t));
+            ggml_backend_tensor_set(conv_mask_all, conv_mask_all_data.data(), 0,
+                conv_mask_all_data.size() * sizeof(float));
         }
 
         if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
@@ -1547,7 +1623,30 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
         std::vector<ggml_tensor*> conv_mask(use_conv ? conv_taps : 0, nullptr);
         std::vector<std::vector<std::int32_t>> conv_shift_data(use_conv ? conv_taps : 0);
         std::vector<std::vector<float>> conv_mask_data(use_conv ? conv_taps : 0);
-        for (int tap = 1; tap < (use_conv ? conv_taps : 0); tap++)
+        // As the single draft (df_grouped_conv_all_taps on Metal), each lane's rows shifted within its own block.
+        const bool conv_all_taps = use_conv && conv_taps >= 2 && df_metal_fused_conv();
+        ggml_tensor* conv_shift_all = nullptr;
+        ggml_tensor* conv_mask_all = nullptr;
+        std::vector<std::int32_t> conv_shift_all_data;
+        std::vector<float> conv_mask_all_data;
+        if (conv_all_taps)
+        {
+            conv_shift_all = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, static_cast<std::int64_t>(nb) * conv_taps);
+            conv_mask_all = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, nb, conv_taps);
+            ggml_set_input(conv_shift_all);
+            ggml_set_input(conv_mask_all);
+            conv_shift_all_data.resize(static_cast<std::size_t>(nb) * conv_taps);
+            conv_mask_all_data.resize(static_cast<std::size_t>(nb) * conv_taps);
+            for (int tap = 0; tap < conv_taps; tap++)
+                for (int lane = 0; lane < L; lane++)
+                    for (int r = 0; r < b; r++)
+                    {
+                        const std::size_t i = static_cast<std::size_t>(tap) * nb + static_cast<std::size_t>(lane) * b + r;
+                        conv_shift_all_data[i] = lane * b + (r >= tap ? r - tap : 0);
+                        conv_mask_all_data[i] = r >= tap ? 1.0f : 0.0f;
+                    }
+        }
+        for (int tap = 1; tap < (use_conv && !conv_all_taps ? conv_taps : 0); tap++)
         {
             conv_shift[tap] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
             conv_mask[tap] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, nb);
@@ -1623,7 +1722,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
                 attn_conv_coef = df_scaled(ctx, ggml_mul_mat(ctx, lt.attn_conv_proj, h), scales, 6 + 9 * l + 7);
                 h = df_grouped_conv(ctx, h, attn_conv_coef, lt.attn_conv_base, /*side=*/0,
                                     conv_taps, conv_num_groups, conv_group_size, hidden_size, nb,
-                                    conv_shift.data(), conv_mask.data());
+                                    conv_shift.data(), conv_mask.data(), conv_shift_all, conv_mask_all);
             }
             ggml_tensor* q = df_scaled(ctx, ggml_mul_mat(ctx, lt.q_w, h), scales, 6 + 9 * l + 0);
             ggml_tensor* kk = df_scaled(ctx, ggml_mul_mat(ctx, lt.k_w, h), scales, 6 + 9 * l + 1);
@@ -1666,7 +1765,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
             {
                 attn_out = df_grouped_conv(ctx, attn_out, attn_conv_coef, lt.attn_conv_base, /*side=*/1,
                                            conv_taps, conv_num_groups, conv_group_size, hidden_size, nb,
-                                           conv_shift.data(), conv_mask.data());
+                                           conv_shift.data(), conv_mask.data(), conv_shift_all, conv_mask_all);
             }
             ggml_tensor* ffn_inp = ggml_add(ctx, attn_out, inpL);
             ggml_tensor* fh = ggml_mul(ctx, ggml_rms_norm(ctx, ffn_inp, eps), lt.ffn_norm_w);
@@ -1676,7 +1775,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
                 ffn_conv_coef = df_scaled(ctx, ggml_mul_mat(ctx, lt.ffn_conv_proj, fh), scales, 6 + 9 * l + 8);
                 fh = df_grouped_conv(ctx, fh, ffn_conv_coef, lt.ffn_conv_base, /*side=*/0,
                                      conv_taps, conv_num_groups, conv_group_size, hidden_size, nb,
-                                     conv_shift.data(), conv_mask.data());
+                                     conv_shift.data(), conv_mask.data(), conv_shift_all, conv_mask_all);
             }
             ggml_tensor* gate = df_scaled(ctx, ggml_mul_mat(ctx, lt.gate_w, fh), scales, 6 + 9 * l + 4);
             ggml_tensor* up   = df_scaled(ctx, ggml_mul_mat(ctx, lt.up_w, fh), scales, 6 + 9 * l + 5);
@@ -1686,7 +1785,7 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
             {
                 down = df_grouped_conv(ctx, down, ffn_conv_coef, lt.ffn_conv_base, /*side=*/1,
                                        conv_taps, conv_num_groups, conv_group_size, hidden_size, nb,
-                                       conv_shift.data(), conv_mask.data());
+                                       conv_shift.data(), conv_mask.data(), conv_shift_all, conv_mask_all);
             }
             inpL = ggml_add(ctx, down, ffn_inp);
         }
@@ -1841,10 +1940,15 @@ TSG_EXPORT int TSGgml_DFlashDraftBlockBatched(
 
         host_read_barrier();
         binder.flush();
-        for (int tap = 1; tap < (use_conv ? conv_taps : 0); tap++)
+        for (int tap = 1; tap < (use_conv && !conv_all_taps ? conv_taps : 0); tap++)
         {
             ggml_backend_tensor_set(conv_shift[tap], conv_shift_data[tap].data(), 0, static_cast<std::size_t>(nb) * sizeof(std::int32_t));
             ggml_backend_tensor_set(conv_mask[tap], conv_mask_data[tap].data(), 0, static_cast<std::size_t>(nb) * sizeof(float));
+        }
+        if (conv_all_taps)
+        {
+            ggml_backend_tensor_set(conv_shift_all, conv_shift_all_data.data(), 0, conv_shift_all_data.size() * sizeof(std::int32_t));
+            ggml_backend_tensor_set(conv_mask_all, conv_mask_all_data.data(), 0, conv_mask_all_data.size() * sizeof(float));
         }
         slot->ctx = ctx; slot->galloc = persist_galloc; slot->graph = graph;
         slot->ids = ids_t; slot->pos = pos_t; slot->mask = mask_t; slot->anchors = anchors_t;
