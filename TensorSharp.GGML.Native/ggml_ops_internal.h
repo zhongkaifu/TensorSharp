@@ -1368,12 +1368,31 @@ namespace tsg
     // op type owns the graph — which is exactly what a "we are 0.7x llama.cpp"
     // gap needs before anything is rewritten.
     bool graph_node_profile_enabled();
-    ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag);
+    // Nodes a caller executes itself, outside ggml (a vendor library, a TensorSharp
+    // kernel). `wants` picks them from the graph before it runs; `run` executes one
+    // synchronously after everything before it has finished, and returns false to
+    // decline, in which case ggml runs that node after all (or, for a
+    // GGML_OP_CUSTOM node ggml cannot run, the graph fails with GGML_STATUS_FAILED). Sources and the result
+    // keep the buffers ggml's allocator gave them, so nothing else changes.
+    struct NodeOffload
+    {
+        bool (*wants)(const ggml_tensor* node, void* ctx) = nullptr;
+        bool (*run)(ggml_tensor* node, void* ctx) = nullptr;
+        void* ctx = nullptr;
+    };
+    // With `offload`, the profiler times an offloaded node under "<OP>:offload".
+    ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag,
+                                       const NodeOffload* offload = nullptr);
     // The node profile's buckets (op, or op:type[:shape]) as totals: a snapshot at a pass's start, and the pass's own
     // share printed as the difference at its end (a prompt pass's segments by op and projection).
     using NodeProfileTotals = std::map<std::string, std::pair<double, long long>>;
     NodeProfileTotals node_profile_totals();
     void node_profile_print_since(const NodeProfileTotals& before, const char* label, int top);
+    // Runs `graph` with `offload`'s nodes executed by the caller and the stretches
+    // between them as ggml graph views (the mechanism graph_compute_fast_conv uses),
+    // through the node profiler when TS_GGML_NODE_PROFILE is set.
+    ggml_status graph_compute_offload(ggml_backend_t backend, ggml_cgraph* graph, const char* tag,
+                                      const NodeOffload& offload);
 #if defined(TSG_GGML_USE_METAL)
     void metal_set_extra_command_buffers(ggml_backend_t backend, int n);
 #endif

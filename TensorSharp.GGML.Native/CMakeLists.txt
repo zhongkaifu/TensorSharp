@@ -452,6 +452,10 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu ggml_ops_deepseek41_tp_cuda.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_host_pin.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_minimax_msa.cu)
+    # MiniMax-H3's wide Q4_K projections on cuBLAS BF16 (tsg_cuda_q4k_gemm.cu).
+    list(APPEND TSG_GGMLOPS_SOURCES tsg_cuda_q4k_gemm.cu)
+    # MiniMax-H3's fused DiT stages: attention prep, modulation, gated residual (tsg_cuda_h3_fused.cu).
+    list(APPEND TSG_GGMLOPS_SOURCES tsg_cuda_h3_fused.cu)
     # Wan / Qwen-Image VAE convolutions on cuDNN (see tsg_cuda_cudnn_conv.cu).
     # Optional: the VAE falls back to ggml's im2col+GEMM when cuDNN is absent.
     #
@@ -470,6 +474,8 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     if (TSG_CUDNN_INCLUDE_DIR)
         message(STATUS "TensorSharp: cuDNN headers at ${TSG_CUDNN_INCLUDE_DIR}; VAE convolutions will use cuDNN when its runtime is present")
         list(APPEND TSG_GGMLOPS_SOURCES tsg_cuda_cudnn_conv.cu)
+        # MiniMax-H3's long unmasked attention on cuDNN's fused SDPA (tsg_cuda_cudnn_sdpa.cu).
+        list(APPEND TSG_GGMLOPS_SOURCES tsg_cuda_cudnn_sdpa.cu)
         set(TSG_HAVE_CUDNN ON)
         # Where the runtime should look first. Points at the provisioned copy when
         # that is what supplied the headers; TS_CUDNN_DIR still overrides at run time.
