@@ -69,6 +69,9 @@ namespace TensorSharp.Cuda
         public int Ne2;
         public long RowBytes;
         public string Name;
+        /// <summary>The decode-size matmul keeps the decode-once dense kernels for this weight whatever else could take
+        /// it (an engine's Q8_0 copy of a BF16 matrix, a draft block's weights; see <see cref="DeviceWeight.DecodeOnce"/>).</summary>
+        public bool DecodeOnce;
         public bool IsValid => HostPtr != IntPtr.Zero || Source != null;
         public long TotalBytes => (long)Ne1 * Math.Max(1, Ne2) * RowBytes;
     }
@@ -84,6 +87,9 @@ namespace TensorSharp.Cuda
         public long RowBytes;
         /// <summary>An engine's optional F16 copy for prefill-size GEMMs (zero when it has none).</summary>
         public IntPtr PrefillF16;
+        /// <summary>Decode-size calls keep the decode-once dense kernels (Dsv4Kernels.DenseQ81Rows) for this weight at every
+        /// row count, so its arithmetic is one whatever the window or batch (from <see cref="CudaWeightDesc.DecodeOnce"/>).</summary>
+        public bool DecodeOnce;
         /// <summary>A stacked expert weight whose experts do not all sit in one device block: a device
         /// table of one address per expert (a VRAM slot or pinned host memory the GPU reads over the
         /// bus). Zero means <see cref="Ptr"/> is the whole stack.</summary>
@@ -189,7 +195,7 @@ namespace TensorSharp.Cuda
                     });
                 }
             }
-            return new DeviceWeight { Ptr = p, Type = qw.GgmlType, Ne0 = qw.Ne0, Ne1 = qw.Ne1, RowBytes = qw.RowBytes };
+            return new DeviceWeight { Ptr = p, Type = qw.GgmlType, Ne0 = qw.Ne0, Ne1 = qw.Ne1, RowBytes = qw.RowBytes, DecodeOnce = qw.DecodeOnce };
         }
 
         /// <summary>

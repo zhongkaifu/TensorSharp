@@ -1583,6 +1583,22 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
                 $"step {i}: confidence {afterReset.Probs[i]:R} vs {fresh.Probs[i]:R}");
     }
 
+    /// <summary>The MTP block's Q8_0 dense weights keep the decode-once dense kernels (DeviceWeight.DecodeOnce), so the Q8_0
+    /// pair matvec never runs them: its catch-ups and draft steps are 1-5 rows, where the pair was no faster and from three
+    /// rows 1.2-2x slower on the RTX 5090. The trunk's Q8_0 weights keep the pair.</summary>
+    [CudaFact]
+    public void TheMtpBlocksQ8_0Weights_KeepTheDecodeOnceKernels()
+    {
+        string path = Fixture(indexerTopK: 2048);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 2048);
+        using ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp);
+        var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+        var (q8, once) = engine.MtpQ8_0Weights;
+        _output.WriteLine($"MTP block: {q8} Q8_0 dense weights, {once} on the decode-once kernels");
+        Assert.True(q8 > 0, "the synthetic MTP block has no Q8_0 dense weights");
+        Assert.Equal(q8, once);
+    }
+
     /// <summary>A decode step's hyper-connection scatter fused with the next mixer's first pass computes what the two
     /// launches compute: the prompt and every decode step, bit for bit, with QSA past its width.</summary>
     [CudaFact]
