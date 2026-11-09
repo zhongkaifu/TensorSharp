@@ -243,6 +243,11 @@ namespace tsg
         // host_expert_io_prefetch: slices read ahead into cache slots on a team of their
         // own; the next resolve settles the batch before it reads any slot.
         IoTeam* g_prefetch_team = nullptr;
+        // host_expert_io_read_rows: a prompt chunk's PLE rows (65K scattered ~row-sized reads at 4K tokens) on a wider
+        // team of their own. Each pread waits ~90 us on the SSD, so the rows' rate is the reads in flight: 12 moved
+        // 128K rows/s (M5 Pro, a 4K prompt's gather 506 ms), 32 -> 272 ms, 64 -> 250 ms. The seams' team keeps its 12:
+        // every call wakes the whole team, which a decode step's few window reads would pay for.
+        IoTeam* g_rows_team = nullptr;
         std::vector<const void*> g_prefetch_keys;
         std::uint64_t g_prefetch_reads = 0, g_prefetch_used = 0;
 
@@ -515,13 +520,14 @@ namespace tsg
                 static_cast<off_t>(src - last->base)});
         }
         g_read_bytes += static_cast<std::uint64_t>(count) * row_bytes;
-        if (g_team == nullptr)
+        if (g_rows_team == nullptr)
         {
-            const char* e = std::getenv("TS_HOST_MOE_IO_THREADS");
+            // TS_PLE_IO_THREADS: reads in flight for PLE rows (default 32).
+            const char* e = std::getenv("TS_PLE_IO_THREADS");
             const int n = e != nullptr ? std::atoi(e) : 0;
-            g_team = new IoTeam(n > 0 && n <= 64 ? n - 1 : 11);
+            g_rows_team = new IoTeam(n > 0 && n <= 128 ? n - 1 : 31);
         }
-        return g_team->run(s_requests);
+        return g_rows_team->run(s_requests);
 #else
         (void)table; (void)row_bytes; (void)rows; (void)count; (void)dst;
         return false;
@@ -665,6 +671,7 @@ namespace tsg
         IoTeam* team = nullptr;
         IoTeam* async_team = nullptr;
         IoTeam* prefetch_team = nullptr;
+        IoTeam* rows_team = nullptr;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             prefetch_settle_locked();
@@ -677,10 +684,13 @@ namespace tsg
             g_async_team = nullptr;
             prefetch_team = g_prefetch_team;
             g_prefetch_team = nullptr;
+            rows_team = g_rows_team;
+            g_rows_team = nullptr;
         }
         delete team;
         delete async_team;
         delete prefetch_team;
+        delete rows_team;
 #endif
     }
 }
