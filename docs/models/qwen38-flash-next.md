@@ -1796,6 +1796,46 @@ checks pass 8/8 in both arms:
 | once per layer and group (default) | 0.79 / 0.51 / 0.49 s | 2.23 / 2.21 / 2.21 s | 0.67 s / 2.74-2.76 s | 243-254 tok/s |
 | Strata (11-07) | | | 0.92 s / 2.75 s | 300-307 tok/s |
 
+#### A keyed router select, 2026-11-09
+
+A decode step's router is a 512 x 2560 BF16 GEMV, then the top-10 select over the 512 softmax scores
+(`ts_dsv4_moe_select_f32`). The select runs one warp a row. Each pick was a shuffle argmax that carried score, weight
+and expert through three shuffles a step, and the winning lane then rescanned its 16 scores in order. In the captured
+decode profile the select took 5.8 us a layer, more than the GEMV before it (5.1 us at 4 rows).
+
+The keyed select (`ts_dsv4_moe_select_keys_f32`, `TS_DSV4_SELECT_KEYS`, on) turns each ranking score into one 64-bit
+key: the score's order-preserving bits above the expert's complement. The larger key is the higher score, then the lower
+expert, which is the argmax's order.
+
+- A pick is a key max over two shuffles a step.
+- The winning lane retakes its best as a four-step tree.
+- Lane k keeps pick k.
+- The weights are read back from shared memory and summed in pick order. Each lane writes its own pick. Before, lane 0
+  stored each pick and read the weights back from global memory to scale them.
+
+The picks and weights are the same bits as the float argmax's. `Dsv4RouterKernelTests` holds the two kernels to each
+other on 2,048 rows built for the order's corner cases: exact ties at every rank, -inf, NaN, +inf, signed zeros, and
+rows with no candidate. The rows cover 64-512 experts, top 6-32, all three gatings, with and without a bias. It also
+holds both kernels to a host reference.
+
+RTX 5090, a graph of 192 launches, 48 cold router matrices (us a call):
+
+| rows | BF16 GEMV | select, float argmax | select, keyed |
+| --- | --- | --- | --- |
+| 1 | 2.78 | 4.83 | 3.11 |
+| 4 | 4.22 | 4.85 | 3.11 |
+
+Engine bench, ISTA `Q2_0`, MTP, one build (`TS_DSV4_SELECT_KEYS=0` for the argmax). Two passes per arm, alternating.
+Every greedy output is identical across arms, and every check passes:
+
+| select | long generation | 4-row verify window | 1-row step | 4K / 16K verify window |
+| --- | --- | --- | --- | --- |
+| float argmax | 231-244 tok/s | 10.09-10.10 ms | 7.01-7.03 ms | 13.37 / 10.63 ms |
+| keyed (default) | 232-246 tok/s | 10.02-10.04 ms | 6.93-6.94 ms | 13.28-13.33 / 10.56-10.58 ms |
+
+Tried and slower: a GEMV block computing 2 or 4 experts, with each thread loading its activations once for all of
+them. At 4 rows it took 4.75 and 6.45 us against 4.22, because the smaller grid kept fewer weight reads in flight.
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the

@@ -38,6 +38,10 @@ namespace TensorSharp.Cuda
         private readonly IntPtr attnFinish;
         private readonly IntPtr regroup;
         private readonly IntPtr moeSelect;
+        // The keyed warp select (same picks and weights; IntPtr.Zero on a module without it).
+        private readonly IntPtr moeSelectKeys;
+        // TS_DSV4_SELECT_KEYS=0: routers of up to 512 experts keep the float-argmax warp select.
+        private static readonly bool _selectKeysEnv = Environment.GetEnvironmentVariable("TS_DSV4_SELECT_KEYS") != "0";
         private readonly IntPtr moeCount;
         private readonly IntPtr moeScan;
         private readonly IntPtr moeScatter;
@@ -216,6 +220,8 @@ namespace TensorSharp.Cuda
             attnFinish = module.GetFunction("ts_dsv4_attn_finish_f32");
             regroup = module.GetFunction("ts_dsv4_regroup_f32");
             moeSelect = module.GetFunction("ts_dsv4_moe_select_f32");
+            try { moeSelectKeys = module.GetFunction("ts_dsv4_moe_select_keys_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { moeSelectKeys = IntPtr.Zero; }
             moeCount = module.GetFunction("ts_dsv4_moe_count_i32");
             moeScan = module.GetFunction("ts_dsv4_moe_scan_i32");
             moeScatter = module.GetFunction("ts_dsv4_moe_scatter_i32");
@@ -644,11 +650,21 @@ namespace TensorSharp.Cuda
         /// ranks score + bias, the weights are the unbiased scores (normalized when
         /// <paramref name="norm"/> is set) times <paramref name="wScale"/>. Hash layers take the
         /// selection from <paramref name="tid2eid"/> instead.</summary>
+        /// <param name="keys">Tests only: true takes the keyed warp select where it applies, false the float-argmax one;
+        /// null takes TS_DSV4_SELECT_KEYS.</param>
         public void MoeSelect(Tensor logits, IntPtr bias, IntPtr tid2eid, Tensor tokens, Tensor sel, Tensor wOut,
-            int nExpert, int nUsed, int norm, float wScale, int nt, IntPtr stream, int gating = RouterSqrtSoftplus)
+            int nExpert, int nUsed, int norm, float wScale, int nt, IntPtr stream, int gating = RouterSqrtSoftplus, bool? keys = null)
         {
             if (gating == RouterSoftmax && nExpert > 512)
                 throw new NotSupportedException($"softmax routing over {nExpert} experts (the kernel's warp path takes up to 512)");
+            if ((keys ?? _selectKeysEnv) && moeSelectKeys != IntPtr.Zero && tid2eid == IntPtr.Zero && nExpert <= 512 && nUsed <= 32)
+            {
+                IntPtr k0 = P(logits), k1 = bias, k2 = P(sel), k3 = P(wOut);
+                int k4 = nExpert, k5 = nUsed, k6 = norm; float k7 = wScale; int k8 = gating;
+                void** kargs = stackalloc void*[] { &k0, &k1, &k2, &k3, &k4, &k5, &k6, &k7, &k8 };
+                Launch(moeSelectKeys, (uint)nt, 1, 1, 32, 0, stream, kargs);
+                return;
+            }
             IntPtr a0 = P(logits), a1 = bias, a2 = tid2eid, a3 = P(tokens), a4 = P(sel), a5 = P(wOut);
             int a6 = nExpert, a7 = nUsed, a8 = norm; float a9 = wScale; int a10 = gating;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10 };
