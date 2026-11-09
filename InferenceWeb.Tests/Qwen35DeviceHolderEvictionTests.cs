@@ -15,8 +15,12 @@ namespace InferenceWeb.Tests;
 /// room for a clone, so a few requests after a 16K prompt the fused graphs could not allocate and short_chat ran at
 /// 4 tok/s. A new holder now makes room by demoting the least recently used retained holders first, a fresh holder
 /// starts at 2048 rows as Flash Next's do, and a request that still does not fit waits.
+/// <para>
+/// The options these tests vary (TS_KV_INITIAL_TOKENS, the retain reserve) are set through the model's seams, not
+/// the process environment: tests running beside these read those variables too, and setting TS_KV_INITIAL_TOKENS
+/// here once shrank a Qwen clone reservation and emptied a Muse Spark prefix cache in other tests.
+/// </para>
 /// </summary>
-[Collection(EngineEnvironmentCollection.Name)]
 public class Qwen35DeviceHolderEvictionTests
 {
     private const BindingFlags Instance = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
@@ -27,6 +31,8 @@ public class Qwen35DeviceHolderEvictionTests
     {
         public DeviceModel() : base("", BackendType.Cpu) { }   // never called: GetUninitializedObject
         public long Total, Base;
+        public long Reserve;          // the retain reserve (TS_QWEN35_DEVICE_RETAIN_RESERVE_MB)
+        public int KvInitialTokens;   // TS_KV_INITIAL_TOKENS
         private List<Qwen35KvCacheHolder>? holders;   // GetUninitializedObject runs no field initializers
         public List<Qwen35KvCacheHolder> Holders => holders ??= new();
         public int Demotions;
@@ -66,6 +72,8 @@ public class Qwen35DeviceHolderEvictionTests
             return true;
         }
         private protected override long ReleaseKeptDeviceArenas() => 0;
+        private protected override long RetainReserveBytes(long totalBytes) => Reserve;
+        private protected override int KvInitialTokensOption => KvInitialTokens;
 
         public Qwen35KvCacheHolder CreateFreshHolder()
         {
@@ -86,12 +94,11 @@ public class Qwen35DeviceHolderEvictionTests
         public DeviceModel Model { get; } = (DeviceModel)RuntimeHelpers.GetUninitializedObject(typeof(DeviceModel));
         public Dictionary<string, Qwen35Model.Qwen35KvCacheHolder> Retained { get; } = new(StringComparer.Ordinal);
         private readonly CpuAllocator allocator = new(BlasEnum.DotNet);
-        private readonly EnvScope env = new();
 
-        public Fixture(BackendType backend, string? kvInitialTokens, string reserveMb = "1")
+        public Fixture(BackendType backend, int kvInitialTokens = 0)
         {
-            env.Set("TS_KV_INITIAL_TOKENS", kvInitialTokens!);
-            env.Set("TS_QWEN35_DEVICE_RETAIN_RESERVE_MB", reserveMb);
+            Model.KvInitialTokens = kvInitialTokens;
+            Model.Reserve = 1L << 20;
             Set(typeof(ModelBase), "<Config>k__BackingField", new ModelConfig { NumLayers = 2, NumKVHeads = 2, HiddenSize = 8, NumHeads = 2 });
             Set(typeof(ModelBase), "<ExecutionPlan>k__BackingField", new BackendExecutionPlan(BackendType.Cpu));
             Set(typeof(ModelBase), "_allocator", allocator);
@@ -119,7 +126,6 @@ public class Qwen35DeviceHolderEvictionTests
                     foreach (Tensor? t in set) t?.Dispose();
                 if (h.ConvScratch != IntPtr.Zero) System.Runtime.InteropServices.Marshal.FreeHGlobal(h.ConvScratch);
             }
-            env.Dispose();
         }
     }
 
@@ -127,12 +133,11 @@ public class Qwen35DeviceHolderEvictionTests
     public void SequentialRequests_KeepTheRetainedDeviceCopiesWithinTheDevice()
     {
         // Whole-window holders (TS_KV_INITIAL_TOKENS = the window), as every holder was under MAX_CONTEXT before.
-        using var fx = new Fixture(BackendType.GgmlCuda, kvInitialTokens: "32768");
+        using var fx = new Fixture(BackendType.GgmlCuda, kvInitialTokens: 32768);
         var model = fx.Model;
         model.Total = 64L << 20;
         model.Base = 32L << 20;
-        long reserve = Qwen35Model.DeviceRetainReserveBytes(model.Total);
-        Assert.Equal(1L << 20, reserve);
+        long reserve = model.Reserve;
 
         long holderBytes = 0;
         for (int request = 0; request < 24; request++)
@@ -155,11 +160,11 @@ public class Qwen35DeviceHolderEvictionTests
     }
 
     [Theory]
-    [InlineData(BackendType.GgmlCuda, null, 2048)]      // one CUDA device: start small, grow with the request
-    [InlineData(BackendType.GgmlCuda, "32768", 32768)]  // an explicit TS_KV_INITIAL_TOKENS sizes holders as it sized the primary
-    [InlineData(BackendType.GgmlCpu, null, 32768)]      // elsewhere: unchanged
-    [InlineData(BackendType.GgmlMetal, null, 32768)]
-    public void AFreshHolder_StartsAt2048RowsOnOneCudaDevice(BackendType backend, string? kvInitialTokens, int expected)
+    [InlineData(BackendType.GgmlCuda, 0, 2048)]        // one CUDA device: start small, grow with the request
+    [InlineData(BackendType.GgmlCuda, 32768, 32768)]   // an explicit TS_KV_INITIAL_TOKENS sizes holders as it sized the primary
+    [InlineData(BackendType.GgmlCpu, 0, 32768)]        // elsewhere: unchanged
+    [InlineData(BackendType.GgmlMetal, 0, 32768)]
+    public void AFreshHolder_StartsAt2048RowsOnOneCudaDevice(BackendType backend, int kvInitialTokens, int expected)
     {
         using var fx = new Fixture(backend, kvInitialTokens);
         fx.Model.Total = 64L << 30;
@@ -172,7 +177,7 @@ public class Qwen35DeviceHolderEvictionTests
     [Fact]
     public void ARequestThatDoesNotFit_Waits_InsteadOfFailingMidStep()
     {
-        using var fx = new Fixture(BackendType.GgmlCuda, kvInitialTokens: null);
+        using var fx = new Fixture(BackendType.GgmlCuda);
         fx.Model.Total = 64L << 30;
         fx.Model.Base = fx.Model.Total - (512L << 20);   // 512 MiB free beside a 2 GiB headroom
 

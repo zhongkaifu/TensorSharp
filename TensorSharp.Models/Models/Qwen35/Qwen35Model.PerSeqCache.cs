@@ -377,7 +377,7 @@ namespace TensorSharp.Models
         {
             int initial = _initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity;
             if (!AdmitsSequencesByDeviceMemory || initial <= CudaFreshHolderTokens
-                || ExecutionOptions.FromEnvironment().KvInitialTokens > 0)
+                || KvInitialTokensOption > 0)
                 return initial;
             if (!_freshHolderCapacityLogged)
             {
@@ -1597,6 +1597,15 @@ namespace TensorSharp.Models
         /// <summary>Free the idle arenas the graph slots keep on the device; returns the bytes freed.</summary>
         private protected virtual long ReleaseKeptDeviceArenas() => GgmlBasicOps.ReleaseKeptArenas();
 
+        /// <summary>The free memory retained holders' device copies leave (<see cref="DeviceRetainReserveBytes"/>,
+        /// TS_QWEN35_DEVICE_RETAIN_RESERVE_MB). Virtual so a test sets it without the process environment, which
+        /// every test running beside it reads.</summary>
+        private protected virtual long RetainReserveBytes(long totalBytes) => DeviceRetainReserveBytes(totalBytes);
+
+        /// <summary>TS_KV_INITIAL_TOKENS (<see cref="ExecutionOptions.KvInitialTokens"/>). Virtual for the same
+        /// reason as <see cref="RetainReserveBytes"/>.</summary>
+        private protected virtual int KvInitialTokensOption => ExecutionOptions.FromEnvironment().KvInitialTokens;
+
         /// <summary>True when every main-stack attention K/V tensor of <paramref name="holder"/>
         /// has a resident device copy that a device-to-device clone can read. Auxiliary
         /// (NextN) layers that no graph has bound keep their host bytes and are copied
@@ -1629,7 +1638,7 @@ namespace TensorSharp.Models
 
         /// <summary>Free device memory a retained (idle) holder's device K/V copies must leave
         /// for activations, graphs and new requests. Env TS_QWEN35_DEVICE_RETAIN_RESERVE_MB.</summary>
-        internal static long DeviceRetainReserveBytes(long totalBytes)
+        private static long DeviceRetainReserveBytes(long totalBytes)
         {
             string raw = Environment.GetEnvironmentVariable("TS_QWEN35_DEVICE_RETAIN_RESERVE_MB");
             if (long.TryParse(raw, out long mb) && mb >= 0)
@@ -1669,7 +1678,7 @@ namespace TensorSharp.Models
             {
                 if (!TryGetDeviceMemory(out long free, out long total) || total <= 0)
                     return !requireReserve;
-                if (free - neededBytes >= DeviceRetainReserveBytes(total))
+                if (free - neededBytes >= RetainReserveBytes(total))
                     return true;
                 // Least recently used first, but a holder whose K/V already reached host
                 // memory (a finished idle sync) demotes for free, so it goes first. Above
@@ -1703,7 +1712,7 @@ namespace TensorSharp.Models
                     return false;
                 if (PrefixReleaseDebug)
                     Console.Error.WriteLine($"[prefix-demote] free={free >> 20}MiB need={neededBytes >> 20}MiB " +
-                        $"reserve={DeviceRetainReserveBytes(total) >> 20}MiB victim={victim.CacheSeqLen}tok " +
+                        $"reserve={RetainReserveBytes(total) >> 20}MiB victim={victim.CacheSeqLen}tok " +
                         $"{System.Diagnostics.Stopwatch.GetElapsedTime(demoteStart).TotalMilliseconds:F0}ms");
             }
             return false;
