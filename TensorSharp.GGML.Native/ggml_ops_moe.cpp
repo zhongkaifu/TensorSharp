@@ -3126,20 +3126,23 @@ namespace tsg
             s_acc_seq = seq;
             s_acc_total += ms_since(t_pass);
             if (s_acc_passes == 0) TSGgml_MoeOffloadCounters(acc.c0, 9);
-            if (++s_acc_passes == 32)
+            // Decode/verify widths report over 32 passes; a prompt pass (one a chunk, rare) reports on its own.
+            const int report_every = seq > 8 ? 1 : 32;
+            if (++s_acc_passes == report_every)
             {
-                // Tier routes over the 32 passes (the seams' expert counters): held, read into a window slot first, and
+                // Tier routes over the passes (the seams' expert counters): held, read into a window slot first, and
                 // left to the host; the bytes the reads took.
                 long long c1[9] = {};
                 TSGgml_MoeOffloadCounters(c1, 9);
+                const double n = report_every;
                 std::fprintf(stderr,
                     "[HOSTMOE-PASS] %s seq=%d segments=%zu per pass: total %.2f ms = accelerator %.2f + host experts %.2f "
                     "(incl. input download) + upload %.2f + other %.2f | routes held %.1f, window reads %.2f (%.2f MB), "
                     "host %.2f%s\n",
-                    kernel_name, seq, segments.size(), s_acc_total / 32, s_acc_gpu / 32, s_acc_host / 32, s_acc_up / 32,
-                    (s_acc_total - s_acc_gpu - s_acc_host - s_acc_up) / 32,
-                    (c1[0] - acc.c0[0]) / 32.0, (c1[1] - acc.c0[1]) / 32.0, (c1[8] - acc.c0[8]) / 32.0 / 1048576.0,
-                    (c1[7] - acc.c0[7]) / 32.0, seamed ? " (event seams)" : "");
+                    kernel_name, seq, segments.size(), s_acc_total / n, s_acc_gpu / n, s_acc_host / n, s_acc_up / n,
+                    (s_acc_total - s_acc_gpu - s_acc_host - s_acc_up) / n,
+                    (c1[0] - acc.c0[0]) / n, (c1[1] - acc.c0[1]) / n, (c1[8] - acc.c0[8]) / n / 1048576.0,
+                    (c1[7] - acc.c0[7]) / n, seamed ? " (event seams)" : "");
                 std::fflush(stderr);
                 s_acc_gpu = s_acc_host = s_acc_up = s_acc_total = 0;
                 s_acc_passes = 0;

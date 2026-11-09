@@ -3012,10 +3012,12 @@ namespace tsg
         NodeProfileState& s = node_profile_state();
         std::lock_guard<std::mutex> lock(s.mu);
         // TS_GGML_NODE_PROFILE=types splits the matmuls by weight type, which is
-        // what decides their kernel (and so how their cost grows with columns).
-        static const bool by_type = []{
+        // what decides their kernel (and so how their cost grows with columns);
+        // =shapes also by the weight's rows x columns (which projection it is).
+        static const int by_type = []{
             const char* e = std::getenv("TS_GGML_NODE_PROFILE");
-            return e != nullptr && std::strcmp(e, "types") == 0;
+            if (e == nullptr) return 0;
+            return std::strcmp(e, "shapes") == 0 ? 2 : std::strcmp(e, "types") == 0 ? 1 : 0;
         }();
         for (int i = 0; i < n; i++)
         {
@@ -3023,7 +3025,11 @@ namespace tsg
             const double us = per_node[static_cast<std::size_t>(i)];
             std::string key = ggml_op_name(node->op);
             if (by_type && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] != nullptr)
+            {
                 key += std::string(":") + ggml_type_name(node->src[0]->type);
+                if (by_type == 2)
+                    key += ":" + std::to_string(node->src[0]->ne[0]) + "x" + std::to_string(node->src[0]->ne[1]);
+            }
             NodeProfileBucket& b = s.buckets[key];
             b.us += us;
             b.calls++;
