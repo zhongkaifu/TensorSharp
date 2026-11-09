@@ -1370,13 +1370,22 @@ namespace TensorSharp.Models
                     // The hash mutates the n-gram history, so it runs exactly once and
                     // in call order, same as the host path did.
                     long tG = Stopwatch.GetTimestamp();
-                    int[] pleRows = ComputePleRows(tokens, startPos);
                     long need = (long)seqLen * Config.HiddenSize;
                     if (_pleEmbBuf == null || _pleEmbBuf.Length < need)
                         _pleEmbBuf = GC.AllocateArray<float>(checked((int)need), pinned: true);
-                    fixed (float* eb = _pleEmbBuf)
-                        GatherPleRowsRaw(eb, pleRows, seqLen);
-                    PhaseLog(seqLen, "ple.gather", tG);
+                    // A prompt's later chunks were gathered while the chunk before them computed.
+                    if (TakePlePrefetch(tokens, startPos, ref _pleEmbBuf))
+                        PhaseLog(seqLen, "ple.prefetched", tG);
+                    else
+                    {
+                        int[] pleRows = ComputePleRows(tokens, startPos);
+                        if (_pleEmbBuf.Length < need)
+                            _pleEmbBuf = GC.AllocateArray<float>(checked((int)need), pinned: true);
+                        fixed (float* eb = _pleEmbBuf)
+                            GatherPleRowsRaw(eb, pleRows, seqLen);
+                        PhaseLog(seqLen, "ple.gather", tG);
+                    }
+                    StartPlePrefetch(startPos + seqLen);
                 }
                 fixed (Qwen4ExpFfnArgs* fp = _ffnArgs)
                 fixed (Qwen4ExpGdnArgs* gp = _gdnArgs)
@@ -1919,6 +1928,7 @@ namespace TensorSharp.Models
             // reports against the mapping's shard, and the routing counters are keyed
             // by the mapped expert addresses and drop with them.
             StopPleTableWarm();
+            JoinPlePrefetch();
             DetachRoutingProfile();
             DisposeMtpHead();
             DisposeDFlash();

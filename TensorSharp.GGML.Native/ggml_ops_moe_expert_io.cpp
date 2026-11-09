@@ -504,30 +504,37 @@ namespace tsg
         std::uint8_t* dst)
     {
 #if !defined(_WIN32)
-        std::lock_guard<std::mutex> lock(g_mutex);
+        // The requests are built under the I/O lock (the mapped files); the reads run on the rows' own team, which
+        // takes one caller at a time, without it: a prompt chunk's rows gathered in the background (the next chunk's,
+        // while this one computes) would otherwise hold up the seams' expert reads for the whole ~250 ms.
         static thread_local std::vector<IoRequest> s_requests;
-        s_requests.clear();
-        s_requests.reserve(static_cast<std::size_t>(count));
-        const MappedFile* last = nullptr;
-        for (int i = 0; i < count; ++i)
+        IoTeam* team = nullptr;
         {
-            if (rows[i] < 0) return false;
-            const std::uint8_t* src = table + static_cast<std::size_t>(rows[i]) * row_bytes;
-            if (last == nullptr || src < last->base || src + row_bytes > last->base + last->length)
-                last = g_files.empty() ? nullptr : find_file(src, row_bytes);
-            if (last == nullptr) return false;
-            s_requests.push_back({last->fd, dst + static_cast<std::size_t>(i) * row_bytes, row_bytes,
-                static_cast<off_t>(src - last->base)});
+            std::lock_guard<std::mutex> lock(g_mutex);
+            s_requests.clear();
+            s_requests.reserve(static_cast<std::size_t>(count));
+            const MappedFile* last = nullptr;
+            for (int i = 0; i < count; ++i)
+            {
+                if (rows[i] < 0) return false;
+                const std::uint8_t* src = table + static_cast<std::size_t>(rows[i]) * row_bytes;
+                if (last == nullptr || src < last->base || src + row_bytes > last->base + last->length)
+                    last = g_files.empty() ? nullptr : find_file(src, row_bytes);
+                if (last == nullptr) return false;
+                s_requests.push_back({last->fd, dst + static_cast<std::size_t>(i) * row_bytes, row_bytes,
+                    static_cast<off_t>(src - last->base)});
+            }
+            g_read_bytes += static_cast<std::uint64_t>(count) * row_bytes;
+            if (g_rows_team == nullptr)
+            {
+                // TS_PLE_IO_THREADS: reads in flight for PLE rows (default 32).
+                const char* e = std::getenv("TS_PLE_IO_THREADS");
+                const int n = e != nullptr ? std::atoi(e) : 0;
+                g_rows_team = new IoTeam(n > 0 && n <= 128 ? n - 1 : 31);
+            }
+            team = g_rows_team;
         }
-        g_read_bytes += static_cast<std::uint64_t>(count) * row_bytes;
-        if (g_rows_team == nullptr)
-        {
-            // TS_PLE_IO_THREADS: reads in flight for PLE rows (default 32).
-            const char* e = std::getenv("TS_PLE_IO_THREADS");
-            const int n = e != nullptr ? std::atoi(e) : 0;
-            g_rows_team = new IoTeam(n > 0 && n <= 128 ? n - 1 : 31);
-        }
-        return g_rows_team->run(s_requests);
+        return team->run(s_requests);
 #else
         (void)table; (void)row_bytes; (void)rows; (void)count; (void)dst;
         return false;

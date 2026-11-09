@@ -3626,7 +3626,19 @@ namespace TensorSharp.Runtime.Scheduling
                     ExecutionOptions.FromEnvironment().KvGenerationReserveMax));
             }
 
-            return PrefillTokens(seq, work);
+            int[] chunk = PrefillTokens(seq, work);
+            // The prompt's next chunk, of the same width, as a hint: a model can prepare its host work while
+            // this chunk computes (IModelArchitecture.PrepareNextPrefillChunk; it checks the chunk it is given).
+            int nextStart = seq.NumComputedTokens + chunk.Length;
+            int nextLen = Math.Min(chunk.Length, seq.PromptTokens.Count - nextStart);
+            if (nextLen > 0)
+            {
+                var next = new int[nextLen];
+                for (int i = 0; i < nextLen; i++)
+                    next[i] = seq.TokenAt(nextStart + i);
+                _model.PrepareNextPrefillChunk(next, nextStart);
+            }
+            return chunk;
         }
 
         private static int[] PrefillTokens(SequenceState seq, ScheduledSequenceWork work)

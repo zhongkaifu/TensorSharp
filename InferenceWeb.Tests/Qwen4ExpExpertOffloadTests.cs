@@ -346,6 +346,52 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         AssertClose($"tsm {kernels}", tsm, ggml, bound);
     }
 
+    /// <summary>A prompt the scheduler feeds in chunks hints each next chunk (IModelArchitecture.PrepareNextPrefillChunk):
+    /// the PLE rows of the next chunk are gathered on the thread pool while the current one computes, from the n-gram
+    /// history it will have, and the next chunk takes them when its tokens, position and history match. The same rows
+    /// either way, so the logits are bit for bit those of gathering each chunk when it runs (TS_Q4E_PLE_PREFETCH=0). A
+    /// hint for a chunk that never comes (another request's forward in between) is discarded; a chunk that starts the
+    /// hinted one (the scheduler holds a prompt's last token back) takes its leading rows.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void PleRows_PrefetchedForTheNextChunk_AnswerAsGatheredInPlace_Metal()
+    {
+        int[] first = LongPrompt.Concat(LongPrompt).Take(300).ToArray();
+        int[] second = LongPrompt.Reverse().Concat(LongPrompt).Take(300).ToArray();
+        float[][] Answer(string prefetch, bool strayHint, out long hits, int secondLength = 300)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_Q4E_PLE_PREFETCH", prefetch);
+            MoeCpuOffloadConfig.Reset();
+            string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "qwen4exp.gguf"), 16);
+            using ModelBase model = ModelBase.Create(path, BackendType.GgmlMetal);
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            model.PrepareNextPrefillChunk(second, first.Length);
+            var rows = new List<float[]> { (float[])model.ForwardRefill(first).Clone() };
+            if (strayHint)
+                model.PrepareNextPrefillChunk(second.Reverse().ToArray(), first.Length + second.Length);
+            rows.Add((float[])model.Forward(second.Take(secondLength).ToArray()).Clone());
+            foreach (int step in Steps)
+                rows.Add((float[])model.Forward(new[] { step }).Clone());
+            hits = q.PlePrefetchHitsForTests;
+            return rows.ToArray();
+        }
+        float[][] inPlace = Answer("0", false, out long offHits);
+        float[][] prefetched = Answer("1", false, out long onHits);
+        float[][] stray = Answer("1", true, out long strayHits);
+        float[][] shortInPlace = Answer("0", false, out _, 299);
+        float[][] shortPrefetched = Answer("1", false, out long shortHits, 299);
+        Assert.Equal(0, offHits);
+        Assert.Equal(1, onHits);
+        Assert.Equal(1, strayHits);   // the stray hint is gathered, then not taken (the decode steps differ)
+        Assert.Equal(1, shortHits);
+        for (int i = 0; i < inPlace.Length; i++)
+        {
+            Assert.True(prefetched[i].AsSpan().SequenceEqual(inPlace[i]), $"row {i}: the prefetched PLE rows changed the logits");
+            Assert.True(stray[i].AsSpan().SequenceEqual(inPlace[i]), $"row {i}: a stray hint changed the logits");
+            Assert.True(shortPrefetched[i].AsSpan().SequenceEqual(shortInPlace[i]), $"row {i}: a shorter chunk's prefetched rows changed the logits");
+        }
+    }
+
     /// <summary>A prompt-width offloaded layer of Q2_0 experts runs on Strata's grouped expert GEMM (tsm::moe_mm_encode).
     /// With its stacks staged by the prefetch, the seam runs the GEMM on the span graph's own tensors (the router's ids
     /// and weights, the FFN input, moe_out) instead of downloading the input, streaming it through a graph of its own and
