@@ -2307,7 +2307,9 @@ int q4e_resolve_device(int device);
 // ggml-cuda flash-attention eligibility for this family's KV type/head size.
 bool q4e_flash_attn_ok(int kv_type, int head_dim);
 // Independent decode rows keep the solo projection/expert reductions while
-// sharing a graph. Prefill and single-sequence decode leave this disabled.
+// sharing a graph. Prefill and single-sequence decode leave this disabled; so
+// does the arena where verify runs batched (Metal by default; see
+// TS_Q4E_VERIFY_ROW_KERNELS).
 void q4e_independent_decode_rows(int rows);
 // Drop (graph only - state kept) every cached per-layer/span graph built from
 // the given holder descriptor arrays, on every device. The arena flush calls

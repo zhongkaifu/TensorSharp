@@ -573,9 +573,16 @@ bool q4e_flash_attn_ok(int kv_type, int head_dim)
     }
 }
 
+namespace { bool q4e_row_kernels_enabled(); }
+
+// The arena's batched decode follows the verify switch (q4e_row_kernels_enabled). On Metal the slots share the
+// batched kernels by default - every dense weight read once per step, not once per slot (a 4-slot step's graph
+// segments 56 ms against 27 for a 4-row verify window) - and TS_Q4E_VERIFY_ROW_KERNELS=1 restores the one-token
+// kernels per slot. CPU and CUDA keep them unless that switch is 0.
 void q4e_independent_decode_rows(int rows)
 {
-    g_q4e_row_kernels = Q4eRowKernels{rows, 0, rows > 0};
+    const bool on = rows > 0 && q4e_row_kernels_enabled();
+    g_q4e_row_kernels = on ? Q4eRowKernels{rows, 0, true} : Q4eRowKernels{};
 }
 
 namespace
