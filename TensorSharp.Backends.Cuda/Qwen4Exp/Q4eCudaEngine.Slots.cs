@@ -387,6 +387,7 @@ namespace TensorSharp.Cuda
                 }
                 CopyCheckpoint(s, restore: true);
                 s.NPast = s.CpNPast;
+                SlotPositionsDropped(s, s.NPast);
                 s.PleTokens.Length = s.CpNPast;
                 // The MTP block's rows from nPast on belong to the continuation given up: the next draft rewrites them
                 // from there, or restarts the block (MtpRestart) when it restarted after nPast. Below nPast the replay

@@ -1518,6 +1518,71 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
                 $"step {i}: confidence {device.Probs[i]:R} vs {host.Probs[i]:R}");
     }
 
+    /// <summary>
+    /// The last prompt group's streams stop standing for their positions once the slot's position falls below them: a
+    /// grouped 150-token prompt, then the sequence reset and a short (ungrouped) prompt over positions the group had held.
+    /// Its catch-up takes every row from the host - none from the stale group buffer - and drafts what a fresh engine
+    /// drafts for that prompt alone, bit for bit.
+    /// </summary>
+    [CudaFact]
+    public void TheMtpCatchUp_AfterTheSlotIsReset_DoesNotReadTheOldGroupsStreams()
+    {
+        _env.Set("TS_Q4E_HOST_EXPERTS", "0");
+        _env.Set("TS_Q4E_UBATCH", "64");
+        _env.Set("TS_Q4E_PROMPT_GROUP", "192");
+        string path = Fixture(indexerTopK: 16, expertGateUpType: SyntheticGguf.GgmlType.Q2_0, expertDownType: SyntheticGguf.GgmlType.Q2_0);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 16);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes * 2 / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        int[] first = Enumerable.Range(0, 150).Select(i => (i * 37 + 11) % 250).ToArray();
+        int[] second = Enumerable.Range(0, 40).Select(i => (i * 53 + 7) % 250).ToArray();
+        const int Steps3 = 3;
+
+        // The second prompt's catch-up: every row from position 0 with the streams of the token before it.
+        (int[] Ids, float[] Probs, long FromDevice) Draft(ModelBase model, int[] prompt)
+        {
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var head = (TensorSharp.Runtime.Speculative.IDraftHead)model;
+            int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            var hidden = new float[prompt.Length * feat];
+            spec.SpecForward(prompt, hidden, new float[vocab], false);
+            int[] tokens = prompt.Append(Steps[0]).ToArray();
+            var rows = new float[tokens.Length * feat];
+            Array.Copy(hidden, 0, rows, feat, (long)prompt.Length * feat);
+            var ids = new int[Steps3];
+            var probs = new float[Steps3];
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            long before = engine.MtpRowsFromDevice;
+            Assert.Equal(Steps3, head.DraftChain(tokens, rows, 0, Steps3, ids, probs));
+            return (ids, probs, engine.MtpRowsFromDevice - before);
+        }
+
+        (int[] Ids, float[] Probs, long FromDevice) afterReset, fresh;
+        using (ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp))
+        {
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            spec.SpecForward(first, new float[first.Length * spec.SpecFeatureSize], new float[model.Config.VocabSize], false);
+            Assert.True(engine.PromptGroupsRun > 0, "the first prompt was not read in a group");
+            engine.Reset();
+            afterReset = Draft(model, second);
+        }
+        _env.Set("TS_Q4E_MTP_D2D", "0");
+        using (ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp))
+            fresh = Draft(model, second);
+        _output.WriteLine($"after the reset: [{string.Join(",", afterReset.Ids)}], {afterReset.FromDevice} rows from the group's buffer; " +
+            $"fresh: [{string.Join(",", fresh.Ids)}]");
+        Assert.Equal(0, afterReset.FromDevice);
+        Assert.Equal(fresh.Ids, afterReset.Ids);
+        for (int i = 0; i < Steps3; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(fresh.Probs[i]) == BitConverter.SingleToInt32Bits(afterReset.Probs[i]),
+                $"step {i}: confidence {afterReset.Probs[i]:R} vs {fresh.Probs[i]:R}");
+    }
+
     /// <summary>A decode step's hyper-connection scatter fused with the next mixer's first pass computes what the two
     /// launches compute: the prompt and every decode step, bit for bit, with QSA past its width.</summary>
     [CudaFact]

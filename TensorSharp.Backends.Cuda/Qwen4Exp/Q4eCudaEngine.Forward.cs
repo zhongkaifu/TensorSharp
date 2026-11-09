@@ -363,6 +363,7 @@ namespace TensorSharp.Cuda
                     Zero(dev, slot.PleHist, 4);
             }
             slot.NPast = 0;
+            SlotPositionsDropped(slot, 0);
             slot.Failed = false;
             slot.PleTokens.Length = 0;
             slot.MtpPast = 0;
@@ -427,6 +428,7 @@ namespace TensorSharp.Cuda
                 t.Dispose();
             slot.Owned.Clear();
             ReturnKvHostSets(slot);
+            SlotPositionsDropped(slot, -1);
         }
 
         /// <summary>Back to position 0 on the active sequence.</summary>
@@ -587,6 +589,22 @@ namespace TensorSharp.Cuda
         private long _groupXsGen, _groupHiddenGen = -1;
         private Slot _groupHiddenSlot;
         private int _groupHiddenP0, _groupHiddenRows;
+
+        /// <summary>
+        /// <paramref name="slot"/>'s position fell to <paramref name="nPast"/> (a reset, a rewind, a verify's rollback, the slot
+        /// freed with -1): the positions from there on will be written again, so the last prompt group's streams no longer
+        /// stand for those positions if they covered any. Without this a new conversation on the slot - a short prompt over
+        /// positions the last group had held - had its MTP catch-up read the old prompt's streams (the drafts' acceptance fell
+        /// to 4-13% on long generation after a grouped multi-turn prompt; the answers stayed right, the verify decides them).
+        /// </summary>
+        private void SlotPositionsDropped(Slot slot, int nPast)
+        {
+            if (ReferenceEquals(slot, _groupHiddenSlot) && nPast < _groupHiddenP0 + _groupHiddenRows)
+            {
+                _groupHiddenGen = -1;
+                _groupHiddenSlot = null;
+            }
+        }
         // Inside a grouped prompt: the routed experts stage (never the host's doorbell) and keep their staging per layer.
         private bool _groupedPrompt;
 
