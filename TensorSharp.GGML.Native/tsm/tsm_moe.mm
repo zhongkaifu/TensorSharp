@@ -81,6 +81,9 @@ namespace
         id<MTLLibrary> library_mm = nil;
         int mm_state = 0;
         std::map<std::string, id<MTLComputePipelineState>> pipelines_mm;
+        // hc_read_encode's scratch: xn in fp16, the down GEMM's output, silu(down) in fp16, the fp16 weights
+        id<MTLBuffer> hr_xnh = nil, hr_v = nil, hr_lo = nil, hr_wd = nil, hr_wu = nil;
+        std::size_t hr_xnh_bytes = 0, hr_v_bytes = 0, hr_lo_bytes = 0, hr_wd_bytes = 0, hr_wu_bytes = 0;
         id<MTLBuffer> mm_bcnt = nil, mm_boff = nil, mm_eoff = nil, mm_tiles = nil, mm_meta = nil, mm_stok = nil,
             mm_sw = nil, mm_pos = nil, mm_xs = nil, mm_hs = nil, mm_ye = nil;
         std::size_t mm_bcnt_bytes = 0, mm_boff_bytes = 0, mm_eoff_bytes = 0, mm_tiles_bytes = 0, mm_meta_bytes = 0,
@@ -1490,10 +1493,172 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
         if (last != nil) [last waitUntilCompleted];
     }
 
+    // ---- the fused hyper-connection read (tsm_moe.h hc_read_*)
+    namespace
+    {
+        struct TsmHrArgs { std::uint32_t n_tok, n_embd, hc, lr; float eps; std::uint32_t pad0, pad1, pad2; };
+        static_assert(sizeof(TsmHrArgs) == 32, "TsmHrArgs must match tsm_hc_read.metal");
+        struct TsmDqArgs { std::uint32_t n_in, n_out, row_bytes, perm, dst_row0, pad0, pad1, pad2; };
+        static_assert(sizeof(TsmDqArgs) == 32, "TsmDqArgs must match tsm_hc_read.metal");
+        struct TsmGemmArgs { std::int32_t M, N, K, pad; };
+        std::atomic<long long> g_hc_read_count{0};
+
+        const char* dq_kernel(int type)
+        {
+            switch (type)
+            {
+                case GGML_TYPE_F32: return "tsm_dq_f32";
+                case GGML_TYPE_F16: return "tsm_dq_f16";
+                case GGML_TYPE_BF16: return "tsm_dq_bf16";
+                case GGML_TYPE_Q8_0: return "tsm_dq_q8_0";
+                default: return nullptr;
+            }
+        }
+
+        bool hc_read_enabled()
+        {
+            const char* e = std::getenv("TS_METAL_HC_READ");   // read per span build (tests switch it)
+            return !(e && e[0] == '0');
+        }
+
+        // One weight's rows into the fp16 matrix at dst_row0 (perm: see tsm_hc_read.metal).
+        void encode_dq(State& s, id<MTLComputeCommandEncoder> enc, const ggml_tensor* w, id<MTLBuffer> dst,
+                       std::uint32_t dst_row0, std::uint32_t perm)
+        {
+            const TsmDqArgs a{static_cast<std::uint32_t>(w->ne[0]), static_cast<std::uint32_t>(w->ne[1]),
+                static_cast<std::uint32_t>(w->nb[1]), perm, dst_row0, 0, 0, 0};
+            [enc setComputePipelineState:pipeline_mm(s, dq_kernel(w->type))];
+            bind(enc, tensor_id(w), 0, 0);
+            [enc setBuffer:dst offset:0 atIndex:1];
+            [enc setBytes:&a length:sizeof(a) atIndex:2];
+            const NSUInteger runs = static_cast<NSUInteger>(w->ne[0] / 32);
+            [enc dispatchThreads:MTLSizeMake(runs, static_cast<NSUInteger>(w->ne[1]), 1)
+                threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(runs, 64), 1, 1)];
+        }
+    }
+
+    bool hc_read_supported(ggml_backend* backend, int down_type, int inject_type, int up_type, int n_embd, int hc, int lr)
+    {
+        if (!hc_read_enabled()) return false;
+        ggml_metal_device_t dev = metal_device(backend);
+        if (dev == nullptr) return false;
+        if (dq_kernel(down_type) == nullptr || dq_kernel(inject_type) == nullptr || dq_kernel(up_type) == nullptr) return false;
+        // Rows dequantize in runs of 32; the up GEMM's 64-column tiles hold 64 / hc whole outputs; the norm's
+        // threadgroup reduces with 8 simdgroups.
+        if (n_embd <= 0 || hc <= 0 || lr <= 0 || (static_cast<std::int64_t>(n_embd) * hc) % 64 != 0 || 64 % hc != 0
+            || lr % 32 != 0)
+            return false;
+        try
+        {
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+            ensure_library(s, device);
+            return mm_library(s, device);
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+    }
+
+    bool hc_read_encode(ggml_backend* backend, const HcReadIO& io)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm hc read: not a Metal backend");
+            const std::int64_t n = io.n_embd, hc = io.hc, lr = io.lr, T = io.T, wide = n * hc;
+            auto need = [](const ggml_tensor* t, const char* what, bool ok) {
+                if (t == nullptr || !ok) throw std::runtime_error(std::string("tsm hc read: ") + what + " does not match the kernels");
+            };
+            need(io.res, "res", io.res && io.res->type == GGML_TYPE_F32 && ggml_is_contiguous(io.res) && ggml_nelements(io.res) == wide * T);
+            need(io.gamma, "gamma", io.gamma && io.gamma->type == GGML_TYPE_F32 && ggml_nelements(io.gamma) == wide);
+            need(io.w_down, "w_down", io.w_down && io.w_down->ne[0] == wide && io.w_down->ne[1] == lr);
+            need(io.w_inject, "w_inject", io.w_inject && io.w_inject->ne[0] == wide && io.w_inject->ne[1] == hc);
+            need(io.w_up, "w_up", io.w_up && io.w_up->ne[0] == lr && io.w_up->ne[1] == wide);
+            need(io.mixed, "mixed", io.mixed && io.mixed->type == GGML_TYPE_F32 && ggml_nelements(io.mixed) == n * T);
+            need(io.inject, "inject", io.inject && io.inject->type == GGML_TYPE_F32 && ggml_nelements(io.inject) == hc * T);
+            const ggml_metal_buffer_id res = tensor_id(io.res), gamma = tensor_id(io.gamma), mixed = tensor_id(io.mixed),
+                inject = tensor_id(io.inject);
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                ensure_library(s, device);
+                if (!mm_library(s, device)) throw std::runtime_error("tsm hc read: the tensor-API library is not available");
+                const std::size_t t = static_cast<std::size_t>(T), w = static_cast<std::size_t>(wide);
+                const std::size_t nr = static_cast<std::size_t>(lr + hc);
+                s.hr_xnh = grow(s, s.hr_xnh, s.hr_xnh_bytes, t * w * 2);
+                s.hr_v = grow(s, s.hr_v, s.hr_v_bytes, t * nr * 4);
+                s.hr_lo = grow(s, s.hr_lo, s.hr_lo_bytes, t * static_cast<std::size_t>(lr) * 2);
+                s.hr_wd = grow(s, s.hr_wd, s.hr_wd_bytes, nr * w * 2);
+                s.hr_wu = grow(s, s.hr_wu, s.hr_wu_bytes, w * static_cast<std::size_t>(lr) * 2);
+                const TsmHrArgs ha{static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(hc),
+                    static_cast<std::uint32_t>(lr), io.eps, 0, 0, 0};
+
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];   // serial: each pass sees the last
+                // the weights in fp16: [down rows | injection rows] and the up rows with the streams interleaved
+                encode_dq(s, enc, io.w_down, s.hr_wd, 0, 0);
+                encode_dq(s, enc, io.w_inject, s.hr_wd, static_cast<std::uint32_t>(lr), 0);
+                encode_dq(s, enc, io.w_up, s.hr_wu, 0, static_cast<std::uint32_t>(hc));
+
+                [enc setComputePipelineState:pipeline_mm(s, "tsm_hr_norm")];
+                bind(enc, res, 0, 0); bind(enc, gamma, 0, 1);
+                [enc setBuffer:s.hr_xnh offset:0 atIndex:2];
+                [enc setBytes:&ha length:sizeof(ha) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(hc), t, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+                const TsmGemmArgs gd{static_cast<std::int32_t>(T), static_cast<std::int32_t>(nr), static_cast<std::int32_t>(wide), 0};
+                [enc setComputePipelineState:pipeline_mm(s, "tsm_gemm_f16_64_64_4")];
+                [enc setBuffer:s.hr_xnh offset:0 atIndex:0]; [enc setBuffer:s.hr_wd offset:0 atIndex:1];
+                [enc setBuffer:s.hr_v offset:0 atIndex:2];
+                [enc setBytes:&gd length:sizeof(gd) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake((nr + 63) / 64, (t + 63) / 64, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                [enc setComputePipelineState:pipeline_mm(s, "tsm_hr_epi_down")];
+                [enc setBuffer:s.hr_v offset:0 atIndex:0]; [enc setBuffer:s.hr_lo offset:0 atIndex:1];
+                bind(enc, inject, 0, 2);
+                [enc setBytes:&ha length:sizeof(ha) atIndex:3];
+                [enc dispatchThreads:MTLSizeMake(t * nr, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+                const TsmGemmArgs gu{static_cast<std::int32_t>(T), static_cast<std::int32_t>(wide), static_cast<std::int32_t>(lr), 0};
+                [enc setComputePipelineState:pipeline_mm(s, "tsm_gemm_hc_up_64_64_4")];
+                [enc setBuffer:s.hr_lo offset:0 atIndex:0]; [enc setBuffer:s.hr_wu offset:0 atIndex:1];
+                [enc setBuffer:s.hr_xnh offset:0 atIndex:2]; bind(enc, mixed, 0, 3);
+                [enc setBytes:&gu length:sizeof(gu) atIndex:4];
+                [enc setBytes:&ha length:sizeof(ha) atIndex:5];
+                [enc dispatchThreadgroups:MTLSizeMake(w / 64, (t + 63) / 64, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                s.last = cb;
+            }
+            g_hc_read_count.fetch_add(1, std::memory_order_relaxed);
+            g_hc_prompt_count.fetch_add(1, std::memory_order_relaxed);   // a hyper-connection pass on these kernels
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true))
+                std::fprintf(stderr, "[tsm] prompt hyper-connection reads run fused on the matrix units (norm, fp16 GEMMs, "
+                    "the mix in the up projection's epilogue; TS_METAL_HC_READ=0 keeps ggml's ops)\n");
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
+
+    long long hc_read_count() { return g_hc_read_count.load(std::memory_order_relaxed); }
+
     void moe_mm_release()
     {
         State& s = state();
         std::lock_guard<std::mutex> lock(s.mu);
+        s.hr_xnh = s.hr_v = s.hr_lo = s.hr_wd = s.hr_wu = nil;
+        s.hr_xnh_bytes = s.hr_v_bytes = s.hr_lo_bytes = s.hr_wd_bytes = s.hr_wu_bytes = 0;
         if (s.mm_xs == nil && s.mm_ye == nil) return;
         // The last pass's command buffer holds its own references; dropping ours frees the scratch once it completes.
         s.mm_bcnt = s.mm_boff = s.mm_eoff = s.mm_tiles = s.mm_stok = s.mm_sw = s.mm_pos = nil;
@@ -1567,6 +1732,69 @@ TSG_EXPORT int TSGgml_TsmMoeMmProbe(int hidden, int n_ff, int n_expert, const vo
 
 // Test hook: the prompt expert layers that ran on moe_mm_encode in this process.
 TSG_EXPORT long long TSGgml_TsmMoeMmCount() { return tsm::moe_mm_count(); }
+
+// ---- test probe: one hyper-connection read through hc_read_encode on weights the caller gives in ggml's layout
+// (w_down [n_embd * hc] x lr rows, w_inject [n_embd * hc] x hc rows, w_up [lr] x (n_embd * hc) rows, each of its own
+// type: F32, F16, BF16 or Q8_0 bytes), T rows of the residual and gamma, into mixed [T][n_embd] and inject [T][hc].
+// Returns 1, or 0 with the last error set.
+TSG_EXPORT int TSGgml_TsmHcReadProbe(int n_embd, int hc, int lr, int down_type, const void* w_down, int inject_type,
+    const void* w_inject, int up_type, const void* w_up, const float* gamma, int T, const float* res, float eps,
+    float* mixed, float* inject)
+{
+    using namespace tsg;
+    if (!ensure_backend()) return 0;
+    ggml_backend_t backend = g_backend;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_context* ctx = nullptr;
+    try
+    {
+        if (!tsm::hc_read_supported(backend, down_type, inject_type, up_type, n_embd, hc, lr))
+            throw std::runtime_error("tsm hc read probe: the kernels do not run here or take these types and shapes");
+        const int wide = n_embd * hc;
+        ggml_init_params ip{};
+        ip.mem_size = 16 * ggml_tensor_overhead();
+        ip.no_alloc = true;
+        ctx = ggml_init(ip);
+        ggml_tensor* wd = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(down_type), wide, lr);
+        ggml_tensor* wi = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(inject_type), wide, hc);
+        ggml_tensor* wu = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(up_type), lr, wide);
+        ggml_tensor* g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, wide);
+        ggml_tensor* r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, wide, T);
+        ggml_tensor* m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+        ggml_tensor* inj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, T);
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (buf == nullptr) throw std::runtime_error("tsm hc read probe: buffer");
+        ggml_backend_tensor_set(wd, w_down, 0, ggml_nbytes(wd));
+        ggml_backend_tensor_set(wi, w_inject, 0, ggml_nbytes(wi));
+        ggml_backend_tensor_set(wu, w_up, 0, ggml_nbytes(wu));
+        ggml_backend_tensor_set(g, gamma, 0, ggml_nbytes(g));
+        ggml_backend_tensor_set(r, res, 0, ggml_nbytes(r));
+        tsm::HcReadIO io;
+        io.res = r; io.gamma = g; io.w_down = wd; io.w_inject = wi; io.w_up = wu; io.mixed = m; io.inject = inj;
+        io.T = T; io.n_embd = n_embd; io.hc = hc; io.lr = lr; io.eps = eps;
+        const bool ok = tsm::hc_read_encode(backend, io);
+        if (ok)
+        {
+            tsm::wait_last();
+            ggml_backend_tensor_get(m, mixed, 0, ggml_nbytes(m));
+            ggml_backend_tensor_get(inj, inject, 0, ggml_nbytes(inj));
+        }
+        tsm::moe_mm_release();
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return ok ? 1 : 0;
+    }
+    catch (const std::exception& e)
+    {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        tsg::set_last_error(e.what());
+        return 0;
+    }
+}
+
+// Test hook: the hyper-connection reads that ran on hc_read_encode in this process.
+TSG_EXPORT long long TSGgml_TsmHcReadCount() { return tsm::hc_read_count(); }
 
 TSG_EXPORT int TSGgml_TsmMoeProbe(int gate_type, int down_type, int hidden, int n_ff, int n_expert,
     const void* gate, const void* up, const void* down, int T, int n_used, const std::int32_t* slots,

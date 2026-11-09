@@ -4628,6 +4628,11 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static partial long TSGgml_TsmMoeMmCount();
         [LibraryImport(DllName)]
+        internal static partial int TSGgml_TsmHcReadProbe(int nEmbd, int hc, int lr, int downType, IntPtr wDown, int injectType,
+            IntPtr wInject, int upType, IntPtr wUp, IntPtr gamma, int rows, IntPtr res, float eps, IntPtr mixed, IntPtr inject);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_TsmHcReadCount();
+        [LibraryImport(DllName)]
         internal static partial long TSGgml_TsmGdnPromptCount();
         [LibraryImport(DllName)]
         internal static partial long TSGgml_TsmHcPromptCount();

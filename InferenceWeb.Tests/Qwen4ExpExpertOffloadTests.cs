@@ -295,11 +295,14 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     /// activations amplify the difference to 3.0e-4. With the QSA selection kernels (tsm_qsa_prompt.metal) the cells a
     /// row keeps can differ where a block's cells tie at the cutoff: ggml's top_k fills ties in atomic order, the
     /// kernels lowest index first (QsaSelection_KeepsTheBestCells_TiesLowestFirst proves the contract), so the bound
-    /// is a valid choice's, not rounding's: measured 8.5e-3 at the first decode step, every argmax equal. The counters
+    /// is a valid choice's, not rounding's: measured 8.5e-3 at the first decode step, every argmax equal. The
+    /// hyper-connection read runs fused on fp16 operands (tsm_hc_read.metal, HcRead_AnswersAsTheDoublePrecisionReference):
+    /// with it alone 9.5e-4 at the prefill and 1.06e-3 at the first decode step, every argmax equal. The counters
     /// prove the kernels ran.</summary>
     [GgmlTheory(BackendType.GgmlMetal)]
     [InlineData("gdn", false)]
     [InlineData("hc", false)]
+    [InlineData("hcmix", false)]
     [InlineData("gdn,hc", false)]
     [InlineData("gdn,hc", true)]
     [InlineData("qsa", false)]
@@ -310,12 +313,13 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     public void PromptKernels_OnTsm_AnswerAsGgml_Metal(string kernels, bool hostExperts)
     {
         bool gdn = kernels.Contains("gdn"), hc = kernels.Contains("hc"), qsa = kernels.Contains("qsa");
-        bool attn = kernels.Contains("attn");
+        bool attn = kernels.Contains("attn"), fusedRead = hc && !kernels.Contains("hcmix");
         float[][] Answer(bool useGdn, bool useHc, bool useQsa, bool useAttn)
         {
             using var env = new NativeEnvScope();
             env.Set("TS_METAL_GDN_PROMPT", useGdn ? "1" : "0");
             env.Set("TS_METAL_HC_PROMPT", useHc ? "1" : "0");
+            env.Set("TS_METAL_HC_READ", fusedRead ? "1" : "0");   // hcmix: the read's mix pass after ggml's matmuls
             env.Set("TS_METAL_QSA_SELECT", useQsa ? "1" : "0");
             env.Set("TS_METAL_QSA_ATTN", useAttn ? "1" : "0");
             env.Set("TS_METAL_QSA_ATTN_MIN_CELLS", "1");   // the fixture's window is a few hundred cells
@@ -325,18 +329,20 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         // selection, so the tie freedom of the selection drops out of that comparison.
         float[][] ggml = Answer(attn && gdn, attn && hc, attn, false);
         long gdnBefore = GgmlBasicOps.TsmGdnPromptCount(), hcBefore = GgmlBasicOps.TsmHcPromptCount();
+        long readBefore = GgmlBasicOps.TsmHcReadCount();
         long qsaBefore = GgmlBasicOps.TsmQsaSelectCount(), attnBefore = GgmlBasicOps.TsmQsaAttnCount();
         float[][] tsm = Answer(gdn, hc, qsa, attn);
         long gdnLayers = GgmlBasicOps.TsmGdnPromptCount() - gdnBefore, hcPasses = GgmlBasicOps.TsmHcPromptCount() - hcBefore;
         long qsaLayers = GgmlBasicOps.TsmQsaSelectCount() - qsaBefore, attnLayers = GgmlBasicOps.TsmQsaAttnCount() - attnBefore;
         _output.WriteLine($"tsm kernels: {gdnLayers} GDN layers, {hcPasses} hyper-connection passes, {qsaLayers} QSA selections, "
             + $"{attnLayers} QSA attention passes");
-        // The fixture's 8 layers: 6 GDN, 2 QSA, 16 half-layers with a read and a scatter each.
+        // The fixture's 8 layers: 6 GDN, 2 QSA, 16 half-layers with a read (fused, tsm::hc_read_encode) and a scatter each.
         Assert.Equal(gdn ? 6 : 0, gdnLayers);
         Assert.Equal(hc ? 32 : 0, hcPasses);
+        Assert.Equal(fusedRead ? 16 : 0, GgmlBasicOps.TsmHcReadCount() - readBefore);
         Assert.Equal(qsa ? 2 : 0, qsaLayers);
         Assert.Equal(attn ? 2 : 0, attnLayers);
-        double bound = attn ? (hostExperts ? 1e-3 : 2e-4) : qsa ? 2e-2 : hostExperts ? 1e-3 : 2e-4;
+        double bound = attn ? (hostExperts ? 1e-3 : 2e-4) : qsa ? 2e-2 : fusedRead ? 2e-3 : hostExperts ? 1e-3 : 2e-4;
         AssertClose($"tsm {kernels}", tsm, ggml, bound);
     }
 
@@ -406,6 +412,11 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     [GgmlFact(BackendType.GgmlMetal)]
     public void TieredExperts_PromptOverflow_RunsOnTheAccelerator_Metal()
     {
+        // The seamed pass reads its hyper connections fused on fp16 operands (TS_METAL_HC_READ, ~1e-3 on this fixture:
+        // PromptKernels_OnTsm_AnswerAsGgml_Metal), which the all-accelerator span does not; the bound here is the
+        // expert placement's, so both read as ggml does.
+        using var env = new NativeEnvScope();
+        env.Set("TS_METAL_HC_READ", "0");
         float[][] device = Run(BackendType.GgmlMetal, () => { }, LongPrompt);
         // (2, 2) leaves rows with three overflow routes, which ggml-metal's MUL_MAT_ID has no kernel for: they are
         // padded to four (an abort before the padding).

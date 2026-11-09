@@ -1258,6 +1258,30 @@ static Q4eHcRead q4e_nodes_hc_read(ggml_context* ctx, ggml_tensor* res_in, ggml_
     const int hc_dim = hc * n_embd;
     Q4eHcRead r{};
     r.res3 = ggml_reshape_3d(ctx, res_in, n_embd, hc, T);
+#if defined(TSG_GGML_USE_METAL)
+    // A prompt-width span building with device operations reads the hyper connection in one pass on TensorSharp's
+    // kernels (tsm::hc_read_encode): the norm, the down / injection GEMM, silu and the up GEMM with the streams mixed
+    // in its epilogue, on fp16 operands. The residual is read only; the scatter stays its own operation.
+    if (const Q4eDeviceOps* dev = g_q4e_dev; dev != nullptr && dev->hc && dev->T == T
+        && res_in->type == GGML_TYPE_F32 && ggml_is_contiguous(res_in) && w_norm->type == GGML_TYPE_F32
+        && tsm::hc_read_supported(g_backend, w_down->type, w_inject->type, w_up->type, n_embd, hc, (int)w_down->ne[1]))
+    {
+        r.mixed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+        dev->bind(r.mixed, dev->off_mixed);
+        if (mixed_name != nullptr) ggml_set_name(r.mixed, mixed_name);
+        r.inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, T);
+        dev->bind(r.inject, dev->off_inject);
+        for (ggml_tensor* t : {w_norm, w_down, w_up, w_inject}) ggml_build_forward_expand(dev->graph, t);
+        tsm::HcReadIO io;
+        io.res = res_in; io.gamma = w_norm; io.w_down = w_down; io.w_inject = w_inject; io.w_up = w_up;
+        io.mixed = r.mixed; io.inject = r.inject;
+        io.T = T; io.n_embd = n_embd; io.hc = hc; io.lr = (int)w_down->ne[1]; io.eps = eps;
+        ggml_tensor* inputs[] = { res_in };
+        dev->push(inputs, 1, {r.mixed, r.inject}, g_q4e_dev_layer,
+            [io](ggml_backend_t backend) { return tsm::hc_read_encode(backend, io); }, "hc read");
+        return r;
+    }
+#endif
     ggml_tensor* xn = ggml_rms_norm(ctx, r.res3, eps);
     bool dev_hc = false;
 #if defined(TSG_GGML_USE_METAL)

@@ -423,11 +423,13 @@ if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
                 "-DFILES=${TSM_MPP_FILES_ARG}" -P "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
         DEPENDS ${TSM_MPP_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
         COMMENT "Embedding the TensorSharp Metal tensor-API kernels")
-    # Strata's grouped expert GEMM for prompt chunks (tsm_moe_mm.metal) on the tensor API: a library of its own with
-    # ggml-common.h and quant.metal, compiled on first use where the tensor API runs.
+    # Strata's grouped expert GEMM for prompt chunks (tsm_moe_mm.metal) and the fused hyper-connection read
+    # (tsm_hc_read.metal) on the tensor API: a library of its own with ggml-common.h and quant.metal, compiled on first
+    # use where the tensor API runs.
     set(TSM_MOEMM_FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/quant.metal"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_moe_mm.metal")
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_moe_mm.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_hc_read.metal")
     set(TSM_MOEMM_INC "${CMAKE_CURRENT_BINARY_DIR}/tsm_moe_mm_source.inc")
     string(REPLACE ";" "\\;" TSM_MOEMM_FILES_ARG "${TSM_MOEMM_FILES}")
     add_custom_command(OUTPUT "${TSM_MOEMM_INC}"

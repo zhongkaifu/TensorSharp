@@ -3483,6 +3483,28 @@ namespace TensorSharp.GGML
                     rows, nUsed, (IntPtr)i, (IntPtr)w, (IntPtr)xp, (IntPtr)o) != 0;
         }
 
+        /// <summary>Test probe of the fused hyper-connection read on the Metal tensor API (tsm::hc_read_encode): rows of the
+        /// residual [rows, nEmbd * hc] through the norm, the down / injection GEMM and the up GEMM with the stream mix, on
+        /// weights in ggml's layout and types (<see cref="GgmlType"/> values F32, F16, BF16, Q8_0), into
+        /// <paramref name="mixed"/> [rows, nEmbd] and <paramref name="inject"/> [rows, hc]. False where the kernels do not
+        /// run (no tensor API) or fail.</summary>
+        public static unsafe bool TsmHcReadProbe(int nEmbd, int hc, int lr, int downType, byte[] wDown, int injectType,
+            byte[] wInject, int upType, byte[] wUp, float[] gamma, int rows, float[] res, float eps, float[] mixed, float[] inject)
+        {
+            fixed (byte* d = wDown) fixed (byte* i = wInject) fixed (byte* u = wUp) fixed (float* g = gamma)
+            fixed (float* r = res) fixed (float* m = mixed) fixed (float* j = inject)
+                return GgmlNative.TSGgml_TsmHcReadProbe(nEmbd, hc, lr, downType, (IntPtr)d, injectType, (IntPtr)i, upType,
+                    (IntPtr)u, (IntPtr)g, rows, (IntPtr)r, eps, (IntPtr)m, (IntPtr)j) != 0;
+        }
+
+        /// <summary>Test hook: the prompt hyper-connection reads that ran fused (tsm::hc_read_encode) in this process. 0 off
+        /// Apple's Metal builds.</summary>
+        public static long TsmHcReadCount()
+        {
+            try { return GgmlNative.TSGgml_TsmHcReadCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         /// <summary>Test hook: the prompt expert layers that ran on Strata's grouped GEMM (tsm::moe_mm_encode) in this
         /// process. 0 off Apple's Metal builds.</summary>
         public static long TsmMoeMmCount()

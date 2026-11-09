@@ -375,4 +375,154 @@ public sealed class TsmMoeKernelTests
         Assert.True(maxRounded / maxRef < 1e-4, $"vs the rounded reference: {maxRounded / maxRef:E3}");
         Assert.True(maxPlain / maxRef < 5e-3, $"vs the unrounded reference: {maxPlain / maxRef:E3}");
     }
+
+    /// <summary>The fused hyper-connection read (tsm::hc_read_encode, the Metal 4 tensor API, after Strata's gr_norm_h /
+    /// gemm_f16 / gr_epi_down / gemm_hc_up): each stream's RMS norm times gamma, the down projection and the injection
+    /// weights in one GEMM, silu(down / hc), and the up projection whose epilogue mixes the streams by their sigmoid
+    /// gates. Weights in the types Flash Next's come in (Q8_0 down / up and BF16 injection, as TS_Q4E_HC_Q8 makes them;
+    /// F16 / F32 too), rows past a 64-row tile. Measured on an M5 Pro: within 3.1e-4 of the unrounded double reference
+    /// (fp16's rounding of the operands), and within 0.6-2.3e-4 of one that rounds xn, the weights and silu(down) to fp16
+    /// where the kernels do (the matrix units' accumulation order); the injection weights within 3.2e-5 of it.</summary>
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData((int)SyntheticGguf.GgmlType.Q8_0, (int)SyntheticGguf.GgmlType.BF16, (int)SyntheticGguf.GgmlType.Q8_0, 40)]
+    [InlineData((int)SyntheticGguf.GgmlType.Q8_0, (int)SyntheticGguf.GgmlType.BF16, (int)SyntheticGguf.GgmlType.Q8_0, 133)]
+    [InlineData((int)SyntheticGguf.GgmlType.F16, (int)SyntheticGguf.GgmlType.F32, (int)SyntheticGguf.GgmlType.BF16, 70)]
+    public void HcRead_AnswersAsTheDoublePrecisionReference(int downTypeId, int injectTypeId, int upTypeId, int rows)
+    {
+        const int n = 256, hc = 4, lr = 64, wide = n * hc;
+        const float eps = 1e-6f;
+        var rng = new Random(rows * 31 + downTypeId);
+        // ggml's bytes for a [cols] x rowsOut matrix of the type, and the values they hold (ggml's dequantization)
+        (byte[] bytes, float[] values) Matrix(string name, SyntheticGguf.GgmlType t, int cols, int rowsOut, float scale)
+        {
+            int count = cols * rowsOut;
+            if (t == SyntheticGguf.GgmlType.Q8_0)
+            {
+                // values of the scale, quantized as llama-quantize does (random codes would be ~64x the scale)
+                var src = new float[count];
+                for (int i = 0; i < count; i++) src[i] = (float)((rng.NextDouble() * 2 - 1) * scale);
+                byte[] b = SyntheticGguf.QuantizeQ8_0(src, cols);
+                var f = new float[count];
+                var h = GCHandle.Alloc(b, GCHandleType.Pinned);
+                var o = GCHandle.Alloc(f, GCHandleType.Pinned);
+                try { GgmlGgufTensorDequant.DequantizeToFloat32Native((int)t, h.AddrOfPinnedObject(), o.AddrOfPinnedObject(), count); }
+                finally { h.Free(); o.Free(); }
+                return (b, f);
+            }
+            var vals = new float[count];
+            for (int i = 0; i < count; i++) vals[i] = (float)((rng.NextDouble() * 2 - 1) * scale);
+            byte[] bytes;
+            switch (t)
+            {
+                case SyntheticGguf.GgmlType.F32:
+                    bytes = new byte[count * 4];
+                    Buffer.BlockCopy(vals, 0, bytes, 0, bytes.Length);
+                    break;
+                case SyntheticGguf.GgmlType.F16:
+                    bytes = new byte[count * 2];
+                    for (int i = 0; i < count; i++)
+                    {
+                        var hv = (System.Half)vals[i];
+                        vals[i] = (float)hv;
+                        BitConverter.TryWriteBytes(bytes.AsSpan(i * 2), BitConverter.HalfToUInt16Bits(hv));
+                    }
+                    break;
+                case SyntheticGguf.GgmlType.BF16:
+                    bytes = new byte[count * 2];
+                    for (int i = 0; i < count; i++)
+                    {
+                        ushort hi = (ushort)(BitConverter.SingleToUInt32Bits(vals[i]) >> 16);   // truncated, as the value it holds
+                        vals[i] = BitConverter.UInt32BitsToSingle((uint)hi << 16);
+                        BitConverter.TryWriteBytes(bytes.AsSpan(i * 2), hi);
+                    }
+                    break;
+                default: throw new ArgumentException(t.ToString());
+            }
+            return (bytes, vals);
+        }
+        var (wdB, wd) = Matrix("hr-down", (SyntheticGguf.GgmlType)downTypeId, wide, lr, 1.5f / MathF.Sqrt(wide));
+        var (wiB, wi) = Matrix("hr-inject", (SyntheticGguf.GgmlType)injectTypeId, wide, hc, 1.5f / MathF.Sqrt(wide));
+        var (wuB, wu) = Matrix("hr-up", (SyntheticGguf.GgmlType)upTypeId, lr, wide, 2.0f / MathF.Sqrt(lr));
+        var gamma = new float[wide];
+        for (int i = 0; i < wide; i++) gamma[i] = (float)(0.5 + rng.NextDouble());
+        var res = new float[rows * wide];
+        for (int i = 0; i < res.Length; i++) res[i] = (float)((rng.NextDouble() * 2 - 1) * (1 + (i / n) % 3));
+
+        var mixed = new float[rows * n];
+        var inject = new float[rows * hc];
+        long before = GgmlBasicOps.TsmHcReadCount();
+        Assert.True(GgmlBasicOps.TsmHcReadProbe(n, hc, lr, downTypeId, wdB, injectTypeId, wiB, upTypeId, wuB, gamma, rows, res,
+            eps, mixed, inject), GgmlBasicOps.LastNativeError("probe failed"));
+        Assert.Equal(before + 1, GgmlBasicOps.TsmHcReadCount());
+
+        static double F16(double v) => (double)(System.Half)(float)v;
+        double mixRounded = 0, mixPlain = 0, mixRef = 0, injRounded = 0, injPlain = 0, injRef = 0;
+        var xn = new double[wide];
+        var xn16 = new double[wide];
+        var lo = new double[lr];
+        var lo16 = new double[lr];
+        for (int t = 0; t < rows; t++)
+        {
+            for (int c = 0; c < hc; c++)
+            {
+                double ss = 0;
+                for (int d = 0; d < n; d++) { double v = res[t * wide + c * n + d]; ss += v * v; }
+                double rs = 1.0 / Math.Sqrt(ss / n + eps);
+                for (int d = 0; d < n; d++)
+                {
+                    int k = c * n + d;
+                    xn[k] = res[t * wide + k] * rs * gamma[k];
+                    xn16[k] = F16(xn[k]);
+                }
+            }
+            for (int r = 0; r < lr + hc; r++)
+            {
+                double v = 0, v16 = 0;
+                for (int k = 0; k < wide; k++)
+                {
+                    double w = r < lr ? wd[r * wide + k] : wi[(r - lr) * wide + k];
+                    v += w * xn[k];
+                    v16 += F16(w) * xn16[k];
+                }
+                if (r < lr)
+                {
+                    double z = v / hc, z16 = v16 / hc;
+                    lo[r] = z / (1 + Math.Exp(-z));
+                    lo16[r] = F16(z16 / (1 + Math.Exp(-z16)));
+                }
+                else
+                {
+                    double g = inject[t * hc + r - lr];
+                    Assert.True(double.IsFinite(g));
+                    injRounded = Math.Max(injRounded, Math.Abs(g - v16));
+                    injPlain = Math.Max(injPlain, Math.Abs(g - v));
+                    injRef = Math.Max(injRef, Math.Abs(v));
+                }
+            }
+            for (int d = 0; d < n; d++)
+            {
+                double m = 0, m16 = 0;
+                for (int c = 0; c < hc; c++)
+                {
+                    int j = c * n + d;
+                    double g = 0, g16 = 0;
+                    for (int q = 0; q < lr; q++) { g += wu[j * lr + q] * lo[q]; g16 += F16(wu[j * lr + q]) * lo16[q]; }
+                    m += xn[j] / (1 + Math.Exp(-g));
+                    m16 += xn16[j] / (1 + Math.Exp(-g16));
+                }
+                m /= hc; m16 /= hc;
+                double got = mixed[t * n + d];
+                Assert.True(double.IsFinite(got));
+                mixRounded = Math.Max(mixRounded, Math.Abs(got - m16));
+                mixPlain = Math.Max(mixPlain, Math.Abs(got - m));
+                mixRef = Math.Max(mixRef, Math.Abs(m));
+            }
+        }
+        _output.WriteLine($"rows {rows}: mixed max |ref| {mixRef:E3}, error vs the rounded reference {mixRounded / mixRef:E3}, "
+            + $"vs the unrounded {mixPlain / mixRef:E3}; inject max |ref| {injRef:E3}, {injRounded / injRef:E3} / {injPlain / injRef:E3}");
+        Assert.True(mixRounded / mixRef < 5e-4, $"mixed vs the rounded reference: {mixRounded / mixRef:E3}");
+        Assert.True(injRounded / injRef < 1e-4, $"inject vs the rounded reference: {injRounded / injRef:E3}");
+        Assert.True(mixPlain / mixRef < 1e-3, $"mixed vs the unrounded reference: {mixPlain / mixRef:E3}");
+        Assert.True(injPlain / injRef < 1e-3, $"inject vs the unrounded reference: {injPlain / injRef:E3}");
+    }
 }

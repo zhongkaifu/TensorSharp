@@ -14,6 +14,10 @@ scatter passes) is TensorSharp's, written after Strata's `gr_epi_up` and `gr_nor
 chunk's grouped expert GEMM on the Metal 4 tensor API (`mm_hist`, `mm_scan`, `mm_place`, `mm_clear`, `mm_gather`,
 `mm_gu3`, `mm_down3`, `mm_combine`) with the Q2_0 decode, trimmed to those kernels and their Q2_0 instantiations; the
 kernel bodies are unchanged and its header lists what was left out.
+`kernels/tsm_hc_read.metal` (the fused hyper-connection read) is TensorSharp's, after Strata's `gr_norm_h`,
+`gr_epi_down` and `gemm_hc_up` (`metal/kernels/prompt.metal`) and `gemm_f16` (`metal/kernels/dense_mm.metal`), same
+commit and terms: the two GEMM bodies follow Strata's, the norm, the epilogue and the dequantization kernels are
+TensorSharp's, and its header lists the changes.
 `kernels/tsm_qsa_prompt.metal` (the QSA cell selection and attention) is TensorSharp's own; `kernels/tsm_qsa_attn_mm.metal`
 (the attention on the Metal 4 tensor API) is TensorSharp's, structured after ggml's `kernels/fa_tensor.metal` (MIT) with
 the query heads as rows as in Strata's `qsa_attn_mm`.

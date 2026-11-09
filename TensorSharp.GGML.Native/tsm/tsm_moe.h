@@ -158,4 +158,26 @@ namespace tsm
     void moe_mm_release();
     // Waits for the last command buffer a tsm encoder committed (ggml's synchronize does not cover them).
     void wait_last();
+
+    // ---- A prompt chunk's hyper-connection read in one pass on the matrix units (tsm/kernels/tsm_hc_read.metal, after
+    // Strata's gr_norm_h / gemm_f16 / gr_epi_down / gemm_hc_up): xn = rms_norm(each stream) * gamma in fp16, the down
+    // projection and the injection weights in one GEMM, silu(down / hc), and the up projection whose epilogue mixes
+    // the streams, in place of ggml's norm, three matmuls and element-wise passes. The weights are dequantized to fp16
+    // a chunk. TS_METAL_HC_READ=0 keeps the ggml path.
+    struct HcReadIO
+    {
+        const ggml_tensor* res = nullptr;       // F32 [n_embd * hc, T], the residual (read only)
+        const ggml_tensor* gamma = nullptr;     // F32 [n_embd * hc]
+        const ggml_tensor* w_down = nullptr;    // [n_embd * hc, lr]
+        const ggml_tensor* w_inject = nullptr;  // [n_embd * hc, hc]
+        const ggml_tensor* w_up = nullptr;      // [lr, n_embd * hc]
+        ggml_tensor* mixed = nullptr;           // F32 [n_embd, T], written
+        ggml_tensor* inject = nullptr;          // F32 [hc, T], written
+        int T = 0, n_embd = 0, hc = 0, lr = 0;
+        float eps = 0.0f;
+    };
+    // Whether the kernels take these weight types (F32, F16, BF16, Q8_0) and shapes on this backend.
+    bool hc_read_supported(ggml_backend* backend, int down_type, int inject_type, int up_type, int n_embd, int hc, int lr);
+    bool hc_read_encode(ggml_backend* backend, const HcReadIO& io);
+    long long hc_read_count();
 }

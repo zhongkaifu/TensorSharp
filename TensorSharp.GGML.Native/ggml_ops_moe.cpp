@@ -2448,19 +2448,25 @@ namespace tsg
         {
             if (hm.device_op)
             {
-                int cut = 0;
+                // The operation runs after the last node it reads. An input that is a leaf (the span's input, or an
+                // earlier device operation's output bound outside the allocator) is whole before the pass or before
+                // any later operation, so it places no cut: two operations in a row (a scatter, then the next
+                // half-layer's read) run with an empty segment between them.
+                int cut = seg_end.empty() ? 0 : seg_end.back();
+                bool any_node = false;
                 for (ggml_tensor* t : hm.device_inputs)
                 {
                     const int i = host_moe_graph_node_index(graph, t);
-                    if (i < 0)
+                    if (i < 0 && (t == nullptr || t->op != GGML_OP_NONE))
                     {
                         set_last_error(std::string(kernel_name) + ": a device operation's input is missing from the graph.");
                         seg_end.clear();
                         return false;
                     }
+                    if (i >= 0) any_node = true;
                     if (i + 1 > cut) cut = i + 1;
                 }
-                if (hm.device_inputs.empty() || (!seg_end.empty() && cut <= seg_end.back()))
+                if (hm.device_inputs.empty() || (!seg_end.empty() && (cut < seg_end.back() || (any_node && cut == seg_end.back()))))
                 {
                     set_last_error(std::string(kernel_name) + ": host-MoE segments are not in graph order.");
                     seg_end.clear();
