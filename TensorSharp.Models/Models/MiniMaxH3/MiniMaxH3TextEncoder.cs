@@ -71,6 +71,8 @@ namespace TensorSharp.Models.MiniMaxH3
         // Carried so the vision tower, built lazily below, gets the same routing.
         private readonly BackendType _backendType;
         private readonly IAllocator _allocatorForVision;
+        // Mappings the native uploads may read from the file instead (MiniMaxH3DirectRead).
+        private readonly IntPtr[] _directRead;
         private bool _disposed;
 
         public MiniMaxH3TextEncoderConfig Config { get; }
@@ -123,6 +125,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 _direct = new MiniMaxH3DirectTextEncoder(_gguf, Config, allocator);
 
             Tokenizer = LoadTokenizer(tokenizerDir ?? Path.GetDirectoryName(Path.GetFullPath(ggufPath)));
+            _directRead = MiniMaxH3DirectRead.Register(_gguf, backend);
         }
 
         /// <summary>Derive the configuration from tensor shapes; the GGUF has no metadata.</summary>
@@ -720,6 +723,7 @@ namespace TensorSharp.Models.MiniMaxH3
             _pins.Clear();
             _vision?.Dispose();
             _vision = null;
+            MiniMaxH3DirectRead.Unregister(_directRead);
             _gguf?.Dispose();
         }
     }

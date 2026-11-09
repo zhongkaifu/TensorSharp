@@ -61,6 +61,8 @@ namespace TensorSharp.Models.MiniMaxH3
         // the device by host pointer exactly like the weights, so releasing residency has
         // to hand them back as well. The model owns the set; this is a reference only.
         private MiniMaxH3LoraSet _boundLora;
+        // Mappings the native uploads may read from the file instead (MiniMaxH3DirectRead).
+        private readonly IntPtr[] _directRead;
         private bool _disposed;
 
         public MiniMaxH3Config Config { get; }
@@ -132,6 +134,7 @@ namespace TensorSharp.Models.MiniMaxH3
             // shared direct primitives instead.
             if (allocator != null && !IsGgmlBackendType(backend))
                 _direct = new MiniMaxH3DirectDiT(_gguf, Config, allocator);
+            _directRead = MiniMaxH3DirectRead.Register(_gguf, backend);
         }
 
         private static bool IsGgmlBackendType(BackendType b) =>
@@ -636,6 +639,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 _boundLora = null;
                 foreach (var h in _pins) if (h.IsAllocated) h.Free();
                 _pins.Clear();
+                MiniMaxH3DirectRead.Unregister(_directRead);
                 _gguf?.Dispose();
                 if (_nativeGraphArena != IntPtr.Zero)
                 {
