@@ -25,6 +25,29 @@ namespace TensorSharp.Cuda
         private DevLayer _mtpLayer;
         private Tensor _mtpEnorm, _mtpHnorm, _mtpHeadNorm;
         private DeviceWeight _mtpEh, _mtpHeadDown, _mtpHeadUp;
+
+        /// <summary>Tests: the MTP block's Q8_0 dense weights (none -> 0) and how many of them keep the decode-once dense
+        /// kernels (<see cref="DeviceWeight.DecodeOnce"/>).</summary>
+        internal (int Q8_0, int DecodeOnce) MtpQ8_0Weights
+        {
+            get
+            {
+                if (_mtpLayer == null)
+                    return (0, 0);
+                var L = _mtpLayer;
+                var all = new[] { L.HcAttnDown, L.HcAttnUp, L.HcFfnDown, L.HcFfnUp, L.Wq, L.Wk, L.Wv, L.Wo, L.Qkv, L.Gate, L.SsmOut,
+                    L.GateShexp, L.UpShexp, L.DownShexp, _mtpEh, _mtpHeadDown, _mtpHeadUp };
+                int q8 = 0, once = 0;
+                foreach (var w in all)
+                    if (w.Ptr != IntPtr.Zero && w.Type == TQ8_0)
+                    {
+                        q8++;
+                        if (w.DecodeOnce)
+                            once++;
+                    }
+                return (q8, once);
+            }
+        }
         /// <summary>The join rows [ubatch * hc, 2E], on the last device.</summary>
         private Tensor _mtpJoin;
         /// <summary>A call's trunk streams staged for upload [ubatch, hc * E].</summary>

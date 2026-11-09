@@ -919,12 +919,22 @@ namespace TensorSharp.Cuda
                    || CudaQuantizedOps.ResidentMatmulTakesQ81(w.Type, (int)w.Ne0, (int)w.Ne1, rows)
                    || Dsv4Kernels.DenseQ81RowsSupports(w.Type, (int)w.Ne0));
 
+        /// <summary>
+        /// Whether a decode-size call of <paramref name="rows"/> on <paramref name="w"/> runs the Q8_0 pair matvec: a Q8_0
+        /// weight of whole 32-value blocks, 1 to 16 rows, the pair loaded and on (TS_Q4E_Q80_PAIR), and the weight not one
+        /// that keeps the decode-once dense kernels (<see cref="DeviceWeight.DecodeOnce"/>: the TS_Q4E_HC_Q8 copies of the
+        /// hyper-connection down mixers and the MTP block's weights, where the pair was 1.2-2x slower from three rows on the
+        /// RTX 5090). A weight takes one kernel at every row count, so a row computes the same at every width.
+        /// </summary>
+        internal static bool TakesQ80Pair(in DeviceWeight w, int rows, bool hasPair)
+            => w.Type == TQ8_0 && !w.DecodeOnce && Q80Pair && hasPair && rows >= 1 && rows <= CudaKernels.Q80PairMaxRows
+               && (w.Ne0 & 31) == 0;
+
         private static void MatMul(Dev dev, in DeviceWeight w, Tensor input, IntPtr xq, Tensor output, int rows, IntPtr stream)
         {
             // Q8_0 decode projections: the pair matvec (tensor cores from three rows, its dp4a twin below), one
             // arithmetic at every row count, so batched rows still compute as each sequence's own step does.
-            if (xq != IntPtr.Zero && w.Type == TQ8_0 && Q80Pair && dev.Alloc.Kernels.HasQ80Pair && rows <= CudaKernels.Q80PairMaxRows
-                && (w.Ne0 & 31) == 0)
+            if (xq != IntPtr.Zero && TakesQ80Pair(w, rows, dev.Alloc.Kernels.HasQ80Pair))
             {
                 dev.Alloc.Kernels.LaunchQuantMatmulQ80Pair(w.Ptr, xq, Ptr(output), w.Ne0, w.Ne1, rows, stream);
                 return;
