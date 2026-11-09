@@ -517,6 +517,23 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         AssertClose("tier, fixed slots only (CUDA)", tiered, device, Bound(BackendType.GgmlCuda, hostPrefill: true));
     }
 
+    /// <summary>A 100-token prompt is wider than a discrete GPU tier's old 64-row split and narrower than the 128 rows
+    /// the seam streams from, so it ran every route of every layer on the host (ggml_cuda Flash Next: 1.1-1.4 s for a
+    /// 73-76 token prompt against 0.27-0.29 s at 64 rows). The tier now splits up to the streaming width: the slots
+    /// compute their routes on the GPU, the host the rest, and the prompt answers as the all-accelerator span.</summary>
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void TieredExperts_SplitASpanNarrowerThanTheStreamingWidth_Cuda()
+    {
+        int[] prompt = Enumerable.Range(0, 100).Select(i => (i * 29 + 3) % 250).ToArray();
+        float[][] device = Run(BackendType.GgmlCuda, () => { }, prompt);
+        float[][] tiered = Run(BackendType.GgmlCuda, MoeCpuOffloadConfig.SetAllLayers, prompt, model =>
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 2, 0));
+        });
+        AssertClose("tier, fixed slots only, 100-row prompt split (CUDA)", tiered, device, Bound(BackendType.GgmlCuda, hostPrefill: true));
+    }
+
     /// <summary>Adaptive fixed slots (<c>TS_MOE_TIER_ADAPT=1</c>, discrete VRAM): 96 decode steps over a
     /// few repeating tokens concentrate the routing on experts the initial slots (ids 0..n/4-1) mostly
     /// do not hold. Every 32 seams the hottest of them are copied into the coldest slots, so more

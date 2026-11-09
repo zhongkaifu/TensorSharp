@@ -694,8 +694,10 @@ it and reads those parts from the SSD as tokens need them.
   1.3 s a chunk whatever its width. When streaming started at 65 tokens, every short prompt
   paid that: cold TTFT for 88-473 token prompts went from 1.35-1.4 s to 0.33-0.76 s with
   the split, and 900 / 1,770 tokens from 1.76-2.0 / 2.7 s to 1.33-1.55 / 2.55 s. At 3,500
-  tokens the two paths are level. `TS_HOST_MOE_TIER_MAX_ROWS` sets the width; a tier
-  without window slots (a discrete GPU's) keeps 64. Routes that neither the slots nor the
+  tokens the two paths are level. `TS_HOST_MOE_TIER_MAX_ROWS` sets the width. A tier
+  without window slots (a discrete GPU's) splits up to one row below where streaming starts (127): when it stopped at
+  64, a 65-127 row span was neither split nor streamed and ran every route on the host (see "Concurrent requests on
+  ggml_cuda" below). Routes that neither the slots nor the
   window take at a prompt width run on the GPU too, their experts read into the one
   staging buffer: on the host decode kernel, which works in blocks of 8 rows and reads
   every overflow expert again per block, a 1,024-token span of Strata's records prompt
