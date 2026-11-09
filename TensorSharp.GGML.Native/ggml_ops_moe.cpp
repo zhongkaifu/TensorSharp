@@ -2466,6 +2466,11 @@ namespace tsg
                 const int i_v = host_moe_graph_node_index(graph, hm.verify_gpu);
                 if (i_v + 1 > cut) cut = i_v + 1;
             }
+            if (hm.pred_next != nullptr)   // the read-ahead's guess is read at this seam: it precedes the cut
+            {
+                const int i_p = host_moe_graph_node_index(graph, hm.pred_next);
+                if (i_p + 1 > cut) cut = i_p + 1;
+            }
             if (!seg_end.empty() && cut <= seg_end.back())
             {
                 set_last_error(std::string(kernel_name) + ": host-MoE segments are not in graph order.");
@@ -2802,6 +2807,15 @@ namespace tsg
             ok = host_moe_compute_segment(hm, s_out, kernel_name, nullptr, false, nullptr, nullptr, nullptr);
             if (timing) *acc_host += ms_since(t_host);
             if (!ok) break;
+            // The accelerator runs this layer's tier routes now (the split released them): read the next tier's
+            // predicted misses meanwhile (Strata's read-ahead), so its seam finds them in place.
+            if (hm.pred_next != nullptr && k + 1 < n_seams && segments[k + 1].hot_tier != nullptr)
+            {
+                static thread_local std::vector<float> s_pred;
+                s_pred.resize(static_cast<std::size_t>(hm.num_experts) * hm.seq_len);
+                ggml_backend_tensor_get(hm.pred_next, s_pred.data(), 0, s_pred.size() * sizeof(float));
+                moe_hot_tier_prefetch(*segments[k + 1].hot_tier, s_pred.data(), hm.seq_len);
+            }
             const auto t_up = timing ? clock::now() : clock::time_point{};
             host_moe_upload_segment(hm, s_out.data());
             tsm::seams_release_out();

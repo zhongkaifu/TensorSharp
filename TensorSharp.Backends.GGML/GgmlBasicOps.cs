@@ -3635,6 +3635,16 @@ namespace TensorSharp.GGML
 
         public static long MoeHotTierTotalBytes() => GgmlNative.TSGgml_MoeHotTierTotalBytes();
 
+        /// <summary>Strata's read-ahead into the tiers' windows since the process started: experts read ahead from
+        /// the next layer's predicted routing, those a route then used, and reads that failed
+        /// (<c>TS_MOE_TIER_PREFETCH</c>).</summary>
+        public static unsafe (long Reads, long Hits, long Failed) MoeTierPrefetchStats()
+        {
+            long* s = stackalloc long[3];
+            GgmlNative.TSGgml_MoeTierPrefetchStats(s);
+            return (s[0], s[1], s[2]);
+        }
+
         /// <summary>Free the accelerator tier of the layer mapped at <paramref name="gate"/>
         /// (<see cref="IntPtr.Zero"/>: all). Drop the graphs that bind it first.</summary>
         public static void MoeHotTierRelease(IntPtr gate) => GgmlNative.TSGgml_MoeHotTierRelease(gate);

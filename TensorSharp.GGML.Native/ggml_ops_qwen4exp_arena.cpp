@@ -1104,7 +1104,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                 res = q4e_nodes_ffn(ctx, binder, &ffn[il], res,
                         n_embd, hc, hc_low_rank, n_slots,
                         n_expert, n_expert_used, n_ff, n_ff_sh, eps,
-                        e.graph, &e.host_moe, il);
+                        e.graph, &e.host_moe, il, il + 1 < n_layers ? &ffn[il + 1] : nullptr);
                 if (ffn[il].cpu_moe) e.host_moe.back().independent_decode_rows = true;
                 ggml_build_forward_expand(e.graph, res);
                 if (trace) { ggml_set_output(res); e.trace_res.push_back(res); }

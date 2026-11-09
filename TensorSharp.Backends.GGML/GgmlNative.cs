@@ -4660,6 +4660,8 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static unsafe partial void TSGgml_MoeHotTierStats(long* stats4);
         [LibraryImport(DllName)]
+        internal static unsafe partial void TSGgml_MoeTierPrefetchStats(long* stats3);
+        [LibraryImport(DllName)]
         internal static partial long TSGgml_MoeHotTierTotalBytes();
         [LibraryImport(DllName)]
         internal static partial void TSGgml_MoeHotTierRelease(IntPtr gate);

@@ -969,6 +969,10 @@ namespace tsg
         // TensorSharp Metal (tsm/tsm_moe.h): the tier's routes computed at the seam by the grouped expert kernels,
         // into this pinned F32 [hidden, seq] input, instead of MUL_MAT_ID in the next segment. Null otherwise.
         ggml_tensor* tsm_hot = nullptr;
+        // The NEXT layer's router logits from this layer's FFN input (F32 [num_experts, seq], pinned), computed in
+        // this segment so the seam can read the next tier's predicted misses ahead (moe_hot_tier_prefetch,
+        // Strata's read-ahead). Null when the next layer has no window or TS_MOE_TIER_PREFETCH=0.
+        ggml_tensor* pred_next = nullptr;
 
         // A device operation in place of host experts (no host work, no transfers): the cut follows the last of
         // device_inputs in graph order, and device_op encodes its work on the accelerator's queue right after that
@@ -1002,6 +1006,10 @@ namespace tsg
         std::uint64_t clock = 0, step = 0;
         std::uint64_t hits = 0, misses = 0, overflow = 0;
         std::uint64_t deferred = 0;       // misses read in the background (verify overlap)
+        // Read-ahead (moe_hot_tier_prefetch): window slots being read for the predicted routes of this layer's next
+        // step, settled when that step's seam starts; and the slots it filled, until that step counts its hits.
+        std::vector<int> prefetch_pending;
+        std::vector<int> prefetched;
         // Adaptive fixed slots (TS_MOE_TIER_ADAPT, discrete VRAM): decayed route counts per
         // expert; every few seams the hottest host-served experts take the coldest slots.
         std::vector<float> heat;
@@ -1020,6 +1028,11 @@ namespace tsg
     void moe_stage_prefetch_release();
     // Decode / verify routes the route tail skip dropped in this process (ggml_ops_moe_hot_tier.cpp).
     long long moe_tail_skipped_routes();
+    // Strata's read-ahead into a tier's window (ggml_ops_moe_hot_tier.cpp): the experts each row's top
+    // moe_tier_prefetch_k() predicted logits name that `tier` does not hold are read into its least recently used
+    // window slots in the background; the tier's next seam waits for them. Exact: a slot holds the expert's bytes.
+    int moe_tier_prefetch_k();
+    void moe_hot_tier_prefetch(MoeHotTier& tier, const float* logits, int T);
 
     // A buffer type over `inner` that keeps the one buffer its owner freed last and hands it to the owner's next
     // allocation it serves (ggml_ops_buffer_reuse.cpp): a graph slot rebuilt for every prompt chunk reuses its arena
@@ -2282,7 +2295,8 @@ ggml_tensor* q4e_nodes_ffn(
     const TSGgmlQwen4ExpFfnArgs* a, ggml_tensor* res_in,
     int n_embd, int hc, int hc_low_rank, int T,
     int n_expert, int n_expert_used, int n_ff, int n_ff_sh, float eps,
-    ggml_cgraph* graph = nullptr, std::vector<tsg::HostMoeSegment>* host_moe = nullptr, int layer = -1);
+    ggml_cgraph* graph = nullptr, std::vector<tsg::HostMoeSegment>* host_moe = nullptr, int layer = -1,
+    const TSGgmlQwen4ExpFfnArgs* next_a = nullptr);
 
 ggml_tensor* q4e_nodes_gdn(
     ggml_context* ctx, Q4eBinder& bnd,

@@ -503,6 +503,36 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         AssertClose("tier, verify-width overlap", overlapped, device, 1e-4);
     }
 
+    /// <summary>Strata's read-ahead: at each seam the next layer's router, applied to this layer's FFN input, names
+    /// the experts the next tier will likely miss, and they are read into its window while the accelerator works. A
+    /// slot holds the expert's bytes wherever it came from, so with the route tail skip off (it decides on what the
+    /// slots hold) decoding answers as without the read-ahead; the counters show it read and was used.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void TieredExperts_ReadAhead_AnswersAsWithout_Metal()
+    {
+        _nativeEnv.Set("TS_MOE_ROUTE_TAIL_SKIP", "0");
+        Action<ModelBase> smallTier = model =>
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            // A few fixed slots and a window, so decode steps miss and the read-ahead has something to read.
+            Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 8, q.ExpertCountForTests / 2));
+        };
+        _nativeEnv.Set("TS_MOE_TIER_PREFETCH", "0");
+        long readsBefore = GgmlBasicOps.MoeTierPrefetchStats().Reads;
+        float[][] without = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, smallTier, null);
+        Assert.Equal(readsBefore, GgmlBasicOps.MoeTierPrefetchStats().Reads);
+
+        _nativeEnv.Set("TS_MOE_TIER_PREFETCH", "6");
+        var before = GgmlBasicOps.MoeTierPrefetchStats();
+        float[][] with = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, smallTier, null);
+        var after = GgmlBasicOps.MoeTierPrefetchStats();
+        _output.WriteLine($"read ahead {after.Reads - before.Reads}, used {after.Hits - before.Hits}, failed {after.Failed - before.Failed}");
+        Assert.True(after.Reads > before.Reads, "the read-ahead read nothing");
+        Assert.True(after.Hits > before.Hits, "no expert read ahead was routed to");
+        Assert.Equal(before.Failed, after.Failed);
+        AssertClose("tier, read-ahead", with, without, 1e-5);
+    }
+
     /// <summary>Discrete VRAM: fixed slots only (no host-writable window), the rest of every
     /// route on the host. Prefill (40 tokens) runs the batched expert kernels on the slots.</summary>
     [GgmlFact(BackendType.GgmlCuda)]

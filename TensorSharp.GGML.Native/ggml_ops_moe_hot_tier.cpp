@@ -340,6 +340,123 @@ namespace tsg
 
     long long moe_tail_skipped_routes() { return g_tail_skipped.load(std::memory_order_relaxed); }
 
+    // ---- read-ahead (Strata's ExpertStream::ahead) ------------------------------------------------------------
+    // Strata guesses the next layer's routing from this layer's FFN input (the next layer's router applied to it, on
+    // the GPU beside this layer's router) and reads the experts it names that the arena lacks while the GPU computes,
+    // so the next layer's host turn finds them in place. Here the guess is HostMoeSegment::pred_next and the reads go
+    // to the next tier's window slots on the background I/O team, issued as soon as this seam has released the
+    // accelerator; the next tier's seam waits for them before it looks up its routes. A guessed expert is copied byte
+    // for byte, so the answers are those without the read-ahead. TS_MOE_TIER_PREFETCH=<k>: each row's top k guesses
+    // (0 turns it off); read per call, so a test toggles it.
+    namespace
+    {
+        std::atomic<long long> g_prefetch_reads{0}, g_prefetch_hits{0}, g_prefetch_failed{0};
+        constexpr int kPrefetchDefaultK = 6;    // Strata's default on a Mac with room (STRATA_METAL_PREFETCH)
+        constexpr int kPrefetchMaxK = 16;
+
+        // The read-ahead batch the tier's next seam must wait for: done (or failed and undone) before the seam reads
+        // the slots. Called at the start of that seam's split, on the thread that issued it.
+        void tier_prefetch_settle(MoeHotTier& tier)
+        {
+            if (tier.prefetch_pending.empty()) return;
+            if (!host_expert_io_wait_async())
+            {
+                // A failed read leaves its slot undefined: empty every slot of the batch; their routes take the
+                // ordinary miss path.
+                for (int v : tier.prefetch_pending)
+                {
+                    if (tier.expert_of[v] >= 0) tier.slot_of[tier.expert_of[v]] = -1;
+                    tier.expert_of[v] = -1;
+                    tier.last_use[v] = 0;
+                }
+                g_prefetch_failed.fetch_add(static_cast<long long>(tier.prefetch_pending.size()), std::memory_order_relaxed);
+            }
+            else
+                tier.prefetched = tier.prefetch_pending;
+            tier.prefetch_pending.clear();
+        }
+    }
+
+    long long g_prefetch_reads_value() { return g_prefetch_reads.load(std::memory_order_relaxed); }
+    long long g_prefetch_hits_value() { return g_prefetch_hits.load(std::memory_order_relaxed); }
+    long long g_prefetch_failed_value() { return g_prefetch_failed.load(std::memory_order_relaxed); }
+
+    int moe_tier_prefetch_k()
+    {
+        const char* e = std::getenv("TS_MOE_TIER_PREFETCH");
+        const int k = e ? std::atoi(e) : kPrefetchDefaultK;
+        return k <= 0 ? 0 : std::min(k, kPrefetchMaxK);
+    }
+
+    void moe_hot_tier_prefetch(MoeHotTier& tier, const float* logits, int T)
+    {
+        const int k = moe_tier_prefetch_k();
+        if (k <= 0 || logits == nullptr || T <= 0 || !tier.cpu_visible || tier.count <= tier.fixed)
+            return;
+        // One background batch at a time (the I/O team's): a batch still in flight is left to finish.
+        if (!tier.prefetch_pending.empty() || host_expert_io_async_pending())
+            return;
+        const int n = tier.num_experts;
+        // Every row's top k guesses, most likely first by the best logit over the rows (Strata's order).
+        static thread_local std::vector<std::pair<float, int>> s_guess;
+        static thread_local std::vector<int> s_top;
+        s_guess.clear();
+        for (int r = 0; r < T; ++r)
+        {
+            const float* lg = logits + static_cast<std::size_t>(r) * n;
+            s_top.clear();
+            for (int e = 0; e < n; ++e)
+            {
+                if (static_cast<int>(s_top.size()) < k) { s_top.push_back(e); continue; }
+                int m = 0;
+                for (int j = 1; j < k; ++j) if (lg[s_top[j]] < lg[s_top[m]]) m = j;
+                if (lg[e] > lg[s_top[m]]) s_top[m] = e;
+            }
+            for (int e : s_top)
+            {
+                if (tier.slot_of[e] >= 0) continue;   // held already (fixed or window)
+                auto it = std::find_if(s_guess.begin(), s_guess.end(), [e](const auto& g) { return g.second == e; });
+                if (it == s_guess.end()) s_guess.emplace_back(lg[e], e);
+                else it->first = std::max(it->first, lg[e]);
+            }
+        }
+        if (s_guess.empty()) return;
+        std::sort(s_guess.begin(), s_guess.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        // At most half the window a step, so the read-ahead never pushes out what the window holds for the rest.
+        const std::size_t limit = std::min<std::size_t>(s_guess.size(), static_cast<std::size_t>((tier.count - tier.fixed) / 2));
+        static thread_local std::vector<const void*> s_src;
+        static thread_local std::vector<std::size_t> s_len;
+        static thread_local std::vector<std::uint8_t*> s_dst;
+        s_src.clear(); s_len.clear(); s_dst.clear();
+        auto* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(tier.buffer));
+        for (std::size_t g = 0; g < limit; ++g)
+        {
+            const int e = s_guess[g].second;
+            int victim = -1;   // the least recently used window slot not taken by this batch
+            for (int s2 = tier.fixed; s2 < tier.count; ++s2)
+            {
+                if (std::find(tier.prefetch_pending.begin(), tier.prefetch_pending.end(), s2) != tier.prefetch_pending.end())
+                    continue;
+                if (victim < 0 || tier.last_use[s2] < tier.last_use[victim]) victim = s2;
+            }
+            if (victim < 0) break;
+            if (tier.expert_of[victim] >= 0) tier.slot_of[tier.expert_of[victim]] = -1;
+            tier.expert_of[victim] = e;
+            tier.slot_of[e] = victim;
+            tier.last_use[victim] = ++tier.clock;
+            tier.prefetch_pending.push_back(victim);
+            for (int p = 0; p < 3; ++p)
+            {
+                s_src.push_back(static_cast<const std::uint8_t*>(tier.source[p]) + static_cast<std::size_t>(e) * tier.stride[p]);
+                s_len.push_back(tier.stride[p]);
+                s_dst.push_back(base + tier.offset[p] + static_cast<std::size_t>(victim) * tier.stride[p]);
+            }
+        }
+        if (s_src.empty()) return;
+        g_prefetch_reads.fetch_add(static_cast<long long>(tier.prefetch_pending.size()), std::memory_order_relaxed);
+        host_expert_io_read_slices_async(s_src.data(), s_len.data(), s_dst.data(), static_cast<int>(s_src.size()));
+    }
+
     bool host_moe_split_hot_routes(const HostMoeSegment& hm, const std::int32_t* ids, const float* weights,
         std::vector<std::int32_t>& cold_ids, std::vector<float>& cold_weights, std::vector<std::uint8_t>& cold_pad,
         int& cold_used)
@@ -349,6 +466,17 @@ namespace tsg
         const std::size_t routes = static_cast<std::size_t>(T) * n_used;
         for (std::size_t i = 0; i < routes; ++i)
             if (ids[i] < 0 || ids[i] >= tier.num_experts) return false;
+        // The read-ahead the previous seam issued for this step: complete before anything reads the slots.
+        tier_prefetch_settle(tier);
+        if (!tier.prefetched.empty())
+        {
+            long long hit = 0;
+            for (int v : tier.prefetched)
+                for (std::size_t i = 0; i < routes; ++i)
+                    if (tier.expert_of[v] == ids[i]) { ++hit; break; }
+            g_prefetch_hits.fetch_add(hit, std::memory_order_relaxed);
+            tier.prefetched.clear();
+        }
         // Between segments: nothing the accelerator still runs reads the slots.
         if (tier_adapt_enabled()) tier_adapt(tier, ids, routes);
 
@@ -822,10 +950,21 @@ TSG_EXPORT void TSGgml_MoeHotTierStats(long long* stats4)
     }
 }
 
+// Read-ahead counters since the process started: [0] experts read ahead, [1] of those a route used at the next
+// step, [2] read-ahead reads that failed (their slots emptied). TS_MOE_TIER_PREFETCH sets the guesses a row.
+TSG_EXPORT void TSGgml_MoeTierPrefetchStats(long long* stats3)
+{
+    if (stats3 == nullptr) return;
+    stats3[0] = tsg::g_prefetch_reads_value();
+    stats3[1] = tsg::g_prefetch_hits_value();
+    stats3[2] = tsg::g_prefetch_failed_value();
+}
+
 // Free the tier of the layer whose gate stack is mapped at `gate` (null: every
 // tier). The caller must already have dropped the graphs that bind it.
 TSG_EXPORT void TSGgml_MoeHotTierRelease(const void* gate)
 {
+    tsg::host_expert_io_wait_async();   // a read-ahead may still write into the slots about to go
     if (gate == nullptr) { tsg::moe_hot_tier_release(); return; }
     std::lock_guard<std::mutex> lock(tsg::g_tier_mutex);
     for (auto it = tsg::g_tiers.begin(); it != tsg::g_tiers.end();)

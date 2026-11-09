@@ -1309,7 +1309,8 @@ ggml_tensor* q4e_nodes_ffn(
     const TSGgmlQwen4ExpFfnArgs* a, ggml_tensor* res_in,
     int n_embd, int hc, int hc_low_rank, int T,
     int n_expert, int n_expert_used, int n_ff, int n_ff_sh, float eps,
-    ggml_cgraph* graph, std::vector<tsg::HostMoeSegment>* host_moe, int layer)
+    ggml_cgraph* graph, std::vector<tsg::HostMoeSegment>* host_moe, int layer,
+    const TSGgmlQwen4ExpFfnArgs* next_a)
 {
     const bool cpu_moe = a->cpu_moe != 0;
     if (cpu_moe && (graph == nullptr || host_moe == nullptr))
@@ -1458,6 +1459,22 @@ ggml_tensor* q4e_nodes_ffn(
                     hot_sum = tsg::host_moe_build_hot_part(ctx, hm, hm.moe_in, *tier, q4e_mul_mat_id,
                         overlap, graph, &overlap_wait);
                 }
+
+#if defined(TSG_GGML_USE_METAL)
+        // Strata's read-ahead: the next layer's router applied to this layer's FFN input, computed in this segment
+        // (the cut follows it, see host_moe_build_segment_ends), so the seam can read the next tier's predicted
+        // misses while the accelerator works (tsg::moe_hot_tier_prefetch). Only where the seam computes the tier's
+        // routes itself (decode and verify widths) and the next tier has a window to fill.
+        if (hm.tsm_hot != nullptr && next_a != nullptr && next_a->cpu_moe && tsg::moe_tier_prefetch_k() > 0)
+            if (tsg::MoeHotTier* next_tier = tsg::moe_hot_tier_find(next_a->gate_exps))
+                if (next_tier->cpu_visible && next_tier->count > next_tier->fixed && next_tier->num_experts == n_expert)
+                {
+                    ggml_tensor* w_next_router = ggml_new_tensor_2d(ctx, (ggml_type)next_a->router_type, n_embd, n_expert);
+                    bnd.add(w_next_router, next_a->router, (std::size_t)next_a->router_bytes);
+                    hm.pred_next = boundary(q4e_mul_mat(ctx, w_next_router, mixed));   // [n_expert, T]
+                    ggml_build_forward_expand(graph, hm.pred_next);
+                }
+#endif
 
         host_moe->push_back(hm);
         if (overlap_wait.io_wait) host_moe->push_back(overlap_wait);
@@ -3365,7 +3382,7 @@ static int q4e_token_span_impl(
             res = q4e_nodes_ffn(ctx, binder, &ffn[il], res,
                     n_embd, hc, hc_low_rank, T,
                     n_expert, n_expert_used, n_ff, n_ff_sh, eps,
-                    graph, &host_moe, il);
+                    graph, &host_moe, il, il + 1 < layer_end ? &ffn[il + 1] : nullptr);
             // A verify-width span runs the one-token device kernels (Q4eRowKernels);
             // its host-offloaded experts must keep the one-token host arithmetic as
             // well, as the arena does. Otherwise the rows take the multi-token host
