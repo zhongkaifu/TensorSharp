@@ -1046,6 +1046,8 @@ namespace TensorSharp.Cuda
 
         public void Dispose()
         {
+            try { DrainDecodeLanes(); } catch { }
+            DisposeDecodeLanes();
             foreach (var slot in _slots.Values)
                 FreeSlot(slot);
             DisposeKvHostPool();
