@@ -69,7 +69,9 @@ namespace tsg
     namespace
     {
         constexpr int kMaxUsed = 64;
-        constexpr int kMaxRows = 8;
+        // 16: the direct CUDA engine's batched speculative verify (four sequences' 4-row windows in one step). The
+        // ggml callers still pass blocks of 8; a row's arithmetic does not depend on how many rows share the call.
+        constexpr int kMaxRows = 16;
         constexpr int kRowsPerChunk = 64;
         constexpr int kSlots = 4;
 
@@ -92,10 +94,14 @@ namespace tsg
         struct DecodeJob
         {
             int n_rows = 0, n_used = 0, n_embd = 0, n_ff = 0;
+            float swiglu_limit = 0.0f;   // HostMoeSegment::swiglu_limit
             const std::uint8_t* gate[kMaxRows * kMaxUsed] = {};
             const std::uint8_t* up[kMaxRows * kMaxUsed] = {};
             const std::uint8_t* down[kMaxRows * kMaxUsed] = {};
             float weight[kMaxRows * kMaxUsed] = {};
+            // Padding entries (a row with fewer routes than n_used): no work, no
+            // contribution. The other entries keep their order and arithmetic.
+            bool skip[kMaxRows * kMaxUsed] = {};
             // Multirow-only schedules group repeated mapped matrices by
             // address, without changing each row's logical expert slots.
             int matrix_order[2 * kMaxRows * kMaxUsed] = {};
@@ -137,6 +143,7 @@ namespace tsg
             const int per = j.chunks_per_matrix;
             const int matrix = j.n_rows == 1 ? c / per : j.matrix_order[c / per];
             const int e = matrix / 2;
+            if (j.skip[e]) return;
             const bool is_up = (matrix & 1) != 0;
             const int r0 = (c % per) * kRowsPerChunk;
             const int r1 = std::min(j.n_ff, r0 + kRowsPerChunk);
@@ -153,11 +160,22 @@ namespace tsg
 
         void phase2_expert(DecodeJob& j, int e)
         {
+            if (j.skip[e]) return;
             const float* g = j.g + (std::size_t)e * j.n_ff;
             const float* u = j.u + (std::size_t)e * j.n_ff;
             float* h = j.h + (std::size_t)e * j.n_ff;
-            for (int i = 0; i < j.n_ff; ++i)
-                h[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
+            if (j.swiglu_limit > 0.0f)
+            {
+                const float L = j.swiglu_limit;
+                for (int i = 0; i < j.n_ff; ++i)
+                {
+                    const float gi = std::min(g[i], L), ui = std::min(std::max(u[i], -L), L);
+                    h[i] = gi / (1.0f + std::exp(-gi)) * ui;
+                }
+            }
+            else
+                for (int i = 0; i < j.n_ff; ++i)
+                    h[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
             j.h_quant(h, j.hq + (std::size_t)e * j.hq_row, j.n_ff);
         }
 
@@ -175,6 +193,7 @@ namespace tsg
             // first), so the result does not depend on how chunks were taken.
             for (int e = 0; e < j.n_used; ++e)
             {
+                if (j.skip[expert_base + e]) continue;
                 const std::uint8_t* base = j.down[expert_base + e];
                 const void* hq = j.hq + (std::size_t)(expert_base + e) * j.hq_row;
                 const float w = j.weight[expert_base + e];
@@ -191,6 +210,7 @@ namespace tsg
         void phase3_project_chunk(DecodeJob& j, int c)
         {
             const int e = j.down_order[c / j.chunks3_per_row];
+            if (j.skip[e]) return;
             const int r0 = (c % j.chunks3_per_row) * kRowsPerChunk;
             const int r1 = std::min(j.n_embd, r0 + kRowsPerChunk);
             const auto* base = j.down[e];
@@ -216,6 +236,7 @@ namespace tsg
             // including duplicate experts and signed routing coefficients.
             for (int e = 0; e < j.n_used; ++e)
             {
+                if (j.skip[expert_base + e]) continue;
                 const float* projected = j.projected + (std::size_t)(expert_base + e) * j.n_embd;
                 const float w = j.weight[expert_base + e];
                 for (int r = r0; r < r1; ++r) acc[r - r0] += w * projected[r];
@@ -395,6 +416,8 @@ namespace tsg
         };
 
         std::mutex g_team_mutex;          // one offloaded layer at a time
+        // Telemetry totals (tensorsharp.moe.host.compute.time and the host route count).
+        std::atomic<long long> g_rows_ns{0}, g_rows_calls{0}, g_rows_slots{0};
         DecodeTeam* g_team = nullptr;
         bool g_team_failed = false;       // the team could not start; use the graph path
 
@@ -423,8 +446,31 @@ namespace tsg
         }
     }
 
+    // Under g_team_mutex (the resolver's lock): read `a`'s slices ahead.
+    static void prefetch_slices_locked(const HostMoePrefetch& a)
+    {
+        constexpr int kMaxPrefetch = 3 * kMaxRows * kMaxUsed;
+        const HostMoeSegment& hm = *a.hm;
+        if (a.ids == nullptr || a.count <= 0 || hm.num_experts <= 0 || hm.hidden <= 0 || hm.n_ff <= 0) return;
+        const std::size_t gate_stride = ggml_row_size((ggml_type)hm.gate_type, hm.hidden) * (std::size_t)hm.n_ff;
+        const std::size_t up_stride = ggml_row_size((ggml_type)hm.up_type, hm.hidden) * (std::size_t)hm.n_ff;
+        const std::size_t down_stride = ggml_row_size((ggml_type)hm.down_type, hm.n_ff) * (std::size_t)hm.hidden;
+        const void* sources[kMaxPrefetch];
+        std::size_t lengths[kMaxPrefetch];
+        int n = 0;
+        for (int k = 0; k < a.count && n + 3 <= kMaxPrefetch; ++k)
+        {
+            if (a.ids[k] < 0 || a.ids[k] >= hm.num_experts) continue;
+            sources[n] = (const std::uint8_t*)hm.gate_data + (std::size_t)a.ids[k] * gate_stride; lengths[n++] = gate_stride;
+            sources[n] = (const std::uint8_t*)hm.up_data + (std::size_t)a.ids[k] * up_stride; lengths[n++] = up_stride;
+            sources[n] = (const std::uint8_t*)hm.down_data + (std::size_t)a.ids[k] * down_stride; lengths[n++] = down_stride;
+        }
+        host_expert_io_prefetch(sources, lengths, n);
+    }
+
     bool host_moe_decode_experts_rows(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
-                                     const float* weights, float* out)
+                                     const float* weights, float* out, const std::uint8_t* skip,
+                                     const HostMoePrefetch* ahead)
     {
         if (!decode_kernel_enabled() || hm.seq_len < 1 || hm.seq_len > kMaxRows || hm.activation != 0
             || hm.up_data == nullptr || hm.gate_bias || hm.up_bias || hm.down_bias
@@ -467,7 +513,24 @@ namespace tsg
         for (int k = 0; k < selected; ++k)
             if (ids[k] < 0 || ids[k] >= hm.num_experts) return false;
 
+        // Every routed slice, all three parts, resolved in one call so the
+        // explicitly read cache fetches all misses together.
+        const void* sources[3 * kMaxRows * kMaxUsed];
+        std::size_t lengths[3 * kMaxRows * kMaxUsed];
+        const std::uint8_t* resolved[3 * kMaxRows * kMaxUsed];
+        for (int k = 0; k < selected; ++k)
+        {
+            sources[3 * k] = (const std::uint8_t*)hm.gate_data + (std::size_t)ids[k] * gate_stride;
+            sources[3 * k + 1] = (const std::uint8_t*)hm.up_data + (std::size_t)ids[k] * up_stride;
+            sources[3 * k + 2] = (const std::uint8_t*)hm.down_data + (std::size_t)ids[k] * down_stride;
+            lengths[3 * k] = gate_stride; lengths[3 * k + 1] = up_stride; lengths[3 * k + 2] = down_stride;
+        }
+
         std::lock_guard<std::mutex> guard(g_team_mutex);
+        // Under the team lock: the slots must stay put until this call's compute
+        // is done, and every caller of the resolver holds this lock.
+        host_expert_io_resolve(sources, lengths, 3 * selected, resolved);
+        if (ahead != nullptr && ahead->hm != nullptr) prefetch_slices_locked(*ahead);
         if (g_team == nullptr)
         {
             if (g_team_failed)
@@ -515,12 +578,14 @@ namespace tsg
 
         DecodeJob& j = g_team->acquire();
         j.n_rows = n_rows; j.n_used = hm.n_used; j.n_embd = n_embd; j.n_ff = n_ff;
+        j.swiglu_limit = hm.swiglu_limit;
         for (int k = 0; k < selected; ++k)
         {
-            j.gate[k] = (const std::uint8_t*)hm.gate_data + (std::size_t)ids[k] * gate_stride;
-            j.up[k] = (const std::uint8_t*)hm.up_data + (std::size_t)ids[k] * up_stride;
-            j.down[k] = (const std::uint8_t*)hm.down_data + (std::size_t)ids[k] * down_stride;
+            j.gate[k] = resolved[3 * k];
+            j.up[k] = resolved[3 * k + 1];
+            j.down[k] = resolved[3 * k + 2];
             j.weight[k] = weights[k];
+            j.skip[k] = skip != nullptr && skip[k] != 0;
         }
         if (n_rows > 1)
         {
@@ -562,7 +627,15 @@ namespace tsg
             j.t_last_join.store(j.t_start, std::memory_order_relaxed);
             j.joined.store(0, std::memory_order_relaxed);
         }
+        const std::int64_t t_run = now_ns();
         g_team->run(j);
+        {
+            int computed = 0;
+            for (int k = 0; k < selected; ++k) computed += j.skip[k] ? 0 : 1;
+            g_rows_ns.fetch_add(now_ns() - t_run, std::memory_order_relaxed);
+            g_rows_calls.fetch_add(1, std::memory_order_relaxed);
+            g_rows_slots.fetch_add(computed, std::memory_order_relaxed);
+        }
         if (timing)
         {
             static double acc_total = 0, acc_join = 0, acc_p1 = 0, acc_p2 = 0, acc_joined = 0;
@@ -587,9 +660,16 @@ namespace tsg
     }
 
     bool host_moe_decode_experts(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
-                                 const float* weights, float* out)
+                                 const float* weights, float* out, const std::uint8_t* skip)
     {
-        return hm.seq_len == 1 && host_moe_decode_experts_rows(hm, x, ids, weights, out);
+        return hm.seq_len == 1 && host_moe_decode_experts_rows(hm, x, ids, weights, out, skip);
+    }
+
+    void host_moe_decode_counters(long long* ns, long long* calls, long long* slots)
+    {
+        if (ns) *ns = g_rows_ns.load(std::memory_order_relaxed);
+        if (calls) *calls = g_rows_calls.load(std::memory_order_relaxed);
+        if (slots) *slots = g_rows_slots.load(std::memory_order_relaxed);
     }
 
     void host_moe_decode_release()
@@ -599,4 +679,40 @@ namespace tsg
         g_team = nullptr;
         g_team_failed = false;
     }
+}
+
+// Routed experts of up to 16 independent rows on the host, from raw expert stacks: the direct CUDA
+// engine's host experts (expert residency), where the stacks are pinned host copies of the experts
+// without a VRAM slot, packed in expert order (ids index the packed stacks; skip[k] != 0 leaves slot
+// k to the GPU). The same kernel, dot products and summation order as an offloaded ggml layer.
+// Returns 1 when out[rows, hidden] was written, 0 for a shape or type the kernel does not cover.
+TSG_EXPORT int TSGgml_HostExpertRows(const void* gate, const void* up, const void* down,
+                                     int gate_type, int up_type, int down_type,
+                                     int num_experts, int hidden, int n_ff, int n_used, int rows,
+                                     const float* x, const std::int32_t* ids, const float* weights,
+                                     const std::uint8_t* skip, float* out)
+{
+    if (gate == nullptr || up == nullptr || down == nullptr || num_experts <= 0 || hidden <= 0 || n_ff <= 0
+        || n_used <= 0 || rows <= 0 || gate_type < 0 || gate_type >= GGML_TYPE_COUNT
+        || up_type < 0 || up_type >= GGML_TYPE_COUNT || down_type < 0 || down_type >= GGML_TYPE_COUNT)
+        return 0;
+    tsg::HostMoeSegment hm;
+    hm.gate_data = const_cast<void*>(gate);
+    hm.up_data = const_cast<void*>(up);
+    hm.down_data = const_cast<void*>(down);
+    hm.gate_type = gate_type; hm.up_type = up_type; hm.down_type = down_type;
+    hm.gate_ne0 = hidden; hm.gate_ne1 = n_ff;
+    hm.up_ne0 = hidden; hm.up_ne1 = n_ff;
+    hm.down_ne0 = n_ff; hm.down_ne1 = hidden;
+    hm.gate_bytes = (std::int64_t)(ggml_row_size((ggml_type)gate_type, hidden) * (std::size_t)n_ff) * num_experts;
+    hm.up_bytes = (std::int64_t)(ggml_row_size((ggml_type)up_type, hidden) * (std::size_t)n_ff) * num_experts;
+    hm.down_bytes = (std::int64_t)(ggml_row_size((ggml_type)down_type, n_ff) * (std::size_t)hidden) * num_experts;
+    hm.activation = 0;
+    hm.num_experts = num_experts;
+    hm.n_used = n_used;
+    hm.seq_len = rows;
+    hm.independent_decode_rows = true;
+    hm.hidden = hidden;
+    hm.n_ff = n_ff;
+    return tsg::host_moe_decode_experts_rows(hm, x, ids, weights, out, skip, nullptr) ? 1 : 0;
 }

@@ -3358,12 +3358,59 @@ namespace TensorSharp.Models
             return sampler.Sample(logits, generatedTokenIds);
         }
 
+        private List<IntPtr> _hostExpertIoBases;
+
+        /// <summary>
+        /// Serve this model's host-offloaded routed experts from the explicitly read
+        /// host expert cache (ggml_ops_moe_expert_io.cpp) instead of page faults on
+        /// the GGUF mapping: misses are read with parallel pread into a bounded cache
+        /// of <paramref name="budgetBytes"/>. Apple only, where the file is read with
+        /// F_NOCACHE so the cache is the only copy kept; elsewhere pread would double
+        /// the page cache. Returns false (and changes nothing) when it does not apply.
+        /// </summary>
+        protected bool EnableHostExpertIo(long budgetBytes)
+        {
+            if (_gguf == null || budgetBytes <= 0 || !IsGgmlBackend
+                || !(OperatingSystem.IsMacOS() || OperatingSystem.IsIOS() || OperatingSystem.IsMacCatalyst()))
+                return false;
+            var regions = _gguf.MappedRegions();
+            var bases = new List<IntPtr>(regions.Count);
+            foreach (var (baseAddress, length, path) in regions)
+            {
+                if (!GgmlBasicOps.HostExpertIoRegister(baseAddress, length, path))
+                {
+                    foreach (IntPtr b in bases) GgmlBasicOps.HostExpertIoUnregister(b);
+                    return false;
+                }
+                bases.Add(baseAddress);
+            }
+            _hostExpertIoBases = bases;
+            GgmlBasicOps.HostExpertIoSetBudget(budgetBytes);
+            return true;
+        }
+
+        /// <summary>Host expert cache budget from <c>TS_HOST_MOE_IO_CACHE_GB</c>
+        /// (0 turns the cache off), or null to use the model's own estimate.</summary>
+        internal static long? HostExpertIoBudgetOverride(string value)
+            => double.TryParse(value, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double gb) && gb >= 0 && gb < 1e6
+                ? (long)(gb * 1e9) : null;
+
+        private void DisableHostExpertIo()
+        {
+            if (_hostExpertIoBases == null) return;
+            foreach (IntPtr b in _hostExpertIoBases) GgmlBasicOps.HostExpertIoUnregister(b);
+            _hostExpertIoBases = null;
+        }
+
         public virtual void Dispose()
         {
             // Release any distributed worker nodes before tearing down the TP
             // group, so every driver exit path (normal or exception) lets the
             // workers leave their loops cleanly.
             SignalDistributedWorkersShutdown();
+            // Cached expert copies must not outlive the mapping they were read from.
+            DisableHostExpertIo();
 
             if (MultimodalInjector is IDisposable multimodalInjector)
                 multimodalInjector.Dispose();

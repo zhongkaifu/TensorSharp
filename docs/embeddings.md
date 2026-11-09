@@ -420,7 +420,17 @@ projections; GGML CUDA uses scoped complete graphs with private pedantic F32
 products, while direct CUDA uses per-call pedantic F32 projections.
 The graph descriptor's `RequireFloat32Precision` policy scopes learned projection
 and SSCP precision; it does not promise exact arithmetic for every ordinary
-ggml operation. The scoped GGML CUDA graph policy passes fresh no-override raw tower, complete
+ggml operation. Without that policy, GGML CUDA audio graphs still compute their
+F32 matrix products (projections with F32 weights, relative attention, the depthwise
+convolution and the SSCP convolutions) on TensorSharp's pedantic cuBLAS handle:
+ggml-cuda creates its own cuBLAS handles with TF32 tensor-op math, so an F32
+`ggml_mul_mat` of more than three rows could round its operands to TF32 despite
+its F32 precision request. The conformer fixture's 25- and 96-row blocks were
+5.8e-4 and 7.1e-4 from the double reference that way, and are 4.3e-7 and 7.6e-7 now.
+On an RTX 5090, the 12-block conformer at EmbeddingGemma 2's width is also faster
+this way: 9.2 instead of 10.3 ms for 188 frames, 22.7 instead of 28.7 ms for 750.
+Q8_0 projections keep ggml's integer kernels;
+`TS_GEMMA4_AUDIO_GGML_CUDA_PEDANTIC=0` keeps ggml's TF32 products. The scoped GGML CUDA graph policy passes fresh no-override raw tower, complete
 HF embedding, and both-protocol HTTP checks. It selects a private pedantic
 cuBLAS handle and does not change shared backend math modes. This
 request does not change global backend math modes or the existing two-argument
@@ -599,8 +609,11 @@ cases even with optional BLAS, so that route remains opt-in. With the 32-row
 threshold, the fresh short case improves from the earlier BLAS experiment's
 76.3 ms to 35.6 ms; only one of seven cases meets the latency margin. CPU
 NumPy goldens still pass. Multimodal latency parity remains unmet, and the
-explicit TF32 attention experiment retains a failed large-exponent precision
-gate and stays disabled by default. These failures are retained in the reports.
+explicit TF32 attention experiment stays disabled by default: on large query/key
+exponents its error (6.3e-5 on an RTX 5090, up to 8.1e-5 by exact TF32 emulation)
+exceeds the 3e-5 pedantic F32 bound. That case's test gates on TF32's own
+rounding bound (1.2e-4, which BF16 operands fail) and reports the excess.
+These failures are retained in the reports.
 
 An optional Linux native CPU projection route uses an unmodified system LP64
 pthread OpenBLAS through TensorSharp-owned graph callbacks. Build the ordinary

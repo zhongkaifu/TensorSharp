@@ -2359,8 +2359,10 @@ public sealed class AgentAppHost : IDisposable
         bool draftAttached = CatalogDraftHeadAttached
             && string.Equals(_loadedCatalogDraftPath, draftHead, StringComparison.Ordinal);
         string algorithm = SpeculationPolicy.ChooseAlgorithm(draftAttached);
+        string tuning = SpeculationPolicy.ApplyDraftTuning(model?.DraftTuning,
+            draftAttached && string.Equals(algorithm, SpeculatorRegistry.Auto, StringComparison.OrdinalIgnoreCase));
         bool live = ModelService.EngineHost.UpdateSpeculation(SpeculationOptions.FromEnvironment());
-        string account = $"{note}; algorithm {algorithm}; {(live ? "applied to the running engine" : "no engine standing, applies at the next load")}";
+        string account = $"{note}; algorithm {algorithm}, {tuning}; {(live ? "applied to the running engine" : "no engine standing, applies at the next load")}";
         HostLog.LogInformation("{Speculation}", account);
         return account;
     }
@@ -2920,6 +2922,8 @@ public sealed class AgentAppHost : IDisposable
                                 draftHead, ModelService.Model is IDraftHead { HasDraftHead: true })
                                 && ModelService.DraftHeadActivationError is null;
                             string algorithm = SpeculationPolicy.ChooseAlgorithm(draftAttached);
+                            string tuning = SpeculationPolicy.ApplyDraftTuning(model.DraftTuning,
+                                draftAttached && string.Equals(algorithm, SpeculatorRegistry.Auto, StringComparison.OrdinalIgnoreCase));
                             // Also hand it to the engine host: a settings switch flipped while this
                             // model was loading was remembered with the algorithm chosen before the
                             // draft head was known, and must not outlive this decision.
@@ -2928,7 +2932,7 @@ public sealed class AgentAppHost : IDisposable
                                 HostLog.LogWarning("{Model}: the draft head {File} did not attach ({Reason}); speculating with {Algorithm} instead",
                                     model.Id, Path.GetFileName(draftHead), ModelService.DraftHeadActivationError ?? "no reason given", algorithm);
                             _loggerFactory.CreateLogger("TensorAgent.Host").LogInformation(
-                                "using {Model} on {Backend} (speculation: {Algorithm})", model.Id, backend.Value, algorithm);
+                                "using {Model} on {Backend} (speculation: {Algorithm}, {Tuning})", model.Id, backend.Value, algorithm, tuning);
                             LogMemory($"after loading {model.Id}");
                             _loadedCatalogDraftPath = draftAttached ? draftHead : null;
                             SetModelLoad(ModelLoadState.Loaded, null);

@@ -101,6 +101,10 @@ public static class Program
         }
 
         string modelPath = args[0];
+        // The same expert-placement switches the CLI reads (TS_CPU_MOE / TS_N_CPU_MOE),
+        // so a model that only fits with its routed experts on the host - DeepSeek V4.1
+        // on a Mac - can be measured here too.
+        MoeCpuOffloadConfig.ConfigureFromEnvironment();
         // A model the backend refuses to load is an ANSWER, not a crash: the CLI and the
         // server both print one stderr line and exit with HostExitCodes.ModelLoadRefused,
         // and a validation run asking "does ggml_cuda-only Bonsai2 refuse the pure-C# cpu

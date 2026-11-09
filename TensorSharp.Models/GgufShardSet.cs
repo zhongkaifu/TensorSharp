@@ -36,6 +36,9 @@ namespace TensorSharp.Models
         /// <summary>The checkpoint's first shard, which carries the metadata.</summary>
         public GgufFile First => _files[0];
 
+        /// <summary>Every shard's path, shard 1 first.</summary>
+        public IReadOnlyList<string> Paths => _paths;
+
         /// <summary>A separate GGUF loaded beside the checkpoint (a drafter), or null.</summary>
         public GgufFile Extra { get; }
 

@@ -856,6 +856,66 @@ originally closed was a silent fallback onto whichever GPU enumerated first, not
 an explicit request; startup names each device it applies to. Treat it as a
 portability and correctness path until it has been measured on your hardware.
 
+#### `ggml_metal` with every routed expert on the host
+
+On a Mac that cannot hold the routed experts (`--cpu-moe`), they no longer run
+as ggml CPU ops reading the GGUF mapping. A CPU lane computes them with
+TensorSharp's host decode kernel (`TS_DSV41_HOST_LANE=0` restores the ggml
+chain), and on Apple the expert slices are read explicitly into a RAM cache,
+in the way Strata's Mac engine streams its experts:
+
+- **Reads.** Misses are read by parallel `pread` (`TS_HOST_MOE_IO_THREADS`)
+  with `F_NOCACHE` and the kernel's read-ahead off. `F_NOCACHE` alone still let
+  read-ahead put about half of every read into the file cache, which then
+  pushed everything else into the compressor.
+- **Wired cache.** The cache (`TS_HOST_MOE_IO_CACHE_GB`, by default 3/4 of the
+  RAM left after the reserve and the uploaded weights) is wired with `mlock`
+  (`TS_HOST_MOE_IO_WIRE=0` leaves it pageable). Expert weights compress about
+  1.2:1, so macOS compressing an unwired slot frees little and turns each later
+  hit into a decompression.
+- **Prefill** runs through the lane in 8-row blocks, each block's experts read
+  while the block before computes. **Decode** predicts the next layer's
+  experts by applying that layer's router to this layer's FFN input (Strata's
+  look-ahead, `TS_DSV41_LOOKAHEAD=0` off) and reads them while this layer
+  computes.
+
+Measured on a 48 GiB M5 Pro with other applications open, UD-IQ2_XXS, a
+23-token code prompt and 96 generated tokens, greedy, one process per run:
+
+| Configuration | Time to first token | Decode |
+|---|---:|---:|
+| ggml CPU chain (`TS_DSV41_HOST_LANE=0`) | 17.6 s | 797-856 ms/token |
+| CPU lane, unwired cache | 6.8-7.5 s | 977-1,278 ms/token |
+| CPU lane, wired cache (default) | 10.6 s | 453 ms/token |
+
+Unwired, 15-17 GB of the 21 GB cache sat in the compressor; wired, 0.15 GB.
+The generated text was identical in every configuration. Perplexity over 512
+tokens of the evaluation text at `n_ctx` 256: 10.83 for the ggml chain, 10.89
+with the lane for decode, 10.92 with the lane for prefill and decode, within
+the run-to-run spread of the chunk scores. Call by call on the C#-built 1017-shaped
+checkpoint (`InferenceWeb.Tests` `Dsv41MetalCpuLaneTests`: a 37-token prefill,
+decode steps and a 3-token append), the lane's logits stay within 1.5e-5 (prefill)
+to 1.9e-3 (decode) relative error of the ggml chain, with the same argmax.
+
+Some V4.1-specific ops (the compressors, the indexer, the Engram lookups) have
+no Metal kernels and still run on the CPU backend with a host round trip each;
+that, rather than the experts, is the next limit on this path.
+
+#### `ggml_cuda` when the host experts exceed RAM
+
+The same lane serves `ggml_cuda` when the routed experts left on the host (`--n-cpu-moe N`) are more than 0.6x
+what the process may keep resident. On Linux that is the cgroup limit, not the machine's RAM. There the host
+experts would otherwise run as ggml CPU ops on a mapping the kernel keeps evicting. `TS_DSV41_HOST_LANE=1` forces
+the lane and `0` keeps the ggml chain. Off Apple the cache is sized from the same allowance. Expert files are opened
+with `POSIX_FADV_RANDOM`, and the look-ahead takes the BF16 routers of ISTA-DASLab's files as well as F32 ones.
+
+Measured beside Strata on an RTX 5090 container (93 GB limit; both models read from a network filesystem)
+with ISTA-DASLab's `GSQ-RCO-IQ2_XXS`, `--n-cpu-moe 34`: the lane took 102.9 GiB of host experts with a 51.1 GiB
+cache. After a 2.3-minute start, the first request took 151 s to its first token while every expert was read cold.
+Warm requests ran at 0.9-1.4 tok/s with 8-15 s to the first token, against Strata's 0.7-1.3 tok/s and 6-12 s after
+its 10.5-minute start. Both engines were reading experts at the filesystem's ~33 MB/s, so this measures the storage.
+It says nothing about either engine's compute path.
+
 `--backend cpu` is not a ggml backend at all: it is the pure-C#
 `DeepSeek4CpuExecutor`, with no native library and no GPU, and it implements the
 whole V4.1 graph — the ratio-1 and ratio-2 block compressors, the shared
@@ -980,7 +1040,7 @@ deepseek41.engram.pad_id`.
 The direct-CUDA engine also checks every routed-expert tensor before it uploads
 anything, against the code that will run it. Its GPU expert kernels are the ones
 the GLM-5.3-Flash and Qwen3.8 direct engines run, and implement Q8_0, Q6_K, Q5_K,
-Q5_1, Q4_K, Q3_K, Q2_K, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS,
+Q5_1, Q4_K, Q3_K, Q2_K, Q2_0, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS,
 IQ1_S and MXFP4 on every route: the per-token decode kernels, and for prefill the
 tensor-core, register-staged and warp-per-row ones. That covers every routed-expert
 type of the 1017 `UD-IQ2_XXS` file: gate/up IQ1_S (10 layers), IQ2_S (15) and

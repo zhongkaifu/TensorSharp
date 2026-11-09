@@ -65,7 +65,7 @@ internal static class Qwen4ExpSyntheticModelBuilder
         GgmlType pleConvType = GgmlType.F32, GgmlType ssmConvType = GgmlType.F32,
         GgmlType? matrixNormType = null, bool qsa = true, int expertCount = Experts, int expertUsedCount = ExpertsUsed,
         int hiddenSize = Hidden, bool q4kxlExperts = false, bool tiedOutput = false, GgmlType? expertDownType = null,
-        float expertDownGain = 0.25f, GgmlType? expertGateUpType = null, int expertFf = ExpertFf)
+        float expertDownGain = 0.25f, GgmlType? expertGateUpType = null, int expertFf = ExpertFf, GgmlType routerType = GgmlType.F32)
     {
         if (expertCount < 1 || expertUsedCount < 1 || expertUsedCount > expertCount)
             throw new System.ArgumentOutOfRangeException(nameof(expertUsedCount), "Expert counts must be positive, and selected experts cannot exceed total experts.");
@@ -202,7 +202,7 @@ internal static class Qwen4ExpSyntheticModelBuilder
                 gateUp = gateUpOverride;
             if (expertDownType is { } downOverride)
                 down = downOverride;
-            t.Add(Proj(p + "ffn_gate_inp.weight", hiddenSize, expertCount, GgmlType.F32));
+            t.Add(Proj(p + "ffn_gate_inp.weight", hiddenSize, expertCount, routerType));
             t.Add(Experts3(p + "ffn_gate_exps.weight", hiddenSize, expertFf, gateUp));
             t.Add(Experts3(p + "ffn_up_exps.weight", hiddenSize, expertFf, gateUp));
             t.Add(Experts3(p + "ffn_down_exps.weight", expertFf, hiddenSize, down, gain: expertDownGain));
@@ -212,8 +212,19 @@ internal static class Qwen4ExpSyntheticModelBuilder
             t.Add(Proj(p + "ffn_down_shexp.weight", SharedFf, hiddenSize, gain: OutGain));
         }
 
+        var kv = Metadata(Layers, indexerTopK, contextLength, qsa, expertCount, expertUsedCount, hiddenSize, expertFf,
+            pleHeadDim, pleConvKernel, ssmConvKernel);
+        SyntheticGguf.Write(path, kv, t);
+        return path;
+    }
+
+    /// <summary>The checkpoint's metadata, <paramref name="blockCount"/> blocks (a NextN file counts its block).</summary>
+    private static List<Kv> Metadata(int blockCount, int indexerTopK, int contextLength, bool qsa, int expertCount,
+        int expertUsedCount, int hiddenSize, int expertFf, int pleHeadDim, int pleConvKernel, int ssmConvKernel)
+    {
+        const int valueDim = StateSize * VHeads;
         const string a = "qwen4exp.";
-        var ratios = new int[Layers];
+        var ratios = new int[blockCount];
         var pleOffsets = new ulong[PleVocab.Length];
         for (int il = 0; il < Layers; il++) ratios[il] = IsRecurrent(il) ? 0 : CompressRatio;
         for (int h = 1; h < PleVocab.Length; h++) pleOffsets[h] = pleOffsets[h - 1] + PleVocab[h - 1];
@@ -221,7 +232,7 @@ internal static class Qwen4ExpSyntheticModelBuilder
         {
             new Str { Key = "general.architecture", V = "qwen4exp" },
             new Str { Key = "general.name", V = "Synthetic qwen4exp engine fixture" },
-            new U32 { Key = a + "block_count", V = Layers },
+            new U32 { Key = a + "block_count", V = (uint)blockCount },
             new U32 { Key = a + "context_length", V = (uint)contextLength },
             new U32 { Key = a + "embedding_length", V = (uint)hiddenSize },
             new U32 { Key = a + "attention.head_count", V = Heads },
@@ -247,7 +258,7 @@ internal static class Qwen4ExpSyntheticModelBuilder
             new U32 { Key = a + "attention.indexer.head_count", V = IndexerHeads },
             new U32 { Key = a + "attention.indexer.key_length", V = IndexerDim },
             new U32 { Key = a + "attention.indexer.top_k", V = (uint)indexerTopK },
-            new I32Arr { Key = a + "attention.compress_ratios", V = qsa ? ratios : new int[Layers] },
+            new I32Arr { Key = a + "attention.compress_ratios", V = qsa ? ratios : new int[blockCount] },
             new I32Arr { Key = a + "ple.layers", V = new[] { PleLayer } },
             new U32 { Key = a + "ple.ngram_size", V = PleNgram },
             new U32 { Key = a + "ple.heads_per_ngram", V = PleHeadsPerNgram },
@@ -260,6 +271,66 @@ internal static class Qwen4ExpSyntheticModelBuilder
             new U64Arr { Key = a + "ple.head_vocab_sizes", V = PleVocab },
         };
         AddByteTokenizer(kv, Vocab, BosToken, EosToken);
+        return kv;
+    }
+
+    /// <summary>
+    /// A shared-target MTP (NextN) file for the checkpoint <see cref="Write"/> writes with its defaults: block
+    /// <see cref="Layers"/> with the published head's 32 tensors (Q8_0 matrices, F32 norms, the inactive BF16
+    /// indexer), and the checkpoint's metadata and tokenizer, as the shipped head carries them.
+    /// </summary>
+    public static string WriteMtp(string path, int indexerTopK = 16, int contextLength = 4096)
+    {
+        const int hiddenSize = Hidden, hcDim = Hc * Hidden;
+        string p = $"blk.{Layers}.";
+        var t = new List<Tensor>();
+        Tensor Proj(string name, int inDim, int outDim, GgmlType type = GgmlType.Q8_0, float gain = 1f)
+        {
+            var w = Gen(name, gain * 1.5f / System.MathF.Sqrt(inDim), inDim, outDim);
+            w.Type = type;
+            return w;
+        }
+        Tensor Norm(string name, int n) => GenAround(name, 1f, 0.1f, n);
+        const float OutGain = 0.25f;
+        t.Add(Norm(p + "nextn.enorm.weight", hiddenSize));
+        t.Add(Norm(p + "nextn.hnorm.weight", hcDim));
+        t.Add(Proj(p + "nextn.eh_proj.weight", 2 * hiddenSize, hiddenSize));
+        t.Add(Norm(p + "nextn.hc_head_norm.weight", hcDim));
+        t.Add(Proj(p + "nextn.hc_head_down.weight", hcDim, HcLowRank));
+        t.Add(Proj(p + "nextn.hc_head_up.weight", HcLowRank, hcDim));
+        foreach (string part in new[] { "attn", "ffn" })
+        {
+            t.Add(Norm(p + $"hc_{part}_norm.weight", hcDim));
+            t.Add(Proj(p + $"hc_{part}_down.weight", hcDim, HcLowRank));
+            t.Add(Proj(p + $"hc_{part}_up.weight", HcLowRank, hcDim));
+            t.Add(Proj(p + $"hc_{part}_inject.weight", hcDim, Hc));
+        }
+        t.Add(Proj(p + "attn_q.weight", hiddenSize, Heads * 2 * HeadDim));
+        t.Add(Proj(p + "attn_k.weight", hiddenSize, KvHeads * HeadDim));
+        t.Add(Proj(p + "attn_v.weight", hiddenSize, KvHeads * HeadDim));
+        t.Add(Norm(p + "attn_q_norm.weight", HeadDim));
+        t.Add(Norm(p + "attn_k_norm.weight", HeadDim));
+        t.Add(Proj(p + "attn_output.weight", Heads * HeadDim, hiddenSize, gain: OutGain));
+        t.Add(Proj(p + "indexer.k_proj.weight", hiddenSize, IndexerDim, GgmlType.BF16));
+        t.Add(Proj(p + "indexer.q_proj.weight", hiddenSize, IndexerHeads * IndexerDim, GgmlType.BF16));
+        t.Add(Norm(p + "indexer.k_norm.weight", IndexerDim));
+        t.Add(Norm(p + "indexer.q_norm.weight", IndexerDim));
+        t.Add(Proj(p + "ffn_gate_inp.weight", hiddenSize, Experts, GgmlType.F32));
+        var gate = Gen(p + "ffn_gate_exps.weight", 1.5f / System.MathF.Sqrt(hiddenSize), hiddenSize, ExpertFf, Experts);
+        var up = Gen(p + "ffn_up_exps.weight", 1.5f / System.MathF.Sqrt(hiddenSize), hiddenSize, ExpertFf, Experts);
+        var down = Gen(p + "ffn_down_exps.weight", 0.25f * 1.5f / System.MathF.Sqrt(ExpertFf), ExpertFf, hiddenSize, Experts);
+        gate.Type = up.Type = down.Type = GgmlType.Q8_0;
+        t.Add(gate); t.Add(up); t.Add(down);
+        t.Add(Gen(p + "ffn_gate_inp_shexp.weight", 1.5f / System.MathF.Sqrt(hiddenSize), hiddenSize));
+        t.Add(Proj(p + "ffn_gate_shexp.weight", hiddenSize, SharedFf));
+        t.Add(Proj(p + "ffn_up_shexp.weight", hiddenSize, SharedFf));
+        t.Add(Proj(p + "ffn_down_shexp.weight", SharedFf, hiddenSize, gain: OutGain));
+
+        int pleHeadDim = hiddenSize / ((PleNgram - 1) * PleHeadsPerNgram);
+        var kv = Metadata(Layers + 1, indexerTopK, contextLength, qsa: true, Experts, ExpertsUsed, hiddenSize, ExpertFf,
+            pleHeadDim, ConvKernel, ConvKernel);
+        kv.Add(new Bool { Key = "qwen4exp.nextn_shared_target_tensors", V = true });
+        kv.Add(new U32 { Key = "qwen4exp.nextn_predict_layers", V = 1 });
         SyntheticGguf.Write(path, kv, t);
         return path;
     }

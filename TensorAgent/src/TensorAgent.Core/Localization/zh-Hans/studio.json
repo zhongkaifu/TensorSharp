@@ -364,7 +364,6 @@
   "studio.keyframesTitle": "设定时刻的照片",
   "studio.guideNamed": "关键帧 {index}",
   "studio.referencePhotosTitle": "参考照片",
-  "studio.referencesHelp2": "你的照片用于展示要包含的人或物；镜头不会以它们开头或结尾。最多选择 {count} 张。",
   "studio.referenceRemoved": "已移除 {name}。顺序：{list}",
   "studio.referenceAdded": "图 {index}：{name}",
   "studio.referenceTileOn": "{name}，图 {index}",

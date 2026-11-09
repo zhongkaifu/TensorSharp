@@ -30,11 +30,17 @@ public sealed class Ltx25ServerPageTests
         int sendStart=page.IndexOf("async function sendMessage()",StringComparison.Ordinal);
         int sendEnd=page.IndexOf("// Finish the interrupted assistant entry",sendStart,StringComparison.Ordinal);
         string routing=Regex.Match(page,@"const VIDEO_ARCHITECTURES = [^\r\n]+;").Value;
+        // The capabilities are what /api/models reports for LTX 2.5 (WebUiChatService), including the
+        // 121-frame floor of its identity sheets (Ltx25ReferenceConditioning.MinimumFrames).
         string source=routing+"\n"+page[start..end]+page[sendStart..sendEnd]+"""
-            var currentArchitecture='ltx-2.5', currentVideoCaps={supportsImageConditioning:true,supportsEndImageConditioning:true,supportsKeyframeConditioning:true,supportsReferenceConditioning:false,maxReferenceImages:16,defaultPreviewFrames:17};
+            var currentArchitecture='ltx-2.5', currentVideoCaps={supportsImageConditioning:true,supportsEndImageConditioning:true,supportsKeyframeConditioning:true,supportsReferenceConditioning:false,maxReferenceImages:16,defaultPreviewFrames:17,minimumReferenceFrames:121};
             var performance={now:function(){return 0;}};
             var calls=[],bubble={},stats={};
             var built=[], pendingUploadCount=0, pendingAttachments=[], currentLoadedModel='ltx.gguf', activeImageEditTarget=null;
+            // The composer's video controls (the page keeps them per loaded model).
+            var videoComposerMode='auto', videoComposerFrames=0, videoComposerResolution='default';
+            function videoResolutionChoices(){return [{value:'default',label:'Model default'}];}
+            function selectedVideoFrames(){return videoComposerFrames>0?videoComposerFrames:17;}
             var messageInput={value:'The woman waves.',style:{}}, attachmentsDiv={}, queuedChatMessages=[], queuedResponseRequested=false;
             function videoImageConditions(){return null;}
             function cancelCurrentGeneration(){}
@@ -50,7 +56,7 @@ public sealed class Ltx25ServerPageTests
               if(__MEDIA__==='longmultiple'){message.stillImagePaths=['a.png','b.png','c.png'];message.videoFrames=97;}
               if(__MEDIA__==='identity'){currentVideoCaps.supportsReferenceConditioning=true;message.stillImagePaths=['a.png','b.png'];message.videoMode='ref';}
               if(__MEDIA__==='identity_then_text'){
-                currentVideoCaps.supportsReferenceConditioning=true;currentVideoCaps.referenceMode=true;
+                currentVideoCaps.supportsReferenceConditioning=true;videoComposerMode='ref';
                 pendingAttachments=[{file:'a.png',mediaType:'image'}];await sendMessage();
                 messageInput.value='A red fox runs.';await sendMessage();message=built[1];
               }

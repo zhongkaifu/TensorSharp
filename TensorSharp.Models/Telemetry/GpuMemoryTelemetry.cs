@@ -127,6 +127,8 @@ namespace TensorSharp.Models.Telemetry
         {
             if (model == null)
                 return;
+            // The MoE offload instruments follow the same models and hooks.
+            MoeOffloadTelemetry.Track(model);
             try
             {
                 string backend = SourceOf(model.DirectAllocatorForTelemetry);
@@ -160,6 +162,7 @@ namespace TensorSharp.Models.Telemetry
         /// </summary>
         public static void Snapshot()
         {
+            MoeOffloadTelemetry.Snapshot();
             // Native device queries for gauges nobody collects would be work for nothing:
             // with telemetry (or metrics) off, every video phase and engine step returns here.
             if (!TensorSharpMetrics.GpuMemoryObserved)

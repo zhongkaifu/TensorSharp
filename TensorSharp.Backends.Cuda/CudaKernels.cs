@@ -224,7 +224,7 @@ namespace TensorSharp.Cuda
             sm80KernelsUsable = ArchGuardedKernelsUsable(compiledArch, ccMajor);
             var archDisabled = new System.Collections.Generic.List<string>();
             if (ccMajor >= 8 && !sm80KernelsUsable)
-                archDisabled.Add("ts_vision_attention_mma_d*, ts_quant_matmul_q8_0_mmq*_f32");
+                archDisabled.Add("ts_vision_attention_mma_d*, ts_quant_matmul_q8_0_mmq*_f32, ts_q80_pair_mma_*");
             if (sm80KernelsUsable)
             {
                 visionPadF16 = GetOptionalFunction(module, "ts_vision_pad_f16", missingOptional);
@@ -343,14 +343,21 @@ namespace TensorSharp.Cuda
             quantMatmulQ80SingleF32 = module.GetFunction("ts_quant_matmul_q8_0_single_f32");
             quantMatmulQ80Vec = RowBoundFunctions(module, "ts_quant_matmul_q8_0_vec_f32");
             quantMatmulQ80Warp = RowBoundFunctions(module, "ts_quant_matmul_q8_0_warp_f32");
-            q80PairMma = new IntPtr[Q80PairSliceCounts.Length];
-            q80PairTwin = new IntPtr[Q80PairSliceCounts.Length][];
-            for (int i = 0; i < Q80PairSliceCounts.Length; i++)
+            // Optional: a module before them has no pair (HasQ80Pair is then false).
+            try
             {
-                int s = Q80PairSliceCounts[i];
-                q80PairMma[i] = module.GetFunction("ts_q80_pair_mma_" + s);
-                q80PairTwin[i] = new[] { module.GetFunction("ts_q80_pair_twin_" + s + "_1"), module.GetFunction("ts_q80_pair_twin_" + s + "_2") };
+                var pairMma = new IntPtr[Q80PairSliceCounts.Length];
+                var pairTwin = new IntPtr[Q80PairSliceCounts.Length][];
+                for (int i = 0; i < Q80PairSliceCounts.Length; i++)
+                {
+                    int s = Q80PairSliceCounts[i];
+                    pairMma[i] = module.GetFunction("ts_q80_pair_mma_" + s);
+                    pairTwin[i] = new[] { module.GetFunction("ts_q80_pair_twin_" + s + "_1"), module.GetFunction("ts_q80_pair_twin_" + s + "_2") };
+                }
+                q80PairMma = pairMma;
+                q80PairTwin = pairTwin;
             }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { q80PairMma = null; q80PairTwin = null; }
             quantMatmulLowKDp4aF32 = LowKFunctions(module, "ts_quant_matmul_lowk_dp4a_f32");
             quantMatmulQ4KDp4aF32 = module.GetFunction("ts_quant_matmul_q4k_dp4a_f32");
             quantMatmulQ5KDp4aF32 = module.GetFunction("ts_quant_matmul_q5k_dp4a_f32");
@@ -373,6 +380,8 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500) { } // CUDA_ERROR_NOT_FOUND
             quantizeQ81SplitRowsF32 = module.GetFunction("ts_quantize_q8_1_split_rows_f32");
             dequantWeightF16 = module.GetFunction("ts_dequant_weight_f16");
+            try { module.GetFunction("ts_caps_q2_0_dequant"); DequantsQ2_0 = true; }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { }
             dequantWeightQ80F16 = module.GetFunction("ts_dequant_weight_q8_0_f16");
             convertF32F16 = module.GetFunction("ts_convert_f32_f16");
             convertF32Bf16 = module.GetFunction("ts_convert_f32_bf16");
@@ -944,6 +953,9 @@ namespace TensorSharp.Cuda
         /// <summary>Whether the int8 tensor-core Q8_0 GEMM (ts_quant_matmul_q8_0_mmq*_f32)
         /// computes anything here: below sm_80 its body compiles to nothing.</summary>
         public bool HasQ80Mmq => sm80KernelsUsable;
+
+        /// <summary>Whether ts_dequant_weight_f16 decodes Q2_0 (the module carries its marker).</summary>
+        public bool DequantsQ2_0 { get; }
 
         /// <summary>The SM architecture the code the driver loaded for this module was compiled
         /// for (0 = unknown; see <see cref="CudaModule.CompiledArchOf"/>).</summary>
@@ -3222,6 +3234,10 @@ namespace TensorSharp.Cuda
                 Launch(quantMatmulQ80Vec[RowBoundIndex(rows)], (uint)outDim, 1, 1, 128, 1, 1, 0, stream, args);
         }
 
+        /// <summary>Whether <see cref="LaunchQuantMatmulQ80Pair"/> runs here: the module carries the pair and its
+        /// tensor-core half has a body (sm_80+ code on an sm_80+ device; see <see cref="ArchGuardedKernelsUsable"/>).</summary>
+        public bool HasQ80Pair => q80PairMma != null && sm80KernelsUsable;
+
         /// <summary>Rows <see cref="LaunchQuantMatmulQ80Pair"/> takes in one launch.</summary>
         public const int Q80PairMaxRows = 16;
 
@@ -3253,6 +3269,8 @@ namespace TensorSharp.Cuda
         public void LaunchQuantMatmulQ80Pair(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim,
             int rows, IntPtr stream)
         {
+            if (!HasQ80Pair)
+                throw new InvalidOperationException("Q8_0 pair matvec: the loaded module has no pair for this GPU (needs sm_80+ code)");
             if (rows < 1 || rows > Q80PairMaxRows || (inDim & 31) != 0)
                 throw new ArgumentOutOfRangeException(nameof(rows), $"Q8_0 pair matvec: {rows} rows of width {inDim}");
             IntPtr weightsArg = weights;

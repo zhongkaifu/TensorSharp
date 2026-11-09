@@ -54,7 +54,8 @@ public sealed class ChatPipelineSelfStopTranscriptTests : IDisposable
         }
 
         Assert.Equal("stop_sequence", terminal.FinishReason);
-        Assert.Equal("01234", streamed.ToString());
+        // The stop sequence is not sent, and its first token ("3") was held back until "4" completed it.
+        Assert.Equal("012", streamed.ToString());
         int[] forwarded = model.ForwardedAnswerTokens();
         Assert.True(forwarded.Length > streamed.Length,
             $"the engine forwarded {forwarded.Length} tokens, no more than the {streamed.Length} streamed: nothing to prove");
@@ -71,6 +72,53 @@ public sealed class ChatPipelineSelfStopTranscriptTests : IDisposable
         Assert.True(recorded.Count >= forwarded.Length,
             $"recorded {recorded.Count} tokens, the cache holds {forwarded.Length}");
         Assert.Equal(forwarded, recorded.Take(forwarded.Length).ToArray());
+    }
+
+    /// <summary>
+    /// A stop sequence is returned the way the OpenAI, Ollama and Anthropic APIs return it: not sent, and
+    /// neither is anything after it; text held back because it could have begun one is sent once it cannot
+    /// (the next piece, or the end of the turn). Every piece used to be sent as decoded, the matching one
+    /// too: <c>stop: ["6"]</c> on "count from 1 to 10" sent "1, 2, 3, 4, 5, 6".
+    /// </summary>
+    [Theory]
+    [InlineData("34", "012", true)]          // split across tokens: "3" is held back, then dropped
+    [InlineData("6", "012345", true)]
+    [InlineData("35", "0123456789zz", false)] // "3" is held back, then sent with "4"
+    [InlineData("zq", "0123456789zz", false)] // the last "z" is held back when the turn ends, then sent
+    [InlineData("", "0123456789zz", false)]   // an empty stop sequence matches nothing
+    public async Task AStopSequence_IsNotSent_AndHeldBackTextIsSentOnceItCannotBeOne(string stop, string expected, bool stops)
+    {
+        using var lifecycle = new ModelLifecycleService(NullLogger.Instance, (path, backend, tp, draft) => new DigitModel(path));
+        lifecycle.LoadModel(_path, null, "cpu");
+        using var host = new InferenceEngineHost(lifecycle, NullLogger.Instance) { SchedulerConfigOverride = Config() };
+        var pipeline = new ChatGenerationPipeline(lifecycle, host,
+            new KVCachePromptRenderer(new FixedRenderer()),
+            new InferenceTelemetry(NullLogger.Instance), NullLogger.Instance);
+        using var session = new ChatSession();
+        SamplingConfig sampling = SamplingConfig.Greedy;
+        sampling.StopSequences = new List<string> { stop };
+        var history = new List<ChatMessage> { new() { Role = "user", Content = "count" } };
+
+        var streamed = new StringBuilder();
+        ChatStreamUpdate terminal = default;
+        await foreach (var update in pipeline.ChatStreamWithMetricsAsync(session, history, 12, CancellationToken.None, sampling))
+        {
+            if (update.Done)
+                terminal = update;
+            else
+                streamed.Append(update.Piece);
+        }
+
+        Assert.Equal(expected, streamed.ToString());
+        Assert.Equal(stops, terminal.FinishReason == "stop_sequence");
+        // The transcript files the turn under what the client was sent, so its next request gets the raw tokens back.
+        var next = session.Transcripts.Augment(new List<ChatMessage>
+        {
+            history[0],
+            new() { Role = "assistant", Content = streamed.ToString() },
+            new() { Role = "user", Content = "go on" },
+        });
+        Assert.NotNull(next.History[1].RawOutputTokens);
     }
 
     /// <summary>

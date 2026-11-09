@@ -169,6 +169,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     internal int ComputeReusablePrefix(SequenceState sequence)
     {
         Drain();
+        RelieveHostMemoryDeficit();
         RequiresSoleAdmission = false;
         LastSource = null;
         TryRestoreCheckpoint(sequence);
@@ -514,15 +515,26 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             GetSpans(sequence));
         if (node.EndState is not null) return;
         string key = _tree.MintKey();
-        bool captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out var footprint);
-        if (!captured && ReleaseOldestScopedPayload())
-            captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
-        if (!captured)
+        // The new node holds no payload yet. Freeing room below can evict a payload in its subtree, and that
+        // eviction cascades through every childless payload-less parent: it returned this node to the pool,
+        // whose parent-less husk then read as the root at Publish ("End states attach to non-root nodes").
+        // The path lock keeps it in the tree until it is published; the release collects it if it was not.
+        LockReceipt guard = _tree.AcquirePath(node);
+        bool published;
+        PayloadFootprint footprint;
+        try
         {
-            _tree.CollectIfEmpty(node);
-            return;
+            bool captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
+            if (!captured && ReleaseOldestScopedPayload())
+                captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
+            if (!captured) return;
+            published = Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy);
         }
-        if (Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy) && publicBoundary)
+        finally
+        {
+            _tree.Release(ref guard);
+        }
+        if (published && publicBoundary)
             SaveCheckpoint(sequence, key, length, footprint);
         Trim();
     }
@@ -546,6 +558,20 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             RegisterPrimary(node, payloadKey, length);
             return false; // The live primary still belongs to the executor, not a retained holder.
         }
+        // As in CaptureCheckpoint: an eviction below this payload-less node would return it to the pool.
+        LockReceipt guard = _tree.AcquirePath(node);
+        try
+        {
+            return RetainFinishedLocked(sequence, primary, node, payloadKey, length);
+        }
+        finally
+        {
+            _tree.Release(ref guard);
+        }
+    }
+
+    private bool RetainFinishedLocked(SequenceState sequence, bool primary, RadixNode node, string payloadKey, int length)
+    {
         bool captured = RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
             && _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
         if (!captured && RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
@@ -752,6 +778,42 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         // Public prefixes have eviction priority, not an exemption from byte caps.
         _tree.EnforceCaps(EvictionTier.PublicTop);
         Drain();
+        RelieveHostMemoryDeficit();
+    }
+
+    private static readonly ResourceClass[] s_deficitClasses =
+        { ResourceClass.HostKv, ResourceClass.StateSnapshot, ResourceClass.DeviceKv, ResourceClass.NativeSlot };
+
+    private long CachedDeficitBytes()
+    {
+        long total = 0;
+        foreach (ResourceClass cls in s_deficitClasses) total += _tree.Cached[cls];
+        return total;
+    }
+
+    /// <summary>Before a request is admitted and after a payload is kept: when the machine is short of
+    /// memory (<see cref="IPrefixCacheModel.QueryHostMemoryDeficitBytes"/>), evict that many cached bytes,
+    /// oldest first and short of the public prefixes. The memory is the machine's, so every byte class
+    /// counts: host K/V first, then recurrent state, device K/V and native slots.</summary>
+    private void RelieveHostMemoryDeficit()
+    {
+        long deficit = _cacheModel.QueryHostMemoryDeficitBytes();
+        if (deficit <= 0) return;
+        long start = CachedDeficitBytes();
+        if (start <= 0) return;
+        foreach (ResourceClass cls in s_deficitClasses)
+        {
+            // A payload or page evicted for one class frees its bytes of the others too.
+            long remaining = deficit - (start - CachedDeficitBytes());
+            if (remaining <= 0) break;
+            if (_tree.Cached[cls] > 0)
+                _tree.Evict(cls, remaining, ReleaseReason.Pressure, EvictionTier.ScopeNewest);
+        }
+        Drain();
+        long kept = CachedDeficitBytes();
+        if (kept != start)
+            _logger.LogInformation("Prefix cache: the machine is {Deficit} MiB short of memory; evicted {Evicted} MiB of cached state, kept {Kept} MiB.",
+                deficit >> 20, (start - kept) >> 20, kept >> 20);
     }
 
     internal string TrimIdleMemory()

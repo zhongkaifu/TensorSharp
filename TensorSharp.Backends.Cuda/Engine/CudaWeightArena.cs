@@ -84,6 +84,10 @@ namespace TensorSharp.Cuda
         public long RowBytes;
         /// <summary>An engine's optional F16 copy for prefill-size GEMMs (zero when it has none).</summary>
         public IntPtr PrefillF16;
+        /// <summary>A stacked expert weight whose experts do not all sit in one device block: a device
+        /// table of one address per expert (a VRAM slot or pinned host memory the GPU reads over the
+        /// bus). Zero means <see cref="Ptr"/> is the whole stack.</summary>
+        public IntPtr Table;
     }
 
     /// <summary>
@@ -142,6 +146,18 @@ namespace TensorSharp.Cuda
                 throw new InvalidOperationException($"[cuda-engine] weight arena overflow on device {_alloc.DeviceId}");
             IntPtr p = (IntPtr)((long)_base + Used);
             Used += aligned;
+            return p;
+        }
+
+        /// <summary>Reserve <paramref name="bytes"/> of uninitialized arena memory; returns the device address.</summary>
+        public IntPtr Reserve(long bytes) => Take(bytes);
+
+        /// <summary>Copy <paramref name="bytes"/> from host memory into the arena now; returns the device
+        /// address. The device's context must be current.</summary>
+        public IntPtr PlaceBytes(IntPtr host, long bytes)
+        {
+            IntPtr p = Take(bytes);
+            CudaDriverApi.cuMemcpyHtoD(p, host, new UIntPtr((ulong)bytes)).ThrowOnError();
             return p;
         }
 

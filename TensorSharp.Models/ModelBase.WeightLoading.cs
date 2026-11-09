@@ -34,6 +34,12 @@ namespace TensorSharp.Models
     {
         // Sparse host lookup tables can opt out of reading every row at startup.
         protected virtual bool ShouldPrefaultWeight(GgufTensorInfo info) => true;
+
+        /// <summary>When the checkpoint is larger than the page cache can hold, the tensors still
+        /// warmed in parallel before the load reads them: everything but the routed experts, which
+        /// are read later and only in part (a tier's or a host cache's share).</summary>
+        protected virtual bool ShouldPrefaultWeightWhenConstrained(GgufTensorInfo info)
+            => !info.Name.Contains("_exps", StringComparison.Ordinal);
         /// <summary>A stage executor excludes other nodes' weights before touching their pages.</summary>
         protected virtual bool ShouldLoadWeight(GgufTensorInfo info) => true;
         protected virtual IAllocator AllocatorForWeight(string name) => _allocator;
@@ -45,7 +51,8 @@ namespace TensorSharp.Models
             // otherwise reads the file at one-or-two-stream speed, which is the
             // whole cold-load time on network-backed model storage.
             ReadBonsaiMetadata();
-            _gguf.PrefaultFileCache(info => ShouldLoadWeight(info) && ShouldPrefaultWeight(info));
+            _gguf.PrefaultFileCache(info => ShouldLoadWeight(info) && ShouldPrefaultWeight(info),
+                ShouldPrefaultWeightWhenConstrained, logProgress: true);
             Console.Write("Loading model weights...");
             int countF32 = 0;
             int countQuant = 0;
@@ -597,6 +604,7 @@ namespace TensorSharp.Models
                 return;
 
             EnsureQuantBackendAvailable();
+            EnableHostExpertIoForCpuMoe();
 
             if (!MoeExpertOffload.IsEnabled)
                 return;
@@ -645,6 +653,45 @@ namespace TensorSharp.Models
         /// <summary>Diagnostic (TS_CUDA_LOG_VRAM=1): logs the model allocator's
         /// dedicated-VRAM free/used at <paramref name="label"/>.</summary>
         public void LogVramSnapshot(string label) => LogCudaVram(_allocator, label);
+
+        /// <summary>
+        /// Any model whose routed experts run on the host (--n-cpu-moe / --cpu-moe)
+        /// reads them through the explicitly read host expert cache when the model
+        /// does not fit in RAM: cold experts then arrive by parallel pread instead of
+        /// page faults inside the compute team, and prefill streams them straight into
+        /// the accelerator's staging memory. A model that fits keeps the mapping, whose
+        /// page cache already holds every expert after the first touch.
+        /// <c>TS_HOST_MOE_IO_CACHE_GB</c> forces a budget (0 turns it off).
+        /// </summary>
+        private void EnableHostExpertIoForCpuMoe()
+        {
+            if (!MoeCpuOffloadConfig.IsEnabled || _gguf == null || _hostExpertIoBases != null)
+                return;
+            long hostBytes = 0;
+            foreach (var kv in _stackedExpertWeights)
+                if (MoeCpuOffloadConfig.IsOffloadedExpertWeightName(kv.Key))
+                    hostBytes += kv.Value.TotalRawBytes;
+            if (hostBytes <= 0)
+                return;
+            long? requested = HostExpertIoBudgetOverride(Environment.GetEnvironmentVariable("TS_HOST_MOE_IO_CACHE_GB"));
+            long budget;
+            if (requested is long r)
+                budget = r;
+            else
+            {
+                long ram = (long)GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+                long reserve = Math.Max(8L << 30, ram / 6);
+                long modelBytes = 0;
+                foreach (string f in _gguf.FilePaths)
+                    try { modelBytes += new System.IO.FileInfo(f).Length; } catch (System.IO.IOException) { }
+                if (ram <= 0 || modelBytes <= ram - reserve)
+                    return;                                   // fits: the page cache serves it
+                budget = Math.Min(hostBytes, Math.Max(0, (ram - reserve - (modelBytes - hostBytes)) / 4 * 3));
+            }
+            if (budget > 0 && EnableHostExpertIo(budget))
+                Console.WriteLine($"  MoE CPU offload: host experts ({hostBytes / 1e9:F1} GB) are read with explicit I/O " +
+                    $"into a {budget / 1e9:F1} GB host expert cache (TS_HOST_MOE_IO_CACHE_GB overrides; 0 reads the mapping).");
+        }
 
         private void PrepareDirectCudaQuantizedWeightsForInference()
         {

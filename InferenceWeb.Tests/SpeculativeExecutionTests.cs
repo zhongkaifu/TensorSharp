@@ -507,6 +507,22 @@ public partial class SpeculativeExecutionTests
     }
 
     [Fact]
+    public void EngineSpec_BlockDrafter_PrefillsThePromptThroughTheContext()
+    {
+        // A block drafter attends over a ring of the prompt's feature rows. It can arm after a plain prefill (it keeps
+        // no per-position chain), but then the whole first answer is drafted without its prompt: the prompt must
+        // prefill through the speculative context, which hands the drafter every prompt row's hidden state.
+        const int promptLen = 20;
+        const int maxNew = 30;
+        var model = new FakeSpeculativeModel { BlockDraftSize = 4, ResumesAfterGap = true };
+        var seq = RunEngineRequest(model, promptLen, maxNew, specEnabled: true);
+        Assert.Equal(ExpectedChain(model, promptLen, maxNew), seq.OutputTokens);
+        Assert.Equal(0, model.FirstHiddenCatchUpPosition);
+        Assert.True(seq.SpecStats.VerifySteps > 0, "the block drafter never drafted");
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
     public void EngineSpec_MediaTurn_LeavesALearnedHeadAlone()
     {
         // A per-token head chains the trunk's hidden state of the last committed
@@ -629,6 +645,21 @@ public partial class SpeculativeExecutionTests
             out string decline);
         Assert.Null(decline);
         Assert.IsType<BlockDraftSpeculator>(speculator);
+        Assert.Equal(expected, speculator.MinDraftProb);
+    }
+
+    [Theory]
+    [InlineData(float.NaN, null, DraftHeadSpeculator.DefaultGate)]  // no trunk preference: algorithm default
+    [InlineData(0.5f, null, 0.5f)]                                   // trunk preference replaces the default
+    [InlineData(0.5f, 0.2f, 0.2f)]                                   // explicit --spec-pmin always wins
+    public void DraftHeadGate_TrunkPreferenceReplacesOnlyTheDefault(float preferred, float? explicitGate, float expected)
+    {
+        var model = new FakeSpeculativeModel { PreferredDraftGate = preferred };
+        var speculator = SpeculatorRegistry.Create(model,
+            new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.DraftHead, MinDraftProb = explicitGate },
+            out string decline);
+        Assert.Null(decline);
+        Assert.IsType<DraftHeadSpeculator>(speculator);
         Assert.Equal(expected, speculator.MinDraftProb);
     }
 
@@ -1277,6 +1308,8 @@ public partial class SpeculativeExecutionTests
         public int BlockDraftSize { get; set; }
         public float PreferredBlockGate { get; set; } = float.NaN;
         public float SpecPreferredBlockGate => PreferredBlockGate;
+        public float PreferredDraftGate { get; set; } = float.NaN;
+        public float SpecPreferredDraftGate => PreferredDraftGate;
         public float[] BlockConfidences { get; set; }
         public int BlockDraftCalls { get; private set; }
         public bool PrefillSelfCatchUp { get; set; }
@@ -1496,8 +1529,13 @@ public partial class SpeculativeExecutionTests
             return n;
         }
 
+        /// <summary>The first position a catch-up delivered with hidden rows (int.MaxValue: none yet).</summary>
+        public int FirstHiddenCatchUpPosition { get; private set; } = int.MaxValue;
+
         public void DraftCatchUp(int[] tokens, float[] hRows, int startPos)
         {
+            if (hRows != null && tokens.Length > 0)
+                FirstHiddenCatchUpPosition = Math.Min(FirstHiddenCatchUpPosition, startPos);
             if (hRows == null)
             {
                 // A seeded start (SeedCommitted) hands over the committed tokens with

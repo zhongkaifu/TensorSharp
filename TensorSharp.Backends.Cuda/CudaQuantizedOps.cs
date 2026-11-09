@@ -276,6 +276,15 @@ namespace TensorSharp.Cuda
                 computeType, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
         }
 
+        /// <summary>
+        /// A prompt-size product through an F16 copy of the weight dequantized for the call and the tensor-core GEMM (the
+        /// route <see cref="RunResidentMatmul"/> takes for large batches), for a layout the shared route does not list
+        /// (Q2_0, when <see cref="CudaKernels.DequantsQ2_0"/>). F32 activations [rows, inDim] to F32 [rows, outDim].
+        /// </summary>
+        internal static void RunPrefillF16Gemm(CudaAllocator allocator, IntPtr weightPtr, int ggmlType, IntPtr inputPtr,
+            IntPtr resultPtr, int inDim, int outDim, int rows)
+            => RunF16Gemm(allocator, allocator.Kernels, weightPtr, ggmlType, inputPtr, resultPtr, inDim, outDim, rows);
+
         private static void RunF16Gemm(
             CudaAllocator allocator, CudaKernels kernels,
             IntPtr weightPtr, int ggmlType, IntPtr inputPtr, IntPtr resultPtr,
@@ -724,13 +733,15 @@ namespace TensorSharp.Cuda
         /// type or shape that route would not send to a q8_1 kernel; the caller then takes
         /// <see cref="AddmmResidentToFloat32"/>.
         /// </summary>
+        /// <param name="stream">The stream to launch on; zero: the allocator's.</param>
         internal static bool TryResidentMatmulQ81(CudaAllocator allocator, IntPtr weightPtr, int ggmlType, IntPtr xq,
-            IntPtr resultPtr, int inDim, int outDim, int rows)
+            IntPtr resultPtr, int inDim, int outDim, int rows, IntPtr stream = default)
         {
             if (!ResidentMatmulTakesQ81(ggmlType, inDim, outDim, rows))
                 return false;
             CudaKernels kernels = allocator.Kernels;
-            IntPtr stream = allocator.Stream.Handle;
+            if (stream == IntPtr.Zero)
+                stream = allocator.Stream.Handle;
             if (ggmlType == 10 || ggmlType == 11)
                 kernels.LaunchQuantMatmulLowKDp4a(ggmlType, weightPtr, xq, resultPtr, inDim, outDim, rows, stream);
             else if (ggmlType == 14)

@@ -113,7 +113,14 @@ TensorSharp 自有图、原生内核与设备集成实现这些行为；上游 g
 隐藏状态保持 F32，不能将全模型降为 F16。原生 GGML CPU 为已验证的 Q8
 模型学习投影和 BF16 矩阵预展开 F32，词表保持压缩；这增加常驻内存。
 直接 CUDA 的学习投影与池化使用每次调用限定的 pedantic F32 精度，
-不改变共享 cuBLAS 全局模式。MLX 对证明安全的形状使用有界混合精度，
+不改变共享 cuBLAS 全局模式。GGML CUDA 的音频图即使未要求 F32 策略，其 F32 矩阵乘
+（F32 权重的投影、相对位置注意力、深度卷积与 SSCP 卷积）也在 TensorSharp 自有的
+pedantic cuBLAS 句柄上计算：ggml-cuda 自己的 cuBLAS 句柄开启 TF32 tensor-op 数学模式，
+超过三行的 F32 `ggml_mul_mat` 即使请求 F32 精度也可能把操作数舍入为 TF32。conformer
+固件的 25 行与 96 行块因此曾与双精度参照相差 5.8e-4 与 7.1e-4，现在为 4.3e-7 与 7.6e-7；
+RTX 5090 上 EmbeddingGemma 2 宽度的 12 层 conformer 也更快（188 帧 10.3 → 9.2 ms，
+750 帧 28.7 → 22.7 ms）。Q8_0 投影仍用 ggml 的整数内核；
+`TS_GEMMA4_AUDIO_GGML_CUDA_PEDANTIC=0` 保留 ggml 的 TF32 乘法。MLX 对证明安全的形状使用有界混合精度，
 其他路径保持各自的精度策略。实验开关的通过不能代替默认路径验证。
 音频默认使用 HF 的 `log(mel + .001)`，非 16 kHz 输入使用自有带限 sinc 重采样；
 显式 `llama_clamp` 是另一项受控比较，不能据此声称默认前端等价。

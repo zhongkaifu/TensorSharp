@@ -241,6 +241,14 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         public bool CanSeedCommitted => !NeedsHidden || _speculator.CanArmAfterPrefixReuse;
 
+        /// <summary>
+        /// Whether a fresh prompt should prefill through this execution rather than the plain path, even when
+        /// <see cref="CanSeedCommitted"/> would arm it afterwards: the speculator's proposals read the prompt's hidden
+        /// rows (<see cref="ISpeculator.ConditionsOnPrompt"/>) and the target does not feed them during its own
+        /// forward (<see cref="ISpeculator.HandlesOwnPrefill"/>).
+        /// </summary>
+        public bool PrefillsThroughContext => NeedsHidden && _speculator.ConditionsOnPrompt && !_speculator.HandlesOwnPrefill;
+
         // False until the trunk hidden state that drafting chains from has been
         // captured by a forward of this execution (see SeedCommitted).
         private bool _carryValid = true;

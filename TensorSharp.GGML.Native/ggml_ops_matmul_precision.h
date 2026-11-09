@@ -52,6 +52,8 @@ ggml_tensor * tsg_matmul_id_quant_pair(ggml_context *, ggml_tensor *, ggml_tenso
 #ifdef TSG_GGML_USE_CUDA
 struct tsg_matmul_cuda_state;
 tsg_matmul_cuda_state * tsg_matmul_cuda_init(ggml_backend_t);
+// nullptr instead of aborting when the device cannot create the private cuBLAS handle.
+tsg_matmul_cuda_state * tsg_matmul_cuda_try_init(ggml_backend_t);
 void tsg_matmul_cuda_free(tsg_matmul_cuda_state *);
 void tsg_matmul_cuda_compute(tsg_matmul_cuda_state *, ggml_tensor *);
 bool tsg_matmul_id_quant_strip_supported(ggml_backend_t, const ggml_tensor *,

@@ -177,6 +177,12 @@ public interface IPrefixCacheModel
 
     /// <summary>Spare bytes of <paramref name="cls"/>; −1 when unknown.</summary>
     long QuerySpareBytes(ResourceClass cls);
+
+    /// <summary>Bytes the machine is short of now, which the cached payloads give back first; 0 when it is
+    /// not. A spare figure measured after a payload was allocated never falls below it, so a host whose
+    /// payloads share memory with everything else (a Mac: the model's weights, the GPU's buffers, other
+    /// programs) needs this to evict before it swaps. 0 by default.</summary>
+    long QueryHostMemoryDeficitBytes() => 0;
 }
 
 /// <summary>Debug and test visibility into a model's payload ownership (I10, I14, I22).</summary>

@@ -34,7 +34,7 @@ public sealed class Q80PairMatvecTests
     /// 1e-4 relative L2 of the dequantized weights times the q8_1-rounded activations (what remains is
     /// accumulation order), so the pair cannot agree with itself by being wrong.
     /// </summary>
-    [CudaTheory]
+    [CudaTheory(TensorCoreModule = "tensorsharp_kernels")]
     [InlineData(2560, 10240)]
     [InlineData(2560, 6144)]
     [InlineData(6144, 2560)]

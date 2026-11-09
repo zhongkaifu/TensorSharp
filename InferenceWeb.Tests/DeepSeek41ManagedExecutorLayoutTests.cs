@@ -388,7 +388,7 @@ public sealed class DeepSeek41ManagedExecutorLayoutTests : IDisposable
         Assert.Contains("blk.2.ffn_down_exps.weight is IQ1_M (GPU-resident)", error.Message);
         Assert.DoesNotContain("blk.1.", error.Message);
         Assert.DoesNotContain("blk.2.ffn_gate_exps", error.Message);
-        Assert.Contains("The GPU expert kernels implement Q8_0, Q6_K, Q5_K, Q5_1, Q4_K, Q3_K, Q2_K, IQ4_XS, IQ4_NL, IQ3_S, " +
+        Assert.Contains("The GPU expert kernels implement Q8_0, Q6_K, Q5_K, Q5_1, Q4_K, Q3_K, Q2_K, Q2_0, IQ4_XS, IQ4_NL, IQ3_S, " +
             "IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S, MXFP4;", error.Message);
         Assert.Contains("Use --backend ggml_cuda", error.Message);
         Assert.True(ModelLoadRefusal.TryDescribe(error, out _));

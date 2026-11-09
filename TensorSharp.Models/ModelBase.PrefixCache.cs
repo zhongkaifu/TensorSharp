@@ -12,6 +12,7 @@
 using System;
 using System.Diagnostics;
 using System.Threading;
+using TensorSharp.GGML;
 using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 namespace TensorSharp.Models
@@ -55,10 +56,66 @@ namespace TensorSharp.Models
                 case ResourceClass.NativeSlot:
                     return GpuMemoryBudget.TryGetReservationSpareBytes(_backend, out long spare) ? Math.Max(0, spare) : -1;
                 case ResourceClass.HostKv:
-                    return HostSpareBytes();
+                    return ClampToMacMemory(HostSpareBytes());
                 default:
                     return -1;
             }
+        }
+
+        /// <summary>
+        /// <see cref="IPrefixCacheModel.QueryHostMemoryDeficitBytes"/>: on a Mac, how far what macOS can
+        /// give without compressing has fallen below what it should keep (<see cref="UnifiedMemorySpareBytes"/>),
+        /// or how far the device is from room for one more request (<see cref="DeviceMemoryDeficitBytes"/>),
+        /// whichever is more; 0 when neither.
+        /// </summary>
+        public long QueryHostMemoryDeficitBytes()
+        {
+            long host = OperatingSystem.IsMacOS() && UnifiedMemorySpareBytes() is long spare && spare < 0 ? -spare : 0;
+            return Math.Max(host, DeviceMemoryDeficitBytes());
+        }
+
+        /// <summary>
+        /// Bytes the device is short of room for one more request's state beside a headroom, which the prefix
+        /// cache then evicts from retained state; 0 by default. The host figure alone cannot see this on a Mac
+        /// whose weights are mapped: their clean file pages count as available, so a model whose GPU working
+        /// set was full never reported a deficit.
+        /// </summary>
+        protected virtual long DeviceMemoryDeficitBytes() => 0;
+
+        /// <summary>The larger of these and 15% of RAM is what <see cref="UnifiedMemorySpareBytes"/> leaves to
+        /// macOS and other programs.</summary>
+        protected const long UnifiedMemoryMinReserveBytes = 7_000_000_000L;
+
+        /// <summary>
+        /// Apple silicon has one memory for the GPU and everything else, and what the GPU reads is
+        /// wired, so retained K/V there comes out of the machine itself; past what macOS can give, it
+        /// compresses and swaps and every step slows down. Qwen3.8-27B on MLX on a 48 GB Mac: sixteen
+        /// retained conversations (each sized for the whole context) took the server past 34 GB, and
+        /// decode fell from 25 to 7-12 tok/s. This is what macOS can give without compressing
+        /// (<see cref="GgmlBasicOps.HostAvailableMemoryBytes"/>: free and purgeable pages and the clean
+        /// file cache) less the larger of 7 GB and 15% of RAM - the rule the Qwen4Exp expert tiers are
+        /// planned by. Negative when the machine is already short; null where it is not measured
+        /// (the native query reports -1 off Apple).
+        /// </summary>
+        protected static long? UnifiedMemorySpareBytes()
+        {
+            try
+            {
+                long available = GgmlBasicOps.HostAvailableMemoryBytes();
+                long ram = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+                if (available < 0 || ram <= 0) return null;
+                return available - Math.Max(UnifiedMemoryMinReserveBytes, ram / 100 * 15);
+            }
+            catch (DllNotFoundException) { return null; }
+            catch (EntryPointNotFoundException) { return null; }
+        }
+
+        /// <summary>A host spare figure (-1 unknown) bounded, on macOS, by <see cref="UnifiedMemorySpareBytes"/>.</summary>
+        private static long ClampToMacMemory(long spare)
+        {
+            if (!OperatingSystem.IsMacOS() || UnifiedMemorySpareBytes() is not long mac) return spare;
+            mac = Math.Max(0, mac);
+            return spare < 0 ? mac : Math.Min(spare, mac);
         }
 
         /// <summary>
