@@ -172,6 +172,16 @@ namespace TensorSharp.Runtime.Speculative
         float SpecPreferredBlockGate => float.NaN;
 
         /// <summary>
+        /// Default per-token confidence gate this trunk wants for a learned PER-TOKEN head
+        /// (<see cref="DraftHeadSpeculator.MinDraftProb"/>), or NaN for the algorithm's own default
+        /// (<see cref="DraftHeadSpeculator.DefaultGate"/>). Like the window preference it only replaces a
+        /// default: an explicit <c>--spec-pmin</c> always wins. Where each verify row costs a sizeable share of a
+        /// decode step (a sparse-MoE trunk whose rows each route their own experts), a draft the head is unsure of
+        /// costs more than it saves.
+        /// </summary>
+        float SpecPreferredDraftGate => float.NaN;
+
+        /// <summary>
         /// True when a verify batch has already written reusable attention KV for
         /// EVERY token it processed (so the accepted prefix's KV is correct in the
         /// live cache), and the model has no recurrent state that a re-forward would
@@ -227,6 +237,17 @@ namespace TensorSharp.Runtime.Speculative
         /// the request lost at position 0.
         /// </summary>
         bool SpecTrunkFollowsBoundCache => false;
+
+        /// <summary>
+        /// Concurrent decoders should take turns at solo speculative steps (one request keeps the turn for a stretch
+        /// of steps) rather than decode one token each in the token-batched graph. True where a speculative step
+        /// serves more tokens per second than a batched step for several sequences: Flash Next streaming its expert
+        /// misses on a 48 GB M5 Pro decoded four requests at 30-35 tokens/s in all batched against 40-44 for one
+        /// request speculating alone, the way Strata serves them (one at a time, 52-55). Needs per-request drafter
+        /// state (<see cref="IPerRequestDraftState"/>). TS_SPEC_TURNS=0/1 overrides. False by default: on a discrete
+        /// GPU a batched step costs little more than a solo one.
+        /// </summary>
+        bool SpecTurnsPreferred => false;
 
         /// <summary>
         /// Trunk forward identical to <see cref="IModelArchitecture.Forward"/>
@@ -343,6 +364,14 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         bool DraftHeadResumesAfterGap => false;
 
+        /// <summary>
+        /// True when the head's drafts condition on the prompt's rows, so a request whose
+        /// prompt prefills from position 0 reads it through its speculative context (the
+        /// head replays every prompt row) even when the head could restart after a gap
+        /// (<see cref="DraftHeadResumesAfterGap"/>) at the first decode step instead.
+        /// </summary>
+        bool DraftHeadConditionsOnPrompt => false;
+
         /// <summary>One per-token draft step at <paramref name="pos"/>: consume
         /// (token, previous hidden), fill next-token logits and the chained
         /// hidden state. Only called for <see cref="DraftHeadKind.PerToken"/>.</summary>
@@ -396,11 +425,43 @@ namespace TensorSharp.Runtime.Speculative
             float[] logitsOut, float[] hOut)
             => throw new NotSupportedException(
                 "This draft head cannot fuse its catch-up with the first draft step.");
+
+        /// <summary>
+        /// True when this head can run a whole per-token draft chain on its device, via <see cref="DraftChain"/>: the
+        /// speculator then makes one call per window instead of one per draft, and never reads draft logits. Used only
+        /// when the draft distribution is not adjusted (no penalties), since the chain picks each step's first maximum.
+        /// </summary>
+        bool SupportsDraftChain => false;
+
+        /// <summary>
+        /// <see cref="DraftCatchUpAndStep"/> (or, for a single token, <see cref="DraftStep"/>) followed by up to
+        /// <paramref name="maxTokens"/> - 1 further steps, each fed the previous step's first-max token and the head's own
+        /// hidden output on the device. Writes each step's token to <paramref name="draftOut"/> and its confidence (the
+        /// top-1 probability over the step's 10 largest logits, the per-token gate's measure) to
+        /// <paramref name="probOut"/>, and returns the steps run (at most <paramref name="maxTokens"/>). The head's own
+        /// state then covers every step's row; later calls start at or before positions it holds.
+        /// </summary>
+        int DraftChain(int[] tokens, float[] hRows, int startPos, int maxTokens, int[] draftOut, float[] probOut) => 0;
     }
 
     /// <summary>Convenience alias for the common case: a model that is its own
     /// speculative target AND ships its own draft head.</summary>
     public interface ISpeculativeModel : ISpeculativeTarget, IDraftHead { }
+
+    /// <summary>
+    /// A drafter that keeps one state per request (a DFlash ring is the context of ONE sequence). Concurrent
+    /// requests that speculate - in a batched verify, or taking turns at solo speculative steps - each bind their own
+    /// before drafting, so one request's drafts never read another's context.
+    /// </summary>
+    public interface IPerRequestDraftState
+    {
+        /// <summary>Point the drafter's per-sequence state at
+        /// <paramref name="requestId"/> (created on first use); null selects the shared state.</summary>
+        void BindDraftState(string? requestId);
+
+        /// <summary>Return <paramref name="requestId"/>'s drafter state.</summary>
+        void ReleaseDraftState(string requestId);
+    }
 
     /// <summary>
     /// A trunk that verifies the draft windows of SEVERAL concurrent sequences, each
@@ -413,7 +474,7 @@ namespace TensorSharp.Runtime.Speculative
     /// state per request (<see cref="BindDraftState"/>), because several sequences
     /// now draft between the same pair of verifies.
     /// </summary>
-    public interface IBatchedSpeculativeTarget
+    public interface IBatchedSpeculativeTarget : IPerRequestDraftState
     {
         /// <summary>Tokens per sequence (anchor plus drafts) one batched verify of
         /// <paramref name="sequences"/> sequences forwards, or 0 when the trunk cannot
@@ -429,13 +490,6 @@ namespace TensorSharp.Runtime.Speculative
         /// writes its whole window for every sequence, padding included, so the window
         /// must fit every sequence's free rows.</summary>
         int FusedCacheFreeRows(string requestId) => 0;
-
-        /// <summary>Point the drafter's per-sequence state at
-        /// <paramref name="requestId"/> (created on first use); null selects the shared state.</summary>
-        void BindDraftState(string? requestId);
-
-        /// <summary>Return <paramref name="requestId"/>'s drafter state.</summary>
-        void ReleaseDraftState(string requestId);
 
         /// <summary>Scope of one batched step: drafting inside it must not end or
         /// re-enter the trunk's single-sequence speculative session.</summary>
@@ -470,6 +524,18 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>Advance sequence i of the last verify by <c>kept[i]</c> tokens
         /// (1 .. window). Throws when the caches may be partially advanced.</summary>
         void CommitBatchedSpecVerify(IReadOnlyList<string> requestIds, int[] positions, int[] kept);
+
+        /// <summary>Whether <see cref="TryBatchedSpecVerifyLogits"/> serves the batched verify of
+        /// sequences that sample: each row's logits come back, and each sequence draws its rows
+        /// with its own sampler exactly as its solo step does.</summary>
+        bool SupportsBatchedSpecLogits => false;
+
+        /// <summary>
+        /// <see cref="TryBatchedSpecVerify"/> that fills <paramref name="logits"/>
+        /// ([sequences * window * vocab]) with every row's logits instead of their argmax.
+        /// </summary>
+        bool TryBatchedSpecVerifyLogits(IReadOnlyList<string> requestIds, int[] positions, int window,
+            int[] tokens, float[] logits, float[] features) => false;
     }
 
     /// <summary>

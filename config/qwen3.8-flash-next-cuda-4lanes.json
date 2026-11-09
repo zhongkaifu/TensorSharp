@@ -1,0 +1,11 @@
+{
+  // Overlay for config/qwen3.8-flash-next-cuda.json when several users share the server:
+  //   TensorSharp.Server.Host --config config/qwen3.8-flash-next-cuda.json --config config/qwen3.8-flash-next-cuda-4lanes.json
+  // The plan leaves VRAM for four sequence lanes (~1.5 GB each), so concurrent requests get slots of their own and
+  // decode and speculate together instead of one after another. RTX 5090: four requests at once 243-258 tok/s in all
+  // (one lane: 200), parallel_4 281-286 (198-216), every request's first token in 0.62-0.67 s; single-stream decode
+  // is 7-11% lower because fewer experts fit beside the lanes. A companion preset, not a standalone model.
+  "environment": {
+    "TS_Q4E_LANES": "4"
+  }
+}

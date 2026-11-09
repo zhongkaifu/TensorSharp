@@ -24,7 +24,8 @@ namespace TensorSharp.Runtime
     {
         public ThinkingTokenBudget(int tokenLimit, int endTokenId, bool closeOnRepetition = false,
             int openTokenId = -1, bool openAtStart = true, bool suppressUnopenedEnd = false,
-            Func<int, bool>? closeAtBoundary = null, IReadOnlyList<int>? closingTokenIds = null)
+            Func<int, bool>? closeAtBoundary = null, IReadOnlyList<int>? closingTokenIds = null,
+            Func<int, bool>? closeOnStop = null)
         {
             if (tokenLimit <= 0) throw new ArgumentOutOfRangeException(nameof(tokenLimit));
             if (endTokenId < 0) throw new ArgumentOutOfRangeException(nameof(endTokenId));
@@ -43,6 +44,7 @@ namespace TensorSharp.Runtime
             OpenAtStart = openAtStart;
             SuppressUnopenedEnd = suppressUnopenedEnd;
             CloseAtBoundary = closeAtBoundary;
+            CloseOnStop = closeOnStop;
         }
 
         /// <summary>Tokens the channel may run before its end token is forced.
@@ -86,5 +88,15 @@ namespace TensorSharp.Runtime
         /// that hands over to the answer first (see ChatProtocol.ThinkingBudgetClosingText).
         /// </summary>
         public IReadOnlyList<int> ClosingTokenIds { get; }
+
+        /// <summary>
+        /// The model's stop tokens (the tokenizer's end-of-sequence test), or null. A stop
+        /// drawn while the channel is open would end the turn with reasoning and no answer;
+        /// with this set the draw closes the channel instead - the closing text, then the
+        /// end token - and the model answers. Qwen3.8-27B NVFP4 under Aider ended 3 of 53
+        /// turns that way, each mid-phrase in a counting loop, which an OpenAI client then
+        /// received as an empty <c>stop</c> (issue #338).
+        /// </summary>
+        public Func<int, bool>? CloseOnStop { get; }
     }
 }

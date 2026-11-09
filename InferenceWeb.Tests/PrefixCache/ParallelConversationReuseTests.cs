@@ -54,6 +54,67 @@ public sealed class ParallelConversationReuseTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// On a Mac a retained conversation's memory is the machine's own (one memory for the GPU and
+    /// everything else), and a spare figure measured after a payload was allocated never falls below what
+    /// is cached, so nothing evicted: a Qwen3.8-27B MLX server kept sixteen conversations sized for the
+    /// whole context, passed 34 GB on a 48 GB Mac and ran 3x slower in swap. The model reports how far the
+    /// machine is short (<see cref="IPrefixCacheModel.QueryHostMemoryDeficitBytes"/>) and the prefix cache
+    /// evicts that much before admitting a request and after keeping one. The retained states go; a public
+    /// prefix may stay, and so does the live primary cache of a family that keeps one resident (it is
+    /// allocated either way: evicting it frees nothing), and every answer is still the cold run's.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Families))]
+    public async Task UnderAMemoryDeficit_TheRetainedConversationsAreEvicted_AndAnswerLikeAColdRun(string family)
+    {
+        const int conversations = 4;
+        var plentyBytes = new long[Turns];
+        var shortBytes = new long[Turns];
+        int[][] plenty = await RunAsync(family, conversations, afterTurn: (engine, turn) => plentyBytes[turn] = CachedBytes(engine));
+        int[][] shortOfMemory = await RunAsync(family, conversations,
+            (model, turn) => model.HostMemoryDeficitBytes = turn > 0 ? long.MaxValue / 4 : 0,
+            (engine, turn) => shortBytes[turn] = CachedBytes(engine));
+        // What a family cannot give back stays (pages in the pool's own blocks, which P2 reuses through; the slot
+        // N keeps), and a page family's host slabs go at the next admission; nothing is ever kept or reused more.
+        for (int turn = 1; turn < Turns; turn++)
+        {
+            Assert.True(shortOfMemory[turn].Sum() <= plenty[turn].Sum(),
+                $"{family} turn {turn}: reused more short of memory ([{string.Join(", ", shortOfMemory[turn])}]) than with it ([{string.Join(", ", plenty[turn])}])");
+            Assert.True(shortBytes[turn] <= plentyBytes[turn],
+                $"{family} turn {turn}: cached {shortBytes[turn]} bytes short of memory, {plentyBytes[turn]} with it");
+        }
+    }
+
+    /// <summary>The case the deficit is for: Qwen 3.5 holders (R). With memory the server keeps every conversation
+    /// it is not running; short of it, the finished conversations are given back as they are kept, and what a turn
+    /// captured on the way (a prompt-tail checkpoint, which does not pass the trim) goes at the next admission.</summary>
+    [Fact]
+    public async Task UnderAMemoryDeficit_Qwen35HoldersAreGivenBack()
+    {
+        const int conversations = 4;
+        var plentyBytes = new long[Turns];
+        var shortBytes = new long[Turns];
+        int[][] plenty = await RunAsync("R", conversations, afterTurn: (engine, turn) => plentyBytes[turn] = CachedBytes(engine));
+        int[][] shortOfMemory = await RunAsync("R", conversations,
+            (model, turn) => model.HostMemoryDeficitBytes = turn > 0 ? long.MaxValue / 4 : 0,
+            (engine, turn) => shortBytes[turn] = CachedBytes(engine));
+        for (int turn = 1; turn < Turns; turn++)
+        {
+            Assert.True(plentyBytes[turn] > 0 && plenty[turn].All(r => r > 0), $"turn {turn}: with memory the conversations were not kept");
+            Assert.True(shortBytes[turn] < plentyBytes[turn] / 2,
+                $"turn {turn}: {shortBytes[turn]} bytes kept short of memory, {plentyBytes[turn]} with it");
+            Assert.True(shortOfMemory[turn].Sum() < plenty[turn].Sum(),
+                $"turn {turn}: reused [{string.Join(", ", shortOfMemory[turn])}] short of memory, [{string.Join(", ", plenty[turn])}] with it");
+        }
+    }
+
+    private static long CachedBytes(InferenceEngine engine)
+    {
+        ResourceVector c = engine.RadixCache!.Tree.Cached;
+        return c.HostKv + c.StateSnapshot + c.DeviceKv + c.NativeSlot;
+    }
+
     [Fact]
     public void TheBudget_FollowsTheConcurrency_UnlessSetExplicitly()
     {
@@ -74,7 +135,8 @@ public sealed class ParallelConversationReuseTests : IDisposable
 
     /// <summary>Runs <paramref name="conversations"/> conversations in parallel for <see cref="Turns"/> turns,
     /// each turn admitted in one step, and returns what every turn of every conversation reused.</summary>
-    private static async Task<int[][]> RunAsync(string family, int conversations)
+    private static async Task<int[][]> RunAsync(string family, int conversations, Action<OracleModel, int>? beforeTurn = null,
+        Action<InferenceEngine, int>? afterTurn = null)
     {
         using var model = Create(family, conversations);
         var config = new SchedulerConfig
@@ -89,6 +151,7 @@ public sealed class ParallelConversationReuseTests : IDisposable
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
         for (int turn = 0; turn < Turns; turn++)
         {
+            beforeTurn?.Invoke(model, turn);
             var requests = prompts.Select((p, i) => new SequenceState($"c{i}t{turn}", p.ToList(), MaxNew, 16,
                 SamplingConfig.Greedy, cacheScope: $"conversation{i}")).ToArray();
             var gate = new ComputeGate();
@@ -98,6 +161,9 @@ public sealed class ParallelConversationReuseTests : IDisposable
             gate.Open();
             InferenceCompletion[] done = await Task.WhenAll(handles.Select(h => h.Completion)).WaitAsync(timeout.Token);
             reused[turn] = done.Select(d => d.PrefixCacheReusedTokens).ToArray();
+            // The last request's state is kept (and a deficit relieved) after its completion is signalled.
+            await engine.WhenStepSettledAsync().WaitAsync(timeout.Token);
+            afterTurn?.Invoke(engine, turn);
             for (int i = 0; i < conversations; i++)
             {
                 Assert.Equal(Cold(family, prompts[i], timeout.Token), requests[i].OutputTokens);

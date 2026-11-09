@@ -423,6 +423,26 @@ Hunyuan Dense, Qwen 3.8 Flash Next, GLM 5.x, DeepSeek V4 / V4.1) reuse stops at 
 first image, video frame or audio clip. DiffusionGemma and the image/video models
 do not use it.
 
+On a Mac the bytes are bounded by what macOS can give. The GPU and everything else
+share one memory there, and a retained state is wired like the weights, so a spare
+figure measured after it was allocated never drops below what is cached: a
+Qwen3.8-27B MLX server on a 48 GB Mac kept sixteen conversations sized for the whole
+context, passed 34 GB and decoded 3x slower once it swapped. The model reports how
+far what macOS can give without compressing (free and purgeable pages and the clean
+file cache) has fallen below the larger of 7 GB and 15% of RAM, and the prefix cache
+evicts that many bytes of retained state, oldest first and short of the public
+prefixes, before it admits a request and after it keeps one
+(`IPrefixCacheModel.QueryHostMemoryDeficitBytes`). The host spare that clones and
+holder pools are sized against is bounded the same way. Elsewhere nothing changes.
+
+That figure cannot see a full GPU working set when the weights are mapped: their clean
+file pages count as available. Qwen 3.8 Flash Next on `ggml_metal` therefore also
+reports what the working set lacks for one more request's state beside its headroom,
+after the idle graph arenas are released, and the deficit is the larger of the two.
+Under Strata's concurrency rounds a request was refused a holder for 42 s while three
+finished conversations stayed retained, then ran on the primary cache, which has no
+admission check, and the GPU ran out of memory; now the retained holders go first.
+
 `TS_SCHED_PREFIX_CACHE=0` disables reuse; `--no-prefix-cache` (CLI and server)
 sets it and also skips the startup warm-up of the shared system/tool prefix and, on
 the server, the checkpoint files. `--spec` leaves the prefix cache on. (The pre-Radix
@@ -566,7 +586,7 @@ request reused nothing, the first specific reason a source declined.
 | `TS_SCHED_NUM_BLOCKS` | `256` | Physical blocks in the engine pool. |
 | `TS_SCHED_BLOCK_SIZE` | `16` for a page-only family (Hunyuan Dense, Mistral 3, Muse-Glimmer), `256` otherwise | Tokens per block. A family whose only cross-request reuse is whole pages reuses at this granularity: at 256, a turn shorter than a block reused nothing. |
 | `TS_SCHED_PREFIX_CACHE` | `1` | Set `0` to disable all admission-time prompt reuse: Radix pages, end states and checkpoints. `--no-prefix-cache` (CLI and server) sets it. |
-| `TS_SCHED_STOP_REPETITION` | `1` | Set `0` to let a looping generation run to its token limit rather than ending it with finish reason `repetition`. |
+| `TS_SCHED_STOP_REPETITION` | `1` | Set `0` to let a looping generation run to its token limit rather than ending it with finish reason `repetition`; reasoning that repeats a templated line is then not closed either. |
 | `TS_SCHED_DECODE_QUANTUM` | `256` | Number of decode tokens before a sequence switch is allowed in fallback-heavy execution. |
 | `TS_PER_SEQ_FUSED` | `1` | Concurrent (N≥2) sequences on fused-capable models run per-request fused Forward, each on its own device K/V holder; `0` serves them on the op-by-op batched paged path instead, whose K/V lives in the shared host block pool (less device memory, a lower decode rate, and no retained holders). |
 | `TS_BATCHED_FUSED_DECODE` | `1` | `0` disables true token-batched fused decode inside the per-sequence fused path (one graph decodes all N sequences). |
@@ -618,7 +638,8 @@ both the CLI and the server. The default is chosen automatically per model
 (`f16` when the model's weights are below F32, `f32` otherwise); the block-quantized tiers
 (`q8_0`, `q4_0`) require the native GGML flash-attention path, and `q4_0`
 (~1/7 of f32) targets very long 128K–256K contexts where the KV cache
-dominates memory.
+dominates memory. Qwen3.8-Flash-Next's direct engine (`--backend cuda`) has its own
+`q8_0` attention kernels, defaults to `q8_0`, and keeps `f16` for `q4_0` (see `docs/models/qwen38-flash-next.md`).
 
 ## Remaining Work
 

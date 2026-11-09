@@ -72,6 +72,7 @@ internal sealed class AdaptedOracleModel : IHolderPrefixCacheModel, IPrefixCache
     }
     public ResourceVector EstimateCloneBytes(string payloadKey, int targetTokens) => Inner.EstimateCloneBytes(payloadKey, targetTokens);
     public long QuerySpareBytes(ResourceClass cls) => Inner.QuerySpareBytes(cls);
+    public long QueryHostMemoryDeficitBytes() => Inner.QueryHostMemoryDeficitBytes();
 
     // ---- diagnostics ----
 

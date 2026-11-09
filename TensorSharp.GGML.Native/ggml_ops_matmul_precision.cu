@@ -342,6 +342,29 @@ tsg_matmul_cuda_state * tsg_matmul_cuda_init(ggml_backend_t backend) {
     return state;
 }
 
+tsg_matmul_cuda_state * tsg_matmul_cuda_try_init(ggml_backend_t backend) {
+    // As tsg_matmul_cuda_init, but a device that cannot hold another cuBLAS handle (its workspace is device
+    // memory) gives nullptr instead of aborting the process: a per-request backend on a full GPU fails that
+    // request (the fourth concurrent Qwen3.8 Flash Next request on ggml_cuda took the server down here).
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (cudaSetDevice(context->device) != cudaSuccess) return nullptr;
+    auto * state = new tsg_matmul_cuda_state;
+    state->device = context->device;
+    state->stream = context->stream(context->device, 0);
+    if (cublasCreate(&state->handle) != CUBLAS_STATUS_SUCCESS) {
+        delete state;
+        return nullptr;
+    }
+    if (cublasSetStream(state->handle, state->stream) != CUBLAS_STATUS_SUCCESS ||
+        cublasSetMathMode(state->handle, CUBLAS_PEDANTIC_MATH) != CUBLAS_STATUS_SUCCESS) {
+        cublasDestroy(state->handle);
+        delete state;
+        return nullptr;
+    }
+    return state;
+}
+
 void tsg_matmul_cuda_free(tsg_matmul_cuda_state * state) {
     if (!state) return;
     CUDA_CHECK(cudaSetDevice(state->device));

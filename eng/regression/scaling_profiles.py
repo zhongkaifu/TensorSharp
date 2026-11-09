@@ -361,7 +361,10 @@ def _learned(profile, context, result, root):
     if draft:
         command += ["--draft-model", draft["model_path"]]
     env = {key: value for key, value in (context.get("env") or {}).items() if not re.search(r"SPEC|DRAFT|DFLASH|DSPARK|NGRAM|MTP", key, re.I)}
-    env.update(MAX_CONTEXT="2048", TS_SPEC_DRAFT=str(params["draft_tokens"]), TS_SCHED_NUM_BLOCKS="16", TS_SCHED_BLOCK_SIZE="128")
+    # Exact token parity is the contract: verify each row with the one-token kernels
+    # (ggml_metal batches Qwen3.8 Flash Next verify rows by default, not bit-identically).
+    env.update(MAX_CONTEXT="2048", TS_SPEC_DRAFT=str(params["draft_tokens"]), TS_SCHED_NUM_BLOCKS="16", TS_SCHED_BLOCK_SIZE="128",
+               TS_Q4E_VERIFY_ROW_KERNELS="1")
     before = _model_snapshot(context)
     item, text = _process(command, context, result, root, "learned", env, check_exit=False)
     _require(result, "learned model and draft files unchanged", _model_snapshot(context) == before)

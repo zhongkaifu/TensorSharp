@@ -304,7 +304,9 @@ namespace TensorSharp.Runtime
                     // Check at publication as well: a host's preflight may have set
                     // an explicit process value after we validated the configuration.
                     if (Environment.GetEnvironmentVariable(entry.Key) != null) continue;
-                    Environment.SetEnvironmentVariable(entry.Key, entry.Value);
+                    // Published to the C runtime too: many of these switches are read by
+                    // the native library with getenv.
+                    NativeEnvironment.Set(entry.Key, entry.Value);
                     applied.Add(entry.Key);
                 }
             }
@@ -313,7 +315,7 @@ namespace TensorSharp.Runtime
                 // Validations/download failures never reach publication. If the
                 // platform rejects a setter, undo the defaults already published.
                 for (int i = applied.Count - 1; i >= 0; i--)
-                    Environment.SetEnvironmentVariable(applied[i], null);
+                    NativeEnvironment.Set(applied[i], null);
                 throw;
             }
         }

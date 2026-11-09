@@ -158,21 +158,27 @@ namespace TensorSharp.Models
         /// A new empty slot, freeing idle retained slots while device memory has no room for one: a retained
         /// slot keeps a finished conversation for its next turn, and a request that needs a slot now outranks
         /// it (DeepSeek's SlotForRequest does the same). Each freed key is added to
-        /// <paramref name="reclaimed"/> for the caller to report through the sink (DEC-23). -1 when nothing is
-        /// left to free; the caller then reports the missing capacity rather than failing the request.
+        /// <paramref name="reclaimed"/> for the caller to report through the sink (DEC-23). A retained slot the
+        /// native side refuses to free (its selection) stays retained and the next oldest goes: stopping at it left
+        /// the others' memory held while the request was refused. -1 when nothing is left to free; the caller then
+        /// reports the missing capacity rather than failing the request.
         /// </summary>
         internal static int AllocReclaiming<TStore>(IDictionary<string, RetainedSlot> retained, TStore store, List<string> reclaimed)
             where TStore : ISlotStore
         {
             int slot = store.Alloc();
-            while (slot < 0 && retained != null && retained.Count > 0)
+            if (slot >= 0 || retained == null || retained.Count == 0)
+                return slot;
+            // Oldest first; a refused one is passed over.
+            foreach (string key in new List<string>(retained.Keys))
             {
-                string key = null;
-                foreach (string candidate in retained.Keys) { key = candidate; break; }
-                if (!store.Free(retained[key].Slot)) break;
+                if (!store.Free(retained[key].Slot))
+                    continue;
                 retained.Remove(key);
                 reclaimed.Add(key);
                 slot = store.Alloc();
+                if (slot >= 0)
+                    break;
             }
             return slot;
         }

@@ -3023,7 +3023,10 @@ async function sendMessage() {
   if (stillImagePaths.length > 0) msg.stillImagePaths = stillImagePaths;
   if (currentVideoCaps) {
     if (videoComposerFrames > 0) msg.videoFrames = videoComposerFrames;
-    if (videoComposerMode !== 'auto') msg.videoMode = videoComposerMode;
+    // References are what this message attaches: the selector stays on "Reference", but a
+    // follow-up with nothing attached is filmed from its description (as in the app).
+    const attachesMedia = stillImagePaths.length > 0 || videoFilePaths.length > 0 || audioPaths.length > 0;
+    if (videoComposerMode !== 'auto' && (videoComposerMode !== 'ref' || attachesMedia)) msg.videoMode = videoComposerMode;
     const resolution = videoResolutionChoices().find(choice => choice.value === videoComposerResolution);
     if (resolution && resolution.width > 0 && resolution.height > 0) {
       msg.videoWidth = resolution.width;
@@ -3467,7 +3470,8 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv, generation) {
       bubbleText.textContent = 'The loaded model needs a first-frame image. Attach one or choose another video model.';
       statsDiv.textContent = 'Missing image'; return;
     }
-    payload.videoMode = 't2v';
+    // LTX 2.5 films its soundtrack with the picture (t2va, set above), as the app's host does.
+    payload.videoMode = currentArchitecture === 'ltx-2.5' ? 't2va' : 't2v';
   }
   statsDiv.textContent = mode +
     (unused > 0 ? ' (' + unused + (unused === 1 ? ' image' : ' images') + ' not used)' : '');

@@ -185,8 +185,43 @@ namespace TensorSharp.Models
             _seqSlotBase = h.SlotBase;
         }
 
-        private Qwen4ExpKvCacheHolder CreateFreshHolder()
-            => AllocateHolder(_initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity);
+        private Qwen4ExpKvCacheHolder CreateFreshHolder() => AllocateHolder(FreshHolderCapacity());
+
+        /// <summary>Rows a new per-request holder starts with on Metal when nothing set them
+        /// (<c>TS_KV_INITIAL_TOKENS</c>): a request reserves its prompt and reply before its first chunk
+        /// (EnsureCacheCapacity), so what a holder starts with only has to be small.</summary>
+        internal const int MetalFreshHolderTokens = 2048;
+
+        private bool _freshHolderCapacityLogged;
+
+        /// <summary>
+        /// An explicit MAX_CONTEXT allocates the whole window up front (ResolveInitialCacheAllocationLength),
+        /// which is right for the primary and was paid again by every concurrent request's holder: on Flash Next
+        /// at MAX_CONTEXT=32768 each live conversation took ~1.6 GB of a Mac's memory for a 29-token prompt (K/V
+        /// and indexer keys 865 MB, recurrent state, the drafter's ring), four of them took the footprint from
+        /// 31 to 39-40 GB on a 48 GB M5 Pro, and every step of Strata's 4-at-once rounds ran 20-50% slower under
+        /// the memory pressure (parallel_4 29 tok/s; 36-37 with holders started at 2048). On Metal a new holder
+        /// starts at <see cref="MetalFreshHolderTokens"/> and grows with its request; an explicit
+        /// <c>TS_KV_INITIAL_TOKENS</c> is used as given (set it to MAX_CONTEXT for whole-window holders).
+        /// </summary>
+        /// <remarks>ggml_cuda paid it too, in VRAM: at MAX_CONTEXT=131072 a Flash Next holder is 3.6 GB of K/V and
+        /// indexer keys beside a 19.1 GB expert tier on a 32 GB RTX 5090, so the second concurrent request's holder
+        /// failed to allocate, the batched arena (366 MiB) failed on every step, and the fourth request's step
+        /// aborted the server inside ggml (cuBLAS could not create a handle). There a holder starts small too.</remarks>
+        private int FreshHolderCapacity()
+        {
+            int initial = _initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity;
+            if (!AdmitsSequencesByDeviceMemory || initial <= MetalFreshHolderTokens
+                || ExecutionOptions.FromEnvironment().KvInitialTokens > 0)
+                return initial;
+            if (!_freshHolderCapacityLogged)
+            {
+                _freshHolderCapacityLogged = true;
+                Console.WriteLine($"[qwen4exp] per-request caches start at {MetalFreshHolderTokens} tokens and grow with " +
+                    $"their request (the primary keeps {initial}); TS_KV_INITIAL_TOKENS sets both.");
+            }
+            return MetalFreshHolderTokens;
+        }
 
         /// <summary>A brand-new, zeroed holder with attention K/V and QSA raw-key
         /// caches of <paramref name="cap"/> rows and zeroed recurrent/PLE state. The
@@ -283,6 +318,8 @@ namespace TensorSharp.Models
 
             if (string.Equals(_activeFusedKey, requestId, StringComparison.Ordinal))
                 return false;
+            if (!_fusedHolders.ContainsKey(requestId))
+                EnsureDeviceRoomForAnotherSequence(requestId);
 
             if (_activeFusedKey == null)
                 _primaryHolder = SnapshotActiveCache();
@@ -304,6 +341,121 @@ namespace TensorSharp.Models
             _activeFusedKey = requestId;
             return fresh;
         }
+
+        /// <summary>
+        /// On Metal a concurrent request's holder (its K/V and indexer keys, recurrent and conv state) becomes device
+        /// copies on its first step, ~1.1 GB at a 32K context on Flash Next, and nothing else bounds how many run at
+        /// once: on a 48 GB M5 Pro the expert tier left ~14 GB of the 38.3 GB working set, Strata's benchmark ran four
+        /// concurrent requests after 16K-token prompts, and Metal ran out of memory mid-step (unrecoverable). So a new
+        /// request's holder needs that much free beside a headroom; the arenas graph slots keep idle go first, and when
+        /// it still does not fit the request waits for a running one to finish (SequenceSlotUnavailableException, the
+        /// scheduler's DeferForSequenceSlot). A lone request runs on the primary cache and never comes here.
+        /// </summary>
+        private void EnsureDeviceRoomForAnotherSequence(string requestId)
+        {
+            if (!AdmitsSequencesByDeviceMemory)
+                return;
+            if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) || total <= 0)
+                return;
+            long need = AnotherSequenceBytes();
+            if (FitsAnotherSequence(free, total, need))
+                return;
+            if (GgmlBasicOps.ReleaseKeptArenas() > 0 && GgmlBasicOps.TryGetDeviceMemoryInfo(out free, out total)
+                && FitsAnotherSequence(free, total, need))
+                return;
+            throw new SequenceSlotUnavailableException(
+                $"qwen4exp: no {DeviceMemoryName} for another concurrent request's state ({need / 1048576.0:F0} MB needed, " +
+                $"{free / 1048576.0:F0} MB free of {total / 1048576.0:F0} MB, {MetalHeadroom(total) / 1048576.0:F0} MB kept free); " +
+                $"{requestId} waits for a running request to finish.");
+        }
+
+        /// <summary>
+        /// Whether one device's free memory bounds how many requests hold state at once: Metal's working set, or one
+        /// CUDA GPU on ggml_cuda (a layer split or tensor parallelism plans its devices explicitly). ggml_cuda had no
+        /// such bound, and a request that did not fit made ggml abort the process mid-step (an out-of-memory CUDA call
+        /// is fatal inside ggml), where on Metal it waits for a running request (SequenceSlotUnavailableException).
+        /// </summary>
+        private bool AdmitsSequencesByDeviceMemory => _backend == BackendType.GgmlMetal
+            || (_backend == BackendType.GgmlCuda && !IsTensorParallel && LayerSplitDegree <= 1 && _q4eStage == null);
+
+        private string DeviceMemoryName => _backend == BackendType.GgmlMetal ? "Metal memory" : "CUDA memory";
+
+        /// <summary>
+        /// What another request's state takes on the device. On Metal, the active holder's caches plus the extra
+        /// state (unchanged). On ggml_cuda, a fresh holder grown to <see cref="CudaSequenceGrowthTokens"/> rows plus
+        /// the extra state: its caches start at <see cref="MetalFreshHolderTokens"/> rows and double as the request
+        /// grows, and each growth is a fresh device copy, so admission leaves room for the first doublings.
+        /// </summary>
+        private long AnotherSequenceBytes() => _backend == BackendType.GgmlMetal
+            ? CacheBytes() + MetalSequenceExtraBytes
+            : HolderCacheBytes(Math.Min(_maxContextLength, Math.Max(FreshHolderCapacity(), CudaSequenceGrowthTokens))) + MetalSequenceExtraBytes;
+
+        /// <summary>Rows of K/V that admission and the expert tier leave room for per concurrent ggml_cuda request.</summary>
+        internal const int CudaSequenceGrowthTokens = 8192;
+
+        /// <summary>Bytes of one holder's attention K/V and QSA indexer keys at <paramref name="tokens"/> rows.</summary>
+        private long HolderCacheBytes(int tokens)
+        {
+            long elements = 0;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_isRecurrent[l]) continue;
+                elements += 2L * Config.NumKVHeads * tokens * Config.HeadDim;
+                if (UsesQsa(l)) elements += (long)tokens * _indexerHeadDim;
+            }
+            return KvBytes(_kvCacheDtype, elements);
+        }
+
+        /// <summary>Bytes of <paramref name="elements"/> cache values stored as <paramref name="dtype"/>.</summary>
+        internal static long KvBytes(KvCacheDtype dtype, long elements) => dtype switch
+        {
+            KvCacheDtype.F32 => elements * 4,
+            KvCacheDtype.F16 => elements * 2,
+            KvCacheDtype.Q8_0 => elements / 32 * 34,
+            KvCacheDtype.Q4_0 => elements / 32 * 18,
+            _ => elements * 2,
+        };
+
+        /// <summary>The working set a new request's state may not eat into: the larger of 1 GB and 1/32 of it, what
+        /// command buffers and the driver allocate beside the graphs (the native arena guard keeps the same).</summary>
+        /// <summary>
+        /// On Metal: what the working set lacks for one more request's state beside the headroom, after the idle
+        /// arenas are released, so the prefix cache evicts finished conversations' holders before a live request
+        /// needs the room. Under Strata's concurrency rounds a request was refused a holder for 42 s while three
+        /// finished conversations stayed retained, then ran on the primary cache, which has no admission check, and
+        /// the GPU ran out of memory.
+        /// </summary>
+        protected override long DeviceMemoryDeficitBytes()
+        {
+            if (!AdmitsSequencesByDeviceMemory)
+                return 0;
+            if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) || total <= 0)
+                return 0;
+            long need = AnotherSequenceBytes();
+            long deficit = SequenceDeficit(free, total, need);
+            if (deficit > 0 && GgmlBasicOps.ReleaseKeptArenas() > 0 && GgmlBasicOps.TryGetDeviceMemoryInfo(out free, out total))
+                deficit = SequenceDeficit(free, total, need);
+            if (deficit > 0)
+                Console.Error.WriteLine($"[qwen4exp] the {(_backend == BackendType.GgmlMetal ? "Metal working set" : "CUDA device")} has " +
+                    $"{free / 1e9:F2} GB free of {total / 1e9:F2} GB; " +
+                    $"another request's state needs {need / 1e9:F2} GB beside {MetalHeadroom(total) / 1e9:F2} GB kept free, so the " +
+                    $"prefix cache is asked for {deficit / 1e9:F2} GB.");
+            return deficit;
+        }
+
+        /// <summary>Bytes missing for <paramref name="needBytes"/> beside the headroom (0 when it fits).</summary>
+        internal static long SequenceDeficit(long freeBytes, long totalBytes, long needBytes)
+            => Math.Max(0, needBytes + MetalHeadroom(totalBytes) - freeBytes);
+
+        internal static long MetalHeadroom(long totalBytes) => Math.Max(1L << 30, totalBytes / 32);
+
+        /// <summary>Whether <paramref name="needBytes"/> more fit in the Metal working set beside the headroom.</summary>
+        internal static bool FitsAnotherSequence(long freeBytes, long totalBytes, long needBytes)
+            => freeBytes - needBytes >= MetalHeadroom(totalBytes);
+
+        /// <summary>A holder's state beyond its K/V and indexer keys (GDN recurrent and conv state, PLE history) plus its
+        /// share of the batched-decode arena and the drafter's per-request ring.</summary>
+        private const long MetalSequenceExtraBytes = 256L << 20;
 
         public void AdoptPrimaryCacheToFused(string requestId)
         {

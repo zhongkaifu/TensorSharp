@@ -110,7 +110,9 @@ namespace TensorSharp.Models
         public static long RowSize(int ggmlType, long ne)
         {
             var type = (GgmlTensorType)ggmlType;
-            if (!SupportsDequantization(type))
+            // A row's byte size needs only the block geometry, which the GGUF reader knows for layouts this
+            // backend cannot dequantize too (Q2_0, read by the GPU kernels).
+            if (!SupportsDequantization(type) && type != GgmlTensorType.Q2_0)
                 throw new NotSupportedException($"Pure C# backend does not support GGUF tensor type {type}.");
 
             long blockSize = GgufFile.GetBlockSize(type);

@@ -16,6 +16,9 @@ namespace TensorSharp.Runtime;
 public partial class GgufFile
 {
     private bool _prefaulted;
+
+    /// <summary>Tests: the memory the prefault budget is half of, instead of the process's.</summary>
+    internal static long? AvailableMemoryOverrideForTests;
     internal long PrefaultReadBytes { get; private set; }
     internal long PrefaultResidentBytes { get; private set; }
 
@@ -28,6 +31,21 @@ public partial class GgufFile
         => PrefaultFileCache(includeTensor, logProgress: true);
 
     public void PrefaultFileCache(Func<GgufTensorInfo, bool>? includeTensor, bool logProgress)
+        => PrefaultFileCache(includeTensor, null, logProgress);
+
+    /// <summary>
+    /// As <see cref="PrefaultFileCache(Func{GgufTensorInfo, bool}?, bool)"/>. When the selected
+    /// tensors are more than half the memory available to the process, the page cache could not
+    /// keep them all and warming them would only evict what the loader is about to read, so only
+    /// <paramref name="whenConstrained"/>'s subset is warmed: the tensors the load reads at once
+    /// (dense weights bound for the accelerator, F32 tensors), not the routed experts that are
+    /// read later and only in part. Without it nothing is warmed, and on network storage every
+    /// eagerly loaded tensor then arrives through serial page faults (Qwen3.8-Flash-Next on a
+    /// geesefs mount: ~50 MB/s for the 4 GB of dense weights, against hundreds of MB/s read in
+    /// parallel).
+    /// </summary>
+    public void PrefaultFileCache(Func<GgufTensorInfo, bool>? includeTensor,
+        Func<GgufTensorInfo, bool>? whenConstrained, bool logProgress)
     {
         // Phones only: Mac Catalyst reports itself as iOS but is a desktop process
         // with a desktop page cache, and warming it is what a desktop load wants.
@@ -39,19 +57,22 @@ public partial class GgufFile
         // Apply the budget to the entire split checkpoint, not independently to
         // each shard: warming seven individually small shards can evict the data
         // that the loader is about to use.
-        var plans = new List<(GgufFile File, List<(long Offset, long Length)> Ranges)>();
-        foreach (GgufFile file in new[] { this }.Concat(_shards))
+        long available = AvailableMemoryOverrideForTests ?? GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+        var plans = PrefaultPlans(includeTensor, out long total);
+        string scope = "";
+        if (total == 0 || (available > 0 && total > available / 2))
         {
-            var ranges = GetPrefaultRanges(file, includeTensor);
-            if (ranges.Count > 0) plans.Add((file, ranges));
+            if (whenConstrained == null) return;
+            plans = PrefaultPlans(info => (includeTensor?.Invoke(info) ?? true) && whenConstrained(info), out total);
+            if (total == 0 || (available > 0 && total > available / 2)) return;
+            scope = " (the eagerly loaded tensors only: the checkpoint is larger than the page cache can hold)";
         }
-        long total = plans.Sum(p => p.Ranges.Sum(r => r.Length));
-        long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
-        if (total == 0 || (available > 0 && total > available / 2)) return;
 
-        int threads = Math.Min(16, Environment.ProcessorCount);
-        if (int.TryParse(Environment.GetEnvironmentVariable("TS_GGUF_PREFAULT_THREADS"), out int requested) && requested > 0)
-            threads = Math.Min(requested, Math.Max(1, Environment.ProcessorCount));
+        // Every read goes through the files' handle pools, opened here once, before any tensor
+        // data is read: some FUSE mounts drop a file's whole page cache at every open().
+        try { OpenReadHandles(); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { return; }
+        int threads = DefaultWarmThreads();
         long readBytes = 0, residentBytes = 0;
         var watch = Stopwatch.StartNew();
         try
@@ -68,14 +89,8 @@ public partial class GgufFile
                 long length = plan.Ranges.Sum(r => r.Length);
                 int workers = (int)Math.Min(threads, Math.Max(1, (length + (8 << 20) - 1) / (8 << 20)));
                 long regionBytes = (length + workers - 1) / workers;
-                var handles = new SafeFileHandle[workers];
-                try
+                SafeFileHandle[] handles = plan.File.ReadHandles();
                 {
-                    // Some FUSE mounts invalidate cached pages on open. Acquire
-                    // every stream before warming so a late worker cannot evict
-                    // the pages another worker has just read.
-                    for (int worker = 0; worker < workers; worker++)
-                        handles[worker] = File.OpenHandle(plan.File._path, FileMode.Open, FileAccess.Read, FileShare.Read);
                     Parallel.For(0, workers, new ParallelOptions { MaxDegreeOfParallelism = workers }, region =>
                     {
                         long start = region * regionBytes, end = Math.Min(start + regionBytes, length);
@@ -122,10 +137,6 @@ public partial class GgufFile
                         }
                     });
                 }
-                finally
-                {
-                    foreach (var handle in handles) handle?.Dispose();
-                }
             }
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or AggregateException)
@@ -136,7 +147,22 @@ public partial class GgufFile
         PrefaultResidentBytes = residentBytes;
         if (logProgress && watch.Elapsed.TotalSeconds >= 1)
             Console.WriteLine($"  Prefaulted GGUF page cache in {watch.Elapsed.TotalSeconds:F1}s with {threads} read streams: " +
-                $"{readBytes / 1073741824.0:F2} GiB read, {residentBytes / 1073741824.0:F2} GiB already resident");
+                $"{readBytes / 1073741824.0:F2} GiB read, {residentBytes / 1073741824.0:F2} GiB already resident{scope}");
+    }
+
+    private List<(GgufFile File, List<(long Offset, long Length)> Ranges)> PrefaultPlans(
+        Func<GgufTensorInfo, bool>? includeTensor, out long total)
+    {
+        var plans = new List<(GgufFile File, List<(long Offset, long Length)> Ranges)>();
+        total = 0;
+        foreach (GgufFile file in new[] { this }.Concat(_shards))
+        {
+            var ranges = GetPrefaultRanges(file, includeTensor);
+            if (ranges.Count == 0) continue;
+            plans.Add((file, ranges));
+            total += ranges.Sum(r => r.Length);
+        }
+        return plans;
     }
 
     // Resolve ownership through the root table; sibling tensors are merged into

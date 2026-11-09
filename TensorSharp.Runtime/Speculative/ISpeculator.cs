@@ -135,6 +135,15 @@ namespace TensorSharp.Runtime.Speculative
         int PrefillContextRows => int.MaxValue;
 
         /// <summary>
+        /// True when proposals condition on the PROMPT's hidden rows - a block drafter's KV ring is filled from the
+        /// prompt's feature rows - so a prompt prefilled on the plain path leaves the drafter without its context for
+        /// the whole first answer. The scheduler then prefills through the speculative context even though the
+        /// speculator could be seeded from the trunk's tokens afterwards; only the last
+        /// <see cref="PrefillContextRows"/> rows capture hidden states. Default false.
+        /// </summary>
+        bool ConditionsOnPrompt => false;
+
+        /// <summary>
         /// True when this algorithm can arm on a sequence that ADOPTED a KV prefix it
         /// never processed itself - the cache came from another request (prefix cache)
         /// or an earlier turn, so trunk positions exist that this speculator did not

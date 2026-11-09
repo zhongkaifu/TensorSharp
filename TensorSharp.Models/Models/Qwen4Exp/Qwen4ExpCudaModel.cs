@@ -20,8 +20,8 @@ using TensorSharp.Runtime.Telemetry;
 
 namespace TensorSharp.Models
 {
-    public sealed class Qwen4ExpCudaModel : ModelBase, IBatchedPagedModel, IPrefixCacheModel, IPrefixCacheModelDiagnostics,
-        IServingTelemetrySource
+    public sealed partial class Qwen4ExpCudaModel : ModelBase, IBatchedPagedModel, IPrefixCacheModel, IPrefixCacheModelDiagnostics,
+        TensorSharp.Runtime.Speculative.ISpeculativeTarget, IServingTelemetrySource
     {
         private Qwen4ExpCudaExecutor _exec;
         private readonly object _sync = new object();
@@ -46,10 +46,6 @@ namespace TensorSharp.Models
             {
                 ParseBaseConfig();
                 ParseTokenizer();
-                if (!string.IsNullOrWhiteSpace(draftGgufPath))
-                    throw new NotSupportedException(
-                        "Qwen3.8-Flash-Next's MTP draft head is not built on --backend cuda yet; drop --draft-model " +
-                        "or run --backend ggml_cuda.");
                 // The direct-CUDA engine has no host-expert seam; the GGML token span does.
                 MoeCpuOffloadConfig.WarnUnsupportedBackend(Qwen4ExpModel.ArchitectureId, "cuda");
                 int maxContext = ResolveConfiguredContextLength();
@@ -57,8 +53,27 @@ namespace TensorSharp.Models
                 // sequence slot. Keep a practical default unless MAX_CONTEXT names one.
                 if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
                     maxContext = Math.Min(maxContext, 65536);
-                int nUbatch = ParseEnvInt("TS_Q4E_UBATCH", 512);
-                _exec = new Qwen4ExpCudaExecutor(ggufPath, maxContext, nUbatch, Math.Max(1, layerSplitDegree));
+                // 1024 prompt rows a forward: each expert's weights are decoded for twice the rows and a layer's fixed
+                // costs halve. RTX 5090, ISTA Q2_0: 4K TTFT 1.29 -> 1.07 s, 16K 5.05 -> 4.17 s, for 345 fewer expert
+                // slots (the larger scratch; long generation within noise); TS_Q4E_UBATCH=512 gives them back.
+                int nUbatch = ParseEnvInt("TS_Q4E_UBATCH", 1024);
+                // --kv-cache-dtype: the engine's kernels store F16 or Q8_0 (int8 codes, an F16 scale per 32 values).
+                // Q8_0 unless the operator chose otherwise (Strata's int8 KV): at 131K context it gives 1.5 GiB more to
+                // expert slots on a 32 GB card - 4K and 16K prompts 11-12% faster, their answers 9-30% faster.
+                if (!KvCacheDtypeConfig.IsExplicitlySet)
+                    _kvCacheDtype = KvCacheDtype.Q8_0;
+                if (_kvCacheDtype == KvCacheDtype.Q4_0)
+                {
+                    Console.Error.WriteLine("[kv-cache] the direct-CUDA qwen4exp engine stores the KV cache as f16 or q8_0; "
+                        + "using f16 for q4_0.");
+                    _kvCacheDtype = KvCacheDtype.F16;
+                }
+                bool kvQ8 = _kvCacheDtype == KvCacheDtype.Q8_0;
+                _exec = new Qwen4ExpCudaExecutor(ggufPath, maxContext, nUbatch, Math.Max(1, layerSplitDegree),
+                    string.IsNullOrWhiteSpace(draftGgufPath) ? null : draftGgufPath, kvQ8);
+                Console.WriteLine(kvQ8
+                    ? "  KV cache: q8_0 (int8 codes, one F16 scale per 32 values; --kv-cache-dtype f16 keeps F16)"
+                    : "  KV cache: f16");
                 _exec.ReclaimRetainedSlot = ReclaimOldestRetainedSlot;
                 _exec.StageObserver = RecordStage;
                 _primarySlot = _exec.ActiveSlot;
@@ -232,8 +247,13 @@ namespace TensorSharp.Models
                     slot = _exec.SlotAlloc();
                     if (slot < 0) slot = SlotRetention.TakeIdlePrimary(_slotByRequest, ref _primarySlot, _activeSlotKey, new Store(_exec));
                     if (slot < 0 && _retainedSlots is { Count: > 0 }) slot = AllocSlotReclaimingRetained();
+                    // Last, slots nothing holds any more (a free refused while one was the engine's selection).
+                    if (slot < 0 && FreeLostSlots() > 0) slot = _exec.SlotAlloc();
                     if (slot < 0)
+                    {
+                        NoteSlotRefusal(requestId);
                         throw new SequenceSlotUnavailableException("qwen4exp has no device memory for another sequence slot.");
+                    }
                     _slotByRequest[requestId] = slot;
                     fresh = true;
                 }
@@ -243,6 +263,46 @@ namespace TensorSharp.Models
                 _cacheSeqLen = _exec.NPast;
                 return fresh;
             }
+        }
+
+        private long _slotRefusalNoted;
+
+        /// <summary>Free the engine's slots that no request, the primary or a retained conversation holds; how many went.
+        /// Under <c>_sync</c>.</summary>
+        private int FreeLostSlots()
+        {
+            var keep = new HashSet<int>();
+            if (_slotByRequest != null)
+                foreach (int s in _slotByRequest.Values)
+                    keep.Add(s);
+            if (_primarySlot >= 0)
+                keep.Add(_primarySlot);
+            if (_retainedSlots != null)
+                foreach (var r in _retainedSlots.Values)
+                    keep.Add(r.Slot);
+            int freed = _exec.SlotFreeAllExcept(keep);
+            if (freed > 0)
+            {
+                System.Threading.Interlocked.Add(ref _lostSlotsFreed, freed);
+                Console.Error.WriteLine($"[qwen4exp] freed {freed} sequence slot(s) nothing held any more, for a new request");
+            }
+            return freed;
+        }
+
+        private long _lostSlotsFreed;
+
+        /// <summary>Who holds the slots when a request is refused one (at most every 30 s): the requests bound to slots, the
+        /// primary, the retained conversations and the active selection. Under <c>_sync</c>.</summary>
+        private void NoteSlotRefusal(string requestId)
+        {
+            long now = Environment.TickCount64;
+            if (now - _slotRefusalNoted < 30_000)
+                return;
+            _slotRefusalNoted = now;
+            string bound = _slotByRequest == null ? "" : string.Join(",", _slotByRequest.Select(kv => $"{kv.Key[^6..]}:{kv.Value}"));
+            string retained = _retainedSlots == null ? "" : string.Join(",", _retainedSlots.Values.Select(r => r.Slot));
+            Console.Error.WriteLine($"[qwen4exp] slot refused for {requestId[^6..]}: bound [{bound}], primary {_primarySlot}, "
+                + $"retained [{retained}], active {(_activeSlotKey == null ? "none" : _activeSlotKey[^6..])}, engine slot {_exec.ActiveSlot}");
         }
 
         public void AdoptPrimaryCacheToFused(string requestId)
@@ -437,7 +497,10 @@ namespace TensorSharp.Models
                     RestorePrimaryCache();
                 }
                 _slotByRequest.Remove(requestId);
-                _exec.SlotFree(slot);
+                // Refused only for the engine's selection; the next request short of room frees it (FreeLostSlots).
+                if (!_exec.SlotFree(slot))
+                    Console.Error.WriteLine($"[qwen4exp] slot {slot} of {requestId} could not be freed now (the engine's selection); "
+                        + "a request short of room frees it later");
             }
         }
 

@@ -826,13 +826,12 @@ namespace TensorSharp.Server
             generatedTokens = new List<int>();
             var rawBytes = new List<byte>();
             int prevValidLen = 0;
-            // Stop-sequence matching needs the full decoded text; only the rare
-            // request that configures string stop sequences pays for accumulating
-            // it. The common path decodes just the newly-completed bytes per token
-            // (below) instead of re-decoding the whole buffer every step (O(n^2)).
-            bool hasStopSequences = cfg.StopSequences != null && cfg.StopSequences.Count > 0;
-            StringBuilder decodedForStops = hasStopSequences ? new StringBuilder() : null;
-            TokenSampler stopSampler = hasStopSequences ? new TokenSampler(cfg) : null;
+            // String stop sequences: a matched one is not sent, and text that could begin
+            // one is held back until the next piece settles it (StopSequenceStream). Only
+            // the rare request that configures them pays for it. The common path decodes
+            // just the newly-completed bytes per token (below) instead of re-decoding the
+            // whole buffer every step (O(n^2)).
+            StopSequenceStream stopSequences = StopSequenceStream.For(cfg.StopSequences);
             finishReason = "max_tokens";
 
             // A family whose model writes the tool's result itself after its call ends the
@@ -917,12 +916,11 @@ namespace TensorSharp.Server
                 }
 
                 bool stopRequested = false;
-                if (hasStopSequences)
+                string send = piece;
+                if (stopSequences != null)
                 {
-                    if (piece.Length > 0)
-                        decodedForStops.Append(piece);
-                    var (_, shouldStop) = stopSampler.CheckStopSequences(decodedForStops.ToString());
-                    if (shouldStop)
+                    send = stopSequences.Append(piece);
+                    if (stopSequences.Matched)
                     {
                         stopRequested = true;
                         finishReason = "stop_sequence";
@@ -966,8 +964,13 @@ namespace TensorSharp.Server
                     }
                 }
 
-                if (piece.Length > 0)
-                    yield return ChatStreamUpdate.Text(piece);
+                // Another of this layer's stops ends the turn here: what was held back for a
+                // stop sequence can no longer become one.
+                if (stopRequested && stopSequences is { Matched: false })
+                    send += stopSequences.Flush();
+
+                if (send.Length > 0)
+                    yield return ChatStreamUpdate.Text(send);
 
                 if (stopRequested)
                 {
@@ -981,6 +984,15 @@ namespace TensorSharp.Server
                 wasCancelled = true;
                 finishReason = "cancelled";
                 stopped = new OperationCanceledException(cancellationToken);
+            }
+
+            // The engine ended the turn (end of sequence, token limit) with text held back for a
+            // stop sequence that never came: it is part of the reply.
+            if (stopSequences != null && !wasCancelled)
+            {
+                string rest = stopSequences.Flush();
+                if (rest.Length > 0)
+                    yield return ChatStreamUpdate.Text(rest);
             }
 
             try
@@ -1023,10 +1035,36 @@ namespace TensorSharp.Server
                     generatedTokens.Add(forwarded[i]);
             }
 
-            string assistantText = Encoding.UTF8.GetString(rawBytes.ToArray());
+            // What the client was sent: a matched stop sequence and anything decoded after it are not.
+            string assistantText = stopSequences is { Matched: true }
+                ? stopSequences.SentText
+                : Encoding.UTF8.GetString(rawBytes.ToArray());
             totalSw.Stop();
             if (CapturesContent(requestTelemetry))
                 CaptureOutputMessage(requestTelemetry, assistantText);
+
+            EmittedAssistantTurn emittedTurn = BuildEmittedTurn(arch, assistantText, enableThinking, tools,
+                // Parsers are primed with the prompt's tail exactly when this
+                // pipeline announced it (above); mirror that, or the recorded content
+                // would differ from what the adapters parsed.
+                announceSuffix ? recordedSuffix : null,
+                wasCancelled);
+
+            // A turn the model ended itself with reasoning and nothing else is not a
+            // finished answer: Qwen3.8-27B NVFP4 ended 3 of 53 Aider turns on a stop token
+            // in the middle of a reasoning loop, and an OpenAI client took the empty `stop`
+            // as the reply (issue #338). Where the family's reasoning has a trained close
+            // the sampler closes it instead (ThinkingTokenBudget.CloseOnStop); a turn that
+            // still ends this way is reported as the reasoning overrun it is, which the
+            // protocols send as `length` and the Web UI answers with its thinking-off retry.
+            if (!wasCancelled && !selfStopped && finishReason == "eos" && IsAnswerlessReasoning(emittedTurn))
+            {
+                _logger.LogWarning(LogEventIds.ChatCompleted,
+                    "chat.reasoning-without-answer sessionId={SessionId}: the model ended the turn after "
+                    + "{Tokens} tokens of reasoning and no answer; reporting it as thinking_budget",
+                    session?.Id ?? "(none)", generatedTokens.Count);
+                finishReason = "thinking_budget";
+            }
 
             // Record this turn for the next request of the same conversation: the raw
             // tokens the cache holds, and what the client was sent for them - the next
@@ -1040,12 +1078,7 @@ namespace TensorSharp.Server
                     RawPromptTrailingWhitespace = generationPromptTrailingWhitespace,
                     RawGenerationSuffix = recordedSuffix,
                 },
-                BuildEmittedTurn(arch, assistantText, enableThinking, tools,
-                    // Parsers are primed with the prompt's tail exactly when this
-                    // pipeline announced it (above); mirror that, or the recorded content
-                    // would differ from what the adapters parsed.
-                    announceSuffix ? recordedSuffix : null,
-                    wasCancelled),
+                emittedTurn,
                 loadEpoch);
 
             if (stopped != null)
@@ -1767,6 +1800,12 @@ namespace TensorSharp.Server
                 return new EmittedAssistantTurn(rawText, null, null, rawText, cancelled);
             }
         }
+
+        /// <summary>Reasoning with no answer and no tool call: what a client receives as an
+        /// empty reply.</summary>
+        internal static bool IsAnswerlessReasoning(EmittedAssistantTurn turn)
+            => !string.IsNullOrWhiteSpace(turn.Thinking) && string.IsNullOrWhiteSpace(turn.Content)
+                && (turn.ToolCalls == null || turn.ToolCalls.Count == 0);
 
         /// <summary>Below this many shared tokens a checkpoint is not worth its copy.</summary>
         internal const int MinSharedPrefixTokens = 64;
@@ -3159,7 +3198,10 @@ namespace TensorSharp.Server
                 return config;
             }
 
-            if (tokenBudget <= 0 && !suppressUnopenedEnd)
+            // A requested channel with no cap (TS_THINKING_BUDGET=0, a reply under 512
+            // tokens) still gets the policy, with no limit: it is what lets a loop or a stop
+            // inside the reasoning close the channel instead of ending the turn answerless.
+            if (tokenBudget <= 0 && !suppressUnopenedEnd && !enableThinking)
                 return config;
             // The caller's config can be shared by requests. Only this request
             // gets the immutable budget policy and an independent grammar position.
@@ -3174,7 +3216,8 @@ namespace TensorSharp.Server
             result.ThinkingBudget = new ThinkingTokenBudget(tokenBudget > 0 ? tokenBudget : int.MaxValue, id,
                 closeOnRepetition: true, openTokenId: openId, openAtStart: openAtStart,
                 suppressUnopenedEnd: suppressUnopenedEnd, closeAtBoundary: boundary,
-                closingTokenIds: enableThinking ? ClosingTextTokens(tokenizer, protocol.ThinkingBudgetClosingText, id) : null);
+                closingTokenIds: enableThinking ? ClosingTextTokens(tokenizer, protocol.ThinkingBudgetClosingText, id) : null,
+                closeOnStop: tokenizer.IsEos);
             installed = true;
             return result;
         }

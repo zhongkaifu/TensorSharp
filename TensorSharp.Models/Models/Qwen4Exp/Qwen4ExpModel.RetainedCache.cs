@@ -341,7 +341,8 @@ namespace TensorSharp.Models
                 Console.Error.WriteLine(
                     $"[q4e retained] refused {what}: {bytes / 1048576.0:F1} MB does not fit the retention budget " +
                     $"({DescribeRetentionBudget(spare)}, retained {RetainedBytesTotal() / 1048576.0:F1} MB" +
-                    (spare.HasValue ? $", headroom {spare.Value / 1048576.0:F0} MB" : "") + ") and the prefix cache owns eviction. Reported once.");
+                    (spare.HasValue ? $", headroom {spare.Value / 1048576.0:F0} MB: {DescribeSpareSources()}" : "") +
+                    ") and the prefix cache owns eviction. Reported once.");
             }
             return false;
         }
@@ -380,6 +381,25 @@ namespace TensorSharp.Models
             return bytes;
         }
 
+        /// <summary>The terms the headroom is the least of, for the refusal message.</summary>
+        private string DescribeSpareSources()
+        {
+            var parts = new List<string>();
+            if (GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) && total > 0)
+                parts.Add($"device {free / 1048576.0:F0} MB free of {total / 1048576.0:F0} MB" +
+                    (GpuMemoryBudget.TryGetReservationSpareBytes(_backend, out long device) ? $" ({device / 1048576.0:F0} MB past its headroom)" : ""));
+            try
+            {
+                long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+                using var process = Process.GetCurrentProcess();
+                parts.Add($"host {available / 1048576.0:F0} MB, working set {process.WorkingSet64 / 1048576.0:F0} MB");
+            }
+            catch (InvalidOperationException) { }
+            if (IsGgmlBackend && UnifiedMemorySpareBytes() is long mac)
+                parts.Add($"macOS spare {mac / 1048576.0:F0} MB");
+            return string.Join("; ", parts);
+        }
+
         /// <summary>Headroom for retained holders: both the host allocation and a GPU
         /// mirror have to fit (see <c>Qwen35Model.GetCacheMemorySpareBytes</c>, which
         /// this mirrors). Unknown budgets leave the configured byte budget alone.</summary>
@@ -401,6 +421,16 @@ namespace TensorSharp.Models
             catch (InvalidOperationException) { }
             catch (System.ComponentModel.Win32Exception) { }
             catch (NotSupportedException) { }
+            // On a Mac the working set and the RAM above are ceilings; retained KV is wired like
+            // everything else the GPU reads, and Metal running out of memory is not recoverable.
+            // So also only what macOS can give without compressing, less what it keeps (the rule
+            // the expert tiers are planned by): retaining a 16K-token conversation beside the next
+            // one's prefill ran Metal out of memory on the 48 GB Mac.
+            if (IsGgmlBackend && UnifiedMemorySpareBytes() is long mac)
+            {
+                long macSpare = Math.Max(0, mac);
+                spare = spare.HasValue ? Math.Min(spare.Value, macSpare) : macSpare;
+            }
             return spare;
         }
 

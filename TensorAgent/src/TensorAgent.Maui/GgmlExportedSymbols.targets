@@ -21,7 +21,10 @@
     with SIGABRT inside load_aot_module, before any managed code runs. Measured on
     device.
 
-    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 340 symbols.
+    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 412 symbols.
+    Test-only exports (inside #if defined(TSG_GGML_TEST_HOOKS) or TSG_GGML_TEST_DIAGNOSTICS
+    blocks) are left out: only the native test build compiles them, and a name listed here
+    becomes a -u link root, so one the device archive lacks fails the Release link.
   -->
   <ItemGroup Condition="'$(RuntimeIdentifier)' == 'ios-arm64'">
     <ReferenceNativeSymbol Include="TSGgml_ActivationGradF32" SymbolType="Function" />
@@ -198,8 +201,16 @@
     <ReferenceNativeSymbol Include="TSGgml_GptOssSyncKvCacheToHost" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasBackendFailure" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasResidentDeviceCopy" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostAvailableMemoryBytes" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ReleaseKeptArenas" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertIoRegister" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertIoSetBudget" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertIoStats" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertIoUnregister" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostExpertRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostMoeExpertCacheStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadBarrier" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostReadRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexReductionF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexSelectF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexSelectGradF32" SymbolType="Function" />
@@ -207,8 +218,6 @@
     <ReferenceNativeSymbol Include="TSGgml_IsActiveDeviceIntegrated" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IsBackendAvailable" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IsMetalAvailable" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_MatmulTestAbortAfterWeightBind" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_MatmulTestAbortedPendingDeviceCopy" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3AudioVaeDecode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3AudioVaeEncode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3DitForward" SymbolType="Function" />
@@ -243,7 +252,6 @@
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3SlotFree" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3SlotNPast" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3TakeReclaimedSlots" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3TestDsparkContext" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3Ubatch" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3VisionHeadF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3VocabSize" SymbolType="Function" />
@@ -252,6 +260,17 @@
     <ReferenceNativeSymbol Include="TSGgml_MoEExpertsSwiGLUResidualF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoEFFNPrefillRouteScaledF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoEFFNPrefillSwiGLUQuantF32" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeHotTierRegister" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeHotTierRelease" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeHotTierStats" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeHotTierTotalBytes" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeTierPrefetchStats" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeOffloadCounters" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeRoutingCounts" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeRoutingRecordDevice" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeRoutingReset" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeStagePrefetchHits" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeStageBorrows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MulMatIdF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MultiDeviceInit" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MuseGlimmerModelForward" SymbolType="Function" />
@@ -303,9 +322,7 @@
     <ReferenceNativeSymbol Include="TSGgml_PagedAttentionForwardDevice" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PagedAttentionForwardDeviceWithSinks" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PagedAttentionForwardWithSinks" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_PagedAttentionSessionCount" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PrefaultHostSpans" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_PrefillAttentionSessionCount" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_PreloadQuantizedWeight" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen21VisionEncoderF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDecodeBatched" SymbolType="Function" />
@@ -351,6 +368,10 @@
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaFlushHostPointerStatus" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaResetBatchedDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpAttnBlock" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCaptureVerifyRows" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpSetFeatureTaps" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCommitVerifyRow" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpRowBufferBytes" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCopyQsaCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpFfnBlock" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpGdnBlock" SymbolType="Function" />
@@ -418,8 +439,6 @@
     <ReferenceNativeSymbol Include="TSGgml_TensorParallelInitLoopback" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_TensorParallelMatmul" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_TensorParallelSetGlobalGeometry" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_TestReuseAllocate" SymbolType="Function" />
-    <ReferenceNativeSymbol Include="TSGgml_TestUndrainedCacheReleases" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_TranscodeBonsaiToQ2_0" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_UnaryF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_UnregisterPinnedHostBuffer" SymbolType="Function" />

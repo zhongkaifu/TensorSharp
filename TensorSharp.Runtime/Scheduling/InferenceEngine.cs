@@ -35,6 +35,8 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly IModelArchitecture _model;
         private readonly ILogger _logger;
         private readonly bool _stopRepetition;
+        // One emitted token's bytes for ReasoningLoopDetector (engine thread only).
+        private readonly List<byte> _loopBytes = new();
         private readonly int _nativeSlotContextLimit;
         // The model's context window (MAX_CONTEXT), or 0 when it advertises none. A request
         // must leave its prompt one token of room and stops generating where it ends.
@@ -318,6 +320,22 @@ namespace TensorSharp.Runtime.Scheduling
         public bool ReleaseRetiredAdapters()
             => _commands.Writer.TryWrite(new EngineCommand { Kind = EngineCommandKind.ReleaseAdapters });
 
+        /// <summary>
+        /// Completes once the engine thread has finished the step it is in, including that step's
+        /// post-step bookkeeping. A request's completion is signalled while its step is still
+        /// finishing: the state it leaves for the next turn is kept (and a memory deficit relieved)
+        /// right after, on the engine thread. A request submitted next is queued behind that
+        /// bookkeeping, so serving never sees the gap, but a caller that reads the prefix cache or
+        /// the model from another thread does. Queued like a trim; completes at once after shutdown.
+        /// </summary>
+        internal Task WhenStepSettledAsync()
+        {
+            var settled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!_commands.Writer.TryWrite(new EngineCommand { Kind = EngineCommandKind.Barrier, Settled = settled }))
+                settled.TrySetResult();
+            return settled.Task;
+        }
+
         /// <summary>How many submitted, unfinished requests run with an adapter that
         /// <paramref name="match"/> accepts. Safe from any thread.</summary>
         public int CountInFlightRequests(Func<IRequestAdapter, bool> match)
@@ -369,6 +387,9 @@ namespace TensorSharp.Runtime.Scheduling
                 if (_handles.TryRemove(entry.Key, out var handle))
                     handle.CompleteWithError(abandoned);
             }
+            // A barrier queued behind the last step has nothing left to wait for.
+            while (_commands.Reader.TryRead(out var pending))
+                pending.Settled?.TrySetResult();
             if (!_worker.IsAlive)
             {
                 lock (_model.GpuComputeLock)
@@ -893,6 +914,10 @@ namespace TensorSharp.Runtime.Scheduling
                     SweepRetiredAdapters();
                     break;
 
+                case EngineCommandKind.Barrier:
+                    cmd.Settled?.TrySetResult();
+                    break;
+
                 case EngineCommandKind.Speculation:
                     _executor.SetSpeculation(cmd.Speculation);
                     _logger.LogInformation(
@@ -1017,6 +1042,28 @@ namespace TensorSharp.Runtime.Scheduling
                     // because the executor appended the whole batch up front.
                     int baseCount = seq.OutputTokens.Count - totalNew;
 
+                    // A stop the sampler turned into a reasoning close (TokenSampler.CloseInsteadOfStop).
+                    var stepSampler = seq.GetOrCreateSampler();
+                    if (stepSampler.StopsClosedInThinking > seq.LoggedStopClosures)
+                    {
+                        seq.LoggedStopClosures = stepSampler.StopsClosedInThinking;
+                        _logger.LogWarning(
+                            "Request {EngineRequestId} drew a stop token inside its reasoning after {Emitted} tokens; " +
+                            "closing the reasoning so the model answers",
+                            seq.RequestId, baseCount);
+                    }
+
+                    // Only reasoning is fed to the templated-loop detector: the channel's state after
+                    // this step's tokens (a channel that closed or opened inside one step is rare,
+                    // and the detector only ever asks to close an open one).
+                    var reasoningLoops = _stopRepetition && (seq.SamplingConfig?.StopRepetition ?? true)
+                        && _model.Tokenizer != null ? seq.ReasoningLoops : null;
+                    if (reasoningLoops != null && !stepSampler.InOpenReasoning(seq.OutputTokens))
+                    {
+                        reasoningLoops.Reset();
+                        reasoningLoops = null;
+                    }
+
                     bool finished = false;
                     for (int t = 0; t < totalNew && !finished; t++)
                     {
@@ -1116,6 +1163,27 @@ namespace TensorSharp.Runtime.Scheduling
                             Interlocked.Increment(ref _totalCompleted);
                             finished = true;
                             break;
+                        }
+
+                        // Reasoning that settled into a templated loop (a line repeated with a
+                        // number or a word changed: ReasoningLoopDetector) is closed so the model
+                        // answers. Never a stop. Asked at the newest token only, as above.
+                        if (reasoningLoops is { } loops)
+                        {
+                            _loopBytes.Clear();
+                            _model.Tokenizer!.AppendTokenBytes(token, _loopBytes);
+                            loops.Observe(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_loopBytes));
+                            if (loops.Looping && emittedCount == seq.OutputTokens.Count)
+                            {
+                                if (stepSampler.TryRequestThinkingClosure(seq.OutputTokens))
+                                    _logger.LogWarning(
+                                        "Request {EngineRequestId} closing reasoning that repeated a templated line {Lines} times " +
+                                        "after {Emitted} tokens: {Line}",
+                                        seq.RequestId, loops.RunLines, emittedCount,
+                                        // The repeated line, decoded: content, kept out of exported logs.
+                                        LogContent.Of(loops.LastLine ?? string.Empty));
+                                loops.Reset();
+                            }
                         }
                     }
                 }
@@ -1285,6 +1353,7 @@ namespace TensorSharp.Runtime.Scheduling
             public SequenceState Sequence;
             public string RequestId;
             public SpeculationOptions Speculation;
+            public TaskCompletionSource? Settled;
         }
 
         private enum EngineCommandKind
@@ -1294,6 +1363,7 @@ namespace TensorSharp.Runtime.Scheduling
             Trim,
             Speculation,
             ReleaseAdapters,
+            Barrier,
         }
     }
 }

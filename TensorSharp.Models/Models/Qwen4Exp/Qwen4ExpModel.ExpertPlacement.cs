@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.IO;
 using TensorSharp.GGML;
 using TensorSharp.Runtime;
 
@@ -60,6 +61,40 @@ namespace TensorSharp.Models
         /// of the weights, inside the Metal working set.</summary>
         internal const long DeviceScratchBytes = 3L << 30;
 
+        /// <summary>What a DFlash drafter named for this load takes once attached (its weights and the KV ring of the
+        /// first request), counted by the Metal plan like the MTP head: the drafter is attached last, after the experts
+        /// took the working set. Unplanned, the 0.45 GB of Flash Next's DFlash2 Q4_K_M was what a 4096-token prompt
+        /// chunk lacked whenever a quiet machine at load sized the tier past ~25.5 GB of a 48 GB M5 Pro: its 2.84 GB
+        /// arena found 3.87-4.0 GB free of the 4.1 GB it needs beside the kept headroom, every 4K chunk ran in halves,
+        /// and 16K-token prompts took a second longer.</summary>
+        private long _pendingDraftBytes;
+
+        internal static long PendingDFlashDraftBytes(string path)
+        {
+            try
+            {
+                return new FileInfo(path).Length + DFlashRingAllowanceBytes;
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is ArgumentException)
+            {
+                return 0;   // the attach reports the file itself
+            }
+        }
+
+        /// <summary>One request's DFlash KV ring (Flash Next DFlash2: 2080 rows x 5 layers, 81 MB F32), rounded up.</summary>
+        internal const long DFlashRingAllowanceBytes = 128L << 20;
+
+        /// <summary>
+        /// With host-served experts (offloaded or tiered layers), the 2048-token kernel warm-up
+        /// routes to nearly every expert of every layer and streams them all: about 46 GB of
+        /// Flash Next's experts read before the first request, minutes on network storage (a
+        /// geesefs mount: over 75 s and still reading). 64 rows stay on the tier path
+        /// (<c>kHostMoeHotTierMaxRows</c>), whose graphs short prompts use; a long prompt then
+        /// streams only the experts it routes.
+        /// </summary>
+        protected override int GgmlPrefillChunkWarmupLength
+            => _expertOnHost != null && Array.IndexOf(_expertOnHost, true) >= 0 ? 64 : 0;
+
         private bool IsExpertLayerOnHost(int layer)
             => _expertOnHost != null && layer >= 0 && layer < _expertOnHost.Length && _expertOnHost[layer];
 
@@ -89,7 +124,17 @@ namespace TensorSharp.Models
                 }
                 for (int l = 0; l < n; l++)
                     _expertOnHost[l] = MoeCpuOffloadConfig.IsLayerOnCpu(l);
+                // Explicit offload still records routing, so a --cpu-moe run is also
+                // how a complete profile is collected for the tiered plan.
+                AttachRoutingProfile();
                 ReportExpertPlacement("--n-cpu-moe / --cpu-moe", null);
+                if (_backend == BackendType.GgmlMetal)
+                {
+                    long resident = 0;
+                    for (int l = 0; l < n; l++)
+                        if (!_expertOnHost[l]) resident += LayerExpertBytes(l);
+                    ConfigureHostExpertIo(HostExpertIoBudget(resident));
+                }
                 return;
             }
 
@@ -120,12 +165,31 @@ namespace TensorSharp.Models
                 // again. The optional MTP head is preloaded AFTER this plan.
                 long pending = checked(CacheBytes() + (_mtpReady ? 0 : _mtpResidentBytes));
                 foreach (var weight in _weights.Values) pending = checked(pending + weight.Storage.ByteLength);
+                // Concurrent requests' holders come out of the same VRAM later: without a reserve the tier
+                // (19.1 GB on the RTX 5090) left ~4.6 GB, and four requests' state plus the batched arena did not fit.
+                int lanes = GgmlCudaLanes(Environment.GetEnvironmentVariable("TS_Q4E_LANES"));
+                long laneReserve = ConcurrentSequenceReserveBytes(lanes,
+                    HolderCacheBytes(Math.Min(_maxContextLength, CudaSequenceGrowthTokens)), MetalSequenceExtraBytes);
+                pending = checked(pending + laneReserve);
+                if (laneReserve > 0)
+                    Console.WriteLine($"[qwen4exp] {lanes} concurrent sequences on ggml_cuda: {Gb(laneReserve)} of VRAM kept beside the " +
+                        $"experts for the {lanes - 1} beside the first ({CudaSequenceGrowthTokens} K/V rows and their state each; TS_Q4E_LANES).");
                 long cacheBudget = ResolveCudaExpertCacheBudget(
                     Environment.GetEnvironmentVariable("TS_HOST_MOE_EXPERT_CACHE_MB"));
                 ulong cacheLayers = ResolveCudaExpertCacheLayers(
                     Environment.GetEnvironmentVariable("TS_HOST_MOE_EXPERT_CACHE_LAYERS"));
                 int resident = PlanCudaDeviceExpertLayers(layerBytes, pending, free,
                     GpuMemoryBudget.ResolveHeadroomBytes(total), cacheBudget, cacheMinimum, cacheLayers, cacheAllocationFloor);
+                if (resident < n && cacheBudget == 0)
+                {
+                    // NInfer's RTX 5090 Flash Next layout: the VRAM the whole-layer plan
+                    // would spend holds every layer's most-routed experts instead, and
+                    // the host computes the rest. Needs a routing profile.
+                    long vram = 0;
+                    for (int l = n - resident; l < n; l++) vram += layerBytes[l];
+                    if (TryPlanExpertTiers(vram))
+                        return;
+                }
                 for (int l = 0; l < n - resident; l++) _expertOnHost[l] = true;
                 ReportExpertPlacement("planned", $"CUDA free {Gb(free)}, reserved scratch {Gb(DeviceScratchBytes)}" +
                     (cacheBudget > 0 ? $", expert cache ceiling {Gb(cacheBudget)}" : "") +
@@ -144,10 +208,51 @@ namespace TensorSharp.Models
             long[] experts = new long[n];
             for (int l = 0; l < n; l++)
                 experts[l] = LayerExpertBytes(l);
-            long other = AcceleratorBoundNonExpertBytes() + CacheBytes();
+            // The MTP head and a DFlash drafter are loaded after this plan, into the same working set.
+            long other = AcceleratorBoundNonExpertBytes() + CacheBytes() + (_mtpReady ? 0 : _mtpResidentBytes) + _pendingDraftBytes;
+
+            long deviceExpertBytes = workingSet - Math.Max(GpuMemoryBudget.MinHeadroomBytes, workingSet / 16)
+                - other - DeviceScratchBytes;
+            // The working set is Metal's ceiling, not what this Mac can give: the expert tier is
+            // wired while the GPU runs, and macOS keeps a floor of file cache besides other
+            // programs' memory. ISTA Q2_0 on a 48 GB Mac planned 29.7 GB of tier against a 40.2 GB
+            // working set and Metal ran out of memory on the first long prompt (an unrecoverable
+            // command-buffer failure). So, as Strata sizes its arena, the experts also stay within
+            // what macOS can give without compressing anything, less max(7 GB, 15% of the RAM)
+            // kept for macOS, the scratch, and the MTP head still to come.
+            // That snapshot depends on the moment (just after another model exits most of the RAM
+            // is free), so the whole wired set - experts, the other accelerator buffers and the
+            // scratch - also stays within 65% of the RAM: on the 48 GB Mac with an editor and a
+            // browser open, ~32 GB wired ran clean and 38.6 GB (the MTP head beside a 26.9 GB tier)
+            // ran Metal out of memory. Strata leaves 30-40% of a Mac's RAM likewise.
+            long available = GgmlBasicOps.HostAvailableMemoryBytes();
+            long keep = Math.Max(7_000_000_000L, ram / 100 * 15);
+            long fits = Math.Min(ram / 100 * 65 - other - DeviceScratchBytes,
+                available > 0 ? available - keep - DeviceScratchBytes - (_mtpReady ? 0 : _mtpResidentBytes) - _pendingDraftBytes
+                    : long.MaxValue);
+            if (fits < deviceExpertBytes)
+                Console.WriteLine($"[moe-offload] qwen4exp: experts on the accelerator stay within {Gb(Math.Max(0, fits))}: " +
+                    $"65% of the RAM wired at most, and macOS can give {(available > 0 ? Gb(available) : "?")} without " +
+                    $"compressing and keeps {Gb(keep)} (Metal working set {Gb(workingSet)}).");
+            deviceExpertBytes = Math.Min(deviceExpertBytes, Math.Max(0, fits));
 
             int onDevice = PlanDeviceExpertLayers(experts, other, workingSet, ram);
+            long layerPlanBytes = 0;
+            for (int l = n - onDevice; l < n; l++) layerPlanBytes += experts[l];
+            // The whole layers kept resident stay under the same cap as a tier.
+            while (onDevice > 0 && layerPlanBytes > deviceExpertBytes)
+                layerPlanBytes -= experts[n - onDevice--];
             if (onDevice >= n)
+                return;
+            // A tier puts a host seam in every MoE layer; whole layers need one only where they are
+            // offloaded. On Metal a seam is a command buffer submitted and waited for (~0.17 ms) and the
+            // host computes the misses, so when the whole-layer plan keeps nearly every layer resident it
+            // wins: ISTA Q2_0 on the 48 GB Mac, 42 of 48 layers resident, decoded 25.0 / 19.8 / 24.8 tok/s
+            // against 22.6 / 15.9 / 23.2 tiered (code / prose / list). With most layers offloaded (UD-Q2_K_XL
+            // there) the tier wins. TS_MOE_HOT_TIER=1 keeps the tier anyway, =0 the whole layers.
+            bool preferLayers = Environment.GetEnvironmentVariable("TS_MOE_HOT_TIER") is not "1"
+                && (long)onDevice * 100 >= (long)n * 85;
+            if (!preferLayers && TryPlanExpertTiers(layerPlanBytes, deviceExpertBytes))
                 return;
             // Offload the FIRST layers, keep the last ones resident (llama.cpp's
             // --n-cpu-moe order): a token then ends on the accelerator without a
@@ -156,6 +261,22 @@ namespace TensorSharp.Models
                 _expertOnHost[l] = true;
             ReportExpertPlacement("planned", $"Metal working set {Gb(workingSet)}, RAM {Gb(ram)}; " +
                 "--n-cpu-moe N overrides");
+            ConfigureHostExpertIo(HostExpertIoBudget(layerPlanBytes));
+        }
+
+        /// <summary>Concurrent sequences ggml_cuda plans VRAM for (<c>TS_Q4E_LANES</c>, as on the direct CUDA engine):
+        /// 1 to 16, 1 when unset or unreadable. Requests beyond what fits wait for a running one either way.</summary>
+        internal static int GgmlCudaLanes(string value)
+            => int.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int lanes)
+                ? Math.Clamp(lanes, 1, 16) : 1;
+
+        /// <summary>VRAM the expert plan keeps for the sequences beside the first: each a holder of
+        /// <paramref name="holderBytes"/> plus <paramref name="extraBytes"/> of recurrent state and arena share.</summary>
+        internal static long ConcurrentSequenceReserveBytes(int lanes, long holderBytes, long extraBytes)
+        {
+            if (lanes < 1 || holderBytes < 0 || extraBytes < 0)
+                throw new ArgumentOutOfRangeException(nameof(lanes));
+            return checked((lanes - 1) * (holderBytes + extraBytes));
         }
 
         internal static long ResolveCudaExpertCacheBudget(string value)
@@ -345,6 +466,10 @@ namespace TensorSharp.Models
                     || string.Equals(kv.Key, "per_layer_token_embd.weight", StringComparison.Ordinal))
                     continue;
                 bytes += kv.Value.RawBytes;
+                // TS_Q4E_HC_Q8=1: the Q8_0 copy of a BF16 hyper-connection matrix is resident besides the file's
+                // pages (without this a 16K-token prompt ran the 48 GB Mac's Metal out of memory).
+                if (HcQ8 && kv.Value.GgmlType == WeightRequant.GgmlTypeBf16 && IsHcMatrix(kv.Key) && kv.Value.Ne0 % 32 == 0)
+                    bytes += WeightRequant.Q8_0Bytes(kv.Value.Ne1, kv.Value.Ne0);
             }
             foreach (var kv in _weights)
                 bytes += kv.Value.Storage.ByteLength;

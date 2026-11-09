@@ -112,6 +112,8 @@ namespace TensorSharp.Runtime.Speculative
 
         public bool HandlesOwnPrefill => _head.DraftSelfCatchUp;
 
+        public bool ConditionsOnPrompt => _head.DraftHeadConditionsOnPrompt;
+
         /// <summary>
         /// A head that keeps per-position state of its own (a NextN/MTP block with
         /// its own KV cache) cannot start drafting after trunk positions it never
@@ -125,6 +127,8 @@ namespace TensorSharp.Runtime.Speculative
         public int Propose(in DraftContext ctx, List<int> draftOut)
         {
             float[] hIn = ctx.CarryHidden ?? throw new ArgumentException("A learned draft head requires carry hidden state.", nameof(ctx));
+            if (_head.SupportsDraftChain && ctx.AdjustLogits == null && ctx.MaxTokens >= 1)
+                return ProposeChain(ctx, hIn, draftOut);
             float[] hOut = _hA;
             int tokIn = ctx.LastToken;
             int first = 0;
@@ -190,6 +194,58 @@ namespace TensorSharp.Runtime.Speculative
                 float[] next = ReferenceEquals(hOut, _hA) ? _hB : _hA;
                 hIn = hOut;
                 hOut = next;
+            }
+            return draftOut.Count;
+        }
+
+        // The chain's outputs, one entry per step.
+        private int[] _chainIds = Array.Empty<int>();
+        private float[] _chainProbs = Array.Empty<float>();
+
+        /// <summary>
+        /// The whole draft window in one head call (<see cref="IDraftHead.DraftChain"/>): the stashed catch-up folded in as
+        /// <see cref="Propose"/> folds it, the drafts kept up to the first one below <see cref="MinDraftProb"/>.
+        /// </summary>
+        private int ProposeChain(in DraftContext ctx, float[] hIn, List<int> draftOut)
+        {
+            int[] tokens;
+            float[] hRows;
+            int start;
+            if (_hasPend && _pendStart + _pendCount != ctx.Position)
+                FlushPending();
+            if (_hasPend)
+            {
+                int n = _pendCount + 1;
+                if (_foldTokens == null || _foldTokens.Length != n)
+                    _foldTokens = new int[n];
+                if (_foldH == null || _foldH.Length < (long)n * _featureSize)
+                    _foldH = new float[(long)n * _featureSize];
+                Array.Copy(_pendTokens, _foldTokens, _pendCount);
+                _foldTokens[_pendCount] = ctx.LastToken;
+                Array.Copy(_pendH, _foldH, (long)_pendCount * _featureSize);
+                Array.Copy(hIn, 0, _foldH, (long)_pendCount * _featureSize, _featureSize);
+                _hasPend = false;
+                tokens = _foldTokens;
+                hRows = _foldH;
+                start = _pendStart;
+            }
+            else
+            {
+                tokens = new[] { ctx.LastToken };
+                hRows = hIn;
+                start = ctx.Position;
+            }
+            if (_chainIds.Length < ctx.MaxTokens)
+            {
+                _chainIds = new int[ctx.MaxTokens];
+                _chainProbs = new float[ctx.MaxTokens];
+            }
+            int steps = _head.DraftChain(tokens, hRows, start, ctx.MaxTokens, _chainIds, _chainProbs);
+            for (int i = 0; i < steps; i++)
+            {
+                if (_chainProbs[i] < MinDraftProb)
+                    break;
+                draftOut.Add(_chainIds[i]);
             }
             return draftOut.Count;
         }

@@ -198,6 +198,8 @@ namespace TensorSharp.Runtime.Speculative
                 speculator.MinDraftProb = options.MinDraftProb.Value;
             else if (speculator is BlockDraftSpeculator && !float.IsNaN(target.SpecPreferredBlockGate))
                 speculator.MinDraftProb = target.SpecPreferredBlockGate;
+            else if (speculator is DraftHeadSpeculator && !float.IsNaN(target.SpecPreferredDraftGate))
+                speculator.MinDraftProb = target.SpecPreferredDraftGate;
             return speculator;
         }
 

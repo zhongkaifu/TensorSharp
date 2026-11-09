@@ -87,6 +87,11 @@
 #include <unistd.h>
 #endif
 
+// The explicitly read host expert cache (ggml_ops_moe_expert_io.cpp), which the V4.1 CPU lane uses.
+TSG_EXPORT int TSGgml_HostExpertIoRegister(const void* base, long long length, const char* path);
+TSG_EXPORT void TSGgml_HostExpertIoSetBudget(long long bytes);
+TSG_EXPORT void TSGgml_HostExpertIoStats(long long* stats4);
+
 namespace tsg_dsv4
 {
 
@@ -496,6 +501,19 @@ struct bd_slot_state
     bool compact_raw = false;        // ... and whether its raw prefix is compacted
 };
 
+// One CPU-lane node of a host-offloaded layer (build_moe_host). `next_router` is set
+// when the following layer is a lane layer too: Strata's lookahead applies that layer's
+// router to this layer's FFN input and reads the experts it picks into the RAM cache
+// while the accelerator runs the next layer's attention.
+struct dsv41_lane
+{
+    tsg::HostMoeSegment hs;
+    const tsg::HostMoeSegment * next = nullptr;
+    const void * next_router = nullptr;    // [n_embd, n_expert] of next_router_type (F32, BF16), from the GGUF mapping
+    int next_router_type = GGML_TYPE_F32;
+    const float * next_bias = nullptr;     // F32 [n_expert]
+};
+
 struct graph_build_result
 {
     ggml_context * ctx = nullptr;
@@ -528,6 +546,8 @@ struct graph_build_result
     uint64_t sig = 0;
     // descriptors referenced (by pointer) from the fused GGML_OP_CUSTOM nodes
     std::deque<tsg_dsv4_fused_desc> descs;
+    // Per-layer contexts of the CPU lane's nodes (build_moe_host), referenced by pointer.
+    std::deque<dsv41_lane> lanes;
     // per-device completion events of this entry's last pipelined use; input
     // refills wait on these instead of a full pipeline drain
     ggml_backend_event_t use_events[MAX_GPUS] = {};
@@ -614,6 +634,17 @@ struct dsv4_model
     // experts. Use this, not backends[], to place graph tensors.
     ggml_backend_t dev_backends[MAX_GPUS + 1] = {};
     bool fused = false;
+    // Every compute device is ggml-metal (unified memory; see build_moe_host).
+    bool metal_gpu = false;
+    // Decode-width host-offloaded layers run TensorSharp's host decode kernel (the CPU lane,
+    // build_moe_host); host_expert_io: their experts come from the explicitly read RAM cache.
+    bool host_lane = false;
+    bool host_expert_io = false;
+    // Per layer, for the lookahead into it (TS_DSV41_LOOKAHEAD=0 off): its router and
+    // selection bias, read from the GGUF mapping; null where the layer has none to offer.
+    std::vector<const void *> lane_router;
+    std::vector<int> lane_router_type;
+    std::vector<const float *> lane_bias;
 
     // Persistent worker pool for the CPU backend — see dsv4_load. Shared by
     // every host split of every graph, so --n-cpu-moe pays for its threads once
@@ -745,6 +776,26 @@ struct dsv4_model
             if (c_ctx[i]) ggml_free(c_ctx[i]);
             if (w_buf[i]) ggml_backend_buffer_free(w_buf[i]);
             if (w_ctx[i]) ggml_free(w_ctx[i]);
+        }
+        if (host_expert_io)
+        {
+            // The explicitly read RAM cache serves these mappings: report it, then drop the
+            // registrations (and the slots they hold) before the mappings go.
+            if (const char * e = getenv("TS_MOE_TIER_STATS"); e && e[0] == '1')
+            {
+                long long st[4] = {};
+                TSGgml_HostExpertIoStats(st);
+                fprintf(stderr, "[dsv41] CPU lane RAM cache: %lld hits, %lld misses (%.1f%% hit), %.1f GiB read, %.1f GiB held\n",
+                        st[0], st[1], st[0] + st[1] > 0 ? 100.0 * st[0] / (double) (st[0] + st[1]) : 0.0,
+                        st[2] / 1073741824.0, st[3] / 1073741824.0);
+                uint64_t ahead = 0, used = 0;
+                tsg::host_expert_io_prefetch_stats(ahead, used);
+                if (ahead > 0)
+                    fprintf(stderr, "[dsv41] CPU lane lookahead: %llu slices read ahead, %llu used (%.1f%%)\n",
+                            (unsigned long long) ahead, (unsigned long long) used, 100.0 * used / (double) ahead);
+            }
+            for (void * a : mmap_addrs)
+                if (a) tsg::host_expert_io_on_drop(a);
         }
         if (!mmap_addrs.empty())
         {
@@ -1383,6 +1434,152 @@ static bool dsv4_mapped_file_range(const dsv4_model & m, const ggml_tensor * t, 
 
 // Load stage: fault the mmapped host-resident weights (the cpu_moe experts) in
 // before the model serves. Returns false only on a load error.
+
+
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+static uint64_t dsv41_physical_memory_bytes()
+{
+    uint64_t bytes = 0;
+    size_t size = sizeof(bytes);
+    return sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) == 0 ? bytes : 0;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The CPU lane of a host-offloaded layer (build_moe_host, decode widths): one
+// CPU node runs TensorSharp's host decode kernel over the routed experts.
+// ---------------------------------------------------------------------------
+static bool dsv41_host_lane_supports(const dsv4_layer & L)
+{
+    const ggml_tensor * t[3] = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps };
+    for (const ggml_tensor * w : t)
+    {
+        if (w == nullptr || w->data == nullptr || !ggml_is_contiguous(w)) return false;
+        const auto * traits = ggml_get_type_traits_cpu(w->type);
+        if (traits == nullptr || traits->vec_dot == nullptr) return false;
+    }
+    return true;
+}
+
+// Strata's lookahead: the next layer's router (sqrt(softplus) scores plus the
+// selection bias, as build_moe ranks them) applied to THIS layer's FFN input rows,
+// and the union of each row's top n_used, to read ahead into the RAM cache. Only a
+// prediction: the next layer still routes on its own input, and a slice it does
+// not need just ages out of the cache.
+static void dsv41_lane_predict(const dsv41_lane & lane, const float * xs, int nt, std::vector<int32_t> & picked)
+{
+    picked.clear();
+    const tsg::HostMoeSegment & nx = *lane.next;
+    const int n_embd = nx.hidden, n_expert = nx.num_experts, n_used = nx.n_used;
+    if (n_used <= 0 || n_used > n_expert) return;
+    // The router's own dot product (F32, or BF16 as ISTA-DASLab's GGUFs store it): the input rows are
+    // converted once to its vec_dot type.
+    const ggml_type rt = (ggml_type) lane.next_router_type;
+    const auto * tt = ggml_get_type_traits_cpu(rt);
+    if (tt == nullptr || tt->vec_dot == nullptr) return;
+    const ggml_type vt = tt->vec_dot_type;
+    const size_t xq_row = ggml_row_size(vt, n_embd), w_row = ggml_row_size(rt, n_embd);
+    static thread_local std::vector<uint8_t> xq;
+    xq.resize(xq_row * (size_t) nt);
+    for (int r = 0; r < nt; ++r)
+    {
+        if (vt == GGML_TYPE_F32)
+            memcpy(xq.data() + (size_t) r * xq_row, xs + (size_t) r * n_embd, (size_t) n_embd * sizeof(float));
+        else if (const auto * vtt = ggml_get_type_traits_cpu(vt); vtt != nullptr && vtt->from_float != nullptr)
+            vtt->from_float(xs + (size_t) r * n_embd, xq.data() + (size_t) r * xq_row, n_embd);
+        else
+            return;
+    }
+    static thread_local std::vector<float> score;
+    static thread_local std::vector<int32_t> order;
+    score.resize((size_t) nt * n_expert);
+    for (int e = 0; e < n_expert; ++e)
+    {
+        const uint8_t * w = (const uint8_t *) lane.next_router + (size_t) e * w_row;
+        for (int r = 0; r < nt; ++r)
+        {
+            float logit = 0.0f;
+            tt->vec_dot(n_embd, &logit, 0, w, 0, xq.data() + (size_t) r * xq_row, 0, 1);
+            const float softplus = logit > 20.0f ? logit : std::log1p(std::exp(logit));
+            score[(size_t) r * n_expert + e] = std::sqrt(softplus) + lane.next_bias[e];
+        }
+    }
+    order.resize(n_expert);
+    for (int r = 0; r < nt; ++r)
+    {
+        const float * sr = score.data() + (size_t) r * n_expert;
+        for (int e = 0; e < n_expert; ++e) order[e] = e;
+        std::partial_sort(order.begin(), order.begin() + n_used, order.end(),
+                          [sr](int32_t a, int32_t b) { return sr[a] > sr[b]; });
+        for (int k = 0; k < n_used; ++k)
+            if (std::find(picked.begin(), picked.end(), order[k]) == picked.end()) picked.push_back(order[k]);
+    }
+}
+
+// src0 x F32 [n_embd, 1, nt], src1 selected I32 [n_used, nt] (possibly a strided
+// top-k view), src2 weights F32 [1, n_used, nt]; dst F32 [n_embd, nt].
+//
+// The decode kernel takes up to 8 rows a call, so a prefill step runs in blocks of 8,
+// each block's experts read ahead (exactly: the ids are known) while the block before
+// computes. The last block - or a decode step's only one - reads ahead the experts the
+// next layer's router predicts for its first rows.
+static void dsv41_host_lane_cpu(ggml_tensor * dst, int ith, int nth, void * userdata)
+{
+    (void) nth;
+    if (ith != 0) return;   // the kernel brings its own team
+    constexpr int kBlock = 8;
+    const dsv41_lane & lane = *static_cast<const dsv41_lane *>(userdata);
+    tsg::HostMoeSegment hm = lane.hs;
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * sel = dst->src[1];
+    const ggml_tensor * w = dst->src[2];
+    const int nt = (int) dst->ne[1], n_used = hm.n_used, n_embd = hm.hidden;
+    static thread_local std::vector<float> xs, ws;
+    static thread_local std::vector<int32_t> ids, predicted;
+    xs.resize((size_t) nt * n_embd);
+    ids.resize((size_t) nt * n_used);
+    ws.resize((size_t) nt * n_used);
+    for (int r = 0; r < nt; ++r)
+    {
+        std::memcpy(xs.data() + (size_t) r * n_embd, (const char *) x->data + (size_t) r * x->nb[2], (size_t) n_embd * sizeof(float));
+        for (int k = 0; k < n_used; ++k)
+        {
+            ids[(size_t) r * n_used + k] = *(const int32_t *) ((const char *) sel->data + (size_t) k * sel->nb[0] + (size_t) r * sel->nb[1]);
+            ws[(size_t) r * n_used + k] = *(const float *) ((const char *) w->data + (size_t) k * w->nb[1] + (size_t) r * w->nb[2]);
+        }
+    }
+    float * out = (float *) dst->data;
+    for (int r0 = 0; r0 < nt; r0 += kBlock)
+    {
+        const int rows = std::min(kBlock, nt - r0);
+        tsg::HostMoePrefetch ahead;
+        if (r0 + kBlock < nt)
+        {
+            ahead.hm = &lane.hs;
+            ahead.ids = ids.data() + (size_t) (r0 + kBlock) * n_used;
+            ahead.count = std::min(kBlock, nt - r0 - kBlock) * n_used;
+        }
+        else if (lane.next != nullptr)
+        {
+            dsv41_lane_predict(lane, xs.data(), std::min(kBlock, nt), predicted);
+            ahead.hm = lane.next;
+            ahead.ids = predicted.data();
+            ahead.count = (int) predicted.size();
+        }
+        hm.seq_len = rows;
+        if (!tsg::host_moe_decode_experts_rows(hm, xs.data() + (size_t) r0 * n_embd, ids.data() + (size_t) r0 * n_used,
+                                               ws.data() + (size_t) r0 * n_used, out + (size_t) r0 * n_embd, nullptr, &ahead))
+        {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                fprintf(stderr, "[dsv41] CPU lane: the host decode kernel declined layer %d; its output is NaN\n", hm.layer);
+            for (int64_t i = 0; i < ggml_nelements(dst); ++i) out[i] = NAN;
+            return;
+        }
+    }
+}
+
 static bool dsv4_prefault_host_experts(dsv4_model & loaded, const shard_files & shards, int load_threads)
 {
     dsv4_model * const m = &loaded;
@@ -2516,11 +2713,14 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         if (allow && strcmp(allow, "0") != 0 && strcmp(allow, "1") != 0)
             throw std::runtime_error("TS_DSV41_ALLOW_NON_CUDA_GPU must be 0 or 1");
         const bool allowed = allow && strcmp(allow, "1") == 0;
+        m->metal_gpu = n_gpu > 0;
         for (int d = 0; d < n_gpu; ++d)
         {
             ggml_backend_dev_t device = ggml_backend_get_device(m->backends[d]);
             ggml_backend_reg_t reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
             const char * name = reg ? ggml_backend_reg_name(reg) : nullptr;
+            if (!name || !(dsv4_backend_matches(name, "MTL") || dsv4_backend_matches(name, "Metal")))
+                m->metal_gpu = false;
             if (name && dsv4_backend_matches(name, "CUDA")) continue;
             if (!allowed)
                 throw std::runtime_error("DeepSeek V4.1 requires CUDA-family GPU devices; selected device " +
@@ -3781,7 +3981,110 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         if (!sizes_ok) return nullptr;
         if (!dsv4_upload_parallel(shards, jobs, load_threads, m->mmap_weight_bytes)) return nullptr;
 
-        if (!dsv4_prefault_host_experts(*m, shards, load_threads)) return nullptr;
+        // Unified memory (ggml-metal) with host-offloaded layers: decode-width steps run the
+        // CPU lane, and on Apple its experts come from the explicitly read RAM cache (whole
+        // expert slices by parallel pread with F_NOCACHE into an LRU byte budget - Strata's
+        // RAM tier), so the page-cache prefault of every offloaded expert, which a 48 GB Mac
+        // cannot hold anyway, is skipped. TS_DSV41_HOST_LANE=0 keeps the ggml CPU chain;
+        // TS_HOST_MOE_IO_CACHE_GB sets the cache (0 reads the mapping).
+        //
+        // A discrete GPU (ggml-cuda) takes the same lane when the host experts do not fit in what
+        // the process may keep resident (the cgroup limit, page cache included): there the
+        // prefault would only thrash the mapping, which is Strata's case for its RAM tier too.
+        // TS_DSV41_HOST_LANE=1 forces the lane, =0 keeps the chain.
+        bool any_host = false;
+        size_t host_expert_bytes = 0;
+        for (int il = 0; il < hp.n_layer; il++)
+        {
+            const dsv4_layer & L = m->layers[il];
+            if (!L.cpu_moe) continue;
+            any_host = true;
+            for (const ggml_tensor * t : { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps })
+                if (t != nullptr) host_expert_bytes += ggml_nbytes(t);
+        }
+        {
+            const char * lane = getenv("TS_DSV41_HOST_LANE");
+            const bool forced_off = lane && strcmp(lane, "0") == 0, forced_on = lane && strcmp(lane, "1") == 0;
+            const size_t allowance = dsv4_host_mem_allowance();
+            const bool exceeds_ram = allowance > 0 && (double) host_expert_bytes > 0.6 * (double) allowance;
+            m->host_lane = hp.v41 && any_host && !forced_off && (m->metal_gpu || forced_on || exceeds_ram);
+            if (m->host_lane && !m->metal_gpu)
+                fprintf(stderr, "[dsv41] CPU lane on a discrete GPU: %.1f GiB of host experts against %.1f GiB this process may "
+                        "keep resident%s (TS_DSV41_HOST_LANE=0 keeps the ggml CPU chain)\n",
+                        host_expert_bytes / 1073741824.0, allowance / 1073741824.0, forced_on ? ", forced" : "");
+        }
+#if !defined(_WIN32)
+        if (m->host_lane)
+        {
+            long long budget = -1;
+            if (const char * e = getenv("TS_HOST_MOE_IO_CACHE_GB")) budget = (long long) (atof(e) * 1073741824.0);
+            if (budget < 0)
+            {
+                // three quarters of what the RAM leaves after a host reserve of max(8 GiB, RAM / 6)
+                // and, on unified memory, the GPU's weights and caches. Off Apple the RAM is what
+                // the process may keep resident (its cgroup limit, which counts the page cache).
+#if defined(__APPLE__)
+                const double ram = (double) dsv41_physical_memory_bytes();
+                const double wired = (double) uploaded + 4.0 * 1073741824.0;
+#else
+                const double ram = (double) dsv4_host_mem_allowance();
+                const double wired = 4.0 * 1073741824.0;
+#endif
+                const double reserve = std::max(8.0 * 1073741824.0, ram / 6.0);
+                budget = (long long) std::max(0.0, (ram - reserve - wired) * 0.75);
+            }
+            int registered = 0;
+            for (size_t si = 0; budget > 0 && si < m->mmap_addrs.size() && si < shards.paths.size(); ++si)
+                if (m->mmap_addrs[si] != nullptr
+                    && TSGgml_HostExpertIoRegister(m->mmap_addrs[si], (long long) m->mmap_sizes[si], shards.paths[si].c_str()))
+                    ++registered;
+            if (registered > 0)
+            {
+                TSGgml_HostExpertIoSetBudget(budget);
+                m->host_expert_io = true;
+            }
+            fprintf(stderr, "[dsv41] CPU lane: decode-width host experts run TensorSharp's host decode kernel%s\n",
+                    m->host_expert_io ? "" : " (reading the mapping)");
+            if (m->host_expert_io)
+                fprintf(stderr, "[dsv41] CPU lane: experts are read explicitly into a %.1f GiB RAM cache "
+                        "(parallel pread, page cache bypassed; TS_HOST_MOE_IO_CACHE_GB overrides, 0 reads the mapping)\n",
+                        budget / 1073741824.0);
+            // The lookahead reads each lane layer's router and bias straight from the mapping
+            // (7.5 MB of F32 a layer, file-backed pages) rather than keeping copies.
+            const char * la = getenv("TS_DSV41_LOOKAHEAD");
+            if (m->host_expert_io && !(la && strcmp(la, "0") == 0))
+            {
+                m->lane_router.assign(hp.n_layer, nullptr);
+                m->lane_router_type.assign(hp.n_layer, GGML_TYPE_F32);
+                m->lane_bias.assign(hp.n_layer, nullptr);
+                int linked = 0;
+                for (int il = (int) hp.hash_layer_count; il < hp.n_layer; ++il)
+                {
+                    if (!m->layers[il].cpu_moe) continue;
+                    char name[96];
+                    snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp.weight", il);
+                    const auto r = sources.find(name);
+                    snprintf(name, sizeof(name), "blk.%d.exp_probs_b.bias", il);
+                    const auto b = sources.find(name);
+                    if (r == sources.end() || b == sources.end()
+                        || (r->second.type != GGML_TYPE_F32 && r->second.type != GGML_TYPE_BF16) || b->second.type != GGML_TYPE_F32
+                        || r->second.ne[0] != hp.n_embd || r->second.ne[1] != hp.n_expert
+                        || b->second.ne[0] != hp.n_expert)
+                        continue;
+                    if (!dsv4_mmap_shard(*m, shards, r->second.shard) || !dsv4_mmap_shard(*m, shards, b->second.shard))
+                        continue;
+                    m->lane_router[il] = (const char *) m->mmap_addrs[r->second.shard] + r->second.offset;
+                    m->lane_router_type[il] = r->second.type;
+                    m->lane_bias[il] = (const float *) ((const char *) m->mmap_addrs[b->second.shard] + b->second.offset);
+                    ++linked;
+                }
+                if (linked > 0)
+                    fprintf(stderr, "[dsv41] CPU lane lookahead: %d layers' experts are predicted from the layer before "
+                            "and read ahead (TS_DSV41_LOOKAHEAD=0 off)\n", linked);
+            }
+        }
+#endif
+        if (!m->host_expert_io && !dsv4_prefault_host_experts(*m, shards, load_threads)) return nullptr;
 
         dsv4_pin_host_experts(*m, n_cpu_moe);
 
@@ -4112,6 +4415,7 @@ struct graph_builder
     void precise_matmul(ggml_tensor * t)
     {
         auto * backend = ggml_backend_sched_get_tensor_backend(res.sched, t);
+
         if (t->src[0]->type == GGML_TYPE_F32 && t->src[1]->type == GGML_TYPE_F32 &&
             (m.n_gpu == 0 || (backend && ggml_backend_is_cpu(backend))))
         {
@@ -5192,6 +5496,55 @@ struct graph_builder
         const int64_t n_used = hp.n_expert_used;
         const int cpu_dev = m.n_gpu;
         auto on_cpu = [&](ggml_tensor * t) -> ggml_tensor * { pin(t, cpu_dev); return t; };
+
+        if (m.host_lane && (nt <= 8 || m.host_expert_io) && dsv41_host_lane_supports(L))
+        {
+            // The CPU lane (Strata's): the selected experts on TensorSharp's host decode
+            // kernel - ggml's CPU dot products on a team woken once per layer - reading each
+            // expert from the explicitly read RAM cache when it is on (whole expert slices by
+            // parallel pread, the page cache bypassed) instead of the ggml CPU mul_mat_id
+            // chain faulting the mapping a page at a time. Wider (prefill) steps take the
+            // lane only with the cache: from the mapping, the chain's batched products win.
+            dsv41_lane & lane = res.lanes.emplace_back();
+            tsg::HostMoeSegment & hs = lane.hs;
+            hs.layer = il;
+            hs.gate_data = L.ffn_gate_exps->data; hs.gate_type = L.ffn_gate_exps->type;
+            hs.gate_ne0 = L.ffn_gate_exps->ne[0]; hs.gate_ne1 = L.ffn_gate_exps->ne[1];
+            hs.gate_bytes = (int64_t) ggml_nbytes(L.ffn_gate_exps);
+            hs.up_data = L.ffn_up_exps->data; hs.up_type = L.ffn_up_exps->type;
+            hs.up_ne0 = L.ffn_up_exps->ne[0]; hs.up_ne1 = L.ffn_up_exps->ne[1];
+            hs.up_bytes = (int64_t) ggml_nbytes(L.ffn_up_exps);
+            hs.down_data = L.ffn_down_exps->data; hs.down_type = L.ffn_down_exps->type;
+            hs.down_ne0 = L.ffn_down_exps->ne[0]; hs.down_ne1 = L.ffn_down_exps->ne[1];
+            hs.down_bytes = (int64_t) ggml_nbytes(L.ffn_down_exps);
+            hs.activation = 0;
+            hs.swiglu_limit = clamp_limit > 1e-6f ? clamp_limit : 0.0f;
+            hs.num_experts = (int) L.ffn_gate_exps->ne[2];
+            hs.n_used = (int) n_used;
+            hs.n_ff = (int) L.ffn_gate_exps->ne[1];
+            hs.hidden = (int) hp.n_embd;
+            // The lookahead into the next layer: built after this one (layers are built in
+            // order), so this layer's node is linked to it once that layer's lane exists.
+            if (res.lanes.size() >= 2)
+            {
+                dsv41_lane & prev = res.lanes[res.lanes.size() - 2];
+                const int pl = prev.hs.layer;
+                if (pl + 1 == il && il < hp.n_layer && il >= hp.hash_layer_count && !res.image_tokens
+                    && (size_t) il < m.lane_router.size() && m.lane_router[il] && m.lane_bias[il])
+                {
+                    prev.next = &hs;
+                    prev.next_router = m.lane_router[il];
+                    prev.next_router_type = m.lane_router_type[il];
+                    prev.next_bias = m.lane_bias[il];
+                }
+            }
+            ggml_tensor * args[] = { cur3, selected, weights };
+            ggml_tensor * moe_out = on_cpu(ggml_custom_4d(ctx, GGML_TYPE_F32, hp.n_embd, nt, 1, 1,
+                    args, 3, dsv41_host_lane_cpu, 1, &lane));
+            ggml_tensor * out = ggml_add(ctx, moe_out, shexp);
+            pin(out, dev);
+            return out;
+        }
 
         ggml_tensor * up = on_cpu(ggml_mul_mat_id(ctx, L.ffn_up_exps, cur3, selected));   // [n_ff, n_used, nt]
         ggml_tensor * gate = on_cpu(ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur3, selected));

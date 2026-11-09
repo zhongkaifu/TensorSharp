@@ -46,6 +46,25 @@ public sealed class ConfigFileArgsEnvironmentTests : IDisposable
             Path.GetFullPath(Environment.GetEnvironmentVariable(key)!));
     }
 
+    /// <summary>Many of these switches are read by the native library with getenv, and on Unix
+    /// .NET keeps its own copy of the environment: a default published only there never reached
+    /// the C runtime (config/qwen3.8-flash-next.json's TS_Q4E_VERIFY_ROW_KERNELS was ignored).</summary>
+    [Fact]
+    public void Defaults_ReachTheNativeEnvironment()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        string key = Key(); Set(key, null);
+        try
+        {
+            ConfigFileArgs.Expand(["--config", Defaults(key, "native")]);
+            Assert.Equal("native", System.Runtime.InteropServices.Marshal.PtrToStringAnsi(NativeGetEnv(key)));
+        }
+        finally { NativeEnvironment.Set(key, null); }
+    }
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "getenv")]
+    private static extern IntPtr NativeGetEnv(string name);
+
     [Fact]
     public void LaterFileWinsDefaults_ButExistingProcessValueWinsBothFiles()
     {

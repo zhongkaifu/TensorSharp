@@ -44,7 +44,21 @@ namespace TensorSharp.Cuda
         public int SlotAlloc()
         {
             if (!SlotFits())
-                return -1;
+            {
+                // Captured batched steps are a cache, and their executable graphs hold device memory: a new sequence needs it
+                // more. In Strata's concurrency rounds the graphs of earlier rounds left the fourth request no slot, and it
+                // waited 4.2-4.6 s for a running one to finish.
+                // Only when the graphs could make up the difference: with one lane every new request's slot falls short
+                // by a whole slot, and giving up the decode graphs there only made each request capture them again (139
+                // of 1,665 verify windows ran uncaptured, short-prompt decode 122-171 -> 95-116 tok/s).
+                if (SlotShortfall() > GraphReleaseBytes)
+                    return RefuseSlot();
+                bool fits = false;
+                while (!fits && ReleaseBatchGraphsForMemory())
+                    fits = SlotFits();
+                if (!fits)
+                    return RefuseSlot();
+            }
             Slot slot;
             try
             {
@@ -62,8 +76,33 @@ namespace TensorSharp.Cuda
         /// <summary>Whether one more slot fits, counting what the allocators hold pooled: its caches
         /// at the initial capacity, plus room for one slot to grow to the whole context, so the
         /// sequences already running are not left without memory to grow into.</summary>
-        private bool SlotFits()
+        private bool SlotFits() => SlotShortfall() <= 0;
+
+        private long _slotRefusalNoted;
+
+        /// <summary>-1, saying (at most every 30 s) how far the devices are from another slot: the model's own message names
+        /// only the running requests.</summary>
+        private int RefuseSlot()
         {
+            long now = Environment.TickCount64;
+            if (now - _slotRefusalNoted >= 30_000)
+            {
+                _slotRefusalNoted = now;
+                long need = 0;
+                for (int d = 0; d < _devs.Length; d++)
+                    need = Math.Max(need, _slotInitialBytes[d] + _slotGrowBytes[d]);
+                Console.Error.WriteLine($"[q4e-cuda] no room for another sequence slot: {SlotShortfall() / 1048576.0:F0} MiB short of "
+                    + $"{need / 1048576.0:F0} MiB plus the {SlotReserveBytes / 1048576.0:F0} MiB reserve ({_slots.Count} slots, "
+                    + $"{_graphs.Count} solo and {_batchGraphs.Count} batched graphs held)");
+            }
+            return -1;
+        }
+
+        /// <summary>Bytes the device shortest of room lacks for one more slot beside the reserve (0 or less when it fits),
+        /// counting what the allocators hold pooled.</summary>
+        private long SlotShortfall()
+        {
+            long worst = long.MinValue;
             for (int d = 0; d < _devs.Length; d++)
             {
                 long need = _slotInitialBytes[d] + _slotGrowBytes[d];
@@ -72,11 +111,13 @@ namespace TensorSharp.Cuda
                 _devs[d].MakeCurrent();
                 (long free, _) = _devs[d].Alloc.GetMemoryInfo();
                 free += _devs[d].Alloc.GetStats().CachedBytes;
-                if (free - need < SlotReserveBytes)
-                    return false;
+                worst = Math.Max(worst, need + SlotReserveBytes - free);
             }
-            return true;
+            return worst == long.MinValue ? 0 : worst;
         }
+
+        /// <summary>A shortfall the captured graphs could make up (they hold well under this): beyond it they are kept.</summary>
+        private const long GraphReleaseBytes = 1L << 30;
 
         // ---------------------------------------------------------------- growing slots
         //
@@ -124,6 +165,10 @@ namespace TensorSharp.Cuda
                 }
                 catch (Exception ex) when (IsOutOfMemory(ex))
                 {
+                    // The captured batched steps give their memory back first (BatchGraphs.cs), then the doubling shrinks to
+                    // what this step needs, then a retained slot is reclaimed.
+                    if (ReleaseBatchGraphsForMemory())
+                        continue;
                     int least = AlignSlotTokens(need);
                     if (cap > least)
                         cap = least;   // the doubling does not fit; take only what this step needs
@@ -165,7 +210,8 @@ namespace TensorSharp.Cuda
             {
                 for (int il = 0; il < _m.NLayer; il++)
                 {
-                    if (_layers[il].Recurrent)
+                    // A streamed layer's window and host copy already cover the whole context.
+                    if (_layers[il].Recurrent || s.Layers[il]?.Kv != null)
                         continue;
                     var bytes = new long[_devs.Length];
                     fresh.Add((il, AllocAttentionCaches(_devs[_layers[il].Device], _layers[il], cap, bytes), bytes));
@@ -190,13 +236,19 @@ namespace TensorSharp.Cuda
                 var old = s.Layers[il];
                 CopyPrefix(dev, n.KCache, old.KCache);
                 CopyPrefix(dev, n.VCache, old.VCache);
+                if (old.KScale != null)
+                {
+                    // Q8_0 KV: the scales are position-major like the codes (one per 32 values of a row).
+                    CopyPrefix(dev, n.KScale, old.KScale);
+                    CopyPrefix(dev, n.VScale, old.VScale);
+                }
                 if (old.IdxRaw != null)
                 {
                     CopyPrefix(dev, n.IdxRaw, old.IdxRaw);
                     CopyPrefix(dev, n.IdxPooled, old.IdxPooled);
                 }
                 CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
-                foreach (Tensor t in new[] { old.KCache, old.VCache, old.IdxRaw, old.IdxPooled })
+                foreach (Tensor t in new[] { old.KCache, old.VCache, old.KScale, old.VScale, old.IdxRaw, old.IdxPooled })
                 {
                     if (t == null)
                         continue;
@@ -204,8 +256,9 @@ namespace TensorSharp.Cuda
                     s.Owned.Remove(t);
                     t.Dispose();
                 }
-                old.KCache = n.KCache; old.VCache = n.VCache; old.IdxRaw = n.IdxRaw; old.IdxPooled = n.IdxPooled;
-                foreach (Tensor t in new[] { n.KCache, n.VCache, n.IdxRaw, n.IdxPooled })
+                old.KCache = n.KCache; old.VCache = n.VCache; old.KScale = n.KScale; old.VScale = n.VScale;
+                old.IdxRaw = n.IdxRaw; old.IdxPooled = n.IdxPooled;
+                foreach (Tensor t in new[] { n.KCache, n.VCache, n.KScale, n.VScale, n.IdxRaw, n.IdxPooled })
                     if (t != null)
                         s.Owned.Add(t);
                 for (int d = 0; d < bytes.Length; d++)
@@ -221,7 +274,8 @@ namespace TensorSharp.Cuda
 
         private static void DisposeAttentionCaches(SlotLayer c)
         {
-            c.KCache?.Dispose(); c.VCache?.Dispose(); c.IdxRaw?.Dispose(); c.IdxPooled?.Dispose();
+            c.KCache?.Dispose(); c.VCache?.Dispose(); c.KScale?.Dispose(); c.VScale?.Dispose();
+            c.IdxRaw?.Dispose(); c.IdxPooled?.Dispose();
         }
 
         public bool SetActiveSlot(int id)
@@ -230,6 +284,25 @@ namespace TensorSharp.Cuda
                 return false;
             _active = slot;
             return true;
+        }
+
+        /// <summary>
+        /// Free every slot but the active one and those in <paramref name="keep"/> (the slots the owner still holds:
+        /// bound to requests, its primary, retained conversations), returning how many went. A slot the owner lost track
+        /// of (its free was refused while it was the selection) otherwise held a lane's memory for good: with 4 lanes on
+        /// the RTX 5090 one such slot made a new request wait for a running one to finish.
+        /// </summary>
+        public int SlotFreeAllExcept(ICollection<int> keep)
+        {
+            var lost = new List<int>();
+            foreach (var (id, slot) in _slots)
+                if (!ReferenceEquals(slot, _active) && !keep.Contains(id))
+                    lost.Add(id);
+            int freed = 0;
+            foreach (int id in lost)
+                if (SlotFree(id))
+                    freed++;
+            return freed;
         }
 
         /// <summary>Free a slot; the active slot cannot be freed.</summary>
@@ -315,6 +388,16 @@ namespace TensorSharp.Cuda
                 CopyCheckpoint(s, restore: true);
                 s.NPast = s.CpNPast;
                 s.PleTokens.Length = s.CpNPast;
+                // The MTP block's rows from nPast on belong to the continuation given up: the next draft rewrites them
+                // from there, or restarts the block (MtpRestart) when it restarted after nPast. Below nPast the replay
+                // feeds the same tokens and streams, so those rows stand.
+                if (s.Mtp != null)
+                {
+                    if (nPast < s.MtpStart)
+                        s.MtpStart = s.MtpPast = nPast;
+                    else
+                        s.MtpPast = Math.Min(s.MtpPast, nPast);
+                }
                 if (tokens != null)
                     Forward(tokens, null);
                 foreach (var dev in _devs)
@@ -385,6 +468,7 @@ namespace TensorSharp.Cuda
             foreach (var r in rows)
                 r.Failed = true;
             _rowsInFlight = n;
+            ArmHostExperts();
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
             bool sampled = BeginSampledForward();
             _issueEnd = 0;
@@ -402,6 +486,8 @@ namespace TensorSharp.Cuda
                     catch (Exception) { _sampling = false; }
                 }
             }
+            CheckHostExperts(n);
+            AdaptResidency();
             CountForwardTime(start);
             foreach (var r in rows)
             {

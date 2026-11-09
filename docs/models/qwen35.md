@@ -895,9 +895,15 @@ process (kernels compiled).
 - **Prompt chunks.** The raw i-quants' 32+-row products dequantize the weight to F16 slices and run
   MLX's GEMM (`TS_MLX_IQ_DEQUANT_GEMM_MIN_ROWS`), as Q6_K and IQ4_XS do: the 2.3K-token prefill
   361 s -> 6.05 s (ggml_metal: 7.0 s).
-- **Verify windows.** 2-31 rows decode each 8-weight group once into simdgroup-matrix tiles
-  (`TS_MLX_IQ_FEWROW_MAX_ROWS`; F32 below 8 rows, F16 from 8 as the kernel they replace): an 8-row
-  verify 359 -> 186 ms.
+- **Verify windows.** 2-31 rows take the few-row kernel (`TS_MLX_IQ_FEWROW_MAX_ROWS`), now laid
+  out as ggml-metal's few-row MMA kernels: the simdgroups of a threadgroup split K, each lane
+  decodes its 16 weights of a chunk once straight into simdgroup-matrix registers (F32), and the
+  partial tiles are summed once at the end. The kernel it replaces staged 64 decoded columns in
+  threadgroup memory with a barrier pair per 64 weights; even with a near-free decoder it took
+  106 of an 8-row forward's 128 ms. An 8-row forward 128 -> 79 ms (ggml_metal 87), 2 rows
+  159 -> 75, 16 rows 212 -> 151 (ggml_metal 153), 31 rows 383 -> 279; the verify window 155 ->
+  92 ms (ggml_metal 88). IQ4_XS and Q6_K decode their 8 values with one scale read instead of
+  value by value.
 - **No re-forward after a rejection.** The verify keeps the recurrent state after every row and the
   accepted row's state is committed on the device, as the ggml verify's snapshots do; the
   pre-verify snapshot is a reference to the immutable MLX arrays instead of a host copy (6 ms ->
@@ -910,23 +916,42 @@ process (kernels compiled).
   K = 5,120) and ended in a barrier. It now has ggml-metal's mul_mv layout: two simdgroups of four
   weight rows each, a lane loading 32 activations once for all four rows. Plain decode
   15.7 -> 20.4 tok/s (49 ms a token), the rate of ggml_metal (20.6) and llama.cpp (20.5) on the file.
-- **Few-row tiles.** The verify-window kernel takes eight simdgroups (64 output columns) per
-  threadgroup instead of four, so the activation tile is staged half as often: an 8-token forward
-  179 -> 159 ms.
+- **Short prompts and wider windows on the matrix units.** Past 8 rows that kernel is bound by
+  its F32 simdgroup products (an 8-row forward is ~430 GFLOP), and from 32 rows the dequant GEMM
+  wrote the whole weight as F16 on every call (~590 ms whatever the row count). On M5 the same K
+  split now multiplies on the tensor API: each simdgroup decodes its chunk of 32 weight rows into
+  a tile of its own and multiplies it against 16, 32 or 64 input rows (`TS_MLX_FEWROW_TENSOR`,
+  9-1024 rows). A forward of 16 rows 151 -> 82 ms (ggml_metal 153), 32 rows 599 -> 104 (291),
+  128 rows 723 -> 325 (363), 512 rows 1377 -> 1205 (1289); it ties the dequant GEMM at 1024 rows,
+  which keeps the longer chunks.
+- **Affine weights: the drafter.** Q4_K and Q8_0 load as MLX affine weights, which ran through MLX's
+  `quantized_matmul`: at the drafter's 7-8 rows it read them at ~120 GB/s. They now take the same
+  few-row kernels with an affine decoder (`TS_MLX_AFFINE_FEWROW_MAX_ROWS`, up to 128 rows with the
+  tensor API): a DFlash2 draft 17.6 -> 13.4 ms (layers 11.0 -> 9.0, the 248K-row head 5.9 -> 3.7),
+  and the verify window 92-96 -> 89 ms from the target's own Q4_K tensors.
+- **Unrolled register arrays.** The first port of that layout took 225 ms for the 8-row forward:
+  the loops over its accumulator and pointer arrays were not unrolled, so the arrays lived in
+  thread memory. With every such loop unrolled (`clang loop unroll(full)`, ggml's `FOR_UNROLL`)
+  it takes 79 ms. Tiling, by contrast, hardly matters on the M5 Pro (79-81 ms for every shape
+  tried; eight weight tiles 85 ms).
+- **Retained conversations on a 48 GB Mac.** Each retained conversation is sized for the whole
+  context (about 2.5 GB at 32K), and sixteen of them took the server past 34 GB and into swap,
+  where every scenario ran 3x slower. Retained state is now bounded by what macOS can give
+  (see [the batching doc](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)): the full benchmark
+  below stayed at 18-23 GB.
 
-| UD-IQ3_XXS, MLX | Before | Now |
-|---|---:|---:|
-| Plain decode | 1.8 tok/s | 20.4 tok/s |
-| DFlash2, code answer | 2.4 tok/s | 25.0 tok/s |
-| DFlash2, list answer | - | 25.7 tok/s |
+Server, greedy, `--spec-draft 7 --spec-pmin 0`, MAX_CONTEXT 32768, two runs each (TTFT / decode):
 
-ggml_metal on the same files and requests: UD-IQ3_XXS plain 20.6, DFlash2 38.6 (code) / 52.3
-(list); Q8_0 plain 9.9, DFlash2 33.2 / 39.6. MLX with Q8_0 and DFlash2: 23.5-24.4 / 26.5-27.6.
-The remaining MLX gap is the 8-row matmul kernel: in an 8-token UD-IQ3_XXS forward (159 ms against
-ggml_metal's 88) the few-row matmuls take 140 ms, the rest 20. It decodes each weight once, as the
-one-row kernel does in about 40 ms, so the difference is its access pattern (eight rows' 64-value
-pieces per simdgroup and chunk), not the codebooks; larger or smaller K chunks, more simdgroups and
-ggml's register-fragment layout were all slower or equal.
+| UD-IQ3_XXS + DFlash2 | ggml_metal | MLX before | MLX now |
+|---|---:|---:|---:|
+| Long generation (74-token prompt, 1,220 tokens) | 0.57-0.60 s / 30.1-31.3 tok/s | 1.27-1.43 s / 17.6-17.7 | 0.34-0.37 s / 31.0-31.6 |
+| 4K-token prompt | 12.9 s / 35-52 | 10.6-10.7 s / 15-18 | 9.8-10.0 s / 39-41 |
+| 16K-token prompt | 53.5 s / 33 | 43.1-43.3 s / 14-15 | 41.1 s / 29 |
+| Multi-turn: first turn, then cached turns | 9.2-9.3 s, 0.32-0.59 s | 8.4-8.8 s, 0.56-0.67 s | 6.4-8.5 s, 0.12 s |
+| Short chat | 0.57 s | 0.66-1.05 s | 0.21 s |
+
+Plain decode is 46.8 ms a token on MLX against 48.4 on ggml_metal. Decode after a 16K-token prompt
+(29 against 33 tok/s, over 56 tokens) is the one figure still behind.
 
 ## 10. Memory and KV cache strategy
 
@@ -1362,6 +1387,27 @@ Folding it into the fused MTP graph is the next step.
   `thinking_budget`), and a bare `</think>` left Qwen3.5-9B reasoning on inside
   its answer. Qwen3.5-9B IQ4_XS on Metal, `max_tokens` 600, two concurrent
   three-turn conversations: 0/2 passed before (empty answers), 2/2 after.
+- **Reasoning that ends without an answer** (issue #338). Qwen3.8-27B NVFP4
+  under Aider ended 3 of 53 turns on a stop token in the middle of its
+  reasoning: each had settled into a counting loop (`Need maybe tests expect
+  to_string for 1:1533 -> 02:33. Good.`, then `1:1534`, for thousands of
+  tokens), and an OpenAI client received an empty `stop`. Three changes, for
+  every family with a trained closing token, whatever `TS_THINKING_BUDGET` is:
+  - a stop token drawn while the reasoning is open closes it instead - the
+    hand-over sentence, then `</think>` - and the model answers
+    (`ThinkingTokenBudget.CloseOnStop`, applied where every token is drawn:
+    host sampling, the device-argmax stash and each speculative verify row);
+  - reasoning that repeats a templated line 32 times in a row (digit runs
+    folded, up to a fifth of the line changed, so `twenty-nine` to `thirty`
+    still repeats: `ReasoningLoopDetector`) is closed the same way. Templated
+    lines in the answer are never touched;
+  - a turn that still ends with reasoning and no answer (a family without a
+    closing token) reports `thinking_budget`, which clients see as `length`.
+
+  On Qwen3.8-27B UD-IQ3_XXS (Metal), the issue's loop primed into the
+  reasoning was carried on by the model and closed after 32 generated lines,
+  and the answer was right (`02:33`); a stand-in stop mid-reasoning was closed
+  and answered `391` for 17 x 23.
 
 ## 13a. Tensor parallelism
 

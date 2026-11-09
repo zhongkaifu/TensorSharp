@@ -364,7 +364,6 @@
   "studio.keyframesTitle": "Fotos en momentos concretos",
   "studio.guideNamed": "Fotograma clave {index}",
   "studio.referencePhotosTitle": "Fotos de referencia",
-  "studio.referencesHelp2": "Tus fotos muestran a quién o qué incluir; la toma no empieza ni termina en ellas. Elige hasta {count}.",
   "studio.referenceRemoved": "Se ha quitado {name}. Orden: {list}",
   "studio.referenceAdded": "Imagen {index}: {name}",
   "studio.referenceTileOn": "{name}, imagen {index}",

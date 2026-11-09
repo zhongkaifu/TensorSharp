@@ -761,6 +761,11 @@ public sealed class AgentAppHostTests : IDisposable
         Assert.Equal(TensorSharp.Models.Video.VideoCanvasPolicy.CompactPreview, turn.CanvasPolicy);
         var fl2va = (TensorSharp.Models.MiniMaxH3.MiniMaxH3Model)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(
             typeof(TensorSharp.Models.MiniMaxH3.MiniMaxH3Model));
+        // The model reports its modes from the denoisers it has (SupportsPartition): an FL2VA checkpoint
+        // is one whose first/last-frame denoiser path is set, as in StudioChainConditioningTests.
+        typeof(TensorSharp.Models.MiniMaxH3.MiniMaxH3Model).GetField("_firstLastDitPath",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(fl2va, "metadata-only-fl2va.gguf");
         var capability = TensorSharp.Chat.Studio.NativeStudioGenerationAdapter.CreateCapability(fl2va, "h3", host.Chat.VideoDefaults);
         Assert.Contains("i2v", capability.Modes);
         Assert.Empty(capability.ImageCanvasModes);

@@ -30,6 +30,7 @@ namespace TensorSharp.Models
             // The GC's available-memory limit accounts for a container/VM or an
             // explicit heap limit. WorkingSet includes the native host allocations
             // and mapped weights that managed-heap accounting alone would miss.
+            long? spare = null;
             try
             {
                 long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
@@ -37,13 +38,17 @@ namespace TensorSharp.Models
                 {
                     using var process = Process.GetCurrentProcess();
                     long reserve = Math.Max(GpuMemoryBudget.MinHeadroomBytes, available / 16);
-                    return Math.Max(0, available - Math.Min(available, process.WorkingSet64) - reserve);
+                    spare = Math.Max(0, available - Math.Min(available, process.WorkingSet64) - reserve);
                 }
             }
             catch (InvalidOperationException) { }
             catch (System.ComponentModel.Win32Exception) { }
             catch (NotSupportedException) { }
-            return null;
+            // On a Mac the working set leaves out the GPU's buffers (an MLX server's stayed at 14 GB while
+            // its footprint passed 34 GB) and other programs' memory: also only what macOS can give.
+            if (OperatingSystem.IsMacOS() && UnifiedMemorySpareBytes() is long mac)
+                spare = spare.HasValue ? Math.Min(spare.Value, Math.Max(0, mac)) : Math.Max(0, mac);
+            return spare;
         }
 
         private const int LongCacheTokens = 16384;

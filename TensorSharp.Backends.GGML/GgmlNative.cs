@@ -4613,6 +4613,82 @@ internal enum GgmlIndexReductionOp
         internal static partial void TSGgml_Qwen4ExpMtpFree(IntPtr handle);
         [LibraryImport(DllName)]
         internal static partial int TSGgml_Qwen4ExpMtpCopyKv(IntPtr handle, IntPtr k, IntPtr v, long bytes);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_Qwen4ExpCaptureVerifyRows(int enable);
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_Qwen4ExpSetFeatureTaps(IntPtr layers, int count, IntPtr output, int rowStride);
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_TsmMoeProbe(int gateType, int downType, int hidden, int nFf, int nExpert,
+            IntPtr gate, IntPtr up, IntPtr down, int rows, int nUsed, IntPtr slots, IntPtr weights, IntPtr x, IntPtr output);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_TsmSeamPasses();
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_TsmGdnPromptCount();
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_TsmHcPromptCount();
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_TsmQsaSelectCount();
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_TsmQsaAttnCount();
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_TsmQsaSelectProbe(int T, int nCells, int nBlocks, int heads, int width,
+            IntPtr scores, IntPtr bias, IntPtr cellBlocks, IntPtr maskIn, IntPtr maskOut);
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_TsmQsaAttnProbe(int T, int nHead, int nHeadKv, int nCells, int width, float scale,
+            IntPtr q, IntPtr k, IntPtr v, IntPtr idx, IntPtr cnt, IntPtr mask, IntPtr output, int iterations, IntPtr msPerPass);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_MoeStagePrefetchHits();
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_MoeStageBorrows();
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_HostReadRows(IntPtr table, long rowBytes, IntPtr rows, int count, IntPtr dst);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_Qwen4ExpQsaIncrementalSteps();
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_MoeTailSkippedRoutes();
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_Qwen4ExpCommitVerifyRow(int row, int rows);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_Qwen4ExpRowBufferBytes();
+
+        // Priority-ranked accelerator tier for host-offloaded routed experts and
+        // the routing counters the host seams keep (ggml_ops_moe_hot_tier.cpp).
+        [LibraryImport(DllName)]
+        internal static unsafe partial int TSGgml_MoeHotTierRegister(IntPtr gate, IntPtr up, IntPtr down,
+            int gateType, int upType, int downType, long gateBytes, long upBytes, long downBytes,
+            int numExperts, int* experts, int count, int window, int releaseSource);
+        [LibraryImport(DllName)]
+        internal static unsafe partial void TSGgml_MoeHotTierStats(long* stats4);
+        [LibraryImport(DllName)]
+        internal static unsafe partial void TSGgml_MoeTierPrefetchStats(long* stats3);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_MoeHotTierTotalBytes();
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_MoeHotTierRelease(IntPtr gate);
+        [LibraryImport(DllName)]
+        internal static unsafe partial int TSGgml_MoeRoutingCounts(IntPtr gate, ulong* counts, int capacity);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_MoeRoutingReset(IntPtr gate);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_MoeRoutingRecordDevice(int on);
+        [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+        internal static partial int TSGgml_HostExpertIoRegister(IntPtr baseAddress, long length, string path);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_HostExpertIoSetBudget(long bytes);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_HostAvailableMemoryBytes();
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_ReleaseKeptArenas();
+        [LibraryImport(DllName)]
+        internal static unsafe partial int TSGgml_MoeOffloadCounters(long* output, int capacity);
+        [LibraryImport(DllName)]
+        internal static unsafe partial int TSGgml_HostExpertRows(IntPtr gate, IntPtr up, IntPtr down,
+            int gateType, int upType, int downType, int numExperts, int hidden, int nFf, int nUsed, int rows,
+            float* x, int* ids, float* weights, byte* skip, float* output);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_HostExpertIoUnregister(IntPtr baseAddress);
+        [LibraryImport(DllName)]
+        internal static unsafe partial void TSGgml_HostExpertIoStats(long* stats4);
 
         [LibraryImport(DllName)]
         private static unsafe partial IntPtr TSGgml_Qwen4ExpStateSnapshotCreate(

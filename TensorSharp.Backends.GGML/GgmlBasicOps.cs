@@ -3456,6 +3456,266 @@ namespace TensorSharp.GGML
         public static void Qwen4ExpMtpFree(IntPtr handle) => GgmlNative.TSGgml_Qwen4ExpMtpFree(handle);
         public static bool Qwen4ExpMtpCopyKv(IntPtr handle, IntPtr k, IntPtr v, long bytes)
             => GgmlNative.TSGgml_Qwen4ExpMtpCopyKv(handle, k, v, bytes) != 0;
+
+        /// <summary>While set, a 2-8 row qwen4exp span keeps every row's recurrent state.</summary>
+        public static void Qwen4ExpCaptureVerifyRows(bool enable) => GgmlNative.TSGgml_Qwen4ExpCaptureVerifyRows(enable ? 1 : 0);
+
+        /// <summary>Test probe of the TensorSharp Metal grouped expert kernels (tsm/tsm_moe.mm): one layer's held routes
+        /// (slot -1: a route the host computes) over stacked expert bytes, into <paramref name="output"/> [rows, hidden].</summary>
+        public static unsafe bool TsmMoeProbe(int gateType, int downType, int hidden, int nFf, int nExpert,
+            byte[] gate, byte[] up, byte[] down, int rows, int nUsed, int[] slots, float[] weights, float[] x, float[] output)
+        {
+            fixed (byte* g = gate) fixed (byte* u = up) fixed (byte* d = down)
+            fixed (int* s = slots) fixed (float* w = weights) fixed (float* xp = x) fixed (float* o = output)
+                return GgmlNative.TSGgml_TsmMoeProbe(gateType, downType, hidden, nFf, nExpert, (IntPtr)g, (IntPtr)u, (IntPtr)d,
+                    rows, nUsed, (IntPtr)s, (IntPtr)w, (IntPtr)xp, (IntPtr)o) != 0;
+        }
+
+        /// <summary>Test hook: the tiered seamed passes whose seams handed over on a shared event (tsm::seams_*) and ran
+        /// to the end in this process. 0 off Apple's Metal builds.</summary>
+        public static long TsmSeamPasses()
+        {
+            try { return GgmlNative.TSGgml_TsmSeamPasses(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Test hook: the prompt-width GDN layers that ran on TensorSharp's Metal kernels
+        /// (tsm::gdn_prompt_encode) in this process. 0 off Apple's Metal builds.</summary>
+        public static long TsmGdnPromptCount()
+        {
+            try { return GgmlNative.TSGgml_TsmGdnPromptCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Test hook: the prompt-width hyper-connection passes (mix, scatter) that ran on TensorSharp's Metal
+        /// kernels (tsm::hc_mix_encode, tsm::hc_scatter_encode) in this process. 0 off Apple's Metal builds.</summary>
+        public static long TsmHcPromptCount()
+        {
+            try { return GgmlNative.TSGgml_TsmHcPromptCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Test probe of the QSA selection kernels (tsm::qsa_select_encode): scores [T, H, B], bias [T, B],
+        /// cell_blocks [cells] and the mask [T, cells] (F16 bits) in; the selected mask (F16 bits) out.</summary>
+        public static unsafe bool TsmQsaSelectProbe(int rows, int cells, int blocks, int heads, int width, float[] scores,
+            float[] bias, int[] cellBlocks, ushort[] maskIn, ushort[] maskOut)
+        {
+            fixed (float* s = scores) fixed (float* b = bias) fixed (int* c = cellBlocks)
+            fixed (ushort* mi = maskIn) fixed (ushort* mo = maskOut)
+                return GgmlNative.TSGgml_TsmQsaSelectProbe(rows, cells, blocks, heads, width, (IntPtr)s, (IntPtr)b, (IntPtr)c,
+                    (IntPtr)mi, (IntPtr)mo) != 0;
+        }
+
+        /// <summary>Test probe of the QSA attention over the chosen cells (tsm::qsa_attn_encode): q [H, T, 256] F32, k and
+        /// v [kv heads, cells, 256] F16 bits, idx [T, width], cnt [T], mask [T, cells] F16 bits in; out [T, H, 256]. With
+        /// <paramref name="iterations"/> > 0 also the time of one pass over that many (<paramref name="msPerPass"/>).</summary>
+        public static unsafe bool TsmQsaAttnProbe(int rows, int heads, int kvHeads, int cells, int width, float scale,
+            float[] q, ushort[] k, ushort[] v, int[] idx, int[] cnt, ushort[] mask, float[] output, int iterations,
+            out double msPerPass)
+        {
+            double ms = 0;
+            bool ok;
+            fixed (float* qp = q) fixed (ushort* kp = k) fixed (ushort* vp = v) fixed (int* ip = idx) fixed (int* cp = cnt)
+            fixed (ushort* mp = mask) fixed (float* op = output)
+                ok = GgmlNative.TSGgml_TsmQsaAttnProbe(rows, heads, kvHeads, cells, width, scale, (IntPtr)qp, (IntPtr)kp,
+                    (IntPtr)vp, (IntPtr)ip, (IntPtr)cp, (IntPtr)mp, (IntPtr)op, iterations, (IntPtr)(&ms)) != 0;
+            msPerPass = ms;
+            return ok;
+        }
+
+        /// <summary>Test hook: the prompt-width QSA selections that ran on TensorSharp's Metal kernels
+        /// (tsm::qsa_select_encode) in this process. 0 off Apple's Metal builds.</summary>
+        public static long TsmQsaSelectCount()
+        {
+            try { return GgmlNative.TSGgml_TsmQsaSelectCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Test hook: the prompt-width QSA attention passes over the chosen cells that ran on TensorSharp's Metal
+        /// kernel (tsm::qsa_attn_encode) in this process. 0 off Apple's Metal builds.</summary>
+        public static long TsmQsaAttnCount()
+        {
+            try { return GgmlNative.TSGgml_TsmQsaAttnCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Fixed-size rows of a mapping registered for explicit reads (HostExpertIoRegister), one pread each,
+        /// packed into <paramref name="dst"/> in list order. False (nothing read) when a row is outside every registered
+        /// mapping; the caller then reads the mapping.</summary>
+        public static unsafe bool HostReadRows(IntPtr table, long rowBytes, int[] rows, IntPtr dst)
+        {
+            if (rows == null || rows.Length == 0) return false;
+            try
+            {
+                fixed (int* r = rows)
+                    return GgmlNative.TSGgml_HostReadRows(table, rowBytes, (IntPtr)r, rows.Length, dst) != 0;
+            }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+
+        /// <summary>Prompt-sized offloaded MoE layers whose experts were staged ahead while the accelerator ran the
+        /// layer before (process total; 0 off Metal).</summary>
+        public static long MoeStagePrefetchHits()
+        {
+            try { return GgmlNative.TSGgml_MoeStagePrefetchHits(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Streamed MoE graphs that staged their routed experts into the one staging buffer without a
+        /// prefetch: a tiered layer's prompt-width overflow routes, or a prefetch miss (process total; 0 off Metal).</summary>
+        public static long MoeStageBorrows()
+        {
+            try { return GgmlNative.TSGgml_MoeStageBorrows(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Test hook: qwen4exp span steps whose QSA layers pooled only the blocks they completed (the pooled
+        /// keys kept between steps). -1 when the native library was built without the test hooks
+        /// (TENSORSHARP_GGML_NATIVE_BUILD_TESTS off, as in the release and CI builds).</summary>
+        public static long Qwen4ExpQsaIncrementalSteps()
+        {
+            try { return GgmlNative.TSGgml_Qwen4ExpQsaIncrementalSteps(); }
+            catch (EntryPointNotFoundException) { return -1; }
+        }
+
+        /// <summary>Test hook: decode / verify routes the route tail skip dropped in this process (missed experts routed
+        /// only at rank TS_MOE_ROUTE_TAIL_SKIP or lower; ggml_ops_moe_hot_tier.cpp). 0 when the hooks are not built.</summary>
+        public static long MoeTailSkippedRoutes()
+        {
+            try { return GgmlNative.TSGgml_MoeTailSkippedRoutes(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>DFlash feature taps for the following qwen4exp spans on this thread: after each
+        /// <paramref name="layers"/>[i] (a completed-output layer id), the mean of its hyper-connection
+        /// streams lands in row r of <paramref name="output"/> at column i * n_embd, rows
+        /// <paramref name="rowStride"/> floats apart. A null output turns the taps off.</summary>
+        public static unsafe bool Qwen4ExpSetFeatureTaps(int[] layers, IntPtr output, int rowStride)
+        {
+            fixed (int* l = layers)
+                return GgmlNative.TSGgml_Qwen4ExpSetFeatureTaps((IntPtr)l, layers?.Length ?? 0, output, rowStride) != 0;
+        }
+
+        /// <summary>Commit the state after <paramref name="row"/> of the last captured
+        /// <paramref name="rows"/>-row verify into the live state buffers.</summary>
+        public static bool Qwen4ExpCommitVerifyRow(int row, int rows) => GgmlNative.TSGgml_Qwen4ExpCommitVerifyRow(row, rows) != 0;
+
+        /// <summary>Bytes held by qwen4exp's verify row buffers (one set shared by every holder); 0 when the native
+        /// library predates the counter.</summary>
+        public static long Qwen4ExpRowBufferBytes()
+        {
+            try { return GgmlNative.TSGgml_Qwen4ExpRowBufferBytes(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Copy <paramref name="experts"/> of one host-offloaded MoE layer (its
+        /// mapped gate/up/down stacks) into a compact accelerator tier; the layer's
+        /// graphs then run those routes on the accelerator and the rest on the host.
+        /// Register before the first graph that uses the layer is built.</summary>
+        public static unsafe bool MoeHotTierRegister(IntPtr gate, IntPtr up, IntPtr down,
+            int gateType, int upType, int downType, long gateBytes, long upBytes, long downBytes,
+            int numExperts, ReadOnlySpan<int> experts, int windowSlots, bool releaseSourcePages)
+        {
+            fixed (int* p = experts)
+                return GgmlNative.TSGgml_MoeHotTierRegister(gate, up, down, gateType, upType, downType,
+                    gateBytes, upBytes, downBytes, numExperts, p, experts.Length, windowSlots,
+                    releaseSourcePages ? 1 : 0) != 0;
+        }
+
+        /// <summary>(slot hits, window misses read from disk, routes left to the host) over
+        /// every accelerator expert tier.</summary>
+        /// <summary>Summed over every tier: slot hits, window reads, steps with routes
+        /// left for the host, and window reads done in the background (verify overlap).</summary>
+        public static unsafe (long Hits, long Misses, long Overflow, long Deferred) MoeHotTierStats()
+        {
+            long* s = stackalloc long[4];
+            GgmlNative.TSGgml_MoeHotTierStats(s);
+            return (s[0], s[1], s[2], s[3]);
+        }
+
+        public static long MoeHotTierTotalBytes() => GgmlNative.TSGgml_MoeHotTierTotalBytes();
+
+        /// <summary>Strata's read-ahead into the tiers' windows since the process started: experts read ahead from
+        /// the next layer's predicted routing, those a route then used, and reads that failed
+        /// (<c>TS_MOE_TIER_PREFETCH</c>).</summary>
+        public static unsafe (long Reads, long Hits, long Failed) MoeTierPrefetchStats()
+        {
+            long* s = stackalloc long[3];
+            GgmlNative.TSGgml_MoeTierPrefetchStats(s);
+            return (s[0], s[1], s[2]);
+        }
+
+        /// <summary>Free the accelerator tier of the layer mapped at <paramref name="gate"/>
+        /// (<see cref="IntPtr.Zero"/>: all). Drop the graphs that bind it first.</summary>
+        public static void MoeHotTierRelease(IntPtr gate) => GgmlNative.TSGgml_MoeHotTierRelease(gate);
+
+        /// <summary>Routed-id counts the host seams saw for the layer whose gate stack is
+        /// mapped at <paramref name="gate"/>; null when it never reached a seam.</summary>
+        public static unsafe ulong[] MoeRoutingCounts(IntPtr gate)
+        {
+            int n = GgmlNative.TSGgml_MoeRoutingCounts(gate, null, 0);
+            if (n <= 0) return null;
+            var counts = new ulong[n];
+            fixed (ulong* p = counts)
+                n = GgmlNative.TSGgml_MoeRoutingCounts(gate, p, counts.Length);
+            return n == counts.Length ? counts : null;
+        }
+
+        public static void MoeRoutingReset(IntPtr gate) => GgmlNative.TSGgml_MoeRoutingReset(gate);
+
+        /// <summary>Count the router ids of accelerator-resident MoE layers too (they have no
+        /// host seam). Process-wide; the counters stay keyed by each layer's mapped gate stack.</summary>
+        public static void MoeRoutingRecordDevice(bool on) => GgmlNative.TSGgml_MoeRoutingRecordDevice(on ? 1 : 0);
+
+        /// <summary>Serve host-offloaded experts mapped inside [<paramref name="baseAddress"/>,
+        /// +<paramref name="length"/>) - a read-only mapping of <paramref name="path"/> from
+        /// offset 0 - from the explicitly read host expert cache.</summary>
+        public static bool HostExpertIoRegister(IntPtr baseAddress, long length, string path)
+            => GgmlNative.TSGgml_HostExpertIoRegister(baseAddress, length, path) != 0;
+
+        /// <summary>Byte budget of the host expert cache; 0 turns it off.</summary>
+        public static void HostExpertIoSetBudget(long bytes) => GgmlNative.TSGgml_HostExpertIoSetBudget(bytes);
+
+        /// <summary>Bytes macOS can give now without compressing or swapping anything (free,
+        /// purgeable and clean file-cache pages); -1 where it is not measured.</summary>
+        public static long HostAvailableMemoryBytes() => GgmlNative.TSGgml_HostAvailableMemoryBytes();
+
+        /// <summary>Frees the idle arenas the graph slots keep for their next build (Metal) and returns the bytes freed;
+        /// 0 when there were none or the native library predates the export.</summary>
+        public static long ReleaseKeptArenas()
+        {
+            try { return GgmlNative.TSGgml_ReleaseKeptArenas(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Process totals of MoE expert offload (TSGgml_MoeOffloadCounters): tier hits, window reads, host
+        /// overflow routes, background reads, adaptive swaps, host kernel ns, host kernel calls, host-computed slots,
+        /// explicit expert I/O bytes. Monotonic; touches no backend.</summary>
+        public static unsafe long[] MoeOffloadCounters()
+        {
+            var values = new long[9];
+            fixed (long* p = values)
+                GgmlNative.TSGgml_MoeOffloadCounters(p, values.Length);
+            return values;
+        }
+
+        /// <summary>Routed experts of up to 8 independent rows on the host, from expert stacks of
+        /// <paramref name="numExperts"/> experts (ggml's CPU dot products, as an offloaded layer computes them).
+        /// Slots with <paramref name="skip"/>[k] != 0 are left out. False for a shape or type it does not cover.</summary>
+        public static unsafe bool HostExpertRows(IntPtr gate, IntPtr up, IntPtr down, int gateType, int upType, int downType,
+            int numExperts, int hidden, int nFf, int nUsed, int rows, float* x, int* ids, float* weights, byte* skip, float* output)
+            => GgmlNative.TSGgml_HostExpertRows(gate, up, down, gateType, upType, downType, numExperts, hidden, nFf, nUsed, rows,
+                x, ids, weights, skip, output) != 0;
+
+        public static void HostExpertIoUnregister(IntPtr baseAddress) => GgmlNative.TSGgml_HostExpertIoUnregister(baseAddress);
+
+        /// <summary>(hits, misses, bytes read, bytes held) of the host expert cache.</summary>
+        public static unsafe (long Hits, long Misses, long ReadBytes, long HeldBytes) HostExpertIoStats()
+        {
+            long* s = stackalloc long[4];
+            GgmlNative.TSGgml_HostExpertIoStats(s);
+            return (s[0], s[1], s[2], s[3]);
+        }
         public static bool Qwen4ExpStateSnapshotRestore(IntPtr handle)
             => GgmlNative.TSGgml_Qwen4ExpStateSnapshotRestore(handle) != 0;
         public static void Qwen4ExpStateSnapshotFree(IntPtr handle)

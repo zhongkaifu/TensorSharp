@@ -23,7 +23,7 @@ namespace TensorSharp.Models
     internal static class MappedTableWarm
     {
         private const long Block = 64L << 20;
-        private const long Headroom = 8L << 30;
+        internal const long Headroom = 8L << 30;
 
         /// <summary>
         /// Start reading <paramref name="ranges"/> (shard path, byte offset, byte count), or return null
@@ -52,16 +52,26 @@ namespace TensorSharp.Models
                 foreach (var (path, offset, length) in ranges)
                     for (long at = 0; at < length; at += Block)
                         blocks.Add((path, offset + at, Math.Min(Block, length - at)));
-                using var handles = new ThreadLocal<Dictionary<string, Microsoft.Win32.SafeHandles.SafeFileHandle>>(
-                    () => new Dictionary<string, Microsoft.Win32.SafeHandles.SafeFileHandle>(), trackAllValues: true);
+                // Every handle is opened before the first read: some FUSE mounts (geesefs) drop a
+                // file's whole page cache at each open(), so a worker opening its handle lazily
+                // threw away the blocks the others had just read.
+                const int Readers = 16;
+                var handles = new Dictionary<string, Microsoft.Win32.SafeHandles.SafeFileHandle[]>();
                 using var buffers = new ThreadLocal<byte[]>(() => new byte[Block]);
+                int next = 0;
                 try
                 {
-                    Parallel.ForEach(blocks, new ParallelOptions { MaxDegreeOfParallelism = 16, CancellationToken = cancel }, block =>
+                    foreach (var (path, _, _) in ranges)
+                        if (!handles.ContainsKey(path))
+                        {
+                            var pool = new Microsoft.Win32.SafeHandles.SafeFileHandle[Readers];
+                            handles[path] = pool;
+                            for (int i = 0; i < Readers; i++)
+                                pool[i] = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                        }
+                    Parallel.ForEach(blocks, new ParallelOptions { MaxDegreeOfParallelism = Readers, CancellationToken = cancel }, block =>
                     {
-                        var open = handles.Value;
-                        if (!open.TryGetValue(block.Path, out var handle))
-                            open[block.Path] = handle = File.OpenHandle(block.Path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                        var handle = handles[block.Path][(Interlocked.Increment(ref next) & int.MaxValue) % Readers];
                         RandomAccess.Read(handle, new Span<byte>(buffers.Value, 0, (int)block.Bytes), block.Offset);
                     });
                     Console.Error.WriteLine($"[{tag}] warmed {bytes / (double)(1L << 30):F1} GiB of {what} in {sw.Elapsed.TotalSeconds:F1}s");
@@ -73,15 +83,27 @@ namespace TensorSharp.Models
                 }
                 finally
                 {
-                    foreach (var open in handles.Values)
-                        foreach (var handle in open.Values)
-                            handle.Dispose();
+                    foreach (var pool in handles.Values)
+                        foreach (var handle in pool)
+                            handle?.Dispose();
                 }
             });
         }
 
-        /// <summary>MemAvailable from /proc/meminfo in bytes, or 0 where there is none.</summary>
+        /// <summary>Host memory a table could still occupy as page cache, in bytes, or 0 where
+        /// the platform reports none: MemAvailable from /proc/meminfo, capped by the process's
+        /// cgroup. A container sees the host's MemAvailable, which can be far more than its own
+        /// memory limit lets it cache.</summary>
         public static long HostMemoryAvailable()
+        {
+            long available = MemInfoAvailable();
+            long cgroup = CgroupMemoryAvailable();
+            if (cgroup > 0 && (available <= 0 || cgroup < available))
+                available = cgroup;
+            return available;
+        }
+
+        private static long MemInfoAvailable()
         {
             try
             {
@@ -96,6 +118,68 @@ namespace TensorSharp.Models
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
             return 0;
+        }
+
+        /// <summary>The cgroup's limit minus what it holds that the kernel cannot reclaim
+        /// (its usage less its file cache), or 0 without a limited memory cgroup. cgroup v2
+        /// (<c>memory.max</c>) and v1 (<c>memory.limit_in_bytes</c>).</summary>
+        internal static long CgroupMemoryAvailable()
+        {
+            try
+            {
+                string v2 = null, v1 = null;
+                if (File.Exists("/proc/self/cgroup"))
+                    foreach (string line in File.ReadLines("/proc/self/cgroup"))
+                    {
+                        if (line.StartsWith("0::", StringComparison.Ordinal)) v2 = line.Substring(3);
+                        else
+                        {
+                            string[] f = line.Split(':', 3);
+                            if (f.Length == 3 && Array.IndexOf(f[1].Split(','), "memory") >= 0) v1 = f[2];
+                        }
+                    }
+                foreach (string dir in Candidates("/sys/fs/cgroup", v2))
+                    if (TryCgroup(dir, "memory.max", "memory.current", "active_file", "inactive_file", out long a))
+                        return a;
+                foreach (string dir in Candidates("/sys/fs/cgroup/memory", v1))
+                    if (TryCgroup(dir, "memory.limit_in_bytes", "memory.usage_in_bytes", "total_active_file", "total_inactive_file", out long a))
+                        return a;
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            catch (FormatException) { }
+            return 0;
+        }
+
+        private static IEnumerable<string> Candidates(string root, string relative)
+        {
+            if (!string.IsNullOrEmpty(relative) && relative != "/")
+                yield return root + relative;
+            yield return root;
+        }
+
+        internal static bool TryCgroup(string dir, string limitFile, string usageFile, string activeKey, string inactiveKey,
+            out long available)
+        {
+            available = 0;
+            string limitPath = Path.Combine(dir, limitFile), usagePath = Path.Combine(dir, usageFile);
+            string statPath = Path.Combine(dir, "memory.stat");
+            if (!File.Exists(limitPath) || !File.Exists(usagePath) || !File.Exists(statPath))
+                return false;
+            string limitText = File.ReadAllText(limitPath).Trim();
+            // "max" (v2) or a page-rounded huge number (v1): no limit, the host figure stands.
+            if (limitText == "max" || !long.TryParse(limitText, out long limit) || limit <= 0 || limit >= (1L << 62))
+                return false;
+            long usage = long.Parse(File.ReadAllText(usagePath).Trim());
+            long cache = 0;
+            foreach (string line in File.ReadLines(statPath))
+            {
+                string[] kv = line.Split(' ', 2);
+                if (kv.Length == 2 && (kv[0] == activeKey || kv[0] == inactiveKey))
+                    cache += long.Parse(kv[1]);
+            }
+            available = Math.Max(1, limit - usage + cache);
+            return true;
         }
     }
 }

@@ -1260,7 +1260,7 @@ static ggml_guid_t tsg_dsv4_backend_guid()
     return &guid;
 }
 
-ggml_backend_t tsg_dsv4_fused_backend_init(ggml_backend_t cuda_backend)
+static ggml_backend_t tsg_dsv4_fused_backend_create(ggml_backend_t cuda_backend, bool may_fail)
 {
     if (!cuda_backend || !ggml_backend_is_cuda(cuda_backend))
     {
@@ -1274,7 +1274,12 @@ ggml_backend_t tsg_dsv4_fused_backend_init(ggml_backend_t cuda_backend)
     ctx->cuda_backend = cuda_backend;
     ctx->cuda_dev = ggml_backend_get_device(cuda_backend);
     ctx->cuda_buft = ggml_backend_get_default_buffer_type(cuda_backend);
-    ctx->matmul = tsg_matmul_cuda_init(cuda_backend);
+    ctx->matmul = may_fail ? tsg_matmul_cuda_try_init(cuda_backend) : tsg_matmul_cuda_init(cuda_backend);
+    if (!ctx->matmul)
+    {
+        delete ctx;
+        return nullptr;
+    }
     snprintf(ctx->name, sizeof(ctx->name), "TSDSV4-%d", ctx->device);
     snprintf(ctx->desc, sizeof(ctx->desc), "TensorSharp DSV4 fused ops (CUDA%d)", ctx->device);
 
@@ -1294,4 +1299,14 @@ ggml_backend_t tsg_dsv4_fused_backend_init(ggml_backend_t cuda_backend)
         /* .context = */ ctx,
     };
     return backend;
+}
+
+ggml_backend_t tsg_dsv4_fused_backend_init(ggml_backend_t cuda_backend)
+{
+    return tsg_dsv4_fused_backend_create(cuda_backend, false);
+}
+
+ggml_backend_t tsg_dsv4_fused_backend_try_init(ggml_backend_t cuda_backend)
+{
+    return tsg_dsv4_fused_backend_create(cuda_backend, true);
 }

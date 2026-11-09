@@ -363,6 +363,8 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500) { } // CUDA_ERROR_NOT_FOUND
             quantizeQ81SplitRowsF32 = module.GetFunction("ts_quantize_q8_1_split_rows_f32");
             dequantWeightF16 = module.GetFunction("ts_dequant_weight_f16");
+            try { module.GetFunction("ts_caps_q2_0_dequant"); DequantsQ2_0 = true; }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { }
             dequantWeightQ80F16 = module.GetFunction("ts_dequant_weight_q8_0_f16");
             convertF32F16 = module.GetFunction("ts_convert_f32_f16");
             convertF32Bf16 = module.GetFunction("ts_convert_f32_bf16");
@@ -934,6 +936,9 @@ namespace TensorSharp.Cuda
         /// <summary>Whether the int8 tensor-core Q8_0 GEMM (ts_quant_matmul_q8_0_mmq*_f32)
         /// computes anything here: below sm_80 its body compiles to nothing.</summary>
         public bool HasQ80Mmq => sm80KernelsUsable;
+
+        /// <summary>Whether ts_dequant_weight_f16 decodes Q2_0 (the module carries its marker).</summary>
+        public bool DequantsQ2_0 { get; }
 
         /// <summary>The SM architecture the code the driver loaded for this module was compiled
         /// for (0 = unknown; see <see cref="CudaModule.CompiledArchOf"/>).</summary>

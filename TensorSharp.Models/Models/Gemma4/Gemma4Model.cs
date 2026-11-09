@@ -203,6 +203,12 @@ namespace TensorSharp.Models
         private int[] _moeSelectedExpertsScratch;
         private int[] _moeTopKScratch;
 
+        /// <summary>Test seam: after <see cref="MoERoute"/> picks a row's experts, receives the
+        /// model, the forward's row count, the row and its routing margin (the smallest chosen
+        /// probability minus the largest unchosen one), so a verify test can tell a router
+        /// near-tie, which two paths' rounding may legitimately break differently, from a wrong row.</summary>
+        internal static Action<Gemma4Model, int, int, float> RouteMarginHookForTest;
+
         // Per-layer caches for the fused expert-batched MoE FFN kernel
         // (GgmlBasicOps.MoEFFNPrefill with GEGLU activation). These are
         // zero-cost views into the original 3D <c>ffn_{gate,up,down}_exps.weight</c>
@@ -5610,6 +5616,7 @@ namespace TensorSharp.Models
             if (selectedExperts == null || selectedExperts.Length < needed)
                 selectedExperts = _moeSelectedExpertsScratch = new int[needed];
             int[] topK = _moeTopKScratch;
+            var marginHook = RouteMarginHookForTest;
 
             for (int s = 0; s < seqLen; s++)
             {
@@ -5633,6 +5640,7 @@ namespace TensorSharp.Models
 
                 // O(n*k) top-k selection on the post-softmax probabilities.
                 TensorComputePrimitives.SelectTopKInPlace(row, numExperts, nUsed, topK);
+                marginHook?.Invoke(this, seqLen, s, RouteMargin(row, numExperts, topK, nUsed));
 
                 // Gather selected probabilities + renormalize over selected.
                 float selectedSum = 0f;
@@ -5653,6 +5661,18 @@ namespace TensorSharp.Models
             }
 
             return (routingWeights, selectedExperts);
+        }
+
+        /// <summary>The smallest chosen probability minus the largest unchosen one (only for <see cref="RouteMarginHookForTest"/>).</summary>
+        private static unsafe float RouteMargin(float* probabilities, int count, int[] chosen, int used)
+        {
+            float lowestChosen = float.PositiveInfinity, highestOther = float.NegativeInfinity;
+            for (int k = 0; k < used; k++)
+                lowestChosen = MathF.Min(lowestChosen, probabilities[chosen[k]]);
+            for (int i = 0; i < count; i++)
+                if (Array.IndexOf(chosen, i, 0, used) < 0)
+                    highestOther = MathF.Max(highestOther, probabilities[i]);
+            return lowestChosen - highestOther;
         }
 
         private unsafe void FuseQKVWeights()
