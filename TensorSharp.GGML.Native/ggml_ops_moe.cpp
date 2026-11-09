@@ -50,6 +50,7 @@ extern "C" int TSGgml_MoeOffloadCounters(long long* out, int capacity);
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <map>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -2931,6 +2932,7 @@ namespace tsg
         // segments (the segments themselves go to the node profile), so a prompt chunk's time is attributed.
         static thread_local double s_prof_device_op_ms = 0;
         static thread_local int s_prof_device_ops = 0;
+        static thread_local std::map<std::string, std::pair<double, int>> s_prof_device_by_name;
         struct ProfPassReport
         {
             bool on; int seq; pass_clock::time_point t0;
@@ -2940,8 +2942,11 @@ namespace tsg
                 std::fprintf(stderr, "[node-profile] host-MoE pass T=%d: %.1f ms wall, TS device ops %.1f ms over %d\n", seq,
                              std::chrono::duration<double, std::milli>(pass_clock::now() - t0).count(),
                              s_prof_device_op_ms, s_prof_device_ops);
+                for (const auto& kv : s_prof_device_by_name)
+                    std::fprintf(stderr, "    %-12s %8.1f ms over %d\n", kv.first.c_str(), kv.second.first, kv.second.second);
                 s_prof_device_op_ms = 0;
                 s_prof_device_ops = 0;
+                s_prof_device_by_name.clear();
             }
         } prof_report{graph_node_profile_enabled() && pass_seq >= 64, pass_seq, pass_clock::now()};
 
@@ -3008,9 +3013,18 @@ namespace tsg
                 }
                 if (prof)
                 {
+                    // The operation's own command buffers, which ggml's synchronize does not wait for: their GPU time
+                    // goes to the operation, not to the next segment's first node.
                     sync_backend(backend);
-                    s_prof_device_op_ms += ms_since(t_op);
+#if defined(TSG_GGML_USE_METAL)
+                    tsm::wait_last();
+#endif
+                    const double op_ms = ms_since(t_op);
+                    s_prof_device_op_ms += op_ms;
                     ++s_prof_device_ops;
+                    auto& by = s_prof_device_by_name[segments[seg].device_name ? segments[seg].device_name : "device op"];
+                    by.first += op_ms;
+                    ++by.second;
                 }
                 continue;
             }

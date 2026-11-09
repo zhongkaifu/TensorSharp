@@ -179,10 +179,11 @@ namespace
         // Whether t's memory is the residual region (a view of it counts).
         bool is_residual(const ggml_tensor* t) const { return t != nullptr && t->data == base + off_res; }
         void push(ggml_tensor* const* inputs, std::size_t n_inputs, std::initializer_list<ggml_tensor*> outputs, int layer,
-                  std::function<bool(ggml_backend_t)> op) const
+                  std::function<bool(ggml_backend_t)> op, const char* name = "device op") const
         {
             tsg::HostMoeSegment seg;
             seg.layer = layer;
+            seg.device_name = name;
             seg.seq_len = T;
             seg.device_inputs.assign(inputs, inputs + n_inputs);
             seg.device_outputs.assign(outputs.begin(), outputs.end());
@@ -1293,7 +1294,7 @@ static Q4eHcRead q4e_nodes_hc_read(ggml_context* ctx, ggml_tensor* res_in, ggml_
         ggml_tensor* inputs[] = { G, r.inject };
         ggml_tensor* mixed = r.mixed;
         dev->push(inputs, 2, {mixed}, g_q4e_dev_layer, [xn, G, mixed, n_embd, hc, T](ggml_backend_t backend) {
-            return tsm::hc_mix_encode(backend, xn, G, mixed, n_embd, hc, T); });
+            return tsm::hc_mix_encode(backend, xn, G, mixed, n_embd, hc, T); }, "hc mix");
         return r;
     }
 #endif
@@ -1338,7 +1339,7 @@ static ggml_tensor* q4e_nodes_hc_scatter(ggml_context* ctx, ggml_tensor* res3, g
         dev->bind(out, dev->off_res);
         ggml_tensor* inputs[] = { b };
         dev->push(inputs, 1, {out}, g_q4e_dev_layer, [res3, b, inject, out, n_embd, hc, T](ggml_backend_t backend) {
-            return tsm::hc_scatter_encode(backend, res3, b, inject, out, n_embd, hc, T); });
+            return tsm::hc_scatter_encode(backend, res3, b, inject, out, n_embd, hc, T); }, "hc scatter");
         return out;
     }
 #endif
@@ -1778,7 +1779,7 @@ ggml_tensor* q4e_nodes_gdn(
         io.conv_state = conv_state; io.ssm_state = ssm_state; io.y = y;
         io.T = T; io.h_k = n_k_heads; io.h_v = n_v_heads; io.channels = conv_dim; io.eps = eps;
         ggml_tensor* inputs[] = { qkv, z, beta_raw, alpha_raw };
-        dev->push(inputs, 4, {y}, g_q4e_dev_layer, [io](ggml_backend_t backend) { return tsm::gdn_prompt_encode(backend, io); });
+        dev->push(inputs, 4, {y}, g_q4e_dev_layer, [io](ggml_backend_t backend) { return tsm::gdn_prompt_encode(backend, io); }, "gdn");
         wb->device_y = y;
         out2 = y;
     }
@@ -2103,7 +2104,7 @@ ggml_tensor* q4e_nodes_attn(
         dev->push(inputs, 3, {out}, g_q4e_dev_layer,
             [q_attn, k_written, v_written, idx, cnt, mask_in, out, T, heads, kv_heads, cells, width, scale](ggml_backend_t backend) {
                 return tsm::qsa_attn_encode(backend, q_attn, k_written, v_written, idx, cnt, mask_in, out,
-                    T, heads, kv_heads, cells, width, scale); });
+                    T, heads, kv_heads, cells, width, scale); }, "qsa attn");
     }
 #endif
     else if (use_flash)

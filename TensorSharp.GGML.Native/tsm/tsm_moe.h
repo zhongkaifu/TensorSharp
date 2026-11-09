@@ -156,4 +156,6 @@ namespace tsm
     // Drops moe_mm_encode's scratch (~0.8 GB at a 4096-row chunk of Flash Next): called once a prompt pass is done, so
     // decode does not carry it.
     void moe_mm_release();
+    // Waits for the last command buffer a tsm encoder committed (ggml's synchronize does not cover them).
+    void wait_last();
 }

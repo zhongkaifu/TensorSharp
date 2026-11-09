@@ -1479,6 +1479,17 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
 
     long long moe_mm_count() { return g_moe_mm_count.load(std::memory_order_relaxed); }
 
+    void wait_last()
+    {
+        State& s = state();
+        id<MTLCommandBuffer> last = nil;
+        {
+            std::lock_guard<std::mutex> lock(s.mu);
+            last = s.last;
+        }
+        if (last != nil) [last waitUntilCompleted];
+    }
+
     void moe_mm_release()
     {
         State& s = state();

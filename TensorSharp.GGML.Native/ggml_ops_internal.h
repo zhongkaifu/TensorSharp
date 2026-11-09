@@ -979,6 +979,7 @@ namespace tsg
         // segment is submitted, before the next one, which reads what it writes (ggml_ops_qwen4exp.cpp's prompt GDN
         // layers on TensorSharp's Metal kernels). False with set_last_error on a failure.
         std::function<bool(ggml_backend_t)> device_op;
+        const char* device_name = "device op";   // what TS_GGML_NODE_PROFILE's prompt-pass report calls it
         std::vector<ggml_tensor*> device_inputs;
         // What it writes (tensors bound outside the allocator): no node before the cut may read them, which
         // host_moe_build_segment_ends checks - a node order that put a reader first would read stale values.

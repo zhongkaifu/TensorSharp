@@ -125,7 +125,7 @@ static ggml_tensor* q4e_nodes_qsa_mask(ggml_context* ctx, ggml_cgraph* graph,
         dev->push(inputs, 1, {lists ? idx : selected_mask, lists ? cnt : selected_mask}, g_q4e_dev_layer,
             [scores_mm, bias, cell_blocks, original_mask, selected_mask, idx, cnt, T, padded, B, H, width](ggml_backend_t backend) {
                 return tsm::qsa_select_encode(backend, scores_mm, bias, cell_blocks, original_mask, selected_mask,
-                    idx, cnt, T, padded, B, H, width); });
+                    idx, cnt, T, padded, B, H, width); }, "qsa select");
         if (sparse_width) *sparse_width = width;
         if (lists) { *sel_idx = idx; *sel_cnt = cnt; return original_mask; }
         return selected_mask;
