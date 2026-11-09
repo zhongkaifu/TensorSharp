@@ -297,7 +297,7 @@ namespace TensorSharp.Cuda
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
             int perSlotMaxRows, IntPtr stream, bool? fused = null,
             CudaExpertStage stage = null, in CudaExpertStageLayer stageLayer = default, IntPtr shDownReady = default,
-            bool keepStaged = false, IntPtr curQ81 = default, bool? q2i8 = null)
+            bool keepStaged = false, IntPtr curQ81 = default, bool? q2i8 = null, bool q80VecDecode = false)
         {
             if (PerSlotForTest)
                 perSlotMaxRows = int.MaxValue;
@@ -317,7 +317,7 @@ namespace TensorSharp.Cuda
                 dk.MoeStageCopy(stageLayer, stage, slots, stream);
             }
             RunExperts(dk, kernels, s, gate, up, down, cur, shDown, ffnOut, nt, nUsed, nExpert, e, ff, clamp,
-                perSlotMaxRows, stream, fused, shDownReady, curQ81, q2i8 ?? Q2_0ExpertsInt8);
+                perSlotMaxRows, stream, fused, shDownReady, curQ81, q2i8 ?? Q2_0ExpertsInt8, q80VecDecode);
             if (staging && !keep)
                 dk.MoeUnstage(stageLayer, stage, stream);
         }
@@ -365,7 +365,7 @@ namespace TensorSharp.Cuda
             in DeviceWeight gate, in DeviceWeight up, in DeviceWeight down,
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
             int perSlotMaxRows, IntPtr stream, bool? fused, IntPtr shDownReady = default, IntPtr curQ81 = default,
-            bool q2i8 = false)
+            bool q2i8 = false, bool q80VecDecode = false)
         {
             int guType = gate.Type, downType = down.Type;
             int slots = nt * nUsed;
@@ -384,10 +384,22 @@ namespace TensorSharp.Cuda
 
             if (perSlot)
             {
-                dk.MoeGateUpDecode(gate.Ptr, up.Ptr, given ? curQ81 : Dsv4CudaEngine.Ptr(s.ActQ8A), s.Sel, s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes,
-                    nt, nUsed, stream, gate.Table, up.Table);
+                // q80VecDecode: Q8_0 experts read a row as the dense Q8_0 matvec does (a caller opting in decodes
+                // differently in the last bits from the shared kernels), through the residency tables as they do.
+                IntPtr act = given ? curQ81 : Dsv4CudaEngine.Ptr(s.ActQ8A);
+                bool q80gu = q80VecDecode && dk.HasQ80VecDecode && guType == TQ8_0 && e % 32 == 0;
+                bool q80dn = q80VecDecode && dk.HasQ80VecDecode && downType == TQ8_0 && ff % 32 == 0;
+                if (q80gu)
+                    dk.MoeGateUpDecodeQ80Vec(gate.Ptr, up.Ptr, act, s.Sel, s.ExpGate, s.ExpUp, ff, e, gate.RowBytes,
+                        nt, nUsed, stream, gate.Table, up.Table);
+                else
+                    dk.MoeGateUpDecode(gate.Ptr, up.Ptr, act, s.Sel, s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes,
+                        nt, nUsed, stream, gate.Table, up.Table);
                 SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.ActQ8B, null, ff, slots, clamp, stream, fused);
-                dk.MoeDownDecode(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, downType, e, ff, down.RowBytes, slots, stream, down.Table);
+                if (q80dn)
+                    dk.MoeDownDecodeQ80Vec(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, e, ff, down.RowBytes, slots, stream, down.Table);
+                else
+                    dk.MoeDownDecode(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, downType, e, ff, down.RowBytes, slots, stream, down.Table);
                 // A shared expert computed on another stream (a fork in the caller's step) joins here, where its output is read.
                 if (shDownReady != IntPtr.Zero)
                     CudaDriverApi.cuStreamWaitEvent(stream, shDownReady, 0).ThrowOnError();

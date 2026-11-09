@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
@@ -464,6 +465,59 @@ public class BatchedExecutorTests
         Assert.Equal(baseline.outputs.Count, declined.outputs.Count);
         for (int i = 0; i < baseline.outputs.Count; i++)
             Assert.Equal(baseline.outputs[i], declined.outputs[i]);
+    }
+
+    /// <summary>
+    /// A batched decode step samples its rows in parallel, each sequence with its own sampler: six
+    /// sequences with seeds of their own draw exactly what they draw one after another, and their draws
+    /// differ from each other (each sampler stayed with its own sequence).
+    /// </summary>
+    [Fact]
+    public async Task BatchExecutor_ParallelSampling_DrawsWhatSerialSamplingDraws()
+    {
+        static SamplingConfig Seeded(int seed) => new()
+        {
+            Temperature = 1f,
+            TopK = 4,
+            TopP = 1f,
+            MinP = 0f,
+            RepetitionPenalty = 1f,
+            PresencePenalty = 0f,
+            FrequencyPenalty = 0f,
+            Seed = seed,
+        };
+
+        static async Task<List<int[]>> RunAsync(bool parallel, string fingerprint)
+        {
+            bool saved = BatchExecutor.ParallelSampling;
+            BatchExecutor.ParallelSampling = parallel;
+            try
+            {
+                var model = new PerSeqFusedStubModel(fingerprint, canBatchDecode: true, samplingLogits: true);
+                using var engine = new InferenceEngine(model, SmallConfig(), NullLogger.Instance);
+                var sequences = Enumerable.Range(0, 6)
+                    .Select(i => new SequenceState($"{fingerprint}-{i}",
+                        Enumerable.Range(1, 4).ToList(), maxNewTokens: 24,
+                        BlockSize, Seeded(1729 + 31 * i)))
+                    .ToList();
+                var handles = sequences.Select(seq => engine.SubmitRequest(seq)).ToList();
+                foreach (var handle in handles)
+                    await handle.Completion.WaitAsync(TimeSpan.FromSeconds(10));
+                return sequences.Select(s => s.OutputTokens.ToArray()).ToList();
+            }
+            finally { BatchExecutor.ParallelSampling = saved; }
+        }
+
+        var serial = await RunAsync(parallel: false, "sample-serial");
+        long before = Interlocked.Read(ref BatchExecutor.ParallelSampledSteps);
+        var parallel = await RunAsync(parallel: true, "sample-parallel");
+        Assert.True(Interlocked.Read(ref BatchExecutor.ParallelSampledSteps) > before,
+            "no batched step sampled its rows in parallel");
+        Assert.Equal(serial.Count, parallel.Count);
+        for (int i = 0; i < serial.Count; i++)
+            Assert.Equal(serial[i], parallel[i]);
+        Assert.True(serial.Select(o => string.Join(",", o)).Distinct().Count() > 1,
+            "the seeds gave every sequence the same draws, so a mixed-up sampler would go unseen");
     }
 
     [Theory]

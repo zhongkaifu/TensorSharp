@@ -1443,7 +1443,8 @@ namespace TensorSharp.Cuda
             CudaMoe.Experts(dev.DK, dev.Alloc.Kernels, dev.Moe, L.GateExps, L.UpExps, L.DownExps,
                 dev.Cur, dev.ShDown, dev.BlockOut, nt, m.NExpertUsed, m.NExpert, e, m.NFfExp, 0f,
                 PerSlotMaxRows, dev.Stream, stage: host ? null : _promptStage ?? _expertStage, stageLayer: L.Stage,
-                shDownReady: fork ? dev.ShJoinEv : IntPtr.Zero, keepStaged: _groupedPrompt, curQ81: curQ);
+                shDownReady: fork ? dev.ShJoinEv : IntPtr.Zero, keepStaged: _groupedPrompt, curQ81: curQ,
+                q80VecDecode: ExpertVecDecode);
             if (host)
             {
                 // The GPU's own experts end here; what follows is the wait for the CPU's share.
