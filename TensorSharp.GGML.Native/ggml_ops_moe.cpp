@@ -2768,6 +2768,21 @@ namespace tsg
         host_read_barrier();
         if (!tsm::seams_begin(backend, n_seams))
             return false;
+        // One command buffer per segment (TS_METAL_SEAM_N_CB, default 0 extra): the segments are enqueued two ahead,
+        // so a second encoding thread hides nothing here, and ggml-metal's split of each ~120-node segment at node 64
+        // fell between a GDN layer's delta net and its state write-back - ggml-metal's GDN cache fusion, which writes
+        // the state straight into the cache, cannot cross a command buffer. One-row passes -1.9 ms on Flash Next
+        // (M5 Pro); verify widths keep every row's state, which that fusion does not cover, so they are unchanged.
+        static const int seam_n_cb = [] {
+            const char* e = std::getenv("TS_METAL_SEAM_N_CB");
+            return e != nullptr && e[0] != '\0' ? std::atoi(e) : 0;
+        }();
+        struct CommandBuffers
+        {
+            ggml_backend_t b;
+            ~CommandBuffers() { metal_set_extra_command_buffers(b, 1); }   // the backend's own setting
+        } restore_command_buffers{backend};
+        metal_set_extra_command_buffers(backend, seam_n_cb);
         int enqueued = 0;   // chunks enqueued: chunk c = [seg_end[c-1], seg_end[c]), followed by seam c when c < n_seams
         auto enqueue_next = [&]() -> bool {
             const int c = enqueued;

@@ -17,6 +17,7 @@
 
 #if defined(TSG_GGML_USE_METAL)
 #include "ggml-backend-impl.h"
+#include "ggml-metal/ggml-metal-context.h"   // ggml_metal_set_n_cb (metal_set_extra_command_buffers)
 #endif
 
 #if defined(__APPLE__) || defined(__linux__)
@@ -823,6 +824,17 @@ namespace tsg
     {
         return op != nullptr && g_backend != nullptr && ggml_backend_supports_op(g_backend, op);
     }
+
+#if defined(TSG_GGML_USE_METAL)
+    // ggml-metal encodes a graph on the calling thread's command buffer plus n extra ones (the backend starts with 1:
+    // the caller encodes MAX(64, n_nodes/10) nodes and commits while a second thread encodes the rest). Not exported
+    // by the backend interface; ggml-metal's own context function, ggml unchanged.
+    void metal_set_extra_command_buffers(ggml_backend_t backend, int n)
+    {
+        if (backend != nullptr && ggml_backend_is_metal(backend))
+            ggml_metal_set_n_cb(static_cast<ggml_metal_t>(backend->context), n);
+    }
+#endif
 
     // --- Size / layout queries ---
 

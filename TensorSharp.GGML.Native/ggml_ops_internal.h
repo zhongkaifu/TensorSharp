@@ -1361,6 +1361,9 @@ namespace tsg
     // gap needs before anything is rewritten.
     bool graph_node_profile_enabled();
     ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag);
+#if defined(TSG_GGML_USE_METAL)
+    void metal_set_extra_command_buffers(ggml_backend_t backend, int n);
+#endif
 
     // Platform convolution offload for the VAEs (MPSGraph on Metal, cuDNN on
     // CUDA). ggml lowers conv2d to im2col + mul_mat, which dominates a VAE graph
