@@ -117,7 +117,9 @@ namespace tsg
             const int n = std::atoi(e);
             if (n >= 0) return n;
         }
-        return tier.cpu_visible && tier.count > tier.fixed ? kHostMoeHotTierWindowMaxRows : kHostMoeHotTierMaxRows;
+        if (tier.cpu_visible && tier.count > tier.fixed) return kHostMoeHotTierWindowMaxRows;
+        // Up to where streaming starts, so no span width falls between the two paths onto the host.
+        return std::max(kHostMoeHotTierMaxRows, moe_stream_rows_threshold() - 1);
     }
 
     MoeHotTier* moe_hot_tier_find(const void* gate_source)

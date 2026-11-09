@@ -1147,7 +1147,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                 for (int i = 0; i < ggml_graph_n_nodes(e.graph); ++i)
                 {
                     if (ggml_graph_node(e.graph, i)->op != GGML_OP_CUSTOM) continue;
-                    e.precise_backend = tsg_dsv4_fused_backend_init(g_backend);
+                    e.precise_backend = tsg_dsv4_fused_backend_try_init(g_backend);
                     if (e.precise_backend == nullptr)
                         return abort_build("precise backend creation failed.");
                     break;

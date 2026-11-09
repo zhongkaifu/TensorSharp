@@ -1110,9 +1110,15 @@ namespace tsg
     // 3500 tokens: 1.76-2.0 / 2.7 / 5.2 s against 1.33-1.55 / 2.55 / 5.1-5.3 s.
     constexpr int kHostMoeHotTierWindowMaxRows = 2048;
     // The widest span `tier` still splits: TS_HOST_MOE_TIER_MAX_ROWS, else kHostMoeHotTierWindowMaxRows for a
-    // host-writable tier with window slots and kHostMoeHotTierMaxRows otherwise (a discrete GPU's tier has no window,
-    // so a wide span's misses would all run on the host). A wider span streams the layer. Read per graph build.
+    // host-writable tier with window slots, and otherwise (a discrete GPU's tier has no window, so a wide span's misses
+    // run on the host) the span width just below the one the seam starts streaming at (moe_stream_rows_threshold),
+    // and never below kHostMoeHotTierMaxRows. A span the tier does not split and the seam does not stream runs every
+    // route on the host: with the split ending at 64 rows and streaming starting at 128, ggml_cuda Flash Next spent
+    // 1.1-1.4 s on a 73-76 token prompt (0.27-0.29 s at 64) and 2.2 s on 120 tokens; split up to 127 rows, 0.55-0.77 s.
+    // A wider span streams the layer. Read per graph build.
     int host_moe_tier_max_rows(const MoeHotTier& tier);
+    // The span width from which an offloaded MoE layer streams its routed experts to the accelerator.
+    int moe_stream_rows_threshold();
     bool host_expert_io_active();
     void host_expert_io_on_drop(const void* ptr);
     void host_expert_io_release();

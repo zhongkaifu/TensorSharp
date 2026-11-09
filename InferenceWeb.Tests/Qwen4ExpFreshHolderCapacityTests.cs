@@ -10,10 +10,11 @@ namespace InferenceWeb.Tests;
 /// <summary>
 /// An explicit MAX_CONTEXT allocates the whole window up front, which every concurrent request's holder paid
 /// again: on Flash Next at 32768 each live conversation took ~1.6 GB of a Mac's memory for a 29-token prompt,
-/// and Strata's 4-at-once rounds ran 20-50% slower per step under the pressure. On Metal a request's holder now
-/// starts at <see cref="Qwen4ExpModel.MetalFreshHolderTokens"/> rows and grows with its request; the primary
-/// keeps the whole window, an explicit TS_KV_INITIAL_TOKENS sizes both, and a holder that grew answers bit for
-/// bit as the whole-window primary does.
+/// and Strata's 4-at-once rounds ran 20-50% slower per step under the pressure. On ggml_cuda at 131072 it was
+/// 3.6 GB of VRAM a request, and the fourth concurrent request aborted the server. On Metal and ggml_cuda a
+/// request's holder now starts at <see cref="Qwen4ExpModel.MetalFreshHolderTokens"/> rows and grows with its
+/// request; the primary keeps the whole window, an explicit TS_KV_INITIAL_TOKENS sizes both, and a holder that
+/// grew answers bit for bit as the whole-window primary does.
 /// </summary>
 public sealed class Qwen4ExpFreshHolderCapacityTests : IDisposable
 {
@@ -47,10 +48,23 @@ public sealed class Qwen4ExpFreshHolderCapacityTests : IDisposable
 
     [GgmlFact(BackendType.GgmlMetal)]
     public void AFreshHolderStartsSmall_GrowsWithItsPrompt_AndAnswersAsTheWholeWindowPrimary()
+        => StartsSmallGrowsAndAnswersAsThePrimary(BackendType.GgmlMetal);
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void OnGgmlCuda_AFreshHolderStartsSmall_GrowsWithItsPrompt_AndAnswersAsTheWholeWindowPrimary()
+        => StartsSmallGrowsAndAnswersAsThePrimary(BackendType.GgmlCuda);
+
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void AnExplicitInitialSize_SizesTheHoldersToo() => ExplicitInitialSizeSizesTheHolders(BackendType.GgmlMetal);
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void OnGgmlCuda_AnExplicitInitialSize_SizesTheHoldersToo() => ExplicitInitialSizeSizesTheHolders(BackendType.GgmlCuda);
+
+    private void StartsSmallGrowsAndAnswersAsThePrimary(BackendType backend)
     {
         string path = Model();
         float[] primary;
-        using (var reference = (Qwen4ExpModel)ModelBase.Create(path, BackendType.GgmlMetal))
+        using (var reference = (Qwen4ExpModel)ModelBase.Create(path, backend))
         {
             Assert.Equal(Context, reference.KvCacheCapacity);
             reference.ResetKVCache();
@@ -58,7 +72,7 @@ public sealed class Qwen4ExpFreshHolderCapacityTests : IDisposable
             primary = (float[])reference.Forward(new[] { Next }).Clone();
         }
 
-        using var model = (Qwen4ExpModel)ModelBase.Create(path, BackendType.GgmlMetal);
+        using var model = (Qwen4ExpModel)ModelBase.Create(path, backend);
         var fused = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
         Assert.Equal(Context, model.KvCacheCapacity);
         fused.BindSequenceCache("a");
@@ -69,15 +83,14 @@ public sealed class Qwen4ExpFreshHolderCapacityTests : IDisposable
 
         double maxDiff = 0;
         for (int i = 0; i < holder.Length; i++) maxDiff = Math.Max(maxDiff, Math.Abs(holder[i] - primary[i]));
-        _output.WriteLine($"grew to {model.KvCacheCapacity} rows; max |holder - primary| = {maxDiff:E3}");
+        _output.WriteLine($"{backend}: grew to {model.KvCacheCapacity} rows; max |holder - primary| = {maxDiff:E3}");
         Assert.True(holder.AsSpan().SequenceEqual(primary), $"the grown holder answers {maxDiff:E3} away from the whole-window primary");
     }
 
-    [GgmlFact(BackendType.GgmlMetal)]
-    public void AnExplicitInitialSize_SizesTheHoldersToo()
+    private void ExplicitInitialSizeSizesTheHolders(BackendType backend)
     {
         _env.Set("TS_KV_INITIAL_TOKENS", "4096");
-        using var model = (Qwen4ExpModel)ModelBase.Create(Model(), BackendType.GgmlMetal);
+        using var model = (Qwen4ExpModel)ModelBase.Create(Model(), backend);
         Assert.Equal(4096, model.KvCacheCapacity);
         ((IBatchedPagedModel)model).BindSequenceCache("a");
         Assert.Equal(4096, model.KvCacheCapacity);

@@ -2243,6 +2243,7 @@ namespace
 
 namespace tsg
 {
+    int moe_stream_rows_threshold() { return moe_offload_stream_batch_threshold(); }
     bool moe_stage_prefetch_enabled() { return stage_prefetch_enabled_impl(); }
     void moe_stage_prefetch_start(const HostMoeSegment& hm) { stage_prefetch_start_impl(hm); }
     void moe_stage_prefetch_join() { stage_prefetch_join_impl(); }
