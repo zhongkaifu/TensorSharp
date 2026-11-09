@@ -173,13 +173,20 @@ struct Model {
     }
 };
 
-// One sequence's ring, filled by the DFlash inject (the same pass A+B DSpine uses).
+// One sequence's ring, filled by the DFlash inject (the same pass A+B DSpine uses). Zeroed floats aligned to 16 KB
+// (a Metal page), as the allocator's tensors are: the inject writes a ring in place only where the backend can wrap
+// its host pointer, std::vector's 16-byte alignment is below what the CPU buffer type needs, and the inject declines
+// such a ring (glibc's large allocations are 16 bytes past a page, so this failed on Linux CPU and not on macOS).
 struct Ring {
-    std::vector<std::vector<float>> k, v;
-    std::vector<void*> kp, vp;
+    std::vector<std::vector<float>> k, v;   // storage, over-allocated by 16 KB
+    std::vector<void*> kp, vp;              // the aligned rings inside it
     int filled = 0;
-    explicit Ring(const Config& c) : k(c.L, std::vector<float>(std::size_t(c.RING) * c.NKV * c.HD)), v(k), kp(c.L), vp(c.L) {
-        for (int l = 0; l < c.L; ++l) { kp[l] = k[l].data(); vp[l] = v[l].data(); }
+    explicit Ring(const Config& c)
+        : k(c.L, std::vector<float>(std::size_t(c.RING) * c.NKV * c.HD + 16384 / sizeof(float))), v(k), kp(c.L), vp(c.L) {
+        auto aligned = [](std::vector<float>& s) {
+            return reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>(s.data()) + 16383) & ~std::uintptr_t(16383));
+        };
+        for (int l = 0; l < c.L; ++l) { kp[l] = aligned(k[l]); vp[l] = aligned(v[l]); }
     }
     std::vector<int> slot_map(int rows) const {
         std::vector<int> map(rows, -1);

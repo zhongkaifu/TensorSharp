@@ -244,10 +244,12 @@ namespace
         std::vector<const void*> cached_keys;   // the cache keys a persisted graph must hold (PersistedBindings)
         ggml_backend_dev_t dev = nullptr;
 
-        void bind(ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
+        // True when `t` is bound in place: to the cached device copy of `data` or to `data` itself. False when it
+        // is queued for an upload into graph storage, where anything the graph writes to it never reaches `data`.
+        bool bind(ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
                   enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
         {
-            if (t == nullptr || data == nullptr) return;
+            if (t == nullptr || data == nullptr) return false;
             if (cacheable && bytes >= 4096)
             {
                 bool needs_upload = false;
@@ -255,7 +257,7 @@ namespace
                 {
                     if (needs_upload) { uploads.push_back({ t, data, bytes }); fresh.push_back(data); }
                     cached_keys.push_back(data);
-                    return;
+                    return true;
                 }
             }
             if (bytes >= 4096)
@@ -267,11 +269,28 @@ namespace
                     if (ggml_backend_tensor_alloc(buf, t, data) == GGML_STATUS_SUCCESS)
                     {
                         if (cacheable) cached_keys.push_back(data);
-                        return;
+                        return true;
                     }
                 }
             }
             uploads.push_back({ t, data, bytes });
+            return false;
+        }
+
+        // An inject's ring: the rows it writes must land in the ring. A ring that binds neither way (on CPU, a host
+        // pointer below the buffer type's alignment) would take them in a graph-local copy and drop them, leaving
+        // the drafter reading stale rows with no error, so the inject declines and says why.
+        bool bind_ring(ggml_tensor* t, void* data, std::size_t bytes, int layer, const char* what)
+        {
+            if (bind(t, data, bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE)) return true;
+            char msg[384];
+            std::snprintf(msg, sizeof msg,
+                "%s: the ring of layer %d (%p, %zu bytes) cannot be written in place on this backend (neither a "
+                "device copy nor a host pointer it can wrap, which needs %zu-byte alignment and at least 4096 bytes); "
+                "the rows would be lost.",
+                what, layer, data, bytes, get_host_ptr_alignment(g_backend, dev));
+            set_last_error(msg);
+            return false;
         }
 
         void flush()
@@ -576,14 +595,21 @@ static int df_inject_one(
         binder.bind(enc_norm_t, const_cast<void*>(enc_norm_data),
                     static_cast<std::size_t>(hidden_size) * sizeof(float), true);
         const std::size_t ring_bytes = kv_cache_bytes(num_kv_heads, ring_rows, head_dim, ring_dtype);
-        for (int l = 0; l < num_layers; l++)
+        bool rings_in_place = true;
+        for (int l = 0; l < num_layers && rings_in_place; l++)
         {
             auto& lt = layers[l];
             binder.bind(lt.k_w, k_arr[l], static_cast<std::size_t>(k_bytes_arr[l]), true);
             binder.bind(lt.v_w, v_arr[l], static_cast<std::size_t>(v_bytes_arr[l]), true);
             binder.bind(lt.k_norm_w, k_norm_arr[l], static_cast<std::size_t>(head_dim) * sizeof(float), true);
-            binder.bind(lt.ring_k, ring_k_arr[l], ring_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-            binder.bind(lt.ring_v, ring_v_arr[l], ring_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            rings_in_place = binder.bind_ring(lt.ring_k, ring_k_arr[l], ring_bytes, l, "DFlash inject")
+                && binder.bind_ring(lt.ring_v, ring_v_arr[l], ring_bytes, l, "DFlash inject");
+        }
+        if (!rings_in_place)
+        {
+            binder.abandon();
+            if (can_persist) ggml_free(ctx);
+            return 0;
         }
 
         // Metal: reorder for encoder concurrency before allocation (no-op on
@@ -915,18 +941,25 @@ static int df_inject_batched(
         binder.bind(enc_norm_t, const_cast<void*>(enc_norm_data),
                     static_cast<std::size_t>(hidden_size) * sizeof(float), true);
         const std::size_t ring_bytes = kv_cache_bytes(num_kv_heads, ring_rows, head_dim, ring_dtype);
-        for (int l = 0; l < num_layers; l++)
+        bool rings_in_place = true;
+        for (int l = 0; l < num_layers && rings_in_place; l++)
         {
             auto& lt = layers[l];
             binder.bind(lt.k_w, k_arr[l], static_cast<std::size_t>(k_bytes_arr[l]), true);
             binder.bind(lt.v_w, v_arr[l], static_cast<std::size_t>(v_bytes_arr[l]), true);
             binder.bind(lt.k_norm_w, k_norm_arr[l], static_cast<std::size_t>(head_dim) * sizeof(float), true);
-            for (int lane = 0; lane < L; lane++)
+            for (int lane = 0; lane < L && rings_in_place; lane++)
             {
                 const std::size_t ix = static_cast<std::size_t>(lane) * num_layers + l;
-                binder.bind(ring_k[ix], ring_k_arr[ix], ring_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-                binder.bind(ring_v[ix], ring_v_arr[ix], ring_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                rings_in_place = binder.bind_ring(ring_k[ix], ring_k_arr[ix], ring_bytes, l, "DFlash batched inject")
+                    && binder.bind_ring(ring_v[ix], ring_v_arr[ix], ring_bytes, l, "DFlash batched inject");
             }
+        }
+        if (!rings_in_place)
+        {
+            binder.abandon();
+            ggml_free(ctx);
+            return 0;
         }
 
         ggml_backend_buffer_t persist_buf = df_test_fail_alloc() ? nullptr : ggml_backend_alloc_ctx_tensors(ctx, g_backend);

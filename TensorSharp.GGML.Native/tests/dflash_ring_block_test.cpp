@@ -126,14 +126,20 @@ struct Weights {
     }
 };
 
-// One sequence on its own ring: the injected frontier, the slot map, and the ring rows.
+// One sequence on its own ring: the injected frontier, the slot map, and the ring rows. The rings are page-aligned
+// zeroed floats, as the allocator's tensors are: the inject writes a ring in place only where the backend can wrap its
+// host pointer, and std::vector's 16-byte alignment is below what the CPU buffer type needs.
 struct Lane {
-    std::vector<std::vector<float>> rk, rv;
-    std::vector<void*> ringk, ringv;
+    std::vector<std::vector<float>> rk, rv;   // storage, over-allocated by a page
+    std::vector<void*> ringk, ringv;          // the page-aligned rings inside it
     int filled = 0;
     std::uint32_t seed;
-    explicit Lane(std::uint32_t s) : rk(N, std::vector<float>(std::size_t(RING) * HD * NKV)), rv(rk), ringk(N), ringv(N), seed(s) {
-        for (int l = 0; l < N; ++l) { ringk[l] = rk[l].data(); ringv[l] = rv[l].data(); }
+    explicit Lane(std::uint32_t s)
+        : rk(N, std::vector<float>(std::size_t(RING) * HD * NKV + 16384 / sizeof(float))), rv(rk), ringk(N), ringv(N), seed(s) {
+        auto aligned = [](std::vector<float>& v) {
+            return reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>(v.data()) + 16383) & ~std::uintptr_t(16383));
+        };
+        for (int l = 0; l < N; ++l) { ringk[l] = aligned(rk[l]); ringv[l] = aligned(rv[l]); }
     }
     std::vector<int> slot_map() const {
         std::vector<int> map(RING, -1);
@@ -219,13 +225,14 @@ int draft_one(Weights& w, Lane& lane, const std::vector<int>& tokens, bool selec
 // The ring rows a window at or after the frontier can read: positions [filled - SW, filled).
 std::vector<float> live_rows(Lane& lane) {
     std::vector<float> rows;
+    const std::size_t ring_bytes = std::size_t(RING) * HD * NKV * sizeof(float);
     for (int l = 0; l < N; ++l) {
-        TSGgml_SyncHostBuffer(lane.rk[l].data(), lane.rk[l].size() * sizeof(float));
-        TSGgml_SyncHostBuffer(lane.rv[l].data(), lane.rv[l].size() * sizeof(float));
+        TSGgml_SyncHostBuffer(lane.ringk[l], ring_bytes);
+        TSGgml_SyncHostBuffer(lane.ringv[l], ring_bytes);
         for (int p = std::max(0, lane.filled - SW); p < lane.filled; ++p)
             for (int h = 0; h < NKV; ++h) {
-                const float* k = lane.rk[l].data() + (std::size_t(h) * RING + p % RING) * HD;
-                const float* v = lane.rv[l].data() + (std::size_t(h) * RING + p % RING) * HD;
+                const float* k = static_cast<const float*>(lane.ringk[l]) + (std::size_t(h) * RING + p % RING) * HD;
+                const float* v = static_cast<const float*>(lane.ringv[l]) + (std::size_t(h) * RING + p % RING) * HD;
                 rows.insert(rows.end(), k, k + HD);
                 rows.insert(rows.end(), v, v + HD);
             }

@@ -9,7 +9,10 @@
 //     next call builds and writes the rows;
 //   - the ring's cached device copy freed under a persisted inject graph (TSGgml_InvalidateHostBuffer, as a per-op ring
 //     write did) and the host ring edited: the next inject rebuilds its graph instead of replaying it over the released
-//     copy (an illegal memory access on CUDA), and the ring holds the edit, the earlier rows and the new row.
+//     copy (an illegal memory access on CUDA), and the ring holds the edit, the earlier rows and the new row;
+//   - a ring the backend cannot write in place (on CPU, a host pointer below the buffer type's alignment) declines the
+//     inject with an error instead of writing the rows into a graph-local copy and dropping them; CUDA writes such a
+//     ring through its cached device copy.
 #include "ggml.h"
 #include <algorithm>
 #include <cmath>
@@ -74,8 +77,8 @@ struct Aligned {
     std::vector<float> store;
     float* p = nullptr;
     std::size_t n = 0;
-    explicit Aligned(std::size_t count) : store(count + 16384 / sizeof(float)), n(count) {
-        p = reinterpret_cast<float*>((reinterpret_cast<std::uintptr_t>(store.data()) + 16383) & ~std::uintptr_t(16383));
+    explicit Aligned(std::size_t count, std::size_t skew = 0) : store(count + 16384 / sizeof(float) + skew), n(count) {
+        p = reinterpret_cast<float*>((reinterpret_cast<std::uintptr_t>(store.data()) + 16383) & ~std::uintptr_t(16383)) + skew;
     }
     Aligned(const Aligned&) = delete;
     Aligned& operator=(const Aligned&) = delete;
@@ -90,8 +93,9 @@ struct Aligned {
 struct Ring {
     std::vector<Aligned> k, v;
     std::vector<void*> kp, vp;
-    Ring() {
-        for (int l = 0; l < N; ++l) { k.emplace_back(std::size_t(RING) * HD * NKV); v.emplace_back(std::size_t(RING) * HD * NKV); }
+    // `skew` floats past a 16 KB boundary: 0 binds in place on every backend, 1 is below the CPU's alignment.
+    explicit Ring(std::size_t skew = 0) {
+        for (int l = 0; l < N; ++l) { k.emplace_back(std::size_t(RING) * HD * NKV, skew); v.emplace_back(std::size_t(RING) * HD * NKV, skew); }
         for (int l = 0; l < N; ++l) { kp.push_back(k[l].data()); vp.push_back(v[l].data()); }
     }
     void sync() {
@@ -215,6 +219,26 @@ int main(int argc, char** argv) {
         for (int l = 0; l < N; ++l) edit = edit && got.k[l][(std::size_t(0) * RING + edited) * HD] == 3.25f;
         std::printf("ring copy released under a cached graph: earlier and new rows %d, host edit kept %d\n", int(rows), int(edit));
         if (!rows || !edit) ok = fail("ring after its device copy was released");
+        reset();
+    }
+
+    // 4. A misaligned ring: the CPU cannot wrap it, so the inject declines and names the ring; a GPU writes it through
+    //    its cached device copy. Either way no inject reports success while the ring misses the rows.
+    {
+        Ring want, skewed(1);
+        if (inject(w, want, 0, 5) != 1) ok = fail("reference inject");
+        want.sync();
+        reset();
+        const int status = inject(w, skewed, 0, 5);
+        const std::string err = TSGgml_GetLastError() ? TSGgml_GetLastError() : "";
+        skewed.sync();
+        bool same = true;
+        for (int s = 0; s < 5; ++s) same = same && skewed.rows(s) == want.rows(s);
+        const bool declined = status == 0 && err.find("in place") != std::string::npos;
+        std::printf("misaligned ring: %s\n", status == 1 ? (same ? "written in place" : "reported success, rows missing")
+                                                         : declined ? ("declined (\"" + err + "\")").c_str() : "failed otherwise");
+        if (status == 1 ? !same : !declined) ok = fail("a misaligned ring must be written or declined");
+        if (backend == 3 && status != 1) ok = fail("CUDA writes a misaligned ring through its device copy");
         reset();
     }
 

@@ -240,23 +240,31 @@ public sealed class DSpineDraftTests
 
     private static float[] PlusOne(float[] v) => v.Select(x => 1f + x).ToArray();
 
-    /// <summary>Unmanaged copies of the weights (the native side keys device copies by these pointers).</summary>
+    /// <summary>
+    /// Unmanaged copies of the weights and rings (the native side keys device copies by these pointers), page-aligned
+    /// as the allocator's tensors are: the inject writes a ring in place only where the backend can wrap its host
+    /// pointer, and AllocHGlobal's 16-byte alignment is below what the CPU buffer type needs.
+    /// </summary>
     private sealed class Native : IDisposable
     {
         private readonly List<IntPtr> _blocks = new();
+        private IntPtr Alloc(int bytes)
+        {
+            IntPtr raw = Marshal.AllocHGlobal(bytes + 16384);
+            _blocks.Add(raw);
+            return (IntPtr)(((long)raw + 16383) & ~16383L);
+        }
         public IntPtr F32(float[] v)
         {
-            IntPtr p = Marshal.AllocHGlobal(v.Length * sizeof(float));
+            IntPtr p = Alloc(v.Length * sizeof(float));
             Marshal.Copy(v, 0, p, v.Length);
-            _blocks.Add(p);
             return p;
         }
         public IntPtr Bf16(float[] v)
         {
             short[] bits = v.Select(x => unchecked((short)ToBf16(x))).ToArray();
-            IntPtr p = Marshal.AllocHGlobal(bits.Length * 2);
+            IntPtr p = Alloc(bits.Length * 2);
             Marshal.Copy(bits, 0, p, bits.Length);
-            _blocks.Add(p);
             return p;
         }
         public void Dispose()
