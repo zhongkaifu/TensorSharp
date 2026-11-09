@@ -967,8 +967,10 @@ namespace TensorSharp.Cuda
             // A verify window or a batched step: every row in one block, a warp per output row, so each weight row is read
             // from memory once (a block per row read it once per row: a 4-row window's LM head took 4x one row's time).
             // Bit for bit the one-row kernel's sums. (A split-K grid of few outputs keeps a block per row: one block
-            // looping over the rows left the GPU too few blocks, and the shared expert slowed down.)
-            if (rows > 1 && rows <= DenseMultiMaxRows && denseQ81RowsMulti != IntPtr.Zero && _denseMulti)
+            // looping over the rows left the GPU too few blocks, and the shared expert slowed down.) One row takes it too:
+            // the one-row kernel's warps walk four output rows each, 80 blocks for 2560 outputs. The shared expert's
+            // 640 -> 2560 Q4_0 down projection took 3.44 us at one row there (2.37 at two rows); 2.01 us here (RTX 5090).
+            if (rows <= DenseMultiMaxRows && denseQ81RowsMulti != IntPtr.Zero && _denseMulti)
                 Launch(denseQ81RowsMulti, CeilDiv(outDim, 8), 1, 1, BlockSize, 0, stream, args);
             else
                 Launch(denseQ81Rows, CeilDiv(outDim, 32), (uint)rows, 1, BlockSize, 0, stream, args);
