@@ -18,6 +18,19 @@ image input needs its matching vision projector, such as `mmproj-BF16.gguf` or
 `mmproj-F16.gguf`: the CLI loads it from beside the model when
 `--image` is given, and the server needs `--mmproj`).
 
+## Recommended presets
+
+| Hardware | Preset | Files | Measured (2026-11-08) |
+| --- | --- | --- | --- |
+| Apple Silicon, 48 GB | `config/qwen3.8-flash-next.json` | ISTA-DASLab GSQ-RCO `Q2_0` (two shards, 66.4 GB) + DFlash2 Q4_K_M drafter, `ggml_metal` | M5 Pro: decode 43-48 tok/s, 4K / 16K prompt TTFT 5.8-6.0 / 22.7-24.3 s, four requests at once 43.4 tok/s, Strata's sanity checks 12/12 |
+| NVIDIA, 32 GB VRAM + ~45 GB RAM | `config/qwen3.8-flash-next-cuda.json` | the same `Q2_0` + the shared MTP head, direct `cuda` engine | RTX 5090: decode 131-250 tok/s, 4K / 16K / 100K prompt TTFT 1.0 / 4.2 / 30.4 s |
+| NVIDIA, several users | add `config/qwen3.8-flash-next-cuda-4lanes.json` | four sequence lanes | RTX 5090: four requests at once 243-258 tok/s, parallel_4 281-286 tok/s |
+| Apple Silicon, UD-Q2_K_XL files | `config/qwen3.8-flash-next-ud-q2_k_xl.json` | UD-Q2_K_XL (three shards) + shared MTP head | M5 Pro: ~31 tok/s decode (the previous preset) |
+
+The `Q2_0` files are [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+(pinned at `ed59f920`) and the drafter is [incoai/Qwen3.8-Flash-Next-DFlash2-GGUF](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2-GGUF)
+(pinned at `4f5a39be`); the presets download and verify them (sha256).
+
 ## How TensorSharp runs it
 
 On the GGML backends the whole token runs as (almost) one graph — embedding,
@@ -768,7 +781,7 @@ repetitions in one session; the profile came from a separate 12-prompt calibrati
 | Before, MTP head | 14.67 / 11.98 / 16.66 | 5.31 / 13.61 / 3.27 |
 | Expert tiers, MTP head, exact verify rows (`TS_Q4E_VERIFY_ROW_KERNELS=1`) | 23.47 / 19.01 / 24.60 | 0.77 / 7.39 / 0.57 |
 | Expert tiers, MTP head (batched verify, the default) | 30.87 / 21.31 / 28.31 | 0.75 / 7.03 / 0.56 |
-| `config/qwen3.8-flash-next.json` (the line above, with its sampling settings) | 27.00 / 20.62 / 32.72 | 0.80 / 7.96 / 0.53 |
+| `config/qwen3.8-flash-next-ud-q2_k_xl.json` (the line above, with its sampling settings) | 27.00 / 20.62 / 32.72 | 0.80 / 7.96 / 0.53 |
 
 The tiered plan computes the experts with the GPU's F32 activations where the old plan's 33
 host layers quantized them to Q8_K, so greedy text can differ from before (here the prose

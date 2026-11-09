@@ -1,7 +1,8 @@
 {
   // Overlay that adds the shared MTP head to another Flash Next preset (for example
   // --config config/qwen3.8-flash-next-iq1_m.json --config config/qwen3.8-flash-next-mtp.json).
-  // config/qwen3.8-flash-next.json already names this head itself. This is a companion
+  // config/qwen3.8-flash-next-ud-q2_k_xl.json already names this head itself (config/qwen3.8-flash-next.json
+  // drafts with DFlash2 instead). This is a companion
   // preset, not a standalone model. Supported on GGML backends; direct CUDA and MLX do not
   // support this head.
   "variables": {

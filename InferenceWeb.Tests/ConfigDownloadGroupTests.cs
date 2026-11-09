@@ -117,48 +117,64 @@ public sealed class ConfigDownloadGroupTests : IDisposable
         Assert.Equal(new[] { "--model", "override.gguf" }, ConfigFileArgs.Expand(args, TextWriter.Null, false));
     }
 
+    /// <summary>The Flash Next preset is the fastest measured setup on Apple Silicon: ISTA-DASLab's GSQ-RCO Q2_0 (two
+    /// shards), the DFlash2 drafter and the validated projector, on ggml_metal, with its environment (MAX_CONTEXT and
+    /// the Q8_0 hyper-connection copy) reaching native getenv. The UD-Q2_K_XL preset keeps the MTP head.</summary>
     [Fact]
-    public void FlashNextPreset_ResolvesAllThreeShardsAndProjector_ThroughServerParser()
+    public void FlashNextPreset_ResolvesItsShardsProjectorAndDrafter_ThroughServerParser()
     {
         DirectoryInfo? repo = new(AppContext.BaseDirectory);
         while (repo != null && !File.Exists(Path.Combine(repo.FullName, "TensorSharp.slnx"))) repo = repo.Parent;
         Assert.NotNull(repo);
-        var config = JsonNode.Parse(File.ReadAllText(Path.Combine(repo.FullName, "config", "qwen3.8-flash-next.json")),
+        var parse = (string name) => JsonNode.Parse(File.ReadAllText(Path.Combine(repo.FullName, "config", name)),
             documentOptions: new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true })!;
+        var config = parse("qwen3.8-flash-next.json");
         // Resolve the real manifest locally, without downloading the multi-gigabyte artifacts.
         config["variables"]!["modelRoot"] = _directory;
-        string modelDirectory = Path.Combine(_directory, "qwen3.8-flash-next");
-        Directory.CreateDirectory(modelDirectory);
         var modelFiles = new[] { config["model"]! }.Concat(config["model"]!["files"]!.AsArray().Select(node => node!)).ToArray();
-        Assert.Equal(3, modelFiles.Length);
+        Assert.Equal(2, modelFiles.Length);
+        string Local(JsonNode entry) => entry["path"]!.GetValue<string>()
+            .Replace("${root}", Path.Combine(_directory, "qwen3.8-flash-next-ista-q2_0"))
+            .Replace("${draftRoot}", Path.Combine(_directory, "qwen3.8-flash-next-dflash2"))
+            .Replace("${projectorRoot}", Path.Combine(_directory, "qwen3.8-flash-next"));
         foreach (JsonNode entry in modelFiles.Append(config["mmproj"]!).Append(config["draft-model"]!))
-            File.WriteAllText(Path.Combine(modelDirectory, Path.GetFileName(entry["path"]!.GetValue<string>())), "cached fixture");
+        {
+            string local = Local(entry);
+            Directory.CreateDirectory(Path.GetDirectoryName(local)!);
+            File.WriteAllText(local, "cached fixture");
+        }
 
-        const string verifyRows = "TS_Q4E_VERIFY_ROW_KERNELS";
-        string? before = Environment.GetEnvironmentVariable(verifyRows);
-        NativeEnvironment.Set(verifyRows, null);
+        string[] variables = { "MAX_CONTEXT", "TS_Q4E_HC_Q8", "TS_Q4E_VERIFY_ROW_KERNELS" };
+        string?[] before = variables.Select(Environment.GetEnvironmentVariable).ToArray();
+        foreach (string name in variables) NativeEnvironment.Set(name, null);
         try
         {
             string path = Write(config);
             string[] expanded = ConfigFileArgs.Expand(["--config", path], TextWriter.Null, false);
             Assert.Single(expanded, value => value == "--model");
-            Assert.EndsWith("-00001-of-00003.gguf", expanded[Array.IndexOf(expanded, "--model") + 1]);
-            Assert.Equal(Path.Combine(modelDirectory, "mmproj-BF16.gguf"), expanded[Array.IndexOf(expanded, "--mmproj") + 1]);
-            // The high-performance preset speculates with the shared MTP head (3 drafts) on
-            // ggml_metal.
-            Assert.Equal(Path.Combine(modelDirectory, "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
-                expanded[Array.IndexOf(expanded, "--draft-model") + 1]);
-            Assert.Equal("3", expanded[Array.IndexOf(expanded, "--spec-draft") + 1]);
+            Assert.EndsWith("GSQ-RCO-Q2_0-00001-of-00002.gguf", expanded[Array.IndexOf(expanded, "--model") + 1]);
+            Assert.Equal(Local(config["mmproj"]!), expanded[Array.IndexOf(expanded, "--mmproj") + 1]);
+            // Naming the DFlash2 drafter is the request to speculate; its block drafts are the engine's defaults.
+            Assert.Equal(Local(config["draft-model"]!), expanded[Array.IndexOf(expanded, "--draft-model") + 1]);
+            Assert.DoesNotContain("--spec-draft", expanded);
             Assert.Equal("ggml_metal", expanded[Array.IndexOf(expanded, "--backend") + 1]);
+            Assert.Equal("32768", Environment.GetEnvironmentVariable("MAX_CONTEXT"));
+            Assert.Equal("1", Environment.GetEnvironmentVariable("TS_Q4E_HC_Q8"));
             // Batched verify is the ggml_metal default; the preset does not set the switch.
-            Assert.Null(Environment.GetEnvironmentVariable(verifyRows));
+            Assert.Null(Environment.GetEnvironmentVariable("TS_Q4E_VERIFY_ROW_KERNELS"));
             var options = ServerOptionsBuilder.Build(expanded, _directory);
             Assert.Equal(1.0f, options.DefaultSamplingConfig.Temperature);
+
+            // The UD-Q2_K_XL preset is the previous one: three shards and the shared MTP head, three drafts.
+            var udq2 = parse("qwen3.8-flash-next-ud-q2_k_xl.json");
+            Assert.Equal(2, udq2["model"]!["files"]!.AsArray().Count);
+            Assert.EndsWith("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", udq2["draft-model"]!["path"]!.GetValue<string>());
+            Assert.Equal(3, udq2["spec-draft"]!.GetValue<int>());
         }
         finally
         {
-            // Never leave the batched-verify default to the other tests in this process.
-            NativeEnvironment.Set(verifyRows, before);
+            // Never leave the preset's environment to the other tests in this process.
+            for (int i = 0; i < variables.Length; i++) NativeEnvironment.Set(variables[i], before[i]);
         }
     }
 

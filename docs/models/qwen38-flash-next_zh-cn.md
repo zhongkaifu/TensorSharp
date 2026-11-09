@@ -17,6 +17,17 @@ PLE n-gram 嵌入块、×4 hyper-connection 流以及 512 专家的 MoE。GGUF �
 `--image` 时会从模型旁边自动加载，服务端则需要显式传
 `--mmproj`）。
 
+## 推荐预设
+
+| 硬件 | 预设 | 文件 | 实测（2026-11-08） |
+| --- | --- | --- | --- |
+| Apple Silicon，48 GB | `config/qwen3.8-flash-next.json` | ISTA-DASLab GSQ-RCO `Q2_0`（两个分片，66.4 GB）+ DFlash2 Q4_K_M 草稿模型，`ggml_metal` | M5 Pro：解码 43-48 tok/s，4K / 16K 提示首 token 5.8-6.0 / 22.7-24.3 秒，四个请求并发合计 43.4 tok/s，Strata 的 12 项正确性检查全部通过 |
+| NVIDIA，32 GB 显存 + 约 45 GB 内存 | `config/qwen3.8-flash-next-cuda.json` | 同一 `Q2_0` + 共享 MTP 头，直接 `cuda` 引擎 | RTX 5090：解码 131-250 tok/s，4K / 16K / 100K 提示首 token 1.0 / 4.2 / 30.4 秒 |
+| NVIDIA，多用户 | 再叠加 `config/qwen3.8-flash-next-cuda-4lanes.json` | 四个序列通道 | RTX 5090：四个请求并发合计 243-258 tok/s，parallel_4 281-286 tok/s |
+| Apple Silicon，UD-Q2_K_XL 文件 | `config/qwen3.8-flash-next-ud-q2_k_xl.json` | UD-Q2_K_XL（三个分片）+ 共享 MTP 头 | M5 Pro：解码约 31 tok/s（之前的预设） |
+
+`Q2_0` 文件来自 [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)（固定在 `ed59f920`），草稿模型来自 [incoai/Qwen3.8-Flash-Next-DFlash2-GGUF](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2-GGUF)（固定在 `4f5a39be`）；预设会自动下载并校验（sha256）。
+
 ## TensorSharp 如何运行它
 
 在 GGML 后端上，整个 token（几乎）只跑一张图——嵌入、PLE（在图内）、全部 48 层、
@@ -473,7 +484,7 @@ VM 上实测（GGUF 位于 geesefs（S3 FUSE）挂载，内存 cgroup 93 GB，`g
 | 之前，MTP 头 | 14.67 / 11.98 / 16.66 | 5.31 / 13.61 / 3.27 |
 | 专家层，MTP 头，精确验证行（`TS_Q4E_VERIFY_ROW_KERNELS=1`） | 23.47 / 19.01 / 24.60 | 0.77 / 7.39 / 0.57 |
 | 专家层，MTP 头（批量 verify，默认） | 30.87 / 21.31 / 28.31 | 0.75 / 7.03 / 0.56 |
-| `config/qwen3.8-flash-next.json`（即上一行，使用其采样设置） | 27.00 / 20.62 / 32.72 | 0.80 / 7.96 / 0.53 |
+| `config/qwen3.8-flash-next-ud-q2_k_xl.json`（即上一行，使用其采样设置） | 27.00 / 20.62 / 32.72 | 0.80 / 7.96 / 0.53 |
 
 专家层方案用 GPU 的 F32 激活计算专家，而旧方案的 33 个主机层把激活量化为 Q8_K，所以贪心文本可能与之前不同
 （此处是文章那个回答，从第 655 个字符起）；当每条路由都有槽位时，专家层与全 GPU span 逐位一致

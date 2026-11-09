@@ -140,12 +140,19 @@ def s_chat_exact(url, R):
 
 
 def s_stream_identity(url, R):
+    # Streamed and non-streamed responses must carry the same greedy text. A server is not always deterministic
+    # across requests: on Qwen3.8 Flash Next the first requests after a load run on a cold expert window, and the
+    # default route-tail skip (approximate) skips more missed experts there, so a plain request before and after the
+    # streamed one brackets it. An API-path difference mismatches both; a server still warming up shows as the two
+    # plain answers differing (recorded, not a failure of the stream path).
     msgs = [{"role": "user", "content": "Write exactly two sentences about the ocean."}]
+    before = chat(url, msgs, stream=False, max_tokens=64)
     a = chat(url, msgs, stream=True, max_tokens=64)
-    b = chat(url, msgs, stream=False, max_tokens=64)
-    R.check("streamed and non-streamed greedy text identical", a["content"] == b["content"],
-            {"stream": a["content"][:120], "plain": b["content"][:120]})
-    R.metrics.update(ttft=a["ttft"], decode_tps=decode_rate(a))
+    after = chat(url, msgs, stream=False, max_tokens=64)
+    R.check("streamed greedy text equals a non-streamed one", a["content"] in (before["content"], after["content"]),
+            {"stream": a["content"], "plain_before": before["content"], "plain_after": after["content"]})
+    R.metrics.update(ttft=a["ttft"], decode_tps=decode_rate(a),
+                     plain_repeatable=before["content"] == after["content"])
 
 
 def s_stop_sequence(url, R):

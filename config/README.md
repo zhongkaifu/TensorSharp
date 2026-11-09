@@ -291,7 +291,10 @@ TensorSharp.Server.Host --config config/gemma-4-26b-a4b.json
 | [`qwen3.5-9b-uncensored-q8.json`](qwen3.5-9b-uncensored-q8.json) | Qwen3.5-9B Uncensored (Q8_0) | Text LLM |
 | [`qwen3.6-27b.json`](qwen3.6-27b.json) | Qwen3.6-27B + vision | Multimodal LLM |
 | [`qwen3.6-35b-a3b.json`](qwen3.6-35b-a3b.json) | Qwen3.6-35B-A3B (MoE) + vision | Multimodal MoE LLM |
-| [`qwen3.8-flash-next.json`](qwen3.8-flash-next.json) | Qwen3.8 Flash Next (UD-Q2_K_XL, three shards) + vision + shared MTP head | Multimodal MoE LLM; ggml_metal high-performance preset (shared MTP head) |
+| [`qwen3.8-flash-next.json`](qwen3.8-flash-next.json) | Qwen3.8 Flash Next (ISTA-DASLab GSQ-RCO Q2_0, two shards) + vision + DFlash2 Q4_K_M drafter | Multimodal MoE LLM; the fastest setup on Apple Silicon (`ggml_metal`): 43-48 tok/s decode, 4K-token prompt TTFT ~6 s, 43 tok/s for four requests at once on an M5 Pro (48 GB) |
+| [`qwen3.8-flash-next-cuda.json`](qwen3.8-flash-next-cuda.json) | Qwen3.8 Flash Next (ISTA-DASLab GSQ-RCO Q2_0) + shared MTP head | MoE LLM; the fastest setup on NVIDIA (direct `cuda` engine): 131-250 tok/s decode, 4K-token prompt TTFT 1.0 s on an RTX 5090; ~45 GB of host RAM |
+| [`qwen3.8-flash-next-cuda-4lanes.json`](qwen3.8-flash-next-cuda-4lanes.json) | Overlay for `qwen3.8-flash-next-cuda.json` | Four sequence lanes for concurrent users: 243-258 tok/s for four requests at once on an RTX 5090 |
+| [`qwen3.8-flash-next-ud-q2_k_xl.json`](qwen3.8-flash-next-ud-q2_k_xl.json) | Qwen3.8 Flash Next (UD-Q2_K_XL, three shards) + vision + shared MTP head | The previous `ggml_metal` preset, for the UD-Q2_K_XL files |
 | [`qwen3.8-27b-metal-dflash2.json`](qwen3.8-27b-metal-dflash2.json) | Qwen3.8-27B (UD-IQ3_XXS) + vision + DFlash2 Q4_K_M drafter | Multimodal LLM on Apple Silicon (`ggml_metal`), speculative decoding: 39-52 tok/s on code and lists on an M5 Pro |
 | [`gemma-4-e4b.json`](gemma-4-e4b.json) | Gemma-4 E4B **uncensored** (TrevorJS's community build, Q8_0) + stock unsloth vision projector + AtomicChat MTP draft | Multimodal LLM |
 | [`gemma-4-12b.json`](gemma-4-12b.json) | Gemma-4 12B (QAT) + vision + MTP draft | Multimodal LLM |
