@@ -21,9 +21,15 @@
 #include <vector>
 
 namespace tsg {
-    bool host_moe_decode_experts_rows(const HostMoeSegment&, const float*, const std::int32_t*, const float*, float*);
     static int test_threads = 1;
     int host_moe_default_thread_count() { return test_threads; }
+    // The explicitly read expert cache (ggml_ops_moe_expert_io.cpp) is not linked: every slice is mapped
+    // memory the kernel reads in place, as with the cache off.
+    void host_expert_io_resolve(const void* const* sources, const std::size_t*, int count, const std::uint8_t** resolved)
+    {
+        for (int i = 0; i < count; ++i) resolved[i] = static_cast<const std::uint8_t*>(sources[i]);
+    }
+    void host_expert_io_prefetch(const void* const*, const std::size_t*, int) {}
 }
 
 namespace {
@@ -150,7 +156,7 @@ namespace {
 
     void declines_untouched(const tsg::HostMoeSegment& hm, const Inputs& in, const char* reason)
     {
-        std::vector<float> out(std::size_t(9) * std::max(1, hm.hidden) + 2 * guard, sentinel);
+        std::vector<float> out(std::size_t(17) * std::max(1, hm.hidden) + 2 * guard, sentinel);
         const auto before = out;
         require(!tsg::host_moe_decode_experts_rows(hm, in.x.data(), in.ids.data(), in.route.data(), out.data() + guard), reason);
         require(std::memcmp(before.data(), out.data(), out.size() * sizeof(float)) == 0, std::string(reason) + ": output changed before decline.");
@@ -159,8 +165,9 @@ namespace {
     void rejection_cases(const Fixture& fixture)
     {
         auto base = fixture.hm; base.seq_len = 4;
-        Inputs in(base, 9, 17);
-        for (int width : {0, -1, 9}) { auto bad = base; bad.seq_len = width; declines_untouched(bad, in, "Unsupported width accepted."); }
+        Inputs in(base, 17, 17);
+        // The kernel takes 1..16 rows (kMaxRows; the direct CUDA engine's 16-row host steps).
+        for (int width : {0, -1, 17}) { auto bad = base; bad.seq_len = width; declines_untouched(bad, in, "Unsupported width accepted."); }
         for (int id : {-1, base.num_experts})
         {
             auto bad_ids = in; bad_ids.ids[std::size_t(base.seq_len) * base.n_used - 1] = id;
@@ -242,7 +249,7 @@ int main(int argc, char** argv)
             tsg::test_threads = threads; tsg::host_moe_decode_release();
             for (int iteration = 0; iteration < 3; ++iteration)
             {
-                for (int width : {1, 2, 3, 4, 8, 2, 8, 3}) { check(fixture, width, iteration); ++checks; }
+                for (int width : {1, 2, 3, 4, 8, 16, 2, 8, 3}) { check(fixture, width, iteration); ++checks; }
                 tsg::host_moe_decode_release(); // Recreate team and reuse all scratch shapes.
             }
             rejection_cases(fixture);
