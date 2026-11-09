@@ -262,7 +262,13 @@ float max_rel(const std::vector<float>& a, const std::vector<float>& b) {
 }
 
 // CUDA: two lanes drafted at once (each on its own ring, at its own frontier) against their single-lane drafts.
-bool batched(Weights& w, bool selector) {
+// The relative difference the two key orders may show. ggml-cuda runs F32 matmuls (every projection of this test's
+// F32 weights, and the attention's F32 fallback at these shapes) on TF32 tensor cores (CUBLAS_TF32_TENSOR_OP_MATH,
+// a 10-bit mantissa), where two key orders differ by ~4e-3 after two layers and the selector; CPU and Metal stay
+// within ~4e-5.
+float tolerance(int backend) { return backend == 3 ? 2e-2f : 1e-3f; }
+
+bool batched(Weights& w, bool selector, int backend) {
     setenv("TS_DFLASH_RING_BLOCK", "1", 1);
     Lane a(11), b(29);
     bool ok = true;
@@ -312,7 +318,7 @@ bool batched(Weights& w, bool selector) {
     TSGgml_DFlashResetCaches();
     TSGgml_ClearHostBufferCache();
     std::printf("DFlash%d batched (2 lanes) vs single: max relative difference %.3g, same picks %d\n", selector ? 2 : 1, worst, int(same));
-    return ok && same && worst < 1e-3f;
+    return ok && same && worst < tolerance(backend);
 }
 }
 
@@ -334,8 +340,8 @@ int main(int argc, char** argv) {
         }
         std::printf("DFlash%d: ring slots vs concatenation over %d steps: max relative difference %.3g, same picks %d, "
                     "live ring rows identical %d\n", selector ? 2 : 1, STEPS, worst, int(same_picks), int(same_rows));
-        if (!(worst < 1e-3f) || !same_picks || !same_rows) return 1;
-        if (backend == 3 && !batched(w, selector)) return 1;
+        if (!(worst < tolerance(backend)) || !same_picks || !same_rows) return 1;
+        if (backend == 3 && !batched(w, selector, backend)) return 1;
         if (backend == 1) {
             std::vector<Step> chains;
             if (!run(w, true, selector, 3, chains, false)) return 1;
