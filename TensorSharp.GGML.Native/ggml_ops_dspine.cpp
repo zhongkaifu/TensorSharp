@@ -344,6 +344,32 @@ namespace
         ggml_cgraph* graph = nullptr;
     };
 
+    // TS_DSPINE_BF16_POINTS=1 (diagnostic): round the bridge's activations to BF16 where the reference rounds them
+    // (sglang_dspine/kernels/dspine.py: raw, the normalized rows, the read projection, the codes, the packed
+    // projection, the message, the write delta, the written row, and the next norm's two steps), to measure what F32
+    // activations change. Off: those tensors stay F32 and the graph is unchanged.
+    bool ds_bf16_points()
+    {
+        static const bool on = [] {
+            const char* e = std::getenv("TS_DSPINE_BF16_POINTS");
+            return e != nullptr && e[0] == '1';
+        }();
+        return on;
+    }
+
+    ggml_tensor* ds_bf16(ggml_context* ctx, ggml_tensor* x)
+    {
+        return ds_bf16_points() ? ggml_cast(ctx, ggml_cast(ctx, ggml_cont(ctx, x), GGML_TYPE_BF16), GGML_TYPE_F32) : x;
+    }
+
+    // The next layer's (or the final) norm of a written row: bf16(bf16(rms_norm(x)) * w) at the BF16 points.
+    ggml_tensor* ds_next_norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, float eps, bool written)
+    {
+        if (!written || !ds_bf16_points())
+            return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+        return ds_bf16(ctx, ggml_mul(ctx, ds_bf16(ctx, ggml_rms_norm(ctx, x, eps)), w));
+    }
+
     // The draft graph for a b-row block. probe: also mark every stage as an output.
     bool ds_build(ggml_context* ctx, const TsgDsParams* p, const TsgDsWeight* w, const DsTables* tables,
                   void** ring_k, void** ring_v, int b, bool probe, DsBinder& binder, DsGraph& g)
@@ -395,7 +421,7 @@ namespace
             binder.bind(rv, ring_v[l], ring_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
 
             // Layer 0 norms its embedding rows; later layers get the previous bridge's next_norm(out).
-            ggml_tensor* h = ggml_mul(ctx, ggml_rms_norm(ctx, inpL, p->eps), attn_norm);
+            ggml_tensor* h = ds_next_norm(ctx, inpL, attn_norm, p->eps, l > 0);
 
             ggml_tensor* q3 = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, q_w, h), HD, NH, b);
             ggml_tensor* k3 = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, k_w, h), HD, NKV, b);
@@ -416,18 +442,19 @@ namespace
             ggml_tensor* ffn_inp = ggml_add(ctx, attn_out, inpL);
             ggml_tensor* fh = ggml_mul(ctx, ggml_rms_norm(ctx, ffn_inp, p->eps), ffn_norm);
             ggml_tensor* act = ggml_mul(ctx, ggml_silu(ctx, ggml_mul_mat(ctx, gate_w, fh)), ggml_mul_mat(ctx, up_w, fh));
-            ggml_tensor* raw = ggml_add(ctx, ggml_mul_mat(ctx, down_w, act), ffn_inp);                  // [H, b]
+            ggml_tensor* raw = ds_bf16(ctx, ggml_add(ctx, ggml_mul_mat(ctx, down_w, act), ffn_inp));    // [H, b]
 
             // ---- the code bridge, on rows 1..b-1 ----
             ggml_tensor* r1 = ggml_view_2d(ctx, raw, H, gm, raw->nb[1], raw->nb[1]);                    // [H, g]
             ggml_tensor* rms = ggml_sqrt(ctx, ggml_clamp(ctx, ggml_mean(ctx, ggml_sqr(ctx, r1)),
                                                          std::numeric_limits<float>::min(),
                                                          std::numeric_limits<float>::max()));         // [1, g]
-            ggml_tensor* nrm = ggml_div(ctx, r1, ggml_scale_bias(ctx, rms, 1.0f, p->bridge_eps));
-            ggml_tensor* proj = ggml_mul_mat(ctx, read_w, nrm);                                         // [C, g]
+            ggml_tensor* nrm = ds_bf16(ctx, ggml_div(ctx, r1, ggml_scale_bias(ctx, rms, 1.0f, p->bridge_eps)));
+            ggml_tensor* proj = ds_bf16(ctx, ggml_mul_mat(ctx, read_w, nrm));                          // [C, g]
             ggml_tensor* pn = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, proj)));                  // [1, g]
-            ggml_tensor* codes = ggml_div(ctx, ggml_scale(ctx, proj, sqrt_c), ggml_scale_bias(ctx, pn, 1.0f, p->bridge_eps));
-            ggml_tensor* packed = ggml_mul_mat(ctx, bridge, codes);                                     // [3R, g]
+            ggml_tensor* codes = ds_bf16(ctx, ggml_div(ctx, ggml_scale(ctx, proj, sqrt_c),
+                                                       ggml_scale_bias(ctx, pn, 1.0f, p->bridge_eps)));
+            ggml_tensor* packed = ds_bf16(ctx, ggml_mul_mat(ctx, bridge, codes));                      // [3R, g]
             ggml_tensor* sv_prev = tsv_anchor;                                                          // [2R, g]
             if (gm > 1)
                 sv_prev = ggml_concat(ctx, tsv_anchor,
@@ -435,9 +462,10 @@ namespace
             ggml_tensor* qv = ggml_view_2d(ctx, packed, R, gm, packed->nb[1], 0);
             ggml_tensor* s_prev = ggml_view_2d(ctx, sv_prev, R, gm, sv_prev->nb[1], 0);
             ggml_tensor* v_prev = ggml_view_2d(ctx, sv_prev, R, gm, sv_prev->nb[1], R * f32);
-            ggml_tensor* msg = ggml_mul(ctx, ggml_sigmoid(ctx, ggml_add(ctx, ggml_add(ctx, qv, s_prev), gate_bias)), v_prev);
-            ggml_tensor* delta = ggml_mul_mat(ctx, write_w, msg);                                       // [H, g]
-            ggml_tensor* upd = ggml_add(ctx, r1, ggml_mul(ctx, delta, rms));
+            ggml_tensor* msg = ds_bf16(ctx, ggml_mul(ctx, ggml_sigmoid(ctx,
+                ggml_add(ctx, ggml_add(ctx, qv, s_prev), gate_bias)), v_prev));
+            ggml_tensor* delta = ds_bf16(ctx, ggml_mul_mat(ctx, write_w, msg));                        // [H, g]
+            ggml_tensor* upd = ds_bf16(ctx, ggml_add(ctx, r1, ggml_mul(ctx, delta, rms)));
             ggml_tensor* out = ggml_concat(ctx, ggml_view_2d(ctx, raw, H, 1, raw->nb[1], 0), upd, 1);   // [H, b]
             if (probe)
             {
@@ -451,7 +479,7 @@ namespace
         }
 
         // ---- the proposal ----
-        ggml_tensor* cur = ggml_mul(ctx, ggml_rms_norm(ctx, inpL, p->eps), out_norm);                   // [H, b]
+        ggml_tensor* cur = ds_next_norm(ctx, inpL, out_norm, p->eps, true);                              // [H, b]
         ggml_tensor* pred = ggml_view_2d(ctx, cur, H, gm, cur->nb[1], cur->nb[1]);
         ggml_tensor* logits = ggml_mul_mat(ctx, head, pred);                                            // [V, g]
         g.cand = ggml_top_k(ctx, logits, K);                                                            // [K, g]
