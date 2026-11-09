@@ -584,6 +584,73 @@ transfer that no longer exists.)
 **What the drafter proposes is only half the story on a recurrent trunk** - the
 other half is what a REJECTION costs, which is the next section.
 
+## DSpine
+
+[DSpine](https://github.com/Tencent/DSpine) (Tencent, Apache-2.0; checkpoint
+`tencent/Qwen3.8-27B-DSpine-b16`) is a DFlash block drafter with two changes:
+
+* **Block-causal attention.** Block row *i* sees the context and block rows 0..*i*
+  (DFlash attends to the whole block). So the first *w* rows of a block ARE a
+  *w*-row block: a step drafts only the rows it can verify
+  (`IDraftHead.DraftBlockIsCausal`), and `--spec-draft 7` and 15 serve the same
+  checkpoint exactly.
+* **A code bridge after every layer.** The layer's rows are read into unit codes
+  (`codes = sqrt(C) * p / |p|`, `p = (raw / rms) @ read_l^T`); each row then gets a
+  gated message from the row before it, written back into the residual stream
+  (`out_t = raw_t + rms_t * (sigmoid(q_t + s_{t-1} + b) * v_{t-1}) @ write_l^T`). The
+  block is read off an exact-sender refinement of the last write: the top-16 head
+  candidates per row, scored against each predecessor candidate through two
+  vocabulary tables built once at load (`TG = (head * final_norm) @ write_last`,
+  `TSV = (sqrt(C) * codebook) @ [pred_gate; prev]^T`, 727 MB BF16 on the 27B), and
+  walked greedily like DFlash2's lattice (ties to the lower token id).
+
+Convert the checkpoint with `eng/dspine-to-gguf.py` (pinned revision; backbone
+`bf16`, `q8_0`, `q4_k` or `q4_k_m`, the bridge stays BF16; K-quants need the built
+native library) and pass the file to `--draft-model`. It is a `dflash` GGUF with
+`dflash.attention.causal = true` and `dflash.dspine.*` keys. The draft is one graph
+(`ggml_ops_dspine.cpp`; the context inject is DFlash's) on `ggml_metal`,
+`ggml_cuda` and `ggml_cpu`; there is no per-op path, so another backend refuses
+the file at load, and a failing draft stops drafting with a warning. The
+direct-CUDA Qwen 3.5 engine (`--backend cuda`) drafts with DFlash2 only.
+
+`eng/dspine-reference.py` is a NumPy reference of the math. `GgmlOpsDSpineDraftTest`
+and `DSpineDraftTests` check every stage, the candidates, the lattice and the
+chain against it; its `real` mode recomputes drafts dumped from the real model
+(`TS_DSPINE_DUMP`) from the checkpoint: four 16-row drafts on Qwen3.8-27B gave the
+same chain at every position. TensorSharp keeps F32 activations where the
+reference rounds the bridge to BF16; `TS_DSPINE_BF16_POINTS=1` rounds them as the
+reference does and left acceptance unchanged.
+
+**What to expect on Apple Silicon.** M5 Pro, Qwen3.8-27B-UD-IQ3_XXS on `ggml_metal`,
+DSpine Q4_K_M (1.50 GiB) against the z-lab DFlash2 Q4_K_M, greedy,
+`eng/qwen38-engine-bench.py` (thinking off, 512-token generations), two passes in
+opposite orders; decode tok/s, and per verify step over every request:
+
+| Arm | long_generation | long_prompt_4k | quality_tasks | Tokens/step | Draft | Verify |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| plain | 21.3 | 20.4 | 20.9 | | | |
+| DFlash2, 7 drafts | 34.5 | 49.7 | 47.9 | 4.29 | 11.1 ms | 88 ms |
+| DSpine, 7 drafts | 33.7 | 65.0 | 48.6 | 4.08 | 11.3 ms | 88 ms |
+| DSpine, 11 drafts | 20.9 | 39.7 | 37.4 | 4.85 | 17.1 ms | 146 ms |
+| DSpine, 15 drafts | 19.8 | 49.6 | 34.8 | 4.94 | 18.0 ms | 153 ms |
+| DSpine, 15 drafts, gate 0.35 | 28.0 | 50.6 | 39.5 | 5.04 | 19.8 ms | 119 ms |
+
+With thinking on (four math/code prompts) DFlash2 at 7 drafts made 5.17 tokens a
+step, DSpine 5.06 at 7 and 5.95 at 15 (43.5, 42.3 and 29.6 tok/s). DSpine's 16-row
+block does accept more per step (+15% over DFlash2 here; the checkpoint's card
+reports +27% on GSM8K against a BF16 target), but on Metal a verify wider than eight
+rows leaves ggml's small-batch matvec kernels and costs 146-153 ms against 88 ms
+for eight, so the wider block would need ~9 tokens a step to win. At eight rows
+DSpine drafts about as well as DFlash2 and costs ~0.2 ms more a draft, and its
+8192-token window (DFlash2's is 2048) pays on a long prompt: the 4K needle answer
+decodes at 65 against 50 tok/s, 97% of drafts accepted. Past the window the edge
+goes: on one 16K-token prompt DSpine made 3.23 tokens a step against DFlash2's 3.56,
+and its draft cost 13.7 ms against 11.4 (it attends an 8224-row ring), 41.5 against
+42.1 tok/s. Sampled (temperature 1, top-p 0.95, top-k 20, quality tasks) the two
+drafters are level: 4.33 against 4.48 tokens a step, 48.0 against 48.3 tok/s, with
+the same pass rates. Greedy text was identical to DFlash2's on 40/40 requests at
+eight and sixteen rows. See [How many rows to verify](#how-many-rows-to-verify).
+
 ## Rejection on a recurrent trunk
 
 Qwen 3.5/3.6/3.8 are hybrids: 48 of Qwen 3.8's 64 layers are GatedDeltaNet, and
@@ -1231,8 +1298,15 @@ replaces the DEFAULT only - it never overrides a number the operator typed. So o
 measurement predates the replayed commit (`TS_Q35_VERIFY_REPLAY`), which no longer keeps
 snapshot slots on `ggml_cuda`; it has not been repeated on that path. On `ggml_metal`, n-gram's default
 for a dense, mostly IQ4_XS Qwen 3.5-family trunk is 12 drafts, a 13-row verify;
-that Metal path keeps only the last three recurrent states rather than one per
-row, and its recorded before/after comparison produced identical tokens (see
+a `ggml_metal` verify wider than eight rows now replays the accepted prefix at
+commit, as `ggml_cuda` does, instead of keeping the last three recurrent states
+(until 2026-11-09, an earlier rejection there restored and re-forwarded the
+accepted prefix; `TS_Q35_VERIFY_REPLAY=0` restores that). On an M5 Pro,
+Qwen3.8-27B-UD-IQ3_XXS, n-gram 12 on three copy prompts (1,110 tokens, identical
+text): 42.2 -> 46.6 tok/s, rollback 27.7 -> 0 ms per verify step, the 13-row
+verify graph 496 -> 97 MB; a DSpine block of 16 (six prompts, identical text):
+15.5 -> 18.6 tok/s, rollback 85.9 -> 0 ms per step, the 16-row graph 509 -> 119 MB.
+The earlier three-state comparison produced identical tokens too (see
 [Building against unchanged ggml](perf/ggml-without-patches.md)).
 
 **Workaround until it is fixed:** `--spec-draft 7` or lower, or

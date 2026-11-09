@@ -694,16 +694,22 @@ namespace
         // Below 64 rows ggml steps the recurrence row by row, so the replayed state
         // is the one the verify computed. TS_Q35_VERIFY_REPLAY=0 restores snapshots
         // (read per call, like TS_Q35_VERIFY_PACK, so a test can compare the two).
+        // ggml_metal replays too once a window is wider than eight rows (an n-gram
+        // window, a DSpine block of up to 16): kept states would cost the verify a
+        // whole recurrent state per row - 2.4 GB written every sixteen-row verify on
+        // Qwen3.8-27B, pinned in its cached graph - and the old three-slot cap sent any
+        // earlier rejection through the restore-and-reforward protocol (a second trunk
+        // forward). Up to eight rows Metal keeps its per-row snapshots.
         const char* replay_setting = std::getenv("TS_Q35_VERIFY_REPLAY");
         const bool replay_commit = (replay_setting == nullptr || replay_setting[0] != '0')
-            && g_backend_type == BACKEND_TYPE_CUDA
+            && (g_backend_type == BACKEND_TYPE_CUDA || (g_backend_type == BACKEND_TYPE_METAL && N > 8))
             && defer_state && state_snapshots > 1 && state_snapshots <= N && N < 64;
         int n_snap = (!replay_commit && defer_state && state_snapshots > 1 && state_snapshots <= N)
             ? state_snapshots : 1;
-        // Wide n-gram windows need not retain a complete recurrent-state matrix
-        // for every prefix. Keep the last three states on Metal; an earlier
-        // rejection uses the existing restore-and-reforward protocol. The live
-        // input remains untouched until a supported snapshot is committed.
+        // With TS_Q35_VERIFY_REPLAY=0 a wide Metal window keeps only its last three
+        // states, as before: an earlier rejection uses the restore-and-reforward
+        // protocol. The live input remains untouched until a supported snapshot is
+        // committed.
         if (g_backend_type == BACKEND_TYPE_METAL && N > 8)
             n_snap = std::min(n_snap, 3);
         // What the caller has to do next, and getting it wrong silently decodes from

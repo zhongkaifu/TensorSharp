@@ -335,6 +335,16 @@ namespace TensorSharp.Runtime.Speculative
         int DraftBlockSize => 0;
 
         /// <summary>
+        /// True when a <see cref="DraftHeadKind.Block"/> head's attention is causal inside
+        /// the block (DSpine), so the first w rows of its block ARE a w-row block: the
+        /// speculator then drafts only the rows a step can verify instead of the trained
+        /// block. False for DFlash / DFlash2, whose block attention is non-causal - a
+        /// narrower block drafts different tokens there, so they always draft the whole
+        /// block and the speculator takes its prefix.
+        /// </summary>
+        bool DraftBlockIsCausal => false;
+
+        /// <summary>
         /// True when <see cref="ISpeculativeTarget.SpecForward"/> replays this
         /// head's own state for every row it processes, so prompt prefill needs
         /// neither per-row hidden states nor a <see cref="DraftCatchUp"/> call.

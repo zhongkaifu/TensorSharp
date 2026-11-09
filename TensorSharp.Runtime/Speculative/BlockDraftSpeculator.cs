@@ -95,9 +95,24 @@ namespace TensorSharp.Runtime.Speculative
 
         public int Propose(in DraftContext ctx, List<int> draftOut)
         {
-            int n = _head.DraftBlock(ctx.LastToken, ctx.CarryHidden, ctx.Position, _blockTokens, _blockConf);
-            return SelectDrafts(_blockTokens, _blockConf, n, ctx.MaxTokens, draftOut);
+            int[] tokens = _blockTokens;
+            float[] conf = _blockConf;
+            // A causal block's first w rows are a w-row block (IDraftHead.DraftBlockIsCausal):
+            // draft only what this step can verify. The head sizes its block off the buffers.
+            if (_head.DraftBlockIsCausal && ctx.MaxTokens > 0 && ctx.MaxTokens < _blockTokens.Length)
+            {
+                int w = ctx.MaxTokens;
+                _narrowTokens ??= new int[_blockTokens.Length][];
+                _narrowConf ??= new float[_blockTokens.Length][];
+                tokens = _narrowTokens[w] ??= new int[w];
+                conf = _narrowConf[w] ??= new float[w];
+            }
+            int n = _head.DraftBlock(ctx.LastToken, ctx.CarryHidden, ctx.Position, tokens, conf);
+            return SelectDrafts(tokens, conf, n, ctx.MaxTokens, draftOut);
         }
+
+        private int[][] _narrowTokens;
+        private float[][] _narrowConf;
 
         /// <summary>The cumulative-confidence gate over one drafted block: keeps the
         /// longest prefix (at most <paramref name="maxTokens"/>) whose product of

@@ -59,6 +59,11 @@
     <ReferenceNativeSymbol Include="TSGgml_DFlashInjectBatched" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DFlashInjectScaled" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DFlashResetCaches" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DSpineDraftBlock" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DSpineResetCaches" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DSpineTablesCreate" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DSpineTablesFree" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DSpineTablesRead" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DequantizeToF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DeviceCopyCacheResidentBytes" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DeviceMemoryInfo" SymbolType="Function" />

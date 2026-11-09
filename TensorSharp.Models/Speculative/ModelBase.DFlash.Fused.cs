@@ -144,12 +144,16 @@ namespace TensorSharp.Models
         private bool CanUseFusedDFlash =>
             _hasDFlash && !IsTensorParallel &&
             (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan ||
-             _backend == BackendType.GgmlMetal);
+             _backend == BackendType.GgmlMetal ||
+             // DSpine has no per-op draft; its inject runs fused on ggml_cpu too.
+             (_dflash.IsDSpine && _backend == BackendType.GgmlCpu));
 
         /// <summary>A quantized weight the fused kernels can bind by cache key.
-        /// (ModelBase has no such helper; the trunk kernels each roll their own.)</summary>
+        /// (ModelBase has no such helper; the trunk kernels each roll their own.)
+        /// A DSpine drafter's BF16/F16 linears are bound in their file encoding.</summary>
         private bool TryDFlashQuant(string name, out QuantizedWeight qw)
-            => _quantWeights.TryGetValue(name, out qw) && qw != null && qw.CacheKey != IntPtr.Zero;
+            => (_quantWeights.TryGetValue(name, out qw) && qw != null && qw.CacheKey != IntPtr.Zero)
+               || TryDSpineRaw(name, out qw);
 
         private unsafe void BuildDFlashArrays()
         {
@@ -307,8 +311,9 @@ namespace TensorSharp.Models
             if (Array.TrueForAll(a.Scales, scale => scale == 1f))
                 a.Scales = null;
             _dflashArrays = a;
-            Console.WriteLine($"  DFlash fused drafter armed ({n} draft layers, ring {a.RingRows} rows, "
-                + (cfg.HasSelector ? "on-device lattice" : "on-device top-1")
+            Console.WriteLine($"  {(cfg.IsDSpine ? "DSpine" : "DFlash")} fused drafter armed ({n} draft layers, ring {a.RingRows} rows, "
+                + (cfg.IsDSpine ? "block-causal draft with the code bridge, on-device refinement lattice"
+                    : cfg.HasSelector ? "on-device lattice" : "on-device top-1")
                 + (cfg.HasConv ? $", conv {cfg.ConvKernelSize}x{cfg.ConvGroupSize}" : string.Empty) + ").");
         }
 
@@ -329,6 +334,8 @@ namespace TensorSharp.Models
         {
             if (_dflashArrays != null)
                 GgmlBasicOps.DFlashResetCaches();
+            if (_dspineState != null)
+                GgmlBasicOps.DSpineResetCaches();
             _dflashRingFilled = 0;
             _dflashRingValidFrom = 0;
         }
@@ -562,6 +569,10 @@ namespace TensorSharp.Models
         /// </summary>
         private int TryFusedDFlashDraftBlock(int anchorToken, int position, int b, int[] draftOut, float[] confOut)
         {
+            // DSpine has its own graph and no per-op fallback (never -1).
+            if (_dflash.IsDSpine)
+                return TryFusedDSpineDraftBlock(anchorToken, position, b, draftOut, confOut);
+
             var a = GetDFlashArrays();
             if (a == null)
                 return -1;
@@ -664,7 +675,8 @@ namespace TensorSharp.Models
         {
             var a = GetDFlashArrays();
             var cfg = _dflash;
-            if (a == null || cfg.MarkovRank > 0 || cfg.HasAttentionSinks || _backend != BackendType.GgmlCuda)
+            // DSpine drafts lane by lane (no batched DSpine graph yet).
+            if (a == null || cfg.MarkovRank > 0 || cfg.HasAttentionSinks || cfg.IsDSpine || _backend != BackendType.GgmlCuda)
                 return false;
             int lanes = requestIds.Count;
             int b = Math.Min(cfg.BlockSize, DFlashBatchDraftWidth + 1);
