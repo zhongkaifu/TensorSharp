@@ -46,7 +46,7 @@ namespace TensorSharp.Models
 {
     public partial class Qwen35Model
     {
-        private sealed class Qwen35KvCacheHolder
+        internal sealed class Qwen35KvCacheHolder
         {
             // Attention KV (one entry per layer; recurrent layers are null).
             public Tensor[] K;
@@ -332,15 +332,105 @@ namespace TensorSharp.Models
 
         private Qwen35KvCacheHolder CreateFreshHolder()
         {
+            Qwen35KvCacheHolder holder;
             if (_holderPool != null && _holderPool.Count > 0)
             {
-                var reused = _holderPool[_holderPool.Count - 1];
+                holder = _holderPool[_holderPool.Count - 1];
                 _holderPool.RemoveAt(_holderPool.Count - 1);
-                ResetHolderForReuse(reused);
-                return reused;
+                ResetHolderForReuse(holder);
             }
-            return AllocateHolder(_initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity);
+            else
+            {
+                holder = AllocateHolder(FreshHolderCapacity());
+            }
+            // Its device copies are made on first use. Make room for them now by demoting the least recently used
+            // retained holders' K/V to host memory: every finished request retains its end state, and without this the
+            // retained holders' device copies were only ever demoted for a clone, so they piled up a request at a time
+            // (a 32K-window 27B holder is 2 GiB) until the fused graphs of later requests found no memory and every
+            // later request ran on the slow fallbacks. A demotion frees through TSGgml_InvalidateHostBuffer, which
+            // moves the cached-buffer epoch for graphs that hold the copy and resets the persisted Qwen3.5 graphs.
+            if (DeviceHolderCopiesEnabled)
+                EnsureDeviceRetainHeadroom(HolderKvBytes(holder, holder.KvCapacity), requireReserve: false, exclude: holder);
+            return holder;
         }
+
+        /// <summary>Rows a new per-request holder starts with on one ggml_cuda device, as Flash Next's do
+        /// (Qwen4ExpModel.FreshHolderCapacity).</summary>
+        internal const int CudaFreshHolderTokens = 2048;
+
+        /// <summary>Rows of K/V admission leaves room for per concurrent ggml_cuda request: the first doublings of a
+        /// holder that starts at <see cref="CudaFreshHolderTokens"/> (Qwen4ExpModel.CudaSequenceGrowthTokens).</summary>
+        internal const int CudaSequenceGrowthTokens = 8192;
+
+        private bool _freshHolderCapacityLogged;
+
+        /// <summary>
+        /// Rows a new per-request holder starts with. An explicit MAX_CONTEXT sizes the primary cache for the whole
+        /// window (ResolveInitialCacheAllocationLength), and every per-request holder used to take the same: 2 GiB of
+        /// K/V per Qwen3.8-27B request at MAX_CONTEXT=32768, whatever its prompt, which a finished request then kept
+        /// on the device as its retained state. On one ggml_cuda device a new holder starts at
+        /// <see cref="CudaFreshHolderTokens"/> and grows with its request (PrepareForPrefill reserves prompt plus
+        /// budget), as Flash Next's do there; the primary keeps the whole window, and an explicit
+        /// <c>TS_KV_INITIAL_TOKENS</c> sets both.
+        /// </summary>
+        private int FreshHolderCapacity()
+        {
+            int initial = _initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity;
+            if (!AdmitsSequencesByDeviceMemory || initial <= CudaFreshHolderTokens
+                || ExecutionOptions.FromEnvironment().KvInitialTokens > 0)
+                return initial;
+            if (!_freshHolderCapacityLogged)
+            {
+                _freshHolderCapacityLogged = true;
+                Console.WriteLine($"[qwen35] per-request caches start at {CudaFreshHolderTokens} tokens and grow with " +
+                    $"their request (the primary keeps {initial}); TS_KV_INITIAL_TOKENS sets both.");
+            }
+            return CudaFreshHolderTokens;
+        }
+
+        /// <summary>
+        /// Whether one CUDA device's free memory bounds how many requests hold state at once (ggml_cuda on a single
+        /// device; tensor parallelism and a layer split plan their devices explicitly), as for Flash Next.
+        /// </summary>
+        private bool AdmitsSequencesByDeviceMemory =>
+            _backend == BackendType.GgmlCuda && !IsTensorParallel && LayerSplitDegree <= 1;
+
+        /// <summary>
+        /// A new concurrent request's holder needs room on the device for its first doublings beside a headroom (the
+        /// headroom Flash Next keeps, Qwen4ExpModel.MetalHeadroom). Idle retained holders give up their device copies
+        /// first, then the kept arenas; when it still does not fit, the request waits for a running one to finish
+        /// (SequenceSlotUnavailableException, the scheduler's DeferForSequenceSlot) instead of failing its fused graphs
+        /// mid-step. A lone request runs on the primary cache and never comes here.
+        /// </summary>
+        private void EnsureDeviceRoomForAnotherSequence(string requestId)
+        {
+            if (!AdmitsSequencesByDeviceMemory)
+                return;
+            if (!TryGetDeviceMemory(out long free, out long total) || total <= 0)
+                return;
+            long need = AnotherSequenceBytes();
+            if (free - need >= Qwen4ExpModel.MetalHeadroom(total))
+                return;
+            if (DeviceHolderCopiesEnabled)
+                EnsureDeviceRetainHeadroom(need, requireReserve: false);
+            if (TryGetDeviceMemory(out free, out total)
+                && free - need >= Qwen4ExpModel.MetalHeadroom(total))
+                return;
+            if (ReleaseKeptDeviceArenas() > 0 && TryGetDeviceMemory(out free, out total)
+                && free - need >= Qwen4ExpModel.MetalHeadroom(total))
+                return;
+            throw new SequenceSlotUnavailableException(
+                $"qwen35: no CUDA memory for another concurrent request's state ({need / 1048576.0:F0} MB needed, " +
+                $"{free / 1048576.0:F0} MB free of {total / 1048576.0:F0} MB, " +
+                $"{Qwen4ExpModel.MetalHeadroom(total) / 1048576.0:F0} MB kept free); " +
+                $"{requestId} waits for a running request to finish.");
+        }
+
+        /// <summary>A fresh holder's K/V grown to <see cref="CudaSequenceGrowthTokens"/> rows (within the window) plus
+        /// its recurrent state and per-request extras (Flash Next's allowance).</summary>
+        private long AnotherSequenceBytes()
+            => (long)Math.Min(_maxContextLength, Math.Max(FreshHolderCapacity(), CudaSequenceGrowthTokens)) * KvCacheBytesPerToken
+               + (256L << 20);
 
         // Only active CUDA clones opt into this reuse. Long-lived checkpoints
         // still allocate compact independent storage, and other backends retain
@@ -475,6 +565,9 @@ namespace TensorSharp.Models
 
             if (string.Equals(_activeFusedKey, requestId, StringComparison.Ordinal))
                 return false; // already active
+            // Before anything moves: a request that has to wait leaves the active cache as it was.
+            if (!_fusedHolders.ContainsKey(requestId))
+                EnsureDeviceRoomForAnotherSequence(requestId);
 
             // Save whatever cache is currently checked out so its (possibly grown)
             // tensors aren't lost when we repoint the active fields. Its verify state
@@ -1490,15 +1583,25 @@ namespace TensorSharp.Models
         // first. Recurrent state (a few percent of the bytes) keeps the host path.
 
         // Device copies are keyed by GGML host storage; any other allocator has none to copy.
-        private bool DeviceHolderCopiesEnabled =>
+        private protected virtual bool DeviceHolderCopiesEnabled =>
             _backend == BackendType.GgmlCuda && !IsTensorParallel && _allocator is GgmlAllocator
             && !string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_DEVICE_HOLDER_COPY"), "0", StringComparison.Ordinal);
+
+        /// <summary>The device's free and total memory. Virtual, with <see cref="DeviceHolderCopiesEnabled"/>,
+        /// <see cref="CanCopyHolderKvOnDevice"/>, <see cref="DemoteRetainedHolderKv"/> and
+        /// <see cref="ReleaseKeptDeviceArenas"/>, so the eviction and admission policy runs against a simulated
+        /// device in tests (Qwen35DeviceHolderEvictionTests).</summary>
+        private protected virtual bool TryGetDeviceMemory(out long free, out long total)
+            => GgmlBasicOps.TryGetDeviceMemoryInfo(out free, out total);
+
+        /// <summary>Free the idle arenas the graph slots keep on the device; returns the bytes freed.</summary>
+        private protected virtual long ReleaseKeptDeviceArenas() => GgmlBasicOps.ReleaseKeptArenas();
 
         /// <summary>True when every main-stack attention K/V tensor of <paramref name="holder"/>
         /// has a resident device copy that a device-to-device clone can read. Auxiliary
         /// (NextN) layers that no graph has bound keep their host bytes and are copied
         /// on the host.</summary>
-        private bool CanCopyHolderKvOnDevice(Qwen35KvCacheHolder holder)
+        private protected virtual bool CanCopyHolderKvOnDevice(Qwen35KvCacheHolder holder)
         {
             if (!DeviceHolderCopiesEnabled || holder?.K == null || holder.V == null || _isRecurrent == null)
                 return false;
@@ -1526,7 +1629,7 @@ namespace TensorSharp.Models
 
         /// <summary>Free device memory a retained (idle) holder's device K/V copies must leave
         /// for activations, graphs and new requests. Env TS_QWEN35_DEVICE_RETAIN_RESERVE_MB.</summary>
-        private static long DeviceRetainReserveBytes(long totalBytes)
+        internal static long DeviceRetainReserveBytes(long totalBytes)
         {
             string raw = Environment.GetEnvironmentVariable("TS_QWEN35_DEVICE_RETAIN_RESERVE_MB");
             if (long.TryParse(raw, out long mb) && mb >= 0)
@@ -1564,7 +1667,7 @@ namespace TensorSharp.Models
                 return false;
             for (int attempt = 0; attempt < 32; attempt++)
             {
-                if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) || total <= 0)
+                if (!TryGetDeviceMemory(out long free, out long total) || total <= 0)
                     return !requireReserve;
                 if (free - neededBytes >= DeviceRetainReserveBytes(total))
                     return true;
@@ -1841,7 +1944,7 @@ namespace TensorSharp.Models
         /// <summary>Move an idle retained holder's K/V to host memory: download device-
         /// authoritative rows, then drop the device copies (which also retires any graph
         /// still bound to them). Its recurrent state is untouched.</summary>
-        private bool DemoteRetainedHolderKv(Qwen35KvCacheHolder holder)
+        private protected virtual bool DemoteRetainedHolderKv(Qwen35KvCacheHolder holder)
         {
             WaitIdleKvSync(holder);
             WaitCaptureReads(holder.K, holder.V);

@@ -1175,6 +1175,11 @@ namespace TensorSharp.Models
             }
 
             DType kvDtype = _kvCacheDtype.ToDType();
+            // The grown cache's device copies sit beside the old ones until the copy is done: demote idle retained
+            // holders' copies for them first, as CreateFreshHolder does for a new holder (a per-request holder starts
+            // at CudaFreshHolderTokens rows and grows here).
+            if (growOnDevice)
+                EnsureDeviceRetainHeadroom((long)newCapacity * KvCacheBytesPerToken, requireReserve: false);
             if (growOnDevice && TryGrowAttentionCacheOnDevice(newCapacity, kvDtype))
             {
                 _kvCacheCapacity = newCapacity;
