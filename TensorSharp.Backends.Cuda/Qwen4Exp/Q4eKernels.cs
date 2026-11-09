@@ -41,7 +41,7 @@ namespace TensorSharp.Cuda
         /// <summary>Values per mixer slice (Q4E_HC_SLICE) and floats of partials per slice (Q4E_HC_PARTIAL).</summary>
         public const int HcSlice = 256, HcPartialFloats = 1 + MaxStreams;
         private readonly IntPtr gdnPrep, convUpdate;
-        private readonly IntPtr attnPrep, attention;
+        private readonly IntPtr attnPrep, attention, attentionG4;
         private readonly IntPtr qsaStore, qsaPool, qsaQuery, qsaScores, qsaSelect;
         private readonly IntPtr pleGate, groupNorm, pleConv;
         private readonly IntPtr sharedGate, setStreamRows;
@@ -60,6 +60,7 @@ namespace TensorSharp.Cuda
             convUpdate = module.GetFunction("ts_q4e_conv_update_f32");
             attnPrep = module.GetFunction("ts_q4e_attn_prep_f32");
             attention = module.GetFunction("ts_q4e_attention_f32");
+            attentionG4 = module.GetFunction("ts_q4e_attention_g4_f32");
             qsaStore = module.GetFunction("ts_q4e_qsa_store_f32");
             qsaPool = module.GetFunction("ts_q4e_qsa_pool_f32");
             qsaQuery = module.GetFunction("ts_q4e_qsa_query_f32");
@@ -206,8 +207,22 @@ namespace TensorSharp.Cuda
             IntPtr a0 = q, a1 = kCache, a2 = vCache, a3 = gate, a4 = cells, a5 = cellCnt, a6 = output, a7 = positions;
             int a8 = p0, a9 = nHead, a10 = nKvHead; float a11 = scale; int a12 = cellStride;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };
-            Launch(attention, (uint)nHead, (uint)rows, 1, BlockSize, stream, args);
+            // A prefill ubatch's rows: four query heads of a KV head to a block, so each cell's K and V load
+            // once for the four (bit-identical: each head computes as below). Decode-size steps keep a block a
+            // head, which leaves more blocks to fill the GPU with few rows.
+            if (rows > PrefillAttentionMinRows && GroupedPrefillAttention && nHead % 4 == 0 && (nHead / nKvHead) % 4 == 0)
+                Launch(attentionG4, (uint)(nHead / 4), (uint)rows, 1, BlockSize, stream, args);
+            else
+                Launch(attention, (uint)nHead, (uint)rows, 1, BlockSize, stream, args);
         }
+
+        /// <summary>Rows above which <see cref="Attention"/> groups query heads.</summary>
+        private const int PrefillAttentionMinRows = 16;
+
+        /// <summary>TS_Q4E_GROUPED_ATTENTION=0: every attention runs a block per query head (A/B; settable for
+        /// tests).</summary>
+        internal static bool GroupedPrefillAttention { get; set; } =
+            Environment.GetEnvironmentVariable("TS_Q4E_GROUPED_ATTENTION") != "0";
 
         // ---- QSA ----
 

@@ -628,6 +628,134 @@ extern "C" __global__ void ts_q4e_attention_f32(
     }
 }
 
+// ts_q4e_attention_f32 for HG query heads of one KV head in a block: each cell's K and V rows load once for the
+// group instead of once per head. Each head keeps that kernel's arithmetic exactly (the same warp per cell
+// split, dot order, online softmax and cross-warp combine), so the output is bit-identical.
+// grid (NH / HG, nt), 256 threads = 8 warps splitting the cells; lane owns 8 of the 256 dims.
+template <int HG>
+__device__ __forceinline__ void q4e_attention_group(
+    const float* __restrict__ q, const half* __restrict__ kCache, const half* __restrict__ vCache,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions, const int p0, const int NH, const int NKV,
+    const float scale, const int cellStride)
+{
+    const int h0 = blockIdx.x * HG;
+    const int t = blockIdx.y;
+    const int kvh = h0 / (NH / NKV);
+    const int p = positions != nullptr ? positions[t] : p0 + t;
+    const int32_t* list = nullptr;
+    int n = p + 1;
+    if (cells != nullptr && cellCnt[t] >= 0)
+    {
+        n = cellCnt[t];
+        list = cells + (size_t)t * cellStride;
+    }
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    float qReg[HG][8];
+#pragma unroll
+    for (int g = 0; g < HG; ++g)
+    {
+        const float* qRow = q + ((size_t)t * NH + h0 + g) * Q4E_ATTN_HD + lane * 8;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            qReg[g][i] = qRow[i];
+    }
+    float m[HG], sum[HG], acc[HG][8];
+#pragma unroll
+    for (int g = 0; g < HG; ++g)
+    {
+        m[g] = -INFINITY;
+        sum[g] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            acc[g][i] = 0.0f;
+    }
+    for (int i = warp; i < n; i += 8)
+    {
+        const int c = list != nullptr ? list[i] : i;
+        const size_t at = ((size_t)c * NKV + kvh) * Q4E_ATTN_HD + lane * 8;
+        const int4 kw = *reinterpret_cast<const int4*>(kCache + at);
+        const int4 vw = *reinterpret_cast<const int4*>(vCache + at);
+        const half2* kh = reinterpret_cast<const half2*>(&kw);
+        const half2* vh = reinterpret_cast<const half2*>(&vw);
+        float kf[8], vf[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            const float2 a = __half22float2(kh[j]);
+            const float2 b = __half22float2(vh[j]);
+            kf[2 * j] = a.x; kf[2 * j + 1] = a.y;
+            vf[2 * j] = b.x; vf[2 * j + 1] = b.y;
+        }
+#pragma unroll
+        for (int g = 0; g < HG; ++g)
+        {
+            float part = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                part += qReg[g][j] * kf[j];
+            const float s = q4e_warp_sum(part) * scale;
+            if (s > m[g])
+            {
+                const float r = expf(m[g] - s);
+                sum[g] *= r;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    acc[g][j] *= r;
+                m[g] = s;
+            }
+            const float w = expf(s - m[g]);
+            sum[g] += w;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                acc[g][j] += w * vf[j];
+        }
+    }
+
+    __shared__ float shAcc[8][Q4E_ATTN_HD];
+    __shared__ float shM[8], shSum[8];
+#pragma unroll
+    for (int g = 0; g < HG; ++g)
+    {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            shAcc[warp][lane * 8 + j] = acc[g][j];
+        if (lane == 0)
+        {
+            shM[warp] = m[g];
+            shSum[warp] = sum[g];
+        }
+        __syncthreads();
+        float M = -INFINITY;
+#pragma unroll
+        for (int w = 0; w < 8; ++w)
+            M = fmaxf(M, shM[w]);
+        float S = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w)
+            S += shSum[w] * (shM[w] == -INFINITY ? 0.0f : expf(shM[w] - M));
+        const float invS = 1.0f / S;
+        const size_t off = ((size_t)t * NH + h0 + g) * Q4E_ATTN_HD;
+        for (int d = threadIdx.x; d < Q4E_ATTN_HD; d += blockDim.x)
+        {
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w)
+                v += shM[w] == -INFINITY ? 0.0f : shAcc[w][d] * expf(shM[w] - M);
+            out[off + d] = v * invS * q4e_sigmoid(gate[off + d]);
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void ts_q4e_attention_g4_f32(
+    const float* __restrict__ q, const half* __restrict__ kCache, const half* __restrict__ vCache,
+    const float* __restrict__ gate, const int32_t* __restrict__ cells, const int32_t* __restrict__ cellCnt,
+    float* __restrict__ out, const int32_t* __restrict__ positions, const int p0, const int NH, const int NKV,
+    const float scale, const int cellStride)
+{ q4e_attention_group<4>(q, kCache, vCache, gate, cells, cellCnt, out, positions, p0, NH, NKV, scale, cellStride); }
+
 // ---------------------------------------------------------------------------
 // Qwen Sparse Attention
 // ---------------------------------------------------------------------------

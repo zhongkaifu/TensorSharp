@@ -262,6 +262,7 @@ Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有�
 | `TS_QWEN35_BATCHED_DRAFT` | Qwen 3.5 / 3.8 批量推测解码 | `0` 为每个请求单独运行 DFlash 草稿图，而不是把所有请求的草稿块放进一个图 | 开 | 未注册 | 否 |
 | `TS_BATCHED_SPEC_LOG` | 批量推测解码 | `1` 打印每个批量步骤保留的 token 数以及草稿 / 验证 / 提交 / 草稿模型提交的毫秒数（`[batched-spec]`） | 关 | 未注册 | 否 |
 | `TS_SCHED_STEP_LOG` | 连续批处理执行器 | `1` 每步打印一行：距上一步的空闲间隔、服务路径耗时毫秒数，以及每个序列的预填充/解码 token 数（`[step]`） | 关 | 未注册 | 否 |
+| `TS_SCHED_PARALLEL_SAMPLE` | 连续批处理执行器 | `0` 让批量解码步骤逐行依次采样。开启时，四行及以上的步骤并行采样各行，每个序列用自己的采样器（自己的随机数生成器和缓冲区），因此抽样结果不变；在 Qwen 248K 词表上做一次全词表 top-k，每行在主机上约 0.3 ms | 开 | 未注册 | 否 |
 | `TS_GPU_LOCK_YIELD_MS` | 连续批处理执行器 | 当请求线程已在等待模型 GPU 锁（提示的媒体准备）时，执行步骤在自己获取该锁之前最多等待的毫秒数；`0` 表示步骤优先获取 | `100` | 未注册 | 否 |
 | `TS_QWEN35_BACKGROUND_CAPTURE` | Qwen 3.5 / 3.8 前缀缓存（CUDA） | `0` 让主机路径的前缀检查点同步下载请求的 K/V 行，而不是在后台流中直接写入检查点 | 开 | 未注册 | 否 |
 | `TS_QWEN35_DEVICE_STATE_HANDOFF` | Qwen 3.5 / 3.8 每请求缓存（CUDA） | `0` 让验证器的循环状态在每次易手时经主机内存搬运（每次切换持有者下载 151 MB、每次恢复再上传、位置 0 上传主机零值），而不是在设备上直接移入/移出各请求自己的设备副本 | 开 | 未注册 | 否 |
@@ -434,6 +435,8 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | `TS_GLM_TP_OVERSUBSCRIBE` | GGML 上 TP 下的 GLM 5.x | `1` 允许多个 rank 共享一张 GPU，用于在单卡机器上验证切分的正确性 | `0`（一 rank 一卡） | `0`, `1` | 否 |
 | `TS_Q4E_LAYER_SPLIT` | `--layer-split N` 下按层切分的 Qwen 3.8 Flash Next（`qwen4exp`） | 直接指定每张 GPU 分到的层数（逗号分隔，例如 `20,28`），取代自动的显存均衡；给出无法满足的值时会直接抛错，而不是静默忽略。这个架构上的 `--layer-split N` 是按层切分而非张量并行——`--tp N` 是独立的 FFN 通道切分模式，不使用此层分配覆盖值 | 自动（按各设备空闲显存装箱） | 未注册 | 否 |
 | `TS_Q4E_RETAINED_CACHE_MB` | Qwen 3.8 Flash Next（`qwen4exp`）保留复用 | 保留会话与共享前缀检查点共用的预算（MiB），受实测内存余量限制。未设置时预算为实测余量的一半（与 Qwen 3.5 对空闲 holder 的规则相同），只有无法测得余量时才用 4096；原先固定的 4096 默认值在 4x A40 张量切分上只能容纳四个并发 1.3 GB 会话中的三个。Radix 前缀缓存负责淘汰，放不下的 holder 会被拒绝（只报告一次）。`0` 或无法解析的值拒绝所有保留 | 实测余量的一半（无法测得时为 `4096`） | 未注册 | 否 |
+| `TS_Q4E_GROUPED_ATTENTION` | Qwen 3.8 Flash Next（`qwen4exp`）直连 CUDA 引擎 | `0` 让所有注意力每个查询头一个线程块。开启时，预填充 ubatch（多于 16 行）把同一 KV 头的四个查询头放进一个线程块，每个单元的 K、V 只为这四个头读取一次；每个头的计算与原来完全相同（逐位一致）。解码步骤仍每头一个线程块 | 开 | 未注册 | 否 |
+| `TS_KDA_SCAN_R4` | Qwen 3.8 Flash Next 与 GLM 5.x 直连 CUDA 引擎（门控 delta 递推） | `1` 让所有扫描每个 warp 处理四行状态。未设置时，预填充 ubatch 的扫描每个 warp 处理一行状态（在每行按顺序走完 ubatch 时可容纳四倍的 warp），并预取下一行的输入；解码步骤仍每个 warp 四行。两者对每个状态元素的计算相同（逐位一致） | 关 | 未注册 | 否 |
 | `GGML_CUDA_ALLREDUCE` | 本地 TP，`ggml_cuda` | `nccl` / `internal` / `none` —— 直接透传给 ggml 的集合通信选择；显式设置同时会跳过启动前探测 | 自动（构建时能找到 NCCL 且通过探测就用 NCCL） | 未注册 | 否 |
 | `TS_GGML_TP_CUDA_GRAPHS` | 本地 TP，`ggml_cuda` | `0` 关闭多 GPU 运行下的 CUDA graph 捕获。TP 下默认**开启**捕获：一个张量并行 token 是几十次按 rank 的小提交，重放的代价远低于重新下发（4×A40：Qwen3.5-9B tp4 88 → 128.5 tok/s，Qwen3.5-35B-A3B tp2 71.3 → 104.1）。历史上曾因捕获污染的隐患而禁用，那个隐患已不再成立——ggml 用 `cudaStreamCaptureModeRelaxed` 捕获。这个 opt-out 会在第一次后端调用之前翻译成原生的 `GGML_CUDA_DISABLE_GRAPHS`，因为 ggml 会在首次使用时锁定该值 | 开启捕获 | 未注册 | 否 |
 | `TS_GGML_TP_AR_PROBE` | 本地 TP，`ggml_cuda` | `0` 跳过两项启动前探测；`force` 忽略缓存的判定（`~/.cache/tensorsharp/tp-collective-probe`）重新探测。模型加载前，进程组会检查两件事：所宣称的设备对之间 peer copy 是否真的把数据送到，以及一次小型 NCCL AllReduce 能否端到端完成——一些云主机声称支持 P2P 但数据永远送不到，NCCL 的第一次集合通信随后会让每块 GPU 永远空转。peer 检查失败时会保留 NCCL 但拿掉它的 peer 传输（`NCCL_P2P_DISABLE=1`），这正是超过 2 张 GPU 时仍能保住设备集合通信的原因 | 探测开启，判定按 驱动/NCCL/GPU 组合缓存 | 未注册 | 否 |
