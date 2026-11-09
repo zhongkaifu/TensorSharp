@@ -391,7 +391,10 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         Assert.Equal(0, splitStaged);
         Assert.True(streamedStaged >= 2, $"the narrowed split did not stream the {LongPrompt.Length}-token prompt");
         AssertClose("windowed tier, prompt split", split, device, 1e-4);
-        AssertClose("windowed tier, prompt split vs streamed", split, streamed, 1e-4);
+        // Streaming stages the layer and computes its experts on other kernels, so the two prompts differ in
+        // rounding (4.3e-5 at the prefill on an M5 Pro), which this fixture amplifies; with the router on ggml-metal's
+        // fused top-k chain (q4e_metal_fusions) one decode step measured 1.4e-4, every argmax equal.
+        AssertClose("windowed tier, prompt split vs streamed", split, streamed, 3e-4);
     }
 
     /// <summary>A prompt-width split whose routes overflow the window (one fixed slot and three window slots for four
@@ -531,6 +534,34 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         Assert.True(after.Hits > before.Hits, "no expert read ahead was routed to");
         Assert.Equal(before.Failed, after.Failed);
         AssertClose("tier, read-ahead", with, without, 1e-5);
+    }
+
+    /// <summary>The node shapes ggml-metal runs as fewer kernels (q4e_metal_fusions: the hyper-connection norm's
+    /// gamma in the streams' shape, the router's top-k as ggml-metal's fused chain, the shared expert's GLU, the
+    /// scatter's one-term outer product) form the same products as the plain ops. All on the accelerator, and with
+    /// every layer's experts at tiered seams (the path whose router chain fuses), decode answers as with
+    /// TS_Q4E_METAL_FUSE=0 within float rounding, every argmax equal. The kernels differ from the plain ops in
+    /// rounding only (the fused norm's products may associate differently; the fused softmax reduces in its own
+    /// order), which this fixture's residual stack amplifies ~40x (its CPU-vs-Metal floor is 0.6-1.8e-2): measured
+    /// on an M5 Pro 4.6e-5 at the 40-token prefill falling to 4.7e-6 by the sixth decode step on the accelerator.
+    /// A wrong broadcast or a wrong expert would be orders of magnitude past the bound.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void FusedNodeShapes_AnswerAsThePlainOps_Metal()
+    {
+        _nativeEnv.Set("TS_MOE_ROUTE_TAIL_SKIP", "0");
+        Action<ModelBase> tier = model =>
+        {
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            Assert.Equal(8, q.RegisterExpertTiersForTests(q.ExpertCountForTests / 4, q.ExpertCountForTests));
+        };
+        _nativeEnv.Set("TS_Q4E_METAL_FUSE", "0");
+        float[][] plainDevice = Run(BackendType.GgmlMetal, () => { });
+        float[][] plainTier = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, tier, null);
+        _nativeEnv.Set("TS_Q4E_METAL_FUSE", null);
+        float[][] fusedDevice = Run(BackendType.GgmlMetal, () => { });
+        float[][] fusedTier = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, Prompt, tier, null);
+        AssertClose("fused node shapes, accelerator", fusedDevice, plainDevice, 2e-4);
+        AssertClose("fused node shapes, tiered seams", fusedTier, plainTier, 2e-4);
     }
 
     /// <summary>Discrete VRAM: fixed slots only (no host-writable window), the rest of every

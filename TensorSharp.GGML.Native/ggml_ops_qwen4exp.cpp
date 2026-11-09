@@ -1214,6 +1214,36 @@ static ggml_tensor* q4e_cont(ggml_context* ctx, ggml_tensor* t)
     return ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
 }
 
+// Node shapes ggml-metal runs as fewer kernels. A Flash Next decode token is ~3,500 dependent kernels, ~7 us each on
+// an M5 Pro against ~6 ms of weight reads, so a kernel saved per layer is ~0.3 ms a token. The same products in shapes
+// ggml-metal's own fusions match: the hyper-connection norm's gamma multiply in the streams' shape (one RMS-norm
+// kernel), the router's top-k as ggml-metal's top-k MoE chain (one kernel for softmax, top-k, gather, renormalise),
+// the shared expert's SiLU product as one GLU kernel, and the scatter's broadcast product as a one-term outer product
+// (no REPEAT); in a GDN layer, the SSM state written straight into the cache by the delta net (ggml-metal's GDN cache
+// fusion, a 3 MB copy fewer) and the conv history copied from its view without a CONT. Ten to twelve kernels a layer.
+// Metal only; TS_Q4E_METAL_FUSE=0 keeps the plain ops.
+// A dependency node keeping `t` allocated until this point of the graph: what ggml_backend_sched's alloc deps do
+// for a fused kernel's inputs (the backend's graph_optimize adds them), for graphs gallocr allocates directly. A VIEW
+// node (ggml_view_tensor would make a leaf, which the allocator does not count) of a bound constant (`anchor`, which
+// it never frees, so viewing it costs nothing) reading `t` as a second source.
+static ggml_tensor* q4e_keep_until_here(ggml_context* ctx, ggml_tensor* anchor, ggml_tensor* t)
+{
+    ggml_tensor* keep = ggml_view_1d(ctx, anchor, 1, 0);
+    keep->src[1] = t;
+    return keep;
+}
+
+static bool q4e_metal_fusions()
+{
+#if defined(TSG_GGML_USE_METAL)
+    // Read per graph build (a test compares both shapes in one process); a built span replays its own shape.
+    const char* e = std::getenv("TS_Q4E_METAL_FUSE");
+    return !(e != nullptr && e[0] == '0') && g_backend_type == BACKEND_TYPE_METAL;
+#else
+    return false;
+#endif
+}
+
 // The hyper-connection read every half-layer opens with: a grouped RMS norm (each residual stream normalised on its
 // own, then the hc-wide row scaled by gamma), the low-rank gate, the streams' gated mean (`mixed`, the block's input)
 // and the injection weights the scatter uses. In a span building with device operations (g_q4e_dev, prompt width)
@@ -1228,8 +1258,23 @@ static Q4eHcRead q4e_nodes_hc_read(ggml_context* ctx, ggml_tensor* res_in, ggml_
     Q4eHcRead r{};
     r.res3 = ggml_reshape_3d(ctx, res_in, n_embd, hc, T);
     ggml_tensor* xn = ggml_rms_norm(ctx, r.res3, eps);
-    xn = ggml_reshape_2d(ctx, xn, hc_dim, T);
-    xn = ggml_mul(ctx, xn, w_norm);
+    bool dev_hc = false;
+#if defined(TSG_GGML_USE_METAL)
+    dev_hc = g_q4e_dev != nullptr && g_q4e_dev->hc && g_q4e_dev->T == T;
+#endif
+    if (q4e_metal_fusions() && !dev_hc)
+    {
+        // gamma as [n_embd, hc]: each stream's row by its own slice, the MUL reading the norm directly - the
+        // pattern ggml-metal fuses (its kernel takes the weight row i01 % hc). The device-op path binds xn itself,
+        // which a reshape view cannot be.
+        xn = ggml_mul(ctx, xn, ggml_reshape_2d(ctx, w_norm, n_embd, hc));
+        xn = ggml_reshape_2d(ctx, xn, hc_dim, T);
+    }
+    else
+    {
+        xn = ggml_reshape_2d(ctx, xn, hc_dim, T);
+        xn = ggml_mul(ctx, xn, w_norm);
+    }
     r.xn = xn;
 
     ggml_tensor* lo = q4e_mul_mat(ctx, w_down, xn);
@@ -1300,6 +1345,13 @@ static ggml_tensor* q4e_nodes_hc_scatter(ggml_context* ctx, ggml_tensor* res3, g
     ggml_tensor* wsc = ggml_scale(ctx, ggml_sigmoid(ctx,
             ggml_scale(ctx, inject, 1.0f / (float)hc)), 2.0f);
     wsc = ggml_reshape_3d(ctx, wsc, 1, hc, T);
+    if (q4e_metal_fusions() && b->type == GGML_TYPE_F32 && ggml_is_contiguous(b))
+    {
+        // b (x) wsc per token as a one-term product: [1, n_embd, T] by [1, hc, T] -> [n_embd, hc, T], each element
+        // the single product b[m] * wsc[c] the broadcast MUL forms, without the REPEAT that writes b hc times.
+        ggml_tensor* outer = ggml_mul_mat(ctx, ggml_reshape_3d(ctx, b, 1, n_embd, T), wsc);
+        return ggml_reshape_2d(ctx, ggml_add(ctx, res3, outer), hc_dim, T);
+    }
     ggml_tensor* bexp = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, b, n_embd, 1, T), n_embd, hc, T, 1);
     return ggml_reshape_2d(ctx, ggml_add(ctx, res3, ggml_mul(ctx, bexp, wsc)), hc_dim, T);
 }
@@ -1352,7 +1404,11 @@ ggml_tensor* q4e_nodes_ffn(
     // weights - llama.cpp's build_moe_ffn with norm_w.
     ggml_tensor* logits = q4e_mul_mat(ctx, w_router, mixed);      // [n_expert, T]
     ggml_set_name(logits, "q4e.ffn.router");
-    ggml_tensor* probs = q4e_soft_max(ctx, logits);
+    // ggml-metal's top-k MoE fusion (q4e_metal_fusions) runs each row on one simdgroup whatever the row count, so a
+    // batched decode routes every request as its solo step does without splitting the softmax per row (which
+    // q4e_soft_max does to keep ggml's own softmax geometry, and which the fused chain could not match).
+    const bool fuse_topk = (cpu_moe || (graph != nullptr && g_q4e_tp_partials == nullptr)) && q4e_metal_fusions();
+    ggml_tensor* probs = fuse_topk ? ggml_soft_max(ctx, logits) : q4e_soft_max(ctx, logits);
     // ggml_argsort_top_k, not ggml_top_k: this is the exact node shape llama.cpp's
     // build_moe_ffn emits, and ggml-cuda's topk_moe fusion matches on the node
     // sequence rather than on intent.
@@ -1362,13 +1418,24 @@ ggml_tensor* q4e_nodes_ffn(
             ggml_reshape_3d(ctx, probs, 1, n_expert, T), sel);     // [1, n_used, T]
     w_sel = ggml_reshape_2d(ctx, w_sel, n_expert_used, T);
     ggml_tensor* w_sum = ggml_sum_rows(ctx, w_sel);                // [1, T]
+    // ggml-metal's top-k MoE fusion (q4e_metal_fusions) matches llama.cpp's chain with its CLAMP and a closing SCALE,
+    // the seam path's only. Neither changes a value: ten of 512 softmax weights sum to far above the clamp's 6.1e-5,
+    // and the scale is 1.
+    if (fuse_topk)
+        w_sum = ggml_clamp(ctx, w_sum, 6.103515625e-5f, std::numeric_limits<float>::infinity());
     w_sel = ggml_div(ctx, w_sel, w_sum);
-    q4e_keep_fusion_input(w_sel);
+    // (The pin is for the owned CUDA backend's prefill combine; inside the fused chain it would refuse the fusion.)
+    if (!fuse_topk) q4e_keep_fusion_input(w_sel);
     w_sel = ggml_reshape_3d(ctx, w_sel, 1, n_expert_used, T);
+    if (fuse_topk)
+        w_sel = ggml_scale(ctx, w_sel, 1.0f);
 
     ggml_tensor* sg = q4e_tp_projection(ctx, w_sh_g, mixed, nullptr, full_shared_ff, n_ff_sh, rank * n_ff_sh);
     ggml_tensor* su = q4e_tp_projection(ctx, w_sh_u, mixed, nullptr, full_shared_ff, n_ff_sh, rank * n_ff_sh);
-    ggml_tensor* shared_activation = ggml_mul(ctx, ggml_silu(ctx, sg), su);
+    // One GLU kernel computes silu(sg) * su with the SiLU kernel's own formula.
+    ggml_tensor* shared_activation = q4e_metal_fusions() && ggml_is_contiguous_1(sg) && ggml_are_same_shape(sg, su)
+        ? ggml_swiglu_split(ctx, sg, su)
+        : ggml_mul(ctx, ggml_silu(ctx, sg), su);
     ggml_tensor* moe_out = nullptr;
     if (cpu_moe)
     {
@@ -1388,14 +1455,45 @@ ggml_tensor* q4e_nodes_ffn(
         tsg::HostMoeSegment hm;
         hm.layer = layer;
         hm.moe_in = boundary(mixed);                                               // [n_embd, T]
-        hm.sel_ids = boundary(sel);                                                // [n_used, T] i32
-        hm.weights = boundary(ggml_reshape_2d(ctx, w_sel, n_expert_used, T));      // [n_used, T]
         // The segment ends right after these three. Expand them NOW, before any
         // node that reads the host's result exists: whatever consumes moe_out
         // must come later in node order, or it would read last token's value.
-        ggml_build_forward_expand(graph, hm.moe_in);
-        ggml_build_forward_expand(graph, hm.sel_ids);
-        ggml_build_forward_expand(graph, hm.weights);
+        if (fuse_topk)
+        {
+            // The fused chain's intermediates must not be graph outputs (ggml_set_output also flags a view's
+            // sources), so neither the argsort nor the division is pinned. The weights' pin reaches only the closing
+            // SCALE, the chain's output. The ids stay in the argsort's storage, held by views no node consumes:
+            // ggml-alloc frees a view source only once its last view has been consumed. The weights expand first,
+            // which puts the router's nodes in the chain's order.
+            hm.weights = boundary(ggml_reshape_2d(ctx, w_sel, n_expert_used, T));  // [n_used, T]
+            // ggml_backend_sched keeps a fused kernel's inputs allocated until its output is placed (the backend's
+            // graph_optimize adds the dependency); this graph is allocated by gallocr directly, so the dependency is
+            // a node here: a view of the pinned FFN input reading the router logits right after the chain. Without
+            // it the allocator places the weights in the logits' freed storage and ggml-metal declines the fusion.
+            // (A VIEW node, which the allocator counts; ggml_view_tensor would make a leaf.)
+            ggml_tensor* keep_logits = q4e_keep_until_here(ctx, w_router, logits);
+            ggml_tensor* hold = nullptr;
+            if (ggml_is_contiguous(sel))
+            {
+                hold = ggml_view_1d(ctx, sel, 1, 0);
+                hm.sel_ids = ggml_view_2d(ctx, sel, sel->ne[0], sel->ne[1], sel->nb[1], 0);
+            }
+            else
+                hm.sel_ids = boundary(sel);                                        // a copy: the ids' own storage
+            ggml_build_forward_expand(graph, hm.moe_in);
+            ggml_build_forward_expand(graph, hm.weights);
+            ggml_build_forward_expand(graph, keep_logits);
+            ggml_build_forward_expand(graph, hm.sel_ids);
+            if (hold != nullptr) ggml_build_forward_expand(graph, hold);
+        }
+        else
+        {
+            hm.sel_ids = boundary(sel);                                            // [n_used, T] i32
+            hm.weights = boundary(ggml_reshape_2d(ctx, w_sel, n_expert_used, T));  // [n_used, T]
+            ggml_build_forward_expand(graph, hm.moe_in);
+            ggml_build_forward_expand(graph, hm.sel_ids);
+            ggml_build_forward_expand(graph, hm.weights);
+        }
 
         // Written by the host between segments: an input (no producer) that is
         // also an output, so ggml-alloc keeps it for the whole pass.
@@ -1483,6 +1581,13 @@ ggml_tensor* q4e_nodes_ffn(
     else
     {
         ggml_tensor* moe_in = ggml_reshape_3d(ctx, mixed, n_embd, 1, T);
+        if (fuse_topk)
+        {
+            // The router chain before the expert products that read its ids, so it stays in the fusion's node
+            // order, and its logits held until its output is placed (see the seam path).
+            ggml_build_forward_expand(graph, w_sel);
+            ggml_build_forward_expand(graph, q4e_keep_until_here(ctx, w_router, logits));
+        }
         if (g_q4e_route_record != nullptr && graph != nullptr && g_q4e_tp_partials == nullptr)
         {
             ggml_tensor* ids = ggml_cont(ctx, sel);                                 // [n_used, T] i32
@@ -1687,9 +1792,11 @@ ggml_tensor* q4e_nodes_gdn(
         conv_in = ggml_concat(ctx, conv_state, qkv_t, 0); // [hist + T, conv_dim, 1]
         conv_out = ggml_silu(ctx, tsg::ssm_conv_any(ctx, conv_in, w_conv)); // [conv_dim, T, 1]
 
-        // keep the last `hist` columns for the next token
-        tail = ggml_cont(ctx, ggml_view_3d(ctx, conv_in, hist, conv_dim, 1,
-                conv_in->nb[1], conv_in->nb[2], ggml_row_size(conv_in->type, T)));
+        // keep the last `hist` columns for the next token. Every consumer copies it into a state (ggml_cpy reads
+        // strides), so on Metal it stays a view: one copy instead of a CONT and a copy.
+        tail = ggml_view_3d(ctx, conv_in, hist, conv_dim, 1,
+                conv_in->nb[1], conv_in->nb[2], ggml_row_size(conv_in->type, T));
+        if (!q4e_metal_fusions()) tail = ggml_cont(ctx, tail);
 
         // ---- delta net ----
         ggml_tensor* q = ggml_view_3d(ctx, conv_out, head_k_dim, n_k_heads, T,
@@ -3282,6 +3389,18 @@ static int q4e_token_span_impl(
                 // updated in place, and nothing else reads it.
                 if (wb.device_y != nullptr)
                     ggml_build_forward_expand(graph, res);
+                else if (q4e_metal_fusions())
+                {
+                    // The SSM state's write-back right behind the delta net, its only reader, as a copy of the net's
+                    // state tail into the cache viewed [D, 1, 1, 1]: ggml-metal's GDN cache fusion, where the net
+                    // writes the new state straight into the cache (a 3 MB copy and a kernel fewer a layer on Flash
+                    // Next; a verify span that keeps every row's state is not that pattern and copies as before).
+                    // Then the residual, which holds the concat that reads conv_state, then that write-back.
+                    ggml_build_forward_expand(graph, ggml_cpy(ctx, wb.new_state,
+                            ggml_reshape_4d(ctx, ssm_state, ggml_nelements(ssm_state), 1, 1, 1)));
+                    ggml_build_forward_expand(graph, res);
+                    ggml_build_forward_expand(graph, ggml_cpy(ctx, wb.tail, conv_state));
+                }
                 else
                 {
                     // The residual first: its tree holds every node that READS the state
