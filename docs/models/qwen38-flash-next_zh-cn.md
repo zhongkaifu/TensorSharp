@@ -1193,6 +1193,44 @@ RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（旧扫�
 | 逐 token | 1.06 / 0.79 / 0.79 s | 3.36 / 3.35 / 3.35 s | 1.00 s / 4.20-4.22 s | 239-242 tok/s |
 | 分块（默认） | 0.99 / 0.71 / 0.70 s | 3.04 / 3.02 / 3.02 s | 0.91 s / 3.79 s | 242-249 tok/s |
 
+#### 在 int8 tensor core 上计算 Q2_0 prompt 专家，2026-11-09
+
+prompt 的路由专家原来在 `ts_dsv4_moe_mma_f32` 上运行。每个 128 token 的组，每个 CTA 都把所属专家的 Q2_0 权重展开为 F16
+（scale 乘 code，用浮点运算），把激活也转为 F16，再以 F32 累加运行 F16 `mma.sync`；GeForce 显卡执行这种累加只有 F16
+速率的一半。SwiGLU 与 down 乘积的输入是对 F32 缓冲区的单独遍历。这是 16K prompt 中最大的阶段：专家用 1.08 s，而 Strata
+用 0.32 s。
+
+Strata 在 int8 tensor core 上计算这些专家，现在已移植（`TS_Q2_0_EXPERTS_INT8`，默认开启），即
+`tensorsharp_dsv4_kernels.cu` 中的 `ts_dsv4_moe_q2i8_*`：
+
+- Q2_0 的 code 0..3 原样作为 int8 操作数送入 `mma.m16n8k32`。
+- 激活每 32 个值舍入为 int8。scale 为 amax / 127，与 decode 内核的 q8_1 行相同，但保持 F32。每个块存储自身之和的负值，
+  因此 code 的 -1 偏移没有代价：一次整数加法就把整数点积精确地变成浮点数。
+- 八个特征的 gate 行与 up 行共用一个 m16 tile，因此 SwiGLU 以及把其输出舍入为 down 乘积的 int8 激活都在寄存器中完成。
+- Strata 会重新打包权重；这些内核则通过专家驻留表就地读取 GGUF 块。每个流水线阶段用 `cp.async` 复制每行的两个 18 字节
+  块（36 字节，位于 4 字节边界）。
+- scratch 复用该路线不再写入的 F32 gate/up 输出。
+- 需要 sm_80 或更新且模块为该 GPU 构建。在提交的 compute_75 基线上运行 F16 内核。
+
+舍入方式与 decode 内核相同。在模型的专家形状上（`CudaMoeQ2_0Int8Tests`），相对以双精度计算的专家块，int8 内核偏离
+9.77e-3，逐 slot 的 q8_1 内核（ggml-cuda MMQ 的算法）偏离 9.73e-3，F16 内核偏离 1.9e-4。
+
+在真实模型上（`Qwen4ExpQ2_0Int8PromptTests`，六个 22 到 12,347 token 的 prompt，关闭依赖历史的捷径），最后一个 prompt
+行的 logits 相对 F16 内核变化 4.9e-2 到 1.1e-1。把同样 prompt 的专家放到逐 slot 的 q8_1 内核上运行（ggml-cuda 的算法），
+变化为 4.8e-2 到 1.8e-1。使用 int8 时，6 个 prompt 的第一个 token 全部相同，64 token 的贪心续写有 4 个保持一致。另外两个
+在几乎打平的位置分开（"1." 对 "-"，"scan through the document" 对 "scan the document"）；q8_1 也在其中第一个位置分开。
+F16 对照组两次运行逐位相同。
+
+512 个专家、top 10、1,024 行的一层专家用时从 1.64 ms 降到 0.85 ms。
+
+RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（F16 内核用 `TS_Q2_0_EXPERTS_INT8=0`）。三次运行的 TTFT，第一次
+为冷启动。引擎基准的 short_chat、long_prompt_4k/16k 与 long_generation 检查两组均为 8/8 通过：
+
+| prompt 专家 | 4K prompt（3,540 token） | 16K prompt（14,092 token） | 引擎基准 4K / 16K TTFT | 长生成 |
+| --- | --- | --- | --- | --- |
+| F16 tensor core | 0.99 / 0.71 / 0.70 s | 3.04 / 3.02 / 3.03 s | 0.86-0.90 s / 3.79-3.80 s | 248-255 tok/s |
+| int8 tensor core（默认） | 0.84 / 0.57 / 0.55 s | 2.48 / 2.47 / 2.47 s | 0.74-0.75 s / 3.13-3.14 s | 240-249 tok/s |
+
 ### ggml_metal 上的 DFlash2 草稿模型，2026-11-08
 
 Strata 在 Mac 上用 DFlash2 起草：一种块草稿模型，一次前向最多提出 7 个 token。TensorSharp 现在在 GGML 后端上也能使用同一个草稿模型：

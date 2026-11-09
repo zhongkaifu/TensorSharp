@@ -1661,6 +1661,49 @@ three runs, the first cold; the engine bench's long-prompt and long-generation n
 | token by token | 1.06 / 0.79 / 0.79 s | 3.36 / 3.35 / 3.35 s | 1.00 s / 4.20-4.22 s | 239-242 tok/s |
 | chunked (default) | 0.99 / 0.71 / 0.70 s | 3.04 / 3.02 / 3.02 s | 0.91 s / 3.79 s | 242-249 tok/s |
 
+#### Q2_0 prompt experts on int8 tensor cores, 2026-11-09
+
+A prompt's routed experts ran on `ts_dsv4_moe_mma_f32`. For every 128-token group, each CTA widened its expert's Q2_0
+weights to F16 (scale times code, in float math) and the activations to F16 beside them, then ran F16 `mma.sync` with
+F32 accumulation, which a GeForce card issues at half its F16 rate. SwiGLU and the down product's input were separate
+passes over F32 buffers. This was the largest stage of a 16K prompt: 1.08 s of experts, where Strata spends 0.32 s.
+
+Strata runs these experts on int8 tensor cores, and that is now ported (`TS_Q2_0_EXPERTS_INT8`, on) as
+`ts_dsv4_moe_q2i8_*` in `tensorsharp_dsv4_kernels.cu`:
+
+- The Q2_0 codes 0..3 go into `mma.m16n8k32` as int8 operands, unchanged.
+- The activations are rounded to int8 per 32 values. The scale is amax / 127, as in the decode kernels' q8_1 rows, but
+  kept in F32. Each block stores minus its own sum, so the codes' -1 offset costs nothing: one integer add turns the
+  integer dot into a float exactly.
+- The gate and up rows of eight features share an m16 tile, so SwiGLU, and the rounding of its output to the down
+  product's int8 activations, happen in registers.
+- Strata repacks the weights; these kernels instead read the GGUF blocks in place through the expert residency table.
+  A pipeline stage copies two 18-byte blocks of each row (36 bytes on a 4-byte boundary) with `cp.async`.
+- The scratch reuses the F32 gate/up outputs this route no longer writes.
+- It needs sm_80 or newer and a module built for the GPU. On the committed compute_75 baseline the F16 kernel runs.
+
+The rounding is the decode kernels'. On the model's expert shapes (`CudaMoeQ2_0Int8Tests`), relative to the expert block
+computed in double, the int8 kernels move it 9.77e-3, the per-slot q8_1 kernels (the arithmetic of ggml-cuda's MMQ)
+9.73e-3, and the F16 kernel 1.9e-4.
+
+On the real model (`Qwen4ExpQ2_0Int8PromptTests`, six prompts of 22 to 12,347 tokens, the history-dependent shortcuts
+off), the last prompt row's logits move 4.9e-2 to 1.1e-1 relative from the F16 kernel's. Running the same prompts'
+experts on the per-slot q8_1 kernels, in ggml-cuda's arithmetic, moves them 4.8e-2 to 1.8e-1. With int8 the first token
+is the same in 6 of 6 prompts, and the 64-token greedy continuations stay identical in 4 of 6. The other two part at a
+near-tie ("1." against "-", "scan through the document" against "scan the document"); q8_1 parts at the first of them
+too. The F16 control repeats bit for bit.
+
+One layer of 512 experts, top 10, over 1,024 rows takes 0.85 ms instead of 1.64 ms.
+
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q2_0_EXPERTS_INT8=0` for the F16 kernel). TTFT of
+three runs, the first cold. The engine bench's short_chat, long_prompt_4k/16k and long_generation checks pass 8/8 in
+both arms:
+
+| prompt experts | 4K prompt (3,540 tokens) | 16K prompt (14,092 tokens) | engine bench 4K / 16K TTFT | long generation |
+| --- | --- | --- | --- | --- |
+| F16 tensor cores | 0.99 / 0.71 / 0.70 s | 3.04 / 3.02 / 3.03 s | 0.86-0.90 s / 3.79-3.80 s | 248-255 tok/s |
+| int8 tensor cores (default) | 0.84 / 0.57 / 0.55 s | 2.48 / 2.47 / 2.47 s | 0.74-0.75 s / 3.13-3.14 s | 240-249 tok/s |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
