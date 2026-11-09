@@ -3611,6 +3611,14 @@ namespace TensorSharp.GGML
             catch (EntryPointNotFoundException) { return 0; }
         }
 
+        /// <summary>Prompt-width offloaded layers whose experts ran on Strata's grouped GEMM at the seam, reading and writing
+        /// the span graph's own tensors (process total; 0 off Metal).</summary>
+        public static long MoeMmSeamLayers()
+        {
+            try { return GgmlNative.TSGgml_MoeMmSeamLayers(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         /// <summary>Test hook: qwen4exp span steps whose QSA layers pooled only the blocks they completed (the pooled
         /// keys kept between steps). -1 when the native library was built without the test hooks
         /// (TENSORSHARP_GGML_NATIVE_BUILD_TESTS off, as in the release and CI builds).</summary>

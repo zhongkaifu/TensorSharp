@@ -4651,6 +4651,8 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static partial long TSGgml_MoeStageBorrows();
         [LibraryImport(DllName)]
+        internal static partial long TSGgml_MoeMmSeamLayers();
+        [LibraryImport(DllName)]
         internal static partial int TSGgml_HostReadRows(IntPtr table, long rowBytes, IntPtr rows, int count, IntPtr dst);
         [LibraryImport(DllName)]
         internal static partial long TSGgml_Qwen4ExpQsaIncrementalSteps();

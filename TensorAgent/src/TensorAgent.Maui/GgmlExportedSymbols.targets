@@ -265,6 +265,7 @@
     <ReferenceNativeSymbol Include="TSGgml_MoeHotTierStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeHotTierTotalBytes" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeTierPrefetchStats" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeMmSeamLayers" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeOffloadCounters" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingCounts" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingRecordDevice" SymbolType="Function" />

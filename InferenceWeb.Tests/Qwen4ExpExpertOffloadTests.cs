@@ -346,6 +346,37 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         AssertClose($"tsm {kernels}", tsm, ggml, bound);
     }
 
+    /// <summary>A prompt-width offloaded layer of Q2_0 experts runs on Strata's grouped expert GEMM (tsm::moe_mm_encode).
+    /// With its stacks staged by the prefetch, the seam runs the GEMM on the span graph's own tensors (the router's ids
+    /// and weights, the FFN input, moe_out) instead of downloading the input, streaming it through a graph of its own and
+    /// uploading the result. Same kernels on the same bytes, so the prompt answers bit for bit as the round trip; decode
+    /// keeps the host kernels either way.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void PromptExperts_GemmAtTheSeam_AnswerAsTheRoundTrip_Metal()
+    {
+        string fixture = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "qwen4exp-q2.gguf"), 16,
+            expertGateUpType: SyntheticGguf.GgmlType.Q2_0, expertDownType: SyntheticGguf.GgmlType.Q2_0);
+        float[][] Answer(string seam, out long gemms, out long seamLayers)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_METAL_MOE_MM_SEAM", seam);
+            long mm0 = GgmlBasicOps.TsmMoeMmCount(), seam0 = GgmlBasicOps.MoeMmSeamLayers();
+            float[][] rows = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, Steps, null, null, fixture);
+            gemms = GgmlBasicOps.TsmMoeMmCount() - mm0;
+            seamLayers = GgmlBasicOps.MoeMmSeamLayers() - seam0;
+            return rows;
+        }
+        float[][] roundTrip = Answer("0", out long rtGemms, out long rtSeam);
+        float[][] seam = Answer("1", out long seamGemms, out long seamLayers);
+        _output.WriteLine($"round trip: {rtGemms} expert GEMMs, {rtSeam} at the seam; seam: {seamGemms} GEMMs, {seamLayers} at the seam");
+        Assert.Equal(8, rtGemms);   // the fixture's 8 layers, each through the streamed graph's GEMM
+        Assert.Equal(0, rtSeam);
+        Assert.Equal(8, seamGemms);
+        Assert.Equal(8, seamLayers);
+        for (int i = 0; i < seam.Length; i++)
+            Assert.True(seam[i].AsSpan().SequenceEqual(roundTrip[i]), $"row {i}: the seam's GEMM changed the logits");
+    }
+
     /// <summary>A prefill-width batch streams every expert an offloaded layer routes into its staging tensor. With a
     /// tier on unified memory, the experts the tier's fixed slots hold are copied from those slots instead of read
     /// from the file (ggml_ops_moe.cpp stage_experts_from_tier); the staged bytes are the same, so the prompt answers
