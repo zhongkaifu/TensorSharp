@@ -2877,6 +2877,23 @@ namespace tsg
         auto ms_since = [](pass_clock::time_point t) {
             return std::chrono::duration<double, std::milli>(pass_clock::now() - t).count();
         };
+        // TS_GGML_NODE_PROFILE: a prompt-width pass reports its wall time and the TS device operations between its
+        // segments (the segments themselves go to the node profile), so a prompt chunk's time is attributed.
+        static thread_local double s_prof_device_op_ms = 0;
+        static thread_local int s_prof_device_ops = 0;
+        struct ProfPassReport
+        {
+            bool on; int seq; pass_clock::time_point t0;
+            ~ProfPassReport()
+            {
+                if (!on) return;
+                std::fprintf(stderr, "[node-profile] host-MoE pass T=%d: %.1f ms wall, TS device ops %.1f ms over %d\n", seq,
+                             std::chrono::duration<double, std::milli>(pass_clock::now() - t0).count(),
+                             s_prof_device_op_ms, s_prof_device_ops);
+                s_prof_device_op_ms = 0;
+                s_prof_device_ops = 0;
+            }
+        } prof_report{graph_node_profile_enabled() && pass_seq >= 64, pass_seq, pass_clock::now()};
 
         // Prompt-sized passes: stage the next offloaded layer's experts while the accelerator runs (see
         // moe_stage_prefetch_start); every staging thread is joined before this returns.
@@ -2918,21 +2935,32 @@ namespace tsg
             if (seg < segments.size() && segments[seg].device_op)
             {
                 // Submitted without a wait: the operation is queued behind the segment (the queue and the buffers'
-                // hazard tracking order it) and the next segment behind it.
+                // hazard tracking order it) and the next segment behind it. Under TS_GGML_NODE_PROFILE the segment
+                // runs profiled (synchronously) and the operation is timed on its own, so a prompt chunk's ops and
+                // the TS kernels between them are attributed instead of hidden in one asynchronous span.
+                const bool prof = graph_node_profile_enabled();
                 if (end > begin)
                 {
                     ggml_cgraph view = ggml_graph_view(graph, begin, end);
-                    if (ggml_backend_graph_compute_async(backend, &view) != GGML_STATUS_SUCCESS)
+                    if ((prof ? graph_compute_profiled(backend, &view, kernel_name)
+                              : ggml_backend_graph_compute_async(backend, &view)) != GGML_STATUS_SUCCESS)
                     {
                         set_last_error(std::string(kernel_name) + ": host-MoE segment execution failed.");
                         return false;
                     }
                 }
                 begin = end;
+                const auto t_op = pass_clock::now();
                 if (!segments[seg].device_op(backend))
                 {
                     sync_backend(backend);
                     return false;
+                }
+                if (prof)
+                {
+                    sync_backend(backend);
+                    s_prof_device_op_ms += ms_since(t_op);
+                    ++s_prof_device_ops;
                 }
                 continue;
             }
@@ -2940,7 +2968,8 @@ namespace tsg
             {
                 const auto t_gpu = s_pass_timing ? pass_clock::now() : pass_clock::time_point{};
                 ggml_cgraph view = ggml_graph_view(graph, begin, end);
-                if (tsg::compute_graph(backend, &view) != GGML_STATUS_SUCCESS)
+                if ((graph_node_profile_enabled() ? graph_compute_profiled(backend, &view, kernel_name)
+                                                  : tsg::compute_graph(backend, &view)) != GGML_STATUS_SUCCESS)
                 {
                     set_last_error(std::string(kernel_name) + ": host-MoE segment execution failed.");
                     return false;
