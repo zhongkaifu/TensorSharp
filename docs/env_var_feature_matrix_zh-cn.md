@@ -379,7 +379,7 @@ Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有�
 | `TS_QWEN_VISION_ATTN` | Qwen 3.5 / 3.8 视觉编码器（CUDA sm_80+） | 视觉注意力内核：`mma`（张量核心，F16 操作数，F32 分数/softmax/输出；相对精确 F32 的精度与分解路径相同，编码器耗时约减半）、`ggml`（分解的 TF32 矩阵乘 + softmax）、`f32`（精确 F32 内核，较慢） | `mma` | 未注册 | 否 |
 | `TS_QWEN_VISION_F32` | Qwen 3.5 / 3.8 视觉编码器（CUDA） | `1` 选择精确 F32 注意力内核（等同 `TS_QWEN_VISION_ATTN=f32`） | 关 | 未注册 | 否 |
 | `TS_SPEC_ADAPTIVE` | 投机解码（所有草稿器） | `0` 关闭成本调节器，于是起草不再与普通 baseline 做对比、也永远不会被暂停。用于 A/B 测量：调节器每一轮的 baseline 步骤都是普通 decode，它们并不免费 | 开 | 未注册 | 否 |
-| `TS_SPEC_TURNS` | 并发解码、目标模型没有批量验证时的投机解码 | `0` 从不轮流投机，`1` 在目标模型支持时总是轮流。轮流：一个序列在自己的 holder 上做单序列投机步（最多 64 步），其他序列等待，然后由最久未被服务的序列接手，而不是每个序列在批量步中各解一个 token。未设置时：由目标模型决定（`ISpeculativeTarget.SpecTurnsPreferred`：`ggml_metal` 上带窗口专家分层的 Qwen 3.8 Flash Next）。M5 Pro、ISTA `Q2_0`、Strata 的 4 并发轮次：总吞吐 30-34 -> 37-43 tok/s | 由模型决定 | 未注册 | 否 |
+| `TS_SPEC_TURNS` | 并发解码、目标模型没有批量验证时的投机解码 | `0` 从不轮流投机，`1` 在目标模型支持时总是轮流。轮流：一个序列在自己的 holder 上做单序列投机步（最多 64 步），其他序列等待，然后由最久未被服务的序列接手，而不是每个序列在批量步中各解一个 token。未设置时：由目标模型决定（`ISpeculativeTarget.SpecTurnsPreferred`；目前没有模型偏好轮流——`ggml_metal` 上的 Qwen 3.8 Flash Next 在其 arena 把注意力半层按槽位批量运行之前偏好轮流：M5 Pro、ISTA `Q2_0`，parallel_2 批量 38.4 tok/s，轮流 37.0-37.9；parallel_4 批量 44.7-44.9，轮流 38.1-39.7） | 关闭（由模型决定） | 未注册 | 否 |
 | `TS_GGML_LOG_DEBUG` | GGML 后端 | `1` 把 ggml 的 DEBUG 日志通道透传出来而不是丢弃。它承载 CUDA 后端的 "CUDA graph warmup complete" / "reset" 这两行，而这是唯一能看出一张图是否真的被 CUDA graph 捕获的途径 | 关 | 未注册 | 否 |
 
 ## 矩阵外的 Muse Spark 开关
