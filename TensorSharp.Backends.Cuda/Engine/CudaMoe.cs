@@ -318,21 +318,19 @@ namespace TensorSharp.Cuda
             if (perSlot)
             {
                 // q80VecDecode: Q8_0 experts read a row as the dense Q8_0 matvec does (a caller opting in decodes
-                // differently in the last bits from the shared kernels). Experts read through a residency table keep
-                // the shared kernels, which follow it.
+                // differently in the last bits from the shared kernels), through the residency tables as they do.
                 IntPtr act = given ? curQ81 : Dsv4CudaEngine.Ptr(s.ActQ8A);
-                bool q80gu = q80VecDecode && dk.HasQ80VecDecode && guType == TQ8_0 && e % 32 == 0
-                    && gate.Table == IntPtr.Zero && up.Table == IntPtr.Zero;
-                bool q80dn = q80VecDecode && dk.HasQ80VecDecode && downType == TQ8_0 && ff % 32 == 0 && down.Table == IntPtr.Zero;
+                bool q80gu = q80VecDecode && dk.HasQ80VecDecode && guType == TQ8_0 && e % 32 == 0;
+                bool q80dn = q80VecDecode && dk.HasQ80VecDecode && downType == TQ8_0 && ff % 32 == 0;
                 if (q80gu)
                     dk.MoeGateUpDecodeQ80Vec(gate.Ptr, up.Ptr, act, s.Sel, s.ExpGate, s.ExpUp, ff, e, gate.RowBytes,
-                        nt, nUsed, stream);
+                        nt, nUsed, stream, gate.Table, up.Table);
                 else
                     dk.MoeGateUpDecode(gate.Ptr, up.Ptr, act, s.Sel, s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes,
                         nt, nUsed, stream, gate.Table, up.Table);
                 SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.ActQ8B, null, ff, slots, clamp, stream, fused);
                 if (q80dn)
-                    dk.MoeDownDecodeQ80Vec(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, e, ff, down.RowBytes, slots, stream);
+                    dk.MoeDownDecodeQ80Vec(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, e, ff, down.RowBytes, slots, stream, down.Table);
                 else
                     dk.MoeDownDecode(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, downType, e, ff, down.RowBytes, slots, stream, down.Table);
                 // A shared expert computed on another stream (a fork in the caller's step) joins here, where its output is read.

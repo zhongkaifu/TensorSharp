@@ -3934,7 +3934,8 @@ __device__ __forceinline__ float ts_dsv4_dot_q8_0_row_vec(const uint8_t* wRow, c
     return ts_dsv4_warp_sum(acc);
 }
 
-// grid (slots, ceil(ff / 8), 2): eight rows a block, z = 0 gate, 1 up.
+// grid (slots, ceil(ff / 8), 2): eight rows a block, z = 0 gate, 1 up. An expert's rows follow its residency table
+// when there is one (ts_dsv4_expert_rows), so a paged-in expert computes as a resident one.
 extern "C" __global__ void ts_dsv4_moe_gateup_decode_q80v_f32(
     const uint8_t* __restrict__ gateW,
     const uint8_t* __restrict__ upW,
@@ -3945,7 +3946,9 @@ extern "C" __global__ void ts_dsv4_moe_gateup_decode_q80v_f32(
     const int ff,
     const int inDim,
     const long long rowBytes,
-    const int nUsed)
+    const int nUsed,
+    const unsigned long long* __restrict__ gateTab,
+    const unsigned long long* __restrict__ upTab)
 {
     const int slot = blockIdx.x;
     const int e = sel[slot];
@@ -3955,7 +3958,8 @@ extern "C" __global__ void ts_dsv4_moe_gateup_decode_q80v_f32(
     if (rr >= ff)
         return;
     const bool isUp = blockIdx.z == 1;
-    const uint8_t* wRow = (isUp ? upW : gateW) + ((size_t)e * ff + rr) * rowBytes;
+    const uint8_t* wRow = (isUp ? ts_dsv4_expert_rows(upW, upTab, e, (size_t)ff * rowBytes)
+                                : ts_dsv4_expert_rows(gateW, gateTab, e, (size_t)ff * rowBytes)) + (size_t)rr * rowBytes;
     const float dot = ts_dsv4_dot_q8_0_row_vec(wRow, act, inDim, lane);
     if (lane == 0)
         (isUp ? upOut : gateOut)[(size_t)slot * ff + rr] = dot;
@@ -3969,7 +3973,8 @@ extern "C" __global__ void ts_dsv4_moe_down_decode_q80v_f32(
     float* __restrict__ downOut,         // [nt * nUsed, E]
     const int E,
     const int ff,
-    const long long rowBytes)
+    const long long rowBytes,
+    const unsigned long long* __restrict__ downTab)
 {
     const int slot = blockIdx.x;
     const int e = sel[slot];
@@ -3977,7 +3982,7 @@ extern "C" __global__ void ts_dsv4_moe_down_decode_q80v_f32(
     const int lane = threadIdx.x % 32;
     if (rr >= E)
         return;
-    const float dot = ts_dsv4_dot_q8_0_row_vec(downW + ((size_t)e * E + rr) * rowBytes,
+    const float dot = ts_dsv4_dot_q8_0_row_vec(ts_dsv4_expert_rows(downW, downTab, e, (size_t)E * rowBytes) + (size_t)rr * rowBytes,
         act + (size_t)slot * (ff / TS_DSV4_QK8_1), ff, lane);
     if (lane == 0)
         downOut[(size_t)slot * E + rr] = dot;
