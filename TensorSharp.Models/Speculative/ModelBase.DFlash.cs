@@ -594,6 +594,11 @@ namespace TensorSharp.Models
             _dflashPendingRowCount = 0;
             DisposeDSpine();
             DisposeDFlashRingPool();
+            if (_dflashSubHead != IntPtr.Zero)
+            {
+                GgmlBasicOps.DFlashResetCaches();   // the persisted draft graphs bind the vocabulary subset's rows
+                FreeDraftVocabSubset();
+            }
             if (_dflashRingK != null)
                 foreach (var t in _dflashRingK) t?.Dispose();
             if (_dflashRingV != null)

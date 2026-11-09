@@ -308,6 +308,8 @@ namespace TensorSharp.Models
                 a.SelSuccNe0 = selS.Ne0; a.SelSuccNe1 = selS.Ne1; a.SelSuccBytes = selS.RawBytes;
             }
 
+            ApplyDraftVocabSubset(a, cfg);
+
             if (Array.TrueForAll(a.Scales, scale => scale == 1f))
                 a.Scales = null;
             _dflashArrays = a;
@@ -315,6 +317,113 @@ namespace TensorSharp.Models
                 + (cfg.IsDSpine ? "block-causal draft with the code bridge, on-device refinement lattice"
                     : cfg.HasSelector ? "on-device lattice" : "on-device top-1")
                 + (cfg.HasConv ? $", conv {cfg.ConvKernelSize}x{cfg.ConvGroupSize}" : string.Empty) + ").");
+        }
+
+        // ---- Draft vocabulary subset (opt-in) ------------------------------------------------
+        //
+        // TS_DFLASH_DRAFT_VOCAB=<file>: the fused DFlash/DFlash2 draft scores only the listed tokens, as Strata's
+        // drafter does (its data/draft_vocab*.bin: little-endian int32 token ids, ascending; Strata ships a 106K
+        // default and 40K English, Cyrillic and French sets). The target's LM-head rows and the selector's
+        // per-token tables are gathered into subset order once, the graph runs over the smaller vocabulary, and the
+        // drafted ids are mapped back on the host. Output stays exact (the target verifies every token); a token
+        // outside the subset can never be drafted, which costs acceptance where the subset under-covers the text.
+        // DSpine keeps its own head. Off by default.
+        private int[] _dflashVocabMap;
+        private IntPtr _dflashSubHead, _dflashSubPred, _dflashSubSucc;
+        private IntPtr _dflashSubSource;          // the full head the subset was gathered from
+        private long _dflashSubHeadBytes, _dflashSubPredBytes, _dflashSubSuccBytes;
+
+        /// <summary>The vocabulary the fused draft graph scores: the subset's size, or the target's.</summary>
+        private int DFlashDraftVocabSize => _dflashVocabMap?.Length ?? Config.VocabSize;
+
+        private void MapDraftVocab(int[] ids, int count) => DraftVocabSubset.MapToTokens(_dflashVocabMap, ids, count);
+
+        private void ApplyDraftVocabSubset(DFlashArrays a, DFlashConfig cfg)
+        {
+            string path = Environment.GetEnvironmentVariable("TS_DFLASH_DRAFT_VOCAB");
+            if (string.IsNullOrEmpty(path))
+                return;
+            if (cfg.IsDSpine)
+            {
+                Console.WriteLine("  TS_DFLASH_DRAFT_VOCAB ignored: a DSpine drafter scores its own head over the full vocabulary.");
+                return;
+            }
+            long vocab = a.LmHeadNe1;
+            if (_dflashVocabMap == null || _dflashSubSource != a.LmHead)
+            {
+                FreeDraftVocabSubset();
+                if (!TryBuildDraftVocabSubset(a, cfg, path, vocab))
+                    return;
+            }
+            a.LmHead = _dflashSubHead; a.LmHeadNe1 = _dflashVocabMap.Length; a.LmHeadBytes = _dflashSubHeadBytes;
+            if (cfg.HasSelector)
+            {
+                a.SelPred = _dflashSubPred; a.SelPredNe1 = _dflashVocabMap.Length; a.SelPredBytes = _dflashSubPredBytes;
+                a.SelSucc = _dflashSubSucc; a.SelSuccNe1 = _dflashVocabMap.Length; a.SelSuccBytes = _dflashSubSuccBytes;
+            }
+        }
+
+        private bool TryBuildDraftVocabSubset(DFlashArrays a, DFlashConfig cfg, string path, long vocab)
+        {
+            int[] map = DraftVocabSubset.Load(path, vocab, cfg.HasSelector ? cfg.SelectorTopK : 1, out string problem);
+            if (problem == null && a.LmHeadBytes % vocab != 0) problem = "the LM head's rows are not whole";
+            if (problem == null && cfg.HasSelector
+                && (a.SelPredNe1 != vocab || a.SelSuccNe1 != vocab || a.SelPredBytes % vocab != 0 || a.SelSuccBytes % vocab != 0))
+                problem = "the selector tables are not one row per token";
+            if (problem != null)
+            {
+                Console.WriteLine($"  TS_DFLASH_DRAFT_VOCAB={path} not used: {problem}; the draft scores the full vocabulary.");
+                return false;
+            }
+            IntPtr source = a.LmHead;
+            _dflashSubHead = DraftVocabSubset.Gather(a.LmHead, a.LmHeadBytes / vocab, map, out _dflashSubHeadBytes);
+            if (cfg.HasSelector)
+            {
+                _dflashSubPred = DraftVocabSubset.Gather(a.SelPred, a.SelPredBytes / vocab, map, out _dflashSubPredBytes);
+                _dflashSubSucc = DraftVocabSubset.Gather(a.SelSucc, a.SelSuccBytes / vocab, map, out _dflashSubSuccBytes);
+            }
+            // Resident device copies, as the model's own weights have (WeightLoading's preload): bound by their
+            // host pointer alone, the rows were uploaded again on every draft (+3 ms per 8-row draft on the Mac).
+            try
+            {
+                bool resident = GgmlBasicOps.PreloadQuantizedWeight(_dflashSubHead, _dflashSubHead, a.LmHeadType,
+                    a.LmHeadNe0, map.Length, _dflashSubHeadBytes);
+                if (resident && cfg.HasSelector)
+                    resident = GgmlBasicOps.PreloadQuantizedWeight(_dflashSubPred, _dflashSubPred, a.SelPredType,
+                            a.SelPredNe0, map.Length, _dflashSubPredBytes)
+                        && GgmlBasicOps.PreloadQuantizedWeight(_dflashSubSucc, _dflashSubSucc, a.SelSuccType,
+                            a.SelSuccNe0, map.Length, _dflashSubSuccBytes);
+                if (!resident)
+                    problem = "its rows do not fit one device buffer";
+            }
+            catch (Exception ex) { problem = "its rows could not be placed on the device: " + ex.Message; }
+            if (problem != null)
+            {
+                FreeDraftVocabSubset();
+                Console.WriteLine($"  TS_DFLASH_DRAFT_VOCAB={path} not used: {problem}; the draft scores the full vocabulary.");
+                return false;
+            }
+            _dflashVocabMap = map;
+            _dflashSubSource = source;
+            double mib = (_dflashSubHeadBytes + _dflashSubPredBytes + _dflashSubSuccBytes) / 1048576.0;
+            Console.WriteLine($"  DFlash draft vocabulary: {map.Length} of {vocab} tokens from {path} ({mib:F1} MiB of head and "
+                + "selector rows); tokens outside it are never drafted (TS_DFLASH_DRAFT_VOCAB).");
+            return true;
+        }
+
+        private void FreeDraftVocabSubset()
+        {
+            foreach (var (p, bytes) in new[] { (_dflashSubHead, _dflashSubHeadBytes), (_dflashSubPred, _dflashSubPredBytes),
+                         (_dflashSubSucc, _dflashSubSuccBytes) })
+            {
+                if (p == IntPtr.Zero) continue;
+                GgmlBasicOps.InvalidateHostBuffer(p);
+                DraftVocabSubset.Free(p, bytes);
+            }
+            _dflashSubHead = _dflashSubPred = _dflashSubSucc = IntPtr.Zero;
+            _dflashSubHeadBytes = _dflashSubPredBytes = _dflashSubSuccBytes = 0;
+            _dflashVocabMap = null;
+            _dflashSubSource = IntPtr.Zero;
         }
 
         private DFlashArrays GetDFlashArrays()
@@ -632,7 +741,7 @@ namespace TensorSharp.Models
                 a.OutNorm,
                 a.TokEmbd, a.TokEmbdType, a.TokEmbdNe0, a.TokEmbdNe1, a.TokEmbdBytes,
                 a.LmHead, a.LmHeadType, a.LmHeadNe0, a.LmHeadNe1, a.LmHeadBytes,
-                Config.VocabSize, _dflashDraftIds, _dflashDraftConf,
+                DFlashDraftVocabSize, _dflashDraftIds, _dflashDraftConf,
                 cfg.HasConv ? cfg.ConvKernelSize : 0, cfg.ConvGroupSize, cfg.ConvNumGroups,
                 a.AttnConvBase, a.AttnConvProj, a.AttnConvProjType, a.AttnConvProjNe0, a.AttnConvProjNe1, a.AttnConvProjBytes,
                 a.FfnConvBase, a.FfnConvProj, a.FfnConvProjType, a.FfnConvProjNe0, a.FfnConvProjNe1, a.FfnConvProjBytes,
@@ -646,7 +755,11 @@ namespace TensorSharp.Models
                 return -1;
 
             if (cfg.HasSelector)
+            {
+                MapDraftVocab(_dflashSelCand, gamma * k);
                 return DFlashWalkLattice(gamma, k, _dflashSelScores, _dflashSelCand, draftOut, confOut);
+            }
+            MapDraftVocab(_dflashDraftIds, b);
 
             // Row 0 is the anchor's own prediction; plain DFlash discards it.
             int drafted = b - 1;
@@ -736,7 +849,7 @@ namespace TensorSharp.Models
                 a.OutNorm,
                 a.TokEmbd, a.TokEmbdType, a.TokEmbdNe0, a.TokEmbdNe1, a.TokEmbdBytes,
                 a.LmHead, a.LmHeadType, a.LmHeadNe0, a.LmHeadNe1, a.LmHeadBytes,
-                Config.VocabSize, idsOut, conf,
+                DFlashDraftVocabSize, idsOut, conf,
                 cfg.HasConv ? cfg.ConvKernelSize : 0, cfg.ConvGroupSize, cfg.ConvNumGroups,
                 a.AttnConvBase, a.AttnConvProj, a.AttnConvProjType, a.AttnConvProjNe0, a.AttnConvProjNe1, a.AttnConvProjBytes,
                 a.FfnConvBase, a.FfnConvProj, a.FfnConvProjType, a.FfnConvProjNe0, a.FfnConvProjNe1, a.FfnConvProjBytes,
@@ -748,6 +861,8 @@ namespace TensorSharp.Models
                 scores, cand, a.Scales);
             if (!ok)
                 return false;
+            if (cfg.HasSelector) MapDraftVocab(cand, lanes * gamma * k);
+            else MapDraftVocab(idsOut, lanes * b);
 
             for (int lane = 0; lane < lanes; lane++)
             {
