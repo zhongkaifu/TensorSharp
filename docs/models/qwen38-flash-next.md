@@ -1836,6 +1836,32 @@ Every greedy output is identical across arms, and every check passes:
 Tried and slower: a GEMV block computing 2 or 4 experts, with each thread loading its activations once for all of
 them. At 4 rows it took 4.75 and 6.45 us against 4.22, because the smaller grid kept fewer weight reads in flight.
 
+#### Row sums of the dense kernels as one reduce-scatter, 2026-11-09
+
+Each decode-once dense kernel ends with a warp sum per activation row: five shuffles each, so 20 for a 4-row window,
+against a main loop of one or two weight units per lane at Flash Next's 2560-wide rows. A window of 4 rows or more now
+reduces its rows as one reduce-scatter (`ts_dsv4_rows_reduce_scatter`). At each step of the warp sum's xor butterfly
+(16, 8, 4, 2, 1), a lane keeps half of its rows and adds its partner's values for them: 6 shuffles for 4 rows. Every add
+is the butterfly's own (the lane's partial plus its partner's, the same partners in the same order), so each row's sum is
+the same bits as before, at every width.
+
+Below 4 rows the kernels keep a warp sum each: there the reduce-scatter took them from 64-80 registers to 128 and slowed
+the 2- and 3-row calls. Done the same way, the router's block GEMV gained nothing (4.21 -> 4.20 us at 4 rows), so it
+keeps its sums.
+
+The dense fingerprints (`Dsv4DenseFastFingerprintTests`), the width tests and the row-invariance tests are unchanged.
+RTX 5090, 4 rows, cold weights (us): qkv IQ4_XS 2560 -> 10240 11.15 -> 10.65; attention q Q2_0 2560 -> 12288
+11.91 -> 11.30; ssm_out Q5_K 6144 -> 2560 12.61 -> 12.16; hyper-connection up Q8_0 320 -> 10240 5.10 -> 4.48; down
+10240 -> 320 5.27 -> 5.36. 1-3 rows unchanged.
+
+Engine bench, two builds, two alternating passes per arm. Every greedy output is identical across arms, and every check
+passes:
+
+| row sums | long generation | 4-row verify window | 4K / 16K 4-row window |
+| --- | --- | --- | --- |
+| a warp sum per row | 232-245 tok/s | 10.02-10.03 ms | 13.36 / 11.05-11.07 ms |
+| one reduce-scatter (default) | 234-248 tok/s | 9.89-9.94 ms | 13.28-13.30 / 10.93-10.96 ms |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
