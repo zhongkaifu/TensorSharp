@@ -146,16 +146,112 @@ public class ApiExceptionMiddlewareTests
         Assert.Equal("abc123", ctx.Response.Headers[RequestLoggingMiddleware.RequestIdHeader]);
     }
 
-    [Fact]
-    public async Task AfterResponseStarted_TheExceptionPropagates()
+    /// <summary>
+    /// A context whose response has begun as <paramref name="contentType"/>, as a
+    /// stream has once its first event is out.
+    /// </summary>
+    private static DefaultHttpContext StartedContextFor(string path, string contentType)
     {
-        // A streaming completion that fails mid-body has already committed its
-        // status line; dropping the connection is the only signal SSE has.
-        var ctx = ContextFor("/v1/chat/completions");
+        var ctx = ContextFor(path);
         ctx.Features.Set<Microsoft.AspNetCore.Http.Features.IHttpResponseFeature>(new StartedResponseFeature());
+        ctx.Response.ContentType = contentType;
+        return ctx;
+    }
+
+    /// <summary>
+    /// The exception a Qwen3.5 server threw from a decode step after a 16K prompt
+    /// had filled the device: the OpenAI stream used to stop without a
+    /// finish_reason or an error, and the bench's stream_completed check could only
+    /// report a truncated reply.
+    /// </summary>
+    private static Task ThrowMidStream() =>
+        throw new InvalidOperationException("Native GGML RmsNorm failed: cudaMalloc failed: out of memory");
+
+    [Fact]
+    public async Task OpenAiChatStreamThatFails_EndsWithAnErrorChunkAndDone()
+    {
+        var ctx = StartedContextFor("/v1/chat/completions", "text/event-stream");
+
+        await ApiExceptionMiddleware.InvokeAsync(ctx, ThrowMidStream);
+
+        string body = await BodyOf(ctx);
+        Assert.EndsWith("data: [DONE]\n\n", body);
+        string[] events = body.Split("\n\n", StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(2, events.Length);
+        Assert.StartsWith("data: ", events[0]);
+        using var doc = JsonDocument.Parse(events[0]["data: ".Length..]);
+        JsonElement error = doc.RootElement.GetProperty("error");
+        Assert.Equal(ApiExceptionMiddleware.StreamFailureMessage, error.GetProperty("message").GetString());
+        Assert.Equal("internal_error", error.GetProperty("type").GetString());
+        // As with a 500 body, the exception's detail stays in the server log.
+        Assert.DoesNotContain("cudaMalloc", body);
+    }
+
+    [Fact]
+    public async Task ResponsesStreamThatFails_EndsWithAnErrorEvent()
+    {
+        var ctx = StartedContextFor("/v1/responses", "text/event-stream");
+
+        await ApiExceptionMiddleware.InvokeAsync(ctx, ThrowMidStream);
+
+        string body = await BodyOf(ctx);
+        Assert.StartsWith("event: error\ndata: ", body);
+        using var doc = JsonDocument.Parse(body["event: error\ndata: ".Length..].TrimEnd('\n'));
+        Assert.Equal("error", doc.RootElement.GetProperty("type").GetString());
+        Assert.Equal("server_error", doc.RootElement.GetProperty("code").GetString());
+        Assert.Equal(ApiExceptionMiddleware.StreamFailureMessage, doc.RootElement.GetProperty("message").GetString());
+    }
+
+    [Fact]
+    public async Task WebUiStreamThatFails_EndsWithADoneErrorFrame()
+    {
+        var ctx = StartedContextFor("/api/chat", "text/event-stream");
+
+        await ApiExceptionMiddleware.InvokeAsync(ctx, ThrowMidStream);
+
+        string body = await BodyOf(ctx);
+        Assert.StartsWith("data: ", body);
+        using var doc = JsonDocument.Parse(body["data: ".Length..].TrimEnd('\n'));
+        Assert.True(doc.RootElement.GetProperty("done").GetBoolean());
+        Assert.Equal(ApiExceptionMiddleware.StreamFailureMessage, doc.RootElement.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task OllamaStreamThatFails_EndsWithAnErrorLine()
+    {
+        var ctx = StartedContextFor("/api/generate", "application/x-ndjson");
+
+        await ApiExceptionMiddleware.InvokeAsync(ctx, ThrowMidStream);
+
+        string body = await BodyOf(ctx);
+        Assert.EndsWith("\n", body);
+        using var doc = JsonDocument.Parse(body.TrimEnd('\n'));
+        Assert.Equal(ApiExceptionMiddleware.StreamFailureMessage, doc.RootElement.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task AfterANonStreamBodyStarted_TheExceptionPropagates()
+    {
+        // A JSON body cut off mid-write has no frame left to add: dropping the
+        // connection is the only signal it has.
+        var ctx = StartedContextFor("/v1/chat/completions", "application/json");
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            ApiExceptionMiddleware.InvokeAsync(ctx, () => throw new InvalidOperationException("mid-stream")));
+            ApiExceptionMiddleware.InvokeAsync(ctx, () => throw new InvalidOperationException("mid-body")));
+        Assert.Equal(string.Empty, await BodyOf(ctx));
+    }
+
+    [Fact]
+    public async Task ClientAbortMidStream_WritesNothing()
+    {
+        var ctx = StartedContextFor("/v1/chat/completions", "text/event-stream");
+        using var aborted = new CancellationTokenSource();
+        await aborted.CancelAsync();
+        ctx.RequestAborted = aborted.Token;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            ApiExceptionMiddleware.InvokeAsync(ctx, () => Task.FromCanceled(aborted.Token)));
+        Assert.Equal(string.Empty, await BodyOf(ctx));
     }
 
     [Fact]
