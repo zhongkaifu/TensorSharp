@@ -23,6 +23,7 @@ bool precise_rows_enabled();
 bool mps_projection_enabled(bool require_float32_precision = false);
 bool fused_ops_enabled(bool qualified_default = false);
 bool cuda_pedantic_enabled(bool require_float32_precision = false);
+bool cuda_f32_products_enabled();
 bool dense_projection_enabled(bool require_float32_precision);
 
 struct audio_graph {
@@ -131,7 +132,7 @@ struct audio_graph {
             handled = tsg_gemma4_audio_metal_graph_compute(g_backend, graph, &status, require_float32_precision);
 #endif
 #if defined(TSG_GGML_USE_CUDA)
-        if (cuda_pedantic_enabled(require_float32_precision)) {
+        if (cuda_pedantic_enabled(require_float32_precision) || cuda_f32_products_enabled()) {
             // A scoped owned backend dispatches custom F32 GEMMs with its
             // private pedantic cuBLAS handle. Ordinary ggml CUDA nodes retain
             // the original stream; no shared handle math mode is mutated.
@@ -188,7 +189,8 @@ ggml_tensor * pad_time(audio_graph& graph, ggml_tensor * input, int channels, in
 }
 
 ggml_tensor * full_precision_mul(ggml_context * ctx, ggml_tensor * left, ggml_tensor * right, bool require_float32_precision = false) {
-    if (cuda_pedantic_enabled(require_float32_precision)) return tsg_matmul_f32(ctx, left, right);
+    if (cuda_pedantic_enabled(require_float32_precision) || (cuda_f32_products_enabled() && !ggml_is_quantized(left->type)))
+        return tsg_matmul_f32(ctx, left, right);
     auto * result = ggml_mul_mat(ctx, left, right);
     ggml_prec_set_acc(result, GGML_PREC_F32);
     return result;
@@ -215,6 +217,24 @@ bool cuda_pedantic_enabled(bool require_float32_precision) {
         (require_float32_precision || (value && std::strcmp(value, "1") == 0));
 #else
     (void)require_float32_precision;
+    return false;
+#endif
+}
+
+// ggml-cuda creates every cuBLAS handle with CUBLAS_TF32_TENSOR_OP_MATH (common.cuh), so an F32
+// ggml_mul_mat that reaches cuBLAS (a projection of more than three rows; one to three rows take
+// ggml's exact F32 vector kernel) may run on TF32 tensor cores although full_precision_mul asks
+// for GGML_PREC_F32: that selects the F32 compute type, not the math mode. On the 5090 the
+// conformer fixture's 25- and 96-row blocks came out 5.8e-4 / 7.1e-4 from the double reference,
+// against 4.3e-7 / 7.6e-7 with these products on the pedantic handle. So F32 (and F16/BF16)
+// products of these graphs go through TensorSharp's pedantic F32 GEMM on CUDA by default;
+// TS_GEMMA4_AUDIO_GGML_CUDA_PEDANTIC=0 keeps ggml's TF32 cuBLAS products. Quantized (Q8_0)
+// projections keep ggml's integer kernels unless pedantic dense projections are asked for.
+bool cuda_f32_products_enabled() {
+#if defined(TSG_GGML_USE_CUDA)
+    const auto * value = std::getenv("TS_GEMMA4_AUDIO_GGML_CUDA_PEDANTIC");
+    return g_backend_type == BACKEND_TYPE_CUDA && !(value && std::strcmp(value, "0") == 0);
+#else
     return false;
 #endif
 }
