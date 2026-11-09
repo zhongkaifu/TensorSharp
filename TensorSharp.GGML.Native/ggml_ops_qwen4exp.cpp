@@ -1735,8 +1735,13 @@ ggml_tensor* q4e_nodes_gdn(
     int n_embd, int hc, int hc_low_rank, int T,
     int head_k_dim, int head_v_dim, int n_k_heads, int n_v_heads, int d_conv,
     float eps, Q4eGdnWriteback* wb,
-    std::vector<ggml_tensor*>* probe)
+    std::vector<ggml_tensor*>* probe, int n_seqs)
 {
+    // n_seqs > 1 (the arena's batched decode): n_seqs sequences of T tokens each, laid out sequence-major in the
+    // residual's columns. Everything but the convolution and the recurrence is per column; those two take the
+    // sequences' histories [hist, conv_dim, n_seqs] and states [S_v, S_v, H, n_seqs].
+    const int S = n_seqs > 1 ? n_seqs : 1;
+    const int cols = T * S;
     const int hc_dim = hc * n_embd;
     const int key_dim = head_k_dim * n_k_heads;
     const int value_dim = head_v_dim * n_v_heads;
@@ -1758,15 +1763,15 @@ ggml_tensor* q4e_nodes_gdn(
     ggml_tensor* w_out     = ggml_new_tensor_2d(ctx, (ggml_type)a->out_proj_type, value_dim, n_embd);
 
     // ---- hyper-connection mixer ----
-    const Q4eHcRead hcr = q4e_nodes_hc_read(ctx, res_in, w_norm, w_down, w_up, w_inject, n_embd, hc, T, eps);
+    const Q4eHcRead hcr = q4e_nodes_hc_read(ctx, res_in, w_norm, w_down, w_up, w_inject, n_embd, hc, cols, eps);
     ggml_tensor* res3 = hcr.res3;
     ggml_tensor* mixed = hcr.mixed;
     ggml_tensor* inject = hcr.inject;
 
     // ---- projections ----
-    ggml_tensor* qkv = q4e_mul_mat(ctx, w_qkv, mixed);        // [conv_dim, T]
-    ggml_tensor* z = q4e_mul_mat(ctx, w_gate, mixed);         // [value_dim, T]
-    ggml_tensor* beta_raw = q4e_mul_mat(ctx, w_beta, mixed);  // [n_v_heads, T]
+    ggml_tensor* qkv = q4e_mul_mat(ctx, w_qkv, mixed);        // [conv_dim, cols]
+    ggml_tensor* z = q4e_mul_mat(ctx, w_gate, mixed);         // [value_dim, cols]
+    ggml_tensor* beta_raw = q4e_mul_mat(ctx, w_beta, mixed);  // [n_v_heads, cols]
     ggml_tensor* alpha_raw = q4e_mul_mat(ctx, w_alpha, mixed);
 
     ggml_tensor* out2 = nullptr;
@@ -1778,11 +1783,11 @@ ggml_tensor* q4e_nodes_gdn(
     int64_t attn_elems = 0;
 #if defined(TSG_GGML_USE_METAL)
     const Q4eDeviceOps* dev = g_q4e_dev;
-    const bool device = dev != nullptr && dev->gdn && dev->T == T && probe == nullptr;
+    const bool device = dev != nullptr && dev->gdn && dev->T == T && probe == nullptr && S == 1;
 #else
     const bool device = false;
 #endif
-    const bool capture = !device && q4e_capture_rows(T);
+    const bool capture = !device && S == 1 && q4e_capture_rows(T);
 #if defined(TSG_GGML_USE_METAL)
     if (device)
     {
@@ -1812,24 +1817,25 @@ ggml_tensor* q4e_nodes_gdn(
     {
         // ---- causal depthwise conv over the ring history ----
         // conv_state is [hist, conv_dim]; qkv transposed is [T, conv_dim].
-        ggml_tensor* qkv_t = ggml_reshape_3d(ctx, q4e_cont(ctx, ggml_transpose(ctx, qkv)),
-                T, conv_dim, 1);
-        conv_in = ggml_concat(ctx, conv_state, qkv_t, 0); // [hist + T, conv_dim, 1]
-        conv_out = ggml_silu(ctx, tsg::ssm_conv_any(ctx, conv_in, w_conv)); // [conv_dim, T, 1]
+        ggml_tensor* qkv_t = S == 1
+            ? ggml_reshape_3d(ctx, q4e_cont(ctx, ggml_transpose(ctx, qkv)), T, conv_dim, 1)
+            : q4e_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, qkv, conv_dim, T, S), 1, 0, 2, 3));   // [T, conv_dim, S]
+        conv_in = ggml_concat(ctx, conv_state, qkv_t, 0); // [hist + T, conv_dim, S]
+        conv_out = ggml_silu(ctx, tsg::ssm_conv_any(ctx, conv_in, w_conv)); // [conv_dim, T, S]
 
         // keep the last `hist` columns for the next token. Every consumer copies it into a state (ggml_cpy reads
         // strides), so on Metal it stays a view: one copy instead of a CONT and a copy.
-        tail = ggml_view_3d(ctx, conv_in, hist, conv_dim, 1,
+        tail = ggml_view_3d(ctx, conv_in, hist, conv_dim, S,
                 conv_in->nb[1], conv_in->nb[2], ggml_row_size(conv_in->type, T));
         if (!q4e_metal_fusions()) tail = ggml_cont(ctx, tail);
 
         // ---- delta net ----
-        ggml_tensor* q = ggml_view_3d(ctx, conv_out, head_k_dim, n_k_heads, T,
+        ggml_tensor* q = ggml_view_3d(ctx, conv_out, head_k_dim, n_k_heads, cols,
                 ggml_row_size(conv_out->type, head_k_dim), conv_out->nb[1], 0);
-        ggml_tensor* k = ggml_view_3d(ctx, conv_out, head_k_dim, n_k_heads, T,
+        ggml_tensor* k = ggml_view_3d(ctx, conv_out, head_k_dim, n_k_heads, cols,
                 ggml_row_size(conv_out->type, head_k_dim), conv_out->nb[1],
                 ggml_row_size(conv_out->type, key_dim));
-        ggml_tensor* v = ggml_view_3d(ctx, conv_out, head_v_dim, n_v_heads, T,
+        ggml_tensor* v = ggml_view_3d(ctx, conv_out, head_v_dim, n_v_heads, cols,
                 ggml_row_size(conv_out->type, head_v_dim), conv_out->nb[1],
                 ggml_row_size(conv_out->type, 2 * key_dim));
 
@@ -1842,42 +1848,49 @@ ggml_tensor* q4e_nodes_gdn(
         // fluent-looking noise.
         if (n_k_heads != n_v_heads)
         {
-            q = ggml_repeat_4d(ctx, q, head_k_dim, n_v_heads, T, 1);
-            k = ggml_repeat_4d(ctx, k, head_k_dim, n_v_heads, T, 1);
+            q = ggml_repeat_4d(ctx, q, head_k_dim, n_v_heads, cols, 1);
+            k = ggml_repeat_4d(ctx, k, head_k_dim, n_v_heads, cols, 1);
         }
-        q = ggml_reshape_4d(ctx, q4e_cont(ctx, q), head_k_dim, n_v_heads, T, 1);
-        k = ggml_reshape_4d(ctx, q4e_cont(ctx, k), head_k_dim, n_v_heads, T, 1);
-        v = ggml_reshape_4d(ctx, q4e_cont(ctx, v), head_v_dim, n_v_heads, T, 1);
+        q = ggml_reshape_4d(ctx, q4e_cont(ctx, q), head_k_dim, n_v_heads, T, S);
+        k = ggml_reshape_4d(ctx, q4e_cont(ctx, k), head_k_dim, n_v_heads, T, S);
+        v = ggml_reshape_4d(ctx, q4e_cont(ctx, v), head_v_dim, n_v_heads, T, S);
 
         // The op scales q internally (llama.cpp passes it unscaled), and a uniform
         // scale here would be absorbed by the RMS norm below in any case.
 
-        ggml_tensor* b4 = ggml_reshape_4d(ctx, ggml_sigmoid(ctx, beta_raw), 1, n_v_heads, T, 1);
+        ggml_tensor* b4 = ggml_reshape_4d(ctx, ggml_sigmoid(ctx, beta_raw), 1, n_v_heads, T, S);
         ggml_tensor* g4 = ggml_reshape_4d(ctx,
                 ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha_raw, w_dt)), w_a),
-                1, n_v_heads, T, 1);
-        ggml_tensor* s4 = ggml_reshape_4d(ctx, ssm_state, head_v_dim, head_v_dim, n_v_heads, 1);
+                1, n_v_heads, T, S);
+        ggml_tensor* s4 = ggml_reshape_4d(ctx, ssm_state, head_v_dim, head_v_dim, n_v_heads, S);
 
         gdn_out = ggml_gated_delta_net(ctx, q, k, v, g4, b4, s4, capture ? T : 1);
 
-        attn_elems = (int64_t)head_v_dim * n_v_heads * T;
-        ggml_tensor* core = ggml_view_3d(ctx, gdn_out, head_v_dim, n_v_heads, T,
+        attn_elems = (int64_t)head_v_dim * n_v_heads * cols;
+        ggml_tensor* core = ggml_view_3d(ctx, gdn_out, head_v_dim, n_v_heads, cols,
                 ggml_row_size(gdn_out->type, head_v_dim),
                 ggml_row_size(gdn_out->type, head_v_dim * n_v_heads), 0);
-        new_state = ggml_view_3d(ctx, gdn_out, head_v_dim, head_v_dim, n_v_heads,
+        // The states follow the outputs, one [S_v, S_v, H] block per sequence.
+        new_state = S == 1
+            ? ggml_view_3d(ctx, gdn_out, head_v_dim, head_v_dim, n_v_heads,
                 ggml_row_size(gdn_out->type, head_v_dim),
                 ggml_row_size(gdn_out->type, head_v_dim * head_v_dim),
+                ggml_row_size(gdn_out->type, attn_elems))
+            : ggml_view_4d(ctx, gdn_out, head_v_dim, head_v_dim, n_v_heads, S,
+                ggml_row_size(gdn_out->type, head_v_dim),
+                ggml_row_size(gdn_out->type, head_v_dim * head_v_dim),
+                ggml_row_size(gdn_out->type, (int64_t)head_v_dim * head_v_dim * n_v_heads),
                 ggml_row_size(gdn_out->type, attn_elems));
 
         // qwen4exp closes with a SIGMOID gate, where Qwen 3.5 uses SiLU.
         ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, q4e_cont(ctx, core), eps), w_ssmnorm);
-        ggml_tensor* zg = ggml_sigmoid(ctx, ggml_reshape_3d(ctx, z, head_v_dim, n_v_heads, T));
-        out2 = ggml_reshape_2d(ctx, ggml_mul(ctx, normed, zg), value_dim, T);
+        ggml_tensor* zg = ggml_sigmoid(ctx, ggml_reshape_3d(ctx, z, head_v_dim, n_v_heads, cols));
+        out2 = ggml_reshape_2d(ctx, ggml_mul(ctx, normed, zg), value_dim, cols);
     }
-    ggml_tensor* proj = q4e_mul_mat(ctx, w_out, out2);        // [n_embd, T]
+    ggml_tensor* proj = q4e_mul_mat(ctx, w_out, out2);        // [n_embd, cols]
 
     // ---- hyper-connection scatter ----
-    ggml_tensor* res_out = q4e_nodes_hc_scatter(ctx, res3, proj, inject, n_embd, hc, T);
+    ggml_tensor* res_out = q4e_nodes_hc_scatter(ctx, res3, proj, inject, n_embd, hc, cols);
 
     bnd.add(w_norm, a->hc_norm, (std::size_t)hc_dim * sizeof(float));
     bnd.add(w_down, a->hc_down, (std::size_t)a->hc_down_bytes);

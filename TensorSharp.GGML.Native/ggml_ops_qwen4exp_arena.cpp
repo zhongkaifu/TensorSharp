@@ -30,6 +30,18 @@
 
 using namespace tsg;
 
+namespace
+{
+    // TS_Q4E_ARENA_BATCHED_GDN=0 runs each slot's GDN half on its own (T = 1 per slot) instead of one batched pass.
+    // Read per graph build (tests compare both); a built graph keeps its form.
+    bool q4e_arena_batched_gdn()
+    {
+        const char* e = std::getenv("TS_Q4E_ARENA_BATCHED_GDN");
+        return !(e != nullptr && e[0] == '0');
+    }
+
+}
+
 // ============================================================================
 // qwen4exp (Qwen3.8-Flash-Next) SLOT-STABLE ARENA token-batched decode: N
 // concurrent sequences, one token each, in ONE ggml graph — the port of the
@@ -1036,7 +1048,26 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                             hist_view, n_embd, hc, ple_T, ple_streams, eps, &state_writes);
                 }
 
-                if (kinds[il] != 0)
+                if (kinds[il] != 0 && q4e_arena_batched_gdn() && n_slots > 1)
+                {
+                    // ===== GDN half, batched: one pass over every slot's column =====
+                    // The mixer, projections, gate and output projection read their weights once for all slots; the
+                    // convolution and the recurrence take every slot's history and state from the arenas at once
+                    // (slots are contiguous there) and write them back with one copy each.
+                    ggml_tensor* conv_all = ggml_view_3d(ctx, e.conv_arena[il], gdn_hist, conv_dim, n_slots,
+                            e.conv_arena[il]->nb[1], e.conv_arena[il]->nb[2], 0);
+                    ggml_tensor* ssm_all = ggml_view_4d(ctx, e.ssm_arena[il], head_v_dim, head_v_dim, n_v_heads, n_slots,
+                            e.ssm_arena[il]->nb[1], e.ssm_arena[il]->nb[2], e.ssm_arena[il]->nb[3], 0);
+                    Q4eGdnWriteback wb{};
+                    res = q4e_nodes_gdn(ctx, binder, &gdn[il], res, conv_all, ssm_all,
+                            n_embd, hc, hc_low_rank, /*T=*/1,
+                            head_k_dim, head_v_dim, n_k_heads, n_v_heads, d_conv,
+                            eps, &wb, nullptr, n_slots);
+                    ggml_build_forward_expand(e.graph, res);
+                    ggml_build_forward_expand(e.graph, ggml_cpy(ctx, wb.tail, conv_all));
+                    ggml_build_forward_expand(e.graph, ggml_cpy(ctx, wb.new_state, ssm_all));
+                }
+                else if (kinds[il] != 0)
                 {
                     // ===== GDN half: per-slot recurrence against arena slices =====
                     ggml_tensor* res_next = nullptr;

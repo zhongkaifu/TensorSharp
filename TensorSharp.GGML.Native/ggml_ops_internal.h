@@ -2321,7 +2321,7 @@ ggml_tensor* q4e_nodes_gdn(
     int n_embd, int hc, int hc_low_rank, int T,
     int head_k_dim, int head_v_dim, int n_k_heads, int n_v_heads, int d_conv,
     float eps, Q4eGdnWriteback* wb,
-    std::vector<ggml_tensor*>* probe = nullptr);
+    std::vector<ggml_tensor*>* probe = nullptr, int n_seqs = 1);
 
 ggml_tensor* q4e_nodes_attn(
     ggml_context* ctx, ggml_cgraph* graph, Q4eBinder& bnd,
