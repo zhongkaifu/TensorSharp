@@ -900,6 +900,28 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         ["nemotron_h_moe_mx"] = 0.0016,  // 8.5e-8..1.0e-7, one row 1.0e-3
     };
 
+    /// <summary>
+    /// A router near-tie: the verify row's k-th chosen expert probability is within this of the
+    /// best unchosen one. Verify computes the router input with a 16-row GEMM, decode with the
+    /// 1-row path, and their rounding moves router logit gaps by about 1e-3 (7.5e-5 in
+    /// probability at p = 0.065), so the two may legitimately pick different experts there.
+    /// Measured on the sliding-window Gemma file on an RTX 5090: at blk.4, row 11's verify router
+    /// picks experts 2,4,8,15 (expert 2 at 6.535129e-2 over expert 7 at 6.533976e-2, a 1.15e-5
+    /// margin; the next smallest of the window's 96 routes is 5.8e-5); the on-device decode router
+    /// ranks expert 7 9.7e-4 above expert 2 in logits and picks 4,7,8,15. The row is 3.57e-2
+    /// from its decode row, every other row 3.1e-3..7.7e-3. ggml_cpu's own verify and decode rows
+    /// split there the same way (3.57e-2), and each CUDA row sits on one of its sides (verify
+    /// 8.1e-3 from ggml_cpu's decode, decode 9.5e-3 from its verify); the managed cpu verify
+    /// router sees the same 1.16e-5 margin and takes the decode side. Every row's greedy token is
+    /// the same in CUDA's and managed cpu's verify and decode rows. The RTX 3080 that set the
+    /// tolerances broke the tie the same way in both paths.
+    /// </summary>
+    private const float RouterNearTie = 1e-4f;
+
+    /// <summary>How far a near-tie row may sit from its decode row: one expert swapped in one
+    /// layer (measured 3.57e-2 on CUDA and on ggml_cpu), with 1.7x headroom.</summary>
+    private const double ExpertSwapBound = 0.06;
+
     [CudaTheory]
     [InlineData("qwen35moe")]
     [InlineData("qwen35")]
@@ -915,17 +937,33 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         // row must be what decoding that token alone, through the default decode path, gives.
         // The plan keeps verify windows on their current kernels below its prefill row
         // thresholds, which these rows pin. Sliding-window Gemma: past the window (D4 put verify
-        // and decode rows ~6% apart; it was D3's two causes, now fixed).
+        // and decode rows ~6% apart; it was D3's two causes, now fixed). A Gemma row whose verify
+        // router has a near-tie (RouterNearTie) may instead differ by one expert swap.
         string path = WriteModel(family);
         int[] prompt = Prompt(64);
         using var cuda = Load(path, BackendType.Cuda);
-        VerifyResult result = VerifyWindow(cuda, prompt[..48], prompt[48..64]);
+        var margins = new float[16];
+        Array.Fill(margins, float.PositiveInfinity);
+        Gemma4Model.RouteMarginHookForTest = (model, rows, row, margin) =>
+        {
+            if (ReferenceEquals(model, cuda) && rows == margins.Length)
+                margins[row] = Math.Min(margins[row], margin);
+        };
+        VerifyResult result;
+        try { result = VerifyWindow(cuda, prompt[..48], prompt[48..64]); }
+        finally { Gemma4Model.RouteMarginHookForTest = null; }
         Assert.True(result.AllRows, $"{family} is not a speculative target");
         AssertFinite(result.Window, family);
         var rel = result.Window.Select((row, i) => RelL2(row, result.Sequential[i])).ToList();
         int bitIdentical = result.Window.Select((row, i) => BitIdentical(row, result.Sequential[i])).Count(x => x);
         Report($"{family} verify rows vs sequential decode (bit-identical {bitIdentical}/{rel.Count})", rel);
-        AssertRows($"{family} verify", result.Window, result.Sequential, _ => VerifyTolerance[family]);
+        if (margins.Any(float.IsFinite))
+            Report($"{family} verify rows' smallest router margins", margins.Select(m => (double)m));
+        double tolerance = VerifyTolerance[family];
+        var swapped = Enumerable.Range(0, rel.Count).Where(i => rel[i] > tolerance && margins[i] < RouterNearTie).ToHashSet();
+        foreach (int i in swapped)
+            _output.WriteLine($"{family} verify row {i}: {rel[i]:E3}, at a router near-tie (margin {margins[i]:E3}); bound {ExpertSwapBound:E2}");
+        AssertRows($"{family} verify", result.Window, result.Sequential, i => swapped.Contains(i) ? ExpertSwapBound : tolerance);
     }
 
     [CudaFact]
