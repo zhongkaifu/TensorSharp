@@ -48,6 +48,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr moeMma;
         private readonly IntPtr moeGateUpDecode;
         private readonly IntPtr moeDownDecode;
+        private readonly IntPtr moeGateUpDecodeQ80V, moeDownDecodeQ80V;
         private readonly IntPtr denseQ81Rows;
         private readonly IntPtr moeScatterAdd;
         private readonly IntPtr hcMean, hcMixPartials, hcPreFinish;
@@ -130,6 +131,8 @@ namespace TensorSharp.Cuda
             moeMma = module.GetFunction("ts_dsv4_moe_mma_f32");
             moeGateUpDecode = module.GetFunction("ts_dsv4_moe_gateup_decode_f32");
             moeDownDecode = module.GetFunction("ts_dsv4_moe_down_decode_f32");
+            moeGateUpDecodeQ80V = module.GetFunction("ts_dsv4_moe_gateup_decode_q80v_f32");
+            moeDownDecodeQ80V = module.GetFunction("ts_dsv4_moe_down_decode_q80v_f32");
             denseQ81Rows = module.GetFunction("ts_dsv4_dense_q81_rows_f32");
             moeScatterAdd = module.GetFunction("ts_dsv4_moe_scatter_add_f32");
             hcMean = module.GetFunction("ts_dsv4_hc_mean_f32");
@@ -581,6 +584,28 @@ namespace TensorSharp.Cuda
             int a4 = wtype, a5 = e, a6 = ff; long a7 = rowBytes;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
             Launch(moeDownDecode, (uint)slots, CeilDiv(e, 32), 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary><see cref="MoeGateUpDecode"/> for Q8_0 experts with a warp per weight row and four lanes per
+        /// 32-value block (<c>ts_dsv4_moe_gateup_decode_q80v_f32</c>): its own arithmetic, the same for every
+        /// slot whatever the row count. Requires <paramref name="inDim"/> a multiple of 32.</summary>
+        public void MoeGateUpDecodeQ80Vec(IntPtr gateW, IntPtr upW, Tensor act, Tensor sel,
+            Tensor gateOut, Tensor upOut, int ff, int inDim, long rowBytes, int nt, int nUsed, IntPtr stream)
+        {
+            IntPtr a0 = gateW, a1 = upW, a2 = P(act), a3 = P(sel), a4 = P(gateOut), a5 = P(upOut);
+            int a6 = ff, a7 = inDim; long a8 = rowBytes; int a9 = nUsed;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9 };
+            Launch(moeGateUpDecodeQ80V, (uint)(nt * nUsed), CeilDiv(ff, 8), 2, BlockSize, 0, stream, args);
+        }
+
+        /// <summary><see cref="MoeDownDecode"/> for Q8_0 experts, as <see cref="MoeGateUpDecodeQ80Vec"/> reads a row.</summary>
+        public void MoeDownDecodeQ80Vec(IntPtr downW, Tensor act, Tensor sel, Tensor downOut,
+            int e, int ff, long rowBytes, int slots, IntPtr stream)
+        {
+            IntPtr a0 = downW, a1 = P(act), a2 = P(sel), a3 = P(downOut);
+            int a4 = e, a5 = ff; long a6 = rowBytes;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6 };
+            Launch(moeDownDecodeQ80V, (uint)slots, CeilDiv(e, 8), 1, BlockSize, 0, stream, args);
         }
 
         /// <summary>Whether <see cref="DenseQ81Rows"/> decodes this weight layout at this input width:

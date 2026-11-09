@@ -138,6 +138,8 @@ namespace TensorSharp.Cuda
         // ts_q80_vec_rows, one instantiation per row bound (1, 4, 8, 16).
         private readonly IntPtr[] quantMatmulQ80Vec;
         private readonly IntPtr[] quantMatmulQ80Warp;
+        private readonly IntPtr[] q80PairMma;
+        private readonly IntPtr[][] q80PairTwin;
         private readonly IntPtr[] quantMatmulLowKDp4aF32;
         private readonly IntPtr quantMatmulQ4KDp4aF32;
         private readonly IntPtr quantMatmulQ5KDp4aF32;
@@ -341,6 +343,14 @@ namespace TensorSharp.Cuda
             quantMatmulQ80SingleF32 = module.GetFunction("ts_quant_matmul_q8_0_single_f32");
             quantMatmulQ80Vec = RowBoundFunctions(module, "ts_quant_matmul_q8_0_vec_f32");
             quantMatmulQ80Warp = RowBoundFunctions(module, "ts_quant_matmul_q8_0_warp_f32");
+            q80PairMma = new IntPtr[Q80PairSliceCounts.Length];
+            q80PairTwin = new IntPtr[Q80PairSliceCounts.Length][];
+            for (int i = 0; i < Q80PairSliceCounts.Length; i++)
+            {
+                int s = Q80PairSliceCounts[i];
+                q80PairMma[i] = module.GetFunction("ts_q80_pair_mma_" + s);
+                q80PairTwin[i] = new[] { module.GetFunction("ts_q80_pair_twin_" + s + "_1"), module.GetFunction("ts_q80_pair_twin_" + s + "_2") };
+            }
             quantMatmulLowKDp4aF32 = LowKFunctions(module, "ts_quant_matmul_lowk_dp4a_f32");
             quantMatmulQ4KDp4aF32 = module.GetFunction("ts_quant_matmul_q4k_dp4a_f32");
             quantMatmulQ5KDp4aF32 = module.GetFunction("ts_quant_matmul_q5k_dp4a_f32");
@@ -3210,6 +3220,61 @@ namespace TensorSharp.Cuda
                 Launch(quantMatmulQ80Warp[RowBoundIndex(rows)], (uint)((outDim + 7) / 8), 1, 1, 256, 1, 1, 0, stream, args);
             else
                 Launch(quantMatmulQ80Vec[RowBoundIndex(rows)], (uint)outDim, 1, 1, 128, 1, 1, 0, stream, args);
+        }
+
+        /// <summary>Rows <see cref="LaunchQuantMatmulQ80Pair"/> takes in one launch.</summary>
+        public const int Q80PairMaxRows = 16;
+
+        /// <summary>The K-slice counts the pair is instantiated for.</summary>
+        private static readonly int[] Q80PairSliceCounts = { 1, 2, 4, 8, 16 };
+
+        /// <summary>The pair's K slices for a weight shape: the fewest (a power of two) that give ~1,024 warps of
+        /// 8-column tiles, at most 16 and at least eight blocks a slice. A function of the shape alone, never of
+        /// the row count, because the slices fix the arithmetic.</summary>
+        public static int Q80PairSlices(int inDim, int outDim)
+        {
+            int tiles = Math.Max(1, (outDim + 7) / 8);
+            int blocks = inDim / 32;
+            int s = 1;
+            while (s < 16 && tiles * s < 1024 && blocks / (s * 2) >= 8)
+                s *= 2;
+            return s;
+        }
+
+        /// <summary>
+        /// Q8_0 matvec over 1..<see cref="Q80PairMaxRows"/> q8_1 activation rows (<c>inDim</c> a multiple of 32) as
+        /// one arithmetic run by two kernels: int8 tensor cores (one Q8_0 block is one m16n8k32 step) for three
+        /// rows and more, a dp4a twin for one or two. Each output sums every block's exact int32 dot, scaled by
+        /// fma in block order into eight interleaved partials per K slice, then fixed pairwise trees over the
+        /// partials and the slices, so a row's result does not depend on the row count or the kernel that ran it.
+        /// It is not the arithmetic of <see cref="LaunchQuantMatmulQ80VecRows"/>: a model switching to it decodes
+        /// differently in the last bits once.
+        /// </summary>
+        public void LaunchQuantMatmulQ80Pair(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim,
+            int rows, IntPtr stream)
+        {
+            if (rows < 1 || rows > Q80PairMaxRows || (inDim & 31) != 0)
+                throw new ArgumentOutOfRangeException(nameof(rows), $"Q8_0 pair matvec: {rows} rows of width {inDim}");
+            IntPtr weightsArg = weights;
+            IntPtr xqArg = xqScratch;
+            IntPtr outputArg = output;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int rowsArg = rows;
+            void** args = stackalloc void*[] { &weightsArg, &xqArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
+            int s = Q80PairSlices(inDim, outDim);
+            int si = System.Numerics.BitOperations.Log2((uint)s);
+            if (rows <= 2)
+            {
+                int c = s >= 8 ? 1 : 8 / s;
+                Launch(q80PairTwin[si][rows - 1], (uint)((outDim + c - 1) / c), 1, 1, 32 * s * c, 1, 1, 0, stream, args);
+            }
+            else
+            {
+                int tpc = s == 1 ? 4 : s == 2 ? 2 : 1;
+                int tiles = (outDim + 7) / 8;
+                Launch(q80PairMma[si], (uint)((tiles + tpc - 1) / tpc), 1, 1, 32 * s * tpc, 1, 1, 0, stream, args);
+            }
         }
 
         /// <summary>Input widths below which the Q8_0 matvec runs a warp per column.</summary>

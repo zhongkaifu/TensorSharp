@@ -230,7 +230,7 @@ namespace TensorSharp.Cuda
         public static void Experts(Dsv4Kernels dk, CudaKernels kernels, CudaMoeScratch s,
             in DeviceWeight gate, in DeviceWeight up, in DeviceWeight down,
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
-            int perSlotMaxRows, IntPtr stream, bool? fused = null)
+            int perSlotMaxRows, IntPtr stream, bool? fused = null, bool q80VecDecode = false)
         {
             int guType = gate.Type, downType = down.Type;
             int slots = nt * nUsed;
@@ -245,10 +245,21 @@ namespace TensorSharp.Cuda
 
             if (perSlot)
             {
-                dk.MoeGateUpDecode(gate.Ptr, up.Ptr, s.ActQ8A, s.Sel, s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes,
-                    nt, nUsed, stream);
+                // q80VecDecode: Q8_0 experts read a row as the dense Q8_0 matvec does (a caller opting in decodes
+                // differently in the last bits from the shared warp-per-block dot).
+                bool q80gu = q80VecDecode && guType == TQ8_0 && e % 32 == 0;
+                bool q80dn = q80VecDecode && downType == TQ8_0 && ff % 32 == 0;
+                if (q80gu)
+                    dk.MoeGateUpDecodeQ80Vec(gate.Ptr, up.Ptr, s.ActQ8A, s.Sel, s.ExpGate, s.ExpUp, ff, e, gate.RowBytes,
+                        nt, nUsed, stream);
+                else
+                    dk.MoeGateUpDecode(gate.Ptr, up.Ptr, s.ActQ8A, s.Sel, s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes,
+                        nt, nUsed, stream);
                 SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.ActQ8B, null, ff, slots, clamp, stream, fused);
-                dk.MoeDownDecode(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, downType, e, ff, down.RowBytes, slots, stream);
+                if (q80dn)
+                    dk.MoeDownDecodeQ80Vec(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, e, ff, down.RowBytes, slots, stream);
+                else
+                    dk.MoeDownDecode(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, downType, e, ff, down.RowBytes, slots, stream);
                 dk.MoeScatterAdd(s.ExpDown, null, s.SelW, shDown, ffnOut, nt, nUsed, e, stream);
                 return;
             }

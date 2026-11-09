@@ -706,7 +706,7 @@ namespace TensorSharp.Cuda
 
             CudaMoe.Experts(dev.DK, dev.Alloc.Kernels, dev.Moe, L.GateExps, L.UpExps, L.DownExps,
                 dev.Cur, dev.ShDown, dev.BlockOut, nt, m.NExpertUsed, m.NExpert, e, m.NFfExp, 0f,
-                PerSlotMaxRows, dev.Stream);
+                PerSlotMaxRows, dev.Stream, q80VecDecode: ExpertVecDecode);
             StageEnd(dev, StExperts);
         }
 
