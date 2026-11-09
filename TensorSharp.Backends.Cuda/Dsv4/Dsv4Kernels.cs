@@ -46,6 +46,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr moeGateUpStaged;
         private readonly IntPtr moeDownStaged;
         private readonly IntPtr moeMma;
+        private readonly IntPtr q2i8QuantAct, q2i8GateUp, q2i8Down;
         private readonly IntPtr moeGateUpDecode;
         private readonly IntPtr moeDownDecode;
         private readonly IntPtr denseQ81Rows;
@@ -132,6 +133,13 @@ namespace TensorSharp.Cuda
         /// </summary>
         public bool HasMoeMma { get; }
 
+        /// <summary>
+        /// Whether the int8 Q2_0 expert kernels (ts_dsv4_moe_q2i8_*) are in the module with their tensor-core
+        /// bodies: they are guarded by __CUDA_ARCH__ &gt;= 800 as ts_dsv4_moe_mma_f32 is, and a module built from
+        /// older source has none.
+        /// </summary>
+        public bool HasMoeQ2I8 { get; }
+
         private Dsv4Kernels(CudaModule module)
         {
             this.module = module;
@@ -212,6 +220,16 @@ namespace TensorSharp.Cuda
             moeGateUpStaged = module.GetFunction("ts_dsv4_moe_gateup_staged_f32");
             moeDownStaged = module.GetFunction("ts_dsv4_moe_down_staged_f32");
             moeMma = module.GetFunction("ts_dsv4_moe_mma_f32");
+            // The int8 Q2_0 expert kernels: absent from a module built from older source; guarded by
+            // __CUDA_ARCH__ >= 800 like the F16 tensor-core kernel, so empty in a compute_75 build.
+            try
+            {
+                q2i8QuantAct = module.GetFunction("ts_dsv4_q2i8_quant_act_f32");
+                q2i8GateUp = module.GetFunction("ts_dsv4_moe_q2i8_gateup_f32");
+                q2i8Down = module.GetFunction("ts_dsv4_moe_q2i8_down_f32");
+                HasMoeQ2I8 = CudaKernels.ArchGuardedKernelsUsable(module.CompiledArchOf("ts_dsv4_moe_q2i8_gateup_f32"), ccMajor);
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { }
             moeGateUpDecode = module.GetFunction("ts_dsv4_moe_gateup_decode_f32");
             moeDownDecode = module.GetFunction("ts_dsv4_moe_down_decode_f32");
             try { moeDownDecodeShort = module.GetFunction("ts_dsv4_moe_down_decode_short_f32"); }
@@ -722,6 +740,64 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13 };
             uint pairs = w1 != IntPtr.Zero || tab1 != IntPtr.Zero ? 2u : 1u;
             Launch(moeMma, CeilDiv(rows, MoeMmaRows), (uint)nExpert, pairs, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>Bytes the int8 Q2_0 expert kernels' activations take per 64 values (64 int8, then each 32-value
+        /// half's F32 scale and offset).</summary>
+        public const int MoeQ2I8ActBytes = 80;
+
+        /// <summary>Whether the int8 Q2_0 expert kernels take these widths: each pipeline stage reads two 64-value
+        /// blocks of K, a gate/up CTA 64 features and a down CTA 128 output rows.</summary>
+        public static bool MoeQ2I8Supports(int e, int ff) => e > 0 && ff > 0 && e % 128 == 0 && ff % 128 == 0;
+
+        /// <summary>Bytes of the int8 activations of <paramref name="rows"/> rows of <paramref name="width"/> values.</summary>
+        public static long MoeQ2I8ActRowsBytes(long rows, int width) => rows * (width / 64) * MoeQ2I8ActBytes;
+
+        /// <summary>x [rows][width] F32 to the int8 Q2_0 expert kernels' activations, xa [rows][width / 64][80].</summary>
+        public void MoeQ2I8QuantAct(IntPtr x, IntPtr xa, int rows, int width, IntPtr stream)
+        {
+            if (width % 64 != 0)
+                throw new ArgumentException($"activation width {width} is not a multiple of 64");
+            long nblk = (long)rows * (width / 64);
+            if (nblk == 0)
+                return;
+            IntPtr a0 = x, a2 = xa;
+            long a1 = nblk;
+            void** args = stackalloc void*[] { &a0, &a1, &a2 };
+            Launch(q2i8QuantAct, CeilDiv(nblk, BlockSize / 32), 1, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>
+        /// Q2_0 gate and up of every member slot of every expert on int8 tensor cores, SwiGLU (clamped when
+        /// <paramref name="limit"/> &gt; 0), and the result quantized per 32 features into <paramref name="hq"/>
+        /// [slots][ff / 64][80], the down kernel's activations. <paramref name="xa"/> holds every token's
+        /// activations (<see cref="MoeQ2I8QuantAct"/> over <paramref name="inDim"/>).
+        /// </summary>
+        public void MoeQ2I8GateUp(IntPtr gateW, IntPtr upW, IntPtr xa, Tensor counts, Tensor offsets, Tensor slotToken,
+            IntPtr hq, int ff, int inDim, long rowBytes, float limit, int nExpert, IntPtr stream,
+            IntPtr gateTab = default, IntPtr upTab = default)
+        {
+            if (!MoeQ2I8Supports(inDim, ff))
+                throw new ArgumentException($"expert widths {inDim} x {ff} are not multiples of 128");
+            IntPtr a0 = gateW, a1 = upW, a2 = xa, a3 = P(counts), a4 = P(offsets), a5 = P(slotToken), a6 = hq;
+            int a7 = ff, a8 = inDim; long a9 = rowBytes; float a10 = limit;
+            IntPtr a11 = gateTab, a12 = upTab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };
+            Launch(q2i8GateUp, CeilDiv(ff, 64), (uint)nExpert, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>Q2_0 down projection of every member slot of every expert on int8 tensor cores, from
+        /// <see cref="MoeQ2I8GateUp"/>'s <paramref name="hq"/> (slot order) into <paramref name="output"/> [slots][rows].</summary>
+        public void MoeQ2I8Down(IntPtr downW, IntPtr hq, Tensor counts, Tensor offsets, Tensor output, int rows, int ff,
+            long rowBytes, int nExpert, IntPtr stream, IntPtr downTab = default)
+        {
+            if (!MoeQ2I8Supports(rows, ff))
+                throw new ArgumentException($"expert widths {rows} x {ff} are not multiples of 128");
+            IntPtr a0 = downW, a1 = hq, a2 = P(counts), a3 = P(offsets), a4 = P(output);
+            int a5 = rows, a6 = ff; long a7 = rowBytes;
+            IntPtr a8 = downTab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8 };
+            Launch(q2i8Down, CeilDiv(rows, 128), (uint)nExpert, 1, BlockSize, 0, stream, args);
         }
 
         /// <summary>Gate/up of every (token, selected expert) slot of <paramref name="nt"/> tokens,
