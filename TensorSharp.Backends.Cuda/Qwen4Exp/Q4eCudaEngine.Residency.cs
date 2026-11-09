@@ -99,7 +99,7 @@ namespace TensorSharp.Cuda
             _devs[0].MakeCurrent();
             var (free, _) = _devs[0].Alloc.GetMemoryInfo();
             return (long)free - DeviceScratchBytes() - (1L << 30) - m.TokEmbd.TotalBytes
-                - m.Output.TotalBytes - (long)m.NVocab * 8 - PromptGroupBytes();
+                - m.Output.TotalBytes - (long)m.NVocab * 8 - PromptGroupBytes() - GroupF16Bytes();
         }
 
         /// <summary>Whether every routed expert fits in VRAM beside <paramref name="nonExpertBytes"/> (no expert residency
@@ -899,7 +899,10 @@ namespace TensorSharp.Cuda
             if (_groupXs != null)
                 Console.Error.WriteLine(
                     $"[q4e-cuda] prompts read layer by layer in groups of up to {PromptGroupRows} rows ({PromptGroupBytes() / 1048576.0:F0} MiB "
-                    + "of streams; TS_Q4E_PROMPT_GROUP, 0 = ubatch order): a missed expert crosses the bus once per layer and group.");
+                    + "of streams; TS_Q4E_PROMPT_GROUP, 0 = ubatch order): a missed expert crosses the bus once per layer and group"
+                    + (_groupF16 != null
+                        ? $", and a layer's dense weights are dequantized to F16 once per group ({_groupF16.ElementCount() / 1048576.0:F0} MiB; TS_Q4E_GROUP_F16=0 per ubatch)."
+                        : "."));
         }
 
         private void FreeHostExperts()
