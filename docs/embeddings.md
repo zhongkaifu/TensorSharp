@@ -599,8 +599,11 @@ cases even with optional BLAS, so that route remains opt-in. With the 32-row
 threshold, the fresh short case improves from the earlier BLAS experiment's
 76.3 ms to 35.6 ms; only one of seven cases meets the latency margin. CPU
 NumPy goldens still pass. Multimodal latency parity remains unmet, and the
-explicit TF32 attention experiment retains a failed large-exponent precision
-gate and stays disabled by default. These failures are retained in the reports.
+explicit TF32 attention experiment stays disabled by default: on large query/key
+exponents its error (6.3e-5 on an RTX 5090, up to 8.1e-5 by exact TF32 emulation)
+exceeds the 3e-5 pedantic F32 bound. That case's test gates on TF32's own
+rounding bound (1.2e-4, which BF16 operands fail) and reports the excess.
+These failures are retained in the reports.
 
 An optional Linux native CPU projection route uses an unmodified system LP64
 pthread OpenBLAS through TensorSharp-owned graph callbacks. Build the ordinary
