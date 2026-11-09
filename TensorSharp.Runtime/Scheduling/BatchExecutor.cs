@@ -175,6 +175,7 @@ namespace TensorSharp.Runtime.Scheduling
         // algorithm can serve the loaded model (no draft head, unknown
         // --spec-type).
         private bool _speculationDeclineWarned;
+        private bool _soloDraftCapWarned;
 
         // The user's rule for every one of these: a fallback must never be
         // silent. Each fires ONCE per executor (i.e. per loaded model) so the
@@ -1208,6 +1209,7 @@ namespace TensorSharp.Runtime.Scheduling
             _fusedSpecDeclined.Clear();
             _lateArmDeclinedFor = null;
             _speculationDeclineWarned = false;
+            _soloDraftCapWarned = false;
             _specPrefixReuseDeclineWarned = false;
             _sharedGovernor = null;   // a new policy is measured afresh
             _sharedGovernorProfile = null;
@@ -2435,7 +2437,24 @@ namespace TensorSharp.Runtime.Scheduling
                 + "pMin={PMin}, trunk={Trunk}, adaptive={Adaptive}, adaptiveSource={AdaptiveSource})",
                 seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, trunkLabel,
                 exec.AdaptiveSpeculation, exec.Governor.SelectionSource);
+            WarnSoloDraftCapOnce(spec, exec.MaxDraftTokens);
             return exec;
+        }
+
+        /// <summary>The single-sequence verify drafts at most <see cref="ISpeculativeTarget.SpecSoloMaxDraftTokens"/>
+        /// a step, whatever --spec-draft or the drafter's block asked for. Say so once per policy, with the
+        /// model's reason and switch, rather than serving a smaller window silently.</summary>
+        private void WarnSoloDraftCapOnce(ISpeculativeTarget spec, int requested)
+        {
+            int cap = spec.SpecSoloMaxDraftTokens;
+            if (_soloDraftCapWarned || cap <= 0 || requested <= cap)
+                return;
+            _soloDraftCapWarned = true;
+            string reason = spec.SpecSoloDraftCapReason ?? "this model's single-sequence verify is capped";
+            _logger.LogWarning(
+                "Speculative decoding: {Requested} drafts a step were requested, but a single-sequence verify "
+                + "drafts at most {Cap} here ({Reason}). Each verify window is at most {Rows} rows.",
+                requested, cap, reason, cap + 1);
         }
 
         private void WarnSpeculationDeclinedOnce(string? reason)
@@ -3306,6 +3325,7 @@ namespace TensorSharp.Runtime.Scheduling
                 + "pMin={PMin}, trunk=fused holder over {Committed} committed tokens, adaptive={Adaptive}, adaptiveSource={AdaptiveSource})",
                 seq.RequestId, speculator.Describe(), exec.MaxDraftTokens, exec.MinDraftProb, prevComputed,
                 exec.AdaptiveSpeculation, exec.Governor.SelectionSource);
+            WarnSoloDraftCapOnce(spec, exec.MaxDraftTokens);
             return true;
         }
 

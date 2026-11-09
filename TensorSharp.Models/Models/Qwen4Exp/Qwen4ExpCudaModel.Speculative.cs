@@ -30,6 +30,8 @@ namespace TensorSharp.Models
         float ISpeculativeTarget.SpecPreferredDraftGate => 0.5f;
         int ISpeculativeTarget.SpecMaxDraftTokens => TensorSharp.Cuda.Q4eCudaEngine.VerifyMaxRows - 1;
         int ISpeculativeTarget.SpecSoloMaxDraftTokens => TensorSharp.Cuda.Q4eCudaEngine.VerifyMaxRows - 1;
+        string ISpeculativeTarget.SpecSoloDraftCapReason =>
+            $"the direct CUDA engine verifies at most {TensorSharp.Cuda.Q4eCudaEngine.VerifyMaxRows} rows a window";
         bool ISpeculativeTarget.SpecVerifyPersistsAcceptedKv => _specRowCommitted;
 
         void ISpeculativeTarget.SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)

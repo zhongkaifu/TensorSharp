@@ -153,6 +153,12 @@ namespace TensorSharp.Runtime.Speculative
         int SpecSoloMaxDraftTokens => int.MaxValue;
 
         /// <summary>
+        /// Why <see cref="SpecSoloMaxDraftTokens"/> is below the requested draft count, and how to
+        /// lift it, for the one warning the executor logs when it lowers a request (no silent caps).
+        /// </summary>
+        string? SpecSoloDraftCapReason => null;
+
+        /// <summary>
         /// Optional default specifically for weight-free n-gram drafting. A positive
         /// value may exceed the shared default when a wider verification batch uses
         /// a faster backend kernel. Explicit --spec-draft still wins within

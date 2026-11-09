@@ -236,4 +236,64 @@ public partial class SpeculativeExecutionTests
         Assert.NotSame(linear.Governor, next.Governor);
         Assert.Equal(before, next.AdaptiveSpeculation);
     }
+
+    [Fact]
+    public void SoloDraftCap_WarnsOncePerPolicyWhenItLowersTheRequestedDrafts()
+    {
+        var target = FixedGovernorTarget();
+        target.SpecSoloMaxDraftTokens = 3;
+        target.SpecSoloDraftCapReason = "test cap reason";
+        var options = new SpeculationOptions { Enabled = true, SpeculatorName = SpeculatorRegistry.Block,
+            MaxDraftTokens = 7, MaxDraftTokensExplicit = true, MinDraftProb = 0 };
+        var pool = new BlockPool(16, BlockSize, BlockSize * 4);
+        var scheduler = new ContinuousBatchScheduler(new SchedulerConfig { Speculation = options }, pool);
+        var logger = new CapLogger();
+        var executor = new BatchExecutor(target, pool, scheduler, logger);
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var arm = typeof(BatchExecutor).GetMethod("TryArmSpeculation", flags)!;
+        var fusedArm = typeof(BatchExecutor).GetMethod("TryGetFusedSpecContext", flags)!;
+
+        using (var a = (SpeculativeExecution)arm.Invoke(executor, new object?[] {
+            target, new SequenceState("a", new[] { 1 }, 20, BlockSize, SamplingConfig.Greedy), null, "test" })!)
+        using (var b = (SpeculativeExecution)arm.Invoke(executor, new object?[] {
+            target, new SequenceState("b", new[] { 1 }, 20, BlockSize, SamplingConfig.Greedy), null, "test" })!)
+        {
+            object?[] args = { target, new SequenceState("c", new[] { 1 }, 20, BlockSize, SamplingConfig.Greedy), 0, null };
+            Assert.True((bool)fusedArm.Invoke(executor, args)!);
+        }
+        string warning = Assert.Single(logger.Warnings);
+        Assert.Contains("7 drafts a step were requested", warning);
+        Assert.Contains("at most 3", warning);
+        Assert.Contains("test cap reason", warning);
+        Assert.Contains("at most 4 rows", warning);
+
+        // A new policy is a new decision: it says so again, once.
+        executor.SetSpeculation(options);
+        using (var d = (SpeculativeExecution)arm.Invoke(executor, new object?[] {
+            target, new SequenceState("d", new[] { 1 }, 20, BlockSize, SamplingConfig.Greedy), null, "test" })!)
+        { }
+        Assert.Equal(2, logger.Warnings.Count);
+
+        // A cap at or above the request lowers nothing and stays quiet.
+        var quietTarget = FixedGovernorTarget();
+        quietTarget.SpecSoloMaxDraftTokens = 7;
+        var quietLogger = new CapLogger();
+        var quiet = new BatchExecutor(quietTarget, pool, scheduler, quietLogger);
+        using (var e = (SpeculativeExecution)arm.Invoke(quiet, new object?[] {
+            quietTarget, new SequenceState("e", new[] { 1 }, 20, BlockSize, SamplingConfig.Greedy), null, "test" })!)
+        { }
+        Assert.Empty(quietLogger.Warnings);
+    }
+
+    private sealed class CapLogger : Microsoft.Extensions.Logging.ILogger
+    {
+        public List<string> Warnings { get; } = new();
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+            TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == Microsoft.Extensions.Logging.LogLevel.Warning) Warnings.Add(formatter(state, exception));
+        }
+    }
 }
