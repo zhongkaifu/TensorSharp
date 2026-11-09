@@ -1493,6 +1493,63 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
         if (last != nil) [last waitUntilCompleted];
     }
 
+    void* copy_async(ggml_backend* backend, const ggml_tensor* const* srcs, const ggml_tensor* const* dsts, int n)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm copy: not a Metal backend");
+            if (n <= 0 || srcs == nullptr || dsts == nullptr) throw std::runtime_error("tsm copy: nothing to copy");
+            std::vector<ggml_metal_buffer_id> from, to;
+            std::vector<std::size_t> bytes;
+            auto metal_buffer = [](const ggml_tensor* t) {
+                ggml_backend_buffer_t b = t->view_src ? t->view_src->buffer : t->buffer;
+                const char* name = b ? ggml_backend_buft_name(ggml_backend_buffer_get_type(b)) : nullptr;
+                return name != nullptr && std::strncmp(name, "MTL", 3) == 0;
+            };
+            for (int i = 0; i < n; ++i)
+            {
+                if (!metal_buffer(srcs[i]) || !metal_buffer(dsts[i])) throw std::runtime_error("tsm copy: not a Metal buffer");
+                const std::size_t b = ggml_nbytes(srcs[i]);
+                if (b != ggml_nbytes(dsts[i])) throw std::runtime_error("tsm copy: sizes differ");
+                from.push_back(tensor_id(srcs[i]));
+                to.push_back(tensor_id(dsts[i]));
+                bytes.push_back(b);
+            }
+            @autoreleasepool
+            {
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
+                for (int i = 0; i < n; ++i)
+                    [enc copyFromBuffer:(__bridge id<MTLBuffer>)from[i].metal sourceOffset:from[i].offs
+                               toBuffer:(__bridge id<MTLBuffer>)to[i].metal destinationOffset:to[i].offs size:bytes[i]];
+                [enc endEncoding];
+                [cb commit];
+                return (__bridge_retained void*)cb;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return nullptr;
+        }
+    }
+
+    void wait_handle(void* handle)
+    {
+        if (handle == nullptr) return;
+        id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)handle;
+        [cb waitUntilCompleted];
+    }
+
+    void release_handle(void* handle)
+    {
+        if (handle == nullptr) return;
+        id<MTLCommandBuffer> cb = (__bridge_transfer id<MTLCommandBuffer>)handle;
+        (void)cb;
+    }
+
     // ---- the fused hyper-connection read (tsm_moe.h hc_read_*)
     namespace
     {

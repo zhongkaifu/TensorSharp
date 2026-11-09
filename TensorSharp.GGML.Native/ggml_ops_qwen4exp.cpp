@@ -4165,7 +4165,31 @@ namespace
         const void* gdn_base = nullptr;
         const void* ple_base = nullptr;
         bool captured = false;
+#if defined(TSG_GGML_USE_METAL)
+        // The capture's copies queued on the accelerator (tsm::copy_async): whatever reads or frees the saved states
+        // waits for them first.
+        void* pending = nullptr;
+        void settle()
+        {
+            if (pending == nullptr) return;
+            tsm::wait_handle(pending);
+            tsm::release_handle(pending);
+            pending = nullptr;
+        }
+        ~Q4eStateSnapshot() { settle(); }
+#else
+        void settle() {}
+#endif
     };
+
+#if defined(TSG_GGML_USE_METAL)
+    // TS_Q4E_SNAPSHOT_GPU=0 keeps the host copy (the accelerator synchronized, then a memcpy per state).
+    bool q4e_snapshot_on_gpu()
+    {
+        static const bool on = [] { const char* e = std::getenv("TS_Q4E_SNAPSHOT_GPU"); return !(e && e[0] == '0'); }();
+        return on && tsg::g_backend_type == tsg::BACKEND_TYPE_METAL;
+    }
+#endif
 }
 
 TSG_EXPORT void* TSGgml_Qwen4ExpStateSnapshotCreate(
@@ -4207,6 +4231,15 @@ TSG_EXPORT int TSGgml_Qwen4ExpStateSnapshotCapture(void* handle)
     try
     {
         set_last_error("");
+        snapshot->settle();
+#if defined(TSG_GGML_USE_METAL)
+        // One device: the copies are queued behind the work already committed, in one blit pass, and the verify window
+        // that follows on the same queue runs after them. Nothing waits here.
+        std::vector<const ggml_tensor*> gpu_src, gpu_dst;
+        const bool on_gpu = q4e_snapshot_on_gpu();
+#else
+        const bool on_gpu = false;
+#endif
         for (auto& entry : snapshot->entries)
         {
             tsg::ScopedRank rank(entry->device);
@@ -4219,9 +4252,31 @@ TSG_EXPORT int TSGgml_Qwen4ExpStateSnapshotCapture(void* handle)
             if (!entry->ready) continue; // the unchanged host seed remains authoritative
             entry->prepare(live->bytes);
             entry->bind_live(live->buf);
+#if defined(TSG_GGML_USE_METAL)
+            if (on_gpu && entry->device == 0)   // (tsm::copy_async refuses a buffer that is not Metal: the host copy then)
+            {
+                gpu_src.push_back(entry->live_tensor);
+                gpu_dst.push_back(entry->saved_tensor);
+                continue;
+            }
+#endif
             tsg::sync_backend(g_backend);
             ggml_backend_tensor_copy(entry->live_tensor, entry->saved_tensor);
         }
+#if defined(TSG_GGML_USE_METAL)
+        if (!gpu_src.empty())
+        {
+            tsg::ScopedRank rank(0);
+            snapshot->pending = tsm::copy_async(g_backend, gpu_src.data(), gpu_dst.data(), (int)gpu_src.size());
+            if (snapshot->pending == nullptr)
+            {
+                tsg::sync_backend(g_backend);   // the host copy, as before
+                for (std::size_t i = 0; i < gpu_src.size(); ++i)
+                    ggml_backend_tensor_copy(const_cast<ggml_tensor*>(gpu_src[i]), const_cast<ggml_tensor*>(gpu_dst[i]));
+            }
+        }
+#endif
+        (void)on_gpu;
         snapshot->captured = true;
         return 1;
     }
@@ -4237,6 +4292,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpStateSnapshotRestore(void* handle)
     try
     {
         set_last_error("");
+        snapshot->settle();   // the capture's copies queued on the accelerator are complete
         // Validate every allocation before changing any state. A freed/replaced
         // holder is never silently recreated from a stale snapshot.
         for (auto& entry : snapshot->entries)

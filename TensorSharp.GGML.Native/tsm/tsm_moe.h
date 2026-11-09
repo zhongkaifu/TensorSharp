@@ -159,6 +159,15 @@ namespace tsm
     // Waits for the last command buffer a tsm encoder committed (ggml's synchronize does not cover them).
     void wait_last();
 
+    // Copies srcs[i] into dsts[i] (the same byte counts, Metal buffers) in one blit pass on ggml-metal's queue, behind the
+    // work already committed there, without waiting: the speculative state snapshot before a verify window, which a host
+    // copy made wait for the accelerator and then memcpy ~115 MB (Flash Next, ~2 ms a step). Returns a retained handle
+    // of its command buffer, or null with the last error set (the caller copies on the host then).
+    void* copy_async(ggml_backend* backend, const ggml_tensor* const* srcs, const ggml_tensor* const* dsts, int n);
+    // Waits for a copy_async handle's copies to complete; release_handle drops it (null is a no-op for both).
+    void wait_handle(void* handle);
+    void release_handle(void* handle);
+
     // ---- A prompt chunk's hyper-connection read in one pass on the matrix units (tsm/kernels/tsm_hc_read.metal, after
     // Strata's gr_norm_h / gemm_f16 / gr_epi_down / gemm_hc_up): xn = rms_norm(each stream) * gamma in fp16, the down
     // projection and the injection weights in one GEMM, silu(down / hc), and the up projection whose epilogue mixes
