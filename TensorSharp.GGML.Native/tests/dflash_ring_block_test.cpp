@@ -78,8 +78,11 @@ int TSGgml_DFlashDraftBlockBatched(
 
 namespace {
 // Two query heads over one KV head; the ring has a block and an anchor of headroom past the window (DFlashConfig.RingRows).
-// The hidden size is Flash Next's: rows past 1024 floats once caught a ggml-metal copy that stopped at 1024.
-constexpr int N = 2, H = 2560, NH = 2, NKV = 1, HD = 32, FF = 128, FEAT = 128, VOCAB = 64;
+// The hidden size is Flash Next's on CPU and Metal: rows past 1024 floats once caught a ggml-metal copy that stopped at
+// 1024. CUDA runs at 64: its F32 matmuls are TF32 (CUBLAS_TF32_TENSOR_OP_MATH), and at 2560 wide the two key orders
+// moved DFlash1's plain argmax across near-ties (values within the tolerance, picks not).
+int H = 2560;
+constexpr int N = 2, NH = 2, NKV = 1, HD = 32, FF = 128, FEAT = 128, VOCAB = 64;
 constexpr int RING = 160, SW = 128, B = 8, RANK = 16, TOPK = VOCAB, TAPS = 2, GROUP = 16;
 constexpr int PROMPT = 150, STEPS = 14;
 
@@ -325,6 +328,7 @@ bool batched(Weights& w, bool selector, int backend) {
 int main(int argc, char** argv) {
     if (argc != 2) return 2;
     const int backend = !std::strcmp(argv[1], "cuda") ? 3 : !std::strcmp(argv[1], "metal") ? 1 : 2;
+    if (backend == 3) H = 64;
     if (!TSGgml_IsBackendAvailable(backend)) return 77;
     random_state = 4242;
     Weights w;
