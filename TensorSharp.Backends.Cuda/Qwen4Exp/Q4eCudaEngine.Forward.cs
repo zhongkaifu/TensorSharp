@@ -581,6 +581,12 @@ namespace TensorSharp.Cuda
         /// </summary>
         private readonly int _promptGroupEnv = Math.Max(0, EnvInt("TS_Q4E_PROMPT_GROUP", 4096));
         private Tensor _groupXs;
+        // _groupXs's writes: each group counts one before it runs. The last group to finish leaves its rows' output streams
+        // there (positions _groupHiddenP0 .. + _groupHiddenRows of _groupHiddenSlot) until the next group runs; the MTP
+        // catch-up after a prompt reads them there (MtpUploadRows) instead of the copy the host hands back.
+        private long _groupXsGen, _groupHiddenGen = -1;
+        private Slot _groupHiddenSlot;
+        private int _groupHiddenP0, _groupHiddenRows;
         // Inside a grouped prompt: the routed experts stage (never the host's doorbell) and keep their staging per layer.
         private bool _groupedPrompt;
 
@@ -788,6 +794,7 @@ namespace TensorSharp.Cuda
             FlushAsyncSwaps();
             Tensor ubatchXs = dev.Xs;
             _groupedPrompt = true;
+            _groupXsGen++;
             bool prefetch = PromptPrefetchUsable();
             try
             {
@@ -873,6 +880,11 @@ namespace TensorSharp.Cuda
                         for (int h = 0; h < 2; h++)
                             CudaDriverApi.cuEventRecord(_halfFree[h], dev.Stream).ThrowOnError();
                 }
+                // Every layer has run: the group's output streams stay in _groupXs until the next group.
+                _groupHiddenSlot = slot;
+                _groupHiddenP0 = p0;
+                _groupHiddenRows = g;
+                _groupHiddenGen = _groupXsGen;
                 if (hOut != null && hRowOffset >= 0 && hOut.LongLength >= ((long)hRowOffset + g) * hc)
                 {
                     CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();

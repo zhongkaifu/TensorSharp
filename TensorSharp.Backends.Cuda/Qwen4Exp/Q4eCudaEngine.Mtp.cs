@@ -215,7 +215,7 @@ namespace TensorSharp.Cuda
         {
             var m = _m;
             var dev = _devs[_mtpLayer.Device];
-            MtpUploadRows(tokens, hPrev, off, nt);
+            MtpUploadRows(tokens, hPrev, off, nt, p0 + slot.MtpStart - off);
             int left = MtpRows(slot, nt, p0, logitsOut != null || hOut != null);
             if (left == 0)
             {
@@ -267,9 +267,19 @@ namespace TensorSharp.Cuda
         /// <summary>Token ids the draft chain's head scores: <c>TS_Q4E_DRAFT_VOCAB</c>, at most the vocabulary.</summary>
         internal int DraftVocab => _draftVocabEnv <= 0 ? _m.NVocab : Math.Min(_draftVocabEnv, _m.NVocab);
 
+        // TS_Q4E_MTP_D2D=0: a catch-up uploads every row's trunk streams from the host.
+        private readonly bool _mtpD2D = Environment.GetEnvironmentVariable("TS_Q4E_MTP_D2D") != "0";
+
+        /// <summary>Catch-up rows whose trunk streams came from the last prompt group's buffer instead of the host (tests).</summary>
+        internal long MtpRowsFromDevice { get; private set; }
+
         /// <summary>A call's token rows embedded into the streams (on the embedding's device) and the trunk streams of the
-        /// tokens before them into G (on the block's).</summary>
-        private void MtpUploadRows(int[] tokens, float[] hPrev, int off, int nt)
+        /// tokens before them into G (on the block's). Row t (tokens[off + t], at position <paramref name="pos0"/> + off + t)
+        /// takes the stream of position pos0 + off + t - 1: from the last prompt group's buffer while it still holds that
+        /// position for this sequence (the same values the host's copy has: the prompt forward copied them from there), else
+        /// from <paramref name="hPrev"/>. A 4,000-row catch-up after a long prompt so moves 164 MB within the GPU instead of
+        /// through pinned host memory (22.6 ms on the RTX 5090, 4.6 of it kernels).</summary>
+        private void MtpUploadRows(int[] tokens, float[] hPrev, int off, int nt, int pos0)
         {
             var m = _m;
             var dev0 = _devs[0];
@@ -284,11 +294,39 @@ namespace TensorSharp.Cuda
             if (dev != dev0)
                 Handoff(dev0, dev, nt);
 
-            // The trunk streams of the previous tokens.
+            // The trunk streams of the previous tokens: rows [a, b) from the last prompt group's buffer when it holds their
+            // positions, the rest from the host.
             dev.MakeCurrent();
             CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
-            Marshal.Copy(hPrev, off * HcDim, _pinnedMtpH, nt * HcDim);
-            CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev.G), _pinnedMtpH, new UIntPtr((ulong)nt * (ulong)HcDim * 4), dev.Stream).ThrowOnError();
+            int a = 0, b = 0;
+            if (_mtpD2D && _groupXs != null && dev == _devs[0] && _groupHiddenGen == _groupXsGen && _groupHiddenSlot == _active)
+            {
+                // Row t's stream is position first + t; the buffer holds positions [p0g, p0g + rows).
+                long first = (long)pos0 + off - 1;
+                a = (int)Math.Clamp(_groupHiddenP0 - first, 0, nt);
+                b = (int)Math.Clamp(_groupHiddenP0 + _groupHiddenRows - first, a, nt);
+                if (b > a)
+                {
+                    long bytes = (long)HcDim * 4;
+                    CudaDriverApi.cuMemcpyDtoDAsync(At(dev.G, (long)a * HcDim), At(_groupXs, (first + a - _groupHiddenP0) * HcDim),
+                        new UIntPtr((ulong)((b - a) * bytes)), dev.Stream).ThrowOnError();
+                    MtpRowsFromDevice += b - a;
+                }
+            }
+            if (b <= a)
+                a = b = nt;
+            HostRows(0, a);
+            HostRows(b, nt);
+
+            void HostRows(int r0, int r1)
+            {
+                if (r1 <= r0)
+                    return;
+                IntPtr pinned = _pinnedMtpH + r0 * HcDim * 4;
+                Marshal.Copy(hPrev, (off + r0) * HcDim, pinned, (r1 - r0) * HcDim);
+                CudaDriverApi.cuMemcpyHtoDAsync(At(dev.G, (long)r0 * HcDim), pinned, new UIntPtr((ulong)(r1 - r0) * (ulong)HcDim * 4),
+                    dev.Stream).ThrowOnError();
+            }
         }
 
         /// <summary>
@@ -381,7 +419,7 @@ namespace TensorSharp.Cuda
             {
                 int nt = Math.Min(m.NUbatch, n - done);
                 bool last = done + nt == n;
-                MtpUploadRows(tokens, hPrev, done, nt);
+                MtpUploadRows(tokens, hPrev, done, nt, p0);
                 left = MtpRows(slot, nt, q0 + done, last);
                 done += nt;
             }

@@ -1458,6 +1458,66 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             () => head.DraftCatchUpAndStep(tokens[..1], rows[..feat], S - 1, new float[vocab], new float[feat]));
     }
 
+    /// <summary>
+    /// The MTP catch-up after a grouped prompt reads the trunk streams of the last group's positions from the group's
+    /// buffer (Q4eCudaEngine.MtpUploadRows), the values the host's copy holds, so the draft chain picks the same tokens with
+    /// the same confidences, bit for bit, as with every row from the host (TS_Q4E_MTP_D2D=0). A 300-token prompt in groups
+    /// of 192 rows (64-row ubatches), the catch-up from position 150: rows for positions 150..191 come from the host, the
+    /// 108 rows of the last group from the device.
+    /// </summary>
+    [CudaFact]
+    public void TheMtpCatchUpAfterAGroupedPrompt_ReadsTheLastGroupsStreams_BitForBit()
+    {
+        _env.Set("TS_Q4E_HOST_EXPERTS", "0");
+        _env.Set("TS_Q4E_UBATCH", "64");
+        _env.Set("TS_Q4E_PROMPT_GROUP", "192");
+        string path = Fixture(indexerTopK: 16, expertGateUpType: SyntheticGguf.GgmlType.Q2_0, expertDownType: SyntheticGguf.GgmlType.Q2_0);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 16);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        // Prompt groups need expert residency: two thirds resident.
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes * 2 / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        int[] prompt = Enumerable.Range(0, 300).Select(i => (i * 37 + 11) % 250).ToArray();
+        const int S = 150, Steps3 = 3;
+
+        (int[] Ids, float[] Probs, long FromDevice, long Groups) Run(string d2d)
+        {
+            _env.Set("TS_Q4E_MTP_D2D", d2d);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var head = (TensorSharp.Runtime.Speculative.IDraftHead)model;
+            int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            var hidden = new float[prompt.Length * feat];
+            spec.SpecForward(prompt, hidden, new float[vocab], false);
+            // The block restarts at S (the gap before it reported), then catches up on the prompt's rows from S and the
+            // next token, row t with the streams of the token before it.
+            head.DraftCatchUp(prompt[..S], null, 0);
+            int[] tokens = prompt[S..].Append(Steps[0]).ToArray();
+            var rows = new float[tokens.Length * feat];
+            Array.Copy(hidden, (long)(S - 1) * feat, rows, 0, (long)tokens.Length * feat);
+            var ids = new int[Steps3];
+            var probs = new float[Steps3];
+            Assert.Equal(Steps3, head.DraftChain(tokens, rows, S, Steps3, ids, probs));
+            return (ids, probs, engine.MtpRowsFromDevice, engine.PromptGroupsRun);
+        }
+        var host = Run("0");
+        var device = Run(null);
+        _output.WriteLine($"host rows:   [{string.Join(",", host.Ids)}] p [{string.Join(",", host.Probs.Select(p => p.ToString("R")))}]");
+        _output.WriteLine($"device rows: [{string.Join(",", device.Ids)}] p [{string.Join(",", device.Probs.Select(p => p.ToString("R")))}], " +
+            $"{device.FromDevice} rows from the group's buffer");
+        Assert.Equal(2, device.Groups);
+        Assert.Equal(0, host.FromDevice);
+        Assert.Equal(prompt.Length - 192, device.FromDevice);
+        Assert.Equal(host.Ids, device.Ids);
+        for (int i = 0; i < Steps3; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(host.Probs[i]) == BitConverter.SingleToInt32Bits(device.Probs[i]),
+                $"step {i}: confidence {device.Probs[i]:R} vs {host.Probs[i]:R}");
+    }
+
     /// <summary>A decode step's hyper-connection scatter fused with the next mixer's first pass computes what the two
     /// launches compute: the prompt and every decode step, bit for bit, with QSA past its width.</summary>
     [CudaFact]
