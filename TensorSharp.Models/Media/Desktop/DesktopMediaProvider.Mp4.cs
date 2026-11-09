@@ -83,12 +83,20 @@ namespace TensorSharp.Models.Media.Desktop
             string ffmpeg = FindFfmpeg();
             if (ffmpeg == null) return false;
 
+            // Opaque frames of one size go to ffmpeg as raw RGB24 on its stdin: the same
+            // 8-bit pixels the PNG route writes (ImageIO.ToRgb8 is what EncodePng
+            // encodes), without encoding and decoding a PNG per frame. Writing 158
+            // 480x864 PNGs through ImageMagick took ~33 s of a MiniMax-H3 clip; ffmpeg's
+            // own x264 encode of them took 0.4 s.
+            bool raw = frames.Length > 0 && Array.TrueForAll(frames, f =>
+                f.Alpha == null && f.Width == frames[0].Width && f.Height == frames[0].Height);
             string tmpDir = Path.Combine(Path.GetTempPath(), $"tswan-frames-{Guid.NewGuid():N}");
             Directory.CreateDirectory(tmpDir);
             try
             {
-                for (int i = 0; i < frames.Length; i++)
-                    ImageIO.SavePng(Path.Combine(tmpDir, $"f{i:D5}.png"), frames[i]);
+                if (!raw)
+                    for (int i = 0; i < frames.Length; i++)
+                        ImageIO.SavePng(Path.Combine(tmpDir, $"f{i:D5}.png"), frames[i]);
 
                 string audioPath = Path.Combine(tmpDir, "audio.f32");
                 if (audio != null)
@@ -99,15 +107,23 @@ namespace TensorSharp.Models.Media.Desktop
                             writer.Write(audio.Channels[channel][sample]);
                 }
 
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
                 var psi = new ProcessStartInfo
                 {
                     FileName = ffmpeg,
                     UseShellExecute = false,
                     RedirectStandardError = true,
+                    RedirectStandardInput = raw,
                     CreateNoWindow = true,
                 };
-                foreach (string value in new[] { "-y", "-loglevel", "error", "-framerate", fps.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                    "-i", Path.Combine(tmpDir, "f%05d.png") }) psi.ArgumentList.Add(value);
+                foreach (string value in new[] { "-y", "-loglevel", "error" }) psi.ArgumentList.Add(value);
+                if (raw)
+                    foreach (string value in new[] { "-f", "rawvideo", "-pix_fmt", "rgb24",
+                        "-s", $"{frames[0].Width.ToString(inv)}x{frames[0].Height.ToString(inv)}",
+                        "-framerate", fps.ToString(inv), "-i", "pipe:0" }) psi.ArgumentList.Add(value);
+                else
+                    foreach (string value in new[] { "-framerate", fps.ToString(inv),
+                        "-i", Path.Combine(tmpDir, "f%05d.png") }) psi.ArgumentList.Add(value);
                 if (audio != null)
                     foreach (string value in new[] { "-f", "f32le", "-ar", audio.SampleRate.ToString(System.Globalization.CultureInfo.InvariantCulture),
                         "-ac", audio.ChannelCount.ToString(System.Globalization.CultureInfo.InvariantCulture), "-i", audioPath,
@@ -115,7 +131,23 @@ namespace TensorSharp.Models.Media.Desktop
                 foreach (string value in new[] { "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-pix_fmt", "yuv420p",
                     "-movflags", "+faststart", path }) psi.ArgumentList.Add(value);
                 using var proc = Process.Start(psi);
-                string err = proc.StandardError.ReadToEnd();
+                // Drain stderr concurrently: while frames stream in, a blocked stderr
+                // pipe would stall ffmpeg and with it our writes to stdin.
+                var errTask = proc.StandardError.ReadToEndAsync();
+                if (raw)
+                {
+                    try
+                    {
+                        using var stdin = proc.StandardInput.BaseStream;
+                        foreach (var frame in frames)
+                            stdin.Write(ImageIO.ToRgb8(frame));
+                    }
+                    catch (IOException)
+                    {
+                        // ffmpeg exited early; its exit code and stderr say why.
+                    }
+                }
+                string err = errTask.GetAwaiter().GetResult();
                 proc.WaitForExit();
                 if (proc.ExitCode != 0)
                 {

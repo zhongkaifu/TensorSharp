@@ -326,6 +326,48 @@ and appended one H3 conversion entry. The committed modules have since become a
 compute_75 baseline built by CUDA 13.0 (see [Development](../../DEVELOPMENT.md)).
 No ggml patches are applied.
 
+### Long clips on ggml_cuda
+
+A 480x864, 158-frame FL2VA clip with the eight-step Turbo plug-in packs 20,511
+tokens. On the CUDA GPU it was measured on, a denoising step took 67.7 s on ggml
+alone: 53% in ggml-cuda's MMA F16 flash attention (16.6 TFLOP/s at this
+shape, against 80-83 TFLOP/s for cuDNN's SDPA), 22% in MMQ Q4_K projections (52
+TOPS, against 89 TFLOP/s for a cuBLAS BF16 GEMM) and 22% in F32 elementwise passes.
+ggml is unchanged; `graph_compute_offload` runs selected nodes of H3's own graphs
+outside it, into the buffers ggml's allocator gave them:
+
+- **Attention** runs on cuDNN's fused SDPA (backend `CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR`,
+  cuDNN 9.13+, resolved at run time like the VAE convolutions), F16 in with F32
+  accumulation (`tsg_cuda_cudnn_sdpa.cu`).
+- **The wide Q4_K projections** dequantize to BF16 per call and run one cuBLAS GEMM
+  with F32 accumulation (`tsg_cuda_q4k_gemm.cu`; sm_80 or newer). BF16 keeps F32's exponent range, so
+  these matmuls drop the q8_1 overflow guard's two scale passes. A LoRA update is
+  merged into the expanded weight (W + up*down, one BF16 rounding) instead of running
+  shrink, expand and a full-size add per projection.
+- **Fused stages** (`tsg_cuda_h3_fused.cu`) stand in the graph as `GGML_OP_CUSTOM`
+  nodes: the qkv bias, q/k RMSNorm, RoPE and F16 narrowing in front of the attention
+  (DiT and video VAE), the per-segment AdaLN modulation, and the gated residuals with
+  their bias and LoRA terms.
+
+| Same clip (pj keyframe, seed 1) | Clip | Denoising step |
+|---|---:|---:|
+| ggml only | 678 s | 67.7 s |
+| + cuDNN attention | 484 s | 39.9 s |
+| + cuBLAS BF16 projections | 431 s | 34.4 s |
+| + no guard passes, raw-RGB ffmpeg pipe | 376 s | 32.0 s |
+| + fused stages | 337 s | 27.1 s |
+| + merged LoRA | 303 s | 22.8 s |
+| + fused video VAE attention (decode 61.6 to 54.9 s) | 293 s | 22.8 s |
+
+Times are whole requests on a freshly started server (the first step also uploads
+the denoiser). A second clip on the same server took 294 s: its denoiser stays
+resident, but the 17 GB text encoder, which is loaded again for every request,
+took 50 s instead of 28 s. ComfyUI's W6A8 H3 makes the same clip in 163 s warm. Output is not bit-identical to the ggml-only path: decoded RGB stays
+at 30.7-31.8 dB PSNR from it, most of which comes from the attention's F32 rather than
+F16 accumulation (the first change alone gives 31.8 dB); successive changes agree with
+each other at 38-39 dB. The MP4 writer now pipes raw RGB24 to ffmpeg instead of
+writing a PNG per frame through ImageMagick (identical pixels; ~33 s to ~1 s here).
+
 ### Long-sequence attention on Metal
 
 A 1280×768×107 first/last-frame clip on FL2VA is 34,991 packed tokens, and at that
@@ -873,6 +915,9 @@ but a track that is spectrally plausible and merely wrong.
 | `TS_H3_UPLOAD_PREFAULT` | Native CUDA bulk page-prefault policy: automatic half-memory/cgroup guard; `0` disables, `1` forces; final default coverage is recorded above |
 | `TS_H3_UPLOAD_WORKERS` | Native bulk-prefault workers (1–8, default 8); distinct from the pipeline's denoiser file-read streams |
 | `TS_H3_UPLOAD_PROFILE=1` | Native weight-upload and graph-compute diagnostics; record separately from trace-free performance runs |
+| `TS_H3_CUDNN_ATTENTION=0` | `ggml_cuda`: keeps every attention on ggml's flash-attention kernel instead of cuDNN's fused SDPA ([below](#long-clips-on-ggml_cuda)); `TS_H3_CUDNN_ATTENTION_VERBOSE=1` prints the cuDNN plans and declines |
+| `TS_H3_CUBLAS_MATMUL=0` | `ggml_cuda`: keeps the DiT's wide Q4_K projections on MMQ instead of cuBLAS BF16; `TS_H3_CUBLAS_MIN_ROWS` (default 1024) is the token threshold |
+| `TS_H3_FUSED=0` | `ggml_cuda`: builds the unfused DiT and VAE graphs (no fused attention prep, modulation, gated residual or merged LoRA) |
 
 ## Reproducing validation
 

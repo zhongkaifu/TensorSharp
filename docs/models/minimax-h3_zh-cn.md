@@ -129,6 +129,30 @@ CUDA 量化投影默认以最多 64 MiB 转换暂存区运行 pedantic F32 GEMM�
 缓存波动很大，暖对照仍更快，因此没有普遍 CUDA 整进程持平结论。
 当前 A/B 和这些历史跨引擎数据不能合并。完整旧数据与限制见[英文卡片](minimax-h3.md)。
 
+### ggml_cuda 上的长片段
+
+480x864、158 帧的 FL2VA 片段（八步 Turbo 插件）打包为 20,511 个 token。在测量所用的 CUDA GPU 上，
+仅用 ggml 时一个去噪步耗时 67.7 s：53% 在 ggml-cuda 的 MMA F16
+flash attention（此形状下 16.6 TFLOP/s，cuDNN SDPA 为 80-83 TFLOP/s），22% 在 MMQ Q4_K 投影
+（52 TOPS，cuBLAS BF16 GEMM 为 89 TFLOP/s），22% 在 F32 逐元素运算。ggml 保持不变；
+`graph_compute_offload` 在 ggml 之外执行 H3 自身图里的选定节点，结果写入 ggml 分配器给出的缓冲区：
+
+- **注意力**改用 cuDNN 融合 SDPA（后端描述符 `CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR`，
+  cuDNN 9.13+，与 VAE 卷积一样在运行时加载），F16 输入、F32 累加（`tsg_cuda_cudnn_sdpa.cu`）。
+- **宽 Q4_K 投影**每次调用展开为 BF16，再做一次 F32 累加的 cuBLAS GEMM（`tsg_cuda_q4k_gemm.cu`，
+  需要 sm_80+）。BF16 保留 F32 的指数范围，因此这些矩阵乘去掉了 q8_1 溢出保护的两次缩放。
+  LoRA 更新合并进展开后的权重（W + up*down，只舍入一次 BF16），不再逐投影做 shrink、expand 和整张量加法。
+- **融合阶段**（`tsg_cuda_h3_fused.cu`）以 `GGML_OP_CUSTOM` 节点出现在图中：注意力前的 qkv 偏置、
+  q/k RMSNorm、RoPE 与 F16 收窄（DiT 与视频 VAE），按段的 AdaLN 调制，以及带偏置与 LoRA 项的门控残差。
+
+同一片段（同一关键帧，种子 1），新启动服务器上的完整请求：仅 ggml 678 s（步 67.7 s）→ cuDNN 注意力
+484 s → cuBLAS BF16 投影 431 s → 去掉保护缩放并以原始 RGB 管道写 MP4 376 s → 融合阶段 337 s →
+合并 LoRA 303 s（步 22.8 s）→ 融合视频 VAE 注意力 293 s。同一服务器的第二个片段为 294 s：去噪器常驻，
+但 17 GB 文本编码器每次请求重新加载，耗时 50 s（首个请求 28 s）。ComfyUI 的
+W6A8 H3 生成同一片段为 163 s（模型已加载）。输出与仅 ggml 路径并非逐位相同：解码 RGB 的 PSNR 为
+30.7-31.8 dB，主要来自注意力改为 F32 累加（仅第一项改动即为 31.8 dB）；相邻改动之间为 38-47 dB。
+MP4 写出改为向 ffmpeg 管道传原始 RGB24，而不是逐帧经 ImageMagick 写 PNG（像素相同；此处 ~33 s 降到 ~1 s）。
+
 ### Metal 上的长序列注意力
 
 FL2VA 上 1280×768×107 的首尾帧片段有 34,991 个打包 token，此时每步的耗时主要在注意力。
@@ -464,6 +488,9 @@ AdaLN 来自学习的 `[8,1025]` 曲线表，三模态分别取调制参数。
 | `TS_H3_UPLOAD_PREFAULT` | 原生 CUDA 自动半内存预算；`0` 禁用，`1` 强制 |
 | `TS_H3_UPLOAD_WORKERS` | 原生 CUDA 预读 1–8 个 worker，默认 8 |
 | `TS_H3_UPLOAD_PROFILE=1` | 预读/上传/图诊断，不能混入正式计时 |
+| `TS_H3_CUDNN_ATTENTION=0` | `ggml_cuda`：注意力保留在 ggml 的 flash attention，而不用 cuDNN 融合 SDPA；`TS_H3_CUDNN_ATTENTION_VERBOSE=1` 打印 cuDNN 计划与回退 |
+| `TS_H3_CUBLAS_MATMUL=0` | `ggml_cuda`：DiT 的宽 Q4_K 投影保留在 MMQ，而不用 cuBLAS BF16；`TS_H3_CUBLAS_MIN_ROWS`（默认 1024）为 token 阈值 |
+| `TS_H3_FUSED=0` | `ggml_cuda`：构建未融合的 DiT 与 VAE 图（不融合注意力前处理、调制、门控残差与 LoRA 合并） |
 | `TS_H3_PREFAULT` | 托管去噪器预读：0 关、1 串行、2 提前重叠、3 默认流水线 |
 | `TS_H3_PREFAULT_THREADS` | 去噪器预读的读取线程；macOS 默认 1，Linux 默认 16（同一遍扫描中并发读取 8 MiB 块，网络卷需要这种并发） |
 | `TS_VIDEO_READAHEAD=0` | 关闭 `ggml_cuda` 文本编码器预读（在上传的页预热之前并发读取）；与 LTX 2.5 共用 |
