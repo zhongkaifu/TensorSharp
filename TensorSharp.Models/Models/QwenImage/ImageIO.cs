@@ -210,7 +210,7 @@ namespace TensorSharp.Models.QwenImage
         private static byte Quantize(float value) => (byte)Math.Clamp(value * 255f + 0.5f, 0f, 255f);
 
         // float [0,1] -> u8 with round-half-up, the quantisation every codec call shares.
-        private static byte[] ToRgb8(RgbImage img)
+        internal static byte[] ToRgb8(RgbImage img)
         {
             var bytes = new byte[(long)img.Width * img.Height * 3];
             var src = img.Pixels;

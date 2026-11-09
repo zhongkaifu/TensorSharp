@@ -2786,6 +2786,12 @@ namespace tsg
                                      int stride, int pad,
                                      void* dst, int OW, int OH, bool full_precision);
     extern "C" void tsg_cudnn_conv2d_release(void);
+    // MiniMax-H3's attention on cuDNN SDPA (tsg_cuda_cudnn_sdpa.cu): plans and scratch.
+    extern "C" void tsg_cudnn_sdpa_release(void);
+    #endif
+    #if defined(TSG_GGML_USE_CUDA)
+    // MiniMax-H3's Q4_K projections on cuBLAS (tsg_cuda_q4k_gemm.cu): handle and scratch.
+    extern "C" void tsg_cuda_q4k_gemm_release(void);
     #endif
 
     // True when the process-global GGML backend is ggml-cuda.
@@ -2976,7 +2982,55 @@ namespace tsg
         return GGML_STATUS_SUCCESS;
     }
 
-    ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag)
+    namespace
+    {
+        // The unprofiled offload loop: ggml views between the offloaded nodes.
+        ggml_status compute_split(ggml_backend_t backend, ggml_cgraph* graph, const NodeOffload& off)
+        {
+            const int n = ggml_graph_n_nodes(graph);
+            int from = 0;
+            for (int i = 0; i < n; i++)
+            {
+                ggml_tensor* node = ggml_graph_node(graph, i);
+                if (!off.wants(node, off.ctx)) continue;
+                if (i > from)
+                {
+                    ggml_cgraph view = ggml_graph_view(graph, from, i);
+                    const ggml_status st = tsg::compute_graph(backend, &view);
+                    if (st != GGML_STATUS_SUCCESS) return st;
+                }
+                tsg::sync_backend(backend);
+                if (!off.run(node, off.ctx))
+                {
+                    // A declined node ggml has no kernel for (the caller's own fused
+                    // GGML_OP_CUSTOM nodes) fails the graph rather than reaching ggml.
+                    if (node->op == GGML_OP_CUSTOM) return GGML_STATUS_FAILED;
+                    ggml_cgraph one = ggml_graph_view(graph, i, i + 1);
+                    const ggml_status st = tsg::compute_graph(backend, &one);
+                    if (st != GGML_STATUS_SUCCESS) return st;
+                }
+                from = i + 1;
+            }
+            if (from < n)
+            {
+                ggml_cgraph view = ggml_graph_view(graph, from, n);
+                const ggml_status st = tsg::compute_graph(backend, &view);
+                if (st != GGML_STATUS_SUCCESS) return st;
+            }
+            return GGML_STATUS_SUCCESS;
+        }
+    }
+
+    ggml_status graph_compute_offload(ggml_backend_t backend, ggml_cgraph* graph, const char* tag,
+                                      const NodeOffload& offload)
+    {
+        if (graph_node_profile_enabled())
+            return graph_compute_profiled(backend, graph, tag, &offload);
+        return compute_split(backend, graph, offload);
+    }
+
+    ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag,
+                                       const NodeOffload* offload)
     {
         // TS_GGML_NODE_PROFILE_TAG=<substring> profiles only the graphs whose tag
         // contains it (e.g. "verify"), so a decode-dominated run does not bury
@@ -2985,21 +3039,32 @@ namespace tsg
             static const char* want = std::getenv("TS_GGML_NODE_PROFILE_TAG");
             if (want != nullptr && want[0] != '\0' && graph_node_profile_enabled()
                 && (tag == nullptr || std::strstr(tag, want) == nullptr))
-                return tsg::compute_graph(backend, graph);
+                return offload != nullptr ? compute_split(backend, graph, *offload) : tsg::compute_graph(backend, graph);
         }
         if (!graph_node_profile_enabled())
-            return tsg::compute_graph(backend, graph);
+            return offload != nullptr ? compute_split(backend, graph, *offload) : tsg::compute_graph(backend, graph);
 
         const int n = ggml_graph_n_nodes(graph);
         std::vector<double> per_node(static_cast<std::size_t>(n), 0.0);
+        std::vector<char> outside(static_cast<std::size_t>(n), 0);
 
         tsg::sync_backend(backend);
         const auto t_start = std::chrono::steady_clock::now();
         for (int i = 0; i < n; i++)
         {
-            ggml_cgraph view = ggml_graph_view(graph, i, i + 1);
             const auto t0 = std::chrono::steady_clock::now();
-            ggml_status st = tsg::compute_graph(backend, &view);
+            ggml_status st = GGML_STATUS_SUCCESS;
+            ggml_tensor* node = ggml_graph_node(graph, i);
+            const bool wanted = offload != nullptr && offload->wants(node, offload->ctx);
+            if (wanted && offload->run(node, offload->ctx))
+                outside[static_cast<std::size_t>(i)] = 1;
+            else if (wanted && node->op == GGML_OP_CUSTOM)
+                return GGML_STATUS_FAILED;   // as compute_split: no ggml kernel to fall back to
+            else
+            {
+                ggml_cgraph view = ggml_graph_view(graph, i, i + 1);
+                st = tsg::compute_graph(backend, &view);
+            }
             tsg::sync_backend(backend);
             const auto t1 = std::chrono::steady_clock::now();
             if (st != GGML_STATUS_SUCCESS)
@@ -3024,6 +3089,8 @@ namespace tsg
             std::string key = ggml_op_name(node->op);
             if (by_type && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] != nullptr)
                 key += std::string(":") + ggml_type_name(node->src[0]->type);
+            if (outside[static_cast<std::size_t>(i)])
+                key += ":offload";
             NodeProfileBucket& b = s.buckets[key];
             b.us += us;
             b.calls++;
@@ -3338,6 +3405,10 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // resident charges the whole denoise for memory only the decode needs.
 #if defined(TSG_HAVE_CUDNN)
     tsg_cudnn_conv2d_release();
+    tsg_cudnn_sdpa_release();
+#endif
+#if defined(TSG_GGML_USE_CUDA)
+    tsg_cuda_q4k_gemm_release();
 #endif
     forget_cache_keys();
     // Host-MoE streaming page-locks the expert stacks it streams (cudaHostRegister
@@ -3486,6 +3557,10 @@ TSG_EXPORT void TSGgml_Shutdown()
     // cuDNN owns a device handle and scratch independently of ggml. Release
     // them before backend teardown, including callers that skip model disposal.
     tsg_cudnn_conv2d_release();
+    tsg_cudnn_sdpa_release();
+#endif
+#if defined(TSG_GGML_USE_CUDA)
+    tsg_cuda_q4k_gemm_release();
 #endif
     // Release every thread's cached prefill-attention and paged-attention
     // sessions, including those of threads that have exited, while their
