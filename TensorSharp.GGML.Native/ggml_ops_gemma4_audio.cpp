@@ -137,7 +137,7 @@ struct audio_graph {
             // private pedantic cuBLAS handle. Ordinary ggml CUDA nodes retain
             // the original stream; no shared handle math mode is mutated.
             std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> precise(
-                tsg_dsv4_fused_backend_init(g_backend), &ggml_backend_free);
+                tsg_dsv4_fused_backend_try_init(g_backend), &ggml_backend_free);
             if (!precise) throw std::runtime_error("Cannot create scoped precise CUDA audio backend.");
             status = ggml_backend_graph_compute(precise.get(), graph);
             handled = true;

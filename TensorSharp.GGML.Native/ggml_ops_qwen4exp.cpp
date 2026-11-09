@@ -3103,8 +3103,9 @@ static int q4e_token_span_impl(
 #ifdef TSG_GGML_USE_CUDA
         if ((!qsa_plans.empty() || tp_mode || g_q4e_prefill_combine) && ggml_backend_is_cuda(g_backend))
         {
-            slot->precise_backend = tsg_dsv4_fused_backend_init(g_backend);
-            if (!slot->precise_backend) throw std::runtime_error("qwen4exp QSA: precise backend creation failed");
+            slot->precise_backend = tsg_dsv4_fused_backend_try_init(g_backend);
+            if (!slot->precise_backend)
+                throw std::runtime_error("qwen4exp QSA: precise backend creation failed (no device memory for its cuBLAS handle)");
         }
 #endif
 

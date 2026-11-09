@@ -120,6 +120,9 @@ bool tsg_dsv4_cuda_supports_native_bf16(ggml_backend_t cuda_backend);
 // directly, all asynchronously on that backend's stream.
 // The cuda_backend must outlive the returned backend.
 ggml_backend_t tsg_dsv4_fused_backend_init(ggml_backend_t cuda_backend);
+// As above, but nullptr instead of aborting when the device cannot create the backend's private
+// cuBLAS handle (no device memory left): for backends made per request or per graph.
+ggml_backend_t tsg_dsv4_fused_backend_try_init(ggml_backend_t cuda_backend);
 
 // Diagnostics for TS_DSV4_PERF>=3: how the device subgraph was submitted.
 // `views` counts the forwarded runs of ordinary nodes (each one a separate

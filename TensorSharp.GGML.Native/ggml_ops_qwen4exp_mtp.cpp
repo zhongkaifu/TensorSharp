@@ -302,7 +302,7 @@ TSG_EXPORT void* TSGgml_Qwen4ExpMtpCreate(const TSGgmlQwen4ExpMtpConfig* config,
 #ifdef TSG_GGML_USE_CUDA
         if (ggml_backend_is_cuda(tsg::active_backend()))
         {
-            executor->precise_backend = tsg_dsv4_fused_backend_init(tsg::active_backend());
+            executor->precise_backend = tsg_dsv4_fused_backend_try_init(tsg::active_backend());
             if (!executor->precise_backend)
                 throw std::runtime_error("qwen4exp MTP: cannot create F32 execution backend");
         }
