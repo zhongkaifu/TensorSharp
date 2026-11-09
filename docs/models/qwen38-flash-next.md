@@ -2213,6 +2213,7 @@ per step. These settings shape it as a server:
 | `TS_Q4E_UBATCH` | `512` | Rows per prefill forward. |
 | `TS_Q4E_PERF` | `0` | `1` logs each forward's time; `3` logs each stage's GPU time per step (uncaptured). |
 | `TS_Q4E_PERF_SAMPLE` | `0` | Every Nth forward runs uncaptured with stage timers and records `tensorsharp.engine.stage.duration` per stage, step kind and rows, instead of a log line. With `TS_Q4E_PERF` at `2` or more it is off. |
+| `TS_KDA_SCAN_R4` | off | `1` runs the gated-delta scan four state rows a warp in prefill too; unset, a prefill ubatch's scan runs one row a warp and prefetches the next row's inputs (bit-identical). |
 
 The scheduler sizes its reservation pool for one context per running sequence for this
 engine (`IBatchedPagedModel.UsesNativeSequenceSlots`), as for DeepSeek V4.1, instead of
@@ -2252,6 +2253,12 @@ Greedy answers are byte-identical with each switch on and off. The CUDA tests
 and `ARewindFromTheCheckpoint_ContinuesAsTheSequenceThatStoppedThere` cover them on the
 synthetic fixture. The direct engine has no MTP drafter and refuses `--tp`; under a layer
 split one GPU computes at a time.
+
+A prefill ubatch's gated-delta scan with one state row a warp computes exactly what the
+four-rows-a-warp scan computes (`Qwen4ExpPrefillKernelTests`); on the same two H100 NVL
+(2026-11-09) the 2,048-token forward's scan fell from 137 to 113 ms.
+Sampling a batched step's rows in parallel took 16 streams at temperature 1 (top-k 20) from
+291 to 316 tok/s in all and 8 from 235 to 250; the draws are unchanged.
 
 ## Benchmark matrix
 

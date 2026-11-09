@@ -27,6 +27,11 @@ namespace TensorSharp.Cuda
         private readonly CudaModule module;
         private readonly IntPtr kdaPrep;
         private readonly IntPtr kdaScan;
+        private readonly IntPtr kdaScanR1;
+
+        /// <summary>Four state rows a warp for every scan, not only decode steps (<c>TS_KDA_SCAN_R4=1</c>;
+        /// settable for tests). Both kernels compute every state element alike.</summary>
+        internal static bool KdaScanFourRows { get; set; } = Environment.GetEnvironmentVariable("TS_KDA_SCAN_R4") == "1";
         private readonly IntPtr kdaOut;
         private readonly IntPtr kdaConvUpdate;
         private readonly IntPtr mlaKvStore;
@@ -48,6 +53,7 @@ namespace TensorSharp.Cuda
             this.module = module;
             kdaPrep = module.GetFunction("ts_glm_kda_prep_f32");
             kdaScan = module.GetFunction("ts_glm_kda_scan_f32");
+            kdaScanR1 = module.GetFunction("ts_glm_kda_scan_r1_f32");
             kdaOut = module.GetFunction("ts_glm_kda_out_f32");
             kdaConvUpdate = module.GetFunction("ts_glm_kda_conv_update_f32");
             mlaKvStore = module.GetFunction("ts_glm_mla_kv_store_f32");
@@ -109,8 +115,15 @@ namespace TensorSharp.Cuda
             IntPtr a0 = scr, a1 = ssmStates, a2 = core;
             int a3 = rowsPerSeq, a4 = heads;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
-            const int warpsPerBlock = 4;   // 16 state rows per block
-            Launch(kdaScan, (uint)heads, (uint)(KdaHeadDim / (4 * warpsPerBlock)), (uint)nSeq, warpsPerBlock * 32, stream, args);
+            // A prefill ubatch walks its rows in order: a state row per warp (four per block), as
+            // ts_glm_kda_scan_f32 computes each, so the SMs hold four times the warps. A decode step (one row a
+            // sequence) keeps four rows a warp, which needs a quarter of the blocks. TS_KDA_SCAN_R4=1 runs four
+            // rows a warp everywhere (A/B); both are bit-identical.
+            const int warpsPerBlock = 4;
+            if (KdaScanFourRows || rowsPerSeq <= 1)
+                Launch(kdaScan, (uint)heads, (uint)(KdaHeadDim / (4 * warpsPerBlock)), (uint)nSeq, warpsPerBlock * 32, stream, args);
+            else
+                Launch(kdaScanR1, (uint)heads, (uint)(KdaHeadDim / warpsPerBlock), (uint)nSeq, warpsPerBlock * 32, stream, args);
         }
 
         public void KdaOut(IntPtr core, IntPtr gate, IntPtr normW, IntPtr output, int rows, int heads, float eps, IntPtr stream)
