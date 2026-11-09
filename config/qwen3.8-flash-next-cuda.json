@@ -4,10 +4,13 @@
   //   TensorSharp.Server.Host --config config/qwen3.8-flash-next-cuda.json
   // For several concurrent users add config/qwen3.8-flash-next-cuda-4lanes.json after this file.
   //
-  // Measured on an RTX 5090 (32 GB), 2026-11-08, one sequence lane: decode 131-177 tok/s (short answers) and
-  // 231-250 (long ones); TTFT 1.0 s at 4K tokens, 4.2 s at 16K, 13.2 s at 48K, 30.4 s at 100K (prefill ~3,900
-  // tok/s); four requests at once 200 tok/s in all. With four lanes: four at once 243-258 tok/s, parallel_4 281-286,
-  // single-stream decode 7-11% lower (fewer experts fit the VRAM). See docs/models/qwen38-flash-next.md.
+  // Measured on an RTX 5090 (32 GB), 2026-11-09, eng/qwen38-engine-bench.py (greedy, two passes), one sequence lane:
+  // decode 141-148 tok/s on short answers and 247-250 on a long generation, 185-204 after a 4K-token prompt and
+  // 237-271 after 16K; TTFT 0.65-0.67 s at 4K and 2.73-2.74 s at 16K (2026-11-08: 13.2 s at 48K, 30.4 s at 100K).
+  // The MTP head commits 3.1 tokens a window (78% of its drafts). With four lanes
+  // (config/qwen3.8-flash-next-cuda-4lanes.json) parallel_4 reached 272-299 tok/s in all.
+  // Strata on the same card: TTFT 0.93 s at 4K and 2.74 s at 16K, decode 307 on a long generation and 394 after long
+  // prompts. See docs/models/qwen38-flash-next.md.
   //
   // The experts do not fit a 32 GB card: the engine keeps the most-routed ones in VRAM (ranked by a routing profile
   // it records on the first load) and computes the rest on the host, so the host needs ~45 GB of RAM (the 28.8 GB

@@ -1,6 +1,13 @@
 {
   // Shared CLI/Server.Host profile for the NInfer v3 Qwen3.8-27B artifact. Add --chat only for the interactive CLI.
   // The artifact embeds its tokenizer, chat template and DFlash2 companion weights.
+  //
+  // Qwen3.8-27B's fastest measured setup on NVIDIA: the NVFP4 artifact on the direct CUDA engine with its DFlash2
+  // weights (7 drafts, no confidence gate). RTX 5090, 2026-11-05 campaign: decode ~203 tok/s single stream (73 without
+  // drafting), 8K-token TTFT 0.78 s, four requests at once up to 372 tok/s in all. The UD-IQ3_XXS GGUF with the
+  // DFlash2 GGUF on ggml_cuda decodes 188-190 tok/s but batched four requests to ~96 tok/s (measured 2026-11-09,
+  // before 74310bb0's VRAM fix; to be re-measured).
+  // Apple Silicon: config/qwen3.8-27b-metal-dflash2.json (ggml-metal has no NVFP4 matmul).
   "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
   "model": {
     "path": "${modelRoot}/qwen3_8_27b_nvfp4.ninfer",
