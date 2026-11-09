@@ -2202,6 +2202,121 @@ ggml_tensor* q4e_nodes_attn(
     return res_out;
 }
 
+// The attention half for an arena step (n_slots sequences, one token each): the mixer, the q|gate / k / v
+// projections, the head norms and the rotary run once over every slot's column, and so do the gate, the output
+// projection and the scatter; only what reads a slot's own cache runs per slot - its QSA selection, its K/V append and
+// its attention - exactly as q4e_nodes_attn does for one sequence (T = 1, its own window, mask and cache views).
+ggml_tensor* q4e_nodes_attn_slots(
+    ggml_context* ctx, ggml_cgraph* graph, Q4eBinder& bnd,
+    const TSGgmlQwen4ExpAttnArgs* a, ggml_tensor* res_in, ggml_tensor* pos, int n_slots,
+    const Q4eAttnSlot* slots,
+    int n_embd, int hc, int hc_low_rank,
+    int head_dim, int n_head, int n_head_kv,
+    int n_rot, float rope_base, float rope_freq_scale, float attn_scale,
+    float eps, bool use_flash)
+{
+    const int hc_dim = hc * n_embd;
+    const int q_dim = head_dim * n_head;
+    const int S = n_slots;
+
+    ggml_tensor* w_norm   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
+    ggml_tensor* w_down   = ggml_new_tensor_2d(ctx, (ggml_type)a->hc_down_type, hc_dim, hc_low_rank);
+    ggml_tensor* w_up     = ggml_new_tensor_2d(ctx, (ggml_type)a->hc_up_type, hc_low_rank, hc_dim);
+    ggml_tensor* w_inject = ggml_new_tensor_2d(ctx, (ggml_type)a->hc_inject_type, hc_dim, hc);
+    ggml_tensor* wq       = ggml_new_tensor_2d(ctx, (ggml_type)a->wq_type, n_embd, q_dim * 2);
+    ggml_tensor* wk       = ggml_new_tensor_2d(ctx, (ggml_type)a->wk_type, n_embd, head_dim * n_head_kv);
+    ggml_tensor* wv       = ggml_new_tensor_2d(ctx, (ggml_type)a->wv_type, n_embd, head_dim * n_head_kv);
+    ggml_tensor* wo       = ggml_new_tensor_2d(ctx, (ggml_type)a->wo_type, q_dim, n_embd);
+    ggml_tensor* q_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+    ggml_tensor* k_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+
+    // ---- once over every slot ----
+    const Q4eHcRead hcr = q4e_nodes_hc_read(ctx, res_in, w_norm, w_down, w_up, w_inject, n_embd, hc, S, eps);
+    ggml_tensor* mixed = hcr.mixed;   // [n_embd, S]
+
+    ggml_tensor* qg = q4e_mul_mat(ctx, wq, mixed);                 // [q_dim*2, S]
+    const std::size_t esz = ggml_element_size(qg);
+    ggml_tensor* q = ggml_view_3d(ctx, qg, head_dim, n_head, S, esz * head_dim * 2, esz * head_dim * 2 * n_head, 0);
+    ggml_tensor* gate = q4e_cont(ctx, ggml_view_3d(ctx, qg, head_dim, n_head, S,
+            esz * head_dim * 2, esz * head_dim * 2 * n_head, esz * head_dim));
+    q = q4e_cont(ctx, q);
+    q4e_keep_fusion_input(q);
+    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, eps), q_norm_w);
+    ggml_tensor* k = ggml_reshape_3d(ctx, q4e_mul_mat(ctx, wk, mixed), head_dim, n_head_kv, S);
+    q4e_keep_fusion_input(k);
+    k = ggml_mul(ctx, ggml_rms_norm(ctx, k, eps), k_norm_w);
+    ggml_tensor* v = ggml_reshape_3d(ctx, q4e_mul_mat(ctx, wv, mixed), head_dim, n_head_kv, S);
+    // Text positions: one per slot (an image-compacted slot keeps the per-slot path).
+    q = ggml_rope_ext(ctx, q, pos, nullptr, n_rot, 2, 0, rope_base, rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+    k = ggml_rope_ext(ctx, k, pos, nullptr, n_rot, 2, 0, rope_base, rope_freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    // ---- per slot: QSA selection, K/V append, attention ----
+    ggml_tensor* attn = nullptr;
+    for (int s = 0; s < S; ++s)
+    {
+        const Q4eAttnSlot& sl = slots[s];
+        ggml_tensor* mask = sl.mask;
+        int qsa_width = 0;
+        if (sl.qsa != nullptr)
+        {
+            ggml_tensor* mixed_s = ggml_view_2d(ctx, mixed, n_embd, 1, mixed->nb[1], (std::size_t)s * mixed->nb[1]);
+            mask = q4e_nodes_qsa_mask(ctx, graph, bnd, *sl.qsa, mixed_s, mask, sl.kv_idx,
+                n_embd, 1, sl.n_kv_pad, n_rot, rope_base, rope_freq_scale, eps, &qsa_width);
+        }
+        ggml_tensor* ks = ggml_view_3d(ctx, k, head_dim, n_head_kv, 1, k->nb[1], k->nb[2], (std::size_t)s * k->nb[2]);
+        ggml_tensor* vs = ggml_view_3d(ctx, v, head_dim, n_head_kv, 1, v->nb[1], v->nb[2], (std::size_t)s * v->nb[2]);
+        ggml_tensor* k_write = q4e_cont(ctx, ggml_permute(ctx, ks, 0, 2, 1, 3));   // [hd, 1, kvH]
+        ggml_tensor* v_write = q4e_cont(ctx, ggml_permute(ctx, vs, 0, 2, 1, 3));
+        ggml_tensor* k_written = ggml_set_rows(ctx, sl.k_cache, k_write, sl.kv_idx);
+        ggml_tensor* v_written = ggml_set_rows(ctx, sl.v_cache, v_write, sl.kv_idx);
+        ggml_tensor* k_full = ggml_view_3d(ctx, k_written, head_dim, sl.n_kv_pad, n_head_kv,
+                sl.k_cache->nb[1], sl.k_cache->nb[2], 0);
+        ggml_tensor* v_full = ggml_view_3d(ctx, v_written, head_dim, sl.n_kv_pad, n_head_kv,
+                sl.v_cache->nb[1], sl.v_cache->nb[2], 0);
+        ggml_build_forward_expand(graph, k_written);
+        ggml_build_forward_expand(graph, v_written);
+        ggml_tensor* qs = ggml_view_3d(ctx, q, head_dim, n_head, 1, q->nb[1], q->nb[2], (std::size_t)s * q->nb[2]);
+        ggml_tensor* q_attn = q4e_cont(ctx, ggml_permute(ctx, qs, 0, 2, 1, 3));   // [hd, 1, nH]
+        ggml_tensor* a_s = nullptr;
+        if (use_flash)
+        {
+            a_s = flash_attn_ext_guarded(ctx, "Qwen4Exp arena attention", q_attn, k_full, v_full, mask,
+                attn_scale, 0.0f, 0.0f, nullptr, GGML_PREC_F32);
+            // As q4e_nodes_attn's decode rows: the QSA mask keeps at most qsa_width cells (TS_Q4E_QSA_SPARSE_FA).
+            static const int mode = [] { const char* e = std::getenv("TS_Q4E_QSA_SPARSE_FA"); return e ? std::atoi(e) : 1; }();
+            if (qsa_width > 0 && a_s->op == GGML_OP_FLASH_ATTN_EXT && mode >= 1)
+                ggml_flash_attn_ext_set_n_kv_max(a_s, qsa_width);
+        }
+        else
+        {
+            ggml_tensor* scores = ggml_mul_mat(ctx, k_full, q_attn);
+            ggml_prec_set_acc(scores, GGML_PREC_F32);
+            ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask, attn_scale, 0.0f);
+            ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));
+            a_s = q4e_cont(ctx, ggml_permute(ctx, ggml_mul_mat(ctx, v_perm, probs), 0, 2, 1, 3));   // [hd, nH, 1]
+        }
+        // CONCAT gives the gate below an explicit edge to every slot's attention.
+        attn = attn ? ggml_concat(ctx, attn, a_s, 2) : a_s;
+    }
+
+    // ---- once over every slot ----
+    attn = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+    ggml_tensor* proj = q4e_mul_mat(ctx, wo, ggml_reshape_2d(ctx, attn, q_dim, S));
+    ggml_tensor* res_out = q4e_nodes_hc_scatter(ctx, hcr.res3, proj, hcr.inject, n_embd, hc, S);
+
+    bnd.add(w_norm, a->hc_norm, (std::size_t)hc_dim * sizeof(float));
+    bnd.add(w_down, a->hc_down, (std::size_t)a->hc_down_bytes);
+    bnd.add(w_up, a->hc_up, (std::size_t)a->hc_up_bytes);
+    bnd.add(w_inject, a->hc_inject, (std::size_t)a->hc_inject_bytes);
+    bnd.add(wq, a->wq, (std::size_t)a->wq_bytes);
+    bnd.add(wk, a->wk, (std::size_t)a->wk_bytes);
+    bnd.add(wv, a->wv, (std::size_t)a->wv_bytes);
+    bnd.add(wo, a->wo, (std::size_t)a->wo_bytes);
+    bnd.add(q_norm_w, a->q_norm, (std::size_t)head_dim * sizeof(float));
+    bnd.add(k_norm_w, a->k_norm, (std::size_t)head_dim * sizeof(float));
+    return res_out;
+}
+
 // PLE half: key/query grouped norms -> per-stream gate -> value projection ->
 // dilated causal depthwise conv over the persistent history -> residual add.
 // The caller owns `conv_hist` ([hc_dim, hist] for the span, a

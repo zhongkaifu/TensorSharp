@@ -40,6 +40,13 @@ namespace
         return !(e != nullptr && e[0] == '0');
     }
 
+    // TS_Q4E_ARENA_BATCHED_ATTN=0 runs each slot's whole attention half on its own instead of batching its mixer,
+    // projections, rotary, gate, output projection and scatter over the slots (q4e_nodes_attn_slots).
+    bool q4e_arena_batched_attn()
+    {
+        const char* e = std::getenv("TS_Q4E_ARENA_BATCHED_ATTN");
+        return !(e != nullptr && e[0] == '0');
+    }
 }
 
 // ============================================================================
@@ -1098,6 +1105,34 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                         ggml_build_forward_expand(e.graph, ggml_cpy(ctx, wb.new_state, ssm_slice));
                     }
                     res = res_next;
+                }
+                else if (q4e_arena_batched_attn() && n_slots > 1)
+                {
+                    // ===== attention half, batched over the slots (each slot's own cache, mask and QSA) =====
+                    const size_t rb = ggml_row_size(kvType, hd);
+                    std::vector<Q4eAttnSlot> slot_in(n_slots);
+                    std::vector<Q4eQsaGraph> qsa_in(n_slots);
+                    for (int s = 0; s < n_slots; ++s)
+                    {
+                        Q4eAttnSlot& sl = slot_in[s];
+                        sl.n_kv_pad = e.attention_windows[s];
+                        sl.mask = ggml_view_2d(ctx, e.attn_mask, sl.n_kv_pad, 1, e.attn_mask->nb[1], (size_t)s * e.attn_mask->nb[3]);
+                        sl.kv_idx = ggml_view_1d(ctx, e.local_idx_in, 1, (size_t)s * sizeof(int64_t));
+                        sl.k_cache = ggml_view_3d(ctx, e.k_arena[il], hd, e.cap, kvH, rb, e.cap * rb, (size_t)s * e.rows_per_slot * rb);
+                        sl.v_cache = ggml_view_3d(ctx, e.v_arena[il], hd, e.cap, kvH, rb, e.cap * rb, (size_t)s * e.rows_per_slot * rb);
+                        if (e.qsa_arena[il])
+                        {
+                            const auto& a = e.qsa_args[il];
+                            auto* raw = e.qsa_arena[il];
+                            qsa_in[s].args = &a;
+                            qsa_in[s].inputs = &e.qsa_inputs[il][s];
+                            qsa_in[s].cache = ggml_view_2d(ctx, raw, a.head_dim, e.cap, raw->nb[1], (size_t)s * raw->nb[2]);
+                            sl.qsa = &qsa_in[s];
+                        }
+                    }
+                    res = q4e_nodes_attn_slots(ctx, e.graph, binder, &attn[il], res, e.rope_pos_in, n_slots,
+                        slot_in.data(), n_embd, hc, hc_low_rank, head_dim, n_head, kvH,
+                        n_rot, rope_base, rope_freq_scale, attn_scale, eps, use_flash);
                 }
                 else
                 {

@@ -2323,6 +2323,27 @@ ggml_tensor* q4e_nodes_gdn(
     float eps, Q4eGdnWriteback* wb,
     std::vector<ggml_tensor*>* probe = nullptr, int n_seqs = 1);
 
+// One arena slot's own attention inputs for q4e_nodes_attn_slots: its mask row, its cache-position index, its cache
+// views and padded window, and its QSA state (null without QSA).
+struct Q4eAttnSlot
+{
+    ggml_tensor* mask = nullptr;
+    ggml_tensor* kv_idx = nullptr;
+    ggml_tensor* k_cache = nullptr;
+    ggml_tensor* v_cache = nullptr;
+    int n_kv_pad = 0;
+    const Q4eQsaGraph* qsa = nullptr;
+};
+
+ggml_tensor* q4e_nodes_attn_slots(
+    ggml_context* ctx, ggml_cgraph* graph, Q4eBinder& bnd,
+    const TSGgmlQwen4ExpAttnArgs* a, ggml_tensor* res_in, ggml_tensor* pos, int n_slots,
+    const Q4eAttnSlot* slots,
+    int n_embd, int hc, int hc_low_rank,
+    int head_dim, int n_head, int n_head_kv,
+    int n_rot, float rope_base, float rope_freq_scale, float attn_scale,
+    float eps, bool use_flash);
+
 ggml_tensor* q4e_nodes_attn(
     ggml_context* ctx, ggml_cgraph* graph, Q4eBinder& bnd,
     const TSGgmlQwen4ExpAttnArgs* a, ggml_tensor* res_in,
