@@ -1231,6 +1231,32 @@ RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（F16 内�
 | F16 tensor core | 0.99 / 0.71 / 0.70 s | 3.04 / 3.02 / 3.03 s | 0.86-0.90 s / 3.79-3.80 s | 248-255 tok/s |
 | int8 tensor core（默认） | 0.84 / 0.57 / 0.55 s | 2.48 / 2.47 / 2.47 s | 0.74-0.75 s / 3.13-3.14 s | 240-249 tok/s |
 
+#### 在 tensor core 上计算 prompt 的 QSA 块分数，2026-11-09
+
+QSA 层先为一行能看到的每个完整块打分（四个 indexer 头上 relu(块 key . query 头) 之和），再保留最好的块。prompt 的行
+原来在 CUDA core 上每个块用一个 warp 计算，每一行都重新读取每个 key：这占 16K prompt 的 0.10 s，而 Strata 只用 0.02 s。
+
+Strata 在 tensor core 上为 prompt 的行打分，现在已移植（`TS_Q4E_QSA_SCORES_MMA`，默认开启），即
+`ts_q4e_qsa_scores_mma_f32`：
+
+- 四个 warp 组成的 block 处理 16 行（它们的四个头，64 个 query 行）对 64 个块的 key，因此每个 key 每 16 行才读取一次。
+- Strata 的 key 是 F16；TensorSharp 的 pooled key 保持 F32。因此两个操作数都以 F16 高、低两半送入：
+  q . k = qh . kh + ql . kh + qh . kl，F32 累加。省去的 ql . kl 项低于乘积的 2^-22。
+- 各头的 relu 仍按头的顺序相加。
+- decode 步、验证窗口和批量步保持 warp 内核，因此一行的分数仍与它自己的 decode 步相同。
+- 需要 sm_80 或更新且模块为该 GPU 构建；提交的 compute_75 基线保持 warp 内核。
+
+在从上下文开头开始、以及位于第 3,000 与 9,000 个位置之后的行上（`Q4eQsaScoresMmaTests`），分数与以双精度计算的分数
+相差不超过 |q . k| 之和的 4.6e-7（warp 内核：6.1e-8）。选择保留的块在全部 1,045 行中都相同，其中 712 行超过选择宽度。
+
+RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（warp 内核用 `TS_Q4E_QSA_SCORES_MMA=0`）。三次运行的 TTFT，
+第一次为冷启动。引擎基准的 short_chat、long_prompt_4k/16k 与 long_generation 检查两组均为 8/8 通过：
+
+| prompt QSA 分数 | 4K prompt（3,541 token） | 16K prompt（14,093 token） | 引擎基准 4K / 16K TTFT |
+| --- | --- | --- | --- |
+| 每个块一个 warp | 0.85 / 0.58 / 0.56 s | 2.48 / 2.47 / 2.47 s | 0.74 s / 3.12-3.13 s |
+| tensor core（默认） | 0.84 / 0.56 / 0.55 s | 2.39 / 2.38 / 2.38 s | 0.73-0.74 s / 3.00-3.01 s |
+
 ### ggml_metal 上的 DFlash2 草稿模型，2026-11-08
 
 Strata 在 Mac 上用 DFlash2 起草：一种块草稿模型，一次前向最多提出 7 个 token。TensorSharp 现在在 GGML 后端上也能使用同一个草稿模型：

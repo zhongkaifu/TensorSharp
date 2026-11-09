@@ -2269,6 +2269,117 @@ extern "C" __global__ void ts_q4e_qsa_scores_f32(
     }
 }
 
+// The same scores for a prompt's rows on tensor cores (TS_Q4E_QSA_SCORES_MMA). After Strata's prompt scoring
+// (src/split/src/qsa.cuh k_idx_score_tc, MIT licence): a block takes 16 rows - their four indexer heads, 64 query rows - against
+// 64 blocks' keys, so each key is read once per 16 rows instead of once per row. Strata splits the query into F16 high and low
+// halves against F16 keys; TensorSharp keeps the pooled keys in F32, so both operands are split and
+// q.k = qh.kh + ql.kh + qh.kl (the ql.kl term is below 2^-22 of the product), with F32 accumulation. The heads' relus are summed
+// in head order, as ts_q4e_qsa_scores_f32 sums them. Four indexer heads, D a multiple of 64. Rows run at p0 + t (a prompt, no
+// position table); a row writes only the blocks it sees. grid (ceil(maxBlocks / 64), ceil(nt / 16)), 128 threads.
+#define Q4E_QSC_KC 64                     // dims per shared-memory chunk
+#define Q4E_QSC_LD (Q4E_QSC_KC + 8)       // halves per row: 144 bytes, conflict-free fragment loads
+
+__device__ __forceinline__ void q4e_qsc_split4(const float4 v, half* hi, half* lo)
+{
+    const half2 h0 = __floats2half2_rn(v.x, v.y), h1 = __floats2half2_rn(v.z, v.w);
+    const float2 f0 = __half22float2(h0), f1 = __half22float2(h1);
+    *reinterpret_cast<half2*>(hi) = h0;
+    *reinterpret_cast<half2*>(hi + 2) = h1;
+    *reinterpret_cast<half2*>(lo) = __floats2half2_rn(v.x - f0.x, v.y - f0.y);
+    *reinterpret_cast<half2*>(lo + 2) = __floats2half2_rn(v.z - f1.x, v.w - f1.y);
+}
+
+extern "C" __global__ void __launch_bounds__(128) ts_q4e_qsa_scores_mma_f32(
+    const float* __restrict__ q,         // [nt, 4, D]
+    const float* __restrict__ pooled,    // [nCtx / R, D]
+    float* __restrict__ scores,          // [nt, stride]
+    const int p0,
+    const int nt,
+    const int D,
+    const int R,
+    const int stride)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    const int t0 = blockIdx.y * 16, j0 = blockIdx.x * 64;
+    const int nbMax = (p0 + min(nt, t0 + 16)) / R;       // the blocks the CTA's last row sees
+    if (j0 >= nbMax)
+        return;
+    __shared__ __align__(16) half qh[64][Q4E_QSC_LD], ql[64][Q4E_QSC_LD], kh[64][Q4E_QSC_LD], kl[64][Q4E_QSC_LD];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, tig = lane & 3;
+    float acc[8][4];
+#pragma unroll
+    for (int n = 0; n < 8; ++n)
+        acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+
+    for (int k0 = 0; k0 < D; k0 += Q4E_QSC_KC)
+    {
+        __syncthreads();                                  // the previous chunk is consumed
+        for (int e = tid; e < 64 * (Q4E_QSC_KC / 4); e += 128)
+        {
+            const int r = e / (Q4E_QSC_KC / 4), c = (e % (Q4E_QSC_KC / 4)) * 4;
+            const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const float4 vq = t0 + (r >> 2) < nt ? *reinterpret_cast<const float4*>(q + ((size_t)t0 * 4 + r) * D + k0 + c) : zero;
+            q4e_qsc_split4(vq, &qh[r][c], &ql[r][c]);
+            const int b = j0 + r;
+            const float4 vk = b < nbMax ? *reinterpret_cast<const float4*>(pooled + (size_t)b * D + k0 + c) : zero;
+            q4e_qsc_split4(vk, &kh[r][c], &kl[r][c]);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < Q4E_QSC_KC; kk += 16)
+        {
+            const int ar = warp * 16 + g;
+            const uint32_t ah[4] = {
+                *reinterpret_cast<const uint32_t*>(&qh[ar][kk + 2 * tig]), *reinterpret_cast<const uint32_t*>(&qh[ar + 8][kk + 2 * tig]),
+                *reinterpret_cast<const uint32_t*>(&qh[ar][kk + 8 + 2 * tig]), *reinterpret_cast<const uint32_t*>(&qh[ar + 8][kk + 8 + 2 * tig]) };
+            const uint32_t al[4] = {
+                *reinterpret_cast<const uint32_t*>(&ql[ar][kk + 2 * tig]), *reinterpret_cast<const uint32_t*>(&ql[ar + 8][kk + 2 * tig]),
+                *reinterpret_cast<const uint32_t*>(&ql[ar][kk + 8 + 2 * tig]), *reinterpret_cast<const uint32_t*>(&ql[ar + 8][kk + 8 + 2 * tig]) };
+#pragma unroll
+            for (int n = 0; n < 8; ++n)
+            {
+                const int br = n * 8 + g;
+                const uint32_t bh0 = *reinterpret_cast<const uint32_t*>(&kh[br][kk + 2 * tig]);
+                const uint32_t bh1 = *reinterpret_cast<const uint32_t*>(&kh[br][kk + 8 + 2 * tig]);
+                const uint32_t bl0 = *reinterpret_cast<const uint32_t*>(&kl[br][kk + 2 * tig]);
+                const uint32_t bl1 = *reinterpret_cast<const uint32_t*>(&kl[br][kk + 8 + 2 * tig]);
+                q4e_mma_f16(acc[n], ah, bh0, bh1);
+                q4e_mma_f16(acc[n], al, bh0, bh1);
+                q4e_mma_f16(acc[n], ah, bl0, bl1);
+            }
+        }
+    }
+
+    // The warp's m16 tile is rows 4 warp .. 4 warp + 3 of the CTA, four heads each: mma row g is head g % 4 of row
+    // 4 warp + g / 4, row g + 8 the same head of row 4 warp + 2 + g / 4. Lanes 4 (g & 4) + 4 h + tig hold head h.
+#pragma unroll
+    for (int n = 0; n < 8; ++n)
+#pragma unroll
+        for (int c = 0; c < 2; ++c)
+        {
+            float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+            for (int h = 0; h < 4; ++h)
+            {
+                const int src = ((g & 4) + h) * 4 + tig;
+                s0 += fmaxf(__shfl_sync(0xffffffffu, acc[n][c], src), 0.0f);
+                s1 += fmaxf(__shfl_sync(0xffffffffu, acc[n][2 + c], src), 0.0f);
+            }
+            if ((g & 3) == 0)
+            {
+                const int j = j0 + n * 8 + 2 * tig + c;
+                const int ta = t0 + warp * 4 + (g >> 2), tb = ta + 2;
+                if (ta < nt && j < (p0 + ta + 1) / R)
+                    scores[(size_t)ta * stride + j] = s0;
+                if (tb < nt && j < (p0 + tb + 1) / R)
+                    scores[(size_t)tb * stride + j] = s1;
+            }
+        }
+#else
+    (void)q; (void)pooled; (void)scores; (void)p0; (void)nt; (void)D; (void)R; (void)stride;
+#endif
+}
+
 // A row's attended cells. Below the width W = topK + R - 1 every cell is visible anyway
 // (cellCnt = -1: attend 0..p). Past it, the cells of the query's own incomplete block
 // (tail..p) first, then the best complete blocks by score until W cells are listed: whole

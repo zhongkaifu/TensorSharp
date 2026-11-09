@@ -82,6 +82,15 @@ namespace TensorSharp.Cuda
         /// <summary>Values per Q8_0 KV scale (Q4E_KV_Q8_BLOCK).</summary>
         public const int KvQ8Block = 32;
         private readonly IntPtr qsaStore, qsaPool, qsaQuery, qsaScores, qsaSelect;
+        // A prompt's QSA block scores on tensor cores (optional; sm_80+ and a module built for it).
+        private readonly IntPtr qsaScoresMma;
+
+        /// <summary>Whether <see cref="QsaScoresMma"/> runs here: the module carries it compiled for sm_80 or newer and the
+        /// device is one (the committed compute_75 baseline compiles its body to nothing).</summary>
+        public bool HasQsaScoresMma { get; }
+
+        /// <summary>Whether <see cref="QsaScoresMma"/> takes these indexer shapes: four heads, a head width in 64s.</summary>
+        public static bool QsaScoresMmaSupports(int heads, int d) => heads == 4 && d > 0 && d % 64 == 0 && d <= MaxIndexerDim;
         // KV streaming (TS_Q4E_KV_RESIDENT; optional: a module before it keeps every layer's K/V resident).
         private readonly IntPtr attnPrepQ8Paged, attentionQ8Paged, attentionSplitQ8Paged, kvResolve, kvPageCopy, kvInvalidate,
             qsaStoreRing, qsaPoolRing;
@@ -188,6 +197,14 @@ namespace TensorSharp.Cuda
                 HasAttentionMma = CudaKernels.ArchGuardedKernelsUsable(module.CompiledArchOf("ts_q4e_attention_mma_q8_f32"), ccMajor);
             }
             catch (CudaException ex) when (ex.ErrorCode == 500) { attentionMma = attentionMmaQ8 = IntPtr.Zero; }
+            try
+            {
+                qsaScoresMma = module.GetFunction("ts_q4e_qsa_scores_mma_f32");
+                CudaDriverApi.cuCtxGetDevice(out int device);
+                CudaDriverApi.cuDeviceGetAttribute(out int ccMajor, 75 /* CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR */, device);
+                HasQsaScoresMma = CudaKernels.ArchGuardedKernelsUsable(module.CompiledArchOf("ts_q4e_qsa_scores_mma_f32"), ccMajor);
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { qsaScoresMma = IntPtr.Zero; }
             try { draftPick = module.GetFunction("ts_q4e_draft_pick_f32"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { draftPick = IntPtr.Zero; }
             try
@@ -625,6 +642,22 @@ namespace TensorSharp.Cuda
             int a4 = p0, a5 = heads, a6 = d, a7 = ratio, a8 = stride;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8 };
             Launch(qsaScores, Math.Min(CeilDiv(maxBlocks, 8), MaxScoreBlocks), (uint)rows, 1, BlockSize, stream, args);
+        }
+
+        /// <summary><see cref="QsaScores"/> for a prompt's <paramref name="rows"/> rows at p0 .. p0 + rows - 1 (no position table)
+        /// on tensor cores: 16 rows against 64 blocks a CTA, both operands split into F16 high and low halves, F32 accumulation.
+        /// Needs <see cref="HasQsaScoresMma"/> and <see cref="QsaScoresMmaSupports"/>.</summary>
+        public void QsaScoresMma(IntPtr q, IntPtr pooled, IntPtr scores, int p0, int d, int ratio, int stride, int maxBlocks,
+            int rows, IntPtr stream)
+        {
+            if (maxBlocks <= 0 || rows <= 0)
+                return;
+            if (!HasQsaScoresMma || !QsaScoresMmaSupports(4, d))
+                throw new InvalidOperationException("the loaded module has no tensor-core QSA scores for this GPU and shape");
+            IntPtr a0 = q, a1 = pooled, a2 = scores;
+            int a3 = p0, a4 = rows, a5 = d, a6 = ratio, a7 = stride;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
+            Launch(qsaScoresMma, CeilDiv(maxBlocks, 64), CeilDiv(rows, 16), 1, 128, stream, args);
         }
 
         public void QsaSelect(IntPtr scores, IntPtr cells, IntPtr cellCnt, IntPtr positions, int p0, int ratio, int topK,
