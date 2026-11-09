@@ -196,6 +196,10 @@ namespace TensorSharp.Cuda
             public Tensor RouterLogits, ShGate, ShUp, ShDown;
             /// <summary>A prompt's router widened from BF16 (allocated on first use).</summary>
             public Tensor RouterF32;
+            /// <summary>The chunked prompt recurrence's T, P and gamma (allocated on first use; when that fails,
+            /// <see cref="GdnChunkUnavailable"/> and the prompt keeps the token-by-token scan).</summary>
+            public Tensor GdnChunkScr;
+            public bool GdnChunkUnavailable;
             // head
             public Tensor Logits, BatchLogits;
             /// <summary>A greedy verify's rows' first-max tokens.</summary>

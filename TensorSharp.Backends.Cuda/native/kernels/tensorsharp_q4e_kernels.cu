@@ -542,6 +542,303 @@ extern "C" __global__ void ts_q4e_conv_update_f32(
 }
 
 // ---------------------------------------------------------------------------
+// The prompt's DeltaNet recurrence in chunks of 32 tokens: the WY form of the gated delta rule (as flash-linear-attention
+// computes it), in FP32. The algorithm, the thread layout and the two kernels follow Strata's gdn_chunk_prep_kernel /
+// gdn_chunk_scan_kernel (src/prefill/kernels.cu, MIT license, Copyright (c) the Strata authors), adapted to this engine's
+// GDN scratch rows (ts_q4e_gdn_prep_f32: per value head, normalized q, k, then v, the log decay g and beta) and its
+// [v][k] state. Per value head, with gamma_t the decay's sum from the chunk's start to t (inclusive) and S0 the state
+// before the chunk:
+//   A[t][i] = beta_t exp(gamma_t - gamma_i) k_t.k_i (i < t),   T = (I + A)^-1 (unit lower triangular),
+//   Y_t = beta_t (v_t - exp(gamma_t) S0^T k_t),   D = T Y,
+//   o_t = exp(gamma_t) S0^T q_t + sum_{i <= t} exp(gamma_t - gamma_i) (q_t.k_i) D_i,
+//   S = exp(gamma_last) S0 + sum_t exp(gamma_last - gamma_t) k_t D_t^T,
+// the same outputs and state as ts_glm_kda_scan_f32's token-by-token walk up to FP32 rounding (another order of the
+// sums). The decay is one scalar a (row, value head) here (ts_q4e_gdn_prep_f32 writes it into every channel), and the
+// three value heads of a key head (h, h + HK, h + 2 HK) share its q and k.
+#define Q4E_GCH 32                         // tokens a chunk (the prep's solve is a lane a token)
+#define Q4E_GDV 16                         // value columns a scan block
+#define Q4E_GKP (Q4E_GDN_HD + 4)           // padded k / q rows of the scan
+#define Q4E_GTP (Q4E_GCH + 1)              // padded T / P rows
+#define Q4E_GVPK 3                         // value heads a key head (Qwen3.8 Flash Next: 48 over 16)
+
+// A block a (chunk, key head): k_t.k_i and q_t.k_i of the chunk, then a warp a value head: gamma, A, T by forward
+// substitution and P. Dynamic shared memory: 4 * (2 * 32 * 129 + 2 * 32 * 33) = 41,472 B.
+extern "C" __global__ void __launch_bounds__(256) ts_q4e_gdn_chunk_prep_f32(
+    const float* __restrict__ scr,   // [HV, rows, Q4E_GDN_SCR]
+    float* __restrict__ tm,          // [chunks, HV, 32, 32]  T
+    float* __restrict__ pm,          // [chunks, HV, 32, 32]  P
+    float* __restrict__ gm,          // [chunks, HV, 32]      gamma
+    const int t0,
+    const int rows,
+    const int HK,
+    const int HV)
+{
+    constexpr int S = Q4E_GDN_HD, GCH = Q4E_GCH, GTP = Q4E_GTP;
+    extern __shared__ __align__(16) float q4e_gsm[];
+    float* sk = q4e_gsm;                   // [GCH][S + 1]
+    float* sq = sk + GCH * (S + 1);        // [GCH][S + 1]
+    float* skk = sq + GCH * (S + 1);       // [GCH][GTP]  k_t.k_i
+    float* sqk = skk + GCH * GTP;          // [GCH][GTP]  q_t.k_i
+    float* sa = q4e_gsm;                   // [VPK][GCH][GTP]  A, then T (over k and q, read by then)
+    const int qh = blockIdx.y, ch = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int tb = t0 + ch * GCH;
+    const int n = min(GCH, rows - tb);
+    for (int p = tid; p < GCH * S; p += 256)
+    {
+        const int t = p / S, r = p - t * S;
+        float kv = 0.0f, qv = 0.0f;
+        if (t < n)
+        {
+            const float* row = scr + ((size_t)qh * rows + tb + t) * Q4E_GDN_SCR;
+            qv = row[r];
+            kv = row[S + r];
+        }
+        sk[t * (S + 1) + r] = kv;
+        sq[t * (S + 1) + r] = qv;
+    }
+    __syncthreads();
+    {   // lane i, rows warp + 8m: k_t.k_i and q_t.k_i on independent sums
+        constexpr int RW = GCH / 8;
+        float kk[RW] = {}, qk[RW] = {};
+        for (int r = 0; r < S; ++r)
+        {
+            const float ki = sk[lane * (S + 1) + r];
+#pragma unroll
+            for (int m = 0; m < RW; ++m)
+            {
+                kk[m] = fmaf(sk[(warp + 8 * m) * (S + 1) + r], ki, kk[m]);
+                qk[m] = fmaf(sq[(warp + 8 * m) * (S + 1) + r], ki, qk[m]);
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < RW; ++m)
+        {
+            const int t = warp + 8 * m;
+            skk[t * GTP + lane] = lane <= t ? kk[m] : 0.0f;
+            sqk[t * GTP + lane] = lane <= t ? qk[m] : 0.0f;
+        }
+    }
+    __syncthreads();
+    if (warp >= Q4E_GVPK)
+        return;
+    const int vh = qh + warp * HK, i = lane;   // warp j: value head j of the key head; lane i: token i
+    float* a = sa + warp * GCH * GTP;
+    const float* rowi = scr + ((size_t)vh * rows + tb + min(i, n - 1)) * Q4E_GDN_SCR;
+    const float b = i < n ? rowi[4 * S] : 0.0f;
+    float gam = i < n ? rowi[3 * S] : 0.0f;    // past the end: decay 0, beta 0 (no effect on S)
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1)
+    {
+        const float u = __shfl_up_sync(0xffffffffu, gam, o);
+        if (lane >= o) gam += u;
+    }
+    for (int t = 0; t < GCH; ++t)
+    {
+        const float gt = __shfl_sync(0xffffffffu, gam, t), bt = __shfl_sync(0xffffffffu, b, t);
+        a[t * GTP + i] = i < t ? bt * expf(gt - gam) * skk[t * GTP + i] : (i == t ? 1.0f : 0.0f);
+    }
+    __syncwarp();
+    // T = (I + A)^-1 by forward substitution, row by row in place over the finished rows.
+    for (int t = 1; t < GCH; ++t)
+    {
+        float v = 0.0f;
+#pragma unroll 8
+        for (int k = 0; k < t; ++k) v = fmaf(-a[t * GTP + k], a[k * GTP + i], v);
+        __syncwarp();
+        if (i < t) a[t * GTP + i] = v;
+        __syncwarp();
+    }
+    float* T_ = tm + ((size_t)ch * HV + vh) * GCH * GCH;
+    float* P_ = pm + ((size_t)ch * HV + vh) * GCH * GCH;
+    for (int t = 0; t < GCH; ++t)
+    {
+        const float gt = __shfl_sync(0xffffffffu, gam, t);
+        T_[t * GCH + i] = a[t * GTP + i];
+        P_[t * GCH + i] = i <= t ? expf(gt - gam) * sqk[t * GTP + i] : 0.0f;
+    }
+    gm[((size_t)ch * HV + vh) * GCH + i] = gam;
+}
+
+// A block a (key head, 16 value columns): 128 threads for each of the key head's three value heads, which share the
+// staged k and q rows; HK x 8 blocks in one wave on a GPU of 128 SMs or more. A thread owns one token's row of the
+// products and holds that token's T and P rows in registers; the state slice (128 key rows x 16 value columns) stays in
+// registers across the chunks. Dynamic shared memory: 4 * (3 * 32 * 132 + 3 * (128 * 16 + 3 * 32 * 16)) = 93,696 B.
+extern "C" __global__ void __launch_bounds__(128 * Q4E_GVPK) ts_q4e_gdn_chunk_scan_f32(
+    float* const* __restrict__ ssmStates,   // [1] -> [HV, 128 (v), 128 (k)]
+    const float* __restrict__ scr,          // [HV, rows, Q4E_GDN_SCR]
+    const float* __restrict__ tm,
+    const float* __restrict__ pm,
+    const float* __restrict__ gm,
+    float* __restrict__ core,               // [rows, HV * 128]
+    const int t0,
+    const int nch,
+    const int rows,
+    const int HK,
+    const int HV)
+{
+    constexpr int S = Q4E_GDN_HD, GCH = Q4E_GCH, GDV = Q4E_GDV, GKP = Q4E_GKP;
+    constexpr int NT = 128 * Q4E_GVPK, HEAD = S * GDV + 3 * GCH * GDV;
+    extern __shared__ __align__(16) float q4e_gsm[];
+    float* kbuf = q4e_gsm;                     // [2][GCH][GKP]  k, double-buffered
+    float* sq = kbuf + 2 * GCH * GKP;          // [GCH][GKP]
+    const int qh = blockIdx.x, c0 = blockIdx.y * GDV, j = threadIdx.x / 128, tid = threadIdx.x % 128;
+    const int vh = qh + j * HK;
+    float* ss = sq + GCH * GKP + j * HEAD;     // [S][GDV]  the state slice at the chunk's start ([k][v])
+    float* sy = ss + S * GDV;                  // [GCH][GDV]  Y
+    float* sd = sy + GCH * GDV;                // [GCH][GDV]  D
+    float* sdd = sd + GCH * GDV;               // [GCH][GDV]  exp(gamma_last - gamma_t) D
+    const int rq = tid >> 2, vq = tid & 3;     // the update's tile: key rows 4rq..4rq+3; value columns 4vq..4vq+3
+    const int tt = tid >> 2, vv = 4 * vq;      // the products' tile: token tt
+    float* state = ssmStates[0] + (size_t)vh * S * S;
+    auto stage_kq = [&](int c_t0, int n, float* dst, bool isq)
+    {
+        for (int p = threadIdx.x; p < GCH * S; p += NT)
+        {
+            const int t = p / S, r = p - t * S;
+            dst[t * GKP + r] = t < n ? scr[((size_t)qh * rows + c_t0 + t) * Q4E_GDN_SCR + (isq ? 0 : S) + r] : 0.0f;
+        }
+    };
+    auto load_vgb = [&](int ch, int c_t0, int n, float4& v4, float& gam, float& bet, float& glast)
+    {
+        if (tt < n)
+        {
+            const float* row = scr + ((size_t)vh * rows + c_t0 + tt) * Q4E_GDN_SCR;
+            v4 = make_float4(row[2 * S + c0 + vv], row[2 * S + c0 + vv + 1], row[2 * S + c0 + vv + 2], row[2 * S + c0 + vv + 3]);
+            bet = row[4 * S];
+        }
+        else
+        {
+            v4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            bet = 0.0f;
+        }
+        const float* g = gm + ((size_t)ch * HV + vh) * GCH;
+        gam = g[tt];
+        glast = g[GCH - 1];
+    };
+    float s[4][4];
+#pragma unroll
+    for (int x = 0; x < 4; ++x)
+    {
+#pragma unroll
+        for (int y = 0; y < 4; ++y) s[x][y] = state[(size_t)(c0 + vv + y) * S + 4 * rq + x];
+        *reinterpret_cast<float4*>(&ss[(4 * rq + x) * GDV + vv]) = make_float4(s[x][0], s[x][1], s[x][2], s[x][3]);
+    }
+    const float outScale = rsqrtf((float)S);
+    float4 v4;
+    float gam, bet, glast;
+    {
+        const int n0 = min(GCH, rows - t0);
+        stage_kq(t0, n0, kbuf, false);
+        stage_kq(t0, n0, sq, true);
+        load_vgb(0, t0, n0, v4, gam, bet, glast);
+        __syncthreads();
+    }
+    for (int ch = 0; ch < nch; ++ch)
+    {
+        const int c_t0 = t0 + ch * GCH;
+        const int n = min(GCH, rows - c_t0);
+        const bool more = ch + 1 < nch;
+        const int n_t0 = c_t0 + GCH;
+        const int nn = more ? min(GCH, rows - n_t0) : 0;
+        const float* sk = kbuf + (ch & 1) * GCH * GKP;
+        float tr[GCH], pr[GCH];
+        {
+            const float4* T4 = reinterpret_cast<const float4*>(tm + (((size_t)ch * HV + vh) * GCH + tt) * GCH);
+            const float4* P4 = reinterpret_cast<const float4*>(pm + (((size_t)ch * HV + vh) * GCH + tt) * GCH);
+#pragma unroll
+            for (int i = 0; i < GCH / 4; ++i)
+            {
+                const float4 a4 = __ldg(T4 + i), b4 = __ldg(P4 + i);
+                tr[4 * i] = a4.x; tr[4 * i + 1] = a4.y; tr[4 * i + 2] = a4.z; tr[4 * i + 3] = a4.w;
+                pr[4 * i] = b4.x; pr[4 * i + 1] = b4.y; pr[4 * i + 2] = b4.z; pr[4 * i + 3] = b4.w;
+            }
+        }
+        float4 nv4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float ngam = 0.0f, nbet = 0.0f, nglast = 0.0f;
+        if (more)
+            load_vgb(ch + 1, n_t0, nn, nv4, ngam, nbet, nglast);
+        // X = K S0 and Q S0 for token tt, then Y = beta (V - exp(gamma) X)
+        float x[4] = {0.f, 0.f, 0.f, 0.f}, qs[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll 4
+        for (int r = 0; r < S; r += 4)
+        {
+            const float4 k4 = *reinterpret_cast<const float4*>(&sk[tt * GKP + r]);
+            const float4 q4 = *reinterpret_cast<const float4*>(&sq[tt * GKP + r]);
+            const float kk[4] = {k4.x, k4.y, k4.z, k4.w}, qq[4] = {q4.x, q4.y, q4.z, q4.w};
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj)
+            {
+                const float4 s4 = *reinterpret_cast<const float4*>(&ss[(r + jj) * GDV + vv]);
+                x[0] = fmaf(kk[jj], s4.x, x[0]); x[1] = fmaf(kk[jj], s4.y, x[1]);
+                x[2] = fmaf(kk[jj], s4.z, x[2]); x[3] = fmaf(kk[jj], s4.w, x[3]);
+                qs[0] = fmaf(qq[jj], s4.x, qs[0]); qs[1] = fmaf(qq[jj], s4.y, qs[1]);
+                qs[2] = fmaf(qq[jj], s4.z, qs[2]); qs[3] = fmaf(qq[jj], s4.w, qs[3]);
+            }
+        }
+        const float e = expf(gam);
+        *reinterpret_cast<float4*>(&sy[tt * GDV + vv]) = make_float4(bet * (v4.x - e * x[0]), bet * (v4.y - e * x[1]),
+                                                                     bet * (v4.z - e * x[2]), bet * (v4.w - e * x[3]));
+        __syncthreads();   // (A) Y complete; every read of q done
+        if (more)
+        {   // the next chunk's k into the other buffer, its q into the single q buffer
+            stage_kq(n_t0, nn, kbuf + ((ch + 1) & 1) * GCH * GKP, false);
+            stage_kq(n_t0, nn, sq, true);
+        }
+        // D = T Y (T is zero above its diagonal), and D decayed to the chunk's end for the update
+        float d[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int i = 0; i < GCH; ++i)
+        {
+            const float4 y4 = *reinterpret_cast<const float4*>(&sy[i * GDV + vv]);
+            d[0] = fmaf(tr[i], y4.x, d[0]); d[1] = fmaf(tr[i], y4.y, d[1]);
+            d[2] = fmaf(tr[i], y4.z, d[2]); d[3] = fmaf(tr[i], y4.w, d[3]);
+        }
+        const float f = expf(glast - gam);
+        *reinterpret_cast<float4*>(&sd[tt * GDV + vv]) = make_float4(d[0], d[1], d[2], d[3]);
+        *reinterpret_cast<float4*>(&sdd[tt * GDV + vv]) = make_float4(f * d[0], f * d[1], f * d[2], f * d[3]);
+        __syncthreads();   // (B) D complete
+        // o = exp(gamma) Q S0 + P D (P is zero above its diagonal), the output
+        float o[4] = {e * qs[0], e * qs[1], e * qs[2], e * qs[3]};
+#pragma unroll
+        for (int i = 0; i < GCH; ++i)
+        {
+            const float4 d4 = *reinterpret_cast<const float4*>(&sd[i * GDV + vv]);
+            o[0] = fmaf(pr[i], d4.x, o[0]); o[1] = fmaf(pr[i], d4.y, o[1]);
+            o[2] = fmaf(pr[i], d4.z, o[2]); o[3] = fmaf(pr[i], d4.w, o[3]);
+        }
+        if (tt < n)
+            *reinterpret_cast<float4*>(core + ((size_t)(c_t0 + tt) * HV + vh) * S + c0 + vv) =
+                make_float4(o[0] * outScale, o[1] * outScale, o[2] * outScale, o[3] * outScale);
+        // S = exp(gamma_last) S0 + K^T (decayed D)
+        const float gL = expf(glast);
+#pragma unroll
+        for (int xx = 0; xx < 4; ++xx)
+#pragma unroll
+            for (int y = 0; y < 4; ++y) s[xx][y] *= gL;
+#pragma unroll 4
+        for (int t = 0; t < GCH; ++t)
+        {
+            const float4 k4 = *reinterpret_cast<const float4*>(&sk[t * GKP + 4 * rq]);
+            const float4 d4 = *reinterpret_cast<const float4*>(&sdd[t * GDV + vv]);
+            const float kx[4] = {k4.x, k4.y, k4.z, k4.w}, dy[4] = {d4.x, d4.y, d4.z, d4.w};
+#pragma unroll
+            for (int xx = 0; xx < 4; ++xx)
+#pragma unroll
+                for (int y = 0; y < 4; ++y) s[xx][y] = fmaf(kx[xx], dy[y], s[xx][y]);
+        }
+#pragma unroll
+        for (int xx = 0; xx < 4; ++xx)
+            *reinterpret_cast<float4*>(&ss[(4 * rq + xx) * GDV + vv]) = make_float4(s[xx][0], s[xx][1], s[xx][2], s[xx][3]);
+        v4 = nv4; gam = ngam; bet = nbet; glast = nglast;
+        __syncthreads();   // (C) the new ss and the next k and q in place; every read of sd, sdd and this k buffer done
+    }
+#pragma unroll
+    for (int xx = 0; xx < 4; ++xx)
+#pragma unroll
+        for (int y = 0; y < 4; ++y) state[(size_t)(c0 + vv + y) * S + 4 * rq + xx] = s[xx][y];
+}
+
+// ---------------------------------------------------------------------------
 // gated GQA attention
 // ---------------------------------------------------------------------------
 

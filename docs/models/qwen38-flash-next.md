@@ -1638,6 +1638,29 @@ ggml_cuda cannot serve this model on the 32 GB card: decode at 0.5-4.7 tok/s (th
 and four requests at once run it out of device memory inside ggml, which aborts the process; it has no admission check
 like ggml_metal's.
 
+#### The prompt DeltaNet recurrence in chunks, 2026-11-09
+
+A prompt's gated DeltaNet layers walked their rows one at a time (KdaScan: a block per value head, each token a rank-1
+update of the 128 x 128 state). That was 0.49 s of a 16K prompt; Strata spends 0.07 s. A single sequence's prompt of
+128 rows or more now takes Strata's chunked form (`TS_Q4E_GDN_CHUNKED`, on), ported into `tensorsharp_q4e_kernels.cu`.
+A prep kernel builds each 32-token chunk's WY factors (the in-chunk triangular solve and gate products) in FP32. A scan
+kernel then applies a chunk as two small matrix products instead of 32 rank-1 updates; it runs 16 key heads x 8 column
+tiles, 384 threads each, one wave on the GPU, and carries the state across chunks in shared memory. Super-blocks of
+2,048 rows bound the scratch (about 25 MB, allocated at the first long prompt). Decode steps, verify windows, batched
+steps, captured graphs and prompts under 128 rows keep KdaScan. Everything stays FP32, but the sums run in another
+order: against the token-by-token scan the outputs move 3e-7 relative and the state at most 6.2e-7 a head
+(`Q4eGdnChunkedTests`, 128, 200 and 4,171 rows). The scan needs 93,696 bytes of opt-in shared memory a block and a GPU
+with at least 128 SMs, so that every block runs in one wave; with fewer it would run in waves and lose. Otherwise the
+engine keeps KdaScan.
+
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q4E_GDN_CHUNKED=0` for the old scan). TTFT of
+three runs, the first cold; the engine bench's long-prompt and long-generation needles pass 6/6 in both arms:
+
+| prompt recurrence | 4K prompt (3,541 tokens) | 16K prompt (14,094 tokens) | engine bench 4K / 16K TTFT | long generation |
+| --- | --- | --- | --- | --- |
+| token by token | 1.06 / 0.79 / 0.79 s | 3.36 / 3.35 / 3.35 s | 1.00 s / 4.20-4.22 s | 239-242 tok/s |
+| chunked (default) | 0.99 / 0.71 / 0.70 s | 3.04 / 3.02 / 3.02 s | 0.91 s / 3.79 s | 242-249 tok/s |
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the

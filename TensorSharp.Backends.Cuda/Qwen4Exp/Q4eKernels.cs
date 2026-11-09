@@ -53,6 +53,15 @@ namespace TensorSharp.Cuda
         /// <summary>Values per mixer slice (Q4E_HC_SLICE) and floats of partials per slice (Q4E_HC_PARTIAL).</summary>
         public const int HcSlice = 256, HcPartialFloats = 1 + MaxStreams;
         private readonly IntPtr gdnPrep, convUpdate;
+        private readonly IntPtr gdnChunkPrep, gdnChunkScan;
+
+        /// <summary>The chunked prompt recurrence (<see cref="GdnChunked"/>) loaded, with the device's opt-in shared memory
+        /// for its scan; <see cref="GdnChunkedSms"/> is the device's SM count.</summary>
+        public bool HasGdnChunked { get; }
+        public int GdnChunkedSms { get; }
+        /// <summary>Tokens a chunk and a super-block of <see cref="GdnChunked"/>.</summary>
+        public const int GdnChunkTokens = 32, GdnChunkSuperBlock = 2048;
+        private const int GdnChunkPrepSmem = 41472, GdnChunkScanSmem = 93696;
         private readonly IntPtr attnPrep, attention, attnPrepQ8, attentionQ8;
         // Decode-size attention split over the cells (optional: a module before it runs a block per head and row).
         private readonly IntPtr attentionSplit, attentionSplitQ8;
@@ -118,6 +127,22 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500) { }
             gdnPrep = module.GetFunction("ts_q4e_gdn_prep_f32");
             convUpdate = module.GetFunction("ts_q4e_conv_update_f32");
+            try
+            {
+                gdnChunkPrep = module.GetFunction("ts_q4e_gdn_chunk_prep_f32");
+                gdnChunkScan = module.GetFunction("ts_q4e_gdn_chunk_scan_f32");
+                CudaDriverApi.cuCtxGetDevice(out int gdnDevice);
+                CudaDriverApi.cuDeviceGetAttribute(out int optin, 97 /* CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN */, gdnDevice);
+                CudaDriverApi.cuDeviceGetAttribute(out int sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, gdnDevice);
+                if (optin >= GdnChunkScanSmem)
+                {
+                    CudaDriverApi.cuFuncSetAttribute(gdnChunkScan, CudaDriverApi.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        GdnChunkScanSmem).ThrowOnError();
+                    GdnChunkedSms = sms;
+                    HasGdnChunked = true;
+                }
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { gdnChunkPrep = gdnChunkScan = IntPtr.Zero; }
             attnPrep = module.GetFunction("ts_q4e_attn_prep_f32");
             attention = module.GetFunction("ts_q4e_attention_f32");
             try { attnPrepQ8 = module.GetFunction("ts_q4e_attn_prep_q8_f32"); attentionQ8 = module.GetFunction("ts_q4e_attention_q8_f32"); }
@@ -306,6 +331,43 @@ namespace TensorSharp.Cuda
             const int GdnPrepBlock = 64;
             Launch(gdnPrep, CeilDiv(warps * 32, GdnPrepBlock), 1, 1, GdnPrepBlock, stream, args);
         }
+
+        /// <summary>
+        /// One sequence's <paramref name="rows"/> rows of the DeltaNet recurrence in chunks of 32 tokens (ts_q4e_gdn_chunk_*,
+        /// the WY form, after Strata's chunked prompt recurrence), reading the rows <see cref="GdnPrep"/> wrote to
+        /// <paramref name="scr"/> and updating the state at ssmStates[0] in place, as KdaScan does token by token. The value
+        /// heads must be three to a key head. <paramref name="tm"/>, <paramref name="pm"/> and <paramref name="gm"/> hold a
+        /// super-block's T, P and gamma (<see cref="GdnChunkScratchFloats"/>).
+        /// </summary>
+        public void GdnChunked(IntPtr scr, IntPtr ssmStates, IntPtr core, IntPtr tm, IntPtr pm, IntPtr gm, int rows,
+            int kHeads, int vHeads, IntPtr stream)
+        {
+            for (int t0 = 0; t0 < rows; t0 += GdnChunkSuperBlock)
+            {
+                int nch = (Math.Min(GdnChunkSuperBlock, rows - t0) + GdnChunkTokens - 1) / GdnChunkTokens;
+                {
+                    IntPtr a0 = scr, a1 = tm, a2 = pm, a3 = gm;
+                    int a4 = t0, a5 = rows, a6 = kHeads, a7 = vHeads;
+                    void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
+                    LaunchShared(gdnChunkPrep, (uint)nch, (uint)kHeads, 1, 256, GdnChunkPrepSmem, stream, args);
+                }
+                {
+                    IntPtr a0 = ssmStates, a1 = scr, a2 = tm, a3 = pm, a4 = gm, a5 = core;
+                    int a6 = t0, a7 = nch, a8 = rows, a9 = kHeads, a10 = vHeads;
+                    void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10 };
+                    LaunchShared(gdnChunkScan, (uint)kHeads, 128 / 16, 1, 128 * 3, GdnChunkScanSmem, stream, args);
+                }
+            }
+        }
+
+        /// <summary>Floats of <see cref="GdnChunked"/>'s scratch for <paramref name="vHeads"/> value heads: T, P and gamma
+        /// of every chunk of a super-block (T and P each <see cref="GdnChunkTPFloats"/>).</summary>
+        public static long GdnChunkScratchFloats(int vHeads) => 2 * GdnChunkTPFloats(vHeads) + (long)(GdnChunkSuperBlock / GdnChunkTokens) * vHeads * GdnChunkTokens;
+
+        public static long GdnChunkTPFloats(int vHeads) => (long)(GdnChunkSuperBlock / GdnChunkTokens) * vHeads * GdnChunkTokens * GdnChunkTokens;
+
+        private static void LaunchShared(IntPtr fn, uint gx, uint gy, uint gz, int block, int shared, IntPtr stream, void** args)
+            => CudaDriverApi.cuLaunchKernel(fn, gx, gy, gz, (uint)block, 1, 1, (uint)shared, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
 
         /// <summary>Keep each sequence's last <paramref name="hist"/> rows of [state; x] as its state.</summary>
         public void ConvUpdate(IntPtr x, IntPtr states, int rowsPerSeq, int nSeq, int channels, int hist, IntPtr stream)
