@@ -1468,4 +1468,99 @@ public class KVCachePromptRendererTests
         }
         return -1;
     }
+
+    // A web page's icon-font glyphs (star ratings) reached TensorAgent through a Playwright
+    // snapshot as U+E000, the character the renderer used to bracket its placeholders, and the
+    // render failed with "Malformed KV-cache placeholder: opening sentinel without matching close".
+    private const string PrivateUseText = "rating \uE000\uE000\uE000\uE000\uE000 \uE001 \uE002 \uE000 ok";
+
+    [Fact]
+    public void RenderToTokens_TextWithTheSentinelCharacters_KeepsThemAndStillSplices()
+    {
+        var tokenizer = new CharTokenizer();
+        var raw = new List<int> { 1001, 1002, 1003 };
+        List<ChatMessage> Conversation(string toolText) => new()
+        {
+            new() { Role = "user", Content = "Q1" },
+            new() { Role = "assistant", Content = "DOES_NOT_MATTER", RawOutputTokens = raw },
+            new() { Role = "tool", Content = toolText },
+            new() { Role = "user", Content = "Q2 " + toolText },
+        };
+        string control = PrivateUseText.Replace('\uE000', '*').Replace('\uE001', '*').Replace('\uE002', '*');
+
+        var withGlyphs = new KVCachePromptRenderer(new FakeRenderer()).RenderToTokens(
+            tokenizer, null, Conversation(PrivateUseText), "fake", addGenerationPrompt: true);
+        var withStars = new KVCachePromptRenderer(new FakeRenderer()).RenderToTokens(
+            tokenizer, null, Conversation(control), "fake", addGenerationPrompt: true);
+
+        // The glyphs reach the model unchanged, and nothing else differs from the control: the
+        // raw tokens sit at the same place and every other token is the same.
+        string decoded = tokenizer.Decode(withGlyphs);
+        Assert.Contains(PrivateUseText, decoded);
+        Assert.Equal(tokenizer.Decode(withStars),
+            decoded.Replace('\uE000', '*').Replace('\uE001', '*').Replace('\uE002', '*'));
+        Assert.Equal(withStars.Count, withGlyphs.Count);
+        Assert.Equal(FindSubsequence(withStars, raw), FindSubsequence(withGlyphs, raw));
+        Assert.True(FindSubsequence(withGlyphs, raw) >= 0);
+        Assert.DoesNotContain("DOES_NOT_MATTER", decoded);
+        Assert.DoesNotContain("R0000", decoded);
+    }
+
+    [Fact]
+    public void RenderToTokens_TextWithTheSentinelCharacters_BreakpointsStayExact()
+    {
+        var tokenizer = new CharTokenizer();
+        List<ChatMessage> Conversation(string text, bool marked) => new()
+        {
+            new() { Role = "system", Content = "sys " + text, CacheControl = marked ? new CacheControlMarker() : null },
+            new() { Role = "user", Content = "Hi " + text },
+        };
+
+        var marked = new KVCachePromptRenderer(new FakeRenderer()).RenderToTokens(
+            tokenizer, null, Conversation(PrivateUseText, marked: true), "fake", addGenerationPrompt: true,
+            out var breakpoints);
+        var plain = new KVCachePromptRenderer(new FakeRenderer()).RenderToTokens(
+            tokenizer, null, Conversation(PrivateUseText, marked: false), "fake", addGenerationPrompt: true, out _);
+
+        Assert.Equal(plain, marked);
+        Assert.Contains(PrivateUseText, tokenizer.Decode(marked));
+        int breakpoint = Assert.Single(breakpoints!);
+        // The breakpoint ends the system turn, after all of its private-use characters.
+        string prefix = tokenizer.Decode(marked.GetRange(0, breakpoint));
+        Assert.Contains("sys " + PrivateUseText, prefix);
+        Assert.DoesNotContain("Hi ", prefix);
+    }
+
+    [Fact]
+    public void ChooseSentinels_AvoidsEveryPrivateUseCharacterTheInputUses()
+    {
+        Assert.Equal(KVCachePromptRenderer.DefaultSentinels,
+            KVCachePromptRenderer.ChooseSentinels(null, new List<ChatMessage> { new() { Role = "user", Content = "plain \uE900 icon" } }, null));
+
+        var messages = new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "a \uE000" },
+            new()
+            {
+                Role = "assistant",
+                ToolCalls = new List<ToolCall>
+                {
+                    // A JSON-escaped argument: a template can print it back as the character.
+                    new() { Name = "fill", Arguments = new Dictionary<string, object?>
+                    {
+                        ["text"] = System.Text.Json.JsonDocument.Parse("\"\\uE003 and \\uE004\"").RootElement.Clone(),
+                    } },
+                },
+            },
+        };
+        var tools = new List<ToolFunction> { new() { Name = "fill", Description = "writes \uE001" } };
+        var chosen = KVCachePromptRenderer.ChooseSentinels("{{ x }} \uE002", messages, tools);
+
+        char[] picked = { chosen.Placeholder, chosen.Breakpoint, chosen.ToolResultProof };
+        Assert.Equal(3, picked.Distinct().Count());
+        foreach (char used in new[] { '\uE000', '\uE001', '\uE002', '\uE003', '\uE004' })
+            Assert.DoesNotContain(used, picked);
+        Assert.Equal(new[] { '\uE005', '\uE006', '\uE007' }, picked);
+    }
 }
+
