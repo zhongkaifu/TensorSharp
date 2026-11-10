@@ -1748,6 +1748,79 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             Assert.True(RelativeError(split[i], single[i]) <= 1e-5, $"forward {i} differs across the split");
     }
 
+    /// <summary>
+    /// Two groups' batched decode steps in flight on a layer split (the engine's decode lanes, IPipelinedBatchedDecode):
+    /// the second group's step issued before the first's finishes, each answers as one batched step of all the rows taken
+    /// on its own, bit for bit, through the keys' first uncaptured runs and their captured graphs (a lane's graphs bake in
+    /// its own pinned buffers); a group of one row too.
+    /// </summary>
+    [MultiCudaTheory(2)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void DecodeLanes_InFlightTogether_AnswerAsOneBatchedStep(int perGroup)
+    {
+        string path = Fixture();
+        string[] ids = Enumerable.Range(0, 2 * perGroup).Select(i => "lane-" + i).ToArray();
+        const int prompt = 24, rounds = 8;
+        float[][][] Decode(bool lanes)
+        {
+            using var model = Assert.IsType<Qwen4ExpCudaModel>(ModelBase.Create(path, BackendType.Cuda, layerSplitDegree: 2));
+            for (int i = 0; i < ids.Length; i++)
+            {
+                model.BindSequenceCache(ids[i]);
+                model.Forward(Prompt.Skip(i).Take(prompt).ToArray());
+            }
+            model.RestorePrimaryCache();
+            var got = new float[rounds][][];
+            for (int round = 0; round < rounds; round++)
+            {
+                int position = prompt + round;
+                int[] tokens = ids.Select((_, i) => (Steps[(round + i) % Steps.Length] + 7 * i) % 250).ToArray();
+                int[] positions = Enumerable.Repeat(position, ids.Length).ToArray();
+                if (lanes)
+                {
+                    var outs = new float[2][][];
+                    for (int g = 0; g < 2; g++)
+                    {
+                        outs[g] = new float[perGroup][];
+                        Assert.True(model.TryIssuePipelinedDecode(g, ids.Skip(g * perGroup).Take(perGroup).ToArray(),
+                            tokens.Skip(g * perGroup).Take(perGroup).ToArray(), positions.Take(perGroup).ToArray(), outs[g]),
+                            $"round {round}: group {g} was declined");
+                    }
+                    got[round] = new float[ids.Length][];
+                    for (int g = 0; g < 2; g++)
+                    {
+                        model.FinishPipelinedDecode(g);
+                        for (int i = 0; i < perGroup; i++)
+                            got[round][g * perGroup + i] = (float[])outs[g][i].Clone();
+                    }
+                }
+                else
+                {
+                    var rows = new float[ids.Length][];
+                    Assert.True(model.TryForwardBatchedFusedDecode(ids, tokens, positions, rows),
+                        $"round {round}: the batched step was declined");
+                    got[round] = rows.Select(r => (float[])r.Clone()).ToArray();
+                }
+            }
+            if (lanes)
+            {
+                Assert.Equal(2, model.PipelinedDecodeGroups);
+                Assert.False(model.HasPendingPipelinedDecode);
+                Assert.Equal(2L * rounds, model.Engine.DecodeLaneSteps);
+                Assert.True(model.Engine.CapturedBatchGraphs >= 2, "no lane's step was captured");
+            }
+            return got;
+        }
+
+        float[][][] one = Decode(lanes: false), two = Decode(lanes: true);
+        for (int round = 0; round < rounds; round++)
+            for (int i = 0; i < ids.Length; i++)
+                Assert.True(one[round][i].AsSpan().SequenceEqual(two[round][i]),
+                    $"round {round}, {ids[i]}: the step in flight beside another answers differently");
+        _output.WriteLine($"{rounds} rounds of two groups of {perGroup} in flight together answer as one batched step");
+    }
+
     /// <summary>A reset clears the recurrent states, the QSA keys and the PLE history as well as the
     /// attention cache.</summary>
     [CudaFact]

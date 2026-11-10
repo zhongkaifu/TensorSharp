@@ -363,6 +363,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_host_moe_cache.cpp
     ggml_ops_moe_hot_tier.cpp
     ggml_ops_moe_expert_io.cpp
+    ggml_ops_direct_read.cpp
     ggml_ops_buffer_reuse.cpp
     ggml_ops_deepseek4.cpp
     ggml_ops_deepseek41_tp.cpp
@@ -558,7 +559,11 @@ endif()
 
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_CUDA=1)
-    target_link_libraries(GgmlOps PRIVATE CUDA::cublas CUDA::cuda_driver)
+    target_link_libraries(GgmlOps PRIVATE CUDA::cublas CUDA::cublasLt CUDA::cuda_driver)
+    if (WIN32)
+        # TSGgml_DeviceMemoryInfo asks DXGI for the adapter's own memory.
+        target_link_libraries(GgmlOps PRIVATE dxgi)
+    endif()
     tsg_add_cuda_vmm_peer_guard(GgmlOps)
     if (TSG_HAVE_CUDNN)
         target_include_directories(GgmlOps PRIVATE ${TSG_CUDNN_INCLUDE_DIR})

@@ -409,6 +409,25 @@ namespace TensorSharp.Models.MiniMaxH3
             catch (IOException) { return 0; }
             catch (UnauthorizedAccessException) { return 0; }
         }
+
+        /// <summary>Roughly what the text encoder occupies on the device while it runs, used
+        /// to decide whether the networks kept from the previous request can stay beside it.
+        ///
+        /// <para>The GGUF is uploaded as it is stored, and the encode's own activations are
+        /// small beside it, so the file size is the estimate. Returns 0 when the size cannot
+        /// be read, which the caller treats as "do not intervene".</para></summary>
+        internal long TextEncoderResidentBytesEstimate()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_tePath)) return 0;
+                var fi = new FileInfo(_tePath);
+                return fi.Exists ? fi.Length : 0;
+            }
+            catch (IOException) { return 0; }
+            catch (UnauthorizedAccessException) { return 0; }
+        }
+
         internal MiniMaxH3AudioVae CreateAudioVae() =>
             _audioVaePath != null
                 ? new MiniMaxH3AudioVae(_audioVaePath, Backend, UsesDirectBackend, _allocator)

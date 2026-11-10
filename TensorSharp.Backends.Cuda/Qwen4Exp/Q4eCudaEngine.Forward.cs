@@ -453,6 +453,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public void Forward(int[] tokens, float[] logitsOut, float[] hOut)
         {
+            DrainDecodeLanes();
             if (tokens == null || tokens.Length == 0)
                 throw new ArgumentException("empty token batch", nameof(tokens));
             Slot slot = _active;
@@ -1366,8 +1367,10 @@ namespace TensorSharp.Cuda
             }
             var dev = _devs[_layers[_pleLayer].Device];
             dev.MakeCurrent();
-            // The staging is reused per ubatch: the previous ubatch's upload must have run.
-            CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+            // The staging is reused per ubatch: the previous ubatch's upload must have run (a decode lane's own staging
+            // was last read by its previous step, finished already).
+            if (!_laneIssue)
+                CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
             _m.Ple.GatherPleRows(histories, new ReadOnlySpan<int>(tokens, tokOff, nt), pos, (float*)dev.PlePinned);
             _devs[0].MakeCurrent();
         }

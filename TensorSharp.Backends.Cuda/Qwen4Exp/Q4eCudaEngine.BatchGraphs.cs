@@ -84,6 +84,9 @@ namespace TensorSharp.Cuda
             if (!CanCaptureBatch(nt) || perSeq < 1 || nt % perSeq != 0)
                 return false;
             var key = new StringBuilder(16 + 8 * (nt / perSeq));
+            // A decode lane's graphs read its own pinned buffers (DecodeLanes.cs): lane 1's are keyed apart.
+            if (_laneInFields != 0)
+                key.Append('L').Append(_laneInFields).Append('/');
             key.Append(perSeq).Append(greedy ? 'g' : 'l').Append(hidden ? 'h' : '-');
             var slots = new int[nt / perSeq];
             for (int r = 0, i = 0; r < nt; r += perSeq, i++)
@@ -103,12 +106,14 @@ namespace TensorSharp.Cuda
                 }
                 _batchKeyRuns.Remove(k);
             }
-            // The pinned inputs are rewritten below: every device's previous work must have run.
-            foreach (var dev in _devs)
-            {
-                dev.MakeCurrent();
-                CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
-            }
+            // The pinned inputs are rewritten below: every device's previous work must have run. A decode lane's are its
+            // own, last read by its previous step, which finished before its rows sampled.
+            if (!_laneIssue)
+                foreach (var dev in _devs)
+                {
+                    dev.MakeCurrent();
+                    CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+                }
             Marshal.Copy(tokens, 0, _pinnedTokens, nt);
             for (int t = 0; t < nt; t++)
                 ((int*)_posPinned)[t] = positions[t];

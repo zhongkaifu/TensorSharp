@@ -4471,12 +4471,15 @@ extern "C" __global__ void ts_dsv4_moe_gateup_decode_f32(
 // 32-value block (two ints each, dp4a) and eight blocks a warp pass, as TensorSharp's dense Q8_0 matvec reads a
 // row. The warp-per-block dot above gives each lane a whole 34-byte block in 16-bit loads and keeps few blocks
 // in flight: one decode row read its ten experts at ~1.5 TB/s. A slot still computes as a lone token's step
-// does, however many share the launch (its own arithmetic, not ts_dsv4_dot_row_warp's).
+// does, however many share the launch (its own arithmetic, not ts_dsv4_dot_row_warp's). The loop is unrolled (the same
+// operations in the same order): a 640-wide down row's three passes then have their loads in flight together, 170 -> 140
+// us a layer for 16 decode rows on the H100 NVL.
 __device__ __forceinline__ float ts_dsv4_dot_q8_0_row_vec(const uint8_t* wRow, const ts_dsv4_block_q8_1* act, int inDim, int lane)
 {
     const int nBlk = inDim / 32;
     const int q = (lane & 3) * 2;
     float acc = 0.0f;
+#pragma unroll 4
     for (int b = lane >> 2; b < nBlk; b += 8)
     {
         const uint8_t* wb = wRow + (size_t)b * TS_DSV4_Q8_0_BLOCK_BYTES;
@@ -4520,6 +4523,71 @@ extern "C" __global__ void ts_dsv4_moe_gateup_decode_q80v_f32(
     const float dot = ts_dsv4_dot_q8_0_row_vec(wRow, act, inDim, lane);
     if (lane == 0)
         (isUp ? upOut : gateOut)[(size_t)slot * ff + rr] = dot;
+}
+
+// ts_dsv4_moe_gateup_decode_q80v_f32 with a slot's gate row and up row in one warp: they read the same activation
+// blocks, loaded once for both, and each row's sum is ts_dsv4_dot_q8_0_row_vec's in its order (the same bits). On the H100
+// NVL at 2560 -> 640 it took 200 against 233 us a layer for 160 slots, 51 against 56 for 40; at 10 slots half the
+// warps leave it slower (19.1 against 17.4), so Dsv4Kernels.MoeGateUpDecodeQ80Vec takes it from 32 slots.
+// grid (slots, ceil(ff / 8)): eight rows a block.
+extern "C" __global__ void ts_dsv4_moe_gateup_decode_q80v_pair_f32(
+    const uint8_t* __restrict__ gateW,
+    const uint8_t* __restrict__ upW,
+    const ts_dsv4_block_q8_1* __restrict__ act, // [nt] rows
+    const int32_t* __restrict__ sel,     // [nt * nUsed]
+    float* __restrict__ gateOut,         // [nt * nUsed, ff]
+    float* __restrict__ upOut,           // [nt * nUsed, ff]
+    const int ff,
+    const int inDim,
+    const long long rowBytes,
+    const int nUsed,
+    const unsigned long long* __restrict__ gateTab,
+    const unsigned long long* __restrict__ upTab)
+{
+    const int slot = blockIdx.x;
+    const int e = sel[slot];
+    act += (size_t)(slot / nUsed) * (inDim / TS_DSV4_QK8_1);
+    const int rr = blockIdx.y * 8 + threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    if (rr >= ff)
+        return;
+    const uint8_t* gRow = ts_dsv4_expert_rows(gateW, gateTab, e, (size_t)ff * rowBytes) + (size_t)rr * rowBytes;
+    const uint8_t* uRow = ts_dsv4_expert_rows(upW, upTab, e, (size_t)ff * rowBytes) + (size_t)rr * rowBytes;
+    const int nBlk = inDim / 32;
+    const int q = (lane & 3) * 2;
+    float ag = 0.0f, au = 0.0f;
+#pragma unroll 2
+    for (int b = lane >> 2; b < nBlk; b += 8)
+    {
+        const float da = __half2float(act[b].d);
+        const int* aq = reinterpret_cast<const int*>(act[b].qs);
+        const int a0 = aq[q], a1 = aq[q + 1];
+        {
+            const uint8_t* wb = gRow + (size_t)b * TS_DSV4_Q8_0_BLOCK_BYTES;
+            const float dw = __half2float(*reinterpret_cast<const half*>(wb));
+            const uint16_t* w16 = reinterpret_cast<const uint16_t*>(wb + 2);
+            const int w0 = (int)w16[2 * q] | ((int)w16[2 * q + 1] << 16);
+            const int w1 = (int)w16[2 * q + 2] | ((int)w16[2 * q + 3] << 16);
+            const int s = __dp4a(w1, a1, __dp4a(w0, a0, 0));
+            ag += dw * da * (float)s;
+        }
+        {
+            const uint8_t* wb = uRow + (size_t)b * TS_DSV4_Q8_0_BLOCK_BYTES;
+            const float dw = __half2float(*reinterpret_cast<const half*>(wb));
+            const uint16_t* w16 = reinterpret_cast<const uint16_t*>(wb + 2);
+            const int w0 = (int)w16[2 * q] | ((int)w16[2 * q + 1] << 16);
+            const int w1 = (int)w16[2 * q + 2] | ((int)w16[2 * q + 3] << 16);
+            const int s = __dp4a(w1, a1, __dp4a(w0, a0, 0));
+            au += dw * da * (float)s;
+        }
+    }
+    ag = ts_dsv4_warp_sum(ag);
+    au = ts_dsv4_warp_sum(au);
+    if (lane == 0)
+    {
+        gateOut[(size_t)slot * ff + rr] = ag;
+        upOut[(size_t)slot * ff + rr] = au;
+    }
 }
 
 // grid (slots, ceil(E / 8)).

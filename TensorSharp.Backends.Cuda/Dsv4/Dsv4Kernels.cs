@@ -53,7 +53,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr q2i8QuantAct, q2i8GateUp, q2i8Down, moeRowMap;
         private readonly IntPtr moeGateUpDecode;
         private readonly IntPtr moeDownDecode;
-        private readonly IntPtr moeGateUpDecodeQ80V, moeDownDecodeQ80V;
+        private readonly IntPtr moeGateUpDecodeQ80V, moeDownDecodeQ80V, moeGateUpDecodeQ80VPair;
         private readonly IntPtr denseQ81Rows;
         private readonly IntPtr moeScatterAdd;
         private readonly IntPtr moeStagePlan, moeStageCopy, moeUnstage, doorbellPublish, doorbellWaitAdd;
@@ -256,6 +256,8 @@ namespace TensorSharp.Cuda
                 moeDownDecodeQ80V = module.GetFunction("ts_dsv4_moe_down_decode_q80v_f32");
             }
             catch (CudaException ex) when (ex.ErrorCode == 500) { moeGateUpDecodeQ80V = moeDownDecodeQ80V = IntPtr.Zero; }
+            try { moeGateUpDecodeQ80VPair = module.GetFunction("ts_dsv4_moe_gateup_decode_q80v_pair_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { moeGateUpDecodeQ80VPair = IntPtr.Zero; }
             denseQ81Rows = module.GetFunction("ts_dsv4_dense_q81_rows_f32");
             moeScatterAdd = module.GetFunction("ts_dsv4_moe_scatter_add_f32");
             hcMean = module.GetFunction("ts_dsv4_hc_mean_f32");
@@ -924,8 +926,18 @@ namespace TensorSharp.Cuda
             int a6 = ff, a7 = inDim; long a8 = rowBytes; int a9 = nUsed;
             IntPtr a10 = gateTab, a11 = upTab;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11 };
-            Launch(moeGateUpDecodeQ80V, (uint)(nt * nUsed), CeilDiv(ff, 8), 2, BlockSize, 0, stream, args);
+            // From 32 slots a warp takes a slot's gate row and up row together (the same sums; fewer activation loads).
+            int slots = nt * nUsed;
+            if (moeGateUpDecodeQ80VPair != IntPtr.Zero && slots >= MoeGateUpQ80PairMinSlots && _moeGateUpQ80Pair)
+                Launch(moeGateUpDecodeQ80VPair, (uint)slots, CeilDiv(ff, 8), 1, BlockSize, 0, stream, args);
+            else
+                Launch(moeGateUpDecodeQ80V, (uint)slots, CeilDiv(ff, 8), 2, BlockSize, 0, stream, args);
         }
+
+        /// <summary>Slots from which <see cref="MoeGateUpDecodeQ80Vec"/> computes a slot's gate and up rows in one warp.</summary>
+        public const int MoeGateUpQ80PairMinSlots = 32;
+        // TS_MOE_GATEUP_Q80_PAIR=0: gate and up rows in separate warps at every slot count (the same sums; for measuring it).
+        private static readonly bool _moeGateUpQ80Pair = Environment.GetEnvironmentVariable("TS_MOE_GATEUP_Q80_PAIR") != "0";
 
         /// <summary><see cref="MoeDownDecode"/> for Q8_0 experts, as <see cref="MoeGateUpDecodeQ80Vec"/> reads a row.</summary>
         public void MoeDownDecodeQ80Vec(IntPtr downW, Tensor act, Tensor sel, Tensor downOut,

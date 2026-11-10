@@ -41,6 +41,9 @@
 
 #if defined(TSG_GGML_USE_CUDA)
 #include <cuda_runtime.h>
+#if defined(_WIN32)
+#include <dxgi.h>
+#endif
 #endif
 
 #if defined(GGML_USE_VULKAN)
@@ -3141,6 +3144,8 @@ namespace tsg
                 if (by_type == 2)
                     key += ":" + std::to_string(node->src[0]->ne[0]) + "x" + std::to_string(node->src[0]->ne[1]);
             }
+            if (by_type && node->op == GGML_OP_CUSTOM && node->name[0] != '\0')
+                key = node->name;
             if (outside[static_cast<std::size_t>(i)])
                 key += ":offload";
             NodeProfileBucket& b = s.buckets[key];
@@ -3764,6 +3769,14 @@ TSG_EXPORT void TSGgml_ReleaseReuseComputeBuffers()
     TSGgml_QwenImage21ResetForwardCache();
     free_reuse_compute_buffer();
     free_reuse_gallocr();
+    // MiniMax-H3's CUDA attention and projection scratch (~3 GB at 20k tokens) is
+    // phase scratch too; both re-create it on their next call.
+#if defined(TSG_HAVE_CUDNN)
+    tsg_cudnn_sdpa_release();
+#endif
+#if defined(TSG_GGML_USE_CUDA)
+    tsg_cuda_q4k_gemm_release();
+#endif
 #if defined(TSG_GGML_USE_METAL)
     // Explicit phase/model scratch release also returns the vendor convolution
     // staging allocations; preserve reuse within a VAE encode/decode phase.
@@ -3878,6 +3891,49 @@ TSG_EXPORT void TSGgml_SetDeviceCopyBudget(int64_t bytes)
 
 namespace
 {
+#if defined(TSG_GGML_USE_CUDA)
+    struct CudaDevice
+    {
+        int ordinal;                // -1: ask ggml
+        std::size_t dedicated;      // the adapter's own memory in bytes, 0 when not known
+    };
+
+    // Bytes of memory that belong to the adapter behind a CUDA ordinal, or 0 where
+    // that cannot be told: off Windows, or for a device no display adapter matches
+    // (one outside WDDM has no LUID).
+    std::size_t adapter_dedicated_bytes(int ordinal)
+    {
+#if defined(_WIN32)
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, ordinal) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        IDXGIFactory1* factory = nullptr;
+        if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) || factory == nullptr)
+            return 0;
+        std::size_t dedicated = 0;
+        IDXGIAdapter1* adapter = nullptr;
+        for (UINT i = 0; dedicated == 0 && factory->EnumAdapters1(i, &adapter) == S_OK; ++i)
+        {
+            DXGI_ADAPTER_DESC1 desc{};
+            static_assert(sizeof(desc.AdapterLuid) == sizeof(prop.luid), "adapter LUID size");
+            if (SUCCEEDED(adapter->GetDesc1(&desc))
+                && std::memcmp(&desc.AdapterLuid, prop.luid, sizeof(prop.luid)) == 0)
+                dedicated = desc.DedicatedVideoMemory;
+            adapter->Release();
+            adapter = nullptr;
+        }
+        factory->Release();
+        return dedicated;
+#else
+        (void)ordinal;
+        return 0;
+#endif
+    }
+#endif
+
     // cudaMemGetInfo for a discrete CUDA device, or false where ggml's query must
     // answer. On Linux ggml's query also runs cudaGetDeviceProperties (~1.7 ms) to
     // detect a unified-memory device, and the serving path asks for free VRAM
@@ -3888,12 +3944,13 @@ namespace
         if (g_backend_type != BACKEND_TYPE_CUDA)
             return false;
         static std::mutex mutex;
-        static std::unordered_map<ggml_backend_dev_t, int> ordinals; // -1: ask ggml
+        static std::unordered_map<ggml_backend_dev_t, CudaDevice> devices;
         int ordinal = -1;
+        std::size_t dedicated = 0;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            auto it = ordinals.find(dev);
-            if (it == ordinals.end())
+            auto it = devices.find(dev);
+            if (it == devices.end())
             {
                 int resolved = -1;
                 ggml_backend_dev_props props{};
@@ -3909,9 +3966,10 @@ namespace
                     (void)cudaGetLastError();
                     resolved = -1;
                 }
-                it = ordinals.emplace(dev, resolved).first;
+                it = devices.emplace(dev, CudaDevice{ resolved, resolved >= 0 ? adapter_dedicated_bytes(resolved) : 0 }).first;
             }
-            ordinal = it->second;
+            ordinal = it->second.ordinal;
+            dedicated = it->second.dedicated;
         }
         if (ordinal < 0)
             return false;
@@ -3929,6 +3987,17 @@ namespace
         const bool ok = cudaMemGetInfo(&free_sz, &total_sz) == cudaSuccess;
         if (!ok)
             (void)cudaGetLastError();
+        // Under WDDM the reading can also count the system memory the driver may back
+        // device allocations with. A device whose own memory is full then still shows
+        // room, and what lands there runs at system-memory speed. Report the adapter's
+        // own memory, less everything in use. A device with little memory of its own
+        // lives in system memory altogether, and its reading stands.
+        if (ok && dedicated < total_sz && dedicated >= total_sz / 2)
+        {
+            const std::size_t used = total_sz - free_sz;
+            total_sz = dedicated;
+            free_sz = used < dedicated ? dedicated - used : 0;
+        }
         if (previous != ordinal)
             cudaSetDevice(previous);
         return ok;

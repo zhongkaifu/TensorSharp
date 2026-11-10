@@ -61,8 +61,11 @@ namespace TensorSharp.Cuda
 
         private readonly int _bvRowBudget = Math.Clamp(EnvInt("TS_Q4E_BATCHED_VERIFY_ROWS", 8), 2, PerSlotMaxRows);
 
-        /// <summary>Whether the engine verifies several sequences' windows in one forward (one GPU, the device argmax).</summary>
-        public bool SupportsBatchedVerify => _devs.Length == 1 && _devs[_lastDev].QK.HasArgmaxRows;
+        /// <summary>Whether the engine verifies several sequences' windows in one forward (the device argmax on the GPU that
+        /// holds the head). Under a layer split the window rows run the batched decode step's split forward, each layer's
+        /// saves live on its own GPU, and the commit synchronizes every GPU, as for one; without it concurrent requests on
+        /// two H100 NVL decoded plainly, the MTP head drafting only for a request alone.</summary>
+        public bool SupportsBatchedVerify => _devs[_lastDev].QK.HasArgmaxRows;
 
         /// <summary>Bytes of one sequence's saves: the recurrent layers' conv and SSM states, and the PLE history.</summary>
         private long SeqSaveBytes()
@@ -161,6 +164,7 @@ namespace TensorSharp.Cuda
         public bool ForwardBatchedVerify(int[] slotIds, int window, int[] tokens, int[] drawnOut, float[] hAll,
             float[] logitsOut = null)
         {
+            DrainDecodeLanes();
             int n = slotIds?.Length ?? 0;
             if (!SupportsBatchedVerify || n < 1 || window < 1 || window > VerifyMaxRows || (long)n * window > PerSlotMaxRows
                 || tokens == null || tokens.Length < n * window)
@@ -279,6 +283,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public bool CommitBatchedVerify(int[] slotIds, int[] kept)
         {
+            DrainDecodeLanes();
             var slots = _bvSlots;
             if (slots == null || slotIds == null || kept == null || slotIds.Length != slots.Length || kept.Length < slots.Length)
                 return false;

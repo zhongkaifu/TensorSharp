@@ -4707,6 +4707,12 @@ internal enum GgmlIndexReductionOp
         internal static partial void TSGgml_HostExpertIoUnregister(IntPtr baseAddress);
         [LibraryImport(DllName)]
         internal static unsafe partial void TSGgml_HostExpertIoStats(long* stats4);
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_DirectReadSupported();
+        [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+        internal static partial int TSGgml_DirectReadRegister(IntPtr baseAddress, long length, string path);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_DirectReadUnregister(IntPtr baseAddress);
 
         [LibraryImport(DllName)]
         private static unsafe partial IntPtr TSGgml_Qwen4ExpStateSnapshotCreate(

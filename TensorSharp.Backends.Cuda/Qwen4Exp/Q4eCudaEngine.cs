@@ -450,7 +450,8 @@ namespace TensorSharp.Cuda
                 slotBytes += 512L << 20;
                 // With the MTP head the lanes verify their drafts together: the batched verify's window buffers and one
                 // set of saves a lane (BatchedVerify.cs).
-                // (Placement has not run: the batched verify needs one GPU, so device 0 is the last.)
+                // Planned for one GPU, where device 0 is the last (placement has not run yet); under a layer split the
+                // saves are allocated on a batched verify's first use, and a step without room for them decodes plainly.
                 long verifyBytes = m.Mtp != null && _devs.Length == 1 && _devs[0].QK.HasArgmaxRows ? BatchVerifyBytes(_lanes) : 0;
                 nonExpertBytes += (_lanes - 1) * slotBytes + SlotReserveBytes + verifyBytes;
                 Console.Error.WriteLine($"[q4e-cuda] {_lanes} sequence lanes: {((_lanes - 1) * slotBytes + SlotReserveBytes + verifyBytes) / 1073741824.0:F2} GiB "
@@ -1060,6 +1061,8 @@ namespace TensorSharp.Cuda
 
         public void Dispose()
         {
+            try { DrainDecodeLanes(); } catch { }
+            DisposeDecodeLanes();
             foreach (var slot in _slots.Values)
                 FreeSlot(slot);
             DisposeKvHostPool();

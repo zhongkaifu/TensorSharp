@@ -28,6 +28,8 @@
 #include <cuda_fp16.h>
 #include <cudnn.h>
 
+#include "tsg_cuda_stage_profile.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -411,7 +413,7 @@ bool execute_plan(SdpaState& s, Plan& p, const void* q16, const void* k, const v
 // The fused stages around the attention (tsg_cuda_h3_fused.cu).
 extern "C" bool tsg_h3_attn_prep(const float* q, int64_t q_sh, int64_t q_ss, const float* k, int64_t k_sh, int64_t k_ss,
                                  const float* v, int64_t v_sh, int64_t v_ss, const float* qb, const float* kb,
-                                 const float* vb, const float* qn, const float* kn,
+                                 const float* vb, int64_t bias_hs, const float* qn, const float* kn,
                                  const float* cosT, const float* ssinT, int rot, float eps, float vInv,
                                  int heads, int seq, int head_dim, void* q16, void* k16, void* v16);
 extern "C" bool tsg_h3_widen_scaled(const void* src16, float* dst, int64_t n, float scale);
@@ -470,13 +472,13 @@ bool tsg_cudnn_sdpa_f32(const float* q, const void* k, const void* v, float* out
 }
 
 // MiniMax-H3's whole DiT attention after the qkv projection: the qkv bias (qb/kb/vb,
-// each nullable, [H*D]), q/k RMSNorm, RoPE and
+// each nullable; head h's slice at h * bias_hs, 0 meaning D), q/k RMSNorm, RoPE and
 // the F16 narrowing in one pass (tsg_h3_attn_prep), cuDNN SDPA, and the result
 // widened to F32 [D*H, S] times the power-of-two V scale. q/k/v are F32 [D, H, S]
 // views with head and token strides in floats. Synchronizes.
 bool tsg_cudnn_h3_attention(const float* q, int64_t q_sh, int64_t q_ss, const float* k, int64_t k_sh, int64_t k_ss,
                             const float* v, int64_t v_sh, int64_t v_ss, const float* qb, const float* kb,
-                            const float* vb, const float* qn, const float* kn,
+                            const float* vb, int64_t bias_hs, const float* qn, const float* kn,
                             const float* cosT, const float* ssinT, int rot, float eps, float vScale, float scale,
                             int heads, int seq, int head_dim, float* out)
 {
@@ -494,12 +496,17 @@ bool tsg_cudnn_h3_attention(const float* q, int64_t q_sh, int64_t q_ss, const fl
     void* k16 = base + pad;
     void* v16 = base + 2 * pad;
     void* o16 = base + 3 * pad;
-    if (!tsg_h3_attn_prep(q, q_sh, q_ss, k, k_sh, k_ss, v, v_sh, v_ss, qb, kb, vb, qn, kn, cosT, ssinT, rot, eps,
+    tsg_stage::Clock clock;
+    if (!tsg_h3_attn_prep(q, q_sh, q_ss, k, k_sh, k_ss, v, v_sh, v_ss, qb, kb, vb, bias_hs, qn, kn, cosT, ssinT, rot, eps,
                           1.0f / vScale, heads, seq, head_dim, q16, k16, v16))
         return false;
+    clock.lap("attention prep");
     if (!execute_plan(s, *p, q16, k16, v16, o16, scale)) return false;
+    clock.lap("attention sdpa");
     if (!tsg_h3_widen_scaled(o16, out, n, vScale)) return false;
-    return cudaStreamSynchronize(nullptr) == cudaSuccess;
+    const bool ok = cudaStreamSynchronize(nullptr) == cudaSuccess;
+    clock.lap("attention widen");
+    return ok;
 }
 
 // Frees the plans, scratch and handle; the next call re-creates them. Called with

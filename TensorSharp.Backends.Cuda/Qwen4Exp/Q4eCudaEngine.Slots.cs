@@ -43,6 +43,7 @@ namespace TensorSharp.Cuda
         /// what the running sequences still need.</summary>
         public int SlotAlloc()
         {
+            DrainDecodeLanes();
             if (!SlotFits())
             {
                 // Captured batched steps are a cache, and their executable graphs hold device memory: a new sequence needs it
@@ -280,6 +281,7 @@ namespace TensorSharp.Cuda
 
         public bool SetActiveSlot(int id)
         {
+            DrainDecodeLanes();
             if (!_slots.TryGetValue(id, out Slot slot))
                 return false;
             _active = slot;
@@ -294,6 +296,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public int SlotFreeAllExcept(ICollection<int> keep)
         {
+            DrainDecodeLanes();
             var lost = new List<int>();
             foreach (var (id, slot) in _slots)
                 if (!ReferenceEquals(slot, _active) && !keep.Contains(id))
@@ -308,6 +311,7 @@ namespace TensorSharp.Cuda
         /// <summary>Free a slot; the active slot cannot be freed.</summary>
         public bool SlotFree(int id)
         {
+            DrainDecodeLanes();
             if (!_slots.TryGetValue(id, out Slot slot) || ReferenceEquals(slot, _active))
                 return false;
             FreeSlot(slot);
@@ -318,6 +322,7 @@ namespace TensorSharp.Cuda
         /// <summary>Head of a slot without selecting it; false when there is no such slot.</summary>
         public bool SlotHead(int id, out int head)
         {
+            DrainDecodeLanes();
             head = 0;
             if (!_slots.TryGetValue(id, out Slot slot))
                 return false;
@@ -328,6 +333,7 @@ namespace TensorSharp.Cuda
         /// <summary><see cref="Reset"/> that reports whether the active slot is usable at position 0.</summary>
         public bool ResetChecked()
         {
+            DrainDecodeLanes();
             try
             {
                 Reset();
@@ -358,6 +364,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public bool Rewind(int nPast)
         {
+            DrainDecodeLanes();
             Slot s = _active;
             if (nPast == s.NPast)
                 return true;
@@ -422,6 +429,7 @@ namespace TensorSharp.Cuda
 
         private bool CanRewind(Slot s, int head, int target)
         {
+            DrainDecodeLanes();
             if (s.Failed || s.NPast != head || target < 0 || target > head)
                 return false;
             if (target == head || target == 0)
@@ -442,6 +450,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public bool ForwardBatchedDecode(int[] slotIds, int[] tokens, int[] positions, float[] logits)
         {
+            DrainDecodeLanes();
             int n = slotIds?.Length ?? 0;
             if (n < 2 || n > MaxBatchedDecodeRows || tokens.Length != n || positions.Length != n
                 || logits.Length < (long)n * _m.NVocab)

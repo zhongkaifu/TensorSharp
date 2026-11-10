@@ -593,6 +593,11 @@ namespace TensorSharp.Runtime.Scheduling
         private List<SequenceStepResult>? TryExecutePath(
             ExecutionPathKind path, SchedulerOutput output, ExecutionOptions options)
         {
+            // Groups' decode steps still in flight (IPipelinedBatchedDecode) leave their sequences' LastLogits unfilled:
+            // any step but another pipelined decode step finishes them first.
+            if (_model is IPipelinedBatchedDecode pipe && pipe.HasPendingPipelinedDecode
+                && (path != ExecutionPathKind.PerSequenceFused || !PipelinesStep(pipe, output, options)))
+                pipe.DrainPipelinedDecode();
             switch (path)
             {
                 case ExecutionPathKind.SpeculativePerSequence:
@@ -1233,6 +1238,154 @@ namespace TensorSharp.Runtime.Scheduling
         /// the path does not itself CAPTURE blocks back into the shared pool
         /// (a concurrent request never writes the shared block storage), so it
         /// can't corrupt blocks shared via copy-on-write.</summary>
+        // TS_SCHED_PIPELINE_DECODE=0: a model that can keep two groups' decode steps in flight decodes every step as one
+        // batch instead (IPipelinedBatchedDecode; the same tokens either way).
+        private static readonly bool s_pipelineDecode =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_SCHED_PIPELINE_DECODE"), "0", StringComparison.Ordinal);
+
+        /// <summary>Steps whose decoders ran as two groups in flight (tests, diagnostics).</summary>
+        internal static long PipelinedDecodeSteps;
+
+        // Each decoding sequence's group while it pipelines, and its order of joining (a group's rows keep that order, so
+        // its captured steps are reused while its members stay).
+        private readonly Dictionary<string, (int Group, long Rank)> _pipeGroupOf = new Dictionary<string, (int, long)>(StringComparer.Ordinal);
+        private long _pipeRank;
+
+        /// <summary>Whether this step's decoders run as pipelined groups: a model that keeps two in flight, every scheduled
+        /// item a decode step (two or more), and no speculation (whose paths read the logits).</summary>
+        private bool PipelinesStep(IPipelinedBatchedDecode pipe, SchedulerOutput output, ExecutionOptions options)
+        {
+            if (!s_pipelineDecode || !options.BatchedFusedDecodeEnabled || SpeculationEnabledThisStep
+                || output.ScheduledWork.Count < 2 || pipe.PipelinedDecodeGroups < 2)
+                return false;
+            foreach (var work in output.ScheduledWork)
+                if (work.IsPrefill)
+                    return false;
+            return true;
+        }
+
+        /// <summary>The step's decoders in two groups, each in the order it joined; null when there are fewer than two. A
+        /// sequence keeps its group; a new one joins the smaller; groups are dealt again (after the steps in flight finish,
+        /// as rows change groups) only when one is empty or holds two more than the other.</summary>
+        private List<ScheduledSequenceWork>[]? PipelineGroups(IPipelinedBatchedDecode pipe, List<ScheduledSequenceWork> decodeWork)
+        {
+            if (decodeWork.Count < 2)
+                return null;
+            var live = new HashSet<string>(decodeWork.Select(w => w.Sequence.RequestId), StringComparer.Ordinal);
+            foreach (var id in _pipeGroupOf.Keys.Where(k => !live.Contains(k)).ToList())
+                _pipeGroupOf.Remove(id);
+            var counts = new int[2];
+            foreach (var (group, _) in _pipeGroupOf.Values)
+                counts[group]++;
+            foreach (var work in decodeWork)
+            {
+                string id = work.Sequence.RequestId;
+                if (_pipeGroupOf.ContainsKey(id))
+                    continue;
+                int g = counts[1] < counts[0] ? 1 : 0;
+                _pipeGroupOf[id] = (g, _pipeRank++);
+                counts[g]++;
+            }
+            if (Math.Min(counts[0], counts[1]) < 1 || Math.Abs(counts[0] - counts[1]) > 2)
+            {
+                // Rows change groups: the steps in flight finish first, then the groups are dealt in turn.
+                pipe.DrainPipelinedDecode();
+                var ordered = _pipeGroupOf.OrderBy(kv => kv.Value.Rank).Select(kv => kv.Key).ToList();
+                for (int i = 0; i < ordered.Count; i++)
+                    _pipeGroupOf[ordered[i]] = (i % 2, _pipeGroupOf[ordered[i]].Rank);
+            }
+            var groups = new[] { new List<ScheduledSequenceWork>(), new List<ScheduledSequenceWork>() };
+            foreach (var work in decodeWork.OrderBy(w => _pipeGroupOf[w.Sequence.RequestId].Rank))
+                groups[_pipeGroupOf[work.Sequence.RequestId].Group].Add(work);
+            return groups[0].Count >= 1 && groups[1].Count >= 1 ? groups : null;
+        }
+
+        /// <summary>
+        /// The decode step as two groups in flight: for each group, finish its previous step (its rows' logits), sample its
+        /// rows from them, and issue its next step without waiting for it. The ids handled (their tokens appended), or null
+        /// when the step was not split (nothing changed). A group the model declines decodes as one synchronous batch, or,
+        /// declined too, keeps its drawn tokens for the round-robin loop.
+        /// </summary>
+        private HashSet<string>? TryPipelinedDecode(IBatchedPagedModel fused, IPipelinedBatchedDecode pipe,
+            List<ScheduledSequenceWork> decodeWork, List<SequenceStepResult> results)
+        {
+            var groups = PipelineGroups(pipe, decodeWork);
+            if (groups == null)
+                return null;
+            HashSet<string>? handled = null;
+            for (int g = 0; g < groups.Length; g++)
+            {
+                var work = groups[g];
+                int cnt = work.Count;
+                pipe.FinishPipelinedDecode(g);
+                var ids = new string[cnt];
+                var toks = new int[cnt];
+                var pos = new int[cnt];
+                if (ParallelSampling && cnt >= ParallelSamplingMinRows && !FirstTokenLogitsDump.IsArmed)
+                {
+                    try
+                    {
+                        Parallel.For(0, cnt, i => toks[i] = PeekPendingOrSample(work[i].Sequence));
+                    }
+                    catch (AggregateException ae) when (ae.InnerExceptions.Count > 0)
+                    {
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
+                    }
+                    Interlocked.Increment(ref ParallelSampledSteps);
+                }
+                else
+                    for (int i = 0; i < cnt; i++)
+                        toks[i] = PeekPendingOrSample(work[i].Sequence);
+                for (int i = 0; i < cnt; i++)
+                {
+                    pos[i] = work[i].Sequence.NumComputedTokens;
+                    ids[i] = work[i].Sequence.RequestId;
+                }
+                var outLogits = new float[cnt][];
+                long started = Stopwatch.GetTimestamp();
+                bool ok = pipe.TryIssuePipelinedDecode(g, ids, toks, pos, outLogits);
+                if (!ok)
+                {
+                    pipe.DrainPipelinedDecode();
+                    ok = fused.TryForwardBatchedFusedDecode(ids, toks, pos, outLogits);
+                }
+                if (!ok)
+                {
+                    // Keep the draws (a stochastic sampler advanced) for the round-robin loop, as the batched path does.
+                    for (int i = 0; i < cnt; i++)
+                    {
+                        work[i].Sequence.PendingDeviceToken = toks[i];
+                        work[i].Sequence.PendingDevicePosition = pos[i];
+                    }
+                    continue;
+                }
+                long ticksPerSequence = (Stopwatch.GetTimestamp() - started) / cnt;
+                ReportBatchedFusedDecodeSuccess(cnt);
+                for (int i = 0; i < cnt; i++)
+                {
+                    var seq = work[i].Sequence;
+                    seq.AppendOutputToken(toks[i]);
+                    seq.PendingDeviceToken = null;
+                    seq.LastLogits = outLogits[i];
+                    seq.AdvanceComputedTokens(1);
+                    if (!seq.FirstTokenAt.HasValue) seq.FirstTokenAt = DateTime.UtcNow;
+                    results.Add(new SequenceStepResult
+                    {
+                        Sequence = seq,
+                        TokensForwarded = 1,
+                        SampledToken = toks[i],
+                        IsPrefill = false,
+                        FullBlocksCaptured = 0,
+                        ForwardElapsedTicks = ticksPerSequence,
+                    });
+                    (handled ??= new HashSet<string>(StringComparer.Ordinal)).Add(seq.RequestId);
+                }
+            }
+            if (handled != null)
+                Interlocked.Increment(ref PipelinedDecodeSteps);
+            return handled;
+        }
+
         private List<SequenceStepResult> ExecuteStepPerSequenceFused(
             IBatchedPagedModel fused, SchedulerOutput output, ExecutionOptions options)
         {
@@ -1319,12 +1472,46 @@ namespace TensorSharp.Runtime.Scheduling
                         fused.CanBatchDecode(work.Sequence.RequestId, work.Sequence.NumComputedTokens))
                         decodeWork.Add(work);
                 int dn = decodeWork.Count;
+                // A layer split's GPUs each run one group's half at a time (IPipelinedBatchedDecode): the step's
+                // decoders in two groups, each group's step left in flight until the group samples again.
+                bool pipelined = false;
+                if (dn == n && _model is IPipelinedBatchedDecode pipe && PipelinesStep(pipe, output, options))
+                {
+                    try
+                    {
+                        var handled = TryPipelinedDecode(fused, pipe, decodeWork, results);
+                        if (handled != null)
+                        {
+                            if (handled.Count == n)
+                                return results;
+                            handledBatched = handled;
+                            pipelined = true;
+                        }
+                        else if (pipe.HasPendingPipelinedDecode)
+                            pipe.DrainPipelinedDecode();
+                    }
+                    catch (Exception ex)
+                    {
+                        // As the batched path below: a throwing kernel may have written some caches, so the whole
+                        // decode subset fails rather than retrying against partially advanced state.
+                        handledBatched = new HashSet<string>(decodeWork.Select(work => work.Sequence.RequestId));
+                        results.RemoveAll(result => handledBatched.Contains(result.Sequence.RequestId));
+                        _logger.LogError(ex, "Pipelined batched decode failed for {Count} sequences; failing the affected requests.", dn);
+                        foreach (var work in decodeWork)
+                        {
+                            var seq = work.Sequence;
+                            seq.Error = ex;
+                            results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
+                        }
+                        return results;
+                    }
+                }
                 // A lone decode beside prefill chunks speculates too. Decoding it one
                 // token per step behind another request's 2048-token chunk (~300 ms a
                 // step) stretched a 41-token reply over seconds; the batched verify of a
                 // single sequence costs about what that plain decode does.
-                bool speculate = dn >= 2 || (dn == 1
-                    && !_pendingRetainedFusedTruncations.ContainsKey(decodeWork[0].Sequence.RequestId));
+                bool speculate = !pipelined && (dn >= 2 || (dn == 1
+                    && !_pendingRetainedFusedTruncations.ContainsKey(decodeWork[0].Sequence.RequestId)));
                 // The step's prompt chunk rides the batched verify when the model can carry it:
                 // one forward for both, so the verify reads no weights of its own.
                 HashSet<string>? mixedHandled = null;
@@ -1334,9 +1521,9 @@ namespace TensorSharp.Runtime.Scheduling
                 if (mixedWork != null)
                     CompleteMixedPrefill(mixedWork, Stopwatch.GetTimestamp() - specStarted, results, ref mixedHandled);
                 // No batched verify: on a trunk that prefers it, one sequence takes a solo speculative turn instead.
-                if (!speculated && dn >= 2 && dn == n && TrySpeculativeTurn(fused, decodeWork, results))
+                if (!pipelined && !speculated && dn >= 2 && dn == n && TrySpeculativeTurn(fused, decodeWork, results))
                     return results;
-                if (!speculated && dn >= 2)
+                if (!pipelined && !speculated && dn >= 2)
                 {
                     var reqIds = new string[dn];
                     var btokens = new int[dn];

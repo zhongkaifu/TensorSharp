@@ -3782,6 +3782,18 @@ namespace TensorSharp.GGML
 
         public static void HostExpertIoUnregister(IntPtr baseAddress) => GgmlNative.TSGgml_HostExpertIoUnregister(baseAddress);
 
+        /// <summary>True when weight uploads can read a registered file directly instead of
+        /// faulting its mapping in, which makes warming the page cache for them redundant.</summary>
+        public static bool DirectReadSupported() => GgmlNative.TSGgml_DirectReadSupported() != 0;
+
+        /// <summary>Record that [<paramref name="baseAddress"/>, +<paramref name="length"/>) is a
+        /// read-only mapping of <paramref name="path"/> from offset 0, so that uploads of weights
+        /// inside it read the file itself. Unregister before the mapping goes.</summary>
+        public static bool DirectReadRegister(IntPtr baseAddress, long length, string path)
+            => GgmlNative.TSGgml_DirectReadRegister(baseAddress, length, path) != 0;
+
+        public static void DirectReadUnregister(IntPtr baseAddress) => GgmlNative.TSGgml_DirectReadUnregister(baseAddress);
+
         /// <summary>(hits, misses, bytes read, bytes held) of the host expert cache.</summary>
         public static unsafe (long Hits, long Misses, long ReadBytes, long HeldBytes) HostExpertIoStats()
         {
