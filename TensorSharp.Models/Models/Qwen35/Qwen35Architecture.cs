@@ -31,6 +31,17 @@ namespace TensorSharp.Models
                 "Ternary-Bonsai-2-27B-mmproj-BF16.gguf",
                 "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
             },
+            Serving = new ServingContract
+            {
+                Implementation = ServingImplementation.Bespoke,
+                HasRoutedExperts = true,
+                ContinuousBatching = MechanismSupport.On(ServingBackends.All),
+                TensorParallel = MechanismSupport.On(ServingBackends.PerOpTensorParallel),
+                LayerSplit = MechanismSupport.None("Qwen 3.5 / 3.6 does not implement whole-layer placement; use --tp N."),
+                HybridParallel = MechanismSupport.None("Qwen 3.5 / 3.6 does not implement whole-layer placement, so it cannot combine it with --tp."),
+                ExpertOffload = MechanismSupport.On(ServingBackends.Ggml).ElsewhereGap(
+                    "Qwen 3.5 MoE offloads routed experts only on the GGML backends; cpu, cuda and mlx keep them in their stacked-expert buffers."),
+            },
         };
     }
 }

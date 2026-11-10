@@ -18,6 +18,19 @@ namespace TensorSharp.Models
             Aliases = new[] { "muse-glimmer", "muse_glimmer" },
             Factory = c => new MuseGlimmerModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.DraftModelPath),
             ProjectorFileHints = new[] { "*mmproj*Muse*Glimmer*.gguf" },
+            Serving = new ServingContract
+            {
+                Implementation = ServingImplementation.Bespoke,
+                HasRoutedExperts = false,
+                ContinuousBatching = MechanismSupport.None(
+                    "Muse-Glimmer has no batched forward; concurrent requests take turns through the per-sequence KV swap."),
+                TensorParallel = MechanismSupport.On(ServingBackends.GgmlMultiDevice)
+                    .When((tp, _) => tp <= 2 ? null : "Muse-Glimmer has 2 KV heads, so --tp is at most 2.")
+                    .ElsewhereGap("Muse-Glimmer tensor parallelism runs on ggml_cuda or ggml_vulkan only."),
+                LayerSplit = MechanismSupport.None("Muse-Glimmer does not implement whole-layer placement; use --tp 2."),
+                HybridParallel = MechanismSupport.None("Muse-Glimmer does not implement whole-layer placement, so it cannot combine it with --tp."),
+                ExpertOffload = MechanismSupport.NotApplicable("dense: no routed experts"),
+            },
         };
     }
 }

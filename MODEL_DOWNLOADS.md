@@ -318,7 +318,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/nv
 
 For image input use the Omni distribution instead: `NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf` + `mmproj-BF16.gguf` from [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF). Audio input is refused unless an audio companion GGUF converted from NVIDIA's checkpoint is loaded: the GGUFs ship no Parakeet/FastConformer audio tower (see [nemotron.md §4.6-4.7](docs/models/nemotron.md)).
 
-**Hunyuan Dense** — Tencent dense Hunyuan / Hy-MT2, text only, single device
+**Hunyuan Dense** — Tencent dense Hunyuan / Hy-MT2, text only (multi-GPU through the shared decoder runtime)
 
 No repository is pinned here: any GGUF whose `general.architecture` is `hunyuan-dense` loads,
 and the architecture is selected from that key rather than from the file name.

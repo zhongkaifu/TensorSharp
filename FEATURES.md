@@ -398,7 +398,8 @@ raise throughput. Which mode each architecture uses:
 
 | Architecture | Multi-GPU mode |
 |---|---|
-| Mistral 3, Gemma 4, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Muse-Glimmer (`--tp 2` max) | Tensor parallelism, opt in with `--tp N` |
+| Mistral 3, Hunyuan Dense (shared decoder runtime) | `--tp T`, `--layer-split P` and both together (hybrid: P whole-layer stages of T GPUs each) on `cuda`, `ggml_cuda`, `ggml_vulkan`; concurrent requests stay batched in every placement ([unified execution](docs/design/unified-execution.md)) |
+| Gemma 4, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Muse-Glimmer (`--tp 2` max) | Tensor parallelism, opt in with `--tp N` |
 | Muse Spark (`muse-spark`) | Both modes run on the native whole-model executor. Local whole-layer placement with `--layer-split N` (up to 16 GPUs) on GGML CUDA / Vulkan, with expert stacks planned per GPU; with every expert stack on CUDA GPUs, one prompt's prefill is pipelined across them. `--tp N` on GGML CUDA splits every layer over N GPUs (at most 16, the KV-head count) through upstream ggml's meta backend, the mechanism behind llama.cpp's `-sm tensor`, single node only. `TS_MUSE_SPARK_NATIVE=0`, and `--tp N` on Vulkan, select the per-op path's attention-head and whole-expert tensor parallelism instead. On ten A40s, layer split prefilled a 4K-token prompt 2.07x and `--tp 10` decoded 1.40x as fast as llama.cpp's matching mode ([report](docs/perf/muse-spark-vs-llama-cpp.md)). The two modes cannot be combined |
 | MiniMax-M3.1 (`minimax-m3`) | Both modes run on the native whole-model executor, `ggml_cuda` only. `--layer-split N` (up to 16 GPUs) places contiguous runs of whole layers, pipelines one prompt's prefill across the GPUs, and takes host experts (`--n-cpu-moe N`, `TS_MINIMAX_M3_CPU_MOE=auto`). `--tp N` (2 to 16 identical CUDA GPUs, single node) runs the executor on upstream ggml's meta backend: with only four KV heads, attention, the sparse-attention indexer and the K/V/index-key caches are mirrored on every GPU, while the dense, routed and shared-expert FFNs split along their hidden dimension and the output head by vocabulary rows, with one all-reduce per layer. It refuses host experts and the DSpark drafter. On eight A40s, `--tp 8` decoded 35.7 tok/s at depth 0 and the layer split prefilled a 32K-token prompt at 1,544 tok/s against llama.cpp's 240 ([benchmarks](docs/benchmarks.md#minimax-m31-flash-on-eight-a40-gpus)). The two modes cannot be combined |
 | Bonsai2 27B (`qwen35` with PRISM Hadamard transforms) | Single device — the loader rejects `--tp` |
@@ -408,7 +409,6 @@ raise throughput. Which mode each architecture uses:
 | GLM-5.3-Flash (`glm5next`) | Local whole-layer placement with `--layer-split N`; `--tp N` selects native local tensor parallelism on GGML GPU backends |
 | DeepSeek V4 Flash | Local whole-layer placement with `--layer-split N`; `--layer-split N` only caps how many GPUs the split uses |
 | DeepSeek V4.1 Flash | `--layer-split N` selects local whole-layer placement. Experimental routed-MoE TP (`--tp N`) runs on GGML CUDA; attention TP and distributed groups are unsupported. The two modes cannot be combined. |
-| Hunyuan Dense (`hunyuan-dense`) | Single device — neither mode; startup says so on stderr |
 | DiffusionGemma, LTX 2.5, Wan 2.1/2.2, MiniMax-H3 | Single device; `--tp N > 1`, `--layer-split N > 1`, and distributed groups are refused at startup. |
 | Qwen 3.8 Flash Next (`qwen4exp`) | Local FFN TP on qualified `ggml_cuda` devices/quantizations with `--tp N`; attention/QSA/GDN/PLE remain replicated. Separate whole-layer placement with `--layer-split N` on GGML CUDA/Vulkan and direct `cuda`. UD-Q2_K_XL is layer-split-only; see the [qualification and measurements](docs/models/qwen38-flash-next.md#multi-gpu) |
 
@@ -506,7 +506,7 @@ silently ignoring a value it cannot honour — useful because the automatic
 balance prices weights and cannot see the vision tower, which loads later and
 lands on GPU 0. Details: [Qwen 3.8 Flash Next card](docs/models/qwen38-flash-next.md).
 
-Hunyuan Dense, DiffusionGemma, LTX 2.5, Wan 2.1/2.2, and MiniMax-H3 are single-device
+DiffusionGemma, LTX 2.5, Wan 2.1/2.2, and MiniMax-H3 are single-device
 architectures. Unsupported multi-GPU requests fail at startup; neither
 `--tp` nor `--layer-split` silently falls back to a single GPU.
 

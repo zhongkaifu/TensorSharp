@@ -725,8 +725,10 @@ namespace TensorSharp.Models
                     continue;
 
                 IntPtr cacheKey = qw.EnsureDeviceCacheKey();
+                // Under layer split the weight belongs to its layer's GPU.
+                var owner = AllocatorForWeight(kv.Key) as CudaAllocator ?? cudaAllocator;
                 CudaQuantizedOps.PreloadQuantizedWeight(
-                    cudaAllocator,
+                    owner,
                     cacheKey,
                     qw.Data,
                     qw.GgmlType,

@@ -1696,7 +1696,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 
 | 架构 | TP 状态 | 说明 |
 |---|---|---|
-| Mistral 3 | ✅ | 融合 / 分离 QKV，YaRN RoPE |
+| Mistral 3 | ✅ + 按层切分 + 混合 | 共享解码运行时：在 `cuda`、`ggml_cuda` 与 `ggml_vulkan` 上支持 `--tp T`、`--layer-split P`（本地；GGML CUDA/Vulkan 上也可跨节点）以及两者组合（`--tp T --layer-split P`：P 个阶段、每段 T 张 GPU）；各种放置下并发请求都保持批处理。见[统一执行设计](docs/design/unified-execution.md)（英文） |
 | Gemma 4 | ✅ | 稠密 TP + MoE。GGML 上融合的整模 MoE 主干在**每个专家内部**切分（gate/up 列并行、down 行并行），从而保留全局专家 id；`TS_GEMMA4_TP_FUSED_MOE=0` 可回退到逐算子的整专家路径。Direct CUDA 上为逐专家切分 |
 | Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM 按 rank 划分 V-head 归属；GGML 上为专家并行 MoE（每个 rank 持有整个专家，shared expert 仍按 Megatron 切分）与列并行（按词表切分的）LM head（LM head 与 embedding 共享权重、或其词表行数不能被本机 TP 度整除时除外，此时它留在 rank 0 上复制），Direct CUDA 上为专家切分且 LM head 保持复制。`cuda` 与 `ggml_cuda` / `ggml_vulkan` 均可运行——GGML 路径使用打包的按 rank GDN 内核（`TSGgml_Qwen35GdnLayerTP`）并把循环状态常驻设备。[Bonsai2](docs/models/bonsai2_zh-cn.md)（带 PRISM PQ2_0 / PTQ1_0 张量的 `qwen35` 文件）例外：只支持单设备 GGML 后端，`--tp` 会被拒绝 |
 | Qwen 3.8 Flash Next | ✅（本地 FFN TP）+ 按层切分 | `ggml_cuda --tp N` 切分路由/共享 FFN，注意力/QSA/GDN/PLE 保持复制。要求合格的 CUDA MMQ 设备与受支持的 FFN 类型；UD-IQ4_XS 已在 A40 TP2/TP4 上检查，UD-Q2_K_XL 则拒绝 TP。此模式不支持 CPU 专家卸载、前缀 checkpoint 与跨节点 TP。独立的 `--layer-split N` 仍支持 GGML CUDA/Vulkan 与 direct `cuda`。实测 A40 TP2 比按层切分慢；见[验证范围、数值门限与基准](docs/models/qwen38-flash-next_zh-cn.md#多-gpu)。 |
@@ -1708,7 +1708,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | GLM 5.x | ✅（仅本地） | 仅限 GGML GPU 后端；GLM-5.2、GLM-5.3 与 GLM-5.3-Flash 的原生 TP 路径都只支持本地单进程（`--tp-node-id` / `--tp-peers` 对整个 GLM 家族都是硬拒绝）。GLM-5.2 切 MLA head 与每个路由专家内的隐藏行。GLM-5.3-Flash 还会切 KDA head 并让每个 rank 持有对应的递归状态；其 MLA head 与路由专家隐藏行同样切分。注意力局部输出会在每次非线性 Sinkhorn 超连接之前归约。在 GLM-5.3-Flash 满足条件的分段快路径上，路由 MoE 局部输出先归约，随后每个 rank 在本地计算并加入其复制的共享专家；超连接、池化 indexer、router、norm、稠密层与 embedding 也保持不切分并按 rank 执行，output norm / LM head 留在 rank 0。CPU MoE、tracing、部分 `TS_GLM_TP_SHARD` 切分、超额 rank 或缺少原生超连接内核时使用组合调度器回退，其中共享专家只在 rank 0 运行一次。GLM-5.3（非 Flash）同样以本地单进程的方式接受 `--tp N`，并在每个 rank 上复制 MLA 与 indexer cache，因此 `--tp` 会成倍放大 KV 占用；它在 `--tp N>1` 下从未被实际跑过——唯一有记录的算术是一个装不下的例子：`--tp 8` 每个 rank 需要 41.7 GiB，而卡只有 46 GB——因此它只是一个被接受的模式，而不是已验证的配置；另外在那里只要 `--tp N>1`，`--spec` 就会被拒绝。用 `--layer-split N` 选择整层放置 |
 | DeepSeek V4 Flash | 按层切分 | 不是张量并行：整模型执行器按每张卡的空闲显存把连续的整层装箱分配，`--layer-split N` 只限制这次切分用几张卡 |
 | DeepSeek V4.1 Flash | partial TP + 按层切分 | GGML CUDA 上的 `--layer-split N` 选择整层放置，`--tp N` 选择路由 MoE 切分。两种模式均可配合节点与 peer 参数跨节点运行；TP 中的注意力保持不切分。详见[多节点配置与限制](docs/multi-node-inference.md)。 |
-| Hunyuan Dense | — | 仅支持单设备；启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组。 |
+| Hunyuan Dense | ✅ + 按层切分 + 混合 | 共享解码运行时：与 Mistral 3 相同的放置方式（`--tp T`、`--layer-split P` 及两者组合），每种放置下都保持批处理。 |
 | DiffusionGemma | — | 仅支持单设备；启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组。 |
 | Wan 2.1 / 2.2、MiniMax-H3 | — | 仅支持单设备：张量并行、按层切分和分布式组均在启动时被拒绝 |
 | Qwen-Image-2.1 | ✅（仅本地，扩散 Transformer） | 在 `ggml_cuda` / `ggml_vulkan` 上，`--tp N`（N 为任何能整除 32 个注意力头的 GPU 数——单机上为 2、4、8 或 16——并受切分时的块对齐约束）切分 DiT 的注意力头与 MLP 列；LoRA 插件随之切分。在 2× A40 上用 `ggml_cuda` 实测加速 1.34-1.57×，但在 `ggml_vulkan` 上比单卡更慢（0.86×，主机归约）。文本编码器、视觉编码器与 VAE 留在第一张 GPU 上，不支持多节点组。见 [Qwen-Image-2.1 卡片](docs/models/qwenimage21_zh-cn.md#cuda-graph-与张量并行) |
@@ -1777,7 +1777,6 @@ tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6
 |---|---|
 | `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号，例如 `0,2`（默认 `0..tp-1`）。Muse Spark 与 MiniMax-M3.1 的原生 `--tp` 会拒绝它，请改用 `CUDA_VISIBLE_DEVICES` |
 | `TS_GGML_TP_PARALLEL=0` | 顺序而非并发地驱动各 rank（诊断用） |
-| `TS_GGML_TP_FUSED_MATMUL=1` | 由单个线程提交两个 rank 的线性层（默认关闭；它每次调用都要为每个 rank 分配设备缓冲，在 Qwen 3.5 35B 上实测慢 2.3×） |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | 超过该元素数量时 AllReduce 走设备集合通信（默认 262144） |
 | `TS_Q4E_LAYER_SPLIT=20,28` | 仅 Qwen 3.8 Flash Next：用显式的每卡层数取代按层切分的自动显存均衡。给出无法满足的值时直接抛错而不是静默忽略——这个开关有用，是因为自动均衡只按权重定价，看不到后加载、会落在 GPU 0 上的视觉塔 |
 | `TS_GGML_F32_RESIDENT=0` | 每次调用重新绑定 F32 线性层权重，而不是常驻设备（诊断用） |
@@ -1882,8 +1881,8 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 
 | 模型 | 默认状态 | 环境变量 | 原生内核子开关 |
 |---|---|---|---|
-| Mistral 3 | 启用 | — | — |
-| Hunyuan Dense | 启用（块量化 KV cache 保留 KV 快照路径）。仅支持单设备：启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组 | — | — |
+| Mistral 3 | 在所有本地放置方式（TP、按层切分、混合）下启用；跨节点按层切分使用串行阶段协议 | — | — |
+| Hunyuan Dense | 在所有放置方式（TP、按层切分、混合）下启用；块量化 KV cache 保留 KV 快照路径 | — | — |
 | Gemma 4 | 启用 | — | — |
 | Qwen 3.5 / 3.6 系列 | 启用 | — | — |
 | GPT OSS | 启用 | — | — |

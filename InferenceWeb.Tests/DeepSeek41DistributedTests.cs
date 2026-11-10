@@ -72,7 +72,7 @@ public sealed class DeepSeek41DistributedTests : IDisposable
     {
         ModelBase.ValidateDistributedTensorParallelism(DeepSeek41Architecture.Descriptor, BackendType.GgmlCuda);
         Assert.True(DeepSeek41Architecture.Descriptor.SupportsDistributedTensorParallel);
-        Assert.Equal(MultiGpuMode.TensorParallel, DeepSeek41Architecture.Descriptor.MultiGpu);
+        Assert.True(DeepSeek41Architecture.Descriptor.Serving.TensorParallel.IsSupportedOn(BackendType.GgmlCuda));
         ITensorParallelGroup group = null;
         Assert.Equal(1, ModelBase.ResolveTensorParallelSupport(DeepSeek41Architecture.Descriptor,
             BackendType.GgmlCuda, 1, ref group, out int split, 2));

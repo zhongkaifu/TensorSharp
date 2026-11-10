@@ -361,7 +361,7 @@ TensorSharp 支持**张量并行（TP）**——按 Megatron-LM 列/行并行范
 | GLM-5.3-Flash（`glm5next`） | 用 `--layer-split N` 显式选择本地整层放置；`--tp N` 在 GGML GPU 后端上选择原生本地张量并行 |
 | DeepSeek V4 Flash | 用 `--layer-split N` 显式选择本地整层放置；`--layer-split N` 只限制这次切分用几张卡 |
 | DeepSeek V4.1 Flash | `--layer-split N` 选择本地整层放置。GGML CUDA 上的实验性 routed-MoE TP 使用 `--tp N`；不支持注意力 TP 与分布式组。两种模式不能组合。 |
-| Hunyuan Dense（`hunyuan-dense`） | 单设备——两种模式都不支持；启动时会在 stderr 上明说 |
+| Hunyuan Dense（`hunyuan-dense`）、Mistral 3 | 共享解码运行时：在 `cuda`、`ggml_cuda`、`ggml_vulkan` 上支持 `--tp T`、`--layer-split P` 及两者组合（混合：P 个整层阶段、每段 T 张 GPU）；每种放置下并发请求都保持批处理 |
 | DiffusionGemma、LTX 2.5、Wan 2.1/2.2、MiniMax-H3 | 仅支持单设备；启动时拒绝 `--tp N > 1`、`--layer-split N > 1` 与分布式组。 |
 | Qwen 3.8 Flash Next（`qwen4exp`） | 在合格的 `ggml_cuda` 设备/量化上用 `--tp N` 开启本地 FFN TP；注意力/QSA/GDN/PLE 保持复制。用独立的 `--layer-split N` 在 GGML CUDA/Vulkan 与 direct `cuda` 上按整层放置。UD-Q2_K_XL 只能按层切分；见[验证范围与测量](docs/models/qwen38-flash-next_zh-cn.md#多-gpu) |
 
@@ -416,7 +416,7 @@ decode 是每个 token 一张持久化的单设备 GGML 图，而它的 GDN / PL
 只按权重定价，看不到稍后才加载、且会落在 GPU 0 上的视觉塔。详见
 [Qwen 3.8 Flash Next 卡片](docs/models/qwen38-flash-next_zh-cn.md)。
 
-Hunyuan Dense、DiffusionGemma、LTX 2.5、Wan 2.1/2.2 与 MiniMax-H3 仅支持单设备。
+DiffusionGemma、LTX 2.5、Wan 2.1/2.2 与 MiniMax-H3 仅支持单设备。
 不支持的多 GPU 请求会在启动时失败；`--tp` 与 `--layer-split` 都不会静默回到单卡。
 
 本地集合通信优先使用 CUDA 点对点（P2P）DMA，但启动时会对每一对支持 P2P 的设备

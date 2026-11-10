@@ -57,7 +57,31 @@ namespace TensorSharp.Models
         protected readonly Dictionary<string, QuantizedWeight> _quantWeights = new();
 
         // ---- Tensor Parallelism ----
-        protected readonly ITensorParallelGroup _tpGroup;
+        protected ITensorParallelGroup _tpGroup;
+
+        /// <summary>
+        /// Make <paramref name="group"/> the tensor-parallel group every sharding / preload
+        /// helper of this class works with until the returned scope is disposed. The shared
+        /// decoder runtime binds each pipeline stage's own group in turn, so hybrid
+        /// TP x layer-split placement reuses the same tested sharding code per stage.
+        /// </summary>
+        protected IDisposable BindTensorParallelGroup(ITensorParallelGroup group)
+        {
+            ITensorParallelGroup previous = _tpGroup;
+            _tpGroup = group;
+            return new GroupBinding(this, previous);
+        }
+
+        private sealed class GroupBinding(ModelBase model, ITensorParallelGroup previous) : IDisposable
+        {
+            private bool _done;
+            public void Dispose()
+            {
+                if (_done) return;
+                _done = true;
+                model._tpGroup = previous;
+            }
+        }
         /// <summary>Whole-layer transport, separate from tensor-parallel sharding.</summary>
         protected ILayerSplitGroup LayerSplitGroup { get; }
         private ITensorParallelGroup DistributedControlGroup => (ITensorParallelGroup)LayerSplitGroup ?? _tpGroup;
@@ -3580,6 +3604,7 @@ namespace TensorSharp.Models
 
             tpDegree = ResolveTensorParallelSupport(architecture, backend, tpDegree, ref tpGroup,
                 out int layerSplit, layerSplitDegree);
+            ValidateExpertOffloadRequest(architecture, backend, tpGroup?.Degree ?? tpDegree, probe);
             // Direct executors enumerate physical shards themselves and need the
             // canonical first path just as the metadata probe does.
             var context = new ModelCreateContext(probe.FilePaths[0], backend, probe, tpDegree, tpGroup, draftModelPath, layerSplit);
@@ -3612,7 +3637,7 @@ namespace TensorSharp.Models
         internal static void ValidateDistributedTensorParallelism(ModelArchitectureDescriptor architecture, BackendType backend)
         {
             ArgumentNullException.ThrowIfNull(architecture);
-            if (architecture.MultiGpu != MultiGpuMode.TensorParallel || !architecture.SupportsDistributedTensorParallel)
+            if (architecture.Serving.TensorParallel.Backends.Count == 0 || !architecture.SupportsDistributedTensorParallel)
                 throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement distributed tensor parallelism. " +
                     "Remove --tp-node-id/--tp-peers; its native or single-device executor cannot consume cross-node collectives.");
             if (backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
@@ -3624,20 +3649,9 @@ namespace TensorSharp.Models
 
         /// <summary>The <c>--backend</c> spelling of <paramref name="backend"/>, which is what an
         /// operator has to type to act on a refusal (the enum name GgmlCuda is not accepted).</summary>
-        private static string BackendOptionName(BackendType backend) => backend switch
-        {
-            BackendType.Cpu => "cpu",
-            BackendType.Cuda => "cuda",
-            BackendType.Mlx => "mlx",
-            BackendType.GgmlCpu => "ggml_cpu",
-            BackendType.GgmlMetal => "ggml_metal",
-            BackendType.GgmlCuda => "ggml_cuda",
-            BackendType.GgmlVulkan => "ggml_vulkan",
-            _ => backend.ToString(),
-        };
+        private static string BackendOptionName(BackendType backend) => BackendNames.OptionName(backend);
 
-        private static string DescribeBackendOptions(IEnumerable<BackendType> backends)
-            => string.Join(", ", backends.Select(b => "--backend " + BackendOptionName(b)));
+        private static string DescribeBackendOptions(IEnumerable<BackendType> backends) => BackendNames.Describe(backends);
 
         /// <summary>Reject unavailable stage executors before allocating GPUs or connecting peers.</summary>
         public static void ValidateDistributedLayerSplit(string ggufPath, BackendType backend)
@@ -3661,11 +3675,14 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Decide whether the requested tensor-parallel degree can actually be
-        /// honoured for <paramref name="architecture"/>. Tensor parallelism and layer
-        /// placement are independent, explicit requests; neither can fall back to the
-        /// other or to one GPU. Validate before applying native settings or loading weights.
+        /// Decide whether the requested placement can be honoured for <paramref name="architecture"/>,
+        /// from its <see cref="ModelArchitectureDescriptor.Serving"/> contract alone. Tensor parallelism
+        /// (<c>--tp T</c>) and whole-layer placement (<c>--layer-split P</c>) are the two dimensions of one
+        /// topology: either alone, or both at once (P stages of T devices) where the contract declares
+        /// <see cref="ServingMechanism.HybridParallel"/>. No request falls back to a different mode or to
+        /// one GPU. Validate before applying native settings or loading weights.
         /// </summary>
+        /// <returns>The tensor-parallel degree to build with (1 for a pure layer split).</returns>
         internal static int ResolveTensorParallelSupport(ModelArchitectureDescriptor architecture,
             BackendType backend, int tpDegree, ref ITensorParallelGroup tpGroup, out int layerSplitDegree,
             int requestedLayerSplitDegree = 1)
@@ -3677,7 +3694,7 @@ namespace TensorSharp.Models
             if (tpGroup is ILayerSplitGroup layers)
             {
                 if (tpDegree > 1)
-                    throw new ArgumentException("--layer-split and --tp select different execution modes and cannot be combined.");
+                    throw new ArgumentException("A distributed --layer-split group cannot also run --tp; hybrid placement runs in one process.");
                 ValidateDistributedLayerSplit(architecture, backend);
                 if (requestedLayerSplitDegree > 1 && requestedLayerSplitDegree != layers.Degree)
                     throw new ArgumentException("The layer-split degree must match the local device group.");
@@ -3689,33 +3706,99 @@ namespace TensorSharp.Models
                 ValidateDistributedTensorParallelism(architecture, backend);
             layerSplitDegree = requestedLayerSplitDegree;
             bool wantsTp = tpDegree > 1 || tpGroup != null;
-            if (requestedLayerSplitDegree > 1)
+            bool wantsLayerSplit = requestedLayerSplitDegree > 1;
+            int localTp = tpGroup?.Degree ?? tpDegree;
+
+            if (wantsTp && wantsLayerSplit)
+            {
+                if (tpGroup != null)
+                    throw new NotSupportedException(
+                        "--tp with --layer-split builds its own per-stage device groups in one process; it cannot use a supplied or distributed group.");
+                RequireMechanism(architecture, ServingMechanism.HybridParallel, backend, tpDegree,
+                    flag: $"--tp {tpDegree} with --layer-split {requestedLayerSplitDegree}");
+                Console.WriteLine($"  Hybrid placement: {requestedLayerSplitDegree} whole-layer stages x tensor parallel {tpDegree} " +
+                    $"= {requestedLayerSplitDegree * tpDegree} GPUs; each stage reduces within its own {tpDegree} GPUs.");
+                return tpDegree;
+            }
+            if (wantsLayerSplit)
             {
                 if (tpGroup != null)
                     throw new NotSupportedException("--layer-split requires a layer-split group; a tensor-parallel group cannot execute whole-layer stages.");
-                if (wantsTp)
-                    throw new ArgumentException("--layer-split and --tp select different execution modes and cannot be combined.");
-                if (architecture.MultiGpu != MultiGpuMode.LayerSplit && !architecture.SupportsLayerSplit)
-                    throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement --layer-split. " +
-                        (architecture.MultiGpu == MultiGpuMode.TensorParallel
-                            ? "Use --tp for tensor parallelism." : architecture.MultiGpuLimitation));
-                if (!architecture.LayerSplitBackends.Contains(backend))
-                    throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement --layer-split on {backend}.");
+                RequireMechanism(architecture, ServingMechanism.LayerSplit, backend, requestedLayerSplitDegree,
+                    flag: $"--layer-split {requestedLayerSplitDegree}");
                 Console.WriteLine(architecture.DescribeMultiGpuPlacement?.Invoke(requestedLayerSplitDegree) ??
                     $"  Layer split: {requestedLayerSplitDegree} GPUs hold contiguous runs of whole layers; no tensor-parallel collectives.");
                 return 1;
             }
             if (!wantsTp) return tpDegree;
-            if (architecture.MultiGpu != MultiGpuMode.TensorParallel &&
-                architecture.SupportsNativeTensorParallel?.Invoke(tpDegree, backend) != true)
-                throw new NotSupportedException($"--tp {tpDegree} requests tensor parallelism. " +
-                    architecture.MultiGpuLimitation +
-                    (architecture.MultiGpu == MultiGpuMode.LayerSplit ? " Use --layer-split N for whole-layer placement." : "") +
-                    (tpGroup != null ? " Distributed --tp-node-id/--tp-peers cannot be used with this architecture." : ""));
-            if (backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan) &&
-                architecture.SupportsNativeTensorParallel?.Invoke(tpDegree, backend) != true)
-                throw new NotSupportedException($"--tp requires a multi-device GPU backend; {backend} cannot honor this request.");
+            // Preconditions see the devices THIS process drives (an executor's per-process
+            // limit); the message names the degree the operator asked for.
+            RequireMechanism(architecture, ServingMechanism.TensorParallel, backend, localTp,
+                distributed: tpGroup != null, flag: $"--tp {tpGroup?.GlobalDegree ?? tpDegree}");
             return tpDegree;
+        }
+
+        /// <summary>The operator flag that requests <paramref name="mechanism"/>, for refusals.</summary>
+        private static string FlagFor(ServingMechanism mechanism) => mechanism switch
+        {
+            ServingMechanism.TensorParallel => "--tp",
+            ServingMechanism.LayerSplit => "--layer-split",
+            ServingMechanism.HybridParallel => "--tp with --layer-split",
+            ServingMechanism.ExpertOffload => "--n-cpu-moe / --cpu-moe",
+            _ => mechanism.ToString(),
+        };
+
+        /// <summary>
+        /// Refuse <paramref name="mechanism"/> on <paramref name="backend"/> unless the architecture's
+        /// serving contract declares it there, naming the family's own reason. A single-device backend
+        /// is refused for every family alike (unless the family declares it as its fixture loopback).
+        /// </summary>
+        internal static void RequireMechanism(ModelArchitectureDescriptor architecture, ServingMechanism mechanism,
+            BackendType backend, int degree, bool distributed = false, string flag = null)
+        {
+            MechanismSupport support = architecture.Serving[mechanism];
+            flag ??= FlagFor(mechanism);
+            string suffix = distributed ? " Distributed --tp-node-id/--tp-peers cannot be used with this architecture." : "";
+            if (support.Kind == SupportKind.NotApplicable)
+                throw new NotSupportedException($"Architecture '{architecture.Id}' does not support {flag}: {support.Reason}.{suffix}");
+            if (support.Backends.Count == 0 && !support.IsLoopback(backend))
+                throw new NotSupportedException($"Architecture '{architecture.Id}' cannot honour {flag}: {support.GapReason}{suffix}");
+            if (!support.IsSupportedOn(backend))
+            {
+                if (ServingContract.IsPlacement(mechanism) && !ServingContract.MultiDeviceBackends.Contains(backend))
+                    throw new NotSupportedException($"{flag} requires a multi-device GPU backend; {backend} cannot honor this request. " +
+                        $"Architecture '{architecture.Id}' implements it on {DescribeBackendOptions(support.Backends)}.");
+                throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement {flag} on --backend " +
+                    $"{BackendOptionName(backend)}. {support.GapReason} It is implemented on {DescribeBackendOptions(support.Backends)}.{suffix}");
+            }
+            string refusal = support.Precondition?.Invoke(degree, backend);
+            if (refusal != null)
+                throw new NotSupportedException(refusal);
+        }
+
+        /// <summary>
+        /// Refuse an expert-offload request (<c>--n-cpu-moe</c> / <c>--cpu-moe</c>) the loaded family
+        /// cannot honour on <paramref name="backend"/>, instead of loading with every expert resident
+        /// while the option claims otherwise. A dense family ignores the option with one notice: its
+        /// checkpoints have no routed experts, so nothing is placed differently either way.
+        /// </summary>
+        internal static void ValidateExpertOffloadRequest(ModelArchitectureDescriptor architecture, BackendType backend,
+            int tpDegree, GgufFile checkpoint = null)
+        {
+            if (!MoeCpuOffloadConfig.IsEnabled) return;
+            string inert = architecture.Serving.ExpertOffload.Kind == SupportKind.NotApplicable
+                ? architecture.Serving.ExpertOffload.Reason
+                : checkpoint != null && !checkpoint.Tensors.Keys.Any(MoeCpuOffloadConfig.IsRoutedExpertWeightName)
+                    ? "this checkpoint is dense (no routed-expert tensors)"
+                    : ServingContract.HostBackends.Contains(backend) && !architecture.Serving.ExpertOffload.IsSupportedOn(backend)
+                        ? $"--backend {BackendOptionName(backend)} already keeps every expert in host memory"
+                        : null;
+            if (inert != null)
+            {
+                Console.Error.WriteLine($"Note: {FlagFor(ServingMechanism.ExpertOffload)} has no effect on '{architecture.Id}': {inert}.");
+                return;
+            }
+            RequireMechanism(architecture, ServingMechanism.ExpertOffload, backend, tpDegree);
         }
 
         /// <summary>

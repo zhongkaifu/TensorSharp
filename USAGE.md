@@ -1931,7 +1931,7 @@ must be reachable between all nodes.
 
 | Architecture | TP status | Notes |
 |---|---|---|
-| Mistral 3 | ✅ | Fused/separate QKV, YaRN RoPE |
+| Mistral 3 | ✅ + layer split + hybrid | Shared decoder runtime: `--tp T`, `--layer-split P` (local, or multi-node on GGML CUDA/Vulkan) and both together (`--tp T --layer-split P`, P stages of T GPUs each) on `cuda`, `ggml_cuda` and `ggml_vulkan`; concurrent requests stay batched in every placement. See [unified execution](docs/design/unified-execution.md) |
 | Gemma 4 | ✅ | Dense TP + MoE. On GGML the fused whole-model MoE trunk splits *inside* each expert (gate/up column-parallel, down row-parallel) so global expert ids keep working; `TS_GEMMA4_TP_FUSED_MOE=0` falls back to the whole-expert per-op path. Per-expert slicing on direct CUDA |
 | Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership; expert-parallel MoE on GGML (whole experts per rank, Megatron-split shared expert) with a column-parallel (vocabulary-sharded) LM head unless the head is tied to the embedding or its vocabulary rows do not divide by the local TP degree (it then stays replicated on rank 0), expert slicing and a replicated LM head on direct CUDA. Runs on both `cuda` and `ggml_cuda` / `ggml_vulkan` — the GGML path uses the packed per-rank GDN kernel (`TSGgml_Qwen35GdnLayerTP`) with device-resident recurrent state. [Bonsai2](docs/models/bonsai2.md) (`qwen35` files with PRISM PQ2_0 / PTQ1_0 tensors) is the exception: single-device GGML backends only, so `--tp` is refused |
 | Qwen 3.8 Flash Next | ✅ (local FFN TP) + layer split | `ggml_cuda --tp N` partitions routed/shared FFNs while attention/QSA/GDN/PLE remain replicated. Requires qualified CUDA MMQ devices and supported FFN types; UD-IQ4_XS was checked on A40 TP2/TP4, but UD-Q2_K_XL is refused for TP. CPU expert offload, prefix checkpoints and distributed TP are unsupported in this mode. `--layer-split N` remains available on GGML CUDA/Vulkan and direct `cuda`. Measured A40 TP2 was slower than layer split; see [qualification, numerical gates and benchmarks](docs/models/qwen38-flash-next.md#multi-gpu). |
@@ -1943,7 +1943,7 @@ must be reachable between all nodes.
 | GLM 5.x | ✅ (local only) | GGML GPU backends only; the native TP path is local/single-process for GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike (`--tp-node-id` / `--tp-peers` are hard-refused for the whole family). GLM-5.2 shards MLA heads and hidden rows inside every routed expert. GLM-5.3-Flash also head-shards KDA with per-rank recurrent state; its MLA heads and routed-expert hidden rows are sharded likewise. Attention partials reduce before each nonlinear Sinkhorn hyper-connection. On GLM-5.3-Flash's eligible segmented fast path, routed-MoE partials reduce first, then each rank computes/adds the replicated shared expert locally; hyper-connections, pooled indexer, router, norms, dense layers and embedding also remain unsharded and execute per rank, while output norm / LM head stay on rank 0. CPU MoE, tracing, partial `TS_GLM_TP_SHARD`, oversubscription, or missing native hyper-connection kernels use the combined scheduler fallback, where the shared expert runs once on rank 0. Plain GLM-5.3 accepts `--tp N` on the same local terms and replicates the MLA and indexer caches on every rank, so `--tp` multiplies the KV footprint; nothing has ever been run on it at `--tp N>1` — the only recorded arithmetic is a non-fit, `--tp 8` wanting 41.7 GiB per rank against 46 GB cards — so treat it as an accepted mode rather than a validated configuration, and note that `--spec` is refused there whenever `--tp N>1`. Use `--layer-split N` for whole-layer placement |
 | DeepSeek V4 Flash | layer split | Not tensor parallelism: the whole-model executors bin-pack contiguous runs of whole layers against each device's free VRAM, and `--layer-split N` only caps how many GPUs that split uses |
 | DeepSeek V4.1 Flash | partial TP + layer split | On GGML CUDA, `--layer-split N` selects whole-layer placement and `--tp N` selects routed-MoE sharding. Both can span nodes through the shared peer options. Attention remains unsharded in TP. See [multi-node setup and limits](docs/multi-node-inference.md). |
-| Hunyuan Dense | — | Single device; `--tp N > 1`, `--layer-split N > 1`, and distributed groups are refused at startup. |
+| Hunyuan Dense | ✅ + layer split + hybrid | Shared decoder runtime: the same placements as Mistral 3 (`--tp T`, `--layer-split P`, both together), with batched serving in each. |
 | DiffusionGemma | — | Single device; `--tp N > 1`, `--layer-split N > 1`, and distributed groups are refused at startup. |
 | Wan 2.1 / 2.2, MiniMax-H3 | — | Single device; `--tp N > 1`, `--layer-split N > 1`, and distributed groups are refused at startup. |
 | Qwen-Image-2.1 | ✅ (local only, diffusion transformer) | `--tp N` (any GPU count that divides the 32 attention heads — 2, 4, 8 or 16 on one machine — subject to block alignment when the weights are sharded) on `ggml_cuda` / `ggml_vulkan` shards the DiT's attention heads and MLP columns; LoRA plug-ins are sharded with it. Measured 1.34-1.57× on 2× A40 with `ggml_cuda`, but slower than one GPU on `ggml_vulkan` (0.86×, host reduction). The text encoder, vision encoder and VAE stay on the first GPU, and multi-node groups are refused. See the [Qwen-Image-2.1 card](docs/models/qwenimage21.md#cuda-graphs-and-tensor-parallelism) |
@@ -2024,7 +2024,6 @@ for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP.
 |---|---|
 | `TENSORSHARP_TP_DEVICES` | GPU ordinals per rank, e.g. `0,2` (default `0..tp-1`). Muse Spark's and MiniMax-M3.1's native `--tp` refuse it; use `CUDA_VISIBLE_DEVICES` there |
 | `TS_GGML_TP_PARALLEL=0` | Drive ranks sequentially instead of concurrently (diagnostic) |
-| `TS_GGML_TP_FUSED_MATMUL=1` | Submit both ranks' linears from one thread (off by default; it allocates a device buffer per rank per call, measured 2.3× slower on Qwen 3.5 35B) |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective (default 262144) |
 | `TS_Q4E_LAYER_SPLIT=20,28` | Qwen 3.8 Flash Next only: explicit layer counts per GPU for its layer split, instead of the automatic VRAM balance. Throws rather than silently ignoring a value it cannot honour — useful because the automatic balance prices weights and cannot see the vision tower, which loads later and lands on GPU 0 |
 | `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of keeping them device-resident (diagnostic) |
@@ -2147,8 +2146,8 @@ continues to measure its direct backend decode paths, including MLX pipelining.
 
 | Model | Default state | Env vars | Native-kernel sub-toggle |
 |---|---|---|---|
-| Mistral 3 | ON | — | — |
-| Hunyuan Dense | ON (a block-quantized KV cache keeps the K/V snapshot path). Single device: `--tp N > 1`, `--layer-split N > 1` and distributed groups are refused at startup | — | — |
+| Mistral 3 | ON in every local placement (TP, layer split, hybrid); a multi-node layer split uses the serialized stage protocol | — | — |
+| Hunyuan Dense | ON in every placement (TP, layer split, hybrid); a block-quantized KV cache keeps the K/V snapshot path | — | — |
 | Gemma 4 | ON | — | — |
 | Qwen 3.5 / 3.6 family | ON | — | — |
 | GPT OSS | ON | — | — |
@@ -2293,7 +2292,7 @@ Every `TS_MINIMAX_M3_*` variable, with its default, is in the
 | MLX batched MoE decode (Qwen 3.5/3.6 MoE) | ON | `TS_MLX_BATCHED_MOE_DECODE=0` runs the per-expert path (no stacked copy) | — |
 | MLX fused MoE gate+up+SiLUMul Metal kernel | ON | — | — |
 | MLX on-device MoE router top-K + softmax | ON when prerequisites are met | — | — |
-| MLX layer-boundary `async_eval` cadence | Gemma 4 / Muse-Glimmer: every 4 layers; Qwen / Nemotron: every 16 layers | `TS_MLX_EVAL_EVERY_N_LAYERS=N` (`0` = disabled where supported) | — |
+| MLX layer-boundary `async_eval` cadence | Gemma 4 / Muse-Glimmer: every 4 layers; Qwen / Nemotron / shared-decoder-runtime families: every 16 layers | `TS_MLX_EVAL_EVERY_N_LAYERS=N` (`0` = disabled where supported) | — |
 | MLX allocator caps (memory / cache / wired buffer) | host-derived | `TS_MLX_MEMORY_LIMIT_MB`, `TS_MLX_CACHE_LIMIT_MB`, `TS_MLX_WIRED_LIMIT_MB` | — |
 
 #### Pure C# CPU backend (`--backend cpu`)

@@ -40,8 +40,9 @@ public sealed class SingleDeviceArchitectureGateTests
     public void FamilyWithoutMultiGpuPath_IsDeclaredSingleDevice(string id)
     {
         var arch = Arch(id);
-        Assert.Equal(MultiGpuMode.SingleDevice, arch.MultiGpu);
-        Assert.Contains(id, arch.MultiGpuLimitation, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(arch.Serving.TensorParallel.Backends);
+        Assert.Empty(arch.Serving.LayerSplit.Backends);
+        Assert.Contains(id, arch.Serving.TensorParallel.GapReason, StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]

@@ -20,6 +20,18 @@ namespace TensorSharp.Models.QwenImage
             // --tp shards the diffusion transformer (heads and MLP columns per GPU);
             // the text encoder and VAE stay on the first GPU.
             Factory = c => new QwenImageModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
+            Serving = new ServingContract
+            {
+                Implementation = ServingImplementation.Bespoke,
+                Backends = new[] { BackendType.Cpu, BackendType.GgmlCpu, BackendType.GgmlMetal, BackendType.GgmlCuda, BackendType.GgmlVulkan },
+                Autoregressive = false,
+                HasRoutedExperts = false,
+                ContinuousBatching = MechanismSupport.NotApplicable("generates media, not decode steps; requests are serialized by its pipeline"),
+                TensorParallel = MechanismSupport.On(ServingBackends.GgmlMultiDevice),
+                LayerSplit = MechanismSupport.None("qwen-image has no layer-split path; it runs on one GPU and extra GPUs stay idle."),
+                HybridParallel = MechanismSupport.None("qwen-image has no multi-GPU placement to combine."),
+                ExpertOffload = MechanismSupport.NotApplicable("no routed experts"),
+            },
             SupportsDistributedTensorParallel = false,
             DetectFromTensors = LooksLikeVersion21,
             LoraPluginType = LoraCliFlags.QwenImagePluginType,

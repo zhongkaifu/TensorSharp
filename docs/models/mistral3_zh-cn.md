@@ -6,7 +6,7 @@
 |---|---|
 | 提供方 | Mistral AI |
 | GGUF 架构标识 | `mistral3`；以及 llama.cpp 尚无 `mistral3` 时转换的 Mistral Small 3.x 文件所用的 `llama`（见[标记为 llama 的文件](#标记为-llama-的文件)） |
-| 模型类 | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs)（旧单序列路径）+ [`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs)（`IBatchedPagedModel`） |
+| 模型类 | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs)（YaRN 旋转、视觉）建立在共享解码运行时 [`StandardDecoderModel`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.cs) 之上（前向、`IBatchedPagedModel`、TP / 按层切分 / 混合） |
 | 视觉编码器 | [`Mistral3VisionEncoder`](../../TensorSharp.Models/Models/Mistral3/Mistral3VisionEncoder.cs)（Pixtral） |
 | 图像处理器 | [`Mistral3ImageProcessor`](../../TensorSharp.Models/Models/Mistral3/Mistral3ImageProcessor.cs) |
 | 示例模型 | Mistral-Small-3.1-24B-Instruct、Ministral-3-14B-Instruct |
@@ -367,7 +367,7 @@ Mistral 3 没有分块 prefill（只有全因果 attention，没有 SWA），没
 ## 11. 批处理 / 分页前向（连续批处理）
 
 Mistral 3 是 TensorSharp 中 `IBatchedPagedModel.ForwardBatch` 的**参考实现**
-（[`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs)），
+（现由共享解码运行时提供：[`StandardDecoderModel.Batched.cs`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.Batched.cs)），
 通过 [`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)
 中描述的共享连续批处理栈（`InferenceEngine` + `ContinuousBatchScheduler` +
 `BatchExecutor`）执行。

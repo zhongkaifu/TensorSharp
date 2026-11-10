@@ -68,6 +68,7 @@ public sealed class DistributedServerLoadTests : IDisposable
             Aliases = [architecture],
             ApplyNativeTunables = context => { observed = context; throw stop; },
             Factory = _ => throw new InvalidOperationException("must not construct a native model"),
+            Serving = ServingContract.SharedRuntime(hasRoutedExperts: false),
         });
         SyntheticGguf.Write(_path, [new SyntheticGguf.Str { Key = "general.architecture", V = architecture }], []);
         var group = new DegreeProbeGroup();
@@ -96,7 +97,7 @@ public sealed class DistributedServerLoadTests : IDisposable
         {
             Id = architecture,
             Aliases = [architecture],
-            SupportsLayerSplit = true,
+            Serving = ServingContract.SharedRuntime(hasRoutedExperts: false),
             SupportsDistributedLayerSplit = true,
             ApplyNativeTunables = context => { observed = context; throw stop; },
             Factory = _ => throw new InvalidOperationException("must not construct"),

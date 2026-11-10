@@ -25,7 +25,8 @@ using TensorSharp.GGML;
 using TensorSharp.MLX;
 
 namespace TensorSharp.Models
-{
+{
+
     // Tensor-parallel weight sharding and the collectives the sharded layers issue.
     // Split out of ModelBase.cs: it is one self-contained concern, it only runs when a
     // TP group is live, and it was a third of the file.
@@ -704,20 +705,6 @@ namespace TensorSharp.Models
             if (_tpQuantWeights.TryGetValue(weightName, out var qShards))
             {
                 int seqLen = (int)input.Sizes[0];
-                // Column-parallel: every rank reads the same replicated
-                // activation straight out of host memory, so one shared input
-                // tensor covers all of them.
-                var sharedInputs = new Tensor[tp];
-                for (int r = 0; r < tp; r++) sharedInputs[r] = input;
-                if (TryTpFusedQuantLinear(sharedInputs, qShards, results, seqLen, allReduce: false))
-                {
-                    // The fused multi-rank linear returns here without touching the
-                    // method's normal exit, so it needs the scale applied too.
-                    TpApplyNamedWeightScale(results, weightName);
-                    _linearTicks += Stopwatch.GetTimestamp() - t0;
-                    return results;
-                }
-
                 _tpGroup.RunPerRank(r =>
                 {
                     var qw = qShards[r];
@@ -760,88 +747,6 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// GGML fast path for a tensor-parallel quantized linear: hand all ranks
-        /// to the native bridge in one call so the per-rank matmuls are submitted
-        /// as concurrent device graphs (and, for a row-parallel layer, reduced
-        /// on-device before they come back). Returns false on other backends, or
-        /// when the shapes don't fit the fused entry point, so the caller can use
-        /// the generic per-rank loop.
-        /// </summary>
-        /// <summary>
-        /// The fused multi-rank linear is OFF by default; set
-        /// TS_GGML_TP_FUSED_MATMUL=1 to use it.
-        ///
-        /// It submits both ranks' graphs from one thread without a hand-off,
-        /// which sounds like the faster shape, but it has to allocate a fresh
-        /// backend buffer per rank per call: its graphs run asynchronously, so it
-        /// cannot use the shared per-rank compute buffer the way the ordinary
-        /// per-op path does. On CUDA that is a cudaMalloc/cudaFree pair per rank
-        /// per linear, and on a nearly-full card the cost dwarfs the hand-off it
-        /// saves. Measured on Qwen3.5-35B-A3B, --tp 2, ggml_cuda: decode 8.7 →
-        /// 20.1 tok/s and the LM head 44 → 1.6 ms/token with it disabled.
-        ///
-        /// The generic path is not serial either — <c>RunPerRank</c> fans the
-        /// ranks out across worker threads — so what is given up is the in-call
-        /// device AllReduce, which <c>ITensorParallelGroup.AllReduce</c> does
-        /// anyway.
-        /// </summary>
-        private static readonly bool TpFusedMatmulEnabled =
-            string.Equals(Environment.GetEnvironmentVariable("TS_GGML_TP_FUSED_MATMUL"), "1", StringComparison.Ordinal);
-
-        private bool TryTpFusedQuantLinear(Tensor[] inputs, QuantizedWeight[] shards, Tensor[] results, int seqLen, bool allReduce)
-        {
-            // The fused entry point exists to overlap several local GPUs. With a
-            // single local rank — the multi-node layout, one GPU per node — there
-            // is nothing to overlap, and it is not the validated configuration:
-            // it was measured to produce wrong results there, while the generic
-            // per-rank path is correct. Require a genuine multi-GPU group.
-            if (!TpFusedMatmulEnabled || !IsGgmlBackend || _ggmlContext == null ||
-                TpDegree < 2 || _ggmlContext.Degree != TpDegree)
-                return false;
-
-            int tp = TpDegree;
-            for (int r = 0; r < tp; r++)
-            {
-                if (!shards[r].HasHostData)
-                    return false;
-            }
-
-            var data = new IntPtr[tp];
-            var types = new int[tp];
-            var ne0 = new long[tp];
-            var ne1 = new long[tp];
-            var raw = new long[tp];
-
-            for (int r = 0; r < tp; r++)
-            {
-                var qw = shards[r];
-                results[r] = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, seqLen, (int)qw.Ne1);
-                // CacheKey identifies the rank-resident device copy created by
-                // PrepareGgmlQuantizedWeightsForInferenceTP; Data would miss it.
-                data[r] = qw.CacheKey;
-                types[r] = qw.GgmlType;
-                ne0[r] = qw.Ne0;
-                ne1[r] = qw.Ne1;
-                raw[r] = qw.RawBytes;
-            }
-
-            try
-            {
-                GgmlBasicOps.TensorParallelMatmul(results, inputs, data, types, ne0, ne1, raw, allReduce);
-                return true;
-            }
-            catch (NotSupportedException)
-            {
-                for (int r = 0; r < tp; r++)
-                {
-                    results[r]?.Dispose();
-                    results[r] = null;
-                }
-                return false;
-            }
-        }
-
-        /// <summary>
         /// Row-parallel linear forward: each GPU computes a partial result using
         /// its weight shard, then AllReduce sums the partials. Returns the
         /// reduced result (replicated on all GPUs); the caller typically uses
@@ -856,17 +761,6 @@ namespace TensorSharp.Models
             if (_tpQuantWeights.TryGetValue(weightName, out var qShards))
             {
                 int seqLen = (int)inputs[0].Sizes[0];
-                if (TryTpFusedQuantLinear(inputs, qShards, partials, seqLen, allReduce: true))
-                {
-                    // The fused multi-rank linear returns here without touching the
-                    // method's normal exit, so it needs the scale applied too.
-                    TpApplyNamedWeightScale(partials, weightName);
-                    _linearTicks += Stopwatch.GetTimestamp() - t0;
-                    for (int r = 1; r < tp; r++)
-                        partials[r].Dispose();
-                    return partials[0];
-                }
-
                 _tpGroup.RunPerRank(r =>
                 {
                     var qw = qShards[r];
@@ -932,15 +826,6 @@ namespace TensorSharp.Models
             if (_tpQuantWeights.TryGetValue(weightName, out var qShards))
             {
                 int seqLen = (int)inputs[0].Sizes[0];
-                if (TryTpFusedQuantLinear(inputs, qShards, partials, seqLen, allReduce: true))
-                {
-                    // The fused multi-rank linear returns here without touching the
-                    // method's normal exit, so it needs the scale applied too.
-                    TpApplyNamedWeightScale(partials, weightName);
-                    _linearTicks += Stopwatch.GetTimestamp() - t0;
-                    return partials;
-                }
-
                 _tpGroup.RunPerRank(r =>
                 {
                     var qw = qShards[r];
@@ -1528,6 +1413,7 @@ namespace TensorSharp.Models
             }
         }
 
-        #endregion
+        #endregion
+
     }
 }

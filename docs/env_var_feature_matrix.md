@@ -188,7 +188,7 @@ catalog entry or the user's setting. The iOS app (`TensorAgent.Maui`) also defau
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `TS_PREFILL_CHUNK` | swept on GPT OSS, Qwen 3.5 / 3.6 family long-context features; honored at runtime by Gemma 4, Nemotron-H, and Mistral 3 as well | Chunked prefill block size | architecture default | `256`, `512`, `1024` | yes |
+| `TS_PREFILL_CHUNK` | swept on GPT OSS, Qwen 3.5 / 3.6 family long-context features; honored at runtime by Gemma 4, Nemotron-H and every shared-decoder-runtime family (Mistral 3, Hunyuan Dense) as well | Chunked prefill block size | architecture default | `256`, `512`, `1024` | yes |
 | `TS_GGML_ASYNC_COMPUTE` | GGML backends | Async compute submission | ON on `ggml_metal` (`0` disables), OFF on other GGML backends | `0`, `1` | yes |
 
 ## Multimodal
@@ -582,7 +582,7 @@ Vulkan backends (`ggml_cuda`, `ggml_vulkan`). `TENSORSHARP_TP_DEGREE`,
 | `TENSORSHARP_TP_DISABLE_P2P` | local TP, `cuda` backend | `1` forces every cross-GPU transfer through host staging instead of CUDA peer-to-peer DMA (matches no-peer hardware such as A16 vGPU profiles) | off (P2P used when the pair passes the DMA self-test) | not registered | no |
 | `TENSORSHARP_TP_HOST_ALLREDUCE` | local TP, `cuda` backend | `1` runs the local AllReduce through host memory (device→host, sum, host→device) instead of the device-to-device path — diagnostic fallback | off (device-to-device) | not registered | no |
 | `TS_GGML_TP_PARALLEL` | local TP, GGML backends | `0` drives the ranks sequentially instead of concurrently (diagnostic) | on (concurrent rank workers) | not registered | no |
-| `TS_GGML_TP_FUSED_MATMUL` | local TP, GGML backends | `1` submits both ranks' linears from one thread; allocates a device buffer per rank per call and measured 2.3× slower on Qwen 3.5 35B | off (generic per-rank path) | not registered | no |
+| `TS_GGML_TP_FUSED_MATMUL` | removed | Was `1` = submit both ranks' linears from one thread (never the default; measured 2.3× slower on Qwen 3.5 35B). Setting it now stops the host with advice | — | removed (hard error) | no |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | local TP, GGML backends | Element count above which AllReduce uses the device collective instead of the host reduction | `262144` | not registered | no |
 | `TS_GGML_F32_RESIDENT` | GGML backends | `0` binds F32 linear weights per call instead of keeping them device-resident (diagnostic) | on (device-resident) | not registered | no |
 | `TS_GEMMA4_TP_FUSED_MOE` | Gemma 4 MoE under TP on GGML | `0` falls back from the fused whole-model MoE trunk (Megatron split inside each expert) to the whole-expert per-op path | on (fused trunk) | not registered | no |

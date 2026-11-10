@@ -93,9 +93,9 @@ public class DeepSeek41ArchitectureTests : IDisposable
         Assert.True(ModelArchitectureRegistry.TryGet("deepseek41", out var v41));
         Assert.True(ModelArchitectureRegistry.TryGet("deepseek4", out var v4));
         Assert.NotSame(v4, v41);
-        Assert.Equal(MultiGpuMode.TensorParallel, v41.MultiGpu);
-        Assert.True(v41.SupportsLayerSplit);
-        Assert.Contains("attention", v41.MultiGpuLimitation);
+        Assert.True(v41.Serving.TensorParallel.IsSupportedOn(BackendType.GgmlCuda));
+        Assert.True(v41.Serving.LayerSplit.IsSupportedOn(BackendType.GgmlCuda));
+        Assert.Empty(v41.Serving.HybridParallel.Backends);
         TensorSharp.ITensorParallelGroup group = null;
         Assert.Equal(1, ModelBase.ResolveTensorParallelSupport(v41, BackendType.GgmlCuda, 1, ref group, out int split, 4));
         Assert.Equal(4, split);
@@ -477,7 +477,9 @@ public class DeepSeek41ArchitectureTests : IDisposable
     public void ExplicitTensorParallelDegreeReachesTheLoader(int degree)
     {
         Assert.Equal(degree, DeepSeek41Architecture.ResolveTensorParallelRanks(degree));
-        Assert.True(DeepSeek41Architecture.Descriptor.SupportsNativeTensorParallel(degree, BackendType.GgmlCuda));
+        Assert.True(DeepSeek41Architecture.Descriptor.Serving.TensorParallel.IsSupportedOn(BackendType.GgmlCuda));
+        Assert.Null(DeepSeek41Architecture.Descriptor.Serving.TensorParallel.Precondition(degree, BackendType.GgmlCuda));
+        Assert.NotNull(DeepSeek41Architecture.Descriptor.Serving.TensorParallel.Precondition(9, BackendType.GgmlCuda));
         DeepSeek41Architecture.ValidateLoad("not-opened.gguf", BackendType.GgmlCuda, null, tpDegree: degree);
     }
 
@@ -489,7 +491,7 @@ public class DeepSeek41ArchitectureTests : IDisposable
     [InlineData(BackendType.GgmlMetal)]
     public void ExplicitTensorParallelDegreeRefusesUnsupportedBackendsBeforeOpeningWeights(BackendType backend)
     {
-        Assert.False(DeepSeek41Architecture.Descriptor.SupportsNativeTensorParallel(6, backend));
+        Assert.False(DeepSeek41Architecture.Descriptor.Serving.TensorParallel.IsSupportedOn(backend));
         Assert.Throws<NotSupportedException>(() =>
             new DeepSeek41Model("not-opened.gguf", backend, tpDegree: 6));
     }

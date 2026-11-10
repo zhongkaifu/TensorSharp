@@ -68,13 +68,12 @@ public sealed class MiniMaxM3ArchitectureTests : IDisposable
     public void TensorParallelAndLayerSplitBothRunOnCuda()
     {
         var arch = Arch();
-        Assert.Equal(MultiGpuMode.TensorParallel, arch.MultiGpu);
-        Assert.True(arch.SupportsLayerSplit);
+        Assert.Equal(new[] { BackendType.GgmlCuda }, arch.Serving.TensorParallel.Backends);
+        Assert.Equal(new[] { BackendType.GgmlCuda }, arch.Serving.LayerSplit.Backends);
         Assert.False(arch.SupportsDistributedTensorParallel);
-        Assert.Null(arch.SupportsNativeTensorParallel);
-        Assert.Equal(new[] { BackendType.GgmlCuda }, arch.LayerSplitBackends);
-        Assert.Contains(arch.Id, arch.MultiGpuLimitation, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("mirrored", arch.MultiGpuLimitation, StringComparison.Ordinal);
+        Assert.Null(arch.Serving.TensorParallel.LoopbackBackend);
+        Assert.Empty(arch.Serving.HybridParallel.Backends);
+        Assert.Contains("MiniMax-M3", arch.Serving.HybridParallel.GapReason, StringComparison.Ordinal);
 
         ITensorParallelGroup group = null;
         int tp = ModelBase.ResolveTensorParallelSupport(arch, BackendType.GgmlCuda, 1, ref group, out int split, 8);
@@ -87,7 +86,7 @@ public sealed class MiniMaxM3ArchitectureTests : IDisposable
         Assert.Equal(1, split);
         Assert.Null(group);
         // ...and never combined with a layer split, nor on a backend without several devices.
-        Assert.Throws<ArgumentException>(() =>
+        Assert.Throws<NotSupportedException>(() =>
             ModelBase.ResolveTensorParallelSupport(arch, BackendType.GgmlCuda, 2, ref group, out _, 2));
         Assert.Throws<NotSupportedException>(() =>
             ModelBase.ResolveTensorParallelSupport(arch, BackendType.GgmlCpu, 2, ref group, out _));

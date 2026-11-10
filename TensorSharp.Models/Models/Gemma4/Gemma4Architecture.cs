@@ -18,6 +18,18 @@ namespace TensorSharp.Models
             Aliases = new[] { "gemma4" },
             Factory = c => new Gemma4Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
             ProjectorFileHints = new[] { "gemma-4-mmproj-F16.gguf" },
+            Serving = new ServingContract
+            {
+                Implementation = ServingImplementation.Bespoke,
+                HasRoutedExperts = true,
+                ContinuousBatching = MechanismSupport.On(ServingBackends.All),
+                // The per-op TP forward has no batched variant: concurrent requests take turns.
+                TensorParallel = MechanismSupport.On(ServingBackends.PerOpTensorParallel),
+                LayerSplit = MechanismSupport.None("Gemma 4 does not implement whole-layer placement; use --tp N."),
+                HybridParallel = MechanismSupport.None("Gemma 4 does not implement whole-layer placement, so it cannot combine it with --tp."),
+                ExpertOffload = MechanismSupport.On(ServingBackends.Ggml).ElsewhereGap(
+                    "Gemma 4 offloads routed experts only on the GGML backends; cpu, cuda and mlx serve every expert from their stacked-expert device buffers."),
+            },
         };
     }
 }

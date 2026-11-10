@@ -17,6 +17,17 @@ namespace TensorSharp.Models
             DisplayName = "GPT-OSS",
             Aliases = new[] { "gptoss", "gpt-oss" },
             Factory = c => new GptOssModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
+            Serving = new ServingContract
+            {
+                Implementation = ServingImplementation.Bespoke,
+                HasRoutedExperts = true,
+                ContinuousBatching = MechanismSupport.On(ServingBackends.All),
+                TensorParallel = MechanismSupport.On(ServingBackends.PerOpTensorParallel),
+                LayerSplit = MechanismSupport.None("GPT-OSS does not implement whole-layer placement; use --tp N."),
+                HybridParallel = MechanismSupport.None("GPT-OSS does not implement whole-layer placement, so it cannot combine it with --tp."),
+                ExpertOffload = MechanismSupport.On(ServingBackends.Ggml).ElsewhereGap(
+                    "GPT-OSS runs host experts through the GGML CPU backend; cpu, cuda and mlx keep every expert on their own device."),
+            },
         };
     }
 }

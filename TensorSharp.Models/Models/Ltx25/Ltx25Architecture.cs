@@ -18,8 +18,18 @@ internal static class Ltx25Architecture
             file.Tensors.ContainsKey("audio_patchify_proj.weight") &&
             file.Tensors.ContainsKey("transformer_blocks.0.prompt_scale_shift_table") &&
             file.Tensors.ContainsKey("transformer_blocks.0.attn1.to_gate_logits.weight"),
-        MultiGpu = MultiGpuMode.SingleDevice,
-        MultiGpuLimitation = "LTX 2.5 (ltx-2.5) currently executes on one device; tensor parallelism and layer splitting are not implemented.",
+        Serving = new ServingContract
+            {
+                Implementation = ServingImplementation.Bespoke,
+                Backends = new[] { BackendType.Cpu, BackendType.Cuda, BackendType.Mlx, BackendType.GgmlMetal, BackendType.GgmlCuda },
+                Autoregressive = false,
+                HasRoutedExperts = false,
+                ContinuousBatching = MechanismSupport.NotApplicable("generates media, not decode steps; requests are serialized by its pipeline"),
+                TensorParallel = MechanismSupport.None("ltx-2.5 has no tensor-parallel path; it runs on one GPU and extra GPUs stay idle."),
+                LayerSplit = MechanismSupport.None("ltx-2.5 has no layer-split path; it runs on one GPU and extra GPUs stay idle."),
+                HybridParallel = MechanismSupport.None("ltx-2.5 has no multi-GPU placement to combine."),
+                ExpertOffload = MechanismSupport.NotApplicable("no routed experts"),
+            },
     };
 
     private static void ConfigurePrecision(ModelCreateContext context)

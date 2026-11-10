@@ -35,7 +35,7 @@ public abstract partial class ModelBase
         else LayerPlacement = new LayerSplitPlan(Config.NumLayers, LayerSplitDegree, node, nodes, driverLast);
         _layerAllocators = new IAllocator[LayerSplitDegree];
         for (int rank = 0; rank < _layerAllocators.Length; rank++)
-            _layerAllocators[rank] = LayerSplitGroup?.GetAllocator(rank) ?? new GgmlAllocator(_ggmlContext, rank);
+            _layerAllocators[rank] = LayerSplitGroup?.GetAllocator(rank) ?? CreateLayerDeviceAllocator(rank);
 
         if (LayerSplitGroup != null)
         {
@@ -59,6 +59,22 @@ public abstract partial class ModelBase
                     throw new InvalidOperationException("Layer-split nodes have different model metadata or execution settings.");
         }
     }
+
+    /// <summary>The allocator for local device <paramref name="rank"/> of a whole-layer split:
+    /// the GGML context's rank, a direct-CUDA device (TENSORSHARP_LAYER_SPLIT_DEVICES picks
+    /// which), or, on the managed cpu backend, a separate host "device" (functional placement
+    /// for tests; never a performance mode).</summary>
+    private IAllocator CreateLayerDeviceAllocator(int rank) => _backend switch
+    {
+        BackendType.Cpu => rank == 0 ? _allocator : new TensorSharp.Cpu.CpuAllocator(BlasEnum.DotNet),
+        BackendType.Cuda => rank == 0 ? _allocator
+            : new TensorSharp.Cuda.CudaAllocator(ParseDeviceIds(LayerSplitDegree, "TENSORSHARP_LAYER_SPLIT_DEVICES")[rank]),
+        BackendType.Mlx => throw new NotSupportedException("The mlx backend exposes one device; whole-layer placement needs several."),
+        _ => new GgmlAllocator(_ggmlContext, rank),
+    };
+
+    /// <summary>The allocator of local layer-split device <paramref name="rank"/> (rank 0 when unsplit).</summary>
+    protected IAllocator LayerDeviceAllocator(int rank) => _layerAllocators == null ? _allocator : _layerAllocators[rank];
 
     protected IAllocator LayerAllocator(int layer) => LayerPlacement == null
         ? _allocator : _layerAllocators[LayerPlacement.LocalRank(layer)];

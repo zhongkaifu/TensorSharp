@@ -91,14 +91,18 @@ public sealed class ModelParallelismOptions
         result.TpDegree = ReadInteger(Resolve(TpDegreeVariable) ?? "1", "--tp / " + TpDegreeVariable, 1);
         result.LayerSplitDegree = ReadInteger(Resolve(LayerSplitDegreeVariable) ?? "1",
             "--layer-split / " + LayerSplitDegreeVariable, 1);
-        if (result.TpDegree > 1 && result.LayerSplitDegree > 1)
-            throw new ArgumentException("--tp and --layer-split cannot both exceed 1. Choose tensor parallelism or layer splitting.");
+        // Both above 1 is hybrid placement: --layer-split stages, each a --tp group, in one
+        // process (whether the architecture supports it is the loader's decision, from its
+        // serving contract). IsLayerSplit names the PURE whole-layer mode.
         result.IsLayerSplit = result.TpDegree == 1 && !string.IsNullOrWhiteSpace(Resolve(LayerSplitDegreeVariable));
 
         string node = Resolve(NodeIdVariable);
         string peers = Resolve(PeersVariable);
         bool hasNode = !string.IsNullOrWhiteSpace(node);
         bool hasPeers = !string.IsNullOrWhiteSpace(peers);
+        if (hasNode && result.TpDegree > 1 && result.LayerSplitDegree > 1)
+            throw new ArgumentException(
+                "--tp with --layer-split (hybrid placement) runs in one process; it cannot be combined with --tp-node-id/--tp-peers.");
         if (hasNode != hasPeers)
             throw new ArgumentException(hasNode
                 ? "--tp-node-id requires --tp-peers (the endpoints of all nodes)."

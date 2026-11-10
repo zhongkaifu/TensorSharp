@@ -26,7 +26,7 @@ namespace TensorSharp.Models
             Id = "mistral3",
             DisplayName = "Mistral 3",
             Aliases = new[] { "mistral3" },
-            SupportsLayerSplit = true,
+            Serving = ServingContract.SharedRuntime(hasRoutedExperts: false),
             SupportsDistributedLayerSplit = true,
             Factory = c => new Mistral3Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree),
             RecognizeRelabelledFile = IsLlamaLabelledMistral3,

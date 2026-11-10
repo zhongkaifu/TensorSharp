@@ -84,19 +84,6 @@ namespace TensorSharp.GGML
         private static partial int TSGgml_TensorParallelExecutePlansDistributed(
             IntPtr[] plans, int rankCount, IntPtr crossNodeCallback, IntPtr crossNodeUser);
 
-        [LibraryImport(DllName)]
-        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static unsafe partial int TSGgml_TensorParallelMatmul(
-            GgmlTensorView2D* results,
-            GgmlTensorView2D* inputs,
-            IntPtr* weightData,
-            int* weightTypes,
-            long* weightNe0,
-            long* weightNe1,
-            long* weightRawBytes,
-            int rankCount,
-            int allReduce);
-
         // The native active rank is thread-local, so mirror it here and skip the
         // interop call when it has not changed: the per-op dispatch hook runs on
         // literally every op.
@@ -369,35 +356,6 @@ namespace TensorSharp.GGML
                 throw new ArgumentException("At least one plan is required.", nameof(plans));
             if (TSGgml_TensorParallelExecutePlans(plans, plans.Length) == 0)
                 throw new InvalidOperationException(GetLastErrorMessage("GGML tensor-parallel plan execution failed."));
-        }
-
-        /// <summary>
-        /// One column-parallel (<paramref name="allReduce"/> false) or
-        /// row-parallel (true) linear across every rank, submitted as N
-        /// concurrent device graphs and synchronized once.
-        /// </summary>
-        public static unsafe void TensorParallelMatmul(
-            GgmlTensorView2D[] results,
-            GgmlTensorView2D[] inputs,
-            IntPtr[] weightData,
-            int[] weightTypes,
-            long[] weightNe0,
-            long[] weightNe1,
-            long[] weightRawBytes,
-            bool allReduce)
-        {
-            int n = results.Length;
-            fixed (GgmlTensorView2D* r = results)
-            fixed (GgmlTensorView2D* i = inputs)
-            fixed (IntPtr* wd = weightData)
-            fixed (int* wt = weightTypes)
-            fixed (long* w0 = weightNe0)
-            fixed (long* w1 = weightNe1)
-            fixed (long* wb = weightRawBytes)
-            {
-                if (TSGgml_TensorParallelMatmul(r, i, wd, wt, w0, w1, wb, n, allReduce ? 1 : 0) == 0)
-                    throw new InvalidOperationException(GetLastErrorMessage("GGML tensor-parallel matmul failed."));
-            }
         }
     }
 }

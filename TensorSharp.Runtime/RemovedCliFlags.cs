@@ -332,6 +332,9 @@ namespace TensorSharp.Runtime
             ("TS_Q4E_SPAN_ATTN",
                 "Qwen 3.8 attention layers always run inside the token-span graph; the per-layer attention "
                 + "split was removed."),
+            ("TS_GGML_TP_FUSED_MATMUL",
+                "the single-thread multi-rank linear it engaged (never the default) allocated a device buffer per rank "
+                + "per call and measured 2.3x slower on Qwen 3.5 35B (ggml_cuda --tp 2); local TP always runs the per-rank path."),
             ("TS_DSV41_TP",
                 "--tp N enables DeepSeek V4.1 routed-MoE tensor parallelism (2..8 GPUs); the environment entry "
                 + "point was removed."),

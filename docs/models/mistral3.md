@@ -6,7 +6,7 @@
 |---|---|
 | Provider | Mistral AI |
 | GGUF architecture key | `mistral3`; also `llama` for Mistral Small 3.x files converted before llama.cpp had `mistral3` (see [llama-labelled files](#llama-labelled-files)) |
-| Source class | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs) (single-sequence) + [`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs) (`IBatchedPagedModel`) |
+| Source class | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs) (YaRN rotary, vision) on the shared decoder runtime [`StandardDecoderModel`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.cs) (forwards, `IBatchedPagedModel`, TP / layer split / hybrid) |
 | Vision encoder | [`Mistral3VisionEncoder`](../../TensorSharp.Models/Models/Mistral3/Mistral3VisionEncoder.cs) (Pixtral) |
 | Image processor | [`Mistral3ImageProcessor`](../../TensorSharp.Models/Models/Mistral3/Mistral3ImageProcessor.cs) |
 | Example models | Mistral-Small-3.1-24B-Instruct, Ministral-3-14B-Instruct |
@@ -434,7 +434,7 @@ Adding either would shrink decode latency and TTFT.
 ## 11. Batched / paged forward (continuous batching)
 
 Mistral 3 is the **reference implementation** of `IBatchedPagedModel.ForwardBatch`
-in TensorSharp ([`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs)).
+in TensorSharp, now provided by the shared decoder runtime ([`StandardDecoderModel.Batched.cs`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.Batched.cs)).
 It runs through the shared continuous-batching engine (`InferenceEngine` +
 `ContinuousBatchScheduler` + `BatchExecutor`) described in
 [`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).

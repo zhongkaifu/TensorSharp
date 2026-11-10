@@ -35,6 +35,15 @@ public sealed class DenseDecoderSyntheticModelBuilder
     public bool IncludeRopeFreqs { get; init; }
     public bool IncludeQkNorms { get; init; }
     public uint ExpertCount { get; init; }
+
+    /// <summary>Routed experts per layer (0: dense FFN). Each layer then carries a router
+    /// (<c>ffn_gate_inp</c>) and stacked F16 <c>ffn_{gate,up,down}_exps</c>, which load as the
+    /// stacked quantized experts a real MoE checkpoint gives, plus the expert metadata.</summary>
+    public int MoeExperts { get; init; }
+    public int MoeTopK { get; init; } = 2;
+    /// <summary>Add an always-active shared expert (<c>ffn_*_shexp</c>) to every MoE layer.</summary>
+    public bool MoeSharedExpert { get; init; }
+    public const int ExpertFfnLength = 32;
     public string RopeScalingType { get; init; }
     public float RopeBase { get; init; } = 1_000_000f;
     public int LayerCount { get; init; } = NumBlocks;
@@ -76,8 +85,9 @@ public sealed class DenseDecoderSyntheticModelBuilder
     }
 
     private bool IsHalf(string name, ulong[] dims) =>
-        HalfPrecisionLayer.HasValue && dims.Length == 2 &&
-        name.StartsWith($"blk.{HalfPrecisionLayer.Value}.", StringComparison.Ordinal);
+        (dims.Length == 3 && name.Contains("_exps.", StringComparison.Ordinal)) ||
+        (HalfPrecisionLayer.HasValue && dims.Length == 2 &&
+         name.StartsWith($"blk.{HalfPrecisionLayer.Value}.", StringComparison.Ordinal));
 
     private List<(string Name, ulong[] Dims, float[] Data)> BuildTensors()
     {
@@ -106,6 +116,20 @@ public sealed class DenseDecoderSyntheticModelBuilder
                 t.Add(Gen(p + "attn_k_norm.weight", 0.2f, HeadDim, offset: 1f));
             }
             t.Add(Gen(p + "ffn_norm.weight", 0.2f, Hidden, offset: 1f));
+            if (MoeExperts > 0)
+            {
+                t.Add(Gen(p + "ffn_gate_inp.weight", 0.3f, Hidden, MoeExperts));
+                t.Add(Gen3(p + "ffn_gate_exps.weight", 0.1f, Hidden, ExpertFfnLength, MoeExperts));
+                t.Add(Gen3(p + "ffn_up_exps.weight", 0.1f, Hidden, ExpertFfnLength, MoeExperts));
+                t.Add(Gen3(p + "ffn_down_exps.weight", 0.1f, ExpertFfnLength, Hidden, MoeExperts));
+                if (MoeSharedExpert)
+                {
+                    t.Add(Gen(p + "ffn_gate_shexp.weight", 0.08f, Hidden, ExpertFfnLength));
+                    t.Add(Gen(p + "ffn_up_shexp.weight", 0.08f, Hidden, ExpertFfnLength));
+                    t.Add(Gen(p + "ffn_down_shexp.weight", 0.08f, ExpertFfnLength, Hidden));
+                }
+                continue;
+            }
             t.Add(Gen(p + "ffn_gate.weight", 0.08f, Hidden, FfnLength));
             t.Add(Gen(p + "ffn_up.weight", 0.08f, Hidden, FfnLength));
             t.Add(Gen(p + "ffn_down.weight", 0.08f, FfnLength, Hidden));
@@ -124,6 +148,12 @@ public sealed class DenseDecoderSyntheticModelBuilder
             data[i] = offset + scale * ((state & 0xFFFF) / 32768f - 1f);
         }
         return (name, d1 > 0 ? new[] { (ulong)d0, (ulong)d1 } : new[] { (ulong)d0 }, data);
+    }
+
+    private static (string, ulong[], float[]) Gen3(string name, float scale, int d0, int d1, int d2)
+    {
+        var (_, _, data) = Gen(name, scale, d0 * d1, d2);
+        return (name, new[] { (ulong)d0, (ulong)d1, (ulong)d2 }, data);
     }
 
     private static uint Fnv1a(string text)
@@ -154,6 +184,12 @@ public sealed class DenseDecoderSyntheticModelBuilder
         };
         if (ExpertCount > 0)
             kv.Add(($"{a}.expert_count", U32(ExpertCount)));
+        if (MoeExperts > 0)
+        {
+            kv.Add(($"{a}.expert_count", U32((uint)MoeExperts)));
+            kv.Add(($"{a}.expert_used_count", U32((uint)MoeTopK)));
+            kv.Add(($"{a}.expert_feed_forward_length", U32(ExpertFfnLength)));
+        }
         if (RopeScalingType != null)
             kv.Add(($"{a}.rope.scaling.type", Str(RopeScalingType)));
 

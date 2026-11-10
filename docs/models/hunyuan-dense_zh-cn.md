@@ -7,9 +7,11 @@ TensorSharp 支持腾讯的稠密 Hunyuan 解码器——即 GGUF 中 `general.a
 Q4 文件会在加载阶段直接失败，而不会退回到某个相近的系列：加载器遇到未知架构时
 选择失败关闭，而不是猜测一套计算图。
 
-它是走通用 per-op 执行器的单设备、纯文本路径：没有融合的整模型计算图，没有张量
-并行，也没有按层切分。服务端通过连续批处理引擎、以批处理分页前向提供服务（见
-[服务](#服务连续批处理)）。
+它是建立在共享解码运行时（[`StandardDecoderModel`](../../TensorSharp.Models/SharedDecoder/StandardDecoderModel.cs)；见
+[统一执行设计](../design/unified-execution.md)，英文）之上的纯文本家族：在 `cuda`、`ggml_cuda`
+与 `ggml_vulkan` 上支持张量并行（`--tp T`）、整层放置（`--layer-split P`，本地或跨节点）
+及两者组合，且每种放置下并发请求都通过分页批处理前向提供服务（见[服务](#服务连续批处理)）。
+目前还没有融合的整模型计算图。
 
 | 属性 | 取值 |
 |---|---|
@@ -22,7 +24,7 @@ Q4 文件会在加载阶段直接失败，而不会退回到某个相近的系�
 | 工具调用 | 否——该协议既不渲染工具声明，也不渲染 `role: "tool"` 结果 |
 | 批处理 / 分页前向 | **默认启用** —— [`HunyuanDenseModel.BatchedForward.cs`](../../TensorSharp.Models/Models/HunyuanDense/HunyuanDenseModel.BatchedForward.cs)（`IBatchedPagedModel`）；`--no-continuous-batching` 选择 K/V 快照换入换出路径 |
 | 投机解码 | 不支持 |
-| 多 GPU | 单设备。`MultiGpuLimitation` 会在 stderr 上明说，而不是让多余的 GPU 静默闲置 |
+| 多 GPU | 共享解码运行时提供的 `--tp T`、`--layer-split P` 与 `--tp T --layer-split P`（混合），支持 `cuda`、`ggml_cuda`、`ggml_vulkan`。已在模拟设备上与单设备对照验证（`SharedRuntimeConformanceTests`），尚未在 GPU 上实测 |
 | 后端 | 通过通用 per-op 路径支持全部后端：`cpu`、`ggml_cpu`、`ggml_metal`、`ggml_cuda`、`ggml_vulkan`、`cuda`、`mlx` |
 
 ## 运行
@@ -132,7 +134,7 @@ Agent Skills 在这里退回到内联指令，与所有没有工具解析器的�
 
 - 仅文本。没有接入投影器，`--image`、`--video`、`--audio` 均不适用。
 - 没有思考通道，没有工具调用解析器，因此不为该模型提供代码工具与子智能体委派。
-- 单设备：没有张量并行、没有按层切分、没有融合整模型计算图、不支持投机解码。
+- 没有融合整模型计算图，不支持投机解码。多 GPU 放置来自共享解码运行时，目前只在模拟设备上验证过，还没有 GPU 实测。
 - Hy-MT2-1.8B 是翻译模型，有自己的输出习惯：对 `What is 17 + 25? Reply with only
   the integer.` 回答 `42.`；在发布翻译夹具上，`structured_json` 与 `||` 分隔词表
   两类 prompt 会被原样抄回而不是翻译。这是模型本身的行为，与服务路径无关。在

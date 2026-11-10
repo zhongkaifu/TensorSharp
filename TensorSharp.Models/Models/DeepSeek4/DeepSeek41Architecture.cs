@@ -18,18 +18,33 @@ namespace TensorSharp.Models
             Id = "deepseek41",
             DisplayName = "DeepSeek V4.1 Flash",
             Aliases = new[] { "deepseek41" },
-            MultiGpu = MultiGpuMode.TensorParallel,
+            Serving = new ServingContract
+            {
+                Implementation = ServingImplementation.Bespoke,
+                // ggml_vulkan / ggml_metal run the same native graph behind TS_DSV41_ALLOW_NON_CUDA_GPU=1.
+                Backends = new[] { BackendType.Cpu, BackendType.Cuda, BackendType.GgmlCpu, BackendType.GgmlCuda,
+                    BackendType.GgmlMetal, BackendType.GgmlVulkan },
+                HasRoutedExperts = true,
+                ContinuousBatching = MechanismSupport.On(BackendType.Cuda, BackendType.GgmlCpu, BackendType.GgmlCuda,
+                        BackendType.GgmlMetal, BackendType.GgmlVulkan)
+                    .ElsewhereGap("the pure-C# DeepSeek V4.1 executor (--backend cpu) serves concurrent requests one at a time."),
+                // Routed-MoE tensor parallelism; attention and shared experts keep local placement.
+                TensorParallel = MechanismSupport.On(BackendType.GgmlCuda).KeepsBatching()
+                    .When((localDegree, _) => localDegree <= 8 ? null : "DeepSeek V4.1 tensor parallelism supports 2 through 8 GPUs.")
+                    .ElsewhereGap("DeepSeek V4.1 routed-MoE tensor parallelism requires --backend ggml_cuda. Select ggml_cuda, or use --layer-split N."),
+                LayerSplit = MechanismSupport.On(BackendType.GgmlCuda, BackendType.Cuda).KeepsBatching()
+                    .ElsewhereGap("DeepSeek V4.1 places whole layers on ggml_cuda and on the direct-CUDA engine only."),
+                HybridParallel = MechanismSupport.None("DeepSeek V4.1 runs --tp and --layer-split as separate placement modes."),
+                ExpertOffload = MechanismSupport.On(BackendType.Cpu, BackendType.GgmlCpu, BackendType.GgmlCuda,
+                        BackendType.GgmlMetal, BackendType.GgmlVulkan)
+                    .ElsewhereGap("the direct-CUDA DeepSeek engine keeps every routed expert in VRAM; use --backend ggml_cuda for --n-cpu-moe."),
+            },
             DistributedTensorParallelBackends = new[] { BackendType.GgmlCuda },
-            SupportsLayerSplit = true,
             SupportsDistributedLayerSplit = true,
             // ggml_cuda's stage graph, and the direct-CUDA engine's stages
             // (Dsv4CudaEngine.Distributed.cs). Tensor parallelism stays ggml_cuda only.
             DistributedLayerSplitBackends = new[] { BackendType.GgmlCuda, BackendType.Cuda },
-            MultiGpuLimitation = "DeepSeek V4.1 uses native routed-MoE tensor parallelism; attention and shared experts retain local layer placement.",
-            SupportsNativeTensorParallel = (degree, backend) => backend == BackendType.GgmlCuda &&
-                degree is >= 2 and <= 8,
             DescribeMultiGpuPlacement = DescribePlacement,
-            LayerSplitBackends = new[] { BackendType.GgmlCuda, BackendType.Cuda },
             ApplyNativeTunables = c => ValidateLoad(c.GgufPath, c.Backend, c.DraftModelPath, c.TpGroup, c.TpDegree, c.Probe),
             ProjectorFileHints = new[] { "deepseek41.vision.gguf" },
             Factory = c => new DeepSeek41Model(c.GgufPath, c.Backend,

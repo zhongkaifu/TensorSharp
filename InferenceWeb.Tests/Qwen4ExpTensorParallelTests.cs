@@ -21,8 +21,8 @@ public sealed class Qwen4ExpTensorParallelTests
     public void ArchitectureKeepsTensorAndLayerParallelismDistinct()
     {
         Assert.True(ModelArchitectureRegistry.TryGet("qwen4exp", out var architecture));
-        Assert.Equal(MultiGpuMode.TensorParallel, architecture.MultiGpu);
-        Assert.True(architecture.SupportsLayerSplit);
+        Assert.True(architecture.Serving.TensorParallel.IsSupportedOn(BackendType.GgmlCuda));
+        Assert.True(architecture.Serving.LayerSplit.IsSupportedOn(BackendType.GgmlCuda));
         Assert.True(architecture.SupportsDistributedTensorParallel);
         Assert.Equal(new[] { BackendType.GgmlCuda }, architecture.DistributedTensorParallelBackends);
         Assert.True(architecture.SupportsDistributedLayerSplit);
@@ -32,7 +32,8 @@ public sealed class Qwen4ExpTensorParallelTests
         Assert.Equal(1, split);
         Assert.Equal(1, ModelBase.ResolveTensorParallelSupport(architecture, BackendType.GgmlCuda, 1, ref group, out split, 2));
         Assert.Equal(2, split);
-        Assert.Throws<ArgumentException>(() => ModelBase.ResolveTensorParallelSupport(architecture, BackendType.GgmlCuda, 2, ref group, out _, 2));
+        Assert.Contains("separate placement modes", Assert.Throws<NotSupportedException>(() =>
+            ModelBase.ResolveTensorParallelSupport(architecture, BackendType.GgmlCuda, 2, ref group, out _, 2)).Message);
     }
 
     [Theory]

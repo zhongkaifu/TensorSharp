@@ -48,25 +48,34 @@ public sealed class Mistral3LayerSplitPrecisionTests : IDisposable
     [InlineData(KvCacheDtype.F32, false)]
     [InlineData(KvCacheDtype.F16, true)]
     [InlineData(KvCacheDtype.F32, true)]
-    public void TensorParallelPreservesExistingCacheDefaultAndExplicitPrecision(KvCacheDtype dtype, bool explicitlySet)
+    public void TensorParallelUsesTheSamePrecisionAsOneDevice(KvCacheDtype dtype, bool explicitlySet)
     {
         new DenseDecoderSyntheticModelBuilder
         {
             Architecture = "mistral3", LayerCount = 4, HalfPrecisionLayer = 3,
         }.Write(_path);
         KvCacheDtypeConfig.RestoreForTests(dtype, explicitlySet);
+        KvCacheDtype single;
+        using (var reference = new InspectableMistral(_path))
+            single = reference.CacheDtype;
+        KvCacheDtypeConfig.RestoreForTests(dtype, explicitlySet);
         using var model = new InspectableMistral(_path, new CpuTensorGroup());
 
-        // Run the real TP constructor, including sharding and cache allocation.
-        // Historically TP uses the captured default rather than inferring one
-        // from model metadata; whole-layer stage consistency must not change it.
-        Assert.Equal(dtype, model.CacheDtype);
+        // The KV cache precision is a property of the model, not of its placement: the
+        // shared runtime resolves the default the same way for one device and for TP
+        // (the old per-family TP path kept the raw captured default instead).
+        Assert.Equal(single, model.CacheDtype);
+        if (explicitlySet) Assert.Equal(dtype, model.CacheDtype);
         Assert.Equal(0, model.QuantizedCount);
         Assert.True(model.TensorParallelQuantizedCount > 0);
-        Assert.All(model.TensorParallelKeyCache, layer =>
+        Assert.All(model.KeyCachesForTests, layer =>
         {
             Assert.Equal(2, layer.Length);
-            Assert.All(layer, cache => Assert.Equal(dtype.ToDType(), cache.ElementType));
+            Assert.All(layer, cache =>
+            {
+                Assert.Equal(model.CacheDtype.ToDType(), cache.ElementType);
+                Assert.Equal(DenseDecoderSyntheticModelBuilder.NumKvHeads / 2, cache.Sizes[0]);
+            });
         });
     }
 
@@ -76,9 +85,6 @@ public sealed class Mistral3LayerSplitPrecisionTests : IDisposable
         public KvCacheDtype CacheDtype => _kvCacheDtype;
         public int QuantizedCount => _quantWeights.Count;
         public int TensorParallelQuantizedCount => _tpQuantWeights.Count;
-        public Tensor[][] TensorParallelKeyCache => (Tensor[][])typeof(Mistral3Model)
-            .GetField("_tpKvCacheK", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
-            .GetValue(this);
     }
 
     // Only allocation and construction run here; no fake collective result can

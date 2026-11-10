@@ -43,10 +43,27 @@ namespace TensorSharp.Models
             },
             ProjectorFileHints = new[] { "*mmproj*.gguf" },
 
-            MultiGpu = MultiGpuMode.TensorParallel,
-            SupportsLayerSplit = true,
-            // The direct-CUDA engine places whole layers too.
-            LayerSplitBackends = new[] { BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda },
+            Serving = new ServingContract
+            {
+                Implementation = ServingImplementation.Bespoke,
+                Backends = new[] { BackendType.Cpu, BackendType.Cuda, BackendType.GgmlCpu, BackendType.GgmlMetal,
+                    BackendType.GgmlCuda, BackendType.GgmlVulkan },
+                HasRoutedExperts = true,
+                // GGML per-sequence state holders and the direct-CUDA engine's slots; the managed
+                // per-op path shares scratch that is not per-sequence.
+                ContinuousBatching = MechanismSupport.On(BackendType.Cuda, BackendType.GgmlCpu, BackendType.GgmlMetal,
+                        BackendType.GgmlCuda, BackendType.GgmlVulkan)
+                    .ElsewhereGap("qwen4exp's managed per-op path (--backend cpu) serves concurrent requests one at a time; use a GGML backend."),
+                TensorParallel = MechanismSupport.On(ServingBackends.GgmlMultiDevice).KeepsBatching()
+                    .ElsewhereGap("the direct-CUDA qwen4exp engine places whole layers; use --layer-split N instead of --tp."),
+                // The direct-CUDA engine places whole layers too.
+                LayerSplit = MechanismSupport.On(BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda).KeepsBatching(),
+                HybridParallel = MechanismSupport.None("qwen4exp runs --tp and --layer-split as separate placement modes."),
+                ExpertOffload = MechanismSupport.On(ServingBackends.Ggml)
+                    .When((tp, _) => tp <= 1 ? null :
+                        "qwen4exp places host experts only without --tp; remove --n-cpu-moe / --cpu-moe or use --layer-split N.")
+                    .ElsewhereGap("qwen4exp places host experts only in its GGML token spans; cpu and the direct-CUDA engine keep them resident."),
+            },
             SupportsDistributedTensorParallel = true,
             DistributedTensorParallelBackends = new[] { BackendType.GgmlCuda },
             SupportsDistributedLayerSplit = true,

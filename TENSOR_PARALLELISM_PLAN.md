@@ -1,5 +1,9 @@
 # Tensor Parallelism Plan
 
+> **Superseded for new work** by [docs/design/unified-execution.md](docs/design/unified-execution.md): placement
+> (TP, layer split, their hybrid) and expert offload are now runtime mechanisms declared per family in a
+> mandatory serving contract. This document records how the per-family TP paths were built.
+
 ## Overview
 
 This document describes the plan for adding tensor parallelism (TP) to TensorSharp,
@@ -82,8 +86,7 @@ Replicated hidden state (all GPUs hold identical copy)
 | `TensorSharp.Backends.Cuda/CudaP2PCommunicator.cs` | **New.** AllReduce via P2P copies + elementwise-add kernel. Reduce-to-zero + broadcast algorithm. Host-memory fallback when P2P is unavailable |
 | `TensorSharp.Backends.Cuda/TensorParallelGroup.cs` | **New.** Multi-GPU coordinator: owns N `CudaAllocator`s + P2P communicator. Public API: `AllReduce(Tensor[])`, `GetAllocator(rank)`, `Synchronize()` |
 | `TensorSharp.Models/ModelBase.cs` | Added TP fields, `tpDegree` constructor param, `ShardWeightsForTensorParallelism()`, `TpColumnParallelLinear()`, `TpRowParallelLinear()`, `TpRMSNorm()`, `TpResidualAdd()`, `BroadcastTensorToAllRanks()`, `PrepareCudaQuantizedWeightsForInferenceTP()`, TP cleanup in `Dispose()`, `Create()` accepts `tpDegree` |
-| `TensorSharp.Models/Models/Mistral3/Mistral3Model.cs` | Constructor accepts `tpDegree`, dispatches to `ForwardTP()` when TP active |
-| `TensorSharp.Models/Models/Mistral3/Mistral3Model.TensorParallel.cs` | **New.** TP forward pass with fused/separate QKV, YaRN RoPE |
+| `TensorSharp.Models/Models/Mistral3/Mistral3Model.cs` | Since 2026-11: built on the shared decoder runtime (`TensorSharp.Models/SharedDecoder/`), which provides TP, layer split, their hybrid and batched serving for every family on it; see [docs/design/unified-execution.md](docs/design/unified-execution.md) |
 | `TensorSharp.Models/Models/Gemma4/Gemma4Model.cs` | Constructor accepts `tpDegree`, dispatches to `ForwardTP()` when TP active |
 | `TensorSharp.Models/Models/Gemma4/Gemma4Model.TensorParallel.cs` | **New.** TP forward pass with dense GeGLU + MoE dual-path FFN, per-layer head dims, shared KV layers |
 | `TensorSharp.Models/Models/Qwen35/Qwen35Model.cs` | Constructor accepts `tpDegree`, dispatches to `ForwardTP()` when TP active |
@@ -93,8 +96,6 @@ Replicated hidden state (all GPUs hold identical copy)
 | `TensorSharp.Models/Models/Nemotron/NemotronModel.cs` | Constructor accepts `tpDegree`, dispatches to `ForwardTP()` when TP active |
 | `TensorSharp.Models/Models/Nemotron/NemotronModel.TensorParallel.cs` | **New.** TP forward pass with Mamba2 (replicated), attention (no RoPE), dense + MoE FFN |
 | `TensorSharp.Cli/Program.cs` | Added `--tp <N>` CLI argument |
-| `TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForwardTP.cs` | **New.** TP batched forward with YaRN RoPE, fused/separate QKV, position-dependent Q scaling |
-| `TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs` | Added TP dispatch to `ForwardBatchTP` when `IsTensorParallel` |
 | `TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback) |
 | `TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback) |
 | `TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs` | `BatchedForwardAvailable` returns false under TP (per-seq fallback) |
@@ -282,7 +283,6 @@ TensorSharp.Cli --model m.gguf --backend ggml_cuda --tp 2 \
 |---|---|
 | `TENSORSHARP_TP_DEVICES` | Explicit GPU ordinals per rank (default `0..tp-1`) |
 | `TS_GGML_TP_PARALLEL=0` | Sequential rank dispatch (diagnostic) |
-| `TS_GGML_TP_FUSED_MATMUL=1` | Use the fused multi-rank linear instead of the generic per-rank one (off by default, see below) |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective |
 | `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of device-resident (diagnostic) |
 | `TS_QWEN35_LAYER_TRACE=1` | Per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops |
@@ -496,8 +496,8 @@ Output is **byte-identical** to the single-GPU run on every prompt tested
 - [ ] **MoE TP throughput on other architectures.** GptOss/Nemotron still walk
       experts per token per rank. Gemma 4 and Qwen 3.5 now use expert
       parallelism; the same treatment applies to them.
-- [ ] **Fused multi-rank linear.** `TSGgml_TensorParallelMatmul` is now OFF by
-      default (`TS_GGML_TP_FUSED_MATMUL=1` re-enables it). Submitting both ranks
+- [x] **Fused multi-rank linear.** Removed in 2026-11 (it was OFF by default and
+      `TS_GGML_TP_FUSED_MATMUL=1` is now a hard error). Submitting both ranks
       from one thread avoids a worker hand-off, but its graphs run
       asynchronously, so it cannot share the per-rank compute buffer and must
       allocate a backend buffer per rank per call — a cudaMalloc/cudaFree pair

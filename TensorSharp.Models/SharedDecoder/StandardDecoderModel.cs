@@ -1,0 +1,1007 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+
+using TensorSharp.GGML;
+using TensorSharp.MLX;
+using TensorSharp.Models.Placement;
+
+namespace TensorSharp.Models
+{
+    /// <summary>
+    /// The shared decoder runtime for pre-norm transformer decoders (attention + SwiGLU FFN
+    /// per layer): it owns everything that is not the family's arithmetic, so a family built
+    /// on it gets every serving mechanism with no code of its own.
+    ///
+    /// <list type="bullet">
+    /// <item><b>Continuous batching</b>: one paged batched forward (<see cref="ForwardBatch"/>);
+    /// the single-sequence forward and KV snapshots are implemented once.</item>
+    /// <item><b>Tensor parallelism</b> (<c>--tp T</c>): weights sharded by role, each branch
+    /// body run once per rank, the runtime reducing the row-parallel partials.</item>
+    /// <item><b>Layer split</b> (<c>--layer-split P</c>, local or multi-node): whole layers per
+    /// device, activations moved at stage boundaries.</item>
+    /// <item><b>Hybrid</b> (<c>--tp T --layer-split P</c>): P stages, each its own T-device group.</item>
+    /// </list>
+    ///
+    /// A family supplies its configuration, tokenizer and the few things that really differ
+    /// between decoders: rotary embedding and Q/K treatment (<see cref="RotateQueryKey"/>),
+    /// and optionally media injection. Everything else - including the backend fast paths the
+    /// per-family forwards used (fused SwiGLU FFN, MLX fused add+norm and decode attention,
+    /// half-operand attention GEMMs on direct CUDA) - lives here, so it is shared too.
+    /// See docs/design/unified-execution.md.
+    /// </summary>
+    public abstract partial class StandardDecoderModel : ModelBase
+    {
+        private static readonly int MlxEvalEveryNLayers = ResolvePositiveEnv("TS_MLX_EVAL_EVERY_N_LAYERS", 16);
+        private static readonly int PrefillChunkTokens = ResolvePositiveEnv("TS_PREFILL_CHUNK", 2048);
+
+        private readonly int _requestedTensorParallel;
+        private readonly int _requestedStages;
+
+        private DeviceMesh _mesh;
+        private Tensor[][] _cacheK;   // [layer][rank]; null rows for layers another node owns
+        private Tensor[][] _cacheV;
+        private int _cacheCapacity;
+        private bool[] _qkvFused;
+        private bool[] _gateUpFused;
+        private int _keyDim;
+        private int _valueDim;
+        private int _localHeads;
+        private int _localKvHeads;
+        private readonly ConcurrentDictionary<(Tensor Weight, int Device), Tensor> _replicas = new();
+
+        /// <param name="tpDegree">T, the tensor-parallel degree of every stage.</param>
+        /// <param name="tpGroup">A caller-supplied device group: a distributed TP group, a
+        /// multi-node layer-split group, or (tests) a simulated group of T x P devices.</param>
+        /// <param name="layerSplitDegree">P, the number of whole-layer stages.</param>
+        protected StandardDecoderModel(string ggufPath, BackendType backend, int tpDegree, ITensorParallelGroup tpGroup,
+            int layerSplitDegree)
+            : base(ggufPath, backend,
+                BaseTensorParallel(tpDegree, tpGroup, layerSplitDegree),
+                tpGroup,
+                tpGroup is ILayerSplitGroup ? 1 : IsHybrid(tpDegree, tpGroup, layerSplitDegree) ? 1 : layerSplitDegree)
+        {
+            _requestedStages = tpGroup is ILayerSplitGroup ? 1 : Math.Max(1, layerSplitDegree);
+            _requestedTensorParallel = tpGroup is ILayerSplitGroup
+                ? 1
+                : IsHybrid(tpDegree, tpGroup, layerSplitDegree)
+                    ? tpDegree
+                    : tpGroup?.Degree ?? Math.Max(1, tpDegree);
+        }
+
+        private static bool IsHybrid(int tp, ITensorParallelGroup group, int stages)
+            => group is not ILayerSplitGroup && stages > 1 && (tp > 1 || group != null);
+
+        /// <summary>What the ModelBase constructor provisions: the full device group (T x P devices)
+        /// for any tensor-parallel mesh, nothing for a pure layer split (ModelBase's own
+        /// whole-layer placement creates those devices).</summary>
+        private static int BaseTensorParallel(int tp, ITensorParallelGroup group, int stages)
+        {
+            if (group is ILayerSplitGroup) return 1;
+            if (IsHybrid(tp, group, stages))
+            {
+                if (tp < 2)
+                    throw new ArgumentException("Hybrid placement needs a tensor-parallel degree of at least 2 per stage.");
+                int devices = checked(tp * stages);
+                if (group != null && group.Degree != devices)
+                    throw new ArgumentException($"A hybrid placement of {stages} stages x tp {tp} needs a group of {devices} devices, not {group.Degree}.");
+                return devices;
+            }
+            return tp;
+        }
+
+        // ---------------------------------------------------------------- family hooks
+
+        /// <summary>
+        /// Rotary embedding and every per-token Q/K treatment of the family, for the rank-local
+        /// heads in <paramref name="rank"/>: <paramref name="q"/> is [tokens, LocalHeads*KeyDim],
+        /// <paramref name="k"/> is [tokens, LocalKvHeads*KeyDim]. Either may be replaced (dispose
+        /// the old one). <paramref name="positions"/> gives every token's absolute position.
+        /// </summary>
+        protected abstract void RotateQueryKey(RankScope rank, int layer, ref Tensor q, ref Tensor k, TokenPositions positions);
+
+        /// <summary>Copy pending media embeddings (images) into the embedded rows of a forward
+        /// that starts at absolute position <paramref name="absoluteStart"/>. Default: none.</summary>
+        protected virtual void InjectPendingMedia(Tensor hidden, int absoluteStart) { }
+
+        /// <summary>True while media embeddings wait to be injected; chunked prefill is skipped then.</summary>
+        protected virtual bool HasPendingMedia => false;
+
+        /// <summary>Extra replicated weights the per-rank code reads on every rank (Q/K norms):
+        /// pre-copied to each rank's device at load. Default: none.</summary>
+        protected virtual System.Collections.Generic.IEnumerable<string> ReplicatedLayerWeights(int layer)
+            => Array.Empty<string>();
+
+        // ---------------------------------------------------------------- geometry
+
+        protected int KeyDim => _keyDim;
+        protected int ValueDim => _valueDim;
+
+        /// <summary>The device mesh (stages x tensor-parallel ranks) this model runs on.</summary>
+        internal DeviceMesh Mesh => _mesh;
+
+        /// <summary>The K caches as [layer][rank], for tests that check placement.</summary>
+        internal Tensor[][] KeyCachesForTests => _cacheK;
+
+        /// <summary>Placement summary, e.g. "2 whole-layer stages x tensor parallel 2 = 4 devices".</summary>
+        public string PlacementDescription => _mesh?.Describe() ?? "not initialized";
+
+        /// <summary>One rank of one stage, as the per-rank code sees it.</summary>
+        protected sealed class RankScope
+        {
+            internal RankScope(int stage, int rank, int degree, IAllocator allocator, int localHeads, int localKvHeads)
+            {
+                Stage = stage;
+                Rank = rank;
+                Degree = degree;
+                Allocator = allocator;
+                LocalHeads = localHeads;
+                LocalKvHeads = localKvHeads;
+            }
+
+            public int Stage { get; }
+            public int Rank { get; }
+            /// <summary>Tensor-parallel degree of the stage (1 = the whole layer on one device).</summary>
+            public int Degree { get; }
+            public IAllocator Allocator { get; }
+            public int LocalHeads { get; }
+            public int LocalKvHeads { get; }
+        }
+
+        /// <summary>Absolute positions of the tokens of one forward.</summary>
+        protected readonly struct TokenPositions
+        {
+            private readonly int[] _explicit;
+
+            private TokenPositions(int start, int count, int[] explicitPositions)
+            {
+                Start = start;
+                Count = count;
+                _explicit = explicitPositions;
+            }
+
+            public static TokenPositions Contiguous(int start, int count) => new(start, count, null);
+            public static TokenPositions Explicit(int[] positions) => new(0, positions.Length, positions);
+
+            /// <summary>First position of a contiguous run (one sequence).</summary>
+            public int Start { get; }
+            public int Count { get; }
+            public bool IsContiguous => _explicit == null;
+            public int this[int token] => _explicit?[token] ?? Start + token;
+
+            /// <summary>Positions repeated for each of <paramref name="heads"/> heads, token-major,
+            /// as Ops.RoPEEx reads them.</summary>
+            public int[] PerHead(int heads)
+            {
+                var result = new int[Count * heads];
+                for (int t = 0; t < Count; t++)
+                {
+                    int p = this[t];
+                    for (int h = 0; h < heads; h++)
+                        result[t * heads + h] = p;
+                }
+                return result;
+            }
+        }
+
+        private static int ResolvePositiveEnv(string name, int fallback)
+        {
+            string raw = Environment.GetEnvironmentVariable(name);
+            return !string.IsNullOrWhiteSpace(raw) && int.TryParse(raw, out int v) && v > 0 ? v : fallback;
+        }
+
+        // ---------------------------------------------------------------- initialization
+
+        /// <summary>
+        /// Build the device mesh, load, fuse, shard and place the weights and allocate the KV
+        /// caches. Call once from the family constructor, after <see cref="ModelBase.Config"/>
+        /// (heads, KV heads, layers) and the tokenizer are set.
+        /// </summary>
+        /// <param name="executionIdentity">Everything that must agree across the nodes of a
+        /// multi-node layer split (hyperparameters, KV dtype); hashed by ModelBase.</param>
+        protected void InitializeDecoder(int keyDim, int valueDim, string executionIdentity)
+        {
+            if (keyDim != valueDim)
+                throw new NotSupportedException($"{Config.Architecture}: the shared decoder runtime needs equal key/value head dims, got {keyDim}/{valueDim}.");
+            _keyDim = keyDim;
+            _valueDim = valueDim;
+            // The runtime's per-op paths interleave host writes (positions, decode rotary and
+            // norms, paged-attention results, stage transfers, host experts) with device
+            // kernels. Metal's lazy-sync drains device work before host READS but has no
+            // host-WRITE barrier, so a later kernel can run against a stale device copy:
+            // measured on an M5 Pro, the per-family Mistral 3 forward this replaced was
+            // non-deterministic on ggml_metal (two identical runs 6.5e-2 apart, 8.9e-2 from the
+            // managed reference) and exact with it off (9e-4 from the reference, like
+            // hunyuan-dense). Gemma 4 and DiffusionGemma make the same call for the same
+            // reason. Process-wide; the next model's GgmlContext re-enables it.
+            if (_backend == BackendType.GgmlMetal && GgmlBasicOps.GetAsyncCompute())
+                GgmlBasicOps.SetAsyncCompute(false);
+            try
+            {
+                bool multiDevice = _requestedStages > 1 || _requestedTensorParallel > 1 || LayerSplitGroup != null;
+                // The model-aligned KV default must not depend on placement: a multi-device
+                // mesh resolves it from the whole checkpoint's metadata (a stage loads only
+                // its own layers), a single device from its loaded weights, as before.
+                if (multiDevice)
+                    ApplyModelAlignedKvCacheDefaultFromMetadata();
+                BuildMesh(executionIdentity);
+                LoadWeights();
+                FuseProjections();
+                DetectMoeLayers();
+                if (!multiDevice)
+                    ApplyModelAlignedKvCacheDefault(_quantWeights);
+                if (_mesh.TensorParallel > 1)
+                    ShardForMesh();
+                PrepareResidency();
+
+                int maxContext = ResolveConfiguredContextLength();
+                int initial = ResolveInitialCacheAllocationLength(maxContext);
+                if (initial < maxContext)
+                    Console.WriteLine($"Initial {_backend} KV cache allocation: {initial} tokens (grows on demand up to {maxContext}).");
+                InitCaches(initial, maxContext);
+                PreReplicateNormWeights();
+                Console.WriteLine($"  Placement: {_mesh.Describe()} (shared decoder runtime).");
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
+        }
+
+        private void FuseProjections()
+        {
+            int fusedQkv = 0;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (OwnsLayer(l) && TryFuseQkvWeights(l))
+                    fusedQkv++;
+            }
+            if (fusedQkv > 0)
+                Console.WriteLine($"  Fused projections: {fusedQkv} QKV");
+            FuseGateUpWeights();
+
+            _qkvFused = new bool[Config.NumLayers];
+            _gateUpFused = new bool[Config.NumLayers];
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                _qkvFused[l] = HasWeight($"blk.{l}.attn_qkv.weight");
+                _gateUpFused[l] = HasWeight($"blk.{l}.ffn_gate_up.weight");
+            }
+        }
+
+        private bool HasWeight(string name) =>
+            _quantWeights.ContainsKey(name) || _weights.ContainsKey(name) ||
+            _tpQuantWeights.ContainsKey(name) || _tpWeights.ContainsKey(name);
+
+        protected bool OwnsLayer(int layer) => LayerPlacement == null || LayerPlacement.Owns(layer);
+
+        // ---------------------------------------------------------------- KV caches
+
+        private void InitCaches(int initial, int maxContext)
+        {
+            _maxContextLength = maxContext;
+            _cacheCapacity = initial;
+            DType dtype = _kvCacheDtype.ToDType();
+            _cacheK = new Tensor[Config.NumLayers][];
+            _cacheV = new Tensor[Config.NumLayers][];
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!OwnsLayer(l)) continue;
+                int stage = _mesh.StageOf(l);
+                _cacheK[l] = new Tensor[_mesh.TensorParallel];
+                _cacheV[l] = new Tensor[_mesh.TensorParallel];
+                for (int r = 0; r < _mesh.TensorParallel; r++)
+                {
+                    IAllocator alloc = _mesh.Allocator(stage, r);
+                    _cacheK[l][r] = new Tensor(alloc, dtype, _localKvHeads, initial, _keyDim);
+                    _cacheV[l][r] = new Tensor(alloc, dtype, _localKvHeads, initial, _valueDim);
+                    InitializeCacheTensor(_cacheK[l][r]);
+                    InitializeCacheTensor(_cacheV[l][r]);
+                }
+            }
+            _cacheSeqLen = 0;
+        }
+
+        private void EnsureCacheCapacity(int required)
+        {
+            if (required <= _cacheCapacity)
+                return;
+            if (required > _maxContextLength)
+                throw new InvalidOperationException($"Requested sequence length {required} exceeds configured max context {_maxContextLength}.");
+            int capacity = Math.Max(_cacheCapacity, 1);
+            while (capacity < required)
+                capacity = Math.Min(_maxContextLength, capacity * 2);
+            DType dtype = _kvCacheDtype.ToDType();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_cacheK[l] == null) continue;
+                int stage = _mesh.StageOf(l);
+                for (int r = 0; r < _mesh.TensorParallel; r++)
+                {
+                    IAllocator alloc = _mesh.Allocator(stage, r);
+                    _cacheK[l][r] = Grow(_cacheK[l][r], new Tensor(alloc, dtype, _localKvHeads, capacity, _keyDim));
+                    _cacheV[l][r] = Grow(_cacheV[l][r], new Tensor(alloc, dtype, _localKvHeads, capacity, _valueDim));
+                }
+            }
+            _cacheCapacity = capacity;
+            Console.WriteLine($"Expanded {Config.Architecture} attention cache to {capacity} tokens.");
+        }
+
+        private Tensor Grow(Tensor old, Tensor grown)
+        {
+            InitializeCacheTensor(grown);
+            if (_cacheSeqLen > 0)
+            {
+                using Tensor src = old.Narrow(1, 0, _cacheSeqLen);
+                using Tensor dst = grown.Narrow(1, 0, _cacheSeqLen);
+                Ops.Copy(dst, src);
+            }
+            old.Dispose();
+            return grown;
+        }
+
+        private System.Collections.Generic.IEnumerable<Tensor> AllCacheTensors(Tensor[][] caches)
+        {
+            if (caches == null) yield break;
+            foreach (Tensor[] layer in caches)
+                if (layer != null)
+                    foreach (Tensor t in layer)
+                        if (t != null) yield return t;
+        }
+
+        public override void PrepareForPrefill(int requiredContextTokens) => EnsureCacheCapacity(requiredContextTokens);
+
+        protected override void ResetKVCacheCore()
+        {
+            _cacheSeqLen = 0;
+            _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
+            _forwardCount = 0;
+            _forwardSw.Reset();
+            foreach (Tensor t in AllCacheTensors(_cacheK)) ResetCacheTensor(t);
+            foreach (Tensor t in AllCacheTensors(_cacheV)) ResetCacheTensor(t);
+        }
+
+        protected override void TruncateKVCacheCore(int tokenCount)
+        {
+            base.TruncateKVCacheCore(tokenCount);
+            foreach (Tensor t in AllCacheTensors(_cacheK)) InvalidateTensorDeviceCache(t);
+            foreach (Tensor t in AllCacheTensors(_cacheV)) InvalidateTensorDeviceCache(t);
+        }
+
+        // ---- K/V snapshots: every layer's, every rank's rows, in (layer, rank) order. A plain
+        // linear GQA cache (row == absolute position, no window, no recurrent state), so a
+        // snapshot restores exactly what a fresh prefill writes. The fingerprint carries the
+        // mesh shape: a TP=2 snapshot holds half-head rows and must never reach a TP=1 cache.
+
+        public override bool SupportsKVStateSnapshot => LayerSplitGroup == null && _cacheK != null;
+
+        public override string KVStateFingerprint =>
+            $"{Config.Architecture}|decoder|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}" +
+            $"|k={_keyDim}|v={_valueDim}|dtype={_kvCacheDtype.ToShortString()}|mesh={_mesh?.Stages}x{_mesh?.TensorParallel}" +
+            FingerprintExtras;
+
+        /// <summary>Family terms the cache identity also depends on (rotary layout, ...).</summary>
+        protected virtual string FingerprintExtras => "";
+
+        private Tensor[] FlatCaches(Tensor[][] caches) => AllCacheTensors(caches).ToArray();
+
+        public override long ComputeKVBlockByteSize(int tokenCount)
+            => KvBlockTransfer.ComputeBlockByteSize(FlatCaches(_cacheK), FlatCaches(_cacheV), tokenCount);
+
+        public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
+            => SupportsKVStateSnapshot && KvBlockTransfer.Extract(
+                _allocator, FlatCaches(_cacheK), FlatCaches(_cacheV), _cacheSeqLen, startToken, tokenCount, destination);
+
+        public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
+        {
+            if (!SupportsKVStateSnapshot)
+                return false;
+            EnsureCacheCapacity(destToken + tokenCount);
+            if (!KvBlockTransfer.Inject(_allocator, FlatCaches(_cacheK), FlatCaches(_cacheV), _cacheSeqLen,
+                    destToken, tokenCount, source))
+                return false;
+            _cacheSeqLen = destToken + tokenCount;
+            foreach (Tensor t in AllCacheTensors(_cacheK)) InvalidateTensorDeviceCache(t);
+            foreach (Tensor t in AllCacheTensors(_cacheV)) InvalidateTensorDeviceCache(t);
+            return true;
+        }
+
+        // ---------------------------------------------------------------- forward
+
+        protected override float[] ForwardRefillCore(int[] tokens)
+        {
+            // Long prompts run in chunks so the per-layer score tensor stays bounded
+            // (~heads x chunk x context). Media carry positions within one forward, and a
+            // multi-node pipeline follows the serialized protocol, so neither is chunked.
+            if (tokens == null || tokens.Length <= PrefillChunkTokens || HasPendingMedia || LayerSplitGroup?.NodeCount > 1)
+                return ForwardCore(tokens);
+            int last = tokens.Length - 1;
+            for (int pos = 0; pos < last; pos += PrefillChunkTokens)
+            {
+                int len = Math.Min(PrefillChunkTokens, last - pos);
+                RunSequence(tokens.AsSpan(pos, len).ToArray(), wantLogits: false);
+            }
+            return ForwardCore(new[] { tokens[last] });
+        }
+
+        protected override float[] ForwardCore(int[] tokens)
+        {
+            ArgumentNullException.ThrowIfNull(tokens);
+            if (tokens.Length == 0) throw new ArgumentException("A forward needs at least one token.", nameof(tokens));
+            if (LayerSplitGroup?.NodeCount > 1)
+                return ForwardDistributedPipeline(tokens);
+            _logitsBuffer = RunSequence(tokens, wantLogits: true);
+            _forwardCount++;
+            return _logitsBuffer;
+        }
+
+        private float[] RunSequence(int[] tokens, bool wantLogits)
+        {
+            int seqLen = tokens.Length;
+            int start = _cacheSeqLen;
+            EnsureCacheCapacity(checked(start + seqLen));
+            _forwardSw.Start();
+            try
+            {
+                var positions = TokenPositions.Contiguous(start, seqLen);
+                EnterStage(0);
+                long t0 = Stopwatch.GetTimestamp();
+                Tensor hidden = Embedding(tokens);
+                _embTicks += Stopwatch.GetTimestamp() - t0;
+                InjectMedia(hidden, start);
+
+                hidden = RunLayers(hidden, positions, batch: null);
+                float[] logits = null;
+                if (wantLogits)
+                    logits = ProjectRows(hidden, new[] { seqLen - 1 });
+                hidden.Dispose();
+                _cacheSeqLen += seqLen;
+                return logits;
+            }
+            finally
+            {
+                EnterStage(0);
+                _forwardSw.Stop();
+            }
+        }
+
+        /// <summary>A multi-node layer split: the serialized stage protocol (ModelBase).</summary>
+        private float[] ForwardDistributedPipeline(int[] tokens)
+        {
+            int seqLen = tokens.Length;
+            int start = _cacheSeqLen;
+            EnsureCacheCapacity(checked(start + seqLen));
+            var positions = TokenPositions.Contiguous(start, seqLen);
+            _forwardSw.Start();
+            try
+            {
+                _logitsBuffer = ForwardLayerPipeline(tokens,
+                    embed: () =>
+                    {
+                        Tensor hidden = Embedding(tokens);
+                        InjectMedia(hidden, start);
+                        return hidden;
+                    },
+                    runLayer: (hidden, layer) => LayerOnOneDevice(hidden, layer, positions, null),
+                    project: hidden => ProjectRows(hidden, new[] { seqLen - 1 }));
+                _cacheSeqLen += seqLen;
+                _forwardCount++;
+                return _logitsBuffer;
+            }
+            finally { _forwardSw.Stop(); }
+        }
+
+        /// <summary>Run every local layer, moving the activation between stages.</summary>
+        private Tensor RunLayers(Tensor hidden, TokenPositions positions, PagedBatch batch)
+        {
+            int stage = 0;
+            Tensor[] ranks = null;
+            if (_mesh.TensorParallel > 1)
+                ranks = Replicate(hidden, 0);
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                int s = _mesh.StageOf(layer);
+                if (s != stage)
+                {
+                    if (ranks != null)
+                    {
+                        hidden = ranks[0];
+                        for (int r = 1; r < ranks.Length; r++) ranks[r].Dispose();
+                    }
+                    EnterStage(s);
+                    hidden = MoveTo(hidden, _mesh.Allocator(s, 0));
+                    stage = s;
+                    if (ranks != null)
+                        ranks = Replicate(hidden, s);
+                }
+
+                if (ranks == null)
+                {
+                    hidden = LayerOnOneDevice(hidden, layer, positions, batch);
+                    if (_backend == BackendType.Mlx && (layer + 1) % MlxEvalEveryNLayers == 0 && layer + 1 != Config.NumLayers)
+                        MlxFusedOps.TryAsyncEvaluate(hidden);
+                }
+                else
+                {
+                    LayerAcrossRanks(ranks, layer, s, positions, batch);
+                }
+            }
+            if (ranks != null)
+            {
+                hidden = ranks[0];
+                for (int r = 1; r < ranks.Length; r++) ranks[r].Dispose();
+            }
+            // The head runs on the last stage's first device.
+            int last = _mesh.Stages - 1;
+            if (stage != last)
+            {
+                EnterStage(last);
+                hidden = MoveTo(hidden, _mesh.Allocator(last, 0));
+            }
+            return hidden;
+        }
+
+        /// <summary>Final norm and LM head for <paramref name="rows"/> of <paramref name="hidden"/>.</summary>
+        private float[] ProjectRows(Tensor hidden, int[] rows)
+        {
+            Tensor normed = RMSNormOp(hidden, "output_norm.weight");
+            Tensor selected;
+            if (rows.Length == hidden.Sizes[0])
+            {
+                selected = normed;
+            }
+            else if (rows.Length == 1)
+            {
+                using Tensor row = normed.Narrow(0, rows[0], 1);
+                selected = Ops.NewContiguous(row);
+                normed.Dispose();
+            }
+            else
+            {
+                int dim = Config.HiddenSize;
+                float[] all = normed.GetElementsAsFloat((int)normed.ElementCount());
+                normed.Dispose();
+                var packed = new float[rows.Length * dim];
+                for (int i = 0; i < rows.Length; i++)
+                    Array.Copy(all, (long)rows[i] * dim, packed, (long)i * dim, dim);
+                selected = CreateFloatTensor(packed, rows.Length, dim);
+            }
+
+            long t0 = Stopwatch.GetTimestamp();
+            Tensor logits = LinearForward(selected, "output.weight") ?? LinearForward(selected, "token_embd.weight");
+            _lmHeadTicks += Stopwatch.GetTimestamp() - t0;
+            selected.Dispose();
+            long t1 = Stopwatch.GetTimestamp();
+            float[] result = TensorToFloatArray(logits);
+            _logitsCopyTicks += Stopwatch.GetTimestamp() - t1;
+            logits.Dispose();
+            return result;
+        }
+
+        // ---------------------------------------------------------------- one layer
+
+        /// <summary>A layer whose stage is a single device: the backend fast paths apply.</summary>
+        private Tensor LayerOnOneDevice(Tensor hidden, int layer, TokenPositions positions, PagedBatch batch)
+        {
+            string p = $"blk.{layer}.";
+            RankScope scope = Scope(_mesh.StageOf(layer), 0);
+
+            Tensor normed = RMSNormOp(hidden, p + "attn_norm.weight");
+            Tensor attn = Attention(scope, normed, layer, positions, batch);
+            normed.Dispose();
+
+            // MLX: (hidden += attn; normed2 = rmsnorm(hidden)) in one dispatch.
+            Tensor normed2 = null;
+            if (_backend == BackendType.Mlx && _weights.TryGetValue(p + "ffn_norm.weight", out var ffnNorm))
+            {
+                normed2 = new Tensor(_allocator, DType.Float32, hidden.Sizes[0], hidden.Sizes[1]);
+                if (!MlxFusedOps.TryAddRmsNorm(hidden, attn, ffnNorm, Config.Eps, normed2))
+                {
+                    normed2.Dispose();
+                    normed2 = null;
+                }
+            }
+            if (normed2 == null)
+            {
+                Ops.Add(hidden, hidden, attn);
+                attn.Dispose();
+                // GGML: norm + gate/up + SiLU*mul + down + residual in one graph.
+                if (_gateUpFused[layer] &&
+                    TryFusedDenseSwiGLUFFNInto(hidden, p + "ffn_norm.weight", p + "ffn_gate_up.weight", p + "ffn_down.weight"))
+                    return hidden;
+                normed2 = RMSNormOp(hidden, p + "ffn_norm.weight");
+            }
+            else
+            {
+                attn.Dispose();
+            }
+
+            Tensor ffn = Ffn(scope, normed2, layer);
+            normed2.Dispose();
+            Ops.Add(hidden, hidden, ffn);
+            ffn.Dispose();
+            return hidden;
+        }
+
+        /// <summary>A layer whose stage is a tensor-parallel group: each branch body runs once per
+        /// rank on that rank's shards and replicated activation, and the partial outputs are
+        /// summed before the residual add.</summary>
+        private void LayerAcrossRanks(Tensor[] hidden, int layer, int stage, TokenPositions positions, PagedBatch batch)
+        {
+            string p = $"blk.{layer}.";
+            int degree = _mesh.TensorParallel;
+            var partial = new Tensor[degree];
+
+            Tensor attnNorm = _weights[p + "attn_norm.weight"];
+            _mesh.RunPerRank(stage, r =>
+            {
+                RankScope scope = Scope(stage, r);
+                using Tensor normed = Ops.RMSNorm(null, hidden[r], Replica(attnNorm, stage, r), null, Config.Eps);
+                partial[r] = Attention(scope, normed, layer, positions, batch);
+            });
+            _mesh.AllReduce(stage, partial);
+            _mesh.RunPerRank(stage, r =>
+            {
+                Ops.Add(hidden[r], hidden[r], partial[r]);
+                partial[r].Dispose();
+                partial[r] = null;
+            });
+
+            Tensor ffnNorm = _weights[p + "ffn_norm.weight"];
+            if (_moeLayer[layer])
+            {
+                // Routing is identical on every rank (replicated input and router): decide it
+                // once, then each rank runs its own experts.
+                var normed = new Tensor[degree];
+                _mesh.RunPerRank(stage, r => normed[r] = Ops.RMSNorm(null, hidden[r], Replica(ffnNorm, stage, r), null, Config.Eps));
+                Routing routing = Route(Scope(stage, 0), normed[0], layer);
+                _mesh.RunPerRank(stage, r =>
+                {
+                    partial[r] = MoeFfn(Scope(stage, r), normed[r], layer, routing);
+                    normed[r].Dispose();
+                });
+            }
+            else
+            {
+                _mesh.RunPerRank(stage, r =>
+                {
+                    RankScope scope = Scope(stage, r);
+                    using Tensor normed = Ops.RMSNorm(null, hidden[r], Replica(ffnNorm, stage, r), null, Config.Eps);
+                    partial[r] = Ffn(scope, normed, layer);
+                });
+            }
+            _mesh.AllReduce(stage, partial);
+            _mesh.RunPerRank(stage, r =>
+            {
+                Ops.Add(hidden[r], hidden[r], partial[r]);
+                partial[r].Dispose();
+            });
+        }
+
+        private RankScope Scope(int stage, int rank)
+            => new(stage, rank, _mesh.TensorParallel,
+                _mesh.TensorParallel == 1 ? _allocator : _mesh.Allocator(stage, rank),
+                _localHeads, _localKvHeads);
+
+        // ---------------------------------------------------------------- branch bodies
+
+        /// <summary>
+        /// Attention branch body for one rank: Q/K/V projections, the family's rotary step, the
+        /// cache write and attention over the rank's heads, and the output projection. Under
+        /// tensor parallelism the result is that rank's partial sum (a row-parallel projection).
+        /// </summary>
+        private Tensor Attention(RankScope scope, Tensor input, int layer, TokenPositions positions, PagedBatch batch)
+        {
+            string p = $"blk.{layer}.";
+            int heads = scope.LocalHeads, kvHeads = scope.LocalKvHeads;
+            int qDim = heads * _keyDim, kDim = kvHeads * _keyDim, vDim = kvHeads * _valueDim;
+            int tokens = positions.Count;
+            bool decode = batch == null && tokens == 1;
+
+            Tensor q, k, v;
+            if (_qkvFused[layer])
+            {
+                Tensor qkv = Linear(scope, input, p + "attn_qkv.weight");
+                if (decode)
+                {
+                    q = qkv.Narrow(1, 0, qDim);
+                    k = qkv.Narrow(1, qDim, kDim);
+                    v = qkv.Narrow(1, qDim + kDim, vDim);
+                }
+                else
+                {
+                    using (Tensor view = qkv.Narrow(1, 0, qDim)) q = Ops.NewContiguous(view);
+                    using (Tensor view = qkv.Narrow(1, qDim, kDim)) k = Ops.NewContiguous(view);
+                    using (Tensor view = qkv.Narrow(1, qDim + kDim, vDim)) v = Ops.NewContiguous(view);
+                }
+                qkv.Dispose();
+            }
+            else
+            {
+                q = Linear(scope, input, p + "attn_q.weight");
+                k = Linear(scope, input, p + "attn_k.weight");
+                v = Linear(scope, input, p + "attn_v.weight");
+            }
+
+            RotateQueryKey(scope, layer, ref q, ref k, positions);
+
+            long t0 = Stopwatch.GetTimestamp();
+            Tensor attn = batch != null
+                ? PagedAttention(scope, layer, q, k, v, batch)
+                : decode
+                    ? DecodeAttention(scope, layer, q, k, v, positions.Start)
+                    : PrefillAttention(scope, layer, q, k, v, positions.Start, tokens);
+            _attnTicks += Stopwatch.GetTimestamp() - t0;
+
+            Tensor output = Linear(scope, attn, p + "attn_output.weight");
+            attn.Dispose();
+            return output;
+        }
+
+        private Tensor DecodeAttention(RankScope scope, int layer, Tensor q, Tensor k, Tensor v, int start)
+        {
+            Tensor cacheK = _cacheK[layer][scope.Rank], cacheV = _cacheV[layer][scope.Rank];
+            int heads = scope.LocalHeads, kvHeads = scope.LocalKvHeads;
+            float scale = 1.0f / MathF.Sqrt(_keyDim);
+            CopyToCacheDecode(cacheK, k, cacheV, v, kvHeads, _keyDim, start);
+            k.Dispose();
+            v.Dispose();
+
+            var result = new Tensor(scope.Allocator, DType.Float32, 1, heads * _valueDim);
+            // MLX keeps K/V on the device and runs mlx_fast_sdpa; the host path would copy
+            // the whole cache back every token.
+            bool done = _backend == BackendType.Mlx && scope.Degree == 1 && MlxFusedOps.TryDecodeAttention(
+                result, q, cacheK, cacheV, heads, kvHeads, _keyDim, 0, start + 1, _cacheCapacity, false, scale);
+            if (!done)
+                AttentionDecodePureCS(q, cacheK, cacheV, result, heads, kvHeads, _keyDim, start + 1, scale);
+            q.Dispose();
+            return result;
+        }
+
+        private Tensor PrefillAttention(RankScope scope, int layer, Tensor q, Tensor k, Tensor v, int start, int tokens)
+        {
+            Tensor cacheK = _cacheK[layer][scope.Rank], cacheV = _cacheV[layer][scope.Rank];
+            int heads = scope.LocalHeads, kvHeads = scope.LocalKvHeads;
+            int total = start + tokens;
+            float scale = 1.0f / MathF.Sqrt(_keyDim);
+
+            Tensor qHeads = ReshapeToHeads(q, heads, tokens, _keyDim);
+            q.Dispose();
+            Tensor kHeads = ReshapeToHeads(k, kvHeads, tokens, _keyDim);
+            k.Dispose();
+            Tensor vHeads = ReshapeToHeads(v, kvHeads, tokens, _valueDim);
+            v.Dispose();
+            CopyToCache(cacheK, kHeads, start, tokens);
+            CopyToCache(cacheV, vHeads, start, tokens);
+            kHeads.Dispose();
+            vHeads.Dispose();
+
+            int group = heads / kvHeads;
+            Tensor kExpanded = ExpandKVHeads(cacheK, group, total);
+            Tensor vExpanded = ExpandKVHeads(cacheV, group, total);
+            using Tensor kT = kExpanded.Transpose(1, 2);
+            var scores = new Tensor(scope.Allocator, DType.Float32, heads, tokens, total);
+            // Half operands by name on direct CUDA: K/V come from the F16 cache, Q and P are
+            // rounded as ggml's flash attention rounds them.
+            HalfOperandGemm.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
+            qHeads.Dispose();
+            kExpanded.Dispose();
+
+            if (IsGgmlBackend)
+            {
+                GgmlBasicOps.AttentionSoftmaxWithSinks(scores, sinks: null, numHeads: heads, seqLen: tokens,
+                    kvLen: total, maskStartPos: start, slidingWindow: 0, scale: 1.0f);
+            }
+            else
+            {
+                Ops.AddCausalMask(scores, tokens, start, float.NegativeInfinity);
+                Ops.Softmax(scores, scores);
+            }
+
+            var attn = new Tensor(scope.Allocator, DType.Float32, heads, tokens, _valueDim);
+            HalfOperandGemm.AddmmBatch(attn, 0, attn, 1.0f, scores, vExpanded);
+            scores.Dispose();
+            vExpanded.Dispose();
+            Tensor flat = ReshapeFromHeads(attn, heads, tokens, _valueDim);
+            attn.Dispose();
+            return flat;
+        }
+
+        /// <summary>SwiGLU FFN branch body for one rank (fused gate|up or separate projections).</summary>
+        private Tensor Ffn(RankScope scope, Tensor input, int layer)
+        {
+            if (_moeLayer[layer])
+                return MoeFfn(scope, input, layer, routing: null);
+            string p = $"blk.{layer}.";
+            int tokens = (int)input.Sizes[0];
+            Tensor gate, up;
+            if (_gateUpFused[layer])
+            {
+                if (scope.Degree == 1)
+                    return FFN(input, p + "ffn_gate_up.weight", p + "ffn_down.weight", tokens);
+                Tensor gateUp = Linear(scope, input, p + "ffn_gate_up.weight");
+                int half = (int)(gateUp.Sizes[1] / 2);
+                if (tokens == 1)
+                {
+                    gate = gateUp.Narrow(1, 0, half);
+                    up = gateUp.Narrow(1, half, half);
+                }
+                else
+                {
+                    using (Tensor view = gateUp.Narrow(1, 0, half)) gate = Ops.NewContiguous(view);
+                    using (Tensor view = gateUp.Narrow(1, half, half)) up = Ops.NewContiguous(view);
+                }
+                gateUp.Dispose();
+            }
+            else
+            {
+                gate = Linear(scope, input, p + "ffn_gate.weight");
+                up = Linear(scope, input, p + "ffn_up.weight");
+            }
+            Ops.SiLUMul(gate, gate, up);
+            up.Dispose();
+            Tensor down = Linear(scope, gate, p + "ffn_down.weight");
+            gate.Dispose();
+            return down;
+        }
+
+        /// <summary>A projection on <paramref name="scope"/>'s device: the whole weight on a single
+        /// device (LinearForward, with LoRA and every backend fast path), the rank's shard under
+        /// tensor parallelism.</summary>
+        protected Tensor Linear(RankScope scope, Tensor input, string weightName)
+        {
+            if (scope.Degree == 1)
+                return LinearForward(input, weightName)
+                    ?? throw new InvalidOperationException($"{Config.Architecture}: weight '{weightName}' is missing.");
+
+            long t0 = Stopwatch.GetTimestamp();
+            int rows = (int)input.Sizes[0];
+            Tensor result;
+            if (_tpQuantWeights.TryGetValue(weightName, out QuantizedWeight[] quant))
+            {
+                QuantizedWeight shard = quant[scope.Rank];
+                result = new Tensor(scope.Allocator, DType.Float32, rows, (int)shard.Ne1);
+                AddmmQuantManaged(result, input, shard);
+            }
+            else if (_tpWeights.TryGetValue(weightName, out Tensor[] dense))
+            {
+                Tensor shard = dense[scope.Rank];
+                using Tensor transposed = shard.Transpose();
+                result = new Tensor(scope.Allocator, DType.Float32, rows, (int)shard.Sizes[0]);
+                Ops.Addmm(result, 0, result, 1.0f, input, transposed);
+            }
+            else
+            {
+                throw new InvalidOperationException($"{Config.Architecture}: weight '{weightName}' has no tensor-parallel shard.");
+            }
+            if (_tpWeightScales.TryGetValue(weightName, out float scale) && scale != 1.0f)
+                Ops.Mul(result, result, scale);
+            Interlocked.Add(ref _linearTicks, Stopwatch.GetTimestamp() - t0);
+            return result;
+        }
+
+        // ---------------------------------------------------------------- devices
+
+        /// <summary>Make <paramref name="stage"/>'s first device the one the single-device helpers
+        /// (Embedding, LinearForward, RMSNormOp, ...) allocate on and run on.</summary>
+        private void EnterStage(int stage)
+        {
+            if (_mesh == null || _mesh.IsSingleDevice) return;
+            _allocator = _mesh.Allocator(stage, 0);
+            if (IsGgmlBackend) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(stage, 0));
+        }
+
+        /// <summary>
+        /// Mark a tensor just written through a host pointer, so no later device kernel reads a
+        /// stale device copy of it. Metal's lazy-sync drains device work before host READS
+        /// (GetFloatPtr, GetElementsAsFloat) but has no host-WRITE barrier. Call it right after
+        /// the write, and only for tensors actually written on the host: a tensor whose newest
+        /// value is still a pending device result must not be invalidated.
+        /// </summary>
+        protected void HostWritten(Tensor tensor)
+        {
+            if (IsGgmlBackend && tensor != null)
+                GgmlBasicOps.InvalidateTensorHostBuffer(tensor);
+        }
+
+        private void InjectMedia(Tensor hidden, int absoluteStart)
+        {
+            if (!HasPendingMedia) return;
+            InjectPendingMedia(hidden, absoluteStart);
+            HostWritten(hidden);
+        }
+
+        /// <summary>The activation on <paramref name="target"/>; copied through host memory when it
+        /// lives elsewhere (stage boundaries carry one [tokens, hidden] tensor).</summary>
+        private Tensor MoveTo(Tensor tensor, IAllocator target)
+        {
+            if (ReferenceEquals(tensor.Storage.Allocator, target))
+                return tensor;
+            float[] values = TensorToFloatArray(tensor);
+            var moved = new Tensor(target, DType.Float32, tensor.Sizes);
+            moved.SetElementsAsFloat(values);
+            HostWritten(moved);
+            tensor.Dispose();
+            return moved;
+        }
+
+        /// <summary>One copy of <paramref name="hidden"/> per rank of <paramref name="stage"/>;
+        /// takes ownership of <paramref name="hidden"/> (it becomes rank 0's copy).</summary>
+        private Tensor[] Replicate(Tensor hidden, int stage)
+        {
+            var copies = new Tensor[_mesh.TensorParallel];
+            copies[0] = MoveTo(hidden, _mesh.Allocator(stage, 0));
+            float[] values = null;
+            for (int r = 1; r < copies.Length; r++)
+            {
+                IAllocator alloc = _mesh.Allocator(stage, r);
+                copies[r] = new Tensor(alloc, DType.Float32, copies[0].Sizes);
+                if (IsGgmlBackend || alloc is TensorSharp.Cpu.CpuAllocator)
+                {
+                    Ops.Copy(copies[r], copies[0]);
+                }
+                else
+                {
+                    values ??= TensorToFloatArray(copies[0]);
+                    copies[r].SetElementsAsFloat(values);
+                    HostWritten(copies[r]);
+                }
+            }
+            return copies;
+        }
+
+        /// <summary>A replicated (unsharded) weight resident on (stage, rank)'s device, copied once.</summary>
+        protected Tensor Replica(Tensor weight, int stage, int rank)
+        {
+            IAllocator target = _mesh.Allocator(stage, rank);
+            if (ReferenceEquals(weight.Storage.Allocator, target) || IsGgmlBackend)
+                return weight;
+            return _replicas.GetOrAdd((weight, _mesh.GlobalDevice(stage, rank)), _ =>
+            {
+                var copy = new Tensor(target, weight.ElementType, weight.Sizes);
+                if (target is TensorSharp.Cpu.CpuAllocator)
+                    Ops.Copy(copy, weight);
+                else
+                    copy.SetElementsAsFloat(weight.GetElementsAsFloat((int)weight.ElementCount()));
+                return copy;
+            });
+        }
+
+        private void PreReplicateNormWeights()
+        {
+            if (_mesh.TensorParallel == 1) return;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!OwnsLayer(l)) continue;
+                int stage = _mesh.StageOf(l);
+                var names = new[] { $"blk.{l}.attn_norm.weight", $"blk.{l}.ffn_norm.weight" }.Concat(ReplicatedLayerWeights(l));
+                foreach (string name in names)
+                {
+                    if (!_weights.TryGetValue(name, out Tensor w)) continue;
+                    for (int r = 0; r < _mesh.TensorParallel; r++)
+                        Replica(w, stage, r);
+                }
+            }
+        }
+
+        public override void Dispose()
+        {
+            foreach (Tensor t in AllCacheTensors(_cacheK)) t.Dispose();
+            foreach (Tensor t in AllCacheTensors(_cacheV)) t.Dispose();
+            _cacheK = _cacheV = null;
+            foreach (Tensor copy in _replicas.Values) copy.Dispose();
+            _replicas.Clear();
+            DisposePagedBuffers();
+            base.Dispose();
+        }
+    }
+}

@@ -91,10 +91,19 @@ namespace TensorSharp.Models
             Aliases = new[] { MiniMaxM3Model.ArchitectureId, "minimax_m3" },
             Factory = c => new MiniMaxM3Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup,
                 c.LayerSplitDegree, c.DraftModelPath),
-            MultiGpu = MultiGpuMode.TensorParallel,
-            SupportsLayerSplit = true,
-            MultiGpuLimitation = TensorParallelPlacement,
-            LayerSplitBackends = new[] { BackendType.GgmlCuda },
+            Serving = new ServingContract
+            {
+                Implementation = ServingImplementation.Bespoke,
+                Backends = new[] { BackendType.GgmlCuda, BackendType.GgmlCpu },
+                HasRoutedExperts = true,
+                // The native executor batches decode and prefill over per-sequence slots in every placement.
+                ContinuousBatching = MechanismSupport.On(BackendType.GgmlCuda, BackendType.GgmlCpu),
+                TensorParallel = MechanismSupport.On(BackendType.GgmlCuda).KeepsBatching(),
+                LayerSplit = MechanismSupport.On(BackendType.GgmlCuda).KeepsBatching(),
+                HybridParallel = MechanismSupport.None(
+                    "MiniMax-M3.1's native executor runs --tp and --layer-split as separate placement modes."),
+                ExpertOffload = MechanismSupport.On(BackendType.GgmlCuda, BackendType.GgmlCpu),
+            },
             SupportsDistributedTensorParallel = false,
             DescribeMultiGpuPlacement = n =>
                 $"  Multi-GPU: MiniMax-M3.1 uses {n} GPUs by LAYER SPLIT (whole-layer placement in its native " +
