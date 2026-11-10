@@ -3,7 +3,8 @@
   // code execution, network, package installs, or machine-specific skills.
   // Source and checksum are shared with agent-qwen3.8-27b.json.
   // The pinned file is IQ3_XXS, not the Q4_K_XL named by that preset's old comments.
-  // Fastest setups: config/qwen3.8-27b-ninfer.json (NVIDIA) and config/qwen3.8-27b-metal-dflash2.json (Apple
+  // Fastest setups: config/qwen3.8-27b-ninfer.json (NVIDIA RTX 50-series), config/qwen3.8-27b-cuda-dflash2.json (other
+  // NVIDIA GPUs, ggml_cuda + DFlash2: 176-178 tok/s on an RTX 5090) and config/qwen3.8-27b-metal-dflash2.json (Apple
   // Silicon); this one decodes without a drafter (~100 tok/s on an RTX 5090, ~21 on an M5 Pro).
   "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
   "model": {

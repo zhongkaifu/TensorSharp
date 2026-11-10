@@ -280,6 +280,10 @@ public static partial class ModelCatalog
             // eng/qwen38-engine-bench.py: long generation 34.5 tok/s (plain 21.3), 49.7 after a
             // 4K-token prompt. DFlash2 stays the drafter: Tencent's DSpine (converted locally, no
             // published GGUF) was faster only after 4K-8K prompts (65.0) and tied elsewhere.
+            // The same files and settings are the fastest on ggml_cuda, the backend the desktop app
+            // picks on an NVIDIA GPU (config/qwen3.8-27b-cuda-dflash2.json): on an RTX 5090,
+            // 2026-11-10, long generation 176-178 tok/s against 89-96 plain, and four requests at
+            // once 180-192 in all.
             DraftTuning = new CatalogDraftTuning(MaxDraftTokens: 7, MinDraftProb: 0f),
             SupportsThinking = true,
             License = ApacheLicense,

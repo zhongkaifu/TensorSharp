@@ -1,0 +1,61 @@
+{
+  // Qwen3.8-27B on NVIDIA through ggml_cuda at its fastest: the UD-IQ3_XXS GGUF with the DFlash2 block drafter, 7
+  // drafts a step, every one verified (no confidence gate), greedy. Shared CLI/Server.Host profile; add --chat only
+  // for the interactive CLI.
+  //
+  //   TensorSharp.Cli         --config config/qwen3.8-27b-cuda-dflash2.json --chat
+  //   TensorSharp.Server.Host --config config/qwen3.8-27b-cuda-dflash2.json
+  //
+  // Measured on an RTX 5090 (32 GB), 2026-11-10, at d4f33229 (after 74310bb0's VRAM fix), eng/qwen38-engine-bench.py,
+  // two passes in opposite orders, decode tok/s: long generation 176-178 (89-96 without the drafter), 184-189 after a
+  // 16K-token prompt, 211-220 on the quality tasks, four requests at once 180-192 in all. After a 4K-token prompt
+  // 251 and 140; the second pass's single 54-token answer had per-window costs in line with the first. 48% of drafts
+  // accepted on free generation; per window the draft costs 2.3 ms and the verify 18.9 ms.
+  //
+  // RTX 50-series (sm_120): config/qwen3.8-27b-ninfer.json is faster there (the NVFP4 artifact on the direct CUDA
+  // engine: ~203 tok/s single stream, up to 372 for four requests); its kernels need sm_120. This preset runs on
+  // any GPU ggml_cuda supports, but it was measured on the RTX 5090 only.
+  //
+  // For mostly long-prompt work, Tencent's DSpine drafter is faster here: 15 drafts with a 0.35 confidence gate
+  // (--spec-draft 15 --spec-pmin 0.35) decode 416-431 tok/s after a 4K prompt and 233-252 after 16K, but 146-160
+  // on free generation, where DFlash2 stays ahead. DSpine has no published GGUF: convert the pinned checkpoint with
+  // `python3 eng/dspine-to-gguf.py` and pass it as --draft-model. See docs/speculative_decoding.md#dspine.
+  "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
+  "model": {
+    "path": "${modelRoot}/Qwen/Qwen3.8-27B-UD-IQ3_XXS.gguf",
+    "urls": ["https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-IQ3_XXS.gguf"],
+    "sha256": "c0b7c3038681ed2e3040456c1dd45f9858b6c2290bed172c70388a94874f3eee"
+  },
+
+  // The vision projector, for images and video frames: 0.93 GB on disk, held as F32 once loaded. Text-only runs can
+  // drop this block (or pass --mmproj none) and keep that memory for the KV cache.
+  "mmproj": {
+    "path": "${modelRoot}/Qwen/Qwen3.8-27B-mmproj-BF16.gguf",
+    "urls": ["https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/mmproj-BF16.gguf"],
+    "sha256": "83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53"
+  },
+
+  // Naming a DFlash file is the request to speculate with it (no --spec needed). Pass --no-spec on the command line
+  // to decode without it (the file is still fetched).
+  "draft-model": {
+    "path": "${modelRoot}/Qwen/Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+    "urls": ["https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/resolve/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"],
+    "sha256": "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd"
+  },
+  "backend": "ggml_cuda",
+
+  // 7 drafts per step, every one verified (no confidence gate).
+  "spec-draft": 7,
+  "spec-pmin": 0,
+
+  "max-tokens": 1024,
+  "temperature": 0,
+  "repeat-penalty": 1,
+  "no-skills": true,
+
+  "environment": {
+    // The measured setup. The model declares 262,144 tokens; a larger window costs KV memory beside the 12 GB of
+    // weights and drafter on a 32 GB card.
+    "MAX_CONTEXT": "32768"
+  }
+}
