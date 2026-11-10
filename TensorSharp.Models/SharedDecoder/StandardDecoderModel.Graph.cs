@@ -453,7 +453,7 @@ namespace TensorSharp.Models
         /// </summary>
         protected sealed class GraphStep : IDisposable
         {
-            private enum Kind : byte { Leaf, Op, Effect, Output }
+            private enum Kind : byte { Leaf, Op, Effect, Output, Alias }
 
             private readonly struct Rec
             {
@@ -556,6 +556,15 @@ namespace TensorSharp.Models
             {
                 Mix(3); Mix(node);
                 if (_record) _recs.Add(new Rec { Kind = Kind.Effect, Node = node });
+            }
+
+            /// <summary>Write <paramref name="node"/>'s result in place inside the state leaf
+            /// <paramref name="baseLeaf"/> at <paramref name="offset"/> bytes; where the base is not
+            /// resident, the <paramref name="fallback"/> copy runs instead (see GgmlGraph.Alias).</summary>
+            public void Alias(int node, int baseLeaf, long offset, int fallback)
+            {
+                Mix(5); Mix(node); Mix(baseLeaf); Mix(offset); Mix(fallback);
+                if (_record) _recs.Add(new Rec { Kind = Kind.Alias, Node = node, Srcs = new[] { baseLeaf, fallback }, Bytes = offset });
             }
 
             /// <summary>The step's result: <paramref name="floats"/> F32 values of <paramref name="node"/>.</summary>
@@ -845,6 +854,7 @@ namespace TensorSharp.Models
                             case Kind.Leaf: g.Leaf(r.Role, r.Type, r.Ne, r.Data, r.Bytes); break;
                             case Kind.Op: g.Op((GgmlGraphOp)r.Op, r.Srcs, r.Ip, r.Fp); break;
                             case Kind.Effect: g.Effect(r.Node); break;
+                            case Kind.Alias: g.Alias(r.Node, r.Srcs[0], r.Bytes, r.Srcs[1]); break;
                             case Kind.Output:
                                 logits = new float[r.Bytes];
                                 pin = GCHandle.Alloc(logits, GCHandleType.Pinned);

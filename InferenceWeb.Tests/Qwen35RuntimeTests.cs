@@ -65,6 +65,12 @@ public sealed class Qwen35RuntimeTests : IDisposable
         return rows;
     }
 
+    /// <summary>Backends whose matmuls round activations (ggml_cpu to BF16; ggml_cuda to BF16 / Q8_1,
+    /// with different kernels for one row than for several): measured on ggml_cuda (RTX PRO 6000,
+    /// 2026-11-10) up to 7.4e-3 against the managed reference and 5.2e-3 graph vs per-op on these
+    /// fixtures, ggml_cpu up to 1.5e-2.</summary>
+    private static bool RoundsActivations(BackendType backend) => backend is BackendType.GgmlCpu or BackendType.GgmlCuda;
+
     private static double RelL2(float[] a, float[] b)
     {
         Assert.Equal(a.Length, b.Length);
@@ -125,7 +131,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
         // (moe), MLX 6.3e-4 / 1.2e-3; ggml_cpu 4.4e-3 / 1.5e-2, where ggml's BF16 matmul rounds
         // the activations to BF16 - Qwen35Model on ggml_cpu sits 4.9e-3 / 1.5e-2 from the same
         // reference. The Gated DeltaNet recurrence itself runs the same host code everywhere.
-        double tolerance = backend == BackendType.GgmlCpu ? 2.5e-2 : 5e-3;
+        double tolerance = RoundsActivations(backend) ? 2.5e-2 : 5e-3;
         for (int i = 0; i < reference.Count; i++)
         {
             double rel = RelL2(actual[i], reference[i]);
@@ -229,7 +235,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture(variant);
-        double tolerance = backend == BackendType.Cpu ? 1e-6 : backend == BackendType.GgmlCpu ? 2.5e-2 : 5e-3;
+        double tolerance = backend == BackendType.Cpu ? 1e-6 : RoundsActivations(backend) ? 2.5e-2 : 5e-3;
         SlotParity.AssertBatchedSlotsMatchAlone(() => Create(path, tp, stages, backend), tolerance,
             $"qwen35 {variant} tp={tp} stages={stages} {backend}");
     }
@@ -253,11 +259,45 @@ public sealed class Qwen35RuntimeTests : IDisposable
         List<float[]> rows = Script(graph);
         Assert.True(graph.GraphRuns >= rows.Count, "every step must run as a whole-forward graph");
         Assert.True(graph.GraphReplays > 0, "consecutive decode tokens must replay their graph");
-        double tolerance = TestGates.PinnedGgmlBackend == BackendType.GgmlCpu ? 2.5e-2 : 5e-3;
+        double tolerance = RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : 5e-3;
         for (int i = 0; i < perOp.Count; i++)
         {
             double rel = RelL2(rows[i], perOp[i]);
             Assert.True(rel <= tolerance, $"{variant} row {i}: graph vs per-op relL2 {rel:E2}");
+        }
+    }
+
+    /// <summary>One request alternating between graph steps and per-op steps (as an adapter step
+    /// forces) keeps its attention cache and recurrent state coherent across both bindings.</summary>
+    [Theory]
+    [InlineData("dense")]
+    [InlineData("moe")]
+    public void GraphAndPerOpStepsShareTheState(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(variant);
+        int[] prompt = Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray();
+        int[] tokens = { 71, 72, 73, 74, 75, 76 };
+        var perOp = new List<float[]>();
+        using (var model = Create(path, backend: TestGates.PinnedGgmlBackend))
+        {
+            model.GraphLoweringEnabled = false;
+            perOp.Add((float[])model.ForwardRefill(prompt).Clone());
+            foreach (int t in tokens) perOp.Add((float[])model.Forward(new[] { t }).Clone());
+        }
+        using var mixed = Create(path, backend: TestGates.PinnedGgmlBackend);
+        var rows = new List<float[]> { (float[])mixed.ForwardRefill(prompt).Clone() };
+        for (int i = 0; i < tokens.Length; i++)
+        {
+            mixed.GraphLoweringEnabled = i is not (2 or 3);   // two per-op steps in the middle
+            rows.Add((float[])mixed.Forward(new[] { tokens[i] }).Clone());
+        }
+        Assert.True(mixed.GraphRuns > 0);
+        double tolerance = RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : 5e-3;
+        for (int i = 0; i < perOp.Count; i++)
+        {
+            double rel = RelL2(rows[i], perOp[i]);
+            Assert.True(rel <= tolerance, $"{variant} row {i}: mixed vs per-op relL2 {rel:E2}");
         }
     }
 

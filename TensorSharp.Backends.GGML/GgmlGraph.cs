@@ -111,6 +111,15 @@ namespace TensorSharp.GGML
                 throw new InvalidOperationException("ggml graph effect failed: " + GgmlBasicOps.LastNativeError());
         }
 
+        /// <summary>Place <paramref name="node"/>'s result in <paramref name="baseLeaf"/>'s buffer at
+        /// <paramref name="offset"/> bytes (an in-place state update); <paramref name="fallback"/> (a copy
+        /// of the state out of the result) runs instead when the base is not in a persistent buffer.</summary>
+        public void Alias(int node, int baseLeaf, long offset, int fallback)
+        {
+            if (GgmlNative.TSGgml_GraphAlias(Handle, node, baseLeaf, offset, fallback) == 0)
+                throw new InvalidOperationException("ggml graph alias failed: " + GgmlBasicOps.LastNativeError());
+        }
+
         /// <summary>Run the graph with this run's input values. False (with the native error) when it failed.</summary>
         public unsafe bool Run(ReadOnlySpan<int> inputs, ReadOnlySpan<IntPtr> data, ReadOnlySpan<long> bytes)
         {
@@ -183,5 +192,9 @@ namespace TensorSharp.GGML
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static partial int TSGgml_GraphLeafIsResident(IntPtr graph, int node);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static partial int TSGgml_GraphAlias(IntPtr graph, int node, int baseLeaf, long offset, int fallback);
     }
 }

@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 
+using TensorSharp.GGML;
 using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models
@@ -114,8 +115,16 @@ namespace TensorSharp.Models
                     if (layer != null)
                         foreach (RecurrentState state in layer)
                             if (state != null)
-                                foreach (Tensor t in state.HostTensors) SyncTensorHostCache(t);
+                                foreach (Tensor t in state.HostTensors) SyncStateTensor(t);
             slot.DeviceDirty = false;
+        }
+
+        /// <summary>Sync a state tensor (possibly a view) through its own pointer: device copies are
+        /// keyed by the exact host address a graph or kernel bound.</summary>
+        private void SyncStateTensor(Tensor t)
+        {
+            if (!IsGgmlBackend || t == null) return;
+            GgmlBasicOps.SyncHostBuffer(TensorComputePrimitives.GetStoragePointer(t), t.ElementCount() * t.ElementType.Size());
         }
 
         private void SyncActiveToHost()

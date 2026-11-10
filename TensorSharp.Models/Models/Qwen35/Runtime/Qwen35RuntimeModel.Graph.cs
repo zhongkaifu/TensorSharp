@@ -24,6 +24,12 @@ namespace TensorSharp.Models
         /// <summary>Qwen 3.5's fused decode measured +8% decode with ggml-metal's reordering (A3B).</summary>
         protected override bool GraphReorderOnMetal => true;
 
+        /// <summary>ggml-metal's gated delta rule finishes reading a head's state before writing it, so a
+        /// decode row may update the state in place (Qwen35Model's fused decode relies on the same);
+        /// unified memory makes the backing and the state view the same bytes for every binding.
+        /// Elsewhere the new state is copied.</summary>
+        private bool InPlaceRecurrentState => _backend == BackendType.GgmlMetal;
+
         protected override void EmitQueryKey(GraphStep step, int layer, ref int q, ref int k)
         {
             q = step.Rope(step.RmsNorm(q, LayerName(layer, "attn_q_norm.weight")), _rotary);
@@ -113,13 +119,32 @@ namespace TensorSharp.Models
                 q4 = step.L2Norm(q4, dk, eps);
                 k4 = step.L2Norm(k4, dk, eps);
 
-                int ssm = step.State(state.Ssm, GgmlType.F32, dk, dv, vHeads);
-                int s4 = step.Reshape(ssm, dk, dv, vHeads, 1);
+                // Every graph binds the state through one key per backend: on Metal the slot's backing
+                // buffer [one row's outputs | state], so a decode row's recurrence can write its result
+                // onto it and update the state in place; elsewhere the state itself, copied back.
+                long stateFloats = (long)dk * dv * vHeads;
+                bool viaBacking = InPlaceRecurrentState;
+                int backing = -1, s4;
+                if (viaBacking)
+                {
+                    backing = step.State(state.Backing, GgmlType.F32, state.RowFloats + stateFloats);
+                    s4 = step.View4(backing, dk, dv, vHeads, 1, dk * f, dk * dv * f, stateFloats * f, state.RowFloats * f);
+                }
+                else
+                {
+                    s4 = step.Reshape(step.State(state.Ssm, GgmlType.F32, dk, dv, vHeads), dk, dv, vHeads, 1);
+                }
                 int gdn = step.Op(GgmlGraphOp.GatedDeltaNet, stackalloc[] { q4, k4, v4, g, beta, s4 }, stackalloc long[] { 1 });
                 int scores = step.View2(gdn, v, count, v * f, 0);
                 int newState = step.Op(GgmlGraphOp.View, stackalloc[] { gdn },
                     stackalloc long[] { 4, dk, dv, vHeads, 1, dk * f, dk * dv * f, dk * dv * vHeads * f, v * count * f });
-                step.Effect(step.Op(GgmlGraphOp.Cpy, newState, s4));
+                int copy = step.Op(GgmlGraphOp.Cpy, newState, s4);
+                if (viaBacking && count == 1)
+                    // [outputs | state] of one row is exactly the backing: the recurrence updates the
+                    // state in place, as Qwen35Model's fused decode does on Metal.
+                    step.Alias(gdn, backing, 0, copy);
+                else
+                    step.Effect(copy);
 
                 int normedOut = step.RmsNorm(step.Reshape(step.Cont(scores), dv, vHeads, count), ssmNorm, eps);
                 int gated = step.Op(GgmlGraphOp.Mul, normedOut, step.Op(GgmlGraphOp.Silu, step.Reshape(z, dv, vHeads, count)));

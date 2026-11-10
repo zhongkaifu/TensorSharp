@@ -221,22 +221,47 @@ namespace TensorSharp.Models
             {
                 _hostPointer = hostPointer;
                 Conv = new Tensor(allocator, DType.Float32, channels, Math.Max(1, convRows));
-                Ssm = new Tensor(allocator, DType.Float32, vHeads, dv, dk);
+                // [one token's outputs | state]: a decode-row graph writes the recurrence's result
+                // into Backing, so its state part lands on Ssm in place (no state copy per token).
+                RowFloats = (long)vHeads * dv;
+                Backing = new Tensor(allocator, DType.Float32, RowFloats + (long)vHeads * dv * dk);
+                using (Tensor tail = Backing.Narrow(0, RowFloats, (long)vHeads * dv * dk))
+                    Ssm = tail.View(vHeads, dv, dk);
                 Reset();
             }
 
             public Tensor Conv { get; }
             public Tensor Ssm { get; }
+            /// <summary>One token's recurrence outputs followed by the state (Ssm views its tail).</summary>
+            public Tensor Backing { get; }
+            public long RowFloats { get; }
 
             public override void Reset()
             {
                 Clear(Conv);
-                Clear(Ssm);
+                Clear(Backing);
+                // The state is also bound through its own view.
+                GgmlBasicOps.InvalidateHostBuffer(_hostPointer(Ssm));
+                GgmlBasicOps.InvalidateTensorHostBuffer(Ssm);
             }
 
-            protected internal override IEnumerable<Tensor> HostTensors => new[] { Conv, Ssm };
+            protected internal override IEnumerable<Tensor> HostTensors => new[] { Conv, Ssm, Backing };
 
             public IntPtr ConvPointer => _hostPointer(Conv);
+
+            /// <summary>Before the per-op block binds the state view: whatever the graphs left in a
+            /// device copy of the backing is already on the host (SyncToHost); make the view re-upload.</summary>
+            public void BeforePerOp()
+            {
+                GgmlBasicOps.InvalidateHostBuffer(_hostPointer(Ssm));
+            }
+
+            /// <summary>After it: bring its state back to the host and make the backing re-upload.</summary>
+            public void AfterPerOp()
+            {
+                GgmlBasicOps.SyncHostBuffer(_hostPointer(Ssm), Ssm.ElementCount() * sizeof(float));
+                GgmlBasicOps.InvalidateHostBuffer(_hostPointer(Backing));
+            }
             public IntPtr SsmPointer => _hostPointer(Ssm);
 
             private unsafe void Clear(Tensor t)
@@ -251,6 +276,7 @@ namespace TensorSharp.Models
             {
                 Conv.Dispose();
                 Ssm.Dispose();
+                Backing.Dispose();
             }
         }
 
@@ -284,6 +310,9 @@ namespace TensorSharp.Models
             var gated = new Tensor(scope.Allocator, DType.Float32, tokens, v);
             try
             {
+                // The graphs may bind the state through the backing buffer; this native block binds the
+                // state view. Hand the bytes over through the host in both directions.
+                state.BeforePerOp();
                 unsafe
                 {
                     GgmlBasicOps.Qwen35GdnLayerTP(
@@ -299,6 +328,7 @@ namespace TensorSharp.Models
                         (IntPtr)GetFloatPtr(gated),
                         packed, qkv, qk, v, kHeads, vHeads, _headKDim, _headVDim, _convKernel, Config.Eps);
                 }
+                state.AfterPerOp();
                 HostWritten(gated);
                 return Linear(scope, gated, p + "ssm_out.weight");
             }

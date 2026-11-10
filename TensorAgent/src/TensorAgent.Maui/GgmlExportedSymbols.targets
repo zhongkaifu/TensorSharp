@@ -207,6 +207,7 @@
     <ReferenceNativeSymbol Include="TSGgml_GptOssResetBatchedDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GptOssResetDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GptOssSyncKvCacheToHost" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphAlias" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphCreate" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphEffect" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphFree" SymbolType="Function" />

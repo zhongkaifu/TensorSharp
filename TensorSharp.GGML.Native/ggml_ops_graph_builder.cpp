@@ -132,6 +132,8 @@ namespace
         std::vector<Output> outputs;
         std::vector<ggml_tensor*> effects;
         std::vector<BufferHandle> ephemeral;
+        struct Alias { ggml_tensor* node; ggml_tensor* base; std::size_t offset; ggml_tensor* fallback; };
+        std::vector<Alias> aliases;
 
         ~TsgGraph()
         {
@@ -322,6 +324,22 @@ namespace
             ggml_set_input(leaf.tensor);
         }
         for (const Output& o : g->outputs) ggml_set_output(o.tensor);
+
+        // Place aliased op results inside their (persistent) base buffers, so the op writes the
+        // state in place. A base living in compute memory cannot host it: run the fallback copy.
+        bool fallbacks = false;
+        for (const auto& a : g->aliases)
+        {
+            const bool resident = a.base->buffer != nullptr && a.base->data != nullptr && a.node->data == nullptr
+                && a.offset + ggml_nbytes(a.node) <= ggml_nbytes(a.base)
+                && ggml_backend_tensor_alloc(a.base->buffer, a.node, static_cast<char*>(a.base->data) + a.offset) == GGML_STATUS_SUCCESS;
+            if (!resident)
+            {
+                ggml_build_forward_expand(g->graph, a.fallback);
+                fallbacks = true;
+            }
+        }
+        (void) fallbacks;
 
         // A one-shot graph borrows the backend's persistent, reused compute allocator (the
         // memory the fused graphs share, grown on demand); a graph that will be replayed keeps
@@ -567,4 +585,23 @@ TSG_EXPORT int TSGgml_GraphLeafIsResident(void* handle, int node)
     for (const Leaf& leaf : g->leaves)
         if (leaf.tensor == t) return leaf.uploaded ? 0 : 1;
     return 0;
+}
+
+// Make `node`'s result live in `base`'s buffer at `offset` bytes (an in-place state update).
+// When `base` is not resident in a persistent buffer, `fallback` (a node that copies the
+// state out of `node`) runs instead.
+TSG_EXPORT int TSGgml_GraphAlias(void* handle, int node, int base, std::int64_t offset, int fallback)
+{
+    auto* g = static_cast<TsgGraph*>(handle);
+    try
+    {
+        if (g == nullptr || g->built) throw std::runtime_error("graph builder: no graph, or graph already built");
+        g->aliases.push_back({ node_at(g, node), node_at(g, base), static_cast<std::size_t>(offset), node_at(g, fallback) });
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
 }
