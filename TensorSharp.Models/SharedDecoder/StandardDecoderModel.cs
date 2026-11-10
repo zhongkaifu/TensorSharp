@@ -834,6 +834,11 @@ namespace TensorSharp.Models
             // the whole cache back every token.
             bool done = _backend == BackendType.Mlx && scope.Degree == 1 && MlxFusedOps.TryDecodeAttention(
                 result, q, cacheK, cacheV, heads, kvHeads, _keyDim, 0, start + 1, _cacheCapacity, false, scale);
+            // Direct CUDA: GQA decode attention on the device over the head-first cache in place.
+            // The host path below copies the whole cache to the host every layer.
+            if (!done && _backend == BackendType.Cuda)
+                done = TensorSharp.Cuda.CudaFusedOps.TryGqaDecodeAttention(
+                    result, q, cacheK, cacheV, heads, kvHeads, _keyDim, 0, start + 1, (int)cacheK.Sizes[1], false, scale);
             if (!done)
                 AttentionDecodePureCS(q, cacheK, cacheV, result, heads, kvHeads, _keyDim, start + 1, scale);
             q.Dispose();
