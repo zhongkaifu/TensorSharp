@@ -301,6 +301,7 @@ body { display: flex; flex-direction: column; }
 
 /* ---- the empty state ---------------------------------------------------- */
 #empty { margin: auto; text-align: center; padding: 20px; color: var(--muted); }
+#empty[hidden] { display: none; }
 #empty h1 { font-size: 26px; margin: 0 0 6px; color: var(--text); letter-spacing: -.02em; }
 #empty p { font-size: 14px; margin: 0 0 14px; }
 #empty .cta {
@@ -730,7 +731,11 @@ button.mini.quiet { background: transparent; color: var(--muted); }
 </div>
 
 <div id="chat">
-  <div id="empty">
+  <!-- Hidden until the script decides. A reload of this page lands in a running app (WebKit
+       reclaims the content process, e.g. while the window is covered and the model holds most
+       of the memory), and showing the welcome until the transcript is fetched looked like the
+       app restarting mid-answer. A fresh chat gets its welcome from emptyState(). -->
+  <div id="empty" hidden>
     <h1>TensorAgent</h1>
     <p><span data-i18n="markup.empty.onDevice">Private AI that runs on this iPhone.</span><br><span data-i18n="markup.empty.private">Nothing you type leaves the device.</span></p>
     <button class="cta" id="empty-cta" type="button" data-i18n="markup.empty.chooseModel">Choose a model</button>
