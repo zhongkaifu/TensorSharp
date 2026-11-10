@@ -1638,6 +1638,257 @@ ggml_cuda cannot serve this model on the 32 GB card: decode at 0.5-4.7 tok/s (th
 and four requests at once run it out of device memory inside ggml, which aborts the process; it has no admission check
 like ggml_metal's.
 
+#### The prompt DeltaNet recurrence in chunks, 2026-11-09
+
+A prompt's gated DeltaNet layers walked their rows one at a time (KdaScan: a block per value head, each token a rank-1
+update of the 128 x 128 state). That was 0.49 s of a 16K prompt; Strata spends 0.07 s. A single sequence's prompt of
+128 rows or more now takes Strata's chunked form (`TS_Q4E_GDN_CHUNKED`, on), ported into `tensorsharp_q4e_kernels.cu`.
+A prep kernel builds each 32-token chunk's WY factors (the in-chunk triangular solve and gate products) in FP32. A scan
+kernel then applies a chunk as two small matrix products instead of 32 rank-1 updates; it runs 16 key heads x 8 column
+tiles, 384 threads each, one wave on the GPU, and carries the state across chunks in shared memory. Super-blocks of
+2,048 rows bound the scratch (about 25 MB, allocated at the first long prompt). Decode steps, verify windows, batched
+steps, captured graphs and prompts under 128 rows keep KdaScan. Everything stays FP32, but the sums run in another
+order: against the token-by-token scan the outputs move 3e-7 relative and the state at most 6.2e-7 a head
+(`Q4eGdnChunkedTests`, 128, 200 and 4,171 rows). The scan needs 93,696 bytes of opt-in shared memory a block and a GPU
+with at least 128 SMs, so that every block runs in one wave; with fewer it would run in waves and lose. Otherwise the
+engine keeps KdaScan.
+
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q4E_GDN_CHUNKED=0` for the old scan). TTFT of
+three runs, the first cold; the engine bench's long-prompt and long-generation needles pass 6/6 in both arms:
+
+| prompt recurrence | 4K prompt (3,541 tokens) | 16K prompt (14,094 tokens) | engine bench 4K / 16K TTFT | long generation |
+| --- | --- | --- | --- | --- |
+| token by token | 1.06 / 0.79 / 0.79 s | 3.36 / 3.35 / 3.35 s | 1.00 s / 4.20-4.22 s | 239-242 tok/s |
+| chunked (default) | 0.99 / 0.71 / 0.70 s | 3.04 / 3.02 / 3.02 s | 0.91 s / 3.79 s | 242-249 tok/s |
+
+#### Q2_0 prompt experts on int8 tensor cores, 2026-11-09
+
+A prompt's routed experts ran on `ts_dsv4_moe_mma_f32`. For every 128-token group, each CTA widened its expert's Q2_0
+weights to F16 (scale times code, in float math) and the activations to F16 beside them, then ran F16 `mma.sync` with
+F32 accumulation, which a GeForce card issues at half its F16 rate. SwiGLU and the down product's input were separate
+passes over F32 buffers. This was the largest stage of a 16K prompt: 1.08 s of experts, where Strata spends 0.32 s.
+
+Strata runs these experts on int8 tensor cores, and that is now ported (`TS_Q2_0_EXPERTS_INT8`, on) as
+`ts_dsv4_moe_q2i8_*` in `tensorsharp_dsv4_kernels.cu`:
+
+- The Q2_0 codes 0..3 go into `mma.m16n8k32` as int8 operands, unchanged.
+- The activations are rounded to int8 per 32 values. The scale is amax / 127, as in the decode kernels' q8_1 rows, but
+  kept in F32. Each block stores minus its own sum, so the codes' -1 offset costs nothing: one integer add turns the
+  integer dot into a float exactly.
+- The gate and up rows of eight features share an m16 tile, so SwiGLU, and the rounding of its output to the down
+  product's int8 activations, happen in registers.
+- Strata repacks the weights; these kernels instead read the GGUF blocks in place through the expert residency table.
+  A pipeline stage copies two 18-byte blocks of each row (36 bytes on a 4-byte boundary) with `cp.async`.
+- The scratch reuses the F32 gate/up outputs this route no longer writes.
+- It needs sm_80 or newer and a module built for the GPU. On the committed compute_75 baseline the F16 kernel runs.
+
+The rounding is the decode kernels'. On the model's expert shapes (`CudaMoeQ2_0Int8Tests`), relative to the expert block
+computed in double, the int8 kernels move it 9.77e-3, the per-slot q8_1 kernels (the arithmetic of ggml-cuda's MMQ)
+9.73e-3, and the F16 kernel 1.9e-4.
+
+On the real model (`Qwen4ExpQ2_0Int8PromptTests`, six prompts of 22 to 12,347 tokens, the history-dependent shortcuts
+off), the last prompt row's logits move 4.9e-2 to 1.1e-1 relative from the F16 kernel's. Running the same prompts'
+experts on the per-slot q8_1 kernels, in ggml-cuda's arithmetic, moves them 4.8e-2 to 1.8e-1. With int8 the first token
+is the same in 6 of 6 prompts, and the 64-token greedy continuations stay identical in 4 of 6. The other two part at a
+near-tie ("1." against "-", "scan through the document" against "scan the document"); q8_1 parts at the first of them
+too. The F16 control repeats bit for bit.
+
+One layer of 512 experts, top 10, over 1,024 rows takes 0.85 ms instead of 1.64 ms.
+
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q2_0_EXPERTS_INT8=0` for the F16 kernel). TTFT of
+three runs, the first cold. The engine bench's short_chat, long_prompt_4k/16k and long_generation checks pass 8/8 in
+both arms:
+
+| prompt experts | 4K prompt (3,540 tokens) | 16K prompt (14,092 tokens) | engine bench 4K / 16K TTFT | long generation |
+| --- | --- | --- | --- | --- |
+| F16 tensor cores | 0.99 / 0.71 / 0.70 s | 3.04 / 3.02 / 3.03 s | 0.86-0.90 s / 3.79-3.80 s | 248-255 tok/s |
+| int8 tensor cores (default) | 0.84 / 0.57 / 0.55 s | 2.48 / 2.47 / 2.47 s | 0.74-0.75 s / 3.13-3.14 s | 240-249 tok/s |
+
+#### QSA block scores of a prompt on tensor cores, 2026-11-09
+
+A QSA layer scores every complete block a row can see (the sum over the four indexer heads of relu(block key . query
+head)) before it keeps the best. A prompt's rows did this one warp per block on the CUDA cores, each row reading every
+key again: 0.10 s of a 16K prompt, where Strata spends 0.02 s.
+
+Strata scores a prompt's rows on tensor cores, and that is now ported (`TS_Q4E_QSA_SCORES_MMA`, on) as
+`ts_q4e_qsa_scores_mma_f32`:
+
+- A block of four warps takes 16 rows (their four heads, 64 query rows) against 64 blocks' keys, so a key is read
+  once per 16 rows.
+- Strata's keys are F16; TensorSharp keeps the pooled keys in F32. So both operands go in as F16 high and low halves:
+  q . k = qh . kh + ql . kh + qh . kl, with F32 accumulation. The dropped ql . kl term is below 2^-22 of the product.
+- The heads' relus are summed in head order, as before.
+- Decode steps, verify windows and batched steps keep the warp kernel, so a row still scores as its own decode step.
+- It needs sm_80 or newer and a module built for the GPU; the committed compute_75 baseline keeps the warp kernel.
+
+On rows starting at the context's beginning and 3,000 and 9,000 positions in (`Q4eQsaScoresMmaTests`), the scores stay
+within 4.6e-7 of the sum of |q . k| from the scores computed in double (the warp kernel: 6.1e-8). The blocks the
+selection keeps are the same in all 1,045 rows, 712 of them past the selection width.
+
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q4E_QSA_SCORES_MMA=0` for the warp kernel). TTFT of
+three runs, the first cold. The engine bench's short_chat, long_prompt_4k/16k and long_generation checks pass 8/8 in
+both arms:
+
+| prompt QSA scores | 4K prompt (3,541 tokens) | 16K prompt (14,093 tokens) | engine bench 4K / 16K TTFT |
+| --- | --- | --- | --- |
+| a warp per block | 0.85 / 0.58 / 0.56 s | 2.48 / 2.47 / 2.47 s | 0.74 s / 3.12-3.13 s |
+| tensor cores (default) | 0.84 / 0.56 / 0.55 s | 2.39 / 2.38 / 2.38 s | 0.73-0.74 s / 3.00-3.01 s |
+
+#### A layer's dense weights dequantized once per prompt group, 2026-11-09
+
+A prompt's dense projections (Q4_K, IQ4_XS, Q5_K, Q3_K, Q4_0 and Q2_0 in the ISTA pack, and the Q8_0 hyper-connection
+copies under `TS_Q4E_HC_Q8=1`) run as F16 tensor-core GEMMs on a copy of the weight dequantized for the call. A prompt
+group (`TS_Q4E_PROMPT_GROUP`, 4,096 rows) already runs each layer over its four 1,024-row ubatches back to back, but
+each ubatch dequantized the layer's weights again. On a 16K prompt that was 183 ms of the 242 ms that dequantizing and
+converting took (nsys). Strata dequantizes per 8K-token chunk.
+
+Now (`TS_Q4E_GROUP_F16`, on) the first ubatch of a layer dequantizes each weight into the group's F16 arena and the
+others reuse that copy. The copy is the same kernel's output, so every product is the same bit for bit.
+`APromptGroupsDenseWeights_DequantizedOncePerLayer_AnswerBitForBit` runs two 520-row ubatches a layer and checks that the
+prompt's and the decode steps' logits are unchanged.
+
+The arena holds the largest layer's quantized projections as F16: 194 MiB for the ISTA pack, a GDN layer with the PLE
+key. Residency plans around it, as around the group's streams, so 147 experts fewer stay in VRAM (17,632 -> 17,485,
+98.4% -> 98.3% of the profiled routes). That can move decode steps, which compute host experts on the CPU.
+
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q4E_GROUP_F16=0` dequantizes per ubatch). TTFT of three
+runs, the first cold. The engine bench's short_chat, long_prompt_4k/16k and long_generation checks pass 8/8 in both
+arms:
+
+| dense weights in a prompt group | 4K prompt (3,541 tokens) | 16K prompt (14,093 tokens) | engine bench 4K / 16K TTFT | long generation |
+| --- | --- | --- | --- | --- |
+| dequantized per ubatch | 0.85 / 0.56 / 0.55 s | 2.39 / 2.38 / 2.38 s | 0.74 s / 3.00-3.01 s | 241-244 tok/s |
+| once per layer and group (default) | 0.80 / 0.53 / 0.51 s | 2.28 / 2.27 / 2.27 s | 0.70 s / 2.85-2.86 s | 237-252 tok/s |
+
+#### The routed experts' gate/up once per prompt group, 2026-11-09
+
+On the int8 kernels, a 1,024-row ubatch gives an expert about 20 tokens, and every ubatch read every expert's weights
+again. At 16K, that re-reading alone is about 476 GB, 264 ms at the RTX 5090's bandwidth before any arithmetic. One layer's
+gate/up takes 0.52 ms over 1,024 rows and 1.27 ms over 4,096 (`CudaMoeQ2_0Int8Tests` timing). Strata reads its prompts in
+8K-token chunks.
+
+Within a prompt group the next layer starts only after all the group's ubatches have run this one. So a group's ubatches
+now leave their routed experts to the end of the layer (`TS_Q4E_GROUP_EXPERTS`, on):
+
+- Each ubatch stages its missed experts (kept for the layer) and runs its router and shared expert.
+- It leaves its selections, int8 activations, shared-expert outputs and scatter logits in the group's buffers.
+- After the last ubatch, one grouping plan and one gate/up run over the whole group, so each expert's gate and up
+  weights are read once per layer and group.
+- Down stays per ubatch, so its per-slot outputs keep their size. Each ubatch's down reads its slots' H through the
+  group's plan (`ts_dsv4_moe_row_map_i32`, and the down kernel's act-row map). The combine and the scatter into the
+  streams follow.
+
+Every slot's products are ubatch order's, so a prompt answers the same bit for bit
+(`APromptGroupsExpertGateUp_RunOncePerLayer_AnswersBitForBit`: 64-row ubatches in groups of 192 rows, Q2_0 experts).
+
+The buffers take 85 MiB at 4,096 rows, mostly the shared-expert outputs and H, so 64 experts fewer stay in VRAM
+(17,485 -> 17,421). A group whose last ubatch has
+16 rows or fewer keeps ubatch order, because that ubatch runs the per-slot kernels. So does any layer the int8 route does
+not take.
+
+RTX 5090, ISTA `Q2_0`, MTP, model in `/dev/shm`, the same build (`TS_Q4E_GROUP_EXPERTS=0` runs gate/up per ubatch). TTFT
+of three runs, the first cold. The engine bench's short_chat, long_prompt_4k/16k and long_generation
+checks pass 8/8 in both arms:
+
+| routed experts' gate/up in a prompt group | 4K prompt (3,541 tokens) | 16K prompt (14,092 tokens) | engine bench 4K / 16K TTFT | long generation |
+| --- | --- | --- | --- | --- |
+| per ubatch | 0.81 / 0.53 / 0.53 s | 2.28 / 2.27 / 2.27 s | 0.70 s / 2.86 s | 240-251 tok/s |
+| once per layer and group (default) | 0.79 / 0.51 / 0.49 s | 2.23 / 2.21 / 2.21 s | 0.67 s / 2.74-2.76 s | 243-254 tok/s |
+| Strata (11-07) | | | 0.92 s / 2.75 s | 300-307 tok/s |
+
+#### A keyed router select, 2026-11-09
+
+A decode step's router is a 512 x 2560 BF16 GEMV, then the top-10 select over the 512 softmax scores
+(`ts_dsv4_moe_select_f32`). The select runs one warp a row. Each pick was a shuffle argmax that carried score, weight
+and expert through three shuffles a step, and the winning lane then rescanned its 16 scores in order. In the captured
+decode profile the select took 5.8 us a layer, more than the GEMV before it (5.1 us at 4 rows).
+
+The keyed select (`ts_dsv4_moe_select_keys_f32`, `TS_DSV4_SELECT_KEYS`, on) turns each ranking score into one 64-bit
+key: the score's order-preserving bits above the expert's complement. The larger key is the higher score, then the lower
+expert, which is the argmax's order.
+
+- A pick is a key max over two shuffles a step.
+- The winning lane retakes its best as a four-step tree.
+- Lane k keeps pick k.
+- The weights are read back from shared memory and summed in pick order. Each lane writes its own pick. Before, lane 0
+  stored each pick and read the weights back from global memory to scale them.
+
+The picks and weights are the same bits as the float argmax's. `Dsv4RouterKernelTests` holds the two kernels to each
+other on 2,048 rows built for the order's corner cases: exact ties at every rank, -inf, NaN, +inf, signed zeros, and
+rows with no candidate. The rows cover 64-512 experts, top 6-32, all three gatings, with and without a bias. It also
+holds both kernels to a host reference.
+
+RTX 5090, a graph of 192 launches, 48 cold router matrices (us a call):
+
+| rows | BF16 GEMV | select, float argmax | select, keyed |
+| --- | --- | --- | --- |
+| 1 | 2.78 | 4.83 | 3.11 |
+| 4 | 4.22 | 4.85 | 3.11 |
+
+Engine bench, ISTA `Q2_0`, MTP, one build (`TS_DSV4_SELECT_KEYS=0` for the argmax). Two passes per arm, alternating.
+Every greedy output is identical across arms, and every check passes:
+
+| select | long generation | 4-row verify window | 1-row step | 4K / 16K verify window |
+| --- | --- | --- | --- | --- |
+| float argmax | 231-244 tok/s | 10.09-10.10 ms | 7.01-7.03 ms | 13.37 / 10.63 ms |
+| keyed (default) | 232-246 tok/s | 10.02-10.04 ms | 6.93-6.94 ms | 13.28-13.33 / 10.56-10.58 ms |
+
+Tried and slower: a GEMV block computing 2 or 4 experts, with each thread loading its activations once for all of
+them. At 4 rows it took 4.75 and 6.45 us against 4.22, because the smaller grid kept fewer weight reads in flight.
+
+#### Row sums of the dense kernels as one reduce-scatter, 2026-11-09
+
+Each decode-once dense kernel ends with a warp sum per activation row: five shuffles each, so 20 for a 4-row window,
+against a main loop of one or two weight units per lane at Flash Next's 2560-wide rows. A window of 4 rows or more now
+reduces its rows as one reduce-scatter (`ts_dsv4_rows_reduce_scatter`). At each step of the warp sum's xor butterfly
+(16, 8, 4, 2, 1), a lane keeps half of its rows and adds its partner's values for them: 6 shuffles for 4 rows. Every add
+is the butterfly's own (the lane's partial plus its partner's, the same partners in the same order), so each row's sum is
+the same bits as before, at every width.
+
+Below 4 rows the kernels keep a warp sum each: there the reduce-scatter took them from 64-80 registers to 128 and slowed
+the 2- and 3-row calls. Done the same way, the router's block GEMV gained nothing (4.21 -> 4.20 us at 4 rows), so it
+keeps its sums.
+
+The dense fingerprints (`Dsv4DenseFastFingerprintTests`), the width tests and the row-invariance tests are unchanged.
+RTX 5090, 4 rows, cold weights (us): qkv IQ4_XS 2560 -> 10240 11.15 -> 10.65; attention q Q2_0 2560 -> 12288
+11.91 -> 11.30; ssm_out Q5_K 6144 -> 2560 12.61 -> 12.16; hyper-connection up Q8_0 320 -> 10240 5.10 -> 4.48; down
+10240 -> 320 5.27 -> 5.36. 1-3 rows unchanged.
+
+Engine bench, two builds, two alternating passes per arm. Every greedy output is identical across arms, and every check
+passes:
+
+| row sums | long generation | 4-row verify window | 4K / 16K 4-row window |
+| --- | --- | --- | --- |
+| a warp sum per row | 232-245 tok/s | 10.02-10.03 ms | 13.36 / 11.05-11.07 ms |
+| one reduce-scatter (default) | 234-248 tok/s | 9.89-9.94 ms | 13.28-13.30 / 10.93-10.96 ms |
+
+#### The MTP catch-up reads the prompt's streams on the device, 2026-11-09
+
+After a long prompt, the first draft window runs the MTP block over the prompt's last 4,000 rows. Only their K/V are
+written: the KV-only catch-up. On the RTX 5090 that took 22.6 ms, about 8% of a 4K answer's decode time, and only
+4.6 ms of it was kernels. The rest was the rows' trunk streams, 4,000 x 10,240 floats (164 MB). They came back from the
+runtime's host copy: each ubatch was copied into pinned memory, then host to device. The same values were still on the
+device.
+
+The last prompt group's output streams stay in the group's buffer until the next group runs. The engine now records
+which positions of which sequence that buffer holds. The catch-up takes those rows' streams device to device, and only
+the rest from the host (`TS_Q4E_MTP_D2D`, on).
+
+The values are the ones the host's copy holds, so the drafts are the same bits. In
+`TheMtpCatchUpAfterAGroupedPrompt_ReadsTheLastGroupsStreams_BitForBit` (a 300-token prompt in 192-row groups, catch-up
+from position 150), the last group's 108 rows come from the device. The chain picks the same tokens with the same
+confidences.
+
+Engine bench, one build, two alternating passes per arm (decode tok/s of the three requests). Every greedy output is
+identical across arms, and every check passes:
+
+| catch-up rows | 4,000-row catch-up | long_prompt_4k | long_prompt_16k |
+| --- | --- | --- | --- |
+| from the host (`TS_Q4E_MTP_D2D=0`) | 21.6-22.7 ms | 177 / 186 / 206, 170 / 185 / 241 | 206 / 230 / 257, 209 / 234 / 256 |
+| from the device (default) | 5.8-6.1 ms | 179 / 198 / 219, 176 / 201 / 255 | 208 / 257 / 277, 211 / 253 / 278 |
+
+The prompt forward still copies the streams to the host (164 MB D2H) for the runtime, so TTFT is unchanged.
+
 ### DFlash2 drafter on ggml_metal, 2026-11-08
 
 Strata drafts with DFlash2 on Macs: a block drafter that proposes up to 7 tokens per pass. TensorSharp now takes the
@@ -2210,7 +2461,7 @@ per step. These settings shape it as a server:
 | `TS_Q4E_REWIND_CHECKPOINT` | on | Each slot keeps its recurrent states as they were at the end of its last multi-token forward. A next turn that matches the slot only partway into the previous reply (re-rendered reasoning or tool calls) rewinds there and replays the slot's own tokens up to the match; `0` turns it off. |
 | `TS_SCHED_PIPELINE_DECODE`, `TS_Q4E_DECODE_LANES` | on | Under `--layer-split 2` and up, batched decode runs as two groups in flight, so the first GPU runs one group's layers while the last runs the other's (two H100 NVL, Q8_0: 582 against 377 tok/s at 16 streams, the same tokens); `0` for either decodes one batched step at a time. |
 | `TS_Q4E_BATCH_GRAPHS` | on | Batched steps (batched decode steps and batched speculative verifies) run as CUDA graphs, one per set of slots, their QSA regimes, rows and head form, captured on a set's third step and at most `TS_Q4E_BATCH_GRAPHS_MAX` (64) of them; `0` issues them kernel by kernel. |
-| `TS_Q4E_Q80_PAIR` | on | Q8_0 decode projections (1 to 16 rows) as one arithmetic on three kernels (sm_80+): int8 tensor cores, a dp4a twin with four lanes on a block and a dp4a kernel with a lane on a block, the fastest for the shape and row count; `0` runs the decode-once dense kernels (`TS_DENSE_FAST`). The two sum in different orders, so answers differ in the last bits. |
+| `TS_Q4E_Q80_PAIR` | on | Q8_0 decode projections (1 to 16 rows) as one arithmetic on three kernels (sm_80+): int8 tensor cores, a dp4a twin with four lanes on a block and a dp4a kernel with a lane on a block, the fastest for the shape and row count; `0` runs the decode-once dense kernels (`TS_DENSE_FAST`). The two sum in different orders, so answers differ in the last bits. Two kinds of weight keep the dense kernels at every row count: the `TS_Q4E_HC_Q8` copies of the hyper-connection down mixers and the MTP block's Q8_0 weights (on the RTX 5090 the pair ran them ~2x slower from three rows, measured before the lane kernel). |
 | `TS_Q4E_EXPERT_VEC` | on | Q8_0 decode experts read each weight row four lanes per 32-value block; `0` runs the shared decode kernels (sixteen lanes a gate/up row, eight a short down row; a different order). Paged-in experts follow their residency table, as resident ones compute. |
 | `TS_MOE_Q80_LANES` | on | Q8_0 decode experts read a weight row with eight lanes (four rows a warp, a lane on whole blocks as aligned 64-bit words): the down projection always, gate/up from 40 slots with a slot's gate and up rows in the same lanes; the same sums. `0` keeps a warp on every row. |
 | `TS_MOE_GATEUP_Q80_PAIR` | on | A Q8_0 decode slot's gate and up rows computed together (the activation loaded once; the same sums): in eight lanes a row from 40 slots, or in one warp from 32 without `TS_MOE_Q80_LANES`; `0` keeps them in separate warps. |

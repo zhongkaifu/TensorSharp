@@ -855,6 +855,8 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 
 `id` 是 `GET /v1/models` 列出的托管模型名（GGUF 文件名去掉 `.gguf`）。把 `contextWindow` 设为服务端的上下文长度。上下文距 `contextWindow` 不足 `compaction.reserveTokens`（默认 16,384）时 pi 就开始压缩，所以在 16K 窗口下应在 pi 的 `settings.json` 中调低它，例如 `{"compaction": {"reserveTokens": 4096}}`。移除旧轮次后提示仍放不进服务端窗口时，服务端返回 HTTP 400 和 `"code": "context_length_exceeded"`，pi 能识别它并通过压缩处理。
 
+[`examples/pi-coding-agent/`](../examples/pi-coding-agent/README_zh-cn.md) 是一套完整配置：Apple Silicon 上带 DFlash2 草稿模型的 Qwen3.8-27B、启动脚本、pi 的 `models.json` 与 `settings.json`、一个 SDK 程序，以及由 pi 修好示例项目中失败测试的端到端检查。
+
 要用模型仓库里的 `chat_template.jinja` 代替 GGUF 中的模板，以 `--chat-template-file chat_template.jinja` 启动服务端。只有模板文本改变；输出解析器、服务端解析的工具调用格式和 BOS 处理仍沿用该模型族的。
 
 服务端启动时自己发出的单 token 预热请求在日志中记为 `chat.start ... origin=prefix-cache-warmup maxTokens=1` 与 `chat.complete tokens=1 origin=prefix-cache-warmup ... finishReason=max_tokens`，它们不是客户端请求。

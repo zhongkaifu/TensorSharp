@@ -247,6 +247,7 @@ namespace TensorSharp.Cuda
             }
             slot.PleTokens.Length = Math.Min(slot.PleTokens.Length, p0 + keep);
             slot.NPast = p0 + keep;
+            SlotPositionsDropped(slot, slot.NPast);
             foreach (var dev in _devs)
             {
                 dev.MakeCurrent();
@@ -282,6 +283,7 @@ namespace TensorSharp.Cuda
             }
             slot.PleTokens.Length = Math.Min(slot.PleTokens.Length, p0);
             slot.NPast = p0;
+            SlotPositionsDropped(slot, p0);
             foreach (var dev in _devs)
             {
                 dev.MakeCurrent();

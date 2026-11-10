@@ -111,6 +111,41 @@ __device__ __forceinline__ float ts_dsv4_warp_sum(float v)
     return v;
 }
 
+// The warp sums of a lane's R values as one reduce-scatter: at each step of ts_dsv4_warp_sum's butterfly (xor 16, 8, ...,
+// 1) a lane keeps half of its values (both halves keep the middle one of an odd count) and adds its partner's for them,
+// so R values take ceil(R / 2) + ceil(R / 4) + ... shuffles where R warp sums took 5 R. Every add is the butterfly's own -
+// this lane's partial plus its partner's, the same partners in the same order - so each value's sum is ts_dsv4_warp_sum's
+// bit for bit, whatever R. Returns the sum of value *row, the one this lane ends up holding (several lanes hold each; the
+// lowest of them is the first lane of __match_any_sync(row)).
+template <int R>
+__device__ __forceinline__ float ts_dsv4_rows_reduce_scatter(float (&s)[R], const int lane, int* row)
+{
+    int base = 0;
+#pragma unroll
+    for (int k = 0; k < 5; ++k)
+    {
+        const int off = 16 >> k;
+        const int m = (R + (1 << k) - 1) >> k;            // values held before the step
+        const int m2 = (R + (2 << k) - 1) >> (k + 1);     // and after it
+        const bool up = (lane & off) != 0;
+#pragma unroll
+        for (int j = 0; j < R; ++j)
+        {
+            if (j < m2)
+            {
+                const int lo = j, hi = m - m2 + j;
+                const float send = up ? s[lo] : s[hi];
+                const float recv = __shfl_xor_sync(0xffffffffu, send, off);
+                s[j] = (up ? s[hi] : s[lo]) + recv;
+            }
+        }
+        if (up)
+            base += m - m2;
+    }
+    *row = base;
+    return s[0];
+}
+
 __device__ __forceinline__ float ts_dsv4_sigmoid(float x)
 {
     return 1.0f / (1.0f + expf(-x));
@@ -2664,6 +2699,57 @@ __device__ __forceinline__ float ts_dsv4_router_score(float logit, int gating)
 #define TS_DSV4_SELECT_PER_LANE 16   // register-held router scores per lane (512 experts)
 #define TS_DSV4_SELECT_MAX_USED 16   // experts a token may select
 
+// The warp select's scores of a lane's experts (lane + 32 i): raw, the weight's score (Qwen's softmax over the row, or the
+// gating's own), and v = raw + bias, the ranking score (-inf past nExpert). Both select kernels take them from here.
+__device__ __forceinline__ void ts_dsv4_select_scores(
+    const float* __restrict__ lg, const float* __restrict__ bias, const int nExpert, const int gating, const int lane,
+    float (&v)[TS_DSV4_SELECT_PER_LANE], float (&raw)[TS_DSV4_SELECT_PER_LANE])
+{
+    if (gating == TS_DSV4_ROUTER_SOFTMAX)
+    {
+        // ggml's soft_max: exp(l - max) times the reciprocal of their sum.
+        float mx = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
+        {
+            const int e = lane + 32 * i;
+            raw[i] = e < nExpert ? lg[e] : -INFINITY;
+            mx = fmaxf(mx, raw[i]);
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
+        {
+            raw[i] = lane + 32 * i < nExpert ? expf(raw[i] - mx) : 0.0f;
+            sum += raw[i];
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            sum += __shfl_xor_sync(0xffffffffu, sum, off);
+        const float inv = 1.0f / sum;
+#pragma unroll
+        for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
+        {
+            const int e = lane + 32 * i;
+            raw[i] *= inv;
+            v[i] = e < nExpert ? raw[i] + (bias != nullptr ? bias[e] : 0.0f) : -INFINITY;
+        }
+    }
+    else
+    {
+#pragma unroll
+        for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
+        {
+            const int e = lane + 32 * i;
+            raw[i] = e < nExpert ? ts_dsv4_router_score(lg[e], gating) : 0.0f;
+            v[i] = e < nExpert ? raw[i] + (bias != nullptr ? bias[e] : 0.0f) : -INFINITY;
+        }
+    }
+}
+
 extern "C" __global__ void ts_dsv4_moe_select_f32(
     const float* __restrict__ logits,   // [nt, nExpert]
     const float* __restrict__ bias,     // [nExpert] or null
@@ -2699,49 +2785,7 @@ extern "C" __global__ void ts_dsv4_moe_select_f32(
         {
             const int lane = threadIdx.x;
             float v[TS_DSV4_SELECT_PER_LANE], raw[TS_DSV4_SELECT_PER_LANE];
-            if (gating == TS_DSV4_ROUTER_SOFTMAX)
-            {
-                // ggml's soft_max: exp(l - max) times the reciprocal of their sum.
-                float mx = -INFINITY;
-#pragma unroll
-                for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
-                {
-                    const int e = lane + 32 * i;
-                    raw[i] = e < nExpert ? lg[e] : -INFINITY;
-                    mx = fmaxf(mx, raw[i]);
-                }
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1)
-                    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-                float sum = 0.0f;
-#pragma unroll
-                for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
-                {
-                    raw[i] = lane + 32 * i < nExpert ? expf(raw[i] - mx) : 0.0f;
-                    sum += raw[i];
-                }
-#pragma unroll
-                for (int off = 16; off > 0; off >>= 1)
-                    sum += __shfl_xor_sync(0xffffffffu, sum, off);
-                const float inv = 1.0f / sum;
-#pragma unroll
-                for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
-                {
-                    const int e = lane + 32 * i;
-                    raw[i] *= inv;
-                    v[i] = e < nExpert ? raw[i] + (bias != nullptr ? bias[e] : 0.0f) : -INFINITY;
-                }
-            }
-            else
-            {
-#pragma unroll
-                for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
-                {
-                    const int e = lane + 32 * i;
-                    raw[i] = e < nExpert ? ts_dsv4_router_score(lg[e], gating) : 0.0f;
-                    v[i] = e < nExpert ? raw[i] + (bias != nullptr ? bias[e] : 0.0f) : -INFINITY;
-                }
-            }
+            ts_dsv4_select_scores(lg, bias, nExpert, gating, lane, v, raw);
             // Each lane keeps the best of its own scores (the higher score, then the lower index), so
             // a pick is one shuffle argmax over the lanes' bests and only the winning lane rescans.
             // Every register array is indexed by unrolled constants: the pick loop itself runs at
@@ -2887,6 +2931,101 @@ extern "C" __global__ void ts_dsv4_moe_select_f32(
         }
         for (int j = 0; j < nUsed; ++j)
             wT[j] = w[j] * wScale;
+    }
+}
+
+// A select key: the ranking score's order-preserving bits above the expert's complement, so the larger key is the higher
+// score, then the lower expert - ts_dsv4_moe_select_f32's order. 0 for a score never picked (-inf or NaN); -0 ranks as +0
+// (the float compare's equals).
+__device__ __forceinline__ unsigned long long ts_dsv4_select_key(const float v, const int e)
+{
+    if (!(v > -INFINITY))
+        return 0ull;
+    unsigned int u = __float_as_uint(v == 0.0f ? 0.0f : v);
+    u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ((unsigned long long)u << 32) | (unsigned int)~e;
+}
+
+__device__ __forceinline__ unsigned long long ts_dsv4_key_max(const unsigned long long a, const unsigned long long b)
+{
+    return a > b ? a : b;
+}
+
+// The largest of a lane's keys, as a tree (four steps, where a scan in order chained sixteen compares).
+__device__ __forceinline__ unsigned long long ts_dsv4_key_max16(const unsigned long long (&k)[TS_DSV4_SELECT_PER_LANE])
+{
+    unsigned long long a[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        a[i] = ts_dsv4_key_max(k[2 * i], k[2 * i + 1]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        a[i] = ts_dsv4_key_max(a[2 * i], a[2 * i + 1]);
+    return ts_dsv4_key_max(ts_dsv4_key_max(a[0], a[1]), ts_dsv4_key_max(a[2], a[3]));
+}
+
+// ts_dsv4_moe_select_f32's warp path (up to 512 experts, no hash LUT) for up to 32 picks, with the same picks and weights in
+// fewer dependent steps. One warp a row (a block of 32). Each score is a 64-bit key (ts_dsv4_select_key), so a pick is a
+// max over two shuffles a step where the float argmax carried score, weight and expert through three, and the winning lane
+// re-takes its best as a tree. Lane k keeps pick k; the weights are read back from shared memory at the end and summed in
+// pick order (the same sum, add for add), and every lane writes its own pick, where lane 0 wrote each pick and read the
+// weights back from global memory to scale them. Requires nExpert <= 512 and nUsed <= 32.
+extern "C" __global__ void __launch_bounds__(32) ts_dsv4_moe_select_keys_f32(
+    const float* __restrict__ logits,   // [nt, nExpert]
+    const float* __restrict__ bias,     // [nExpert] or null
+    int32_t* __restrict__ sel,          // [nt, nUsed]
+    float* __restrict__ wOut,           // [nt, nUsed]
+    const int nExpert,
+    const int nUsed,
+    const int norm,
+    const float wScale,
+    const int gating)
+{
+    const int t = blockIdx.x, lane = threadIdx.x;
+    const float* lg = logits + (size_t)t * nExpert;
+    __shared__ float shRaw[32 * TS_DSV4_SELECT_PER_LANE];
+    float v[TS_DSV4_SELECT_PER_LANE], raw[TS_DSV4_SELECT_PER_LANE];
+    ts_dsv4_select_scores(lg, bias, nExpert, gating, lane, v, raw);
+    unsigned long long key[TS_DSV4_SELECT_PER_LANE];
+#pragma unroll
+    for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
+    {
+        const int e = lane + 32 * i;
+        shRaw[e] = raw[i];
+        key[i] = e < nExpert ? ts_dsv4_select_key(v[i], e) : 0ull;
+    }
+    unsigned long long best = ts_dsv4_key_max16(key);
+    int mySel = 0;
+    for (int k = 0; k < nUsed; ++k)
+    {
+        unsigned long long m = best;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            m = ts_dsv4_key_max(m, __shfl_xor_sync(0xffffffffu, m, off));
+        // No candidate left (every score -inf or NaN): expert 0, weighed by its own score.
+        const int chosen = m == 0ull ? 0 : (int)~(unsigned int)m;
+        if (lane == k)
+            mySel = chosen;
+        if (m != 0ull && (chosen & 31) == lane)
+        {
+            const int slot = chosen >> 5;
+#pragma unroll
+            for (int i = 0; i < TS_DSV4_SELECT_PER_LANE; ++i)
+                if (i == slot)
+                    key[i] = 0ull;
+            best = ts_dsv4_key_max16(key);
+        }
+    }
+    __syncwarp();
+    const float myW = lane < nUsed ? shRaw[mySel] : 0.0f;
+    float wsum = 0.0f;
+    for (int k = 0; k < nUsed; ++k)
+        wsum += __shfl_sync(0xffffffffu, myW, k);
+    if (lane < nUsed)
+    {
+        const float inv = 1.0f / fmaxf(wsum, 6.103515625e-5f);
+        sel[(size_t)t * nUsed + lane] = mySel;
+        wOut[(size_t)t * nUsed + lane] = (norm ? myW * inv : myW) * wScale;
     }
 }
 
@@ -3776,6 +3915,424 @@ extern "C" __global__ void __launch_bounds__(TS_MOE_MMA_THREADS, 2) ts_dsv4_moe_
     (void)w0; (void)w1; (void)act; (void)counts; (void)offsets; (void)slotToken;
     (void)out0; (void)out1; (void)wtype; (void)rows; (void)inDim; (void)rowBytes;
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Q2_0 grouped expert projections on int8 tensor cores (prefill; TS_Q2_0_EXPERTS_INT8).
+//
+// Ported from Strata's prompt experts for the Q2_0 pack (src/prefill/moe_fused.cu, MIT licence). The kernel
+// above widens each weight to F16 per pass (scale and code in float math) and runs F16 mma with F32
+// accumulation, which a GeForce card issues at half the F16 rate; here the Q2_0 codes go to the tensor
+// cores as they are.
+//
+// The arithmetic. A Q2_0 block is 64 weights w = d_w * (q - 1), q in 0..3, weight j in byte j / 4 at bits
+// 2 * (j % 4). An activation block of 32 values is x = d_x * a, a = rint(x / d_x) in -127..127 with
+// d_x = amax / 127 (kept in F32, where ggml's q8_1 rounds it to F16). Over one 32-value half-block
+//     sum w x = d_w * d_x * (sum q a - sum a),
+// so the int8 product takes the codes as they are (0..3 is a valid s8) and the offset is the activations'
+// own sum, stored with the block. |sum q a| <= 32 * 3 * 127 < 2^22, so as_float(0x4B400000 + dot) is
+// 1.5 * 2^23 + dot exactly, and the block stores c = -(1.5 * 2^23 + sum a): their float sum is
+// dot - sum a with no rounding. Per output and 64-block: acc += d_w * (d_x0 * t0 + d_x1 * t1).
+//
+// The K order. mma.m16n8k32 takes four consecutive k per register. (word >> 2t) & 0x03030303 holds weights
+// t, t+4, t+8, t+12 of a 16-weight word, so mma k index 16h + 4t + j stands for weight (and activation)
+// 16h + t + 4j of a half-block; activations are stored in that order (perm32), so a lane's two B registers
+// of a half-block are one 8-byte load.
+//
+// What differs from Strata: the weights are read in place from the GGUF blocks (18 bytes: F16 d, then 16
+// code bytes) through the expert residency table. A pipeline stage takes two blocks of every weight row,
+// 36 bytes on a 4-byte boundary (rows are whole blocks, so no copy reads past an expert), with 4-byte
+// cp.async; the first block's codes are funnel-shifted out of shared memory. Gate and up stay separate
+// tensors: a CTA's 128 weight rows are 64 features' gate and up interleaved, so an m16 tile holds the gate
+// rows of 8 features as its rows 0-7 and their up rows as 8-15, and a lane has gate and up of one feature
+// for SwiGLU in registers. The member tokens come from TensorSharp's grouping plan.
+// ---------------------------------------------------------------------------
+
+#define TS_Q2I8_AB 80                 // activation bytes per 64 values: 2 x 32 s8 (perm32), then {d0, c0, d1, c1}
+#define TS_Q2I8_MAGIC 0x4B400000      // the bits of 1.5 * 2^23
+#define TS_Q2I8_MAGICF 12582912.0f
+#define TS_Q2I8_THREADS 256           // 8 warps: 2 along the weight rows (64 each) x 4 along the token tile (16 each)
+#define TS_Q2I8_WROWS 128             // weight rows per CTA: 64 features of gate/up, or 128 outputs of down
+#define TS_Q2I8_TILE 64               // member tokens per pass
+#define TS_Q2I8_STAGES 3              // cp.async pipeline depth, two Q2_0 blocks (128 values of K) per stage
+#define TS_Q2I8_WWORDS 9              // 32-bit words of two Q2_0 blocks (36 bytes)
+#define TS_Q2I8_W_BYTES (TS_Q2I8_WROWS * TS_Q2I8_WWORDS * 4)
+#define TS_Q2I8_A_BYTES (TS_Q2I8_TILE * 2 * TS_Q2I8_AB)
+#define TS_Q2I8_STAGE_BYTES (TS_Q2I8_W_BYTES + TS_Q2I8_A_BYTES)
+
+// Where value k of a 32-value half-block is stored (see "The K order").
+__host__ __device__ __forceinline__ int ts_q2i8_perm32(int k) { return 8 * (k & 3) + 4 * (k >> 4) + ((k & 15) >> 2); }
+
+// Activations for the int8 expert kernels: x [rows][width] F32 -> xa [rows][width / 64][80]. One warp per
+// 64 values (width % 64 == 0, so the rows are one flat run of blocks).
+extern "C" __global__ void ts_dsv4_q2i8_quant_act_f32(const float* __restrict__ x, const long long nblk,
+                                                      uint8_t* __restrict__ xa)
+{
+    const long long w = (long long)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (w >= nblk)
+        return;
+    const float v0 = x[w * 64 + lane], v1 = x[w * 64 + 32 + lane];
+    float a0 = fabsf(v0), a1 = fabsf(v1);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        a0 = fmaxf(a0, __shfl_xor_sync(0xffffffffu, a0, o));
+        a1 = fmaxf(a1, __shfl_xor_sync(0xffffffffu, a1, o));
+    }
+    // As the q8_1 quantizers round (amax / 127, rint, clamp), with d kept in F32.
+    const float d0 = a0 > 0.0f ? a0 / 127.0f : 0.0f, d1 = a1 > 0.0f ? a1 / 127.0f : 0.0f;
+    const float i0 = d0 > 0.0f ? 1.0f / d0 : 0.0f, i1 = d1 > 0.0f ? 1.0f / d1 : 0.0f;
+    const int q0 = max(-127, min(127, (int)rintf(v0 * i0)));
+    const int q1 = max(-127, min(127, (int)rintf(v1 * i1)));
+    int s0 = q0, s1 = q1;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        s0 += __shfl_xor_sync(0xffffffffu, s0, o);
+        s1 += __shfl_xor_sync(0xffffffffu, s1, o);
+    }
+    uint8_t* out = xa + w * TS_Q2I8_AB;
+    out[ts_q2i8_perm32(lane)] = (uint8_t)(int8_t)q0;
+    out[32 + ts_q2i8_perm32(lane)] = (uint8_t)(int8_t)q1;
+    if (lane == 0)
+        *reinterpret_cast<float4*>(out + 64) = make_float4(d0, -(TS_Q2I8_MAGICF + (float)s0), d1, -(TS_Q2I8_MAGICF + (float)s1));
+}
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+__device__ __forceinline__ void ts_q2i8_cp4(void* dst, const void* src)
+{
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((unsigned)__cvta_generic_to_shared(dst)), "l"(src));
+}
+__device__ __forceinline__ void ts_q2i8_cp16(void* dst, const void* src)
+{
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned)__cvta_generic_to_shared(dst)), "l"(src));
+}
+__device__ __forceinline__ void ts_q2i8_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N> __device__ __forceinline__ void ts_q2i8_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+// d = A (16 x 32 s8, row) * B (32 x 8 s8, col), int32, from zero.
+__device__ __forceinline__ void ts_q2i8_mma(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
+{
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+}
+
+// Block blk (0 or 1) of a stage's two Q2_0 blocks of one weight row (nine words from a 4-byte boundary):
+// its 16 code bytes as four words and its scale.
+__device__ __forceinline__ void ts_q2i8_block(const uint32_t* __restrict__ w, int blk, uint4& codes, float& d)
+{
+    if (blk == 0)
+    {
+        const uint32_t w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3], w4 = w[4];
+        d = __half2float(__ushort_as_half((unsigned short)(w0 & 0xFFFFu)));
+        codes = make_uint4(__funnelshift_r(w0, w1, 16), __funnelshift_r(w1, w2, 16),
+                           __funnelshift_r(w2, w3, 16), __funnelshift_r(w3, w4, 16));
+    }
+    else
+    {
+        d = __half2float(__ushort_as_half((unsigned short)(w[4] >> 16)));
+        codes = make_uint4(w[5], w[6], w[7], w[8]);
+    }
+}
+
+// One CTA of either projection over every member token of its expert, in passes of 64. GU: gate and up of
+// features [r0, r0 + 64) against the members' tokens' activations (act per token, slotToken maps a member
+// to it), SwiGLU, and H quantized per 32 features into hq (per member row, the down kernel's activations).
+// !GU: down rows [r0, r0 + 128) against hq (act per member row, or the row slotToken names when it is set),
+// F32 into out per member row.
+template <bool GU>
+__device__ __forceinline__ void ts_q2i8_expert(
+    const uint8_t* __restrict__ wA, const uint8_t* __restrict__ wB, const long long rowBytes, const int r0,
+    const uint8_t* __restrict__ act, const long long actLd, const int nPairs,
+    const int32_t* __restrict__ slotToken, const int off, const int m,
+    uint8_t* __restrict__ hq, const long long hqLd, const int hBlock, const float limit,
+    float* __restrict__ out, const long long outLd)
+{
+    __shared__ __align__(16) uint8_t smem[TS_Q2I8_STAGES * TS_Q2I8_STAGE_BYTES];
+    __shared__ int srow[TS_Q2I8_TILE];
+    constexpr unsigned M2 = 0x03030303u;
+
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, tig = lane & 3;
+    const int wr = warp & 1, nb0 = 16 * (warp >> 1);
+    int ra[4], rb[4];                                   // the CTA-local weight rows of mma rows g and g + 8
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        if (GU) { ra[i] = 2 * (32 * wr + 8 * i + g); rb[i] = ra[i] + 1; }
+        else { ra[i] = 64 * wr + 16 * i + g; rb[i] = ra[i] + 8; }
+    }
+
+    for (int p0 = 0; p0 < m; p0 += TS_Q2I8_TILE)
+    {
+        const int nrows = min(TS_Q2I8_TILE, m - p0);
+        const int nrows8 = (nrows + 7) & ~7;            // rows a live n8 tile reads
+        __syncthreads();                                // the previous pass is done with smem and srow
+        if (tid < TS_Q2I8_TILE)
+        {
+            const int r = off + p0 + min(tid, nrows - 1);
+            srow[tid] = slotToken != nullptr ? slotToken[r] : r;
+        }
+        __syncthreads();
+
+        auto load = [&](int kp) {
+            uint8_t* st = smem + (kp % TS_Q2I8_STAGES) * TS_Q2I8_STAGE_BYTES;
+            uint32_t* sw = reinterpret_cast<uint32_t*>(st);
+            for (int u = tid; u < TS_Q2I8_WROWS * TS_Q2I8_WWORDS; u += TS_Q2I8_THREADS)
+            {
+                const int lr = u / TS_Q2I8_WWORDS, q = u - lr * TS_Q2I8_WWORDS;
+                const uint8_t* row = GU ? ((lr & 1) ? wB : wA) + (size_t)(r0 + (lr >> 1)) * rowBytes
+                                        : wA + (size_t)(r0 + lr) * rowBytes;
+                ts_q2i8_cp4(sw + u, row + (size_t)kp * 36 + 4 * q);
+            }
+            uint8_t* sa = st + TS_Q2I8_W_BYTES;
+            for (int u = tid; u < nrows8 * 10; u += TS_Q2I8_THREADS)
+            {
+                const int r = u / 10, q = u - r * 10;
+                ts_q2i8_cp16(sa + r * (2 * TS_Q2I8_AB) + q * 16, act + (size_t)srow[r] * actLd + (size_t)kp * (2 * TS_Q2I8_AB) + q * 16);
+            }
+        };
+
+#pragma unroll
+        for (int s = 0; s < TS_Q2I8_STAGES - 1; ++s)
+        {
+            if (s < nPairs)
+                load(s);
+            ts_q2i8_commit();
+        }
+
+        // A warp whose rows all lie past the pass's end only takes part in the copies.
+        const bool on0 = nb0 < nrows, on1 = nb0 + 8 < nrows;
+        float acc[4][2][4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int n = 0; n < 2; ++n)
+#pragma unroll
+                for (int q = 0; q < 4; ++q)
+                    acc[i][n][q] = 0.0f;
+
+        for (int kp = 0; kp < nPairs; ++kp)
+        {
+            ts_q2i8_wait<TS_Q2I8_STAGES - 2>();
+            __syncthreads();
+            if (kp + TS_Q2I8_STAGES - 1 < nPairs)
+                load(kp + TS_Q2I8_STAGES - 1);
+            ts_q2i8_commit();
+            if (!on0)
+                continue;
+            const uint8_t* st = smem + (kp % TS_Q2I8_STAGES) * TS_Q2I8_STAGE_BYTES;
+            const uint32_t* sw = reinterpret_cast<const uint32_t*>(st);
+            const uint8_t* sa = st + TS_Q2I8_W_BYTES;
+#pragma unroll
+            for (int blk = 0; blk < 2; ++blk)
+            {
+                uint2 bq[2][2];                         // [n8 tile][half]: the B registers
+                float4 sc[2][2];                        // [n8 tile][column 2 tig + c]: {d0, c0, d1, c1}
+#pragma unroll
+                for (int n = 0; n < 2; ++n)
+                {
+                    if (n == 1 && !on1)
+                        break;
+                    const uint8_t* r = sa + (nb0 + 8 * n + g) * (2 * TS_Q2I8_AB) + blk * TS_Q2I8_AB + 8 * tig;
+                    bq[n][0] = *reinterpret_cast<const uint2*>(r);
+                    bq[n][1] = *reinterpret_cast<const uint2*>(r + 32);
+                    const uint8_t* z = sa + (nb0 + 8 * n + 2 * tig) * (2 * TS_Q2I8_AB) + blk * TS_Q2I8_AB + 64;
+                    sc[n][0] = *reinterpret_cast<const float4*>(z);
+                    sc[n][1] = *reinterpret_cast<const float4*>(z + 2 * TS_Q2I8_AB);
+                }
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                {
+                    uint4 ca, cb;
+                    float da, db;
+                    ts_q2i8_block(sw + ra[i] * TS_Q2I8_WWORDS, blk, ca, da);
+                    ts_q2i8_block(sw + rb[i] * TS_Q2I8_WWORDS, blk, cb, db);
+                    const int s = 2 * tig;
+                    const uint32_t a0[4] = {(ca.x >> s) & M2, (cb.x >> s) & M2, (ca.y >> s) & M2, (cb.y >> s) & M2};
+                    const uint32_t a1[4] = {(ca.z >> s) & M2, (cb.z >> s) & M2, (ca.w >> s) & M2, (cb.w >> s) & M2};
+#pragma unroll
+                    for (int n = 0; n < 2; ++n)
+                    {
+                        if (n == 1 && !on1)
+                            break;
+                        int d0[4], d1[4];
+                        ts_q2i8_mma(d0, a0, bq[n][0].x, bq[n][0].y);
+                        ts_q2i8_mma(d1, a1, bq[n][1].x, bq[n][1].y);
+#pragma unroll
+                        for (int q = 0; q < 4; ++q)
+                        {
+                            const float4 z = sc[n][q & 1];
+                            const float u0 = __int_as_float(TS_Q2I8_MAGIC + d0[q]) + z.y;
+                            const float u1 = __int_as_float(TS_Q2I8_MAGIC + d1[q]) + z.w;
+                            acc[i][n][q] = fmaf(q < 2 ? da : db, fmaf(z.z, u1, z.x * u0), acc[i][n][q]);
+                        }
+                    }
+                }
+            }
+        }
+        ts_q2i8_wait<0>();
+        if (!on0)
+            continue;
+
+        if (GU)
+        {
+            // SwiGLU of feature 32 wr + 8 i + g of the CTA (lane g of m tile i) for member rows nb0 + 8 n + 2 tig + c,
+            // then H to int8 per member over the warp's 32 features: one 32-value half-block of the down product's K.
+#pragma unroll
+            for (int n = 0; n < 2; ++n)
+            {
+                if (n == 1 && !on1)
+                    break;
+#pragma unroll
+                for (int c = 0; c < 2; ++c)
+                {
+                    float h[4], am = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        float gt = acc[i][n][c], up = acc[i][n][2 + c];
+                        if (limit > 0.0f)
+                        {
+                            up = fminf(fmaxf(up, -limit), limit);
+                            gt = fminf(gt, limit);
+                        }
+                        h[i] = __fmul_rn(up, gt / (1.0f + expf(-gt)));
+                        am = fmaxf(am, fabsf(h[i]));
+                    }
+#pragma unroll
+                    for (int o = 4; o < 32; o <<= 1)
+                        am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+                    const float d = am > 0.0f ? am / 127.0f : 0.0f;
+                    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+                    int qv[4], sum = 0;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        qv[i] = max(-127, min(127, (int)rintf(h[i] * id)));
+                        sum += qv[i];
+                    }
+#pragma unroll
+                    for (int o = 4; o < 32; o <<= 1)
+                        sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                    const int r = nb0 + 8 * n + 2 * tig + c;
+                    if (r < nrows)
+                    {
+                        const int grp = hBlock + wr;    // the warp's 32-feature group of the member's H row
+                        uint8_t* o = hq + (size_t)(off + p0 + r) * hqLd + (size_t)(grp >> 1) * TS_Q2I8_AB;
+                        const int hh = grp & 1;
+#pragma unroll
+                        for (int i = 0; i < 4; ++i)
+                            o[32 * hh + ts_q2i8_perm32(8 * i + g)] = (uint8_t)(int8_t)qv[i];
+                        if (g == 0)
+                            *reinterpret_cast<float2*>(o + 64 + 8 * hh) = make_float2(d, -(TS_Q2I8_MAGICF + (float)sum));
+                    }
+                }
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int n = 0; n < 2; ++n)
+                {
+                    if (n == 1 && !on1)
+                        break;
+#pragma unroll
+                    for (int q = 0; q < 4; ++q)
+                    {
+                        const int r = nb0 + 8 * n + 2 * tig + (q & 1);
+                        if (r < nrows)
+                            out[(size_t)(off + p0 + r) * outLd + r0 + (q < 2 ? ra[i] : rb[i])] = acc[i][n][q];
+                    }
+                }
+        }
+    }
+}
+#endif
+
+// Gate/up of every member slot of expert blockIdx.y for features [blockIdx.x * 64, +64): SwiGLU (clamped when
+// limit > 0) and H to int8 into hq [slots][ff / 64][80]. xa holds every token's activations
+// (ts_dsv4_q2i8_quant_act_f32 over inDim). Requires inDim % 128 == 0 and ff % 64 == 0.
+extern "C" __global__ void __launch_bounds__(TS_Q2I8_THREADS, 2) ts_dsv4_moe_q2i8_gateup_f32(
+    const uint8_t* __restrict__ gateW,
+    const uint8_t* __restrict__ upW,
+    const uint8_t* __restrict__ xa,
+    const int32_t* __restrict__ counts,
+    const int32_t* __restrict__ offsets,
+    const int32_t* __restrict__ slotToken,
+    uint8_t* __restrict__ hq,
+    const int ff,
+    const int inDim,
+    const long long rowBytes,
+    const float limit,
+    const unsigned long long* __restrict__ gateTab,
+    const unsigned long long* __restrict__ upTab)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    const int e = blockIdx.y;
+    const int m = counts[e];
+    const int f0 = blockIdx.x * 64;
+    if (m == 0 || f0 >= ff)
+        return;
+    const size_t expertBytes = (size_t)ff * rowBytes;
+    ts_q2i8_expert<true>(ts_dsv4_expert_rows(gateW, gateTab, e, expertBytes), ts_dsv4_expert_rows(upW, upTab, e, expertBytes),
+        rowBytes, f0, xa, (long long)(inDim / 64) * TS_Q2I8_AB, inDim / 128, slotToken, offsets[e], m,
+        hq, (long long)(ff / 64) * TS_Q2I8_AB, f0 / 32, limit, nullptr, 0);
+#else
+    (void)gateW; (void)upW; (void)xa; (void)counts; (void)offsets; (void)slotToken; (void)hq;
+    (void)ff; (void)inDim; (void)rowBytes; (void)limit; (void)gateTab; (void)upTab;
+#endif
+}
+
+// Down rows [blockIdx.x * 128, +128) of expert blockIdx.y against its member slots' H, F32 into out [slots][rows].
+// hq holds H in this grouping's member order, or (actRow set) in another grouping's: member i reads row actRow[i]
+// (Flash Next's prompt groups run gate/up once over a group's ubatches and down per ubatch). Requires ff % 128 == 0
+// and rows % 128 == 0.
+extern "C" __global__ void __launch_bounds__(TS_Q2I8_THREADS, 2) ts_dsv4_moe_q2i8_down_f32(
+    const uint8_t* __restrict__ downW,
+    const uint8_t* __restrict__ hq,
+    const int32_t* __restrict__ counts,
+    const int32_t* __restrict__ offsets,
+    float* __restrict__ out,
+    const int rows,
+    const int ff,
+    const long long rowBytes,
+    const unsigned long long* __restrict__ downTab,
+    const int32_t* __restrict__ actRow)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    const int e = blockIdx.y;
+    const int m = counts[e];
+    const int r0 = blockIdx.x * TS_Q2I8_WROWS;
+    if (m == 0 || r0 >= rows)
+        return;
+    ts_q2i8_expert<false>(ts_dsv4_expert_rows(downW, downTab, e, (size_t)rows * rowBytes), nullptr, rowBytes, r0,
+        hq, (long long)(ff / 64) * TS_Q2I8_AB, ff / 128, actRow, offsets[e], m,
+        nullptr, 0, 0, 0.0f, out, rows);
+#else
+    (void)downW; (void)hq; (void)counts; (void)offsets; (void)out; (void)rows; (void)ff; (void)rowBytes; (void)downTab;
+    (void)actRow;
+#endif
+}
+
+// For the slots of one ubatch of a group: actRow[rowOfSlot[s]] = groupRowOfSlot[base + s], the row of the group's
+// grouping that holds slot s's H, at the row the ubatch's own grouping gives the slot.
+extern "C" __global__ void ts_dsv4_moe_row_map_i32(
+    const int32_t* __restrict__ rowOfSlot,
+    const int32_t* __restrict__ groupRowOfSlot,
+    const int base,
+    int32_t* __restrict__ actRow,
+    const int slots)
+{
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= slots)
+        return;
+    const int r = rowOfSlot[s];
+    if (r >= 0)
+        actRow[r] = groupRowOfSlot[base + s];
 }
 
 // Expert gate/up projections over grouped tokens. grid (nExpert, ffTiles, 2);
@@ -4713,23 +5270,42 @@ __device__ __forceinline__ void ts_dsv4_dense_fast(
             for (int r = 0; r < R; ++r)
                 s[r] = 0.0f;
         }
-        if (W == 1)
+        if constexpr (R >= 4)
         {
+            // Four rows or more: one reduce-scatter (each row's sum the warp sum's bits, ts_dsv4_rows_reduce_scatter).
+            // Fewer keep a warp sum each: the reduce-scatter took their kernels from 64-80 registers to 128.
+            int hr;
+            const float hv = ts_dsv4_rows_reduce_scatter<R>(s, lane, &hr);
+            const bool first = lane == __ffs(__match_any_sync(0xffffffffu, hr)) - 1;
+            if (W == 1)
+            {
+                if (first && hr < n && rr < outDim)
+                    out[(size_t)(r0 + hr) * outDim + rr] = hv;
+                continue;
+            }
+            if (first)
+                part[warp][hr] = hv;
+        }
+        else
+        {
+            if (W == 1)
+            {
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+                {
+                    const float v = ts_dsv4_warp_sum(s[r]);
+                    if (lane == 0 && r < n && rr < outDim)
+                        out[(size_t)(r0 + r) * outDim + rr] = v;
+                }
+                continue;
+            }
 #pragma unroll
             for (int r = 0; r < R; ++r)
             {
                 const float v = ts_dsv4_warp_sum(s[r]);
-                if (lane == 0 && r < n && rr < outDim)
-                    out[(size_t)(r0 + r) * outDim + rr] = v;
+                if (lane == 0)
+                    part[warp][r] = v;
             }
-            continue;
-        }
-#pragma unroll
-        for (int r = 0; r < R; ++r)
-        {
-            const float v = ts_dsv4_warp_sum(s[r]);
-            if (lane == 0)
-                part[warp][r] = v;
         }
         __syncthreads();
         if (sub == 0 && lane < n && rr < outDim)
@@ -4760,6 +5336,20 @@ TS_DSV4_DENSE_FAST(1, 4)
 TS_DSV4_DENSE_FAST(2, 4)
 TS_DSV4_DENSE_FAST(4, 4)
 TS_DSV4_DENSE_FAST(8, 4)
+// Every width up to 8, so a window of 3, 5, 6 or 7 rows (a verify of 2, 4, 5 or 6 drafts) computes its own rows instead of
+// the next power of two's: a row's arithmetic does not depend on R, so each width answers as the padded dispatch did.
+TS_DSV4_DENSE_FAST(3, 1)
+TS_DSV4_DENSE_FAST(5, 1)
+TS_DSV4_DENSE_FAST(6, 1)
+TS_DSV4_DENSE_FAST(7, 1)
+TS_DSV4_DENSE_FAST(3, 2)
+TS_DSV4_DENSE_FAST(5, 2)
+TS_DSV4_DENSE_FAST(6, 2)
+TS_DSV4_DENSE_FAST(7, 2)
+TS_DSV4_DENSE_FAST(3, 4)
+TS_DSV4_DENSE_FAST(5, 4)
+TS_DSV4_DENSE_FAST(6, 4)
+TS_DSV4_DENSE_FAST(7, 4)
 #undef TS_DSV4_DENSE_FAST
 
 // ts_dsv4_moe_gateup_decode_f32 with sixteen lanes an output row and two rows a warp (the short down kernel's layout):

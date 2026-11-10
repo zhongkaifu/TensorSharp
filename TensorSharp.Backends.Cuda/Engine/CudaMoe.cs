@@ -145,6 +145,37 @@ namespace TensorSharp.Cuda
         internal enum ExpertRoute { PerSlot, TensorCore, Staged, Warp }
 
         /// <summary>
+        /// TS_Q2_0_EXPERTS_INT8: whether the tensor-core route runs Q2_0 experts (ISTA's Qwen3.8-Flash-Next pack) on
+        /// the int8 kernels (ts_dsv4_moe_q2i8_*: the codes as int8 operands against q8_1-style activations with F32
+        /// scales, SwiGLU and the down product's activations fused) instead of widening the weights to F16. On by
+        /// default; <c>0</c> keeps the F16 kernel. The activations round as the decode kernels' (and ggml-cuda's MMQ)
+        /// q8_1 rows do, so a prompt's expert outputs carry the decode steps' error instead of the F16 kernel's.
+        /// Settable for in-process A/B runs (a real-model test compares both routes on one loaded model).
+        /// </summary>
+        internal static bool Q2_0ExpertsInt8 { get; set; } = Environment.GetEnvironmentVariable("TS_Q2_0_EXPERTS_INT8") != "0";
+
+        /// <summary>Test hook for real-model A/B runs: every ubatch takes the per-slot decode kernels (q8_1 activations
+        /// against the integer codes, the arithmetic of ggml-cuda's MMQ/MMVQ), so one prompt's experts can be compared in
+        /// all three arithmetics on one loaded model. Never set outside tests.</summary>
+        internal static bool PerSlotForTest { get; set; }
+
+        /// <summary>
+        /// Whether a tensor-core ubatch takes the int8 Q2_0 kernels: switched on (<paramref name="enabled"/>), a module
+        /// with their bodies, Q2_0 gate/up and down, widths on their 128 grid, the tokens' int8 activations fitting in
+        /// the scratch's up outputs (where they are written; H goes to the gate outputs), and every stacked weight on a
+        /// 4-byte boundary (their rows are copied in 4-byte words; residency tables point at aligned slots).
+        /// </summary>
+        internal static bool UsesQ2I8(bool enabled, bool hasKernels, in DeviceWeight gate, in DeviceWeight up,
+            in DeviceWeight down, int e, int ff, int nUsed)
+        {
+            static bool Aligned(in DeviceWeight w) => w.Table != IntPtr.Zero || ((long)w.Ptr & 3) == 0;
+            return enabled && hasKernels && gate.Type == TQ2_0 && up.Type == TQ2_0 && down.Type == TQ2_0
+                && Dsv4Kernels.MoeQ2I8Supports(e, ff)
+                && Dsv4Kernels.MoeQ2I8ActRowsBytes(1, e) <= (long)nUsed * ff * sizeof(float)
+                && Aligned(gate) && Aligned(up) && Aligned(down);
+        }
+
+        /// <summary>
         /// Up to <paramref name="perSlotMaxRows"/> tokens run the per-(token, expert) decode kernels;
         /// longer ubatches the tensor-core kernel where the module has its body and both widths sit on
         /// its k-step, else the register-staged kernels where they take both widths, else the grouped
@@ -266,8 +297,10 @@ namespace TensorSharp.Cuda
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
             int perSlotMaxRows, IntPtr stream, bool? fused = null,
             CudaExpertStage stage = null, in CudaExpertStageLayer stageLayer = default, IntPtr shDownReady = default,
-            bool keepStaged = false, IntPtr curQ81 = default, bool q80VecDecode = false)
+            bool keepStaged = false, IntPtr curQ81 = default, bool? q2i8 = null, bool q80VecDecode = false)
         {
+            if (PerSlotForTest)
+                perSlotMaxRows = int.MaxValue;
             int guType = gate.Type, downType = down.Type;
             int slots = nt * nUsed;
             bool staging = stage != null && stageLayer.IsValid && stageLayer.Staged;
@@ -284,7 +317,7 @@ namespace TensorSharp.Cuda
                 dk.MoeStageCopy(stageLayer, stage, slots, stream);
             }
             RunExperts(dk, kernels, s, gate, up, down, cur, shDown, ffnOut, nt, nUsed, nExpert, e, ff, clamp,
-                perSlotMaxRows, stream, fused, shDownReady, curQ81, q80VecDecode);
+                perSlotMaxRows, stream, fused, shDownReady, curQ81, q2i8 ?? Q2_0ExpertsInt8, q80VecDecode);
             if (staging && !keep)
                 dk.MoeUnstage(stageLayer, stage, stream);
         }
@@ -296,10 +329,43 @@ namespace TensorSharp.Cuda
                 dk.MoeUnstage(stageLayer, stage, stream);
         }
 
+        /// <summary>Whether <see cref="StageKept"/> can serve a layer: nothing to stage, or staging that keeps what earlier
+        /// calls of the layer staged.</summary>
+        internal static bool CanStageKept(Dsv4Kernels dk, CudaExpertStage stage, in CudaExpertStageLayer stageLayer)
+            => stage == null || !stageLayer.IsValid || !stageLayer.Staged || (dk.HasStageKeep && stage.StageFrom != IntPtr.Zero);
+
+        /// <summary>
+        /// The staging <see cref="Experts"/> does with keepStaged, for a call that runs its products later (Flash Next's
+        /// prompt groups): the experts <paramref name="sel"/> selects that have no VRAM slot are staged, and what earlier
+        /// calls of the layer staged stays. The layer ends with <see cref="Unstage"/>. Needs <see cref="CanStageKept"/>.
+        /// </summary>
+        internal static void StageKept(Dsv4Kernels dk, Tensor sel, int slots, CudaExpertStage stage,
+            in CudaExpertStageLayer stageLayer, IntPtr stream)
+        {
+            if (stage == null || !stageLayer.IsValid || !stageLayer.Staged)
+                return;
+            dk.MoeStageMarkFrom(stage, stream);
+            dk.MoeStagePlan(sel, slots, stageLayer, stage, stream);
+            dk.MoeStageCopyNew(stageLayer, stage, slots, stream);
+        }
+
+        /// <summary>The grouping plan of <paramref name="slots"/> selections, all on the device: per-expert counts, their
+        /// exclusive scan, each slot's row in expert order and each row's token (the plan <see cref="Experts"/> builds for
+        /// a long ubatch).</summary>
+        internal static void Plan(Dsv4Kernels dk, CudaKernels kernels, Tensor sel, Tensor counts, Tensor offsets, Tensor cursors,
+            Tensor rowOfSlot, Tensor slotToken, int slots, int nUsed, int nExpert, IntPtr stream)
+        {
+            kernels.LaunchFillF32(Dsv4CudaEngine.Ptr(counts), nExpert, 0f, stream);
+            dk.MoeCount(sel, counts, slots, stream);
+            dk.MoeScan(counts, offsets, cursors, nExpert, stream);
+            dk.MoeScatter(sel, cursors, rowOfSlot, slotToken, slots, nUsed, stream);
+        }
+
         private static void RunExperts(Dsv4Kernels dk, CudaKernels kernels, CudaMoeScratch s,
             in DeviceWeight gate, in DeviceWeight up, in DeviceWeight down,
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
-            int perSlotMaxRows, IntPtr stream, bool? fused, IntPtr shDownReady = default, IntPtr curQ81 = default, bool q80VecDecode = false)
+            int perSlotMaxRows, IntPtr stream, bool? fused, IntPtr shDownReady = default, IntPtr curQ81 = default,
+            bool q2i8 = false, bool q80VecDecode = false)
         {
             int guType = gate.Type, downType = down.Type;
             int slots = nt * nUsed;
@@ -307,6 +373,7 @@ namespace TensorSharp.Cuda
                 dk.DecodesLegacyQuants);
             bool perSlot = route == ExpertRoute.PerSlot;
             bool mma = route == ExpertRoute.TensorCore;
+            bool int8 = mma && UsesQ2I8(q2i8, dk.HasMoeQ2I8, gate, up, down, e, ff, nUsed);
             bool staged = route == ExpertRoute.Staged;
             // The per-slot route reads cur's q8_1 rows: the caller's (curQ81, rounded as QuantizeQ81 rounds) when it has them.
             bool given = perSlot && curQ81 != IntPtr.Zero;
@@ -341,12 +408,19 @@ namespace TensorSharp.Cuda
             }
 
             // The grouping plan, all on the device.
-            kernels.LaunchFillF32(Dsv4CudaEngine.Ptr(s.Counts), nExpert, 0f, stream);
-            dk.MoeCount(s.Sel, s.Counts, slots, stream);
-            dk.MoeScan(s.Counts, s.Offsets, s.Cursors, nExpert, stream);
-            dk.MoeScatter(s.Sel, s.Cursors, s.RowOfSlot, s.SlotToken, slots, nUsed, stream);
+            Plan(dk, kernels, s.Sel, s.Counts, s.Offsets, s.Cursors, s.RowOfSlot, s.SlotToken, slots, nUsed, nExpert, stream);
 
-            if (mma)
+            if (int8)
+            {
+                // The tokens' int8 activations live in the up outputs' memory and H in the gate outputs': this route
+                // writes neither as F32 (UsesQ2I8 checked the first fits; H takes 80 of every 256 bytes).
+                IntPtr xa = Dsv4CudaEngine.Ptr(s.ExpUp), hq = Dsv4CudaEngine.Ptr(s.ExpGate);
+                dk.MoeQ2I8QuantAct(Dsv4CudaEngine.Ptr(cur), xa, nt, e, stream);
+                dk.MoeQ2I8GateUp(gate.Ptr, up.Ptr, xa, s.Counts, s.Offsets, s.SlotToken, hq, ff, e, gate.RowBytes, clamp,
+                    nExpert, stream, gate.Table, up.Table);
+                dk.MoeQ2I8Down(down.Ptr, hq, s.Counts, s.Offsets, s.ExpDown, e, ff, down.RowBytes, nExpert, stream, down.Table);
+            }
+            else if (mma)
             {
                 dk.MoeMma(gate.Ptr, up.Ptr, cur, s.Counts, s.Offsets, s.SlotToken,
                     s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes, nExpert, stream, gate.Table, up.Table);

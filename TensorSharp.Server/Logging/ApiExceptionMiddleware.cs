@@ -63,14 +63,82 @@ public static class ApiExceptionMiddleware
         {
             await next().ConfigureAwait(false);
         }
-        catch (Exception ex) when (!context.Response.HasStarted && !IsClientAbort(context, ex))
+        catch (Exception ex) when (!IsClientAbort(context, ex))
         {
-            await WriteErrorAsync(context, ex).ConfigureAwait(false);
+            if (!context.Response.HasStarted)
+            {
+                await WriteErrorAsync(context, ex).ConfigureAwait(false);
+                return;
+            }
+            // A streaming completion that fails mid-body (a device allocation
+            // failure halfway through a decode, say) has already sent its
+            // status line. Ending the stream there, or dropping the
+            // connection, reads to a client as a reply that simply stopped:
+            // an OpenAI client sees neither a finish_reason nor an error. The
+            // stream gets its protocol's terminal error frame instead; a
+            // started body that is not a stream keeps propagating, and the
+            // connection drops.
+            if (!await TryEndStreamWithErrorAsync(context).ConfigureAwait(false))
+                throw;
         }
-        // A streaming completion that fails mid-body has already sent its
-        // status line, so there is nothing left to shape; the exception
-        // propagates and the connection drops, which is the only signal SSE
-        // has for a truncated stream.
+    }
+
+    /// <summary>
+    /// The message a failed stream ends with. Like a 500 body it says nothing
+    /// about the exception, whose detail <see cref="RequestLoggingMiddleware"/>
+    /// has already logged.
+    /// </summary>
+    internal const string StreamFailureMessage =
+        "The server failed while generating this response; the output before this error is incomplete.";
+
+    /// <summary>
+    /// End a started stream with its protocol's error frame: an
+    /// <c>{error:{message,type}}</c> chunk and the <c>[DONE]</c> sentinel on
+    /// the OpenAI chat routes (OpenAI's own mid-stream error, which its SDKs
+    /// raise on), the Responses API's <c>error</c> event on
+    /// <c>/v1/responses</c>, a final <c>{done,error}</c> frame on the Web UI's
+    /// event streams and an <c>{error}</c> line on Ollama's NDJSON. False when
+    /// the body is not a stream, or the frame cannot be written (the client
+    /// is gone).
+    /// </summary>
+    private static async Task<bool> TryEndStreamWithErrorAsync(HttpContext context)
+    {
+        string contentType = context.Response.ContentType ?? "";
+        string? frame = null;
+        if (contentType.StartsWith("text/event-stream", StringComparison.OrdinalIgnoreCase))
+        {
+            if (context.Request.Path.StartsWithSegments("/v1/responses"))
+                frame = "event: error\ndata: " + JsonSerializer.Serialize(new
+                {
+                    type = "error",
+                    code = "server_error",
+                    message = StreamFailureMessage,
+                    param = (string?)null,
+                }) + "\n\n";
+            else if (context.Request.Path.StartsWithSegments("/v1"))
+                frame = "data: " + JsonSerializer.Serialize(new
+                {
+                    error = new { message = StreamFailureMessage, type = "internal_error" },
+                }) + "\n\ndata: [DONE]\n\n";
+            else
+                frame = "data: " + JsonSerializer.Serialize(new { done = true, error = StreamFailureMessage }) + "\n\n";
+        }
+        else if (contentType.StartsWith("application/x-ndjson", StringComparison.OrdinalIgnoreCase))
+        {
+            frame = JsonSerializer.Serialize(new { error = StreamFailureMessage }) + "\n";
+        }
+        if (frame == null)
+            return false;
+        try
+        {
+            await context.Response.WriteAsync(frame).ConfigureAwait(false);
+            await context.Response.Body.FlushAsync().ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     /// <summary>

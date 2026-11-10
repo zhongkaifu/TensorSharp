@@ -348,6 +348,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_muse_glimmer_vision.cpp
     ggml_ops_minimax_m3_vision.cpp
     ggml_ops_dflash.cpp
+    ggml_ops_dspine.cpp
     ggml_ops_diffusion.cpp
     ggml_ops_qwen_image.cpp
     ggml_ops_qwen_image21.cpp
@@ -405,7 +406,8 @@ if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
         "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_moe_glue.metal"
         "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_gdn_prompt.metal"
         "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_hc_prompt.metal"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_qsa_prompt.metal")
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_qsa_prompt.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_df_tail.metal")
     set(TSM_GGML_COMMON "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src/ggml-common.h")
     set(TSM_SOURCE_INC "${CMAKE_CURRENT_BINARY_DIR}/tsm_moe_source.inc")
     string(REPLACE ";" "\\;" TSM_KERNEL_FILES_ARG "${TSM_KERNEL_FILES}")
@@ -424,9 +426,23 @@ if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
                 "-DFILES=${TSM_MPP_FILES_ARG}" -P "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
         DEPENDS ${TSM_MPP_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
         COMMENT "Embedding the TensorSharp Metal tensor-API kernels")
-    list(APPEND TSG_GGMLOPS_SOURCES tsm/tsm_moe.mm "${TSM_SOURCE_INC}" "${TSM_MPP_INC}")
+    # Strata's grouped expert GEMM for prompt chunks (tsm_moe_mm.metal) and the fused hyper-connection read
+    # (tsm_hc_read.metal) on the tensor API: a library of its own with ggml-common.h and quant.metal, compiled on first
+    # use where the tensor API runs.
+    set(TSM_MOEMM_FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/quant.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_moe_mm.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tsm/kernels/tsm_hc_read.metal")
+    set(TSM_MOEMM_INC "${CMAKE_CURRENT_BINARY_DIR}/tsm_moe_mm_source.inc")
+    string(REPLACE ";" "\\;" TSM_MOEMM_FILES_ARG "${TSM_MOEMM_FILES}")
+    add_custom_command(OUTPUT "${TSM_MOEMM_INC}"
+        COMMAND ${CMAKE_COMMAND} -DOUT=${TSM_MOEMM_INC} -DVAR=kTsmMoeMmSource -DMPP=1 -DGGML_COMMON=${TSM_GGML_COMMON}
+                "-DFILES=${TSM_MOEMM_FILES_ARG}" -P "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
+        DEPENDS ${TSM_MOEMM_FILES} "${TSM_GGML_COMMON}" "${CMAKE_CURRENT_SOURCE_DIR}/tsm/tsm_embed.cmake"
+        COMMENT "Embedding the TensorSharp Metal prompt expert kernels")
+    list(APPEND TSG_GGMLOPS_SOURCES tsm/tsm_moe.mm "${TSM_SOURCE_INC}" "${TSM_MPP_INC}" "${TSM_MOEMM_INC}")
     set_source_files_properties(tsm/tsm_moe.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
-        OBJECT_DEPENDS "${TSM_SOURCE_INC};${TSM_MPP_INC}")
+        OBJECT_DEPENDS "${TSM_SOURCE_INC};${TSM_MPP_INC};${TSM_MOEMM_INC}")
 endif()
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)
@@ -1374,6 +1390,30 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_link_libraries(GgmlOpsDFlashScaleTest PRIVATE GgmlOps ggml-base)
     add_test(NAME dflash-sidecar-scales-cpu COMMAND GgmlOpsDFlashScaleTest cpu)
     set_tests_properties(dflash-sidecar-scales-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
+    # The DFlash/DSpine ring inject under a failed allocation, in chunks, and with its ring copy released under a
+    # persisted graph (ggml_ops_dflash.cpp; the epoch in ggml_ops_core.cpp).
+    # Its hooks (TSGgml_DFlashTestFailAllocs, TSGgml_DFlashTestInjectChunk) exist only in a test build of the source.
+    set_property(SOURCE ggml_ops_dflash.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    add_executable(GgmlOpsDFlashInjectTest tests/dflash_inject_test.cpp)
+    target_link_libraries(GgmlOpsDFlashInjectTest PRIVATE GgmlOps ggml-base)
+    foreach(TSG_DFINJ_BACKEND IN ITEMS cpu cuda metal)
+        add_test(NAME dflash-inject-${TSG_DFINJ_BACKEND} COMMAND GgmlOpsDFlashInjectTest ${TSG_DFINJ_BACKEND})
+        set_tests_properties(dflash-inject-${TSG_DFINJ_BACKEND} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
+    endforeach()
+    add_executable(GgmlOpsDFlashRingBlockTest tests/dflash_ring_block_test.cpp)
+    target_link_libraries(GgmlOpsDFlashRingBlockTest PRIVATE GgmlOps ggml-base)
+    foreach(TSG_DFRING_BACKEND IN ITEMS cpu cuda metal)
+        add_test(NAME dflash-ring-block-${TSG_DFRING_BACKEND} COMMAND GgmlOpsDFlashRingBlockTest ${TSG_DFRING_BACKEND})
+        set_tests_properties(dflash-ring-block-${TSG_DFRING_BACKEND} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
+    endforeach()
+    # The DSpine draft (ggml_ops_dspine.cpp) against eng/dspine-reference.py's expected values.
+    add_executable(GgmlOpsDSpineDraftTest tests/dspine_draft_test.cpp)
+    target_link_libraries(GgmlOpsDSpineDraftTest PRIVATE GgmlOps ggml-base)
+    foreach(TSG_DSPINE_BACKEND IN ITEMS cpu cuda metal)
+        add_test(NAME dspine-draft-${TSG_DSPINE_BACKEND} COMMAND GgmlOpsDSpineDraftTest ${TSG_DSPINE_BACKEND}
+                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/dspine_draft_reference.bin")
+        set_tests_properties(dspine-draft-${TSG_DSPINE_BACKEND} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300 RUN_SERIAL TRUE)
+    endforeach()
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         add_test(NAME qwen35-arena-sidecar-scales-cuda COMMAND GgmlOpsQwen35ArenaScaleTest cuda default)
         set_tests_properties(qwen35-arena-sidecar-scales-cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)

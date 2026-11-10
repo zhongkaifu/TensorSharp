@@ -1212,7 +1212,7 @@ namespace TensorSharp.Models
             _fdStateResident = false;
             // The batched-fused device KV pool is seeded from the host paged pool;
             // any state reset/rebuild must force a re-seed before the next fused decode.
-            _bfdPoolSeeded = false;
+            InvalidateBatchedFusedSeed();
             // CUDA/Vulkan persistent graphs still use their established hard-drop
             // lifecycle. Metal can retain its graph across a logical state change:
             // the next replay receives an explicit reseed flag and uploads the
@@ -1886,9 +1886,10 @@ namespace TensorSharp.Models
 
         /// <summary>Pull the live device state back into the host mirrors and clear
         /// <see cref="_fvDeviceStateCurrent"/>. Every path that reads the mirrors -
-        /// the op-by-op recurrent block, a prefill chunk, a state snapshot - goes
-        /// through here first.</summary>
-        internal unsafe void DrainDeviceRecurrentState()
+        /// the op-by-op recurrent block, a prefill chunk, a state snapshot, the
+        /// linear->paged migration - goes through here first. Virtual so a test can
+        /// observe the drain without a device (Qwen35MigrationDrainTests).</summary>
+        internal virtual unsafe void DrainDeviceRecurrentState()
         {
             if (!_fvDeviceStateCurrent)
                 return;
@@ -2033,7 +2034,7 @@ namespace TensorSharp.Models
             if (_fdStateResident)
             {
                 _fdStateResident = false;
-                _bfdPoolSeeded = false;
+                InvalidateBatchedFusedSeed();
                 GgmlBasicOps.Qwen35ResetDecodeCache();
                 CountDecodeGraphReset();
             }
@@ -2364,9 +2365,10 @@ namespace TensorSharp.Models
             // have recomputed is already on the device and costs one slot fetch.
             // Only the all-rows verify: a prefill chunk is never rolled back, and
             // asking for N snapshots there would size the graph for nothing.
-            // On ggml_cuda the kernel answers the same request without keeping a
-            // state per row: it keeps the recurrence inputs, and committing slot s
-            // replays the kept rows (TS_Q35_VERIFY_REPLAY=0 keeps the states instead).
+            // On ggml_cuda, and on ggml_metal for a window wider than eight rows, the
+            // kernel answers the same request without keeping a state per row: it keeps
+            // the recurrence inputs, and committing slot s replays the kept rows
+            // (TS_Q35_VERIFY_REPLAY=0 keeps the states instead).
             // The protocol here is the same either way.
             int requestedSnapshots = (_fvSnapshotsEnabled && nLogitRows <= 0 && seqLen > 1)
                 ? seqLen : 1;

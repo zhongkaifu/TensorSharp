@@ -296,6 +296,9 @@ namespace TensorSharp.Models
         /// Default no-op; models with a grow-on-demand KV cache override to pre-size it.</summary>
         public virtual void PrepareForPrefill(int requiredContextTokens) { }
 
+        /// <summary>Next-chunk hint (see <see cref="IModelArchitecture.PrepareNextPrefillChunk"/>). Default no-op.</summary>
+        public virtual void PrepareNextPrefillChunk(int[] tokens, int startPos) { }
+
         /// <summary>
         /// Release what only makes the NEXT request faster: the host memory pool's
         /// unused blocks here, and whatever a model parks for reuse in its override.

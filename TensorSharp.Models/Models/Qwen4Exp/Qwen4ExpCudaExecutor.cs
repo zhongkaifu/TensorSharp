@@ -60,10 +60,14 @@ namespace TensorSharp.Models
                 if (tmp != IntPtr.Zero)
                     System.Runtime.InteropServices.NativeMemory.Free((void*)tmp);
             }
+            // A down mixer's copy (10240 -> 320) stays on the decode-once dense kernels: the Q8_0 pair matvec ran it ~2x
+            // slower from three rows and 1.4x at 16 on the RTX 5090. An up mixer (320 -> 10240) keeps the pair: the dense
+            // kernels win by 0.1-0.5 us up to 5 rows, the pair by 6.6 us at 9-16 (a batched verify of four sequences)
+            // (Q80PairVsDenseFastBenchTests).
             return new CudaWeightDesc
             {
                 HostPtr = dst, GgmlType = WeightRequant.GgmlTypeQ8_0, Ne0 = w.Ne0, Ne1 = w.Ne1, Ne2 = 1,
-                RowBytes = cols / 32 * 34, Name = name,
+                RowBytes = cols / 32 * 34, Name = name, DecodeOnce = name.EndsWith("_down.weight", StringComparison.Ordinal),
             };
         }
 
@@ -426,6 +430,14 @@ namespace TensorSharp.Models
             };
             if (mtp.Hnorm.Length != hcDim)
                 throw new NotSupportedException($"[{Tag}] the MTP block's hnorm is {mtp.Hnorm.Length} wide, the trunk's streams {hcDim}");
+            // The block's dense weights keep the decode-once dense kernels at every row count (its catch-ups and draft steps
+            // are 1-5 rows, where the Q8_0 pair matvec was no faster and from three rows 1.2-2x slower on the RTX 5090).
+            var L = mtp.Layer;
+            L.HcAttnDown.DecodeOnce = L.HcAttnUp.DecodeOnce = L.HcFfnDown.DecodeOnce = L.HcFfnUp.DecodeOnce = true;
+            L.Wq.DecodeOnce = L.Wk.DecodeOnce = L.Wv.DecodeOnce = L.Wo.DecodeOnce = true;
+            L.Qkv.DecodeOnce = L.Gate.DecodeOnce = L.SsmOut.DecodeOnce = true;
+            L.GateShexp.DecodeOnce = L.UpShexp.DecodeOnce = L.DownShexp.DecodeOnce = true;
+            mtp.EhProj.DecodeOnce = mtp.HeadHcDown.DecodeOnce = mtp.HeadHcUp.DecodeOnce = true;
             int expertType = WeightRequant.MtpExpertType();
             if (expertType == WeightRequant.GgmlTypeQ4_0)
                 throw new NotSupportedException(

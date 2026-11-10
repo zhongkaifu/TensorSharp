@@ -140,4 +140,79 @@ namespace tsm
                          const ggml_tensor* idx, const ggml_tensor* cnt, const ggml_tensor* mask_in, ggml_tensor* out,
                          int T, int n_head, int n_head_kv, int n_cells, int width, float scale);
     long long qsa_attn_count();
+
+    // A prompt chunk's routed experts on Strata's grouped GEMM (tsm/kernels/tsm_moe_mm.metal, the Metal 4 tensor API):
+    // the (token, expert) entries sorted by expert into 16-row tiles, gate+up+SwiGLU in one pass, down, then each
+    // token's weighted sum in route order. Q2_0 gate/up/down stacks in one Metal buffer; TS_METAL_MOE_MM=0 turns it off.
+    bool moe_mm_enabled();
+    bool moe_mm_supported(ggml_backend* backend, int gate_type, int up_type, int down_type, int hidden, int n_ff,
+                          int n_expert, int n_used);
+    // x / out F32 [hidden, T]; ids I32 and wts F32 [n_used, T]; gate / up [hidden, n_ff, n_expert], down [n_ff, hidden,
+    // n_expert]. wait: return only once the output is written. False with the last error set.
+    bool moe_mm_encode(ggml_backend* backend, const ggml_tensor* x, const ggml_tensor* ids, const ggml_tensor* wts,
+                       const ggml_tensor* gate, const ggml_tensor* up, const ggml_tensor* down, ggml_tensor* out,
+                       int T, int hidden, int n_ff, int n_expert, int n_used, bool wait);
+    long long moe_mm_count();
+    // Drops moe_mm_encode's scratch (~0.8 GB at a 4096-row chunk of Flash Next): called once a prompt pass is done, so
+    // decode does not carry it.
+    void moe_mm_release();
+    // Waits for the last command buffer a tsm encoder committed (ggml's synchronize does not cover them).
+    void wait_last();
+
+    // Copies srcs[i] into dsts[i] (the same byte counts, Metal buffers) in one blit pass on ggml-metal's queue, behind the
+    // work already committed there, without waiting: the speculative state snapshot before a verify window, which a host
+    // copy made wait for the accelerator and then memcpy ~115 MB (Flash Next, ~2 ms a step). Returns a retained handle
+    // of its command buffer, or null with the last error set (the caller copies on the host then).
+    void* copy_async(ggml_backend* backend, const ggml_tensor* const* srcs, const ggml_tensor* const* dsts, int n);
+    // Waits for a copy_async handle's copies to complete; release_handle drops it (null is a no-op for both).
+    void wait_handle(void* handle);
+    void release_handle(void* handle);
+
+    // ---- A prompt chunk's hyper-connection read in one pass on the matrix units (tsm/kernels/tsm_hc_read.metal, after
+    // Strata's gr_norm_h / gemm_f16 / gr_epi_down / gemm_hc_up): xn = rms_norm(each stream) * gamma in fp16, the down
+    // projection and the injection weights in one GEMM, silu(down / hc), and the up projection whose epilogue mixes
+    // the streams, in place of ggml's norm, three matmuls and element-wise passes. The weights are dequantized to fp16
+    // a chunk. TS_METAL_HC_READ=0 keeps the ggml path.
+    struct HcReadIO
+    {
+        const ggml_tensor* res = nullptr;       // F32 [n_embd * hc, T], the residual (read only)
+        const ggml_tensor* gamma = nullptr;     // F32 [n_embd * hc]
+        const ggml_tensor* w_down = nullptr;    // [n_embd * hc, lr]
+        const ggml_tensor* w_inject = nullptr;  // [n_embd * hc, hc]
+        const ggml_tensor* w_up = nullptr;      // [lr, n_embd * hc]
+        ggml_tensor* mixed = nullptr;           // F32 [n_embd, T], written
+        ggml_tensor* inject = nullptr;          // F32 [hc, T], written
+        int T = 0, n_embd = 0, hc = 0, lr = 0;
+        float eps = 0.0f;
+    };
+    // Whether the kernels take these weight types (F32, F16, BF16, Q8_0) and shapes on this backend.
+    bool hc_read_supported(ggml_backend* backend, int down_type, int inject_type, int up_type, int n_embd, int hc, int lr);
+    bool hc_read_encode(ggml_backend* backend, const HcReadIO& io);
+    long long hc_read_count();
+
+    // ---- The end of a DFlash2 draft (tsm/kernels/tsm_df_tail.metal): the target's q5_K output head over the block's
+    // proposal rows on the matrix units, the top-16 of each row, and the candidate selector's transition lattice over
+    // q4_K codebooks of rank 256, in one command buffer behind the draft graph on ggml-metal's queue, in place of
+    // ggml's per-row head, a vocabulary-wide top-k and the selector's small ops. The outputs are the ggml path's: the
+    // candidates [gamma][16] and the lattice (16 anchor scores, then a [16 predecessor][16 candidate] matrix per later
+    // position). TS_METAL_DF_TAIL=0 keeps the ggml path.
+    struct DfTailIO
+    {
+        const ggml_tensor* h = nullptr;      // F32 [hidden, rows], the final normed rows; the proposals are rows 1..gamma
+        const ggml_tensor* ph = nullptr;     // F32 [rank, gamma], the selector's hidden projection (scaled)
+        const ggml_tensor* head = nullptr;   // q5_K [hidden, vocab]
+        const ggml_tensor* pred = nullptr;   // q4_K [rank, vocab], the predecessor codebook
+        const ggml_tensor* succ = nullptr;   // q4_K [rank, vocab], the successor codebook
+        int gamma = 0, anchor = 0;
+        float head_scale = 1.0f, pred_scale = 1.0f, succ_scale = 1.0f, logit_scale = 1.0f, softcap = 0.0f;
+        int* cand_out = nullptr;             // host [gamma * 16]
+        float* scores_out = nullptr;         // host [16 + 16 * 16 * (gamma - 1)]
+        float* logits_out = nullptr;         // optional host [gamma * vocab] (the probe)
+    };
+    bool df_tail_enabled();
+    bool df_tail_supported(ggml_backend* backend, int head_type, int hidden, int vocab, int rank, int top_k,
+                           int pred_type, int succ_type, int gamma);
+    // Encodes and commits the tail, waits for it, and copies the outputs to the host arrays.
+    bool df_tail_run(ggml_backend* backend, const DfTailIO& io);
+    long long df_tail_count();
 }

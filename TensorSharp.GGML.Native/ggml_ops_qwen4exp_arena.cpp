@@ -30,6 +30,25 @@
 
 using namespace tsg;
 
+namespace
+{
+    // TS_Q4E_ARENA_BATCHED_GDN=0 runs each slot's GDN half on its own (T = 1 per slot) instead of one batched pass.
+    // Read per graph build (tests compare both); a built graph keeps its form.
+    bool q4e_arena_batched_gdn()
+    {
+        const char* e = std::getenv("TS_Q4E_ARENA_BATCHED_GDN");
+        return !(e != nullptr && e[0] == '0');
+    }
+
+    // TS_Q4E_ARENA_BATCHED_ATTN=0 runs each slot's whole attention half on its own instead of batching its mixer,
+    // projections, rotary, gate, output projection and scatter over the slots (q4e_nodes_attn_slots).
+    bool q4e_arena_batched_attn()
+    {
+        const char* e = std::getenv("TS_Q4E_ARENA_BATCHED_ATTN");
+        return !(e != nullptr && e[0] == '0');
+    }
+}
+
 // ============================================================================
 // qwen4exp (Qwen3.8-Flash-Next) SLOT-STABLE ARENA token-batched decode: N
 // concurrent sequences, one token each, in ONE ggml graph — the port of the
@@ -1036,7 +1055,26 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                             hist_view, n_embd, hc, ple_T, ple_streams, eps, &state_writes);
                 }
 
-                if (kinds[il] != 0)
+                if (kinds[il] != 0 && q4e_arena_batched_gdn() && n_slots > 1)
+                {
+                    // ===== GDN half, batched: one pass over every slot's column =====
+                    // The mixer, projections, gate and output projection read their weights once for all slots; the
+                    // convolution and the recurrence take every slot's history and state from the arenas at once
+                    // (slots are contiguous there) and write them back with one copy each.
+                    ggml_tensor* conv_all = ggml_view_3d(ctx, e.conv_arena[il], gdn_hist, conv_dim, n_slots,
+                            e.conv_arena[il]->nb[1], e.conv_arena[il]->nb[2], 0);
+                    ggml_tensor* ssm_all = ggml_view_4d(ctx, e.ssm_arena[il], head_v_dim, head_v_dim, n_v_heads, n_slots,
+                            e.ssm_arena[il]->nb[1], e.ssm_arena[il]->nb[2], e.ssm_arena[il]->nb[3], 0);
+                    Q4eGdnWriteback wb{};
+                    res = q4e_nodes_gdn(ctx, binder, &gdn[il], res, conv_all, ssm_all,
+                            n_embd, hc, hc_low_rank, /*T=*/1,
+                            head_k_dim, head_v_dim, n_k_heads, n_v_heads, d_conv,
+                            eps, &wb, nullptr, n_slots);
+                    ggml_build_forward_expand(e.graph, res);
+                    ggml_build_forward_expand(e.graph, ggml_cpy(ctx, wb.tail, conv_all));
+                    ggml_build_forward_expand(e.graph, ggml_cpy(ctx, wb.new_state, ssm_all));
+                }
+                else if (kinds[il] != 0)
                 {
                     // ===== GDN half: per-slot recurrence against arena slices =====
                     ggml_tensor* res_next = nullptr;
@@ -1067,6 +1105,34 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                         ggml_build_forward_expand(e.graph, ggml_cpy(ctx, wb.new_state, ssm_slice));
                     }
                     res = res_next;
+                }
+                else if (q4e_arena_batched_attn() && n_slots > 1)
+                {
+                    // ===== attention half, batched over the slots (each slot's own cache, mask and QSA) =====
+                    const size_t rb = ggml_row_size(kvType, hd);
+                    std::vector<Q4eAttnSlot> slot_in(n_slots);
+                    std::vector<Q4eQsaGraph> qsa_in(n_slots);
+                    for (int s = 0; s < n_slots; ++s)
+                    {
+                        Q4eAttnSlot& sl = slot_in[s];
+                        sl.n_kv_pad = e.attention_windows[s];
+                        sl.mask = ggml_view_2d(ctx, e.attn_mask, sl.n_kv_pad, 1, e.attn_mask->nb[1], (size_t)s * e.attn_mask->nb[3]);
+                        sl.kv_idx = ggml_view_1d(ctx, e.local_idx_in, 1, (size_t)s * sizeof(int64_t));
+                        sl.k_cache = ggml_view_3d(ctx, e.k_arena[il], hd, e.cap, kvH, rb, e.cap * rb, (size_t)s * e.rows_per_slot * rb);
+                        sl.v_cache = ggml_view_3d(ctx, e.v_arena[il], hd, e.cap, kvH, rb, e.cap * rb, (size_t)s * e.rows_per_slot * rb);
+                        if (e.qsa_arena[il])
+                        {
+                            const auto& a = e.qsa_args[il];
+                            auto* raw = e.qsa_arena[il];
+                            qsa_in[s].args = &a;
+                            qsa_in[s].inputs = &e.qsa_inputs[il][s];
+                            qsa_in[s].cache = ggml_view_2d(ctx, raw, a.head_dim, e.cap, raw->nb[1], (size_t)s * raw->nb[2]);
+                            sl.qsa = &qsa_in[s];
+                        }
+                    }
+                    res = q4e_nodes_attn_slots(ctx, e.graph, binder, &attn[il], res, e.rope_pos_in, n_slots,
+                        slot_in.data(), n_embd, hc, hc_low_rank, head_dim, n_head, kvH,
+                        n_rot, rope_base, rope_freq_scale, attn_scale, eps, use_flash);
                 }
                 else
                 {

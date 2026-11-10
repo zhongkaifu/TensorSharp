@@ -24,6 +24,89 @@ namespace TensorSharp.Models
         private List<int> _pleHistory = new();
         private int _pleNextPos;
 
+        // The next prompt chunk's PLE rows, gathered on the thread pool while this chunk computes
+        // (PrepareNextPrefillChunk): the scheduler's hint, then the gather it started, keyed by the chunk and
+        // the n-gram history it assumed. A chunk takes it only when all of them match; it is always joined first.
+        private int[] _pleHintTokens;
+        private int _pleHintStart = -1;
+        private Task _plePrefetch;
+        private int[] _plePrefetchTokens;
+        private int _plePrefetchStart = -1;
+        private int[] _plePrefetchHistory;
+        private float[] _plePrefetchBuf;
+        private byte[] _plePrefetchPacked;
+
+        public override void PrepareNextPrefillChunk(int[] tokens, int startPos)
+        {
+            if (tokens == null || tokens.Length < PlePrefetchMinRows || !PlePrefetchEnabled) return;
+            _pleHintTokens = tokens;
+            _pleHintStart = startPos;
+        }
+
+        // TS_Q4E_PLE_PREFETCH=0 gathers every chunk's rows when it runs. Below this width a chunk's gather is short.
+        private const int PlePrefetchMinRows = 256;
+        private static bool PlePrefetchEnabled => Environment.GetEnvironmentVariable("TS_Q4E_PLE_PREFETCH") != "0";
+
+        /// <summary>Joins a prefetch in flight and takes its rows into <paramref name="dst"/>'s place when it gathered
+        /// this chunk (or one this chunk starts) from this history (committing the history as <see cref="ComputePleRows(int[], int)"/>
+        /// would); false otherwise, and the caller gathers.</summary>
+        private bool TakePlePrefetch(int[] tokens, int startPos, ref float[] dst)
+        {
+            Task t = _plePrefetch;
+            if (t == null) return false;
+            _plePrefetch = null;
+            bool ok;
+            try { t.Wait(); ok = true; }
+            catch (AggregateException) { ok = false; }
+            // A chunk that starts the hinted one (the scheduler holds a prompt's last token back for the first
+            // decode step) takes its leading rows: a token's rows depend only on the tokens before it.
+            ok = ok && _plePrefetchStart == startPos && _pleNextPos == startPos
+                && _plePrefetchTokens != null && tokens.Length <= _plePrefetchTokens.Length
+                && tokens.AsSpan().SequenceEqual(_plePrefetchTokens.AsSpan(0, tokens.Length))
+                && _plePrefetchHistory != null && System.Linq.Enumerable.SequenceEqual(_pleHistory, _plePrefetchHistory);
+            if (!ok) return false;
+            CommitPleHistory(_pleHistory, tokens, startPos, _pleNextPos);
+            _pleNextPos = startPos + tokens.Length;
+            (dst, _plePrefetchBuf) = (_plePrefetchBuf, dst);
+            PlePrefetchHitsForTests++;
+            return true;
+        }
+
+        /// <summary>Prompt chunks that took the rows gathered while the chunk before them computed.</summary>
+        internal long PlePrefetchHitsForTests { get; private set; }
+
+        /// <summary>Starts gathering the hinted chunk's rows when it follows the one just gathered (the n-gram
+        /// history now ends with it), into the spare pinned buffer.</summary>
+        private unsafe void StartPlePrefetch(int nextPos)
+        {
+            int[] next = _pleHintTokens;
+            int start = _pleHintStart;
+            _pleHintTokens = null;
+            _pleHintStart = -1;
+            if (next == null || start != nextPos || _plePrefetch != null) return;
+            int[] history = _pleHistory.ToArray();
+            long need = (long)next.Length * Config.HiddenSize;
+            if (_plePrefetchBuf == null || _plePrefetchBuf.Length < need)
+                _plePrefetchBuf = GC.AllocateArray<float>(checked((int)need), pinned: true);
+            float[] buf = _plePrefetchBuf;
+            _plePrefetchTokens = next;
+            _plePrefetchStart = start;
+            _plePrefetchHistory = history;
+            _plePrefetch = Task.Run(() =>
+            {
+                int[] rows = ComputePleRows(next, start, new List<int>(history), start);
+                fixed (float* eb = buf)
+                    GatherPleRowsRaw(eb, rows, next.Length, ref _plePrefetchPacked);
+            });
+        }
+
+        private void JoinPlePrefetch()
+        {
+            Task t = _plePrefetch;
+            _plePrefetch = null;
+            try { t?.Wait(); } catch (AggregateException) { }
+        }
+
         private void ResetPleHistory()
         {
             _pleHistory.Clear();
@@ -305,6 +388,10 @@ namespace TensorSharp.Models
         private byte[] _plePackedRows;
 
         private unsafe byte* ReadPleRowsPacked(QuantizedWeight qw, int[] rows, long qRowBytes)
+            => ReadPleRowsPacked(qw, rows, qRowBytes, ref _plePackedRows);
+
+        // `scratch`: the caller's packed-row buffer (the background prefetch keeps one of its own).
+        private unsafe byte* ReadPleRowsPacked(QuantizedWeight qw, int[] rows, long qRowBytes, ref byte[] scratch)
         {
             if (!_pleTableOnDisk || rows.Length < PleExplicitReadMinRows || !qw.IsFileBacked
                 || Environment.GetEnvironmentVariable("TS_PLE_EXPLICIT_READ") == "0")
@@ -312,9 +399,9 @@ namespace TensorSharp.Models
             long need = rows.Length * qRowBytes;
             if (need > int.MaxValue)
                 return null;
-            if (_plePackedRows == null || _plePackedRows.Length < need)
-                _plePackedRows = GC.AllocateUninitializedArray<byte>((int)need, pinned: true);
-            byte* packed = (byte*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref _plePackedRows[0]);
+            if (scratch == null || scratch.Length < need)
+                scratch = GC.AllocateUninitializedArray<byte>((int)need, pinned: true);
+            byte* packed = (byte*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref scratch[0]);
             return TensorSharp.GGML.GgmlBasicOps.HostReadRows(qw.Data, qRowBytes, rows, (IntPtr)packed) ? packed : null;
         }
 
@@ -512,6 +599,9 @@ namespace TensorSharp.Models
         /// independent faults the SSD can serve concurrently.
         /// </summary>
         private unsafe void GatherPleRowsRaw(float* dst, int[] rows, int seqLen)
+            => GatherPleRowsRaw(dst, rows, seqLen, ref _plePackedRows);
+
+        private unsafe void GatherPleRowsRaw(float* dst, int[] rows, int seqLen, ref byte[] packedScratch)
         {
             const string name = "per_layer_token_embd.weight";
             if (_quantWeights.TryGetValue(name, out var qw))
@@ -523,7 +613,7 @@ namespace TensorSharp.Models
                 long baseA = (long)qw.Data;
                 long dstA = (long)dst;
                 var ggmlType = qw.GgmlType;
-                long packedA = (long)ReadPleRowsPacked(qw, rows, qRowBytes);
+                long packedA = (long)ReadPleRowsPacked(qw, rows, qRowBytes, ref packedScratch);
                 void DequantRow(int i)
                 {
                     NativeDequant.DequantizeToFloat32Native(

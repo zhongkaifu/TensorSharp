@@ -42,12 +42,16 @@
 #include "ggml_h3_graph_inputs.h"
 #include "ggml_ops_metal_flash_pad.h"
 #include "ggml_h3_lora.h"
+#include "ggml_ops_matmul_precision.h"
 
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -484,7 +488,88 @@ struct H3Offload
     bool attention = false;
     bool matmul = false;
     bool fused = false;
+    bool f32 = false;                  // TS_H3_CUDA_F32_PRODUCTS: weight products on the pedantic handle
+    ggml_backend_t backend = nullptr;
 };
+
+// ---------------------------------------------------------------------------
+// The DiT forward's weight products in F32 (ggml_cuda only, TS_H3_CUDA_F32_PRODUCTS=1).
+//
+// ggml-cuda runs a float matmul on cuBLAS handles it sets to
+// CUBLAS_TF32_TENSOR_OP_MATH, which rounds both operands to TF32's 10-bit
+// mantissa. With the switch, each product of the DiT forward whose left operand
+// is a bound float tensor (an F32/F16/BF16 weight or a LoRA plug-in's down or up
+// factor, or a row view of one) runs instead on TensorSharp's F32 GEMM over a
+// private CUBLAS_PEDANTIC_MATH handle (ggml_ops_matmul_precision.cu, the seam the
+// Gemma 4 audio graphs use). Quantized weights keep their kernels, and the
+// attention's own products keep ggml's. Off by default: ggml_cuda keeps its
+// TF32/BF16 speed, and the switch's cost on a real checkpoint is not measured.
+//
+// On the all-F32 LoRA parity fixture (MiniMaxH3LoraParityTests) the native step
+// against the direct CPU path, without a plug-in, went from rel 6.08e-4 to 8.07e-6;
+// every float product including the attention's: 1.24e-7; the plug-in's products
+// alone left it at 6.08e-4, since TF32 noise in the base path does not cancel
+// between the step with and without the update.
+// ---------------------------------------------------------------------------
+[[maybe_unused]] void h3_f32_warn_once(std::atomic<bool>& said, const std::string& what)
+{
+    if (!said.exchange(true))
+        std::fprintf(stderr, "[minimax-h3] TS_H3_CUDA_F32_PRODUCTS=1: %s\n", what.c_str());
+}
+
+[[maybe_unused]] bool h3_f32_products_enabled()
+{
+    // Read per graph, as TS_H3_NO_FLASH is: a test process switches it between steps.
+    const char* e = std::getenv("TS_H3_CUDA_F32_PRODUCTS");
+    if (e == nullptr || std::strcmp(e, "1") != 0) return false;
+#if defined(TSG_GGML_USE_CUDA)
+    if (g_backend_type == BACKEND_TYPE_CUDA) return true;
+#endif
+    static std::atomic<bool> said{false};
+    h3_f32_warn_once(said, "the switch applies to ggml_cuda only; this backend keeps its own matrix products.");
+    return false;
+}
+
+#if defined(TSG_GGML_USE_CUDA)
+bool h3_f32_product_wants(const ggml_tensor* node)
+{
+    if (node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr || node->src[1] == nullptr) return false;
+    const ggml_tensor* a = node->src[0];
+    const ggml_tensor* bound = a->view_src != nullptr ? a->view_src : a;
+    if (bound->op != GGML_OP_NONE) return false;   // the attention's products and other computed operands
+    if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_BF16) return false;
+    if (node->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32) return true;
+    static std::atomic<bool> said{false};
+    h3_f32_warn_once(said, std::string("a ") + ggml_type_name(a->type) + " x " + ggml_type_name(node->src[1]->type) +
+                     " product (" + node->name + ") has no F32 path; it runs on ggml-cuda's TF32 cuBLAS.");
+    return false;
+}
+
+bool h3_f32_product_run(ggml_tensor* node, ggml_backend_t backend)
+{
+    // One private pedantic handle per backend, on that backend's stream.
+    static std::mutex lock;
+    static std::vector<std::pair<ggml_backend_t, tsg_matmul_cuda_state*>> states;
+    tsg_matmul_cuda_state* state = nullptr;
+    {
+        std::lock_guard<std::mutex> hold(lock);
+        for (auto& s : states)
+            if (s.first == backend) state = s.second;
+        if (state == nullptr && (state = tsg_matmul_cuda_try_init(backend)) != nullptr)
+            states.emplace_back(backend, state);
+    }
+    if (state == nullptr)
+    {
+        static std::atomic<bool> said{false};
+        h3_f32_warn_once(said, "the pedantic cuBLAS handle could not be created (device memory); the weight products run "
+                               "on ggml-cuda's TF32 cuBLAS.");
+        return false;   // compute_split runs the node on ggml
+    }
+    tsg_matmul_cuda_compute(state, node);
+    tsg::sync_backend(backend);
+    return true;
+}
+#endif
 
 bool h3_offload_wants(const ggml_tensor* node, void* ctx)
 {
@@ -495,17 +580,21 @@ bool h3_offload_wants(const ggml_tensor* node, void* ctx)
 #if defined(TSG_GGML_USE_CUDA)
     if (o->matmul && h3_q4k_matmul_wants(node)) return true;
     if (o->fused && h3_fused_params(node).kind != H3_FUSED_NONE) return true;
+    if (o->f32 && h3_f32_product_wants(node)) return true;
 #endif
     (void) o; (void) node;
     return false;
 }
 
-bool h3_offload_run(ggml_tensor* node, void*)
+bool h3_offload_run(ggml_tensor* node, void* ctx)
 {
 #if defined(TSG_GGML_USE_CUDA) && defined(TSG_HAVE_CUDNN)
     if (node->op == GGML_OP_FLASH_ATTN_EXT) return h3_sdpa_run_node(node);
 #endif
 #if defined(TSG_GGML_USE_CUDA)
+    // A wanted float product is the F32 path's; a wanted quantized one is a Q4_K weight on cuBLAS BF16.
+    if (node->op == GGML_OP_MUL_MAT && !ggml_is_quantized(node->src[0]->type))
+        return h3_f32_product_run(node, static_cast<const H3Offload*>(ctx)->backend);
     if (node->op == GGML_OP_MUL_MAT) return h3_q4k_matmul_run(node);
     if (node->op == GGML_OP_CUSTOM) return h3_fused_run(node);
 #endif
@@ -540,9 +629,11 @@ ggml_status h3_compute(ggml_backend_t backend, ggml_cgraph* graph, const char* t
     which.matmul = h3_cublas_matmul_enabled() && tag != nullptr && std::strstr(tag, "dit-forward") != nullptr;
     // Fused nodes exist only where a graph built them (the DiT and the video VAE decoder).
     which.fused = h3_fused_enabled();
+    which.f32 = tag != nullptr && std::strstr(tag, "dit-forward") != nullptr && h3_f32_products_enabled();
+    which.backend = backend;
 #endif
     ggml_status status;
-    if (which.attention || which.matmul || which.fused)
+    if (which.attention || which.matmul || which.fused || which.f32)
     {
         NodeOffload offload;
         offload.wants = h3_offload_wants;

@@ -660,6 +660,103 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     }
 
     /// <summary>
+    /// A prompt group's ubatches share their layer's dense weights as F16 (TS_Q4E_GROUP_F16): the first ubatch of a layer
+    /// dequantizes each quantized projection into the group's arena and the others reuse that copy, which is the same
+    /// kernel's output, so the prompt and the decode steps after it answer bit for bit as dequantizing per ubatch does.
+    /// 520-row ubatches (past the Q8_0 MMQ's 512 rows, so the fixture's Q8_0 projections take the F16 route) of an
+    /// 1,100-token prompt in groups of 1,040 rows: two ubatches a layer, then a group of one.
+    /// </summary>
+    [CudaFact]
+    public void APromptGroupsDenseWeights_DequantizedOncePerLayer_AnswerBitForBit()
+    {
+        _env.Set("TS_Q4E_HOST_EXPERTS", "0");
+        _env.Set("MAX_CONTEXT", "2048");    // the class keeps 1024; the prompt is 1,100 tokens
+        _env.Set("TS_Q4E_UBATCH", "520");
+        _env.Set("TS_Q4E_PROMPT_GROUP", "1040");
+        string path = Fixture(indexerTopK: 16, q2kxlExperts: true);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        // Prompt groups need expert residency: two thirds resident.
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes * 2 / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        int[] prompt = Enumerable.Range(0, 1100).Select(i => (i * 37 + 11) % 250).ToArray();
+
+        (float[][] Rows, long Groups, long Dequantized, long Reused) Answer(string f16)
+        {
+            _env.Set("TS_Q4E_GROUP_F16", f16);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            var rows = new float[Steps.Length + 1][];
+            rows[0] = (float[])model.ForwardRefill(prompt).Clone();
+            for (int i = 0; i < Steps.Length; i++)
+                rows[i + 1] = (float[])model.Forward(new[] { Steps[i] }).Clone();
+            return (rows, engine.PromptGroupsRun, engine.GroupF16Dequantized, engine.GroupF16Reused);
+        }
+        var perUbatch = Answer("0");
+        var shared = Answer(null);
+        _output.WriteLine($"prompt groups {shared.Groups}: F16 copies dequantized {shared.Dequantized}, reused {shared.Reused} " +
+            $"(per ubatch: {perUbatch.Dequantized} / {perUbatch.Reused})");
+        Assert.Equal(2, perUbatch.Groups);
+        Assert.Equal(2, shared.Groups);
+        Assert.Equal(0, perUbatch.Dequantized + perUbatch.Reused);
+        Assert.True(shared.Dequantized > 0, "no layer dequantized a weight into the group's arena");
+        Assert.Equal(shared.Dequantized, shared.Reused);    // two ubatches a layer in the first group, the second alone
+        for (int i = 0; i < shared.Rows.Length; i++)
+            Assert.True(shared.Rows[i].AsSpan().SequenceEqual(perUbatch.Rows[i]),
+                $"{(i == 0 ? "prefill" : $"decode {i}")}: sharing the layer's F16 weights changed the logits");
+    }
+
+    /// <summary>
+    /// A prompt group runs its routed experts' gate/up once over all its ubatches (TS_Q4E_GROUP_EXPERTS): each ubatch
+    /// stages its missed experts and leaves its selections, int8 activations, shared-expert outputs and scatter logits to
+    /// the group; after the last, gate/up runs over the group and each ubatch's down reads its slots' H through the group's
+    /// plan. Every slot's products are ubatch order's, so the prompt and the decode steps after it answer bit for bit as
+    /// the per-ubatch experts do. Q2_0 experts on the int8 route, 64-row ubatches of a 300-token prompt in groups of 192
+    /// rows: three ubatches, then 64 and 44.
+    /// </summary>
+    [CudaFact]
+    public void APromptGroupsExpertGateUp_RunOncePerLayer_AnswersBitForBit()
+    {
+        _env.Set("TS_Q4E_HOST_EXPERTS", "0");
+        _env.Set("TS_Q4E_UBATCH", "64");
+        _env.Set("TS_Q4E_PROMPT_GROUP", "192");
+        string path = Fixture(indexerTopK: 16, expertGateUpType: SyntheticGguf.GgmlType.Q2_0, expertDownType: SyntheticGguf.GgmlType.Q2_0);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        // Prompt groups need expert residency: two thirds resident.
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes * 2 / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        int[] prompt = Enumerable.Range(0, 300).Select(i => (i * 37 + 11) % 250).ToArray();
+
+        (float[][] Rows, long Groups, long Deferred) Answer(string grouped)
+        {
+            _env.Set("TS_Q4E_GROUP_EXPERTS", grouped);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            var rows = new float[Steps.Length + 1][];
+            rows[0] = (float[])model.ForwardRefill(prompt).Clone();
+            for (int i = 0; i < Steps.Length; i++)
+                rows[i + 1] = (float[])model.Forward(new[] { Steps[i] }).Clone();
+            return (rows, engine.PromptGroupsRun, engine.GroupExpertsRun);
+        }
+        var perUbatch = Answer("0");
+        var grouped = Answer(null);
+        _output.WriteLine($"prompt groups {grouped.Groups}: layers whose gate/up ran over the group {grouped.Deferred} " +
+            $"(per ubatch: {perUbatch.Deferred})");
+        Assert.Equal(2, perUbatch.Groups);
+        Assert.Equal(2, grouped.Groups);
+        Assert.Equal(0, perUbatch.Deferred);
+        Assert.Equal(2L * Qwen4ExpSyntheticModelBuilder.Layers, grouped.Deferred);
+        for (int i = 0; i < grouped.Rows.Length; i++)
+            Assert.True(grouped.Rows[i].AsSpan().SequenceEqual(perUbatch.Rows[i]),
+                $"{(i == 0 ? "prefill" : $"decode {i}")}: running the group's gate/up at once changed the logits");
+    }
+
+    /// <summary>
     /// The route-tail skip (TS_MOE_ROUTE_TAIL_SKIP; Strata's STRATA_ROUTE_TAIL_SKIP): in decode steps and verify windows a
     /// host expert every row routes at the given rank or lower is left out. The fixture routes 4 of 16 experts, so rank 2
     /// leaves out misses at ranks 2-3: some slots are skipped and the answers move; a rank as wide as the selection skips
@@ -1359,6 +1456,147 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         Assert.True(hRestarted.AsSpan().SequenceEqual(hFresh), "the restarted block's streams differ from a block that started there");
         Assert.ThrowsAny<InvalidOperationException>(
             () => head.DraftCatchUpAndStep(tokens[..1], rows[..feat], S - 1, new float[vocab], new float[feat]));
+    }
+
+    /// <summary>
+    /// The MTP catch-up after a grouped prompt reads the trunk streams of the last group's positions from the group's
+    /// buffer (Q4eCudaEngine.MtpUploadRows), the values the host's copy holds, so the draft chain picks the same tokens with
+    /// the same confidences, bit for bit, as with every row from the host (TS_Q4E_MTP_D2D=0). A 300-token prompt in groups
+    /// of 192 rows (64-row ubatches), the catch-up from position 150: rows for positions 150..191 come from the host, the
+    /// 108 rows of the last group from the device.
+    /// </summary>
+    [CudaFact]
+    public void TheMtpCatchUpAfterAGroupedPrompt_ReadsTheLastGroupsStreams_BitForBit()
+    {
+        _env.Set("TS_Q4E_HOST_EXPERTS", "0");
+        _env.Set("TS_Q4E_UBATCH", "64");
+        _env.Set("TS_Q4E_PROMPT_GROUP", "192");
+        string path = Fixture(indexerTopK: 16, expertGateUpType: SyntheticGguf.GgmlType.Q2_0, expertDownType: SyntheticGguf.GgmlType.Q2_0);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 16);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        // Prompt groups need expert residency: two thirds resident.
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes * 2 / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        int[] prompt = Enumerable.Range(0, 300).Select(i => (i * 37 + 11) % 250).ToArray();
+        const int S = 150, Steps3 = 3;
+
+        (int[] Ids, float[] Probs, long FromDevice, long Groups) Run(string d2d)
+        {
+            _env.Set("TS_Q4E_MTP_D2D", d2d);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var head = (TensorSharp.Runtime.Speculative.IDraftHead)model;
+            int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            var hidden = new float[prompt.Length * feat];
+            spec.SpecForward(prompt, hidden, new float[vocab], false);
+            // The block restarts at S (the gap before it reported), then catches up on the prompt's rows from S and the
+            // next token, row t with the streams of the token before it.
+            head.DraftCatchUp(prompt[..S], null, 0);
+            int[] tokens = prompt[S..].Append(Steps[0]).ToArray();
+            var rows = new float[tokens.Length * feat];
+            Array.Copy(hidden, (long)(S - 1) * feat, rows, 0, (long)tokens.Length * feat);
+            var ids = new int[Steps3];
+            var probs = new float[Steps3];
+            Assert.Equal(Steps3, head.DraftChain(tokens, rows, S, Steps3, ids, probs));
+            return (ids, probs, engine.MtpRowsFromDevice, engine.PromptGroupsRun);
+        }
+        var host = Run("0");
+        var device = Run(null);
+        _output.WriteLine($"host rows:   [{string.Join(",", host.Ids)}] p [{string.Join(",", host.Probs.Select(p => p.ToString("R")))}]");
+        _output.WriteLine($"device rows: [{string.Join(",", device.Ids)}] p [{string.Join(",", device.Probs.Select(p => p.ToString("R")))}], " +
+            $"{device.FromDevice} rows from the group's buffer");
+        Assert.Equal(2, device.Groups);
+        Assert.Equal(0, host.FromDevice);
+        Assert.Equal(prompt.Length - 192, device.FromDevice);
+        Assert.Equal(host.Ids, device.Ids);
+        for (int i = 0; i < Steps3; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(host.Probs[i]) == BitConverter.SingleToInt32Bits(device.Probs[i]),
+                $"step {i}: confidence {device.Probs[i]:R} vs {host.Probs[i]:R}");
+    }
+
+    /// <summary>
+    /// The last prompt group's streams stop standing for their positions once the slot's position falls below them: a
+    /// grouped 150-token prompt, then the sequence reset and a short (ungrouped) prompt over positions the group had held.
+    /// Its catch-up takes every row from the host - none from the stale group buffer - and drafts what a fresh engine
+    /// drafts for that prompt alone, bit for bit.
+    /// </summary>
+    [CudaFact]
+    public void TheMtpCatchUp_AfterTheSlotIsReset_DoesNotReadTheOldGroupsStreams()
+    {
+        _env.Set("TS_Q4E_HOST_EXPERTS", "0");
+        _env.Set("TS_Q4E_UBATCH", "64");
+        _env.Set("TS_Q4E_PROMPT_GROUP", "192");
+        string path = Fixture(indexerTopK: 16, expertGateUpType: SyntheticGguf.GgmlType.Q2_0, expertDownType: SyntheticGguf.GgmlType.Q2_0);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 16);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes * 2 / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        int[] first = Enumerable.Range(0, 150).Select(i => (i * 37 + 11) % 250).ToArray();
+        int[] second = Enumerable.Range(0, 40).Select(i => (i * 53 + 7) % 250).ToArray();
+        const int Steps3 = 3;
+
+        // The second prompt's catch-up: every row from position 0 with the streams of the token before it.
+        (int[] Ids, float[] Probs, long FromDevice) Draft(ModelBase model, int[] prompt)
+        {
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var head = (TensorSharp.Runtime.Speculative.IDraftHead)model;
+            int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            var hidden = new float[prompt.Length * feat];
+            spec.SpecForward(prompt, hidden, new float[vocab], false);
+            int[] tokens = prompt.Append(Steps[0]).ToArray();
+            var rows = new float[tokens.Length * feat];
+            Array.Copy(hidden, 0, rows, feat, (long)prompt.Length * feat);
+            var ids = new int[Steps3];
+            var probs = new float[Steps3];
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            long before = engine.MtpRowsFromDevice;
+            Assert.Equal(Steps3, head.DraftChain(tokens, rows, 0, Steps3, ids, probs));
+            return (ids, probs, engine.MtpRowsFromDevice - before);
+        }
+
+        (int[] Ids, float[] Probs, long FromDevice) afterReset, fresh;
+        using (ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp))
+        {
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            spec.SpecForward(first, new float[first.Length * spec.SpecFeatureSize], new float[model.Config.VocabSize], false);
+            Assert.True(engine.PromptGroupsRun > 0, "the first prompt was not read in a group");
+            engine.Reset();
+            afterReset = Draft(model, second);
+        }
+        _env.Set("TS_Q4E_MTP_D2D", "0");
+        using (ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp))
+            fresh = Draft(model, second);
+        _output.WriteLine($"after the reset: [{string.Join(",", afterReset.Ids)}], {afterReset.FromDevice} rows from the group's buffer; " +
+            $"fresh: [{string.Join(",", fresh.Ids)}]");
+        Assert.Equal(0, afterReset.FromDevice);
+        Assert.Equal(fresh.Ids, afterReset.Ids);
+        for (int i = 0; i < Steps3; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(fresh.Probs[i]) == BitConverter.SingleToInt32Bits(afterReset.Probs[i]),
+                $"step {i}: confidence {afterReset.Probs[i]:R} vs {fresh.Probs[i]:R}");
+    }
+
+    /// <summary>The MTP block's Q8_0 dense weights keep the decode-once dense kernels (DeviceWeight.DecodeOnce), so the Q8_0
+    /// pair matvec never runs them: its catch-ups and draft steps are 1-5 rows, where the pair was no faster and from three
+    /// rows 1.2-2x slower on the RTX 5090. The trunk's Q8_0 weights keep the pair.</summary>
+    [CudaFact]
+    public void TheMtpBlocksQ8_0Weights_KeepTheDecodeOnceKernels()
+    {
+        string path = Fixture(indexerTopK: 2048);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 2048);
+        using ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp);
+        var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+        var (q8, once) = engine.MtpQ8_0Weights;
+        _output.WriteLine($"MTP block: {q8} Q8_0 dense weights, {once} on the decode-once kernels");
+        Assert.True(q8 > 0, "the synthetic MTP block has no Q8_0 dense weights");
+        Assert.Equal(q8, once);
     }
 
     /// <summary>A decode step's hyper-connection scatter fused with the next mixer's first pass computes what the two

@@ -21,7 +21,7 @@
     with SIGABRT inside load_aot_module, before any managed code runs. Measured on
     device.
 
-    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 412 symbols.
+    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 431 symbols.
     Test-only exports (inside #if defined(TSG_GGML_TEST_HOOKS) or TSG_GGML_TEST_DIAGNOSTICS
     blocks) are left out: only the native test build compiles them, and a name listed here
     becomes a -u link root, so one the device archive lacks fails the Release link.
@@ -59,6 +59,11 @@
     <ReferenceNativeSymbol Include="TSGgml_DFlashInjectBatched" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DFlashInjectScaled" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DFlashResetCaches" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DSpineDraftBlock" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DSpineResetCaches" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DSpineTablesCreate" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DSpineTablesFree" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DSpineTablesRead" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DequantizeToF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DeviceCopyCacheResidentBytes" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DeviceMemoryInfo" SymbolType="Function" />
@@ -67,6 +72,9 @@
     <ReferenceNativeSymbol Include="TSGgml_DiffusionLmHeadSample" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DiffusionModelDecode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DiffusionPrefillAttentionF32" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DirectReadRegister" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DirectReadSupported" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DirectReadUnregister" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DownloadDeviceCopyRanges" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv41AttachVision" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv41ForwardVision" SymbolType="Function" />
@@ -265,6 +273,7 @@
     <ReferenceNativeSymbol Include="TSGgml_MoeHotTierStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeHotTierTotalBytes" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeTierPrefetchStats" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MoeMmSeamLayers" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeOffloadCounters" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingCounts" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MoeRoutingRecordDevice" SymbolType="Function" />

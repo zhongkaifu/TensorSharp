@@ -100,6 +100,9 @@ namespace TensorSharp.Models
         /// anchor's own prediction, which DFlash discards).</summary>
         public int DraftBlockSize => HasDFlash ? _dflash.MaxDraftTokens : 0;
 
+        /// <summary>A DSpine block is causal: a step drafts only the rows it verifies.</summary>
+        public bool DraftBlockIsCausal => HasDFlash && _dflash.CausalBlock;
+
         /// <summary>The DFlash ring: older prompt rows are overwritten before any draft.</summary>
         public int DraftContextRows => HasDFlash && DFlashRingRows > 0 ? DFlashRingRows : int.MaxValue;
 

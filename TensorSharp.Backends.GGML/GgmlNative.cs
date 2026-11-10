@@ -4623,6 +4623,22 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static partial long TSGgml_TsmSeamPasses();
         [LibraryImport(DllName)]
+        internal static partial int TSGgml_TsmMoeMmProbe(int hidden, int nFf, int nExpert, IntPtr gate, IntPtr up, IntPtr down,
+            int rows, int nUsed, IntPtr ids, IntPtr weights, IntPtr x, IntPtr output);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_TsmMoeMmCount();
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_TsmHcReadProbe(int nEmbd, int hc, int lr, int downType, IntPtr wDown, int injectType,
+            IntPtr wInject, int upType, IntPtr wUp, IntPtr gamma, int rows, IntPtr res, float eps, IntPtr mixed, IntPtr inject);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_TsmHcReadCount();
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_TsmDfTailProbe(int hidden, int vocab, int rank, int gamma, IntPtr head, IntPtr pred,
+            IntPtr succ, IntPtr h, IntPtr ph, int anchor, float headScale, float predScale, float succScale, float logitScale,
+            float softcap, IntPtr cand, IntPtr scores, IntPtr logits, int repeat);
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_TsmDfTailCount();
+        [LibraryImport(DllName)]
         internal static partial long TSGgml_TsmGdnPromptCount();
         [LibraryImport(DllName)]
         internal static partial long TSGgml_TsmHcPromptCount();
@@ -4640,6 +4656,8 @@ internal enum GgmlIndexReductionOp
         internal static partial long TSGgml_MoeStagePrefetchHits();
         [LibraryImport(DllName)]
         internal static partial long TSGgml_MoeStageBorrows();
+        [LibraryImport(DllName)]
+        internal static partial long TSGgml_MoeMmSeamLayers();
         [LibraryImport(DllName)]
         internal static partial int TSGgml_HostReadRows(IntPtr table, long rowBytes, IntPtr rows, int count, IntPtr dst);
         [LibraryImport(DllName)]

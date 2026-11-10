@@ -1,0 +1,10 @@
+{
+  "name": "pi-tensorsharp-sample",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A small module with failing tests for the Pi + TensorSharp example to fix.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

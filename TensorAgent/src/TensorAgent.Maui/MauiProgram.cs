@@ -59,6 +59,7 @@ public static class MauiProgram
         // DesktopEnvironment; a no-op on Windows, where PATH comes from the registry.
         if (Core.Hosting.DesktopEnvironment.ImportLoginShellPath() is { } path)
             Console.WriteLine($"TensorAgent: PATH from the login shell ({path.Split(Path.PathSeparator).Length} entries)");
+        ApplyDesktopEngineSettings();
 #endif
 
 #if IOS || MACCATALYST
@@ -108,9 +109,29 @@ public static class MauiProgram
         return builder.Build();
     }
 
+#if !IOS
+    /// <summary>
+    /// Qwen3.8 Flash Next reads its BF16 hyper-connection matrices as a Q8_0 copy made once at load
+    /// (Strata's default read): 1.26 GB a token becomes 0.67 GB. The fastest presets turn it on
+    /// (config/qwen3.8-flash-next.json, config/qwen3.8-flash-next-cuda.json), and every measurement of
+    /// the catalog's Flash Next entries assumes it. Only the qwen4exp model reads it, once, when its
+    /// type initializes, so it is set before any model loads. A value already in the environment wins.
+    /// </summary>
+    private const string FlashNextHcQ8Variable = "TS_Q4E_HC_Q8";
+
+    private static void ApplyDesktopEngineSettings()
+    {
+        // Managed-to-managed (Qwen4ExpModel reads it with Environment.GetEnvironmentVariable), so
+        // SetEnvironmentVariable is enough; no native getenv reads it.
+        if (Environment.GetEnvironmentVariable(FlashNextHcQ8Variable) is not { Length: > 0 })
+            Environment.SetEnvironmentVariable(FlashNextHcQ8Variable, "1");
+        Console.WriteLine($"TensorAgent: Flash Next hyper-connection read {(Environment.GetEnvironmentVariable(FlashNextHcQ8Variable) == "1" ? "Q8_0" : "BF16")}");
+    }
+#endif
+
 #if IOS
     /// <summary>
-    /// The engine settings measured on an iPhone: a desktop keeps the engine's defaults.
+    /// The engine settings measured on an iPhone; a desktop sets only <see cref="ApplyDesktopEngineSettings"/>.
     /// </summary>
     private static void ApplyPhoneEngineSettings()
     {
