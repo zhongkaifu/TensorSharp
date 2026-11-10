@@ -652,9 +652,20 @@ namespace TensorSharp.Cuda
 
         /// <summary>Forwards (decode steps, verify windows, batched steps) between adaptation rounds (TS_MOE_TIER_ADAPT_EVERY).</summary>
         private readonly int AdaptEvery = Math.Max(1, EnvInt("TS_MOE_TIER_ADAPT_EVERY", 4));
-        /// <summary>Swaps a round makes at most, the largest gains first across the layers (TS_MOE_TIER_ADAPT_SWAPS): 8 when
-        /// they block, 64 when they overlap the decode (Q4eCudaEngine.AsyncSwaps.cs).</summary>
-        private int AdaptSwapsPerCall => Math.Max(1, EnvInt("TS_MOE_TIER_ADAPT_SWAPS", AsyncSwapsUsable ? 64 : 8));
+        /// <summary>Swaps a round makes at most, the largest gains first across the layers (<see cref="AdaptSwapBudget"/>).</summary>
+        private int AdaptSwapsPerCall => AdaptSwapBudget(Environment.GetEnvironmentVariable("TS_MOE_TIER_ADAPT_SWAPS"), AsyncSwapsUsable);
+
+        internal const int OverlappedAdaptSwaps = 256, BlockingAdaptSwaps = 8;
+
+        /// <summary>
+        /// A round's swap budget: TS_MOE_TIER_ADAPT_SWAPS when set; otherwise 8 when the swaps block the decode, and 256 when
+        /// they overlap it (Q4eCudaEngine.AsyncSwaps.cs; a round then carries at most what the staging slots hold,
+        /// <see cref="AsyncSwapCapacity"/>, 254 for Flash Next). At 64 the answer to a long prompt caught up with what it
+        /// routes to over more windows: on the RTX 5090 its first eight 4-row verify windows took 12.7-13.4 ms against
+        /// 10.9 at 256, windows 9-16 11.5 against 9.4-10.7, with the TTFTs and four requests at once unchanged.
+        /// </summary>
+        internal static int AdaptSwapBudget(string explicitSwaps, bool overlapped)
+            => int.TryParse(explicitSwaps, out int n) ? Math.Max(1, n) : overlapped ? OverlappedAdaptSwaps : BlockingAdaptSwaps;
 
         /// <summary>Swaps a round after a prompt makes at most (TS_MOE_TIER_ADAPT_PROMPT_SWAPS; 0 = prompts teach nothing).
         /// The decode after a long prompt routes much as the prompt did: on the RTX 5090 the first verify windows after a
