@@ -3281,7 +3281,9 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>
-        /// The pair's kernel for a call. Every kernel computes the same bits, so this is speed alone (measured on an
+        /// The pair's kernel for a call that was not timed on its GPU (<see cref="TuneQ80Pair"/> times every shape an
+        /// engine launches; see CudaKernels.Q80PairTuning.cs). Every kernel computes the same bits, so this is speed
+        /// alone (measured on an
         /// H100 NVL at Qwen3.8 Flash Next's decode shapes, 2026-11-09): the twin for one row, and for two where a
         /// slice is long (48+ blocks), the output wide (8192-65536 of 1024+ inputs) or the slices many (16); the lane
         /// kernel for two to four, but the twin for three or four on a long slice of a narrow output (6144 -> 2560);
@@ -3307,7 +3309,8 @@ namespace TensorSharp.Cuda
         /// <summary>
         /// Q8_0 matvec over 1..<see cref="Q80PairMaxRows"/> q8_1 activation rows (<c>inDim</c> a multiple of 32) as
         /// one arithmetic run by three kernels: int8 tensor cores (one Q8_0 block is one m16n8k32 step) and two dp4a
-        /// kernels, picked by <see cref="Q80PairKernelFor"/>. Each output sums every block's exact int32 dot, scaled
+        /// kernels, the fastest measured on this GPU for the shape and row count (<see cref="TuneQ80Pair"/>; the
+        /// heuristic <see cref="Q80PairKernelFor"/> for a shape not timed). Each output sums every block's exact int32 dot, scaled
         /// by fma in block order into eight interleaved partials per K slice, then fixed pairwise trees over the
         /// partials and the slices, so a row's result does not depend on the row count or the kernel that ran it.
         /// It is not the arithmetic of <see cref="LaunchQuantMatmulQ80VecRows"/>: a model switching to it decodes
@@ -3315,7 +3318,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public void LaunchQuantMatmulQ80Pair(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim,
             int rows, IntPtr stream)
-            => LaunchQuantMatmulQ80PairKernel(Q80PairKernelFor(inDim, outDim, rows), weights, xqScratch, output, inDim,
+            => LaunchQuantMatmulQ80PairKernel(Q80PairKernelOnDevice(inDim, outDim, rows), weights, xqScratch, output, inDim,
                 outDim, rows, stream);
 
         /// <summary><see cref="LaunchQuantMatmulQ80Pair"/> on a given kernel (tests: each must give the others' bits).</summary>
@@ -3324,7 +3327,7 @@ namespace TensorSharp.Cuda
         {
             if (!HasQ80Pair)
                 throw new InvalidOperationException("Q8_0 pair matvec: the loaded module has no pair for this GPU (needs sm_80+ code)");
-            int maxRows = kernel == Q80PairKernel.Twin ? 4 : kernel == Q80PairKernel.Lane ? 8 : Q80PairMaxRows;
+            int maxRows = Q80PairKernelMaxRows(kernel);
             if (rows < 1 || rows > maxRows || (inDim & 31) != 0)
                 throw new ArgumentOutOfRangeException(nameof(rows), $"Q8_0 pair matvec ({kernel}): {rows} rows of width {inDim}");
             IntPtr weightsArg = weights;

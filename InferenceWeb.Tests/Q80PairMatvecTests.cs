@@ -192,6 +192,102 @@ public sealed class Q80PairMatvecTests
     public void ThePairsKernel_FollowsShapeAndRows(int inDim, int outDim, int rows, string kernel)
         => Assert.Equal(kernel, CudaKernels.Q80PairKernelFor(inDim, outDim, rows).ToString());
 
+    /// <summary>A launch takes the kernel timed for its shape and rows; a shape that was never timed takes the
+    /// heuristic and is named once, not silently.</summary>
+    [Fact]
+    public void ALaunch_TakesTheTimedKernel_AndAnUntimedShapeIsNamedOnce()
+    {
+        var timed = Enumerable.Repeat(CudaKernels.Q80PairKernel.Mma, MaxRows).ToArray();
+        timed[0] = CudaKernels.Q80PairKernel.Lane;
+        var table = new Dictionary<(int InDim, int OutDim), CudaKernels.Q80PairKernel[]> { [(320, 10240)] = timed };
+        var warned = new System.Collections.Concurrent.ConcurrentDictionary<(int InDim, int OutDim), bool>();
+        var log = new System.IO.StringWriter();
+
+        for (int rows = 1; rows <= MaxRows; rows++)
+            Assert.Equal(timed[rows - 1], CudaKernels.PickQ80PairKernel(table, 320, 10240, rows, warned, log));
+        Assert.Equal("", log.ToString());
+
+        for (int rows = 1; rows <= MaxRows; rows++)
+            Assert.Equal(CudaKernels.Q80PairKernelFor(640, 2560, rows),
+                CudaKernels.PickQ80PairKernel(table, 640, 2560, rows, warned, log));
+        string said = log.ToString();
+        Assert.Contains("640 -> 2560", said);
+        Assert.Single(said.Split('\n', StringSplitOptions.RemoveEmptyEntries));
+        Assert.Equal("lane 1, mma 2-16", CudaKernels.DescribeQ80PairPicks(timed));
+    }
+
+    /// <summary>A timed kernel replaces the heuristic's pick only when it is faster by more than the noise margin
+    /// (3% of the pick's time or 0.10 us, whichever is larger): near-ties keep the heuristic's pick, so two runs that
+    /// time the same kernels a hair apart still choose alike; a clear winner wins.</summary>
+    [Theory]
+    [InlineData(3.67, 3.64, 9.0, "Twin")]    // 640 -> 2560 at 4 rows on the RTX 5090: twin 3.67, lane 3.64 (a tie)
+    [InlineData(4.47, 4.09, 4.76, "Lane")]   // 320 -> 10240 at 2 rows: the lane kernel by 0.38 us (8.5%)
+    [InlineData(2.40, 2.33, 4.00, "Twin")]   // 0.07 us is under the 0.10 us floor though it is 2.9%
+    [InlineData(20.0, 19.5, 30.0, "Twin")]   // 0.5 us is under 3% of 20 us
+    [InlineData(20.0, 19.3, 30.0, "Lane")]   // 0.7 us is over both
+    public void ANearTie_KeepsTheHeuristicsPick(double twinUs, double laneUs, double mmaUs, string want)
+    {
+        var micros = new Dictionary<CudaKernels.Q80PairKernel, double>
+        {
+            [CudaKernels.Q80PairKernel.Twin] = twinUs,
+            [CudaKernels.Q80PairKernel.Lane] = laneUs,
+            [CudaKernels.Q80PairKernel.Mma] = mmaUs,
+        };
+        Assert.Equal(want, CudaKernels.ChooseQ80PairKernel(CudaKernels.Q80PairKernel.Twin, micros).ToString());
+        // A heuristic pick that is the fastest stays whatever the margin.
+        Assert.Equal("Mma", CudaKernels.ChooseQ80PairKernel(CudaKernels.Q80PairKernel.Mma,
+            new Dictionary<CudaKernels.Q80PairKernel, double> { [CudaKernels.Q80PairKernel.Mma] = 1.0, [CudaKernels.Q80PairKernel.Lane] = 1.5 }).ToString());
+    }
+
+    /// <summary>
+    /// The kernels a tuning run picks, at Flash Next's pair shapes (the TS_Q4E_HC_Q8 up mixer, the ISTA checkpoint's
+    /// Q8_0 shared-expert down) and the down mixer's: each row count's pick takes that many rows, and a launch through
+    /// the timed table gives the tensor cores' bits, so a timing-based choice can never change an output.
+    /// </summary>
+    [CudaTheory(TensorCoreModule = "tensorsharp_kernels")]
+    [InlineData(320, 10240)]
+    [InlineData(640, 2560)]
+    [InlineData(10240, 320)]
+    public void TheTimedKernels_GiveTheTensorCoresBits(int inDim, int outDim)
+    {
+        long rowBytes = inDim / 32 * 34;
+        var act = new float[MaxRows, inDim];
+        for (int t = 0; t < MaxRows; t++)
+            for (int k = 0; k < inDim; k++)
+                act[t, k] = MathF.Sin(0.0211f * (k + 5) * (t + 1)) + 0.2f * MathF.Cos(0.033f * k + 7 * t);
+
+        using var allocator = new CudaAllocator(0);
+        allocator.Context.MakeCurrent();
+        IntPtr stream = allocator.Stream.Handle;
+        using var w = Up(allocator, QuantRows(Q8_0, outDim, rowBytes, seed: 31));
+        using var input = Up(allocator, act);
+        long q81Row = (long)(inDim / 32) * CudaKernels.Q81BlockBytes;
+        using var xq = new Tensor(allocator, DType.UInt8, MaxRows * q81Row);
+        CudaQuantizedOps.QuantizeRowsQ81(allocator, Dsv4CudaEngine.Ptr(input), Dsv4CudaEngine.Ptr(xq), inDim, MaxRows);
+        using var want = new Tensor(allocator, DType.Float32, MaxRows, outDim);
+        using var got = new Tensor(allocator, DType.Float32, MaxRows, outDim);
+
+        string summary = allocator.Kernels.TuneQ80Pair(new[] { (Dsv4CudaEngine.Ptr(w), inDim, outDim) }, stream);
+        _output.WriteLine(summary);
+        Assert.Contains($"{inDim}x{outDim}", summary);
+        for (int rows = 1; rows <= MaxRows; rows++)
+        {
+            var kernel = allocator.Kernels.Q80PairKernelOnDevice(inDim, outDim, rows);
+            Assert.True(rows <= CudaKernels.Q80PairKernelMaxRows(kernel), $"{rows} rows timed onto the {kernel} kernel");
+            allocator.Kernels.LaunchQuantMatmulQ80PairKernel(CudaKernels.Q80PairKernel.Mma, Dsv4CudaEngine.Ptr(w),
+                Dsv4CudaEngine.Ptr(xq), Dsv4CudaEngine.Ptr(want), inDim, outDim, rows, stream);
+            allocator.Kernels.LaunchFillF32(Dsv4CudaEngine.Ptr(got), MaxRows * outDim, float.NaN, stream);
+            allocator.Kernels.LaunchQuantMatmulQ80Pair(Dsv4CudaEngine.Ptr(w), Dsv4CudaEngine.Ptr(xq), Dsv4CudaEngine.Ptr(got),
+                inDim, outDim, rows, stream);
+            allocator.Stream.Synchronize();
+            float[] mma = Down(want, rows * outDim), timedOut = Down(got, rows * outDim);
+            for (int i = 0; i < rows * outDim; i++)
+                if (BitConverter.SingleToInt32Bits(timedOut[i]) != BitConverter.SingleToInt32Bits(mma[i]))
+                    Assert.Fail($"{inDim} -> {outDim}, {rows} rows on the timed {kernel} kernel: {timedOut[i]:R} at row " +
+                        $"{i / outDim}, column {i % outDim}; the tensor cores {mma[i]:R}");
+        }
+    }
+
     /// <summary>The K slices fix the arithmetic, so they depend on the weight's shape alone: never on the rows.</summary>
     [Theory]
     [InlineData(2560, 10240, 1)]

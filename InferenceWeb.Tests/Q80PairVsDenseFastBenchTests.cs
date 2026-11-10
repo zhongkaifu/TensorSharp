@@ -149,4 +149,98 @@ public sealed class Q80PairVsDenseFastBenchTests
             }
         }
     }
+
+    /// <summary>
+    /// Timing only: each of the pair's kernels (the dp4a twin at 1-4 rows, the dp4a lane kernel at 1-8, the tensor
+    /// cores at 1-16; all give the same bits) at Flash Next's Q8_0 decode shapes, graph-captured with cold weights,
+    /// beside the decode-once dense kernels (other arithmetic) where they read the shape, and the kernel
+    /// <see cref="CudaKernels.Q80PairKernelFor"/>'s heuristic names. The ISTA checkpoint's TS_Q4E_HC_Q8 up mixers and
+    /// its two Q8_0 shared-expert downs take the pair; its down mixers and the MTP block's weights keep the dense kernels.
+    /// </summary>
+    [CudaFact(TensorCoreModule = "tensorsharp_kernels")]
+    [Trait("Category", "Bench")]
+    public void FlashNextQ8_0Shapes_EachPairKernel()
+    {
+        var shapes = new (string Name, int In, int Out)[]
+        {
+            ("hc up", 320, 10240),
+            ("shexp down", 640, 2560),
+            ("hc down", 10240, 320),
+            ("q / qkv", 2560, 10240),
+            ("gdn gate", 2560, 6144),
+            ("attn q", 2560, 12288),
+            ("ssm_out / attn o", 6144, 2560),
+            ("attn k / v", 2560, 512),
+            ("shexp gate / up", 2560, 640),
+            ("lm_head", 2560, 248320),
+        };
+        using var allocator = new CudaAllocator(0);
+        allocator.Context.MakeCurrent();
+        using var dk = Dsv4Kernels.Create();
+        Assert.True(allocator.Kernels.HasQ80Pair, "no pair matvec in the loaded module");
+        IntPtr stream = allocator.Stream.Handle;
+        var rnd = new Random(7);
+        var device = CudaDevice.GetDevice(allocator.DeviceId);
+        _output.WriteLine($"{device.Name}, sm_{device.ComputeCapabilityMajor}{device.ComputeCapabilityMinor}");
+        foreach (var (name, inDim, outDim) in shapes)
+        {
+            long rowBytes = inDim / 32 * 34L, matBytes = rowBytes * outDim;
+            int copies = (int)Math.Max(2, Math.Min(64, (768L << 20) / matBytes));
+            byte[] w = QuantRows(Q8_0, outDim, rowBytes, seed: inDim + outDim);
+            var mats = new List<Tensor>();
+            try
+            {
+                for (int c = 0; c < copies; c++)
+                    mats.Add(Up(allocator, w));
+                var x = new float[16 * inDim];
+                for (int i = 0; i < x.Length; i++)
+                    x[i] = (float)(rnd.NextDouble() * 2 - 1);
+                using Tensor xT = Up(allocator, x);
+                using Tensor xq = new Tensor(allocator, DType.UInt8, 16L * (inDim / 32) * CudaKernels.Q81BlockBytes);
+                using Tensor y = new Tensor(allocator, DType.Float32, 16, outDim);
+                allocator.Kernels.LaunchQuantizeQ81Rows(Ptr(xT), Ptr(xq), inDim, 16, stream, warpCooperative: true);
+                _output.WriteLine($"{name} {inDim} -> {outDim} ({matBytes / 1048576.0:F2} MiB, " +
+                    $"{CudaKernels.Q80PairSlices(inDim, outDim)} K slices), us per call:");
+                for (int rows = 1; rows <= 16; rows++)
+                {
+                    int n = Math.Max(copies, 64);
+                    string line = $"  {rows,2}r";
+                    double best = double.MaxValue;
+                    CudaKernels.Q80PairKernel bestKernel = CudaKernels.Q80PairKernel.Mma;
+                    foreach (var kernel in new[] { CudaKernels.Q80PairKernel.Twin, CudaKernels.Q80PairKernel.Lane, CudaKernels.Q80PairKernel.Mma })
+                    {
+                        int maxRows = kernel == CudaKernels.Q80PairKernel.Twin ? 4 : kernel == CudaKernels.Q80PairKernel.Lane ? 8 : 16;
+                        if (rows > maxRows)
+                        {
+                            line += $" {kernel.ToString().ToLowerInvariant()}     -  ";
+                            continue;
+                        }
+                        double us = GraphMicros(stream, i => allocator.Kernels.LaunchQuantMatmulQ80PairKernel(kernel,
+                            Ptr(mats[i % copies]), Ptr(xq), Ptr(y), inDim, outDim, rows, stream), n, 10);
+                        line += $" {kernel.ToString().ToLowerInvariant()} {us,7:F2}";
+                        if (us < best)
+                        {
+                            best = us;
+                            bestKernel = kernel;
+                        }
+                    }
+                    var picked = CudaKernels.Q80PairKernelFor(inDim, outDim, rows);
+                    line += $" | best {bestKernel.ToString().ToLowerInvariant()}, heuristic {picked.ToString().ToLowerInvariant()}";
+                    if (dk.DenseFastReads(Q8_0, inDim))
+                    {
+                        double dense = GraphMicros(stream, i => dk.DenseQ81Rows(Ptr(mats[i % copies]), Ptr(xq), Ptr(y), Q8_0,
+                            outDim, inDim, rowBytes, rows, stream), n, 10);
+                        line += $" | dense {dense,7:F2}";
+                    }
+                    _output.WriteLine(line);
+                }
+            }
+            finally
+            {
+                allocator.Synchronize();
+                foreach (Tensor t in mats)
+                    t.Dispose();
+            }
+        }
+    }
 }
