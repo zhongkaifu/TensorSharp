@@ -200,6 +200,40 @@ public sealed class Qwen35RuntimeTests : IDisposable
         Assert.Equal(first, again);
     }
 
+    /// <summary>Slots carry the Gated DeltaNet state with the attention rows: batched steps over
+    /// several requests reproduce each request alone, in every placement and on the device backends
+    /// (device recurrence on GGML).</summary>
+    [Theory]
+    [InlineData("dense", 1, 1)]
+    [InlineData("moe", 1, 1)]
+    [InlineData("dense", 2, 1)]
+    [InlineData("dense", 1, 2)]
+    [InlineData("moe", 1, 2)]
+    [InlineData("dense", 2, 2)]
+    public void SlotBatchesMatchEachSequenceAlone(string variant, int tp, int stages)
+        => CompareSlotBatches(variant, tp, stages, BackendType.Cpu);
+
+    [Theory]
+    [InlineData("dense")]
+    [InlineData("moe")]
+    public void SlotBatchesMatchEachSequenceAloneOnThePinnedGgmlBackend(string variant)
+        => CompareSlotBatches(variant, 1, 1, TestGates.PinnedGgmlBackend);
+
+    [MlxTheory]
+    [InlineData("dense")]
+    [InlineData("moe")]
+    public void SlotBatchesMatchEachSequenceAloneOnMlx(string variant)
+        => CompareSlotBatches(variant, 1, 1, BackendType.Mlx);
+
+    private void CompareSlotBatches(string variant, int tp, int stages, BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(variant);
+        double tolerance = backend == BackendType.Cpu ? 1e-6 : backend == BackendType.GgmlCpu ? 2.5e-2 : 5e-3;
+        SlotParity.AssertBatchedSlotsMatchAlone(() => Create(path, tp, stages, backend), tolerance,
+            $"qwen35 {variant} tp={tp} stages={stages} {backend}");
+    }
+
     public static TheoryData<int, int> BatchedPlacements() => new() { { 1, 1 }, { 2, 1 }, { 1, 2 }, { 2, 2 } };
 
     [Theory]
@@ -236,7 +270,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
 
         using var model = Create(path, tp, stages);
-        Assert.True(((IBatchedPagedModel)model).BatchedForwardAvailable);
+        Assert.True(((IBatchedPagedModel)model).SupportsPerSequenceFusedForward);
         var cfg = new SchedulerConfig
         {
             MaxNumBatchedTokens = 256,
@@ -259,7 +293,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
             return tokens.ToArray();
         })).WaitAsync(TimeSpan.FromMinutes(3));
 
-        Assert.True(model.BatchedForwardCount > 0, "the engine must use the paged batched forward");
+        Assert.True(model.BatchedForwardCount > 0, "the engine must serve these requests in batched steps over their slots");
         for (int i = 0; i < prompts.Count; i++)
         {
             int n = Math.Min(outputs[i].Length, expected[i].Length);

@@ -117,6 +117,40 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         }
     }
 
+    /// <summary>Three requests' slots in batched steps (prefill chunks of different lengths, then
+    /// decode, with a lone step on one slot in between) reproduce each request run alone on the
+    /// primary cache: the slot path changes which rows share a forward, not what any row computes.</summary>
+    [Theory]
+    [MemberData(nameof(Placements))]
+    public void SlotBatchesMatchEachSequenceAlone(string family, int tp, int stages)
+        => CompareSlotBatches(family, tp, stages, BackendType.Cpu);
+
+    [Theory]
+    [MemberData(nameof(Families))]
+    public void SlotBatchesMatchEachSequenceAloneOnTheManagedBackend(string family)
+        => CompareSlotBatches(family, 1, 1, BackendType.Cpu);
+
+    [Theory]
+    [MemberData(nameof(Families))]
+    public void SlotBatchesMatchEachSequenceAloneOnThePinnedGgmlBackend(string family)
+        => CompareSlotBatches(family, 1, 1, TestGates.PinnedGgmlBackend);
+
+    [MlxTheory]
+    [MemberData(nameof(Families))]
+    public void SlotBatchesMatchEachSequenceAloneOnMlx(string family)
+        => CompareSlotBatches(family, 1, 1, BackendType.Mlx);
+
+    private void CompareSlotBatches(string family, int tp, int stages, BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family);
+        // Managed rows are computed row by row: batching must not change them at all. Device
+        // kernels may pick a different matmul for one row than for several.
+        double tolerance = backend == BackendType.Cpu ? 1e-6 : backend == BackendType.Mlx ? 5e-3 : 1e-3;
+        SlotParity.AssertBatchedSlotsMatchAlone(() => Create(family, path, tp, stages, backend), tolerance,
+            $"{family} tp={tp} stages={stages} {backend}");
+    }
+
     /// <summary>A fixed script over one cache: prefill, decode, truncate + refill, reset, prefill.</summary>
     private static List<float[]> Script(ModelBase model)
     {
@@ -240,9 +274,9 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
 
         using var model = Create(family, path, tp, stages);
         var batched = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
-        Assert.True(batched.BatchedForwardAvailable, "continuous batching must survive every local placement");
+        Assert.True(batched.SupportsPerSequenceFusedForward, "continuous batching must survive every local placement");
         var caps = ExecutionCapabilities.FromModel(model);
-        Assert.True(caps.BatchedForwardAvailable);
+        Assert.True(caps.SupportsPerSequenceFusedForward);
 
         var cfg = new SchedulerConfig
         {
@@ -267,7 +301,7 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         })).WaitAsync(TimeSpan.FromMinutes(2));
 
         Assert.True(((StandardDecoderModel)model).BatchedForwardCount > 0,
-            "the engine must serve these requests through the paged batched forward, not the per-sequence swap");
+            "the engine must serve these requests in batched steps over their slots, not one at a time");
         for (int i = 0; i < prompts.Count; i++)
         {
             int n = Math.Min(outputs[i].Length, expected[i].Length);

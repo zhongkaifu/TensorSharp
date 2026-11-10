@@ -448,7 +448,7 @@ silently unreduced output.
 
 | Mechanism | How the runtime provides it |
 |---|---|
-| Continuous batching | One forward over a ragged batch (`BatchedForwardContext`: positions, query starts, slot mapping, block tables). `Forward(tokens)` is the same code with one sequence. KV lives in paged blocks per (layer, rank); `TryExtractKVBlock`/`TryInjectKVBlock` and linear→paged migration are implemented once. |
+| Continuous batching | Every request owns a **slot**: its attention cache rows on each (layer, rank) device, in the configured KV dtype, plus its recurrent states (6.5). The bound slot is the model's active cache, so a lone request runs the single-sequence kernels; binding another request swaps references. A batched step packs every scheduled row of every slot into one activation; only attention (and a recurrent mixer) runs per sequence, on that sequence's slot. `TryExtractKVBlock`/`TryInjectKVBlock`, retention and donation to the prefix cache are implemented once. |
 | Tensor parallelism | Weights are sharded by role at load (column: output rows; row: input blocks; KV-group aware; fused QKV/gate-up sharded per segment, then fused per rank). Each branch body runs once per rank (`RunPerRank`, concurrent on GGML); the runtime all-reduces the partials. |
 | Layer split | The runtime assigns layers to stages, loads only owned weights on each stage's devices, allocates that layer's KV there, and copies the activation at stage boundaries. |
 | Hybrid TP × PP | Stage `s` runs its layers with the TP sub-group of its devices; boundaries move the replicated activation from one sub-group to the next. |
@@ -476,6 +476,53 @@ executed by a TensorSharp-owned scheduler with one ggml meta backend per stage (
 device range (PP) and CPU buffers for host experts. Upstream ggml is used unchanged, as AGENTS.md
 requires.
 
+### 6.4 Hybrid stacks: recurrent mixers
+
+A layer's token mixer may be a recurrent block (linear attention, an SSM) instead of
+attention. The family declares which layers (`IsRecurrentLayer`), the shape of one rank's
+state (`CreateRecurrentState`, an opaque `RecurrentState`), the block itself
+(`RecurrentMixer`: normalized input in, the rank's partial output out, state advanced) and how
+its weights shard (`ShardRecurrentLayer`, with `ShardOutputRows` / `ShardInputColumnGroups`
+for any head layout). The runtime owns where state lives: one per (layer, rank) for
+the primary cache and one per (slot, layer, rank) for each request, carried with the slot's
+attention rows, fresh for a new request and recycled on `OnSequenceReleased`. So TP, layer split, hybrid and batching need nothing family-specific.
+A fused native block may take the raw residual and apply the input norm itself
+(`RecurrentMixerTakesRawInput`).
+
+A recurrent state summarizes every token so far, so such a stack truncates only to its length
+or to zero, has no K/V snapshots, and declares itself class R to the prefix cache (no
+resumable pages): a shared prefix is re-prefilled, never restored wrong.
+
+Qwen 3.5 / 3.6 is the first user (`Qwen35RuntimeModel`): gated attention
+(`GatedAttentionOutput`: `attn_q` emits `[q_h | gate_h]`), QK-norm before a partial NeoX
+rotary, Gated DeltaNet as the recurrent mixer, and MoE with a sigmoid-gated shared expert.
+Under TP a rank owns a contiguous block of key heads and the value heads that read them
+(block-cyclic), so the recurrence is rank-local and only `ssm_out` is reduced. On the GGML
+backends each rank's block is one native graph with the state on the device; elsewhere it is
+a managed loop.
+
+### 6.5 Slots: device-resident continuous batching
+
+The first runtime kept a batched step's K/V in host F32 arrays (paged blocks) and ran attention
+on the host; every bespoke family's paged path does the same. On a lone request that path is
+slower than the device cache it replaced. Measured through the server on an M5 Pro (4 distinct
+greedy chats, 64 tokens each; main vs slots):
+
+| Model | Backend | Lone request, tok/s | 4 concurrent, tok/s | Identical text |
+|---|---|---|---|---|
+| Hy-MT2-1.8B Q4_K_M | `ggml_metal` | 14.0 → 28.1 | 29.3 → 44.4 | 4/4 |
+| Ministral-3-3B Q4_K_M | `ggml_metal` | 17.4 → 27.3 | 35.2 → 45.4 | 4/4 (main 3/4) |
+| Hy-MT2-1.8B Q4_K_M | `mlx` | 33.1 → 84.6 | 76.3 → 190.5 | 4/4 |
+| Ministral-3-3B Q4_K_M | `mlx` | 31.3 → 62.9 | 69.8 → 132.7 | 4/4 |
+
+Slots use the per-request holder contract the engine already batches (`BindSequenceCache`,
+`TryForwardBatchedFusedDecode` / `TryForwardBatchedFusedPrefill`, retention, and
+`IHolderPrefixCacheModel` donation), so the engine serves the runtime exactly as it serves the
+holder families. `SlotParity` checks the contract: three requests in batched steps (prefill
+chunks of different lengths, decode, a lone step on one slot in between) reproduce each request
+alone in every placement, bit-identical on the managed backend and within backend rounding on
+GGML and MLX. A multi-node pipeline (the serialized stage protocol) has no slots yet.
+
 ---
 
 ## 7. Migration plan
@@ -484,7 +531,7 @@ requires.
 |---|---|---|
 | 1 (this change) | Topology, backend providers, contract + enforcement, managed shared runtime, legacy option clean-up | Hunyuan Dense and Mistral 3 text tower move to the shared runtime; all other families declare their real support and gaps |
 | 2 | Native lowering of recipes to one ggml graph per micro-batch; device-resident paged KV; graph reuse | perf parity gate per family before switching |
-| 3 | Port per-op families: Muse-Glimmer, GPT-OSS, Nemotron-H, Gemma 4, Qwen 3.5 (recurrent state as a runtime-owned slot pool) | delete each family's `*TensorParallel*`, `*BatchedForward*`, `*PerSeqCache*` once its recipe passes parity and perf gates |
+| 3 | Port per-op families: Muse-Glimmer, GPT-OSS, Nemotron-H, Gemma 4, Qwen 3.5 (recurrent state as a runtime-owned slot pool) | delete each family's `*TensorParallel*`, `*BatchedForward*`, `*PerSeqCache*` once its recipe passes parity and perf gates. **Status:** Qwen 3.5's recipe is on the runtime (6.4) and serves layer split, hybrid and host experts on cuda / mlx; one device and `--tp` stay on `Qwen35Model` until the runtime matches its fused graphs (Phase 2), so none of its files is deleted yet |
 | 4 | Native executors (Muse Spark, MiniMax-M3, DeepSeek V4/V4.1, GLM, Qwen 3.8 Flash Next) share one scheduler/placement/slot core extracted from them | per-family split plans become role maps |
 
 A family moves only when its recipe matches the old path's logits on fixtures and real
@@ -558,11 +605,37 @@ to the host every token. Disabling Metal lazy-sync did not cost these per-op pat
 These are single-device numbers; the per-op `ggml_metal` path remains slow for its size, which is
 what Phase 2's native lowering addresses.
 
-### 9.3 Not validated
+### 9.3 Real GPUs (2026-11-10)
 
-* No GPU multi-device run: the RTX 5090 VM was unreachable and no multi-GPU machine was
-  available. TP, layer split and hybrid on `cuda`, `ggml_cuda` and `ggml_vulkan` are proven only
-  on simulated devices, which exercise the runtime's placement, sharding, per-rank execution,
-  reduction and stage transfers but not GPU kernels, peer copies or collectives. Hybrid on
-  GPUs also reduces each stage through the host (no native sub-group collective yet).
-* No performance claim for multi-device placements.
+2x RTX PRO 6000 Blackwell Server Edition, each exposed as one MIG 1g.24gb slice (two 24 GB
+devices, no peer access), CUDA 13.2, ggml `cd6d2b75`, native library built for sm_120.
+
+* **CUDA test lane** (`TS_TEST_GGML_BACKEND=cuda`): this branch 13,891 passed / 4 failed,
+  baseline 13,845 / 1. The shared failure (`DirectCudaPrefillModelTests` gemma4moe_global) is
+  pre-existing; the other three were test plumbing (a registry scan that saw another test's
+  throwaway architecture, a reflection helper that did not know the runtime's cache layout),
+  fixed since.
+* **Real checkpoints** (Hy-MT2-1.8B, Ministral-3-3B, Mistral-Small-3.1-24B, Q4_K_M) through the
+  CLI on `ggml_cuda` and `cuda`, one GPU, `--tp 2` and `--layer-split 2`: every placement loads
+  and generates; one GPU and layer split produce byte-identical greedy text per backend; tensor
+  parallelism diverges after about ten tokens (summation order). The baseline refuses Hunyuan
+  Dense on both multi-GPU placements and Mistral 3 layer split on `cuda`.
+
+| Model | Backend | 1 GPU | `--tp 2` | `--layer-split 2` |
+|---|---|---|---|---|
+| Hy-MT2-1.8B | `ggml_cuda` | 876 / 64.5 (old 529 / 58.0) | 653 / 41.1 (old: refused) | 623 / 65.2 (old: refused) |
+| Hy-MT2-1.8B | `cuda` | 5,061 / 60.5 (old 4,744 / 53.1) | 1,416 / 36.1 (old: refused) | 4,572 / 61.4 (old: refused) |
+| Ministral-3-3B | `ggml_cuda` | 584 / 61.1 (old 604 / 65.1) | 515 / 37.8 (old 282 / 42.2) | 592 / 64.0 (old 594 / 62.4) |
+| Ministral-3-3B | `cuda` | 2,656 / 43.6 (old 2,637 / 44.5) | 1,090 / 28.2 (old 193 / 24.9) | 2,391 / 29.7 (old: refused) |
+| Mistral-Small-3.1-24B | `ggml_cuda` | 275 / 18.4 (old 271 / 18.6) | 184 / 16.5 (old 122 / 17.5) | 266 / 18.7 (old: failed) |
+
+(prefill / decode tok/s, 512 / 128 tokens, medians.) Two slices with no peer access make tensor
+parallelism a capacity feature here, not a speed one.
+
+### 9.4 Not validated
+
+* Hybrid placement on GPUs (it needs four devices) and anything on `ggml_vulkan`: proven only on
+  simulated devices. Hybrid stages reduce through the host (no native sub-group collective yet).
+* Tensor-parallel decode on `ggml_cuda` is 6-10% below the old Mistral 3 TP path, and Ministral
+  on `cuda --layer-split 2` decodes 32% below one GPU while Hunyuan Dense does not; both are
+  open.

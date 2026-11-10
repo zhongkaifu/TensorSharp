@@ -194,7 +194,8 @@ public sealed class TextLoraModelParityTests : IDisposable
         int[][] outputs;
         using (var model = ModelBase.Create(basePath, backend))
         {
-            Assert.True(((IBatchedPagedModel)model).BatchedForwardAvailable);
+            var batchedModel = (IBatchedPagedModel)model;
+            Assert.True(batchedModel.BatchedForwardAvailable || batchedModel.SupportsPerSequenceFusedForward);
             var cfg = new SchedulerConfig
             {
                 MaxNumBatchedTokens = 256, MaxNumRunningSequences = 4, MaxPrefillChunkSize = 8,

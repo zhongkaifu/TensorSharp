@@ -35,8 +35,6 @@ namespace TensorSharp.Models
         private bool[] _recurrentLayer;
         private bool _anyRecurrent;
         private RecurrentState[][] _recurrentPrimary;   // [layer][rank]
-        private readonly Dictionary<string, RecurrentState[][]> _recurrentBySequence = new(StringComparer.Ordinal);
-        private readonly object _recurrentLock = new();
 
         // ---------------------------------------------------------------- family hooks
 
@@ -119,43 +117,12 @@ namespace TensorSharp.Models
         /// <summary>A batched sequence's states, created reset on first sight and reset again
         /// when the engine (re)starts it from token zero. Resolved once per batch, before any
         /// layer runs.</summary>
-        private RecurrentState[][] SequenceStates(string sequenceId, bool fresh)
-        {
-            lock (_recurrentLock)
-            {
-                if (!_recurrentBySequence.TryGetValue(sequenceId, out var states))
-                {
-                    states = NewRecurrentStates();
-                    _recurrentBySequence[sequenceId] = states;
-                    return states;
-                }
-                if (fresh) ResetStates(states);
-                return states;
-            }
-        }
-
-        /// <summary>The engine finished with a sequence: its recurrent states go.</summary>
-        public void OnSequenceReleased(string requestId)
-        {
-            if (requestId == null) return;
-            lock (_recurrentLock)
-            {
-                if (_recurrentBySequence.Remove(requestId, out var states))
-                    DisposeStates(states);
-            }
-        }
-
         private void ResetRecurrentPrimary() => ResetStates(_recurrentPrimary);
 
         private void DisposeRecurrentStates()
         {
             DisposeStates(_recurrentPrimary);
             _recurrentPrimary = null;
-            lock (_recurrentLock)
-            {
-                foreach (var states in _recurrentBySequence.Values) DisposeStates(states);
-                _recurrentBySequence.Clear();
-            }
         }
 
         // ---------------------------------------------------------------- the mixer branch
@@ -164,7 +131,7 @@ namespace TensorSharp.Models
         /// The token mixer of one layer on one rank: attention, or the family's recurrent block
         /// - run once per sequence of a paged batch, each with its own state.
         /// </summary>
-        private Tensor Mixer(RankScope scope, Tensor normed, int layer, TokenPositions positions, PagedBatch batch)
+        private Tensor Mixer(RankScope scope, Tensor normed, int layer, TokenPositions positions, SlotBatch batch)
         {
             if (!_recurrentLayer[layer])
                 return Attention(scope, normed, layer, positions, batch);
@@ -176,9 +143,8 @@ namespace TensorSharp.Models
             for (int s = 0; s < batch.NumSequences; s++)
             {
                 int start = batch.QueryStart[s];
-                int count = (s + 1 < batch.NumSequences ? batch.QueryStart[s + 1] : tokens) - start;
-                if (count <= 0) continue;
-                RecurrentState state = batch.RecurrentStates[s][layer][scope.Rank];
+                int count = batch.Counts[s];
+                RecurrentState state = batch.Slots[s].Recurrent[layer][scope.Rank];
                 using Tensor rowsView = normed.Narrow(0, start, count);
                 using Tensor rows = Ops.NewContiguous(rowsView);
                 using Tensor part = RecurrentMixer(scope, rows, layer, state);

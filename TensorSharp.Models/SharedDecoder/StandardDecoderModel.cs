@@ -545,7 +545,7 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Run every local layer, moving the activation between stages.</summary>
-        private Tensor RunLayers(Tensor hidden, TokenPositions positions, PagedBatch batch)
+        private Tensor RunLayers(Tensor hidden, TokenPositions positions, SlotBatch batch)
         {
             int stage = 0;
             Tensor[] ranks = null;
@@ -634,7 +634,7 @@ namespace TensorSharp.Models
         // ---------------------------------------------------------------- one layer
 
         /// <summary>A layer whose stage is a single device: the backend fast paths apply.</summary>
-        private Tensor LayerOnOneDevice(Tensor hidden, int layer, TokenPositions positions, PagedBatch batch)
+        private Tensor LayerOnOneDevice(Tensor hidden, int layer, TokenPositions positions, SlotBatch batch)
         {
             string p = $"blk.{layer}.";
             RankScope scope = Scope(_mesh.StageOf(layer), 0);
@@ -682,7 +682,7 @@ namespace TensorSharp.Models
         /// <summary>A layer whose stage is a tensor-parallel group: each branch body runs once per
         /// rank on that rank's shards and replicated activation, and the partial outputs are
         /// summed before the residual add.</summary>
-        private void LayerAcrossRanks(Tensor[] hidden, int layer, int stage, TokenPositions positions, PagedBatch batch)
+        private void LayerAcrossRanks(Tensor[] hidden, int layer, int stage, TokenPositions positions, SlotBatch batch)
         {
             string p = $"blk.{layer}.";
             int degree = _mesh.TensorParallel;
@@ -748,7 +748,7 @@ namespace TensorSharp.Models
         /// cache write and attention over the rank's heads, and the output projection. Under
         /// tensor parallelism the result is that rank's partial sum (a row-parallel projection).
         /// </summary>
-        private Tensor Attention(RankScope scope, Tensor input, int layer, TokenPositions positions, PagedBatch batch)
+        private Tensor Attention(RankScope scope, Tensor input, int layer, TokenPositions positions, SlotBatch batch)
         {
             string p = $"blk.{layer}.";
             int heads = scope.LocalHeads, kvHeads = scope.LocalKvHeads;
@@ -787,10 +787,10 @@ namespace TensorSharp.Models
 
             long t0 = Stopwatch.GetTimestamp();
             Tensor attn = batch != null
-                ? PagedAttention(scope, layer, q, k, v, batch)
+                ? SlotAttention(scope, layer, q, k, v, batch)
                 : decode
-                    ? DecodeAttention(scope, layer, q, k, v, positions.Start)
-                    : PrefillAttention(scope, layer, q, k, v, positions.Start, tokens);
+                    ? DecodeAttention(scope, _cacheK[layer][scope.Rank], _cacheV[layer][scope.Rank], _cacheCapacity, q, k, v, positions.Start)
+                    : PrefillAttention(scope, _cacheK[layer][scope.Rank], _cacheV[layer][scope.Rank], q, k, v, positions.Start, tokens);
             _attnTicks += Stopwatch.GetTimestamp() - t0;
             if (gate != null)
             {
@@ -820,9 +820,8 @@ namespace TensorSharp.Models
             return flatGate;
         }
 
-        private Tensor DecodeAttention(RankScope scope, int layer, Tensor q, Tensor k, Tensor v, int start)
+        private Tensor DecodeAttention(RankScope scope, Tensor cacheK, Tensor cacheV, int capacity, Tensor q, Tensor k, Tensor v, int start)
         {
-            Tensor cacheK = _cacheK[layer][scope.Rank], cacheV = _cacheV[layer][scope.Rank];
             int heads = scope.LocalHeads, kvHeads = scope.LocalKvHeads;
             float scale = 1.0f / MathF.Sqrt(_keyDim);
             CopyToCacheDecode(cacheK, k, cacheV, v, kvHeads, _keyDim, start);
@@ -833,7 +832,7 @@ namespace TensorSharp.Models
             // MLX keeps K/V on the device and runs mlx_fast_sdpa; the host path would copy
             // the whole cache back every token.
             bool done = _backend == BackendType.Mlx && scope.Degree == 1 && MlxFusedOps.TryDecodeAttention(
-                result, q, cacheK, cacheV, heads, kvHeads, _keyDim, 0, start + 1, _cacheCapacity, false, scale);
+                result, q, cacheK, cacheV, heads, kvHeads, _keyDim, 0, start + 1, capacity, false, scale);
             // Direct CUDA: GQA decode attention on the device over the head-first cache in place.
             // The host path below copies the whole cache to the host every layer.
             if (!done && _backend == BackendType.Cuda)
@@ -845,9 +844,8 @@ namespace TensorSharp.Models
             return result;
         }
 
-        private Tensor PrefillAttention(RankScope scope, int layer, Tensor q, Tensor k, Tensor v, int start, int tokens)
+        private Tensor PrefillAttention(RankScope scope, Tensor cacheK, Tensor cacheV, Tensor q, Tensor k, Tensor v, int start, int tokens)
         {
-            Tensor cacheK = _cacheK[layer][scope.Rank], cacheV = _cacheV[layer][scope.Rank];
             int heads = scope.LocalHeads, kvHeads = scope.LocalKvHeads;
             int total = start + tokens;
             float scale = 1.0f / MathF.Sqrt(_keyDim);
@@ -1078,7 +1076,7 @@ namespace TensorSharp.Models
             _cacheK = _cacheV = null;
             foreach (Tensor copy in _replicas.Values) copy.Dispose();
             _replicas.Clear();
-            DisposePagedBuffers();
+            DisposeSlots();
             DisposeRecurrentStates();
             base.Dispose();
         }

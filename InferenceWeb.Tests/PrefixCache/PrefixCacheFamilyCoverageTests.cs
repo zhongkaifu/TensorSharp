@@ -99,14 +99,14 @@ public sealed class PrefixCacheFamilyCoverageTests
     [InlineData(typeof(Qwen4ExpModel))]
     [InlineData(typeof(DeepSeek4Model))]
     [InlineData(typeof(GptOssModel))]
+    [InlineData(typeof(Mistral3Model))]
+    [InlineData(typeof(HunyuanDenseModel))]
+    [InlineData(typeof(Qwen35RuntimeModel))]
     public void HolderFamilies_UseTheHolderAdapter(Type family)
         => Assert.True(typeof(IHolderPrefixCacheModel).IsAssignableFrom(family), $"{family.Name} is not an IHolderPrefixCacheModel");
 
     [Theory]
-    [InlineData(typeof(Mistral3Model))]
-    [InlineData(typeof(HunyuanDenseModel))]
     [InlineData(typeof(MuseGlimmerModel))]
-    [InlineData(typeof(Qwen35RuntimeModel))]
     public void PageFamilies_RefuseEveryEndStateMember(Type family)
         => Assert.True(typeof(IPageOnlyPrefixCacheModel).IsAssignableFrom(family), $"{family.Name} is not an IPageOnlyPrefixCacheModel");
 
