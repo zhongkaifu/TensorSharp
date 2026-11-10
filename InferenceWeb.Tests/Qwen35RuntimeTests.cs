@@ -234,6 +234,32 @@ public sealed class Qwen35RuntimeTests : IDisposable
             $"qwen35 {variant} tp={tp} stages={stages} {backend}");
     }
 
+    /// <summary>On a GGML backend every step (attention, Gated DeltaNet with its slot state, MoE)
+    /// runs as one whole-forward graph and computes what the per-op path computes.</summary>
+    [Theory]
+    [InlineData("dense")]
+    [InlineData("moe")]
+    public void WholeForwardGraphMatchesThePerOpPath(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(variant);
+        List<float[]> perOp;
+        using (var model = Create(path, backend: TestGates.PinnedGgmlBackend))
+        {
+            model.GraphLoweringEnabled = false;
+            perOp = Script(model);
+        }
+        using var graph = Create(path, backend: TestGates.PinnedGgmlBackend);
+        List<float[]> rows = Script(graph);
+        Assert.True(graph.GraphRuns >= rows.Count, "every step must run as a whole-forward graph");
+        double tolerance = TestGates.PinnedGgmlBackend == BackendType.GgmlCpu ? 2.5e-2 : 5e-3;
+        for (int i = 0; i < perOp.Count; i++)
+        {
+            double rel = RelL2(rows[i], perOp[i]);
+            Assert.True(rel <= tolerance, $"{variant} row {i}: graph vs per-op relL2 {rel:E2}");
+        }
+    }
+
     public static TheoryData<int, int> BatchedPlacements() => new() { { 1, 1 }, { 2, 1 }, { 1, 2 }, { 2, 2 } };
 
     [Theory]

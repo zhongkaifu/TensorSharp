@@ -234,6 +234,8 @@ namespace TensorSharp.Models
                 Clear(Ssm);
             }
 
+            protected internal override IEnumerable<Tensor> HostTensors => new[] { Conv, Ssm };
+
             public IntPtr ConvPointer => _hostPointer(Conv);
             public IntPtr SsmPointer => _hostPointer(Ssm);
 

@@ -151,6 +151,31 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
             $"{family} tp={tp} stages={stages} {backend}");
     }
 
+    /// <summary>On a GGML backend every step runs as one whole-forward graph, and it computes what
+    /// the per-op path computes.</summary>
+    [Theory]
+    [MemberData(nameof(Families))]
+    public void WholeForwardGraphMatchesThePerOpPath(string family)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family);
+        List<float[]> perOp;
+        using (var model = Create(family, path, 1, 1, TestGates.PinnedGgmlBackend))
+        {
+            ((StandardDecoderModel)model).GraphLoweringEnabled = false;
+            perOp = Script(model);
+            Assert.Equal(0, ((StandardDecoderModel)model).GraphRuns);
+        }
+        using var graph = Create(family, path, 1, 1, TestGates.PinnedGgmlBackend);
+        List<float[]> rows = Script(graph);
+        Assert.True(((StandardDecoderModel)graph).GraphRuns >= rows.Count, "every step must run as a whole-forward graph");
+        for (int i = 0; i < perOp.Count; i++)
+        {
+            double rel = RelL2(rows[i], perOp[i]);
+            Assert.True(rel <= 1e-3, $"{family} row {i}: graph vs per-op relL2 {rel:E2}");
+        }
+    }
+
     /// <summary>A fixed script over one cache: prefill, decode, truncate + refill, reset, prefill.</summary>
     private static List<float[]> Script(ModelBase model)
     {

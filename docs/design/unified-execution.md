@@ -523,6 +523,31 @@ chunks of different lengths, decode, a lone step on one slot in between) reprodu
 alone in every placement, bit-identical on the managed backend and within backend rounding on
 GGML and MLX. A multi-node pipeline (the serialized stage protocol) has no slots yet.
 
+### 6.6 Whole-forward graphs (the native lowering, first step)
+
+Hand-fused native graphs were written per family and per mode (decode, prefill, batched, tensor
+parallel, verify): 7.3k lines of the native library are such graphs, and the same blocks recur
+across them (`flash_attn_ext` in 32 files, `rope_ext` in 26, `mul_mat_id` in 19). The runtime
+now emits each step as ONE ggml graph instead (`StandardDecoderModel.Graph.cs` over the generic
+builder `ggml_ops_graph_builder.cpp` / `GgmlGraph`): leaves are weights (bound to the cached
+device copy by host pointer), state (slot caches and recurrent states, updated in place) and
+per-run inputs; the runtime writes norms, projections, cache writes, per-sequence attention on
+each slot, dense FFN and routed experts once for every family, and a family adds only its own
+pieces (`EmitQueryKey`: rotary, QK-norm, position scale; `EmitRecurrentMixer`: Qwen 3.5's Gated
+DeltaNet). Single-device GGML placements use it; other placements keep the per-op path until
+their lowering lands. Measured on an M5 Pro, `ggml_metal`, 512 / 128 tokens, tok/s:
+
+| Model | per-op runtime | graph | legacy family code |
+|---|---|---|---|
+| Hy-MT2-1.8B Q4_K_M | 627 / 14.7 | 4,720 / 141.6 | - |
+| Ministral-3-3B Q4_K_M | 429 / 24.7 | 2,651 / 98.3 | - |
+| Qwen3.5-0.8B Q8_0 | ~1,750 / 45.7 | 6,996 / 166.6 | 9,370 / 220 (`Qwen35Model` fused graphs) |
+
+Greedy text is byte-identical to the per-op path on all three; Qwen3.5-0.8B perplexity is
+50.1337 through the graph and through `Qwen35Model` alike. The remaining Qwen gap is the
+per-token graph rebuild, which the fused decode avoids by replaying a fixed-topology graph; the
+graph decode is next to do the same (KV writes by index, a padded attention window under a mask).
+
 ---
 
 ## 7. Migration plan

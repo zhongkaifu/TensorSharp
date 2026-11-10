@@ -29,6 +29,10 @@ namespace TensorSharp.Models
             /// <summary>Back to the state before any token.</summary>
             public abstract void Reset();
 
+            /// <summary>Host tensors holding the state, which a whole-forward graph may update on
+            /// the device; synced back before any host code reads them.</summary>
+            protected internal virtual System.Collections.Generic.IEnumerable<Tensor> HostTensors => Array.Empty<Tensor>();
+
             public virtual void Dispose() { }
         }
 

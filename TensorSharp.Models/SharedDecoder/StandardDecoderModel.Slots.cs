@@ -25,7 +25,7 @@ namespace TensorSharp.Models
     public abstract partial class StandardDecoderModel : IBatchedPagedModel
     {
         /// <summary>One request's decoder state.</summary>
-        private sealed class Slot
+        internal sealed class Slot
         {
             public Tensor[][] K;   // [layer][rank]; null rows for layers another node owns or recurrent layers
             public Tensor[][] V;
@@ -33,6 +33,7 @@ namespace TensorSharp.Models
             public int Length;
             public RecurrentState[][] Recurrent;   // [layer][rank]; hybrid stacks only
             public float[] Logits;                 // reused by batched steps
+            public bool DeviceDirty;               // a graph wrote its rows/state in device memory
         }
 
         /// <summary>Rows of a batched step: sequence s owns rows [QueryStart[s], QueryStart[s] + Counts[s])
@@ -85,6 +86,7 @@ namespace TensorSharp.Models
             Capacity = _cacheCapacity,
             Length = _cacheSeqLen,
             Recurrent = _recurrentPrimary,
+            DeviceDirty = _cacheDeviceDirty,
         };
 
         private void LoadActive(Slot slot)
@@ -94,6 +96,33 @@ namespace TensorSharp.Models
             _cacheCapacity = slot.Capacity;
             _cacheSeqLen = slot.Length;
             _recurrentPrimary = slot.Recurrent;
+            _cacheDeviceDirty = slot.DeviceDirty;
+        }
+
+        // A whole-forward graph wrote the active cache/state in device memory.
+        private bool _cacheDeviceDirty;
+
+        /// <summary>Bring a slot's device-written rows and states back to its host tensors, before
+        /// host code (the per-op path, snapshots, truncation, growth) reads or rewrites them.</summary>
+        private void SyncToHost(Slot slot)
+        {
+            if (slot == null || !slot.DeviceDirty) return;
+            foreach (Tensor t in AllCacheTensors(slot.K)) SyncTensorHostCache(t);
+            foreach (Tensor t in AllCacheTensors(slot.V)) SyncTensorHostCache(t);
+            if (slot.Recurrent != null)
+                foreach (RecurrentState[] layer in slot.Recurrent)
+                    if (layer != null)
+                        foreach (RecurrentState state in layer)
+                            if (state != null)
+                                foreach (Tensor t in state.HostTensors) SyncTensorHostCache(t);
+            slot.DeviceDirty = false;
+        }
+
+        private void SyncActiveToHost()
+        {
+            if (!_cacheDeviceDirty) return;
+            SyncToHost(SnapshotActive());
+            _cacheDeviceDirty = false;
         }
 
         /// <summary>Write the active fields back into the bound request's slot and reinstate the
@@ -175,6 +204,7 @@ namespace TensorSharp.Models
         private void EnsureSlotCapacity(Slot slot, int required)
         {
             if (required <= slot.Capacity) return;
+            SyncToHost(slot);
             if (required > _maxContextLength)
                 throw new InvalidOperationException($"Requested sequence length {required} exceeds configured max context {_maxContextLength}.");
             int capacity = Math.Max(slot.Capacity, 1);
@@ -183,8 +213,8 @@ namespace TensorSharp.Models
             (Tensor[][] k, Tensor[][] v) = AllocateCaches(capacity);
             CopyRows(slot.K, k, slot.Length);
             CopyRows(slot.V, v, slot.Length);
-            foreach (Tensor t in AllCacheTensors(slot.K)) t.Dispose();
-            foreach (Tensor t in AllCacheTensors(slot.V)) t.Dispose();
+            foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+            foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             slot.K = k;
             slot.V = v;
             slot.Capacity = capacity;
@@ -406,6 +436,27 @@ namespace TensorSharp.Models
                 Starts = (int[])starts.Clone(),
                 Slots = slots,
             };
+
+            Tensor embedded = null;
+            try
+            {
+                embedded = Embedding(flatTokens);
+                if (TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(), wantLogits: true, out float[][] graphLogits))
+                {
+                    BatchedForwardCount++;
+                    for (int s = 0; s < n; s++)
+                    {
+                        slots[s].Length = starts[s] + counts[s];
+                        outLogits[s] = graphLogits[s];
+                    }
+                    return true;
+                }
+            }
+            finally
+            {
+                embedded?.Dispose();
+            }
+            foreach (Slot slot in slots) SyncToHost(slot);
 
             float[] all;
             // A step with a text-LoRA adapter selected must apply it to every planned weight.

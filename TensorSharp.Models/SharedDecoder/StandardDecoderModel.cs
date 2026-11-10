@@ -353,6 +353,7 @@ namespace TensorSharp.Models
                 return;
             if (required > _maxContextLength)
                 throw new InvalidOperationException($"Requested sequence length {required} exceeds configured max context {_maxContextLength}.");
+            SyncActiveToHost();
             int capacity = Math.Max(_cacheCapacity, 1);
             while (capacity < required)
                 capacity = Math.Min(_maxContextLength, capacity * 2);
@@ -381,6 +382,7 @@ namespace TensorSharp.Models
                 using Tensor dst = grown.Narrow(1, 0, _cacheSeqLen);
                 Ops.Copy(dst, src);
             }
+            InvalidateTensorDeviceCache(old);
             old.Dispose();
             return grown;
         }
@@ -405,10 +407,13 @@ namespace TensorSharp.Models
             foreach (Tensor t in AllCacheTensors(_cacheK)) ResetCacheTensor(t);
             foreach (Tensor t in AllCacheTensors(_cacheV)) ResetCacheTensor(t);
             ResetRecurrentPrimary();
+            // Rows past the length are dead and the states were rewritten on the host.
+            _cacheDeviceDirty = false;
         }
 
         protected override void TruncateKVCacheCore(int tokenCount)
         {
+            SyncActiveToHost();
             if (_anyRecurrent && tokenCount != _cacheSeqLen)
             {
                 if (tokenCount != 0)
@@ -442,13 +447,18 @@ namespace TensorSharp.Models
             => KvBlockTransfer.ComputeBlockByteSize(FlatCaches(_cacheK), FlatCaches(_cacheV), tokenCount);
 
         public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
-            => SupportsKVStateSnapshot && KvBlockTransfer.Extract(
+        {
+            if (!SupportsKVStateSnapshot) return false;
+            SyncActiveToHost();
+            return KvBlockTransfer.Extract(
                 _allocator, FlatCaches(_cacheK), FlatCaches(_cacheV), _cacheSeqLen, startToken, tokenCount, destination);
+        }
 
         public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
         {
             if (!SupportsKVStateSnapshot)
                 return false;
+            SyncActiveToHost();
             EnsureCacheCapacity(destToken + tokenCount);
             if (!KvBlockTransfer.Inject(_allocator, FlatCaches(_cacheK), FlatCaches(_cacheV), _cacheSeqLen,
                     destToken, tokenCount, source))
@@ -502,6 +512,16 @@ namespace TensorSharp.Models
                 Tensor hidden = Embedding(tokens);
                 _embTicks += Stopwatch.GetTimestamp() - t0;
                 InjectMedia(hidden, start);
+
+                if (TryRunGraph(hidden, new[] { SnapshotActive() }, new[] { 0 }, new[] { seqLen }, new[] { start },
+                        wantLogits, out float[][] graphLogits))
+                {
+                    hidden.Dispose();
+                    _cacheDeviceDirty = true;
+                    _cacheSeqLen += seqLen;
+                    return graphLogits?[0];
+                }
+                SyncActiveToHost();
 
                 hidden = RunLayers(hidden, positions, batch: null);
                 float[] logits = null;
