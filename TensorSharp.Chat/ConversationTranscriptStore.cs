@@ -416,13 +416,22 @@ namespace TensorSharp.Server
                 return false;
             // Whitespace can change code, quoted strings and ordinary words. A
             // formatting change may forfeit reuse; it must not restore different text.
-            string clientThinking = client.Thinking ?? string.Empty;
-            string emittedThinking = emitted.Thinking ?? string.Empty;
+            // Reasoning compares without its surrounding whitespace. The stream sends it with the
+            // newline the model writes before </think> (Qwen: "...\n</think>"), while the parser
+            // records it trimmed, so a client that replays exactly what it streamed (pi does)
+            // never matched: every round of its tool loop re-prefilled everything after the
+            // shared prefix (Qwen3.8-27B, 3.8K of 5.4K prompt tokens reused instead of 5.3K).
+            // That whitespace is the template's framing, not reasoning text, and the splice
+            // restores the exact generated tokens; any difference inside the reasoning still
+            // refuses the match.
+            string clientThinking = (client.Thinking ?? string.Empty).Trim();
+            string emittedThinking = (emitted.Thinking ?? string.Empty).Trim();
             // A tool-loop transcript records every round's reasoning; a client may send back
             // all of it or only the complete final round, not an arbitrary suffix.
             if (clientThinking.Length > 0
                 && !string.Equals(clientThinking, emittedThinking, StringComparison.Ordinal)
-                && !(record.Replacement.Count > 1 && string.Equals(clientThinking, record.FinalThinking, StringComparison.Ordinal)))
+                && !(record.Replacement.Count > 1
+                     && string.Equals(clientThinking, (record.FinalThinking ?? string.Empty).Trim(), StringComparison.Ordinal)))
                 return false;
 
             string clientContent = client.Content ?? string.Empty;

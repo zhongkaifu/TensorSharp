@@ -216,6 +216,49 @@ public class ModelServiceRawTokenHistoryTests
         Assert.Equal("t0", own.InheritedScope);
     }
 
+    /// <summary>pi replays a tool-call round's reasoning exactly as it streamed: with the
+    /// newline the model wrote before &lt;/think&gt;, which the parser records trimmed. It
+    /// is the same turn, so its raw tokens splice and the conversation's scope carries over;
+    /// reasoning that differs inside still renders from the client's own text.</summary>
+    [Fact]
+    public void Augment_StreamedReasoningWithItsFramingNewline_StillSplices()
+    {
+        var store = NewStore();
+        var ask = new ChatMessage { Role = "user", Content = "Read src/stats.js." };
+        var read = new List<ToolCall>
+        {
+            new() { Name = "read", Arguments = new Dictionary<string, object> { ["path"] = "src/stats.js" } },
+        };
+        store.Record(new List<ChatMessage> { ask },
+            Generated("I need to read the file.\n</think>\n\n<tool_call>...</tool_call>", new List<int> { 4, 5, 6 }),
+            Emitted(string.Empty, rawText: "<tool_call>...</tool_call>", toolCalls: read, thinking: "I need to read the file."),
+            scope: "pi-1");
+
+        List<ChatMessage> Replay(string thinking) => new()
+        {
+            new() { Role = "user", Content = ask.Content },
+            new()
+            {
+                Role = "assistant",
+                Content = null,
+                Thinking = thinking,
+                ToolCalls = new List<ToolCall>
+                {
+                    new() { Id = "call_1", Name = "read", Arguments = new Dictionary<string, object> { ["path"] = "src/stats.js" } },
+                },
+            },
+            new() { Role = "tool", Content = "export function median(values) {}", ToolCallId = "call_1" },
+        };
+
+        var streamed = store.Augment(Replay("I need to read the file.\n"));
+        Assert.Equal(new[] { 4, 5, 6 }, streamed.History[1].RawOutputTokens);
+        Assert.Equal("pi-1", streamed.InheritedScope);
+
+        var edited = store.Augment(Replay("I need to read another file.\n"));
+        Assert.Null(edited.History[1].RawOutputTokens);
+        Assert.Null(edited.InheritedScope);
+    }
+
     /// <summary>Two parallel tool calls: the client received (and echoes back) the newline
     /// between them as content, while the parser recorded none. It is still this
     /// conversation's turn: the raw tokens splice and the scope carries over. Visible text
