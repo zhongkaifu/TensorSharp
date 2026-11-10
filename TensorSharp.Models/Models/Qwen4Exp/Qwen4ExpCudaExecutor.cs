@@ -409,7 +409,8 @@ namespace TensorSharp.Models
         /// <summary>The shared-target NextN block the GGUF set carries beside the checkpoint (validated against it).</summary>
         private Q4eCudaEngine.MtpDesc BuildMtp(int hcDim)
         {
-            int layer = Qwen4ExpModel.ValidateMtpHead(_gguf.First, _gguf.Extra);
+            // The target's tensors from every shard: the first of a split checkpoint may hold none of them.
+            int layer = Qwen4ExpModel.ValidateMtpHead(_gguf.First, _gguf.Extra, _gguf.InfoOf);
             string p = $"blk.{layer}.";
             var mtp = new Q4eCudaEngine.MtpDesc
             {

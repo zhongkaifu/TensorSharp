@@ -50,6 +50,20 @@ public partial class Qwen4ExpMtpValidationTests
         Assert.Throws<InvalidOperationException>(() => Validate(f.Target, f.Draft));
     }
 
+    [Fact]
+    public void SplitTarget_FindsTheBorrowedTensorsInItsOtherShards()
+    {
+        // The first shard of a split checkpoint opened shard by shard (the direct-CUDA engine's GgufShardSet) holds
+        // the metadata and, in Unsloth's six-shard Q8_0, none of the tensors: the lookup finds them in the others.
+        using var f = new HeadMetadataFixture();
+        var shards = f.Target.Tensors.ToDictionary(kv => kv.Key, kv => kv.Value);
+        f.Target.Tensors.Clear();
+        Assert.Throws<InvalidOperationException>(() => Validate(f.Target, f.Draft));
+        Assert.Equal(48, Validate(f.Target, f.Draft, name => shards.GetValueOrDefault(name)));
+        shards["output.weight"].Shape[1]++;
+        Assert.Throws<InvalidOperationException>(() => Validate(f.Target, f.Draft, name => shards.GetValueOrDefault(name)));
+    }
+
     [Theory]
     [InlineData("tokenizer.ggml.tokens")]
     [InlineData("tokenizer.ggml.merges")]
@@ -144,12 +158,12 @@ public partial class Qwen4ExpMtpValidationTests
         Assert.True(error is InvalidOperationException or NotSupportedException, error.ToString());
     }
 
-    private static int Validate(GgufFile target, GgufFile draft)
+    private static int Validate(GgufFile target, GgufFile draft, Func<string, GgufTensorInfo?>? targetTensor = null)
     {
         try
         {
             return (int)typeof(Qwen4ExpModel).GetMethod("ValidateMtpHead", BindingFlags.Static | BindingFlags.NonPublic)!
-                .Invoke(null, new object[] { target, draft })!;
+                .Invoke(null, new object[] { target, draft, targetTensor })!;
         }
         catch (TargetInvocationException e) when (e.InnerException != null)
         { ExceptionDispatchInfo.Capture(e.InnerException).Throw(); throw; }

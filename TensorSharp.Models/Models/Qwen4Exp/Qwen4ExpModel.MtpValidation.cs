@@ -10,10 +10,15 @@ namespace TensorSharp.Models
     {
         // Validate metadata and tensor directories before mapping payloads or
         // borrowing target pointers. This does not read or claim weight values.
-        internal static int ValidateMtpHead(GgufFile target, GgufFile draft)
+        // targetTensor finds the target's tensors when they are not in target's own
+        // table: a split checkpoint opened shard by shard (the direct-CUDA engine's
+        // GgufShardSet) keeps its metadata in the first shard and its tensors in the
+        // others (Unsloth's six-shard Q8_0 has none in the first).
+        internal static int ValidateMtpHead(GgufFile target, GgufFile draft, Func<string, GgufTensorInfo> targetTensor = null)
         {
             ArgumentNullException.ThrowIfNull(target);
             ArgumentNullException.ThrowIfNull(draft);
+            targetTensor ??= name => target.Tensors.TryGetValue(name, out var t) ? t : null;
             const string a = "qwen4exp.";
             if (target.GetString("general.architecture") != ArchitectureId
                 || draft.GetString("general.architecture") != ArchitectureId
@@ -90,8 +95,8 @@ namespace TensorSharp.Models
                 || target.GetUint32(a + "rope.dimension_count") > dim
                 || target.GetUint32(a + "rope.dimension_count") % 2 != 0 || vocab == 0)
                 throw new NotSupportedException("qwen4exp MTP attention, HC, expert, or rotary dimensions are unsupported.");
-            Require(target, "token_embd.weight", false, hidden, vocab);
-            Require(target, "output.weight", false, hidden, vocab);
+            RequireTensor(targetTensor("token_embd.weight"), "token_embd.weight", false, hidden, vocab);
+            RequireTensor(targetTensor("output.weight"), "output.weight", false, hidden, vocab);
             string p = $"blk.{layer}.";
             Require(draft, p + "nextn.enorm.weight", true, hidden);
             Require(draft, p + "nextn.hnorm.weight", true, width);
@@ -131,8 +136,11 @@ namespace TensorSharp.Models
             return layer;
 
             static void Require(GgufFile file, string name, bool f32, params ulong[] shape)
+                => RequireTensor(file.Tensors.TryGetValue(name, out var t) ? t : null, name, f32, shape);
+
+            static void RequireTensor(GgufTensorInfo tensor, string name, bool f32, params ulong[] shape)
             {
-                if (!file.Tensors.TryGetValue(name, out var tensor) || !tensor.Shape.SequenceEqual(shape))
+                if (tensor == null || !tensor.Shape.SequenceEqual(shape))
                     throw new InvalidOperationException($"qwen4exp MTP tensor is missing or has the wrong shape: {name}.");
                 if (f32 && tensor.Type != GgmlTensorType.F32)
                     throw new NotSupportedException($"qwen4exp MTP norm must be F32: {name}.");
