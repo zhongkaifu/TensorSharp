@@ -126,7 +126,7 @@ namespace TensorSharp.Models
                     _expertOnHost[l] = MoeCpuOffloadConfig.IsLayerOnCpu(l);
                 // Explicit offload still records routing, so a --cpu-moe run is also
                 // how a complete profile is collected for the tiered plan.
-                AttachRoutingProfile();
+                AttachRoutingProfile(ArchitectureId, _fusedGateUpExperts ? 0 : _numExperts);
                 ReportExpertPlacement("--n-cpu-moe / --cpu-moe", null);
                 if (_backend == BackendType.GgmlMetal)
                 {

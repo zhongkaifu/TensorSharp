@@ -36,139 +36,17 @@ namespace TensorSharp.Models
     /// the layer plan; <c>TS_MOE_HOT_TIER_GB</c> sets the tier budget (default: the
     /// bytes the layer plan would have wired).</para>
     /// </summary>
+    /// <summary>
+    /// Flash Next's tier budget (see <see cref="ModelBase"/>'s expert tiers, which register,
+    /// profile and release them for every family). The layer plan in
+    /// <see cref="PlanExpertPlacement"/> wires whole trailing layers: every one of their 512
+    /// experts stays resident, used or not. A tiered plan spends the same bytes on the experts that
+    /// are routed most, in every layer; on Qwen3.8-Flash-Next the most-routed third of a layer's
+    /// experts takes about half of its routes.
+    /// </summary>
     public partial class Qwen4ExpModel
     {
-        private MoeRoutingProfile _routingProfile;
-
-        /// <summary>Per layer, the experts its accelerator tier holds in fixed slots (null for a
-        /// layer without a tier). The host serves every other route of a host layer.</summary>
-        private int[][] _tierExperts;
-        private string _routingProfilePath;
-        private bool _routingProfileExitHook;
-        // The accelerator-resident layers' graphs also count their routing (see
-        // TryPlanExpertTiers): a discrete-VRAM plan without a covering profile.
-        private bool _recordingDeviceRoutes;
-
-        /// <summary>Window slots the registered tiers fill on demand (0 without tiers or on discrete VRAM).</summary>
-        private int _tierWindowSlots;
-
-        internal static bool ExpertTiersEnabled()
-            => Environment.GetEnvironmentVariable("TS_MOE_HOT_TIER") is not "0";
-
-        internal static long? ExpertTierBudgetOverride(string value)
-            => double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out double gb)
-               && gb >= 0 && gb < 1e6 ? (long)(gb * 1e9) : null;
-
-        /// <summary>The share of a unified-memory tier budget given to window slots (least recently used, filled as the
-        /// text routes) instead of profile-ranked fixed slots. The profile ranks experts over other prompts; the window
-        /// follows this one. ISTA Q2_0 on the 48 GB M5 Pro, the same 25 GB either way: 0.3 GB of window (what the fixed
-        /// slots left) read 26-47 missed experts a 4-row verify pass and computed up to 13 routes on the host, 3.1 GB
-        /// (this share) read 14-19 and none on the host - the pass 52.8-59.0 -> 49.4-51.0 ms, a 1-row step 32.5-33.9 ->
-        /// 31.9-32.5 ms. <c>TS_MOE_WINDOW_SHARE</c> (0 to 0.9) sets it; an explicit <c>TS_MOE_HOT_TIER_GB</c> keeps its
-        /// own split (the window gets what the fixed slots leave).</summary>
-        internal const double DefaultWindowShare = 0.12;
-
-        internal static double WindowShare(string value)
-            => double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out double share)
-               && share >= 0 && share <= 0.9 ? share : DefaultWindowShare;
-
-        private bool TryGetLayerExperts(int layer, out StackedExpertWeights gate, out StackedExpertWeights up,
-            out StackedExpertWeights down)
-        {
-            up = down = null;
-            return _stackedExpertWeights.TryGetValue($"blk.{layer}.ffn_gate_exps.weight", out gate)
-                && _stackedExpertWeights.TryGetValue($"blk.{layer}.ffn_up_exps.weight", out up)
-                && _stackedExpertWeights.TryGetValue($"blk.{layer}.ffn_down_exps.weight", out down);
-        }
-
-        /// <summary>Find (or start) this model's routing profile and zero the native
-        /// counters, so what is saved at dispose is exactly this load's routing.</summary>
-        private void AttachRoutingProfile()
-        {
-            if (_routingProfile != null || !IsGgmlBackend || IsTensorParallel || _fusedGateUpExperts)
-                return;
-            int n = Config.NumLayers;
-            string identity = MoeRoutingProfile.IdentityFor(ModelFilePaths, ArchitectureId, n, _numExperts);
-            string path = identity == null ? null : MoeRoutingProfile.PathFor(identity);
-            if (path == null)
-                return;
-            _routingProfilePath = path;
-            _routingProfile = MoeRoutingProfile.TryLoad(path, identity, n, _numExperts)
-                ?? new MoeRoutingProfile(identity, n, _numExperts);
-            for (int l = 0; l < n; l++)
-                if (TryGetLayerExperts(l, out var gate, out _, out _))
-                    GgmlBasicOps.MoeRoutingReset(gate.Data);
-            if (!_routingProfileExitHook)
-            {
-                // A CLI run can end without disposing the model; the counters are
-                // in native memory, so harvest them while it still exists.
-                AppDomain.CurrentDomain.ProcessExit += OnProcessExitSaveRoutingProfile;
-                _routingProfileExitHook = true;
-            }
-        }
-
-        private void OnProcessExitSaveRoutingProfile(object sender, EventArgs e) => SaveRoutingProfile();
-
-        /// <summary>Merge this load's routing into the profile file. Re-reads the file
-        /// first so concurrent processes on the same model add up rather than
-        /// overwrite each other. Never throws: a profile is an optimization.</summary>
-        private void SaveRoutingProfile()
-        {
-            if (_routingProfile == null || _routingProfilePath == null)
-                return;
-            try
-            {
-                int n = Config.NumLayers;
-                MoeRoutingProfile merged = null;
-                for (int l = 0; l < n; l++)
-                {
-                    if (!TryGetLayerExperts(l, out var gate, out _, out _))
-                        continue;
-                    ulong[] counts = GgmlBasicOps.MoeRoutingCounts(gate.Data);
-                    if (counts == null || counts.Length != _numExperts)
-                        continue;
-                    ulong sum = 0;
-                    foreach (ulong c in counts) sum += c;
-                    if (sum == 0)
-                        continue;
-                    merged ??= MoeRoutingProfile.TryLoad(_routingProfilePath, _routingProfile.Identity, n, _numExperts)
-                        ?? new MoeRoutingProfile(_routingProfile.Identity, n, _numExperts);
-                    merged.Add(l, counts);
-                    GgmlBasicOps.MoeRoutingReset(gate.Data);
-                }
-                if (merged != null && merged.TrySave(_routingProfilePath))
-                    _routingProfile = merged;
-            }
-            catch (Exception ex) when (ex is OverflowException or InvalidOperationException or DllNotFoundException
-                or EntryPointNotFoundException)
-            {
-                Console.Error.WriteLine($"[moe-offload] routing profile not saved: {ex.Message}");
-            }
-        }
-
-        private void DetachRoutingProfile()
-        {
-            if (IsGgmlBackend && Environment.GetEnvironmentVariable("TS_MOE_TIER_STATS") == "1")
-            {
-                var t = GgmlBasicOps.MoeHotTierStats();
-                var io = GgmlBasicOps.HostExpertIoStats();
-                Console.Error.WriteLine($"[moe-offload] tier slots: {t.Hits} hits, {t.Misses} window reads " +
-                    $"({t.Deferred} in the background), {t.Overflow} overflow steps; host cache: {io.Hits} hits, " +
-                    $"{io.Misses} misses, {io.ReadBytes / 1e9:F1} GB read.");
-            }
-            SaveRoutingProfile();
-            if (_recordingDeviceRoutes)
-            {
-                GgmlBasicOps.MoeRoutingRecordDevice(false);
-                _recordingDeviceRoutes = false;
-            }
-            if (_routingProfileExitHook)
-            {
-                AppDomain.CurrentDomain.ProcessExit -= OnProcessExitSaveRoutingProfile;
-                _routingProfileExitHook = false;
-            }
-            _routingProfile = null;
-        }
+        private protected override bool IsExpertLayerOffloaded(int layer) => IsExpertLayerOnHost(layer);
 
         /// <summary>RAM for explicitly read experts: <c>TS_HOST_MOE_IO_CACHE_GB</c>, or three
         /// quarters of what is left after the host reserve and everything wired for the
@@ -199,90 +77,11 @@ namespace TensorSharp.Models
             return true;
         }
 
-        /// <summary>Test hook: give every host layer a tier holding experts 0..fixed-1 plus
-        /// <paramref name="windowPerLayer"/> window slots. Call before the first forward.
-        /// Returns the number of layers tiered.</summary>
         /// <summary>Test hook: serve the GGUF mapping through the explicit-read I/O layer (as a tiered Mac load does),
         /// with a host expert cache of <paramref name="budgetBytes"/>.</summary>
         internal bool EnableHostExpertIoForTests(long budgetBytes) => EnableHostExpertIo(budgetBytes);
 
-        internal int RegisterExpertTiersForTests(int fixedPerLayer, int windowPerLayer)
-        {
-            int tiered = 0;
-            for (int l = 0; l < Config.NumLayers; l++)
-            {
-                if (!IsExpertLayerOnHost(l) || !TryGetLayerExperts(l, out var gate, out var up, out var down))
-                    continue;
-                int fixedCount = Math.Clamp(fixedPerLayer, 0, _numExperts);
-                int window = Math.Clamp(windowPerLayer, 0, _numExperts - fixedCount);
-                var ids = new int[fixedCount];
-                for (int i = 0; i < ids.Length; i++) ids[i] = i;
-                if (GgmlBasicOps.MoeHotTierRegister(gate.Data, up.Data, down.Data,
-                        gate.GgmlType, up.GgmlType, down.GgmlType,
-                        gate.TotalRawBytes, up.TotalRawBytes, down.TotalRawBytes,
-                        _numExperts, ids, window, releaseSourcePages: false))
-                    tiered++;
-            }
-            return tiered;
-        }
-
         internal int ExpertCountForTests => _numExperts;
-
-        /// <summary>Test hook: the native routing counters of layer <paramref name="layer"/>.</summary>
-        internal ulong[] RoutingCountsForTests(int layer)
-            => TryGetLayerExperts(layer, out var gate, out _, out _) ? GgmlBasicOps.MoeRoutingCounts(gate.Data) : null;
-
-        /// <summary>Test hook: record (or stop recording) accelerator-resident layers' routing.</summary>
-        internal void RecordDeviceRoutesForTests(bool on)
-        {
-            for (int l = 0; l < Config.NumLayers; l++)
-                if (TryGetLayerExperts(l, out var gate, out _, out _))
-                    GgmlBasicOps.MoeRoutingReset(gate.Data);
-            GgmlBasicOps.MoeRoutingRecordDevice(on);
-            _recordingDeviceRoutes = on;
-        }
-
-        /// <summary>Free this model's accelerator tiers; its graphs are already gone.</summary>
-        private void ReleaseExpertTiers()
-        {
-            if (!IsGgmlBackend || _stackedExpertWeights == null)
-                return;
-            for (int l = 0; l < Config.NumLayers; l++)
-                if (TryGetLayerExperts(l, out var gate, out _, out _))
-                    GgmlBasicOps.MoeHotTierRelease(gate.Data);
-        }
-
-        /// <summary>
-        /// Read every fixed slot's expert slices into the page cache with parallel large reads
-        /// before the tiers copy them. The native fill faults its sources in on 16 threads, a page
-        /// at a time; on a network mount each fault is a round trip: measured on a geesefs mount,
-        /// the 23.0 GB tier of Qwen3.8-Flash-Next took 363 s that way (~63 MB/s).
-        /// </summary>
-        private void WarmTierExperts(List<int> layers, int[][] tiers)
-        {
-            if (_gguf == null)
-                return;
-            var ranges = new List<(IntPtr Pointer, long Bytes)>();
-            foreach (int l in layers)
-            {
-                if (tiers[l].Length == 0 || !TryGetLayerExperts(l, out var gate, out var up, out var down))
-                    continue;
-                foreach (var w in new[] { gate, up, down })
-                {
-                    long per = w.PerExpertRawBytes;
-                    foreach (int e in tiers[l])
-                        ranges.Add((w.Data + (nint)(e * per), per));
-                }
-            }
-            if (ranges.Count == 0)
-                return;
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            int threads = GgufFile.DefaultWarmThreads();
-            long read = _gguf.WarmMappedRanges(ranges, threads);
-            if (sw.Elapsed.TotalSeconds >= 1)
-                Console.WriteLine($"[moe-offload] qwen4exp: read the accelerator tier's experts ({Gb(read)}) in " +
-                    $"{sw.Elapsed.TotalSeconds:F1}s with {threads} parallel reads.");
-        }
 
         /// <summary>The tiered plan for a Metal run whose experts do not fit. Returns
         /// false to keep the layer plan. <paramref name="deviceExpertBytes"/> bounds the
@@ -293,7 +92,7 @@ namespace TensorSharp.Models
             bool unified = _backend == BackendType.GgmlMetal;
             if (!ExpertTiersEnabled() || _fusedGateUpExperts || !(unified || _backend == BackendType.GgmlCuda))
                 return false;
-            AttachRoutingProfile();
+            AttachRoutingProfile(ArchitectureId, _fusedGateUpExperts ? 0 : _numExperts);
             if (_routingProfile == null)
                 return false;
             int n = Config.NumLayers;
@@ -359,42 +158,7 @@ namespace TensorSharp.Models
             foreach (int l in moeLayers) tierBytes += (long)tiers[l].Length * expertBytes[l];
             windowBudget = Math.Min(windowBudget, Math.Max(0, deviceExpertBytes - tierBytes));
             long perLayerWindow = windowBudget / Math.Max(1, moeLayers.Count);
-            WarmTierExperts(moeLayers, tiers);
-            _tierExperts = new int[n][];
-            int tiered = 0, experts = 0, windowSlots = 0;
-            long bytes = 0;
-            double covered = 0;
-            foreach (int l in moeLayers)
-            {
-                int[] tier = tiers[l];
-                int window = (int)Math.Min(_numExperts - tier.Length, perLayerWindow / expertBytes[l]);
-                if ((tier.Length == 0 && window == 0) || !TryGetLayerExperts(l, out var gate, out var up, out var down))
-                    continue;
-                if (!GgmlBasicOps.MoeHotTierRegister(gate.Data, up.Data, down.Data,
-                        gate.GgmlType, up.GgmlType, down.GgmlType,
-                        gate.TotalRawBytes, up.TotalRawBytes, down.TotalRawBytes,
-                        _numExperts, tier, window, releaseSourcePages: true))
-                {
-                    Console.Error.WriteLine($"[moe-offload] qwen4exp: layer {l} keeps every route on the host " +
-                        $"(accelerator tier not created: {GgmlBasicOps.LastNativeError()})");
-                    continue;
-                }
-                tiered++;
-                _tierExperts[l] = tier;
-                experts += tier.Length;
-                bytes += tier.Length * expertBytes[l];
-                windowSlots += window;
-                ReadOnlySpan<ulong> counts = _routingProfile.Counts(l);
-                ulong hit = 0;
-                foreach (int e in tier) hit += counts[e];
-                if (profiled) covered += (double)hit / _routingProfile.Routes(l);
-            }
-            _tierWindowSlots = windowSlots;
-            Console.WriteLine($"[moe-offload] qwen4exp (tiered): all {moeLayers.Count} layers' routed experts run at " +
-                $"a host seam; {tiered} layers keep their most-routed experts on the accelerator ({experts} experts, " +
-                $"{Gb(bytes)} of a {Gb(budget)} budget) covering {covered / Math.Max(1, moeLayers.Count) * 100:F1}% " +
-                $"of profiled routes, plus {windowSlots} window slots ({Gb(windowSlots * (long)(expertBytes[moeLayers[0]]))}) " +
-                $"filled on demand. Profile: {_routingProfilePath}.");
+            RegisterExpertTiers("qwen4exp", moeLayers, expertBytes, _numExperts, tiers, perLayerWindow, profiled, budget);
             return true;
         }
     }
