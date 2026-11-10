@@ -542,12 +542,20 @@ namespace TensorSharp.Models
             }
         }
 
-        // Drain the device-resident GDN state left by the N=1 fast-path fused decode
-        // (TryFullModelDecode keeps conv in _fdConvScratch and delta in
-        // _deltaStateTensor on the device) back into the host buffers, so a
-        // subsequent linear->paged migration reads the LATEST recurrent state.
+        // Drain every device-resident copy of the N=1 owner's recurrent state back into the host buffers, so a
+        // subsequent linear->paged migration reads the LATEST recurrent state:
+        //  - an arena slot's (the newest rows and state of a holder in the batched arena);
+        //  - the fused verify graph's (_fvDeviceStateCurrent: a prompt prefill chunk or a speculative verify leaves
+        //    the live state on the device with the mirrors behind and NO fused decode resident). The migration
+        //    used to skip this one, so a request migrated right after its solo prefill (a second request joining
+        //    then, e.g. the first of four arriving a step early) carried its pre-prompt recurrent state into the
+        //    batched path and answered garbage from its second token;
+        //  - the fused decode's (TryFullModelDecode keeps conv in _fdConvScratch and delta in _deltaStateTensor on
+        //    the device).
         private unsafe void DrainFusedDecodeStateForMigration()
         {
+            FlushArenaSlotForActiveHolder();
+            DrainDeviceRecurrentState();
             if (!_fdStateResident || _fdConvScratch == IntPtr.Zero)
                 return; // host _convState / _deltaStateTensor are already current
 

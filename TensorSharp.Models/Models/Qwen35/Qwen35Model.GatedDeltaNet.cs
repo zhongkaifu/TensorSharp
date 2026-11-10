@@ -1886,9 +1886,10 @@ namespace TensorSharp.Models
 
         /// <summary>Pull the live device state back into the host mirrors and clear
         /// <see cref="_fvDeviceStateCurrent"/>. Every path that reads the mirrors -
-        /// the op-by-op recurrent block, a prefill chunk, a state snapshot - goes
-        /// through here first.</summary>
-        internal unsafe void DrainDeviceRecurrentState()
+        /// the op-by-op recurrent block, a prefill chunk, a state snapshot, the
+        /// linear->paged migration - goes through here first. Virtual so a test can
+        /// observe the drain without a device (Qwen35MigrationDrainTests).</summary>
+        internal virtual unsafe void DrainDeviceRecurrentState()
         {
             if (!_fvDeviceStateCurrent)
                 return;
