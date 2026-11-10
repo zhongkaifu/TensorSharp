@@ -94,6 +94,10 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- weight ownership
 
+        /// <summary>The layer whose placement a layer follows: a draft layer after the stack sits with
+        /// the last decoder layer (its node, its stage).</summary>
+        private int PlacementLayer(int layer) => layer >= Config.NumLayers ? Config.NumLayers - 1 : layer;
+
         private bool IsWholeLayerSplit => _mesh != null && _mesh.TensorParallel == 1 && LayerPlacement != null;
 
         private bool IsHeadWeight(string name) =>
@@ -105,7 +109,7 @@ namespace TensorSharp.Models
         protected override bool ShouldLoadWeight(GgufTensorInfo info)
         {
             if (LayerPlacement == null) return true;
-            if (LayerSplitPlan.TryGetLayer(info.Name, out int layer)) return LayerPlacement.Owns(layer);
+            if (LayerSplitPlan.TryGetLayer(info.Name, out int layer)) return LayerPlacement.Owns(PlacementLayer(layer));
             if (info.Name == "token_embd.weight")
                 return LayerPlacement.IsFirst || (LayerPlacement.IsLast && !_gguf.Tensors.ContainsKey("output.weight"));
             if (info.Name.StartsWith("output", StringComparison.Ordinal)) return LayerPlacement.IsLast;
@@ -115,7 +119,7 @@ namespace TensorSharp.Models
         protected override int PreloadRankForWeight(string name)
         {
             if (!IsWholeLayerSplit) return 0;
-            if (LayerSplitPlan.TryGetLayer(name, out int layer)) return LayerPlacement.LocalRank(layer);
+            if (LayerSplitPlan.TryGetLayer(name, out int layer)) return LayerPlacement.LocalRank(PlacementLayer(layer));
             return IsHeadWeight(name) ? LayerSplitDegree - 1 : 0;
         }
 
@@ -124,7 +128,7 @@ namespace TensorSharp.Models
             if (_mesh == null || _mesh.IsSingleDevice) return base.AllocatorForWeight(name);
             if (IsWholeLayerSplit)
             {
-                if (LayerSplitPlan.TryGetLayer(name, out int owned)) return LayerAllocator(owned);
+                if (LayerSplitPlan.TryGetLayer(name, out int owned)) return LayerAllocator(PlacementLayer(owned));
                 return LayerAllocator(IsHeadWeight(name) ? LayerPlacement.EndLayer - 1 : LayerPlacement.FirstLayer);
             }
             return _mesh.Allocator(StageOfWeight(name), 0);
@@ -136,7 +140,8 @@ namespace TensorSharp.Models
         /// <summary>The stage holding <paramref name="name"/> on a local mesh.</summary>
         private int StageOfWeight(string name)
         {
-            if (LayerSplitPlan.TryGetLayer(name, out int layer) && layer < Config.NumLayers) return _mesh.StageOf(layer);
+            if (LayerSplitPlan.TryGetLayer(name, out int layer))
+                return layer < Config.NumLayers ? _mesh.StageOf(layer) : _mesh.Stages - 1;
             return name.StartsWith("output", StringComparison.Ordinal) ? _mesh.Stages - 1 : 0;
         }
 

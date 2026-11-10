@@ -61,7 +61,7 @@ namespace TensorSharp.Models
         {
             if (!GraphLoweringEnabled) return "disabled";
             if (!IsGgmlBackend) return "not a GGML backend";
-            if (!_mesh.IsSingleDevice) return "multi-device placement";
+            if (_mesh.TensorParallel > 1) return "tensor-parallel placement";
             if (LayerSplitGroup != null) return "multi-node pipeline";
             if (GraphRotary == null) return "the family has no graph rotary";
             if (_anyRecurrent && !RecurrentMixerLowers) return "recurrent layers without a graph mixer";
@@ -195,6 +195,8 @@ namespace TensorSharp.Models
             int rows = (int)hidden.Sizes[0];
             bool replayable = true;
             foreach (int c in counts) replayable &= c <= SmallChunkRows;
+            if (_mesh.Stages > 1)
+                return TryRunStagedGraphStep(hidden, slots, first, counts, starts, request, replayable, out result);
             CachedGraph graph = RunTraced(rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, 0,
                 step => EmitStep(step, hidden, request), out StepOutputs outputs, out bool owned);
             if (graph == null) return false;
@@ -208,6 +210,82 @@ namespace TensorSharp.Models
             };
             if (owned) graph.Dispose();
             return true;
+        }
+
+        /// <summary>
+        /// A step over whole-layer stages on this process's devices: each stage's layers are one graph
+        /// on its device (bound to the stage's caches, states and weights), the rows pass from stage to
+        /// stage through the host, and the last stage runs the head. A capture comes from whichever
+        /// stage holds its layer.
+        /// </summary>
+        private bool TryRunStagedGraphStep(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
+            GraphRequest request, bool replayable, out GraphResult result)
+        {
+            result = null;
+            int rows = (int)hidden.Sizes[0], stages = _mesh.Stages, hiddenSize = Config.HiddenSize;
+            float[][] captures = request.CaptureLayers.Length > 0 ? new float[request.CaptureLayers.Length][] : null;
+            Tensor input = hidden;
+            try
+            {
+                for (int s = 0; s < stages; s++)
+                {
+                    EnterStage(s);
+                    (int from, int to) = StageLayers(s);
+                    bool last = s == stages - 1;
+                    Tensor stageInput = input;
+                    CachedGraph graph = RunTraced(rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, 0,
+                        step => EmitStep(step, stageInput, request, from, to, last), out StepOutputs outputs, out bool owned);
+                    if (graph == null)
+                    {
+                        if (s == 0) return false;
+                        throw new InvalidOperationException($"{Config.Architecture}: stage {s}'s graph declined after stage 0 ran.");
+                    }
+                    try
+                    {
+                        if (outputs.Captures != null)
+                            for (int c = 0; c < outputs.Captures.Length; c++)
+                                if (outputs.Captures[c] >= 0) captures[c] = (float[])graph.Outputs[outputs.Captures[c]].Clone();
+                        if (!last)
+                        {
+                            float[] rowsOut = graph.Outputs[outputs.Hidden];
+                            if (!ReferenceEquals(input, hidden)) input.Dispose();
+                            EnterStage(s + 1);
+                            input = CreateFloatTensor((float[])rowsOut.Clone(), rows, hiddenSize);
+                            continue;
+                        }
+                        result = new GraphResult
+                        {
+                            Logits = outputs.Logits >= 0 ? graph.Outputs[outputs.Logits] : null,
+                            Final = outputs.Final >= 0 ? graph.Outputs[outputs.Final] : null,
+                            Captures = captures,
+                        };
+                    }
+                    finally
+                    {
+                        if (owned) graph.Dispose();
+                    }
+                }
+                return true;
+            }
+            finally
+            {
+                if (!ReferenceEquals(input, hidden)) input.Dispose();
+                EnterStage(0);
+            }
+        }
+
+        /// <summary>The decoder layers of pipeline stage <paramref name="stage"/>: [from, to).</summary>
+        private (int From, int To) StageLayers(int stage)
+        {
+            int from = -1, to = -1;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_mesh.StageOf(l) != stage) continue;
+                if (from < 0) from = l;
+                else if (to != l) throw new InvalidOperationException($"{Config.Architecture}: stage {stage}'s layers are not contiguous.");
+                to = l + 1;
+            }
+            return from < 0 ? (0, 0) : (from, to);
         }
 
         /// <summary>
@@ -329,15 +407,20 @@ namespace TensorSharp.Models
 
         private struct StepOutputs
         {
-            public int Logits, Final;
-            public int[] Captures;
+            public int Logits, Final, Hidden;
+            public int[] Captures;   // -1: the captured layer is another stage's
         }
 
         /// <summary>Trace one step: every layer, then what the request asks for.</summary>
         private StepOutputs EmitStep(GraphStep step, Tensor hidden, GraphRequest request)
+            => EmitStep(step, hidden, request, 0, Config.NumLayers, head: true);
+
+        /// <summary>Trace layers [<paramref name="from"/>, <paramref name="to"/>) (one pipeline stage), then
+        /// the head when <paramref name="head"/>, else the stage's output rows for the next stage.</summary>
+        private StepOutputs EmitStep(GraphStep step, Tensor hidden, GraphRequest request, int from, int to, bool head)
         {
             int n = step.Sequences, rows = step.Rows, hiddenSize = Config.HiddenSize;
-            var outputs = new StepOutputs { Logits = -1, Final = -1 };
+            var outputs = new StepOutputs { Logits = -1, Final = -1, Hidden = -1 };
             int h = step.Input(hidden, hiddenSize, rows);
             var positions = new int[rows];
             for (int s = 0; s < n; s++)
@@ -349,8 +432,12 @@ namespace TensorSharp.Models
                 step.SetPositionTable(AxisMajorPositions(request.PositionTable, rows));
             }
 
-            if (request.CaptureLayers.Length > 0) outputs.Captures = new int[request.CaptureLayers.Length];
-            for (int layer = 0; layer < Config.NumLayers; layer++)
+            if (request.CaptureLayers.Length > 0)
+            {
+                outputs.Captures = new int[request.CaptureLayers.Length];
+                Array.Fill(outputs.Captures, -1);
+            }
+            for (int layer = from; layer < to; layer++)
             {
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
                     if (request.CaptureLayers[c] == layer)
@@ -361,6 +448,11 @@ namespace TensorSharp.Models
                 int ffnIn = step.RmsNorm(h, FfnNormWeight(layer));
                 int ffn = _moeLayer[layer] ? EmitMoe(step, layer, ffnIn) : EmitDenseFfn(step, layer, ffnIn);
                 h = step.Op(GgmlGraphOp.Add, h, ffn);
+            }
+            if (!head)
+            {
+                outputs.Hidden = step.Output(h, (long)hiddenSize * rows);
+                return outputs;
             }
             for (int c = 0; c < request.CaptureLayers.Length; c++)
                 if (request.CaptureLayers[c] >= Config.NumLayers)

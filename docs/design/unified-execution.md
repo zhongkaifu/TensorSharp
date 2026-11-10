@@ -644,6 +644,15 @@ gate constants under 4 KB were uploaded every run, a synchronous copy each on CU
 ggml_cuda decode 33.2 ms / token against `Qwen35Model`'s 33.5 (it was 34.4); prompt 501 vs 486 ms
 for 512 tokens.
 
+**Whole-layer stages.** A local layer split runs one graph per stage on its own device (bound to
+that stage's caches, states and weights); the rows pass from stage to stage through the host and
+the last stage runs the head; captures come from whichever stage holds their layer, a verify's
+recurrent commit runs per stage, and a draft layer sits on the last stage (placed with the last
+decoder layer). Two RTX PRO 6000 (ggml_cuda), `--layer-split 2` vs one GPU, 512 / 128 tok/s:
+Qwen3.5-9B 3,058 / 40.7 vs 3,235 / 41.0; Qwen3.8-27B 946 / 29.5 vs 973 / 29.6 (the per-op stages
+this replaced ran Hy-MT2 at 623 / 65 against 7,246 / 205 on one GPU). Greedy text is identical to
+one GPU; 27B speculation across the two stages equals plain greedy (MTP ~36 tok/s, DFlash2 ~43).
+
 **Mixed-type in-projections.** A Gated DeltaNet whose four projections are quantized differently
 (the unsloth UD mixes) is not packed on one device: the graph runs the four products, and the
 per-op path runs that layer's mixer as its own graph (`RunRecurrentMixerGraph`) instead of a

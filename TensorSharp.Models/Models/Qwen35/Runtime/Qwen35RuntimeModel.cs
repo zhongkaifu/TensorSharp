@@ -73,9 +73,9 @@ namespace TensorSharp.Models
             // NextN / MTP draft blocks are counted in block_count but are not decoder layers.
             int nextn = (int)_gguf.GetUint32($"{arch}.nextn_predict_layers", 0);
             Config.NumLayers -= nextn;
-            // The NextN/MTP block drafts on one device (multi-device drafting comes with the graph
-            // lowering of tensor parallelism and layer split).
-            _draftLayers = layerSplitDegree <= 1 && tpDegree <= 1 && tpGroup == null ? Math.Min(nextn, 1) : 0;
+            // The NextN/MTP block drafts on one device or the last of this process's whole-layer
+            // stages (tensor parallelism and multi-node pipelines draft once their graphs lower).
+            _draftLayers = tpDegree <= 1 && tpGroup == null ? Math.Min(nextn, 1) : 0;
 
             int interval = (int)_gguf.GetUint32($"{arch}.full_attention_interval", 4);
             _isRecurrent = new bool[Config.NumLayers];

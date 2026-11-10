@@ -87,6 +87,26 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     /// reference: the pinned GGML backend (ggml_cpu by default; ggml_metal, ggml_cuda or
     /// ggml_vulkan in their lanes), so the runtime's backend fast paths (fused SwiGLU FFN,
     /// fused softmax, native paged attention) are covered wherever the suite runs.</summary>
+    /// <summary>Two whole-layer stages on two GGML devices: one graph per stage, the same logits as one
+    /// device, and speculation across the stages.</summary>
+    [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
+    [MemberData(nameof(Families))]
+    public void StageGraphsMatchOneDevice(string family)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family);
+        List<float[]> single;
+        using (var one = Create(family, path, 1, 1, BackendType.GgmlCuda))
+            single = Script(one);
+        using var staged = Create(family, path, 1, 2, BackendType.GgmlCuda);
+        List<float[]> graph = Script(staged);
+        var sdm = Assert.IsAssignableFrom<StandardDecoderModel>(staged);
+        Assert.True(sdm.GraphRuns > 0 && sdm.GraphReplays > 0, $"{family}: the stages did not run as replayed graphs");
+        for (int i = 0; i < single.Count; i++)
+            Assert.True(RelL2(graph[i], single[i]) <= 1e-3, $"{family} stage graphs row {i}: relL2 {RelL2(graph[i], single[i]):E2}");
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(family, path, 1, 2, BackendType.GgmlCuda), $"{family} stages", tieTolerance: 1e-2);
+    }
+
     [Theory]
     [MemberData(nameof(Families))]
     public void PinnedGgmlBackendMatchesTheManagedReference(string family) => CompareBackend(family, TestGates.PinnedGgmlBackend);

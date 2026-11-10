@@ -57,27 +57,41 @@ namespace TensorSharp.Models
                 return;
             }
             if (kept == 0) return;
-            IntPtr key = IntPtr.Zero;
-            for (int layer = 0; layer < Config.NumLayers && key == IntPtr.Zero; layer++)
-                if (_isRecurrent[layer] && ActiveRecurrentState(layer) is DeviceGdnState first && first.Verify != null)
-                    key = TensorComputePrimitives.GetStoragePointer(first.Verify);
-            if (key == IntPtr.Zero) return;
-            if (!_commitGraphs.TryGetValue((key, kept, rows), out GgmlGraph g))
+            // One commit graph per pipeline stage: each binds its own device's states.
+            for (int stage = 0; stage < Mesh.Stages; stage++)
             {
-                g = BuildCommitGraph(kept, rows);
-                _commitGraphs[(key, kept, rows)] = g;
+                IntPtr key = IntPtr.Zero;
+                for (int layer = 0; layer < Config.NumLayers && key == IntPtr.Zero; layer++)
+                    if (_isRecurrent[layer] && Mesh.StageOf(layer) == stage
+                        && ActiveRecurrentState(layer) is DeviceGdnState first && first.Verify != null)
+                        key = TensorComputePrimitives.GetStoragePointer(first.Verify);
+                if (key == IntPtr.Zero) continue;
+                EnterGraphStage(stage);
+                try
+                {
+                    if (!_commitGraphs.TryGetValue((key, kept, rows), out GgmlGraph g))
+                    {
+                        g = BuildCommitGraph(kept, rows, stage);
+                        _commitGraphs[(key, kept, rows)] = g;
+                    }
+                    if (!g.Run(ReadOnlySpan<int>.Empty, ReadOnlySpan<IntPtr>.Empty, ReadOnlySpan<long>.Empty))
+                        throw new InvalidOperationException($"{Config.Architecture} recurrent-state commit failed: {GgmlBasicOps.LastNativeError()}");
+                }
+                finally
+                {
+                    EnterGraphStage(0);
+                }
             }
-            if (!g.Run(ReadOnlySpan<int>.Empty, ReadOnlySpan<IntPtr>.Empty, ReadOnlySpan<long>.Empty))
-                throw new InvalidOperationException($"{Config.Architecture} recurrent-state commit failed: {GgmlBasicOps.LastNativeError()}");
         }
 
-        private GgmlGraph BuildCommitGraph(int kept, int rows)
+        private GgmlGraph BuildCommitGraph(int kept, int rows, int stage)
         {
             const long f = sizeof(float);
             var g = new GgmlGraph(Math.Max(256, Config.NumLayers * 16), replayable: true);
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
-                if (!_isRecurrent[layer] || ActiveRecurrentState(layer) is not DeviceGdnState state || state.Verify == null)
+                if (!_isRecurrent[layer] || Mesh.StageOf(layer) != stage
+                    || ActiveRecurrentState(layer) is not DeviceGdnState state || state.Verify == null)
                     continue;
                 long stateFloats = state.StateFloats, stateBytes = stateFloats * f;
                 int cap = state.SnapshotCapacity, convRows = state.ConvRows, channels = state.Channels;

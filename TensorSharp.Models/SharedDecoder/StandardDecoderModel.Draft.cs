@@ -48,6 +48,7 @@ namespace TensorSharp.Models
                 RunDraftLayerPerOp(tokens, hRows, startPos, logitsOut, hOut);
                 return;
             }
+            EnterStage(StageOfLayer(Config.NumLayers));
             Tensor embedded = DraftEmbedding(tokens);
             Tensor hidden = CreateFloatTensor(hRows.AsSpan(0, rows * hiddenSize).ToArray(), rows, hiddenSize);
             Slot active = SnapshotActive();
@@ -75,6 +76,7 @@ namespace TensorSharp.Models
                 if (owned) graph?.Dispose();
                 embedded.Dispose();
                 hidden.Dispose();
+                EnterStage(0);
                 _forwardSw.Stop();
             }
         }

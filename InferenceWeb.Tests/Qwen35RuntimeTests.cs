@@ -539,6 +539,44 @@ public sealed class Qwen35RuntimeTests : IDisposable
         return result;
     }
 
+    /// <summary>Two whole-layer stages on two GGML devices run one graph per stage: the same logits as
+    /// one device (graph and per-op), speculation and the MTP draft layer on the last stage, and
+    /// checkpoints across the stages' devices.</summary>
+    [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
+    [InlineData("dense")]
+    [InlineData("moe")]
+    public void StageGraphsMatchOneDevice(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(variant);
+        List<float[]> single;
+        using (var one = Create(path, backend: BackendType.GgmlCuda))
+            single = Script(one);
+        using var staged = Create(path, 1, 2, BackendType.GgmlCuda);
+        Assert.Equal(2, staged.Mesh.Stages);
+        List<float[]> graph = Script(staged);
+        Assert.True(staged.GraphRuns > 0 && staged.GraphReplays > 0, "the stages did not run as replayed graphs");
+        staged.ResetKVCache();
+        staged.GraphLoweringEnabled = false;
+        List<float[]> perOp = Script(staged);
+        for (int i = 0; i < single.Count; i++)
+        {
+            Assert.True(RelL2(graph[i], single[i]) <= 1e-3, $"stage graphs row {i}: relL2 {RelL2(graph[i], single[i]):E2}");
+            Assert.True(RelL2(perOp[i], single[i]) <= 2.5e-2, $"per-op stages row {i}: relL2 {RelL2(perOp[i], single[i]):E2}");
+        }
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(path, 1, 2, BackendType.GgmlCuda), $"qwen35 {variant} stages", tieTolerance: 1e-2);
+        CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(path, 1, 2, BackendType.GgmlCuda), 1e-5, $"qwen35 {variant} stages");
+    }
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void MtpDraftsOnTheLastStage()
+    {
+        if (TestGates.GgmlDevicesSkip(BackendType.GgmlCuda, 2) != null) return;
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense-nextn");
+        SpeculativeRuntimeChecks.AssertDraftHeadMatchesPlainGreedy(() => Create(path, 1, 2, BackendType.GgmlCuda), "qwen35 nextn stages", tieTolerance: 1e-2);
+    }
+
     /// <summary>A shared-prefix checkpoint (attention rows and Gated DeltaNet state), cloned or written
     /// to a file and read back, continues exactly as a fresh run.</summary>
     [Theory]

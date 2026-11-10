@@ -336,7 +336,7 @@ namespace TensorSharp.Models
             _quantWeights.ContainsKey(name) || _weights.ContainsKey(name) ||
             _tpQuantWeights.ContainsKey(name) || _tpWeights.ContainsKey(name);
 
-        protected bool OwnsLayer(int layer) => LayerPlacement == null || LayerPlacement.Owns(layer);
+        protected bool OwnsLayer(int layer) => LayerPlacement == null || LayerPlacement.Owns(PlacementLayer(layer));
 
         // ---------------------------------------------------------------- KV caches
 
@@ -1049,6 +1049,9 @@ namespace TensorSharp.Models
 
         /// <summary>Make <paramref name="stage"/>'s first device the one the single-device helpers
         /// (Embedding, LinearForward, RMSNormOp, ...) allocate on and run on.</summary>
+        /// <summary>Make <paramref name="stage"/>'s first device the active one (a family's own graphs).</summary>
+        protected void EnterGraphStage(int stage) => EnterStage(stage);
+
         private void EnterStage(int stage)
         {
             if (_mesh == null || _mesh.IsSingleDevice) return;
