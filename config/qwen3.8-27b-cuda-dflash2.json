@@ -7,13 +7,13 @@
   //   TensorSharp.Server.Host --config config/qwen3.8-27b-cuda-dflash2.json
   //
   // Measured on an RTX 5090 (32 GB), 2026-11-10, at d4f33229 (after 74310bb0's VRAM fix), eng/qwen38-engine-bench.py,
-  // two passes in opposite orders, decode tok/s: long generation 176-178 (89-96 without the drafter), 184-189 after a
-  // 16K-token prompt, 211-220 on the quality tasks, four requests at once 180-192 in all. After a 4K-token prompt
-  // 251 and 140; the second pass's single 54-token answer had per-window costs in line with the first. 48% of drafts
-  // accepted on free generation; per window the draft costs 2.3 ms and the verify 18.9 ms. This file as written, run
-  // back to back with those settings on the same build, matched them within the VM's noise; its VRAM peak was 27.4 GB
-  // on the 32 GB card with the projector loaded. 24 GB cards were not tested: if it does not fit, drop the projector
-  // (--mmproj none) or lower MAX_CONTEXT.
+  // five single passes on a VM whose host load swung them by up to ~15%, decode tok/s: long generation 155-178
+  // (89-96 without the drafter), 170-189 after a 16K-token prompt, 196-220 on the quality tasks, four requests at
+  // once 168-192 in all. After a 4K-token prompt 140-251: a single 54-token answer, so one slow window moves it.
+  // 48% of drafts accepted on free generation; per window the draft costs 2.3 ms and the verify 18.9 ms. This file
+  // as written, run back to back with those settings on the same build, gave the same text in every scenario and the
+  // same speed within the VM's noise; its VRAM peak was 27.4 GB on the 32 GB card with the projector loaded. 24 GB
+  // cards were not tested: if it does not fit, drop the projector (--mmproj none) or lower MAX_CONTEXT.
   //
   // RTX 50-series (sm_120): config/qwen3.8-27b-ninfer.json is faster there (the NVFP4 artifact on the direct CUDA
   // engine: ~203 tok/s single stream, up to 372 for four requests); its kernels need sm_120. This preset runs on
