@@ -145,6 +145,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public void MtpRestart(int position)
         {
+            DrainDecodeLanes();
             if (_mtpLayer == null)
                 throw new InvalidOperationException("[q4e-cuda] no MTP block is loaded");
             if (position < 0 || position > _m.NCtx)
@@ -177,6 +178,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public void MtpForward(int[] tokens, float[] hPrev, int p0, float[] logitsOut, float[] hOut)
         {
+            DrainDecodeLanes();
             if (_mtpLayer == null)
                 throw new InvalidOperationException("[q4e-cuda] no MTP block is loaded");
             ArgumentNullException.ThrowIfNull(tokens);
@@ -353,6 +355,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public int MtpDraftChain(int[] tokens, float[] hPrev, int p0, int steps, int[] idsOut, float[] probsOut)
         {
+            DrainDecodeLanes();
             if (!HasMtpDraftChain)
                 throw new InvalidOperationException("[q4e-cuda] the MTP draft chain needs the block on one GPU and the pick kernel");
             ArgumentNullException.ThrowIfNull(tokens);

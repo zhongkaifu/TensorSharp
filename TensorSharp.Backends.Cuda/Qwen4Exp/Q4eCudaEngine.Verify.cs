@@ -129,6 +129,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public void ForwardVerifyGreedy(int[] tokens, int[] drawnOut, float[] hAll)
         {
+            DrainDecodeLanes();
             ArgumentNullException.ThrowIfNull(drawnOut);
             if (drawnOut.Length < tokens.Length)
                 throw new ArgumentException("a greedy verify needs one output token per row", nameof(drawnOut));
@@ -206,6 +207,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public bool CommitVerify(int keep)
         {
+            DrainDecodeLanes();
             Slot slot = _verifySlot;
             int nt = _verifyRows, p0 = _verifyP0;
             if (p0 < 0 || slot == null || keep < 1 || keep > nt)
@@ -256,6 +258,7 @@ namespace TensorSharp.Cuda
         /// <summary>Put the states back to before the last verify window (its rows all rejected); the head returns to its start.</summary>
         public bool RestoreVerify()
         {
+            DrainDecodeLanes();
             Slot slot = _verifySlot;
             int p0 = _verifyP0;
             if (p0 < 0 || slot == null)

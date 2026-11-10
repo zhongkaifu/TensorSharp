@@ -164,6 +164,7 @@ namespace TensorSharp.Cuda
         public bool ForwardBatchedVerify(int[] slotIds, int window, int[] tokens, int[] drawnOut, float[] hAll,
             float[] logitsOut = null)
         {
+            DrainDecodeLanes();
             int n = slotIds?.Length ?? 0;
             if (!SupportsBatchedVerify || n < 1 || window < 1 || window > VerifyMaxRows || (long)n * window > PerSlotMaxRows
                 || tokens == null || tokens.Length < n * window)
@@ -282,6 +283,7 @@ namespace TensorSharp.Cuda
         /// </summary>
         public bool CommitBatchedVerify(int[] slotIds, int[] kept)
         {
+            DrainDecodeLanes();
             var slots = _bvSlots;
             if (slots == null || slotIds == null || kept == null || slotIds.Length != slots.Length || kept.Length < slots.Length)
                 return false;
