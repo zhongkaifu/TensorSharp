@@ -111,13 +111,6 @@ namespace TensorSharp.Models
         /// </summary>
         protected abstract void RotateQueryKey(RankScope rank, int layer, ref Tensor q, ref Tensor k, TokenPositions positions);
 
-        /// <summary>Copy pending media embeddings (images) into the embedded rows of a forward
-        /// that starts at absolute position <paramref name="absoluteStart"/>. Default: none.</summary>
-        protected virtual void InjectPendingMedia(Tensor hidden, int absoluteStart) { }
-
-        /// <summary>True while media embeddings wait to be injected; chunked prefill is skipped then.</summary>
-        protected virtual bool HasPendingMedia => false;
-
         /// <summary>The FFN pre-norm weight of <paramref name="layer"/>. Default
         /// <c>blk.N.ffn_norm.weight</c>; Qwen 3.5 calls it <c>post_attention_norm</c>.</summary>
         protected virtual string FfnNormWeight(int layer) => LayerName(layer, "ffn_norm.weight");
@@ -205,21 +198,33 @@ namespace TensorSharp.Models
         {
             private readonly int[] _explicit;
 
-            private TokenPositions(int start, int count, int[] explicitPositions)
+            private TokenPositions(int start, int count, int[] explicitPositions, int ropeDelta = 0, int[] table = null)
             {
                 Start = start;
                 Count = count;
                 _explicit = explicitPositions;
+                RopeDelta = ropeDelta;
+                Table = table;
             }
 
             public static TokenPositions Contiguous(int start, int count) => new(start, count, null);
+            /// <summary>Per-row rotary positions (a batched step: each sequence's KV index plus its delta).</summary>
             public static TokenPositions Explicit(int[] positions) => new(0, positions.Length, positions);
 
-            /// <summary>First position of a contiguous run (one sequence).</summary>
+            /// <summary>The same rows rotated at KV index + <paramref name="delta"/>, or by the (T,H,W)
+            /// rows of <paramref name="table"/> (multi-axis rotary).</summary>
+            public TokenPositions WithRotary(int delta, int[] table) => new(Start, Count, _explicit, delta, table);
+
+            /// <summary>KV index of the first row of a contiguous run (one sequence).</summary>
             public int Start { get; }
             public int Count { get; }
             public bool IsContiguous => _explicit == null;
-            public int this[int token] => _explicit?[token] ?? Start + token;
+            /// <summary>Rotary position minus KV index for a contiguous run (0 without a position table).</summary>
+            public int RopeDelta { get; }
+            /// <summary>Flat (T,H,W) rotary positions of these rows, or null (every axis at this[t]).</summary>
+            public int[] Table { get; }
+            /// <summary>The rotary position of a row.</summary>
+            public int this[int token] => _explicit?[token] ?? Start + token + RopeDelta;
 
             /// <summary>Positions repeated for each of <paramref name="heads"/> heads, token-major,
             /// as Ops.RoPEEx reads them.</summary>
@@ -416,6 +421,8 @@ namespace TensorSharp.Models
         {
             _verifyRows = 0;   // the state is reset; nothing to settle
             _draftStart = 0;
+            _ropeDelta = 0;
+            _pendingPositionTable = null;
             _cacheSeqLen = 0;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
@@ -528,7 +535,7 @@ namespace TensorSharp.Models
             _forwardSw.Start();
             try
             {
-                var positions = TokenPositions.Contiguous(start, seqLen);
+                var positions = BeginRotaryPositions(start, seqLen);
                 EnterStage(0);
                 long t0 = Stopwatch.GetTimestamp();
                 Tensor hidden = Embedding(tokens);
@@ -536,7 +543,7 @@ namespace TensorSharp.Models
                 InjectMedia(hidden, start);
 
                 if (TryRunGraph(hidden, new[] { SnapshotActive() }, new[] { 0 }, new[] { seqLen }, new[] { start },
-                        wantLogits, out float[][] graphLogits))
+                        wantLogits, out float[][] graphLogits, positions.Table))
                 {
                     hidden.Dispose();
                     _cacheDeviceDirty = true;
@@ -567,7 +574,7 @@ namespace TensorSharp.Models
             int seqLen = tokens.Length;
             int start = _cacheSeqLen;
             EnsureCacheCapacity(checked(start + seqLen));
-            var positions = TokenPositions.Contiguous(start, seqLen);
+            var positions = BeginRotaryPositions(start, seqLen);
             _forwardSw.Start();
             try
             {
@@ -1062,13 +1069,6 @@ namespace TensorSharp.Models
                 GgmlBasicOps.InvalidateTensorHostBuffer(tensor);
         }
 
-        private void InjectMedia(Tensor hidden, int absoluteStart)
-        {
-            if (!HasPendingMedia) return;
-            InjectPendingMedia(hidden, absoluteStart);
-            HostWritten(hidden);
-        }
-
         /// <summary>The activation on <paramref name="target"/>; copied through host memory when it
         /// lives elsewhere (stage boundaries carry one [tokens, hidden] tensor).</summary>
         private Tensor MoveTo(Tensor tensor, IAllocator target)
@@ -1152,6 +1152,7 @@ namespace TensorSharp.Models
             DisposeSlots();
             ClearGraphCache();
             DisposeRecurrentStates();
+            DropPendingMedia();
             base.Dispose();
         }
     }

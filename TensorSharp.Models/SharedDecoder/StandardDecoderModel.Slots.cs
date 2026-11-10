@@ -36,6 +36,7 @@ namespace TensorSharp.Models
             public float[] Logits;                 // reused by batched steps
             public bool DeviceDirty;               // a graph wrote its rows/state in device memory
             public int DraftStart;                 // the draft layers attend to rows from here on
+            public int RopeDelta;                  // rotary position = KV index + this past a position table
         }
 
         /// <summary>Rows of a batched step: sequence s owns rows [QueryStart[s], QueryStart[s] + Counts[s])
@@ -96,6 +97,7 @@ namespace TensorSharp.Models
             Recurrent = _recurrentPrimary,
             DeviceDirty = _cacheDeviceDirty,
             DraftStart = _draftStart,
+            RopeDelta = _ropeDelta,
         };
 
         private void LoadActive(Slot slot)
@@ -107,6 +109,7 @@ namespace TensorSharp.Models
             _recurrentPrimary = slot.Recurrent;
             _cacheDeviceDirty = slot.DeviceDirty;
             _draftStart = slot.DraftStart;
+            _ropeDelta = slot.RopeDelta;
         }
 
         // The active cache's draft-layer floor (see Slot.DraftStart).
@@ -423,7 +426,7 @@ namespace TensorSharp.Models
         /// slot or does not continue its slot at the given position.</summary>
         private bool TryForwardSlots(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits)
         {
-            if (!SupportsPerSequenceFusedForward || _slots == null || HasPendingMedia) return false;
+            if (!SupportsPerSequenceFusedForward || _slots == null || HasPendingMedia || _pendingPositionTable != null) return false;
             int n = requestIds.Count;
             if (n == 0 || chunks.Count != n || starts.Length != n || outLogits.Length != n) return false;
 
@@ -451,7 +454,7 @@ namespace TensorSharp.Models
             for (int s = 0; s < n; s++)
             {
                 Array.Copy(chunks[s], 0, flatTokens, queryStart[s], counts[s]);
-                for (int i = 0; i < counts[s]; i++) positions[queryStart[s] + i] = starts[s] + i;
+                for (int i = 0; i < counts[s]; i++) positions[queryStart[s] + i] = starts[s] + i + slots[s].RopeDelta;
                 lastRows[s] = queryStart[s] + counts[s] - 1;
             }
             var batch = new SlotBatch

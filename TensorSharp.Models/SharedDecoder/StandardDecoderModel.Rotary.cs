@@ -111,9 +111,14 @@ namespace TensorSharp.Models
         /// </summary>
         protected void Rotate(Tensor data, int numHeads, int headDim, TokenPositions positions, RotarySpec spec)
         {
+            if (positions.Table != null && RotarySections is { } sections)
+            {
+                RotateTableOnHost(data, numHeads, headDim, positions, spec, sections);
+                return;
+            }
             if (positions.Count == 1 && positions.IsContiguous && HostDecodeOps)
             {
-                RotateOnHost(data, numHeads, headDim, positions.Start, spec);
+                RotateOnHost(data, numHeads, headDim, positions[0], spec);
                 HostWritten(data);
                 return;
             }
@@ -126,6 +131,44 @@ namespace TensorSharp.Models
             using Tensor reshaped = data.View(1, tokens, numHeads, headDim);
             Ops.RoPEEx(reshaped, reshaped, posTensor, spec.Dims, spec.NeoX ? 2 : 0, spec.OriginalContext,
                 spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow);
+        }
+
+        /// <summary>
+        /// Multi-axis rotary from a (T, H, W) position table, on the host (prompt rows with media):
+        /// ggml's interleaved M-RoPE with NeoX pairs, where pair i of the rotated dims takes the H
+        /// position when i mod 3 == 1 (and i &lt; 3 * sections[1]), W when 2 (&lt; 3 * sections[2]), T
+        /// when 0 (&lt; 3 * sections[0]), the extra axis (0) otherwise; the frequency is the pair's.
+        /// </summary>
+        private void RotateTableOnHost(Tensor data, int numHeads, int headDim, TokenPositions positions, RotarySpec spec, int[] sections)
+        {
+            int tokens = positions.Count, half = spec.Dims / 2;
+            int sectDims = sections[0] + sections[1] + sections[2] + (sections.Length > 3 ? sections[3] : 0);
+            float[] values = data.GetElementsAsFloat(tokens * numHeads * headDim);
+            var cos = new float[4][];
+            var sin = new float[4][];
+            for (int a = 0; a < 4; a++) { cos[a] = new float[half]; sin[a] = new float[half]; }
+            for (int t = 0; t < tokens; t++)
+            {
+                for (int a = 0; a < 4; a++)
+                    spec.Table(a < 3 ? positions.Table[3 * t + a] : 0, cos[a], sin[a]);
+                for (int h = 0; h < numHeads; h++)
+                {
+                    int head = (t * numHeads + h) * headDim;
+                    for (int i = 0; i < half; i++)
+                    {
+                        int sector = i % sectDims;
+                        int axis = sector % 3 == 1 && sector < 3 * sections[1] ? 1
+                            : sector % 3 == 2 && sector < 3 * sections[2] ? 2
+                            : sector % 3 == 0 && sector < 3 * sections[0] ? 0 : 3;
+                        float c = cos[axis][i], sn = sin[axis][i];
+                        float x0 = values[head + i], x1 = values[head + i + half];
+                        values[head + i] = x0 * c - x1 * sn;
+                        values[head + i + half] = x0 * sn + x1 * c;
+                    }
+                }
+            }
+            data.SetElementsAsFloat(values);
+            HostWritten(data);
         }
 
         private unsafe void RotateOnHost(Tensor data, int numHeads, int headDim, int position, RotarySpec spec)

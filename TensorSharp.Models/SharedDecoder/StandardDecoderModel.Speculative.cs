@@ -151,8 +151,10 @@ namespace TensorSharp.Models
             int rows = tokens.Length, start = _cacheSeqLen, hiddenSize = Config.HiddenSize;
             EnsureCacheCapacity(checked(start + rows));
             bool dflash = HasDFlash;
+            TokenPositions positions = BeginRotaryPositions(start, rows);
             var request = new GraphRequest
             {
+                PositionTable = positions.Table,
                 AllRowLogits = allLogitsRows,
                 LastRowLogits = !allLogitsRows,
                 CaptureLayers = dflash && hAllOut != null ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
@@ -162,10 +164,11 @@ namespace TensorSharp.Models
             if (GraphUnsupportedReason() != null)
             {
                 if (SpeculationRefusal is { } refusal) throw new NotSupportedException(refusal);
-                SpecForwardPerOp(tokens, hAllOut, logitsOut, allLogitsRows, request);
+                SpecForwardPerOp(tokens, hAllOut, logitsOut, allLogitsRows, request, positions);
                 return;
             }
             Tensor hidden = Embedding(tokens);
+            InjectMedia(hidden, start);
             GraphResult result;
             _forwardSw.Start();
             try
@@ -190,7 +193,8 @@ namespace TensorSharp.Models
 
         /// <summary>The verify off the graphs: the per-op layers with the drafter's rows captured, every
         /// row's logits when asked, and the recurrent states keeping the window.</summary>
-        private void SpecForwardPerOp(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows, GraphRequest request)
+        private void SpecForwardPerOp(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows, GraphRequest request,
+            TokenPositions positions)
         {
             int rows = tokens.Length, start = _cacheSeqLen, hiddenSize = Config.HiddenSize;
             int[] captureLayers = request.CaptureLayers;
@@ -203,7 +207,8 @@ namespace TensorSharp.Models
             {
                 EnterStage(0);
                 Tensor hidden = Embedding(tokens);
-                hidden = RunLayers(hidden, TokenPositions.Contiguous(start, rows), batch: null, (layer, input) =>
+                InjectMedia(hidden, start);
+                hidden = RunLayers(hidden, positions, batch: null, (layer, input) =>
                 {
                     for (int c = 0; c < captureLayers.Length; c++)
                         if (captureLayers[c] == layer) captures[c] = input.GetElementsAsFloat(rows * hiddenSize);

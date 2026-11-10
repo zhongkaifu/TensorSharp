@@ -98,7 +98,7 @@ namespace TensorSharp.Models
                 _attentionFloor = _draftStart;
                 try
                 {
-                    x = LayerOnOneDevice(x, n, TokenPositions.Contiguous(startPos, rows), batch: null);
+                    x = LayerOnOneDevice(x, n, TokenPositions.Contiguous(startPos, rows).WithRotary(_ropeDelta, null), batch: null);
                 }
                 finally
                 {
@@ -132,7 +132,7 @@ namespace TensorSharp.Models
             int e = step.RmsNorm(step.Input(embedded, hiddenSize, rows), LayerName(n, "nextn.enorm.weight"));
             int h = step.RmsNorm(step.Input(hidden, hiddenSize, rows), LayerName(n, "nextn.hnorm.weight"));
             var positions = new int[rows];
-            for (int i = 0; i < rows; i++) positions[i] = step.Starts[0] + i;
+            for (int i = 0; i < rows; i++) positions[i] = step.Starts[0] + i + step.Slots[0].RopeDelta;
             step.SetPositions(positions);
             int x = step.MatMul(LayerName(n, "nextn.eh_proj.weight"),
                 step.Op(GgmlGraphOp.Concat, stackalloc[] { e, h }, stackalloc long[] { 0 }));

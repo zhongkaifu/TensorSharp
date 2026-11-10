@@ -100,6 +100,7 @@ namespace
                                 // (a [head_dim, length, kv_heads] window, copied where a backend's attention needs it)
         OP_SWIGLU = 51,         // silu(first half) * second half, along ne0
         OP_GEGLU = 52,
+        OP_ROPE_MULTI = 53,     // srcs: x, positions [4 * rows], [freq factors]; ip: n_dims, mode, n_ctx_orig, sections[4]; fp: as ROPE_EXT
     };
 
     struct Leaf
@@ -247,6 +248,15 @@ namespace
             return ggml_rope_ext(ctx, src(0), src(1), src(2),
                                  static_cast<int>(ipar(0, 0)), static_cast<int>(ipar(1, 0)), static_cast<int>(ipar(2, 0)),
                                  fpar(0, 10000.0f), fpar(1, 1.0f), fpar(2, 0.0f), fpar(3, 1.0f), fpar(4, 32.0f), fpar(5, 1.0f));
+        case OP_ROPE_MULTI:
+        {
+            need(2);
+            int sections[GGML_MROPE_SECTIONS] = {};
+            for (int i = 0; i < GGML_MROPE_SECTIONS && i < 4; i++) sections[i] = static_cast<int>(ipar(3 + i, 0));
+            return ggml_rope_multi(ctx, src(0), src(1), src(2),
+                                   static_cast<int>(ipar(0, 0)), sections, static_cast<int>(ipar(1, 0)), static_cast<int>(ipar(2, 0)),
+                                   fpar(0, 10000.0f), fpar(1, 1.0f), fpar(2, 0.0f), fpar(3, 1.0f), fpar(4, 32.0f), fpar(5, 1.0f));
+        }
         case OP_FLASH_ATTN_EXT:
         {
             need(3);

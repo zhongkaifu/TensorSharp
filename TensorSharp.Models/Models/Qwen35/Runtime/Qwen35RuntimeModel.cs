@@ -87,6 +87,8 @@ namespace TensorSharp.Models
 
             int headDim = Config.HeadDim;
             _ropeDim = (int)_gguf.GetUint32($"{arch}.rope.dimension_count", (uint)headDim);
+            // Qwen-VL's interleaved M-RoPE: rotated pairs per (T, H, W, extra) axis.
+            _ropeSections = _gguf.GetInt32Array($"{arch}.rope.dimension_sections") is { Length: >= 3 } sections ? sections : null;
             _rotary = new RotarySpec(_ropeDim, neoX: true, Config.RopeBase, 1.0f / Config.RopeScale);
             ParseTokenizer();
 

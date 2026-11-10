@@ -442,6 +442,103 @@ public sealed class Qwen35RuntimeTests : IDisposable
         return rows;
     }
 
+    /// <summary>An image span (media rows over its placeholders, a (T, H, W) table whose rotary positions
+    /// differ from the KV indices) and the decode after it (KV index + delta): the graph's multi-axis
+    /// rotary, the per-op host rotation and the managed reference agree.</summary>
+    [Fact]
+    public void ImageSpanPositionsAgreeAcrossPaths()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense");
+        List<float[]> reference;
+        using (var managed = Create(path))
+            reference = MediaScript(managed, out _);
+        using var model = Create(path, backend: TestGates.PinnedGgmlBackend);
+        List<float[]> graph = MediaScript(model, out int delta);
+        Assert.Equal(-4, delta);   // 8 rows take 4 positions
+        model.ResetKVCache();
+        model.GraphLoweringEnabled = false;
+        List<float[]> perOp = MediaScript(model, out _);
+        double tolerance = RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : 5e-3;
+        for (int i = 0; i < reference.Count; i++)
+        {
+            Assert.True(RelL2(graph[i], reference[i]) <= tolerance, $"graph row {i}: relL2 {RelL2(graph[i], reference[i]):E2}");
+            Assert.True(RelL2(perOp[i], reference[i]) <= tolerance, $"per-op row {i}: relL2 {RelL2(perOp[i], reference[i]):E2}");
+        }
+        // The positions matter: the same rows at scalar positions answer differently.
+        model.ResetKVCache();
+        model.GraphLoweringEnabled = true;
+        float[] scalar = model.ForwardRefill(MediaPrompt);
+        Assert.True(RelL2(scalar, graph[0]) > 10 * tolerance, "the position table changed nothing");
+    }
+
+    /// <summary>The same image span through Qwen35Model (its fused graphs run ggml's M-RoPE).</summary>
+    [Fact]
+    public void ImageSpanMatchesTheFamilyImplementation()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense");
+        List<float[]> legacy;
+        using (var family = new Qwen35Model(path, TestGates.PinnedGgmlBackend))
+            legacy = MediaScript(family, out _);
+        using var runtime = Create(path, backend: TestGates.PinnedGgmlBackend);
+        List<float[]> actual = MediaScript(runtime, out _);
+        double tolerance = RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : 5e-3;
+        for (int i = 0; i < legacy.Count; i++)
+            Assert.True(RelL2(actual[i], legacy[i]) <= tolerance, $"row {i}: relL2 {RelL2(actual[i], legacy[i]):E2} from Qwen35Model");
+    }
+
+    [MlxFact]
+    public void MlxImageSpanMatchesTheManagedReference()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense");
+        List<float[]> reference;
+        using (var managed = Create(path))
+            reference = MediaScript(managed, out _);
+        using var model = Create(path, backend: BackendType.Mlx);
+        List<float[]> actual = MediaScript(model, out _);
+        for (int i = 0; i < reference.Count; i++)
+            Assert.True(RelL2(actual[i], reference[i]) <= 5e-3, $"mlx row {i}: relL2 {RelL2(actual[i], reference[i]):E2}");
+    }
+
+    private static readonly int[] MediaPrompt = Enumerable.Range(0, 24).Select(i => 40 + (i * 7) % 60).ToArray();
+
+    /// <summary>Rows 5..12 are a 2 x 4 image span at base 5 (T 5, H 5-6, W 5-8); the text after it
+    /// resumes at 9; three decode steps follow.</summary>
+    private static List<float[]> MediaScript(ModelBase model, out int delta)
+    {
+        int hidden = model.Config.HiddenSize, rows = MediaPrompt.Length;
+        var table = new int[3 * rows];
+        for (int i = 0; i < rows; i++)
+        {
+            if (i >= 5 && i < 13)
+            {
+                table[3 * i] = 5;
+                table[3 * i + 1] = 5 + (i - 5) / 4;
+                table[3 * i + 2] = 5 + (i - 5) % 4;
+            }
+            else
+            {
+                int p = i < 5 ? i : 9 + (i - 13);
+                table[3 * i] = table[3 * i + 1] = table[3 * i + 2] = p;
+            }
+        }
+        var media = new float[8 * hidden];
+        var rng = new Random(7);
+        for (int j = 0; j < media.Length; j++) media[j] = (float)(rng.NextDouble() - 0.5) * 0.4f;
+        var embeddings = new Tensor(new TensorSharp.Cpu.CpuAllocator(BlasEnum.DotNet), DType.Float32, 8, hidden);
+        embeddings.SetElementsAsFloat(media);
+
+        ((TensorSharp.Models.Architecture.IMRoPEPositionSink)model).SetMRoPEPositions(table);
+        ((TensorSharp.Models.Architecture.IVisionCapableModel)model).SetVisionEmbeddings(embeddings, 5);
+        var result = new List<float[]> { (float[])model.ForwardRefill(MediaPrompt).Clone() };
+        delta = (model as Qwen35RuntimeModel)?.ActiveRopeDelta ?? 0;
+        foreach (int token in new[] { 71, 72, 73 })
+            result.Add((float[])model.Forward(new[] { token }).Clone());
+        return result;
+    }
+
     /// <summary>A shared-prefix checkpoint (attention rows and Gated DeltaNet state), cloned or written
     /// to a file and read back, continues exactly as a fresh run.</summary>
     [Theory]

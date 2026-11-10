@@ -41,7 +41,6 @@ namespace TensorSharp.Models
 
         // Vision support
         private Mistral3VisionEncoder _visionEncoder;
-        private readonly List<(Tensor embeddings, int position)> _pendingVisionEmbeddingsList = new();
 
         // Preserve the CLR signature used by existing compiled callers.
         public Mistral3Model(string ggufPath, BackendType backend, int tpDegree, ITensorParallelGroup tpGroup)
@@ -126,7 +125,6 @@ namespace TensorSharp.Models
 
         public void LoadVisionEncoder(string mmProjPath)
         {
-            RefuseVisionOffFirstStage();
             _visionEncoder = new Mistral3VisionEncoder(mmProjPath, _allocator);
             _visionEncoder.SetHostModel(this);
         }
@@ -135,50 +133,9 @@ namespace TensorSharp.Models
         /// layouts that interleave marker tokens with encoder output.</summary>
         internal Tensor EmbedTokensForMultimodal(int[] tokens) => Embedding(tokens);
 
-        public void SetVisionEmbeddings(Tensor embeddings, int insertPosition)
-        {
-            RefuseVisionOffFirstStage();
-            _pendingVisionEmbeddingsList.Add((embeddings, insertPosition));
-        }
-
-        /// <summary>Image rows are embedded and injected where this node embeds
-        /// tokens. In a multi-node pipeline that runs the last stage on node 0 (the
-        /// default), the first stage is another node, so images are refused rather
-        /// than dropped.</summary>
-        private void RefuseVisionOffFirstStage()
-        {
-            if (LayerSplitGroup?.NodeCount > 1 && LayerPlacement != null && !LayerPlacement.IsFirst)
-                throw new NotSupportedException(
-                    "Multi-node layer split runs node 0 as the last stage, so it cannot inject image embeddings. " +
-                    $"Set {LayerSplitPlan.DriverStageVariable}=first on every node to serve images.");
-        }
+        public void SetVisionEmbeddings(Tensor embeddings, int insertPosition) => QueueMedia(embeddings, insertPosition);
 
         public Mistral3VisionEncoder VisionEncoder => _visionEncoder;
-
-        protected override bool HasPendingMedia => _pendingVisionEmbeddingsList.Count > 0;
-
-        protected override unsafe void InjectPendingMedia(Tensor hidden, int absoluteStart)
-        {
-            if (_pendingVisionEmbeddingsList.Count == 0)
-                return;
-            int dim = Config.HiddenSize;
-            float* hPtr = GetFloatPtr(hidden);
-            foreach (var (embeddings, insertPos) in _pendingVisionEmbeddingsList)
-            {
-                int numVisionTokens = (int)embeddings.Sizes[0];
-                float* vPtr = GetFloatPtr(embeddings);
-                for (int t = 0; t < numVisionTokens; t++)
-                {
-                    Buffer.MemoryCopy(vPtr + (long)t * dim, hPtr + (long)(insertPos + t) * dim,
-                        dim * sizeof(float), dim * sizeof(float));
-                }
-                // insertPos is the offset within the current forward; absoluteStart makes the
-                // absolute position explicit so the log reads monotonically across chunks.
-                Console.WriteLine($"Injected {numVisionTokens} vision tokens at chunk-offset {insertPos} (absolute position {absoluteStart + insertPos})");
-                embeddings.Dispose();
-            }
-            _pendingVisionEmbeddingsList.Clear();
-        }
 
         // ---------------------------------------------------------------- rotary
 
@@ -239,9 +196,6 @@ namespace TensorSharp.Models
         public override void Dispose()
         {
             _visionEncoder?.Dispose();
-            foreach (var (embeddings, _) in _pendingVisionEmbeddingsList)
-                embeddings?.Dispose();
-            _pendingVisionEmbeddingsList.Clear();
             base.Dispose();
         }
     }

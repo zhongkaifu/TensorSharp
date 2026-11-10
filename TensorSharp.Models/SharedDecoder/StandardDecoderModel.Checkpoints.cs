@@ -22,7 +22,7 @@ namespace TensorSharp.Models
     public abstract partial class StandardDecoderModel
     {
         private const uint CheckpointMagic = 0x4C535354; // "TSSL"
-        private const int CheckpointVersion = 1;
+        private const int CheckpointVersion = 2;   // 2: the rotary delta
 
         public bool SupportsPrefixCheckpoints => SupportsPerSequenceFusedForward && RecurrentStatesCopy;
 
@@ -84,7 +84,7 @@ namespace TensorSharp.Models
             SyncToHost(source);
             int capacity = Math.Min(_maxContextLength, Math.Max(FreshSlotTokens, capacityTokens));
             var slot = new Slot { Capacity = capacity, Length = source.Length, DraftStart = source.DraftStart,
-                Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
+                RopeDelta = source.RopeDelta, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
             (slot.K, slot.V) = AllocateCaches(capacity);
             CopyRowsOnHost(source.K, slot.K, source.Length);
             CopyRowsOnHost(source.V, slot.V, source.Length);
@@ -133,6 +133,7 @@ namespace TensorSharp.Models
             writer.Write(CheckpointVersion);
             writer.Write(CheckpointNamespace);
             writer.Write(slot.Length);
+            writer.Write(slot.RopeDelta);
             var block = new byte[ComputeBlockBytes(slot, slot.Length)];
             if (!KvBlockTransfer.Extract(_allocator, FlatCaches(slot.K), FlatCaches(slot.V), slot.Length, 0, slot.Length, block))
                 return false;
@@ -159,6 +160,7 @@ namespace TensorSharp.Models
                 if (reader.ReadUInt32() != CheckpointMagic || reader.ReadInt32() != CheckpointVersion) return false;
                 if (reader.ReadString() != CheckpointNamespace) return false;
                 int length = reader.ReadInt32();
+                int ropeDelta = reader.ReadInt32();
                 if (length <= 0 || length > _maxContextLength) return false;
                 int capacity = Math.Min(_maxContextLength, Math.Max(FreshSlotTokens, length));
                 slot = new Slot { Capacity = capacity, Length = 0, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
@@ -184,6 +186,7 @@ namespace TensorSharp.Models
                         if (layer != null)
                             foreach (RecurrentState state in layer) state?.OnHostWritten();
                 slot.Length = length;
+                slot.RopeDelta = ropeDelta;
                 slot.DraftStart = length;   // the file holds no draft-layer rows
                 _retainedSlots.Add(key, slot);
                 return true;

@@ -114,6 +114,8 @@ namespace TensorSharp.Models
             public bool CaptureFinal { get; init; }
             /// <summary>Keep the recurrent state after every row (a verify the accept count rewinds).</summary>
             public bool RecurrentSnapshots { get; init; }
+            /// <summary>Flat (T, H, W) rotary positions of a single sequence's rows (multi-axis rotary).</summary>
+            public int[] PositionTable { get; init; }
         }
 
         private sealed class GraphResult
@@ -148,10 +150,10 @@ namespace TensorSharp.Models
         /// when the step cannot be lowered (nothing was written).
         /// </summary>
         private bool TryRunGraph(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
-            bool wantLogits, out float[][] logits)
+            bool wantLogits, out float[][] logits, int[] positionTable = null)
         {
             logits = null;
-            var request = new GraphRequest { LastRowLogits = wantLogits };
+            var request = new GraphRequest { LastRowLogits = wantLogits, PositionTable = positionTable };
             if (!TryRunGraphStep(hidden, slots, first, counts, starts, request, out GraphResult result))
                 return false;
             if (result.Logits != null)
@@ -339,8 +341,13 @@ namespace TensorSharp.Models
             int h = step.Input(hidden, hiddenSize, rows);
             var positions = new int[rows];
             for (int s = 0; s < n; s++)
-                for (int i = 0; i < step.Counts[s]; i++) positions[step.First[s] + i] = step.Starts[s] + i;
+                for (int i = 0; i < step.Counts[s]; i++) positions[step.First[s] + i] = step.Starts[s] + i + step.Slots[s].RopeDelta;
             step.SetPositions(positions);
+            if (request.PositionTable != null)
+            {
+                if (n != 1) throw new InvalidOperationException("A rotary position table drives one sequence's rows.");
+                step.SetPositionTable(AxisMajorPositions(request.PositionTable, rows));
+            }
 
             if (request.CaptureLayers.Length > 0) outputs.Captures = new int[request.CaptureLayers.Length];
             for (int layer = 0; layer < Config.NumLayers; layer++)
@@ -799,6 +806,12 @@ namespace TensorSharp.Models
                 Positions = InputI32(positions, positions.Length);
             }
 
+            /// <summary>Axis-major [4 * rows] rotary positions (ggml_rope_multi); rotary ops then take them.</summary>
+            internal void SetPositionTable(int[] axisMajor) => PositionTable = InputI32(axisMajor, axisMajor.Length);
+
+            /// <summary>Multi-axis rotary positions [4 * rows] (I32), or -1.</summary>
+            public int PositionTable { get; private set; } = -1;
+
             /// <summary>The rows [count, 1] (I64) a short chunk is written at: start .. start + count - 1.</summary>
             internal int WriteRows(int start, int count)
             {
@@ -956,10 +969,19 @@ namespace TensorSharp.Models
             /// already is contiguous (every op result is; views, permutes and transposes may not be).</summary>
             public int Cont(int x) => _strided.Contains(x) ? Op(GgmlGraphOp.Cont, x) : x;
 
+            /// <summary>Rotary at the step's positions; with a position table the family's multi-axis
+            /// rotary (ggml's interleaved M-RoPE over its sections), which equals the scalar one for text.</summary>
             public int Rope(int x, RotarySpec spec)
-                => Op(GgmlGraphOp.RopeExt, stackalloc[] { x, Positions },
+            {
+                if (PositionTable >= 0 && _m.RotarySections is { } sections)
+                    return Op(GgmlGraphOp.RopeMulti, stackalloc[] { x, PositionTable },
+                        stackalloc long[] { spec.Dims, 40 /* GGML_ROPE_TYPE_IMROPE */, spec.OriginalContext,
+                            sections[0], sections[1], sections[2], sections.Length > 3 ? sections[3] : 0 },
+                        stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow });
+                return Op(GgmlGraphOp.RopeExt, stackalloc[] { x, Positions },
                     stackalloc long[] { spec.Dims, spec.NeoX ? 2 : 0, spec.OriginalContext },
                     stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow });
+            }
 
             /// <summary>Flash attention of q [d, rows, heads] over k/v [d, kv, kv_heads]: [dv, heads, rows].</summary>
             public int FlashAttention(int q, int k, int v, int mask, float scale)

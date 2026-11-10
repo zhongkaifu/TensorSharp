@@ -626,6 +626,24 @@ Ministral 95 vs main 29. Prompt: 0.8B 10,970 vs 11,744 at 512 tokens, 10,772 vs 
 (open). Perplexity of Qwen3.8-27B on 2 x 512 tokens: ggml_metal 24.48, runtime MLX 24.54,
 `Qwen35Model` MLX 25.35.
 
+**Media and multi-axis rotary.** Media embeddings (an image's encoder rows) are queued once for
+every family (`StandardDecoderModel.Media.cs`; Mistral 3's copy is gone) and written over their
+placeholder rows before the first layer. A family with a multi-axis rotary declares its sections
+(`RotarySections`; Qwen-VL's interleaved M-RoPE `[11, 11, 10, 0]`): the prompt expander stages each
+chunk's (T, H, W) table, the graph lowers it to `ggml_rope_multi` (`GGML_ROPE_TYPE_IMROPE`), the
+per-op path rotates those rows on the host by the same rule (pair i takes H when i mod 3 = 1 and
+i < 3 x sections[1], W when 2 and i < 3 x sections[2], else T), and past the table every row
+rotates at KV index + a per-sequence delta that the slot and checkpoints carry (file version 2).
+A synthetic 2 x 4 image span and the decode after it agree across the graph, the per-op path, the
+managed reference, MLX and `Qwen35Model` (ggml_cpu and ggml_metal). Qwen 3.5 loads its Qwen-VL
+tower on the runtime (`Qwen35RuntimeModel.Multimodal.cs`); a real tower is not yet validated end
+to end.
+
+**Small weights.** Graph weights of any size bind to cached device copies (norms and per-head
+gate constants under 4 KB were uploaded every run, a synchronous copy each on CUDA): Qwen3.8-27B
+ggml_cuda decode 33.2 ms / token against `Qwen35Model`'s 33.5 (it was 34.4); prompt 501 vs 486 ms
+for 512 tokens.
+
 **Mixed-type in-projections.** A Gated DeltaNet whose four projections are quantized differently
 (the unsloth UD mixes) is not packed on one device: the graph runs the four products, and the
 per-op path runs that layer's mixer as its own graph (`RunRecurrentMixerGraph`) instead of a
