@@ -21,7 +21,7 @@
     with SIGABRT inside load_aot_module, before any managed code runs. Measured on
     device.
 
-    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 412 symbols.
+    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 431 symbols.
     Test-only exports (inside #if defined(TSG_GGML_TEST_HOOKS) or TSG_GGML_TEST_DIAGNOSTICS
     blocks) are left out: only the native test build compiles them, and a name listed here
     becomes a -u link root, so one the device archive lacks fails the Release link.
@@ -72,6 +72,9 @@
     <ReferenceNativeSymbol Include="TSGgml_DiffusionLmHeadSample" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DiffusionModelDecode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DiffusionPrefillAttentionF32" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DirectReadRegister" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DirectReadSupported" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DirectReadUnregister" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DownloadDeviceCopyRanges" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv41AttachVision" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv41ForwardVision" SymbolType="Function" />
