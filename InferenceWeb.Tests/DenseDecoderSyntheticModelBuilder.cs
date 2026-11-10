@@ -47,6 +47,8 @@ public sealed class DenseDecoderSyntheticModelBuilder
     public string RopeScalingType { get; init; }
     public float RopeBase { get; init; } = 1_000_000f;
     public int LayerCount { get; init; } = NumBlocks;
+    /// <summary>Key/value head dimension (default <see cref="HeadDim"/>; flash-attention kernels need 64 and up).</summary>
+    public int KeyLength { get; init; } = HeadDim;
     public bool TiedOutput { get; init; }
     /// <summary>Store one layer's matrices as F16 while all other weights remain F32.</summary>
     public int? HalfPrecisionLayer { get; init; }
@@ -91,8 +93,8 @@ public sealed class DenseDecoderSyntheticModelBuilder
 
     private List<(string Name, ulong[] Dims, float[] Data)> BuildTensors()
     {
-        int qDim = NumHeads * HeadDim;
-        int kDim = NumKvHeads * HeadDim;
+        int qDim = NumHeads * KeyLength;
+        int kDim = NumKvHeads * KeyLength;
         var t = new List<(string, ulong[], float[])>
         {
             Gen("token_embd.weight", 0.08f, Hidden, VocabSize),
@@ -100,7 +102,7 @@ public sealed class DenseDecoderSyntheticModelBuilder
         };
         if (!TiedOutput) t.Add(Gen("output.weight", 0.08f, Hidden, VocabSize));
         if (IncludeRopeFreqs)
-            t.Add(Gen("rope_freqs.weight", 0.1f, HeadDim / 2, offset: 1f));
+            t.Add(Gen("rope_freqs.weight", 0.1f, KeyLength / 2, offset: 1f));
 
         for (int l = 0; l < LayerCount; l++)
         {
@@ -112,8 +114,8 @@ public sealed class DenseDecoderSyntheticModelBuilder
             t.Add(Gen(p + "attn_output.weight", 0.08f, qDim, Hidden));
             if (IncludeQkNorms)
             {
-                t.Add(Gen(p + "attn_q_norm.weight", 0.2f, HeadDim, offset: 1f));
-                t.Add(Gen(p + "attn_k_norm.weight", 0.2f, HeadDim, offset: 1f));
+                t.Add(Gen(p + "attn_q_norm.weight", 0.2f, KeyLength, offset: 1f));
+                t.Add(Gen(p + "attn_k_norm.weight", 0.2f, KeyLength, offset: 1f));
             }
             t.Add(Gen(p + "ffn_norm.weight", 0.2f, Hidden, offset: 1f));
             if (MoeExperts > 0)
@@ -175,9 +177,9 @@ public sealed class DenseDecoderSyntheticModelBuilder
             ($"{a}.feed_forward_length", U32(FfnLength)),
             ($"{a}.attention.head_count", U32(NumHeads)),
             ($"{a}.attention.head_count_kv", U32(NumKvHeads)),
-            ($"{a}.attention.key_length", U32(HeadDim)),
-            ($"{a}.attention.value_length", U32(HeadDim)),
-            ($"{a}.rope.dimension_count", U32(HeadDim)),
+            ($"{a}.attention.key_length", U32((uint)KeyLength)),
+            ($"{a}.attention.value_length", U32((uint)KeyLength)),
+            ($"{a}.rope.dimension_count", U32((uint)KeyLength)),
             ($"{a}.rope.freq_base", F32(RopeBase)),
             ($"{a}.attention.layer_norm_rms_epsilon", F32(1e-5f)),
             ($"{a}.vocab_size", U32((uint)VocabSize)),

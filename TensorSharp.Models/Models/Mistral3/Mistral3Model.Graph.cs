@@ -8,6 +8,8 @@ using System;
 
 using TensorSharp.GGML;
 
+using TensorSharp.Graph;
+
 namespace TensorSharp.Models
 {
     public partial class Mistral3Model
@@ -31,7 +33,7 @@ namespace TensorSharp.Models
                 any |= MathF.Abs(scale[t] - 1.0f) >= 1e-7f;
             }
             if (any)
-                q = step.Op(GgmlGraphOp.Mul, q, step.InputF32(scale, 1, 1, positions.Length));
+                q = step.Op(GraphOp.Mul, q, step.InputF32(scale, 1, 1, positions.Length));
         }
     }
 }

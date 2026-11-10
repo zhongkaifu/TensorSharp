@@ -31,6 +31,11 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace tsg;
@@ -110,6 +115,8 @@ namespace
         std::size_t bytes;
         int role;
         bool uploaded;   // bound to compute memory: uploaded every run (and downloaded after, for STATE)
+        bool has_split = false;                        // tensor parallelism: how the leaf spreads over the ranks
+        ggml_backend_meta_split_state split{};
     };
 
     struct Output
@@ -119,8 +126,125 @@ namespace
         std::size_t bytes;
     };
 
+    // ---- tensor parallelism: a graph on ggml's meta device over several ranks (upstream's
+    // tensor-split mechanism). Weights and states live in meta buffers, spread by the split state
+    // the managed side gives each leaf (heads, channels, experts; mirrored otherwise); compute
+    // tensors take the meta backend's inferred states, and its collectives reduce partial sums.
+    struct TpGroup
+    {
+        std::vector<int> ranks;
+        ggml_backend_dev_t meta = nullptr;
+        ggml_backend_t backend = nullptr;
+    };
+
+    std::mutex g_tp_mu;
+    std::vector<std::unique_ptr<TpGroup>> g_tp_groups;
+
+    // Split states of meta-resident tensors, by tensor name (the meta buffer asks by tensor).
+    std::mutex g_split_mu;
+    std::unordered_map<std::string, ggml_backend_meta_split_state> g_splits;
+
+    ggml_backend_meta_split_state tp_split_cb(const ggml_tensor* t, void*)
+    {
+        ggml_backend_meta_split_state st;
+        std::memset(&st, 0, sizeof(st));
+        st.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        st.nr[0] = 1;
+        st.n_segments = 1;
+        std::lock_guard<std::mutex> lk(g_split_mu);
+        auto it = g_splits.find(t->name);
+        return it == g_splits.end() ? st : it->second;
+    }
+
+    TpGroup* tp_group(const int* ranks, int n)
+    {
+        std::lock_guard<std::mutex> lk(g_tp_mu);
+        for (const auto& grp : g_tp_groups)
+            if (static_cast<int>(grp->ranks.size()) == n && std::equal(grp->ranks.begin(), grp->ranks.end(), ranks))
+                return grp.get();
+        if (n < 2 || n > GGML_BACKEND_META_MAX_DEVICES)
+            throw std::runtime_error("graph builder: tensor parallelism spans 2 to 16 ranks");
+        auto grp = std::make_unique<TpGroup>();
+        ggml_backend_dev_t devs[GGML_BACKEND_META_MAX_DEVICES] = {};
+        int device_indices[GGML_BACKEND_META_MAX_DEVICES] = {};
+        for (int i = 0; i < n; i++)
+        {
+            ScopedRank scope(ranks[i]);
+            if (!ensure_backend() || g_backend == nullptr)
+                throw std::runtime_error("graph builder: a tensor-parallel rank has no backend");
+            devs[i] = ggml_backend_get_device(g_backend);
+            device_indices[i] = dev().device_index >= 0 ? dev().device_index : ranks[i];
+            grp->ranks.push_back(ranks[i]);
+        }
+#ifdef TSG_GGML_USE_CUDA
+        tp_cuda_prepare_collective(device_indices, n);   // before the meta backend creates its communicator
+#else
+        (void) device_indices;
+#endif
+        static std::mutex meta_mu;   // ggml's meta device cache is not thread-safe
+        std::lock_guard<std::mutex> meta_lk(meta_mu);
+        grp->meta = ggml_backend_meta_device(devs, static_cast<size_t>(n), tp_split_cb, nullptr);
+        grp->backend = grp->meta != nullptr ? ggml_backend_dev_init(grp->meta, nullptr) : nullptr;
+        if (grp->backend == nullptr)
+            throw std::runtime_error("graph builder: creating the tensor-parallel backend failed");
+        g_tp_groups.push_back(std::move(grp));
+        return g_tp_groups.back().get();
+    }
+
+    // A weight or state resident in a meta buffer, keyed by its host pointer; a graph's leaf is
+    // placed at the same address, so it aliases the resident slices on every rank.
+    struct MetaResident
+    {
+        ggml_context* ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        ggml_tensor* t = nullptr;
+        std::size_t bytes = 0;
+        ~MetaResident()
+        {
+            if (buf != nullptr) ggml_backend_buffer_free(buf);
+            if (ctx != nullptr) ggml_free(ctx);
+        }
+    };
+
+    std::mutex g_resident_mu;   // also serializes meta set_tensor (not thread-safe)
+    std::map<std::pair<TpGroup*, void*>, std::unique_ptr<MetaResident>> g_residents;
+
+    MetaResident* meta_resident(TpGroup* grp, const Leaf& leaf)
+    {
+        std::lock_guard<std::mutex> lk(g_resident_mu);
+        auto key = std::make_pair(grp, leaf.data);
+        auto it = g_residents.find(key);
+        if (it != g_residents.end())
+        {
+            if (it->second->bytes == leaf.bytes && ggml_are_same_shape(it->second->t, leaf.tensor) && it->second->t->type == leaf.tensor->type)
+                return it->second.get();
+            g_residents.erase(it);
+        }
+        auto r = std::make_unique<MetaResident>();
+        char name[GGML_MAX_NAME];
+        std::snprintf(name, sizeof(name), "tsgtp:%p:%d", leaf.data, leaf.has_split ? static_cast<int>(leaf.split.axis) : -1);
+        if (leaf.has_split)
+        {
+            std::lock_guard<std::mutex> slk(g_split_mu);
+            g_splits[name] = leaf.split;
+        }
+        ggml_init_params params{ ggml_tensor_overhead() * 2, nullptr, true };
+        r->ctx = ggml_init(params);
+        if (r->ctx == nullptr) throw std::runtime_error("graph builder: tensor-parallel context allocation failed");
+        r->t = ggml_new_tensor(r->ctx, leaf.tensor->type, GGML_MAX_DIMS, leaf.tensor->ne);
+        ggml_set_name(r->t, name);
+        r->buf = ggml_backend_alloc_ctx_tensors_from_buft(r->ctx, ggml_backend_dev_buffer_type(grp->meta));
+        if (r->buf == nullptr) throw std::runtime_error("graph builder: tensor-parallel weight allocation failed (out of device memory?)");
+        r->bytes = leaf.bytes;
+        ggml_backend_tensor_set(r->t, resolve_upload_source(leaf.data), 0, leaf.bytes);
+        MetaResident* raw = r.get();
+        g_residents[key] = std::move(r);
+        return raw;
+    }
+
     struct TsgGraph
     {
+        TpGroup* tp = nullptr;     // tensor parallelism: the meta device this graph runs on
         ggml_context* ctx = nullptr;
         ggml_cgraph* graph = nullptr;
         ggml_gallocr_t galloc = nullptr;
@@ -149,6 +273,8 @@ namespace
             if (ctx != nullptr) ggml_free(ctx);
         }
     };
+
+    ggml_backend_t graph_backend(const TsgGraph* g) { return g->tp != nullptr ? g->tp->backend : g_backend; }
 
     ggml_tensor* node_at(TsgGraph* g, int index)
     {
@@ -260,6 +386,15 @@ namespace
         case OP_FLASH_ATTN_EXT:
         {
             need(3);
+            if (g->tp != nullptr)
+            {
+                // Tensor parallelism: the explicit-ops fallback would pair query heads with KV heads
+                // split differently, which the meta device cannot run (build() refuses unsupported nodes).
+                ggml_tensor* fa = ggml_flash_attn_ext(ctx, src(0), src(1), src(2), src(3), fpar(0, 1.0f), fpar(1, 0.0f), fpar(2, 0.0f));
+                ggml_flash_attn_ext_set_prec(fa, static_cast<ggml_prec>(ipar(0, 0)));
+                if (src(4) != nullptr) ggml_flash_attn_ext_add_sinks(fa, src(4));
+                return fa;
+            }
             // srcs[4]: optional attention sinks.
             return flash_attn_ext_guarded(ctx, "graph builder", src(0), src(1), src(2), src(3),
                                           fpar(0, 1.0f), fpar(1, 0.0f), fpar(2, 0.0f), src(4),
@@ -308,11 +443,39 @@ namespace
         // Before allocation: reordering after lifetime planning would invalidate the alias plan.
         if (g->reorder) optimize_graph_for_metal(g->ctx, g->graph);
 
-        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (g->tp != nullptr)
+        {
+            // A node the ranks cannot run would fall back to the CPU and come back mirrored, which
+            // aborts the meta device mid-graph: refuse the graph instead (Muse Spark's tp_check_graph).
+            for (int i = 0; i < ggml_graph_n_nodes(g->graph); i++)
+            {
+                ggml_tensor* node = ggml_graph_node(g->graph, i);
+                if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE
+                    || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) continue;
+                if (ggml_nelements(node) == 0 || node->op == GGML_OP_ARANGE || !ggml_backend_supports_op(g->tp->backend, node))
+                {
+                    char why[256];
+                    std::snprintf(why, sizeof(why), "graph builder: %s [%lld, %lld, %lld, %lld] cannot run on the tensor-parallel devices",
+                                  ggml_op_desc(node), (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3]);
+                    throw std::runtime_error(why);
+                }
+            }
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(graph_backend(g));
         for (Leaf& leaf : g->leaves)
         {
             leaf.uploaded = true;
             if (leaf.role == LEAF_INPUT || leaf.data == nullptr) continue;
+            if (g->tp != nullptr)
+            {
+                // Weights and states are resident in meta buffers (uploaded once, spread by their split).
+                MetaResident* r = meta_resident(g->tp, leaf);
+                ggml_set_name(leaf.tensor, r->t->name);
+                if (ggml_backend_tensor_alloc(r->buf, leaf.tensor, r->t->data) != GGML_STATUS_SUCCESS)
+                    throw std::runtime_error("graph builder: binding a tensor-parallel leaf failed");
+                leaf.uploaded = false;
+                continue;
+            }
             const auto usage = leaf.role == LEAF_STATE ? GGML_BACKEND_BUFFER_USAGE_COMPUTE : GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
             // Weights live as long as the model, so even a small one (a norm, a per-head gate
             // constant) keeps a device copy: in compute memory it would be uploaded every run, a
@@ -359,12 +522,12 @@ namespace
         // A one-shot graph borrows the backend's persistent, reused compute allocator (the
         // memory the fused graphs share, grown on demand); a graph that will be replayed keeps
         // its own, so no other graph can reuse its intermediates between runs.
-        if (!g->replayable && alloc_graph_reuse_gallocr(g->graph))
+        if (g->tp == nullptr && !g->replayable && alloc_graph_reuse_gallocr(g->graph))
         {
             g->built = true;
             return true;
         }
-        g->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+        g->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(graph_backend(g)));
         if (g->galloc == nullptr || !ggml_gallocr_alloc_graph(g->galloc, g->graph))
         {
             set_last_error("graph builder: failed to allocate the graph's compute memory.");
@@ -378,6 +541,72 @@ namespace
         g->replayable = true;
         g->built = true;
         return true;
+    }
+}
+
+// A graph over `nranks` ranks with tensor parallelism (ggml's meta device): leaves given a split
+// (TSGgml_GraphLeafSplit) spread over the ranks, the rest are mirrored.
+TSG_EXPORT void* TSGgml_GraphCreateTp(int max_nodes, int replayable, const int* ranks, int nranks)
+{
+    try
+    {
+        if (ranks == nullptr || nranks < 2) throw std::runtime_error("graph builder: tensor parallelism needs 2 or more ranks");
+        TpGroup* grp = tp_group(ranks, nranks);
+        if (max_nodes < 16) max_nodes = 16;
+        auto* g = new TsgGraph();
+        g->tp = grp;
+        g->rank = ranks[0];
+        g->max_nodes = max_nodes;
+        g->replayable = replayable != 0;
+        ggml_init_params params{};
+        params.mem_size = ggml_tensor_overhead() * static_cast<std::size_t>(max_nodes) * 2
+                          + ggml_graph_overhead_custom(static_cast<std::size_t>(max_nodes), false);
+        params.no_alloc = true;
+        g->ctx = ggml_init(params);
+        if (g->ctx == nullptr)
+        {
+            delete g;
+            set_last_error("graph builder: ggml_init failed.");
+            return nullptr;
+        }
+        return g;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return nullptr;
+    }
+}
+
+// How leaf `node` spreads over a tensor-parallel graph's ranks: split along `axis` (0-3) with
+// `ne` = per (segment, rank) extents, segment s repeating nr[s] times (ggml_backend_meta_split_state).
+TSG_EXPORT int TSGgml_GraphLeafSplit(void* handle, int node, int axis, const std::int64_t* ne, int nne,
+                                     const std::uint32_t* nr, int nsegments)
+{
+    auto* g = static_cast<TsgGraph*>(handle);
+    try
+    {
+        if (g == nullptr || g->tp == nullptr || g->built) throw std::runtime_error("graph builder: a split needs an unbuilt tensor-parallel graph");
+        if (axis < 0 || axis >= GGML_MAX_DIMS || nsegments < 1 || nsegments > 16 || nne != nsegments * static_cast<int>(g->tp->ranks.size()))
+            throw std::runtime_error("graph builder: bad leaf split");
+        ggml_tensor* t = node_at(g, node);
+        for (Leaf& leaf : g->leaves)
+        {
+            if (leaf.tensor != t) continue;
+            std::memset(&leaf.split, 0, sizeof(leaf.split));
+            leaf.split.axis = static_cast<ggml_backend_meta_split_axis>(axis);
+            for (int i = 0; i < nne; i++) leaf.split.ne[i] = ne[i];
+            for (int s2 = 0; s2 < nsegments; s2++) leaf.split.nr[s2] = nr != nullptr ? nr[s2] : 1;
+            leaf.split.n_segments = static_cast<std::uint32_t>(nsegments);
+            leaf.has_split = true;
+            return 1;
+        }
+        throw std::runtime_error("graph builder: a split names a node that is not a leaf");
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
     }
 }
 
@@ -564,28 +793,28 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
         ggml_status status;
         if (graph_node_profile_enabled())
         {
-            status = graph_compute_profiled(g_backend, g->graph, g->replayable ? "graph builder decode" : "graph builder prefill");
+            status = graph_compute_profiled(graph_backend(g), g->graph, g->replayable ? "graph builder decode" : "graph builder prefill");
         }
         else
         {
             const std::uint64_t errors_before = g_ggml_error_count.load(std::memory_order_acquire);
-            status = ggml_backend_graph_compute_async(g_backend, g->graph);
+            status = ggml_backend_graph_compute_async(graph_backend(g), g->graph);
             if (g_ggml_error_count.load(std::memory_order_acquire) != errors_before)
                 g_backend_compute_failed.store(true, std::memory_order_release);
         }
         if (status != GGML_STATUS_SUCCESS)
         {
-            sync_backend(g_backend);
+            sync_backend(graph_backend(g));
             set_last_error("graph builder: backend graph execution failed.");
             return 0;
         }
         for (const Output& o : g->outputs)
             if (o.data != nullptr)
-                ggml_backend_tensor_get_async(g_backend, o.tensor, o.data, 0, o.bytes);
+                ggml_backend_tensor_get_async(graph_backend(g), o.tensor, o.data, 0, o.bytes);
         for (const Leaf& leaf : g->leaves)
             if (leaf.role == LEAF_STATE && leaf.uploaded && leaf.data != nullptr && leaf.tensor->buffer != nullptr)
-                ggml_backend_tensor_get_async(g_backend, leaf.tensor, leaf.data, 0, leaf.bytes);
-        sync_backend(g_backend);
+                ggml_backend_tensor_get_async(graph_backend(g), leaf.tensor, leaf.data, 0, leaf.bytes);
+        sync_backend(graph_backend(g));
         clear_last_error();
         return 1;
     }
@@ -624,5 +853,32 @@ TSG_EXPORT int TSGgml_GraphAlias(void* handle, int node, int base, std::int64_t 
     {
         set_last_error(ex.what());
         return 0;
+    }
+}
+
+namespace tsg_graphtp
+{
+    // The host bytes behind `ptr` changed (or are being freed): drop its meta residents (graphs
+    // bound to them are dropped by the managed side first).
+    void on_drop(void* ptr)
+    {
+        std::lock_guard<std::mutex> lk(g_resident_mu);
+        for (auto it = g_residents.begin(); it != g_residents.end();)
+            it = it->first.second == ptr ? g_residents.erase(it) : std::next(it);
+    }
+
+    // Gather a meta-resident state back into its host bytes; false when `ptr` has none.
+    bool sync_to_host(void* ptr, std::size_t size)
+    {
+        std::lock_guard<std::mutex> lk(g_resident_mu);
+        bool any = false;
+        for (auto& [key, r] : g_residents)
+        {
+            if (key.second != ptr) continue;
+            ggml_backend_synchronize(key.first->backend);
+            ggml_backend_tensor_get(r->t, ptr, 0, std::min(size, r->bytes));
+            any = true;
+        }
+        return any;
     }
 }

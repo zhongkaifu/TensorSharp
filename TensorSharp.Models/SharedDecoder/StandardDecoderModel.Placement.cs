@@ -24,6 +24,22 @@ namespace TensorSharp.Models
         private void BuildMesh(string executionIdentity)
         {
             int stages = _requestedStages, tp = _requestedTensorParallel;
+            if (tp > 1 && stages == 1 && LayerSplitGroup == null && _tpGroup is GgmlTensorParallelGroup && GraphTensorParallelism)
+            {
+                // Tensor parallelism as whole-forward graphs on ggml's meta device: the model is laid
+                // out as on one device (global heads, unsharded weights), and each graph's weight and
+                // state leaves are spread over the ranks by their split (GraphWeightSplit).
+                ValidateShardable(tp);
+                _graphTpRanks = Enumerable.Range(0, tp).ToArray();
+                _shardDegree = 1;
+                _shardRankOffset = 0;
+                _localHeads = Config.NumHeads;
+                _localKvHeads = Config.NumKVHeads;
+                IAllocator rank0 = _tpGroup.GetAllocator(0);
+                _mesh = new DeviceMesh(1, 1, _ => rank0, null, null);
+                Console.WriteLine($"  Tensor parallelism: whole-forward graphs over {tp} GPUs (ggml's meta device).");
+                return;
+            }
             // A distributed TP group shards by its GLOBAL degree; a stage group by its own.
             int shardDegree = tp == 1 ? 1 : stages == 1 ? GlobalTpDegree : tp;
             _shardDegree = shardDegree;
@@ -60,6 +76,20 @@ namespace TensorSharp.Models
                 _mesh = new DeviceMesh(1, 1, _ => _allocator, null, null);
             }
         }
+
+        /// <summary>Ranks of tensor-parallel graphs (ggml's meta device), or null.</summary>
+        private int[] _graphTpRanks;
+
+        /// <summary>
+        /// Tensor parallelism runs as whole-forward graphs on ggml's meta device: the family lowers
+        /// (rotary, mixers) and no layer keeps its experts on the host; recurrent stacks wait for
+        /// their state splits. Opt-in (TS_GRAPH_TENSOR_PARALLEL=1) until validated on GPUs with peer
+        /// access: on MIG slices without it (the 2026-11-10 lab VM) the meta device's internal
+        /// all-reduce faults in flash attention or hangs, and --tp keeps the per-op path.
+        /// </summary>
+        private bool GraphTensorParallelism
+            => GraphRotary != null && !_anyRecurrent && !MoeCpuOffloadConfig.IsEnabled
+               && Environment.GetEnvironmentVariable("TS_GRAPH_TENSOR_PARALLEL") == "1";
 
         private void ValidateShardable(int degree)
         {
@@ -187,6 +217,8 @@ namespace TensorSharp.Models
 
         private void PrepareResidency()
         {
+            // Tensor-parallel graphs upload each weight's slices to the meta device on first use.
+            if (_graphTpRanks != null) return;
             if (_mesh.TensorParallel == 1)
             {
                 // One device, or whole layers: the single-device preload places each weight on

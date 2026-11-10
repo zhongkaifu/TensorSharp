@@ -61,16 +61,16 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         return data;
     }
 
-    private string Fixture(string family) => (family switch
+    private string Fixture(string family, int keyLength = DenseDecoderSyntheticModelBuilder.HeadDim) => (family switch
     {
-        "mistral3" => new DenseDecoderSyntheticModelBuilder { Architecture = "mistral3", LayerCount = Layers },
+        "mistral3" => new DenseDecoderSyntheticModelBuilder { Architecture = "mistral3", LayerCount = Layers, KeyLength = keyLength },
         "hunyuan-dense" => new DenseDecoderSyntheticModelBuilder
         {
             Architecture = "hunyuan-dense", PreTokenizer = "hunyuan-dense", IncludeMistralControlTokens = false,
-            IncludeQkNorms = true, RopeBase = 10000f, LayerCount = Layers,
+            IncludeQkNorms = true, RopeBase = 10000f, LayerCount = Layers, KeyLength = keyLength,
         },
         _ => throw new ArgumentOutOfRangeException(nameof(family)),
-    }).Write(Path.Combine(_dir, family + ".gguf"));
+    }).Write(Path.Combine(_dir, $"{family}-{keyLength}.gguf"));
 
     private static ModelBase Create(string family, string path, int tp, int stages, BackendType backend = BackendType.Cpu)
     {
@@ -87,6 +87,38 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     /// reference: the pinned GGML backend (ggml_cpu by default; ggml_metal, ggml_cuda or
     /// ggml_vulkan in their lanes), so the runtime's backend fast paths (fused SwiGLU FFN,
     /// fused softmax, native paged attention) are covered wherever the suite runs.</summary>
+    /// <summary>Tensor parallelism over two GGML devices as whole-forward graphs on ggml's meta device:
+    /// the same logits as one device (partial sums reduce in another order), decode replays, and
+    /// speculation.</summary>
+    [GgmlTheory(BackendType.GgmlCuda, Devices = 2, Skip = "Tensor-parallel graphs are opt-in (TS_GRAPH_TENSOR_PARALLEL=1) until validated on " +
+        "GPUs with peer access; on MIG slices the meta device's all-reduce faults or hangs.")]
+    [MemberData(nameof(Families))]
+    public void TensorParallelGraphsMatchOneDevice(string family)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        // Head dim 64: ggml-cuda's flash attention has no kernel for the default 16, and a
+        // tensor-parallel graph refuses the explicit-ops fallback.
+        string path = Fixture(family, keyLength: 64);
+        List<float[]> single;
+        using (var one = Create(family, path, 1, 1, BackendType.GgmlCuda))
+            single = Script(one);
+        using ModelBase tp = CreateGgmlTensorParallel(family, path);
+        List<float[]> actual = Script(tp);
+        var sdm = Assert.IsAssignableFrom<StandardDecoderModel>(tp);
+        Assert.True(sdm.GraphRuns > 0 && sdm.GraphReplays > 0, $"{family}: tensor parallelism did not run as replayed graphs");
+        for (int i = 0; i < single.Count; i++)
+            Assert.True(RelL2(actual[i], single[i]) <= 5e-3, $"{family} tp2 graphs row {i}: relL2 {RelL2(actual[i], single[i]):E2}");
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => CreateGgmlTensorParallel(family, path), $"{family} tp2", tieTolerance: 1e-2);
+    }
+
+    /// <summary>A GGML tensor-parallel group of two (the model builds it: no group is passed).</summary>
+    private static ModelBase CreateGgmlTensorParallel(string family, string path) => family switch
+    {
+        "mistral3" => new Mistral3Model(path, BackendType.GgmlCuda, 2, null, 1),
+        "hunyuan-dense" => new HunyuanDenseModel(path, BackendType.GgmlCuda, 2, null, 1),
+        _ => throw new ArgumentOutOfRangeException(nameof(family)),
+    };
+
     /// <summary>Two whole-layer stages on two GGML devices: one graph per stage, the same logits as one
     /// device, and speculation across the stages.</summary>
     [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
@@ -116,10 +148,17 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     [MemberData(nameof(Families))]
     public void MlxMatchesTheManagedReference(string family) => CompareBackend(family, BackendType.Mlx);
 
-    private void CompareBackend(string family, BackendType backend)
+    /// <summary>The same with 64-wide heads, which the backends' flash-attention kernels serve (the
+    /// default 16 runs attention as explicit ops on ggml_cuda).</summary>
+    [Theory]
+    [MemberData(nameof(Families))]
+    public void PinnedGgmlBackendFlashAttentionMatchesTheManagedReference(string family)
+        => CompareBackend(family, TestGates.PinnedGgmlBackend, keyLength: 64);
+
+    private void CompareBackend(string family, BackendType backend, int keyLength = DenseDecoderSyntheticModelBuilder.HeadDim)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
-        string path = Fixture(family);
+        string path = Fixture(family, keyLength);
         List<float[]> reference;
         using (var managed = Create(family, path, 1, 1))
             reference = Script(managed);

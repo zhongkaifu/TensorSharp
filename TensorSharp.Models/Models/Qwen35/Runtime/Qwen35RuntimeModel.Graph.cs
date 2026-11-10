@@ -7,6 +7,8 @@
 using System;
 using TensorSharp.GGML;
 
+using TensorSharp.Graph;
+
 namespace TensorSharp.Models
 {
     /// <summary>
@@ -23,13 +25,13 @@ namespace TensorSharp.Models
         protected override bool RecurrentMixerLowers => DeviceRecurrence && ShardDegree == 1;
 
         /// <summary>Qwen 3.5's fused decode measured +8% decode with ggml-metal's reordering (A3B).</summary>
-        protected override bool GraphReorderOnMetal => true;
+        protected override bool GraphConcurrencyReorder => true;
 
         /// <summary>ggml-metal's gated delta rule finishes reading a head's state before writing it, so a
         /// decode row may update the state in place (Qwen35Model's fused decode relies on the same);
         /// unified memory makes the backing and the state view the same bytes for every binding.
         /// Elsewhere the new state is copied.</summary>
-        private bool InPlaceRecurrentState => _backend == BackendType.GgmlMetal;
+        private bool InPlaceRecurrentState => GraphExecutor?.Capabilities.InPlaceStateAlias == true;
 
         protected override void EmitQueryKey(GraphStep step, int layer, ref int q, ref int k)
         {
@@ -37,12 +39,12 @@ namespace TensorSharp.Models
             k = step.Rope(step.RmsNorm(k, LayerName(layer, "attn_k_norm.weight")), _rotary);
         }
 
-        // Commit graphs replay per (verify buffer, kept, rows): only copies, no inputs.
-        private readonly System.Collections.Generic.Dictionary<(IntPtr, int, int), GgmlGraph> _commitGraphs = new();
+        // Commit programs replay per (verify buffer, kept, rows): only copies, no inputs.
+        private readonly System.Collections.Generic.Dictionary<(IntPtr, int, int), IGraphPlan> _commitGraphs = new();
 
         protected override void OnGraphCacheCleared()
         {
-            foreach (GgmlGraph g in _commitGraphs.Values) g.Dispose();
+            foreach (IGraphPlan g in _commitGraphs.Values) g.Dispose();
             _commitGraphs.Clear();
         }
 
@@ -69,13 +71,13 @@ namespace TensorSharp.Models
                 EnterGraphStage(stage);
                 try
                 {
-                    if (!_commitGraphs.TryGetValue((key, kept, rows), out GgmlGraph g))
+                    if (!_commitGraphs.TryGetValue((key, kept, rows), out IGraphPlan g))
                     {
-                        g = BuildCommitGraph(kept, rows, stage);
+                        g = GraphExecutor.Compile(BuildCommitProgram(kept, rows, stage));
                         _commitGraphs[(key, kept, rows)] = g;
                     }
                     if (!g.Run(ReadOnlySpan<int>.Empty, ReadOnlySpan<IntPtr>.Empty, ReadOnlySpan<long>.Empty))
-                        throw new InvalidOperationException($"{Config.Architecture} recurrent-state commit failed: {GgmlBasicOps.LastNativeError()}");
+                        throw new InvalidOperationException($"{Config.Architecture} recurrent-state commit failed: {g.LastError}");
                 }
                 finally
                 {
@@ -84,10 +86,10 @@ namespace TensorSharp.Models
             }
         }
 
-        private GgmlGraph BuildCommitGraph(int kept, int rows, int stage)
+        private GraphProgram BuildCommitProgram(int kept, int rows, int stage)
         {
             const long f = sizeof(float);
-            var g = new GgmlGraph(Math.Max(256, Config.NumLayers * 16), replayable: true);
+            var g = new GraphProgramBuilder(record: true);
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 if (!_isRecurrent[layer] || Mesh.StageOf(layer) != stage
@@ -98,22 +100,22 @@ namespace TensorSharp.Models
                 // Result layout [rows' outputs | state after the last row | state 1 row before | ...].
                 long offset = state.RowFloats * rows * f + (rows - kept) * stateBytes;
                 int verify = GraphLeaf(g, state.Verify, cap * (state.RowFloats + stateFloats));
-                int source = g.Op(GgmlGraphOp.View, stackalloc[] { verify }, stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, offset });
+                int source = g.Op(GraphOp.View, stackalloc[] { verify }, stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, offset });
                 int target = InPlaceRecurrentState
-                    ? g.Op(GgmlGraphOp.View, stackalloc[] { GraphLeaf(g, state.Backing, state.RowFloats + stateFloats) },
+                    ? g.Op(GraphOp.View, stackalloc[] { GraphLeaf(g, state.Backing, state.RowFloats + stateFloats) },
                         stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, state.RowFloats * f })
-                    : g.Op(GgmlGraphOp.Reshape, stackalloc[] { GraphLeaf(g, state.Ssm, _headKDim, _headVDim, _numVHeads) }, stackalloc long[] { stateFloats });
-                g.Effect(g.Op(GgmlGraphOp.Cpy, source, target));
+                    : g.Op(GraphOp.Reshape, stackalloc[] { GraphLeaf(g, state.Ssm, _headKDim, _headVDim, _numVHeads) }, stackalloc long[] { stateFloats });
+                g.Effect(g.Op(GraphOp.Cpy, source, target));
                 int hist = GraphLeaf(g, state.ConvHistory, convRows + cap, channels);
-                int window = g.Op(GgmlGraphOp.View, stackalloc[] { hist },
+                int window = g.Op(GraphOp.View, stackalloc[] { hist },
                     stackalloc long[] { 2, convRows, channels, 1, 1, (convRows + cap) * f, 0, 0, kept * f });
-                g.Effect(g.Op(GgmlGraphOp.Cpy, window, GraphLeaf(g, state.Conv, convRows, channels)));
+                g.Effect(g.Op(GraphOp.Cpy, window, GraphLeaf(g, state.Conv, convRows, channels)));
             }
-            return g;
+            return g.ToProgram(replayable: true, reorder: false);
         }
 
-        private static int GraphLeaf(GgmlGraph g, Tensor t, params long[] ne)
-            => g.Leaf(GgmlLeafRole.State, GgmlType.F32, ne, TensorComputePrimitives.GetStoragePointer(t), t.Storage.ByteLength);
+        private static int GraphLeaf(GraphProgramBuilder g, Tensor t, params long[] ne)
+            => g.Leaf(GraphLeafRole.State, GraphFormat.F32, ne, TensorComputePrimitives.GetStoragePointer(t), t.Storage.ByteLength);
 
         protected override int EmitRecurrentMixer(GraphStep step, int layer, int normed)
         {
@@ -179,20 +181,20 @@ namespace TensorSharp.Models
                     alphaRaw = step.Cont(step.View2(proj, vHeads, count, nb1, row0 + (channels + v + vHeads) * f));
                 }
 
-                int beta = step.Reshape(step.Op(GgmlGraphOp.Sigmoid, betaRaw), 1, vHeads, count, 1);
-                int g = step.Op(GgmlGraphOp.Mul, step.Op(GgmlGraphOp.Softplus, step.Op(GgmlGraphOp.Add, alphaRaw, dt)), a);
+                int beta = step.Reshape(step.Op(GraphOp.Sigmoid, betaRaw), 1, vHeads, count, 1);
+                int g = step.Op(GraphOp.Mul, step.Op(GraphOp.Softplus, step.Op(GraphOp.Add, alphaRaw, dt)), a);
                 g = step.Reshape(g, 1, vHeads, count, 1);
 
                 // The causal conv over [previous window | this chunk], and the new window.
-                int window = step.State(state.Conv, GgmlType.F32, convRows, channels);
+                int window = step.State(state.Conv, GraphFormat.F32, convRows, channels);
                 // ggml_concat writes a contiguous result, so it reads the transposed view directly.
-                int convIn = step.Op(GgmlGraphOp.Concat, stackalloc[] { window, step.Transpose(qkv) }, stackalloc long[] { 0 });
-                int conv = step.Op(GgmlGraphOp.Silu, step.Op(GgmlGraphOp.SsmConv, convIn, convW));   // [channels, count]
+                int convIn = step.Op(GraphOp.Concat, stackalloc[] { window, step.Transpose(qkv) }, stackalloc long[] { 0 });
+                int conv = step.Op(GraphOp.Silu, step.Op(GraphOp.SsmConv, convIn, convW));   // [channels, count]
                 // convIn is a fresh contiguous [convRows + count, channels]. A verify window leaves the
                 // live window alone: the commit sets it from the window's conv history.
                 bool keep = step.RecurrentSnapshots && count > 1;
                 if (!keep)
-                    step.Effect(step.Op(GgmlGraphOp.Cpy,
+                    step.Effect(step.Op(GraphOp.Cpy,
                         step.View2(convIn, convRows, channels, (convRows + count) * f, count * f), window));
 
                 // Q, K, V as [head, heads, tokens, 1] views of the conv output; where the backend reads
@@ -218,37 +220,37 @@ namespace TensorSharp.Models
                 int backing = -1, s4;
                 if (viaBacking)
                 {
-                    backing = step.State(state.Backing, GgmlType.F32, state.RowFloats + stateFloats);
+                    backing = step.State(state.Backing, GraphFormat.F32, state.RowFloats + stateFloats);
                     s4 = step.View4(backing, dk, dv, vHeads, 1, dk * f, dk * dv * f, stateFloats * f, state.RowFloats * f);
                 }
                 else
                 {
-                    s4 = step.Reshape(step.State(state.Ssm, GgmlType.F32, dk, dv, vHeads), dk, dv, vHeads, 1);
+                    s4 = step.Reshape(step.State(state.Ssm, GraphFormat.F32, dk, dv, vHeads), dk, dv, vHeads, 1);
                 }
                 // A verify window keeps the state after each of its rows: the recurrence writes its whole
                 // result into the request's verify buffer in place, the live state stays the one before the
                 // window, and the commit copies the accepted prefix's state into place.
                 long stateBytes = stateFloats * f;
-                int gdn = step.Op(GgmlGraphOp.GatedDeltaNet, stackalloc[] { q4, k4, v4, g, beta, s4 },
+                int gdn = step.Op(GraphOp.GatedDeltaNet, stackalloc[] { q4, k4, v4, g, beta, s4 },
                     stackalloc long[] { keep ? count : 1 });
                 int scores = step.View2(gdn, v, count, v * f, 0);
-                int newState = step.Op(GgmlGraphOp.View, stackalloc[] { gdn },
+                int newState = step.Op(GraphOp.View, stackalloc[] { gdn },
                     stackalloc long[] { 4, dk, dv, vHeads, 1, dk * f, dk * dv * f, dk * dv * vHeads * f, v * count * f });
                 if (keep)
                 {
                     if (state.EnsureSpecBuffers(count)) NoteGraphBindingsChanged();
                     int cap = state.SnapshotCapacity;
-                    int verify = step.State(state.Verify, GgmlType.F32, cap * (state.RowFloats + stateFloats));
+                    int verify = step.State(state.Verify, GraphFormat.F32, cap * (state.RowFloats + stateFloats));
                     long total = v * count + stateFloats * count;
-                    int fallback = step.Op(GgmlGraphOp.Cpy, step.View2(gdn, total, 1, total * f, 0), step.View2(verify, total, 1, total * f, 0));
+                    int fallback = step.Op(GraphOp.Cpy, step.View2(gdn, total, 1, total * f, 0), step.View2(verify, total, 1, total * f, 0));
                     step.Alias(gdn, verify, 0, fallback);
-                    int hist = step.State(state.ConvHistory, GgmlType.F32, convRows + cap, channels);
-                    step.Effect(step.Op(GgmlGraphOp.Cpy, convIn,
+                    int hist = step.State(state.ConvHistory, GraphFormat.F32, convRows + cap, channels);
+                    step.Effect(step.Op(GraphOp.Cpy, convIn,
                         step.View2(hist, convRows + count, channels, (convRows + cap) * f, 0)));
                 }
                 else
                 {
-                    int copy = step.Op(GgmlGraphOp.Cpy, newState, s4);
+                    int copy = step.Op(GraphOp.Cpy, newState, s4);
                     if (viaBacking && count == 1)
                         // [outputs | state] of one row is exactly the backing: the recurrence updates the
                         // state in place, as Qwen35Model's fused decode does on Metal.
@@ -258,9 +260,9 @@ namespace TensorSharp.Models
                 }
 
                 int normedOut = step.RmsNorm(step.Reshape(step.Cont(scores), dv, vHeads, count), ssmNorm, eps);
-                int gated = step.Op(GgmlGraphOp.Mul, normedOut, step.Op(GgmlGraphOp.Silu, step.Reshape(z, dv, vHeads, count)));
+                int gated = step.Op(GraphOp.Mul, normedOut, step.Op(GraphOp.Silu, step.Reshape(z, dv, vHeads, count)));
                 int part = step.Reshape(gated, v, count);
-                output = output < 0 ? part : step.Op(GgmlGraphOp.Concat, stackalloc[] { output, part }, stackalloc long[] { 1 });
+                output = output < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { output, part }, stackalloc long[] { 1 });
             }
             return step.MatMul(LayerName(layer, "ssm_out.weight"), output);
         }

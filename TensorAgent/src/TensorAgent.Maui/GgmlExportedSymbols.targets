@@ -209,10 +209,12 @@
     <ReferenceNativeSymbol Include="TSGgml_GptOssSyncKvCacheToHost" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphAlias" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphCreate" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphCreateTp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphEffect" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphFree" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphLeaf" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphLeafIsResident" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphLeafSplit" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphOp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphOutput" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphRun" SymbolType="Function" />

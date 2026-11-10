@@ -8,6 +8,8 @@ using System;
 
 using TensorSharp.GGML;
 
+using TensorSharp.Graph;
+
 namespace TensorSharp.Models
 {
     /// <summary>
@@ -137,13 +139,13 @@ namespace TensorSharp.Models
             for (int i = 0; i < rows; i++) positions[i] = step.Starts[0] + i + step.Slots[0].RopeDelta;
             step.SetPositions(positions);
             int x = step.MatMul(LayerName(n, "nextn.eh_proj.weight"),
-                step.Op(GgmlGraphOp.Concat, stackalloc[] { e, h }, stackalloc long[] { 0 }));
-            x = step.Op(GgmlGraphOp.Add, x, EmitAttention(step, n, step.RmsNorm(x, LayerName(n, "attn_norm.weight"))));
+                step.Op(GraphOp.Concat, stackalloc[] { e, h }, stackalloc long[] { 0 }));
+            x = step.Op(GraphOp.Add, x, EmitAttention(step, n, step.RmsNorm(x, LayerName(n, "attn_norm.weight"))));
             // A catch-up only needs the layer's K/V rows (written as effects): the graph holds what
             // feeds an output or an effect, so its attention output and FFN are never computed.
             if (!wantLogits) return outputs;
             int ffnIn = step.RmsNorm(x, FfnNormWeight(n));
-            x = step.Op(GgmlGraphOp.Add, x, _moeLayer[n] ? EmitMoe(step, n, ffnIn) : EmitDenseFfn(step, n, ffnIn));
+            x = step.Op(GraphOp.Add, x, _moeLayer[n] ? EmitMoe(step, n, ffnIn) : EmitDenseFfn(step, n, ffnIn));
             string headNorm = HasWeight(LayerName(n, "nextn.shared_head_norm.weight"))
                 ? LayerName(n, "nextn.shared_head_norm.weight") : "output_norm.weight";
             int last = rows == 1 ? x : step.View2(x, hiddenSize, 1, hiddenSize * 4L, (rows - 1) * hiddenSize * 4L);

@@ -61,6 +61,29 @@ namespace TensorSharp.GGML
                 throw new InvalidOperationException("ggml graph creation failed: " + GgmlBasicOps.LastNativeError());
         }
 
+        /// <summary>A graph over <paramref name="ranks"/> with tensor parallelism (ggml's meta device):
+        /// leaves given a split (<see cref="Split"/>) spread over the ranks, the rest are mirrored.</summary>
+        public unsafe GgmlGraph(int maxNodes, bool replayable, ReadOnlySpan<int> ranks)
+        {
+            fixed (int* pr = ranks)
+                _handle = GgmlNative.TSGgml_GraphCreateTp(maxNodes, replayable ? 1 : 0, pr, ranks.Length);
+            if (_handle == IntPtr.Zero)
+                throw new InvalidOperationException("ggml tensor-parallel graph creation failed: " + GgmlBasicOps.LastNativeError());
+            TensorParallelRanks = ranks.Length;
+        }
+
+        /// <summary>Ranks a tensor-parallel graph spans (0: one device).</summary>
+        public int TensorParallelRanks { get; }
+
+        /// <summary>Spread leaf <paramref name="node"/> along <paramref name="axis"/>: <paramref name="ne"/> holds
+        /// each (segment, rank)'s extent, segment s repeating <paramref name="nr"/>[s] times.</summary>
+        public unsafe void Split(int node, int axis, ReadOnlySpan<long> ne, ReadOnlySpan<uint> nr)
+        {
+            fixed (long* pne = ne)
+            fixed (uint* pnr = nr)
+                Check(GgmlNative.TSGgml_GraphLeafSplit(Handle, node, axis, pne, ne.Length, pnr, nr.Length), "split");
+        }
+
         public bool IsBuilt { get; private set; }
 
         /// <summary>Nodes emitted so far.</summary>
@@ -160,6 +183,14 @@ namespace TensorSharp.GGML
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static partial IntPtr TSGgml_GraphCreate(int maxNodes, int replayable, int reorder);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static unsafe partial IntPtr TSGgml_GraphCreateTp(int maxNodes, int replayable, int* ranks, int nranks);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static unsafe partial int TSGgml_GraphLeafSplit(IntPtr graph, int node, int axis, long* ne, int nne, uint* nr, int nsegments);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

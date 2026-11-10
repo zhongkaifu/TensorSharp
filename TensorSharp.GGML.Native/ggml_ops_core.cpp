@@ -4029,6 +4029,12 @@ TSG_EXPORT int TSGgml_DeviceMemoryInfo(int64_t* free_bytes, int64_t* total_bytes
     return 1;
 }
 
+namespace tsg_graphtp
+{
+    void on_drop(void* ptr);
+    bool sync_to_host(void* ptr, std::size_t size);
+}
+
 TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
 {
     // The same host pointer can be resident on several ranks (a replicated
@@ -4052,6 +4058,7 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
     // are being freed) behind the kernels — its arena slot, if any, is stale.
     tsg_q35arena::on_drop(ptr);
     tsg_q4earena::on_drop(ptr);
+    tsg_graphtp::on_drop(ptr);
     // A mapped expert's address can be recycled by a subsequent model load.
     // Compact expert slots have their own allocations, so they must be dropped
     // even when the ordinary host-buffer cache had no copy of this pointer.
@@ -4097,7 +4104,7 @@ TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
 
 TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)
 {
-    bool any = false;
+    bool any = tsg_graphtp::sync_to_host(ptr, size);
     for (int r = 0; r < tsg::g_device_count.load(std::memory_order_acquire); ++r)
     {
         tsg::ScopedRank rank(r);
