@@ -3471,6 +3471,71 @@ namespace TensorSharp.GGML
                     rows, nUsed, (IntPtr)s, (IntPtr)w, (IntPtr)xp, (IntPtr)o) != 0;
         }
 
+        /// <summary>Test probe of Strata's prompt expert GEMM on the Metal tensor API (tsm::moe_mm_encode): one layer's
+        /// routes (<paramref name="ids"/>, <paramref name="weights"/>: nUsed a row) over stacked Q2_0 expert bytes, into
+        /// <paramref name="output"/> [rows, hidden]. False where the kernels do not run (no tensor API) or fail.</summary>
+        public static unsafe bool TsmMoeMmProbe(int hidden, int nFf, int nExpert, byte[] gate, byte[] up, byte[] down,
+            int rows, int nUsed, int[] ids, float[] weights, float[] x, float[] output)
+        {
+            fixed (byte* g = gate) fixed (byte* u = up) fixed (byte* d = down)
+            fixed (int* i = ids) fixed (float* w = weights) fixed (float* xp = x) fixed (float* o = output)
+                return GgmlNative.TSGgml_TsmMoeMmProbe(hidden, nFf, nExpert, (IntPtr)g, (IntPtr)u, (IntPtr)d,
+                    rows, nUsed, (IntPtr)i, (IntPtr)w, (IntPtr)xp, (IntPtr)o) != 0;
+        }
+
+        /// <summary>Test probe of the fused hyper-connection read on the Metal tensor API (tsm::hc_read_encode): rows of the
+        /// residual [rows, nEmbd * hc] through the norm, the down / injection GEMM and the up GEMM with the stream mix, on
+        /// weights in ggml's layout and types (<see cref="GgmlType"/> values F32, F16, BF16, Q8_0), into
+        /// <paramref name="mixed"/> [rows, nEmbd] and <paramref name="inject"/> [rows, hc]. False where the kernels do not
+        /// run (no tensor API) or fail.</summary>
+        public static unsafe bool TsmHcReadProbe(int nEmbd, int hc, int lr, int downType, byte[] wDown, int injectType,
+            byte[] wInject, int upType, byte[] wUp, float[] gamma, int rows, float[] res, float eps, float[] mixed, float[] inject)
+        {
+            fixed (byte* d = wDown) fixed (byte* i = wInject) fixed (byte* u = wUp) fixed (float* g = gamma)
+            fixed (float* r = res) fixed (float* m = mixed) fixed (float* j = inject)
+                return GgmlNative.TSGgml_TsmHcReadProbe(nEmbd, hc, lr, downType, (IntPtr)d, injectType, (IntPtr)i, upType,
+                    (IntPtr)u, (IntPtr)g, rows, (IntPtr)r, eps, (IntPtr)m, (IntPtr)j) != 0;
+        }
+
+        /// <summary>Test probe of a DFlash2 draft's tail on TensorSharp's Metal kernels (tsm::df_tail_run): the q5_K head
+        /// <paramref name="head"/> [vocab rows of hidden] over rows 1..gamma of <paramref name="h"/> [(gamma + 1) * hidden],
+        /// the top-16 of each row, and the selector lattice over the q4_K codebooks [vocab rows of rank] with
+        /// <paramref name="ph"/> [gamma * rank]. Writes <paramref name="cand"/> [gamma * 16], <paramref name="scores"/>
+        /// [16 + 256 * (gamma - 1)] and <paramref name="logits"/> [gamma * vocab]. False where the kernels do not run.</summary>
+        public static unsafe bool TsmDfTailProbe(int hidden, int vocab, int rank, int gamma, byte[] head, byte[] pred, byte[] succ,
+            float[] h, float[] ph, int anchor, float headScale, float predScale, float succScale, float logitScale, float softcap,
+            int[] cand, float[] scores, float[] logits)
+        {
+            fixed (byte* hd = head) fixed (byte* p = pred) fixed (byte* s = succ) fixed (float* x = h) fixed (float* q = ph)
+            fixed (int* c = cand) fixed (float* o = scores) fixed (float* l = logits)
+                return GgmlNative.TSGgml_TsmDfTailProbe(hidden, vocab, rank, gamma, (IntPtr)hd, (IntPtr)p, (IntPtr)s, (IntPtr)x,
+                    (IntPtr)q, anchor, headScale, predScale, succScale, logitScale, softcap, (IntPtr)c, (IntPtr)o, (IntPtr)l, 1) != 0;
+        }
+
+        /// <summary>Test hook: the DFlash2 draft tails that ran on TensorSharp's kernels (tsm::df_tail_run) in this process.
+        /// 0 off Apple's Metal builds.</summary>
+        public static long TsmDfTailCount()
+        {
+            try { return GgmlNative.TSGgml_TsmDfTailCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Test hook: the prompt hyper-connection reads that ran fused (tsm::hc_read_encode) in this process. 0 off
+        /// Apple's Metal builds.</summary>
+        public static long TsmHcReadCount()
+        {
+            try { return GgmlNative.TSGgml_TsmHcReadCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Test hook: the prompt expert layers that ran on Strata's grouped GEMM (tsm::moe_mm_encode) in this
+        /// process. 0 off Apple's Metal builds.</summary>
+        public static long TsmMoeMmCount()
+        {
+            try { return GgmlNative.TSGgml_TsmMoeMmCount(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         /// <summary>Test hook: the tiered seamed passes whose seams handed over on a shared event (tsm::seams_*) and ran
         /// to the end in this process. 0 off Apple's Metal builds.</summary>
         public static long TsmSeamPasses()
@@ -3566,6 +3631,14 @@ namespace TensorSharp.GGML
         public static long MoeStageBorrows()
         {
             try { return GgmlNative.TSGgml_MoeStageBorrows(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>Prompt-width offloaded layers whose experts ran on Strata's grouped GEMM at the seam, reading and writing
+        /// the span graph's own tensors (process total; 0 off Metal).</summary>
+        public static long MoeMmSeamLayers()
+        {
+            try { return GgmlNative.TSGgml_MoeMmSeamLayers(); }
             catch (EntryPointNotFoundException) { return 0; }
         }
 

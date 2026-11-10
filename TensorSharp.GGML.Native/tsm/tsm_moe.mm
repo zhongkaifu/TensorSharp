@@ -24,6 +24,7 @@
 
 #include "tsm_moe_source.inc"
 #include "tsm_mpp_source.inc"
+#include "tsm_moe_mm_source.inc"
 
 namespace
 {
@@ -75,6 +76,23 @@ namespace
         id<MTLLibrary> library_mpp = nil;
         int mpp_state = 0;
         std::map<std::string, id<MTLComputePipelineState>> pipelines_mpp;
+        // The prompt expert GEMM library (tsm_moe_mm_source.inc: quant.metal + Strata's moe_mm, language 4.0) and
+        // moe_mm_encode's plan and scratch.
+        id<MTLLibrary> library_mm = nil;
+        int mm_state = 0;
+        std::map<std::string, id<MTLComputePipelineState>> pipelines_mm;
+        // hc_read_encode's scratch: xn in fp16, the down GEMM's output, silu(down) in fp16, the fp16 weights
+        id<MTLBuffer> hr_xnh = nil, hr_v = nil, hr_lo = nil, hr_wd = nil, hr_wu = nil;
+        std::size_t hr_xnh_bytes = 0, hr_v_bytes = 0, hr_lo_bytes = 0, hr_wd_bytes = 0, hr_wu_bytes = 0;
+        // df_tail_run's scratch: the head's operand in fp16 and its sub-block sums, the logits, the top-k partials, the
+        // candidates and the lattice
+        id<MTLBuffer> df_xh = nil, df_xs = nil, df_logits = nil, df_cval = nil, df_cidx = nil, df_tok = nil, df_out = nil;
+        std::size_t df_xh_bytes = 0, df_xs_bytes = 0, df_logits_bytes = 0, df_cval_bytes = 0, df_cidx_bytes = 0,
+            df_tok_bytes = 0, df_out_bytes = 0;
+        id<MTLBuffer> mm_bcnt = nil, mm_boff = nil, mm_eoff = nil, mm_tiles = nil, mm_meta = nil, mm_stok = nil,
+            mm_sw = nil, mm_pos = nil, mm_xs = nil, mm_hs = nil, mm_ye = nil;
+        std::size_t mm_bcnt_bytes = 0, mm_boff_bytes = 0, mm_eoff_bytes = 0, mm_tiles_bytes = 0, mm_meta_bytes = 0,
+            mm_stok_bytes = 0, mm_sw_bytes = 0, mm_pos_bytes = 0, mm_xs_bytes = 0, mm_hs_bytes = 0, mm_ye_bytes = 0;
     };
     State& state() { static State s; return s; }
 
@@ -118,6 +136,13 @@ namespace
         s.library_mpp = nil;
         s.mpp_state = 0;
         s.pipelines_mpp.clear();
+        s.library_mm = nil;
+        s.mm_state = 0;
+        s.pipelines_mm.clear();
+        s.mm_bcnt = s.mm_boff = s.mm_eoff = s.mm_tiles = s.mm_meta = s.mm_stok = s.mm_sw = s.mm_pos = nil;
+        s.mm_xs = s.mm_hs = s.mm_ye = nil;
+        s.mm_bcnt_bytes = s.mm_boff_bytes = s.mm_eoff_bytes = s.mm_tiles_bytes = s.mm_meta_bytes = 0;
+        s.mm_stok_bytes = s.mm_sw_bytes = s.mm_pos_bytes = s.mm_xs_bytes = s.mm_hs_bytes = s.mm_ye_bytes = 0;
         MTLCompileOptions* options = [MTLCompileOptions new];
         // Safe math, as Strata compiles them: no reassociation, so a row's sums do not depend on the window around it.
         if (@available(macOS 15.0, iOS 18.0, *)) options.mathMode = MTLMathModeSafe;
@@ -178,6 +203,48 @@ namespace
         if (p == nil)
             throw std::runtime_error("tsm: pipeline " + name + ": " + (error ? error.localizedDescription.UTF8String : "?"));
         s.pipelines_mpp[name] = p;
+        return p;
+    }
+
+    // The prompt expert GEMM library, compiled on first use where the tensor API runs (mpp_available decides that).
+    bool mm_library(State& s, id<MTLDevice> device)
+    {
+        if (s.mm_state != 0) return s.mm_state > 0;
+        s.mm_state = -1;
+        if (!mpp_available(s, device)) return false;
+        MTLCompileOptions* options = [MTLCompileOptions new];
+        options.languageVersion = (MTLLanguageVersion)(4 << 16);
+        if (@available(macOS 15.0, iOS 18.0, *)) options.mathMode = MTLMathModeSafe;
+        NSError* error = nil;
+        id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:kTsmMoeMmSource]
+                                                      options:options error:&error];
+        if (library == nil)
+        {
+            std::fprintf(stderr, "[tsm] the prompt expert GEMM does not compile: %s\n",
+                error ? error.localizedDescription.UTF8String : "?");
+            return false;
+        }
+        s.library_mm = library;
+        s.mm_state = 1;
+        return true;
+    }
+
+    id<MTLComputePipelineState> pipeline_mm(State& s, const std::string& name)
+    {
+        auto it = s.pipelines_mm.find(name);
+        if (it != s.pipelines_mm.end()) return it->second;
+        NSError* error = nil;
+        MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
+        bool ctab = true;   // QUANT_CTAB (23), as the expert kernels above
+        [values setConstantValue:&ctab type:MTLDataTypeBool atIndex:23];
+        id<MTLFunction> f = [s.library_mm newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]
+                                               constantValues:values error:&error];
+        if (f == nil)
+            throw std::runtime_error("tsm: no prompt expert kernel " + name + (error ? std::string(": ") + error.localizedDescription.UTF8String : ""));
+        id<MTLComputePipelineState> p = [s.device newComputePipelineStateWithFunction:f error:&error];
+        if (p == nil)
+            throw std::runtime_error("tsm: pipeline " + name + ": " + (error ? error.localizedDescription.UTF8String : "?"));
+        s.pipelines_mm[name] = p;
         return p;
     }
 
@@ -1211,11 +1278,835 @@ kernel void tsm_keepalive(device atomic_uint* c [[buffer(0)]], constant uint& n 
     }
 
     long long qsa_attn_count() { return g_qsa_attn_count.load(std::memory_order_relaxed); }
+
+    // ---- the prompt expert GEMM (Strata's moe_mm: tsm/kernels/tsm_moe_mm.metal) ---------------------------------
+    namespace
+    {
+        std::atomic<long long> g_moe_mm_count{0};
+        constexpr int kMmTm = 16;   // the plan's tile height (rows of one expert)
+        struct MmPlanArgs { std::uint32_t n_ent, topk, n_expert, tm, n_blocks; };
+        struct MmArgs
+        {
+            std::uint64_t gate_off, up_off, down_off, gu_stride, d_stride;
+            std::uint32_t gu_row, d_row, n_embd, n_ff;
+        };
+        static_assert(sizeof(MmArgs) == 56, "MmArgs must match tsm_moe_mm.metal");
+    }
+
+    bool moe_mm_enabled()
+    {
+        const char* e = std::getenv("TS_METAL_MOE_MM");
+        return !(e != nullptr && e[0] == '0');
+    }
+
+    bool moe_mm_supported(ggml_backend* backend, int gate_type, int up_type, int down_type, int hidden, int n_ff,
+                          int n_expert, int n_used)
+    {
+        if (!moe_mm_enabled()) return false;
+        ggml_metal_device_t dev = metal_device(backend);
+        if (dev == nullptr) return false;
+        // The instantiated tiles: Q2_0 everywhere; gate/up 128 n_ff rows a threadgroup, down 128 n_embd rows; K in
+        // chunks of 32; the plan's scan runs one thread an expert in one threadgroup.
+        if (gate_type != 42 || up_type != 42 || down_type != 42) return false;
+        if (hidden <= 0 || n_ff <= 0 || hidden % 128 != 0 || n_ff % 128 != 0) return false;
+        if (n_expert <= 0 || n_expert > 1024 || n_used <= 0) return false;
+        try
+        {
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+            ensure_library(s, device);
+            return mm_library(s, device);
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+    }
+
+    bool moe_mm_encode(ggml_backend* backend, const ggml_tensor* x, const ggml_tensor* ids, const ggml_tensor* wts,
+                       const ggml_tensor* gate, const ggml_tensor* up, const ggml_tensor* down, ggml_tensor* out,
+                       int T, int hidden, int n_ff, int n_expert, int n_used, bool wait)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm moe mm: not a Metal backend");
+            const std::int64_t t = T;
+            require_type(x, GGML_TYPE_F32, hidden * t, "x");
+            require_type(out, GGML_TYPE_F32, hidden * t, "out");
+            require_type(ids, GGML_TYPE_I32, n_used * t, "ids");
+            require_type(wts, GGML_TYPE_F32, n_used * t, "weights");
+            for (const ggml_tensor* w : {gate, up, down})
+                if (w == nullptr || w->type != GGML_TYPE_Q2_0 || w->ne[2] != n_expert || !ggml_is_contiguous(w))
+                    throw std::runtime_error("tsm moe mm: the experts are not contiguous Q2_0 stacks");
+            if (gate->ne[0] != hidden || gate->ne[1] != n_ff || up->ne[0] != hidden || up->ne[1] != n_ff
+                || down->ne[0] != n_ff || down->ne[1] != hidden)
+                throw std::runtime_error("tsm moe mm: expert shapes");
+            const ggml_metal_buffer_id gi = tensor_id(gate), ui = tensor_id(up), di = tensor_id(down);
+            // Strata's kernels address gate, up and down from one buffer: base + offset + expert * stride.
+            if (gi.metal != ui.metal || gi.metal != di.metal)
+                throw std::runtime_error("tsm moe mm: the expert stacks are in different buffers");
+            const std::size_t base = std::min({gi.offs, ui.offs, di.offs});
+            MmArgs ma{};
+            ma.gate_off = gi.offs - base; ma.up_off = ui.offs - base; ma.down_off = di.offs - base;
+            ma.gu_row = static_cast<std::uint32_t>(row_bytes(GGML_TYPE_Q2_0, hidden));
+            ma.d_row = static_cast<std::uint32_t>(row_bytes(GGML_TYPE_Q2_0, n_ff));
+            ma.gu_stride = static_cast<std::uint64_t>(ma.gu_row) * n_ff;
+            ma.d_stride = static_cast<std::uint64_t>(ma.d_row) * hidden;
+            ma.n_embd = static_cast<std::uint32_t>(hidden);
+            ma.n_ff = static_cast<std::uint32_t>(n_ff);
+            if (gate->nb[2] != ma.gu_stride || up->nb[2] != ma.gu_stride || down->nb[2] != ma.d_stride)
+                throw std::runtime_error("tsm moe mm: expert strides");
+            const std::uint32_t n_ent = static_cast<std::uint32_t>(n_used) * static_cast<std::uint32_t>(T);
+            const std::uint32_t n_blocks = (n_ent + 1023) / 1024;
+            const std::size_t max_rows = static_cast<std::size_t>(n_ent) + static_cast<std::size_t>(n_expert) * (kMmTm - 1);
+            const std::size_t max_tiles = (max_rows + kMmTm - 1) / kMmTm;
+            const MmPlanArgs pa{n_ent, static_cast<std::uint32_t>(n_used), static_cast<std::uint32_t>(n_expert),
+                static_cast<std::uint32_t>(kMmTm), n_blocks};
+            const ggml_metal_buffer_id xi = tensor_id(x), ii = tensor_id(ids), wi = tensor_id(wts), oi = tensor_id(out);
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                ensure_library(s, device);
+                if (!mm_library(s, device)) throw std::runtime_error("tsm moe mm: the tensor API does not run here");
+                const std::size_t blocks_bytes = static_cast<std::size_t>(n_blocks) * n_expert * sizeof(std::uint32_t);
+                s.mm_bcnt = grow(s, s.mm_bcnt, s.mm_bcnt_bytes, blocks_bytes);
+                s.mm_boff = grow(s, s.mm_boff, s.mm_boff_bytes, blocks_bytes);
+                s.mm_eoff = grow(s, s.mm_eoff, s.mm_eoff_bytes, static_cast<std::size_t>(n_expert) * sizeof(std::uint32_t));
+                s.mm_tiles = grow(s, s.mm_tiles, s.mm_tiles_bytes, max_tiles * 2 * sizeof(std::int32_t));
+                s.mm_stok = grow(s, s.mm_stok, s.mm_stok_bytes, max_rows * sizeof(std::int32_t));
+                s.mm_sw = grow(s, s.mm_sw, s.mm_sw_bytes, max_rows * sizeof(float));
+                s.mm_pos = grow(s, s.mm_pos, s.mm_pos_bytes, static_cast<std::size_t>(n_ent) * sizeof(std::int32_t));
+                s.mm_xs = grow(s, s.mm_xs, s.mm_xs_bytes, max_rows * hidden * sizeof(std::uint16_t));
+                s.mm_hs = grow(s, s.mm_hs, s.mm_hs_bytes, max_rows * n_ff * sizeof(std::uint16_t));
+                s.mm_ye = grow(s, s.mm_ye, s.mm_ye_bytes, max_rows * hidden * sizeof(float));
+                if (s.mm_meta == nil)
+                    s.mm_meta = grow(s, s.mm_meta, s.mm_meta_bytes, 16 * sizeof(std::uint32_t));
+                // The GEMMs' grid widths, which the scan leaves to the host (it writes their heights and the gather's).
+                auto* meta = static_cast<std::uint32_t*>([s.mm_meta contents]);
+                meta[2] = static_cast<std::uint32_t>(n_ff / (32 * 4));
+                meta[5] = static_cast<std::uint32_t>(hidden / (64 * 2));
+                id<MTLBuffer> W = (__bridge id<MTLBuffer>)gi.metal;
+                id<MTLCommandBuffer> cmd = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];   // serial: each pass reads the last
+                const std::uint32_t nclr = static_cast<std::uint32_t>(max_rows);
+                [enc setComputePipelineState:pipeline_mm(s, "mm_clear")];
+                [enc setBuffer:s.mm_stok offset:0 atIndex:0];
+                [enc setBytes:&nclr length:sizeof(nclr) atIndex:1];
+                [enc dispatchThreadgroups:MTLSizeMake((max_rows + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc setComputePipelineState:pipeline_mm(s, "mm_hist")];
+                bind(enc, ii, 0, 0);
+                [enc setBuffer:s.mm_bcnt offset:0 atIndex:1];
+                [enc setBytes:&pa length:sizeof(pa) atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(n_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+                [enc setComputePipelineState:pipeline_mm(s, "mm_scan")];
+                [enc setBuffer:s.mm_bcnt offset:0 atIndex:0];
+                [enc setBuffer:s.mm_boff offset:0 atIndex:1];
+                [enc setBuffer:s.mm_eoff offset:0 atIndex:2];
+                [enc setBuffer:s.mm_tiles offset:0 atIndex:3];
+                [enc setBuffer:s.mm_meta offset:0 atIndex:4];
+                [enc setBytes:&pa length:sizeof(pa) atIndex:5];
+                // whole simdgroups: each publishes its totals from lane 31 (threads past the experts count 0 rows)
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(static_cast<std::size_t>((n_expert + 31) / 32 * 32), 1, 1)];
+                [enc setComputePipelineState:pipeline_mm(s, "mm_place")];
+                bind(enc, ii, 0, 0);
+                bind(enc, wi, 0, 1);
+                [enc setBuffer:s.mm_boff offset:0 atIndex:2];
+                [enc setBuffer:s.mm_eoff offset:0 atIndex:3];
+                [enc setBuffer:s.mm_stok offset:0 atIndex:4];
+                [enc setBuffer:s.mm_sw offset:0 atIndex:5];
+                [enc setBuffer:s.mm_pos offset:0 atIndex:6];
+                [enc setBytes:&pa length:sizeof(pa) atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(n_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+                const std::uint32_t ne = static_cast<std::uint32_t>(hidden);
+                [enc setComputePipelineState:pipeline_mm(s, "mm_gather")];
+                bind(enc, xi, 0, 0);
+                [enc setBuffer:s.mm_stok offset:0 atIndex:1];
+                [enc setBuffer:s.mm_xs offset:0 atIndex:2];
+                [enc setBytes:&ne length:sizeof(ne) atIndex:3];
+                [enc dispatchThreadgroupsWithIndirectBuffer:s.mm_meta indirectBufferOffset:8 * sizeof(std::uint32_t)
+                                      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                // gate/up then down; buffers 5..8 (the SSD arena's slot map and chunks) are unused without its constant
+                [enc setComputePipelineState:pipeline_mm(s, "mm_gu3_42_16_32_32_4")];
+                [enc setBuffer:W offset:base atIndex:0];
+                [enc setBuffer:s.mm_xs offset:0 atIndex:1];
+                [enc setBuffer:s.mm_hs offset:0 atIndex:2];
+                [enc setBuffer:s.mm_tiles offset:0 atIndex:3];
+                [enc setBytes:&ma length:sizeof(ma) atIndex:4];
+                for (int b = 5; b <= 8; ++b) [enc setBuffer:W offset:base atIndex:b];
+                [enc dispatchThreadgroupsWithIndirectBuffer:s.mm_meta indirectBufferOffset:2 * sizeof(std::uint32_t)
+                                      threadsPerThreadgroup:MTLSizeMake(32 * 4, 1, 1)];
+                [enc setComputePipelineState:pipeline_mm(s, "mm_down3_42_16_64_32_2")];
+                [enc setBuffer:W offset:base atIndex:0];
+                [enc setBuffer:s.mm_hs offset:0 atIndex:1];
+                [enc setBuffer:s.mm_ye offset:0 atIndex:2];
+                [enc setBuffer:s.mm_tiles offset:0 atIndex:3];
+                [enc setBytes:&ma length:sizeof(ma) atIndex:4];
+                for (int b = 5; b <= 8; ++b) [enc setBuffer:W offset:base atIndex:b];
+                [enc dispatchThreadgroupsWithIndirectBuffer:s.mm_meta indirectBufferOffset:5 * sizeof(std::uint32_t)
+                                      threadsPerThreadgroup:MTLSizeMake(32 * 2, 1, 1)];
+                const std::uint32_t ca[4] = {static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(hidden),
+                    static_cast<std::uint32_t>(n_used), 0};
+                [enc setComputePipelineState:pipeline_mm(s, "mm_combine")];
+                [enc setBuffer:s.mm_ye offset:0 atIndex:0];
+                [enc setBuffer:s.mm_pos offset:0 atIndex:1];
+                [enc setBuffer:s.mm_sw offset:0 atIndex:2];
+                bind(enc, oi, 0, 3);
+                [enc setBytes:ca length:sizeof(ca) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake((static_cast<std::size_t>(T) * hidden + 255) / 256, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                [cmd commit];
+                s.last = cmd;
+                if (wait)
+                {
+                    [cmd waitUntilCompleted];
+                    if (cmd.status == MTLCommandBufferStatusError)
+                        throw std::runtime_error(std::string("tsm moe mm: ") +
+                            (cmd.error ? cmd.error.localizedDescription.UTF8String : "command buffer failed"));
+                }
+            }
+            g_moe_mm_count.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true))
+                std::fprintf(stderr, "[tsm] prompt experts run on Strata's grouped GEMM (moe_mm on the tensor API; "
+                    "TS_METAL_MOE_MM=0 keeps MUL_MAT_ID)\n");
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
+
+    long long moe_mm_count() { return g_moe_mm_count.load(std::memory_order_relaxed); }
+
+    void wait_last()
+    {
+        State& s = state();
+        id<MTLCommandBuffer> last = nil;
+        {
+            std::lock_guard<std::mutex> lock(s.mu);
+            last = s.last;
+        }
+        if (last != nil) [last waitUntilCompleted];
+    }
+
+    void* copy_async(ggml_backend* backend, const ggml_tensor* const* srcs, const ggml_tensor* const* dsts, int n)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm copy: not a Metal backend");
+            if (n <= 0 || srcs == nullptr || dsts == nullptr) throw std::runtime_error("tsm copy: nothing to copy");
+            std::vector<ggml_metal_buffer_id> from, to;
+            std::vector<std::size_t> bytes;
+            auto metal_buffer = [](const ggml_tensor* t) {
+                ggml_backend_buffer_t b = t->view_src ? t->view_src->buffer : t->buffer;
+                const char* name = b ? ggml_backend_buft_name(ggml_backend_buffer_get_type(b)) : nullptr;
+                return name != nullptr && std::strncmp(name, "MTL", 3) == 0;
+            };
+            for (int i = 0; i < n; ++i)
+            {
+                if (!metal_buffer(srcs[i]) || !metal_buffer(dsts[i])) throw std::runtime_error("tsm copy: not a Metal buffer");
+                const std::size_t b = ggml_nbytes(srcs[i]);
+                if (b != ggml_nbytes(dsts[i])) throw std::runtime_error("tsm copy: sizes differ");
+                from.push_back(tensor_id(srcs[i]));
+                to.push_back(tensor_id(dsts[i]));
+                bytes.push_back(b);
+            }
+            @autoreleasepool
+            {
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
+                for (int i = 0; i < n; ++i)
+                    [enc copyFromBuffer:(__bridge id<MTLBuffer>)from[i].metal sourceOffset:from[i].offs
+                               toBuffer:(__bridge id<MTLBuffer>)to[i].metal destinationOffset:to[i].offs size:bytes[i]];
+                [enc endEncoding];
+                [cb commit];
+                return (__bridge_retained void*)cb;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return nullptr;
+        }
+    }
+
+    void wait_handle(void* handle)
+    {
+        if (handle == nullptr) return;
+        id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)handle;
+        [cb waitUntilCompleted];
+    }
+
+    void release_handle(void* handle)
+    {
+        if (handle == nullptr) return;
+        id<MTLCommandBuffer> cb = (__bridge_transfer id<MTLCommandBuffer>)handle;
+        (void)cb;
+    }
+
+    // ---- the fused hyper-connection read (tsm_moe.h hc_read_*)
+    namespace
+    {
+        struct TsmHrArgs { std::uint32_t n_tok, n_embd, hc, lr; float eps; std::uint32_t pad0, pad1, pad2; };
+        static_assert(sizeof(TsmHrArgs) == 32, "TsmHrArgs must match tsm_hc_read.metal");
+        struct TsmDqArgs { std::uint32_t n_in, n_out, row_bytes, perm, dst_row0, pad0, pad1, pad2; };
+        static_assert(sizeof(TsmDqArgs) == 32, "TsmDqArgs must match tsm_hc_read.metal");
+        struct TsmGemmArgs { std::int32_t M, N, K, pad; };
+        std::atomic<long long> g_hc_read_count{0};
+
+        const char* dq_kernel(int type)
+        {
+            switch (type)
+            {
+                case GGML_TYPE_F32: return "tsm_dq_f32";
+                case GGML_TYPE_F16: return "tsm_dq_f16";
+                case GGML_TYPE_BF16: return "tsm_dq_bf16";
+                case GGML_TYPE_Q8_0: return "tsm_dq_q8_0";
+                default: return nullptr;
+            }
+        }
+
+        bool hc_read_enabled()
+        {
+            const char* e = std::getenv("TS_METAL_HC_READ");   // read per span build (tests switch it)
+            return !(e && e[0] == '0');
+        }
+
+        // One weight's rows into the fp16 matrix at dst_row0 (perm: see tsm_hc_read.metal).
+        void encode_dq(State& s, id<MTLComputeCommandEncoder> enc, const ggml_tensor* w, id<MTLBuffer> dst,
+                       std::uint32_t dst_row0, std::uint32_t perm)
+        {
+            const TsmDqArgs a{static_cast<std::uint32_t>(w->ne[0]), static_cast<std::uint32_t>(w->ne[1]),
+                static_cast<std::uint32_t>(w->nb[1]), perm, dst_row0, 0, 0, 0};
+            [enc setComputePipelineState:pipeline_mm(s, dq_kernel(w->type))];
+            bind(enc, tensor_id(w), 0, 0);
+            [enc setBuffer:dst offset:0 atIndex:1];
+            [enc setBytes:&a length:sizeof(a) atIndex:2];
+            const NSUInteger runs = static_cast<NSUInteger>(w->ne[0] / 32);
+            [enc dispatchThreads:MTLSizeMake(runs, static_cast<NSUInteger>(w->ne[1]), 1)
+                threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(runs, 64), 1, 1)];
+        }
+    }
+
+    bool hc_read_supported(ggml_backend* backend, int down_type, int inject_type, int up_type, int n_embd, int hc, int lr)
+    {
+        if (!hc_read_enabled()) return false;
+        ggml_metal_device_t dev = metal_device(backend);
+        if (dev == nullptr) return false;
+        if (dq_kernel(down_type) == nullptr || dq_kernel(inject_type) == nullptr || dq_kernel(up_type) == nullptr) return false;
+        // Rows dequantize in runs of 32; the up GEMM's 64-column tiles hold 64 / hc whole outputs; the norm's
+        // threadgroup reduces with 8 simdgroups.
+        if (n_embd <= 0 || hc <= 0 || lr <= 0 || (static_cast<std::int64_t>(n_embd) * hc) % 64 != 0 || 64 % hc != 0
+            || lr % 32 != 0)
+            return false;
+        try
+        {
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+            ensure_library(s, device);
+            return mm_library(s, device);
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+    }
+
+    bool hc_read_encode(ggml_backend* backend, const HcReadIO& io)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm hc read: not a Metal backend");
+            const std::int64_t n = io.n_embd, hc = io.hc, lr = io.lr, T = io.T, wide = n * hc;
+            auto need = [](const ggml_tensor* t, const char* what, bool ok) {
+                if (t == nullptr || !ok) throw std::runtime_error(std::string("tsm hc read: ") + what + " does not match the kernels");
+            };
+            need(io.res, "res", io.res && io.res->type == GGML_TYPE_F32 && ggml_is_contiguous(io.res) && ggml_nelements(io.res) == wide * T);
+            need(io.gamma, "gamma", io.gamma && io.gamma->type == GGML_TYPE_F32 && ggml_nelements(io.gamma) == wide);
+            need(io.w_down, "w_down", io.w_down && io.w_down->ne[0] == wide && io.w_down->ne[1] == lr);
+            need(io.w_inject, "w_inject", io.w_inject && io.w_inject->ne[0] == wide && io.w_inject->ne[1] == hc);
+            need(io.w_up, "w_up", io.w_up && io.w_up->ne[0] == lr && io.w_up->ne[1] == wide);
+            need(io.mixed, "mixed", io.mixed && io.mixed->type == GGML_TYPE_F32 && ggml_nelements(io.mixed) == n * T);
+            need(io.inject, "inject", io.inject && io.inject->type == GGML_TYPE_F32 && ggml_nelements(io.inject) == hc * T);
+            const ggml_metal_buffer_id res = tensor_id(io.res), gamma = tensor_id(io.gamma), mixed = tensor_id(io.mixed),
+                inject = tensor_id(io.inject);
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                ensure_library(s, device);
+                if (!mm_library(s, device)) throw std::runtime_error("tsm hc read: the tensor-API library is not available");
+                const std::size_t t = static_cast<std::size_t>(T), w = static_cast<std::size_t>(wide);
+                const std::size_t nr = static_cast<std::size_t>(lr + hc);
+                s.hr_xnh = grow(s, s.hr_xnh, s.hr_xnh_bytes, t * w * 2);
+                s.hr_v = grow(s, s.hr_v, s.hr_v_bytes, t * nr * 4);
+                s.hr_lo = grow(s, s.hr_lo, s.hr_lo_bytes, t * static_cast<std::size_t>(lr) * 2);
+                s.hr_wd = grow(s, s.hr_wd, s.hr_wd_bytes, nr * w * 2);
+                s.hr_wu = grow(s, s.hr_wu, s.hr_wu_bytes, w * static_cast<std::size_t>(lr) * 2);
+                const TsmHrArgs ha{static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(hc),
+                    static_cast<std::uint32_t>(lr), io.eps, 0, 0, 0};
+
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];   // serial: each pass sees the last
+                // the weights in fp16: [down rows | injection rows] and the up rows with the streams interleaved
+                encode_dq(s, enc, io.w_down, s.hr_wd, 0, 0);
+                encode_dq(s, enc, io.w_inject, s.hr_wd, static_cast<std::uint32_t>(lr), 0);
+                encode_dq(s, enc, io.w_up, s.hr_wu, 0, static_cast<std::uint32_t>(hc));
+
+                [enc setComputePipelineState:pipeline_mm(s, "tsm_hr_norm")];
+                bind(enc, res, 0, 0); bind(enc, gamma, 0, 1);
+                [enc setBuffer:s.hr_xnh offset:0 atIndex:2];
+                [enc setBytes:&ha length:sizeof(ha) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(hc), t, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+                const TsmGemmArgs gd{static_cast<std::int32_t>(T), static_cast<std::int32_t>(nr), static_cast<std::int32_t>(wide), 0};
+                [enc setComputePipelineState:pipeline_mm(s, "tsm_gemm_f16_64_64_4")];
+                [enc setBuffer:s.hr_xnh offset:0 atIndex:0]; [enc setBuffer:s.hr_wd offset:0 atIndex:1];
+                [enc setBuffer:s.hr_v offset:0 atIndex:2];
+                [enc setBytes:&gd length:sizeof(gd) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake((nr + 63) / 64, (t + 63) / 64, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+                [enc setComputePipelineState:pipeline_mm(s, "tsm_hr_epi_down")];
+                [enc setBuffer:s.hr_v offset:0 atIndex:0]; [enc setBuffer:s.hr_lo offset:0 atIndex:1];
+                bind(enc, inject, 0, 2);
+                [enc setBytes:&ha length:sizeof(ha) atIndex:3];
+                [enc dispatchThreads:MTLSizeMake(t * nr, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+                const TsmGemmArgs gu{static_cast<std::int32_t>(T), static_cast<std::int32_t>(wide), static_cast<std::int32_t>(lr), 0};
+                [enc setComputePipelineState:pipeline_mm(s, "tsm_gemm_hc_up_64_64_4")];
+                [enc setBuffer:s.hr_lo offset:0 atIndex:0]; [enc setBuffer:s.hr_wu offset:0 atIndex:1];
+                [enc setBuffer:s.hr_xnh offset:0 atIndex:2]; bind(enc, mixed, 0, 3);
+                [enc setBytes:&gu length:sizeof(gu) atIndex:4];
+                [enc setBytes:&ha length:sizeof(ha) atIndex:5];
+                [enc dispatchThreadgroups:MTLSizeMake(w / 64, (t + 63) / 64, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                s.last = cb;
+            }
+            g_hc_read_count.fetch_add(1, std::memory_order_relaxed);
+            g_hc_prompt_count.fetch_add(1, std::memory_order_relaxed);   // a hyper-connection pass on these kernels
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true))
+                std::fprintf(stderr, "[tsm] prompt hyper-connection reads run fused on the matrix units (norm, fp16 GEMMs, "
+                    "the mix in the up projection's epilogue; TS_METAL_HC_READ=0 keeps ggml's ops)\n");
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
+
+    long long hc_read_count() { return g_hc_read_count.load(std::memory_order_relaxed); }
+
+    void moe_mm_release()
+    {
+        State& s = state();
+        std::lock_guard<std::mutex> lock(s.mu);
+        s.hr_xnh = s.hr_v = s.hr_lo = s.hr_wd = s.hr_wu = nil;
+        s.hr_xnh_bytes = s.hr_v_bytes = s.hr_lo_bytes = s.hr_wd_bytes = s.hr_wu_bytes = 0;
+        if (s.mm_xs == nil && s.mm_ye == nil) return;
+        // The last pass's command buffer holds its own references; dropping ours frees the scratch once it completes.
+        s.mm_bcnt = s.mm_boff = s.mm_eoff = s.mm_tiles = s.mm_stok = s.mm_sw = s.mm_pos = nil;
+        s.mm_xs = s.mm_hs = s.mm_ye = nil;
+        s.mm_bcnt_bytes = s.mm_boff_bytes = s.mm_eoff_bytes = s.mm_tiles_bytes = 0;
+        s.mm_stok_bytes = s.mm_sw_bytes = s.mm_pos_bytes = s.mm_xs_bytes = s.mm_hs_bytes = s.mm_ye_bytes = 0;
+    }
+
+    // ---- the end of a DFlash2 draft (tsm_df_tail.metal)
+    namespace
+    {
+        std::atomic<long long> g_df_tail_count{0};
+        constexpr int kDfTopK = 16;          // TSM_DF_TOPK
+        constexpr int kDfTopBlocksMax = 128; // TSM_DF_TOPB_MAX
+        struct TsmDfHeadArgs { std::uint32_t K, rows, row_bytes, ncol, x_row0; float scale; std::uint32_t pad0, pad1; };
+        struct TsmDfTopkArgs { std::int32_t n, blocks; };
+        struct TsmDfSelArgs { std::uint32_t rank, k, gamma, vocab; std::int32_t anchor;
+                              float pred_scale, succ_scale, logit_scale, softcap; std::uint32_t pad0, pad1, pad2; };
+
+        constexpr int kDfHeadSimdgroups = 4;   // tsm_df_head_q5k: one 8-row tile per simdgroup, 4 simdgroups a threadgroup
+    }
+
+    bool df_tail_enabled()
+    {
+        const char* e = std::getenv("TS_METAL_DF_TAIL");   // read per call (tests switch it)
+        return !(e && e[0] == '0');
+    }
+
+    bool df_tail_supported(ggml_backend* backend, int head_type, int hidden, int vocab, int rank, int top_k,
+                           int pred_type, int succ_type, int gamma)
+    {
+        if (!df_tail_enabled()) return false;
+        if (metal_device(backend) == nullptr) return false;
+        // q5_K head rows of whole 256-blocks; one 4096-column top-k block per threadgroup, at most kDfTopBlocksMax of them;
+        // q4_K codebook rows of one block (rank 256, a thread per element); at most 8 proposal rows (one fragment).
+        return head_type == GGML_TYPE_Q5_K && hidden > 0 && hidden % 256 == 0
+            && vocab >= kDfTopK && (static_cast<std::int64_t>(vocab) + 4095) / 4096 <= kDfTopBlocksMax
+            && rank == 256 && top_k == kDfTopK && pred_type == GGML_TYPE_Q4_K && succ_type == GGML_TYPE_Q4_K
+            && gamma >= 1 && gamma <= 8;
+    }
+
+    bool df_tail_run(ggml_backend* backend, const DfTailIO& io)
+    {
+        try
+        {
+            ggml_metal_device_t dev = metal_device(backend);
+            if (dev == nullptr) throw std::runtime_error("tsm df tail: not a Metal backend");
+            if (io.h == nullptr || io.ph == nullptr || io.head == nullptr || io.pred == nullptr || io.succ == nullptr
+                || io.cand_out == nullptr || io.scores_out == nullptr)
+                throw std::runtime_error("tsm df tail: missing a tensor or an output");
+            const std::int64_t K = io.head->ne[0], vocab = io.head->ne[1], rank = io.pred->ne[0];
+            const int gamma = io.gamma, k = kDfTopK;
+            if (!df_tail_supported(backend, io.head->type, static_cast<int>(K), static_cast<int>(vocab), static_cast<int>(rank),
+                                   k, io.pred->type, io.succ->type, gamma))
+                throw std::runtime_error("tsm df tail: these types or shapes are not the kernels'");
+            if (io.h->type != GGML_TYPE_F32 || io.h->ne[0] != K || io.h->ne[1] < gamma + 1 || !ggml_is_contiguous(io.h)
+                || io.ph->type != GGML_TYPE_F32 || io.ph->ne[0] != rank || io.ph->ne[1] < gamma || !ggml_is_contiguous(io.ph)
+                || io.succ->ne[0] != rank || io.pred->ne[1] != vocab || io.succ->ne[1] != vocab
+                || io.anchor < 0 || io.anchor >= vocab)
+                throw std::runtime_error("tsm df tail: the rows do not match the weights");
+            const ggml_metal_buffer_id h = tensor_id(io.h), ph = tensor_id(io.ph), head = tensor_id(io.head),
+                pred = tensor_id(io.pred), succ = tensor_id(io.succ);
+            const int blocks = static_cast<int>((vocab + 4095) / 4096);
+            const std::size_t g = static_cast<std::size_t>(gamma), V = static_cast<std::size_t>(vocab);
+            const std::size_t out_floats = static_cast<std::size_t>(k) + static_cast<std::size_t>(k) * k * (g - 1);
+            State& s = state();
+            std::lock_guard<std::mutex> lock(s.mu);
+            @autoreleasepool
+            {
+                id<MTLDevice> device = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(dev);
+                id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)ggml_metal_device_get_queue(dev);
+                ensure_library(s, device);
+                s.df_xh = grow(s, s.df_xh, s.df_xh_bytes, 8 * static_cast<std::size_t>(K) * 2);
+                s.df_xs = grow(s, s.df_xs, s.df_xs_bytes, 8 * static_cast<std::size_t>(K / 32) * 4);
+                s.df_logits = grow(s, s.df_logits, s.df_logits_bytes, g * V * 4);
+                s.df_cval = grow(s, s.df_cval, s.df_cval_bytes, g * blocks * k * 4);
+                s.df_cidx = grow(s, s.df_cidx, s.df_cidx_bytes, g * blocks * k * 4);
+                s.df_tok = grow(s, s.df_tok, s.df_tok_bytes, g * k * 4);
+                s.df_out = grow(s, s.df_out, s.df_out_bytes, out_floats * 4);
+                const TsmDfHeadArgs ha{static_cast<std::uint32_t>(K), static_cast<std::uint32_t>(vocab),
+                    static_cast<std::uint32_t>(io.head->nb[1]), static_cast<std::uint32_t>(gamma), 1u, io.head_scale, 0, 0};
+                const TsmDfTopkArgs ta{static_cast<std::int32_t>(vocab), blocks};
+                const TsmDfSelArgs sa{static_cast<std::uint32_t>(rank), static_cast<std::uint32_t>(k),
+                    static_cast<std::uint32_t>(gamma), static_cast<std::uint32_t>(vocab), io.anchor,
+                    io.pred_scale, io.succ_scale, io.logit_scale, io.softcap, 0, 0, 0};
+
+                const std::string hk = "tsm_df_head_q5k";
+                const std::size_t nrt = (V + 7) / 8, per_tg = kDfHeadSimdgroups;
+                // The five passes, in order; serial in one encoder, so each sees the last.
+                auto encode_stage = [&](id<MTLComputeCommandEncoder> enc, int stage) {
+                    switch (stage)
+                    {
+                    case 0:
+                        [enc setComputePipelineState:pipeline(s, "tsm_df_xprep")];
+                        bind(enc, h, 0, 0);
+                        [enc setBuffer:s.df_xh offset:0 atIndex:1]; [enc setBuffer:s.df_xs offset:0 atIndex:2];
+                        [enc setBytes:&ha length:sizeof(ha) atIndex:3];
+                        [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(K / 32), 8, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+                        break;
+                    case 1:
+                        [enc setComputePipelineState:pipeline(s, hk)];
+                        bind(enc, head, 0, 0);
+                        [enc setBuffer:s.df_xh offset:0 atIndex:1]; [enc setBuffer:s.df_xs offset:0 atIndex:2];
+                        [enc setBuffer:s.df_logits offset:0 atIndex:3];
+                        [enc setBytes:&ha length:sizeof(ha) atIndex:4];
+                        [enc dispatchThreadgroups:MTLSizeMake((nrt + per_tg - 1) / per_tg, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(kDfHeadSimdgroups * 32, 1, 1)];
+                        break;
+                    case 2:
+                        [enc setComputePipelineState:pipeline(s, "tsm_df_topk_part")];
+                        [enc setBuffer:s.df_logits offset:0 atIndex:0]; [enc setBuffer:s.df_cval offset:0 atIndex:1];
+                        [enc setBuffer:s.df_cidx offset:0 atIndex:2];
+                        [enc setBytes:&ta length:sizeof(ta) atIndex:3];
+                        [enc dispatchThreadgroups:MTLSizeMake(g, static_cast<NSUInteger>(blocks), 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        break;
+                    case 3:
+                        [enc setComputePipelineState:pipeline(s, "tsm_df_topk_merge")];
+                        [enc setBuffer:s.df_cval offset:0 atIndex:0]; [enc setBuffer:s.df_cidx offset:0 atIndex:1];
+                        [enc setBuffer:s.df_tok offset:0 atIndex:2];
+                        [enc setBytes:&ta length:sizeof(ta) atIndex:3];
+                        [enc dispatchThreadgroups:MTLSizeMake(g, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        break;
+                    default:
+                        [enc setComputePipelineState:pipeline(s, "tsm_df_select_q4k")];
+                        bind(enc, ph, 0, 0);
+                        [enc setBuffer:s.df_logits offset:0 atIndex:1]; [enc setBuffer:s.df_tok offset:0 atIndex:2];
+                        bind(enc, pred, 0, 3); bind(enc, succ, 0, 4);
+                        [enc setBuffer:s.df_out offset:0 atIndex:5];
+                        [enc setBytes:&sa length:sizeof(sa) atIndex:6];
+                        [enc dispatchThreadgroups:MTLSizeMake(1 + static_cast<std::size_t>(k) * (g - 1), 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        break;
+                    }
+                };
+                auto finish = [](id<MTLCommandBuffer> cb) {
+                    [cb waitUntilCompleted];
+                    if (cb.status != MTLCommandBufferStatusCompleted)
+                        throw std::runtime_error(std::string("tsm df tail: the command buffer failed: ")
+                            + (cb.error ? cb.error.localizedDescription.UTF8String : "?"));
+                    return 1000.0 * (cb.GPUEndTime - cb.GPUStartTime);
+                };
+                // TS_METAL_DF_TAIL_PROF=1 reports the tail's accelerator time every 64 drafts; =2 runs each pass in its own
+                // command buffer and reports them apart (measurement only: the passes no longer overlap).
+                static const int prof = [] { const char* e = std::getenv("TS_METAL_DF_TAIL_PROF"); return e ? std::atoi(e) : 0; }();
+                static double prof_ms[6] = {};
+                static long long prof_n = 0;
+                if (prof == 2)
+                {
+                    for (int stage = 0; stage < 5; ++stage)
+                    {
+                        id<MTLCommandBuffer> cb = [queue commandBuffer];
+                        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                        encode_stage(enc, stage);
+                        [enc endEncoding];
+                        [cb commit];
+                        s.last = cb;
+                        prof_ms[stage] += finish(cb);
+                    }
+                }
+                else
+                {
+                    id<MTLCommandBuffer> cb = [queue commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    for (int stage = 0; stage < 5; ++stage) encode_stage(enc, stage);
+                    [enc endEncoding];
+                    [cb commit];
+                    s.last = cb;
+                    prof_ms[5] += finish(cb);
+                }
+                if (prof > 0 && ++prof_n % 64 == 0)
+                {
+                    if (prof == 2)
+                        std::fprintf(stderr, "[tsm] df tail over 64 drafts (passes apart): xprep %.3f, head %.3f, top-k %.3f + %.3f, "
+                            "lattice %.3f ms\n", prof_ms[0] / 64, prof_ms[1] / 64, prof_ms[2] / 64, prof_ms[3] / 64, prof_ms[4] / 64);
+                    else
+                        std::fprintf(stderr, "[tsm] df tail over 64 drafts: %.3f ms of accelerator time\n", prof_ms[5] / 64);
+                    for (double& v : prof_ms) v = 0;
+                }
+                std::memcpy(io.cand_out, s.df_tok.contents, g * k * sizeof(std::int32_t));
+                std::memcpy(io.scores_out, s.df_out.contents, out_floats * sizeof(float));
+                if (io.logits_out != nullptr)
+                    std::memcpy(io.logits_out, s.df_logits.contents, g * V * sizeof(float));
+            }
+            g_df_tail_count.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true))
+                std::fprintf(stderr, "[tsm] DFlash2 drafts end on TensorSharp kernels (q5_K head on the matrix units, top-16, "
+                    "selector lattice; TS_METAL_DF_TAIL=0 keeps ggml's ops)\n");
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            tsg::set_last_error(e.what());
+            return false;
+        }
+    }
+
+    long long df_tail_count() { return g_df_tail_count.load(std::memory_order_relaxed); }
 }
 
 // ---- test probe: one layer's held routes through moe_encode, on expert bytes the caller gives (stacked [expert]
 // gate rows, up rows, down rows in GGUF blocks), against a reference the caller computes. Returns 1, or 0 with the
 // last error set (the formats or shapes the kernels do not take, or no Metal backend).
+// ---- test probe: one layer's routed experts through moe_mm_encode (Strata's prompt expert GEMM) on stacked Q2_0
+// expert bytes the caller gives (gate [expert][n_ff rows of hidden], up likewise, down [expert][hidden rows of n_ff]),
+// T rows of x and n_used (id, weight) routes a row, into out [T][hidden]. Returns 1, or 0 with the last error set.
+TSG_EXPORT int TSGgml_TsmMoeMmProbe(int hidden, int n_ff, int n_expert, const void* gate, const void* up, const void* down,
+    int T, int n_used, const std::int32_t* ids, const float* weights, const float* x, float* out)
+{
+    using namespace tsg;
+    if (!ensure_backend()) return 0;
+    ggml_backend_t backend = g_backend;
+    ggml_backend_buffer_t wbuf = nullptr, abuf = nullptr;
+    ggml_context* ctx = nullptr;
+    try
+    {
+        if (!tsm::moe_mm_supported(backend, 42, 42, 42, hidden, n_ff, n_expert, n_used))
+            throw std::runtime_error("tsm moe mm probe: the kernels do not run here or take these shapes");
+        ggml_init_params ip{};
+        ip.mem_size = 16 * ggml_tensor_overhead();
+        ip.no_alloc = true;
+        ctx = ggml_init(ip);
+        ggml_tensor* g = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, hidden, n_ff, n_expert);
+        ggml_tensor* u = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, hidden, n_ff, n_expert);
+        ggml_tensor* d = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_0, n_ff, hidden, n_expert);
+        wbuf = ggml_backend_alloc_ctx_tensors(ctx, backend);   // the three stacks in one buffer, as the kernels address them
+        if (wbuf == nullptr) throw std::runtime_error("tsm moe mm probe: weight buffer");
+        ggml_backend_tensor_set(g, gate, 0, ggml_nbytes(g));
+        ggml_backend_tensor_set(u, up, 0, ggml_nbytes(u));
+        ggml_backend_tensor_set(d, down, 0, ggml_nbytes(d));
+        ggml_context* actx = nullptr;
+        ggml_init_params ap{};
+        ap.mem_size = 8 * ggml_tensor_overhead();
+        ap.no_alloc = true;
+        actx = ggml_init(ap);
+        ggml_tensor* xin = ggml_new_tensor_2d(actx, GGML_TYPE_F32, hidden, T);
+        ggml_tensor* res = ggml_new_tensor_2d(actx, GGML_TYPE_F32, hidden, T);
+        ggml_tensor* it = ggml_new_tensor_2d(actx, GGML_TYPE_I32, n_used, T);
+        ggml_tensor* wt = ggml_new_tensor_3d(actx, GGML_TYPE_F32, 1, n_used, T);
+        abuf = ggml_backend_alloc_ctx_tensors(actx, backend);
+        if (abuf == nullptr) { ggml_free(actx); throw std::runtime_error("tsm moe mm probe: activation buffer"); }
+        ggml_backend_tensor_set(xin, x, 0, ggml_nbytes(xin));
+        ggml_backend_tensor_set(it, ids, 0, ggml_nbytes(it));
+        ggml_backend_tensor_set(wt, weights, 0, ggml_nbytes(wt));
+        const bool ok = tsm::moe_mm_encode(backend, xin, it, wt, g, u, d, res, T, hidden, n_ff, n_expert, n_used, true);
+        if (ok) ggml_backend_tensor_get(res, out, 0, ggml_nbytes(res));
+        ggml_backend_buffer_free(abuf);
+        ggml_free(actx);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx);
+        return ok ? 1 : 0;
+    }
+    catch (const std::exception& e)
+    {
+        if (abuf) ggml_backend_buffer_free(abuf);
+        if (wbuf) ggml_backend_buffer_free(wbuf);
+        if (ctx) ggml_free(ctx);
+        tsg::set_last_error(e.what());
+        return 0;
+    }
+}
+
+// Test hook: the prompt expert layers that ran on moe_mm_encode in this process.
+TSG_EXPORT long long TSGgml_TsmMoeMmCount() { return tsm::moe_mm_count(); }
+
+// ---- test probe: one hyper-connection read through hc_read_encode on weights the caller gives in ggml's layout
+// (w_down [n_embd * hc] x lr rows, w_inject [n_embd * hc] x hc rows, w_up [lr] x (n_embd * hc) rows, each of its own
+// type: F32, F16, BF16 or Q8_0 bytes), T rows of the residual and gamma, into mixed [T][n_embd] and inject [T][hc].
+// Returns 1, or 0 with the last error set.
+TSG_EXPORT int TSGgml_TsmHcReadProbe(int n_embd, int hc, int lr, int down_type, const void* w_down, int inject_type,
+    const void* w_inject, int up_type, const void* w_up, const float* gamma, int T, const float* res, float eps,
+    float* mixed, float* inject)
+{
+    using namespace tsg;
+    if (!ensure_backend()) return 0;
+    ggml_backend_t backend = g_backend;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_context* ctx = nullptr;
+    try
+    {
+        if (!tsm::hc_read_supported(backend, down_type, inject_type, up_type, n_embd, hc, lr))
+            throw std::runtime_error("tsm hc read probe: the kernels do not run here or take these types and shapes");
+        const int wide = n_embd * hc;
+        ggml_init_params ip{};
+        ip.mem_size = 16 * ggml_tensor_overhead();
+        ip.no_alloc = true;
+        ctx = ggml_init(ip);
+        ggml_tensor* wd = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(down_type), wide, lr);
+        ggml_tensor* wi = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(inject_type), wide, hc);
+        ggml_tensor* wu = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(up_type), lr, wide);
+        ggml_tensor* g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, wide);
+        ggml_tensor* r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, wide, T);
+        ggml_tensor* m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+        ggml_tensor* inj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, T);
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (buf == nullptr) throw std::runtime_error("tsm hc read probe: buffer");
+        ggml_backend_tensor_set(wd, w_down, 0, ggml_nbytes(wd));
+        ggml_backend_tensor_set(wi, w_inject, 0, ggml_nbytes(wi));
+        ggml_backend_tensor_set(wu, w_up, 0, ggml_nbytes(wu));
+        ggml_backend_tensor_set(g, gamma, 0, ggml_nbytes(g));
+        ggml_backend_tensor_set(r, res, 0, ggml_nbytes(r));
+        tsm::HcReadIO io;
+        io.res = r; io.gamma = g; io.w_down = wd; io.w_inject = wi; io.w_up = wu; io.mixed = m; io.inject = inj;
+        io.T = T; io.n_embd = n_embd; io.hc = hc; io.lr = lr; io.eps = eps;
+        const bool ok = tsm::hc_read_encode(backend, io);
+        if (ok)
+        {
+            tsm::wait_last();
+            ggml_backend_tensor_get(m, mixed, 0, ggml_nbytes(m));
+            ggml_backend_tensor_get(inj, inject, 0, ggml_nbytes(inj));
+        }
+        tsm::moe_mm_release();
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return ok ? 1 : 0;
+    }
+    catch (const std::exception& e)
+    {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        tsg::set_last_error(e.what());
+        return 0;
+    }
+}
+
+// Test hook: the hyper-connection reads that ran on hc_read_encode in this process.
+TSG_EXPORT long long TSGgml_TsmHcReadCount() { return tsm::hc_read_count(); }
+
+// ---- test probe: a DFlash2 draft's tail (tsm::df_tail_run) on bytes the caller gives: the q5_K head [vocab][hidden],
+// the q4_K predecessor and successor codebooks [vocab][rank], gamma + 1 final rows h (row 0 the anchor's, unused), the
+// selector's hidden projection ph [gamma][rank]; out: the candidates [gamma][16], the lattice (16 + 16 * 16 * (gamma - 1)
+// floats) and the head's logits [gamma][vocab]. `repeat` runs the tail that many times on the same upload (timing with
+// TS_METAL_DF_TAIL_PROF). Returns 1, or 0 with the last error set.
+TSG_EXPORT int TSGgml_TsmDfTailProbe(int hidden, int vocab, int rank, int gamma, const void* head, const void* pred,
+    const void* succ, const float* h, const float* ph, int anchor, float head_scale, float pred_scale, float succ_scale,
+    float logit_scale, float softcap, int* cand, float* scores, float* logits, int repeat)
+{
+    using namespace tsg;
+    if (!ensure_backend()) return 0;
+    ggml_backend_t backend = g_backend;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_context* ctx = nullptr;
+    try
+    {
+        if (!tsm::df_tail_supported(backend, GGML_TYPE_Q5_K, hidden, vocab, rank, 16, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, gamma))
+            throw std::runtime_error("tsm df tail probe: the kernels do not run here or take these shapes");
+        ggml_init_params ip{};
+        ip.mem_size = 16 * ggml_tensor_overhead();
+        ip.no_alloc = true;
+        ctx = ggml_init(ip);
+        ggml_tensor* wh = ggml_new_tensor_2d(ctx, GGML_TYPE_Q5_K, hidden, vocab);
+        ggml_tensor* wp = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, rank, vocab);
+        ggml_tensor* ws = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, rank, vocab);
+        ggml_tensor* th = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, gamma + 1);
+        ggml_tensor* tp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, gamma);
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (buf == nullptr) throw std::runtime_error("tsm df tail probe: buffer");
+        ggml_backend_tensor_set(wh, head, 0, ggml_nbytes(wh));
+        ggml_backend_tensor_set(wp, pred, 0, ggml_nbytes(wp));
+        ggml_backend_tensor_set(ws, succ, 0, ggml_nbytes(ws));
+        ggml_backend_tensor_set(th, h, 0, ggml_nbytes(th));
+        ggml_backend_tensor_set(tp, ph, 0, ggml_nbytes(tp));
+        tsm::DfTailIO io;
+        io.h = th; io.ph = tp; io.head = wh; io.pred = wp; io.succ = ws;
+        io.gamma = gamma; io.anchor = anchor;
+        io.head_scale = head_scale; io.pred_scale = pred_scale; io.succ_scale = succ_scale;
+        io.logit_scale = logit_scale; io.softcap = softcap;
+        io.cand_out = cand; io.scores_out = scores; io.logits_out = logits;
+        bool ok = true;
+        for (int i = 0; ok && i < (repeat > 1 ? repeat : 1); ++i) ok = tsm::df_tail_run(backend, io);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return ok ? 1 : 0;
+    }
+    catch (const std::exception& e)
+    {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        tsg::set_last_error(e.what());
+        return 0;
+    }
+}
+
+// Test hook: the DFlash2 draft tails that ran on tsm::df_tail_run in this process.
+TSG_EXPORT long long TSGgml_TsmDfTailCount() { return tsm::df_tail_count(); }
+
 TSG_EXPORT int TSGgml_TsmMoeProbe(int gate_type, int down_type, int hidden, int n_ff, int n_expert,
     const void* gate, const void* up, const void* down, int T, int n_used, const std::int32_t* slots,
     const float* weights, const float* x, float* out)

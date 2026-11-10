@@ -177,6 +177,15 @@ namespace TensorSharp.Runtime
         /// </summary>
         void PrepareForPrefill(int requiredContextTokens) { }
 
+        /// <summary>
+        /// Hint, issued as the scheduler builds a prefill chunk, of the chunk the same request will most
+        /// likely prefill next: <paramref name="tokens"/> at <paramref name="startPos"/>. A model whose
+        /// prompt pass does host work before the accelerator starts (Qwen 3.8 Flash Next's PLE rows) can
+        /// do the next chunk's while this one computes. Only a hint: the model must check that the chunk
+        /// it is then given is this one, in the state it assumed. Default no-op.
+        /// </summary>
+        void PrepareNextPrefillChunk(int[] tokens, int startPos) { }
+
         /// <summary>Release memory that only serves the NEXT request's speed — parked
         /// per-request holders, pooled host buffers — because the host has been told
         /// the process is about to run out. Called on the engine thread between steps,

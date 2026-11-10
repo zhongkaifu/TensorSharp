@@ -1,0 +1,11 @@
+{
+  "name": "pi-tensorsharp-sdk-example",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Drive the Pi coding agent from code, with TensorSharp serving Qwen3.8-27B.",
+  "engines": { "node": ">=22.19.0" },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.1"
+  }
+}

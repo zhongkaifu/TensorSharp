@@ -46,6 +46,10 @@ namespace TensorSharp.Models
 
         public int SpecSoloMaxDraftTokens => HasDFlash && _backend == BackendType.GgmlCuda ? s_soloSpecDraftSetting : int.MaxValue;
 
+        public string SpecSoloDraftCapReason =>
+            "on ggml_cuda a single-sequence verify of up to 8 rows stays in ggml-cuda's matvec kernel; "
+            + "TS_QWEN35_SOLO_SPEC_DRAFT=<n> sets the cap";
+
         private bool _batchedSpecScope;
         private Qwen35KvCacheHolder[] _batchedSpecHolders;
         private int[] _batchedSpecOrder;

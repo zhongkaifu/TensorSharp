@@ -1,0 +1,27 @@
+{
+  // Overlay for config/qwen3.8-27b-metal-dflash2.json when the Pi coding agent drives the server. Pass it after the
+  // preset, so its values replace the preset's:
+  //
+  //   TensorSharp.Server.Host --config config/qwen3.8-27b-metal-dflash2.json \
+  //                           --config examples/pi-coding-agent/tensorsharp-pi.json
+  //
+  // The preset keeps its model, drafter and speed settings: Qwen3.8-27B UD-IQ3_XXS on ggml_metal with the DFlash2
+  // drafter, 7 drafts a step, no confidence gate, greedy decoding.
+
+  "host": "127.0.0.1",
+  "port": 5000,
+
+  // The preset's "max-tokens": 1024 is a pinned limit, so it would also cap every request Pi sends at 1,024 tokens:
+  // too few for a thinking model that writes code. Pi asks for its model's maxTokens (16,384 in pi-agent/models.json).
+  "max-tokens": 16384,
+
+  // A coding agent sends text only: skip the 0.93 GB vision projector (and its download).
+  "mmproj": "none",
+
+  // Pi's system prompt, tool schemas, file contents and tool output fill a context quickly. q8_0 K/V halves its memory
+  // at the same decode speed (the preset's own note), so 64K tokens fit beside the 10.9 GB of weights on a 32 GB Mac.
+  "kv-cache-dtype": "q8_0",
+  "environment": {
+    "MAX_CONTEXT": "65536"
+  }
+}

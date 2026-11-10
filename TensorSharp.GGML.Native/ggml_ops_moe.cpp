@@ -50,6 +50,7 @@ extern "C" int TSGgml_MoeOffloadCounters(long long* out, int capacity);
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <map>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -2032,7 +2033,27 @@ namespace
         }
 
         const auto t_compute = std::chrono::steady_clock::now();
-        ggml_status status = tsg::compute_graph(g_backend, graph);
+        // A plain streamed layer of Q2_0 experts on Metal: Strata's grouped expert GEMM (tsm::moe_mm_encode) on the
+        // staged stacks instead of the graph's three MUL_MAT_ID - gate, up and SwiGLU in one pass on the matrix units,
+        // the down projection, then each token's weighted sum in route order into hidden_out_t.
+        bool experts_on_tsm = false;
+#if defined(TSG_GGML_USE_METAL)
+        if (stream_experts && standalone_mode && activation_type == 0 && up_w != nullptr && !fused_gate_up
+            && !single_projection_activation && gate_bias_t == nullptr && up_bias_t == nullptr && down_bias_t == nullptr
+            && post_expert_norm_t == nullptr && route_up_scale_t == nullptr
+            && tsm::moe_mm_supported(g_backend, gate_type, up_type, down_type, hidden_dim, n_ff, num_experts, n_used))
+        {
+            experts_on_tsm = tsm::moe_mm_encode(g_backend, hidden_t, ids_t, weights_t, gate_w, up_w, down_w, hidden_out_t,
+                seq_len, hidden_dim, n_ff, num_experts, n_used, true);
+            if (!experts_on_tsm)
+            {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true))
+                    std::fprintf(stderr, "[tsm] prompt experts fall back to MUL_MAT_ID: %s\n", g_last_error.c_str());
+            }
+        }
+#endif
+        ggml_status status = experts_on_tsm ? GGML_STATUS_SUCCESS : tsg::compute_graph(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
         {
             set_last_error("MoE prefill: ggml_backend_graph_compute failed.");
@@ -2427,19 +2448,25 @@ namespace tsg
         {
             if (hm.device_op)
             {
-                int cut = 0;
+                // The operation runs after the last node it reads. An input that is a leaf (the span's input, or an
+                // earlier device operation's output bound outside the allocator) is whole before the pass or before
+                // any later operation, so it places no cut: two operations in a row (a scatter, then the next
+                // half-layer's read) run with an empty segment between them.
+                int cut = seg_end.empty() ? 0 : seg_end.back();
+                bool any_node = false;
                 for (ggml_tensor* t : hm.device_inputs)
                 {
                     const int i = host_moe_graph_node_index(graph, t);
-                    if (i < 0)
+                    if (i < 0 && (t == nullptr || t->op != GGML_OP_NONE))
                     {
                         set_last_error(std::string(kernel_name) + ": a device operation's input is missing from the graph.");
                         seg_end.clear();
                         return false;
                     }
+                    if (i >= 0) any_node = true;
                     if (i + 1 > cut) cut = i + 1;
                 }
-                if (hm.device_inputs.empty() || (!seg_end.empty() && cut <= seg_end.back()))
+                if (hm.device_inputs.empty() || (!seg_end.empty() && (cut < seg_end.back() || (any_node && cut == seg_end.back()))))
                 {
                     set_last_error(std::string(kernel_name) + ": host-MoE segments are not in graph order.");
                     seg_end.clear();
@@ -2713,6 +2740,76 @@ namespace tsg
         return ok;
     }
 
+#if defined(TSG_GGML_USE_METAL)
+    // A prompt-width offloaded layer on Metal whose stacks the prefetch staged whole (stage_prefetch_start_impl):
+    // Strata's grouped expert GEMM (tsm::moe_mm_encode) reads the seam's input, ids and weights where the segment left
+    // them and writes moe_out in place. The other way round trip four copies of a layer's activations (the input
+    // downloaded, uploaded into the streamed graph, its output downloaded, then uploaded as moe_out: ~4 ms a layer at
+    // 4096 rows of Flash Next) for the same kernels and arithmetic. Synchronous, as the streamed graph is: the next
+    // layer's prefetch reuses the staging buffer once this returns. TS_METAL_MOE_MM_SEAM=0 keeps the round trip.
+    std::atomic<long long> g_moe_mm_seam_layers{0};
+    bool host_moe_prompt_mm(const HostMoeSegment& hm, ggml_backend_t backend)
+    {
+        const char* e = std::getenv("TS_METAL_MOE_MM_SEAM");
+        if ((e && e[0] == '0') || g_backend_type != BACKEND_TYPE_METAL || backend == nullptr) return false;
+        const int stream_from = moe_offload_stream_batch_threshold();
+        if (stream_from <= 0 || hm.seq_len < stream_from) return false;
+        if (hm.hot_tier != nullptr || hm.verify_gpu != nullptr || hm.tp_reduced != 0 || hm.activation != 0
+            || hm.swiglu_limit > 0.0f || hm.up_data == nullptr || hm.gate_bias != nullptr || hm.up_bias != nullptr
+            || hm.down_bias != nullptr)
+            return false;
+        const std::int64_t T = hm.seq_len, acts = static_cast<std::int64_t>(hm.hidden) * T;
+        const std::int64_t routes = static_cast<std::int64_t>(hm.n_used) * T;
+        auto flat = [](const ggml_tensor* t, ggml_type type, std::int64_t n) {
+            return t != nullptr && t->type == type && ggml_is_contiguous(t) && ggml_nelements(t) == n;
+        };
+        if (!flat(hm.moe_in, GGML_TYPE_F32, acts) || !flat(hm.moe_out, GGML_TYPE_F32, acts)
+            || !flat(hm.sel_ids, GGML_TYPE_I32, routes) || !flat(hm.weights, GGML_TYPE_F32, routes))
+            return false;
+        if (hm.gate_ne0 != hm.hidden || hm.gate_ne1 != hm.n_ff || hm.up_ne0 != hm.hidden || hm.up_ne1 != hm.n_ff
+            || hm.down_ne0 != hm.n_ff || hm.down_ne1 != hm.hidden)
+            return false;
+        if (!tsm::moe_mm_supported(backend, hm.gate_type, hm.up_type, hm.down_type, hm.hidden, hm.n_ff, hm.num_experts,
+                                   hm.n_used))
+            return false;
+        ggml_backend_buffer_t buf = nullptr;
+        std::size_t off[3] = {}, bytes[3] = {};
+        if (!stage_prefetch_take_impl(hm.gate_data, hm.up_data, hm.down_data, buf, off, bytes)) return false;
+        ggml_init_params ip{};
+        ip.mem_size = 4 * ggml_tensor_overhead();
+        ip.no_alloc = true;
+        ggml_context* ctx = ggml_init(ip);
+        if (ctx == nullptr) return false;
+        ggml_tensor* g = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(hm.gate_type), hm.gate_ne0, hm.gate_ne1, hm.num_experts);
+        ggml_tensor* u = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(hm.up_type), hm.up_ne0, hm.up_ne1, hm.num_experts);
+        ggml_tensor* d = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(hm.down_type), hm.down_ne0, hm.down_ne1, hm.num_experts);
+        auto* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(buf));
+        bool ok = ggml_nbytes(g) == bytes[0] && ggml_nbytes(u) == bytes[1] && ggml_nbytes(d) == bytes[2]
+            && ggml_backend_tensor_alloc(buf, g, base + off[0]) == GGML_STATUS_SUCCESS
+            && ggml_backend_tensor_alloc(buf, u, base + off[1]) == GGML_STATUS_SUCCESS
+            && ggml_backend_tensor_alloc(buf, d, base + off[2]) == GGML_STATUS_SUCCESS;
+        if (ok)
+            ok = tsm::moe_mm_encode(backend, hm.moe_in, hm.sel_ids, hm.weights, g, u, d, hm.moe_out,
+                                    hm.seq_len, hm.hidden, hm.n_ff, hm.num_experts, hm.n_used, true);
+        ggml_free(ctx);
+        if (!ok)
+        {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true))
+                std::fprintf(stderr, "[tsm] prompt experts at the seam fall back to the streamed graph: %s\n",
+                    g_last_error.c_str());
+            return false;
+        }
+        // The routing statistics the host path keeps (the expert tiers' adaptation reads them).
+        static thread_local std::vector<std::int32_t> s_ids;
+        s_ids.resize(static_cast<std::size_t>(routes));
+        ggml_backend_tensor_get(hm.sel_ids, s_ids.data(), 0, s_ids.size() * sizeof(std::int32_t));
+        moe_routing_count(hm.gate_data, hm.num_experts, s_ids.data(), s_ids.size());
+        g_moe_mm_seam_layers.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+#endif
+
     // TS_HOST_MOE_OVERLAP=0 runs a tiered seam's accelerator half after the host's
     // (the A/B for the overlap in host_moe_execute_segments).
     bool host_moe_overlap_enabled()
@@ -2911,17 +3008,23 @@ namespace tsg
         // segments (the segments themselves go to the node profile), so a prompt chunk's time is attributed.
         static thread_local double s_prof_device_op_ms = 0;
         static thread_local int s_prof_device_ops = 0;
+        static thread_local std::map<std::string, std::pair<double, int>> s_prof_device_by_name;
         struct ProfPassReport
         {
             bool on; int seq; pass_clock::time_point t0;
+            NodeProfileTotals nodes0 = on ? node_profile_totals() : NodeProfileTotals{};
             ~ProfPassReport()
             {
                 if (!on) return;
                 std::fprintf(stderr, "[node-profile] host-MoE pass T=%d: %.1f ms wall, TS device ops %.1f ms over %d\n", seq,
                              std::chrono::duration<double, std::milli>(pass_clock::now() - t0).count(),
                              s_prof_device_op_ms, s_prof_device_ops);
+                for (const auto& kv : s_prof_device_by_name)
+                    std::fprintf(stderr, "    %-12s %8.1f ms over %d\n", kv.first.c_str(), kv.second.first, kv.second.second);
+                node_profile_print_since(nodes0, "this pass's segments", 40);
                 s_prof_device_op_ms = 0;
                 s_prof_device_ops = 0;
+                s_prof_device_by_name.clear();
             }
         } prof_report{graph_node_profile_enabled() && pass_seq >= 64, pass_seq, pass_clock::now()};
 
@@ -2988,9 +3091,18 @@ namespace tsg
                 }
                 if (prof)
                 {
+                    // The operation's own command buffers, which ggml's synchronize does not wait for: their GPU time
+                    // goes to the operation, not to the next segment's first node.
                     sync_backend(backend);
-                    s_prof_device_op_ms += ms_since(t_op);
+#if defined(TSG_GGML_USE_METAL)
+                    tsm::wait_last();
+#endif
+                    const double op_ms = ms_since(t_op);
+                    s_prof_device_op_ms += op_ms;
                     ++s_prof_device_ops;
+                    auto& by = s_prof_device_by_name[segments[seg].device_name ? segments[seg].device_name : "device op"];
+                    by.first += op_ms;
+                    ++by.second;
                 }
                 continue;
             }
@@ -3051,6 +3163,14 @@ namespace tsg
                 h->launched = ggml_backend_graph_compute_async(h->backend, &view) == GGML_STATUS_SUCCESS;
             };
             const auto t_host = s_pass_timing ? pass_clock::now() : pass_clock::time_point{};
+#if defined(TSG_GGML_USE_METAL)
+            if (!debug_this_call && hot.end <= hot.begin && host_moe_prompt_mm(hm, backend))
+            {
+                if (s_pass_timing) s_acc_host += ms_since(t_host);
+                if (prefetch && prefetchable(next_host(seg + 1))) moe_stage_prefetch_start(segments[next_host(seg + 1)]);
+                continue;
+            }
+#endif
             if (!host_moe_compute_segment(hm, s_moe_out, kernel_name,
                                           debug_this_call ? &staged : nullptr, true,
                                           !debug_this_call && hm.verify_gpu == nullptr ? &output_on_device : nullptr,
@@ -3115,6 +3235,10 @@ namespace tsg
                 std::fflush(stderr);
             }
         }
+#if defined(TSG_GGML_USE_METAL)
+        // A prompt pass may have run its experts on the tensor-API GEMM: its scratch goes with the pass.
+        if (pass_seq > 8) tsm::moe_mm_release();
+#endif
         if (s_pass_timing)
         {
             const int seq = segments.empty() ? 0 : segments[0].seq_len;
@@ -3126,20 +3250,23 @@ namespace tsg
             s_acc_seq = seq;
             s_acc_total += ms_since(t_pass);
             if (s_acc_passes == 0) TSGgml_MoeOffloadCounters(acc.c0, 9);
-            if (++s_acc_passes == 32)
+            // Decode/verify widths report over 32 passes; a prompt pass (one a chunk, rare) reports on its own.
+            const int report_every = seq > 8 ? 1 : 32;
+            if (++s_acc_passes == report_every)
             {
-                // Tier routes over the 32 passes (the seams' expert counters): held, read into a window slot first, and
+                // Tier routes over the passes (the seams' expert counters): held, read into a window slot first, and
                 // left to the host; the bytes the reads took.
                 long long c1[9] = {};
                 TSGgml_MoeOffloadCounters(c1, 9);
+                const double n = report_every;
                 std::fprintf(stderr,
                     "[HOSTMOE-PASS] %s seq=%d segments=%zu per pass: total %.2f ms = accelerator %.2f + host experts %.2f "
                     "(incl. input download) + upload %.2f + other %.2f | routes held %.1f, window reads %.2f (%.2f MB), "
                     "host %.2f%s\n",
-                    kernel_name, seq, segments.size(), s_acc_total / 32, s_acc_gpu / 32, s_acc_host / 32, s_acc_up / 32,
-                    (s_acc_total - s_acc_gpu - s_acc_host - s_acc_up) / 32,
-                    (c1[0] - acc.c0[0]) / 32.0, (c1[1] - acc.c0[1]) / 32.0, (c1[8] - acc.c0[8]) / 32.0 / 1048576.0,
-                    (c1[7] - acc.c0[7]) / 32.0, seamed ? " (event seams)" : "");
+                    kernel_name, seq, segments.size(), s_acc_total / n, s_acc_gpu / n, s_acc_host / n, s_acc_up / n,
+                    (s_acc_total - s_acc_gpu - s_acc_host - s_acc_up) / n,
+                    (c1[0] - acc.c0[0]) / n, (c1[1] - acc.c0[1]) / n, (c1[8] - acc.c0[8]) / n / 1048576.0,
+                    (c1[7] - acc.c0[7]) / n, seamed ? " (event seams)" : "");
                 std::fflush(stderr);
                 s_acc_gpu = s_acc_host = s_acc_up = s_acc_total = 0;
                 s_acc_passes = 0;
@@ -3155,6 +3282,17 @@ extern "C"
     TSG_EXPORT long long TSGgml_MoeStagePrefetchHits()
     {
         return tsg::moe_stage_prefetch_hits();
+    }
+
+    // Test hook: the prompt-width offloaded layers whose experts ran on Strata's grouped GEMM at the seam
+    // (host_moe_prompt_mm), process total.
+    TSG_EXPORT long long TSGgml_MoeMmSeamLayers()
+    {
+#if defined(TSG_GGML_USE_METAL)
+        return g_moe_mm_seam_layers.load(std::memory_order_relaxed);
+#else
+        return 0;
+#endif
     }
 
     // Streamed MoE graphs that staged into the one staging buffer without a prefetch (a tiered layer's prompt-width

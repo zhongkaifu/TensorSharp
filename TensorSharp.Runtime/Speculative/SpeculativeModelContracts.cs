@@ -153,6 +153,12 @@ namespace TensorSharp.Runtime.Speculative
         int SpecSoloMaxDraftTokens => int.MaxValue;
 
         /// <summary>
+        /// Why <see cref="SpecSoloMaxDraftTokens"/> is below the requested draft count, and how to
+        /// lift it, for the one warning the executor logs when it lowers a request (no silent caps).
+        /// </summary>
+        string? SpecSoloDraftCapReason => null;
+
+        /// <summary>
         /// Optional default specifically for weight-free n-gram drafting. A positive
         /// value may exceed the shared default when a wider verification batch uses
         /// a faster backend kernel. Explicit --spec-draft still wins within
@@ -333,6 +339,16 @@ namespace TensorSharp.Runtime.Speculative
         /// <summary>Tokens a <see cref="DraftHeadKind.Block"/> head emits per
         /// pass (its trained block size); 0 for a per-token head.</summary>
         int DraftBlockSize => 0;
+
+        /// <summary>
+        /// True when a <see cref="DraftHeadKind.Block"/> head's attention is causal inside
+        /// the block (DSpine), so the first w rows of its block ARE a w-row block: the
+        /// speculator then drafts only the rows a step can verify instead of the trained
+        /// block. False for DFlash / DFlash2, whose block attention is non-causal - a
+        /// narrower block drafts different tokens there, so they always draft the whole
+        /// block and the speculator takes its prefix.
+        /// </summary>
+        bool DraftBlockIsCausal => false;
 
         /// <summary>
         /// True when <see cref="ISpeculativeTarget.SpecForward"/> replays this

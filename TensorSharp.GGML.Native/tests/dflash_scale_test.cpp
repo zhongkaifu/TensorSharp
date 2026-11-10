@@ -7,7 +7,23 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <vector>
+
+// Ring rows aligned to 16 KB (a Metal page), as the allocator's tensors are: the inject writes a ring in place only
+// where the backend can wrap its host pointer, std::vector's 16-byte alignment is below what the CPU buffer type
+// needs, and the inject declines such a ring (glibc's large allocations are 16 bytes past a page, so this failed on
+// Linux CPU and not on macOS).
+template <class T> struct PageAligned {
+    using value_type = T;
+    PageAligned() = default;
+    template <class U> PageAligned(const PageAligned<U>&) {}
+    T* allocate(std::size_t n) { return static_cast<T*>(::operator new(n * sizeof(T), std::align_val_t(16384))); }
+    void deallocate(T* p, std::size_t) { ::operator delete(p, std::align_val_t(16384)); }
+    template <class U> bool operator==(const PageAligned<U>&) const { return true; }
+    template <class U> bool operator!=(const PageAligned<U>&) const { return false; }
+};
+using RingRows = std::vector<float, PageAligned<float>>;
 
 extern "C" {
 int TSGgml_IsBackendAvailable(int);
@@ -114,7 +130,7 @@ bool run(int mode, bool selector, Result& result) {
     for (int side = 0; side < 2; ++side)
         std::fill(conv_base.begin() + side*TAPS*H, conv_base.begin() + side*TAPS*H + H, 1.f);
     std::vector<void*> norms(N,norm.data()), bases(N,conv_base.data());
-    std::vector<std::vector<float>> rk(N,std::vector<float>(RING*HD)), rv = rk;
+    std::vector<RingRows> rk(N,RingRows(RING*HD)), rv = rk;
     std::vector<void*> ringk(N), ringv(N);
     for (int l = 0; l < N; ++l) { ringk[l] = rk[l].data(); ringv[l] = rv[l].data(); }
     std::vector<float> features = data(FEAT*B,1.f), scales(SCALE_COUNT);

@@ -9,18 +9,34 @@ namespace InferenceWeb.Tests;
 /// Keeps the trained model's 512-expert router width in a small deterministic
 /// checkpoint. Metal selects a different softmax reduction geometry for four
 /// rows than for one row unless decode preserves each request's row geometry.
-/// Synthetic weights verify numerical isolation, not language quality.
+/// The arena follows the verify switch: TS_Q4E_VERIFY_ROW_KERNELS=1 keeps each
+/// request's one-token kernels (bitwise equal to independent requests); the
+/// default shares the batched kernels (weights read once a step) and stays
+/// within rounding of them. Synthetic weights verify numerical isolation, not
+/// language quality.
 /// </summary>
 [Collection("Qwen4Exp MTP integration")]
 public sealed class Qwen4ExpRouterBatchGeometryTests(ITestOutputHelper output) : IDisposable
 {
     private readonly string _directory = Path.Combine(Path.GetTempPath(), "ts-q4e-router-" + Guid.NewGuid().ToString("N"));
     private readonly EnvScope _environment = new();
+    // The native library reads TS_Q4E_VERIFY_ROW_KERNELS with getenv.
+    private readonly NativeEnvScope _native = new();
 
     [GgmlTheory(BackendType.GgmlMetal)]
     [InlineData(3)]
     [InlineData(4)]
-    public void Router512Experts_MetalBatchedLogitsMatchSoloBitwise(int width)
+    public void Router512Experts_MetalBatchedLogitsMatchSoloBitwise(int width) => Run(width, exactRows: true);
+
+    // Batched kernels round the shared router and projections differently from
+    // one row; on this fixture the difference is ~5e-7. A bound three orders above
+    // that still catches a wrong slot, state or KV row.
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void Router512Experts_MetalBatchedKernelsStayWithinRounding(int width) => Run(width, exactRows: false);
+
+    private void Run(int width, bool exactRows)
     {
         const int steps = 8;
         Directory.CreateDirectory(_directory);
@@ -29,6 +45,7 @@ public sealed class Qwen4ExpRouterBatchGeometryTests(ITestOutputHelper output) :
         _environment.Set("TS_PER_SEQ_FUSED", "1");
         _environment.Set("TS_Q4E_DISABLE_ARENA_DECODE", null);
         _environment.ClearSpeculationVars();
+        _native.Set("TS_Q4E_VERIFY_ROW_KERNELS", exactRows ? "1" : null);
         MoeCpuOffloadConfig.Reset();
         // The router stays on Metal. Host expert weights keep the fixture's
         // accelerator footprint small while retaining 512 experts / top ten.
@@ -63,7 +80,7 @@ public sealed class Qwen4ExpRouterBatchGeometryTests(ITestOutputHelper output) :
                 model.BatchedFusedDecodeDeclineReason);
             for (int row = 0; row < width; ++row)
             {
-                AssertBitwiseEqual(expected[order[row]][step], rows[row],
+                AssertMatches(exactRows, expected[order[row]][step], rows[row],
                     $"width={width}, step={step}, request={order[row]}, caller row={row}");
                 if (row > 0) Assert.NotSame(rows[0], rows[row]);
             }
@@ -78,9 +95,25 @@ public sealed class Qwen4ExpRouterBatchGeometryTests(ITestOutputHelper output) :
             float[] serial = (float[])model.Forward([Token(i, steps)]).Clone();
             model.BindSequenceCache(batchIds[i]);
             Assert.Equal(positions[i], model.CacheSeqLen);
-            AssertBitwiseEqual(serial, model.Forward([Token(i, steps)]), $"width={width}, solo continuation row={i}");
+            AssertMatches(exactRows, serial, model.Forward([Token(i, steps)]), $"width={width}, solo continuation row={i}");
         }
-        output.WriteLine($"Metal: 512 experts/top ten, width={width}, {steps} batched graphs; all prefill, decode and solo-continuation logits bitwise equal to independent requests.");
+        output.WriteLine($"Metal: 512 experts/top ten, width={width}, {steps} batched graphs; prefill bitwise, decode and " +
+            $"solo-continuation logits {(exactRows ? "bitwise equal to" : $"within {Tolerance} of")} independent requests.");
+    }
+
+    private const double Tolerance = 1e-3;
+
+    private static void AssertMatches(bool exact, float[] expected, float[] actual, string phase)
+    {
+        if (exact) { AssertBitwiseEqual(expected, actual, phase); return; }
+        Assert.Equal(expected.Length, actual.Length);
+        double maximumError = 0;
+        for (int i = 0; i < expected.Length; ++i)
+        {
+            Assert.True(float.IsFinite(expected[i]) && float.IsFinite(actual[i]), $"{phase}: non-finite logit {i}.");
+            maximumError = Math.Max(maximumError, Math.Abs((double)expected[i] - actual[i]));
+        }
+        Assert.True(maximumError < Tolerance, $"{phase}: max |dlogit|={maximumError:G9} exceeds {Tolerance}.");
     }
 
     private static int[] Prompt(int seed, int count)
@@ -105,6 +138,7 @@ public sealed class Qwen4ExpRouterBatchGeometryTests(ITestOutputHelper output) :
     public void Dispose()
     {
         _environment.Dispose();
+        _native.Dispose();
         MoeCpuOffloadConfig.Reset();
         if (Directory.Exists(_directory)) Directory.Delete(_directory, recursive: true);
     }

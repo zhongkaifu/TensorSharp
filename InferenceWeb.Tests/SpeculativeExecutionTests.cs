@@ -1426,6 +1426,8 @@ public partial class SpeculativeExecutionTests
             set => _prefersFixedCostGovernor = value;
         }
         public int SpecMaxDraftTokens { get; set; } = int.MaxValue;
+        public int SpecSoloMaxDraftTokens { get; set; } = int.MaxValue;
+        public string? SpecSoloDraftCapReason { get; set; }
         public int CacheSeqLen => _trunk.Count;
         public int ContextLimit { get; set; } = 4096;
         public int MaxContextLength => ContextLimit;

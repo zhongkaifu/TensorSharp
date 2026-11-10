@@ -39,6 +39,9 @@ namespace TensorSharp.Models
             public bool HostStale;
             public string Owner;
             public long LastUsed;
+            /// <summary>A fused inject failed for the request on this ring: its context is incomplete, and the request
+            /// decodes without drafts (ModelBase.DFlash.cs, DFlashEncodeAndInject). Cleared when the ring changes hands.</summary>
+            public bool DraftingDeclined;
         }
 
         /// <summary>Rings beyond the model's own (81 MB each on Qwen3.8-27B's DFlash2).
@@ -91,11 +94,14 @@ namespace TensorSharp.Models
         /// <summary>Return <paramref name="requestId"/>'s ring to the pool.</summary>
         internal void ReleaseDFlashRing(string requestId)
         {
+            // Without ring objects (one request at a time) the decline lives on the model; the request is over.
+            _dflashModelDraftingDeclined = false;
             if (requestId == null)
                 return;
             if (_dflashModelRing != null && string.Equals(_dflashModelRing.Owner, requestId, StringComparison.Ordinal))
             {
                 _dflashModelRing.Owner = null;   // its rows stay for the conversation's next turn
+                _dflashModelRing.DraftingDeclined = false;
                 return;
             }
             if (_dflashRingPool == null)
@@ -107,6 +113,7 @@ namespace TensorSharp.Models
                 if (ReferenceEquals(ring, _dflashActiveRing))
                     BindDFlashRing(null);
                 ring.Owner = null;
+                ring.DraftingDeclined = false;
                 return;
             }
         }
@@ -121,6 +128,8 @@ namespace TensorSharp.Models
                         pooled |= string.Equals(ring.Owner, requestId, StringComparison.Ordinal);
                 if (!pooled)
                 {
+                    if (!string.Equals(_dflashModelRing.Owner, requestId, StringComparison.Ordinal))
+                        _dflashModelRing.DraftingDeclined = false;   // a new owner drafts until its own inject fails
                     _dflashModelRing.Owner = requestId;
                     return _dflashModelRing;
                 }
@@ -145,10 +154,12 @@ namespace TensorSharp.Models
             chosen ??= lru ?? _dflashModelRing;
             if (ReferenceEquals(chosen, _dflashModelRing))
                 return chosen;
-            // A new owner starts with an empty valid run; the bytes are left as they are.
+            // A new owner starts with an empty valid run and drafting on (a ring taken from its least recently used
+            // owner may carry that owner's decline); the bytes are left as they are.
             chosen.Owner = requestId;
             chosen.Filled = 0;
             chosen.ValidFrom = 0;
+            chosen.DraftingDeclined = false;
             return chosen;
         }
 

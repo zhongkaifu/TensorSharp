@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -979,6 +980,7 @@ namespace tsg
         // segment is submitted, before the next one, which reads what it writes (ggml_ops_qwen4exp.cpp's prompt GDN
         // layers on TensorSharp's Metal kernels). False with set_last_error on a failure.
         std::function<bool(ggml_backend_t)> device_op;
+        const char* device_name = "device op";   // what TS_GGML_NODE_PROFILE's prompt-pass report calls it
         std::vector<ggml_tensor*> device_inputs;
         // What it writes (tensors bound outside the allocator): no node before the cut may read them, which
         // host_moe_build_segment_ends checks - a node order that put a reader first would read stale values.
@@ -1381,6 +1383,11 @@ namespace tsg
     // With `offload`, the profiler times an offloaded node under "<OP>:offload".
     ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag,
                                        const NodeOffload* offload = nullptr);
+    // The node profile's buckets (op, or op:type[:shape]) as totals: a snapshot at a pass's start, and the pass's own
+    // share printed as the difference at its end (a prompt pass's segments by op and projection).
+    using NodeProfileTotals = std::map<std::string, std::pair<double, long long>>;
+    NodeProfileTotals node_profile_totals();
+    void node_profile_print_since(const NodeProfileTotals& before, const char* label, int top);
     // Runs `graph` with `offload`'s nodes executed by the caller and the stretches
     // between them as ggml graph views (the mechanism graph_compute_fast_conv uses),
     // through the node profiler when TS_GGML_NODE_PROFILE is set.
@@ -1837,6 +1844,39 @@ namespace tsg
     // must invalidate downstream state keyed on that buffer use the result to skip
     // the work when the pointer had no device copy to begin with.
     bool invalidate_cached_buffer(void* data);
+    // The cached-buffer epoch (ggml_ops_core.cpp): it moves when a path frees or replaces a cached device/host-pointer
+    // buffer that a persisted graph holds (key registered through PersistedBindings), or on a bulk clear (key null).
+    std::uint64_t cached_buffer_epoch();
+    void note_cached_buffer_released(const void* key);
+    void persisted_key_hold(const void* key);
+    void persisted_key_drop(const void* key);
+
+    // A persisted graph's cached bindings: keep() registers the cache keys the graph was bound to and records the
+    // epoch; still_bound() is false once any registered key's buffer was freed or replaced since, and the graph must be
+    // rebuilt instead of replayed (a replay would run over released device memory).
+    struct PersistedBindings
+    {
+        std::vector<const void*> keys;
+        std::uint64_t epoch = 0;
+        bool held = false;
+
+        void keep(const std::vector<const void*>& bound)
+        {
+            release();
+            keys = bound;
+            for (const void* k : keys) persisted_key_hold(k);
+            held = true;
+            epoch = cached_buffer_epoch();
+        }
+        void release()
+        {
+            if (held)
+                for (const void* k : keys) persisted_key_drop(k);
+            keys.clear();
+            held = false;
+        }
+        bool still_bound() const { return held && epoch == cached_buffer_epoch(); }
+    };
     // Retire Qwen-Image-2.1 graphs before an immutable weight is changed/freed.
     void qwen_image21_invalidate_weight(const void* data);
 
@@ -2300,7 +2340,9 @@ int q4e_resolve_device(int device);
 // ggml-cuda flash-attention eligibility for this family's KV type/head size.
 bool q4e_flash_attn_ok(int kv_type, int head_dim);
 // Independent decode rows keep the solo projection/expert reductions while
-// sharing a graph. Prefill and single-sequence decode leave this disabled.
+// sharing a graph. Prefill and single-sequence decode leave this disabled; so
+// does the arena where verify runs batched (Metal by default; see
+// TS_Q4E_VERIFY_ROW_KERNELS).
 void q4e_independent_decode_rows(int rows);
 // Drop (graph only - state kept) every cached per-layer/span graph built from
 // the given holder descriptor arrays, on every device. The arena flush calls
@@ -2333,7 +2375,28 @@ ggml_tensor* q4e_nodes_gdn(
     int n_embd, int hc, int hc_low_rank, int T,
     int head_k_dim, int head_v_dim, int n_k_heads, int n_v_heads, int d_conv,
     float eps, Q4eGdnWriteback* wb,
-    std::vector<ggml_tensor*>* probe = nullptr);
+    std::vector<ggml_tensor*>* probe = nullptr, int n_seqs = 1);
+
+// One arena slot's own attention inputs for q4e_nodes_attn_slots: its mask row, its cache-position index, its cache
+// views and padded window, and its QSA state (null without QSA).
+struct Q4eAttnSlot
+{
+    ggml_tensor* mask = nullptr;
+    ggml_tensor* kv_idx = nullptr;
+    ggml_tensor* k_cache = nullptr;
+    ggml_tensor* v_cache = nullptr;
+    int n_kv_pad = 0;
+    const Q4eQsaGraph* qsa = nullptr;
+};
+
+ggml_tensor* q4e_nodes_attn_slots(
+    ggml_context* ctx, ggml_cgraph* graph, Q4eBinder& bnd,
+    const TSGgmlQwen4ExpAttnArgs* a, ggml_tensor* res_in, ggml_tensor* pos, int n_slots,
+    const Q4eAttnSlot* slots,
+    int n_embd, int hc, int hc_low_rank,
+    int head_dim, int n_head, int n_head_kv,
+    int n_rot, float rope_base, float rope_freq_scale, float attn_scale,
+    float eps, bool use_flash);
 
 ggml_tensor* q4e_nodes_attn(
     ggml_context* ctx, ggml_cgraph* graph, Q4eBinder& bnd,

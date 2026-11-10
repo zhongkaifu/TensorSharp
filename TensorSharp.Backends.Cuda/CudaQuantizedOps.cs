@@ -285,6 +285,75 @@ namespace TensorSharp.Cuda
             IntPtr resultPtr, int inDim, int outDim, int rows)
             => RunF16Gemm(allocator, allocator.Kernels, weightPtr, ggmlType, inputPtr, resultPtr, inDim, outDim, rows);
 
+        /// <summary>
+        /// While open on a thread, the F16 GEMM route keeps each weight it dequantizes in <paramref name="arena"/> (as long as
+        /// it fits) and later calls with the same weight on the same allocator reuse that copy instead of dequantizing again:
+        /// an engine that runs several ubatches of one layer back to back (Flash Next's prompt groups) dequantizes each of the
+        /// layer's weights once. The copy is the same kernel's output, so every product is the same bit for bit. The caller
+        /// owns the arena, keeps it alive while the scope is open, and must not let another weight take a cached address
+        /// (a scope lives within one layer's calls).
+        /// </summary>
+        internal static F16WeightScope BeginF16WeightScope(CudaAllocator allocator, IntPtr arena, long capacity)
+        {
+            var scope = new F16WeightScope(allocator, arena, capacity);
+            t_f16Scope = scope;
+            return scope;
+        }
+
+        [ThreadStatic] private static F16WeightScope t_f16Scope;
+
+        internal sealed class F16WeightScope : IDisposable
+        {
+            private readonly CudaAllocator _allocator;
+            private readonly IntPtr _arena;
+            private readonly long _capacity;
+            private long _used;
+            private readonly Dictionary<IntPtr, IntPtr> _copies = new();
+
+            /// <summary>Weights dequantized into the arena, and calls that reused one.</summary>
+            public int Dequantized { get; private set; }
+            public int Reused { get; private set; }
+
+            internal F16WeightScope(CudaAllocator allocator, IntPtr arena, long capacity)
+            {
+                _allocator = allocator;
+                _arena = arena;
+                _capacity = capacity;
+            }
+
+            /// <summary>The cached copy of <paramref name="weight"/> (<paramref name="fresh"/> false), or room for one
+            /// (<paramref name="fresh"/> true, the caller dequantizes into it), or false when the arena has no room.</summary>
+            internal bool TryTake(CudaAllocator allocator, IntPtr weight, long bytes, out IntPtr f16, out bool fresh)
+            {
+                fresh = false;
+                if (!ReferenceEquals(allocator, _allocator) || _arena == IntPtr.Zero)
+                {
+                    f16 = IntPtr.Zero;
+                    return false;
+                }
+                if (_copies.TryGetValue(weight, out f16))
+                {
+                    Reused++;
+                    return true;
+                }
+                long size = (bytes + 255) & ~255L;     // cuBLAS sees the alignment the scratch gives
+                if (_used + size > _capacity)
+                    return false;
+                f16 = (IntPtr)((long)_arena + _used);
+                _used += size;
+                _copies[weight] = f16;
+                fresh = true;
+                Dequantized++;
+                return true;
+            }
+
+            public void Dispose()
+            {
+                if (ReferenceEquals(t_f16Scope, this))
+                    t_f16Scope = null;
+            }
+        }
+
         private static void RunF16Gemm(
             CudaAllocator allocator, CudaKernels kernels,
             IntPtr weightPtr, int ggmlType, IntPtr inputPtr, IntPtr resultPtr,
@@ -305,11 +374,17 @@ namespace TensorSharp.Cuda
             }
             else
             {
-                wF16 = EnsureScratch(WF16Scratch, allocator, wElems * 2);
-                if (ggmlType == 8 && Q80F16DequantEnabled)
-                    kernels.LaunchDequantWeightQ80F16(weightPtr, wF16, wElems, stream);
-                else
-                    kernels.LaunchDequantWeightF16(weightPtr, wF16, ggmlType, inDim, wElems, stream);
+                F16WeightScope scope = t_f16Scope;
+                bool fresh = true;
+                if (scope == null || !scope.TryTake(allocator, weightPtr, wElems * 2, out wF16, out fresh))
+                    wF16 = EnsureScratch(WF16Scratch, allocator, wElems * 2);
+                if (fresh)
+                {
+                    if (ggmlType == 8 && Q80F16DequantEnabled)
+                        kernels.LaunchDequantWeightQ80F16(weightPtr, wF16, wElems, stream);
+                    else
+                        kernels.LaunchDequantWeightF16(weightPtr, wF16, ggmlType, inDim, wElems, stream);
+                }
             }
             kernels.LaunchConvertF32F16(inputPtr, aF16, aElems, stream);
 

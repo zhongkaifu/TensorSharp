@@ -10,6 +10,15 @@
   // speculative governor falls back to plain decoding there (about 21 tok/s). Slower in the same
   // runs: 5 drafts (code 36.3), the Q8_0 drafter, the checkpoint's own NextN head, and the default
   // confidence gate. Sampling (temperature > 0) still speculates, with fewer drafts accepted.
+  // 2026-11-09, eng/qwen38-engine-bench.py (two passes): long generation 34.5 tok/s (plain 21.3),
+  // 49.7 after a 4K-token prompt, 42.1 after 16K, 48.6 on the generated quality tasks.
+  //
+  // For mostly long-prompt work (4K-8K tokens), Tencent's DSpine drafter is faster here: 65.0 tok/s
+  // after a 4K prompt (+31%; its context ring holds 8192 rows against DFlash2's 2080), the same
+  // speed elsewhere, identical greedy text. It has no published GGUF: convert the pinned checkpoint
+  // with `python3 eng/dspine-to-gguf.py --input <tencent/Qwen3.8-27B-DSpine-b16 dir> --out
+  // Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf --type q4_k_m` and pass it as --draft-model (keep 7 drafts:
+  // a Metal verify wider than 8 rows costs 146-153 ms against 88). See docs/speculative_decoding.md.
   "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
   "model": {
     "path": "${modelRoot}/Qwen/Qwen3.8-27B-UD-IQ3_XXS.gguf",

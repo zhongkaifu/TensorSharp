@@ -295,11 +295,14 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     /// activations amplify the difference to 3.0e-4. With the QSA selection kernels (tsm_qsa_prompt.metal) the cells a
     /// row keeps can differ where a block's cells tie at the cutoff: ggml's top_k fills ties in atomic order, the
     /// kernels lowest index first (QsaSelection_KeepsTheBestCells_TiesLowestFirst proves the contract), so the bound
-    /// is a valid choice's, not rounding's: measured 8.5e-3 at the first decode step, every argmax equal. The counters
+    /// is a valid choice's, not rounding's: measured 8.5e-3 at the first decode step, every argmax equal. The
+    /// hyper-connection read runs fused on fp16 operands (tsm_hc_read.metal, HcRead_AnswersAsTheDoublePrecisionReference):
+    /// with it alone 9.5e-4 at the prefill and 1.06e-3 at the first decode step, every argmax equal. The counters
     /// prove the kernels ran.</summary>
     [GgmlTheory(BackendType.GgmlMetal)]
     [InlineData("gdn", false)]
     [InlineData("hc", false)]
+    [InlineData("hcmix", false)]
     [InlineData("gdn,hc", false)]
     [InlineData("gdn,hc", true)]
     [InlineData("qsa", false)]
@@ -310,12 +313,13 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     public void PromptKernels_OnTsm_AnswerAsGgml_Metal(string kernels, bool hostExperts)
     {
         bool gdn = kernels.Contains("gdn"), hc = kernels.Contains("hc"), qsa = kernels.Contains("qsa");
-        bool attn = kernels.Contains("attn");
+        bool attn = kernels.Contains("attn"), fusedRead = hc && !kernels.Contains("hcmix");
         float[][] Answer(bool useGdn, bool useHc, bool useQsa, bool useAttn)
         {
             using var env = new NativeEnvScope();
             env.Set("TS_METAL_GDN_PROMPT", useGdn ? "1" : "0");
             env.Set("TS_METAL_HC_PROMPT", useHc ? "1" : "0");
+            env.Set("TS_METAL_HC_READ", fusedRead ? "1" : "0");   // hcmix: the read's mix pass after ggml's matmuls
             env.Set("TS_METAL_QSA_SELECT", useQsa ? "1" : "0");
             env.Set("TS_METAL_QSA_ATTN", useAttn ? "1" : "0");
             env.Set("TS_METAL_QSA_ATTN_MIN_CELLS", "1");   // the fixture's window is a few hundred cells
@@ -325,19 +329,98 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         // selection, so the tie freedom of the selection drops out of that comparison.
         float[][] ggml = Answer(attn && gdn, attn && hc, attn, false);
         long gdnBefore = GgmlBasicOps.TsmGdnPromptCount(), hcBefore = GgmlBasicOps.TsmHcPromptCount();
+        long readBefore = GgmlBasicOps.TsmHcReadCount();
         long qsaBefore = GgmlBasicOps.TsmQsaSelectCount(), attnBefore = GgmlBasicOps.TsmQsaAttnCount();
         float[][] tsm = Answer(gdn, hc, qsa, attn);
         long gdnLayers = GgmlBasicOps.TsmGdnPromptCount() - gdnBefore, hcPasses = GgmlBasicOps.TsmHcPromptCount() - hcBefore;
         long qsaLayers = GgmlBasicOps.TsmQsaSelectCount() - qsaBefore, attnLayers = GgmlBasicOps.TsmQsaAttnCount() - attnBefore;
         _output.WriteLine($"tsm kernels: {gdnLayers} GDN layers, {hcPasses} hyper-connection passes, {qsaLayers} QSA selections, "
             + $"{attnLayers} QSA attention passes");
-        // The fixture's 8 layers: 6 GDN, 2 QSA, 16 half-layers with a read and a scatter each.
+        // The fixture's 8 layers: 6 GDN, 2 QSA, 16 half-layers with a read (fused, tsm::hc_read_encode) and a scatter each.
         Assert.Equal(gdn ? 6 : 0, gdnLayers);
         Assert.Equal(hc ? 32 : 0, hcPasses);
+        Assert.Equal(fusedRead ? 16 : 0, GgmlBasicOps.TsmHcReadCount() - readBefore);
         Assert.Equal(qsa ? 2 : 0, qsaLayers);
         Assert.Equal(attn ? 2 : 0, attnLayers);
-        double bound = attn ? (hostExperts ? 1e-3 : 2e-4) : qsa ? 2e-2 : hostExperts ? 1e-3 : 2e-4;
+        double bound = attn ? (hostExperts ? 1e-3 : 2e-4) : qsa ? 2e-2 : fusedRead ? 2e-3 : hostExperts ? 1e-3 : 2e-4;
         AssertClose($"tsm {kernels}", tsm, ggml, bound);
+    }
+
+    /// <summary>A prompt the scheduler feeds in chunks hints each next chunk (IModelArchitecture.PrepareNextPrefillChunk):
+    /// the PLE rows of the next chunk are gathered on the thread pool while the current one computes, from the n-gram
+    /// history it will have, and the next chunk takes them when its tokens, position and history match. The same rows
+    /// either way, so the logits are bit for bit those of gathering each chunk when it runs (TS_Q4E_PLE_PREFETCH=0). A
+    /// hint for a chunk that never comes (another request's forward in between) is discarded; a chunk that starts the
+    /// hinted one (the scheduler holds a prompt's last token back) takes its leading rows.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void PleRows_PrefetchedForTheNextChunk_AnswerAsGatheredInPlace_Metal()
+    {
+        int[] first = LongPrompt.Concat(LongPrompt).Take(300).ToArray();
+        int[] second = LongPrompt.Reverse().Concat(LongPrompt).Take(300).ToArray();
+        float[][] Answer(string prefetch, bool strayHint, out long hits, int secondLength = 300)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_Q4E_PLE_PREFETCH", prefetch);
+            MoeCpuOffloadConfig.Reset();
+            string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "qwen4exp.gguf"), 16);
+            using ModelBase model = ModelBase.Create(path, BackendType.GgmlMetal);
+            var q = Assert.IsType<Qwen4ExpModel>(model);
+            model.PrepareNextPrefillChunk(second, first.Length);
+            var rows = new List<float[]> { (float[])model.ForwardRefill(first).Clone() };
+            if (strayHint)
+                model.PrepareNextPrefillChunk(second.Reverse().ToArray(), first.Length + second.Length);
+            rows.Add((float[])model.Forward(second.Take(secondLength).ToArray()).Clone());
+            foreach (int step in Steps)
+                rows.Add((float[])model.Forward(new[] { step }).Clone());
+            hits = q.PlePrefetchHitsForTests;
+            return rows.ToArray();
+        }
+        float[][] inPlace = Answer("0", false, out long offHits);
+        float[][] prefetched = Answer("1", false, out long onHits);
+        float[][] stray = Answer("1", true, out long strayHits);
+        float[][] shortInPlace = Answer("0", false, out _, 299);
+        float[][] shortPrefetched = Answer("1", false, out long shortHits, 299);
+        Assert.Equal(0, offHits);
+        Assert.Equal(1, onHits);
+        Assert.Equal(1, strayHits);   // the stray hint is gathered, then not taken (the decode steps differ)
+        Assert.Equal(1, shortHits);
+        for (int i = 0; i < inPlace.Length; i++)
+        {
+            Assert.True(prefetched[i].AsSpan().SequenceEqual(inPlace[i]), $"row {i}: the prefetched PLE rows changed the logits");
+            Assert.True(stray[i].AsSpan().SequenceEqual(inPlace[i]), $"row {i}: a stray hint changed the logits");
+            Assert.True(shortPrefetched[i].AsSpan().SequenceEqual(shortInPlace[i]), $"row {i}: a shorter chunk's prefetched rows changed the logits");
+        }
+    }
+
+    /// <summary>A prompt-width offloaded layer of Q2_0 experts runs on Strata's grouped expert GEMM (tsm::moe_mm_encode).
+    /// With its stacks staged by the prefetch, the seam runs the GEMM on the span graph's own tensors (the router's ids
+    /// and weights, the FFN input, moe_out) instead of downloading the input, streaming it through a graph of its own and
+    /// uploading the result. Same kernels on the same bytes, so the prompt answers bit for bit as the round trip; decode
+    /// keeps the host kernels either way.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void PromptExperts_GemmAtTheSeam_AnswerAsTheRoundTrip_Metal()
+    {
+        string fixture = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "qwen4exp-q2.gguf"), 16,
+            expertGateUpType: SyntheticGguf.GgmlType.Q2_0, expertDownType: SyntheticGguf.GgmlType.Q2_0);
+        float[][] Answer(string seam, out long gemms, out long seamLayers)
+        {
+            using var env = new NativeEnvScope();
+            env.Set("TS_METAL_MOE_MM_SEAM", seam);
+            long mm0 = GgmlBasicOps.TsmMoeMmCount(), seam0 = GgmlBasicOps.MoeMmSeamLayers();
+            float[][] rows = Run(BackendType.GgmlMetal, MoeCpuOffloadConfig.SetAllLayers, LongPrompt, Steps, null, null, fixture);
+            gemms = GgmlBasicOps.TsmMoeMmCount() - mm0;
+            seamLayers = GgmlBasicOps.MoeMmSeamLayers() - seam0;
+            return rows;
+        }
+        float[][] roundTrip = Answer("0", out long rtGemms, out long rtSeam);
+        float[][] seam = Answer("1", out long seamGemms, out long seamLayers);
+        _output.WriteLine($"round trip: {rtGemms} expert GEMMs, {rtSeam} at the seam; seam: {seamGemms} GEMMs, {seamLayers} at the seam");
+        Assert.Equal(8, rtGemms);   // the fixture's 8 layers, each through the streamed graph's GEMM
+        Assert.Equal(0, rtSeam);
+        Assert.Equal(8, seamGemms);
+        Assert.Equal(8, seamLayers);
+        for (int i = 0; i < seam.Length; i++)
+            Assert.True(seam[i].AsSpan().SequenceEqual(roundTrip[i]), $"row {i}: the seam's GEMM changed the logits");
     }
 
     /// <summary>A prefill-width batch streams every expert an offloaded layer routes into its staging tensor. With a
@@ -406,6 +489,11 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     [GgmlFact(BackendType.GgmlMetal)]
     public void TieredExperts_PromptOverflow_RunsOnTheAccelerator_Metal()
     {
+        // The seamed pass reads its hyper connections fused on fp16 operands (TS_METAL_HC_READ, ~1e-3 on this fixture:
+        // PromptKernels_OnTsm_AnswerAsGgml_Metal), which the all-accelerator span does not; the bound here is the
+        // expert placement's, so both read as ggml does.
+        using var env = new NativeEnvScope();
+        env.Set("TS_METAL_HC_READ", "0");
         float[][] device = Run(BackendType.GgmlMetal, () => { }, LongPrompt);
         // (2, 2) leaves rows with three overflow routes, which ggml-metal's MUL_MAT_ID has no kernel for: they are
         // padded to four (an abort before the padding).

@@ -26,6 +26,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using TensorSharp.Cuda.Interop;
@@ -203,6 +204,10 @@ namespace TensorSharp.Cuda
             public Tensor RouterLogits, ShGate, ShUp, ShDown;
             /// <summary>A prompt's router widened from BF16 (allocated on first use).</summary>
             public Tensor RouterF32;
+            /// <summary>The chunked prompt recurrence's T, P and gamma (allocated on first use; when that fails,
+            /// <see cref="GdnChunkUnavailable"/> and the prompt keeps the token-by-token scan).</summary>
+            public Tensor GdnChunkScr;
+            public bool GdnChunkUnavailable;
             // head
             public Tensor Logits, BatchLogits;
             /// <summary>A greedy verify's rows' first-max tokens.</summary>
@@ -525,6 +530,8 @@ namespace TensorSharp.Cuda
 
             foreach (var dev in _devs)
                 AllocateScratch(dev);
+            // Before the first slot: the timing's weight copies need the VRAM the slot's caches will take.
+            TuneQ80PairKernels();
             ReportResidency();
             StartHostExperts();
             _active = CreateSlot();
@@ -916,12 +923,69 @@ namespace TensorSharp.Cuda
                    || CudaQuantizedOps.ResidentMatmulTakesQ81(w.Type, (int)w.Ne0, (int)w.Ne1, rows)
                    || Dsv4Kernels.DenseQ81RowsSupports(w.Type, (int)w.Ne0));
 
+        /// <summary>
+        /// Whether a decode-size call of <paramref name="rows"/> on <paramref name="w"/> runs the Q8_0 pair matvec: a Q8_0
+        /// weight of whole 32-value blocks, 1 to 16 rows, the pair loaded and on (TS_Q4E_Q80_PAIR), and the weight not one
+        /// that keeps the decode-once dense kernels (<see cref="DeviceWeight.DecodeOnce"/>: the TS_Q4E_HC_Q8 copies of the
+        /// hyper-connection down mixers and the MTP block's weights, where the pair was 1.2-2x slower from three rows on the
+        /// RTX 5090). A weight takes one kernel at every row count, so a row computes the same at every width.
+        /// </summary>
+        internal static bool TakesQ80Pair(in DeviceWeight w, int rows, bool hasPair)
+            => w.Type == TQ8_0 && !w.DecodeOnce && Q80Pair && hasPair && rows >= 1 && rows <= CudaKernels.Q80PairMaxRows
+               && (w.Ne0 & 31) == 0;
+
+        /// <summary>Every dense projection on each device that <see cref="MatMul(Dev, in DeviceWeight, Tensor, IntPtr, Tensor, int, IntPtr)"/>
+        /// may run: each layer's on its device, the output head's and the MTP block's on the last.</summary>
+        private IEnumerable<(int Device, DeviceWeight Weight)> DenseDeviceWeights()
+        {
+            foreach (DevLayer L in _layers)
+                foreach (DeviceWeight w in new[] { L.HcAttnDown, L.HcAttnUp, L.HcFfnDown, L.HcFfnUp, L.Qkv, L.Gate, L.SsmOut,
+                             L.Wq, L.Wk, L.Wv, L.Wo, L.PleKey, L.PleValue, L.GateShexp, L.UpShexp, L.DownShexp })
+                    yield return (L.Device, w);
+            foreach (DeviceWeight w in new[] { _output, _outHcDown, _outHcUp })
+                yield return (_lastDev, w);
+            if (_mtpLayer != null)
+            {
+                DevLayer M = _mtpLayer;
+                foreach (DeviceWeight w in new[] { M.HcAttnDown, M.HcAttnUp, M.HcFfnDown, M.HcFfnUp, M.Wq, M.Wk, M.Wv, M.Wo,
+                             M.GateShexp, M.UpShexp, M.DownShexp, _mtpEh, _mtpHeadDown, _mtpHeadUp })
+                    yield return (M.Device, w);
+            }
+        }
+
+        /// <summary>
+        /// Time the Q8_0 pair's kernels (bit-identical, <see cref="CudaKernels.TuneQ80Pair"/>) on each device at the
+        /// shape of every weight there that takes the pair, so a launch runs this GPU's fastest for its shape and rows
+        /// rather than the H100-measured heuristic. One line a device: the cost and the kernel per shape and rows.
+        /// </summary>
+        private void TuneQ80PairKernels()
+        {
+            if (!Q80Pair)
+                return;
+            for (int d = 0; d < _devs.Length; d++)
+            {
+                Dev dev = _devs[d];
+                bool hasPair = dev.Alloc.Kernels.HasQ80Pair;
+                var weights = DenseDeviceWeights()
+                    .Where(x => x.Device == d && x.Weight.Ptr != IntPtr.Zero && TakesQ80Pair(x.Weight, 1, hasPair))
+                    .Select(x => (x.Weight.Ptr, (int)x.Weight.Ne0, (int)x.Weight.Ne1))
+                    .ToList();
+                if (weights.Count == 0)
+                    continue;
+                dev.MakeCurrent();
+                string summary = dev.Alloc.Kernels.TuneQ80Pair(weights, dev.Stream);
+                if (summary != null)
+                    Console.Error.WriteLine($"[q4e-cuda] Q8_0 pair kernels on GPU {d}: {summary}");
+            }
+            _devs[0].MakeCurrent();
+        }
+
         private static void MatMul(Dev dev, in DeviceWeight w, Tensor input, IntPtr xq, Tensor output, int rows, IntPtr stream)
         {
-            // Q8_0 decode projections: the pair matvec (tensor cores from three rows, its dp4a twin below), one
-            // arithmetic at every row count, so batched rows still compute as each sequence's own step does.
-            if (xq != IntPtr.Zero && w.Type == TQ8_0 && Q80Pair && dev.Alloc.Kernels.HasQ80Pair && rows <= CudaKernels.Q80PairMaxRows
-                && (w.Ne0 & 31) == 0)
+            // Q8_0 decode projections: the pair matvec (the kernel timed fastest on this GPU for the shape and rows; all
+            // three give the same bits), one arithmetic at every row count, so batched rows still compute as each
+            // sequence's own step does.
+            if (xq != IntPtr.Zero && TakesQ80Pair(w, rows, dev.Alloc.Kernels.HasQ80Pair))
             {
                 dev.Alloc.Kernels.LaunchQuantMatmulQ80Pair(w.Ptr, xq, Ptr(output), w.Ne0, w.Ne1, rows, stream);
                 return;

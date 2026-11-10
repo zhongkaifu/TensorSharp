@@ -38,6 +38,10 @@ namespace TensorSharp.Cuda
         private readonly IntPtr attnFinish;
         private readonly IntPtr regroup;
         private readonly IntPtr moeSelect;
+        // The keyed warp select (same picks and weights; IntPtr.Zero on a module without it).
+        private readonly IntPtr moeSelectKeys;
+        // TS_DSV4_SELECT_KEYS=0: routers of up to 512 experts keep the float-argmax warp select.
+        private static readonly bool _selectKeysEnv = Environment.GetEnvironmentVariable("TS_DSV4_SELECT_KEYS") != "0";
         private readonly IntPtr moeCount;
         private readonly IntPtr moeScan;
         private readonly IntPtr moeScatter;
@@ -46,6 +50,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr moeGateUpStaged;
         private readonly IntPtr moeDownStaged;
         private readonly IntPtr moeMma;
+        private readonly IntPtr q2i8QuantAct, q2i8GateUp, q2i8Down, moeRowMap;
         private readonly IntPtr moeGateUpDecode;
         private readonly IntPtr moeDownDecode;
         private readonly IntPtr moeGateUpDecodeQ80V, moeDownDecodeQ80V, moeGateUpDecodeQ80VPair;
@@ -67,9 +72,13 @@ namespace TensorSharp.Cuda
         // The same products for 2..16 rows in one block, the weights read once (optional: a module before it launches a
         // block per row).
         private readonly IntPtr denseQ81RowsMulti;
-        // Decode once, dot every row (optional): [R index (1, 2, 4, 8 rows a pass), W index (1, 2, 4 warps an output)].
-        private readonly IntPtr[,] denseFast = new IntPtr[4, 3];
+        // Decode once, dot every row (optional): [R (rows a pass, 1..8), W index (1, 2, 4 warps an output)]. A module from
+        // before the 3/5/6/7-row instantiations fills those widths with the next power of two's kernel.
+        private readonly IntPtr[,] denseFast = new IntPtr[9, 3];
         private readonly bool _hasDenseFast;
+
+        /// <summary>Whether the module has a decode-once kernel for every width 1..8 (each window computes its own rows).</summary>
+        public bool HasDenseFastEveryWidth { get; }
 
         /// <summary>Activation rows the one-block-for-every-row dense kernels take.</summary>
         public const int DenseMultiMaxRows = 16;
@@ -132,6 +141,13 @@ namespace TensorSharp.Cuda
         /// committed compute_75 baseline holds. See CudaKernels.ArchGuardedKernelsUsable.
         /// </summary>
         public bool HasMoeMma { get; }
+
+        /// <summary>
+        /// Whether the int8 Q2_0 expert kernels (ts_dsv4_moe_q2i8_*) are in the module with their tensor-core
+        /// bodies: they are guarded by __CUDA_ARCH__ &gt;= 800 as ts_dsv4_moe_mma_f32 is, and a module built from
+        /// older source has none.
+        /// </summary>
+        public bool HasMoeQ2I8 { get; }
 
         private Dsv4Kernels(CudaModule module)
         {
@@ -205,6 +221,8 @@ namespace TensorSharp.Cuda
             attnFinish = module.GetFunction("ts_dsv4_attn_finish_f32");
             regroup = module.GetFunction("ts_dsv4_regroup_f32");
             moeSelect = module.GetFunction("ts_dsv4_moe_select_f32");
+            try { moeSelectKeys = module.GetFunction("ts_dsv4_moe_select_keys_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { moeSelectKeys = IntPtr.Zero; }
             moeCount = module.GetFunction("ts_dsv4_moe_count_i32");
             moeScan = module.GetFunction("ts_dsv4_moe_scan_i32");
             moeScatter = module.GetFunction("ts_dsv4_moe_scatter_i32");
@@ -213,6 +231,19 @@ namespace TensorSharp.Cuda
             moeGateUpStaged = module.GetFunction("ts_dsv4_moe_gateup_staged_f32");
             moeDownStaged = module.GetFunction("ts_dsv4_moe_down_staged_f32");
             moeMma = module.GetFunction("ts_dsv4_moe_mma_f32");
+            // The int8 Q2_0 expert kernels: absent from a module built from older source; guarded by
+            // __CUDA_ARCH__ >= 800 like the F16 tensor-core kernel, so empty in a compute_75 build.
+            try
+            {
+                q2i8QuantAct = module.GetFunction("ts_dsv4_q2i8_quant_act_f32");
+                q2i8GateUp = module.GetFunction("ts_dsv4_moe_q2i8_gateup_f32");
+                q2i8Down = module.GetFunction("ts_dsv4_moe_q2i8_down_f32");
+                HasMoeQ2I8 = CudaKernels.ArchGuardedKernelsUsable(module.CompiledArchOf("ts_dsv4_moe_q2i8_gateup_f32"), ccMajor);
+                // The down kernel's act-row map came with this kernel: a module without it ignores the map.
+                try { moeRowMap = module.GetFunction("ts_dsv4_moe_row_map_i32"); }
+                catch (CudaException ex) when (ex.ErrorCode == 500) { moeRowMap = IntPtr.Zero; }
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { }
             moeGateUpDecode = module.GetFunction("ts_dsv4_moe_gateup_decode_f32");
             moeDownDecode = module.GetFunction("ts_dsv4_moe_down_decode_f32");
             try { moeDownDecodeShort = module.GetFunction("ts_dsv4_moe_down_decode_short_f32"); }
@@ -286,10 +317,25 @@ namespace TensorSharp.Cuda
                 try
                 {
                     int[] rs = { 1, 2, 4, 8 }, ws = { 1, 2, 4 };
-                    for (int ri = 0; ri < 4; ri++)
+                    foreach (int r in rs)
                         for (int wi = 0; wi < 3; wi++)
-                            denseFast[ri, wi] = module.GetFunction($"ts_dsv4_dense_fast_r{rs[ri]}_w{ws[wi]}_f32");
+                            denseFast[r, wi] = module.GetFunction($"ts_dsv4_dense_fast_r{r}_w{ws[wi]}_f32");
                     _hasDenseFast = true;
+                    try
+                    {
+                        foreach (int r in new[] { 3, 5, 6, 7 })
+                            for (int wi = 0; wi < 3; wi++)
+                                denseFast[r, wi] = module.GetFunction($"ts_dsv4_dense_fast_r{r}_w{ws[wi]}_f32");
+                        HasDenseFastEveryWidth = true;
+                    }
+                    catch (CudaException ex) when (ex.ErrorCode == 500)
+                    {
+                        for (int wi = 0; wi < 3; wi++)
+                        {
+                            denseFast[3, wi] = denseFast[4, wi];
+                            denseFast[5, wi] = denseFast[6, wi] = denseFast[7, wi] = denseFast[8, wi];
+                        }
+                    }
                 }
                 catch (CudaException ex) when (ex.ErrorCode == 500) { _hasDenseFast = false; }
                 denseBf16RowsSplitK = module.GetFunction("ts_dense_bf16_rows_splitk_f32");
@@ -613,11 +659,21 @@ namespace TensorSharp.Cuda
         /// ranks score + bias, the weights are the unbiased scores (normalized when
         /// <paramref name="norm"/> is set) times <paramref name="wScale"/>. Hash layers take the
         /// selection from <paramref name="tid2eid"/> instead.</summary>
+        /// <param name="keys">Tests only: true takes the keyed warp select where it applies, false the float-argmax one;
+        /// null takes TS_DSV4_SELECT_KEYS.</param>
         public void MoeSelect(Tensor logits, IntPtr bias, IntPtr tid2eid, Tensor tokens, Tensor sel, Tensor wOut,
-            int nExpert, int nUsed, int norm, float wScale, int nt, IntPtr stream, int gating = RouterSqrtSoftplus)
+            int nExpert, int nUsed, int norm, float wScale, int nt, IntPtr stream, int gating = RouterSqrtSoftplus, bool? keys = null)
         {
             if (gating == RouterSoftmax && nExpert > 512)
                 throw new NotSupportedException($"softmax routing over {nExpert} experts (the kernel's warp path takes up to 512)");
+            if ((keys ?? _selectKeysEnv) && moeSelectKeys != IntPtr.Zero && tid2eid == IntPtr.Zero && nExpert <= 512 && nUsed <= 32)
+            {
+                IntPtr k0 = P(logits), k1 = bias, k2 = P(sel), k3 = P(wOut);
+                int k4 = nExpert, k5 = nUsed, k6 = norm; float k7 = wScale; int k8 = gating;
+                void** kargs = stackalloc void*[] { &k0, &k1, &k2, &k3, &k4, &k5, &k6, &k7, &k8 };
+                Launch(moeSelectKeys, (uint)nt, 1, 1, 32, 0, stream, kargs);
+                return;
+            }
             IntPtr a0 = P(logits), a1 = bias, a2 = tid2eid, a3 = P(tokens), a4 = P(sel), a5 = P(wOut);
             int a6 = nExpert, a7 = nUsed, a8 = norm; float a9 = wScale; int a10 = gating;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10 };
@@ -731,6 +787,83 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12, &a13 };
             uint pairs = w1 != IntPtr.Zero || tab1 != IntPtr.Zero ? 2u : 1u;
             Launch(moeMma, CeilDiv(rows, MoeMmaRows), (uint)nExpert, pairs, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>Bytes the int8 Q2_0 expert kernels' activations take per 64 values (64 int8, then each 32-value
+        /// half's F32 scale and offset).</summary>
+        public const int MoeQ2I8ActBytes = 80;
+
+        /// <summary>Whether the int8 Q2_0 expert kernels take these widths: each pipeline stage reads two 64-value
+        /// blocks of K, a gate/up CTA 64 features and a down CTA 128 output rows.</summary>
+        public static bool MoeQ2I8Supports(int e, int ff) => e > 0 && ff > 0 && e % 128 == 0 && ff % 128 == 0;
+
+        /// <summary>Bytes of the int8 activations of <paramref name="rows"/> rows of <paramref name="width"/> values.</summary>
+        public static long MoeQ2I8ActRowsBytes(long rows, int width) => rows * (width / 64) * MoeQ2I8ActBytes;
+
+        /// <summary>x [rows][width] F32 to the int8 Q2_0 expert kernels' activations, xa [rows][width / 64][80].</summary>
+        public void MoeQ2I8QuantAct(IntPtr x, IntPtr xa, int rows, int width, IntPtr stream)
+        {
+            if (width % 64 != 0)
+                throw new ArgumentException($"activation width {width} is not a multiple of 64");
+            long nblk = (long)rows * (width / 64);
+            if (nblk == 0)
+                return;
+            IntPtr a0 = x, a2 = xa;
+            long a1 = nblk;
+            void** args = stackalloc void*[] { &a0, &a1, &a2 };
+            Launch(q2i8QuantAct, CeilDiv(nblk, BlockSize / 32), 1, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>
+        /// Q2_0 gate and up of every member slot of every expert on int8 tensor cores, SwiGLU (clamped when
+        /// <paramref name="limit"/> &gt; 0), and the result quantized per 32 features into <paramref name="hq"/>
+        /// [slots][ff / 64][80], the down kernel's activations. <paramref name="xa"/> holds every token's
+        /// activations (<see cref="MoeQ2I8QuantAct"/> over <paramref name="inDim"/>).
+        /// </summary>
+        public void MoeQ2I8GateUp(IntPtr gateW, IntPtr upW, IntPtr xa, Tensor counts, Tensor offsets, Tensor slotToken,
+            IntPtr hq, int ff, int inDim, long rowBytes, float limit, int nExpert, IntPtr stream,
+            IntPtr gateTab = default, IntPtr upTab = default)
+        {
+            if (!MoeQ2I8Supports(inDim, ff))
+                throw new ArgumentException($"expert widths {inDim} x {ff} are not multiples of 128");
+            IntPtr a0 = gateW, a1 = upW, a2 = xa, a3 = P(counts), a4 = P(offsets), a5 = P(slotToken), a6 = hq;
+            int a7 = ff, a8 = inDim; long a9 = rowBytes; float a10 = limit;
+            IntPtr a11 = gateTab, a12 = upTab;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11, &a12 };
+            Launch(q2i8GateUp, CeilDiv(ff, 64), (uint)nExpert, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>Q2_0 down projection of every member slot of every expert on int8 tensor cores, from
+        /// <see cref="MoeQ2I8GateUp"/>'s <paramref name="hq"/> (slot order) into <paramref name="output"/> [slots][rows].</summary>
+        public void MoeQ2I8Down(IntPtr downW, IntPtr hq, Tensor counts, Tensor offsets, Tensor output, int rows, int ff,
+            long rowBytes, int nExpert, IntPtr stream, IntPtr downTab = default, IntPtr actRow = default)
+        {
+            if (!MoeQ2I8Supports(rows, ff))
+                throw new ArgumentException($"expert widths {rows} x {ff} are not multiples of 128");
+            if (actRow != IntPtr.Zero && !HasMoeRowMap)
+                throw new InvalidOperationException("the loaded module's int8 down kernel predates its act-row map");
+            IntPtr a0 = downW, a1 = hq, a2 = P(counts), a3 = P(offsets), a4 = P(output);
+            int a5 = rows, a6 = ff; long a7 = rowBytes;
+            IntPtr a8 = downTab, a9 = actRow;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9 };
+            Launch(q2i8Down, CeilDiv(rows, 128), (uint)nExpert, 1, BlockSize, 0, stream, args);
+        }
+
+        /// <summary>Whether the module maps a ubatch's slots onto a group's int8 H rows (<see cref="MoeRowMap"/> and
+        /// <see cref="MoeQ2I8Down"/>'s actRow).</summary>
+        public bool HasMoeRowMap => HasMoeQ2I8 && moeRowMap != IntPtr.Zero;
+
+        /// <summary>For one ubatch of a group: actRow[rowOfSlot[s]] = groupRowOfSlot[baseSlot + s] over its
+        /// <paramref name="slots"/> slots, the group grouping's row holding each slot's H at the row the ubatch's own grouping
+        /// gives it.</summary>
+        public void MoeRowMap(Tensor rowOfSlot, Tensor groupRowOfSlot, int baseSlot, Tensor actRow, int slots, IntPtr stream)
+        {
+            if (slots <= 0)
+                return;
+            IntPtr a0 = P(rowOfSlot), a1 = P(groupRowOfSlot), a3 = P(actRow);
+            int a2 = baseSlot, a4 = slots;
+            void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4 };
+            Launch(moeRowMap, CeilDiv(slots, BlockSize), 1, 1, BlockSize, 0, stream, args);
         }
 
         /// <summary>Gate/up of every (token, selected expert) slot of <paramref name="nt"/> tokens,
@@ -855,20 +988,23 @@ namespace TensorSharp.Cuda
 
         /// <summary>out[rows, outDim] = act[rows, inDim] x w^T for an input already quantized to q8_1,
         /// one warp per output row. Reads only the buffers passed, so it can be captured.</summary>
+        /// <param name="fastWidth">Tests only: the decode-once kernel's rows a pass (1..8) instead of the window's own width
+        /// (at least the rows, or more passes run); 0 picks it as the engines do.</param>
         public void DenseQ81Rows(IntPtr w, IntPtr act, IntPtr output, int wtype, int outDim, int inDim, long rowBytes,
-            int rows, IntPtr stream)
+            int rows, IntPtr stream, int fastWidth = 0)
         {
             IntPtr a0 = w, a1 = act, a2 = output;
             int a3 = wtype, a4 = outDim, a5 = inDim; long a6 = rowBytes; int a7 = rows;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
             // The formats the decode-once kernels read: each unit decoded once and dotted against every row, W warps an
-            // output row by shape. A 4-row window's 2560 -> 10240 IQ4_XS projection 33 -> 11.5 us on the RTX 5090.
+            // output row by shape. A 4-row window's 2560 -> 10240 IQ4_XS projection 33 -> 11.5 us on the RTX 5090. A window
+            // of up to 8 rows runs the kernel of its own width; longer ones take passes of 8.
             if (rows <= DenseMultiMaxRows && DenseFastReads(wtype, inDim))
             {
                 int wi = DenseFastWarps(outDim);
-                int ri = rows <= 1 ? 0 : rows <= 2 ? 1 : rows <= 4 ? 2 : 3;
+                int r = fastWidth > 0 ? Math.Min(fastWidth, 8) : Math.Min(Math.Max(rows, 1), 8);
                 int perBlock = 8 / wi;
-                Launch(denseFast[ri, wi == 1 ? 0 : wi == 2 ? 1 : 2], (uint)((outDim + perBlock - 1) / perBlock), 1, 1, BlockSize, 0, stream, args);
+                Launch(denseFast[r, wi == 1 ? 0 : wi == 2 ? 1 : 2], (uint)((outDim + perBlock - 1) / perBlock), 1, 1, BlockSize, 0, stream, args);
                 return;
             }
             // Few output rows of a long input (a 10240 -> 320 hyper-connection projection): split each row's units
@@ -881,8 +1017,10 @@ namespace TensorSharp.Cuda
             // A verify window or a batched step: every row in one block, a warp per output row, so each weight row is read
             // from memory once (a block per row read it once per row: a 4-row window's LM head took 4x one row's time).
             // Bit for bit the one-row kernel's sums. (A split-K grid of few outputs keeps a block per row: one block
-            // looping over the rows left the GPU too few blocks, and the shared expert slowed down.)
-            if (rows > 1 && rows <= DenseMultiMaxRows && denseQ81RowsMulti != IntPtr.Zero && _denseMulti)
+            // looping over the rows left the GPU too few blocks, and the shared expert slowed down.) One row takes it too:
+            // the one-row kernel's warps walk four output rows each, 80 blocks for 2560 outputs. The shared expert's
+            // 640 -> 2560 Q4_0 down projection took 3.44 us at one row there (2.37 at two rows); 2.01 us here (RTX 5090).
+            if (rows <= DenseMultiMaxRows && denseQ81RowsMulti != IntPtr.Zero && _denseMulti)
                 Launch(denseQ81RowsMulti, CeilDiv(outDim, 8), 1, 1, BlockSize, 0, stream, args);
             else
                 Launch(denseQ81Rows, CeilDiv(outDim, 32), (uint)rows, 1, BlockSize, 0, stream, args);

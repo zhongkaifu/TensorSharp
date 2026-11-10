@@ -4,9 +4,10 @@
   //   TensorSharp.Cli         --config config/qwen3.8-flash-next.json --chat
   //   TensorSharp.Server.Host --config config/qwen3.8-flash-next.json
   //
-  // Measured on an M5 Pro (48 GB), 2026-11-08, Strata's standard-v1 bundle and eng/qwen38-engine-bench.py:
-  //   decode 43-48 tok/s (short and long answers), 4K-token prompt TTFT 5.8-6.0 s, 16K 22.7-24.3 s,
-  //   four requests at once 43.4 tok/s in all, parallel_4 35-37 tok/s, Strata's 12 sanity checks 12/12.
+  // Measured on an M5 Pro (48 GB), 2026-11-09, eng/qwen38-engine-bench.py (greedy, two alternating passes):
+  //   long-generation decode 50-51 tok/s; 4K-token prompt TTFT 4.4-4.6 s, then 59-63 tok/s; 16K 17.2-17.6 s;
+  //   short-chat first token 0.30-0.32 s; two requests at once 40.5 tok/s in all, four 55.5-56.3 (first tokens 1.3 s).
+  //   Strata on the same files: 53.5-57.2 tok/s, 4.1-4.4 s, 16.2-17.6 s, four at once 45.8 (one request at a time).
   // The UD-Q2_K_XL files with the MTP head (config/qwen3.8-flash-next-ud-q2_k_xl.json) decode ~31 tok/s there.
   //
   // On a 48 GB Mac the files are larger than memory by design. The engine keeps every layer's most-routed experts in
@@ -66,7 +67,11 @@
   },
   // The DFlash2 drafter: naming it is the request to speculate (no --spec needed); pass --no-spec to decode without
   // it. Its block drafts (up to 6 a step, confidence gate 0.5) are the engine's defaults; drafts are verified as one
-  // batched forward on ggml_metal, and concurrent requests take speculative turns.
+  // batched forward on ggml_metal. Concurrent requests decode together in batched steps that read each weight once
+  // for all of them (TS_SPEC_TURNS=1 restores one request's speculative turn at a time).
+  //
+  // Not set, deliberately: TS_DFLASH_DRAFT_VOCAB (Strata's 106K draft vocabulary). The draft gets 1.3 ms faster, but
+  // decode moved +4.5% on English, -6.1% on Chinese and -1.9% on code (the subset drafts fewer of their tokens).
   "draft-model": {
     "path": "${draftRoot}/Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf",
     "urls": ["${dflash}/Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf"],

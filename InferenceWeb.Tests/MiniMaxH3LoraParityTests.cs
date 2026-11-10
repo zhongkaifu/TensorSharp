@@ -341,6 +341,12 @@ public sealed class MiniMaxH3LoraParityTests : IDisposable
     /// the synthetic "all" case (it moves the step by 38%) scales that rounding up with q/k/v.
     /// So the explicit softmax is where GgmlCpu is held to 1e-4: it isolates the LoRA wiring.
     /// The flash path, and any device, are held to rel 2e-3 and an update cosine of 0.9999.
+    ///
+    /// GgmlCuda runs its float products on cuBLAS handles ggml-cuda sets to TF32 tensor-op math,
+    /// which put the no-plug-in floor at rel 6.1e-4 on this all-F32 fixture (1.5e-7 with TF32
+    /// off). So there the 0.9999 cosine is held under TS_H3_CUDA_F32_PRODUCTS=1, which moves the
+    /// DiT's weight products to TensorSharp's pedantic F32 GEMM (floor 8.1e-6), and the default
+    /// TF32 path gets a bound derived from its own floor (below).
     /// </summary>
     [Theory]
     [MemberData(nameof(NativeCases))]
@@ -349,25 +355,47 @@ public sealed class MiniMaxH3LoraParityTests : IDisposable
         BackendType backend = TestGates.PinnedGgmlBackend;
         using var attentionPath = new NativeEnvScope();
         attentionPath.Set("TS_H3_NO_FLASH", flash ? null : "1");
+        // The default path first, whatever the process environment says.
+        attentionPath.Set("TS_H3_CUDA_F32_PRODUCTS", null);
         var adapter = Build(id);
         string manifest = Plugin(adapter);
         using var packed = LoadSet(new LoraSpec(manifest), _base, backend, direct: false);
         using var exact = LoadSet(new LoraSpec(manifest), _base, BackendType.Cpu, direct: true);
         using var native = Native(_base);
         using var direct = Direct(_base);
+        string attention = flash ? "flash attention" : "explicit softmax";
 
         // The two paths' disagreement without a plug-in: the floor the comparison stands on.
-        float[] nativeBase = TinyH3Step.Run(native, null), directBase = TinyH3Step.Run(direct, null);
-        float[] nativeLora = TinyH3Step.Run(native, packed), directLora = TinyH3Step.Run(direct, exact);
-        double floor = TinyH3Step.Rel(nativeBase, directBase);
-        double rel = TinyH3Step.Rel(nativeLora, directLora);
-        double cosine = TinyH3Step.Cosine(TinyH3Step.Minus(nativeLora, nativeBase), TinyH3Step.Minus(directLora, directBase));
+        float[] directBase = TinyH3Step.Run(direct, null), directLora = TinyH3Step.Run(direct, exact);
         double moved = TinyH3Step.Rel(directLora, directBase);
-        string attention = flash ? "flash attention" : "explicit softmax";
-        _out.WriteLine($"[h3-lora-parity] {backend} ({attention}) vs direct-cpu {id}: no-plug-in floor rel {floor:E3}; " +
-            $"with the plug-in rel {rel:E3}; update cosine {cosine:F7}; the update moves the step by rel {moved:E3}");
+        (double floor, double rel, double cosine) Compare(string label)
+        {
+            float[] nativeBase = TinyH3Step.Run(native, null), nativeLora = TinyH3Step.Run(native, packed);
+            double f = TinyH3Step.Rel(nativeBase, directBase);
+            double r = TinyH3Step.Rel(nativeLora, directLora);
+            double c = TinyH3Step.Cosine(TinyH3Step.Minus(nativeLora, nativeBase), TinyH3Step.Minus(directLora, directBase));
+            _out.WriteLine($"[h3-lora-parity] {backend} ({attention}{label}) vs direct-cpu {id}: no-plug-in floor rel {f:E3}; " +
+                $"with the plug-in rel {r:E3}; update cosine {c:F7}; the update moves the step by rel {moved:E3}");
+            return (f, r, c);
+        }
+        var (floor, rel, cosine) = Compare("");
 
         Assert.True(moved > 1e-3, $"{id}: the update moved the step by only rel {moved:E3}");
+        if (backend == BackendType.GgmlCuda)
+        {
+            // The default (TF32) path. Its native step carries noise of relative size `floor` against the direct
+            // CPU path, and the update - the difference of two steps whose noise does not cancel - has size
+            // `moved`: its direction is off by up to about floor / moved, so its cosine falls short of 1 by up to
+            // about (floor / moved)^2 / 2. The bound is that, doubled, from this run's own floor; measured 1 - cos
+            // was 0.23-0.47 (floor / moved)^2 across these cases.
+            double bound = (floor / moved) * (floor / moved);
+            Assert.True(rel <= 2e-3, $"{id}: {backend} ({attention}, TF32) vs direct CPU rel {rel:E3} > 2e-3 (no-plug-in floor {floor:E3})");
+            Assert.True(1 - cosine <= bound,
+                $"{id}: {backend} ({attention}, TF32) update 1 - cosine {1 - cosine:E3} > (floor / moved)^2 = {bound:E3}");
+            // The same step with the DiT's weight products in pedantic F32: held to the bound every device meets.
+            attentionPath.Set("TS_H3_CUDA_F32_PRODUCTS", "1");
+            (floor, rel, cosine) = Compare(", TS_H3_CUDA_F32_PRODUCTS=1");
+        }
         if (backend == BackendType.GgmlCpu && !flash)
         {
             Assert.True(rel <= 1e-4, $"{id}: GgmlCpu ({attention}) vs direct CPU rel {rel:E3} > 1e-4 (no-plug-in floor {floor:E3})");

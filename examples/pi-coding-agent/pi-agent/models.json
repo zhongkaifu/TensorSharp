@@ -1,0 +1,29 @@
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "tensorsharp": {
+      "name": "TensorSharp (local)",
+      "baseUrl": "http://127.0.0.1:5000/v1",
+      "api": "openai-completions",
+      "apiKey": "none",
+      "compat": {
+        "supportsDeveloperRole": true,
+        "supportsReasoningEffort": false,
+        "supportsStore": false,
+        "maxTokensField": "max_completion_tokens",
+        "thinkingFormat": "qwen-chat-template"
+      },
+      "models": [
+        {
+          "id": "Qwen3.8-27B-UD-IQ3_XXS",
+          "name": "Qwen3.8 27B (TensorSharp, DFlash2)",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 65536,
+          "maxTokens": 16384,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    }
+  }
+}

@@ -265,8 +265,10 @@ namespace TensorSharp.Models
             }
             if (cfg.BlockSize > cfg.RingRows)
                 throw new InvalidOperationException($"DFlash block_size {cfg.BlockSize} exceeds the ring ({cfg.RingRows} rows).");
+            if (cfg.IsDSpine && DSpineBackendRefusal() is { } dspineRefusal)
+                throw new NotSupportedException($"DSpine drafter refused: {dspineRefusal}.");
 
-            LoadDFlashDraftTensors(draft);
+            LoadDFlashDraftTensors(draft, cfg.IsDSpine);
             AttachDFlashSidecarScales();
 
             _dflash = cfg;
@@ -304,6 +306,20 @@ namespace TensorSharp.Models
                 _dflashLayerNames = null;
                 return;
             }
+            if (cfg.IsDSpine)
+            {
+                try
+                {
+                    AttachDSpine();
+                }
+                catch
+                {
+                    DisposeDSpine();
+                    _dflash = null;
+                    _dflashLayerNames = null;
+                    throw;
+                }
+            }
 
             _dflashCaptureSlot = new int[Config.NumLayers];
             for (int l = 0; l < Config.NumLayers; l++)
@@ -340,12 +356,17 @@ namespace TensorSharp.Models
         /// converter-spelling normalization DFlash does not need: the drafter's
         /// tensor names are already the final ones.
         /// </summary>
-        private unsafe void LoadDFlashDraftTensors(GgufFile draft)
+        private unsafe void LoadDFlashDraftTensors(GgufFile draft, bool dspine = false)
         {
             foreach (var kv in draft.Tensors)
             {
                 var info = kv.Value;
                 string name = DFlashConfig.WeightPrefix + info.Name;
+                if (dspine && KeepDSpineRaw(info))
+                {
+                    LoadDSpineRawTensor(draft, info, name);
+                    continue;
+                }
                 long byteCount = draft.GetTensorByteCount(info);
 
                 // F16/BF16 linears are NOT "quantized" for this path: the GGML
@@ -439,7 +460,7 @@ namespace TensorSharp.Models
         /// <summary>True when <paramref name="name"/> resolves to something
         /// <see cref="LinearForward"/> can multiply by.</summary>
         private bool HasDFlashLinear(string name)
-            => _quantWeights.ContainsKey(name) || _weights.ContainsKey(name);
+            => _quantWeights.ContainsKey(name) || _weights.ContainsKey(name) || (_dspineRaw?.ContainsKey(name) ?? false);
 
         private bool VerifyDFlashTensors(out string missing)
         {
@@ -543,6 +564,12 @@ namespace TensorSharp.Models
                 }
             }
 
+            if (_dflash.IsDSpine && MissingDSpineTensor() is { } dspineMissing)
+            {
+                missing = dspineMissing;
+                return false;
+            }
+
             // The drafter has no LM head of its own: it borrows the target's.
             if (!HasDFlashLinear(DFlashTargetOutputWeightName)) { missing = DFlashTargetOutputWeightName; return false; }
             if (!HasDFlashLinear("token_embd.weight")) { missing = "token_embd.weight"; return false; }
@@ -565,7 +592,13 @@ namespace TensorSharp.Models
             _dflashDeferInjects = false;
             _dflashPendingInjects.Clear();
             _dflashPendingRowCount = 0;
+            DisposeDSpine();
             DisposeDFlashRingPool();
+            if (_dflashSubHead != IntPtr.Zero)
+            {
+                GgmlBasicOps.DFlashResetCaches();   // the persisted draft graphs bind the vocabulary subset's rows
+                FreeDraftVocabSubset();
+            }
             if (_dflashRingK != null)
                 foreach (var t in _dflashRingK) t?.Dispose();
             if (_dflashRingV != null)
@@ -641,12 +674,59 @@ namespace TensorSharp.Models
         /// supports it, otherwise the per-op pair.</summary>
         private void DFlashEncodeAndInject(float[] hRows, int rowOffset, int n, int startPos)
         {
+            RecordDSpineDumpRows(hRows, rowOffset, n, startPos);
+            if (DFlashDraftingDeclined)
+                return;   // this request's ring is incomplete; it decodes without drafts
+            _dflashFusedInjectFailed = false;
             if (TryFusedDFlashInject(hRows, rowOffset, n, startPos))
+                return;
+
+            if (_dflashFusedInjectFailed && DeclineDraftingAfterFailedInject(GgmlBasicOps.LastNativeError()))
                 return;
 
             EnsureDFlashRingHostSynchronized();
             using Tensor g = DFlashEncode(hRows, rowOffset, n);
             DFlashInjectKv(g, n, startPos);
+        }
+
+        /// <summary>
+        /// After a fused inject that ran and failed (device memory, typically): on a discrete GPU the bound request
+        /// stops drafting and decodes plainly, with one warning per model naming the consequence, and this returns
+        /// true. The per-op fallback is not taken there: it rewrites the ring through ordinary ops, replacing the
+        /// device copy the persisted drafter graphs were bound to (an illegal memory access on CUDA before those
+        /// graphs held their bindings), and it needs the device memory the fused inject just failed to get.
+        /// Elsewhere this returns false and the per-op inject runs.
+        /// </summary>
+        internal bool DeclineDraftingAfterFailedInject(string nativeError)
+        {
+            if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan)
+                return false;
+            DFlashDraftingDeclined = true;
+            if (!_dflashInjectDeclineWarned)
+            {
+                _dflashInjectDeclineWarned = true;
+                Console.Error.WriteLine($"[dflash] the drafter's context inject failed on {_backend} ({nativeError}); " +
+                    "this request decodes without drafts. Further failures are not reported.");
+            }
+            return true;
+        }
+
+        /// <summary>Set by <see cref="TryFusedDFlashInject"/> when the native inject ran and failed (as opposed to
+        /// the fused path not applying).</summary>
+        private bool _dflashFusedInjectFailed;
+        private bool _dflashInjectDeclineWarned;
+        private bool _dflashModelDraftingDeclined;
+
+        /// <summary>The bound request stopped drafting after a failed inject (DFlashRing.DraftingDeclined; the
+        /// model-level flag when no ring object is bound, cleared when a request releases its draft state).</summary>
+        internal bool DFlashDraftingDeclined
+        {
+            get => _dflashActiveRing?.DraftingDeclined ?? _dflashModelDraftingDeclined;
+            set
+            {
+                if (_dflashActiveRing != null) _dflashActiveRing.DraftingDeclined = value;
+                else _dflashModelDraftingDeclined = value;
+            }
         }
 
         /// <summary>
@@ -660,7 +740,7 @@ namespace TensorSharp.Models
         private protected int DFlashPropose(int lastToken, float[] hPrev, int position, int[] draftOut, float[] confOut)
         {
             RequireDFlash();
-            if (position <= 0 || draftOut == null || draftOut.Length == 0)
+            if (position <= 0 || draftOut == null || draftOut.Length == 0 || DFlashDraftingDeclined)
                 return 0;
 
             // The drafter's own key for the last committed position, exactly like

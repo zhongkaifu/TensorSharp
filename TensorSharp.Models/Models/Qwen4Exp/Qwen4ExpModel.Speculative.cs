@@ -53,10 +53,12 @@ namespace TensorSharp.Models
         public bool SpecSupportsMultimodalPrefill => !HasDistributedQwen;
         public bool SpecTrunkFollowsBoundCache => !HasDistributedQwen;
 
-        /// <summary>On ggml_metal with expert tiers that read their misses into window slots (unified memory), a step
-        /// is bound by the experts it reads: four requests batched decoded 30-35 tokens/s in all on a 48 GB M5 Pro
-        /// against 40-44 for one speculating alone, so concurrent requests take turns (BatchExecutor).</summary>
-        public bool SpecTurnsPreferred => _backend == BackendType.GgmlMetal && _tierWindowSlots > 0;
+        /// <summary>Concurrent requests decode in batched arena steps rather than taking speculative turns. Turns won
+        /// while the arena ran each slot's attention halves on their own (four requests batched decoded 30-35 tokens/s
+        /// in all on a 48 GB M5 Pro, one speculating alone 40-44); with those halves batched over the slots, batched
+        /// steps serve parallel_2 at 38.4 tok/s against 37.0-37.9 in turns and parallel_4 at 44.7-44.9 against
+        /// 38.1-39.7. TS_SPEC_TURNS=1 still takes turns.</summary>
+        public bool SpecTurnsPreferred => false;
         public bool SpeculationProfitable => !HasDistributedQwen && !_specStateFailed && IsGgmlBackend
             && !_tokenGraphUnsupported && !_fusedGateUpExperts
             && !_fusedFfnUnsupported && !_fusedGdnUnsupported && !_fusedAttnUnsupported

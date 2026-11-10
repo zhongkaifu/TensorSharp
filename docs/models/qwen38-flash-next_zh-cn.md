@@ -1173,6 +1173,222 @@ slot：lane 规划没有计入回退检查点的副本，作为引擎当前选�
 ggml_cuda 无法在 32 GB 显卡上服务该模型：decode 为 0.5-4.7 tok/s（专家从网络卷读取），四个请求同时到来会在 ggml 内部耗尽显存，
 导致进程中止；它没有 ggml_metal 那样的准入检查。
 
+#### 分块计算 prompt 的 DeltaNet 递推，2026-11-09
+
+prompt 的门控 DeltaNet 层原来逐行推进（KdaScan：每个 value 头一个 block，每个 token 对 128 x 128 的状态做一次秩一更新）。
+这占 16K prompt 的 0.49 s，而 Strata 只用 0.07 s。现在单个序列 128 行及以上的 prompt 改用 Strata 的分块形式
+（`TS_Q4E_GDN_CHUNKED`，默认开启），移植到 `tensorsharp_q4e_kernels.cu`。准备内核以 FP32 为每个 32 token 的块构建 WY
+因子（块内三角求解与门控乘积）。扫描内核随后把一个块当作两个小矩阵乘积来应用，而不是 32 次秩一更新；它以 16 个 key 头 x
+8 个列 tile 运行，每个 384 个线程，在 GPU 上一波完成，并在共享内存中跨块携带状态。每 2,048 行一个超级块，限制了 scratch
+大小（约 25 MB，在第一个长 prompt 时分配）。decode 步、验证窗口、批量步、捕获的图以及不足 128 行的 prompt 保持 KdaScan。
+全部保持 FP32，但求和顺序不同：与逐 token 扫描相比，输出相对变化 3e-7，状态每个头最多 6.2e-7（`Q4eGdnChunkedTests`，128、
+200 与 4,171 行）。扫描内核每个 block 需要 93,696 字节的 opt-in 共享内存，并需要至少 128 个 SM 的 GPU，使所有 block 一波
+完成；SM 更少时会分波运行，反而更慢。不满足条件时引擎保持 KdaScan。
+
+RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（旧扫描用 `TS_Q4E_GDN_CHUNKED=0`）。三次运行的 TTFT，第一次为
+冷启动；引擎基准的长 prompt 与长生成 needle 两组均为 6/6 通过：
+
+| prompt 递推 | 4K prompt（3,541 token） | 16K prompt（14,094 token） | 引擎基准 4K / 16K TTFT | 长生成 |
+| --- | --- | --- | --- | --- |
+| 逐 token | 1.06 / 0.79 / 0.79 s | 3.36 / 3.35 / 3.35 s | 1.00 s / 4.20-4.22 s | 239-242 tok/s |
+| 分块（默认） | 0.99 / 0.71 / 0.70 s | 3.04 / 3.02 / 3.02 s | 0.91 s / 3.79 s | 242-249 tok/s |
+
+#### 在 int8 tensor core 上计算 Q2_0 prompt 专家，2026-11-09
+
+prompt 的路由专家原来在 `ts_dsv4_moe_mma_f32` 上运行。每个 128 token 的组，每个 CTA 都把所属专家的 Q2_0 权重展开为 F16
+（scale 乘 code，用浮点运算），把激活也转为 F16，再以 F32 累加运行 F16 `mma.sync`；GeForce 显卡执行这种累加只有 F16
+速率的一半。SwiGLU 与 down 乘积的输入是对 F32 缓冲区的单独遍历。这是 16K prompt 中最大的阶段：专家用 1.08 s，而 Strata
+用 0.32 s。
+
+Strata 在 int8 tensor core 上计算这些专家，现在已移植（`TS_Q2_0_EXPERTS_INT8`，默认开启），即
+`tensorsharp_dsv4_kernels.cu` 中的 `ts_dsv4_moe_q2i8_*`：
+
+- Q2_0 的 code 0..3 原样作为 int8 操作数送入 `mma.m16n8k32`。
+- 激活每 32 个值舍入为 int8。scale 为 amax / 127，与 decode 内核的 q8_1 行相同，但保持 F32。每个块存储自身之和的负值，
+  因此 code 的 -1 偏移没有代价：一次整数加法就把整数点积精确地变成浮点数。
+- 八个特征的 gate 行与 up 行共用一个 m16 tile，因此 SwiGLU 以及把其输出舍入为 down 乘积的 int8 激活都在寄存器中完成。
+- Strata 会重新打包权重；这些内核则通过专家驻留表就地读取 GGUF 块。每个流水线阶段用 `cp.async` 复制每行的两个 18 字节
+  块（36 字节，位于 4 字节边界）。
+- scratch 复用该路线不再写入的 F32 gate/up 输出。
+- 需要 sm_80 或更新且模块为该 GPU 构建。在提交的 compute_75 基线上运行 F16 内核。
+
+舍入方式与 decode 内核相同。在模型的专家形状上（`CudaMoeQ2_0Int8Tests`），相对以双精度计算的专家块，int8 内核偏离
+9.77e-3，逐 slot 的 q8_1 内核（ggml-cuda MMQ 的算法）偏离 9.73e-3，F16 内核偏离 1.9e-4。
+
+在真实模型上（`Qwen4ExpQ2_0Int8PromptTests`，六个 22 到 12,347 token 的 prompt，关闭依赖历史的捷径），最后一个 prompt
+行的 logits 相对 F16 内核变化 4.9e-2 到 1.1e-1。把同样 prompt 的专家放到逐 slot 的 q8_1 内核上运行（ggml-cuda 的算法），
+变化为 4.8e-2 到 1.8e-1。使用 int8 时，6 个 prompt 的第一个 token 全部相同，64 token 的贪心续写有 4 个保持一致。另外两个
+在几乎打平的位置分开（"1." 对 "-"，"scan through the document" 对 "scan the document"）；q8_1 也在其中第一个位置分开。
+F16 对照组两次运行逐位相同。
+
+512 个专家、top 10、1,024 行的一层专家用时从 1.64 ms 降到 0.85 ms。
+
+RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（F16 内核用 `TS_Q2_0_EXPERTS_INT8=0`）。三次运行的 TTFT，第一次
+为冷启动。引擎基准的 short_chat、long_prompt_4k/16k 与 long_generation 检查两组均为 8/8 通过：
+
+| prompt 专家 | 4K prompt（3,540 token） | 16K prompt（14,092 token） | 引擎基准 4K / 16K TTFT | 长生成 |
+| --- | --- | --- | --- | --- |
+| F16 tensor core | 0.99 / 0.71 / 0.70 s | 3.04 / 3.02 / 3.03 s | 0.86-0.90 s / 3.79-3.80 s | 248-255 tok/s |
+| int8 tensor core（默认） | 0.84 / 0.57 / 0.55 s | 2.48 / 2.47 / 2.47 s | 0.74-0.75 s / 3.13-3.14 s | 240-249 tok/s |
+
+#### 在 tensor core 上计算 prompt 的 QSA 块分数，2026-11-09
+
+QSA 层先为一行能看到的每个完整块打分（四个 indexer 头上 relu(块 key . query 头) 之和），再保留最好的块。prompt 的行
+原来在 CUDA core 上每个块用一个 warp 计算，每一行都重新读取每个 key：这占 16K prompt 的 0.10 s，而 Strata 只用 0.02 s。
+
+Strata 在 tensor core 上为 prompt 的行打分，现在已移植（`TS_Q4E_QSA_SCORES_MMA`，默认开启），即
+`ts_q4e_qsa_scores_mma_f32`：
+
+- 四个 warp 组成的 block 处理 16 行（它们的四个头，64 个 query 行）对 64 个块的 key，因此每个 key 每 16 行才读取一次。
+- Strata 的 key 是 F16；TensorSharp 的 pooled key 保持 F32。因此两个操作数都以 F16 高、低两半送入：
+  q . k = qh . kh + ql . kh + qh . kl，F32 累加。省去的 ql . kl 项低于乘积的 2^-22。
+- 各头的 relu 仍按头的顺序相加。
+- decode 步、验证窗口和批量步保持 warp 内核，因此一行的分数仍与它自己的 decode 步相同。
+- 需要 sm_80 或更新且模块为该 GPU 构建；提交的 compute_75 基线保持 warp 内核。
+
+在从上下文开头开始、以及位于第 3,000 与 9,000 个位置之后的行上（`Q4eQsaScoresMmaTests`），分数与以双精度计算的分数
+相差不超过 |q . k| 之和的 4.6e-7（warp 内核：6.1e-8）。选择保留的块在全部 1,045 行中都相同，其中 712 行超过选择宽度。
+
+RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（warp 内核用 `TS_Q4E_QSA_SCORES_MMA=0`）。三次运行的 TTFT，
+第一次为冷启动。引擎基准的 short_chat、long_prompt_4k/16k 与 long_generation 检查两组均为 8/8 通过：
+
+| prompt QSA 分数 | 4K prompt（3,541 token） | 16K prompt（14,093 token） | 引擎基准 4K / 16K TTFT |
+| --- | --- | --- | --- |
+| 每个块一个 warp | 0.85 / 0.58 / 0.56 s | 2.48 / 2.47 / 2.47 s | 0.74 s / 3.12-3.13 s |
+| tensor core（默认） | 0.84 / 0.56 / 0.55 s | 2.39 / 2.38 / 2.38 s | 0.73-0.74 s / 3.00-3.01 s |
+
+#### 每个 prompt 组只把一层的稠密权重反量化一次，2026-11-09
+
+prompt 的稠密投影（ISTA 包中的 Q4_K、IQ4_XS、Q5_K、Q3_K、Q4_0 与 Q2_0，以及 `TS_Q4E_HC_Q8=1` 下 hyper-connection 的 Q8_0
+副本）在为本次调用反量化出的权重副本上以 F16 tensor core GEMM 运行。prompt 组（`TS_Q4E_PROMPT_GROUP`，4,096 行）已经让每一层
+连续处理它的四个 1,024 行 ubatch，但每个 ubatch 都重新反量化这一层的权重。在 16K prompt 上，反量化与转换共用 242 ms，其中
+183 ms 是这一部分（nsys）。Strata 每个 8K token 的分块反量化一次。
+
+现在（`TS_Q4E_GROUP_F16`，默认开启）一层的第一个 ubatch 把每个权重反量化到组的 F16 arena 中，其余 ubatch 复用该副本。副本就是
+同一内核的输出，因此每个乘积逐位相同。`APromptGroupsDenseWeights_DequantizedOncePerLayer_AnswerBitForBit` 让每层运行两个 520 行
+的 ubatch，并检查 prompt 与 decode 步的 logits 不变。
+
+arena 保存最大一层的量化投影的 F16 形式：ISTA 包为 194 MiB，即带 PLE key 的 GDN 层。驻留规划会像为组的流预留空间一样为它
+预留，因此显存中少留 147 个专家（17,632 -> 17,485，所分析路由的 98.4% -> 98.3%）。这可能改变 decode 步的结果，因为 decode
+步在 CPU 上计算主机专家。
+
+RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（`TS_Q4E_GROUP_F16=0` 时每个 ubatch 反量化一次）。三次运行的 TTFT，
+第一次为冷启动。引擎基准的 short_chat、long_prompt_4k/16k 与 long_generation 检查两组均为 8/8 通过：
+
+| prompt 组中的稠密权重 | 4K prompt（3,541 token） | 16K prompt（14,093 token） | 引擎基准 4K / 16K TTFT | 长生成 |
+| --- | --- | --- | --- | --- |
+| 每个 ubatch 反量化 | 0.85 / 0.56 / 0.55 s | 2.39 / 2.38 / 2.38 s | 0.74 s / 3.00-3.01 s | 241-244 tok/s |
+| 每层每组一次（默认） | 0.80 / 0.53 / 0.51 s | 2.28 / 2.27 / 2.27 s | 0.70 s / 2.85-2.86 s | 237-252 tok/s |
+
+#### 每个 prompt 组只运行一次路由专家的 gate/up，2026-11-09
+
+在 int8 内核上，1,024 行的 ubatch 平均每个专家约 20 个 token，而每个 ubatch 都重新读取每个专家的权重。16K 时仅重复读取就约
+476 GB，以 RTX 5090 的带宽计算，未做任何运算就要 264 ms。一层的 gate/up 在 1,024 行上用 0.52 ms，在 4,096 行上用 1.27 ms
+（`CudaMoeQ2_0Int8Tests` 计时）。Strata 以 8K token 的分块读取 prompt。
+
+在 prompt 组中，下一层要等组内所有 ubatch 都跑完这一层才开始。因此组内的 ubatch 现在把路由专家留到这一层的最后
+（`TS_Q4E_GROUP_EXPERTS`，默认开启）：
+
+- 每个 ubatch 暂存它缺失的专家（整层保留），并运行它的 router 与共享专家。
+- 它把选择结果、int8 激活、共享专家输出与 scatter logits 留在组的缓冲区中。
+- 最后一个 ubatch 之后，一次分组计划和一次 gate/up 覆盖整个组，因此每个专家的 gate 与 up 权重每层每组只读取一次。
+- down 仍按 ubatch 运行，因此其逐 slot 输出保持原大小。每个 ubatch 的 down 通过组的计划读取其 slot 的 H
+  （`ts_dsv4_moe_row_map_i32` 与 down 内核的 act-row 映射），随后是合并与写入流的 scatter。
+
+每个 slot 的乘积都与按 ubatch 顺序相同，因此 prompt 的结果逐位相同
+（`APromptGroupsExpertGateUp_RunOncePerLayer_AnswersBitForBit`：每组 192 行的 64 行 ubatch，Q2_0 专家）。
+
+4,096 行时这些缓冲区占 85 MiB，主要是共享专家输出与 H，因此显存中少留 64 个专家（17,485 -> 17,421）。组的最后一个
+ubatch 不超过 16 行时，该组保持 ubatch 顺序，因为该 ubatch 运行逐 slot 内核；int8 路线不接管的层也一样。
+
+RTX 5090，ISTA `Q2_0`，MTP，模型位于 `/dev/shm`，同一构建（`TS_Q4E_GROUP_EXPERTS=0` 时按 ubatch 运行 gate/up）。三次运行的
+TTFT，第一次为冷启动。引擎基准的 short_chat、long_prompt_4k/16k 与 long_generation 检查两组均为 8/8 通过：
+
+| prompt 组中路由专家的 gate/up | 4K prompt（3,541 token） | 16K prompt（14,092 token） | 引擎基准 4K / 16K TTFT | 长生成 |
+| --- | --- | --- | --- | --- |
+| 每个 ubatch | 0.81 / 0.53 / 0.53 s | 2.28 / 2.27 / 2.27 s | 0.70 s / 2.86 s | 240-251 tok/s |
+| 每层每组一次（默认） | 0.79 / 0.51 / 0.49 s | 2.23 / 2.21 / 2.21 s | 0.67 s / 2.74-2.76 s | 243-254 tok/s |
+| Strata（11-07） | | | 0.92 s / 2.75 s | 300-307 tok/s |
+
+#### 以 64 位键做 router 选择，2026-11-09
+
+decode 步的 router 是一个 512 x 2560 的 BF16 GEMV，随后在 512 个 softmax 分数上做 top-10 选择（`ts_dsv4_moe_select_f32`）。
+选择每行用一个 warp。原来每次选取都是一次 shuffle argmax，每步要用三次 shuffle 同时传递分数、权重和专家编号；随后胜出的
+lane 按顺序重新扫描自己的 16 个分数。在 graph 捕获的 decode 剖析中，选择每层用 5.8 us，比它之前的 GEMV（4 行 5.1 us）还多。
+
+带键的选择（`ts_dsv4_moe_select_keys_f32`，`TS_DSV4_SELECT_KEYS`，默认开启）把每个排序分数变成一个 64 位键：保序的分数位在上，
+专家编号的补码在下。键越大，分数越高；分数相同时专家编号越小，与 argmax 的顺序一致。
+
+- 每次选取是每步两次 shuffle 的键最大值。
+- 胜出的 lane 用四步树形归约重取自己的最佳值。
+- lane k 保存第 k 个选择。
+- 权重最后从共享内存读回，按选取顺序求和。每个 lane 写出自己的选择。原来是 lane 0 逐个写出选择，再从全局内存读回权重做缩放。
+
+选择与权重与浮点 argmax 逐位相同。`Dsv4RouterKernelTests` 在 2,048 个专为排序边界情况构造的行上比较两个内核：各名次上的完全
+并列、-inf、NaN、+inf、带符号的零，以及没有候选的行。这些行覆盖 64-512 个专家、top 6-32、全部三种 gating、有无 bias。
+两个内核也都与主机端参考实现比较。
+
+RTX 5090，每个 graph 192 次启动，48 个冷 router 矩阵（每次调用 us）：
+
+| 行数 | BF16 GEMV | 选择，浮点 argmax | 选择，带键 |
+| --- | --- | --- | --- |
+| 1 | 2.78 | 4.83 | 3.11 |
+| 4 | 4.22 | 4.85 | 3.11 |
+
+引擎基准，ISTA `Q2_0`，MTP，同一构建（`TS_DSV4_SELECT_KEYS=0` 为 argmax）。每组两轮，交替运行。两组的贪心输出全部一致，
+所有检查均通过：
+
+| 选择 | 长生成 | 4 行验证窗口 | 1 行步 | 4K / 16K 验证窗口 |
+| --- | --- | --- | --- | --- |
+| 浮点 argmax | 231-244 tok/s | 10.09-10.10 ms | 7.01-7.03 ms | 13.37 / 10.63 ms |
+| 带键（默认） | 232-246 tok/s | 10.02-10.04 ms | 6.93-6.94 ms | 13.28-13.33 / 10.56-10.58 ms |
+
+尝试后更慢的：GEMV 的每个 block 计算 2 或 4 个专家，每个线程只加载一次激活供它们共用。4 行时用 4.75 和 6.45 us，
+而原来是 4.22 us，因为 grid 变小后同时在途的权重读取更少。
+
+#### 稠密内核的行和改为一次 reduce-scatter，2026-11-09
+
+每个只解码一次的稠密内核最后对每个激活行做一次 warp 求和：每次 5 次 shuffle，4 行窗口共 20 次；而在 Flash Next 2560 宽的行上，
+主循环每个 lane 只处理一两个权重单元。4 行及以上的窗口现在把各行合并为一次 reduce-scatter（`ts_dsv4_rows_reduce_scatter`）。
+在 warp 求和的 xor butterfly（16、8、4、2、1）的每一步，一个 lane 保留一半的行，并加上配对 lane 在这些行上的值：4 行只需 6 次
+shuffle。每次加法都与 butterfly 中的那次加法相同（本 lane 的部分和加上配对 lane 的，配对关系与顺序都不变），所以每行的和在
+每个宽度下都与原来逐位相同。
+
+少于 4 行时，内核仍对每行单独做 warp 求和：在那里 reduce-scatter 把寄存器从 64-80 个增加到 128 个，2 行和 3 行的调用变慢。
+router 的 block GEMV 用同样方法没有收益（4 行 4.21 -> 4.20 us），因此保持原有求和方式。
+
+稠密内核的指纹（`Dsv4DenseFastFingerprintTests`）、宽度测试与行不变性测试均不变。RTX 5090，4 行，冷权重（us）：qkv IQ4_XS
+2560 -> 10240 11.15 -> 10.65；注意力 q Q2_0 2560 -> 12288 11.91 -> 11.30；ssm_out Q5_K 6144 -> 2560 12.61 -> 12.16；超连接
+up Q8_0 320 -> 10240 5.10 -> 4.48；down 10240 -> 320 5.27 -> 5.36。1-3 行不变。
+
+引擎基准，两个构建，每组两轮交替运行。两组的贪心输出全部一致，所有检查均通过：
+
+| 行和 | 长生成 | 4 行验证窗口 | 4K / 16K 4 行窗口 |
+| --- | --- | --- | --- |
+| 每行一次 warp 求和 | 232-245 tok/s | 10.02-10.03 ms | 13.36 / 11.05-11.07 ms |
+| 一次 reduce-scatter（默认） | 234-248 tok/s | 9.89-9.94 ms | 13.28-13.30 / 10.93-10.96 ms |
+
+#### MTP 追赶在设备上读取提示词的流，2026-11-09
+
+长提示词之后，第一个草稿窗口会让 MTP 块处理提示词的最后 4,000 行。这些行只写入 K/V，即只写 KV 的追赶。在 RTX 5090 上它耗时
+22.6 ms，约占 4K 回答 decode 时间的 8%，其中只有 4.6 ms 是内核。其余时间花在这些行的主干流上：4,000 x 10,240 个浮点数
+（164 MB）。它们取自运行时的主机副本：每个 ubatch 先复制到锁页内存，再从主机复制到设备，而同样的值其实仍在设备上。
+
+最后一个提示词组的输出流会一直留在该组的缓冲区里，直到下一个组运行。引擎现在记录该缓冲区保存的是哪个序列的哪些位置。
+追赶对这些行直接在设备内复制流，只有其余的行仍从主机上传（`TS_Q4E_MTP_D2D`，默认开启）。
+
+这些值与主机副本中的值相同，所以草稿逐位一致。在 `TheMtpCatchUpAfterAGroupedPrompt_ReadsTheLastGroupsStreams_BitForBit` 中
+（300 token 的提示词按 192 行分组，从位置 150 开始追赶），最后一组的 108 行来自设备；草稿链选出相同的 token，置信度也相同。
+
+引擎基准，同一构建，每组两轮交替运行（三个请求的 decode tok/s）。两组的贪心输出全部一致，所有检查均通过：
+
+| 追赶行 | 4,000 行追赶 | long_prompt_4k | long_prompt_16k |
+| --- | --- | --- | --- |
+| 来自主机（`TS_Q4E_MTP_D2D=0`） | 21.6-22.7 ms | 177 / 186 / 206，170 / 185 / 241 | 206 / 230 / 257，209 / 234 / 256 |
+| 来自设备（默认） | 5.8-6.1 ms | 179 / 198 / 219，176 / 201 / 255 | 208 / 257 / 277，211 / 253 / 278 |
+
+提示词前向仍会把这些流复制到主机供运行时使用（164 MB D2H），所以 TTFT 不变。
+
 ### ggml_metal 上的 DFlash2 草稿模型，2026-11-08
 
 Strata 在 Mac 上用 DFlash2 起草：一种块草稿模型，一次前向最多提出 7 个 token。TensorSharp 现在在 GGML 后端上也能使用同一个草稿模型：
