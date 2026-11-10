@@ -52,9 +52,11 @@ namespace TensorSharp.GGML
 
         /// <param name="replayable">True for a graph run more than once (it then keeps its own
         /// compute memory); false borrows the backend's shared compute memory for one run.</param>
-        public GgmlGraph(int maxNodes, bool replayable = false)
+        /// <param name="reorder">Let the backend reorder nodes for concurrency (ggml-metal's graph
+        /// optimizer); a family opts in where it measures faster.</param>
+        public GgmlGraph(int maxNodes, bool replayable = false, bool reorder = false)
         {
-            _handle = GgmlNative.TSGgml_GraphCreate(maxNodes, replayable ? 1 : 0);
+            _handle = GgmlNative.TSGgml_GraphCreate(maxNodes, replayable ? 1 : 0, reorder ? 1 : 0);
             if (_handle == IntPtr.Zero)
                 throw new InvalidOperationException("ggml graph creation failed: " + GgmlBasicOps.LastNativeError());
         }
@@ -148,7 +150,7 @@ namespace TensorSharp.GGML
     {
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        internal static partial IntPtr TSGgml_GraphCreate(int maxNodes, int replayable);
+        internal static partial IntPtr TSGgml_GraphCreate(int maxNodes, int replayable, int reorder);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

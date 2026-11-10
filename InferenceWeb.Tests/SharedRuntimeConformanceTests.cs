@@ -169,6 +169,7 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         using var graph = Create(family, path, 1, 1, TestGates.PinnedGgmlBackend);
         List<float[]> rows = Script(graph);
         Assert.True(((StandardDecoderModel)graph).GraphRuns >= rows.Count, "every step must run as a whole-forward graph");
+        Assert.True(((StandardDecoderModel)graph).GraphReplays > 0, "consecutive decode tokens must replay their graph");
         for (int i = 0; i < perOp.Count; i++)
         {
             double rel = RelL2(rows[i], perOp[i]);
@@ -179,17 +180,18 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     /// <summary>A fixed script over one cache: prefill, decode, truncate + refill, reset, prefill.</summary>
     private static List<float[]> Script(ModelBase model)
     {
+        // Logits buffers may be reused by the model's next forward: keep copies.
         var rows = new List<float[]>();
         int[] prompt = Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray();
-        rows.Add(model.ForwardRefill(prompt));
+        rows.Add((float[])model.ForwardRefill(prompt).Clone());
         foreach (int token in new[] { 71, 72, 73, 74 })
-            rows.Add(model.Forward(new[] { token }));
+            rows.Add((float[])model.Forward(new[] { token }).Clone());
         Assert.True(model.TryTruncateKVCache(10));
-        rows.Add(model.ForwardRefill(new[] { 91, 92, 93, 94, 95 }));
-        rows.Add(model.Forward(new[] { 96 }));
+        rows.Add((float[])model.ForwardRefill(new[] { 91, 92, 93, 94, 95 }).Clone());
+        rows.Add((float[])model.Forward(new[] { 96 }).Clone());
         model.ResetKVCache();
-        rows.Add(model.ForwardRefill(new[] { 33, 34, 35, 36, 37, 38, 39 }));
-        rows.Add(model.Forward(new[] { 40 }));
+        rows.Add((float[])model.ForwardRefill(new[] { 33, 34, 35, 36, 37, 38, 39 }).Clone());
+        rows.Add((float[])model.Forward(new[] { 40 }).Clone());
         return rows;
     }
 
@@ -346,7 +348,7 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         using var model = Create(family, path, tp, stages);
         int[] prompt = Enumerable.Range(0, 12).Select(i => 50 + i).ToArray();
         model.ForwardRefill(prompt);
-        float[] expectedNext = model.Forward(new[] { 77 });
+        float[] expectedNext = (float[])model.Forward(new[] { 77 }).Clone();
 
         model.ResetKVCache();
         model.ForwardRefill(prompt);

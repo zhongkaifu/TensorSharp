@@ -52,6 +52,10 @@ namespace TensorSharp.Models
         /// <summary>Whether the family's recurrent layers lower to the graph.</summary>
         protected virtual bool RecurrentMixerLowers => false;
 
+        /// <summary>Let ggml-metal reorder the graph for concurrency. Off by default: it widens the
+        /// live set and measured slower on some families; a family opts in where it measures faster.</summary>
+        protected virtual bool GraphReorderOnMetal => false;
+
         /// <summary>A reason the current configuration cannot run whole-forward graphs, or null.</summary>
         private string GraphUnsupportedReason()
         {
@@ -78,6 +82,37 @@ namespace TensorSharp.Models
             _ => throw new ArgumentException($"Unsupported KV cache dtype: {dt}"),
         };
 
+        // Decode graphs (every sequence one row) are replayed while their trace matches.
+        private const int GraphCacheEntries = 8;
+        private readonly Dictionary<(ulong, ulong), CachedGraph> _graphCache = new();
+        private readonly LinkedList<(ulong, ulong)> _graphLru = new();
+
+        /// <summary>A built graph kept for replay, with the buffer its logits land in.</summary>
+        internal sealed class CachedGraph : IDisposable
+        {
+            public required GgmlGraph Graph { get; init; }
+            public float[] Logits { get; init; }
+            public GCHandle Pin { get; init; }
+
+            public void Dispose()
+            {
+                Graph.Dispose();
+                if (Pin.IsAllocated) Pin.Free();
+            }
+        }
+
+        /// <summary>Drop replayable graphs: a bound cache or state was reallocated, freed, or
+        /// rewritten on the host, so their device bindings may be stale.</summary>
+        private void ClearGraphCache()
+        {
+            foreach (CachedGraph entry in _graphCache.Values) entry.Dispose();
+            _graphCache.Clear();
+            _graphLru.Clear();
+        }
+
+        /// <summary>Steps that replayed a cached graph (tests check decode replays).</summary>
+        internal int GraphReplays { get; private set; }
+
         /// <summary>
         /// Run one step as a whole-forward graph. <paramref name="hidden"/> is the embedded rows
         /// [rows, hidden] (media already injected); sequence s owns rows [first[s], first[s] +
@@ -97,76 +132,152 @@ namespace TensorSharp.Models
                     _graphDeclined = reason;
                     Console.WriteLine($"  {Config.Architecture}: per-op execution ({reason}).");
                 }
+                ClearGraphCache();
                 return false;
             }
 
             int n = slots.Length;
             int rows = (int)hidden.Sizes[0];
-            using var step = new GraphStep(this, rows, slots, first, counts, starts);
-            float[] all = null;
+            bool decode = rows == n;
+
+            // A decode step first traces in hash-only mode: when a cached graph has the same
+            // signature it replays with this step's inputs, and nothing else is recorded.
+            GraphStep step = null;
+            CachedGraph graph = null;
+            bool owned = false;
+            int head = -1;
             try
             {
-                int h = step.Input(hidden, Config.HiddenSize, rows);
-                var positions = new int[rows];
-                for (int s = 0; s < n; s++)
-                    for (int i = 0; i < counts[s]; i++) positions[first[s] + i] = starts[s] + i;
-                step.SetPositions(positions);
-
-                for (int layer = 0; layer < Config.NumLayers; layer++)
+                if (decode && _graphCache.Count > 0)
                 {
-                    int normed = step.RmsNorm(h, $"blk.{layer}.attn_norm.weight");
-                    int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
-                    h = step.Op(GgmlGraphOp.Add, h, mix);
-                    int ffnIn = step.RmsNorm(h, FfnNormWeight(layer));
-                    int ffn = _moeLayer[layer] ? EmitMoe(step, layer, ffnIn) : EmitDenseFfn(step, layer, ffnIn);
-                    h = step.Op(GgmlGraphOp.Add, h, ffn);
-                }
-
-                if (wantLogits)
-                {
-                    int final = step.RmsNorm(h, "output_norm.weight");
-                    int selected;
-                    if (n == 1 && rows == 1) selected = final;
-                    else if (n == 1) selected = step.Rows2(final, Config.HiddenSize, rows - 1, 1);
+                    step = new GraphStep(this, rows, slots, first, counts, starts, decode, record: false);
+                    head = EmitStep(step, hidden, wantLogits);
+                    if (_graphCache.TryGetValue(step.Signature, out graph))
+                    {
+                        _graphLru.Remove(step.Signature);
+                        _graphLru.AddFirst(step.Signature);
+                        GraphReplays++;
+                    }
                     else
                     {
-                        var last = new int[n];
-                        for (int s = 0; s < n; s++) last[s] = first[s] + counts[s] - 1;
-                        selected = step.Op(GgmlGraphOp.GetRows, final, step.InputI32(last, n));
+                        step.Dispose();
+                        step = null;
                     }
-                    int head = step.MatMul(_quantWeights.ContainsKey("output.weight") || _weights.ContainsKey("output.weight")
-                        ? "output.weight" : "token_embd.weight", selected);
-                    all = new float[(long)Config.VocabSize * n];
-                    step.Output(head, all);
                 }
-                if (!step.Run())
+                if (graph == null)
+                {
+                    step = new GraphStep(this, rows, slots, first, counts, starts, decode, record: true);
+                    head = EmitStep(step, hidden, wantLogits);
+                    graph = step.Build(replayable: decode, reorder: decode && GraphReorderOnMetal);
+                    if (decode)
+                    {
+                        var key = step.Signature;
+                        _graphCache[key] = graph;
+                        _graphLru.AddFirst(key);
+                        while (_graphLru.Count > GraphCacheEntries)
+                        {
+                            var evict = _graphLru.Last.Value;
+                            _graphLru.RemoveLast();
+                            _graphCache.Remove(evict, out CachedGraph old);
+                            old?.Dispose();
+                        }
+                    }
+                    else
+                    {
+                        owned = true;
+                    }
+                }
+
+                if (!step.Run(graph.Graph))
                     throw new InvalidOperationException($"{Config.Architecture} graph step failed: {GgmlBasicOps.LastNativeError()}");
+                GraphRuns++;
+                foreach (Slot slot in slots) slot.DeviceDirty = true;
+                if (head >= 0)
+                {
+                    int vocab = Config.VocabSize;
+                    logits = new float[n][];
+                    if (n == 1 && !owned)
+                    {
+                        // The graph's own buffer, rewritten by its next run: the same contract as a
+                        // model-owned logits buffer.
+                        logits[0] = graph.Logits;
+                    }
+                    else
+                    {
+                        for (int s = 0; s < n; s++)
+                        {
+                            logits[s] = new float[vocab];
+                            Array.Copy(graph.Logits, (long)s * vocab, logits[s], 0, vocab);
+                        }
+                    }
+                }
+                return true;
             }
-            catch (InvalidOperationException) when (step.Rejected)
+            catch (InvalidOperationException) when (step != null && step.Rejected)
             {
-                // The lowering met a case it does not express before anything ran.
+                // The lowering met a case it does not express; nothing was built or run.
+                ClearGraphCache();
                 return false;
             }
-            GraphRuns++;
-            foreach (Slot slot in slots) slot.DeviceDirty = true;
-            if (all != null)
+            finally
             {
-                int vocab = Config.VocabSize;
-                logits = new float[n][];
-                for (int s = 0; s < n; s++)
-                {
-                    logits[s] = new float[vocab];
-                    Array.Copy(all, (long)s * vocab, logits[s], 0, vocab);
-                }
+                step?.Dispose();
+                if (owned) graph?.Dispose();
             }
-            return true;
+        }
+
+        /// <summary>Trace one step: every layer, then (when wanted) the head over each sequence's last row.
+        /// Returns the head node, or -1.</summary>
+        private int EmitStep(GraphStep step, Tensor hidden, bool wantLogits)
+        {
+            int n = step.Sequences, rows = step.Rows;
+            int h = step.Input(hidden, Config.HiddenSize, rows);
+            var positions = new int[rows];
+            for (int s = 0; s < n; s++)
+                for (int i = 0; i < step.Counts[s]; i++) positions[step.First[s] + i] = step.Starts[s] + i;
+            step.SetPositions(positions);
+
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                int normed = step.RmsNorm(h, LayerName(layer, "attn_norm.weight"));
+                int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
+                h = step.Op(GgmlGraphOp.Add, h, mix);
+                int ffnIn = step.RmsNorm(h, FfnNormWeight(layer));
+                int ffn = _moeLayer[layer] ? EmitMoe(step, layer, ffnIn) : EmitDenseFfn(step, layer, ffnIn);
+                h = step.Op(GgmlGraphOp.Add, h, ffn);
+            }
+            if (!wantLogits) return -1;
+
+            int final = step.RmsNorm(h, "output_norm.weight");
+            int selected;
+            if (n == 1 && rows == 1) selected = final;
+            else if (n == 1) selected = step.View2(final, Config.HiddenSize, 1, Config.HiddenSize * 4L, (rows - 1) * Config.HiddenSize * 4L);
+            else
+            {
+                var last = new int[n];
+                for (int s = 0; s < n; s++) last[s] = step.First[s] + step.Counts[s] - 1;
+                selected = step.Op(GgmlGraphOp.GetRows, final, step.InputI32(last, n));
+            }
+            int head = step.MatMul(_quantWeights.ContainsKey("output.weight") || _weights.ContainsKey("output.weight")
+                ? "output.weight" : "token_embd.weight", selected);
+            step.Output(head, (long)Config.VocabSize * n);
+            return head;
+        }
+
+        private readonly Dictionary<(int Layer, string Suffix), string> _layerNames = new();
+
+        /// <summary><c>blk.{layer}.{suffix}</c>, built once (traces run every token).</summary>
+        protected string LayerName(int layer, string suffix)
+        {
+            if (!_layerNames.TryGetValue((layer, suffix), out string name))
+                _layerNames[(layer, suffix)] = name = $"blk.{layer}.{suffix}";
+            return name;
         }
 
         // ---------------------------------------------------------------- branches
 
         private int EmitAttention(GraphStep step, int layer, int x)
         {
-            string p = $"blk.{layer}.";
             int heads = _localHeads, kvHeads = _localKvHeads, d = _keyDim, dv = _valueDim, rows = step.Rows;
             const long f = sizeof(float);
             long qDim = (long)heads * d, kDim = (long)kvHeads * d, vDim = (long)kvHeads * dv;
@@ -176,7 +287,7 @@ namespace TensorSharp.Models
             int q, k, v, gate = -1;
             if (_qkvFused[layer])
             {
-                int qkv = step.MatMul(p + "attn_qkv.weight", x);
+                int qkv = step.MatMul(LayerName(layer, "attn_qkv.weight"), x);
                 long width = qWidth + kDim + vDim;
                 q = step.View3(qkv, d, heads, rows, qStride * f, width * f, 0);
                 if (GatedAttentionOutput) gate = step.View3(qkv, d, heads, rows, qStride * f, width * f, d * f);
@@ -185,58 +296,65 @@ namespace TensorSharp.Models
             }
             else
             {
-                int qa = step.MatMul(p + "attn_q.weight", x);
+                int qa = step.MatMul(LayerName(layer, "attn_q.weight"), x);
                 q = step.View3(qa, d, heads, rows, qStride * f, qWidth * f, 0);
                 if (GatedAttentionOutput) gate = step.View3(qa, d, heads, rows, qStride * f, qWidth * f, d * f);
-                k = step.Reshape(step.MatMul(p + "attn_k.weight", x), d, kvHeads, rows);
-                v = step.Reshape(step.MatMul(p + "attn_v.weight", x), dv, kvHeads, rows);
+                k = step.Reshape(step.MatMul(LayerName(layer, "attn_k.weight"), x), d, kvHeads, rows);
+                v = step.Reshape(step.MatMul(LayerName(layer, "attn_v.weight"), x), dv, kvHeads, rows);
             }
-            q = step.Op(GgmlGraphOp.Cont, q);
-            k = step.Op(GgmlGraphOp.Cont, k);
-            v = step.Op(GgmlGraphOp.Cont, v);
+            q = step.Cont(q);
+            k = step.Cont(k);
+            v = step.Cont(v);
             EmitQueryKey(step, layer, ref q, ref k);
 
             int kvType = KvGgmlType(_kvCacheDtype.ToDType());
             float scale = 1.0f / MathF.Sqrt(d);
+            long kRow = RowBytes(kvType, d), vRow = RowBytes(kvType, dv);
             int n = step.Sequences;
             int attn = -1;
             for (int s = 0; s < n; s++)
             {
                 int count = step.Counts[s], start = step.Starts[s];
                 Slot slot = step.Slots[s];
-                int qs = n == 1 ? q : step.Rows3(q, step.First[s], count);
-                int ks = n == 1 ? k : step.Rows3(k, step.First[s], count);
-                int vs = n == 1 ? v : step.Rows3(v, step.First[s], count);
-                int qPerm = step.Op(GgmlGraphOp.Permute, stackalloc[] { qs }, stackalloc long[] { 0, 2, 1, 3 });
-                int kFresh = step.Op(GgmlGraphOp.Cont, step.Op(GgmlGraphOp.Permute, stackalloc[] { ks }, stackalloc long[] { 0, 2, 1, 3 }));
-                int vFresh = step.Op(GgmlGraphOp.Cont, step.Op(GgmlGraphOp.Permute, stackalloc[] { vs }, stackalloc long[] { 0, 2, 1, 3 }));
+                long firstRow = step.First[s];
+                int qs = n == 1 ? q : step.View3(q, d, heads, count, d * f, d * heads * f, firstRow * d * heads * f);
+                int ks = n == 1 ? k : step.View3(k, d, kvHeads, count, d * f, d * kvHeads * f, firstRow * d * kvHeads * f);
+                int vs = n == 1 ? v : step.View3(v, dv, kvHeads, count, dv * f, dv * kvHeads * f, firstRow * dv * kvHeads * f);
+                int qPerm = step.Permute(qs, 0, 2, 1, 3);
+                // [d, heads, count] -> [d, count, heads]; one row is the same bytes either way.
+                int kFresh = count == 1 ? step.Reshape(ks, d, 1, kvHeads) : step.Cont(step.Permute(ks, 0, 2, 1, 3));
+                int vFresh = count == 1 ? step.Reshape(vs, dv, 1, kvHeads) : step.Cont(step.Permute(vs, 0, 2, 1, 3));
 
-                Tensor cacheK = slot.K[layer][0], cacheV = slot.V[layer][0];
                 int cap = slot.Capacity;
-                int ck = step.State(cacheK, kvType, d, cap, kvHeads);
-                int cv = step.State(cacheV, kvType, dv, cap, kvHeads);
-                var (_, nbK, _) = step.G.Shape(ck);
-                var (_, nbV, _) = step.G.Shape(cv);
-                step.G.Effect(step.Op(GgmlGraphOp.Cpy, kFresh, step.View3(ck, d, count, kvHeads, nbK[1], nbK[2], start * nbK[1])));
-                step.G.Effect(step.Op(GgmlGraphOp.Cpy, vFresh, step.View3(cv, dv, count, kvHeads, nbV[1], nbV[2], start * nbV[1])));
+                int ck = step.State(slot.K[layer][0], kvType, d, cap, kvHeads);
+                int cv = step.State(slot.V[layer][0], kvType, dv, cap, kvHeads);
 
                 int fa;
                 if (count == 1)
                 {
-                    // Decode reads the cache (the row just written included), as a single request does.
+                    // Decode: the row is written by index and attention reads a padded window under
+                    // a mask, so every token of a window bucket replays the same graph.
+                    int row = step.WriteIndex(start);
+                    step.Effect(step.Op(GgmlGraphOp.SetRows, ck, kFresh, row));
+                    step.Effect(step.Op(GgmlGraphOp.SetRows, cv, vFresh, row));
+                    int stepRows = DecodeWindowStep;
+                    int window = Math.Min(cap, (start + 1 + stepRows - 1) / stepRows * stepRows);
                     int gqa = heads / kvHeads;
-                    int kWin = step.Op(GgmlGraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, start + 1, kvType, 1, gqa });
-                    int vWin = step.Op(GgmlGraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, start + 1, kvType, 1, gqa });
-                    fa = step.FlashAttention(qPerm, kWin, vWin, -1, scale);
+                    int kWin = step.Op(GgmlGraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, window, kvType, 1, gqa });
+                    int vWin = step.Op(GgmlGraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, window, kvType, 1, gqa });
+                    fa = step.FlashAttention(qPerm, kWin, vWin, step.DecodeMask(window, start + 1), scale);
                 }
                 else
                 {
-                    // A prompt chunk attends to the cached prefix and its own fresh rows (F32).
+                    // A prompt chunk is written at its offset and attends to the cached prefix and
+                    // its own fresh rows (F32), as the fused prefill graphs do.
+                    step.Effect(step.Op(GgmlGraphOp.Cpy, kFresh, step.View3(ck, d, count, kvHeads, kRow, kRow * cap, start * kRow)));
+                    step.Effect(step.Op(GgmlGraphOp.Cpy, vFresh, step.View3(cv, dv, count, kvHeads, vRow, vRow * cap, start * vRow)));
                     int kAttn = kFresh, vAttn = vFresh;
                     if (start > 0)
                     {
-                        int kPrev = step.View3(ck, d, start, kvHeads, nbK[1], nbK[2], 0);
-                        int vPrev = step.View3(cv, dv, start, kvHeads, nbV[1], nbV[2], 0);
+                        int kPrev = step.View3(ck, d, start, kvHeads, kRow, kRow * cap, 0);
+                        int vPrev = step.View3(cv, dv, start, kvHeads, vRow, vRow * cap, 0);
                         if (kvType != GgmlType.F32)
                         {
                             kPrev = step.Op(GgmlGraphOp.Cast, stackalloc[] { kPrev }, stackalloc long[] { GgmlType.F32 });
@@ -253,24 +371,23 @@ namespace TensorSharp.Models
 
             if (gate >= 0)
             {
-                int g = step.Reshape(step.Op(GgmlGraphOp.Cont, gate), (int)qDim, rows);
+                int g = step.Reshape(step.Cont(gate), (int)qDim, rows);
                 attn = step.Op(GgmlGraphOp.Mul, attn, step.Op(GgmlGraphOp.Sigmoid, g));
             }
-            return step.MatMul(p + "attn_output.weight", attn);
+            return step.MatMul(LayerName(layer, "attn_output.weight"), attn);
         }
 
         private int EmitDenseFfn(GraphStep step, int layer, int x)
         {
-            string p = $"blk.{layer}.";
             int act = _gateUpFused[layer]
-                ? step.Op(GgmlGraphOp.Swiglu, step.MatMul(p + "ffn_gate_up.weight", x))
-                : step.Op(GgmlGraphOp.SwigluSplit, step.MatMul(p + "ffn_gate.weight", x), step.MatMul(p + "ffn_up.weight", x));
-            return step.MatMul(p + "ffn_down.weight", act);
+                ? step.Op(GgmlGraphOp.Swiglu, step.MatMul(LayerName(layer, "ffn_gate_up.weight"), x))
+                : step.Op(GgmlGraphOp.SwigluSplit, step.MatMul(LayerName(layer, "ffn_gate.weight"), x), step.MatMul(LayerName(layer, "ffn_up.weight"), x));
+            return step.MatMul(LayerName(layer, "ffn_down.weight"), act);
         }
 
         private int EmitMoe(GraphStep step, int layer, int x)
         {
-            string p = $"blk.{layer}.";
+            string p = LayerName(layer, "");
             int rows = step.Rows, hidden = Config.HiddenSize, k = _expertsUsed;
             int probs = step.Op(GgmlGraphOp.SoftMaxExt, step.MatMul(p + "ffn_gate_inp.weight", x));   // [E, rows]
             int selected = step.Op(GgmlGraphOp.TopK, stackalloc[] { probs }, stackalloc long[] { k });      // [K, rows]
@@ -287,14 +404,14 @@ namespace TensorSharp.Models
             int act = step.Op(GgmlGraphOp.SwigluSplit, gate, up);                                            // [ff, K, rows]
             int down = step.Op(GgmlGraphOp.MulMatId, step.Experts(p + "ffn_down_exps.weight"), act, selected); // [hidden, K, rows]
             down = step.Op(GgmlGraphOp.Mul, down, weights);
-            var (_, nb, _) = step.G.Shape(down);
+            long rowBytes = hidden * 4L;
             int output = -1;
             for (int j = 0; j < k; j++)
             {
-                int slice = step.View2(down, hidden, rows, nb[2], j * nb[1]);
+                int slice = step.View2(down, hidden, rows, rowBytes * k, j * rowBytes);
                 output = output < 0 ? slice : step.Op(GgmlGraphOp.Add, output, slice);
             }
-            output = step.Op(GgmlGraphOp.Cont, output);
+            output = step.Cont(output);
 
             if (HasWeight(p + "ffn_gate_shexp.weight"))
             {
@@ -312,48 +429,143 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- the step
 
-        /// <summary>One graph under construction: its sequences and the helpers branch code uses.</summary>
+        /// <summary>Rows a decode attention window grows by: 64 on Metal, whose padded tail costs
+        /// more than a replay rebuild every 64 tokens (measured with Qwen 3.5's fused decode); 256
+        /// (the flash-attention KV stride) elsewhere.</summary>
+        private int DecodeWindowStep => _backend == BackendType.GgmlMetal ? 64 : 256;
+
+        /// <summary>Bytes of one row of <paramref name="ne0"/> elements of a ggml type.</summary>
+        private static long RowBytes(int type, long ne0) => type switch
+        {
+            GgmlType.F32 => ne0 * 4,
+            GgmlType.F16 => ne0 * 2,
+            GgmlType.Q8_0 => ne0 / 32 * 34,
+            GgmlType.Q4_0 => ne0 / 32 * 18,
+            _ => throw new ArgumentException($"no row size for ggml type {type}"),
+        };
+
+        /// <summary>
+        /// One step's graph as a trace: branch code emits nodes here (no native calls), the trace
+        /// carries a signature over everything that shapes the graph - ops, parameters, extents and
+        /// the bound host pointers - and is built natively only when no cached graph has that
+        /// signature. Per-run inputs (activations, positions, masks, write indices) are not part
+        /// of the signature; their values ride the run.
+        /// </summary>
         protected sealed class GraphStep : IDisposable
         {
+            private enum Kind : byte { Leaf, Op, Effect, Output }
+
+            private readonly struct Rec
+            {
+                public Kind Kind { get; init; }
+                public int Op { get; init; }
+                public int[] Srcs { get; init; }
+                public long[] Ip { get; init; }
+                public float[] Fp { get; init; }
+                public GgmlLeafRole Role { get; init; }
+                public int Type { get; init; }
+                public long[] Ne { get; init; }
+                public IntPtr Data { get; init; }
+                public long Bytes { get; init; }
+                public int Node { get; init; }
+            }
+
             private readonly StandardDecoderModel _m;
+            private readonly List<Rec> _recs = new();
             private readonly Dictionary<string, int> _weights = new(StringComparer.Ordinal);
             private readonly Dictionary<Tensor, int> _states = new(ReferenceEqualityComparer.Instance);
             private readonly List<GCHandle> _pins = new();
             private readonly List<int> _inputs = new();
             private readonly List<IntPtr> _inputData = new();
             private readonly List<long> _inputBytes = new();
-            private int _mask = -1;
-            private int _maskStart = -1, _maskCount = -1;
+            private int _nodes;
+            private ulong _h1 = 14695981039346656037UL, _h2 = 0x9E3779B97F4A7C15UL;
+            private int _mask = -1, _maskStart = -1, _maskCount = -1;
+            private int _decodeMask = -1, _decodeMaskWindow = -1, _decodeMaskValid = -1;
+            private readonly Dictionary<int, int> _writeIndex = new();
+            private readonly HashSet<int> _strided = new();   // nodes whose layout is not contiguous
 
-            internal GraphStep(StandardDecoderModel model, int rows, Slot[] slots, int[] first, int[] counts, int[] starts)
+            private readonly bool _record;
+
+            internal GraphStep(StandardDecoderModel model, int rows, Slot[] slots, int[] first, int[] counts, int[] starts,
+                bool decode, bool record)
             {
                 _m = model;
+                _record = record;
                 Rows = rows;
                 Slots = slots;
                 First = first;
                 Counts = counts;
                 Starts = starts;
-                G = new GgmlGraph(16384);
+                IsDecode = decode;
             }
 
-            internal GgmlGraph G { get; }
             internal Slot[] Slots { get; }
             public int Rows { get; }
             public int Sequences => Slots.Length;
             public int[] First { get; }
             public int[] Counts { get; }
             public int[] Starts { get; }
+            /// <summary>Every sequence forwards one row (the graph may be replayed).</summary>
+            public bool IsDecode { get; }
             /// <summary>Token positions [rows] (I32).</summary>
             public int Positions { get; private set; } = -1;
             /// <summary>The positions' values (row order).</summary>
             public int[] PositionValues { get; private set; }
             internal bool Rejected { get; private set; }
+            internal (ulong, ulong) Signature => (_h1, _h2);
 
-            public int Op(GgmlGraphOp op, int a) => G.Op(op, a);
-            public int Op(GgmlGraphOp op, int a, int b) => G.Op(op, a, b);
-            public int Op(GgmlGraphOp op, int a, int b, int c) => G.Op(op, a, b, c);
+            // ---- tracing
+
+            private void Mix(long value)
+            {
+                ulong v = unchecked((ulong)value);
+                _h1 = (_h1 ^ v) * 1099511628211UL;
+                _h2 = (_h2 ^ (v + 0x9E3779B97F4A7C15UL + (_h2 << 6) + (_h2 >> 2))) * 0xC2B2AE3D27D4EB4FUL;
+            }
+
+            private void Mix(ReadOnlySpan<long> values) { Mix(values.Length); foreach (long v in values) Mix(v); }
+
+            private void Mix(ReadOnlySpan<int> values) { Mix(values.Length); foreach (int v in values) Mix(v); }
+
+            private void Mix(ReadOnlySpan<float> values) { Mix(values.Length); foreach (float v in values) Mix(BitConverter.SingleToInt32Bits(v)); }
+
+            private int Leaf(GgmlLeafRole role, int type, ReadOnlySpan<long> ne, IntPtr data, long bytes)
+            {
+                Mix(1); Mix((int)role); Mix(type); Mix(ne);
+                if (role != GgmlLeafRole.Input) { Mix(data.ToInt64()); Mix(bytes); }
+                if (_record) _recs.Add(new Rec { Kind = Kind.Leaf, Role = role, Type = type, Ne = ne.ToArray(), Data = data, Bytes = bytes });
+                return _nodes++;
+            }
+
+            public int Op(GgmlGraphOp op, int a) => Op(op, stackalloc[] { a });
+            public int Op(GgmlGraphOp op, int a, int b) => Op(op, stackalloc[] { a, b });
+            public int Op(GgmlGraphOp op, int a, int b, int c) => Op(op, stackalloc[] { a, b, c });
+
             public int Op(GgmlGraphOp op, ReadOnlySpan<int> srcs, ReadOnlySpan<long> ip = default, ReadOnlySpan<float> fp = default)
-                => G.Op(op, srcs, ip, fp);
+            {
+                foreach (int src in srcs)
+                    if (src < 0 || src >= _nodes) throw new ArgumentOutOfRangeException(nameof(srcs), $"{op}: source node {src} does not exist");
+                Mix(2); Mix((int)op); Mix(srcs); Mix(ip); Mix(fp);
+                if (_record) _recs.Add(new Rec { Kind = Kind.Op, Op = (int)op, Srcs = srcs.ToArray(), Ip = ip.ToArray(), Fp = fp.ToArray() });
+                return _nodes++;
+            }
+
+            /// <summary>Run <paramref name="node"/> for its side effect (a cache or state write).</summary>
+            public void Effect(int node)
+            {
+                Mix(3); Mix(node);
+                if (_record) _recs.Add(new Rec { Kind = Kind.Effect, Node = node });
+            }
+
+            /// <summary>The step's result: <paramref name="floats"/> F32 values of <paramref name="node"/>.</summary>
+            internal void Output(int node, long floats)
+            {
+                Mix(4); Mix(node); Mix(floats);
+                if (_record) _recs.Add(new Rec { Kind = Kind.Output, Node = node, Bytes = floats });
+            }
+
+            // ---- leaves
 
             /// <summary>A model weight by name: quantized (its device-cache key) or F32.</summary>
             public int Weight(string name)
@@ -362,7 +574,7 @@ namespace TensorSharp.Models
                 if (_m._quantWeights.TryGetValue(name, out QuantizedWeight q))
                 {
                     IntPtr key = q.CacheKey != IntPtr.Zero ? q.CacheKey : q.Data;
-                    node = G.Leaf(GgmlLeafRole.Weight, q.GgmlType, stackalloc long[] { q.Ne0, q.Ne1 }, key, q.RawBytes);
+                    node = Leaf(GgmlLeafRole.Weight, q.GgmlType, stackalloc long[] { q.Ne0, q.Ne1 }, key, q.RawBytes);
                 }
                 else if (_m._weights.TryGetValue(name, out Tensor t))
                 {
@@ -388,10 +600,13 @@ namespace TensorSharp.Models
             {
                 if (_weights.TryGetValue(name, out int node)) return node;
                 if (!_m._stackedExpertWeights.TryGetValue(name, out StackedExpertWeights w)) throw Reject($"experts '{name}' are not stacked");
-                node = G.Leaf(GgmlLeafRole.Weight, w.GgmlType, stackalloc long[] { w.PerExpertNe0, w.PerExpertNe1, w.NumExperts }, w.Data, w.TotalRawBytes);
+                node = Leaf(GgmlLeafRole.Weight, w.GgmlType, stackalloc long[] { w.PerExpertNe0, w.PerExpertNe1, w.NumExperts }, w.Data, w.TotalRawBytes);
                 _weights[name] = node;
                 return node;
             }
+
+            /// <summary>An F32 tensor the family prepared (device constants, norms) as a read-only leaf.</summary>
+            public int TensorWeight(Tensor t, params long[] ne) => TensorLeaf(GgmlLeafRole.Weight, t, GgmlType.F32, ne.Length == 0 ? Extents(t) : ne);
 
             /// <summary>Read-write state the graph updates in place (a slot's cache or recurrent state).</summary>
             public int State(Tensor t, int type, params long[] ne)
@@ -406,10 +621,7 @@ namespace TensorSharp.Models
             internal RecurrentState SequenceState(int s, int layer) => Slots[s].Recurrent[layer][0];
 
             private int TensorLeaf(GgmlLeafRole role, Tensor t, int type, ReadOnlySpan<long> ne)
-            {
-                IntPtr data = TensorComputePrimitives.GetStoragePointer(t);
-                return G.Leaf(role, type, ne, data, t.Storage.ByteLength);
-            }
+                => Leaf(role, type, ne, TensorComputePrimitives.GetStoragePointer(t), t.Storage.ByteLength);
 
             private static long[] Extents(Tensor t)
             {
@@ -418,24 +630,26 @@ namespace TensorSharp.Models
                 return ne;
             }
 
+            // ---- per-run inputs
+
             /// <summary>An F32 activation [cols, rows] read from a host tensor every run.</summary>
             internal int Input(Tensor t, long cols, long rows)
             {
-                int node = G.Leaf(GgmlLeafRole.Input, GgmlType.F32, stackalloc long[] { cols, rows }, IntPtr.Zero, 0);
+                int node = Leaf(GgmlLeafRole.Input, GgmlType.F32, stackalloc long[] { cols, rows }, IntPtr.Zero, 0);
                 AddInput(node, TensorComputePrimitives.GetStoragePointer(t), cols * rows * sizeof(float));
                 return node;
             }
 
             public int InputI32(int[] values, long count)
             {
-                int node = G.Leaf(GgmlLeafRole.Input, GgmlType.I32, stackalloc long[] { count }, IntPtr.Zero, 0);
+                int node = Leaf(GgmlLeafRole.Input, GgmlType.I32, stackalloc long[] { count }, IntPtr.Zero, 0);
                 AddInput(node, Pin(values), count * sizeof(int));
                 return node;
             }
 
             public int InputF32(float[] values, params long[] ne)
             {
-                int node = G.Leaf(GgmlLeafRole.Input, GgmlType.F32, ne, IntPtr.Zero, 0);
+                int node = Leaf(GgmlLeafRole.Input, GgmlType.F32, ne, IntPtr.Zero, 0);
                 AddInput(node, Pin(values), (long)values.Length * sizeof(float));
                 return node;
             }
@@ -446,13 +660,28 @@ namespace TensorSharp.Models
                 Positions = InputI32(positions, positions.Length);
             }
 
-            /// <summary>An F32 tensor the family prepared (device constants, norms) as a read-only leaf.</summary>
-            public int TensorWeight(Tensor t, params long[] ne) => TensorLeaf(GgmlLeafRole.Weight, t, GgmlType.F32, ne.Length == 0 ? Extents(t) : ne);
+            /// <summary>The row index [1, 1] (I64) a decode token is written at.</summary>
+            internal int WriteIndex(int row)
+            {
+                if (_writeIndex.TryGetValue(row, out int node)) return node;
+                node = Leaf(GgmlLeafRole.Input, GgmlType.I64, stackalloc long[] { 1, 1 }, IntPtr.Zero, 0);
+                AddInput(node, Pin(new long[] { row }), sizeof(long));
+                _writeIndex[row] = node;
+                return node;
+            }
 
-            /// <summary>rms_norm(x, eps / n) / sqrt(n) over ne0: the L2 normalization ggml's GDN path uses.</summary>
-            public int L2Norm(int x, long n, float eps)
-                => Op(GgmlGraphOp.Scale, stackalloc[] { Op(GgmlGraphOp.RmsNorm, stackalloc[] { x }, default, stackalloc[] { eps / n }) },
-                    default, stackalloc[] { 1.0f / MathF.Sqrt(n) });
+            /// <summary>An F16 mask [window, 1] admitting the first <paramref name="valid"/> rows.</summary>
+            internal int DecodeMask(int window, int valid)
+            {
+                if (_decodeMask >= 0 && _decodeMaskWindow == window && _decodeMaskValid == valid) return _decodeMask;
+                var mask = new ushort[window];
+                for (int i = valid; i < window; i++) mask[i] = 0xFC00;   // -inf
+                _decodeMask = Leaf(GgmlLeafRole.Input, GgmlType.F16, stackalloc long[] { window, 1 }, IntPtr.Zero, 0);
+                AddInput(_decodeMask, Pin(mask), mask.LongLength * sizeof(ushort));
+                _decodeMaskWindow = window;
+                _decodeMaskValid = valid;
+                return _decodeMask;
+            }
 
             /// <summary>A causal F16 mask [start + count, count] for a chunk continuing at <paramref name="start"/>.</summary>
             public int CausalMask(int start, int count)
@@ -460,10 +689,9 @@ namespace TensorSharp.Models
                 if (_mask >= 0 && _maskStart == start && _maskCount == count) return _mask;
                 int kv = start + count;
                 var mask = new ushort[(long)kv * count];
-                const ushort negInf = 0xFC00;
                 for (int qi = 0; qi < count; qi++)
-                    for (int ki = start + qi + 1; ki < kv; ki++) mask[(long)qi * kv + ki] = negInf;
-                _mask = G.Leaf(GgmlLeafRole.Input, GgmlType.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
+                    for (int ki = start + qi + 1; ki < kv; ki++) mask[(long)qi * kv + ki] = 0xFC00;
+                _mask = Leaf(GgmlLeafRole.Input, GgmlType.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
                 AddInput(_mask, Pin(mask), mask.LongLength * sizeof(ushort));
                 _maskStart = start;
                 _maskCount = count;
@@ -484,8 +712,6 @@ namespace TensorSharp.Models
                 _inputBytes.Add(bytes);
             }
 
-            public void Output(int node, float[] destination) => G.Output(node, Pin(destination), destination.LongLength * sizeof(float));
-
             // ---- composites
 
             /// <summary>rms_norm(x) * weight.</summary>
@@ -493,6 +719,11 @@ namespace TensorSharp.Models
 
             public int RmsNorm(int x, int weight, float eps)
                 => Op(GgmlGraphOp.Mul, Op(GgmlGraphOp.RmsNorm, stackalloc[] { x }, default, stackalloc[] { eps }), weight);
+
+            /// <summary>rms_norm(x, eps / n) / sqrt(n) over ne0: the L2 normalization ggml's GDN path uses.</summary>
+            public int L2Norm(int x, long n, float eps)
+                => Op(GgmlGraphOp.Scale, stackalloc[] { Op(GgmlGraphOp.RmsNorm, stackalloc[] { x }, default, stackalloc[] { eps / n }) },
+                    default, stackalloc[] { 1.0f / MathF.Sqrt(n) });
 
             /// <summary>weight · x, with a quantized weight's per-tensor scale applied.</summary>
             public int MatMul(string weight, int x)
@@ -503,27 +734,79 @@ namespace TensorSharp.Models
                 return y;
             }
 
+            /// <summary>weight[firstRow .. firstRow + rows) · x: a row block of a (packed) weight as its
+            /// own product, so the result is contiguous.</summary>
+            public int MatMulRows(string weight, long firstRow, long rows, int x)
+            {
+                int w = Weight(weight);
+                long ne0, rowBytes;
+                float scale = 1.0f;
+                if (_m._quantWeights.TryGetValue(weight, out QuantizedWeight q))
+                {
+                    ne0 = q.Ne0;
+                    rowBytes = q.RawBytes / q.Ne1;
+                    scale = q.Scale;
+                }
+                else
+                {
+                    Tensor t = _m._weights[weight];
+                    ne0 = t.Sizes[t.DimensionCount - 1];
+                    rowBytes = ne0 * sizeof(float);
+                }
+                int block = Op(GgmlGraphOp.View, stackalloc[] { w }, stackalloc long[] { 2, ne0, rows, 1, 1, rowBytes, 0, 0, firstRow * rowBytes });
+                int y = Op(GgmlGraphOp.MulMat, block, x);
+                if (scale != 1.0f)
+                    y = Op(GgmlGraphOp.Scale, stackalloc[] { y }, default, stackalloc[] { scale });
+                return y;
+            }
+
             public int Reshape(int x, params long[] ne) => Op(GgmlGraphOp.Reshape, stackalloc[] { x }, ne);
 
+            /// <summary>A view of an F32 node; recorded as strided unless its rows are packed.</summary>
             public int View2(int x, long ne0, long ne1, long nb1, long offset)
-                => Op(GgmlGraphOp.View, stackalloc[] { x }, stackalloc long[] { 2, ne0, ne1, 1, 1, nb1, 0, 0, offset });
+            {
+                int node = Op(GgmlGraphOp.View, stackalloc[] { x }, stackalloc long[] { 2, ne0, ne1, 1, 1, nb1, 0, 0, offset });
+                if (ne1 > 1 && nb1 != ne0 * 4) _strided.Add(node);
+                return node;
+            }
+
+            public int View4(int x, long ne0, long ne1, long ne2, long ne3, long nb1, long nb2, long nb3, long offset)
+            {
+                int node = Op(GgmlGraphOp.View, stackalloc[] { x }, stackalloc long[] { 4, ne0, ne1, ne2, ne3, nb1, nb2, nb3, offset });
+                if ((ne1 > 1 && nb1 != ne0 * 4) || (ne2 > 1 && nb2 != ne0 * ne1 * 4) || (ne3 > 1 && nb3 != ne0 * ne1 * ne2 * 4))
+                    _strided.Add(node);
+                return node;
+            }
+
+            /// <summary>The backend's norms, unary ops and recurrent kernels read row-contiguous strided
+            /// views (ggml-metal, ggml-cuda); elsewhere a strided input is copied contiguous first.</summary>
+            public bool StridedInputs => _m._backend is BackendType.GgmlMetal or BackendType.GgmlCuda;
 
             public int View3(int x, long ne0, long ne1, long ne2, long nb1, long nb2, long offset)
-                => Op(GgmlGraphOp.View, stackalloc[] { x }, stackalloc long[] { 3, ne0, ne1, ne2, 1, nb1, nb2, 0, offset });
-
-            /// <summary>Rows [first, first + count) of a 2-D [cols, rows] node.</summary>
-            public int Rows2(int x, long cols, long first, long count)
             {
-                var (_, nb, _) = G.Shape(x);
-                return View2(x, cols, count, nb[1], first * nb[1]);
+                int node = Op(GgmlGraphOp.View, stackalloc[] { x }, stackalloc long[] { 3, ne0, ne1, ne2, 1, nb1, nb2, 0, offset });
+                if ((ne1 > 1 && nb1 != ne0 * 4) || (ne2 > 1 && nb2 != ne0 * ne1 * 4)) _strided.Add(node);
+                return node;
             }
 
-            /// <summary>Rows [first, first + count) (ne2) of a 3-D [a, b, rows] node.</summary>
-            public int Rows3(int x, long first, long count)
+            /// <summary>Permute axes (strided).</summary>
+            public int Permute(int x, long a0, long a1, long a2, long a3)
             {
-                var (ne, nb, _) = G.Shape(x);
-                return View3(x, ne[0], ne[1], count, nb[1], nb[2], first * nb[2]);
+                int node = Op(GgmlGraphOp.Permute, stackalloc[] { x }, stackalloc long[] { a0, a1, a2, a3 });
+                _strided.Add(node);
+                return node;
             }
+
+            public int Transpose(int x)
+            {
+                int node = Op(GgmlGraphOp.Transpose, x);
+                _strided.Add(node);
+                return node;
+            }
+
+            /// <summary>A contiguous copy of <paramref name="x"/>, or <paramref name="x"/> itself when it
+            /// already is contiguous (every op result is; views, permutes and transposes may not be).</summary>
+            public int Cont(int x) => _strided.Contains(x) ? Op(GgmlGraphOp.Cont, x) : x;
 
             public int Rope(int x, RotarySpec spec)
                 => Op(GgmlGraphOp.RopeExt, stackalloc[] { x, Positions },
@@ -544,14 +827,46 @@ namespace TensorSharp.Models
                 return new InvalidOperationException(why);
             }
 
-            internal bool Run() => G.Run(
-                System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_inputs),
-                System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_inputData),
-                System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_inputBytes));
+            // ---- native
+
+            /// <summary>Build the trace as a native graph (node handles equal trace indices).</summary>
+            internal CachedGraph Build(bool replayable, bool reorder)
+            {
+                if (!_record) throw new InvalidOperationException("a hash-only trace cannot be built");
+                var g = new GgmlGraph(Math.Max(1024, _nodes + 64), replayable, reorder);
+                float[] logits = null;
+                GCHandle pin = default;
+                try
+                {
+                    foreach (Rec r in _recs)
+                    {
+                        switch (r.Kind)
+                        {
+                            case Kind.Leaf: g.Leaf(r.Role, r.Type, r.Ne, r.Data, r.Bytes); break;
+                            case Kind.Op: g.Op((GgmlGraphOp)r.Op, r.Srcs, r.Ip, r.Fp); break;
+                            case Kind.Effect: g.Effect(r.Node); break;
+                            case Kind.Output:
+                                logits = new float[r.Bytes];
+                                pin = GCHandle.Alloc(logits, GCHandleType.Pinned);
+                                g.Output(r.Node, pin.AddrOfPinnedObject(), r.Bytes * sizeof(float));
+                                break;
+                        }
+                    }
+                    return new CachedGraph { Graph = g, Logits = logits, Pin = pin };
+                }
+                catch
+                {
+                    g.Dispose();
+                    if (pin.IsAllocated) pin.Free();
+                    throw;
+                }
+            }
+
+            internal bool Run(GgmlGraph graph) => graph.Run(
+                CollectionsMarshal.AsSpan(_inputs), CollectionsMarshal.AsSpan(_inputData), CollectionsMarshal.AsSpan(_inputBytes));
 
             public void Dispose()
             {
-                G.Dispose();
                 foreach (GCHandle pin in _pins) pin.Free();
                 _pins.Clear();
             }

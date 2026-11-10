@@ -13,9 +13,8 @@ namespace TensorSharp.Models
         /// <summary>NeoX rotary, then per-head Q/K RMSNorm (Hunyuan normalizes after rotating).</summary>
         protected override void EmitQueryKey(GraphStep step, int layer, ref int q, ref int k)
         {
-            string p = $"blk.{layer}.";
-            q = step.RmsNorm(step.Rope(q, _rotary), p + "attn_q_norm.weight");
-            k = step.RmsNorm(step.Rope(k, _rotary), p + "attn_k_norm.weight");
+            q = step.RmsNorm(step.Rope(q, _rotary), LayerName(layer, "attn_q_norm.weight"));
+            k = step.RmsNorm(step.Rope(k, _rotary), LayerName(layer, "attn_k_norm.weight"));
         }
     }
 }

@@ -77,12 +77,12 @@ public sealed class SharedRuntimeMoeConformanceTests : IDisposable
     private static List<float[]> Script(ModelBase model)
     {
         var rows = new List<float[]>();
-        rows.Add(model.ForwardRefill(Enumerable.Range(0, 15).Select(i => 40 + (i * 13) % 150).ToArray()));
+        rows.Add((float[])model.ForwardRefill(Enumerable.Range(0, 15).Select(i => 40 + (i * 13) % 150).ToArray()).Clone());
         foreach (int token in new[] { 70, 71, 72 })
-            rows.Add(model.Forward(new[] { token }));
+            rows.Add((float[])model.Forward(new[] { token }).Clone());
         Assert.True(model.TryTruncateKVCache(9));
-        rows.Add(model.ForwardRefill(new[] { 90, 91, 92, 93 }));
-        rows.Add(model.Forward(new[] { 94 }));
+        rows.Add((float[])model.ForwardRefill(new[] { 90, 91, 92, 93 }).Clone());
+        rows.Add((float[])model.Forward(new[] { 94 }).Clone());
         return rows;
     }
 

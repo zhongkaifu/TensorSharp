@@ -125,6 +125,7 @@ namespace
         int max_nodes = 0;
         bool built = false;
         bool replayable = false;   // owns its allocator (else it may run once)
+        bool reorder = false;      // let the backend reorder for concurrency (Metal), opted in per family
         int runs = 0;
         std::vector<ggml_tensor*> nodes;
         std::vector<Leaf> leaves;
@@ -290,6 +291,8 @@ namespace
         if (g->graph == nullptr) { set_last_error("graph builder: graph allocation failed."); return false; }
         for (ggml_tensor* e : g->effects) ggml_build_forward_expand(g->graph, e);
         for (const Output& o : g->outputs) ggml_build_forward_expand(g->graph, o.tensor);
+        // Before allocation: reordering after lifetime planning would invalidate the alias plan.
+        if (g->reorder) optimize_graph_for_metal(g->ctx, g->graph);
 
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         for (Leaf& leaf : g->leaves)
@@ -340,7 +343,7 @@ namespace
     }
 }
 
-TSG_EXPORT void* TSGgml_GraphCreate(int max_nodes, int replayable)
+TSG_EXPORT void* TSGgml_GraphCreate(int max_nodes, int replayable, int reorder)
 {
     try
     {
@@ -350,6 +353,7 @@ TSG_EXPORT void* TSGgml_GraphCreate(int max_nodes, int replayable)
         g->rank = g_active_rank;
         g->max_nodes = max_nodes;
         g->replayable = replayable != 0;
+        g->reorder = reorder != 0;
         ggml_init_params params{};
         params.mem_size = ggml_tensor_overhead() * static_cast<std::size_t>(max_nodes) * 2
                           + ggml_graph_overhead_custom(static_cast<std::size_t>(max_nodes), false);
@@ -502,6 +506,8 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
 
         // Device work queued by earlier calls may still read or write these host buffers.
         host_read_barrier();
+        // Leaves living in compute memory are uploaded every run, weights included: the allocator
+        // may reuse an input's memory after its last use within the graph.
         for (const Leaf& leaf : g->leaves)
             if (leaf.uploaded && leaf.data != nullptr)
                 ggml_backend_tensor_set(leaf.tensor, resolve_upload_source(leaf.data), 0, leaf.bytes);
@@ -513,18 +519,34 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
                 ggml_backend_tensor_set(t, input_data[i], 0, n);
         }
 
-        if (compute_graph(g_backend, g->graph) != GGML_STATUS_SUCCESS)
+        // Enqueue the graph and the downloads back to back, then synchronize once (as llama.cpp's
+        // scheduler does): a synchronous compute followed by a download is a second command-buffer
+        // round trip per step. The run is complete when this returns.
+        ggml_status status;
+        if (graph_node_profile_enabled())
         {
+            status = graph_compute_profiled(g_backend, g->graph, g->replayable ? "graph builder decode" : "graph builder prefill");
+        }
+        else
+        {
+            const std::uint64_t errors_before = g_ggml_error_count.load(std::memory_order_acquire);
+            status = ggml_backend_graph_compute_async(g_backend, g->graph);
+            if (g_ggml_error_count.load(std::memory_order_acquire) != errors_before)
+                g_backend_compute_failed.store(true, std::memory_order_release);
+        }
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            sync_backend(g_backend);
             set_last_error("graph builder: backend graph execution failed.");
             return 0;
         }
-        sync_backend(g_backend);
         for (const Output& o : g->outputs)
             if (o.data != nullptr)
-                ggml_backend_tensor_get(o.tensor, o.data, 0, o.bytes);
+                ggml_backend_tensor_get_async(g_backend, o.tensor, o.data, 0, o.bytes);
         for (const Leaf& leaf : g->leaves)
             if (leaf.role == LEAF_STATE && leaf.uploaded && leaf.data != nullptr)
-                ggml_backend_tensor_get(leaf.tensor, leaf.data, 0, leaf.bytes);
+                ggml_backend_tensor_get_async(g_backend, leaf.tensor, leaf.data, 0, leaf.bytes);
+        sync_backend(g_backend);
         clear_last_error();
         return 1;
     }

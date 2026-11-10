@@ -148,6 +148,7 @@ namespace TensorSharp.Models
                 Slot pooled = _slotPool[^1];
                 _slotPool.RemoveAt(_slotPool.Count - 1);
                 pooled.Length = 0;
+                ClearGraphCache();
                 ResetStates(pooled.Recurrent);
                 return pooled;
             }
@@ -183,6 +184,7 @@ namespace TensorSharp.Models
         private void DisposeSlot(Slot slot)
         {
             if (slot == null) return;
+            ClearGraphCache();
             foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
             slot.K = slot.V = null;
@@ -211,6 +213,7 @@ namespace TensorSharp.Models
             while (capacity < required)
                 capacity = Math.Min(_maxContextLength, capacity * 2);
             (Tensor[][] k, Tensor[][] v) = AllocateCaches(capacity);
+            ClearGraphCache();
             CopyRows(slot.K, k, slot.Length);
             CopyRows(slot.V, v, slot.Length);
             foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
@@ -357,6 +360,7 @@ namespace TensorSharp.Models
             if (_slotPool != null)
                 foreach (Slot slot in _slotPool) DisposeSlot(slot);
             _slots = _retainedSlots = null;
+            ClearGraphCache();
             _slotPool = null;
         }
 
@@ -457,6 +461,7 @@ namespace TensorSharp.Models
                 embedded?.Dispose();
             }
             foreach (Slot slot in slots) SyncToHost(slot);
+            ClearGraphCache();
 
             float[] all;
             // A step with a text-LoRA adapter selected must apply it to every planned weight.

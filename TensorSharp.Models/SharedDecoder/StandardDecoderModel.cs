@@ -117,7 +117,7 @@ namespace TensorSharp.Models
 
         /// <summary>The FFN pre-norm weight of <paramref name="layer"/>. Default
         /// <c>blk.N.ffn_norm.weight</c>; Qwen 3.5 calls it <c>post_attention_norm</c>.</summary>
-        protected virtual string FfnNormWeight(int layer) => $"blk.{layer}.ffn_norm.weight";
+        protected virtual string FfnNormWeight(int layer) => LayerName(layer, "ffn_norm.weight");
 
         /// <summary>
         /// Attention whose query projection also emits a per-head output gate, interleaved per
@@ -354,6 +354,7 @@ namespace TensorSharp.Models
             if (required > _maxContextLength)
                 throw new InvalidOperationException($"Requested sequence length {required} exceeds configured max context {_maxContextLength}.");
             SyncActiveToHost();
+            ClearGraphCache();
             int capacity = Math.Max(_cacheCapacity, 1);
             while (capacity < required)
                 capacity = Math.Min(_maxContextLength, capacity * 2);
@@ -409,11 +410,13 @@ namespace TensorSharp.Models
             ResetRecurrentPrimary();
             // Rows past the length are dead and the states were rewritten on the host.
             _cacheDeviceDirty = false;
+            ClearGraphCache();
         }
 
         protected override void TruncateKVCacheCore(int tokenCount)
         {
             SyncActiveToHost();
+            ClearGraphCache();
             if (_anyRecurrent && tokenCount != _cacheSeqLen)
             {
                 if (tokenCount != 0)
@@ -459,6 +462,7 @@ namespace TensorSharp.Models
             if (!SupportsKVStateSnapshot)
                 return false;
             SyncActiveToHost();
+            ClearGraphCache();
             EnsureCacheCapacity(destToken + tokenCount);
             if (!KvBlockTransfer.Inject(_allocator, FlatCaches(_cacheK), FlatCaches(_cacheV), _cacheSeqLen,
                     destToken, tokenCount, source))
@@ -522,6 +526,7 @@ namespace TensorSharp.Models
                     return graphLogits?[0];
                 }
                 SyncActiveToHost();
+                ClearGraphCache();
 
                 hidden = RunLayers(hidden, positions, batch: null);
                 float[] logits = null;
@@ -1097,6 +1102,7 @@ namespace TensorSharp.Models
             foreach (Tensor copy in _replicas.Values) copy.Dispose();
             _replicas.Clear();
             DisposeSlots();
+            ClearGraphCache();
             DisposeRecurrentStates();
             base.Dispose();
         }

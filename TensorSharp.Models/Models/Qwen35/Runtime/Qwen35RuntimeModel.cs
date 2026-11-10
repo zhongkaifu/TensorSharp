@@ -145,7 +145,7 @@ namespace TensorSharp.Models
 
         protected override bool GatedAttentionOutput => true;
 
-        protected override string FfnNormWeight(int layer) => $"blk.{layer}.post_attention_norm.weight";
+        protected override string FfnNormWeight(int layer) => LayerName(layer, "post_attention_norm.weight");
 
         protected override string FingerprintExtras => $"|qwen35|rope={_ropeDim}";
 

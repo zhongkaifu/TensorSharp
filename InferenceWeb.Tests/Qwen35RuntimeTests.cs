@@ -252,6 +252,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
         using var graph = Create(path, backend: TestGates.PinnedGgmlBackend);
         List<float[]> rows = Script(graph);
         Assert.True(graph.GraphRuns >= rows.Count, "every step must run as a whole-forward graph");
+        Assert.True(graph.GraphReplays > 0, "consecutive decode tokens must replay their graph");
         double tolerance = TestGates.PinnedGgmlBackend == BackendType.GgmlCpu ? 2.5e-2 : 5e-3;
         for (int i = 0; i < perOp.Count; i++)
         {

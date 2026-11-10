@@ -21,11 +21,13 @@ namespace TensorSharp.Models
 
         protected override bool RecurrentMixerLowers => DeviceRecurrence && ShardDegree == 1;
 
+        /// <summary>Qwen 3.5's fused decode measured +8% decode with ggml-metal's reordering (A3B).</summary>
+        protected override bool GraphReorderOnMetal => true;
+
         protected override void EmitQueryKey(GraphStep step, int layer, ref int q, ref int k)
         {
-            string p = $"blk.{layer}.";
-            q = step.Rope(step.RmsNorm(q, p + "attn_q_norm.weight"), _rotary);
-            k = step.Rope(step.RmsNorm(k, p + "attn_k_norm.weight"), _rotary);
+            q = step.Rope(step.RmsNorm(q, LayerName(layer, "attn_q_norm.weight")), _rotary);
+            k = step.Rope(step.RmsNorm(k, LayerName(layer, "attn_k_norm.weight")), _rotary);
         }
 
         protected override int EmitRecurrentMixer(GraphStep step, int layer, int normed)
@@ -37,7 +39,22 @@ namespace TensorSharp.Models
             int convRows = _convKernel - 1;
             float eps = Config.Eps;
 
-            int proj = step.MatMul(InProjName(layer), normed);                     // [packed, rows]
+            // Decode rows take the packed in-projection in one product; a prompt chunk takes its four
+            // row blocks as separate products, so each part is contiguous (no slice copies).
+            bool split = step.Rows > step.Sequences;
+            string inProj = InProjName(layer);
+            int proj = -1, qkvAll = -1, zAll = -1, betaAll = -1, alphaAll = -1;
+            if (split)
+            {
+                qkvAll = step.MatMulRows(inProj, 0, channels, normed);                       // [channels, rows]
+                zAll = step.MatMulRows(inProj, channels, v, normed);                         // [v, rows]
+                betaAll = step.MatMulRows(inProj, channels + v, vHeads, normed);             // [vHeads, rows]
+                alphaAll = step.MatMulRows(inProj, channels + v + vHeads, vHeads, normed);   // [vHeads, rows]
+            }
+            else
+            {
+                proj = step.MatMul(inProj, normed);                                          // [packed, rows]
+            }
             int dt = step.TensorWeight(_deviceDtBias[layer][0]);
             int a = step.TensorWeight(_deviceA[layer][0]);
             int convW = step.TensorWeight(_deviceConvW[layer][0], _convKernel, channels);
@@ -51,10 +68,22 @@ namespace TensorSharp.Models
                 long row0 = step.First[s] * nb1;
                 var state = (DeviceGdnState)step.SequenceState(s, layer);
 
-                int qkv = step.Op(GgmlGraphOp.Cont, step.View2(proj, channels, count, nb1, row0));
-                int z = step.Op(GgmlGraphOp.Cont, step.View2(proj, v, count, nb1, row0 + channels * f));
-                int betaRaw = step.Op(GgmlGraphOp.Cont, step.View2(proj, vHeads, count, nb1, row0 + (channels + v) * f));
-                int alphaRaw = step.Op(GgmlGraphOp.Cont, step.View2(proj, vHeads, count, nb1, row0 + (channels + v + vHeads) * f));
+                int qkv, z, betaRaw, alphaRaw;
+                if (split)
+                {
+                    long col = step.First[s];
+                    qkv = step.Sequences == 1 ? qkvAll : step.View2(qkvAll, channels, count, channels * f, col * channels * f);
+                    z = step.Sequences == 1 ? zAll : step.View2(zAll, v, count, v * f, col * v * f);
+                    betaRaw = step.Sequences == 1 ? betaAll : step.View2(betaAll, vHeads, count, vHeads * f, col * vHeads * f);
+                    alphaRaw = step.Sequences == 1 ? alphaAll : step.View2(alphaAll, vHeads, count, vHeads * f, col * vHeads * f);
+                }
+                else
+                {
+                    qkv = step.Cont(step.View2(proj, channels, count, nb1, row0));
+                    z = step.Cont(step.View2(proj, v, count, nb1, row0 + channels * f));
+                    betaRaw = step.Cont(step.View2(proj, vHeads, count, nb1, row0 + (channels + v) * f));
+                    alphaRaw = step.Cont(step.View2(proj, vHeads, count, nb1, row0 + (channels + v + vHeads) * f));
+                }
 
                 int beta = step.Reshape(step.Op(GgmlGraphOp.Sigmoid, betaRaw), 1, vHeads, count, 1);
                 int g = step.Op(GgmlGraphOp.Mul, step.Op(GgmlGraphOp.Softplus, step.Op(GgmlGraphOp.Add, alphaRaw, dt)), a);
@@ -62,33 +91,42 @@ namespace TensorSharp.Models
 
                 // The causal conv over [previous window | this chunk], and the new window.
                 int window = step.State(state.Conv, GgmlType.F32, convRows, channels);
-                int convIn = step.Op(GgmlGraphOp.Concat, stackalloc[] { window, step.Op(GgmlGraphOp.Transpose, qkv) }, stackalloc long[] { 0 });
+                // ggml_concat writes a contiguous result, so it reads the transposed view directly.
+                int convIn = step.Op(GgmlGraphOp.Concat, stackalloc[] { window, step.Transpose(qkv) }, stackalloc long[] { 0 });
                 int conv = step.Op(GgmlGraphOp.Silu, step.Op(GgmlGraphOp.SsmConv, convIn, convW));   // [channels, count]
-                var (_, convNb, _) = step.G.Shape(convIn);
-                step.G.Effect(step.Op(GgmlGraphOp.Cpy,
-                    step.View2(convIn, convRows, channels, convNb[1], count * convNb[0]), window));
+                // convIn is a fresh contiguous [convRows + count, channels].
+                step.Effect(step.Op(GgmlGraphOp.Cpy,
+                    step.View2(convIn, convRows, channels, (convRows + count) * f, count * f), window));
 
-                int qc = step.L2Norm(step.Op(GgmlGraphOp.Cont, step.View3(conv, dk, kHeads, count, dk * f, channels * f, 0)), dk, eps);
-                int kc = step.L2Norm(step.Op(GgmlGraphOp.Cont, step.View3(conv, dk, kHeads, count, dk * f, channels * f, qk * f)), dk, eps);
-                int vc = step.Op(GgmlGraphOp.Cont, step.View3(conv, dv, vHeads, count, dv * f, channels * f, 2 * qk * f));
+                // Q, K, V as [head, heads, tokens, 1] views of the conv output; where the backend reads
+                // strided rows they feed the norms and the recurrence directly, else contiguous copies.
+                long token = channels * f, all = channels * count * f;
+                int q4 = step.View4(conv, dk, kHeads, count, 1, dk * f, token, all, 0);
+                int k4 = step.View4(conv, dk, kHeads, count, 1, dk * f, token, all, qk * f);
+                int v4 = step.View4(conv, dv, vHeads, count, 1, dv * f, token, all, 2 * qk * f);
+                if (!step.StridedInputs)
+                {
+                    q4 = step.Cont(q4);
+                    k4 = step.Cont(k4);
+                    v4 = step.Cont(v4);
+                }
+                q4 = step.L2Norm(q4, dk, eps);
+                k4 = step.L2Norm(k4, dk, eps);
 
                 int ssm = step.State(state.Ssm, GgmlType.F32, dk, dv, vHeads);
                 int s4 = step.Reshape(ssm, dk, dv, vHeads, 1);
-                int gdn = step.Op(GgmlGraphOp.GatedDeltaNet,
-                    stackalloc[] { step.Reshape(qc, dk, kHeads, count, 1), step.Reshape(kc, dk, kHeads, count, 1),
-                                   step.Reshape(vc, dv, vHeads, count, 1), g, beta, s4 },
-                    stackalloc long[] { 1 });
+                int gdn = step.Op(GgmlGraphOp.GatedDeltaNet, stackalloc[] { q4, k4, v4, g, beta, s4 }, stackalloc long[] { 1 });
                 int scores = step.View2(gdn, v, count, v * f, 0);
                 int newState = step.Op(GgmlGraphOp.View, stackalloc[] { gdn },
                     stackalloc long[] { 4, dk, dv, vHeads, 1, dk * f, dk * dv * f, dk * dv * vHeads * f, v * count * f });
-                step.G.Effect(step.Op(GgmlGraphOp.Cpy, newState, s4));
+                step.Effect(step.Op(GgmlGraphOp.Cpy, newState, s4));
 
-                int normedOut = step.RmsNorm(step.Reshape(step.Op(GgmlGraphOp.Cont, scores), dv, vHeads, count), ssmNorm, eps);
+                int normedOut = step.RmsNorm(step.Reshape(step.Cont(scores), dv, vHeads, count), ssmNorm, eps);
                 int gated = step.Op(GgmlGraphOp.Mul, normedOut, step.Op(GgmlGraphOp.Silu, step.Reshape(z, dv, vHeads, count)));
                 int part = step.Reshape(gated, v, count);
                 output = output < 0 ? part : step.Op(GgmlGraphOp.Concat, stackalloc[] { output, part }, stackalloc long[] { 1 });
             }
-            return step.MatMul($"blk.{layer}.ssm_out.weight", output);
+            return step.MatMul(LayerName(layer, "ssm_out.weight"), output);
         }
     }
 }

@@ -544,9 +544,18 @@ their lowering lands. Measured on an M5 Pro, `ggml_metal`, 512 / 128 tokens, tok
 | Qwen3.5-0.8B Q8_0 | ~1,750 / 45.7 | 6,996 / 166.6 | 9,370 / 220 (`Qwen35Model` fused graphs) |
 
 Greedy text is byte-identical to the per-op path on all three; Qwen3.5-0.8B perplexity is
-50.1337 through the graph and through `Qwen35Model` alike. The remaining Qwen gap is the
-per-token graph rebuild, which the fused decode avoids by replaying a fixed-topology graph; the
-graph decode is next to do the same (KV writes by index, a padded attention window under a mask).
+50.1337 through the graph and through `Qwen35Model` alike.
+
+**Replay.** Emission is a trace with a 128-bit signature over everything that shapes the graph
+(ops, parameters, extents, bound host pointers); per-run inputs (activations, positions, masks,
+KV write indices) are outside it. A decode step writes K/V by index (`set_rows`) and attends to
+a window padded to 64 rows on Metal (256 elsewhere) under a mask, so every token of a bucket has
+the same signature: it traces in hash-only mode and replays the cached graph. Copies are emitted
+only for strided inputs, and where the backend reads row-contiguous strided views (Metal, CUDA,
+as the fused Qwen graphs already rely on) the Gated DeltaNet's Q/K/V feed the norms and the
+recurrence directly. Qwen3.5-0.8B, `ggml_metal`, after replay: 9,076 / 196.7 tok/s against
+`Qwen35Model`'s 9,450 / 220 (96% / 89%); Hy-MT2 4,755 / 168.1, Ministral 2,725 / 107.3.
+Perplexity stays 50.1337. Qwen keeps `Qwen35Model` on one device until decode reaches parity.
 
 ---
 
