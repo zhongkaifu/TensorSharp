@@ -291,6 +291,8 @@ namespace TensorSharp.Models
             // Under residency a decode step computes its missed experts with the host's expert kernel
             // (ggml's CPU dot products) while the GPU computes the rest; TS_Q4E_HOST_EXPERTS=0 stages them.
             m.HostExperts = TensorSharp.GGML.GgmlBasicOps.HostExpertRows;
+            // Whether the experts without a VRAM slot can be pinned copies, or must be read from the shards' mappings.
+            m.HostMemoryAvailable = MappedTableWarm.HostMemoryAvailable();
             return m;
         }
 

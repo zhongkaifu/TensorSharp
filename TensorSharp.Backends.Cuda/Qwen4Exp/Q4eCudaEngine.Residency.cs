@@ -23,6 +23,11 @@
 // captured graph (Strata runs a token the same way). The kernels' arithmetic does not depend on
 // where the bytes live, so the output is the all-resident engine's, bit for bit.
 //
+// A host without the memory to pin those copies (Flash Next GSQ-RCO Q2_0 beside a 16 GB laptop GPU and
+// 32 GB of RAM: 24 GiB of host experts) reads them from the model file's mapping instead (Mapped): no
+// copy, pages the OS can evict. The GPU cannot read pageable memory, so every step a graph can capture
+// leaves its misses to the CPU, and a prompt's staging plan is filled by host copies (MappedStageCopy).
+//
 // A model that fits keeps the old layout (no tables). A layer split keeps it too: residency is
 // planned for one device.
 using System;
@@ -42,10 +47,16 @@ namespace TensorSharp.Cuda
             public int SlotExperts, TotalExperts;
             public double CoveredRoutes = double.NaN;
             /// <summary>Pinned host copies of the experts without a slot [layer][gate, up, down], packed in
-            /// expert order (zero when a layer has none), freed with the engine.</summary>
+            /// expert order (zero when a layer has none), freed with the engine. When <see cref="Mapped"/>: each
+            /// stack's expert 0 in the model file's mapping (the whole stack, every expert at its own place).</summary>
             public IntPtr[][] Host;
-            /// <summary>Per layer: each expert's index in its packed host copy, or -1 when it has a slot.</summary>
+            /// <summary>Per layer: each expert's index in its packed host copy, or -1 when it has a slot. When
+            /// <see cref="Mapped"/> a host expert's index is its own number (its place in the file's stack).</summary>
             public int[][] HostIndex;
+            /// <summary>The host experts are read from the model file's mapping instead of pinned copies (the host has not
+            /// the memory to pin them): pageable, so the GPU never reads them; the CPU computes every step of up to
+            /// <see cref="HostExpertMaxRows"/> rows, and prompts stage their misses with host copies (MappedStageCopy).</summary>
+            public bool Mapped;
             /// <summary>Decode steps leave the missed experts to the host (see the file comment).</summary>
             public bool HostCompute;
             /// <summary>Adaptive residency (on unless TS_MOE_TIER_ADAPT=0, host compute only): host copies of each layer's tables,
@@ -273,12 +284,15 @@ namespace TensorSharp.Cuda
             stage.StageList = dev.Weights.Reserve((long)stage.Capacity * 4);
             stage.Staging = dev.Weights.Reserve(StagingBytes());
             _expertStage = stage;
+            if (_residency.Mapped)
+                CreateMappedStageCopy(stage);
             if (_residency.HostCompute)
             {
                 // The zero expert: all-zero blocks decode to zero weights, so a missed expert's GPU product is 0.
                 _zeroExpert = dev.Weights.Reserve(StagingStride());
                 CudaDriverApi.cuMemsetD8(_zeroExpert, 0, new UIntPtr((ulong)StagingStride())).ThrowOnError();
-                int g = Math.Min(_hybridMissesEnv, stage.Capacity / 2);
+                // The GPU's share is copied by a kernel reading the pinned host copies: none when they are mapped.
+                int g = _residency.Mapped ? 0 : Math.Min(_hybridMissesEnv, stage.Capacity / 2);
                 if (g > 0 && dev.DK.HasHybridMisses)
                 {
                     // The GPU's share of a decode step's misses: the staging's last slots. An overlapped adaptive round
@@ -315,15 +329,193 @@ namespace TensorSharp.Cuda
         /// <summary>The staging the GPU's share of the missed experts goes through, or null (see TS_Q4E_HYBRID_MISSES).</summary>
         private CudaExpertStage _hybridStage;
 
+        // Mapped host experts: two pinned bounce buffers a staging copy alternates between (parallel reads from the mapping
+        // fill one while the other crosses the bus), and per buffer the event of its last copy.
+        private readonly IntPtr[] _mapBounce = new IntPtr[2], _mapBounceDone = new IntPtr[2];
+        private int _mapBounceSlots;
+
+        /// <summary>Experts prompts have staged from the model file's mapping (a test proves the path engaged).</summary>
+        internal long MappedStagedExperts { get; private set; }
+
+        /// <summary>Whether the host experts are read from the model file's mapping (<see cref="ExpertResidency.Mapped"/>).</summary>
+        internal bool HostExpertsMapped => _residency?.Mapped == true;
+
+        /// <summary>The host copy mapped host experts stage through (<see cref="CudaExpertStage.HostCopy"/>).</summary>
+        private void CreateMappedStageCopy(CudaExpertStage stage)
+        {
+            _mapBounceSlots = (int)Math.Clamp((64L << 20) / Math.Max(1, stage.Stride), 1, stage.Capacity);
+            for (int h = 0; h < 2; h++)
+            {
+                CudaDriverApi.cuMemHostAlloc(out _mapBounce[h], new UIntPtr((ulong)(_mapBounceSlots * stage.Stride)), 0).ThrowOnError();
+                CudaDriverApi.cuEventCreate(out _mapBounceDone[h], 0x02 /*DISABLE_TIMING*/).ThrowOnError();
+            }
+            stage.HostCopy = MappedStageCopy;
+        }
+
         /// <summary>
-        /// Copies the experts without a slot into pinned host memory the GPU can address, packed per
-        /// stack in expert order, in parallel (the reads are the slow part on network storage). Runs
-        /// once, before the layers are uploaded.
+        /// Fills the staging slots the plan just queued on <paramref name="stream"/> gave (all of them, or with
+        /// <paramref name="newOnly"/> those since the stage's StageFrom mark) from the model file's mapping: waits for the
+        /// plan, reads which experts it placed where, and copies them through the pinned bounce buffers. The kernels that
+        /// follow on the stream read the same bytes the copy kernels would have staged.
+        /// </summary>
+        private void MappedStageCopy(CudaExpertStage stage, CudaExpertStageLayer layer, bool newOnly, IntPtr stream)
+        {
+            CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();
+            int count = 0, from = 0;
+            CudaDriverApi.cuMemcpyDtoH((IntPtr)(&count), stage.StageCount, new UIntPtr(4)).ThrowOnError();
+            if (newOnly)
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)(&from), stage.StageFrom, new UIntPtr(4)).ThrowOnError();
+            count = Math.Min(count, stage.Capacity);
+            from = Math.Clamp(from, 0, count);
+            int n = count - from;
+            if (n <= 0)
+                return;
+            var list = new int[n];
+            fixed (int* p = list)
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)p, stage.StageList + (nint)(from * 4L), new UIntPtr((ulong)n * 4)).ThrowOnError();
+            IntPtr[] src = { layer.HostGate, layer.HostUp, layer.HostDown };
+            long[] bytes = { layer.BytesGate, layer.BytesUp, layer.BytesDown };
+            long[] off = { 0, layer.OffUp, layer.OffDown };
+            int nExpert = _m.NExpert;
+            foreach (int e in list)
+                if ((uint)e >= (uint)nExpert)
+                    throw new InvalidOperationException($"[q4e-cuda] a staging plan names expert {e} of {nExpert}.");
+            if (src[0] == IntPtr.Zero || src[1] == IntPtr.Zero || src[2] == IntPtr.Zero)
+                throw new InvalidOperationException("[q4e-cuda] a staging plan names host experts of a layer without a mapping.");
+            long stride = stage.Stride;
+            var opts = new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(EnvInt("TS_Q4E_EXPERT_READERS", 16), 1, 64) };
+            for (int c0 = 0, h = 0; c0 < n; c0 += _mapBounceSlots, h ^= 1)
+            {
+                int cn = Math.Min(_mapBounceSlots, n - c0), first = c0;
+                // The buffer's previous copy has crossed the bus.
+                CudaDriverApi.cuEventSynchronize(_mapBounceDone[h]).ThrowOnError();
+                IntPtr bounce = _mapBounce[h];
+                Parallel.For(0, cn * 3, opts, j =>
+                {
+                    int i = j / 3, k = j % 3;
+                    long b = bytes[k];
+                    Buffer.MemoryCopy((void*)(src[k] + (nint)(list[first + i] * b)), (void*)(bounce + (nint)(i * stride + off[k])), b, b);
+                });
+                // The plan's slots from..count-1 hold list[0..n-1] in order: the chunk is one run of consecutive slots.
+                CudaDriverApi.cuMemcpyHtoDAsync(stage.Staging + (nint)((from + c0) * stride), bounce, new UIntPtr((ulong)(cn * stride)),
+                    stream).ThrowOnError();
+                CudaDriverApi.cuEventRecord(_mapBounceDone[h], stream).ThrowOnError();
+            }
+            MappedStagedExperts += n;
+        }
+
+        private void FreeMappedStageCopy()
+        {
+            for (int h = 0; h < 2; h++)
+            {
+                if (_mapBounceDone[h] != IntPtr.Zero)
+                {
+                    CudaDriverApi.cuEventSynchronize(_mapBounceDone[h]);
+                    CudaDriverApi.cuEventDestroy(_mapBounceDone[h]);
+                }
+                if (_mapBounce[h] != IntPtr.Zero)
+                    CudaDriverApi.cuMemFreeHost(_mapBounce[h]);
+                _mapBounceDone[h] = _mapBounce[h] = IntPtr.Zero;
+            }
+        }
+
+        /// <summary>Host memory left beside pinned host experts for the OS, the rest of the process and the page cache the
+        /// PLE table's rows and the model's other host reads go through.</summary>
+        private const long HostPinReserve = 4L << 30;
+
+        /// <summary>
+        /// The experts without a slot, in host memory, once, before the layers are uploaded: pinned copies the GPU can
+        /// address (<see cref="PinHostExperts"/>), or, when the host has not the memory to pin them, the model file's
+        /// mapping (<see cref="MapHostExperts"/>). TS_Q4E_HOST_EXPERTS_PIN=1 always pins, 0 always maps; unset pins when
+        /// the copies and the pinned KV fit the host's available memory with <see cref="HostPinReserve"/> to spare, and
+        /// maps when they do not or pinning runs out of memory.
         /// </summary>
         private void LoadHostExperts()
         {
             var m = _m;
             var r = _residency;
+            string pin = Environment.GetEnvironmentVariable("TS_Q4E_HOST_EXPERTS_PIN");
+            long need = HostPinnedNeed(), available = m.HostMemoryAvailable;
+            string Gib(long b) => (b / 1073741824.0).ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+            if (pin == "0" || (pin != "1" && available > 0 && need + HostPinReserve > available))
+            {
+                string why = pin == "0" ? "TS_Q4E_HOST_EXPERTS_PIN=0"
+                    : $"pinning them and the KV host copies takes {Gib(need)} GiB, the host has {Gib(available)} GiB available";
+                string cannot = HostExpertsUnmappable();
+                if (cannot == null)
+                {
+                    MapHostExperts(why);
+                    return;
+                }
+                if (pin == "0")
+                    throw new NotSupportedException($"[q4e-cuda] TS_Q4E_HOST_EXPERTS_PIN=0, but the host experts cannot be read from the model file: {cannot}.");
+                Console.Error.WriteLine($"[q4e-cuda] {why}, but the host experts cannot be read from the model file ({cannot}); pinning them anyway.");
+            }
+            try
+            {
+                PinHostExperts();
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 2 /* CUDA_ERROR_OUT_OF_MEMORY */)
+            {
+                FreeHostExperts();
+                string unmappable = pin == "1" ? null : HostExpertsUnmappable();
+                if (pin == "1" || unmappable != null)
+                    throw new InvalidOperationException(
+                        $"[q4e-cuda] the {Gib(r.HostBytes)} GiB of experts without a VRAM slot do not fit in pinned host memory"
+                        + (available > 0 ? $" ({Gib(available)} GiB available)" : "")
+                        + (unmappable != null ? $", and they cannot be read from the model file instead ({unmappable})" : " (TS_Q4E_HOST_EXPERTS_PIN=1)")
+                        + ". Free host memory, lower MAX_CONTEXT, or run with --backend ggml_cuda.", ex);
+                MapHostExperts($"pinning {Gib(need)} GiB ran out of host memory");
+            }
+        }
+
+        /// <summary>Pinned host memory expert residency takes: the host experts' copies and the sequences' KV host copies
+        /// (TS_Q4E_KV_RESIDENT).</summary>
+        private long HostPinnedNeed()
+        {
+            long kv = 0;
+            if (_kvWindow > 0)
+                for (int il = 0; il < _m.NLayer; il++)
+                    if (KvStreamed(il))
+                        kv += 2 * KvCacheBytes(_m.NCtx);
+            return _residency.HostBytes + kv * Math.Max(1, _lanes);
+        }
+
+        /// <summary>Why the host experts cannot be read from the model file's mapping, or null when they can: the CPU must
+        /// compute every step's missed experts (the GPU cannot read pageable memory) and each stack must map.</summary>
+        private string HostExpertsUnmappable()
+        {
+            var r = _residency;
+            if (!r.HostCompute)
+                return "the host does not compute missed experts (TS_Q4E_HOST_EXPERTS=0, the expert sizes, or the kernel module)";
+            for (int il = 0; il < _m.NLayer; il++)
+            {
+                if (Array.TrueForAll(r.Resident[il], x => x))
+                    continue;
+                var l = _m.Layers[il];
+                foreach (var w in new[] { l.GateExps, l.UpExps, l.DownExps })
+                    if (!TryMapStack(w, out _))
+                        return $"{w.Name ?? $"a layer {il} expert stack"} is not in a file the loader can map";
+            }
+            return null;
+        }
+
+        private static bool TryMapStack(in CudaWeightDesc w, out IntPtr mapped)
+        {
+            mapped = IntPtr.Zero;
+            return w.Source is ICudaMappedWeightSource ms && ms.TryMapRange(w.SourceOffset, w.TotalBytes, out mapped)
+                && mapped != IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Copies the experts without a slot into pinned host memory the GPU can address, packed per
+        /// stack in expert order, in parallel (the reads are the slow part on network storage).
+        /// </summary>
+        private void PinHostExperts()
+        {
+            var m = _m;
+            var r = _residency;
+            r.Mapped = false;
             r.Host = new IntPtr[m.NLayer][];
             r.HostIndex = new int[m.NLayer][];
             var jobs = new List<(IntPtr Dst, CudaWeightDesc Src, long Offset, long Bytes)>();
@@ -349,6 +541,48 @@ namespace TensorSharp.Cuda
                 }
             }
             RunReads(jobs);
+        }
+
+        /// <summary>
+        /// The experts without a slot read from the model file's mapping (<see cref="ExpertResidency.Mapped"/>): no copy,
+        /// and file-backed pages the OS can evict and read again, so experts that outweigh the host's memory run at storage
+        /// speed instead of failing to load. Every step of up to <see cref="HostExpertMaxRows"/> rows (all a captured step
+        /// can hold) leaves its missed experts to the CPU; prompts stage theirs with host copies (MappedStageCopy); the
+        /// GPU's share of a decode step's misses (TS_Q4E_HYBRID_MISSES) and the prompt prefetch, which read host experts
+        /// from the GPU, are off.
+        /// </summary>
+        private void MapHostExperts(string why)
+        {
+            var m = _m;
+            var r = _residency;
+            r.Mapped = true;
+            r.Host = new IntPtr[m.NLayer][];
+            r.HostIndex = new int[m.NLayer][];
+            for (int il = 0; il < m.NLayer; il++)
+            {
+                var l = m.Layers[il];
+                var index = r.HostIndex[il] = new int[m.NExpert];
+                int n = 0;
+                for (int e = 0; e < m.NExpert; e++)
+                {
+                    index[e] = r.Resident[il][e] ? -1 : e;
+                    if (index[e] >= 0)
+                        n++;
+                }
+                r.Host[il] = new IntPtr[3];
+                if (n == 0)
+                    continue;
+                var stacks = new[] { l.GateExps, l.UpExps, l.DownExps };
+                for (int k = 0; k < 3; k++)
+                    r.Host[il][k] = TryMapStack(stacks[k], out IntPtr mapped) ? mapped
+                        : throw new InvalidOperationException($"[q4e-cuda] layer {il}'s expert stack {stacks[k].Name} did not map.");
+            }
+            _hostExpertRows = HostExpertMaxRows;
+            Console.Error.WriteLine($"[q4e-cuda] host experts read from the model file's mapping, not pinned ({why}): "
+                + $"{r.HostBytes / 1073741824.0:F1} GiB of experts stay pageable, the CPU computes the missed experts of steps of up to "
+                + $"{_hostExpertRows} rows, and prompts copy theirs to the GPU from the host. Decode and prompts slow down to the "
+                + "speed the OS serves those pages at (the model's storage once they no longer fit the page cache). "
+                + "TS_Q4E_HOST_EXPERTS_PIN=1 pins them.");
         }
 
         /// <summary>One read per run of consecutive selected experts (at most 64 MiB), into consecutive destination bytes.</summary>
@@ -404,8 +638,9 @@ namespace TensorSharp.Cuda
             {
                 var w = stacks[k];
                 long expertBytes = w.TotalBytes / _m.NExpert;
+                // A pinned copy's device address (what the copy kernels stage from); a mapped stack has none.
                 IntPtr hostDev = IntPtr.Zero;
-                if (r.Host[il][k] != IntPtr.Zero)
+                if (!r.Mapped && r.Host[il][k] != IntPtr.Zero)
                     CudaDriverApi.cuMemHostGetDevicePointer(out hostDev, r.Host[il][k], 0).ThrowOnError();
 
                 // The resident experts' bytes: straight from the mapping, or read now (packed) for this stack.
@@ -433,7 +668,7 @@ namespace TensorSharp.Cuda
                         }
                         else
                         {
-                            hostTable[e] = (ulong)(hostDev + (nint)(index[e] * expertBytes));
+                            hostTable[e] = r.Mapped ? 0 : (ulong)(hostDev + (nint)(index[e] * expertBytes));
                             table[e] = hostCompute ? (ulong)_zeroExpert : hostTable[e];
                         }
                     }
@@ -502,6 +737,8 @@ namespace TensorSharp.Cuda
                 TabGate = placed[0].Table, TabUp = placed[1].Table, TabDown = placed[2].Table,
                 SrcTabGate = srcTabs[0], SrcTabUp = srcTabs[1], SrcTabDown = srcTabs[2],
                 RestTabGate = restTabs[0], RestTabUp = restTabs[1], RestTabDown = restTabs[2],
+                HostGate = r.Mapped ? r.Host[il][0] : IntPtr.Zero, HostUp = r.Mapped ? r.Host[il][1] : IntPtr.Zero,
+                HostDown = r.Mapped ? r.Host[il][2] : IntPtr.Zero,
                 Staged = stages,
                 BytesGate = bg, BytesUp = bu, BytesDown = bd,
                 OffUp = CudaWeightArena.Align(bg), OffDown = CudaWeightArena.Align(bg) + CudaWeightArena.Align(bu),
@@ -527,7 +764,8 @@ namespace TensorSharp.Cuda
                 {
                     Gate = r.Host[il][0], Up = r.Host[il][1], Down = r.Host[il][2],
                     GateType = l.GateExps.GgmlType, UpType = l.UpExps.GgmlType, DownType = l.DownExps.GgmlType,
-                    Packed = packed, HostIndex = r.HostIndex[il],
+                    // A mapped stack holds every expert at its own number, which is then its host index.
+                    Packed = r.Mapped ? m.NExpert : packed, HostIndex = r.HostIndex[il],
                 };
             }
             _devs[0].MakeCurrent();
@@ -816,7 +1054,8 @@ namespace TensorSharp.Cuda
             return (hot, cold);
         }
 
-        /// <summary>Host expert <paramref name="hot"/> takes VRAM expert <paramref name="cold"/>'s slots; cold takes hot's packed host place.</summary>
+        /// <summary>Host expert <paramref name="hot"/> takes VRAM expert <paramref name="cold"/>'s slots; cold takes hot's packed host
+        /// place (mapped host experts: cold's own place in the file, which already holds it).</summary>
         private void SwapExperts(int il, int hot, int cold)
         {
             var r = _residency;
@@ -829,14 +1068,15 @@ namespace TensorSharp.Cuda
                 IntPtr host = r.Host[il][k] + (nint)(i * eb);
                 IntPtr slot = (IntPtr)(long)r.Tab[il][k][cold];
                 Buffer.MemoryCopy((void*)host, (void*)_adaptTemp, eb, eb);
-                CudaDriverApi.cuMemcpyDtoH(host, slot, new UIntPtr((ulong)eb)).ThrowOnError();
+                if (!r.Mapped)
+                    CudaDriverApi.cuMemcpyDtoH(host, slot, new UIntPtr((ulong)eb)).ThrowOnError();
                 CudaDriverApi.cuMemcpyHtoD(slot, _adaptTemp, new UIntPtr((ulong)eb)).ThrowOnError();
                 r.Src[il][k][cold] = r.Src[il][k][hot];
                 r.Src[il][k][hot] = 0;
                 r.Tab[il][k][hot] = (ulong)(long)slot;
                 r.Tab[il][k][cold] = (ulong)(long)_zeroExpert;
             }
-            r.HostIndex[il][cold] = i;
+            r.HostIndex[il][cold] = r.Mapped ? cold : i;
             r.HostIndex[il][hot] = -1;
             r.IsHostFlags[il][hot] = 0;
             r.IsHostFlags[il][cold] = 1;
@@ -869,8 +1109,10 @@ namespace TensorSharp.Cuda
         /// <summary>Rows up to which a step leaves its missed experts to the CPU (TS_Q4E_HOST_EXPERT_ROWS, 1 to
         /// <see cref="HostExpertMaxRows"/>, default <see cref="HostExpertDefaultRows"/>); wider steps stage them over the bus.
         /// A verify window's rows miss more experts between them than one decode row does, and the GPU waits for the CPU at
-        /// every layer. A batched speculative verify of four sequences is 16 rows.</summary>
-        private readonly int _hostExpertRows = Math.Clamp(EnvInt("TS_Q4E_HOST_EXPERT_ROWS", HostExpertDefaultRows), 1, HostExpertMaxRows);
+        /// every layer. A batched speculative verify of four sequences is 16 rows. With host experts read from the model
+        /// file's mapping every step up to <see cref="HostExpertMaxRows"/> (all a captured step can hold): staging those
+        /// copies them on the host, which a captured step cannot.</summary>
+        private int _hostExpertRows = Math.Clamp(EnvInt("TS_Q4E_HOST_EXPERT_ROWS", HostExpertDefaultRows), 1, HostExpertMaxRows);
 
         /// <summary>A forward is about to run: keep the host experts' server spinning; and after it, report its failure.</summary>
         private void ArmHostExperts() => _hostServer?.Arm();
@@ -903,7 +1145,8 @@ namespace TensorSharp.Cuda
             string covered = double.IsNaN(r.CoveredRoutes) ? "no routing profile" : $"{r.CoveredRoutes * 100:F1}% of profiled routes";
             Console.Error.WriteLine(
                 $"[q4e-cuda] expert residency: {r.SlotExperts} of {r.TotalExperts} experts in VRAM " +
-                $"({r.SlotBytes / 1073741824.0:F1} GiB, {covered}); the other experts in pinned host memory " +
+                $"({r.SlotBytes / 1073741824.0:F1} GiB, {covered}); the other experts " +
+                (r.Mapped ? "read from the model file's mapping " : "in pinned host memory ") +
                 $"({r.HostBytes / 1073741824.0:F1} GiB), " +
                 (r.HostCompute ? $"computed by the CPU in decode steps of up to {_hostExpertRows} rows and staged over the bus in prompts."
                                : "staged over the bus when routed."));
@@ -921,13 +1164,16 @@ namespace TensorSharp.Cuda
 
         private void FreeHostExperts()
         {
+            FreeMappedStageCopy();
             if (_residency?.Host == null)
                 return;
-            foreach (var layer in _residency.Host)
-                if (layer != null)
-                    foreach (IntPtr p in layer)
-                        if (p != IntPtr.Zero)
-                            CudaDriverApi.cuMemFreeHost(p);
+            // Mapped stacks belong to the shards' mappings, which outlive the engine.
+            if (!_residency.Mapped)
+                foreach (var layer in _residency.Host)
+                    if (layer != null)
+                        foreach (IntPtr p in layer)
+                            if (p != IntPtr.Zero)
+                                CudaDriverApi.cuMemFreeHost(p);
             _residency.Host = null;
         }
     }

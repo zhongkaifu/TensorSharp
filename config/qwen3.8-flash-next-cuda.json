@@ -15,6 +15,10 @@
   // The experts do not fit a 32 GB card: the engine keeps the most-routed ones in VRAM (ranked by a routing profile
   // it records on the first load) and computes the rest on the host, so the host needs ~45 GB of RAM (the 28.8 GB
   // n-gram table, ~15 GB of pinned host experts, ~1.6 GB of pinned KV per sequence). Loading takes ~3 minutes.
+  // A host without the RAM to pin its share of the experts reads them from the model files' mapping instead (slower,
+  // at the speed the OS serves those pages; TS_Q4E_HOST_EXPERTS_PIN): a 16 GB RTX 3080 Laptop with 32 GB of RAM keeps
+  // 6.5 GiB of experts in VRAM, maps the other 25.1 GiB, loads in ~13 s and decoded at ~17 tok/s after a 3.5K-token
+  // prompt (TTFT 22 s from a cold page cache).
   // Apple Silicon: config/qwen3.8-flash-next.json.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",

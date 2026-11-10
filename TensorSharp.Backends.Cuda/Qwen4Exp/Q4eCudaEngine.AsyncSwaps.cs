@@ -181,7 +181,9 @@ namespace TensorSharp.Cuda
                 {
                     long eb = bytes[k], off = MatrixOffset(stage, k);
                     CudaDriverApi.cuMemcpyDtoDAsync((IntPtr)(long)s.Slot[k], s.HotCopy + (nint)off, new UIntPtr((ulong)eb), _swapStream).ThrowOnError();
-                    CudaDriverApi.cuMemcpyDtoHAsync(r.Host[s.Layer][k] + (nint)(s.Index * eb), s.ColdCopy + (nint)off, new UIntPtr((ulong)eb), _swapStream).ThrowOnError();
+                    // A mapped stack already holds the cold expert at its own place (and is read-only).
+                    if (!r.Mapped)
+                        CudaDriverApi.cuMemcpyDtoHAsync(r.Host[s.Layer][k] + (nint)(s.Index * eb), s.ColdCopy + (nint)off, new UIntPtr((ulong)eb), _swapStream).ThrowOnError();
                 }
             }
             CudaDriverApi.cuEventRecord(_swapEvent, _swapStream).ThrowOnError();
@@ -203,7 +205,7 @@ namespace TensorSharp.Cuda
                     r.Src[s.Layer][k][s.Hot] = 0;
                 }
                 r.IsHostFlags[s.Layer][s.Cold] = 1;
-                r.HostIndex[s.Layer][s.Cold] = s.Index;
+                r.HostIndex[s.Layer][s.Cold] = r.Mapped ? s.Cold : s.Index;
                 changed.Add(s.Layer);
                 _adaptSwaps++;
                 CudaMoeOffloadCounters.AddSwap();

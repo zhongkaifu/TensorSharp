@@ -136,6 +136,10 @@ namespace TensorSharp.Cuda
             /// <summary>The host's expert kernel; with it a decode step under residency computes its missed experts
             /// on the CPU (Residency.cs). Null keeps staging them.</summary>
             public CudaHostExpertRows HostExperts;
+            /// <summary>Host memory the process can still take, in bytes (MemAvailable capped by the memory cgroup, the
+            /// available physical memory on Windows), or 0 when unknown: whether residency's host experts can be pinned
+            /// copies or are read from the model file's mapping (Residency.cs).</summary>
+            public long HostMemoryAvailable;
             /// <summary>The MTP draft block, or null.</summary>
             public MtpDesc Mtp;
         }

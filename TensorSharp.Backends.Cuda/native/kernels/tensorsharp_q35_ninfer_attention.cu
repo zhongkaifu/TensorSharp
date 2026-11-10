@@ -21,9 +21,8 @@ __device__ __forceinline__ uint4 ts_ninfer_fp8x8_bf16(uint2 codes, float scale)
     for (int i = 0; i < 4; ++i)
     {
         const uint32_t pair = (w[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-        uint32_t h;
-        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"((unsigned short)pair));
-        const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+        // cuda_fp8.h: PTX cvt.rn.f16x2.e4m3x2 on sm_89+, exact integer widening below.
+        const float2 f = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)pair, __NV_E4M3)));
         const __nv_bfloat162 b = __floats2bfloat162_rn(f.x * scale, f.y * scale);
         out[i] = *reinterpret_cast<const uint32_t*>(&b);
     }

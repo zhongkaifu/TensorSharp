@@ -26,7 +26,14 @@ namespace TensorSharp.Cuda
         public IntPtr StageOf, StageList, StageCount, StageFrom, Staging;
         public long Stride;
         public int Capacity;
+        /// <summary>Fills the planned staging slots from the host instead of the copy kernels, or null: host experts the
+        /// GPU cannot address (read from the model file's mapping, not pinned). Called on the host after the plan was
+        /// queued on <c>stream</c>; <c>newOnly</c> copies only the experts planned since the stage's StageFrom mark.</summary>
+        public CudaExpertStageHostCopy HostCopy;
     }
+
+    /// <summary>See <see cref="CudaExpertStage.HostCopy"/>.</summary>
+    internal delegate void CudaExpertStageHostCopy(CudaExpertStage stage, CudaExpertStageLayer layer, bool newOnly, IntPtr stream);
 
     /// <summary>One layer's view for staging: its tables, which experts live in host memory, tables of each
     /// expert's device-mapped host copy (what staging copies from) and of the address each table entry
@@ -36,6 +43,9 @@ namespace TensorSharp.Cuda
     {
         public IntPtr IsHost, TabGate, TabUp, TabDown, SrcTabGate, SrcTabUp, SrcTabDown, RestTabGate, RestTabUp, RestTabDown;
         public long BytesGate, BytesUp, BytesDown, OffUp, OffDown;
+        /// <summary>Host addresses of expert 0 of each stack in the model file's mapping, for a stage's
+        /// <see cref="CudaExpertStage.HostCopy"/> (zero for pinned host copies, which the copy kernels read).</summary>
+        public IntPtr HostGate, HostUp, HostDown;
         /// <summary>Whether calls stage this layer's missed experts (expert sizes in whole 16-byte units).</summary>
         public bool Staged;
         public bool IsValid => IsHost != IntPtr.Zero;
@@ -309,12 +319,12 @@ namespace TensorSharp.Cuda
             {
                 dk.MoeStageMarkFrom(stage, stream);
                 dk.MoeStagePlan(s.Sel, slots, stageLayer, stage, stream);
-                dk.MoeStageCopyNew(stageLayer, stage, slots, stream);
+                CopyStaged(dk, stageLayer, stage, slots, newOnly: true, stream);
             }
             else if (staging)
             {
                 dk.MoeStagePlan(s.Sel, slots, stageLayer, stage, stream);
-                dk.MoeStageCopy(stageLayer, stage, slots, stream);
+                CopyStaged(dk, stageLayer, stage, slots, newOnly: false, stream);
             }
             RunExperts(dk, kernels, s, gate, up, down, cur, shDown, ffnOut, nt, nUsed, nExpert, e, ff, clamp,
                 perSlotMaxRows, stream, fused, shDownReady, curQ81, q2i8 ?? Q2_0ExpertsInt8, q80VecDecode);
@@ -346,7 +356,20 @@ namespace TensorSharp.Cuda
                 return;
             dk.MoeStageMarkFrom(stage, stream);
             dk.MoeStagePlan(sel, slots, stageLayer, stage, stream);
-            dk.MoeStageCopyNew(stageLayer, stage, slots, stream);
+            CopyStaged(dk, stageLayer, stage, slots, newOnly: true, stream);
+        }
+
+        /// <summary>The planned experts' bytes into staging: the copy kernels from the device-mapped host copies, or the
+        /// stage's <see cref="CudaExpertStage.HostCopy"/>.</summary>
+        private static void CopyStaged(Dsv4Kernels dk, in CudaExpertStageLayer stageLayer, CudaExpertStage stage, int slots,
+            bool newOnly, IntPtr stream)
+        {
+            if (stage.HostCopy != null)
+                stage.HostCopy(stage, stageLayer, newOnly, stream);
+            else if (newOnly)
+                dk.MoeStageCopyNew(stageLayer, stage, slots, stream);
+            else
+                dk.MoeStageCopy(stageLayer, stage, slots, stream);
         }
 
         /// <summary>The grouping plan of <paramref name="slots"/> selections, all on the device: per-expert counts, their
