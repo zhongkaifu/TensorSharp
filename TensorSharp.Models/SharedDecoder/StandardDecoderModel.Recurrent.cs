@@ -56,6 +56,10 @@ namespace TensorSharp.Models
         protected virtual Tensor RecurrentMixer(RankScope scope, Tensor normed, int layer, RecurrentState state)
             => throw new NotSupportedException($"{Config.Architecture} declares recurrent layers but no recurrent mixer.");
 
+        /// <summary>True when the recurrent mixer applies the layer's input norm itself (a fused
+        /// native block): it then receives the raw residual instead of the normalized input.</summary>
+        protected virtual bool RecurrentMixerTakesRawInput => false;
+
         /// <summary>Shard a recurrent layer's weights for the stage group bound by the runtime
         /// (ModelBase sharding helpers: ShardOutputRows, ShardInputColumnGroups, ...).</summary>
         protected virtual void ShardRecurrentLayer(int layer)

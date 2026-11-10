@@ -632,7 +632,9 @@ namespace TensorSharp.Models
             string p = $"blk.{layer}.";
             RankScope scope = Scope(_mesh.StageOf(layer), 0);
 
-            Tensor normed = RMSNormOp(hidden, p + "attn_norm.weight");
+            Tensor normed = _recurrentLayer[layer] && RecurrentMixerTakesRawInput
+                ? hidden.CopyRef()
+                : RMSNormOp(hidden, p + "attn_norm.weight");
             Tensor attn = Mixer(scope, normed, layer, positions, batch);
             normed.Dispose();
 
@@ -683,7 +685,9 @@ namespace TensorSharp.Models
             _mesh.RunPerRank(stage, r =>
             {
                 RankScope scope = Scope(stage, r);
-                using Tensor normed = Ops.RMSNorm(null, hidden[r], Replica(attnNorm, stage, r), null, Config.Eps);
+                using Tensor normed = _recurrentLayer[layer] && RecurrentMixerTakesRawInput
+                    ? hidden[r].CopyRef()
+                    : Ops.RMSNorm(null, hidden[r], Replica(attnNorm, stage, r), null, Config.Eps);
                 partial[r] = Mixer(scope, normed, layer, positions, batch);
             });
             _mesh.AllReduce(stage, partial);

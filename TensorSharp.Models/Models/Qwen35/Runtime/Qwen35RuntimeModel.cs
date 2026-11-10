@@ -30,7 +30,7 @@ namespace TensorSharp.Models
     /// that read them (block-cyclic), so its recurrence is self-contained and only
     /// <c>ssm_out</c>'s partial sum is reduced, like attention's output projection.
     /// </summary>
-    public sealed class Qwen35RuntimeModel : StandardDecoderModel
+    public sealed partial class Qwen35RuntimeModel : StandardDecoderModel
     {
         private readonly bool[] _isRecurrent;
         private readonly int _ropeDim;
@@ -106,6 +106,10 @@ namespace TensorSharp.Models
             InitializeDecoder(headDim, headDim, string.Create(CultureInfo.InvariantCulture,
                 $"qwen35|{Config.NumHeads}|{Config.NumKVHeads}|{headDim}|{Config.Eps:R}|{Config.RopeBase:R}|{Config.RopeScale:R}|{_ropeDim}|" +
                 $"{_numKHeads}|{_numVHeads}|{_headKDim}|{_convKernel}|{interval}"));
+            if (DeviceRecurrence && Mesh.TensorParallel == 1)
+                for (int l = 0; l < Config.NumLayers; l++)
+                    if (_isRecurrent[l] && OwnsLayer(l))
+                        PackInProjection(l, 1, 0, 1, _ => AllocatorForWeight($"blk.{l}.attn_qkv.weight"));
             if (HasSidecarWeightScales && HasRoutedExpertLayers)
             {
                 Dispose();
@@ -114,6 +118,8 @@ namespace TensorSharp.Models
                     "decoder runtime; this checkpoint cannot run with --layer-split or host experts on cuda/mlx.");
             }
             BuildRecurrentConstants();
+            if (DeviceRecurrence)
+                BuildDeviceConstants();
         }
 
         /// <summary>
@@ -127,6 +133,8 @@ namespace TensorSharp.Models
                || (MoeCpuOffloadConfig.IsEnabled && context.Backend is BackendType.Cuda or BackendType.Mlx);
 
         protected override bool IsRecurrentLayer(int layer) => _isRecurrent[layer];
+
+        private unsafe IntPtr HostPointer(Tensor tensor) => (IntPtr)GetFloatPtr(tensor);
 
         protected override bool GatedAttentionOutput => true;
 
@@ -228,6 +236,12 @@ namespace TensorSharp.Models
         {
             string p = $"blk.{layer}.";
             int degree = ShardDegree;
+            if (DeviceRecurrence)
+            {
+                PackInProjection(layer, TpDegree, TpRankOffset, degree, r => _tpGroup.GetAllocator(r));
+                ShardInputColumnGroups(p + "ssm_out.weight", r => ValueHeadsOf(r, degree), _headVDim);
+                return;
+            }
             ShardOutputRows(p + "attn_qkv.weight", r => QkvChannelsOf(r, degree));
             ShardOutputRows(p + "attn_gate.weight", r => ValueChannelsOf(r, degree));
             ShardOutputRows(p + "ssm_beta.weight", r => ValueHeadsOf(r, degree));
@@ -311,11 +325,15 @@ namespace TensorSharp.Models
             int vHeads = _numVHeads / ShardDegree;
             int kHeads = _numKHeads / ShardDegree;
             int channels = 2 * kHeads * _headKDim + vHeads * _headVDim;
-            return new GdnState(_convKernel - 1, channels, vHeads, _headVDim, _headKDim);
+            return DeviceRecurrence
+                ? new DeviceGdnState(scope.Allocator, HostPointer, _convKernel - 1, channels, vHeads, _headVDim, _headKDim)
+                : new GdnState(_convKernel - 1, channels, vHeads, _headVDim, _headKDim);
         }
 
         protected override Tensor RecurrentMixer(RankScope scope, Tensor normed, int layer, RecurrentState state)
         {
+            if (state is DeviceGdnState device)
+                return DeviceGatedDeltaNet(scope, normed, layer, device);
             string p = $"blk.{layer}.";
             var gdn = (GdnState)state;
             int tokens = (int)normed.Sizes[0];
