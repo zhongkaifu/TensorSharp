@@ -1,0 +1,6 @@
+{
+  "defaultProvider": "tensorsharp",
+  "defaultModel": "Qwen3.8-27B-UD-IQ3_XXS",
+  "defaultThinkingLevel": "medium",
+  "enableInstallTelemetry": false
+}

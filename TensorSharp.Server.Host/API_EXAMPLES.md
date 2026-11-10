@@ -937,6 +937,11 @@ of `contextWindow`, so with a 16K window lower it in pi's `settings.json`, for e
 window even after old turns are removed, the server answers HTTP 400 with
 `"code": "context_length_exceeded"`, which pi recognizes and handles by compacting.
 
+[`examples/pi-coding-agent/`](../examples/pi-coding-agent/README.md) is a complete setup: it covers
+Qwen3.8-27B with the DFlash2 drafter on Apple Silicon, start scripts, pi's `models.json` and
+`settings.json`, an SDK program, and an end-to-end check in which pi fixes a sample project's
+failing tests.
+
 To use a repository's `chat_template.jinja` instead of the one in the GGUF, start
 the server with `--chat-template-file chat_template.jinja`. Only the template text
 changes; the output parser, the tool-call format the server parses and the BOS
