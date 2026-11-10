@@ -174,8 +174,15 @@ prefill 分块。请求加入、退出、缓存增长及返回 solo 路径时，
 再由另一条路径读取其状态。图像请求完成媒体 prefill 后也能加入批量 decode；压缩后的
 旋转位置与 QSA 坐标历史随自己的 holder 保存。
 
-张量并行、按层切分、其他 KV dtype，以及 span / 后端几何不可用的配置，在支持时仍使用
-逐序列融合路径。GPU arena 要求上游 flash attention 支持对应的 head 几何；CPU 使用相应
+按层切分、其他 KV dtype，以及 span / 后端几何不可用的配置，在支持时仍使用
+逐序列融合路径。单节点 `--tp N` 下 arena 在每个 rank 上运行：每个 rank 用自己的 FFN 分片以及
+各请求 K/V、GDN、PLE、QSA 状态的本地副本构建同一张图，同一请求在每个 rank 上占用相同的 slot，
+各 rank 在每层的两次 gather 处汇合，与 solo 步骤的各 rank 相同。整个批次每步只做一组 gather，
+而轮询的 solo 步骤每个请求各做一组。token 行在主机上收集（与张量并行的 solo 步骤一致），输出头在
+rank 0 上运行。每个 rank 的显存按其权重规划，因此只有在 arena 的缓存之外仍留有通常的余量
+（max(1 GiB, 设备的 1/32)）时才在该 rank 上构建 arena，否则各请求逐个 decode。没有请求占用的
+几何会在计算新几何的大小之前退役；无法分配的 prompt span 会先收回 arena，再判定请求失败。
+跨节点的张量并行仍使用逐序列路径。GPU arena 要求上游 flash attention 支持对应的 head 几何；CPU 使用相应
 attention 回退。参与批量执行的每个 holder 必须已有初始化的权威状态、位置相符，并能容纳
 下一行缓存。需要增长的 holder 先走 solo 路径，再加入批量执行。
 只有一个就绪 decoder 时使用 solo 融合 decode。
@@ -1675,7 +1682,16 @@ down 按输出行切分，再汇集输出供 hyper-connection 写回。每个 ra
 down 点积保持原始完整宽度，避免求和顺序的微小差异被后续激活量化放大。
 注意力、GDN、QSA、PLE 使用复制的权重及各 rank 独立状态，
 输出头仅在 rank 0 执行。图像与工具调用沿用同一目标图；投机回滚会恢复每个 rank
-的 GDN/PLE 状态。TP 下仍不支持共享前缀检查点。`ggml_cuda` 下可使用
+的 GDN/PLE 状态。TP 下仍不支持共享前缀检查点。
+两个或更多就绪的 decoder 在每个 rank 上共用一个批量步骤（融合 arena，见“并发 decode 默认使用融合 arena”），
+各层的 gather 每步只做一次，而不是每个请求一次。两块 H100 NVL、Q8_0、`--tp 2`、
+`TS_KV_INITIAL_TOKENS=2048`、贪心、每个请求 384 token：1 / 2 / 4 / 8 / 16 路为 64 / 92 / 123 / 146 / 165 tok/s，
+逐个解码（`TS_Q4E_DISABLE_ARENA_DECODE=1`）为 64 / 62 / 32 / 28 / 31。与单设备相同，1 到 8 路时批量解码的文本与
+逐个解码相同；16 路时图的行数超过保留单 token 融合的 8 行，文本在接近并列处分开（`--tp 2` 下在 53 到 1382 个
+字符之后，单 GPU 上在 6 到 1349 个字符之后）。`--tp` 下每个请求的缓存按整个上下文窗口分配，除非设置了
+`TS_KV_INITIAL_TOKENS`：本模型在 `MAX_CONTEXT=65536` 时每个 rank 1.8 GB，这两块 GPU 因此可以批量解码 2 路和 4 路
+（83 和 88 tok/s，逐个解码为 60 和 52），8 路时 arena 因显存不足被拒绝。
+`ggml_cuda` 下可使用
 `--tp-node-id` 和 `--tp-peers` 扩展到多个节点，FFN 行切分依据全局 rank 数量。
 分布式按层切分则传递完整的 F32 超连接残差，GDN、卷积、PLE 与 QSA 状态留在所属层。
 分布式模式当前仅支持串行文本请求，不支持媒体、投机解码及保留序列快照。

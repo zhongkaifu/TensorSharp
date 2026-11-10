@@ -2344,6 +2344,20 @@ bool q4e_flash_attn_ok(int kv_type, int head_dim);
 // does the arena where verify runs batched (Metal by default; see
 // TS_Q4E_VERIFY_ROW_KERNELS).
 void q4e_independent_decode_rows(int rows);
+// While alive, q4e_nodes_ffn builds ONE RANK's tensor-sliced FFN - gate/up over the rank's channels, down over
+// its output rows - and appends each layer's two reduction partials to `partials` in graph order: the cut points
+// of that rank's TpRankPlan. The token span sets the same state up itself; this is for a builder outside it (the
+// arena's tensor-parallel batched step). A null `partials` leaves the builder as it is.
+struct Q4eTpFfnScope
+{
+    Q4eTpFfnScope(std::vector<ggml_tensor*>* partials, int degree, int rank);
+    ~Q4eTpFfnScope();
+    Q4eTpFfnScope(const Q4eTpFfnScope&) = delete;
+    Q4eTpFfnScope& operator=(const Q4eTpFfnScope&) = delete;
+
+private:
+    bool active_;
+};
 // Drop (graph only - state kept) every cached per-layer/span graph built from
 // the given holder descriptor arrays, on every device. The arena flush calls
 // this after invalidating a holder's resident KV copies: captured solo graphs

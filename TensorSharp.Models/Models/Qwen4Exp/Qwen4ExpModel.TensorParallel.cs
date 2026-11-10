@@ -17,6 +17,9 @@ namespace TensorSharp.Models
         private Qwen4ExpFfnArgs[][] _q4eTpFfnArgs;
         private IntPtr[] _q4eTpPlans;
         private long _q4eTpExpertBytes;
+        // ArenaBatchedDecodeSteps when the batched decode arena was last given back to a span (see ExecuteQwen4ExpSpan).
+        private long _arenaStepsAtReclaim;
+        private bool _arenaReclaimLogged;
 
         protected override bool ShouldPrefaultWeight(GgufTensorInfo info)
             => !string.Equals(info.Name, "per_layer_token_embd.weight", StringComparison.Ordinal);
@@ -260,30 +263,44 @@ namespace TensorSharp.Models
         {
             if (IsTensorParallel)
             {
-                if (_q4eTpFfnArgs == null)
+                EnsureTensorParallelFfnArgs();
+                _q4eTpPlans ??= new IntPtr[TpDegree];
+                for (bool reclaimed = false; ;)
                 {
-                    _q4eTpFfnArgs = new Qwen4ExpFfnArgs[TpDegree][];
-                    _q4eTpPlans = new IntPtr[TpDegree];
-                    for (int r = 0; r < TpDegree; ++r)
+                    try
                     {
-                        var args = GC.AllocateArray<Qwen4ExpFfnArgs>(Config.NumLayers, pinned: true);
-                        for (int l = 0; l < Config.NumLayers; ++l)
-                            if (!TryFillFfnArgs(l, ref args[l], r))
-                                throw new NotSupportedException("Qwen4Exp TP descriptors could not be resolved.");
-                        _q4eTpFfnArgs[r] = args;
+                        for (int r = 0; r < TpDegree; ++r)
+                            fixed (Qwen4ExpFfnArgs* rankFfn = _q4eTpFfnArgs[r])
+                                _q4eTpPlans[r] = GgmlBasicOps.Qwen4ExpTokenSpanTpGlobal((IntPtr)rankFfn, gdn, attn, kinds, layerBegin, layerEnd,
+                                    resData, maskData, nEmbd, hc, hcLowRank, nTokens,
+                                    headKDim, headVDim, nKHeads, nVHeads, dConv,
+                                    headDim, nHead, nHeadKv, kvCapacity, nKv, position,
+                                    nRot, ropeBase, ropeFreqScale, attnScale,
+                                    nExpert, nExpertUsed, nFf / GlobalTpDegree, nFfSh / GlobalTpDegree, eps, cacheSlot,
+                                    r == 0 ? head : IntPtr.Zero, r == 0 ? logitsOut : IntPtr.Zero,
+                                    ple, pleLayer, pleEmb, mropePos, mropeSections, ropePosition,
+                                    r, r == 0 ? hiddenOut : IntPtr.Zero, logitsRows, qsa, qsaPositions, qsaPositionCount, GlobalTpDegree, TpRankOffset);
+                        break;
+                    }
+                    catch (InvalidOperationException failure) when (!reclaimed
+                        && ArenaBatchedDecodeSteps > _arenaStepsAtReclaim && IsDeviceAllocationFailure(failure.Message))
+                    {
+                        // A rank's device is planned to its weights, tensor parallelism admits requests without
+                        // measuring what is left, and a span that cannot allocate fails its request. The batched decode
+                        // arena is the one allocation there that no request needs: its slots flush back to their
+                        // requests' own state. So before the request fails, the arena is given back and the span is
+                        // planned again. Nothing has run: every rank's graph is planned before any is launched.
+                        reclaimed = true;
+                        _arenaStepsAtReclaim = ArenaBatchedDecodeSteps;
+                        GgmlBasicOps.Qwen4ExpArenaResetBatchedDecodeCache();
+                        if (!_arenaReclaimLogged)
+                        {
+                            _arenaReclaimLogged = true;
+                            Console.Error.WriteLine("[qwen4exp] a span did not fit in a tensor-parallel rank's memory (" +
+                                failure.Message + "); the batched decode arena was released and the span planned again. Reported once.");
+                        }
                     }
                 }
-                for (int r = 0; r < TpDegree; ++r)
-                    fixed (Qwen4ExpFfnArgs* rankFfn = _q4eTpFfnArgs[r])
-                        _q4eTpPlans[r] = GgmlBasicOps.Qwen4ExpTokenSpanTpGlobal((IntPtr)rankFfn, gdn, attn, kinds, layerBegin, layerEnd,
-                            resData, maskData, nEmbd, hc, hcLowRank, nTokens,
-                            headKDim, headVDim, nKHeads, nVHeads, dConv,
-                            headDim, nHead, nHeadKv, kvCapacity, nKv, position,
-                            nRot, ropeBase, ropeFreqScale, attnScale,
-                            nExpert, nExpertUsed, nFf / GlobalTpDegree, nFfSh / GlobalTpDegree, eps, cacheSlot,
-                            r == 0 ? head : IntPtr.Zero, r == 0 ? logitsOut : IntPtr.Zero,
-                            ple, pleLayer, pleEmb, mropePos, mropeSections, ropePosition,
-                            r, r == 0 ? hiddenOut : IntPtr.Zero, logitsRows, qsa, qsaPositions, qsaPositionCount, GlobalTpDegree, TpRankOffset);
                 if (HasDistributedQwen)
                 {
                     try { GgmlBasicOps.TensorParallelExecutePlansDistributed(_q4eTpPlans, _q4eCrossNode); }
@@ -303,6 +320,27 @@ namespace TensorSharp.Models
                 nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot,
                 head, logitsOut, ple, pleLayer, pleEmb, mropePos, mropeSections, ropePosition,
                 device, hiddenOut, logitsRows, qsa, qsaPositions, qsaPositionCount);
+        }
+
+        private static bool IsDeviceAllocationFailure(string message)
+            => message != null && (message.Contains("alloc", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("out of memory", StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>Every rank's FFN descriptors (its expert and shared-expert shards), pinned: what a rank's
+        /// span graph and its batched decode graph bind.</summary>
+        private Qwen4ExpFfnArgs[][] EnsureTensorParallelFfnArgs()
+        {
+            if (_q4eTpFfnArgs != null) return _q4eTpFfnArgs;
+            var ranks = new Qwen4ExpFfnArgs[TpDegree][];
+            for (int r = 0; r < TpDegree; ++r)
+            {
+                var args = GC.AllocateArray<Qwen4ExpFfnArgs>(Config.NumLayers, pinned: true);
+                for (int l = 0; l < Config.NumLayers; ++l)
+                    if (!TryFillFfnArgs(l, ref args[l], r))
+                        throw new NotSupportedException("Qwen4Exp TP descriptors could not be resolved.");
+                ranks[r] = args;
+            }
+            return _q4eTpFfnArgs = ranks;
         }
 
         private void DisposeQwen4ExpTensorParallel()
