@@ -368,6 +368,67 @@ F16 accumulation (the first change alone gives 31.8 dB); successive changes agre
 each other at 38-39 dB. The MP4 writer now pipes raw RGB24 to ffmpeg instead of
 writing a PNG per frame through ImageMagick (identical pixels; ~33 s to ~1 s here).
 
+A second round trims what was left around the denoiser:
+
+- **The denoise loop's buffers go back after the last step.** On `ggml_cuda` the
+  pipeline now releases the reuse compute buffer the DiT graph grew and the CUDA
+  attention and projection scratch before the decode. Previously they stayed
+  allocated into the next request's 17 GB text encoder load. Where the driver backs
+  allocations past local memory with host RAM, they took the memory that encoder's
+  mapped file needs: a second request's text conditioning took 33 s instead of 50 s.
+- **fc2 reads fc1's output directly.** Its projection applies the SwiGLU to fc1's
+  `[gate | value]` rows as it narrows them to BF16, so the GLU node and its F32 result
+  leave the graph.
+- **The video VAE decoder is fused too.**
+  - Its projections run on cuBLAS F16, the same F16 input ggml-cuda's own cuBLAS path
+    converts activations to.
+  - The qkv bias joins the attention prep (the VAE interleaves q, k and v per head).
+  - w1's bias and the SwiGLU join w2's input narrowing.
+  - out's and w2's biases join the layer scales in one residual kernel.
+  - The tile loop's CPU passes (unpacking and blending) run in parallel.
+  - A second request's decode took 32.9 s instead of 44.4 s. The decoded RGB is
+    within 46-47 dB of the previous build, and the parallel tiling is bit-identical.
+
+Same clip, whole requests to one server, measured back to back:
+
+| Build | First request | Second request |
+|---|---:|---:|
+| After the changes above | 296.8 s | 283.8 s |
+| + the second round | 277.4 s | 251.6 s |
+
+A third round, measured later the same day on the same clip and server, leaves the
+default output byte-identical to the second round's:
+
+- **Weight uploads read the file instead of the mapping** (`ggml_ops_direct_read.cpp`).
+  Unbuffered, sector-aligned reads on 8 threads go into a small pool of page-locked
+  buffers, which are uploaded as they arrive. The page cache is bypassed, so the
+  denoiser's pages are not evicted, and the pipeline's read-ahead of the encoder and
+  denoiser files is skipped. The text encoder's upload went from 0.7 GB/s through the
+  mapping to 2.8 GB/s, and text conditioning from 28-33 s to 8-10 s. This is
+  implemented on Windows with `ggml_cuda`; elsewhere uploads are unchanged.
+- **Device memory is the adapter's own.** Under WDDM, `cudaMemGetInfo` can count the
+  shared system memory the driver may back allocations with. `TSGgml_DeviceMemoryInfo`
+  now reports the adapter's dedicated memory less what is in use, so a full device
+  stops showing room.
+- **The VAEs leave the device only when the encoder would not fit.** Before the text
+  encoder runs on `ggml_cuda`, the pipeline releases the video and audio VAEs only if
+  the spare memory is less than the encoder file. Otherwise they stay, which keeps the
+  second-round decode time.
+- **The gated residual runs one block per token.** It looks up the segment's gate row
+  once per block, and the segment lookup is unrolled. A denoising step went from
+  22.4 s to 20.8 s.
+- **Opt-in FP8 projections (`TS_H3_FP8_MATMUL`).** These run E4M3 operands through
+  cuBLASLt with one power-of-two scale per operand, falling back to BF16/F16 for any
+  shape without an FP8 kernel. They change the result, since E4M3 keeps 4 significant
+  bits: the DiT's projection products come out 27-37 dB (31 on average) above their
+  own rounding error. With `TS_H3_FP8_MATMUL=1` a step takes 16.4 s instead of 20.8 s.
+  `vae` and `all` (the video VAE's F16 projections) are not measured end to end.
+
+| Build | First request | Second request |
+|---|---:|---:|
+| + the third round | 223.4 s | 214.3 s |
+| + `TS_H3_FP8_MATMUL=1` | 188.8 s | 181.0 s |
+
 ### Long-sequence attention on Metal
 
 A 1280×768×107 first/last-frame clip on FL2VA is 34,991 packed tokens, and at that
@@ -918,6 +979,9 @@ but a track that is spectrally plausible and merely wrong.
 | `TS_H3_CUDNN_ATTENTION=0` | `ggml_cuda`: keeps every attention on ggml's flash-attention kernel instead of cuDNN's fused SDPA ([below](#long-clips-on-ggml_cuda)); `TS_H3_CUDNN_ATTENTION_VERBOSE=1` prints the cuDNN plans and declines |
 | `TS_H3_CUBLAS_MATMUL=0` | `ggml_cuda`: keeps the DiT's wide Q4_K projections on MMQ instead of cuBLAS BF16; `TS_H3_CUBLAS_MIN_ROWS` (default 1024) is the token threshold |
 | `TS_H3_FUSED=0` | `ggml_cuda`: builds the unfused DiT and VAE graphs (no fused attention prep, modulation, gated residual or merged LoRA) |
+| `TS_H3_DIRECT_READ=0` | `ggml_cuda` on Windows: uploads weights from the mapping instead of reading the file unbuffered; `TS_H3_DIRECT_READ_THREADS` (1–32, default 8) is the reader count |
+| `TS_H3_FP8_MATMUL` | `ggml_cuda`: opt-in FP8 (E4M3) projections through cuBLASLt; `1` for the DiT, `vae` for the video VAE, `all` for both. Changes the output |
+| `TS_H3_STAGE_PROFILE=1` | Synchronizing per-stage timings inside the fused CUDA attention and GEMM nodes, printed when the scratch is released; exclude from formal timings |
 
 ## Reproducing validation
 

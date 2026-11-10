@@ -35,17 +35,23 @@ namespace {
 
 constexpr int kMaxSegments = 8;
 
+// Unused slots are empty ranges, and `last` is the final segment's column.
 struct Segments
 {
-    int n;
     int start[kMaxSegments], end[kMaxSegments], col[kMaxSegments];
+    int last;
 };
 
+// Unrolled over every slot so each index is a constant: a kernel argument indexed
+// by a runtime value is copied to every thread's local memory first, which costs
+// more than the lookup. The segments are disjoint, so the order does not matter.
 __device__ __forceinline__ int segment_col(const Segments& s, long long t)
 {
-    for (int i = 0; i < s.n; i++)
-        if (t >= s.start[i] && t < s.end[i]) return s.col[i];
-    return s.col[s.n - 1];
+    int col = s.last;
+#pragma unroll
+    for (int i = kMaxSegments - 1; i >= 0; i--)
+        if (t >= s.start[i] && t < s.end[i]) col = s.col[i];
+    return col;
 }
 
 __device__ __forceinline__ float warp_sum(float v)
@@ -61,7 +67,7 @@ __global__ void attn_prep(const float* __restrict__ q, long long q_sh, long long
                           const float* __restrict__ k, long long k_sh, long long k_ss,
                           const float* __restrict__ v, long long v_sh, long long v_ss,
                           const float* __restrict__ qb, const float* __restrict__ kb, const float* __restrict__ vb,
-                          const float* __restrict__ qn, const float* __restrict__ kn,
+                          long long bias_hs, const float* __restrict__ qn, const float* __restrict__ kn,
                           const float* __restrict__ cosT, const float* __restrict__ ssinT, int rot,
                           float eps, float vInv, int H, int S,
                           __half* __restrict__ q16, __half* __restrict__ k16, __half* __restrict__ v16)
@@ -88,7 +94,7 @@ __global__ void attn_prep(const float* __restrict__ q, long long q_sh, long long
         for (int j = 0; j < J; j++)
         {
             x[j] = src[lane + 32 * j];
-            if (bias != nullptr) x[j] = __fadd_rn(x[j], bias[h * D + lane + 32 * j]);
+            if (bias != nullptr) x[j] = __fadd_rn(x[j], bias[h * bias_hs + lane + 32 * j]);
             ss += x[j] * x[j];
         }
         ss = warp_sum(ss);
@@ -121,7 +127,7 @@ __global__ void attn_prep(const float* __restrict__ q, long long q_sh, long long
     for (int j = 0; j < J; j++)
     {
         float y = vsrc[lane + 32 * j];
-        if (vb != nullptr) y = __fadd_rn(y, vb[h * D + lane + 32 * j]);
+        if (vb != nullptr) y = __fadd_rn(y, vb[h * bias_hs + lane + 32 * j]);
         v16[outBase + lane + 32 * j] = __float2half_rn(vInv == 1.0f ? y : __fmul_rn(y, vInv));
     }
 }
@@ -161,12 +167,34 @@ __global__ void modulate(const float* __restrict__ x, long long x_rs, const floa
     }
 }
 
+// One block per token, so the segment's gate row is looked up once per block.
 __global__ void gated_residual(const float* __restrict__ base, long long b_rs,
                                const float* __restrict__ mm, long long mm_rs,
                                const float* __restrict__ bias,
                                const float* __restrict__ delta, long long d_rs,
                                const float* __restrict__ mods, long long m_rs, int gateIdx,
-                               Segments segs, int hidden, long long rows, float* __restrict__ out)
+                               Segments segs, int hidden, float* __restrict__ out)
+{
+    const long long t = blockIdx.x;
+    const float* b = base + t * b_rs;
+    const float* m = mm + t * mm_rs;
+    const float* d = delta != nullptr ? delta + t * d_rs : nullptr;
+    const float* g = mods + (long long) (segment_col(segs, t) + gateIdx) * m_rs;
+    float* o = out + t * hidden;
+    for (int c = threadIdx.x; c < hidden; c += blockDim.x)
+    {
+        float u = m[c];
+        if (bias != nullptr) u = __fadd_rn(u, bias[c]);
+        if (d != nullptr) u = __fadd_rn(d[c], u);
+        o[c] = __fadd_rn(b[c], __fmul_rn(u, g[c]));
+    }
+}
+
+// The video VAE's residual: base + (mm + bias) * scale, bias and scale per channel
+// (each nullable), in the graph's order (add, mul, add).
+__global__ void scaled_residual(const float* __restrict__ base, long long b_rs, const float* __restrict__ mm,
+                                long long mm_rs, const float* __restrict__ bias, const float* __restrict__ scale,
+                                int hidden, long long rows, float* __restrict__ out)
 {
     const long long n = (long long) hidden * rows;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x)
@@ -175,9 +203,8 @@ __global__ void gated_residual(const float* __restrict__ base, long long b_rs,
         const int c = (int) (i - t * hidden);
         float u = mm[t * mm_rs + c];
         if (bias != nullptr) u = __fadd_rn(u, bias[c]);
-        if (delta != nullptr) u = __fadd_rn(delta[t * d_rs + c], u);
-        const float g = mods[(long long) (segment_col(segs, t) + gateIdx) * m_rs + c];
-        out[i] = __fadd_rn(base[t * b_rs + c], __fmul_rn(u, g));
+        if (scale != nullptr) u = __fmul_rn(u, scale[c]);
+        out[i] = __fadd_rn(base[t * b_rs + c], u);
     }
 }
 
@@ -199,13 +226,14 @@ int grid_for(long long n)
 Segments make_segments(const int32_t* segs, int nseg)
 {
     Segments s{};
-    s.n = nseg < kMaxSegments ? nseg : kMaxSegments;
-    for (int i = 0; i < s.n; i++)
+    const int n = nseg < kMaxSegments ? nseg : kMaxSegments;
+    for (int i = 0; i < n; i++)
     {
         s.start[i] = segs[4 * i + 0];
         s.end[i] = segs[4 * i + 1];
         s.col[i] = segs[4 * i + 2];
     }
+    s.last = n > 0 ? s.col[n - 1] : 0;
     return s;
 }
 
@@ -218,7 +246,7 @@ int tsg_h3_fused_max_segments(void) { return kMaxSegments; }
 // Strides are in floats: *_sh between heads, *_ss between tokens. qn/kn may be null.
 bool tsg_h3_attn_prep(const float* q, int64_t q_sh, int64_t q_ss, const float* k, int64_t k_sh, int64_t k_ss,
                       const float* v, int64_t v_sh, int64_t v_ss, const float* qb, const float* kb, const float* vb,
-                      const float* qn, const float* kn,
+                      int64_t bias_hs, const float* qn, const float* kn,
                       const float* cosT, const float* ssinT, int rot, float eps, float vInv,
                       int heads, int seq, int head_dim, void* q16, void* k16, void* v16)
 {
@@ -227,11 +255,13 @@ bool tsg_h3_attn_prep(const float* q, int64_t q_sh, int64_t q_ss, const float* k
     switch (head_dim)
     {
     case 64:
-        attn_prep<64><<<blocks, 128>>>(q, q_sh, q_ss, k, k_sh, k_ss, v, v_sh, v_ss, qb, kb, vb, qn, kn, cosT, ssinT, rot, eps, vInv,
+        attn_prep<64><<<blocks, 128>>>(q, q_sh, q_ss, k, k_sh, k_ss, v, v_sh, v_ss, qb, kb, vb, bias_hs > 0 ? bias_hs : 64,
+                                       qn, kn, cosT, ssinT, rot, eps, vInv,
                                        heads, seq, (__half*) q16, (__half*) k16, (__half*) v16);
         break;
     case 128:
-        attn_prep<128><<<blocks, 128>>>(q, q_sh, q_ss, k, k_sh, k_ss, v, v_sh, v_ss, qb, kb, vb, qn, kn, cosT, ssinT, rot, eps, vInv,
+        attn_prep<128><<<blocks, 128>>>(q, q_sh, q_ss, k, k_sh, k_ss, v, v_sh, v_ss, qb, kb, vb, bias_hs > 0 ? bias_hs : 128,
+                                        qn, kn, cosT, ssinT, rot, eps, vInv,
                                         heads, seq, (__half*) q16, (__half*) k16, (__half*) v16);
         break;
     default:
@@ -256,8 +286,15 @@ bool tsg_h3_gated_residual(const float* base, int64_t b_rs, const float* mm, int
                            const int32_t* segs, int nseg, int hidden, int64_t rows, float* out)
 {
     if (nseg <= 0 || nseg > kMaxSegments) return false;
-    gated_residual<<<grid_for((long long) hidden * rows), 256>>>(base, b_rs, mm, mm_rs, bias, delta, d_rs, mods, m_rs,
-                                                                gateIdx, make_segments(segs, nseg), hidden, rows, out);
+    gated_residual<<<(unsigned int) rows, 256>>>(base, b_rs, mm, mm_rs, bias, delta, d_rs, mods, m_rs, gateIdx,
+                                                 make_segments(segs, nseg), hidden, out);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool tsg_h3_scaled_residual(const float* base, int64_t b_rs, const float* mm, int64_t mm_rs, const float* bias,
+                            const float* scale, int hidden, int64_t rows, float* out)
+{
+    scaled_residual<<<grid_for((long long) hidden * rows), 256>>>(base, b_rs, mm, mm_rs, bias, scale, hidden, rows, out);
     return cudaGetLastError() == cudaSuccess;
 }
 

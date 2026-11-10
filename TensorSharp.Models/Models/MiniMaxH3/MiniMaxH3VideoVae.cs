@@ -331,9 +331,13 @@ namespace TensorSharp.Models.MiniMaxH3
             int frames = latentT * pt, height = latentH * ps, width = latentW * ps;
             var outp = new float[(long)oc * frames * height * width];
 
-            for (int t = 0; t < latentT; t++)
-                for (int h = 0; h < latentH; h++)
-                    for (int w = 0; w < latentW; w++)
+            // Each (t, h) token row fills its own pixel rows, so the rows run in parallel
+            // with exactly the serial loop's copies (a decode unpacks 135 tiles of 5.5M
+            // values each at 480x864 x 158 frames).
+            System.Threading.Tasks.Parallel.For(0, latentT * latentH, th =>
+            {
+                int t = th / latentH, h = th % latentH;
+                for (int w = 0; w < latentW; w++)
                     {
                         long token = ((long)t * latentH + h) * latentW + w;
                         long src = token * patchDim;
@@ -351,6 +355,7 @@ namespace TensorSharp.Models.MiniMaxH3
                                 }
                             }
                     }
+            });
             return outp;
         }
 
@@ -574,7 +579,9 @@ namespace TensorSharp.Models.MiniMaxH3
                                 Array.Copy(latent, src, tile, dst, LatentChannels);
                             }
 
+                    var nativeClock = System.Diagnostics.Stopwatch.StartNew();
                     float[] patches = DecodeTokens(tile, latentT, r.Length, c.Length);
+                    _decodeNativeSeconds += nativeClock.Elapsed.TotalSeconds;
                     float[] px = UnpackPatches(patches, latentT, r.Length, c.Length);
 
                     int th = r.Length * PatchSpatial, tw = c.Length * PatchSpatial;
@@ -588,7 +595,10 @@ namespace TensorSharp.Models.MiniMaxH3
                     var wy = Ramp(th, r.LeadOverlap * PatchSpatial, r.TrailOverlap * PatchSpatial);
                     var wx = Ramp(tw, c.LeadOverlap * PatchSpatial, c.TrailOverlap * PatchSpatial);
 
-                    for (int f = 0; f < frames; f++)
+                    // One frame per worker: a frame's rows belong to it alone, and the tiles
+                    // still accumulate one after another, so every sum is the serial one.
+                    System.Threading.Tasks.Parallel.For(0, frames, f =>
+                    {
                         for (int y = 0; y < th; y++)
                         {
                             long dstRow = ((long)f * height + (y0 + y)) * width + x0;
@@ -601,17 +611,32 @@ namespace TensorSharp.Models.MiniMaxH3
                                     acc[ch * plane + dstRow + x] += px[ch * tplane + srcRow + x] * w;
                             }
                         }
+                    });
                     onTile?.Invoke(++done, totalTiles);
                 }
 
-            for (long i = 0; i < plane; i++)
+            System.Threading.Tasks.Parallel.For(0, frames, f =>
             {
-                float w = weight[i];
-                if (w <= 0f) continue;
-                float inv = 1f / w;
-                for (int ch = 0; ch < 3; ch++) acc[ch * plane + i] *= inv;
-            }
+                for (long i = (long)f * hw, end = i + hw; i < end; i++)
+                {
+                    float w = weight[i];
+                    if (w <= 0f) continue;
+                    float inv = 1f / w;
+                    for (int ch = 0; ch < 3; ch++) acc[ch * plane + i] *= inv;
+                }
+            });
             return acc;
+        }
+
+        // Seconds this decoder spent inside the native per-tile decode, for TS_H3_PHASE's
+        // split of the VAE stage into GPU graphs and the managed tiling around them.
+        private double _decodeNativeSeconds;
+
+        internal double TakeDecodeNativeSeconds()
+        {
+            double s = _decodeNativeSeconds;
+            _decodeNativeSeconds = 0;
+            return s;
         }
 
         private static float[] Ramp(int length, int lead, int trail)

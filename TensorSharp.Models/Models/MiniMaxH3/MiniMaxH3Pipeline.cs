@@ -158,7 +158,11 @@ namespace TensorSharp.Models.MiniMaxH3
             // the first upload. Mode 1 does the same read serially after the encoder is
             // released, which is safer on a host whose page cache cannot hold both files.
             System.Threading.Tasks.Task<double> prefault = null;
-            if (PrefaultMode == 2)
+            // Where the uploads read the weight files themselves there is no page cache to
+            // warm for them: a read-ahead would read each file a second time and take the
+            // memory the other networks' pages are in.
+            bool directRead = MiniMaxH3DirectRead.Supported(_model.Backend);
+            if (PrefaultMode == 2 && !directRead)
             {
                 string ditPath = _model.DenoiserPathFor(partition);
                 long avail = AvailablePhysicalBytes();
@@ -181,7 +185,7 @@ namespace TensorSharp.Models.MiniMaxH3
             // 15.5 GB at ~1 GB/s: 16 s of an 18 s trunk. Concurrent 8 MiB reads reach
             // ~2.3 GiB/s there, and the touches then find the pages cached. Metal binds the
             // same mapped pages zero-copy and reads them from a local SSD, so it needs none.
-            using var teRead = _model.Backend == BackendType.GgmlCuda
+            using var teRead = _model.Backend == BackendType.GgmlCuda && !directRead
                 ? MappedFileReadAhead.TryStart(_model.TextEncoderPath, MappedFileReadAhead.WholeFile(_model.TextEncoderPath),
                     message => Console.WriteLine("  [h3] warning: text-encoder " + message), long.MaxValue)
                 : null;
@@ -236,7 +240,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 // whichever is shorter comes for free. The denoiser cannot upload until
                 // BOTH are done - it needs the VRAM the teardown returns and the pages the
                 // read places - which is exactly the join below.
-                if (PrefaultMode == 1 || PrefaultMode == 3)
+                if ((PrefaultMode == 1 || PrefaultMode == 3) && !directRead)
                 {
                     string ditPath = _model.DenoiserPathFor(partition);
                     long avail = AvailablePhysicalBytes();
@@ -561,7 +565,8 @@ namespace TensorSharp.Models.MiniMaxH3
             vaeRunClock.Stop();
             if (PhaseTiming)
                 Console.WriteLine($"  [h3] .. video VAE open {vaeOpenClock.Elapsed.TotalSeconds:F1}s, "
-                                  + $"decode {vaeRunClock.Elapsed.TotalSeconds:F1}s");
+                                  + $"decode {vaeRunClock.Elapsed.TotalSeconds:F1}s "
+                                  + $"(native tiles {_vae?.TakeDecodeNativeSeconds() ?? 0:F1}s)");
 
             // The decoder now hands back exactly the clip's frames, warm-up and
             // chunk overlaps already resolved.
@@ -604,6 +609,11 @@ namespace TensorSharp.Models.MiniMaxH3
                     }
                 }
             }
+
+            // The decoders' reuse gallocr and attention/projection scratch are of no use
+            // to the next request, which starts with the largest upload of all.
+            if (_model.Backend == BackendType.GgmlCuda)
+                GgmlBasicOps.ReleaseReuseComputeBuffers();
 
             total.Stop();
             Report(p, "done", steps, steps, total);
@@ -1494,6 +1504,14 @@ namespace TensorSharp.Models.MiniMaxH3
             }
             if (_dit == null || _model.Backend != BackendType.GgmlCuda)
                 return;
+            // The denoise loop's reuse gallocr (several GB at 20k tokens) and the CUDA
+            // attention/projection scratch are of no use to the decode or to the next
+            // request's 17 GB text encoder, and they otherwise stay allocated into both.
+            // Where the driver backs allocations past local memory with host RAM, that
+            // is the RAM the encoder's mapped file needs: a second clip's text
+            // conditioning took 50 s against 28 s for the first. The next denoise
+            // re-creates both on demand.
+            GgmlBasicOps.ReleaseReuseComputeBuffers();
             if (!GpuMemoryBudget.TryGetSpareBytes(_model.Backend, out long spare))
                 return;   // no reading of the device: leave today's behaviour alone
             long need = _model.VideoVaeResidentBytesEstimate();
@@ -1503,8 +1521,9 @@ namespace TensorSharp.Models.MiniMaxH3
             _dit.ReleaseDeviceResidency();
         }
 
-        /// <summary>On a unified-memory device, take the denoiser and the VAEs kept from the
-        /// previous request off the device before the text encoder runs.
+        /// <summary>Before the text encoder runs, take the networks kept from the previous
+        /// request off the device where they would crowd it: all three on Metal, the VAEs on
+        /// CUDA when the encoder would not fit beside them.
         ///
         /// <para>The pipeline keeps all three between requests, and on Metal every weight
         /// they bound is a buffer wrapped zero-copy over the mapped file and held resident,
@@ -1516,15 +1535,40 @@ namespace TensorSharp.Models.MiniMaxH3
         /// the next bind usually finds them there, and the native graphs are built per call,
         /// so nothing still points at the old wraps.</para>
         ///
-        /// <para>Discrete GPUs keep today's behaviour (see
-        /// <see cref="ReleaseDenoiserIfVaeWouldNotFit"/>), and TS_H3_KEEP_RESIDENT=1 keeps the
-        /// networks on a unified-memory host that has the memory for all of them.</para></summary>
+        /// <para>On CUDA the encoder is the largest upload of a request, and from the second
+        /// request on it lands on a device that still holds the denoiser and the video VAE.
+        /// When the three add up to more than the device has, a driver that backs the
+        /// overflow with host memory does not fail the request, it slows the encoder's
+        /// upload and its forward (measured: the upload at half its rate, and 11.8 s of text
+        /// conditioning against 7.2 s on an empty device). The VAEs are the cheaper pair to
+        /// bring back, a few seconds of upload at the decode against a denoiser twice their
+        /// size, so they are the ones released, and only when the encoder would not fit; a
+        /// device with room for all of it releases nothing. TS_H3_KEEP_RESIDENT=1 keeps
+        /// everything on either backend.</para></summary>
         private void ReleaseKeptNetworksForTheTextEncoder()
         {
-            if (_model.Backend != BackendType.GgmlMetal
-                || Environment.GetEnvironmentVariable("TS_H3_KEEP_RESIDENT") == "1")
+            if (Environment.GetEnvironmentVariable("TS_H3_KEEP_RESIDENT") == "1")
                 return;
-            _dit?.ReleaseDeviceResidency();
+            if (_model.Backend == BackendType.GgmlMetal)
+            {
+                _dit?.ReleaseDeviceResidency();
+                _vae?.ReleaseDeviceResidency();
+                _audioVae?.ReleaseDeviceResidency();
+                return;
+            }
+            if (_model.Backend != BackendType.GgmlCuda || (_vae == null && _audioVae == null))
+                return;
+            // A request that failed part-way never reached its own release of these.
+            GgmlBasicOps.ReleaseReuseComputeBuffers();
+            // No reading of the device leaves today's behaviour alone.
+            bool known = GpuMemoryBudget.TryGetSpareBytes(_model.Backend, out long spare);
+            long need = _model.TextEncoderResidentBytesEstimate();
+            bool release = known && need > 0 && spare < need;
+            if (PhaseTiming)
+                Console.WriteLine($"  [h3] .. before the encoder: spare {(known ? spare >> 20 : -1)} MiB, "
+                                  + $"encoder {need >> 20} MiB, VAEs {(release ? "released" : "kept")}");
+            if (!release)
+                return;
             _vae?.ReleaseDeviceResidency();
             _audioVae?.ReleaseDeviceResidency();
         }
