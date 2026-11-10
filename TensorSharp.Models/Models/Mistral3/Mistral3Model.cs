@@ -219,17 +219,21 @@ namespace TensorSharp.Models
 
         /// <summary>Position-dependent Q scaling for YaRN, one factor per token (it scales the
         /// whole row): q *= (1 + beta * log(1 + floor(pos / orig_ctx))).</summary>
+        /// <remarks>Below the original context every factor is 1, so the query is not touched at
+        /// all: reading it back would cost a device round trip per layer on GPU backends.</remarks>
         private unsafe void ApplyPositionScale(Tensor q, int rowWidth, TokenPositions positions)
         {
-            float* ptr = GetFloatPtr(q);
+            float* ptr = null;
             for (int t = 0; t < positions.Count; t++)
             {
                 float interval = MathF.Floor((float)positions[t] / _ropeOrigCtx);
                 float posScale = 1.0f + _ropeScalingBeta * MathF.Log(1.0f + interval);
                 if (MathF.Abs(posScale - 1.0f) < 1e-7f) continue;
+                if (ptr == null) ptr = GetFloatPtr(q);
                 VecScale(ptr + (long)t * rowWidth, posScale, rowWidth);
             }
-            HostWritten(q);
+            if (ptr != null)
+                HostWritten(q);
         }
 
         public override void Dispose()
