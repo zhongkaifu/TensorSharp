@@ -651,6 +651,44 @@ drafters are level: 4.33 against 4.48 tokens a step, 48.0 against 48.3 tok/s, wi
 the same pass rates. Greedy text was identical to DFlash2's on 40/40 requests at
 eight and sixteen rows. See [How many rows to verify](#how-many-rows-to-verify).
 
+**What to expect on NVIDIA.** RTX 5090, the same model, drafters and harness on
+`ggml_cuda`. Setup: `MAX_CONTEXT=32768`, two passes in opposite orders,
+2026-11-09, at `d4f33229`. Decode tok/s, pass 1 / pass 2; parallel_4 is the
+aggregate of four requests:
+
+| Arm | long_generation | long_prompt_4k | long_prompt_16k | quality_tasks | parallel_4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| plain | 88.8 / 96.0 | 89.5 / 90.4 | 83.5 / 88.6 | 89.6 / 94.5 | 188 / 200 |
+| DFlash2, 7 drafts | 178.1 / 176.3 | 251.0 / 140.3 | 188.7 / 183.5 | 211.3 / 220.4 | 192 / 180 |
+| DSpine, 7 drafts | 158.8 / 146.9 | 304.7 / 282.3 | 203.1 / 177.7 | 195.4 / 199.6 | 181 / 185 |
+| DSpine, 11 drafts | 149.8 / 143.1 | 297.6 / 330.8 | 229.0 / 201.8 | 221.9 / 220.7 | 183 / 174 |
+| DSpine, 15 drafts | 137.7 / 135.1 | 374.5 / 421.7 | 252.2 / 258.4 | 212.9 / 213.5 | 170 / 167 |
+| DSpine, 15 drafts, gate 0.35 | 146.1 / 160.3 | 430.5 / 416.3 | 252.4 / 233.3 | 212.3 / 207.9 | 180 / 178 |
+
+**Verify width.** Unlike on Metal, a CUDA verify wider than eight rows stays cheap:
+18.3 ms a window at 8 rows, 21.7 at 12, 23.3 at 16. So DSpine's wider block pays
+where drafts are accepted:
+- After a 4K-token prompt, 15 drafts with the 0.35 gate decode at 2.2x DFlash2
+  (85% of drafts accepted).
+- After 16K, they decode about 30% faster.
+- On free generation acceptance drops (23% for 15 drafts without the gate, 52%
+  with it), and DFlash2 stays ahead: 177 against 153 tok/s.
+- DFlash2's second 4K pass (140.3) was one 54-token answer; its per-window costs
+  were in line with pass 1.
+
+**Cost per window.** DFlash2 on long_generation: the draft takes 2.34 ms, the verify
+18.9 ms, and the rollback 0. The persisted verify commits the accepted prefix.
+
+**Greedy text.** Plain decoding is identical across passes, and every speculative arm
+matches it on long_prompt_4k, long_prompt_16k, short_chat and parallel_4.
+Elsewhere a near-tie can flip, because the multi-row verify is not row-invariant on
+`ggml_cuda`, and wider windows flip more often:
+- quality_tasks: 11-13 of 16 answers identical.
+- long_generation: identical in 3/3 runs at DSpine 7 drafts, 2/3 at DFlash2 and the
+  gated 15, 1/3 at 15, and 0/3 at 11.
+
+The pass/fail verdicts are the same in every arm.
+
 ## Rejection on a recurrent trunk
 
 Qwen 3.5/3.6/3.8 are hybrids: 48 of Qwen 3.8's 64 layers are GatedDeltaNet, and
