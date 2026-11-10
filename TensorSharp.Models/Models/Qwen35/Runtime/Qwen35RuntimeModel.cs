@@ -106,10 +106,6 @@ namespace TensorSharp.Models
             InitializeDecoder(headDim, headDim, string.Create(CultureInfo.InvariantCulture,
                 $"qwen35|{Config.NumHeads}|{Config.NumKVHeads}|{headDim}|{Config.Eps:R}|{Config.RopeBase:R}|{Config.RopeScale:R}|{_ropeDim}|" +
                 $"{_numKHeads}|{_numVHeads}|{_headKDim}|{_convKernel}|{interval}"));
-            if (DeviceRecurrence && Mesh.TensorParallel == 1)
-                for (int l = 0; l < Config.NumLayers; l++)
-                    if (_isRecurrent[l] && OwnsLayer(l))
-                        PackInProjection(l, 1, 0, 1, _ => AllocatorForWeight($"blk.{l}.attn_qkv.weight"));
             if (HasSidecarWeightScales && HasRoutedExpertLayers)
             {
                 Dispose();
@@ -133,6 +129,17 @@ namespace TensorSharp.Models
                || (MoeCpuOffloadConfig.IsEnabled && context.Backend is BackendType.Cuda or BackendType.Mlx);
 
         protected override bool IsRecurrentLayer(int layer) => _isRecurrent[layer];
+
+        /// <summary>One device or whole-layer stages: the device recurrence's packed
+        /// in-projection, built before residency releases the host copies (under tensor
+        /// parallelism ShardRecurrentLayer packs per rank instead).</summary>
+        protected override void PrepareLoadedWeights()
+        {
+            if (!DeviceRecurrence || Mesh.TensorParallel != 1) return;
+            for (int l = 0; l < Config.NumLayers; l++)
+                if (_isRecurrent[l] && OwnsLayer(l))
+                    PackInProjection(l, 1, 0, 1, _ => AllocatorForWeight($"blk.{l}.attn_qkv.weight"));
+        }
 
         private unsafe IntPtr HostPointer(Tensor tensor) => (IntPtr)GetFloatPtr(tensor);
 

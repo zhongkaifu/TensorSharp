@@ -126,6 +126,10 @@ namespace TensorSharp.Models
         /// </summary>
         protected virtual bool GatedAttentionOutput => false;
 
+        /// <summary>Called once after loading and fusing, before sharding and device residency:
+        /// the place to repack or derive weights from their host copies. Default: nothing.</summary>
+        protected virtual void PrepareLoadedWeights() { }
+
         /// <summary>Constraints beyond heads and FFN width that a tensor-parallel degree must meet
         /// (recurrent head counts, ...); each entry names what does not divide. Default: none.</summary>
         protected virtual System.Collections.Generic.IEnumerable<string> ShardingProblems(int degree)
@@ -264,6 +268,9 @@ namespace TensorSharp.Models
                 LoadWeights();
                 FuseProjections();
                 DetectMoeLayers();
+                // Families reshape loaded weights here, while every host copy still exists:
+                // residency below may release them (direct and GGML CUDA preloads).
+                PrepareLoadedWeights();
                 if (!multiDevice)
                     ApplyModelAlignedKvCacheDefault(_quantWeights);
                 if (_mesh.TensorParallel > 1)
