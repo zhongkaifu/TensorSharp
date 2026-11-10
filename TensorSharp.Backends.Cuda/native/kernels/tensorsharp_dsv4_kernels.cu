@@ -4613,6 +4613,124 @@ extern "C" __global__ void ts_dsv4_moe_down_decode_q80v_f32(
         downOut[(size_t)slot * E + rr] = dot;
 }
 
+// The Q8_0 decode experts above with eight lanes on a weight row and four rows a warp. A warp a row gives sixteen
+// decode rows' down projection 409,600 warps (160 slots x 2560 rows of 680 bytes), each lane with a 16-bit load or
+// two in flight: it read at ~1.6 TB/s where the card gives ~3.7. Here a lane takes whole blocks (those whose index
+// is its own modulo 8), a block's 32 weight bytes as five aligned 64-bit words shifted to the block's phase in them
+// (a 34-byte block starts on any even address; a word holding one of its bytes is in its page), and keeps the block's
+// four dp4a quarter sums apart. Lane j's quarter q is then what lane 4 * j + q of ts_dsv4_dot_q8_0_row_vec holds,
+// and ts_dsv4_lanes8_sum adds them in that warp sum's order: the same bits from either layout.
+// H100 NVL, us a layer at 2560 <-> 640 for 1 / 4 / 16 decode rows of ten experts: down 20.2 / 46.7 / 188.0 ->
+// 13.4 / 30.4 / 111.6; gate/up, a slot's two rows in the same lanes, 56.1 -> 52.0 at 4 rows and 232.7 -> 186.3 at
+// 16, and behind a warp a row at one row and at three (24.3 against 17.4, 46.5 against 43.3), where Dsv4Kernels
+// keeps that.
+__device__ __forceinline__ void ts_dsv4_q8_0_block_quarters(float (&a)[4], const uint8_t* wb, const ts_dsv4_block_q8_1& ab)
+{
+    const float t = __half2float(*reinterpret_cast<const half*>(wb)) * __half2float(ab.d);
+    const size_t p = (size_t)(wb + 2);
+    const unsigned r = (unsigned)(p & 7) * 8;
+    const unsigned long long* w = reinterpret_cast<const unsigned long long*>(p & ~(size_t)7);
+    // The fifth word holds bytes of the block only when the block is off the word's boundary.
+    const unsigned long long w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3], w4 = w[r ? 4 : 3];
+    const unsigned long long x0 = r ? (w0 >> r) | (w1 << (64 - r)) : w0;
+    const unsigned long long x1 = r ? (w1 >> r) | (w2 << (64 - r)) : w1;
+    const unsigned long long x2 = r ? (w2 >> r) | (w3 << (64 - r)) : w2;
+    const unsigned long long x3 = r ? (w3 >> r) | (w4 << (64 - r)) : w3;
+    const int* aq = reinterpret_cast<const int*>(ab.qs);
+    a[0] += t * (float)__dp4a((int)(x0 >> 32), aq[1], __dp4a((int)x0, aq[0], 0));
+    a[1] += t * (float)__dp4a((int)(x1 >> 32), aq[3], __dp4a((int)x1, aq[2], 0));
+    a[2] += t * (float)__dp4a((int)(x2 >> 32), aq[5], __dp4a((int)x2, aq[4], 0));
+    a[3] += t * (float)__dp4a((int)(x3 >> 32), aq[7], __dp4a((int)x3, aq[6], 0));
+}
+
+// A row's sum from its eight lanes' quarter sums, in ts_dsv4_warp_sum's order over ts_dsv4_dot_q8_0_row_vec's lanes:
+// the block index's low three bits from the highest down, then the quarters. Every lane of the eight returns it.
+__device__ __forceinline__ float ts_dsv4_lanes8_sum(float (&a)[4])
+{
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+    {
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1)
+            a[i] += __shfl_xor_sync(0xffffffffu, a[i], o);
+    }
+    return (a[0] + a[2]) + (a[1] + a[3]);
+}
+
+// ts_dsv4_moe_gateup_decode_q80v_pair_f32, eight lanes a row: a slot's gate row and its up row in the same lanes
+// (the activation blocks loaded once for both), each row's sum as ts_dsv4_moe_gateup_decode_q80v_f32 gives it.
+// grid (slots, ceil(ff / (blockDim.x / 8))): four rows a warp. A warp's rows past the last read the last row (its
+// lanes shuffle together) and write nothing. Gate and up rows in lanes of their own were no faster at any row count
+// (52.5 against 52.0 us a layer at four rows, 217 against 186 at sixteen), so there is no such kernel.
+extern "C" __global__ void ts_dsv4_moe_gateup_decode_q80v8_pair_f32(
+    const uint8_t* __restrict__ gateW,
+    const uint8_t* __restrict__ upW,
+    const ts_dsv4_block_q8_1* __restrict__ act, // [nt] rows
+    const int32_t* __restrict__ sel,     // [nt * nUsed]
+    float* __restrict__ gateOut,         // [nt * nUsed, ff]
+    float* __restrict__ upOut,           // [nt * nUsed, ff]
+    const int ff,
+    const int inDim,
+    const long long rowBytes,
+    const int nUsed,
+    const unsigned long long* __restrict__ gateTab,
+    const unsigned long long* __restrict__ upTab)
+{
+    const int slot = blockIdx.x;
+    const int e = sel[slot];
+    act += (size_t)(slot / nUsed) * (inDim / TS_DSV4_QK8_1);
+    const int lane = threadIdx.x % 32;
+    const int row0 = (blockIdx.y * (blockDim.x / 32) + threadIdx.x / 32) * 4;
+    if (row0 >= ff)
+        return;
+    const int rr = row0 + lane / 8, j = lane % 8;
+    const size_t rowOff = (size_t)(rr < ff ? rr : ff - 1) * rowBytes;
+    const uint8_t* gRow = ts_dsv4_expert_rows(gateW, gateTab, e, (size_t)ff * rowBytes) + rowOff;
+    const uint8_t* uRow = ts_dsv4_expert_rows(upW, upTab, e, (size_t)ff * rowBytes) + rowOff;
+    const int nBlk = inDim / TS_DSV4_QK8_1;
+    float ag[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, au[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (int b = j; b < nBlk; b += 8)
+    {
+        ts_dsv4_q8_0_block_quarters(ag, gRow + (size_t)b * TS_DSV4_Q8_0_BLOCK_BYTES, act[b]);
+        ts_dsv4_q8_0_block_quarters(au, uRow + (size_t)b * TS_DSV4_Q8_0_BLOCK_BYTES, act[b]);
+    }
+    const float g = ts_dsv4_lanes8_sum(ag), u = ts_dsv4_lanes8_sum(au);
+    if (j == 0 && rr < ff)
+    {
+        gateOut[(size_t)slot * ff + rr] = g;
+        upOut[(size_t)slot * ff + rr] = u;
+    }
+}
+
+// ts_dsv4_moe_down_decode_q80v_f32, eight lanes a row. grid (slots, ceil(E / (blockDim.x / 8))).
+extern "C" __global__ void ts_dsv4_moe_down_decode_q80v8_f32(
+    const uint8_t* __restrict__ downW,
+    const ts_dsv4_block_q8_1* __restrict__ act, // [nt * nUsed] rows
+    const int32_t* __restrict__ sel,
+    float* __restrict__ downOut,         // [nt * nUsed, E]
+    const int E,
+    const int ff,
+    const long long rowBytes,
+    const unsigned long long* __restrict__ downTab)
+{
+    const int slot = blockIdx.x;
+    const int e = sel[slot];
+    const int lane = threadIdx.x % 32;
+    const int row0 = (blockIdx.y * (blockDim.x / 32) + threadIdx.x / 32) * 4;
+    if (row0 >= E)
+        return;
+    const int rr = row0 + lane / 8, j = lane % 8;
+    const uint8_t* wRow = ts_dsv4_expert_rows(downW, downTab, e, (size_t)E * rowBytes) + (size_t)(rr < E ? rr : E - 1) * rowBytes;
+    act += (size_t)slot * (ff / TS_DSV4_QK8_1);
+    const int nBlk = ff / TS_DSV4_QK8_1;
+    float a[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (int b = j; b < nBlk; b += 8)
+        ts_dsv4_q8_0_block_quarters(a, wRow + (size_t)b * TS_DSV4_Q8_0_BLOCK_BYTES, act[b]);
+    const float dot = ts_dsv4_lanes8_sum(a);
+    if (j == 0 && rr < E)
+        downOut[(size_t)slot * E + rr] = dot;
+}
+
 extern "C" __global__ void ts_dsv4_moe_down_decode_f32(
     const uint8_t* __restrict__ downW,
     const ts_dsv4_block_q8_1* __restrict__ act, // [nt * nUsed] rows
