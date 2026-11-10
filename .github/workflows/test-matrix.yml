@@ -17,18 +17,15 @@ name: Engine Comparison (TensorSharp vs llama.cpp)
 #   4. Generates a single markdown report covering both performance and
 #      quality (uploaded as an artifact + rendered into the job summary).
 #
-# Two profiles:
-#   - smoke (pull_request): one small model (gemma4-12b), four cheap scenarios
-#     (text_short, function_call, json_mode, prefill_4k). The report is posted
-#     as a PR comment. Superseded runs on the same PR are cancelled.
-#   - full  (workflow_dispatch / weekly schedule): the whole CI model +
-#     scenario set; dispatch inputs can select a custom subset.
+# It runs on workflow_dispatch and on a weekly schedule, over the whole CI
+# model + scenario set; dispatch inputs can select a custom subset. (The
+# pull-request smoke profile and its PR comment were removed on 2026-11-10.)
 #
 # llama.cpp sources/build and the model files live in a persistent directory
 # on the runner ($HOME/tensorsharp-bench by default, overridable with the
 # BENCH_HOME repository variable), so only the first run on a fresh runner
-# pays the llama.cpp build + ~20 GB model download; repeat runs (including PR
-# smoke runs) only pay incremental costs.
+# pays the llama.cpp build + ~20 GB model download; repeat runs only pay
+# incremental costs.
 #
 # Self-hosted runner required: [self-hosted, tensorsharp-cuda]
 #   - Linux + NVIDIA GPU with a CUDA 13 toolkit (nvcc) on PATH and an R580+
@@ -37,8 +34,6 @@ name: Engine Comparison (TensorSharp vs llama.cpp)
 #   - ~40 GB free disk for llama.cpp builds + model files
 
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       models:
@@ -58,11 +53,10 @@ on:
     - cron: "0 3 * * 1"
 
 concurrency:
-  # One benchmark per ref. PR smoke runs are cancelled when new commits land;
-  # full runs (dispatch / schedule) are long and expensive, so later triggers
+  # One benchmark per ref. Runs are long and expensive, so later triggers
   # queue behind them instead of cancelling.
   group: engine-comparison-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 defaults:
   run:
@@ -72,14 +66,12 @@ jobs:
   benchmark:
     name: Benchmark (tensorsharp-cuda)
     runs-on: [self-hosted, tensorsharp-cuda]
-    # PR smoke runs are small; only full runs need the long ceiling.
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 120 || 300 }}
+    timeout-minutes: 300
     env:
-      # pull_request -> trimmed smoke profile; dispatch/schedule -> inputs or
-      # the full CI default set.
-      BENCH_PROFILE: ${{ github.event_name == 'pull_request' && 'smoke (pull request)' || github.event_name == 'schedule' && 'full (weekly schedule)' || 'full / custom (manual dispatch)' }}
-      BENCH_MODELS: ${{ github.event_name == 'pull_request' && 'gemma4-12b' || github.event.inputs.models || 'gemma4-12b,qwen36-35b-a3b' }}
-      BENCH_SCENARIOS: ${{ github.event_name == 'pull_request' && 'text_short,function_call,json_mode,prefill_4k' || github.event.inputs.scenarios || 'text_short,text_long,multi_turn,function_call,json_mode,prefill_2k,prefill_4k,prefill_8k' }}
+      # dispatch -> its inputs, else the full CI default set.
+      BENCH_PROFILE: ${{ github.event_name == 'schedule' && 'full (weekly schedule)' || 'full / custom (manual dispatch)' }}
+      BENCH_MODELS: ${{ github.event.inputs.models || 'gemma4-12b,qwen36-35b-a3b' }}
+      BENCH_SCENARIOS: ${{ github.event.inputs.scenarios || 'text_short,text_long,multi_turn,function_call,json_mode,prefill_2k,prefill_4k,prefill_8k' }}
       LLAMA_REF: ${{ github.event.inputs.llama_ref || 'master' }}
     steps:
       # clean: false keeps the untracked incremental state that makes repeat
@@ -241,43 +233,3 @@ jobs:
               sys.exit("no benchmark cell ran successfully - check model/binary setup")
           print(f"{len(ok)} ok cells, 0 failed")
           EOF
-
-  pr-comment:
-    name: PR comment
-    needs: benchmark
-    if: github.event_name == 'pull_request' && always()
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: engine-comparison-report
-          merge-multiple: true
-          path: report
-      - name: Post or update PR comment
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const marker = '<!-- engine-comparison-report -->';
-            let body = marker + '\n## Engine comparison — TensorSharp vs llama.cpp (PR smoke)\n\n';
-            const f = 'report/engine-comparison-report.md';
-            if (fs.existsSync(f)) {
-              const txt = fs.readFileSync(f, 'utf8');
-              // PR comment bodies cap at 65536 chars.
-              body += txt.length > 60000
-                ? txt.slice(0, 60000) + '\n\n_(truncated — see the engine-comparison-report artifact for the full report)_'
-                : txt;
-            } else {
-              body += '_No report artifact was produced — the benchmark failed before generating results (see the workflow logs)._';
-            }
-            const { owner, repo } = context.repo;
-            const issue_number = context.issue.number;
-            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
-            const existing = comments.find(c => c.body && c.body.startsWith(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-            } else {
-              await github.rest.issues.createComment({ owner, repo, issue_number, body });
-            }

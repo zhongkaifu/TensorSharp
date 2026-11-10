@@ -67,8 +67,12 @@ namespace TensorSharp.Models
                 return ArenaDecline("disabled via TS_Q4E_DISABLE_ARENA_DECODE=1");
             if (!IsGgmlBackend || _tokenGraphUnsupported)
                 return ArenaDecline("the complete GGML token-span path is unavailable");
-            if (IsTensorParallel || LayerSplitDegree > 1)
+            if (LayerSplitDegree > 1)
                 return ArenaDecline("arena decode currently requires one device");
+            // Tensor parallelism on one node: every rank runs the arena graph with its own FFN shard and its own
+            // replica of the holders' state, meeting at each layer's reductions as the solo span's ranks do.
+            if (IsTensorParallel && (HasDistributedQwen || GlobalTpDegree != TpDegree || TpRankOffset != 0))
+                return ArenaDecline("arena decode under tensor parallelism currently requires one node");
             if (_specForwardActive || _pendingMRoPEPositions != null)
                 return ArenaDecline("speculative or media prefill is active");
             int n = requestIds?.Count ?? 0;
@@ -168,9 +172,12 @@ namespace TensorSharp.Models
             }
             // Unsupported GET_ROWS types and very large embedding tables take
             // the same N-row host dequant path as solo decode.
+            // Tensor parallelism gathers them on the host too, as its solo steps do, where an in-graph gather
+            // would put a copy of the table on every rank.
             Tensor embeddingRows = null;
-            if (_quantWeights.TryGetValue("token_embd.weight", out var qw)
-                && (!CanUseGgmlQuantizedGetRows(qw.GgmlType) || qw.DevicePreloadTooLarge))
+            if (IsTensorParallel
+                || (_quantWeights.TryGetValue("token_embd.weight", out var qw)
+                    && (!CanUseGgmlQuantizedGetRows(qw.GgmlType) || qw.DevicePreloadTooLarge)))
                 embeddingRows = Embedding(sortedTokens);
             using (embeddingRows)
             {
@@ -187,11 +194,32 @@ namespace TensorSharp.Models
                     if (_pleHeads > 0) h.PleHistory.EnsureCapacity(checked(h.PleHistory.Count + 1));
                 }
                 int[] sampled = outNextTokens != null ? new int[n] : null;
+                IntPtr[] rankFfn = null;
+                if (IsTensorParallel)
+                {
+                    var ranks = EnsureTensorParallelFfnArgs();
+                    rankFfn = new IntPtr[ranks.Length];
+                    for (int r = 0; r < ranks.Length; ++r) rankFfn[r] = PinnedArrayPointer(ranks[r]);
+                }
                 int status;
                 fixed (float* lp = _arenaLogitsStaging)
                 fixed (float* pe = pleEmbedding)
                 fixed (int* sp = sampled)
-                    status = GgmlBasicOps.Qwen4ExpArenaDecodeBatchedStatus(
+                    status = rankFfn != null
+                        ? GgmlBasicOps.Qwen4ExpArenaDecodeBatchedTpStatus(
+                            rankFfn, gdnArgs[0], attnArgs[0], PinnedArrayPointer(_headArgs), pleArgs[0],
+                            PinnedArrayPointer(_layerKinds), Config.NumLayers, _pleHeads > 0 ? _pleLayerIndex : -1, n,
+                            sortedTokens, sortedPositions, ropePositions, capacities, k, v, conv, ssm, pleState,
+                            attnArgs, gdnArgs, pleArgs, HasQsa ? qsaArgs : null,
+                            HasQsa ? qsaPositions : null, HasQsa ? qsaCounts : null,
+                            Config.HiddenSize, _hc, _hcLowRank, Config.HeadDim, Config.NumHeads, Config.NumKVHeads, _ropeDimCount,
+                            Config.RopeBase, 1f / Config.RopeScale, _attnScale,
+                            _headKDim, _headVDim, _numKHeads, _numVHeads, _convKernel,
+                            _numExperts, _numExpertsUsed, _expertFf / TpDegree, _sharedFf / TpDegree, Config.Eps, 1,
+                            embedding, embeddingType, Config.HiddenSize, Config.VocabSize, embeddingBytes,
+                            embeddingRows == null ? IntPtr.Zero : (IntPtr)GetFloatPtr(embeddingRows), (IntPtr)pe,
+                            (IntPtr)lp, (IntPtr)sp, outLogits != null)
+                        : GgmlBasicOps.Qwen4ExpArenaDecodeBatchedStatus(
                         PinnedArrayPointer(_ffnArgs), gdnArgs[0], attnArgs[0], PinnedArrayPointer(_headArgs), pleArgs[0],
                         PinnedArrayPointer(_layerKinds), Config.NumLayers, _pleHeads > 0 ? _pleLayerIndex : -1, n,
                         sortedTokens, sortedPositions, ropePositions, capacities, k, v, conv, ssm, pleState,

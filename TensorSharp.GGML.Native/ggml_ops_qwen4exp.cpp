@@ -585,6 +585,24 @@ void q4e_independent_decode_rows(int rows)
     g_q4e_row_kernels = on ? Q4eRowKernels{rows, 0, true} : Q4eRowKernels{};
 }
 
+Q4eTpFfnScope::Q4eTpFfnScope(std::vector<ggml_tensor*>* partials, int degree, int rank) : active_(partials != nullptr)
+{
+    if (!active_) return;
+    if (degree < 2 || rank < 0 || rank >= degree)
+        throw std::invalid_argument("qwen4exp TP: invalid rank topology");
+    g_q4e_tp_partials = partials;
+    g_q4e_tp_degree = degree;
+    g_q4e_tp_rank = rank;
+}
+
+Q4eTpFfnScope::~Q4eTpFfnScope()
+{
+    if (!active_) return;
+    g_q4e_tp_partials = nullptr;
+    g_q4e_tp_degree = 1;
+    g_q4e_tp_rank = 0;
+}
+
 namespace
 {
 

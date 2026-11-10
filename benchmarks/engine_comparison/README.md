@@ -632,11 +632,10 @@ as workflow artifacts; local runs do not replace a published benchmark page.
 ## CI (GitHub Actions)
 
 `.github/workflows/test-matrix.yml` runs this harness on the self-hosted
-`tensorsharp-cuda` runner in two profiles: a trimmed **smoke** profile on every
-pull request (`gemma4-12b` only; `text_short`, `function_call`, `json_mode`,
-`prefill_4k`; report posted as a PR comment), and the **full** CI set on
-demand via `workflow_dispatch` (inputs select a custom subset) plus a weekly
-schedule. Each run:
+`tensorsharp-cuda` runner over the full CI set, on demand via
+`workflow_dispatch` (inputs select a custom subset) and on a weekly schedule.
+It no longer runs on pull requests: the per-PR smoke profile and its PR comment
+were removed on 2026-11-10. Each run:
 
 1. builds TensorSharp (native GGML CUDA library + `TensorSharp.Server.Host`),
 2. clones and builds **llama.cpp** (CUDA, `llama-server`; pick the ref with the

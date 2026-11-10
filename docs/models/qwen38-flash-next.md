@@ -283,8 +283,20 @@ flush or retire the corresponding arena slot before another path reads its
 state. Image requests join this path after media prefill; their compacted
 rotary positions and QSA coordinate history stay with their holder.
 
-Tensor parallelism, layer splitting, other KV dtypes and unavailable span or
-backend geometry continue through the per-sequence fused path when supported.
+Layer splitting, other KV dtypes and unavailable span or backend geometry
+continue through the per-sequence fused path when supported. Under `--tp N` on
+one node the arena runs on every rank: each rank builds the same graph with its
+own FFN shard and its own replica of the requests' K/V, GDN, PLE and QSA state,
+a request sits in the same slot on every rank, and the ranks meet at each
+layer's two gathers as a solo step's ranks do. The batch shares one set of
+gathers a step, where round-robin solo steps pay one set per request. Token rows
+are gathered on the host, as solo tensor-parallel steps gather them, and rank 0
+runs the head. A rank's memory is planned to its weights, so the arena is built
+there only while its caches leave the usual headroom free (max(1 GiB, 1/32 of
+the device)); otherwise the requests decode one at a time. A geometry no request
+sits in is retired before another is sized, and a prompt span that cannot
+allocate takes the arena back before its request fails. Tensor parallelism
+across nodes keeps the per-sequence path.
 GPU arena execution requires upstream flash attention support for its head
 geometry; CPU uses the corresponding attention fallback. Every participating
 holder must have authoritative initialized state, a matching position and room
@@ -1324,8 +1336,32 @@ RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/
 | adaptation | short chat | long generation | 4K prompt | 16K prompt | CPU experts a window after 4K / 16K |
 | --- | --- | --- | --- | --- | --- |
 | 8 blocking swaps a round | 0.08-0.10 s / 88-102 | 154-182 | 1.62-1.70 s / 135-160 | 6.71-6.88 s / 167-184 | 115-171 / 69-98 |
-| 64 overlapped swaps a round (default) | 0.07-0.09 s / 75-110 | 174-179 | 1.61-1.69 s / 137-188 | 6.76-6.81 s / 183-198 | 31-146 / 26-33 |
+| 64 overlapped swaps a round (default until 2026-11-10) | 0.07-0.09 s / 75-110 | 174-179 | 1.61-1.69 s / 137-188 | 6.76-6.81 s / 183-198 | 31-146 / 26-33 |
 | 96 overlapped swaps a round | 0.07-0.09 s / 82-100 | 169-180 | 1.61-1.69 s / 151-193 | 6.71-6.79 s / 151-193 | 32-96 / 17-28 |
+
+#### Larger adaptation rounds, 2026-11-10
+
+A round that overlaps the decode can carry as many swaps as its staging slots hold (254 for Flash Next), and the
+default budget is now 256 instead of 64 (`TS_MOE_TIER_ADAPT_SWAPS`, when set, is still every round's). The answer to a
+long prompt routes elsewhere than the residency learned before it, and at 64 a round it kept missing those experts for
+many windows. Counted with the host computing every miss (`TS_Q4E_HYBRID_MISSES=0`), the first 16K-token answer of a
+sequence had 49 misses a window in its windows 1-8 and 21 in windows 17-64; at 256, 13-17 and 5-6. Moving the prompt's
+experts in at the end of the prompt with the GPU waiting (a prototype, not merged) did less (32 / 5) and cost 50-280 ms
+of TTFT per 4,096-token prefill chunk.
+
+RTX 5090, ISTA `Q2_0`, MTP: four prompts (4K, 16K, 4K and 16K tokens of repo prose) each answered with a 768-token
+summary; two sets of 3 rotating passes; median 4-row verify ms by window position after each prompt:
+
+| swaps a round | windows 1-8 | 9-16 | 17-64 | 65-256 |
+| --- | --- | --- | --- | --- |
+| 64 (until 2026-11-10) | 13.41 / 12.73 | 11.54 / 11.53 | 11.01 / 10.63 | 10.64 / 10.25 |
+| 256 (default) | 10.88 / 10.86 | 10.67 / 9.36 | 10.70 / 10.25 | 10.49 / 10.25 |
+
+Elsewhere, 3 alternating passes each: the engine bench's 16K TTFT 3.28 -> 3.15 s (median) and four requests at once
+152-175 -> 150-191 tok/s; a 16K prompt right after a long answer prefilled as before (synchronized stage times:
+routed experts 772 -> 781 ms, all stages 3,951 -> 3,885 ms; TTFT 4.22-4.26 -> 4.12-4.24 s). No VRAM is added (a round
+borrows the prompt staging), and the bus carried less during the requests (111-129 GB host to device against 133-192
+at 64), as fewer missed experts were staged.
 
 #### The next prompt layer staged ahead, 2026-11-08
 
@@ -2234,6 +2270,20 @@ later activation quantization can amplify. Attention, GDN, QSA and PLE run with 
 and independent state on each rank. The output head runs on rank 0. The image
 and tool-call paths use the same target graph; speculative rollback restores
 GDN and PLE state on every rank. Prefix checkpoints remain disabled under TP.
+Two or more ready decoders share one batched step on every rank (the fused
+arena, see "Concurrent decode uses the fused arena by default"), so their
+layers' gathers are paid once a step and not once a request. Two H100 NVL, Q8_0,
+`--tp 2`, `TS_KV_INITIAL_TOKENS=2048`, greedy, 384 tokens a request: 64 / 92 /
+123 / 146 / 165 tok/s at 1 / 2 / 4 / 8 / 16 requests, against 64 / 62 / 32 / 28
+/ 31 decoding them one at a time (`TS_Q4E_DISABLE_ARENA_DECODE=1`). As on one
+device, the batched answers were the one-at-a-time text at 1 to 8 requests and
+parted from it at near ties at 16, where a graph is wider than the 8 rows that
+keep the one-token fusions (after 53 to 1382 characters under `--tp 2`, 6 to
+1349 on one GPU). Under `--tp` a request's caches are sized for the whole context window
+unless `TS_KV_INITIAL_TOKENS` says otherwise: 1.8 GB a rank at
+`MAX_CONTEXT=65536` on this model, which left those GPUs room to batch 2 and 4
+requests (83 and 88 tok/s against 60 and 52) but not 8, where the arena is
+declined for memory.
 The gathers preserve FP32 using TensorSharp's CUDA collective. Fallbacks use
 zero-copy chunks below upstream CUDA's automatic BF16 threshold, or an FP32 host
 sum when a device collective is unavailable. Two collectives per FFN communicate

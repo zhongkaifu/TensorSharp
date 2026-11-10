@@ -18,6 +18,10 @@ namespace TensorSharp.GGML
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static partial void TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static partial int TSGgml_Qwen4ExpArenaDecodeBatched(
             IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr head, IntPtr ple,
             IntPtr kinds, int numLayers, int pleLayer, int numSequences,
@@ -36,6 +40,28 @@ namespace TensorSharp.GGML
             long tokenEmbeddingDim, long tokenEmbeddingVocab, long tokenEmbeddingBytes,
             IntPtr embeddingRows, IntPtr pleEmbedding,
             IntPtr logits, IntPtr sampled, int wantLogits, int device);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static partial int TSGgml_Qwen4ExpArenaDecodeBatchedTp(
+            [In] IntPtr[] ffnByRank, int ranks,
+            IntPtr gdn, IntPtr attn, IntPtr head, IntPtr ple,
+            IntPtr kinds, int numLayers, int pleLayer, int numSequences,
+            [In] int[] tokens, [In] int[] positions, [In] int[] ropePositions, [In] int[] capacities,
+            [In] IntPtr[] kCaches, [In] IntPtr[] vCaches,
+            [In] IntPtr[] convStates, [In] IntPtr[] ssmStates, [In] IntPtr[] pleStates,
+            [In] IntPtr[] attnDescriptors, [In] IntPtr[] gdnDescriptors, [In] IntPtr[] pleDescriptors,
+            [In] IntPtr[] qsaDescriptors, [In] IntPtr[] qsaPositions, [In] int[] qsaPositionCounts,
+            int hiddenSize, int hc, int hcLowRank,
+            int headDim, int numHeads, int numKvHeads, int rotaryDims,
+            float ropeBase, float ropeFrequencyScale, float attentionScale,
+            int headKDim, int headVDim, int numKHeads, int numVHeads, int convKernel,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            float eps, int kvCacheType,
+            IntPtr tokenEmbedding, int tokenEmbeddingType,
+            long tokenEmbeddingDim, long tokenEmbeddingVocab, long tokenEmbeddingBytes,
+            IntPtr embeddingRows, IntPtr pleEmbedding,
+            IntPtr logits, IntPtr sampled, int wantLogits);
     }
 
     public partial class GgmlBasicOps
@@ -45,6 +71,11 @@ namespace TensorSharp.GGML
 
         public static int Qwen4ExpArenaFlushHostPointerStatus(IntPtr pointer)
             => GgmlNative.TSGgml_Qwen4ExpArenaFlushHostPointerStatus(pointer);
+
+        /// <summary>Flushes every arena slot back to its request's own caches and state, on every device, and
+        /// frees the arena graphs. A slot whose flush fails stays fenced, as after any failed flush.</summary>
+        public static void Qwen4ExpArenaResetBatchedDecodeCache()
+            => GgmlNative.TSGgml_Qwen4ExpArenaResetBatchedDecodeCache();
 
         /// <summary>Returns 1 on success, 0 before execution declined, and -1
         /// when execution may have advanced recurrent state. A negative result
@@ -75,5 +106,37 @@ namespace TensorSharp.GGML
                 numExperts, numExpertsUsed, expertFf, sharedFf, eps, kvCacheType,
                 tokenEmbedding, tokenEmbeddingType, tokenEmbeddingDim, tokenEmbeddingVocab, tokenEmbeddingBytes,
                 embeddingRows, pleEmbedding, logits, sampled, wantLogits ? 1 : 0, device);
+
+        /// <summary>The same step under tensor parallelism, one call for every rank of the node:
+        /// <paramref name="ffnByRank"/> holds each rank's FFN descriptors (its expert shards) and
+        /// <paramref name="expertFf"/> / <paramref name="sharedFf"/> are the per-rank widths. Returns as
+        /// <see cref="Qwen4ExpArenaDecodeBatchedStatus"/> does.</summary>
+        public static int Qwen4ExpArenaDecodeBatchedTpStatus(
+            IntPtr[] ffnByRank,
+            IntPtr gdn, IntPtr attn, IntPtr head, IntPtr ple,
+            IntPtr kinds, int numLayers, int pleLayer, int numSequences,
+            int[] tokens, int[] positions, int[] ropePositions, int[] capacities,
+            IntPtr[] kCaches, IntPtr[] vCaches, IntPtr[] convStates, IntPtr[] ssmStates, IntPtr[] pleStates,
+            IntPtr[] attnDescriptors, IntPtr[] gdnDescriptors, IntPtr[] pleDescriptors,
+            IntPtr[] qsaDescriptors, IntPtr[] qsaPositions, int[] qsaPositionCounts,
+            int hiddenSize, int hc, int hcLowRank,
+            int headDim, int numHeads, int numKvHeads, int rotaryDims,
+            float ropeBase, float ropeFrequencyScale, float attentionScale,
+            int headKDim, int headVDim, int numKHeads, int numVHeads, int convKernel,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            float eps, int kvCacheType,
+            IntPtr tokenEmbedding, int tokenEmbeddingType,
+            long tokenEmbeddingDim, long tokenEmbeddingVocab, long tokenEmbeddingBytes,
+            IntPtr embeddingRows, IntPtr pleEmbedding, IntPtr logits, IntPtr sampled, bool wantLogits)
+            => GgmlNative.TSGgml_Qwen4ExpArenaDecodeBatchedTp(
+                ffnByRank, ffnByRank.Length, gdn, attn, head, ple, kinds, numLayers, pleLayer, numSequences,
+                tokens, positions, ropePositions, capacities, kCaches, vCaches,
+                convStates, ssmStates, pleStates, attnDescriptors, gdnDescriptors, pleDescriptors,
+                qsaDescriptors, qsaPositions, qsaPositionCounts,
+                hiddenSize, hc, hcLowRank, headDim, numHeads, numKvHeads, rotaryDims,
+                ropeBase, ropeFrequencyScale, attentionScale, headKDim, headVDim, numKHeads, numVHeads, convKernel,
+                numExperts, numExpertsUsed, expertFf, sharedFf, eps, kvCacheType,
+                tokenEmbedding, tokenEmbeddingType, tokenEmbeddingDim, tokenEmbeddingVocab, tokenEmbeddingBytes,
+                embeddingRows, pleEmbedding, logits, sampled, wantLogits ? 1 : 0);
     }
 }

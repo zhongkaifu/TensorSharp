@@ -5,10 +5,11 @@
   // Qwen3.8-27B's fastest measured setup on NVIDIA: the NVFP4 artifact on the direct CUDA engine with its DFlash2
   // weights (7 drafts, no confidence gate). RTX 5090, 2026-11-05 campaign: decode ~203 tok/s single stream (73 without
   // drafting), 8K-token TTFT 0.78 s, four requests at once up to 372 tok/s in all. The UD-IQ3_XXS GGUF with the
-  // DFlash2 GGUF on ggml_cuda (2026-11-09, d4f33229, after 74310bb0's VRAM fix) decodes 176-178 tok/s single stream
-  // and 180-192 tok/s for four requests at once. For long-prompt work there, Tencent's DSpine drafter with 15 drafts
+  // DFlash2 GGUF on ggml_cuda (2026-11-09, d4f33229, after 74310bb0's VRAM fix) decodes 155-178 tok/s single stream
+  // and 168-192 tok/s for four requests at once. For long-prompt work there, Tencent's DSpine drafter with 15 drafts
   // and a 0.35 gate decodes 416-431 tok/s after a 4K-token prompt (DFlash2 140-251) and 233-252 after 16K
-  // (DFlash2 184-189); DFlash2 stays ahead on free generation. See docs/speculative_decoding.md#dspine.
+  // (DFlash2 170-189); DFlash2 stays ahead on free generation. See docs/speculative_decoding.md#dspine. That setup is
+  // config/qwen3.8-27b-cuda-dflash2.json, the preset for NVIDIA GPUs other than sm_120: this artifact's kernels need it.
   // Apple Silicon: config/qwen3.8-27b-metal-dflash2.json (ggml-metal has no NVFP4 matmul).
   "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
   "model": {

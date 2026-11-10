@@ -146,6 +146,7 @@
         "qwen3.6-27b",
         "qwen3.6-35b-a3b",
         "qwen3.8-27b",
+        "qwen3.8-27b-cuda-dflash2",
         "qwen3.8-27b-metal-dflash2",
         "qwen3.8-27b-ninfer",
         "qwen3.8-27b-ninfer-64k"
@@ -3277,6 +3278,37 @@
       "notes": [
         "Apple Silicon profile: UD-IQ3_XXS with the DFlash2 Q4_K_M drafter (7 drafts, no confidence gate); the files of TensorAgent's qwen3.8-27b-iq3xxs entry.",
         "No automatic runner scenario claims it: a ggml_metal DFlash2 verify is not bit-identical to plain decode, so the speculation scenario's exact-sequence assertion does not apply; the qwen3.8-27b preset carries the family's scenarios."
+      ]
+    },
+    {
+      "id": "qwen3.8-27b-cuda-dflash2",
+      "config": "config/qwen3.8-27b-cuda-dflash2.json",
+      "kind": "text",
+      "family": "qwen35",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "backends": [
+        "ggml_cuda"
+      ],
+      "scenarios": [],
+      "source_evidence": [
+        "config/qwen3.8-27b-cuda-dflash2.json",
+        "TensorSharp.Models/Models/Qwen35/Qwen35Architecture.cs",
+        "docs/models/qwen35.md",
+        "docs/speculative_decoding.md"
+      ],
+      "layout": "dense",
+      "file_sizes": {
+        "Qwen3.8-27B-UD-IQ3_XXS.gguf": 10934860704,
+        "Qwen3.8-27B-mmproj-BF16.gguf": 931146432,
+        "Qwen3.8-27B-DFlash2-Q4_K_M.gguf": 1143006816
+      },
+      "status": "configured",
+      "notes": [
+        "NVIDIA ggml_cuda profile: UD-IQ3_XXS with the DFlash2 Q4_K_M drafter (7 drafts, no confidence gate), MAX_CONTEXT 32768; the same files as qwen3.8-27b-metal-dflash2.",
+        "No automatic runner scenario claims it: a ggml_cuda multi-row verify is not row-invariant (greedy text can differ from plain decode at near-ties), so the speculation scenario's exact-sequence assertion does not apply; the qwen3.8-27b preset carries the family's scenarios."
       ]
     },
     {

@@ -30,6 +30,8 @@
 
 using namespace tsg;
 
+TSG_EXPORT int TSGgml_DeviceMemoryInfo(int64_t* free_bytes, int64_t* total_bytes);
+
 namespace
 {
     // TS_Q4E_ARENA_BATCHED_GDN=0 runs each slot's GDN half on its own (T = 1 per slot) instead of one batched pass.
@@ -97,8 +99,18 @@ namespace
 // Eligibility: one CPU, Metal or CUDA device, F16 KV, folded head descriptors
 // and no-wrap positions. All lanes retain the solo flash-attention geometry.
 // CPU exercises the same cache ownership path. Managed code gates speculative
-// sessions and tensor/layer splits. Failures after compute starts invalidate
+// sessions and layer splits. Failures after compute starts invalidate
 // affected holders rather than retrying against partly advanced state.
+//
+// TENSOR PARALLELISM (TSGgml_Qwen4ExpArenaDecodeBatchedTp): every rank builds
+// this same graph in its own pool, with its own replica of each sequence's
+// K/V, GDN, PLE and QSA state (the solo span replicates them the same way) and
+// its own FFN shard: q4e_nodes_ffn slices gate/up channels and down output
+// rows and records each layer's two reductions (Q4eTpFfnScope), which become
+// the rank's TpRankPlan. The step prepares every rank (slots, joins, inputs),
+// runs the plans together (tp_execute_plans) and then finishes every rank, so
+// N sequences share one set of 2 * layers reductions a step where N round-robin
+// solo steps pay N sets. Rank 0 alone carries the head.
 // ============================================================================
 namespace
 {
@@ -182,6 +194,10 @@ namespace
         ggml_type kv_type = GGML_TYPE_F16;
         std::vector<Q4abSlot> slots;
         std::vector<int> attention_windows;
+        // Tensor parallelism: this rank's graph cut at each layer's two FFN reductions, and the
+        // topology that graph was built for (degree 1 = one device, no plan).
+        tsg::TpRankPlan tp_plan;
+        int tp_degree = 1, tp_rank = 0;
 
         std::vector<std::int32_t> tok_stage;
         std::vector<std::int32_t> pos_stage;
@@ -212,6 +228,7 @@ namespace
             qsa_arena.clear(); qsa_args.clear(); qsa_inputs.clear();
             host_moe.clear(); host_moe_seg_end.clear();
             trace_res.clear();
+            tp_plan.clear();
             valid = false;
         }
 
@@ -642,7 +659,127 @@ TSG_EXPORT void TSGgml_Qwen4ExpArenaResetBatchedDecodeCache()
 // ([attn_layer * n + s] / [gdn_layer * n + s] / [s]). Outputs are in the
 // caller's sequence order.
 // ============================================================================
-TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
+namespace
+{
+    // One rank's half of a tensor-parallel step. q4ab_decode stops at the launch and fills
+    // the outputs; the caller runs every rank's plan together and calls q4ab_finish on each.
+    struct Q4abTpRank
+    {
+        int degree = 0;                 // tensor-parallel degree
+        int rank = 0;                   // this rank's index in it
+        // The slot each caller sequence took on the first rank, for every later rank: the ranks'
+        // partials are reduced column by column, so a sequence sits in the same slot on all of them.
+        const std::vector<int>* follow = nullptr;
+        Q4abEntry* entry = nullptr;     // out: the prepared entry (tp_plan ready)
+        std::vector<int> slot_of;       // out: caller sequence -> slot
+    };
+
+    bool q4ab_trace()
+    {
+        const char* e = std::getenv("TS_Q4E_SPAN_TRACE");
+        return e != nullptr && e[0] == '1';
+    }
+
+    // After the launch, on the entry's rank (q4ab_mutex held). A failed launch retires the
+    // call's slots; a completed one reads the outputs back in the caller's sequence order and
+    // commits each slot's new row. A tensor-parallel rank without the head has nothing to read.
+    int q4ab_finish(Q4abEntry& e, const std::vector<int>& slot_of, bool succeeded, int n_seqs,
+                    const std::int32_t* cache_positions, float* logits_data, std::int32_t* sampled_data,
+                    int want_logits, bool trace)
+    {
+        if (!succeeded)
+        {
+            set_last_error("qwen4exp arena batched decode: graph execution failed.");
+            // A partially executed graph may have advanced SOME layers'
+            // GDN/PLE state for this call's slots and not others — that mixed
+            // state is unrecoverable, so those slots drop WITHOUT a state
+            // flush. Managed code fails these holders and never retries them;
+            // partially advanced recurrent state cannot be served safely.
+            // Only the previously committed KV rows [clean, len) are flushed.
+            for (int i = 0; i < n_seqs; i++)
+                e.slots[slot_of[i]].state_dirty = false;
+            q4ab_flush_entry(e);
+            e.release_graph();
+            e.slots.clear();
+            return -1;
+        }
+
+        Q4abPool& pool = q4ab_pool();
+        const int vocab_size = e.vocab;
+        const int hc_dim = e.hc_dim;
+        const bool has_head = e.logits_out != nullptr;
+        const bool need_logits = has_head && ((want_logits != 0) || (sampled_data != nullptr && !e.has_argmax));
+        if (need_logits)
+            finalize_compute_with_download(e.logits_out, e.logits_stage.data(),
+                                           e.logits_stage.size() * sizeof(float));
+        if (has_head && sampled_data != nullptr && e.has_argmax)
+            finalize_compute_with_download(e.sampled_out, e.sampled_stage.data(),
+                                           e.sampled_stage.size() * sizeof(std::int32_t));
+        host_read_barrier();
+
+        if (trace) for (size_t i = 0; i < e.trace_res.size(); ++i)
+        {
+            auto* t = e.trace_res[i];
+            std::vector<float> values((size_t)ggml_nelements(t));
+            ggml_backend_tensor_get(t, values.data(), 0, values.size() * sizeof(float));
+            for (int caller = 0; caller < n_seqs; ++caller)
+            {
+                const float* row = values.data() + (size_t)slot_of[caller] * hc_dim;
+                double norm = 0;
+                uint64_t hash = 1469598103934665603ULL;
+                for (int c = 0; c < hc_dim; ++c) { norm += (double)row[c] * row[c]; uint32_t bits; std::memcpy(&bits, row + c, sizeof(bits)); hash = (hash ^ bits) * 1099511628211ULL; }
+                fprintf(stderr, "[q4e-arena-trace] row=%d pos=%d l=%zu half=%zu l2=%.9e hash=%016llx head=%.9e %.9e\n",
+                    caller, cache_positions[caller], i / 2, i % 2, std::sqrt(norm), (unsigned long long)hash, row[0], row[1]);
+            }
+        }
+
+        if (has_head && want_logits != 0 && logits_data != nullptr)
+        {
+            for (int i = 0; i < n_seqs; i++)
+            {
+                const int s = slot_of[i];
+                std::memcpy(logits_data + static_cast<std::size_t>(i) * vocab_size,
+                            &e.logits_stage[static_cast<std::size_t>(s) * vocab_size],
+                            static_cast<std::size_t>(vocab_size) * sizeof(float));
+            }
+        }
+        if (has_head && sampled_data != nullptr)
+        {
+            for (int i = 0; i < n_seqs; i++)
+            {
+                const int s = slot_of[i];
+                if (e.has_argmax)
+                {
+                    sampled_data[i] = e.sampled_stage[s];
+                }
+                else
+                {
+                    const float* row = &e.logits_stage[static_cast<std::size_t>(s) * vocab_size];
+                    int best = 0;
+                    for (int v = 1; v < vocab_size; v++)
+                        if (row[v] > row[best]) best = v;
+                    sampled_data[i] = best;
+                }
+            }
+        }
+
+        for (int i = 0; i < n_seqs; i++)
+        {
+            Q4abSlot& sl = e.slots[slot_of[i]];
+            sl.len = cache_positions[i] + 1;
+            sl.state_dirty = true;
+            sl.last_used = ++pool.clock;
+        }
+
+        clear_last_error();
+        return 1;
+    }
+}
+
+// The step on the device `device` selects. With `tp` (one rank of a tensor-parallel step) it
+// returns 2 at the launch, the entry prepared and its plan ready, and leaves the launch and
+// q4ab_finish to the caller, who also holds q4ab_mutex; without it, it runs the whole step.
+static int q4ab_decode(
     const TSGgmlQwen4ExpFfnArgs* ffn,
     const TSGgmlQwen4ExpGdnArgs* gdn,
     const TSGgmlQwen4ExpAttnArgs* attn,
@@ -669,7 +806,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
     std::int64_t token_embd_ne0, std::int64_t token_embd_ne1, std::int64_t token_embd_bytes,
     const float* embedding_rows, const float* ple_emb,
     float* logits_data, std::int32_t* sampled_data, int want_logits,
-    int device)
+    int device, Q4abTpRank* tp)
 {
     bool compute_started = false;
     try
@@ -695,7 +832,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
             return 0;
         }
         const bool has_ple = ple != nullptr;
-        const bool trace = std::getenv("TS_Q4E_SPAN_TRACE") && std::getenv("TS_Q4E_SPAN_TRACE")[0] == '1';
+        const bool trace = q4ab_trace();
         if (has_ple != (ple_layer >= 0 && ple_layer < n_layers) ||
             (has_ple && (ple_emb == nullptr || ple_state_arr == nullptr || ple_desc_arr == nullptr)))
         {
@@ -807,8 +944,23 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
         const int n_slots_req = q4ab_slot_bucket(n_seqs);
         const void* sig_disc = ffn[0].hc_norm;
 
-        std::lock_guard<std::mutex> qlock(q4ab_mutex());
+        // A tensor-parallel step holds the lock across its ranks.
+        std::unique_lock<std::mutex> qlock(q4ab_mutex(), std::defer_lock);
+        if (tp == nullptr) qlock.lock();
         Q4abGuard guard;
+        const int tp_degree = tp != nullptr ? tp->degree : 1;
+        const int tp_rank = tp != nullptr ? tp->rank : 0;
+        const std::vector<int>* follow = tp != nullptr ? tp->follow : nullptr;
+        if (follow != nullptr)
+        {
+            bool valid = static_cast<int>(follow->size()) == n_seqs;
+            for (int i = 0; valid && i < n_seqs; ++i)
+            {
+                valid = (*follow)[i] >= 0 && (*follow)[i] < n_slots_req;
+                for (int t = 0; valid && t < i; ++t) valid = (*follow)[t] != (*follow)[i];
+            }
+            if (!valid) throw std::invalid_argument("qwen4exp arena: invalid slot map for a tensor-parallel rank");
+        }
 
         // ---- entry lookup / build ----
         Q4abPool& pool = q4ab_pool();
@@ -826,7 +978,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
         auto matching_windows = [&](const Q4abEntry& e) {
             std::vector<int> assigned(n_seqs, -1);
             std::vector<bool> used(e.n_slots, false);
-            for (int i = 0; i < n_seqs; ++i)
+            if (follow != nullptr) assigned = *follow;
+            else for (int i = 0; i < n_seqs; ++i)
                 for (int s = 0; s < e.n_slots; ++s)
                     if (e.slots[s].active && e.slots[s].key == k_cache_arr[i]) { assigned[i] = s; used[s] = true; break; }
             for (int i = 0; i < n_seqs; ++i) if (assigned[i] < 0)
@@ -844,7 +997,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                 e.hd == hd && e.kvH == kvH && e.kv_type == kvType && e.hc == hc &&
                 e.conv_dim == conv_dim && e.gdn_hist == gdn_hist &&
                 e.head_v == head_v_dim && e.v_heads == n_v_heads &&
-                e.ple_hist == ple_hist)
+                e.ple_hist == ple_hist &&
+                e.tp_degree == tp_degree && e.tp_rank == tp_rank)
             {
                 bool same_qsa = true;
                 for (int l = 0; l < n_layers; ++l)
@@ -859,7 +1013,19 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
 
         if (needs_build)
         {
-            if (g_backend_type == BACKEND_TYPE_METAL)
+            if (tp != nullptr)
+            {
+                // A rank's device is planned to its share of the weights, so two geometries' K/V
+                // arenas do not coexist there: the call's sequences leave the geometry they sat in
+                // before the new one is sized, which empties it for the retirement below.
+                for (int i = 0; i < n_seqs; ++i)
+                {
+                    const auto it = q4ab_registry().find(k_cache_arr[i]);
+                    if (it != q4ab_registry().end() && it->second.first != entry_idx)
+                        q4ab_flush_and_drop_slot(pool.entries[it->second.first], it->second.second);
+                }
+            }
+            if (g_backend_type == BACKEND_TYPE_METAL || tp != nullptr)
             {
                 // These recurrent arenas can retain hundreds of MiB per
                 // geometry. On unified memory that competes with the mapped
@@ -912,11 +1078,42 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
             e.conv_dim = conv_dim; e.gdn_hist = gdn_hist;
             e.head_v = head_v_dim; e.v_heads = n_v_heads;
             e.ple_hist = ple_hist;
+            e.tp_degree = tp_degree; e.tp_rank = tp_rank;
             e.cap = std::max(q4ab_cap_round(maxTotal), prev_cap);
             e.rows_per_slot = static_cast<std::int64_t>(kvH) * e.cap;
+            if (tp != nullptr)
+            {
+                // Every request's prompt spans and state come out of what a rank's weights leave
+                // free. The arena's persistent leaves are sized before anything is built, and a
+                // geometry that would leave less than the usual headroom (max(1 GiB, 1/32 of the
+                // device), as a new request's state must) declines: the sequences then decode one
+                // at a time, as they did before this step existed.
+                std::int64_t free_bytes = 0, total_bytes = 0;
+                if (TSGgml_DeviceMemoryInfo(&free_bytes, &total_bytes) != 0)
+                {
+                    const std::size_t lanes = static_cast<std::size_t>(e.n_slots) + 1;
+                    std::size_t need = 2 * static_cast<std::size_t>(attn_layers) * ggml_row_size(kvType, hd)
+                            * static_cast<std::size_t>(e.rows_per_slot) * lanes
+                        + static_cast<std::size_t>(gdn_layers) * (convBytes + ssmBytes) * lanes
+                        + pleBytes * lanes
+                        + (static_cast<std::size_t>(256) << 20);   // inputs, intermediates, the logits
+                    if (qsa_arr) for (int l = 0; l < n_layers; ++l)
+                        if (qsa_arr[0][l].ratio > 0)
+                            need += ggml_row_size((ggml_type)qsa_arr[0][l].cache_type, qsa_arr[0][l].head_dim)
+                                * static_cast<std::size_t>(e.cap) * e.n_slots;
+                    const std::int64_t headroom = std::max<std::int64_t>(std::int64_t{1} << 30, total_bytes / 32);
+                    if (free_bytes - static_cast<std::int64_t>(need) < headroom)
+                    {
+                        set_last_error("qwen4exp arena batched decode: a tensor-parallel rank has no room for the arena ("
+                            + std::to_string(need >> 20) + " MB needed, " + std::to_string(free_bytes >> 20) + " MB free, "
+                            + std::to_string(headroom >> 20) + " MB kept free).");
+                        return 0;
+                    }
+                }
+            }
             e.slots.assign(e.n_slots, Q4abSlot{});
             e.attention_windows.assign(e.n_slots, std::min<int64_t>(256, e.cap));
-            for (int i = 0; i < n_seqs; ++i) e.attention_windows[i] = window_for(i);
+            for (int i = 0; i < n_seqs; ++i) e.attention_windows[follow != nullptr ? (*follow)[i] : i] = window_for(i);
             const int n_slots = e.n_slots;
             struct IndependentRows {
                 explicit IndependentRows(int rows) { q4e_independent_decode_rows(rows); }
@@ -1016,6 +1213,11 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                 static_cast<ggml_type>(token_embd_type), token_embd_ne0, token_embd_ne1);
 
             // ---- graph ----
+            // Under tensor parallelism the FFN builder shards this rank's projections and records
+            // each layer's two reductions, in graph order; the first local rank carries the head.
+            std::vector<ggml_tensor*> tp_partials;
+            Q4eTpFfnScope tp_ffn(tp != nullptr ? &tp_partials : nullptr, tp_degree, tp_rank);
+            const bool with_head = tp == nullptr || tsg::g_active_rank == 0;
             e.graph = ggml_new_graph_custom(ctx, graph_size, false);
             Q4eBinder binder{ggml_backend_get_device(g_backend)};
 
@@ -1177,18 +1379,23 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
             }
 
             // Every slot's token is "last": the head mixer runs with T = n_slots.
-            ggml_tensor* logits = q4e_nodes_head(ctx, binder, head, res,
-                    n_embd, hc, hc_low_rank, n_slots, eps);
-            e.logits_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, vocab_size, n_slots);
-            ggml_tensor* out_cpy = ggml_cpy(ctx, logits, e.logits_out);
-            ggml_set_output(out_cpy);
-
-            ggml_tensor* amax = ggml_argmax(ctx, logits);
-            e.has_argmax = backend_supports_op(amax);
-            if (e.has_argmax)
+            ggml_tensor* out_cpy = nullptr;
+            ggml_tensor* amax = nullptr;
+            if (with_head)
             {
-                ggml_set_output(amax);
-                e.sampled_out = amax;
+                ggml_tensor* logits = q4e_nodes_head(ctx, binder, head, res,
+                        n_embd, hc, hc_low_rank, n_slots, eps);
+                e.logits_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, vocab_size, n_slots);
+                out_cpy = ggml_cpy(ctx, logits, e.logits_out);
+                ggml_set_output(out_cpy);
+
+                amax = ggml_argmax(ctx, logits);
+                e.has_argmax = backend_supports_op(amax);
+                if (e.has_argmax)
+                {
+                    ggml_set_output(amax);
+                    e.sampled_out = amax;
+                }
             }
 
             // The state writes have no consumer edge to the logits; expand them
@@ -1199,7 +1406,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                 ggml_set_output(wnode);
                 ggml_build_forward_expand(e.graph, wnode);
             }
-            ggml_build_forward_expand(e.graph, out_cpy);
+            if (out_cpy != nullptr)
+                ggml_build_forward_expand(e.graph, out_cpy);
             if (e.has_argmax)
                 ggml_build_forward_expand(e.graph, amax);
 
@@ -1225,7 +1433,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                 static_cast<std::size_t>(token_embd_bytes));
             if (!host_moe_build_segment_ends(e.graph, e.host_moe, e.host_moe_seg_end, kQ4abKernel))
                 return abort_build("host expert graph boundaries invalid.");
-            SuppressGraphReorder keep_order(!e.host_moe.empty());
+            // The collective executor, like the host-MoE seams, pauses at node indices.
+            SuppressGraphReorder keep_order(tp != nullptr || !e.host_moe.empty());
 
             // Everything unbound (inputs, arenas, intermediates, logits) lands
             // in the entry's OWN buffer — nothing touches the shared gallocr
@@ -1269,13 +1478,23 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
             }
 #endif
 
+            if (tp != nullptr)
+            {
+                e.tp_plan.graph = e.graph;
+                e.tp_plan.backend = e.precise_backend;
+                e.tp_plan.allreduce_f32 = true;
+                e.tp_plan.ar_tensor = tp_partials;
+                if (!tp_plan_segments(e.tp_plan, tp_partials))
+                    return abort_build("failed to locate the FFN reduction boundaries.");
+            }
+
             e.tok_stage.assign(n_slots, 0);
             e.pos_stage.assign(n_slots, 0);
             e.idx_stage.assign(static_cast<std::size_t>(kvH) * n_slots, 0);
             e.local_idx_stage.assign(n_slots, 0);
             e.embedding_stage.assign(embedding_rows ? (size_t)H * n_slots : 0, 0.f);
             e.ple_stage.assign(has_ple ? static_cast<std::size_t>(n_embd) * n_slots : 0, 0.0f);
-            e.logits_stage.assign(static_cast<std::size_t>(vocab_size) * n_slots, 0.0f);
+            e.logits_stage.assign(with_head ? static_cast<std::size_t>(vocab_size) * n_slots : 0, 0.0f);
             e.sampled_stage.assign(n_slots, 0);
             e.valid = true;
         }
@@ -1286,6 +1505,18 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
         const std::size_t row_bytes = ggml_row_size(kvType, hd);
 
         // ---- slot assignment ----
+        if (follow != nullptr)
+        {
+            // Keep only the slots that already hold the sequence the first rank has there.
+            for (int s = 0; s < n_slots; s++)
+            {
+                if (!e.slots[s].active) continue;
+                bool keep = false;
+                for (int i = 0; i < n_seqs; i++)
+                    if ((*follow)[i] == s && e.slots[s].key == k_cache_arr[i]) { keep = true; break; }
+                if (!keep) q4ab_flush_and_drop_slot(e, s);
+            }
+        }
         std::vector<int> slot_of(n_seqs, -1);
         for (int i = 0; i < n_seqs; i++)
         {
@@ -1330,7 +1561,13 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
         {
             if (slot_of[i] >= 0) continue;
             int s = -1;
-            for (int j = 0; j < n_slots; j++)
+            if (follow != nullptr)
+            {
+                s = (*follow)[i];
+                if (e.slots[s].active)
+                    throw std::logic_error("qwen4exp arena: a tensor-parallel rank's slot is still occupied");
+            }
+            else for (int j = 0; j < n_slots; j++)
                 if (!e.slots[j].active) { s = j; break; }
             if (s < 0)
             {
@@ -1662,97 +1899,177 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
             }
         }
 
+        if (tp != nullptr)
+        {
+            // Launched by the caller with the other ranks' graphs.
+            tp->entry = &e;
+            tp->slot_of = std::move(slot_of);
+            return 2;
+        }
+
         compute_started = true;
         const auto execution_backend = e.execution_backend();
         const bool succeeded = e.host_moe.empty()
             ? tsg::graph_compute_profiled(execution_backend, e.graph, kQ4abKernel) == GGML_STATUS_SUCCESS
             : host_moe_execute_segments(e.graph, e.host_moe, e.host_moe_seg_end, kQ4abKernel, execution_backend);
-        if (!succeeded)
-        {
-            set_last_error("qwen4exp arena batched decode: graph execution failed.");
-            // A partially executed graph may have advanced SOME layers'
-            // GDN/PLE state for this call's slots and not others — that mixed
-            // state is unrecoverable, so those slots drop WITHOUT a state
-            // flush. Managed code fails these holders and never retries them;
-            // partially advanced recurrent state cannot be served safely.
-            // Only the previously committed KV rows [clean, len) are flushed.
-            for (int i = 0; i < n_seqs; i++)
-                e.slots[slot_of[i]].state_dirty = false;
-            q4ab_flush_entry(e);
-            e.release_graph();
-            e.slots.clear();
-            return -1;
-        }
-
-        const bool need_logits = (want_logits != 0) || (sampled_data != nullptr && !e.has_argmax);
-        if (need_logits)
-            finalize_compute_with_download(e.logits_out, e.logits_stage.data(),
-                                           e.logits_stage.size() * sizeof(float));
-        if (sampled_data != nullptr && e.has_argmax)
-            finalize_compute_with_download(e.sampled_out, e.sampled_stage.data(),
-                                           e.sampled_stage.size() * sizeof(std::int32_t));
-        host_read_barrier();
-
-        if (trace) for (size_t i = 0; i < e.trace_res.size(); ++i)
-        {
-            auto* t = e.trace_res[i];
-            std::vector<float> values((size_t)ggml_nelements(t));
-            ggml_backend_tensor_get(t, values.data(), 0, values.size() * sizeof(float));
-            for (int caller = 0; caller < n_seqs; ++caller)
-            {
-                const float* row = values.data() + (size_t)slot_of[caller] * hc_dim;
-                double norm = 0;
-                uint64_t hash = 1469598103934665603ULL;
-                for (int c = 0; c < hc_dim; ++c) { norm += (double)row[c] * row[c]; uint32_t bits; std::memcpy(&bits, row + c, sizeof(bits)); hash = (hash ^ bits) * 1099511628211ULL; }
-                fprintf(stderr, "[q4e-arena-trace] row=%d pos=%d l=%zu half=%zu l2=%.9e hash=%016llx head=%.9e %.9e\n",
-                    caller, cache_positions[caller], i / 2, i % 2, std::sqrt(norm), (unsigned long long)hash, row[0], row[1]);
-            }
-        }
-
-        if (want_logits != 0 && logits_data != nullptr)
-        {
-            for (int i = 0; i < n_seqs; i++)
-            {
-                const int s = slot_of[i];
-                std::memcpy(logits_data + static_cast<std::size_t>(i) * vocab_size,
-                            &e.logits_stage[static_cast<std::size_t>(s) * vocab_size],
-                            static_cast<std::size_t>(vocab_size) * sizeof(float));
-            }
-        }
-        if (sampled_data != nullptr)
-        {
-            for (int i = 0; i < n_seqs; i++)
-            {
-                const int s = slot_of[i];
-                if (e.has_argmax)
-                {
-                    sampled_data[i] = e.sampled_stage[s];
-                }
-                else
-                {
-                    const float* row = &e.logits_stage[static_cast<std::size_t>(s) * vocab_size];
-                    int best = 0;
-                    for (int v = 1; v < vocab_size; v++)
-                        if (row[v] > row[best]) best = v;
-                    sampled_data[i] = best;
-                }
-            }
-        }
-
-        for (int i = 0; i < n_seqs; i++)
-        {
-            Q4abSlot& sl = e.slots[slot_of[i]];
-            sl.len = cache_positions[i] + 1;
-            sl.state_dirty = true;
-            sl.last_used = ++pool.clock;
-        }
-
-        clear_last_error();
-        return 1;
+        return q4ab_finish(e, slot_of, succeeded, n_seqs, cache_positions, logits_data, sampled_data,
+                           want_logits, trace);
     }
     // A failed flush can leave solo state only partially copied, even before
     // this call computes. Do not let callers retry the batch as solo decode.
     catch (const Q4abFlushFailure& ex) { set_last_error(ex.what()); return -1; }
     catch (const std::exception& ex) { set_last_error(ex.what()); return compute_started ? -1 : 0; }
     catch (...) { set_last_error("Unknown error in qwen4exp arena batched decode."); return compute_started ? -1 : 0; }
+}
+
+TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
+    const TSGgmlQwen4ExpFfnArgs* ffn,
+    const TSGgmlQwen4ExpGdnArgs* gdn,
+    const TSGgmlQwen4ExpAttnArgs* attn,
+    const TSGgmlQwen4ExpHeadArgs* head,
+    const TSGgmlQwen4ExpPleArgs* ple,
+    const unsigned char* kinds, int n_layers, int ple_layer,
+    int n_seqs,
+    const std::int32_t* token_ids,
+    const std::int32_t* cache_positions,
+    const std::int32_t* rope_positions,
+    const std::int32_t* cache_rows,
+    void** k_cache_arr, void** v_cache_arr,
+    void** conv_state_arr, void** ssm_state_arr, void** ple_state_arr,
+    void** attn_desc_arr, void** gdn_desc_arr, void** ple_desc_arr,
+    const TSGgmlQwen4ExpQsaArgs* const* qsa_arr,
+    const std::int32_t* const* qsa_positions_arr, const std::int32_t* qsa_position_counts,
+    int n_embd, int hc, int hc_low_rank,
+    int head_dim, int n_head, int n_head_kv, int n_rot,
+    float rope_base, float rope_freq_scale, float attn_scale,
+    int head_k_dim, int head_v_dim, int n_k_heads, int n_v_heads, int d_conv,
+    int n_expert, int n_expert_used, int n_ff, int n_ff_sh,
+    float eps, int kv_cache_type,
+    const void* token_embd_data, int token_embd_type,
+    std::int64_t token_embd_ne0, std::int64_t token_embd_ne1, std::int64_t token_embd_bytes,
+    const float* embedding_rows, const float* ple_emb,
+    float* logits_data, std::int32_t* sampled_data, int want_logits,
+    int device)
+{
+    return q4ab_decode(ffn, gdn, attn, head, ple, kinds, n_layers, ple_layer, n_seqs,
+        token_ids, cache_positions, rope_positions, cache_rows, k_cache_arr, v_cache_arr,
+        conv_state_arr, ssm_state_arr, ple_state_arr, attn_desc_arr, gdn_desc_arr, ple_desc_arr,
+        qsa_arr, qsa_positions_arr, qsa_position_counts,
+        n_embd, hc, hc_low_rank, head_dim, n_head, n_head_kv, n_rot,
+        rope_base, rope_freq_scale, attn_scale,
+        head_k_dim, head_v_dim, n_k_heads, n_v_heads, d_conv,
+        n_expert, n_expert_used, n_ff, n_ff_sh, eps, kv_cache_type,
+        token_embd_data, token_embd_type, token_embd_ne0, token_embd_ne1, token_embd_bytes,
+        embedding_rows, ple_emb, logits_data, sampled_data, want_logits,
+        device, nullptr);
+}
+
+// The batched arena step under tensor parallelism: one call for the node's `ranks` devices.
+// ffn_by_rank[r] is rank r's descriptor array (its expert and shared-expert shards) and n_ff /
+// n_ff_sh are the per-rank widths, as for TSGgml_Qwen4ExpTokenSpanTp; every other descriptor is
+// shared, each rank resolving it to its own resident copy and its own replica of the sequences'
+// state. Returns as the one-device call does: 1, 0 when declined before any rank computed (the
+// caller may decode the sequences one at a time), -1 once state may have advanced.
+TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatchedTp(
+    const TSGgmlQwen4ExpFfnArgs* const* ffn_by_rank, int ranks,
+    const TSGgmlQwen4ExpGdnArgs* gdn,
+    const TSGgmlQwen4ExpAttnArgs* attn,
+    const TSGgmlQwen4ExpHeadArgs* head,
+    const TSGgmlQwen4ExpPleArgs* ple,
+    const unsigned char* kinds, int n_layers, int ple_layer,
+    int n_seqs,
+    const std::int32_t* token_ids,
+    const std::int32_t* cache_positions,
+    const std::int32_t* rope_positions,
+    const std::int32_t* cache_rows,
+    void** k_cache_arr, void** v_cache_arr,
+    void** conv_state_arr, void** ssm_state_arr, void** ple_state_arr,
+    void** attn_desc_arr, void** gdn_desc_arr, void** ple_desc_arr,
+    const TSGgmlQwen4ExpQsaArgs* const* qsa_arr,
+    const std::int32_t* const* qsa_positions_arr, const std::int32_t* qsa_position_counts,
+    int n_embd, int hc, int hc_low_rank,
+    int head_dim, int n_head, int n_head_kv, int n_rot,
+    float rope_base, float rope_freq_scale, float attn_scale,
+    int head_k_dim, int head_v_dim, int n_k_heads, int n_v_heads, int d_conv,
+    int n_expert, int n_expert_used, int n_ff, int n_ff_sh,
+    float eps, int kv_cache_type,
+    const void* token_embd_data, int token_embd_type,
+    std::int64_t token_embd_ne0, std::int64_t token_embd_ne1, std::int64_t token_embd_bytes,
+    const float* embedding_rows, const float* ple_emb,
+    float* logits_data, std::int32_t* sampled_data, int want_logits)
+{
+    bool launched = false;
+    try
+    {
+        if (ffn_by_rank == nullptr || ranks < 2 || ranks > tsg::TSG_MAX_DEVICES ||
+            ranks != tsg::g_device_count.load(std::memory_order_acquire))
+        {
+            set_last_error("qwen4exp arena batched decode: the tensor-parallel step takes one FFN shard per device.");
+            return 0;
+        }
+        for (int r = 0; r < ranks; ++r)
+            if (ffn_by_rank[r] == nullptr)
+            {
+                set_last_error("qwen4exp arena batched decode: invalid arguments.");
+                return 0;
+            }
+        if (!tsg::tp_fused_available(ranks))
+        {
+            set_last_error("qwen4exp arena batched decode: tensor parallelism needs a device collective.");
+            return 0;
+        }
+
+        std::lock_guard<std::mutex> qlock(q4ab_mutex());
+        Q4abGuard guard;
+        std::vector<Q4abTpRank> steps(static_cast<std::size_t>(ranks));
+        std::vector<tsg::TpRankPlan*> plans(static_cast<std::size_t>(ranks), nullptr);
+        for (int r = 0; r < ranks; ++r)
+        {
+            // A rank that declines leaves the earlier ranks' joined slots as they are: nothing
+            // has computed, so they hold exactly the state they joined from.
+            steps[r].degree = ranks;
+            steps[r].rank = r;
+            steps[r].follow = r == 0 ? nullptr : &steps[0].slot_of;
+            const int status = q4ab_decode(ffn_by_rank[r], gdn, attn, head, ple, kinds, n_layers, ple_layer, n_seqs,
+                token_ids, cache_positions, rope_positions, cache_rows, k_cache_arr, v_cache_arr,
+                conv_state_arr, ssm_state_arr, ple_state_arr, attn_desc_arr, gdn_desc_arr, ple_desc_arr,
+                qsa_arr, qsa_positions_arr, qsa_position_counts,
+                n_embd, hc, hc_low_rank, head_dim, n_head, n_head_kv, n_rot,
+                rope_base, rope_freq_scale, attn_scale,
+                head_k_dim, head_v_dim, n_k_heads, n_v_heads, d_conv,
+                n_expert, n_expert_used, n_ff, n_ff_sh, eps, kv_cache_type,
+                token_embd_data, token_embd_type, token_embd_ne0, token_embd_ne1, token_embd_bytes,
+                embedding_rows, ple_emb, logits_data, sampled_data, want_logits,
+                r, &steps[r]);
+            if (status != 2) return status;
+            plans[r] = &steps[r].entry->tp_plan;
+        }
+
+        launched = true;
+        const bool executed = tsg::tp_execute_plans(plans.data(), ranks);
+        std::string failure = executed ? std::string() : g_last_error;
+        const bool trace = q4ab_trace();
+        int result = 1;
+        for (int r = 0; r < ranks; ++r)
+        {
+            // Every rank finishes (or retires its slots), whatever another rank's outcome.
+            tsg::ScopedRank rank(q4e_resolve_device(r));
+            int status = -1;
+            try
+            {
+                status = q4ab_finish(*steps[r].entry, steps[r].slot_of, executed, n_seqs, cache_positions,
+                                     logits_data, sampled_data, want_logits, trace);
+                if (status != 1 && failure.empty()) failure = g_last_error;
+            }
+            catch (const std::exception& ex) { if (failure.empty()) failure = ex.what(); }
+            catch (...) { if (failure.empty()) failure = "unknown error finishing a rank"; }
+            if (status != 1) result = -1;
+        }
+        if (result == 1) clear_last_error();
+        else set_last_error("qwen4exp arena batched decode: tensor-parallel step failed: " + failure);
+        return result;
+    }
+    catch (const Q4abFlushFailure& ex) { set_last_error(ex.what()); return -1; }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return launched ? -1 : 0; }
+    catch (...) { set_last_error("Unknown error in qwen4exp arena batched decode."); return launched ? -1 : 0; }
 }
