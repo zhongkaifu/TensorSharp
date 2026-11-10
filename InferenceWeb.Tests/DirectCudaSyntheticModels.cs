@@ -253,10 +253,12 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
     public const int HeadDim = 256;
     public const int Vocab = 256;
     public const int SsmKHeads = 2;          // ssm.group_count
-    public const int SsmVHeads = 2;          // ssm.time_step_rank (== group_count in the 0.8B)
     public const int SsmHeadDim = 128;
-    public const int SsmInner = SsmVHeads * SsmHeadDim;
     public const int SsmConv = 4;
+    /// <summary>ssm.time_step_rank: value heads (== group_count in the 0.8B; 3x it in the 27B, whose
+    /// value head h reads key head h mod group_count).</summary>
+    public int SsmVHeads { get; init; } = 2;
+    private int SsmInner => SsmVHeads * SsmHeadDim;
 
     public int Layers { get; init; } = 4;
     public int Ff { get; init; } = 448;      // 3584 / 8: not a multiple of 128 or 256
@@ -265,6 +267,9 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
     public float EmbeddingScale { get; init; } = 0.5f;
     /// <summary>Write an untied output.weight (the 0.8B ties the head to the embedding).</summary>
     public bool UntiedOutput { get; init; }
+    /// <summary>Append a NextN/MTP block (blk.{Layers}: gated full attention, dense FFN and the
+    /// nextn projection and norms), as Qwen 3.6 / 3.8 checkpoints ship.</summary>
+    public bool NextN { get; init; }
 
     /// <summary>A file whose greedy continuation depends on the history: with the tied head these
     /// small files repeat their last token (0/12 argmax changes when only the history changes);
@@ -277,7 +282,8 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
         var kv = new List<Kv>
         {
             new Str { Key = "general.architecture", V = a },
-            new U32 { Key = $"{a}.block_count", V = (uint)Layers },
+            new U32 { Key = $"{a}.block_count", V = (uint)(Layers + (NextN ? 1 : 0)) },
+            new U32 { Key = $"{a}.nextn_predict_layers", V = NextN ? 1u : 0u },
             new U32 { Key = $"{a}.context_length", V = 4096 },
             new U32 { Key = $"{a}.embedding_length", V = Hidden },
             new U32 { Key = $"{a}.feed_forward_length", V = (uint)Ff },
@@ -291,8 +297,8 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
             new U32 { Key = $"{a}.ssm.conv_kernel", V = SsmConv },
             new U32 { Key = $"{a}.ssm.state_size", V = SsmHeadDim },
             new U32 { Key = $"{a}.ssm.group_count", V = SsmKHeads },
-            new U32 { Key = $"{a}.ssm.time_step_rank", V = SsmVHeads },
-            new U32 { Key = $"{a}.ssm.inner_size", V = SsmInner },
+            new U32 { Key = $"{a}.ssm.time_step_rank", V = (uint)SsmVHeads },
+            new U32 { Key = $"{a}.ssm.inner_size", V = (uint)SsmInner },
             new U32 { Key = $"{a}.full_attention_interval", V = 4 },
             new U32 { Key = $"{a}.rope.dimension_count", V = 64 },
         };
@@ -306,12 +312,19 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
         if (UntiedOutput)
             t.Add(W(Gen("output.weight", 0.08f, Hidden, Vocab)));
         int qkvDim = 2 * SsmKHeads * SsmHeadDim + SsmInner;
-        for (int l = 0; l < Layers; l++)
+        for (int l = 0; l < Layers + (NextN ? 1 : 0); l++)
         {
             string p = $"blk.{l}.";
             t.Add(GenAround(p + "attn_norm.weight", 1f, 0.1f, Hidden));
             t.Add(GenAround(p + "post_attention_norm.weight", 1f, 0.1f, Hidden));
-            if ((l + 1) % 4 != 0)
+            if (l == Layers)
+            {
+                t.Add(W(Gen(p + "nextn.eh_proj.weight", 0.06f, 2 * Hidden, Hidden)));
+                t.Add(GenAround(p + "nextn.enorm.weight", 1f, 0.1f, Hidden));
+                t.Add(GenAround(p + "nextn.hnorm.weight", 1f, 0.1f, Hidden));
+                t.Add(GenAround(p + "nextn.shared_head_norm.weight", 1f, 0.1f, Hidden));
+            }
+            if (l < Layers && (l + 1) % 4 != 0)
             {
                 t.Add(W(Gen(p + "attn_qkv.weight", 0.06f, Hidden, qkvDim)));
                 t.Add(W(Gen(p + "attn_gate.weight", 0.06f, Hidden, SsmInner)));

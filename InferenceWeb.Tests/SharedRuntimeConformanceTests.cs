@@ -108,8 +108,15 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         // Measured on an M5 Pro (2026-11-10) with the pre-runtime per-family code: MLX sits
         // 1.2e-3 (mistral3) / 1.75e-3 (hunyuan-dense) from the managed reference on these
         // fixtures, ggml_cpu below 1e-6. The runtime reproduces those outputs bit for bit
-        // (MLX hunyuan-dense within 3e-7: its add+norm now uses MLX's fused kernel).
-        double tolerance = backend == BackendType.Mlx ? 5e-3 : 1e-3;
+        // (MLX hunyuan-dense within 3e-7: its add+norm now uses MLX's fused kernel). ggml-cuda's
+        // flash attention converts F32 K/V to F16 inside the kernel: 1.2e-3 (hunyuan-dense, RTX PRO
+        // 6000, 2026-11-10); an F16 cache (the default) stores what it reads.
+        double tolerance = backend switch
+        {
+            BackendType.Mlx => 5e-3,
+            BackendType.GgmlCuda => 2.5e-3,
+            _ => 1e-3,
+        };
         for (int i = 0; i < reference.Count; i++)
         {
             double rel = RelL2(actual[i], reference[i]);
@@ -187,7 +194,9 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture(family);
-        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(family, path, 1, 1, TestGates.PinnedGgmlBackend), family);
+        // ggml_cuda / ggml_cpu round a verify window's activations differently than one row's.
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(family, path, 1, 1, TestGates.PinnedGgmlBackend), family,
+            tieTolerance: TestGates.PinnedGgmlBackend is BackendType.GgmlCuda or BackendType.GgmlCpu ? 1e-2 : 0);
     }
 
     /// <summary>A shared-prefix checkpoint, cloned or written to a file and read back, continues exactly.</summary>

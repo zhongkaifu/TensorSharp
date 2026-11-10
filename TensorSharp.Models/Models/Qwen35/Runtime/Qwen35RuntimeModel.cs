@@ -73,6 +73,9 @@ namespace TensorSharp.Models
             // NextN / MTP draft blocks are counted in block_count but are not decoder layers.
             int nextn = (int)_gguf.GetUint32($"{arch}.nextn_predict_layers", 0);
             Config.NumLayers -= nextn;
+            // The NextN/MTP block drafts on one device (multi-device drafting comes with the graph
+            // lowering of tensor parallelism and layer split).
+            _draftLayers = layerSplitDegree <= 1 && tpDegree <= 1 && tpGroup == null ? Math.Min(nextn, 1) : 0;
 
             int interval = (int)_gguf.GetUint32($"{arch}.full_attention_interval", 4);
             _isRecurrent = new bool[Config.NumLayers];
@@ -131,34 +134,18 @@ namespace TensorSharp.Models
 
         protected override bool IsRecurrentLayer(int layer) => _isRecurrent[layer];
 
-        /// <summary>One device or whole-layer stages: the device recurrence's packed
-        /// in-projection, built before residency releases the host copies (under tensor
+        /// <summary>One device or whole-layer stages: the in-projection packed into one product where
+        /// the four sources share a quantized type (rows move as they are), before residency releases
+        /// the host copies. Mixed types stay four products (the graph lowering runs them; under tensor
         /// parallelism ShardRecurrentLayer packs per rank instead).</summary>
         protected override void PrepareLoadedWeights()
         {
-            if (!DeviceRecurrence || Mesh.TensorParallel != 1) return;
+            if (!(DeviceRecurrence || MlxRecurrence) || Mesh.TensorParallel != 1) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                if (!_isRecurrent[l] || !OwnsLayer(l)) continue;
-                // A single-device graph runs the four projections as they were quantized (as the
-                // fused graphs do); packing mixed types would mean a dense F32 copy (16 GB on a
-                // mixed-quant 27B). Pack at load only where the per-op block is the serving path.
-                if (!InProjectionSharesType(l) && GraphServesPlacement) continue;
+                if (!_isRecurrent[l] || !OwnsLayer(l) || !InProjectionSharesType(l)) continue;
                 int layer = l;
                 PackInProjection(layer, 1, 0, 1, _ => AllocatorForWeight($"blk.{layer}.attn_qkv.weight"));
-            }
-        }
-
-        /// <summary>Whether single-device steps run as whole-forward graphs (they then use the
-        /// projections unpacked when their types differ).</summary>
-        private bool GraphServesPlacement
-        {
-            get
-            {
-                if (!IsGgmlBackend || !Mesh.IsSingleDevice || LayerSplitGroup != null) return false;
-                for (int l = 0; l < Config.NumLayers; l++)
-                    if (MoeCpuOffloadConfig.IsLayerOnCpu(l) && HasWeight($"blk.{l}.ffn_gate_inp.weight")) return false;
-                return true;
             }
         }
 
@@ -182,8 +169,13 @@ namespace TensorSharp.Models
         }
 
         /// <summary>The MTP draft block (layers past the decoder stack) is not loaded.</summary>
+        private readonly int _draftLayers;
+
+        protected override int DraftLayerCount => _draftLayers;
+
+        /// <summary>Decoder layers and, on one device, the NextN/MTP draft layer.</summary>
         protected override bool ShouldLoadWeight(GgufTensorInfo info)
-            => !(LayerSplitPlan.TryGetLayer(info.Name, out int layer) && layer >= Config.NumLayers)
+            => !(LayerSplitPlan.TryGetLayer(info.Name, out int layer) && layer >= Config.NumLayers + _draftLayers)
                && base.ShouldLoadWeight(info);
 
         // ---------------------------------------------------------------- attention
@@ -353,8 +345,10 @@ namespace TensorSharp.Models
             int vHeads = _numVHeads / ShardDegree;
             int kHeads = _numKHeads / ShardDegree;
             int channels = 2 * kHeads * _headKDim + vHeads * _headVDim;
-            return DeviceRecurrence
-                ? new DeviceGdnState(scope.Allocator, HostPointer, _convKernel - 1, channels, vHeads, _headVDim, _headKDim)
+            if (DeviceRecurrence)
+                return new DeviceGdnState(scope.Allocator, HostPointer, _convKernel - 1, channels, vHeads, _headVDim, _headKDim);
+            return MlxRecurrence
+                ? new MlxGdnState(_convKernel - 1, channels, vHeads, _headVDim, _headKDim)
                 : new GdnState(_convKernel - 1, channels, vHeads, _headVDim, _headKDim);
         }
 
@@ -362,6 +356,8 @@ namespace TensorSharp.Models
         {
             if (state is DeviceGdnState device)
                 return DeviceGatedDeltaNet(scope, normed, layer, device);
+            if (state is MlxGdnState mlx)
+                return MlxGatedDeltaNet(scope, normed, layer, mlx);
             string p = $"blk.{layer}.";
             var gdn = (GdnState)state;
             int tokens = (int)normed.Sizes[0];

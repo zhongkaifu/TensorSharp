@@ -35,6 +35,7 @@ namespace TensorSharp.Models
             public RecurrentState[][] Recurrent;   // [layer][rank]; hybrid stacks only
             public float[] Logits;                 // reused by batched steps
             public bool DeviceDirty;               // a graph wrote its rows/state in device memory
+            public int DraftStart;                 // the draft layers attend to rows from here on
         }
 
         /// <summary>Rows of a batched step: sequence s owns rows [QueryStart[s], QueryStart[s] + Counts[s])
@@ -94,6 +95,7 @@ namespace TensorSharp.Models
             Length = _cacheSeqLen,
             Recurrent = _recurrentPrimary,
             DeviceDirty = _cacheDeviceDirty,
+            DraftStart = _draftStart,
         };
 
         private void LoadActive(Slot slot)
@@ -104,7 +106,11 @@ namespace TensorSharp.Models
             _cacheSeqLen = slot.Length;
             _recurrentPrimary = slot.Recurrent;
             _cacheDeviceDirty = slot.DeviceDirty;
+            _draftStart = slot.DraftStart;
         }
+
+        // The active cache's draft-layer floor (see Slot.DraftStart).
+        private int _draftStart;
 
         // A whole-forward graph wrote the active cache/state in device memory.
         private bool _cacheDeviceDirty;
@@ -163,6 +169,7 @@ namespace TensorSharp.Models
                 Slot pooled = _slotPool[^1];
                 _slotPool.RemoveAt(_slotPool.Count - 1);
                 pooled.Length = 0;
+                pooled.DraftStart = 0;
                 ClearGraphCache();
                 ResetStates(pooled.Recurrent);
                 return pooled;
@@ -176,12 +183,12 @@ namespace TensorSharp.Models
         private (Tensor[][] K, Tensor[][] V) AllocateCaches(int capacity)
         {
             DType dtype = _kvCacheDtype.ToDType();
-            var k = new Tensor[Config.NumLayers][];
-            var v = new Tensor[Config.NumLayers][];
-            for (int l = 0; l < Config.NumLayers; l++)
+            var k = new Tensor[TotalLayers][];
+            var v = new Tensor[TotalLayers][];
+            for (int l = 0; l < TotalLayers; l++)
             {
                 if (!OwnsLayer(l) || _recurrentLayer[l]) continue;
-                int stage = _mesh.StageOf(l);
+                int stage = StageOfLayer(l);
                 k[l] = new Tensor[_mesh.TensorParallel];
                 v[l] = new Tensor[_mesh.TensorParallel];
                 for (int r = 0; r < _mesh.TensorParallel; r++)

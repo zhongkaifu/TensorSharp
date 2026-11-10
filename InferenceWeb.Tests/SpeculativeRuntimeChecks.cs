@@ -15,35 +15,80 @@ internal static class SpeculativeRuntimeChecks
 {
     /// <summary>Greedy speculation with n-gram drafts over a repetitive prompt (drafts both accepted and
     /// rejected) emits exactly the plain greedy tokens, and the verify path actually ran.</summary>
-    public static void AssertMatchesPlainGreedy(Func<ModelBase> create, string label, int maxNew = 24)
+    /// <param name="tieTolerance">On a backend whose kernels round activations differently for a
+    /// verify window than for one row (ggml_cuda, ggml_cpu), the streams may part only where plain
+    /// greedy's top two logits are within this relative margin, and only to the runner-up; 0
+    /// (exact backends) requires the streams to be equal.</param>
+    public static void AssertMatchesPlainGreedy(Func<ModelBase> create, string label, int maxNew = 24, double tieTolerance = 0)
     {
         int[] prompt = Enumerable.Range(0, 12).Select(i => 40 + i % 6).Concat(Enumerable.Range(0, 9).Select(i => 40 + i % 6)).ToArray();
-
-        var plain = new List<int>();
-        using (ModelBase model = create())
-        {
-            float[] logits = model.ForwardRefill(prompt);
-            for (int i = 0; i < maxNew; i++)
-            {
-                int token = ArgMax(logits);
-                plain.Add(token);
-                logits = model.Forward(new[] { token });
-            }
-        }
+        List<Greedy> plain = PlainGreedy(create, prompt, maxNew);
 
         using ModelBase target = create();
         var spec = Assert.IsAssignableFrom<ISpeculativeTarget>(target);
         Assert.Null(spec.SpeculationRefusal);
         // Drafts from the known continuation, wrong at their third token every other time: verifies
         // are both fully and partly accepted, whatever the model's own repetition.
-        var decoder = new SpeculativeDecoder(spec, new ScriptedSpeculator(prompt.Concat(plain).ToArray(), target.Config.VocabSize));
+        var decoder = new SpeculativeDecoder(spec, new ScriptedSpeculator(prompt.Concat(plain.Select(g => g.Token)).ToArray(), target.Config.VocabSize));
         List<int> drafted = decoder.GenerateGreedy(prompt, maxNew);
-        Assert.Equal(plain.Take(drafted.Count), drafted);
+        AssertSameStream(plain, drafted, tieTolerance, label);
         Assert.Equal(maxNew, drafted.Count);
         // The verify path ran, and some drafts were rejected (the prefix commit, not just a full accept).
         Assert.True(decoder.VerifySteps > 0, $"{label}: no verify ran");
         Assert.True(decoder.TokensAccepted > 0, $"{label}: no draft was accepted");
         Assert.True(decoder.TokensAccepted < decoder.TokensDrafted, $"{label}: every draft was accepted ({decoder.TokensAccepted})");
+    }
+
+    /// <summary>Greedy speculation through the model's own per-token draft head (NextN/MTP) emits
+    /// exactly the plain greedy tokens: drafting, catch-up and the fused catch-up step ran.</summary>
+    public static void AssertDraftHeadMatchesPlainGreedy(Func<ModelBase> create, string label, int maxNew = 24, double tieTolerance = 0)
+    {
+        int[] prompt = Enumerable.Range(0, 21).Select(i => 40 + (i * 7) % 23).ToArray();
+        List<Greedy> plain = PlainGreedy(create, prompt, maxNew);
+
+        using ModelBase target = create();
+        var spec = Assert.IsAssignableFrom<ISpeculativeModel>(target);
+        Assert.Null(spec.SpeculationRefusal);
+        Assert.Equal(DraftHeadKind.PerToken, spec.DraftHeadKind);
+        // Gate 0: every step drafts its whole window, whatever the (random) head's confidence.
+        var speculator = new DraftHeadSpeculator(spec, target.Config.VocabSize, spec.SpecFeatureSize, 3) { MinDraftProb = 0 };
+        var decoder = new SpeculativeDecoder(spec, speculator);
+        List<int> drafted = decoder.GenerateGreedy(prompt, maxNew);
+        AssertSameStream(plain, drafted, tieTolerance, label);
+        Assert.Equal(maxNew, drafted.Count);
+        Assert.True(decoder.VerifySteps > 0, $"{label}: no verify ran");
+        Assert.True(decoder.TokensDrafted > 0, $"{label}: the head drafted nothing");
+    }
+
+    private readonly record struct Greedy(int Token, int RunnerUp, double RelativeMargin);
+
+    private static List<Greedy> PlainGreedy(Func<ModelBase> create, int[] prompt, int maxNew)
+    {
+        var plain = new List<Greedy>();
+        using ModelBase model = create();
+        float[] logits = model.ForwardRefill(prompt);
+        for (int i = 0; i < maxNew; i++)
+        {
+            int best = ArgMax(logits), second = -1;
+            for (int v = 0; v < logits.Length; v++)
+                if (v != best && (second < 0 || logits[v] > logits[second])) second = v;
+            plain.Add(new Greedy(best, second, (logits[best] - logits[second]) / Math.Max(Math.Abs(logits[best]), 1e-6)));
+            logits = model.Forward(new[] { best });
+        }
+        return plain;
+    }
+
+    /// <summary>Equal streams, or (with a tie tolerance) equal up to a near-tie of plain greedy where the
+    /// speculative stream took the runner-up; after that the two continue from different tokens.</summary>
+    private static void AssertSameStream(List<Greedy> plain, List<int> drafted, double tieTolerance, string label)
+    {
+        for (int i = 0; i < Math.Min(plain.Count, drafted.Count); i++)
+        {
+            if (plain[i].Token == drafted[i]) continue;
+            Assert.True(tieTolerance > 0 && plain[i].RelativeMargin <= tieTolerance && drafted[i] == plain[i].RunnerUp,
+                $"{label}: token {i} is {drafted[i]}, plain greedy {plain[i].Token} (runner-up {plain[i].RunnerUp}, relative margin {plain[i].RelativeMargin:E2})");
+            return;
+        }
     }
 
     /// <summary>Proposes the next tokens of a known sequence, corrupting the third draft of every other

@@ -190,23 +190,45 @@ namespace TensorSharp.Models
                 return false;
             }
 
-            int n = slots.Length;
             int rows = (int)hidden.Sizes[0];
             bool replayable = true;
             foreach (int c in counts) replayable &= c <= SmallChunkRows;
+            CachedGraph graph = RunTraced(rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, 0,
+                step => EmitStep(step, hidden, request), out StepOutputs outputs, out bool owned);
+            if (graph == null) return false;
+            // A replayed graph's buffers are rewritten by its next run (the model-owned buffer
+            // contract); a one-shot graph's arrays are the caller's.
+            result = new GraphResult
+            {
+                Logits = outputs.Logits >= 0 ? graph.Outputs[outputs.Logits] : null,
+                Final = outputs.Final >= 0 ? graph.Outputs[outputs.Final] : null,
+                Captures = outputs.Captures == null ? null : Array.ConvertAll(outputs.Captures, i => graph.Outputs[i]),
+            };
+            if (owned) graph.Dispose();
+            return true;
+        }
 
-            // A replayable step first traces in hash-only mode: when a cached graph has the same
-            // signature it replays with this step's inputs, and nothing else is recorded.
+        /// <summary>
+        /// Trace <paramref name="emit"/> and run it: a replayable step first traces in hash-only
+        /// mode and replays the cached graph with the same signature (only this step's inputs are
+        /// recorded); otherwise the trace is recorded and built (and cached when replayable).
+        /// Returns the graph whose outputs hold the results (the caller disposes it when
+        /// <paramref name="owned"/>), or null when the lowering met a case it does not express
+        /// (nothing was run).
+        /// </summary>
+        private CachedGraph RunTraced(int rows, Slot[] slots, int[] first, int[] counts, int[] starts, bool replayable,
+            bool snapshots, int attentionFloor, Func<GraphStep, StepOutputs> emit, out StepOutputs outputs, out bool owned)
+        {
             GraphStep step = null;
             CachedGraph graph = null;
-            bool owned = false;
-            StepOutputs outputs = default;
+            owned = false;
+            outputs = default;
             try
             {
                 if (replayable && _graphCache.Count > 0)
                 {
-                    step = new GraphStep(this, rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, record: false);
-                    outputs = EmitStep(step, hidden, request);
+                    step = new GraphStep(this, rows, slots, first, counts, starts, replayable, snapshots, record: false) { AttentionFloor = attentionFloor };
+                    outputs = emit(step);
                     if (_graphCache.TryGetValue(step.Signature, out graph))
                     {
                         _graphLru.Remove(step.Signature);
@@ -221,8 +243,8 @@ namespace TensorSharp.Models
                 }
                 if (graph == null)
                 {
-                    step = new GraphStep(this, rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, record: true);
-                    outputs = EmitStep(step, hidden, request);
+                    step = new GraphStep(this, rows, slots, first, counts, starts, replayable, snapshots, record: true) { AttentionFloor = attentionFloor };
+                    outputs = emit(step);
                     graph = step.Build(replayable, reorder: replayable && GraphReorderOnMetal);
                     if (replayable)
                     {
@@ -247,26 +269,59 @@ namespace TensorSharp.Models
                     throw new InvalidOperationException($"{Config.Architecture} graph step failed: {GgmlBasicOps.LastNativeError()}");
                 GraphRuns++;
                 foreach (Slot slot in slots) slot.DeviceDirty = true;
-                // A replayed graph's buffers are rewritten by its next run (the model-owned buffer
-                // contract); a one-shot graph's arrays are the caller's.
-                result = new GraphResult
-                {
-                    Logits = outputs.Logits >= 0 ? graph.Outputs[outputs.Logits] : null,
-                    Final = outputs.Final >= 0 ? graph.Outputs[outputs.Final] : null,
-                    Captures = outputs.Captures == null ? null : Array.ConvertAll(outputs.Captures, i => graph.Outputs[i]),
-                };
-                return true;
+                return graph;
             }
             catch (InvalidOperationException) when (step != null && step.Rejected)
             {
                 // The lowering met a case it does not express; nothing was built or run.
+                if (owned) graph?.Dispose();
+                owned = false;
                 ClearGraphCache();
-                return false;
+                return null;
+            }
+            catch
+            {
+                if (owned) graph?.Dispose();
+                throw;
             }
             finally
             {
                 step?.Dispose();
-                if (owned) graph?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// One layer's recurrent mixer as its own graph, for the per-op path where the family's
+        /// lowering is the implementation for these weights: <paramref name="raw"/> is the layer input
+        /// [rows, hidden] (its norm runs in the graph), <paramref name="state"/> the sequence's state,
+        /// host-current before and after (the per-op path's invariant). Returns [rows, hidden].
+        /// </summary>
+        protected Tensor RunRecurrentMixerGraph(RankScope scope, Tensor raw, int layer, RecurrentState state)
+        {
+            int rows = (int)raw.Sizes[0], hiddenSize = Config.HiddenSize;
+            var slot = new Slot { Recurrent = new RecurrentState[TotalLayers][] };
+            slot.Recurrent[layer] = new[] { state };
+            CachedGraph graph = RunTraced(rows, new[] { slot }, new[] { 0 }, new[] { rows }, new[] { 0 },
+                replayable: rows <= SmallChunkRows, snapshots: false, attentionFloor: 0,
+                step =>
+                {
+                    int x = step.RmsNorm(step.Input(raw, hiddenSize, rows), LayerName(layer, "attn_norm.weight"));
+                    return new StepOutputs { Logits = -1, Final = step.Output(EmitRecurrentMixer(step, layer, x), (long)hiddenSize * rows) };
+                },
+                out StepOutputs outputs, out bool owned);
+            if (graph == null)
+                throw new NotSupportedException($"{Config.Architecture}: layer {layer}'s recurrent mixer cannot run as a graph.");
+            try
+            {
+                foreach (Tensor t in state.HostTensors) SyncStateTensor(t);
+                var result = new Tensor(scope.Allocator, DType.Float32, rows, hiddenSize);
+                result.SetElementsAsFloat(graph.Outputs[outputs.Final]);
+                HostWritten(result);
+                return result;
+            }
+            finally
+            {
+                if (owned) graph.Dispose();
             }
         }
 
@@ -577,6 +632,8 @@ namespace TensorSharp.Models
             public bool IsDecode { get; }
             /// <summary>Keep the recurrent state after every row (a verify window).</summary>
             public bool RecurrentSnapshots { get; }
+            /// <summary>Cache rows below this are masked out (a draft layer that resumed after a gap).</summary>
+            public int AttentionFloor { get; init; }
             /// <summary>Token positions [rows] (I32).</summary>
             public int Positions { get; private set; } = -1;
             /// <summary>The positions' values (row order).</summary>
@@ -760,7 +817,10 @@ namespace TensorSharp.Models
                 if (_decodeMask >= 0 && _decodeMaskWindow == window && _decodeMaskValid == start * 64 + count) return _decodeMask;
                 var mask = new ushort[(long)window * count];
                 for (int q = 0; q < count; q++)
-                    for (int k = start + q + 1; k < window; k++) mask[(long)q * window + k] = 0xFC00;   // -inf
+                {
+                    for (int k = 0; k < Math.Min(AttentionFloor, window); k++) mask[(long)q * window + k] = 0xFC00;   // -inf
+                    for (int k = start + q + 1; k < window; k++) mask[(long)q * window + k] = 0xFC00;
+                }
                 _decodeMask = Leaf(GgmlLeafRole.Input, GgmlType.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
                 AddInput(_decodeMask, Pin(mask), mask.LongLength * sizeof(ushort));
                 _decodeMaskWindow = window;
@@ -775,7 +835,10 @@ namespace TensorSharp.Models
                 int kv = start + count;
                 var mask = new ushort[(long)kv * count];
                 for (int qi = 0; qi < count; qi++)
+                {
+                    for (int ki = 0; ki < Math.Min(AttentionFloor, kv); ki++) mask[(long)qi * kv + ki] = 0xFC00;
                     for (int ki = start + qi + 1; ki < kv; ki++) mask[(long)qi * kv + ki] = 0xFC00;
+                }
                 _mask = Leaf(GgmlLeafRole.Input, GgmlType.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
                 AddInput(_mask, Pin(mask), mask.LongLength * sizeof(ushort));
                 _maskStart = start;

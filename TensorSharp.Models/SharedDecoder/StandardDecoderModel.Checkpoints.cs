@@ -83,7 +83,8 @@ namespace TensorSharp.Models
         {
             SyncToHost(source);
             int capacity = Math.Min(_maxContextLength, Math.Max(FreshSlotTokens, capacityTokens));
-            var slot = new Slot { Capacity = capacity, Length = source.Length, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
+            var slot = new Slot { Capacity = capacity, Length = source.Length, DraftStart = source.DraftStart,
+                Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
             (slot.K, slot.V) = AllocateCaches(capacity);
             CopyRowsOnHost(source.K, slot.K, source.Length);
             CopyRowsOnHost(source.V, slot.V, source.Length);
@@ -183,6 +184,7 @@ namespace TensorSharp.Models
                         if (layer != null)
                             foreach (RecurrentState state in layer) state?.OnHostWritten();
                 slot.Length = length;
+                slot.DraftStart = length;   // the file holds no draft-layer rows
                 _retainedSlots.Add(key, slot);
                 return true;
             }

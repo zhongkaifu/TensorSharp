@@ -37,9 +37,23 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Set the active request's recurrent states to those after <paramref name="kept"/>
-        /// rows of the last <paramref name="rows"/>-row verify (0: before it). Hybrid stacks only.</summary>
+        /// rows of the last <paramref name="rows"/>-row verify (0: before it). Hybrid stacks only. The
+        /// per-op path's states keep their own window (<see cref="RecurrentState.BeginVerify"/>); a
+        /// family whose graphs keep it in device buffers overrides this.</summary>
         protected virtual void CommitRecurrentPrefix(int kept, int rows)
-            => throw new NotSupportedException($"{Config.Architecture} keeps no recurrent snapshots.");
+        {
+            foreach (RecurrentState state in ActiveRecurrentStates())
+                state.CommitVerify(kept);
+        }
+
+        private System.Collections.Generic.IEnumerable<RecurrentState> ActiveRecurrentStates()
+        {
+            if (_recurrentPrimary == null) yield break;
+            foreach (RecurrentState[] layer in _recurrentPrimary)
+                if (layer != null)
+                    foreach (RecurrentState state in layer)
+                        if (state != null) yield return state;
+        }
 
         /// <summary>The active request's recurrent state of (layer, rank 0).</summary>
         protected RecurrentState ActiveRecurrentState(int layer) => _recurrentPrimary?[layer]?[0];
@@ -51,9 +65,9 @@ namespace TensorSharp.Models
         protected void AttachDraftModel(string draftModelPath)
         {
             if (string.IsNullOrEmpty(draftModelPath)) return;
-            if (GraphUnsupportedReason() is { } reason)
+            if (SpeculationRefusal is { } reason)
             {
-                Console.WriteLine($"  Draft model '{System.IO.Path.GetFileName(draftModelPath)}' not attached: speculative decoding runs on whole-forward graphs ({reason}).");
+                Console.WriteLine($"  Draft model '{System.IO.Path.GetFileName(draftModelPath)}' not attached: {reason}.");
                 return;
             }
             LoadDFlashDraftWeights(draftModelPath);
@@ -61,10 +75,21 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- the trunk
 
-        /// <summary>Speculation verifies on whole-forward graphs; elsewhere the engine decodes plainly.</summary>
-        public string SpeculationRefusal => GraphUnsupportedReason() is { } reason
-            ? $"speculative decoding runs on whole-forward graphs ({reason})"
-            : null;
+        /// <summary>Speculation verifies on whole-forward graphs, or off them (MLX, direct CUDA, the
+        /// managed CPU) on one device whose recurrent states keep a verify window.</summary>
+        public string SpeculationRefusal
+        {
+            get
+            {
+                if (GraphUnsupportedReason() is not { } reason) return null;
+                if (!_mesh.IsSingleDevice || LayerSplitGroup != null)
+                    return $"speculative decoding off whole-forward graphs ({reason}) runs on one device";
+                foreach (RecurrentState state in ActiveRecurrentStates())
+                    if (!state.SupportsVerify)
+                        return $"speculative decoding off whole-forward graphs ({reason}) needs recurrent states that keep a verify window";
+                return null;
+            }
+        }
 
         public bool SpeculationProfitable => SpeculationRefusal == null;
 
@@ -134,6 +159,12 @@ namespace TensorSharp.Models
                 CaptureFinal = !dflash && hAllOut != null,
                 RecurrentSnapshots = _anyRecurrent && rows > 1 && rows <= SmallChunkRows,
             };
+            if (GraphUnsupportedReason() != null)
+            {
+                if (SpeculationRefusal is { } refusal) throw new NotSupportedException(refusal);
+                SpecForwardPerOp(tokens, hAllOut, logitsOut, allLogitsRows, request);
+                return;
+            }
             Tensor hidden = Embedding(tokens);
             GraphResult result;
             _forwardSw.Start();
@@ -154,18 +185,73 @@ namespace TensorSharp.Models
             int vocab = Config.VocabSize;
             long logitFloats = allLogitsRows ? (long)rows * vocab : vocab;
             Array.Copy(result.Logits, 0, logitsOut, 0, Math.Min(logitFloats, logitsOut.LongLength));
+            WriteSpecFeatures(hAllOut, rows, result.Captures, result.Final);
+        }
 
-            if (hAllOut == null || hAllOut.LongLength == 0) return;
-            if (dflash)
+        /// <summary>The verify off the graphs: the per-op layers with the drafter's rows captured, every
+        /// row's logits when asked, and the recurrent states keeping the window.</summary>
+        private void SpecForwardPerOp(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows, GraphRequest request)
+        {
+            int rows = tokens.Length, start = _cacheSeqLen, hiddenSize = Config.HiddenSize;
+            int[] captureLayers = request.CaptureLayers;
+            var captures = captureLayers.Length > 0 ? new float[captureLayers.Length][] : null;
+            float[] final = null;
+            if (request.RecurrentSnapshots)
+                foreach (RecurrentState state in ActiveRecurrentStates()) state.BeginVerify();
+            _forwardSw.Start();
+            try
             {
-                // Row-major [rows][target layers][hidden]; a buffer too small for every row takes the last.
+                EnterStage(0);
+                Tensor hidden = Embedding(tokens);
+                hidden = RunLayers(hidden, TokenPositions.Contiguous(start, rows), batch: null, (layer, input) =>
+                {
+                    for (int c = 0; c < captureLayers.Length; c++)
+                        if (captureLayers[c] == layer) captures[c] = input.GetElementsAsFloat(rows * hiddenSize);
+                });
+                for (int c = 0; c < captureLayers.Length; c++)
+                    if (captureLayers[c] >= Config.NumLayers) captures[c] = hidden.GetElementsAsFloat(rows * hiddenSize);
+                if (request.CaptureFinal)
+                {
+                    using Tensor normed = RMSNormOp(hidden, "output_norm.weight");
+                    final = normed.GetElementsAsFloat(rows * hiddenSize);
+                }
+                var which = new int[allLogitsRows ? rows : 1];
+                for (int i = 0; i < which.Length; i++) which[i] = allLogitsRows ? i : rows - 1;
+                float[] logits = ProjectRows(hidden, which);
+                hidden.Dispose();
+                Array.Copy(logits, 0, logitsOut, 0, Math.Min(logits.LongLength, logitsOut.LongLength));
+            }
+            catch
+            {
+                if (request.RecurrentSnapshots)
+                    foreach (RecurrentState state in ActiveRecurrentStates()) state.CommitVerify(0);
+                throw;
+            }
+            finally
+            {
+                EnterStage(0);
+                _forwardSw.Stop();
+            }
+            _cacheSeqLen += rows;
+            _verifyRows = request.RecurrentSnapshots ? rows : 0;
+            WriteSpecFeatures(hAllOut, rows, captures, final);
+        }
+
+        /// <summary>The drafter's rows: DFlash's target-layer residuals row-major [rows][layers][hidden],
+        /// or the final-normed rows; a buffer too small for every row takes the last.</summary>
+        private void WriteSpecFeatures(float[] hAllOut, int rows, float[][] captures, float[] final)
+        {
+            if (hAllOut == null || hAllOut.LongLength == 0) return;
+            int hiddenSize = Config.HiddenSize;
+            if (HasDFlash)
+            {
                 int feat = DFlashSettings.FeatureSize;
                 bool all = hAllOut.LongLength >= (long)rows * feat;
                 if (!all && hAllOut.LongLength < feat)
                     throw new ArgumentException($"DFlash hidden capture buffer holds {hAllOut.LongLength} floats; one feature row needs {feat}.", nameof(hAllOut));
-                for (int c = 0; c < result.Captures.Length; c++)
+                for (int c = 0; c < captures.Length; c++)
                 {
-                    float[] layer = result.Captures[c];
+                    float[] layer = captures[c];
                     if (all)
                         for (int r = 0; r < rows; r++)
                             Array.Copy(layer, (long)r * hiddenSize, hAllOut, (long)r * feat + (long)c * hiddenSize, hiddenSize);
@@ -177,9 +263,9 @@ namespace TensorSharp.Models
             {
                 long floats = Math.Min(hAllOut.LongLength, (long)rows * hiddenSize);
                 if (floats >= (long)rows * hiddenSize)
-                    Array.Copy(result.Final, 0, hAllOut, 0, floats);
+                    Array.Copy(final, 0, hAllOut, 0, floats);
                 else
-                    Array.Copy(result.Final, (long)(rows - 1) * hiddenSize, hAllOut, 0, hiddenSize);
+                    Array.Copy(final, (long)(rows - 1) * hiddenSize, hAllOut, 0, hiddenSize);
             }
         }
 
@@ -197,12 +283,15 @@ namespace TensorSharp.Models
             CommitRecurrentPrefix(kept, rows);
         }
 
-        /// <summary>Back to the state before the last verify: until its commit the live state is that state.</summary>
+        /// <summary>Back to the state before the last verify (the graphs' live state still is; the per-op
+        /// path's states restore the one they kept).</summary>
         public void SpecRestoreRecurrentState()
         {
             if (_verifyRows > 1)
             {
+                int rows = _verifyRows;
                 _verifyRows = 0;
+                CommitRecurrentPrefix(0, rows);
                 return;
             }
             if (_anyRecurrent)
@@ -222,7 +311,7 @@ namespace TensorSharp.Models
         public override void WarmUpKernels()
         {
             base.WarmUpKernels();
-            if (!HasDFlash || SpeculationRefusal != null) return;
+            if (!HasDFlash || GraphUnsupportedReason() != null) return;
             int widest = Math.Min(SmallChunkRows, Math.Max(2, Math.Max(SpecPreferredDraftWindow, 1) + 1));
             int safeToken = Config.VocabSize > 1 ? 1 : 0;
             var started = System.Diagnostics.Stopwatch.StartNew();
@@ -243,7 +332,7 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- the draft head
 
-        public DraftHeadKind DraftHeadKind => HasDFlash ? DraftHeadKind.Block : DraftHeadKind.None;
+        public DraftHeadKind DraftHeadKind => HasDFlash ? DraftHeadKind.Block : HasDraftLayer ? DraftHeadKind.PerToken : DraftHeadKind.None;
 
         public int DraftBlockSize => HasDFlash ? DFlashSettings.MaxDraftTokens : 0;
 
@@ -256,8 +345,13 @@ namespace TensorSharp.Models
 
         public void DraftCatchUp(int[] tokens, float[] hRows, int startPos)
         {
-            if (!HasDFlash) throw new InvalidOperationException($"{Config.Architecture} has no draft head.");
-            DFlashCommit(tokens, hRows, startPos);
+            if (HasDFlash)
+            {
+                DFlashCommit(tokens, hRows, startPos);
+                return;
+            }
+            if (!HasDraftLayer) throw new InvalidOperationException($"{Config.Architecture} has no draft head.");
+            DraftLayerCatchUp(tokens, hRows, startPos);
         }
     }
 }

@@ -586,6 +586,51 @@ within about 0.3% of it (Metal 50.13, MLX 50.09-50.14), and the runtime is the c
 CUDA arms, so this is rounding, not a quality loss. Qwen keeps `Qwen35Model` on one device until
 CUDA prefill and the features below reach parity.
 
+### 6.7 Speculation, draft layers and MLX
+
+**Draft layers.** A NextN / MTP block (`blk.{NumLayers}`: `nextn.enorm` / `hnorm` / `eh_proj`, one
+decoder layer, `shared_head_norm` and the trunk's head) is a draft layer of the runtime
+(`StandardDecoderModel.Draft.cs`): the family declares `DraftLayerCount`, the slot carries its K/V
+rows like any other layer, and the draft step is emitted with the same attention / FFN / expert
+code as the trunk, as a replayable graph (or per op off the graphs). A head that resumes after a
+gap (prefix reuse, plain steps) masks the cache rows below the resume point (`AttentionFloor`)
+instead of keeping a second cache. A catch-up emits only the layer's K/V writes. Qwen3.8-27B
+UD-IQ3_XXS, coding prompt, 9 agent turns, greedy:
+
+| | legacy MTP (`Qwen35Model`) | runtime MTP |
+|---|---|---|
+| ggml_metal (M5 Pro), mean tok/s | 21.3 | 26.7 |
+| accepted / drafted | 225 / 372 | 226 / 371 |
+| ggml_cuda (RTX PRO 6000), mean tok/s | 28.8 | 36.3 |
+| accepted / drafted | 145 / 328 | 146 / 312 |
+
+Text equals plain greedy on both backends through the runtime; on CUDA `Qwen35Model`'s MTP output
+does not (its plain text equals the runtime's). DFlash2 on the same CUDA GPU: 45.9 / 46.4 tok/s
+legacy vs 45.6 / 44.8 runtime (two rounds, 9 turns each).
+
+**Speculation off the graphs.** Where whole-forward graphs do not apply (MLX, direct CUDA, the
+managed CPU) a single-device verify runs per op: `SpecForward` captures the drafter's rows
+(DFlash target-layer inputs or the final-normed rows) and every row's logits, and recurrent
+states that implement `BeginVerify` / `CommitVerify` keep the state before the window and after
+each row (MLX: the Gated DeltaNet scan runs the window row by row and keeps each row's arrays; a
+copy is a reference, MLX arrays being immutable). The draft layer has the same per-op form, its
+attention floored through MLX's cached SDPA. Qwen3.8-27B on MLX, MTP: 24-31 tok/s against 19-20
+plain; 160 tokens equal to plain greedy on MLX and ggml_metal with the same acceptance (111 / 132).
+
+**MLX.** The runtime's Gated DeltaNet on MLX runs MLX's fused kernels with the state in MLX
+arrays (it ran on the host: Qwen3.5-0.8B 277 / 50 tok/s); attention reads the cache through a
+strided view under MLX's fused SDPA (mlx-lm's update-and-fetch), decode and prompt chunks alike;
+the lazy graph is handed to the GPU every 4 layers. Real generation (9 agent turns), tok/s:
+Qwen3.5-0.8B 191 vs `Qwen35Model` 175; Qwen3.8-27B 19.3-20.0 vs 20.3; Hy-MT2 140 vs main 34;
+Ministral 95 vs main 29. Prompt: 0.8B 10,970 vs 11,744 at 512 tokens, 10,772 vs 12,454 at 2,048
+(open). Perplexity of Qwen3.8-27B on 2 x 512 tokens: ggml_metal 24.48, runtime MLX 24.54,
+`Qwen35Model` MLX 25.35.
+
+**Mixed-type in-projections.** A Gated DeltaNet whose four projections are quantized differently
+(the unsloth UD mixes) is not packed on one device: the graph runs the four products, and the
+per-op path runs that layer's mixer as its own graph (`RunRecurrentMixerGraph`) instead of a
+requantized copy, so both paths compute the same thing.
+
 ---
 
 ## 7. Migration plan

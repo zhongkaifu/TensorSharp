@@ -40,7 +40,10 @@ namespace TensorSharp.Models
     /// </summary>
     public abstract partial class StandardDecoderModel : ModelBase
     {
-        private static readonly int MlxEvalEveryNLayers = ResolvePositiveEnv("TS_MLX_EVAL_EVERY_N_LAYERS", 16);
+        // MLX: hand the lazy graph to the GPU every N layers (async), so it runs while later layers
+        // are built. Measured on an M5 Pro (2026-11-10), real generation: Qwen3.5-0.8B 191 tok/s at
+        // N=4 vs 183 (8) and 168 (16); Qwen3.8-27B IQ3_XXS 19.3-20.0 at 4 vs 18.5-19.5 at 16.
+        private static readonly int MlxEvalEveryNLayers = ResolvePositiveEnv("TS_MLX_EVAL_EVERY_N_LAYERS", 4);
         private static readonly int PrefillChunkTokens = ResolvePositiveEnv("TS_PREFILL_CHUNK", 2048);
 
         private readonly int _requestedTensorParallel;
@@ -118,6 +121,16 @@ namespace TensorSharp.Models
         /// <summary>The FFN pre-norm weight of <paramref name="layer"/>. Default
         /// <c>blk.N.ffn_norm.weight</c>; Qwen 3.5 calls it <c>post_attention_norm</c>.</summary>
         protected virtual string FfnNormWeight(int layer) => LayerName(layer, "ffn_norm.weight");
+
+        /// <summary>NextN / MTP draft layers after the decoder stack (<c>blk.{NumLayers + i}</c>): one decoder
+        /// layer each, run by the draft head, never by the trunk. 0 when the family has none here.</summary>
+        protected virtual int DraftLayerCount => 0;
+
+        /// <summary>Decoder layers plus draft layers: what weights, fusion, routing and caches cover.</summary>
+        private int TotalLayers => Config.NumLayers + DraftLayerCount;
+
+        /// <summary>The stage a layer runs on; draft layers run with the head, on the last stage.</summary>
+        private int StageOfLayer(int layer) => layer >= Config.NumLayers ? _mesh.Stages - 1 : _mesh.StageOf(layer);
 
         /// <summary>
         /// Attention whose query projection also emits a per-head output gate, interleaved per
@@ -296,7 +309,7 @@ namespace TensorSharp.Models
         private void FuseProjections()
         {
             int fusedQkv = 0;
-            for (int l = 0; l < Config.NumLayers; l++)
+            for (int l = 0; l < TotalLayers; l++)
             {
                 if (OwnsLayer(l) && TryFuseQkvWeights(l))
                     fusedQkv++;
@@ -305,9 +318,9 @@ namespace TensorSharp.Models
                 Console.WriteLine($"  Fused projections: {fusedQkv} QKV");
             FuseGateUpWeights();
 
-            _qkvFused = new bool[Config.NumLayers];
-            _gateUpFused = new bool[Config.NumLayers];
-            for (int l = 0; l < Config.NumLayers; l++)
+            _qkvFused = new bool[TotalLayers];
+            _gateUpFused = new bool[TotalLayers];
+            for (int l = 0; l < TotalLayers; l++)
             {
                 _qkvFused[l] = HasWeight($"blk.{l}.attn_qkv.weight");
                 _gateUpFused[l] = HasWeight($"blk.{l}.ffn_gate_up.weight");
@@ -327,12 +340,12 @@ namespace TensorSharp.Models
             _maxContextLength = maxContext;
             _cacheCapacity = initial;
             DType dtype = _kvCacheDtype.ToDType();
-            _cacheK = new Tensor[Config.NumLayers][];
-            _cacheV = new Tensor[Config.NumLayers][];
-            for (int l = 0; l < Config.NumLayers; l++)
+            _cacheK = new Tensor[TotalLayers][];
+            _cacheV = new Tensor[TotalLayers][];
+            for (int l = 0; l < TotalLayers; l++)
             {
                 if (!OwnsLayer(l) || _recurrentLayer[l]) continue;
-                int stage = _mesh.StageOf(l);
+                int stage = StageOfLayer(l);
                 _cacheK[l] = new Tensor[_mesh.TensorParallel];
                 _cacheV[l] = new Tensor[_mesh.TensorParallel];
                 for (int r = 0; r < _mesh.TensorParallel; r++)
@@ -359,10 +372,10 @@ namespace TensorSharp.Models
             while (capacity < required)
                 capacity = Math.Min(_maxContextLength, capacity * 2);
             DType dtype = _kvCacheDtype.ToDType();
-            for (int l = 0; l < Config.NumLayers; l++)
+            for (int l = 0; l < _cacheK.Length; l++)
             {
                 if (_cacheK[l] == null) continue;
-                int stage = _mesh.StageOf(l);
+                int stage = StageOfLayer(l);
                 for (int r = 0; r < _mesh.TensorParallel; r++)
                 {
                     IAllocator alloc = _mesh.Allocator(stage, r);
@@ -402,6 +415,7 @@ namespace TensorSharp.Models
         protected override void ResetKVCacheCore()
         {
             _verifyRows = 0;   // the state is reset; nothing to settle
+            _draftStart = 0;
             _cacheSeqLen = 0;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
@@ -445,7 +459,9 @@ namespace TensorSharp.Models
         /// <summary>Family terms the cache identity also depends on (rotary layout, ...).</summary>
         protected virtual string FingerprintExtras => "";
 
-        private Tensor[] FlatCaches(Tensor[][] caches) => AllCacheTensors(caches).ToArray();
+        /// <summary>The decoder layers' caches in transfer order (draft layers' rows are not pages).</summary>
+        private Tensor[] FlatCaches(Tensor[][] caches)
+            => AllCacheTensors(caches?.Take(Config.NumLayers).ToArray()).ToArray();
 
         public override long ComputeKVBlockByteSize(int tokenCount)
             => KvBlockTransfer.ComputeBlockByteSize(FlatCaches(_cacheK), FlatCaches(_cacheV), tokenCount);
@@ -572,7 +588,7 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Run every local layer, moving the activation between stages.</summary>
-        private Tensor RunLayers(Tensor hidden, TokenPositions positions, SlotBatch batch)
+        private Tensor RunLayers(Tensor hidden, TokenPositions positions, SlotBatch batch, Action<int, Tensor> beforeLayer = null)
         {
             int stage = 0;
             Tensor[] ranks = null;
@@ -597,6 +613,7 @@ namespace TensorSharp.Models
 
                 if (ranks == null)
                 {
+                    beforeLayer?.Invoke(layer, hidden);
                     hidden = LayerOnOneDevice(hidden, layer, positions, batch);
                     if (_backend == BackendType.Mlx && (layer + 1) % MlxEvalEveryNLayers == 0 && layer + 1 != Config.NumLayers)
                         MlxFusedOps.TryAsyncEvaluate(hidden);
@@ -664,7 +681,7 @@ namespace TensorSharp.Models
         private Tensor LayerOnOneDevice(Tensor hidden, int layer, TokenPositions positions, SlotBatch batch)
         {
             string p = $"blk.{layer}.";
-            RankScope scope = Scope(_mesh.StageOf(layer), 0);
+            RankScope scope = Scope(StageOfLayer(layer), 0);
 
             Tensor normed = _recurrentLayer[layer] && RecurrentMixerTakesRawInput
                 ? hidden.CopyRef()
@@ -782,7 +799,8 @@ namespace TensorSharp.Models
             int qDim = heads * _keyDim, kDim = kvHeads * _keyDim, vDim = kvHeads * _valueDim;
             int qWidth = GatedAttentionOutput ? 2 * qDim : qDim;
             int tokens = positions.Count;
-            bool decode = batch == null && tokens == 1;
+            // A floored step (a draft layer that resumed after a gap) masks its keys as a chunk does.
+            bool decode = batch == null && tokens == 1 && _attentionFloor == 0;
 
             Tensor q, k, v;
             if (_qkvFused[layer])
@@ -847,6 +865,17 @@ namespace TensorSharp.Models
             return flatGate;
         }
 
+        /// <summary>MLX's fused SDPA over the cache rows [0, <paramref name="kvLen"/>) for the last
+        /// <paramref name="rows"/> query rows (causal), reading the cache in place.</summary>
+        private bool MlxCachedAttention(RankScope scope, Tensor result, Tensor q, Tensor cacheK, Tensor cacheV, int rows, int kvLen, float scale)
+            => _backend == BackendType.Mlx && scope.Degree == 1 && _keyDim == _valueDim && q.IsContiguous()
+               && MlxFusedOps.TryCachedAttention(result, q, cacheK, cacheV, scope.LocalHeads, scope.LocalKvHeads, _keyDim, rows, kvLen, scale,
+                   kvFloor: _attentionFloor);
+
+        /// <summary>Cache rows below this are not attended by the per-op path (a draft layer that resumed
+        /// after a gap); 0 for the trunk.</summary>
+        private int _attentionFloor;
+
         private Tensor DecodeAttention(RankScope scope, Tensor cacheK, Tensor cacheV, int capacity, Tensor q, Tensor k, Tensor v, int start)
         {
             int heads = scope.LocalHeads, kvHeads = scope.LocalKvHeads;
@@ -856,10 +885,12 @@ namespace TensorSharp.Models
             v.Dispose();
 
             var result = new Tensor(scope.Allocator, DType.Float32, 1, heads * _valueDim);
-            // MLX keeps K/V on the device and runs mlx_fast_sdpa; the host path would copy
-            // the whole cache back every token.
-            bool done = _backend == BackendType.Mlx && scope.Degree == 1 && MlxFusedOps.TryDecodeAttention(
-                result, q, cacheK, cacheV, heads, kvHeads, _keyDim, 0, start + 1, capacity, false, scale);
+            // MLX keeps K/V on the device and runs its fused SDPA over a strided view of the
+            // cache's live rows (mlx-lm's update_and_fetch + scaled_dot_product_attention); the
+            // host path would copy the whole cache back every token.
+            bool done = MlxCachedAttention(scope, result, q, cacheK, cacheV, 1, start + 1, scale)
+                || (_backend == BackendType.Mlx && scope.Degree == 1 && MlxFusedOps.TryDecodeAttention(
+                    result, q, cacheK, cacheV, heads, kvHeads, _keyDim, 0, start + 1, capacity, false, scale));
             // Direct CUDA: GQA decode attention on the device over the head-first cache in place.
             // The host path below copies the whole cache to the host every layer.
             if (!done && _backend == BackendType.Cuda)
@@ -877,8 +908,6 @@ namespace TensorSharp.Models
             int total = start + tokens;
             float scale = 1.0f / MathF.Sqrt(_keyDim);
 
-            Tensor qHeads = ReshapeToHeads(q, heads, tokens, _keyDim);
-            q.Dispose();
             Tensor kHeads = ReshapeToHeads(k, kvHeads, tokens, _keyDim);
             k.Dispose();
             Tensor vHeads = ReshapeToHeads(v, kvHeads, tokens, _valueDim);
@@ -887,6 +916,18 @@ namespace TensorSharp.Models
             CopyToCache(cacheV, vHeads, start, tokens);
             kHeads.Dispose();
             vHeads.Dispose();
+
+            // MLX: the chunk's rows are in the cache; one fused SDPA over its live rows.
+            var fused = new Tensor(scope.Allocator, DType.Float32, tokens, heads * _valueDim);
+            if (MlxCachedAttention(scope, fused, q, cacheK, cacheV, tokens, total, scale))
+            {
+                q.Dispose();
+                return fused;
+            }
+            fused.Dispose();
+
+            Tensor qHeads = ReshapeToHeads(q, heads, tokens, _keyDim);
+            q.Dispose();
 
             int group = heads / kvHeads;
             Tensor kExpanded = ExpandKVHeads(cacheK, group, total);
@@ -899,6 +940,11 @@ namespace TensorSharp.Models
             qHeads.Dispose();
             kExpanded.Dispose();
 
+            if (_attentionFloor > 0)
+            {
+                using Tensor below = scores.Narrow(2, 0, Math.Min(_attentionFloor, total));
+                Ops.Fill(below, float.NegativeInfinity);
+            }
             if (IsGgmlBackend)
             {
                 GgmlBasicOps.AttentionSoftmaxWithSinks(scores, sinks: null, numHeads: heads, seqLen: tokens,

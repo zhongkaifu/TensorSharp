@@ -26,7 +26,9 @@
 #include "ggml_ops_internal.h"
 #include "ggml_ops_transformer_common.h"
 #include "ggml-alloc.h"
+#include "ggml-impl.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -302,7 +304,10 @@ namespace
             leaf.uploaded = true;
             if (leaf.role == LEAF_INPUT || leaf.data == nullptr) continue;
             const auto usage = leaf.role == LEAF_STATE ? GGML_BACKEND_BUFFER_USAGE_COMPUTE : GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
-            if (leaf.bytes >= 4096)
+            // Weights live as long as the model, so even a small one (a norm, a per-head gate
+            // constant) keeps a device copy: in compute memory it would be uploaded every run, a
+            // synchronous copy per tensor on CUDA (~180 per Qwen3.8-27B decode step).
+            if (leaf.bytes >= 4096 || leaf.role == LEAF_WEIGHT)
             {
                 bool needs_upload = false;
                 if (try_bind_cached_tensor(g_backend, dev, leaf.tensor, leaf.data, leaf.bytes, needs_upload, usage))
@@ -313,7 +318,7 @@ namespace
                     continue;
                 }
                 ggml_backend_buffer_t buf = nullptr;
-                if (try_get_host_ptr_buffer(g_backend, dev, leaf.data, leaf.bytes, true, buf)
+                if (leaf.bytes >= 4096 && try_get_host_ptr_buffer(g_backend, dev, leaf.data, leaf.bytes, true, buf)
                     && ggml_backend_tensor_alloc(buf, leaf.tensor, leaf.data) == GGML_STATUS_SUCCESS)
                 {
                     leaf.uploaded = false;
@@ -355,6 +360,11 @@ namespace
             set_last_error("graph builder: failed to allocate the graph's compute memory.");
             return false;
         }
+        // A graph that replays keeps every node and binding for its lifetime: a stable non-zero id
+        // lets ggml-cuda reuse its captured CUDA graph without re-comparing every node per run (it
+        // treats id 0 as unknown). One-shot graphs keep 0.
+        static std::atomic<std::uint64_t> next_uid{UINT64_C(0x5453475200000000)};   // "TSGR"
+        g->graph->uid = next_uid.fetch_add(1, std::memory_order_relaxed);
         g->replayable = true;
         g->built = true;
         return true;
@@ -525,15 +535,16 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
         // Device work queued by earlier calls may still read or write these host buffers.
         host_read_barrier();
         // Leaves living in compute memory are uploaded every run, weights included: the allocator
-        // may reuse an input's memory after its last use within the graph.
+        // may reuse an input's memory after its last use within the graph. A leaf nothing in the
+        // graph reads (the trace may emit more than the outputs and effects need) has no memory.
         for (const Leaf& leaf : g->leaves)
-            if (leaf.uploaded && leaf.data != nullptr)
+            if (leaf.uploaded && leaf.data != nullptr && leaf.tensor->buffer != nullptr)
                 ggml_backend_tensor_set(leaf.tensor, resolve_upload_source(leaf.data), 0, leaf.bytes);
         for (int i = 0; i < ninputs; i++)
         {
             ggml_tensor* t = node_at(g, inputs[i]);
             const std::size_t n = std::min(static_cast<std::size_t>(input_bytes[i]), ggml_nbytes(t));
-            if (input_data[i] != nullptr && n > 0)
+            if (input_data[i] != nullptr && n > 0 && t->buffer != nullptr)
                 ggml_backend_tensor_set(t, input_data[i], 0, n);
         }
 
@@ -562,7 +573,7 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
             if (o.data != nullptr)
                 ggml_backend_tensor_get_async(g_backend, o.tensor, o.data, 0, o.bytes);
         for (const Leaf& leaf : g->leaves)
-            if (leaf.role == LEAF_STATE && leaf.uploaded && leaf.data != nullptr)
+            if (leaf.role == LEAF_STATE && leaf.uploaded && leaf.data != nullptr && leaf.tensor->buffer != nullptr)
                 ggml_backend_tensor_get_async(g_backend, leaf.tensor, leaf.data, 0, leaf.bytes);
         sync_backend(g_backend);
         clear_last_error();

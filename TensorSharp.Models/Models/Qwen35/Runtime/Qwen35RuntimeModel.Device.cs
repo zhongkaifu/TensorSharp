@@ -48,19 +48,6 @@ namespace TensorSharp.Models
             return true;
         }
 
-        /// <summary>The packed in-projection the per-op block needs, built on first use when the
-        /// load kept the sources unpacked for the graphs (Q8_0 rows; the sources stay).</summary>
-        private void EnsurePackedInProjection(int layer)
-        {
-            string name = InProjName(layer);
-            if (_quantWeights.ContainsKey(name) || _weights.ContainsKey(name)) return;
-            foreach (string source in InProjSources(layer))
-                if (_quantWeights.TryGetValue(source, out QuantizedWeight q) && !q.HasHostData)
-                    throw new NotSupportedException(
-                        $"{Config.Architecture}: layer {layer}'s mixed-type in-projection was released to the device and cannot be packed for the per-op path.");
-            PackInProjection(layer, 1, 0, 1, _ => AllocatorForWeight($"blk.{layer}.attn_qkv.weight"), keepSources: true);
-        }
-
         /// <summary>
         /// Pack the four input projections into the native block's in-projection,
         /// <c>[qkv | z | beta | alpha]</c> rows in the rank's channel order: rows move as they are
@@ -68,8 +55,7 @@ namespace TensorSharp.Models
         /// device and re-encoded as Q8_0 per rank under tensor parallelism (as Qwen35Model does).
         /// The four sources are dropped.
         /// </summary>
-        private void PackInProjection(int layer, int ranks, int rankOffset, int degree, Func<int, IAllocator> allocatorOf,
-            bool keepSources = false)
+        private void PackInProjection(int layer, int ranks, int rankOffset, int degree, Func<int, IAllocator> allocatorOf)
         {
             string p = $"blk.{layer}.";
             string[] sources = { p + "attn_qkv.weight", p + "attn_gate.weight", p + "ssm_beta.weight", p + "ssm_alpha.weight" };
@@ -103,7 +89,7 @@ namespace TensorSharp.Models
                 for (int i = 0; i < sources.Length; i++) { rows[i] = rowsOf[i](rankOffset + r); total += rows[i].Length; }
                 if (sameQuant)
                     packedQuant[r] = CopyQuantRows(quant, rows, total);
-                else if ((ranks > 1 || keepSources) && hidden % 32 == 0)
+                else if (ranks > 1 && hidden % 32 == 0)
                     packedQuant[r] = RequantRows(quant, dense, rows, total, hidden);
                 else
                     packedDense[r] = DenseRows(quant, dense, rows, total, hidden, allocatorOf(r));
@@ -118,7 +104,6 @@ namespace TensorSharp.Models
             else if (packedQuant[0] != null) _tpQuantWeights[name] = packedQuant;
             else _tpWeights[name] = packedDense;
 
-            if (keepSources) return;
             for (int i = 0; i < sources.Length; i++)
             {
                 if (_quantWeights.Remove(sources[i], out var q)) q.Dispose();
@@ -380,9 +365,12 @@ namespace TensorSharp.Models
             int qkv = 2 * qk + v;
             int packed = qkv + v + 2 * vHeads;
 
-            IntPtr w; int type; long ne0, ne1, bytes;
-            if (scope.Degree == 1) EnsurePackedInProjection(layer);
+            // One device keeps in-projections of mixed types unpacked (packing them would mean a
+            // dense or requantized copy): the family's graph lowering runs them as quantized.
             string name = InProjName(layer);
+            if (scope.Degree == 1 && !_quantWeights.ContainsKey(name) && !_weights.ContainsKey(name))
+                return RunRecurrentMixerGraph(scope, raw, layer, state);
+            IntPtr w; int type; long ne0, ne1, bytes;
             QuantizedWeight q = scope.Degree == 1
                 ? (_quantWeights.TryGetValue(name, out var single) ? single : null)
                 : (_tpQuantWeights.TryGetValue(name, out var shards) ? shards[scope.Rank] : null);

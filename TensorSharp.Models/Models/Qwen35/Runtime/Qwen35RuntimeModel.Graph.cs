@@ -51,6 +51,11 @@ namespace TensorSharp.Models
         /// still the one before the window).</summary>
         protected override void CommitRecurrentPrefix(int kept, int rows)
         {
+            if (!DeviceRecurrence)
+            {
+                base.CommitRecurrentPrefix(kept, rows);
+                return;
+            }
             if (kept == 0) return;
             IntPtr key = IntPtr.Zero;
             for (int layer = 0; layer < Config.NumLayers && key == IntPtr.Zero; layer++)

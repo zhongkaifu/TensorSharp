@@ -54,8 +54,8 @@ namespace TensorSharp.Models
 
         private void DetectMoeLayers()
         {
-            _moeLayer = new bool[Config.NumLayers];
-            for (int l = 0; l < Config.NumLayers; l++)
+            _moeLayer = new bool[TotalLayers];
+            for (int l = 0; l < TotalLayers; l++)
             {
                 _moeLayer[l] = OwnsLayer(l) && HasWeight($"blk.{l}.ffn_gate_inp.weight");
                 _anyMoe |= _moeLayer[l];

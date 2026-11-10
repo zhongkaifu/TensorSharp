@@ -42,6 +42,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
         "dense" => new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true }.Write(Path.Combine(_dir, "q35-dense.gguf")),
         // In-projection sources of two types (as mixed-quant checkpoints have): the graph runs them
         // unpacked, the per-op block packs them on first use.
+        // Three value heads per key head, as the 27B (value head h reads key head h mod group_count).
+        "dense-gqa" => new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true, SsmVHeads = 6 }.Write(Path.Combine(_dir, "q35-dense-gqa.gguf")),
+        "dense-nextn" => new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true, NextN = true }.Write(Path.Combine(_dir, "q35-dense-nextn.gguf")),
         "dense-mixed" => new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true, GateProjectionType = SyntheticGguf.GgmlType.F32 }
             .Write(Path.Combine(_dir, "q35-dense-mixed.gguf")),
         // BF16 weights: no activation quantization, so the comparison is tight.
@@ -69,11 +72,10 @@ public sealed class Qwen35RuntimeTests : IDisposable
         return rows;
     }
 
-    /// <summary>Graph vs per-op bound. A mixed-type in-projection is requantized to Q8_0 for the
-    /// per-op block (as multi-GPU packing does) while the graph runs the original weights:
-    /// measured 6.3e-3 on ggml_metal; the graph itself stays within 5e-3 of the managed reference.</summary>
+    /// <summary>Graph vs per-op bound: the per-op path runs a mixed-type in-projection through the
+    /// same graph lowering, so every variant is bound alike.</summary>
     private static double PerOpTolerance(string variant)
-        => RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : variant == "dense-mixed" ? 1.5e-2 : 5e-3;
+        => RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : 5e-3;
 
     /// <summary>Backends whose matmuls round activations (ggml_cpu to BF16; ggml_cuda to BF16 / Q8_1,
     /// with different kernels for one row than for several): measured on ggml_cuda (RTX PRO 6000,
@@ -96,6 +98,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
 
     [Theory]
     [InlineData("dense", 1e-4)]
+    [InlineData("dense-gqa", 1e-4)]
     [InlineData("moe", 1e-4)]
     // Measured 2026-11-10 (M5 Pro): 7.9e-3; the legacy implementation's own prefill and decode
     // disagree by 2.5e-3 on this fixture, and ggml vs the managed kernels by 5e-2.
@@ -121,11 +124,13 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [Theory]
     [InlineData("dense")]
     [InlineData("dense-mixed")]
+    [InlineData("dense-gqa")]
     [InlineData("moe")]
     public void PinnedGgmlBackendMatchesTheManagedReference(string variant) => CompareBackend(variant, TestGates.PinnedGgmlBackend);
 
     [MlxTheory]
     [InlineData("dense")]
+    [InlineData("dense-gqa")]
     [InlineData("moe")]
     public void MlxMatchesTheManagedReference(string variant) => CompareBackend(variant, BackendType.Mlx);
 
@@ -256,6 +261,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [Theory]
     [InlineData("dense")]
     [InlineData("dense-mixed")]
+    [InlineData("dense-gqa")]
     [InlineData("moe")]
     public void WholeForwardGraphMatchesThePerOpPath(string variant)
     {
@@ -284,6 +290,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [Theory]
     [InlineData("dense")]
     [InlineData("dense-mixed")]
+    [InlineData("dense-gqa")]
     [InlineData("moe")]
     public void GraphAndPerOpStepsShareTheState(string variant)
     {
@@ -325,7 +332,114 @@ public sealed class Qwen35RuntimeTests : IDisposable
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture(variant);
-        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(path, backend: TestGates.PinnedGgmlBackend), $"qwen35 {variant}");
+        // ggml_cuda's verify kernels round differently than its one-row kernels: the moe fixture's
+        // token 7 is a 0.36% tie there (RTX PRO 6000, 2026-11-10) and the verify takes the runner-up.
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(path, backend: TestGates.PinnedGgmlBackend), $"qwen35 {variant}",
+            tieTolerance: RoundsActivations(TestGates.PinnedGgmlBackend) ? 1e-2 : 0);
+    }
+
+    /// <summary>The NextN/MTP block drafts through the runtime's generic draft layer: speculation
+    /// emits the plain greedy tokens.</summary>
+    [Fact]
+    public void MtpSpeculationMatchesPlainGreedy()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense-nextn");
+        SpeculativeRuntimeChecks.AssertDraftHeadMatchesPlainGreedy(() => Create(path, backend: TestGates.PinnedGgmlBackend), "qwen35 nextn",
+            tieTolerance: RoundsActivations(TestGates.PinnedGgmlBackend) ? 1e-2 : 0);
+    }
+
+    /// <summary>On MLX speculation runs off the graphs: the per-op verify keeps the Gated DeltaNet's
+    /// window in MLX arrays and the draft layer runs per op; both emit the plain greedy tokens.</summary>
+    [MlxFact]
+    public void MlxSpeculationMatchesPlainGreedy()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense-nextn");
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(path, backend: BackendType.Mlx), "qwen35 mlx");
+        SpeculativeRuntimeChecks.AssertDraftHeadMatchesPlainGreedy(() => Create(path, backend: BackendType.Mlx), "qwen35 mlx nextn");
+    }
+
+    /// <summary>The per-op draft layer (MLX) computes what the graph one does.</summary>
+    [MlxFact]
+    public void MlxDraftHeadMatchesTheFamilyImplementation()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense-nextn");
+        List<float[]> legacy;
+        using (var family = new Qwen35Model(path, BackendType.Cpu))
+            legacy = DraftTrace(family);
+        using var runtime = Create(path, backend: BackendType.Mlx);
+        List<float[]> actual = DraftTrace(runtime);
+        Assert.Equal(legacy.Count, actual.Count);
+        for (int i = 0; i < legacy.Count; i++)
+        {
+            double rel = RelL2(actual[i], legacy[i]);
+            Assert.True(rel <= 5e-3, $"mlx draft row {i}: relL2 {rel:E2} from Qwen35Model");
+        }
+    }
+
+    /// <summary>The runtime's draft layer computes what Qwen35Model's MTP head does: prompt
+    /// catch-up, two chained draft steps, a gap (no trunk rows) and the fused catch-up step.</summary>
+    [Fact]
+    public void MtpDraftHeadMatchesTheFamilyImplementation()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense-nextn");
+        List<float[]> legacy;
+        using (var family = new Qwen35Model(path, BackendType.Cpu))
+            legacy = DraftTrace(family);
+        using var runtime = Create(path, backend: TestGates.PinnedGgmlBackend);
+        List<float[]> actual = DraftTrace(runtime);
+        double tolerance = RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : 5e-3;
+        Assert.Equal(legacy.Count, actual.Count);
+        for (int i = 0; i < legacy.Count; i++)
+        {
+            double rel = RelL2(actual[i], legacy[i]);
+            Assert.True(rel <= tolerance, $"draft row {i}: relL2 {rel:E2} from Qwen35Model");
+        }
+    }
+
+    private static List<float[]> DraftTrace(ModelBase model)
+    {
+        var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeModel>(model);
+        Assert.Equal(TensorSharp.Runtime.Speculative.DraftHeadKind.PerToken, spec.DraftHeadKind);
+        int hidden = model.Config.HiddenSize, vocab = model.Config.VocabSize;
+        int[] prompt = Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray();
+        int n = prompt.Length;
+        var rows = new List<float[]>();
+        var hAll = new float[n * hidden];
+        var logits = new float[vocab];
+        spec.SpecForward(prompt, hAll, logits, false);
+        rows.Add((float[])logits.Clone());
+        rows.Add(hAll[((n - 1) * hidden)..]);
+        // Row k of the catch-up is the hidden row of the token before tokens[k].
+        spec.DraftCatchUp(prompt[1..], hAll[..((n - 1) * hidden)], 1);
+        var draft = new float[vocab];
+        var h1 = new float[hidden];
+        int next = ArgMax(logits);
+        spec.DraftStep(next, hAll[((n - 1) * hidden)..], n, draft, h1);
+        rows.Add((float[])draft.Clone());
+        rows.Add((float[])h1.Clone());
+        var h2 = new float[hidden];
+        spec.DraftStep(ArgMax(draft), h1, n + 1, draft, h2);
+        rows.Add((float[])draft.Clone());
+        rows.Add((float[])h2.Clone());
+
+        // The trunk takes `next`; the head skips it (a gap: no trunk rows), then folds the replay
+        // of `after` into the draft that follows `third`.
+        var hNext = new float[hidden];
+        spec.SpecForward(new[] { next }, hNext, logits, false);
+        spec.DraftCatchUp(new[] { next }, null, n);
+        int after = ArgMax(logits);
+        var hAfter = new float[hidden];
+        spec.SpecForward(new[] { after }, hAfter, logits, false);
+        int third = ArgMax(logits);
+        var h3 = new float[hidden];
+        spec.DraftCatchUpAndStep(new[] { after, third }, hNext.Concat(hAfter).ToArray(), n + 1, draft, h3);
+        rows.Add((float[])draft.Clone());
+        rows.Add(h3);
+        return rows;
     }
 
     /// <summary>A shared-prefix checkpoint (attention rows and Gated DeltaNet state), cloned or written

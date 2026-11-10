@@ -1980,10 +1980,12 @@ namespace TensorSharp.MLX
             int kvLen,
             float scale,
             Tensor sinks = null,
-            int slidingWindow = 0)
+            int slidingWindow = 0,
+            int kvFloor = 0)
         {
             if (seqLen <= 0 || kvLen < seqLen || numHeads <= 0 || numKVHeads <= 0
-                || numHeads % numKVHeads != 0 || headDim <= 0 || slidingWindow < 0)
+                || numHeads % numKVHeads != 0 || headDim <= 0 || slidingWindow < 0
+                || kvFloor < 0 || kvFloor > kvLen - seqLen)
                 return false;
             if (sinks != null && (sinks.ElementType != DType.Float32
                 || sinks.ElementCount() != numHeads || !(sinks.Storage is MlxStorage)))
@@ -2007,7 +2009,8 @@ namespace TensorSharp.MLX
             // a window that starts past the view's first key; only then is an explicit
             // [seqLen, keys] mask needed.
             int firstPos = kvLen - seqLen;
-            int kvStart = slidingWindow > 0 ? Math.Max(0, firstPos - slidingWindow + 1) : 0;
+            // Keys below kvFloor are not attended (a draft layer that resumed after a gap).
+            int kvStart = Math.Max(kvFloor, slidingWindow > 0 ? Math.Max(0, firstPos - slidingWindow + 1) : 0);
             int keyCount = kvLen - kvStart;
             bool windowMask = slidingWindow > 0 && seqLen > 1 && kvLen - slidingWindow > kvStart;
 

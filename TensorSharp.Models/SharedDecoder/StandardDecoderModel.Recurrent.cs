@@ -46,6 +46,19 @@ namespace TensorSharp.Models
             /// <summary>The state's host bytes were rewritten: drop every device copy of them.</summary>
             protected internal virtual void OnHostWritten() { }
 
+            /// <summary>The per-op path can verify a draft window on this state: it keeps the state
+            /// before the window and after each of its rows (<see cref="BeginVerify"/>).</summary>
+            protected internal virtual bool SupportsVerify => false;
+
+            /// <summary>The next multi-row step is a verify window: keep the state before it and
+            /// after each of its rows until <see cref="CommitVerify"/>.</summary>
+            protected internal virtual void BeginVerify()
+                => throw new NotSupportedException($"{GetType().Name} cannot verify a draft window.");
+
+            /// <summary>Keep the state after <paramref name="kept"/> rows of the window (0: before it).</summary>
+            protected internal virtual void CommitVerify(int kept)
+                => throw new NotSupportedException($"{GetType().Name} cannot verify a draft window.");
+
             public virtual void Dispose() { }
         }
 
@@ -87,7 +100,7 @@ namespace TensorSharp.Models
 
         private void DetectRecurrentLayers()
         {
-            _recurrentLayer = new bool[Config.NumLayers];
+            _recurrentLayer = new bool[TotalLayers];   // draft layers are attention layers
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 _recurrentLayer[l] = IsRecurrentLayer(l);
