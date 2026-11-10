@@ -137,8 +137,28 @@ namespace TensorSharp.Models
         {
             if (!DeviceRecurrence || Mesh.TensorParallel != 1) return;
             for (int l = 0; l < Config.NumLayers; l++)
-                if (_isRecurrent[l] && OwnsLayer(l))
-                    PackInProjection(l, 1, 0, 1, _ => AllocatorForWeight($"blk.{l}.attn_qkv.weight"));
+            {
+                if (!_isRecurrent[l] || !OwnsLayer(l)) continue;
+                // A single-device graph runs the four projections as they were quantized (as the
+                // fused graphs do); packing mixed types would mean a dense F32 copy (16 GB on a
+                // mixed-quant 27B). Pack at load only where the per-op block is the serving path.
+                if (!InProjectionSharesType(l) && GraphServesPlacement) continue;
+                int layer = l;
+                PackInProjection(layer, 1, 0, 1, _ => AllocatorForWeight($"blk.{layer}.attn_qkv.weight"));
+            }
+        }
+
+        /// <summary>Whether single-device steps run as whole-forward graphs (they then use the
+        /// projections unpacked when their types differ).</summary>
+        private bool GraphServesPlacement
+        {
+            get
+            {
+                if (!IsGgmlBackend || !Mesh.IsSingleDevice || LayerSplitGroup != null) return false;
+                for (int l = 0; l < Config.NumLayers; l++)
+                    if (MoeCpuOffloadConfig.IsLayerOnCpu(l) && HasWeight($"blk.{l}.ffn_gate_inp.weight")) return false;
+                return true;
+            }
         }
 
         private unsafe IntPtr HostPointer(Tensor tensor) => (IntPtr)GetFloatPtr(tensor);

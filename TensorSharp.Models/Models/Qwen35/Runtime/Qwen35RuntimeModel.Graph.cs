@@ -47,10 +47,19 @@ namespace TensorSharp.Models
 
             // Decode rows take the packed in-projection in one product; a prompt chunk takes its four
             // row blocks as separate products, so each part is contiguous (no slice copies).
-            bool split = step.Rows > step.Sequences;
             string inProj = InProjName(layer);
+            bool isPacked = _quantWeights.ContainsKey(inProj) || _weights.ContainsKey(inProj);
+            bool split = !isPacked || step.Rows > step.Sequences;
             int proj = -1, qkvAll = -1, zAll = -1, betaAll = -1, alphaAll = -1;
-            if (split)
+            if (!isPacked)
+            {
+                // The projections as they were quantized (mixed types are not packed).
+                qkvAll = step.MatMul(LayerName(layer, "attn_qkv.weight"), normed);
+                zAll = step.MatMul(LayerName(layer, "attn_gate.weight"), normed);
+                betaAll = step.MatMul(LayerName(layer, "ssm_beta.weight"), normed);
+                alphaAll = step.MatMul(LayerName(layer, "ssm_alpha.weight"), normed);
+            }
+            else if (split)
             {
                 qkvAll = step.MatMulRows(inProj, 0, channels, normed);                       // [channels, rows]
                 zAll = step.MatMulRows(inProj, channels, v, normed);                         // [v, rows]

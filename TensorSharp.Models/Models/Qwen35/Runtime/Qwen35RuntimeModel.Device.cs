@@ -32,6 +32,35 @@ namespace TensorSharp.Models
 
         private static string InProjName(int layer) => $"blk.{layer}.ssm_in_proj.weight";
 
+        private static string[] InProjSources(int layer)
+            => new[] { $"blk.{layer}.attn_qkv.weight", $"blk.{layer}.attn_gate.weight", $"blk.{layer}.ssm_beta.weight", $"blk.{layer}.ssm_alpha.weight" };
+
+        /// <summary>The four in-projection sources are quantized alike (so packing copies rows).</summary>
+        private bool InProjectionSharesType(int layer)
+        {
+            int type = -1;
+            foreach (string name in InProjSources(layer))
+            {
+                if (!_quantWeights.TryGetValue(name, out QuantizedWeight q)) return false;
+                if (type >= 0 && q.GgmlType != type) return false;
+                type = q.GgmlType;
+            }
+            return true;
+        }
+
+        /// <summary>The packed in-projection the per-op block needs, built on first use when the
+        /// load kept the sources unpacked for the graphs (Q8_0 rows; the sources stay).</summary>
+        private void EnsurePackedInProjection(int layer)
+        {
+            string name = InProjName(layer);
+            if (_quantWeights.ContainsKey(name) || _weights.ContainsKey(name)) return;
+            foreach (string source in InProjSources(layer))
+                if (_quantWeights.TryGetValue(source, out QuantizedWeight q) && !q.HasHostData)
+                    throw new NotSupportedException(
+                        $"{Config.Architecture}: layer {layer}'s mixed-type in-projection was released to the device and cannot be packed for the per-op path.");
+            PackInProjection(layer, 1, 0, 1, _ => AllocatorForWeight($"blk.{layer}.attn_qkv.weight"), keepSources: true);
+        }
+
         /// <summary>
         /// Pack the four input projections into the native block's in-projection,
         /// <c>[qkv | z | beta | alpha]</c> rows in the rank's channel order: rows move as they are
@@ -39,7 +68,8 @@ namespace TensorSharp.Models
         /// device and re-encoded as Q8_0 per rank under tensor parallelism (as Qwen35Model does).
         /// The four sources are dropped.
         /// </summary>
-        private void PackInProjection(int layer, int ranks, int rankOffset, int degree, Func<int, IAllocator> allocatorOf)
+        private void PackInProjection(int layer, int ranks, int rankOffset, int degree, Func<int, IAllocator> allocatorOf,
+            bool keepSources = false)
         {
             string p = $"blk.{layer}.";
             string[] sources = { p + "attn_qkv.weight", p + "attn_gate.weight", p + "ssm_beta.weight", p + "ssm_alpha.weight" };
@@ -73,7 +103,7 @@ namespace TensorSharp.Models
                 for (int i = 0; i < sources.Length; i++) { rows[i] = rowsOf[i](rankOffset + r); total += rows[i].Length; }
                 if (sameQuant)
                     packedQuant[r] = CopyQuantRows(quant, rows, total);
-                else if (ranks > 1 && hidden % 32 == 0)
+                else if ((ranks > 1 || keepSources) && hidden % 32 == 0)
                     packedQuant[r] = RequantRows(quant, dense, rows, total, hidden);
                 else
                     packedDense[r] = DenseRows(quant, dense, rows, total, hidden, allocatorOf(r));
@@ -88,6 +118,7 @@ namespace TensorSharp.Models
             else if (packedQuant[0] != null) _tpQuantWeights[name] = packedQuant;
             else _tpWeights[name] = packedDense;
 
+            if (keepSources) return;
             for (int i = 0; i < sources.Length; i++)
             {
                 if (_quantWeights.Remove(sources[i], out var q)) q.Dispose();
@@ -292,6 +323,7 @@ namespace TensorSharp.Models
             int packed = qkv + v + 2 * vHeads;
 
             IntPtr w; int type; long ne0, ne1, bytes;
+            if (scope.Degree == 1) EnsurePackedInProjection(layer);
             string name = InProjName(layer);
             QuantizedWeight q = scope.Degree == 1
                 ? (_quantWeights.TryGetValue(name, out var single) ? single : null)

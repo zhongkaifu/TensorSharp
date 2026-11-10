@@ -340,9 +340,15 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
         return path;
     }
 
+    /// <summary>A type for the Gated DeltaNet's beta/alpha projections that differs from
+    /// <see cref="WeightType"/> (mixed-quant checkpoints mix the in-projection's types); null keeps
+    /// <see cref="WeightType"/>.</summary>
+    public GgmlType? GateProjectionType { get; init; }
+
     private Tensor W(Tensor x)
     {
-        x.Type = WeightType;
+        x.Type = GateProjectionType is { } gate && (x.Name.EndsWith("ssm_alpha.weight", StringComparison.Ordinal)
+            || x.Name.EndsWith("ssm_beta.weight", StringComparison.Ordinal)) ? gate : WeightType;
         return x;
     }
 }

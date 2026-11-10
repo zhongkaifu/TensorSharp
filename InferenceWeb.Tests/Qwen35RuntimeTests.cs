@@ -40,6 +40,10 @@ public sealed class Qwen35RuntimeTests : IDisposable
     private string Fixture(string variant) => variant switch
     {
         "dense" => new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true }.Write(Path.Combine(_dir, "q35-dense.gguf")),
+        // In-projection sources of two types (as mixed-quant checkpoints have): the graph runs them
+        // unpacked, the per-op block packs them on first use.
+        "dense-mixed" => new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true, GateProjectionType = SyntheticGguf.GgmlType.F32 }
+            .Write(Path.Combine(_dir, "q35-dense-mixed.gguf")),
         // BF16 weights: no activation quantization, so the comparison is tight.
         "moe" => new Qwen35MoeSyntheticModelBuilder { Layers = 8, UniformWeightType = SyntheticGguf.GgmlType.BF16 }.Write(Path.Combine(_dir, "q35-moe.gguf")),
         // The quantized mix (IQ3_S / IQ4_XS experts, Q8_0 projections) quantizes activations, so
@@ -64,6 +68,12 @@ public sealed class Qwen35RuntimeTests : IDisposable
         rows.Add((float[])model.Forward(new[] { 40 }).Clone());
         return rows;
     }
+
+    /// <summary>Graph vs per-op bound. A mixed-type in-projection is requantized to Q8_0 for the
+    /// per-op block (as multi-GPU packing does) while the graph runs the original weights:
+    /// measured 6.3e-3 on ggml_metal; the graph itself stays within 5e-3 of the managed reference.</summary>
+    private static double PerOpTolerance(string variant)
+        => RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : variant == "dense-mixed" ? 1.5e-2 : 5e-3;
 
     /// <summary>Backends whose matmuls round activations (ggml_cpu to BF16; ggml_cuda to BF16 / Q8_1,
     /// with different kernels for one row than for several): measured on ggml_cuda (RTX PRO 6000,
@@ -110,6 +120,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     /// against the managed reference, as the shared-runtime conformance does for every family.</summary>
     [Theory]
     [InlineData("dense")]
+    [InlineData("dense-mixed")]
     [InlineData("moe")]
     public void PinnedGgmlBackendMatchesTheManagedReference(string variant) => CompareBackend(variant, TestGates.PinnedGgmlBackend);
 
@@ -244,6 +255,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     /// runs as one whole-forward graph and computes what the per-op path computes.</summary>
     [Theory]
     [InlineData("dense")]
+    [InlineData("dense-mixed")]
     [InlineData("moe")]
     public void WholeForwardGraphMatchesThePerOpPath(string variant)
     {
@@ -259,7 +271,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
         List<float[]> rows = Script(graph);
         Assert.True(graph.GraphRuns >= rows.Count, "every step must run as a whole-forward graph");
         Assert.True(graph.GraphReplays > 0, "consecutive decode tokens must replay their graph");
-        double tolerance = RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : 5e-3;
+        double tolerance = PerOpTolerance(variant);
         for (int i = 0; i < perOp.Count; i++)
         {
             double rel = RelL2(rows[i], perOp[i]);
@@ -271,6 +283,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     /// forces) keeps its attention cache and recurrent state coherent across both bindings.</summary>
     [Theory]
     [InlineData("dense")]
+    [InlineData("dense-mixed")]
     [InlineData("moe")]
     public void GraphAndPerOpStepsShareTheState(string variant)
     {
@@ -293,7 +306,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
             rows.Add((float[])mixed.Forward(new[] { tokens[i] }).Clone());
         }
         Assert.True(mixed.GraphRuns > 0);
-        double tolerance = RoundsActivations(TestGates.PinnedGgmlBackend) ? 2.5e-2 : 5e-3;
+        double tolerance = PerOpTolerance(variant);
         for (int i = 0; i < perOp.Count; i++)
         {
             double rel = RelL2(rows[i], perOp[i]);

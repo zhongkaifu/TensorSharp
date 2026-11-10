@@ -314,7 +314,7 @@ namespace TensorSharp.Models
             }
         }
 
-        private bool HasWeight(string name) =>
+        protected bool HasWeight(string name) =>
             _quantWeights.ContainsKey(name) || _weights.ContainsKey(name) ||
             _tpQuantWeights.ContainsKey(name) || _tpWeights.ContainsKey(name);
 
