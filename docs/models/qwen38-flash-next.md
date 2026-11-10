@@ -1336,8 +1336,32 @@ RTX 5090, ISTA `Q2_0`, MTP, same client, 3 repetitions (TTFT / decode tok/s; 15/
 | adaptation | short chat | long generation | 4K prompt | 16K prompt | CPU experts a window after 4K / 16K |
 | --- | --- | --- | --- | --- | --- |
 | 8 blocking swaps a round | 0.08-0.10 s / 88-102 | 154-182 | 1.62-1.70 s / 135-160 | 6.71-6.88 s / 167-184 | 115-171 / 69-98 |
-| 64 overlapped swaps a round (default) | 0.07-0.09 s / 75-110 | 174-179 | 1.61-1.69 s / 137-188 | 6.76-6.81 s / 183-198 | 31-146 / 26-33 |
+| 64 overlapped swaps a round (default until 2026-11-10) | 0.07-0.09 s / 75-110 | 174-179 | 1.61-1.69 s / 137-188 | 6.76-6.81 s / 183-198 | 31-146 / 26-33 |
 | 96 overlapped swaps a round | 0.07-0.09 s / 82-100 | 169-180 | 1.61-1.69 s / 151-193 | 6.71-6.79 s / 151-193 | 32-96 / 17-28 |
+
+#### Larger adaptation rounds, 2026-11-10
+
+A round that overlaps the decode can carry as many swaps as its staging slots hold (254 for Flash Next), and the
+default budget is now 256 instead of 64 (`TS_MOE_TIER_ADAPT_SWAPS`, when set, is still every round's). The answer to a
+long prompt routes elsewhere than the residency learned before it, and at 64 a round it kept missing those experts for
+many windows. Counted with the host computing every miss (`TS_Q4E_HYBRID_MISSES=0`), the first 16K-token answer of a
+sequence had 49 misses a window in its windows 1-8 and 21 in windows 17-64; at 256, 13-17 and 5-6. Moving the prompt's
+experts in at the end of the prompt with the GPU waiting (a prototype, not merged) did less (32 / 5) and cost 50-280 ms
+of TTFT per 4,096-token prefill chunk.
+
+RTX 5090, ISTA `Q2_0`, MTP: four prompts (4K, 16K, 4K and 16K tokens of repo prose) each answered with a 768-token
+summary; two sets of 3 rotating passes; median 4-row verify ms by window position after each prompt:
+
+| swaps a round | windows 1-8 | 9-16 | 17-64 | 65-256 |
+| --- | --- | --- | --- | --- |
+| 64 (until 2026-11-10) | 13.41 / 12.73 | 11.54 / 11.53 | 11.01 / 10.63 | 10.64 / 10.25 |
+| 256 (default) | 10.88 / 10.86 | 10.67 / 9.36 | 10.70 / 10.25 | 10.49 / 10.25 |
+
+Elsewhere, 3 alternating passes each: the engine bench's 16K TTFT 3.28 -> 3.15 s (median) and four requests at once
+152-175 -> 150-191 tok/s; a 16K prompt right after a long answer prefilled as before (synchronized stage times:
+routed experts 772 -> 781 ms, all stages 3,951 -> 3,885 ms; TTFT 4.22-4.26 -> 4.12-4.24 s). No VRAM is added (a round
+borrows the prompt staging), and the bus carried less during the requests (111-129 GB host to device against 133-192
+at 64), as fewer missed experts were staged.
 
 #### The next prompt layer staged ahead, 2026-11-08
 
