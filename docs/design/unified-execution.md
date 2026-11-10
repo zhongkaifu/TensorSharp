@@ -555,7 +555,36 @@ only for strided inputs, and where the backend reads row-contiguous strided view
 as the fused Qwen graphs already rely on) the Gated DeltaNet's Q/K/V feed the norms and the
 recurrence directly. Qwen3.5-0.8B, `ggml_metal`, after replay: 9,076 / 196.7 tok/s against
 `Qwen35Model`'s 9,450 / 220 (96% / 89%); Hy-MT2 4,755 / 168.1, Ministral 2,725 / 107.3.
-Perplexity stays 50.1337. Qwen keeps `Qwen35Model` on one device until decode reaches parity.
+Perplexity stays 50.1337.
+
+**In-place recurrent state.** The per-token copy of each Gated DeltaNet state (18 x 1 MB on
+Qwen3.5-0.8B) was the rest of the decode gap. The builder's alias primitive places an op's
+result inside a persistent state buffer (falling back to the copy when the buffer is not
+resident); each request's GDN state has a backing buffer [one row's outputs | state], and on
+Metal a decode row's recurrence writes onto it in place, as `Qwen35Model`'s fused decode does.
+Two A/B rounds, runtime vs `Qwen35Model`: decode 220.8 / 220.2 vs 220.1 / 220.1 tok/s, prefill
+9,279 / 9,103 vs 9,472 / 9,521; perplexity 50.1337 both; 96-token greedy text identical.
+
+**ggml_cuda** (RTX PRO 6000 slice, one GPU, 512 / 128, two rounds, main -> graph):
+
+| Model | main | graph |
+|---|---|---|
+| Hy-MT2-1.8B Q4_K_M | 819-838 / 54.5-58.0 | 7,246-7,296 / 204-206 |
+| Ministral-3-3B Q4_K_M | 466-622 / 62.3-64.0 | 4,545-4,820 / 137-138 |
+| Mistral-Small-3.1-24B Q4_K_M | 290-319 / 18.8-18.9 | 1,133-1,139 / 25.2-25.3 |
+
+Mistral-Small's greedy text is identical to main; Ministral's differs by design (the YaRN fix
+above; perplexity on 1,020 tokens 47.45 -> 42.29). Hy-MT2's diverges after about 25 words:
+its perplexity is 148.72 on main's CUDA path and 149.64 through the graph, against an exact
+managed reference of 146.39 and 149.45 / 149.50 on ggml_metal (main / graph). Every GGML arm
+sits about 2% above the exact value because ggml quantizes activations in quantized matmuls;
+the graph computes on CUDA what Metal computes, and main's CUDA prefill (about 9x slower)
+dequantized the weights instead, which lands 0.6% lower. Qwen 3.5 on CUDA through the graph: 0.8B 16.1-16.3k / 258 vs `Qwen35Model` 17.4-18.6k /
+269-271; 9B 3.1-3.2k / 40.1 vs 3.5k / 40.6 (9B greedy text identical). Its 0.8B perplexity is
+50.33 against the legacy 50.07; the exact managed reference is 50.24, every backend scatters
+within about 0.3% of it (Metal 50.13, MLX 50.09-50.14), and the runtime is the closer of the two
+CUDA arms, so this is rounding, not a quality loss. Qwen keeps `Qwen35Model` on one device until
+CUDA prefill and the features below reach parity.
 
 ---
 
