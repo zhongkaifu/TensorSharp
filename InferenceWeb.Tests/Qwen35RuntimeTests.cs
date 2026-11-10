@@ -328,6 +328,18 @@ public sealed class Qwen35RuntimeTests : IDisposable
         SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(path, backend: TestGates.PinnedGgmlBackend), $"qwen35 {variant}");
     }
 
+    /// <summary>A shared-prefix checkpoint (attention rows and Gated DeltaNet state), cloned or written
+    /// to a file and read back, continues exactly as a fresh run.</summary>
+    [Theory]
+    [InlineData("dense")]
+    [InlineData("moe")]
+    public void CheckpointsContinueExactly(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(variant);
+        CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(path, backend: TestGates.PinnedGgmlBackend), 1e-5, $"qwen35 {variant}");
+    }
+
     public static TheoryData<int, int> BatchedPlacements() => new() { { 1, 1 }, { 2, 1 }, { 1, 2 }, { 2, 2 } };
 
     [Theory]

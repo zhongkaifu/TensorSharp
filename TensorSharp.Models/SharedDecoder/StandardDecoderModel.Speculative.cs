@@ -94,6 +94,27 @@ namespace TensorSharp.Models
             : _backend == BackendType.GgmlCuda ? 7
             : _backend == BackendType.GgmlMetal ? 5 : 3;
 
+        /// <summary>
+        /// Weight-free n-gram drafts on a dense hybrid stack on ggml_metal whose matmul weights are mostly
+        /// IQ4_XS: Metal serves IQ4_XS with independent matvecs through eight verify rows, so a twelve-token
+        /// draft makes the thirteen-row GEMM pay. Elsewhere the speculator's default.
+        /// </summary>
+        public int SpecPreferredNGramDraftWindow
+        {
+            get
+            {
+                if (_backend != BackendType.GgmlMetal || _anyMoe || !_mesh.IsSingleDevice || !_anyRecurrent) return 0;
+                long iq4 = 0, total = 0;
+                foreach (var (name, q) in _quantWeights)
+                {
+                    if (q.Ne1 <= 1 || !(name.StartsWith("blk.", StringComparison.Ordinal) || name == "output.weight")) continue;
+                    total += q.RawBytes;
+                    if (q.GgmlType == (int)GgmlTensorType.IQ4_XS) iq4 += q.RawBytes;
+                }
+                return iq4 > 0 && iq4 >= total - iq4 ? 12 : 0;
+            }
+        }
+
         /// <summary>No confidence gate for a block drafter on a hybrid stack on ggml_metal (see
         /// <see cref="SpecPreferredDraftWindow"/>).</summary>
         public float SpecPreferredBlockGate => _anyRecurrent && HasDFlash && _backend == BackendType.GgmlMetal ? 0f : float.NaN;

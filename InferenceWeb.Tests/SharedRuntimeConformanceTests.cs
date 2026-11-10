@@ -190,6 +190,17 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(family, path, 1, 1, TestGates.PinnedGgmlBackend), family);
     }
 
+    /// <summary>A shared-prefix checkpoint, cloned or written to a file and read back, continues exactly.</summary>
+    [Theory]
+    [MemberData(nameof(Families))]
+    public void CheckpointsContinueExactly(string family)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family);
+        CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(family, path, 1, 1), 1e-6, $"{family} managed");
+        CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(family, path, 1, 1, TestGates.PinnedGgmlBackend), 1e-5, $"{family} ggml");
+    }
+
     /// <summary>A fixed script over one cache: prefill, decode, truncate + refill, reset, prefill.</summary>
     private static List<float[]> Script(ModelBase model)
     {

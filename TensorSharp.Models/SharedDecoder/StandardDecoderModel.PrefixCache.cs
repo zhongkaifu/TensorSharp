@@ -31,12 +31,16 @@ namespace TensorSharp.Models
                 ? PageFamilyCapabilities(FamilyClass.R, TruncationKind.None, pagesNeedStateAtEnd: true)
                 : PageFamilyCapabilities(FamilyClass.P, TruncationKind.Any);
             if (!SupportsRetainedFusedCache) return pages;
+            bool copies = SupportsPrefixCheckpoints;
             return pages with
             {
-                EndState = EndStateSupport.DonateOnly,
+                NamespaceFingerprint = CheckpointNamespace,
+                EndState = copies ? EndStateSupport.CopyAndDonate : EndStateSupport.DonateOnly,
+                CanCaptureCopy = copies,
                 AdoptPrimaryOnDisplacement = true,
                 MinRetainTokens = 32,
                 RewindCapTokens = _anyRecurrent ? pages.RewindCapTokens : int.MaxValue,
+                Persistable = copies && SupportsRetainedCacheSerialization,
             };
         }
 
@@ -63,8 +67,6 @@ namespace TensorSharp.Models
             return targetTokens == payloadTokens || CanTruncateKVCache(payloadTokens, targetTokens);
         }
 
-        /// <summary>Donation only: no copy of a slot is offered.</summary>
-        public bool SettleForCopy(string payloadKey) => false;
 
         public PayloadFootprint MeasureEndState(string payloadKey)
         {
@@ -77,7 +79,13 @@ namespace TensorSharp.Models
             return new PayloadFootprint(slot.Length, slot.Capacity, vector, PositionDelta: 0);
         }
 
-        public ResourceVector EstimateCloneBytes(string payloadKey, int targetTokens) => default;
+        public ResourceVector EstimateCloneBytes(string payloadKey, int targetTokens)
+        {
+            if (!TryGetRetained(payloadKey, out Slot slot)) return default;
+            long bytes = CloneBytes(slot, targetTokens);
+            bool host = _backend is BackendType.Cpu or BackendType.GgmlCpu;
+            return new ResourceVector { HostKv = host ? bytes : 0, DeviceKv = host ? 0 : bytes };
+        }
 
         private bool TryGetRetained(string payloadKey, out Slot slot)
         {

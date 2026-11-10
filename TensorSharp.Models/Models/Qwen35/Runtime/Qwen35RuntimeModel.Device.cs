@@ -309,6 +309,31 @@ namespace TensorSharp.Models
 
             protected internal override IEnumerable<Tensor> HostTensors => new[] { Conv, Ssm, Backing };
 
+            protected internal override bool CanCopy => true;
+
+            protected internal override IEnumerable<Tensor> CheckpointTensors => new[] { Conv, Backing };
+
+            protected internal override unsafe void CopyFrom(RecurrentState source)
+            {
+                var other = (DeviceGdnState)source;
+                foreach (var (from, to) in new[] { (other.Conv, Conv), (other.Backing, Backing) })
+                {
+                    long bytes = to.ElementCount() * sizeof(float);
+                    Buffer.MemoryCopy((void*)_hostPointer(from), (void*)_hostPointer(to), bytes, bytes);
+                }
+                OnHostWritten();
+            }
+
+            /// <summary>Every key the state is bound through: the conv window, the backing and the state view.</summary>
+            protected internal override void OnHostWritten()
+            {
+                foreach (Tensor t in new[] { Conv, Backing, Ssm })
+                {
+                    GgmlBasicOps.InvalidateHostBuffer(_hostPointer(t));
+                    GgmlBasicOps.InvalidateTensorHostBuffer(t);
+                }
+            }
+
             public IntPtr ConvPointer => _hostPointer(Conv);
 
             /// <summary>Before the per-op block binds the state view: whatever the graphs left in a

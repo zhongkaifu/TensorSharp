@@ -33,6 +33,19 @@ namespace TensorSharp.Models
             /// the device; synced back before any host code reads them.</summary>
             protected internal virtual System.Collections.Generic.IEnumerable<Tensor> HostTensors => Array.Empty<Tensor>();
 
+            /// <summary>The state can be copied (shared-prefix checkpoints, clones).</summary>
+            protected internal virtual bool CanCopy => false;
+
+            /// <summary>Copy <paramref name="source"/>'s host-current state into this one.</summary>
+            protected internal virtual void CopyFrom(RecurrentState source)
+                => throw new NotSupportedException($"{GetType().Name} cannot be copied.");
+
+            /// <summary>The tensors a checkpoint file holds, without aliases.</summary>
+            protected internal virtual System.Collections.Generic.IEnumerable<Tensor> CheckpointTensors => HostTensors;
+
+            /// <summary>The state's host bytes were rewritten: drop every device copy of them.</summary>
+            protected internal virtual void OnHostWritten() { }
+
             public virtual void Dispose() { }
         }
 
