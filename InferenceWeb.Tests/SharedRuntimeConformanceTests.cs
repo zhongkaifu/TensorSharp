@@ -180,6 +180,16 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         }
     }
 
+    /// <summary>Greedy speculative decoding (n-gram drafts) emits what plain greedy decoding emits.</summary>
+    [Theory]
+    [MemberData(nameof(Families))]
+    public void SpeculativeDecodingMatchesPlainGreedy(string family)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family);
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(family, path, 1, 1, TestGates.PinnedGgmlBackend), family);
+    }
+
     /// <summary>A fixed script over one cache: prefill, decode, truncate + refill, reset, prefill.</summary>
     private static List<float[]> Script(ModelBase model)
     {

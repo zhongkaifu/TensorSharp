@@ -4,6 +4,7 @@
 // This file is part of TensorSharp.
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using System;
 using TensorSharp.GGML;
 
 namespace TensorSharp.Models
@@ -35,6 +36,65 @@ namespace TensorSharp.Models
             q = step.Rope(step.RmsNorm(q, LayerName(layer, "attn_q_norm.weight")), _rotary);
             k = step.Rope(step.RmsNorm(k, LayerName(layer, "attn_k_norm.weight")), _rotary);
         }
+
+        // Commit graphs replay per (verify buffer, kept, rows): only copies, no inputs.
+        private readonly System.Collections.Generic.Dictionary<(IntPtr, int, int), GgmlGraph> _commitGraphs = new();
+
+        protected override void OnGraphCacheCleared()
+        {
+            foreach (GgmlGraph g in _commitGraphs.Values) g.Dispose();
+            _commitGraphs.Clear();
+        }
+
+        /// <summary>Set the active request's recurrent states to those after <paramref name="kept"/> rows of
+        /// the last <paramref name="rows"/>-row verify, from its verify buffers (0 rows: the live state is
+        /// still the one before the window).</summary>
+        protected override void CommitRecurrentPrefix(int kept, int rows)
+        {
+            if (kept == 0) return;
+            IntPtr key = IntPtr.Zero;
+            for (int layer = 0; layer < Config.NumLayers && key == IntPtr.Zero; layer++)
+                if (_isRecurrent[layer] && ActiveRecurrentState(layer) is DeviceGdnState first && first.Verify != null)
+                    key = TensorComputePrimitives.GetStoragePointer(first.Verify);
+            if (key == IntPtr.Zero) return;
+            if (!_commitGraphs.TryGetValue((key, kept, rows), out GgmlGraph g))
+            {
+                g = BuildCommitGraph(kept, rows);
+                _commitGraphs[(key, kept, rows)] = g;
+            }
+            if (!g.Run(ReadOnlySpan<int>.Empty, ReadOnlySpan<IntPtr>.Empty, ReadOnlySpan<long>.Empty))
+                throw new InvalidOperationException($"{Config.Architecture} recurrent-state commit failed: {GgmlBasicOps.LastNativeError()}");
+        }
+
+        private GgmlGraph BuildCommitGraph(int kept, int rows)
+        {
+            const long f = sizeof(float);
+            var g = new GgmlGraph(Math.Max(256, Config.NumLayers * 16), replayable: true);
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                if (!_isRecurrent[layer] || ActiveRecurrentState(layer) is not DeviceGdnState state || state.Verify == null)
+                    continue;
+                long stateFloats = state.StateFloats, stateBytes = stateFloats * f;
+                int cap = state.SnapshotCapacity, convRows = state.ConvRows, channels = state.Channels;
+                // Result layout [rows' outputs | state after the last row | state 1 row before | ...].
+                long offset = state.RowFloats * rows * f + (rows - kept) * stateBytes;
+                int verify = GraphLeaf(g, state.Verify, cap * (state.RowFloats + stateFloats));
+                int source = g.Op(GgmlGraphOp.View, stackalloc[] { verify }, stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, offset });
+                int target = InPlaceRecurrentState
+                    ? g.Op(GgmlGraphOp.View, stackalloc[] { GraphLeaf(g, state.Backing, state.RowFloats + stateFloats) },
+                        stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, state.RowFloats * f })
+                    : g.Op(GgmlGraphOp.Reshape, stackalloc[] { GraphLeaf(g, state.Ssm, _headKDim, _headVDim, _numVHeads) }, stackalloc long[] { stateFloats });
+                g.Effect(g.Op(GgmlGraphOp.Cpy, source, target));
+                int hist = GraphLeaf(g, state.ConvHistory, convRows + cap, channels);
+                int window = g.Op(GgmlGraphOp.View, stackalloc[] { hist },
+                    stackalloc long[] { 2, convRows, channels, 1, 1, (convRows + cap) * f, 0, 0, kept * f });
+                g.Effect(g.Op(GgmlGraphOp.Cpy, window, GraphLeaf(g, state.Conv, convRows, channels)));
+            }
+            return g;
+        }
+
+        private static int GraphLeaf(GgmlGraph g, Tensor t, params long[] ne)
+            => g.Leaf(GgmlLeafRole.State, GgmlType.F32, ne, TensorComputePrimitives.GetStoragePointer(t), t.Storage.ByteLength);
 
         protected override int EmitRecurrentMixer(GraphStep step, int layer, int normed)
         {
@@ -109,9 +169,12 @@ namespace TensorSharp.Models
                 // ggml_concat writes a contiguous result, so it reads the transposed view directly.
                 int convIn = step.Op(GgmlGraphOp.Concat, stackalloc[] { window, step.Transpose(qkv) }, stackalloc long[] { 0 });
                 int conv = step.Op(GgmlGraphOp.Silu, step.Op(GgmlGraphOp.SsmConv, convIn, convW));   // [channels, count]
-                // convIn is a fresh contiguous [convRows + count, channels].
-                step.Effect(step.Op(GgmlGraphOp.Cpy,
-                    step.View2(convIn, convRows, channels, (convRows + count) * f, count * f), window));
+                // convIn is a fresh contiguous [convRows + count, channels]. A verify window leaves the
+                // live window alone: the commit sets it from the window's conv history.
+                bool keep = step.RecurrentSnapshots && count > 1;
+                if (!keep)
+                    step.Effect(step.Op(GgmlGraphOp.Cpy,
+                        step.View2(convIn, convRows, channels, (convRows + count) * f, count * f), window));
 
                 // Q, K, V as [head, heads, tokens, 1] views of the conv output; where the backend reads
                 // strided rows they feed the norms and the recurrence directly, else contiguous copies.
@@ -143,17 +206,37 @@ namespace TensorSharp.Models
                 {
                     s4 = step.Reshape(step.State(state.Ssm, GgmlType.F32, dk, dv, vHeads), dk, dv, vHeads, 1);
                 }
-                int gdn = step.Op(GgmlGraphOp.GatedDeltaNet, stackalloc[] { q4, k4, v4, g, beta, s4 }, stackalloc long[] { 1 });
+                // A verify window keeps the state after each of its rows: the recurrence writes its whole
+                // result into the request's verify buffer in place, the live state stays the one before the
+                // window, and the commit copies the accepted prefix's state into place.
+                long stateBytes = stateFloats * f;
+                int gdn = step.Op(GgmlGraphOp.GatedDeltaNet, stackalloc[] { q4, k4, v4, g, beta, s4 },
+                    stackalloc long[] { keep ? count : 1 });
                 int scores = step.View2(gdn, v, count, v * f, 0);
                 int newState = step.Op(GgmlGraphOp.View, stackalloc[] { gdn },
                     stackalloc long[] { 4, dk, dv, vHeads, 1, dk * f, dk * dv * f, dk * dv * vHeads * f, v * count * f });
-                int copy = step.Op(GgmlGraphOp.Cpy, newState, s4);
-                if (viaBacking && count == 1)
-                    // [outputs | state] of one row is exactly the backing: the recurrence updates the
-                    // state in place, as Qwen35Model's fused decode does on Metal.
-                    step.Alias(gdn, backing, 0, copy);
+                if (keep)
+                {
+                    if (state.EnsureSpecBuffers(count)) NoteGraphBindingsChanged();
+                    int cap = state.SnapshotCapacity;
+                    int verify = step.State(state.Verify, GgmlType.F32, cap * (state.RowFloats + stateFloats));
+                    long total = v * count + stateFloats * count;
+                    int fallback = step.Op(GgmlGraphOp.Cpy, step.View2(gdn, total, 1, total * f, 0), step.View2(verify, total, 1, total * f, 0));
+                    step.Alias(gdn, verify, 0, fallback);
+                    int hist = step.State(state.ConvHistory, GgmlType.F32, convRows + cap, channels);
+                    step.Effect(step.Op(GgmlGraphOp.Cpy, convIn,
+                        step.View2(hist, convRows + count, channels, (convRows + cap) * f, 0)));
+                }
                 else
-                    step.Effect(copy);
+                {
+                    int copy = step.Op(GgmlGraphOp.Cpy, newState, s4);
+                    if (viaBacking && count == 1)
+                        // [outputs | state] of one row is exactly the backing: the recurrence updates the
+                        // state in place, as Qwen35Model's fused decode does on Metal.
+                        step.Alias(gdn, backing, 0, copy);
+                    else
+                        step.Effect(copy);
+                }
 
                 int normedOut = step.RmsNorm(step.Reshape(step.Cont(scores), dv, vHeads, count), ssmNorm, eps);
                 int gated = step.Op(GgmlGraphOp.Mul, normedOut, step.Op(GgmlGraphOp.Silu, step.Reshape(z, dv, vHeads, count)));

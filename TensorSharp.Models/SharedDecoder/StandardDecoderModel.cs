@@ -401,6 +401,7 @@ namespace TensorSharp.Models
 
         protected override void ResetKVCacheCore()
         {
+            _verifyRows = 0;   // the state is reset; nothing to settle
             _cacheSeqLen = 0;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
@@ -504,6 +505,7 @@ namespace TensorSharp.Models
 
         private float[] RunSequence(int[] tokens, bool wantLogits)
         {
+            SettlePendingVerify();
             int seqLen = tokens.Length;
             int start = _cacheSeqLen;
             EnsureCacheCapacity(checked(start + seqLen));

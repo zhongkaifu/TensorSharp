@@ -80,7 +80,13 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- active fields
 
-        private Slot SnapshotActive() => new()
+        private Slot SnapshotActive()
+        {
+            SettlePendingVerify();
+            return SnapshotActiveFields();
+        }
+
+        private Slot SnapshotActiveFields() => new()
         {
             K = _cacheK,
             V = _cacheV,

@@ -30,11 +30,7 @@ namespace TensorSharp.Models
             {
                 if (Qwen35RuntimeModel.Serves(c))
                 {
-                    if (!string.IsNullOrEmpty(c.DraftModelPath))
-                        throw new NotSupportedException(
-                            "Qwen 3.5 / 3.6 with --layer-split or host experts on cuda/mlx runs on the shared decoder runtime, " +
-                            "which has no speculative drafter yet; drop --draft-model or the placement.");
-                    return new Qwen35RuntimeModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree);
+                    return new Qwen35RuntimeModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree, c.DraftModelPath);
                 }
                 bool native = c.Backend == BackendType.Cuda && c.TpDegree <= 1 && c.TpGroup == null && Qwen35CudaModel.CanServe(c.Probe);
                 return native

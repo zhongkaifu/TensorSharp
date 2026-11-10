@@ -50,7 +50,7 @@ namespace TensorSharp.Models
         private float[][] _ssmNorm;    // [layer] = [headVDim]
 
         public Qwen35RuntimeModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
-            int layerSplitDegree = 1)
+            int layerSplitDegree = 1, string draftModelPath = null)
             : base(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree)
         {
             string arch = _gguf.GetString("general.architecture") ?? "qwen35";
@@ -116,6 +116,7 @@ namespace TensorSharp.Models
             BuildRecurrentConstants();
             if (DeviceRecurrence)
                 BuildDeviceConstants();
+            AttachDraftModel(draftModelPath);
         }
 
         /// <summary>

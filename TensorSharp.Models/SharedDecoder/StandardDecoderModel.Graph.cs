@@ -83,7 +83,7 @@ namespace TensorSharp.Models
         };
 
         // Decode graphs (every sequence one row) are replayed while their trace matches.
-        private const int GraphCacheEntries = 8;
+        private const int GraphCacheEntries = 32;   // decode + verify widths x window buckets
         private readonly Dictionary<(ulong, ulong), CachedGraph> _graphCache = new();
         private readonly LinkedList<(ulong, ulong)> _graphLru = new();
 
@@ -91,20 +91,47 @@ namespace TensorSharp.Models
         internal sealed class CachedGraph : IDisposable
         {
             public required GgmlGraph Graph { get; init; }
-            public float[] Logits { get; init; }
-            public GCHandle Pin { get; init; }
+            /// <summary>The step's results, in the order they were declared (GraphStep.Output).</summary>
+            public required float[][] Outputs { get; init; }
+            public required GCHandle[] Pins { get; init; }
 
             public void Dispose()
             {
                 Graph.Dispose();
-                if (Pin.IsAllocated) Pin.Free();
+                foreach (GCHandle pin in Pins) if (pin.IsAllocated) pin.Free();
             }
         }
+
+        /// <summary>What a step returns besides advancing the caches.</summary>
+        private sealed class GraphRequest
+        {
+            /// <summary>Logits of each sequence's last row, or of every row.</summary>
+            public bool LastRowLogits { get; init; } = true;
+            public bool AllRowLogits { get; init; }
+            /// <summary>Layers whose INPUT residual [hidden, rows] is returned (a drafter's features).</summary>
+            public int[] CaptureLayers { get; init; } = Array.Empty<int>();
+            /// <summary>Return the final-normed rows [hidden, rows] (a per-token draft head's input).</summary>
+            public bool CaptureFinal { get; init; }
+            /// <summary>Keep the recurrent state after every row (a verify the accept count rewinds).</summary>
+            public bool RecurrentSnapshots { get; init; }
+        }
+
+        private sealed class GraphResult
+        {
+            public float[] Logits;
+            public float[][] Captures;
+            public float[] Final;
+        }
+
+        /// <summary>Rows per sequence up to which a step writes K/V by index and attends to the padded
+        /// cache window (as decode does), so the graph replays; longer chunks attend to their fresh rows.</summary>
+        internal const int SmallChunkRows = 16;
 
         /// <summary>Drop replayable graphs: a bound cache or state was reallocated, freed, or
         /// rewritten on the host, so their device bindings may be stale.</summary>
         private void ClearGraphCache()
         {
+            OnGraphCacheCleared();
             foreach (CachedGraph entry in _graphCache.Values) entry.Dispose();
             _graphCache.Clear();
             _graphLru.Clear();
@@ -124,6 +151,33 @@ namespace TensorSharp.Models
             bool wantLogits, out float[][] logits)
         {
             logits = null;
+            var request = new GraphRequest { LastRowLogits = wantLogits };
+            if (!TryRunGraphStep(hidden, slots, first, counts, starts, request, out GraphResult result))
+                return false;
+            if (result.Logits != null)
+            {
+                int n = slots.Length, vocab = Config.VocabSize;
+                logits = new float[n][];
+                if (n == 1)
+                {
+                    logits[0] = result.Logits;
+                }
+                else
+                {
+                    for (int s = 0; s < n; s++)
+                    {
+                        logits[s] = new float[vocab];
+                        Array.Copy(result.Logits, (long)s * vocab, logits[s], 0, vocab);
+                    }
+                }
+            }
+            return true;
+        }
+
+        private bool TryRunGraphStep(Tensor hidden, Slot[] slots, int[] first, int[] counts, int[] starts,
+            GraphRequest request, out GraphResult result)
+        {
+            result = null;
             string reason = GraphUnsupportedReason();
             if (reason != null)
             {
@@ -138,20 +192,21 @@ namespace TensorSharp.Models
 
             int n = slots.Length;
             int rows = (int)hidden.Sizes[0];
-            bool decode = rows == n;
+            bool replayable = true;
+            foreach (int c in counts) replayable &= c <= SmallChunkRows;
 
-            // A decode step first traces in hash-only mode: when a cached graph has the same
+            // A replayable step first traces in hash-only mode: when a cached graph has the same
             // signature it replays with this step's inputs, and nothing else is recorded.
             GraphStep step = null;
             CachedGraph graph = null;
             bool owned = false;
-            int head = -1;
+            StepOutputs outputs = default;
             try
             {
-                if (decode && _graphCache.Count > 0)
+                if (replayable && _graphCache.Count > 0)
                 {
-                    step = new GraphStep(this, rows, slots, first, counts, starts, decode, record: false);
-                    head = EmitStep(step, hidden, wantLogits);
+                    step = new GraphStep(this, rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, record: false);
+                    outputs = EmitStep(step, hidden, request);
                     if (_graphCache.TryGetValue(step.Signature, out graph))
                     {
                         _graphLru.Remove(step.Signature);
@@ -166,10 +221,10 @@ namespace TensorSharp.Models
                 }
                 if (graph == null)
                 {
-                    step = new GraphStep(this, rows, slots, first, counts, starts, decode, record: true);
-                    head = EmitStep(step, hidden, wantLogits);
-                    graph = step.Build(replayable: decode, reorder: decode && GraphReorderOnMetal);
-                    if (decode)
+                    step = new GraphStep(this, rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, record: true);
+                    outputs = EmitStep(step, hidden, request);
+                    graph = step.Build(replayable, reorder: replayable && GraphReorderOnMetal);
+                    if (replayable)
                     {
                         var key = step.Signature;
                         _graphCache[key] = graph;
@@ -192,25 +247,14 @@ namespace TensorSharp.Models
                     throw new InvalidOperationException($"{Config.Architecture} graph step failed: {GgmlBasicOps.LastNativeError()}");
                 GraphRuns++;
                 foreach (Slot slot in slots) slot.DeviceDirty = true;
-                if (head >= 0)
+                // A replayed graph's buffers are rewritten by its next run (the model-owned buffer
+                // contract); a one-shot graph's arrays are the caller's.
+                result = new GraphResult
                 {
-                    int vocab = Config.VocabSize;
-                    logits = new float[n][];
-                    if (n == 1 && !owned)
-                    {
-                        // The graph's own buffer, rewritten by its next run: the same contract as a
-                        // model-owned logits buffer.
-                        logits[0] = graph.Logits;
-                    }
-                    else
-                    {
-                        for (int s = 0; s < n; s++)
-                        {
-                            logits[s] = new float[vocab];
-                            Array.Copy(graph.Logits, (long)s * vocab, logits[s], 0, vocab);
-                        }
-                    }
-                }
+                    Logits = outputs.Logits >= 0 ? graph.Outputs[outputs.Logits] : null,
+                    Final = outputs.Final >= 0 ? graph.Outputs[outputs.Final] : null,
+                    Captures = outputs.Captures == null ? null : Array.ConvertAll(outputs.Captures, i => graph.Outputs[i]),
+                };
                 return true;
             }
             catch (InvalidOperationException) when (step != null && step.Rejected)
@@ -226,19 +270,29 @@ namespace TensorSharp.Models
             }
         }
 
-        /// <summary>Trace one step: every layer, then (when wanted) the head over each sequence's last row.
-        /// Returns the head node, or -1.</summary>
-        private int EmitStep(GraphStep step, Tensor hidden, bool wantLogits)
+        private struct StepOutputs
         {
-            int n = step.Sequences, rows = step.Rows;
-            int h = step.Input(hidden, Config.HiddenSize, rows);
+            public int Logits, Final;
+            public int[] Captures;
+        }
+
+        /// <summary>Trace one step: every layer, then what the request asks for.</summary>
+        private StepOutputs EmitStep(GraphStep step, Tensor hidden, GraphRequest request)
+        {
+            int n = step.Sequences, rows = step.Rows, hiddenSize = Config.HiddenSize;
+            var outputs = new StepOutputs { Logits = -1, Final = -1 };
+            int h = step.Input(hidden, hiddenSize, rows);
             var positions = new int[rows];
             for (int s = 0; s < n; s++)
                 for (int i = 0; i < step.Counts[s]; i++) positions[step.First[s] + i] = step.Starts[s] + i;
             step.SetPositions(positions);
 
+            if (request.CaptureLayers.Length > 0) outputs.Captures = new int[request.CaptureLayers.Length];
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
+                for (int c = 0; c < request.CaptureLayers.Length; c++)
+                    if (request.CaptureLayers[c] == layer)
+                        outputs.Captures[c] = step.Output(h, (long)hiddenSize * rows);
                 int normed = step.RmsNorm(h, LayerName(layer, "attn_norm.weight"));
                 int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
                 h = step.Op(GgmlGraphOp.Add, h, mix);
@@ -246,22 +300,33 @@ namespace TensorSharp.Models
                 int ffn = _moeLayer[layer] ? EmitMoe(step, layer, ffnIn) : EmitDenseFfn(step, layer, ffnIn);
                 h = step.Op(GgmlGraphOp.Add, h, ffn);
             }
-            if (!wantLogits) return -1;
+            for (int c = 0; c < request.CaptureLayers.Length; c++)
+                if (request.CaptureLayers[c] >= Config.NumLayers)
+                    outputs.Captures[c] = step.Output(h, (long)hiddenSize * rows);
+            if (!request.LastRowLogits && !request.AllRowLogits && !request.CaptureFinal) return outputs;
 
             int final = step.RmsNorm(h, "output_norm.weight");
-            int selected;
-            if (n == 1 && rows == 1) selected = final;
-            else if (n == 1) selected = step.View2(final, Config.HiddenSize, 1, Config.HiddenSize * 4L, (rows - 1) * Config.HiddenSize * 4L);
-            else
+            if (request.CaptureFinal) outputs.Final = step.Output(final, (long)hiddenSize * rows);
+            string headName = _quantWeights.ContainsKey("output.weight") || _weights.ContainsKey("output.weight")
+                ? "output.weight" : "token_embd.weight";
+            if (request.AllRowLogits)
             {
-                var last = new int[n];
-                for (int s = 0; s < n; s++) last[s] = step.First[s] + step.Counts[s] - 1;
-                selected = step.Op(GgmlGraphOp.GetRows, final, step.InputI32(last, n));
+                outputs.Logits = step.Output(step.MatMul(headName, final), (long)Config.VocabSize * rows);
             }
-            int head = step.MatMul(_quantWeights.ContainsKey("output.weight") || _weights.ContainsKey("output.weight")
-                ? "output.weight" : "token_embd.weight", selected);
-            step.Output(head, (long)Config.VocabSize * n);
-            return head;
+            else if (request.LastRowLogits)
+            {
+                int selected;
+                if (n == 1 && rows == 1) selected = final;
+                else if (n == 1) selected = step.View2(final, hiddenSize, 1, hiddenSize * 4L, (rows - 1) * hiddenSize * 4L);
+                else
+                {
+                    var last = new int[n];
+                    for (int s = 0; s < n; s++) last[s] = step.First[s] + step.Counts[s] - 1;
+                    selected = step.Op(GgmlGraphOp.GetRows, final, step.InputI32(last, n));
+                }
+                outputs.Logits = step.Output(step.MatMul(headName, selected), (long)Config.VocabSize * n);
+            }
+            return outputs;
         }
 
         private readonly Dictionary<(int Layer, string Suffix), string> _layerNames = new();
@@ -330,19 +395,20 @@ namespace TensorSharp.Models
                 int cv = step.State(slot.V[layer][0], kvType, dv, cap, kvHeads);
 
                 int fa;
-                if (count == 1)
+                if (count <= SmallChunkRows)
                 {
-                    // Decode: the row is written by index and attention reads a padded window under
-                    // a mask, so every token of a window bucket replays the same graph.
-                    int row = step.WriteIndex(start);
-                    step.Effect(step.Op(GgmlGraphOp.SetRows, ck, kFresh, row));
-                    step.Effect(step.Op(GgmlGraphOp.SetRows, cv, vFresh, row));
+                    // Decode and short chunks (a verify window): rows are written by index and
+                    // attention reads the padded cache window under a causal mask, so every row is
+                    // computed as a decode row is and a window bucket replays the same graph.
+                    int rowsAt = step.WriteRows(start, count);
+                    step.Effect(step.Op(GgmlGraphOp.SetRows, ck, kFresh, rowsAt));
+                    step.Effect(step.Op(GgmlGraphOp.SetRows, cv, vFresh, rowsAt));
                     int stepRows = DecodeWindowStep;
-                    int window = Math.Min(cap, (start + 1 + stepRows - 1) / stepRows * stepRows);
+                    int window = Math.Min(cap, (start + count + stepRows - 1) / stepRows * stepRows);
                     int gqa = heads / kvHeads;
-                    int kWin = step.Op(GgmlGraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, window, kvType, 1, gqa });
-                    int vWin = step.Op(GgmlGraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, window, kvType, 1, gqa });
-                    fa = step.FlashAttention(qPerm, kWin, vWin, step.DecodeMask(window, start + 1), scale);
+                    int kWin = step.Op(GgmlGraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, window, kvType, count, gqa });
+                    int vWin = step.Op(GgmlGraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, window, kvType, count, gqa });
+                    fa = step.FlashAttention(qPerm, kWin, vWin, step.ChunkMask(window, start, count), scale);
                 }
                 else
                 {
@@ -481,15 +547,16 @@ namespace TensorSharp.Models
             private int _nodes;
             private ulong _h1 = 14695981039346656037UL, _h2 = 0x9E3779B97F4A7C15UL;
             private int _mask = -1, _maskStart = -1, _maskCount = -1;
-            private int _decodeMask = -1, _decodeMaskWindow = -1, _decodeMaskValid = -1;
+            private int _decodeMask = -1, _decodeMaskWindow = -1, _decodeMaskValid = -1;   // valid: start * 64 + count
             private readonly Dictionary<int, int> _writeIndex = new();
             private readonly HashSet<int> _strided = new();   // nodes whose layout is not contiguous
 
             private readonly bool _record;
 
             internal GraphStep(StandardDecoderModel model, int rows, Slot[] slots, int[] first, int[] counts, int[] starts,
-                bool decode, bool record)
+                bool decode, bool snapshots, bool record)
             {
+                RecurrentSnapshots = snapshots;
                 _m = model;
                 _record = record;
                 Rows = rows;
@@ -506,8 +573,10 @@ namespace TensorSharp.Models
             public int[] First { get; }
             public int[] Counts { get; }
             public int[] Starts { get; }
-            /// <summary>Every sequence forwards one row (the graph may be replayed).</summary>
+            /// <summary>Every sequence forwards a short chunk (the graph may be replayed).</summary>
             public bool IsDecode { get; }
+            /// <summary>Keep the recurrent state after every row (a verify window).</summary>
+            public bool RecurrentSnapshots { get; }
             /// <summary>Token positions [rows] (I32).</summary>
             public int Positions { get; private set; } = -1;
             /// <summary>The positions' values (row order).</summary>
@@ -567,11 +636,15 @@ namespace TensorSharp.Models
                 if (_record) _recs.Add(new Rec { Kind = Kind.Alias, Node = node, Srcs = new[] { baseLeaf, fallback }, Bytes = offset });
             }
 
-            /// <summary>The step's result: <paramref name="floats"/> F32 values of <paramref name="node"/>.</summary>
-            internal void Output(int node, long floats)
+            private int _outputs;
+
+            /// <summary>A step result: <paramref name="floats"/> F32 values of <paramref name="node"/>;
+            /// returns its index among the step's results.</summary>
+            internal int Output(int node, long floats)
             {
                 Mix(4); Mix(node); Mix(floats);
                 if (_record) _recs.Add(new Rec { Kind = Kind.Output, Node = node, Bytes = floats });
+                return _outputs++;
             }
 
             // ---- leaves
@@ -669,26 +742,29 @@ namespace TensorSharp.Models
                 Positions = InputI32(positions, positions.Length);
             }
 
-            /// <summary>The row index [1, 1] (I64) a decode token is written at.</summary>
-            internal int WriteIndex(int row)
+            /// <summary>The rows [count, 1] (I64) a short chunk is written at: start .. start + count - 1.</summary>
+            internal int WriteRows(int start, int count)
             {
-                if (_writeIndex.TryGetValue(row, out int node)) return node;
-                node = Leaf(GgmlLeafRole.Input, GgmlType.I64, stackalloc long[] { 1, 1 }, IntPtr.Zero, 0);
-                AddInput(node, Pin(new long[] { row }), sizeof(long));
-                _writeIndex[row] = node;
+                if (_writeIndex.TryGetValue(start * 64 + count, out int node)) return node;
+                node = Leaf(GgmlLeafRole.Input, GgmlType.I64, stackalloc long[] { count, 1 }, IntPtr.Zero, 0);
+                var rows = new long[count];
+                for (int i = 0; i < count; i++) rows[i] = start + i;
+                AddInput(node, Pin(rows), count * sizeof(long));
+                _writeIndex[start * 64 + count] = node;
                 return node;
             }
 
-            /// <summary>An F16 mask [window, 1] admitting the first <paramref name="valid"/> rows.</summary>
-            internal int DecodeMask(int window, int valid)
+            /// <summary>An F16 causal mask [window, count]: row q sees cache rows 0 .. start + q.</summary>
+            internal int ChunkMask(int window, int start, int count)
             {
-                if (_decodeMask >= 0 && _decodeMaskWindow == window && _decodeMaskValid == valid) return _decodeMask;
-                var mask = new ushort[window];
-                for (int i = valid; i < window; i++) mask[i] = 0xFC00;   // -inf
-                _decodeMask = Leaf(GgmlLeafRole.Input, GgmlType.F16, stackalloc long[] { window, 1 }, IntPtr.Zero, 0);
+                if (_decodeMask >= 0 && _decodeMaskWindow == window && _decodeMaskValid == start * 64 + count) return _decodeMask;
+                var mask = new ushort[(long)window * count];
+                for (int q = 0; q < count; q++)
+                    for (int k = start + q + 1; k < window; k++) mask[(long)q * window + k] = 0xFC00;   // -inf
+                _decodeMask = Leaf(GgmlLeafRole.Input, GgmlType.F16, stackalloc long[] { window, count }, IntPtr.Zero, 0);
                 AddInput(_decodeMask, Pin(mask), mask.LongLength * sizeof(ushort));
                 _decodeMaskWindow = window;
-                _decodeMaskValid = valid;
+                _decodeMaskValid = start * 64 + count;
                 return _decodeMask;
             }
 
@@ -843,8 +919,8 @@ namespace TensorSharp.Models
             {
                 if (!_record) throw new InvalidOperationException("a hash-only trace cannot be built");
                 var g = new GgmlGraph(Math.Max(1024, _nodes + 64), replayable, reorder);
-                float[] logits = null;
-                GCHandle pin = default;
+                var outputs = new List<float[]>();
+                var pins = new List<GCHandle>();
                 try
                 {
                     foreach (Rec r in _recs)
@@ -856,18 +932,20 @@ namespace TensorSharp.Models
                             case Kind.Effect: g.Effect(r.Node); break;
                             case Kind.Alias: g.Alias(r.Node, r.Srcs[0], r.Bytes, r.Srcs[1]); break;
                             case Kind.Output:
-                                logits = new float[r.Bytes];
-                                pin = GCHandle.Alloc(logits, GCHandleType.Pinned);
+                                var values = new float[r.Bytes];
+                                GCHandle pin = GCHandle.Alloc(values, GCHandleType.Pinned);
+                                outputs.Add(values);
+                                pins.Add(pin);
                                 g.Output(r.Node, pin.AddrOfPinnedObject(), r.Bytes * sizeof(float));
                                 break;
                         }
                     }
-                    return new CachedGraph { Graph = g, Logits = logits, Pin = pin };
+                    return new CachedGraph { Graph = g, Outputs = outputs.ToArray(), Pins = pins.ToArray() };
                 }
                 catch
                 {
                     g.Dispose();
-                    if (pin.IsAllocated) pin.Free();
+                    foreach (GCHandle pin in pins) pin.Free();
                     throw;
                 }
             }

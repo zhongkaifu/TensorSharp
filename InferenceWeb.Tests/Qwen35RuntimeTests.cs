@@ -314,6 +314,20 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>Greedy speculative decoding on the runtime (n-gram drafts, so verifies are partly
+    /// accepted and partly rejected) emits exactly the tokens plain greedy decoding emits: the
+    /// verify keeps each row's recurrent state and the accept count selects the accepted prefix's.</summary>
+    [Theory]
+    [InlineData("dense")]
+    [InlineData("dense-mixed")]
+    [InlineData("moe")]
+    public void SpeculativeDecodingMatchesPlainGreedy(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(variant);
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(path, backend: TestGates.PinnedGgmlBackend), $"qwen35 {variant}");
+    }
+
     public static TheoryData<int, int> BatchedPlacements() => new() { { 1, 1 }, { 2, 1 }, { 1, 2 }, { 2, 2 } };
 
     [Theory]

@@ -251,6 +251,10 @@ namespace TensorSharp.Models
                 int convRows, int channels, int vHeads, int dv, int dk)
             {
                 _hostPointer = hostPointer;
+                _allocator = allocator;
+                ConvRows = Math.Max(1, convRows);
+                Channels = channels;
+                StateFloats = (long)vHeads * dv * dk;
                 Conv = new Tensor(allocator, DType.Float32, channels, Math.Max(1, convRows));
                 // [one token's outputs | state]: a decode-row graph writes the recurrence's result
                 // into Backing, so its state part lands on Ssm in place (no state copy per token).
@@ -261,8 +265,35 @@ namespace TensorSharp.Models
                 Reset();
             }
 
+            private readonly IAllocator _allocator;
+
             public Tensor Conv { get; }
             public Tensor Ssm { get; }
+            public int ConvRows { get; }
+            public int Channels { get; }
+            public long StateFloats { get; }
+
+            /// <summary>A verify window's recurrence result, written there in place: [outputs of its rows |
+            /// state after the last row | state 1 row before it | ...], room for SnapshotCapacity rows.</summary>
+            public Tensor Verify { get; private set; }
+            /// <summary>The conv inputs of a verify window, [channels, ConvRows + capacity]: columns
+            /// [k, k + ConvRows) are the window after k of its rows.</summary>
+            public Tensor ConvHistory { get; private set; }
+            public int SnapshotCapacity { get; private set; }
+
+            /// <summary>Room for a <paramref name="rows"/>-row verify; true when the buffers moved.</summary>
+            public bool EnsureSpecBuffers(int rows)
+            {
+                if (rows <= SnapshotCapacity) return false;
+                int capacity = 4;
+                while (capacity < rows) capacity *= 2;
+                Verify?.Dispose();
+                ConvHistory?.Dispose();
+                Verify = new Tensor(_allocator, DType.Float32, capacity * (RowFloats + StateFloats));
+                ConvHistory = new Tensor(_allocator, DType.Float32, Channels, ConvRows + capacity);
+                SnapshotCapacity = capacity;
+                return true;
+            }
             /// <summary>One token's recurrence outputs followed by the state (Ssm views its tail).</summary>
             public Tensor Backing { get; }
             public long RowFloats { get; }
@@ -308,6 +339,8 @@ namespace TensorSharp.Models
                 Conv.Dispose();
                 Ssm.Dispose();
                 Backing.Dispose();
+                Verify?.Dispose();
+                ConvHistory?.Dispose();
             }
         }
 
