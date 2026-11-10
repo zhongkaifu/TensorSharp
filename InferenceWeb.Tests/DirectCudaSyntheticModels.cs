@@ -140,6 +140,11 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
     public int TopK { get; init; } = 4;
     public int ExpertFf { get; init; } = 256;
     public int SharedFf { get; init; } = 256;
+    /// <summary>When set, every projection and expert is written in this type (BF16: no
+    /// activation quantization, so two implementations of the recipe can be compared tightly;
+    /// the default IQ3_S / IQ4_XS / Q8_0 mix quantizes activations and so amplifies tiny
+    /// upstream differences into ~1e-2 output differences).</summary>
+    public GgmlType? UniformWeightType { get; init; }
 
     public string Write(string path)
     {
@@ -173,9 +178,9 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
 
         var t = new List<Tensor>
         {
-            GptOssSyntheticModelBuilder.Q8(Gen("token_embd.weight", 0.5f, Hidden, Vocab)),
+            Q8(Gen("token_embd.weight", 0.5f, Hidden, Vocab)),
             GenAround("output_norm.weight", 1f, 0.1f, Hidden),
-            Blocks("output.weight", GgmlType.Q6_K, 0.08f, Hidden, Vocab),
+            Typed("output.weight", GgmlType.Q6_K, 0.08f, Hidden, Vocab),
         };
         int qkvDim = 2 * SsmKHeads * SsmHeadDim + SsmInner;
         for (int l = 0; l < Layers; l++)
@@ -205,9 +210,9 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
                 t.Add(Q8(p + "attn_output.weight", 0.04f, NumHeads * HeadDim, Hidden));
             }
             t.Add(Gen(p + "ffn_gate_inp.weight", 0.3f, Hidden, Experts));
-            t.Add(Blocks(p + "ffn_gate_exps.weight", GgmlType.IQ3_S, 0.06f, Hidden, ExpertFf, Experts));
-            t.Add(Blocks(p + "ffn_up_exps.weight", GgmlType.IQ3_S, 0.06f, Hidden, ExpertFf, Experts));
-            t.Add(Blocks(p + "ffn_down_exps.weight", GgmlType.IQ4_XS, 0.06f, ExpertFf, Hidden, Experts));
+            t.Add(Typed(p + "ffn_gate_exps.weight", GgmlType.IQ3_S, 0.06f, Hidden, ExpertFf, Experts));
+            t.Add(Typed(p + "ffn_up_exps.weight", GgmlType.IQ3_S, 0.06f, Hidden, ExpertFf, Experts));
+            t.Add(Typed(p + "ffn_down_exps.weight", GgmlType.IQ4_XS, 0.06f, ExpertFf, Hidden, Experts));
             t.Add(Gen(p + "ffn_gate_inp_shexp.weight", 0.3f, Hidden));
             t.Add(Q8(p + "ffn_gate_shexp.weight", 0.06f, Hidden, SharedFf));
             t.Add(Q8(p + "ffn_up_shexp.weight", 0.06f, Hidden, SharedFf));
@@ -217,7 +222,22 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
         return path;
     }
 
-    private static Tensor Q8(string name, float scale, params int[] dims) => GptOssSyntheticModelBuilder.Q8(Gen(name, scale, dims));
+    private Tensor Q8(string name, float scale, params int[] dims) => Q8(Gen(name, scale, dims));
+
+    private Tensor Q8(Tensor x)
+    {
+        if (UniformWeightType is not GgmlType uniform) return GptOssSyntheticModelBuilder.Q8(x);
+        x.Type = uniform;
+        return x;
+    }
+
+    private Tensor Typed(string name, GgmlType type, float scale, params int[] dims)
+    {
+        if (UniformWeightType is not GgmlType uniform) return Blocks(name, type, scale, dims);
+        Tensor x = Gen(name, scale, dims);
+        x.Type = uniform;
+        return x;
+    }
 }
 
 /// <summary>Dense Qwen3.5 (qwen35, the 0.8B layout that Stage 0 calls qwen08): three Gated DeltaNet

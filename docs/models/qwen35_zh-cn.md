@@ -881,6 +881,39 @@ ssm_out + AllReduce 6%、router 6%、LM head 2.5%。在能装进单卡的 Qwen3.
 上，使用设备 AllReduce 时 `--tp 2` 与单卡运行在 60 个贪心 token 内逐字节一致。
 完整细节见 [`TENSOR_PARALLELISM_PLAN.md`](../../TENSOR_PARALLELISM_PLAN.md)。
 
+## 13b. 多 GPU 放置
+
+| 请求 | 由谁服务 |
+|---|---|
+| 单设备 | `Qwen35Model`（融合整模型计算图、MLX、直连 CUDA） |
+| `--tp N` | `Qwen35Model` 自身的张量并行（13a）；并发请求逐个服务 |
+| `--layer-split P`、`--tp T --layer-split P`（混合），`cuda` / `ggml_cuda` / `ggml_vulkan`，单进程 | 运行在[共享解码运行时](../design/unified-execution.md)（英文）上的 [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs)；并发请求保持批处理 |
+| `cuda` 或 `mlx` 上的 `--n-cpu-moe N` / `--cpu-moe` | `Qwen35RuntimeModel`（运行时的主机专家） |
+
+`Qwen35RuntimeModel` 是该家族在运行时上的配方：运行时的门控注意力（`attn_q` 输出每个
+head 的 `[q_h | gate_h]`）、在部分 NeoX 旋转之前做逐 head 的 Q/K RMSNorm，以及作为循环
+混合器的 Gated DeltaNet，其状态由运行时按（层，rank）以及按批处理序列保存。在 `--tp`
+下每个 rank 拥有一段 key head 以及读取它们的 value head（块循环），因此只有 `ssm_out`
+的部分和需要归约。它暂不支持：图像（仅文本）、`--draft-model`（拒绝）与内嵌的 NextN 块
+（不加载），以及 Bonsai2 / PRISM checkpoint 和路由专家上的 NVFP4 sidecar 缩放（加载时
+拒绝）。循环状态无法回退，所以只能截断到当前长度或零，前缀缓存会重新预填共享前缀，而不是
+恢复它。
+
+它的 Gated DeltaNet 递推在主机上运行，每 token 比 `Qwen35Model` 的融合计算图慢，因此只
+服务 `Qwen35Model` 不支持的场景。在 Apple M5 Pro 上用 Qwen3.5-0.8B Q8_0、本仓库文档的两个
+512 token 块测得（teacher-forced，与 `llama-perplexity` 的计分方式相同）：
+
+| 后端 | `Qwen35Model` | `Qwen35RuntimeModel` |
+|---|---|---|
+| 困惑度，`cpu` / `ggml_metal` / `mlx` | 50.242 / 50.134 / 50.090 | 50.239 / 50.136 / 50.135 |
+| decode tok/s，`cpu` / `ggml_metal` / `mlx` | 110 / 226 / 188 | 75 / 29 / 48 |
+
+llama.cpp `llama-perplexity` 在相同块上为 50.170。在合成 BF16 夹具（dense 与 MoE，包括
+value head 多于 key head 的情况）上两者的相对 L2 差在 1e-4 以内；张量并行、按层切分、混合
+放置、批处理并发请求与主机专家在 `Qwen35RuntimeTests` 中与单设备对照验证。要把其余放置也
+迁到运行时，需要按 rank 在设备上运行递推，以及运行时的原生计算图下沉
+（[统一执行 §7](../design/unified-execution.md)，英文）。
+
 ## 14. 优化机会
 
 - **原生 GDN decode（回退路径）** —— 融合整模型路径已是原生实现，但逐算子

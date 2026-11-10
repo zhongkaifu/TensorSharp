@@ -4,6 +4,8 @@
 // This file is part of TensorSharp.
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using System;
+using System.Linq;
 using TensorSharp.Models.Architecture;
 
 namespace TensorSharp.Models
@@ -18,8 +20,22 @@ namespace TensorSharp.Models
             Aliases = new[] { "qwen35", "qwen35moe", "qwen3next" },
             // --backend cuda on a dense NVFP4 checkpoint runs the direct-CUDA engine
             // (TS_Q35_NATIVE=0 keeps the managed path).
+            // The shared decoder runtime (Qwen35RuntimeModel) serves the placements and
+            // mechanisms the family's own model does not: whole-layer stages (local or
+            // multi-node), their hybrid with --tp, and routed experts on the host for cuda and
+            // mlx. Everything else keeps Qwen35Model's fused single-device and tensor-parallel
+            // graphs, which the runtime does not match yet (Qwen3.5-0.8B decode on an M5 Pro:
+            // 226 vs 29 tok/s on ggml_metal, 188 vs 48 on MLX).
             Factory = c =>
             {
+                if (Qwen35RuntimeModel.Serves(c))
+                {
+                    if (!string.IsNullOrEmpty(c.DraftModelPath))
+                        throw new NotSupportedException(
+                            "Qwen 3.5 / 3.6 with --layer-split or host experts on cuda/mlx runs on the shared decoder runtime, " +
+                            "which has no speculative drafter yet; drop --draft-model or the placement.");
+                    return new Qwen35RuntimeModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree);
+                }
                 bool native = c.Backend == BackendType.Cuda && c.TpDegree <= 1 && c.TpGroup == null && Qwen35CudaModel.CanServe(c.Probe);
                 return native
                     ? new Qwen35CudaModel(c.GgufPath, c.DraftModelPath)
@@ -36,11 +52,13 @@ namespace TensorSharp.Models
                 Implementation = ServingImplementation.Bespoke,
                 HasRoutedExperts = true,
                 ContinuousBatching = MechanismSupport.On(ServingBackends.All),
+                // Qwen35Model's own tensor parallelism: per-rank fused graphs, no batched forward.
                 TensorParallel = MechanismSupport.On(ServingBackends.PerOpTensorParallel),
-                LayerSplit = MechanismSupport.None("Qwen 3.5 / 3.6 does not implement whole-layer placement; use --tp N."),
-                HybridParallel = MechanismSupport.None("Qwen 3.5 / 3.6 does not implement whole-layer placement, so it cannot combine it with --tp."),
-                ExpertOffload = MechanismSupport.On(ServingBackends.Ggml).ElsewhereGap(
-                    "Qwen 3.5 MoE offloads routed experts only on the GGML backends; cpu, cuda and mlx keep them in their stacked-expert buffers."),
+                // The shared decoder runtime: batching survives both.
+                LayerSplit = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
+                HybridParallel = MechanismSupport.On(ServingContract.MultiDeviceBackends.ToArray()).KeepsBatching(),
+                // GGML backends: Qwen35Model's host-MoE seam; cuda and mlx: the shared runtime.
+                ExpertOffload = MechanismSupport.On(ServingBackends.All),
             },
         };
     }

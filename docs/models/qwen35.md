@@ -1441,6 +1441,44 @@ Q8_0 (which fits one card) `--tp 2` is byte-identical to the single-GPU run over
 60 greedy tokens with the device AllReduce. Full detail:
 [`TENSOR_PARALLELISM_PLAN.md`](../../TENSOR_PARALLELISM_PLAN.md).
 
+## 13b. Multi-GPU placements
+
+| Request | Served by |
+|---|---|
+| one device | `Qwen35Model` (fused whole-model graphs, MLX, direct CUDA) |
+| `--tp N` | `Qwen35Model`'s own tensor parallelism (13a); concurrent requests are served one at a time |
+| `--layer-split P`, `--tp T --layer-split P` (hybrid), on `cuda` / `ggml_cuda` / `ggml_vulkan`, one process | [`Qwen35RuntimeModel`](../../TensorSharp.Models/Models/Qwen35/Runtime/Qwen35RuntimeModel.cs) on the [shared decoder runtime](../design/unified-execution.md); concurrent requests stay batched |
+| `--n-cpu-moe N` / `--cpu-moe` on `cuda` or `mlx` | `Qwen35RuntimeModel` (the runtime's host experts) |
+
+`Qwen35RuntimeModel` is the family's recipe on the runtime: the runtime's gated
+attention (`attn_q` emits `[q_h | gate_h]`), per-head Q/K RMSNorm before the partial
+NeoX rotary, and Gated DeltaNet as a recurrent mixer whose state the runtime keeps per
+(layer, rank) and per batched sequence. Under `--tp` a rank owns a block of key heads
+and the value heads that read them (block-cyclic), so only `ssm_out`'s partial sum is
+reduced. What it does not do yet: images (text only), `--draft-model` (refused) and
+the embedded NextN block (not loaded), and Bonsai2 / PRISM checkpoints or NVFP4
+sidecar scales on routed experts (both refused at load). A recurrent state cannot be
+rewound, so it truncates only to its length or to zero and the prefix cache
+re-prefills a shared prefix instead of restoring it.
+
+Its Gated DeltaNet recurrence runs on the host, so it is slower per token than
+`Qwen35Model`'s fused graphs, which is why it serves only what `Qwen35Model` does not.
+Measured on an Apple M5 Pro, Qwen3.5-0.8B Q8_0, two 512-token chunks of this
+repository's docs (teacher-forced, as `llama-perplexity` scores them):
+
+| Backend | `Qwen35Model` | `Qwen35RuntimeModel` |
+|---|---|---|
+| perplexity, `cpu` / `ggml_metal` / `mlx` | 50.242 / 50.134 / 50.090 | 50.239 / 50.136 / 50.135 |
+| decode tok/s, `cpu` / `ggml_metal` / `mlx` | 110 / 226 / 188 | 75 / 29 / 48 |
+
+llama.cpp `llama-perplexity` on the same chunks: 50.170. On synthetic BF16 fixtures
+(dense and MoE, including value heads that outnumber key heads) the two agree within
+1e-4 relative L2; tensor parallelism, layer split, hybrid placement, batched
+concurrent requests and host experts are checked against one device in
+`Qwen35RuntimeTests`. Moving the remaining placements to the runtime needs the
+recurrence on the device per rank and the runtime's native graph lowering
+([unified execution §7](../design/unified-execution.md)).
+
 ## 14. Optimization opportunities
 
 - **Native GDN decode (fallback path)** — the fused whole-model path is

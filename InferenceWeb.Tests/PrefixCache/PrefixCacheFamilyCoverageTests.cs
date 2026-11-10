@@ -89,7 +89,7 @@ public sealed class PrefixCacheFamilyCoverageTests
         Assert.Equal(
             new[] { "DeepSeek41Model", "DeepSeek4Model", "Gemma4Model", "GlmDsaModel", "GptOssModel", "HunyuanDenseModel",
                     "MiniMaxM3Model", "Mistral3Model", "MuseGlimmerModel", "MuseSparkModel", "NemotronModel", "Qwen35CudaModel",
-                    "Qwen35Model", "Qwen4ExpCudaModel", "Qwen4ExpModel" },
+                    "Qwen35Model", "Qwen35RuntimeModel", "Qwen4ExpCudaModel", "Qwen4ExpModel" },
             engineServed.Select(t => t.Name).ToArray());
     }
 
@@ -106,6 +106,7 @@ public sealed class PrefixCacheFamilyCoverageTests
     [InlineData(typeof(Mistral3Model))]
     [InlineData(typeof(HunyuanDenseModel))]
     [InlineData(typeof(MuseGlimmerModel))]
+    [InlineData(typeof(Qwen35RuntimeModel))]
     public void PageFamilies_RefuseEveryEndStateMember(Type family)
         => Assert.True(typeof(IPageOnlyPrefixCacheModel).IsAssignableFrom(family), $"{family.Name} is not an IPageOnlyPrefixCacheModel");
 

@@ -351,7 +351,9 @@ TensorSharp 支持**张量并行（TP）**——按 Megatron-LM 列/行并行范
 
 | 架构 | 多卡模式 |
 |---|---|
-| Mistral 3、Gemma 4、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Muse-Glimmer（上限 `--tp 2`） | 张量并行，用 `--tp N` 显式开启 |
+| Mistral 3、Hunyuan Dense（共享解码运行时） | 在 `cuda`、`ggml_cuda`、`ggml_vulkan` 上支持 `--tp T`、`--layer-split P` 以及两者组合（混合：P 个整层阶段，每个阶段 T 张 GPU）；每种放置下并发请求都保持批处理（[统一执行](docs/design/unified-execution.md)，英文） |
+| Qwen 3.5/3.6-family（`qwen35`、`qwen35moe`） | `--tp N`：该家族自己的张量并行（按 rank 的融合计算图；并发请求逐个服务）。`--layer-split P` 与 `--tp T --layer-split P`（混合）在 `cuda`、`ggml_cuda`、`ggml_vulkan` 上（单进程）：由共享解码运行时提供，保持批处理；仅文本、不支持 `--draft-model`，每 token 比单设备融合计算图慢（见 [qwen35_zh-cn.md](docs/models/qwen35_zh-cn.md#13b-多-gpu-放置)）。Bonsai2 与带 NVFP4 sidecar 的 MoE checkpoint 在这些放置下被拒绝 |
+| Gemma 4、GPT OSS、Nemotron-H、Muse-Glimmer（上限 `--tp 2`） | 张量并行，用 `--tp N` 显式开启 |
 | Muse Spark（`muse-spark`） | 两种模式都由原生整模型执行器运行。在 GGML CUDA / Vulkan 上用 `--layer-split N`（最多 16 张 GPU）做本地整层放置，专家栈按每张 GPU 规划；专家栈全部在 CUDA GPU 上时，一个提示的 prefill 以流水线方式分布到各 GPU。GGML CUDA 上的 `--tp N` 通过上游 ggml 的 meta 后端（llama.cpp `-sm tensor` 所用的机制）把每层切分到 N 张 GPU（最多 16 张，即 KV 头数），仅限单节点。`TS_MUSE_SPARK_NATIVE=0` 以及 Vulkan 上的 `--tp N` 改选逐算子路径的注意力头与整专家张量并行。在十张 A40 上，按层切分的 4K token 提示 prefill 为 llama.cpp 对应模式的 2.07 倍，`--tp 10` 的 decode 为 1.40 倍（[报告](docs/perf/muse-spark-vs-llama-cpp.md)，英文）。两种模式不能组合 |
 | MiniMax-M3.1（`minimax-m3`） | 两种模式都由原生整模型执行器运行，仅限 `ggml_cuda`。`--layer-split N`（最多 16 张 GPU）放置连续的整层，把一个提示的 prefill 以流水线方式分布到各 GPU，并支持主机专家（`--n-cpu-moe N`、`TS_MINIMAX_M3_CPU_MOE=auto`）。`--tp N`（2 到 16 张相同型号的 CUDA GPU，仅单节点）在上游 ggml 的 meta 后端上运行执行器：由于只有四个 KV 头，注意力、稀疏注意力索引器以及 K/V/索引键缓存在每张 GPU 上镜像，稠密、路由与共享专家 FFN 沿隐藏维切分，输出头按词表行切分，每层一次 all-reduce。它拒绝主机专家与 DSpark 草稿器。在八张 A40 上，`--tp 8` 深度 0 的 decode 为 35.7 tok/s，按层切分的 32K token 提示 prefill 为 1,544 tok/s，llama.cpp 为 240（[性能数据](docs/benchmarks_zh-cn.md#八张-a40-上的-minimax-m31-flash)）。两种模式不能组合 |
 | Bonsai2 27B（带 PRISM Hadamard 变换的 `qwen35`） | 单设备——加载器拒绝 `--tp` |
