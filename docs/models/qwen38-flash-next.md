@@ -283,8 +283,20 @@ flush or retire the corresponding arena slot before another path reads its
 state. Image requests join this path after media prefill; their compacted
 rotary positions and QSA coordinate history stay with their holder.
 
-Tensor parallelism, layer splitting, other KV dtypes and unavailable span or
-backend geometry continue through the per-sequence fused path when supported.
+Layer splitting, other KV dtypes and unavailable span or backend geometry
+continue through the per-sequence fused path when supported. Under `--tp N` on
+one node the arena runs on every rank: each rank builds the same graph with its
+own FFN shard and its own replica of the requests' K/V, GDN, PLE and QSA state,
+a request sits in the same slot on every rank, and the ranks meet at each
+layer's two gathers as a solo step's ranks do. The batch shares one set of
+gathers a step, where round-robin solo steps pay one set per request. Token rows
+are gathered on the host, as solo tensor-parallel steps gather them, and rank 0
+runs the head. A rank's memory is planned to its weights, so the arena is built
+there only while its caches leave the usual headroom free (max(1 GiB, 1/32 of
+the device)); otherwise the requests decode one at a time. A geometry no request
+sits in is retired before another is sized, and a prompt span that cannot
+allocate takes the arena back before its request fails. Tensor parallelism
+across nodes keeps the per-sequence path.
 GPU arena execution requires upstream flash attention support for its head
 geometry; CPU uses the corresponding attention fallback. Every participating
 holder must have authoritative initialized state, a matching position and room
@@ -2234,6 +2246,20 @@ later activation quantization can amplify. Attention, GDN, QSA and PLE run with 
 and independent state on each rank. The output head runs on rank 0. The image
 and tool-call paths use the same target graph; speculative rollback restores
 GDN and PLE state on every rank. Prefix checkpoints remain disabled under TP.
+Two or more ready decoders share one batched step on every rank (the fused
+arena, see "Concurrent decode uses the fused arena by default"), so their
+layers' gathers are paid once a step and not once a request. Two H100 NVL, Q8_0,
+`--tp 2`, `TS_KV_INITIAL_TOKENS=2048`, greedy, 384 tokens a request: 64 / 92 /
+123 / 146 / 165 tok/s at 1 / 2 / 4 / 8 / 16 requests, against 64 / 62 / 32 / 28
+/ 31 decoding them one at a time (`TS_Q4E_DISABLE_ARENA_DECODE=1`). As on one
+device, the batched answers were the one-at-a-time text at 1 to 8 requests and
+parted from it at near ties at 16, where a graph is wider than the 8 rows that
+keep the one-token fusions (after 53 to 1382 characters under `--tp 2`, 6 to
+1349 on one GPU). Under `--tp` a request's caches are sized for the whole context window
+unless `TS_KV_INITIAL_TOKENS` says otherwise: 1.8 GB a rank at
+`MAX_CONTEXT=65536` on this model, which left those GPUs room to batch 2 and 4
+requests (83 and 88 tok/s against 60 and 52) but not 8, where the arena is
+declined for memory.
 The gathers preserve FP32 using TensorSharp's CUDA collective. Fallbacks use
 zero-copy chunks below upstream CUDA's automatic BF16 threshold, or an FP32 host
 sum when a device collective is unavailable. Two collectives per FFN communicate

@@ -373,6 +373,7 @@
     <ReferenceNativeSymbol Include="TSGgml_Qwen35VisionEncoderMergedF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ZeroLiveStateOwned" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaDecodeBatched" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaDecodeBatchedTp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaFlushHostPointer" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaFlushHostPointerStatus" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaResetBatchedDecodeCache" SymbolType="Function" />

@@ -479,6 +479,94 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
         output.WriteLine($"{backend}, width={width}, q2kxl={q2kxl}, hostLayers={offloadLayers}: 6 arena steps, growth/media QSA/reorder/churn/GC/solo rejoin; worst |dlogit|={worst:G6}.");
     }
 
+    /// <summary>Tensor parallelism: every rank runs the arena graph with its own FFN shard and its own replica of
+    /// the holders' state, and the ranks meet at each layer's two reductions. The model first decodes the script one
+    /// request at a time (its solo tensor-parallel steps), then decodes it again through the arena, where the
+    /// requests leave for a solo step and rejoin, and finally continue solo. GGML_CUDA_DEVICES=2 runs it on one
+    /// GPU.</summary>
+    [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
+    [InlineData(2)] [InlineData(3)] [InlineData(4)]
+    public void TensorParallelArenaFollowsItsSoloSteps_Cuda(int width)
+    {
+        const int rounds = 7;
+        string path = Fixture();
+        // One model: the tensor-parallel degree is process-global native state, so a one-device reference could
+        // not run beside it.
+        using var model = Assert.IsType<Qwen4ExpModel>(ModelBase.Create(path, BackendType.GgmlCuda, tpDegree: 2));
+
+        float[][][] Decode(string tag, bool arena)
+        {
+            string[] ids = Enumerable.Range(0, width).Select(i => $"{tag}-{i}").ToArray();
+            var positions = new int[width];
+            for (int i = 0; i < width; ++i)
+            {
+                int[] prompt = Prompt(i, 24 + 3 * i);
+                Assert.True(model.BindSequenceCache(ids[i]));
+                model.Forward(prompt);
+                // A prefill can grow to exactly the prompt length; the next solo step grows it again.
+                model.Forward([197]);
+                positions[i] = prompt.Length + 1;
+            }
+            model.RestorePrimaryCache();
+            var rows = new float[rounds + 1][][];
+            for (int round = 0; round < rounds; ++round)
+            {
+                int[] tokens = Enumerable.Range(0, width).Select(i => (37 + 23 * i + 17 * round) % 250).ToArray();
+                rows[round] = new float[width][];
+                if (!arena || round == 3)
+                {
+                    // In the arena pass: every holder leaves the arena for one solo step, then rejoins.
+                    for (int i = 0; i < width; ++i)
+                    {
+                        model.BindSequenceCache(ids[i]);
+                        rows[round][i] = (float[])model.Forward([tokens[i]]).Clone();
+                    }
+                    model.RestorePrimaryCache();
+                }
+                else
+                {
+                    // Vary caller order; output mapping must follow request ids.
+                    int[] order = Enumerable.Range(0, width).OrderBy(i => (i + round) % width).ToArray();
+                    var batch = new float[width][];
+                    Assert.True(model.TryForwardBatchedFusedDecode(order.Select(i => ids[i]).ToArray(),
+                        order.Select(i => tokens[i]).ToArray(), order.Select(i => positions[i]).ToArray(), batch),
+                        model.BatchedFusedDecodeDeclineReason);
+                    for (int i = 0; i < width; ++i) rows[round][order[i]] = (float[])batch[i].Clone();
+                }
+                for (int i = 0; i < width; ++i) ++positions[i];
+            }
+            // The arena's teardown publishes every rank's state back for a solo continuation.
+            rows[rounds] = new float[width][];
+            for (int i = 0; i < width; ++i)
+            {
+                model.BindSequenceCache(ids[i]);
+                Assert.Equal(positions[i], model.CacheSeqLen);
+                rows[rounds][i] = (float[])model.Forward([113]).Clone();
+            }
+            model.RestorePrimaryCache();
+            foreach (string id in ids) model.OnSequenceReleased(id);
+            return rows;
+        }
+
+        long before = model.ArenaBatchedDecodeSteps;
+        float[][][] solo = Decode("solo", arena: false);
+        Assert.Equal(before, model.ArenaBatchedDecodeSteps);
+        float[][][] batched = Decode("arena", arena: true);
+        Assert.Equal(rounds - 1, model.ArenaBatchedDecodeSteps - before);
+        double worst = 0;
+        int equal = 0, total = 0;
+        for (int round = 0; round <= rounds; ++round)
+            for (int i = 0; i < width; ++i)
+            {
+                worst = Math.Max(worst, AssertClose(solo[round][i], batched[round][i], $"round {round}, request {i}"));
+                Assert.Equal(ArgMax(solo[round][i]), ArgMax(batched[round][i]));
+                if (solo[round][i].AsSpan().SequenceEqual(batched[round][i])) ++equal;
+                ++total;
+            }
+        output.WriteLine($"GgmlCuda tp=2, width={width}: {rounds - 1} arena steps against solo steps, solo rejoin and continuation; " +
+            $"worst |dlogit|={worst:G6}, {equal}/{total} rows bit-identical.");
+    }
+
     [GgmlFact(BackendType.GgmlCpu)]
     public void PleTranspose_IsOwnedAcrossNewHoldersAndForcedCollections()
         => RunPleLifetime(BackendType.GgmlCpu);
