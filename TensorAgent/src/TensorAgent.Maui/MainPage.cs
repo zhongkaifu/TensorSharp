@@ -1621,6 +1621,7 @@ public sealed class MainPage : ContentPage
             if (_pageReady && !await PageIsAliveAsync())
             {
                 Console.WriteLine("TensorAgent: the page stopped answering; reloading it");
+                TraceReload("appearing: the page stopped answering; reloading it");
                 _pageReady = false;
                 _webView.Source = new UrlWebViewSource { Url = _host.EntryUrl };
                 return;
@@ -1664,6 +1665,9 @@ public sealed class MainPage : ContentPage
         MainThread.BeginInvokeOnMainThread(() =>
         {
             Console.WriteLine("TensorAgent: the chat renderer terminated");
+            // Into background.log as well: stdout is /dev/null for an app opened from the
+            // Finder, and a reload mid-answer is otherwise only seen as a flash.
+            TraceReload($"renderer: the chat renderer terminated (chat visible {_chatVisible})");
             _chatRendererNeedsReload = true;
             _pageReady = false;
             // A covered renderer may be reclaimed repeatedly under GPU memory
@@ -1676,6 +1680,7 @@ public sealed class MainPage : ContentPage
     private void ReloadTerminatedChatRenderer()
     {
         Console.WriteLine("TensorAgent: reloading the terminated chat renderer");
+        TraceReload("renderer: reloading the terminated chat renderer");
         _chatRendererNeedsReload = false;
         _pageReady = false;
         _webView.Source = new UrlWebViewSource { Url = _host.EntryUrl };
@@ -1703,6 +1708,7 @@ public sealed class MainPage : ContentPage
             _languageReloadPending = false;
             _pageReady = false;
             Console.WriteLine($"TensorAgent: reloading the page in {Loc.Language.Tag}");
+            TraceReload($"language: reloading the page in {Loc.Language.Tag}");
             _webView.Source = new UrlWebViewSource { Url = _host.EntryUrl };
             return true;
         }
@@ -1789,6 +1795,7 @@ public sealed class MainPage : ContentPage
         MainThread.BeginInvokeOnMainThread(() =>
         {
             Console.WriteLine("TensorAgent: the loopback server moved; reloading the page at " + url);
+            TraceReload("listener: the loopback server moved; reloading the page");
             _pageReady = false;
             _webView.Source = new UrlWebViewSource { Url = url };
         });
@@ -2069,6 +2076,26 @@ public sealed class MainPage : ContentPage
     /// reload itself forever.
     /// </para>
     /// </summary>
+    /// <summary>
+    /// Record a reload of the chat page, and why, in logs/background.log with the app's memory
+    /// at that moment. A reload in the middle of an answer is visible to the user only as a brief
+    /// return to the empty chat, and the console that says why is not attached to an app opened
+    /// from the Finder or the home screen.
+    /// </summary>
+    private void TraceReload(string what)
+    {
+        try
+        {
+            long workingSetMb = Environment.WorkingSet / (1024 * 1024);
+            long managedMb = GC.GetTotalMemory(false) / (1024 * 1024);
+            _host.App.TraceBackground($"{what} [working set {workingSetMb} MB, managed {managedMb} MB, turn running {_host.App.Turns.IsBusy}]");
+        }
+        catch (Exception)
+        {
+            // A diagnostic must never be the reason a reload does not happen.
+        }
+    }
+
     private async Task<bool> PageIsAliveAsync()
     {
         try

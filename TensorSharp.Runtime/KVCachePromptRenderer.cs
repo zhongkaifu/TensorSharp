@@ -59,19 +59,180 @@ namespace TensorSharp.Runtime
     /// </summary>
     public sealed class KVCachePromptRenderer
     {
-        // U+E000 is in the Private Use Area: real text never contains it. Each cached
-        // assistant message gets a numbered placeholder so we can locate raw tokens in
-        // order even if the chat template duplicates content (it doesn't today, but
-        // numbering is cheap and defensive).
-        internal const char PlaceholderSentinel = '\uE000';
+        // Three Private Use Area characters bracket what the renderer inserts into the
+        // template's input and finds again in its output:
+        //  - each cached assistant message's numbered placeholder, so raw tokens are
+        //    located in order even if the chat template duplicates content;
+        //  - explicit cache breakpoints;
+        //  - a per-render nonce inside each tool result while proving that a candidate
+        //    raw-token splice did not make the template drop it (removed before
+        //    tokenization; it never reaches the model).
+        // Real text can contain private-use characters: icon fonts put glyphs there (a web
+        // page's star ratings came through a Playwright snapshot as U+E000), as do PDF
+        // extraction of unmapped glyphs and legacy encodings. An input character equal to
+        // a sentinel used to be read as half a placeholder ("Malformed KV-cache
+        // placeholder: opening sentinel without matching close"). So each render picks
+        // three characters its input does not contain (ChooseSentinels): U+E000-U+E002
+        // when free, the first free ones above otherwise. The input itself is never
+        // changed, and the markers are gone before the tokens are returned, so the choice
+        // cannot change the output.
+        internal readonly record struct SentinelSet(char Placeholder, char Breakpoint, char ToolResultProof);
 
-        // U+E001 is used for explicit cache breakpoints.
-        internal const char BreakpointSentinel = '\uE001';
+        internal static readonly SentinelSet DefaultSentinels = new('\uE000', '\uE001', '\uE002');
 
-        // U+E002 brackets a per-render nonce inserted inside each tool result while
-        // proving that a candidate raw-token splice did not make the template drop it.
-        // The proof is removed before tokenization and never reaches the model.
-        internal const char ToolResultProofSentinel = '\uE002';
+        // The set of the render running on this thread. Rendering is synchronous, so a
+        // render's helpers run on the thread that entered it; outside a render (tests
+        // calling the helpers directly) the defaults apply.
+        [ThreadStatic] private static SentinelSet? t_sentinels;
+
+        private static SentinelSet ActiveSentinels => t_sentinels ?? DefaultSentinels;
+
+        internal static char PlaceholderSentinel => ActiveSentinels.Placeholder;
+
+        internal static char BreakpointSentinel => ActiveSentinels.Breakpoint;
+
+        internal static char ToolResultProofSentinel => ActiveSentinels.ToolResultProof;
+
+        /// <summary>
+        /// The sentinels for a render of this input: U+E000-U+E002 unless the input uses any of
+        /// them, otherwise the first three private-use characters (U+E000-U+F8FF) it does not use.
+        /// Every string the template can echo is scanned: the template itself, each message's text
+        /// fields, tool calls (argument values unescaped, since a template may print a JSON-escaped
+        /// "" back as the character) and the tool definitions.
+        /// </summary>
+        internal static SentinelSet ChooseSentinels(
+            string? chatTemplate, IReadOnlyList<ChatMessage>? messages, IReadOnlyList<ToolFunction>? tools)
+        {
+            HashSet<char>? used = null;
+            void Scan(string? s)
+            {
+                if (string.IsNullOrEmpty(s)) return;
+                foreach (char c in s)
+                    if (c >= PrivateUseFirst && c <= PrivateUseLast)
+                        (used ??= new HashSet<char>()).Add(c);
+            }
+
+            Scan(chatTemplate);
+            if (messages != null)
+            {
+                foreach (ChatMessage message in messages)
+                {
+                    if (message == null) continue;
+                    Scan(message.Role);
+                    Scan(message.Content);
+                    Scan(message.Thinking);
+                    Scan(message.ToolCallId);
+                    Scan(message.RawPromptTrailingWhitespace);
+                    Scan(message.RawGenerationSuffix);
+                    if (message.TextFileNames != null) foreach (string name in message.TextFileNames) Scan(name);
+                    if (message.AttachmentNames != null) foreach (string name in message.AttachmentNames) Scan(name);
+                    if (message.ToolCalls != null)
+                        foreach (ToolCall call in message.ToolCalls)
+                        {
+                            if (call == null) continue;
+                            Scan(call.Id);
+                            Scan(call.Name);
+                            if (call.Arguments != null)
+                                foreach (var argument in call.Arguments)
+                                {
+                                    Scan(argument.Key);
+                                    ScanValue(argument.Value, Scan);
+                                }
+                        }
+                }
+            }
+            if (tools != null)
+            {
+                foreach (ToolFunction tool in tools)
+                {
+                    if (tool == null) continue;
+                    Scan(tool.Name);
+                    Scan(tool.Description);
+                    Scan(tool.ParametersSchemaJson);
+                    if (tool.Required != null) foreach (string name in tool.Required) Scan(name);
+                    if (tool.Parameters != null)
+                        foreach (var parameter in tool.Parameters)
+                        {
+                            Scan(parameter.Key);
+                            if (parameter.Value == null) continue;
+                            Scan(parameter.Value.Type);
+                            Scan(parameter.Value.Description);
+                            if (parameter.Value.Enum != null) foreach (string value in parameter.Value.Enum) Scan(value);
+                        }
+                }
+            }
+
+            if (used == null
+                || (!used.Contains(DefaultSentinels.Placeholder)
+                    && !used.Contains(DefaultSentinels.Breakpoint)
+                    && !used.Contains(DefaultSentinels.ToolResultProof)))
+                return DefaultSentinels;
+
+            Span<char> free = stackalloc char[3];
+            int found = 0;
+            for (int c = PrivateUseFirst; c <= PrivateUseLast && found < 3; c++)
+                if (!used.Contains((char)c))
+                    free[found++] = (char)c;
+            if (found < 3)
+                throw new InvalidOperationException(
+                    "The prompt uses every character of the Private Use Area (U+E000-U+F8FF), so the KV-cache renderer has none left to mark placeholders with.");
+            return new SentinelSet(free[0], free[1], free[2]);
+        }
+
+        private const char PrivateUseFirst = '';
+        private const char PrivateUseLast = '';
+
+        private static void ScanValue(object? value, Action<string?> scan)
+        {
+            switch (value)
+            {
+                case null:
+                    return;
+                case string s:
+                    scan(s);
+                    return;
+                case System.Text.Json.JsonElement element:
+                    ScanJson(element, scan);
+                    return;
+                case System.Text.Json.Nodes.JsonNode node:
+                    // ToJsonString escapes non-ASCII, so walk the values instead.
+                    ScanJson(System.Text.Json.JsonSerializer.SerializeToElement(node), scan);
+                    return;
+                case System.Collections.IDictionary dictionary:
+                    foreach (System.Collections.DictionaryEntry entry in dictionary)
+                    {
+                        ScanValue(entry.Key, scan);
+                        ScanValue(entry.Value, scan);
+                    }
+                    return;
+                case System.Collections.IEnumerable sequence:
+                    foreach (object? item in sequence) ScanValue(item, scan);
+                    return;
+                default:
+                    scan(value.ToString());
+                    return;
+            }
+        }
+
+        private static void ScanJson(System.Text.Json.JsonElement element, Action<string?> scan)
+        {
+            switch (element.ValueKind)
+            {
+                case System.Text.Json.JsonValueKind.String:
+                    scan(element.GetString());
+                    break;
+                case System.Text.Json.JsonValueKind.Object:
+                    foreach (var property in element.EnumerateObject())
+                    {
+                        scan(property.Name);
+                        ScanJson(property.Value, scan);
+                    }
+                    break;
+                case System.Text.Json.JsonValueKind.Array:
+                    foreach (var item in element.EnumerateArray()) ScanJson(item, scan);
+                    break;
+            }
+        }
 
         private readonly IPromptRenderer _innerRenderer;
 
@@ -247,6 +408,34 @@ namespace TensorSharp.Runtime
             List<ToolFunction>? tools = null,
             bool enableThinking = false,
             string? reasoningEffort = null)
+        {
+            // The render's sentinels must not occur in its input (see SentinelSet).
+            SentinelSet? outer = t_sentinels;
+            t_sentinels = ChooseSentinels(chatTemplate, messages, tools);
+            try
+            {
+                return RenderToTokensCore(
+                    tokenizer, chatTemplate, messages, architecture, addGenerationPrompt,
+                    out explicitBreakpoints, out generationPromptTrailingWhitespace, tools, enableThinking,
+                    reasoningEffort);
+            }
+            finally
+            {
+                t_sentinels = outer;
+            }
+        }
+
+        private List<int> RenderToTokensCore(
+            ITokenizer tokenizer,
+            string chatTemplate,
+            List<ChatMessage> messages,
+            string architecture,
+            bool addGenerationPrompt,
+            out List<int>? explicitBreakpoints,
+            out string generationPromptTrailingWhitespace,
+            List<ToolFunction>? tools,
+            bool enableThinking,
+            string? reasoningEffort)
         {
             explicitBreakpoints = null;
             generationPromptTrailingWhitespace = string.Empty;
