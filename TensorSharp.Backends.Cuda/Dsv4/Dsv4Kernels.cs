@@ -49,6 +49,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr moeGateUpDecode;
         private readonly IntPtr moeDownDecode;
         private readonly IntPtr moeGateUpDecodeQ80V, moeDownDecodeQ80V, moeGateUpDecodeQ80VPair;
+        private readonly IntPtr moeGateUpDecodeQ80V8Pair, moeDownDecodeQ80V8;
         private readonly IntPtr denseQ81Rows;
         private readonly IntPtr moeScatterAdd;
         private readonly IntPtr moeStagePlan, moeStageCopy, moeUnstage, doorbellPublish, doorbellWaitAdd;
@@ -227,6 +228,12 @@ namespace TensorSharp.Cuda
             catch (CudaException ex) when (ex.ErrorCode == 500) { moeGateUpDecodeQ80V = moeDownDecodeQ80V = IntPtr.Zero; }
             try { moeGateUpDecodeQ80VPair = module.GetFunction("ts_dsv4_moe_gateup_decode_q80v_pair_f32"); }
             catch (CudaException ex) when (ex.ErrorCode == 500) { moeGateUpDecodeQ80VPair = IntPtr.Zero; }
+            try
+            {
+                moeGateUpDecodeQ80V8Pair = module.GetFunction("ts_dsv4_moe_gateup_decode_q80v8_pair_f32");
+                moeDownDecodeQ80V8 = module.GetFunction("ts_dsv4_moe_down_decode_q80v8_f32");
+            }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { moeGateUpDecodeQ80V8Pair = moeDownDecodeQ80V8 = IntPtr.Zero; }
             denseQ81Rows = module.GetFunction("ts_dsv4_dense_q81_rows_f32");
             moeScatterAdd = module.GetFunction("ts_dsv4_moe_scatter_add_f32");
             hcMean = module.GetFunction("ts_dsv4_hc_mean_f32");
@@ -781,11 +788,21 @@ namespace TensorSharp.Cuda
         public bool HasQ80VecDecode => moeGateUpDecodeQ80V != IntPtr.Zero && moeDownDecodeQ80V != IntPtr.Zero;
 
         /// <summary><see cref="MoeGateUpDecode"/> for Q8_0 experts with a warp per weight row and four lanes per
-        /// 32-value block (<c>ts_dsv4_moe_gateup_decode_q80v_f32</c>): its own arithmetic, the same for every
+        /// 32-value block (<c>ts_dsv4_moe_gateup_decode_q80v_f32</c>) or, the same sums, in another layout
+        /// (<see cref="MoeGateUpQ80LayoutFor"/>): its own arithmetic, the same for every
         /// slot whatever the row count, from q8_1 activation rows at <paramref name="act"/>; an expert's rows follow
         /// its residency table when one is given, as the shared decode kernels' do. Requires
         /// <paramref name="inDim"/> a multiple of 32 and <see cref="HasQ80VecDecode"/>.</summary>
         public void MoeGateUpDecodeQ80Vec(IntPtr gateW, IntPtr upW, IntPtr act, Tensor sel,
+            Tensor gateOut, Tensor upOut, int ff, int inDim, long rowBytes, int nt, int nUsed, IntPtr stream,
+            IntPtr gateTab = default, IntPtr upTab = default)
+            => MoeGateUpDecodeQ80VecAs(
+                MoeGateUpQ80LayoutFor(nt * nUsed, HasQ80LaneDecode && _moeQ80Lanes, _moeGateUpQ80Pair, moeGateUpDecodeQ80VPair != IntPtr.Zero),
+                gateW, upW, act, sel, gateOut, upOut, ff, inDim, rowBytes, nt, nUsed, stream, gateTab, upTab);
+
+        /// <summary><see cref="MoeGateUpDecodeQ80Vec"/> in a named layout, for tests and measurements: every layout
+        /// gives a row the same bits.</summary>
+        internal void MoeGateUpDecodeQ80VecAs(Q80ExpertLayout layout, IntPtr gateW, IntPtr upW, IntPtr act, Tensor sel,
             Tensor gateOut, Tensor upOut, int ff, int inDim, long rowBytes, int nt, int nUsed, IntPtr stream,
             IntPtr gateTab = default, IntPtr upTab = default)
         {
@@ -793,29 +810,89 @@ namespace TensorSharp.Cuda
             int a6 = ff, a7 = inDim; long a8 = rowBytes; int a9 = nUsed;
             IntPtr a10 = gateTab, a11 = upTab;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11 };
-            // From 32 slots a warp takes a slot's gate row and up row together (the same sums; fewer activation loads).
-            int slots = nt * nUsed;
-            if (moeGateUpDecodeQ80VPair != IntPtr.Zero && slots >= MoeGateUpQ80PairMinSlots && _moeGateUpQ80Pair)
-                Launch(moeGateUpDecodeQ80VPair, (uint)slots, CeilDiv(ff, 8), 1, BlockSize, 0, stream, args);
-            else
-                Launch(moeGateUpDecodeQ80V, (uint)slots, CeilDiv(ff, 8), 2, BlockSize, 0, stream, args);
+            uint slots = (uint)(nt * nUsed);
+            switch (layout)
+            {
+                // Eight lanes a row: a 128-thread block holds sixteen of a slot's gate rows and their up rows.
+                case Q80ExpertLayout.Lanes:
+                    Launch(moeGateUpDecodeQ80V8Pair, slots, CeilDiv(ff, 16), 1, 128, 0, stream, args);
+                    break;
+                case Q80ExpertLayout.WarpPair:
+                    Launch(moeGateUpDecodeQ80VPair, slots, CeilDiv(ff, 8), 1, BlockSize, 0, stream, args);
+                    break;
+                default:
+                    Launch(moeGateUpDecodeQ80V, slots, CeilDiv(ff, 8), 2, BlockSize, 0, stream, args);
+                    break;
+            }
         }
 
-        /// <summary>Slots from which <see cref="MoeGateUpDecodeQ80Vec"/> computes a slot's gate and up rows in one warp.</summary>
+        /// <summary>How a Q8_0 decode expert launch lays weight rows on warps. A row sums to the same bits in each.</summary>
+        public enum Q80ExpertLayout
+        {
+            /// <summary>A warp a row, four lanes on each 32-value block.</summary>
+            Warp,
+            /// <summary>A warp on a slot's gate row and up row together (gate/up only).</summary>
+            WarpPair,
+            /// <summary>Eight lanes a row, four rows a warp, a lane on whole blocks; for gate/up, a slot's gate row
+            /// and up row in the same lanes.</summary>
+            Lanes,
+        }
+
+        /// <summary>Whether the module has the Q8_0 decode experts with eight lanes a row (<see cref="Q80ExpertLayout.Lanes"/>).</summary>
+        public bool HasQ80LaneDecode => moeGateUpDecodeQ80V8Pair != IntPtr.Zero && moeDownDecodeQ80V8 != IntPtr.Zero;
+
+        /// <summary>The layout <see cref="MoeGateUpDecodeQ80Vec"/> runs <paramref name="slots"/> slots in, by what was
+        /// faster on the H100 NVL at 2560 -> 640: a warp a row below four decode rows of ten experts (17.4 us a
+        /// layer against 24.3 in eight lanes for one row, 43.3 against 46.5 for three) and, from
+        /// <see cref="MoeGateUpQ80LanesMinSlots"/>, a slot's gate and up rows in eight lanes a row (52.0 against
+        /// 56.1 for 40 slots, 186.3 against 232.7 for 160). Without the lane kernels (<paramref name="lanes"/>
+        /// false) the warp layouts as before; <paramref name="pair"/> false keeps gate and up rows apart, a warp a
+        /// row.</summary>
+        public static Q80ExpertLayout MoeGateUpQ80LayoutFor(int slots, bool lanes, bool pair = true, bool warpPair = true)
+        {
+            if (!pair)
+                return Q80ExpertLayout.Warp;
+            if (lanes && slots >= MoeGateUpQ80LanesMinSlots)
+                return Q80ExpertLayout.Lanes;
+            return warpPair && slots >= MoeGateUpQ80PairMinSlots ? Q80ExpertLayout.WarpPair : Q80ExpertLayout.Warp;
+        }
+
+        /// <summary>Slots from which <see cref="MoeGateUpDecodeQ80Vec"/> reads a slot's gate and up rows with eight
+        /// lanes a row.</summary>
+        public const int MoeGateUpQ80LanesMinSlots = 40;
+        // TS_MOE_Q80_LANES=0: the Q8_0 decode experts a warp a row at every slot count (the same sums; for measuring it).
+        private static readonly bool _moeQ80Lanes = Environment.GetEnvironmentVariable("TS_MOE_Q80_LANES") != "0";
+
+        /// <summary>Slots from which the warp-a-row layout computes a slot's gate and up rows in one warp.</summary>
         public const int MoeGateUpQ80PairMinSlots = 32;
-        // TS_MOE_GATEUP_Q80_PAIR=0: gate and up rows in separate warps at every slot count (the same sums; for measuring it).
+        // TS_MOE_GATEUP_Q80_PAIR=0: gate and up rows apart, a warp a row, at every slot count (the same sums; for measuring it).
         private static readonly bool _moeGateUpQ80Pair = Environment.GetEnvironmentVariable("TS_MOE_GATEUP_Q80_PAIR") != "0";
 
-        /// <summary><see cref="MoeDownDecode"/> for Q8_0 experts, as <see cref="MoeGateUpDecodeQ80Vec"/> reads a row.</summary>
+        /// <summary><see cref="MoeDownDecode"/> for Q8_0 experts, as <see cref="MoeGateUpDecodeQ80Vec"/> reads a row:
+        /// eight lanes a row when the module has that layout (<see cref="HasQ80LaneDecode"/>), else a warp a row.
+        /// The same bits either way.</summary>
         public void MoeDownDecodeQ80Vec(IntPtr downW, Tensor act, Tensor sel, Tensor downOut,
+            int e, int ff, long rowBytes, int slots, IntPtr stream, IntPtr downTab = default)
+            => MoeDownDecodeQ80VecAs(HasQ80LaneDecode && _moeQ80Lanes ? Q80ExpertLayout.Lanes : Q80ExpertLayout.Warp,
+                downW, act, sel, downOut, e, ff, rowBytes, slots, stream, downTab);
+
+        /// <summary><see cref="MoeDownDecodeQ80Vec"/> in a named layout (<see cref="Q80ExpertLayout.Warp"/> or
+        /// <see cref="Q80ExpertLayout.Lanes"/>), for tests and measurements.</summary>
+        internal void MoeDownDecodeQ80VecAs(Q80ExpertLayout layout, IntPtr downW, Tensor act, Tensor sel, Tensor downOut,
             int e, int ff, long rowBytes, int slots, IntPtr stream, IntPtr downTab = default)
         {
             IntPtr a0 = downW, a1 = P(act), a2 = P(sel), a3 = P(downOut);
             int a4 = e, a5 = ff; long a6 = rowBytes;
             IntPtr a7 = downTab;
             void** args = stackalloc void*[] { &a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7 };
-            Launch(moeDownDecodeQ80V, (uint)slots, CeilDiv(e, 8), 1, BlockSize, 0, stream, args);
+            if (layout == Q80ExpertLayout.Lanes)
+                // Eight lanes a row: a thread block holds BlockSize / 8 rows. 64- to 512-thread blocks were within
+                // 3 us a layer of each other from 10 to 160 slots.
+                Launch(moeDownDecodeQ80V8, (uint)slots, CeilDiv(e, BlockSize / 8), 1, BlockSize, 0, stream, args);
+            else
+                Launch(moeDownDecodeQ80V, (uint)slots, CeilDiv(e, 8), 1, BlockSize, 0, stream, args);
         }
+
 
         /// <summary>Whether <see cref="DenseQ81Rows"/> decodes this weight layout at this input width:
         /// the formats the warp-per-row dot handles, at widths of whole decode units (32-value blocks,
