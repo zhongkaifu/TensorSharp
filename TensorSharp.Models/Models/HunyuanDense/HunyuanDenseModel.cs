@@ -20,6 +20,7 @@ namespace TensorSharp.Models
     public sealed partial class HunyuanDenseModel : StandardDecoderModel
     {
         private readonly int _ropeDim;
+        private readonly RotarySpec _rotary;
 
         public HunyuanDenseModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
             int layerSplitDegree = 1)
@@ -36,6 +37,7 @@ namespace TensorSharp.Models
 
             _ropeDim = (int)_gguf.GetUint32($"{arch}.rope.dimension_count", (uint)keyLen);
             ApplyHunyuanRopeBase(arch, keyLen);
+            _rotary = new RotarySpec(_ropeDim, neoX: true, Config.RopeBase, 1.0f / Config.RopeScale);
             ParseTokenizer();
 
             Console.WriteLine($"Model: {arch}, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
@@ -94,29 +96,18 @@ namespace TensorSharp.Models
         protected override void RotateQueryKey(RankScope rank, int layer, ref Tensor q, ref Tensor k, TokenPositions positions)
         {
             string p = $"blk.{layer}.";
-            ApplyNeoXRoPE(q, rank.LocalHeads, positions);
-            ApplyNeoXRoPE(k, rank.LocalKvHeads, positions);
-            // The host fast path serves a single sequence's decode token (as it always did);
-            // a paged batch, even of one token, keeps the device op.
-            bool hostDecode = positions.Count == 1 && positions.IsContiguous;
+            Rotate(q, rank.LocalHeads, KeyDim, positions, _rotary);
+            Rotate(k, rank.LocalKvHeads, KeyDim, positions, _rotary);
+            // The host path serves a single sequence's decode token; a paged batch, even of
+            // one token, keeps the device op.
+            bool hostDecode = positions.Count == 1 && positions.IsContiguous && HostDecodeOps;
             ApplyQKNorm(q, Replica(_weights[p + "attn_q_norm.weight"], rank.Stage, rank.Rank), rank.LocalHeads, positions.Count, hostDecode);
             ApplyQKNorm(k, Replica(_weights[p + "attn_k_norm.weight"], rank.Stage, rank.Rank), rank.LocalKvHeads, positions.Count, hostDecode);
         }
 
-        private void ApplyNeoXRoPE(Tensor data, int numHeads, TokenPositions positions)
-        {
-            int rows = positions.Count * numHeads;
-            using Tensor posTensor = CreateIntTensorOn(data.Storage.Allocator, positions.PerHead(numHeads), rows);
-            HostWritten(posTensor);
-            using Tensor reshaped = data.View(1, positions.Count, numHeads, KeyDim);
-            Ops.RoPEEx(reshaped, reshaped, posTensor, _ropeDim, 2, 0,
-                Config.RopeBase, 1.0f / Config.RopeScale,
-                0.0f, 1.0f, 0.0f, 0.0f);
-        }
-
         private void ApplyQKNorm(Tensor data, Tensor alpha, int numHeads, int tokens, bool hostDecode)
         {
-            if (hostDecode && _backend != BackendType.Mlx && _backend != BackendType.Cuda)
+            if (hostDecode)
             {
                 RMSNormInPlaceCpu(data, alpha, numHeads, KeyDim, Config.Eps);
                 HostWritten(data);

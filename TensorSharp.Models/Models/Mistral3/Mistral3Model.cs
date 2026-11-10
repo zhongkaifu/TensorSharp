@@ -24,7 +24,6 @@ namespace TensorSharp.Models
     /// </summary>
     public partial class Mistral3Model : StandardDecoderModel
     {
-        private float[] _ropeFreqs;
         private readonly int _ropeDim;
 
         // YaRN scaling parameters
@@ -35,7 +34,10 @@ namespace TensorSharp.Models
         private readonly float _ropeBetaSlow;
         private readonly float _ropeMscale;
         private readonly float _ropeMscaleAllDim;
+        private readonly float _ropeYarnLogMul;
+        private readonly float _ropeAttnFactor;
         private readonly string _ropeType;
+        private readonly RotarySpec _rotary;
 
         // Vision support
         private Mistral3VisionEncoder _visionEncoder;
@@ -82,6 +84,8 @@ namespace TensorSharp.Models
                             _gguf.GetFloat32($"{arch}.rope.scaling.beta_slow", 1.0f));
             _ropeMscale = _gguf.GetFloat32($"{arch}.rope.scaling.mscale", 0f);
             _ropeMscaleAllDim = _gguf.GetFloat32($"{arch}.rope.scaling.mscale_all_dim", 0f);
+            _ropeYarnLogMul = _gguf.GetFloat32($"{arch}.rope.scaling.yarn_log_multiplier", 0f);
+            _ropeAttnFactor = YarnAttnFactor(_gguf.GetFloat32($"{arch}.rope.scaling.attn_factor", 1f));
 
             Console.WriteLine($"Model: {arch}, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
                 $"Heads={Config.NumHeads}, KVHeads={Config.NumKVHeads}, KeyLen={keyLen}, " +
@@ -90,12 +94,18 @@ namespace TensorSharp.Models
                 $"dim={_ropeDim}, origCtx={_ropeOrigCtx}");
             if (_ropeType == "yarn")
                 Console.WriteLine($"YaRN beta={_ropeScalingBeta}, betaFast={_ropeBetaFast}, " +
-                    $"betaSlow={_ropeBetaSlow}, extFactor={_ropeExtFactor}");
+                    $"betaSlow={_ropeBetaSlow}, extFactor={_ropeExtFactor}, attnFactor={_ropeAttnFactor}");
+
+            bool yarn = _ropeType == "yarn";
+            _rotary = new RotarySpec(_ropeDim, neoX: false, Config.RopeBase, 1.0f / Config.RopeScale, _ropeOrigCtx,
+                yarn ? _ropeExtFactor : 0f, _ropeAttnFactor, yarn ? _ropeBetaFast : 0f, yarn ? _ropeBetaSlow : 0f);
 
             ParseTokenizer();
-            PrecomputeRopeFrequencies();
+            // "rope2": every position rotates through RoPEEx with the attention factor above.
+            // Prefix checkpoints saved by the earlier rotary (host decode frequencies, YaRN
+            // mscale not cancelled) hold different K rows and must not be reused.
             InitializeDecoder(keyLen, valueLen, string.Create(CultureInfo.InvariantCulture,
-                $"mistral3|{Config.NumHeads}|{Config.NumKVHeads}|{keyLen}|{valueLen}|{Config.Eps:R}|{Config.RopeBase:R}|{Config.RopeScale:R}|{_ropeType}|{_ropeDim}|{_ropeOrigCtx}|{_ropeScalingBeta:R}|{_ropeExtFactor:R}|{_ropeBetaFast:R}|{_ropeBetaSlow:R}|{_ropeMscale:R}|{_ropeMscaleAllDim:R}"));
+                $"mistral3|rope2|{Config.NumHeads}|{Config.NumKVHeads}|{keyLen}|{valueLen}|{Config.Eps:R}|{Config.RopeBase:R}|{Config.RopeScale:R}|{_ropeType}|{_ropeDim}|{_ropeOrigCtx}|{_ropeScalingBeta:R}|{_ropeExtFactor:R}|{_ropeBetaFast:R}|{_ropeBetaSlow:R}|{_ropeAttnFactor:R}"));
         }
 
         // Text LoRA: on a single device every projection of a decoder layer and the LM head
@@ -111,50 +121,6 @@ namespace TensorSharp.Models
             => weightName == "output.weight" || IsDecoderLayerProjection(weightName, s_textLoraProjections)
                 ? null
                 : "is not one of the projections Mistral 3 applies a LoRA delta to";
-
-        private void PrecomputeRopeFrequencies()
-        {
-            int halfDim = _ropeDim / 2;
-            float freqScale = 1.0f / Config.RopeScale;
-            _ropeFreqs = new float[halfDim];
-            for (int i = 0; i < halfDim; i++)
-                _ropeFreqs[i] = freqScale / MathF.Pow(Config.RopeBase, (2.0f * i) / _ropeDim);
-            if (_ropeType == "yarn" && _ropeOrigCtx > 0)
-                ApplyYarnFreqCorrection(_ropeFreqs, halfDim);
-        }
-
-        /// <summary>
-        /// Apply YaRN frequency correction to precomputed RoPE frequencies for decode path.
-        /// Interpolates between extrapolated and interpolated frequencies based on
-        /// whether each frequency band is within the "slow" or "fast" rotation range.
-        /// </summary>
-        private void ApplyYarnFreqCorrection(float[] freqs, int halfDim)
-        {
-            float lowFreqWavelen = (float)(_ropeOrigCtx / _ropeBetaSlow);
-            float highFreqWavelen = (float)(_ropeOrigCtx / _ropeBetaFast);
-
-            for (int i = 0; i < halfDim; i++)
-            {
-                float origFreq = 1.0f / MathF.Pow(Config.RopeBase, (2.0f * i) / _ropeDim);
-                float wavelen = 2.0f * MathF.PI / origFreq;
-
-                if (wavelen < highFreqWavelen)
-                {
-                    freqs[i] = origFreq;   // high frequency: extrapolation
-                }
-                else if (wavelen > lowFreqWavelen)
-                {
-                    freqs[i] = origFreq / Config.RopeScale;   // low frequency: interpolation
-                }
-                else
-                {
-                    float smooth = (lowFreqWavelen / wavelen - 1.0f) /
-                                   (lowFreqWavelen / highFreqWavelen - 1.0f);
-                    float interpFreq = origFreq / Config.RopeScale;
-                    freqs[i] = (1.0f - smooth) * interpFreq + smooth * origFreq;
-                }
-            }
-        }
 
         // ---------------------------------------------------------------- vision
 
@@ -216,74 +182,39 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- rotary
 
-        /// <summary>GPT-J (norm) RoPE with Mistral's YaRN parameters, then the YaRN
-        /// position-dependent Q scale. A single decode token uses the precomputed
-        /// YaRN-corrected frequencies on the host; prompts and batches use Ops.RoPEEx.</summary>
+        /// <summary>GPT-J (norm) RoPE with Mistral's YaRN parameters (the runtime's rotary:
+        /// the same function for prompts, batches and decode), then the YaRN position-dependent
+        /// Q scale.</summary>
         protected override void RotateQueryKey(RankScope rank, int layer, ref Tensor q, ref Tensor k, TokenPositions positions)
         {
-            if (positions.Count == 1 && positions.IsContiguous)
-            {
-                ApplyRoPEDecode(q, rank.LocalHeads, positions.Start);
-                ApplyRoPEDecode(k, rank.LocalKvHeads, positions.Start);
-            }
-            else
-            {
-                q = ApplyRoPE(q, rank.LocalHeads, positions);
-                k = ApplyRoPE(k, rank.LocalKvHeads, positions);
-            }
+            Rotate(q, rank.LocalHeads, KeyDim, positions, _rotary);
+            Rotate(k, rank.LocalKvHeads, KeyDim, positions, _rotary);
             if (_ropeOrigCtx > 0)
                 ApplyPositionScale(q, rank.LocalHeads * KeyDim, positions);
         }
 
-        private unsafe void ApplyRoPEDecode(Tensor data, int numHeads, int position)
+        /// <summary>
+        /// The rotary attention factor, as llama.cpp computes it (llama_context, YaRN). With
+        /// a non-zero extrapolation factor the rotary multiplies cos/sin by
+        /// <c>1 + 0.1 ln(factor)</c> itself, so the factor cancels that and applies the
+        /// checkpoint's own magnitude scale instead: <c>mscale(factor, m) / mscale(factor,
+        /// m_all)</c>, where <c>yarn_log_multiplier</c> (or <c>mscale_all_dim</c>) is
+        /// <c>m_all</c> and <c>m</c> is <c>mscale</c> (default 1); without either it is the
+        /// standard YaRN <c>mscale(factor, 1)</c>. Ministral 3 ships
+        /// <c>yarn_log_multiplier = 1</c>, so its rotary keeps unit magnitude.
+        /// </summary>
+        private float YarnAttnFactor(float checkpointAttnFactor)
         {
-            int halfDim = _ropeDim / 2;
-            float* ptr = GetFloatPtr(data);
-            float* cosTable = stackalloc float[halfDim];
-            float* sinTable = stackalloc float[halfDim];
-            for (int i = 0; i < halfDim; i++)
-            {
-                float theta = position * _ropeFreqs[i];
-                cosTable[i] = MathF.Cos(theta);
-                sinTable[i] = MathF.Sin(theta);
-            }
-            for (int h = 0; h < numHeads; h++)
-            {
-                float* head = ptr + h * KeyDim;
-                for (int i = 0; i < halfDim; i++)
-                {
-                    float x0 = head[2 * i];
-                    float x1 = head[2 * i + 1];
-                    head[2 * i] = x0 * cosTable[i] - x1 * sinTable[i];
-                    head[2 * i + 1] = x0 * sinTable[i] + x1 * cosTable[i];
-                }
-            }
-            HostWritten(data);
-        }
-
-        private Tensor ApplyRoPE(Tensor data, int numHeads, TokenPositions positions)
-        {
-            int tokens = positions.Count;
-            using Tensor posTensor = CreateIntTensorOn(data.Storage.Allocator, positions.PerHead(numHeads), tokens * numHeads);
-            HostWritten(posTensor);
-            // In place: rotating into a fresh tensor and disposing the input while the device
-            // op is still queued (Metal lazy-sync) gave a deterministic, wrong prefill.
-            using Tensor reshaped = data.View(1, tokens, numHeads, KeyDim);
-            Ops.RoPEEx(
-                reshaped, reshaped, posTensor, _ropeDim, 0, _ropeOrigCtx,
-                Config.RopeBase, 1.0f / Config.RopeScale,
-                _ropeType == "yarn" ? _ropeExtFactor : 0f,
-                ComputeAttnFactor(),
-                _ropeType == "yarn" ? _ropeBetaFast : 0f,
-                _ropeType == "yarn" ? _ropeBetaSlow : 0f);
-            return data;
-        }
-
-        private float ComputeAttnFactor()
-        {
-            if (_ropeMscale != 0 && _ropeMscaleAllDim != 0)
-                return 1.0f / (0.1f * MathF.Log(Config.RopeScale) + 1.0f);
-            return 1.0f;
+            if (_ropeType != "yarn" || _ropeExtFactor == 0f)
+                return checkpointAttnFactor;
+            float factor = Config.RopeScale;
+            static float Mscale(float scale, float m) => scale <= 1f ? 1f : 0.1f * m * MathF.Log(scale) + 1f;
+            float mAll = _ropeYarnLogMul != 0f ? _ropeYarnLogMul : _ropeMscaleAllDim;
+            float m = _ropeMscale != 0f ? _ropeMscale : 1f;
+            float attn = mAll != 0f ? Mscale(factor, m) / Mscale(factor, mAll) : Mscale(factor, 1f);
+            if (factor > 1f)
+                attn *= 1f / (1f + 0.1f * MathF.Log(factor));
+            return attn * checkpointAttnFactor;
         }
 
         /// <summary>Position-dependent Q scaling for YaRN, one factor per token (it scales the
