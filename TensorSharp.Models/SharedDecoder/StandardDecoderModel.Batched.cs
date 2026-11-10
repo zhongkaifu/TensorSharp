@@ -43,6 +43,8 @@ namespace TensorSharp.Models
             public required int[][] BlockTables { get; init; }
             public int[] FlatBlockTables { get; init; }
             public int[] BlockTableOffsets { get; init; }
+            /// <summary>Per sequence, its recurrent states [layer][rank] (hybrid stacks only).</summary>
+            public RecurrentState[][][] RecurrentStates { get; init; }
         }
 
         /// <summary>
@@ -118,6 +120,13 @@ namespace TensorSharp.Models
             }
 
             (int[] flatTables, int[] offsets) = IsGgmlBackend ? FlattenBlockTables(ctx.BlockTables) : (null, null);
+            RecurrentState[][][] recurrent = null;
+            if (HasRecurrentLayers)
+            {
+                recurrent = new RecurrentState[numSeqs][][];
+                for (int s = 0; s < numSeqs; s++)
+                    recurrent[s] = SequenceStates(ctx.Sequences[s].RequestId, ctx.Sequences[s].NumComputedTokens == 0);
+            }
             var batch = new PagedBatch
             {
                 NumSequences = numSeqs,
@@ -128,6 +137,7 @@ namespace TensorSharp.Models
                 BlockTables = ctx.BlockTables,
                 FlatBlockTables = flatTables,
                 BlockTableOffsets = offsets,
+                RecurrentStates = recurrent,
             };
 
             _forwardSw.Start();
@@ -232,7 +242,7 @@ namespace TensorSharp.Models
             _pagedV = new float[Config.NumLayers][][];
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                if (!OwnsLayer(l)) continue;
+                if (!OwnsLayer(l) || _recurrentLayer[l]) continue;
                 _pagedK[l] = new float[ranks][];
                 _pagedV[l] = new float[ranks][];
                 for (int r = 0; r < ranks; r++)

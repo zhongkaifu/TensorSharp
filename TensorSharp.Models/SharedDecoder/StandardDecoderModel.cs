@@ -115,6 +115,22 @@ namespace TensorSharp.Models
         /// <summary>True while media embeddings wait to be injected; chunked prefill is skipped then.</summary>
         protected virtual bool HasPendingMedia => false;
 
+        /// <summary>The FFN pre-norm weight of <paramref name="layer"/>. Default
+        /// <c>blk.N.ffn_norm.weight</c>; Qwen 3.5 calls it <c>post_attention_norm</c>.</summary>
+        protected virtual string FfnNormWeight(int layer) => $"blk.{layer}.ffn_norm.weight";
+
+        /// <summary>
+        /// Attention whose query projection also emits a per-head output gate, interleaved per
+        /// head as <c>[q_h | gate_h]</c> (Qwen 3.5 / Qwen3-Next): the runtime splits it off and
+        /// multiplies the attention output by <c>sigmoid(gate)</c> before the output projection.
+        /// </summary>
+        protected virtual bool GatedAttentionOutput => false;
+
+        /// <summary>Constraints beyond heads and FFN width that a tensor-parallel degree must meet
+        /// (recurrent head counts, ...); each entry names what does not divide. Default: none.</summary>
+        protected virtual System.Collections.Generic.IEnumerable<string> ShardingProblems(int degree)
+            => Array.Empty<string>();
+
         /// <summary>Extra replicated weights the per-rank code reads on every rank (Q/K norms):
         /// pre-copied to each rank's device at load. Default: none.</summary>
         protected virtual System.Collections.Generic.IEnumerable<string> ReplicatedLayerWeights(int layer)
@@ -124,6 +140,17 @@ namespace TensorSharp.Models
 
         protected int KeyDim => _keyDim;
         protected int ValueDim => _valueDim;
+
+        private int _shardDegree = 1;
+        private int _shardRankOffset;
+
+        /// <summary>The degree weights are sharded by: the stage's tensor-parallel degree, or a
+        /// distributed group's global degree (this process then holds ranks
+        /// [<see cref="ShardRankOffset"/>, +TensorParallel) of it).</summary>
+        protected int ShardDegree => _shardDegree;
+
+        /// <summary>The global shard index of this process's first local rank.</summary>
+        protected int ShardRankOffset => _shardRankOffset;
 
         /// <summary>The device mesh (stages x tensor-parallel ranks) this model runs on.</summary>
         internal DeviceMesh Mesh => _mesh;
@@ -226,6 +253,7 @@ namespace TensorSharp.Models
                 GgmlBasicOps.SetAsyncCompute(false);
             try
             {
+                DetectRecurrentLayers();
                 bool multiDevice = _requestedStages > 1 || _requestedTensorParallel > 1 || LayerSplitGroup != null;
                 // The model-aligned KV default must not depend on placement: a multi-device
                 // mesh resolves it from the whole checkpoint's metadata (a stage loads only
@@ -247,6 +275,7 @@ namespace TensorSharp.Models
                 if (initial < maxContext)
                     Console.WriteLine($"Initial {_backend} KV cache allocation: {initial} tokens (grows on demand up to {maxContext}).");
                 InitCaches(initial, maxContext);
+                InitRecurrentStates();
                 PreReplicateNormWeights();
                 Console.WriteLine($"  Placement: {_mesh.Describe()} (shared decoder runtime).");
             }
@@ -295,7 +324,7 @@ namespace TensorSharp.Models
             _cacheV = new Tensor[Config.NumLayers][];
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                if (!OwnsLayer(l)) continue;
+                if (!OwnsLayer(l) || _recurrentLayer[l]) continue;
                 int stage = _mesh.StageOf(l);
                 _cacheK[l] = new Tensor[_mesh.TensorParallel];
                 _cacheV[l] = new Tensor[_mesh.TensorParallel];
@@ -368,10 +397,18 @@ namespace TensorSharp.Models
             _forwardSw.Reset();
             foreach (Tensor t in AllCacheTensors(_cacheK)) ResetCacheTensor(t);
             foreach (Tensor t in AllCacheTensors(_cacheV)) ResetCacheTensor(t);
+            ResetRecurrentPrimary();
         }
 
         protected override void TruncateKVCacheCore(int tokenCount)
         {
+            if (_anyRecurrent && tokenCount != _cacheSeqLen)
+            {
+                if (tokenCount != 0)
+                    throw new NotSupportedException(
+                        $"{Config.Architecture} has recurrent layers: its cache truncates only to its length or to zero, not {tokenCount}.");
+                ResetRecurrentPrimary();
+            }
             base.TruncateKVCacheCore(tokenCount);
             foreach (Tensor t in AllCacheTensors(_cacheK)) InvalidateTensorDeviceCache(t);
             foreach (Tensor t in AllCacheTensors(_cacheV)) InvalidateTensorDeviceCache(t);
@@ -382,7 +419,7 @@ namespace TensorSharp.Models
         // snapshot restores exactly what a fresh prefill writes. The fingerprint carries the
         // mesh shape: a TP=2 snapshot holds half-head rows and must never reach a TP=1 cache.
 
-        public override bool SupportsKVStateSnapshot => LayerSplitGroup == null && _cacheK != null;
+        public override bool SupportsKVStateSnapshot => LayerSplitGroup == null && _cacheK != null && !_anyRecurrent;
 
         public override string KVStateFingerprint =>
             $"{Config.Architecture}|decoder|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}" +
@@ -596,12 +633,13 @@ namespace TensorSharp.Models
             RankScope scope = Scope(_mesh.StageOf(layer), 0);
 
             Tensor normed = RMSNormOp(hidden, p + "attn_norm.weight");
-            Tensor attn = Attention(scope, normed, layer, positions, batch);
+            Tensor attn = Mixer(scope, normed, layer, positions, batch);
             normed.Dispose();
 
             // MLX: (hidden += attn; normed2 = rmsnorm(hidden)) in one dispatch.
             Tensor normed2 = null;
-            if (_backend == BackendType.Mlx && _weights.TryGetValue(p + "ffn_norm.weight", out var ffnNorm))
+            string ffnNormName = FfnNormWeight(layer);
+            if (_backend == BackendType.Mlx && _weights.TryGetValue(ffnNormName, out var ffnNorm))
             {
                 normed2 = new Tensor(_allocator, DType.Float32, hidden.Sizes[0], hidden.Sizes[1]);
                 if (!MlxFusedOps.TryAddRmsNorm(hidden, attn, ffnNorm, Config.Eps, normed2))
@@ -616,9 +654,9 @@ namespace TensorSharp.Models
                 attn.Dispose();
                 // GGML: norm + gate/up + SiLU*mul + down + residual in one graph.
                 if (_gateUpFused[layer] &&
-                    TryFusedDenseSwiGLUFFNInto(hidden, p + "ffn_norm.weight", p + "ffn_gate_up.weight", p + "ffn_down.weight"))
+                    TryFusedDenseSwiGLUFFNInto(hidden, ffnNormName, p + "ffn_gate_up.weight", p + "ffn_down.weight"))
                     return hidden;
-                normed2 = RMSNormOp(hidden, p + "ffn_norm.weight");
+                normed2 = RMSNormOp(hidden, ffnNormName);
             }
             else
             {
@@ -646,7 +684,7 @@ namespace TensorSharp.Models
             {
                 RankScope scope = Scope(stage, r);
                 using Tensor normed = Ops.RMSNorm(null, hidden[r], Replica(attnNorm, stage, r), null, Config.Eps);
-                partial[r] = Attention(scope, normed, layer, positions, batch);
+                partial[r] = Mixer(scope, normed, layer, positions, batch);
             });
             _mesh.AllReduce(stage, partial);
             _mesh.RunPerRank(stage, r =>
@@ -656,7 +694,7 @@ namespace TensorSharp.Models
                 partial[r] = null;
             });
 
-            Tensor ffnNorm = _weights[p + "ffn_norm.weight"];
+            Tensor ffnNorm = _weights[FfnNormWeight(layer)];
             if (_moeLayer[layer])
             {
                 // Routing is identical on every rank (replicated input and router): decide it
@@ -704,6 +742,7 @@ namespace TensorSharp.Models
             string p = $"blk.{layer}.";
             int heads = scope.LocalHeads, kvHeads = scope.LocalKvHeads;
             int qDim = heads * _keyDim, kDim = kvHeads * _keyDim, vDim = kvHeads * _valueDim;
+            int qWidth = GatedAttentionOutput ? 2 * qDim : qDim;
             int tokens = positions.Count;
             bool decode = batch == null && tokens == 1;
 
@@ -711,17 +750,17 @@ namespace TensorSharp.Models
             if (_qkvFused[layer])
             {
                 Tensor qkv = Linear(scope, input, p + "attn_qkv.weight");
-                if (decode)
+                if (decode && !GatedAttentionOutput)
                 {
-                    q = qkv.Narrow(1, 0, qDim);
-                    k = qkv.Narrow(1, qDim, kDim);
-                    v = qkv.Narrow(1, qDim + kDim, vDim);
+                    q = qkv.Narrow(1, 0, qWidth);
+                    k = qkv.Narrow(1, qWidth, kDim);
+                    v = qkv.Narrow(1, qWidth + kDim, vDim);
                 }
                 else
                 {
-                    using (Tensor view = qkv.Narrow(1, 0, qDim)) q = Ops.NewContiguous(view);
-                    using (Tensor view = qkv.Narrow(1, qDim, kDim)) k = Ops.NewContiguous(view);
-                    using (Tensor view = qkv.Narrow(1, qDim + kDim, vDim)) v = Ops.NewContiguous(view);
+                    using (Tensor view = qkv.Narrow(1, 0, qWidth)) q = Ops.NewContiguous(view);
+                    using (Tensor view = qkv.Narrow(1, qWidth, kDim)) k = Ops.NewContiguous(view);
+                    using (Tensor view = qkv.Narrow(1, qWidth + kDim, vDim)) v = Ops.NewContiguous(view);
                 }
                 qkv.Dispose();
             }
@@ -732,6 +771,7 @@ namespace TensorSharp.Models
                 v = Linear(scope, input, p + "attn_v.weight");
             }
 
+            Tensor gate = GatedAttentionOutput ? SplitGatedQuery(ref q, tokens, heads) : null;
             RotateQueryKey(scope, layer, ref q, ref k, positions);
 
             long t0 = Stopwatch.GetTimestamp();
@@ -741,10 +781,32 @@ namespace TensorSharp.Models
                     ? DecodeAttention(scope, layer, q, k, v, positions.Start)
                     : PrefillAttention(scope, layer, q, k, v, positions.Start, tokens);
             _attnTicks += Stopwatch.GetTimestamp() - t0;
+            if (gate != null)
+            {
+                Ops.SigmoidMul(attn, attn, gate);
+                gate.Dispose();
+            }
 
             Tensor output = Linear(scope, attn, p + "attn_output.weight");
             attn.Dispose();
             return output;
+        }
+
+        /// <summary>Split a gated query [tokens, heads * 2 * keyDim], laid out [q_h | gate_h] per
+        /// head, into the query (replacing <paramref name="q"/>) and the gate.</summary>
+        private Tensor SplitGatedQuery(ref Tensor q, int tokens, int heads)
+        {
+            using Tensor grouped = q.View(tokens, heads, 2, _keyDim);
+            using Tensor qView = grouped.Select(2, 0);
+            using Tensor gateView = grouped.Select(2, 1);
+            Tensor query = Ops.NewContiguous(qView);
+            Tensor gate = Ops.NewContiguous(gateView);
+            q.Dispose();
+            q = query.View(tokens, heads * _keyDim);
+            query.Dispose();
+            Tensor flatGate = gate.View(tokens, heads * _keyDim);
+            gate.Dispose();
+            return flatGate;
         }
 
         private Tensor DecodeAttention(RankScope scope, int layer, Tensor q, Tensor k, Tensor v, int start)
@@ -983,7 +1045,7 @@ namespace TensorSharp.Models
             {
                 if (!OwnsLayer(l)) continue;
                 int stage = _mesh.StageOf(l);
-                var names = new[] { $"blk.{l}.attn_norm.weight", $"blk.{l}.ffn_norm.weight" }.Concat(ReplicatedLayerWeights(l));
+                var names = new[] { $"blk.{l}.attn_norm.weight", FfnNormWeight(l) }.Concat(ReplicatedLayerWeights(l));
                 foreach (string name in names)
                 {
                     if (!_weights.TryGetValue(name, out Tensor w)) continue;
@@ -1001,6 +1063,7 @@ namespace TensorSharp.Models
             foreach (Tensor copy in _replicas.Values) copy.Dispose();
             _replicas.Clear();
             DisposePagedBuffers();
+            DisposeRecurrentStates();
             base.Dispose();
         }
     }

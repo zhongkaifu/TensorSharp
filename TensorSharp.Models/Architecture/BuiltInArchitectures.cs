@@ -4,6 +4,8 @@
 // This file is part of TensorSharp.
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using System.Collections.Generic;
+
 namespace TensorSharp.Models.Architecture
 {
     /// <summary>
@@ -21,33 +23,43 @@ namespace TensorSharp.Models.Architecture
     /// </summary>
     internal static class BuiltInArchitectures
     {
-        public static void RegisterAll()
+        /// <summary>
+        /// Every built-in architecture, in registration (detection) order. Tests judge these,
+        /// not the live registry, which tests also extend with throwaway descriptors.
+        /// </summary>
+        public static IReadOnlyList<ModelArchitectureDescriptor> Descriptors { get; } = new[]
         {
             // Metadata-free detectors first so unlabelled files can be recognized
             // from their tensor layout before resolution fails closed.
-            ModelArchitectureRegistry.Register(MiniMaxH3.MiniMaxH3Architecture.Descriptor);
-            ModelArchitectureRegistry.Register(Ltx25.Ltx25Architecture.Descriptor);
+            MiniMaxH3.MiniMaxH3Architecture.Descriptor,
+            Ltx25.Ltx25Architecture.Descriptor,
 
             // Text / multimodal language models.
-            ModelArchitectureRegistry.Register(Qwen35Architecture.Descriptor);
-            ModelArchitectureRegistry.Register(Qwen4ExpArchitecture.Descriptor);
-            ModelArchitectureRegistry.Register(Gemma4Architecture.Descriptor);
-            ModelArchitectureRegistry.Register(GptOssArchitecture.Descriptor);
-            ModelArchitectureRegistry.Register(NemotronArchitecture.Descriptor);
-            ModelArchitectureRegistry.Register(Mistral3Architecture.Descriptor);
-            ModelArchitectureRegistry.Register(HunyuanDenseArchitecture.Descriptor);
-            ModelArchitectureRegistry.Register(MuseGlimmerArchitecture.Descriptor);
-            ModelArchitectureRegistry.Register(MuseSparkArchitecture.Descriptor);
-            ModelArchitectureRegistry.Register(DeepSeek4Architecture.Descriptor);
-            ModelArchitectureRegistry.Register(DeepSeek41Architecture.Descriptor);
-            ModelArchitectureRegistry.Register(GlmDsaArchitecture.Descriptor);
-            ModelArchitectureRegistry.Register(GlmDsaArchitecture.FlashDescriptor);
-            ModelArchitectureRegistry.Register(MiniMaxM3Architecture.Descriptor);
+            Qwen35Architecture.Descriptor,
+            Qwen4ExpArchitecture.Descriptor,
+            Gemma4Architecture.Descriptor,
+            GptOssArchitecture.Descriptor,
+            NemotronArchitecture.Descriptor,
+            Mistral3Architecture.Descriptor,
+            HunyuanDenseArchitecture.Descriptor,
+            MuseGlimmerArchitecture.Descriptor,
+            MuseSparkArchitecture.Descriptor,
+            DeepSeek4Architecture.Descriptor,
+            DeepSeek41Architecture.Descriptor,
+            GlmDsaArchitecture.Descriptor,
+            GlmDsaArchitecture.FlashDescriptor,
+            MiniMaxM3Architecture.Descriptor,
 
             // Generative media.
-            ModelArchitectureRegistry.Register(DiffusionGemmaArchitecture.Descriptor);
-            ModelArchitectureRegistry.Register(QwenImage.QwenImageArchitecture.Descriptor);
-            ModelArchitectureRegistry.Register(WanVideo.WanVideoArchitecture.Descriptor);
+            DiffusionGemmaArchitecture.Descriptor,
+            QwenImage.QwenImageArchitecture.Descriptor,
+            WanVideo.WanVideoArchitecture.Descriptor,
+        };
+
+        public static void RegisterAll()
+        {
+            foreach (ModelArchitectureDescriptor descriptor in Descriptors)
+                ModelArchitectureRegistry.Register(descriptor);
         }
     }
 }

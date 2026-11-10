@@ -251,13 +251,10 @@ namespace TensorSharp.Models
         protected void ShardConcatenatedColumnParallel(string weightName, params int[] segmentDims)
         {
             if (!IsTensorParallel) return;
-
-            int tp = TpDegree;
             int globalTp = GlobalTpDegree;
-            int rankOffset = TpRankOffset;
 
             // Output-row indices for a global rank: its 1/tp slice of each segment.
-            int[] BuildRows(int globalRank)
+            ShardOutputRows(weightName, globalRank =>
             {
                 var idx = new List<int>();
                 int baseOff = 0;
@@ -270,7 +267,21 @@ namespace TensorSharp.Models
                     baseOff += segDim;
                 }
                 return idx.ToArray();
-            }
+            });
+        }
+
+        /// <summary>
+        /// Column-parallel shard by an arbitrary set of output rows per rank, gathered in the
+        /// order <paramref name="rowsOfGlobalRank"/> gives them (any head layout: segmented,
+        /// block-cyclic, ...). Quantized rows are independent blocks, so they move unchanged;
+        /// F32 rows are copied. No-op when the weight is absent or nothing is sharded.
+        /// </summary>
+        protected void ShardOutputRows(string weightName, Func<int, int[]> rowsOfGlobalRank)
+        {
+            if (!IsTensorParallel) return;
+
+            int tp = TpDegree;
+            int rankOffset = TpRankOffset;
 
             if (_quantWeights.TryGetValue(weightName, out var qw))
             {
@@ -278,7 +289,7 @@ namespace TensorSharp.Models
                 var shards = new QuantizedWeight[tp];
                 for (int r = 0; r < tp; r++)
                 {
-                    int[] rows = BuildRows(rankOffset + r);
+                    int[] rows = rowsOfGlobalRank(rankOffset + r);
                     long totalBytes = rows.Length * rowBytes;
                     IntPtr shardPtr = QuantizedWeight.AllocateBuffer(totalBytes);
                     unsafe
@@ -310,7 +321,7 @@ namespace TensorSharp.Models
                 var shards = new Tensor[tp];
                 for (int r = 0; r < tp; r++)
                 {
-                    int[] rows = BuildRows(rankOffset + r);
+                    int[] rows = rowsOfGlobalRank(rankOffset + r);
                     var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, rows.Length, inDim);
                     unsafe
                     {
@@ -326,7 +337,148 @@ namespace TensorSharp.Models
                 }
 
                 _tpWeights[weightName] = shards;
+                RecordTpWeightScale(weightName, null);
+                _weights.Remove(weightName);
+                w.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Row-parallel shard whose input columns are gathered in groups: rank r keeps the
+        /// <paramref name="groupWidth"/>-wide column groups <paramref name="groupsOfGlobalRank"/>
+        /// lists, in that order (e.g. a recurrent block's output projection, whose input is the
+        /// rank's block-cyclic value heads). A quantized weight moves whole source blocks when
+        /// the group width is a multiple of the block; otherwise each row is dequantized,
+        /// gathered and re-encoded as Q8_0 (or kept F32 when 32 does not divide the group).
+        /// </summary>
+        protected void ShardInputColumnGroups(string weightName, Func<int, int[]> groupsOfGlobalRank, int groupWidth)
+        {
+            if (!IsTensorParallel) return;
+
+            int tp = TpDegree;
+            int rankOffset = TpRankOffset;
+
+            if (_quantWeights.TryGetValue(weightName, out var qw))
+            {
+                var type = (GgmlTensorType)qw.GgmlType;
+                long blockSize = GgufFile.GetBlockSize(type);
+                long srcRowBytes = NativeDequant.RowSize(qw.GgmlType, qw.Ne0);
+                var shards = new QuantizedWeight[tp];
+                if (blockSize > 0 && groupWidth % blockSize == 0)
+                {
+                    long groupBytes = groupWidth / blockSize * GgufFile.GetTypeSize(type);
+                    for (int r = 0; r < tp; r++)
+                    {
+                        int[] groups = groupsOfGlobalRank(rankOffset + r);
+                        long ne0 = (long)groups.Length * groupWidth;
+                        long dstRowBytes = groups.Length * groupBytes;
+                        long total = qw.Ne1 * dstRowBytes;
+                        IntPtr shardPtr = QuantizedWeight.AllocateBuffer(total);
+                        unsafe
+                        {
+                            byte* src = (byte*)qw.Data.ToPointer();
+                            byte* dst = (byte*)shardPtr.ToPointer();
+                            for (long row = 0; row < qw.Ne1; row++)
+                                for (int g = 0; g < groups.Length; g++)
+                                    Buffer.MemoryCopy(
+                                        src + row * srcRowBytes + groups[g] * groupBytes,
+                                        dst + row * dstRowBytes + g * groupBytes,
+                                        groupBytes, groupBytes);
+                        }
+                        shards[r] = new QuantizedWeight(shardPtr, total, qw.GgmlType, ne0, qw.Ne1) { Scale = qw.Scale };
+                    }
+                    _tpQuantWeights[weightName] = shards;
+                }
+                else if (groupWidth % 32 == 0)
+                {
+                    const int q8Type = (int)GgmlTensorType.Q8_0;
+                    Console.WriteLine($"  {weightName}: {type} block ({blockSize} elements) does not divide the " +
+                        $"{groupWidth}-column groups; re-encoding its tensor-parallel shards as Q8_0.");
+                    for (int r = 0; r < tp; r++)
+                    {
+                        int[] groups = groupsOfGlobalRank(rankOffset + r);
+                        long ne0 = (long)groups.Length * groupWidth;
+                        long dstRowBytes = NativeDequant.RowSize(q8Type, ne0);
+                        long total = qw.Ne1 * dstRowBytes;
+                        IntPtr shardPtr = QuantizedWeight.AllocateBuffer(total);
+                        unsafe
+                        {
+                            byte* src = (byte*)qw.Data.ToPointer();
+                            byte* dst = (byte*)shardPtr.ToPointer();
+                            var srcRow = new float[qw.Ne0];
+                            var dstRow = new float[ne0];
+                            fixed (float* sf = srcRow, df = dstRow)
+                            {
+                                for (long row = 0; row < qw.Ne1; row++)
+                                {
+                                    NativeDequant.DequantizeToFloat32Native(qw.GgmlType, (IntPtr)(src + row * srcRowBytes), (IntPtr)sf, qw.Ne0);
+                                    for (int g = 0; g < groups.Length; g++)
+                                        Buffer.MemoryCopy(sf + (long)groups[g] * groupWidth, df + (long)g * groupWidth,
+                                            groupWidth * sizeof(float), groupWidth * sizeof(float));
+                                    ManagedQuantizedOps.QuantizeRowFromFloat32(q8Type, df, (IntPtr)(dst + row * dstRowBytes), ne0);
+                                }
+                            }
+                        }
+                        shards[r] = new QuantizedWeight(shardPtr, total, q8Type, ne0, qw.Ne1) { Scale = qw.Scale };
+                    }
+                    _tpQuantWeights[weightName] = shards;
+                }
+                else
+                {
+                    var dense = new Tensor[tp];
+                    for (int r = 0; r < tp; r++)
+                    {
+                        int[] groups = groupsOfGlobalRank(rankOffset + r);
+                        long ne0 = (long)groups.Length * groupWidth;
+                        var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, qw.Ne1, ne0);
+                        unsafe
+                        {
+                            byte* src = (byte*)qw.Data.ToPointer();
+                            float* dstBase = GetFloatPtr(shard);
+                            var srcRow = new float[qw.Ne0];
+                            fixed (float* sf = srcRow)
+                            {
+                                for (long row = 0; row < qw.Ne1; row++)
+                                {
+                                    NativeDequant.DequantizeToFloat32Native(qw.GgmlType, (IntPtr)(src + row * srcRowBytes), (IntPtr)sf, qw.Ne0);
+                                    for (int g = 0; g < groups.Length; g++)
+                                        Buffer.MemoryCopy(sf + (long)groups[g] * groupWidth, dstBase + row * ne0 + (long)g * groupWidth,
+                                            groupWidth * sizeof(float), groupWidth * sizeof(float));
+                                }
+                            }
+                        }
+                        dense[r] = shard;
+                    }
+                    _tpWeights[weightName] = dense;
+                }
                 RecordTpWeightScale(weightName, qw);
+                _quantWeights.Remove(weightName);
+                qw.Dispose();
+            }
+            else if (_weights.TryGetValue(weightName, out var w))
+            {
+                int outDim = (int)w.Sizes[0];
+                int inDim = (int)w.Sizes[1];
+                var shards = new Tensor[tp];
+                for (int r = 0; r < tp; r++)
+                {
+                    int[] groups = groupsOfGlobalRank(rankOffset + r);
+                    int ne0 = groups.Length * groupWidth;
+                    var shard = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, outDim, ne0);
+                    unsafe
+                    {
+                        float* srcPtr = GetFloatPtr(w);
+                        float* dstPtr = GetFloatPtr(shard);
+                        for (int row = 0; row < outDim; row++)
+                            for (int g = 0; g < groups.Length; g++)
+                                Buffer.MemoryCopy(srcPtr + (long)row * inDim + (long)groups[g] * groupWidth,
+                                    dstPtr + (long)row * ne0 + (long)g * groupWidth,
+                                    groupWidth * sizeof(float), groupWidth * sizeof(float));
+                    }
+                    shards[r] = shard;
+                }
+                _tpWeights[weightName] = shards;
+                RecordTpWeightScale(weightName, null);
                 _weights.Remove(weightName);
                 w.Dispose();
             }

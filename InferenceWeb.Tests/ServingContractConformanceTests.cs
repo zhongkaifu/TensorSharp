@@ -169,12 +169,12 @@ public sealed class ServingContractConformanceTests
     };
 
     private static IEnumerable<string> ActualGaps() =>
-        ModelArchitectureRegistry.All.SelectMany(a => a.Serving.Gaps().Select(g => $"{a.Id}: {g}"));
+        BuiltInArchitectures.Descriptors.SelectMany(a => a.Serving.Gaps().Select(g => $"{a.Id}: {g}"));
 
     [Fact]
     public void EveryFamilyDeclaresAServingContract()
     {
-        foreach (var arch in ModelArchitectureRegistry.All)
+        foreach (var arch in BuiltInArchitectures.Descriptors)
         {
             Assert.NotNull(arch.Serving);
             foreach (ServingMechanism mechanism in Enum.GetValues<ServingMechanism>())
@@ -198,7 +198,7 @@ public sealed class ServingContractConformanceTests
     [Fact]
     public void NewFamiliesAreBuiltOnTheSharedRuntime()
     {
-        foreach (var arch in ModelArchitectureRegistry.All)
+        foreach (var arch in BuiltInArchitectures.Descriptors)
         {
             if (arch.Serving.Implementation == ServingImplementation.SharedRuntime) continue;
             Assert.True(LegacyBespokeFamilies.Contains(arch.Id),
@@ -223,7 +223,7 @@ public sealed class ServingContractConformanceTests
     public void EverySharedRuntimeFamilyHasAConformanceFixture()
     {
         var withFixtures = SharedRuntimeConformanceTests.FamilyIds.ToHashSet(StringComparer.Ordinal);
-        foreach (var arch in ModelArchitectureRegistry.All.Where(a => a.Serving.Implementation == ServingImplementation.SharedRuntime))
+        foreach (var arch in BuiltInArchitectures.Descriptors.Where(a => a.Serving.Implementation == ServingImplementation.SharedRuntime))
             Assert.True(withFixtures.Contains(arch.Id),
                 $"'{arch.Id}' claims every mechanism through the shared runtime; add its synthetic fixture to " +
                 "SharedRuntimeConformanceTests.Families so the claims are proven.");

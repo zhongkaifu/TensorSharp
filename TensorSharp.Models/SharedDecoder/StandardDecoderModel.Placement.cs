@@ -26,6 +26,8 @@ namespace TensorSharp.Models
             int stages = _requestedStages, tp = _requestedTensorParallel;
             // A distributed TP group shards by its GLOBAL degree; a stage group by its own.
             int shardDegree = tp == 1 ? 1 : stages == 1 ? GlobalTpDegree : tp;
+            _shardDegree = shardDegree;
+            _shardRankOffset = tp > 1 && stages == 1 ? TpRankOffset : 0;
             ValidateShardable(shardDegree);
             _localHeads = Config.NumHeads / shardDegree;
             _localKvHeads = Config.NumKVHeads / shardDegree;
@@ -66,6 +68,7 @@ namespace TensorSharp.Models
             if (Config.NumHeads % degree != 0) problems.Add($"{Config.NumHeads} attention heads");
             if (Config.NumKVHeads % degree != 0) problems.Add($"{Config.NumKVHeads} KV heads");
             if (Config.IntermediateSize > 0 && Config.IntermediateSize % degree != 0) problems.Add($"FFN width {Config.IntermediateSize}");
+            problems.AddRange(ShardingProblems(degree));
             if (problems.Count > 0)
                 throw new NotSupportedException(
                     $"{Config.Architecture} cannot be split over {degree} tensor-parallel devices: {string.Join(", ", problems)} " +
@@ -155,16 +158,20 @@ namespace TensorSharp.Models
                 {
                     if (_mesh.StageOf(l) != stage) continue;
                     string p = $"blk.{l}.";
-                    if (_qkvFused[l])
+                    int qRows = Config.NumHeads * _keyDim * (GatedAttentionOutput ? 2 : 1);
+                    if (_recurrentLayer[l])
+                        ShardRecurrentLayer(l);
+                    else if (_qkvFused[l])
                         ShardConcatenatedColumnParallel(p + "attn_qkv.weight",
-                            Config.NumHeads * _keyDim, Config.NumKVHeads * _keyDim, Config.NumKVHeads * _valueDim);
+                            qRows, Config.NumKVHeads * _keyDim, Config.NumKVHeads * _valueDim);
                     else
                         columns.AddRange(new[] { p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight" });
                     if (_gateUpFused[l])
                         ShardFusedGateUpColumnParallel(p + "ffn_gate_up.weight");
                     else
                         columns.AddRange(new[] { p + "ffn_gate.weight", p + "ffn_up.weight" });
-                    rows.Add(p + "attn_output.weight");
+                    if (!_recurrentLayer[l])
+                        rows.Add(p + "attn_output.weight");
                     rows.Add(p + "ffn_down.weight");
                 }
                 ShardWeightsForTensorParallelism(columns, rows);

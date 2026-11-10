@@ -809,20 +809,26 @@ public sealed class DirectCudaPrefillModelTests : IDisposable
         ["museglimmer"] = p => new MuseGlimmerSyntheticModelBuilder().Write(p),
     };
 
-    /// <summary>How many of the model's direct-CUDA K/V cache storages (_kvCacheK/_kvCacheV, by
-    /// reflection) hold host writes not yet uploaded.</summary>
+    /// <summary>How many of the model's direct-CUDA K/V cache storages hold host writes not yet
+    /// uploaded: the per-family caches (_kvCacheK/_kvCacheV, one tensor per layer) or, for a
+    /// family on the shared decoder runtime, its per-(layer, rank) caches (_cacheK/_cacheV),
+    /// found by reflection.</summary>
     private static (int Dirty, int Count) HostDirtyKvCaches(ModelBase model)
     {
         const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance
             | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.DeclaredOnly;
         int dirty = 0, count = 0;
-        foreach (string name in new[] { "_kvCacheK", "_kvCacheV" })
+        foreach (string name in new[] { "_kvCacheK", "_kvCacheV", "_cacheK", "_cacheV" })
         {
             System.Reflection.FieldInfo field = null;
             for (Type type = model.GetType(); type != null && field == null; type = type.BaseType)
                 field = type.GetField(name, flags);
-            if (field?.GetValue(model) is not TensorSharp.Tensor[] caches)
-                continue;
+            IEnumerable<TensorSharp.Tensor> caches = field?.GetValue(model) switch
+            {
+                TensorSharp.Tensor[] perLayer => perLayer,
+                TensorSharp.Tensor[][] perLayerRank => perLayerRank.Where(l => l != null).SelectMany(l => l),
+                _ => Array.Empty<TensorSharp.Tensor>(),
+            };
             foreach (TensorSharp.Tensor cache in caches)
             {
                 if (cache?.Storage is not TensorSharp.Cuda.CudaStorage storage)

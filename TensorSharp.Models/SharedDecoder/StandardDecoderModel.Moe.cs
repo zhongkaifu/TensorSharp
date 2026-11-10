@@ -41,6 +41,9 @@ namespace TensorSharp.Models
         /// <c>{arch}.expert_weights_norm</c> and falls back to true.</summary>
         protected virtual bool NormalizeExpertWeights => _normalizeExpertWeights;
 
+        /// <summary>Whether any layer this process owns has routed experts.</summary>
+        protected bool HasRoutedExpertLayers => _anyMoe;
+
         /// <summary>Routing decided for one batch of tokens: K experts and weights per token.</summary>
         private sealed class Routing
         {
@@ -276,7 +279,9 @@ namespace TensorSharp.Models
             return d.GetElementsAsFloat(rows * hidden);
         }
 
-        /// <summary>The always-active shared expert: a dense SwiGLU FFN on the scope's device.</summary>
+        /// <summary>The always-active shared expert: a dense SwiGLU FFN on the scope's device,
+        /// scaled per token by <c>sigmoid(x . ffn_gate_inp_shexp)</c> when the layer has that
+        /// gate (Qwen 3.5 / Qwen3-Next MoE).</summary>
         private Tensor SharedExpert(RankScope scope, Tensor input, int layer)
         {
             string p = $"blk.{layer}.";
@@ -286,7 +291,29 @@ namespace TensorSharp.Models
             up.Dispose();
             Tensor down = ReplicatedLinear(scope, gate, p + "ffn_down_shexp.weight");
             gate.Dispose();
+            if (_weights.TryGetValue(p + "ffn_gate_inp_shexp.weight", out Tensor gateVector))
+                ScaleRowsBySigmoidGate(down, input, gateVector);
             return down;
+        }
+
+        /// <summary><paramref name="rows"/>[t] *= sigmoid(<paramref name="input"/>[t] . <paramref name="gateVector"/>).</summary>
+        private void ScaleRowsBySigmoidGate(Tensor rows, Tensor input, Tensor gateVector)
+        {
+            int tokens = (int)input.Sizes[0];
+            int width = (int)input.Sizes[1];
+            int outWidth = (int)rows.Sizes[1];
+            float[] x = input.GetElementsAsFloat(tokens * width);
+            float[] w = gateVector.GetElementsAsFloat((int)Math.Min(gateVector.ElementCount(), width));
+            float[] y = rows.GetElementsAsFloat(tokens * outWidth);
+            for (int t = 0; t < tokens; t++)
+            {
+                float dot = 0;
+                for (int i = 0; i < w.Length; i++) dot += x[(long)t * width + i] * w[i];
+                float g = 1f / (1f + MathF.Exp(-dot));
+                for (int c = 0; c < outWidth; c++) y[(long)t * outWidth + c] *= g;
+            }
+            rows.SetElementsAsFloat(y);
+            HostWritten(rows);
         }
 
         /// <summary>An unsharded projection on the scope's device (LinearForward on one device).</summary>
