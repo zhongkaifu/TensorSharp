@@ -20,6 +20,7 @@
 #pragma once
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
 
 namespace ts_smt {
@@ -49,6 +50,14 @@ __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi)
     return *reinterpret_cast<uint32_t*>(&v);
 }
 
+// Two E4M3FN codes (low byte = lower K, in .x) -> F16x2, exact: every E4M3 value is an F16 value.
+// cuda_fp8.h emits PTX cvt.rn.f16x2.e4m3x2 on sm_89+ and an exact integer widening below it; a
+// raw asm of that instruction is rejected by ptxas for sm_75/80/86 targets.
+__device__ __forceinline__ __half2 e4m3x2_f16x2(uint32_t two)
+{
+    return __half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(two & 0xffffu), __NV_E4M3));
+}
+
 // Two E4M3FN codes (low byte = lower K) -> BF16x2, exact. sm_120a with CUDA 13.2+ widens the pair
 // in one instruction (PTX 9.2 cvt.rn.bf16x2.e4m3x2, as NInfer's fp8_e4m3x2_to_bf16x2_bits);
 // otherwise E4M3 -> F16 -> F32 -> BF16.
@@ -60,9 +69,7 @@ __device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t two)
     asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"((unsigned short)(two & 0xffffu)));
     return r;
 #else
-    uint32_t h;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"((unsigned short)(two & 0xffffu)));
-    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+    const float2 f = __half22float2(e4m3x2_f16x2(two));
     return pack_bf16(f.x, f.y);
 #endif
 }
@@ -310,9 +317,7 @@ __device__ __forceinline__ void project(const uint8_t* __restrict__ w, const voi
 // Two E4M3FN codes (low byte = lower K) -> F32 pair, exact.
 __device__ __forceinline__ float2 e4m3x2_f32x2(uint32_t two)
 {
-    uint32_t h;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"((unsigned short)(two & 0xffffu)));
-    return __half22float2(*reinterpret_cast<const __half2*>(&h));
+    return __half22float2(e4m3x2_f16x2(two));
 }
 
 template <int VPL>

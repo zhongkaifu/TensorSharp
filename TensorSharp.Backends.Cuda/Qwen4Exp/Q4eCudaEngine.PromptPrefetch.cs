@@ -50,7 +50,8 @@ namespace TensorSharp.Cuda
                 return _prefetchUsable;
             _prefetchChecked = true;
             var r = _residency;
-            if (!_promptPrefetchEnv || r == null || _expertStage == null || _devs.Length != 1)
+            // Mapped host experts are not packed in host-index order (and stage through host copies).
+            if (!_promptPrefetchEnv || r == null || r.Mapped || _expertStage == null || _devs.Length != 1)
                 return false;
             int half = _expertStage.Capacity / 2, most = 0, fit = 0, pairs = 0;
             _halfFits = new bool[_m.NLayer];

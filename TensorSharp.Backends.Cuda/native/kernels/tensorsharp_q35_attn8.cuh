@@ -212,9 +212,9 @@ __device__ __forceinline__ void ts_q35_a8_row32(const uint8_t* __restrict__ row,
 #pragma unroll
                     for (int e = 0; e < 2; ++e)
                     {
-                        uint32_t h;
-                        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"((unsigned short)((a[x] >> (16 * e)) & 0xffffu)));
-                        const float2 f = __half22float2(*reinterpret_cast<const half2*>(&h));
+                        // cuda_fp8.h: PTX cvt.rn.f16x2.e4m3x2 on sm_89+, exact integer widening below.
+                        const float2 f = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(
+                            (__nv_fp8x2_storage_t)((a[x] >> (16 * e)) & 0xffffu), __NV_E4M3)));
                         dst[c * 16 + x * 4 + 2 * e] = f.x * d;
                         dst[c * 16 + x * 4 + 2 * e + 1] = f.y * d;
                     }

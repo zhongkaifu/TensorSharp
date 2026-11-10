@@ -93,14 +93,40 @@ namespace TensorSharp.Models
         /// <summary>Host memory a table could still occupy as page cache, in bytes, or 0 where
         /// the platform reports none: MemAvailable from /proc/meminfo, capped by the process's
         /// cgroup. A container sees the host's MemAvailable, which can be far more than its own
-        /// memory limit lets it cache.</summary>
+        /// memory limit lets it cache. On Windows, the available physical memory (free and
+        /// standby pages, what MemAvailable counts on Linux).</summary>
         public static long HostMemoryAvailable()
         {
+            if (OperatingSystem.IsWindows())
+                return WindowsAvailablePhysical();
             long available = MemInfoAvailable();
             long cgroup = CgroupMemoryAvailable();
             if (cgroup > 0 && (available <= 0 || cgroup < available))
                 available = cgroup;
             return available;
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct MemoryStatusEx
+        {
+            public uint Length, MemoryLoad;
+            public ulong TotalPhys, AvailPhys, TotalPageFile, AvailPageFile, TotalVirtual, AvailVirtual, AvailExtendedVirtual;
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern int GlobalMemoryStatusEx(ref MemoryStatusEx status);
+
+        private static long WindowsAvailablePhysical()
+        {
+            try
+            {
+                var status = new MemoryStatusEx { Length = (uint)System.Runtime.InteropServices.Marshal.SizeOf<MemoryStatusEx>() };
+                return GlobalMemoryStatusEx(ref status) != 0 ? (long)Math.Min(status.AvailPhys, (ulong)long.MaxValue) : 0;
+            }
+            catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+            {
+                return 0;
+            }
         }
 
         private static long MemInfoAvailable()

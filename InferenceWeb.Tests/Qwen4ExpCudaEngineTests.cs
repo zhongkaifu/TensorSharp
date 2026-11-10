@@ -840,6 +840,60 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Host experts read from the model file's mapping (TS_Q4E_HOST_EXPERTS_PIN=0; unset, what a host without the memory to
+    /// pin them gets): the CPU computes decode misses from the mapping and a prompt's staging plan is filled by host copies
+    /// instead of the copy kernels. The bytes are the pinned copies', so a 40-token prompt in one ubatch, the same prompt
+    /// in 12-row ubatches read layer by layer in groups of 24 (staging kept across a layer's ubatches), the decode steps
+    /// after it and a verify window answer bit for bit as with pinned host experts.
+    /// </summary>
+    [CudaFact]
+    public void ExpertResidency_MappedHostExperts_AnswerAsPinnedBitForBit()
+    {
+        string path = Fixture(indexerTopK: 2048, q2kxlExperts: true);
+        long expertBytes = 0;
+        using (var g = new GgufFile(path))
+            foreach (var (name, t) in g.Tensors)
+                if (name.Contains("_exps.", StringComparison.Ordinal))
+                    expertBytes += g.GetTensorByteCount(t);
+        _env.Set("TS_Q4E_EXPERT_VRAM_GB", (expertBytes / 3 / 1e9).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        // Mapped host experts leave every step of up to 16 rows to the CPU; the pinned run does the same here.
+        _env.Set("TS_Q4E_HOST_EXPERT_ROWS", "16");
+        int vocab = Qwen4ExpSyntheticModelBuilder.Vocab;
+        (float[][] Rows, float[] Window, long Misses, long Staged, bool Mapped) Answer(string pin)
+        {
+            _env.Set("TS_Q4E_HOST_EXPERTS_PIN", pin);
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda);
+            var engine = Assert.IsType<Qwen4ExpCudaModel>(model).Engine;
+            float[][] rows = Run(model);
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var window = new float[4 * vocab];
+            spec.SpecSnapshotRecurrentState();
+            spec.SpecForward(new[] { 5, 77, 123, 9 }, null, window, true);
+            return (rows, window, engine.HostExpertMisses, engine.MappedStagedExperts, engine.HostExpertsMapped);
+        }
+        foreach (var (ubatch, group) in new[] { ((string)null, "0"), ("12", "24") })
+        {
+            _env.Set("TS_Q4E_UBATCH", ubatch);
+            _env.Set("TS_Q4E_PROMPT_GROUP", group);
+            var pinned = Answer("1");
+            var mapped = Answer("0");
+            string at = ubatch == null ? "one ubatch" : $"{ubatch}-row ubatches in groups of {group}";
+            _output.WriteLine($"{at}: experts on the CPU pinned {pinned.Misses}, mapped {mapped.Misses}; "
+                + $"experts staged from the mapping {mapped.Staged}");
+            Assert.False(pinned.Mapped, $"{at}: TS_Q4E_HOST_EXPERTS_PIN=1 mapped the host experts");
+            Assert.True(mapped.Mapped, $"{at}: TS_Q4E_HOST_EXPERTS_PIN=0 pinned the host experts");
+            Assert.Equal(0, pinned.Staged);
+            Assert.True(mapped.Staged > 0, $"{at}: the prompt staged nothing from the mapping");
+            Assert.True(pinned.Misses > 0, $"{at}: no expert was left to the CPU");
+            Assert.Equal(pinned.Misses, mapped.Misses);
+            for (int i = 0; i < pinned.Rows.Length; i++)
+                Assert.True(mapped.Rows[i].AsSpan().SequenceEqual(pinned.Rows[i]),
+                    $"{at}, {(i == 0 ? "prefill" : $"decode {i}")}: mapped host experts changed the logits");
+            Assert.True(mapped.Window.AsSpan().SequenceEqual(pinned.Window), $"{at}: mapped host experts changed the verify window");
+        }
+    }
+
     /// <summary>A layer whose selected experts all have VRAM slots rings no doorbell (the GPU skips the host's echo):
     /// with a third of the experts resident some layers ring and some do not, and the answers are bit for bit those of
     /// ringing every layer, decode steps and a verify window alike, with the same experts left to the CPU.</summary>
