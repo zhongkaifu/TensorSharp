@@ -20,12 +20,11 @@ namespace TensorSharp.Models
             Aliases = new[] { "qwen35", "qwen35moe", "qwen3next" },
             // --backend cuda on a dense NVFP4 checkpoint runs the direct-CUDA engine
             // (TS_Q35_NATIVE=0 keeps the managed path).
-            // The shared decoder runtime (Qwen35RuntimeModel) serves the placements and
-            // mechanisms the family's own model does not: whole-layer stages (local or
-            // multi-node), their hybrid with --tp, and routed experts on the host for cuda and
-            // mlx. Everything else keeps Qwen35Model's fused single-device and tensor-parallel
-            // graphs, which the runtime does not match yet (Qwen3.5-0.8B decode on an M5 Pro:
-            // 226 vs 29 tok/s on ggml_metal, 188 vs 48 on MLX).
+            // The shared decoder runtime (Qwen35RuntimeModel) serves whole-layer stages (local or
+            // multi-node), their hybrid with --tp, routed experts on the host for cuda and mlx, and
+            // one device on ggml_cuda / ggml_metal for checkpoints without routed experts (see
+            // Qwen35RuntimeModel.ServesOneDevice). Qwen35Model keeps routed-expert checkpoints on
+            // one device, its own --tp, Bonsai2 PRISM rotations, and the other backends.
             Factory = c =>
             {
                 if (Qwen35RuntimeModel.Serves(c))

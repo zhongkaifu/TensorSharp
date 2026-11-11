@@ -34,7 +34,9 @@ public sealed class Qwen35PrimaryDecodeAfterHolderTests
     {
         string path = TestGates.FindGguf(Environment.GetEnvironmentVariable(EnvModelDir), Qwen35_9B);
         Assert.True(path != null, "the gate admitted the model but the loader found none");
-        using var model = (Qwen35Model)ModelBase.Create(path, TestGates.PinnedGgmlBackend);
+        // Qwen35Model's holder bookkeeping, built directly (dense ggml_cuda / ggml_metal checkpoints
+        // route to the shared runtime).
+        using var model = new Qwen35Model(path, TestGates.PinnedGgmlBackend);
         int[] prompt = model.Tokenizer.Encode("The three longest rivers in Europe are", addSpecial: true).ToArray();
 
         // The model's very first fused decode runs on a per-request holder.

@@ -308,7 +308,13 @@ public class Qwen35ImageFollowUpExactnessTests
 
         // The arena batched decode is where each sequence's RoPE position comes from its
         // holder's delta; say whether it served these steps (CUDA and Metal only).
-        long arenaSteps = ctx.Model is Qwen35Model q35 ? q35.ArenaBatchedDecodeSteps : 0;
+        // Qwen35Model's arena steps, or the shared runtime's batched slot steps.
+        long arenaSteps = ctx.Model switch
+        {
+            Qwen35Model q35 => q35.ArenaBatchedDecodeSteps,
+            StandardDecoderModel runtime => runtime.BatchedForwardCount,
+            _ => 0,
+        };
         _output.WriteLine($"[concurrent] arena batched decode steps: {arenaSteps}");
         if (ctx.Backend is BackendType.GgmlMetal or BackendType.GgmlCuda)
             Assert.True(arenaSteps > 0, "the concurrent turns never reached the arena batched decode");

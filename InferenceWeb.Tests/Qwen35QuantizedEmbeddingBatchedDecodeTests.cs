@@ -38,7 +38,8 @@ public sealed class Qwen35QuantizedEmbeddingBatchedDecodeTests
             Environment.SetEnvironmentVariable("TS_QWEN35_PROBE_LENGTHS", null);
             Environment.SetEnvironmentVariable("TS_QWEN35_PROBE_SNAPSHOT_DIR", null);
             KvCacheDtypeConfig.Set(KvCacheDtype.F16);
-            using var model = Assert.IsType<Qwen35Model>(ModelBase.Create(path, BackendType.GgmlCuda));
+            // Qwen35Model's batched decode (the factory routes one dense ggml_cuda device to the runtime).
+            using var model = new Qwen35Model(path, BackendType.GgmlCuda);
             foreach (int width in new[] { 3, 2, 4 })
             {
                 // The discovered width-four drift first violated the KL budget at
