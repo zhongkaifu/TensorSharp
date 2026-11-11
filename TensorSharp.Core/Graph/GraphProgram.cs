@@ -88,8 +88,8 @@ namespace TensorSharp.Graph
         /// [dv, vHeads, rows, 1] of silu(ssm_conv); g = softplus(alpha + dt) * a and beta = sigmoid(beta),
         /// both [1, vHeads, rows, 1].</summary>
         DeltaNetPrep = 1,
-        /// <summary>rms_norm(y) * w * silu(z) per head. Inputs: y and z [d, heads, rows], w [d]. Fp: eps.
-        /// Result: [d, heads, rows].</summary>
+        /// <summary>rms_norm(y) * w * silu(z) per head (sigmoid(z) with Ip[0] = 1). Inputs: y and z [d, heads, rows],
+        /// w [d]. Fp: eps. Result: [d, heads, rows].</summary>
         GatedRmsNorm = 2,
         /// <summary>A SwiGLU feed-forward: down · (silu(gate · x) * (up · x)). Inputs: x [n, rows], then the
         /// quantized weights: gate_up (gate rows then up rows) and down, or (Ip[0] = 1) gate, up and down.

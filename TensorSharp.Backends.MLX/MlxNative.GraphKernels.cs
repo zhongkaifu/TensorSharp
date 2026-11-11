@@ -59,7 +59,7 @@ if (head < 2 * KHeads) {
 ";
 
         // GraphFusion.GatedRmsNorm: one threadgroup of D threads per row of y [n, D]:
-        // y * rsqrt(mean(y^2) + eps) * w * silu(z).
+        // y * rsqrt(mean(y^2) + eps) * w * silu(z), or sigmoid(z) with Sigmoid.
         private const string GatedRmsNormSource = @"
 threadgroup float partial[32];
 const uint i = thread_position_in_threadgroup.x;
@@ -71,7 +71,7 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 float total = 0.0f;
 for (uint s = 0; s < D / 32; s++) total += partial[s];
 const float zz = z[r * D + i];
-out[r * D + i] = v * metal::rsqrt(total / D + as_type<float>(EpsBits)) * w[i] * (zz / (1.0f + metal::exp(-zz)));
+out[r * D + i] = v * metal::rsqrt(total / D + as_type<float>(EpsBits)) * w[i] * (Sigmoid ? 1.0f / (1.0f + metal::exp(-zz)) : zz / (1.0f + metal::exp(-zz)));
 ";
 
         // ggml_gated_delta_net for one row a sequence (decode): MlxNative's T=1 kernel with ggml's inputs, the
@@ -225,12 +225,12 @@ for (int i = 0; i < n_per_t; ++i) o_state[n_per_t * dk_idx + i] = state[i];
         }
 
         /// <summary>GraphFusion.GatedRmsNorm over <paramref name="n"/> rows of <paramref name="d"/>.</summary>
-        internal static MlxArray GatedRmsNorm(MlxArray y, MlxArray z, MlxArray w, int n, int d, float eps)
+        internal static MlxArray GatedRmsNorm(MlxArray y, MlxArray z, MlxArray w, int n, int d, float eps, bool sigmoid = false)
         {
             MlxFastMetalKernel kernel = GraphKernel(ref gatedRmsNormKernel, "tensorsharp_graph_gated_rms_norm",
                 new[] { "y", "z", "w" }, new[] { "out" }, GatedRmsNormSource);
             return RunGraphKernel(kernel, new[] { y, z, w }, new[] { (new[] { n, d }, "out") },
-                new[] { ("D", d), ("EpsBits", BitConverter.SingleToInt32Bits(eps)) }, n * d, 1, d, "the gated RMS norm")[0];
+                new[] { ("D", d), ("EpsBits", BitConverter.SingleToInt32Bits(eps)), ("Sigmoid", sigmoid ? 1 : 0) }, n * d, 1, d, "the gated RMS norm")[0];
         }
     }
 }

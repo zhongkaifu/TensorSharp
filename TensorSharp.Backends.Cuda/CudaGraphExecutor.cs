@@ -185,6 +185,7 @@ namespace TensorSharp.Cuda
                 }
                 case GraphFusion.GatedRmsNorm:
                 {
+                    if (ip != null && ip.Length > 0 && ip[0] != 0) return false;   // the kernel gates with silu only
                     Tensor y = inputs[0];
                     int d = (int)inputs[2].ElementCount();
                     if (d % 32 != 0 || d > 1024 || y.ElementCount() % d != 0 || inputs[1].ElementCount() != y.ElementCount())

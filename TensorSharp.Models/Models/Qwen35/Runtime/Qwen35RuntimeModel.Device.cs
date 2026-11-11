@@ -20,7 +20,7 @@ namespace TensorSharp.Models
     /// kernel serves one device, every stage of a layer split and every rank of tensor
     /// parallelism; the runtime finishes the block with the row-parallel ssm_out.
     /// </summary>
-    public sealed partial class Qwen35RuntimeModel
+    public partial class Qwen35RuntimeModel
     {
         private bool DeviceRecurrence => IsGgmlBackend;
 
@@ -234,11 +234,11 @@ namespace TensorSharp.Models
         /// Where the executor binds host bytes (GGML), the tensors are host-backed and the device copy is
         /// authoritative: a reset zeroes the host bytes and drops the device copy; elsewhere they are the
         /// backend's own tensors.</summary>
-        private sealed class DeviceGdnState : RecurrentState
+        protected internal class DeviceGdnState : RecurrentState
         {
-            private readonly Func<Tensor, IntPtr> _hostPointer;
-            private readonly IGraphExecutor _executor;
-            private readonly bool _host;
+            protected readonly Func<Tensor, IntPtr> _hostPointer;
+            protected readonly IGraphExecutor _executor;
+            protected readonly bool _host;
 
             public DeviceGdnState(IAllocator allocator, IGraphExecutor executor, Func<Tensor, IntPtr> hostPointer,
                 int convRows, int channels, int vHeads, int dv, int dk)
@@ -330,7 +330,7 @@ namespace TensorSharp.Models
                 foreach (Tensor t in new[] { Conv, Backing, Ssm }) Invalidate(t);
             }
 
-            private void Invalidate(Tensor t)
+            protected void Invalidate(Tensor t)
             {
                 _executor?.Invalidate(_hostPointer(t));
                 GgmlBasicOps.InvalidateTensorHostBuffer(t);
@@ -351,7 +351,7 @@ namespace TensorSharp.Models
 
             public IntPtr SsmPointer => _hostPointer(Ssm);
 
-            private unsafe void Clear(Tensor t)
+            protected unsafe void Clear(Tensor t)
             {
                 if (!_host)
                 {

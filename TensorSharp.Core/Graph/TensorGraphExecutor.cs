@@ -60,7 +60,7 @@ namespace TensorSharp.Graph
             GraphOp.Exp, GraphOp.Neg, GraphOp.Tanh, GraphOp.Relu, GraphOp.SwigluSplit, GraphOp.Swiglu, GraphOp.Reshape,
             GraphOp.View, GraphOp.Permute, GraphOp.Transpose, GraphOp.Cont, GraphOp.Cast, GraphOp.Cpy, GraphOp.SetRows,
             GraphOp.RopeExt, GraphOp.RopeMulti, GraphOp.FlashAttnExt, GraphOp.SoftMaxExt, GraphOp.TopK, GraphOp.SumRows,
-            GraphOp.SsmConv, GraphOp.GatedDeltaNet, GraphOp.Concat, GraphOp.KvWindow,
+            GraphOp.SsmConv, GraphOp.GatedDeltaNet, GraphOp.Concat, GraphOp.KvWindow, GraphOp.Sqr, GraphOp.Sqrt, GraphOp.Clamp,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -1140,6 +1140,9 @@ namespace TensorSharp.Graph
                 case GraphOp.Sub: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Sub(r, a, b)));
                 case GraphOp.Mul: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Mul(r, a, b)));
                 case GraphOp.Div: return V(Binary(T(0), T(1), run, (r, a, b) => Ops.Div(r, a, b)));
+                case GraphOp.Sqr: { Tensor x = In(T(0), run); return V(Ops.Mul(null, x, x)); }
+                case GraphOp.Sqrt: return V(Ops.Pow(null, In(T(0), run), 0.5f));
+                case GraphOp.Clamp: return V(Ops.Clamp(null, In(T(0), run), Fp(0, float.MinValue), Fp(1, float.MaxValue)));
                 case GraphOp.Scale: return V(Ops.Mul(null, In(T(0), run), Fp(0, 1f)));
                 case GraphOp.Silu: return V(Ops.SiLU(null, In(T(0), run)));
                 case GraphOp.Sigmoid: return V(Ops.Sigmoid(null, In(T(0), run)));

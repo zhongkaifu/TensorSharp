@@ -229,6 +229,8 @@ namespace TensorSharp.Models
         {
             result = null;
             string reason = GraphUnsupportedReason();
+            if (reason != null && RequiresGraphs)
+                throw new NotSupportedException($"{Config.Architecture} runs only as graphs on the shared runtime, which this step cannot use ({reason}).");
             if (reason != null && _graphTpRanks != null && reason != "disabled")
                 throw new NotSupportedException(
                     $"{Config.Architecture}: tensor parallelism runs as whole-forward graphs, which this step cannot use ({reason}).");
@@ -537,6 +539,7 @@ namespace TensorSharp.Models
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
                     if (request.CaptureLayers[c] == layer)
                         outputs.Captures[c] = step.Output(h, (long)width * rows);
+                h = EmitLayerPrologue(step, layer, h);
                 int normed = EmitBlockInput(step, layer, h, BlockSite.Mixer, out int mixContext);
                 int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
                 h = EmitBlockOutput(step, layer, h, BlockSite.Mixer, mixContext, mix);
@@ -583,6 +586,13 @@ namespace TensorSharp.Models
 
         /// <summary>Where a block reads the residual stream.</summary>
         protected enum BlockSite { Mixer, Ffn }
+
+        /// <summary>A family whose blocks the per-op path does not implement (hyper-connections): a step that
+        /// cannot run as a graph fails instead of falling back.</summary>
+        protected virtual bool RequiresGraphs => false;
+
+        /// <summary>What a layer adds to the residual stream before its blocks (Flash Next's PLE); default none.</summary>
+        protected virtual int EmitLayerPrologue(GraphStep step, int layer, int stream) => stream;
 
         /// <summary>The width of the residual stream between layers and stages (several streams of the
         /// hidden size where a family keeps hyper-connections).</summary>

@@ -18,7 +18,7 @@ namespace TensorSharp.Models
     /// SiLU, Q/K L2-norm, ggml's gated delta rule (value head h reads key head h mod nK) and the
     /// gated RMSNorm, with the conv window and the delta state written back in place.
     /// </summary>
-    public sealed partial class Qwen35RuntimeModel
+    public partial class Qwen35RuntimeModel
     {
         protected override RotarySpec GraphRotary => _rotary;
 
@@ -268,8 +268,9 @@ namespace TensorSharp.Models
                 }
 
                 int y = step.Reshape(step.Cont(scores), dv, vHeads, count), zh = step.Reshape(z, dv, vHeads, count);
-                step.BeginFused(GraphFusion.GatedRmsNorm, stackalloc[] { y, zh, ssmNorm }, default, stackalloc[] { eps });
-                int gated = step.Op(GraphOp.Mul, step.RmsNorm(y, ssmNorm, eps), step.Op(GraphOp.Silu, zh));
+                bool sigmoid = MixerSigmoidGate;
+                step.BeginFused(GraphFusion.GatedRmsNorm, stackalloc[] { y, zh, ssmNorm }, stackalloc long[] { sigmoid ? 1 : 0 }, stackalloc[] { eps });
+                int gated = step.Op(GraphOp.Mul, step.RmsNorm(y, ssmNorm, eps), step.Op(sigmoid ? GraphOp.Sigmoid : GraphOp.Silu, zh));
                 step.EndFused(stackalloc[] { gated });
                 int part = step.Reshape(gated, v, count);
                 output = output < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { output, part }, stackalloc long[] { 1 });

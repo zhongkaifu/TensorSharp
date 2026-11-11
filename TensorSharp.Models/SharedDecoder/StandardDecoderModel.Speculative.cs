@@ -75,12 +75,16 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- the trunk
 
+        /// <summary>What a family cannot speculate with yet (null: nothing).</summary>
+        protected virtual string FamilySpeculationRefusal => null;
+
         /// <summary>Speculation verifies on whole-forward graphs, or off them (MLX, direct CUDA, the
         /// managed CPU) on one device whose recurrent states keep a verify window.</summary>
         public string SpeculationRefusal
         {
             get
             {
+                if (FamilySpeculationRefusal is { } family) return family;
                 if (GraphUnsupportedReason() is not { } reason) return null;
                 if (!_mesh.IsSingleDevice || LayerSplitGroup != null)
                     return $"speculative decoding off whole-forward graphs ({reason}) runs on one device";
@@ -167,7 +171,7 @@ namespace TensorSharp.Models
                 SpecForwardPerOp(tokens, hAllOut, logitsOut, allLogitsRows, request, positions);
                 return;
             }
-            Tensor hidden = Embedding(tokens);
+            Tensor hidden = EmbedStep(tokens);
             InjectMedia(hidden, start);
             GraphResult result;
             _forwardSw.Start();
@@ -206,7 +210,7 @@ namespace TensorSharp.Models
             try
             {
                 EnterStage(0);
-                Tensor hidden = Embedding(tokens);
+                Tensor hidden = EmbedStep(tokens);
                 InjectMedia(hidden, start);
                 hidden = RunLayers(hidden, positions, batch: null, (layer, input) =>
                 {

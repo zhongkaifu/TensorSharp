@@ -30,7 +30,7 @@ namespace TensorSharp.Models
     /// that read them (block-cyclic), so its recurrence is self-contained and only
     /// <c>ssm_out</c>'s partial sum is reduced, like attention's output projection.
     /// </summary>
-    public sealed partial class Qwen35RuntimeModel : StandardDecoderModel
+    public partial class Qwen35RuntimeModel : StandardDecoderModel
     {
         private readonly bool[] _isRecurrent;
         private readonly int _ropeDim;
@@ -80,10 +80,13 @@ namespace TensorSharp.Models
             int interval = (int)_gguf.GetUint32($"{arch}.full_attention_interval", 4);
             _isRecurrent = new bool[Config.NumLayers];
             string[] layerTypes = _gguf.GetStringArray($"{arch}.layer_types");
+            uint[] recurrentLayers = _gguf.GetUint32Array($"{arch}.attention.recurrent_layers");   // qwen4exp's per-layer flags
             for (int l = 0; l < Config.NumLayers; l++)
                 _isRecurrent[l] = layerTypes != null && layerTypes.Length == Config.NumLayers
                     ? string.Equals(layerTypes[l], "linear_attention", StringComparison.OrdinalIgnoreCase)
-                    : (l + 1) % interval != 0;
+                    : recurrentLayers != null && recurrentLayers.Length >= Config.NumLayers
+                        ? recurrentLayers[l] != 0
+                        : (l + 1) % interval != 0;
 
             int headDim = Config.HeadDim;
             _ropeDim = (int)_gguf.GetUint32($"{arch}.rope.dimension_count", (uint)headDim);
@@ -128,7 +131,7 @@ namespace TensorSharp.Models
         /// The requests the shared runtime serves for this family (see Qwen35Architecture):
         /// whole-layer stages, local or multi-node, alone or with --tp; routed experts on the host
         /// for cuda and mlx, where Qwen35Model keeps them in device buffers; and one device on
-        /// ggml_cuda / ggml_metal for checkpoints without routed experts (<see cref="ServesOneDevice"/>).
+        /// ggml_cuda, ggml_metal or MLX for checkpoints without routed experts (<see cref="ServesOneDevice"/>).
         /// </summary>
         internal static bool Serves(Architecture.ModelCreateContext context)
             => context.LayerSplitDegree > 1
@@ -137,15 +140,16 @@ namespace TensorSharp.Models
                || ServesOneDevice(context);
 
         /// <summary>
-        /// One device on ggml_cuda or ggml_metal, for a checkpoint without routed experts or Bonsai2
-        /// PRISM rotations: the runtime's whole-forward graphs match Qwen35Model there (Qwen3.8-27B
-        /// UD-IQ3_XXS, prefill / decode tok/s: ggml_metal 388.7 / 21.0 vs 393.3 / 21.0 on an M5 Pro;
-        /// ggml_cuda measured on an RTX PRO 6000 in the commit adding this route), and its MTP
-        /// and DFlash2 speculation is faster. Qwen35Model keeps routed experts (its fused MoE graphs
-        /// and host seam), --tp (its per-rank fused graphs), PRISM rotations and the other backends.
+        /// One device on ggml_cuda, ggml_metal or MLX, for a checkpoint without routed experts or Bonsai2
+        /// PRISM rotations: the runtime matches Qwen35Model there (Qwen3.8-27B UD-IQ3_XXS, prefill /
+        /// decode tok/s: ggml_metal 388.7 / 21.0 vs 393.3 / 21.0 on an M5 Pro; ggml_cuda measured on an
+        /// RTX PRO 6000 in the commit adding this route; MLX decode 19.8 vs 19.6-20.0, MTP 29.8 vs
+        /// 29.3-29.6, DFlash2 29.3-29.8 vs 27.5-27.7, Qwen3.5-0.8B Q8_0 prompt 12,130 vs 12,290).
+        /// Qwen35Model keeps routed experts (its fused MoE graphs and host seam), --tp (its per-rank
+        /// fused graphs), PRISM rotations and the other backends (direct CUDA is not at parity yet).
         /// </summary>
         internal static bool ServesOneDevice(Architecture.ModelCreateContext context)
-            => context.Backend is BackendType.GgmlCuda or BackendType.GgmlMetal
+            => context.Backend is BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.Mlx
                && context.TpDegree <= 1 && context.TpGroup == null && context.LayerSplitDegree <= 1
                && context.Probe != null && !HasRoutedExperts(context.Probe) && !CarriesPrismRotations(context.Probe);
 
@@ -184,7 +188,7 @@ namespace TensorSharp.Models
             }
         }
 
-        private unsafe IntPtr HostPointer(Tensor tensor) => (IntPtr)GetFloatPtr(tensor);
+        protected unsafe IntPtr HostPointer(Tensor tensor) => (IntPtr)GetFloatPtr(tensor);
 
         protected override bool GatedAttentionOutput => true;
 
@@ -381,9 +385,16 @@ namespace TensorSharp.Models
             int kHeads = _numKHeads / ShardDegree;
             int channels = 2 * kHeads * _headKDim + vHeads * _headVDim;
             if (TensorRecurrence)
-                return new DeviceGdnState(scope.Allocator, GraphExecutor, HostPointer, _convKernel - 1, channels, vHeads, _headVDim, _headKDim);
+                return CreateDeviceGdnState(scope, layer, _convKernel - 1, channels, vHeads, _headVDim, _headKDim);
             return new GdnState(_convKernel - 1, channels, vHeads, _headVDim, _headKDim);
         }
+
+        /// <summary>A layer's tensor state (a family adds what its layer keeps besides the recurrence).</summary>
+        protected virtual DeviceGdnState CreateDeviceGdnState(RankScope scope, int layer, int convRows, int channels, int vHeads, int dv, int dk)
+            => new(scope.Allocator, GraphExecutor, HostPointer, convRows, channels, vHeads, dv, dk);
+
+        /// <summary>The recurrence's output gate: sigmoid(z) (Qwen3.8-Flash-Next) instead of silu(z).</summary>
+        protected virtual bool MixerSigmoidGate => false;
 
         protected override Tensor RecurrentMixer(RankScope scope, Tensor normed, int layer, RecurrentState state)
         {

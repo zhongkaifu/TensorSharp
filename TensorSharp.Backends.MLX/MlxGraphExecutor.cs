@@ -112,7 +112,7 @@ namespace TensorSharp.MLX
                         if (d % 32 != 0 || d > 1024 || y.ElementCount() % d != 0 || inputs[1].ElementCount() != y.ElementCount())
                             return false;
                         int n = (int)(y.ElementCount() / d);
-                        outs = new[] { MlxNative.GatedRmsNorm(views[0], views[1], views[2], n, d, eps) };
+                        outs = new[] { MlxNative.GatedRmsNorm(views[0], views[1], views[2], n, d, eps, ip != null && ip.Length > 0 && ip[0] == 1) };
                         results[0] = Wrap(outs[0], y.Sizes);
                         return true;
                     }

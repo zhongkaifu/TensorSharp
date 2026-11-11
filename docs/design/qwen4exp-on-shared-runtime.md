@@ -1,6 +1,29 @@
 # Qwen3.8-Flash-Next (`qwen4exp`) on the shared decoder runtime
 
-Status: design. `Qwen4ExpModel` and its engines stay until the runtime matches them.
+Status: steps 1 and 2 of §3 are in (`Qwen4ExpRuntimeModel`, not routed yet). `Qwen4ExpModel` and its engines
+stay until the runtime matches them.
+
+**Done (2026-11-11).** `Qwen4ExpRuntimeModel` derives from `Qwen35RuntimeModel` and adds only the family's own
+parts: the hyper-connection hooks (§2.1), the sigmoid output gate of the recurrence (§2.2), the PLE layer (§2.4)
+and the QSA budget (§2.3 phase 1). On the synthetic checkpoint (`Qwen4ExpRuntimeTests`) it matches
+`Qwen4ExpModel`:
+
+| backend | one prompt | chunked prompt |
+|---|---|---|
+| managed CPU | same bits within 1.5e-7 | ~5e-3 (each model moves as much against its own unchunked run) |
+| ggml_cpu, ggml_metal | 4-6e-3 (`Qwen4ExpModel` itself differs from its managed run by 6e-3) | same |
+| MLX | under 2e-2 against `Qwen4ExpModel`'s managed run | same |
+
+What the port needed in the runtime: `EmitLayerPrologue` (a layer's addition to the stream before its blocks),
+`StepTokens` (the rows' tokens, for the n-gram hashes), `RequiresGraphs` (no per-op fallback for a family the
+per-op layers do not implement), `FamilySpeculationRefusal`, a state factory (`CreateDeviceGdnState`; the PLE
+layer's state adds the conv history and the n-gram history, the latter as floats in a tensor so copies and
+prefix checkpoints carry it), `attention.recurrent_layers`, and `Sqr`/`Sqrt`/`Clamp` in the tensor executors.
+One trap: a replayable step is emitted twice when its signature misses the cache (the signature pass, then the
+recording), so hashing a step must use the history as of its start (the state keeps one level of undo).
+
+**Next:** the real checkpoint needs its experts off the device (§2.5: a tiered expert op), the MTP head and
+DFlash2 (§2.6, with the PLE histories rewound by a verify), and QSA phase 2 above the budget.
 
 Flash Next has 125 B parameters in total and 6 B active. Its routed experts take 46 GB at UD-Q2_K_XL.
 

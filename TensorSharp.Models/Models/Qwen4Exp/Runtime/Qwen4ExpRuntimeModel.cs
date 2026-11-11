@@ -1,0 +1,534 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using TensorSharp.Graph;
+
+namespace TensorSharp.Models
+{
+    /// <summary>
+    /// Qwen3.8-Flash-Next (<c>qwen4exp</c>) on the shared decoder runtime: Qwen 3.5's Gated DeltaNet and gated
+    /// attention (<see cref="Qwen35RuntimeModel"/>) under hyper-connections, with a PLE layer and the MoE's
+    /// shared expert behind a scalar sigmoid gate.
+    /// <list type="bullet">
+    /// <item><b>Hyper-connections:</b> the residual stream is <c>hc</c> copies of the hidden row. A block reads
+    /// it through a grouped RMS norm (one gamma per stream element), a low-rank gate
+    /// <c>sigmoid(W_up · silu(W_down · xn / hc))</c> and the mean over the streams of <c>xn * gate</c>, and writes
+    /// back <c>stream_c += out * 2 * sigmoid(W_inject · xn / hc)_c</c>. The final mixer is the output norm.</item>
+    /// <item><b>Gated DeltaNet:</b> the mixer reads the hyper-connection mixer's row (no input norm) and gates
+    /// its output with <c>sigmoid(z)</c>.</item>
+    /// <item><b>PLE</b> (the layers in <c>ple.layers</c>): rows of an n-gram hash table are gathered on the host per
+    /// token, projected to a key [hc·n] and a value [n]; per stream <c>s = key_c · query_c / sqrt(n)</c> (both grouped-
+    /// normed, the query from the stream), <c>gated_c = value * sigmoid(sign(s) sqrt(max(|s|, 1e-6)))</c>, and
+    /// <c>stream += gated + silu(conv(norm(gated)))</c> with a causal depthwise conv dilated by the n-gram size. The
+    /// n-gram history and the conv history are the sequence's state.</item>
+    /// <item><b>QSA</b> layers attend densely, which is exact below <c>indexer_top_k * compress_ratio</c> cached
+    /// tokens; longer sequences are refused.</item>
+    /// </list>
+    /// Speculation (the MTP head, DFlash2) and expert tiers are not ported yet: <see cref="Qwen4ExpModel"/> serves
+    /// them.
+    /// </summary>
+    public sealed partial class Qwen4ExpRuntimeModel : Qwen35RuntimeModel
+    {
+        private const string PleTable = "per_layer_token_embd.weight";
+        private const float PleScoreFloor = 1e-6f;
+
+        private PleSpec _ple;
+        private readonly Dictionary<int, Tensor> _pleTaps = new();
+
+        public Qwen4ExpRuntimeModel(string ggufPath, BackendType backend, string draftModelPath = null)
+            : base(ggufPath, backend, 1, null, 1, draftModelPath)
+        {
+            PleSpec ple = Ple;
+            if (ple.Hc < 2)
+            {
+                Dispose();
+                throw new NotSupportedException($"{Config.Architecture}: {ple.Hc} hyper-connection streams; the runtime's qwen4exp needs 2 or more.");
+            }
+            if (GraphExecutor == null)
+            {
+                Dispose();
+                throw new NotSupportedException($"{Config.Architecture}: backend {backend} registers no graph executor; qwen4exp runs only as graphs.");
+            }
+            for (int l = 0; l < Config.NumLayers; l++)
+                if (ple.IsPle[l] && !IsRecurrentLayer(l))
+                {
+                    Dispose();
+                    throw new NotSupportedException($"{Config.Architecture}: PLE on attention layer {l} (the runtime keeps PLE state with a recurrent layer's).");
+                }
+            if (ple.Layers > 0 && !_quantWeights.ContainsKey(PleTable) && !_weights.ContainsKey(PleTable))
+            {
+                Dispose();
+                throw new NotSupportedException($"{Config.Architecture}: PLE layers without {PleTable}.");
+            }
+            Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                $"  Hyper-connections: {ple.Hc} streams, low rank {ple.HcLowRank}; PLE layers: {ple.Layers} " +
+                $"(n-gram {ple.Ngram}, {ple.Heads} heads of {ple.HeadDim}, conv {ple.ConvKernel}); QSA dense up to {ple.QsaBudget} tokens."));
+        }
+
+        // ---------------------------------------------------------------- configuration
+
+        /// <summary>The family's constants, read from the GGUF on first use: the base constructor already calls
+        /// the hooks below (states, stream width) before this class's fields are set.</summary>
+        private PleSpec Ple => _ple ??= new PleSpec(_gguf, Config);
+
+        private sealed class PleSpec
+        {
+            public readonly int Hc, HcLowRank, Hidden;
+            public readonly bool[] IsPle;
+            public readonly int Layers, Ngram, HeadsPerNgram, Heads, HeadDim, ConvKernel, Eos;
+            public readonly ulong[] Multipliers, Offsets, VocabSizes;
+            public readonly int[] CompressRatios;
+            public readonly long QsaBudget;
+
+            public PleSpec(GgufFile gguf, ModelConfig config)
+            {
+                string a = gguf.GetString("general.architecture") ?? "qwen4exp";
+                Hidden = config.HiddenSize;
+                Hc = (int)gguf.GetUint32($"{a}.hyper_connection.count", 1);
+                HcLowRank = (int)gguf.GetUint32($"{a}.hyper_connection.low_rank", 0);
+                int layers = config.NumLayers;
+                IsPle = new bool[layers];
+                if (gguf.GetInt32Array($"{a}.ple.layers") is { Length: > 0 } pleLayers)
+                {
+                    foreach (int l in pleLayers)
+                    {
+                        if (l < 0 || l >= layers) throw new NotSupportedException($"{a}.ple.layers names layer {l}, outside 0..{layers - 1}.");
+                        IsPle[l] = true;
+                        Layers++;
+                    }
+                    Ngram = (int)gguf.GetUint32($"{a}.ple.ngram_size");
+                    HeadsPerNgram = (int)gguf.GetUint32($"{a}.ple.heads_per_ngram");
+                    ConvKernel = (int)gguf.GetUint32($"{a}.ple.conv_kernel");
+                    Eos = (int)gguf.GetUint32($"{a}.ple.eos_token_id");
+                    HeadDim = (int)gguf.GetUint32($"{a}.embedding_length_per_layer_input");
+                    Heads = (Ngram - 1) * HeadsPerNgram;
+                    Multipliers = gguf.GetUint64Array($"{a}.ple.layer_multipliers");
+                    Offsets = gguf.GetUint64Array($"{a}.ple.head_offsets");
+                    VocabSizes = gguf.GetUint64Array($"{a}.ple.head_vocab_sizes");
+                    if (Ngram < 2 || Heads * HeadDim != Hidden || ConvKernel < 1
+                        || Multipliers == null || Multipliers.Length < Ngram || Offsets == null || Offsets.Length < Heads
+                        || VocabSizes == null || VocabSizes.Length < Heads)
+                        throw new NotSupportedException($"{a}: inconsistent PLE metadata (n-gram {Ngram}, {Heads} heads of {HeadDim} for hidden {Hidden}).");
+                }
+                CompressRatios = new int[layers];
+                if (gguf.GetInt32Array($"{a}.attention.compress_ratios") is { } ratios)
+                    for (int l = 0; l < layers && l < ratios.Length; l++) CompressRatios[l] = ratios[l];
+                long topK = gguf.GetUint32($"{a}.attention.indexer.top_k", 0);
+                QsaBudget = long.MaxValue;
+                for (int l = 0; l < layers; l++)
+                    if (CompressRatios[l] > 0) QsaBudget = Math.Min(QsaBudget, topK * CompressRatios[l]);
+            }
+
+            /// <summary>Rows of the PLE layers' conv history: (kernel - 1) taps, each n-gram positions apart.</summary>
+            public int ConvHistory => (ConvKernel - 1) * Ngram;
+
+            public long StreamFloats => (long)Hc * Hidden;
+        }
+
+        // ---------------------------------------------------------------- family hooks
+
+        protected override bool MixerSigmoidGate => true;
+
+        protected override bool RequiresGraphs => true;
+
+        protected override int StreamWidth => checked((int)Ple.StreamFloats);
+
+        protected override string FamilySpeculationRefusal =>
+            "qwen4exp on the shared runtime does not speculate yet (its MTP head and DFlash2 run on Qwen4ExpModel)";
+
+        protected override DeviceGdnState CreateDeviceGdnState(RankScope scope, int layer, int convRows, int channels, int vHeads, int dv, int dk)
+            => Ple.IsPle[layer]
+                ? new PleGdnState(scope.Allocator, GraphExecutor, HostPointer, convRows, channels, vHeads, dv, dk, Ple)
+                : base.CreateDeviceGdnState(scope, layer, convRows, channels, vHeads, dv, dk);
+
+        /// <summary>The embedding's hc copies, stream c at elements [c·n, (c+1)·n) of a row.</summary>
+        protected override int EmitStreamInput(GraphStep step, int embedded)
+        {
+            int stream = embedded;
+            for (int c = 1; c < Ple.Hc; c++)
+                stream = step.Op(GraphOp.Concat, stackalloc[] { stream, embedded }, stackalloc long[] { 0 });
+            return stream;
+        }
+
+        protected override int EmitBlockInput(GraphStep step, int layer, int stream, BlockSite site, out int context)
+        {
+            string part = site == BlockSite.Mixer ? "attn" : "ffn";
+            return HcMix(step, stream, LayerName(layer, $"hc_{part}_norm.weight"), LayerName(layer, $"hc_{part}_down.weight"),
+                LayerName(layer, $"hc_{part}_up.weight"), LayerName(layer, $"hc_{part}_inject.weight"), out context);
+        }
+
+        /// <summary>stream_c += output * 2 * sigmoid(inject_c / hc).</summary>
+        protected override int EmitBlockOutput(GraphStep step, int layer, int stream, BlockSite site, int context, int output)
+        {
+            PleSpec p = Ple;
+            int rows = step.Rows, hc = p.Hc;
+            int w = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Sigmoid, step.Op(GraphOp.Scale, stackalloc[] { context }, default, stackalloc[] { 1f / hc })) },
+                default, stackalloc[] { 2f });
+            int weights = step.Reshape(w, 1, hc, rows);
+            int scaled = step.Op(GraphOp.Mul, Streams(step, step.Reshape(step.Cont(output), p.Hidden, 1, rows), hc), weights);
+            return step.Op(GraphOp.Add, stream, step.Reshape(scaled, p.StreamFloats, rows));
+        }
+
+        /// <summary>The final mixer is the output norm (qwen4exp has no output_norm).</summary>
+        protected override int EmitStreamOutput(GraphStep step, int stream)
+            => HcMix(step, stream, "output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", null, out _);
+
+        protected override int EmitLayerPrologue(GraphStep step, int layer, int stream)
+        {
+            PleSpec p = Ple;
+            for (int s = 0; s < step.Sequences; s++)
+                if (step.Starts[s] + step.Counts[s] > p.QsaBudget)
+                    throw new NotSupportedException(string.Create(CultureInfo.InvariantCulture,
+                        $"{Config.Architecture}: {step.Starts[s] + step.Counts[s]} tokens exceed the {p.QsaBudget} its QSA layers attend densely; the shared runtime does not run QSA's block selection yet."));
+            return p.IsPle[layer] ? EmitPle(step, layer, stream) : stream;
+        }
+
+        // ---------------------------------------------------------------- hyper-connections
+
+        /// <summary>The grouped norm, low-rank gate and stream mean: [n, rows], with the inject [hc, rows] when
+        /// <paramref name="inject"/> is named.</summary>
+        private int HcMix(GraphStep step, int stream, string norm, string down, string up, string inject, out int injected)
+        {
+            PleSpec p = Ple;
+            int rows = step.Rows, hc = p.Hc;
+            long n = p.Hidden, width = p.StreamFloats;
+            int xn = GroupedNorm(step, stream, norm);
+            int lo = step.Op(GraphOp.Silu, step.Op(GraphOp.Scale, stackalloc[] { step.MatMul(down, xn) }, default, stackalloc[] { 1f / hc }));
+            int gate = step.Op(GraphOp.Sigmoid, step.MatMul(up, lo));
+            int gated = step.Op(GraphOp.Mul, xn, gate);
+            const long f = sizeof(float);
+            int mixed = step.View2(gated, n, rows, width * f, 0);
+            for (int c = 1; c < hc; c++)
+                mixed = step.Op(GraphOp.Add, mixed, step.View2(gated, n, rows, width * f, c * n * f));
+            mixed = step.Op(GraphOp.Scale, stackalloc[] { mixed }, default, stackalloc[] { 1f / hc });
+            injected = inject != null ? step.MatMul(inject, xn) : -1;
+            return mixed;
+        }
+
+        /// <summary>RMS norm of each stream of x [hc·n, rows], times the [hc·n] gammas of <paramref name="weight"/>.</summary>
+        private int GroupedNorm(GraphStep step, int x, string weight)
+        {
+            PleSpec p = Ple;
+            int rows = step.Rows;
+            int perStream = step.Op(GraphOp.RmsNorm, stackalloc[] { step.Reshape(step.Cont(x), p.Hidden, p.Hc, rows) }, default, stackalloc[] { Config.Eps });
+            return step.Op(GraphOp.Mul, step.Reshape(perStream, p.StreamFloats, rows), step.Weight(weight));
+        }
+
+        /// <summary>x [n, 1, rows] as [n, hc, rows] (hc copies along the stream axis).</summary>
+        private static int Streams(GraphStep step, int x, int hc)
+        {
+            int all = x;
+            for (int c = 1; c < hc; c++)
+                all = step.Op(GraphOp.Concat, stackalloc[] { all, x }, stackalloc long[] { 1 });
+            return all;
+        }
+
+        // ---------------------------------------------------------------- PLE
+
+        private int EmitPle(GraphStep step, int layer, int stream)
+        {
+            PleSpec p = Ple;
+            int rows = step.Rows, hc = p.Hc;
+            long n = p.Hidden, width = p.StreamFloats;
+            const long f = sizeof(float);
+
+            int embedded = step.InputF32(GatherPleRows(step, layer), n, rows);
+            int key = GroupedNorm(step, step.MatMul(LayerName(layer, "ple_key.weight"), embedded), LayerName(layer, "ple_norm_key.weight"));
+            int value = step.MatMul(LayerName(layer, "ple_value.weight"), embedded);                  // [n, rows]
+            int query = GroupedNorm(step, stream, LayerName(layer, "ple_norm_query.weight"));
+            // s = key_c · query_c / sqrt(n) per stream; gate = sigmoid(sign(s) sqrt(max(|s|, floor))).
+            int dot = step.Op(GraphOp.SumRows, step.Reshape(step.Op(GraphOp.Mul, key, query), n, hc, rows));   // [1, hc, rows]
+            int score = step.Op(GraphOp.Scale, stackalloc[] { dot }, default, stackalloc[] { 1f / MathF.Sqrt(n) });
+            int magnitude = step.Op(GraphOp.Sqrt, step.Op(GraphOp.Sqr, score));
+            int root = step.Op(GraphOp.Sqrt, stackalloc[] { step.Op(GraphOp.Clamp, stackalloc[] { magnitude }, default, stackalloc[] { PleScoreFloor, float.MaxValue }) });
+            int sign = step.Op(GraphOp.Div, score, step.Op(GraphOp.Clamp, stackalloc[] { magnitude }, default, stackalloc[] { float.Epsilon * 1e8f, float.MaxValue }));
+            int gate = step.Op(GraphOp.Sigmoid, step.Op(GraphOp.Mul, sign, root));                     // [1, hc, rows]
+            int gated = step.Reshape(step.Op(GraphOp.Mul, Streams(step, step.Reshape(value, n, 1, rows), hc), gate), width, rows);
+
+            // The causal depthwise conv over [history | rows], taps n-gram positions apart, then silu.
+            int normed = GroupedNorm(step, gated, LayerName(layer, "ple_norm_conv.weight"));
+            int taps = step.TensorWeight(PleTaps(layer), width, p.ConvKernel);
+            int history = p.ConvHistory;
+            int conv = -1;
+            for (int s = 0; s < step.Sequences; s++)
+            {
+                int count = step.Counts[s];
+                var state = (PleGdnState)step.SequenceState(s, layer);
+                int rowsOf = step.Sequences == 1 ? normed : step.View2(normed, width, count, width * f, step.First[s] * width * f);
+                int padded = rowsOf, past = 0;
+                if (history > 0)
+                {
+                    past = step.State(state.PleConv, GraphFormat.F32, width, history);
+                    padded = step.Op(GraphOp.Concat, stackalloc[] { past, rowsOf }, stackalloc long[] { 1 });   // [width, history + count]
+                }
+                int sum = -1;
+                for (int k = 0; k < p.ConvKernel; k++)
+                {
+                    long back = (long)(p.ConvKernel - 1 - k) * p.Ngram;
+                    int shifted = step.View2(padded, width, count, width * f, (history - back) * width * f);
+                    int term = step.Op(GraphOp.Mul, shifted, step.View2(taps, width, 1, width * f, k * width * f));
+                    sum = sum < 0 ? term : step.Op(GraphOp.Add, sum, term);
+                }
+                int part = step.Op(GraphOp.Silu, sum);
+                if (history > 0)
+                    step.Effect(step.Op(GraphOp.Cpy, step.View2(padded, width, history, width * f, (long)count * width * f), past));
+                conv = conv < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { conv, part }, stackalloc long[] { 1 });
+            }
+            return step.Op(GraphOp.Add, stream, step.Op(GraphOp.Add, gated, conv));
+        }
+
+        /// <summary>ple_conv1d [kernel, hc·n] (one weight per channel and tap) as tap rows on the device.</summary>
+        private unsafe Tensor PleTaps(int layer)
+        {
+            if (_pleTaps.TryGetValue(layer, out Tensor taps)) return taps;
+            PleSpec p = Ple;
+            string name = LayerName(layer, "ple_conv1d.weight");
+            long width = p.StreamFloats;
+            int kernel = p.ConvKernel;
+            var raw = new float[width * kernel];
+            if (_weights.TryGetValue(name, out Tensor w))
+                Array.Copy(w.GetElementsAsFloat((int)w.ElementCount()), raw, raw.Length);
+            else if (_quantWeights.TryGetValue(name, out QuantizedWeight q))
+                NativeDequant.DequantizeToFloat32(q.GgmlType, q.Data, raw, 0, raw.Length);
+            else
+                throw new NotSupportedException($"{Config.Architecture}: {name} is missing.");
+            var rowsByTap = new float[raw.Length];
+            for (long c = 0; c < width; c++)
+                for (int k = 0; k < kernel; k++)
+                    rowsByTap[k * width + c] = raw[c * kernel + k];
+            taps = CreateFloatTensor(rowsByTap, kernel, width);
+            _pleTaps[layer] = taps;
+            return taps;
+        }
+
+        /// <summary>This step's PLE rows, [rows, n]: each sequence's n-gram hashes over its history and its rows (the
+        /// history then advances), gathered from the host table.</summary>
+        private unsafe float[] GatherPleRows(GraphStep step, int layer)
+        {
+            PleSpec p = Ple;
+            int[] tokens = StepTokens;
+            if (tokens == null || tokens.Length != step.Rows)
+                throw new InvalidOperationException($"{Config.Architecture}: the PLE layer needs the step's {step.Rows} tokens.");
+            var ids = new int[(long)step.Rows * p.Heads];
+            for (int s = 0; s < step.Sequences; s++)
+            {
+                var state = (PleGdnState)step.SequenceState(s, layer);
+                state.HashRows(tokens, step.First[s], step.Counts[s], step.Starts[s], ids);
+            }
+            var embedded = new float[(long)step.Rows * p.Hidden];
+            if (_quantWeights.TryGetValue(PleTable, out QuantizedWeight table))
+            {
+                long rowBytes = NativeDequant.RowSize(table.GgmlType, table.Ne0);
+                fixed (float* dst = embedded)
+                    for (long i = 0; i < ids.Length; i++)
+                        NativeDequant.DequantizeToFloat32Native(table.GgmlType, (IntPtr)((byte*)table.Data + ids[i] * rowBytes),
+                            (IntPtr)(dst + i * p.HeadDim), p.HeadDim);
+            }
+            else
+            {
+                Tensor dense = _weights[PleTable];
+                for (long i = 0; i < ids.Length; i++)
+                {
+                    using Tensor row = dense.Narrow(0, ids[i], 1);
+                    Array.Copy(row.GetElementsAsFloat(p.HeadDim), 0, embedded, i * p.HeadDim, p.HeadDim);
+                }
+            }
+            return embedded;
+        }
+
+        /// <summary>A PLE layer's sequence state: the recurrence's, the PLE conv history [history, hc·n] and the
+        /// n-gram history (the last n-1 tokens and the position after them, as floats in a tensor so copies,
+        /// snapshots and prefix checkpoints carry it; a host mirror serves the hashing).</summary>
+        private sealed class PleGdnState : DeviceGdnState
+        {
+            private readonly PleSpec _p;
+            private readonly int[] _tokens, _undoTokens;
+            private int _count, _next;
+            private bool _stale;
+            // The history before the last hashed step: a step's emission may run twice (a replayable step's
+            // signature pass, then its recording), and both must hash with the history as of its start.
+            private int _undoCount, _undoNext, _lastStart = -1, _lastCount = -1;
+
+            public PleGdnState(IAllocator allocator, IGraphExecutor executor, Func<Tensor, IntPtr> hostPointer,
+                int convRows, int channels, int vHeads, int dv, int dk, PleSpec p)
+                : base(allocator, executor, hostPointer, convRows, channels, vHeads, dv, dk)
+            {
+                _p = p;
+                _tokens = new int[p.Ngram - 1];
+                _undoTokens = new int[p.Ngram - 1];
+                PleConv = new Tensor(allocator, DType.Float32, Math.Max(1, p.ConvHistory), p.StreamFloats);
+                PleTokens = new Tensor(allocator, DType.Float32, 2 + p.Ngram - 1);
+                ResetPle();
+            }
+
+            public Tensor PleConv { get; }
+            public Tensor PleTokens { get; }
+
+            public override void Reset()
+            {
+                base.Reset();
+                ResetPle();
+            }
+
+            private void ResetPle()
+            {
+                if (PleConv == null) return;   // the base constructor resets before this one ran
+                Clear(PleConv);
+                _count = _next = 0;
+                _stale = false;
+                _lastStart = -1;
+                WriteTokens();
+            }
+
+            protected internal override IEnumerable<Tensor> HostTensors => Concat(base.HostTensors);
+
+            protected internal override IEnumerable<Tensor> CheckpointTensors => Concat(base.CheckpointTensors);
+
+            private IEnumerable<Tensor> Concat(IEnumerable<Tensor> first)
+            {
+                foreach (Tensor t in first) yield return t;
+                yield return PleConv;
+                yield return PleTokens;
+            }
+
+            protected internal override unsafe void CopyFrom(RecurrentState source)
+            {
+                base.CopyFrom(source);
+                var other = (PleGdnState)source;
+                foreach (var (from, to) in new[] { (other.PleConv, PleConv), (other.PleTokens, PleTokens) })
+                {
+                    if (!_host)
+                    {
+                        Ops.Copy(to, from);
+                        continue;
+                    }
+                    long bytes = to.ElementCount() * sizeof(float);
+                    Buffer.MemoryCopy((void*)_hostPointer(from), (void*)_hostPointer(to), bytes, bytes);
+                    Invalidate(to);
+                }
+                _stale = true;
+                _lastStart = -1;
+            }
+
+            protected internal override void OnHostWritten()
+            {
+                base.OnHostWritten();
+                if (_host) Invalidate(PleConv);
+                _stale = true;
+                _lastStart = -1;
+            }
+
+            /// <summary>Hash rows [first, first + count) of <paramref name="tokens"/> (positions from
+            /// <paramref name="start"/>) into <paramref name="ids"/> (heads fastest), then advance the history:
+            /// Qwen4ExpModel.ComputePleRows's rule, with this sequence's history.</summary>
+            public void HashRows(int[] tokens, int first, int count, int start, int[] ids)
+            {
+                ReadTokens();
+                if (start == _lastStart && count == _lastCount)
+                {
+                    _count = _undoCount;
+                    _next = _undoNext;
+                    Array.Copy(_undoTokens, _tokens, _tokens.Length);
+                }
+                else
+                {
+                    _undoCount = _count;
+                    _undoNext = _next;
+                    Array.Copy(_tokens, _undoTokens, _tokens.Length);
+                }
+                _lastStart = start;
+                _lastCount = count;
+                int ngram = _p.Ngram, eos = _p.Eos;
+                var hist = new List<int>(ngram);
+                if (_next == start)
+                    for (int i = 0; i < _count; i++) hist.Add(_tokens[i]);
+                while (hist.Count < ngram - 1) hist.Insert(0, eos);
+                var ctx = new long[ngram];
+                for (int i = 0; i < count; i++)
+                {
+                    int pos = start + i;
+                    ctx[0] = tokens[first + i];
+                    bool cut = false;
+                    for (int s = 1; s < ngram; s++)
+                    {
+                        long tok;
+                        if (cut)
+                        {
+                            tok = eos;
+                        }
+                        else if (i - s >= 0)
+                        {
+                            tok = tokens[first + i - s];
+                        }
+                        else
+                        {
+                            int back = s - i, idx = hist.Count - back;
+                            tok = back > 0 && idx >= 0 && idx < hist.Count && pos - s >= 0 ? hist[idx] : eos;
+                        }
+                        ctx[s] = tok;
+                        if (tok == eos) cut = true;
+                    }
+                    for (int g = 2; g <= ngram; g++)
+                    {
+                        ulong mixed = (ulong)ctx[0] * _p.Multipliers[0];
+                        for (int j = 1; j < g; j++) mixed ^= (ulong)ctx[j] * _p.Multipliers[j];
+                        int baseHead = (g - 2) * _p.HeadsPerNgram;
+                        for (int hh = 0; hh < _p.HeadsPerNgram; hh++)
+                        {
+                            int h = baseHead + hh;
+                            ids[(long)(first + i) * _p.Heads + h] = (int)(mixed % _p.VocabSizes[h] + _p.Offsets[h]);
+                        }
+                    }
+                }
+                // The last n-1 tokens (this step's, after the history's when it continues it).
+                var all = new List<int>(hist.Count + count);
+                if (_next == start) for (int i = 0; i < _count; i++) all.Add(_tokens[i]);
+                for (int i = 0; i < count; i++) all.Add(tokens[first + i]);
+                _count = Math.Min(ngram - 1, all.Count);
+                for (int i = 0; i < _count; i++) _tokens[i] = all[all.Count - _count + i];
+                _next = start + count;
+                WriteTokens();
+            }
+
+            private void WriteTokens()
+            {
+                var v = new float[PleTokens.ElementCount()];
+                v[0] = _count;
+                v[1] = _next;
+                for (int i = 0; i < _count; i++) v[2 + i] = _tokens[i];
+                PleTokens.SetElementsAsFloat(v);
+                if (_host) Invalidate(PleTokens);
+            }
+
+            private void ReadTokens()
+            {
+                if (!_stale) return;
+                float[] v = PleTokens.GetElementsAsFloat((int)PleTokens.ElementCount());
+                _count = (int)v[0];
+                _next = (int)v[1];
+                for (int i = 0; i < _count; i++) _tokens[i] = (int)v[2 + i];
+                _stale = false;
+            }
+
+            public override void Dispose()
+            {
+                base.Dispose();
+                PleConv.Dispose();
+                PleTokens.Dispose();
+            }
+        }
+
+        public override void Dispose()
+        {
+            foreach (Tensor t in _pleTaps.Values) t.Dispose();
+            _pleTaps.Clear();
+            base.Dispose();
+        }
+    }
+}

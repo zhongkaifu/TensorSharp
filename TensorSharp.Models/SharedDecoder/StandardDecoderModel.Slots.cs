@@ -469,7 +469,7 @@ namespace TensorSharp.Models
             Tensor embedded = null;
             try
             {
-                embedded = Embedding(flatTokens);
+                embedded = EmbedStep(flatTokens);
                 if (TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(), wantLogits: true, out float[][] graphLogits))
                 {
                     BatchedForwardCount++;
@@ -496,7 +496,7 @@ namespace TensorSharp.Models
             {
                 BatchedForwardCount++;
                 EnterStage(0);
-                Tensor hidden = Embedding(flatTokens);
+                Tensor hidden = EmbedStep(flatTokens);
                 hidden = RunLayers(hidden, TokenPositions.Explicit(positions), batch);
                 all = ProjectRows(hidden, lastRows);
                 hidden.Dispose();

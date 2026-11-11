@@ -311,6 +311,16 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>The tokens of the step being embedded (every sequence's rows, in row order), for a family whose
+        /// layers read more than the embedding (Flash Next's per-layer n-gram rows).</summary>
+        protected int[] StepTokens { get; private set; }
+
+        private Tensor EmbedStep(int[] tokens)
+        {
+            StepTokens = tokens;
+            return Embedding(tokens);
+        }
+
         // A layer without ffn_gate_up runs ffn_gate and ffn_up as two products on every path (graph
         // SwigluSplit, per-op, tensor-parallel shards), so a mixed-quant pair stays in its own types
         // where fusing it would requantize: IQ2_XXS/IQ2_XS/IQ1_S pairs (no importance matrix), and on
@@ -545,7 +555,7 @@ namespace TensorSharp.Models
                 var positions = BeginRotaryPositions(start, seqLen);
                 EnterStage(0);
                 long t0 = Stopwatch.GetTimestamp();
-                Tensor hidden = Embedding(tokens);
+                Tensor hidden = EmbedStep(tokens);
                 _embTicks += Stopwatch.GetTimestamp() - t0;
                 InjectMedia(hidden, start);
 
@@ -588,7 +598,7 @@ namespace TensorSharp.Models
                 _logitsBuffer = ForwardLayerPipeline(tokens,
                     embed: () =>
                     {
-                        Tensor hidden = Embedding(tokens);
+                        Tensor hidden = EmbedStep(tokens);
                         InjectMedia(hidden, start);
                         return hidden;
                     },

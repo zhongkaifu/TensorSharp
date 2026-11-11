@@ -16,7 +16,7 @@ namespace TensorSharp.Models
     /// expansion, and its (T, H, W) position tables, which the runtime rotates with the family's
     /// interleaved M-RoPE sections (images and their media rows are the runtime's generic path).
     /// </summary>
-    public sealed partial class Qwen35RuntimeModel : IVisionCapableModel, IMRoPEPositionSink, IMultimodalPromptExpander
+    public partial class Qwen35RuntimeModel : IVisionCapableModel, IMRoPEPositionSink, IMultimodalPromptExpander
     {
         private int[] _ropeSections;
 
