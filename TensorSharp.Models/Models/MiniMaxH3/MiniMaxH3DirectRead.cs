@@ -27,11 +27,16 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <summary>Registers every mapping behind <paramref name="gguf"/> and returns the ones
         /// to hand to <see cref="Unregister"/>. Call it last in a constructor: a registration
         /// that outlives its mapping would describe whatever is mapped there next.</summary>
-        public static IntPtr[] Register(GgufFile gguf, BackendType backend)
+        public static IntPtr[] Register(GgufFile gguf, BackendType backend) =>
+            Supported(backend) ? Register(gguf.MappedRegions(), backend) : Array.Empty<IntPtr>();
+
+        /// <summary><see cref="Register(GgufFile, BackendType)"/> for mappings given directly,
+        /// such as a safetensors denoiser's.</summary>
+        public static IntPtr[] Register(IReadOnlyList<(IntPtr Base, long Length, string Path)> regions, BackendType backend)
         {
             if (!Supported(backend)) return Array.Empty<IntPtr>();
             var bases = new List<IntPtr>();
-            foreach (var (address, length, path) in gguf.MappedRegions())
+            foreach (var (address, length, path) in regions)
                 if (GgmlBasicOps.DirectReadRegister(address, length, Path.GetFullPath(path)))
                     bases.Add(address);
             return bases.ToArray();

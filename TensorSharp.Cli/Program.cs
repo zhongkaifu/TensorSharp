@@ -1134,18 +1134,26 @@ namespace TensorSharp.Cli
             // --image model.png --image dress.png); the first image drives the output
             // geometry, and each is tagged <image1>, <image2>, ... ahead of the prompt in
             // command-line order, so the prompt can refer to them by those tags.
-            if (model is TensorSharp.Models.QwenImage.QwenImageModel qwenImageModel)
+            // MiniMax-H3-Image takes the same route for text to image.
+            if (model is TensorSharp.Models.QwenImage.IImageGenerationModel imageModel)
             {
                 string prompt = editPrompt
                     ?? (inputFile != null && File.Exists(inputFile) ? File.ReadAllText(inputFile).Trim() : "");
                 if (imagePathList.Count == 0 && string.IsNullOrWhiteSpace(prompt))
                 {
-                    Console.Error.WriteLine("Qwen-Image-2.1 text-to-image generation requires --prompt <description> or --input prompt.txt.");
+                    Console.Error.WriteLine("Text-to-image generation requires --prompt <description> or --input prompt.txt.");
+                    Environment.ExitCode = 1;
+                    return;
+                }
+                if (imagePathList.Count > 0 && !imageModel.SupportsImageEdit)
+                {
+                    Console.Error.WriteLine($"{imageModel.ImageModelFamily} does not edit images here; drop --image.");
                     Environment.ExitCode = 1;
                     return;
                 }
                 string outPath = outputFile ?? (imagePathList.Count == 0 ? "generated.png" : "edited.png");
-                RunImageEdit(qwenImageModel, imagePathList, prompt, outPath, diffusionStepsSet ? diffusionSteps : 0, cfgScaleSet ? cfgScale : 0f, diffusionSeed, imageWidth, imageHeight, negativePrompt, imageMask, keepSourceSize);
+                RunImageEdit(model, imageModel, imagePathList, prompt, outPath, diffusionStepsSet ? diffusionSteps : 0, cfgScaleSet ? cfgScale : 0f, diffusionSeed, imageWidth, imageHeight,
+                    negativePrompt, imageMask, keepSourceSize);
                 return;
             }
 
@@ -2352,7 +2360,7 @@ namespace TensorSharp.Cli
                 throw new ArgumentException("--keep-source-size cannot be combined with --width/--height; it returns the first image's own size.");
         }
 
-        static void RunImageEdit(TensorSharp.Models.QwenImage.QwenImageModel model,
+        static void RunImageEdit(ModelBase model, TensorSharp.Models.QwenImage.IImageGenerationModel imageModel,
             IReadOnlyList<string> imagePaths, string prompt, string outputPath, int steps, float cfgScale, int seed,
             int width = 0, int height = 0, string negativePrompt = null, ImageMaskCliOptions imageMask = null,
             bool keepSourceSize = false)
@@ -2362,7 +2370,8 @@ namespace TensorSharp.Cli
                 if (!File.Exists(path))
                     throw new ArgumentException($"Input image not found: {path}");
             }
-            Console.WriteLine("=== Qwen-Image-2.1 ===");
+            Console.WriteLine(imageModel is TensorSharp.Models.QwenImage.QwenImageModel
+                ? "=== Qwen-Image-2.1 ===" : $"=== {imageModel.ImageModelFamily} ===");
             for (int i = 0; i < imagePaths.Count; i++)
                 Console.WriteLine($"  input{(imagePaths.Count > 1 ? $" {i + 1}" : "  ")}: {imagePaths[i]}");
             Console.WriteLine($"  prompt : {prompt}");
@@ -2400,7 +2409,7 @@ namespace TensorSharp.Cli
             TensorSharp.Models.QwenImage.RgbImage output;
             try
             {
-                output = inputs.Count == 0 ? model.GenerateImage(prompt, p) : model.EditImage(prompt, inputs, p);
+                output = inputs.Count == 0 ? imageModel.GenerateImage(prompt, p) : imageModel.EditImage(prompt, inputs, p);
                 sw.Stop();
                 TensorSharp.Models.QwenImage.ImageIO.SavePng(outputPath, output);
             }

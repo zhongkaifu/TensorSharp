@@ -216,6 +216,14 @@ namespace TensorSharp.Runtime
             return _mappedBase != null;
         }
 
+        /// <summary>The whole file's mapping: its base address (file offset 0) and length, so a
+        /// tensor pointer can be turned back into a file offset (native direct reads).</summary>
+        public unsafe (IntPtr Base, long Length) MappedRegion()
+        {
+            EnsureMappedView();
+            return ((IntPtr)_mappedBase, _fileLength);
+        }
+
         /// <summary>Positional read from the same physical file handle that backs
         /// this reader's mapping. May return fewer bytes at EOF. The reader owns
         /// the handle; callers must finish reads before disposing the reader.</summary>

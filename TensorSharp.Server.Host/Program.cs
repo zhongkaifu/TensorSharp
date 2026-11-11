@@ -787,7 +787,7 @@ if (hostingOptions.WebUiEnabled && !hostingOptions.EmbeddingsEnabled && hostingO
     // Image/video diffusion models have no autoregressive chat prefix to prefill.
     // Calling their chat adapter would emit a false startup failure before image serving.
     && app.Services.GetRequiredService<ModelService>().Model is not
-        (TensorSharp.Models.QwenImage.QwenImageModel or TensorSharp.Models.Video.IVideoGenerationModel)
+        (TensorSharp.Models.QwenImage.IImageGenerationModel or TensorSharp.Models.Video.IVideoGenerationModel)
     // DiffusionGemma keeps nothing across requests either: every turn gets a fresh sequence
     // state whose prompt K/V are recomputed per block, and diffusion turns record no cache
     // scope - yet its one-token warm-up is a full 48-step, 256-token canvas denoise, twice

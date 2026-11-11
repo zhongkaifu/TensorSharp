@@ -1,0 +1,7 @@
+{
+  "description": "MiniMax-H3-Image from config/minimax-h3-image.json: text to image at up to ~16 MP in the model's own six steps, guidance 1.",
+  "config": "config/minimax-h3-image.json",
+  "args": ["--backend", "ggml_cuda"],
+  "service_name": "tensorsharp-comfyui-minimax-h3-image",
+  "startup_timeout": 3600
+}

@@ -3463,6 +3463,21 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MiniMaxH3VitDecodeBatch(in H3VideoVaeDecodeArgs desc, int batch);
+
+        /// <summary>The H3 ViT decode over <paramref name="batch"/> independent sequences of
+        /// <c>desc.Tokens</c> tokens each, held one after another in the latent and output
+        /// buffers (the rope tables are one sequence's): MiniMax-H3-Image's VAE tiles.</summary>
+        public static bool TryMiniMaxH3VitDecodeBatch(in H3VideoVaeDecodeArgs desc, int batch)
+        {
+            int r = TSGgml_MiniMaxH3VitDecodeBatch(in desc, batch);
+            if (r == 0)
+                Console.Error.WriteLine($"[h3-image-vae FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_MiniMaxH3TextEncode(in H3TextEncodeArgs desc);
 
         /// <summary>Qwen3-VL text-encoder prefill for MiniMax-H3: the whole

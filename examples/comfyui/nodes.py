@@ -271,8 +271,8 @@ class TensorSharpImage(io.ComfyNode):
             inputs=[
                 ServerType.Input("server"),
                 io.String.Input("prompt", multiline=True, default=""),
-                io.Int.Input("width", default=0, min=0, max=4096, step=32, tooltip="0: the model's default."),
-                io.Int.Input("height", default=0, min=0, max=4096, step=32, tooltip="0: the model's default."),
+                io.Int.Input("width", default=0, min=0, max=8192, step=32, tooltip="0: the model's default (MiniMax-H3-Image: 2048, up to about 16 MP such as 6272x2688)."),
+                io.Int.Input("height", default=0, min=0, max=8192, step=32, tooltip="0: the model's default."),
                 io.Int.Input("steps", default=0, min=0, max=200, tooltip="0: 40 steps, or the LoRA plug-in's recipe."),
                 io.Float.Input("cfg", default=0.0, min=0.0, max=30.0, step=0.1, tooltip="0: the model's default."),
                 _seed_input(),
