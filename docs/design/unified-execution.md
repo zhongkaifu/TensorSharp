@@ -658,6 +658,68 @@ one GPU; 27B speculation across the two stages equals plain greedy (MTP ~36 tok/
 per-op path runs that layer's mixer as its own graph (`RunRecurrentMixerGraph`) instead of a
 requantized copy, so both paths compute the same thing.
 
+### 6.8 Backends as executor plugins
+
+The runtime does not run a step on a backend: it records it as a backend-neutral program
+(`TensorSharp.Core/Graph`: `GraphProgram`, built by `GraphProgramBuilder`) and hands it to the
+`IGraphExecutor` registered for the allocator's type. A backend assembly registers its executor from
+a module initializer (`GraphExecutors.Register`); the runtime only reads `GraphCapabilities`
+(strided views, in-place state aliasing, concurrency reorder, decode window bucket, tensor
+parallelism, quantized KV caches, host-pointer binding, whether plans replay). The program's leaves
+are weights, states and per-run inputs, each carrying its object (a `Tensor`, or an `IGraphWeight`
+for quantized blocks, `IGraphExpertWeights` for stacked experts); the ops have ggml's semantics.
+
+* **GGML** (`GgmlGraphExecutor`): a program is one ggml graph, leaves bound to cached device copies by
+  host address, replayable programs cached by signature. Behaviour is unchanged by the refactor (CUDA
+  27B same-session A/B: prefill 962 vs 967 tok/s, decode 29.6 vs 29.6).
+* **Tensor backends** (`TensorGraphExecutor`, Core): an interpreter that runs a program node by node
+  on the backend's tensors. ggml extents and byte strides become views over the same storage, so
+  cache and state writes land in the leaves' tensors; generic ops go through `Ops`; a plugin overrides
+  the kernels it has (quantized products, attention, the delta rule, the causal conv, softplus,
+  add+norm). A plan validates its ops once; a step kind that already ran as a recorded program
+  *streams*: its nodes run as they are emitted, overlapping the device, since nothing in it can be
+  rejected half way. A residual add and an RMSNorm wait for their consumer, so a norm scaled by a
+  weight is one weighted norm, and with the plugin's kernel the add before it joins. Attention reads
+  the mask's host values and picks the fused kernel's mode (none, causal from the last key, a floor of
+  masked keys) or applies the mask as given. Layer boundaries are scheduling hints (MLX starts the GPU
+  every 4 layers). Outputs may stay on the device (`IGraphTensorOutputs`), which the per-op recurrent
+  mixer uses. Every copy goes through one primitive that converts element types; views are bounds
+  checked, because a view past its storage would corrupt memory instead of failing.
+  * `ManagedGraphExecutor` (CPU): the managed GEMMs. `MlxGraphExecutor`: MLX's quantized and direct
+    F32 products, fused SDPA on the cache views (GQA native, q cast to the cache type), the gated
+    delta kernels (T=1, blocked prompt, per-row snapshots), depthwise `conv1d`, `logaddexp`,
+    `AddRmsNorm`, the plan on MLX's worker thread (no hop per op). `CudaGraphExecutor`: the backend's
+    quantized products and the per-op path's cache kernels (head-first cache writes, GQA decode
+    attention, KV expansion with half-operand prompt GEMMs), broadcast operands gathered (CUDA's binary
+    kernels take same-shaped operands), and `tensorsharp_graph_kernels.cu` (ggml-semantics gated delta
+    rule, softplus, ssm_conv).
+* **Memory:** a node's tensors are released after its last reader (counted from the recorded program;
+  a streamed step checks it is the template node by node). Holding a step's intermediates to its end
+  overflowed the CUDA allocator's cache (driver frees synchronise) and held gigabytes on a prompt chunk:
+  CUDA Hy-MT2 prefill went from -32% to -5% of the per-op path with it, MLX prefill +4%.
+* **Qwen 3.5's recurrence** is one emission and one tensor state (`DeviceGdnState`) on every backend
+  with an executor; the MLX-only recurrence is gone, and the per-op path runs the layer's mixer
+  program. The managed recurrence remains for tensor parallelism on the tensor backends.
+
+Measured on an M5 Pro (2026-11-10), MLX, `--bench-prefill 512 --bench-decode 128`, same binary with
+the tensor executors on and off, interleaved:
+
+| model | prefill tok/s (executor / per-op) | decode tok/s (executor / per-op) |
+|---|---|---|
+| Hy-MT2 1.8B Q4_K_M | 5,585 / 5,440 | 147.9 / 147.7 |
+| Ministral 3B Q4_K_M | 3,219 / ~3,180 | 93.5 / ~94 |
+| Qwen3.5-0.8B Q8_0 (runtime) | 8,942 / 10,970 (per-op MLX recurrence, before) | 189.0 / 191 |
+
+Direct CUDA, one RTX PRO 6000, same binary, executor / per-op: Hy-MT2 prefill 5,062 / 5,312, decode
+126.9 / 125.7; Ministral 3,076 / 3,264, decode 99.6 / 100.6; Qwen3.5-0.8B (runtime) 8,265 / 117,
+decode 165.7 / 72.4 (the per-op path runs the recurrence on the host). The dense prompt gap (~5%) is
+open.
+
+Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens). The Qwen prompt
+gap is the program's ggml-style decomposition of the recurrence (about 20 bandwidth-bound passes a
+layer over [512, 6144]) against the old path's fused MLX pre/post kernels; it needs fusion of
+elementwise chains, which is the next step.
+
 ---
 
 ## 7. Migration plan

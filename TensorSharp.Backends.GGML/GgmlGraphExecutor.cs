@@ -51,6 +51,7 @@ namespace TensorSharp.GGML
                 DecodeWindowRows = metal ? 64 : 256,
                 TensorParallel = backend == GgmlBackendType.Cuda,
                 BindsHostPointers = true,
+                QuantizedKvCache = true,
             };
         }
 

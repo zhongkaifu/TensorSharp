@@ -147,7 +147,11 @@ public sealed class Qwen35RuntimeTests : IDisposable
         // (moe), MLX 6.3e-4 / 1.2e-3; ggml_cpu 4.4e-3 / 1.5e-2, where ggml's BF16 matmul rounds
         // the activations to BF16 - Qwen35Model on ggml_cpu sits 4.9e-3 / 1.5e-2 from the same
         // reference. The Gated DeltaNet recurrence itself runs the same host code everywhere.
-        double tolerance = RoundsActivations(backend) ? 2.5e-2 : 5e-3;
+        // MLX's MoE row 0 (the prompt chunk) sits 5.9e-3 away since the runtime runs as programs on
+        // MLX (M5 Pro, 2026-11-10): MLX and the managed executor pick different experts in 3 of the
+        // fixture's 232 routings, all near-ties (top-k margins 7.6e-4 .. 2.4e-3 relative); the gated
+        // delta kernel matches the host recurrence to 3e-7 on the same inputs.
+        double tolerance = RoundsActivations(backend) ? 2.5e-2 : backend == BackendType.Mlx && variant == "moe" ? 1e-2 : 5e-3;
         for (int i = 0; i < reference.Count; i++)
         {
             double rel = RelL2(actual[i], reference[i]);

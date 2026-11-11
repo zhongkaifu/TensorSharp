@@ -60,11 +60,18 @@ namespace TensorSharp.Graph
         long Bytes { get; }
     }
 
+    /// <summary>Stacked experts (<see cref="IGraphWeight.Ne2"/> of them) whose members a backend can
+    /// also take one at a time (each with its own resident copy).</summary>
+    public interface IGraphExpertWeights : IGraphWeight
+    {
+        IGraphWeight Expert(int index);
+    }
+
     /// <summary>How a leaf spreads over tensor-parallel ranks: along <see cref="Axis"/>, <see cref="Ne"/>
     /// holding each (segment, rank)'s extent, segment s repeating <see cref="Nr"/>[s] times.</summary>
     public sealed record GraphSplit(int Axis, long[] Ne, uint[] Nr);
 
-    public enum GraphNodeKind : byte { Leaf, Op, Effect, Output, Alias }
+    public enum GraphNodeKind : byte { Leaf, Op, Effect, Output, Alias, Boundary }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
     /// effects, outputs and aliases refer to them.</summary>
@@ -83,17 +90,17 @@ namespace TensorSharp.Graph
         public long Bytes { get; init; }
         /// <summary>The node an effect, output or alias refers to.</summary>
         public int Node { get; init; }
-        public GraphSplit Split { get; init; }
+        public GraphSplit? Split { get; init; }
         /// <summary>A leaf's object for backends that run on tensors: the <see cref="Tensor"/> of a weight
         /// or state, or the <see cref="IGraphWeight"/> of a quantized weight (null for inputs).</summary>
-        public object Handle { get; init; }
+        public object? Handle { get; init; }
     }
 
     /// <summary>A recorded program: what one step computes, independent of any backend.</summary>
     public sealed class GraphProgram
     {
         internal GraphProgram(GraphNode[] entries, int nodeCount, long[] outputFloats, bool replayable, bool reorder,
-            int[] tensorParallelRanks, (ulong, ulong) signature)
+            int[]? tensorParallelRanks, (ulong, ulong) signature)
         {
             Entries = entries;
             NodeCount = nodeCount;
@@ -113,7 +120,7 @@ namespace TensorSharp.Graph
         /// <summary>The backend may reorder independent work for concurrency.</summary>
         public bool Reorder { get; }
         /// <summary>Ranks the program spreads over (tensor parallelism), or null.</summary>
-        public int[] TensorParallelRanks { get; }
+        public int[]? TensorParallelRanks { get; }
         /// <summary>A hash of everything that shapes the program (not its per-run input values).</summary>
         public (ulong, ulong) Signature { get; }
     }
@@ -124,13 +131,24 @@ namespace TensorSharp.Graph
     /// </summary>
     public sealed class GraphProgramBuilder
     {
-        private readonly List<GraphNode> _entries;
+        private readonly List<GraphNode>? _entries;
         private readonly List<long> _outputs = new();
         private ulong _h1 = 14695981039346656037UL, _h2 = 0x9E3779B97F4A7C15UL;
 
         public GraphProgramBuilder(bool record) => _entries = record ? new List<GraphNode>() : null;
 
         public bool Recording => _entries != null;
+
+        /// <summary>Also hands every entry to this sink as it is recorded (a streaming executor).</summary>
+        public IGraphSink? Sink { get; set; }
+
+        private void Emit(int node, in GraphNode entry)
+        {
+            _entries?.Add(entry);
+            Sink?.Entry(node, entry);
+        }
+
+        private bool Keeping => _entries != null || Sink != null;
         public int NodeCount { get; private set; }
         public int OutputCount => _outputs.Count;
         public (ulong, ulong) Signature => (_h1, _h2);
@@ -148,12 +166,12 @@ namespace TensorSharp.Graph
 
         public void Mix(ReadOnlySpan<float> values) { Mix(values.Length); foreach (float v in values) Mix(BitConverter.SingleToInt32Bits(v)); }
 
-        public int Leaf(GraphLeafRole role, int format, ReadOnlySpan<long> ne, IntPtr data, long bytes, GraphSplit split = null, object handle = null)
+        public int Leaf(GraphLeafRole role, int format, ReadOnlySpan<long> ne, IntPtr data, long bytes, GraphSplit? split = null, object? handle = null)
         {
             Mix(1); Mix((int)role); Mix(format); Mix(ne);
             if (role != GraphLeafRole.Input) { Mix(data.ToInt64()); Mix(bytes); }
             if (split != null) { Mix(100 + split.Axis); Mix(split.Ne); }
-            _entries?.Add(new GraphNode { Kind = GraphNodeKind.Leaf, Role = role, Format = format, Ne = ne.ToArray(), Data = data, Bytes = bytes, Split = split, Handle = handle });
+            if (Keeping) Emit(NodeCount, new GraphNode { Kind = GraphNodeKind.Leaf, Role = role, Format = format, Ne = ne.ToArray(), Data = data, Bytes = bytes, Split = split, Handle = handle });
             return NodeCount++;
         }
 
@@ -166,7 +184,7 @@ namespace TensorSharp.Graph
             foreach (int src in srcs)
                 if (src < 0 || src >= NodeCount) throw new ArgumentOutOfRangeException(nameof(srcs), $"{op}: source node {src} does not exist");
             Mix(2); Mix((int)op); Mix(srcs); Mix(ip); Mix(fp);
-            _entries?.Add(new GraphNode { Kind = GraphNodeKind.Op, Op = op, Srcs = srcs.ToArray(), Ip = ip.ToArray(), Fp = fp.ToArray() });
+            if (Keeping) Emit(NodeCount, new GraphNode { Kind = GraphNodeKind.Op, Op = op, Srcs = srcs.ToArray(), Ip = ip.ToArray(), Fp = fp.ToArray() });
             return NodeCount++;
         }
 
@@ -174,7 +192,7 @@ namespace TensorSharp.Graph
         public void Effect(int node)
         {
             Mix(3); Mix(node);
-            _entries?.Add(new GraphNode { Kind = GraphNodeKind.Effect, Node = node });
+            if (Keeping) Emit(-1, new GraphNode { Kind = GraphNodeKind.Effect, Node = node });
         }
 
         /// <summary>Write <paramref name="node"/>'s result in place inside the state leaf
@@ -183,19 +201,28 @@ namespace TensorSharp.Graph
         public void Alias(int node, int baseLeaf, long offset, int fallback)
         {
             Mix(5); Mix(node); Mix(baseLeaf); Mix(offset); Mix(fallback);
-            _entries?.Add(new GraphNode { Kind = GraphNodeKind.Alias, Node = node, Srcs = new[] { baseLeaf, fallback }, Bytes = offset });
+            if (Keeping) Emit(-1, new GraphNode { Kind = GraphNodeKind.Alias, Node = node, Srcs = new[] { baseLeaf, fallback }, Bytes = offset });
+        }
+
+        /// <summary>A scheduling hint, not a computation: <paramref name="node"/> closes a unit of work (a
+        /// layer). An executor that builds work lazily may start running what precedes it there; one
+        /// that compiles the whole program ignores it.</summary>
+        public void Boundary(int node)
+        {
+            Mix(6); Mix(node);
+            if (Keeping) Emit(-1, new GraphNode { Kind = GraphNodeKind.Boundary, Node = node });
         }
 
         /// <summary>A result of <paramref name="floats"/> F32 values; returns its output index.</summary>
         public int Output(int node, long floats)
         {
             Mix(4); Mix(node); Mix(floats);
-            _entries?.Add(new GraphNode { Kind = GraphNodeKind.Output, Node = node, Bytes = floats });
+            if (Keeping) Emit(-1, new GraphNode { Kind = GraphNodeKind.Output, Node = node, Bytes = floats });
             _outputs.Add(floats);
             return _outputs.Count - 1;
         }
 
-        public GraphProgram ToProgram(bool replayable, bool reorder, int[] tensorParallelRanks = null)
+        public GraphProgram ToProgram(bool replayable, bool reorder, int[]? tensorParallelRanks = null)
         {
             if (_entries == null) throw new InvalidOperationException("A hash-only trace has no program.");
             return new GraphProgram(_entries.ToArray(), NodeCount, _outputs.ToArray(), replayable, reorder, tensorParallelRanks, Signature);

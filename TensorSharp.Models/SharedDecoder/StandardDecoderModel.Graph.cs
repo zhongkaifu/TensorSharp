@@ -72,7 +72,52 @@ namespace TensorSharp.Models
                 if (_moeLayer[l] && MoeCpuOffloadConfig.IsLayerOnCpu(l)) return "host-offloaded experts";
             DType kv = _kvCacheDtype.ToDType();
             if (kv != DType.Float32 && kv != DType.Float16 && kv != DType.Q8_0 && kv != DType.Q4_0) return $"KV dtype {kv}";
+            if ((kv == DType.Q8_0 || kv == DType.Q4_0) && !GraphExecutor.Capabilities.QuantizedKvCache) return $"KV dtype {kv} on this backend's executor";
             return null;
+        }
+
+        private readonly Dictionary<string, GraphExpertSet> _graphExpertSets = new();
+
+        /// <summary>Step kinds (shape, emitter) that ran as recorded programs: a streaming executor runs
+        /// later steps of the kind as they are emitted.</summary>
+        private readonly HashSet<string> _streamedKinds = new();
+
+        /// <summary>The recorded program of each streamed kind: its readers per node let a stream release
+        /// tensors after their last use.</summary>
+        private readonly Dictionary<string, GraphProgram> _streamTemplates = new();
+
+        /// <summary>A stacked expert weight with its members (each a quantized weight with its own
+        /// resident copy), for executors that run routed experts one at a time.</summary>
+        private GraphExpertSet ExpertSet(string name, StackedExpertWeights stacked)
+        {
+            lock (_graphExpertSets)
+            {
+                if (_graphExpertSets.TryGetValue(name, out GraphExpertSet set)) return set;
+                string baseName = name.EndsWith(".weight", StringComparison.Ordinal) ? name[..^7] : name;
+                var members = new QuantizedWeight[stacked.NumExperts];
+                for (int e = 0; e < members.Length; e++)
+                    _quantWeights.TryGetValue($"{baseName}.{e}.weight", out members[e]);
+                return _graphExpertSets[name] = new GraphExpertSet(stacked, members);
+            }
+        }
+
+        private sealed class GraphExpertSet : IGraphExpertWeights
+        {
+            private readonly StackedExpertWeights _w;
+            private readonly QuantizedWeight[] _members;
+
+            public GraphExpertSet(StackedExpertWeights w, QuantizedWeight[] members) { _w = w; _members = members; }
+
+            public int Format => _w.GgmlType;
+            public long Ne0 => _w.PerExpertNe0;
+            public long Ne1 => _w.PerExpertNe1;
+            public long Ne2 => _w.NumExperts;
+            public IntPtr Data => _w.Data;
+            public IntPtr CacheKey => _w.Data;
+            public long Bytes => _w.TotalRawBytes;
+
+            public IGraphWeight Expert(int index) => _members[index]
+                ?? throw new NotSupportedException($"expert {index} has no member weight");
         }
 
         private static int KvGgmlType(DType dt) => dt switch
@@ -134,6 +179,8 @@ namespace TensorSharp.Models
             foreach (CachedGraph entry in _graphCache.Values) entry.Dispose();
             _graphCache.Clear();
             _graphLru.Clear();
+            _streamedKinds.Clear();
+            _streamTemplates.Clear();
         }
 
         /// <summary>Steps that replayed a cached graph (tests check decode replays).</summary>
@@ -297,7 +344,8 @@ namespace TensorSharp.Models
         /// (nothing was run).
         /// </summary>
         private CachedGraph RunTraced(int rows, Slot[] slots, int[] first, int[] counts, int[] starts, bool replayable,
-            bool snapshots, int attentionFloor, Func<GraphStep, StepOutputs> emit, out StepOutputs outputs, out bool owned)
+            bool snapshots, int attentionFloor, Func<GraphStep, StepOutputs> emit, out StepOutputs outputs, out bool owned,
+            bool deviceOutputs = false)
         {
             GraphStep step = null;
             CachedGraph graph = null;
@@ -305,6 +353,37 @@ namespace TensorSharp.Models
             outputs = default;
             try
             {
+                // An executor whose plans do not replay records every step once (no signature pass); a
+                // step of a kind that already ran as a recorded program streams (its ops run as they are
+                // emitted, overlapping the device): it cannot be rejected half way through.
+                replayable &= GraphExecutor.Capabilities.Replays;
+                string kind = null;
+                if (GraphExecutor is IStreamingGraphExecutor streaming)
+                {
+                    kind = $"{rows}|{slots.Length}|{snapshots}|{attentionFloor > 0}|{emit.Method.MetadataToken}|{string.Join(",", counts)}";
+                    if (_streamedKinds.Contains(kind))
+                    {
+                        IGraphStream stream = streaming.OpenStream(_streamTemplates.GetValueOrDefault(kind));
+                        if (deviceOutputs && stream is IGraphTensorOutputs keepStream) keepStream.KeepTensors = true;
+                        graph = new CachedGraph { Plan = stream };
+                        owned = true;
+                        step = new GraphStep(this, rows, slots, first, counts, starts, false, snapshots, record: false)
+                            { AttentionFloor = attentionFloor, Sink = stream };
+                        StepOutputs emitted = default;
+                        GraphStep streamed = step;
+                        bool ok = stream.Execute(() =>
+                        {
+                            emitted = emit(streamed);
+                            return streamed.Run(stream);
+                        });
+                        outputs = emitted;
+                        if (!ok)
+                            throw new InvalidOperationException($"{Config.Architecture} graph step failed: {stream.LastError}");
+                        GraphRuns++;
+                        foreach (Slot slot in slots) slot.DeviceDirty = true;
+                        return graph;
+                    }
+                }
                 if (replayable && _graphCache.Count > 0)
                 {
                     step = new GraphStep(this, rows, slots, first, counts, starts, replayable, snapshots, record: false) { AttentionFloor = attentionFloor };
@@ -345,9 +424,11 @@ namespace TensorSharp.Models
                     }
                 }
 
+                if (graph.Plan is IGraphTensorOutputs keep) keep.KeepTensors = deviceOutputs;
                 if (!step.Run(graph.Plan))
                     throw new InvalidOperationException($"{Config.Architecture} graph step failed: {graph.Plan.LastError}");
                 GraphRuns++;
+                if (kind != null && _streamedKinds.Add(kind)) _streamTemplates[kind] = step.Program;
                 foreach (Slot slot in slots) slot.DeviceDirty = true;
                 return graph;
             }
@@ -388,11 +469,17 @@ namespace TensorSharp.Models
                     int x = step.RmsNorm(step.Input(raw, hiddenSize, rows), LayerName(layer, "attn_norm.weight"));
                     return new StepOutputs { Logits = -1, Final = step.Output(EmitRecurrentMixer(step, layer, x), (long)hiddenSize * rows) };
                 },
-                out StepOutputs outputs, out bool owned);
+                out StepOutputs outputs, out bool owned, deviceOutputs: true);
             if (graph == null)
                 throw new NotSupportedException($"{Config.Architecture}: layer {layer}'s recurrent mixer cannot run as a graph.");
             try
             {
+                // A tensor executor hands the result over on the device (no host copy, no wait).
+                if (graph.Plan is IGraphTensorOutputs device && device.KeepTensors)
+                {
+                    using Tensor y = device.TakeOutput(outputs.Final);
+                    return y.View(rows, hiddenSize);
+                }
                 foreach (Tensor t in state.HostTensors) SyncStateTensor(t);
                 var result = new Tensor(scope.Allocator, DType.Float32, rows, hiddenSize);
                 result.SetElementsAsFloat(graph.Outputs[outputs.Final]);
@@ -448,6 +535,7 @@ namespace TensorSharp.Models
                 int ffnIn = step.RmsNorm(h, FfnNormWeight(layer));
                 int ffn = _moeLayer[layer] ? EmitMoe(step, layer, ffnIn) : EmitDenseFfn(step, layer, ffnIn);
                 h = step.Op(GraphOp.Add, h, ffn);
+                step.Boundary(h);
             }
             if (!head)
             {
@@ -551,7 +639,7 @@ namespace TensorSharp.Models
                 int fa;
                 // Tensor-parallel graphs write every chunk by index too: ggml's meta device splits
                 // set_rows by KV head, while a copy into a strided cache view fails on the ranks.
-                if (count <= SmallChunkRows || _graphTpRanks != null)
+                if (count <= SmallChunkRows || _graphTpRanks != null || GraphExecutor.Capabilities.IndexedCacheWrites)
                 {
                     // Decode and short chunks (a verify window): rows are written by index and
                     // attention reads the padded cache window under a causal mask, so every row is
@@ -758,6 +846,9 @@ namespace TensorSharp.Models
             /// <summary>Run <paramref name="node"/> for its side effect (a cache or state write).</summary>
             public void Effect(int node) => _b.Effect(node);
 
+            /// <summary>A layer's output: a point where a lazily building executor may start running.</summary>
+            public void Boundary(int node) => _b.Boundary(node);
+
             /// <summary>Write <paramref name="node"/>'s result in place inside the state leaf
             /// <paramref name="baseLeaf"/> at <paramref name="offset"/> bytes; where the base is not
             /// resident, the <paramref name="fallback"/> copy runs instead (see GgmlGraph.Alias).</summary>
@@ -805,7 +896,7 @@ namespace TensorSharp.Models
                 if (_weights.TryGetValue(name, out int node)) return node;
                 if (!_m._stackedExpertWeights.TryGetValue(name, out StackedExpertWeights w)) throw Reject($"experts '{name}' are not stacked");
                 long[] ne = { w.PerExpertNe0, w.PerExpertNe1, w.NumExperts };
-                node = Leaf(GraphLeafRole.Weight, w.GgmlType, ne, w.Data, w.TotalRawBytes, _m.SplitOf(name, ne, w.GgmlType), w);
+                node = Leaf(GraphLeafRole.Weight, w.GgmlType, ne, w.Data, w.TotalRawBytes, _m.SplitOf(name, ne, w.GgmlType), _m.ExpertSet(name, w));
                 _weights[name] = node;
                 return node;
             }
@@ -935,8 +1026,15 @@ namespace TensorSharp.Models
                 return handle.AddrOfPinnedObject();
             }
 
+            /// <summary>The program <see cref="Build"/> recorded.</summary>
+            internal GraphProgram Program { get; private set; }
+
+            /// <summary>A streaming executor's sink: entries and input values go there as they are emitted.</summary>
+            internal IGraphSink Sink { get => _b.Sink; init => _b.Sink = value; }
+
             private void AddInput(int node, IntPtr data, long bytes, object handle = null)
             {
+                _b.Sink?.InputData(node, data, bytes, handle);
                 _inputs.Add(node);
                 _inputData.Add(data);
                 _inputBytes.Add(bytes);
@@ -1077,6 +1175,7 @@ namespace TensorSharp.Models
             {
                 if (!_record) throw new InvalidOperationException("a hash-only trace cannot be built");
                 GraphProgram program = _b.ToProgram(replayable, reorder, _m._graphTpRanks);
+                Program = program;
                 return new CachedGraph { Plan = _m.GraphExecutor.Compile(program) };
             }
 

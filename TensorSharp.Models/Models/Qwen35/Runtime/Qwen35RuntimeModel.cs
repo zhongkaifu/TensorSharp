@@ -119,7 +119,7 @@ namespace TensorSharp.Models
                     "decoder runtime; this checkpoint cannot run with --layer-split or host experts on cuda/mlx.");
             }
             BuildRecurrentConstants();
-            if (DeviceRecurrence)
+            if (TensorRecurrence)
                 BuildDeviceConstants();
             AttachDraftModel(draftModelPath);
         }
@@ -142,7 +142,7 @@ namespace TensorSharp.Models
         /// parallelism ShardRecurrentLayer packs per rank instead).</summary>
         protected override void PrepareLoadedWeights()
         {
-            if (!(DeviceRecurrence || MlxRecurrence) || Mesh.TensorParallel != 1) return;
+            if (!TensorRecurrence || Mesh.TensorParallel != 1) return;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (!_isRecurrent[l] || !OwnsLayer(l) || !InProjectionSharesType(l)) continue;
@@ -347,19 +347,15 @@ namespace TensorSharp.Models
             int vHeads = _numVHeads / ShardDegree;
             int kHeads = _numKHeads / ShardDegree;
             int channels = 2 * kHeads * _headKDim + vHeads * _headVDim;
-            if (DeviceRecurrence)
-                return new DeviceGdnState(scope.Allocator, HostPointer, _convKernel - 1, channels, vHeads, _headVDim, _headKDim);
-            return MlxRecurrence
-                ? new MlxGdnState(_convKernel - 1, channels, vHeads, _headVDim, _headKDim)
-                : new GdnState(_convKernel - 1, channels, vHeads, _headVDim, _headKDim);
+            if (TensorRecurrence)
+                return new DeviceGdnState(scope.Allocator, GraphExecutor, HostPointer, _convKernel - 1, channels, vHeads, _headVDim, _headKDim);
+            return new GdnState(_convKernel - 1, channels, vHeads, _headVDim, _headKDim);
         }
 
         protected override Tensor RecurrentMixer(RankScope scope, Tensor normed, int layer, RecurrentState state)
         {
             if (state is DeviceGdnState device)
                 return DeviceGatedDeltaNet(scope, normed, layer, device);
-            if (state is MlxGdnState mlx)
-                return MlxGatedDeltaNet(scope, normed, layer, mlx);
             string p = $"blk.{layer}.";
             var gdn = (GdnState)state;
             int tokens = (int)normed.Sizes[0];

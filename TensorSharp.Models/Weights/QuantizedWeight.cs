@@ -26,8 +26,9 @@ using TensorSharp.GGML;
 using TensorSharp.MLX;
 
 namespace TensorSharp.Models
-{
-    public partial class QuantizedWeight : IDisposable
+{
+
+    public partial class QuantizedWeight : IDisposable, TensorSharp.Graph.IGraphWeight
     {
         private IntPtr _data;
         private GCHandle _cacheKeyHandle;
@@ -48,6 +49,13 @@ namespace TensorSharp.Models
         private bool _ownsCacheKeyHandle;
         private object _ownerToken;
         public bool HasHostData => _data != IntPtr.Zero;
+
+        int TensorSharp.Graph.IGraphWeight.Format => GgmlType;
+        long TensorSharp.Graph.IGraphWeight.Ne2 => 1;
+        long TensorSharp.Graph.IGraphWeight.Bytes => RawBytes;
+        // A backend binding the weight by object keys its resident copy on the device cache key
+        // (what the per-op products pass), not on the host pointer.
+        IntPtr TensorSharp.Graph.IGraphWeight.CacheKey => EnsureDeviceCacheKey();
         public bool HasExternalHostView => _data != IntPtr.Zero && !_ownsBuffer && _ownerToken != null;
         internal bool IsExternalHostViewOwnedBy(object owner)
             => HasExternalHostView && ReferenceEquals(_ownerToken, owner);
@@ -458,5 +466,6 @@ namespace TensorSharp.Models
             _ownerToken = ownerToken;
             OwnedBuffer = ownedBuffer;
         }
-    }
+    }
+
 }

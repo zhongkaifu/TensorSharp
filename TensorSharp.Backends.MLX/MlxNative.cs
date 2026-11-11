@@ -3814,6 +3814,38 @@ if (simd_id == 0) {
             });
         }
 
+        /// <summary>mlx_conv1d: input [N, L, C_in], weight [C_out, K, C_in / groups]: [N, L_out, C_out].</summary>
+        internal static MlxArray Conv1d(MlxArray input, MlxArray weight, int stride, int padding, int dilation, int groups)
+        {
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxArray result;
+                Check(mlx_conv1d(out result, input, weight, stride, padding, dilation, groups, DefaultStream()), "running MLX conv1d");
+                return result;
+            });
+        }
+
+        /// <summary>log(exp(a) + exp(b)), elementwise (b broadcasts).</summary>
+        internal static MlxArray LogAddExp(MlxArray a, MlxArray b)
+        {
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxArray result;
+                Check(mlx_logaddexp(out result, a, b, DefaultStream()), "running MLX logaddexp");
+                return result;
+            });
+        }
+
+        internal static MlxArray SumAxis(MlxArray array, int axis, bool keepDims)
+        {
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxArray result;
+                Check(mlx_sum_axis(out result, array, axis, keepDims, DefaultStream()), "summing MLX array");
+                return result;
+            });
+        }
+
         internal static MlxArray Contiguous(MlxArray array)
         {
             return MlxWorker.Shared.Invoke(() =>
@@ -9058,6 +9090,18 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
         [LibraryImport(LibraryName, EntryPoint = "mlx_as_strided")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int mlx_as_strided(out MlxArray result, MlxArray array, int[] shape, nuint shapeCount, long[] strides, nuint stridesCount, nuint offset, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_conv1d")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_conv1d(out MlxArray result, MlxArray input, MlxArray weight, int stride, int padding, int dilation, int groups, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_logaddexp")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_logaddexp(out MlxArray result, MlxArray a, MlxArray b, MlxStream stream);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_sum_axis")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_sum_axis(out MlxArray result, MlxArray array, int axis, [MarshalAs(UnmanagedType.U1)] bool keepDims, MlxStream stream);
 
         [LibraryImport(LibraryName, EntryPoint = "mlx_reshape")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

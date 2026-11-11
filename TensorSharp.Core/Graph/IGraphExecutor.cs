@@ -24,6 +24,11 @@ namespace TensorSharp.Graph
         public bool TensorParallel { get; init; }
         /// <summary>Prompt chunks write K/V by row index (no copy into a strided cache view).</summary>
         public bool IndexedCacheWrites { get; init; }
+        /// <summary>K/V caches may be block-quantized (Q8_0, Q4_0): views and writes address their blocks.</summary>
+        public bool QuantizedKvCache { get; init; }
+        /// <summary>A compiled plan is worth keeping to run again (a replayable program is cached and
+        /// looked up by its signature); otherwise every step is recorded and compiled once.</summary>
+        public bool Replays { get; init; } = true;
         /// <summary>Leaves are bound by their host bytes (GGML's device caches are keyed by host
         /// address); otherwise by the leaf's object (<see cref="GraphNode.Handle"/>), and a leaf's
         /// <see cref="GraphNode.Data"/> is only an identity.</summary>
@@ -84,6 +89,44 @@ namespace TensorSharp.Graph
         string LastError { get; }
     }
 
+    /// <summary>Receives a program's entries as they are recorded (node index -1 for entries that are
+    /// not nodes), and each input leaf's per-run value right after the leaf.</summary>
+    public interface IGraphSink
+    {
+        void Entry(int node, in GraphNode entry);
+        void InputData(int node, IntPtr data, long bytes, object handle);
+    }
+
+    /// <summary>
+    /// A program that runs as it is recorded: its nodes are evaluated as they arrive (the emitting code
+    /// runs inside <see cref="Execute"/>, on the backend's thread), and <see cref="IGraphPlan.Run"/>
+    /// then only reads the outputs. For executors whose plans would not replay anyway, so recording
+    /// overlaps the device's work instead of preceding it.
+    /// </summary>
+    public interface IGraphStream : IGraphSink, IGraphPlan
+    {
+        bool Execute(Func<bool> body);
+    }
+
+    /// <summary>An executor that can also run programs as they are recorded.</summary>
+    public interface IStreamingGraphExecutor : IGraphExecutor
+    {
+        /// <summary>A stream for one step. <paramref name="template"/>, when given, is a recorded program of
+        /// the same kind: the stream releases each node's tensors after its last reader (it checks that the
+        /// step matches the template node by node, and keeps everything to the end where it does not).</summary>
+        IGraphStream OpenStream(GraphProgram? template = null);
+    }
+
+    /// <summary>A plan whose outputs can stay on the device: set <see cref="KeepTensors"/> before a run and
+    /// take each output as a tensor after it (no host copy, no wait for the device).</summary>
+    public interface IGraphTensorOutputs
+    {
+        bool KeepTensors { get; set; }
+
+        /// <summary>Output <paramref name="index"/> of the last run (the caller owns it).</summary>
+        Tensor TakeOutput(int index);
+    }
+
     /// <summary>Executor plugins, by the allocator type of the backend they serve.</summary>
     public static class GraphExecutors
     {
@@ -96,11 +139,11 @@ namespace TensorSharp.Graph
                 factory ?? throw new ArgumentNullException(nameof(factory));
 
         /// <summary>The executor for <paramref name="allocator"/>'s backend, or null when none is registered.</summary>
-        public static IGraphExecutor For(IAllocator allocator)
+        public static IGraphExecutor? For(IAllocator? allocator)
         {
             if (allocator == null) return null;
-            for (Type t = allocator.GetType(); t != null; t = t.BaseType)
-                if (s_factories.TryGetValue(t, out var factory))
+            for (Type? t = allocator.GetType(); t != null; t = t.BaseType)
+                if (s_factories.TryGetValue(t, out Func<IAllocator, IGraphExecutor>? factory))
                     return factory(allocator);
             return null;
         }

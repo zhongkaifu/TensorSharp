@@ -246,6 +246,42 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         }
     }
 
+    /// <summary>The tensor executor (programs run node by node on a backend's tensors) computes what
+    /// the backend's per-op path computes: the managed CPU here, MLX and direct CUDA in their lanes.</summary>
+    [Theory]
+    [MemberData(nameof(Families))]
+    public void ManagedTensorExecutorMatchesThePerOpPath(string family) => CompareTensorExecutor(family, BackendType.Cpu, 1e-5);
+
+    [MlxTheory]
+    [MemberData(nameof(Families))]
+    public void MlxTensorExecutorMatchesThePerOpPath(string family) => CompareTensorExecutor(family, BackendType.Mlx, 2e-3);
+
+    [CudaTheory]
+    [MemberData(nameof(Families))]
+    public void CudaTensorExecutorMatchesThePerOpPath(string family) => CompareTensorExecutor(family, BackendType.Cuda, 2e-3);
+
+    private void CompareTensorExecutor(string family, BackendType backend, double tolerance)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(family);
+        List<float[]> perOp;
+        using (var model = Create(family, path, 1, 1, backend))
+        {
+            ((StandardDecoderModel)model).GraphLoweringEnabled = false;
+            perOp = Script(model);
+        }
+        using var graph = Create(family, path, 1, 1, backend);
+        List<float[]> rows = Script(graph);
+        Assert.True(((StandardDecoderModel)graph).GraphRuns >= rows.Count, $"{family} on {backend}: every step must run as a program");
+        for (int i = 0; i < perOp.Count; i++)
+        {
+            double rel = RelL2(rows[i], perOp[i]);
+            Assert.True(rel <= tolerance, $"{family} on {backend} row {i}: executor vs per-op relL2 {rel:E2}");
+        }
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(family, path, 1, 1, backend), $"{family} {backend} executor",
+            tieTolerance: backend == BackendType.Cpu ? 0 : 1e-2);
+    }
+
     /// <summary>Greedy speculative decoding (n-gram drafts) emits what plain greedy decoding emits.</summary>
     [Theory]
     [MemberData(nameof(Families))]

@@ -1,0 +1,67 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+//
+// Launchers for the graph executor's kernels (native/kernels/tensorsharp_graph_kernels.cu, compiled to
+// tensorsharp_graph_kernels.ptx): the program ops with no generic tensor-op equivalent, with ggml's
+// semantics.
+using System;
+using TensorSharp.Cuda.Interop;
+
+namespace TensorSharp.Cuda
+{
+    internal sealed unsafe class CudaGraphKernels : CudaPrefillModule
+    {
+        public const string PtxFileName = "tensorsharp_graph_kernels.ptx";
+        public const string CapsKernelName = "ts_graph_caps";
+
+        /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
+        /// kernel is added or changes its signature.</summary>
+        public const int CurrentVersion = 2;
+
+        private readonly IntPtr _gatedDeltaNet, _softplus, _ssmConv;
+
+        private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
+        {
+            if (!IsCurrent) return;
+            _gatedDeltaNet = module.GetFunction("ts_graph_gated_delta_net_f32");
+            _softplus = module.GetFunction("ts_graph_softplus_f32");
+            _ssmConv = module.GetFunction("ts_graph_ssm_conv_f32");
+        }
+
+        /// <summary>The current module, or false with the reason it cannot be used (requires a current context).</summary>
+        public static bool TryCreate(out CudaGraphKernels kernels, out string reason)
+            => TryCreate(PtxFileName, m => new CudaGraphKernels(m), out kernels, out reason);
+
+        /// <summary>ggml_gated_delta_net over contiguous F32 device buffers (see the kernel's contract);
+        /// <paramref name="s"/> % 32 == 0 and <= 256.</summary>
+        public void LaunchGatedDeltaNet(IntPtr q, IntPtr k, IntPtr v, IntPtr g, IntPtr beta, IntPtr state, IntPtr output,
+            int s, int heads, int keyHeads, int tokens, int sequences, int slots, bool perKeyDecay, IntPtr stream)
+        {
+            int kda = perKeyDecay ? 1 : 0;
+            void** args = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences, &slots, &kda };
+            CudaDriverApi.cuLaunchKernel(_gatedDeltaNet, (uint)(sequences * heads), (uint)((s + 3) / 4), 1, 128, 1, 1, 0, stream,
+                (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>ggml_softplus over <paramref name="n"/> contiguous floats.</summary>
+        public void LaunchSoftplus(IntPtr x, IntPtr y, long n, IntPtr stream)
+        {
+            void** args = stackalloc void*[] { &x, &y, &n };
+            CudaDriverApi.cuLaunchKernel(_softplus, (uint)((n + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary>ggml_ssm_conv: x [n_s, channels, length] (time innermost), w [channels, width] (contiguous):
+        /// out [n_s, length - width + 1, channels].</summary>
+        public void LaunchSsmConv(IntPtr x, IntPtr w, IntPtr output, int channels, int length, int width, int sequences, IntPtr stream)
+        {
+            int nt = length - width + 1;
+            long total = (long)sequences * nt * channels;
+            void** args = stackalloc void*[] { &x, &w, &output, &channels, &length, &width, &nt, &sequences };
+            CudaDriverApi.cuLaunchKernel(_ssmConv, (uint)((total + 255) / 256), 1, 1, 256, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+    }
+}

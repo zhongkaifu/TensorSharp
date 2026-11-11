@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 
 using TensorSharp.GGML;
+using TensorSharp.Graph;
 
 namespace TensorSharp.Models
 {
@@ -23,7 +24,11 @@ namespace TensorSharp.Models
     {
         private bool DeviceRecurrence => IsGgmlBackend;
 
-        protected override bool RecurrentMixerTakesRawInput => DeviceRecurrence;
+        /// <summary>The recurrence runs as program nodes over tensor-held states (every backend with a
+        /// graph executor on one shard; GGML's per-rank native block under tensor parallelism).</summary>
+        private bool TensorRecurrence => DeviceRecurrence || (ShardDegree == 1 && GraphExecutor != null);
+
+        protected override bool RecurrentMixerTakesRawInput => TensorRecurrence;
 
         private Tensor[][] _deviceConvW;   // [layer][rank] [channels, kernel] (one filter per channel)
         private Tensor[][] _deviceDtBias;  // [layer][rank] [localV]
@@ -224,18 +229,23 @@ namespace TensorSharp.Models
             return t;
         }
 
-        /// <summary>A rank's state as host-backed GGML tensors the native block binds on the
-        /// device by their host pointers: the conv window [channels, kernel-1] (oldest first per
-        /// channel) and the delta state [vHeads, Dv, Dk]. The device copy is authoritative; a reset
-        /// zeroes the host bytes and drops the device copy so the next block uploads zeros.</summary>
+        /// <summary>A rank's state as tensors on its device: the conv window [channels, kernel-1] (oldest
+        /// first per channel) and the delta state [vHeads, Dv, Dk]. Programs bind them as state leaves.
+        /// Where the executor binds host bytes (GGML), the tensors are host-backed and the device copy is
+        /// authoritative: a reset zeroes the host bytes and drops the device copy; elsewhere they are the
+        /// backend's own tensors.</summary>
         private sealed class DeviceGdnState : RecurrentState
         {
             private readonly Func<Tensor, IntPtr> _hostPointer;
+            private readonly IGraphExecutor _executor;
+            private readonly bool _host;
 
-            public DeviceGdnState(IAllocator allocator, Func<Tensor, IntPtr> hostPointer,
+            public DeviceGdnState(IAllocator allocator, IGraphExecutor executor, Func<Tensor, IntPtr> hostPointer,
                 int convRows, int channels, int vHeads, int dv, int dk)
             {
                 _hostPointer = hostPointer;
+                _executor = executor;
+                _host = executor?.Capabilities.BindsHostPointers ?? true;
                 _allocator = allocator;
                 ConvRows = Math.Max(1, convRows);
                 Channels = channels;
@@ -288,8 +298,7 @@ namespace TensorSharp.Models
                 Clear(Conv);
                 Clear(Backing);
                 // The state is also bound through its own view.
-                GgmlBasicOps.InvalidateHostBuffer(_hostPointer(Ssm));
-                GgmlBasicOps.InvalidateTensorHostBuffer(Ssm);
+                if (_host) Invalidate(Ssm);
             }
 
             protected internal override IEnumerable<Tensor> HostTensors => new[] { Conv, Ssm, Backing };
@@ -303,6 +312,11 @@ namespace TensorSharp.Models
                 var other = (DeviceGdnState)source;
                 foreach (var (from, to) in new[] { (other.Conv, Conv), (other.Backing, Backing) })
                 {
+                    if (!_host)
+                    {
+                        Ops.Copy(to, from);
+                        continue;
+                    }
                     long bytes = to.ElementCount() * sizeof(float);
                     Buffer.MemoryCopy((void*)_hostPointer(from), (void*)_hostPointer(to), bytes, bytes);
                 }
@@ -312,36 +326,41 @@ namespace TensorSharp.Models
             /// <summary>Every key the state is bound through: the conv window, the backing and the state view.</summary>
             protected internal override void OnHostWritten()
             {
-                foreach (Tensor t in new[] { Conv, Backing, Ssm })
-                {
-                    GgmlBasicOps.InvalidateHostBuffer(_hostPointer(t));
-                    GgmlBasicOps.InvalidateTensorHostBuffer(t);
-                }
+                if (!_host) return;
+                foreach (Tensor t in new[] { Conv, Backing, Ssm }) Invalidate(t);
+            }
+
+            private void Invalidate(Tensor t)
+            {
+                _executor?.Invalidate(_hostPointer(t));
+                GgmlBasicOps.InvalidateTensorHostBuffer(t);
             }
 
             public IntPtr ConvPointer => _hostPointer(Conv);
 
-            /// <summary>Before the per-op block binds the state view: whatever the graphs left in a
-            /// device copy of the backing is already on the host (SyncToHost); make the view re-upload.</summary>
-            public void BeforePerOp()
-            {
-                GgmlBasicOps.InvalidateHostBuffer(_hostPointer(Ssm));
-            }
+            /// <summary>Before GGML's per-rank native block binds the state view: whatever the graphs left
+            /// in a device copy of the backing is already on the host (SyncToHost); make the view re-upload.</summary>
+            public void BeforePerOp() => _executor?.Invalidate(_hostPointer(Ssm));
 
             /// <summary>After it: bring its state back to the host and make the backing re-upload.</summary>
             public void AfterPerOp()
             {
-                GgmlBasicOps.SyncHostBuffer(_hostPointer(Ssm), Ssm.ElementCount() * sizeof(float));
-                GgmlBasicOps.InvalidateHostBuffer(_hostPointer(Backing));
+                _executor?.SyncToHost(_hostPointer(Ssm), Ssm.ElementCount() * sizeof(float));
+                _executor?.Invalidate(_hostPointer(Backing));
             }
+
             public IntPtr SsmPointer => _hostPointer(Ssm);
 
             private unsafe void Clear(Tensor t)
             {
+                if (!_host)
+                {
+                    Ops.Fill(t, 0);
+                    return;
+                }
                 IntPtr p = _hostPointer(t);
                 new Span<float>((float*)p, checked((int)t.ElementCount())).Clear();
-                GgmlBasicOps.InvalidateHostBuffer(p);
-                GgmlBasicOps.InvalidateTensorHostBuffer(t);
+                Invalidate(t);
             }
 
             public override void Dispose()
@@ -367,8 +386,11 @@ namespace TensorSharp.Models
 
             // One device keeps in-projections of mixed types unpacked (packing them would mean a
             // dense or requantized copy): the family's graph lowering runs them as quantized.
+            // One shard runs the family's mixer program (every backend's executor); GGML's native
+            // block serves tensor parallelism. On one device it also keeps in-projections of mixed
+            // types unpacked (packing them would mean a dense or requantized copy).
             string name = InProjName(layer);
-            if (scope.Degree == 1 && !_quantWeights.ContainsKey(name) && !_weights.ContainsKey(name))
+            if (scope.Degree == 1 && (!IsGgmlBackend || (!_quantWeights.ContainsKey(name) && !_weights.ContainsKey(name))))
                 return RunRecurrentMixerGraph(scope, raw, layer, state);
             IntPtr w; int type; long ne0, ne1, bytes;
             QuantizedWeight q = scope.Degree == 1

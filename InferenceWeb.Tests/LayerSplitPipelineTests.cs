@@ -157,7 +157,9 @@ public sealed class LayerSplitPipelineTests : IDisposable
             try { return new InspectableMistral(_path, group); }
             catch { group.Dispose(); throw; }
         }))).WaitAsync(TimeSpan.FromSeconds(30));
-        using var reference = new InspectableMistral(_path);
+        // The same compute path as the pipeline (which runs per-op until multi-node stages are
+        // programs), so the comparison stays exact: this test is about routing, not kernels.
+        using var reference = new InspectableMistral(_path) { GraphLoweringEnabled = false };
         var driver = models[0];
         var worker = Task.Run(models[1].RunDistributedWorkerLoop);
         try

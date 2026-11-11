@@ -22,7 +22,7 @@ namespace TensorSharp.Models
     {
         protected override RotarySpec GraphRotary => _rotary;
 
-        protected override bool RecurrentMixerLowers => DeviceRecurrence && ShardDegree == 1;
+        protected override bool RecurrentMixerLowers => TensorRecurrence && ShardDegree == 1;
 
         /// <summary>Qwen 3.5's fused decode measured +8% decode with ggml-metal's reordering (A3B).</summary>
         protected override bool GraphConcurrencyReorder => true;
@@ -53,7 +53,7 @@ namespace TensorSharp.Models
         /// still the one before the window).</summary>
         protected override void CommitRecurrentPrefix(int kept, int rows)
         {
-            if (!DeviceRecurrence)
+            if (!TensorRecurrence)
             {
                 base.CommitRecurrentPrefix(kept, rows);
                 return;
@@ -66,7 +66,7 @@ namespace TensorSharp.Models
                 for (int layer = 0; layer < Config.NumLayers && key == IntPtr.Zero; layer++)
                     if (_isRecurrent[layer] && Mesh.StageOf(layer) == stage
                         && ActiveRecurrentState(layer) is DeviceGdnState first && first.Verify != null)
-                        key = TensorComputePrimitives.GetStoragePointer(first.Verify);
+                        key = StateIdentity(first.Verify);
                 if (key == IntPtr.Zero) continue;
                 EnterGraphStage(stage);
                 try
@@ -114,8 +114,13 @@ namespace TensorSharp.Models
             return g.ToProgram(replayable: true, reorder: false);
         }
 
-        private static int GraphLeaf(GraphProgramBuilder g, Tensor t, params long[] ne)
-            => g.Leaf(GraphLeafRole.State, GraphFormat.F32, ne, TensorComputePrimitives.GetStoragePointer(t), t.Storage.ByteLength);
+        private int GraphLeaf(GraphProgramBuilder g, Tensor t, params long[] ne)
+            => g.Leaf(GraphLeafRole.State, GraphFormat.F32, ne, StateIdentity(t), t.Storage.ByteLength, handle: t);
+
+        /// <summary>A state tensor's bytes where the executor binds host memory, else a stable identity.</summary>
+        private IntPtr StateIdentity(Tensor t) => GraphExecutor.Capabilities.BindsHostPointers
+            ? TensorComputePrimitives.GetStoragePointer(t)
+            : GraphIdentity.Of(t.Storage, t.StorageOffset);
 
         protected override int EmitRecurrentMixer(GraphStep step, int layer, int normed)
         {

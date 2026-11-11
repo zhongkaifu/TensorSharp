@@ -138,8 +138,8 @@ namespace TensorSharp.Models
         /// keyed by the exact host address a graph or kernel bound.</summary>
         private void SyncStateTensor(Tensor t)
         {
-            if (!IsGgmlBackend || t == null) return;
-            GgmlBasicOps.SyncHostBuffer(TensorComputePrimitives.GetStoragePointer(t), t.ElementCount() * t.ElementType.Size());
+            if (t == null || GraphExecutor is not { Capabilities.BindsHostPointers: true } executor) return;
+            executor.SyncToHost(TensorComputePrimitives.GetStoragePointer(t), t.ElementCount() * t.ElementType.Size());
         }
 
         private void SyncActiveToHost()
