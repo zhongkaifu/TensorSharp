@@ -715,10 +715,46 @@ Direct CUDA, one RTX PRO 6000, same binary, executor / per-op: Hy-MT2 prefill 5,
 decode 165.7 / 72.4 (the per-op path runs the recurrence on the host). The dense prompt gap (~5%) is
 open.
 
-Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens). The Qwen prompt
-gap is the program's ggml-style decomposition of the recurrence (about 20 bandwidth-bound passes a
-layer over [512, 6144]) against the old path's fused MLX pre/post kernels; it needs fusion of
-elementwise chains, which is the next step.
+Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
+
+#### Fused regions, lazy copies, aliases
+
+* **Fused regions** (`GraphFusion`, `BeginFused` / `EndFused`): a family marks ops that compute named
+  results from named inputs (no effects, no state). The ops stay the reference: GGML ignores the marks
+  and builds the same graph. A tensor executor with a kernel for the kind defers the region's ops and
+  runs its kernel; a node inside is computed only if something else reads it, and a declined kernel runs
+  the ops. Qwen 3.5's recurrence has two: `DeltaNetPrep` (the gates, the causal conv over
+  [window | rows], silu, the L2-normed Q and K) and `GatedRmsNorm` (the output norm times silu(z)), each
+  one Metal kernel on MLX and one CUDA kernel. Results follow the kind's documented shapes; inputs go to
+  the kernel in their canonical shapes (an input that arrived 4-D once read the wrong row count), and the
+  MLX prep kernel reads them through their strides: a prompt chunk's row blocks of the packed input
+  projection are views, and making them contiguous cost about 3 ms per 1,024 rows on Qwen3.5-0.8B.
+  Every family's dense FFN is a third kind, `SwigluFfn` (unscaled quantized weights): MLX runs a prompt
+  chunk's three products with F16 activations between them, as the old fused prefill FFN did (the per-op
+  F32 round trips cost Qwen3.5-0.8B's prompt 9 ms per 1,024 rows); decode rows run the ops.
+* **Copies run when forced:** a `Cpy` runs when an effect, an alias or a reader asks for it, as ggml
+  schedules it. A streamed step used to run each copy as it was emitted, so an alias's fallback copy ran
+  ahead of the alias the executor could have honoured.
+* **Aliases:** `TryAlias` lets an executor place a result inside a state leaf without the fallback
+  copy. MLX adopts the result's arrays for that byte range (the rest of the leaf stays as views).
+* **MLX storage parts:** an MLX storage can hold its contents as consecutive arrays; a view inside one
+  part reads it, anything else joins them. The delta rule's [outputs | states] result is two parts (the
+  state part becomes the live state by an array swap, no copy), and a verify window's per-row states are
+  one part each in ggml's newest-first order (slices, no gather).
+
+Qwen3.8-27B UD-IQ3_XXS on MLX (M5 Pro, 2,311-token prompt, 256 tokens, greedy; runtime / `Qwen35Model`,
+alternating runs): plain decode 19.8 / 19.6-20.0 tok/s, MTP 29.8 / 29.3-29.6, DFlash2 29.3-29.8 /
+27.5-27.7, prompt equal; plain text identical, speculative text identical to plain, perplexity 9.8240 /
+9.8244. Before these changes: plain 17.5 (the runtime requantized mixed gate/up pairs that the old model
+runs split), MTP 26.8-27.6 (the alias's copy joined 25 MB a layer per verify), DFlash2 26.2-26.6.
+Qwen3.5-0.8B Q8_0 on MLX, 1,024-token prompt: 12,130 / 12,290 tok/s (was 8,942 before fusion, 10,600
+before `SwigluFfn` and the strided prep); decode 197 / 197.
+
+Multi-axis rotary whose axes all hold the same position (text) runs as NeoX rotary on the device; the
+host loop, which read the rows back, now serves only image tokens.
+
+Direct CUDA (RTX PRO 6000) is not at parity yet: Qwen3.5-0.8B Q8_0 prompt 8,800 / 15,400 tok/s, decode
+209 / 272; 9B prompt 1,800 / 2,300, decode 38.4 / 38.7 (runtime / `Qwen35CudaModel`).
 
 ---
 

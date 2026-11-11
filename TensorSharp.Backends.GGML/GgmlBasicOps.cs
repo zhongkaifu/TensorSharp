@@ -3604,11 +3604,11 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>Test hook: decode / verify routes the route tail skip dropped in this process (missed experts routed
-        /// only at rank TS_MOE_ROUTE_TAIL_SKIP or lower; ggml_ops_moe_hot_tier.cpp). 0 when the hooks are not built.</summary>
+        /// only at rank TS_MOE_ROUTE_TAIL_SKIP or lower; ggml_ops_moe_hot_tier.cpp). -1 when the hooks are not built.</summary>
         public static long MoeTailSkippedRoutes()
         {
             try { return GgmlNative.TSGgml_MoeTailSkippedRoutes(); }
-            catch (EntryPointNotFoundException) { return 0; }
+            catch (EntryPointNotFoundException) { return -1; }
         }
 
         /// <summary>DFlash feature taps for the following qwen4exp spans on this thread: after each

@@ -311,6 +311,13 @@ namespace TensorSharp.Models
             }
         }
 
+        // A layer without ffn_gate_up runs ffn_gate and ffn_up as two products on every path (graph
+        // SwigluSplit, per-op, tensor-parallel shards), so a mixed-quant pair stays in its own types
+        // where fusing it would requantize: IQ2_XXS/IQ2_XS/IQ1_S pairs (no importance matrix), and on
+        // MLX every mixed pair (a requantized side reads more bits a weight and rounds twice).
+        protected override bool SupportsSplitGateUpFfn => true;
+        protected override bool SplitsMixedGateUpOnMlx => true;
+
         private void FuseProjections()
         {
             int fusedQkv = 0;

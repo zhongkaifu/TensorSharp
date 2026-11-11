@@ -848,6 +848,77 @@ namespace TensorSharp.MLX
             });
         }
 
+        /// <summary>A quantized weight as the graph executor names it (its cache key, host bytes, GGUF type, extents).</summary>
+        public readonly record struct WeightSpec(IntPtr Key, IntPtr Data, int Type, long Ne0, long Ne1, long Bytes)
+        {
+            public bool IsSet => Key != IntPtr.Zero || Data != IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// <paramref name="result"/> [rows, n] = down · (silu(gate · x) * (up · x)) with F16 activations between the
+        /// products (one cast in, one out), as <see cref="TryRmsNormSwiGluAddHalf"/> runs a prompt block: with
+        /// <paramref name="up"/> unset, <paramref name="gate"/> is the fused gate_up (gate rows then up rows).
+        /// Declines (touching nothing) below the half-matmul row threshold or unless every weight is affine with
+        /// F16 scales.
+        /// </summary>
+        public static bool TrySwiGluFfnHalf(Tensor result, Tensor x, WeightSpec gate, WeightSpec up, WeightSpec down)
+        {
+            if (x?.Storage is not MlxStorage inputStorage || result?.Storage is not MlxStorage resultStorage
+                || x.ElementType != DType.Float32 || result.ElementType != DType.Float32 || !result.IsContiguous())
+                return false;
+            long hidden = x.Sizes[^1], rowsLong = x.ElementCount() / hidden;
+            if (rowsLong < HalfMatmulMinRows || rowsLong > int.MaxValue) return false;
+            int rows = (int)rowsLong;
+            bool split = up.IsSet;
+            long intermediate = split ? gate.Ne1 : gate.Ne1 / 2;
+            if (gate.Ne0 != hidden || (split && (up.Ne0 != hidden || up.Ne1 != intermediate)) || down.Ne0 != intermediate
+                || result.ElementCount() != rowsLong * down.Ne1 || intermediate <= 0 || intermediate > int.MaxValue)
+                return false;
+            foreach (WeightSpec w in split ? new[] { gate, up, down } : new[] { gate, down })
+                if (!CanPreloadQuantizedType(w.Type)) return false;
+            DeviceWeight g = EnsureWeight(resultStorage.DeviceId, gate.Key, gate.Data, gate.Type, gate.Ne0, gate.Ne1, gate.Bytes);
+            DeviceWeight u = split ? EnsureWeight(resultStorage.DeviceId, up.Key, up.Data, up.Type, up.Ne0, up.Ne1, up.Bytes) : null;
+            DeviceWeight d = EnsureWeight(resultStorage.DeviceId, down.Key, down.Data, down.Type, down.Ne0, down.Ne1, down.Bytes);
+            if (!g.HalfAffine || !d.HalfAffine || (split && !u.HalfAffine)) return false;
+            int inter = (int)intermediate;
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray input = default, half = default, gateOut = default, upOut = default, gateRows = default, upRows = default;
+                MlxNative.MlxArray activated = default, downOut = default, downF32 = default;
+                try
+                {
+                    input = inputStorage.CreateArrayView(new[] { rows, (int)hidden }, new[] { hidden, 1L }, x.StorageOffset);
+                    half = MlxNative.Astype(input, DType.Float16);
+                    gateOut = MlxNative.QuantizedMatmul(half, g.Weight, g.Scales, g.Biases, transpose: true, g.GroupSize, g.Bits, g.Mode);
+                    if (split)
+                    {
+                        upOut = MlxNative.QuantizedMatmul(half, u.Weight, u.Scales, u.Biases, transpose: true, u.GroupSize, u.Bits, u.Mode);
+                        activated = MlxCompiledOps.SwiGLU(gateOut, upOut);
+                    }
+                    else
+                    {
+                        gateRows = MlxNative.Slice(gateOut, new[] { 0, 0 }, new[] { rows, inter }, new[] { 1, 1 });
+                        upRows = MlxNative.Slice(gateOut, new[] { 0, inter }, new[] { rows, 2 * inter }, new[] { 1, 1 });
+                        activated = MlxCompiledOps.SwiGLU(gateRows, upRows);
+                    }
+                    downOut = MlxNative.QuantizedMatmul(activated, d.Weight, d.Scales, d.Biases, transpose: true, d.GroupSize, d.Bits, d.Mode);
+                    downF32 = MlxNative.Astype(downOut, DType.Float32);
+                    SetDeviceResult(result, downF32);
+                    downF32 = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    foreach (var a in new[] { input, half, gateOut, upOut, gateRows, upRows, activated, downOut, downF32 })
+                        MlxNative.FreeArray(a);
+                }
+            });
+        }
+
         /// <summary>
         /// <see cref="TryRmsNormSwiGluAddHalf"/> for a gate and up kept as two weights, as
         /// mixed-quant GGUFs are on MLX (IQ4_XS ffn_gate with Q5_K ffn_up in Qwen3.8 UD

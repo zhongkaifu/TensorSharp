@@ -71,7 +71,31 @@ namespace TensorSharp.Graph
     /// holding each (segment, rank)'s extent, segment s repeating <see cref="Nr"/>[s] times.</summary>
     public sealed record GraphSplit(int Axis, long[] Ne, uint[] Nr);
 
-    public enum GraphNodeKind : byte { Leaf, Op, Effect, Output, Alias, Boundary }
+    public enum GraphNodeKind : byte { Leaf, Op, Effect, Output, Alias, Boundary, Fused, FusedEnd }
+
+    /// <summary>
+    /// What a fused region computes (see <see cref="GraphProgramBuilder.BeginFused"/>). The region's ops are
+    /// the reference: an executor with a kernel for the kind may compute the region's results from its
+    /// inputs in one dispatch; any other runs the ops.
+    /// </summary>
+    public enum GraphFusion
+    {
+        /// <summary>A gated delta rule's inputs for one sequence. Inputs: the conv window [convRows, channels]
+        /// (time innermost), qkv [channels, rows], the conv kernel [width, channels], alpha and beta
+        /// [vHeads, rows], dt and a [vHeads]. Ip: dk, kHeads, dv, vHeads. Fp: the L2 norm's eps. Results:
+        /// the conv input [convRows + rows, channels] (window then rows, time innermost); q and k
+        /// [dk, heads, rows, 1], each head L2-normed (x / sqrt(sum x^2 + eps)), of silu(ssm_conv); v
+        /// [dv, vHeads, rows, 1] of silu(ssm_conv); g = softplus(alpha + dt) * a and beta = sigmoid(beta),
+        /// both [1, vHeads, rows, 1].</summary>
+        DeltaNetPrep = 1,
+        /// <summary>rms_norm(y) * w * silu(z) per head. Inputs: y and z [d, heads, rows], w [d]. Fp: eps.
+        /// Result: [d, heads, rows].</summary>
+        GatedRmsNorm = 2,
+        /// <summary>A SwiGLU feed-forward: down · (silu(gate · x) * (up · x)). Inputs: x [n, rows], then the
+        /// quantized weights: gate_up (gate rows then up rows) and down, or (Ip[0] = 1) gate, up and down.
+        /// Result: [n, rows].</summary>
+        SwigluFfn = 3,
+    }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
     /// effects, outputs and aliases refer to them.</summary>
@@ -211,6 +235,27 @@ namespace TensorSharp.Graph
         {
             Mix(6); Mix(node);
             if (Keeping) Emit(-1, new GraphNode { Kind = GraphNodeKind.Boundary, Node = node });
+        }
+
+        /// <summary>
+        /// Open a region of <paramref name="kind"/> over <paramref name="inputs"/> (nodes that exist now). The ops
+        /// up to <see cref="EndFused"/> compute its results from the inputs alone (no effects, no state); an
+        /// executor with a kernel for the kind may run that instead, and nodes inside are then computed
+        /// only if something else reads them.
+        /// </summary>
+        public void BeginFused(GraphFusion kind, ReadOnlySpan<int> inputs, ReadOnlySpan<long> ip = default, ReadOnlySpan<float> fp = default)
+        {
+            foreach (int src in inputs)
+                if (src < 0 || src >= NodeCount) throw new ArgumentOutOfRangeException(nameof(inputs), $"{kind}: input node {src} does not exist");
+            Mix(7); Mix((int)kind); Mix(inputs); Mix(ip); Mix(fp);
+            if (Keeping) Emit(-1, new GraphNode { Kind = GraphNodeKind.Fused, Node = (int)kind, Srcs = inputs.ToArray(), Ip = ip.ToArray(), Fp = fp.ToArray() });
+        }
+
+        /// <summary>Close the open region; <paramref name="results"/> are its results in the kind's order.</summary>
+        public void EndFused(ReadOnlySpan<int> results)
+        {
+            Mix(8); Mix(results);
+            if (Keeping) Emit(-1, new GraphNode { Kind = GraphNodeKind.FusedEnd, Srcs = results.ToArray() });
         }
 
         /// <summary>A result of <paramref name="floats"/> F32 values; returns its output index.</summary>

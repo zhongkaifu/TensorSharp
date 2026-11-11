@@ -186,22 +186,17 @@ namespace TensorSharp.Models
                     alphaRaw = step.Cont(step.View2(proj, vHeads, count, nb1, row0 + (channels + v + vHeads) * f));
                 }
 
+                // The delta rule's inputs, one region a backend may run as one kernel (GraphFusion.DeltaNetPrep):
+                // the gates, the causal conv over [previous window | this chunk] and the L2-normed Q and K.
+                int window = step.State(state.Conv, GraphFormat.F32, convRows, channels);
+                step.BeginFused(GraphFusion.DeltaNetPrep, stackalloc[] { window, qkv, convW, alphaRaw, betaRaw, dt, a },
+                    stackalloc long[] { dk, kHeads, dv, vHeads }, stackalloc[] { eps });
                 int beta = step.Reshape(step.Op(GraphOp.Sigmoid, betaRaw), 1, vHeads, count, 1);
                 int g = step.Op(GraphOp.Mul, step.Op(GraphOp.Softplus, step.Op(GraphOp.Add, alphaRaw, dt)), a);
                 g = step.Reshape(g, 1, vHeads, count, 1);
-
-                // The causal conv over [previous window | this chunk], and the new window.
-                int window = step.State(state.Conv, GraphFormat.F32, convRows, channels);
                 // ggml_concat writes a contiguous result, so it reads the transposed view directly.
                 int convIn = step.Op(GraphOp.Concat, stackalloc[] { window, step.Transpose(qkv) }, stackalloc long[] { 0 });
                 int conv = step.Op(GraphOp.Silu, step.Op(GraphOp.SsmConv, convIn, convW));   // [channels, count]
-                // convIn is a fresh contiguous [convRows + count, channels]. A verify window leaves the
-                // live window alone: the commit sets it from the window's conv history.
-                bool keep = step.RecurrentSnapshots && count > 1;
-                if (!keep)
-                    step.Effect(step.Op(GraphOp.Cpy,
-                        step.View2(convIn, convRows, channels, (convRows + count) * f, count * f), window));
-
                 // Q, K, V as [head, heads, tokens, 1] views of the conv output; where the backend reads
                 // strided rows they feed the norms and the recurrence directly, else contiguous copies.
                 long token = channels * f, all = channels * count * f;
@@ -216,6 +211,14 @@ namespace TensorSharp.Models
                 }
                 q4 = step.L2Norm(q4, dk, eps);
                 k4 = step.L2Norm(k4, dk, eps);
+                step.EndFused(stackalloc[] { convIn, q4, k4, v4, g, beta });
+
+                // convIn is a fresh contiguous [convRows + count, channels]: its last rows are the new window.
+                // A verify window leaves the live window alone: the commit sets it from the conv history.
+                bool keep = step.RecurrentSnapshots && count > 1;
+                if (!keep)
+                    step.Effect(step.Op(GraphOp.Cpy,
+                        step.View2(convIn, convRows, channels, (convRows + count) * f, count * f), window));
 
                 // Every graph binds the state through one key per backend: on Metal the slot's backing
                 // buffer [one row's outputs | state], so a decode row's recurrence can write its result
@@ -264,8 +267,10 @@ namespace TensorSharp.Models
                         step.Effect(copy);
                 }
 
-                int normedOut = step.RmsNorm(step.Reshape(step.Cont(scores), dv, vHeads, count), ssmNorm, eps);
-                int gated = step.Op(GraphOp.Mul, normedOut, step.Op(GraphOp.Silu, step.Reshape(z, dv, vHeads, count)));
+                int y = step.Reshape(step.Cont(scores), dv, vHeads, count), zh = step.Reshape(z, dv, vHeads, count);
+                step.BeginFused(GraphFusion.GatedRmsNorm, stackalloc[] { y, zh, ssmNorm }, default, stackalloc[] { eps });
+                int gated = step.Op(GraphOp.Mul, step.RmsNorm(y, ssmNorm, eps), step.Op(GraphOp.Silu, zh));
+                step.EndFused(stackalloc[] { gated });
                 int part = step.Reshape(gated, v, count);
                 output = output < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { output, part }, stackalloc long[] { 1 });
             }

@@ -8366,6 +8366,12 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
         }
 
         private static MlxFastMetalKernel CreateFastMetalKernel(string name, string[] inputs, string[] outputs, string source, string header)
+            => CreateFastMetalKernel(name, inputs, outputs, source, header, ensureRowContiguous: true);
+
+        /// <summary>With <paramref name="ensureRowContiguous"/> false the kernel reads its inputs as they are
+        /// (strided views; its source indexes them through <c>name_strides</c>).</summary>
+        private static MlxFastMetalKernel CreateFastMetalKernel(string name, string[] inputs, string[] outputs, string source, string header,
+            bool ensureRowContiguous)
         {
             IntPtr namePtr = IntPtr.Zero;
             IntPtr sourcePtr = IntPtr.Zero;
@@ -8385,7 +8391,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                     outputVector,
                     sourcePtr,
                     headerPtr,
-                    true,
+                    ensureRowContiguous,
                     false);
             }
             finally

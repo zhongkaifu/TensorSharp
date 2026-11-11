@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 
 using TensorSharp.Graph;
@@ -59,6 +60,149 @@ namespace TensorSharp.MLX
             return r;
         }
 
+        protected override bool Fuses(GraphFusion kind) => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SwigluFfn;
+
+        /// <summary>The delta rule's prep and the gated norm after it as one Metal kernel each
+        /// (MlxNative.GraphKernels).</summary>
+        protected override bool TryFused(GraphFusion kind, Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results)
+        {
+            if (kind == GraphFusion.SwigluFfn) return TrySwigluFfn(inputs[0], weights, ip, results);
+            foreach (Tensor t in inputs)
+                if (t == null || !(t.Storage is MlxStorage) || t.ElementType != DType.Float32) return false;
+            float eps = fp != null && fp.Length > 0 ? fp[0] : 1e-6f;
+            var views = new MlxNative.MlxArray[inputs.Length];
+            MlxNative.MlxArray[] outs = null;
+            try
+            {
+                switch (kind)
+                {
+                    case GraphFusion.DeltaNetPrep:
+                    {
+                        int dk = (int)ip[0], kHeads = (int)ip[1], dv = (int)ip[2], vHeads = (int)ip[3];
+                        Tensor window = inputs[0], qkv = inputs[1], convW = inputs[2];
+                        int channels = (int)window.Sizes[0], convRows = (int)window.Sizes[^1], width = (int)convW.Sizes[^1];
+                        int rows = (int)(qkv.ElementCount() / channels);
+                        if (dk != dv || dk % 32 != 0 || dk > 1024 || channels != (2 * kHeads + vHeads) * dk
+                            || window.ElementCount() != (long)channels * convRows || convW.ElementCount() != (long)channels * width
+                            || inputs[3].ElementCount() != (long)rows * vHeads || inputs[4].ElementCount() != (long)rows * vHeads)
+                            return false;
+                        // The kernel reads each input in its documented 2-D (or 1-D) shape, through the view's own
+                        // strides (a prompt chunk's row blocks of the packed projection are not copied).
+                        int[][] shapes =
+                        {
+                            new[] { channels, convRows }, new[] { rows, channels }, new[] { channels, width },
+                            new[] { rows, vHeads }, new[] { rows, vHeads }, new[] { vHeads }, new[] { vHeads },
+                        };
+                        for (int i = 0; i < inputs.Length; i++) views[i] = StridedView(inputs[i], shapes[i]);
+                        outs = MlxNative.DeltaNetPrep(views[0], views[1], views[2], views[3], views[4], views[5], views[6],
+                            rows, channels, convRows, width, dk, kHeads, vHeads, eps);
+                        long[][] sizes =
+                        {
+                            new long[] { channels, convRows + rows }, new long[] { rows, kHeads, dk }, new long[] { rows, kHeads, dk },
+                            new long[] { rows, vHeads, dv }, new long[] { rows, vHeads, 1 }, new long[] { rows, vHeads, 1 },
+                        };
+                        for (int o = 0; o < results.Length; o++) results[o] = Wrap(outs[o], sizes[o]);
+                        return true;
+                    }
+                    case GraphFusion.GatedRmsNorm:
+                    {
+                        for (int i = 0; i < inputs.Length; i++) views[i] = View(inputs[i]);
+                        Tensor y = inputs[0], w = inputs[2];
+                        int d = (int)w.ElementCount();
+                        if (d % 32 != 0 || d > 1024 || y.ElementCount() % d != 0 || inputs[1].ElementCount() != y.ElementCount())
+                            return false;
+                        int n = (int)(y.ElementCount() / d);
+                        outs = new[] { MlxNative.GatedRmsNorm(views[0], views[1], views[2], n, d, eps) };
+                        results[0] = Wrap(outs[0], y.Sizes);
+                        return true;
+                    }
+                    default:
+                        return false;
+                }
+            }
+            finally
+            {
+                foreach (var v in views) MlxNative.FreeArray(v);
+                if (outs != null) foreach (var o in outs) MlxNative.FreeArray(o);
+            }
+        }
+
+        /// <summary>A prompt chunk's SwiGLU feed-forward in half precision (MlxQuantizedOps.TrySwiGluFfnHalf): the
+        /// activations stay F16 between the three products. Fewer rows (decode, a verify) run the ops.</summary>
+        private bool TrySwigluFfn(Tensor x, IGraphWeight[] weights, long[] ip, Tensor[] results)
+        {
+            if (x == null || x.Storage is not MlxStorage || x.ElementType != DType.Float32 || x.ElementCount() % x.Sizes[^1] != 0)
+                return false;
+            bool split = ip != null && ip.Length > 0 && ip[0] == 1;
+            IGraphWeight gate = weights[1], up = split ? weights[2] : null, down = weights[split ? 3 : 2];
+            if (gate == null || down == null || (split && up == null)) return false;
+            long rows = x.ElementCount() / x.Sizes[^1];
+            var result = new Tensor(Allocator, DType.Float32, rows, down.Ne1);
+            if (MlxQuantizedOps.TrySwiGluFfnHalf(result, x, Spec(gate), up == null ? default : Spec(up), Spec(down)))
+            {
+                results[0] = result;
+                return true;
+            }
+            result.Dispose();
+            return false;
+        }
+
+        private static MlxQuantizedOps.WeightSpec Spec(IGraphWeight w) => new(w.CacheKey, w.Data, w.Format, w.Ne0, w.Ne1, w.Bytes);
+
+        /// <summary>A view of <paramref name="t"/> in <paramref name="shape"/> (its own extents with leading ones
+        /// dropped) over its strides, or a reshape where its layout is not of that shape.</summary>
+        private static MlxNative.MlxArray StridedView(Tensor t, int[] shape)
+        {
+            var sizes = new List<long>();
+            var strides = new List<long>();
+            for (int d = 0; d < t.DimensionCount; d++)
+            {
+                if (t.Sizes[d] == 1) continue;
+                sizes.Add(t.Sizes[d]);
+                strides.Add(t.Strides[d]);
+            }
+            bool same = sizes.Count <= shape.Length;
+            for (int d = 0, k = shape.Length - sizes.Count; same && d < sizes.Count; d++) same = sizes[d] == shape[k + d];
+            if (same)
+            {
+                var full = new long[shape.Length];
+                for (int d = shape.Length - 1, k = sizes.Count - 1; d >= 0; d--, k--)
+                    full[d] = k >= 0 ? strides[k] : (d + 1 < shape.Length ? full[d + 1] * shape[d + 1] : 1);
+                return ((MlxStorage)t.Storage).CreateArrayView(shape, full, t.StorageOffset);
+            }
+            MlxNative.MlxArray view = View(t);
+            try { return MlxNative.Reshape(view, shape); }
+            finally { MlxNative.FreeArray(view); }
+        }
+
+        /// <summary>An aliased result (a verify window's [outputs | states] into the request's buffer) is adopted
+        /// by the leaf's storage as views of the result's arrays: no copy.</summary>
+        protected override bool TryAlias(Tensor result, Tensor leaf, long offsetBytes)
+        {
+            if (!(result.Storage is MlxStorage source && leaf.Storage is MlxStorage target) || ReferenceEquals(source, target)
+                || result.ElementType != DType.Float32 || leaf.ElementType != DType.Float32 || !result.IsContiguous()
+                || offsetBytes % sizeof(float) != 0)
+                return false;
+            long offset = leaf.StorageOffset + offsetBytes / sizeof(float), n = result.ElementCount();
+            if (offset < 0 || offset + n > target.ElementCount) return false;
+            target.AdoptRange(offset, source.FlatRange(result.StorageOffset, n));
+            return true;
+        }
+
+        /// <summary>A copy over a whole contiguous tensor (a recurrent state's update) takes the source's
+        /// array: MLX arrays are immutable, so the destination reads the same bytes with no copy.</summary>
+        protected override void CopyInto(Tensor dst, Tensor src)
+        {
+            if (dst.Storage is MlxStorage target && src.Storage is MlxStorage source && !ReferenceEquals(target, source)
+                && dst.ElementType == src.ElementType && dst.StorageOffset == 0 && dst.ElementCount() == target.ElementCount
+                && dst.IsContiguous() && src.IsContiguous() && src.ElementCount() == dst.ElementCount())
+            {
+                target.ReplaceDeviceArray(source.CreateArrayView(new[] { checked((int)src.ElementCount()) }, new[] { 1L }, src.StorageOffset));
+                return;
+            }
+            base.CopyInto(dst, src);
+        }
+
         /// <summary>MLX ops run on its worker thread: the whole plan runs there, so its ops do not hop.</summary>
         protected override bool OnBackendThread(Func<bool> run) => MlxWorker.Shared.Invoke(run);
 
@@ -86,7 +230,7 @@ namespace TensorSharp.MLX
                         weight.Ne0, weight.Ne1, weight.Bytes)))
                 return result;
             result.Dispose();
-            throw new NotSupportedException($"MLX has no product for weight type {weight.Format}");
+            return HostProduct(weight, x);
         }
 
         /// <summary>MLX's fused attention (GQA native) over the K/V views as they are: q is cast to the
@@ -161,43 +305,54 @@ namespace TensorSharp.MLX
                 || !(q.Storage is MlxStorage))
                 return base.GatedDeltaNet(q, k, v, g, beta, state, snapshots);
 
-            using Tensor qs = Ops.Mul(null, q, 1f / MathF.Sqrt(sv));
-            using Tensor decay = Ops.Exp(null, g);
+            // One decode row takes ggml's q and log decay as they are; other shapes the kernels' (q / sqrt(S), exp(g)).
+            bool decode = slots == 1 && nt == 1;
+            using Tensor qs = decode ? null : Ops.Mul(null, q, 1f / MathF.Sqrt(sv));
+            using Tensor decay = decode ? null : Ops.Exp(null, g);
             MlxNative.MlxArray qa = default, ka = default, va = default, ga = default, ba = default, sa = default;
             MlxNative.MlxArray y = default, next = default, rows = default, order = default, picked = default;
-            MlxNative.MlxArray yFlat = default, sFlat = default, all = default;
+            MlxNative.MlxArray yFlat = default, sFlat = default;
             try
             {
-                qa = View(qs); ka = View(k); va = View(v); ga = View(decay); ba = View(beta); sa = View(state);
-                if (slots == 1)
+                qa = View(qs ?? q); ka = View(k); va = View(v); ga = View(decay ?? g); ba = View(beta); sa = View(state);
+                if (decode)
+                {
+                    (y, next) = MlxNative.GatedDeltaDecode(qa, ka, va, ga, ba, sa, ns, hk, h, sv, sv);
+                    sFlat = MlxNative.Reshape(next, new[] { ns * h * sv * sv });
+                }
+                else if (slots == 1)
                 {
                     MlxNative.GatedDelta(qa, ka, va, ga, ba, sa, ns, nt, hk, h, sv, sv, out y, out next);
                     sFlat = MlxNative.Reshape(next, new[] { ns * h * sv * sv });
                 }
                 else
                 {
-                    // Every row's state [T, B, Hv, Dv, Dk], newest first as ggml's snapshot slots.
+                    // Every row's state [T, B, Hv, Dv, Dk]: ggml's snapshot slots are newest first, so the
+                    // result holds each row's state as its own part in that order (slices, no gather).
                     MlxNative.GatedDeltaRows(qa, ka, va, ga, ba, sa, ns, nt, hk, h, sv, sv, out y, out next, out rows);
-                    var reverse = new int[nt];
-                    for (int t = 0; t < nt; t++) reverse[t] = nt - 1 - t;
-                    unsafe
-                    {
-                        fixed (int* r = reverse) order = MlxNative.NewArrayFromHost((IntPtr)r, new[] { nt }, DType.Int32);
-                    }
-                    picked = MlxNative.TakeAxis(rows, order, 0);
-                    sFlat = MlxNative.Reshape(picked, new[] { nt * ns * h * sv * sv });
+                    yFlat = MlxNative.Reshape(y, new[] { ns * nt * h * sv });
+                    int per = ns * h * sv * sv;
+                    picked = MlxNative.Reshape(rows, new[] { nt * per });
+                    var parts = new MlxNative.MlxArray[1 + nt];
+                    parts[0] = yFlat;
+                    for (int t = 0; t < nt; t++)
+                        parts[1 + t] = MlxNative.Slice(picked, new[] { (nt - 1 - t) * per }, new[] { (nt - t) * per }, new[] { 1 });
+                    var rowsResult = new Tensor(Allocator, DType.Float32, (long)ns * nt * h * sv + (long)nt * per);
+                    ((MlxStorage)rowsResult.Storage).ReplaceDeviceParts(parts);
+                    yFlat = default;
+                    return rowsResult;
                 }
                 yFlat = MlxNative.Reshape(y, new[] { ns * nt * h * sv });
-                all = MlxNative.ConcatenateAxis(yFlat, sFlat, 0);
                 long total = (long)ns * nt * h * sv + (long)slots * ns * h * sv * sv;
                 var result = new Tensor(Allocator, DType.Float32, total);
-                ((MlxStorage)result.Storage).ReplaceDeviceArray(all);
-                all = default;
+                // ggml's [outputs | states] as two parts: the views of either read it without a concat.
+                ((MlxStorage)result.Storage).ReplaceDeviceParts(yFlat, sFlat);
+                yFlat = sFlat = default;
                 return result;
             }
             finally
             {
-                foreach (var a in new[] { qa, ka, va, ga, ba, sa, y, next, rows, order, picked, yFlat, sFlat, all })
+                foreach (var a in new[] { qa, ka, va, ga, ba, sa, y, next, rows, order, picked, yFlat, sFlat })
                     MlxNative.FreeArray(a);
             }
         }

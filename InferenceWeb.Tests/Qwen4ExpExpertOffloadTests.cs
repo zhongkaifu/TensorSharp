@@ -265,11 +265,13 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
             });
         }
         float[][] exact = Answer("0", allHeld: false);
+        // The counter is a native test hook (-1 where the library was built without them): the bits are compared regardless.
         long before = GgmlBasicOps.MoeTailSkippedRoutes();
         float[][] skipped = Answer("2", allHeld: false);
         long dropped = GgmlBasicOps.MoeTailSkippedRoutes() - before;
-        _output.WriteLine($"routes skipped: {dropped}");
-        Assert.True(dropped > 0, "no decode step skipped a missed low-rank route");
+        _output.WriteLine(before < 0 ? "routes skipped: no counter (native test hooks not built)" : $"routes skipped: {dropped}");
+        if (before >= 0)
+            Assert.True(dropped > 0, "no decode step skipped a missed low-rank route");
         Assert.True(skipped[0].AsSpan().SequenceEqual(exact[0]), "the prompt skipped routes (prompt widths compute every route)");
         for (int i = 1; i < skipped.Length; i++)
         {

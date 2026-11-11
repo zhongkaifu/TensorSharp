@@ -19,8 +19,18 @@ namespace TensorSharp.Models.Graph
     public sealed class ManagedGraphExecutor : TensorGraphExecutor
     {
         [ModuleInitializer]
-        internal static void Register()
-            => GraphExecutors.Register(typeof(CpuAllocator), allocator => new ManagedGraphExecutor(allocator));
+        internal static unsafe void Register()
+        {
+            GraphExecutors.Register(typeof(CpuAllocator), allocator => new ManagedGraphExecutor(allocator));
+            // Backends without a kernel for a weight's format run it on the host (their per-op paths do).
+            HostQuantizedProduct = (weight, x, rows, y) =>
+            {
+                fixed (float* xp = x)
+                fixed (float* yp = y)
+                    ManagedQuantizedOps.AddmmQuantizedToFloat32(weight.Format, weight.Data, weight.Ne0, weight.Ne1,
+                        xp, (int)weight.Ne0, rows, yp, (int)weight.Ne1);
+            };
+        }
 
         public ManagedGraphExecutor(IAllocator allocator) : base(allocator) { }
 

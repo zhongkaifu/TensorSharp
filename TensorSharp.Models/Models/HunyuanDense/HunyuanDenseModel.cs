@@ -58,8 +58,6 @@ namespace TensorSharp.Models
             }
         }
 
-        protected override bool SupportsSplitGateUpFfn => true;
-
         // Text LoRA: every projection of a decoder layer and the LM head run through
         // LinearForward, attn_q/k/v and ffn_gate/up fused or (split FFN) as two weights. The
         // fused dense FFN graph declines while an adapter is selected.

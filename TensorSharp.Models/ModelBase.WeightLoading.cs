@@ -1341,7 +1341,7 @@ namespace TensorSharp.Models
             {
                 Console.WriteLine(
                     $"  Split projections: {keptMixedLayers.Count} of {numLayers} mixed-quant ffn_gate/ffn_up pairs run " +
-                    "as two matmuls in their own types on MLX (no requantization; TS_MLX_MIXED_GATE_UP_SPLIT=0 fuses them).");
+                    "as two matmuls in their own types on MLX (no requantization).");
             }
             ReportDeclinedFusionCopies();
         }

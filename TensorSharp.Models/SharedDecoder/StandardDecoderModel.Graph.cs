@@ -158,6 +158,10 @@ namespace TensorSharp.Models
             public bool RecurrentSnapshots { get; init; }
             /// <summary>Flat (T, H, W) rotary positions of a single sequence's rows (multi-axis rotary).</summary>
             public int[] PositionTable { get; init; }
+
+            /// <summary>What the request changes in the emitted program (a streamed step's template key).</summary>
+            public string Shape =>
+                $"{LastRowLogits}{AllRowLogits}{CaptureFinal}{PositionTable != null}:{string.Join(".", CaptureLayers)}";
         }
 
         private sealed class GraphResult
@@ -245,7 +249,7 @@ namespace TensorSharp.Models
             if (_mesh.Stages > 1)
                 return TryRunStagedGraphStep(hidden, slots, first, counts, starts, request, replayable, out result);
             CachedGraph graph = RunTraced(rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, 0,
-                step => EmitStep(step, hidden, request), out StepOutputs outputs, out bool owned);
+                step => EmitStep(step, hidden, request), out StepOutputs outputs, out bool owned, shape: request.Shape);
             if (graph == null) return false;
             // A replayed graph's buffers are rewritten by its next run (the model-owned buffer
             // contract); a one-shot graph's arrays are the caller's.
@@ -281,7 +285,8 @@ namespace TensorSharp.Models
                     bool last = s == stages - 1;
                     Tensor stageInput = input;
                     CachedGraph graph = RunTraced(rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, 0,
-                        step => EmitStep(step, stageInput, request, from, to, last), out StepOutputs outputs, out bool owned);
+                        step => EmitStep(step, stageInput, request, from, to, last), out StepOutputs outputs, out bool owned,
+                        shape: $"{request.Shape}|stage{s}");
                     if (graph == null)
                     {
                         if (s == 0) return false;
@@ -297,7 +302,7 @@ namespace TensorSharp.Models
                             float[] rowsOut = graph.Outputs[outputs.Hidden];
                             if (!ReferenceEquals(input, hidden)) input.Dispose();
                             EnterStage(s + 1);
-                            input = CreateFloatTensor((float[])rowsOut.Clone(), rows, hiddenSize);
+                            input = CreateFloatTensor((float[])rowsOut.Clone(), rows, StreamWidth);
                             continue;
                         }
                         result = new GraphResult
@@ -345,7 +350,7 @@ namespace TensorSharp.Models
         /// </summary>
         private CachedGraph RunTraced(int rows, Slot[] slots, int[] first, int[] counts, int[] starts, bool replayable,
             bool snapshots, int attentionFloor, Func<GraphStep, StepOutputs> emit, out StepOutputs outputs, out bool owned,
-            bool deviceOutputs = false)
+            bool deviceOutputs = false, string shape = null)
         {
             GraphStep step = null;
             CachedGraph graph = null;
@@ -360,7 +365,9 @@ namespace TensorSharp.Models
                 string kind = null;
                 if (GraphExecutor is IStreamingGraphExecutor streaming)
                 {
-                    kind = $"{rows}|{slots.Length}|{snapshots}|{attentionFloor > 0}|{emit.Method.MetadataToken}|{string.Join(",", counts)}";
+                    // Everything that changes what the step emits: a stream frees each node after the template's
+                    // last reader, so a step that emits differently (other outputs, another stage) must not share it.
+                    kind = $"{rows}|{slots.Length}|{snapshots}|{attentionFloor > 0}|{emit.Method.MetadataToken}|{string.Join(",", counts)}|{shape}";
                     if (_streamedKinds.Contains(kind))
                     {
                         IGraphStream stream = streaming.OpenStream(_streamTemplates.GetValueOrDefault(kind));
@@ -506,9 +513,10 @@ namespace TensorSharp.Models
         /// the head when <paramref name="head"/>, else the stage's output rows for the next stage.</summary>
         private StepOutputs EmitStep(GraphStep step, Tensor hidden, GraphRequest request, int from, int to, bool head)
         {
-            int n = step.Sequences, rows = step.Rows, hiddenSize = Config.HiddenSize;
+            int n = step.Sequences, rows = step.Rows, hiddenSize = Config.HiddenSize, width = StreamWidth;
             var outputs = new StepOutputs { Logits = -1, Final = -1, Hidden = -1 };
-            int h = step.Input(hidden, hiddenSize, rows);
+            // The first stage widens the embedded rows into the residual stream; later stages receive it.
+            int h = from == 0 ? EmitStreamInput(step, step.Input(hidden, hiddenSize, rows)) : step.Input(hidden, width, rows);
             var positions = new int[rows];
             for (int s = 0; s < n; s++)
                 for (int i = 0; i < step.Counts[s]; i++) positions[step.First[s] + i] = step.Starts[s] + i + step.Slots[s].RopeDelta;
@@ -528,26 +536,26 @@ namespace TensorSharp.Models
             {
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
                     if (request.CaptureLayers[c] == layer)
-                        outputs.Captures[c] = step.Output(h, (long)hiddenSize * rows);
-                int normed = step.RmsNorm(h, LayerName(layer, "attn_norm.weight"));
+                        outputs.Captures[c] = step.Output(h, (long)width * rows);
+                int normed = EmitBlockInput(step, layer, h, BlockSite.Mixer, out int mixContext);
                 int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
-                h = step.Op(GraphOp.Add, h, mix);
-                int ffnIn = step.RmsNorm(h, FfnNormWeight(layer));
+                h = EmitBlockOutput(step, layer, h, BlockSite.Mixer, mixContext, mix);
+                int ffnIn = EmitBlockInput(step, layer, h, BlockSite.Ffn, out int ffnContext);
                 int ffn = _moeLayer[layer] ? EmitMoe(step, layer, ffnIn) : EmitDenseFfn(step, layer, ffnIn);
-                h = step.Op(GraphOp.Add, h, ffn);
+                h = EmitBlockOutput(step, layer, h, BlockSite.Ffn, ffnContext, ffn);
                 step.Boundary(h);
             }
             if (!head)
             {
-                outputs.Hidden = step.Output(h, (long)hiddenSize * rows);
+                outputs.Hidden = step.Output(h, (long)width * rows);
                 return outputs;
             }
             for (int c = 0; c < request.CaptureLayers.Length; c++)
                 if (request.CaptureLayers[c] >= Config.NumLayers)
-                    outputs.Captures[c] = step.Output(h, (long)hiddenSize * rows);
+                    outputs.Captures[c] = step.Output(h, (long)width * rows);
             if (!request.LastRowLogits && !request.AllRowLogits && !request.CaptureFinal) return outputs;
 
-            int final = step.RmsNorm(h, "output_norm.weight");
+            int final = EmitStreamOutput(step, h);
             if (request.CaptureFinal) outputs.Final = step.Output(final, (long)hiddenSize * rows);
             string headName = _quantWeights.ContainsKey("output.weight") || _weights.ContainsKey("output.weight")
                 ? "output.weight" : "token_embd.weight";
@@ -570,6 +578,33 @@ namespace TensorSharp.Models
             }
             return outputs;
         }
+
+        // ---------------------------------------------------------------- the residual stream
+
+        /// <summary>Where a block reads the residual stream.</summary>
+        protected enum BlockSite { Mixer, Ffn }
+
+        /// <summary>The width of the residual stream between layers and stages (several streams of the
+        /// hidden size where a family keeps hyper-connections).</summary>
+        protected virtual int StreamWidth => Config.HiddenSize;
+
+        /// <summary>The residual stream entering the stack from the embedded rows [hidden, rows].</summary>
+        protected virtual int EmitStreamInput(GraphStep step, int embedded) => embedded;
+
+        /// <summary>A block's input [hidden, rows] from the stream; <paramref name="context"/> carries what the
+        /// family's <see cref="EmitBlockOutput"/> needs (-1: nothing). Default: the pre-norm.</summary>
+        protected virtual int EmitBlockInput(GraphStep step, int layer, int stream, BlockSite site, out int context)
+        {
+            context = -1;
+            return step.RmsNorm(stream, site == BlockSite.Mixer ? LayerName(layer, "attn_norm.weight") : FfnNormWeight(layer));
+        }
+
+        /// <summary>The stream after a block's output [hidden, rows] joins it. Default: the residual add.</summary>
+        protected virtual int EmitBlockOutput(GraphStep step, int layer, int stream, BlockSite site, int context, int output)
+            => step.Op(GraphOp.Add, stream, output);
+
+        /// <summary>The head's input [hidden, rows] from the stream. Default: the output norm.</summary>
+        protected virtual int EmitStreamOutput(GraphStep step, int stream) => step.RmsNorm(stream, "output_norm.weight");
 
         private readonly Dictionary<(int Layer, string Suffix), string> _layerNames = new();
 
@@ -689,11 +724,25 @@ namespace TensorSharp.Models
 
         private int EmitDenseFfn(GraphStep step, int layer, int x)
         {
-            int act = _gateUpFused[layer]
-                ? step.Op(GraphOp.Swiglu, step.MatMul(LayerName(layer, "ffn_gate_up.weight"), x))
-                : step.Op(GraphOp.SwigluSplit, step.MatMul(LayerName(layer, "ffn_gate.weight"), x), step.MatMul(LayerName(layer, "ffn_up.weight"), x));
-            return step.MatMul(LayerName(layer, "ffn_down.weight"), act);
+            bool fused = _gateUpFused[layer];
+            string gate = LayerName(layer, fused ? "ffn_gate_up.weight" : "ffn_gate.weight"), up = LayerName(layer, "ffn_up.weight");
+            string down = LayerName(layer, "ffn_down.weight");
+            // Quantized weights without per-tensor scales form a region a backend may run as one feed-forward.
+            bool region = UnscaledQuantized(gate) && UnscaledQuantized(down) && (fused || UnscaledQuantized(up));
+            if (region)
+            {
+                if (fused) step.BeginFused(GraphFusion.SwigluFfn, stackalloc[] { x, step.Weight(gate), step.Weight(down) });
+                else step.BeginFused(GraphFusion.SwigluFfn, stackalloc[] { x, step.Weight(gate), step.Weight(up), step.Weight(down) }, stackalloc long[] { 1 });
+            }
+            int act = fused
+                ? step.Op(GraphOp.Swiglu, step.MatMul(gate, x))
+                : step.Op(GraphOp.SwigluSplit, step.MatMul(gate, x), step.MatMul(up, x));
+            int y = step.MatMul(down, act);
+            if (region) step.EndFused(stackalloc[] { y });
+            return y;
         }
+
+        private bool UnscaledQuantized(string name) => _quantWeights.TryGetValue(name, out QuantizedWeight q) && q.Scale == 1.0f;
 
         private int EmitMoe(GraphStep step, int layer, int x)
         {
@@ -848,6 +897,13 @@ namespace TensorSharp.Models
 
             /// <summary>A layer's output: a point where a lazily building executor may start running.</summary>
             public void Boundary(int node) => _b.Boundary(node);
+
+            /// <summary>The ops up to <see cref="EndFused"/> are a region of <paramref name="kind"/> (see
+            /// <see cref="GraphFusion"/>): an executor with its kernel computes the results in one dispatch.</summary>
+            public void BeginFused(GraphFusion kind, ReadOnlySpan<int> inputs, ReadOnlySpan<long> ip = default, ReadOnlySpan<float> fp = default)
+                => _b.BeginFused(kind, inputs, ip, fp);
+
+            public void EndFused(ReadOnlySpan<int> results) => _b.EndFused(results);
 
             /// <summary>Write <paramref name="node"/>'s result in place inside the state leaf
             /// <paramref name="baseLeaf"/> at <paramref name="offset"/> bytes; where the base is not

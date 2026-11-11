@@ -63,7 +63,8 @@ namespace TensorSharp.Models
             {
                 graph = RunTraced(rows, new[] { active }, new[] { 0 }, new[] { rows }, new[] { startPos },
                     replayable: rows <= SmallChunkRows, snapshots: false, attentionFloor: active.DraftStart,
-                    step => EmitDraftLayer(step, embedded, hidden, wantLogits), out outputs, out owned);
+                    step => EmitDraftLayer(step, embedded, hidden, wantLogits), out outputs, out owned,
+                    shape: wantLogits ? "logits" : "rows");
                 if (graph == null)
                     throw new NotSupportedException(SpeculationRefusal ?? $"{Config.Architecture}: the draft layer cannot run as a graph.");
                 _cacheDeviceDirty = true;

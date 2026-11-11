@@ -85,6 +85,25 @@ namespace TensorSharp.Graph
         /// <summary>x [n, Ne0] (contiguous F32) times the quantized weight's rows: [n, Ne1].</summary>
         protected abstract Tensor QuantizedMatMul(IGraphWeight weight, Tensor x);
 
+        /// <summary>The managed product of a weight's host blocks with host rows (x [rows, Ne0] -> [rows, Ne1]),
+        /// registered by the assembly that holds the managed kernels. A backend without a kernel for a weight's
+        /// format runs it through here, as its per-op path does.</summary>
+        public static Action<IGraphWeight, float[], int, float[]> HostQuantizedProduct { get; set; }
+
+        /// <summary><see cref="HostQuantizedProduct"/> on <paramref name="x"/>'s rows (copied to the host and back).</summary>
+        protected Tensor HostProduct(IGraphWeight weight, Tensor x)
+        {
+            if (HostQuantizedProduct == null || weight.Data == IntPtr.Zero)
+                throw new NotSupportedException($"{GetType().Name} has no product for weight type {weight.Format}, and no host copy to run it on");
+            int rows = (int)x.Sizes[0];
+            float[] input = x.GetElementsAsFloat((int)x.ElementCount());
+            var output = new float[(long)rows * weight.Ne1];
+            HostQuantizedProduct(weight, input, rows, output);
+            var result = new Tensor(Allocator, DType.Float32, rows, weight.Ne1);
+            result.SetElementsAsFloat(output);
+            return result;
+        }
+
         /// <summary>x [n, Ne0] times expert <paramref name="expert"/> of stacked weights: [n, Ne1].</summary>
         protected virtual Tensor ExpertMatMul(IGraphExpertWeights weights, int expert, Tensor x)
             => QuantizedMatMul(weights.Expert(expert), x);
@@ -329,6 +348,9 @@ namespace TensorSharp.Graph
                 }
             }
 
+            /// <summary>The template keeps <paramref name="node"/> to the end (an output, effect or alias reads it).</summary>
+            public bool Pins(int node) => node < Count && Uses[node] >= Forever;
+
             /// <summary>The streamed entry is the template's node (so its counts apply).</summary>
             public bool Matches(int node, in GraphNode e)
             {
@@ -354,7 +376,8 @@ namespace TensorSharp.Graph
         /// </summary>
         private sealed class Session
         {
-            private const byte None = 0, Pending = 1, Deferred = 2, Done = 3;
+            private const byte None = 0, Pending = 1, Deferred = 2, Done = 3, Lazy = 4;   // Lazy: inside a fused region
+            private const int Released = int.MinValue / 2;   // a released node's count (later reads never reach 0)
 
             private readonly TensorGraphExecutor _x;
             private readonly bool[] _dead;
@@ -385,6 +408,9 @@ namespace TensorSharp.Graph
                 (_nodes, _values, _state, _fresh, _own, _uses) = (b.Nodes, b.Values, b.State, b.Fresh, b.Own, b.Uses);
             }
 
+            private GraphNode _region;   // the open fused region this executor has a kernel for (Kind Fused), else default
+            private bool InRegion => _region.Kind == GraphNodeKind.Fused;
+
             public void Entry(int node, in GraphNode e)
             {
                 switch (e.Kind)
@@ -400,6 +426,11 @@ namespace TensorSharp.Graph
                         }
                         if (_dead != null && _dead[node]) return;
                         GraphNode entry = e;
+                        if (e.Kind == GraphNodeKind.Op && InRegion)
+                        {
+                            _state[node] = Lazy;
+                            break;
+                        }
                         if (e.Kind == GraphNodeKind.Leaf)
                         {
                             if (e.Role == GraphLeafRole.Input) _state[node] = Pending;
@@ -411,15 +442,66 @@ namespace TensorSharp.Graph
                         }
                         break;
                     }
-                    case GraphNodeKind.Effect: { int n = e.Node; Attribute(() => Force(n)); break; }
-                    // No in-place results here: the alias's copy into the state runs instead.
-                    case GraphNodeKind.Alias: { int n = e.Srcs[1]; Attribute(() => Force(n)); break; }
-                    case GraphNodeKind.Output: _outputs.Add(e.Node); _outputFloats.Add(e.Bytes); break;
+                    case GraphNodeKind.Effect: { int n = e.Node; Pinned(n); Attribute(() => Force(n)); break; }
+                    // The executor places the result in the leaf if it can, else the alias's copy runs.
+                    case GraphNodeKind.Alias:
+                    {
+                        GraphNode alias = e;
+                        Pinned(e.Node);
+                        Pinned(alias.Srcs[1]);
+                        Attribute(() =>
+                        {
+                            if (!_x.TryAlias(Get(alias.Node), Get(alias.Srcs[0]), alias.Bytes)) Force(alias.Srcs[1]);
+                        });
+                        break;
+                    }
+                    case GraphNodeKind.Output: Pinned(e.Node); _outputs.Add(e.Node); _outputFloats.Add(e.Bytes); break;
                     case GraphNodeKind.Boundary:
                         if (_state[e.Node] == Done) Boundary(e.Node);
                         else _boundaryPending[e.Node] = 0;
                         break;
+                    case GraphNodeKind.Fused:
+                        if (!InRegion && _x.Fuses((GraphFusion)e.Node)) _region = e;
+                        break;
+                    case GraphNodeKind.FusedEnd:
+                        if (InRegion)
+                        {
+                            GraphNode region = _region, end = e;
+                            _region = default;
+                            Attribute(() => RunFused(region, end.Srcs));
+                        }
+                        break;
                 }
+            }
+
+            /// <summary>The region's results from its kernel, else from its ops.</summary>
+            private void RunFused(in GraphNode region, int[] results)
+            {
+                var inputs = new Tensor[region.Srcs.Length];
+                var weights = new IGraphWeight[region.Srcs.Length];
+                for (int i = 0; i < inputs.Length; i++)
+                {
+                    Force(region.Srcs[i]);
+                    if (_values[region.Srcs[i]].Weight is { } weight)
+                    {
+                        weights[i] = weight;
+                        continue;
+                    }
+                    inputs[i] = Get(region.Srcs[i]);
+                    if (!_x.KernelsReadStridedViews && !inputs[i].IsContiguous()) inputs[i] = _x.Contig(inputs[i], Run);
+                }
+                var outs = new Tensor[results.Length];
+                if (_x.TryFused((GraphFusion)region.Node, inputs, weights, region.Ip, region.Fp, outs))
+                {
+                    for (int i = 0; i < results.Length; i++)
+                    {
+                        _state[results[i]] = None;
+                        Set(results[i], new Value { Tensor = Run.Keep(outs[i]) }, fresh: true);
+                    }
+                    return;
+                }
+                foreach (Tensor t in outs) t?.Dispose();
+                foreach (int r in results) Force(r);
             }
 
             public void InputData(int node, IntPtr data, long bytes, object handle)
@@ -487,11 +569,24 @@ namespace TensorSharp.Graph
                 _setDuring.RemoveRange(setMark, _setDuring.Count - setMark);
             }
 
+            /// <summary>An output, effect or alias reads <paramref name="node"/> at the end: a template that did not
+            /// keep it is another step's, so nothing more is released (and a node it already released fails here,
+            /// not as a read of a destroyed tensor).</summary>
+            private void Pinned(int node)
+            {
+                if (!_freeing || _live.Pins(node)) return;
+                _freeing = false;
+                if (_uses[node] < 0)
+                    throw new InvalidOperationException(
+                        $"streamed step diverged from its template: node {node} was released before an output read it");
+            }
+
             /// <summary>Node <paramref name="node"/> has been read once more: release it after its last reader.</summary>
             private void Use(int node)
             {
                 if (!_freeing || node < 0) return;
                 if (--_uses[node] != 0) return;
+                _uses[node] = Released;
                 Tensor t = _own[node];
                 if (t != null)
                 {
@@ -552,6 +647,12 @@ namespace TensorSharp.Graph
 
             private void Force(int node)
             {
+                if (_state[node] == Lazy)
+                {
+                    // A fused region's op or a copy something reads or forces: run it now (its sources first).
+                    _state[node] = None;
+                    Op(node, _nodes[node], forced: true);
+                }
                 switch (_state[node])
                 {
                     case Done: return;
@@ -569,14 +670,30 @@ namespace TensorSharp.Graph
 
             private bool Waiting(int node) => _state[node] == Deferred || (_state[node] == Done && _fresh[node]);
 
-            private void Op(int node, in GraphNode n)
+            private void Op(int node, in GraphNode n, bool forced = false)
             {
                 switch (n.Op)
                 {
+                    // A copy runs when an effect, an alias (whose executor may place the result instead) or a
+                    // reader asks for it, as ggml schedules it: an alias's fallback never runs ahead of the alias.
+                    case GraphOp.Cpy when !forced:
+                        _state[node] = Lazy;
+                        return;
                     case GraphOp.Add when Waiting(n.Srcs[0]) && Waiting(n.Srcs[1]):
                     case GraphOp.RmsNorm when Waiting(n.Srcs[0]):
                         _state[node] = Deferred;
                         return;
+                    // A scaled norm (ggml's l2_norm as the runtime writes it) is a norm weighted by a constant.
+                    case GraphOp.Scale when _state[n.Srcs[0]] == Deferred && _nodes[n.Srcs[0]].Op == GraphOp.RmsNorm
+                        && (n.Fp == null || n.Fp.Length < 2 || n.Fp[1] == 0f):
+                    {
+                        GraphNode norm = _nodes[n.Srcs[0]];
+                        Tensor x = Get(norm.Srcs[0]);
+                        Value scaled = _x.WeightedNorm(x, Eps(norm), _x.Constant(x.Sizes[^1], n.Fp?[0] ?? 1f), Run);
+                        Consumed(n.Srcs[0]);
+                        Set(node, scaled, fresh: true);
+                        return;
+                    }
                     case GraphOp.Mul when _state[n.Srcs[0]] == Deferred && _nodes[n.Srcs[0]].Op == GraphOp.RmsNorm && IsWeightVector(n.Srcs[1]):
                     {
                         GraphNode norm = _nodes[n.Srcs[0]];
@@ -816,6 +933,20 @@ namespace TensorSharp.Graph
 
         /// <summary>sum = a + b and rms_norm(sum) * weight in one kernel (same shapes; the weight a vector
         /// over the rows), both fresh tensors; false where the backend has no such kernel.</summary>
+        /// <summary>Make <paramref name="leaf"/>'s bytes at <paramref name="offsetBytes"/> hold <paramref name="result"/>
+        /// without the alias's copy (the executor shares the result's memory); false runs the copy.</summary>
+        protected virtual bool TryAlias(Tensor result, Tensor leaf, long offsetBytes) => false;
+
+        /// <summary>Whether this executor has a kernel for regions of <paramref name="kind"/> (its sessions then
+        /// defer the region's ops).</summary>
+        protected virtual bool Fuses(GraphFusion kind) => false;
+
+        /// <summary>A fused region's results (<see cref="GraphFusion"/> documents each kind's inputs and results,
+        /// in ggml's extents) from its inputs: a tensor in <paramref name="inputs"/>, or a quantized weight in
+        /// <paramref name="weights"/> at the same index; false (nothing set) where the kernel does not apply,
+        /// and the region's ops run instead.</summary>
+        protected virtual bool TryFused(GraphFusion kind, Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results) => false;
+
         protected virtual bool TryAddWeightedNorm(Tensor a, Tensor b, Tensor weight, float eps, out Tensor sum, out Tensor normed)
         {
             sum = normed = null;
@@ -1199,6 +1330,18 @@ namespace TensorSharp.Graph
         }
 
         /// <summary>rms_norm(x) * weight as one kernel (the weight a vector over x's rows).</summary>
+        private readonly Dictionary<(long, float), Tensor> _constants = new();
+
+        /// <summary>A device vector of <paramref name="length"/> copies of <paramref name="value"/> (kept for the executor's life).</summary>
+        private Tensor Constant(long length, float value)
+        {
+            if (_constants.TryGetValue((length, value), out Tensor t)) return t;
+            t = new Tensor(Allocator, DType.Float32, length);
+            Ops.Fill(t, value);
+            _constants[(length, value)] = t;
+            return t;
+        }
+
         private Value WeightedNorm(Tensor x0, float eps, Tensor weight, RunState run)
         {
             Tensor x = Contig(x0, run);
@@ -1497,6 +1640,13 @@ namespace TensorSharp.Graph
             int dims = (int)n.Ip[0], mode = (int)n.Ip[1], ctx = (int)n.Ip[2];
             float freqBase = n.Fp[0], freqScale = n.Fp[1], extFactor = n.Fp[2], attnFactor = n.Fp[3];
             int[] pos = Ints(positions);
+            // Multi-axis rotary whose axes all carry the same position (every text token) is NeoX rotary at
+            // that position: the device kernel, not the host loop below (which reads and writes the rows).
+            if (multi && extFactor == 0f && pos.Length >= 3 * tokens && SameAxes(pos, tokens, n.Ip.Length > 6 && n.Ip[6] > 0 ? 4 : 3))
+            {
+                multi = false;
+                mode = 2;   // GGML_ROPE_TYPE_NEOX
+            }
             if (!multi)
             {
                 if (!run.RowPositions.TryGetValue((positionsNode, heads), out Tensor p) || positionsNode < 0)
@@ -1546,6 +1696,14 @@ namespace TensorSharp.Graph
             }
             result.SetElementsAsFloat(v);
             return result;
+        }
+
+        private static bool SameAxes(int[] pos, int tokens, int axes)
+        {
+            for (int a = 1; a < axes; a++)
+                for (int t = 0; t < tokens; t++)
+                    if (pos[a * tokens + t] != pos[t]) return false;
+            return true;
         }
 
         /// <summary>The host gated delta rule (ggml-cpu's loop).</summary>
