@@ -68,7 +68,9 @@ __device__ __forceinline__ float warp_sum(float v)
 }
 
 // One warp per (token, head); D/32 elements per lane. smem holds the normalized head
-// so the rotate-half partner (d +- rot/2) can be read across lanes.
+// so the rotate-half partner (d +- rot/2) can be read across lanes. S counts every
+// token of the call; with several independent sequences of rope_seq tokens each (a
+// batch of VAE tiles) token s takes the rotation of its position s % rope_seq.
 template <int D>
 __global__ void attn_prep(const float* __restrict__ q, long long q_sh, long long q_ss,
                           const float* __restrict__ k, long long k_sh, long long k_ss,
@@ -76,7 +78,7 @@ __global__ void attn_prep(const float* __restrict__ q, long long q_sh, long long
                           const float* __restrict__ qb, const float* __restrict__ kb, const float* __restrict__ vb,
                           long long bias_hs, const float* __restrict__ qn, const float* __restrict__ kn,
                           const float* __restrict__ cosT, const float* __restrict__ ssinT, int rot,
-                          float eps, float vInv, int H, int S,
+                          float eps, float vInv, int H, int S, int rope_seq,
                           __half* __restrict__ q16, __half* __restrict__ k16, __half* __restrict__ v16,
                           const uint32_t* __restrict__ rowpeak, const uint32_t* __restrict__ tokpeak,
                           long long q_off, long long k_off, long long v_off)
@@ -90,7 +92,9 @@ __global__ void attn_prep(const float* __restrict__ q, long long q_sh, long long
     const int h = (int) (pair - s * H);
     const long long outBase = ((long long) h * S + s) * D;
     const int half = rot / 2;
+    const long long pos = rope_seq > 0 && rope_seq < S ? s % rope_seq : s;
     // With peaks, q, k and v are int32 sums; *_off is the product row q, k or v starts at.
+    // The peaks are per token of the call, whichever sequence it belongs to.
     const float sx = tokpeak != nullptr ? tsg_int8_token_scale(tokpeak[s]) : 0.0f;
 
     for (int which = 0; which < 2; which++)
@@ -128,7 +132,7 @@ __global__ void attn_prep(const float* __restrict__ q, long long q_sh, long long
             if (d < rot)
             {
                 const float partner = smem[warp][d < half ? d + half : d - half];
-                o = __fadd_rn(__fmul_rn(x[j], cosT[s * rot + d]), __fmul_rn(partner, ssinT[s * rot + d]));
+                o = __fadd_rn(__fmul_rn(x[j], cosT[pos * rot + d]), __fmul_rn(partner, ssinT[pos * rot + d]));
             }
             dst[outBase + d] = __float2half_rn(o);
         }
@@ -260,13 +264,15 @@ extern "C" {
 int tsg_h3_fused_max_segments(void) { return kMaxSegments; }
 
 // Strides are in floats: *_sh between heads, *_ss between tokens. qn/kn may be null.
+// seq is every token of the call; rope_seq (0 = seq) is the length of each of the
+// independent sequences they make up, which the rotation tables cover.
 // With rowpeak and tokpeak, q, k and v are views of one product still held as int32
 // sums, starting at its rows q_off, k_off and v_off (tsg_cuda_int8_scale.h).
 bool tsg_h3_attn_prep(const float* q, int64_t q_sh, int64_t q_ss, const float* k, int64_t k_sh, int64_t k_ss,
                       const float* v, int64_t v_sh, int64_t v_ss, const float* qb, const float* kb, const float* vb,
                       int64_t bias_hs, const float* qn, const float* kn,
                       const float* cosT, const float* ssinT, int rot, float eps, float vInv,
-                      int heads, int seq, int head_dim, void* q16, void* k16, void* v16,
+                      int heads, int seq, int rope_seq, int head_dim, void* q16, void* k16, void* v16,
                       const uint32_t* rowpeak, const uint32_t* tokpeak, int64_t q_off, int64_t k_off, int64_t v_off)
 {
     const long long pairs = (long long) seq * heads;
@@ -276,13 +282,13 @@ bool tsg_h3_attn_prep(const float* q, int64_t q_sh, int64_t q_ss, const float* k
     case 64:
         attn_prep<64><<<blocks, 128>>>(q, q_sh, q_ss, k, k_sh, k_ss, v, v_sh, v_ss, qb, kb, vb, bias_hs > 0 ? bias_hs : 64,
                                        qn, kn, cosT, ssinT, rot, eps, vInv,
-                                       heads, seq, (__half*) q16, (__half*) k16, (__half*) v16,
+                                       heads, seq, rope_seq, (__half*) q16, (__half*) k16, (__half*) v16,
                                        rowpeak, tokpeak, q_off, k_off, v_off);
         break;
     case 128:
         attn_prep<128><<<blocks, 128>>>(q, q_sh, q_ss, k, k_sh, k_ss, v, v_sh, v_ss, qb, kb, vb, bias_hs > 0 ? bias_hs : 128,
                                         qn, kn, cosT, ssinT, rot, eps, vInv,
-                                        heads, seq, (__half*) q16, (__half*) k16, (__half*) v16,
+                                        heads, seq, rope_seq, (__half*) q16, (__half*) k16, (__half*) v16,
                                         rowpeak, tokpeak, q_off, k_off, v_off);
         break;
     default:

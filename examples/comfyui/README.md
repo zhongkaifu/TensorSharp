@@ -52,7 +52,7 @@ cannot install this one. The nodes appear under **TensorSharp** in the node libr
 |---|---|
 | **TensorSharp Server** | Names the server (`url`) and a launch `profile`. With a profile, it starts a server for that profile on the URL's port, or reuses one already hosting its model. A server it started for another profile is stopped first. Without a profile, it connects to a server that is already running |
 | **TensorSharp Video** | Makes one clip from text, a first frame (`first_frame`), a last frame (`last_frame`) or reference pictures (`reference_images`, one per picture of the batch). It outputs the `video` (an MP4 with sound, saved under `output/tensorsharp/`), its `last_frame` for chaining the next clip, the `audio` and the file `path` |
-| **TensorSharp Image** | Generates a picture, or edits the connected pictures (`images`, each picture of the batch one reference). It shows the server's denoising previews on the node |
+| **TensorSharp Image** | Generates a picture, or edits the connected pictures (`images`, each picture of the batch one reference). It shows the server's denoising previews on the node, and the finished picture reduced to at most 1024 pixels on its long side (the `image` output stays full size) |
 | **TensorSharp Stop Server** | Stops the server this ComfyUI started once the value it receives (a clip, a picture, anything) exists, and passes that value on, so later nodes get the GPU memory back. The next TensorSharp node starts it again |
 
 A setting left at zero is decided by the hosted model, its preset or its LoRA plug-in.
@@ -86,6 +86,8 @@ that is not set is an error, not an empty string.
 | `ltx25-distilled` | [`config/ltx-2.5-distilled.json`](../../config/ltx-2.5-distilled.json) on `ggml_cuda` |
 | `minimax-h3` | [`config/minimax-h3-fl2va.json`](../../config/minimax-h3-fl2va.json) on `ggml_cuda`, 20 steps |
 | `minimax-h3-turbo` | The same with the eight-step Turbo plug-in ([`config/lora/minimax-h3-fl2v-turbo-8step.json`](../../config/lora/minimax-h3-fl2v-turbo-8step.json)) |
+| `minimax-h3-image` | [`config/minimax-h3-image.json`](../../config/minimax-h3-image.json) on `ggml_cuda`, for the **TensorSharp Image** node (six steps, 2048x2048 unless the node sets a size) |
+| `minimax-h3-image-int8` | The same with `TS_H3_INT8_MATMUL=1`: int8 projections, ComfyUI's INT8 template's precision class and speed |
 | `qwen-image-2.1` | [`config/qwen-image-2.1.json`](../../config/qwen-image-2.1.json) on `ggml_cuda` |
 | `qwen-image-2.1-turbo` | [`config/qwen-image-2.1-turbo.json`](../../config/qwen-image-2.1-turbo.json) on `ggml_cuda` |
 

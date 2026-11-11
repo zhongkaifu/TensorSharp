@@ -342,8 +342,8 @@ bool build_plan(SdpaState& s, Plan& p, const int64_t qd[4], const int64_t qs[4],
             p.plan = std::move(plan);
             p.workspace = ws;
             if (verbose())
-                std::fprintf(stderr, "[cudnn-sdpa] plan for H=%lld Sq=%lld Skv=%lld D=%lld: config %lld of %lld (heuristic %d), workspace %lld bytes\n",
-                    (long long) qd[1], (long long) qd[2], (long long) kd[2], (long long) qd[3],
+                std::fprintf(stderr, "[cudnn-sdpa] plan for B=%lld H=%lld Sq=%lld Skv=%lld D=%lld: config %lld of %lld (heuristic %d), workspace %lld bytes\n",
+                    (long long) qd[0], (long long) qd[1], (long long) qd[2], (long long) kd[2], (long long) qd[3],
                     (long long) i, (long long) got, (int) mode, (long long) ws);
             return true;
         }
@@ -405,6 +405,30 @@ Plan* find_plan(SdpaState& s, int64_t H, int64_t Sq, int64_t Skv, int64_t D,
     return it->second.ok ? &it->second : nullptr;
 }
 
+// The plan for B independent sequences of S tokens each, held one after another:
+// Q, K and V as tsg_h3_attn_prep writes them, [H, B*S, D] (a sequence's tokens
+// contiguous within its head), and the result in ggml's [D, H, B*S]. B = 1 is
+// find_plan's layout for the same shape.
+Plan* find_plan_batched(SdpaState& s, int64_t B, int64_t H, int64_t S, int64_t D)
+{
+    if (B <= 1) return find_plan(s, H, S, S, D, D, S * D, D, S * D);
+    const int64_t d4[4] = { B, H, S, D };
+    const int64_t in[4] = { S * D, B * S * D, D, 1 };
+    const int64_t os[4] = { S * H * D, D, H * D, 1 };
+    const PlanKey key { H, S, S, D, D, B * S * D, D, B * S * D, B, 0, 0, 0 };
+    auto it = s.plans.find(key);
+    if (it == s.plans.end())
+    {
+        Plan p;
+        p.ok = build_plan(s, p, d4, in, d4, in, d4, in, d4, os);
+        if (!p.ok && verbose())
+            std::fprintf(stderr, "[cudnn-sdpa] no engine for B=%lld H=%lld S=%lld D=%lld; the sequences run one at a time\n",
+                (long long) B, (long long) H, (long long) S, (long long) D);
+        it = s.plans.emplace(key, std::move(p)).first;
+    }
+    return it->second.ok ? &it->second : nullptr;
+}
+
 bool execute_plan(SdpaState& s, Plan& p, const void* q16, const void* k, const void* v, void* o16, float scale)
 {
     void* ws = nullptr;
@@ -428,7 +452,7 @@ extern "C" bool tsg_h3_attn_prep(const float* q, int64_t q_sh, int64_t q_ss, con
                                  const float* v, int64_t v_sh, int64_t v_ss, const float* qb, const float* kb,
                                  const float* vb, int64_t bias_hs, const float* qn, const float* kn,
                                  const float* cosT, const float* ssinT, int rot, float eps, float vInv,
-                                 int heads, int seq, int head_dim, void* q16, void* k16, void* v16,
+                                 int heads, int seq, int rope_seq, int head_dim, void* q16, void* k16, void* v16,
                                  const uint32_t* rowpeak, const uint32_t* tokpeak, int64_t q_off, int64_t k_off,
                                  int64_t v_off);
 extern "C" bool tsg_h3_widen_scaled(const void* src16, float* dst, int64_t n, float scale);
@@ -457,6 +481,16 @@ bool tsg_cudnn_sdpa_prepare(int64_t heads, int64_t seq, int64_t head_dim)
     std::lock_guard<std::mutex> lock(s.mu);
     if (!ensure_handle(s)) return false;
     return find_plan(s, heads, seq, seq, head_dim, head_dim, seq * head_dim, head_dim, seq * head_dim) != nullptr;
+}
+
+// tsg_cudnn_sdpa_prepare for `batch` independent sequences of `seq` tokens in one call
+// (tsg_cudnn_h3_attention with that batch).
+bool tsg_cudnn_sdpa_prepare_batched(int64_t heads, int64_t seq, int64_t head_dim, int64_t batch)
+{
+    SdpaState& s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (!ensure_handle(s)) return false;
+    return find_plan_batched(s, batch, heads, seq, head_dim) != nullptr;
 }
 
 // O = softmax(scale * Q K^T) V over one batch, without a mask.
@@ -521,6 +555,10 @@ bool tsg_cudnn_sdpa_f32_strided(const float* q, int64_t q_stride_s, int64_t q_st
 // widened to F32 [D*H, S] times the power-of-two V scale. q/k/v are F32 [D, H, S]
 // views with head and token strides in floats. Synchronizes.
 //
+// With batch > 1 the S tokens are `batch` independent sequences of S / batch tokens
+// (a row of VAE tiles), each attending only within itself and rotated by its own
+// positions (cosT/ssinT cover one sequence); one cuDNN call computes them all.
+//
 // A build with FlashAttention (TSG_HAVE_FLASH_ATTN) runs the product on its kernel where
 // it has one for the shape, and on cuDNN's engine otherwise. The plan is still required,
 // so the graph's choice of this node does not depend on which of the two runs.
@@ -531,16 +569,17 @@ bool tsg_cudnn_h3_attention(const float* q, int64_t q_sh, int64_t q_ss, const fl
                             const float* v, int64_t v_sh, int64_t v_ss, const float* qb, const float* kb,
                             const float* vb, int64_t bias_hs, const float* qn, const float* kn,
                             const float* cosT, const float* ssinT, int rot, float eps, float vScale, float scale,
-                            int heads, int seq, int head_dim, float* out, const uint32_t* rowpeak,
+                            int heads, int seq, int head_dim, int batch, float* out, const uint32_t* rowpeak,
                             const uint32_t* tokpeak, int64_t q_off, int64_t k_off, int64_t v_off)
 {
     SdpaState& s = state();
     std::lock_guard<std::mutex> lock(s.mu);
     if (!ensure_handle(s)) return false;
-    const int64_t D = head_dim, S = seq;
-    Plan* p = find_plan(s, heads, S, S, D, D, S * D, D, S * D);
+    if (batch < 1 || seq % batch != 0) return false;
+    const int64_t D = head_dim, S = seq / batch;
+    Plan* p = find_plan_batched(s, batch, heads, S, D);
     if (p == nullptr) return false;
-    const long long n = (long long) heads * S * D;
+    const long long n = (long long) heads * seq * D;
     const std::size_t pad = ((std::size_t) n * sizeof(__half) + 255) / 256 * 256;
     if (ensure_buffer(s.scratch, s.scratchBytes, 4 * pad) == nullptr) return false;
     char* base = static_cast<char*>(s.scratch);
@@ -550,12 +589,13 @@ bool tsg_cudnn_h3_attention(const float* q, int64_t q_sh, int64_t q_ss, const fl
     void* o16 = base + 3 * pad;
     tsg_stage::Clock clock;
     if (!tsg_h3_attn_prep(q, q_sh, q_ss, k, k_sh, k_ss, v, v_sh, v_ss, qb, kb, vb, bias_hs, qn, kn, cosT, ssinT, rot, eps,
-                          1.0f / vScale, heads, seq, head_dim, q16, k16, v16, rowpeak, tokpeak, q_off, k_off, v_off))
+                          1.0f / vScale, heads, seq, (int) S, head_dim, q16, k16, v16, rowpeak, tokpeak, q_off, k_off,
+                          v_off))
         return false;
     clock.lap("attention prep");
     bool flash = false;
 #if defined(TSG_HAVE_FLASH_ATTN)
-    flash = tsg_flash_attn_h3(q16, k16, v16, o16, heads, S, D, scale);
+    if (batch == 1) flash = tsg_flash_attn_h3(q16, k16, v16, o16, heads, S, D, scale);
 #endif
     if (!flash && !execute_plan(s, *p, q16, k16, v16, o16, scale)) return false;
     clock.lap(flash ? "attention flash" : "attention sdpa");

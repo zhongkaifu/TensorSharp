@@ -75,10 +75,23 @@ def _png(image: torch.Tensor) -> bytes:
     return buffer.getvalue()
 
 
-def _image_tensor(path: str) -> torch.Tensor:
+# The node's own preview is at most this many pixels on its long side. ComfyUI writes a
+# preview as a full PNG (compress level 1): 1.1 s for one 4096x4096 picture, more than
+# the decode, where 1024 pixels takes about 0.1 s. The node's output stays full size.
+PREVIEW_MAX_SIDE = 1024
+
+
+def _image_and_preview(path: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """The picture at `path` as a ComfyUI image, and a copy reduced for the node's preview
+    (the picture itself when it is small already)."""
     with Image.open(path) as img:
-        array = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-    return torch.from_numpy(array)[None, ...]
+        rgb = img.convert("RGB")
+    image = torch.from_numpy(np.asarray(rgb, dtype=np.float32) / 255.0)[None, ...]
+    factor = -(-max(rgb.size) // PREVIEW_MAX_SIDE)   # ceiling division
+    if factor <= 1:
+        return image, image
+    small = rgb.reduce(factor)                       # box filter over factor x factor blocks
+    return image, torch.from_numpy(np.asarray(small, dtype=np.float32) / 255.0)[None, ...]
 
 
 def _wav_audio(path: str) -> dict | None:
@@ -271,8 +284,8 @@ class TensorSharpImage(io.ComfyNode):
             inputs=[
                 ServerType.Input("server"),
                 io.String.Input("prompt", multiline=True, default=""),
-                io.Int.Input("width", default=0, min=0, max=4096, step=32, tooltip="0: the model's default."),
-                io.Int.Input("height", default=0, min=0, max=4096, step=32, tooltip="0: the model's default."),
+                io.Int.Input("width", default=0, min=0, max=8192, step=32, tooltip="0: the model's default (MiniMax-H3-Image: 2048, up to about 16 MP such as 6272x2688)."),
+                io.Int.Input("height", default=0, min=0, max=8192, step=32, tooltip="0: the model's default."),
                 io.Int.Input("steps", default=0, min=0, max=200, tooltip="0: 40 steps, or the LoRA plug-in's recipe."),
                 io.Float.Input("cfg", default=0.0, min=0.0, max=30.0, step=0.1, tooltip="0: the model's default."),
                 _seed_input(),
@@ -300,8 +313,8 @@ class TensorSharpImage(io.ComfyNode):
             result = await _stream_with_progress(client, route, body, steps or 40)
             path = os.path.join(folder_paths.get_temp_directory(), "tensorsharp", os.path.basename(result["url"]))
             await client.download(result["url"], path)
-        image = _image_tensor(path)
-        return io.NodeOutput(image, ui=ui.PreviewImage(image, cls=cls))
+        image, preview = _image_and_preview(path)
+        return io.NodeOutput(image, ui=ui.PreviewImage(preview, cls=cls))
 
 
 class TensorSharpStopServer(io.ComfyNode):

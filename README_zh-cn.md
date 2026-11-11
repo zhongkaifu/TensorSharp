@@ -19,7 +19,7 @@
 
 - **本地模型，多种入口。** 同一引擎用于 CLI、浏览器聊天及兼容 Ollama/OpenAI 的 API，支持纯托管 CPU 与原生加速后端。
 - **文本与多模态模型。** 支持稠密与 MoE GGUF 模型、推理、图像 / 音频输入和文档问答。各模型家族的能力见[支持的模型](docs/supported_models_zh-cn.md)。
-- **嵌入与媒体生成。** [EmbeddingGemma 2](docs/embeddings_zh-cn.md) 提供文本 / 代码嵌入及可选的图像、音频和视频输入；[Qwen-Image-2.1 与 Turbo](docs/models/qwenimage21_zh-cn.md) 支持图像生成与蒙版编辑；[LTX 2.5 Distilled](docs/models/ltx-2.5_zh-cn.md)（48 kHz）与 [MiniMax-H3](docs/models/minimax-h3_zh-cn.md)（32 kHz）支持视频与立体声音频联合生成。
+- **嵌入与媒体生成。** [EmbeddingGemma 2](docs/embeddings_zh-cn.md) 提供文本 / 代码嵌入及可选的图像、音频和视频输入；[Qwen-Image-2.1 与 Turbo](docs/models/qwenimage21_zh-cn.md) 支持图像生成与蒙版编辑；[MiniMax-H3-Image](docs/models/minimax-h3-image_zh-cn.md)支持最高约 16 MP 的文生图；[LTX 2.5 Distilled](docs/models/ltx-2.5_zh-cn.md)（48 kHz）与 [MiniMax-H3](docs/models/minimax-h3_zh-cn.md)（32 kHz）支持视频与立体声音频联合生成。
 - **高效服务。** 连续批处理与分页、Radix 前缀共享 KV 缓存默认开启；支持的模型还可使用投机解码与多 GPU 放置。详见[功能说明](FEATURES_zh-cn.md)。
 - **可选的 OpenTelemetry 遥测。** 服务端与 CLI 可以导出聊天、嵌入、工具调用、模型加载、图像与视频生成以及 Video Studio 任务的 trace、指标和日志，通过 OTLP 发送，或直接发往 Azure Application Insights。默认关闭；除非显式开启，提示词与输出都不会进入导出数据。详见[遥测](USAGE_zh-cn.md#遥测opentelemetry)与[现成的后端示例](examples/opentelemetry/README.md)（英文）。
 - **Agent Skills 与代码工具。** `TensorSharp.AgentHost` 提供文件、shell 和文档工作流。[17 个随附技能](docs/agent_skills.md)（英文）涵盖研究、文档、TDD、设计访谈与交接；开启联网后，`find-skills` 可搜索、检查并安装更多技能。服务端与 TensorAgent 聊天还支持[有界子智能体委派](docs/multi_agent.md)（英文），子智能体拥有私有工作区并默认只读。
@@ -101,7 +101,7 @@ dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNat
 
 - **文本、推理与多模态 LLM：** [DeepSeek V4 Flash](docs/models/deepseek4_zh-cn.md) / [V4.1 Flash](docs/models/deepseek41_zh-cn.md)、[GLM 5.x](docs/models/glm_zh-cn.md)、[Gemma 4](docs/models/gemma4_zh-cn.md)、[Qwen 3.5 / 3.6 / 3.8 27B](docs/models/qwen35_zh-cn.md)、[Qwen 3.8 Flash Next](docs/models/qwen38-flash-next_zh-cn.md)、[Bonsai2](docs/models/bonsai2_zh-cn.md)（Qwen 家族）、[GPT OSS](docs/models/gptoss_zh-cn.md)、[Nemotron-H](docs/models/nemotron_zh-cn.md)、[Mistral 3](docs/models/mistral3_zh-cn.md)、[Hunyuan Dense](docs/models/hunyuan-dense_zh-cn.md)、[Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md)、[Muse Spark](docs/models/muse-spark_zh-cn.md)（816B MoE，多 GPU）与 [MiniMax-M3.1-Flash](docs/models/minimax-m3_zh-cn.md)（428B MoE，多 GPU）。
 - **文本扩散：** [DiffusionGemma](docs/models/diffusiongemma_zh-cn.md)，包含 `/v1/systemone` 上的 [Jev 类型化判定](docs/models/jev_zh-cn.md)（支持文本、图像、上传文档、抽样视频帧，以及通过已配置 ASR 配套服务得到的语音转录）。
-- **图像生成/编辑与视频生成：** [Qwen-Image-2.1](docs/models/qwenimage21_zh-cn.md)、[LTX 2.5 Distilled（视频 + 48 kHz 立体声音频）](docs/models/ltx-2.5_zh-cn.md)、[MiniMax-H3（视频 + 立体声音频）](docs/models/minimax-h3_zh-cn.md) 与 [Wan 2.1 / 2.2](docs/models/wan_zh-cn.md)。
+- **图像生成/编辑与视频生成：** [Qwen-Image-2.1](docs/models/qwenimage21_zh-cn.md)、[MiniMax-H3-Image](docs/models/minimax-h3-image_zh-cn.md)、[LTX 2.5 Distilled（视频 + 48 kHz 立体声音频）](docs/models/ltx-2.5_zh-cn.md)、[MiniMax-H3（视频 + 立体声音频）](docs/models/minimax-h3_zh-cn.md) 与 [Wan 2.1 / 2.2](docs/models/wan_zh-cn.md)。
 - **嵌入：** [EmbeddingGemma 2](docs/embeddings_zh-cn.md)，包括文本 / 代码及可选的图像、音频、视频输入；以及 Snowflake Arctic Embed L v2.0、all-MiniLM-L6-v2 等 BERT / XLM-R 编码器。
 
 各模型的后端、模态、功能支持与验证覆盖范围不同，详见[支持的模型](docs/supported_models_zh-cn.md)各表、[模型卡片](docs/models/README_zh-cn.md)及[嵌入指南](docs/embeddings_zh-cn.md)。
