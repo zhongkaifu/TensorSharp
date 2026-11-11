@@ -897,7 +897,7 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 | `TS_MAMBA2_PREFILL_CACHE_MB` | Nemotron-H：缓存的原生 Mamba2 prefill 计算图可占用的设备内存（MiB，按最近最少使用淘汰，默认 1024）。大于预算的计算图只服务当次调用，随后释放。 |
 | `TS_MLX_MLOCK_GGUF` | 默认 `1`，通过 `mlock(2)` 把 GGUF mmap 区域钉在物理内存，避免前向之间被换出。设为 `0` 关闭（适用于进程 `memlock` rlimit 太低、或希望让 OS 自行管理分页的情况）。仅 MLX 后端。 |
 | `TS_MLX_BATCHED_MOE_DECODE` | 默认 `1`，将 Qwen 3.5/3.6 MoE 解码时每专家的 K 次 dispatch 合并为每种（gate / up / down）一次批处理 dispatch。在显存紧张的机器上可设为 `0` 关闭（可节省堆叠权重 slab 带来的近一倍权重显存占用）。 |
-| `TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB` | 覆盖 MLX 分配器硬上限 / 空闲缓冲池上限 / wired 缓冲上限（兆字节）。默认值会根据宿主机统一内存大小派生。 |
+| `TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB` | 覆盖 MLX 分配器硬上限 / 空闲缓冲池上限 / wired 缓冲上限（兆字节）。分配器上限和 wired 上限默认为内存的 70%，并至少给 macOS 留出 min(8 GiB, 内存的四分之一)：wired 内存不会被换出，上限接近内存总量时 Mac 会卡死而不是让分配失败。空闲缓冲池上限默认 2048。 |
 | `TS_MLX_EVAL_EVERY_N_LAYERS` | 解码时定期触发 `mlx_async_eval` 的层间隔，用于让 GPU 计算和宿主端排队重叠。每个 MLX 模型有自己的默认值（Gemma 4 与 Muse-Glimmer 每 4 层，Qwen 3.5 与 Nemotron-H 每 16 层）；该变量为所有模型统一设置。支持处可设为 `0` 关闭。 |
 | `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` | 覆盖 `--backend mlx` 时 `libmlxc` 的搜索路径。 |
 

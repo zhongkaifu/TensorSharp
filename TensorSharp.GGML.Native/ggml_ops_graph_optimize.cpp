@@ -9,18 +9,43 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(TSG_GGML_USE_METAL)
+#include "ggml-metal/ggml-metal-fusion.h"
+#endif
+
+namespace {
+    using Dependencies = std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>>;
+
+    void add_dependency(void * data, ggml_tensor * tensor, ggml_tensor * until) {
+        if (!tensor || !until) throw std::runtime_error("Backend optimizer requested a null allocation dependency");
+        auto & keep = (*static_cast<Dependencies *>(data))[until];
+        if (std::find(keep.begin(), keep.end(), tensor) == keep.end()) keep.push_back(tensor);
+    }
+
+    void insert_dependencies(ggml_context * ctx, ggml_cgraph * graph, const Dependencies & dependencies);
+}
+
 void tsg_optimize_graph_with_alloc_dependencies(ggml_backend_t backend, ggml_context * ctx, ggml_cgraph * graph) {
     if (!backend || !graph || !backend->iface.graph_optimize) return;
-    std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> dependencies;
-    ggml_backend_graph_optimize_params params = {
-        [](void * data, ggml_tensor * tensor, ggml_tensor * until) {
-            if (!tensor || !until) throw std::runtime_error("Backend optimizer requested a null allocation dependency");
-            auto & map = *static_cast<decltype(dependencies) *>(data);
-            auto & keep = map[until];
-            if (std::find(keep.begin(), keep.end(), tensor) == keep.end()) keep.push_back(tensor);
-        }, &dependencies
-    };
+    Dependencies dependencies;
+    ggml_backend_graph_optimize_params params = { add_dependency, &dependencies };
     backend->iface.graph_optimize(backend, graph, &params);
+    insert_dependencies(ctx, graph, dependencies);
+}
+
+void tsg_add_metal_fusion_alloc_dependencies(ggml_context * ctx, ggml_cgraph * graph) {
+#if defined(TSG_GGML_USE_METAL)
+    if (!graph) return;
+    Dependencies dependencies;
+    ggml_metal_fusion_add_alloc_deps(&dependencies, add_dependency, graph);
+    insert_dependencies(ctx, graph, dependencies);
+#else
+    (void)ctx; (void)graph;
+#endif
+}
+
+namespace {
+void insert_dependencies(ggml_context * ctx, ggml_cgraph * graph, const Dependencies & dependencies) {
     if (dependencies.empty()) return;
 
     std::unordered_set<ggml_tensor *> nodes(graph->nodes, graph->nodes + graph->n_nodes);
@@ -63,4 +88,5 @@ void tsg_optimize_graph_with_alloc_dependencies(ggml_backend_t backend, ggml_con
             graph->nodes[graph->n_nodes++] = dep;
         }
     }
+}
 }

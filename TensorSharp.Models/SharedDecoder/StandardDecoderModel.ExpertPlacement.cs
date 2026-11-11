@@ -77,7 +77,14 @@ namespace TensorSharp.Models
             // The caches and float weights were filled on the host; their first device bindings are still to come.
             long pending = checked(CacheBytes() + _pendingDraftBytes);
             foreach (var weight in _weights.Values) pending = checked(pending + weight.Storage.ByteLength);
-            int resident = PlanCudaDeviceExpertLayers(layerBytes, pending, free, GpuMemoryBudget.ResolveHeadroomBytes(total), 0);
+            long headroom = GpuMemoryBudget.ResolveHeadroomBytes(total), allExperts = 0;
+            foreach (long b in layerBytes) allExperts += b;
+            // Experts that fit beside everything else stay whole on the device: the plan's scratch reserve is Flash Next's
+            // prompt arena, and on a 24 GB slice it offloaded 5 of Qwen3.6-35B-A3B's 40 layers that run whole there
+            // (decode 73.6 against 85.9 tok/s on an RTX PRO 6000 MIG slice).
+            if (allExperts + pending + headroom <= free)
+                return;
+            int resident = PlanCudaDeviceExpertLayers(layerBytes, pending, free, headroom, 0);
             if (resident >= n)
                 return;
             long vram = 0;
@@ -103,6 +110,14 @@ namespace TensorSharp.Models
                 experts[l] = _moeLayer[l] ? LayerExpertBytes(l) : 0;
             long other = AcceleratorBoundNonExpertBytes() + CacheBytes() + _pendingDraftBytes;
             long deviceExpertBytes = workingSet - Math.Max(GpuMemoryBudget.MinHeadroomBytes, workingSet / 16) - other - DeviceScratchBytes;
+            // A model whose experts fit the working set and the 65% of the RAM a load may wire stays whole on the
+            // accelerator: what macOS reports it can give is a moment's reading (just after another load it was 10.2 GB
+            // of 51.5, the file's own pages still cached), and a fitting model offloaded on it decoded at a third of
+            // the speed and computed its experts on the host (Qwen3.6-35B-A3B, 22 GB, M5 Pro).
+            long allExperts = 0;
+            foreach (long e in experts) allExperts += e;
+            if (allExperts <= Math.Min(deviceExpertBytes, ram / 100 * 65 - other - DeviceScratchBytes))
+                return;
             // Within what macOS can give without compressing, less max(7 GB, 15% of the RAM) for itself, and within 65%
             // of the RAM wired in all.
             long available = GgmlBasicOps.HostAvailableMemoryBytes();

@@ -24,6 +24,7 @@
 // Upstream ggml is used unchanged; everything here is TensorSharp-owned.
 
 #include "ggml_ops_internal.h"
+#include "ggml_ops_graph_optimize.h"
 #include "ggml_ops_transformer_common.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
@@ -591,6 +592,10 @@ namespace
         // Before allocation: reordering after lifetime planning would invalidate the alias plan (and a
         // reorder would move nodes across a pause).
         if (g->reorder && g->host_moe.empty()) optimize_graph_for_metal(g->ctx, g->graph);
+        // Otherwise ggml-metal still fuses the graph's chains when it encodes them, and runs independent neighbours
+        // concurrently: without the fusions' allocation dependencies the allocator hands a fused kernel's input to a
+        // concurrent node (Qwen3.6-35B-A3B decoded two different texts in alternate runs on an M5 Pro).
+        else if (g_backend_type == BACKEND_TYPE_METAL) tsg_add_metal_fusion_alloc_dependencies(g->ctx, g->graph);
 
         if (g->tp != nullptr)
         {
