@@ -794,6 +794,17 @@ Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
   Every family's dense FFN is a third kind, `SwigluFfn` (unscaled quantized weights): MLX runs a prompt
   chunk's three products with F16 activations between them, as the old fused prefill FFN did (the per-op
   F32 round trips cost Qwen3.5-0.8B's prompt 9 ms per 1,024 rows); decode rows run the ops.
+  A softmax-gated MoE layer's routed experts are a fourth kind, `RoutedExperts` (x, the router logits and
+  the three expert stacks in; the weighted sum out). The interpreter's ops sorted the logits on the host
+  through a delegate, summed the weights through MLX's CPU fallback (a second sync per layer), regrouped
+  the rows for each of the three products and added the K outputs one view at a time. On MLX a decode row
+  now keeps the top-K on the device when every projection has a batched kernel (IQ2_XXS). Otherwise one
+  read of the logits routes it, gate and up run as one batched kernel where they can, and the down
+  projections run per expert. A prompt chunk or verify window routes all rows with one read, runs each
+  expert used once over its rows, and sums with one batched product. Qwen3.6-35B-A3B UD-IQ2_XXS (down
+  projections IQ3_S / IQ2_S) on an M5 Pro, runtime / `Qwen35Model`: decode 35.4-36.9 / 28.7-33.2 tok/s
+  (22.7 before), 55-token TTFT 339-367 / 413-452 ms, 1,825-token prompt 1.70 / 16.07 s (same text),
+  perplexity 14.7301 / 14.7150.
 * **Copies run when forced:** a `Cpy` runs when an effect, an alias or a reader asks for it, as ggml
   schedules it. A streamed step used to run each copy as it was emitted, so an alias's fallback copy ran
   ahead of the alias the executor could have honoured.

@@ -60,13 +60,15 @@ namespace TensorSharp.MLX
             return r;
         }
 
-        protected override bool Fuses(GraphFusion kind) => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SwigluFfn;
+        protected override bool Fuses(GraphFusion kind)
+            => kind is GraphFusion.DeltaNetPrep or GraphFusion.GatedRmsNorm or GraphFusion.SwigluFfn or GraphFusion.RoutedExperts;
 
         /// <summary>The delta rule's prep and the gated norm after it as one Metal kernel each
         /// (MlxNative.GraphKernels).</summary>
         protected override bool TryFused(GraphFusion kind, Tensor[] inputs, IGraphWeight[] weights, long[] ip, float[] fp, Tensor[] results)
         {
             if (kind == GraphFusion.SwigluFfn) return TrySwigluFfn(inputs[0], weights, ip, results);
+            if (kind == GraphFusion.RoutedExperts) return TryRoutedExperts(inputs[0], inputs[1], weights, ip, results);
             foreach (Tensor t in inputs)
                 if (t == null || !(t.Storage is MlxStorage) || t.ElementType != DType.Float32) return false;
             float eps = fp != null && fp.Length > 0 ? fp[0] : 1e-6f;
@@ -148,6 +150,217 @@ namespace TensorSharp.MLX
         }
 
         private static MlxQuantizedOps.WeightSpec Spec(IGraphWeight w) => new(w.CacheKey, w.Data, w.Format, w.Ne0, w.Ne1, w.Bytes);
+
+        /// <summary>
+        /// A decode row's routed experts as legacy Qwen35Model runs them on MLX. Where every projection has a batched
+        /// kernel (IQ2_XXS), the top-K and their renormalized weights stay on the device
+        /// (MlxFusedOps.TryMoeRouterTopKSoftmax). Otherwise one read of the logits routes on the host, gate and up
+        /// run as one batched kernel where they can, and each expert's down projection runs on its own; the weighted
+        /// sum is one product either way. The region's ops sorted the logits through a delegate, summed the
+        /// weights through the element-wise CPU fallback (a second sync per layer) and ran every expert as separate
+        /// ops (Qwen3.6-35B-A3B UD-IQ2_XXS on an M5 Pro: 22.7 tok/s; Qwen35Model 32.7). Other shapes and weightings
+        /// run the ops.
+        /// </summary>
+        private bool TryRoutedExperts(Tensor x, Tensor logits, IGraphWeight[] weights, long[] ip, Tensor[] results)
+        {
+            if (x == null || logits == null || ip == null || ip.Length < 2 || ip[1] != 1) return false;
+            if (x.Storage is not MlxStorage || logits.Storage is not MlxStorage || x.ElementType != DType.Float32
+                || logits.ElementType != DType.Float32 || !x.IsContiguous() || !logits.IsContiguous())
+                return false;
+            if (weights[2] is not IGraphExpertWeights gate || weights[3] is not IGraphExpertWeights up || weights[4] is not IGraphExpertWeights down)
+                return false;
+            int k = (int)ip[0], hidden = (int)gate.Ne0, ff = (int)gate.Ne1, experts = (int)gate.Ne2;
+            long rows = x.ElementCount() / x.Sizes[^1];
+            if (rows < 1 || x.Sizes[^1] != hidden || logits.ElementCount() != rows * experts || k <= 0 || k >= experts
+                || up.Ne0 != hidden || up.Ne1 != ff || down.Ne0 != ff || down.Ne1 != hidden || up.Ne2 != experts || down.Ne2 != experts)
+                return false;
+            if (rows > 1) return TryRoutedExpertRows(x, logits, gate, up, down, k, (int)rows, results);
+            bool batchedGateUp = MlxQuantizedOps.SupportsBatchedMoeMatmul(gate.Format) && up.Format == gate.Format;
+            bool batchedDown = MlxQuantizedOps.SupportsBatchedMoeMatmul(down.Format);
+
+            Tensor x2 = null, ids = null, routeWeights = null, act = null, upOut = null, downOut = null, output = null;
+            try
+            {
+                x2 = x.View(1, hidden);
+                ids = new Tensor(Allocator, DType.Int32, k);
+                routeWeights = new Tensor(Allocator, DType.Float32, 1, k);
+                int[] top = null;
+                if (batchedGateUp && batchedDown)
+                {
+                    using Tensor logits2 = logits.View(1, experts);
+                    if (!MlxFusedOps.TryMoeRouterTopKSoftmax(logits2, ids, routeWeights)) return false;
+                }
+                else
+                {
+                    // The K largest logits (ties to the lower expert, as the TopK op orders them), softmax over them.
+                    float[] l = logits.GetElementsAsFloat(experts);
+                    top = new int[k];
+                    var chosen = new bool[experts];
+                    for (int j = 0; j < k; j++)
+                    {
+                        int best = -1;
+                        for (int e = 0; e < experts; e++)
+                            if (!chosen[e] && (best < 0 || l[e] > l[best])) best = e;
+                        chosen[best] = true;
+                        top[j] = best;
+                    }
+                    var w = new float[k];
+                    double sum = 0;
+                    for (int j = 0; j < k; j++) sum += w[j] = MathF.Exp(l[top[j]] - l[top[0]]);
+                    for (int j = 0; j < k; j++) w[j] = (float)(w[j] / sum);
+                    ids.SetElementsAsInt(top);
+                    routeWeights.SetElementsAsFloat(w);
+                }
+
+                act = new Tensor(Allocator, DType.Float32, k, ff);
+                if (!(batchedGateUp && MlxQuantizedOps.TryMoeFusedGateUpSilu(act, x2, ids, gate.CacheKey, gate.Data, gate.Bytes,
+                        up.CacheKey, up.Data, up.Bytes, gate.Format, hidden, ff, experts)))
+                {
+                    upOut = new Tensor(Allocator, DType.Float32, k, ff);
+                    if (batchedGateUp)
+                    {
+                        if (!MlxQuantizedOps.TryMoeMatmulBatched(act, x2, ids, gate.CacheKey, gate.Data, gate.Format, hidden, ff, experts, gate.Bytes, sharedInput: true)
+                            || !MlxQuantizedOps.TryMoeMatmulBatched(upOut, x2, ids, up.CacheKey, up.Data, up.Format, hidden, ff, experts, up.Bytes, sharedInput: true))
+                            return false;
+                    }
+                    else
+                    {
+                        if (top == null) return false;
+                        for (int j = 0; j < k; j++)
+                        {
+                            CopyRow(act, j, QuantizedMatMul(gate.Expert(top[j]), x2));
+                            CopyRow(upOut, j, QuantizedMatMul(up.Expert(top[j]), x2));
+                        }
+                    }
+                    Ops.SiLUMul(act, act, upOut);
+                }
+
+                downOut = new Tensor(Allocator, DType.Float32, k, hidden);
+                if (batchedDown)
+                {
+                    if (!MlxQuantizedOps.TryMoeMatmulBatched(downOut, act, ids, down.CacheKey, down.Data, down.Format, ff, hidden, experts, down.Bytes, sharedInput: false))
+                        return false;
+                }
+                else
+                {
+                    if (top == null) return false;
+                    for (int j = 0; j < k; j++)
+                    {
+                        using Tensor row = act.Narrow(0, j, 1);
+                        CopyRow(downOut, j, QuantizedMatMul(down.Expert(top[j]), row));
+                    }
+                }
+                output = new Tensor(Allocator, DType.Float32, 1, hidden);
+                Ops.Fill(output, 0f);
+                Ops.Addmm(output, 1.0f, output, 1.0f, routeWeights, downOut);
+                results[0] = output;
+                output = null;
+                return true;
+            }
+            finally
+            {
+                x2?.Dispose();
+                ids?.Dispose();
+                routeWeights?.Dispose();
+                act?.Dispose();
+                upOut?.Dispose();
+                downOut?.Dispose();
+                output?.Dispose();
+            }
+
+            static void CopyRow(Tensor target, int row, Tensor value)
+            {
+                using (value)
+                using (Tensor dst = target.Narrow(0, row, 1))
+                    Ops.Copy(dst, value);
+            }
+        }
+
+        /// <summary>
+        /// Several rows' routed experts (a prompt chunk, a verify window): one read of the logits routes every row on
+        /// the host, each expert used runs its SwiGLU feed-forward once over the rows that chose it (gathered), and
+        /// the routed weights sum each row's K outputs in one batched product. The region's ops regrouped the rows
+        /// for each of the three products, summed the weights through the CPU fallback and added the K outputs one
+        /// view at a time.
+        /// </summary>
+        private bool TryRoutedExpertRows(Tensor x, Tensor logits, IGraphExpertWeights gate, IGraphExpertWeights up,
+            IGraphExpertWeights down, int k, int rows, Tensor[] results)
+        {
+            int hidden = (int)gate.Ne0, experts = (int)gate.Ne2;
+            float[] l = logits.GetElementsAsFloat(rows * experts);
+            var ids = new int[rows * k];
+            var w = new float[rows * k];
+            var chosen = new bool[experts];
+            for (int r = 0; r < rows; r++)
+            {
+                int b = r * experts;
+                Array.Clear(chosen);
+                for (int j = 0; j < k; j++)
+                {
+                    int best = -1;
+                    for (int e = 0; e < experts; e++)
+                        if (!chosen[e] && (best < 0 || l[b + e] > l[b + best])) best = e;
+                    chosen[best] = true;
+                    ids[r * k + j] = best;
+                }
+                double sum = 0;
+                float top = l[b + ids[r * k]];
+                for (int j = 0; j < k; j++) sum += w[r * k + j] = MathF.Exp(l[b + ids[r * k + j]] - top);
+                for (int j = 0; j < k; j++) w[r * k + j] = (float)(w[r * k + j] / sum);
+            }
+
+            // Slots (row * k + j) grouped by expert; the pieces come back in that order and are put back in slot order.
+            var byExpert = new List<int>[experts];
+            for (int s = 0; s < rows * k; s++) (byExpert[ids[s]] ??= new List<int>()).Add(s);
+            var pieces = new List<Tensor>();
+            var inverse = new int[rows * k];
+            var temps = new List<Tensor>();
+            Tensor x2 = null, sorted = null, slotOrder = null, routeWeights = null, output = null;
+            try
+            {
+                x2 = x.View(rows, hidden);
+                int at = 0;
+                for (int e = 0; e < experts; e++)
+                {
+                    if (byExpert[e] == null) continue;
+                    int[] slots = byExpert[e].ToArray();
+                    var sourceRows = new int[slots.Length];
+                    for (int i = 0; i < slots.Length; i++) sourceRows[i] = slots[i] / k;
+                    Tensor idx = Temp(new Tensor(Allocator, DType.Int32, sourceRows.Length));
+                    idx.SetElementsAsInt(sourceRows);
+                    Tensor xs = Temp(Ops.IndexSelect(null, x2, idx));
+                    Tensor g = Temp(QuantizedMatMul(gate.Expert(e), xs));
+                    Tensor u = Temp(QuantizedMatMul(up.Expert(e), xs));
+                    Ops.SiLUMul(g, g, u);
+                    pieces.Add(Temp(QuantizedMatMul(down.Expert(e), g)));
+                    foreach (int slot in slots) inverse[slot] = at++;
+                }
+                sorted = pieces.Count == 1 ? pieces[0] : Temp(Ops.Concat(null, 0, pieces.ToArray()));
+                Tensor order = Temp(new Tensor(Allocator, DType.Int32, inverse.Length));
+                order.SetElementsAsInt(inverse);
+                slotOrder = Temp(Ops.IndexSelect(null, sorted, order));                     // [rows * k, hidden]
+                using Tensor perRow = slotOrder.View(rows, k, hidden);
+                routeWeights = Temp(new Tensor(Allocator, DType.Float32, rows, 1, k));
+                routeWeights.SetElementsAsFloat(w);
+                output = new Tensor(Allocator, DType.Float32, rows, 1, hidden);
+                Ops.Fill(output, 0f);
+                Ops.AddmmBatch(output, 1.0f, output, 1.0f, routeWeights, perRow);
+                results[0] = output.View(rows, hidden);
+                return true;
+            }
+            finally
+            {
+                x2?.Dispose();
+                output?.Dispose();
+                foreach (Tensor t in temps) t.Dispose();
+            }
+
+            Tensor Temp(Tensor t)
+            {
+                temps.Add(t);
+                return t;
+            }
+        }
 
         /// <summary>A view of <paramref name="t"/> in <paramref name="shape"/> (its own extents with leading ones
         /// dropped) over its strides, or a reshape where its layout is not of that shape.</summary>

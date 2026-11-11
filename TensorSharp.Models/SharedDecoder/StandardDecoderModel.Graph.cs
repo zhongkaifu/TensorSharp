@@ -878,7 +878,17 @@ namespace TensorSharp.Models
         {
             string p = LayerName(layer, "");
             int rows = step.Rows, hidden = Config.HiddenSize, k = _expertsUsed;
-            int probs = step.Op(GraphOp.SoftMaxExt, step.MatMul(p + "ffn_gate_inp.weight", x));   // [E, rows]
+            int logits = step.MatMul(p + "ffn_gate_inp.weight", x);                                    // [E, rows]
+            // Experts on the device: routing and experts are one region an executor may run with its own MoE kernels
+            // (MLX keeps the top-K on the device instead of reading the logits back every layer).
+            bool region = !(IsExpertLayerOffloaded(layer) && GraphExecutor.Capabilities.HostExperts);
+            if (region)
+                step.BeginFused(GraphFusion.RoutedExperts, stackalloc[]
+                {
+                    x, logits, step.Experts(p + "ffn_gate_exps.weight"), step.Experts(p + "ffn_up_exps.weight"),
+                    step.Experts(p + "ffn_down_exps.weight"),
+                }, stackalloc long[] { k, NormalizeExpertWeights ? 1 : 0 });
+            int probs = step.Op(GraphOp.SoftMaxExt, logits);                                            // [E, rows]
             int selected = step.Op(GraphOp.TopK, stackalloc[] { probs }, stackalloc long[] { k });      // [K, rows]
             int weights = step.Op(GraphOp.GetRows, step.Reshape(probs, 1, _numExperts, rows), selected); // [1, K, rows]
             if (NormalizeExpertWeights)
@@ -928,6 +938,7 @@ namespace TensorSharp.Models
                     output = output < 0 ? slice : step.Op(GraphOp.Add, output, slice);
                 }
                 output = step.Cont(output);
+                step.EndFused(stackalloc[] { output });
             }
 
             if (HasWeight(p + "ffn_gate_shexp.weight"))

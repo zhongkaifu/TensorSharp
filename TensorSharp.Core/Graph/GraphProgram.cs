@@ -103,6 +103,11 @@ namespace TensorSharp.Graph
         /// quantized weights: gate_up (gate rows then up rows) and down, or (Ip[0] = 1) gate, up and down.
         /// Result: [n, rows].</summary>
         SwigluFfn = 3,
+        /// <summary>The routed experts of a softmax-gated MoE layer: the top-K experts of each row by its router
+        /// logits, their softmax weights renormalized over the K (Ip[1] = 1) or as they are (Ip[1] = 0), and the
+        /// weighted sum of their SwiGLU feed-forwards. Inputs: x [n, rows], the router logits [E, rows], then the
+        /// stacked experts gate, up and down. Ip: K, renormalize. Result: [n, rows].</summary>
+        RoutedExperts = 4,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);
