@@ -76,6 +76,13 @@ namespace TensorSharp.Models
             // The NextN/MTP block drafts on one device or the last of this process's whole-layer
             // stages (tensor parallelism and multi-node pipelines draft once their graphs lower).
             _draftLayers = tpDegree <= 1 && tpGroup == null ? Math.Min(nextn, 1) : 0;
+            // A family whose MTP head ships as its own file (--draft-model): its layer loads as the draft layer.
+            if (_draftLayers == 0 && tpDegree <= 1 && tpGroup == null && OpenSeparateDraftHead(draftModelPath) is { } head)
+            {
+                _draftLayers = 1;
+                _separateDraftHead = head;
+                LoadAdditionalWeights(head);
+            }
 
             int interval = (int)_gguf.GetUint32($"{arch}.full_attention_interval", 4);
             _isRecurrent = new bool[Config.NumLayers];
@@ -124,8 +131,14 @@ namespace TensorSharp.Models
             BuildRecurrentConstants();
             if (TensorRecurrence)
                 BuildDeviceConstants();
-            AttachDraftModel(draftModelPath);
+            if (_separateDraftHead == null) AttachDraftModel(draftModelPath);
         }
+
+        /// <summary>A draft head shipped as its own GGUF (validated and open, its layer blk.{NumLayers}), or null:
+        /// <c>--draft-model</c> then names a DFlash / DFlash2 / DSpine drafter. Called before the caches exist.</summary>
+        protected virtual GgufFile OpenSeparateDraftHead(string draftModelPath) => null;
+
+        private GgufFile _separateDraftHead;
 
         /// <summary>
         /// The requests the shared runtime serves for this family (see Qwen35Architecture):

@@ -46,7 +46,7 @@ namespace TensorSharp.Models
                 state.CommitVerify(kept);
         }
 
-        private System.Collections.Generic.IEnumerable<RecurrentState> ActiveRecurrentStates()
+        protected System.Collections.Generic.IEnumerable<RecurrentState> ActiveRecurrentStates()
         {
             if (_recurrentPrimary == null) yield break;
             foreach (RecurrentState[] layer in _recurrentPrimary)
@@ -97,7 +97,7 @@ namespace TensorSharp.Models
 
         public bool SpeculationProfitable => SpeculationRefusal == null;
 
-        public int SpecFeatureSize => HasDFlash ? DFlashSettings.FeatureSize : Config.HiddenSize;
+        public int SpecFeatureSize => HasDFlash ? DFlashSettings.FeatureSize : DraftFeatureWidth;
 
         public int SpecPrefillChunkSize => HasDFlash ? DFlashPrefillChunkSize : 0;
 
@@ -270,11 +270,12 @@ namespace TensorSharp.Models
             }
             else
             {
-                long floats = Math.Min(hAllOut.LongLength, (long)rows * hiddenSize);
-                if (floats >= (long)rows * hiddenSize)
+                int width = DraftFeatureWidth;
+                long floats = Math.Min(hAllOut.LongLength, (long)rows * width);
+                if (floats >= (long)rows * width)
                     Array.Copy(final, 0, hAllOut, 0, floats);
                 else
-                    Array.Copy(final, (long)(rows - 1) * hiddenSize, hAllOut, 0, hiddenSize);
+                    Array.Copy(final, (long)(rows - 1) * width, hAllOut, 0, width);
             }
         }
 

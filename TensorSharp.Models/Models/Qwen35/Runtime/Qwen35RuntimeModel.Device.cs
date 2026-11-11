@@ -277,7 +277,7 @@ namespace TensorSharp.Models
             public int SnapshotCapacity { get; private set; }
 
             /// <summary>Room for a <paramref name="rows"/>-row verify; true when the buffers moved.</summary>
-            public bool EnsureSpecBuffers(int rows)
+            public virtual bool EnsureSpecBuffers(int rows)
             {
                 if (rows <= SnapshotCapacity) return false;
                 int capacity = 4;

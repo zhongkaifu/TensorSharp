@@ -139,8 +139,74 @@ namespace TensorSharp.Models
 
         protected override int StreamWidth => checked((int)Ple.StreamFloats);
 
-        protected override string FamilySpeculationRefusal =>
-            "qwen4exp on the shared runtime does not speculate yet (its MTP head and DFlash2 run on Qwen4ExpModel)";
+        // ---------------------------------------------------------------- the MTP head
+
+        /// <summary>The shared-target MTP head (<c>--draft-model mtp-*.gguf</c>): one NextN block after the trunk.</summary>
+        protected override GgufFile OpenSeparateDraftHead(string draftModelPath)
+        {
+            if (string.IsNullOrWhiteSpace(draftModelPath) || Qwen4ExpModel.IsDFlashDraftFile(draftModelPath)) return null;
+            var file = new GgufFile(draftModelPath);
+            try
+            {
+                if (file.IsSplit) throw new NotSupportedException("The shared qwen4exp MTP head must be a single GGUF file.");
+                int layer = Qwen4ExpModel.ValidateMtpHead(_gguf, file);
+                if (layer != Config.NumLayers)
+                    throw new InvalidOperationException($"qwen4exp MTP block {layer} does not follow the {Config.NumLayers}-layer trunk.");
+                return file;
+            }
+            catch
+            {
+                file.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>The head reads the trunk's whole stream and chains its own (Qwen4ExpModel's NextN block).</summary>
+        protected override bool DraftChainsStream => true;
+
+        protected override string[] DraftLayerWeights =>
+            new[] { "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", "attn_output.weight", "nextn.hc_head_norm.weight" };
+
+        /// <summary>Each stream sees [rms(embedding) * enorm, grouped rms(stream) * hnorm] through eh_proj (a single
+        /// norm over the whole stream, or one projection of all streams, is a different trained model).</summary>
+        protected override int EmitDraftInput(GraphStep step, int layer, int embedded, int hidden)
+        {
+            PleSpec p = Ple;
+            int rows = step.Rows, hc = p.Hc;
+            long n = p.Hidden;
+            int e = step.RmsNorm(embedded, LayerName(layer, "nextn.enorm.weight"));
+            int h = GroupedNorm(step, hidden, rows, LayerName(layer, "nextn.hnorm.weight"));
+            int joined = step.Op(GraphOp.Concat, stackalloc[] { Streams(step, step.Reshape(e, n, 1, rows), hc), step.Reshape(h, n, hc, rows) },
+                stackalloc long[] { 0 });                                                                   // [2n, hc, rows]
+            int x = step.MatMul(LayerName(layer, "nextn.eh_proj.weight"), step.Reshape(joined, 2 * n, (long)hc * rows));
+            return step.Reshape(x, p.StreamFloats, rows);
+        }
+
+        /// <summary>The head's mixer on the last row (nextn.hc_head_*), then the trunk's output.weight.</summary>
+        protected override int EmitDraftHead(GraphStep step, int layer, int last)
+            => HcMix(step, last, 1, LayerName(layer, "nextn.hc_head_norm.weight"), LayerName(layer, "nextn.hc_head_down.weight"),
+                LayerName(layer, "nextn.hc_head_up.weight"), null, out _);
+
+        // ---------------------------------------------------------------- verify windows
+
+        protected override void CommitHostVerify(int kept, int rows)
+        {
+            foreach (RecurrentState state in ActiveRecurrentStates())
+                if (state is PleGdnState ple) ple.CommitVerify(kept);
+        }
+
+        /// <summary>The PLE conv window after the kept rows, from the verify's conv history.</summary>
+        protected override void EmitCommitExtras(GraphProgramBuilder g, int layer, DeviceGdnState state, int kept, int rows)
+        {
+            if (state is not PleGdnState ple || ple.PleConvHistory == null) return;
+            const long f = sizeof(float);
+            PleSpec p = Ple;
+            long width = p.StreamFloats;
+            int history = p.ConvHistory;
+            int all = GraphLeaf(g, ple.PleConvHistory, width, history + ple.SnapshotCapacity);
+            int window = g.Op(GraphOp.View, stackalloc[] { all }, stackalloc long[] { 2, width, history, 1, 1, width * f, 0, 0, kept * width * f });
+            g.Effect(g.Op(GraphOp.Cpy, window, GraphLeaf(g, ple.PleConv, width, history)));
+        }
 
         protected override DeviceGdnState CreateDeviceGdnState(RankScope scope, int layer, int convRows, int channels, int vHeads, int dv, int dk)
             => Ple.IsPle[layer]
@@ -159,7 +225,7 @@ namespace TensorSharp.Models
         protected override int EmitBlockInput(GraphStep step, int layer, int stream, BlockSite site, out int context)
         {
             string part = site == BlockSite.Mixer ? "attn" : "ffn";
-            return HcMix(step, stream, LayerName(layer, $"hc_{part}_norm.weight"), LayerName(layer, $"hc_{part}_down.weight"),
+            return HcMix(step, stream, step.Rows, LayerName(layer, $"hc_{part}_norm.weight"), LayerName(layer, $"hc_{part}_down.weight"),
                 LayerName(layer, $"hc_{part}_up.weight"), LayerName(layer, $"hc_{part}_inject.weight"), out context);
         }
 
@@ -177,7 +243,7 @@ namespace TensorSharp.Models
 
         /// <summary>The final mixer is the output norm (qwen4exp has no output_norm).</summary>
         protected override int EmitStreamOutput(GraphStep step, int stream)
-            => HcMix(step, stream, "output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", null, out _);
+            => HcMix(step, stream, step.Rows, "output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", null, out _);
 
         protected override int EmitLayerPrologue(GraphStep step, int layer, int stream)
         {
@@ -193,12 +259,12 @@ namespace TensorSharp.Models
 
         /// <summary>The grouped norm, low-rank gate and stream mean: [n, rows], with the inject [hc, rows] when
         /// <paramref name="inject"/> is named.</summary>
-        private int HcMix(GraphStep step, int stream, string norm, string down, string up, string inject, out int injected)
+        private int HcMix(GraphStep step, int stream, int rows, string norm, string down, string up, string inject, out int injected)
         {
             PleSpec p = Ple;
-            int rows = step.Rows, hc = p.Hc;
+            int hc = p.Hc;
             long n = p.Hidden, width = p.StreamFloats;
-            int xn = GroupedNorm(step, stream, norm);
+            int xn = GroupedNorm(step, stream, rows, norm);
             int lo = step.Op(GraphOp.Silu, step.Op(GraphOp.Scale, stackalloc[] { step.MatMul(down, xn) }, default, stackalloc[] { 1f / hc }));
             int gate = step.Op(GraphOp.Sigmoid, step.MatMul(up, lo));
             int gated = step.Op(GraphOp.Mul, xn, gate);
@@ -212,10 +278,9 @@ namespace TensorSharp.Models
         }
 
         /// <summary>RMS norm of each stream of x [hc·n, rows], times the [hc·n] gammas of <paramref name="weight"/>.</summary>
-        private int GroupedNorm(GraphStep step, int x, string weight)
+        private int GroupedNorm(GraphStep step, int x, int rows, string weight)
         {
             PleSpec p = Ple;
-            int rows = step.Rows;
             int perStream = step.Op(GraphOp.RmsNorm, stackalloc[] { step.Reshape(step.Cont(x), p.Hidden, p.Hc, rows) }, default, stackalloc[] { Config.Eps });
             return step.Op(GraphOp.Mul, step.Reshape(perStream, p.StreamFloats, rows), step.Weight(weight));
         }
@@ -239,9 +304,9 @@ namespace TensorSharp.Models
             const long f = sizeof(float);
 
             int embedded = step.InputF32(GatherPleRows(step, layer), n, rows);
-            int key = GroupedNorm(step, step.MatMul(LayerName(layer, "ple_key.weight"), embedded), LayerName(layer, "ple_norm_key.weight"));
+            int key = GroupedNorm(step, step.MatMul(LayerName(layer, "ple_key.weight"), embedded), rows, LayerName(layer, "ple_norm_key.weight"));
             int value = step.MatMul(LayerName(layer, "ple_value.weight"), embedded);                  // [n, rows]
-            int query = GroupedNorm(step, stream, LayerName(layer, "ple_norm_query.weight"));
+            int query = GroupedNorm(step, stream, rows, LayerName(layer, "ple_norm_query.weight"));
             // s = key_c · query_c / sqrt(n) per stream; gate = sigmoid(sign(s) sqrt(max(|s|, floor))).
             int dot = step.Op(GraphOp.SumRows, step.Reshape(step.Op(GraphOp.Mul, key, query), n, hc, rows));   // [1, hc, rows]
             int score = step.Op(GraphOp.Scale, stackalloc[] { dot }, default, stackalloc[] { 1f / MathF.Sqrt(n) });
@@ -252,7 +317,7 @@ namespace TensorSharp.Models
             int gated = step.Reshape(step.Op(GraphOp.Mul, Streams(step, step.Reshape(value, n, 1, rows), hc), gate), width, rows);
 
             // The causal depthwise conv over [history | rows], taps n-gram positions apart, then silu.
-            int normed = GroupedNorm(step, gated, LayerName(layer, "ple_norm_conv.weight"));
+            int normed = GroupedNorm(step, gated, rows, LayerName(layer, "ple_norm_conv.weight"));
             int taps = step.TensorWeight(PleTaps(layer), width, p.ConvKernel);
             int history = p.ConvHistory;
             int conv = -1;
@@ -276,8 +341,16 @@ namespace TensorSharp.Models
                     sum = sum < 0 ? term : step.Op(GraphOp.Add, sum, term);
                 }
                 int part = step.Op(GraphOp.Silu, sum);
-                if (history > 0)
+                // A verify window leaves the live history alone: the commit sets it from the window's conv history.
+                bool keep = step.RecurrentSnapshots && count > 1;
+                if (history > 0 && !keep)
                     step.Effect(step.Op(GraphOp.Cpy, step.View2(padded, width, history, width * f, (long)count * width * f), past));
+                else if (history > 0)
+                {
+                    if (state.EnsureSpecBuffers(count)) NoteGraphBindingsChanged();
+                    int all = step.State(state.PleConvHistory, GraphFormat.F32, width, history + state.SnapshotCapacity);
+                    step.Effect(step.Op(GraphOp.Cpy, padded, step.View2(all, width, history + count, width * f, 0)));
+                }
                 conv = conv < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { conv, part }, stackalloc long[] { 1 });
             }
             return step.Op(GraphOp.Add, stream, step.Op(GraphOp.Add, gated, conv));
@@ -369,6 +442,33 @@ namespace TensorSharp.Models
 
             public Tensor PleConv { get; }
             public Tensor PleTokens { get; }
+            /// <summary>A verify window's [history | rows] conv input (the commit's source), with room for the
+            /// verify capacity.</summary>
+            public Tensor PleConvHistory { get; private set; }
+            private int[] _verifyTokens = Array.Empty<int>();
+
+            public override bool EnsureSpecBuffers(int rows)
+            {
+                bool grown = base.EnsureSpecBuffers(rows);
+                if (!grown && PleConvHistory != null) return false;
+                PleConvHistory?.Dispose();
+                PleConvHistory = new Tensor(PleConv.Allocator, DType.Float32, Math.Max(1, _p.ConvHistory) + SnapshotCapacity, _p.StreamFloats);
+                return true;
+            }
+
+            /// <summary>A verify kept <paramref name="kept"/> rows: the n-gram history as of the window's start, advanced
+            /// by those rows (0: the history before the window).</summary>
+            public void CommitVerify(int kept)
+            {
+                ReadTokens();
+                int start = _lastStart;
+                _count = _undoCount;
+                _next = _undoNext;
+                Array.Copy(_undoTokens, _tokens, _tokens.Length);
+                if (kept > 0) Advance(_verifyTokens, 0, Math.Min(kept, _verifyTokens.Length), start);
+                _lastStart = -1;
+                WriteTokens();
+            }
 
             public override void Reset()
             {
@@ -486,14 +586,21 @@ namespace TensorSharp.Models
                         }
                     }
                 }
-                // The last n-1 tokens (this step's, after the history's when it continues it).
-                var all = new List<int>(hist.Count + count);
+                _verifyTokens = tokens.AsSpan(first, count).ToArray();
+                Advance(tokens, first, count, start);
+                WriteTokens();
+            }
+
+            /// <summary>The last n-1 tokens after rows [first, first + count) at <paramref name="start"/> (after the
+            /// history's when the rows continue it).</summary>
+            private void Advance(int[] tokens, int first, int count, int start)
+            {
+                var all = new List<int>(_p.Ngram - 1 + count);
                 if (_next == start) for (int i = 0; i < _count; i++) all.Add(_tokens[i]);
                 for (int i = 0; i < count; i++) all.Add(tokens[first + i]);
-                _count = Math.Min(ngram - 1, all.Count);
+                _count = Math.Min(_p.Ngram - 1, all.Count);
                 for (int i = 0; i < _count; i++) _tokens[i] = all[all.Count - _count + i];
                 _next = start + count;
-                WriteTokens();
             }
 
             private void WriteTokens()
@@ -521,6 +628,7 @@ namespace TensorSharp.Models
                 base.Dispose();
                 PleConv.Dispose();
                 PleTokens.Dispose();
+                PleConvHistory?.Dispose();
             }
         }
 

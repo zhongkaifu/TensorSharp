@@ -559,7 +559,8 @@ namespace TensorSharp.Models
             if (!request.LastRowLogits && !request.AllRowLogits && !request.CaptureFinal) return outputs;
 
             int final = EmitStreamOutput(step, h);
-            if (request.CaptureFinal) outputs.Final = step.Output(final, (long)hiddenSize * rows);
+            if (request.CaptureFinal)
+                outputs.Final = DraftChainsStream ? step.Output(h, (long)width * rows) : step.Output(final, (long)hiddenSize * rows);
             string headName = _quantWeights.ContainsKey("output.weight") || _weights.ContainsKey("output.weight")
                 ? "output.weight" : "token_embd.weight";
             if (request.AllRowLogits)

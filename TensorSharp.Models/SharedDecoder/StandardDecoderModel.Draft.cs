@@ -22,6 +22,16 @@ namespace TensorSharp.Models
     /// </summary>
     public abstract partial class StandardDecoderModel
     {
+        /// <summary>The draft layer reads (and chains) the trunk's whole residual stream, not its final-normed row
+        /// (hyper-connections: the head's mixer is the draft head's own).</summary>
+        protected virtual bool DraftChainsStream => false;
+
+        /// <summary>Floats per row of the draft head's input: the stream's width or the hidden size.</summary>
+        protected int DraftFeatureWidth => DraftChainsStream ? StreamWidth : Config.HiddenSize;
+
+        /// <summary>The draft layer's weights that must be present (suffixes of blk.{NumLayers}).</summary>
+        protected virtual string[] DraftLayerWeights => new[] { "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", "attn_norm.weight", "attn_output.weight" };
+
         /// <summary>The first draft layer's weights are all present (the family loaded them).</summary>
         protected bool HasDraftLayer
         {
@@ -29,7 +39,7 @@ namespace TensorSharp.Models
             {
                 if (DraftLayerCount <= 0) return false;
                 int n = Config.NumLayers;
-                foreach (string suffix in new[] { "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", "attn_norm.weight", "attn_output.weight" })
+                foreach (string suffix in DraftLayerWeights)
                     if (!HasWeight(LayerName(n, suffix))) return false;
                 return _cacheK != null && _cacheK.Length > n && _cacheK[n] != null;
             }
@@ -40,7 +50,7 @@ namespace TensorSharp.Models
         /// returns the last row's logits and its normed hidden row (the next step's input).</summary>
         private void RunDraftLayer(int[] tokens, float[] hRows, int startPos, float[] logitsOut, float[] hOut)
         {
-            int rows = tokens.Length, hiddenSize = Config.HiddenSize;
+            int rows = tokens.Length, hiddenSize = DraftFeatureWidth;
             if (hRows == null || hRows.LongLength < (long)rows * hiddenSize)
                 throw new ArgumentException($"{rows} draft rows need {(long)rows * hiddenSize} hidden floats.", nameof(hRows));
             SettlePendingVerify();
@@ -129,33 +139,48 @@ namespace TensorSharp.Models
             }
         }
 
-        /// <summary>Trace the draft layer: projected input, one decoder layer, shared head (last row).</summary>
+        /// <summary>Trace the draft layer: projected input, one decoder layer (the family's block hooks), its head
+        /// (last row). The chained row is the head's normed row, or the stream (<see cref="DraftChainsStream"/>).</summary>
         private StepOutputs EmitDraftLayer(GraphStep step, Tensor embedded, Tensor hidden, bool wantLogits)
         {
-            int rows = step.Rows, hiddenSize = Config.HiddenSize, n = Config.NumLayers;
+            int rows = step.Rows, hiddenSize = Config.HiddenSize, n = Config.NumLayers, width = DraftFeatureWidth;
             var outputs = new StepOutputs { Logits = -1, Final = -1 };
-            int e = step.RmsNorm(step.Input(embedded, hiddenSize, rows), LayerName(n, "nextn.enorm.weight"));
-            int h = step.RmsNorm(step.Input(hidden, hiddenSize, rows), LayerName(n, "nextn.hnorm.weight"));
             var positions = new int[rows];
             for (int i = 0; i < rows; i++) positions[i] = step.Starts[0] + i + step.Slots[0].RopeDelta;
             step.SetPositions(positions);
-            int x = step.MatMul(LayerName(n, "nextn.eh_proj.weight"),
-                step.Op(GraphOp.Concat, stackalloc[] { e, h }, stackalloc long[] { 0 }));
-            x = step.Op(GraphOp.Add, x, EmitAttention(step, n, step.RmsNorm(x, LayerName(n, "attn_norm.weight"))));
+            int x = EmitDraftInput(step, n, step.Input(embedded, hiddenSize, rows), step.Input(hidden, width, rows));
+            int normed = EmitBlockInput(step, n, x, BlockSite.Mixer, out int mixContext);
+            x = EmitBlockOutput(step, n, x, BlockSite.Mixer, mixContext, EmitAttention(step, n, normed));
             // A catch-up only needs the layer's K/V rows (written as effects): the graph holds what
             // feeds an output or an effect, so its attention output and FFN are never computed.
             if (!wantLogits) return outputs;
-            int ffnIn = step.RmsNorm(x, FfnNormWeight(n));
-            x = step.Op(GraphOp.Add, x, _moeLayer[n] ? EmitMoe(step, n, ffnIn) : EmitDenseFfn(step, n, ffnIn));
-            string headNorm = HasWeight(LayerName(n, "nextn.shared_head_norm.weight"))
-                ? LayerName(n, "nextn.shared_head_norm.weight") : "output_norm.weight";
-            int last = rows == 1 ? x : step.View2(x, hiddenSize, 1, hiddenSize * 4L, (rows - 1) * hiddenSize * 4L);
-            int normed = step.RmsNorm(last, headNorm);
-            string head = HasWeight(LayerName(n, "nextn.shared_head_head.weight")) ? LayerName(n, "nextn.shared_head_head.weight")
+            int ffnIn = EmitBlockInput(step, n, x, BlockSite.Ffn, out int ffnContext);
+            x = EmitBlockOutput(step, n, x, BlockSite.Ffn, ffnContext, _moeLayer[n] ? EmitMoe(step, n, ffnIn) : EmitDenseFfn(step, n, ffnIn));
+            int streamWidth = DraftChainsStream ? StreamWidth : hiddenSize;
+            int last = rows == 1 ? x : step.View2(x, streamWidth, 1, streamWidth * 4L, (rows - 1) * streamWidth * 4L);
+            int head = EmitDraftHead(step, n, last);
+            string headWeight = HasWeight(LayerName(n, "nextn.shared_head_head.weight")) ? LayerName(n, "nextn.shared_head_head.weight")
                 : HasWeight("output.weight") ? "output.weight" : "token_embd.weight";
-            outputs.Final = step.Output(normed, hiddenSize);
-            outputs.Logits = step.Output(step.MatMul(head, normed), Config.VocabSize);
+            outputs.Final = step.Output(DraftChainsStream ? last : head, width);
+            outputs.Logits = step.Output(step.MatMul(headWeight, head), Config.VocabSize);
             return outputs;
+        }
+
+        /// <summary>The draft layer's input: the next tokens' embedding and the trunk's rows, each RMS-normed
+        /// (<c>nextn.enorm</c>, <c>nextn.hnorm</c>), concatenated and projected (<c>nextn.eh_proj</c>).</summary>
+        protected virtual int EmitDraftInput(GraphStep step, int layer, int embedded, int hidden)
+        {
+            int e = step.RmsNorm(embedded, LayerName(layer, "nextn.enorm.weight"));
+            int h = step.RmsNorm(hidden, LayerName(layer, "nextn.hnorm.weight"));
+            return step.MatMul(LayerName(layer, "nextn.eh_proj.weight"), step.Op(GraphOp.Concat, stackalloc[] { e, h }, stackalloc long[] { 0 }));
+        }
+
+        /// <summary>The draft head's normed row [hidden, 1] from the layer's last row.</summary>
+        protected virtual int EmitDraftHead(GraphStep step, int layer, int last)
+        {
+            string headNorm = HasWeight(LayerName(layer, "nextn.shared_head_norm.weight"))
+                ? LayerName(layer, "nextn.shared_head_norm.weight") : "output_norm.weight";
+            return step.RmsNorm(last, headNorm);
         }
 
         /// <summary>The draft layer's own token embedding when it ships one, else the trunk's.</summary>

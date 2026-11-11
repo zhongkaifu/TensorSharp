@@ -28,8 +28,18 @@ routes it holds). What remains for the real checkpoint is choosing the offloaded
 tiers as `Qwen4ExpModel.ExpertTiers` does (routing profile, fixed and window slots), and the prompt-width
 streaming.
 
-**Next:** the tier policy above, the MTP head and DFlash2 (§2.6, with the PLE histories rewound by a verify),
-and QSA phase 2 above the budget.
+**Speculation (§2.6, MTP).** The shared-target MTP head (`--draft-model mtp-*.gguf`) loads as the runtime's
+draft layer (`OpenSeparateDraftHead`, before the caches exist). The draft layer is the shared one, split into
+hooks: `EmitDraftInput` (here: each stream sees [rms(embedding) * enorm, grouped rms(stream) * hnorm] through
+eh_proj), the block hooks (hyper-connections), `EmitDraftHead` (here: the `nextn.hc_head_*` mixer), and
+`DraftChainsStream` (the head reads the trunk's whole stream and chains its own). A verify window keeps the PLE
+layer's conv input in a history buffer and leaves the live histories alone; the accept count commits the kept
+prefix's conv window (`EmitCommitExtras`) and n-gram history (`CommitHostVerify`). Greedy speculation (n-gram
+drafts and the MTP head) emits the plain greedy tokens on the managed CPU, ggml_cpu, ggml_metal and MLX, and
+the head's drafts match `Qwen4ExpModel`'s within 3e-2 (ggml_cpu, ggml_metal).
+
+**Next:** the tier policy above, DFlash2 (its feature taps are the mean of the streams after each target
+layer), and QSA phase 2 above the budget.
 
 Flash Next has 125 B parameters in total and 6 B active. Its routed experts take 46 GB at UD-Q2_K_XL.
 

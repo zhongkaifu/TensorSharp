@@ -58,6 +58,7 @@ namespace TensorSharp.Models
                 base.CommitRecurrentPrefix(kept, rows);
                 return;
             }
+            CommitHostVerify(kept, rows);
             if (kept == 0) return;
             // One commit graph per pipeline stage: each binds its own device's states.
             for (int stage = 0; stage < Mesh.Stages; stage++)
@@ -110,11 +111,19 @@ namespace TensorSharp.Models
                 int window = g.Op(GraphOp.View, stackalloc[] { hist },
                     stackalloc long[] { 2, convRows, channels, 1, 1, (convRows + cap) * f, 0, 0, kept * f });
                 g.Effect(g.Op(GraphOp.Cpy, window, GraphLeaf(g, state.Conv, convRows, channels)));
+                EmitCommitExtras(g, layer, state, kept, rows);
             }
             return g.ToProgram(replayable: true, reorder: false);
         }
 
-        private int GraphLeaf(GraphProgramBuilder g, Tensor t, params long[] ne)
+        /// <summary>A family's host-side state settled by a verify that kept <paramref name="kept"/> of its
+        /// <paramref name="rows"/> (0: none, the state before the window stays).</summary>
+        protected virtual void CommitHostVerify(int kept, int rows) { }
+
+        /// <summary>What else the commit program copies for a layer's state (a family's extra histories).</summary>
+        protected virtual void EmitCommitExtras(GraphProgramBuilder g, int layer, DeviceGdnState state, int kept, int rows) { }
+
+        protected int GraphLeaf(GraphProgramBuilder g, Tensor t, params long[] ne)
             => g.Leaf(GraphLeafRole.State, GraphFormat.F32, ne, StateIdentity(t), t.Storage.ByteLength, handle: t);
 
         /// <summary>A state tensor's bytes where the executor binds host memory, else a stable identity.</summary>

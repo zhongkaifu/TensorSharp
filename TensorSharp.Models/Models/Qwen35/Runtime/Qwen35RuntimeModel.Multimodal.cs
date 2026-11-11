@@ -46,6 +46,9 @@ namespace TensorSharp.Models
             VisionEncoder?.Dispose();
             VisionEncoder = null;
             base.Dispose();
+            // Its mapped weights were the draft layer's: released with the model's weights above.
+            _separateDraftHead?.Dispose();
+            _separateDraftHead = null;
         }
     }
 }
