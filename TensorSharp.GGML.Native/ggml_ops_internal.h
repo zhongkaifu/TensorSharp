@@ -1380,6 +1380,13 @@ namespace tsg
         bool (*run)(ggml_tensor* node, void* ctx) = nullptr;
         void* ctx = nullptr;
     };
+    // A GGML_OP_FLASH_ATTN_EXT node on cuDNN's fused SDPA (ggml_cuda with cuDNN; see
+    // ggml_ops_minimax_h3.cpp): whether cuDNN can take the node (F32 Q, F16 K/V, no
+    // mask, sinks, bias or softcap), and its execution into the node's own buffer,
+    // false when cuDNN declines so that the caller leaves the node to ggml. For a
+    // NodeOffload of another model's graph.
+    bool cudnn_sdpa_node_wants(const ggml_tensor* node);
+    bool cudnn_sdpa_node_run(ggml_tensor* node);
     // With `offload`, the profiler times an offloaded node under "<OP>:offload".
     ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag,
                                        const NodeOffload* offload = nullptr);

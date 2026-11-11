@@ -99,6 +99,37 @@ Use fresh processes for upstream environment controls, which ggml may read only
 once. Keep prompts, model quantization, resolution, steps, CFG, seed, sampler and
 sigma schedule fixed when comparing modes.
 
+## Projections on cuBLAS and attention on cuDNN
+
+On `ggml_cuda` with an sm_80 or newer GPU, the DiT's wide Q4_K and Q6_K projections
+leave ggml's MMQ kernels for the route MiniMax-H3's DiT uses: the weight is expanded
+to BF16 per call and multiplied by one cuBLAS GEMM with F32 accumulation
+(`tsg_cuda_q4k_gemm.cu`). Where cuDNN is available, the unmasked attentions (the image
+segments) run on cuDNN's fused SDPA instead of ggml-cuda's flash-attention kernel; Q may
+be the permuted view the graph already has. The graph and its allocation stay ggml's:
+`graph_compute_offload` runs these nodes into their own buffers, and a node either
+library declines runs on ggml as before. Text segments keep their causal masks and
+ggml's kernel.
+
+Measured on an A100 80 GB (Linux, sm_80 build), `qwen_image_2.1_Q4_K_M.gguf`,
+1344x768, 25 steps, warm server, the same prompt and seed:
+
+| Build | Cached denoising step | Denoise | Whole picture |
+|---|---:|---:|---:|
+| MMQ and ggml flash attention (`TS_QWEN21_CUBLAS_MATMUL=0`, `TS_QWEN21_CUDNN_ATTENTION=0`) | 0.99 s | 28.4 s | 31.0 s |
+| + Q4_K projections on cuBLAS BF16 | 0.62 s | 17.1 s | 19.1 s |
+| + Q6_K projections on cuBLAS BF16 | 0.58 s | 16.2 s | 18.1 s |
+| + attention on cuDNN SDPA (the default) | 0.47 s | 14.0 s | 15.9 s |
+| + `TS_H3_INT8_MATMUL=1` (opt-in) | 0.44 s | 12.7 s | 14.6 s |
+
+With `TS_GGML_NODE_PROFILE=shapes`, a step's attention went from 188 ms to 68 ms and
+its 32 Q6_K products from 66 ms to 25 ms; the Q4_K products are 268 ms of the remaining
+506 ms, at about 245 TFLOP/s for the widest. The pictures differ from the MMQ build's
+by rounding only: 34.5 dB PSNR for the default route and 28.8 dB between it and the
+INT8 one, which rounds each weight row and each token's activations to 8 bits
+([MiniMax-H3](../models/minimax-h3.md#long-clips-on-ggml_cuda)). ComfyUI's INT8 Qwen-Image-2.1
+makes the same picture in 7.6 s on that GPU.
+
 ## VAE execution
 
 The CUDA Qwen-Image-2.1 VAE can emit its complete encoder or decoder into the

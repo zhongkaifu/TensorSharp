@@ -84,12 +84,19 @@ that is not set is an error, not an empty string.
 | Profile | Preset |
 |---|---|
 | `ltx25-distilled` | [`config/ltx-2.5-distilled.json`](../../config/ltx-2.5-distilled.json) on `ggml_cuda` |
+| `minimax-h3` | [`config/minimax-h3-fl2va.json`](../../config/minimax-h3-fl2va.json) on `ggml_cuda`, 20 steps |
+| `minimax-h3-turbo` | The same with the eight-step Turbo plug-in ([`config/lora/minimax-h3-fl2v-turbo-8step.json`](../../config/lora/minimax-h3-fl2v-turbo-8step.json)) |
+| `qwen-image-2.1` | [`config/qwen-image-2.1.json`](../../config/qwen-image-2.1.json) on `ggml_cuda` |
 | `qwen-image-2.1-turbo` | [`config/qwen-image-2.1-turbo.json`](../../config/qwen-image-2.1-turbo.json) on `ggml_cuda` |
 
 On Apple Silicon, change `--backend` to `mlx` or `ggml_metal`. Any other preset in
 [`config/`](../../config), such as the Wan video presets, takes a profile of the same
 shape. `TENSORSHARP_COMFYUI_PROFILES` adds folders of your own profiles, searched before
 this one, so local profiles stay outside the repository.
+
+Servers of two profiles can run side by side on their own ports: each keeps its Video
+Studio store in `<ComfyUI>/logs/tensorsharp-studio-<port>` (`TS_STUDIO_DIRECTORY`, unless
+the profile's `env` sets it), since one store admits one server.
 
 Each started server writes to `<ComfyUI>/logs/tensorsharp-<port>.log`. A server ComfyUI
 did not start is never stopped; the node reports the conflict instead.

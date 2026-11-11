@@ -357,6 +357,19 @@ __global__ void narrow_f32_f16(const float* __restrict__ src, __half* __restrict
         dst[i] = __float2half_rn(src[i]);
 }
 
+// narrow_f32_f16 for a strided Q, element (d, s, h) at d + s*stride_s + h*stride_h
+// floats, into the contiguous head-major F16 cuDNN reads. One block per (head, token).
+__global__ void narrow_strided_f32_f16(const float* __restrict__ src, long long stride_s, long long stride_h,
+                                       __half* __restrict__ dst, long long seq, long long rows, int head_dim)
+{
+    const long long r = blockIdx.x;
+    if (r >= rows) return;
+    const long long h = r / seq, s = r - h * seq;
+    const float* __restrict__ in = src + s * stride_s + h * stride_h;
+    __half* __restrict__ out = dst + r * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) out[d] = __float2half_rn(in[d]);
+}
+
 __global__ void widen_f16_f32(const __half* __restrict__ src, float* __restrict__ dst, long long n)
 {
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x)
@@ -445,10 +458,26 @@ bool tsg_cudnn_sdpa_prepare(int64_t heads, int64_t seq, int64_t head_dim)
 // Returns false (having touched nothing the caller relies on) when cuDNN or an
 // engine for the shape is unavailable; the caller then runs the node on ggml.
 // Synchronizes the default stream before returning.
+bool tsg_cudnn_sdpa_f32_strided(const float* q, int64_t q_stride_s, int64_t q_stride_h, const void* k, const void* v,
+                                float* out, int64_t heads, int64_t seq_q, int64_t seq_kv, int64_t head_dim,
+                                int64_t k_stride_s, int64_t k_stride_h, int64_t v_stride_s, int64_t v_stride_h,
+                                float scale);
+
 bool tsg_cudnn_sdpa_f32(const float* q, const void* k, const void* v, float* out,
                         int64_t heads, int64_t seq_q, int64_t seq_kv, int64_t head_dim,
                         int64_t k_stride_s, int64_t k_stride_h, int64_t v_stride_s, int64_t v_stride_h,
                         float scale)
+{
+    return tsg_cudnn_sdpa_f32_strided(q, head_dim, seq_q * head_dim, k, v, out, heads, seq_q, seq_kv, head_dim,
+                                      k_stride_s, k_stride_h, v_stride_s, v_stride_h, scale);
+}
+
+// tsg_cudnn_sdpa_f32 for a Q that need not be contiguous: element (d, s, h) at
+// d + s*q_stride_s + h*q_stride_h floats (a permuted view of [D, H, Sq], say).
+bool tsg_cudnn_sdpa_f32_strided(const float* q, int64_t q_stride_s, int64_t q_stride_h, const void* k, const void* v,
+                                float* out, int64_t heads, int64_t seq_q, int64_t seq_kv, int64_t head_dim,
+                                int64_t k_stride_s, int64_t k_stride_h, int64_t v_stride_s, int64_t v_stride_h,
+                                float scale)
 {
     SdpaState& s = state();
     std::lock_guard<std::mutex> lock(s.mu);
@@ -463,7 +492,14 @@ bool tsg_cudnn_sdpa_f32(const float* q, const void* k, const void* v, float* out
     __half* q16 = static_cast<__half*>(s.scratch);
     __half* o16 = reinterpret_cast<__half*>(static_cast<char*>(s.scratch) + pad);
 
-    narrow_f32_f16<<<grid_for(nq), 256>>>(q, q16, nq);
+    if (q_stride_s == head_dim && q_stride_h == seq_q * head_dim)
+        narrow_f32_f16<<<grid_for(nq), 256>>>(q, q16, nq);
+    else
+    {
+        if (heads * seq_q > 0x7fffffffLL || head_dim > 1024) return false;
+        narrow_strided_f32_f16<<<(unsigned int) (heads * seq_q), (unsigned int) head_dim>>>(
+            q, q_stride_s, q_stride_h, q16, seq_q, heads * seq_q, (int) head_dim);
+    }
     if (cudaGetLastError() != cudaSuccess) return false;
     if (!execute_plan(s, *p, q16, k, v, o16, scale)) return false;
     widen_f16_f32<<<grid_for(nq), 256>>>(o16, out, nq);
