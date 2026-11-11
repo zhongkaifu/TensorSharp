@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(GgmlOps LANGUAGES C CXX)
 option(TENSORSHARP_GGML_NATIVE_BUILD_TESTS "Build TensorSharp GGML native regression tests" OFF)
 option(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA "Enable the ggml-cuda backend when building on Windows or Linux" OFF)
+option(TENSORSHARP_FLASH_ATTENTION "Fetch FlashAttention-2 and CUTLASS and run MiniMax-H3's DiT attention on its kernel (CUDA, sm_80 and newer)" OFF)
 option(TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN "Enable the ggml-vulkan backend when building on Windows or Linux" OFF)
 # Cache marker maintained by build-windows.ps1 / build-linux.sh: ON when the
 # ENABLE_VULKAN value came from an explicit user choice (flag or env var) rather
@@ -488,6 +489,38 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         message(STATUS "TensorSharp: cuDNN headers not found; VAE convolutions stay on ggml im2col+GEMM "
                        "(run eng/fetch-cudnn to provision, or set TENSORSHARP_CUDNN=OFF to stop looking)")
     endif()
+    # MiniMax-H3's DiT attention on FlashAttention-2's forward kernel instead of cuDNN's
+    # SDPA engine (tsg_cuda_flash_attn.cu). Opt-in: it downloads two pinned source
+    # archives at configure time and compiles one CUTLASS kernel (head size 128, F16),
+    # a few minutes of nvcc. The node it runs in is the cuDNN one.
+    if (TENSORSHARP_FLASH_ATTENTION AND TSG_HAVE_CUDNN)
+        include(FetchContent)
+        # SOURCE_SUBDIR names nothing, so the archives are unpacked and not configured.
+        FetchContent_Declare(tsg_flash_attention
+            URL https://github.com/Dao-AILab/flash-attention/archive/dceb374126248b17dbfee91c202514f533fd2ec6.tar.gz
+            URL_HASH SHA256=4c28b06b391bd2eda84a8af39f1032c1d1beed66fa8eb98e6abd685dbae07c45
+            SOURCE_SUBDIR tsg-sources-only)
+        FetchContent_Declare(tsg_cutlass
+            URL https://github.com/NVIDIA/cutlass/archive/7127592069c2fe01b041e174ba4345ef9b279671.tar.gz
+            URL_HASH SHA256=12baa9c2bf22eaca065b5e55387c21bb4ac742992a6ecd2dd1d3b016dfd25a0a
+            SOURCE_SUBDIR tsg-sources-only)
+        FetchContent_MakeAvailable(tsg_flash_attention tsg_cutlass)
+        set(TSG_FLASH_ATTN_SRC "${tsg_flash_attention_SOURCE_DIR}/csrc/flash_attn/src")
+        set(TSG_FLASH_ATTN_KERNEL "${TSG_FLASH_ATTN_SRC}/flash_fwd_hdim128_fp16_sm80.cu")
+        list(APPEND TSG_GGMLOPS_SOURCES tsg_cuda_flash_attn.cu "${TSG_FLASH_ATTN_KERNEL}")
+        set_property(SOURCE tsg_cuda_flash_attn.cu "${TSG_FLASH_ATTN_KERNEL}" APPEND PROPERTY INCLUDE_DIRECTORIES
+            "${CMAKE_CURRENT_SOURCE_DIR}/flash_attn_shim" "${TSG_FLASH_ATTN_SRC}" "${tsg_cutlass_SOURCE_DIR}/include")
+        set_property(SOURCE tsg_cuda_flash_attn.cu "${TSG_FLASH_ATTN_KERNEL}" APPEND PROPERTY COMPILE_OPTIONS
+            --expt-relaxed-constexpr --expt-extended-lambda)
+        # Only the plain forward is called: no dropout, bias, cap, window or padded head.
+        set_property(SOURCE "${TSG_FLASH_ATTN_KERNEL}" APPEND PROPERTY COMPILE_DEFINITIONS
+            FLASHATTENTION_DISABLE_DROPOUT FLASHATTENTION_DISABLE_ALIBI FLASHATTENTION_DISABLE_SOFTCAP
+            FLASHATTENTION_DISABLE_UNEVEN_K FLASHATTENTION_DISABLE_LOCAL)
+        set(TSG_HAVE_FLASH_ATTN ON)
+        message(STATUS "TensorSharp: FlashAttention-2 at ${tsg_flash_attention_SOURCE_DIR}; MiniMax-H3's DiT attention will use it on sm_80 and newer")
+    elseif (TENSORSHARP_FLASH_ATTENTION)
+        message(WARNING "TENSORSHARP_FLASH_ATTENTION needs the cuDNN headers (the attention node it runs in is the cuDNN one); it is off for this build")
+    endif()
 endif()
 
 if (TENSORSHARP_GGML_NATIVE_IOS)
@@ -570,6 +603,9 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         target_include_directories(GgmlOps PRIVATE ${TSG_CUDNN_INCLUDE_DIR})
         # Deliberately NOT linked -- resolved with LoadLibrary/dlopen at run time.
         target_compile_definitions(GgmlOps PRIVATE TSG_HAVE_CUDNN=1)
+        if (TSG_HAVE_FLASH_ATTN)
+            target_compile_definitions(GgmlOps PRIVATE TSG_HAVE_FLASH_ATTN=1)
+        endif()
         if (TSG_CUDNN_RUNTIME_HINT)
             target_compile_definitions(GgmlOps PRIVATE
                 "TSG_CUDNN_RUNTIME_DIR=\"${TSG_CUDNN_RUNTIME_HINT}\"")

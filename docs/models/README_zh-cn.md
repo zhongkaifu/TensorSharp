@@ -55,6 +55,7 @@ DeepSeek 1017 的默认 YOCO prefill 是近似计算；选择精确设置前请�
 |---|---|---|---|
 | [Qwen-Image-2.1](qwenimage21_zh-cn.md) | 文本、可选参考 / 蒙版图像 | 图像 / 图像编辑 | 条件支持：匹配编码器 / VAE 与采样配方；组件验证覆盖随后端变化。 |
 | [LTX 2.5 Distilled](ltx-2.5_zh-cn.md) | 文本、图像关键帧；可选身份参考图 | 视频 + 48 kHz 立体声 | 实验性：使用当前两阶段配方与伴随模型；不支持 Vulkan 与多 GPU。 |
+| [MiniMax-H3-Image](minimax-h3-image_zh-cn.md) | 文本 | 图像，约 4 至 20 MP | 条件支持：仅 ggml 后端（已在 `ggml_cuda` 上实测）；6 步蒸馏、guidance 1；尚未实现编辑。 |
 | [MiniMax-H3](minimax-h3_zh-cn.md) | 文本、关键帧或由检查点决定的参考媒体 | 视频 + 32 kHz 立体声 | 条件支持：FL2VA / Ref2VA 是不同检查点。组件门控与完整生成验证范围不同。 |
 | [Wan 2.1 / 2.2](wan_zh-cn.md) | 文本；图像取决于变体 | 视频（无音频） | 条件支持：按变体匹配编码器 / VAE、采样器与步数；不支持多 GPU。 |
 

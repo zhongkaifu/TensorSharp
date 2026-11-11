@@ -32,6 +32,7 @@ namespace TensorSharp.Models.Architecture
             // Metadata-free detectors first so unlabelled files can be recognized
             // from their tensor layout before resolution fails closed.
             MiniMaxH3.MiniMaxH3Architecture.Descriptor,
+            MiniMaxH3.MiniMaxH3ImageArchitecture.Descriptor,
             Ltx25.Ltx25Architecture.Descriptor,
 
             // Text / multimodal language models.

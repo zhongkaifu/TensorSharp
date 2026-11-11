@@ -248,6 +248,7 @@
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3VideoVaeEncode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3VideoVaeEncode3D" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3VisionEncode" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_MiniMaxH3VitDecodeBatch" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3ClearVisionRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3CtxSize" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_MiniMaxM3DsparkBlockSize" SymbolType="Function" />

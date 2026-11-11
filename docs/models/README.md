@@ -11,7 +11,7 @@ Start with the output you need, then check the model's inputs, weights and backe
 | Run a first local text model | [Getting started](../getting_started.md) → [Gemma 4 E4B native-GGML lane](gemma4.md#verified-gemma-4-e4b-native-ggml-fast-path); add the matching projector for media input. |
 | Use images, documents or tools in a chat | Choose a text family below, then check its modality, tool-protocol and backend limits. |
 | Search text, code or media | [Embedding guide](../embeddings.md): Snowflake, MiniLM and EmbeddingGemma 2 output vectors; media support depends on the encoder. |
-| Generate or edit images | [Qwen-Image-2.1](qwenimage21.md), with its matching files and sampling recipe. |
+| Generate or edit images | [Qwen-Image-2.1](qwenimage21.md), with its matching files and sampling recipe; [MiniMax-H3-Image](minimax-h3-image.md) for text to image up to ~16 MP. |
 | Generate video, with or without audio | [LTX 2.5](ltx-2.5.md), [MiniMax-H3](minimax-h3.md) or [Wan](wan.md); compare the outputs below. |
 | Get files for a model you have chosen | [Model downloads](../../MODEL_DOWNLOADS.md) and its card; check the named quantization, memory and companion files. |
 
@@ -54,6 +54,7 @@ DeepSeek 1017 defaults to approximate YOCO prefill; read its [quality and benchm
 | Family / card | Inputs | Output / task | Conditions and evidence |
 |---|---|---|---|
 | [Qwen-Image-2.1](qwenimage21.md) | Text, optional reference/mask images | Images / image edits | Conditional: matching encoder/VAE and sampling recipe; component coverage varies by backend. |
+| [MiniMax-H3-Image](minimax-h3-image.md) | Text | Images, ~4 to 20 MP | Conditional: ggml backends only (`ggml_cuda` measured); six distilled steps, guidance 1; editing not implemented. |
 | [LTX 2.5 Distilled](ltx-2.5.md) | Text, image keyframes; optional identity sheets | Video + 48 kHz stereo | Experimental: current two-stage recipe and companions; Vulkan and multi-GPU are unsupported. |
 | [MiniMax-H3](minimax-h3.md) | Text, keyframes or reference media by checkpoint | Video + 32 kHz stereo | Conditional: distinct FL2VA/Ref2VA checkpoints. Component gates and whole-generation coverage differ. |
 | [Wan 2.1 / 2.2](wan.md) | Text, image by variant | Video (no audio) | Conditional: variant-specific encoders/VAE, sampler and step schedule; multi-GPU is unsupported. |

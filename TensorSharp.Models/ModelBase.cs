@@ -3599,6 +3599,15 @@ namespace TensorSharp.Models
                 ggufPath = NinferQwen38GgufConverter.EnsureGguf(ggufPath);
             }
 
+            // MiniMax-H3-Image's denoiser ships as safetensors in its original tensor names,
+            // which the DiT reads as they are; there is no GGUF header to probe.
+            if (MiniMaxH3.MiniMaxH3ImageModel.IsImageDenoiserSafetensors(ggufPath))
+            {
+                if (tpDegree > 1 || tpGroup != null || layerSplitDegree > 1)
+                    throw new NotSupportedException("minimax-h3-image runs on one GPU; remove --tp / --layer-split.");
+                return new MiniMaxH3.MiniMaxH3ImageModel(ggufPath, backend);
+            }
+
             using var probe = new GgufFile(ggufPath);
             var architecture = ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe);
 

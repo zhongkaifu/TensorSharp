@@ -432,9 +432,14 @@ default output byte-identical to the second round's:
 **Opt-in INT8 projections (`TS_H3_INT8_MATMUL=1`)** are the same idea for a GPU without
 FP8 kernels (sm_80: A100, RTX 30). Each row of the merged weight and each token's
 activations are rounded to int8 against their own peak, cuBLASLt multiplies them with an
-exact int32 sum, and one pass scales the result back to F32. Nothing stays resident: the
-weight is rounded per call, as the BF16 route expands it per call. A shape cuBLASLt has no
-int8 kernel for runs on BF16.
+exact int32 sum, and the sums times the two scales are the F32 product. A shape cuBLASLt
+has no int8 kernel for runs on BF16.
+
+`TS_H3_INT8_MATMUL=vae` (or `all`, with the DiT) does the same for the F16 projections of the
+video VAE decoder, keeping the int8 rows of each weight on the device between tiles. On an
+A100 80 GB the 196 tiles of a 1344x768, 124-frame clip took 11.6 s instead of 15.5 s (13.7 s
+before the passes around the multiplies were folded, below), and the clip was 41 to 45 dB
+PSNR from the F16 decode. A tile's int8 multiplies take 24 ms alone against 40 ms in F16.
 
 Measured on an A100 80 GB (Linux, sm_80 build) with a 1344x768, 124-frame FL2VA clip and
 the eight-step Turbo plug-in (39,844 tokens), warm server, times per DiT block from
@@ -453,6 +458,77 @@ between runs. The attention (cuDNN SDPA, 273 ms a block at this length) is uncha
 and is now two thirds of a step. ComfyUI's W6A8 H3 makes the same clip in 159-167 s on
 that GPU; its int8 projections take 29.1, 22.6 and 8.9 ms for fc1, qkv and out, and its
 attention 254 ms.
+
+**The passes around an int8 multiply.** As first written, the route merged the LoRA into
+the weight and rounded it on every call, read each token's activations twice to round
+them, and ran a pass over the product to scale it back to F32. On a block's four
+projections that was 30 ms beside 83 ms of multiplies. Three changes remove most of it,
+and none changes a value: a clip is byte-identical with all three on or off.
+
+- **A product stays int32 until it is read.** In the fused DiT and VAE graphs every
+  projection's result has exactly one reader, a kernel of ours: q, k and v go to the
+  attention prep, fc1 to fc2's rounding, out and fc2 to the gated residual (the VAE's to
+  its scaled residual). Each applies the two scales as it loads an element, with the same
+  two multiplications the pass made. The graph is checked before it runs
+  (`h3_deferrable`): a product with any other reader, or more than one, is scaled as
+  before. `TS_H3_INT8_DEFER=0` turns this off.
+- **Activations are rounded in one pass.** A token's values wait in shared memory between
+  finding the peak and rounding (57 KB for fc2's 14,336 values, which sm_80 and newer
+  allow a block on request), so a row is read and its SwiGLU evaluated once.
+  `TS_H3_INT8_ONE_PASS=0` turns this off.
+- **The DiT's int8 rows are kept between steps** while 8 GB of device memory stays free.
+  For H3's DiT that is 19 GB, which took the peak on the A100 from 30 GB to 49 GB. The
+  rows are freed with the projection scratch after the last step and dropped whenever a
+  weight or LoRA factor is uploaded again. From the second step on the LoRA merge and the
+  rounding are skipped; the first step is half a second slower for the allocation.
+  `TS_H3_INT8_KEEP_WEIGHTS=0` turns this off.
+
+Per block on the same A100 and clip, with FlashAttention (`TS_H3_STAGE_PROFILE`):
+
+| Stage | Before | After |
+|---|---:|---:|
+| fc1, 5376 x 28672 | 42.4 ms | 34.6 ms |
+| qkv, 5376 x 21504 | 33.2 ms | 27.0 ms |
+| fc2, 14336 x 5376 (SwiGLU input) | 26.3 ms | 23.0 ms |
+| out, 7168 x 5376 | 11.4 ms | 9.5 ms |
+| attention prep (now also scales qkv) | 3.4 ms | 4.8 ms |
+
+| `TS_H3_INT8_MATMUL` | Denoising step | VAE decode | Warm request |
+|---|---:|---:|---:|
+| `1`, before | 19.1-19.2 s | 16.4 s | 177.9, 178.5 s |
+| `1` | 18.1 s | 16.4 s | 169.8, 170.0 s |
+| `all` | 18.1 s | 12.4 s | 165.7, 166.0, 166.6 s |
+
+ComfyUI's template made the same clip in 157.5 and 162.5 s in the same session.
+
+**FlashAttention-2 for the DiT attention (build option `TENSORSHARP_FLASH_ATTENTION`).**
+PyTorch runs that attention on [FlashAttention-2](https://github.com/Dao-AILab/flash-attention)'s
+forward kernel, which is faster than cuDNN's SDPA engine at this shape. A native build
+configured with `-DTENSORSHARP_FLASH_ATTENTION=ON` fetches the pinned flash-attention and
+CUTLASS sources, compiles the one kernel this model uses (head size 128, F16, no mask;
+about a minute of nvcc) and runs the fused attention node's product on it, between the
+same prep and widen passes and on the same F16 operands. It needs the cuDNN headers (the
+node is the cuDNN one, and cuDNN still runs shapes the kernel does not cover, such as
+the video VAE's 64-wide heads) and a GPU of sm_80 or newer. `TS_H3_FLASH_ATTENTION=0`
+puts the attention back on cuDNN.
+
+On the same A100 and clip (39,875 tokens, 56 heads x 128), with `TS_H3_INT8_MATMUL=1`:
+
+| Attention | Per block | Denoising step | Warm request |
+|---|---:|---:|---:|
+| cuDNN SDPA | 278-281 ms | 20.5-20.7 s | 188.0, 188.1 s |
+| FlashAttention-2 | 251 ms | 19.1-19.2 s | 177.9, 178.5 s |
+
+Alone on that GPU the kernel takes 245 ms, and its output is 73 dB above its difference
+from a double-precision reference (36 sampled rows of 128), which is F16 rounding. The
+two engines round differently, and eight denoising steps amplify that: the clips are
+31.6 and 24.8 dB PSNR from the cuDNN ones (the same seeds), the size of change the int8
+projections make. The option is off by default because it downloads sources at
+configure time; it has been built with CUDA 13 on Linux only.
+
+That A100 runs at its 300 W power cap during a step, and the cap sets the multiply
+times: cuBLASLt's int8 fc1 takes 29.5 ms on constant operands at 1350 MHz and 35.6 ms on
+random ones at 1125 MHz, so a kernel timed alone on easy data understates its cost here.
 
 ### Long-sequence attention on Metal
 
@@ -1002,12 +1078,14 @@ but a track that is spectrally plausible and merely wrong.
 | `TS_H3_UPLOAD_WORKERS` | Native bulk-prefault workers (1–8, default 8); distinct from the pipeline's denoiser file-read streams |
 | `TS_H3_UPLOAD_PROFILE=1` | Native weight-upload and graph-compute diagnostics; record separately from trace-free performance runs |
 | `TS_H3_CUDNN_ATTENTION=0` | `ggml_cuda`: keeps every attention on ggml's flash-attention kernel instead of cuDNN's fused SDPA ([below](#long-clips-on-ggml_cuda)); `TS_H3_CUDNN_ATTENTION_VERBOSE=1` prints the cuDNN plans and declines |
+| `TS_H3_FLASH_ATTENTION=0` | `ggml_cuda`, builds with `-DTENSORSHARP_FLASH_ATTENTION=ON` only: keeps the DiT attention on cuDNN's SDPA instead of FlashAttention-2 |
 | `TS_H3_CUBLAS_MATMUL=0` | `ggml_cuda`: keeps the DiT's wide Q4_K projections on MMQ instead of cuBLAS BF16; `TS_H3_CUBLAS_MIN_ROWS` (default 1024) is the token threshold |
 | `TS_H3_FUSED=0` | `ggml_cuda`: builds the unfused DiT and VAE graphs (no fused attention prep, modulation, gated residual or merged LoRA) |
 | `TS_H3_CUDA_F32_PRODUCTS=1` | `ggml_cuda`: runs the DiT forward's weight products (F32/F16/BF16 weights and LoRA factors; quantized weights and the attention's own products excluded) on TensorSharp's F32 GEMM over a pedantic cuBLAS handle instead of ggml-cuda's TF32 cuBLAS. Off by default (its cost on a real checkpoint is not measured); on the all-F32 LoRA parity fixture the native-vs-direct-CPU floor went from 6.08e-4 to 8.07e-6. A product that cannot take the path is named once on stderr and runs on ggml |
 | `TS_H3_DIRECT_READ=0` | `ggml_cuda` on Windows: uploads weights from the mapping instead of reading the file unbuffered; `TS_H3_DIRECT_READ_THREADS` (1–32, default 8) is the reader count |
 | `TS_H3_FP8_MATMUL` | `ggml_cuda`: opt-in FP8 (E4M3) projections through cuBLASLt; `1` for the DiT, `vae` for the video VAE, `all` for both. Changes the output |
-| `TS_H3_INT8_MATMUL=1` | `ggml_cuda`: opt-in int8 projections for the DiT through cuBLASLt, a scale per weight row and per token; also applies to Qwen-Image-2.1's Q4_K projections on cuBLAS. Changes the output |
+| `TS_H3_INT8_MATMUL` | `ggml_cuda`: opt-in int8 projections through cuBLASLt, a scale per weight row and per token; `1` for the DiT, `vae` for the video VAE, `all` for both; `1` and `all` also applies to Qwen-Image-2.1's Q4_K projections on cuBLAS, and `1` and `all` to MiniMax-H3-Image's BF16 projections ([its card](minimax-h3-image.md)). Changes the output |
+| `TS_H3_INT8_DEFER=0`, `TS_H3_INT8_ONE_PASS=0`, `TS_H3_INT8_KEEP_WEIGHTS=0` | `ggml_cuda` with `TS_H3_INT8_MATMUL`: scale every int8 product to F32 with its own pass, round activations in two passes, round the DiT's weights on every call. The output is the same either way; the switches are for A/B timing and for a device short of memory |
 | `TS_H3_STAGE_PROFILE=1` | Synchronizing per-stage timings inside the fused CUDA attention and GEMM nodes, printed when the scratch is released; exclude from formal timings |
 
 ## Reproducing validation

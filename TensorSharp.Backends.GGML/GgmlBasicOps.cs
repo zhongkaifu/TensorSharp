@@ -2345,6 +2345,13 @@ namespace TensorSharp.GGML
             return GgmlNative.TryMiniMaxH3VideoVaeDecode(in args);
         }
 
+        /// <summary><see cref="TryMiniMaxH3VideoVaeDecode"/> over <paramref name="batch"/>
+        /// sequences of <c>args.Tokens</c> tokens in one graph (MiniMax-H3-Image's VAE tiles).</summary>
+        public static bool TryMiniMaxH3VitDecodeBatch(in H3VideoVaeDecodeArgs args, int batch)
+        {
+            return GgmlNative.TryMiniMaxH3VitDecodeBatch(in args, batch);
+        }
+
         /// <summary>MiniMax-H3's Qwen3-VL text-encoder prefill in ONE ggml graph.</summary>
         public static bool TryMiniMaxH3TextEncode(in H3TextEncodeArgs args)
         {

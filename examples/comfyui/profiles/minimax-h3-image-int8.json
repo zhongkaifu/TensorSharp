@@ -1,0 +1,8 @@
+{
+  "description": "MiniMax-H3-Image with the DiT's projections on int8 tensor cores (TS_H3_INT8_MATMUL=1): each BF16 weight row and each token rounded to 8 bits per call, the precision class of ComfyUI's INT8 checkpoint; it denoises a 16 MP picture about 17% faster than bf16.",
+  "config": "config/minimax-h3-image.json",
+  "args": ["--backend", "ggml_cuda"],
+  "env": {"TS_H3_INT8_MATMUL": "1"},
+  "service_name": "tensorsharp-comfyui-minimax-h3-image-int8",
+  "startup_timeout": 3600
+}

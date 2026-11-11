@@ -28,7 +28,7 @@ public sealed class ServingContractConformanceTests
     {
         "qwen35", "qwen4exp", "gemma4", "gptoss", "nemotron_h", "muse-glimmer", "muse-spark",
         "deepseek4", "deepseek41", "glm-dsa", "glm5next", "minimax-m3",
-        "diffusion-gemma", "qwen_image", "wan", "ltx-2.5", "minimax-h3",
+        "diffusion-gemma", "qwen_image", "wan", "ltx-2.5", "minimax-h3", "minimax-h3-image",
     };
 
     /// <summary>
@@ -109,6 +109,9 @@ public sealed class ServingContractConformanceTests
         "minimax-h3: LayerSplit@ggml_cuda",
         "minimax-h3: TensorParallel@cuda",
         "minimax-h3: TensorParallel@ggml_cuda",
+        "minimax-h3-image: HybridParallel@ggml_cuda",
+        "minimax-h3-image: LayerSplit@ggml_cuda",
+        "minimax-h3-image: TensorParallel@ggml_cuda",
         "minimax-m3: HybridParallel@ggml_cuda",
         "muse-glimmer: ContinuousBatching@cpu",
         "muse-glimmer: ContinuousBatching@cuda",
