@@ -1044,7 +1044,7 @@ but a track that is spectrally plausible and merely wrong.
 | `TS_H3_CUDA_F32_PRODUCTS=1` | `ggml_cuda`: runs the DiT forward's weight products (F32/F16/BF16 weights and LoRA factors; quantized weights and the attention's own products excluded) on TensorSharp's F32 GEMM over a pedantic cuBLAS handle instead of ggml-cuda's TF32 cuBLAS. Off by default (its cost on a real checkpoint is not measured); on the all-F32 LoRA parity fixture the native-vs-direct-CPU floor went from 6.08e-4 to 8.07e-6. A product that cannot take the path is named once on stderr and runs on ggml |
 | `TS_H3_DIRECT_READ=0` | `ggml_cuda` on Windows: uploads weights from the mapping instead of reading the file unbuffered; `TS_H3_DIRECT_READ_THREADS` (1–32, default 8) is the reader count |
 | `TS_H3_FP8_MATMUL` | `ggml_cuda`: opt-in FP8 (E4M3) projections through cuBLASLt; `1` for the DiT, `vae` for the video VAE, `all` for both. Changes the output |
-| `TS_H3_INT8_MATMUL` | `ggml_cuda`: opt-in int8 projections through cuBLASLt, a scale per weight row and per token; `1` for the DiT, `vae` for the video VAE, `all` for both; `1` and `all` also applies to Qwen-Image-2.1's Q4_K projections on cuBLAS. Changes the output |
+| `TS_H3_INT8_MATMUL` | `ggml_cuda`: opt-in int8 projections through cuBLASLt, a scale per weight row and per token; `1` for the DiT, `vae` for the video VAE, `all` for both; `1` and `all` also applies to Qwen-Image-2.1's Q4_K projections on cuBLAS, and `1` and `all` to MiniMax-H3-Image's BF16 projections ([its card](minimax-h3-image.md)). Changes the output |
 | `TS_H3_STAGE_PROFILE=1` | Synchronizing per-stage timings inside the fused CUDA attention and GEMM nodes, printed when the scratch is released; exclude from formal timings |
 
 ## Reproducing validation

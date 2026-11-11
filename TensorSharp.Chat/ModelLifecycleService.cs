@@ -261,8 +261,10 @@ namespace TensorSharp.Server
                 _ = NinferQwen38TargetPlan.Create(artifact);
                 _ = TensorSharp.Runtime.NinferQwen38Frontend.FromReader(artifact);
             }
-            else
+            else if (!TensorSharp.Models.MiniMaxH3.MiniMaxH3ImageModel.IsImageDenoiserSafetensors(modelPath))
             {
+                // (A MiniMax-H3-Image safetensors denoiser has no GGUF header; its own header
+                // was just parsed by the check above.)
                 using var gguf = new GgufFile(modelPath);
                 gguf.ThrowIfTruncated();
             }

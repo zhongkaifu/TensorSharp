@@ -1299,7 +1299,7 @@ namespace TensorSharp.Chat
         /// both through one chat route (TensorAgent) decides with this which service a
         /// turn goes to.
         /// </summary>
-        public bool LoadedModelMakesImages => _svc.Model is TensorSharp.Models.QwenImage.QwenImageModel;
+        public bool LoadedModelMakesImages => _svc.Model is TensorSharp.Models.QwenImage.IImageGenerationModel;
 
         /// <summary>The host's authoritative persistent Studio service, shared by chat tools and manual editing.</summary>
         public TensorSharp.Studio.StudioService Studio { get; set; }
@@ -1416,11 +1416,12 @@ namespace TensorSharp.Chat
         // Every loadable QwenImageModel is a Qwen-Image-2.1 model: earlier Qwen-Image
         // checkpoints are refused at load, so the model type is the whole check.
         private const string NotAnImageModelError = "The loaded model is not a Qwen-Image-2.1 model.";
-        private const string NotAGenerationModelError = "Text-to-image generation requires a Qwen-Image-2.1 model.";
+        private const string NotAGenerationModelError =
+            "Text-to-image generation requires an image model (Qwen-Image-2.1 or MiniMax-H3-Image).";
 
-        private TensorSharp.Models.QwenImage.QwenImageModel RequireImageEditModel()
+        private TensorSharp.Models.QwenImage.IImageGenerationModel RequireImageEditModel()
         {
-            if (_svc.Model is not TensorSharp.Models.QwenImage.QwenImageModel editModel)
+            if (_svc.Model is not TensorSharp.Models.QwenImage.IImageGenerationModel { SupportsImageEdit: true } editModel)
                 throw new WebUiRequestRejectedException(400, new { error = NotAnImageModelError });
             return editModel;
         }
@@ -1468,9 +1469,9 @@ namespace TensorSharp.Chat
             EnsureImageEditHeadroom(_loggerFactory.CreateLogger("TensorSharp.Server.ImageEdit"), "Image generation rejected: {Reason}");
         }
 
-        private TensorSharp.Models.QwenImage.QwenImageModel RequireImageGenerationModel()
+        private TensorSharp.Models.QwenImage.IImageGenerationModel RequireImageGenerationModel()
         {
-            if (_svc.Model is not TensorSharp.Models.QwenImage.QwenImageModel model)
+            if (_svc.Model is not TensorSharp.Models.QwenImage.IImageGenerationModel model)
                 throw new WebUiRequestRejectedException(400, new { error = NotAGenerationModelError });
             return model;
         }
@@ -1696,8 +1697,21 @@ namespace TensorSharp.Chat
         /// model keeps the set it had.</summary>
         private sealed class LoraApplyException(string message, Exception inner) : InvalidOperationException(message, inner);
 
+        /// <summary><see cref="ApplyLoras"/> for a picture: a model that takes no plug-ins
+        /// (MiniMax-H3-Image) refuses a non-empty set rather than making the picture without it.</summary>
+        private static void ApplyImageLoras(
+            TensorSharp.Models.QwenImage.IImageGenerationModel model, IReadOnlyList<LoraSpec> loras, ILogger logger)
+        {
+            if (loras == null)
+                return;
+            if (model is ILoraPluginHost host)
+                ApplyLoras(host, loras, logger, "Image request");
+            else if (loras.Count > 0)
+                throw new LoraApplyException($"{model.ImageModelFamily} takes no LoRA plug-ins.", null);
+        }
+
         private async Task<object> RunImageEditAsync(
-            TensorSharp.Models.QwenImage.QwenImageModel model,
+            TensorSharp.Models.QwenImage.IImageGenerationModel model,
             string prompt, TensorSharp.Models.QwenImage.QwenImageParams p, List<byte[]> imageBytesList, ILogger logger,
             bool generate, IReadOnlyList<LoraSpec> loras,
             TensorSharp.Models.QwenImage.ImageGenerationTelemetry telemetry, CancellationToken cancellationToken)
@@ -1721,7 +1735,7 @@ namespace TensorSharp.Chat
                         cancellationToken.ThrowIfCancellationRequested();
                         var inputs = imageBytesList.ConvertAll(bytes => DecodeRequestImage(bytes, "image"));
                         ValidateImageMaskGeometry(p, inputs);
-                        ApplyLoras(model, loras, logger, "Image request");
+                        ApplyImageLoras(model, loras, logger);
                         p.OnStep = (_, total, _) =>
                         {
                             cancellationToken.ThrowIfCancellationRequested();
@@ -1902,7 +1916,8 @@ namespace TensorSharp.Chat
             // consumer that stops reading disposes this iterator without waiting for the picture.
             var imageTelemetry = StartImageRequest(generate);
 
-            if (_svc.Model is not TensorSharp.Models.QwenImage.QwenImageModel editModel)
+            if (_svc.Model is not TensorSharp.Models.QwenImage.IImageGenerationModel editModel
+                || (!generate && !editModel.SupportsImageEdit))
             {
                 imageTelemetry.MarkRefused(ImageRefusedNotImageModel);
                 imageTelemetry.Dispose();
@@ -1980,7 +1995,7 @@ namespace TensorSharp.Chat
                         var inputs = imageBytesList.ConvertAll(bytes => DecodeRequestImage(bytes, "image"));
                         ct.ThrowIfCancellationRequested();
                         ValidateImageMaskGeometry(p, inputs);
-                        ApplyLoras(editModel, loras, logger, "Image request");
+                        ApplyImageLoras(editModel, loras, logger);
                         p.PreviewCount = previewCount;
                         p.OnStep = (step, total, preview) =>
                             {

@@ -280,7 +280,7 @@ namespace TensorSharp.Models.MiniMaxH3
         public static bool LooksLikeMiniMaxH3(GgufFile gguf) =>
             gguf != null && MiniMaxH3Config.IsMiniMaxH3(gguf.Tensors);
 
-        private static string ResolveCompanion(string envVar, string dir,
+        internal static string ResolveCompanion(string envVar, string dir,
                                                string[] preferred, Func<string, bool> match)
         {
             string env = Environment.GetEnvironmentVariable(envVar);

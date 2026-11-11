@@ -26,7 +26,7 @@ namespace TensorSharp.Models.QwenImage
     /// environment variables). This class is not an <see cref="IModelArchitecture"/>
     /// text generator; use <see cref="GenerateImage"/> or <see cref="EditImage(string, RgbImage, QwenImageParams)"/>.
     /// </summary>
-    public sealed class QwenImageModel : ModelBase, ILoraPluginHost
+    public sealed class QwenImageModel : ModelBase, ILoraPluginHost, IImageGenerationModel
     {
         private readonly string _vaePath;
         private readonly string _tePath;
@@ -295,6 +295,11 @@ namespace TensorSharp.Models.QwenImage
         private QwenImage21Pipeline GetPipeline21() => _pipeline21 ??= new QwenImage21Pipeline(this);
 
         /// <summary>Generate an image from text using Qwen-Image-2.1.</summary>
+        string IImageGenerationModel.ImageModelFamily => "qwen_image";
+
+        /// <inheritdoc/>
+        public bool SupportsImageEdit => true;
+
         public RgbImage GenerateImage(string prompt, QwenImageParams p = null)
         {
             return GetPipeline21().Run(prompt, Array.Empty<RgbImage>(), p ?? new QwenImageParams());

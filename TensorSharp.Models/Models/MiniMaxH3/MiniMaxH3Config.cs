@@ -54,7 +54,15 @@ namespace TensorSharp.Models.MiniMaxH3
         public int AttentionHeadDim { get; init; }
         public int FfnHiddenSize { get; init; }
         public int VideoLatentChannels { get; init; }
+        /// <summary>Audio latent channels, or 0 for an image checkpoint (MiniMax-H3-Image),
+        /// which has no audio stream at all.</summary>
         public int AudioLatentChannels { get; init; }
+        /// <summary>True for the audio-video denoisers; false for MiniMax-H3-Image.</summary>
+        public bool HasAudio => AudioLatentChannels > 0;
+        /// <summary>Output heads stacked in <c>final_layer.video_out</c>: 1 for the video
+        /// denoisers, the distilled step count (6) for a PDD checkpoint such as
+        /// MiniMax-H3-Image, whose head for a step is the first head plus that step's offset.</summary>
+        public int PddSteps { get; init; } = 1;
         public int TextDim { get; init; }
         public int RopeInvFreqLength { get; init; }
         public MiniMaxH3TimeEmbedding TimeEmbedding { get; init; }
@@ -95,14 +103,25 @@ namespace TensorSharp.Models.MiniMaxH3
         private const string VideoPatchProj = "video_patch_proj.weight";
         private const string AudioPatchProj = "audio_patch_proj.weight";
 
-        /// <summary>True when the tensor table looks like a MiniMax-H3 diffusion model.
-        /// Used to route a metadata-less GGUF, which no architecture string can do.</summary>
+        /// <summary>The text projection every H3 denoiser has; with the video patch
+        /// projection and no audio one it identifies MiniMax-H3-Image.</summary>
+        private const string ConditionProj = "condition_proj.weight";
+
+        /// <summary>True when the tensor table looks like a MiniMax-H3 audio-video diffusion
+        /// model. Used to route a metadata-less GGUF, which no architecture string can do.</summary>
         public static bool IsMiniMaxH3(IReadOnlyDictionary<string, GgufTensorInfo> tensors)
             => TryFindPrefix(tensors, out _);
 
-        /// <summary>Locate the prefix the H3 weights sit under, if any.</summary>
+        /// <summary>True when the tensor table is a MiniMax-H3-Image denoiser: the H3 DiT
+        /// with no audio stream.</summary>
+        public static bool IsMiniMaxH3Image(IReadOnlyDictionary<string, GgufTensorInfo> tensors)
+            => TryFindPrefix(tensors, out _, requireAudio: false) && !TryFindPrefix(tensors, out _);
+
+        /// <summary>Locate the prefix the H3 weights sit under, if any. The audio-video
+        /// denoisers are the ones with both patch projections; <paramref name="requireAudio"/>
+        /// false also accepts an image denoiser (video patch and text projections only).</summary>
         public static bool TryFindPrefix(
-            IReadOnlyDictionary<string, GgufTensorInfo> tensors, out string prefix)
+            IReadOnlyDictionary<string, GgufTensorInfo> tensors, out string prefix, bool requireAudio = true)
         {
             prefix = null;
             if (tensors is null) return false;
@@ -110,7 +129,8 @@ namespace TensorSharp.Models.MiniMaxH3
             {
                 if (!name.EndsWith(VideoPatchProj, StringComparison.Ordinal)) continue;
                 string candidate = name[..^VideoPatchProj.Length];
-                if (tensors.ContainsKey(candidate + AudioPatchProj))
+                if (tensors.ContainsKey(candidate + AudioPatchProj)
+                    || (!requireAudio && tensors.ContainsKey(candidate + ConditionProj)))
                 {
                     prefix = candidate;
                     return true;
@@ -119,13 +139,14 @@ namespace TensorSharp.Models.MiniMaxH3
             return false;
         }
 
-        /// <summary>Derive the full configuration from a checkpoint's tensor table.</summary>
+        /// <summary>Derive the full configuration from a checkpoint's tensor table, an
+        /// audio-video denoiser or a MiniMax-H3-Image one.</summary>
         public static MiniMaxH3Config Detect(IReadOnlyDictionary<string, GgufTensorInfo> tensors)
         {
             if (tensors is null) throw new ArgumentNullException(nameof(tensors));
-            if (!TryFindPrefix(tensors, out string prefix))
+            if (!TryFindPrefix(tensors, out string prefix, requireAudio: false))
                 throw new InvalidOperationException(
-                    "Not a MiniMax-H3 diffusion checkpoint: video_patch_proj/audio_patch_proj are absent.");
+                    "Not a MiniMax-H3 diffusion checkpoint: video_patch_proj and condition_proj are absent.");
 
             GgufTensorInfo Get(string suffix)
             {
@@ -167,6 +188,18 @@ namespace TensorSharp.Models.MiniMaxH3
                 curveGrid = 0;
             }
 
+            // A PDD checkpoint stacks its step heads in video_out: [hidden, patchDim * steps].
+            int pddSteps = 1;
+            if (Has("final_layer.video_out.weight"))
+            {
+                int videoOutRows = Dim(Get("final_layer.video_out.weight"), 1);
+                int patchDim = videoChannels * patchVolume;
+                if (patchDim <= 0 || videoOutRows % patchDim != 0)
+                    throw new InvalidOperationException(
+                        $"MiniMax-H3 final_layer.video_out has {videoOutRows} rows, not a multiple of the {patchDim}-value patch.");
+                pddSteps = videoOutRows / patchDim;
+            }
+
             return new MiniMaxH3Config
             {
                 Prefix = prefix,
@@ -177,7 +210,8 @@ namespace TensorSharp.Models.MiniMaxH3
                 AttentionHeadDim = headDim,
                 FfnHiddenSize = ffn,
                 VideoLatentChannels = videoChannels,
-                AudioLatentChannels = Dim(Get(AudioPatchProj), 0),
+                AudioLatentChannels = Has(AudioPatchProj) ? Dim(Get(AudioPatchProj), 0) : 0,
+                PddSteps = pddSteps,
                 TextDim = Dim(Get("condition_proj.weight"), 0),
                 RopeInvFreqLength = Dim(Get("rope.inv_freq"), 0),
                 TimeEmbedding = timeEmbedding,
@@ -218,6 +252,7 @@ namespace TensorSharp.Models.MiniMaxH3
             $"MiniMax-H3 DiT: hidden={HiddenSize} layers={NumLayers}(+{TokenRefinerLayers} refiner) " +
             $"heads={NumAttentionHeads}x{AttentionHeadDim} (inner={AttentionInnerDim}) ffn={FfnHiddenSize} " +
             $"video_ch={VideoLatentChannels} audio_ch={AudioLatentChannels} text_dim={TextDim} " +
+            (PddSteps > 1 ? $"pdd_heads={PddSteps} " : "") +
             $"rope={RopeInvFreqLength}x3 (rot={RopeRotaryDim}/{AttentionHeadDim}) " +
             $"time={TimeEmbedding}({TimeEmbedDim}" +
             (AdaLnCurveGrid > 0 ? $", grid={AdaLnCurveGrid}" : "") + ")";

@@ -1,0 +1,73 @@
+{
+  // MiniMax-H3-Image — text to image at up to ~16 MP, the MiniMax-H3 DiT (33B) without
+  // its audio stream, six distilled steps, no CFG.
+  //
+  //   TensorSharp.Server.Host --config config/minimax-h3-image.json
+  //
+  //   TensorSharp.Cli --config config/minimax-h3-image.json \
+  //     --prompt "a red paper lantern in a snowy courtyard at dusk" --output lantern.png
+  //
+  // Downloads into ${modelRoot} on the first run (~58 GB) and reuses the files after:
+  //   1. the denoiser     (model)               the bf16 DiT as MiniMax released it   40.2 GB
+  //   2. Qwen3-VL-32B     (video-text-encoder)  MiniMax-H3's text encoder, 50 layers  16.97 GiB
+  //   3. the image VAE    (video-vae)           2-D ViT decoder, 16x                   1.17 GB
+  // The denoiser is read from the safetensors file as it is; there is no GGUF to make.
+  // The text encoder is the same file config/minimax-h3-fl2va.json downloads, so the two
+  // configs share it.
+  //
+  // Steps, size and guidance are left to the model: six steps on the checkpoint's own
+  // sigma grid (anything else is allowed but is not what it was distilled for), guidance
+  // fixed at 1 (a cfg above 1 or a negative prompt is refused), and 2048 x 2048 when a
+  // request names no size, which is what ComfyUI's template opens at. The model works
+  // from about 4 MP to 20 MP and is best around 16 MP: 4096x4096, 4736x3552, 5024x3360,
+  // 5472x3072, 6272x2688 (sides are multiples of 32). Seeds draw the initial latent as
+  // ComfyUI does (CPU torch.randn), so a seed reproduces ComfyUI's template picture up to
+  // kernel precision.
+  //
+  // Licence: the MiniMax-H3-Image Community License Agreement, which excludes the United
+  // States, the European Union, the United Kingdom and the Republic of Korea; see
+  // docs/models/minimax-h3-image.md before using it.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "hf": "https://huggingface.co",
+    "comfy": "${hf}/Comfy-Org/MiniMax-H3-Image/resolve/0bb149f51e3156ed4b90dd45d5620346bfe1df8f",
+    "gguf": "${hf}/unsloth/MiniMax-H3-GGUF/resolve/d629413c2e5b51b38c453668b75ca3b06ca92703"
+  },
+
+  "backend": "ggml_cuda",
+
+  "model": {
+    "path": "${modelRoot}/minimax-h3-image/minimax_h3_image_pruned_bf16.safetensors",
+    "urls": [ "${comfy}/diffusion_models/minimax_h3_image_pruned_bf16.safetensors" ],
+    "sha256": "a767f5325db019588b3491a93d80288d336c826a7aeb87bec67675e554367222"
+  },
+
+  "video-text-encoder": {
+    "path": "${modelRoot}/qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
+    "urls": [ "${gguf}/qwen3vl_32b_minimax_h3-Q4_K_M.gguf" ],
+    "sha256": "11e6efe70a57ce7f4838c47bdbd1a1c4b8ce10e2b7747f1b065990b70f4b05fc",
+    "files": [
+      {
+        "path": "${modelRoot}/vocab.json",
+        "urls": [ "${hf}/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/vocab.json" ],
+        "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      },
+      {
+        "path": "${modelRoot}/merges.txt",
+        "urls": [ "${hf}/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/merges.txt" ],
+        "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"
+      },
+      {
+        "path": "${modelRoot}/tokenizer_config.json",
+        "urls": [ "${hf}/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/tokenizer_config.json" ],
+        "sha256": "a07e942ac874baa13758de8d1fbdb186683cc03416b5589e1b6671c6b3057c68"
+      }
+    ]
+  },
+
+  "video-vae": {
+    "path": "${modelRoot}/minimax-h3-image/minimax_h3_image_vae_fp16.safetensors",
+    "urls": [ "${comfy}/vae/minimax_h3_image_vae_fp16.safetensors" ],
+    "sha256": "d80e9c2e5cfc9844869961ff5a58c9a9e52182df6bfb30b26018dd7f348721af"
+  }
+}

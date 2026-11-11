@@ -133,6 +133,11 @@ namespace TensorSharp.Models.Media.Desktop
                 StorageType.Char, channels == 4 ? PixelMapping.RGBA : PixelMapping.RGB);
             using var image = new MagickImage(rgb8, settings);
             image.Format = MagickFormat.Png;
+            // PNG quality is zlib level x 10 + row filter: 15 is level 1 with adaptive
+            // filters. ImageMagick's default, 75 (level 7), spent 8.3 s on a 16 MP
+            // MiniMax-H3-Image picture for 19.3 MB; level 1 takes 0.9 s for 22.0 MB (level 4,
+            // 45, 2.0 s for 19.6 MB), so a large picture no longer waits on its own encode.
+            image.Quality = 15;
             return image.ToByteArray();
         }
 
