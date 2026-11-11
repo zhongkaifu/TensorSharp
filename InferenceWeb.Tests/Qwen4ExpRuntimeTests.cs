@@ -500,4 +500,33 @@ public sealed class Qwen4ExpRuntimePromptKernelTests : IDisposable
         Qwen4ExpRuntimeTests.AssertClose(ops, kernel, 1e-3, "metal kernel vs ops");   // 4.5e-5 measured (M5 Pro)
         Qwen4ExpRuntimeTests.AssertClose(managed, kernel, 2e-2, "metal kernel vs managed");
     }
+
+    /// <summary>A prompt chunk past the QSA budget attends only each row's chosen cells on TensorSharp's kernels
+    /// (tsm_qsa_compact, tsm_qsa_attn) where its window is wide enough (8K cells on the tensor API; the test hook lowers
+    /// it to the fixture's): the same rows as ggml's flash attention under the selection's mask. The kernels read an
+    /// F16 cache, pinned for this test's models only.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void SelectedAttentionAnswersAsTheMaskedFlashAttention()
+    {
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-selected.gguf"), indexerTopK: 8, qsa: true);   // dense up to 11
+        using IDisposable f16 = KvCacheDtypeConfig.ForCurrentFlowInTests(KvCacheDtype.F16);
+        float[][] masked = Rows(new Qwen4ExpRuntimeModel(path, BackendType.GgmlMetal), Prompt.Length);
+        float[][] selected;
+        long passes;
+        GgmlBasicOps.TsmQsaAttnSetMinCells(1);
+        try
+        {
+            long before = GgmlBasicOps.TsmQsaAttnCount();
+            selected = Rows(new Qwen4ExpRuntimeModel(path, BackendType.GgmlMetal), Prompt.Length);
+            passes = GgmlBasicOps.TsmQsaAttnCount() - before;
+        }
+        finally
+        {
+            GgmlBasicOps.TsmQsaAttnSetMinCells(0);
+        }
+        _output.WriteLine($"selected attention passes {passes}; vs the masked flash attention "
+            + string.Join(" ", Qwen4ExpRuntimeTests.RowErrors(masked, selected).Select(e => e.ToString("E1"))));
+        Assert.Equal(2, passes);   // the fixture's two QSA layers in the prompt chunk (decode rows take ggml's sparse path)
+        Qwen4ExpRuntimeTests.AssertClose(masked, selected, 1e-3, "selected attention vs masked flash attention");   // 4.8e-5 measured (M5 Pro)
+    }
 }

@@ -27,9 +27,9 @@ namespace TensorSharp.Models
         private const uint CheckpointMagic = 0x4C535354; // "TSSL"
         private const int CheckpointVersion = 2;   // 2: the rotary delta
 
-        /// <summary>The format a checkpoint file is written in: 3 where the model keeps extra key caches (their rows
-        /// follow the recurrent states), so a file without them is not read as one with them.</summary>
-        private int CheckpointFormat => _extraCacheLayer.Length > 0 ? 3 : CheckpointVersion;
+        /// <summary>The format a checkpoint file is written in: where the model keeps extra key caches (their rows
+        /// follow the recurrent states) 4, so a file without them, or with 3's one-key QSA rows, is not read as one.</summary>
+        private int CheckpointFormat => _extraCacheLayer.Length > 0 ? 4 : CheckpointVersion;
 
         public bool SupportsPrefixCheckpoints => SupportsPerSequenceFusedForward && RecurrentStatesCopy;
 

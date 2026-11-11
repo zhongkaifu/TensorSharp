@@ -159,11 +159,11 @@ cell a row sees, so dense attention is exact.
 
 Past the budget, the selection follows llama.cpp after #29751 (`build_qsa_sel`):
 
-- **Indexer keys.** Every row's raw key (`indexer.k_proj · x`) goes into an extra key cache of the slot, one head
-  wide, in the K/V cache's type, dense or not. It is an entry of the slot's K array after the layers' caches, so
-  slot growth, copies, checkpoints and their files move it with the rest.
+- **Indexer keys.** Every row's raw key (`indexer.k_proj · x`) goes into an extra key cache of the slot, in the K/V
+  cache's type, dense or not. It is an entry of the slot's K array after the layers' caches, so slot growth, copies,
+  checkpoints and their files move it with the rest.
 - **Blocks.** A block is `ratio` consecutive cells. Its pooled key is the mean of its members' raw keys, RMS-normed
-  with `indexer.k_norm` and rotated to its first cell. Blocks span the attention window; those past the cells are
+  with `indexer.k_norm` and rotated to its first cell, kept in its last member's row once it is complete. Blocks span the attention window; those past the cells are
   padded and invisible, so a decode graph replays within a window bucket.
 - **Scores.** The rows' indexer queries (`indexer.q_proj`, `indexer.q_norm`, rotated at their positions) score every
   block with `GraphOp.LightningIndexer`: the heads' rectified dot products, summed and scaled by `1/sqrt(d)`. A block
@@ -182,7 +182,10 @@ blocks plus the tail.
 Limits:
 
 - A step with rotary position tables (media) past the budget is refused with a reason.
-- Every step pools every block again: O(window) per QSA layer, which is small next to the attention it masks.
+- A cache row is [raw key | pooled key] (twice llama.cpp's raw-only width per cell, as its packed rows): every
+  step writes its rows as [raw | 0] and pools the blocks it completes into their last members' rows; a selecting
+  step gathers the pooled keys. A rewind leaves a stale pooled key only in a block it made incomplete, which no row
+  sees until the block completes and is pooled again. Checkpoint files of this layout are format 4.
 - A dense step limits its decode advance to the budget (`GraphStep.LimitAdvance`), so a step past it is traced and
   selects. Qwen4Exp steps do not advance today: the PLE layer's gathered rows are an opaque input.
 - Dense and selecting steps emit different graphs, so the family names the mode (`EmissionVariant`): a streamed step
@@ -224,9 +227,26 @@ Decode and verify rows past the budget pass the selection's width to the attenti
 `ggml_flash_attn_ext_set_n_kv_max`), so ggml-metal attends only the selected cells: at 14,769 tokens decode went
 from 23.2-23.5 to 23.8-23.9 tok/s (three interleaved runs each, same text; `Qwen4ExpModel` 23.4-24.2). Prompt chunks
 keep the dense kernels: ggml's sparse path is a one-row kernel. That prompt takes 25.8-26.5 s against
-`Qwen4ExpModel`'s 24.0-24.6 s, with the same text. The gap is the attention over a window past 8K cells, which
-`Qwen4ExpModel` runs over each token's chosen cells only (`tsm_qsa_attn`) and the runtime runs densely under the
+`Qwen4ExpModel`'s 24.0-24.6 s, with the same text. The gap was the attention over a window past 8K cells, which
+`Qwen4ExpModel` runs over each token's chosen cells only (`tsm_qsa_attn`) and the runtime ran densely under the
 selection's mask (919 ms of a 2,480-row chunk's synchronized node time at 14.8K cells).
+
+A prompt chunk's attention past the budget now does too: the GGML builder lowers a flash attention that carries the
+selection's width, at prompt width and over a window `tsm::qsa_attn_supported` takes (8K cells on the tensor API),
+to one device operation that compacts the mask into each row's cell list (`tsm_qsa_compact`) and runs `tsm_qsa_attn`
+over those cells. On the synthetic checkpoint it answers within 4.8e-5 of ggml's flash attention under the same mask
+(`SelectedAttentionAnswersAsTheMaskedFlashAttention`, the window threshold lowered by a test hook). At 14,769 tokens
+the prompt takes 24.7-24.8 s against `Qwen4ExpModel`'s 23.5-24.3 s (two interleaved runs each). Decode at that
+length was 22.9-23.0 against 23.7-24.2 tok/s: the runtime pooled every block's indexer key again each step, where
+`Qwen4ExpModel` keeps the pooled keys.
+
+The runtime keeps them too now (§2.3): a QSA cache row is [raw key | pooled key], each step pools only the blocks it
+completes (a decode or verify step its last ceil(count / ratio) complete blocks, the same values again, so its graph
+does not change with the position), and the selection gathers each block's pooled key from its last member's row.
+On the synthetic checkpoint every row is bit-identical to pooling the window every step (managed and Metal; a probe
+that read the wrong row does differ). At 14,769 tokens, two interleaved runs each, 96 tokens: decode 24.7-24.9
+against 24.5-24.7 tok/s, prompt 24.8-24.9 against 23.7-24.5 s; at 3,608 tokens decode 25.3-25.4 against 25.6-25.7,
+prompt 5.73-5.79 against 5.72-5.75 s.
 
 ### 2.4 PLE
 

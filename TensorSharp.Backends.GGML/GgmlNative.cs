@@ -4647,6 +4647,8 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static partial long TSGgml_TsmQsaAttnCount();
         [LibraryImport(DllName)]
+        internal static partial void TSGgml_TsmQsaAttnSetMinCells(int cells);
+        [LibraryImport(DllName)]
         internal static partial int TSGgml_TsmQsaSelectProbe(int T, int nCells, int nBlocks, int heads, int width,
             IntPtr scores, IntPtr bias, IntPtr cellBlocks, IntPtr maskIn, IntPtr maskOut);
         [LibraryImport(DllName)]

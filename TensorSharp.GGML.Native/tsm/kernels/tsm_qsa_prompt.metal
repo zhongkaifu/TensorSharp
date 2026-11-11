@@ -47,6 +47,44 @@ static inline float tsm_qsa_value(device const float* srow, device const int* ce
     return srow[cell_blocks[c]] + float(mrow[c]);
 }
 
+// A selection given as its attention mask (the runtime's GraphOp.TopKMask: the chosen cells keep the mask's value,
+// the rest are -inf) as tsm_qsa_attn's lists: idx [T][width] = each token's finite cells in ascending order, cnt [T] =
+// their number (at most width). grid (T), 256 threads.
+struct TsmQsaCompactArgs {
+    uint n_tok;
+    uint n_cells;
+    uint width;
+    uint pad;
+};
+
+kernel void tsm_qsa_compact(device const half* mask [[buffer(0)]], device int* idx [[buffer(1)]], device int* cnt [[buffer(2)]],
+                            constant TsmQsaCompactArgs& a [[buffer(3)]],
+                            uint t [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                            ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup uint sg_kept[kQsaThreads / 32];
+    const uint n = a.n_cells;
+    device const half* row = mask + ulong(t) * n;
+    device int* irow = idx + ulong(t) * a.width;
+    uint base = 0;
+    for (uint c0 = 0; c0 < n; c0 += kQsaThreads) {
+        const uint c = c0 + tid;
+        const uint keep = (c < n && isfinite(float(row[c]))) ? 1u : 0u;
+        const uint before_in_sg = simd_prefix_exclusive_sum(keep);
+        const uint sg_total = simd_sum(keep);
+        if (lane == 0) sg_kept[sg] = sg_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint before = base + before_in_sg, tile = 0;
+        for (uint i = 0; i < kQsaThreads / 32; ++i) {
+            if (i < sg) before += sg_kept[i];
+            tile += sg_kept[i];
+        }
+        if (keep != 0u && before < a.width) irow[before] = int(c);
+        base += tile;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) cnt[t] = int(min(base, a.width));
+}
+
 // grid (T), 256 threads
 kernel void tsm_qsa_select(device const float* S [[buffer(0)]], device const int* cell_blocks [[buffer(1)]],
                            device const half* mask_in [[buffer(2)]], device half* mask_out [[buffer(3)]],

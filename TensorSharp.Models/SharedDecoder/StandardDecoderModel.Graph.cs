@@ -1232,6 +1232,16 @@ namespace TensorSharp.Models
             /// <summary>Multi-axis rotary positions [4 * rows] (I32), or -1.</summary>
             public int PositionTable { get; private set; } = -1;
 
+            /// <summary>Rows [n, 1] (I64) a scattered write goes to (they do not follow the rows' positions).</summary>
+            internal int InputRows(int[] rows)
+            {
+                var values = new long[rows.Length];
+                for (int i = 0; i < rows.Length; i++) values[i] = rows[i];
+                int node = Leaf(GraphLeafRole.Input, GraphFormat.I64, stackalloc long[] { rows.Length, 1 }, IntPtr.Zero, 0);
+                AddInput(node, Pin(values), values.LongLength * sizeof(long), values: values);
+                return node;
+            }
+
             /// <summary>The rows [count, 1] (I64) a short chunk is written at: start .. start + count - 1.</summary>
             internal int WriteRows(int start, int count)
             {

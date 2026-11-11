@@ -13,14 +13,17 @@ using TensorSharp.Graph;
 namespace TensorSharp.Models
 {
     /// <summary>
-    /// QSA, Qwen 3.8's sparse attention layers (llama.cpp src/models/qwen4exp.cpp, build_qsa_sel). Every token's raw
-    /// indexer key (<c>indexer.k_proj · x</c>) is kept in the slot's extra key cache. A block is <c>ratio</c> consecutive
-    /// cells; its pooled key is the mean of its members' raw keys, RMS-normed and rotated to its first cell. A query
-    /// row scores every block it can see with the lightning indexer (the heads' rectified dot products, summed) and
-    /// attends the cells of its top <c>top_k / ratio</c> blocks and of its own incomplete tail block, under the causal
-    /// mask. While a sequence holds no more cells than that selection keeps, it attends densely, which is the same.
-    /// Blocks span the attention window (padded past the cells, invisible), so a decode graph replays within a window
-    /// bucket. Rows at text positions only: a position table (media) is refused once the selection is sparse.
+    /// QSA, Qwen 3.8's sparse attention layers (llama.cpp src/models/qwen4exp.cpp, build_qsa_sel). A block is
+    /// <c>ratio</c> consecutive cells; its pooled key is the mean of its members' raw indexer keys
+    /// (<c>indexer.k_proj · x</c>), RMS-normed and rotated to its first cell. A row of the slot's extra key cache is
+    /// [raw key | pooled key]: every step writes its rows' raw keys and pools the blocks it completes into their last
+    /// members' rows (llama.cpp's kpool), dense or not, so the selection reads each block's pooled key instead of pooling
+    /// the window again. A query row scores every block it can see with the lightning indexer (the heads' rectified dot
+    /// products, summed) and attends the cells of its top <c>top_k / ratio</c> blocks and of its own incomplete tail
+    /// block, under the causal mask. While a sequence holds no more cells than that selection keeps, it attends densely,
+    /// which is the same. Blocks span the attention window (padded past the cells, invisible), so a decode graph
+    /// replays within a window bucket. Rows at text positions only: a position table (media) is refused once the
+    /// selection is sparse.
     /// </summary>
     public sealed partial class Qwen4ExpRuntimeModel
     {
@@ -54,30 +57,77 @@ namespace TensorSharp.Models
             return new string(modes);
         }
 
-        /// <summary>Decode and verify rows past the budget attend at most the budget's cells (the top blocks and the
-        /// tail): the backend may attend only those (ggml-metal's sparse flash attention). Prompt chunks keep the dense
-        /// kernels, which ggml's one-row sparse kernel does not beat at their width.</summary>
+        /// <summary>Rows past the budget attend at most the budget's cells (the top blocks and the tail), so the backend
+        /// may attend only those: ggml-metal's sparse flash attention for decode and verify rows, TensorSharp's kernel
+        /// (tsm_qsa_attn) for a prompt chunk over a wide window.</summary>
         protected override int AttentionKvMax(GraphStep step, int layer, int s)
-            => QsaRatio(layer) > 0 && step.Counts[s] <= SmallChunkRows && step.Starts[s] + step.Counts[s] > Ple.QsaBudget
-                ? (int)Ple.QsaBudget : 0;
+            => QsaRatio(layer) > 0 && step.Starts[s] + step.Counts[s] > Ple.QsaBudget ? (int)Ple.QsaBudget : 0;
 
-        /// <summary>A QSA layer's slots keep each cell's raw indexer key.</summary>
-        protected override int ExtraKeyCacheWidth(int layer) => QsaRatio(layer) > 0 ? Qsa.Dim : 0;
+        /// <summary>A QSA layer's slots keep each cell's [raw indexer key | its block's pooled key, in the block's last
+        /// cell].</summary>
+        protected override int ExtraKeyCacheWidth(int layer) => QsaRatio(layer) > 0 ? 2 * Qsa.Dim : 0;
 
-        /// <summary>Every row's raw indexer key into its sequence's cache, dense or not: the selection pools them once a
-        /// sequence outgrows the dense budget.</summary>
+        /// <summary>The cache of <paramref name="layer"/> for sequence <paramref name="s"/>, [2d, capacity].</summary>
+        private int QsaCache(GraphStep step, int layer, int s)
+        {
+            Slot slot = step.Slots[s];
+            return step.State(ExtraKeyCache(slot.K, layer), KvCacheGraphType, 2 * Qsa.Dim, slot.Capacity, 1);
+        }
+
+        /// <summary>Every row's raw indexer key into its sequence's cache, and the blocks the step completes pooled into
+        /// their last members' rows, dense or not: a selecting step reads every block's pooled key.</summary>
         protected override void EmitAttentionInput(GraphStep step, int layer, int x)
         {
-            if (QsaRatio(layer) <= 0) return;
+            int ratio = QsaRatio(layer);
+            if (ratio <= 0) return;
             int d = Qsa.Dim, kvType = KvCacheGraphType;
+            const long f = sizeof(float);
             int raw = step.MatMul(LayerName(layer, "indexer.k_proj.weight"), x);   // [d, rows]
             for (int s = 0; s < step.Sequences; s++)
             {
-                int count = step.Counts[s];
+                int count = step.Counts[s], start = step.Starts[s];
                 Slot slot = step.Slots[s];
-                int cache = step.State(ExtraKeyCache(slot.K, layer), kvType, d, slot.Capacity, 1);
-                int rows = step.Sequences == 1 ? raw : step.View2(raw, d, count, d * 4L, step.First[s] * d * 4L);
-                step.Effect(step.Op(GraphOp.SetRows, cache, step.Reshape(step.Cont(rows), d, count, 1), step.WriteRows(step.Starts[s], count)));
+                int cache = QsaCache(step, layer, s);
+                int rows = step.Sequences == 1 ? raw : step.View2(raw, d, count, d * f, step.First[s] * d * f);
+                // [raw | 0]: a row's pooled half is written once its block is complete (llama.cpp's packed rows).
+                int packed = step.Op(GraphOp.Concat, stackalloc[] { step.Cont(rows), step.Op(GraphOp.Scale, stackalloc[] { step.Cont(rows) }, default, stackalloc[] { 0f }) },
+                    stackalloc long[] { 0 });
+                step.Effect(step.Op(GraphOp.SetRows, cache, step.Reshape(packed, 2 * d, count, 1), step.WriteRows(start, count)));
+
+                // The blocks to pool: those the step completes; a decode or verify step pools its last ceil(count /
+                // ratio) complete blocks (again where they were complete before: the same values), so its graph is the
+                // same at every position.
+                int end = (start + count) / ratio;
+                int first = count <= SmallChunkRows ? end - (count + ratio - 1) / ratio : (start + ratio) / ratio - 1;
+                first = Math.Max(first, 0);
+                if (end <= first) continue;
+                int n = end - first;
+                var members = new int[ratio * n];
+                var lastRows = new int[n];
+                var positions = new int[n];
+                for (int b = 0; b < n; b++)
+                {
+                    int block = first + b;
+                    positions[b] = block * ratio;
+                    lastRows[b] = block * ratio + ratio - 1;
+                    for (int i = 0; i < ratio; i++) members[b * ratio + i] = block * ratio + i;
+                }
+                // The members' raw keys (the cache's raw half, rows of 2d), read after this step's write.
+                int rawHalf = step.View2(cache, d, slot.Capacity, RowBytes(kvType, 2 * d), 0);
+                int gathered = step.Op(GraphOp.GetRows, rawHalf, step.InputI32(members, members.Length));   // [d, ratio * n]
+                int sum = -1;
+                for (int i = 0; i < ratio; i++)
+                {
+                    int member = step.View2(gathered, d, n, ratio * d * f, i * d * f);
+                    sum = sum < 0 ? step.Cont(member) : step.Op(GraphOp.Add, sum, member);
+                }
+                int pooled = step.Op(GraphOp.Scale, stackalloc[] { sum }, default, stackalloc[] { 1f / ratio });
+                pooled = step.RmsNorm(pooled, LayerName(layer, "indexer.k_norm.weight"));
+                pooled = step.RopeAt(step.Reshape(pooled, d, 1, n), GraphRotary, step.InputI32(positions, n));
+                // [the last member's raw key | the pooled key] into the last member's row.
+                int lastRaw = step.Cont(step.View2(gathered, d, n, ratio * d * f, (ratio - 1) * d * f));
+                int row = step.Op(GraphOp.Concat, stackalloc[] { lastRaw, step.Reshape(pooled, d, n) }, stackalloc long[] { 0 });
+                step.Effect(step.Op(GraphOp.SetRows, cache, step.Reshape(row, 2 * d, n, 1), step.InputRows(lastRows)));
             }
         }
 
@@ -100,18 +150,13 @@ namespace TensorSharp.Models
 
             // The plan: blocks over the window, complete ones holding cells, the rest padded and invisible.
             int pools = (keys + ratio - 1) / ratio, complete = (start + count) / ratio;
-            var gather = new int[ratio * pools];          // the members a block's key pools (padded blocks read cell 0)
+            var pooledRows = new int[pools];              // the row holding a block's pooled key (padded blocks read row 0)
             var cells = new int[ratio * pools];           // the members a picked block keeps (padded: out of range)
-            var poolPositions = new int[pools];
             for (int b = 0; b < pools; b++)
             {
-                poolPositions[b] = b * ratio;
+                pooledRows[b] = b < complete ? b * ratio + ratio - 1 : 0;
                 for (int i = 0; i < ratio; i++)
-                {
-                    int c = b * ratio + i;
-                    gather[b * ratio + i] = b < complete ? c : 0;
-                    cells[b * ratio + i] = b < complete ? c : keys;
-                }
+                    cells[b * ratio + i] = b < complete ? b * ratio + i : keys;
             }
             var visible = new ushort[pools * count];      // 0 where row q sees all of block b, -inf elsewhere (F16)
             var tail = new int[(ratio - 1) * count];      // row q's incomplete block's cells (out of range past them)
@@ -124,19 +169,9 @@ namespace TensorSharp.Models
                     tail[r * (ratio - 1) + t] = tailStart + t <= p ? tailStart + t : keys;
             }
 
-            // Each block's pooled key: the mean of its members, normed, rotated to its first cell.
-            int cache = step.State(ExtraKeyCache(slot.K, layer), kvType, d, slot.Capacity, 1);
-            int rowsOf = step.View2(cache, d, slot.Capacity, RowBytes(kvType, d), 0);
-            int members = step.Op(GraphOp.GetRows, rowsOf, step.InputI32(gather, gather.Length));   // [d, ratio * pools]
-            int sum = -1;
-            for (int i = 0; i < ratio; i++)
-            {
-                int member = step.View2(members, d, pools, ratio * d * 4L, i * d * 4L);
-                sum = sum < 0 ? step.Cont(member) : step.Op(GraphOp.Add, sum, member);
-            }
-            int pooled = step.Op(GraphOp.Scale, stackalloc[] { sum }, default, stackalloc[] { 1f / ratio });
-            pooled = step.RmsNorm(pooled, LayerName(layer, "indexer.k_norm.weight"));
-            pooled = step.RopeAt(step.Reshape(pooled, d, 1, pools), GraphRotary, step.InputI32(poolPositions, pools));
+            // Each block's pooled key, from its last member's row (the cache's pooled half).
+            int pooledHalf = step.View2(QsaCache(step, layer, s), d, slot.Capacity, RowBytes(kvType, 2 * d), RowBytes(kvType, d));
+            int pooled = step.Reshape(step.Op(GraphOp.GetRows, pooledHalf, step.InputI32(pooledRows, pools)), d, 1, pools);
 
             // The rows' indexer queries, scored against every block.
             int xs = step.Sequences == 1 ? x : step.View2(x, Config.HiddenSize, count, Config.HiddenSize * 4L, step.First[s] * Config.HiddenSize * 4L);

@@ -3556,6 +3556,14 @@ namespace TensorSharp.GGML
             catch (EntryPointNotFoundException) { return 0; }
         }
 
+        /// <summary>Test hook: the narrowest attention window (cells) the prompt QSA attention over the chosen cells takes
+        /// (0 restores the default), so a synthetic checkpoint's short windows reach it. No-op off Apple's Metal builds.</summary>
+        public static void TsmQsaAttnSetMinCells(int cells)
+        {
+            try { GgmlNative.TSGgml_TsmQsaAttnSetMinCells(cells); }
+            catch (EntryPointNotFoundException) { }
+        }
+
         /// <summary>Fixed-size rows of a mapping registered for explicit reads (HostExpertIoRegister), one pread each,
         /// packed into <paramref name="dst"/> in list order. False (nothing read) when a row is outside every registered
         /// mapping; the caller then reads the mapping.</summary>

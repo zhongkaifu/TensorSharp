@@ -150,11 +150,14 @@ namespace TensorSharp.Models
     {
         private static KvCacheDtype _current = KvCacheDtype.F32;
         private static bool _explicitlySet;
+        // A test's own choice for the models it constructs on its flow, ahead of the process-wide one, which tests
+        // running alongside may be setting (ForCurrentFlowInTests).
+        private static readonly System.Threading.AsyncLocal<KvCacheDtype?> s_flow = new();
 
         /// <summary>The user's explicit choice, or F32 when there is none. Not the dtype
         /// any particular model allocated (see <c>ModelBase.KvCacheDtype</c>).</summary>
-        public static KvCacheDtype Current => _current;
-        public static bool IsExplicitlySet => _explicitlySet;
+        public static KvCacheDtype Current => s_flow.Value ?? _current;
+        public static bool IsExplicitlySet => s_flow.Value.HasValue || _explicitlySet;
 
         public static void Set(KvCacheDtype dtype)
         {
@@ -172,6 +175,25 @@ namespace TensorSharp.Models
         {
             _current = dtype;
             _explicitlySet = explicitlySet;
+        }
+
+        /// <summary>
+        /// An explicit choice for the models constructed on the calling test's flow only (disposing restores the
+        /// flow's previous one): a test whose path depends on the cache's type, unaffected by tests in parallel
+        /// that set the process-wide choice.
+        /// </summary>
+        internal static IDisposable ForCurrentFlowInTests(KvCacheDtype dtype)
+        {
+            KvCacheDtype? previous = s_flow.Value;
+            s_flow.Value = dtype;
+            return new FlowScope(previous);
+        }
+
+        private sealed class FlowScope : IDisposable
+        {
+            private readonly KvCacheDtype? _previous;
+            public FlowScope(KvCacheDtype? previous) => _previous = previous;
+            public void Dispose() => s_flow.Value = _previous;
         }
 
         /// <summary>

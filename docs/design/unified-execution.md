@@ -811,7 +811,10 @@ Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
   graph segments as `Qwen4ExpModel` runs them (`HostMoeSegment::device_op`): `DeltaNetPrompt`, a delta-net
   layer's whole mixer from its input projections to the gated output, conv window and state written in
   place (`tsm_gdn_prompt`; sigmoid output gate only), and `HcRead`, a hyper-connection read
-  (`tsm_hc_read`). The region's ops are numbered but not built; the operands the kernel reads and its
+  (`tsm_hc_read`). A flash attention that carries a selection's width (`FlashAttnExt` ip[1], a bound on every
+  mask row's finite cells) runs, at prompt width over a window of 8K cells or more, as a device operation that
+  compacts the mask into cell lists and attends only those (`tsm_qsa_compact`, `tsm_qsa_attn`); decode and
+  verify rows pass the bound to ggml (`ggml_flash_attn_ext_set_n_kv_max`). The region's ops are numbered but not built; the operands the kernel reads and its
   results live in an IO buffer outside the graph allocator (one region per role, reused by every layer,
   kept for the next prompt chunk and released by `TSGgml_Shutdown`). Prompt chunks on Metal over an F16
   or block-quantized cache also write K/V by index and attend its window padded to 64 rows

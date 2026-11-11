@@ -264,6 +264,7 @@ namespace
     {
         FUSED_DELTA_NET_PROMPT = 5,   // GraphFusion.DeltaNetPrompt
         FUSED_HC_READ = 6,            // GraphFusion.HcRead
+        SELECTED_ATTENTION = 100,     // a prompt chunk's flash attention under a selection's mask (no region: the op)
     };
 
     struct DeviceIo
@@ -306,7 +307,11 @@ namespace
 
     // The IO buffer's roles: each operand a kind's operation keeps there, one region per role (every region of the
     // kind reuses it; different kinds never share one).
-    enum IoRole { IO_GDN_QKV, IO_GDN_Z, IO_GDN_ALPHA, IO_GDN_BETA, IO_GDN_Y, IO_HC_MIXED, IO_HC_INJECT, IO_ROLES };
+    enum IoRole
+    {
+        IO_GDN_QKV, IO_GDN_Z, IO_GDN_ALPHA, IO_GDN_BETA, IO_GDN_Y, IO_HC_MIXED, IO_HC_INJECT,
+        IO_SEL_Q, IO_SEL_MASK, IO_SEL_IDX, IO_SEL_CNT, IO_SEL_OUT, IO_ROLES
+    };
 
     // A served region's operands in the IO buffer, by role.
     std::vector<std::pair<IoRole, ggml_tensor*>> io_operands(const DeviceRegion& r)
@@ -318,6 +323,9 @@ namespace
                      { IO_GDN_Y, r.results[0] } };
         case FUSED_HC_READ:
             return { { IO_HC_MIXED, r.results[0] }, { IO_HC_INJECT, r.results[1] } };
+        case SELECTED_ATTENTION:
+            return { { IO_SEL_Q, r.in[0] }, { IO_SEL_MASK, r.in[3] }, { IO_SEL_IDX, r.results[0] }, { IO_SEL_CNT, r.results[1] },
+                     { IO_SEL_OUT, r.results[2] } };
         default:
             return {};
         }
@@ -511,6 +519,9 @@ namespace
         return hot != nullptr ? ggml_add(ctx, hm.moe_out, hot) : hm.moe_out;
     }
 
+    ggml_tensor* try_selected_attention(TsgGraph* g, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* mask,
+                                        float scale, std::int64_t width);
+
     ggml_tensor* build_op(TsgGraph* g, int op, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp)
     {
         ggml_context* ctx = g->ctx;
@@ -617,12 +628,20 @@ namespace
                 return fa;
             }
             // srcs[4]: optional attention sinks. ip[1] > 0 bounds every mask row's finite entries (a selection's
-            // width): the backend may then attend only those.
+            // width): decode and verify rows then attend only those (ggml's sparse path, a one-row kernel); a prompt
+            // chunk over a wide window does on TensorSharp's kernels, else densely.
+            std::int64_t width = ipar(1, 0);
+            if (width > 0 && src(4) == nullptr && src(0)->ne[1] > 16)
+            {
+                if (ggml_tensor* sel = try_selected_attention(g, src(0), src(1), src(2), src(3), fpar(0, 1.0f), width))
+                    return sel;
+                width = 0;
+            }
             ggml_tensor* fa = flash_attn_ext_guarded(ctx, "graph builder", src(0), src(1), src(2), src(3),
                                                      fpar(0, 1.0f), fpar(1, 0.0f), fpar(2, 0.0f), src(4),
                                                      static_cast<ggml_prec>(ipar(0, 0)));
-            if (ipar(1, 0) > 0 && fa->op == GGML_OP_FLASH_ATTN_EXT)
-                ggml_flash_attn_ext_set_n_kv_max(fa, static_cast<std::int32_t>(ipar(1, 0)));
+            if (width > 0 && fa->op == GGML_OP_FLASH_ATTN_EXT)
+                ggml_flash_attn_ext_set_n_kv_max(fa, static_cast<std::int32_t>(width));
             return fa;
         }
         case OP_SOFT_MAX_EXT: need(1); return ggml_soft_max_ext(ctx, src(0), src(1), fpar(0, 1.0f), fpar(1, 0.0f));
@@ -684,11 +703,59 @@ namespace
         return v;
     }
 
-    // A computed F32 result the IO buffer can hold in place of the allocator (not a view, not yet placed).
-    bool io_bindable(const ggml_tensor* t)
+    // A computed result the IO buffer can hold in place of the allocator (not a view, not yet placed).
+    bool io_bindable(const ggml_tensor* t, ggml_type type = GGML_TYPE_F32)
     {
         return t != nullptr && t->op != GGML_OP_NONE && t->view_src == nullptr && t->data == nullptr && t->buffer == nullptr
-            && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+            && t->type == type && ggml_is_contiguous(t);
+    }
+
+    // A prompt chunk's flash attention under a selection's mask (every row at most `width` finite cells) over a wide
+    // window, as one device operation: the mask compacted into each row's cell list (tsm_qsa_compact), then the
+    // attention over those cells only (tsm_qsa_attn, Qwen4ExpModel's prompt kernel). Null where it does not apply.
+    ggml_tensor* try_selected_attention(TsgGraph* g, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* mask,
+                                        float scale, std::int64_t width)
+    {
+#if defined(TSG_GGML_USE_METAL)
+        if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_METAL || mask == nullptr || width <= 0) return nullptr;
+        const std::int64_t D = q->ne[0], T = q->ne[1], heads = q->ne[2], cells = k->ne[1], kv_heads = k->ne[2];
+        if (T < device_ops_min_rows() || q->type != GGML_TYPE_F32 || q->ne[3] != 1 || v->ne[0] != D || v->ne[1] != cells
+            || v->ne[2] != kv_heads || mask->ne[0] != cells || mask->ne[1] != T || !io_bindable(mask, GGML_TYPE_F16))
+            return nullptr;
+        for (const ggml_tensor* c : { k, v })
+            if (c->type != GGML_TYPE_F16 || c->nb[0] != 2 || c->nb[1] % 8 != 0 || c->nb[2] % 8 != 0) return nullptr;
+        if (!tsm::qsa_attn_supported(graph_backend(g), static_cast<int>(D), static_cast<int>(heads), static_cast<int>(kv_heads),
+                                     k->type, static_cast<int>(cells)))
+            return nullptr;
+        ggml_context* ctx = g->ctx;
+        DeviceRegion r;
+        r.kind = SELECTED_ATTENTION;
+        r.in = { ggml_cont(ctx, q), k, v, mask };   // the queries as the kernel reads them, [D, T, H]
+        r.results = { ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, T), ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T),
+                      ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, heads, T) };   // the flash attention's [D, H, T]
+        ggml_tensor *qc = r.in[0], *idx = r.results[0], *cnt = r.results[1], *out = r.results[2];
+        const int t = static_cast<int>(T), n_cells = static_cast<int>(cells), w = static_cast<int>(width);
+        const int n_head = static_cast<int>(heads), n_head_kv = static_cast<int>(kv_heads);
+        tsg::HostMoeSegment seg;
+        seg.layer = static_cast<int>(g->regions.size());
+        seg.device_name = "selected attention";
+        seg.seq_len = t;
+        // After the queries, the mask and this layer's cache writes (effects, expanded before in program order).
+        seg.device_inputs = { qc, mask, k, v };
+        seg.device_outputs = { idx, cnt, out };
+        seg.device_op = [qc, k, v, mask, idx, cnt, out, t, n_cells, w, n_head, n_head_kv, scale](ggml_backend_t backend) {
+            return tsm::qsa_compact_encode(backend, mask, idx, cnt, t, n_cells, w)
+                && tsm::qsa_attn_encode(backend, qc, k, v, idx, cnt, mask, out, t, n_head, n_head_kv, n_cells, w, scale);
+        };
+        g->regions.push_back(std::move(r));
+        g->host_moe.push_back(std::move(seg));
+        g->host_moe_holds.emplace_back(nullptr, nullptr);
+        g->order.emplace_back(1, static_cast<int>(g->host_moe.size()) - 1);
+        return out;
+#else
+        (void) g; (void) q; (void) k; (void) v; (void) mask; (void) scale; (void) width;
+        return nullptr;
+#endif
     }
 
     // Whether this graph's backend runs region `kind` over these operands as one device operation; if so, records
