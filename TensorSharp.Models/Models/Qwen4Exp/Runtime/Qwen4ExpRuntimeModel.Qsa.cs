@@ -54,6 +54,13 @@ namespace TensorSharp.Models
             return new string(modes);
         }
 
+        /// <summary>Decode and verify rows past the budget attend at most the budget's cells (the top blocks and the
+        /// tail): the backend may attend only those (ggml-metal's sparse flash attention). Prompt chunks keep the dense
+        /// kernels, which ggml's one-row sparse kernel does not beat at their width.</summary>
+        protected override int AttentionKvMax(GraphStep step, int layer, int s)
+            => QsaRatio(layer) > 0 && step.Counts[s] <= SmallChunkRows && step.Starts[s] + step.Counts[s] > Ple.QsaBudget
+                ? (int)Ple.QsaBudget : 0;
+
         /// <summary>A QSA layer's slots keep each cell's raw indexer key.</summary>
         protected override int ExtraKeyCacheWidth(int layer) => QsaRatio(layer) > 0 ? Qsa.Dim : 0;
 

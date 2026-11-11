@@ -764,6 +764,10 @@ namespace TensorSharp.Models
         /// ([<paramref name="keys"/>, its rows], F16, causal) unless the family narrows it (Qwen 3.8's QSA selection).</summary>
         protected virtual int EmitAttentionMask(GraphStep step, int layer, int x, int s, int mask, int keys) => mask;
 
+        /// <summary>A bound on the cells any row of sequence <paramref name="s"/> attends in <paramref name="layer"/> under
+        /// its mask (a selection's width), so the backend may attend only those; 0 for none.</summary>
+        protected virtual int AttentionKvMax(GraphStep step, int layer, int s) => 0;
+
         private int EmitAttention(GraphStep step, int layer, int x)
         {
             EmitAttentionInput(step, layer, x);
@@ -836,7 +840,8 @@ namespace TensorSharp.Models
                     int gqa = heads / kvHeads;
                     int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, window, kvType, count, gqa });
                     int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, window, kvType, count, gqa });
-                    fa = step.FlashAttention(qPerm, kWin, vWin, EmitAttentionMask(step, layer, x, s, step.ChunkMask(window, start, count), window), scale);
+                    fa = step.FlashAttention(qPerm, kWin, vWin, EmitAttentionMask(step, layer, x, s, step.ChunkMask(window, start, count), window), scale,
+                        AttentionKvMax(step, layer, s));
                 }
                 else
                 {
@@ -1495,11 +1500,13 @@ namespace TensorSharp.Models
             }
 
             /// <summary>Flash attention of q [d, rows, heads] over k/v [d, kv, kv_heads]: [dv, heads, rows].</summary>
-            public int FlashAttention(int q, int k, int v, int mask, float scale)
+            /// <summary>Flash attention; <paramref name="kvMax"/> &gt; 0 bounds the finite entries of every mask row, which
+            /// lets a backend attend only those (ggml_flash_attn_ext_set_n_kv_max).</summary>
+            public int FlashAttention(int q, int k, int v, int mask, float scale, int kvMax = 0)
             {
                 Span<int> srcs = stackalloc[] { q, k, v, mask };
-                return Op(GraphOp.FlashAttnExt, mask >= 0 ? srcs : srcs[..3], stackalloc long[] { 10 /* F32 accumulation */ },
-                    stackalloc[] { scale, 0f, 0f });
+                ReadOnlySpan<long> ip = kvMax > 0 ? stackalloc long[] { 10 /* F32 accumulation */, kvMax } : stackalloc long[] { 10 };
+                return Op(GraphOp.FlashAttnExt, mask >= 0 ? srcs : srcs[..3], ip, stackalloc[] { scale, 0f, 0f });
             }
 
             private InvalidOperationException Reject(string why)

@@ -616,10 +616,14 @@ namespace
                 if (src(4) != nullptr) ggml_flash_attn_ext_add_sinks(fa, src(4));
                 return fa;
             }
-            // srcs[4]: optional attention sinks.
-            return flash_attn_ext_guarded(ctx, "graph builder", src(0), src(1), src(2), src(3),
-                                          fpar(0, 1.0f), fpar(1, 0.0f), fpar(2, 0.0f), src(4),
-                                          static_cast<ggml_prec>(ipar(0, 0)));
+            // srcs[4]: optional attention sinks. ip[1] > 0 bounds every mask row's finite entries (a selection's
+            // width): the backend may then attend only those.
+            ggml_tensor* fa = flash_attn_ext_guarded(ctx, "graph builder", src(0), src(1), src(2), src(3),
+                                                     fpar(0, 1.0f), fpar(1, 0.0f), fpar(2, 0.0f), src(4),
+                                                     static_cast<ggml_prec>(ipar(0, 0)));
+            if (ipar(1, 0) > 0 && fa->op == GGML_OP_FLASH_ATTN_EXT)
+                ggml_flash_attn_ext_set_n_kv_max(fa, static_cast<std::int32_t>(ipar(1, 0)));
+            return fa;
         }
         case OP_SOFT_MAX_EXT: need(1); return ggml_soft_max_ext(ctx, src(0), src(1), fpar(0, 1.0f), fpar(1, 0.0f));
         case OP_ARGSORT: need(1); return ggml_argsort(ctx, src(0), ipar(0, 0) == 0 ? GGML_SORT_ORDER_ASC : GGML_SORT_ORDER_DESC);

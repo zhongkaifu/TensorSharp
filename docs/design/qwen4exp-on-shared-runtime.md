@@ -220,6 +220,14 @@ padded to 64 rows, as `Qwen4ExpModel`'s does (ggml-metal's tensor-API flash atte
 Decode at that length is 24.2 against 24.6 tok/s. Left: the scatter and the stream mix (`tsm_hc_prompt`), which
 `Qwen4ExpModel` runs in place in its span's residual region.
 
+Decode and verify rows past the budget pass the selection's width to the attention (`AttentionKvMax`, ggml's
+`ggml_flash_attn_ext_set_n_kv_max`), so ggml-metal attends only the selected cells: at 14,769 tokens decode went
+from 23.2-23.5 to 23.8-23.9 tok/s (three interleaved runs each, same text; `Qwen4ExpModel` 23.4-24.2). Prompt chunks
+keep the dense kernels: ggml's sparse path is a one-row kernel. That prompt takes 25.8-26.5 s against
+`Qwen4ExpModel`'s 24.0-24.6 s, with the same text. The gap is the attention over a window past 8K cells, which
+`Qwen4ExpModel` runs over each token's chosen cells only (`tsm_qsa_attn`) and the runtime runs densely under the
+selection's mask (919 ms of a 2,480-row chunk's synchronized node time at 14.8K cells).
+
 ### 2.4 PLE
 
 The family computes the rows on the host before the step. These are the table gathers by n-gram hash, with the existing prefetch. It hands them to the step as an input of the layer that owns PLE:
