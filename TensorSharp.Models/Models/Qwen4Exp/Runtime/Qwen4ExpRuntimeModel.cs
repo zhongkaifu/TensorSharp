@@ -171,6 +171,11 @@ namespace TensorSharp.Models
         /// <summary>The head reads the trunk's whole stream and chains its own (Qwen4ExpModel's NextN block).</summary>
         protected override bool DraftChainsStream => true;
 
+        /// <summary>Each verify row routes its own ten experts, so a draft the MTP head is unsure of costs more than it
+        /// saves (Qwen4ExpModel's gate). UD-Q2_K_XL on the 48 GB M5 Pro, 200 greedy tokens: at 0.5 five runs gave 29.8 and
+        /// 33.9-34.1 tok/s; at the per-token default 0.15 four gave 33.7-34.0 twice and 19.6-20.1 twice.</summary>
+        public override float SpecPreferredDraftGate => 0.5f;
+
         protected override string[] DraftLayerWeights =>
             new[] { "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", "attn_output.weight", "nextn.hc_head_norm.weight" };
 

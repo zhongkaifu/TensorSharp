@@ -148,6 +148,9 @@ namespace TensorSharp.Models
         /// <see cref="SpecPreferredDraftWindow"/>).</summary>
         public float SpecPreferredBlockGate => _anyRecurrent && HasDFlash && _backend == BackendType.GgmlMetal ? 0f : float.NaN;
 
+        /// <summary>The per-token draft head's confidence gate; NaN keeps the speculator's default.</summary>
+        public virtual float SpecPreferredDraftGate => float.NaN;
+
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
             ArgumentNullException.ThrowIfNull(tokens);

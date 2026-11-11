@@ -74,8 +74,12 @@ the hc streams. On the synthetic checkpoint with a synthetic drafter the feature
 a verify match `Qwen4ExpModel`'s native taps within 2e-2 (ggml_cpu, ggml_metal), and greedy block speculation
 emits the plain greedy tokens on the managed CPU, ggml_cpu, ggml_metal and MLX.
 
-**Next:** MTP and DFlash2 on the real checkpoint, QSA phase 2 above the budget (8192 tokens), and the real model on
-ggml_cuda.
+Speculation on the same checkpoint and machine (200 greedy tokens, each side's defaults): MTP 31.8-34.1 tok/s
+(runtime, gate 0.5 as `Qwen4ExpModel`'s) against 32.0, with identical text; DFlash2 37.0 against 23.1. With
+route-tail skip off, plain, MTP and DFlash2 text agree until a near-tie (three different spellings of one heading),
+where a verify window's batched Metal kernels round differently from one row's, as `Qwen4ExpModel`'s do.
+
+**Next:** QSA phase 2 above the budget (8192 tokens), and the real model on ggml_cuda.
 
 Flash Next has 125 B parameters in total and 6 B active. Its routed experts take 46 GB at UD-Q2_K_XL.
 
