@@ -385,33 +385,103 @@ extern "C" bool tsg_h3_modulate(const float* x, int64_t x_rs, const float* w, co
                                 int hidden, int64_t rows, float* out);
 extern "C" bool tsg_h3_gated_residual(const float* base, int64_t b_rs, const float* mm, int64_t mm_rs, const float* bias,
                                       const float* delta, int64_t d_rs, const float* mods, int64_t m_rs, int gateIdx,
-                                      const int32_t* segs, int nseg, int hidden, int64_t rows, float* out);
+                                      const int32_t* segs, int nseg, int hidden, int64_t rows, float* out,
+                                      const uint32_t* mmRow, const uint32_t* mmTok);
 extern "C" bool tsg_h3_fused_sync(void);
 extern "C" bool tsg_h3_scaled_residual(const float* base, int64_t b_rs, const float* mm, int64_t mm_rs, const float* bias,
-                                       const float* scale, int hidden, int64_t rows, float* out);
+                                       const float* scale, int hidden, int64_t rows, float* out,
+                                       const uint32_t* mmRow, const uint32_t* mmTok);
 extern "C" bool tsg_cuda_f16_gemm(const void* w_f16, int64_t K, int64_t N, const float* x, int64_t x_row_stride,
-                                  const float* x_bias, int swiglu, int64_t T, float* dst, int64_t dst_ld);
+                                  const float* x_bias, int swiglu, int64_t T, float* dst, int64_t dst_ld, int flags);
 extern "C" void tsg_cuda_f16_gemm_forget_weights(void);
+extern "C" void tsg_cuda_q4k_gemm_forget_weights(void);
 extern "C" bool tsg_cuda_q4k_lora_gemm_bf16(const void* w_q4k, int64_t K, int64_t N, const float* x, int64_t x_row_stride,
                                             int64_t T, float* dst, int64_t dst_ld, int nparts, const void* const* downs,
                                             const void* const* ups, const int64_t* ranks, const int64_t* outs,
-                                            const int64_t* offsets, int factor_f32, int x_swiglu);
+                                            const int64_t* offsets, int factor_f32, int x_swiglu, int flags);
+// A product an int8 GEMM left as int32 sums for its one reader (tsg_cuda_int8_scale.h).
+extern "C" bool tsg_cuda_int8_pending(const void* data, const uint32_t** rowpeak, const uint32_t** tokpeak, int64_t* rows,
+                                      int64_t* ld);
+extern "C" void tsg_cuda_int8_consumed(const void* data);
+extern "C" bool tsg_cuda_int8_materialize(const void* data);
+extern "C" int tsg_cuda_int8_forget_pending(void);
 #if defined(TSG_HAVE_CUDNN)
 extern "C" bool tsg_cudnn_sdpa_prepare(int64_t heads, int64_t seq, int64_t head_dim);
 extern "C" bool tsg_cudnn_h3_attention(const float* q, int64_t q_sh, int64_t q_ss, const float* k, int64_t k_sh, int64_t k_ss,
                                        const float* v, int64_t v_sh, int64_t v_ss, const float* qb, const float* kb,
                                        const float* vb, int64_t bias_hs, const float* qn, const float* kn,
                                        const float* cosT, const float* ssinT, int rot, float eps, float vScale, float scale,
-                                       int heads, int seq, int head_dim, float* out);
+                                       int heads, int seq, int head_dim, float* out, const uint32_t* rowpeak,
+                                       const uint32_t* tokpeak, int64_t q_off, int64_t k_off, int64_t v_off);
 #endif
 
 std::int64_t h3_rows(const ggml_tensor* t) { return static_cast<std::int64_t>(t->nb[1] / sizeof(float)); }
 
-bool h3_fused_run(ggml_tensor* node)
+const ggml_tensor* h3_view_base(const ggml_tensor* t) { return t->view_src != nullptr ? t->view_src : t; }
+
+// The products of a graph that an int8 GEMM may leave as int32 sums: those of a fused
+// projection whose result is read by exactly one node, and by that node only through
+// an input its kernel can take that way (the attention's q, k and v, a projection's
+// x, a residual's mm; see h3_fused_run). Views read nothing themselves. Any other
+// reader, a second reader or an output flag keeps the product F32.
+std::unordered_set<const ggml_tensor*> h3_deferrable(ggml_cgraph* graph)
+{
+    const int n = ggml_graph_n_nodes(graph);
+    std::unordered_map<const ggml_tensor*, int> reader;     // -1 none yet, -2 not deferrable
+    for (int i = 0; i < n; i++)
+    {
+        const ggml_tensor* node = ggml_graph_node(graph, i);
+        const std::int32_t kind = h3_fused_params(node).kind;
+        if (kind != H3_FUSED_LORA_GEMM && kind != H3_FUSED_F16_GEMM) continue;
+        reader[node] = (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ? -2 : -1;
+    }
+    std::unordered_set<const ggml_tensor*> out;
+    if (reader.empty()) return out;
+    for (int i = 0; i < n; i++)
+    {
+        const ggml_tensor* node = ggml_graph_node(graph, i);
+        if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE ||
+            node->op == GGML_OP_TRANSPOSE)
+            continue;
+        const std::int32_t kind = h3_fused_params(node).kind;
+        for (int j = 0; j < GGML_MAX_SRC; j++)
+        {
+            const ggml_tensor* src = node->src[j];
+            if (src == nullptr) continue;
+            auto it = reader.find(h3_view_base(src));
+            if (it == reader.end()) continue;
+            const bool whole = src->view_src == nullptr;
+            const bool takes = (kind == H3_FUSED_ATTENTION && j <= 2) ||
+                               ((kind == H3_FUSED_LORA_GEMM || kind == H3_FUSED_F16_GEMM) && j == 1 && whole) ||
+                               ((kind == H3_FUSED_RESIDUAL || kind == H3_FUSED_SCALED_RESIDUAL) && j == 1 && whole);
+            if (!takes || (it->second != -1 && it->second != i)) it->second = -2;
+            else it->second = i;
+        }
+    }
+    for (const auto& kv : reader)
+        if (kv.second >= 0) out.insert(kv.first);
+    return out;
+}
+
+// `deferrable` (null = none): the graph's h3_deferrable set.
+bool h3_fused_run(ggml_tensor* node, const std::unordered_set<const ggml_tensor*>* deferrable)
 {
     const H3FusedParams p = h3_fused_params(node);
     const auto* segs = static_cast<const std::int32_t*>(p.segments);
     auto f = [](const ggml_tensor* t) { return t != nullptr ? static_cast<const float*>(t->data) : nullptr; };
+    const int defer = deferrable != nullptr && deferrable->count(node) != 0 ? 1 : 0;
+    // A residual's mm as int32 sums: its peaks when the kernel can read it in place
+    // (the whole product, token for token), else it is scaled to F32 first.
+    struct Sums { const uint32_t* row = nullptr; const uint32_t* tok = nullptr; bool pending = false; bool ok = true; };
+    auto sumsOf = [&](const ggml_tensor* mm) {
+        Sums s;
+        std::int64_t rows = 0, ld = 0;
+        if (!tsg_cuda_int8_pending(h3_view_base(mm)->data, &s.row, &s.tok, &rows, &ld)) return s;
+        if (mm->view_src == nullptr && h3_rows(mm) == ld && node->ne[0] <= rows) { s.pending = true; return s; }
+        s.row = s.tok = nullptr;
+        s.ok = tsg_cuda_int8_materialize(h3_view_base(mm)->data);
+        return s;
+    };
     bool ok = false;
     switch (p.kind)
     {
@@ -426,12 +496,38 @@ bool h3_fused_run(ggml_tensor* node)
         // The DiT's qkv bias is stacked [q | k | v]; the video VAE's interleaves the
         // three per head (c = D, b = 3*D).
         const std::int64_t part = p.c > 0 ? p.c : q->ne[0] * q->ne[1];
+        // q, k and v as views of one product still in int32: its peaks and the row each
+        // view starts at, when all three are token-for-token views of it; otherwise
+        // whatever is pending behind them becomes F32 first.
+        const ggml_tensor* qkv = h3_view_base(q);
+        const uint32_t* rowpeak = nullptr;
+        const uint32_t* tokpeak = nullptr;
+        std::int64_t rows = 0, ld = 0, off[3] = { 0, 0, 0 };
+        bool pending = tsg_cuda_int8_pending(qkv->data, &rowpeak, &tokpeak, &rows, &ld);
+        if (pending)
+        {
+            const ggml_tensor* views[3] = { q, k, v };
+            bool inPlace = true;
+            for (int i = 0; i < 3 && inPlace; i++)
+            {
+                const ggml_tensor* t = views[i];
+                off[i] = static_cast<std::int64_t>(static_cast<const char*>(t->data) - static_cast<const char*>(qkv->data)) / fl;
+                const std::int64_t last = off[i] + (t->ne[1] - 1) * static_cast<std::int64_t>(t->nb[1] / fl) + t->ne[0];
+                inPlace = h3_view_base(t) == qkv && static_cast<std::int64_t>(t->nb[2] / fl) == ld && off[i] >= 0 &&
+                          last <= rows;
+            }
+            if (!inPlace) { pending = false; rowpeak = tokpeak = nullptr; }
+        }
+        if (!pending)
+            for (const ggml_tensor* t : { q, k, v })
+                if (!tsg_cuda_int8_materialize(h3_view_base(t)->data)) return false;
         ok = tsg_cudnn_h3_attention(f(q), q->nb[1] / fl, q->nb[2] / fl, f(k), k->nb[1] / fl, k->nb[2] / fl,
                                     f(v), v->nb[1] / fl, v->nb[2] / fl, bias, bias != nullptr ? bias + part : nullptr,
                                     bias != nullptr ? bias + 2 * part : nullptr, p.b, f(node->src[3]), f(node->src[4]),
                                     f(node->src[5]), f(node->src[6]), p.a, p.f0, p.f1, p.f2,
                                     static_cast<int>(q->ne[1]), static_cast<int>(q->ne[2]), static_cast<int>(q->ne[0]),
-                                    static_cast<float*>(node->data));
+                                    static_cast<float*>(node->data), rowpeak, tokpeak, off[0], off[1], off[2]);
+        if (pending) tsg_cuda_int8_consumed(qkv->data);
 #endif
         return ok;   // synchronized inside
     }
@@ -453,24 +549,31 @@ bool h3_fused_run(ggml_tensor* node)
             n++;
         }
         const bool f32 = n > 0 && node->src[2]->type == GGML_TYPE_F32;
+        // 2: the weight's int8 rows may be kept; it and its factors stay bound until the
+        // pipeline releases the scratch.
         return tsg_cuda_q4k_lora_gemm_bf16(w->data, w->ne[0], w->ne[1], f(x), h3_rows(x), x->ne[1],
                                            static_cast<float*>(node->data), node->ne[0], n, downs, ups, ranks, outs,
-                                           offsets, f32 ? 1 : 0, p.f0 != 0.0f ? 1 : 0);   // synchronized inside
+                                           offsets, f32 ? 1 : 0, p.f0 != 0.0f ? 1 : 0, defer | 2);   // synchronized inside
     }
     case H3_FUSED_F16_GEMM:
     {
         const ggml_tensor* w = node->src[0];
         const ggml_tensor* x = node->src[1];
         return tsg_cuda_f16_gemm(w->data, w->ne[0], w->ne[1], f(x), h3_rows(x), f(node->src[2]),
-                                 p.f0 != 0.0f ? 1 : 0, x->ne[1], static_cast<float*>(node->data), node->ne[0]);
+                                 p.f0 != 0.0f ? 1 : 0, x->ne[1], static_cast<float*>(node->data), node->ne[0], defer);
     }
     case H3_FUSED_SCALED_RESIDUAL:
     {
         const ggml_tensor* base = node->src[0];
         const ggml_tensor* mm = node->src[1];
+        const Sums sums = sumsOf(mm);
+        if (!sums.ok) return false;
         ok = tsg_h3_scaled_residual(f(base), h3_rows(base), f(mm), h3_rows(mm), f(node->src[2]), f(node->src[3]),
-                                    static_cast<int>(node->ne[0]), node->ne[1], static_cast<float*>(node->data));
-        break;
+                                    static_cast<int>(node->ne[0]), node->ne[1], static_cast<float*>(node->data),
+                                    sums.row, sums.tok)
+            && tsg_h3_fused_sync();
+        if (sums.pending) tsg_cuda_int8_consumed(mm->data);
+        return ok;
     }
     case H3_FUSED_MODULATE:
     {
@@ -486,11 +589,15 @@ bool h3_fused_run(ggml_tensor* node)
         const ggml_tensor* mm = node->src[1];
         const ggml_tensor* delta = node->src[3];
         const ggml_tensor* mods = node->src[4];
+        const Sums sums = sumsOf(mm);
+        if (!sums.ok) return false;
         ok = tsg_h3_gated_residual(f(base), h3_rows(base), f(mm), h3_rows(mm), f(node->src[2]),
                                    f(delta), delta != nullptr ? h3_rows(delta) : 0, f(mods), h3_rows(mods), p.a,
                                    segs, p.nseg, static_cast<int>(node->ne[0]), node->ne[1],
-                                   static_cast<float*>(node->data));
-        break;
+                                   static_cast<float*>(node->data), sums.row, sums.tok)
+            && tsg_h3_fused_sync();
+        if (sums.pending) tsg_cuda_int8_consumed(mm->data);
+        return ok;
     }
     default:
         return false;
@@ -508,6 +615,7 @@ struct H3Offload
     bool fused = false;
     bool f32 = false;                  // TS_H3_CUDA_F32_PRODUCTS: weight products on the pedantic handle
     ggml_backend_t backend = nullptr;
+    std::unordered_set<const ggml_tensor*> deferrable;     // h3_deferrable of the graph
 };
 
 // ---------------------------------------------------------------------------
@@ -614,7 +722,7 @@ bool h3_offload_run(ggml_tensor* node, void* ctx)
     if (node->op == GGML_OP_MUL_MAT && !ggml_is_quantized(node->src[0]->type))
         return h3_f32_product_run(node, static_cast<const H3Offload*>(ctx)->backend);
     if (node->op == GGML_OP_MUL_MAT) return h3_q4k_matmul_run(node);
-    if (node->op == GGML_OP_CUSTOM) return h3_fused_run(node);
+    if (node->op == GGML_OP_CUSTOM) return h3_fused_run(node, &static_cast<const H3Offload*>(ctx)->deferrable);
 #endif
     (void) node;
     return false;
@@ -649,6 +757,12 @@ ggml_status h3_compute(ggml_backend_t backend, ggml_cgraph* graph, const char* t
     which.fused = h3_fused_enabled();
     which.f32 = tag != nullptr && std::strstr(tag, "dit-forward") != nullptr && h3_f32_products_enabled();
     which.backend = backend;
+    // TS_H3_INT8_DEFER=0 has every int8 product scaled to F32 by its own pass, as before.
+    static const bool defer = []{
+        const char* e = std::getenv("TS_H3_INT8_DEFER");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    if (which.fused && defer) which.deferrable = h3_deferrable(graph);
 #endif
     ggml_status status;
     if (which.attention || which.matmul || which.fused || which.f32)
@@ -658,6 +772,15 @@ ggml_status h3_compute(ggml_backend_t backend, ggml_cgraph* graph, const char* t
         offload.run = h3_offload_run;
         offload.ctx = &which;
         status = graph_compute_offload(backend, graph, tag, offload);
+#if defined(TSG_GGML_USE_CUDA)
+        // Every product left as int32 has a reader that takes it; one still pending
+        // means some node read sums as F32.
+        if (which.fused && tsg_cuda_int8_forget_pending() != 0 && status == GGML_STATUS_SUCCESS)
+        {
+            std::fprintf(stderr, "[minimax-h3] %s: an int8 product was left unscaled and never read\n", tag != nullptr ? tag : "");
+            status = GGML_STATUS_FAILED;
+        }
+#endif
     }
     else
         status = graph_node_profile_enabled()
@@ -2343,6 +2466,17 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
 
         host_read_barrier();
         h3_upload_weights("minimax-h3/dit-forward", uploads);
+#if defined(TSG_GGML_USE_CUDA)
+        // As the video VAE decoder does for tsg_cuda_f16_gemm: the int8 route keeps a
+        // weight's merged rows by the device addresses of the weight and its LoRA
+        // factors, and an upload of any size worth a copy of its own means one is new.
+        for (const HostBinding& u : uploads)
+            if (u.bytes >= 4096)
+            {
+                tsg_cuda_q4k_gemm_forget_weights();
+                break;
+            }
+#endif
         ggml_backend_tensor_set(vin, d->video_tokens, 0, ggml_nbytes(vin));
         ggml_backend_tensor_set(ain, d->audio_tokens, 0, ggml_nbytes(ain));
         if (acin != nullptr)

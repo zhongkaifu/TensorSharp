@@ -178,8 +178,16 @@ fc2 直接读取 fc1 的 `[gate | value]` 输出，在收窄为 BF16 时完成 S
 21.7 s 降到 20.2 s，热态整次请求由 203 s 降到 191-193 s；解码结果与 BF16 路径相差 30.6 dB PSNR，多次运行完全一致。
 `TS_H3_INT8_MATMUL=vae`（或 `all`，连同 DiT）对视频 VAE 解码器的 F16 投影做同样处理，并把每个权重的 int8 行保留在
 设备上供各分块复用。在 A100 80 GB 上，1344x768、124 帧片段的 196 个分块由 15.5 s 降到 13.7 s，与 F16 解码相差
-41-45 dB PSNR。收益有限，因为每个乘积在乘法前后仍要从 F32 舍入并缩放回 F32：单个分块的 int8 乘法为 24 ms（F16 为
-40 ms），整个节点为 48.5 ms（F16 为 56 ms）。
+41-45 dB PSNR（下述改动之后为 11.6 s）。单个分块的 int8 乘法单独计时为 24 ms（F16 为 40 ms）。
+
+int8 乘法周围的几遍处理也已去掉大半，且不改变任何数值（三项开关全开或全关，片段逐字节相同）：
+乘积在被读取之前保持 int32，由唯一的读取内核（注意力预处理、fc2 的舍入、残差）在加载元素时乘上两个缩放
+（`TS_H3_INT8_DEFER=0` 关闭）；每个 token 的激活值暂存在共享内存中，一遍完成求峰值与舍入
+（`TS_H3_INT8_ONE_PASS=0` 关闭）；设备剩余内存不少于 8 GB 时，DiT 的 int8 权重行在各步之间保留
+（H3 的 DiT 为 19 GB，A100 上峰值由 30 GB 升至 49 GB，`TS_H3_INT8_KEEP_WEIGHTS=0` 关闭）。
+同一 A100 与片段上（含 FlashAttention），去噪单步由 19.1-19.2 s 降到 18.1 s，热态整次请求由 177.9-178.5 s 降到
+169.8-170.0 s（`TS_H3_INT8_MATMUL=1`）与 165.7-166.6 s（`all`，VAE 解码 12.4 s）；同一会话中 ComfyUI 模板为
+157.5 与 162.5 s。
 
 DiT 注意力可改用 [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) 的前向内核（PyTorch 所用的内核）：
 以 `-DTENSORSHARP_FLASH_ATTENTION=ON` 配置原生构建时，会下载固定版本的 flash-attention 与 CUTLASS 源码，只编译本模型

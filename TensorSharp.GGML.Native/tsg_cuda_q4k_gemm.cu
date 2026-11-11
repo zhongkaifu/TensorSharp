@@ -46,6 +46,7 @@
 #endif
 
 #include "tsg_cuda_stage_profile.h"
+#include "tsg_cuda_int8_scale.h"
 
 #include <cmath>
 #include <cstdint>
@@ -336,25 +337,40 @@ __global__ void dequant_q4k_rows_i8(const BlockQ4K* __restrict__ w, const float*
 // narrow_rows_bf16 or (swiglu) narrow_swiglu_bf16 with each token's activations rounded
 // to int8 against the token's own peak, which tokpeak[r] receives as F32 bits. One
 // block per token: its threads find the peak, then round.
+//
+// x is F32 or, with srcRow and srcTok, the int32 sums an int8 GEMM left there
+// (tsg_cuda_int8_scale.h). With `keep` the token's values wait in shared memory between
+// the two loops (the launch gives the block room for them), so the row is read and its
+// SwiGLU evaluated once; without it they are computed again. The values are the same
+// either way.
 __global__ void quant_rows_i8(const float* __restrict__ x, long long row_stride, const float* __restrict__ bias,
-                              int swiglu, int8_t* __restrict__ out, uint32_t* __restrict__ tokpeak, long long cols,
+                              int swiglu, const uint32_t* __restrict__ srcRow, const uint32_t* __restrict__ srcTok,
+                              int keep, int8_t* __restrict__ out, uint32_t* __restrict__ tokpeak, long long cols,
                               long long rows)
 {
-    __shared__ float top[256];
+    extern __shared__ float smem[];
+    float* top = smem;                      // blockDim.x slots
+    float* kept = smem + blockDim.x;        // cols slots when keep
     const long long r = blockIdx.x;
     if (r >= rows) return;
     const float* __restrict__ row = x + r * row_stride;
+    const float sx = srcTok != nullptr ? tsg_int8_token_scale(srcTok[r]) : 0.0f;
     // As narrow_rows_f16 reads them: the bias, when given, is added before the SwiGLU.
     auto value = [&](long long c) {
-        float g = row[c];
+        float g = tsg_int8_product(row, c, srcRow, 0, sx);
         if (bias != nullptr) g = __fadd_rn(g, bias[c]);
         if (!swiglu) return g;
-        float u = row[cols + c];
+        float u = tsg_int8_product(row, cols + c, srcRow, 0, sx);
         if (bias != nullptr) u = __fadd_rn(u, bias[cols + c]);
         return (g / (1.0f + expf(-g))) * u;
     };
     float m = 0.0f;
-    for (long long c = threadIdx.x; c < cols; c += blockDim.x) m = fmaxf(m, fabsf(value(c)));
+    for (long long c = threadIdx.x; c < cols; c += blockDim.x)
+    {
+        const float v = value(c);
+        if (keep) kept[c] = v;
+        m = fmaxf(m, fabsf(v));
+    }
     top[threadIdx.x] = m;
     __syncthreads();
     for (int half = blockDim.x / 2; half > 0; half >>= 1)
@@ -366,7 +382,7 @@ __global__ void quant_rows_i8(const float* __restrict__ x, long long row_stride,
     if (threadIdx.x == 0) tokpeak[r] = __float_as_uint(peak);
     const float inv = peak > 0.0f && peak <= 3.0e38f ? 127.0f / peak : 0.0f;
     int8_t* __restrict__ o = out + r * cols;
-    for (long long c = threadIdx.x; c < cols; c += blockDim.x) o[c] = i8_rn(value(c) * inv);
+    for (long long c = threadIdx.x; c < cols; c += blockDim.x) o[c] = i8_rn((keep ? kept[c] : value(c)) * inv);
 }
 
 // Row n of an F16 weight (K halves at n * K) rounded to int8 against its largest
@@ -401,11 +417,9 @@ __global__ void scale_i32_f32(float* __restrict__ dst, long long ld, const uint3
 {
     const long long t = blockIdx.x;
     if (t >= T) return;
-    float* __restrict__ col = dst + t * ld;
-    const int32_t* __restrict__ acc = reinterpret_cast<const int32_t*>(col);
-    const float sx = __uint_as_float(tokpeak[t]) * (1.0f / (127.0f * 127.0f));
-    for (long long n = threadIdx.x; n < N; n += blockDim.x)
-        col[n] = (float) acc[n] * (__uint_as_float(rowpeak[n]) * sx);
+    float* col = dst + t * ld;
+    const float sx = tsg_int8_token_scale(tokpeak[t]);
+    for (long long n = threadIdx.x; n < N; n += blockDim.x) col[n] = tsg_int8_product(col, n, rowpeak, 0, sx);
 }
 
 // One multiply as cuBLASLt takes it: dst (N x T, ld) = W (K x N) transposed times
@@ -445,6 +459,30 @@ struct Int8Codes
     int64_t K = 0, N = 0;
 };
 
+// A DiT weight's merged rows as int8, kept from one denoising step to the next
+// (int8_kept), and what they were merged from: the LoRA factors by address.
+struct Int8Kept
+{
+    Int8Codes codes;
+    bool ready = false;                 // the rows have been written
+    int nparts = 0, f32 = 0;
+    const void* downs[3] = {};
+    const void* ups[3] = {};
+    int64_t ranks[3] = {}, outs[3] = {}, offsets[3] = {};
+};
+
+// A product left as int32 sums for its reader (tsg_cuda_int8_scale.h): the peaks its
+// operands were divided by. `peaks` is the pooled scratch holding tokpeak and, unless
+// the weight keeps its own, rowpeak.
+struct Int8Pending
+{
+    void* peaks = nullptr;
+    std::size_t peakBytes = 0;
+    const uint32_t* rowpeak = nullptr;
+    const uint32_t* tokpeak = nullptr;
+    int64_t N = 0, T = 0, ld = 0;
+};
+
 #endif // TSG_CUDA_FP8_GEMM
 
 struct GemmState
@@ -464,6 +502,9 @@ struct GemmState
     std::unordered_map<const void*, Fp8Exponents> guesses;     // by weight
     std::unordered_map<const void*, Fp8Codes> codes;           // by F16 weight
     std::unordered_map<const void*, Int8Codes> int8Codes;      // by F16 weight
+    std::unordered_map<const void*, Int8Kept> int8Kept;        // by Q4_K weight
+    std::unordered_map<const void*, Int8Pending> pending;      // by product
+    std::vector<std::pair<void*, std::size_t>> peakPool;       // peak scratch not in use
 #endif
 };
 
@@ -518,16 +559,58 @@ int fp8_use()
     return use;
 }
 
+// Peak scratch for a product that outlives the call: a pending product's peaks must
+// last until its reader has run, by when the next GEMM has reused s.peak.
+void* pool_take(GemmState& s, std::size_t need, std::size_t& got)
+{
+    for (std::size_t i = 0; i < s.peakPool.size(); i++)
+        if (s.peakPool[i].second >= need)
+        {
+            void* p = s.peakPool[i].first;
+            got = s.peakPool[i].second;
+            s.peakPool[i] = s.peakPool.back();
+            s.peakPool.pop_back();
+            return p;
+        }
+    void* p = nullptr;
+    if (cudaMalloc(&p, need) != cudaSuccess)
+    {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    got = need;
+    return p;
+}
+
+void pool_give(GemmState& s, void* p, std::size_t bytes)
+{
+    if (p != nullptr) s.peakPool.emplace_back(p, bytes);
+}
+
+// Drops the pending products without scaling them; returns how many there were.
+int int8_forget_pending(GemmState& s)
+{
+    const int n = (int) s.pending.size();
+    for (auto& kv : s.pending) pool_give(s, kv.second.peaks, kv.second.peakBytes);
+    s.pending.clear();
+    return n;
+}
+
+void int8_free_codes(Int8Codes& c)
+{
+    if (c.data != nullptr) cudaFree(c.data);
+    if (c.rowpeak != nullptr) cudaFree(c.rowpeak);
+    c.data = c.rowpeak = nullptr;
+}
+
 void fp8_forget_codes(GemmState& s)
 {
     for (auto& kv : s.codes)
         if (kv.second.data != nullptr) cudaFree(kv.second.data);
     s.codes.clear();
-    for (auto& kv : s.int8Codes)
-    {
-        if (kv.second.data != nullptr) cudaFree(kv.second.data);
-        if (kv.second.rowpeak != nullptr) cudaFree(kv.second.rowpeak);
-    }
+    // A pending product's rowpeak may be one of these.
+    int8_forget_pending(s);
+    for (auto& kv : s.int8Codes) int8_free_codes(kv.second);
     s.int8Codes.clear();
 }
 
@@ -545,6 +628,10 @@ void fp8_destroy(Fp8Plan& p)
 void fp8_release(GemmState& s)
 {
     fp8_forget_codes(s);
+    for (auto& kv : s.int8Kept) int8_free_codes(kv.second.codes);
+    s.int8Kept.clear();
+    for (auto& p : s.peakPool) cudaFree(p.first);
+    s.peakPool.clear();
     for (Fp8Plan& p : s.plans) fp8_destroy(p);
     s.plans.clear();
     if (s.lt != nullptr) cublasLtDestroy(s.lt);
@@ -691,6 +778,9 @@ bool fp8_gemm(GemmState& s, const void* w_q4k, const float* delta, int64_t K, in
     return ok;
 }
 
+// The device memory int8_kept leaves free.
+constexpr std::size_t kKeepReserve = (std::size_t) 8 << 30;
+
 // TS_H3_INT8_MATMUL: 1 for the DiT's projections on int8 tensor cores, vae for the
 // video VAE's, all for both (as TS_H3_FP8_MATMUL).
 int int8_use()
@@ -706,6 +796,126 @@ int int8_use()
     return use;
 }
 
+// quant_rows_i8 over T tokens of K values. A token's values stay in shared memory
+// between the peak and the rounding where a block may have that much (K = 14,336 for
+// fc2 takes 57 KB, which sm_80 and newer allow on request); otherwise they are computed
+// twice, as before.
+bool quant_rows(const float* x, int64_t x_row_stride, const float* bias, int swiglu, const Int8Pending* xin,
+                int8_t* out, uint32_t* tokpeak, int64_t K, int64_t T)
+{
+    static const int roomy = [] {
+        if (const char* e = std::getenv("TS_H3_INT8_ONE_PASS"); e != nullptr && e[0] == '0') return 0;
+        int device = 0, most = 0;
+        if (cudaGetDevice(&device) != cudaSuccess) return 0;
+        if (cudaDeviceGetAttribute(&most, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess) return 0;
+        if (cudaFuncSetAttribute(quant_rows_i8, cudaFuncAttributeMaxDynamicSharedMemorySize, most) != cudaSuccess)
+        {
+            (void) cudaGetLastError();
+            return 0;
+        }
+        return most;
+    }();
+    // Measured on an A100 at 39,875 tokens: K = 14,336 with SwiGLU took 6.7 ms in two
+    // passes of 256 threads and 3.8 ms in one of 1024; K = 5,376 took 1.4 and 1.0 ms
+    // (512 threads), K = 7,168 1.9 and 1.25 ms.
+    const int wide = K >= 8192 ? 1024 : 512;
+    const int keep = roomy > 0 && ((std::size_t) K + wide) * sizeof(float) <= (std::size_t) roomy ? 1 : 0;
+    const int threads = keep ? wide : 256;
+    const std::size_t smem = ((std::size_t) threads + (keep ? (std::size_t) K : 0)) * sizeof(float);
+    quant_rows_i8<<<(unsigned int) T, threads, smem>>>(x, x_row_stride, bias, swiglu,
+                                                       xin != nullptr ? xin->rowpeak : nullptr,
+                                                       xin != nullptr ? xin->tokpeak : nullptr, keep, out, tokpeak, K, T);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+// Whether a GEMM over K inputs per token (2K with SwiGLU) can read x's pending int32
+// sums where they are: x must be the whole product, token for token.
+bool reads_pending(const Int8Pending& p, int64_t x_row_stride, int64_t K, int swiglu, int64_t T)
+{
+    return p.ld == x_row_stride && p.T == T && (swiglu ? 2 * K : K) <= p.N;
+}
+
+// The pending product at `data`, scaled to F32 in place and no longer pending. True
+// when there was none or the pass ran.
+bool int8_settle(GemmState& s, const void* data)
+{
+    auto it = s.pending.find(data);
+    if (it == s.pending.end()) return true;
+    const Int8Pending p = it->second;
+    s.pending.erase(it);
+    scale_i32_f32<<<(unsigned int) p.T, 256>>>(static_cast<float*>(const_cast<void*>(data)), p.ld, p.rowpeak, p.tokpeak,
+                                               p.N, p.T);
+    const bool ok = cudaGetLastError() == cudaSuccess && cudaStreamSynchronize(nullptr) == cudaSuccess;
+    pool_give(s, p.peaks, p.peakBytes);
+    return ok;
+}
+
+// The pending product at `data` has been read.
+void int8_consumed(GemmState& s, const void* data)
+{
+    auto it = s.pending.find(data);
+    if (it == s.pending.end()) return;
+    pool_give(s, it->second.peaks, it->second.peakBytes);
+    s.pending.erase(it);
+}
+
+// The int8 rows of a DiT weight with its LoRA update merged, kept by the weight's
+// address until the scratch is released (the pipeline releases it after the last
+// denoising step). A step multiplies by each weight once, so from the second step on
+// neither the update (a rank-r GEMM into N x K floats) nor the rounding (each row read
+// twice from its Q4_K blocks) is repeated. `hit` says the rows are there; otherwise the
+// entry is new and int8_gemm fills it. Null when the device has no room to spare: the
+// rows of H3's DiT are 19 GB, and they are only kept while kKeepReserve stays free.
+// TS_H3_INT8_KEEP_WEIGHTS=0 keeps none.
+Int8Kept* int8_kept(GemmState& s, const void* w_q4k, int64_t K, int64_t N, int nparts, const void* const* downs,
+                    const void* const* ups, const int64_t* ranks, const int64_t* outs, const int64_t* offsets,
+                    int factor_f32, bool& hit)
+{
+    static const bool on = [] {
+        const char* e = std::getenv("TS_H3_INT8_KEEP_WEIGHTS");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    hit = false;
+    if (!on || nparts > 3) return nullptr;
+    auto it = s.int8Kept.find(w_q4k);
+    if (it != s.int8Kept.end())
+    {
+        Int8Kept& k = it->second;
+        bool same = k.ready && k.codes.K == K && k.codes.N == N && k.nparts == nparts && k.f32 == factor_f32;
+        for (int i = 0; same && i < nparts; i++)
+            same = k.downs[i] == downs[i] && k.ups[i] == ups[i] && k.ranks[i] == ranks[i] && k.outs[i] == outs[i]
+                && k.offsets[i] == offsets[i];
+        if (same)
+        {
+            hit = true;
+            return &k;
+        }
+        int8_free_codes(k.codes);
+        s.int8Kept.erase(it);
+    }
+    const std::size_t bytes = (std::size_t) K * N + (std::size_t) N * sizeof(uint32_t);
+    std::size_t spare = 0, total = 0;
+    if (cudaMemGetInfo(&spare, &total) != cudaSuccess || spare < bytes + kKeepReserve) return nullptr;
+    Int8Kept made;
+    made.codes.K = K;
+    made.codes.N = N;
+    made.nparts = nparts;
+    made.f32 = factor_f32;
+    for (int i = 0; i < nparts; i++)
+    {
+        made.downs[i] = downs[i]; made.ups[i] = ups[i];
+        made.ranks[i] = ranks[i]; made.outs[i] = outs[i]; made.offsets[i] = offsets[i];
+    }
+    if (cudaMalloc(&made.codes.data, (std::size_t) K * N) != cudaSuccess
+        || cudaMalloc(&made.codes.rowpeak, (std::size_t) N * sizeof(uint32_t)) != cudaSuccess)
+    {
+        (void) cudaGetLastError();
+        int8_free_codes(made.codes);
+        return nullptr;
+    }
+    return &(s.int8Kept[w_q4k] = made);
+}
+
 // The product on int8 tensor cores: dst[n, t] = sw[n] sx[t] * sum_k Wq[n, k] xq[t, k],
 // where Wq is row n of the merged weight divided by sw[n] = peak / 127 and rounded to
 // int8, and xq token t's activations divided by sx[t] likewise. The sum is exact in
@@ -717,12 +927,18 @@ int int8_use()
 //
 // A scale per weight row and per token is what a GEMM lets through, and it is what
 // this model needs: its tokens' magnitudes differ by orders, and a weight's rows by
-// less but enough. Rounding the weight per call (each row read twice from its Q4_K
-// blocks, the LoRA update merged in) keeps nothing resident, as the BF16 route keeps
-// nothing.
+// less but enough. Without `keep` the weight is rounded per call (each row read twice
+// from its Q4_K blocks, the LoRA update merged in) and nothing stays resident, as the
+// BF16 route keeps nothing.
+//
+// `xin` says x holds the int32 sums of an earlier product (they are read through its
+// peaks); `defer` leaves this product's sums in dst the same way, for a reader that
+// asks for them (tsg_cuda_int8_scale.h); `keep` holds or receives the weight's int8
+// rows (int8_kept), in which case `delta` is not read once they are ready.
 template <typename Lap>
 bool int8_gemm(GemmState& s, const void* w_q4k, const float* delta, int64_t K, int64_t N, const float* x,
-               int64_t x_row_stride, int x_swiglu, int64_t T, float* dst, int64_t dst_ld, Lap&& lap)
+               int64_t x_row_stride, int x_swiglu, int64_t T, float* dst, int64_t dst_ld, const Int8Pending* xin,
+               bool defer, Int8Kept* keep, Lap&& lap)
 {
     if (K > 131072 || T > 0x7fffffffLL || N > 0x7fffffffLL) return false;
     Fp8Plan* plan = fp8_plan(s, K, N, T, dst_ld, true);
@@ -737,20 +953,43 @@ bool int8_gemm(GemmState& s, const void* w_q4k, const float* delta, int64_t K, i
         }
         return false;
     }
-    if (ensure(s.peak, s.peakBytes, (std::size_t) (N + T) * sizeof(uint32_t)) == nullptr) return false;
     if (plan->pick.workspaceSize > 0 && ensure(s.work, s.workBytes, plan->pick.workspaceSize) == nullptr)
         return false;
+    const std::size_t peakNeed = (std::size_t) (N + T) * sizeof(uint32_t);
+    void* peaks = nullptr;
+    std::size_t peakBytes = 0;
+    if (defer && (peaks = pool_take(s, peakNeed, peakBytes)) == nullptr) defer = false;
+    if (!defer && (peaks = ensure(s.peak, s.peakBytes, peakNeed)) == nullptr) return false;
+    auto fail = [&] {
+        if (defer) pool_give(s, peaks, peakBytes);
+        return false;
+    };
     const auto* wq = static_cast<const BlockQ4K*>(w_q4k);
-    auto* wc = static_cast<int8_t*>(s.w);        // sized for BF16: twice what int8 needs
     auto* xc = static_cast<int8_t*>(s.x);
-    auto* rowpeak = static_cast<uint32_t*>(s.peak);
-    uint32_t* tokpeak = rowpeak + N;
+    auto* ownRowpeak = static_cast<uint32_t*>(peaks);
+    uint32_t* tokpeak = ownRowpeak + N;
     const int perRow = (int) (K / 256);
 
-    dequant_q4k_rows_i8<<<(unsigned int) N, 256>>>(wq, delta, wc, rowpeak, N, perRow);
-    lap("dequant");
-    quant_rows_i8<<<(unsigned int) T, 256>>>(x, x_row_stride, nullptr, x_swiglu, xc, tokpeak, K, T);
-    if (cudaGetLastError() != cudaSuccess) return false;
+    const int8_t* wc;
+    const uint32_t* rowpeak;
+    if (keep != nullptr && keep->ready)
+    {
+        wc = static_cast<const int8_t*>(keep->codes.data);
+        rowpeak = static_cast<const uint32_t*>(keep->codes.rowpeak);
+    }
+    else
+    {
+        // s.w is sized for BF16: twice what int8 needs.
+        auto* wout = static_cast<int8_t*>(keep != nullptr ? keep->codes.data : s.w);
+        auto* peakOut = keep != nullptr ? static_cast<uint32_t*>(keep->codes.rowpeak) : ownRowpeak;
+        dequant_q4k_rows_i8<<<(unsigned int) N, 256>>>(wq, delta, wout, peakOut, N, perRow);
+        if (cudaGetLastError() != cudaSuccess) return fail();
+        if (keep != nullptr) keep->ready = true;
+        lap("dequant");
+        wc = wout;
+        rowpeak = peakOut;
+    }
+    if (!quant_rows(x, x_row_stride, nullptr, x_swiglu, xin, xc, tokpeak, K, T)) return fail();
     lap("narrow");
 
     const int32_t alpha = 1, beta = 0;
@@ -758,9 +997,21 @@ bool int8_gemm(GemmState& s, const void* w_q4k, const float* delta, int64_t K, i
                        &plan->pick.algo, s.work, plan->pick.workspaceSize, nullptr) != CUBLAS_STATUS_SUCCESS)
     {
         plan->usable = false;       // BF16 for this shape from here on
-        return false;
+        return fail();
     }
     lap("multiply");
+    if (defer)
+    {
+        if (cudaStreamSynchronize(nullptr) != cudaSuccess) return fail();
+        Int8Pending p;
+        p.peaks = peaks;
+        p.peakBytes = peakBytes;
+        p.rowpeak = rowpeak;
+        p.tokpeak = tokpeak;
+        p.N = N; p.T = T; p.ld = dst_ld;
+        s.pending[dst] = p;
+        return true;
+    }
     scale_i32_f32<<<(unsigned int) T, 256>>>(dst, dst_ld, rowpeak, tokpeak, N, T);
     if (cudaGetLastError() != cudaSuccess) return false;
     const bool ok = cudaStreamSynchronize(nullptr) == cudaSuccess;
@@ -927,7 +1178,8 @@ const Int8Codes* int8_codes(GemmState& s, const void* w_f16, int64_t K, int64_t 
 // calls (int8_codes). Returns true when dst holds the product; false leaves the F16
 // route to compute it.
 bool int8_f16_gemm(GemmState& s, const void* w_f16, int64_t K, int64_t N, const float* x, int64_t x_row_stride,
-                   const float* x_bias, int swiglu, int64_t T, float* dst, int64_t dst_ld)
+                   const float* x_bias, int swiglu, int64_t T, float* dst, int64_t dst_ld, const Int8Pending* xin,
+                   bool defer)
 {
     // Too small to gain from it, and the caller keeps only larger weights at an address
     // of their own.
@@ -935,24 +1187,44 @@ bool int8_f16_gemm(GemmState& s, const void* w_f16, int64_t K, int64_t N, const 
     if (K > 131072 || T > 0x7fffffffLL || N > 0x7fffffffLL) return false;
     Fp8Plan* plan = fp8_plan(s, K, N, T, dst_ld, true);
     if (plan == nullptr) return false;
-    if (ensure(s.peak, s.peakBytes, (std::size_t) T * sizeof(uint32_t)) == nullptr) return false;
     if (plan->pick.workspaceSize > 0 && ensure(s.work, s.workBytes, plan->pick.workspaceSize) == nullptr)
         return false;
     const Int8Codes* w = int8_codes(s, w_f16, K, N);
     if (w == nullptr) return false;
+    const std::size_t peakNeed = (std::size_t) T * sizeof(uint32_t);
+    void* peaks = nullptr;
+    std::size_t peakBytes = 0;
+    if (defer && (peaks = pool_take(s, peakNeed, peakBytes)) == nullptr) defer = false;
+    if (!defer && (peaks = ensure(s.peak, s.peakBytes, peakNeed)) == nullptr) return false;
+    auto fail = [&] {
+        if (defer) pool_give(s, peaks, peakBytes);
+        return false;
+    };
     auto* xc = static_cast<int8_t*>(s.x);        // sized for F16: twice what int8 needs
-    auto* tokpeak = static_cast<uint32_t*>(s.peak);
+    auto* tokpeak = static_cast<uint32_t*>(peaks);
+    const auto* rowpeak = static_cast<const uint32_t*>(w->rowpeak);
 
-    quant_rows_i8<<<(unsigned int) T, 256>>>(x, x_row_stride, x_bias, swiglu, xc, tokpeak, K, T);
-    if (cudaGetLastError() != cudaSuccess) return false;
+    if (!quant_rows(x, x_row_stride, x_bias, swiglu, xin, xc, tokpeak, K, T)) return fail();
     const int32_t alpha = 1, beta = 0;
     if (cublasLtMatmul(s.lt, plan->op, &alpha, w->data, plan->a, xc, plan->b, &beta, dst, plan->c, dst, plan->c,
                        &plan->pick.algo, s.work, plan->pick.workspaceSize, nullptr) != CUBLAS_STATUS_SUCCESS)
     {
         plan->usable = false;       // F16 for this shape from here on
-        return false;
+        return fail();
     }
-    scale_i32_f32<<<(unsigned int) T, 256>>>(dst, dst_ld, static_cast<const uint32_t*>(w->rowpeak), tokpeak, N, T);
+    if (defer)
+    {
+        if (cudaStreamSynchronize(nullptr) != cudaSuccess) return fail();
+        Int8Pending p;
+        p.peaks = peaks;
+        p.peakBytes = peakBytes;
+        p.rowpeak = rowpeak;        // the weight's own, kept until its codes are forgotten
+        p.tokpeak = tokpeak;
+        p.N = N; p.T = T; p.ld = dst_ld;
+        s.pending[dst] = p;
+        return true;
+    }
+    scale_i32_f32<<<(unsigned int) T, 256>>>(dst, dst_ld, rowpeak, tokpeak, N, T);
     if (cudaGetLastError() != cudaSuccess) return false;
     return cudaStreamSynchronize(nullptr) == cudaSuccess;
 }
@@ -984,13 +1256,13 @@ bool tsg_cuda_q4k_gemm_supported(void)
 bool tsg_cuda_q4k_lora_gemm_bf16(const void* w_q4k, int64_t K, int64_t N, const float* x, int64_t x_row_stride,
                                  int64_t T, float* dst, int64_t dst_ld, int nparts, const void* const* downs,
                                  const void* const* ups, const int64_t* ranks, const int64_t* outs,
-                                 const int64_t* offsets, int factor_f32, int x_swiglu);
+                                 const int64_t* offsets, int factor_f32, int x_swiglu, int flags);
 
 bool tsg_cuda_q4k_gemm_bf16(const void* w_q4k, int64_t K, int64_t N, const float* x, int64_t x_row_stride,
                             int64_t T, float* dst, int64_t dst_ld)
 {
     return tsg_cuda_q4k_lora_gemm_bf16(w_q4k, K, N, x, x_row_stride, T, dst, dst_ld, 0, nullptr, nullptr,
-                                       nullptr, nullptr, nullptr, 0, 0);
+                                       nullptr, nullptr, nullptr, 0, 0, 0);
 }
 
 // As tsg_cuda_q4k_gemm_bf16, with LoRA updates merged into the weight first:
@@ -1001,10 +1273,16 @@ bool tsg_cuda_q4k_gemm_bf16(const void* w_q4k, int64_t K, int64_t N, const float
 // F32 and added to the dequantized row before its single BF16 rounding. With
 // x_swiglu, each x row holds fc1's [gate | value] (2K floats) and the GEMM reads
 // SwiGLU of it (narrow_swiglu_bf16).
+//
+// `flags` concern the int8 route only (tsg_cuda_int8_scale.h): 1 lets it leave dst as
+// int32 sums for a reader that asks for them, 2 lets it keep the weight's int8 rows
+// between calls (int8_kept; the weight and its factors must stay where they are until
+// tsg_cuda_q4k_gemm_release). An x that holds pending sums is read as such by the int8
+// route and scaled to F32 in place before any other.
 bool tsg_cuda_q4k_lora_gemm_bf16(const void* w_q4k, int64_t K, int64_t N, const float* x, int64_t x_row_stride,
                                  int64_t T, float* dst, int64_t dst_ld, int nparts, const void* const* downs,
                                  const void* const* ups, const int64_t* ranks, const int64_t* outs,
-                                 const int64_t* offsets, int factor_f32, int x_swiglu)
+                                 const int64_t* offsets, int factor_f32, int x_swiglu, int flags)
 {
     if (K % 256 != 0 || K <= 0 || N <= 0 || T <= 0) return false;
     GemmState& s = state();
@@ -1025,14 +1303,16 @@ bool tsg_cuda_q4k_lora_gemm_bf16(const void* w_q4k, int64_t K, int64_t N, const 
         clock.lap(stage);
     };
 
+    // The F32 LoRA update, formed when a route needs it (the int8 route does not once
+    // it holds the merged rows).
     float* delta = nullptr;
-    if (nparts > 0)
-    {
+    auto merge = [&]() -> bool {
+        if (nparts <= 0 || delta != nullptr) return true;
         if (ensure(s.d, s.dBytes, (std::size_t) N * K * sizeof(float)) == nullptr) return false;
-        delta = static_cast<float*>(s.d);
+        float* d = static_cast<float*>(s.d);
         int64_t covered = 0;
         for (int i = 0; i < nparts; i++) covered += outs[i];
-        if (covered != N && cudaMemsetAsync(delta, 0, (std::size_t) N * K * sizeof(float), nullptr) != cudaSuccess)
+        if (covered != N && cudaMemsetAsync(d, 0, (std::size_t) N * K * sizeof(float), nullptr) != cudaSuccess)
             return false;
         const float one = 1.0f, zero = 0.0f;
         const cudaDataType_t ft = factor_f32 ? CUDA_R_32F : CUDA_R_16F;
@@ -1041,19 +1321,48 @@ bool tsg_cuda_q4k_lora_gemm_bf16(const void* w_q4k, int64_t K, int64_t N, const 
             // Column-major: delta' (K x out, ld K) = down' (K x rank, ld K) * up' (rank x out, ld rank).
             if (cublasGemmEx(s.handle, CUBLAS_OP_N, CUBLAS_OP_N, (int) K, (int) outs[i], (int) ranks[i], &one,
                              downs[i], ft, (int) K, ups[i], ft, (int) ranks[i], &zero,
-                             delta + offsets[i] * K, CUDA_R_32F, (int) K,
+                             d + offsets[i] * K, CUDA_R_32F, (int) K,
                              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
                 return false;
         }
+        delta = d;
         lap("lora");
-    }
+        return true;
+    };
 
 #if defined(TSG_CUDA_FP8_GEMM)
-    if ((int8_use() & FP8_DIT) != 0 && int8_gemm(s, w_q4k, delta, K, N, x, x_row_stride, x_swiglu, T, dst, dst_ld, lap))
-        return true;
+    const bool int8 = (int8_use() & FP8_DIT) != 0;
+    const Int8Pending* xin = nullptr;
+    if (auto it = s.pending.find(x); it != s.pending.end())
+    {
+        if (int8 && reads_pending(it->second, x_row_stride, K, x_swiglu, T)) xin = &it->second;
+        else if (!int8_settle(s, x)) return false;
+    }
+    if (int8)
+    {
+        bool hit = false;
+        Int8Kept* keep = (flags & 2) != 0
+            ? int8_kept(s, w_q4k, K, N, nparts, downs, ups, ranks, outs, offsets, factor_f32, hit) : nullptr;
+        if (!hit && !merge()) return false;
+        if (int8_gemm(s, w_q4k, delta, K, N, x, x_row_stride, x_swiglu, T, dst, dst_ld, xin, (flags & 1) != 0, keep, lap))
+        {
+            if (xin != nullptr) int8_consumed(s, x);
+            return true;
+        }
+        if (keep != nullptr && !keep->ready)
+        {
+            int8_free_codes(keep->codes);
+            s.int8Kept.erase(w_q4k);
+        }
+        if (!int8_settle(s, x)) return false;
+    }
+    if (!merge()) return false;
     if ((fp8_use() & FP8_DIT) != 0
         && fp8_gemm(s, w_q4k, delta, K, N, x, x_row_stride, x_swiglu, T, dst, dst_ld, lap))
         return true;
+#else
+    (void) flags;
+    if (!merge()) return false;
 #endif
 
     const long long blocks = (long long) N * (K / 256);
@@ -1114,7 +1423,7 @@ bool tsg_cuda_q6k_gemm_bf16(const void* w_q6k, int64_t K, int64_t N, const float
 // of x's [gate | value] rows (2K floats each, x_bias then 2K long), narrowed to F16;
 // the GEMM accumulates in F32 into an F32 dst. Synchronizes the default stream.
 bool tsg_cuda_f16_gemm(const void* w_f16, int64_t K, int64_t N, const float* x, int64_t x_row_stride,
-                       const float* x_bias, int swiglu, int64_t T, float* dst, int64_t dst_ld)
+                       const float* x_bias, int swiglu, int64_t T, float* dst, int64_t dst_ld, int flags)
 {
     if (K <= 0 || N <= 0 || T <= 0) return false;
     GemmState& s = state();
@@ -1122,12 +1431,28 @@ bool tsg_cuda_f16_gemm(const void* w_f16, int64_t K, int64_t N, const float* x, 
     if (!ensure_handle(s)) return false;
     if (ensure(s.x, s.xBytes, (std::size_t) T * K * sizeof(__half)) == nullptr) return false;
 #if defined(TSG_CUDA_FP8_GEMM)
-    if ((int8_use() & FP8_VAE) != 0
-        && int8_f16_gemm(s, w_f16, K, N, x, x_row_stride, x_bias, swiglu, T, dst, dst_ld))
-        return true;
+    // `flags` and a pending x: as tsg_cuda_q4k_lora_gemm_bf16 (1 = dst may stay int32).
+    const bool int8 = (int8_use() & FP8_VAE) != 0;
+    const Int8Pending* xin = nullptr;
+    if (auto it = s.pending.find(x); it != s.pending.end())
+    {
+        if (int8 && reads_pending(it->second, x_row_stride, K, swiglu, T)) xin = &it->second;
+        else if (!int8_settle(s, x)) return false;
+    }
+    if (int8)
+    {
+        if (int8_f16_gemm(s, w_f16, K, N, x, x_row_stride, x_bias, swiglu, T, dst, dst_ld, xin, (flags & 1) != 0))
+        {
+            if (xin != nullptr) int8_consumed(s, x);
+            return true;
+        }
+        if (!int8_settle(s, x)) return false;
+    }
     if ((fp8_use() & FP8_VAE) != 0
         && fp8_f16_gemm(s, w_f16, K, N, x, x_row_stride, x_bias, swiglu, T, dst, dst_ld))
         return true;
+#else
+    (void) flags;
 #endif
     auto* xh = static_cast<__half*>(s.x);
     narrow_rows_f16<<<grid_for((long long) T * K), 256>>>(x, x_row_stride, x_bias, swiglu, xh, K, T);
@@ -1143,6 +1468,60 @@ bool tsg_cuda_f16_gemm(const void* w_f16, int64_t K, int64_t N, const float* x, 
     return cudaStreamSynchronize(nullptr) == cudaSuccess;
 }
 
+// The readers' side of a product left as int32 sums (tsg_cuda_int8_scale.h).
+bool tsg_cuda_int8_pending(const void* data, const uint32_t** rowpeak, const uint32_t** tokpeak, int64_t* rows,
+                           int64_t* ld)
+{
+#if defined(TSG_CUDA_FP8_GEMM)
+    GemmState& s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    auto it = s.pending.find(data);
+    if (it == s.pending.end()) return false;
+    *rowpeak = it->second.rowpeak;
+    *tokpeak = it->second.tokpeak;
+    *rows = it->second.N;
+    *ld = it->second.ld;
+    return true;
+#else
+    (void) data; (void) rowpeak; (void) tokpeak; (void) rows; (void) ld;
+    return false;
+#endif
+}
+
+void tsg_cuda_int8_consumed(const void* data)
+{
+#if defined(TSG_CUDA_FP8_GEMM)
+    GemmState& s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    int8_consumed(s, data);
+#else
+    (void) data;
+#endif
+}
+
+bool tsg_cuda_int8_materialize(const void* data)
+{
+#if defined(TSG_CUDA_FP8_GEMM)
+    GemmState& s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    return int8_settle(s, data);
+#else
+    (void) data;
+    return true;
+#endif
+}
+
+int tsg_cuda_int8_forget_pending(void)
+{
+#if defined(TSG_CUDA_FP8_GEMM)
+    GemmState& s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    return int8_forget_pending(s);
+#else
+    return 0;
+#endif
+}
+
 // A weight tsg_cuda_f16_gemm is given has a new device copy, so another weight may now
 // sit where one used to: drop what is kept by their addresses.
 void tsg_cuda_f16_gemm_forget_weights(void)
@@ -1151,6 +1530,18 @@ void tsg_cuda_f16_gemm_forget_weights(void)
     GemmState& s = state();
     std::lock_guard<std::mutex> lock(s.mu);
     fp8_forget_codes(s);
+#endif
+}
+
+// A Q4_K weight or LoRA factor tsg_cuda_q4k_lora_gemm_bf16 is given has a new device
+// copy, so the int8 rows kept by those addresses may describe something else.
+void tsg_cuda_q4k_gemm_forget_weights(void)
+{
+#if defined(TSG_CUDA_FP8_GEMM)
+    GemmState& s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    for (auto& kv : s.int8Kept) int8_free_codes(kv.second.codes);
+    s.int8Kept.clear();
 #endif
 }
 
