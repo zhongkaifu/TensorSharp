@@ -749,6 +749,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [Theory]
     [InlineData("dense")]
     [InlineData("moe")]
+    [InlineData("dense-nextn")]   // a draft layer: K/V rows past the trunk's layers, no recurrent state there
     public void CheckpointsContinueExactly(string variant)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);

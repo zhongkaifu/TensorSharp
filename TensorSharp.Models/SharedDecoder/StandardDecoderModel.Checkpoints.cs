@@ -164,7 +164,7 @@ namespace TensorSharp.Models
                         CopyRows(source.K[l][0], target.K[l][0], d, kRow);
                         CopyRows(source.V[l][0], target.V[l][0], dv, vRow);
                     }
-                    if (_anyRecurrent && source.Recurrent[l] != null)
+                    if (_anyRecurrent && l < source.Recurrent.Length && source.Recurrent[l] != null)
                     {
                         Tensor[] from = source.Recurrent[l][0].GraphTensors, to = target.Recurrent[l][0].GraphTensors;
                         for (int i = 0; i < from.Length; i++)
