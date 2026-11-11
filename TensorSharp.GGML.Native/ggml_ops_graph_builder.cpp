@@ -106,6 +106,7 @@ namespace
         OP_SWIGLU = 51,         // silu(first half) * second half, along ne0
         OP_GEGLU = 52,
         OP_ROPE_MULTI = 53,     // srcs: x, positions [4 * rows], [freq factors]; ip: n_dims, mode, n_ctx_orig, sections[4]; fp: as ROPE_EXT
+        OP_MOE_HOST = 54,       // srcs: x [n, T], ids [k, T], weights [k, T], gate/up/down expert stacks (host); ip: layer
     };
 
     struct Leaf
@@ -115,6 +116,7 @@ namespace
         std::size_t bytes;
         int role;
         bool uploaded;   // bound to compute memory: uploaded every run (and downloaded after, for STATE)
+        bool host_only = false;                        // read from host memory at a host-expert pause, never bound
         bool has_split = false;                        // tensor parallelism: how the leaf spreads over the ranks
         ggml_backend_meta_split_state split{};
     };
@@ -261,6 +263,12 @@ namespace
         std::vector<BufferHandle> ephemeral;
         struct Alias { ggml_tensor* node; ggml_tensor* base; std::size_t offset; ggml_tensor* fallback; };
         std::vector<Alias> aliases;
+        // Host-expert pauses (OP_MOE_HOST, tsg::HostMoeSegment) and the node each segment ends after.
+        std::vector<tsg::HostMoeSegment> host_moe;
+        std::vector<int> seg_end;
+        // Effects and pauses in program order (kind 0: effects[i], 1: host_moe[i]): the graph is expanded in this
+        // order, so a pause's boundary tensors precede everything that reads its result.
+        std::vector<std::pair<int, int>> order;
 
         ~TsgGraph()
         {
@@ -276,6 +284,7 @@ namespace
 
     ggml_backend_t graph_backend(const TsgGraph* g) { return g->tp != nullptr ? g->tp->backend : g_backend; }
 
+
     ggml_tensor* node_at(TsgGraph* g, int index)
     {
         if (index < 0) return nullptr;
@@ -289,6 +298,73 @@ namespace
         if (t == nullptr) throw std::runtime_error("graph builder: ggml returned no node");
         g->nodes.push_back(t);
         return static_cast<int>(g->nodes.size()) - 1;
+    }
+
+    Leaf* leaf_of(TsgGraph* g, const ggml_tensor* t)
+    {
+        for (Leaf& leaf : g->leaves)
+            if (leaf.tensor == t) return &leaf;
+        return nullptr;
+    }
+
+    /// Routed experts from host memory (tsg::HostMoeSegment): the graph pauses after the router's outputs, the
+    /// host computes the experts into moe_out, and an accelerator tier registered for the gate stack
+    /// (ggml_ops_moe_hot_tier.cpp) runs the routes it holds in the next segment.
+    ggml_tensor* build_host_experts(TsgGraph* g, const int* s, int ns, const std::int64_t* ip, int nip)
+    {
+        if (ns < 6) throw std::runtime_error("graph builder: host experts take x, ids, weights and three expert stacks");
+        if (g->tp != nullptr) throw std::runtime_error("graph builder: host experts under tensor parallelism are not supported");
+        ggml_context* ctx = g->ctx;
+        ggml_tensor* x = node_at(g, s[0]);
+        ggml_tensor* ids = node_at(g, s[1]);
+        ggml_tensor* weights = node_at(g, s[2]);
+        Leaf* parts[3] = { leaf_of(g, node_at(g, s[3])), leaf_of(g, node_at(g, s[4])), leaf_of(g, node_at(g, s[5])) };
+        for (Leaf* leaf : parts)
+            if (leaf == nullptr || leaf->data == nullptr || leaf->role != LEAF_WEIGHT)
+                throw std::runtime_error("graph builder: host experts need weight leaves with host data");
+        const std::int64_t n = x->ne[0], T = ggml_nelements(x) / n, n_used = ids->ne[0];
+        const ggml_tensor* gate = parts[0]->tensor;
+        const std::int64_t n_ff = gate->ne[1], experts = gate->ne[2];
+        auto boundary = [&](ggml_tensor* t) {
+            if (!ggml_is_contiguous(t)) t = ggml_cont(ctx, t);
+            for (ggml_tensor* p = t; p != nullptr; p = p->view_src) ggml_set_output(p);
+            return t;
+        };
+        tsg::HostMoeSegment hm;
+        hm.layer = nip > 0 ? static_cast<int>(ip[0]) : 0;
+        hm.moe_in = boundary(ggml_reshape_2d(ctx, ggml_is_contiguous(x) ? x : ggml_cont(ctx, x), n, T));
+        hm.sel_ids = boundary(ggml_reshape_2d(ctx, ggml_is_contiguous(ids) ? ids : ggml_cont(ctx, ids), n_used, T));
+        hm.weights = boundary(ggml_reshape_2d(ctx, ggml_is_contiguous(weights) ? weights : ggml_cont(ctx, weights), n_used, T));
+        hm.moe_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
+        ggml_set_input(hm.moe_out);
+        ggml_set_output(hm.moe_out);
+        void** data[3] = { &hm.gate_data, &hm.up_data, &hm.down_data };
+        int* type[3] = { &hm.gate_type, &hm.up_type, &hm.down_type };
+        std::int64_t* bytes[3] = { &hm.gate_bytes, &hm.up_bytes, &hm.down_bytes };
+        for (int i = 0; i < 3; i++)
+        {
+            parts[i]->host_only = true;
+            *data[i] = parts[i]->data;
+            *type[i] = parts[i]->tensor->type;
+            *bytes[i] = static_cast<std::int64_t>(parts[i]->bytes);
+        }
+        hm.gate_ne0 = n; hm.gate_ne1 = n_ff;
+        hm.up_ne0 = n; hm.up_ne1 = n_ff;
+        hm.down_ne0 = n_ff; hm.down_ne1 = n;
+        hm.activation = 0;   // silu(gate) * up
+        hm.num_experts = static_cast<int>(experts);
+        hm.n_used = static_cast<int>(n_used);
+        hm.n_ff = static_cast<int>(n_ff);
+        hm.seq_len = static_cast<int>(T);
+        hm.hidden = static_cast<int>(n);
+        ggml_tensor* hot = nullptr;
+        if (tsg::MoeHotTier* tier = tsg::moe_hot_tier_find(hm.gate_data))
+            if (T <= tsg::host_moe_tier_max_rows(*tier) && tier->num_experts == hm.num_experts && tier->count >= hm.n_used
+                && tier->type[0] == hm.gate_type && tier->type[1] == hm.up_type && tier->type[2] == hm.down_type)
+                hot = tsg::host_moe_build_hot_part(ctx, hm, hm.moe_in, *tier, ggml_mul_mat_id, 0, nullptr, nullptr);
+        g->host_moe.push_back(hm);
+        g->order.emplace_back(1, static_cast<int>(g->host_moe.size()) - 1);
+        return hot != nullptr ? ggml_add(ctx, hm.moe_out, hot) : hm.moe_out;
     }
 
     ggml_tensor* build_op(TsgGraph* g, int op, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp)
@@ -374,6 +450,7 @@ namespace
             return ggml_rope_ext(ctx, src(0), src(1), src(2),
                                  static_cast<int>(ipar(0, 0)), static_cast<int>(ipar(1, 0)), static_cast<int>(ipar(2, 0)),
                                  fpar(0, 10000.0f), fpar(1, 1.0f), fpar(2, 0.0f), fpar(3, 1.0f), fpar(4, 32.0f), fpar(5, 1.0f));
+        case OP_MOE_HOST: return build_host_experts(g, s, ns, ip, nip);
         case OP_ROPE_MULTI:
         {
             need(2);
@@ -438,10 +515,24 @@ namespace
     {
         g->graph = ggml_new_graph_custom(g->ctx, g->max_nodes, false);
         if (g->graph == nullptr) { set_last_error("graph builder: graph allocation failed."); return false; }
-        for (ggml_tensor* e : g->effects) ggml_build_forward_expand(g->graph, e);
+        // Effects and host-expert pauses in program order: a pause's boundary tensors come before any node that
+        // reads its result (moe_out has no producer, so nothing else orders them).
+        for (const auto& [kind, index] : g->order)
+        {
+            if (kind == 0)
+            {
+                ggml_build_forward_expand(g->graph, g->effects[static_cast<std::size_t>(index)]);
+                continue;
+            }
+            const tsg::HostMoeSegment& hm = g->host_moe[static_cast<std::size_t>(index)];
+            ggml_build_forward_expand(g->graph, hm.moe_in);
+            ggml_build_forward_expand(g->graph, hm.sel_ids);
+            ggml_build_forward_expand(g->graph, hm.weights);
+        }
         for (const Output& o : g->outputs) ggml_build_forward_expand(g->graph, o.tensor);
-        // Before allocation: reordering after lifetime planning would invalidate the alias plan.
-        if (g->reorder) optimize_graph_for_metal(g->ctx, g->graph);
+        // Before allocation: reordering after lifetime planning would invalidate the alias plan (and a
+        // reorder would move nodes across a pause).
+        if (g->reorder && g->host_moe.empty()) optimize_graph_for_metal(g->ctx, g->graph);
 
         if (g->tp != nullptr)
         {
@@ -464,8 +555,8 @@ namespace
         ggml_backend_dev_t dev = ggml_backend_get_device(graph_backend(g));
         for (Leaf& leaf : g->leaves)
         {
-            leaf.uploaded = true;
-            if (leaf.role == LEAF_INPUT || leaf.data == nullptr) continue;
+            leaf.uploaded = !leaf.host_only;
+            if (leaf.role == LEAF_INPUT || leaf.data == nullptr || leaf.host_only) continue;
             if (g->tp != nullptr)
             {
                 // Weights and states are resident in meta buffers (uploaded once, spread by their split).
@@ -518,6 +609,8 @@ namespace
             }
         }
         (void) fallbacks;
+        if (!g->host_moe.empty() && !tsg::host_moe_build_segment_ends(g->graph, g->host_moe, g->seg_end, "graph builder"))
+            return false;
 
         // A one-shot graph borrows the backend's persistent, reused compute allocator (the
         // memory the fused graphs share, grown on demand); a graph that will be replayed keeps
@@ -741,6 +834,7 @@ TSG_EXPORT int TSGgml_GraphEffect(void* handle, int node)
     {
         if (g == nullptr || g->built) throw std::runtime_error("graph builder: no graph, or graph already built");
         g->effects.push_back(node_at(g, node));
+        g->order.emplace_back(0, static_cast<int>(g->effects.size()) - 1);
         return 1;
     }
     catch (const std::exception& ex)
@@ -790,8 +884,17 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
         // Enqueue the graph and the downloads back to back, then synchronize once (as llama.cpp's
         // scheduler does): a synchronous compute followed by a download is a second command-buffer
         // round trip per step. The run is complete when this returns.
-        ggml_status status;
-        if (graph_node_profile_enabled())
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (!g->host_moe.empty())
+        {
+            // Accelerator segments and host-expert pauses in turn (the outputs are read below).
+            if (!tsg::host_moe_execute_segments(g->graph, g->host_moe, g->seg_end, "graph builder", graph_backend(g)))
+            {
+                sync_backend(graph_backend(g));
+                return 0;
+            }
+        }
+        else if (graph_node_profile_enabled())
         {
             status = graph_compute_profiled(graph_backend(g), g->graph, g->replayable ? "graph builder decode" : "graph builder prefill");
         }

@@ -753,6 +753,20 @@ before `SwigluFfn` and the strided prep); decode 197 / 197.
 Multi-axis rotary whose axes all hold the same position (text) runs as NeoX rotary on the device; the
 host loop, which read the rows back, now serves only image tokens.
 
+#### Routed experts in host memory
+
+`GraphOp.MoeHostExperts` takes a layer's routed experts from host memory (`--n-cpu-moe`): the router and the
+expert weights are the program's, the products are the host's. An executor with
+`GraphCapabilities.HostExperts` runs it at a pause in the program; the others decline the step as before
+(MLX and direct CUDA keep the per-op host experts). The GGML plugin lowers it to the native
+`tsg::HostMoeSegment` the fused model graphs already use: the graph builder records the pauses and the
+effects in program order (a pause's boundary tensors must precede every node that reads its result, since
+`moe_out` has no producer), runs the graph with `host_moe_execute_segments`, and never binds the expert stacks
+to the device. An accelerator tier registered for the gate stack (`MoeHotTierRegister`) runs the routes it
+holds in the next segment, as in the fused graphs. Qwen 3.5 MoE (`Qwen35RuntimeTests`): the host experts
+answer as the accelerator's (BF16 within 1e-2) and keep the runtime as close to `Qwen35Model`'s offloaded
+run as the accelerator's keep it to `Qwen35Model`'s (ggml_cpu, ggml_metal).
+
 Direct CUDA (RTX PRO 6000) is not at parity yet: Qwen3.5-0.8B Q8_0 prompt 8,800 / 15,400 tok/s, decode
 209 / 272; 9B prompt 1,800 / 2,300, decode 38.4 / 38.7 (runtime / `Qwen35CudaModel`).
 

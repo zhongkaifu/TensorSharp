@@ -22,8 +22,14 @@ prefix checkpoints carry it), `attention.recurrent_layers`, and `Sqr`/`Sqrt`/`Cl
 One trap: a replayable step is emitted twice when its signature misses the cache (the signature pass, then the
 recording), so hashing a step must use the history as of its start (the state keeps one level of undo).
 
-**Next:** the real checkpoint needs its experts off the device (§2.5: a tiered expert op), the MTP head and
-DFlash2 (§2.6, with the PLE histories rewound by a verify), and QSA phase 2 above the budget.
+**Host experts (§2.5, first half).** `GraphOp.MoeHostExperts` runs a layer's routed experts from host memory at a
+pause in the program (GGML: the native `HostMoeSegment` seam, with a registered accelerator tier running the
+routes it holds). What remains for the real checkpoint is choosing the offloaded layers and registering the
+tiers as `Qwen4ExpModel.ExpertTiers` does (routing profile, fixed and window slots), and the prompt-width
+streaming.
+
+**Next:** the tier policy above, the MTP head and DFlash2 (§2.6, with the PLE histories rewound by a verify),
+and QSA phase 2 above the budget.
 
 Flash Next has 125 B parameters in total and 6 B active. Its routed experts take 46 GB at UD-Q2_K_XL.
 

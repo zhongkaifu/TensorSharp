@@ -26,6 +26,9 @@ namespace TensorSharp.Graph
         public bool IndexedCacheWrites { get; init; }
         /// <summary>K/V caches may be block-quantized (Q8_0, Q4_0): views and writes address their blocks.</summary>
         public bool QuantizedKvCache { get; init; }
+        /// <summary>It runs <see cref="GraphOp.MoeHostExperts"/>: routed experts computed from host memory at a
+        /// pause in the program.</summary>
+        public bool HostExperts { get; init; }
         /// <summary>A compiled plan is worth keeping to run again (a replayable program is cached and
         /// looked up by its signature); otherwise every step is recorded and compiled once.</summary>
         public bool Replays { get; init; } = true;

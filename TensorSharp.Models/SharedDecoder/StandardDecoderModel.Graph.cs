@@ -69,7 +69,7 @@ namespace TensorSharp.Models
             if (_anyRecurrent && !RecurrentMixerLowers) return "recurrent layers without a graph mixer";
             if (StepAdapter != null) return "a request adapter is selected";
             for (int l = 0; l < Config.NumLayers; l++)
-                if (_moeLayer[l] && MoeCpuOffloadConfig.IsLayerOnCpu(l)) return "host-offloaded experts";
+                if (_moeLayer[l] && MoeCpuOffloadConfig.IsLayerOnCpu(l) && !GraphExecutor.Capabilities.HostExperts) return "host-offloaded experts";
             DType kv = _kvCacheDtype.ToDType();
             if (kv != DType.Float32 && kv != DType.Float16 && kv != DType.Q8_0 && kv != DType.Q4_0) return $"KV dtype {kv}";
             if ((kv == DType.Q8_0 || kv == DType.Q4_0) && !GraphExecutor.Capabilities.QuantizedKvCache) return $"KV dtype {kv} on this backend's executor";
@@ -767,20 +767,34 @@ namespace TensorSharp.Models
                 weights = step.Op(GraphOp.Div, weights, step.Reshape(sum, 1, 1, rows));
             }
 
-            int input = step.Reshape(x, hidden, 1, rows);
-            int gate = step.Op(GraphOp.MulMatId, step.Experts(p + "ffn_gate_exps.weight"), input, selected);
-            int up = step.Op(GraphOp.MulMatId, step.Experts(p + "ffn_up_exps.weight"), input, selected);
-            int act = step.Op(GraphOp.SwigluSplit, gate, up);                                            // [ff, K, rows]
-            int down = step.Op(GraphOp.MulMatId, step.Experts(p + "ffn_down_exps.weight"), act, selected); // [hidden, K, rows]
-            down = step.Op(GraphOp.Mul, down, weights);
-            long rowBytes = hidden * 4L;
-            int output = -1;
-            for (int j = 0; j < k; j++)
+            int output;
+            if (MoeCpuOffloadConfig.IsLayerOnCpu(layer) && GraphExecutor.Capabilities.HostExperts)
             {
-                int slice = step.View2(down, hidden, rows, rowBytes * k, j * rowBytes);
-                output = output < 0 ? slice : step.Op(GraphOp.Add, output, slice);
+                // The experts stay in host memory: the program pauses for them (and a registered accelerator tier
+                // runs the routes it holds).
+                output = step.Op(GraphOp.MoeHostExperts, stackalloc[]
+                {
+                    x, selected, weights, step.Experts(p + "ffn_gate_exps.weight"), step.Experts(p + "ffn_up_exps.weight"),
+                    step.Experts(p + "ffn_down_exps.weight"),
+                }, stackalloc long[] { layer });
             }
-            output = step.Cont(output);
+            else
+            {
+                int input = step.Reshape(x, hidden, 1, rows);
+                int gate = step.Op(GraphOp.MulMatId, step.Experts(p + "ffn_gate_exps.weight"), input, selected);
+                int up = step.Op(GraphOp.MulMatId, step.Experts(p + "ffn_up_exps.weight"), input, selected);
+                int act = step.Op(GraphOp.SwigluSplit, gate, up);                                            // [ff, K, rows]
+                int down = step.Op(GraphOp.MulMatId, step.Experts(p + "ffn_down_exps.weight"), act, selected); // [hidden, K, rows]
+                down = step.Op(GraphOp.Mul, down, weights);
+                long rowBytes = hidden * 4L;
+                output = -1;
+                for (int j = 0; j < k; j++)
+                {
+                    int slice = step.View2(down, hidden, rows, rowBytes * k, j * rowBytes);
+                    output = output < 0 ? slice : step.Op(GraphOp.Add, output, slice);
+                }
+                output = step.Cont(output);
+            }
 
             if (HasWeight(p + "ffn_gate_shexp.weight"))
             {

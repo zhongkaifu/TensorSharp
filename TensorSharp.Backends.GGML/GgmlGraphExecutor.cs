@@ -52,6 +52,8 @@ namespace TensorSharp.GGML
                 TensorParallel = backend == GgmlBackendType.Cuda,
                 BindsHostPointers = true,
                 QuantizedKvCache = true,
+                // Routed experts in host memory run at a pause in the graph (ggml_ops_graph_builder.cpp).
+                HostExperts = true,
             };
         }
 

@@ -155,6 +155,67 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData("moe")]
     public void MlxMatchesTheManagedReference(string variant) => CompareBackend(variant, BackendType.Mlx);
 
+    /// <summary>Every MoE layer's experts in host memory (--n-cpu-moe all) on the pinned GGML backend: the step's
+    /// graph pauses for them (GraphOp.MoeHostExperts). The host's expert kernels answer as the accelerator's do
+    /// (except quantized experts on Metal and CUDA, which quantize the activations unlike the host: Qwen35Model's own
+    /// host and accelerator runs sit 0.1-0.5 apart on this fixture there, from route flips), and
+    /// they keep the runtime as close to Qwen35Model's offloaded run as the accelerator's keep it to Qwen35Model's.</summary>
+    [Theory]
+    [InlineData("moe")]
+    [InlineData("moe-quantized")]
+    public void HostExpertsInTheGraphMatchTheAcceleratorAndQwen35Model(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        BackendType backend = TestGates.PinnedGgmlBackend;
+        string path = Fixture(variant);
+        List<float[]> device, host, legacyDevice, legacyHost, tiered;
+        MoeCpuOffloadConfig.Reset();
+        try
+        {
+            using (var model = Create(path, backend: backend)) device = Script(model);
+            using (var model = new Qwen35Model(path, backend)) legacyDevice = Script(model);
+            MoeCpuOffloadConfig.SetAllLayers();
+            using (var model = Create(path, backend: backend))
+            {
+                host = Script(model);
+                Assert.True(model.GraphRuns > 0, "the offloaded steps did not run as graphs");
+            }
+            using (var model = new Qwen35Model(path, backend)) legacyHost = Script(model);
+            // A tier holding every expert (fixed slots): every route runs on the accelerator at the pause.
+            using (var model = Create(path, backend: backend))
+            {
+                Assert.True(model.RegisterExpertTiersForTests(int.MaxValue, 0) > 0, "no layer took a tier");
+                tiered = Script(model);
+            }
+        }
+        finally
+        {
+            MoeCpuOffloadConfig.Reset();
+        }
+        // ggml_cuda: the paused graphs' last row (a second request's decode) sits 1.4e-2 from the unpaused one's with
+        // the tier and with the host alike (BF16, RTX PRO 6000); ggml_metal 5.6e-3.
+        Assert.True(tiered.Select((r, i) => RelL2(r, device[i])).All(r => r <= (variant == "moe" ? 2e-2 : 3e-2)),
+            $"{variant} on {backend}: a tier holding every expert, relL2 from the accelerator's experts: " +
+            string.Join(", ", tiered.Select((r, i) => RelL2(r, device[i]).ToString("E2"))));
+        string Rows(List<float[]> a, List<float[]> b) => string.Join(", ", a.Select((r, i) => RelL2(r, b[i]).ToString("E2")));
+        // Quantized experts: the accelerators quantize the activations their own way (Metal not at all, CUDA as
+        // q8_1), so only ggml_cpu, whose experts are the host's kernels, compares them.
+        if (variant == "moe" || backend == BackendType.GgmlCpu)
+        {
+            // BF16 experts: ggml-cuda rounds the activations to BF16 (1.4e-2 measured on an RTX PRO 6000).
+            double tolerance = variant == "moe" ? 2e-2 : 3e-2;
+            Assert.True(host.Select((r, i) => RelL2(r, device[i])).All(r => r <= tolerance),
+                $"{variant} on {backend}: relL2 from the accelerator's experts: {Rows(host, device)}");
+        }
+        // The runtime and Qwen35Model route this fixture's near-ties differently: with quantized experts they sit up
+        // to 6.1e-2 apart even on the accelerator (ggml_cpu), with BF16 experts 1.2e-2 (ggml_cuda). Worst row, host
+        // experts against Qwen35Model's (2026-11-11): ggml_metal 1.9e-3 (moe) / 2.6e-2 (moe-quantized), ggml_cuda
+        // 1.1e-2 (moe).
+        double fromLegacy = variant == "moe" ? 2e-2 : 7e-2;
+        Assert.True(host.Select((r, i) => RelL2(r, legacyHost[i])).All(r => r <= fromLegacy),
+            $"{variant} on {backend}: host experts relL2 from Qwen35Model's {Rows(host, legacyHost)}; accelerator experts {Rows(device, legacyDevice)}");
+    }
+
     private void CompareBackend(string variant, BackendType backend)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);

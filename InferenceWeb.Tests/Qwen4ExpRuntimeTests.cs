@@ -36,10 +36,11 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         string path = Fixture(qsa: false);
         float[][] expected = Run(() => new Qwen4ExpModel(path, BackendType.Cpu), chunkedPrompt);
         float[][] actual = Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cpu), chunkedPrompt);
-        // One prompt runs the same products in the same order: the same bits within rounding. A chunked prompt's
-        // managed products pick their kernels by row count, so either model moves by ~5e-3 against its own
-        // unchunked run (Qwen4ExpModel: 4.7e-3 measured), and the two by as much against each other.
-        AssertClose(expected, actual, chunkedPrompt ? 1e-2 : 1e-5, "managed cpu");
+        // On arm64 one prompt runs the same products in the same order: the same bits within 1.5e-7. A chunked
+        // prompt's managed products pick their kernels by row count, so either model moves by ~5e-3 against its
+        // own unchunked run (Qwen4ExpModel: 4.7e-3 measured), and the two by as much against each other; on x64
+        // the two models' products differ by as much in one prompt too (6.4e-3 measured on Linux).
+        AssertClose(expected, actual, chunkedPrompt || !System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.Equals(System.Runtime.InteropServices.Architecture.Arm64) ? 1e-2 : 1e-5, "managed cpu");
     }
 
     /// <summary>MLX (F16 attention over F16 caches, MLX's own kernels) against Qwen4ExpModel's managed run.</summary>
