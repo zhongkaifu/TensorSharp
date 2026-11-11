@@ -152,7 +152,14 @@ public class Qwen35ArenaQuantizedKvTests : IDisposable
         // And it must have actually batched. Matching tokens alone prove nothing
         // here - the round-robin fallback produces correct tokens too - so require
         // the positive signal that arena steps were served.
-        long arenaSteps = ((Qwen35Model)model).ArenaBatchedDecodeSteps;
+        // Qwen35Model's arena steps, or the shared runtime's batched slot steps (one dense ggml_cuda /
+        // ggml_metal device routes to the runtime).
+        long arenaSteps = model switch
+        {
+            Qwen35Model q35 => q35.ArenaBatchedDecodeSteps,
+            StandardDecoderModel runtime => runtime.BatchedForwardCount,
+            _ => 0,
+        };
         _output.WriteLine($"[arena-q8] arena batched decode steps: {arenaSteps}");
         Assert.True(arenaSteps > 0,
             "the arena batched decode never ran, so this comparison says nothing about it"

@@ -41,7 +41,9 @@ public sealed class Qwen35MigrationAfterPrefillTests
     {
         string path = TestGates.FindSmallestGguf(Environment.GetEnvironmentVariable(EnvModelDir), Qwen35Family);
         Assert.True(path != null, "the gate admitted the model but the loader found none");
-        using var model = Assert.IsType<Qwen35Model>(ModelBase.Create(path, BackendType.GgmlCuda));
+        // Qwen35Model's own paged migration (one ggml_cuda device routes dense checkpoints to the
+        // shared runtime, so the family model is built directly).
+        using var model = new Qwen35Model(path, BackendType.GgmlCuda);
         var batched = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
         Assert.True(batched.SupportsLinearKVMigration, "no linear migration on this lane");
         var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());

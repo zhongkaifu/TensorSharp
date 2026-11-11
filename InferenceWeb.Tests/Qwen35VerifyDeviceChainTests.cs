@@ -183,7 +183,8 @@ public sealed class Qwen35VerifyDeviceChainTests
     {
         string path = Environment.GetEnvironmentVariable("TS_Q35_STATE_MODEL");
         Assert.True(File.Exists(path), "TS_Q35_STATE_MODEL must name a Qwen3.5 GGUF file.");
-        using ModelBase loaded = ModelBase.Create(path, BackendType.GgmlMetal);
+        // Qwen35Model's verify chain, built directly (dense ggml_metal checkpoints route to the shared runtime).
+        using ModelBase loaded = new Qwen35Model(path, BackendType.GgmlMetal);
         Qwen35Model model = Assert.IsType<Qwen35Model>(loaded);
         var target = (ISpeculativeTarget)model;
         int[] prompt = model.Tokenizer.Encode(

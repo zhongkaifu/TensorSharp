@@ -126,13 +126,46 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// The requests the shared runtime serves for this family (see Qwen35Architecture):
-        /// whole-layer stages, local or multi-node, alone or with --tp; and routed experts on
-        /// the host for cuda and mlx, where Qwen35Model keeps them in device buffers.
+        /// whole-layer stages, local or multi-node, alone or with --tp; routed experts on the host
+        /// for cuda and mlx, where Qwen35Model keeps them in device buffers; and one device on
+        /// ggml_cuda / ggml_metal for checkpoints without routed experts (<see cref="ServesOneDevice"/>).
         /// </summary>
         internal static bool Serves(Architecture.ModelCreateContext context)
             => context.LayerSplitDegree > 1
                || context.TpGroup is ILayerSplitGroup
-               || (MoeCpuOffloadConfig.IsEnabled && context.Backend is BackendType.Cuda or BackendType.Mlx);
+               || (MoeCpuOffloadConfig.IsEnabled && context.Backend is BackendType.Cuda or BackendType.Mlx)
+               || ServesOneDevice(context);
+
+        /// <summary>
+        /// One device on ggml_cuda or ggml_metal, for a checkpoint without routed experts or Bonsai2
+        /// PRISM rotations: the runtime's whole-forward graphs match Qwen35Model there (Qwen3.8-27B
+        /// UD-IQ3_XXS, prefill / decode tok/s: ggml_metal 388.7 / 21.0 vs 393.3 / 21.0 on an M5 Pro;
+        /// ggml_cuda measured on an RTX PRO 6000 in the commit adding this route), and its MTP
+        /// and DFlash2 speculation is faster. Qwen35Model keeps routed experts (its fused MoE graphs
+        /// and host seam), --tp (its per-rank fused graphs), PRISM rotations and the other backends.
+        /// </summary>
+        internal static bool ServesOneDevice(Architecture.ModelCreateContext context)
+            => context.Backend is BackendType.GgmlCuda or BackendType.GgmlMetal
+               && context.TpDegree <= 1 && context.TpGroup == null && context.LayerSplitDegree <= 1
+               && context.Probe != null && !HasRoutedExperts(context.Probe) && !CarriesPrismRotations(context.Probe);
+
+        private static bool HasRoutedExperts(GgufFile probe)
+        {
+            foreach (string name in probe.Tensors.Keys)
+                if (name.Contains("_exps.", StringComparison.Ordinal)) return true;
+            return false;
+        }
+
+        /// <summary>Bonsai2's PRISM Hadamard rotations (or its low-bit tensor types), which only
+        /// Qwen35Model applies.</summary>
+        private static bool CarriesPrismRotations(GgufFile probe)
+        {
+            foreach (string key in probe.Metadata.Keys)
+                if (key.StartsWith("prism.hadamard.", StringComparison.Ordinal)) return true;
+            foreach (var tensor in probe.Tensors.Values)
+                if (tensor.Type is GgmlTensorType.PQ2_0 or GgmlTensorType.PTQ1_0) return true;
+            return false;
+        }
 
         protected override bool IsRecurrentLayer(int layer) => _isRecurrent[layer];
 

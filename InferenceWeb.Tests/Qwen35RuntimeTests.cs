@@ -58,6 +58,26 @@ public sealed class Qwen35RuntimeTests : IDisposable
     private static Qwen35RuntimeModel Create(string path, int tp = 1, int stages = 1, BackendType backend = BackendType.Cpu)
         => new(path, backend, tp, tp > 1 ? new SimulatedDeviceGroup(tp * stages) : null, stages);
 
+    /// <summary>The factory's route: one ggml_cuda / ggml_metal device runs a dense checkpoint on the
+    /// shared runtime; routed experts, --tp, and every other backend stay with Qwen35Model.</summary>
+    [Theory]
+    [InlineData("dense", BackendType.GgmlCuda, 1, true)]
+    [InlineData("dense", BackendType.GgmlMetal, 1, true)]
+    [InlineData("dense-nextn", BackendType.GgmlCuda, 1, true)]
+    [InlineData("dense", BackendType.GgmlCuda, 2, false)]
+    [InlineData("dense", BackendType.GgmlCpu, 1, false)]
+    [InlineData("dense", BackendType.Cuda, 1, false)]
+    [InlineData("dense", BackendType.Mlx, 1, false)]
+    [InlineData("moe", BackendType.GgmlCuda, 1, false)]
+    [InlineData("moe", BackendType.GgmlMetal, 1, false)]
+    public void OneDeviceRouteServesDenseCheckpointsOnGgmlCudaAndMetal(string variant, BackendType backend, int tp, bool runtime)
+    {
+        using var probe = new GgufFile(Fixture(variant));
+        var context = new TensorSharp.Models.Architecture.ModelCreateContext(probe.FilePaths[0], backend, probe, tp);
+        Assert.Equal(runtime, Qwen35RuntimeModel.ServesOneDevice(context));
+        Assert.Equal(runtime, Qwen35RuntimeModel.Serves(context));
+    }
+
     /// <summary>Prefill, decode, reset, prefill, decode: a recurrent stack cannot rewind.</summary>
     private static List<float[]> Script(ModelBase model)
     {

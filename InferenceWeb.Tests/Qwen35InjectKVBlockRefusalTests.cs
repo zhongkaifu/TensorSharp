@@ -40,7 +40,9 @@ public class Qwen35InjectKVBlockRefusalTests
         if (modelPath == null) { _output.WriteLine("no qwen3.5-9b model; skipping"); return; }
         BackendType backend = TestGates.PinnedGgmlBackend;
 
-        using var model = ModelBase.Create(modelPath, backend);
+        // Qwen35Model's KV block injection, built directly (dense one-device checkpoints route to the
+        // shared runtime).
+        using var model = new Qwen35Model(modelPath, backend);
         var q35 = Assert.IsType<Qwen35Model>(model);
         _output.WriteLine($"model {System.IO.Path.GetFileName(modelPath)} on {backend}");
         int[] tokens = model.Tokenizer.Encode(

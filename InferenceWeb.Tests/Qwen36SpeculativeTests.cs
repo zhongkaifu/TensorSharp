@@ -49,7 +49,7 @@ public class Qwen36SpeculativeTests
         int maxDraft = EnvInt("TS_SPEC_DRAFT", 8);
 
         _output.WriteLine($"[mtp] loading {Path.GetFileName(modelPath)} backend={ResolveBackend()}");
-        using var model = (Qwen35Model)ModelBase.Create(modelPath, ResolveBackend());
+        using var model = new Qwen35Model(modelPath, ResolveBackend());
         Xunit.Assert.True(model.HasDraftHead, "model should expose a NextN/MTP draft head");
 
         string prompt = "Q: What is the capital of France?\nA: The capital of France is Paris.\n" +
@@ -115,7 +115,7 @@ public class Qwen36SpeculativeTests
         int maxDraft = EnvInt("TS_SPEC_DRAFT", 8);
 
         _output.WriteLine($"[mtp-bench] loading {Path.GetFileName(modelPath)} backend={ResolveBackend()}");
-        using var model = (Qwen35Model)ModelBase.Create(modelPath, ResolveBackend());
+        using var model = new Qwen35Model(modelPath, ResolveBackend());
         Xunit.Assert.True(model.HasDraftHead);
 
         string prompt = "Write a short story about a robot learning to paint. " +
@@ -182,7 +182,7 @@ public class Qwen36SpeculativeTests
         int maxDraft = EnvInt("TS_SPEC_DRAFT", 8);
 
         _output.WriteLine($"[mtp-profile] loading {Path.GetFileName(modelPath)} backend={ResolveBackend()}");
-        using var model = (Qwen35Model)ModelBase.Create(modelPath, ResolveBackend());
+        using var model = new Qwen35Model(modelPath, ResolveBackend());
         Xunit.Assert.True(model.HasDraftHead);
 
         string prompt = "Write a long, detailed essay about the history of video games. Begin:";

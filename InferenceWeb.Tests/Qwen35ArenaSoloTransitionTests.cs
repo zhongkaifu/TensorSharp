@@ -52,7 +52,8 @@ public sealed class Qwen35ArenaSoloTransitionTests
             return;
         }
         string path = TestGates.FindGguf(Environment.GetEnvironmentVariable(EnvModelDir), ModelPattern)!;
-        using ModelBase model = ModelBase.Create(path, backend);
+        // Qwen35Model's arena, built directly (dense one-device checkpoints route to the shared runtime).
+        using ModelBase model = new Qwen35Model(path, backend);
         var paged = (IBatchedPagedModel)model;
         var q35 = Assert.IsType<Qwen35Model>(model);
 
