@@ -340,7 +340,9 @@ bool h3_q4k_matmul_run(ggml_tensor* node)
 //                       f0 = 1 when x is fc1's [gate | value] and the GEMM reads its
 //                       SwiGLU
 //   H3_FUSED_F16_GEMM   w (F16), x, x bias (nullable) -> W act(x) on cuBLAS, act being
-//                       x + bias or, with f0 = 1, SwiGLU(x + bias) (the video VAE)
+//                       x + bias or, with f0 = 1, SwiGLU(x + bias) (the video VAE); a BF16
+//                       w, no bias, is a BF16 DiT's fc2 over fc1's [gate | value]
+//                       (tsg_cuda_bf16_gemm, cuBLAS BF16 or int8)
 //   H3_FUSED_SCALED_RESIDUAL base, mm, bias, scale -> base + (mm + bias) * scale
 //   H3_FUSED_MODULATE   x, norm weight, mods -> RMSNorm(x)*w modulated per segment
 //   H3_FUSED_RESIDUAL   base, mm, bias, delta, mods -> base + (delta+(mm+bias))*gate
@@ -388,7 +390,9 @@ ggml_tensor* h3_fused_node(ggml_context* ctx, std::int64_t ne0, std::int64_t ne1
     // The node profiler splits GGML_OP_CUSTOM by name: the stage and, for a GEMM, its width.
     static const char* const names[] = { "", "attention", "modulate", "residual", "gemm", "f16gemm", "scaled-residual" };
     if (p.kind == H3_FUSED_LORA_GEMM || p.kind == H3_FUSED_F16_GEMM)
-        ggml_format_name(node, "%s %lldx%lld%s", names[p.kind], static_cast<long long>(srcs[0]->ne[0]),
+        ggml_format_name(node, "%s %lldx%lld%s",
+                         p.kind == H3_FUSED_F16_GEMM && srcs[0]->type == GGML_TYPE_BF16 ? "bf16gemm" : names[p.kind],
+                         static_cast<long long>(srcs[0]->ne[0]),
                          static_cast<long long>(srcs[0]->ne[1]), p.f0 != 0.0f ? " swiglu" : "");
     else
         ggml_set_name(node, names[p.kind]);
@@ -428,11 +432,12 @@ extern "C" bool tsg_cuda_q4k_lora_gemm_bf16(const void* w_q4k, int64_t K, int64_
                                             const int64_t* offsets, int factor_f32, int x_swiglu);
 #if defined(TSG_HAVE_CUDNN)
 extern "C" bool tsg_cudnn_sdpa_prepare(int64_t heads, int64_t seq, int64_t head_dim);
+extern "C" bool tsg_cudnn_sdpa_prepare_batched(int64_t heads, int64_t seq, int64_t head_dim, int64_t batch);
 extern "C" bool tsg_cudnn_h3_attention(const float* q, int64_t q_sh, int64_t q_ss, const float* k, int64_t k_sh, int64_t k_ss,
                                        const float* v, int64_t v_sh, int64_t v_ss, const float* qb, const float* kb,
                                        const float* vb, int64_t bias_hs, const float* qn, const float* kn,
                                        const float* cosT, const float* ssinT, int rot, float eps, float vScale, float scale,
-                                       int heads, int seq, int head_dim, float* out);
+                                       int heads, int seq, int head_dim, int batch, float* out);
 #endif
 
 std::int64_t h3_rows(const ggml_tensor* t) { return static_cast<std::int64_t>(t->nb[1] / sizeof(float)); }
@@ -456,12 +461,17 @@ bool h3_fused_run(ggml_tensor* node)
         // The DiT's qkv bias is stacked [q | k | v]; the video VAE's interleaves the
         // three per head (c = D, b = 3*D).
         const std::int64_t part = p.c > 0 ? p.c : q->ne[0] * q->ne[1];
+        // A q longer than the rotation tables is a batch of independent sequences of
+        // the tables' length (the image VAE's row of tiles, h3_vit_decode).
+        const ggml_tensor* cosT = node->src[5];
+        const std::int64_t tokens = q->ne[2];
+        const std::int64_t perSeq = cosT != nullptr && cosT->ne[1] > 0 && tokens % cosT->ne[1] == 0 ? cosT->ne[1] : tokens;
         ok = tsg_cudnn_h3_attention(f(q), q->nb[1] / fl, q->nb[2] / fl, f(k), k->nb[1] / fl, k->nb[2] / fl,
                                     f(v), v->nb[1] / fl, v->nb[2] / fl, bias, bias != nullptr ? bias + part : nullptr,
                                     bias != nullptr ? bias + 2 * part : nullptr, p.b, f(node->src[3]), f(node->src[4]),
-                                    f(node->src[5]), f(node->src[6]), p.a, p.f0, p.f1, p.f2,
-                                    static_cast<int>(q->ne[1]), static_cast<int>(q->ne[2]), static_cast<int>(q->ne[0]),
-                                    static_cast<float*>(node->data));
+                                    f(cosT), f(node->src[6]), p.a, p.f0, p.f1, p.f2,
+                                    static_cast<int>(q->ne[1]), static_cast<int>(tokens), static_cast<int>(q->ne[0]),
+                                    static_cast<int>(tokens / perSeq), static_cast<float*>(node->data));
 #endif
         return ok;   // synchronized inside
     }
@@ -491,6 +501,12 @@ bool h3_fused_run(ggml_tensor* node)
     {
         const ggml_tensor* w = node->src[0];
         const ggml_tensor* x = node->src[1];
+        // A BF16 weight is the DiT's fc2 reading fc1's [gate | value] (no x bias): the
+        // BF16 cuBLAS route or, with TS_H3_INT8_MATMUL, the int8 one, as h3_bf16_matmul_run.
+        if (w->type == GGML_TYPE_BF16)
+            return node->src[2] == nullptr &&
+                   tsg_cuda_bf16_gemm(w->data, w->ne[0], w->ne[1], f(x), h3_rows(x), p.f0 != 0.0f ? 1 : 0, x->ne[1],
+                                      static_cast<float*>(node->data), node->ne[0]);
         return tsg_cuda_f16_gemm(w->data, w->ne[0], w->ne[1], f(x), h3_rows(x), f(node->src[2]),
                                  p.f0 != 0.0f ? 1 : 0, x->ne[1], static_cast<float*>(node->data), node->ne[0]);
     }
@@ -1092,10 +1108,13 @@ static int h3_vit_decode(const TSGgmlMiniMaxH3VideoVaeDecodeDesc* d, int batch)
         const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
         const std::size_t f = sizeof(float);
         H3FlashMasks flashMasks;
-        bool vaeAttentionFusable = false;
+        bool vaeAttentionFusable = false, vaeAttentionBatched = false;
 #if defined(TSG_GGML_USE_CUDA) && defined(TSG_HAVE_CUDNN)
         vaeAttentionFusable = h3_fused_enabled() && h3_cudnn_attention_enabled() && (hd == 64 || hd == 128) &&
                               tsg_cudnn_sdpa_prepare(heads, seq, hd);
+        // The whole batch's attention in one node and one cuDNN call, where an engine
+        // takes the batched layout; otherwise one node per sequence and a concat.
+        vaeAttentionBatched = vaeAttentionFusable && batch > 1 && tsg_cudnn_sdpa_prepare_batched(heads, seq, hd, batch);
 #endif
 
         for (int l = 0; l < nl; l++)
@@ -1148,12 +1167,24 @@ static int h3_vit_decode(const TSGgmlMiniMaxH3VideoVaeDecodeDesc* d, int batch)
                 p.f1 = h3_flash_v_scale(seq);
                 p.f2 = scale;
                 ggml_tensor* merged = nullptr;
-                for (int b = 0; b < batch; b++)
+                if (vaeAttentionBatched)
                 {
-                    ggml_tensor* one = h3_fused_node(ctx, static_cast<std::int64_t>(hd) * heads, seq,
-                                                     { part(0, b), part(1, b), part(2, b), nullptr, nullptr, cosf, sinS, qkvb }, p);
-                    merged = merged == nullptr ? one : ggml_concat(ctx, merged, one, 1);
+                    // q, k and v of every sequence as one view each: the node reads the
+                    // batch from q's length over the rotation tables' (h3_fused_run).
+                    auto whole = [&](int i) {
+                        return ggml_view_3d(ctx, qkv, hd, heads, static_cast<std::int64_t>(seq) * batch, hs, qkv->nb[1],
+                                            static_cast<std::size_t>(i) * hd * f);
+                    };
+                    merged = h3_fused_node(ctx, static_cast<std::int64_t>(hd) * heads, static_cast<std::int64_t>(seq) * batch,
+                                           { whole(0), whole(1), whole(2), nullptr, nullptr, cosf, sinS, qkvb }, p);
                 }
+                else
+                    for (int b = 0; b < batch; b++)
+                    {
+                        ggml_tensor* one = h3_fused_node(ctx, static_cast<std::int64_t>(hd) * heads, seq,
+                                                         { part(0, b), part(1, b), part(2, b), nullptr, nullptr, cosf, sinS, qkvb }, p);
+                        merged = merged == nullptr ? one : ggml_concat(ctx, merged, one, 1);
+                    }
                 h = scaledResidual(h, f16Gemm(ow, merged, nullptr, false), ob, s1);
 
                 ggml_tensor* n2 = ggml_mul(ctx, ggml_rms_norm(ctx, h, eps), n2w);
@@ -2336,6 +2367,25 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
                 x = fusedResidual(x, projectionTerms(ow, merged, ob, bl != nullptr ? &bl->out : nullptr), 2);
 
                 h = fusedModulate(x, n2w, 3, 4);
+#if defined(TSG_GGML_USE_CUDA)
+                // A BF16 fc2 on the cuBLAS/int8 route reads fc1's [gate | value] and applies
+                // the SwiGLU as it narrows its input (H3_FUSED_F16_GEMM with a BF16 weight),
+                // so the GLU node and its [ffn, seq] F32 result leave the graph.
+                const bool mlpLora = bl != nullptr && (h3_lora_has(bl->fc1) || h3_lora_has(bl->fc2));
+                if (!mlpLora && w1->type == GGML_TYPE_BF16 && w2->type == GGML_TYPE_BF16 && w1->ne[1] == 2 * w2->ne[0] &&
+                    h3_cublas_matmul_enabled() && !h3_f32_products_enabled() && h->ne[1] >= h3_cublas_min_rows())
+                {
+                    ggml_tensor* gv = lin(w1, h, b1);                        // [2*ffn, seq]
+                    H3FusedParams p{};
+                    p.kind = H3_FUSED_F16_GEMM;
+                    p.f0 = 1.0f;
+                    ResidualTerms t{};
+                    t.mm = h3_fused_node(ctx, w2->ne[1], gv->ne[1], { w2, gv, nullptr }, p);
+                    t.bias = b2;
+                    x = fusedResidual(x, t, 5);
+                    continue;
+                }
+#endif
                 ggml_tensor* act = mlpAct(h, w1, b1, bl);
                 x = fusedResidual(x, projectionTerms(w2, act, b2, bl != nullptr ? &bl->fc2 : nullptr), 5);
                 continue;

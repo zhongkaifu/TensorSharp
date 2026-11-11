@@ -129,16 +129,12 @@ namespace TensorSharp.Models.Media.Desktop
             if (rgb8.Length != (long)width * height * channels)
                 throw new ArgumentException($"pixel buffer {rgb8.Length} != {width}x{height}x{channels}", nameof(rgb8));
 
-            var settings = new PixelReadSettings((uint)width, (uint)height,
-                StorageType.Char, channels == 4 ? PixelMapping.RGBA : PixelMapping.RGB);
-            using var image = new MagickImage(rgb8, settings);
-            image.Format = MagickFormat.Png;
-            // PNG quality is zlib level x 10 + row filter: 15 is level 1 with adaptive
-            // filters. ImageMagick's default, 75 (level 7), spent 8.3 s on a 16 MP
-            // MiniMax-H3-Image picture for 19.3 MB; level 1 takes 0.9 s for 22.0 MB (level 4,
-            // 45, 2.0 s for 19.6 MB), so a large picture no longer waits on its own encode.
-            image.Quality = 15;
-            return image.ToByteArray();
+            // The managed codec's banded, parallel encoder (as the Apple provider uses):
+            // a 16 MP MiniMax-H3-Image picture, 48 MiB of RGB, takes about 0.1 s for
+            // 19 MiB, where ImageMagick took 8.3 s at its default zlib level 7 (19.3 MB)
+            // and 0.9 s at level 1 with adaptive filters (22.0 MB), plus the import of the
+            // pixels into its own image.
+            return PngCodec.Encode(rgb8, width, height, channels);
         }
 
         public byte[] ResizeRgb8(byte[] rgb8, int srcW, int srcH, int dstW, int dstH, ResizeFilter filter)

@@ -442,9 +442,14 @@ namespace TensorSharp.Models.MiniMaxH3
             var rgb = new float[(long)height * width * 3];
             float[] mean = MiniMaxH3VideoVae.PixelMean, std = MiniMaxH3VideoVae.PixelStd;
             long plane = (long)height * width;
-            for (long p = 0; p < plane; p++)
-                for (int c = 0; c < 3; c++)
-                    rgb[p * 3 + c] = Math.Clamp(canvas[c * plane + p] * std[c] + mean[c], 0f, 1f);
+            // By rows across the cores (50 M values at 16 MP).
+            System.Threading.Tasks.Parallel.For(0, height, y =>
+            {
+                long row = (long)y * width;
+                for (long p = row; p < row + width; p++)
+                    for (int c = 0; c < 3; c++)
+                        rgb[p * 3 + c] = Math.Clamp(canvas[c * plane + p] * std[c] + mean[c], 0f, 1f);
+            });
             return new QwenImage.RgbImage(width, height, rgb);
         }
 

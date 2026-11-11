@@ -52,7 +52,7 @@ cannot install this one. The nodes appear under **TensorSharp** in the node libr
 |---|---|
 | **TensorSharp Server** | Names the server (`url`) and a launch `profile`. With a profile, it starts a server for that profile on the URL's port, or reuses one already hosting its model. A server it started for another profile is stopped first. Without a profile, it connects to a server that is already running |
 | **TensorSharp Video** | Makes one clip from text, a first frame (`first_frame`), a last frame (`last_frame`) or reference pictures (`reference_images`, one per picture of the batch). It outputs the `video` (an MP4 with sound, saved under `output/tensorsharp/`), its `last_frame` for chaining the next clip, the `audio` and the file `path` |
-| **TensorSharp Image** | Generates a picture, or edits the connected pictures (`images`, each picture of the batch one reference). It shows the server's denoising previews on the node |
+| **TensorSharp Image** | Generates a picture, or edits the connected pictures (`images`, each picture of the batch one reference). It shows the server's denoising previews on the node, and the finished picture reduced to at most 1024 pixels on its long side (the `image` output stays full size) |
 | **TensorSharp Stop Server** | Stops the server this ComfyUI started once the value it receives (a clip, a picture, anything) exists, and passes that value on, so later nodes get the GPU memory back. The next TensorSharp node starts it again |
 
 A setting left at zero is decided by the hosted model, its preset or its LoRA plug-in.
