@@ -118,6 +118,20 @@ namespace TensorSharp.Graph
         /// weighted sum of their SwiGLU feed-forwards. Inputs: x [n, rows], the router logits [E, rows], then the
         /// stacked experts gate, up and down. Ip: K, renormalize. Result: [n, rows].</summary>
         RoutedExperts = 4,
+        /// <summary>A gated delta-net layer's mixer over one sequence's prompt chunk, from its input projections to the
+        /// gated output: the inputs' prep (holding a <see cref="DeltaNetPrep"/> region), the recurrence, the conv window
+        /// and recurrent state updates (effects inside the region) and the gated norm (a <see cref="GatedRmsNorm"/>
+        /// region). Inputs: qkv [channels, rows], z [dv * vHeads, rows], alpha and beta [vHeads, rows], the conv kernel
+        /// [width, channels], dt and a [vHeads], the norm weight [dv], the conv window [width - 1, channels] and the
+        /// recurrent state [dk, dv, vHeads, 1] (both written in place). Ip: dk, kHeads, dv, vHeads, the output gate
+        /// (0 silu, 1 sigmoid), the conv width. Fp: eps. Result: the gated output [dv, vHeads, rows].</summary>
+        DeltaNetPrompt = 5,
+        /// <summary>A hyper-connection read: each of the hc residual streams RMS-normed and the row scaled by the gammas
+        /// (xn), the low-rank gate sigmoid(up · silu(down · xn / hc)), the streams' gated mean and the injection
+        /// weights inject · xn. Inputs: the streams [hc * n, rows], the gammas [hc * n], then the down [hc * n, lr],
+        /// inject [hc * n, hc] and up [lr, hc * n] weights (no per-tensor scale). Ip: n, hc, lr. Fp: eps. Results: the
+        /// mix [n, rows] and the injection weights [hc, rows].</summary>
+        HcRead = 6,
     }
 
     /// <summary>One recorded entry of a program. Leaves and ops are nodes (numbered in order);

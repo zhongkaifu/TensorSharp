@@ -410,6 +410,7 @@ namespace TensorSharp.Graph
             }
 
             private GraphNode _region;   // the open fused region this executor has a kernel for (Kind Fused), else default
+            private int _nested;         // regions opened inside it (part of it: their ends do not close it)
             private bool InRegion => _region.Kind == GraphNodeKind.Fused;
 
             public void Entry(int node, in GraphNode e)
@@ -462,10 +463,12 @@ namespace TensorSharp.Graph
                         else _boundaryPending[e.Node] = 0;
                         break;
                     case GraphNodeKind.Fused:
-                        if (!InRegion && _x.Fuses((GraphFusion)e.Node)) _region = e;
+                        if (InRegion) _nested++;
+                        else if (_x.Fuses((GraphFusion)e.Node)) _region = e;
                         break;
                     case GraphNodeKind.FusedEnd:
-                        if (InRegion)
+                        if (InRegion && _nested > 0) _nested--;
+                        else if (InRegion)
                         {
                             GraphNode region = _region, end = e;
                             _region = default;

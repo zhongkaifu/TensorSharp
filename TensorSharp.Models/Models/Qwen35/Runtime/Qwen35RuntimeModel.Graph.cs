@@ -199,9 +199,35 @@ namespace TensorSharp.Models
                     alphaRaw = step.Cont(step.View2(proj, vHeads, count, nb1, row0 + (channels + v + vHeads) * f));
                 }
 
+                int window = step.State(state.Conv, GraphFormat.F32, convRows, channels);
+                // A verify window leaves the live window alone: the commit sets it from the conv history.
+                bool keep = step.RecurrentSnapshots && count > 1;
+
+                // Every graph binds the state through one key per backend: on Metal the slot's backing
+                // buffer [one row's outputs | state], so a decode row's recurrence can write its result
+                // onto it and update the state in place; elsewhere the state itself, copied back.
+                long stateFloats = (long)dk * dv * vHeads;
+                bool viaBacking = InPlaceRecurrentState;
+                int backing = -1, s4;
+                if (viaBacking)
+                {
+                    backing = step.State(state.Backing, GraphFormat.F32, state.RowFloats + stateFloats);
+                    s4 = step.View4(backing, dk, dv, vHeads, 1, dk * f, dk * dv * f, stateFloats * f, state.RowFloats * f);
+                }
+                else
+                {
+                    s4 = step.Reshape(step.State(state.Ssm, GraphFormat.F32, dk, dv, vHeads), dk, dv, vHeads, 1);
+                }
+
+                // A prompt chunk's whole mixer, from its projections to the gated output, is one region a backend
+                // may run as one kernel (GraphFusion.DeltaNetPrompt: Metal's prompt-width delta-net kernels).
+                bool mixer = !keep && count > 1;
+                if (mixer)
+                    step.BeginFused(GraphFusion.DeltaNetPrompt, stackalloc[] { qkv, z, alphaRaw, betaRaw, convW, dt, a, ssmNorm, window, s4 },
+                        stackalloc long[] { dk, kHeads, dv, vHeads, MixerSigmoidGate ? 1 : 0, _convKernel }, stackalloc[] { eps });
+
                 // The delta rule's inputs, one region a backend may run as one kernel (GraphFusion.DeltaNetPrep):
                 // the gates, the causal conv over [previous window | this chunk] and the L2-normed Q and K.
-                int window = step.State(state.Conv, GraphFormat.F32, convRows, channels);
                 step.BeginFused(GraphFusion.DeltaNetPrep, stackalloc[] { window, qkv, convW, alphaRaw, betaRaw, dt, a },
                     stackalloc long[] { dk, kHeads, dv, vHeads }, stackalloc[] { eps });
                 int beta = step.Reshape(step.Op(GraphOp.Sigmoid, betaRaw), 1, vHeads, count, 1);
@@ -227,27 +253,10 @@ namespace TensorSharp.Models
                 step.EndFused(stackalloc[] { convIn, q4, k4, v4, g, beta });
 
                 // convIn is a fresh contiguous [convRows + count, channels]: its last rows are the new window.
-                // A verify window leaves the live window alone: the commit sets it from the conv history.
-                bool keep = step.RecurrentSnapshots && count > 1;
                 if (!keep)
                     step.Effect(step.Op(GraphOp.Cpy,
                         step.View2(convIn, convRows, channels, (convRows + count) * f, count * f), window));
 
-                // Every graph binds the state through one key per backend: on Metal the slot's backing
-                // buffer [one row's outputs | state], so a decode row's recurrence can write its result
-                // onto it and update the state in place; elsewhere the state itself, copied back.
-                long stateFloats = (long)dk * dv * vHeads;
-                bool viaBacking = InPlaceRecurrentState;
-                int backing = -1, s4;
-                if (viaBacking)
-                {
-                    backing = step.State(state.Backing, GraphFormat.F32, state.RowFloats + stateFloats);
-                    s4 = step.View4(backing, dk, dv, vHeads, 1, dk * f, dk * dv * f, stateFloats * f, state.RowFloats * f);
-                }
-                else
-                {
-                    s4 = step.Reshape(step.State(state.Ssm, GraphFormat.F32, dk, dv, vHeads), dk, dv, vHeads, 1);
-                }
                 // A verify window keeps the state after each of its rows: the recurrence writes its whole
                 // result into the request's verify buffer in place, the live state stays the one before the
                 // window, and the commit copies the accepted prefix's state into place.
@@ -285,6 +294,7 @@ namespace TensorSharp.Models
                 step.BeginFused(GraphFusion.GatedRmsNorm, stackalloc[] { y, zh, ssmNorm }, stackalloc long[] { sigmoid ? 1 : 0 }, stackalloc[] { eps });
                 int gated = step.Op(GraphOp.Mul, step.RmsNorm(y, ssmNorm, eps), step.Op(sigmoid ? GraphOp.Sigmoid : GraphOp.Silu, zh));
                 step.EndFused(stackalloc[] { gated });
+                if (mixer) step.EndFused(stackalloc[] { gated });
                 int part = step.Reshape(gated, v, count);
                 output = output < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { output, part }, stackalloc long[] { 1 });
             }

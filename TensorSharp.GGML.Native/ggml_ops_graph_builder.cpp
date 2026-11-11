@@ -39,6 +39,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(TSG_GGML_USE_METAL)
+#include "tsm/tsm_moe.h"
+#endif
+
 using namespace tsg;
 
 namespace
@@ -252,6 +256,73 @@ namespace
     // contexts (tier copies). Sized from the program's node count alone, a 48-layer tiered prefill overflowed it.
     std::size_t graph_slots(int max_nodes) { return static_cast<std::size_t>(max_nodes) * 2 + 256; }
 
+    // Fused regions (GraphFusion, TSGgml_GraphFusedBegin) a backend kernel computes as one device operation between
+    // graph segments, in place of the region's ops: the operands it reads and writes live in an IO buffer outside the
+    // graph allocator (which frees a tensor after its last graph consumer and never frees one without consumers), one
+    // region per role that every such region of the graph reuses (the queue orders the kernels and the segments).
+    enum FusedKind
+    {
+        FUSED_DELTA_NET_PROMPT = 5,   // GraphFusion.DeltaNetPrompt
+        FUSED_HC_READ = 6,            // GraphFusion.HcRead
+    };
+
+    struct DeviceIo
+    {
+        ggml_backend_buffer_t buf = nullptr;
+        std::size_t size = 0;
+        ~DeviceIo() { if (buf != nullptr) ggml_backend_buffer_free(buf); }
+    };
+
+    // The newest IO buffer per backend, reused by every graph while it is big enough (a new Metal buffer costs ~75 ms
+    // a GB); a graph keeps the one it bound to, so growing never frees memory a built graph still points into. Like
+    // the reused compute allocator one-shot graphs share (alloc_graph_reuse_gallocr), it assumes a backend runs one
+    // graph at a time.
+    std::mutex g_device_io_mu;
+    std::map<ggml_backend_t, std::shared_ptr<DeviceIo>> g_device_io;
+
+    std::shared_ptr<DeviceIo> device_io(ggml_backend_t backend, std::size_t bytes)
+    {
+        std::lock_guard<std::mutex> lk(g_device_io_mu);
+        std::shared_ptr<DeviceIo>& io = g_device_io[backend];
+        if (io != nullptr && io->size >= bytes) return io;
+        io.reset();
+        auto fresh = std::make_shared<DeviceIo>();
+        fresh->size = bytes + bytes / 4;   // headroom: a prompt's chunks grow by a few rows at a time
+        fresh->buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(backend), fresh->size);
+        if (fresh->buf == nullptr) throw std::runtime_error("graph builder: the device operations' IO buffer could not be allocated");
+        io = fresh;
+        return io;
+    }
+
+    // A served region: its operands (the program's inputs to it, in the kind's order) and its results.
+    struct DeviceRegion
+    {
+        int kind = 0;
+        std::vector<ggml_tensor*> in;
+        std::vector<std::int64_t> ip;
+        std::vector<float> fp;
+        std::vector<ggml_tensor*> results;
+    };
+
+    // The IO buffer's roles: each operand a kind's operation keeps there, one region per role (every region of the
+    // kind reuses it; different kinds never share one).
+    enum IoRole { IO_GDN_QKV, IO_GDN_Z, IO_GDN_ALPHA, IO_GDN_BETA, IO_GDN_Y, IO_HC_MIXED, IO_HC_INJECT, IO_ROLES };
+
+    // A served region's operands in the IO buffer, by role.
+    std::vector<std::pair<IoRole, ggml_tensor*>> io_operands(const DeviceRegion& r)
+    {
+        switch (r.kind)
+        {
+        case FUSED_DELTA_NET_PROMPT:
+            return { { IO_GDN_QKV, r.in[0] }, { IO_GDN_Z, r.in[1] }, { IO_GDN_ALPHA, r.in[2] }, { IO_GDN_BETA, r.in[3] },
+                     { IO_GDN_Y, r.results[0] } };
+        case FUSED_HC_READ:
+            return { { IO_HC_MIXED, r.results[0] }, { IO_HC_INJECT, r.results[1] } };
+        default:
+            return {};
+        }
+    }
+
     struct TsgGraph
     {
         TpGroup* tp = nullptr;     // tensor parallelism: the meta device this graph runs on
@@ -280,6 +351,14 @@ namespace
         // Effects and pauses in program order (kind 0: effects[i], 1: host_moe[i]): the graph is expanded in this
         // order, so a pause's boundary tensors precede everything that reads its result.
         std::vector<std::pair<int, int>> order;
+        // Fused regions served by a device operation (TSGgml_GraphFusedBegin), the open regions (the served one's
+        // index, -1 for one whose ops are built), the served region being recorded (-1: none) and the nodes its ops
+        // would have produced (no tensor: nothing outside the region reads them).
+        std::vector<DeviceRegion> regions;
+        std::vector<int> open_regions;
+        int serving = -1;
+        std::vector<char> skipped;
+        std::shared_ptr<DeviceIo> io;
 
         ~TsgGraph()
         {
@@ -301,6 +380,9 @@ namespace
         if (index < 0) return nullptr;
         if (index >= static_cast<int>(g->nodes.size()))
             throw std::runtime_error("graph builder: source node index out of range");
+        if (g->skipped[static_cast<std::size_t>(index)])
+            throw std::runtime_error("graph builder: node " + std::to_string(index)
+                                     + " is inside a region a device operation computes; only the region's results are read after it");
         return g->nodes[static_cast<std::size_t>(index)];
     }
 
@@ -308,6 +390,15 @@ namespace
     {
         if (t == nullptr) throw std::runtime_error("graph builder: ggml returned no node");
         g->nodes.push_back(t);
+        g->skipped.push_back(0);
+        return static_cast<int>(g->nodes.size()) - 1;
+    }
+
+    // A node of a served region's ops: numbered like the program's, never built.
+    int push_skipped(TsgGraph* g)
+    {
+        g->nodes.push_back(nullptr);
+        g->skipped.push_back(1);
         return static_cast<int>(g->nodes.size()) - 1;
     }
 
@@ -577,11 +668,174 @@ namespace
         }
     }
 
+    // Prompt-width device operations from this many rows (the same switch as Qwen4ExpModel's spans; the kernels'
+    // own switches are TS_METAL_GDN_PROMPT and TS_METAL_HC_READ).
+    int device_ops_min_rows()
+    {
+        static const int v = [] {
+            const char* e = std::getenv("TS_METAL_PROMPT_OPS_MIN_ROWS");
+            const int n = e != nullptr ? std::atoi(e) : 0;
+            return n > 0 ? n : 64;
+        }();
+        return v;
+    }
+
+    // A computed F32 result the IO buffer can hold in place of the allocator (not a view, not yet placed).
+    bool io_bindable(const ggml_tensor* t)
+    {
+        return t != nullptr && t->op != GGML_OP_NONE && t->view_src == nullptr && t->data == nullptr && t->buffer == nullptr
+            && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+    }
+
+    // Whether this graph's backend runs region `kind` over these operands as one device operation; if so, records
+    // the region (its ops are then skipped until its end).
+    bool try_serve_region(TsgGraph* g, int kind, const int* s, int ns, const std::int64_t* ip, int nip, const float* fp, int nfp)
+    {
+#if defined(TSG_GGML_USE_METAL)
+        if (g->tp != nullptr || g_backend_type != BACKEND_TYPE_METAL) return false;
+        std::vector<ggml_tensor*> in(static_cast<std::size_t>(ns));
+        for (int i = 0; i < ns; i++) in[static_cast<std::size_t>(i)] = node_at(g, s[i]);
+        if (kind == FUSED_DELTA_NET_PROMPT)
+        {
+            // qkv, z, alpha, beta, conv kernel, dt, a, norm weight, conv window, recurrent state; ip dk, kHeads, dv,
+            // vHeads, gate (1 sigmoid), conv width; fp eps.
+            if (ns != 10 || nip < 6 || nfp < 1) return false;
+            const std::int64_t dk = ip[0], kh = ip[1], dv = ip[2], vh = ip[3], width = ip[5];
+            const std::int64_t T = in[0]->ne[1], channels = in[0]->ne[0];
+            if (ip[4] != 1 || T < device_ops_min_rows()) return false;   // the kernels gate with sigmoid(z) only
+            if (!tsm::gdn_prompt_supported(graph_backend(g), static_cast<int>(dk), static_cast<int>(dv), static_cast<int>(kh),
+                                           static_cast<int>(vh), static_cast<int>(width)))
+                return false;
+            for (int i = 0; i < 4; i++) if (!io_bindable(in[i]) || in[i]->ne[1] != T) return false;
+            if (channels != 2 * kh * dk + vh * dv || in[1]->ne[0] != vh * dv || in[2]->ne[0] != vh || in[3]->ne[0] != vh)
+                return false;
+            for (int i = 4; i < 10; i++) if (in[i]->type != GGML_TYPE_F32 || !ggml_is_contiguous(in[i])) return false;
+            if (in[4]->ne[0] != width || in[4]->ne[1] != channels || in[8]->ne[0] != width - 1 || in[8]->ne[1] != channels
+                || ggml_nelements(in[9]) != dk * dv * vh || in[7]->ne[0] != dv)
+                return false;
+        }
+        else if (kind == FUSED_HC_READ)
+        {
+            // the residual streams [hc * n, T], the norm's gammas [hc * n], the down, inject and up weights; ip n, hc,
+            // low rank; fp eps.
+            if (ns != 5 || nip < 3 || nfp < 1) return false;
+            const std::int64_t n = ip[0], hc = ip[1], lr = ip[2];
+            const std::int64_t T = in[0]->ne[1];
+            if (T < device_ops_min_rows() || in[0]->type != GGML_TYPE_F32 || !ggml_is_contiguous(in[0]) || in[0]->ne[0] != n * hc
+                || in[1]->type != GGML_TYPE_F32 || ggml_nelements(in[1]) != n * hc)
+                return false;
+            if (in[2]->ne[0] != n * hc || in[2]->ne[1] != lr || in[3]->ne[0] != n * hc || in[3]->ne[1] != hc
+                || in[4]->ne[0] != lr || in[4]->ne[1] != n * hc)
+                return false;
+            if (!tsm::hc_read_supported(graph_backend(g), in[2]->type, in[3]->type, in[4]->type, static_cast<int>(n),
+                                        static_cast<int>(hc), static_cast<int>(lr)))
+                return false;
+        }
+        else
+        {
+            return false;
+        }
+        DeviceRegion r;
+        r.kind = kind;
+        r.in = std::move(in);
+        r.ip.assign(ip, ip + nip);
+        r.fp.assign(fp, fp + nfp);
+        g->regions.push_back(std::move(r));
+        return true;
+#else
+        (void) g; (void) kind; (void) s; (void) ns; (void) ip; (void) nip; (void) fp; (void) nfp;
+        return false;
+#endif
+    }
+
+    // The served region's end: its results are the device operation's outputs, which the next segment reads.
+    void finish_region(TsgGraph* g, const int* results, int nresults)
+    {
+#if defined(TSG_GGML_USE_METAL)
+        DeviceRegion& r = g->regions[static_cast<std::size_t>(g->serving)];
+        const std::int64_t T = r.in[0]->ne[1];
+        tsg::HostMoeSegment seg;
+        seg.layer = static_cast<int>(g->regions.size()) - 1;
+        seg.seq_len = static_cast<int>(T);
+        if (r.kind == FUSED_DELTA_NET_PROMPT)
+        {
+            if (nresults != 1) throw std::runtime_error("graph builder: a delta-net prompt region has one result, the gated output");
+            const std::int64_t dv = r.ip[2], vh = r.ip[3];
+            r.results = { ggml_new_tensor_3d(g->ctx, GGML_TYPE_F32, dv, vh, T) };   // bound into the IO buffer at build
+            tsm::GdnPromptIO io;
+            io.qkv = r.in[0]; io.z = r.in[1]; io.alpha = r.in[2]; io.beta = r.in[3];
+            io.conv_w = r.in[4]; io.dt = r.in[5]; io.a = r.in[6]; io.norm_w = r.in[7];
+            io.conv_state = r.in[8]; io.ssm_state = r.in[9]; io.y = r.results[0];
+            io.T = static_cast<int>(T); io.h_k = static_cast<int>(r.ip[1]); io.h_v = static_cast<int>(vh);
+            io.channels = static_cast<int>(r.in[0]->ne[0]); io.eps = r.fp[0];
+            seg.device_name = "gdn prompt";
+            // Everything the kernels read or write: the projections end the segment before them; the state view and
+            // the leaves join the graph so the allocator places them (leaves place no cut).
+            seg.device_inputs = { r.in[0], r.in[1], r.in[2], r.in[3], r.in[9], r.in[8], r.in[4], r.in[5], r.in[6], r.in[7] };
+            seg.device_op = [io](ggml_backend_t backend) { return tsm::gdn_prompt_encode(backend, io); };
+        }
+        else
+        {
+            if (nresults != 2) throw std::runtime_error("graph builder: a hyper-connection read has two results, the mix and the inject");
+            const std::int64_t n = r.ip[0], hc = r.ip[1];
+            r.results = { ggml_new_tensor_2d(g->ctx, GGML_TYPE_F32, n, T), ggml_new_tensor_2d(g->ctx, GGML_TYPE_F32, hc, T) };
+            tsm::HcReadIO io;
+            io.res = r.in[0]; io.gamma = r.in[1]; io.w_down = r.in[2]; io.w_inject = r.in[3]; io.w_up = r.in[4];
+            io.mixed = r.results[0]; io.inject = r.results[1];
+            io.T = static_cast<int>(T); io.n_embd = static_cast<int>(n); io.hc = static_cast<int>(hc);
+            io.lr = static_cast<int>(r.ip[2]); io.eps = r.fp[0];
+            seg.device_name = "hc read";
+            // The residual is read only: its last graph reader (the block's scatter) comes after the cut, so the
+            // allocator keeps it.
+            seg.device_inputs = { r.in[0], r.in[1], r.in[2], r.in[3], r.in[4] };
+            seg.device_op = [io](ggml_backend_t backend) { return tsm::hc_read_encode(backend, io); };
+        }
+        for (int i = 0; i < nresults; i++)
+        {
+            if (results[i] < 0 || results[i] >= static_cast<int>(g->nodes.size()))
+                throw std::runtime_error("graph builder: a fused region's result is not a node");
+            g->nodes[static_cast<std::size_t>(results[i])] = r.results[static_cast<std::size_t>(i)];
+            g->skipped[static_cast<std::size_t>(results[i])] = 0;
+        }
+        seg.device_outputs = r.results;
+        g->host_moe.push_back(std::move(seg));
+        g->host_moe_holds.emplace_back(nullptr, nullptr);
+        g->order.emplace_back(1, static_cast<int>(g->host_moe.size()) - 1);
+#else
+        (void) g; (void) results; (void) nresults;
+#endif
+    }
+
+    // The served regions' operands into the IO buffer: one region per role, which every region of the kind reuses.
+    void bind_regions(TsgGraph* g)
+    {
+        if (g->regions.empty()) return;
+        auto aligned = [](std::size_t b) { return (b + 255) & ~static_cast<std::size_t>(255); };
+        std::size_t size[IO_ROLES] = {};
+        for (const DeviceRegion& r : g->regions)
+            for (const auto& [role, t] : io_operands(r))
+                size[role] = std::max(size[role], aligned(ggml_nbytes(t)));
+        std::size_t off[IO_ROLES] = {}, bytes = 0;
+        for (int role = 0; role < IO_ROLES; role++)
+        {
+            off[role] = bytes;
+            bytes += size[role];
+        }
+        g->io = device_io(graph_backend(g), bytes);
+        auto* base = static_cast<char*>(ggml_backend_buffer_get_base(g->io->buf));
+        for (const DeviceRegion& r : g->regions)
+            for (const auto& [role, t] : io_operands(r))
+                if (ggml_backend_tensor_alloc(g->io->buf, t, base + off[role]) != GGML_STATUS_SUCCESS)
+                    throw std::runtime_error("graph builder: binding a device operation's operand failed");
+    }
+
     // Bind the leaves, then let the graph's own allocator place every other tensor.
     bool build(TsgGraph* g)
     {
         g->graph = ggml_new_graph_custom(g->ctx, graph_slots(g->max_nodes), false);
         if (g->graph == nullptr) { set_last_error("graph builder: graph allocation failed."); return false; }
+        if (g->serving >= 0 || !g->open_regions.empty()) { set_last_error("graph builder: a fused region is still open."); return false; }
+        bind_regions(g);
         // Effects and host-expert pauses in program order: a pause's boundary tensors come before any node that
         // reads its result (moe_out has no producer, so nothing else orders them).
         for (const auto& [kind, index] : g->order)
@@ -592,6 +846,11 @@ namespace
                 continue;
             }
             const tsg::HostMoeSegment& hm = g->host_moe[static_cast<std::size_t>(index)];
+            if (hm.device_op)
+            {
+                for (ggml_tensor* t : hm.device_inputs) ggml_build_forward_expand(g->graph, t);
+                continue;
+            }
             const auto& [keep_logits, hold_ids] = g->host_moe_holds[static_cast<std::size_t>(index)];
             ggml_build_forward_expand(g->graph, hm.moe_in);
             // The route weights before the ids: their parents then come in llama.cpp's order (softmax, reshape,
@@ -851,6 +1110,7 @@ TSG_EXPORT int TSGgml_GraphOp(void* handle, int op, const int* srcs, int nsrc,
     try
     {
         if (g == nullptr || g->built) throw std::runtime_error("graph builder: no graph, or graph already built");
+        if (g->serving >= 0) return push_skipped(g);   // a device operation computes the region
         return push(g, build_op(g, op, srcs, nsrc, ip, nip, fp, nfp));
     }
     catch (const std::exception& ex)
@@ -910,6 +1170,7 @@ TSG_EXPORT int TSGgml_GraphEffect(void* handle, int node)
     try
     {
         if (g == nullptr || g->built) throw std::runtime_error("graph builder: no graph, or graph already built");
+        if (g->serving >= 0) return 1;   // the region's state writes are the device operation's
         g->effects.push_back(node_at(g, node));
         g->order.emplace_back(0, static_cast<int>(g->effects.size()) - 1);
         return 1;
@@ -1005,6 +1266,64 @@ TSG_EXPORT int TSGgml_GraphRun(void* handle, const int* inputs, void* const* inp
     }
 }
 
+// Drops the kept device-operation IO buffers (graphs still holding one keep it until they are freed): before the
+// backends are torn down (TSGgml_Shutdown), whose device asserts at exit that no buffer is left.
+extern "C" void TSGgml_GraphReleaseDeviceIo()
+{
+    std::lock_guard<std::mutex> lk(g_device_io_mu);
+    g_device_io.clear();
+}
+
+// A fused region of GraphFusion `kind` over `srcs` begins: 1 when a device operation computes it (its ops, effects and
+// aliases up to the matching TSGgml_GraphFusedEnd are then numbered but not built), 0 when its ops are built. A region
+// nested in a served one is part of it.
+TSG_EXPORT int TSGgml_GraphFusedBegin(void* handle, int kind, const int* srcs, int nsrc,
+                                      const std::int64_t* ip, int nip, const float* fp, int nfp)
+{
+    auto* g = static_cast<TsgGraph*>(handle);
+    try
+    {
+        if (g == nullptr || g->built) throw std::runtime_error("graph builder: no graph, or graph already built");
+        if (g->serving >= 0)
+        {
+            g->open_regions.push_back(-1);
+            return 0;
+        }
+        const bool served = try_serve_region(g, kind, srcs, nsrc, ip, nip, fp, nfp);
+        g->open_regions.push_back(served ? static_cast<int>(g->regions.size()) - 1 : -1);
+        if (served) g->serving = g->open_regions.back();
+        return served ? 1 : 0;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return -1;
+    }
+}
+
+// The innermost open region ends; `results` are its result nodes in the kind's order.
+TSG_EXPORT int TSGgml_GraphFusedEnd(void* handle, const int* results, int nresults)
+{
+    auto* g = static_cast<TsgGraph*>(handle);
+    try
+    {
+        if (g == nullptr || g->built || g->open_regions.empty()) throw std::runtime_error("graph builder: no open fused region");
+        const int region = g->open_regions.back();
+        g->open_regions.pop_back();
+        if (region >= 0 && region == g->serving)
+        {
+            finish_region(g, results, nresults);
+            g->serving = -1;
+        }
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+}
+
 // Whether a leaf was bound to device memory that outlives the run (its host bytes are then
 // stale after the run on a device with its own memory until synced).
 TSG_EXPORT int TSGgml_GraphLeafIsResident(void* handle, int node)
@@ -1026,6 +1345,7 @@ TSG_EXPORT int TSGgml_GraphAlias(void* handle, int node, int base, std::int64_t 
     try
     {
         if (g == nullptr || g->built) throw std::runtime_error("graph builder: no graph, or graph already built");
+        if (g->serving >= 0) return 1;
         g->aliases.push_back({ node_at(g, node), node_at(g, base), static_cast<std::size_t>(offset), node_at(g, fallback) });
         return 1;
     }

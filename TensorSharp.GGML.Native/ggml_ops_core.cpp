@@ -3403,6 +3403,7 @@ extern "C" void TSGgml_WanResetForwardCache();
 
 // Tensor-parallel graphs held across calls, defined in their own kernels.
 // TSGgml_Shutdown releases them while the backends are still alive.
+extern "C" void TSGgml_GraphReleaseDeviceIo();
 extern "C" void TSGgml_Gemma4ReleaseVerifyTpGraphs();
 extern "C" void TSGgml_Qwen35ReleaseAttentionTpGraphs();
 extern "C" void TSGgml_Qwen35GdnDropTpGraphs();
@@ -3598,6 +3599,8 @@ TSG_EXPORT void TSGgml_Shutdown()
     // they were allocated from is torn down. Both free every rank's slot.
     free_reuse_compute_buffer();
     free_reuse_gallocr();
+    // The graph builder's device-operation IO buffers (kept for the next prompt chunk).
+    TSGgml_GraphReleaseDeviceIo();
     // Tensor-parallel graphs parked between "build" and "execute", plus the
     // persistent per-rank decode graphs. They own backend buffers, and letting
     // static destructors free them after the CUDA driver has shut down aborts

@@ -821,7 +821,9 @@ namespace TensorSharp.Models
                 int fa;
                 // Tensor-parallel graphs write every chunk by index too: ggml's meta device splits
                 // set_rows by KV head, while a copy into a strided cache view fails on the ranks.
-                if (count <= SmallChunkRows || _graphTpRanks != null || GraphExecutor.Capabilities.IndexedCacheWrites)
+                GraphCapabilities caps = GraphExecutor.Capabilities;
+                if (count <= SmallChunkRows || _graphTpRanks != null || caps.IndexedCacheWrites
+                    || (caps.PaddedCacheAttention && kvType != GraphFormat.F32))
                 {
                     // Decode and short chunks (a verify window): rows are written by index and
                     // attention reads the padded cache window under a causal mask, so every row is

@@ -212,6 +212,8 @@
     <ReferenceNativeSymbol Include="TSGgml_GraphCreateTp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphEffect" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphFree" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphFusedBegin" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GraphFusedEnd" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphLeaf" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphLeafIsResident" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GraphLeafSplit" SymbolType="Function" />

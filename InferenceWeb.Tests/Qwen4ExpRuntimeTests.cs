@@ -9,6 +9,9 @@
 // hyper-connections, the sigmoid-gated recurrence, gated attention, the PLE layer (its n-gram and conv
 // histories across steps) and the shared-expert MoE.
 
+using TensorSharp.GGML;
+using Xunit.Abstractions;
+
 namespace InferenceWeb.Tests;
 
 public sealed class Qwen4ExpRuntimeTests : IDisposable
@@ -410,13 +413,13 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         return rows.ToArray();
     }
 
-    private static void AssertClose(float[][] expected, float[][] actual, double tolerance, string label)
+    internal static void AssertClose(float[][] expected, float[][] actual, double tolerance, string label)
     {
         double[] errors = RowErrors(expected, actual);
         Assert.True(errors.All(e => e < tolerance), $"{label} relL2 per row: {string.Join(", ", errors.Select(e => e.ToString("E2")))}");
     }
 
-    private static double[] RowErrors(float[][] expected, float[][] actual)
+    internal static double[] RowErrors(float[][] expected, float[][] actual)
     {
         Assert.Equal(expected.Length, actual.Length);
         var errors = new double[expected.Length];
@@ -432,5 +435,69 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
             errors[i] = Math.Sqrt(num / Math.Max(den, 1e-30));
         }
         return errors;
+    }
+}
+
+/// <summary>
+/// The runtime's prompt chunks on Metal's prompt-width kernels (TensorSharp's tsm kernels as device operations between
+/// graph segments, as Qwen4ExpModel runs them): a 66-row prompt is wide enough for them (64 rows,
+/// TS_METAL_PROMPT_OPS_MIN_ROWS) and within the dense QSA budget of a top-k of 64 (67 cells). In the collection of
+/// the other tests that count the kernels' passes.
+/// </summary>
+[Collection("MoeCpuOffloadConfig")]
+public sealed class Qwen4ExpRuntimePromptKernelTests : IDisposable
+{
+    private readonly string _dir = Directory.CreateTempSubdirectory("q4e-prompt-kernels").FullName;
+    private readonly ITestOutputHelper _output;
+
+    public Qwen4ExpRuntimePromptKernelTests(ITestOutputHelper output) => _output = output;
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
+    }
+
+    private static readonly int[] Prompt = Enumerable.Range(0, 66).Select(i => 3 + (i * 37) % 240).ToArray();
+    private static readonly int[] Decode = { 41, 9, 130, 77 };
+
+    private static float[][] Rows(ModelBase model, int firstChunk)
+    {
+        using (model)
+        {
+            model.ResetKVCache();
+            var rows = new List<float[]>();
+            if (firstChunk < Prompt.Length)
+            {
+                model.ForwardRefill(Prompt[..firstChunk]);
+                rows.Add((float[])model.Forward(Prompt[firstChunk..]).Clone());
+            }
+            else
+            {
+                rows.Add((float[])model.ForwardRefill(Prompt).Clone());
+            }
+            foreach (int token in Decode)
+                rows.Add((float[])model.Forward(new[] { token }).Clone());
+            return rows.ToArray();
+        }
+    }
+
+    /// <summary>The delta-net layers' mixer (GraphFusion.DeltaNetPrompt) on tsm_gdn_prompt and every half-layer's
+    /// hyper-connection read (GraphFusion.HcRead) on tsm_hc_read: the same rows as the ops on Metal (the prompt in
+    /// two 33-row chunks, below the kernels' width), and as the managed runtime.</summary>
+    [GgmlFact(BackendType.GgmlMetal)]
+    public void PromptKernelsAnswerAsTheirOps()
+    {
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e.gguf"), indexerTopK: 64, qsa: true);
+        float[][] ops = Rows(new Qwen4ExpRuntimeModel(path, BackendType.GgmlMetal), 33);
+        long gdnBefore = GgmlBasicOps.TsmGdnPromptCount(), readBefore = GgmlBasicOps.TsmHcReadCount();
+        float[][] kernel = Rows(new Qwen4ExpRuntimeModel(path, BackendType.GgmlMetal), Prompt.Length);
+        long layers = GgmlBasicOps.TsmGdnPromptCount() - gdnBefore, reads = GgmlBasicOps.TsmHcReadCount() - readBefore;
+        float[][] managed = Rows(new Qwen4ExpRuntimeModel(path, BackendType.Cpu), Prompt.Length);
+        _output.WriteLine($"gdn kernel layers {layers}, hc reads {reads}; kernel vs ops {string.Join(" ", Qwen4ExpRuntimeTests.RowErrors(ops, kernel).Select(e => e.ToString("E1")))}; "
+            + $"kernel vs managed {string.Join(" ", Qwen4ExpRuntimeTests.RowErrors(managed, kernel).Select(e => e.ToString("E1")))}");
+        Assert.Equal(6, layers);   // the fixture's six delta-net layers, once each
+        Assert.Equal(16, reads);   // its eight layers' two half-layers
+        Qwen4ExpRuntimeTests.AssertClose(ops, kernel, 1e-3, "metal kernel vs ops");   // 4.5e-5 measured (M5 Pro)
+        Qwen4ExpRuntimeTests.AssertClose(managed, kernel, 2e-2, "metal kernel vs managed");
     }
 }

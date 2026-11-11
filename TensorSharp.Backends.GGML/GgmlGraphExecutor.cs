@@ -49,6 +49,9 @@ namespace TensorSharp.GGML
                 // Metal's concurrency reorder (+8% decode on Qwen 3.5 A3B).
                 ConcurrencyReorder = metal,
                 DecodeWindowRows = metal ? 64 : 256,
+                // ggml-metal's tensor-API flash attention takes F16 K/V in windows of 64 only: a 1.8K prompt's
+                // attention took 110 ms over F32 fresh rows of exact length, 51 ms over the padded cache window (M5 Pro).
+                PaddedCacheAttention = metal,
                 TensorParallel = backend == GgmlBackendType.Cuda,
                 BindsHostPointers = true,
                 SeparateDeviceCopies = backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan,
@@ -84,6 +87,10 @@ namespace TensorSharp.GGML
                         case GraphNodeKind.Op: g.Op((GgmlGraphOp)(int)n.Op, n.Srcs, n.Ip, n.Fp); break;
                         case GraphNodeKind.Effect: g.Effect(n.Node); break;
                         case GraphNodeKind.Alias: g.Alias(n.Node, n.Srcs[0], n.Bytes, n.Srcs[1]); break;
+                        // A region the backend has a kernel for (Metal's prompt-width delta-net layers) runs as one
+                        // device operation between graph segments; any other builds its ops.
+                        case GraphNodeKind.Fused: g.FusedBegin(n.Node, n.Srcs, n.Ip, n.Fp); break;
+                        case GraphNodeKind.FusedEnd: g.FusedEnd(n.Srcs); break;
                         case GraphNodeKind.Output:
                             var values = new float[n.Bytes];
                             GCHandle pin = GCHandle.Alloc(values, GCHandleType.Pinned);

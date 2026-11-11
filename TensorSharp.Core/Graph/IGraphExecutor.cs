@@ -24,6 +24,11 @@ namespace TensorSharp.Graph
         public bool TensorParallel { get; init; }
         /// <summary>Prompt chunks write K/V by row index (no copy into a strided cache view).</summary>
         public bool IndexedCacheWrites { get; init; }
+        /// <summary>A prompt chunk over an F16 or block-quantized K/V cache is written by row index and attends the
+        /// cache's window padded to <see cref="DecodeWindowRows"/>, as decode does, instead of its own fresh F32 rows:
+        /// the device's fast attention needs reduced-precision K/V in whole windows. An F32 cache keeps the fresh rows
+        /// (exact, and no faster that way).</summary>
+        public bool PaddedCacheAttention { get; init; }
         /// <summary>K/V caches may be block-quantized (Q8_0, Q4_0): views and writes address their blocks.</summary>
         public bool QuantizedKvCache { get; init; }
         /// <summary>It runs <see cref="GraphOp.MoeHostExperts"/>: routed experts computed from host memory at a

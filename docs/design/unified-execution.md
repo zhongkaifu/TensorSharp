@@ -782,8 +782,9 @@ Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
 #### Fused regions, lazy copies, aliases
 
 * **Fused regions** (`GraphFusion`, `BeginFused` / `EndFused`): a family marks ops that compute named
-  results from named inputs (no effects, no state). The ops stay the reference: GGML ignores the marks
-  and builds the same graph. A tensor executor with a kernel for the kind defers the region's ops and
+  results from named inputs. The ops stay the reference: an executor without a kernel for the kind runs
+  them. A region may hold others (the inner ones are part of it when the outer is served) and, for a kind
+  that says so, the state writes its kernel does in place. A tensor executor with a kernel for the kind defers the region's ops and
   runs its kernel; a node inside is computed only if something else reads it, and a declined kernel runs
   the ops. Qwen 3.5's recurrence has two: `DeltaNetPrep` (the gates, the causal conv over
   [window | rows], silu, the L2-normed Q and K) and `GatedRmsNorm` (the output norm times silu(z)), each
@@ -805,6 +806,20 @@ Greedy text is identical between the two paths (Hy-MT2, Ministral, 96 tokens).
   projections IQ3_S / IQ2_S) on an M5 Pro, runtime / `Qwen35Model`: decode 35.4-36.9 / 28.7-33.2 tok/s
   (22.7 before), 55-token TTFT 339-367 / 413-452 ms, 1,825-token prompt 1.70 / 16.07 s (same text),
   perplexity 14.7301 / 14.7150.
+* **Device operations on GGML (Metal):** the native builder serves two kinds at prompt width (64 rows,
+  `TS_METAL_PROMPT_OPS_MIN_ROWS`) with TensorSharp's Metal kernels, encoded on ggml-metal's queue between
+  graph segments as `Qwen4ExpModel` runs them (`HostMoeSegment::device_op`): `DeltaNetPrompt`, a delta-net
+  layer's whole mixer from its input projections to the gated output, conv window and state written in
+  place (`tsm_gdn_prompt`; sigmoid output gate only), and `HcRead`, a hyper-connection read
+  (`tsm_hc_read`). The region's ops are numbered but not built; the operands the kernel reads and its
+  results live in an IO buffer outside the graph allocator (one region per role, reused by every layer,
+  kept for the next prompt chunk and released by `TSGgml_Shutdown`). Prompt chunks on Metal over an F16
+  or block-quantized cache also write K/V by index and attend its window padded to 64 rows
+  (`PaddedCacheAttention`): ggml-metal's tensor-API flash attention takes F16 K/V in windows of 64 only. An
+  F32 cache keeps the fresh F32 rows (exact, and no faster the other way). Flash Next UD-Q2_K_XL, 3,608-token
+  prompt, M5 Pro: 7.3-7.5 s before, 5.79-5.85 s after, `Qwen4ExpModel` 5.69-5.83 s (same text as before);
+  Qwen3.5-0.8B perplexity 19.8009 for both paths, Qwen3.6-35B-A3B Q4_K_M 1,825 tokens 1.03 s against
+  1.05 s.
 * **Copies run when forced:** a `Cpy` runs when an effect, an alias or a reader asks for it, as ggml
   schedules it. A streamed step used to run each copy as it was emitted, so an alias's fallback copy ran
   ahead of the alias the executor could have honoured.

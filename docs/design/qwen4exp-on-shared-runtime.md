@@ -205,6 +205,21 @@ ops, where `Qwen4ExpModel` encodes TensorSharp's Metal prompt kernels between gr
 `tsm_hc_read`, `tsm_hc_prompt`). At 1.8K tokens, where expert reads dominate, the two are even (4.6-5.1 s against
 5.1-5.2 s).
 
+The runtime now runs them too, as fused regions the GGML executor serves on Metal (unified-execution.md, "Device
+operations on GGML"): the delta-net mixer (`GraphFusion.DeltaNetPrompt`, `tsm_gdn_prompt`) and every half-layer's
+hyper-connection read (`GraphFusion.HcRead`, `tsm_hc_read`), and its prompt attention reads the F16 cache over a window
+padded to 64 rows, as `Qwen4ExpModel`'s does (ggml-metal's tensor-API flash attention). Same prompt, interleaved runs:
+
+| step | runtime prompt | `Qwen4ExpModel` |
+|---|---|---|
+| before | 7.28-7.47 s | 5.78-5.83 s |
+| + delta-net kernel | 6.66-6.73 s | 5.74-5.94 s |
+| + hyper-connection read | 6.07-6.40 s | 5.71-6.24 s |
+| + padded F16 attention | 5.79-5.85 s | 5.69-5.83 s |
+
+Decode at that length is 24.2 against 24.6 tok/s. Left: the scatter and the stream mix (`tsm_hc_prompt`), which
+`Qwen4ExpModel` runs in place in its span's residual region.
+
 ### 2.4 PLE
 
 The family computes the rows on the host before the step. These are the table gathers by n-gram hash, with the existing prefetch. It hands them to the step as an input of the layer that owns PLE:

@@ -240,9 +240,20 @@ namespace TensorSharp.Models
         protected override int EmitBlockInput(GraphStep step, int layer, int stream, BlockSite site, out int context)
         {
             string part = site == BlockSite.Mixer ? "attn" : "ffn";
-            return HcMix(step, stream, step.Rows, LayerName(layer, $"hc_{part}_norm.weight"), LayerName(layer, $"hc_{part}_down.weight"),
-                LayerName(layer, $"hc_{part}_up.weight"), LayerName(layer, $"hc_{part}_inject.weight"), out context);
+            string norm = LayerName(layer, $"hc_{part}_norm.weight"), down = LayerName(layer, $"hc_{part}_down.weight"),
+                up = LayerName(layer, $"hc_{part}_up.weight"), inject = LayerName(layer, $"hc_{part}_inject.weight");
+            // A prompt chunk's read is one region a backend may run as one kernel (GraphFusion.HcRead: Metal's
+            // prompt-width hyper-connection read), where the weights carry no per-tensor scale.
+            bool region = step.Rows > 1 && Unscaled(down) && Unscaled(up) && Unscaled(inject);
+            if (region)
+                step.BeginFused(GraphFusion.HcRead, stackalloc[] { stream, step.Weight(norm), step.Weight(down), step.Weight(inject), step.Weight(up) },
+                    stackalloc long[] { Ple.Hidden, Ple.Hc, Ple.HcLowRank }, stackalloc[] { Config.Eps });
+            int mixed = HcMix(step, stream, step.Rows, norm, down, up, inject, out context);
+            if (region) step.EndFused(stackalloc[] { mixed, context });
+            return mixed;
         }
+
+        private bool Unscaled(string weight) => !_quantWeights.TryGetValue(weight, out QuantizedWeight q) || q.Scale == 1.0f;
 
         /// <summary>stream_c += output * 2 * sigmoid(inject_c / hc).</summary>
         protected override int EmitBlockOutput(GraphStep step, int layer, int stream, BlockSite site, int context, int output)

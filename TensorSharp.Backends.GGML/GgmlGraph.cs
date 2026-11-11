@@ -110,6 +110,28 @@ namespace TensorSharp.GGML
                 return Check(GgmlNative.TSGgml_GraphOp(Handle, (int)op, ps, srcs.Length, pi, ip.Length, pf, fp.Length), op.ToString());
         }
 
+        /// <summary>A fused region of <paramref name="kind"/> (GraphFusion) begins: true when a device operation computes
+        /// it (its ops up to <see cref="FusedEnd"/> are numbered but not built).</summary>
+        public unsafe bool FusedBegin(int kind, ReadOnlySpan<int> srcs, ReadOnlySpan<long> ip, ReadOnlySpan<float> fp)
+        {
+            fixed (int* ps = srcs)
+            fixed (long* pi = ip)
+            fixed (float* pf = fp)
+            {
+                int served = GgmlNative.TSGgml_GraphFusedBegin(Handle, kind, ps, srcs.Length, pi, ip.Length, pf, fp.Length);
+                if (served < 0) throw new InvalidOperationException("ggml graph fused region failed: " + GgmlBasicOps.LastNativeError());
+                return served == 1;
+            }
+        }
+
+        /// <summary>The innermost open region ends with <paramref name="results"/>.</summary>
+        public unsafe void FusedEnd(ReadOnlySpan<int> results)
+        {
+            fixed (int* pr = results)
+                if (GgmlNative.TSGgml_GraphFusedEnd(Handle, pr, results.Length) == 0)
+                    throw new InvalidOperationException("ggml graph fused region end failed: " + GgmlBasicOps.LastNativeError());
+        }
+
         /// <summary>ne0..ne3, nb0..nb3 and the ggml type of a node.</summary>
         public unsafe (long[] Ne, long[] Nb, int Type) Shape(int node)
         {
@@ -228,5 +250,13 @@ namespace TensorSharp.GGML
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         internal static partial int TSGgml_GraphAlias(IntPtr graph, int node, int baseLeaf, long offset, int fallback);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static unsafe partial int TSGgml_GraphFusedBegin(IntPtr graph, int kind, int* srcs, int nsrc, long* ip, int nip, float* fp, int nfp);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        internal static unsafe partial int TSGgml_GraphFusedEnd(IntPtr graph, int* results, int nresults);
     }
 }
