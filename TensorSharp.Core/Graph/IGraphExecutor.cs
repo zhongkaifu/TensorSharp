@@ -36,6 +36,10 @@ namespace TensorSharp.Graph
         /// address); otherwise by the leaf's object (<see cref="GraphNode.Handle"/>), and a leaf's
         /// <see cref="GraphNode.Data"/> is only an identity.</summary>
         public bool BindsHostPointers { get; init; }
+        /// <summary>A leaf bound by its host bytes is computed on through a separate device copy, moved to and from
+        /// the host by syncs; false where the device reads the host bytes themselves (Metal's shared buffers, the
+        /// CPU), so a host copy of them moves nothing across.</summary>
+        public bool SeparateDeviceCopies { get; init; }
     }
 
     /// <summary>A stable identity for a storage object, for program signatures of executors that bind

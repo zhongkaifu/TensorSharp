@@ -257,6 +257,29 @@ public class ExecutionPlannerTests
         Assert.Equal(ExecutionPathKind.BatchedPaged, plan.Selected);
     }
 
+    // ----- unified batching -----
+
+    /// <summary>A model serving every request from its own slot runs every step on the unified path: solo or
+    /// concurrent, speculating (its windows verify inside the step) or not, with media pending, whatever the
+    /// per-sequence switches say.</summary>
+    [Theory]
+    [InlineData(1, false, false)]
+    [InlineData(3, false, false)]
+    [InlineData(1, true, false)]
+    [InlineData(4, true, false)]
+    [InlineData(2, false, true)]
+    public void SlotModel_EveryStepIsUnified(int sequences, bool speculate, bool mediaPending)
+    {
+        var caps = SpecLinearCaps() with { SupportsUnifiedBatching = true, SupportsPerSequenceFusedForward = true };
+        var features = Seqs(sequences) with { MultimodalPendingCount = mediaPending ? 1 : 0 };
+        var options = ExecutionOptions.Default with { BatchedPathDisabled = true, PerSeqFusedEnabled = false };
+
+        var plan = ExecutionPlanner.PlanStep(caps, options, speculate ? SpecConfig : PlainConfig, features);
+
+        Assert.Equal(ExecutionPathKind.Unified, plan.Selected);
+        Assert.Single(plan.Candidates);
+    }
+
     // ----- speculative decoding (NextN/MTP) -----
 
     private static ExecutionCapabilities SpecLinearCaps() => BatchedCaps() with

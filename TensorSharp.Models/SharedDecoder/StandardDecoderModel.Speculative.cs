@@ -6,6 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
 
+using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Runtime.Speculative;
 
 namespace TensorSharp.Models
@@ -324,6 +325,12 @@ namespace TensorSharp.Models
         public override void WarmUpKernels()
         {
             base.WarmUpKernels();
+            WarmVerifyWidths();
+            WarmPooledSlot();
+        }
+
+        private void WarmVerifyWidths()
+        {
             if (!HasDFlash || GraphUnsupportedReason() != null) return;
             int widest = Math.Min(SmallChunkRows, Math.Max(2, Math.Max(SpecPreferredDraftWindow, 1) + 1));
             int safeToken = Config.VocabSize > 1 ? 1 : 0;
@@ -341,6 +348,31 @@ namespace TensorSharp.Models
             }
             ResetKVCache();
             Console.WriteLine($"    Verify warmup (2-{widest} rows): {started.Elapsed.TotalMilliseconds:F1} ms");
+        }
+
+        /// <summary>
+        /// One decode row on a request slot that then waits in the pool: the first request takes it, so neither the
+        /// slot's allocation nor the graph of its first decode window lands on that request's first token (Qwen3.6
+        /// 35B-A3B on an M5 Pro: 3 ms to allocate the slot, 7 ms to build the one-row graph of a 55-token prompt's
+        /// last token). Last, after every warm-up that resets the cache (a reset clears the graph cache).
+        /// </summary>
+        private void WarmPooledSlot()
+        {
+            if (!SupportsUnifiedBatching || GraphUnsupportedReason() != null || _mesh.Stages > 1
+                || ExecutionOptions.FromEnvironment().KvHolderPoolMax <= 0)
+                return;
+            const string key = "\u0001warm-slot";
+            int safeToken = Config.VocabSize > 1 ? 1 : 0;
+            EnsureSequenceSlot(key, FreshSlotTokens);
+            var logits = new float[1][];
+            try
+            {
+                TryForwardUnified(new[] { key }, new[] { new[] { safeToken } }, new[] { 0 }, logits);
+            }
+            finally
+            {
+                OnSequenceReleased(key);
+            }
         }
 
         // ---------------------------------------------------------------- the draft head

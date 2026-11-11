@@ -42,11 +42,11 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         var options = ExecutionOptions.FromEnvironment();
         // A materialized holder is only readable through the fused per-request route, a paged end state only
         // through the batched route. Without that route (--no-continuous-batching, TS_PER_SEQ_FUSED=0, or a model
-        // that lacks it) no placeholder blocks may be adopted for it.
+        // that lacks it) no placeholder blocks may be adopted for it. A unified model reads every request's slot.
         bool endStateRoute = capabilities.PagedEndStates
             ? !options.BatchedPathDisabled && model is IBatchedPagedModel { BatchedForwardAvailable: true }
-            : !options.BatchedPathDisabled && options.PerSeqFusedEnabled
-              && model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true };
+            : ServesFromSlots(model) || (!options.BatchedPathDisabled && options.PerSeqFusedEnabled
+              && model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true });
         if (!endStateRoute)
             capabilities = capabilities with
             {
@@ -157,9 +157,15 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             Math.Max(0, limit), GetSpans(sequence), route, PrimaryAvailable);
     }
 
+    /// <summary>Every step of the model runs on per-request slots (<see cref="ExecutionPathKind.Unified"/>), whatever
+    /// the per-sequence switches say.</summary>
+    private static bool ServesFromSlots(object model) => model is IUnifiedBatchModel { SupportsUnifiedBatching: true };
+
     private ExpectedRoute PredictRoute()
     {
         var options = ExecutionOptions.FromEnvironment();
+        if (ServesFromSlots(_model))
+            return ExpectedRoute.PerSequenceFused;
         if (!options.BatchedPathDisabled && options.PerSeqFusedEnabled
             && _model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true })
             return ExpectedRoute.PerSequenceFused;

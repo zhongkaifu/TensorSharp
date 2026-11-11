@@ -10,6 +10,9 @@ using System.IO;
 using System.Linq;
 using System.Text;
 
+using TensorSharp.GGML;
+using TensorSharp.Graph;
+
 namespace TensorSharp.Models
 {
     /// <summary>
@@ -70,33 +73,142 @@ namespace TensorSharp.Models
             return true;
         }
 
-        /// <summary>The retained slot's bytes are current on the host (copies read them there).</summary>
+        /// <summary>The retained slot can be copied (<see cref="CopySlot"/> reads its bytes wherever they are current).</summary>
         public bool SettleForCopy(string payloadKey)
-        {
-            if (_retainedSlots == null || payloadKey == null || !_retainedSlots.TryGetValue(payloadKey, out Slot slot)) return false;
-            SyncToHost(slot);
-            return true;
-        }
+            => _retainedSlots != null && payloadKey != null && _retainedSlots.ContainsKey(payloadKey);
+
+        /// <summary>Slot copies made on the device (<see cref="TryCopySlotOnDevice"/>); tests check the path was taken.</summary>
+        internal int DeviceSlotCopies { get; private set; }
+
+        /// <summary>Copy on the device where the host copy is the cheaper one too (tests run the copy program on any
+        /// GGML backend).</summary>
+        internal bool ForceDeviceSlotCopies { get; set; }
+
+        /// <summary>The executor keeps separate device copies, so a slot copy a graph left there stays there.</summary>
+        internal bool SlotCopiesStayOnDevice => ForceDeviceSlotCopies
+            || GraphExecutor is { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } };
 
         /// <summary>A deep copy of <paramref name="source"/> sized for <paramref name="capacityTokens"/>.</summary>
         private Slot CopySlot(Slot source, int capacityTokens)
         {
-            SyncToHost(source);
             int capacity = Math.Min(_maxContextLength, Math.Max(FreshSlotTokens, capacityTokens));
-            var slot = new Slot { Capacity = capacity, Length = source.Length, DraftStart = source.DraftStart,
-                RopeDelta = source.RopeDelta, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
-            (slot.K, slot.V) = AllocateCaches(capacity);
-            CopyRowsOnHost(source.K, slot.K, source.Length);
-            CopyRowsOnHost(source.V, slot.V, source.Length);
+            // A pooled slot's caches and states are overwritten whole and keep their device copies (cached graphs
+            // bind them), so the host route writes them in place.
+            Slot slot = TakePooledSlot(capacity, mustFit: true);
+            bool inPlace = slot != null;
+            if (slot == null)
+            {
+                slot = new Slot { Capacity = capacity, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
+                (slot.K, slot.V) = AllocateCaches(capacity);
+            }
+            slot.Length = source.Length;
+            slot.DraftStart = source.DraftStart;
+            slot.RopeDelta = source.RopeDelta;
+            if (TryCopySlotOnDevice(source, slot))
+                return slot;
+            SyncToHost(source);
+            CopyRowsOnHost(source.K, slot.K, source.Length, inPlace);
+            CopyRowsOnHost(source.V, slot.V, source.Length, inPlace);
+            bool kept = true;
             if (_anyRecurrent)
                 for (int l = 0; l < source.Recurrent.Length; l++)
                     if (source.Recurrent[l] != null)
                         for (int r = 0; r < source.Recurrent[l].Length; r++)
-                            slot.Recurrent[l][r].CopyFrom(source.Recurrent[l][r]);
+                        {
+                            if (inPlace) kept &= slot.Recurrent[l][r].CopyFromInPlace(source.Recurrent[l][r]);
+                            else slot.Recurrent[l][r].CopyFrom(source.Recurrent[l][r]);
+                        }
+            if (!kept) ClearGraphCache();
+            // Its device copies hold what the host does now.
+            slot.DeviceDirty = false;
             return slot;
         }
 
-        private void CopyRowsOnHost(Tensor[][] from, Tensor[][] to, int rows)
+        /// <summary>
+        /// Copy a slot whose newest bytes a graph left in device memory without bringing them to the host: one small
+        /// program per stage copies each attention layer's rows [0, length) and each state's graph-bound tensors
+        /// between the two slots' device copies, and the target is left device-current. Syncing the source to the
+        /// host instead read back every cache at its whole capacity (134 ms for a 55-token prompt's checkpoint on
+        /// CUDA). False (nothing copied) where the copy goes through the host: a host-current source, an executor
+        /// that binds no host memory, a device that reads the host bytes themselves (Metal's shared buffers, the CPU:
+        /// a memcpy there took 4.4 ms for Qwen3.6-35B-A3B's 54-token checkpoint on an M5 Pro, a copy program binding
+        /// the new slot's 40 buffers 8.7 ms), tensor-parallel caches, quantized rows or a state graphs do not bind.
+        /// </summary>
+        private bool TryCopySlotOnDevice(Slot source, Slot target)
+        {
+            if (!source.DeviceDirty || source.Length <= 0 || _graphTpRanks != null || _mesh.TensorParallel != 1
+                || GraphExecutor is not { Capabilities.BindsHostPointers: true } executor
+                || !(executor.Capabilities.SeparateDeviceCopies || ForceDeviceSlotCopies))
+                return false;
+            int kvType = KvGgmlType(_kvCacheDtype.ToDType());
+            if (kvType != GraphFormat.F32 && kvType != GraphFormat.F16) return false;
+            if (_anyRecurrent)
+                foreach (RecurrentState[] layer in source.Recurrent)
+                    if (layer != null && (layer[0]?.GraphTensors == null))
+                        return false;
+
+            int rows = source.Length, d = _keyDim, dv = _valueDim, kvHeads = _localKvHeads;
+            long kRow = RowBytes(kvType, d), vRow = RowBytes(kvType, dv);
+            for (int stage = 0; stage < _mesh.Stages; stage++)
+            {
+                var g = new GraphProgramBuilder(record: true);
+                int copies = 0;
+                for (int l = 0; l < TotalLayers; l++)
+                {
+                    if (!OwnsLayer(l) || StageOfLayer(l) != stage) continue;
+                    if (source.K?[l] != null)
+                    {
+                        CopyRows(source.K[l][0], target.K[l][0], d, kRow);
+                        CopyRows(source.V[l][0], target.V[l][0], dv, vRow);
+                    }
+                    if (_anyRecurrent && source.Recurrent[l] != null)
+                    {
+                        Tensor[] from = source.Recurrent[l][0].GraphTensors, to = target.Recurrent[l][0].GraphTensors;
+                        for (int i = 0; i < from.Length; i++)
+                        {
+                            long n = from[i].ElementCount();
+                            g.Effect(g.Op(GraphOp.Cpy, Leaf(from[i], GraphFormat.F32, n), Leaf(to[i], GraphFormat.F32, n)));
+                            copies++;
+                        }
+                    }
+                }
+                if (copies == 0) continue;
+                EnterStage(stage);
+                try
+                {
+                    using IGraphPlan plan = executor.Compile(g.ToProgram(replayable: false, reorder: false));
+                    if (!plan.Run(ReadOnlySpan<int>.Empty, ReadOnlySpan<IntPtr>.Empty, ReadOnlySpan<long>.Empty))
+                        throw new InvalidOperationException($"{Config.Architecture} slot copy failed: {plan.LastError}");
+                }
+                finally
+                {
+                    EnterStage(0);
+                }
+
+                void CopyRows(Tensor from, Tensor to, int dim, long rowBytes)
+                {
+                    int src = g.Op(GraphOp.View, stackalloc[] { Leaf(from, kvType, dim, source.Capacity, kvHeads) },
+                        stackalloc long[] { 3, dim, rows, kvHeads, 1, rowBytes, rowBytes * source.Capacity, 0, 0 });
+                    int dst = g.Op(GraphOp.View, stackalloc[] { Leaf(to, kvType, dim, target.Capacity, kvHeads) },
+                        stackalloc long[] { 3, dim, rows, kvHeads, 1, rowBytes, rowBytes * target.Capacity, 0, 0 });
+                    g.Effect(g.Op(GraphOp.Cpy, src, dst));
+                    copies++;
+                }
+
+                int Leaf(Tensor t, int type, params long[] ne)
+                    => g.Leaf(GraphLeafRole.State, type, ne, TensorComputePrimitives.GetStoragePointer(t), t.Storage.ByteLength, handle: t);
+            }
+            if (_anyRecurrent)
+                for (int l = 0; l < source.Recurrent.Length; l++)
+                    if (source.Recurrent[l] != null)
+                        target.Recurrent[l][0].AfterDeviceCopy(source.Recurrent[l][0]);
+            target.DeviceDirty = true;
+            DeviceSlotCopies++;
+            return true;
+        }
+
+        /// <param name="inPlace">Write the rows into the targets' device copies rather than dropping them.</param>
+        private void CopyRowsOnHost(Tensor[][] from, Tensor[][] to, int rows, bool inPlace)
         {
             if (from == null || rows <= 0) return;
             for (int l = 0; l < from.Length; l++)
@@ -105,9 +217,27 @@ namespace TensorSharp.Models
                 for (int r = 0; r < from[l].Length; r++)
                 {
                     CopyCacheRows(from[l][r], to[l][r], rows);
-                    InvalidateTensorDeviceCache(to[l][r]);
+                    if (inPlace) UploadCacheRows(to[l][r], rows);
+                    else InvalidateTensorDeviceCache(to[l][r]);
                 }
             }
+        }
+
+        /// <summary>Rows [0, <paramref name="rows"/>) of every head of a cache written on the host, into its device copy.</summary>
+        private void UploadCacheRows(Tensor cache, int rows)
+        {
+            if (!IsGgmlBackend || rows <= 0) return;
+            int heads = (int)cache.Sizes[0];
+            long capacity = cache.Sizes[1];
+            long rowBytes = RowBytes(KvGgmlType(_kvCacheDtype.ToDType()), cache.Sizes[2]);
+            var offsets = new long[heads];
+            var lengths = new long[heads];
+            for (int h = 0; h < heads; h++)
+            {
+                offsets[h] = h * capacity * rowBytes;
+                lengths[h] = rows * rowBytes;
+            }
+            GgmlBasicOps.UploadHostBufferRanges(TensorComputePrimitives.GetStoragePointer(cache), offsets, lengths);
         }
 
         /// <summary>Bytes a clone of a retained slot takes: KV rows for <paramref name="targetTokens"/>

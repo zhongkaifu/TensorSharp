@@ -523,6 +523,55 @@ chunks of different lengths, decode, a lone step on one slot in between) reprodu
 alone in every placement, bit-identical on the managed backend and within backend rounding on
 GGML and MLX. A multi-node pipeline (the serialized stage protocol) has no slots yet.
 
+#### The unified step
+
+A model on the runtime is served by one executor path, `ExecutionPathKind.Unified`
+(`IUnifiedBatchModel`, `BatchExecutor.ExecuteStepUnified`). There is no per-sequence route, no shared
+primary cache to hand from request to request, and no paged migration. Each step:
+
+1. **Prepares slots.** Every scheduled request gets its slot (`EnsureSequenceSlot`), sized once for its
+   prompt, its generation budget and a verify window. A slot adopted from the prefix cache past the
+   prompt rewinds, and a reused prefix is injected, exactly as a per-request holder binds.
+2. **Verifies speculating requests together.** Decode tokens of requests that speculate are drafted per
+   request, each over its own drafter state: a draft layer's rows live in the slot, and a DFlash ring is
+   per request. One forward then verifies every window on its own slot
+   (`StandardDecoderModel.BatchedSpeculative.cs`, an `IBatchedSpeculativeTarget` over slots). A hybrid
+   stack keeps each row's recurrent state, and the commit sets each slot to the state after the rows it
+   kept.
+3. **Runs everything else in one forward.** Prompt chunks and plain decode tokens of every other request
+   go into one forward (`TryForwardUnified`). A block drafter conditions on the prompt, so its requests'
+   chunks come back with their feature rows, and `SpeculativeExecution.CommitPrefill` feeds them to that
+   request's drafter.
+
+A request with pending media still runs its chunk through the model's media path on its own slot.
+
+A slot copy (a shared-prefix checkpoint, or a clone of one) stays on the device where the executor keeps
+separate device copies (`GraphCapabilities.SeparateDeviceCopies`, CUDA). There, syncing the source
+read every cache back at its whole capacity: 134 ms for a 55-token checkpoint. On Metal and the CPU the
+host copy is cheaper, because the device reads the host bytes themselves.
+
+Pooled slots keep their device copies. Their states are reset and copied in place (`ResetInPlace`,
+`CopyFromInPlace`: write the host bytes, then upload them into the existing copy), so the graphs cached
+over a pooled slot replay for its next request. A warmed slot waits in the pool after warm-up. On an
+M5 Pro (Qwen3.6-35B-A3B UD-Q4_K_M, `ggml_metal`, 55-token prompt) these took the first request's one-row
+step from 23.9 to 15.9 ms.
+
+The runtime's verify takes exactly the longest draft plus its anchor (`BatchedSpecExactWindow`): graphs
+replay per width, and a padded row costs a row. When nothing is drafted, the step is one decode row. A
+4-row window for such a step cost 100 ms on Qwen3.8-Flash-Next, the one-row decode 40.
+
+Measured on an M5 Pro (`ggml_metal`, greedy, 200 tokens, legacy family vs the unified step, runs
+interleaved):
+
+| Model | Drafter | Legacy, tok/s | Unified, tok/s | Note |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next UD-Q2_K_XL | MTP (shared Q8_0) | 32.5, 33.3 | 34.1, 31.5, 32.0 | acceptance 76-78% vs 72-77% |
+| Qwen3.8-Flash-Next UD-Q2_K_XL | DFlash2 Q4_K_M | 41.3, 39.4, 39.6 | 38.4, 40.2, 39.0 | runtime drafts 5 at gate 0 |
+| Qwen3.6-35B-A3B UD-Q4_K_M | n-gram, quote-back prompt | 113.4, 128.5 | 134.5, 133.7 | same text, 99% acceptance |
+
+A legacy run that loaded while macOS reported 11.7 GB free (0.8 GB expert tier instead of 5.1 GB) is left
+out: the window budget, and with route-tail skip the greedy text too, depends on that reading.
+
 ### 6.6 Whole-forward graphs (the native lowering, first step)
 
 Hand-fused native graphs were written per family and per mode (decode, prefill, batched, tensor

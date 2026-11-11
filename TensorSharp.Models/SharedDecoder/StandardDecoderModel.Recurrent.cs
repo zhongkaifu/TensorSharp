@@ -29,6 +29,15 @@ namespace TensorSharp.Models
             /// <summary>Back to the state before any token.</summary>
             public abstract void Reset();
 
+            /// <summary><see cref="Reset"/> that rewrites every device copy in place instead of dropping it, so the
+            /// graphs cached over this state stay valid (a pooled slot's next request replays them). False: the
+            /// state reset through <see cref="Reset"/>, and its device copies are gone.</summary>
+            public virtual bool ResetInPlace()
+            {
+                Reset();
+                return false;
+            }
+
             /// <summary>Host tensors holding the state, which a whole-forward graph may update on
             /// the device; synced back before any host code reads them.</summary>
             protected internal virtual System.Collections.Generic.IEnumerable<Tensor> HostTensors => Array.Empty<Tensor>();
@@ -39,9 +48,23 @@ namespace TensorSharp.Models
             /// <summary>Copy <paramref name="source"/>'s host-current state into this one.</summary>
             protected internal virtual void CopyFrom(RecurrentState source)
                 => throw new NotSupportedException($"{GetType().Name} cannot be copied.");
+            /// <summary><see cref="CopyFrom"/> that writes each existing device copy in place (see
+            /// <see cref="ResetInPlace"/>); false when it dropped them instead.</summary>
+            protected internal virtual bool CopyFromInPlace(RecurrentState source)
+            {
+                CopyFrom(source);
+                return false;
+            }
 
             /// <summary>The tensors a checkpoint file holds, without aliases.</summary>
             protected internal virtual System.Collections.Generic.IEnumerable<Tensor> CheckpointTensors => HostTensors;
+            /// <summary>The F32 tensors whole-forward graphs bind for this state, each through its own key, whose device
+            /// copies hold the state between steps: a copy on the device copies these. Null: the state copies on the
+            /// host only.</summary>
+            protected internal virtual Tensor[] GraphTensors => null;
+            /// <summary>After <see cref="GraphTensors"/> were copied from <paramref name="source"/> on the device: copy
+            /// what the state keeps on the host.</summary>
+            protected internal virtual void AfterDeviceCopy(RecurrentState source) { }
 
             /// <summary>The state's host bytes were rewritten: drop every device copy of them.</summary>
             protected internal virtual void OnHostWritten() { }
@@ -134,6 +157,18 @@ namespace TensorSharp.Models
             foreach (RecurrentState[] layer in states)
                 if (layer != null)
                     foreach (RecurrentState s in layer) s?.Reset();
+        }
+
+        /// <summary><see cref="RecurrentState.ResetInPlace"/> for every state; false when any dropped its device copies.</summary>
+        private static bool ResetStatesInPlace(RecurrentState[][] states)
+        {
+            bool kept = true;
+            if (states == null) return kept;
+            foreach (RecurrentState[] layer in states)
+                if (layer != null)
+                    foreach (RecurrentState s in layer)
+                        if (s != null) kept &= s.ResetInPlace();
+            return kept;
         }
 
         private static void DisposeStates(RecurrentState[][] states)

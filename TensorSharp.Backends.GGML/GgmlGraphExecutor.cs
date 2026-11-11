@@ -51,6 +51,7 @@ namespace TensorSharp.GGML
                 DecodeWindowRows = metal ? 64 : 256,
                 TensorParallel = backend == GgmlBackendType.Cuda,
                 BindsHostPointers = true,
+                SeparateDeviceCopies = backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan,
                 QuantizedKvCache = true,
                 // Routed experts in host memory run at a pause in the graph (ggml_ops_graph_builder.cpp).
                 HostExperts = true,

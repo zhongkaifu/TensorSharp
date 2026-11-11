@@ -536,6 +536,23 @@ namespace TensorSharp.Models
                 ResetPle();
             }
 
+            /// <summary>The token history is host-only (graphs never bind it), so rewriting it drops nothing.</summary>
+            public override bool ResetInPlace()
+            {
+                if (!_host)
+                {
+                    Reset();
+                    return true;
+                }
+                if (!base.ResetInPlace()) return false;
+                ClearInPlace(PleConv);
+                _count = _next = 0;
+                _stale = false;
+                _lastStart = -1;
+                WriteTokens();
+                return true;
+            }
+
             private void ResetPle()
             {
                 if (PleConv == null) return;   // the base constructor resets before this one ran
@@ -572,6 +589,37 @@ namespace TensorSharp.Models
                     Buffer.MemoryCopy((void*)_hostPointer(from), (void*)_hostPointer(to), bytes, bytes);
                     Invalidate(to);
                 }
+                _stale = true;
+                _lastStart = -1;
+            }
+
+            protected internal override bool CopyFromInPlace(RecurrentState source)
+            {
+                if (!_host)
+                {
+                    CopyFrom(source);
+                    return true;
+                }
+                if (!base.CopyFromInPlace(source)) return false;
+                var other = (PleGdnState)source;
+                CopyInPlace(other.PleConv, PleConv);
+                CopyInPlace(other.PleTokens, PleTokens);
+                _stale = true;
+                _lastStart = -1;
+                return true;
+            }
+
+            protected internal override Tensor[] GraphTensors
+                => base.GraphTensors is { } graph ? [.. graph, PleConv] : null;
+
+            /// <summary>The token history lives on the host only.</summary>
+            protected internal override unsafe void AfterDeviceCopy(RecurrentState source)
+            {
+                base.AfterDeviceCopy(source);
+                var other = (PleGdnState)source;
+                long bytes = PleTokens.ElementCount() * sizeof(float);
+                Buffer.MemoryCopy((void*)_hostPointer(other.PleTokens), (void*)_hostPointer(PleTokens), bytes, bytes);
+                Invalidate(PleTokens);
                 _stale = true;
                 _lastStart = -1;
             }

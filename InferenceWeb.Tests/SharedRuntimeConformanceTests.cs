@@ -302,7 +302,7 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture(family);
         CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(family, path, 1, 1), 1e-6, $"{family} managed");
-        CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(family, path, 1, 1, TestGates.PinnedGgmlBackend), 1e-5, $"{family} ggml");
+        CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(family, path, 1, 1, TestGates.PinnedGgmlBackend), 1e-5, $"{family} ggml", deviceCopies: true);
     }
 
     /// <summary>A fixed script over one cache: prefill, decode, truncate + refill, reset, prefill.</summary>

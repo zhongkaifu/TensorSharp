@@ -4,8 +4,10 @@
 // This file is part of TensorSharp.
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
 using TensorSharp.Models;
+using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Runtime.Speculative;
 
 namespace InferenceWeb.Tests;
@@ -79,6 +81,62 @@ internal static class SpeculativeRuntimeChecks
         Assert.Equal(maxNew, drafted.Count);
         Assert.True(decoder.VerifySteps > 0, $"{label}: no verify ran");
         Assert.True(decoder.TokensDrafted > 0, $"{label}: the drafter drafted nothing");
+    }
+
+    /// <summary>
+    /// Speculation through the engine's unified step emits what plain decoding does, for one request and for several
+    /// at once: each drafts over its own drafter state and every window is verified in one forward over the requests'
+    /// slots (the batched verify must have run). Prompts repeat, so an n-gram drafter's drafts are accepted.
+    /// </summary>
+    public static async Task AssertEngineSpeculationMatchesPlain(Func<ModelBase> create, SpeculationOptions speculation,
+        string label, int maxNew = 20)
+    {
+        int[][] prompts =
+        {
+            Enumerable.Range(0, 24).Select(i => 40 + i % 6).ToArray(),
+            Enumerable.Range(0, 19).Select(i => 50 + (i * 5) % 9).ToArray(),
+            Enumerable.Range(0, 27).Select(i => 44 + i % 4).ToArray(),
+        };
+        foreach (int concurrent in new[] { 1, prompts.Length })
+        {
+            int[][] chosen = prompts.Take(concurrent).ToArray();
+            int[][] plain = await ServeAsync(create, chosen, null, maxNew, verifySteps: null);
+            int verified = 0;
+            int[][] drafted = await ServeAsync(create, chosen, speculation, maxNew, steps => verified = steps);
+            for (int r = 0; r < chosen.Length; r++)
+                Assert.True(plain[r].SequenceEqual(drafted[r]),
+                    $"{label} x{concurrent}: request {r} gave [{string.Join(",", drafted[r])}], plain [{string.Join(",", plain[r])}]");
+            Assert.True(verified > 0, $"{label} x{concurrent}: no batched verify ran");
+        }
+    }
+
+    private static async Task<int[][]> ServeAsync(Func<ModelBase> create, int[][] prompts, SpeculationOptions speculation,
+        int maxNew, Action<int> verifySteps)
+    {
+        using ModelBase model = create();
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 256,
+            MaxNumRunningSequences = 4,
+            MaxPrefillChunkSize = 16,
+            NumBlocks = 64,
+            BlockSize = 16,
+            EnablePrefixCaching = false,
+            Speculation = speculation ?? new SpeculationOptions { Enabled = false },
+        };
+        using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
+        var handles = prompts.Select((p, i) => engine.SubmitRequest(
+            new SequenceState($"req{i}", p, maxNew, cfg.BlockSize, SamplingConfig.Greedy))).ToList();
+        int[][] outputs = await Task.WhenAll(handles.Select(async h =>
+        {
+            var tokens = new List<int>();
+            await foreach (int t in h.Tokens.ReadAllAsync())
+                tokens.Add(t);
+            await h.Completion;
+            return tokens.ToArray();
+        })).WaitAsync(TimeSpan.FromMinutes(3));
+        verifySteps?.Invoke(((StandardDecoderModel)model).BatchedSpecVerifySteps);
+        return outputs;
     }
 
     private readonly record struct Greedy(int Token, int RunnerUp, double RelativeMargin);

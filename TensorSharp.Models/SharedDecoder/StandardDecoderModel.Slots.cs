@@ -37,6 +37,7 @@ namespace TensorSharp.Models
             public bool DeviceDirty;               // a graph wrote its rows/state in device memory
             public int DraftStart;                 // the draft layers attend to rows from here on
             public int RopeDelta;                  // rotary position = KV index + this past a position table
+            public int VerifyRows;                 // a batched verify's window, its recurrent states awaiting the commit
         }
 
         /// <summary>Rows of a batched step: sequence s owns rows [QueryStart[s], QueryStart[s] + Counts[s])
@@ -165,22 +166,44 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- slot lifecycle
 
-        private Slot NewSlot()
+        /// <summary>An empty slot for <paramref name="reserveTokens"/> tokens: a pooled one, whose caches and states
+        /// keep their device copies, so the graphs cached over it replay for its next request; else a new one of that
+        /// size.</summary>
+        private Slot NewSlot(int reserveTokens = 0)
         {
-            if (_slotPool != null && _slotPool.Count > 0)
+            if (TakePooledSlot(reserveTokens, mustFit: false) is { } pooled)
             {
-                Slot pooled = _slotPool[^1];
-                _slotPool.RemoveAt(_slotPool.Count - 1);
-                pooled.Length = 0;
-                pooled.DraftStart = 0;
-                ClearGraphCache();
-                ResetStates(pooled.Recurrent);
+                if (!ResetStatesInPlace(pooled.Recurrent))
+                    ClearGraphCache();
                 return pooled;
             }
-            int capacity = Math.Min(FreshSlotTokens, Math.Max(1, _maxContextLength));
+            int capacity = Math.Min(_maxContextLength, Math.Max(Math.Max(1, reserveTokens), Math.Min(FreshSlotTokens, Math.Max(1, _maxContextLength))));
             var slot = new Slot { Capacity = capacity, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
             (slot.K, slot.V) = AllocateCaches(capacity);
             return slot;
+        }
+
+        /// <summary>The pooled slot that best holds <paramref name="tokens"/> (the smallest that does, else the largest;
+        /// <paramref name="mustFit"/>: null unless one does), emptied but its states as they were; null when the
+        /// pool has none.</summary>
+        private Slot TakePooledSlot(int tokens, bool mustFit)
+        {
+            if (_slotPool == null || _slotPool.Count == 0) return null;
+            int pick = 0;
+            for (int i = 1; i < _slotPool.Count; i++)
+            {
+                int best = _slotPool[pick].Capacity, cap = _slotPool[i].Capacity;
+                bool fits = cap >= tokens, bestFits = best >= tokens;
+                if (fits ? !bestFits || cap < best : !bestFits && cap > best) pick = i;
+            }
+            Slot pooled = _slotPool[pick];
+            if (mustFit && pooled.Capacity < tokens) return null;
+            _slotPool.RemoveAt(pick);
+            pooled.Length = 0;
+            pooled.DraftStart = 0;
+            pooled.RopeDelta = 0;
+            pooled.VerifyRows = 0;
+            return pooled;
         }
 
         private (Tensor[][] K, Tensor[][] V) AllocateCaches(int capacity)
@@ -424,7 +447,10 @@ namespace TensorSharp.Models
         /// <summary>One forward over several requests' slots: every row through one activation,
         /// attention per sequence on its own slot. Declines (nothing written) when a request has no
         /// slot or does not continue its slot at the given position.</summary>
-        private bool TryForwardSlots(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits)
+        /// <param name="features">Per request, a buffer for its rows' drafter features, or null (see
+        /// <see cref="IUnifiedBatchModel.TryForwardUnified"/>); entries are set to null when no graph captured them.</param>
+        private bool TryForwardSlots(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> chunks, int[] starts, float[][] outLogits,
+            float[][] features = null)
         {
             if (!SupportsPerSequenceFusedForward || _slots == null || HasPendingMedia || _pendingPositionTable != null) return false;
             int n = requestIds.Count;
@@ -470,14 +496,19 @@ namespace TensorSharp.Models
             try
             {
                 embedded = EmbedStep(flatTokens);
-                if (TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(), wantLogits: true, out float[][] graphLogits))
+                bool capture = features != null && Array.Exists(features, f => f != null);
+                if (capture ? TryRunCapturingGraph(embedded, slots, queryStart, counts, starts, outLogits, features)
+                    : TryRunGraph(embedded, slots, queryStart, counts, (int[])starts.Clone(), wantLogits: true, out float[][] graphLogits)
+                      && CopyLogits(graphLogits, outLogits))
                 {
                     BatchedForwardCount++;
                     for (int s = 0; s < n; s++)
-                    {
                         slots[s].Length = starts[s] + counts[s];
-                        outLogits[s] = graphLogits[s];
-                    }
+                    return true;
+                }
+                static bool CopyLogits(float[][] from, float[][] to)
+                {
+                    Array.Copy(from, to, to.Length);
                     return true;
                 }
             }
@@ -487,6 +518,7 @@ namespace TensorSharp.Models
             }
             foreach (Slot slot in slots) SyncToHost(slot);
             ClearGraphCache();
+            if (features != null) Array.Clear(features);   // the per-op layers capture no drafter features
 
             float[] all;
             // A step with a text-LoRA adapter selected must apply it to every planned weight.

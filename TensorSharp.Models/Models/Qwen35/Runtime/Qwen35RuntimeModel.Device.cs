@@ -301,11 +301,62 @@ namespace TensorSharp.Models
                 if (_host) Invalidate(Ssm);
             }
 
+            /// <summary>Zero the host bytes and write them into each existing device copy (the backing's, the state
+            /// view's): nothing a cached graph binds is freed.</summary>
+            public override bool ResetInPlace()
+            {
+                if (!_host)
+                {
+                    Reset();   // the backend's own tensors, filled where they live
+                    return true;
+                }
+                ClearInPlace(Conv);
+                ClearInPlace(Backing);
+                long stateBytes = Ssm.ElementCount() * sizeof(float);
+                GgmlBasicOps.UploadHostBufferRanges(_hostPointer(Ssm), stackalloc long[] { 0 }, stackalloc long[] { stateBytes });
+                return true;
+            }
+
+            protected unsafe void ClearInPlace(Tensor t)
+            {
+                long bytes = t.ElementCount() * sizeof(float);
+                IntPtr p = _hostPointer(t);
+                new Span<float>((float*)p, checked((int)t.ElementCount())).Clear();
+                GgmlBasicOps.UploadHostBufferRanges(p, stackalloc long[] { 0 }, stackalloc long[] { bytes });
+            }
+
+            protected internal override bool CopyFromInPlace(RecurrentState source)
+            {
+                if (!_host)
+                {
+                    CopyFrom(source);
+                    return true;
+                }
+                var other = (DeviceGdnState)source;
+                CopyInPlace(other.Conv, Conv);
+                CopyInPlace(other.Backing, Backing);
+                long stateBytes = Ssm.ElementCount() * sizeof(float);
+                GgmlBasicOps.UploadHostBufferRanges(_hostPointer(Ssm), stackalloc long[] { 0 }, stackalloc long[] { stateBytes });
+                return true;
+            }
+
+            /// <summary>Host bytes copied, then written into the target's device copy if it has one.</summary>
+            protected unsafe void CopyInPlace(Tensor from, Tensor to)
+            {
+                long bytes = to.ElementCount() * sizeof(float);
+                Buffer.MemoryCopy((void*)_hostPointer(from), (void*)_hostPointer(to), bytes, bytes);
+                GgmlBasicOps.UploadHostBufferRanges(_hostPointer(to), stackalloc long[] { 0 }, stackalloc long[] { bytes });
+            }
+
             protected internal override IEnumerable<Tensor> HostTensors => new[] { Conv, Ssm, Backing };
 
             protected internal override bool CanCopy => true;
 
             protected internal override IEnumerable<Tensor> CheckpointTensors => new[] { Conv, Backing };
+
+            /// <summary>Graphs bind the conv window and, per backend, the backing (in place) or the state view.</summary>
+            protected internal override Tensor[] GraphTensors
+                => _host ? new[] { Conv, _executor?.Capabilities.InPlaceStateAlias == true ? Backing : Ssm } : null;
 
             protected internal override unsafe void CopyFrom(RecurrentState source)
             {

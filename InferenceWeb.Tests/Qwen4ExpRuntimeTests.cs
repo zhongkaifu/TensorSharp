@@ -216,6 +216,20 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         SpeculativeRuntimeChecks.AssertBlockDraftMatchesPlainGreedy(() => new Qwen4ExpRuntimeModel(target, BackendType.Cpu, draft), "qwen4exp cpu dflash");
     }
 
+    /// <summary>The engine's unified step drafts each request's blocks over its own DFlash ring (the prompt's
+    /// feature rows captured by the batched prefill) and verifies every window in one forward: one request or several
+    /// at once give the plain greedy streams; so do n-gram drafts.</summary>
+    [Theory]
+    [InlineData(SpeculatorRegistry.Block)]
+    [InlineData(SpeculatorRegistry.NGram)]
+    public async Task EngineSpeculationMatchesPlainOnTheManagedCpu(string speculator)
+    {
+        var (target, draft) = DFlashFixtures(qsa: false);
+        var options = new SpeculationOptions { Enabled = true, SpeculatorName = speculator, MaxDraftTokens = 3, MinDraftProb = 0 };
+        await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(() => new Qwen4ExpRuntimeModel(target, BackendType.Cpu, draft),
+            options, $"qwen4exp cpu {speculator}");
+    }
+
     [MlxFact]
     public void DFlashSpeculationMatchesPlainGreedyOnMlx()
     {

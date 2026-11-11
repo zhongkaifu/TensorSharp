@@ -424,6 +424,24 @@ public sealed class Qwen35RuntimeTests : IDisposable
             tieTolerance: RoundsActivations(TestGates.PinnedGgmlBackend) ? 1e-2 : 0);
     }
 
+    /// <summary>The engine's unified step speculates: n-gram and MTP drafts of one request or of several at once,
+    /// each over its own drafter state and verified together on their slots, give the plain greedy streams.</summary>
+    [Theory]
+    [InlineData("dense", SpeculatorRegistry.NGram, BackendType.Cpu)]
+    [InlineData("moe", SpeculatorRegistry.NGram, BackendType.Cpu)]
+    [InlineData("dense-nextn", SpeculatorRegistry.DraftHead, BackendType.Cpu)]
+    [InlineData("dense", SpeculatorRegistry.NGram, BackendType.GgmlCpu)]
+    [InlineData("dense-nextn", SpeculatorRegistry.DraftHead, BackendType.GgmlCpu)]
+    public async Task EngineSpeculationMatchesPlain(string variant, string speculator, BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        if (backend == BackendType.GgmlCpu) backend = TestGates.PinnedGgmlBackend;
+        string path = Fixture(variant);
+        var options = new SpeculationOptions { Enabled = true, SpeculatorName = speculator, MaxDraftTokens = 3, MinDraftProb = 0 };
+        await SpeculativeRuntimeChecks.AssertEngineSpeculationMatchesPlain(() => Create(path, backend: backend), options,
+            $"qwen35 {variant} {speculator} {backend}");
+    }
+
     /// <summary>The NextN/MTP block drafts through the runtime's generic draft layer: speculation
     /// emits the plain greedy tokens.</summary>
     [Fact]
@@ -651,7 +669,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
             Assert.True(RelL2(perOp[i], single[i]) <= 2.5e-2, $"per-op stages row {i}: relL2 {RelL2(perOp[i], single[i]):E2}");
         }
         SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(path, 1, 2, BackendType.GgmlCuda), $"qwen35 {variant} stages", tieTolerance: 1e-2);
-        CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(path, 1, 2, BackendType.GgmlCuda), 1e-5, $"qwen35 {variant} stages");
+        CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(path, 1, 2, BackendType.GgmlCuda), 1e-5, $"qwen35 {variant} stages", deviceCopies: true);
     }
 
     [GgmlFact(BackendType.GgmlCuda)]
@@ -672,7 +690,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
         string path = Fixture(variant);
-        CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(path, backend: TestGates.PinnedGgmlBackend), 1e-5, $"qwen35 {variant}");
+        CheckpointChecks.AssertCheckpointsContinueExactly(() => Create(path, backend: TestGates.PinnedGgmlBackend), 1e-5, $"qwen35 {variant}", deviceCopies: true);
     }
 
     public static TheoryData<int, int> BatchedPlacements() => new() { { 1, 1 }, { 2, 1 }, { 1, 2 }, { 2, 2 } };

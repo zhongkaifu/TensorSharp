@@ -14,7 +14,9 @@ namespace InferenceWeb.Tests;
 /// by another instance), continues exactly as a fresh run of the same tokens.</summary>
 internal static class CheckpointChecks
 {
-    public static void AssertCheckpointsContinueExactly(Func<ModelBase> create, double tolerance, string label)
+    /// <param name="deviceCopies">The model runs on a GGML backend: the checks run once as loaded and once with every
+    /// slot copy made by the device copy program, which must then have been used.</param>
+    public static void AssertCheckpointsContinueExactly(Func<ModelBase> create, double tolerance, string label, bool deviceCopies = false)
     {
         int[] prefix = Enumerable.Range(0, 23).Select(i => 40 + (i * 7) % 60).ToArray();
         int[] tail = { 71, 72, 73 };
@@ -26,31 +28,40 @@ internal static class CheckpointChecks
             foreach (int t in tail) expected.Add((float[])reference.Forward(new[] { t }).Clone());
         }
 
-        byte[] file;
-        using (ModelBase model = create())
+        foreach (bool forceDevice in deviceCopies ? new[] { false, true } : new[] { false })
         {
-            var slots = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
-            Assert.True(slots.SupportsPrefixCheckpoints, $"{label}: no checkpoints");
-            slots.BindSequenceCache("a");
-            model.ForwardRefill(prefix);
-            Assert.True(slots.TryCheckpointActiveCache("shared"), $"{label}: checkpoint refused");
-            model.Forward(new[] { 99 });   // the source request moves on; the checkpoint must not
+            string run = forceDevice ? $"{label} device copies" : label;
+            byte[] file;
+            using (ModelBase model = create())
+            {
+                var slots = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
+                Assert.True(slots.SupportsPrefixCheckpoints, $"{run}: no checkpoints");
+                var runtime = model as StandardDecoderModel;
+                if (forceDevice) runtime!.ForceDeviceSlotCopies = true;
+                slots.BindSequenceCache("a");
+                model.ForwardRefill(prefix);
+                Assert.True(slots.TryCheckpointActiveCache("shared"), $"{run}: checkpoint refused");
+                model.Forward(new[] { 99 });   // the source request moves on; the checkpoint must not
 
-            Assert.True(slots.TryCloneRetainedCache("shared", "b"));
-            Assert.False(slots.BindSequenceCache("b"), "the clone is the request's slot, not a fresh one");
-            Compare(model, tail, expected, tolerance, $"{label} clone");
+                Assert.True(slots.TryCloneRetainedCache("shared", "b"));
+                Assert.False(slots.BindSequenceCache("b"), "the clone is the request's slot, not a fresh one");
+                Compare(model, tail, expected, tolerance, $"{run} clone");
+                // Where graphs left the rows on the device, the checkpoint and the clone never went through the host.
+                if (runtime != null && runtime.GraphRuns > 0 && runtime.SlotCopiesStayOnDevice)
+                    Assert.True(runtime.DeviceSlotCopies >= 2, $"{run}: {runtime.DeviceSlotCopies} slot copies on the device");
 
-            using var stream = new MemoryStream();
-            Assert.True(slots.TryExportRetainedCache("shared", stream));
-            file = stream.ToArray();
+                using var stream = new MemoryStream();
+                Assert.True(slots.TryExportRetainedCache("shared", stream));
+                file = stream.ToArray();
+            }
+
+            using ModelBase other = create();
+            var otherSlots = (IBatchedPagedModel)other;
+            Assert.True(otherSlots.TryImportRetainedCache("restored", new MemoryStream(file)), $"{run}: import refused");
+            Assert.True(otherSlots.TryCloneRetainedCache("restored", "c"));
+            otherSlots.BindSequenceCache("c");
+            Compare(other, tail, expected, tolerance, $"{run} file");
         }
-
-        using ModelBase other = create();
-        var otherSlots = (IBatchedPagedModel)other;
-        Assert.True(otherSlots.TryImportRetainedCache("restored", new MemoryStream(file)), $"{label}: import refused");
-        Assert.True(otherSlots.TryCloneRetainedCache("restored", "c"));
-        otherSlots.BindSequenceCache("c");
-        Compare(other, tail, expected, tolerance, $"{label} file");
     }
 
     private static void Compare(ModelBase model, int[] tail, List<float[]> expected, double tolerance, string label)

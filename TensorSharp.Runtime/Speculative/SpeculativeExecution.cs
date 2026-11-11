@@ -335,6 +335,47 @@ namespace TensorSharp.Runtime.Speculative
         }
 
         /// <summary>
+        /// <see cref="PrefillStep"/> for a prompt chunk another forward ran: <paramref name="rows"/> holds each of its
+        /// rows' drafter features (rows x <see cref="ISpeculativeTarget.SpecFeatureSize"/>), captured by a forward of
+        /// several requests' work (the unified step). The speculator's state then covers the chunk as if this
+        /// execution had forwarded it, and the last row's features carry into the next chunk or the first draft.
+        /// </summary>
+        public void CommitPrefill(int[] chunk, int startPos, float[] rows, int promptEnd = -1)
+        {
+            if (chunk == null || chunk.Length == 0)
+                throw new ArgumentException("Chunk must not be empty.", nameof(chunk));
+            int n = chunk.Length;
+            if (!NeedsHidden)
+            {
+                _speculator.Commit(chunk, null, startPos);
+                return;
+            }
+            if (rows == null || rows.LongLength < (long)n * _hidden)
+                throw new ArgumentException($"{n} prompt rows need {(long)n * _hidden} feature floats.", nameof(rows));
+            EnsureChunkBuffers(n);
+            Array.Copy(rows, (long)(n - 1) * _hidden, _lastRowH!, 0, _hidden);
+            if (_speculator.HandlesOwnPrefill)
+            {
+                // A drafter the trunk keeps in sync itself needs only the carry.
+            }
+            else if (promptEnd > 0 && _speculator.PrefillContextRows < int.MaxValue
+                && (long)startPos + n <= (long)promptEnd - _speculator.PrefillContextRows)
+            {
+                _speculator.Commit(chunk, null, startPos);   // older than the drafter's context at the prompt's end
+            }
+            else
+            {
+                // Token k pairs with the features of the token before it (see PrefillStep).
+                Array.Copy(_pendingH!, 0, _chunkH!, 0, _hidden);
+                if (n > 1)
+                    Array.Copy(rows, 0, _chunkH!, _hidden, (long)(n - 1) * _hidden);
+                _speculator.Commit(chunk, _chunkH, startPos);
+            }
+            Array.Copy(_lastRowH!, 0, _pendingH!, 0, _hidden);
+            _carryValid = true;
+        }
+
+        /// <summary>
         /// One speculative decode step for <paramref name="lastToken"/> at trunk
         /// position <paramref name="position"/> (== tokens already in the cache).
         /// <paramref name="kMax"/> additionally caps this step's draft window
