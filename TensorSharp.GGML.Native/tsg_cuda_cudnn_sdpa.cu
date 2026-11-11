@@ -452,7 +452,9 @@ extern "C" bool tsg_h3_attn_prep(const float* q, int64_t q_sh, int64_t q_ss, con
                                  const float* v, int64_t v_sh, int64_t v_ss, const float* qb, const float* kb,
                                  const float* vb, int64_t bias_hs, const float* qn, const float* kn,
                                  const float* cosT, const float* ssinT, int rot, float eps, float vInv,
-                                 int heads, int seq, int rope_seq, int head_dim, void* q16, void* k16, void* v16);
+                                 int heads, int seq, int rope_seq, int head_dim, void* q16, void* k16, void* v16,
+                                 const uint32_t* rowpeak, const uint32_t* tokpeak, int64_t q_off, int64_t k_off,
+                                 int64_t v_off);
 extern "C" bool tsg_h3_widen_scaled(const void* src16, float* dst, int64_t n, float scale);
 #if defined(TSG_HAVE_FLASH_ATTN)
 // The same product on FlashAttention-2 (tsg_cuda_flash_attn.cu).
@@ -560,11 +562,15 @@ bool tsg_cudnn_sdpa_f32_strided(const float* q, int64_t q_stride_s, int64_t q_st
 // A build with FlashAttention (TSG_HAVE_FLASH_ATTN) runs the product on its kernel where
 // it has one for the shape, and on cuDNN's engine otherwise. The plan is still required,
 // so the graph's choice of this node does not depend on which of the two runs.
+//
+// rowpeak, tokpeak and the three offsets: q, k and v are views of a product an int8
+// GEMM left as int32 sums, as tsg_h3_attn_prep takes them (null peaks: F32).
 bool tsg_cudnn_h3_attention(const float* q, int64_t q_sh, int64_t q_ss, const float* k, int64_t k_sh, int64_t k_ss,
                             const float* v, int64_t v_sh, int64_t v_ss, const float* qb, const float* kb,
                             const float* vb, int64_t bias_hs, const float* qn, const float* kn,
                             const float* cosT, const float* ssinT, int rot, float eps, float vScale, float scale,
-                            int heads, int seq, int head_dim, int batch, float* out)
+                            int heads, int seq, int head_dim, int batch, float* out, const uint32_t* rowpeak,
+                            const uint32_t* tokpeak, int64_t q_off, int64_t k_off, int64_t v_off)
 {
     SdpaState& s = state();
     std::lock_guard<std::mutex> lock(s.mu);
@@ -583,7 +589,8 @@ bool tsg_cudnn_h3_attention(const float* q, int64_t q_sh, int64_t q_ss, const fl
     void* o16 = base + 3 * pad;
     tsg_stage::Clock clock;
     if (!tsg_h3_attn_prep(q, q_sh, q_ss, k, k_sh, k_ss, v, v_sh, v_ss, qb, kb, vb, bias_hs, qn, kn, cosT, ssinT, rot, eps,
-                          1.0f / vScale, heads, seq, (int) S, head_dim, q16, k16, v16))
+                          1.0f / vScale, heads, seq, (int) S, head_dim, q16, k16, v16, rowpeak, tokpeak, q_off, k_off,
+                          v_off))
         return false;
     clock.lap("attention prep");
     bool flash = false;

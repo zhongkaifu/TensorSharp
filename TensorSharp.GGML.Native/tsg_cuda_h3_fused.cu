@@ -24,10 +24,17 @@
 // operation. graph_compute_offload executes the GGML_OP_CUSTOM nodes that stand
 // for these stages (see ggml_ops_minimax_h3.cpp); all launches go to the legacy
 // default stream and the caller synchronizes.
+//
+// The kernels that read a projection's product (the attention prep its q, k and v, the
+// two residuals their mm) also take it as the int32 sums an int8 GEMM left unscaled,
+// given the peaks to scale them by as they load (tsg_cuda_int8_scale.h); null peaks
+// mean F32, as before.
 #if defined(TSG_GGML_USE_CUDA)
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+
+#include "tsg_cuda_int8_scale.h"
 
 #include <cstdint>
 
@@ -72,7 +79,9 @@ __global__ void attn_prep(const float* __restrict__ q, long long q_sh, long long
                           long long bias_hs, const float* __restrict__ qn, const float* __restrict__ kn,
                           const float* __restrict__ cosT, const float* __restrict__ ssinT, int rot,
                           float eps, float vInv, int H, int S, int rope_seq,
-                          __half* __restrict__ q16, __half* __restrict__ k16, __half* __restrict__ v16)
+                          __half* __restrict__ q16, __half* __restrict__ k16, __half* __restrict__ v16,
+                          const uint32_t* __restrict__ rowpeak, const uint32_t* __restrict__ tokpeak,
+                          long long q_off, long long k_off, long long v_off)
 {
     constexpr int J = D / 32;
     __shared__ float smem[4][D];
@@ -84,10 +93,14 @@ __global__ void attn_prep(const float* __restrict__ q, long long q_sh, long long
     const long long outBase = ((long long) h * S + s) * D;
     const int half = rot / 2;
     const long long pos = rope_seq > 0 && rope_seq < S ? s % rope_seq : s;
+    // With peaks, q, k and v are int32 sums; *_off is the product row q, k or v starts at.
+    // The peaks are per token of the call, whichever sequence it belongs to.
+    const float sx = tokpeak != nullptr ? tsg_int8_token_scale(tokpeak[s]) : 0.0f;
 
     for (int which = 0; which < 2; which++)
     {
         const float* src = which == 0 ? q + s * q_ss + h * q_sh : k + s * k_ss + h * k_sh;
+        const long long first = which == 0 ? q_off + h * q_sh : k_off + h * k_sh;
         const float* w = which == 0 ? qn : kn;
         const float* bias = which == 0 ? qb : kb;
         __half* dst = which == 0 ? q16 : k16;
@@ -96,7 +109,7 @@ __global__ void attn_prep(const float* __restrict__ q, long long q_sh, long long
 #pragma unroll
         for (int j = 0; j < J; j++)
         {
-            x[j] = src[lane + 32 * j];
+            x[j] = tsg_int8_product(src, lane + 32 * j, rowpeak, first, sx);
             if (bias != nullptr) x[j] = __fadd_rn(x[j], bias[h * bias_hs + lane + 32 * j]);
             ss += x[j] * x[j];
         }
@@ -126,10 +139,11 @@ __global__ void attn_prep(const float* __restrict__ q, long long q_sh, long long
         __syncwarp();
     }
     const float* vsrc = v + s * v_ss + h * v_sh;
+    const long long vfirst = v_off + h * v_sh;
 #pragma unroll
     for (int j = 0; j < J; j++)
     {
-        float y = vsrc[lane + 32 * j];
+        float y = tsg_int8_product(vsrc, lane + 32 * j, rowpeak, vfirst, sx);
         if (vb != nullptr) y = __fadd_rn(y, vb[h * bias_hs + lane + 32 * j]);
         v16[outBase + lane + 32 * j] = __float2half_rn(vInv == 1.0f ? y : __fmul_rn(y, vInv));
     }
@@ -176,17 +190,19 @@ __global__ void gated_residual(const float* __restrict__ base, long long b_rs,
                                const float* __restrict__ bias,
                                const float* __restrict__ delta, long long d_rs,
                                const float* __restrict__ mods, long long m_rs, int gateIdx,
-                               Segments segs, int hidden, float* __restrict__ out)
+                               Segments segs, int hidden, float* __restrict__ out,
+                               const uint32_t* __restrict__ mmRow, const uint32_t* __restrict__ mmTok)
 {
     const long long t = blockIdx.x;
     const float* b = base + t * b_rs;
     const float* m = mm + t * mm_rs;
+    const float sx = mmTok != nullptr ? tsg_int8_token_scale(mmTok[t]) : 0.0f;
     const float* d = delta != nullptr ? delta + t * d_rs : nullptr;
     const float* g = mods + (long long) (segment_col(segs, t) + gateIdx) * m_rs;
     float* o = out + t * hidden;
     for (int c = threadIdx.x; c < hidden; c += blockDim.x)
     {
-        float u = m[c];
+        float u = tsg_int8_product(m, c, mmRow, 0, sx);
         if (bias != nullptr) u = __fadd_rn(u, bias[c]);
         if (d != nullptr) u = __fadd_rn(d[c], u);
         o[c] = __fadd_rn(b[c], __fmul_rn(u, g[c]));
@@ -197,14 +213,15 @@ __global__ void gated_residual(const float* __restrict__ base, long long b_rs,
 // (each nullable), in the graph's order (add, mul, add).
 __global__ void scaled_residual(const float* __restrict__ base, long long b_rs, const float* __restrict__ mm,
                                 long long mm_rs, const float* __restrict__ bias, const float* __restrict__ scale,
-                                int hidden, long long rows, float* __restrict__ out)
+                                int hidden, long long rows, float* __restrict__ out,
+                                const uint32_t* __restrict__ mmRow, const uint32_t* __restrict__ mmTok)
 {
     const long long n = (long long) hidden * rows;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x)
     {
         const long long t = i / hidden;
         const int c = (int) (i - t * hidden);
-        float u = mm[t * mm_rs + c];
+        float u = tsg_int8_product(mm + t * mm_rs, c, mmRow, 0, mmTok != nullptr ? tsg_int8_token_scale(mmTok[t]) : 0.0f);
         if (bias != nullptr) u = __fadd_rn(u, bias[c]);
         if (scale != nullptr) u = __fmul_rn(u, scale[c]);
         out[i] = __fadd_rn(base[t * b_rs + c], u);
@@ -249,11 +266,14 @@ int tsg_h3_fused_max_segments(void) { return kMaxSegments; }
 // Strides are in floats: *_sh between heads, *_ss between tokens. qn/kn may be null.
 // seq is every token of the call; rope_seq (0 = seq) is the length of each of the
 // independent sequences they make up, which the rotation tables cover.
+// With rowpeak and tokpeak, q, k and v are views of one product still held as int32
+// sums, starting at its rows q_off, k_off and v_off (tsg_cuda_int8_scale.h).
 bool tsg_h3_attn_prep(const float* q, int64_t q_sh, int64_t q_ss, const float* k, int64_t k_sh, int64_t k_ss,
                       const float* v, int64_t v_sh, int64_t v_ss, const float* qb, const float* kb, const float* vb,
                       int64_t bias_hs, const float* qn, const float* kn,
                       const float* cosT, const float* ssinT, int rot, float eps, float vInv,
-                      int heads, int seq, int rope_seq, int head_dim, void* q16, void* k16, void* v16)
+                      int heads, int seq, int rope_seq, int head_dim, void* q16, void* k16, void* v16,
+                      const uint32_t* rowpeak, const uint32_t* tokpeak, int64_t q_off, int64_t k_off, int64_t v_off)
 {
     const long long pairs = (long long) seq * heads;
     const unsigned int blocks = (unsigned int) ((pairs + 3) / 4);
@@ -262,12 +282,14 @@ bool tsg_h3_attn_prep(const float* q, int64_t q_sh, int64_t q_ss, const float* k
     case 64:
         attn_prep<64><<<blocks, 128>>>(q, q_sh, q_ss, k, k_sh, k_ss, v, v_sh, v_ss, qb, kb, vb, bias_hs > 0 ? bias_hs : 64,
                                        qn, kn, cosT, ssinT, rot, eps, vInv,
-                                       heads, seq, rope_seq, (__half*) q16, (__half*) k16, (__half*) v16);
+                                       heads, seq, rope_seq, (__half*) q16, (__half*) k16, (__half*) v16,
+                                       rowpeak, tokpeak, q_off, k_off, v_off);
         break;
     case 128:
         attn_prep<128><<<blocks, 128>>>(q, q_sh, q_ss, k, k_sh, k_ss, v, v_sh, v_ss, qb, kb, vb, bias_hs > 0 ? bias_hs : 128,
                                         qn, kn, cosT, ssinT, rot, eps, vInv,
-                                        heads, seq, rope_seq, (__half*) q16, (__half*) k16, (__half*) v16);
+                                        heads, seq, rope_seq, (__half*) q16, (__half*) k16, (__half*) v16,
+                                        rowpeak, tokpeak, q_off, k_off, v_off);
         break;
     default:
         return false;
@@ -286,20 +308,24 @@ bool tsg_h3_modulate(const float* x, int64_t x_rs, const float* w, const float* 
     return cudaGetLastError() == cudaSuccess;
 }
 
+// mmRow and mmTok (both or neither): mm holds int32 sums (tsg_cuda_int8_scale.h).
 bool tsg_h3_gated_residual(const float* base, int64_t b_rs, const float* mm, int64_t mm_rs, const float* bias,
                            const float* delta, int64_t d_rs, const float* mods, int64_t m_rs, int gateIdx,
-                           const int32_t* segs, int nseg, int hidden, int64_t rows, float* out)
+                           const int32_t* segs, int nseg, int hidden, int64_t rows, float* out,
+                           const uint32_t* mmRow, const uint32_t* mmTok)
 {
     if (nseg <= 0 || nseg > kMaxSegments) return false;
     gated_residual<<<(unsigned int) rows, 256>>>(base, b_rs, mm, mm_rs, bias, delta, d_rs, mods, m_rs, gateIdx,
-                                                 make_segments(segs, nseg), hidden, out);
+                                                 make_segments(segs, nseg), hidden, out, mmRow, mmTok);
     return cudaGetLastError() == cudaSuccess;
 }
 
 bool tsg_h3_scaled_residual(const float* base, int64_t b_rs, const float* mm, int64_t mm_rs, const float* bias,
-                            const float* scale, int hidden, int64_t rows, float* out)
+                            const float* scale, int hidden, int64_t rows, float* out,
+                            const uint32_t* mmRow, const uint32_t* mmTok)
 {
-    scaled_residual<<<grid_for((long long) hidden * rows), 256>>>(base, b_rs, mm, mm_rs, bias, scale, hidden, rows, out);
+    scaled_residual<<<grid_for((long long) hidden * rows), 256>>>(base, b_rs, mm, mm_rs, bias, scale, hidden, rows, out,
+                                                                  mmRow, mmTok);
     return cudaGetLastError() == cudaSuccess;
 }
 
