@@ -556,6 +556,19 @@ over a pooled slot replay for its next request. A warmed slot waits in the pool 
 M5 Pro (Qwen3.6-35B-A3B UD-Q4_K_M, `ggml_metal`, 55-token prompt) these took the first request's one-row
 step from 23.9 to 15.9 ms.
 
+**Decode steps without a trace.** A replayed step was still traced to find its cached graph: about 3,400
+nodes and 0.28 ms per token on Qwen3.6-35B-A3B, 2% of a decode step. `TryAdvanceDecode` skips the trace
+when a decode step repeats the previous one a position on. That needs the same slots (caches, states and
+capacity unchanged), every sequence one row further, the same request shape and attention floor, and no
+graph dropped since. The kept step's inputs are tagged by how they follow positions (`InputKind`:
+positions, write rows, decode masks, the embedded rows, constants). They are rewritten in place, and a
+decode mask must stay inside its window bucket. A step with any other input (Flash Next's PLE rows), or a
+family whose emission has side effects, traces as before; families opt in with `DecodeStepsAdvance`.
+`AdvancedDecodeStepsMatchTracedOnes` checks that every logit equals the traced step's, across a bucket
+edge, for one sequence and for two. With it, decode on the M5 Pro (`ggml_metal`, same text) is at parity:
+Qwen3.6-35B-A3B 66.5/67.6/67.2 vs legacy 67.0/67.8/67.7 tok/s, and Qwen3.5-0.8B 218.3/218.1/218.5
+vs 216.8/212.6/218.1.
+
 The runtime's verify takes exactly the longest draft plus its anchor (`BatchedSpecExactWindow`): graphs
 replay per width, and a padded row costs a row. When nothing is drafted, the step is one decode row. A
 4-row window for such a step cost 100 ms on Qwen3.8-Flash-Next, the one-row decode 40.

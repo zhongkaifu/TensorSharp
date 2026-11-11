@@ -33,6 +33,10 @@ namespace TensorSharp.Models
         /// Elsewhere the new state is copied.</summary>
         private bool InPlaceRecurrentState => GraphExecutor?.Capabilities.InPlaceStateAlias == true;
 
+        /// <summary>The recurrence binds its states as leaves and adds no inputs; attention and the experts (a host
+        /// seam's parameters are its layer) follow positions through the step's standard inputs only.</summary>
+        protected override bool DecodeStepsAdvance => true;
+
         protected override void EmitQueryKey(GraphStep step, int layer, ref int q, ref int k)
         {
             q = step.Rope(step.RmsNorm(q, LayerName(layer, "attn_q_norm.weight")), _rotary);

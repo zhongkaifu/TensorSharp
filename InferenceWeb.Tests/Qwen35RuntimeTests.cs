@@ -424,6 +424,69 @@ public sealed class Qwen35RuntimeTests : IDisposable
             tieTolerance: RoundsActivations(TestGates.PinnedGgmlBackend) ? 1e-2 : 0);
     }
 
+    /// <summary>A decode step that repeats the last one a position on runs again without a trace: every logit is the
+    /// traced step's, for one request and for two in one step, across a decode window's bucket edge. (An executor
+    /// whose plans are not replayed, the managed CPU, traces every step anyway.)</summary>
+    [Theory]
+    [InlineData("dense")]
+    [InlineData("moe")]
+    public void AdvancedDecodeStepsMatchTracedOnes(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        BackendType backend = TestGates.PinnedGgmlBackend;
+        string path = Fixture(variant);
+
+        List<float[]> Run(bool advance, out int advances)
+        {
+            using var model = Create(path, backend: backend);
+            model.DecodeAdvanceDisabled = !advance;
+            var unified = (IUnifiedBatchModel)model;
+            var trace = new List<float[]>();
+            string[] ids = { "a", "b" };
+            int[][] prompts = { Enumerable.Range(0, 20).Select(i => 40 + i % 7).ToArray(), Enumerable.Range(0, 9).Select(i => 50 + i).ToArray() };
+            var next = new int[2];
+            var lengths = new int[2];
+            for (int s = 0; s < 2; s++)
+            {
+                unified.EnsureSequenceSlot(ids[s], 320);
+                var logits = new float[1][];
+                Assert.True(unified.TryForwardUnified(new[] { ids[s] }, new[] { prompts[s] }, new[] { 0 }, logits));
+                next[s] = ArgMax(logits[0]);
+                lengths[s] = prompts[s].Length;
+            }
+            // "a" alone past the 64-row bucket edge, then both together, then "b" alone past the 256-row one.
+            void Decode(string[] which, int steps)
+            {
+                for (int t = 0; t < steps; t++)
+                {
+                    int[] seqs = which.Select(id => Array.IndexOf(ids, id)).ToArray();
+                    var logits = new float[seqs.Length][];
+                    Assert.True(unified.TryForwardUnified(which, seqs.Select(s => new[] { next[s] }).ToArray(),
+                        seqs.Select(s => lengths[s]).ToArray(), logits));
+                    for (int i = 0; i < seqs.Length; i++)
+                    {
+                        trace.Add((float[])logits[i].Clone());
+                        next[seqs[i]] = ArgMax(logits[i]);
+                        lengths[seqs[i]]++;
+                    }
+                }
+            }
+            Decode(new[] { "a" }, 50);
+            Decode(new[] { "a", "b" }, 30);
+            Decode(new[] { "b" }, 220);
+            advances = model.DecodeAdvances;
+            return trace;
+        }
+
+        List<float[]> traced = Run(advance: false, out int none);
+        List<float[]> advanced = Run(advance: true, out int advances);
+        Assert.Equal(0, none);
+        Assert.True(advances > 200, $"{advances} decode steps advanced");
+        Assert.Equal(traced.Count, advanced.Count);
+        for (int i = 0; i < traced.Count; i++)
+            Assert.True(traced[i].AsSpan().SequenceEqual(advanced[i]), $"row {i}: advanced logits differ (relL2 {RelL2(advanced[i], traced[i]):E2})");
+    }
+
     /// <summary>The engine's unified step speculates: n-gram and MTP drafts of one request or of several at once,
     /// each over its own drafter state and verified together on their slots, give the plain greedy streams.</summary>
     [Theory]
