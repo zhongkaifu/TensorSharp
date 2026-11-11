@@ -29,8 +29,8 @@ namespace TensorSharp.Models
     /// normed, the query from the stream), <c>gated_c = value * sigmoid(sign(s) sqrt(max(|s|, 1e-6)))</c>, and
     /// <c>stream += gated + silu(conv(norm(gated)))</c> with a causal depthwise conv dilated by the n-gram size. The
     /// n-gram history and the conv history are the sequence's state.</item>
-    /// <item><b>QSA</b> layers attend densely, which is exact below <c>indexer_top_k * compress_ratio</c> cached
-    /// tokens; longer sequences are refused.</item>
+    /// <item><b>QSA</b> layers attend densely, which is exact up to <c>indexer_top_k + compress_ratio - 1</c> cached
+    /// tokens (the selection keeps every cell up to there); longer sequences are refused.</item>
     /// </list>
     /// Speculation (the MTP head, DFlash2) and expert tiers are not ported yet: <see cref="Qwen4ExpModel"/> serves
     /// them.
@@ -126,10 +126,13 @@ namespace TensorSharp.Models
                 CompressRatios = new int[layers];
                 if (gguf.GetInt32Array($"{a}.attention.compress_ratios") is { } ratios)
                     for (int l = 0; l < layers && l < ratios.Length; l++) CompressRatios[l] = ratios[l];
+                // indexer.top_k counts cells: a QSA layer attends the top top_k / ratio complete blocks of ratio cells
+                // and the incomplete tail (llama.cpp src/models/qwen4exp.cpp: n_sel = ratio * (top_k / ratio) + ratio - 1),
+                // so it attends everything, densely, up to that many cells (Flash Next: 2,051).
                 long topK = gguf.GetUint32($"{a}.attention.indexer.top_k", 0);
                 QsaBudget = long.MaxValue;
                 for (int l = 0; l < layers; l++)
-                    if (CompressRatios[l] > 0) QsaBudget = Math.Min(QsaBudget, topK * CompressRatios[l]);
+                    if (CompressRatios[l] > 0) QsaBudget = Math.Min(QsaBudget, topK / CompressRatios[l] * CompressRatios[l] + CompressRatios[l] - 1);
             }
 
             /// <summary>Rows of the PLE layers' conv history: (kernel - 1) taps, each n-gram positions apart.</summary>
