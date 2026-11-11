@@ -557,8 +557,10 @@ namespace TensorSharp.Models.MiniMaxH3
             RequireFiniteOutput(latent, "video VAE input");
 
             var vaeRunClock = Stopwatch.StartNew();
-            float[] pixels = _vae.Decode(
-                latent, shape.LatentFrames, shape.LatentHeight, shape.LatentWidth,
+            // Straight to RGB frames: the decoder resolves the warm-up frames and chunk
+            // overlaps, checks the values are finite and converts each frame in one pass.
+            RgbImage[] frames = _vae.DecodeFrames(
+                latent, shape.LatentFrames, shape.LatentHeight, shape.LatentWidth, shape.Frames,
                 (tile, tiles) => Report(p, "vae-decode", steps, steps, total, $"tile {tile}/{tiles}", "vae-decode",
                     p.OnProgress == null ? null
                         : new Dictionary<string, object> { [TelemetryAttributes.VideoTiles] = tiles }));
@@ -568,12 +570,6 @@ namespace TensorSharp.Models.MiniMaxH3
                                   + $"decode {vaeRunClock.Elapsed.TotalSeconds:F1}s "
                                   + $"(native tiles {_vae?.TakeDecodeNativeSeconds() ?? 0:F1}s)");
 
-            // The decoder now hands back exactly the clip's frames, warm-up and
-            // chunk overlaps already resolved.
-            int decodedFrames = MiniMaxH3VideoVae.DecodedFrameCount(shape.LatentFrames);
-            RequireFiniteOutput(pixels, "video VAE output");
-            MiniMaxH3VideoVae.ToRgb(pixels, decodedFrames, shape.Height, shape.Width);
-            RgbImage[] frames = TakeFrames(pixels, decodedFrames, shape);
 
             // ---- decode the joint audio track ----
             // The final sampler carrier has a videoShift/audioShift factor.
@@ -1412,31 +1408,6 @@ namespace TensorSharp.Models.MiniMaxH3
             int w = (int)Math.Round(Math.Sqrt(PreviewArea * aspect));
             int h = (int)Math.Round(Math.Sqrt(PreviewArea / aspect));
             return (Math.Max(w, 32), Math.Max(h, 32));
-        }
-
-        /// <summary>Slice the decoded clip into frames.
-        ///
-        /// <para>The temporal chunking in the VAE already dropped the decoder's warm-up
-        /// frames and cross-faded the chunk seams, so this is a straight take of the
-        /// requested count — the frame arithmetic lives in one place now instead of
-        /// being split between a decode heuristic here and the chunk loop there.</para></summary>
-        private static RgbImage[] TakeFrames(float[] pixels, int decodedFrames, MiniMaxH3Shape shape)
-        {
-            int count = Math.Min(shape.Frames, decodedFrames);
-            var frames = new RgbImage[count];
-            long plane = (long)decodedFrames * shape.Height * shape.Width;
-            int hw = shape.Height * shape.Width;
-            for (int f = 0; f < count; f++)
-            {
-                // The decoder is channel-planar over the whole clip; slice one frame
-                // out of each channel plane into the CHW layout RgbImage expects.
-                var chw = new float[3 * hw];
-                long frameBase = (long)f * hw;
-                for (int c = 0; c < 3; c++)
-                    Array.Copy(pixels, c * plane + frameBase, chw, c * hw, hw);
-                frames[f] = RgbImage.FromPlanarChw(shape.Width, shape.Height, chw);
-            }
-            return frames;
         }
 
         /// <summary>Report progress. <paramref name="stage"/> names a part of the phase for

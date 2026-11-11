@@ -430,6 +430,12 @@ extern "C" bool tsg_h3_attn_prep(const float* q, int64_t q_sh, int64_t q_ss, con
                                  const float* cosT, const float* ssinT, int rot, float eps, float vInv,
                                  int heads, int seq, int head_dim, void* q16, void* k16, void* v16);
 extern "C" bool tsg_h3_widen_scaled(const void* src16, float* dst, int64_t n, float scale);
+#if defined(TSG_HAVE_FLASH_ATTN)
+// The same product on FlashAttention-2 (tsg_cuda_flash_attn.cu).
+extern "C" bool tsg_flash_attn_h3(const void* q, const void* k, const void* v, void* o, int64_t heads, int64_t seq,
+                                  int64_t head_dim, float scale);
+extern "C" void tsg_flash_attn_release(void);
+#endif
 
 extern "C" {
 
@@ -512,6 +518,10 @@ bool tsg_cudnn_sdpa_f32_strided(const float* q, int64_t q_stride_s, int64_t q_st
 // the F16 narrowing in one pass (tsg_h3_attn_prep), cuDNN SDPA, and the result
 // widened to F32 [D*H, S] times the power-of-two V scale. q/k/v are F32 [D, H, S]
 // views with head and token strides in floats. Synchronizes.
+//
+// A build with FlashAttention (TSG_HAVE_FLASH_ATTN) runs the product on its kernel where
+// it has one for the shape, and on cuDNN's engine otherwise. The plan is still required,
+// so the graph's choice of this node does not depend on which of the two runs.
 bool tsg_cudnn_h3_attention(const float* q, int64_t q_sh, int64_t q_ss, const float* k, int64_t k_sh, int64_t k_ss,
                             const float* v, int64_t v_sh, int64_t v_ss, const float* qb, const float* kb,
                             const float* vb, int64_t bias_hs, const float* qn, const float* kn,
@@ -537,8 +547,12 @@ bool tsg_cudnn_h3_attention(const float* q, int64_t q_sh, int64_t q_ss, const fl
                           1.0f / vScale, heads, seq, head_dim, q16, k16, v16))
         return false;
     clock.lap("attention prep");
-    if (!execute_plan(s, *p, q16, k16, v16, o16, scale)) return false;
-    clock.lap("attention sdpa");
+    bool flash = false;
+#if defined(TSG_HAVE_FLASH_ATTN)
+    flash = tsg_flash_attn_h3(q16, k16, v16, o16, heads, S, D, scale);
+#endif
+    if (!flash && !execute_plan(s, *p, q16, k16, v16, o16, scale)) return false;
+    clock.lap(flash ? "attention flash" : "attention sdpa");
     if (!tsg_h3_widen_scaled(o16, out, n, vScale)) return false;
     const bool ok = cudaStreamSynchronize(nullptr) == cudaSuccess;
     clock.lap("attention widen");
@@ -558,6 +572,9 @@ void tsg_cudnn_sdpa_release(void)
     s.handle = nullptr;
     s.probed = false;
     s.usable = false;
+#if defined(TSG_HAVE_FLASH_ATTN)
+    tsg_flash_attn_release();
+#endif
 }
 
 } // extern "C"

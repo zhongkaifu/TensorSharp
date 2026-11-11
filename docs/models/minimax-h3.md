@@ -436,6 +436,13 @@ exact int32 sum, and one pass scales the result back to F32. Nothing stays resid
 weight is rounded per call, as the BF16 route expands it per call. A shape cuBLASLt has no
 int8 kernel for runs on BF16.
 
+`TS_H3_INT8_MATMUL=vae` (or `all`, with the DiT) does the same for the F16 projections of the
+video VAE decoder, keeping the int8 rows of each weight on the device between tiles. On an
+A100 80 GB the 196 tiles of a 1344x768, 124-frame clip took 13.7 s instead of 15.5 s, and the
+clip was 41 to 45 dB PSNR from the F16 decode. The gain is small because each product is
+still rounded from and scaled back to F32 around the multiply: the int8 multiplies of a tile
+take 24 ms against 40 ms in F16, the nodes 48.5 ms against 56 ms.
+
 Measured on an A100 80 GB (Linux, sm_80 build) with a 1344x768, 124-frame FL2VA clip and
 the eight-step Turbo plug-in (39,844 tokens), warm server, times per DiT block from
 `TS_H3_STAGE_PROFILE`:
@@ -453,6 +460,35 @@ between runs. The attention (cuDNN SDPA, 273 ms a block at this length) is uncha
 and is now two thirds of a step. ComfyUI's W6A8 H3 makes the same clip in 159-167 s on
 that GPU; its int8 projections take 29.1, 22.6 and 8.9 ms for fc1, qkv and out, and its
 attention 254 ms.
+
+**FlashAttention-2 for the DiT attention (build option `TENSORSHARP_FLASH_ATTENTION`).**
+PyTorch runs that attention on [FlashAttention-2](https://github.com/Dao-AILab/flash-attention)'s
+forward kernel, which is faster than cuDNN's SDPA engine at this shape. A native build
+configured with `-DTENSORSHARP_FLASH_ATTENTION=ON` fetches the pinned flash-attention and
+CUTLASS sources, compiles the one kernel this model uses (head size 128, F16, no mask;
+about a minute of nvcc) and runs the fused attention node's product on it, between the
+same prep and widen passes and on the same F16 operands. It needs the cuDNN headers (the
+node is the cuDNN one, and cuDNN still runs shapes the kernel does not cover, such as
+the video VAE's 64-wide heads) and a GPU of sm_80 or newer. `TS_H3_FLASH_ATTENTION=0`
+puts the attention back on cuDNN.
+
+On the same A100 and clip (39,875 tokens, 56 heads x 128), with `TS_H3_INT8_MATMUL=1`:
+
+| Attention | Per block | Denoising step | Warm request |
+|---|---:|---:|---:|
+| cuDNN SDPA | 278-281 ms | 20.5-20.7 s | 188.0, 188.1 s |
+| FlashAttention-2 | 251 ms | 19.1-19.2 s | 177.9, 178.5 s |
+
+Alone on that GPU the kernel takes 245 ms, and its output is 73 dB above its difference
+from a double-precision reference (36 sampled rows of 128), which is F16 rounding. The
+two engines round differently, and eight denoising steps amplify that: the clips are
+31.6 and 24.8 dB PSNR from the cuDNN ones (the same seeds), the size of change the int8
+projections make. The option is off by default because it downloads sources at
+configure time; it has been built with CUDA 13 on Linux only.
+
+That A100 runs at its 300 W power cap during a step, and the cap sets the multiply
+times: cuBLASLt's int8 fc1 takes 29.5 ms on constant operands at 1350 MHz and 35.6 ms on
+random ones at 1125 MHz, so a kernel timed alone on easy data understates its cost here.
 
 ### Long-sequence attention on Metal
 
@@ -1002,12 +1038,13 @@ but a track that is spectrally plausible and merely wrong.
 | `TS_H3_UPLOAD_WORKERS` | Native bulk-prefault workers (1–8, default 8); distinct from the pipeline's denoiser file-read streams |
 | `TS_H3_UPLOAD_PROFILE=1` | Native weight-upload and graph-compute diagnostics; record separately from trace-free performance runs |
 | `TS_H3_CUDNN_ATTENTION=0` | `ggml_cuda`: keeps every attention on ggml's flash-attention kernel instead of cuDNN's fused SDPA ([below](#long-clips-on-ggml_cuda)); `TS_H3_CUDNN_ATTENTION_VERBOSE=1` prints the cuDNN plans and declines |
+| `TS_H3_FLASH_ATTENTION=0` | `ggml_cuda`, builds with `-DTENSORSHARP_FLASH_ATTENTION=ON` only: keeps the DiT attention on cuDNN's SDPA instead of FlashAttention-2 |
 | `TS_H3_CUBLAS_MATMUL=0` | `ggml_cuda`: keeps the DiT's wide Q4_K projections on MMQ instead of cuBLAS BF16; `TS_H3_CUBLAS_MIN_ROWS` (default 1024) is the token threshold |
 | `TS_H3_FUSED=0` | `ggml_cuda`: builds the unfused DiT and VAE graphs (no fused attention prep, modulation, gated residual or merged LoRA) |
 | `TS_H3_CUDA_F32_PRODUCTS=1` | `ggml_cuda`: runs the DiT forward's weight products (F32/F16/BF16 weights and LoRA factors; quantized weights and the attention's own products excluded) on TensorSharp's F32 GEMM over a pedantic cuBLAS handle instead of ggml-cuda's TF32 cuBLAS. Off by default (its cost on a real checkpoint is not measured); on the all-F32 LoRA parity fixture the native-vs-direct-CPU floor went from 6.08e-4 to 8.07e-6. A product that cannot take the path is named once on stderr and runs on ggml |
 | `TS_H3_DIRECT_READ=0` | `ggml_cuda` on Windows: uploads weights from the mapping instead of reading the file unbuffered; `TS_H3_DIRECT_READ_THREADS` (1–32, default 8) is the reader count |
 | `TS_H3_FP8_MATMUL` | `ggml_cuda`: opt-in FP8 (E4M3) projections through cuBLASLt; `1` for the DiT, `vae` for the video VAE, `all` for both. Changes the output |
-| `TS_H3_INT8_MATMUL=1` | `ggml_cuda`: opt-in int8 projections for the DiT through cuBLASLt, a scale per weight row and per token; also applies to Qwen-Image-2.1's Q4_K projections on cuBLAS. Changes the output |
+| `TS_H3_INT8_MATMUL` | `ggml_cuda`: opt-in int8 projections through cuBLASLt, a scale per weight row and per token; `1` for the DiT, `vae` for the video VAE, `all` for both; `1` and `all` also applies to Qwen-Image-2.1's Q4_K projections on cuBLAS. Changes the output |
 | `TS_H3_STAGE_PROFILE=1` | Synchronizing per-stage timings inside the fused CUDA attention and GEMM nodes, printed when the scratch is released; exclude from formal timings |
 
 ## Reproducing validation
