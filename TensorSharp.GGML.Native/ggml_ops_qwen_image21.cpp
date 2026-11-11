@@ -24,6 +24,16 @@
 #include "ggml_ops_qwen_image21.h"
 
 using namespace tsg;
+
+#if defined(TSG_GGML_USE_CUDA)
+// tsg_cuda_q4k_gemm.cu: a Q4_K weight times F32 rows on one cuBLAS BF16 GEMM.
+extern "C" bool tsg_cuda_q4k_gemm_bf16(const void* w_q4k, int64_t K, int64_t N, const float* x,
+                                       int64_t x_row_stride, int64_t T, float* dst, int64_t dst_ld);
+extern "C" bool tsg_cuda_q6k_gemm_bf16(const void* w_q6k, int64_t K, int64_t N, const float* x,
+                                       int64_t x_row_stride, int64_t T, float* dst, int64_t dst_ld);
+extern "C" bool tsg_cuda_q4k_gemm_supported(void);
+#endif
+
 namespace {
 struct Upload { ggml_tensor* tensor; const void* data; size_t bytes; };
 struct Resident { const void* key; size_t bytes; ggml_backend_buffer_t buffer; };
@@ -725,9 +735,87 @@ void upload_inputs(ForwardGraph& entry, const TSGQi21Desc& d) {
             ggml_backend_tensor_set(input.tensor, field_data(d, input.field, input.offset), 0, ggml_nbytes(input.tensor));
 }
 
+// The wide Q4_K and Q6_K projections on cuBLAS BF16 (ggml_cuda, sm_80 or newer), as
+// MiniMax-H3's DiT runs its own (see ggml_ops_minimax_h3.cpp): ggml-cuda's MMQ rounds the
+// activations to 8-bit q8_1 blocks and multiplies on int8 tensor cores at a fraction of a
+// BF16 GEMM's rate, and re-expanding a weight to BF16 per call costs about a hundredth of
+// its product. The graph and its allocation stay ggml's; graph_compute_offload runs these
+// MUL_MAT nodes into their own buffers. TS_QWEN21_CUBLAS_MATMUL=0 keeps them on MMQ;
+// TS_QWEN21_CUBLAS_MIN_ROWS (default 256) is the token threshold. The Q4_K ones follow
+// TS_H3_INT8_MATMUL and TS_H3_FP8_MATMUL too (tsg_cuda_q4k_gemm.cu).
+//
+// The unmasked attentions (the image segments) run on cuDNN's fused SDPA where ggml_cuda
+// has cuDNN, again as H3's: several times the rate of ggml-cuda's flash-attention kernel
+// at this sequence length, with the F32 accumulation the node asks for.
+// TS_QWEN21_CUDNN_ATTENTION=0 keeps them on ggml.
+#if defined(TSG_GGML_USE_CUDA)
+bool cublas_matmul_enabled() {
+    static const bool on = option_enabled("TS_QWEN21_CUBLAS_MATMUL", true) &&
+        g_backend_type == BACKEND_TYPE_CUDA && tsg_cuda_q4k_gemm_supported();
+    return on;
+}
+
+int64_t cublas_min_rows() {
+    static const int64_t rows = [] {
+        const char* e = std::getenv("TS_QWEN21_CUBLAS_MIN_ROWS");
+        const long long v = e != nullptr ? std::atoll(e) : 0;
+        return static_cast<int64_t>(v > 0 ? v : 256);
+    }();
+    return rows;
+}
+
+bool cudnn_attention_enabled() {
+    static const bool on = option_enabled("TS_QWEN21_CUDNN_ATTENTION", true) && g_backend_type == BACKEND_TYPE_CUDA;
+    return on;
+}
+
+struct Offload { bool matmul, attention; };
+
+bool offload_wants(const ggml_tensor* node, void* ctx) {
+    const auto* which = static_cast<const Offload*>(ctx);
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) return which->attention && cudnn_sdpa_node_wants(node);
+    if (node->op != GGML_OP_MUL_MAT || !which->matmul) return false;
+    const ggml_tensor* w = node->src[0];
+    const ggml_tensor* x = node->src[1];
+    if (w == nullptr || x == nullptr || (w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q6_K)) return false;
+    if (x->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) return false;
+    if (w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1) return false;
+    if (w->ne[0] % 256 != 0 || x->ne[0] != w->ne[0] || x->ne[1] < cublas_min_rows()) return false;
+    if (!ggml_is_contiguous(w) || !ggml_is_contiguous(node)) return false;
+    if (x->nb[0] != sizeof(float) || x->nb[1] % sizeof(float) != 0) return false;
+    return true;
+}
+
+bool offload_run(ggml_tensor* node, void*) {
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) return cudnn_sdpa_node_run(node);
+    const ggml_tensor* w = node->src[0];
+    const ggml_tensor* x = node->src[1];
+    const auto gemm = w->type == GGML_TYPE_Q6_K ? tsg_cuda_q6k_gemm_bf16 : tsg_cuda_q4k_gemm_bf16;
+    return gemm(w->data, w->ne[0], w->ne[1], static_cast<const float*>(x->data),
+                static_cast<int64_t>(x->nb[1] / sizeof(float)), x->ne[1],
+                static_cast<float*>(node->data), node->ne[0]);
+}
+#endif
+
+ggml_status compute_forward(ggml_cgraph* graph) {
+    static const char* const tag = "qwen-image21 forward";
+#if defined(TSG_GGML_USE_CUDA)
+    Offload which { cublas_matmul_enabled(), cudnn_attention_enabled() };
+    if (which.matmul || which.attention) {
+        NodeOffload offload;
+        offload.wants = offload_wants;
+        offload.run = offload_run;
+        offload.ctx = &which;
+        return graph_compute_offload(g_backend, graph, tag, offload);
+    }
+#endif
+    // A plain compute unless TS_GGML_NODE_PROFILE is set.
+    return graph_compute_profiled(g_backend, graph, tag);
+}
+
 void run_graph(ForwardGraph& entry, const TSGQi21Desc& d) {
     upload_inputs(entry, d);
-    if (compute_graph(g_backend, entry.graph) != GGML_STATUS_SUCCESS)
+    if (compute_forward(entry.graph) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("QwenImage21: graph compute failed");
     ggml_backend_tensor_get(entry.output, d.output, 0, ggml_nbytes(entry.output));
     ++entry.runs;
