@@ -27,6 +27,10 @@ namespace TensorSharp.Models
         private const uint CheckpointMagic = 0x4C535354; // "TSSL"
         private const int CheckpointVersion = 2;   // 2: the rotary delta
 
+        /// <summary>The format a checkpoint file is written in: 3 where the model keeps extra key caches (their rows
+        /// follow the recurrent states), so a file without them is not read as one with them.</summary>
+        private int CheckpointFormat => _extraCacheLayer.Length > 0 ? 3 : CheckpointVersion;
+
         public bool SupportsPrefixCheckpoints => SupportsPerSequenceFusedForward && RecurrentStatesCopy;
 
         public bool SupportsRetainedCacheSerialization => SupportsPrefixCheckpoints;
@@ -150,20 +154,21 @@ namespace TensorSharp.Models
                     if (layer != null && (layer[0]?.GraphTensors == null))
                         return false;
 
-            int rows = source.Length, d = _keyDim, dv = _valueDim, kvHeads = _localKvHeads;
-            long kRow = RowBytes(kvType, d), vRow = RowBytes(kvType, dv);
+            int rows = source.Length;
             for (int stage = 0; stage < _mesh.Stages; stage++)
             {
                 var g = new GraphProgramBuilder(record: true);
                 int copies = 0;
+                // Every cache entry (the layers' K and V, the extra key caches) by its own heads and width.
+                for (int e = 0; e < source.K.Length; e++)
+                {
+                    if (CacheStage(e) != stage) continue;
+                    if (source.K[e] != null) CopyRows(source.K[e][0], target.K[e][0]);
+                    if (source.V[e] != null) CopyRows(source.V[e][0], target.V[e][0]);
+                }
                 for (int l = 0; l < TotalLayers; l++)
                 {
                     if (!OwnsLayer(l) || StageOfLayer(l) != stage) continue;
-                    if (source.K?[l] != null)
-                    {
-                        CopyRows(source.K[l][0], target.K[l][0], d, kRow);
-                        CopyRows(source.V[l][0], target.V[l][0], dv, vRow);
-                    }
                     if (_anyRecurrent && l < source.Recurrent.Length && source.Recurrent[l] != null)
                     {
                         Tensor[] from = source.Recurrent[l][0].GraphTensors, to = target.Recurrent[l][0].GraphTensors;
@@ -188,12 +193,14 @@ namespace TensorSharp.Models
                     EnterStage(0);
                 }
 
-                void CopyRows(Tensor from, Tensor to, int dim, long rowBytes)
+                void CopyRows(Tensor from, Tensor to)
                 {
-                    int src = g.Op(GraphOp.View, stackalloc[] { Leaf(from, kvType, dim, source.Capacity, kvHeads) },
-                        stackalloc long[] { 3, dim, rows, kvHeads, 1, rowBytes, rowBytes * source.Capacity, 0, 0 });
-                    int dst = g.Op(GraphOp.View, stackalloc[] { Leaf(to, kvType, dim, target.Capacity, kvHeads) },
-                        stackalloc long[] { 3, dim, rows, kvHeads, 1, rowBytes, rowBytes * target.Capacity, 0, 0 });
+                    int heads = (int)from.Sizes[0], dim = (int)from.Sizes[2];
+                    long rowBytes = RowBytes(kvType, dim);
+                    int src = g.Op(GraphOp.View, stackalloc[] { Leaf(from, kvType, dim, source.Capacity, heads) },
+                        stackalloc long[] { 3, dim, rows, heads, 1, rowBytes, rowBytes * source.Capacity, 0, 0 });
+                    int dst = g.Op(GraphOp.View, stackalloc[] { Leaf(to, kvType, dim, target.Capacity, heads) },
+                        stackalloc long[] { 3, dim, rows, heads, 1, rowBytes, rowBytes * target.Capacity, 0, 0 });
                     g.Effect(g.Op(GraphOp.Cpy, src, dst));
                     copies++;
                 }
@@ -263,7 +270,7 @@ namespace TensorSharp.Models
             SyncToHost(slot);
             using var writer = new BinaryWriter(destination, Encoding.UTF8, leaveOpen: true);
             writer.Write(CheckpointMagic);
-            writer.Write(CheckpointVersion);
+            writer.Write(CheckpointFormat);
             writer.Write(CheckpointNamespace);
             writer.Write(slot.Length);
             writer.Write(slot.RopeDelta);
@@ -278,7 +285,36 @@ namespace TensorSharp.Models
                 writer.Write(bytes.Length);
                 writer.Write(bytes);
             }
+            foreach (Tensor t in ExtraCacheTensors(slot))
+            {
+                byte[] bytes = CacheRowBytes(t, slot.Length);
+                writer.Write(bytes.Length);
+                writer.Write(bytes);
+            }
             return true;
+        }
+
+        private IEnumerable<Tensor> ExtraCacheTensors(Slot slot)
+        {
+            for (int e = TotalLayers; e < slot.K.Length; e++)
+                if (slot.K[e] != null)
+                    foreach (Tensor t in slot.K[e]) yield return t;
+        }
+
+        /// <summary>Rows [0, <paramref name="rows"/>) of a one-head cache tensor, as stored.</summary>
+        private unsafe byte[] CacheRowBytes(Tensor cache, int rows)
+        {
+            var bytes = new byte[rows * RowBytes(KvGgmlType(_kvCacheDtype.ToDType()), cache.Sizes[2]) * cache.Sizes[0]];
+            fixed (byte* dst = bytes)
+                Buffer.MemoryCopy((void*)TensorComputePrimitives.GetStoragePointer(cache), dst, bytes.Length, bytes.Length);
+            return bytes;
+        }
+
+        private unsafe void WriteCacheRowBytes(Tensor cache, byte[] bytes)
+        {
+            fixed (byte* src = bytes)
+                Buffer.MemoryCopy(src, (void*)TensorComputePrimitives.GetStoragePointer(cache), cache.Storage.ByteLength, bytes.Length);
+            InvalidateTensorDeviceCache(cache);
         }
 
         public bool TryImportRetainedCache(string key, Stream source)
@@ -290,7 +326,7 @@ namespace TensorSharp.Models
             try
             {
                 using var reader = new BinaryReader(source, Encoding.UTF8, leaveOpen: true);
-                if (reader.ReadUInt32() != CheckpointMagic || reader.ReadInt32() != CheckpointVersion) return false;
+                if (reader.ReadUInt32() != CheckpointMagic || reader.ReadInt32() != CheckpointFormat) return false;
                 if (reader.ReadString() != CheckpointNamespace) return false;
                 int length = reader.ReadInt32();
                 int ropeDelta = reader.ReadInt32();
@@ -313,6 +349,12 @@ namespace TensorSharp.Models
                     int bytes = reader.ReadInt32();
                     if (bytes != t.ElementCount() * t.ElementType.Size()) { DisposeSlot(slot); return false; }
                     WriteStateBytes(t, reader.ReadBytes(bytes));
+                }
+                foreach (Tensor t in ExtraCacheTensors(slot))
+                {
+                    int bytes = reader.ReadInt32();
+                    if (bytes != length * RowBytes(KvGgmlType(_kvCacheDtype.ToDType()), t.Sizes[2]) * t.Sizes[0]) { DisposeSlot(slot); return false; }
+                    WriteCacheRowBytes(t, reader.ReadBytes(bytes));
                 }
                 if (slot.Recurrent != null)
                     foreach (RecurrentState[] layer in slot.Recurrent)

@@ -120,7 +120,7 @@ namespace TensorSharp.Models
                 ?? throw new NotSupportedException($"expert {index} has no member weight");
         }
 
-        private static int KvGgmlType(DType dt) => dt switch
+        private protected static int KvGgmlType(DType dt) => dt switch
         {
             DType.Float32 => GraphFormat.F32,
             DType.Float16 => GraphFormat.F16,
@@ -186,6 +186,11 @@ namespace TensorSharp.Models
 
         /// <summary>Trace every step (tests compare against it).</summary>
         internal bool DecodeAdvanceDisabled { get; set; }
+
+        /// <summary>What else, beyond the rows, counts and outputs, decides what a step emits: a family whose graph
+        /// depends on where its sequences are (QSA selects past its budget) names it, so a streamed step never frees
+        /// nodes by the last readers of a template emitted the other way.</summary>
+        protected virtual string EmissionVariant(int[] counts, int[] starts) => null;
 
         /// <summary>Decode steps run as the previous one advanced, without a trace.</summary>
         internal int DecodeAdvances { get; private set; }
@@ -480,7 +485,7 @@ namespace TensorSharp.Models
                 {
                     // Everything that changes what the step emits: a stream frees each node after the template's
                     // last reader, so a step that emits differently (other outputs, another stage) must not share it.
-                    kind = $"{rows}|{slots.Length}|{snapshots}|{attentionFloor > 0}|{emit.Method.MetadataToken}|{string.Join(",", counts)}|{shape}";
+                    kind = $"{rows}|{slots.Length}|{snapshots}|{attentionFloor > 0}|{emit.Method.MetadataToken}|{string.Join(",", counts)}|{shape}|{EmissionVariant(counts, starts)}";
                     if (_streamedKinds.Contains(kind))
                     {
                         IGraphStream stream = streaming.OpenStream(_streamTemplates.GetValueOrDefault(kind));
@@ -748,8 +753,20 @@ namespace TensorSharp.Models
 
         // ---------------------------------------------------------------- branches
 
+        /// <summary>What a family adds where an attention layer reads its input <paramref name="x"/> [hidden, rows], before
+        /// the attention (Qwen 3.8 writes its QSA indexer keys); default nothing.</summary>
+        protected virtual void EmitAttentionInput(GraphStep step, int layer, int x) { }
+
+        /// <summary>The graph type of the K/V caches (and extra key caches).</summary>
+        private protected int KvCacheGraphType => KvGgmlType(_kvCacheDtype.ToDType());
+
+        /// <summary>The mask sequence <paramref name="s"/> attends under in <paramref name="layer"/>: <paramref name="mask"/>
+        /// ([<paramref name="keys"/>, its rows], F16, causal) unless the family narrows it (Qwen 3.8's QSA selection).</summary>
+        protected virtual int EmitAttentionMask(GraphStep step, int layer, int x, int s, int mask, int keys) => mask;
+
         private int EmitAttention(GraphStep step, int layer, int x)
         {
+            EmitAttentionInput(step, layer, x);
             int heads = _localHeads, kvHeads = _localKvHeads, d = _keyDim, dv = _valueDim, rows = step.Rows;
             const long f = sizeof(float);
             long qDim = (long)heads * d, kDim = (long)kvHeads * d, vDim = (long)kvHeads * dv;
@@ -817,7 +834,7 @@ namespace TensorSharp.Models
                     int gqa = heads / kvHeads;
                     int kWin = step.Op(GraphOp.KvWindow, stackalloc[] { ck }, stackalloc long[] { d, cap, kvHeads, 0, window, kvType, count, gqa });
                     int vWin = step.Op(GraphOp.KvWindow, stackalloc[] { cv }, stackalloc long[] { dv, cap, kvHeads, 0, window, kvType, count, gqa });
-                    fa = step.FlashAttention(qPerm, kWin, vWin, step.ChunkMask(window, start, count), scale);
+                    fa = step.FlashAttention(qPerm, kWin, vWin, EmitAttentionMask(step, layer, x, s, step.ChunkMask(window, start, count), window), scale);
                 }
                 else
                 {
@@ -838,7 +855,7 @@ namespace TensorSharp.Models
                         kAttn = step.Op(GraphOp.Concat, stackalloc[] { kPrev, kFresh }, stackalloc long[] { 1 });
                         vAttn = step.Op(GraphOp.Concat, stackalloc[] { vPrev, vFresh }, stackalloc long[] { 1 });
                     }
-                    fa = step.FlashAttention(qPerm, kAttn, vAttn, step.CausalMask(start, count), scale);
+                    fa = step.FlashAttention(qPerm, kAttn, vAttn, EmitAttentionMask(step, layer, x, s, step.CausalMask(start, count), start + count), scale);
                 }
                 int part = step.Reshape(fa, heads * dv, count);
                 attn = attn < 0 ? part : step.Op(GraphOp.Concat, stackalloc[] { attn, part }, stackalloc long[] { 1 });
@@ -980,7 +997,7 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Bytes of one row of <paramref name="ne0"/> elements of a ggml type.</summary>
-        private static long RowBytes(int type, long ne0) => type switch
+        private protected static long RowBytes(int type, long ne0) => type switch
         {
             GraphFormat.F32 => ne0 * 4,
             GraphFormat.F16 => ne0 * 2,
@@ -1300,13 +1317,27 @@ namespace TensorSharp.Models
             /// <summary>Every input follows positions in a known way, so the step can be run again one position on.</summary>
             internal bool Advanceable => !_inputMeta.Exists(m => m.Kind == InputKind.Opaque);
 
+            private List<(int Start, int Max)> _advanceLimits;
+
+            /// <summary>The graph a trace builds for a sequence continuing at <paramref name="start"/> stays the same only
+            /// up to <paramref name="maxStart"/> (a family whose graph changes past a position: QSA attends densely only
+            /// within its budget); an advance past it is refused.</summary>
+            internal void LimitAdvance(int start, int maxStart) => (_advanceLimits ??= new()).Add((start, maxStart));
+
             /// <summary>Rewrite this step's inputs for every row one position on, with <paramref name="hidden"/> as its
             /// rows: positions and write rows plus one, decode masks one column wider (each must stay inside its
-            /// window: false, nothing changed, when one would not).</summary>
+            /// window and every limit honored: false, nothing changed, when one would not).</summary>
             internal bool TryAdvance(Tensor hidden)
             {
                 foreach (InputMeta m in _inputMeta)
                     if (m.Kind == InputKind.DecodeMask && m.Start + m.Count + 1 > m.Window) return false;
+                if (_advanceLimits != null)
+                {
+                    foreach ((int start, int max) in _advanceLimits)
+                        if (start + 1 > max) return false;
+                    for (int i = 0; i < _advanceLimits.Count; i++)
+                        _advanceLimits[i] = (_advanceLimits[i].Start + 1, _advanceLimits[i].Max);
+                }
                 for (int i = 0; i < _inputMeta.Count; i++)
                 {
                     InputMeta m = _inputMeta[i];
@@ -1380,6 +1411,26 @@ namespace TensorSharp.Models
             }
 
             public int Reshape(int x, params long[] ne) => Op(GraphOp.Reshape, stackalloc[] { x }, ne);
+
+            /// <summary>An F16 input [ne...] read from <paramref name="values"/> every run (a family's mask).</summary>
+            internal int InputF16(ushort[] values, params long[] ne)
+            {
+                int node = Leaf(GraphLeafRole.Input, GraphFormat.F16, ne, IntPtr.Zero, 0);
+                AddInput(node, Pin(values), values.LongLength * sizeof(ushort));
+                return node;
+            }
+
+            /// <summary>Rotary over x [d, heads, n] at <paramref name="positions"/> (I32 [n]) rather than the step's rows'
+            /// positions (keys pooled at their blocks' first cells).</summary>
+            internal int RopeAt(int x, RotarySpec spec, int positions)
+                => Op(GraphOp.RopeExt, stackalloc[] { x, positions },
+                    stackalloc long[] { spec.Dims, spec.NeoX ? 2 : 0, spec.OriginalContext },
+                    stackalloc[] { spec.FreqBase, spec.FreqScale, spec.ExtFactor, spec.AttnFactor, spec.BetaFast, spec.BetaSlow });
+
+            /// <summary>Positions [count] of sequence <paramref name="s"/>'s rows (a view of the step's).</summary>
+            internal int SequencePositions(int s)
+                => Sequences == 1 ? Positions
+                    : Op(GraphOp.View, stackalloc[] { Positions }, stackalloc long[] { 1, Counts[s], 1, 1, 1, Counts[s] * 4L, 0, 0, First[s] * 4L });
 
             /// <summary>A view of an F32 node; recorded as strided unless its rows are packed.</summary>
             public int View2(int x, long ne0, long ne1, long nb1, long offset)

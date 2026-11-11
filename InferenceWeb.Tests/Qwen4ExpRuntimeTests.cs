@@ -80,6 +80,89 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         AssertClose(expected, actual, 2e-2, backend.ToString());
     }
 
+    // ---- QSA past its dense budget: the block selection
+
+    /// <summary>How a sparse QSA run reaches its sparse rows.</summary>
+    public enum QsaRun
+    {
+        /// <summary>A 40-token prompt in one step, then 12 decode steps.</summary>
+        Whole,
+        /// <summary>The same prompt in two steps (23 tokens, then 17 continuing at 23).</summary>
+        Chunked,
+        /// <summary>A 6-token prompt, then 18 decode steps: the first 5 attend densely, the rest select.</summary>
+        Crossing,
+    }
+
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [InlineData(QsaRun.Whole)]
+    [InlineData(QsaRun.Chunked)]
+    [InlineData(QsaRun.Crossing)]
+    public void SparseQsaOnGgmlCpuMatchesTheManagedSelection(QsaRun run) => SparseQsaMatches(BackendType.GgmlCpu, run);
+
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(QsaRun.Whole)]
+    [InlineData(QsaRun.Chunked)]
+    [InlineData(QsaRun.Crossing)]
+    public void SparseQsaOnGgmlMetalMatchesTheManagedSelection(QsaRun run) => SparseQsaMatches(BackendType.GgmlMetal, run);
+
+    [MlxTheory]
+    [InlineData(QsaRun.Whole)]
+    [InlineData(QsaRun.Chunked)]
+    [InlineData(QsaRun.Crossing)]
+    public void SparseQsaOnMlxMatchesTheManagedSelection(QsaRun run) => SparseQsaMatches(BackendType.Mlx, run);
+
+    /// <summary>
+    /// A top-k of 8 cells keeps QSA dense up to 11 cells; past them a row attends only its top two blocks and its
+    /// incomplete tail. ggml's lightning indexer and top-k mask (the GGML lowering) select what the interpreter's
+    /// host ops do on the managed CPU. Qwen4ExpModel is no reference here: its native selection keeps
+    /// <c>top_k + ratio - 1</c> single cells (llama.cpp before #29751), which takes part of a third block where a
+    /// row's tail is short; the runtime keeps whole blocks plus the tail, as llama.cpp does since. The backends
+    /// agree to under 9e-3 per row; one block more (a top-k of 12) moves rows by 2.1e-2 or more and dense attention
+    /// by 3.4e-2 or more, so the tolerance tells a wrong pick from rounding, and the dense run shows the selection
+    /// engages (and, decoding across the budget, that the rows within it are dense).
+    /// </summary>
+    private void SparseQsaMatches(BackendType backend, QsaRun run)
+    {
+        const double tolerance = 1.5e-2;
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-sparse.gguf"), indexerTopK: 8, qsa: true);
+        string densePath = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-dense.gguf"), indexerTopK: 64, qsa: true);
+        int[] prompt = Enumerable.Range(0, run == QsaRun.Crossing ? 6 : 40).Select(i => 3 + (i * 37) % 240).ToArray();
+        int[] decode = Enumerable.Range(0, run == QsaRun.Crossing ? 18 : 12).Select(i => 5 + (i * 11) % 200).ToArray();
+        float[][] Rows(Func<ModelBase> create)
+        {
+            using ModelBase model = create();
+            model.ResetKVCache();
+            var rows = new List<float[]>();
+            if (run == QsaRun.Chunked)
+            {
+                model.ForwardRefill(prompt[..23]);
+                rows.Add((float[])model.Forward(prompt[23..]).Clone());
+            }
+            else
+            {
+                rows.Add((float[])model.ForwardRefill(prompt).Clone());
+            }
+            foreach (int token in decode)
+                rows.Add((float[])model.Forward(new[] { token }).Clone());
+            return rows.ToArray();
+        }
+        float[][] expected = Rows(() => new Qwen4ExpRuntimeModel(path, BackendType.Cpu));
+        float[][] actual = Rows(() => new Qwen4ExpRuntimeModel(path, backend));
+        AssertClose(expected, actual, tolerance, $"{backend} sparse qsa ({run})");
+        double[] fromDense = RowErrors(expected, Rows(() => new Qwen4ExpRuntimeModel(densePath, BackendType.Cpu)));
+        string detail = string.Join(", ", fromDense.Select(e => e.ToString("E2")));
+        if (run == QsaRun.Crossing)
+        {
+            // Row r ends at position 5 + r: rows 0..5 hold at most 11 cells.
+            Assert.True(fromDense.Take(6).All(e => e < 1e-6), $"rows within the budget are not dense: {detail}");
+            Assert.True(fromDense.Skip(6).Max() > tolerance, $"the selection barely moves the rows past the budget: {detail}");
+        }
+        else
+        {
+            Assert.True(fromDense.All(e => e > tolerance), $"the selection barely moves the rows: {detail}");
+        }
+    }
+
     // ---- speculation: the PLE histories follow a verify's accept count; the MTP head chains the stream
 
     private (string Target, string Mtp) SpecFixtures(bool qsa)
@@ -329,6 +412,12 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
 
     private static void AssertClose(float[][] expected, float[][] actual, double tolerance, string label)
     {
+        double[] errors = RowErrors(expected, actual);
+        Assert.True(errors.All(e => e < tolerance), $"{label} relL2 per row: {string.Join(", ", errors.Select(e => e.ToString("E2")))}");
+    }
+
+    private static double[] RowErrors(float[][] expected, float[][] actual)
+    {
         Assert.Equal(expected.Length, actual.Length);
         var errors = new double[expected.Length];
         for (int i = 0; i < expected.Length; i++)
@@ -342,6 +431,6 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
             }
             errors[i] = Math.Sqrt(num / Math.Max(den, 1e-30));
         }
-        Assert.True(errors.All(e => e < tolerance), $"{label} relL2 per row: {string.Join(", ", errors.Select(e => e.ToString("E2")))}");
+        return errors;
     }
 }

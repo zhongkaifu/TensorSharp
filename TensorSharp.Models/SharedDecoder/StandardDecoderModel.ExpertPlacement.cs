@@ -263,7 +263,7 @@ namespace TensorSharp.Models
             if (_cacheK == null) return 0;
             for (int l = 0; l < _cacheK.Length; l++)
                 for (int r = 0; _cacheK[l] != null && r < _cacheK[l].Length; r++)
-                    bytes += _cacheK[l][r].Storage.ByteLength + _cacheV[l][r].Storage.ByteLength;
+                    bytes += _cacheK[l][r].Storage.ByteLength + (_cacheV[l]?[r]?.Storage.ByteLength ?? 0);   // an extra key cache has no V
             return bytes;
         }
 

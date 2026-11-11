@@ -1,11 +1,11 @@
 # Qwen3.8-Flash-Next (`qwen4exp`) on the shared decoder runtime
 
-Status: steps 1 to 3 of §3 and QSA phase 1 are in (`Qwen4ExpRuntimeModel`, not routed yet). `Qwen4ExpModel` and its engines
+Status: steps 1 to 3 of §3 and QSA (dense and sparse) are in (`Qwen4ExpRuntimeModel`, not routed yet). `Qwen4ExpModel` and its engines
 stay until the runtime matches them.
 
 **Done (2026-11-11).** `Qwen4ExpRuntimeModel` derives from `Qwen35RuntimeModel` and adds only the family's own
 parts: the hyper-connection hooks (§2.1), the sigmoid output gate of the recurrence (§2.2), the PLE layer (§2.4)
-and the QSA budget (§2.3 phase 1). On the synthetic checkpoint (`Qwen4ExpRuntimeTests`) it matches
+and QSA (§2.3). On the synthetic checkpoint (`Qwen4ExpRuntimeTests`) it matches
 `Qwen4ExpModel`:
 
 | backend | one prompt | chunked prompt |
@@ -79,7 +79,7 @@ Speculation on the same checkpoint and machine (200 greedy tokens, each side's d
 route-tail skip off, plain, MTP and DFlash2 text agree until a near-tie (three different spellings of one heading),
 where a verify window's batched Metal kernels round differently from one row's, as `Qwen4ExpModel`'s do.
 
-**Next:** QSA phase 2 above the budget (8192 tokens), and the real model on ggml_cuda.
+**Next:** the real model on ggml_cuda.
 
 Flash Next has 125 B parameters in total and 6 B active. Its routed experts take 46 GB at UD-Q2_K_XL.
 
@@ -153,15 +153,57 @@ The packed in-projection, the snapshots for verify windows and the commit progra
 
 ### 2.3 QSA
 
-Phase 1 runs the attention dense. That is exact while a request's KV length is at most `indexer_top_k · compress_ratio`. Above that budget the runtime refuses with a reason. It never approximates silently.
+A QSA layer attends densely while a sequence holds at most `top_k / ratio · ratio + ratio - 1` cells (2,051 for
+Flash Next: its top 512 blocks of 4 plus an incomplete tail of up to 3). Within that budget the selection keeps every
+cell a row sees, so dense attention is exact.
 
-Phase 2 adds the following:
+Past the budget, the selection follows llama.cpp after #29751 (`build_qsa_sel`):
 
-- **Indexer cache:** a per-slot, per-layer state of compressed indexer keys. It is written when a block of `compress_ratio` cells completes.
-- **Selection:** `MulMat` for the indexer scores, then `TopK` over blocks.
-- **Gather:** a `GetRows` of the selected cells' K/V into a window, then `FlashAttnExt` under the matching mask.
+- **Indexer keys.** Every row's raw key (`indexer.k_proj · x`) goes into an extra key cache of the slot, one head
+  wide, in the K/V cache's type, dense or not. It is an entry of the slot's K array after the layers' caches, so
+  slot growth, copies, checkpoints and their files move it with the rest.
+- **Blocks.** A block is `ratio` consecutive cells. Its pooled key is the mean of its members' raw keys, RMS-normed
+  with `indexer.k_norm` and rotated to its first cell. Blocks span the attention window; those past the cells are
+  padded and invisible, so a decode graph replays within a window bucket.
+- **Scores.** The rows' indexer queries (`indexer.q_proj`, `indexer.q_norm`, rotated at their positions) score every
+  block with `GraphOp.LightningIndexer`: the heads' rectified dot products, summed and scaled by `1/sqrt(d)`. A block
+  that is not complete at or before the row scores `-inf`.
+- **Selection.** `TopK` keeps `min(blocks, top_k / ratio)` blocks; `GraphOp.TopKMask` keeps their cells and the
+  row's incomplete tail under the causal mask, `-inf` elsewhere. `FlashAttnExt` then runs over the window under that
+  mask. Nothing is gathered.
 
-The GGML lowering can keep the existing QSA kernels as a composite op, `GraphOp.SparseAttention`, with its primitive decomposition as the reference. The tensor executors run the decomposition. Ties at the cut-off are resolved by index, as ggml's `top_k` does, so programs agree across backends.
+Both new ops are upstream ggml's (`ggml_lightning_indexer`, `ggml_top_k_mask`), so the GGML lowering is one op each.
+The managed interpreter and MLX run them as host loops.
+
+`Qwen4ExpModel` is no reference past the budget: its native selection keeps `top_k + ratio - 1` single cells
+(llama.cpp before #29751), which takes part of a third block where a row's tail is short. The runtime keeps whole
+blocks plus the tail.
+
+Limits:
+
+- A step with rotary position tables (media) past the budget is refused with a reason.
+- Every step pools every block again: O(window) per QSA layer, which is small next to the attention it masks.
+- A dense step limits its decode advance to the budget (`GraphStep.LimitAdvance`), so a step past it is traced and
+  selects. Qwen4Exp steps do not advance today: the PLE layer's gathered rows are an opaque input.
+- Dense and selecting steps emit different graphs, so the family names the mode (`EmissionVariant`): a streamed step
+  (managed, MLX) never frees nodes by the last readers of a template emitted the other way.
+
+Measured on the real model (UD-Q2_K_XL, ggml_metal, M5 Pro, plain greedy, a 3,608-token prompt that asks about its
+first lines, 2 runs each, 2026-11-11):
+
+| run | prompt | decode at ~3.6K cells |
+|---|---|---|
+| `Qwen4ExpModel`, 64 tokens | 5.78-5.83 s | 24.0-24.2 tok/s |
+| runtime, 64 tokens | 7.28-7.47 s | 23.7-23.9 tok/s |
+| runtime, 16 tokens | 7.50-7.79 s | 21.6-21.8 tok/s |
+| runtime with the selection off (wrong past the budget, for cost only), 16 tokens | 7.27-7.30 s | 22.6-22.9 tok/s |
+
+Both answer the retrieval questions correctly, and the first 64 tokens match one of `Qwen4ExpModel`'s two runs
+(its runs differ from each other). The selection costs 0.2-0.5 s of a 3.6K prompt and about 4% of decode at that
+length. The rest of the prompt gap is not QSA: the runtime emits the GDN layers and the hyper connections as ggml
+ops, where `Qwen4ExpModel` encodes TensorSharp's Metal prompt kernels between graph segments (`tsm_gdn_prompt`,
+`tsm_hc_read`, `tsm_hc_prompt`). At 1.8K tokens, where expert reads dominate, the two are even (4.6-5.1 s against
+5.1-5.2 s).
 
 ### 2.4 PLE
 
@@ -198,7 +240,7 @@ The Flash Next MTP head is a draft layer whose input is the final mixer's collap
 1. **§2.1 and §2.2 with dense attention and dense MoE.** These run on a synthetic `qwen4exp` fixture (`Qwen4ExpSyntheticModelBuilder`; HC 4, two GDN layers and one attention layer, PLE off, 8 experts). They must match `Qwen4ExpModel` on the managed and `ggml_cpu` backends (same tolerances as `Qwen35RuntimeTests`), then match under slots, layer split and speculation.
 2. **§2.4 PLE** with prefix reuse and rewind. The fixture gets PLE on. Concurrent requests' PLE histories must stay separate.
 3. **§2.5 tiers and host experts in a program** on ggml_cuda. The fixture must match with every expert held, then with tiers and host experts. Route-tail skip changes decode rows only within the existing tolerance and never the prompt (the `RouteTailSkip_*` tests).
-4. **§2.3 QSA phase 1 (dense below the budget)**, then phase 2. Phase 2 must give the same cells as the native kernels on tie-free inputs.
+4. **§2.3 QSA**, dense within the budget, then the block selection past it. The GGML lowering must select what the managed interpreter does (`SparseQsa*` tests), whole prompts, chunked prompts and decode across the budget.
 5. **The real model** (UD-Q2_K_XL, 79 GB, on 2× RTX PRO 6000) on ggml_cuda, against `Qwen4ExpModel`: greedy text, NLL, prefill/decode tok/s, MTP and DFlash2 acceptance and speed, concurrency and prefix reuse. The route changes only where the runtime is at parity.
 6. **The direct `cuda` engine:** its Q4e kernels become the CUDA executor plugin's kernels. Metal and MLX follow through their plugins.
 

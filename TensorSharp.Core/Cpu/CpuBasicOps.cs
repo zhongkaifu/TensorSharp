@@ -742,6 +742,11 @@ namespace TensorSharp.Cpu
         [RegisterOpStorageType("indexselect", typeof(CpuStorage))]
         public Tensor IndexSelect(Tensor result, Tensor src, Tensor indice, bool isAdd)
         {
+            // The kernel copies (and adds as) 4-byte floats: a narrower element would be read and written at the
+            // wrong width (an F16 source wrote twice its result's bytes).
+            if (src.ElementType.Size() != sizeof(float) || (isAdd && src.ElementType != DType.Float32)
+                || (result != null && result.ElementType != src.ElementType))
+                throw new NotSupportedException($"index_select over {src.ElementType}{(isAdd ? " (add)" : "")}: 4-byte elements only.");
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, new long[] { indice.Sizes[0], src.Sizes[1] });
 
             int ndim = writeTarget.DimensionCount;

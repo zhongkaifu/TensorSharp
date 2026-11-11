@@ -61,6 +61,7 @@ namespace TensorSharp.Graph
             GraphOp.View, GraphOp.Permute, GraphOp.Transpose, GraphOp.Cont, GraphOp.Cast, GraphOp.Cpy, GraphOp.SetRows,
             GraphOp.RopeExt, GraphOp.RopeMulti, GraphOp.FlashAttnExt, GraphOp.SoftMaxExt, GraphOp.TopK, GraphOp.SumRows,
             GraphOp.SsmConv, GraphOp.GatedDeltaNet, GraphOp.Concat, GraphOp.KvWindow, GraphOp.Sqr, GraphOp.Sqrt, GraphOp.Clamp,
+            GraphOp.LightningIndexer, GraphOp.TopKMask,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -1212,6 +1213,17 @@ namespace TensorSharp.Graph
                     if (n.Srcs.Length > 2) throw new NotSupportedException("rotary frequency factors");
                     return V(Rope(T(0), values[n.Srcs[1]], n, n.Op == GraphOp.RopeMulti, run, n.Srcs[1]));
                 }
+                case GraphOp.LightningIndexer: return V(LightningIndexer(T(0), T(1), T(2), T(3), run));
+                case GraphOp.TopKMask:
+                {
+                    int at = 2;
+                    Tensor score = Ip(0, 0) != 0 ? T(at++) : null;
+                    int[] blocks = Ip(1, 0) != 0 ? Ints(values[n.Srcs[at++]]) : null;
+                    long[] blockNe = blocks != null ? Ne(values[n.Srcs[at - 1]].Tensor) : null;
+                    int[] extra = Ip(2, 0) != 0 ? Ints(values[n.Srcs[at++]]) : null;
+                    long[] extraNe = extra != null ? Ne(values[n.Srcs[at - 1]].Tensor) : null;
+                    return V(TopKMask(T(0), Ints(values[n.Srcs[1]]), Ne(values[n.Srcs[1]].Tensor), score, blocks, blockNe, extra, extraNe, run));
+                }
                 case GraphOp.FlashAttnExt:
                 {
                     if (n.Srcs.Length > 4) throw new NotSupportedException("attention sinks");
@@ -1573,7 +1585,10 @@ namespace TensorSharp.Graph
             for (long b = 0; b < batches; b++)
                 for (long i = 0; i < n; i++)
                     flat[b * n + i] = checked((int)(b * na[1] + index[b * n + i]));
+            // ggml's get_rows reads F16 rows as F32 (a family pooling an F16 key cache sums them as F32); the
+            // host gather copies 4-byte elements, so an F16 source is widened first.
             Tensor s = Contig(src, run);
+            if (s.ElementType == DType.Float16) s = F32(s, run.Owned);
             using Tensor s2 = s.View(na[1] * batches, na[0]);
             Tensor idx = IntTensor(flat, new long[] { flat.Length }, run);
             using Tensor r = Ops.IndexSelect(null, s2, idx);
@@ -1615,6 +1630,74 @@ namespace TensorSharp.Graph
             Tensor m2 = m3.Select(0, 0);
             if (ne[1] == rows) return run.KeepLasting(m2);
             using (m2) return run.KeepLasting(m2.Narrow(0, 0, rows));
+        }
+
+        /// <summary>ggml_lightning_indexer on the host: q [d, heads, rows], keys [d, 1, n], weights [heads, rows],
+        /// mask [n, rows]; [n, rows] = sum over heads of weight * relu(q . key) + mask.</summary>
+        private Tensor LightningIndexer(Tensor q, Tensor keys, Tensor weights, Tensor mask, RunState run)
+        {
+            long[] nq = Ne(q), nk = Ne(keys);
+            int d = (int)nq[0], heads = (int)nq[1], rows = (int)nq[2], n = (int)nk[2];
+            float[] qv = HostFloats(q, run), kv = HostFloats(keys, run), wv = HostFloats(weights, run), mv = HostFloats(mask, run);
+            var result = new float[(long)rows * n];
+            for (int r = 0; r < rows; r++)
+                for (int j = 0; j < n; j++)
+                {
+                    double sum = 0;
+                    for (int h = 0; h < heads; h++)
+                    {
+                        long qo = ((long)r * heads + h) * d, ko = (long)j * d;
+                        double dot = 0;
+                        for (int i = 0; i < d; i++) dot += qv[qo + i] * kv[ko + i];
+                        if (dot > 0) sum += wv[(long)r * heads + h] * dot;
+                    }
+                    result[(long)r * n + j] = (float)sum + mv[(long)r * n + j];
+                }
+            var t = new Tensor(Allocator, DType.Float32, rows, n);
+            t.SetElementsAsFloat(result);
+            return t;
+        }
+
+        /// <summary>ggml_top_k_mask on the host (see <see cref="GraphOp.TopKMask"/>): an F32 [n_kv, rows] mask.</summary>
+        private Tensor TopKMask(Tensor mask, int[] picks, long[] pickNe, Tensor score, int[] blocks, long[] blockNe,
+            int[] extra, long[] extraNe, RunState run)
+        {
+            long[] nm = Ne(mask);
+            int nkv = (int)nm[0], maskRows = (int)(mask.ElementCount() / nkv), top = (int)pickNe[0];
+            int rows = (int)(picks.Length / top);
+            float[] mv = HostFloats(mask, run), sv = score != null ? HostFloats(score, run) : null;
+            int nPick = score != null ? (int)Ne(score)[0] : 0;
+            int cells = blocks != null ? (int)blockNe[0] : 1;
+            var result = new float[(long)rows * nkv];
+            Array.Fill(result, float.NegativeInfinity);
+            for (int r = 0; r < rows; r++)
+            {
+                long src = (long)(r % maskRows) * nkv, dst = (long)r * nkv;
+                void Keep(int c)
+                {
+                    if (c >= 0 && c < nkv) result[dst + c] = mv[src + c];
+                }
+                for (int t = 0; t < top; t++)
+                {
+                    int pick = picks[(long)r * top + t];
+                    if (sv != null && (pick < 0 || pick >= nPick || float.IsNegativeInfinity(sv[(long)r * nPick + pick]))) continue;
+                    if (blocks == null) { Keep(pick); continue; }
+                    if (pick < 0 || pick >= blockNe[1]) continue;
+                    for (int c = 0; c < cells; c++) Keep(blocks[(long)pick * cells + c]);
+                }
+                if (extra != null)
+                    for (int e = 0; e < extraNe[0]; e++) Keep(extra[(long)r * extraNe[0] + e]);
+            }
+            var t2 = new Tensor(Allocator, DType.Float32, rows, nkv);
+            t2.SetElementsAsFloat(result);
+            return t2;
+        }
+
+        /// <summary>A tensor's values on the host as F32 (an F16 mask converted).</summary>
+        private float[] HostFloats(Tensor t, RunState run)
+        {
+            Tensor x = t.ElementType == DType.Float32 ? Contig(t, run) : F32(t, run.Owned);
+            return x.GetElementsAsFloat((int)x.ElementCount());
         }
 
         private Value TopK(Tensor x, int k, RunState run)

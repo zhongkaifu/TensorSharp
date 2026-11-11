@@ -108,6 +108,8 @@ namespace
         OP_GEGLU = 52,
         OP_ROPE_MULTI = 53,     // srcs: x, positions [4 * rows], [freq factors]; ip: n_dims, mode, n_ctx_orig, sections[4]; fp: as ROPE_EXT
         OP_MOE_HOST = 54,       // srcs: x [n, T], ids [k, T], weights [k, T], gate/up/down expert stacks (host); ip: layer
+        OP_LIGHTNING_INDEXER = 55, // srcs: q [d, heads, T], k [d, 1, n_kv], weights [heads, T], mask [n_kv, T] (F16)
+        OP_TOP_K_MASK = 56,     // srcs: mask [n_kv, T], top_k [n_top, T], then (ip[0..2] flags) score, blocks, extra
     };
 
     struct Leaf
@@ -534,6 +536,18 @@ namespace
         // to the host seams' route-tail skip, and argsort + view is the chain ggml-metal's top-k MoE fusion matches.
         case OP_TOP_K: need(1); return ggml_argsort_top_k(ctx, src(0), static_cast<int>(ipar(0, 1)));
         case OP_SUM_ROWS: need(1); return ggml_sum_rows(ctx, src(0));
+        case OP_LIGHTNING_INDEXER: need(4); return ggml_lightning_indexer(ctx, src(0), src(1), src(2), src(3));
+        case OP_TOP_K_MASK:
+        {
+            // The optional operands follow in order, each present when its flag is set.
+            need(2);
+            int at = 2;
+            ggml_tensor* score = ipar(0, 0) != 0 ? src(at++) : nullptr;
+            ggml_tensor* blocks = ipar(1, 0) != 0 ? src(at++) : nullptr;
+            ggml_tensor* extra = ipar(2, 0) != 0 ? src(at++) : nullptr;
+            if (at > ns) throw std::runtime_error("graph builder: top_k_mask is missing an optional operand");
+            return ggml_top_k_mask(ctx, src(0), src(1), score, blocks, extra);
+        }
         case OP_SSM_CONV: need(2); return ssm_conv_any(ctx, src(0), src(1));
         case OP_GATED_DELTA_NET: need(6); return ggml_gated_delta_net(ctx, src(0), src(1), src(2), src(3), src(4), src(5), ipar(0, 1));
         case OP_CONCAT: need(2); return ggml_concat(ctx, src(0), src(1), static_cast<int>(ipar(0, 0)));

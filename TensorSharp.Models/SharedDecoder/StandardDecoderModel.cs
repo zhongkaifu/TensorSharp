@@ -122,6 +122,59 @@ namespace TensorSharp.Models
         /// <summary>Decoder layers plus draft layers: what weights, fusion, routing and caches cover.</summary>
         private int TotalLayers => Config.NumLayers + DraftLayerCount;
 
+        // ---------------------------------------------------------------- extra key caches
+
+        /// <summary>A family's extra per-cell key cache for <paramref name="layer"/>: one head of this many values per
+        /// cell, in the K/V cache's type (Qwen 3.8's QSA indexer keys); 0 for none. A slot keeps it after the layers'
+        /// caches (entry <see cref="TotalLayers"/> + j of its K array, no V), so whatever moves a slot's rows moves it.</summary>
+        protected virtual int ExtraKeyCacheWidth(int layer) => 0;
+
+        private int[] _extraCacheLayer = Array.Empty<int>();   // extra cache j -> its layer
+
+        /// <summary>Entries of a slot's K array: the layers' caches, then the extra key caches.</summary>
+        private int CacheEntries => TotalLayers + _extraCacheLayer.Length;
+
+        /// <summary>The stage an entry of a slot's caches lives on.</summary>
+        private int CacheStage(int entry) => StageOfLayer(entry < TotalLayers ? entry : _extraCacheLayer[entry - TotalLayers]);
+
+        /// <summary>Entry <paramref name="entry"/>'s cache tensor for one rank at <paramref name="capacity"/> cells (null where
+        /// it has none: a recurrent layer, another node's layer, an extra cache's value side).</summary>
+        private Tensor NewCacheTensor(int entry, int rank, int capacity, bool value)
+        {
+            DType dtype = _kvCacheDtype.ToDType();
+            Tensor t;
+            if (entry >= TotalLayers)
+            {
+                int layer = _extraCacheLayer[entry - TotalLayers];
+                if (value || !OwnsLayer(layer)) return null;
+                t = new Tensor(_mesh.Allocator(CacheStage(entry), rank), dtype, 1, capacity, ExtraKeyCacheWidth(layer));
+            }
+            else
+            {
+                if (!OwnsLayer(entry) || _recurrentLayer[entry]) return null;
+                IAllocator alloc = _mesh.Allocator(CacheStage(entry), rank);
+                t = value ? new Tensor(alloc, dtype, _localKvHeads, capacity, _valueDim)
+                          : new Tensor(alloc, dtype, _localKvHeads, capacity, _keyDim);
+            }
+            InitializeCacheTensor(t);
+            return t;
+        }
+
+        /// <summary>The extra key cache of <paramref name="layer"/> in <paramref name="k"/> (a slot's K array), or null.</summary>
+        private protected Tensor ExtraKeyCache(Tensor[][] k, int layer, int rank = 0)
+        {
+            int j = Array.IndexOf(_extraCacheLayer, layer);
+            return j < 0 || k == null || k.Length <= TotalLayers + j ? null : k[TotalLayers + j]?[rank];
+        }
+
+        private void InitExtraCaches()
+        {
+            var layers = new System.Collections.Generic.List<int>();
+            for (int l = 0; l < Config.NumLayers; l++)
+                if (ExtraKeyCacheWidth(l) > 0) layers.Add(l);
+            _extraCacheLayer = layers.ToArray();
+        }
+
         /// <summary>The stage a layer runs on; draft layers run with the head, on the last stage.</summary>
         private int StageOfLayer(int layer) => layer >= Config.NumLayers ? _mesh.Stages - 1 : _mesh.StageOf(layer);
 
@@ -362,24 +415,8 @@ namespace TensorSharp.Models
         {
             _maxContextLength = maxContext;
             _cacheCapacity = initial;
-            DType dtype = _kvCacheDtype.ToDType();
-            _cacheK = new Tensor[TotalLayers][];
-            _cacheV = new Tensor[TotalLayers][];
-            for (int l = 0; l < TotalLayers; l++)
-            {
-                if (!OwnsLayer(l) || _recurrentLayer[l]) continue;
-                int stage = StageOfLayer(l);
-                _cacheK[l] = new Tensor[_mesh.TensorParallel];
-                _cacheV[l] = new Tensor[_mesh.TensorParallel];
-                for (int r = 0; r < _mesh.TensorParallel; r++)
-                {
-                    IAllocator alloc = _mesh.Allocator(stage, r);
-                    _cacheK[l][r] = new Tensor(alloc, dtype, _localKvHeads, initial, _keyDim);
-                    _cacheV[l][r] = new Tensor(alloc, dtype, _localKvHeads, initial, _valueDim);
-                    InitializeCacheTensor(_cacheK[l][r]);
-                    InitializeCacheTensor(_cacheV[l][r]);
-                }
-            }
+            InitExtraCaches();
+            (_cacheK, _cacheV) = AllocateCaches(initial);
             _cacheSeqLen = 0;
         }
 
@@ -394,16 +431,13 @@ namespace TensorSharp.Models
             int capacity = Math.Max(_cacheCapacity, 1);
             while (capacity < required)
                 capacity = Math.Min(_maxContextLength, capacity * 2);
-            DType dtype = _kvCacheDtype.ToDType();
             for (int l = 0; l < _cacheK.Length; l++)
             {
                 if (_cacheK[l] == null) continue;
-                int stage = StageOfLayer(l);
                 for (int r = 0; r < _mesh.TensorParallel; r++)
                 {
-                    IAllocator alloc = _mesh.Allocator(stage, r);
-                    _cacheK[l][r] = Grow(_cacheK[l][r], new Tensor(alloc, dtype, _localKvHeads, capacity, _keyDim));
-                    _cacheV[l][r] = Grow(_cacheV[l][r], new Tensor(alloc, dtype, _localKvHeads, capacity, _valueDim));
+                    _cacheK[l][r] = Grow(_cacheK[l][r], NewCacheTensor(l, r, capacity, value: false));
+                    if (_cacheV[l]?[r] != null) _cacheV[l][r] = Grow(_cacheV[l][r], NewCacheTensor(l, r, capacity, value: true));
                 }
             }
             _cacheCapacity = capacity;
@@ -412,7 +446,6 @@ namespace TensorSharp.Models
 
         private Tensor Grow(Tensor old, Tensor grown)
         {
-            InitializeCacheTensor(grown);
             if (_cacheSeqLen > 0)
             {
                 using Tensor src = old.Narrow(1, 0, _cacheSeqLen);

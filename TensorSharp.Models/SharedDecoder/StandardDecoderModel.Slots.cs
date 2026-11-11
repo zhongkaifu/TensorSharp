@@ -206,25 +206,22 @@ namespace TensorSharp.Models
             return pooled;
         }
 
+        /// <summary>A slot's caches at <paramref name="capacity"/> cells: K and V per layer and rank, then the extra key
+        /// caches (K only).</summary>
         private (Tensor[][] K, Tensor[][] V) AllocateCaches(int capacity)
         {
-            DType dtype = _kvCacheDtype.ToDType();
-            var k = new Tensor[TotalLayers][];
-            var v = new Tensor[TotalLayers][];
-            for (int l = 0; l < TotalLayers; l++)
+            var k = new Tensor[CacheEntries][];
+            var v = new Tensor[CacheEntries][];
+            for (int e = 0; e < CacheEntries; e++)
             {
-                if (!OwnsLayer(l) || _recurrentLayer[l]) continue;
-                int stage = StageOfLayer(l);
-                k[l] = new Tensor[_mesh.TensorParallel];
-                v[l] = new Tensor[_mesh.TensorParallel];
-                for (int r = 0; r < _mesh.TensorParallel; r++)
-                {
-                    IAllocator alloc = _mesh.Allocator(stage, r);
-                    k[l][r] = new Tensor(alloc, dtype, _localKvHeads, capacity, _keyDim);
-                    v[l][r] = new Tensor(alloc, dtype, _localKvHeads, capacity, _valueDim);
-                    InitializeCacheTensor(k[l][r]);
-                    InitializeCacheTensor(v[l][r]);
-                }
+                Tensor first = NewCacheTensor(e, 0, capacity, value: false);
+                if (first == null) continue;
+                k[e] = new Tensor[_mesh.TensorParallel];
+                k[e][0] = first;
+                for (int r = 1; r < _mesh.TensorParallel; r++) k[e][r] = NewCacheTensor(e, r, capacity, value: false);
+                if (e >= TotalLayers) continue;
+                v[e] = new Tensor[_mesh.TensorParallel];
+                for (int r = 0; r < _mesh.TensorParallel; r++) v[e][r] = NewCacheTensor(e, r, capacity, value: true);
             }
             return (k, v);
         }

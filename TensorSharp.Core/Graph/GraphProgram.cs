@@ -33,6 +33,16 @@ namespace TensorSharp.Graph
         /// <see cref="GraphCapabilities.HostExperts"/> pauses the program there (an accelerator tier registered
         /// for the gate stack runs the routes it holds); the others do not take it.</summary>
         MoeHostExperts = 54,
+        /// <summary>A lightning indexer's scores (ggml_lightning_indexer): srcs q [d, heads, rows], keys [d, 1, n],
+        /// the heads' weights [heads, rows] and a mask [n, rows] (F16). Result [n, rows] = sum over heads of
+        /// weight * relu(q_head . key) plus the mask.</summary>
+        LightningIndexer = 55,
+        /// <summary>A top-k selection's attention mask (ggml_top_k_mask): srcs mask [n_kv, rows], picks [n_top, rows]
+        /// (I32), then, where Ip[0..2] are set, each pick's score [n_pick, rows] (a pick lives while its score is
+        /// above -inf), the cells of each pick [n_cells, n_pick] (I32; else a pick is a cell) and cells every row keeps
+        /// [n_extra, rows] (I32). Result [n_kv, rows]: the mask's value at a kept cell, -inf elsewhere; cells out of
+        /// range are skipped.</summary>
+        TopKMask = 56,
     }
 
     /// <summary>How a leaf's bytes are bound.</summary>

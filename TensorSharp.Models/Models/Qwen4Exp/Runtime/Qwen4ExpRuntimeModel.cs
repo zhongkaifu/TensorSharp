@@ -29,8 +29,8 @@ namespace TensorSharp.Models
     /// normed, the query from the stream), <c>gated_c = value * sigmoid(sign(s) sqrt(max(|s|, 1e-6)))</c>, and
     /// <c>stream += gated + silu(conv(norm(gated)))</c> with a causal depthwise conv dilated by the n-gram size. The
     /// n-gram history and the conv history are the sequence's state.</item>
-    /// <item><b>QSA</b> layers attend densely, which is exact up to <c>indexer_top_k + compress_ratio - 1</c> cached
-    /// tokens (the selection keeps every cell up to there); longer sequences are refused.</item>
+    /// <item><b>QSA</b> layers keep every cell's indexer key and attend the cells of their top blocks past
+    /// <c>top_k / ratio * ratio + ratio - 1</c> cached tokens, densely within (Qwen4ExpRuntimeModel.Qsa.cs).</item>
     /// </list>
     /// Speculation (the MTP head, DFlash2) and expert tiers are not ported yet: <see cref="Qwen4ExpModel"/> serves
     /// them.
@@ -70,7 +70,7 @@ namespace TensorSharp.Models
             }
             Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
                 $"  Hyper-connections: {ple.Hc} streams, low rank {ple.HcLowRank}; PLE layers: {ple.Layers} " +
-                $"(n-gram {ple.Ngram}, {ple.Heads} heads of {ple.HeadDim}, conv {ple.ConvKernel}); QSA dense up to {ple.QsaBudget} tokens."));
+                $"(n-gram {ple.Ngram}, {ple.Heads} heads of {ple.HeadDim}, conv {ple.ConvKernel}); QSA dense up to {ple.QsaBudget} tokens, sparse past it."));
             // The table (~29 GB on Flash Next) is read a few scattered rows a token from the mapping: a fault should
             // read the row's page, not a read-ahead cluster around it (Qwen4ExpModel.PreparePleTableAccess).
             if (_quantWeights.TryGetValue(PleTable, out QuantizedWeight table) && table.IsFileBacked && table.AdviseRandomAccess())
@@ -279,10 +279,6 @@ namespace TensorSharp.Models
         protected override int EmitLayerPrologue(GraphStep step, int layer, int stream)
         {
             PleSpec p = Ple;
-            for (int s = 0; s < step.Sequences; s++)
-                if (step.Starts[s] + step.Counts[s] > p.QsaBudget)
-                    throw new NotSupportedException(string.Create(CultureInfo.InvariantCulture,
-                        $"{Config.Architecture}: {step.Starts[s] + step.Counts[s]} tokens exceed the {p.QsaBudget} its QSA layers attend densely; the shared runtime does not run QSA's block selection yet."));
             return p.IsPle[layer] ? EmitPle(step, layer, stream) : stream;
         }
 
