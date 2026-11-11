@@ -267,8 +267,27 @@ namespace TensorSharp.Models.MiniMaxH3
                     $"latent must hold {expected} floats for {latentT}x{latentH}x{latentW}, got {latent.Length}.",
                     nameof(latent));
 
+            return DecodeTokens(latent, latentT, latentH, latentW, reuse: null);
+        }
+
+        // The rotary tables of the last tile shape. A clip decodes hundreds of tiles of
+        // one shape, and the tables depend on nothing else.
+        private (int T, int H, int W, float[] Cos, float[] Sin) _rope;
+
+        /// <summary>As <see cref="DecodeTokens(float[], int, int, int)"/>, writing into
+        /// <paramref name="reuse"/> when it has the right length (a tile's patch tokens
+        /// are 22 MB at 7x16x16 latents, and a clip decodes a couple of hundred tiles).
+        /// The result is <paramref name="reuse"/> or a new array.</summary>
+        private float[] DecodeTokens(float[] latent, int latentT, int latentH, int latentW, float[] reuse)
+        {
+            int tokens = latentT * latentH * latentW;
             int suffix = NumRegisterTokens + 1;
-            var (cos, sin) = BuildRope(latentT, latentH, latentW, suffix);
+            if (_rope.Cos == null || _rope.T != latentT || _rope.H != latentH || _rope.W != latentW)
+            {
+                var (c, s) = BuildRope(latentT, latentH, latentW, suffix);
+                _rope = (latentT, latentH, latentW, c, s);
+            }
+            float[] cos = _rope.Cos, sin = _rope.Sin;
 
             if (_useDirect)
             {
@@ -276,7 +295,8 @@ namespace TensorSharp.Models.MiniMaxH3
                 return EnsureDirectDecoder().DecodeTokens(latent, tokens, LatentChannels, cos, sin, PatchDim);
             }
 
-            var output = new float[(long)tokens * PatchDim];
+            long outputLength = (long)tokens * PatchDim;
+            float[] output = reuse != null && reuse.LongLength == outputLength ? reuse : new float[outputLength];
 
             var latentPin = GCHandle.Alloc(latent, GCHandleType.Pinned);
             var cosPin = GCHandle.Alloc(cos, GCHandleType.Pinned);
@@ -438,194 +458,365 @@ namespace TensorSharp.Models.MiniMaxH3
         public float[] Decode(float[] latent, int latentT, int latentH, int latentW,
                               Action<int, int> onTile = null)
         {
-            int expected = DecodedFrameCount(latentT);
-            long voxel = (long)latentH * latentW * LatentChannels;
+            float[] scratch = null;
+            return DecodeClip(
+                (tile, t, h, w) => scratch = DecodeTileTimed(tile, t, h, w, scratch),
+                latent, latentT, latentH, latentW, onTile);
+        }
 
-            // Pad by repeating the last latent frame so the chunk loop divides evenly.
+        /// <summary>Decode a whole clip straight to RGB frames: <see cref="Decode"/>,
+        /// <see cref="ToRgb"/> and the split into frames in one pass per frame, with the
+        /// same values. At most <paramref name="maxFrames"/> frames are returned. Throws
+        /// when the decoder produced a non-finite value, before the clamp to [0,1] could
+        /// hide it.</summary>
+        public RgbImage[] DecodeFrames(float[] latent, int latentT, int latentH, int latentW,
+                                       int maxFrames, Action<int, int> onTile = null)
+        {
+            float[] scratch = null;
+            return DecodeClipFrames(
+                (tile, t, h, w) => scratch = DecodeTileTimed(tile, t, h, w, scratch),
+                latent, latentT, latentH, latentW, maxFrames, onTile);
+        }
+
+        private float[] DecodeTileTimed(float[] tile, int latentT, int latentH, int latentW, float[] scratch)
+        {
+            var nativeClock = System.Diagnostics.Stopwatch.StartNew();
+            float[] patches = DecodeTokens(tile, latentT, latentH, latentW, scratch);
+            _decodeNativeSeconds += nativeClock.Elapsed.TotalSeconds;
+            return patches;
+        }
+
+        /// <summary>Decodes one tile of latents, [latentT][h][w][24], to its patch
+        /// tokens, [tokens][patchDim]. The result is read before the next call, so an
+        /// implementation may hand back the same array every time.</summary>
+        internal delegate float[] TileDecoder(float[] tile, int latentT, int latentH, int latentW);
+
+        /// <summary>A run of output frames taken from one temporal window. The first
+        /// <see cref="Blend"/> of them cross-fade from the previous window's frames
+        /// starting at <see cref="PreviousStart"/>.</summary>
+        internal readonly record struct Segment(int Window, int Start, int Count, int Blend, int PreviousStart);
+
+        /// <summary>The temporal windows of a clip and the output frames each gives.
+        /// <paramref name="pad"/> is the number of times the last latent frame is
+        /// repeated so that the windows divide evenly; <paramref name="total"/> is the
+        /// number of frames the segments hold together.</summary>
+        internal static List<Segment> PlanSegments(int latentT, out int pad, out int chunks, out int total)
+        {
             int pseudo = latentT + DecodeTokenDrop;
-            int pad = (DecodeTokensPerChunk - pseudo % DecodeTokensPerChunk) % DecodeTokensPerChunk;
+            pad = (DecodeTokensPerChunk - pseudo % DecodeTokensPerChunk) % DecodeTokensPerChunk;
             pseudo += pad;
-            int chunks = pseudo / DecodeTokensPerChunk - 1;
+            chunks = pseudo / DecodeTokensPerChunk - 1;
             if (chunks < 1) { pad += DecodeTokensPerChunk; chunks += 1; }
-
             int paddedT = latentT + pad;
-            float[] padded = latent;
-            if (pad > 0)
-            {
-                padded = new float[(long)paddedT * voxel];
-                Array.Copy(latent, padded, (long)latentT * voxel);
-                for (int i = 0; i < pad; i++)
-                    Array.Copy(latent, (long)(latentT - 1) * voxel,
-                               padded, (long)(latentT + i) * voxel, voxel);
-            }
 
-            int height = latentH * PatchSpatial, width = latentW * PatchSpatial;
-            long hw = (long)height * width;
-            var result = new List<float[]>();       // each is [3][n][hw], channel-planar
-            var counts = new List<int>();
-            float[] overlap = null; int overlapCount = 0;
-            int totalChunks = chunks;
-
+            var segments = new List<Segment>();
+            total = 0;
+            int overlapStart = 0, overlapCount = 0;
             for (int i = 0; i < chunks; i++)
             {
-                int start = i * DecodeTokensPerChunk;
-                int end = Math.Min(start + DecodeTokensPerChunk + DecodeTokenOverlap, paddedT);
-                int take = end - start;
-                var chunk = new float[(long)take * voxel];
-                Array.Copy(padded, (long)start * voxel, chunk, 0, (long)take * voxel);
-
-                // Every window tiles the same plane, so the count runs over the whole clip.
-                int window = i;
-                float[] pixels = DecodeWindow(chunk, take, latentH, latentW,
-                    onTile == null ? null : (done, tiles) => onTile(window * tiles + done, chunks * tiles));
-                int decoded = take * PatchTemporal;
-
+                int decoded = WindowLatentFrames(i, paddedT) * PatchTemporal;
                 int firstEnd = Math.Min(DecodeFramesPerChunk, decoded);
                 int firstStart = Math.Min(DecodeFramePrePadding, firstEnd);
                 int firstCount = firstEnd - firstStart;
-                float[] first = SliceFrames(pixels, decoded, hw, firstStart, firstCount);
 
-                if (overlap != null)
-                {
-                    BlendTemporal(overlap, overlapCount, first, firstCount, hw, DecodeFrameOverlap);
-                    overlap = null; overlapCount = 0;
-                }
-                result.Add(first); counts.Add(firstCount);
+                // Linear over the overlap, so the two windows' weights sum to one.
+                int blend = Math.Min(DecodeFrameOverlap, Math.Min(overlapCount, firstCount));
+                segments.Add(new Segment(i, firstStart, firstCount, blend,
+                                         overlapStart + overlapCount - blend));
+                total += firstCount;
 
-                if (decoded > DecodeFramesPerChunk + DecodeFramePrePadding)
+                overlapCount = Math.Max(0, decoded - (DecodeFramesPerChunk + DecodeFramePrePadding));
+                overlapStart = DecodeFramesPerChunk + DecodeFramePrePadding;
+                if (i == chunks - 1 && overlapCount > 0)
                 {
-                    overlapCount = decoded - (DecodeFramesPerChunk + DecodeFramePrePadding);
-                    overlap = SliceFrames(pixels, decoded, hw,
-                                          DecodeFramesPerChunk + DecodeFramePrePadding, overlapCount);
-                }
-                if (i == totalChunks - 1 && overlap != null)
-                {
-                    result.Add(overlap); counts.Add(overlapCount);
-                    overlap = null; overlapCount = 0;
+                    segments.Add(new Segment(i, overlapStart, overlapCount, 0, 0));
+                    total += overlapCount;
                 }
             }
+            return segments;
+        }
 
-            int total = 0;
-            foreach (int c in counts) total += c;
-            int keep = Math.Min(total, expected);
-            var outp = new float[3 * (long)keep * hw];
-            int written = 0;
-            for (int p = 0; p < result.Count && written < keep; p++)
+        private static int WindowLatentFrames(int window, int paddedT)
+        {
+            int start = window * DecodeTokensPerChunk;
+            return Math.Min(start + DecodeTokensPerChunk + DecodeTokenOverlap, paddedT) - start;
+        }
+
+        /// <summary>What <see cref="DecodeWindows"/> hands the caller for each output
+        /// frame: the window's accumulated planes and, for a cross-faded frame, the
+        /// previous window's. A value is <c>acc * InverseWeight</c>, and a cross-faded
+        /// one is <c>previous * (1 - Fade) + current * Fade</c>.</summary>
+        private readonly struct FrameSource
+        {
+            public readonly float[] Acc, Previous, InverseWeight;
+            public readonly long Plane, PreviousPlane;   // floats per channel in each
+            public readonly int Frame, PreviousFrame;
+            public readonly float Fade;                 // weight of this window; 1 when not cross-faded
+            public readonly int Hw;
+
+            public FrameSource(float[] acc, long plane, int frame, float[] previous, long previousPlane,
+                               int previousFrame, float fade, float[] inverseWeight, int hw)
             {
-                int n = Math.Min(counts[p], keep - written);
-                for (int ch = 0; ch < 3; ch++)
-                    Array.Copy(result[p], (long)ch * counts[p] * hw,
-                               outp, ((long)ch * keep + written) * hw, (long)n * hw);
-                written += n;
+                Acc = acc; Plane = plane; Frame = frame;
+                Previous = previous; PreviousPlane = previousPlane; PreviousFrame = previousFrame;
+                Fade = fade; InverseWeight = inverseWeight; Hw = hw;
             }
+
+            /// <summary>One channel of the frame, in ImageNet-normalized space.</summary>
+            public void Read(int channel, Span<float> destination)
+            {
+                ReadOnlySpan<float> inv = InverseWeight;
+                ReadOnlySpan<float> cur = Acc.AsSpan(checked((int)(channel * Plane + (long)Frame * Hw)), Hw);
+                int n = Hw, i = 0, lanes = System.Numerics.Vector<float>.Count;
+                if (Previous == null)
+                {
+                    for (; i <= n - lanes; i += lanes)
+                        (new System.Numerics.Vector<float>(cur.Slice(i)) * new System.Numerics.Vector<float>(inv.Slice(i)))
+                            .CopyTo(destination.Slice(i));
+                    for (; i < n; i++) destination[i] = cur[i] * inv[i];
+                    return;
+                }
+                ReadOnlySpan<float> prev = Previous.AsSpan(
+                    checked((int)(channel * PreviousPlane + (long)PreviousFrame * Hw)), Hw);
+                float wb = Fade, wa = 1f - wb;
+                var vwa = new System.Numerics.Vector<float>(wa);
+                var vwb = new System.Numerics.Vector<float>(wb);
+                for (; i <= n - lanes; i += lanes)
+                {
+                    var vi = new System.Numerics.Vector<float>(inv.Slice(i));
+                    var a = new System.Numerics.Vector<float>(prev.Slice(i)) * vi;
+                    var b = new System.Numerics.Vector<float>(cur.Slice(i)) * vi;
+                    (a * vwa + b * vwb).CopyTo(destination.Slice(i));
+                }
+                for (; i < n; i++) destination[i] = prev[i] * inv[i] * wa + cur[i] * inv[i] * wb;
+            }
+        }
+
+        private delegate void FrameSink(int outputFrame, in FrameSource source);
+
+        /// <summary>The clip as channel-planar floats; see <see cref="Decode"/>.</summary>
+        internal static float[] DecodeClip(TileDecoder decodeTile, float[] latent,
+                                           int latentT, int latentH, int latentW,
+                                           Action<int, int> onTile = null)
+        {
+            var segments = PlanSegments(latentT, out _, out _, out int total);
+            int keep = Math.Min(total, DecodedFrameCount(latentT));
+            int hw = latentH * PatchSpatial * latentW * PatchSpatial;
+            var outp = new float[3 * (long)keep * hw];
+            DecodeWindows(decodeTile, latent, latentT, latentH, latentW, segments, keep, onTile,
+                (int frame, in FrameSource source) =>
+                {
+                    for (int ch = 0; ch < 3; ch++)
+                        source.Read(ch, outp.AsSpan(checked((int)(((long)ch * keep + frame) * hw)), hw));
+                });
             return outp;
         }
 
-        // One frame range out of a channel-planar [3][frames][hw] buffer.
-        private static float[] SliceFrames(float[] src, int frames, long hw, int start, int count)
+        /// <summary>The clip as RGB frames; see <see cref="DecodeFrames"/>.</summary>
+        internal static RgbImage[] DecodeClipFrames(TileDecoder decodeTile, float[] latent,
+                                                    int latentT, int latentH, int latentW, int maxFrames,
+                                                    Action<int, int> onTile = null)
         {
-            var dst = new float[3 * (long)count * hw];
-            for (int ch = 0; ch < 3; ch++)
-                Array.Copy(src, ((long)ch * frames + start) * hw,
-                           dst, (long)ch * count * hw, (long)count * hw);
-            return dst;
-        }
-
-        // Cross-fade the tail of `previous` into the head of `current`, in place on
-        // `current`. Linear over `extent` frames, so the two chunks' weights sum to one.
-        private static void BlendTemporal(float[] previous, int previousCount,
-                                          float[] current, int currentCount, long hw, int extent)
-        {
-            extent = Math.Min(extent, Math.Min(previousCount, currentCount));
-            int from = previousCount - extent;
-            for (int ch = 0; ch < 3; ch++)
-                for (int t = 0; t < extent; t++)
+            var segments = PlanSegments(latentT, out _, out _, out int total);
+            int keep = Math.Max(0, Math.Min(maxFrames, Math.Min(total, DecodedFrameCount(latentT))));
+            int height = latentH * PatchSpatial, width = latentW * PatchSpatial;
+            int hw = height * width;
+            var frames = new RgbImage[keep];
+            int badFrame = -1;
+            DecodeWindows(decodeTile, latent, latentT, latentH, latentW, segments, keep, onTile,
+                (int frame, in FrameSource source) =>
                 {
-                    float wb = t / (float)extent, wa = 1f - wb;
-                    long dst = ((long)ch * currentCount + t) * hw;
-                    long src = ((long)ch * previousCount + (from + t)) * hw;
-                    for (long i = 0; i < hw; i++)
-                        current[dst + i] = previous[src + i] * wa + current[dst + i] * wb;
-                }
+                    float[] plane = System.Buffers.ArrayPool<float>.Shared.Rent(hw);
+                    var px = new float[3 * hw];
+                    bool finite = true;
+                    for (int ch = 0; ch < 3; ch++)
+                    {
+                        Span<float> values = plane.AsSpan(0, hw);
+                        source.Read(ch, values);
+                        float m = PixelMean[ch], s = PixelStd[ch];
+                        for (int i = 0, p = ch; i < values.Length; i++, p += 3)
+                        {
+                            float v = values[i];
+                            finite &= float.IsFinite(v);
+                            px[p] = Math.Clamp(v * s + m, 0f, 1f);
+                        }
+                    }
+                    System.Buffers.ArrayPool<float>.Shared.Return(plane);
+                    if (!finite) System.Threading.Interlocked.CompareExchange(ref badFrame, frame, -1);
+                    frames[frame] = new RgbImage(width, height, px);
+                });
+            if (badFrame >= 0)
+                throw new InvalidOperationException(
+                    $"MiniMax-H3 video VAE output contains a non-finite value in frame {badFrame} " +
+                    $"of {keep}. Generation stopped before media conversion.");
+            return frames;
         }
 
-        /// <summary>Decode ONE temporal window, tiling spatially and cross-fading the
-        /// seams. Returns channel-planar [3][T*4][H*16][W*16].</summary>
-        private float[] DecodeWindow(float[] latent, int latentT, int latentH, int latentW,
-                                     Action<int, int> onTile = null)
+        /// <summary>Decode the clip window by window and hand every output frame below
+        /// <paramref name="keep"/> to <paramref name="sink"/>, frames of one window in
+        /// parallel. A window is tiled spatially with cross-faded seams; its frames
+        /// stay as accumulated sums until a sink reads them, so no clip-sized
+        /// intermediate is ever written.</summary>
+        private static void DecodeWindows(TileDecoder decodeTile, float[] latent,
+                                          int latentT, int latentH, int latentW,
+                                          List<Segment> segments, int keep,
+                                          Action<int, int> onTile, FrameSink sink)
         {
+            PlanSegments(latentT, out int pad, out int chunks, out _);
+            long voxel = (long)latentH * latentW * LatentChannels;
+            int paddedT = latentT + pad;
+
             var rows = PlanTiles(latentH);
             var cols = PlanTiles(latentW);
-            int frames = latentT * PatchTemporal;
             int height = latentH * PatchSpatial, width = latentW * PatchSpatial;
-            long hw = (long)height * width;
-            long plane = (long)frames * hw;
+            int hw = checked(height * width);
+            float[] inverseWeight = InverseTileWeight(rows, cols, height, width);
+            int tilesPerWindow = rows.Count * cols.Count;
 
-            var acc = new float[3 * plane];
-            var weight = new float[plane];   // shared across channels
-            int done = 0, totalTiles = rows.Count * cols.Count;
+            float[] acc = null, previous = null;
+            long plane = 0, previousPlane = 0;
+            int written = 0, next = 0;
+            for (int i = 0; i < chunks && written < keep; i++)
+            {
+                int take = WindowLatentFrames(i, paddedT);
+                // The window's latents; past the clip's end the last frame repeats.
+                var chunk = new float[(long)take * voxel];
+                for (int t = 0; t < take; t++)
+                    Array.Copy(latent, (long)Math.Min(i * DecodeTokensPerChunk + t, latentT - 1) * voxel,
+                               chunk, (long)t * voxel, voxel);
+
+                long windowPlane = (long)take * PatchTemporal * hw;
+                // The buffer of two windows back is free again; the previous one's
+                // tail may still be cross-faded into this window's head.
+                float[] spare = previous;
+                previous = acc; previousPlane = plane;
+                acc = spare != null && spare.LongLength == 3 * windowPlane ? spare : new float[3 * windowPlane];
+                plane = windowPlane;
+
+                // Every window tiles the same plane, so the count runs over the whole clip.
+                int window = i;
+                AccumulateWindow(decodeTile, chunk, take, latentH, latentW, rows, cols, acc,
+                    onTile == null ? null : done => onTile(window * tilesPerWindow + done, chunks * tilesPerWindow));
+
+                for (; next < segments.Count && segments[next].Window == i && written < keep; next++)
+                {
+                    Segment s = segments[next];
+                    int n = Math.Min(s.Count, keep - written);
+                    int first = written;
+                    float[] curAcc = acc, prevAcc = previous;
+                    long curPlane = plane, prevPlane = previousPlane;
+                    System.Threading.Tasks.Parallel.For(0, n, j =>
+                    {
+                        var source = j < s.Blend
+                            ? new FrameSource(curAcc, curPlane, s.Start + j, prevAcc, prevPlane,
+                                              s.PreviousStart + j, j / (float)s.Blend, inverseWeight, hw)
+                            : new FrameSource(curAcc, curPlane, s.Start + j, null, 0, 0, 1f, inverseWeight, hw);
+                        sink(first + j, in source);
+                    });
+                    written += n;
+                }
+            }
+        }
+
+        // 1 / (the tile ramps summed over a pixel), which turns the accumulated
+        // weighted sums into the cross-faded value. It is the same for every frame.
+        private static float[] InverseTileWeight(List<Tile> rows, List<Tile> cols, int height, int width)
+        {
+            var weight = new float[(long)height * width];
+            foreach (var r in rows)
+                foreach (var c in cols)
+                {
+                    int th = r.Length * PatchSpatial, tw = c.Length * PatchSpatial;
+                    int y0 = r.Start * PatchSpatial, x0 = c.Start * PatchSpatial;
+                    var wy = Ramp(th, r.LeadOverlap * PatchSpatial, r.TrailOverlap * PatchSpatial);
+                    var wx = Ramp(tw, c.LeadOverlap * PatchSpatial, c.TrailOverlap * PatchSpatial);
+                    for (int y = 0; y < th; y++)
+                        for (int x = 0; x < tw; x++)
+                            weight[(long)(y0 + y) * width + x0 + x] += wy[y] * wx[x];
+                }
+            for (long i = 0; i < weight.LongLength; i++)
+                weight[i] = weight[i] > 0f ? 1f / weight[i] : 1f;
+            return weight;
+        }
+
+        /// <summary>Decode ONE temporal window into <paramref name="acc"/>, channel-planar
+        /// [3][T*4][H*16][W*16]: every tile's pixels times its seam ramps, summed. The
+        /// patch tokens go from the decoder to their pixels in one pass (the
+        /// depth-to-space of <see cref="UnpackPatches"/> and the ramp together).</summary>
+        private static void AccumulateWindow(TileDecoder decodeTile, float[] latent,
+                                             int latentT, int latentH, int latentW,
+                                             List<Tile> rows, List<Tile> cols, float[] acc,
+                                             Action<int> onTile)
+        {
+            const int pt = PatchTemporal, ps = PatchSpatial;
+            int patchDim = OutChannels * pt * ps * ps;
+            int frames = latentT * pt;
+            int height = latentH * ps, width = latentW * ps;
+            long plane = (long)frames * height * width;
+            System.Threading.Tasks.Parallel.For(0, OutChannels * frames, i =>
+                acc.AsSpan(checked((int)((long)i * height * width)), height * width).Clear());
+            int done = 0;
 
             foreach (var r in rows)
                 foreach (var c in cols)
                 {
                     var tile = new float[(long)latentT * r.Length * c.Length * LatentChannels];
+                    int rowFloats = c.Length * LatentChannels;
                     for (int t = 0; t < latentT; t++)
                         for (int y = 0; y < r.Length; y++)
-                            for (int x = 0; x < c.Length; x++)
-                            {
-                                long src = (((long)t * latentH + (r.Start + y)) * latentW
-                                            + (c.Start + x)) * LatentChannels;
-                                long dst = (((long)t * r.Length + y) * c.Length + x) * LatentChannels;
-                                Array.Copy(latent, src, tile, dst, LatentChannels);
-                            }
+                            Array.Copy(latent,
+                                       (((long)t * latentH + (r.Start + y)) * latentW + c.Start) * LatentChannels,
+                                       tile, ((long)t * r.Length + y) * rowFloats, rowFloats);
 
-                    var nativeClock = System.Diagnostics.Stopwatch.StartNew();
-                    float[] patches = DecodeTokens(tile, latentT, r.Length, c.Length);
-                    _decodeNativeSeconds += nativeClock.Elapsed.TotalSeconds;
-                    float[] px = UnpackPatches(patches, latentT, r.Length, c.Length);
+                    float[] patches = decodeTile(tile, latentT, r.Length, c.Length);
 
-                    int th = r.Length * PatchSpatial, tw = c.Length * PatchSpatial;
-                    long thw = (long)th * tw;
-                    long tplane = (long)frames * thw;
-                    int y0 = r.Start * PatchSpatial, x0 = c.Start * PatchSpatial;
+                    int tileH = r.Length, tileW = c.Length;
+                    int th = tileH * ps, tw = tileW * ps;
+                    int y0 = r.Start * ps, x0 = c.Start * ps;
 
                     // Linear ramps on the overlapping edges. Two neighbours' ramps sum
                     // to 1 across a seam, so the normalized accumulation reproduces the
                     // reference's pairwise linear cross-fade.
-                    var wy = Ramp(th, r.LeadOverlap * PatchSpatial, r.TrailOverlap * PatchSpatial);
-                    var wx = Ramp(tw, c.LeadOverlap * PatchSpatial, c.TrailOverlap * PatchSpatial);
+                    var wy = Ramp(th, r.LeadOverlap * ps, r.TrailOverlap * ps);
+                    var wx = Ramp(tw, c.LeadOverlap * ps, c.TrailOverlap * ps);
 
                     // One frame per worker: a frame's rows belong to it alone, and the tiles
                     // still accumulate one after another, so every sum is the serial one.
                     System.Threading.Tasks.Parallel.For(0, frames, f =>
                     {
+                        int t = f / pt, kt = f % pt;
+                        int lanes = System.Numerics.Vector<float>.Count;
+                        Span<float> w = tw <= 1024 ? stackalloc float[tw] : new float[tw];
+                        ReadOnlySpan<float> wxs = wx;
                         for (int y = 0; y < th; y++)
                         {
+                            int h = y / ps, kh = y % ps;
+                            float wyv = wy[y];
+                            for (int x = 0; x < tw; x++) w[x] = wyv * wxs[x];
                             long dstRow = ((long)f * height + (y0 + y)) * width + x0;
-                            long srcRow = ((long)f * th + y) * tw;
-                            for (int x = 0; x < tw; x++)
+                            long tokenRow = ((long)t * tileH + h) * tileW;
+                            for (int ch = 0; ch < OutChannels; ch++)
                             {
-                                float w = wy[y] * wx[x];
-                                weight[dstRow + x] += w;
-                                for (int ch = 0; ch < 3; ch++)
-                                    acc[ch * plane + dstRow + x] += px[ch * tplane + srcRow + x] * w;
+                                Span<float> dst = acc.AsSpan(checked((int)(ch * plane + dstRow)), tw);
+                                int inPatch = ((ch * pt + kt) * ps + kh) * ps;
+                                for (int tx = 0; tx < tileW; tx++)
+                                {
+                                    ReadOnlySpan<float> src = patches.AsSpan(
+                                        checked((int)((tokenRow + tx) * patchDim + inPatch)), ps);
+                                    Span<float> d = dst.Slice(tx * ps, ps);
+                                    ReadOnlySpan<float> wv = w.Slice(tx * ps, ps);
+                                    int k = 0;
+                                    for (; k <= ps - lanes; k += lanes)
+                                        (new System.Numerics.Vector<float>(d.Slice(k))
+                                         + new System.Numerics.Vector<float>(src.Slice(k))
+                                           * new System.Numerics.Vector<float>(wv.Slice(k))).CopyTo(d.Slice(k));
+                                    for (; k < ps; k++) d[k] += src[k] * wv[k];
+                                }
                             }
                         }
                     });
-                    onTile?.Invoke(++done, totalTiles);
+                    onTile?.Invoke(++done);
                 }
-
-            System.Threading.Tasks.Parallel.For(0, frames, f =>
-            {
-                for (long i = (long)f * hw, end = i + hw; i < end; i++)
-                {
-                    float w = weight[i];
-                    if (w <= 0f) continue;
-                    float inv = 1f / w;
-                    for (int ch = 0; ch < 3; ch++) acc[ch * plane + i] *= inv;
-                }
-            });
-            return acc;
         }
 
         // Seconds this decoder spent inside the native per-tile decode, for TS_H3_PHASE's

@@ -176,6 +176,18 @@ fc2 直接读取 fc1 的 `[gate | value]` 输出，在收窄为 BF16 时完成 S
 每个 token 的激活各按自身峰值舍入为 int8，经 cuBLASLt 以 int32 精确累加，再用一遍把结果缩放回 F32，同样会改变输出。
 在 A100 80 GB 上（1344x768、124 帧、Turbo 8 步、39,844 个 token），fc1 的乘法由 50.3 ms 降到 31.8 ms，去噪单步由
 21.7 s 降到 20.2 s，热态整次请求由 203 s 降到 191-193 s；解码结果与 BF16 路径相差 30.6 dB PSNR，多次运行完全一致。
+`TS_H3_INT8_MATMUL=vae`（或 `all`，连同 DiT）对视频 VAE 解码器的 F16 投影做同样处理，并把每个权重的 int8 行保留在
+设备上供各分块复用。在 A100 80 GB 上，1344x768、124 帧片段的 196 个分块由 15.5 s 降到 13.7 s，与 F16 解码相差
+41-45 dB PSNR。收益有限，因为每个乘积在乘法前后仍要从 F32 舍入并缩放回 F32：单个分块的 int8 乘法为 24 ms（F16 为
+40 ms），整个节点为 48.5 ms（F16 为 56 ms）。
+
+DiT 注意力可改用 [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) 的前向内核（PyTorch 所用的内核）：
+以 `-DTENSORSHARP_FLASH_ATTENTION=ON` 配置原生构建时，会下载固定版本的 flash-attention 与 CUTLASS 源码，只编译本模型
+用到的一个内核（头维 128、F16、无掩码），并在融合注意力节点中替代 cuDNN 的 SDPA；需要 cuDNN 头文件与 sm_80 及以上的
+GPU，`TS_H3_FLASH_ATTENTION=0` 可切回 cuDNN。在同一 A100 与片段上（39,875 个 token，`TS_H3_INT8_MATMUL=1`），每个块的
+注意力由 278-281 ms 降到 251 ms，去噪单步由 20.5-20.7 s 降到 19.1-19.2 s，热态整次请求由 188 s 降到 177.9-178.5 s。
+内核输出与双精度参考相差 73 dB（F16 舍入量级）；两种实现的舍入不同，经 8 步去噪放大后，片段与 cuDNN 结果相差
+31.6 与 24.8 dB PSNR。该选项默认关闭（配置时需要联网下载源码），目前只在 Linux 的 CUDA 13 上构建过。
 
 ### Metal 上的长序列注意力
 
@@ -512,6 +524,7 @@ AdaLN 来自学习的 `[8,1025]` 曲线表，三模态分别取调制参数。
 | `TS_H3_UPLOAD_PREFAULT` | 原生 CUDA 自动半内存预算；`0` 禁用，`1` 强制 |
 | `TS_H3_UPLOAD_WORKERS` | 原生 CUDA 预读 1–8 个 worker，默认 8 |
 | `TS_H3_UPLOAD_PROFILE=1` | 预读/上传/图诊断，不能混入正式计时 |
+| `TS_H3_FLASH_ATTENTION=0` | `ggml_cuda`，仅限以 `-DTENSORSHARP_FLASH_ATTENTION=ON` 构建：DiT 注意力保留在 cuDNN SDPA，而不用 FlashAttention-2 |
 | `TS_H3_CUDNN_ATTENTION=0` | `ggml_cuda`：注意力保留在 ggml 的 flash attention，而不用 cuDNN 融合 SDPA；`TS_H3_CUDNN_ATTENTION_VERBOSE=1` 打印 cuDNN 计划与回退 |
 | `TS_H3_CUBLAS_MATMUL=0` | `ggml_cuda`：DiT 的宽 Q4_K 投影保留在 MMQ，而不用 cuBLAS BF16；`TS_H3_CUBLAS_MIN_ROWS`（默认 1024）为 token 阈值 |
 | `TS_H3_FUSED=0` | `ggml_cuda`：构建未融合的 DiT 与 VAE 图（不融合注意力前处理、调制、门控残差与 LoRA 合并） |
