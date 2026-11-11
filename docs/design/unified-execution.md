@@ -767,6 +767,12 @@ holds in the next segment, as in the fused graphs. Qwen 3.5 MoE (`Qwen35RuntimeT
 answer as the accelerator's (BF16 within 1e-2) and keep the runtime as close to `Qwen35Model`'s offloaded
 run as the accelerator's keep it to `Qwen35Model`'s (ggml_cpu, ggml_metal).
 
+Which layers run there is the runtime's plan on one GGML device (`StandardDecoderModel.ExpertPlacement`), for
+every MoE family: the explicit flags win; otherwise experts that do not fit leave whole trailing layers on the
+accelerator, or every layer at a pause with its most-routed experts in a registered tier (a routing profile
+from earlier loads ranks them; on unified memory, window slots fill on demand while it is collected). The
+budgets (`ExpertPlacementPlanner`) are the ones measured for Flash Next.
+
 Direct CUDA (RTX PRO 6000) is not at parity yet: Qwen3.5-0.8B Q8_0 prompt 8,800 / 15,400 tok/s, decode
 209 / 272; 9B prompt 1,800 / 2,300, decode 38.4 / 38.7 (runtime / `Qwen35CudaModel`).
 

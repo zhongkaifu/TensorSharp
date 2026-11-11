@@ -876,7 +876,7 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     public void Plan_On48GiBMac_OffloadsTheLeadingLayers()
     {
         long[] experts = Enumerable.Repeat(957_000_000L, 48).ToArray();
-        int onDevice = Qwen4ExpModel.PlanDeviceExpertLayers(experts, 4 * GB, 40_200_000_000L, 51_539_607_552L);
+        int onDevice = ExpertPlacementPlanner.PlanDeviceExpertLayers(experts, 4 * GB, 40_200_000_000L, 51_539_607_552L);
         _output.WriteLine($"48 GiB: {onDevice} of 48 layers' experts on the accelerator");
         // Measured best on that Mac: 12-16 wired layers (see OffloadedHotFraction).
         Assert.InRange(onDevice, 12, 18);
@@ -886,7 +886,7 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     public void Plan_WhenEverythingFits_KeepsEveryLayer()
     {
         long[] experts = Enumerable.Repeat(957_000_000L, 48).ToArray();
-        Assert.Equal(48, Qwen4ExpModel.PlanDeviceExpertLayers(experts, 4 * GB, 110 * GB, 137_438_953_472L));
+        Assert.Equal(48, ExpertPlacementPlanner.PlanDeviceExpertLayers(experts, 4 * GB, 110 * GB, 137_438_953_472L));
     }
 
     [Fact]
@@ -894,8 +894,8 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
     {
         long[] experts = Enumerable.Repeat(957_000_000L, 48).ToArray();
         // Plenty of RAM, a small working set: the working set is the binding limit.
-        int onDevice = Qwen4ExpModel.PlanDeviceExpertLayers(experts, 4 * GB, 20 * GB, 512 * GB);
-        long wired = 4 * GB + Qwen4ExpModel.DeviceScratchBytes + onDevice * 957_000_000L;
+        int onDevice = ExpertPlacementPlanner.PlanDeviceExpertLayers(experts, 4 * GB, 20 * GB, 512 * GB);
+        long wired = 4 * GB + ExpertPlacementPlanner.DeviceScratchBytes + onDevice * 957_000_000L;
         Assert.True(wired <= 20 * GB - 20 * GB / 16, $"{onDevice} layers wire {wired} bytes");
         Assert.True(wired + 957_000_000L > 20 * GB - 20 * GB / 16, "one more layer would still have fit");
     }
@@ -910,15 +910,15 @@ public sealed class Qwen4ExpExpertOffloadTests : IDisposable
         File.WriteAllBytes(path, new byte[12345]);
         try
         {
-            Assert.Equal(12345 + Qwen4ExpModel.DFlashRingAllowanceBytes, Qwen4ExpModel.PendingDFlashDraftBytes(path));
+            Assert.Equal(12345 + ExpertPlacementPlanner.DFlashRingAllowanceBytes, ExpertPlacementPlanner.PendingDFlashDraftBytes(path));
         }
         finally { File.Delete(path); }
-        Assert.Equal(0, Qwen4ExpModel.PendingDFlashDraftBytes(path));
+        Assert.Equal(0, ExpertPlacementPlanner.PendingDFlashDraftBytes(path));
     }
 
     [Fact]
     public void Plan_TooSmallForAnyLayer_OffloadsEverything()
-        => Assert.Equal(0, Qwen4ExpModel.PlanDeviceExpertLayers(
+        => Assert.Equal(0, ExpertPlacementPlanner.PlanDeviceExpertLayers(
             Enumerable.Repeat(957_000_000L, 48).ToArray(), 4 * GB, 8 * GB, 16 * GB));
 
     /// <summary>The descriptor crosses to TSGgmlQwen4ExpFfnArgs by layout: 12 pointers, 10 int64,

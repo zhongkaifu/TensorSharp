@@ -12,6 +12,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using TensorSharp.Core;
 using TensorSharp.Runtime;
+using static TensorSharp.Models.ExpertPlacementPlanner;
 
 namespace TensorSharp.Models
 {

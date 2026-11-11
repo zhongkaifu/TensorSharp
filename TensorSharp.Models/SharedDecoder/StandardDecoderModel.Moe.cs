@@ -71,7 +71,7 @@ namespace TensorSharp.Models
                     $"(got {_numExperts} and {_expertsUsed}).");
             int offloaded = 0;
             for (int l = 0; l < Config.NumLayers; l++)
-                if (_moeLayer[l] && MoeCpuOffloadConfig.IsLayerOnCpu(l)) offloaded++;
+                if (_moeLayer[l] && IsExpertLayerOffloaded(l)) offloaded++;
             Console.WriteLine($"  Routed experts: {_numExperts} per layer, top-{_expertsUsed}" +
                 (offloaded > 0 ? $"; {offloaded} layer(s) keep their experts in host memory and run them there" : "") + ".");
         }
@@ -149,7 +149,7 @@ namespace TensorSharp.Models
             routing ??= Route(scope, input, layer);
             int tokens = (int)input.Sizes[0];
             int hidden = Config.HiddenSize;
-            bool onHost = MoeCpuOffloadConfig.IsLayerOnCpu(layer);
+            bool onHost = IsExpertLayerOffloaded(layer);
 
             Tensor output = null;
             if (scope.Degree == 1 && IsGgmlBackend)

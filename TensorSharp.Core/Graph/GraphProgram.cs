@@ -26,7 +26,9 @@ namespace TensorSharp.Graph
         SumRows = 40, SsmConv = 41, GatedDeltaNet = 42, Concat = 43, Clamp = 44, Repeat = 45,
         Pad = 46, Mean = 47, AddId = 48, Argmax = 49, KvWindow = 50, Swiglu = 51, Geglu = 52, RopeMulti = 53,
         /// <summary>Routed SwiGLU experts whose weights stay in host memory: srcs x [n, rows], ids (I32 [k, rows]),
-        /// route weights ([k, rows]), then the stacked gate, up and down experts; Ip: the layer, n_ff. Result
+        /// route weights ([k, rows]), then the stacked gate, up and down experts, and optionally the next offloaded
+        /// layer's router and gate stack (a hint: an executor may read that layer's predicted experts ahead); Ip: the
+        /// layer, n_ff. Result
         /// [n, rows] = sum over k of w * down(silu(gate x) * up x) for each row's experts. An executor with
         /// <see cref="GraphCapabilities.HostExperts"/> pauses the program there (an accelerator tier registered
         /// for the gate stack runs the routes it holds); the others do not take it.</summary>

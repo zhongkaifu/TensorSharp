@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next (`qwen4exp`) on the shared decoder runtime
 
-Status: steps 1 and 2 of §3 are in (`Qwen4ExpRuntimeModel`, not routed yet). `Qwen4ExpModel` and its engines
+Status: steps 1 to 3 of §3 and QSA phase 1 are in (`Qwen4ExpRuntimeModel`, not routed yet). `Qwen4ExpModel` and its engines
 stay until the runtime matches them.
 
 **Done (2026-11-11).** `Qwen4ExpRuntimeModel` derives from `Qwen35RuntimeModel` and adds only the family's own
@@ -24,9 +24,14 @@ recording), so hashing a step must use the history as of its start (the state ke
 
 **Host experts (§2.5, first half).** `GraphOp.MoeHostExperts` runs a layer's routed experts from host memory at a
 pause in the program (GGML: the native `HostMoeSegment` seam, with a registered accelerator tier running the
-routes it holds). What remains for the real checkpoint is choosing the offloaded layers and registering the
-tiers as `Qwen4ExpModel.ExpertTiers` does (routing profile, fixed and window slots), and the prompt-width
-streaming.
+routes it holds). The runtime plans the offload itself on one GGML device (`StandardDecoderModel.ExpertPlacement`,
+for every MoE family): explicit `--n-cpu-moe` / `--cpu-moe` win; otherwise a model whose experts do not fit
+keeps whole trailing layers on the accelerator, or - with a routing profile from earlier loads, or on unified
+memory with window slots only while the profile is collected - runs every layer at a seam with its most-routed
+experts in fixed slots. The budgets are `ExpertPlacementPlanner`'s (moved out of `Qwen4ExpModel`, which uses
+them too). With it the real UD-Q2_K_XL checkpoint (79 GB) loads and generates on the 48 GB M5 Pro (ggml_metal).
+The native builder sizes its cgraph from the context's tensor capacity: a tiered pause lowers to about a dozen
+ggml tensors per layer, which overflowed a graph sized from the program's node count.
 
 **Speculation (§2.6, MTP).** The shared-target MTP head (`--draft-model mtp-*.gguf`) loads as the runtime's
 draft layer (`OpenSeparateDraftHead`, before the caches exist). The draft layer is the shared one, split into
@@ -38,8 +43,39 @@ prefix's conv window (`EmitCommitExtras`) and n-gram history (`CommitHostVerify`
 drafts and the MTP head) emits the plain greedy tokens on the managed CPU, ggml_cpu, ggml_metal and MLX, and
 the head's drafts match `Qwen4ExpModel`'s within 3e-2 (ggml_cpu, ggml_metal).
 
-**Next:** the tier policy above, DFlash2 (its feature taps are the mean of the streams after each target
-layer), and QSA phase 2 above the budget.
+**The real checkpoint on the Mac.** UD-Q2_K_XL on the 48 GB M5 Pro (ggml_metal), the runtime against `Qwen4ExpModel`,
+both tiered by the same routing profile with the host expert cache pinned (`TS_HOST_MOE_IO_CACHE_GB=6`; without it
+the window follows what macOS can give at load, which moves with the run order):
+
+| | runtime | `Qwen4ExpModel` |
+|---|---|---|
+| decode, 200 greedy tokens | 28.9-29.0 tok/s | 29.1-29.2 tok/s |
+| 54-token prompt | 0.77-0.79 s | 0.84-0.86 s |
+| perplexity, 2 x 1024 tokens (route-tail skip off) | 13.714 | 13.778 |
+| the same run's prompt halves (2 x 513 tokens) | 4.37 s | 4.35 s |
+
+`TS_HOST_MOE_TIMING=3` splits each pass the same way for both (accelerator, host experts, window reads). What
+closed the gap from -9%, in order: Strata's read-ahead (`MoeHostExperts` takes the next offloaded layer's router and
+gate stack, and the GGML builder computes `pred_next` from them); the PLE rows gathered as `Qwen4ExpModel` does
+(random-access advice on the table, a decode's 16 faults concurrently, a prompt's rows by pread), 1.7 -> 0.35 ms a
+token; and ggml-metal's own fusions, about 280 kernels a token fewer. Those need the node shapes ggml-metal
+matches: `TopK` lowers to `ggml_argsort_top_k` (descending, as the IR defines it; `ggml_top_k`'s order is
+unspecified, so the host seams' route-tail skip took a route's position for a rank it was not), the router is
+llama.cpp's chain with its clamp and closing scale, a pause pins the route weights first and holds one-row ids with
+views no node consumes (an output flag on the argsort refuses the fusion), a VIEW of the router weight keeps the
+logits allocated past the chain (the alloc dependency `ggml_backend_sched` would add; the builder allocates with
+gallocr), and the stream broadcasts are one-term products (`[1, n] x [1, hc]` mul_mat) instead of hc copies.
+Route-tail skip makes decode depend on what the window holds, so text and perplexity move between runs with it on.
+
+**Speculation (DFlash2).** A DFlash drafter (`--draft-model` with `general.architecture = dflash`) attaches through
+the shared `AttachDraftModel`. The runtime already captured the stream entering each `dflash.target_layers` id,
+which is the completed output `Qwen4ExpModel` taps at id - 1; the one family hook is `EmitCaptureRow`, the mean of
+the hc streams. On the synthetic checkpoint with a synthetic drafter the feature rows and logits of a prompt and
+a verify match `Qwen4ExpModel`'s native taps within 2e-2 (ggml_cpu, ggml_metal), and greedy block speculation
+emits the plain greedy tokens on the managed CPU, ggml_cpu, ggml_metal and MLX.
+
+**Next:** MTP and DFlash2 on the real checkpoint, QSA phase 2 above the budget (8192 tokens), and the real model on
+ggml_cuda.
 
 Flash Next has 125 B parameters in total and 6 B active. Its routed experts take 46 GB at UD-Q2_K_XL.
 

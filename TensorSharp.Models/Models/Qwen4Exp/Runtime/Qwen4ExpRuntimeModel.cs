@@ -7,6 +7,8 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Threading.Tasks;
+using TensorSharp.GGML;
 using TensorSharp.Graph;
 
 namespace TensorSharp.Models
@@ -69,6 +71,11 @@ namespace TensorSharp.Models
             Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
                 $"  Hyper-connections: {ple.Hc} streams, low rank {ple.HcLowRank}; PLE layers: {ple.Layers} " +
                 $"(n-gram {ple.Ngram}, {ple.Heads} heads of {ple.HeadDim}, conv {ple.ConvKernel}); QSA dense up to {ple.QsaBudget} tokens."));
+            // The table (~29 GB on Flash Next) is read a few scattered rows a token from the mapping: a fault should
+            // read the row's page, not a read-ahead cluster around it (Qwen4ExpModel.PreparePleTableAccess).
+            if (_quantWeights.TryGetValue(PleTable, out QuantizedWeight table) && table.IsFileBacked && table.AdviseRandomAccess())
+                Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                    $"  PLE n-gram table: {table.RawBytes / 1e9:F1} GB read on demand from the GGUF mapping (random-access advice)."));
         }
 
         // ---------------------------------------------------------------- configuration
@@ -236,14 +243,30 @@ namespace TensorSharp.Models
             int rows = step.Rows, hc = p.Hc;
             int w = step.Op(GraphOp.Scale, stackalloc[] { step.Op(GraphOp.Sigmoid, step.Op(GraphOp.Scale, stackalloc[] { context }, default, stackalloc[] { 1f / hc })) },
                 default, stackalloc[] { 2f });
-            int weights = step.Reshape(w, 1, hc, rows);
-            int scaled = step.Op(GraphOp.Mul, Streams(step, step.Reshape(step.Cont(output), p.Hidden, 1, rows), hc), weights);
+            int scaled = Outer(step, step.Cont(output), p.Hidden, step.Reshape(w, 1, hc, rows), hc, rows);
             return step.Op(GraphOp.Add, stream, step.Reshape(scaled, p.StreamFloats, rows));
         }
 
         /// <summary>The final mixer is the output norm (qwen4exp has no output_norm).</summary>
         protected override int EmitStreamOutput(GraphStep step, int stream)
             => HcMix(step, stream, step.Rows, "output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", null, out _);
+
+        /// <summary>The PLE table's rows are gathered on the host; the accelerator never binds it.</summary>
+        protected override bool IsHostOnlyWeight(string name) => name == PleTable;
+
+        /// <summary>DFlash2's encoder was trained on each tapped residual averaged over the hc streams
+        /// (Qwen4ExpModel.DFlash.cs).</summary>
+        protected override int EmitCaptureRow(GraphStep step, int stream)
+        {
+            PleSpec p = Ple;
+            int rows = step.Rows;
+            long n = p.Hidden, width = p.StreamFloats;
+            const long f = sizeof(float);
+            int sum = step.View2(stream, n, rows, width * f, 0);
+            for (int c = 1; c < p.Hc; c++)
+                sum = step.Op(GraphOp.Add, sum, step.View2(stream, n, rows, width * f, c * n * f));
+            return step.Op(GraphOp.Scale, stackalloc[] { sum }, default, stackalloc[] { 1f / p.Hc });
+        }
 
         protected override int EmitLayerPrologue(GraphStep step, int layer, int stream)
         {
@@ -285,6 +308,12 @@ namespace TensorSharp.Models
             return step.Op(GraphOp.Mul, step.Reshape(perStream, p.StreamFloats, rows), step.Weight(weight));
         }
 
+        /// <summary>x [n, rows] times each row's [hc] weights: [n, hc, rows], each element the one product x[m] * w[c]. As a
+        /// one-term product (a [1, n, rows] by [1, hc, rows] mul_mat) instead of hc copies of x and a multiply: ggml-metal
+        /// runs it as one kernel (Qwen4ExpModel's scatter).</summary>
+        private static int Outer(GraphStep step, int x, long n, int weights, int hc, int rows)
+            => step.Op(GraphOp.MulMat, step.Reshape(x, 1, n, rows), step.Reshape(weights, 1, hc, rows));
+
         /// <summary>x [n, 1, rows] as [n, hc, rows] (hc copies along the stream axis).</summary>
         private static int Streams(GraphStep step, int x, int hc)
         {
@@ -314,7 +343,7 @@ namespace TensorSharp.Models
             int root = step.Op(GraphOp.Sqrt, stackalloc[] { step.Op(GraphOp.Clamp, stackalloc[] { magnitude }, default, stackalloc[] { PleScoreFloor, float.MaxValue }) });
             int sign = step.Op(GraphOp.Div, score, step.Op(GraphOp.Clamp, stackalloc[] { magnitude }, default, stackalloc[] { float.Epsilon * 1e8f, float.MaxValue }));
             int gate = step.Op(GraphOp.Sigmoid, step.Op(GraphOp.Mul, sign, root));                     // [1, hc, rows]
-            int gated = step.Reshape(step.Op(GraphOp.Mul, Streams(step, step.Reshape(value, n, 1, rows), hc), gate), width, rows);
+            int gated = step.Reshape(Outer(step, value, n, gate, hc, rows), width, rows);
 
             // The causal depthwise conv over [history | rows], taps n-gram positions apart, then silu.
             int normed = GroupedNorm(step, gated, rows, LayerName(layer, "ple_norm_conv.weight"));
@@ -382,6 +411,20 @@ namespace TensorSharp.Models
 
         /// <summary>This step's PLE rows, [rows, n]: each sequence's n-gram hashes over its history and its rows (the
         /// history then advances), gathered from the host table.</summary>
+        private const int PleExplicitReadMinRows = 1024;
+        private byte[] _plePackedRows;
+
+        /// <summary>The rows read explicitly into a packed buffer (row i at i * row bytes); 0 to read the mapping.</summary>
+        private unsafe long ReadPleRowsPacked(QuantizedWeight table, int[] ids, long rowBytes)
+        {
+            long need = ids.Length * rowBytes;
+            if (need > int.MaxValue) return 0;
+            if (_plePackedRows == null || _plePackedRows.Length < need)
+                _plePackedRows = GC.AllocateUninitializedArray<byte>((int)need, pinned: true);
+            var packed = (IntPtr)System.Runtime.CompilerServices.Unsafe.AsPointer(ref _plePackedRows[0]);
+            return GgmlBasicOps.HostReadRows(table.Data, rowBytes, ids, packed) ? (long)packed : 0;
+        }
+
         private unsafe float[] GatherPleRows(GraphStep step, int layer)
         {
             PleSpec p = Ple;
@@ -397,11 +440,23 @@ namespace TensorSharp.Models
             var embedded = new float[(long)step.Rows * p.Hidden];
             if (_quantWeights.TryGetValue(PleTable, out QuantizedWeight table))
             {
-                long rowBytes = NativeDequant.RowSize(table.GgmlType, table.Ne0);
+                int type = table.GgmlType, dim = p.HeadDim;
+                long rowBytes = NativeDequant.RowSize(type, table.Ne0);
+                // A row the page cache lacks is a read from disk: a prompt's rows are read explicitly and packed (one
+                // pread each on the native I/O team; as faults a 4096-token chunk's 65K rows took 1.1-3.1 s on an M5
+                // Pro), and the rows are dequantized concurrently, so a decode's 16 faults overlap (Qwen4ExpModel.Ple).
+                long packed = table.IsFileBacked && ids.Length >= PleExplicitReadMinRows ? ReadPleRowsPacked(table, ids, rowBytes) : 0;
+                long source = packed != 0 ? packed : (long)table.Data;
                 fixed (float* dst = embedded)
-                    for (long i = 0; i < ids.Length; i++)
-                        NativeDequant.DequantizeToFloat32Native(table.GgmlType, (IntPtr)((byte*)table.Data + ids[i] * rowBytes),
-                            (IntPtr)(dst + i * p.HeadDim), p.HeadDim);
+                {
+                    long dstA = (long)dst;
+                    void Row(int i) => NativeDequant.DequantizeToFloat32Native(type, (IntPtr)(source + (packed != 0 ? i : ids[i]) * rowBytes),
+                        (IntPtr)(dstA + (long)i * dim * sizeof(float)), dim);
+                    if (ids.Length > 1 && (table.IsFileBacked || ids.Length >= 16 * p.Heads))
+                        Parallel.For(0, ids.Length, Row);
+                    else
+                        for (int i = 0; i < ids.Length; i++) Row(i);
+                }
             }
             else
             {

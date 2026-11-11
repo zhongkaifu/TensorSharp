@@ -69,7 +69,7 @@ namespace TensorSharp.Models
             if (_anyRecurrent && !RecurrentMixerLowers) return "recurrent layers without a graph mixer";
             if (StepAdapter != null) return "a request adapter is selected";
             for (int l = 0; l < Config.NumLayers; l++)
-                if (_moeLayer[l] && MoeCpuOffloadConfig.IsLayerOnCpu(l) && !GraphExecutor.Capabilities.HostExperts) return "host-offloaded experts";
+                if (_moeLayer[l] && IsExpertLayerOffloaded(l) && !GraphExecutor.Capabilities.HostExperts) return "host-offloaded experts";
             DType kv = _kvCacheDtype.ToDType();
             if (kv != DType.Float32 && kv != DType.Float16 && kv != DType.Q8_0 && kv != DType.Q4_0) return $"KV dtype {kv}";
             if ((kv == DType.Q8_0 || kv == DType.Q4_0) && !GraphExecutor.Capabilities.QuantizedKvCache) return $"KV dtype {kv} on this backend's executor";
@@ -538,7 +538,7 @@ namespace TensorSharp.Models
             {
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
                     if (request.CaptureLayers[c] == layer)
-                        outputs.Captures[c] = step.Output(h, (long)width * rows);
+                        outputs.Captures[c] = step.Output(EmitCaptureRow(step, h), (long)hiddenSize * rows);
                 h = EmitLayerPrologue(step, layer, h);
                 int normed = EmitBlockInput(step, layer, h, BlockSite.Mixer, out int mixContext);
                 int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
@@ -555,7 +555,7 @@ namespace TensorSharp.Models
             }
             for (int c = 0; c < request.CaptureLayers.Length; c++)
                 if (request.CaptureLayers[c] >= Config.NumLayers)
-                    outputs.Captures[c] = step.Output(h, (long)width * rows);
+                    outputs.Captures[c] = step.Output(EmitCaptureRow(step, h), (long)hiddenSize * rows);
             if (!request.LastRowLogits && !request.AllRowLogits && !request.CaptureFinal) return outputs;
 
             int final = EmitStreamOutput(step, h);
@@ -616,6 +616,9 @@ namespace TensorSharp.Models
 
         /// <summary>The head's input [hidden, rows] from the stream. Default: the output norm.</summary>
         protected virtual int EmitStreamOutput(GraphStep step, int stream) => step.RmsNorm(stream, "output_norm.weight");
+
+        /// <summary>A DFlash drafter's tapped row [hidden, rows] of the stream entering a layer. Default: the stream.</summary>
+        protected virtual int EmitCaptureRow(GraphStep step, int stream) => stream;
 
         private readonly Dictionary<(int Layer, string Suffix), string> _layerNames = new();
 
@@ -764,20 +767,34 @@ namespace TensorSharp.Models
             int weights = step.Op(GraphOp.GetRows, step.Reshape(probs, 1, _numExperts, rows), selected); // [1, K, rows]
             if (NormalizeExpertWeights)
             {
-                int sum = step.Op(GraphOp.SumRows, step.Reshape(weights, k, rows));                     // [1, rows]
-                weights = step.Op(GraphOp.Div, weights, step.Reshape(sum, 1, 1, rows));
+                // llama.cpp's build_moe_ffn chain with its closing scale, which ggml-metal runs as one kernel with the
+                // softmax and top-k. Neither the clamp nor the scale changes a value (K of the softmax weights sum far
+                // above the clamp); the scale also keeps the chain's last node the one a host-expert pause pins.
+                int picked = step.Reshape(weights, k, rows);
+                int sum = step.Op(GraphOp.Clamp, stackalloc[] { step.Op(GraphOp.SumRows, picked) }, default,
+                    stackalloc[] { 6.103515625e-5f, float.PositiveInfinity });                              // [1, rows]
+                weights = step.Op(GraphOp.Scale, stackalloc[] { step.Reshape(step.Op(GraphOp.Div, picked, sum), 1, k, rows) }, default,
+                    stackalloc[] { 1f });
             }
 
             int output;
-            if (MoeCpuOffloadConfig.IsLayerOnCpu(layer) && GraphExecutor.Capabilities.HostExperts)
+            if (IsExpertLayerOffloaded(layer) && GraphExecutor.Capabilities.HostExperts)
             {
                 // The experts stay in host memory: the program pauses for them (and a registered accelerator tier
                 // runs the routes it holds).
-                output = step.Op(GraphOp.MoeHostExperts, stackalloc[]
-                {
-                    x, selected, weights, step.Experts(p + "ffn_gate_exps.weight"), step.Experts(p + "ffn_up_exps.weight"),
-                    step.Experts(p + "ffn_down_exps.weight"),
-                }, stackalloc long[] { layer });
+                int gateStack = step.Experts(p + "ffn_gate_exps.weight"), upStack = step.Experts(p + "ffn_up_exps.weight"),
+                    downStack = step.Experts(p + "ffn_down_exps.weight");
+                // The next offloaded layer's router and gate stack: the seam may read that layer's predicted misses
+                // into its tier while the accelerator works (Strata's read-ahead; the GGML plugin decides).
+                int next = layer + 1;
+                output = next < Config.NumLayers && _moeLayer[next] && IsExpertLayerOffloaded(next) && OwnsLayer(next)
+                         && StageOfLayer(next) == StageOfLayer(layer)
+                    ? step.Op(GraphOp.MoeHostExperts, stackalloc[]
+                    {
+                        x, selected, weights, gateStack, upStack, downStack,
+                        step.Weight(LayerName(next, "ffn_gate_inp.weight")), step.Experts(LayerName(next, "ffn_gate_exps.weight")),
+                    }, stackalloc long[] { layer })
+                    : step.Op(GraphOp.MoeHostExperts, stackalloc[] { x, selected, weights, gateStack, upStack, downStack }, stackalloc long[] { layer });
             }
             else
             {

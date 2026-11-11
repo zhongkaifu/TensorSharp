@@ -60,6 +60,27 @@ internal static class SpeculativeRuntimeChecks
         Assert.True(decoder.TokensDrafted > 0, $"{label}: the head drafted nothing");
     }
 
+    /// <summary>Greedy speculation through the model's block drafter (DFlash) emits exactly the plain greedy
+    /// tokens: the prompt and every verify feed the drafter's feature rows, and its blocks are verified.</summary>
+    public static void AssertBlockDraftMatchesPlainGreedy(Func<ModelBase> create, string label, int maxNew = 24, double tieTolerance = 0)
+    {
+        int[] prompt = Enumerable.Range(0, 21).Select(i => 40 + (i * 7) % 23).ToArray();
+        List<Greedy> plain = PlainGreedy(create, prompt, maxNew);
+
+        using ModelBase target = create();
+        var spec = Assert.IsAssignableFrom<ISpeculativeModel>(target);
+        Assert.Null(spec.SpeculationRefusal);
+        Assert.Equal(DraftHeadKind.Block, spec.DraftHeadKind);
+        // Gate 0 and no cost governor: every step drafts the whole block, whatever the (random) drafter's confidence.
+        var speculator = new BlockDraftSpeculator(spec, spec.DraftBlockSize, spec.DraftBlockSize) { MinDraftProb = 0 };
+        var decoder = new SpeculativeDecoder(spec, speculator) { AdaptiveSpeculation = false };
+        List<int> drafted = decoder.GenerateGreedy(prompt, maxNew);
+        AssertSameStream(plain, drafted, tieTolerance, label);
+        Assert.Equal(maxNew, drafted.Count);
+        Assert.True(decoder.VerifySteps > 0, $"{label}: no verify ran");
+        Assert.True(decoder.TokensDrafted > 0, $"{label}: the drafter drafted nothing");
+    }
+
     private readonly record struct Greedy(int Token, int RunnerUp, double RelativeMargin);
 
     private static List<Greedy> PlainGreedy(Func<ModelBase> create, int[] prompt, int maxNew)

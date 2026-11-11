@@ -149,6 +149,98 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         Assert.True(rel.All(r => r <= 3e-2), $"{backend}: draft rows relL2 from Qwen4ExpModel: {string.Join(", ", rel.Select(r => r.ToString("E2")))}");
     }
 
+    // ---- DFlash: the drafter reads the hc-stream mean of the residual entering its target layers
+
+    private (string Target, string Draft) DFlashFixtures(bool qsa)
+        => (Fixture(qsa), Qwen4ExpSyntheticModelBuilder.WriteDFlash(Path.Combine(_dir, "q4e-dflash.gguf")));
+
+    /// <summary>The feature rows a prompt and a verify capture, and their logits, match Qwen4ExpModel's native taps
+    /// (which run on GGML only).</summary>
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(BackendType.GgmlMetal)]
+    public void DFlashFeaturesMatchQwen4ExpModelOnMetal(BackendType backend) => DFlashFeaturesMatch(backend);
+
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [InlineData(BackendType.GgmlCpu)]
+    public void DFlashFeaturesMatchQwen4ExpModelOnGgmlCpu(BackendType backend) => DFlashFeaturesMatch(backend);
+
+    private void DFlashFeaturesMatch(BackendType backend)
+    {
+        var (target, draft) = DFlashFixtures(qsa: true);
+        float[][] legacy, actual;
+        using (var family = new Qwen4ExpModel(target, backend, draftGgufPath: draft))
+            legacy = FeatureTrace(family);
+        using (var runtime = new Qwen4ExpRuntimeModel(target, backend, draft))
+            actual = FeatureTrace(runtime);
+        double[] rel = Errors(legacy, actual);
+        Assert.True(rel.All(r => r <= 2e-2), $"{backend}: DFlash rows relL2 from Qwen4ExpModel: {string.Join(", ", rel.Select(r => r.ToString("E2")))}");
+    }
+
+    /// <summary>Each prompt row's features, then a 3-row verify's features and logits.</summary>
+    private static float[][] FeatureTrace(ModelBase model)
+    {
+        var spec = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.ISpeculativeTarget>(model);
+        var head = Assert.IsAssignableFrom<TensorSharp.Runtime.Speculative.IDraftHead>(model);
+        Assert.Equal(TensorSharp.Runtime.Speculative.DraftHeadKind.Block, head.DraftHeadKind);
+        int width = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+        Assert.Equal(3 * Qwen4ExpSyntheticModelBuilder.Hidden, width);
+        int[] prompt = Enumerable.Range(0, 17).Select(i => 40 + (i * 11) % 150).ToArray();
+        int[] window = { 41, 9, 130 };
+        var rows = new List<float[]>();
+        model.ResetKVCache();
+        var hAll = new float[prompt.Length * width];
+        var logits = new float[vocab];
+        spec.SpecForward(prompt, hAll, logits, false);
+        for (int r = 0; r < prompt.Length; r++) rows.Add(hAll[(r * width)..((r + 1) * width)]);
+        rows.Add((float[])logits.Clone());
+        var hWindow = new float[window.Length * width];
+        var windowLogits = new float[window.Length * vocab];
+        spec.SpecForward(window, hWindow, windowLogits, true);
+        for (int r = 0; r < window.Length; r++)
+        {
+            rows.Add(hWindow[(r * width)..((r + 1) * width)]);
+            rows.Add(windowLogits[(r * vocab)..((r + 1) * vocab)]);
+        }
+        // Every tapped layer of every row was written (zeros would compare equal to zeros).
+        foreach (float[] features in hAll.Chunk(width).Concat(hWindow.Chunk(width)))
+            for (int tap = 0; tap < 3; tap++)
+                Assert.Contains(features.Skip(tap * Qwen4ExpSyntheticModelBuilder.Hidden).Take(Qwen4ExpSyntheticModelBuilder.Hidden), v => v != 0);
+        return rows.ToArray();
+    }
+
+    [Fact]
+    public void DFlashSpeculationMatchesPlainGreedyOnTheManagedCpu()
+    {
+        var (target, draft) = DFlashFixtures(qsa: false);
+        SpeculativeRuntimeChecks.AssertBlockDraftMatchesPlainGreedy(() => new Qwen4ExpRuntimeModel(target, BackendType.Cpu, draft), "qwen4exp cpu dflash");
+    }
+
+    [MlxFact]
+    public void DFlashSpeculationMatchesPlainGreedyOnMlx()
+    {
+        var (target, draft) = DFlashFixtures(qsa: false);
+        SpeculativeRuntimeChecks.AssertBlockDraftMatchesPlainGreedy(() => new Qwen4ExpRuntimeModel(target, BackendType.Mlx, draft), "qwen4exp mlx dflash");
+    }
+
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [InlineData(BackendType.GgmlCpu, 1e-2)]
+    public void DFlashSpeculationMatchesPlainGreedyOnGgmlCpu(BackendType backend, double tieTolerance) => DFlashSpeculationOnGgml(backend, tieTolerance);
+
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(BackendType.GgmlMetal, 0)]
+    public void DFlashSpeculationMatchesPlainGreedyOnGgmlMetal(BackendType backend, double tieTolerance) => DFlashSpeculationOnGgml(backend, tieTolerance);
+
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData(BackendType.GgmlCuda, 1e-2)]
+    public void DFlashSpeculationMatchesPlainGreedyOnGgmlCuda(BackendType backend, double tieTolerance) => DFlashSpeculationOnGgml(backend, tieTolerance);
+
+    private void DFlashSpeculationOnGgml(BackendType backend, double tieTolerance)
+    {
+        var (target, draft) = DFlashFixtures(qsa: true);
+        SpeculativeRuntimeChecks.AssertBlockDraftMatchesPlainGreedy(() => new Qwen4ExpRuntimeModel(target, backend, draft), $"qwen4exp {backend} dflash",
+            tieTolerance: tieTolerance);
+    }
+
     /// <summary>Logits of the trunk and of the head's prompt catch-up and two chained drafts.</summary>
     private static List<float[]> DraftTrace(ModelBase model)
     {

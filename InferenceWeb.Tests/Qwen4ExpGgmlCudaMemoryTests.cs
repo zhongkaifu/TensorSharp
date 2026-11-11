@@ -24,15 +24,15 @@ public class Qwen4ExpGgmlCudaMemoryTests
     [InlineData("-2", 1)]
     [InlineData("two", 1)]
     public void TheLaneCount_ComesFromTsQ4eLanes_ClampedToOneToSixteen(string value, int expected)
-        => Assert.Equal(expected, Qwen4ExpModel.GgmlCudaLanes(value));
+        => Assert.Equal(expected, ExpertPlacementPlanner.GgmlCudaLanes(value));
 
     [Fact]
     public void OneLane_ReservesNothing_AndEachFurtherLane_AHolderAndItsState()
     {
         const long holder = 226L << 20, extra = 256L << 20;
-        Assert.Equal(0, Qwen4ExpModel.ConcurrentSequenceReserveBytes(1, holder, extra));
-        Assert.Equal(3 * (holder + extra), Qwen4ExpModel.ConcurrentSequenceReserveBytes(4, holder, extra));
-        Assert.Throws<ArgumentOutOfRangeException>(() => Qwen4ExpModel.ConcurrentSequenceReserveBytes(0, holder, extra));
+        Assert.Equal(0, ExpertPlacementPlanner.ConcurrentSequenceReserveBytes(1, holder, extra));
+        Assert.Equal(3 * (holder + extra), ExpertPlacementPlanner.ConcurrentSequenceReserveBytes(4, holder, extra));
+        Assert.Throws<ArgumentOutOfRangeException>(() => ExpertPlacementPlanner.ConcurrentSequenceReserveBytes(0, holder, extra));
     }
 
     /// <summary>Flash Next's 12 attention layers at 8192 rows: 2 KV heads x 256 dims of K and V plus 128 indexer dims

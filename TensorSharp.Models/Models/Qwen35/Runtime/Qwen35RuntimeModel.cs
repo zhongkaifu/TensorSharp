@@ -118,6 +118,9 @@ namespace TensorSharp.Models
                     $"{arch}: this checkpoint carries PRISM Hadamard rotations (Bonsai2), which only the single-device " +
                     "Qwen 3.5 path applies; it cannot run with --layer-split or host experts on cuda/mlx.");
 
+            // A drafter named besides a separate MTP head attaches after the expert plan, into the same memory.
+            if (_separateDraftHead == null && !string.IsNullOrWhiteSpace(draftModelPath))
+                _pendingDraftBytes = ExpertPlacementPlanner.PendingDFlashDraftBytes(draftModelPath);
             InitializeDecoder(headDim, headDim, string.Create(CultureInfo.InvariantCulture,
                 $"qwen35|{Config.NumHeads}|{Config.NumKVHeads}|{headDim}|{Config.Eps:R}|{Config.RopeBase:R}|{Config.RopeScale:R}|{_ropeDim}|" +
                 $"{_numKHeads}|{_numVHeads}|{_headKDim}|{_convKernel}|{interval}"));
@@ -132,6 +135,7 @@ namespace TensorSharp.Models
             if (TensorRecurrence)
                 BuildDeviceConstants();
             if (_separateDraftHead == null) AttachDraftModel(draftModelPath);
+            _pendingDraftBytes = 0;
         }
 
         /// <summary>A draft head shipped as its own GGUF (validated and open, its layer blk.{NumLayers}), or null:

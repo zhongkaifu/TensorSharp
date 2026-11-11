@@ -301,6 +301,7 @@ namespace TensorSharp.Models
                     Console.WriteLine($"Initial {_backend} KV cache allocation: {initial} tokens (grows on demand up to {maxContext}).");
                 InitCaches(initial, maxContext);
                 InitRecurrentStates();
+                PlanExpertPlacement();
                 PreReplicateNormWeights();
                 Console.WriteLine($"  Placement: {_mesh.Describe()} (shared decoder runtime).");
             }

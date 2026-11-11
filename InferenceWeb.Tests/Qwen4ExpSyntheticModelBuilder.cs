@@ -334,4 +334,49 @@ internal static class Qwen4ExpSyntheticModelBuilder
         SyntheticGguf.Write(path, kv, t);
         return path;
     }
+
+    /// <summary>A one-layer DFlash drafter for the checkpoint <see cref="Write"/> writes: it reads the stream entering
+    /// layers [2, 5, 7], as Flash Next's DFlash2 reads [6, 16, 26, 36, 46], and borrows the trunk's embedding and head.</summary>
+    public static string WriteDFlash(string path, int blockSize = 4)
+    {
+        const int heads = 4, kvHeads = 2, headDim = 64, ffn = 512;
+        int[] taps = { 2, 5, 7 };
+        var kv = new List<Kv>
+        {
+            new Str { Key = "general.architecture", V = "dflash" },
+            new U32 { Key = "dflash.block_count", V = 1 },
+            new U32 { Key = "dflash.embedding_length", V = Hidden },
+            new U32 { Key = "dflash.feed_forward_length", V = ffn },
+            new U32 { Key = "dflash.attention.head_count", V = heads },
+            new U32 { Key = "dflash.attention.head_count_kv", V = kvHeads },
+            new U32 { Key = "dflash.attention.key_length", V = headDim },
+            new U32 { Key = "dflash.attention.value_length", V = headDim },
+            new F32 { Key = "dflash.rope.freq_base", V = 1e7f },
+            new F32 { Key = "dflash.attention.layer_norm_rms_epsilon", V = 1e-6f },
+            new U32 { Key = "dflash.block_size", V = (uint)blockSize },
+            new I32Arr { Key = "dflash.target_layers", V = taps },
+            new U32 { Key = "dflash.attention.sliding_window", V = 4096 },
+            new U32 { Key = "tokenizer.ggml.mask_token_id", V = Vocab - 3 },
+        };
+        float S(int inDim) => 1.5f / System.MathF.Sqrt(inDim);
+        var t = new List<Tensor>
+        {
+            Gen("fc.weight", S(taps.Length * Hidden), taps.Length * Hidden, Hidden),
+            GenAround("enc.output_norm.weight", 1f, 0.1f, Hidden),
+            GenAround("output_norm.weight", 1f, 0.1f, Hidden),
+            GenAround("blk.0.attn_norm.weight", 1f, 0.1f, Hidden),
+            Gen("blk.0.attn_q.weight", S(Hidden), Hidden, heads * headDim),
+            Gen("blk.0.attn_k.weight", S(Hidden), Hidden, kvHeads * headDim),
+            Gen("blk.0.attn_v.weight", S(Hidden), Hidden, kvHeads * headDim),
+            Gen("blk.0.attn_output.weight", 0.25f * S(heads * headDim), heads * headDim, Hidden),
+            GenAround("blk.0.attn_q_norm.weight", 1f, 0.1f, headDim),
+            GenAround("blk.0.attn_k_norm.weight", 1f, 0.1f, headDim),
+            GenAround("blk.0.ffn_norm.weight", 1f, 0.1f, Hidden),
+            Gen("blk.0.ffn_gate.weight", S(Hidden), Hidden, ffn),
+            Gen("blk.0.ffn_up.weight", S(Hidden), Hidden, ffn),
+            Gen("blk.0.ffn_down.weight", 0.25f * S(ffn), ffn, Hidden),
+        };
+        SyntheticGguf.Write(path, kv, t);
+        return path;
+    }
 }

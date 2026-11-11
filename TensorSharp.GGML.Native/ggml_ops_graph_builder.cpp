@@ -244,6 +244,11 @@ namespace
         return raw;
     }
 
+    // The cgraph's slots: every tensor the context can hold (lowering emits several ggml tensors for one program
+    // node - a tiered host-expert pause builds its hot part, about a dozen per MoE layer), plus leaves from other
+    // contexts (tier copies). Sized from the program's node count alone, a 48-layer tiered prefill overflowed it.
+    std::size_t graph_slots(int max_nodes) { return static_cast<std::size_t>(max_nodes) * 2 + 256; }
+
     struct TsgGraph
     {
         TpGroup* tp = nullptr;     // tensor parallelism: the meta device this graph runs on
@@ -265,6 +270,9 @@ namespace
         std::vector<Alias> aliases;
         // Host-expert pauses (OP_MOE_HOST, tsg::HostMoeSegment) and the node each segment ends after.
         std::vector<tsg::HostMoeSegment> host_moe;
+        // Per pause, nodes expanded after its route weights and before its ids: views that keep a fused router
+        // chain's input and ids allocated (see build_host_experts). Null where not needed.
+        std::vector<std::pair<ggml_tensor*, ggml_tensor*>> host_moe_holds;
         std::vector<int> seg_end;
         // Effects and pauses in program order (kind 0: effects[i], 1: host_moe[i]): the graph is expanded in this
         // order, so a pause's boundary tensors precede everything that reads its result.
@@ -333,8 +341,33 @@ namespace
         tsg::HostMoeSegment hm;
         hm.layer = nip > 0 ? static_cast<int>(ip[0]) : 0;
         hm.moe_in = boundary(ggml_reshape_2d(ctx, ggml_is_contiguous(x) ? x : ggml_cont(ctx, x), n, T));
-        hm.sel_ids = boundary(ggml_reshape_2d(ctx, ggml_is_contiguous(ids) ? ids : ggml_cont(ctx, ids), n_used, T));
         hm.weights = boundary(ggml_reshape_2d(ctx, ggml_is_contiguous(weights) ? weights : ggml_cont(ctx, weights), n_used, T));
+        // A router written as llama.cpp's chain (softmax, argsort top-k, get_rows, renormalise, scale) is one kernel on
+        // ggml-metal, which declines it when a chain node is a graph output or the allocator reused the logits'
+        // storage inside it. So contiguous ids (one row) are not pinned (ggml_set_output would flag the argsort):
+        // views no node consumes hold the argsort's storage (ggml-alloc frees a view source only after its last
+        // view is consumed). And a VIEW of the router weight - a bound constant the allocator never frees - reading
+        // the logits as a second source keeps them allocated until after the chain: what ggml_backend_sched's alloc
+        // deps do for a fused kernel's inputs, for this graph that gallocr allocates directly.
+        ggml_tensor* keep_logits = nullptr;
+        ggml_tensor* hold_ids = nullptr;
+        if (ggml_is_contiguous(ids))
+        {
+            hold_ids = ggml_view_1d(ctx, ids, 1, 0);
+            hm.sel_ids = ggml_view_2d(ctx, ids, n_used, T, ggml_row_size(ids->type, n_used), 0);
+        }
+        else
+        {
+            hm.sel_ids = boundary(ggml_reshape_2d(ctx, ggml_cont(ctx, ids), n_used, T));
+        }
+        if (const ggml_tensor* sort = ids->view_src; sort != nullptr && sort->op == GGML_OP_ARGSORT)
+            if (ggml_tensor* soft = sort->src[0]; soft != nullptr && soft->op == GGML_OP_SOFT_MAX)
+                if (ggml_tensor* logits = soft->src[0]; logits != nullptr && logits->op == GGML_OP_MUL_MAT)
+                    if (Leaf* router = leaf_of(g, logits->src[0]); router != nullptr && router->role == LEAF_WEIGHT)
+                    {
+                        keep_logits = ggml_view_1d(ctx, router->tensor, 1, 0);
+                        keep_logits->src[1] = logits;
+                    }
         hm.moe_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
         ggml_set_input(hm.moe_out);
         ggml_set_output(hm.moe_out);
@@ -362,7 +395,24 @@ namespace
             if (T <= tsg::host_moe_tier_max_rows(*tier) && tier->num_experts == hm.num_experts && tier->count >= hm.n_used
                 && tier->type[0] == hm.gate_type && tier->type[1] == hm.up_type && tier->type[2] == hm.down_type)
                 hot = tsg::host_moe_build_hot_part(ctx, hm, hm.moe_in, *tier, ggml_mul_mat_id, 0, nullptr, nullptr);
+        // Strata's read-ahead (srcs 6 and 7: the next offloaded layer's router and gate stack): that router applied
+        // to this layer's FFN input before the pause, so the seam reads the next tier's predicted misses into its
+        // window while the accelerator works (moe_hot_tier_prefetch). Only where the seam computes the tier's routes
+        // itself (decode and verify widths) and the next tier has a window to fill.
+        if (ns >= 8)
+        {
+            Leaf* next_router = leaf_of(g, node_at(g, s[6]));
+            Leaf* next_gate = leaf_of(g, node_at(g, s[7]));
+            if (next_router == nullptr || next_gate == nullptr || next_gate->data == nullptr || next_gate->role != LEAF_WEIGHT)
+                throw std::runtime_error("graph builder: the read-ahead takes the next layer's router and gate stack leaves");
+            next_gate->host_only = true;   // host experts' data, never bound
+            if (hm.tsm_hot != nullptr && tsg::moe_tier_prefetch_k() > 0)
+                if (tsg::MoeHotTier* next_tier = tsg::moe_hot_tier_find(next_gate->data))
+                    if (next_tier->cpu_visible && next_tier->count > next_tier->fixed && next_tier->num_experts == hm.num_experts)
+                        hm.pred_next = boundary(ggml_mul_mat(ctx, next_router->tensor, hm.moe_in));   // [experts, T]
+        }
         g->host_moe.push_back(hm);
+        g->host_moe_holds.emplace_back(keep_logits, hold_ids);
         g->order.emplace_back(1, static_cast<int>(g->host_moe.size()) - 1);
         return hot != nullptr ? ggml_add(ctx, hm.moe_out, hot) : hm.moe_out;
     }
@@ -479,7 +529,9 @@ namespace
         }
         case OP_SOFT_MAX_EXT: need(1); return ggml_soft_max_ext(ctx, src(0), src(1), fpar(0, 1.0f), fpar(1, 0.0f));
         case OP_ARGSORT: need(1); return ggml_argsort(ctx, src(0), ipar(0, 0) == 0 ? GGML_SORT_ORDER_ASC : GGML_SORT_ORDER_DESC);
-        case OP_TOP_K: need(1); return ggml_top_k(ctx, src(0), static_cast<int>(ipar(0, 1)));
+        // Descending, as the IR defines it (ggml_top_k's are in no particular order): a route's position is its rank
+        // to the host seams' route-tail skip, and argsort + view is the chain ggml-metal's top-k MoE fusion matches.
+        case OP_TOP_K: need(1); return ggml_argsort_top_k(ctx, src(0), static_cast<int>(ipar(0, 1)));
         case OP_SUM_ROWS: need(1); return ggml_sum_rows(ctx, src(0));
         case OP_SSM_CONV: need(2); return ssm_conv_any(ctx, src(0), src(1));
         case OP_GATED_DELTA_NET: need(6); return ggml_gated_delta_net(ctx, src(0), src(1), src(2), src(3), src(4), src(5), ipar(0, 1));
@@ -513,7 +565,7 @@ namespace
     // Bind the leaves, then let the graph's own allocator place every other tensor.
     bool build(TsgGraph* g)
     {
-        g->graph = ggml_new_graph_custom(g->ctx, g->max_nodes, false);
+        g->graph = ggml_new_graph_custom(g->ctx, graph_slots(g->max_nodes), false);
         if (g->graph == nullptr) { set_last_error("graph builder: graph allocation failed."); return false; }
         // Effects and host-expert pauses in program order: a pause's boundary tensors come before any node that
         // reads its result (moe_out has no producer, so nothing else orders them).
@@ -525,9 +577,15 @@ namespace
                 continue;
             }
             const tsg::HostMoeSegment& hm = g->host_moe[static_cast<std::size_t>(index)];
+            const auto& [keep_logits, hold_ids] = g->host_moe_holds[static_cast<std::size_t>(index)];
             ggml_build_forward_expand(g->graph, hm.moe_in);
-            ggml_build_forward_expand(g->graph, hm.sel_ids);
+            // The route weights before the ids: their parents then come in llama.cpp's order (softmax, reshape,
+            // argsort, view, get_rows, ...), the node sequence ggml-metal's top-k MoE fusion matches.
             ggml_build_forward_expand(g->graph, hm.weights);
+            if (keep_logits != nullptr) ggml_build_forward_expand(g->graph, keep_logits);
+            ggml_build_forward_expand(g->graph, hm.sel_ids);
+            if (hold_ids != nullptr) ggml_build_forward_expand(g->graph, hold_ids);
+            if (hm.pred_next != nullptr) ggml_build_forward_expand(g->graph, hm.pred_next);   // read at this pause
         }
         for (const Output& o : g->outputs) ggml_build_forward_expand(g->graph, o.tensor);
         // Before allocation: reordering after lifetime planning would invalidate the alias plan (and a
@@ -653,7 +711,7 @@ TSG_EXPORT void* TSGgml_GraphCreateTp(int max_nodes, int replayable, const int* 
         g->replayable = replayable != 0;
         ggml_init_params params{};
         params.mem_size = ggml_tensor_overhead() * static_cast<std::size_t>(max_nodes) * 2
-                          + ggml_graph_overhead_custom(static_cast<std::size_t>(max_nodes), false);
+                          + ggml_graph_overhead_custom(graph_slots(max_nodes), false);
         params.no_alloc = true;
         g->ctx = ggml_init(params);
         if (g->ctx == nullptr)
@@ -716,7 +774,7 @@ TSG_EXPORT void* TSGgml_GraphCreate(int max_nodes, int replayable, int reorder)
         g->reorder = reorder != 0;
         ggml_init_params params{};
         params.mem_size = ggml_tensor_overhead() * static_cast<std::size_t>(max_nodes) * 2
-                          + ggml_graph_overhead_custom(static_cast<std::size_t>(max_nodes), false);
+                          + ggml_graph_overhead_custom(graph_slots(max_nodes), false);
         params.mem_buffer = nullptr;
         params.no_alloc = true;
         g->ctx = ggml_init(params);
