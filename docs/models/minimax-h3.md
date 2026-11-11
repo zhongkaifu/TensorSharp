@@ -429,6 +429,31 @@ default output byte-identical to the second round's:
 | + the third round | 223.4 s | 214.3 s |
 | + `TS_H3_FP8_MATMUL=1` | 188.8 s | 181.0 s |
 
+**Opt-in INT8 projections (`TS_H3_INT8_MATMUL=1`)** are the same idea for a GPU without
+FP8 kernels (sm_80: A100, RTX 30). Each row of the merged weight and each token's
+activations are rounded to int8 against their own peak, cuBLASLt multiplies them with an
+exact int32 sum, and one pass scales the result back to F32. Nothing stays resident: the
+weight is rounded per call, as the BF16 route expands it per call. A shape cuBLASLt has no
+int8 kernel for runs on BF16.
+
+Measured on an A100 80 GB (Linux, sm_80 build) with a 1344x768, 124-frame FL2VA clip and
+the eight-step Turbo plug-in (39,844 tokens), warm server, times per DiT block from
+`TS_H3_STAGE_PROFILE`:
+
+| Projection (in x out) | BF16 multiply | INT8 multiply | INT8 with its rounding and scaling passes |
+|---|---:|---:|---:|
+| fc1, 5376 x 28672 | 50.3 ms | 31.8 ms | 41.0 ms |
+| qkv, 5376 x 21504 | 39.2 ms | 24.6 ms | 31.9 ms |
+| fc2, 14336 x 5376 (SwiGLU input) | 26.5 ms | 16.6 ms | 25.5 ms |
+| out, 7168 x 5376 | 11.7 ms | 7.6 ms | 11.1 ms |
+
+A denoising step went from 21.7 s to 20.2 s and a warm request from 203 s to 191-193 s
+(three clips). The decoded clip is 30.6 dB PSNR from the BF16 route's and identical
+between runs. The attention (cuDNN SDPA, 273 ms a block at this length) is unchanged
+and is now two thirds of a step. ComfyUI's W6A8 H3 makes the same clip in 159-167 s on
+that GPU; its int8 projections take 29.1, 22.6 and 8.9 ms for fc1, qkv and out, and its
+attention 254 ms.
+
 ### Long-sequence attention on Metal
 
 A 1280×768×107 first/last-frame clip on FL2VA is 34,991 packed tokens, and at that
@@ -982,6 +1007,7 @@ but a track that is spectrally plausible and merely wrong.
 | `TS_H3_CUDA_F32_PRODUCTS=1` | `ggml_cuda`: runs the DiT forward's weight products (F32/F16/BF16 weights and LoRA factors; quantized weights and the attention's own products excluded) on TensorSharp's F32 GEMM over a pedantic cuBLAS handle instead of ggml-cuda's TF32 cuBLAS. Off by default (its cost on a real checkpoint is not measured); on the all-F32 LoRA parity fixture the native-vs-direct-CPU floor went from 6.08e-4 to 8.07e-6. A product that cannot take the path is named once on stderr and runs on ggml |
 | `TS_H3_DIRECT_READ=0` | `ggml_cuda` on Windows: uploads weights from the mapping instead of reading the file unbuffered; `TS_H3_DIRECT_READ_THREADS` (1–32, default 8) is the reader count |
 | `TS_H3_FP8_MATMUL` | `ggml_cuda`: opt-in FP8 (E4M3) projections through cuBLASLt; `1` for the DiT, `vae` for the video VAE, `all` for both. Changes the output |
+| `TS_H3_INT8_MATMUL=1` | `ggml_cuda`: opt-in int8 projections for the DiT through cuBLASLt, a scale per weight row and per token; also applies to Qwen-Image-2.1's Q4_K projections on cuBLAS. Changes the output |
 | `TS_H3_STAGE_PROFILE=1` | Synchronizing per-stage timings inside the fused CUDA attention and GEMM nodes, printed when the scratch is released; exclude from formal timings |
 
 ## Reproducing validation

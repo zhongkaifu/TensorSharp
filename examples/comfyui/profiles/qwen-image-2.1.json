@@ -1,0 +1,7 @@
+{
+  "description": "Qwen-Image-2.1 from config/qwen-image-2.1.json: text-to-image and editing in the model's own 40 steps.",
+  "config": "config/qwen-image-2.1.json",
+  "args": ["--backend", "ggml_cuda"],
+  "service_name": "tensorsharp-comfyui-qwen-image",
+  "startup_timeout": 3600
+}

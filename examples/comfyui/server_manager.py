@@ -361,9 +361,13 @@ async def ensure_server(url: str, profile_name: str, log_dir: str, before_start=
                    f"{subprocess.list2cmdline(command)}\n".encode())
     log_file.flush()
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+    env = profile.environment()
+    # One Video Studio store per port: a server refuses to start on a store another
+    # running server owns, and two profiles on two ports otherwise share the default one.
+    env.setdefault("TS_STUDIO_DIRECTORY", os.path.join(log_dir, f"tensorsharp-studio-{port}"))
     proc = subprocess.Popen(
         command, stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-        env=profile.environment(), cwd=os.path.dirname(profile.resolved_server_dll()), creationflags=flags)
+        env=env, cwd=os.path.dirname(profile.resolved_server_dll()), creationflags=flags)
     log_file.close()  # the child holds its own handle
     if sys.platform == "win32":
         _windows_kill_with_parent(proc)

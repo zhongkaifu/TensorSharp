@@ -26,6 +26,12 @@
 // BF16 GEMM's rate. It is opt-in because it changes the result: E4M3 keeps 4
 // significant bits, and on this model's projections the product came out 27 to 37 dB
 // (31 on average) above its own rounding error. See fp8_gemm.
+//
+// TS_H3_INT8_MATMUL=1 multiplies 8-bit integers through cuBLASLt instead, which a GPU
+// without FP8 kernels (sm_80: A100, RTX 30) has tensor cores for as well: each weight
+// row and each token's activations are rounded to int8 against their own peak, the
+// product accumulates exactly in int32, and one pass scales it back to F32. It is
+// opt-in for the same reason: the result changes. See int8_gemm.
 #if defined(TSG_GGML_USE_CUDA)
 
 #include <cuda_runtime.h>
@@ -104,6 +110,37 @@ __global__ void dequant_q4k_bf16(const BlockQ4K* __restrict__ w, const float* __
     q4k_pair(w, delta, blk, threadIdx.x, at, lo, hi);
     out[at] = __float2bfloat16_rn(lo);
     out[at + 32] = __float2bfloat16_rn(hi);
+}
+
+// ggml's block_q6_K (ggml-common.h): 256 weights in 210 bytes, unaligned: the low
+// four bits of each quant (128 bytes), the high two (64), sixteen int8 scales and the
+// F16 super-block scale. Read as bytes.
+enum : int { kQ6KBytes = 210, kQ6KHigh = 128, kQ6KScales = 192, kQ6KD = 208 };
+
+// ggml's dequantize_row_q6_K in F32, rounded to BF16 once. One thread per (half, l)
+// of a block writes that position's four weights.
+__global__ void dequant_q6k_bf16(const uint8_t* __restrict__ w, __nv_bfloat16* __restrict__ out, long long blocks)
+{
+    const long long blk = blockIdx.x;
+    if (blk >= blocks) return;
+    const uint8_t* __restrict__ b = w + blk * kQ6KBytes;
+    const int half = threadIdx.x >> 5;      // 128 weights each
+    const int l = threadIdx.x & 31;
+    const uint8_t* ql = b + 64 * half;
+    const uint8_t* qh = b + kQ6KHigh + 32 * half;
+    const int8_t* sc = reinterpret_cast<const int8_t*>(b + kQ6KScales) + 8 * half;
+    const float d = __half2float(__ushort_as_half((unsigned short) (b[kQ6KD] | (b[kQ6KD + 1] << 8))));
+    const int is = l >> 4;
+    const int h = qh[l];
+    const int q1 = (int) ((ql[l] & 0xF) | ((h & 3) << 4)) - 32;
+    const int q2 = (int) ((ql[l + 32] & 0xF) | (((h >> 2) & 3) << 4)) - 32;
+    const int q3 = (int) ((ql[l] >> 4) | (((h >> 4) & 3) << 4)) - 32;
+    const int q4 = (int) ((ql[l + 32] >> 4) | (((h >> 6) & 3) << 4)) - 32;
+    __nv_bfloat16* __restrict__ y = out + blk * 256 + 128 * half + l;
+    y[0] = __float2bfloat16_rn(d * sc[is] * q1);
+    y[32] = __float2bfloat16_rn(d * sc[is + 2] * q2);
+    y[64] = __float2bfloat16_rn(d * sc[is + 4] * q3);
+    y[96] = __float2bfloat16_rn(d * sc[is + 6] * q4);
 }
 
 __global__ void narrow_rows_bf16(const float* __restrict__ x, long long row_stride, __nv_bfloat16* __restrict__ out,
@@ -250,10 +287,102 @@ __global__ void encode_f16_e4m3(const __half* __restrict__ w, uint8_t* __restric
     raise_peak(peak, top);
 }
 
+// ---- INT8 (TS_H3_INT8_MATMUL) ----
+
+// v, already scaled so that the operand's peak is 127, rounded to int8.
+__device__ __forceinline__ int8_t i8_rn(float v)
+{
+    return (int8_t) (int) fminf(fmaxf(rintf(v), -127.0f), 127.0f);
+}
+
+// Row n of the merged weight rounded to int8 against its largest magnitude, which
+// rowpeak[n] receives as F32 bits. One block per row: its threads find the peak over
+// the row's quant bytes (q4k_pair, as dequant_q4k_bf16 reads them), then round.
+__global__ void dequant_q4k_rows_i8(const BlockQ4K* __restrict__ w, const float* __restrict__ delta,
+                                    int8_t* __restrict__ out, uint32_t* __restrict__ rowpeak, long long rows,
+                                    int blocksPerRow)
+{
+    __shared__ float top[256];
+    const long long n = blockIdx.x;
+    if (n >= rows) return;
+    const long long first = n * blocksPerRow;
+    const int pairs = blocksPerRow * 128;
+    long long at;
+    float lo, hi;
+    float m = 0.0f;
+    for (int i = threadIdx.x; i < pairs; i += blockDim.x)
+    {
+        q4k_pair(w, delta, first + (i >> 7), i & 127, at, lo, hi);
+        m = fmaxf(m, fmaxf(fabsf(lo), fabsf(hi)));
+    }
+    top[threadIdx.x] = m;
+    __syncthreads();
+    for (int half = blockDim.x / 2; half > 0; half >>= 1)
+    {
+        if (threadIdx.x < half) top[threadIdx.x] = fmaxf(top[threadIdx.x], top[threadIdx.x + half]);
+        __syncthreads();
+    }
+    const float peak = top[0];
+    if (threadIdx.x == 0) rowpeak[n] = __float_as_uint(peak);
+    const float inv = peak > 0.0f && peak <= 3.0e38f ? 127.0f / peak : 0.0f;
+    for (int i = threadIdx.x; i < pairs; i += blockDim.x)
+    {
+        q4k_pair(w, delta, first + (i >> 7), i & 127, at, lo, hi);
+        out[at] = i8_rn(lo * inv);
+        out[at + 32] = i8_rn(hi * inv);
+    }
+}
+
+// narrow_rows_bf16 or (swiglu) narrow_swiglu_bf16 with each token's activations rounded
+// to int8 against the token's own peak, which tokpeak[r] receives as F32 bits. One
+// block per token: its threads find the peak, then round.
+__global__ void quant_rows_i8(const float* __restrict__ x, long long row_stride, int swiglu,
+                              int8_t* __restrict__ out, uint32_t* __restrict__ tokpeak, long long cols, long long rows)
+{
+    __shared__ float top[256];
+    const long long r = blockIdx.x;
+    if (r >= rows) return;
+    const float* __restrict__ row = x + r * row_stride;
+    auto value = [&](long long c) {
+        const float g = row[c];
+        return swiglu ? (g / (1.0f + expf(-g))) * row[cols + c] : g;
+    };
+    float m = 0.0f;
+    for (long long c = threadIdx.x; c < cols; c += blockDim.x) m = fmaxf(m, fabsf(value(c)));
+    top[threadIdx.x] = m;
+    __syncthreads();
+    for (int half = blockDim.x / 2; half > 0; half >>= 1)
+    {
+        if (threadIdx.x < half) top[threadIdx.x] = fmaxf(top[threadIdx.x], top[threadIdx.x + half]);
+        __syncthreads();
+    }
+    const float peak = top[0];
+    if (threadIdx.x == 0) tokpeak[r] = __float_as_uint(peak);
+    const float inv = peak > 0.0f && peak <= 3.0e38f ? 127.0f / peak : 0.0f;
+    int8_t* __restrict__ o = out + r * cols;
+    for (long long c = threadIdx.x; c < cols; c += blockDim.x) o[c] = i8_rn(value(c) * inv);
+}
+
+// The int32 products in dst, in place, to F32: element (n, t) times the two scales its
+// operands were divided by. One block per token.
+__global__ void scale_i32_f32(float* __restrict__ dst, long long ld, const uint32_t* __restrict__ rowpeak,
+                              const uint32_t* __restrict__ tokpeak, long long N, long long T)
+{
+    const long long t = blockIdx.x;
+    if (t >= T) return;
+    float* __restrict__ col = dst + t * ld;
+    const int32_t* __restrict__ acc = reinterpret_cast<const int32_t*>(col);
+    const float sx = __uint_as_float(tokpeak[t]) * (1.0f / (127.0f * 127.0f));
+    for (long long n = threadIdx.x; n < N; n += blockDim.x)
+        col[n] = (float) acc[n] * (__uint_as_float(rowpeak[n]) * sx);
+}
+
 // One multiply as cuBLASLt takes it: dst (N x T, ld) = W (K x N) transposed times
-// x (K x T), both operands E4M3, F32 accumulation and result.
+// x (K x T), both operands E4M3 with F32 accumulation and result, or (int8) both int8
+// with an int32 one.
 struct Fp8Plan
 {
+    bool int8 = false;
     int64_t K = 0, N = 0, T = 0, ld = 0;
     bool usable = false;
     cublasLtMatmulDesc_t op = nullptr;
@@ -381,10 +510,10 @@ void fp8_release(GemmState& s)
 // The plan for a shape, or nullptr where cuBLASLt has no FP8 kernel for it: a GPU
 // without one, or a shape it declines. That verdict is kept with the plan, so a
 // declined shape costs one lookup per call.
-Fp8Plan* fp8_plan(GemmState& s, int64_t K, int64_t N, int64_t T, int64_t ld)
+Fp8Plan* fp8_plan(GemmState& s, int64_t K, int64_t N, int64_t T, int64_t ld, bool int8 = false)
 {
     for (Fp8Plan& p : s.plans)
-        if (p.K == K && p.N == N && p.T == T && p.ld == ld) return p.usable ? &p : nullptr;
+        if (p.int8 == int8 && p.K == K && p.N == N && p.T == T && p.ld == ld) return p.usable ? &p : nullptr;
     if (!s.ltProbed)
     {
         s.ltProbed = true;
@@ -396,7 +525,10 @@ Fp8Plan* fp8_plan(GemmState& s, int64_t K, int64_t N, int64_t T, int64_t ld)
         s.plans.clear();
     }
     Fp8Plan p;
+    p.int8 = int8;
     p.K = K; p.N = N; p.T = T; p.ld = ld;
+    const cudaDataType_t operand = int8 ? CUDA_R_8I : CUDA_R_8F_E4M3;
+    const cudaDataType_t result = int8 ? CUDA_R_32I : CUDA_R_32F;
     if (s.lt != nullptr)
     {
         // FP8 kernels take the first operand transposed and the second as it is.
@@ -405,11 +537,11 @@ Fp8Plan* fp8_plan(GemmState& s, int64_t K, int64_t N, int64_t T, int64_t ld)
         cublasLtMatmulPreference_t pref = nullptr;
         int found = 0;
         const cublasStatus_t ok = CUBLAS_STATUS_SUCCESS;
-        p.usable = cublasLtMatmulDescCreate(&p.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) == ok
+        p.usable = cublasLtMatmulDescCreate(&p.op, int8 ? CUBLAS_COMPUTE_32I : CUBLAS_COMPUTE_32F, result) == ok
             && cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &transposed, sizeof(transposed)) == ok
-            && cublasLtMatrixLayoutCreate(&p.a, CUDA_R_8F_E4M3, (uint64_t) K, (uint64_t) N, K) == ok
-            && cublasLtMatrixLayoutCreate(&p.b, CUDA_R_8F_E4M3, (uint64_t) K, (uint64_t) T, K) == ok
-            && cublasLtMatrixLayoutCreate(&p.c, CUDA_R_32F, (uint64_t) N, (uint64_t) T, ld) == ok
+            && cublasLtMatrixLayoutCreate(&p.a, operand, (uint64_t) K, (uint64_t) N, K) == ok
+            && cublasLtMatrixLayoutCreate(&p.b, operand, (uint64_t) K, (uint64_t) T, K) == ok
+            && cublasLtMatrixLayoutCreate(&p.c, result, (uint64_t) N, (uint64_t) T, ld) == ok
             && cublasLtMatmulPreferenceCreate(&pref) == ok
             && cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workLimit,
                                                     sizeof(workLimit)) == ok
@@ -509,6 +641,78 @@ bool fp8_gemm(GemmState& s, const void* w_q4k, const float* delta, int64_t K, in
     }
     const bool ok = cudaStreamSynchronize(nullptr) == cudaSuccess;
     lap("multiply");
+    return ok;
+}
+
+// TS_H3_INT8_MATMUL=1: the DiT's projections on int8 tensor cores.
+bool int8_use()
+{
+    static const bool use = [] {
+        const char* v = std::getenv("TS_H3_INT8_MATMUL");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return use;
+}
+
+// The product on int8 tensor cores: dst[n, t] = sw[n] sx[t] * sum_k Wq[n, k] xq[t, k],
+// where Wq is row n of the merged weight divided by sw[n] = peak / 127 and rounded to
+// int8, and xq token t's activations divided by sx[t] likewise. The sum is exact in
+// int32 (K * 127^2 stays below 2^31 up to K = 133,000), so the only error is the two
+// roundings: each operand keeps 7 bits against its own row's peak, where BF16 keeps
+// 8 significant bits per element. Returns true when dst holds the product; false
+// leaves the BF16 route to compute it: no int8 kernel for this shape on the device, or
+// scratch that could not be had.
+//
+// A scale per weight row and per token is what a GEMM lets through, and it is what
+// this model needs: its tokens' magnitudes differ by orders, and a weight's rows by
+// less but enough. Rounding the weight per call (each row read twice from its Q4_K
+// blocks, the LoRA update merged in) keeps nothing resident, as the BF16 route keeps
+// nothing.
+template <typename Lap>
+bool int8_gemm(GemmState& s, const void* w_q4k, const float* delta, int64_t K, int64_t N, const float* x,
+               int64_t x_row_stride, int x_swiglu, int64_t T, float* dst, int64_t dst_ld, Lap&& lap)
+{
+    if (K > 131072 || T > 0x7fffffffLL || N > 0x7fffffffLL) return false;
+    Fp8Plan* plan = fp8_plan(s, K, N, T, dst_ld, true);
+    if (plan == nullptr)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            std::fprintf(stderr, "[h3-int8] cuBLASLt has no int8 kernel for %lld x %lld x %lld here; such products "
+                                 "run on BF16.\n", (long long) K, (long long) N, (long long) T);
+        }
+        return false;
+    }
+    if (ensure(s.peak, s.peakBytes, (std::size_t) (N + T) * sizeof(uint32_t)) == nullptr) return false;
+    if (plan->pick.workspaceSize > 0 && ensure(s.work, s.workBytes, plan->pick.workspaceSize) == nullptr)
+        return false;
+    const auto* wq = static_cast<const BlockQ4K*>(w_q4k);
+    auto* wc = static_cast<int8_t*>(s.w);        // sized for BF16: twice what int8 needs
+    auto* xc = static_cast<int8_t*>(s.x);
+    auto* rowpeak = static_cast<uint32_t*>(s.peak);
+    uint32_t* tokpeak = rowpeak + N;
+    const int perRow = (int) (K / 256);
+
+    dequant_q4k_rows_i8<<<(unsigned int) N, 256>>>(wq, delta, wc, rowpeak, N, perRow);
+    lap("dequant");
+    quant_rows_i8<<<(unsigned int) T, 256>>>(x, x_row_stride, x_swiglu, xc, tokpeak, K, T);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    lap("narrow");
+
+    const int32_t alpha = 1, beta = 0;
+    if (cublasLtMatmul(s.lt, plan->op, &alpha, wc, plan->a, xc, plan->b, &beta, dst, plan->c, dst, plan->c,
+                       &plan->pick.algo, s.work, plan->pick.workspaceSize, nullptr) != CUBLAS_STATUS_SUCCESS)
+    {
+        plan->usable = false;       // BF16 for this shape from here on
+        return false;
+    }
+    lap("multiply");
+    scale_i32_f32<<<(unsigned int) T, 256>>>(dst, dst_ld, rowpeak, tokpeak, N, T);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    const bool ok = cudaStreamSynchronize(nullptr) == cudaSuccess;
+    lap("scale");
     return ok;
 }
 
@@ -720,6 +924,8 @@ bool tsg_cuda_q4k_lora_gemm_bf16(const void* w_q4k, int64_t K, int64_t N, const 
     }
 
 #if defined(TSG_CUDA_FP8_GEMM)
+    if (int8_use() && int8_gemm(s, w_q4k, delta, K, N, x, x_row_stride, x_swiglu, T, dst, dst_ld, lap))
+        return true;
     if ((fp8_use() & FP8_DIT) != 0
         && fp8_gemm(s, w_q4k, delta, K, N, x, x_row_stride, x_swiglu, T, dst, dst_ld, lap))
         return true;
@@ -747,6 +953,35 @@ bool tsg_cuda_q4k_lora_gemm_bf16(const void* w_q4k, int64_t K, int64_t N, const 
     const bool ok = cudaStreamSynchronize(nullptr) == cudaSuccess;
     lap("multiply");
     return ok;
+}
+
+// tsg_cuda_q4k_gemm_bf16 for a contiguous Q6_K W (the tensors a Q4_K_M file keeps at
+// six bits): dequantized to BF16 per call, one cuBLAS GEMM with F32 accumulation.
+bool tsg_cuda_q6k_gemm_bf16(const void* w_q6k, int64_t K, int64_t N, const float* x, int64_t x_row_stride,
+                            int64_t T, float* dst, int64_t dst_ld)
+{
+    if (K % 256 != 0 || K <= 0 || N <= 0 || T <= 0) return false;
+    GemmState& s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (!ensure_handle(s)) return false;
+    const std::size_t wNeed = (std::size_t) N * K * sizeof(__nv_bfloat16);
+    const std::size_t xNeed = (std::size_t) T * K * sizeof(__nv_bfloat16);
+    if (ensure(s.w, s.wBytes, wNeed) == nullptr || ensure(s.x, s.xBytes, xNeed) == nullptr) return false;
+    auto* wb = static_cast<__nv_bfloat16*>(s.w);
+    auto* xb = static_cast<__nv_bfloat16*>(s.x);
+    const long long blocks = (long long) N * (K / 256);
+    dequant_q6k_bf16<<<(unsigned int) blocks, 64>>>(static_cast<const uint8_t*>(w_q6k), wb, blocks);
+    narrow_rows_bf16<<<grid_for((long long) T * K), 256>>>(x, x_row_stride, xb, K, T);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    const float alpha = 1.0f, beta = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(s.handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                                           (int) N, (int) T, (int) K, &alpha,
+                                           wb, CUDA_R_16BF, (int) K,
+                                           xb, CUDA_R_16BF, (int) K, &beta,
+                                           dst, CUDA_R_32F, (int) dst_ld,
+                                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) return false;
+    return cudaStreamSynchronize(nullptr) == cudaSuccess;
 }
 
 // dst[n, t] = sum_k W[n, k] * act(x)[t, k] for a contiguous F16 W of N rows by K: the

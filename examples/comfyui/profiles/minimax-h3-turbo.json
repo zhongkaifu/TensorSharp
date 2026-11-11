@@ -1,0 +1,7 @@
+{
+  "description": "MiniMax-H3 FL2VA from config/minimax-h3-fl2va.json with the LightX2V Turbo 8-step plug-in: text-to-video, first and last frame, with a 32 kHz stereo soundtrack, in eight steps.",
+  "config": "config/minimax-h3-fl2va.json",
+  "args": ["--backend", "ggml_cuda", "--lora", "../../config/lora/minimax-h3-fl2v-turbo-8step.json"],
+  "service_name": "tensorsharp-comfyui-minimax-h3",
+  "startup_timeout": 3600
+}

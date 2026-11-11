@@ -1,0 +1,7 @@
+{
+  "description": "MiniMax-H3 from config/minimax-h3-fl2va.json: text-to-video, first and last frame, and reference pictures, with a 32 kHz stereo soundtrack, in the model's own 20 steps.",
+  "config": "config/minimax-h3-fl2va.json",
+  "args": ["--backend", "ggml_cuda"],
+  "service_name": "tensorsharp-comfyui-minimax-h3",
+  "startup_timeout": 3600
+}

@@ -161,7 +161,20 @@ namespace {
 // note above h3_attend). TS_H3_CUDNN_ATTENTION=0 keeps every attention on ggml.
 // ---------------------------------------------------------------------------
 #if defined(TSG_GGML_USE_CUDA) && defined(TSG_HAVE_CUDNN)
+extern "C" bool tsg_cudnn_sdpa_f32_strided(const float* q, int64_t q_stride_s, int64_t q_stride_h, const void* k,
+                                           const void* v, float* out, int64_t heads, int64_t seq_q, int64_t seq_kv,
+                                           int64_t head_dim, int64_t k_stride_s, int64_t k_stride_h,
+                                           int64_t v_stride_s, int64_t v_stride_h, float scale);
+
+// stridedQ also admits a Q that is a strided view (a permutation of [D, H, Sq]).
+bool sdpa_wants(const ggml_tensor* node, bool stridedQ);
+
 bool h3_sdpa_wants(const ggml_tensor* node, void*)
+{
+    return sdpa_wants(node, false);
+}
+
+bool sdpa_wants(const ggml_tensor* node, bool stridedQ)
 {
     if (node->op != GGML_OP_FLASH_ATTN_EXT) return false;
     const ggml_tensor* q = node->src[0];
@@ -180,7 +193,10 @@ bool h3_sdpa_wants(const ggml_tensor* node, void*)
     if (D % 8 != 0 || D > 256 || k->ne[0] != D || v->ne[0] != D) return false;
     if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1) return false;
     if (k->ne[2] != q->ne[2] || v->ne[2] != q->ne[2] || v->ne[1] != k->ne[1]) return false;   // no GQA
-    if (!ggml_is_contiguous(q) || !ggml_is_contiguous(node)) return false;
+    if (!ggml_is_contiguous(node)) return false;
+    if (stridedQ ? q->nb[0] != sizeof(float) || q->nb[1] % sizeof(float) != 0 || q->nb[2] % sizeof(float) != 0
+                 : !ggml_is_contiguous(q))
+        return false;
     if (node->ne[0] != D || node->ne[1] != q->ne[2] || node->ne[2] != q->ne[1]) return false;
     for (const ggml_tensor* t : { k, v })
         if (t->nb[0] != sizeof(ggml_fp16_t) || t->nb[1] % 16 != 0 || t->nb[2] % 16 != 0) return false;
@@ -197,7 +213,9 @@ bool h3_sdpa_run_node(ggml_tensor* node)
     float scale = 0.0f;
     std::memcpy(&scale, node->op_params, sizeof(float));
     const int64_t h = sizeof(ggml_fp16_t);
-    return tsg_cudnn_sdpa_f32(static_cast<const float*>(q->data), k->data, v->data, static_cast<float*>(node->data),
+    const int64_t f = sizeof(float);
+    return tsg_cudnn_sdpa_f32_strided(static_cast<const float*>(q->data), static_cast<int64_t>(q->nb[1]) / f,
+                              static_cast<int64_t>(q->nb[2]) / f, k->data, v->data, static_cast<float*>(node->data),
                               q->ne[2], q->ne[1], k->ne[1], q->ne[0],
                               static_cast<int64_t>(k->nb[1]) / h, static_cast<int64_t>(k->nb[2]) / h,
                               static_cast<int64_t>(v->nb[1]) / h, static_cast<int64_t>(v->nb[2]) / h, scale);
@@ -872,6 +890,32 @@ ggml_tensor* h3_mm(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x, bool guard
 }
 
 } // namespace
+
+// Declared in ggml_ops_internal.h (C++ linkage) for other models' graphs.
+extern "C++" {
+namespace tsg
+{
+    bool cudnn_sdpa_node_wants(const ggml_tensor* node)
+    {
+#if defined(TSG_GGML_USE_CUDA) && defined(TSG_HAVE_CUDNN)
+        return g_backend_type == BACKEND_TYPE_CUDA && sdpa_wants(node, true) && tsg_cudnn_sdpa_available();
+#else
+        (void) node;
+        return false;
+#endif
+    }
+
+    bool cudnn_sdpa_node_run(ggml_tensor* node)
+    {
+#if defined(TSG_GGML_USE_CUDA) && defined(TSG_HAVE_CUDNN)
+        return h3_sdpa_run_node(node);
+#else
+        (void) node;
+        return false;
+#endif
+    }
+}
+} // extern "C++"
 
 TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeDecode(const TSGgmlMiniMaxH3VideoVaeDecodeDesc* d)
 {
