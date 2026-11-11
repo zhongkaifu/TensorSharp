@@ -354,24 +354,29 @@ namespace TensorSharp.Models
         /// One decode row on a request slot that then waits in the pool: the first request takes it, so neither the
         /// slot's allocation nor the graph of its first decode window lands on that request's first token (Qwen3.6
         /// 35B-A3B on an M5 Pro: 3 ms to allocate the slot, 7 ms to build the one-row graph of a 55-token prompt's
-        /// last token). Last, after every warm-up that resets the cache (a reset clears the graph cache).
+        /// last token). Where prompts are checkpointed, a second slot waits too, its buffers bound on the device, for
+        /// the first request's prompt-tail checkpoint to be copied into there. Last, after every warm-up that resets
+        /// the cache (a reset clears the graph cache).
         /// </summary>
         private void WarmPooledSlot()
         {
             if (!SupportsUnifiedBatching || GraphUnsupportedReason() != null || _mesh.Stages > 1
                 || ExecutionOptions.FromEnvironment().KvHolderPoolMax <= 0)
                 return;
-            const string key = "\u0001warm-slot";
+            string[] keys = SupportsPrefixCheckpoints ? new[] { "\u0001warm-slot", "\u0001warm-checkpoint" } : new[] { "\u0001warm-slot" };
             int safeToken = Config.VocabSize > 1 ? 1 : 0;
-            EnsureSequenceSlot(key, FreshSlotTokens);
             var logits = new float[1][];
             try
             {
-                TryForwardUnified(new[] { key }, new[] { new[] { safeToken } }, new[] { 0 }, logits);
+                foreach (string key in keys)
+                {
+                    EnsureSequenceSlot(key, FreshSlotTokens);
+                    TryForwardUnified(new[] { key }, new[] { new[] { safeToken } }, new[] { 0 }, logits);
+                }
             }
             finally
             {
-                OnSequenceReleased(key);
+                foreach (string key in keys) OnSequenceReleased(key);
             }
         }
 

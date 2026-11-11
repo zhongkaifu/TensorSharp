@@ -104,7 +104,7 @@ namespace TensorSharp.Models
             slot.Length = source.Length;
             slot.DraftStart = source.DraftStart;
             slot.RopeDelta = source.RopeDelta;
-            if (TryCopySlotOnDevice(source, slot))
+            if (TryCopySlotOnDevice(source, slot, targetBound: inPlace))
                 return slot;
             SyncToHost(source);
             CopyRowsOnHost(source.K, slot.K, source.Length, inPlace);
@@ -134,11 +134,14 @@ namespace TensorSharp.Models
         /// a memcpy there took 4.4 ms for Qwen3.6-35B-A3B's 54-token checkpoint on an M5 Pro, a copy program binding
         /// the new slot's 40 buffers 8.7 ms), tensor-parallel caches, quantized rows or a state graphs do not bind.
         /// </summary>
-        private bool TryCopySlotOnDevice(Slot source, Slot target)
+        /// <param name="targetBound">The target is a pooled slot whose buffers the device already holds: the copy
+        /// program binds nothing new, and costs less than a host copy on a device that reads host bytes too (Metal:
+        /// a 54-token checkpoint of Qwen3.6-35B-A3B).</param>
+        private bool TryCopySlotOnDevice(Slot source, Slot target, bool targetBound)
         {
             if (!source.DeviceDirty || source.Length <= 0 || _graphTpRanks != null || _mesh.TensorParallel != 1
                 || GraphExecutor is not { Capabilities.BindsHostPointers: true } executor
-                || !(executor.Capabilities.SeparateDeviceCopies || ForceDeviceSlotCopies))
+                || !(executor.Capabilities.SeparateDeviceCopies || ForceDeviceSlotCopies || targetBound))
                 return false;
             int kvType = KvGgmlType(_kvCacheDtype.ToDType());
             if (kvType != GraphFormat.F32 && kvType != GraphFormat.F16) return false;
