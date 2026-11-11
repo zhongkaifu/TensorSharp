@@ -36,11 +36,12 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
         string path = Fixture(qsa: false);
         float[][] expected = Run(() => new Qwen4ExpModel(path, BackendType.Cpu), chunkedPrompt);
         float[][] actual = Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cpu), chunkedPrompt);
-        // On arm64 one prompt runs the same products in the same order: the same bits within 1.5e-7. A chunked
-        // prompt's managed products pick their kernels by row count, so either model moves by ~5e-3 against its
-        // own unchunked run (Qwen4ExpModel: 4.7e-3 measured), and the two by as much against each other; on x64
-        // the two models' products differ by as much in one prompt too (6.4e-3 measured on Linux).
-        AssertClose(expected, actual, chunkedPrompt || !System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.Equals(System.Runtime.InteropServices.Architecture.Arm64) ? 1e-2 : 1e-5, "managed cpu");
+        // The managed executor runs the recurrent mixer's regions as fused host kernels (ManagedGraphExecutor), whose
+        // results stay within 2.4e-7 of the region's own ops but round differently; through this fixture's routing
+        // (16 random experts, top 4) that moves one prompt by ~3.3e-3 on arm64. A chunked prompt's managed products
+        // pick their kernels by row count, so either model moves by ~5e-3 against its own unchunked run
+        // (Qwen4ExpModel: 4.7e-3 measured), and x64's products differ by 6.4e-3 in one prompt (Linux).
+        AssertClose(expected, actual, 1e-2, "managed cpu");
     }
 
     /// <summary>MLX (F16 attention over F16 caches, MLX's own kernels) against Qwen4ExpModel's managed run.</summary>
