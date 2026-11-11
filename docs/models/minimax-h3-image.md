@@ -106,33 +106,45 @@ encoder. ComfyUI's sampling time is its progress bar; TensorSharp's phases are t
 | 2048x2048 (4 MP) | Text | Denoise, 6 steps | VAE decode | ComfyUI job |
 |---|---:|---:|---:|---:|
 | ComfyUI template | | 2.6 s (0.43 s/step) | | 3.97 s |
-| TensorSharp, bf16 projections | 0.09 s | 3.17 s (0.53 s/step) | 0.47 s (121 tiles) | 5.28 s |
-| TensorSharp, `TS_H3_INT8_MATMUL=1` (`minimax-h3-image-int8`) | 0.09 s | 2.63 s (0.44 s/step) | 0.44 s | 4.72 s |
+| TensorSharp, bf16 projections | 0.10 s | 3.09 s (0.51 s/step) | 0.28 s (121 tiles) | 4.38 s |
+| TensorSharp, `TS_H3_INT8_MATMUL=1` (`minimax-h3-image-int8`) | 0.09 s | 2.55 s (0.43 s/step) | 0.27 s | 3.88 s |
 
 | 4096x4096 (16 MP) | Text | Denoise, 6 steps | VAE decode | ComfyUI job |
 |---|---:|---:|---:|---:|
 | ComfyUI template | | 14.7 s (2.45 s/step) | | 19.9 s |
-| TensorSharp, bf16 projections | 0.09 s | 16.4 s (2.74 s/step) | 1.7 s (441 tiles) | 23.7 s |
-| TensorSharp, `TS_H3_INT8_MATMUL=1` (`minimax-h3-image-int8`) | 0.09 s | 13.4 s (2.24 s/step) | 1.7 s | 20.7 s |
+| TensorSharp, bf16 projections | 0.09 s | 15.8 s (2.63 s/step) | 0.95 s (441 tiles) | 19.6 s |
+| TensorSharp, `TS_H3_INT8_MATMUL=1` (`minimax-h3-image-int8`) | 0.09 s | 13.1 s (2.18 s/step) | 0.9 s | 16.9 s |
 
 The job is the ComfyUI prompt through the TensorSharp Image node: TensorSharp's picture
-plus its PNG (0.45 s at 4 MP, 1.55 s at 16 MP), the node's download and decode, and
-ComfyUI's SaveImage, which a ComfyUI-only job pays as well. The first job of a server
-(weights from the page cache) took 9.9 s with int8 and 16.1 s with bf16 at 4 MP, against
-55.1 s for ComfyUI's first job.
+plus its PNG (under 0.1 s at 4 MP, 0.1 to 0.4 s at 16 MP), the node's download and
+decode, and ComfyUI's SaveImage, which a ComfyUI-only job pays as well (2.0 s for a
+16 MP PNG). The first job of a server (weights from the page cache) took 9.1 s with int8
+and 9.5 s with bf16 at 4 MP, against 55.1 s for ComfyUI's first job.
 
 - **Projections.** A BF16 DiT's wide products (qkv, out, fc1, fc2) run on cuBLAS with
   the weight as stored; `TS_H3_INT8_MATMUL=1` rounds each weight row and each token
   to int8 per call and multiplies on int8 tensor cores, the precision class of
   ComfyUI's INT8 checkpoint. It is opt-in because it changes the picture: against
   the bf16 picture of the same seed it measured 17.5 to 19.8 dB PSNR (same
-  composition, different detail).
+  composition, different detail). fc2 reads fc1's [gate | value] output and applies
+  the SwiGLU as it narrows (or rounds) its input, so the SwiGLU's own pass over a
+  [14336, tokens] tensor is gone (1.5 ms a block at 16 MP).
+- **Attention.** cuDNN's SDPA runs the 56 x 128 attention over 16,540 tokens in 18 ms
+  a block (21 ms with its prep and widening), the rate PyTorch's cuDNN backend reaches
+  on the same GPU (its FlashAttention-2 took 30 ms); it is about half of a 16 MP step.
 - **VAE.** The decoder runs a row of 256-pixel tiles in one native call
-  (`TSGgml_MiniMaxH3VitDecodeBatch`): at 16 MP that is 21 calls rather than 441,
-  1.29 s of native time where per-tile calls took 1.84 s.
-- **PNG.** The desktop media provider encodes PNGs at zlib level 1 with adaptive
-  filters (ImageMagick quality 15): a 16 MP picture took 8.3 s at ImageMagick's
-  default level 7 and 0.9 s now, for a file 14% larger.
+  (`TSGgml_MiniMaxH3VitDecodeBatch`), and the row's attention in one cuDNN call over a
+  batch of sequences rather than one call and one concat per tile: 0.7 s of native
+  time at 16 MP, where per-tile attention took 1.29 s and per-tile calls 1.84 s.
+- **PNG.** PNGs are written by the managed codec on every media provider: the Up
+  filter, and bands of about 1 MiB of rows deflated at zlib level 4 in parallel (each
+  band its own IDAT chunk, the pigz construction). The encode of a 16 MP picture
+  takes about 0.1 s for 19.9 MB, where ImageMagick took 8.3 s at its default level 7
+  and 0.9 s at level 1 (21.3 MB for the same picture); from the end of the decode to
+  the written file, 1.6 s became 0.1 to 0.4 s.
+- **Preview.** The TensorSharp Image node previews the finished picture at most
+  1024 pixels on its long side; ComfyUI writes a preview as a full PNG, which took
+  1.1 s for a 16 MP picture. The node's `image` output is the full picture.
 - **Pictures, not pixels.** The two engines start from the same latent (the noise
   is ComfyUI's), and at 16 MP give the same composition, but they do not agree
   pixel for pixel: the Q4_K_M encoder against INT8, bf16 or per-call int8 against

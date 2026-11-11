@@ -72,6 +72,63 @@ public class MediaProviderContractTests : IDisposable
         Assert.Equal((w, h), Desktop.ReadDimensions(png));
     }
 
+    [Theory]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void ManagedPng_SeveralDeflateBands_RoundTripExactly(int channels)
+    {
+        // About 1 MiB of scanlines a band: 300 pixels a row and 4,000 rows make three or four
+        // bands, each its own IDAT chunk, every band but the last ending in a sync flush.
+        const int w = 300, h = 4000;
+        var rng = new Random(7);
+        byte[] pixels = new byte[w * h * channels];
+        for (int i = 0; i < pixels.Length; i++)
+            pixels[i] = (byte)((i / channels % w) + (i / (w * channels)) * 3 + rng.Next(8));
+        byte[] png = Managed.EncodePng(pixels, w, h, channels);
+
+        Assert.True(CountChunks(png, "IDAT") >= 3);
+        byte[] rgba = Managed.DecodeRgba(png, out int dw, out int dh);
+        Assert.Equal((w, h), (dw, dh));
+        ImageResult stb = ImageResult.FromMemory(png, ColorComponents.RedGreenBlueAlpha);
+        Assert.Equal(rgba, stb.Data);
+        for (int p = 0; p < w * h; p++)
+            for (int c = 0; c < 4; c++)
+                Assert.Equal(c < channels ? pixels[p * channels + c] : (byte)255, rgba[p * 4 + c]);
+
+        // The same pixels give the same file: the bands follow the geometry, not the cores.
+        Assert.Equal(png, Managed.EncodePng(pixels, w, h, channels));
+    }
+
+    [Fact]
+    public void Adler32Combine_MatchesTheChecksumOfTheConcatenation()
+    {
+        var rng = new Random(3);
+        byte[] a = new byte[70_001], b = new byte[123_457];
+        rng.NextBytes(a);
+        rng.NextBytes(b);
+        Assert.Equal(Adler32(a.Concat(b).ToArray()), PngCodec.Adler32Combine(Adler32(a), Adler32(b), b.Length));
+        Assert.Equal(Adler32(a), PngCodec.Adler32Combine(Adler32(a), 1, 0));
+    }
+
+    private static uint Adler32(byte[] data)
+    {
+        uint s1 = 1, s2 = 0;
+        foreach (byte x in data) { s1 = (s1 + x) % 65521; s2 = (s2 + s1) % 65521; }
+        return (s2 << 16) | s1;
+    }
+
+    private static int CountChunks(byte[] png, string type)
+    {
+        int count = 0;
+        for (int at = 8; at + 8 <= png.Length;)
+        {
+            int length = (png[at] << 24) | (png[at + 1] << 16) | (png[at + 2] << 8) | png[at + 3];
+            if (System.Text.Encoding.ASCII.GetString(png, at + 4, 4) == type) count++;
+            at += 12 + length;
+        }
+        return count;
+    }
+
     [Fact]
     public void ManagedPng_EncodesRgbAsOpaque_AndIsReadableByThirdPartyDecoders()
     {

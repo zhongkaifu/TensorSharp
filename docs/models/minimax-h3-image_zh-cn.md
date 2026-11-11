@@ -91,28 +91,35 @@ TensorSharp 读取 bf16 DiT 与 Q4_K_M 编码器。ComfyUI 的采样时间取自
 | 2048x2048（4 MP） | 文本 | 去噪，6 步 | VAE 解码 | ComfyUI 任务 |
 |---|---:|---:|---:|---:|
 | ComfyUI 模板 | | 2.6 s（0.43 s/步） | | 3.97 s |
-| TensorSharp，bf16 投影 | 0.09 s | 3.17 s（0.53 s/步） | 0.47 s（121 个瓦片） | 5.28 s |
-| TensorSharp，`TS_H3_INT8_MATMUL=1`（`minimax-h3-image-int8`） | 0.09 s | 2.63 s（0.44 s/步） | 0.44 s | 4.72 s |
+| TensorSharp，bf16 投影 | 0.10 s | 3.09 s（0.51 s/步） | 0.28 s（121 个瓦片） | 4.38 s |
+| TensorSharp，`TS_H3_INT8_MATMUL=1`（`minimax-h3-image-int8`） | 0.09 s | 2.55 s（0.43 s/步） | 0.27 s | 3.88 s |
 
 | 4096x4096（16 MP） | 文本 | 去噪，6 步 | VAE 解码 | ComfyUI 任务 |
 |---|---:|---:|---:|---:|
 | ComfyUI 模板 | | 14.7 s（2.45 s/步） | | 19.9 s |
-| TensorSharp，bf16 投影 | 0.09 s | 16.4 s（2.74 s/步） | 1.7 s（441 个瓦片） | 23.7 s |
-| TensorSharp，`TS_H3_INT8_MATMUL=1`（`minimax-h3-image-int8`） | 0.09 s | 13.4 s（2.24 s/步） | 1.7 s | 20.7 s |
+| TensorSharp，bf16 投影 | 0.09 s | 15.8 s（2.63 s/步） | 0.95 s（441 个瓦片） | 19.6 s |
+| TensorSharp，`TS_H3_INT8_MATMUL=1`（`minimax-h3-image-int8`） | 0.09 s | 13.1 s（2.18 s/步） | 0.9 s | 16.9 s |
 
 “任务”指经由 TensorSharp Image 节点的整个 ComfyUI prompt：TensorSharp 的生成及其 PNG 编码
-（4 MP 时 0.45 s，16 MP 时 1.55 s）、节点的下载与解码，以及 ComfyUI 的 SaveImage（纯 ComfyUI
-任务同样需要）。服务器的第一个任务（权重来自页缓存）在 4 MP 时 int8 为 9.9 s、bf16 为 16.1 s，
-ComfyUI 的第一个任务为 55.1 s。
+（4 MP 时不到 0.1 s，16 MP 时 0.1 至 0.4 s）、节点的下载与解码，以及 ComfyUI 的 SaveImage
+（纯 ComfyUI 任务同样需要，16 MP 的 PNG 为 2.0 s）。服务器的第一个任务（权重来自页缓存）在 4 MP
+时 int8 为 9.1 s、bf16 为 9.5 s，ComfyUI 的第一个任务为 55.1 s。
 
 - **投影。** BF16 DiT 的宽矩阵乘（qkv、out、fc1、fc2）以原样权重在 cuBLAS 上运行；
   `TS_H3_INT8_MATMUL=1` 每次调用时把每一行权重和每个 token 舍入为 int8，在 int8 Tensor Core 上相乘，
   与 ComfyUI INT8 检查点属同一精度档次。它是可选项，因为会改变图像：与同一种子的 bf16 图像相比，
-  PSNR 为 17.5 至 19.8 dB（构图相同，细节不同）。
-- **VAE。** 解码器在一次原生调用中处理一整行 256 像素瓦片（`TSGgml_MiniMaxH3VitDecodeBatch`）：
-  16 MP 时为 21 次调用而非 441 次，原生耗时 1.29 s，逐瓦片调用为 1.84 s。
-- **PNG。** 桌面媒体提供者以 zlib 1 级加自适应滤波（ImageMagick quality 15）编码 PNG：一张 16 MP
-  图像在 ImageMagick 默认的 7 级下需要 8.3 s，现在为 0.9 s，文件大 14%。
+  PSNR 为 17.5 至 19.8 dB（构图相同，细节不同）。fc2 直接读取 fc1 的 [gate | value] 输出，在收窄
+  （或舍入）输入时完成 SwiGLU，省去了 SwiGLU 对 [14336, token 数] 张量的单独一遍（16 MP 时每块 1.5 ms）。
+- **注意力。** cuDNN 的 SDPA 在 16,540 个 token 上运行 56 x 128 的注意力，每块 18 ms（含准备与回宽为
+  21 ms），与同一 GPU 上 PyTorch 的 cuDNN 后端相当（其 FlashAttention-2 为 30 ms），约占 16 MP 每步的一半。
+- **VAE。** 解码器在一次原生调用中处理一整行 256 像素瓦片（`TSGgml_MiniMaxH3VitDecodeBatch`），
+  这一行的注意力也以一个批次在一次 cuDNN 调用中完成，而不是每个瓦片一次调用加一次拼接：16 MP 时
+  原生耗时 0.7 s，逐瓦片注意力为 1.29 s，逐瓦片调用为 1.84 s。
+- **PNG。** 所有媒体提供者都用托管编解码器写 PNG：Up 滤波，按约 1 MiB 的行分段，以 zlib 4 级并行压缩
+  （每段一个 IDAT 块，即 pigz 的做法）。一张 16 MP 图像的编码约 0.1 s，19.9 MB；ImageMagick 在默认的
+  7 级下需要 8.3 s，1 级为 0.9 s（同一张图 21.3 MB）；从解码结束到文件写完，由 1.6 s 变为 0.1 至 0.4 s。
+- **预览。** TensorSharp Image 节点对生成的图像只预览长边至多 1024 像素的缩小版；ComfyUI 会把预览写成完整
+  PNG，16 MP 时需要 1.1 s。节点的 `image` 输出仍是完整图像。
 - **画面而非像素。** 两个引擎从相同的潜变量出发（噪声与 ComfyUI 一致），16 MP 时构图相同，但
   逐像素并不一致：Q4_K_M 编码器对 INT8、bf16 或逐次 int8 对 ComfyUI 的 INT8 权重与内核，这些差异
   在 6 步蒸馏采样中被放大（两个引擎之间 PSNR 为 9 至 12 dB；4 MP 时构图可能不同）。两者都遵循了
