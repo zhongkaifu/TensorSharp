@@ -390,7 +390,10 @@ namespace TensorSharp.Models
             {
                 foreach (string key in keys)
                 {
-                    EnsureSequenceSlot(key, FreshSlotTokens);
+                    // A device with no room for the second slot (EnsureDeviceRoomForSlot) keeps the first warm: refused
+                    // here, the exception ended the load.
+                    try { EnsureSequenceSlot(key, FreshSlotTokens); }
+                    catch (SequenceSlotUnavailableException) { break; }
                     TryForwardUnified(new[] { key }, new[] { new[] { safeToken } }, new[] { 0 }, logits);
                 }
             }
