@@ -51,7 +51,10 @@ namespace TensorSharp.GGML
                 DecodeWindowRows = metal ? 64 : 256,
                 // ggml-metal's tensor-API flash attention takes F16 K/V in windows of 64 only: a 1.8K prompt's
                 // attention took 110 ms over F32 fresh rows of exact length, 51 ms over the padded cache window (M5 Pro).
-                PaddedCacheAttention = metal,
+                // ggml-cuda groups a KV head's queries only over K whose length is a multiple of 256: over exact-length
+                // rows Qwen3.6-35B-A3B's 3.6K prompt spent 133.6 ms in flash attention, Qwen35Model's padded window 31.5
+                // (A40, nsys).
+                PaddedCacheAttention = metal || backend == GgmlBackendType.Cuda,
                 TensorParallel = backend == GgmlBackendType.Cuda,
                 BindsHostPointers = true,
                 SeparateDeviceCopies = backend is GgmlBackendType.Cuda or GgmlBackendType.Vulkan,
