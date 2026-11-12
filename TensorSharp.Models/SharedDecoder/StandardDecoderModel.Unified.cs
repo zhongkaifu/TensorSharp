@@ -66,7 +66,7 @@ namespace TensorSharp.Models
                 return HolderPrefixCacheAdapter.TryCaptureCopy(this, requestId, payloadKey, out footprint);
             _retainedSlots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
             if (_retainedSlots.ContainsKey(payloadKey) || slot.Length <= 0) return false;
-            _retainedSlots.Add(payloadKey, CopySlot(slot, slot.Length));
+            _retainedSlots.Add(payloadKey, Retained(CopySlot(slot, slot.Length)));
             footprint = MeasureEndState(payloadKey);
             return true;
         }

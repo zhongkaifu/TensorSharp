@@ -71,7 +71,7 @@ namespace TensorSharp.Models
         public PayloadFootprint MeasureEndState(string payloadKey)
         {
             if (!TryGetRetained(payloadKey, out Slot slot)) return default;
-            long bytes = 0;
+            long bytes = RecurrentStateBytes(slot);
             foreach (Tensor t in AllCacheTensors(slot.K)) bytes = checked(bytes + t.Storage.ByteLength);
             foreach (Tensor t in AllCacheTensors(slot.V)) bytes = checked(bytes + t.Storage.ByteLength);
             bool host = _backend is BackendType.Cpu or BackendType.GgmlCpu;
@@ -85,6 +85,28 @@ namespace TensorSharp.Models
             long bytes = CloneBytes(slot, targetTokens);
             bool host = _backend is BackendType.Cpu or BackendType.GgmlCpu;
             return new ResourceVector { HostKv = host ? bytes : 0, DeviceKv = host ? 0 : bytes };
+        }
+
+        /// <summary>A slot's recurrent states, which the prefix cache's budget charges with its caches.</summary>
+        private static long RecurrentStateBytes(Slot slot)
+        {
+            long bytes = 0;
+            if (slot.Recurrent != null)
+                foreach (RecurrentState[] layer in slot.Recurrent)
+                    if (layer != null)
+                        foreach (RecurrentState state in layer)
+                            if (state != null) bytes = checked(bytes + state.StateBytes);
+            return bytes;
+        }
+
+        /// <summary>A slot entering the retained set no longer speculates: its states give up their verify buffers.</summary>
+        private static Slot Retained(Slot slot)
+        {
+            if (slot?.Recurrent != null)
+                foreach (RecurrentState[] layer in slot.Recurrent)
+                    if (layer != null)
+                        foreach (RecurrentState state in layer) state?.ReleaseSpecBuffers();
+            return slot;
         }
 
         private bool TryGetRetained(string payloadKey, out Slot slot)

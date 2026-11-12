@@ -520,6 +520,13 @@ namespace TensorSharp.Models
             public Tensor PleConvHistory { get; private set; }
             private int[] _verifyTokens = Array.Empty<int>();
 
+            protected internal override void ReleaseSpecBuffers()
+            {
+                base.ReleaseSpecBuffers();
+                PleConvHistory?.Dispose();
+                PleConvHistory = null;
+            }
+
             public override bool EnsureSpecBuffers(int rows)
             {
                 bool grown = base.EnsureSpecBuffers(rows);

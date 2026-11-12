@@ -355,7 +355,7 @@ namespace TensorSharp.Models
                     _primary = null;
                 }
             }
-            _retainedSlots.Add(key, slot);
+            _retainedSlots.Add(key, Retained(slot));
             _slots.Remove(requestId);
             return true;
         }

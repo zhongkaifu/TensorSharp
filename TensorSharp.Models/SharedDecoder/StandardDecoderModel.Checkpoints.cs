@@ -60,7 +60,7 @@ namespace TensorSharp.Models
             if (_retainedSlots.ContainsKey(key)) return false;
             Slot active = SnapshotActive();
             if (active.K == null || active.Length <= 0) return false;
-            _retainedSlots.Add(key, CopySlot(active, active.Length));
+            _retainedSlots.Add(key, Retained(CopySlot(active, active.Length)));
             return true;
         }
 

@@ -276,6 +276,22 @@ namespace TensorSharp.Models
             public Tensor ConvHistory { get; private set; }
             public int SnapshotCapacity { get; private set; }
 
+            /// <summary>A retained slot drops its verify buffers: [rows | states] for up to SnapshotCapacity rows is
+            /// several GB on a 27B DFlash2 slot, which the prefix cache's budget did not see (a 24 GB A5000 ran out of
+            /// memory on the fourth request).</summary>
+            protected internal override void ReleaseSpecBuffers()
+            {
+                Verify?.Dispose();
+                ConvHistory?.Dispose();
+                Verify = null;
+                ConvHistory = null;
+                SnapshotCapacity = 0;
+            }
+
+            protected internal override long StateBytes
+                => Conv.Storage.ByteLength + Backing.Storage.ByteLength
+                   + (Verify?.Storage.ByteLength ?? 0) + (ConvHistory?.Storage.ByteLength ?? 0);
+
             /// <summary>Room for a <paramref name="rows"/>-row verify; true when the buffers moved.</summary>
             public virtual bool EnsureSpecBuffers(int rows)
             {

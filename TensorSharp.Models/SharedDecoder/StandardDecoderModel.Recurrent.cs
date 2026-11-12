@@ -69,6 +69,13 @@ namespace TensorSharp.Models
             /// <summary>The state's host bytes were rewritten: drop every device copy of them.</summary>
             protected internal virtual void OnHostWritten() { }
 
+            /// <summary>The slot holding this state no longer speculates (it was retained for prefix reuse): free what
+            /// only a verify window needs; a later verify allocates it again.</summary>
+            protected internal virtual void ReleaseSpecBuffers() { }
+
+            /// <summary>Bytes of the state's tensors (a retained slot's footprint counts them with its caches).</summary>
+            protected internal virtual long StateBytes => 0;
+
             /// <summary>The per-op path can verify a draft window on this state: it keeps the state
             /// before the window and after each of its rows (<see cref="BeginVerify"/>).</summary>
             protected internal virtual bool SupportsVerify => false;
