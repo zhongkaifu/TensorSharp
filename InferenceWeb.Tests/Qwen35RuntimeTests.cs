@@ -1054,6 +1054,53 @@ public sealed class Qwen35RuntimeTests : IDisposable
         Assert.Equal(0, unified.EnsureSequenceSlot("second", 64));
     }
 
+    /// <summary>A slot whose rows a graph left on the device grows there (new caches zero-filled on the device, the rows
+    /// copied device to device) when a request's reservation passes its capacity, and decoding continues exactly as
+    /// without the growth. Through the host it downloaded every row and uploaded them again.</summary>
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData(BackendType.GgmlCuda)]
+    public void SlotsGrowOnTheDeviceOnCuda(BackendType backend) => AssertSlotsGrowOnTheDevice(backend);
+
+    [GgmlTheory(BackendType.GgmlVulkan)]
+    [InlineData(BackendType.GgmlVulkan)]
+    public void SlotsGrowOnTheDeviceOnVulkan(BackendType backend) => AssertSlotsGrowOnTheDevice(backend);
+
+    private void AssertSlotsGrowOnTheDevice(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture("dense");
+        int[] prompt = Enumerable.Range(0, 37).Select(i => 41 + (i * 7) % 90).ToArray();
+        int[] tail = { 71, 72, 73, 74 };
+        var expected = new List<float[]>();
+        using (var reference = Create(path, backend: backend))
+        {
+            var u = (IUnifiedBatchModel)reference;
+            u.EnsureSequenceSlot("a", 2048);
+            var logits = new float[1][];
+            Assert.True(u.TryForwardUnified(new[] { "a" }, new[] { prompt }, new[] { 0 }, logits));
+            for (int i = 0; i < tail.Length; i++)
+            {
+                Assert.True(u.TryForwardUnified(new[] { "a" }, new[] { new[] { tail[i] } }, new[] { prompt.Length + i }, logits));
+                expected.Add((float[])logits[0].Clone());
+            }
+        }
+
+        using var model = Create(path, backend: backend);
+        var unified = (IUnifiedBatchModel)model;
+        unified.EnsureSequenceSlot("a", 64);
+        var rows = new float[1][];
+        Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { prompt }, new[] { 0 }, rows));
+        int before = model.DeviceSlotGrowths;
+        Assert.Equal(prompt.Length, unified.EnsureSequenceSlot("a", 2048));   // past the fresh slot's 512 cells
+        Assert.True(model.DeviceSlotGrowths > before, "the slot grew through the host");
+        for (int i = 0; i < tail.Length; i++)
+        {
+            Assert.True(unified.TryForwardUnified(new[] { "a" }, new[] { new[] { tail[i] } }, new[] { prompt.Length + i }, rows));
+            double rel = RelL2(rows[0], expected[i]);
+            Assert.True(rel <= 1e-5, $"row {i} after the growth: relL2 {rel:E2}");
+        }
+    }
+
     /// <summary>The unified step times its host parts as the batched decode does
     /// (tensorsharp.engine.step.phase.duration): the decoders' draws ("sample", by decoders) and each forward ("issue",
     /// by the rows it ran: a prompt chunk's many, two decoders' two).</summary>

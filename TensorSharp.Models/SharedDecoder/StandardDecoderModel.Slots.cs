@@ -401,12 +401,13 @@ namespace TensorSharp.Models
         private void EnsureSlotCapacity(Slot slot, int required)
         {
             if (required <= slot.Capacity) return;
-            SyncToHost(slot);
             if (required > _maxContextLength)
                 throw new InvalidOperationException($"Requested sequence length {required} exceeds configured max context {_maxContextLength}.");
             int capacity = Math.Max(slot.Capacity, 1);
             while (capacity < required)
                 capacity = Math.Min(_maxContextLength, capacity * 2);
+            if (TryGrowSlotOnDevice(slot, capacity)) return;
+            SyncToHost(slot);
             (Tensor[][] k, Tensor[][] v) = AllocateCaches(capacity);
             ClearGraphCache();
             CopyRows(slot.K, k, slot.Length);

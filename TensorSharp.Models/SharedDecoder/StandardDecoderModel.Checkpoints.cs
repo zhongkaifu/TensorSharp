@@ -81,6 +81,9 @@ namespace TensorSharp.Models
         public bool SettleForCopy(string payloadKey)
             => _retainedSlots != null && payloadKey != null && _retainedSlots.ContainsKey(payloadKey);
 
+        /// <summary>Slots grown on the device (<see cref="TryGrowSlotOnDevice"/>); tests check the path was taken.</summary>
+        internal int DeviceSlotGrowths { get; private set; }
+
         /// <summary>Slot copies made on the device (<see cref="TryCopySlotOnDevice"/>); tests check the path was taken.</summary>
         internal int DeviceSlotCopies { get; private set; }
 
@@ -91,6 +94,29 @@ namespace TensorSharp.Models
         /// <summary>Per-rank tensor-parallel graphs on one stage: each rank's share of a slot is primed and copied on its own
         /// device (GGML ranks keep their device copies in per-rank caches).</summary>
         private bool RankedSlotCopies => _rankGraphs && _graphTpRanks == null && _mesh.TensorParallel > 1 && _mesh.Stages == 1 && IsGgmlBackend;
+
+        /// <summary>Every tensor of <paramref name="slot"/> a graph binds has a device copy of the size the graphs bind
+        /// (one device), so a copy can read the device instead of the host.</summary>
+        private bool DeviceCopiesResident(Slot slot)
+        {
+            if (!KeepsDeviceCopies || _mesh.TensorParallel != 1 || _mesh.Stages != 1) return false;
+            foreach (Tensor t in AllCacheTensors(slot.K).Concat(AllCacheTensors(slot.V)))
+                if (GgmlBasicOps.CachedBufferBytes(TensorComputePrimitives.GetStoragePointer(t)) != t.Storage.ByteLength)
+                    return false;
+            if (slot.Recurrent != null)
+                foreach (RecurrentState[] layer in slot.Recurrent)
+                    if (layer != null)
+                        foreach (RecurrentState state in layer)
+                            if (state?.GraphTensors is { } tensors)
+                                foreach (Tensor t in tensors)
+                                    if (GgmlBasicOps.CachedBufferBytes(TensorComputePrimitives.GetStoragePointer(t)) != t.ElementCount() * sizeof(float))
+                                        return false;
+            return true;
+        }
+
+        /// <summary>The GGML backend keeps device copies of what graphs bind (Metal, CUDA, Vulkan; not the CPU, whose
+        /// graphs read the host bytes): a host-current slot can still be copied on the device.</summary>
+        internal bool KeepsDeviceCopies => IsGgmlBackend && _backend != BackendType.GgmlCpu;
 
         /// <summary>The executor keeps separate device copies, so a slot copy a graph left there stays there.</summary>
         internal bool SlotCopiesStayOnDevice => ForceDeviceSlotCopies
@@ -149,7 +175,7 @@ namespace TensorSharp.Models
         /// a 54-token checkpoint of Qwen3.6-35B-A3B).</param>
         private bool TryCopySlotOnDevice(Slot source, Slot target, bool targetBound)
         {
-            if (!source.DeviceDirty || source.Length <= 0 || _graphTpRanks != null || (_mesh.TensorParallel != 1 && !RankedSlotCopies)
+            if (source.Length <= 0 || _graphTpRanks != null || (_mesh.TensorParallel != 1 && !RankedSlotCopies)
                 || GraphExecutor is not { Capabilities.BindsHostPointers: true } executor
                 || !(executor.Capabilities.SeparateDeviceCopies || ForceDeviceSlotCopies || targetBound))
                 return false;
@@ -159,10 +185,30 @@ namespace TensorSharp.Models
                 foreach (RecurrentState[] layer in source.Recurrent)
                     if (layer != null && Array.Exists(layer, state => state?.GraphTensors == null))
                         return false;
+            // The source's device copies hold its bytes: a graph left them there, or a sync to the host (a checkpoint
+            // written to its file) copied them out and left them as they were. The server exports every shared-prefix
+            // checkpoint, so its clones went through the host and their next graph uploaded every row again
+            // (Qwen3.5-9B, ggml_cuda: 0.39-0.43 s of a 16K-token reuse's 0.8 s first token).
+            if (!source.DeviceDirty && !DeviceCopiesResident(source)) return false;
             // A fresh target's buffers are written by the copy before anything reads them: no upload of its host bytes.
             if (!targetBound) PrimeDeviceCopies(target, overwritten: true);
 
-            int rows = source.Length;
+            RunSlotCopies(source, target, source.Length, kvType, executor, states: true);
+            if (_anyRecurrent)
+                for (int l = 0; l < source.Recurrent.Length; l++)
+                    if (source.Recurrent[l] != null)
+                        for (int rank = 0; rank < source.Recurrent[l].Length; rank++)
+                            target.Recurrent[l][rank].AfterDeviceCopy(source.Recurrent[l][rank]);
+            target.DeviceDirty = true;
+            DeviceSlotCopies++;
+            return true;
+        }
+
+        /// <summary>One copy program per (stage, rank): rows [0, <paramref name="rows"/>) of every cache entry from
+        /// <paramref name="source"/> into <paramref name="target"/> (each by its own capacity), and with
+        /// <paramref name="states"/> every state's graph-bound tensors, between the slots' device copies.</summary>
+        private void RunSlotCopies(Slot source, Slot target, int rows, int kvType, IGraphExecutor executor, bool states)
+        {
             for (int stage = 0; stage < _mesh.Stages; stage++)
             for (int rank = 0; rank < _mesh.TensorParallel; rank++)
             {
@@ -178,7 +224,7 @@ namespace TensorSharp.Models
                 for (int l = 0; l < TotalLayers; l++)
                 {
                     if (!OwnsLayer(l) || StageOfLayer(l) != stage) continue;
-                    if (_anyRecurrent && l < source.Recurrent.Length && source.Recurrent[l] != null)
+                    if (states && _anyRecurrent && l < source.Recurrent.Length && source.Recurrent[l] != null)
                     {
                         Tensor[] from = source.Recurrent[l][rank].GraphTensors, to = target.Recurrent[l][rank].GraphTensors;
                         for (int i = 0; i < from.Length; i++)
@@ -218,13 +264,44 @@ namespace TensorSharp.Models
                 int Leaf(Tensor t, int type, params long[] ne)
                     => g.Leaf(GraphLeafRole.State, type, ne, TensorComputePrimitives.GetStoragePointer(t), t.Storage.ByteLength, handle: t);
             }
-            if (_anyRecurrent)
-                for (int l = 0; l < source.Recurrent.Length; l++)
-                    if (source.Recurrent[l] != null)
-                        for (int rank = 0; rank < source.Recurrent[l].Length; rank++)
-                            target.Recurrent[l][rank].AfterDeviceCopy(source.Recurrent[l][rank]);
-            target.DeviceDirty = true;
-            DeviceSlotCopies++;
+        }
+
+        /// <summary>
+        /// Grow a slot's caches to <paramref name="capacity"/> cells on the device: new caches whose device copies are
+        /// zero-filled there, the rows copied device to device, the states left as they are. Through the host, a clone
+        /// that a request's reservation grew downloaded every row and uploaded them again at its next graph (Qwen3.5-9B,
+        /// ggml_cuda, a 16K-token reuse: about 0.3 s more than the host clone it replaced). False (nothing changed)
+        /// where the executor keeps no separate device copies or the rows are not on the device.
+        /// </summary>
+        private bool TryGrowSlotOnDevice(Slot slot, int capacity)
+        {
+            if (slot.Length <= 0 || _graphTpRanks != null || (_mesh.TensorParallel != 1 && !RankedSlotCopies)
+                || GraphExecutor is not { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } } executor)
+                return false;
+            int kvType = KvGgmlType(_kvCacheDtype.ToDType());
+            if (kvType != GraphFormat.F32 && kvType != GraphFormat.F16) return false;
+            if (!slot.DeviceDirty && !DeviceCopiesResident(slot)) return false;
+            (Tensor[][] k, Tensor[][] v) = AllocateCaches(capacity);
+            var grown = new Slot { Capacity = capacity, K = k, V = v };
+            try
+            {
+                PrimeDeviceCopies(grown, overwritten: true);
+                RunSlotCopies(slot, grown, slot.Length, kvType, executor, states: false);
+            }
+            catch
+            {
+                foreach (Tensor t in AllCacheTensors(k).Concat(AllCacheTensors(v))) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+                throw;
+            }
+            ClearGraphCache();
+            foreach (Tensor t in AllCacheTensors(slot.K)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+            foreach (Tensor t in AllCacheTensors(slot.V)) { InvalidateTensorDeviceCache(t); t.Dispose(); }
+            slot.K = k;
+            slot.V = v;
+            slot.Capacity = capacity;
+            // The rows are on the device only: the host bytes of the new caches are not written.
+            slot.DeviceDirty = true;
+            DeviceSlotGrowths++;
             return true;
         }
 

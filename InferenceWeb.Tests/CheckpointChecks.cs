@@ -69,6 +69,16 @@ internal static class CheckpointChecks
                 using var stream = new MemoryStream();
                 Assert.True(slots.TryExportRetainedCache("shared", stream));
                 file = stream.ToArray();
+                // Writing the file synced the checkpoint to the host and left its device copies as they were: a clone
+                // still copies on the device (a server exports every shared-prefix checkpoint it keeps).
+                if (runtime != null && runtime.GraphRuns > 0 && runtime.SlotCopiesStayOnDevice && runtime.KeepsDeviceCopies)
+                {
+                    int beforeClone = runtime.DeviceSlotCopies;
+                    Assert.True(slots.TryCloneRetainedCache("shared", "d"));
+                    Assert.True(runtime.DeviceSlotCopies > beforeClone, $"{run}: a clone of an exported checkpoint went through the host");
+                    slots.BindSequenceCache("d");
+                    Compare(model, tail, expected, tolerance, $"{run} clone after export");
+                }
             }
 
             using ModelBase other = create();
