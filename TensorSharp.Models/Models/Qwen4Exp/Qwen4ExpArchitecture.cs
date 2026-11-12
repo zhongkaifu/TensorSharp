@@ -30,9 +30,9 @@ namespace TensorSharp.Models
 
         public static ModelArchitectureDescriptor Descriptor { get; } = new()
         {
-            Id = Qwen4ExpModel.ArchitectureId,
+            Id = Qwen4ExpFormat.ArchitectureId,
             DisplayName = "Qwen3.8-Flash-Next",
-            Aliases = new[] { Qwen4ExpModel.ArchitectureId },
+            Aliases = new[] { Qwen4ExpFormat.ArchitectureId },
             // --backend cuda loads the direct-CUDA whole-model engine; the GGML backends the native
             // token spans. MLX has no kernels for this architecture and is refused up front.
             Factory = c => c.Backend switch

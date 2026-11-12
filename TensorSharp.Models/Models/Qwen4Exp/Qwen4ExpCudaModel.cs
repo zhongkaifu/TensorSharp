@@ -47,13 +47,13 @@ namespace TensorSharp.Models
             int layerSplitDegree = 1, string draftGgufPath = null)
             : base(ggufPath, Validate(tpDegree, tpGroup, layerSplitDegree), 1, null)
         {
-            Config = new ModelConfig { Architecture = Qwen4ExpModel.ArchitectureId };
+            Config = new ModelConfig { Architecture = Qwen4ExpFormat.ArchitectureId };
             try
             {
                 ParseBaseConfig();
                 ParseTokenizer();
                 // The direct-CUDA engine has no host-expert seam; the GGML token span does.
-                MoeCpuOffloadConfig.WarnUnsupportedBackend(Qwen4ExpModel.ArchitectureId, "cuda");
+                MoeCpuOffloadConfig.WarnUnsupportedBackend(Qwen4ExpFormat.ArchitectureId, "cuda");
                 int maxContext = ResolveConfiguredContextLength();
                 // The checkpoint advertises 262144 tokens: ~7 GiB of attention and indexer rows per
                 // sequence slot. Keep a practical default unless MAX_CONTEXT names one.
@@ -86,7 +86,7 @@ namespace TensorSharp.Models
                 _maxContextLength = _exec.ContextSize;
                 Config.VocabSize = _exec.VocabSize;
                 _logitsBuffer = new float[Config.VocabSize];
-                Console.WriteLine($"Model: {Qwen4ExpModel.ArchitectureId} on the direct-CUDA engine, Layers={Config.NumLayers}, " +
+                Console.WriteLine($"Model: {Qwen4ExpFormat.ArchitectureId} on the direct-CUDA engine, Layers={Config.NumLayers}, " +
                     $"Hidden={Config.HiddenSize}, Vocab={Config.VocabSize}, n_ctx={_maxContextLength}");
             }
             catch
@@ -362,7 +362,7 @@ namespace TensorSharp.Models
 
         private long _reclaimsForNewSlot, _reclaimsForGrowth;
         private static readonly KeyValuePair<string, object> s_architectureTag =
-            new(TelemetryAttributes.ModelArchitecture, Qwen4ExpModel.ArchitectureId);
+            new(TelemetryAttributes.ModelArchitecture, Qwen4ExpFormat.ArchitectureId);
 
         /// <summary>The engine's counters and this model's slot ownership, for TensorSharp's
         /// instruments. Runs on the metrics thread and never takes <c>_sync</c>: a forward holds

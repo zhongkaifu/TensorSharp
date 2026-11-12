@@ -160,12 +160,12 @@ namespace TensorSharp.Models
         /// <summary>The shared-target MTP head (<c>--draft-model mtp-*.gguf</c>): one NextN block after the trunk.</summary>
         protected override GgufFile OpenSeparateDraftHead(string draftModelPath)
         {
-            if (string.IsNullOrWhiteSpace(draftModelPath) || Qwen4ExpModel.IsDFlashDraftFile(draftModelPath)) return null;
+            if (string.IsNullOrWhiteSpace(draftModelPath) || Qwen4ExpFormat.IsDFlashDraftFile(draftModelPath)) return null;
             var file = new GgufFile(draftModelPath);
             try
             {
                 if (file.IsSplit) throw new NotSupportedException("The shared qwen4exp MTP head must be a single GGUF file.");
-                int layer = Qwen4ExpModel.ValidateMtpHead(_gguf, file);
+                int layer = Qwen4ExpFormat.ValidateMtpHead(_gguf, file);
                 if (layer != Config.NumLayers)
                     throw new InvalidOperationException($"qwen4exp MTP block {layer} does not follow the {Config.NumLayers}-layer trunk.");
                 return file;

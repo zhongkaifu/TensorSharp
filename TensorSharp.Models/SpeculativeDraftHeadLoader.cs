@@ -101,7 +101,7 @@ namespace TensorSharp.Models
             {
                 // A DFlash drafter attaches in the constructor, where its feature taps are
                 // set up; reaching here means the constructor declined it and said why.
-                if (Qwen4ExpModel.IsDFlashDraftFile(draftPath))
+                if (Qwen4ExpFormat.IsDFlashDraftFile(draftPath))
                 {
                     error = $"DFlash drafter '{Path.GetFileName(draftPath)}' was not attached when the model loaded "
                             + "(the load log gives the reason).";

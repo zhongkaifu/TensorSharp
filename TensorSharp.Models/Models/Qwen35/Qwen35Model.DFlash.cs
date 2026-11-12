@@ -38,30 +38,6 @@ namespace TensorSharp.Models
     public partial class Qwen35Model
     {
         /// <summary>
-        /// Path of a DFlash drafter GGUF, if one was configured
-        /// (<c>--draft-model</c>) AND it really is one.
-        /// The same flag also names an MTP-only file for other architectures, so
-        /// the architecture string decides rather than the extension.
-        /// </summary>
-        internal static string ResolveQwen35DFlashPath(string path)
-        {
-            if (string.IsNullOrWhiteSpace(path) || !System.IO.File.Exists(path))
-                return null;
-            try
-            {
-                using var probe = new GgufFile(path);
-                string arch = probe.GetString("general.architecture") ?? string.Empty;
-                return string.Equals(arch, DFlashConfig.ArchName, StringComparison.Ordinal) ? path : null;
-            }
-            catch
-            {
-                // A file we cannot open is not a drafter; the loader below will say
-                // so if the operator really meant it.
-                return null;
-            }
-        }
-
-        /// <summary>
         /// Attach a DFlash drafter to this trunk. Called from the constructor after
         /// the trunk weights and caches exist, because the drafter's tensors are
         /// merged into the same dictionaries and its ring is allocated from the same
@@ -69,7 +45,7 @@ namespace TensorSharp.Models
         /// </summary>
         private void TryLoadQwen35DFlash(string draftModelPath)
         {
-            string path = ResolveQwen35DFlashPath(draftModelPath);
+            string path = DFlashDraftFiles.Resolve(draftModelPath);
             if (path == null)
                 return;
 

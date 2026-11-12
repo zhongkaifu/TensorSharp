@@ -62,7 +62,7 @@ namespace TensorSharp.Models
             var file = new GgufFile(path);
             try
             {
-                int layer = ValidateMtpHead(_gguf, file);
+                int layer = Qwen4ExpFormat.ValidateMtpHead(_gguf, file);
                 if (file.IsSplit)
                     throw new NotSupportedException("The shared qwen4exp MTP head must be a single GGUF file.");
                 long fileBytes = new FileInfo(path).Length;

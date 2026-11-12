@@ -51,7 +51,7 @@ namespace TensorSharp.Models
     /// </summary>
     public partial class Qwen4ExpModel : ModelBase
     {
-        public const string ArchitectureId = "qwen4exp";
+        public const string ArchitectureId = Qwen4ExpFormat.ArchitectureId;
 
         // ---- hyper-connections ----
         private int _hc;             // residual stream multiplicity (4)
@@ -109,7 +109,7 @@ namespace TensorSharp.Models
                 ParseTokenizer();
                 // --draft-model names either the shared MTP head or a DFlash/DFlash2
                 // drafter; the file's architecture decides. DFlash attaches last.
-                string dflashPath = IsDFlashDraftFile(draftGgufPath) ? draftGgufPath : null;
+                string dflashPath = Qwen4ExpFormat.IsDFlashDraftFile(draftGgufPath) ? draftGgufPath : null;
                 if (!string.IsNullOrWhiteSpace(draftGgufPath) && dflashPath == null)
                     LoadMtpDraftWeights(draftGgufPath);
 

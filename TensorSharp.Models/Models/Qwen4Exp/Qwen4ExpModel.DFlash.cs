@@ -44,11 +44,6 @@ namespace TensorSharp.Models
         /// order (dflash.target_layers - 1). Null without a DFlash drafter.</summary>
         private int[] _dflashTapLayers;
 
-        /// <summary>True when <paramref name="path"/> names a DFlash/DFlash2 drafter
-        /// (general.architecture = dflash) rather than a shared MTP head.</summary>
-        internal static bool IsDFlashDraftFile(string path)
-            => Qwen35Model.ResolveQwen35DFlashPath(path) != null;
-
         /// <summary>Attach a DFlash drafter. Called last in the constructor, because its
         /// tensors join the trunk's weight dictionaries and its ring comes off the same
         /// allocator. Declines (with a message) rather than failing the load: a drafter

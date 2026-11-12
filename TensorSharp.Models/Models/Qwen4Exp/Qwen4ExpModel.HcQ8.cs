@@ -20,7 +20,6 @@ namespace TensorSharp.Models
     public partial class Qwen4ExpModel
     {
         private const int GgmlTypeBf16 = WeightRequant.GgmlTypeBf16, GgmlTypeQ8_0 = WeightRequant.GgmlTypeQ8_0;
-        internal static readonly bool HcQ8 = Environment.GetEnvironmentVariable("TS_Q4E_HC_Q8") == "1";
         private readonly Dictionary<string, (IntPtr Ptr, long Bytes)> _hcQ8 = new();
         private bool _hcQ8Declined;
 
@@ -34,7 +33,7 @@ namespace TensorSharp.Models
         {
             ptr = IntPtr.Zero;
             bytes = 0;
-            if (!HcQ8 || qw.GgmlType != GgmlTypeBf16 || !IsHcMatrix(name))
+            if (!Qwen4ExpFormat.HcQ8 || qw.GgmlType != GgmlTypeBf16 || !IsHcMatrix(name))
                 return false;
             if (!qw.HasHostData || qw.Ne0 % 32 != 0)
             {

@@ -6,8 +6,19 @@ using TensorSharp.Runtime;
 
 namespace TensorSharp.Models
 {
-    public partial class Qwen4ExpModel
+    /// <summary>Format facts and checks of qwen4exp (Qwen 3.8 Flash Next) checkpoints shared by its executors (the shared
+    /// runtime, the direct-CUDA engine and Qwen4ExpModel): none of them hold model state.</summary>
+    internal static class Qwen4ExpFormat
     {
+        public const string ArchitectureId = "qwen4exp";
+
+        /// <summary>TS_Q4E_HC_Q8=1: BF16 hyper-connection matrices run as Q8_0 copies.</summary>
+        internal static readonly bool HcQ8 = Environment.GetEnvironmentVariable("TS_Q4E_HC_Q8") == "1";
+
+        /// <summary>True when <paramref name="path"/> names a DFlash/DFlash2 drafter (general.architecture = dflash) rather
+        /// than a shared MTP head.</summary>
+        internal static bool IsDFlashDraftFile(string path) => DFlashDraftFiles.Resolve(path) != null;
+
         // Validate metadata and tensor directories before mapping payloads or
         // borrowing target pointers. This does not read or claim weight values.
         // targetTensor finds the target's tensors when they are not in target's own

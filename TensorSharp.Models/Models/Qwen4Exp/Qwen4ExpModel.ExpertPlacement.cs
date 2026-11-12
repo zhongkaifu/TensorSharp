@@ -256,7 +256,7 @@ namespace TensorSharp.Models
                 bytes += kv.Value.RawBytes;
                 // TS_Q4E_HC_Q8=1: the Q8_0 copy of a BF16 hyper-connection matrix is resident besides the file's
                 // pages (without this a 16K-token prompt ran the 48 GB Mac's Metal out of memory).
-                if (HcQ8 && kv.Value.GgmlType == WeightRequant.GgmlTypeBf16 && IsHcMatrix(kv.Key) && kv.Value.Ne0 % 32 == 0)
+                if (Qwen4ExpFormat.HcQ8 && kv.Value.GgmlType == WeightRequant.GgmlTypeBf16 && IsHcMatrix(kv.Key) && kv.Value.Ne0 % 32 == 0)
                     bytes += WeightRequant.Q8_0Bytes(kv.Value.Ne1, kv.Value.Ne0);
             }
             foreach (var kv in _weights)

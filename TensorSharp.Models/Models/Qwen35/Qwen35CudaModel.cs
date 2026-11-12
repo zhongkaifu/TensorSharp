@@ -98,7 +98,7 @@ namespace TensorSharp.Models
                 if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
                     maxContext = Math.Min(maxContext, 65536);
                 int nUbatch = ParseEnvInt("TS_Q35_UBATCH", 2048);
-                _exec = new Qwen35CudaExecutor(ggufPath, maxContext, nUbatch, Qwen35Model.ResolveQwen35DFlashPath(draftGgufPath));
+                _exec = new Qwen35CudaExecutor(ggufPath, maxContext, nUbatch, DFlashDraftFiles.Resolve(draftGgufPath));
                 InitializeEngineRuntime();
                 Console.WriteLine($"Model: qwen35 on the direct-CUDA engine, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
                     $"Vocab={Config.VocabSize}, n_ctx={_maxContextLength}, drafter={(_exec.Draft != null ? "DFlash2" : "none")}");
