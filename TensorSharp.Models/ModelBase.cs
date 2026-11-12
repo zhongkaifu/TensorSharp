@@ -2785,6 +2785,20 @@ namespace TensorSharp.Models
         private bool _forwardIsPrompt;
         protected bool ForwardIsPrompt => _forwardIsPrompt;
 
+        /// <summary>A prompt chunk whose logits the caller will not read when <paramref name="morePromptFollows"/>
+        /// (<see cref="IModelArchitecture.ForwardPrompt(int[], bool)"/>): a model that can skip them returns null.</summary>
+        public float[] ForwardPrompt(int[] tokens, bool morePromptFollows)
+        {
+            _promptLogitsUnused = morePromptFollows;
+            try { return ForwardPrompt(tokens); }
+            finally { _promptLogitsUnused = false; }
+        }
+
+        private bool _promptLogitsUnused;
+        /// <summary>Inside <see cref="ForwardCore"/>: this prompt chunk's logits have no reader, so the model may return
+        /// null instead of computing them.</summary>
+        protected bool PromptLogitsUnused => _promptLogitsUnused;
+
         public float[] Forward(int[] tokens)
         {
             ThrowIfBackendFailed();

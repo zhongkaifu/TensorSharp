@@ -1803,6 +1803,64 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
     }
 
     /// <summary>
+    /// Prompt chunks left in flight on a layer split (Q4eCudaEngine.PromptPipeline.cs): a chunk that more of the prompt
+    /// follows comes back without logits while the last device still runs it, and the next chunk follows it. The prompt's
+    /// last logits and the decode steps after it are those of chunks waited for, bit for bit; so are they when another
+    /// sequence's prompt cuts in between two chunks (it waits for the chunk in flight). TS_Q4E_PROMPT_PIPELINE=0 waits
+    /// for every chunk.
+    /// </summary>
+    [MultiCudaTheory(2)]
+    [InlineData(24, false)]
+    [InlineData(24, true)]
+    [InlineData(96, false)]
+    public void PromptChunksInFlight_AnswerBitForBitAsChunksWaitedFor(int chunk, bool interleave)
+    {
+        string path = Fixture();
+        int[] prompt = Enumerable.Range(0, 384).Select(i => (i * 37 + 11) % 250).ToArray();
+        int[] other = Enumerable.Range(0, 48).Select(i => (i * 53 + 5) % 250).ToArray();
+        float[][] Read(bool inFlight, out long deferred)
+        {
+            using var model = Assert.IsType<Qwen4ExpCudaModel>(ModelBase.Create(path, BackendType.Cuda, layerSplitDegree: 2));
+            var rows = new List<float[]>();
+            model.BindSequenceCache("a");
+            for (int at = 0; at < prompt.Length; at += chunk)
+            {
+                int[] part = prompt[at..Math.Min(prompt.Length, at + chunk)];
+                bool more = at + chunk < prompt.Length;
+                float[] logits = inFlight ? model.ForwardPrompt(part, more) : model.ForwardPrompt(part);
+                if (inFlight && more)
+                    Assert.Null(logits);
+                else if (!more)
+                    rows.Add((float[])logits.Clone());
+                if (interleave && at == chunk)
+                {
+                    // Another sequence's whole prompt between two chunks, then back.
+                    model.BindSequenceCache("b");
+                    rows.Add((float[])model.ForwardPrompt(other).Clone());
+                    model.BindSequenceCache("a");
+                }
+            }
+            foreach (int t in Steps)
+                rows.Add((float[])model.Forward(new[] { t }).Clone());
+            if (interleave)
+            {
+                model.BindSequenceCache("b");
+                rows.Add((float[])model.Forward(new[] { Steps[0] }).Clone());
+            }
+            deferred = model.Engine.PromptChunksDeferred;
+            return rows.ToArray();
+        }
+
+        float[][] waited = Read(inFlight: false, out long none), flight = Read(inFlight: true, out long left);
+        Assert.Equal(0, none);
+        Assert.Equal((prompt.Length - 1) / chunk, left);
+        Assert.Equal(waited.Length, flight.Length);
+        for (int i = 0; i < waited.Length; i++)
+            Assert.True(waited[i].AsSpan().SequenceEqual(flight[i]), $"forward {i} differs with the prompt's chunks in flight");
+        _output.WriteLine($"{left} prompt chunks of {chunk} rows left in flight answer as chunks waited for");
+    }
+
+    /// <summary>
     /// Two groups' batched decode steps in flight on a layer split (the engine's decode lanes, IPipelinedBatchedDecode):
     /// the second group's step issued before the first's finishes, each answers as one batched step of all the rows taken
     /// on its own, bit for bit, through the keys' first uncaptured runs and their captured graphs (a lane's graphs bake in

@@ -281,7 +281,9 @@ namespace TensorSharp.Cuda
 
         public bool SetActiveSlot(int id)
         {
-            DrainDecodeLanes();
+            // Host state only: a prompt chunk in flight stays (its slot is selected again before its next chunk, and a
+            // forward on any other slot waits for it).
+            DrainLanes();
             if (!_slots.TryGetValue(id, out Slot slot))
                 return false;
             _active = slot;
@@ -322,7 +324,7 @@ namespace TensorSharp.Cuda
         /// <summary>Head of a slot without selecting it; false when there is no such slot.</summary>
         public bool SlotHead(int id, out int head)
         {
-            DrainDecodeLanes();
+            DrainLanes();
             head = 0;
             if (!_slots.TryGetValue(id, out Slot slot))
                 return false;
