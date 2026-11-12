@@ -123,9 +123,10 @@ namespace TensorSharp.GGML
             finally { GgmlBasicOps.SetActiveRank(previous); }
         }
 
-        /// <summary>The ranks' graphs segment by segment, each all-reduce partial summed exactly in F32 between segments
-        /// (ggml_ops_graph_builder.cpp's TSGgml_GraphRunRanked over tsg::tp_execute_plans).</summary>
-        public bool RunRanked(IGraphPlan[] plans, GraphRunInputs[] inputs, out string error)
+        /// <summary>The ranks' graphs segment by segment, each all-reduce partial summed between segments
+        /// (ggml_ops_graph_builder.cpp's TSGgml_GraphRunRanked over tsg::tp_execute_plans). An exact sum of a partial wider
+        /// than the transport's F32 limit runs in pieces of 32,764 floats (a 2048-row prompt chunk's: ~256 collectives).</summary>
+        public bool RunRanked(IGraphPlan[] plans, GraphRunInputs[] inputs, bool exactSums, out string error)
         {
             ArgumentNullException.ThrowIfNull(plans);
             ArgumentNullException.ThrowIfNull(inputs);
@@ -133,7 +134,7 @@ namespace TensorSharp.GGML
             for (int r = 0; r < plans.Length; r++)
                 graphs[r] = plans[r] is Plan p ? p.Graph : throw new ArgumentException("every plan must be this executor's", nameof(plans));
             bool ok = GgmlGraph.RunRanked(graphs, Array.ConvertAll(inputs, i => i.Nodes), Array.ConvertAll(inputs, i => i.Data),
-                Array.ConvertAll(inputs, i => i.Bytes), exactF32: true);
+                Array.ConvertAll(inputs, i => i.Bytes), exactSums);
             error = ok ? null : GgmlBasicOps.LastNativeError();
             return ok;
         }

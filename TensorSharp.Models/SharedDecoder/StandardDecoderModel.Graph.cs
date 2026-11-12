@@ -780,7 +780,7 @@ namespace TensorSharp.Models
             var h = new int[ranks];
             for (int r = 0; r < ranks; r++)
             {
-                steps[r].SetPositions(positions);
+                steps[r].SetPositions(r == 0 ? positions : (int[])positions.Clone());   // each rank's own: an advance bumps it
                 if (request.PositionTable != null)
                 {
                     if (n != 1) throw new InvalidOperationException("A rotary position table drives one sequence's rows.");
@@ -904,12 +904,94 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>Whether every tensor-parallel partial must be summed exactly in F32, prompt chunks' too (a fast transport may
+        /// carry wide sums in BF16). Default: decode and verify steps only.</summary>
+        protected virtual bool ExactTensorParallelSums => false;
+
         /// <summary>Compiled per-rank plans by the ranks' combined signature (decode kinds replay), most recent first.</summary>
         private readonly Dictionary<(ulong, ulong), CachedGraph[]> _rankGraphCache = new();
         private readonly LinkedList<(ulong, ulong)> _rankGraphLru = new();
 
+        /// <summary>The last per-rank decode step, kept to run again one position on (<see cref="DecodeReplay"/>'s ranked form).</summary>
+        private sealed class RankedReplay
+        {
+            public GraphStep[] Steps;
+            public CachedGraph[] Plans;
+            public (ulong, ulong) Signature;
+            public StepOutputs Outputs;
+            public Slot[] Slots;
+            public Tensor[][][] K;
+            public RecurrentState[][][] Recurrent;
+            public int[] Capacity, RopeDelta, Starts;
+            public string Shape;
+            public long Epoch;
+        }
+
+        private RankedReplay _rankedReplay;
+
+        private void KeepRankedReplay(GraphStep[] steps, CachedGraph[] plans, StepOutputs outputs, Slot[] slots, int[] starts, string shape)
+        {
+            DropRankedReplay();
+            int n = slots.Length;
+            var r = new RankedReplay
+            {
+                Steps = (GraphStep[])steps.Clone(), Plans = plans, Signature = RankedSignature(steps), Outputs = outputs,
+                Slots = (Slot[])slots.Clone(), K = new Tensor[n][][], Recurrent = new RecurrentState[n][][], Capacity = new int[n],
+                RopeDelta = new int[n], Starts = (int[])starts.Clone(), Shape = shape, Epoch = _graphEpoch,
+            };
+            for (int s = 0; s < n; s++)
+            {
+                r.K[s] = slots[s].K;
+                r.Recurrent[s] = slots[s].Recurrent;
+                r.Capacity[s] = slots[s].Capacity;
+                r.RopeDelta[s] = slots[s].RopeDelta;
+            }
+            _rankedReplay = r;
+        }
+
+        private void DropRankedReplay()
+        {
+            if (_rankedReplay == null) return;
+            foreach (GraphStep step in _rankedReplay.Steps) step?.Dispose();
+            _rankedReplay = null;
+        }
+
+        /// <summary>The kept per-rank decode step advanced one position with <paramref name="inputs"/> as the ranks' rows: the
+        /// same slots (caches, states, capacity), every sequence one position on, the same shape, no graph dropped since,
+        /// and every rank's masks still inside their window (the ranks' steps agree on that, so all advance or none).</summary>
+        private bool TryAdvanceRanked(Slot[] slots, int[] starts, string shape, Tensor[] inputs, out CachedGraph[] plans, out StepOutputs outputs)
+        {
+            plans = null;
+            outputs = default;
+            RankedReplay r = _rankedReplay;
+            if (r == null || r.Epoch != _graphEpoch || r.Shape != shape || r.Slots.Length != slots.Length) return false;
+            for (int s = 0; s < slots.Length; s++)
+            {
+                Slot slot = slots[s];
+                if (!ReferenceEquals(slot, r.Slots[s]) || !ReferenceEquals(slot.K, r.K[s]) || !ReferenceEquals(slot.Recurrent, r.Recurrent[s])
+                    || slot.Capacity != r.Capacity[s] || slot.RopeDelta != r.RopeDelta[s] || starts[s] != r.Starts[s] + 1)
+                    return false;
+            }
+            if (!_rankGraphCache.TryGetValue(r.Signature, out CachedGraph[] cached) || !ReferenceEquals(cached, r.Plans)
+                || !r.Steps[0].TryAdvance(inputs[0]))
+            {
+                DropRankedReplay();
+                return false;
+            }
+            for (int rank = 1; rank < r.Steps.Length; rank++)
+                if (!r.Steps[rank].TryAdvance(inputs[rank]))
+                    throw new InvalidOperationException($"{Config.Architecture}: tensor-parallel rank {rank} could not advance where rank 0 did.");
+            Array.Copy(starts, r.Starts, starts.Length);
+            _rankGraphLru.Remove(r.Signature);
+            _rankGraphLru.AddFirst(r.Signature);
+            plans = cached;
+            outputs = r.Outputs;
+            return true;
+        }
+
         private void ClearRankGraphCache()
         {
+            DropRankedReplay();
             foreach (CachedGraph[] plans in _rankGraphCache.Values)
                 foreach (CachedGraph plan in plans) plan.Dispose();
             _rankGraphCache.Clear();
@@ -941,14 +1023,24 @@ namespace TensorSharp.Models
             int ranks = _mesh.TensorParallel, rows = (int)hidden.Sizes[0];
             bool replayable = executor.Capabilities.Replays;
             foreach (int c in counts) replayable &= c <= SmallChunkRows;
+            // A decode step one position on from the last runs as it advanced, without a trace (TryAdvanceDecode's rule).
+            bool advance = replayable && DecodeStepsAdvance && !DecodeAdvanceDisabled && request.PositionTable == null
+                && !request.RecurrentSnapshots && Array.TrueForAll(counts, c => c == 1);
             Tensor[] inputs = RankInputs(hidden);
             var steps = new GraphStep[ranks];
             CachedGraph[] plans = null;
-            bool owned = false;
+            bool owned = false, replayed = false;
             StepOutputs outputs = default;
             try
             {
-                if (replayable && _rankGraphCache.Count > 0)
+                if (advance && TryAdvanceRanked(slots, starts, request.Shape, inputs, out plans, out outputs))
+                {
+                    Array.Copy(_rankedReplay.Steps, steps, ranks);
+                    replayed = true;
+                    DecodeAdvances++;
+                    GraphReplays++;
+                }
+                else if (replayable && _rankGraphCache.Count > 0)
                 {
                     for (int r = 0; r < ranks; r++)
                         steps[r] = new GraphStep(this, rows, slots, first, counts, starts, replayable, request.RecurrentSnapshots, record: false) { Rank = r };
@@ -1000,10 +1092,25 @@ namespace TensorSharp.Models
                         owned = true;
                     }
                 }
-                if (!executor.RunRanked(Array.ConvertAll(plans, p => p.Plan), Array.ConvertAll(steps, step => step.RunInputs()), out string error))
+                // Decode and verify partials are summed exactly; a prompt chunk's take the fast transport (as Qwen35Model's
+                // tensor-parallel graphs do), unless the family needs exact sums throughout.
+                bool exact = ExactTensorParallelSums || replayable;
+                if (!executor.RunRanked(Array.ConvertAll(plans, p => p.Plan), Array.ConvertAll(steps, step => step.RunInputs()), exact, out string error))
+                {
+                    if (replayed) DropRankedReplay();
                     throw new InvalidOperationException($"{Config.Architecture} tensor-parallel graph step failed: {error}");
+                }
                 GraphRuns++;
                 foreach (Slot slot in slots) slot.DeviceDirty = true;
+                if (replayed)
+                {
+                    Array.Clear(steps);   // the replay owns them
+                }
+                else if (advance && !owned && Array.TrueForAll(steps, step => step.Advanceable))
+                {
+                    KeepRankedReplay(steps, plans, outputs, slots, starts, request.Shape);
+                    Array.Clear(steps);
+                }
                 CachedGraph lead = plans[0];
                 result = new GraphResult
                 {
@@ -1016,7 +1123,8 @@ namespace TensorSharp.Models
             }
             finally
             {
-                foreach (GraphStep step in steps) step?.Dispose();
+                if (!replayed)
+                    foreach (GraphStep step in steps) step?.Dispose();
                 if (owned)
                     foreach (CachedGraph plan in plans) plan?.Dispose();
                 for (int r = 0; r < inputs.Length; r++)

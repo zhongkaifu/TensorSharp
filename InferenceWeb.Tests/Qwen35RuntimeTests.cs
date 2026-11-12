@@ -560,14 +560,24 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData("dense")]
     [InlineData("moe")]
     public void AdvancedDecodeStepsMatchTracedOnes(string variant)
+        => AssertAdvancedDecodeMatchesTraced(variant, path => Create(path, backend: TestGates.PinnedGgmlBackend));
+
+    /// <summary>The same over per-rank graphs on two ggml_cuda GPUs: every rank's step advances in place and the ranks run
+    /// together without a trace.</summary>
+    [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
+    [InlineData("dense")]
+    [InlineData("moe-tp")]
+    public void AdvancedRankedDecodeStepsMatchTracedOnes(string variant)
+        => AssertAdvancedDecodeMatchesTraced(variant, path => new Qwen35RuntimeModel(path, BackendType.GgmlCuda, 2, null, 1));
+
+    private void AssertAdvancedDecodeMatchesTraced(string variant, Func<string, Qwen35RuntimeModel> create)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
-        BackendType backend = TestGates.PinnedGgmlBackend;
         string path = Fixture(variant);
 
         List<float[]> Run(bool advance, out int advances)
         {
-            using var model = Create(path, backend: backend);
+            using var model = create(path);
             model.DecodeAdvanceDisabled = !advance;
             var unified = (IUnifiedBatchModel)model;
             var trace = new List<float[]>();

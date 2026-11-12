@@ -846,9 +846,16 @@ whole programs (`IRankedGraphExecutor`): each rank's program is compiled into a 
 device (`CompileForRank`), its `GraphOp.AllReduce` nodes are the graph's segment boundaries (the native
 builder's `OP_ALLREDUCE` returns its contiguous F32 partial and records it), and the ranks' graphs run
 together through the existing segmented driver (`TSGgml_GraphRunRanked` over `tsg::tp_execute_plans`):
-every rank's segment is submitted, the partial is summed in place in exact F32 on the devices, the next
-segment follows. Decode kinds replay: a later step re-traces only to bind its inputs and finds the ranks'
-plans by their combined signature. Shards and replicated weights are preloaded on every rank's device,
+every rank's segment is submitted, the partial is summed in place on the devices, the next segment
+follows. Decode and verify partials are summed in exact F32; a prompt chunk's take the transport's own
+reduction (upstream NCCL rounds wide F32 sums to BF16, as Qwen35Model's tensor-parallel graphs accept),
+unless the family needs exact sums throughout (Flash Next: `ExactTensorParallelSums`). Decode kinds
+replay: a later step re-traces only to bind its inputs and finds the ranks' plans by their combined
+signature, and a decode step one position on from the last advances every rank's kept step in place
+without a trace (`TryAdvanceRanked`; each rank owns its position input, which the advance bumps).
+2x A40, ggml_cuda `--tp 2`, runtime / Qwen35Model decode short / 4K tok/s: Qwen3.5-9B Q8_0 86.1 / 84.0
+vs 94.4 / 91.8, Qwen3.6-35B-A3B UD-Q4_K_M 105.6 / 100.9 vs 106.3 / 105.1; 4K prefill 1.17 vs 0.91 s
+(9B) and 1.14 vs 0.96 s (35B) - both gaps open. Shards and replicated weights are preloaded on every rank's device,
 one thread rank by rank (a ggml preload lands on the calling thread's active rank); routed-expert shards
 are preloaded too, since each rank's graph reads its slices device-resident. ggml's meta device stays
 opt-in (`TS_GRAPH_TENSOR_PARALLEL=1`).

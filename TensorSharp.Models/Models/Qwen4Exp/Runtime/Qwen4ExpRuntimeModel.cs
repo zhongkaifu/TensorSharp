@@ -155,6 +155,10 @@ namespace TensorSharp.Models
         /// rank from replicated weights and the rank's own copy of their state, so every rank selects the same blocks.</summary>
         protected override bool RanksLower => true;
 
+        /// <summary>Hyper-connections carry four streams through every partial: sums stay exact in F32 (Qwen4ExpModel's
+        /// tensor-parallel plans set allreduce_f32 for the same reason).</summary>
+        protected override bool ExactTensorParallelSums => true;
+
         // ---------------------------------------------------------------- the MTP head
 
         /// <summary>The shared-target MTP head (<c>--draft-model mtp-*.gguf</c>): one NextN block after the trunk.</summary>

@@ -147,8 +147,9 @@ namespace TensorSharp.Graph
         /// <summary>Compile <paramref name="program"/> for rank <paramref name="rank"/>'s device.</summary>
         IGraphPlan CompileForRank(GraphProgram program, int rank);
 
-        /// <summary>Run every rank's plan together; false with <paramref name="error"/> on failure.</summary>
-        bool RunRanked(IGraphPlan[] plans, GraphRunInputs[] inputs, out string error);
+        /// <summary>Run every rank's plan together; false with <paramref name="error"/> on failure. <paramref name="exactSums"/>:
+        /// sum the partials in F32 whatever the transport would round (a fast transport may carry large sums in BF16).</summary>
+        bool RunRanked(IGraphPlan[] plans, GraphRunInputs[] inputs, bool exactSums, out string error);
     }
 
     /// <summary>A plan whose outputs can stay on the device: set <see cref="KeepTensors"/> before a run and
