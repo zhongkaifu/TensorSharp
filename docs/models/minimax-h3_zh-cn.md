@@ -196,6 +196,9 @@ GPU，`TS_H3_FLASH_ATTENTION=0` 可切回 cuDNN。在同一 A100 与片段上（
 注意力由 278-281 ms 降到 251 ms，去噪单步由 20.5-20.7 s 降到 19.1-19.2 s，热态整次请求由 188 s 降到 177.9-178.5 s。
 内核输出与双精度参考相差 73 dB（F16 舍入量级）；两种实现的舍入不同，经 8 步去噪放大后，片段与 cuDNN 结果相差
 31.6 与 24.8 dB PSNR。该选项默认关闭（配置时需要联网下载源码），目前只在 Linux 的 CUDA 13 上构建过。
+该内核是面向 Ampere 的代码，而 cuDNN 在 Hopper 上有专门的实现：在 H100 NVL（sm_90 构建、同一片段、`TS_H3_INT8_MATMUL=all`）上，
+每个块的注意力 cuDNN 为 114 ms、FlashAttention-2 为 165 ms，热态整次请求分别为 76.7-77.1 s 与 97.4 s。因此含该内核的构建
+只在 sm_8x 上默认使用它，更新的 GPU 默认仍走 cuDNN；`TS_H3_FLASH_ATTENTION=1` 可在这些 GPU 上强制使用该内核。
 
 ### Metal 上的长序列注意力
 
@@ -532,7 +535,7 @@ AdaLN 来自学习的 `[8,1025]` 曲线表，三模态分别取调制参数。
 | `TS_H3_UPLOAD_PREFAULT` | 原生 CUDA 自动半内存预算；`0` 禁用，`1` 强制 |
 | `TS_H3_UPLOAD_WORKERS` | 原生 CUDA 预读 1–8 个 worker，默认 8 |
 | `TS_H3_UPLOAD_PROFILE=1` | 预读/上传/图诊断，不能混入正式计时 |
-| `TS_H3_FLASH_ATTENTION=0` | `ggml_cuda`，仅限以 `-DTENSORSHARP_FLASH_ATTENTION=ON` 构建：DiT 注意力保留在 cuDNN SDPA，而不用 FlashAttention-2 |
+| `TS_H3_FLASH_ATTENTION` | `ggml_cuda`，仅限以 `-DTENSORSHARP_FLASH_ATTENTION=ON` 构建：`0` 让 DiT 注意力保留在 cuDNN SDPA；`1` 在比 sm_8x 更新的 GPU 上也使用 FlashAttention-2。未设置时：sm_8x 用 FlashAttention-2，更新的 GPU 用 cuDNN |
 | `TS_H3_CUDNN_ATTENTION=0` | `ggml_cuda`：注意力保留在 ggml 的 flash attention，而不用 cuDNN 融合 SDPA；`TS_H3_CUDNN_ATTENTION_VERBOSE=1` 打印 cuDNN 计划与回退 |
 | `TS_H3_CUBLAS_MATMUL=0` | `ggml_cuda`：DiT 的宽 Q4_K 投影保留在 MMQ，而不用 cuBLAS BF16；`TS_H3_CUBLAS_MIN_ROWS`（默认 1024）为 token 阈值 |
 | `TS_H3_FUSED=0` | `ggml_cuda`：构建未融合的 DiT 与 VAE 图（不融合注意力前处理、调制、门控残差与 LoRA 合并） |
