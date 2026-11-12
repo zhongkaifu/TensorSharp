@@ -24,6 +24,14 @@ namespace TensorSharp.Runtime
         /// unless the model routes a prompt chunk differently from a decode token.</summary>
         float[] ForwardPrompt(int[] tokens) => Forward(tokens);
 
+        /// <summary>
+        /// Forward a prompt chunk, saying whether more of the same prompt follows it. With
+        /// <paramref name="morePromptFollows"/> nothing samples from the chunk's logits, so a model may skip them and
+        /// return null (and may return before the chunk has finished computing, as long as its next call behaves as if
+        /// it had). Otherwise, and by default, identical to <see cref="ForwardPrompt(int[])"/>.
+        /// </summary>
+        float[] ForwardPrompt(int[] tokens, bool morePromptFollows) => ForwardPrompt(tokens);
+
         void ResetKVCache();
 
         /// <summary>

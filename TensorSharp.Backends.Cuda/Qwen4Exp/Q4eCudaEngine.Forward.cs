@@ -453,7 +453,15 @@ namespace TensorSharp.Cuda
         /// </summary>
         public void Forward(int[] tokens, float[] logitsOut, float[] hOut)
         {
-            DrainDecodeLanes();
+            bool deferred = _deferPromptCall;
+            _deferPromptCall = false;
+            _fwdWaitTicks = _fwdPleTicks = 0;
+            // A prompt chunk left in flight is followed in stream order by the same sequence's next chunk, as one call's
+            // ubatches follow each other; any other forward waits for it first.
+            if (_promptInFlight && ReferenceEquals(_promptInFlightSlot, _active) && tokens != null && tokens.Length > PerSlotMaxRows)
+                DrainLanes();
+            else
+                DrainDecodeLanes();
             if (tokens == null || tokens.Length == 0)
                 throw new ArgumentException("empty token batch", nameof(tokens));
             Slot slot = _active;
@@ -511,11 +519,27 @@ namespace TensorSharp.Cuda
             slot.Failed = false;
             if (tokens.Length >= 2)
                 CheckpointActive();
+            if (deferred)
+            {
+                // Issued, not waited for: the last device still runs it (PromptPipeline.cs).
+                _promptInFlight = true;
+                _promptInFlightSlot = slot;
+                PromptChunksDeferred++;
+            }
+            else
+                DrainPrompt();
             if (_perf > 0)
             {
                 double secs = sw.Elapsed.TotalSeconds;
-                Console.Error.WriteLine($"[q4e-cuda] forward {tokens.Length} tokens in {secs:F3}s ({tokens.Length / secs:F1} tok/s), "
-                    + $"host issue {IssueMs(start):F1}ms" + KvFetchedNote(slot, tokens.Length > PerSlotMaxRows ? 1 : 32));
+            {
+                // A prompt's host time: waiting for a device before its pinned inputs are rewritten, and the PLE rows.
+                string host = tokens.Length > PerSlotMaxRows
+                    ? $" (waited for a device {TicksMs(_fwdWaitTicks):F0}ms, PLE rows {TicksMs(_fwdPleTicks):F0}ms)" : "";
+                Console.Error.WriteLine(deferred
+                    ? $"[q4e-cuda] forward {tokens.Length} tokens issued in {secs:F3}s and left in flight (the next chunk follows it){host}"
+                    : $"[q4e-cuda] forward {tokens.Length} tokens in {secs:F3}s ({tokens.Length / secs:F1} tok/s), "
+                      + $"host issue {IssueMs(start):F1}ms{host}" + KvFetchedNote(slot, tokens.Length > PerSlotMaxRows ? 1 : 32));
+            }
             }
         }
 
@@ -535,7 +559,9 @@ namespace TensorSharp.Cuda
             if (nt > _hostExpertRows)
                 FlushAsyncSwaps();
             // The pinned tokens are rewritten per ubatch: the previous upload must have run.
+            long waitStart = System.Diagnostics.Stopwatch.GetTimestamp();
             CudaDriverApi.cuStreamSynchronize(dev0.Stream).ThrowOnError();
+            _fwdWaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - waitStart;
             Marshal.Copy(tokens, tokOff, _pinnedTokens, nt);
             CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev0.Tokens), _pinnedTokens, new UIntPtr((ulong)nt * 4), dev0.Stream).ThrowOnError();
             StageBegin(dev0);
@@ -1369,9 +1395,13 @@ namespace TensorSharp.Cuda
             dev.MakeCurrent();
             // The staging is reused per ubatch: the previous ubatch's upload must have run (a decode lane's own staging
             // was last read by its previous step, finished already).
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             if (!_laneIssue)
                 CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+            long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
             _m.Ple.GatherPleRows(histories, new ReadOnlySpan<int>(tokens, tokOff, nt), pos, (float*)dev.PlePinned);
+            _fwdWaitTicks += t1 - t0;
+            _fwdPleTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t1;
             _devs[0].MakeCurrent();
         }
 
