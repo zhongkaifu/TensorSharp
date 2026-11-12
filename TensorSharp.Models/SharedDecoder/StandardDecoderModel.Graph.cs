@@ -1769,12 +1769,8 @@ namespace TensorSharp.Models
             {
                 if (_mask >= 0 && _maskStart == start && _maskCount == count) return _mask;
                 int kv = start + count;
-                var mask = new ushort[(long)kv * count];
-                for (int qi = 0; qi < count; qi++)
-                {
-                    for (int ki = 0; ki < Math.Min(AttentionFloor, kv); ki++) mask[(long)qi * kv + ki] = 0xFC00;
-                    for (int ki = start + qi + 1; ki < kv; ki++) mask[(long)qi * kv + ki] = 0xFC00;
-                }
+                var mask = GC.AllocateUninitializedArray<ushort>(checked(kv * count));
+                FillCausalRows(mask, kv, start, count);
                 _mask = Leaf(GraphLeafRole.Input, GraphFormat.F16, stackalloc long[] { kv, count }, IntPtr.Zero, 0);
                 AddInput(_mask, Pin(mask), mask.LongLength * sizeof(ushort));
                 _maskStart = start;
@@ -1795,13 +1791,26 @@ namespace TensorSharp.Models
             /// <summary>A streaming executor's sink: entries and input values go there as they are emitted.</summary>
             internal IGraphSink Sink { get => _b.Sink; init => _b.Sink = value; }
 
-            private void FillChunkMask(ushort[] mask, int window, int start, int count)
+            private void FillChunkMask(ushort[] mask, int window, int start, int count) => FillCausalRows(mask, window, start, count);
+
+            /// <summary>An F16 causal mask [<paramref name="width"/>, <paramref name="count"/>] for rows continuing at
+            /// <paramref name="start"/>: row q is -inf before the attention floor and past start + q, zero between. Whole
+            /// rows are filled at once, large masks row-parallel (a 3.6K-row prompt chunk's is 26 MB: element loops took
+            /// ~10 ms of its trace).</summary>
+            private void FillCausalRows(ushort[] mask, int width, int start, int count)
             {
-                Array.Clear(mask);
-                for (int q = 0; q < count; q++)
+                const ushort negInf = 0xFC00;
+                int floor = Math.Min(AttentionFloor, width);
+                if ((long)width * count >= 1 << 20) System.Threading.Tasks.Parallel.For(0, count, Row);
+                else for (int q = 0; q < count; q++) Row(q);
+
+                void Row(int q)
                 {
-                    for (int k = 0; k < Math.Min(AttentionFloor, window); k++) mask[(long)q * window + k] = 0xFC00;   // -inf
-                    for (int k = start + q + 1; k < window; k++) mask[(long)q * window + k] = 0xFC00;
+                    Span<ushort> row = mask.AsSpan(q * width, width);
+                    int open = Math.Min(width, start + q + 1);
+                    row[..floor].Fill(negInf);
+                    if (open > floor) row[floor..open].Clear();
+                    row[Math.Max(open, floor)..].Fill(negInf);
                 }
             }
 
