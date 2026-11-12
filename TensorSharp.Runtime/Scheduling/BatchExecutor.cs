@@ -1249,16 +1249,42 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Steps whose decoders ran as two groups in flight (tests, diagnostics).</summary>
         internal static long PipelinedDecodeSteps;
 
+        private KeyValuePair<string, object?> _phaseArchitectureTag;
+        private static readonly KeyValuePair<string, object?> s_phaseFinish = new(Telemetry.TelemetryAttributes.StepPhase, "finish");
+        private static readonly KeyValuePair<string, object?> s_phaseSample = new(Telemetry.TelemetryAttributes.StepPhase, "sample");
+        private static readonly KeyValuePair<string, object?> s_phaseIssue = new(Telemetry.TelemetryAttributes.StepPhase, "issue");
+
+        /// <summary>The host's time in one part of a batched decode step (tensorsharp.engine.step.phase.duration): from
+        /// <paramref name="since"/> to now, which it returns for the next part. A flag read with no meter listener.</summary>
+        private long RecordStepPhase(in KeyValuePair<string, object?> phase, long since, int rows)
+        {
+            var histogram = Telemetry.TensorSharpMetrics.EngineStepPhaseDuration;
+            if (!histogram.Enabled)
+                return since;
+            long now = Stopwatch.GetTimestamp();
+            if (_phaseArchitectureTag.Key == null)
+            {
+                string? architecture = _model.Config?.Architecture;
+                _phaseArchitectureTag = new(Telemetry.TelemetryAttributes.ModelArchitecture,
+                    string.IsNullOrEmpty(architecture) ? "unknown" : architecture);
+            }
+            histogram.Record((double)(now - since) / Stopwatch.Frequency, _phaseArchitectureTag, phase,
+                new KeyValuePair<string, object?>(Telemetry.TelemetryAttributes.RowsBucket, Telemetry.TelemetryAttributes.RowsBucketOf(rows)));
+            return now;
+        }
+
         // Each decoding sequence's group while it pipelines, and its order of joining (a group's rows keep that order, so
         // its captured steps are reused while its members stay).
         private readonly Dictionary<string, (int Group, long Rank)> _pipeGroupOf = new Dictionary<string, (int, long)>(StringComparer.Ordinal);
         private long _pipeRank;
 
         /// <summary>Whether this step's decoders run as pipelined groups: a model that keeps two in flight, every scheduled
-        /// item a decode step (two or more), and no speculation (whose paths read the logits).</summary>
+        /// item a decode step (two or more), and no speculation (whose paths read the logits) unless the model's groups
+        /// outrun its batched verify (<see cref="IPipelinedBatchedDecode.PipelinedDecodeOutrunsSpeculation"/>).</summary>
         private bool PipelinesStep(IPipelinedBatchedDecode pipe, SchedulerOutput output, ExecutionOptions options)
         {
-            if (!s_pipelineDecode || !options.BatchedFusedDecodeEnabled || SpeculationEnabledThisStep
+            if (!s_pipelineDecode || !options.BatchedFusedDecodeEnabled
+                || (SpeculationEnabledThisStep && !pipe.PipelinedDecodeOutrunsSpeculation)
                 || output.ScheduledWork.Count < 2 || pipe.PipelinedDecodeGroups < 2)
                 return false;
             foreach (var work in output.ScheduledWork)
@@ -1320,7 +1346,9 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 var work = groups[g];
                 int cnt = work.Count;
+                long phaseAt = Stopwatch.GetTimestamp();
                 pipe.FinishPipelinedDecode(g);
+                phaseAt = RecordStepPhase(s_phaseFinish, phaseAt, cnt);
                 var ids = new string[cnt];
                 var toks = new int[cnt];
                 var pos = new int[cnt];
@@ -1345,6 +1373,7 @@ namespace TensorSharp.Runtime.Scheduling
                     ids[i] = work[i].Sequence.RequestId;
                 }
                 var outLogits = new float[cnt][];
+                phaseAt = RecordStepPhase(s_phaseSample, phaseAt, cnt);
                 long started = Stopwatch.GetTimestamp();
                 bool ok = pipe.TryIssuePipelinedDecode(g, ids, toks, pos, outLogits);
                 if (!ok)
@@ -1352,6 +1381,7 @@ namespace TensorSharp.Runtime.Scheduling
                     pipe.DrainPipelinedDecode();
                     ok = fused.TryForwardBatchedFusedDecode(ids, toks, pos, outLogits);
                 }
+                RecordStepPhase(s_phaseIssue, phaseAt, cnt);
                 if (!ok)
                 {
                     // Keep the draws (a stochastic sampler advanced) for the round-robin loop, as the batched path does.
@@ -1534,6 +1564,7 @@ namespace TensorSharp.Runtime.Scheduling
                     try
                     {
                         bool allGreedy = true;
+                        long phaseAt = Stopwatch.GetTimestamp();
                         // Each sequence samples with its own sampler (its own RNG and buffers) from its own
                         // logits, so a batch's draws run side by side: a full-vocabulary top-k is ~0.3 ms a
                         // row at Qwen's 248K tokens.
@@ -1565,6 +1596,7 @@ namespace TensorSharp.Runtime.Scheduling
                             if (allGreedy && !seq.GetOrCreateSampler().IsPlainGreedyArgmax)
                                 allGreedy = false;
                         }
+                        phaseAt = RecordStepPhase(s_phaseSample, phaseAt, dn);
                         if (allGreedy)
                         {
                             // Device-sampled fast path: no host logits at all. The
@@ -1574,6 +1606,7 @@ namespace TensorSharp.Runtime.Scheduling
                             var nextTokens = new int[dn];
                             long batchStarted = Stopwatch.GetTimestamp();
                             bool sampledBatchSucceeded = fused.TryForwardBatchedFusedDecodeSampled(reqIds, btokens, bpositions, nextTokens);
+                            phaseAt = RecordStepPhase(s_phaseIssue, phaseAt, dn);
                             long batchTicksPerSequence = (Stopwatch.GetTimestamp() - batchStarted) / dn;
                             if (sampledBatchSucceeded)
                             {
@@ -1608,6 +1641,7 @@ namespace TensorSharp.Runtime.Scheduling
                             var outLogits = new float[dn][];
                             long batchStarted = Stopwatch.GetTimestamp();
                             bool logitsBatchSucceeded = fused.TryForwardBatchedFusedDecode(reqIds, btokens, bpositions, outLogits);
+                            RecordStepPhase(s_phaseIssue, phaseAt, dn);
                             long batchTicksPerSequence = (Stopwatch.GetTimestamp() - batchStarted) / dn;
                             if (logitsBatchSucceeded)
                             {

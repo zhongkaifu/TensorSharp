@@ -65,5 +65,20 @@ namespace TensorSharp.Runtime.Telemetry
         /// </summary>
         public double ForwardIssueSeconds { get; init; }
         public double ForwardWaitSeconds { get; init; }
+
+        /// <summary>
+        /// Decode steps an engine keeps in flight on lanes of their own (two groups of sequences on a layer split, one
+        /// GPU running each group's half): steps and rows, how many steps were done before the host came back for their
+        /// logits (the GPUs waited for the host) against how many the host waited for, and the host's time issuing a
+        /// lane's step, waiting for one, and with a lane empty between a step's finish and its next issue (sampling
+        /// and scheduling: time that lane's GPU work could have been running).
+        /// </summary>
+        public long DecodeLaneSteps { get; init; }
+        public long DecodeLaneRows { get; init; }
+        public long DecodeLaneFinishesReady { get; init; }
+        public long DecodeLaneFinishesWaited { get; init; }
+        public double DecodeLaneIssueSeconds { get; init; }
+        public double DecodeLaneWaitSeconds { get; init; }
+        public double DecodeLaneIdleSeconds { get; init; }
     }
 }

@@ -17,8 +17,15 @@ namespace TensorSharp.Runtime.Scheduling
     /// </summary>
     public interface IPipelinedBatchedDecode
     {
-        /// <summary>Groups the model keeps in flight at once (2), or 0 when it cannot pipeline (one GPU, a draft head).</summary>
+        /// <summary>Groups the model keeps in flight at once (2), or 0 when it cannot pipeline (one GPU).</summary>
         int PipelinedDecodeGroups { get; }
+
+        /// <summary>
+        /// Whether two or more decoders run faster as pipelined groups of plain steps than through the model's batched
+        /// speculative verify, so a step of decoders pipelines although speculation is on (a lone decoder still
+        /// speculates). False keeps speculation first, as a model without pipelined groups does.
+        /// </summary>
+        bool PipelinedDecodeOutrunsSpeculation => false;
 
         /// <summary>Whether a group's step is in flight, its rows' logits not filled yet.</summary>
         bool HasPendingPipelinedDecode { get; }

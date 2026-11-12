@@ -625,6 +625,7 @@ namespace TensorSharp.Runtime.Speculative
             Stats.TokensAccepted += m;
             Telemetry.TensorSharpMetrics.SpeculativeTokensDrafted.Add(k, _architectureTag);
             Telemetry.TensorSharpMetrics.SpeculativeTokensAccepted.Add(m, _architectureTag);
+            RecordAcceptedLength(k, m);
 
             // Tell the trunk the accept count BEFORE deciding how to roll back: a
             // trunk that deferred post-verify state until this was known settles it
@@ -758,6 +759,16 @@ namespace TensorSharp.Runtime.Speculative
             return block.SelectDrafts(blockTokens, blockConf, Math.Min(blockTokens.Length, blockConf.Length), maxTokens, draftsOut);
         }
 
+        /// <summary>One verify window's accepted drafts, by how many it drafted
+        /// (tensorsharp.speculative.accepted_length): the distribution behind the drafted and accepted totals.</summary>
+        private void RecordAcceptedLength(int drafted, int accepted)
+        {
+            var histogram = Telemetry.TensorSharpMetrics.SpeculativeAcceptedLength;
+            if (histogram.Enabled && drafted > 0)
+                histogram.Record(accepted, _architectureTag,
+                    new KeyValuePair<string, object?>(Telemetry.TelemetryAttributes.SpeculativeDrafted, drafted));
+        }
+
         /// <summary>
         /// Batched step, second half: the trunk verified [<paramref name="lastToken"/>,
         /// drafts] at <paramref name="position"/> and kept the anchor plus
@@ -781,6 +792,7 @@ namespace TensorSharp.Runtime.Speculative
                 Stats.TokensAccepted += accepted;
                 Telemetry.TensorSharpMetrics.SpeculativeTokensDrafted.Add(k, _architectureTag);
                 Telemetry.TensorSharpMetrics.SpeculativeTokensAccepted.Add(accepted, _architectureTag);
+                RecordAcceptedLength(k, accepted);
                 if (accepted < k)
                     Stats.RollbackSteps++;
                 Stats.VerifyTicks += verifyTicks;

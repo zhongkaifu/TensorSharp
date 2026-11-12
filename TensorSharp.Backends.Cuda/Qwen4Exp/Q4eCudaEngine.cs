@@ -258,6 +258,10 @@ namespace TensorSharp.Cuda
             /// (cache row 0, <see cref="MtpRestart"/>) to MtpPast.</summary>
             public SlotLayer Mtp;
             public int MtpPast, MtpStart;
+            /// <summary>The trunk's output streams of position <see cref="MtpCarryPos"/> (-1: none), on the block's device:
+            /// what the block joins with the next position's token when it follows a forward there (MtpFollowUbatch).</summary>
+            public Tensor MtpCarry;
+            public int MtpCarryPos = -1;
 
             // The rewind checkpoint: the recurrent states as they stood at the end of the last
             // multi-token forward (a prompt boundary), at CpNPast, or -1 for none. Decode steps leave

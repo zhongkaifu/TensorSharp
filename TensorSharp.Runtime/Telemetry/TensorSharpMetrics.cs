@@ -110,6 +110,18 @@ namespace TensorSharp.Runtime.Telemetry
             "GPU time of one stage of a sampled forward (TS_Q4E_PERF_SAMPLE on the Qwen3.8-Flash-Next direct-CUDA engine), by stage, step kind and rows.",
             advice: new InstrumentAdvice<double> { HistogramBucketBoundaries = s_stageBuckets });
 
+        public static readonly Histogram<double> EngineStepPhaseDuration = M.CreateHistogram(
+            "tensorsharp.engine.step.phase.duration", "s",
+            "Host time of one part of a batched decode step, by phase (finish: waiting for the previous step's logits and copying them; sample; issue: queueing the step's GPU work, or the whole forward where the step waits for itself; draft and verify on speculative steps) and rows.",
+            advice: new InstrumentAdvice<double> { HistogramBucketBoundaries = s_stageBuckets });
+
+        private static readonly int[] s_acceptedBuckets = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+
+        public static readonly Histogram<int> SpeculativeAcceptedLength = M.CreateHistogram(
+            "tensorsharp.speculative.accepted_length", "{token}",
+            "Drafted tokens the target accepted in one verify window, by the window's drafted tokens (tensorsharp.speculative.drafted).",
+            advice: new InstrumentAdvice<int> { HistogramBucketBoundaries = s_acceptedBuckets });
+
         public static readonly Counter<long> SpeculativeTokensDrafted = M.CreateCounter<long>(
             "tensorsharp.speculative.tokens.drafted", "{token}", "Tokens a speculator proposed.");
 
@@ -252,6 +264,22 @@ namespace TensorSharp.Runtime.Telemetry
             M.CreateObservableCounter("tensorsharp.engine.forward.wait_time",
                 () => ServingMeasurements((s => s.ForwardWaitSeconds, null, null)), "s",
                 "Host time spent waiting for forwards' GPU work after issuing it.");
+            M.CreateObservableCounter("tensorsharp.engine.lane.steps",
+                () => ServingMeasurements(
+                    (s => s.DecodeLaneFinishesReady, TelemetryAttributes.LaneFinish, "ready"),
+                    (s => s.DecodeLaneFinishesWaited, TelemetryAttributes.LaneFinish, "waited")),
+                "{step}",
+                "Decode steps kept in flight on a decode lane, by how they ended for the host. ready: the GPUs had finished before the host came back for the logits, so the host (sampling, scheduling) bounds the rate; waited: the GPUs do.");
+            M.CreateObservableCounter("tensorsharp.engine.lane.rows",
+                () => ServingMeasurements((s => s.DecodeLaneRows, null, null)), "{row}",
+                "Rows (sequences) the decode lanes' steps carried.");
+            M.CreateObservableCounter("tensorsharp.engine.lane.time",
+                () => ServingMeasurements(
+                    (s => s.DecodeLaneIssueSeconds, TelemetryAttributes.LaneState, "issue"),
+                    (s => s.DecodeLaneWaitSeconds, TelemetryAttributes.LaneState, "wait"),
+                    (s => s.DecodeLaneIdleSeconds, TelemetryAttributes.LaneState, "idle")),
+                "s",
+                "Host time per decode lane state, summed over lanes: issue (queueing a lane's step), wait (blocked on a lane's step), idle (a lane with no step in flight between its finish and its next issue).");
         }
 
         private static readonly ObservableCounter<long> s_moeRoutes;

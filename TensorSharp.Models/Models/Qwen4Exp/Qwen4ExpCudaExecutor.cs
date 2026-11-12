@@ -175,6 +175,19 @@ namespace TensorSharp.Models
         public void ForwardVerify(int[] tokens, float[] logitsAll, float[] hAll) => _engine.ForwardVerify(tokens, logitsAll, hAll);
         public void ForwardVerifyGreedy(int[] tokens, int[] drawnOut, float[] hAll) => _engine.ForwardVerifyGreedy(tokens, drawnOut, hAll);
         public bool HasMtpDraftChain => _engine.HasMtpDraftChain;
+        public bool CanMtpFollowForward => _engine.CanMtpFollowForward;
+        public bool MtpFollowReady => _engine.MtpFollowReady;
+        public (int Start, int Past) MtpSpan => _engine.MtpSpan;
+        public int MtpFollowedThrough => _engine.MtpFollowedThrough;
+        /// <summary>The next forwards' rows go to the MTP block on its device too (Q4eCudaEngine.MtpFollowsForward).</summary>
+        public bool MtpFollowsForward { set => _engine.MtpFollowsForward = value; }
+        /// <summary>A forward whose rows the MTP block takes on its device as they finish (Q4eCudaEngine.MtpFollowsForward).</summary>
+        public void ForwardFollowed(int[] tokens, float[] logits, float[] hOut)
+        {
+            _engine.MtpFollowsForward = true;
+            try { Forward(tokens, logits, hOut); }
+            finally { _engine.MtpFollowsForward = false; }
+        }
         public int MtpDraftChain(int[] tokens, float[] hPrev, int p0, int steps, int[] idsOut, float[] probsOut)
             => _engine.MtpDraftChain(tokens, hPrev, p0, steps, idsOut, probsOut);
 

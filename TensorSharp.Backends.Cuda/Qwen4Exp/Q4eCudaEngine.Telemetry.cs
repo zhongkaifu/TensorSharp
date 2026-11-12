@@ -22,7 +22,9 @@ namespace TensorSharp.Cuda
             long Grows, long GrowFailures,
             long RewindsToCheckpoint, long RewindsWithReplay, long RewindsToZero, long RewindsRefused, long ReplayedTokens,
             long SoloGraphCaptures, long SoloGraphLaunches, long BatchedGraphCaptures, long BatchedGraphLaunches,
-            long GraphCaptureFailures, double ForwardIssueSeconds, double ForwardWaitSeconds);
+            long GraphCaptureFailures, double ForwardIssueSeconds, double ForwardWaitSeconds,
+            long LaneSteps = 0, long LaneRows = 0, long LaneFinishesReady = 0, long LaneFinishesWaited = 0,
+            double LaneIssueSeconds = 0, double LaneWaitSeconds = 0, double LaneIdleSeconds = 0);
 
         private int _tSlots;
         private long _tSlotBytes, _tSlotCapacity;
@@ -30,6 +32,10 @@ namespace TensorSharp.Cuda
         private long _tRewindCheckpoint, _tRewindReplay, _tRewindZero, _tRewindRefused, _tReplayTokens;
         private long _tSoloCaptures, _tSoloLaunches, _tBatchedCaptures, _tBatchedLaunches, _tCaptureFailures;
         private long _tIssueTicks, _tWaitTicks;
+        // Decode lanes (DecodeLanes.cs): rows their steps carried, finishes that found the step done already (the GPUs
+        // were waiting for the host) against finishes that waited for it, and the host's time issuing a lane's step,
+        // waiting for one, and between a step's end as the host saw it and its lane's next issue.
+        private long _tLaneRows, _tLaneReady, _tLaneWaited, _tLaneIssueTicks, _tLaneWaitTicks, _tLaneIdleTicks;
 
         /// <summary>The serving counters, from any thread.</summary>
         public TelemetryCounters ReadTelemetry()
@@ -43,7 +49,11 @@ namespace TensorSharp.Cuda
                 Interlocked.Read(ref _tSoloCaptures), Interlocked.Read(ref _tSoloLaunches),
                 Interlocked.Read(ref _tBatchedCaptures), Interlocked.Read(ref _tBatchedLaunches),
                 Interlocked.Read(ref _tCaptureFailures),
-                Interlocked.Read(ref _tIssueTicks) / f, Interlocked.Read(ref _tWaitTicks) / f);
+                Interlocked.Read(ref _tIssueTicks) / f, Interlocked.Read(ref _tWaitTicks) / f,
+                Interlocked.Read(ref _tLaneSteps), Interlocked.Read(ref _tLaneRows),
+                Interlocked.Read(ref _tLaneReady), Interlocked.Read(ref _tLaneWaited),
+                Interlocked.Read(ref _tLaneIssueTicks) / f, Interlocked.Read(ref _tLaneWaitTicks) / f,
+                Interlocked.Read(ref _tLaneIdleTicks) / f);
         }
 
         /// <summary>A slot came (<paramref name="sign"/> 1) or went (-1): its bytes and capacity.</summary>

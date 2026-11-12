@@ -12,7 +12,8 @@
 // flash-attention and CUTLASS sources at configure time and compiles the one kernel
 // this model uses (head size 128, F16, no mask). The kernel's launch template includes
 // two PyTorch headers; flash_attn_shim/ stands in for them. TS_H3_FLASH_ATTENTION=0
-// leaves the attention on cuDNN.
+// leaves the attention on cuDNN, which is also where it stays on a GPU newer than sm_8x
+// unless TS_H3_FLASH_ATTENTION=1 (see usable).
 #if defined(TSG_GGML_USE_CUDA) && defined(TSG_HAVE_FLASH_ATTN)
 
 #include "flash.h"
@@ -50,13 +51,19 @@ bool usable(FlashState& s)
 {
     if (s.probed) return s.usable;
     s.probed = true;
-    if (const char* e = std::getenv("TS_H3_FLASH_ATTENTION"); e != nullptr && e[0] == '0') return s.usable = false;
+    const char* e = std::getenv("TS_H3_FLASH_ATTENTION");
+    if (e != nullptr && e[0] == '0') return s.usable = false;
     // The kernel is tensor-core MMA code for sm_80 and newer; a build for an older
     // architecture holds only a stub.
     int device = 0, major = 0;
     if (cudaGetDevice(&device) != cudaSuccess) return s.usable = false;
     if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) return s.usable = false;
-    return s.usable = major >= 8;
+    // It is Ampere code, and it wins only there: at 39,875 tokens it takes 251 ms a block
+    // on an A100 where cuDNN's SDPA takes 278, and 165 ms on an H100 where cuDNN's takes
+    // 114 (cuDNN has a Hopper engine). So it is the default on sm_8x alone;
+    // TS_H3_FLASH_ATTENTION=1 asks for it on a newer GPU too.
+    const bool asked = e != nullptr && e[0] == '1';
+    return s.usable = asked ? major >= 8 : major == 8;
 }
 
 } // namespace

@@ -17,9 +17,22 @@ namespace TensorSharp.Models
 {
     public sealed partial class Qwen4ExpCudaModel : IPipelinedBatchedDecode
     {
-        /// <summary>Two on a layer split with captured batched steps, none on one GPU or with a draft head (its speculative
-        /// paths read every step's logits).</summary>
-        public int PipelinedDecodeGroups => _exec?.Engine?.SupportsDecodeLanes == true && !HasDraftHead ? 2 : 0;
+        /// <summary>Two on a layer split with captured batched steps, none on one GPU. With a draft head too when
+        /// <see cref="PipelinedDecodeOutrunsSpeculation"/>: a lone request speculates, two or more decode plainly as groups.</summary>
+        public int PipelinedDecodeGroups
+            => _exec?.Engine?.SupportsDecodeLanes == true && (!HasDraftHead || s_pipelineOverSpeculation) ? 2 : 0;
+
+        /// <summary>
+        /// With the MTP head on a layer split, two or more requests decode faster as two plain groups in flight than
+        /// through the batched verify, which runs one step at a time: two H100 NVL, Q8_0, greedy, 232 / 373 / 552 / 754
+        /// tok/s at 2 / 4 / 8 / 16 streams as groups against 185 / 243 with the batched verify at 2 / 4 (level with the
+        /// plain batched step from 6). A request alone keeps its drafts. TS_Q4E_PIPELINE_OVER_SPEC=0 puts the batched
+        /// verify first again (and a draft head then turns the groups off, as before).
+        /// </summary>
+        public bool PipelinedDecodeOutrunsSpeculation => HasDraftHead && s_pipelineOverSpeculation;
+
+        private static readonly bool s_pipelineOverSpeculation =
+            Environment.GetEnvironmentVariable("TS_Q4E_PIPELINE_OVER_SPEC") != "0";
 
         public bool HasPendingPipelinedDecode => _exec?.Engine?.HasPendingDecodeLanes == true;
 
