@@ -189,6 +189,15 @@ namespace TensorSharp.Models
         /// 33.9-34.1 tok/s; at the per-token default 0.15 four gave 33.7-34.0 twice and 19.6-20.1 twice.</summary>
         public override float SpecPreferredDraftGate => 0.5f;
 
+        /// <summary>DFlash blocks as Qwen4ExpModel verifies them: windows of up to six drafts, ended where the product of
+        /// the drafter's confidences falls below 0.5 (every verify row routes its own experts, and past QSA's dense budget
+        /// a row costs more). The dense hybrids' Metal tuning (five rows, no gate) drafted at 45% acceptance after a
+        /// 3.6K-token prompt and decoded 30.3-30.5 tok/s against Qwen4ExpModel's 31.8-31.9 at 68% (M5 Pro, UD-Q2_K_XL,
+        /// DFlash2 Q8_0).</summary>
+        public override int SpecPreferredDraftWindow => HasDFlash ? Math.Min(6, Math.Max(1, DFlashSettings.MaxDraftTokens)) : 3;
+
+        public override float SpecPreferredBlockGate => HasDFlash ? 0.5f : float.NaN;
+
         protected override string[] DraftLayerWeights =>
             new[] { "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", "attn_output.weight", "nextn.hc_head_norm.weight" };
 

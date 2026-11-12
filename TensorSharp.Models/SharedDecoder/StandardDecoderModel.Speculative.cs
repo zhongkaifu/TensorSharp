@@ -139,7 +139,7 @@ namespace TensorSharp.Models
         /// coding workload: 7 beat 5 and 3 on every turn); 3 elsewhere and for other drafters.
         /// Attention-only stacks take the speculator's own default.
         /// </summary>
-        public int SpecPreferredDraftWindow => !_anyRecurrent ? 0
+        public virtual int SpecPreferredDraftWindow => !_anyRecurrent ? 0
             : !HasDFlash ? 3
             : _backend == BackendType.GgmlCuda ? 7
             : _backend == BackendType.GgmlMetal ? 5 : 3;
@@ -167,7 +167,7 @@ namespace TensorSharp.Models
 
         /// <summary>No confidence gate for a block drafter on a hybrid stack on ggml_metal (see
         /// <see cref="SpecPreferredDraftWindow"/>).</summary>
-        public float SpecPreferredBlockGate => _anyRecurrent && HasDFlash && _backend == BackendType.GgmlMetal ? 0f : float.NaN;
+        public virtual float SpecPreferredBlockGate => _anyRecurrent && HasDFlash && _backend == BackendType.GgmlMetal ? 0f : float.NaN;
 
         /// <summary>The per-token draft head's confidence gate; NaN keeps the speculator's default.</summary>
         public virtual float SpecPreferredDraftGate => float.NaN;
