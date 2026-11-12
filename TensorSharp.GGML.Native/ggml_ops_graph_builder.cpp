@@ -24,6 +24,7 @@
 // Upstream ggml is used unchanged; everything here is TensorSharp-owned.
 
 #include "ggml_ops_internal.h"
+#include "ggml_ops_bonsai.h"
 #include "ggml_ops_graph_optimize.h"
 #include "ggml_ops_transformer_common.h"
 #include "ggml-alloc.h"
@@ -371,6 +372,8 @@ namespace
         int serving = -1;
         std::vector<char> skipped;
         std::shared_ptr<DeviceIo> io;
+        // Bonsai2 PRISM: the rotated activation each (input, transform) products share (see weight_product).
+        tsg::BonsaiMemo bonsai;
 
         ~TsgGraph()
         {
@@ -419,6 +422,22 @@ namespace
         for (Leaf& leaf : g->leaves)
             if (leaf.tensor == t) return &leaf;
         return nullptr;
+    }
+
+    /// w · x. A weight leaf (or a row block of one) whose host bytes carry a Bonsai2 PRISM transform
+    /// (TSGgml_BonsaiRegisterWeight, keyed by those bytes) reads x rotated, as Qwen35Model's graphs do
+    /// (tsg::bonsai_mul_mat); every product of one input under one transform shares the rotation.
+    ggml_tensor* weight_product(TsgGraph* g, ggml_tensor* w, ggml_tensor* x)
+    {
+        if (tsg::bonsai_any_transform())
+        {
+            const ggml_tensor* base = w;
+            while (base->view_src != nullptr) base = base->view_src;
+            if (Leaf* leaf = leaf_of(g, base); leaf != nullptr && leaf->role == LEAF_WEIGHT && leaf->data != nullptr
+                && tsg::bonsai_weight_has_transform(leaf->data))
+                return tsg::bonsai_mul_mat_memo(g->ctx, w, x, leaf->data, g->bonsai);
+        }
+        return ggml_mul_mat(g->ctx, w, x);
     }
 
     /// Routed experts from host memory (tsg::HostMoeSegment): the graph pauses after the router's outputs, the
@@ -550,7 +569,7 @@ namespace
         case OP_MUL_MAT:
         {
             need(2);
-            ggml_tensor* r = ggml_mul_mat(ctx, src(0), src(1));
+            ggml_tensor* r = weight_product(g, src(0), src(1));
             if (ipar(0, 0) != 0) ggml_prec_set_acc(r, static_cast<ggml_prec>(ipar(0, 0)));
             return r;
         }

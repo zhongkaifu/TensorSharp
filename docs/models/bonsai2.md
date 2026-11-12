@@ -110,12 +110,15 @@ dotnet run --project TensorSharp.Server.Host -c Release -- \
   --backend ggml_metal --host 127.0.0.1 --port 5000
 ```
 
-The existing Qwen 3.5 implementation provides whole-model prefill/decode,
-per-sequence KV and recurrent states, and continuous batching. The PRISM
-transforms are inserted into those paths so the model can use their existing
-fusion and state management. Rotations add work, and the repacked weights use
-more memory than the publisher's custom formats; performance must be measured
-on the actual workload.
+On one `ggml_metal` or `ggml_cuda` device the model runs on the shared decoder
+runtime (`Qwen35RuntimeModel`), the path every dense Qwen 3.5 checkpoint takes
+there: when GGML builds a step's graph, every product whose weight carries a
+forward rotation reads its input rotated (Q/K/V and gate/up share one rotated
+input), and the embedding rows go through the inverse transform. `ggml_cpu`
+and `ggml_vulkan` keep the Qwen 3.5 family implementation, which inserts the
+same transforms into its fused graphs. Rotations add work, and the repacked
+weights use more memory than the publisher's custom formats; performance must
+be measured on the actual workload.
 
 ## Reproducible validation
 
@@ -199,3 +202,24 @@ checkout stays unchanged, measures model-only and HTTP (concurrency 1 and 4)
 throughput on the same GGUF, runs a projector smoke, and writes its output under
 ignored `artifacts/`. No results from it are committed, so CUDA model execution
 remains unvalidated as stated above.
+
+### Shared decoder runtime (2026-11-12)
+
+Using unchanged upstream ggml `cd6d2b75f5d3e4b2f3fe8e8fbc6c8b84ac80e74a` on the
+M5 Pro, the PTQ1_0 file (SHA-256 above) gave the same greedy text on
+`ggml_metal` from the shared runtime as from the family implementation, two
+interleaved runs of each, F16 KV:
+
+| Prompt | Metric | Runtime | Family implementation |
+|---|---|---:|---:|
+| 55 tokens | Prefill (ms) | 357-370 | 376-402 |
+| 55 tokens | Decode, 128 tokens (tok/s) | 27.4 | 27.2-27.4 |
+| 3,609 tokens | Prefill (ms) | 11,512-11,533 | 11,592-11,636 |
+| 3,609 tokens | Decode, 109 tokens (tok/s) | 26.1 | 26.2 |
+
+A synthetic PRISM checkpoint (rotated PQ2_0 projections, head and embedding,
+grouped value heads) compares the two paths' logits in
+`Qwen35RuntimeTests.PrismRotationsMatchQwen35Model`: 1.1e-5 apart at most on
+`ggml_metal`, 2.0e-2 on `ggml_cpu` (its BF16-rounded activations); with the
+rotations left out the first row is 1.2 away. That test also passed on
+`ggml_cuda` (RTX 2000 Ada); the real checkpoint was not run on CUDA.

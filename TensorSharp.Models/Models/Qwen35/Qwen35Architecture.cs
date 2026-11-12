@@ -22,9 +22,9 @@ namespace TensorSharp.Models
             // (TS_Q35_NATIVE=0 keeps the managed path).
             // The shared decoder runtime (Qwen35RuntimeModel) serves whole-layer stages (local or
             // multi-node), their hybrid with --tp, routed experts on the host for cuda and mlx, and
-            // one device on ggml_cuda / ggml_metal / mlx for checkpoints without routed experts (see
-            // Qwen35RuntimeModel.ServesOneDevice). Qwen35Model keeps routed-expert checkpoints on
-            // one device, its own --tp, Bonsai2 PRISM rotations, and the other backends.
+            // one device on ggml_cuda / ggml_metal / mlx for checkpoints without routed experts, Bonsai2's
+            // PRISM rotations included (see Qwen35RuntimeModel.ServesOneDevice). Qwen35Model keeps
+            // routed-expert checkpoints on one device, its own --tp, and the other backends.
             Factory = c =>
             {
                 if (Qwen35RuntimeModel.Serves(c))

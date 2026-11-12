@@ -968,6 +968,9 @@ namespace TensorSharp.Models
             string kName = $"blk.{layer}.attn_k.weight";
             string vName = $"blk.{layer}.attn_v.weight";
             string qkvName = $"blk.{layer}.attn_qkv.weight";
+            // Bonsai2 PRISM: rows concatenate only where the three read the same rotated (or unrotated) input.
+            if (BonsaiHadamard != null && !BonsaiHadamard.CanFuseProjections(qName, kName, vName))
+                return false;
 
             if (_quantWeights.TryGetValue(qName, out var qw) &&
                 _quantWeights.TryGetValue(kName, out var kw) &&

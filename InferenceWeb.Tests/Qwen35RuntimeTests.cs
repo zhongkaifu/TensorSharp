@@ -49,6 +49,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
         "dense-nextn" => new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true, NextN = true }.Write(Path.Combine(_dir, "q35-dense-nextn.gguf")),
         "dense-mixed" => new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true, GateProjectionType = SyntheticGguf.GgmlType.F32 }
             .Write(Path.Combine(_dir, "q35-dense-mixed.gguf")),
+        // Bonsai2's PRISM layout: rotated PQ2_0 projections, head and embedding, grouped value heads (3 per key head).
+        "dense-prism" => new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true, SsmVHeads = 6, Ff = 512, Prism = true }
+            .Write(Path.Combine(_dir, "q35-dense-prism.gguf")),
         // BF16 weights: no activation quantization, so the comparison is tight.
         "moe" => new Qwen35MoeSyntheticModelBuilder { Layers = 8, UniformWeightType = SyntheticGguf.GgmlType.BF16 }.Write(Path.Combine(_dir, "q35-moe.gguf")),
         // The quantized mix (IQ3_S / IQ4_XS experts, Q8_0 projections) quantizes activations, so
@@ -69,6 +72,8 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData("dense", BackendType.GgmlCuda, 1, true)]
     [InlineData("dense", BackendType.GgmlMetal, 1, true)]
     [InlineData("dense-nextn", BackendType.GgmlCuda, 1, true)]
+    [InlineData("dense-prism", BackendType.GgmlMetal, 1, true)]
+    [InlineData("dense-prism", BackendType.GgmlCuda, 1, true)]
     [InlineData("dense", BackendType.GgmlCuda, 2, false)]
     [InlineData("dense", BackendType.GgmlCpu, 1, false)]
     [InlineData("dense", BackendType.Cuda, 1, false)]
@@ -144,6 +149,41 @@ public sealed class Qwen35RuntimeTests : IDisposable
             double rel = RelL2(actual[i], legacy[i]);
             Assert.True(rel <= tolerance, $"{variant} row {i}: relL2 {rel:E2} from Qwen35Model");
         }
+    }
+
+    /// <summary>Bonsai2's PRISM rotations on the pinned GGML backend: the runtime's step graphs read every rotated
+    /// product's input rotated (the GGML graph builder's weight_product, Q/K/V and gate/up sharing one rotation; the
+    /// grouped value heads permuted before ssm_out's) and embed through the inverse transform, as Qwen35Model's fused
+    /// graphs do.</summary>
+    [Fact]
+    public void PrismRotationsMatchQwen35Model()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        BackendType backend = TestGates.PinnedGgmlBackend;
+        string path = Fixture("dense-prism");
+        List<float[]> legacy;
+        using (var family = new Qwen35Model(path, backend))
+            legacy = Script(family);
+        using var runtime = Create(path, backend: backend);
+        List<float[]> actual = Script(runtime);
+        Assert.True(runtime.GraphRuns > 0, "the steps did not run as graphs");
+        // Measured 2026-11-12 (M5 Pro): ggml_metal 1.1e-5 at most, ggml_cpu 2.0e-2 (its BF16-rounded activations, as
+        // PerOpTolerance bounds); with the rotations left out the first row is 1.2 away.
+        double tolerance = RoundsActivations(backend) ? 2.5e-2 : 1e-4;
+        for (int i = 0; i < legacy.Count; i++)
+        {
+            double rel = RelL2(actual[i], legacy[i]);
+            Assert.True(rel <= tolerance, $"row {i}: relL2 {rel:E2} from Qwen35Model");
+        }
+    }
+
+    /// <summary>Off GGML no path applies the rotations: the load says so instead of answering unrotated.</summary>
+    [Fact]
+    public void PrismRotationsAreRefusedOffGgml()
+    {
+        string path = Fixture("dense-prism");
+        var error = Assert.Throws<NotSupportedException>(() => Create(path));
+        Assert.Contains("GGML", error.Message);
     }
 
     /// <summary>The runtime recipe on a real compute backend (the pinned GGML backend, MLX)

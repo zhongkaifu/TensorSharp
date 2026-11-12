@@ -262,6 +262,50 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
     public int SsmVHeads { get; init; } = 2;
     private int SsmInner => SsmVHeads * SsmHeadDim;
 
+    /// <summary>Bonsai2's PRISM layout (Ternary-Bonsai-2-27B): the projections and the output head PQ2_0 under
+    /// forward Hadamard rotations of block 128, the embedding PQ2_0 under the inverse one, beta/alpha kept in
+    /// <see cref="WeightType"/>, value heads grouped (gdn_v_grouped). Needs 128-aligned input widths (<see cref="Ff"/>
+    /// 512) and no NextN block (the rotations cover the decoder's layers only).</summary>
+    public bool Prism { get; init; }
+
+    private static readonly string[] PrismRotated =
+    {
+        "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+    };
+
+    private void ApplyPrism(List<Kv> kv, List<Tensor> t)
+    {
+        if (NextN) throw new InvalidOperationException("PRISM rotations cover the decoder's layers only.");
+        var forward = new List<string>();
+        var widths = new SortedSet<int>();
+        for (int i = 0; i < t.Count; i++)
+        {
+            string name = t[i].Name;
+            bool inverse = name == "token_embd.weight";
+            bool rotated = name == "output.weight" || Array.Exists(PrismRotated, s => name.EndsWith("." + s, StringComparison.Ordinal));
+            if (!inverse && !rotated) continue;
+            t[i] = Pq2(t[i]);
+            widths.Add((int)t[i].Dims[0]);
+            if (rotated) forward.Add(name);
+        }
+        int total = 0;
+        foreach (int width in widths) total += width;
+        var signs = new List<float>(total);
+        foreach (float v in Gen("prism.hadamard.signs", 1f, total).Data) signs.Add(v < 0 ? -1f : 1f);
+        const string p = "prism.hadamard.";
+        kv.Add(new U32 { Key = p + "version", V = 1 });
+        kv.Add(new U32 { Key = p + "block_size", V = 128 });
+        kv.Add(new Str { Key = p + "transform", V = "normalized-sylvester-walsh-hadamard" });
+        kv.Add(new Str { Key = p + "axis", V = "input-last-dimension" });
+        kv.Add(new Str { Key = p + "sign_mode", V = "explicit" });
+        kv.Add(new I32Arr { Key = p + "sign_widths", V = new List<int>(widths) });
+        kv.Add(new F32Arr { Key = p + "sign_values", V = signs });
+        kv.Add(new StrArr { Key = p + "weight_names", V = forward });
+        kv.Add(new StrArr { Key = p + "inverse_weight_names", V = new[] { "token_embd.weight" } });
+        kv.Add(new Bool { Key = p + "gdn_v_grouped", V = true });
+    }
+
     public int Layers { get; init; } = 4;
     public int Ff { get; init; } = 448;      // 3584 / 8: not a multiple of 128 or 256
     public GgmlType WeightType { get; init; } = GgmlType.BF16;
@@ -351,6 +395,7 @@ internal sealed class Qwen35DenseSyntheticModelBuilder
             t.Add(W(Gen(p + "ffn_up.weight", 0.06f, Hidden, Ff)));
             t.Add(W(Gen(p + "ffn_down.weight", 0.05f, Ff, Hidden)));
         }
+        if (Prism) ApplyPrism(kv, t);
         SyntheticGguf.Write(path, kv, t);
         return path;
     }

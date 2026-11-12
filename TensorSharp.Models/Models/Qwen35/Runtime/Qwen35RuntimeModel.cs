@@ -111,13 +111,10 @@ namespace TensorSharp.Models
                 $"RoPE dims={_ropeDim} base={Config.RopeBase} (NeoX, after QK-norm)");
 
             // What the shared runtime does not implement for this family is refused, not
-            // approximated: Bonsai2's PRISM rotations and its low-bit transcode (Qwen35Model's
-            // single-device GGML path), and per-tensor NVFP4 scale sidecars on routed experts
-            // (the runtime's expert kernels do not apply them; projections do).
-            if (HasBonsaiCheckpointMetadata)
-                throw new NotSupportedException(
-                    $"{arch}: this checkpoint carries PRISM Hadamard rotations (Bonsai2), which only the single-device " +
-                    "Qwen 3.5 path applies; it cannot run with --layer-split or host experts on cuda/mlx.");
+            // approximated: per-tensor NVFP4 scale sidecars on routed experts (the runtime's expert
+            // kernels do not apply them; projections do). Bonsai2's PRISM rotations run where GGML
+            // builds the graphs (PrepareLoadedWeights registers them); the load refuses them on every
+            // other backend and under tensor parallelism (ModelBase.ReadBonsaiMetadata).
 
             // A drafter named besides a separate MTP head attaches after the expert plan, into the same memory.
             if (_separateDraftHead == null && !string.IsNullOrWhiteSpace(draftModelPath))
@@ -158,18 +155,19 @@ namespace TensorSharp.Models
                || ServesOneDevice(context);
 
         /// <summary>
-        /// One device on ggml_cuda, ggml_metal or MLX, for a checkpoint without routed experts or Bonsai2
-        /// PRISM rotations: the runtime matches Qwen35Model there (Qwen3.8-27B UD-IQ3_XXS, prefill /
-        /// decode tok/s: ggml_metal 388.7 / 21.0 vs 393.3 / 21.0 on an M5 Pro; ggml_cuda measured on an
-        /// RTX PRO 6000 in the commit adding this route; MLX decode 19.8 vs 19.6-20.0, MTP 29.8 vs
-        /// 29.3-29.6, DFlash2 29.3-29.8 vs 27.5-27.7, Qwen3.5-0.8B Q8_0 prompt 12,130 vs 12,290).
-        /// Qwen35Model keeps routed experts (its fused MoE graphs and host seam), --tp (its per-rank
-        /// fused graphs), PRISM rotations and the other backends (direct CUDA is not at parity yet).
+        /// One device on ggml_cuda, ggml_metal or MLX, for a checkpoint without routed experts: the runtime
+        /// matches Qwen35Model there (Qwen3.8-27B UD-IQ3_XXS, prefill / decode tok/s: ggml_metal 388.7 / 21.0
+        /// vs 393.3 / 21.0 on an M5 Pro; ggml_cuda measured on an RTX PRO 6000 in the commit adding this route;
+        /// MLX decode 19.8 vs 19.6-20.0, MTP 29.8 vs 29.3-29.6, DFlash2 29.3-29.8 vs 27.5-27.7, Qwen3.5-0.8B
+        /// Q8_0 prompt 12,130 vs 12,290). Bonsai2's PRISM rotations included: the GGML graphs rotate the
+        /// rotated products' inputs (MLX refuses them at load, as Qwen35Model does). Qwen35Model keeps routed
+        /// experts (its fused MoE graphs and host seam), --tp (its per-rank fused graphs) and the other
+        /// backends (direct CUDA is not at parity yet).
         /// </summary>
         internal static bool ServesOneDevice(Architecture.ModelCreateContext context)
             => context.Backend is BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.Mlx
                && context.TpDegree <= 1 && context.TpGroup == null && context.LayerSplitDegree <= 1
-               && context.Probe != null && !HasRoutedExperts(context.Probe) && !CarriesPrismRotations(context.Probe);
+               && context.Probe != null && !HasRoutedExperts(context.Probe);
 
         private static bool HasRoutedExperts(GgufFile probe)
         {
@@ -178,32 +176,34 @@ namespace TensorSharp.Models
             return false;
         }
 
-        /// <summary>Bonsai2's PRISM Hadamard rotations (or its low-bit tensor types), which only
-        /// Qwen35Model applies.</summary>
-        private static bool CarriesPrismRotations(GgufFile probe)
-        {
-            foreach (string key in probe.Metadata.Keys)
-                if (key.StartsWith("prism.hadamard.", StringComparison.Ordinal)) return true;
-            foreach (var tensor in probe.Tensors.Values)
-                if (tensor.Type is GgmlTensorType.PQ2_0 or GgmlTensorType.PTQ1_0) return true;
-            return false;
-        }
-
         protected override bool IsRecurrentLayer(int layer) => _isRecurrent[layer];
 
         /// <summary>One device or whole-layer stages: the in-projection packed into one product where
         /// the four sources share a quantized type (rows move as they are), before residency releases
         /// the host copies. Mixed types stay four products (the graph lowering runs them; under tensor
-        /// parallelism ShardRecurrentLayer packs per rank instead).</summary>
+        /// parallelism ShardRecurrentLayer packs per rank instead). Then Bonsai2's PRISM transforms go on
+        /// the rotated weights, fused QKV and gate/up included (the GGML graph builder rotates their inputs).</summary>
         protected override void PrepareLoadedWeights()
         {
-            if (!TensorRecurrence || Mesh.TensorParallel != 1) return;
-            for (int l = 0; l < Config.NumLayers; l++)
+            if (TensorRecurrence && Mesh.TensorParallel == 1)
             {
-                if (!_isRecurrent[l] || !OwnsLayer(l) || !InProjectionSharesType(l)) continue;
-                int layer = l;
-                PackInProjection(layer, 1, 0, 1, _ => AllocatorForWeight($"blk.{layer}.attn_qkv.weight"));
+                for (int l = 0; l < Config.NumLayers; l++)
+                {
+                    // A packed in-projection would carry no transform: PRISM rotates qkv and z, never beta and alpha.
+                    if (!_isRecurrent[l] || !OwnsLayer(l) || !InProjectionSharesType(l) || RotatesAny(InProjSources(l))) continue;
+                    int layer = l;
+                    PackInProjection(layer, 1, 0, 1, _ => AllocatorForWeight($"blk.{layer}.attn_qkv.weight"));
+                }
             }
+            RegisterBonsaiWeightTransforms(_headVDim, _numKHeads, _numVHeads);
+        }
+
+        private bool RotatesAny(string[] names)
+        {
+            if (BonsaiHadamard == null) return false;
+            foreach (string name in names)
+                if (BonsaiHadamard.WeightNames.Contains(name) || BonsaiHadamard.InverseWeightNames.Contains(name)) return true;
+            return false;
         }
 
         protected unsafe IntPtr HostPointer(Tensor tensor) => (IntPtr)GetFloatPtr(tensor);

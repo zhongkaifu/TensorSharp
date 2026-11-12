@@ -966,6 +966,19 @@ before `SwigluFfn` and the strided prep); decode 197 / 197.
 Multi-axis rotary whose axes all hold the same position (text) runs as NeoX rotary on the device; the
 host loop, which read the rows back, now serves only image tokens.
 
+#### Weight transforms (Bonsai2 PRISM)
+
+Bonsai2 stores its projections rotated: each rotated weight expects its input through a signed
+Walsh-Hadamard transform, and the embedding's rows come out through the inverse one. The runtime registers
+the transforms on the loaded weights (fused Q/K/V and gate/up keep their sources'; an in-projection that
+would mix rotated and unrotated rows is not packed), and the GGML graph builder lowers a product whose
+weight leaf carries one as the product of the rotated input (`weight_product` over
+`tsg::bonsai_mul_mat_memo`: one rotation per input and transform, shared by Q/K/V and by gate/up). The
+embedding rows are gathered through the inverse transform as before. No other executor applies them, so
+the load refuses PRISM checkpoints there and under tensor parallelism. Real Ternary-Bonsai-2-27B PTQ1_0 on
+ggml_metal: the same greedy text as Qwen35Model, prefill 11.5 vs 11.6 s at 3.6K tokens, decode 26.1 vs
+26.2 tok/s (docs/models/bonsai2.md).
+
 #### Routed experts in host memory
 
 `GraphOp.MoeHostExperts` takes a layer's routed experts from host memory (`--n-cpu-moe`): the router and the
