@@ -1473,6 +1473,120 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
             Assert.True(Math.Abs(stepwise.Probs[i] - chained.Probs[i]) <= 1e-4f, $"step {i}: confidence {chained.Probs[i]} vs {stepwise.Probs[i]}");
     }
 
+    /// <summary>
+    /// The MTP draft chain on a layer split: the block is on the last GPU and the token embedding on the first, so the
+    /// engine keeps a second copy of the embedding beside the block and the chain's steps stay on that device (without
+    /// it every drafted token went through the host: embedded on the first GPU, handed over, its logits read back).
+    /// The chain there picks the tokens, with the confidences, of the chain on one GPU.
+    /// </summary>
+    [MultiCudaFact(2)]
+    public void TheMtpDraftChain_RunsOnALayerSplit_AsOnOneGpu()
+    {
+        string path = Fixture(indexerTopK: 2048);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 2048);
+        const int Steps3 = 3;
+        (int[] Ids, float[] Probs) Run(int layerSplit)
+        {
+            using ModelBase model = ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp, layerSplitDegree: layerSplit);
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var head = (TensorSharp.Runtime.Speculative.IDraftHead)model;
+            Assert.True(head.SupportsDraftChain, $"no draft chain with a layer split of {layerSplit}");
+            int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            var hidden = new float[Prompt.Length * feat];
+            spec.SpecForward(Prompt, hidden, new float[vocab], false);
+            var rows = new float[(Prompt.Length + 1) * feat];
+            Array.Copy(hidden, 0, rows, feat, Prompt.Length * feat);
+            var tokens = Prompt.Append(Steps[0]).ToArray();
+            var ids = new int[Steps3];
+            var probs = new float[Steps3];
+            Assert.Equal(Steps3, head.DraftChain(tokens, rows, 0, Steps3, ids, probs));
+            // A second window from the chain's own cache, as a speculator's next draft: the verified tokens, then drafts.
+            var ids2 = new int[Steps3];
+            var probs2 = new float[Steps3];
+            var next = new float[2 * feat];
+            Array.Copy(rows, (long)Prompt.Length * feat, next, 0, feat);
+            Array.Copy(rows, (long)Prompt.Length * feat, next, feat, feat);
+            Assert.Equal(Steps3, head.DraftChain(new[] { Steps[0], ids[0] }, next, Prompt.Length, Steps3, ids2, probs2));
+            return (ids.Concat(ids2).ToArray(), probs.Concat(probs2).ToArray());
+        }
+        var one = Run(1);
+        var split = Run(2);
+        _output.WriteLine($"one GPU:     [{string.Join(",", one.Ids)}] p [{string.Join(",", one.Probs.Select(p => p.ToString("F5")))}]");
+        _output.WriteLine($"layer split: [{string.Join(",", split.Ids)}] p [{string.Join(",", split.Probs.Select(p => p.ToString("F5")))}]");
+        Assert.Equal(one.Ids, split.Ids);
+        for (int i = 0; i < one.Probs.Length; i++)
+            Assert.True(Math.Abs(one.Probs[i] - split.Probs[i]) <= 1e-4f, $"step {i}: confidence {split.Probs[i]} vs {one.Probs[i]}");
+    }
+
+    /// <summary>
+    /// The MTP block follows a prompt on its own device (Q4eCudaEngine.MtpFollowsForward, IDraftHead.DraftSelfCatchUp): as
+    /// each ubatch finishes, the block joins every row's token with the streams of the row before it and writes its K/V
+    /// there, so the prompt hands the host its last row's streams only. The drafts after it are those of the host's
+    /// catch-up over every row's streams (TS_Q4E_MTP_FOLLOW=0), on one GPU and on a layer split.
+    /// </summary>
+    [CudaFact]
+    public void TheMtpBlock_FollowsAPromptOnItsDevice_AsTheHostCatchUp() => MtpFollowsAPrompt(layerSplit: 1);
+
+    [MultiCudaFact(2)]
+    public void TheMtpBlock_FollowsAPromptOnItsDevice_OnALayerSplit() => MtpFollowsAPrompt(layerSplit: 2);
+
+    private void MtpFollowsAPrompt(int layerSplit)
+    {
+        string path = Fixture(indexerTopK: 2048);
+        string mtp = Qwen4ExpSyntheticModelBuilder.WriteMtp(Path.Combine(_dir, "qwen4exp-mtp.gguf"), indexerTopK: 2048);
+        const int Steps3 = 3;
+        (int[] Ids, float[] Probs) Run(bool follow)
+        {
+            _env.Set("TS_Q4E_MTP_FOLLOW", follow ? "1" : "0");
+            using var model = Assert.IsType<Qwen4ExpCudaModel>(
+                ModelBase.Create(path, BackendType.Cuda, draftModelPath: mtp, layerSplitDegree: layerSplit));
+            var spec = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+            var head = (TensorSharp.Runtime.Speculative.IDraftHead)model;
+            Assert.Equal(follow, head.DraftSelfCatchUp);
+            int feat = spec.SpecFeatureSize, vocab = model.Config.VocabSize;
+            var last = new float[feat];
+            // The prompt in two chunks, as a scheduler reads it; the second continues the first.
+            int half = Prompt.Length / 2;
+            int[] first = Prompt.Take(half).ToArray(), second = Prompt.Skip(half).ToArray();
+            if (follow)
+            {
+                spec.SpecForward(first, last, new float[vocab], false);
+                spec.SpecForward(second, last, new float[vocab], false);
+                Assert.Equal(Prompt.Length, model.Engine.MtpRowsFollowed);
+                // The positions reported as a gap (a plain prefill's seed) are held already: no restart.
+                head.DraftCatchUp(Prompt, null, 0);
+                Assert.Equal((0, Prompt.Length), model.Engine.MtpSpan);
+            }
+            else
+            {
+                // The host's catch-up over the same chunks: row t with the streams of row t - 1 (zeros before the first).
+                var hidden = new float[Prompt.Length * feat];
+                var chunk = new float[second.Length * feat];
+                spec.SpecForward(first, chunk, new float[vocab], false);
+                Array.Copy(chunk, 0, hidden, 0, (long)first.Length * feat);
+                spec.SpecForward(second, chunk, new float[vocab], false);
+                Array.Copy(chunk, 0, hidden, (long)first.Length * feat, (long)second.Length * feat);
+                var rows = new float[Prompt.Length * feat];
+                Array.Copy(hidden, 0, rows, feat, (long)(Prompt.Length - 1) * feat);
+                head.DraftCatchUp(first, rows.AsSpan(0, first.Length * feat).ToArray(), 0);
+                head.DraftCatchUp(second, rows.AsSpan(first.Length * feat).ToArray(), first.Length);
+                Array.Copy(hidden, (long)(Prompt.Length - 1) * feat, last, 0, feat);
+                Assert.Equal(0, model.Engine.MtpRowsFollowed);
+            }
+            var ids = new int[Steps3];
+            var probs = new float[Steps3];
+            Assert.Equal(Steps3, head.DraftChain(new[] { Steps[0] }, last, Prompt.Length, Steps3, ids, probs));
+            return (ids, probs);
+        }
+        var host = Run(follow: false);
+        var device = Run(follow: true);
+        _output.WriteLine($"host catch-up: [{string.Join(",", host.Ids)}] p [{string.Join(",", host.Probs.Select(p => p.ToString("F5")))}]");
+        _output.WriteLine($"followed:      [{string.Join(",", device.Ids)}] p [{string.Join(",", device.Probs.Select(p => p.ToString("F5")))}]");
+        Assert.Equal(host.Ids, device.Ids);
+        for (int i = 0; i < Steps3; i++)
+            Assert.True(Math.Abs(host.Probs[i] - device.Probs[i]) <= 1e-4f, $"step {i}: confidence {device.Probs[i]} vs {host.Probs[i]}");
+    }
+
     /// <summary>The MTP block restarts its cache after a gap (IDraftHead.DraftHeadResumesAfterGap): a catch-up without hidden
     /// rows moves its row 0 to the end of the gap, and the rows replayed from there answer bit for bit as a block that
     /// started with them at position 0 (its cache counts from the restart, and RoPE scores depend on distance alone). A
@@ -1921,6 +2035,12 @@ public sealed class Qwen4ExpCudaEngineTests : IDisposable
                 Assert.False(model.HasPendingPipelinedDecode);
                 Assert.Equal(2L * rounds, model.Engine.DecodeLaneSteps);
                 Assert.True(model.Engine.CapturedBatchGraphs >= 2, "no lane's step was captured");
+                // The lanes' serving counters: every step, its rows, and how it ended for the host.
+                var counters = model.Engine.ReadTelemetry();
+                Assert.Equal(2L * rounds, counters.LaneSteps);
+                Assert.Equal(2L * perGroup * rounds, counters.LaneRows);
+                Assert.Equal(counters.LaneSteps, counters.LaneFinishesReady + counters.LaneFinishesWaited);
+                Assert.True(counters.LaneIssueSeconds > 0, "no lane issue time was counted");
             }
             return got;
         }

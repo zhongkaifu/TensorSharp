@@ -73,6 +73,10 @@ namespace TensorSharp.Cuda
             long b = 0;
             foreach (var w in MtpWeights(_m.Mtp, experts: true))
                 b += CudaWeightArena.Align(w.TotalBytes);
+            // On a layer split the draft chain embeds each drafted token on the block's device (the last): a second copy
+            // of the token embedding there, beside the first device's.
+            if (MtpEmbedsOnItsDevice)
+                b += CudaWeightArena.Align(_m.TokEmbd.TotalBytes);
             return b;
         }
 
@@ -89,9 +93,22 @@ namespace TensorSharp.Cuda
             return MtpArenaBytes() + floats + kv + join;
         }
 
+        // TS_Q4E_MTP_CHAIN_SPLIT=0: on a layer split the drafts go through the host one at a time, as before the chain ran
+        // there (no second copy of the token embedding).
+        private static readonly bool s_mtpChainSplit = Environment.GetEnvironmentVariable("TS_Q4E_MTP_CHAIN_SPLIT") != "0";
+
+        /// <summary>Whether the block's device holds its own copy of the token embedding: a layer split (the block is on
+        /// the last device, the embedding on the first), so a draft chain's steps stay on the block's device.</summary>
+        private bool MtpEmbedsOnItsDevice => _m.Mtp != null && _devs.Length > 1 && s_mtpChainSplit;
+
+        /// <summary>The token embedding on the block's device when that is not the first (<see cref="MtpEmbedsOnItsDevice"/>).</summary>
+        private DeviceWeight _mtpTokEmbd;
+
         private void UploadMtp(Dev dev)
         {
             var mtp = _m.Mtp;
+            if (MtpEmbedsOnItsDevice && dev.Ordinal != 0)
+                _mtpTokEmbd = dev.Weights.Place(_m.TokEmbd);
             UploadLayer(dev, mtp.Layer, _mtpLayer, -1);
             // The per-stream norm takes [hc * E] weights: enorm repeated once per stream.
             var enorm = new float[_m.Hc * _m.NEmbd];
@@ -109,6 +126,8 @@ namespace TensorSharp.Cuda
         {
             var m = _m;
             _mtpJoin = AllocF32(dev, (long)m.NUbatch * m.Hc, 2L * m.NEmbd);
+            // A draft chain's picked token, embedded on this device (device 0 has its own).
+            dev.Tokens ??= AllocT(dev, DType.Int32, m.NUbatch);
             CudaDriverApi.cuMemHostAlloc(out _pinnedMtpH, new UIntPtr((ulong)m.NUbatch * (ulong)HcDim * 4), 0x1).ThrowOnError();
             dev.DraftIds = AllocT(dev, DType.Int32, MaxDraftChainSteps);
             dev.DraftProbs = AllocF32(dev, MaxDraftChainSteps);
@@ -127,6 +146,13 @@ namespace TensorSharp.Cuda
             if (_pinnedChain != IntPtr.Zero)
                 CudaDriverApi.cuMemFreeHost(_pinnedChain);
             _pinnedChain = IntPtr.Zero;
+            if (_mtpTokPinned != null)
+                for (int i = 0; i < _mtpTokPinned.Length; i++)
+                {
+                    if (_mtpTokPinned[i] != IntPtr.Zero) CudaDriverApi.cuMemFreeHost(_mtpTokPinned[i]);
+                    if (_mtpTokCopied[i] != IntPtr.Zero) CudaDriverApi.cuEventDestroy(_mtpTokCopied[i]);
+                }
+            _mtpTokPinned = null;
         }
 
         /// <summary>The MTP block's K/V for a slot, for the whole context (it does not grow with the slot): F16, or
@@ -157,6 +183,8 @@ namespace TensorSharp.Cuda
             slot.Mtp = c;
             slot.MtpPast = 0;
             slot.MtpStart = 0;
+            slot.MtpCarry = SlotTensor(slot, dev, DType.Float32, HcDim);
+            slot.MtpCarryPos = -1;
         }
 
         /// <summary>
@@ -177,6 +205,7 @@ namespace TensorSharp.Cuda
             EnsureMtpCache(slot);
             slot.MtpStart = position;
             slot.MtpPast = position;
+            slot.MtpCarryPos = -1;
         }
 
         // TS_Q4E_MTP_RESUME=0: the block never restarts by itself (Qwen4ExpCudaModel reads the same switch).
@@ -191,7 +220,7 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>The active slot's MTP cache: the first position it holds (its restart) and the end.</summary>
-        internal (int Start, int Past) MtpSpan => _active.Mtp == null ? (0, 0) : (_active.MtpStart, _active.MtpPast);
+        public (int Start, int Past) MtpSpan => _active.Mtp == null ? (0, 0) : (_active.MtpStart, _active.MtpPast);
 
         /// <summary>
         /// Run the MTP block over <paramref name="tokens"/> at positions <paramref name="p0"/>, ... of the active slot,
@@ -214,6 +243,8 @@ namespace TensorSharp.Cuda
             if (slot.Failed)
                 throw new InvalidOperationException("[q4e-cuda] the sequence's last forward failed; reset it before reuse");
             EnsureMtpCache(slot);
+            // Rows written here are the caller's, not the trunk's own as it forwarded them: nothing follows on from them.
+            slot.MtpCarryPos = -1;
             MtpRestartOnGap(slot, p0);
             if (p0 < slot.MtpStart || p0 > slot.MtpPast)
                 throw new InvalidOperationException($"[q4e-cuda] the MTP block holds positions {slot.MtpStart}..{slot.MtpPast} and cannot draft from {p0}");
@@ -310,14 +341,26 @@ namespace TensorSharp.Cuda
             var dev0 = _devs[0];
             var dev = _devs[_mtpLayer.Device];
 
-            // The token rows, embedded into all four streams on the embedding's device.
-            dev0.MakeCurrent();
-            CudaDriverApi.cuStreamSynchronize(dev0.Stream).ThrowOnError();
-            Marshal.Copy(tokens, off, _pinnedTokens, nt);
-            CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev0.Tokens), _pinnedTokens, new UIntPtr((ulong)nt * 4), dev0.Stream).ThrowOnError();
-            dev0.DK.Embed(_tokEmbd.Ptr, dev0.Tokens, dev0.Xs, _tokEmbd.Type, _tokEmbd.RowBytes, nt, m.NEmbd, dev0.Stream);
-            if (dev != dev0)
-                Handoff(dev0, dev, nt);
+            // The token rows, embedded into all four streams: on the block's device where it holds the embedding (a layer
+            // split's second copy), else on the first device and handed over.
+            if (dev != dev0 && _mtpTokEmbd.Ptr != IntPtr.Zero)
+            {
+                dev.MakeCurrent();
+                CudaDriverApi.cuStreamSynchronize(dev.Stream).ThrowOnError();
+                Marshal.Copy(tokens, off, _pinnedTokens, nt);
+                CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev.Tokens), _pinnedTokens, new UIntPtr((ulong)nt * 4), dev.Stream).ThrowOnError();
+                dev.DK.Embed(_mtpTokEmbd.Ptr, dev.Tokens, dev.Xs, _mtpTokEmbd.Type, _mtpTokEmbd.RowBytes, nt, m.NEmbd, dev.Stream);
+            }
+            else
+            {
+                dev0.MakeCurrent();
+                CudaDriverApi.cuStreamSynchronize(dev0.Stream).ThrowOnError();
+                Marshal.Copy(tokens, off, _pinnedTokens, nt);
+                CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev0.Tokens), _pinnedTokens, new UIntPtr((ulong)nt * 4), dev0.Stream).ThrowOnError();
+                dev0.DK.Embed(_tokEmbd.Ptr, dev0.Tokens, dev0.Xs, _tokEmbd.Type, _tokEmbd.RowBytes, nt, m.NEmbd, dev0.Stream);
+                if (dev != dev0)
+                    Handoff(dev0, dev, nt);
+            }
 
             // The trunk streams of the previous tokens: rows [a, b) from the last prompt group's buffer when it holds their
             // positions, the rest from the host.
@@ -399,12 +442,145 @@ namespace TensorSharp.Cuda
             return nt;
         }
 
+        // ---- the block follows a forward on its own device ----
+
+        // TS_Q4E_MTP_FOLLOW=0: a prompt read for a speculating request hands every row's streams to the host, which hands
+        // them back for the block's catch-up, as before the block followed the forward on its device.
+        private readonly bool _mtpFollow = Environment.GetEnvironmentVariable("TS_Q4E_MTP_FOLLOW") != "0";
+
+        /// <summary>Whether the block can follow a forward on its device (<see cref="MtpFollowsForward"/>): it is on the
+        /// last device, where a forward's rows end, with the token embedding there, and prompts run in ubatch order (a
+        /// prompt read layer by layer under expert residency keeps its rows' streams apart, and the host's catch-up reads
+        /// them from there).</summary>
+        public bool CanMtpFollowForward => _mtpFollow && _mtpLayer != null && _mtpLayer.Device == _lastDev
+            && (_devs.Length == 1 || _mtpTokEmbd.Ptr != IntPtr.Zero) && _groupXs == null;
+
+        /// <summary>
+        /// Set around a <see cref="Forward(int[], float[], float[])"/> whose rows the block should take as they finish
+        /// (a speculating request's prompt): after each ubatch's last layer the block joins every row's token with the
+        /// streams of the row before it and writes its K/V, on its own device, where those streams already are. The
+        /// host's catch-up did the same from a copy: every row's streams (40 KB a token) crossed to the host and back,
+        /// which with the forwards waiting on it read a 40K-token prompt at 3,850 tok/s against 6,000 without the block.
+        /// The rows must continue what the block holds, from position 0 on; any other forward leaves a gap the block
+        /// restarts after, as before.
+        /// </summary>
+        public bool MtpFollowsForward { get; set; }
+
+        /// <summary>Whether a followed forward of the active slot would continue the block's cache now: at position 0, or
+        /// right behind the rows it holds with their last row's streams still on the device.</summary>
+        public bool MtpFollowReady
+        {
+            get
+            {
+                if (!CanMtpFollowForward)
+                    return false;
+                Slot s = _active;
+                return s.NPast == 0 || (s.Mtp != null && s.MtpPast == s.NPast && s.MtpCarryPos == s.NPast - 1 && s.NPast > s.MtpStart);
+            }
+        }
+
+        /// <summary>The position up to which the active slot's block holds rows it took from the trunk's own forwards
+        /// (<see cref="MtpFollowUbatch"/>), nothing written after them; -1 when its last rows came another way. A caller
+        /// that reports those positions as a gap finds them held already.</summary>
+        public int MtpFollowedThrough
+        {
+            get
+            {
+                Slot s = _active;
+                return s.Mtp != null && s.MtpCarryPos >= 0 && s.MtpPast == s.MtpCarryPos + 1 ? s.MtpPast : -1;
+            }
+        }
+
+        /// <summary>Rows the block took on its device as forwards finished them (tests, diagnostics).</summary>
+        internal long MtpRowsFollowed { get; private set; }
+
+        // The followed rows' tokens, staged for the block's device: a forward's own pinned tokens are rewritten for the next
+        // ubatch as soon as the first device has read them, while the last device may still be on the ubatch before. A
+        // ring slot is rewritten once the copy out of it has run.
+        private const int MtpTokenRing = 4;
+        private IntPtr[] _mtpTokPinned;
+        private IntPtr[] _mtpTokCopied;
+        private bool[] _mtpTokUsed;
+        private int _mtpTokNext;
+
+        private void EnsureMtpTokenRing(Dev dev)
+        {
+            if (_mtpTokPinned != null)
+                return;
+            var pinned = new IntPtr[MtpTokenRing];
+            var copied = new IntPtr[MtpTokenRing];
+            for (int i = 0; i < MtpTokenRing; i++)
+            {
+                CudaDriverApi.cuMemHostAlloc(out pinned[i], new UIntPtr((ulong)_m.NUbatch * 4), 0x1).ThrowOnError();
+                CudaDriverApi.cuEventCreate(out copied[i], 0x02 /*DISABLE_TIMING*/).ThrowOnError();
+            }
+            _mtpTokCopied = copied;
+            _mtpTokUsed = new bool[MtpTokenRing];
+            _mtpTokPinned = pinned;
+        }
+
+        /// <summary>
+        /// The block over the ubatch the forward just issued (<paramref name="nt"/> rows of <paramref name="slot"/> from
+        /// <paramref name="p0"/>, whose output streams are in the last device's Xs): row t joins its token with the
+        /// streams of row t - 1 (the carry of the previous ubatch for row 0, zeros at position 0) and leaves its K/V in
+        /// the block's cache; the last row's streams become the carry. Issued behind the ubatch's own work (the head
+        /// included) on the device's stream. False, and nothing issued, when the rows do not continue the block's cache.
+        /// </summary>
+        private bool MtpFollowUbatch(Slot slot, int[] tokens, int off, int nt, int p0)
+        {
+            if (!CanMtpFollowForward || nt < 1)
+                return false;
+            var m = _m;
+            var dev = _devs[_mtpLayer.Device];
+            EnsureMtpCache(slot);
+            if (p0 == 0)
+                slot.MtpStart = slot.MtpPast = 0;
+            else if (slot.MtpPast != p0 || slot.MtpCarryPos != p0 - 1 || p0 <= slot.MtpStart)
+            {
+                slot.MtpCarryPos = -1;
+                return false;
+            }
+            int q0 = p0 - slot.MtpStart;
+            if (q0 + nt > m.NCtx)
+                return false;
+            dev.MakeCurrent();
+            EnsureMtpTokenRing(dev);
+            int ring = _mtpTokNext;
+            _mtpTokNext = (ring + 1) % MtpTokenRing;
+            if (_mtpTokUsed[ring])
+                CudaDriverApi.cuEventSynchronize(_mtpTokCopied[ring]).ThrowOnError();
+            Marshal.Copy(tokens, off, _mtpTokPinned[ring], nt);
+            _mtpTokUsed[ring] = true;
+            CudaDriverApi.cuMemcpyHtoDAsync(Ptr(dev.Tokens), _mtpTokPinned[ring], new UIntPtr((ulong)nt * 4), dev.Stream).ThrowOnError();
+            CudaDriverApi.cuEventRecord(_mtpTokCopied[ring], dev.Stream).ThrowOnError();
+
+            // Row t's previous streams: row t - 1's of this ubatch, the carry for row 0.
+            long rowBytes = (long)HcDim * 4;
+            if (nt > 1)
+                CudaDriverApi.cuMemcpyDtoDAsync(At(dev.G, HcDim), Ptr(dev.Xs), new UIntPtr((ulong)((nt - 1) * rowBytes)), dev.Stream).ThrowOnError();
+            if (p0 == 0)
+                CudaDriverApi.cuMemsetD8Async(Ptr(dev.G), 0, new UIntPtr((ulong)rowBytes), dev.Stream).ThrowOnError();
+            else
+                CudaDriverApi.cuMemcpyDtoDAsync(Ptr(dev.G), Ptr(slot.MtpCarry), new UIntPtr((ulong)rowBytes), dev.Stream).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoDAsync(Ptr(slot.MtpCarry), At(dev.Xs, (long)(nt - 1) * HcDim), new UIntPtr((ulong)rowBytes), dev.Stream).ThrowOnError();
+
+            DeviceWeight embd = dev.Ordinal == 0 ? _tokEmbd : _mtpTokEmbd;
+            dev.DK.Embed(embd.Ptr, dev.Tokens, dev.Xs, embd.Type, embd.RowBytes, nt, m.NEmbd, dev.Stream);
+            MtpRows(slot, nt, q0, rest: false);
+            slot.MtpPast = p0 + nt;
+            slot.MtpCarryPos = p0 + nt - 1;
+            MtpRowsFollowed += nt;
+            _devs[0].MakeCurrent();
+            return true;
+        }
+
         /// <summary>Steps a <see cref="MtpDraftChain"/> takes at most.</summary>
         public const int MaxDraftChainSteps = 8;
 
-        /// <summary>Whether <see cref="MtpDraftChain"/> runs here: an MTP block on one GPU and the pick kernel loaded.</summary>
-        public bool HasMtpDraftChain => _mtpLayer != null && _devs.Length == 1 && _devs[0].QK.HasDraftPick
-            && Environment.GetEnvironmentVariable("TS_Q4E_MTP_CHAIN") != "0";
+        /// <summary>Whether <see cref="MtpDraftChain"/> runs here: an MTP block, the pick kernel loaded, and the token
+        /// embedding on the block's device (one GPU, or a layer split's second copy).</summary>
+        public bool HasMtpDraftChain => _mtpLayer != null && (_devs.Length == 1 || MtpEmbedsOnItsDevice)
+            && _devs[_mtpLayer.Device].QK.HasDraftPick && Environment.GetEnvironmentVariable("TS_Q4E_MTP_CHAIN") != "0";
 
         /// <summary>
         /// A whole per-token draft chain on the device: <see cref="MtpForward"/> over <paramref name="tokens"/> (the
@@ -418,7 +594,7 @@ namespace TensorSharp.Cuda
         {
             DrainDecodeLanes();
             if (!HasMtpDraftChain)
-                throw new InvalidOperationException("[q4e-cuda] the MTP draft chain needs the block on one GPU and the pick kernel");
+                throw new InvalidOperationException("[q4e-cuda] the MTP draft chain needs the pick kernel and the token embedding on the block's device");
             ArgumentNullException.ThrowIfNull(tokens);
             ArgumentNullException.ThrowIfNull(hPrev);
             int n = tokens.Length;
@@ -429,6 +605,8 @@ namespace TensorSharp.Cuda
             if (slot.Failed)
                 throw new InvalidOperationException("[q4e-cuda] the sequence's last forward failed; reset it before reuse");
             EnsureMtpCache(slot);
+            // Rows written here are the caller's, not the trunk's own as it forwarded them: nothing follows on from them.
+            slot.MtpCarryPos = -1;
             MtpRestartOnGap(slot, p0);
             if (p0 < slot.MtpStart || p0 > slot.MtpPast)
                 throw new InvalidOperationException($"[q4e-cuda] the MTP block holds positions {slot.MtpStart}..{slot.MtpPast} and cannot draft from {p0}");
@@ -439,7 +617,8 @@ namespace TensorSharp.Cuda
             slot.MtpPast = Math.Min(slot.MtpPast, p0);
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
             var m = _m;
-            var dev = _devs[0];
+            var dev = _devs[_mtpLayer.Device];
+            DeviceWeight embd = dev.Ordinal == 0 ? _tokEmbd : _mtpTokEmbd;
             int done = 0, left = 0;
             while (done < n)
             {
@@ -459,7 +638,7 @@ namespace TensorSharp.Cuda
                     break;
                 // The next row: the picked token embedded into the streams, this row's output streams as its previous ones.
                 CudaDriverApi.cuMemcpyDtoDAsync(Ptr(dev.G), At(dev.Xs, (long)row * HcDim), new UIntPtr((ulong)HcDim * 4), dev.Stream).ThrowOnError();
-                dev.DK.Embed(_tokEmbd.Ptr, dev.Tokens, dev.Xs, _tokEmbd.Type, _tokEmbd.RowBytes, 1, m.NEmbd, dev.Stream);
+                dev.DK.Embed(embd.Ptr, dev.Tokens, dev.Xs, embd.Type, embd.RowBytes, 1, m.NEmbd, dev.Stream);
                 pos++;
                 MtpRows(slot, 1, pos, true);
                 row = 0;

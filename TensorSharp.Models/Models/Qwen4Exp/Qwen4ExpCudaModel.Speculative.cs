@@ -44,13 +44,21 @@ namespace TensorSharp.Models
                 if (n > window && allLogitsRows)
                     throw new NotSupportedException(
                         $"qwen4exp on --backend cuda verifies at most {window} rows with every row's logits; the speculator asked for {n}.");
-                if (n > window)
+                // The block takes a prompt's rows on its device (DraftSelfCatchUp): any chunk of two rows or more with
+                // the last row's logits is the plain forward, followed there.
+                // One row too while the block is right behind the trunk (the step that captures the carry after a prompt
+                // read on the plain path): the block then holds that row as well and the first draft continues from it.
+                bool followed = DraftSelfCatchUp && !allLogitsRows && _exec.MtpFollowReady;
+                if (n > window || followed)
                 {
                     // A prompt chunk: the plain forward, last row's logits, and the rows' hidden streams (every row's,
                     // or the last row's when hAllOut holds one).
                     if (_logitsBuffer == null || _logitsBuffer.Length != vocab)
                         _logitsBuffer = new float[vocab];
-                    _exec.Forward(tokens, _logitsBuffer, hAllOut);
+                    if (followed)
+                        _exec.ForwardFollowed(tokens, _logitsBuffer, hAllOut);
+                    else
+                        _exec.Forward(tokens, _logitsBuffer, hAllOut);
                     Array.Copy(_logitsBuffer, logitsOut, vocab);
                     _cacheSeqLen = _exec.NPast;
                     return;
@@ -157,8 +165,22 @@ namespace TensorSharp.Models
         private static readonly bool s_mtpResume = Environment.GetEnvironmentVariable("TS_Q4E_MTP_RESUME") != "0";
 
         // A lone request still reads its prompt through the context, so the block's cache holds the prompt (the drafts
-        // condition on it), as before.
-        public bool DraftHeadConditionsOnPrompt => HasDraftHead;
+        // condition on it), as before. TS_Q4E_MTP_PROMPT=0 reads every prompt plainly and restarts the block at the first
+        // decode step, as a request beside others or on a reused prefix already does: the prompt's hidden rows (40 KB a
+        // token) then never cross to the host and back, and on a layer split its chunks stay in flight (two H100 NVL,
+        // Q8_0, a 40K-token prompt: 6,000 tok/s against 3,850 through the context).
+        public bool DraftHeadConditionsOnPrompt => HasDraftHead && s_mtpPrompt;
+
+        /// <summary>
+        /// The engine's MTP block takes a prompt's rows on its own device as the forward finishes them
+        /// (Q4eCudaEngine.MtpFollowsForward), so a prompt read through the speculative context hands back the last row's
+        /// streams only and the speculator replays nothing: two H100 NVL, Q8_0, a 19K-token prompt at 4,200 tok/s before
+        /// (every row's streams to the host and back), the drafts conditioned on it as before. TS_Q4E_MTP_FOLLOW=0 keeps
+        /// the host's catch-up.
+        /// </summary>
+        public bool DraftSelfCatchUp => HasDraftHead && _exec?.CanMtpFollowForward == true;
+
+        private static readonly bool s_mtpPrompt = Environment.GetEnvironmentVariable("TS_Q4E_MTP_PROMPT") != "0";
 
         public void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
             => RunMtp(new[] { token }, hPrev, pos, logitsOut, hOut);
@@ -194,7 +216,14 @@ namespace TensorSharp.Models
                 if (!DraftHeadResumesAfterGap || logitsOut != null || hOut != null)
                     throw new ArgumentNullException(nameof(hRows), "the MTP block needs the trunk's hidden streams of every row it replays");
                 lock (_sync)
-                    OnDraftSlot(() => { _exec.MtpRestart(startPos + tokens.Length); return 0; });
+                    OnDraftSlot(() =>
+                    {
+                        // Rows the block took on its device as the trunk forwarded them are no gap: it holds them already.
+                        int end = startPos + tokens.Length;
+                        if (!(DraftSelfCatchUp && _exec.MtpFollowedThrough == end && _exec.MtpSpan.Start <= startPos))
+                            _exec.MtpRestart(end);
+                        return 0;
+                    });
                 return;
             }
             if (tokens.Length == 0)

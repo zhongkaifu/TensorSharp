@@ -2847,6 +2847,11 @@ semantic conventions, which are still in development and may change.
 | `tensorsharp.engine.inter_token.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.step_kind` (of the step that emitted the token). Time between a sequence's consecutive output tokens |
 | `tensorsharp.prefix_cache.lookups` | counter, `{lookup}` | `tensorsharp.model.architecture`, `tensorsharp.prefix_cache.outcome` (`full`, `partial`, `miss`), `tensorsharp.prefix_cache.source` |
 | `tensorsharp.engine.stage.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.stage`, `tensorsharp.engine.step_kind`, `tensorsharp.engine.rows` |
+| `tensorsharp.engine.step.phase.duration` | histogram, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.step.phase` (`finish`, `sample`, `issue`), `tensorsharp.engine.rows`. Host time of each part of a batched decode step |
+| `tensorsharp.engine.lane.steps` | counter, `{step}` | `tensorsharp.model.architecture`, `tensorsharp.engine.lane.finish` (`ready`, `waited`) |
+| `tensorsharp.engine.lane.rows` | counter, `{row}` | `tensorsharp.model.architecture` |
+| `tensorsharp.engine.lane.time` | counter, `s` | `tensorsharp.model.architecture`, `tensorsharp.engine.lane.state` (`issue`, `wait`, `idle`) |
+| `tensorsharp.speculative.accepted_length` | histogram, `{token}` | `tensorsharp.model.architecture`, `tensorsharp.speculative.drafted`. Drafted tokens one verify window kept |
 | `tensorsharp.slots` | gauge, `{slot}` | `tensorsharp.model.architecture`, `tensorsharp.slot.state` (`running`, `retained`) |
 | `tensorsharp.slots.memory` / `.capacity` | gauge, `By` / `{token}` | `tensorsharp.model.architecture` |
 | `tensorsharp.slots.grows`, `.grow_failures` | counter | `tensorsharp.model.architecture` |
@@ -2897,6 +2902,19 @@ semantic conventions, which are still in development and may change.
 - `tensorsharp.engine.stage.duration` is recorded only when `TS_Q4E_PERF_SAMPLE=N` is set: every
   Nth forward of that engine runs uncaptured, with GPU timers around each stage, and records one value per
   stage. `tensorsharp.engine.rows` is the batch's rows in buckets (`1`, `2-4`, `5-8`, `9-16`, `17+`).
+  A decode lane's step is sampled too (the other lane's step finishes first, so the stages time that step
+  alone), and at most one forward every `TS_Q4E_PERF_SAMPLE_MIN_MS` (10 s) is sampled: a sampled forward costs
+  several captured steps.
+- `tensorsharp.engine.step.phase.duration` splits a batched decode step's host time: `finish` is the wait for the
+  previous step's logits and their copy, `sample` the draws, `issue` queueing the next step's GPU work (the whole
+  forward where the step waits for itself). With decode lanes (a layer split), `tensorsharp.engine.lane.steps`
+  counts each lane step by how it ended for the host: `ready` means the GPUs had finished before the host came
+  back for the logits, so sampling and scheduling set the pace; `waited` means the GPUs do.
+  `tensorsharp.engine.lane.time` sums, over the lanes, the host's time issuing a lane's step, waiting for one,
+  and with a lane empty between a step's finish and its next issue (`idle`, gaps of a second or more left out:
+  time that lane's GPU work could have been running).
+- `tensorsharp.speculative.accepted_length` records, per verify window, how many drafted tokens the target kept,
+  with the window's drafted count as an attribute: the distribution behind the drafted and accepted totals.
 - `tensorsharp.video.generation.duration` includes the wait for the video lock. A phase that fails
   or is cancelled has a span but no `tensorsharp.video.phase.duration` value.
 - The GPU memory gauges report the latest snapshot, taken on the thread that is doing that

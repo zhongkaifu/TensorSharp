@@ -1262,7 +1262,7 @@ after another. Changed:
 - **Greedy verify on the device** (`TS_Q4E_GREEDY_VERIFY`, on). A plain greedy sampler takes each verify row's first
   maximum from an argmax kernel in the captured window, instead of a megabyte of logits a row crossing the bus to the
   host's scan. Same tokens.
-- **The draft chain on the device** (`TS_Q4E_MTP_CHAIN`, on; one GPU, no sampling penalties). A window's drafts run as
+- **The draft chain on the device** (`TS_Q4E_MTP_CHAIN`, on; one GPU, or a layer split with `TS_Q4E_MTP_CHAIN_SPLIT`; no sampling penalties). A window's drafts run as
   one chain: a pick kernel takes each step's first-max token and its top-10 confidence and feeds the next step, so the
   host makes one call a window and reads no draft logits. Drafting went from 2.1-2.2 to 1.9-2.1 ms a window; the end
   to end numbers stayed within run-to-run noise (short chat 74-102, long generation 141-175, 4K 108-131, 16K 154-170
@@ -2519,7 +2519,9 @@ per step. These settings shape it as a server:
 | `TS_Q4E_PLACEMENT_SLOTS` | `16` | The layer split balances weights plus this many slots' caches, as many as fit; `1` balances for one. |
 | `TS_Q4E_UBATCH` | `512` | Rows per prefill forward. |
 | `TS_Q4E_PERF` | `0` | `1` logs each forward's time; `3` logs each stage's GPU time per step (uncaptured). |
-| `TS_Q4E_PERF_SAMPLE` | `0` | Every Nth forward runs uncaptured with stage timers and records `tensorsharp.engine.stage.duration` per stage, step kind and rows, instead of a log line. With `TS_Q4E_PERF` at `2` or more it is off. |
+| `TS_Q4E_PERF_SAMPLE` | `0` | Every Nth forward runs uncaptured with stage timers and records `tensorsharp.engine.stage.duration` per stage, step kind and rows, instead of a log line. A decode lane's step is sampled too (the other lane finishes first), and at most one forward every `TS_Q4E_PERF_SAMPLE_MIN_MS` (10,000) is sampled. With `TS_Q4E_PERF` at `2` or more it is off. |
+| `TS_Q4E_PIPELINE_OVER_SPEC` | on | With the MTP head under `--layer-split 2` and up, a lone request speculates and two or more decode plainly as two groups in flight; `0` puts the batched verify first again (a draft head then turns the groups off). |
+| `TS_Q4E_MTP_FOLLOW`, `TS_Q4E_MTP_CHAIN_SPLIT` | on | With the MTP head, the block takes a lone request's prompt on its own device as each ubatch finishes, instead of through the host; on a layer split the last GPU holds a second copy of the token embedding for it (0.67 GiB for Q8_0), which also keeps a window's draft chain on that GPU. `0` for the first keeps the host's catch-up; `0` for the second turns both off on a layer split. |
 | `TS_KDA_SCAN_R4` | off | `1` runs the gated-delta scan four state rows a warp in prefill too; unset, a prefill ubatch's scan runs one row a warp and prefetches the next row's inputs (bit-identical). |
 
 The scheduler sizes its reservation pool for one context per running sequence for this
@@ -2574,6 +2576,46 @@ With each of the other switches on and off greedy answers are byte-identical. Th
 and `ARewindFromTheCheckpoint_ContinuesAsTheSequenceThatStoppedThere` cover them on the
 synthetic fixture. The direct engine has no MTP drafter and refuses `--tp`; under a layer
 split one GPU computes at a time.
+
+With the shared MTP head on a layer split (2026-11-12, the same two H100 NVL, Q8_0, upstream
+`567d171d`), one configuration now serves a lone request and a crowd. Before, loading the head
+turned the two decode groups off and sent concurrent requests through the batched verify, one
+step at a time, and a speculating request's prompt handed every row's streams to the host and
+back:
+
+| Greedy tok/s at streams | 1 | 2 | 4 | 8 | 16 | 32 |
+| --- | --- | --- | --- | --- | --- | --- |
+| No draft head | 122 | 232 | 373 | 552 | 754 | 984 |
+| MTP head, before | 178 | 209 | 273 | 363 | 470 | 449 |
+| MTP head, now | 179 | 241 | 389 | 560 | 771 | 1,019 |
+
+- **Two or more requests decode as groups** (`TS_Q4E_PIPELINE_OVER_SPEC`): the scheduler asks
+  the model whether its pipelined groups outrun its batched verify
+  (`IPipelinedBatchedDecode.PipelinedDecodeOutrunsSpeculation`) and, if so, speculates only for
+  a lone decoder. A request that was speculating joins a group and takes up its drafts again
+  when it is alone (the block restarts after the plain steps, `TS_Q4E_MTP_RESUME`).
+- **The block follows a prompt on its device** (`TS_Q4E_MTP_FOLLOW`,
+  `IDraftHead.DraftSelfCatchUp`): after each ubatch's last layer the block joins every row's
+  token with the streams of the row before it (the previous ubatch's last row is kept on the
+  device) and writes its K/V. The prompt therefore runs on the plain path, its chunks in
+  flight, and the first draft continues from the block's rows: a 19K-token prompt of scripts
+  and compose files read at 6,670 tok/s against 4,070 through the host, a 40K-token one at
+  6,066 against 3,819, with 80-85% of the drafts kept either way and the same answers.
+  `TheMtpBlock_FollowsAPromptOnItsDevice_AsTheHostCatchUp` holds the drafts after a followed
+  prompt to those of the host's catch-up, on one GPU and on a layer split.
+- **The token embedding beside the block** (`TS_Q4E_MTP_CHAIN_SPLIT`): on a layer split the
+  embedding is on the first GPU and the block on the last, so following needs a second copy
+  (0.67 GiB); with it a window's draft chain runs on the last GPU as it does on one GPU
+  (`TheMtpDraftChain_RunsOnALayerSplit_AsOnOneGpu`). The chain by itself is worth about 1% there.
+
+Every greedy answer above equals the plain build's at the same stream count, and six requests
+overlapped with staggered starts and lengths answer as each does alone.
+
+Tried and dropped: more than two decode lanes, each with its own stream and decode scratch, so
+that a GPU runs several groups' steps at once. A step is about two thousand small kernels, but
+two one-row halves side by side on a GPU take 6.0 ms against 5.35 ms for one two-row half:
+4 / 8 / 16 / 32 streams ran at 335 / 505 / 720 / 949 tok/s on four lanes against 374 / 548 / 757 /
+996 on two. Batching rows in a step beats running steps side by side.
 
 A prefill ubatch's gated-delta scan with one state row a warp computes exactly what the
 four-rows-a-warp scan computes (`Qwen4ExpPrefillKernelTests`); on the same two H100 NVL

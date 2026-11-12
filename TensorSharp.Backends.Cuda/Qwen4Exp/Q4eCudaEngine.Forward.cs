@@ -497,6 +497,9 @@ namespace TensorSharp.Cuda
                         bool last = done + nt == tokens.Length;
                         ForwardUbatch(slot, tokens, done, nt, slot.NPast, last ? logitsOut : null,
                             hOut: allHidden || last ? hOut : null, hRowOffset: allHidden ? done : -1);
+                        // A speculating request's rows: the MTP block takes them on its device, behind the ubatch.
+                        if (MtpFollowsForward)
+                            MtpFollowUbatch(slot, tokens, done, nt, slot.NPast);
                         slot.NPast += nt;
                         done += nt;
                     }
@@ -1719,10 +1722,23 @@ namespace TensorSharp.Cuda
         {
             if (_perfSample <= 0 || StageObserver == null || ++_forwardsSinceSample < _perfSample)
                 return false;
+            // A sampled forward runs uncaptured with a GPU event a stage, several times a captured step's time, and on a
+            // decode lane the other lane's step finishes first: at most one every TS_Q4E_PERF_SAMPLE_MIN_MS, so the
+            // profile stays under a percent of a busy engine's time however fast its steps are (every 200th forward of
+            // two lanes at 16 streams was one every two seconds, and 5-7% of the tokens).
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (_lastSampleAt != 0 && _perfSampleMinMs > 0
+                && (now - _lastSampleAt) * 1000.0 / System.Diagnostics.Stopwatch.Frequency < _perfSampleMinMs)
+                return false;
+            _lastSampleAt = now;
             _forwardsSinceSample = 0;
             _sampling = true;
             return true;
         }
+
+        // TS_Q4E_PERF_SAMPLE_MIN_MS: the least time between two sampled forwards (0: every TS_Q4E_PERF_SAMPLE-th forward).
+        private readonly int _perfSampleMinMs = Math.Max(0, EnvInt("TS_Q4E_PERF_SAMPLE_MIN_MS", 10000));
+        private long _lastSampleAt;
 
         /// <summary>A sampled forward's stage times to <see cref="StageObserver"/>, after every device
         /// finished it.</summary>

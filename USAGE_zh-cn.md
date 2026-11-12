@@ -2518,6 +2518,11 @@ meter 为 `TensorSharp` 和 `TensorSharp.Studio`，另有 .NET 的 `System.Runti
 | `tensorsharp.engine.inter_token.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.step_kind`（产生该 token 的步骤）。同一序列相邻两个输出 token 的间隔；`mixed` 与 `decode` 的差即与提示词共用步骤的代价 |
 | `tensorsharp.prefix_cache.lookups` | counter，`{lookup}` | `tensorsharp.model.architecture`、`tensorsharp.prefix_cache.outcome`（`full`、`partial`、`miss`）、`tensorsharp.prefix_cache.source` |
 | `tensorsharp.engine.stage.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.stage`、`tensorsharp.engine.step_kind`、`tensorsharp.engine.rows`；仅在设置 `TS_Q4E_PERF_SAMPLE=N` 时记录 |
+| `tensorsharp.engine.step.phase.duration` | histogram，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.step.phase`（`finish`、`sample`、`issue`）、`tensorsharp.engine.rows`；批量解码步骤中主机各部分的耗时：等待并复制上一步的 logits、采样、下发下一步的 GPU 工作 |
+| `tensorsharp.engine.lane.steps` | counter，`{step}` | `tensorsharp.model.architecture`、`tensorsharp.engine.lane.finish`（`ready`：主机回来取 logits 时 GPU 已完成，瓶颈在主机；`waited`：瓶颈在 GPU） |
+| `tensorsharp.engine.lane.rows` | counter，`{row}` | `tensorsharp.model.architecture` |
+| `tensorsharp.engine.lane.time` | counter，`s` | `tensorsharp.model.architecture`、`tensorsharp.engine.lane.state`（`issue`、`wait`、`idle`）；各解码通道上主机下发、等待以及通道空闲的时间之和 |
+| `tensorsharp.speculative.accepted_length` | histogram，`{token}` | `tensorsharp.model.architecture`、`tensorsharp.speculative.drafted`；一个验证窗口保留的草稿 token 数 |
 | `tensorsharp.slots` | gauge，`{slot}` | `tensorsharp.model.architecture`、`tensorsharp.slot.state`（`running`、`retained`） |
 | `tensorsharp.slots.memory` / `.capacity` | gauge，`By` / `{token}` | `tensorsharp.model.architecture` |
 | `tensorsharp.slots.grows`、`.grow_failures` | counter | `tensorsharp.model.architecture` |
