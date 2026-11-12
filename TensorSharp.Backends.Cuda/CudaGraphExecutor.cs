@@ -312,8 +312,13 @@ namespace TensorSharp.Cuda
             output.EnsureDeviceCurrent();
             IntPtr P(Tensor t) => ((CudaStorage)t.Storage).DevicePtrAtElement(t.StorageOffset);
             cuda.Context.MakeCurrent();
-            kernels.LaunchGatedDeltaNet(P(q), P(k), P(v), P(g), P(beta), P(state), output.DevicePtrAtElement(0),
-                s, heads, keyHeads, tokens, sequences, slots, kda, cuda.Stream.Handle);
+            // A chunk of rows reads each token's q and k once per four state rows; a decode row keeps the one-row kernel.
+            if (tokens > 1)
+                kernels.LaunchGatedDeltaNetRows4(P(q), P(k), P(v), P(g), P(beta), P(state), output.DevicePtrAtElement(0),
+                    s, heads, keyHeads, tokens, sequences, slots, kda, cuda.Stream.Handle);
+            else
+                kernels.LaunchGatedDeltaNet(P(q), P(k), P(v), P(g), P(beta), P(state), output.DevicePtrAtElement(0),
+                    s, heads, keyHeads, tokens, sequences, slots, kda, cuda.Stream.Handle);
             output.MarkDeviceModified();
             return result;
         }

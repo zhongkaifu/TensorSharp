@@ -779,7 +779,9 @@ for quantized blocks, `IGraphExpertWeights` for stacked experts); the ops have g
   view with leading unit extents keeps the view instead of copying it contiguous first - the conv window's update had
   run a pitched copy of 6144 rows of 3 floats per layer (124 us each, 32% of Qwen3.5-0.8B's decode GPU time). RTX 2000
   Ada, Qwen3.5-0.8B Q8_0: decode 109 -> 141-156 tok/s (Qwen35Model 175-178; the GPU time per token is now below its,
-  the rest is launch overhead), 9B 18.8-20.1 -> 22.6-23.0 (Qwen35Model 22.6-22.7). Greedy text unchanged.
+  the rest is launch overhead), 9B 18.8-20.1 -> 22.6-23.0 (Qwen35Model 22.6-22.7). Greedy text unchanged. A prompt
+  chunk's delta rule runs four state rows a warp (`ts_graph_gated_delta_net_rows4_f32`, the same bits): 9B 1.8K
+  prefill 576 -> 220 ms of GPU time (the per-op scan: 170 ms), 0.8B prefill 600 -> 436 ms.
 * **Routed experts on direct CUDA:** `CudaGraphExecutor` serves `GraphFusion.RoutedExperts` (the
   renormalized routing) with the per-op path's kernels: decode and verify rows (up to 32) route and run
   their experts on the device through tables of the members' resident copies

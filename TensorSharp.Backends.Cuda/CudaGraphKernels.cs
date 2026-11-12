@@ -20,14 +20,15 @@ namespace TensorSharp.Cuda
 
         /// <summary>TS_GRAPH_KERNELS_VERSION in tensorsharp_graph_kernels.cu: bump both together whenever a
         /// kernel is added or changes its signature.</summary>
-        public const int CurrentVersion = 3;
+        public const int CurrentVersion = 4;
 
-        private readonly IntPtr _gatedDeltaNet, _softplus, _ssmConv, _deltaNetPrep, _gatedRmsNorm;
+        private readonly IntPtr _gatedDeltaNet, _gatedDeltaNetRows4, _softplus, _ssmConv, _deltaNetPrep, _gatedRmsNorm;
 
         private CudaGraphKernels(CudaModule module) : base(module, CapsKernelName, CurrentVersion)
         {
             if (!IsCurrent) return;
             _gatedDeltaNet = module.GetFunction("ts_graph_gated_delta_net_f32");
+            _gatedDeltaNetRows4 = module.GetFunction("ts_graph_gated_delta_net_rows4_f32");
             _softplus = module.GetFunction("ts_graph_softplus_f32");
             _ssmConv = module.GetFunction("ts_graph_ssm_conv_f32");
             _deltaNetPrep = module.GetFunction("ts_graph_deltanet_prep_f32");
@@ -46,6 +47,17 @@ namespace TensorSharp.Cuda
             int kda = perKeyDecay ? 1 : 0;
             void** args = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences, &slots, &kda };
             CudaDriverApi.cuLaunchKernel(_gatedDeltaNet, (uint)(sequences * heads), (uint)((s + 3) / 4), 1, 128, 1, 1, 0, stream,
+                (IntPtr)args, IntPtr.Zero).ThrowOnError();
+        }
+
+        /// <summary><see cref="LaunchGatedDeltaNet"/> with four state rows a warp (a prompt chunk reads each token's q and k
+        /// once for four rows); the same results.</summary>
+        public void LaunchGatedDeltaNetRows4(IntPtr q, IntPtr k, IntPtr v, IntPtr g, IntPtr beta, IntPtr state, IntPtr output,
+            int s, int heads, int keyHeads, int tokens, int sequences, int slots, bool perKeyDecay, IntPtr stream)
+        {
+            int kda = perKeyDecay ? 1 : 0;
+            void** args = stackalloc void*[] { &q, &k, &v, &g, &beta, &state, &output, &s, &heads, &keyHeads, &tokens, &sequences, &slots, &kda };
+            CudaDriverApi.cuLaunchKernel(_gatedDeltaNetRows4, (uint)(sequences * heads), (uint)((s + 15) / 16), 1, 128, 1, 1, 0, stream,
                 (IntPtr)args, IntPtr.Zero).ThrowOnError();
         }
 

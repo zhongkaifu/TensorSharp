@@ -9,7 +9,7 @@
 // have no generic tensor-op equivalent, with ggml's semantics so a program computes the same thing
 // on every backend.
 
-#define TS_GRAPH_KERNELS_VERSION 3
+#define TS_GRAPH_KERNELS_VERSION 4
 
 extern "C" __global__ void ts_graph_caps(int* out)
 {
@@ -100,6 +100,103 @@ extern "C" __global__ void ts_graph_gated_delta_net_f32(
 #pragma unroll
             for (int j = 0; j < 8; j++)
                 if (j < per) s_out[lane + 32 * j] = st[j];
+        }
+    }
+}
+
+// ts_graph_gated_delta_net_f32 with four state rows a warp: a token's q, k and gates are read once for the four rows
+// (a prompt chunk re-read them for every row, 3.4x the legacy prefill scan's time on Qwen3.5-9B). Each state element
+// goes through the same operations in the same order as in the one-row kernel, so the results are the same bits.
+extern "C" __global__ void ts_graph_gated_delta_net_rows4_f32(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta, const float* __restrict__ state,
+    float* __restrict__ out, int S, int h, int hk, int n_t, int n_s, int slots, int kda)
+{
+    const int seq = blockIdx.x / h;
+    const int head = blockIdx.x % h;
+    const int kh = head % hk;
+    const int lane = threadIdx.x & 31;
+    const int r0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * 4;
+    if (seq >= n_s || r0 >= S)
+        return;
+
+    const int per = S >> 5;   // elements of a row a lane keeps (<= 8)
+    float st[4][8];
+    const float* s_in = state + ((size_t)(seq * h + head) * S + r0) * S;
+#pragma unroll
+    for (int r = 0; r < 4; r++)
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+            st[r][j] = (j < per && r0 + r < S) ? s_in[(size_t)r * S + lane + 32 * j] : 0.0f;
+
+    const float scale = rsqrtf((float)S);
+    const size_t attn = (size_t)n_s * n_t * h * S;
+    const size_t per_snap = (size_t)n_s * h * S * S;
+    for (int t = 0; t < n_t; t++)
+    {
+        const size_t qk_off = ((size_t)(seq * n_t + t) * hk + kh) * S;
+        const size_t v_off = ((size_t)(seq * n_t + t) * h + head) * S;
+        const size_t gb = (size_t)(seq * n_t + t) * h + head;
+        float kk[8], qq[8], e[8];
+        const float eg = kda ? 0.0f : expf(g[gb]);
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            if (j >= per) break;
+            const int i = lane + 32 * j;
+            kk[j] = k[qk_off + i];
+            qq[j] = q[qk_off + i];
+            e[j] = kda ? expf(g[gb * S + i]) : eg;
+        }
+        float kv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                if (j >= per) break;
+                st[r][j] *= e[j];
+                kv[r] += st[r][j] * kk[j];
+            }
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+            kv[r] = ts_graph_warp_sum(kv[r]);
+        const float b = beta[gb];
+        float y[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            const float delta = (r0 + r < S ? v[v_off + r0 + r] - kv[r] : 0.0f) * b;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                if (j >= per) break;
+                st[r][j] += kk[j] * delta;
+                y[r] += st[r][j] * qq[j];
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+            y[r] = ts_graph_warp_sum(y[r]);
+        if (lane == 0)
+        {
+#pragma unroll
+            for (int r = 0; r < 4; r++)
+                if (r0 + r < S) out[v_off + r0 + r] = y[r] * scale;
+        }
+
+        const int slot = n_t - 1 - t;
+        if (slot < slots)
+        {
+            float* s_out = out + attn + slot * per_snap + ((size_t)(seq * h + head) * S + r0) * S;
+#pragma unroll
+            for (int r = 0; r < 4; r++)
+            {
+                if (r0 + r >= S) break;
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    if (j < per) s_out[(size_t)r * S + lane + 32 * j] = st[r][j];
+            }
         }
     }
 }
