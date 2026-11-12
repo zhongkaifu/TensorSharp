@@ -475,5 +475,6 @@
     <ReferenceNativeSymbol Include="TSGgml_WanT5Encode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_WanVaeDecode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_WanVaeEncode" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ZeroDeviceCopies" SymbolType="Function" />
   </ItemGroup>
 </Project>

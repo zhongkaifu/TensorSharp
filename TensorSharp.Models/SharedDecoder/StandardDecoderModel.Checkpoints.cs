@@ -88,6 +88,10 @@ namespace TensorSharp.Models
         /// GGML backend).</summary>
         internal bool ForceDeviceSlotCopies { get; set; }
 
+        /// <summary>Per-rank tensor-parallel graphs on one stage: each rank's share of a slot is primed and copied on its own
+        /// device (GGML ranks keep their device copies in per-rank caches).</summary>
+        private bool RankedSlotCopies => _rankGraphs && _graphTpRanks == null && _mesh.TensorParallel > 1 && _mesh.Stages == 1 && IsGgmlBackend;
+
         /// <summary>The executor keeps separate device copies, so a slot copy a graph left there stays there.</summary>
         internal bool SlotCopiesStayOnDevice => ForceDeviceSlotCopies
             || GraphExecutor is { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } };
@@ -136,14 +140,16 @@ namespace TensorSharp.Models
         /// CUDA). False (nothing copied) where the copy goes through the host: a host-current source, an executor
         /// that binds no host memory, a device that reads the host bytes themselves (Metal's shared buffers, the CPU:
         /// a memcpy there took 4.4 ms for Qwen3.6-35B-A3B's 54-token checkpoint on an M5 Pro, a copy program binding
-        /// the new slot's 40 buffers 8.7 ms), tensor-parallel caches, quantized rows or a state graphs do not bind.
+        /// the new slot's 40 buffers 8.7 ms), tensor-parallel caches outside per-rank graphs, quantized rows or a state
+        /// graphs do not bind. Per-rank tensor-parallel graphs copy each rank's share on its own device: through the host,
+        /// Qwen3.5-9B's 3.6K-token checkpoint on 2x A40 took 172 ms of the prompt's 1.2 s.
         /// </summary>
         /// <param name="targetBound">The target is a pooled slot whose buffers the device already holds: the copy
         /// program binds nothing new, and costs less than a host copy on a device that reads host bytes too (Metal:
         /// a 54-token checkpoint of Qwen3.6-35B-A3B).</param>
         private bool TryCopySlotOnDevice(Slot source, Slot target, bool targetBound)
         {
-            if (!source.DeviceDirty || source.Length <= 0 || _graphTpRanks != null || _mesh.TensorParallel != 1
+            if (!source.DeviceDirty || source.Length <= 0 || _graphTpRanks != null || (_mesh.TensorParallel != 1 && !RankedSlotCopies)
                 || GraphExecutor is not { Capabilities.BindsHostPointers: true } executor
                 || !(executor.Capabilities.SeparateDeviceCopies || ForceDeviceSlotCopies || targetBound))
                 return false;
@@ -151,13 +157,14 @@ namespace TensorSharp.Models
             if (kvType != GraphFormat.F32 && kvType != GraphFormat.F16) return false;
             if (_anyRecurrent)
                 foreach (RecurrentState[] layer in source.Recurrent)
-                    if (layer != null && (layer[0]?.GraphTensors == null))
+                    if (layer != null && Array.Exists(layer, state => state?.GraphTensors == null))
                         return false;
             // A fresh target's buffers are written by the copy before anything reads them: no upload of its host bytes.
             if (!targetBound) PrimeDeviceCopies(target, overwritten: true);
 
             int rows = source.Length;
             for (int stage = 0; stage < _mesh.Stages; stage++)
+            for (int rank = 0; rank < _mesh.TensorParallel; rank++)
             {
                 var g = new GraphProgramBuilder(record: true);
                 int copies = 0;
@@ -165,15 +172,15 @@ namespace TensorSharp.Models
                 for (int e = 0; e < source.K.Length; e++)
                 {
                     if (CacheStage(e) != stage) continue;
-                    if (source.K[e] != null) CopyRows(source.K[e][0], target.K[e][0]);
-                    if (source.V[e] != null) CopyRows(source.V[e][0], target.V[e][0]);
+                    if (source.K[e] != null) CopyRows(source.K[e][rank], target.K[e][rank]);
+                    if (source.V[e] != null) CopyRows(source.V[e][rank], target.V[e][rank]);
                 }
                 for (int l = 0; l < TotalLayers; l++)
                 {
                     if (!OwnsLayer(l) || StageOfLayer(l) != stage) continue;
                     if (_anyRecurrent && l < source.Recurrent.Length && source.Recurrent[l] != null)
                     {
-                        Tensor[] from = source.Recurrent[l][0].GraphTensors, to = target.Recurrent[l][0].GraphTensors;
+                        Tensor[] from = source.Recurrent[l][rank].GraphTensors, to = target.Recurrent[l][rank].GraphTensors;
                         for (int i = 0; i < from.Length; i++)
                         {
                             long n = from[i].ElementCount();
@@ -186,7 +193,8 @@ namespace TensorSharp.Models
                 EnterStage(stage);
                 try
                 {
-                    using IGraphPlan plan = executor.Compile(g.ToProgram(replayable: false, reorder: false));
+                    GraphProgram program = g.ToProgram(replayable: false, reorder: false);
+                    using IGraphPlan plan = _mesh.TensorParallel == 1 ? executor.Compile(program) : CompileForDevice(program, stage, rank);
                     if (!plan.Run(ReadOnlySpan<int>.Empty, ReadOnlySpan<IntPtr>.Empty, ReadOnlySpan<long>.Empty))
                         throw new InvalidOperationException($"{Config.Architecture} slot copy failed: {plan.LastError}");
                 }
@@ -213,7 +221,8 @@ namespace TensorSharp.Models
             if (_anyRecurrent)
                 for (int l = 0; l < source.Recurrent.Length; l++)
                     if (source.Recurrent[l] != null)
-                        target.Recurrent[l][0].AfterDeviceCopy(source.Recurrent[l][0]);
+                        for (int rank = 0; rank < source.Recurrent[l].Length; rank++)
+                            target.Recurrent[l][rank].AfterDeviceCopy(source.Recurrent[l][rank]);
             target.DeviceDirty = true;
             DeviceSlotCopies++;
             return true;

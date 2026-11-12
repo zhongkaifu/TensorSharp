@@ -17,9 +17,22 @@ namespace TensorSharp.Models
     /// step runs every scheduled request's prompt chunk or decode token in one forward over their slots
     /// (<see cref="TryForwardSlots"/>), whatever the count.
     /// </summary>
-    public abstract partial class StandardDecoderModel : IUnifiedBatchModel
+    public abstract partial class StandardDecoderModel : IUnifiedBatchModel, ISoloPrefillBudgetModel
     {
         public bool SupportsUnifiedBatching => SupportsPerSequenceFusedForward;
+
+        /// <summary>A lone prompt's step on MLX, in tokens (see <see cref="PreferredSoloPrefillTokens"/>).</summary>
+        private const int MlxPromptStepTokens = 512;
+
+        /// <summary>
+        /// On MLX a lone prompt prefills in steps of <see cref="MlxPromptStepTokens"/>: MLX holds memory of the order of
+        /// each layer's feed-forward activations until a step ends (Qwen3.8-27B on an M5 Pro: 0.9 GB a layer for a
+        /// 3.6K-token step, past 40 GB wired), so the scheduler's whole-prompt step ran out of memory where 512-token
+        /// steps peak at 22 GB wired (Qwen35Model 19 GB) in the same prompt time (9.09 vs 9.07-9.11 s; 1024-token steps
+        /// 8.99 s at 31 GB). Elsewhere the scheduler's own steps (0).
+        /// </summary>
+        public int PreferredSoloPrefillTokens(int start, int remaining)
+            => _backend == BackendType.Mlx ? Math.Min(remaining, MlxPromptStepTokens) : 0;
 
         public int EnsureSequenceSlot(string requestId, int reserveTokens)
         {
@@ -29,7 +42,10 @@ namespace TensorSharp.Models
             _slots ??= new Dictionary<string, Slot>(StringComparer.Ordinal);
             int reserve = Math.Min(_maxContextLength, reserveTokens);
             if (!_slots.TryGetValue(requestId, out Slot slot))
+            {
+                EnsureDeviceRoomForSlot(requestId, Math.Max(reserve, FreshSlotTokens));
                 _slots[requestId] = slot = NewSlot(reserve);
+            }
             if (reserve > slot.Capacity)
                 EnsureSlotCapacity(slot, reserve);
             return slot.Length;

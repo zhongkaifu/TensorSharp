@@ -2479,6 +2479,13 @@ namespace TensorSharp.Runtime.Scheduling
                             $"{seq.RequestId}: its slot holds {held} tokens, the sequence {seq.NumComputedTokens}.");
                     prepared.Add(work);
                 }
+                catch (SequenceSlotUnavailableException ex) when (seq.NumComputedTokens == 0)
+                {
+                    // The device holds no slot for a NEW request beside the running ones: nothing of it ran or is held, so
+                    // it waits for one of them to finish instead of failing.
+                    _logger.LogDebug("No unified slot for {EngineRequestId} yet: {Reason}", seq.RequestId, ex.Message);
+                    results.Add(new SequenceStepResult { Sequence = seq, SlotUnavailable = true });
+                }
                 catch (Exception ex)
                 {
                     FailUnified(seq, ex, results);

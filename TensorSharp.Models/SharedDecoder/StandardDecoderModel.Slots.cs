@@ -6,6 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 using TensorSharp.GGML;
 using TensorSharp.Runtime.Scheduling;
@@ -181,7 +182,88 @@ namespace TensorSharp.Models
             var slot = new Slot { Capacity = capacity, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
             (slot.K, slot.V) = AllocateCaches(capacity);
             PrimeDeviceCopies(slot, overwritten: false);
+            if (_slotStateBytes < 0) MeasureSlotBytes(slot);
             return slot;
+        }
+
+        // ---------------------------------------------------------------- device-memory admission
+
+        // A slot's cache bytes per token and its states' bytes, measured on the first slot (-1 until then).
+        private long _slotBytesPerToken = -1, _slotStateBytes = -1;
+
+        /// <summary>Beside a slot's caches and states: its drafter buffers and its share of the graphs' memory (the margin
+        /// Qwen4ExpModel keeps for a holder on Metal).</summary>
+        private const long SlotExtraBytes = 256L << 20;
+
+        private void MeasureSlotBytes(Slot slot)
+        {
+            long cache = 0;
+            foreach (Tensor t in AllCacheTensors(slot.K).Concat(AllCacheTensors(slot.V))) cache += t.Storage.ByteLength;
+            long states = 0;
+            if (slot.Recurrent != null)
+                foreach (RecurrentState[] layer in slot.Recurrent)
+                    if (layer != null)
+                        foreach (RecurrentState state in layer)
+                            if (state != null)
+                                states += state.StateBytes > 0 ? state.StateBytes
+                                    : state.CheckpointTensors.Sum(t => t.ElementCount() * t.ElementType.Size());
+            _slotBytesPerToken = cache / Math.Max(1, slot.Capacity);
+            _slotStateBytes = states;
+        }
+
+        /// <summary>Device bytes a slot of <paramref name="capacity"/> tokens takes, with its margin; -1 before the first
+        /// slot was measured.</summary>
+        private long SlotDeviceBytes(int capacity)
+            => _slotStateBytes < 0 ? -1 : _slotBytesPerToken * capacity + _slotStateBytes + SlotExtraBytes;
+
+        /// <summary>
+        /// Whether one device's free memory bounds how many requests hold slots: Metal's working set, or one ggml_cuda GPU
+        /// (a split or tensor-parallel mesh plans its devices explicitly), as Qwen4ExpModel and Qwen35Model admit their
+        /// holders. Without it the runtime allocated a slot for every concurrent request and kept every finished one: two
+        /// Qwen3.8-Flash-Next conversations on a 48 GB Mac reached 38 GB wired, where Qwen4ExpModel stayed at 32 GB; an
+        /// allocation past a CUDA GPU's memory aborts the process inside ggml.
+        /// </summary>
+        private bool AdmitsSlotsByDeviceMemory => IsGgmlBackend && _mesh.Stages == 1 && _mesh.TensorParallel == 1
+            && LayerSplitGroup == null && (_backend == BackendType.GgmlMetal || _backend == BackendType.GgmlCuda);
+
+        /// <summary>The device memory kept free beside the slots: the larger of 1 GB and 1/32 of it.</summary>
+        private static long DeviceHeadroom(long totalBytes) => Math.Max(1L << 30, totalBytes / 32);
+
+        /// <summary>The device's free and total bytes (the GGML backend's report; tests substitute their own).</summary>
+        internal Func<(long Free, long Total)?> DeviceMemoryProbe { get; set; } = static ()
+            => GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) && total > 0 ? (free, total) : null;
+
+        /// <summary>What the device lacks for <paramref name="needBytes"/> beside its headroom, after the kept graph arenas
+        /// are released (0 when it fits or is not measured).</summary>
+        private long DeviceDeficit(long needBytes)
+        {
+            if (needBytes <= 0 || DeviceMemoryProbe() is not { } memory) return 0;
+            long deficit = Math.Max(0, needBytes + DeviceHeadroom(memory.Total) - memory.Free);
+            if (deficit > 0 && GgmlBasicOps.ReleaseKeptArenas() > 0 && DeviceMemoryProbe() is { } after)
+                deficit = Math.Max(0, needBytes + DeviceHeadroom(after.Total) - after.Free);
+            return deficit;
+        }
+
+        /// <summary>The prefix cache evicts finished requests' slots before a new request needs their room: what the device
+        /// lacks for one more fresh slot (<see cref="ModelBase.QueryHostMemoryDeficitBytes"/>).</summary>
+        protected override long DeviceMemoryDeficitBytes()
+            => AdmitsSlotsByDeviceMemory ? DeviceDeficit(SlotDeviceBytes(FreshSlotTokens)) : 0;
+
+        /// <summary><see cref="DeviceMemoryDeficitBytes"/> alone (tests).</summary>
+        internal long DeviceSlotDeficitBytes => DeviceMemoryDeficitBytes();
+
+        /// <summary>A new request's slot of <paramref name="capacity"/> tokens must fit on the device while other requests
+        /// hold theirs; otherwise it waits for one of them to finish (<see cref="SequenceSlotUnavailableException"/>, which
+        /// the scheduler re-queues). A lone request always gets its slot.</summary>
+        private void EnsureDeviceRoomForSlot(string requestId, int capacity)
+        {
+            if (!AdmitsSlotsByDeviceMemory || _slots == null || _slots.Count == 0 || (_slotPool?.Count ?? 0) > 0) return;
+            long need = SlotDeviceBytes(capacity);
+            long deficit = DeviceDeficit(need);
+            if (deficit > 0)
+                throw new SequenceSlotUnavailableException(
+                    $"{Config.Architecture}: no device memory for another request's slot ({need / 1048576.0:F0} MB, " +
+                    $"{deficit / 1048576.0:F0} MB short beside the headroom); {requestId} waits for a running request to finish.");
         }
 
         /// <summary>
@@ -194,22 +276,61 @@ namespace TensorSharp.Models
         /// </summary>
         private void PrimeDeviceCopies(Slot slot, bool overwritten)
         {
-            if (!IsGgmlBackend || _mesh.Stages != 1 || _mesh.TensorParallel != 1
+            // One device, or the ranks of per-rank tensor-parallel graphs: each rank primes its share on its own device.
+            bool ranked = RankedSlotCopies;
+            if (!IsGgmlBackend || _mesh.Stages != 1 || (_mesh.TensorParallel != 1 && !ranked)
                 || GraphExecutor is not { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } })
                 return;
             // Each by the bytes a graph binds it with (ggml's size of the leaf): a cache whole, a state's F32 view by its
-            // own elements (the state view of a backing is not the whole storage).
-            foreach (Tensor t in AllCacheTensors(slot.K)) Prime(t, t.Storage.ByteLength);
-            foreach (Tensor t in AllCacheTensors(slot.V)) Prime(t, t.Storage.ByteLength);
-            if (slot.Recurrent == null) return;
-            foreach (RecurrentState[] layer in slot.Recurrent)
-                if (layer != null)
-                    foreach (RecurrentState state in layer)
-                        if (state?.GraphTensors is { } tensors && (overwritten || state.GraphTensorsResetToZero))
-                            foreach (Tensor t in tensors) Prime(t, t.ElementCount() * sizeof(float));
+            // own elements (the state view of a backing is not the whole storage). The caches and the states each share
+            // one device allocation (GgmlBasicOps.ZeroDeviceCopies): a slot's ~80 tensors were as many allocations, 0.7 ms
+            // each on ggml-vulkan. Apart, a slot that grows frees its old caches' buffer whole.
+            var keys = new List<IntPtr>();
+            var bytes = new List<long>();
+            int previous = ranked ? GgmlBasicOps.GetActiveRank() : 0;
+            try
+            {
+                for (int rank = 0; rank < _mesh.TensorParallel; rank++)
+                {
+                    if (ranked) GgmlBasicOps.SetActiveRank(_mesh.GlobalDevice(0, rank));
+                    foreach (Tensor t in RankTensors(slot.K, rank)) Add(t, t.Storage.ByteLength);
+                    foreach (Tensor t in RankTensors(slot.V, rank)) Add(t, t.Storage.ByteLength);
+                    Prime();
+                    if (slot.Recurrent == null) continue;
+                    foreach (RecurrentState[] layer in slot.Recurrent)
+                        if (layer != null && rank < layer.Length && layer[rank]?.GraphTensors is { } tensors
+                            && (overwritten || layer[rank].GraphTensorsResetToZero))
+                            foreach (Tensor t in tensors) Add(t, t.ElementCount() * sizeof(float));
+                    Prime();
+                }
+            }
+            finally
+            {
+                if (ranked) GgmlBasicOps.SetActiveRank(previous);
+            }
 
-            static void Prime(Tensor t, long bytes)
-                => GgmlBasicOps.ZeroDeviceCopy(TensorComputePrimitives.GetStoragePointer(t), bytes);
+            static IEnumerable<Tensor> RankTensors(Tensor[][] caches, int rank)
+            {
+                if (caches == null) yield break;
+                foreach (Tensor[] entry in caches)
+                    if (entry != null && rank < entry.Length && entry[rank] != null) yield return entry[rank];
+            }
+
+            void Add(Tensor t, long size)
+            {
+                keys.Add(TensorComputePrimitives.GetStoragePointer(t));
+                bytes.Add(size);
+            }
+
+            void Prime()
+            {
+                if (keys.Count > 0 && !GgmlBasicOps.ZeroDeviceCopies(
+                        System.Runtime.InteropServices.CollectionsMarshal.AsSpan(keys),
+                        System.Runtime.InteropServices.CollectionsMarshal.AsSpan(bytes)))
+                    for (int i = 0; i < keys.Count; i++) GgmlBasicOps.ZeroDeviceCopy(keys[i], bytes[i]);
+                keys.Clear();
+                bytes.Clear();
+            }
         }
 
         /// <summary>The pooled slot that best holds <paramref name="tokens"/> (the smallest that does, else the largest;

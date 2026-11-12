@@ -263,6 +263,13 @@ namespace tsg
         // or the host pointer for a zero-copy wrap). Recording it lets a repeat
         // bind attach with two assignments and no backend calls at all.
         void* bound_addr = nullptr;
+        // Where this entry's device copy starts in `buffer`. Non-zero only for a
+        // slice of a buffer shared by several keys (TSGgml_ZeroDeviceCopies: one
+        // allocation for a request slot's caches instead of one per layer), whose
+        // owners are counted in DeviceState::shared_buffer_refs. Use
+        // cached_buffer_addr / release_cached_buffer_locked, never the buffer's
+        // base or ggml_backend_buffer_free, on host-cache entries.
+        std::size_t offset = 0;
     };
 
     // --- Multi-device (tensor-parallel) state -------------------------------
@@ -306,6 +313,11 @@ namespace tsg
 
         std::int64_t device_copy_resident_bytes = 0;
         std::int64_t device_copy_budget_bytes = 0;
+
+        // Host-cache entries sharing one device buffer (slices at their offsets),
+        // by buffer: the last entry released frees it. Guarded by
+        // host_buffer_cache_mutex.
+        std::unordered_map<ggml_backend_buffer_t, int> shared_buffer_refs;
     };
 
     extern DeviceState g_device_states[TSG_MAX_DEVICES];
@@ -400,6 +412,34 @@ namespace tsg
 #define g_offloadable_budget            (::tsg::dev().offloadable_budget)
 #define g_device_copy_resident_bytes    (::tsg::dev().device_copy_resident_bytes)
 #define g_device_copy_budget_bytes      (::tsg::dev().device_copy_budget_bytes)
+#define g_shared_buffer_refs            (::tsg::dev().shared_buffer_refs)
+
+    // A host-cache entry's device address (its buffer's base plus its slice offset).
+    inline void* cached_buffer_addr(const CachedHostBuffer& entry)
+    {
+        void* base = entry.buffer != nullptr ? ggml_backend_buffer_get_base(entry.buffer) : nullptr;
+        return base != nullptr ? static_cast<char*>(base) + entry.offset : nullptr;
+    }
+
+    // Free a host-cache entry's buffer, or drop its share of a shared one (the
+    // last share frees it). Caller holds host_buffer_cache_mutex.
+    inline void release_cached_buffer_locked(CachedHostBuffer& entry)
+    {
+        if (entry.buffer == nullptr)
+            return;
+        auto shared = g_shared_buffer_refs.find(entry.buffer);
+        if (shared != g_shared_buffer_refs.end())
+        {
+            if (--shared->second <= 0)
+            {
+                g_shared_buffer_refs.erase(shared);
+                ggml_backend_buffer_free(entry.buffer);
+            }
+        }
+        else
+            ggml_backend_buffer_free(entry.buffer);
+        entry.buffer = nullptr;
+    }
 
     constexpr int BACKEND_TYPE_METAL = 1;
     constexpr int BACKEND_TYPE_CPU = 2;

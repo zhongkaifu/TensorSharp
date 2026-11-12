@@ -5044,6 +5044,10 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_ZeroDeviceCopies(IntPtr* keys, long* bytes, int count, byte* skipped);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial long TSGgml_CachedBufferBytes(IntPtr key);
 
         [LibraryImport(DllName)]
@@ -7073,6 +7077,27 @@ internal enum GgmlIndexReductionOp
             fixed (long* d = dstOffsets)
             fixed (long* l = lengths)
                 return TSGgml_UploadToDeviceCopyRanges(srcHost, srcBytes, dstKey, dstBytes, so, d, l, lengths.Length, zeroDestination ? 1 : 0) == 1;
+        }
+
+        /// <summary>
+        /// Zero-filled device copies for several host keys in shared device buffers (one allocation and one clear for
+        /// all of them). <paramref name="skipped"/>[i] is set for a key left alone (it already has a cached buffer, or
+        /// alone exceeds a buffer). Returns the keys placed, or -1 when nothing was (no separate device copies, several
+        /// devices, the budget, an allocation).
+        /// </summary>
+        public static unsafe int ZeroDeviceCopies(ReadOnlySpan<IntPtr> keys, ReadOnlySpan<long> bytes, Span<bool> skipped)
+        {
+            if (keys.Length != bytes.Length || skipped.Length != keys.Length)
+                throw new ArgumentException("key, size and skipped spans must have the same length.");
+            if (keys.Length == 0) return 0;
+            var flags = new byte[keys.Length];
+            int placed;
+            fixed (IntPtr* k = keys)
+            fixed (long* b = bytes)
+            fixed (byte* f = flags)
+                placed = TSGgml_ZeroDeviceCopies(k, b, keys.Length, f);
+            for (int i = 0; i < flags.Length; i++) skipped[i] = flags[i] != 0;
+            return placed;
         }
 
         /// <summary>Upload all host bytes of <paramref name="key"/> into its device copy,

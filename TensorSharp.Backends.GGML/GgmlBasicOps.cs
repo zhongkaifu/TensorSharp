@@ -1874,6 +1874,24 @@ namespace TensorSharp.GGML
         public static bool ZeroDeviceCopy(IntPtr key, long bytes)
             => GgmlNative.UploadToDeviceCopyRanges(ZeroCopySource, 1, key, bytes, default, default, default, zeroDestination: true);
 
+        /// <summary>
+        /// <see cref="ZeroDeviceCopy"/> for several keys at once, their copies slices of shared device buffers: one
+        /// allocation and one clear instead of one of each per key (a Qwen 3.5 slot's ~80 caches and states: 0.7 ms an
+        /// allocation on ggml-vulkan). A key the shared buffers could not take (one already cached, or too large) gets
+        /// the per-key fill. False when nothing was primed (the backend keeps no separate device copies, runs several
+        /// devices, or a fill failed).
+        /// </summary>
+        public static bool ZeroDeviceCopies(ReadOnlySpan<IntPtr> keys, ReadOnlySpan<long> bytes)
+        {
+            var skipped = new bool[keys.Length];
+            if (GgmlNative.ZeroDeviceCopies(keys, bytes, skipped) < 0)
+                return false;
+            bool all = true;
+            for (int i = 0; i < keys.Length; i++)
+                if (skipped[i]) all &= ZeroDeviceCopy(keys[i], bytes[i]);
+            return all;
+        }
+
         /// <summary>A source the zero-filling copy names but never reads (it copies no range).</summary>
         private static readonly IntPtr ZeroCopySource = Marshal.AllocHGlobal(1);
         public static long CachedBufferBytes(IntPtr key) => GgmlNative.CachedBufferBytes(key);

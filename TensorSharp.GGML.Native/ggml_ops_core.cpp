@@ -1308,7 +1308,7 @@ namespace tsg
             return 0;
         std::size_t freed = cit->second.bytes;
         device_copy_account_remove_locked(cit->second);
-        ggml_backend_buffer_free(cit->second.buffer);
+        release_cached_buffer_locked(cit->second);
         g_host_buffer_cache.erase(cit);
         note_cached_buffer_released(key);
         advise_pages_dont_need(key, freed);
@@ -1363,7 +1363,7 @@ namespace tsg
                     g_offloadable_resident_bytes = 0;
             }
             device_copy_account_remove_locked(it->second);
-            ggml_backend_buffer_free(it->second.buffer);
+            release_cached_buffer_locked(it->second);
             g_host_buffer_cache.erase(it);
         }
         note_cached_buffer_released(data);
@@ -1445,7 +1445,7 @@ namespace tsg
             it->second.bytes != bytes)
             return false;
         out_buffer = it->second.buffer;
-        out_addr = ggml_backend_buffer_get_base(it->second.buffer);
+        out_addr = cached_buffer_addr(it->second);
         return out_addr != nullptr;
     }
 
@@ -1525,11 +1525,11 @@ namespace tsg
                     required_size <= it->second.buffer_size)
                 {
                     out_buffer = it->second.buffer;
-                    out_addr = use_device_copy ? ggml_backend_buffer_get_base(out_buffer) : data;
+                    out_addr = use_device_copy ? cached_buffer_addr(it->second) : data;
                     return true;
                 }
                 device_copy_account_remove_locked(it->second);
-                ggml_backend_buffer_free(it->second.buffer);
+                release_cached_buffer_locked(it->second);
                 g_host_buffer_cache.erase(it);
                 note_cached_buffer_released(data);
             }
@@ -2182,6 +2182,7 @@ namespace tsg
             return true;
 
         ggml_backend_buffer_t buffer = nullptr;
+        std::size_t buffer_offset = 0;
         CachedBufferMode mode = CachedBufferMode::HostPtr;
         {
             std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
@@ -2204,6 +2205,7 @@ namespace tsg
             if (bytes > it->second.bytes)
                 return true;
             buffer = it->second.buffer;
+            buffer_offset = it->second.offset;
             mode = it->second.mode;
         }
 
@@ -2219,6 +2221,8 @@ namespace tsg
             return false;
 
         void* addr = ggml_backend_buffer_get_base(buffer);
+        if (addr != nullptr)
+            addr = static_cast<char*>(addr) + buffer_offset;
         if (addr == nullptr)
             return false;
 
@@ -3520,8 +3524,9 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
         {
             std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
             for (auto& [ptr, cached] : g_host_buffer_cache)
-                ggml_backend_buffer_free(cached.buffer);
+                release_cached_buffer_locked(cached);
             g_host_buffer_cache.clear();
+            g_shared_buffer_refs.clear();
             tsg::note_cached_buffer_released(nullptr);
             g_offloadable_lru.clear();
             g_offloadable_lru_map.clear();
@@ -3583,8 +3588,9 @@ TSG_EXPORT void TSGgml_Shutdown()
         {
             std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
             for (auto& [ptr, cached] : g_host_buffer_cache)
-                ggml_backend_buffer_free(cached.buffer);
+                release_cached_buffer_locked(cached);
             g_host_buffer_cache.clear();
+            g_shared_buffer_refs.clear();
             g_offloadable_keys.clear();
             g_offloadable_lru.clear();
             g_offloadable_lru_map.clear();
@@ -4135,6 +4141,7 @@ static bool cached_buffer_ranges(void* base, const std::int64_t* offsets, const 
         return true;
 
     ggml_backend_buffer_t buffer = nullptr;
+    std::size_t buffer_offset = 0;
     tsg::CachedBufferMode mode = tsg::CachedBufferMode::HostPtr;
     std::size_t cached_bytes = 0;
     {
@@ -4143,6 +4150,7 @@ static bool cached_buffer_ranges(void* base, const std::int64_t* offsets, const 
         if (it == g_host_buffer_cache.end())
             return true;
         buffer = it->second.buffer;
+        buffer_offset = it->second.offset;
         mode = it->second.mode;
         cached_bytes = it->second.bytes;
     }
@@ -4167,6 +4175,8 @@ static bool cached_buffer_ranges(void* base, const std::int64_t* offsets, const 
     if (tensor == nullptr)
         return false;
     void* addr = ggml_backend_buffer_get_base(buffer);
+    if (addr != nullptr)
+        addr = static_cast<char*>(addr) + buffer_offset;
     if (addr == nullptr)
         return false;
     if (ggml_backend_tensor_alloc(buffer, tensor, addr) != GGML_STATUS_SUCCESS)
@@ -4250,6 +4260,7 @@ TSG_EXPORT int TSGgml_SyncIdleHostBufferRanges(void* ptr, const std::int64_t* of
         if (tsg::g_device_count.load(std::memory_order_acquire) > 1)
             return -1;
         ggml_backend_buffer_t buffer = nullptr;
+        std::size_t buffer_offset = 0;
         tsg::CachedBufferMode mode = tsg::CachedBufferMode::HostPtr;
         std::size_t cached_bytes = 0;
         {
@@ -4258,6 +4269,7 @@ TSG_EXPORT int TSGgml_SyncIdleHostBufferRanges(void* ptr, const std::int64_t* of
             if (it == g_host_buffer_cache.end())
                 return 0;
             buffer = it->second.buffer;
+            buffer_offset = it->second.offset;
             mode = it->second.mode;
             cached_bytes = it->second.bytes;
         }
@@ -4267,6 +4279,8 @@ TSG_EXPORT int TSGgml_SyncIdleHostBufferRanges(void* ptr, const std::int64_t* of
             if (offsets[i] < 0 || lengths[i] < 0 || static_cast<std::size_t>(offsets[i] + lengths[i]) > cached_bytes)
                 return 0;
         void* addr = ggml_backend_buffer_get_base(buffer);
+        if (addr != nullptr)
+            addr = static_cast<char*>(addr) + buffer_offset;
         if (addr == nullptr)
             return -1;
         ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, /*no_alloc=*/true };
@@ -4308,6 +4322,7 @@ TSG_EXPORT int TSGgml_DownloadDeviceCopyRanges(const void* src_key, void* dst,
         if (tsg::g_device_count.load(std::memory_order_acquire) > 1)
             return -1;
         ggml_backend_buffer_t buffer = nullptr;
+        std::size_t buffer_offset = 0;
         tsg::CachedBufferMode mode = tsg::CachedBufferMode::HostPtr;
         std::size_t cached_bytes = 0;
         {
@@ -4316,6 +4331,7 @@ TSG_EXPORT int TSGgml_DownloadDeviceCopyRanges(const void* src_key, void* dst,
             if (it == g_host_buffer_cache.end())
                 return 0;
             buffer = it->second.buffer;
+            buffer_offset = it->second.offset;
             mode = it->second.mode;
             cached_bytes = it->second.bytes;
         }
@@ -4326,6 +4342,8 @@ TSG_EXPORT int TSGgml_DownloadDeviceCopyRanges(const void* src_key, void* dst,
                 static_cast<std::size_t>(src_offsets[i] + lengths[i]) > cached_bytes)
                 return 0;
         void* addr = ggml_backend_buffer_get_base(buffer);
+        if (addr != nullptr)
+            addr = static_cast<char*>(addr) + buffer_offset;
         if (addr == nullptr)
             return -1;
         ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, /*no_alloc=*/true };
@@ -4399,6 +4417,7 @@ static int copy_ranges_into_device_copy(
 
     ggml_backend_buffer_t src_buffer = nullptr;
     ggml_backend_buffer_t dst_buffer = nullptr;
+    std::size_t src_offset = 0, dst_offset = 0;
     bool created = false;
     {
         std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
@@ -4409,6 +4428,7 @@ static int copy_ranges_into_device_copy(
                 source->second.bytes != static_cast<std::size_t>(src_bytes) || source->second.buffer == nullptr)
                 return error("source has no resident device copy.");
             src_buffer = source->second.buffer;
+            src_offset = source->second.offset;
         }
         auto dst = g_host_buffer_cache.find(dst_key);
         if (dst != g_host_buffer_cache.end())
@@ -4419,6 +4439,7 @@ static int copy_ranges_into_device_copy(
                 dst->second.bytes != static_cast<std::size_t>(dst_bytes) || dst->second.buffer == nullptr)
                 return error("destination has an incompatible cached buffer.");
             dst_buffer = dst->second.buffer;
+            dst_offset = dst->second.offset;
         }
     }
 
@@ -4455,9 +4476,11 @@ static int copy_ranges_into_device_copy(
     ggml_tensor* src_t = src_is_host ? nullptr : ggml_new_tensor_1d(context.value, GGML_TYPE_I8, src_bytes);
     ggml_tensor* dst_t = ggml_new_tensor_1d(context.value, GGML_TYPE_I8, dst_bytes);
     if ((!src_is_host && (src_t == nullptr ||
-            ggml_backend_tensor_alloc(src_buffer, src_t, ggml_backend_buffer_get_base(src_buffer)) != GGML_STATUS_SUCCESS)) ||
+            ggml_backend_tensor_alloc(src_buffer, src_t,
+                static_cast<char*>(ggml_backend_buffer_get_base(src_buffer)) + src_offset) != GGML_STATUS_SUCCESS)) ||
         dst_t == nullptr ||
-        ggml_backend_tensor_alloc(dst_buffer, dst_t, ggml_backend_buffer_get_base(dst_buffer)) != GGML_STATUS_SUCCESS)
+        ggml_backend_tensor_alloc(dst_buffer, dst_t,
+            static_cast<char*>(ggml_backend_buffer_get_base(dst_buffer)) + dst_offset) != GGML_STATUS_SUCCESS)
         return fail("binding the device buffers failed.");
 
     // Kernels still in flight may write the source rows or read the destination.
@@ -4527,6 +4550,134 @@ TSG_EXPORT int TSGgml_UploadToDeviceCopyRanges(
 {
     return copy_ranges_into_device_copy(src_host, /*src_is_host=*/true, src_bytes, dst_key, dst_bytes,
         src_offsets, dst_offsets, lengths, count, zero_dst, "upload_to_device_copy_ranges");
+}
+
+// Zero-filled device copies for `count` host keys at once, as slices of shared
+// device buffers (one per run of keys up to the buffer type's max size): a new
+// request slot's caches or states, whose host bytes are dead rows or zeros. Keyed
+// one at a time (TSGgml_UploadToDeviceCopyRanges, zero_dst) each key cost an
+// allocation, a memset and two backend syncs: ~80 per Qwen 3.5 slot, 0.7 ms each
+// on ggml-vulkan. Keys that already have a cached buffer, or that alone exceed the
+// buffer type's max size, are left alone and flagged in `skipped` for the caller's
+// per-key path. Returns the number of keys given a shared slice, or -1 on failure
+// (nothing registered). Works on the caller's active rank (TSGgml_SetActiveRank):
+// its backend, its cache - a tensor-parallel rank primes its own share there.
+TSG_EXPORT int TSGgml_ZeroDeviceCopies(void* const* keys, const std::int64_t* bytes, int count, std::uint8_t* skipped)
+{
+    if (keys == nullptr || bytes == nullptr || count <= 0)
+        return 0;
+    if (!ensure_backend() || g_backend == nullptr)
+    {
+        set_last_error("zero_device_copies: requires an initialized device backend on the active rank.");
+        return -1;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+    if (dev == nullptr || !prefers_device_local_cache(dev))
+    {
+        set_last_error("zero_device_copies: backend has no device-local copies.");
+        return -1;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
+    if (buft == nullptr)
+        return -1;
+    const std::size_t alignment = std::max<std::size_t>(ggml_backend_buft_get_alignment(buft), 256);
+    const std::size_t max_size = ggml_backend_buft_get_max_size(buft);
+    auto align_up = [alignment](std::size_t v) { return (v + alignment - 1) / alignment * alignment; };
+
+    // The keys to place, each with room for one padded row past its bytes (later
+    // binds compare a typed tensor's allocation size), as the per-key path leaves.
+    std::vector<int> pending;
+    std::vector<std::size_t> slice(static_cast<std::size_t>(count), 0);
+    {
+        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+        for (int i = 0; i < count; ++i)
+        {
+            if (skipped != nullptr) skipped[i] = 0;
+            if (keys[i] == nullptr || bytes[i] <= 0)
+                continue;
+            const std::size_t size = align_up(static_cast<std::size_t>(bytes[i]) + 4096);
+            if (g_host_buffer_cache.find(keys[i]) != g_host_buffer_cache.end() || size > max_size)
+            {
+                if (skipped != nullptr) skipped[i] = 1;
+                continue;
+            }
+            slice[static_cast<std::size_t>(i)] = size;
+            pending.push_back(i);
+        }
+    }
+
+    // Runs of keys that fit one buffer each.
+    struct Group
+    {
+        std::size_t total = 0;
+        std::vector<std::pair<int, std::size_t>> members;
+        ggml_backend_buffer_t buffer = nullptr;
+    };
+    std::vector<Group> groups;
+    for (int i : pending)
+    {
+        const std::size_t size = slice[static_cast<std::size_t>(i)];
+        if (groups.empty() || groups.back().total + size > max_size)
+            groups.emplace_back();
+        groups.back().members.emplace_back(i, groups.back().total);
+        groups.back().total += size;
+    }
+    std::size_t total = 0;
+    for (const Group& g : groups) total += g.total;
+    {
+        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+        if (g_device_copy_budget_bytes > 0 &&
+            g_device_copy_resident_bytes + static_cast<std::int64_t>(total) > g_device_copy_budget_bytes)
+        {
+            set_last_error("zero_device_copies: device-copy budget exhausted.");
+            return -1;
+        }
+    }
+    for (Group& g : groups)
+    {
+        g.buffer = ggml_backend_buft_alloc_buffer(buft, g.total);
+        if (g.buffer == nullptr)
+        {
+            for (Group& h : groups)
+                if (h.buffer != nullptr) ggml_backend_buffer_free(h.buffer);
+            set_last_error("zero_device_copies: device allocation failed.");
+            return -1;
+        }
+        ggml_backend_buffer_set_usage(g.buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        ggml_backend_buffer_clear(g.buffer, 0);
+    }
+
+    int placed = 0;
+    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+    for (Group& g : groups)
+    {
+        int owners = 0;
+        for (const auto& [i, offset] : g.members)
+        {
+            // Bound by another thread since the scan: keep that one.
+            if (g_host_buffer_cache.find(keys[i]) != g_host_buffer_cache.end())
+            {
+                if (skipped != nullptr) skipped[i] = 1;
+                continue;
+            }
+            CachedHostBuffer entry;
+            entry.buffer = g.buffer;
+            entry.bytes = static_cast<std::size_t>(bytes[i]);
+            entry.buffer_size = slice[static_cast<std::size_t>(i)];
+            entry.mode = CachedBufferMode::DeviceCopy;
+            entry.offset = offset;
+            g_host_buffer_cache[keys[i]] = entry;
+            g_device_copy_resident_bytes += static_cast<std::int64_t>(entry.buffer_size);
+            ++owners;
+            ++placed;
+        }
+        if (owners == 0)
+            ggml_backend_buffer_free(g.buffer);
+        else
+            g_shared_buffer_refs[g.buffer] = owners;
+    }
+    clear_last_error();
+    return placed;
 }
 
 // Diagnostic: the host-byte size recorded for `key`'s cached buffer, negated for

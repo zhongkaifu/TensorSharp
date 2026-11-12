@@ -364,6 +364,19 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>On per-rank graphs a shared-prefix checkpoint and its clone are copied rank by rank on each rank's device
+    /// (each rank's share of the caches and states), and the clone continues exactly as the request did.</summary>
+    [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]
+    [InlineData("dense")]
+    [InlineData("moe-tp")]
+    public void RankGraphCheckpointsCopyOnEachRanksDevice(string variant)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string path = Fixture(variant);
+        CheckpointChecks.AssertCheckpointsContinueExactly(() => new Qwen35RuntimeModel(path, BackendType.GgmlCuda, 2, null, 1),
+            1e-5, $"qwen35 {variant} tp2 ranks", deviceCopies: true);
+    }
+
     /// <summary>Two tensor-parallel ranks on CUDA device 0, each with its own allocator and stream; the all-reduce sums
     /// through the host.</summary>
     private sealed class OneGpuCudaGroup : ITensorParallelGroup
@@ -1007,6 +1020,38 @@ public sealed class Qwen35RuntimeTests : IDisposable
             Assert.True(n > 0, $"request {i} produced nothing");
             Assert.Equal(expected[i].Take(n), outputs[i].Take(n));
         }
+    }
+
+    /// <summary>On one Metal or CUDA device a new request's slot must fit beside the running requests' (else it waits:
+    /// <see cref="TensorSharp.Runtime.Scheduling.SequenceSlotUnavailableException"/>), a lone request always gets one, and
+    /// the prefix cache is asked to free what one more fresh slot lacks (as Qwen4ExpModel admits its holders).</summary>
+    [GgmlTheory(BackendType.GgmlMetal)]
+    [InlineData(BackendType.GgmlMetal)]
+    public void NewSlotsWaitForDeviceMemoryOnMetal(BackendType backend) => AssertSlotsWaitForDeviceMemory(backend);
+
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData(BackendType.GgmlCuda)]
+    public void NewSlotsWaitForDeviceMemoryOnCuda(BackendType backend) => AssertSlotsWaitForDeviceMemory(backend);
+
+    private void AssertSlotsWaitForDeviceMemory(BackendType backend)
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        using var model = Create(Fixture("dense"), backend: backend);
+        const long gb = 1L << 30;
+        (long Free, long Total)? memory = (64 * gb, 64 * gb);
+        model.DeviceMemoryProbe = () => memory;
+        var unified = (IUnifiedBatchModel)model;
+
+        memory = (1, 64 * gb);
+        Assert.Equal(0, unified.EnsureSequenceSlot("lone", 64));    // nothing else holds a slot: it always gets one
+        Assert.True(model.DeviceSlotDeficitBytes > 0, "a full device asks the prefix cache for a fresh slot's room");
+        Assert.Throws<TensorSharp.Runtime.Scheduling.SequenceSlotUnavailableException>(() => unified.EnsureSequenceSlot("second", 64));
+        Assert.True(unified.TryForwardUnified(new[] { "lone" }, new[] { new[] { 5, 6, 7 } }, new[] { 0 }, new float[1][]),
+            "the running request is untouched by the refusal");
+
+        memory = (64 * gb, 64 * gb);
+        Assert.Equal(0, model.DeviceSlotDeficitBytes);
+        Assert.Equal(0, unified.EnsureSequenceSlot("second", 64));
     }
 
     /// <summary>The unified step times its host parts as the batched decode does
