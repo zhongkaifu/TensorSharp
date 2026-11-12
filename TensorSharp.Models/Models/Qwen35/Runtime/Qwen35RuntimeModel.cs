@@ -146,7 +146,7 @@ namespace TensorSharp.Models
         /// The requests the shared runtime serves for this family (see Qwen35Architecture):
         /// whole-layer stages, local or multi-node, alone or with --tp; routed experts on the host
         /// for cuda and mlx, where Qwen35Model keeps them in device buffers; and one device on
-        /// ggml_cuda, ggml_metal, ggml_cpu or MLX for checkpoints without routed experts (<see cref="ServesOneDevice"/>).
+        /// ggml_cuda, ggml_metal, ggml_cpu or MLX (<see cref="ServesOneDevice"/>).
         /// </summary>
         internal static bool Serves(Architecture.ModelCreateContext context)
             => context.LayerSplitDegree > 1
@@ -155,23 +155,25 @@ namespace TensorSharp.Models
                || ServesOneDevice(context);
 
         /// <summary>
-        /// One device on ggml_cuda, ggml_metal, ggml_cpu or MLX, for a checkpoint without routed experts: the
-        /// runtime matches Qwen35Model there (Qwen3.8-27B UD-IQ3_XXS, prefill / decode tok/s: ggml_metal 388.7 /
+        /// One device on ggml_cuda, ggml_metal, ggml_cpu or MLX, for a checkpoint without routed experts (with them on
+        /// the GGML devices, below): the runtime matches Qwen35Model there (Qwen3.8-27B UD-IQ3_XXS, prefill / decode tok/s: ggml_metal 388.7 /
         /// 21.0 vs 393.3 / 21.0 on an M5 Pro; ggml_cuda measured on an RTX PRO 6000 in the commit adding this
         /// route; MLX decode 19.8 vs 19.6-20.0, MTP 29.8 vs 29.3-29.6, DFlash2 29.3-29.8 vs 27.5-27.7,
         /// Qwen3.5-0.8B Q8_0 prompt 12,130 vs 12,290) or beats it (ggml_cpu on the M5 Pro, prefill / decode:
         /// Qwen3.5-0.8B Q8_0 3.6K tokens 3.2 vs 9.6 s / 99-111 vs 20 tok/s; Qwen3.8-27B UD-IQ3_XXS 55 tokens 6.0
         /// vs 7.2-8.2 s / 6.2-6.8 vs 3.2-3.8 tok/s). Bonsai2's PRISM rotations included: the GGML graphs rotate
-        /// the rotated products' inputs (MLX refuses them at load, as Qwen35Model does). Routed experts too on
-        /// ggml_cpu (Qwen3.6-35B-A3B UD-Q4_K_M: 55-token prompt 0.57-0.59 vs 1.24-2.04 s, decode 37-46 vs 6.4-7.4
-        /// tok/s, perplexity 12.86 vs 12.96 over 1,022 tokens). Qwen35Model keeps routed experts elsewhere (4K-token
-        /// decode 2.6% behind on ggml_cuda, 0.9% on ggml_metal; MLX wires 3 GB more on a 3.6K prompt), --tp (its
-        /// per-rank fused graphs) and the other backends (direct CUDA and ggml_vulkan are not at parity yet).
+        /// the rotated products' inputs (MLX refuses them at load, as Qwen35Model does). Routed experts too, on the
+        /// GGML devices (Qwen3.6-35B-A3B UD-Q4_K_M, runtime vs Qwen35Model: one A40 ggml_cuda, a 3.6K-token prompt
+        /// then 512 tokens 762-804 vs 813-871 ms / 106.7-108.1 vs 104.0 tok/s, perplexity over 4,088 tokens 13.10 vs
+        /// 13.13; ggml_metal on an M5 Pro 2.17 vs 2.21-2.23 s / 66.7-66.8 vs 66.8-67.0 tok/s, 13.13 vs 13.09; ggml_cpu
+        /// 55-token prompt 0.57-0.59 vs 1.24-2.04 s, decode 37-46 vs 6.4-7.4 tok/s, 12.86 vs 12.96). MLX keeps them on
+        /// Qwen35Model: it wires 3 GB more for a 3.6K-token prompt there. Qwen35Model also keeps --tp (its per-rank
+        /// fused graphs) and the other backends (direct CUDA and ggml_vulkan are not at parity yet).
         /// </summary>
         internal static bool ServesOneDevice(Architecture.ModelCreateContext context)
             => context.Backend is BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu or BackendType.Mlx
                && context.TpDegree <= 1 && context.TpGroup == null && context.LayerSplitDegree <= 1
-               && context.Probe != null && (context.Backend == BackendType.GgmlCpu || !HasRoutedExperts(context.Probe));
+               && context.Probe != null && (context.Backend != BackendType.Mlx || !HasRoutedExperts(context.Probe));
 
         private static bool HasRoutedExperts(GgufFile probe)
         {
