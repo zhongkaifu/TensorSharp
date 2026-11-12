@@ -363,6 +363,7 @@ namespace TensorSharp.Models
                 InitCaches(initial, maxContext);
                 InitRecurrentStates();
                 PlanExpertPlacement();
+                StartHostWarm();
                 PreReplicateNormWeights();
                 Console.WriteLine($"  Placement: {_mesh.Describe()} (shared decoder runtime).");
             }
@@ -1218,6 +1219,7 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            StopHostWarm();
             foreach (RankExpertStack stack in _rankStacks.Values) stack.Stack.Dispose();
             _rankStacks.Clear();
             foreach (Tensor t in AllCacheTensors(_cacheK)) t.Dispose();

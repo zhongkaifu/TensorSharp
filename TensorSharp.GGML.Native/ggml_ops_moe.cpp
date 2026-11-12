@@ -3001,6 +3001,8 @@ namespace tsg
         double& s_acc_gpu = acc.gpu; double& s_acc_host = acc.host; double& s_acc_up = acc.up;
         double& s_acc_total = acc.total; int& s_acc_passes = acc.passes; int& s_acc_seq = acc.seq;
         const auto t_pass = s_pass_timing ? pass_clock::now() : pass_clock::time_point{};
+        // The route counters as the report's first pass starts (taken after it, a prompt pass - reported alone - read 0).
+        if (s_pass_timing && (s_acc_passes == 0 || pass_seq != s_acc_seq)) TSGgml_MoeOffloadCounters(acc.c0, 9);
         auto ms_since = [](pass_clock::time_point t) {
             return std::chrono::duration<double, std::milli>(pass_clock::now() - t).count();
         };
@@ -3249,7 +3251,6 @@ namespace tsg
             }
             s_acc_seq = seq;
             s_acc_total += ms_since(t_pass);
-            if (s_acc_passes == 0) TSGgml_MoeOffloadCounters(acc.c0, 9);
             // Decode/verify widths report over 32 passes; a prompt pass (one a chunk, rare) reports on its own.
             const int report_every = seq > 8 ? 1 : 32;
             if (++s_acc_passes == report_every)

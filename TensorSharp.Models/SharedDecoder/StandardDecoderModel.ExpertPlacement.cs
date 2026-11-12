@@ -47,6 +47,102 @@ namespace TensorSharp.Models
         protected override int GgmlPrefillChunkWarmupLength
             => _expertOnHost != null && Array.IndexOf(_expertOnHost, true) >= 0 ? 64 : base.GgmlPrefillChunkWarmupLength;
 
+        /// <summary>The experts each layer's accelerator tier holds (null: no tiers).</summary>
+        private int[][] _tierExperts;
+
+        private System.Threading.Tasks.Task _hostWarm;
+        private System.Threading.CancellationTokenSource _hostWarmCancel;
+
+        /// <summary>
+        /// Read what the host serves into the page cache in the background (Qwen4ExpModel's rule): the file-backed host-only
+        /// tables and the routed experts the host computes (outside the tiers), the most-routed first, within what the host
+        /// can keep cached. On a network filesystem every uncached row or expert is a storage round trip inside a step (92-120
+        /// ms on a geesefs mount). Not on Metal, which reads host experts explicitly into slots.
+        /// TS_HOST_WARM_WAIT=1 returns from the load only once the warm is done.
+        /// </summary>
+        private void StartHostWarm()
+        {
+            if (_backend == BackendType.GgmlMetal || _gguf == null) return;
+            long available = MappedTableWarm.HostMemoryAvailable();
+            if (available <= 0) return;
+            long room = available - MappedTableWarm.Headroom;
+            var ranges = new List<(IntPtr Pointer, long Bytes)>();
+            long tableBytes = 0, expertBytes = 0;
+            int slices = 0;
+            foreach (var (name, q) in _quantWeights)
+            {
+                if (!IsHostOnlyWeight(name) || !q.IsFileBacked || q.RawBytes > room) continue;
+                ranges.Add((q.Data, q.RawBytes));
+                tableBytes += q.RawBytes;
+                room -= q.RawBytes;
+            }
+            foreach (var (pointer, bytes) in HostServedExpertSlices())
+            {
+                if (bytes > room) break;
+                ranges.Add((pointer, bytes));
+                room -= bytes;
+                expertBytes += bytes;
+                slices++;
+            }
+            if (ranges.Count == 0) return;
+            int experts = slices / 3;
+            string what = (tableBytes > 0 ? "the host-only tables" : "") + (tableBytes > 0 && experts > 0 ? " and " : "")
+                + (experts > 0 ? $"{experts} host-served experts" : "");
+            _hostWarmCancel = new System.Threading.CancellationTokenSource();
+            var cancel = _hostWarmCancel.Token;
+            GgufFile gguf = _gguf;
+            string arch = Config.Architecture;
+            _hostWarm = System.Threading.Tasks.Task.Run(() =>
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                try
+                {
+                    long read = gguf.WarmMappedRanges(ranges, GgufFile.DefaultWarmThreads(), cancel);
+                    if (!cancel.IsCancellationRequested)
+                        Console.Error.WriteLine($"[{arch}] warmed {read / (double)(1L << 30):F1} GiB of {what} in {sw.Elapsed.TotalSeconds:F1}s");
+                }
+                catch (OperationCanceledException) { }
+            });
+            bool wait = Environment.GetEnvironmentVariable("TS_HOST_WARM_WAIT") == "1";
+            Console.WriteLine($"[{arch}] warming {(tableBytes + expertBytes) / (double)(1L << 30):F1} GiB of {what} " +
+                (wait ? "before serving (TS_HOST_WARM_WAIT=1)" : "in the background (the first answers read the rest from the model files)"));
+            if (wait) _hostWarm.Wait();
+        }
+
+        /// <summary>The (pointer, bytes) slices of every routed expert the host computes, one per gate/up/down part, the
+        /// most-routed first when a routing profile covers the layer.</summary>
+        private IEnumerable<(IntPtr Pointer, long Bytes)> HostServedExpertSlices()
+        {
+            if (_expertOnHost == null) yield break;
+            var order = new List<(ulong Count, int Layer, int Expert)>();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!_expertOnHost[l] || !TryGetLayerExperts(l, out _, out _, out _)) continue;
+                var held = new HashSet<int>(_tierExperts?[l] ?? Array.Empty<int>());
+                ReadOnlySpan<ulong> counts = _routingProfile != null && _routingProfile.CoversLayers(new[] { l }) ? _routingProfile.Counts(l) : default;
+                for (int e = 0; e < _numExperts; e++)
+                    if (!held.Contains(e)) order.Add((counts.IsEmpty ? 0 : counts[e], l, e));
+            }
+            order.Sort((a, b) => b.Count.CompareTo(a.Count));
+            foreach (var (_, l, e) in order)
+            {
+                TryGetLayerExperts(l, out var gate, out var up, out var down);
+                foreach (StackedExpertWeights w in new[] { gate, up, down })
+                    if (w != null) yield return (w.Data + (nint)(e * w.PerExpertRawBytes), w.PerExpertRawBytes);
+            }
+        }
+
+        private void StopHostWarm()
+        {
+            if (_hostWarmCancel == null) return;
+            _hostWarmCancel.Cancel();
+            try { _hostWarm?.Wait(); }
+            catch (AggregateException) { }
+            _hostWarmCancel.Dispose();
+            _hostWarmCancel = null;
+            _hostWarm = null;
+        }
+
         /// <summary>A host-only table is read a few rows a token, on demand: warming every row at load read 28.8 GB
         /// (Flash Next's PLE table) the page cache could not keep.</summary>
         protected override bool ShouldPrefaultWeight(GgufTensorInfo info) => !IsHostOnlyWeight(info.Name);
@@ -258,6 +354,7 @@ namespace TensorSharp.Models
             long windowBudget = explicitIo ? ioBudget - ioBudget / 8 : 0;
             int[][] tiers = profiled ? _routingProfile.SelectTiers(expertBytes, budget) : new int[n][];
             for (int l = 0; l < n; l++) tiers[l] ??= Array.Empty<int>();
+            _tierExperts = tiers;
             long tierBytes = 0;
             foreach (int l in moeLayers) tierBytes += (long)tiers[l].Length * expertBytes[l];
             windowBudget = Math.Min(windowBudget, Math.Max(0, deviceExpertBytes - tierBytes));

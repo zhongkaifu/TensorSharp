@@ -231,7 +231,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
             using (var model = Create(path, backend: backend))
             {
                 Assert.True(model.RegisterExpertTiersForTests(int.MaxValue, 0) > 0, "no layer took a tier");
+                long held = TensorSharp.GGML.GgmlBasicOps.MoeOffloadCounters()[0];
                 tiered = Script(model);
+                Assert.True(TensorSharp.GGML.GgmlBasicOps.MoeOffloadCounters()[0] > held, "the tier held no route: every one ran on the host");
             }
         }
         finally
