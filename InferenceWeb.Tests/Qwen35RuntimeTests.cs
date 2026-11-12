@@ -285,6 +285,15 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>Speculation on per-rank graphs: each rank's verify keeps its recurrent states' window, and the commit runs
+    /// per rank on its own share of the heads; the NextN draft layer runs whole (unsharded) on rank 0.</summary>
+    [Fact]
+    public void SpeculationOnRankGraphsMatchesPlainGreedy()
+    {
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(Fixture("dense"), tp: 2), "qwen35 dense tp2");
+        SpeculativeRuntimeChecks.AssertDraftHeadMatchesPlainGreedy(() => Create(Fixture("dense-nextn"), tp: 2), "qwen35 nextn tp2");
+    }
+
     /// <summary>Per-rank graphs on ggml_cuda over two GPUs: each rank's program compiles to its device's ggml graph, and
     /// the ranks' graphs run together, pausing at every all-reduce while the devices sum the partial (exact F32).</summary>
     [GgmlTheory(BackendType.GgmlCuda, Devices = 2)]

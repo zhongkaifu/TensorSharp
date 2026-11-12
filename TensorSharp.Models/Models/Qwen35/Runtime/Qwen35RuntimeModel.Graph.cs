@@ -67,13 +67,15 @@ namespace TensorSharp.Models
             }
             CommitHostVerify(kept, rows);
             if (kept == 0) return;
-            // One commit graph per pipeline stage: each binds its own device's states.
+            // One commit graph per pipeline stage and tensor-parallel rank: each binds its own device's states (a rank's
+            // hold its share of the heads).
             for (int stage = 0; stage < Mesh.Stages; stage++)
+            for (int rank = 0; rank < Mesh.TensorParallel; rank++)
             {
                 IntPtr key = IntPtr.Zero;
                 for (int layer = 0; layer < Config.NumLayers && key == IntPtr.Zero; layer++)
-                    if (_isRecurrent[layer] && Mesh.StageOf(layer) == stage
-                        && ActiveRecurrentState(layer) is DeviceGdnState first && first.Verify != null)
+                    if (_isRecurrent[layer] && OwnsLayer(layer) && Mesh.StageOf(layer) == stage
+                        && ActiveRecurrentState(layer, rank) is DeviceGdnState first && first.Verify != null)
                         key = StateIdentity(first.Verify);
                 if (key == IntPtr.Zero) continue;
                 EnterGraphStage(stage);
@@ -81,7 +83,7 @@ namespace TensorSharp.Models
                 {
                     if (!_commitGraphs.TryGetValue((key, kept, rows), out IGraphPlan g))
                     {
-                        g = GraphExecutor.Compile(BuildCommitProgram(kept, rows, stage));
+                        g = CompileForDevice(BuildCommitProgram(kept, rows, stage, rank), stage, rank);
                         _commitGraphs[(key, kept, rows)] = g;
                     }
                     if (!g.Run(ReadOnlySpan<int>.Empty, ReadOnlySpan<IntPtr>.Empty, ReadOnlySpan<long>.Empty))
@@ -94,14 +96,14 @@ namespace TensorSharp.Models
             }
         }
 
-        private GraphProgram BuildCommitProgram(int kept, int rows, int stage)
+        private GraphProgram BuildCommitProgram(int kept, int rows, int stage, int rank)
         {
             const long f = sizeof(float);
             var g = new GraphProgramBuilder(record: true);
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
-                if (!_isRecurrent[layer] || Mesh.StageOf(layer) != stage
-                    || ActiveRecurrentState(layer) is not DeviceGdnState state || state.Verify == null)
+                if (!_isRecurrent[layer] || !OwnsLayer(layer) || Mesh.StageOf(layer) != stage
+                    || ActiveRecurrentState(layer, rank) is not DeviceGdnState state || state.Verify == null)
                     continue;
                 long stateFloats = state.StateFloats, stateBytes = stateFloats * f;
                 int cap = state.SnapshotCapacity, convRows = state.ConvRows, channels = state.Channels;
@@ -112,7 +114,7 @@ namespace TensorSharp.Models
                 int target = InPlaceRecurrentState
                     ? g.Op(GraphOp.View, stackalloc[] { GraphLeaf(g, state.Backing, state.RowFloats + stateFloats) },
                         stackalloc long[] { 1, stateFloats, 1, 1, 1, stateBytes, 0, 0, state.RowFloats * f })
-                    : g.Op(GraphOp.Reshape, stackalloc[] { GraphLeaf(g, state.Ssm, _headKDim, _headVDim, _numVHeads) }, stackalloc long[] { stateFloats });
+                    : g.Op(GraphOp.Reshape, stackalloc[] { GraphLeaf(g, state.Ssm, _headKDim, _headVDim, state.Ssm.Sizes[0]) }, stackalloc long[] { stateFloats });
                 g.Effect(g.Op(GraphOp.Cpy, source, target));
                 int hist = GraphLeaf(g, state.ConvHistory, convRows + cap, channels);
                 int window = g.Op(GraphOp.View, stackalloc[] { hist },

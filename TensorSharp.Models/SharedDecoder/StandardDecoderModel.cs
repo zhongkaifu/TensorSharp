@@ -156,9 +156,13 @@ namespace TensorSharp.Models
             else
             {
                 if (!OwnsLayer(entry) || _recurrentLayer[entry]) return null;
+                // A draft layer is not sharded: under tensor parallelism it runs whole on rank 0, with every KV head.
+                bool draft = entry >= Config.NumLayers && _mesh.TensorParallel > 1;
+                if (draft && rank > 0) return null;
                 IAllocator alloc = _mesh.Allocator(CacheStage(entry), rank);
-                t = value ? new Tensor(alloc, dtype, _localKvHeads, capacity, _valueDim)
-                          : new Tensor(alloc, dtype, _localKvHeads, capacity, _keyDim);
+                int kvHeads = draft ? Config.NumKVHeads : _localKvHeads;
+                t = value ? new Tensor(alloc, dtype, kvHeads, capacity, _valueDim)
+                          : new Tensor(alloc, dtype, kvHeads, capacity, _keyDim);
             }
             InitializeCacheTensor(t);
             return t;
@@ -747,7 +751,10 @@ namespace TensorSharp.Models
         private Tensor LayerOnOneDevice(Tensor hidden, int layer, TokenPositions positions, SlotBatch batch)
         {
             string p = $"blk.{layer}.";
-            RankScope scope = Scope(StageOfLayer(layer), 0);
+            // A draft layer is not sharded: under tensor parallelism it runs whole on the last stage's rank 0.
+            RankScope scope = layer >= Config.NumLayers && _mesh.TensorParallel > 1
+                ? new RankScope(StageOfLayer(layer), 0, 1, _mesh.Allocator(StageOfLayer(layer), 0), Config.NumHeads, Config.NumKVHeads)
+                : Scope(StageOfLayer(layer), 0);
 
             Tensor normed = _recurrentLayer[layer] && RecurrentMixerTakesRawInput
                 ? hidden.CopyRef()

@@ -836,8 +836,10 @@ order guarantees every rank reached it before any rank reads the total. A kind's
 ranks' programs (nothing runs) so their streams release tensors by the readers. Rank 0 runs the head.
 Replicated weights are resident on every rank's allocator, rank 0's included: the CUDA quantized cache
 is keyed by allocator, and the model's own allocator of a GPU is another one with its own stream
-(Qwen3.6-35B-A3B decode went from 19.9 to 29.9 tok/s with rank 0 on its own copies). Speculation is
-refused here for now (the draft layer is not sharded).
+(Qwen3.6-35B-A3B decode went from 19.9 to 29.9 tok/s with rank 0 on its own copies). Speculation
+verifies on the ranks' graphs: each rank's recurrent states keep their verify window and the commit runs
+per (stage, rank) on the rank's share of the heads (`CompileForDevice`); a NextN/MTP draft layer is not
+sharded and runs whole on rank 0 (its KV cache holds every head there, none on the other ranks).
 
 On GGML (ggml_cuda with a device collective) the same ranked emission feeds an executor that compiles
 whole programs (`IRankedGraphExecutor`): each rank's program is compiled into a ggml graph on its own
@@ -851,6 +853,13 @@ one thread rank by rank (a ggml preload lands on the calling thread's active ran
 are preloaded too, since each rank's graph reads its slices device-resident. ggml's meta device stays
 opt-in (`TS_GRAPH_TENSOR_PARALLEL=1`).
 
+Flash Next lowers per rank as well: the recurrent and attention heads and the experts' width split as
+Qwen 3.5's, while the hyper-connection mixes, the PLE and QSA's indexer (its keys, its block selection)
+run whole on every rank from replicated weights and the rank's own copy of their state (the indexer
+cache, the PLE conv history), so every rank picks the same blocks. On simulated devices it matches one
+device to 1e-4 dense and selecting, with BF16 weights; with Q8_0 weights the ranks' repacked
+in-projections round apart from one device's by the activation quantization (8.5e-3 for Qwen 3.5's
+dense fixture, 1.7e-5 in BF16).
 
 The local group's peer-to-peer self-test now also runs a kernel that reads the other GPU's memory through
 the peer mapping. On the 2x A40 VM (PXB, a virtualized PCIe switch) the driver grants peer access, the

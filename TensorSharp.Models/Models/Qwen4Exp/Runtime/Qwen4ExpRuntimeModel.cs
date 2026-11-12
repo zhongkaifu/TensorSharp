@@ -43,8 +43,9 @@ namespace TensorSharp.Models
         private PleSpec _ple;
         private readonly Dictionary<int, Tensor> _pleTaps = new();
 
-        public Qwen4ExpRuntimeModel(string ggufPath, BackendType backend, string draftModelPath = null, int layerSplitDegree = 1)
-            : base(ggufPath, backend, 1, null, layerSplitDegree, draftModelPath)
+        public Qwen4ExpRuntimeModel(string ggufPath, BackendType backend, string draftModelPath = null, int layerSplitDegree = 1,
+            int tpDegree = 1, ITensorParallelGroup tpGroup = null)
+            : base(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree, draftModelPath)
         {
             PleSpec ple = Ple;
             if (ple.Hc < 2)
@@ -149,8 +150,10 @@ namespace TensorSharp.Models
 
         protected override int StreamWidth => checked((int)Ple.StreamFloats);
 
-        /// <summary>Hyper-connections, the PLE and QSA's indexer keys are not traced per rank yet: --tp keeps the per-op path.</summary>
-        protected override bool RanksLower => false;
+        /// <summary>Each rank traces its shard: the recurrent and attention heads and the experts' width split as Qwen 3.5's,
+        /// while the hyper-connection mixes, the PLE and QSA's indexer (its keys, its block selection) run whole on every
+        /// rank from replicated weights and the rank's own copy of their state, so every rank selects the same blocks.</summary>
+        protected override bool RanksLower => true;
 
         // ---------------------------------------------------------------- the MTP head
 
@@ -365,7 +368,7 @@ namespace TensorSharp.Models
 
             // The causal depthwise conv over [history | rows], taps n-gram positions apart, then silu.
             int normed = GroupedNorm(step, gated, rows, LayerName(layer, "ple_norm_conv.weight"));
-            int taps = step.TensorWeight(PleTaps(layer), width, p.ConvKernel);
+            int taps = step.TensorWeight(step.Replicated(PleTaps(layer)), width, p.ConvKernel);
             int history = p.ConvHistory;
             int conv = -1;
             for (int s = 0; s < step.Sequences; s++)

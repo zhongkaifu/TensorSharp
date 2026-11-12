@@ -73,11 +73,12 @@ namespace TensorSharp.Models
             // NextN / MTP draft blocks are counted in block_count but are not decoder layers.
             int nextn = (int)_gguf.GetUint32($"{arch}.nextn_predict_layers", 0);
             Config.NumLayers -= nextn;
-            // The NextN/MTP block drafts on one device or the last of this process's whole-layer
-            // stages (tensor parallelism and multi-node pipelines draft once their graphs lower).
-            _draftLayers = tpDegree <= 1 && tpGroup == null ? Math.Min(nextn, 1) : 0;
+            // The NextN/MTP block drafts on one device, the last of this process's whole-layer stages, or (unsharded) on
+            // rank 0 of a tensor-parallel group; a multi-node pipeline drafts once its graphs lower.
+            bool drafts = tpGroup == null || (tpGroup is not ILayerSplitGroup && tpGroup.NodeCount == 1);
+            _draftLayers = drafts ? Math.Min(nextn, 1) : 0;
             // A family whose MTP head ships as its own file (--draft-model): its layer loads as the draft layer.
-            if (_draftLayers == 0 && tpDegree <= 1 && tpGroup == null && OpenSeparateDraftHead(draftModelPath) is { } head)
+            if (_draftLayers == 0 && drafts && OpenSeparateDraftHead(draftModelPath) is { } head)
             {
                 _draftLayers = 1;
                 _separateDraftHead = head;

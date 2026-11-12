@@ -6,6 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
 
+using TensorSharp.Graph;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Runtime.Speculative;
 
@@ -59,6 +60,22 @@ namespace TensorSharp.Models
         /// <summary>The active request's recurrent state of (layer, rank 0).</summary>
         protected RecurrentState ActiveRecurrentState(int layer) => _recurrentPrimary?[layer]?[0];
 
+        /// <summary>Tensor-parallel rank <paramref name="rank"/>'s state of <paramref name="layer"/> (null past the layer's ranks).</summary>
+        protected RecurrentState ActiveRecurrentState(int layer, int rank)
+            => _recurrentPrimary?[layer] is { } ranks && rank < ranks.Length ? ranks[rank] : null;
+
+        /// <summary>Compile <paramref name="program"/> for device (<paramref name="stage"/>, <paramref name="rank"/>): its own
+        /// executor, or a compiling executor's plan for that device. On one device or a whole-layer split, the current
+        /// stage's executor (the caller entered the stage).</summary>
+        protected IGraphPlan CompileForDevice(GraphProgram program, int stage, int rank)
+        {
+            if (_mesh.TensorParallel == 1) return GraphExecutor.Compile(program);
+            IGraphExecutor executor = ExecutorFor(_mesh.Allocator(stage, rank));
+            return executor is IRankedGraphExecutor ranked
+                ? ranked.CompileForRank(program, _mesh.GlobalDevice(stage, rank))
+                : executor.Compile(program);
+        }
+
         /// <summary>A family moved buffers a cached graph binds: drop the cached graphs.</summary>
         protected void NoteGraphBindingsChanged() => ClearGraphCache();
 
@@ -87,7 +104,8 @@ namespace TensorSharp.Models
             {
                 if (FamilySpeculationRefusal is { } family) return family;
                 // The draft layer is not sharded, and per-rank graphs do not trace it.
-                if (_rankGraphs) return "speculative decoding does not run on per-rank tensor-parallel graphs";
+                // Per-rank graphs verify (each rank's recurrent states keep their window and commit on their device);
+                // the draft layer is not sharded, so a family loads none under tensor parallelism.
                 if (GraphUnsupportedReason() is not { } reason) return null;
                 if (!_mesh.IsSingleDevice || LayerSplitGroup != null)
                     return $"speculative decoding off whole-forward graphs ({reason}) runs on one device";

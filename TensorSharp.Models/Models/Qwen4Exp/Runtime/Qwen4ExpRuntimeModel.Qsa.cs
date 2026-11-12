@@ -67,11 +67,12 @@ namespace TensorSharp.Models
         /// cell].</summary>
         protected override int ExtraKeyCacheWidth(int layer) => QsaRatio(layer) > 0 ? 2 * Qsa.Dim : 0;
 
-        /// <summary>The cache of <paramref name="layer"/> for sequence <paramref name="s"/>, [2d, capacity].</summary>
+        /// <summary>The cache of <paramref name="layer"/> for sequence <paramref name="s"/>, [2d, capacity]: the step's
+        /// rank's copy (every rank keeps the whole indexer cache and selects the same blocks).</summary>
         private int QsaCache(GraphStep step, int layer, int s)
         {
             Slot slot = step.Slots[s];
-            return step.State(ExtraKeyCache(slot.K, layer), KvCacheGraphType, 2 * Qsa.Dim, slot.Capacity, 1);
+            return step.State(ExtraKeyCache(slot.K, layer, Math.Max(step.Rank, 0)), KvCacheGraphType, 2 * Qsa.Dim, slot.Capacity, 1);
         }
 
         /// <summary>Every row's raw indexer key into its sequence's cache, and the blocks the step completes pooled into

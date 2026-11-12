@@ -132,6 +132,15 @@ public sealed class SharedRuntimeConformanceTests : IDisposable
             Assert.True(RelL2(actual[i], single[i]) <= 1e-3, $"{family} tp2 rank graphs row {i}: relL2 {RelL2(actual[i], single[i]):E2}");
     }
 
+    /// <summary>Speculation on per-rank graphs over two simulated devices matches plain greedy decoding.</summary>
+    [Theory]
+    [MemberData(nameof(Families))]
+    public void SpeculationOnRankGraphsMatchesPlainGreedy(string family)
+    {
+        string path = Fixture(family);
+        SpeculativeRuntimeChecks.AssertMatchesPlainGreedy(() => Create(family, path, 2, 1), $"{family} tp2");
+    }
+
     /// <summary>A GGML tensor-parallel group of two (the model builds it: no group is passed).</summary>
     private static ModelBase CreateGgmlTensorParallel(string family, string path) => family switch
     {

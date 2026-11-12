@@ -9,6 +9,7 @@
 // hyper-connections, the sigmoid-gated recurrence, gated attention, the PLE layer (its n-gram and conv
 // histories across steps) and the shared-expert MoE.
 
+using TensorSharp;
 using TensorSharp.GGML;
 using Xunit.Abstractions;
 
@@ -180,6 +181,54 @@ public sealed class Qwen4ExpRuntimeTests : IDisposable
 
     /// <summary>n-gram drafts (accepted and rejected): the verify keeps each row's recurrent and PLE state, and the
     /// accept count commits the kept prefix's n-gram and conv histories.</summary>
+    /// <summary>Tensor parallelism as per-rank graphs on two simulated devices: the heads and experts split, the
+    /// hyper-connections, PLE and QSA indexer whole on each rank; the same logits as one device, with QSA dense and
+    /// selecting (a top-k of 8 over a 40-token prompt: every rank must pick the same blocks).</summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void RankGraphsMatchOneDeviceOnTheManagedCpu(bool qsa, bool chunkedPrompt)
+    {
+        // BF16 projections and experts: Q8_0 ones quantize the activations, and the ranks' repacked in-projections
+        // round apart from one device's by that noise (8.5e-3 for Qwen 3.5's dense fixture, 1.7e-5 in BF16).
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, $"q4e-tp-{qsa}.gguf"), indexerTopK: 64, qsa: qsa,
+            projectionType: SyntheticGguf.GgmlType.BF16, expertGateUpType: SyntheticGguf.GgmlType.BF16, expertDownType: SyntheticGguf.GgmlType.BF16);
+        var group = new SimulatedDeviceGroup(2);
+        ModelBase Placed()
+        {
+            var model = new Qwen4ExpRuntimeModel(path, BackendType.Cpu, tpDegree: 2, tpGroup: group);
+            Assert.Equal(2, model.Mesh.TensorParallel);
+            return model;
+        }
+        AssertClose(Run(() => new Qwen4ExpRuntimeModel(path, BackendType.Cpu), chunkedPrompt), Run(Placed, chunkedPrompt), 1e-4,
+            $"tp2 qsa={qsa} chunked={chunkedPrompt}");
+        Assert.True(group.AllReduceCount > 0, "the ranks never reduced");
+    }
+
+    [Fact]
+    public void RankGraphsSelectTheSameQsaBlocksAsOneDevice()
+    {
+        string path = Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_dir, "q4e-sparse-tp.gguf"), indexerTopK: 8, qsa: true,
+            projectionType: SyntheticGguf.GgmlType.BF16, expertGateUpType: SyntheticGguf.GgmlType.BF16, expertDownType: SyntheticGguf.GgmlType.BF16);
+        int[] prompt = Enumerable.Range(0, 40).Select(i => 3 + (i * 37) % 240).ToArray();
+        int[] decode = Enumerable.Range(0, 12).Select(i => 5 + (i * 11) % 200).ToArray();
+        float[][] Rows(ModelBase model)
+        {
+            using (model)
+            {
+                var rows = new List<float[]> { (float[])model.ForwardRefill(prompt).Clone() };
+                foreach (int token in decode) rows.Add((float[])model.Forward(new[] { token }).Clone());
+                return rows.ToArray();
+            }
+        }
+        double[] errors = RowErrors(Rows(new Qwen4ExpRuntimeModel(path, BackendType.Cpu)),
+            Rows(new Qwen4ExpRuntimeModel(path, BackendType.Cpu, tpDegree: 2, tpGroup: new SimulatedDeviceGroup(2))));
+        // Partial sums only reorder the additions: one near-tied block pick a run is allowed, within a block's worth.
+        Assert.True(errors.Count(e => e >= 1e-4) <= 1 && errors.All(e => e < 5e-2),
+            $"tp2 sparse qsa relL2 per row: {string.Join(", ", errors.Select(e => e.ToString("E2")))}");
+    }
+
     [Fact]
     public void SpeculationMatchesPlainGreedyOnTheManagedCpu()
     {

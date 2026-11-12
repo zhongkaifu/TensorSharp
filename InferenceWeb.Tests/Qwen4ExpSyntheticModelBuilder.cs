@@ -65,7 +65,8 @@ internal static class Qwen4ExpSyntheticModelBuilder
         GgmlType pleConvType = GgmlType.F32, GgmlType ssmConvType = GgmlType.F32,
         GgmlType? matrixNormType = null, bool qsa = true, int expertCount = Experts, int expertUsedCount = ExpertsUsed,
         int hiddenSize = Hidden, bool q4kxlExperts = false, bool tiedOutput = false, GgmlType? expertDownType = null,
-        float expertDownGain = 0.25f, GgmlType? expertGateUpType = null, int expertFf = ExpertFf, GgmlType routerType = GgmlType.F32)
+        float expertDownGain = 0.25f, GgmlType? expertGateUpType = null, int expertFf = ExpertFf, GgmlType routerType = GgmlType.F32,
+        GgmlType projectionType = GgmlType.Q8_0)
     {
         if (expertCount < 1 || expertUsedCount < 1 || expertUsedCount > expertCount)
             throw new System.ArgumentOutOfRangeException(nameof(expertUsedCount), "Expert counts must be positive, and selected experts cannot exceed total experts.");
@@ -84,8 +85,9 @@ internal static class Qwen4ExpSyntheticModelBuilder
         // output projection writes a small update into the residual (gain 0.25), as a trained model's
         // do, so rounding differences between engines stay the size they start at instead of
         // compounding through a chaotic stack.
-        Tensor Proj(string name, int inDim, int outDim, GgmlType type = GgmlType.Q8_0, float gain = 1f)
+        Tensor Proj(string name, int inDim, int outDim, GgmlType? explicitType = null, float gain = 1f)
         {
+            GgmlType type = explicitType ?? projectionType;
             float s = gain * 1.5f / System.MathF.Sqrt(inDim);
             if (type is GgmlType.Q8_0 or GgmlType.F32 or GgmlType.BF16)
             {
@@ -97,10 +99,10 @@ internal static class Qwen4ExpSyntheticModelBuilder
         }
         Tensor Experts3(string name, int inDim, int outDim, GgmlType type, float gain = 1f)
         {
-            if (type == GgmlType.Q8_0)
+            if (type is GgmlType.Q8_0 or GgmlType.BF16)
             {
                 var w = Gen(name, gain * 1.5f / System.MathF.Sqrt(inDim), inDim, outDim, expertCount);
-                w.Type = GgmlType.Q8_0;
+                w.Type = type;
                 return w;
             }
             return Blocks(name, type, gain * 0.8f / System.MathF.Sqrt(inDim), inDim, outDim, expertCount);
