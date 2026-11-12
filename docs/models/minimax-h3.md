@@ -509,8 +509,9 @@ CUTLASS sources, compiles the one kernel this model uses (head size 128, F16, no
 about a minute of nvcc) and runs the fused attention node's product on it, between the
 same prep and widen passes and on the same F16 operands. It needs the cuDNN headers (the
 node is the cuDNN one, and cuDNN still runs shapes the kernel does not cover, such as
-the video VAE's 64-wide heads) and a GPU of sm_80 or newer. `TS_H3_FLASH_ATTENTION=0`
-puts the attention back on cuDNN.
+the video VAE's 64-wide heads) and a GPU of sm_80 or newer. It is the default engine on
+sm_8x only (below); `TS_H3_FLASH_ATTENTION=0` puts the attention back on cuDNN there, and
+`TS_H3_FLASH_ATTENTION=1` asks for the kernel on a newer GPU.
 
 On the same A100 and clip (39,875 tokens, 56 heads x 128), with `TS_H3_INT8_MATMUL=1`:
 
@@ -525,6 +526,18 @@ two engines round differently, and eight denoising steps amplify that: the clips
 31.6 and 24.8 dB PSNR from the cuDNN ones (the same seeds), the size of change the int8
 projections make. The option is off by default because it downloads sources at
 configure time; it has been built with CUDA 13 on Linux only.
+
+The kernel is Ampere code, and cuDNN has a Hopper engine. On an H100 NVL (sm_90 build, the
+same clip, `TS_H3_INT8_MATMUL=all`) the kernel is the slower of the two, so a build with
+it still runs cuDNN there unless `TS_H3_FLASH_ATTENTION=1`:
+
+| Attention, H100 NVL | Per block | Warm request |
+|---|---:|---:|
+| cuDNN SDPA | 114 ms | 76.7, 77.1 s |
+| FlashAttention-2 | 165 ms | 97.4, 97.4 s |
+
+MiniMax-H3-Image shows the same on that GPU: a 4096x4096 picture with int8 projections
+takes 13.7 s on cuDNN and 16.4 s on the kernel.
 
 That A100 runs at its 300 W power cap during a step, and the cap sets the multiply
 times: cuBLASLt's int8 fc1 takes 29.5 ms on constant operands at 1350 MHz and 35.6 ms on
@@ -1078,7 +1091,7 @@ but a track that is spectrally plausible and merely wrong.
 | `TS_H3_UPLOAD_WORKERS` | Native bulk-prefault workers (1–8, default 8); distinct from the pipeline's denoiser file-read streams |
 | `TS_H3_UPLOAD_PROFILE=1` | Native weight-upload and graph-compute diagnostics; record separately from trace-free performance runs |
 | `TS_H3_CUDNN_ATTENTION=0` | `ggml_cuda`: keeps every attention on ggml's flash-attention kernel instead of cuDNN's fused SDPA ([below](#long-clips-on-ggml_cuda)); `TS_H3_CUDNN_ATTENTION_VERBOSE=1` prints the cuDNN plans and declines |
-| `TS_H3_FLASH_ATTENTION=0` | `ggml_cuda`, builds with `-DTENSORSHARP_FLASH_ATTENTION=ON` only: keeps the DiT attention on cuDNN's SDPA instead of FlashAttention-2 |
+| `TS_H3_FLASH_ATTENTION` | `ggml_cuda`, builds with `-DTENSORSHARP_FLASH_ATTENTION=ON` only: `0` keeps the DiT attention on cuDNN's SDPA instead of FlashAttention-2, `1` uses FlashAttention-2 on a GPU newer than sm_8x too. Unset: FlashAttention-2 on sm_8x, cuDNN on newer GPUs |
 | `TS_H3_CUBLAS_MATMUL=0` | `ggml_cuda`: keeps the DiT's wide Q4_K projections on MMQ instead of cuBLAS BF16; `TS_H3_CUBLAS_MIN_ROWS` (default 1024) is the token threshold |
 | `TS_H3_FUSED=0` | `ggml_cuda`: builds the unfused DiT and VAE graphs (no fused attention prep, modulation, gated residual or merged LoRA) |
 | `TS_H3_CUDA_F32_PRODUCTS=1` | `ggml_cuda`: runs the DiT forward's weight products (F32/F16/BF16 weights and LoRA factors; quantized weights and the attention's own products excluded) on TensorSharp's F32 GEMM over a pedantic cuBLAS handle instead of ggml-cuda's TF32 cuBLAS. Off by default (its cost on a real checkpoint is not measured); on the all-F32 LoRA parity fixture the native-vs-direct-CPU floor went from 6.08e-4 to 8.07e-6. A product that cannot take the path is named once on stderr and runs on ggml |
