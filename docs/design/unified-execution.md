@@ -774,6 +774,12 @@ for quantized blocks, `IGraphExpertWeights` for stacked experts); the ops have g
 * **Qwen 3.5's recurrence** is one emission and one tensor state (`DeviceGdnState`) on every backend
   with an executor; the MLX-only recurrence is gone, and the per-op path runs the layer's mixer
   program. Under tensor parallelism the tensor backends trace each rank's heads (per-rank graphs, below).
+* **Direct CUDA decode copies:** a decode row's delta rule writes [row outputs | new state] straight into the slot's
+  backing (`InPlaceStateAlias`; the kernel's warps read their state rows before writing them back), and a copy of a
+  view with leading unit extents keeps the view instead of copying it contiguous first - the conv window's update had
+  run a pitched copy of 6144 rows of 3 floats per layer (124 us each, 32% of Qwen3.5-0.8B's decode GPU time). RTX 2000
+  Ada, Qwen3.5-0.8B Q8_0: decode 109 -> 141-156 tok/s (Qwen35Model 175-178; the GPU time per token is now below its,
+  the rest is launch overhead), 9B 18.8-20.1 -> 22.6-23.0 (Qwen35Model 22.6-22.7). Greedy text unchanged.
 * **Routed experts on direct CUDA:** `CudaGraphExecutor` serves `GraphFusion.RoutedExperts` (the
   renormalized routing) with the per-op path's kernels: decode and verify rows (up to 32) route and run
   their experts on the device through tables of the members' resident copies

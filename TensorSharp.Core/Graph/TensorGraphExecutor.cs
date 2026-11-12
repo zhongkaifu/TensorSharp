@@ -1594,6 +1594,12 @@ namespace TensorSharp.Graph
         {
             if (src.Sizes.SequenceEqual(like.Sizes)) return src;
             if (src.ElementCount() != like.ElementCount()) throw new NotSupportedException("a copy between different element counts");
+            // Leading unit extents only (a 4-D view of a 2-D box): the same strided elements, viewed without a copy. Made
+            // contiguous first, a conv window's update ran a pitched copy of 6144 rows of 3 floats per layer on CUDA.
+            int lead = 0;
+            while (src.DimensionCount - lead > like.DimensionCount && src.Sizes[lead] == 1) lead++;
+            if (lead > 0 && src.Sizes.Slice(lead).SequenceEqual(like.Sizes))
+                return run.Keep(new Tensor(src.Sizes.Slice(lead).ToArray(), src.Strides.Slice(lead).ToArray(), src.Storage, src.StorageOffset));
             return run.Keep(Contig(src, run).View(like.Sizes));
         }
 

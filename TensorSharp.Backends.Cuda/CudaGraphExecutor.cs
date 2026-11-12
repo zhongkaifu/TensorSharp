@@ -24,8 +24,47 @@ namespace TensorSharp.Cuda
 
         public CudaGraphExecutor(IAllocator allocator) : base(allocator) { }
 
+        /// <summary>The base executor's capabilities, and a decode row's recurrence updates its state in place (see
+        /// <see cref="GatedDeltaNet"/>).</summary>
+        public override GraphCapabilities Capabilities { get; } = new()
+        {
+            StridedViews = true, DecodeWindowRows = 1, Replays = false, IndexedCacheWrites = true, InPlaceStateAlias = true,
+        };
+
         /// <summary>CUDA's binary kernels take same-shaped contiguous operands: a broadcast operand is gathered.</summary>
         protected override bool BroadcastsInKernels => false;
+
+        /// <summary>
+        /// Many short strided rows (a conv window's update: each channel's last width-1 columns, 6144 rows of 3 floats on
+        /// Qwen3.5-0.8B) gather through the head-first kernel, a thread an element. The generic pitched copy runs a block a
+        /// row: 124 us a layer, a third of that model's decode GPU time.
+        /// </summary>
+        protected override void CopyInto(Tensor dst, Tensor src)
+        {
+            if (!TryGatherShortRows(dst, src)) base.CopyInto(dst, src);
+        }
+
+        private static bool TryGatherShortRows(Tensor dst, Tensor src)
+        {
+            if (src.DimensionCount != 2 || src.ElementType != DType.Float32 || dst.ElementType != DType.Float32
+                || !dst.IsContiguous() || dst.ElementCount() != src.ElementCount() || src.Strides[1] != 1
+                || src.Storage is not CudaStorage from || dst.Storage is not CudaStorage to || from.DeviceId != to.DeviceId)
+                return false;
+            long rows = src.Sizes[0], width = src.Sizes[1], pitch = src.Strides[0];
+            if (rows < 64 || width > 16 || pitch <= width || pitch > int.MaxValue)
+                return false;
+            long column = src.StorageOffset % pitch, start = src.StorageOffset - column;
+            if (column + width > pitch || start + rows * pitch > src.Storage.ElementCount)
+                return false;
+            using var cache = new Tensor(new[] { rows, pitch, 1L }, new[] { pitch, 1L, 1L }, src.Storage, start);
+            using Tensor result = dst.View(rows, width, 1);
+            return CudaFusedOps.TryGatherCircularHeadFirst(result, cache, (int)column, (int)width, (int)pitch);
+        }
+
+        /// <summary>The recurrence wrote its result into the leaf already (<see cref="GatedDeltaNet"/>): nothing to copy.</summary>
+        protected override bool TryAlias(Tensor result, Tensor leaf, long offsetBytes)
+            => ReferenceEquals(result.Storage, leaf.Storage)
+               && result.StorageOffset * result.ElementType.Size() == leaf.StorageOffset * leaf.ElementType.Size() + offsetBytes;
 
         /// <summary>A prompt chunk's or a decode row's K/V rows into the head-first cache (F32 or F16) with the
         /// per-op path's kernel.</summary>
@@ -256,9 +295,18 @@ namespace TensorSharp.Cuda
             if (kernels == null || Array.Exists(inputs, t => t.Storage is not CudaStorage || !t.IsContiguous() || t.ElementType != DType.Float32))
                 return base.GatedDeltaNet(q, k, v, g, beta, state, snapshots);
 
-            long total = (long)sequences * tokens * heads * s + (long)slots * sequences * heads * s * s;
-            var result = new Tensor(Allocator, DType.Float32, total);
+            long rowFloats = (long)sequences * tokens * heads * s;
+            long total = rowFloats + (long)slots * sequences * heads * s * s;
             var cuda = (CudaAllocator)Allocator;
+            // A decode row whose state is the tail of a [row outputs | state] buffer (a slot's backing): the result goes
+            // there, the new state over the old (each warp reads its state row before writing it back), and the alias
+            // that follows finds it in place - a 1 MB state copy per layer and token otherwise (Qwen3.5-0.8B: 32% of
+            // the decode GPU time).
+            bool inPlace = slots == 1 && tokens == 1 && sequences == 1 && state.Storage is CudaStorage held
+                && state.StorageOffset == rowFloats && held.ElementCount == total && held.DeviceId == cuda.DeviceId;
+            Tensor result = inPlace
+                ? new Tensor(new[] { total }, new[] { 1L }, state.Storage, 0)
+                : new Tensor(Allocator, DType.Float32, total);
             foreach (Tensor t in inputs) ((CudaStorage)t.Storage).EnsureDeviceCurrent();
             var output = (CudaStorage)result.Storage;
             output.EnsureDeviceCurrent();
