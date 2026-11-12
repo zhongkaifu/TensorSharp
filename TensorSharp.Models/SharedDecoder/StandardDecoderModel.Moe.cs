@@ -84,7 +84,9 @@ namespace TensorSharp.Models
         /// not uploaded a second time.</summary>
         protected override bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
         {
-            if (!base.ShouldPreloadCudaQuantWeightToDevice(weightName)) return false;
+            // A host-only table (Flash Next's 28.8 GB PLE table) stays in the mapping: preloaded, it took 28.8 GB of a 48 GB
+            // A40 and left the routed experts a 7.7 GB tier (legacy: 36.4 GB of experts resident).
+            if (IsHostOnlyWeight(weightName) || !base.ShouldPreloadCudaQuantWeightToDevice(weightName)) return false;
             if (!IsExpertMember(weightName)) return true;
             // Per-rank graphs run every member's shard on its rank; the per-op tensor-parallel path runs whole experts
             // from the host.

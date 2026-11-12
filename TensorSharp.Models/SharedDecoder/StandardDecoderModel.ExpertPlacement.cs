@@ -41,6 +41,16 @@ namespace TensorSharp.Models
 
         protected override bool CountsInLayerBalance(string tensorName) => !IsHostOnlyWeight(tensorName);
 
+        /// <summary>With host-served experts (offloaded or tiered layers) a 2048-token kernel warm-up routes to nearly every
+        /// expert of every layer and streams them all (Qwen4ExpModel's rule): Flash Next's runtime warmed 2048 tokens in 638 s
+        /// on an A40 with tiered experts. 64 rows stay on the tier path, whose graphs short prompts use.</summary>
+        protected override int GgmlPrefillChunkWarmupLength
+            => _expertOnHost != null && Array.IndexOf(_expertOnHost, true) >= 0 ? 64 : base.GgmlPrefillChunkWarmupLength;
+
+        /// <summary>A host-only table is read a few rows a token, on demand: warming every row at load read 28.8 GB
+        /// (Flash Next's PLE table) the page cache could not keep.</summary>
+        protected override bool ShouldPrefaultWeight(GgufTensorInfo info) => !IsHostOnlyWeight(info.Name);
+
         /// <summary>Decide <see cref="_expertOnHost"/> once the weights and caches exist, before the first forward.</summary>
         private void PlanExpertPlacement()
         {
@@ -84,8 +94,7 @@ namespace TensorSharp.Models
             for (int l = 0; l < n; l++)
                 layerBytes[l] = _moeLayer[l] ? LayerExpertBytes(l) : 0;
             // The caches and float weights were filled on the host; their first device bindings are still to come.
-            long pending = checked(CacheBytes() + _pendingDraftBytes);
-            foreach (var weight in _weights.Values) pending = checked(pending + weight.Storage.ByteLength);
+            long pending = checked(CacheBytes() + _pendingDraftBytes + DeviceBoundFloatBytes());
             long headroom = GpuMemoryBudget.ResolveHeadroomBytes(total), allExperts = 0;
             foreach (long b in layerBytes) allExperts += b;
             // Experts that fit beside everything else stay whole on the device: the plan's scratch reserve is Flash Next's
@@ -115,8 +124,7 @@ namespace TensorSharp.Models
         {
             var onHost = new bool[n];
             var details = new List<string>();
-            long floatBytes = 0;
-            foreach (var weight in _weights.Values) floatBytes += weight.Storage.ByteLength;
+            long floatBytes = DeviceBoundFloatBytes();
             try
             {
                 for (int s = 0; s < _mesh.Stages; s++)
@@ -294,6 +302,16 @@ namespace TensorSharp.Models
 
         /// <summary>Every weight the accelerator binds besides the trunk's routed experts (a draft layer's experts
         /// are resident).</summary>
+        /// <summary>The float weights whose first device bindings are still to come: every one but a host-only table (Flash
+        /// Next's PLE table, where a checkpoint stores it as floats: it is read from the host, never bound).</summary>
+        private long DeviceBoundFloatBytes()
+        {
+            long bytes = 0;
+            foreach (var kv in _weights)
+                if (!IsHostOnlyWeight(kv.Key)) bytes = checked(bytes + kv.Value.Storage.ByteLength);
+            return bytes;
+        }
+
         private long AcceleratorBoundNonExpertBytes()
         {
             long bytes = 0;
