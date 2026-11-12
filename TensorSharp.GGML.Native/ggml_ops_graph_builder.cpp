@@ -357,6 +357,11 @@ namespace
         // Per pause, nodes expanded after its route weights and before its ids: views that keep a fused router
         // chain's input and ids allocated (see build_host_experts). Null where not needed.
         std::vector<std::pair<ggml_tensor*, ggml_tensor*>> host_moe_holds;
+        // The rows every host-expert pause of a shape reads (moe_in) and writes (moe_out), by (hidden, rows): one pair a
+        // graph, bound in a buffer of its own (ephemeral) outside the allocator. Pauses run in order and each pause's
+        // pair is read before the next one writes it, so the layers share it; pinned as graph outputs per pause, the
+        // allocator kept every layer's pair to the end (3.3 GB for Qwen3.8-Flash-Next's 3.6K-token prompt).
+        std::map<std::pair<std::int64_t, std::int64_t>, std::pair<ggml_tensor*, ggml_tensor*>> seam_rows;
         std::vector<int> seg_end;
         // Tensor-parallel partials (OP_ALLREDUCE) in program order: each ends a segment of TSGgml_GraphRunRanked, after
         // which the ranks sum it in place. A graph run alone (one rank) reads them as they are.
@@ -465,7 +470,14 @@ namespace
         };
         tsg::HostMoeSegment hm;
         hm.layer = nip > 0 ? static_cast<int>(ip[0]) : 0;
-        hm.moe_in = boundary(ggml_reshape_2d(ctx, ggml_is_contiguous(x) ? x : ggml_cont(ctx, x), n, T));
+        auto& seam = g->seam_rows[{ n, T }];
+        if (seam.first == nullptr)
+        {
+            seam.first = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
+            seam.second = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
+        }
+        // The pause reads the FFN input from the shared rows (a copy ending this segment), not from a pinned output.
+        hm.moe_in = ggml_cpy(ctx, ggml_reshape_2d(ctx, ggml_is_contiguous(x) ? x : ggml_cont(ctx, x), n, T), seam.first);
         hm.weights = boundary(ggml_reshape_2d(ctx, ggml_is_contiguous(weights) ? weights : ggml_cont(ctx, weights), n_used, T));
         // A router written as llama.cpp's chain (softmax, argsort top-k, get_rows, renormalise, scale) is one kernel on
         // ggml-metal, which declines it when a chain node is a graph output or the allocator reused the logits'
@@ -493,9 +505,7 @@ namespace
                         keep_logits = ggml_view_1d(ctx, router->tensor, 1, 0);
                         keep_logits->src[1] = logits;
                     }
-        hm.moe_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
-        ggml_set_input(hm.moe_out);
-        ggml_set_output(hm.moe_out);
+        hm.moe_out = seam.second;
         void** data[3] = { &hm.gate_data, &hm.up_data, &hm.down_data };
         int* type[3] = { &hm.gate_type, &hm.up_type, &hm.down_type };
         std::int64_t* bytes[3] = { &hm.gate_bytes, &hm.up_bytes, &hm.down_bytes };
@@ -997,6 +1007,29 @@ namespace
             }
         }
         ggml_backend_dev_t dev = ggml_backend_get_device(graph_backend(g));
+        if (!g->seam_rows.empty() && g->seam_rows.begin()->second.first->buffer == nullptr)
+        {
+            // The host-expert pauses' shared rows: one buffer of the graph's own, so the allocator neither places nor
+            // frees them.
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(graph_backend(g));
+            const std::size_t align = ggml_backend_buft_get_alignment(buft);
+            std::size_t total = 0;
+            for (const auto& [shape, pair] : g->seam_rows)
+                for (ggml_tensor* t : { pair.first, pair.second })
+                    total += (ggml_backend_buft_get_alloc_size(buft, t) + align - 1) / align * align;
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, total);
+            if (buf == nullptr) throw std::runtime_error("graph builder: allocating the host-expert pause rows failed");
+            g->ephemeral.emplace_back(buf);
+            char* base = static_cast<char*>(ggml_backend_buffer_get_base(buf));
+            std::size_t offset = 0;
+            for (const auto& [shape, pair] : g->seam_rows)
+                for (ggml_tensor* t : { pair.first, pair.second })
+                {
+                    if (ggml_backend_tensor_alloc(buf, t, base + offset) != GGML_STATUS_SUCCESS)
+                        throw std::runtime_error("graph builder: binding the host-expert pause rows failed");
+                    offset += (ggml_backend_buft_get_alloc_size(buft, t) + align - 1) / align * align;
+                }
+        }
         for (Leaf& leaf : g->leaves)
         {
             leaf.uploaded = !leaf.host_only;

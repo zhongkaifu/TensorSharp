@@ -539,7 +539,7 @@ namespace TensorSharp.Models
             protected internal override void ReleaseSpecBuffers()
             {
                 base.ReleaseSpecBuffers();
-                PleConvHistory?.Dispose();
+                Free(PleConvHistory);
                 PleConvHistory = null;
             }
 
@@ -547,7 +547,7 @@ namespace TensorSharp.Models
             {
                 bool grown = base.EnsureSpecBuffers(rows);
                 if (!grown && PleConvHistory != null) return false;
-                PleConvHistory?.Dispose();
+                Free(PleConvHistory);
                 PleConvHistory = new Tensor(PleConv.Allocator, DType.Float32, Math.Max(1, _p.ConvHistory) + SnapshotCapacity, _p.StreamFloats);
                 return true;
             }
@@ -770,9 +770,9 @@ namespace TensorSharp.Models
             public override void Dispose()
             {
                 base.Dispose();
-                PleConv.Dispose();
-                PleTokens.Dispose();
-                PleConvHistory?.Dispose();
+                Free(PleConv);
+                Free(PleTokens);
+                Free(PleConvHistory);
             }
         }
 

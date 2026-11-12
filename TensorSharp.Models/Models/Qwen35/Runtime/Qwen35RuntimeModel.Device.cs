@@ -281,8 +281,8 @@ namespace TensorSharp.Models
             /// memory on the fourth request).</summary>
             protected internal override void ReleaseSpecBuffers()
             {
-                Verify?.Dispose();
-                ConvHistory?.Dispose();
+                Free(Verify);
+                Free(ConvHistory);
                 Verify = null;
                 ConvHistory = null;
                 SnapshotCapacity = 0;
@@ -298,8 +298,8 @@ namespace TensorSharp.Models
                 if (rows <= SnapshotCapacity) return false;
                 int capacity = 4;
                 while (capacity < rows) capacity *= 2;
-                Verify?.Dispose();
-                ConvHistory?.Dispose();
+                Free(Verify);
+                Free(ConvHistory);
                 Verify = new Tensor(_allocator, DType.Float32, capacity * (RowFloats + StateFloats));
                 ConvHistory = new Tensor(_allocator, DType.Float32, Channels, ConvRows + capacity);
                 SnapshotCapacity = capacity;
@@ -407,6 +407,16 @@ namespace TensorSharp.Models
                 GgmlBasicOps.InvalidateTensorHostBuffer(t);
             }
 
+            /// <summary>Dispose <paramref name="t"/> (null: nothing) with the device copies graphs made of its host bytes.
+            /// Keyed by host pointer, those copies outlived the tensor: Qwen3.8-Flash-Next on Metal kept ~0.9 GB of them
+            /// a request (5.4 GB after six), and an allocation reusing the address could have bound a stale one.</summary>
+            protected void Free(Tensor t)
+            {
+                if (t == null) return;
+                if (_host) Invalidate(t);
+                t.Dispose();
+            }
+
             public IntPtr ConvPointer => _hostPointer(Conv);
 
             /// <summary>Before GGML's per-rank native block binds the state view: whatever the graphs left
@@ -436,11 +446,11 @@ namespace TensorSharp.Models
 
             public override void Dispose()
             {
-                Conv.Dispose();
-                Ssm.Dispose();
-                Backing.Dispose();
-                Verify?.Dispose();
-                ConvHistory?.Dispose();
+                Free(Conv);
+                Free(Ssm);
+                Free(Backing);
+                Free(Verify);
+                Free(ConvHistory);
             }
         }
 
