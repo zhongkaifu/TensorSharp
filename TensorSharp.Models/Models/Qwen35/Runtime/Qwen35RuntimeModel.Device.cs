@@ -368,6 +368,10 @@ namespace TensorSharp.Models
 
             protected internal override bool CanCopy => true;
 
+            /// <summary>The conv window, the backing and its state view are all zeros after <see cref="Reset"/> (a subclass
+            /// binding more tensors in graphs revisits this).</summary>
+            protected internal override bool GraphTensorsResetToZero => true;
+
             protected internal override IEnumerable<Tensor> CheckpointTensors => new[] { Conv, Backing };
 
             /// <summary>Graphs bind the conv window and, per backend, the backing (in place) or the state view.</summary>

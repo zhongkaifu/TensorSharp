@@ -1864,6 +1864,18 @@ namespace TensorSharp.GGML
             ReadOnlySpan<long> srcOffsets, ReadOnlySpan<long> dstOffsets, ReadOnlySpan<long> lengths, bool zeroDestination)
             => GgmlNative.UploadToDeviceCopyRanges(srcHost, srcBytes, dstKey, dstBytes, srcOffsets, dstOffsets, lengths, zeroDestination);
         public static bool EnsureDeviceCopyFromHost(IntPtr key, long bytes) => GgmlNative.EnsureDeviceCopyFromHost(key, bytes);
+
+        /// <summary>
+        /// Give <paramref name="key"/> (<paramref name="bytes"/> host bytes) a device copy filled with zeros on the device,
+        /// nothing uploaded: for a tensor whose host bytes are zeros, or whose device copy is written whole before it is
+        /// read. A later binding finds it and uploads nothing. False (nothing changed) where the backend keeps no separate
+        /// device copies, runs several devices, or holds a copy of another size for the key.
+        /// </summary>
+        public static bool ZeroDeviceCopy(IntPtr key, long bytes)
+            => GgmlNative.UploadToDeviceCopyRanges(ZeroCopySource, 1, key, bytes, default, default, default, zeroDestination: true);
+
+        /// <summary>A source the zero-filling copy names but never reads (it copies no range).</summary>
+        private static readonly IntPtr ZeroCopySource = Marshal.AllocHGlobal(1);
         public static long CachedBufferBytes(IntPtr key) => GgmlNative.CachedBufferBytes(key);
         public static void SetAsyncCompute(bool enabled) => GgmlNative.SetAsyncCompute(enabled);
         public static bool GetAsyncCompute() => GgmlNative.GetAsyncCompute();

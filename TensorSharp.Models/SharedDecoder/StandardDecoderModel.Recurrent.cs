@@ -62,6 +62,9 @@ namespace TensorSharp.Models
             /// copies hold the state between steps: a copy on the device copies these. Null: the state copies on the
             /// host only.</summary>
             protected internal virtual Tensor[] GraphTensors => null;
+            /// <summary>A reset state's <see cref="GraphTensors"/> hold zeros only, so a fresh state's device copies may be
+            /// created zero-filled on the device instead of uploaded (<see cref="StandardDecoderModel.PrimeDeviceCopies"/>).</summary>
+            protected internal virtual bool GraphTensorsResetToZero => false;
             /// <summary>After <see cref="GraphTensors"/> were copied from <paramref name="source"/> on the device: copy
             /// what the state keeps on the host.</summary>
             protected internal virtual void AfterDeviceCopy(RecurrentState source) { }

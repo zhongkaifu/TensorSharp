@@ -153,6 +153,8 @@ namespace TensorSharp.Models
                 foreach (RecurrentState[] layer in source.Recurrent)
                     if (layer != null && (layer[0]?.GraphTensors == null))
                         return false;
+            // A fresh target's buffers are written by the copy before anything reads them: no upload of its host bytes.
+            if (!targetBound) PrimeDeviceCopies(target, overwritten: true);
 
             int rows = source.Length;
             for (int stage = 0; stage < _mesh.Stages; stage++)

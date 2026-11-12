@@ -180,7 +180,36 @@ namespace TensorSharp.Models
             int capacity = Math.Min(_maxContextLength, Math.Max(Math.Max(1, reserveTokens), Math.Min(FreshSlotTokens, Math.Max(1, _maxContextLength))));
             var slot = new Slot { Capacity = capacity, Recurrent = _anyRecurrent ? NewRecurrentStates() : null };
             (slot.K, slot.V) = AllocateCaches(capacity);
+            PrimeDeviceCopies(slot, overwritten: false);
             return slot;
+        }
+
+        /// <summary>
+        /// A fresh slot's graph-bound caches and states get their device copies zero-filled on the device, where the executor
+        /// keeps separate device copies (ggml_cuda, ggml_vulkan): the first graph binding them then uploads nothing. Their host
+        /// bytes are dead rows (past the slot's length) or a reset state's zeros; with <paramref name="overwritten"/>, a copy
+        /// on the device writes every bound byte before anything reads it. Those uploads were most of a request's setup:
+        /// Qwen3.5-9B on an RTX 2000 Ada uploaded 48-165 MB per graph at ~3 GB/s, twice a request (its slot, then its prefix
+        /// checkpoint's), 31-65 ms each. A state whose reset is not all zeros keeps the upload.
+        /// </summary>
+        private void PrimeDeviceCopies(Slot slot, bool overwritten)
+        {
+            if (!IsGgmlBackend || _mesh.Stages != 1 || _mesh.TensorParallel != 1
+                || GraphExecutor is not { Capabilities: { BindsHostPointers: true, SeparateDeviceCopies: true } })
+                return;
+            // Each by the bytes a graph binds it with (ggml's size of the leaf): a cache whole, a state's F32 view by its
+            // own elements (the state view of a backing is not the whole storage).
+            foreach (Tensor t in AllCacheTensors(slot.K)) Prime(t, t.Storage.ByteLength);
+            foreach (Tensor t in AllCacheTensors(slot.V)) Prime(t, t.Storage.ByteLength);
+            if (slot.Recurrent == null) return;
+            foreach (RecurrentState[] layer in slot.Recurrent)
+                if (layer != null)
+                    foreach (RecurrentState state in layer)
+                        if (state?.GraphTensors is { } tensors && (overwritten || state.GraphTensorsResetToZero))
+                            foreach (Tensor t in tensors) Prime(t, t.ElementCount() * sizeof(float));
+
+            static void Prime(Tensor t, long bytes)
+                => GgmlBasicOps.ZeroDeviceCopy(TensorComputePrimitives.GetStoragePointer(t), bytes);
         }
 
         /// <summary>The pooled slot that best holds <paramref name="tokens"/> (the smallest that does, else the largest;
