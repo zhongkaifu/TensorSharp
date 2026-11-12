@@ -165,11 +165,15 @@ namespace TensorSharp.Models
             float[][] outLogits, float[][] features)
         {
             bool dflash = HasDFlash;
+            int feat0 = SpecFeatureSize;
+            // One sequence: the graph returns only the rows its drafter needs (features[0] holds that many).
+            int tail = slots.Length == 1 && dflash && features[0] != null ? (int)Math.Min(counts[0], features[0].LongLength / feat0) : 0;
             var request = new GraphRequest
             {
                 LastRowLogits = true,
                 CaptureLayers = dflash ? DFlashSettings.TargetLayerIds : Array.Empty<int>(),
                 CaptureFinal = !dflash,
+                CaptureTail = tail,
             };
             if (!TryRunGraphStep(hidden, slots, first, counts, (int[])starts.Clone(), request, out GraphResult result))
                 return false;
@@ -187,11 +191,13 @@ namespace TensorSharp.Models
                 }
                 float[] rows = features[s];
                 if (rows == null) continue;
-                if (rows.LongLength < (long)counts[s] * feat)
-                    throw new ArgumentException($"{counts[s]} feature rows need {(long)counts[s] * feat} floats.", nameof(features));
-                for (int r = 0; r < counts[s]; r++)
+                // The sequence's last `wanted` rows (the rows the drafter's context needs).
+                int wanted = (int)Math.Min(counts[s], rows.LongLength / feat);
+                if (wanted < 1)
+                    throw new ArgumentException($"A prompt chunk's features need at least {feat} floats.", nameof(features));
+                for (int r = 0; r < wanted; r++)
                 {
-                    long row = first[s] + r;
+                    long row = tail > 0 ? r : first[s] + counts[s] - wanted + r;
                     if (dflash)
                         for (int c = 0; c < result.Captures.Length; c++)
                             Array.Copy(result.Captures[c], row * hiddenSize, rows, (long)r * feat + (long)c * hiddenSize, hiddenSize);

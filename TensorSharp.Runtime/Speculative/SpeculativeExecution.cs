@@ -249,6 +249,23 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         public bool PrefillsThroughContext => NeedsHidden && _speculator.ConditionsOnPrompt && !_speculator.HandlesOwnPrefill;
 
+        /// <summary>
+        /// How many trailing rows of a prompt chunk of <paramref name="count"/> tokens at <paramref name="startPos"/>
+        /// <see cref="CommitPrefill"/> needs the features of: the rows the drafter's context holds at the prompt's end
+        /// (<paramref name="promptEnd"/>), one before them (token k pairs with the row before it), and always the
+        /// chunk's last row (it carries into the next chunk). DFlash2's context is 2,080 rows: a 16K-token prompt's
+        /// earlier rows were captured and fed to it for nothing.
+        /// </summary>
+        public int PrefillFeatureRows(int startPos, int count, int promptEnd)
+        {
+            if (count <= 0) return 0;
+            if (!NeedsHidden || _speculator.HandlesOwnPrefill) return 1;
+            if (promptEnd <= 0 || _speculator.PrefillContextRows == int.MaxValue) return count;
+            long firstNeeded = (long)promptEnd - _speculator.PrefillContextRows - 1;
+            long skip = Math.Max(0, firstNeeded - startPos);
+            return (int)Math.Max(1, count - Math.Min(count, skip));
+        }
+
         // False until the trunk hidden state that drafting chains from has been
         // captured by a forward of this execution (see SeedCommitted).
         private bool _carryValid = true;
@@ -335,10 +352,12 @@ namespace TensorSharp.Runtime.Speculative
         }
 
         /// <summary>
-        /// <see cref="PrefillStep"/> for a prompt chunk another forward ran: <paramref name="rows"/> holds each of its
-        /// rows' drafter features (rows x <see cref="ISpeculativeTarget.SpecFeatureSize"/>), captured by a forward of
+        /// <see cref="PrefillStep"/> for a prompt chunk another forward ran: <paramref name="rows"/> holds the drafter
+        /// features of its last c rows (c x <see cref="ISpeculativeTarget.SpecFeatureSize"/>, c from
+        /// <see cref="PrefillFeatureRows"/>: every row, or those the drafter's context needs), captured by a forward of
         /// several requests' work (the unified step). The speculator's state then covers the chunk as if this
-        /// execution had forwarded it, and the last row's features carry into the next chunk or the first draft.
+        /// execution had forwarded it (older tokens without features), and the last row's features carry into the next
+        /// chunk or the first draft.
         /// </summary>
         public void CommitPrefill(int[] chunk, int startPos, float[] rows, int promptEnd = -1)
         {
@@ -350,13 +369,29 @@ namespace TensorSharp.Runtime.Speculative
                 _speculator.Commit(chunk, null, startPos);
                 return;
             }
-            if (rows == null || rows.LongLength < (long)n * _hidden)
-                throw new ArgumentException($"{n} prompt rows need {(long)n * _hidden} feature floats.", nameof(rows));
+            // The rows hold the chunk's last c rows' features (PrefillFeatureRows): all of them, or those the drafter's
+            // context needs and the one before them.
+            long c = rows == null ? 0 : Math.Min(n, rows.LongLength / _hidden);
+            if (c < 1)
+                throw new ArgumentException($"A prompt chunk needs at least its last row's {_hidden} feature floats.", nameof(rows));
             EnsureChunkBuffers(n);
-            Array.Copy(rows, (long)(n - 1) * _hidden, _lastRowH!, 0, _hidden);
+            Array.Copy(rows!, (c - 1) * _hidden, _lastRowH!, 0, _hidden);
             if (_speculator.HandlesOwnPrefill)
             {
                 // A drafter the trunk keeps in sync itself needs only the carry.
+            }
+            else if (c < n)
+            {
+                // Tokens 0 .. n-c are older than the drafter's context at the prompt's end (their preceding rows were
+                // not captured); the rest pair with the captured rows before them.
+                int head = (int)(n - c + 1);
+                _speculator.Commit(chunk[..head], null, startPos);
+                if (head < n)
+                {
+                    var tailRows = new float[(n - head) * (long)_hidden];
+                    Array.Copy(rows!, 0, tailRows, 0, tailRows.LongLength);
+                    _speculator.Commit(chunk[head..], tailRows, startPos + head);
+                }
             }
             else if (promptEnd > 0 && _speculator.PrefillContextRows < int.MaxValue
                 && (long)startPos + n <= (long)promptEnd - _speculator.PrefillContextRows)

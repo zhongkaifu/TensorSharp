@@ -197,6 +197,9 @@ namespace TensorSharp.Models
             public bool AllRowLogits { get; init; }
             /// <summary>Layers whose INPUT residual [hidden, rows] is returned (a drafter's features).</summary>
             public int[] CaptureLayers { get; init; } = Array.Empty<int>();
+            /// <summary>Capture only the step's last this-many rows (0: every row): a block drafter's context holds only
+            /// the rows nearest the prompt's end.</summary>
+            public int CaptureTail { get; init; }
             /// <summary>Return the final-normed rows [hidden, rows] (a per-token draft head's input).</summary>
             public bool CaptureFinal { get; init; }
             /// <summary>Keep the recurrent state after every row (a verify the accept count rewinds).</summary>
@@ -206,7 +209,7 @@ namespace TensorSharp.Models
 
             /// <summary>What the request changes in the emitted program (a streamed step's template key).</summary>
             public string Shape =>
-                $"{LastRowLogits}{AllRowLogits}{CaptureFinal}{PositionTable != null}:{string.Join(".", CaptureLayers)}";
+                $"{LastRowLogits}{AllRowLogits}{CaptureFinal}{PositionTable != null}:{string.Join(".", CaptureLayers)}:{CaptureTail}";
         }
 
         private sealed class GraphResult
@@ -710,7 +713,7 @@ namespace TensorSharp.Models
             {
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
                     if (request.CaptureLayers[c] == layer)
-                        outputs.Captures[c] = step.Output(EmitCaptureRow(step, h), (long)hiddenSize * rows);
+                        outputs.Captures[c] = EmitCaptureOutput(step, h, request);
                 h = EmitLayerPrologue(step, layer, h);
                 int normed = EmitBlockInput(step, layer, h, BlockSite.Mixer, out int mixContext);
                 int mix = _recurrentLayer[layer] ? EmitRecurrentMixer(step, layer, normed) : EmitAttention(step, layer, normed);
@@ -736,7 +739,7 @@ namespace TensorSharp.Models
             int n = step.Sequences, rows = step.Rows, hiddenSize = Config.HiddenSize, width = StreamWidth;
             for (int c = 0; c < request.CaptureLayers.Length; c++)
                 if (request.CaptureLayers[c] >= Config.NumLayers)
-                    outputs.Captures[c] = step.Output(EmitCaptureRow(step, h), (long)hiddenSize * rows);
+                    outputs.Captures[c] = EmitCaptureOutput(step, h, request);
             if (!request.LastRowLogits && !request.AllRowLogits && !request.CaptureFinal) return;
 
             int final = EmitStreamOutput(step, h);
@@ -799,7 +802,7 @@ namespace TensorSharp.Models
             {
                 for (int c = 0; c < request.CaptureLayers.Length; c++)
                     if (request.CaptureLayers[c] == layer)
-                        outputs.Captures[c] = lead.Output(EmitCaptureRow(lead, h[0]), (long)hiddenSize * rows);
+                        outputs.Captures[c] = EmitCaptureOutput(lead, h[0], request);
                 for (int r = 0; r < ranks; r++)
                 {
                     h[r] = EmitLayerPrologue(steps[r], layer, h[r]);
@@ -1191,6 +1194,18 @@ namespace TensorSharp.Models
 
         /// <summary>A DFlash drafter's tapped row [hidden, rows] of the stream entering a layer. Default: the stream.</summary>
         protected virtual int EmitCaptureRow(GraphStep step, int stream) => stream;
+
+        /// <summary>A captured layer input as an output: every row's, or the step's last
+        /// <see cref="GraphRequest.CaptureTail"/> rows' (copied out, so the rest is freed with the step).</summary>
+        private int EmitCaptureOutput(GraphStep step, int stream, GraphRequest request)
+        {
+            int rows = step.Rows, hiddenSize = Config.HiddenSize;
+            int x = EmitCaptureRow(step, stream);
+            int tail = request.CaptureTail > 0 && request.CaptureTail < rows ? request.CaptureTail : rows;
+            if (tail < rows)
+                x = step.Cont(step.View2(x, hiddenSize, tail, hiddenSize * 4L, (rows - tail) * (long)hiddenSize * 4));
+            return step.Output(x, (long)hiddenSize * tail);
+        }
 
         private readonly Dictionary<(int Layer, string Suffix), string> _layerNames = new();
 

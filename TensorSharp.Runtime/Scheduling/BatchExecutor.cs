@@ -2502,11 +2502,14 @@ namespace TensorSharp.Runtime.Scheduling
                 starts[i] = batch[i].Start;
             }
             var lastLogits = new float[batch.Count][];
-            // A prompt-conditioned drafter's chunks come back with their rows' features.
+            // A prompt-conditioned drafter's chunks come back with the features of the rows its context needs.
             float[][]? features = null;
             for (int i = 0; i < batch.Count; i++)
-                if (batch[i].Drafter != null)
-                    (features ??= new float[batch.Count][])[i] = new float[(long)tokens[i].Length * ((ISpeculativeTarget)_model).SpecFeatureSize];
+                if (batch[i].Drafter is { } drafter)
+                {
+                    int rows = drafter.Exec.PrefillFeatureRows(starts[i], tokens[i].Length, batch[i].Work.Sequence.PromptTokens.Count);
+                    (features ??= new float[batch.Count][])[i] = new float[(long)rows * ((ISpeculativeTarget)_model).SpecFeatureSize];
+                }
             try
             {
                 long started = Stopwatch.GetTimestamp();

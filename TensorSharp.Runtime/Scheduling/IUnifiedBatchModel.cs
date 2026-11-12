@@ -27,9 +27,9 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>One forward: request s's <paramref name="tokens"/>[s] at positions <paramref name="starts"/>[s]
         /// onward, every request's rows together; <paramref name="lastRowLogits"/>[s] its last row's logits. Declines
         /// (false, nothing written) when a request's slot does not continue at its start.
-        /// <paramref name="features"/>[s], when given for request s (a buffer of its rows x the drafter's feature
-        /// width), receives each of its rows' drafter features (a prompt-conditioned drafter's prefill); it is set to
-        /// null when this forward could not capture them.</summary>
+        /// <paramref name="features"/>[s], when given for request s (a buffer of c x the drafter's feature width, c no
+        /// more than its rows), receives the drafter features of its LAST c rows (a prompt-conditioned drafter's prefill
+        /// needs only the rows its context holds); it is set to null when this forward could not capture them.</summary>
         bool TryForwardUnified(IReadOnlyList<string> requestIds, IReadOnlyList<int[]> tokens, int[] starts, float[][] lastRowLogits,
             float[][]? features = null);
 
