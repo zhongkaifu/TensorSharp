@@ -26,7 +26,7 @@ namespace TensorSharp.Models
 
         /// <summary>The recurrence runs as program nodes over tensor-held states (every backend with a
         /// graph executor on one shard; GGML's per-rank native block under tensor parallelism).</summary>
-        private bool TensorRecurrence => DeviceRecurrence || (ShardDegree == 1 && GraphExecutor != null);
+        private bool TensorRecurrence => DeviceRecurrence || ((ShardDegree == 1 || RankGraphs) && GraphExecutor != null);
 
         protected override bool RecurrentMixerTakesRawInput => TensorRecurrence;
 

@@ -408,7 +408,7 @@ namespace TensorSharp.Models
 
         /// <summary>A layer's tensor state (a family adds what its layer keeps besides the recurrence).</summary>
         protected virtual DeviceGdnState CreateDeviceGdnState(RankScope scope, int layer, int convRows, int channels, int vHeads, int dv, int dk)
-            => new(scope.Allocator, GraphExecutor, HostPointer, convRows, channels, vHeads, dv, dk);
+            => new(scope.Allocator, ExecutorFor(scope.Allocator), HostPointer, convRows, channels, vHeads, dv, dk);
 
         /// <summary>The recurrence's output gate: sigmoid(z) (Qwen3.8-Flash-Next) instead of silu(z).</summary>
         protected virtual bool MixerSigmoidGate => false;

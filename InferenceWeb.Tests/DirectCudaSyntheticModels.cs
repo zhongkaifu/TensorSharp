@@ -140,6 +140,8 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
     public int TopK { get; init; } = 4;
     public int ExpertFf { get; init; } = 256;
     public int SharedFf { get; init; } = 256;
+    /// <summary>KV heads (default <see cref="NumKvHeads"/>); two let tensor parallelism split them.</summary>
+    public int KvHeads { get; init; } = NumKvHeads;
     /// <summary>When set, every projection and expert is written in this type (BF16: no
     /// activation quantization, so two implementations of the recipe can be compared tightly;
     /// the default IQ3_S / IQ4_XS / Q8_0 mix quantizes activations and so amplifies tiny
@@ -156,7 +158,7 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
             new U32 { Key = $"{a}.context_length", V = 4096 },
             new U32 { Key = $"{a}.embedding_length", V = Hidden },
             new U32 { Key = $"{a}.attention.head_count", V = NumHeads },
-            new U32 { Key = $"{a}.attention.head_count_kv", V = NumKvHeads },
+            new U32 { Key = $"{a}.attention.head_count_kv", V = (uint)KvHeads },
             new I32Arr { Key = $"{a}.rope.dimension_sections", V = new[] { 11, 11, 10, 0 } },
             new F32 { Key = $"{a}.rope.freq_base", V = 10000000f },
             new F32 { Key = $"{a}.attention.layer_norm_rms_epsilon", V = 1e-6f },
@@ -203,8 +205,8 @@ internal sealed class Qwen35MoeSyntheticModelBuilder
             else
             {
                 t.Add(Q8(p + "attn_q.weight", 0.06f, Hidden, 2 * NumHeads * HeadDim));   // Q and its gate
-                t.Add(Q8(p + "attn_k.weight", 0.06f, Hidden, NumKvHeads * HeadDim));
-                t.Add(Q8(p + "attn_v.weight", 0.06f, Hidden, NumKvHeads * HeadDim));
+                t.Add(Q8(p + "attn_k.weight", 0.06f, Hidden, KvHeads * HeadDim));
+                t.Add(Q8(p + "attn_v.weight", 0.06f, Hidden, KvHeads * HeadDim));
                 t.Add(GenAround(p + "attn_q_norm.weight", 1f, 0.1f, HeadDim));
                 t.Add(GenAround(p + "attn_k_norm.weight", 1f, 0.1f, HeadDim));
                 t.Add(Q8(p + "attn_output.weight", 0.04f, NumHeads * HeadDim, Hidden));

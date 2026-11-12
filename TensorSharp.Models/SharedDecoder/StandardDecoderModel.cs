@@ -838,9 +838,14 @@ namespace TensorSharp.Models
             });
         }
 
+        /// <summary>
+        /// Rank <paramref name="rank"/> of <paramref name="stage"/>. Its allocator is that device's,
+        /// not the current stage's: state built outside the stage (recurrent states made for every
+        /// layer at once) must land on the device whose layers use it.
+        /// </summary>
         private RankScope Scope(int stage, int rank)
             => new(stage, rank, _mesh.TensorParallel,
-                _mesh.TensorParallel == 1 ? _allocator : _mesh.Allocator(stage, rank),
+                _mesh.IsSingleDevice ? _allocator : _mesh.Allocator(stage, rank),
                 _localHeads, _localKvHeads);
 
         // ---------------------------------------------------------------- branch bodies

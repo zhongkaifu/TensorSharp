@@ -22,7 +22,10 @@ namespace TensorSharp.Models
     {
         protected override RotarySpec GraphRotary => _rotary;
 
-        protected override bool RecurrentMixerLowers => TensorRecurrence && ShardDegree == 1;
+        protected override bool RecurrentMixerLowers => TensorRecurrence && (ShardDegree == 1 || RankGraphs);
+
+        /// <summary>The mixer traces one rank's heads (its sharded projections, per-rank constants and states).</summary>
+        protected override bool RanksLower => true;
 
         /// <summary>Qwen 3.5's fused decode measured +8% decode with ggml-metal's reordering (A3B).</summary>
         protected override bool GraphConcurrencyReorder => true;
@@ -138,7 +141,8 @@ namespace TensorSharp.Models
         protected override int EmitRecurrentMixer(GraphStep step, int layer, int normed)
         {
             const long f = sizeof(float);
-            int kHeads = _numKHeads, vHeads = _numVHeads, dk = _headKDim, dv = _headVDim;
+            // A tensor-parallel rank traces its own heads (its shards of the projections, constants and state).
+            int kHeads = _numKHeads / step.Degree, vHeads = _numVHeads / step.Degree, dk = _headKDim, dv = _headVDim;
             long qk = (long)kHeads * dk, v = (long)vHeads * dv;
             long channels = 2 * qk + v, packed = channels + v + 2L * vHeads;
             int convRows = _convKernel - 1;
@@ -169,10 +173,10 @@ namespace TensorSharp.Models
             {
                 proj = step.MatMul(inProj, normed);                                          // [packed, rows]
             }
-            int dt = step.TensorWeight(_deviceDtBias[layer][0]);
-            int a = step.TensorWeight(_deviceA[layer][0]);
-            int convW = step.TensorWeight(_deviceConvW[layer][0], _convKernel, channels);
-            int ssmNorm = step.TensorWeight(_deviceSsmNorm[layer]);
+            int dt = step.TensorWeight(_deviceDtBias[layer][step.RankIndex]);
+            int a = step.TensorWeight(_deviceA[layer][step.RankIndex]);
+            int convW = step.TensorWeight(_deviceConvW[layer][step.RankIndex], _convKernel, channels);
+            int ssmNorm = step.TensorWeight(step.Replicated(_deviceSsmNorm[layer]));
             long nb1 = packed * f;
 
             int output = -1;

@@ -113,6 +113,13 @@ namespace TensorSharp.Cuda
                         enabled[j * n + i] = false;
                         CudaStorage.MarkPeerAccessFailed(
                             allocators[i].DeviceId, allocators[j].DeviceId);
+                        // The contexts are the devices' primary ones, which ggml's CUDA backend shares: left
+                        // enabled, its cross-device copies in this process kept using the broken mapping
+                        // (MuseSpark's ggml_cuda layer split went wrong once a group had enabled it).
+                        allocators[i].Context.MakeCurrent();
+                        CudaDriverApi.cuCtxDisablePeerAccess(allocators[j].Context.Handle);
+                        allocators[j].Context.MakeCurrent();
+                        CudaDriverApi.cuCtxDisablePeerAccess(allocators[i].Context.Handle);
                     }
                 }
             }
@@ -172,7 +179,7 @@ namespace TensorSharp.Cuda
                         return false;
                 }
 
-                return true;
+                return KernelReadsPeer(allocators, src, dst, srcBuf, dstBuf, testBytes / sizeof(float));
             }
             catch
             {
@@ -192,6 +199,39 @@ namespace TensorSharp.Cuda
                     CudaDriverApi.cuMemFree(dstBuf);
                 }
             }
+        }
+
+        /// <summary>
+        /// A kernel on <paramref name="dst"/> reading <paramref name="src"/>'s memory through the peer mapping
+        /// (SM loads, not the copy engine) sees what is there: <paramref name="dstBuf"/> + <paramref name="srcBuf"/>
+        /// into <paramref name="dstBuf"/>, which holds a copy of <paramref name="srcBuf"/>, must double every value.
+        /// A virtualized PCIe switch can grant peer access while dropping peer traffic: on a 2x A40 VM (PXB) these
+        /// loads read NaN every time and peer copies lost whole buffers in a third of runs (fresh buffers, first use),
+        /// which the copy test above passes. True without the kernels (nothing to run).
+        /// </summary>
+        private static unsafe bool KernelReadsPeer(CudaAllocator[] allocators, int src, int dst, IntPtr srcBuf, IntPtr dstBuf, int floats)
+        {
+            CudaKernels kernels = allocators[dst].Kernels;
+            if (kernels == null)
+                return true;
+            var values = new float[floats];
+            for (int k = 0; k < floats; k++)
+                values[k] = (k % 251) * 0.25f + src + 1;
+            allocators[src].Context.MakeCurrent();
+            fixed (float* v = values)
+                CudaDriverApi.cuMemcpyHtoD(srcBuf, (IntPtr)v, new UIntPtr((ulong)floats * sizeof(float))).ThrowOnError();
+            allocators[dst].Context.MakeCurrent();
+            fixed (float* v = values)
+                CudaDriverApi.cuMemcpyHtoD(dstBuf, (IntPtr)v, new UIntPtr((ulong)floats * sizeof(float))).ThrowOnError();
+            kernels.LaunchBinaryF32(dstBuf, srcBuf, dstBuf, floats, 0, allocators[dst].Stream.Handle);   // op 0: add
+            allocators[dst].Stream.Synchronize();
+            var readback = new float[floats];
+            fixed (float* r = readback)
+                CudaDriverApi.cuMemcpyDtoH((IntPtr)r, dstBuf, new UIntPtr((ulong)floats * sizeof(float))).ThrowOnError();
+            for (int k = 0; k < floats; k++)
+                if (readback[k] != 2 * values[k])
+                    return false;
+            return true;
         }
 
         /// <summary>

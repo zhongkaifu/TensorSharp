@@ -86,7 +86,9 @@ namespace TensorSharp.Models
         {
             if (!base.ShouldPreloadCudaQuantWeightToDevice(weightName)) return false;
             if (!IsExpertMember(weightName)) return true;
-            return _mesh != null && _mesh.TensorParallel == 1 && !IsGgmlBackend;
+            // Per-rank graphs run every member's shard on its rank; the per-op tensor-parallel path runs whole experts
+            // from the host.
+            return _mesh != null && (_mesh.TensorParallel == 1 || _rankGraphs) && !IsGgmlBackend;
         }
 
         protected override bool ShouldPreloadMlxQuantWeightToDevice(string weightName, QuantizedWeight weight)

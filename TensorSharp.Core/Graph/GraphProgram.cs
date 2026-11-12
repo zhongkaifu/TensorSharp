@@ -43,6 +43,22 @@ namespace TensorSharp.Graph
         /// [n_extra, rows] (I32). Result [n_kv, rows]: the mask's value at a kept cell, -inf elsewhere; cells out of
         /// range are skipped.</summary>
         TopKMask = 56,
+        /// <summary>This rank's partial [n, rows] summed over its tensor-parallel group (every rank gets the total): srcs the
+        /// partial, which no other node reads. The ranks' programs run in lockstep (see <see cref="IGraphCollective"/>), so
+        /// every rank reaches its reduce before any rank reads the total.</summary>
+        AllReduce = 57,
+    }
+
+    /// <summary>
+    /// A tensor-parallel group's sum for executors whose ranks' programs are traced in lockstep on one thread: each
+    /// rank's <see cref="GraphOp.AllReduce"/> hands its partial in, and the last rank's arrival sums them in place (the
+    /// group's collective), before the trace emits any rank's next node.
+    /// </summary>
+    public interface IGraphCollective
+    {
+        int Degree { get; }
+        /// <summary>Rank <paramref name="rank"/>'s partial (a reference the collective releases once it summed).</summary>
+        void Contribute(int rank, Tensor partial);
     }
 
     /// <summary>How a leaf's bytes are bound.</summary>

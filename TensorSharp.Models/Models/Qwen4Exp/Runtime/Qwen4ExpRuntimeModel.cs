@@ -149,6 +149,9 @@ namespace TensorSharp.Models
 
         protected override int StreamWidth => checked((int)Ple.StreamFloats);
 
+        /// <summary>Hyper-connections, the PLE and QSA's indexer keys are not traced per rank yet: --tp keeps the per-op path.</summary>
+        protected override bool RanksLower => false;
+
         // ---------------------------------------------------------------- the MTP head
 
         /// <summary>The shared-target MTP head (<c>--draft-model mtp-*.gguf</c>): one NextN block after the trunk.</summary>
@@ -225,7 +228,7 @@ namespace TensorSharp.Models
 
         protected override DeviceGdnState CreateDeviceGdnState(RankScope scope, int layer, int convRows, int channels, int vHeads, int dv, int dk)
             => Ple.IsPle[layer]
-                ? new PleGdnState(scope.Allocator, GraphExecutor, HostPointer, convRows, channels, vHeads, dv, dk, Ple)
+                ? new PleGdnState(scope.Allocator, ExecutorFor(scope.Allocator), HostPointer, convRows, channels, vHeads, dv, dk, Ple)
                 : base.CreateDeviceGdnState(scope, layer, convRows, channels, vHeads, dv, dk);
 
         /// <summary>The embedding's hc copies, stream c at elements [c·n, (c+1)·n) of a row.</summary>

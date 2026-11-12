@@ -30,6 +30,21 @@ namespace TensorSharp.Graph
 
         public IAllocator Allocator { get; }
 
+        /// <summary>The tensor-parallel group this executor's device belongs to, for <see cref="GraphOp.AllReduce"/>
+        /// (null: a program with a reduce is rejected).</summary>
+        public IGraphCollective Collective { get; private set; }
+
+        /// <summary>This executor's rank in <see cref="Collective"/>.</summary>
+        public int CollectiveRank { get; private set; }
+
+        /// <summary>Make this executor rank <paramref name="rank"/> of <paramref name="collective"/>.</summary>
+        public void JoinCollective(IGraphCollective collective, int rank)
+        {
+            if (collective != null && (rank < 0 || rank >= collective.Degree)) throw new ArgumentOutOfRangeException(nameof(rank));
+            Collective = collective;
+            CollectiveRank = rank;
+        }
+
         /// <summary>Views are tensor views here (any strides), and a program is cheap to compile, so
         /// decode windows are exact (no padded rows to attend over).</summary>
         /// <summary>Exact decode windows; prompt chunks are written into the cache by row index and attend
@@ -61,7 +76,7 @@ namespace TensorSharp.Graph
             GraphOp.View, GraphOp.Permute, GraphOp.Transpose, GraphOp.Cont, GraphOp.Cast, GraphOp.Cpy, GraphOp.SetRows,
             GraphOp.RopeExt, GraphOp.RopeMulti, GraphOp.FlashAttnExt, GraphOp.SoftMaxExt, GraphOp.TopK, GraphOp.SumRows,
             GraphOp.SsmConv, GraphOp.GatedDeltaNet, GraphOp.Concat, GraphOp.KvWindow, GraphOp.Sqr, GraphOp.Sqrt, GraphOp.Clamp,
-            GraphOp.LightningIndexer, GraphOp.TopKMask,
+            GraphOp.LightningIndexer, GraphOp.TopKMask, GraphOp.AllReduce,
         };
 
         public IGraphPlan Compile(GraphProgram program)
@@ -378,6 +393,7 @@ namespace TensorSharp.Graph
         private sealed class Session
         {
             private const byte None = 0, Pending = 1, Deferred = 2, Done = 3, Lazy = 4;   // Lazy: inside a fused region
+            private const byte Skipped = 5;   // a fused region's op its results did not need: it never runs
             private const int Released = int.MinValue / 2;   // a released node's count (later reads never reach 0)
 
             private readonly TensorGraphExecutor _x;
@@ -410,6 +426,7 @@ namespace TensorSharp.Graph
             }
 
             private GraphNode _region;   // the open fused region this executor has a kernel for (Kind Fused), else default
+            private readonly List<int> _regionOps = new();   // the ops the open region deferred, in order
             private int _nested;         // regions opened inside it (part of it: their ends do not close it)
             private bool InRegion => _region.Kind == GraphNodeKind.Fused;
 
@@ -431,6 +448,7 @@ namespace TensorSharp.Graph
                         if (e.Kind == GraphNodeKind.Op && InRegion)
                         {
                             _state[node] = Lazy;
+                            _regionOps.Add(node);
                             break;
                         }
                         if (e.Kind == GraphNodeKind.Leaf)
@@ -473,9 +491,27 @@ namespace TensorSharp.Graph
                             GraphNode region = _region, end = e;
                             _region = default;
                             Attribute(() => RunFused(region, end.Srcs));
+                            SkipUnrun();
                         }
                         break;
                 }
+            }
+
+            /// <summary>
+            /// The closed region's ops that did not run (its kernel computed the results, or the results did not need
+            /// them) never will: their reads are spent, so their sources are released after their other readers (else a
+            /// region's inputs - a prompt chunk's in-projections - stayed alive to the end of the step).
+            /// </summary>
+            private void SkipUnrun()
+            {
+                for (int i = _regionOps.Count - 1; i >= 0; i--)
+                {
+                    int op = _regionOps[i];
+                    if (_state[op] != Lazy) continue;
+                    _state[op] = Skipped;
+                    Consumed(op);
+                }
+                _regionOps.Clear();
             }
 
             /// <summary>The region's results from its kernel, else from its ops.</summary>
@@ -550,6 +586,7 @@ namespace TensorSharp.Graph
                 Array.Clear(_fresh, 0, _count);
                 Array.Clear(_own, 0, _count);
                 Array.Clear(_uses, 0, _count);
+                _regionOps.Clear();
                 _x._buffers = new Buffers { Nodes = _nodes, Values = _values, State = _state, Fresh = _fresh, Own = _own, Uses = _uses };
                 _count = 0;
             }
@@ -662,6 +699,7 @@ namespace TensorSharp.Graph
                     case Done: return;
                     case Pending: throw new InvalidOperationException($"input node {node} was not given a value");
                     case None: throw new InvalidOperationException($"node {node} was not evaluated");
+                    case Skipped: throw new InvalidOperationException($"node {node} is inside a fused region its kernel served: only the region's results are read after it");
                 }
                 GraphNode n = _nodes[node];
                 Tensor result = n.Op == GraphOp.Add
@@ -1217,6 +1255,18 @@ namespace TensorSharp.Graph
                     return V(Rope(T(0), values[n.Srcs[1]], n, n.Op == GraphOp.RopeMulti, run, n.Srcs[1]));
                 }
                 case GraphOp.LightningIndexer: return V(LightningIndexer(T(0), T(1), T(2), T(3), run));
+                case GraphOp.AllReduce:
+                {
+                    if (Collective == null) throw new NotSupportedException("an all-reduce outside a tensor-parallel group");
+                    // The reduce sums in place: the result is the partial's storage (its own reference, so the
+                    // session releases the two independently); the collective sums once every rank handed its in.
+                    Tensor partial = Contig(T(0), run);
+                    // Collectives move whole storages: a partial viewing part of one gets its own.
+                    if (partial.StorageOffset != 0 || partial.Storage.ElementCount != partial.ElementCount())
+                        partial = run.Keep(Ops.NewContiguous(partial));
+                    Collective.Contribute(CollectiveRank, partial.CopyRef());
+                    return V(partial.CopyRef());
+                }
                 case GraphOp.TopKMask:
                 {
                     int at = 2;

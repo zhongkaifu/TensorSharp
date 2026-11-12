@@ -55,7 +55,8 @@ namespace TensorSharp.Models
                 throw new ArgumentException($"{rows} draft rows need {(long)rows * hiddenSize} hidden floats.", nameof(hRows));
             SettlePendingVerify();
             EnsureCacheCapacity(checked(startPos + rows));
-            if (GraphUnsupportedReason() != null)
+            // Per-rank graphs do not trace the (unsharded) draft layer: it keeps the per-op path, as under --tp before.
+            if (GraphUnsupportedReason() != null || _rankGraphs)
             {
                 RunDraftLayerPerOp(tokens, hRows, startPos, logitsOut, hOut);
                 return;

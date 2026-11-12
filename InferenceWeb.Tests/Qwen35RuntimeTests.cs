@@ -44,6 +44,8 @@ public sealed class Qwen35RuntimeTests : IDisposable
         // unpacked, the per-op block packs them on first use.
         // Three value heads per key head, as the 27B (value head h reads key head h mod group_count).
         "dense-gqa" => new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true, SsmVHeads = 6 }.Write(Path.Combine(_dir, "q35-dense-gqa.gguf")),
+        // The 0.8B's layout: the head reads the token embedding.
+        "dense-tied" => new Qwen35DenseSyntheticModelBuilder { Layers = 8 }.Write(Path.Combine(_dir, "q35-dense-tied.gguf")),
         "dense-nextn" => new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true, NextN = true }.Write(Path.Combine(_dir, "q35-dense-nextn.gguf")),
         "dense-mixed" => new Qwen35DenseSyntheticModelBuilder { Layers = 8, UntiedOutput = true, GateProjectionType = SyntheticGguf.GgmlType.F32 }
             .Write(Path.Combine(_dir, "q35-dense-mixed.gguf")),
@@ -52,6 +54,9 @@ public sealed class Qwen35RuntimeTests : IDisposable
         // The quantized mix (IQ3_S / IQ4_XS experts, Q8_0 projections) quantizes activations, so
         // a rounding flip upstream moves outputs by ~1e-2 in either implementation.
         "moe-quantized" => new Qwen35MoeSyntheticModelBuilder { Layers = 8 }.Write(Path.Combine(_dir, "q35-moe-q.gguf")),
+        // Two KV heads, so tensor parallelism can split the attention layers.
+        "moe-tp" => new Qwen35MoeSyntheticModelBuilder { Layers = 8, UniformWeightType = SyntheticGguf.GgmlType.BF16, KvHeads = 2 }
+            .Write(Path.Combine(_dir, "q35-moe-tp.gguf")),
         _ => throw new ArgumentOutOfRangeException(nameof(variant)),
     };
 
@@ -246,17 +251,105 @@ public sealed class Qwen35RuntimeTests : IDisposable
 
     [Theory]
     [MemberData(nameof(Placements))]
-    public void PlacementMatchesOneDevice(int tp, int stages)
+    public void PlacementMatchesOneDevice(int tp, int stages) => AssertPlacementMatchesOneDevice("dense", tp, stages);
+
+    /// <summary>Routed experts under tensor parallelism: each rank's graph runs its slice of every expert (sharded by
+    /// width like a dense feed-forward) and the partials meet in the all-reduce.</summary>
+    [Fact]
+    public void RoutedExpertsUnderTensorParallelismMatchOneDevice() => AssertPlacementMatchesOneDevice("moe-tp", 2, 1);
+
+    /// <summary>Per-rank graphs on direct CUDA, two ranks on one GPU (each its own allocator and stream): one KV head
+    /// per rank (the dense fixture's two), and routed experts sharded by width.</summary>
+    [CudaTheory]
+    [InlineData("dense", KvCacheDtype.F32)]
+    [InlineData("dense", KvCacheDtype.F16)]
+    [InlineData("dense-tied", KvCacheDtype.F16)]
+    [InlineData("moe-tp", KvCacheDtype.F32)]
+    public void DirectCudaRankGraphsMatchOneDevice(string variant, KvCacheDtype kv)
+    {
+        KvCacheDtypeConfig.RestoreForTests(kv, true);
+        string path = Fixture(variant);
+        List<float[]> reference;
+        using (var single = Create(path, backend: BackendType.Cuda))
+            reference = Script(single);
+        var group = new OneGpuCudaGroup(2);
+        using var placed = new Qwen35RuntimeModel(path, BackendType.Cuda, 2, group, 1);
+        List<float[]> actual = Script(placed);
+        Assert.True(group.AllReduceCount > 0 && placed.GraphRuns > 0, $"{variant}: no per-rank graph ran");
+        for (int i = 0; i < reference.Count; i++)
+        {
+            double rel = RelL2(actual[i], reference[i]);
+            // BF16 experts run on BF16-rounded activations here (the tensor-core products), as on the
+            // activation-rounding backends: 8.2e-3 measured on an A40, within 5e-3 on an RTX 2000 Ada.
+            Assert.True(rel <= (variant == "moe-tp" ? 2.5e-2 : 5e-3), $"{variant} {kv} row {i}: relL2 {rel:E2}");
+        }
+    }
+
+    /// <summary>Two tensor-parallel ranks on CUDA device 0, each with its own allocator and stream; the all-reduce sums
+    /// through the host.</summary>
+    private sealed class OneGpuCudaGroup : ITensorParallelGroup
+    {
+        private readonly TensorSharp.Cuda.CudaAllocator[] _allocators;
+
+        public OneGpuCudaGroup(int degree) =>
+            _allocators = Enumerable.Range(0, degree).Select(_ => new TensorSharp.Cuda.CudaAllocator(0)).ToArray();
+
+        public int Degree => _allocators.Length;
+        public bool IsActive => Degree > 1;
+        public int GlobalDegree => Degree;
+        public int GlobalRankOffset => 0;
+        public int NodeCount => 1;
+        public int AllReduceCount { get; private set; }
+        public IAllocator GetAllocator(int rank) => _allocators[rank];
+
+        public void AllReduce(Tensor[] tensors)
+        {
+            AllReduceCount++;
+            foreach (var allocator in _allocators) allocator.Synchronize();
+            int n = (int)tensors[0].Storage.ElementCount;
+            float[] sum = tensors[0].GetElementsAsFloat(n);
+            for (int r = 1; r < tensors.Length; r++)
+            {
+                float[] part = tensors[r].GetElementsAsFloat(n);
+                for (int i = 0; i < n; i++) sum[i] += part[i];
+            }
+            foreach (var tensor in tensors)
+            {
+                tensor.SetElementsAsFloat(sum);
+                tensor.EnsureDeviceCurrent();
+            }
+            foreach (var allocator in _allocators) allocator.Synchronize();
+        }
+
+        public void Synchronize()
+        {
+            foreach (var allocator in _allocators) allocator.Synchronize();
+        }
+
+        public void Barrier() { }
+        public void BroadcastControl(int op, int[] payload) => throw new NotSupportedException();
+        public (int op, int[] payload) ReceiveControl() => throw new NotSupportedException();
+
+        public void Dispose()
+        {
+            foreach (var allocator in _allocators) allocator.Dispose();
+        }
+    }
+
+    private void AssertPlacementMatchesOneDevice(string variant, int tp, int stages)
     {
         KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
-        string path = Fixture("dense");
+        string path = Fixture(variant);
         List<float[]> reference;
         using (var single = Create(path))
             reference = Script(single);
-        using var placed = Create(path, tp, stages);
+        var group = tp > 1 ? new SimulatedDeviceGroup(tp * stages) : null;
+        using var placed = new Qwen35RuntimeModel(path, BackendType.Cpu, tp, group, stages);
         Assert.Equal(tp, placed.Mesh.TensorParallel);
         Assert.Equal(stages, placed.Mesh.Stages);
         List<float[]> actual = Script(placed);
+        // One stage of tensor parallelism runs per-rank graphs: their partials meet in the graphs' all-reduces.
+        if (tp > 1 && stages == 1) Assert.True(group.AllReduceCount > 0 && placed.GraphRuns > 0, $"{variant} tp={tp}: no per-rank graph ran");
         double tolerance = tp == 1 ? 0 : 1e-4;
         for (int i = 0; i < reference.Count; i++)
         {
@@ -316,6 +409,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData("dense", 1, 1)]
     [InlineData("moe", 1, 1)]
     [InlineData("dense", 2, 1)]
+    [InlineData("moe-tp", 2, 1)]
     [InlineData("dense", 1, 2)]
     [InlineData("moe", 1, 2)]
     [InlineData("dense", 2, 2)]

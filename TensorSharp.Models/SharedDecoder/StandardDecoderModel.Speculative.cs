@@ -86,6 +86,8 @@ namespace TensorSharp.Models
             get
             {
                 if (FamilySpeculationRefusal is { } family) return family;
+                // The draft layer is not sharded, and per-rank graphs do not trace it.
+                if (_rankGraphs) return "speculative decoding does not run on per-rank tensor-parallel graphs";
                 if (GraphUnsupportedReason() is not { } reason) return null;
                 if (!_mesh.IsSingleDevice || LayerSplitGroup != null)
                     return $"speculative decoding off whole-forward graphs ({reason}) runs on one device";
@@ -331,7 +333,7 @@ namespace TensorSharp.Models
 
         private void WarmVerifyWidths()
         {
-            if (!HasDFlash || GraphUnsupportedReason() != null) return;
+            if (!HasDFlash || GraphUnsupportedReason() != null || SpeculationRefusal != null) return;
             int widest = Math.Min(SmallChunkRows, Math.Max(2, Math.Max(SpecPreferredDraftWindow, 1) + 1));
             int safeToken = Config.VocabSize > 1 ? 1 : 0;
             var started = System.Diagnostics.Stopwatch.StartNew();

@@ -752,16 +752,69 @@ for quantized blocks, `IGraphExpertWeights` for stacked experts); the ops have g
     delta kernels (T=1, blocked prompt, per-row snapshots), depthwise `conv1d`, `logaddexp`,
     `AddRmsNorm`, the plan on MLX's worker thread (no hop per op). `CudaGraphExecutor`: the backend's
     quantized products and the per-op path's cache kernels (head-first cache writes, GQA decode
-    attention, KV expansion with half-operand prompt GEMMs), broadcast operands gathered (CUDA's binary
-    kernels take same-shaped operands), and `tensorsharp_graph_kernels.cu` (ggml-semantics gated delta
-    rule, softplus, ssm_conv).
+    attention, KV expansion with half-operand prompt GEMMs; a single KV head's cache binds without its
+    head extent and is viewed with it again), broadcast operands gathered (CUDA's binary kernels take
+    same-shaped operands), `tensorsharp_graph_kernels.cu` (ggml-semantics gated delta rule, softplus,
+    ssm_conv), and routed experts with the per-op path's MoE kernels (below).
 * **Memory:** a node's tensors are released after its last reader (counted from the recorded program;
   a streamed step checks it is the template node by node). Holding a step's intermediates to its end
   overflowed the CUDA allocator's cache (driver frees synchronise) and held gigabytes on a prompt chunk:
-  CUDA Hy-MT2 prefill went from -32% to -5% of the per-op path with it, MLX prefill +4%.
+  CUDA Hy-MT2 prefill went from -32% to -5% of the per-op path with it, MLX prefill +4%. The ops of a
+  fused region that never run (its kernel computed the results, or the results did not need them) spend
+  their reads when the region closes; before that, a region's inputs lived to the step's end - Qwen3.5-9B
+  Q8_0 on direct CUDA held ~180 MB per Gated DeltaNet layer of a 1.8K-row prompt chunk (the packed
+  in-projection's product and its blocks) and ran out of memory on a 16 GB RTX 2000 Ada; it now stays at
+  12.3 GB through the chunk.
+* **One executor per allocator:** an executor that binds tensors by object allocates its per-run tensors
+  on its allocator's device, so the runtime keeps one per allocator (`ExecutorFor`): each stage of a
+  layer split and each rank of tensor parallelism runs on its own, and a stage's states bind through the
+  executor of the device they live on. A layer split on direct CUDA had faulted (illegal address) because
+  the rank scope handed recurrent states built for all layers at once the current stage's allocator;
+  `CudaGraphExecutor` now names an operand on another device before launching instead.
 * **Qwen 3.5's recurrence** is one emission and one tensor state (`DeviceGdnState`) on every backend
   with an executor; the MLX-only recurrence is gone, and the per-op path runs the layer's mixer
-  program. The managed recurrence remains for tensor parallelism on the tensor backends.
+  program. Under tensor parallelism the tensor backends trace each rank's heads (per-rank graphs, below).
+* **Routed experts on direct CUDA:** `CudaGraphExecutor` serves `GraphFusion.RoutedExperts` (the
+  renormalized routing) with the per-op path's kernels: decode and verify rows (up to 32) route and run
+  their experts on the device through tables of the members' resident copies
+  (`TryMoEExpertFFN{Decode,Prefill}SwiGLU`), with no host read; a prompt chunk routes on the host and runs
+  each selected expert once over its rows (`TryMoEScatterAddWeightedRows`). Before it, the region's ops
+  ran with `sum` on the host. Qwen3.6-35B-A3B UD-Q4_K_M, one A40: decode 18.2 -> 43.5 tok/s (short
+  prompt) and 18.7 -> 36.7 (1.8K), the 1.8K prefill 24.7 -> 3.9 s; Qwen35Model's fused path is 66 / 62
+  tok/s and 1.8 s. The greedy text equals the ggml_cuda runtime's.
+
+#### Tensor parallelism as per-rank graphs
+
+On the tensor executors (direct CUDA; the managed executor of a simulated group) `--tp T` runs each
+step as T programs, one per rank on its own executor: the rank's heads, its shards of the projections
+(and of every routed expert, split by width like a dense feed-forward), its caches and recurrent state.
+The runtime emits the ranks block by block on one thread (`EmitRankedStep`) into their executors'
+streams, so each rank's ops run as they are emitted and the devices work at once. A block's partial
+(attention or mixer output, feed-forward) goes through `GraphOp.AllReduce`: each rank hands it to its
+group's `IGraphCollective`, and the last rank's arrival runs the group's all-reduce in place - the block
+order guarantees every rank reached it before any rank reads the total. A kind's first step records the
+ranks' programs (nothing runs) so their streams release tensors by the readers. Rank 0 runs the head.
+Replicated weights are resident on every rank's allocator, rank 0's included: the CUDA quantized cache
+is keyed by allocator, and the model's own allocator of a GPU is another one with its own stream
+(Qwen3.6-35B-A3B decode went from 19.9 to 29.9 tok/s with rank 0 on its own copies). Speculation is
+refused here for now (the draft layer is not sharded). GGML keeps its per-op path or ggml's meta device.
+
+The local group's peer-to-peer self-test now also runs a kernel that reads the other GPU's memory through
+the peer mapping. On the 2x A40 VM (PXB, a virtualized PCIe switch) the driver grants peer access, the
+copy-engine round trip passes, yet kernel loads read NaN every time and peer copies lost whole buffers in
+about a third of runs (fresh buffers on first use) - Qwen3.5-0.8B `--tp 2` printed garbage on both the
+runtime and Qwen35Model. Such a pair is demoted to host-staged transfers (as `TENSORSHARP_TP_DISABLE_P2P`
+does by hand), which measured correct and no slower there (0.8B: 26-33 tok/s), and its peer access is
+turned off again: the contexts are the devices' primary ones, shared with ggml's CUDA backend, whose
+cross-device copies in the same process otherwise kept using the broken mapping (MuseSpark's ggml_cuda
+layer split failed after a group had enabled it).
+
+Direct CUDA, 2x A40 (PCIe), host-fenced all-reduce, nothing loads GGML: Qwen3.5-9B Q8_0 decode 30-35
+tok/s short / 22 at 1.8K (Qwen35Model's TP 26.3 / 23.6; the per-op runtime path was 15.5 with a 72.8 s
+long prefill), Qwen3.6-35B-A3B 19.9 / 17.8 tok/s with the short prompt's text equal to one GPU's. Both
+models fit one A40, where they decode faster (46.8 and 43.5): the 2 all-reduces per layer cost more than
+the halved weight reads on PCIe. A stream-ordered all-reduce (events instead of host fences) measured
+slower here (28.6 vs 35.3 tok/s, ~100 us per cross-device event chain) and was not kept.
 
 Measured on an M5 Pro (2026-11-10), MLX, `--bench-prefill 512 --bench-decode 128`, same binary with
 the tensor executors on and off, interleaved:

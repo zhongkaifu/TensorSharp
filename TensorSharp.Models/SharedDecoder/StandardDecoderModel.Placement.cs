@@ -10,6 +10,7 @@ using System.Linq;
 
 using TensorSharp.Cuda;
 using TensorSharp.GGML;
+using TensorSharp.Graph;
 using TensorSharp.Models.Placement;
 
 namespace TensorSharp.Models
@@ -70,6 +71,14 @@ namespace TensorSharp.Models
                 if (_tpGroup == null || _tpGroup.Degree != tp)
                     throw new InvalidOperationException($"Tensor parallelism needs a group of {tp} devices.");
                 _mesh = new DeviceMesh(1, tp, d => _tpGroup.GetAllocator(d), _tpGroup, null);
+                _rankGraphs = RankGraphsServe(tp);
+                if (_rankGraphs)
+                {
+                    var collective = new MeshCollective(_mesh, 0);
+                    for (int r = 0; r < tp; r++)
+                        ((TensorGraphExecutor)ExecutorFor(_mesh.Allocator(0, r))).JoinCollective(collective, r);
+                    Console.WriteLine($"  Tensor parallelism: each of {tp} devices runs its shard of every step as a graph, in lockstep.");
+                }
             }
             else
             {
@@ -79,6 +88,69 @@ namespace TensorSharp.Models
 
         /// <summary>Ranks of tensor-parallel graphs (ggml's meta device), or null.</summary>
         private int[] _graphTpRanks;
+
+        /// <summary>
+        /// Tensor parallelism as each rank's own program (direct CUDA, and the managed executor of a simulated group):
+        /// every rank traces its shard of the step on its device's executor, the ranks' nodes interleaved block by block
+        /// (TryRunRankedGraphStep); each block's partial is summed by <see cref="GraphOp.AllReduce"/> before it joins the
+        /// rank's copy of the residual stream. Routed experts are sharded like the dense feed-forwards (each expert's
+        /// width), not spread whole over the ranks as the per-op path does, so such a model runs only as these graphs.
+        /// </summary>
+        private bool _rankGraphs;
+
+        /// <summary>Whether this model's tensor-parallel steps run as per-rank graphs (see <see cref="_rankGraphs"/>).</summary>
+        protected bool RankGraphs => _rankGraphs;
+
+        /// <summary>Whether the family's lowering traces one rank's shard (its local heads, sharded weights and per-rank
+        /// state); default: families without recurrent layers, whose blocks the runtime emits.</summary>
+        protected virtual bool RanksLower => !_anyRecurrent;
+
+        private bool RankGraphsServe(int tp)
+            => GraphLoweringEnabled && GraphRotary != null && RanksLower && !MoeCpuOffloadConfig.IsEnabled
+               && StepAdapter == null && GlobalTpDegree == tp && TpRankOffset == 0
+               && ExecutorFor(_mesh.Allocator(0, 0)) is TensorGraphExecutor;
+
+        /// <summary>A stage group's sum for per-rank graphs: the last rank's partial runs the group's all-reduce.</summary>
+        private sealed class MeshCollective : IGraphCollective
+        {
+            private readonly DeviceMesh _mesh;
+            private readonly int _stage;
+            private readonly Tensor[] _parts;
+            private int _arrived;
+
+            public MeshCollective(DeviceMesh mesh, int stage)
+            {
+                _mesh = mesh;
+                _stage = stage;
+                _parts = new Tensor[mesh.TensorParallel];
+            }
+
+            public int Degree => _parts.Length;
+
+            public void Contribute(int rank, Tensor partial)
+            {
+                if (_parts[rank] != null)
+                {
+                    partial.Dispose();
+                    throw new InvalidOperationException($"Tensor-parallel rank {rank} reduced twice before every rank reduced once.");
+                }
+                _parts[rank] = partial;
+                if (++_arrived < _parts.Length) return;
+                try
+                {
+                    _mesh.AllReduce(_stage, _parts);
+                }
+                finally
+                {
+                    for (int r = 0; r < _parts.Length; r++)
+                    {
+                        _parts[r].Dispose();
+                        _parts[r] = null;
+                    }
+                    _arrived = 0;
+                }
+            }
+        }
 
         /// <summary>
         /// Tensor parallelism runs as whole-forward graphs on ggml's meta device: the family lowers
@@ -208,6 +280,13 @@ namespace TensorSharp.Models
                     if (!_recurrentLayer[l])
                         rows.Add(p + "attn_output.weight");
                     rows.Add(p + "ffn_down.weight");
+                    if (_rankGraphs && _moeLayer[l])
+                    {
+                        // Each routed expert (its members) and the shared expert split by their width, like a dense
+                        // feed-forward: every rank runs every selected expert's slice.
+                        columns.AddRange(new[] { p + "ffn_gate_exps.", p + "ffn_up_exps.", p + "ffn_gate_shexp.weight", p + "ffn_up_shexp.weight" });
+                        rows.AddRange(new[] { p + "ffn_down_exps.", p + "ffn_down_shexp.weight" });
+                    }
                 }
                 ShardWeightsForTensorParallelism(columns, rows);
             }
@@ -228,7 +307,8 @@ namespace TensorSharp.Models
             }
             if (_mesh.Stages == 1)
             {
-                PrepareCudaQuantizedWeightsForInferenceTP();
+                if (_rankGraphs) PrepareRankGraphResidency();
+                else PrepareCudaQuantizedWeightsForInferenceTP();
                 return;
             }
             PrepareHybridResidency();
@@ -279,6 +359,46 @@ namespace TensorSharp.Models
             for (int d = 0; d < bytes.Length; d++)
                 Console.WriteLine($"  Hybrid device {d} (stage {d / _mesh.TensorParallel}, rank {d % _mesh.TensorParallel}): " +
                     $"{bytes[d] / 1024 / 1024} MB of quantized weights resident.");
+        }
+
+        /// <summary>
+        /// Per-rank graphs: each shard onto its rank's device, and every replicated weight onto every rank (each rank's
+        /// executor finds a weight under its own allocator); the head stays on rank 0, which runs it. Host copies of the
+        /// replicated weights are kept (the per-op embedding and sampling read them); the shards' are released.
+        /// </summary>
+        private void PrepareRankGraphResidency()
+        {
+            if (_backend != BackendType.Cuda) return;   // host-memory devices (simulated groups): nothing to upload
+            long[] bytes = new long[_mesh.TensorParallel];
+            var resident = new HashSet<QuantizedWeight>[_mesh.TensorParallel];
+            _mesh.RunPerRank(0, r =>
+            {
+                resident[r] = new HashSet<QuantizedWeight>(ReferenceEqualityComparer.Instance);
+                foreach (var kv in _tpQuantWeights)
+                {
+                    QuantizedWeight shard = kv.Value[r];
+                    if (!shard.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key)) continue;
+                    if (Preload(shard, _mesh.Allocator(0, r), ggml: false))
+                    {
+                        bytes[r] += shard.RawBytes;
+                        resident[r].Add(shard);
+                    }
+                }
+            });
+            foreach (var kv in _quantWeights)
+            {
+                QuantizedWeight weight = kv.Value;
+                if (!weight.HasHostData || !ShouldPreloadCudaQuantWeightToDevice(kv.Key) || kv.Key == "token_embd.weight") continue;
+                int ranks = IsHeadWeight(kv.Key) ? 1 : _mesh.TensorParallel;
+                for (int r = 0; r < ranks; r++)
+                    if (Preload(weight, _mesh.Allocator(0, r), ggml: false)) bytes[r] += weight.RawBytes;
+            }
+            // Only a shard its rank holds gives up its host copy (another is read from the host).
+            foreach (var kv in _tpQuantWeights)
+                for (int r = 0; r < kv.Value.Length; r++)
+                    if (resident[r].Contains(kv.Value[r]) && !ShouldRetainCudaHostQuantWeight(kv.Key)) kv.Value[r].ReleaseHostData();
+            for (int r = 0; r < bytes.Length; r++)
+                Console.WriteLine($"  Rank {r}: {bytes[r] / 1024 / 1024} MB of quantized weights resident.");
         }
 
         private static bool Preload(QuantizedWeight weight, IAllocator allocator, bool ggml)
