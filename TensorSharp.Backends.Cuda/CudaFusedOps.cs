@@ -593,8 +593,11 @@ namespace TensorSharp.Cuda
         public const int MaxMoEExpertsUsed = 32;
 
         internal static bool IsMoERouterConfigurationSupported(int numExperts, int nUsed)
-            => numExperts > 0 && nUsed > 0
+            => numExperts > 0 && numExperts <= MaxMoERouterExperts && nUsed > 0
                && nUsed <= numExperts && nUsed <= MaxMoEExpertsUsed;
+
+        /// <summary>Experts the warp router covers (a 32-bit taken mask per lane).</summary>
+        public const int MaxMoERouterExperts = 1024;
 
         internal static bool IsMoeDp4aDimensionSupported(int type, int inDim)
         {

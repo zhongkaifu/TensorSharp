@@ -7995,13 +7995,61 @@ extern "C" __global__ void ts_quant_get_rows_f32(
 // regardless of which experts it routes to.
 // ============================================================================
 
-// Router: top-k over the expert logits with the weights renormalized over the
-// selected experts (== softmax over the selected logits) and the per-expert
-// output scale folded in. Mirrors Gemma4Model.MoERoute's selected set + weights
-// exactly (SelectTopKInPlace's strict-'>' first-seen-wins tie-break; softmax
-// over selected == full-softmax-then-renormalize-over-selected). One block; the
-// serial scan runs in thread 0 (num_experts is small, e.g. 128), which keeps the
-// tie-break bit-identical to the CPU reference.
+// The router for one token, by one warp: the k largest logits (an earlier expert wins a tie, as a serial scan with a
+// strict '>' keeps it; nothing at or below -FLT_MAX is taken), softmax over them, times the per-expert scale. Lane l
+// holds experts l, l + 32, ...; each of k rounds takes the warp's best remaining one, so the selection comes out by
+// descending logit. A serial scan in thread 0 took 69 us a call over 256 experts (17% of Qwen3.6-35B-A3B's decode GPU
+// time). Up to 1024 experts (a 32-bit taken mask per lane).
+__device__ __forceinline__ void ts_moe_route_warp(
+    const float* logits, const float* per_expert_scale, int* selected_experts, float* routing_weights,
+    int num_experts, int n_used)
+{
+    const int lane = threadIdx.x & 31;
+    const int MAX_K = 32;
+    const int k = n_used < MAX_K ? n_used : MAX_K;
+    unsigned int taken = 0u;
+    float my_val = -FLT_MAX;   // lane r keeps round r's pick
+    int my_idx = -1;
+    for (int r = 0; r < k; r++)
+    {
+        float best = -FLT_MAX;
+        int bi = 0x7fffffff;
+        for (int e = lane, j = 0; e < num_experts; e += 32, j++)
+        {
+            if (taken & (1u << j)) continue;
+            const float v = logits[e];
+            if (v > best || (v == best && v > -FLT_MAX && e < bi)) { best = v; bi = e; }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+        }
+        const bool found = best > -FLT_MAX;
+        if (found && (bi & 31) == lane) taken |= 1u << (bi >> 5);
+        if (lane == r) { my_val = best; my_idx = found ? bi : -1; }
+    }
+
+    float max_sel = my_val;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) max_sel = fmaxf(max_sel, __shfl_xor_sync(0xffffffffu, max_sel, o));
+    const float ex = lane < k ? expf(my_val - max_sel) : 0.0f;
+    float sum = ex;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+    if (lane < k)
+    {
+        float w = ex * inv;
+        if (per_expert_scale != nullptr && my_idx >= 0)
+            w *= per_expert_scale[my_idx];
+        selected_experts[lane] = my_idx;
+        routing_weights[lane] = w;
+    }
+}
+
 extern "C" __global__ void ts_moe_router_f32(
     const float* logits,            // [num_experts]
     const float* per_expert_scale,  // [num_experts] or nullptr
@@ -8010,39 +8058,9 @@ extern "C" __global__ void ts_moe_router_f32(
     int num_experts,
     int n_used)
 {
-    if (threadIdx.x != 0)
+    if (threadIdx.x >= 32)
         return;
-
-    const int MAX_K = 32;
-    float top_val[MAX_K];
-    int   top_idx[MAX_K];
-    int k = n_used < MAX_K ? n_used : MAX_K;
-    for (int i = 0; i < k; i++) { top_val[i] = -FLT_MAX; top_idx[i] = -1; }
-
-    for (int e = 0; e < num_experts; e++)
-    {
-        float v = logits[e];
-        int min_slot = 0;
-        for (int j = 1; j < k; j++)
-            if (top_val[j] < top_val[min_slot]) min_slot = j;
-        if (v > top_val[min_slot]) { top_val[min_slot] = v; top_idx[min_slot] = e; }
-    }
-
-    float max_sel = -FLT_MAX;
-    for (int i = 0; i < k; i++) max_sel = fmaxf(max_sel, top_val[i]);
-    float sum = 0.0f;
-    for (int i = 0; i < k; i++) { float ex = expf(top_val[i] - max_sel); top_val[i] = ex; sum += ex; }
-    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-
-    for (int i = 0; i < k; i++)
-    {
-        int e = top_idx[i];
-        float w = top_val[i] * inv;
-        if (per_expert_scale != nullptr && e >= 0)
-            w *= per_expert_scale[e];
-        selected_experts[i] = e;
-        routing_weights[i] = w;
-    }
+    ts_moe_route_warp(logits, per_expert_scale, selected_experts, routing_weights, num_experts, n_used);
 }
 
 // Gate/up projection for the selected experts. Each warp computes one output
@@ -8399,44 +8417,11 @@ extern "C" __global__ void ts_moe_router_batched_f32(
     int n_used,
     int num_tokens)
 {
-    int t = blockIdx.x;
-    if (t >= num_tokens || threadIdx.x != 0)
+    const int t = blockIdx.x;
+    if (t >= num_tokens || threadIdx.x >= 32)
         return;
-
-    const float* tlogits = logits + (size_t)t * num_experts;
-    int* tsel = selected_experts + (size_t)t * n_used;
-    float* trw = routing_weights + (size_t)t * n_used;
-
-    const int MAX_K = 32;
-    float top_val[MAX_K];
-    int   top_idx[MAX_K];
-    int k = n_used < MAX_K ? n_used : MAX_K;
-    for (int i = 0; i < k; i++) { top_val[i] = -FLT_MAX; top_idx[i] = -1; }
-
-    for (int e = 0; e < num_experts; e++)
-    {
-        float v = tlogits[e];
-        int min_slot = 0;
-        for (int j = 1; j < k; j++)
-            if (top_val[j] < top_val[min_slot]) min_slot = j;
-        if (v > top_val[min_slot]) { top_val[min_slot] = v; top_idx[min_slot] = e; }
-    }
-
-    float max_sel = -FLT_MAX;
-    for (int i = 0; i < k; i++) max_sel = fmaxf(max_sel, top_val[i]);
-    float sum = 0.0f;
-    for (int i = 0; i < k; i++) { float ex = expf(top_val[i] - max_sel); top_val[i] = ex; sum += ex; }
-    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-
-    for (int i = 0; i < k; i++)
-    {
-        int e = top_idx[i];
-        float w = top_val[i] * inv;
-        if (per_expert_scale != nullptr && e >= 0)
-            w *= per_expert_scale[e];
-        tsel[i] = e;
-        trw[i] = w;
-    }
+    ts_moe_route_warp(logits + (size_t)t * num_experts, per_expert_scale,
+        selected_experts + (size_t)t * n_used, routing_weights + (size_t)t * n_used, num_experts, n_used);
 }
 
 // Gate/up projection, dp4a. grid = (out_dim, n_used, num_tokens).

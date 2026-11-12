@@ -787,7 +787,10 @@ for quantized blocks, `IGraphExpertWeights` for stacked experts); the ops have g
   their experts on the device through tables of the members' resident copies
   (`TryMoEExpertFFN{Decode,Prefill}SwiGLU`), with no host read; a prompt chunk routes on the host and runs
   each selected expert once over its rows (`TryMoEScatterAddWeightedRows`). Before it, the region's ops
-  ran with `sum` on the host. Qwen3.6-35B-A3B UD-Q4_K_M, one A40: decode 18.2 -> 43.5 tok/s (short
+  ran with `sum` on the host. The router itself (shared with Qwen35Model's per-op path) is a warp top-k now (the
+  same experts and weights, listed by descending logit; the serial scan in one thread took 69 us a call over 256
+  experts): Qwen35Model's direct-CUDA 35B decode 66.3 / 61.9 -> 81.1 / 74.2 tok/s, the runtime 57.0 / 55.3 -> 58.3 /
+  60.6 (it is bound by launches; Qwen35Model captures CUDA graphs). Qwen3.6-35B-A3B UD-Q4_K_M, one A40: decode 18.2 -> 43.5 tok/s (short
   prompt) and 18.7 -> 36.7 (1.8K), the 1.8K prefill 24.7 -> 3.9 s; Qwen35Model's fused path is 66 / 62
   tok/s and 1.8 s. The greedy text equals the ggml_cuda runtime's.
 

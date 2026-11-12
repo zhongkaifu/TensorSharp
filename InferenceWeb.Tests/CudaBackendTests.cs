@@ -2908,26 +2908,30 @@ public class CudaBackendTests
                     useGateUpDp4a: true, useDownDp4a: true);
                 Assert.True(ran);
 
-                var expectedSelected = new int[rows * nUsed];
-                var expectedRoute = new float[rows * nUsed];
                 var expertProbability = new float[rows, numExperts];
                 for (int r = 0; r < rows; r++)
                 {
                     float exp0 = MathF.Exp(logitsHost[r, 0]), exp1 = MathF.Exp(logitsHost[r, 1]);
                     expertProbability[r, 0] = exp0 / (exp0 + exp1);
                     expertProbability[r, 1] = exp1 / (exp0 + exp1);
+                }
+                // The router's contract is each row's selected set and its weights; it lists them by descending logit
+                // (the warp top-k), so compare expert by expert.
+                int[] selectedHost = selected.GetElementsAsInt(rows * nUsed);
+                float[] routeHost = routeWeights.GetElementsAsFloat(rows * nUsed);
+                for (int r = 0; r < rows; r++)
+                {
+                    var experts = new int[nUsed];
                     for (int slot = 0; slot < nUsed; slot++)
                     {
-                        // The router retains replacement-slot order, not score
-                        // order. With top-k == expert count, slots are filled
-                        // in expert-ID order even when their scores reverse.
-                        int expert = slot;
-                        expectedSelected[r * nUsed + slot] = expert;
-                        expectedRoute[r * nUsed + slot] = expertProbability[r, expert];
+                        int expert = selectedHost[r * nUsed + slot];
+                        experts[slot] = expert;
+                        Assert.InRange(expert, 0, numExperts - 1);
+                        Assert.True(MathF.Abs(routeHost[r * nUsed + slot] - expertProbability[r, expert]) <= 2e-5f,
+                            $"row {r} expert {expert}: weight {routeHost[r * nUsed + slot]} vs {expertProbability[r, expert]}");
                     }
+                    Assert.Equal(Enumerable.Range(0, nUsed), experts.OrderBy(e => e));
                 }
-                Assert.Equal(expectedSelected, selected.GetElementsAsInt(rows * nUsed));
-                AssertClose(expectedRoute, routeWeights.GetElementsAsFloat(rows * nUsed), 2e-5f);
 
                 float[,] qInput = QuantizeDequantizeQ8_1StoredScale(inputHost);
                 var expected = new float[rows * hiddenDim];
