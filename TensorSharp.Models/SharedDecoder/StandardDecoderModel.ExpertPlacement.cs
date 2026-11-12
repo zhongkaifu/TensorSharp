@@ -39,12 +39,21 @@ namespace TensorSharp.Models
         /// <summary>A weight the host reads and the accelerator never binds (Flash Next's PLE table).</summary>
         protected virtual bool IsHostOnlyWeight(string name) => false;
 
+        protected override bool CountsInLayerBalance(string tensorName) => !IsHostOnlyWeight(tensorName);
+
         /// <summary>Decide <see cref="_expertOnHost"/> once the weights and caches exist, before the first forward.</summary>
         private void PlanExpertPlacement()
         {
-            if (!_anyMoe || !IsGgmlBackend || _mesh.TensorParallel > 1 || _mesh.Stages > 1 || LayerSplitGroup != null)
+            if (!_anyMoe || !IsGgmlBackend || _mesh.TensorParallel > 1 || LayerSplitGroup != null)
                 return;
             int n = Config.NumLayers;
+            if (_mesh.Stages > 1)
+            {
+                // Explicit flags already name the layers; otherwise each stage plans against its own GPU.
+                if (!MoeCpuOffloadConfig.IsExplicitlySet && _backend == BackendType.GgmlCuda)
+                    PlanCudaStages(n);
+                return;
+            }
             if (MoeCpuOffloadConfig.IsExplicitlySet)
             {
                 if (!MoeCpuOffloadConfig.IsEnabled || _backend == BackendType.GgmlCpu)
@@ -94,6 +103,51 @@ namespace TensorSharp.Models
             _expertOnHost = new bool[n];
             for (int l = 0; l < n - resident; l++) _expertOnHost[l] = _moeLayer[l];
             ReportExpertPlacement("planned", $"CUDA free {Gb(free)}, reserved scratch {Gb(DeviceScratchBytes)}; --n-cpu-moe N overrides");
+        }
+
+        /// <summary>
+        /// A layer split on discrete GPUs: each stage keeps the experts of its trailing layers that fit its own device's
+        /// free memory beside its share of the caches and float weights, and its first layers run at a host seam (the stage
+        /// graphs pause there as one device's does). Without it every expert stayed on the devices: Qwen3.8-Flash-Next
+        /// UD-Q2_K_XL (75 GB) over 2x A40 asked stage 0's graph for a 21 GB compute buffer and could not load.
+        /// </summary>
+        private void PlanCudaStages(int n)
+        {
+            var onHost = new bool[n];
+            var details = new List<string>();
+            long floatBytes = 0;
+            foreach (var weight in _weights.Values) floatBytes += weight.Storage.ByteLength;
+            try
+            {
+                for (int s = 0; s < _mesh.Stages; s++)
+                {
+                    EnterStage(s);
+                    if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) || total <= 0)
+                        return;
+                    (int from, int to) = StageLayers(s);
+                    var layerBytes = new long[to - from];
+                    long stageExperts = 0;
+                    for (int l = from; l < to; l++)
+                        stageExperts += layerBytes[l - from] = _moeLayer[l] ? LayerExpertBytes(l) : 0;
+                    // The stage's share of what binds on first use: its layers' caches, the float weights, the drafter on the last.
+                    long pending = checked(CacheBytes() * (to - from) / Math.Max(1, n) + floatBytes / _mesh.Stages
+                        + (s == _mesh.Stages - 1 ? _pendingDraftBytes : 0));
+                    long headroom = GpuMemoryBudget.ResolveHeadroomBytes(total);
+                    if (stageExperts + pending + headroom <= free)
+                        continue;
+                    int resident = PlanCudaDeviceExpertLayers(layerBytes, pending, free, headroom, 0);
+                    for (int l = from; l < to - resident; l++) onHost[l] = _moeLayer[l];
+                    details.Add($"stage {s}: {to - from - resident} of {to - from} layers on the host, CUDA free {Gb(free)}");
+                }
+            }
+            finally
+            {
+                EnterStage(0);
+            }
+            if (details.Count == 0)
+                return;
+            _expertOnHost = onHost;
+            ReportExpertPlacement("planned per stage", $"{string.Join("; ", details)}; reserved scratch {Gb(DeviceScratchBytes)} each; --n-cpu-moe N overrides");
         }
 
         /// <summary>Unified memory: the experts stay within the Metal working set and what macOS can wire (see

@@ -789,6 +789,17 @@ for quantized blocks, `IGraphExpertWeights` for stacked experts); the ops have g
   prompt) and 18.7 -> 36.7 (1.8K), the 1.8K prefill 24.7 -> 3.9 s; Qwen35Model's fused path is 66 / 62
   tok/s and 1.8 s. The greedy text equals the ggml_cuda runtime's.
 
+#### Expert placement under a layer split
+
+A layer split on discrete GPUs plans each stage against its own device (`PlanCudaStages`): the experts of a stage's
+trailing layers that fit its GPU's free memory beside its share of the caches and float weights stay there, its first
+layers run at the host seam. Without it every expert counted as resident: Qwen3.8-Flash-Next UD-Q2_K_XL (75 GB) over 2x
+A40 asked stage 0's graph for a 21 GB compute buffer and did not load. The whole-layer balance no longer counts weights
+no device holds (the 28.8 GB PLE table had been charged to the head's stage, leaving the last A40 10 of 48 layers). Now
+24/24 layers, 14 of 48 layers' experts on the host (13.6 GB read from the mapping): decode 3.4 (short) / 5.0 (4K)
+tok/s, 4K prefill 98.7 s, against Qwen4ExpModel's 4.9 / 7.6 and 59.8 s on the same VM (both read host experts from a
+network volume).
+
 #### Tensor parallelism as per-rank graphs
 
 On the tensor executors (direct CUDA; the managed executor of a simulated group) `--tp T` runs each

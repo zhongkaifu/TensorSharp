@@ -12,6 +12,10 @@ public abstract partial class ModelBase
     private IAllocator[] _layerAllocators;
 
     /// <summary>Initialize a family-independent dense layer pipeline after reading Config.</summary>
+    /// <summary>Whether a tensor's bytes weigh in the whole-layer balance: a weight no device holds (Flash Next's 28.8 GB
+    /// PLE table, read from the mapping) does not - counted as the head's, it left the last of two A40s 10 of 48 layers.</summary>
+    protected virtual bool CountsInLayerBalance(string tensorName) => true;
+
     protected void ConfigureLayerPlacement(string executionIdentity, bool balanceWeightBytes = false)
     {
         if (LayerSplitGroup == null && LayerSplitDegree <= 1) return;
@@ -23,6 +27,7 @@ public abstract partial class ModelBase
             long embedding = 0, head = 0;
             foreach (var info in _gguf.Tensors.Values)
             {
+                if (!CountsInLayerBalance(info.Name)) continue;
                 long resident = IsQuantizedLinearWeight(info) ? _gguf.GetTensorByteCount(info) : checked(info.NumElements * 4);
                 if (LayerSplitPlan.TryGetLayer(info.Name, out int layer) && layer < bytes.Length)
                     bytes[layer] = checked(bytes[layer] + resident);
