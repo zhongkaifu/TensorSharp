@@ -135,6 +135,15 @@ namespace TensorSharp.Models
         {
             lock (_sync)
             {
+                // A prompt chunk that more of the prompt follows has no reader for its logits. Under a layer split the
+                // engine issues it without the head and leaves it in flight, so the first GPU starts the next chunk
+                // while the last one finishes this one (Q4eCudaEngine.PromptPipeline.cs). No logits come back.
+                if (ForwardIsPrompt && PromptLogitsUnused && _exec.DefersPromptChunk(tokens.Length))
+                {
+                    _exec.ForwardPromptDeferred(tokens);
+                    _cacheSeqLen = _exec.NPast;
+                    return null;
+                }
                 if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
                     _logitsBuffer = new float[Config.VocabSize];
                 _exec.Forward(tokens, _logitsBuffer);

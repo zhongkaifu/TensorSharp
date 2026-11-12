@@ -162,6 +162,8 @@ namespace TensorSharp.Cuda
         {
             if (!SupportsDecodeLanes || lane < 0 || lane > 1)
                 return 0;
+            // A lane's step waits only for its own previous step; a prompt chunk in flight finishes first.
+            DrainPrompt();
             EnsureDecodeLanes();
             var L = _decodeLanes[lane];
             if (L.Rows != null)
@@ -284,8 +286,16 @@ namespace TensorSharp.Cuda
             System.Threading.Interlocked.Increment(ref _tLaneSteps);
         }
 
-        /// <summary>Finish every lane's step in flight (any call but a lane's own runs this first).</summary>
+        /// <summary>Finish every lane's step in flight and a prompt chunk left in flight (any call but a lane's own, or the
+        /// prompt's next chunk, runs this first).</summary>
         public void DrainDecodeLanes()
+        {
+            DrainPrompt();
+            DrainLanes();
+        }
+
+        /// <summary>Finish every lane's step in flight; a prompt chunk in flight stays (PromptPipeline.cs).</summary>
+        private void DrainLanes()
         {
             if (_decodeLanes == null)
                 return;

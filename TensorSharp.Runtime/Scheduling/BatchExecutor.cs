@@ -1855,13 +1855,16 @@ namespace TensorSharp.Runtime.Scheduling
                     }
 
                     var swForward = Stopwatch.StartNew();
-                    float[] logits = work.IsPrefill ? _model.ForwardPrompt(inputTokens) : _model.Forward(inputTokens);
+                    float[] logits = work.IsPrefill
+                        ? _model.ForwardPrompt(inputTokens, MorePromptFollows(seq, prevComputed + inputTokens.Length))
+                        : _model.Forward(inputTokens);
                     swForward.Stop();
 
                     // Every sequence's forward overwrites the model's shared
                     // logits buffer, so each must be cloned before the next
                     // sequence's forward in this same step.
-                    seq.LastLogits = (float[])logits.Clone();
+                    // (A prompt chunk more of the prompt follows may come back without logits.)
+                    seq.LastLogits = (float[]?)logits?.Clone();
 
                     seq.AdvanceComputedTokens(inputTokens.Length);
                     if (work.IsPrefill)
@@ -2319,7 +2322,9 @@ namespace TensorSharp.Runtime.Scheduling
                     }
 
                     var swForward = Stopwatch.StartNew();
-                    float[] logits = work.IsPrefill ? _model.ForwardPrompt(inputTokens) : _model.Forward(inputTokens);
+                    float[] logits = work.IsPrefill
+                        ? _model.ForwardPrompt(inputTokens, MorePromptFollows(seq, prevComputed + inputTokens.Length))
+                        : _model.Forward(inputTokens);
                     swForward.Stop();
 
                     // Forward writes the shared linear cache, not the model's
@@ -2343,7 +2348,7 @@ namespace TensorSharp.Runtime.Scheduling
                     // (ownership-swapped or preempted), another sequence's
                     // forward could clobber our buffer. Clone in that case.
                     if (output.ScheduledWork.Count > 1)
-                        seq.LastLogits = (float[])logits.Clone();
+                        seq.LastLogits = (float[]?)logits?.Clone();
                     else
                         seq.LastLogits = logits;
 
@@ -3838,6 +3843,12 @@ namespace TensorSharp.Runtime.Scheduling
             _currentOwner = seq;
             _ownerForwardedTokens = 0;
         }
+
+        /// <summary>Whether a prompt chunk ending at <paramref name="end"/> is followed by more of the same prompt before
+        /// anything reads its logits or its state: not the prompt's last chunk, and not one that ends at a checkpoint
+        /// boundary. A model may then skip the chunk's logits (<see cref="IModelArchitecture.ForwardPrompt(int[], bool)"/>).</summary>
+        private static bool MorePromptFollows(SequenceState seq, int end)
+            => end < seq.PromptTokens.Count && !seq.IsPublicCheckpointBoundary(end);
 
         private int[] BuildPrefillChunk(SequenceState seq, ScheduledSequenceWork work)
         {

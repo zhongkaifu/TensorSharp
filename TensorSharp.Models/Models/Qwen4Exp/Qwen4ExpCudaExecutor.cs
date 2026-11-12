@@ -164,6 +164,10 @@ namespace TensorSharp.Models
 
         public void Forward(int[] tokens, float[] logitsOut) => _engine.Forward(tokens, logitsOut);
         public void Forward(int[] tokens, float[] logitsOut, float[] hOut) => _engine.Forward(tokens, logitsOut, hOut);
+        /// <summary>Whether a prompt chunk of <paramref name="rows"/> rows that more of the prompt follows is left in flight
+        /// (a layer split: <see cref="TensorSharp.Cuda.Q4eCudaEngine.ForwardPromptDeferred"/>).</summary>
+        public bool DefersPromptChunk(int rows) => _engine.DefersPromptChunk(rows);
+        public void ForwardPromptDeferred(int[] tokens) => _engine.ForwardPromptDeferred(tokens);
         public int HiddenWidth => _engine.HiddenWidth;
         public bool HasMtp => _engine.HasMtp;
         public void MtpForward(int[] tokens, float[] hPrev, int p0, float[] logitsOut, float[] hOut)
@@ -563,8 +567,37 @@ namespace TensorSharp.Models
         /// </summary>
         public void GatherPleRows(Qwen4ExpPleHistory[] histories, ReadOnlySpan<int> tokens, ReadOnlySpan<int> positions, float* dst)
         {
+            // A prompt ubatch on several threads: a row depends only on its own token and history, and a GPU waits for
+            // these rows (4,096 tokens: 37 ms on one thread, 5 ms on sixteen, on an 80-vCPU host). TS_Q4E_PLE_GATHER_THREADS=1
+            // keeps one thread.
+            int n = tokens.Length, threads = Math.Min(PleGatherThreads, n / PleGatherMinRowsPerThread);
+            if (threads > 1)
+            {
+                int[] tk = tokens.ToArray(), ps = positions.ToArray();
+                IntPtr dstPtr = (IntPtr)dst;
+                int per = (n + threads - 1) / threads;
+                Parallel.For(0, threads, new ParallelOptions { MaxDegreeOfParallelism = threads }, c =>
+                {
+                    int from = c * per, to = Math.Min(n, from + per);
+                    if (from < to)
+                        GatherPleRange(histories, tk, ps, (float*)dstPtr, from, to);
+                });
+                return;
+            }
+            GatherPleRange(histories, tokens, positions, dst, 0, n);
+        }
+
+        private const int PleGatherMinRowsPerThread = 64;
+        private static readonly int PleGatherThreads = Math.Clamp(
+            int.TryParse(Environment.GetEnvironmentVariable("TS_Q4E_PLE_GATHER_THREADS"), out int pleThreads) && pleThreads > 0
+                ? pleThreads : Math.Min(16, Environment.ProcessorCount / 2),
+            1, 64);
+
+        private void GatherPleRange(Qwen4ExpPleHistory[] histories, ReadOnlySpan<int> tokens, ReadOnlySpan<int> positions, float* dst,
+            int from, int to)
+        {
             var ctx = new long[_pleNgram];
-            for (int t = 0; t < tokens.Length; t++)
+            for (int t = from; t < to; t++)
             {
                 var hist = histories[t];
                 int pos = positions[t];
