@@ -38,6 +38,7 @@ namespace TensorSharp.Cuda
             public float[][] Out;                          // its rows' logits, filled when it finishes
             public float[] Flat;                           // an uncaptured step's logits
             public long Started;
+            public long FinishedAt;                        // when the host last completed this lane's step (telemetry)
         }
 
         private DecodeLane[] _decodeLanes;
@@ -196,6 +197,12 @@ namespace TensorSharp.Cuda
                 if (outRows[i] == null || outRows[i].Length < vocab)
                     outRows[i] = new float[vocab];
 
+            // A sampled step (TS_Q4E_PERF_SAMPLE) runs uncaptured with stage timers, alone on the devices: the other lane's
+            // step in flight finishes first (its logits are copied out early, nothing else changes), so the stages time
+            // this step's kernels and not the wait behind the other lane's.
+            bool sampled = BeginSampledForward();
+            if (sampled)
+                FinishBatchedDecodeLane(lane ^ 1);
             UseLaneFields(lane);
             bool done;
             try
@@ -206,6 +213,9 @@ namespace TensorSharp.Cuda
                 _rowsInFlight = n;
                 ArmHostExperts();
                 L.Started = System.Diagnostics.Stopwatch.GetTimestamp();
+                // A lane left empty for longer than a step could take was waiting for requests, not for the host.
+                if (L.FinishedAt > 0 && L.Started - L.FinishedAt < System.Diagnostics.Stopwatch.Frequency)
+                    System.Threading.Interlocked.Add(ref _tLaneIdleTicks, L.Started - L.FinishedAt);
                 _issueEnd = 0;
                 _laneIssue = true;
                 try
@@ -230,18 +240,27 @@ namespace TensorSharp.Cuda
                 {
                     _laneIssue = false;
                     _rowsInFlight = 0;
+                    if (sampled)
+                    {
+                        try { EndSampledForward(n, decode: true); }
+                        catch (Exception) { _sampling = false; }
+                    }
                 }
             }
             finally
             {
                 UseLaneFields(0);
             }
+            System.Threading.Interlocked.Add(ref _tLaneIssueTicks, System.Diagnostics.Stopwatch.GetTimestamp() - L.Started);
+            System.Threading.Interlocked.Add(ref _tLaneRows, n);
             L.Rows = rows;
             L.Out = outRows;
             if (!done)
                 return 1;
             for (int i = 0; i < n; i++)
                 Array.Copy(L.Flat, (long)i * vocab, outRows[i], 0, vocab);
+            // An uncaptured step waited for itself.
+            System.Threading.Interlocked.Increment(ref _tLaneWaited);
             CompleteLane(L);
             return 2;
         }
@@ -256,7 +275,17 @@ namespace TensorSharp.Cuda
                 return;
             var last = _devs[_lastDev];
             last.MakeCurrent();
-            CudaDriverApi.cuEventSynchronize(L.HeadDone).ThrowOnError();
+            // Done already: the GPUs finished the step before the host came back for it (the host is the bound); else the
+            // host waits for them.
+            if (CudaDriverApi.cuEventQuery(L.HeadDone) == 0)
+                System.Threading.Interlocked.Increment(ref _tLaneReady);
+            else
+            {
+                long waitStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                CudaDriverApi.cuEventSynchronize(L.HeadDone).ThrowOnError();
+                System.Threading.Interlocked.Add(ref _tLaneWaitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - waitStart);
+                System.Threading.Interlocked.Increment(ref _tLaneWaited);
+            }
             int n = L.Rows.Length, vocab = _m.NVocab;
             long src = (long)L.PinnedLogits, rowBytes = (long)vocab * 4;
             var outRows = L.Out;
@@ -283,6 +312,7 @@ namespace TensorSharp.Cuda
             CheckHostExperts(n);
             AdaptResidency();
             CountForwardTime(L.Started);
+            L.FinishedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             System.Threading.Interlocked.Increment(ref _tLaneSteps);
         }
 

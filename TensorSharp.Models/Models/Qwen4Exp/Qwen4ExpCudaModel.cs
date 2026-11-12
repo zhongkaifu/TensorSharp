@@ -138,17 +138,31 @@ namespace TensorSharp.Models
                 // A prompt chunk that more of the prompt follows has no reader for its logits. Under a layer split the
                 // engine issues it without the head and leaves it in flight, so the first GPU starts the next chunk
                 // while the last one finishes this one (Q4eCudaEngine.PromptPipeline.cs). No logits come back.
-                if (ForwardIsPrompt && PromptLogitsUnused && _exec.DefersPromptChunk(tokens.Length))
+                // A lone request's prompt (the primary cache) with a draft head: the MTP block takes the rows on its device
+                // as each ubatch finishes (DraftSelfCatchUp), so the request's drafts start conditioned on its prompt
+                // although the prompt ran on this plain path.
+                bool followed = ForwardIsPrompt && _activeSlotKey == null && DraftSelfCatchUp && _exec.MtpFollowReady;
+                if (followed)
+                    _exec.MtpFollowsForward = true;
+                try
                 {
-                    _exec.ForwardPromptDeferred(tokens);
+                    if (ForwardIsPrompt && PromptLogitsUnused && _exec.DefersPromptChunk(tokens.Length))
+                    {
+                        _exec.ForwardPromptDeferred(tokens);
+                        _cacheSeqLen = _exec.NPast;
+                        return null;
+                    }
+                    if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
+                        _logitsBuffer = new float[Config.VocabSize];
+                    _exec.Forward(tokens, _logitsBuffer);
                     _cacheSeqLen = _exec.NPast;
-                    return null;
+                    return _logitsBuffer;
                 }
-                if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
-                    _logitsBuffer = new float[Config.VocabSize];
-                _exec.Forward(tokens, _logitsBuffer);
-                _cacheSeqLen = _exec.NPast;
-                return _logitsBuffer;
+                finally
+                {
+                    if (followed)
+                        _exec.MtpFollowsForward = false;
+                }
             }
         }
 
@@ -401,6 +415,13 @@ namespace TensorSharp.Models
                 GraphCaptureFailures = c.GraphCaptureFailures,
                 ForwardIssueSeconds = c.ForwardIssueSeconds,
                 ForwardWaitSeconds = c.ForwardWaitSeconds,
+                DecodeLaneSteps = c.LaneSteps,
+                DecodeLaneRows = c.LaneRows,
+                DecodeLaneFinishesReady = c.LaneFinishesReady,
+                DecodeLaneFinishesWaited = c.LaneFinishesWaited,
+                DecodeLaneIssueSeconds = c.LaneIssueSeconds,
+                DecodeLaneWaitSeconds = c.LaneWaitSeconds,
+                DecodeLaneIdleSeconds = c.LaneIdleSeconds,
             };
         }
 
