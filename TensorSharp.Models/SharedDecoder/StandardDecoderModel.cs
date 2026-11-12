@@ -73,12 +73,16 @@ namespace TensorSharp.Models
                 tpGroup is ILayerSplitGroup ? 1 : IsHybrid(tpDegree, tpGroup, layerSplitDegree) ? 1 : layerSplitDegree)
         {
             _requestedStages = tpGroup is ILayerSplitGroup ? 1 : Math.Max(1, layerSplitDegree);
-            _requestedTensorParallel = tpGroup is ILayerSplitGroup
-                ? 1
+            _requestedTensorParallel = tpGroup is ILayerSplitGroup layers
+                ? layers.StageTensorParallel
                 : IsHybrid(tpDegree, tpGroup, layerSplitDegree)
                     ? tpDegree
                     : tpGroup?.Degree ?? Math.Max(1, tpDegree);
         }
+
+        /// <summary>A node of a multi-node pipeline may run its own number of stages, each a tensor-parallel group of
+        /// its own size: the plan follows the nodes' agreed topology and each node runs its layers on its local mesh.</summary>
+        protected override bool RunsMixedNodeShapes => true;
 
         private static bool IsHybrid(int tp, ITensorParallelGroup group, int stages)
             => group is not ILayerSplitGroup && stages > 1 && (tp > 1 || group != null);
@@ -629,15 +633,17 @@ namespace TensorSharp.Models
             _forwardSw.Start();
             try
             {
-                _logitsBuffer = ForwardLayerPipeline(tokens,
-                    embed: () =>
-                    {
-                        Tensor hidden = EmbedStep(tokens);
-                        InjectMedia(hidden, start);
-                        return hidden;
-                    },
-                    runLayer: (hidden, layer) => LayerOnOneDevice(hidden, layer, positions, null),
-                    project: hidden => ProjectRows(hidden, new[] { seqLen - 1 }));
+                Tensor Embed()
+                {
+                    Tensor hidden = EmbedStep(tokens);
+                    InjectMedia(hidden, start);
+                    return hidden;
+                }
+                float[] Project(Tensor hidden) => ProjectRows(hidden, new[] { seqLen - 1 });
+                // Single-device stages run layer by layer; tensor-parallel stages run on this node's mesh.
+                _logitsBuffer = _mesh.TensorParallel == 1
+                    ? ForwardLayerPipeline(tokens, Embed, runLayer: (hidden, layer) => LayerOnOneDevice(hidden, layer, positions, null), Project)
+                    : ForwardLayerPipeline(tokens, Embed, runLocalLayers: hidden => RunLayers(hidden, positions, batch: null), Project);
                 _cacheSeqLen += seqLen;
                 _forwardCount++;
                 return _logitsBuffer;
@@ -652,7 +658,9 @@ namespace TensorSharp.Models
             Tensor[] ranks = null;
             if (_mesh.TensorParallel > 1)
                 ranks = Replicate(hidden, 0);
-            for (int layer = 0; layer < Config.NumLayers; layer++)
+            // A node of a multi-node pipeline runs its own layers, starting on its first local stage.
+            int first = LayerPlacement?.FirstLayer ?? 0, end = LayerPlacement?.EndLayer ?? Config.NumLayers;
+            for (int layer = first; layer < end; layer++)
             {
                 int s = _mesh.StageOf(layer);
                 if (s != stage)

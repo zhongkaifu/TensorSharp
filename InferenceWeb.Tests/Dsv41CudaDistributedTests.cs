@@ -780,7 +780,8 @@ public sealed partial class Dsv41CudaDistributedTests : IDisposable
         }
     }
 
-    /// <summary>The direct-CUDA local group carries only the GPU count; the ggml one still refuses cuda.</summary>
+    /// <summary>The direct-CUDA local group carries the GPU count and makes a device's allocator only when asked (the
+    /// shared decoder runtime's stages ask; an engine owning its contexts never does); the ggml one still refuses cuda.</summary>
     [CudaFact]
     public void TheCudaLocalGroup_CarriesOnlyItsDegree()
     {
@@ -789,7 +790,9 @@ public sealed partial class Dsv41CudaDistributedTests : IDisposable
         Assert.Equal(1, devices.Degree);
         Assert.Equal(1, devices.NodeCount);
         Assert.False(devices.IsActive);
-        Assert.Throws<NotSupportedException>(() => devices.GetAllocator(0));
+        var allocator = Assert.IsType<TensorSharp.Cuda.CudaAllocator>(devices.GetAllocator(0));
+        Assert.Same(allocator, devices.GetAllocator(0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => devices.GetAllocator(1));
         Assert.Throws<NotSupportedException>(() => ModelBase.CreateGgmlLocalLayerSplitGroup(BackendType.Cuda, 1));
         Assert.Throws<ArgumentOutOfRangeException>(() => ModelBase.CreateLocalLayerSplitGroup(BackendType.Cuda, 9));
         int visible = CudaDevice.GetDeviceCount();

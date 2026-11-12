@@ -79,12 +79,22 @@ public sealed class ModelParallelismOptionsTests : IDisposable
         }
     }
 
-    [Fact]
-    public void HybridPlacementIsRefusedAcrossNodes()
-        => Assert.Contains("one process", Assert.Throws<ArgumentException>(() => ModelParallelismOptions.Parse(new[]
+    /// <summary>Across nodes an explicit --layer-split selects the node pipeline and --tp sizes each of this node's
+    /// stages, even --layer-split 1 (one stage of --tp GPUs); --tp alone stays one group spanning the nodes.</summary>
+    [Theory]
+    [InlineData("--layer-split=2", "--tp=2", true, 4)]
+    [InlineData("--layer-split=1", "--tp=2", true, 2)]
+    [InlineData("--layer-split=2", "--tp=1", true, 2)]
+    [InlineData("--tp=2", "--tp=2", false, 2)]
+    public void LayerSplitAcrossNodesSelectsTheNodePipeline(string first, string second, bool pipeline, int localDevices)
+    {
+        var options = ModelParallelismOptions.Parse(new[]
         {
-            "--tp=2", "--layer-split=2", "--tp-node-id=0", "--tp-peers=127.0.0.1:9500,127.0.0.1:9501",
-        })).Message);
+            first, second, "--tp-node-id=0", "--tp-peers=127.0.0.1:9500,127.0.0.1:9501",
+        });
+        Assert.Equal(pipeline, options.IsDistributedPipeline);
+        Assert.Equal(localDevices, options.Distributed.LocalDegree);
+    }
 
     [Fact]
     public void CliOverridesEnvironmentIncludingAnExplicitDegreeOfOne()

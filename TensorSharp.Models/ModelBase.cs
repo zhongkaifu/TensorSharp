@@ -357,6 +357,14 @@ namespace TensorSharp.Models
         /// </summary>
         protected int LayerSplitDegree { get; }
 
+        /// <summary>
+        /// Whether this model runs a multi-node pipeline whose nodes differ (stage counts, tensor-parallel stages,
+        /// capacities): its plan follows the nodes' agreed <see cref="ILayerSplitGroup.Topology"/>, each node's layers
+        /// in proportion to its capacity. Other models refuse nodes of different shapes and split evenly. Read by the
+        /// constructor: an override returns a constant.
+        /// </summary>
+        protected virtual bool RunsMixedNodeShapes => false;
+
         protected ModelBase(string ggufPath, BackendType backend, int tpDegree = 1,
             ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1, bool openGguf = true)
         {
@@ -364,7 +372,15 @@ namespace TensorSharp.Models
             if (layerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(layerSplitDegree));
             LayerSplitGroup = tpGroup as ILayerSplitGroup;
             if (LayerSplitGroup != null)
-                layerSplitDegree = LayerSplitGroup.Degree;
+            {
+                layerSplitDegree = LayerSplitGroup.LocalStages;
+                // Nodes of different shapes, or tensor-parallel stages, need a model that plans and runs them
+                // (the shared decoder runtime); a family with its own pipeline assumes every node is alike.
+                if (!RunsMixedNodeShapes && (LayerSplitGroup.StageTensorParallel > 1 || LayerSplitGroup.Topology?.HasUniformShape == false))
+                    throw new NotSupportedException(
+                        $"{GetType().Name} runs a multi-node --layer-split only when every node runs the same number of " +
+                        "single-GPU stages: give every node the same --layer-split and no --tp.");
+            }
             if ((layerSplitDegree > 1 || LayerSplitGroup != null) &&
                 (tpDegree > 1 || (tpGroup != null && LayerSplitGroup == null)))
                 throw new ArgumentException("--layer-split and --tp select different execution modes and cannot be combined.");
@@ -562,6 +578,59 @@ namespace TensorSharp.Models
             => backend == BackendType.Cuda
                 ? new DirectCudaLayerSplitDevices(Math.Max(1, localDegree))
                 : CreateGgmlLocalLayerSplitGroup(backend, localDegree);
+
+        /// <summary>
+        /// The on-node group of a distributed <c>--layer-split P</c> node: single-GPU stages as
+        /// <see cref="CreateLocalLayerSplitGroup"/>; with <c>--tp T</c>, a tensor-parallel group of all P x T devices,
+        /// local stage s on devices [s*T, (s+1)*T), each stage reducing within its own devices.
+        /// </summary>
+        public static ITensorParallelGroup CreateLocalStageGroup(BackendType backend, int stages, int stageTensorParallel)
+        {
+            if (stageTensorParallel <= 1) return CreateLocalLayerSplitGroup(backend, stages);
+            int devices = checked(Math.Max(1, stages) * stageTensorParallel);
+            return backend == BackendType.Cuda ? new Cuda.TensorParallelGroup(devices) : CreateGgmlLocalTpGroup(backend, devices);
+        }
+
+        /// <summary>
+        /// One local stage's capacity in a multi-node layer plan: the total memory of its devices in whole GiB (this
+        /// node's smallest stage), or 0 when the backend cannot say (every node then weighs a stage by its devices).
+        /// CUDA devices only: direct CUDA and ggml_cuda name their CUDA ordinal; for direct-CUDA single-GPU stages the
+        /// ordinals are TENSORSHARP_LAYER_SPLIT_DEVICES's (no allocator is made just to measure).
+        /// </summary>
+        public static long MeasureStageCapacity(ITensorParallelGroup localGroup, BackendType backend, int stageTensorParallel)
+        {
+            ArgumentNullException.ThrowIfNull(localGroup);
+            if (backend is not (BackendType.Cuda or BackendType.GgmlCuda)) return 0;
+            int stages = localGroup.Degree / Math.Max(1, stageTensorParallel);
+            long smallest = long.MaxValue;
+            try
+            {
+                for (int s = 0; s < stages; s++)
+                {
+                    long bytes = 0;
+                    for (int r = 0; r < stageTensorParallel; r++)
+                    {
+                        int device = s * stageTensorParallel + r;
+                        int ordinal = localGroup is DirectCudaLayerSplitDevices
+                            ? ParseDeviceIds(localGroup.Degree, "TENSORSHARP_LAYER_SPLIT_DEVICES")[device]
+                            : localGroup.GetAllocator(device) switch
+                        {
+                            Cuda.CudaAllocator cuda => cuda.DeviceId,
+                            GgmlAllocator ggml => ggml.DeviceId,
+                            _ => -1,
+                        };
+                        if (ordinal < 0) return 0;
+                        bytes = checked(bytes + Cuda.CudaDevice.GetDevice(ordinal).TotalMemoryBytes);
+                    }
+                    smallest = Math.Min(smallest, bytes);
+                }
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                return 0;   // the device cannot be queried: weigh by device count
+            }
+            return smallest == long.MaxValue ? 0 : Math.Max(1, smallest >> 30);
+        }
 
         public static GgmlLayerSplitDevices CreateGgmlLocalLayerSplitGroup(BackendType backend, int localDegree)
         {
@@ -3717,13 +3786,19 @@ namespace TensorSharp.Models
             if (requestedLayerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(requestedLayerSplitDegree));
             if (tpGroup is ILayerSplitGroup layers)
             {
-                if (tpDegree > 1)
-                    throw new ArgumentException("A distributed --layer-split group cannot also run --tp; hybrid placement runs in one process.");
+                int stageTp = layers.StageTensorParallel;
+                if (tpDegree > 1 && tpDegree != stageTp)
+                    throw new ArgumentException($"--tp {tpDegree} does not match the node's stages of {stageTp} GPU(s).");
                 ValidateDistributedLayerSplit(architecture, backend);
-                if (requestedLayerSplitDegree > 1 && requestedLayerSplitDegree != layers.Degree)
+                if (stageTp > 1)
+                    RequireMechanism(architecture, ServingMechanism.HybridParallel, backend, stageTp,
+                        flag: $"--tp {stageTp} with a multi-node --layer-split");
+                if (requestedLayerSplitDegree > 1 && requestedLayerSplitDegree != layers.LocalStages)
                     throw new ArgumentException("The layer-split degree must match the local device group.");
-                layerSplitDegree = layers.Degree;
-                Console.WriteLine($"  Distributed layer split: {layers.NodeCount} nodes, {layers.Degree} GPUs per node, whole-layer stage transfers.");
+                layerSplitDegree = layers.LocalStages;
+                Console.WriteLine(layers.Topology is { HasUniformShape: false } || stageTp > 1
+                    ? $"  Distributed layer split: {layers.NodeCount} nodes; this node runs {layers.LocalStages} stage(s) of {stageTp} GPU(s); whole-layer stage transfers."
+                    : $"  Distributed layer split: {layers.NodeCount} nodes, {layers.Degree} GPUs per node, whole-layer stage transfers.");
                 return 1;
             }
             if (tpGroup?.NodeCount > 1)

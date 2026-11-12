@@ -41,15 +41,26 @@ namespace TensorSharp.Models
                 Console.WriteLine($"  Tensor parallelism: whole-forward graphs over {tp} GPUs (ggml's meta device).");
                 return;
             }
-            // A distributed TP group shards by its GLOBAL degree; a stage group by its own.
-            int shardDegree = tp == 1 ? 1 : stages == 1 ? GlobalTpDegree : tp;
+            // A distributed TP group shards by its GLOBAL degree; a stage group (local or a pipeline node's) by its own.
+            bool distributedTp = tp > 1 && stages == 1 && LayerSplitGroup == null;
+            int shardDegree = tp == 1 ? 1 : distributedTp ? GlobalTpDegree : tp;
             _shardDegree = shardDegree;
-            _shardRankOffset = tp > 1 && stages == 1 ? TpRankOffset : 0;
+            _shardRankOffset = distributedTp ? TpRankOffset : 0;
             ValidateShardable(shardDegree);
             _localHeads = Config.NumHeads / shardDegree;
             _localKvHeads = Config.NumKVHeads / shardDegree;
 
-            if (LayerSplitGroup != null || (stages > 1 && tp == 1))
+            if (LayerSplitGroup != null && tp > 1)
+            {
+                // A pipeline node whose stages are tensor-parallel groups: the node's own layers (the agreed plan) over
+                // its P local stages of T devices, each stage reducing within its devices.
+                ConfigureLayerPlacement(executionIdentity + "|" + _kvCacheDtype, balanceWeightBytes: true);
+                ITensorParallelGroup local = ((INestedTensorParallelGroup)LayerSplitGroup).LocalGroup;
+                _mesh = new DeviceMesh(LayerSplitDegree, tp, d => local.GetAllocator(d), local, LayerPlacement);
+                if (IsGgmlBackend)
+                    GgmlBasicOps.TensorParallelSetGlobalGeometry(tp, 0);
+            }
+            else if (LayerSplitGroup != null || (stages > 1 && tp == 1))
             {
                 // ModelBase's whole-layer placement: local devices, or this node's share of a
                 // multi-node pipeline (whose nodes must agree on everything in the identity).
@@ -263,7 +274,7 @@ namespace TensorSharp.Models
                 var rows = new List<string>();
                 for (int l = 0; l < Config.NumLayers; l++)
                 {
-                    if (_mesh.StageOf(l) != stage) continue;
+                    if (!OwnsLayer(l) || _mesh.StageOf(l) != stage) continue;
                     string p = $"blk.{l}.";
                     int qRows = Config.NumHeads * _keyDim * (GatedAttentionOutput ? 2 : 1);
                     if (_recurrentLayer[l])
@@ -305,7 +316,7 @@ namespace TensorSharp.Models
                 PrepareCudaQuantizedWeightsForInference();
                 return;
             }
-            if (_mesh.Stages == 1)
+            if (_mesh.Stages == 1 && LayerSplitGroup == null)
             {
                 if (_rankGraphs) PrepareRankGraphResidency();
                 else PrepareCudaQuantizedWeightsForInferenceTP();

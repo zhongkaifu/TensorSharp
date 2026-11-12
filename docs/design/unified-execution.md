@@ -311,14 +311,16 @@ sequenceDiagram
 | `--tp T` | T | one stage, T tensor-parallel ranks |
 | `--layer-split P` | P (local) or P per node | P whole-layer stages of one device each |
 | `--tp T --layer-split P` | T x P (one process) | P stages, each its own T-device TP group |
+| `--layer-split P_i [--tp T_i]` per node, with `--tp-peers` | sum of P_i x T_i | node i: P_i stages of T_i devices; nodes may differ |
 
 * **Validation** (`ModelBase.ResolveTensorParallelSupport`) reads only the family's serving
   contract: hybrid needs `HybridParallel` on the backend, a pure split `LayerSplit`, pure TP
   `TensorParallel`; a single-device backend is refused for every family alike; a mechanism's
   `Precondition` checks degree limits (Muse-Glimmer's two KV heads, DeepSeek V4.1's eight GPUs
   per process). Refusals keep the existing contract: exit code 2 and one stderr line. The
-  option parser (`ModelParallelismOptions`) accepts both degrees together and refuses only a
-  multi-node hybrid.
+  option parser (`ModelParallelismOptions`) accepts both degrees together; across nodes an
+  explicit `--layer-split` selects the node pipeline (`IsDistributedPipeline`), `--tp` then
+  sizing each of the node's stages.
 * **Placement** (`DeviceMesh`): device (stage s, rank r) is global device `s*T + r` of one
   group spanning all T x P devices (its allocators, its per-rank pinning, its native
   collective when there is one stage). Layer ranges come from the existing weight-byte
@@ -329,6 +331,22 @@ sequenceDiagram
 
 Multi-node groups (`--tp-node-id/--tp-peers`) keep their existing validation; a multi-node
 whole-layer split runs the serialized stage protocol (`ModelBase.ForwardLayerPipeline`).
+
+**Nodes of different shapes.** Every process still holds a uniform mesh (its own P x T);
+heterogeneity lives between nodes. `DistributedLayerSplitGroup` takes the node's local group
+(P x T devices, stage s on devices [s*T, (s+1)*T)) and each stage's capacity (the total
+memory of its CUDA devices in whole GiB, `ModelBase.MeasureStageCapacity`; 0 = unknown, and
+then every node weighs a stage by its device count). Its handshake checks only the mode
+(`layer-split`), then sums every node's (P, T, capacity) row into place: the agreed
+`LayerSplitTopology`. `LayerSplitPlan.Create` gives each node a contiguous run of layers in
+proportion to its capacity (`PartitionByCapacity`: the largest bytes-to-capacity ratio is
+minimized exactly, by cross-multiplication, each node owning at least its stage count), and
+splits the node's run evenly over its own stages; a uniform topology gives exactly the old
+plan. On the shared decoder runtime (`RunsMixedNodeShapes`) a node with T > 1 builds its
+local `DeviceMesh(P, T, ..., plan)`, shards only its own layers per stage, and its share of a
+forward runs through `RunLayers` on that mesh (`ForwardLayerPipeline`'s `runLocalLayers`
+form); the activation crosses nodes as before. Families with their own pipelines refuse a
+non-uniform shape at construction and keep the even split when only the capacities differ.
 
 ## 4. Backends: what is abstract today, and the plug-in step
 
@@ -1050,6 +1068,15 @@ devices, no peer access), CUDA 13.2, ggml `cd6d2b75`, native library built for s
 
 (prefill / decode tok/s, 512 / 128 tokens, medians.) Two slices with no peer access make tensor
 parallelism a capacity feature here, not a speed one.
+
+**Nodes of different shapes (2026-11-12).** Three machines, ggml `cd6d2b75`: 2x A40 (node 0, the
+driver), 1x RTX A5000 and 1x RTX 2000 Ada, Qwen3.5-9B Q8_0, peers relayed over SSH tunnels
+through a workstation (so 1.2-1.5 tok/s says nothing about speed). The nodes agreed on 88 / 23 /
+15 GiB per stage and planned layers [0,3) / [3,8) / [8,32). On `ggml_cuda` (node 0 `--tp 2
+--layer-split 1`, and node 0 `--layer-split 2`) and `cuda` (node 0 `--tp 2 --layer-split 1`),
+both 48-token greedy replies were identical to one A40's. Not run across machines: `ggml_vulkan`,
+MoE checkpoints, a node with several tensor-parallel stages (covered only by the simulated
+`HeterogeneousPipelineTests`), and any throughput measurement on a real network.
 
 ### 9.4 Not validated
 

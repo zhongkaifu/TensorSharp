@@ -16,9 +16,9 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 多 GPU 与多节点</div>
   <h1>多 GPU 与多节点</h1>
-  <p class="lede"><code>--tp N</code> 仅选择张量并行，在层内切分权重；<code>--layer-split N</code> 在支持的架构上选择整层放置。两种参数互斥，不支持的请求会在启动时失败。按层切分仅限单节点；只有支持分布式张量并行的架构才能通过 <code>--tp-node-id</code> / <code>--tp-peers</code> 跨节点运行。旧的按层切分命令需将 <code>--tp N</code> 改为 <code>--layer-split N</code>（环境变量：<code>TENSORSHARP_LAYER_SPLIT_DEGREE=N</code>）。</p>
+  <p class="lede"><code>--tp N</code> 仅选择张量并行，在层内切分权重；<code>--layer-split N</code> 在支持的架构上选择整层放置。在共享解码运行时上的架构可同时使用两者：<code>--layer-split P</code> 个 stage，每个 stage 由 <code>--tp T</code> 张 GPU 组成；不支持的请求会在启动时失败。配合 <code>--tp-node-id</code> / <code>--tp-peers</code> 时，单独的 <code>--tp</code> 表示一个跨节点的张量并行组；显式给出 <code>--layer-split</code> 则把各节点组成整层流水线。在共享解码运行时（Qwen 3.5、Mistral 3）上，每个节点各自设置 <code>--layer-split</code> 和 <code>--tp</code>，GPU 数量不同的节点可以组成同一条流水线，层按各节点的显存大小分配（见 <code>docs/multi-node-inference.md</code>）。旧的按层切分命令需将 <code>--tp N</code> 改为 <code>--layer-split N</code>（环境变量：<code>TENSORSHARP_LAYER_SPLIT_DEGREE=N</code>）。</p>
 
-  <div class="callout note"><div class="ic">🧭</div><p><code>--tp N</code> 仅选择张量并行，在层内切分权重；<code>--layer-split N</code> 在支持的架构上选择整层放置。两种参数互斥，不支持的请求会在启动时失败。按层切分仅限单节点；只有支持分布式张量并行的架构才能通过 <code>--tp-node-id</code> / <code>--tp-peers</code> 跨节点运行。旧的按层切分命令需将 <code>--tp N</code> 改为 <code>--layer-split N</code>（环境变量：<code>TENSORSHARP_LAYER_SPLIT_DEGREE=N</code>）。</p></div>
+  <div class="callout note"><div class="ic">🧭</div><p><code>--tp N</code> 仅选择张量并行，在层内切分权重；<code>--layer-split N</code> 在支持的架构上选择整层放置。在共享解码运行时上的架构可同时使用两者：<code>--layer-split P</code> 个 stage，每个 stage 由 <code>--tp T</code> 张 GPU 组成；不支持的请求会在启动时失败。配合 <code>--tp-node-id</code> / <code>--tp-peers</code> 时，单独的 <code>--tp</code> 表示一个跨节点的张量并行组；显式给出 <code>--layer-split</code> 则把各节点组成整层流水线。在共享解码运行时（Qwen 3.5、Mistral 3）上，每个节点各自设置 <code>--layer-split</code> 和 <code>--tp</code>，GPU 数量不同的节点可以组成同一条流水线，层按各节点的显存大小分配（见 <code>docs/multi-node-inference.md</code>）。旧的按层切分命令需将 <code>--tp N</code> 改为 <code>--layer-split N</code>（环境变量：<code>TENSORSHARP_LAYER_SPLIT_DEGREE=N</code>）。</p></div>
 
   <h2 id="why">什么时候需要它？</h2>
   <ul>

@@ -370,8 +370,8 @@ namespace TensorSharp.Server
                 string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS")))
                 return;
 
-            bool layerSelected = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE")) &&
-                (!int.TryParse(Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE"), out int tpDegree) || tpDegree <= 1);
+            // Across nodes an explicit --layer-split selects the node pipeline (each node's stages may be --tp groups).
+            bool layerSelected = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_LAYER_SPLIT_DEGREE"));
             BackendType backend = ResolveBackend(backendStr);
             if (layerSelected) ModelBase.ValidateDistributedLayerSplit(modelPath, backend);
             else ModelBase.ValidateDistributedTensorParallelism(modelPath, backend);

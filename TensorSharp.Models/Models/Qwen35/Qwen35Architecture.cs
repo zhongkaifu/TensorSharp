@@ -42,6 +42,10 @@ namespace TensorSharp.Models
                 "Ternary-Bonsai-2-27B-mmproj-BF16.gguf",
                 "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
             },
+            // A multi-node --layer-split runs on the shared decoder runtime (Qwen35RuntimeModel): each node loads
+            // only its layers, and its stages may be --tp groups of their own size (nodes of different shapes).
+            SupportsDistributedLayerSplit = true,
+            DistributedLayerSplitBackends = new[] { BackendType.GgmlCuda, BackendType.GgmlVulkan, BackendType.Cuda },
             Serving = new ServingContract
             {
                 Implementation = ServingImplementation.Bespoke,

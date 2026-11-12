@@ -21,10 +21,13 @@ public abstract partial class ModelBase
         if (LayerSplitGroup == null && LayerSplitDegree <= 1) return;
         int node = LayerSplitGroup?.NodeId ?? 0, nodes = LayerSplitGroup?.NodeCount ?? 1;
         bool driverLast = nodes > 1 && LayerSplitPlan.DriverRunsLastStageFromEnvironment();
+        // Nodes of different shapes or capacities split by capacity, for a model that runs them.
+        LayerSplitTopology topology = RunsMixedNodeShapes ? LayerSplitGroup?.Topology : null;
+        long[] bytes = null;
+        long embedding = 0, head = 0;
         if (balanceWeightBytes)
         {
-            var bytes = new long[Config.NumLayers];
-            long embedding = 0, head = 0;
+            bytes = new long[Config.NumLayers];
             foreach (var info in _gguf.Tensors.Values)
             {
                 if (!CountsInLayerBalance(info.Name)) continue;
@@ -35,12 +38,20 @@ public abstract partial class ModelBase
                 else head = checked(head + resident);
             }
             if (!_gguf.Tensors.ContainsKey("output.weight")) head = checked(head + embedding);
-            LayerPlacement = LayerSplitPlan.CreateWeighted(bytes, LayerSplitDegree, node, nodes, embedding, head, driverLast);
         }
+        if (topology != null)
+            LayerPlacement = LayerSplitPlan.Create(Config.NumLayers, bytes, topology, node, embedding, head, driverLast);
+        else if (balanceWeightBytes)
+            LayerPlacement = LayerSplitPlan.CreateWeighted(bytes, LayerSplitDegree, node, nodes, embedding, head, driverLast);
         else LayerPlacement = new LayerSplitPlan(Config.NumLayers, LayerSplitDegree, node, nodes, driverLast);
+        if (topology is { IsUniform: false })
+            Console.WriteLine($"  Layer plan over nodes of different shapes: this node (pipeline position {LayerPlacement.StageIndex}) " +
+                $"owns layers [{LayerPlacement.FirstLayer}, {LayerPlacement.EndLayer}) of {Config.NumLayers}.");
+        // Local stage s starts at device s*T of the node's group (T = 1 for single-device stages).
+        int stageDevices = LayerSplitGroup?.StageTensorParallel ?? 1;
         _layerAllocators = new IAllocator[LayerSplitDegree];
         for (int rank = 0; rank < _layerAllocators.Length; rank++)
-            _layerAllocators[rank] = LayerSplitGroup?.GetAllocator(rank) ?? CreateLayerDeviceAllocator(rank);
+            _layerAllocators[rank] = LayerSplitGroup?.GetAllocator(rank * stageDevices) ?? CreateLayerDeviceAllocator(rank);
 
         if (LayerSplitGroup != null)
         {
@@ -88,7 +99,7 @@ public abstract partial class ModelBase
     {
         if (_layerAllocators == null) return;
         _allocator = _layerAllocators[rank];
-        if (IsGgmlBackend) GgmlBasicOps.SetActiveRank(rank);
+        if (IsGgmlBackend) GgmlBasicOps.SetActiveRank(rank * (LayerSplitGroup?.StageTensorParallel ?? 1));
     }
 
     /// <summary>Only the first stage embeds; each stage executes its own whole layers;
@@ -98,6 +109,19 @@ public abstract partial class ModelBase
     /// ILayerSplitGroup transport with their complete boundary-state representation.</summary>
     protected float[] ForwardLayerPipeline(int[] tokens, Func<Tensor> embed,
         Func<Tensor, int, Tensor> runLayer, Func<Tensor, float[]> project)
+    {
+        ArgumentNullException.ThrowIfNull(tokens);
+        return ForwardLayerPipeline(tokens, embed, (Func<Tensor, Tensor>)(hidden => RunOwnedLayers(hidden, tokens.Length, runLayer)), project);
+    }
+
+    /// <summary>
+    /// The stage protocol with this node's layers run by <paramref name="runLocalLayers"/>: it receives the activation
+    /// on local stage 0's device (taking ownership) and returns it after layer <see cref="LayerSplitPlan.EndLayer"/> - 1,
+    /// where <paramref name="project"/> reads it when this node runs the last stage. For a model whose local stages are
+    /// not single devices (tensor-parallel stages), which the per-layer form cannot express.
+    /// </summary>
+    protected float[] ForwardLayerPipeline(int[] tokens, Func<Tensor> embed,
+        Func<Tensor, Tensor> runLocalLayers, Func<Tensor, float[]> project)
     {
         if (LayerPlacement == null) throw new InvalidOperationException("Layer placement has not been configured.");
         ArgumentNullException.ThrowIfNull(tokens);
@@ -116,22 +140,9 @@ public abstract partial class ModelBase
                 hidden = new Tensor(_allocator, DType.Float32, tokens.Length, Config.HiddenSize);
                 hidden.SetElementsAsFloat(input);
             }
-            int previousRank = 0;
-            for (int layer = LayerPlacement.FirstLayer; layer < LayerPlacement.EndLayer; layer++)
-            {
-                int rank = LayerPlacement.LocalRank(layer);
-                if (rank != previousRank)
-                {
-                    var values = TensorToFloatArray(hidden);
-                    hidden.Dispose();
-                    hidden = null;
-                    SelectLayerDevice(rank);
-                    hidden = new Tensor(_allocator, DType.Float32, tokens.Length, Config.HiddenSize);
-                    hidden.SetElementsAsFloat(values);
-                    previousRank = rank;
-                }
-                hidden = runLayer(hidden, layer);
-            }
+            Tensor received = hidden;
+            hidden = null;
+            hidden = runLocalLayers(received);
             if (LayerPlacement.IsLast)
             {
                 float[] result = project(hidden);
@@ -167,6 +178,37 @@ public abstract partial class ModelBase
         {
             hidden?.Dispose();
             SelectLayerDevice(0);
+        }
+    }
+
+    /// <summary>This node's layers one at a time, the activation moved through host memory to each local device in
+    /// turn (single-device stages). Takes ownership of <paramref name="hidden"/>.</summary>
+    private Tensor RunOwnedLayers(Tensor hidden, int rows, Func<Tensor, int, Tensor> runLayer)
+    {
+        try
+        {
+            int previousRank = 0;
+            for (int layer = LayerPlacement.FirstLayer; layer < LayerPlacement.EndLayer; layer++)
+            {
+                int rank = LayerPlacement.LocalRank(layer);
+                if (rank != previousRank)
+                {
+                    var values = TensorToFloatArray(hidden);
+                    hidden.Dispose();
+                    hidden = null;
+                    SelectLayerDevice(rank);
+                    hidden = new Tensor(_allocator, DType.Float32, rows, Config.HiddenSize);
+                    hidden.SetElementsAsFloat(values);
+                    previousRank = rank;
+                }
+                hidden = runLayer(hidden, layer);
+            }
+            return hidden;
+        }
+        catch
+        {
+            hidden?.Dispose();
+            throw;
         }
     }
 }

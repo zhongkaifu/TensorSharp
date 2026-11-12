@@ -36,13 +36,30 @@ public sealed class DirectCudaLayerSplitDevices : ITensorParallelGroup
     // Placement only: never activates tensor sharding.
     public bool IsActive => false;
 
-    public IAllocator GetAllocator(int rank) => throw new NotSupportedException(
-        "The direct-CUDA layer-split group carries only its GPU count; the engine owns its device allocators.");
+    private readonly IAllocator[] _allocators = new IAllocator[8];
+
+    /// <summary>Local device <paramref name="rank"/>'s allocator (TENSORSHARP_LAYER_SPLIT_DEVICES picks the ordinals, as
+    /// for a local split), made on first request: an engine that owns its device contexts never asks, the shared decoder
+    /// runtime's stages do.</summary>
+    public IAllocator GetAllocator(int rank)
+    {
+        if ((uint)rank >= (uint)Degree) throw new ArgumentOutOfRangeException(nameof(rank));
+        lock (_allocators)
+            return _allocators[rank] ??= new CudaAllocator(ModelBase.ParseDeviceIds(Degree, "TENSORSHARP_LAYER_SPLIT_DEVICES")[rank]);
+    }
 
     public void AllReduce(Tensor[] tensors) => throw new NotSupportedException("Layer splitting does not reduce tensors.");
     public void Synchronize() { }
     public void Barrier() { }
     public void BroadcastControl(int op, int[] payload) => throw new NotSupportedException();
     public (int op, int[] payload) ReceiveControl() => throw new NotSupportedException();
-    public void Dispose() { }
+    public void Dispose()
+    {
+        lock (_allocators)
+            for (int i = 0; i < _allocators.Length; i++)
+            {
+                (_allocators[i] as IDisposable)?.Dispose();
+                _allocators[i] = null;
+            }
+    }
 }
