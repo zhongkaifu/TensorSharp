@@ -2491,6 +2491,10 @@ namespace TensorSharp.Runtime.Scheduling
 
             var batch = new List<(ScheduledSequenceWork Work, int[] Tokens, int Start, int Sampled, SpecSeqContext? Drafter)>(prepared.Count);
             var injector = _model.MultimodalInjector;
+            // The step's host phases (tensorsharp.engine.step.phase.duration), as the batched decode records them: the
+            // decoders' draws ("sample") and the forward ("issue", bucketed by the rows it ran).
+            long sampleTicks = 0;
+            int decoders = 0;
             foreach (var work in prepared)
             {
                 var seq = work.Sequence;
@@ -2513,7 +2517,10 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                     else
                     {
+                        long drawn = Stopwatch.GetTimestamp();
                         int token = TakePendingOrSample(seq);
+                        sampleTicks += Stopwatch.GetTimestamp() - drawn;
+                        decoders++;
                         seq.AppendOutputToken(token);
                         batch.Add((work, new[] { token }, start, token, null));
                     }
@@ -2523,17 +2530,21 @@ namespace TensorSharp.Runtime.Scheduling
                     FailUnified(seq, ex, results);
                 }
             }
+            if (decoders > 0)
+                RecordStepPhase(s_phaseSample, Stopwatch.GetTimestamp() - sampleTicks, decoders);
             if (batch.Count == 0)
                 return results;
 
             var ids = new string[batch.Count];
             var tokens = new int[batch.Count][];
             var starts = new int[batch.Count];
+            int stepRows = 0;
             for (int i = 0; i < batch.Count; i++)
             {
                 ids[i] = batch[i].Work.Sequence.RequestId;
                 tokens[i] = batch[i].Tokens;
                 starts[i] = batch[i].Start;
+                stepRows += tokens[i].Length;
             }
             var lastLogits = new float[batch.Count][];
             // A prompt-conditioned drafter's chunks come back with the features of the rows its context needs.
@@ -2549,6 +2560,7 @@ namespace TensorSharp.Runtime.Scheduling
                 long started = Stopwatch.GetTimestamp();
                 if (!model.TryForwardUnified(ids, tokens, starts, lastLogits, features))
                     throw new InvalidOperationException("the model declined a unified step whose slots it had prepared");
+                RecordStepPhase(s_phaseIssue, started, stepRows);
                 long ticksPerSequence = (Stopwatch.GetTimestamp() - started) / batch.Count;
                 if (batch.Count >= 2) ReportBatchedFusedDecodeSuccess(batch.Count);
                 if (features != null)

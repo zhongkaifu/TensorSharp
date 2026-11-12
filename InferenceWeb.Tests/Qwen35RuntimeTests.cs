@@ -1009,6 +1009,72 @@ public sealed class Qwen35RuntimeTests : IDisposable
         }
     }
 
+    /// <summary>The unified step times its host parts as the batched decode does
+    /// (tensorsharp.engine.step.phase.duration): the decoders' draws ("sample", by decoders) and each forward ("issue",
+    /// by the rows it ran: a prompt chunk's many, two decoders' two).</summary>
+    [Fact]
+    public async Task UnifiedStepsRecordTheirHostPhases()
+    {
+        KvCacheDtypeConfig.RestoreForTests(KvCacheDtype.F32, true);
+        string architecture = "qwen35-phases-" + Guid.NewGuid().ToString("N");
+        var phases = new System.Collections.Concurrent.ConcurrentQueue<(string Phase, string Rows)>();
+        using var meters = new System.Diagnostics.Metrics.MeterListener
+        {
+            InstrumentPublished = (instrument, listener) =>
+            {
+                if (instrument.Meter.Name == TensorSharp.Runtime.Telemetry.TensorSharpTelemetry.MeterName
+                    && instrument.Name == "tensorsharp.engine.step.phase.duration")
+                    listener.EnableMeasurementEvents(instrument);
+            },
+        };
+        meters.SetMeasurementEventCallback<double>((_, seconds, tags, _) =>
+        {
+            string arch = null, phase = null, rows = null;
+            foreach (var tag in tags)
+            {
+                if (tag.Key == TensorSharp.Runtime.Telemetry.TelemetryAttributes.ModelArchitecture) arch = tag.Value as string;
+                else if (tag.Key == TensorSharp.Runtime.Telemetry.TelemetryAttributes.StepPhase) phase = tag.Value as string;
+                else if (tag.Key == TensorSharp.Runtime.Telemetry.TelemetryAttributes.RowsBucket) rows = tag.Value as string;
+            }
+            if (arch == architecture && seconds >= 0)
+                phases.Enqueue((phase, rows));
+        });
+        meters.Start();
+
+        using (var model = Create(Fixture("dense")))
+        {
+            model.Config.Architecture = architecture;
+            var cfg = new SchedulerConfig
+            {
+                MaxNumBatchedTokens = 256,
+                MaxNumRunningSequences = 4,
+                MaxPrefillChunkSize = 32,
+                NumBlocks = 32,
+                BlockSize = 16,
+                EnablePrefixCaching = false,
+            };
+            using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
+            int[][] prompts =
+            {
+                Enumerable.Range(0, 19).Select(i => 65 + (i * 7) % 50).ToArray(),
+                Enumerable.Range(0, 27).Select(i => 97 + (i * 5) % 26).ToArray(),
+            };
+            var handles = prompts.Select((p, i) => engine.SubmitRequest(
+                new SequenceState($"req{i}", p, 6, cfg.BlockSize, SamplingConfig.Greedy))).ToList();
+            await Task.WhenAll(handles.Select(async h =>
+            {
+                await foreach (int _ in h.Tokens.ReadAllAsync()) { }
+                await h.Completion;
+            })).WaitAsync(TimeSpan.FromMinutes(3));
+            Assert.True(model.BatchedForwardCount > 0, "the requests must be served in unified steps");
+        }
+
+        Assert.Contains(phases, p => p.Phase == "sample" && p.Rows == "2-4");
+        Assert.Contains(phases, p => p.Phase == "issue" && p.Rows == "2-4");
+        Assert.Contains(phases, p => p.Phase == "issue" && p.Rows != "1" && p.Rows != "2-4");
+        Assert.All(phases, p => Assert.Contains(p.Phase, new[] { "sample", "issue" }));
+    }
+
     private static int ArgMax(float[] logits)
     {
         int best = 0;
