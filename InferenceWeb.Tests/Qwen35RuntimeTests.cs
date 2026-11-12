@@ -67,7 +67,8 @@ public sealed class Qwen35RuntimeTests : IDisposable
         => new(path, backend, tp, tp > 1 ? new SimulatedDeviceGroup(tp * stages) : null, stages);
 
     /// <summary>The factory's route: one ggml_cuda / ggml_metal / ggml_cpu / MLX device runs a dense checkpoint on
-    /// the shared runtime; routed experts, --tp, and every other backend stay with Qwen35Model.</summary>
+    /// the shared runtime, ggml_cpu a routed-expert one too; other routed-expert devices, --tp, and every other
+    /// backend stay with Qwen35Model.</summary>
     [Theory]
     [InlineData("dense", BackendType.GgmlCuda, 1, true)]
     [InlineData("dense", BackendType.GgmlMetal, 1, true)]
@@ -82,6 +83,7 @@ public sealed class Qwen35RuntimeTests : IDisposable
     [InlineData("moe", BackendType.Mlx, 1, false)]
     [InlineData("moe", BackendType.GgmlCuda, 1, false)]
     [InlineData("moe", BackendType.GgmlMetal, 1, false)]
+    [InlineData("moe", BackendType.GgmlCpu, 1, true)]
     public void OneDeviceRouteServesDenseCheckpoints(string variant, BackendType backend, int tp, bool runtime)
     {
         using var probe = new GgufFile(Fixture(variant));
